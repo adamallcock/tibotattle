@@ -1,7 +1,8 @@
 import { createV1QuotaPageReader,backfillV1QuotaFitProjection } from '../src/quota-fit-projection';
 import { readV1UsagePage,accountScopedQuotaAnalysisV1,accountScopedModelCompositionV1 } from '../src/quota-analysis-v1';
 import { loadV1SourcePin } from '../src/telemetry-v1-source-selection';
-import { loadTypedV1AnalysisScope,TYPED_V1_PLAN_PAGE_SQL,TYPED_V1_FIT_PAGE_SQL,TYPED_V1_USAGE_AT_TIME_SQL } from '../src/typed-v1-analysis-reader';
+import { loadTypedV1AnalysisScope,TYPED_V1_PLAN_PAGE_SQL,TYPED_V1_HISTORY_PLAN_PAGE_SQL,
+ TYPED_V1_FIT_PAGE_SQL,TYPED_V1_USAGE_AT_TIME_SQL } from '../src/typed-v1-analysis-reader';
 import { decodeTypedTelemetryUsageAnalysisRows,MAX_TYPED_V1_USAGE_ANALYSIS_BYTES } from '../src/typed-telemetry-compatibility';
 import { env, reset, applyD1Migrations, type D1Migration } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -70,6 +71,16 @@ async function write(database:D1Database,f:Fixture,records:TelemetryV1Record[],s
 }
 async function both(f:Awaited<ReturnType<typeof pair>>,records:TelemetryV1Record[],stream:'quota'|'usage',seq=0){await write(source(),f.typed,records,stream,seq);await write(raw(),f.original,records,stream,seq);}
 const normalize=(rows:unknown[])=>JSON.parse(JSON.stringify(rows).replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g,'synthetic-device'));
+function observeAnalysisPlans(database:D1Database){const plans:{sql:string;details:string[]}[]=[];
+ const statement=(inner:D1PreparedStatement,sql:string,args:unknown[]=[]):D1PreparedStatement=>new Proxy(inner,{get(value,key){
+  if(key==='bind')return(...bindings:unknown[])=>statement(value.bind(...bindings),sql,bindings);
+  if(key==='all')return async(...call:unknown[])=>{if(sql.includes('typed_plan_input AS MATERIALIZED')||sql.includes('typed_quota_input AS MATERIALIZED')){
+   const explained=await database.prepare(`EXPLAIN QUERY PLAN ${sql}`).bind(...args).all<{detail:string}>();
+   plans.push({sql,details:explained.results.map(row=>row.detail)});}
+   return Reflect.apply(Reflect.get(value,key) as Function,value,call);};
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}});
+ return {database:new Proxy(database,{get(value,key){if(key==='prepare')return(sql:string)=>statement(value.prepare(sql),sql);
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}}),plans};}
 function quota(i:number,resetsAt=`${day()}T23:00:00.000Z`):TelemetryV1Record{return {schemaVersion:'quota-observation-v1.0',observationId:`synthetic-quota-${i.toString().padStart(8,'0')}`,
  observedTime:`${day()}T12:00:00.000Z`,provider:'openai_codex',planType:i%3?'pro':'plus',planVariant:'unknown',limitId:'codex',slot:'secondary',usedPercent:0.30000000000000004,windowDurationMinutes:10080,resetsAt};}
 function usage(i:number):TelemetryV1Record{return JSON.parse(telemetryV11LegacyProjection('usage',v11UsageRecord(day(),'a',{eventId:`event:v2:${i.toString(16).padStart(64,'0')}`}))!.canonicalRecord);}
@@ -87,6 +98,20 @@ describe('typed v1 existing analytical reader parity',()=>{
   expect(await source().prepare('SELECT count(*) n FROM telemetry_v1_quota_fit_rows').first('n')).toBe(0);
   expect(await backfillV1QuotaFitProjection(source())).toMatchObject({status:'complete',pagesRun:0,queriesUsed:2,throughRecordId:10});
   await expect(source().prepare('UPDATE typed_telemetry_quota SET analysis_source_row_id=999').run()).rejects.toThrow();
+ });
+ it('selects the typed reader when the isolated source has no legacy backfill singleton',async()=>{
+  const f=await pair();await both(f,[quota(0)],'quota');
+  await source().prepare('DELETE FROM telemetry_v1_quota_fit_backfill').run();
+  const reader=await createV1QuotaPageReader(source(),f.typed.participantId);
+  expect(await reader.readPlanPage({observedAt:`${day()}T00:00:00.000Z`,id:0},3)).toHaveLength(1);
+ });
+ it('fails closed when a bounded physical page has no compatibility admission',async()=>{
+  const f=await pair();await both(f,[quota(0)],'quota');
+  await source().prepare('DROP TRIGGER typed_v1_current_record_retained').run();
+  await source().prepare('DELETE FROM typed_v1_record_admissions').run();
+  const reader=await createV1QuotaPageReader(source(),f.typed.participantId);
+  await expect(reader.readPlanPage({observedAt:`${day()}T00:00:00.000Z`,id:0},3))
+   .rejects.toThrow('TYPED_V1_ANALYSIS_NOT_READY');
  });
  it('returns a complete5000-row usage page with the original JSON and two physical queries',async()=>{
   const f=await pair();for(let chunk=0;chunk<25;chunk++)await both(f,Array.from({length:200},(_,i)=>usage(chunk*200+i)),'usage',chunk);
@@ -107,7 +132,23 @@ describe('typed v1 existing analytical reader parity',()=>{
   const q=Array.from({length:34},(_,i)=>({...quota(i,at(168)),planType:'pro',observedTime:at(i/2),usedPercent:i*2.5})) as TelemetryV1Record[];
   const u=Array.from({length:33},(_,i)=>({...usage(i),eventTime:at(i/2+0.25)})) as TelemetryV1Record[];
   await both(f,q,'quota');await both(f,u,'usage');const options={nowMs:base+86400000};
-  const scalar=await accountScopedQuotaAnalysisV1(source(),f.typed.participantId,options);
+  const unrelated=await pair();
+  for(let chunk=0;chunk<5;chunk++)await write(source(),unrelated.typed,
+   Array.from({length:200},(_,i)=>quota(chunk*200+i+1000)),'quota',chunk);
+  await source().prepare('ANALYZE').run();
+  const observed=observeAnalysisPlans(source());
+  const scalar=await accountScopedQuotaAnalysisV1(observed.database,f.typed.participantId,options);
+  expect(observed.plans.map(plan=>plan.sql.includes('typed_plan_input AS MATERIALIZED')?'plan':'quota').sort()).toEqual(['plan','quota']);
+  for(const plan of observed.plans){
+   const ownerSeek=plan.details.findIndex(detail=>detail.includes('SEARCH base USING')&&detail.includes('typed_v1_owner_observed'));
+   const compatibilityRow=plan.details.findIndex(detail=>detail.includes('SEARCH r USING INTEGER PRIMARY KEY'));
+   const materializedScan=plan.details.findIndex(detail=>detail==='SCAN r');
+   expect(ownerSeek,JSON.stringify(plan.details)).toBeGreaterThan(-1);
+   expect(compatibilityRow,JSON.stringify(plan.details)).toBeGreaterThan(ownerSeek);
+   expect(materializedScan,JSON.stringify(plan.details)).toBeGreaterThan(compatibilityRow);
+   expect(plan.details.some(detail=>detail.includes('SCAN base'))).toBe(false);
+   expect(plan.details.some(detail=>detail.includes('sqlite_autoindex_typed_telemetry_records_1 (namespace_id='))).toBe(false);
+  }
   const clean=(value:object)=>{const {inputFingerprint,...rest}=value as Record<string,unknown>;if(inputFingerprint!==undefined)expect(inputFingerprint).toMatch(/^[0-9a-f]{64}$/);return rest;};
   expect(clean(scalar)).toEqual(clean(await accountScopedQuotaAnalysisV1(raw(),f.original.participantId,options)));
   expect(Reflect.get(scalar,'status')).not.toBe('not_testable');
@@ -116,13 +157,39 @@ describe('typed v1 existing analytical reader parity',()=>{
  });
  it('uses declared seek indexes before bounded compatibility expansion',async()=>{
   const f=await pair();await both(f,[quota(0)],'quota');await both(f,[usage(0)],'usage');
+  const unrelated=await pair();
+  for(let chunk=0;chunk<5;chunk++)await write(source(),unrelated.typed,
+   Array.from({length:200},(_,i)=>quota(chunk*200+i+1000)),'quota',chunk);
+  for(let chunk=0;chunk<5;chunk++)await write(source(),unrelated.typed,
+   Array.from({length:200},(_,i)=>usage(chunk*200+i+1000)),'usage',chunk);
+  await source().prepare('ANALYZE').run();
   const scope=(await loadTypedV1AnalysisScope(source(),f.typed.participantId))!;
   for(const [sql,args,index] of [
    [TYPED_V1_PLAN_PAGE_SQL,[scope.ownerId,Date.parse(`${day()}T12:00:00.000Z`),0,3],'typed_v1_owner_observed'],
+   [TYPED_V1_HISTORY_PLAN_PAGE_SQL,[scope.ownerId,Date.parse(`${day()}T12:00:00.000Z`),0,3,
+    Date.parse(`${day()}T23:59:59.999Z`)],'typed_v1_owner_observed'],
    [TYPED_V1_FIT_PAGE_SQL,[scope.ownerId,2,Date.parse(`${day()}T23:00:00.000Z`),Date.parse(`${day()}T12:00:00.000Z`),0,3],'typed_v1_quota_reset'],
    [TYPED_V1_USAGE_AT_TIME_SQL,[scope.ownerId,JSON.stringify([[f.typed.participantId,day(),f.typed.deviceId]]),Date.parse(`${day()}T12:05:00.000Z`),0,3],'typed_v1_owner_observed'],
   ] as const){const plan=await source().prepare(`EXPLAIN QUERY PLAN ${sql}`).bind(...args).all<{detail:string}>();
-   expect(plan.results.some(row=>row.detail.includes('SEARCH')&&row.detail.includes(index))).toBe(true);}
+   expect(plan.results.some(row=>row.detail.includes('SEARCH')&&row.detail.includes(index))).toBe(true);
+   if(sql===TYPED_V1_USAGE_AT_TIME_SQL){
+    const ownerSeek=plan.results.findIndex(row=>row.detail.includes('SEARCH base USING')&&row.detail.includes('typed_v1_owner_observed'));
+    const keyedExpansion=plan.results.findIndex(row=>row.detail.includes('SEARCH r USING INTEGER PRIMARY KEY'));
+    expect(ownerSeek,JSON.stringify(plan.results)).toBeGreaterThan(-1);
+    expect(keyedExpansion,JSON.stringify(plan.results)).toBeGreaterThan(ownerSeek);
+    expect(plan.results.some(row=>row.detail.includes('SCAN base'))).toBe(false);
+    expect(plan.results.some(row=>row.detail.includes('sqlite_autoindex_typed_telemetry_records_1 (namespace_id='))).toBe(false);
+   }else{
+    const pageScan=plan.results.findIndex(row=>row.detail==='SCAN page');
+    const keyedExpansion=plan.results.findIndex(row=>row.detail.includes('SEARCH r USING INTEGER PRIMARY KEY'));
+    expect(plan.results.some(row=>row.detail==='MATERIALIZE expanded')).toBe(true);
+    expect(pageScan).toBeGreaterThan(-1);
+    expect(keyedExpansion).toBeGreaterThan(pageScan);
+    expect(plan.results.some(row=>row.detail.includes('sqlite_autoindex_typed_telemetry_records_1 (namespace_id='))).toBe(false);
+    expect(plan.results.some(row=>row.detail.includes('MATERIALIZE typed_v1_current_records'))).toBe(false);
+    expect(plan.results.some(row=>row.detail.includes('SCAN typed_v1_current_records'))).toBe(false);
+   }
+  }
  });
  it('refuses unqualified analytical schema instead of returning an empty JSON result',async()=>{
   const f=await pair();await source().prepare('DROP TABLE typed_v1_analytical_schema').run();

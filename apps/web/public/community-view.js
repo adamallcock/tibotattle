@@ -75,6 +75,7 @@ const COMMUNITY_DAILY_NUMERIC_COLUMNS = Object.freeze(new Set([1, 2, 3, 4]));
 // Container-scoped interaction only: no response or point values are retained.
 // Replacing an unavailable view drops its state rather than reviving old data.
 const dailyDisclosureByContainer = new WeakMap();
+const cacheRetentionDisclosureByContainer = new WeakMap();
 const allowanceInspectionByContainer = new WeakMap();
 
 /**
@@ -760,6 +761,132 @@ function appendCommunityDailyChart({ documentRef, container, series, t }) {
   container.append(figure);
 }
 
+// The cache-retention lane. Band identifiers are contract values, never copy,
+// so every published band maps to its own translated label.
+const COMMUNITY_CACHE_RETENTION_BAND_KEYS = Object.freeze({
+  under_one_minute: "community.cacheRetention.band.underOneMinute",
+  one_to_two_minutes: "community.cacheRetention.band.oneToTwoMinutes",
+  two_to_five_minutes: "community.cacheRetention.band.twoToFiveMinutes",
+  five_to_ten_minutes: "community.cacheRetention.band.fiveToTenMinutes",
+  ten_to_thirty_minutes: "community.cacheRetention.band.tenToThirtyMinutes",
+  thirty_minutes_to_one_hour: "community.cacheRetention.band.thirtyMinutesToOneHour",
+  one_to_two_hours: "community.cacheRetention.band.oneToTwoHours",
+  two_to_six_hours: "community.cacheRetention.band.twoToSixHours",
+  six_to_twenty_four_hours: "community.cacheRetention.band.sixToTwentyFourHours",
+  over_twenty_four_hours: "community.cacheRetention.band.overTwentyFourHours",
+});
+
+const COMMUNITY_CACHE_RETENTION_COLUMN_KEYS = Object.freeze([
+  "community.cacheRetention.column.pause",
+  "community.cacheRetention.column.reusedMoreThanHalf",
+  "community.cacheRetention.column.matchedOrExceeded",
+  "community.cacheRetention.column.adjacencies",
+  "community.cacheRetention.column.sessions",
+  "community.cacheRetention.column.contributors",
+  "community.cacheRetention.column.topContributorShare",
+]);
+
+/**
+ * A rate the lane declined to publish stays the shared em-dash, exactly as the
+ * neighbouring cards render an unavailable number. A measured zero formats as
+ * `0%` and must never collapse into the same glyph.
+ */
+function retentionRate(value) {
+  return value === null
+    ? compact(null)
+    : numberFormatter({ style: "percent", maximumFractionDigits: 1 }).format(value);
+}
+
+/**
+ * Renders the community cache-retention bands. A band with no measured gap is
+ * still listed, with its counts at zero and its rates as the unavailable
+ * em-dash: dropping thin or empty bands would turn missing evidence into an
+ * apparent floor, and rendering their rates as 0% would turn it into an
+ * apparent absence of reuse.
+ */
+function appendCommunityCacheRetention({ documentRef, container, retention, t, wasOpen }) {
+  const { node } = createDomHelpers(documentRef);
+  const disclosure = node("details", "journey-disclosure snapshot-breakdown");
+  disclosure.open = wasOpen;
+  const summary = node("summary");
+  summary.append(node("span", "", t("community.cacheRetention.summary")));
+  disclosure.append(summary);
+  // The measurement caveats travel with the numbers rather than sitting
+  // outside the disclosure, so a reader cannot reach a rate without them.
+  disclosure.append(
+    node("p", "snapshot-disclosure", t("community.cacheRetention.measuresCopy")),
+    node("p", "snapshot-disclosure", t("community.cacheRetention.gapBasisCaveat")),
+  );
+
+  const wrap = node("div", "table-wrap snapshot-table");
+  const table = documentRef.createElement("table");
+  table.append(node("caption", "sr-only", t("community.cacheRetention.caption")));
+  const thead = documentRef.createElement("thead");
+  const header = documentRef.createElement("tr");
+  COMMUNITY_CACHE_RETENTION_COLUMN_KEYS.forEach((key, index) => {
+    const th = documentRef.createElement("th");
+    th.scope = "col";
+    if (index > 0) th.className = "numeric";
+    th.textContent = t(key);
+    header.append(th);
+  });
+  thead.append(header);
+  const tbody = documentRef.createElement("tbody");
+  for (const band of retention.bands) {
+    const row = documentRef.createElement("tr");
+    const identity = documentRef.createElement("th");
+    identity.scope = "row";
+    identity.textContent = t(COMMUNITY_CACHE_RETENTION_BAND_KEYS[band.band]);
+    row.append(identity);
+    const cells = [
+      retentionRate(band.reusedMoreThanHalfRate),
+      retentionRate(band.matchedOrExceededRate),
+      compact(band.adjacencies),
+      compact(band.sessions),
+      compact(band.contributors),
+      retentionRate(band.topContributorShare),
+    ];
+    cells.forEach((value, index) => {
+      const cell = documentRef.createElement("td");
+      cell.className = "numeric";
+      // Narrow layouts stack each row into a labelled card; the label is the
+      // translated column header carried on the cell itself.
+      cell.setAttribute(
+        "data-label",
+        t(COMMUNITY_CACHE_RETENTION_COLUMN_KEYS[index + 1] ?? ""),
+      );
+      cell.textContent = value;
+      row.append(cell);
+    });
+    tbody.append(row);
+  }
+  table.append(thead, tbody);
+  wrap.append(table);
+  disclosure.append(wrap);
+
+  if (retention.bands.some((band) => band.adjacencies === 0)) {
+    disclosure.append(node("p", "annotation", t("community.cacheRetention.noEvidenceNote")));
+  }
+  // What the two rate columns are a fraction OF. Without this a reader has to
+  // guess the referent, and the likeliest guess -- the whole prompt prefix --
+  // is the wrong one.
+  disclosure.append(node("p", "annotation", t("community.cacheRetention.columnNote")));
+  disclosure.append(node("p", "annotation", t("community.cacheRetention.concentrationNote")));
+  const excluded = retention.bands.reduce((total, band) => total
+    + band.excludedInsufficientEvidence
+    + band.excludedContextContracted
+    + band.unorderedTies, 0);
+  if (excluded > 0) {
+    disclosure.append(node("p", "annotation", t("community.cacheRetention.excludedNote", {
+      insufficient: compact(retention.bands.reduce((total, band) => total + band.excludedInsufficientEvidence, 0)),
+      contracted: compact(retention.bands.reduce((total, band) => total + band.excludedContextContracted, 0)),
+      ties: compact(retention.bands.reduce((total, band) => total + band.unorderedTies, 0)),
+    })));
+  }
+  container.append(disclosure);
+  return disclosure;
+}
+
 /**
  * Renders the day-partitioned community series. Publication revisions remain
  * part of the read contract, but the reader-facing summary describes the
@@ -788,7 +915,10 @@ export function renderCommunityDailySeries({
   const locale = documentRef?.documentElement?.lang ?? "en-US";
   const t = (key, values = {}) => translate(key, values, locale);
   const wasOpen = dailyDisclosureByContainer.get(container)?.open === true;
+  const retentionWasOpen =
+    cacheRetentionDisclosureByContainer.get(container)?.open === true;
   dailyDisclosureByContainer.delete(container);
+  cacheRetentionDisclosureByContainer.delete(container);
   clear(container);
   const series = normalizeCommunityDailySeries(payload);
   const retained = cachedEvidence(cache);
@@ -938,6 +1068,18 @@ export function renderCommunityDailySeries({
   // across refreshes — leading with a second `details` would shadow it.
   container.append(sourceDisclosureDetails(node, t, ["community.daily.recomputeNote"]));
   dailyDisclosureByContainer.set(container, breakdown);
+
+  // Optional and community-wide: absent until the lane publishes, and an
+  // absent lane leaves the rest of the day series untouched.
+  if (series.cacheRetention !== null) {
+    cacheRetentionDisclosureByContainer.set(container, appendCommunityCacheRetention({
+      documentRef,
+      container,
+      retention: series.cacheRetention,
+      t,
+      wasOpen: retentionWasOpen,
+    }));
+  }
   return series.state;
 }
 

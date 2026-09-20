@@ -13,10 +13,11 @@ test('actual restored accountless source completes replay, independent analytics
  const directory=join(root,'operation');const result=await rehearseStorageRestore({workerRoot,directory,records:3,allowUnfrozen:true});
  assert.equal(result.qualifiedRestoreBase,false);assert.equal(result.runtimeReady,false);
  const bytes=await readFile(join(directory,'restored-runtime-evidence.json'));const proof=JSON.parse(bytes);
+ assert.equal(proof.schema,'d1-storage-restored-runtime-v2');
  const restore=JSON.parse(await readFile(join(directory,'qualification-evidence.json')));
  assert.equal(storageSha256(bytes),restore.restoredRuntimeEvidenceSha256);
  for(const name of ['credentialsPreserved','acceptedReceiptReplayVerified','newUploadAccepted','journalDrained','dailyValuesExact',
-  'retainedTombstoneSuppressed','optOutImmediate','revokedCredentialsRefused','physicalErasureComplete','independentLedgerPreserved','sourceUnchanged'])assert.equal(proof[name],true,name);
+  'retainedTombstoneSuppressed','optOutImmediate','optOutRetainsAcceptedHistory','revokedCredentialsRefused','physicalErasureComplete','independentLedgerPreserved','sourceUnchanged'])assert.equal(proof[name],true,name);
  assert.equal(proof.recordsBefore,3);assert.equal(proof.recordsAfterAccepted,4);assert.equal(proof.remoteOperations,false);
  assert.ok(restore.restoreElapsedMs>0);assert.ok(restore.runtimeElapsedMs>0);
 });

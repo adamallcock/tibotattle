@@ -12,6 +12,7 @@ import { connectCdp, selectMacDashboardTarget, selectMacSettingsTarget, waitFor 
 import { desktopFirstRunDialogCopy, validateDesktopFirstRunReceipt } from '../apps/electron/desktop-first-run.js';
 import { classifyDesktopSharingInstallation } from '../apps/electron/desktop-sharing-installation.js';
 import { verifySignedStagingLaunchInputs, prepareSignedStagingDisposableProfile, parseSignedStagingConsumerArguments } from './consume-signed-electron-staging.mjs';
+import { macOSLoopbackLaunch, MACOS_LOOPBACK_MODE } from './lib/macos-loopback-qualification.mjs';
 
 export const SIGNED_STAGING_EXECUTION_SCHEMA = 'tibotattle-signed-staging-execution-v1';
 const OPERATION = 10_000;
@@ -154,41 +155,74 @@ export function assertSignedStagingFreshProjection(sharing, receipt) {
   return true;
 }
 
-async function launch(verified, environment, { untouched = false } = {}) {
+async function launch(verified, environment, { untouched = false, onFailure, launchServices = false,
+  networkMode = null, observeBeforeDashboard } = {}) {
+  if (networkMode !== null && networkMode !== MACOS_LOOPBACK_MODE) fail('network_policy');
+  if (networkMode !== null && launchServices) fail('network_policy');
+  if (observeBeforeDashboard !== undefined && (networkMode !== MACOS_LOOPBACK_MODE
+    || typeof observeBeforeDashboard !== 'function')) fail('startup_observer');
   // Same-identity handover/SingleInstanceLock must never attach to a pre-existing app.
   if (processTable().some((row) => /\/TiboTattle(?: Dev)?\.app\/Contents\/MacOS\/TiboTattle(?: Dev)?$/u.test(row.command))) fail('preexisting_app');
   const port = await freePort();
-  const child = spawn(verified.executable, ['--remote-debugging-port=' + port, '--remote-debugging-address=127.0.0.1'],
-    { cwd: verified.appPath, env: environment, detached: true, stdio: 'ignore' });
+  const argumentsList = ['--remote-debugging-port=' + port, '--remote-debugging-address=127.0.0.1'];
+  const direct = networkMode === null ? { executable: verified.executable, args: argumentsList }
+    : macOSLoopbackLaunch(verified.executable, argumentsList, networkMode);
+  const child = launchServices
+    ? spawn('/usr/bin/open', ['-W', '-n', verified.appPath, '--args', ...argumentsList],
+      { cwd: verified.appPath, env: environment, detached: true, stdio: 'ignore' })
+    : spawn(direct.executable, direct.args,
+      { cwd: verified.appPath, env: environment, detached: true, stdio: 'ignore' });
   let exited = false;
   let spawnFailed = false;
   child.once('exit', () => { exited = true; });
   child.once('error', () => { spawnFailed = true; });
   const state = { child, pid: child.pid, sessions: [], groupVerified: false,
     stopped: () => exited || spawnFailed };
+  let launchStage = 'process_group';
   try {
     await waitFor(() => {
       if (state.stopped()) fail('startup');
-      const row = processTable().find((entry) => entry.pid === child.pid);
+      const entries = processTable();
+      if (launchServices) {
+        const matches = entries.filter((entry) => entry.command === verified.executable);
+        if (matches.length !== 1 || matches[0].group !== matches[0].pid) return false;
+        state.pid = matches[0].pid;
+        return true;
+      }
+      const row = entries.find((entry) => entry.pid === child.pid);
       return row?.group === child.pid && row.command === verified.executable;
     }, OPERATION, 'process group');
     state.groupVerified = true;
+    // The callback observes only this verified owned PID. Qualification can
+    // inspect the real pre-dashboard native refusal without injecting a backend.
+    if (observeBeforeDashboard) {
+      state.startupObservation = await observeBeforeDashboard(state.pid);
+      if (state.startupObservation !== null) return state;
+    }
     if (untouched) await continueNativeIntro(state, verified);
-    await waitFor(() => listenerOwned(child.pid, port), STARTUP, 'owned debugger');
+    launchStage = 'owned_debugger';
+    await waitFor(() => listenerOwned(state.pid, port), STARTUP, 'owned debugger');
+    launchStage = 'dashboard_target';
     const target = await waitFor(async () => selectMacDashboardTarget(await json(`http://127.0.0.1:${port}/json/list`), port), STARTUP, 'dashboard target');
     const dashboard = await connectCdp(target);
+    state.dashboard = dashboard;
     state.sessions.push(dashboard);
+    launchStage = 'dashboard_ready';
     await waitFor(() => dashboard.evaluate('document.readyState === "complete" && document.title === "TiboTattle" && typeof globalThis.tibotattleDesktop?.getSharingPreference === "function"'), STARTUP, 'dashboard ready');
     // Settings methods remain restricted to the actual Settings frame.
     await dashboard.evaluate('globalThis.tibotattleDesktop.openSettings()');
     const origin = new URL(target.url).origin;
+    launchStage = 'settings_target';
     const settingsTarget = await waitFor(async () => selectMacSettingsTarget(await json(`http://127.0.0.1:${port}/json/list`), origin, port), STARTUP, 'settings target');
     state.settings = await connectCdp(settingsTarget);
     state.sessions.push(state.settings);
+    launchStage = 'settings_ready';
     await waitFor(() => state.settings.evaluate('typeof globalThis.tibotattleDesktop?.getSharingPreference === "function"'), STARTUP, 'settings ready');
     state.readSharing = () => state.settings.evaluate('globalThis.tibotattleDesktop.getSharingPreference()');
     return state;
   } catch (error) {
+    error.signedLaunchStage = launchStage;
+    if (onFailure) { try { await onFailure({ pid: state.pid, stage: launchStage }); } catch {} }
     const stopped = await stop(state);
     error.ownedMacProcessesStopped = stopped === true;
     throw error;

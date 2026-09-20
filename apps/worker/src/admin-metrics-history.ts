@@ -25,6 +25,8 @@ import { isCurrentCommunityAllowancePublication,
   type CommunityAllowancePublicationStateRow } from "./community-daily-aggregates";
 import { QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS } from "./constants";
 import { ApiError } from "./errors";
+import { readPublishedStorageCommunityAdminPreview } from "./storage-community-graph-publication";
+import type { StorageAnalyticsBindings } from "./analytics-delivery";
 
 export const ADMIN_METRICS_HISTORY_SCHEMA_VERSION = "admin-metrics-history-v0.2";
 
@@ -53,6 +55,10 @@ const SNAPSHOT_RESULT_LIMIT = 400;
 // The gauge JSON is a small flat object; anything larger than this is a bug
 // in the capture path, and refusing the write beats growing rows unbounded.
 const SNAPSHOT_JSON_LIMIT_BYTES = 4_000;
+// Typed-storage maintenance runs alongside journal catch-up. It may inspect
+// retained operational headers, never an unbounded raw-record corpus. Refuse a
+// publication when an exact source series exceeds this explicit scan bound.
+const STORAGE_ADMIN_SOURCE_ROW_LIMIT = 10_000;
 
 interface DayCountRow {
   day: string;
@@ -131,33 +137,48 @@ async function eventSeries(
     nowEpoch: number;
     // COUNT(*) unless given: an aggregate over rows in the bucket.
     bucketExpression?: string;
+    maximumRows?: number;
   },
 ): Promise<AdminEventSeries> {
-  const { table, timestampColumn, nowEpoch } = options;
+  const { table, timestampColumn, nowEpoch, maximumRows } = options;
   const expression = options.bucketExpression ?? "COUNT(*)";
+  if (maximumRows !== undefined && expression !== "COUNT(*)") {
+    throw new Error("bounded event expression unavailable");
+  }
+  const relation = maximumRows === undefined ? table : "source_rows";
+  const sourceCte = maximumRows === undefined ? "" : `WITH source_rows AS (
+    SELECT ${timestampColumn} FROM ${table}
+     WHERE ${timestampColumn} IS NOT NULL
+     ORDER BY ${timestampColumn} DESC LIMIT ${maximumRows + 1}
+  ) `;
   const since24h = iso(nowEpoch - DAY_MILLISECONDS);
   const since48h = iso(nowEpoch - 2 * DAY_MILLISECONDS);
   const recentDayStart = recentCalendarDayStart(nowEpoch);
   const [byDay, windows] = await Promise.all([
     db.prepare(
-      `SELECT substr(${timestampColumn}, 1, 10) AS day, ${expression} AS n
-         FROM ${table}
+      `${sourceCte}SELECT substr(${timestampColumn}, 1, 10) AS day, ${expression} AS n
+         FROM ${relation}
         WHERE ${timestampColumn} IS NOT NULL
           AND ${timestampColumn} >= ?1
         GROUP BY substr(${timestampColumn}, 1, 10)
         ORDER BY day`,
     ).bind(recentDayStart).all<DayCountRow>(),
     db.prepare(
-      `SELECT
-         (SELECT ${expression} FROM ${table}
+      `${sourceCte}SELECT
+         (SELECT ${expression} FROM ${relation}
            WHERE ${timestampColumn} IS NOT NULL) AS total,
-         (SELECT ${expression} FROM ${table}
+         (SELECT ${expression} FROM ${relation}
            WHERE ${timestampColumn} >= ?1) AS last24,
-         (SELECT ${expression} FROM ${table}
-           WHERE ${timestampColumn} >= ?2 AND ${timestampColumn} < ?1) AS prev24`,
+         (SELECT ${expression} FROM ${relation}
+           WHERE ${timestampColumn} >= ?2 AND ${timestampColumn} < ?1) AS prev24,
+         (SELECT COUNT(*) FROM ${relation}) AS scanned_rows`,
     ).bind(since24h, since48h)
-      .first<{ total: number; last24: number; prev24: number }>(),
+      .first<{ total: number; last24: number; prev24: number; scanned_rows: number }>(),
   ]);
+  if (maximumRows !== undefined
+      && Number(windows?.scanned_rows ?? maximumRows + 1) > maximumRows) {
+    throw new Error("admin metric source bound exceeded");
+  }
   return {
     total: Number(windows?.total ?? 0),
     last24Hours: Number(windows?.last24 ?? 0),
@@ -235,6 +256,8 @@ function seriesFromV1Rows(
 async function v1UploadEventSeries(
   db: D1Database,
   nowEpoch: number,
+  maximumRows?: number,
+  includeV11 = false,
 ): Promise<{
   uploadedChunks: AdminEventSeries;
   uploadedRecords: AdminEventSeries;
@@ -243,20 +266,33 @@ async function v1UploadEventSeries(
   const since24h = iso(nowEpoch - DAY_MILLISECONDS);
   const since48h = iso(nowEpoch - 2 * DAY_MILLISECONDS);
   const recentDayStart = recentCalendarDayStart(nowEpoch);
+  const relation = maximumRows === undefined && !includeV11
+    ? "telemetry_v1_chunks" : "source_rows";
+  const sourceCte = includeV11 ? `WITH source_rows AS (
+    SELECT created_at,accepted_record_count AS record_count,participant_id
+      FROM telemetry_v1_chunks WHERE created_at IS NOT NULL
+    UNION ALL
+    SELECT created_at,record_count,participant_id
+      FROM telemetry_v11_chunks WHERE created_at IS NOT NULL
+  ) ` : maximumRows === undefined ? "" : `WITH source_rows AS (
+    SELECT created_at,record_count,participant_id FROM telemetry_v1_chunks
+     WHERE created_at IS NOT NULL
+     ORDER BY created_at DESC LIMIT ${maximumRows + 1}
+  ) `;
   const [byDay, windows] = await Promise.all([
     db.prepare(
-      `SELECT substr(created_at, 1, 10) AS day,
+      `${sourceCte}SELECT substr(created_at, 1, 10) AS day,
               COUNT(*) AS chunks,
               COALESCE(SUM(record_count), 0) AS records,
               COUNT(DISTINCT participant_id) AS participants
-         FROM telemetry_v1_chunks
+         FROM ${relation}
         WHERE created_at IS NOT NULL
           AND created_at >= ?1
         GROUP BY substr(created_at, 1, 10)
         ORDER BY day`,
     ).bind(recentDayStart).all<V1UploadDayRow>(),
     db.prepare(
-      `SELECT
+      `${sourceCte}SELECT
          COUNT(*) AS chunks_total,
          COALESCE(SUM(CASE WHEN created_at >= ?1 THEN 1 ELSE 0 END), 0)
            AS chunks_last24,
@@ -271,12 +307,17 @@ async function v1UploadEventSeries(
          COUNT(DISTINCT CASE WHEN created_at >= ?1 THEN participant_id END)
            AS participants_last24,
          COUNT(DISTINCT CASE WHEN created_at >= ?2 AND created_at < ?1
-           THEN participant_id END) AS participants_prev24
-         FROM telemetry_v1_chunks
+           THEN participant_id END) AS participants_prev24,
+         COUNT(*) AS scanned_rows
+         FROM ${relation}
         WHERE created_at IS NOT NULL`,
     ).bind(since24h, since48h)
-      .first<V1UploadWindowRow>(),
+      .first<V1UploadWindowRow & { scanned_rows: number }>(),
   ]);
+  if (maximumRows !== undefined
+      && Number(windows?.scanned_rows ?? maximumRows + 1) > maximumRows) {
+    throw new Error("admin metric source bound exceeded");
+  }
   return {
     uploadedChunks: seriesFromV1Rows(
       byDay.results,
@@ -302,30 +343,42 @@ async function v1UploadEventSeries(
 async function acceptedTelemetryUploadEventSeries(
   db: D1Database,
   nowEpoch: number,
+  maximumRows?: number,
 ): Promise<AdminEventSeries> {
   const since24h = iso(nowEpoch - DAY_MILLISECONDS);
   const since48h = iso(nowEpoch - 2 * DAY_MILLISECONDS);
   const recentDayStart = recentCalendarDayStart(nowEpoch);
+  const relation = maximumRows === undefined ? "telemetry_contributions" : "source_rows";
+  const sourceCte = maximumRows === undefined ? "" : `WITH source_rows AS (
+    SELECT created_at,status FROM telemetry_contributions
+     WHERE status='accepted' AND created_at IS NOT NULL
+     ORDER BY created_at DESC LIMIT ${maximumRows + 1}
+  ) `;
   const [byDay, windows] = await Promise.all([
     db.prepare(
-      `SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS n
-         FROM telemetry_contributions
+      `${sourceCte}SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS n
+         FROM ${relation}
         WHERE status = 'accepted' AND created_at IS NOT NULL
           AND created_at >= ?1
         GROUP BY substr(created_at, 1, 10)
         ORDER BY day`,
     ).bind(recentDayStart).all<DayCountRow>(),
     db.prepare(
-      `SELECT COUNT(*) AS total,
+      `${sourceCte}SELECT COUNT(*) AS total,
               COALESCE(SUM(CASE WHEN created_at >= ?1 THEN 1 ELSE 0 END), 0)
                 AS last24,
               COALESCE(SUM(CASE WHEN created_at >= ?2 AND created_at < ?1
-                THEN 1 ELSE 0 END), 0) AS prev24
-         FROM telemetry_contributions
+                THEN 1 ELSE 0 END), 0) AS prev24,
+              COUNT(*) AS scanned_rows
+         FROM ${relation}
         WHERE status = 'accepted' AND created_at IS NOT NULL`,
     ).bind(since24h, since48h)
-      .first<{ total: number; last24: number; prev24: number }>(),
+      .first<{ total: number; last24: number; prev24: number; scanned_rows: number }>(),
   ]);
+  if (maximumRows !== undefined
+      && Number(windows?.scanned_rows ?? maximumRows + 1) > maximumRows) {
+    throw new Error("admin metric source bound exceeded");
+  }
   return {
     total: Number(windows?.total ?? 0),
     last24Hours: Number(windows?.last24 ?? 0),
@@ -365,6 +418,20 @@ export async function readAdminMetricsHistory(
   db: D1Database,
   nowEpoch: number,
 ): Promise<AdminMetricsHistory> {
+  return buildAdminMetricsHistory(
+    db,
+    readGaugeSnapshots(db, nowEpoch),
+    nowEpoch,
+  );
+}
+
+async function buildAdminMetricsHistory(
+  source: D1Database,
+  snapshotsPromise: Promise<AdminMetricsHistory["gauges"]["snapshots"]>,
+  nowEpoch: number,
+  maximumRows?: number,
+  includeV11 = false,
+): Promise<AdminMetricsHistory> {
   const [
     participants,
     webSessions,
@@ -376,19 +443,25 @@ export async function readAdminMetricsHistory(
     downloads,
     snapshots,
   ] = await Promise.all([
-    eventSeries(db, { table: "participants", timestampColumn: "created_at", nowEpoch }),
-    eventSeries(db, { table: "web_sessions", timestampColumn: "issued_at", nowEpoch }),
-    eventSeries(db, { table: "device_pairings", timestampColumn: "issued_at", nowEpoch }),
-    eventSeries(db, { table: "device_credentials", timestampColumn: "issued_at", nowEpoch }),
-    eventSeries(db, {
+    eventSeries(source, { table: "participants", timestampColumn: "created_at", nowEpoch, maximumRows }),
+    eventSeries(source, { table: "web_sessions", timestampColumn: "issued_at", nowEpoch, maximumRows }),
+    eventSeries(source, { table: "device_pairings", timestampColumn: "issued_at", nowEpoch, maximumRows }),
+    eventSeries(source, { table: "device_credentials", timestampColumn: "issued_at", nowEpoch, maximumRows }),
+    eventSeries(source, {
       table: "telemetry_v1_device_consents",
       timestampColumn: "consented_at",
       nowEpoch,
+      maximumRows,
     }),
-    v1UploadEventSeries(db, nowEpoch),
-    acceptedTelemetryUploadEventSeries(db, nowEpoch),
-    downloadSeries(db, nowEpoch),
-    readGaugeSnapshots(db, nowEpoch),
+    v1UploadEventSeries(
+      source,
+      nowEpoch,
+      includeV11 ? undefined : maximumRows,
+      includeV11,
+    ),
+    acceptedTelemetryUploadEventSeries(source, nowEpoch, maximumRows),
+    downloadSeries(source, nowEpoch),
+    snapshotsPromise,
   ]);
   const acceptedUploads = addEventSeries(
     v1Uploads.uploadedChunks,
@@ -411,6 +484,22 @@ export async function readAdminMetricsHistory(
     downloads,
     gauges: { snapshots },
   };
+}
+
+/** Scheduled typed-storage builder. Operational tables retain their explicit
+ * row bound. Compact v1/v1.1 upload headers are aggregated exactly so a large
+ * recovered corpus does not make the cache permanently unavailable. */
+async function readStorageAdminMetricsHistory(
+  bindings: StorageAnalyticsBindings,
+  nowEpoch: number,
+): Promise<AdminMetricsHistory> {
+  return buildAdminMetricsHistory(
+    bindings.source,
+    readStorageGaugeSnapshots(bindings.target, bindings.sourceId, nowEpoch),
+    nowEpoch,
+    STORAGE_ADMIN_SOURCE_ROW_LIMIT,
+    true,
+  );
 }
 
 const ADMIN_EVENT_SERIES_NAMES = Object.freeze([
@@ -639,6 +728,29 @@ function cacheUnavailable(): never {
   throw new ApiError(503, "ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE");
 }
 
+function parseCachedHistoryRow(
+  row: { generated_at: string; payload_json: string } | null,
+  nowEpoch: number,
+): AdminMetricsHistory {
+  if (row === null
+      || typeof row.generated_at !== "string"
+      || typeof row.payload_json !== "string"
+      || new TextEncoder().encode(row.payload_json).byteLength
+        > HISTORY_CACHE_JSON_LIMIT_BYTES) {
+    return cacheUnavailable();
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.payload_json);
+  } catch {
+    return cacheUnavailable();
+  }
+  if (!validCachedAdminMetricsHistory(parsed, row.generated_at, nowEpoch)) {
+    return cacheUnavailable();
+  }
+  return parsed;
+}
+
 /**
  * The interactive owner route's complete data path after authentication: one
  * bounded SELECT from the singleton aggregate cache. It never rebuilds,
@@ -660,23 +772,30 @@ export async function readCachedAdminMetricsHistory(
   } catch {
     throw new ApiError(503, "ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE");
   }
-  if (row === null
-      || typeof row.generated_at !== "string"
-      || typeof row.payload_json !== "string"
-      || new TextEncoder().encode(row.payload_json).byteLength
-        > HISTORY_CACHE_JSON_LIMIT_BYTES) {
-    return cacheUnavailable();
-  }
-  let parsed: unknown;
+  return parseCachedHistoryRow(row, nowEpoch);
+}
+
+/** Typed interactive route: one target SELECT, pinned to the exact registered
+ * source. Source authority resolution happens before this helper is called. */
+export async function readCachedStorageAdminMetricsHistory(
+  bindings: StorageAnalyticsBindings,
+  nowEpoch: number,
+): Promise<AdminMetricsHistory> {
+  let row: { generated_at: string; payload_json: string } | null;
   try {
-    parsed = JSON.parse(row.payload_json);
+    row = await bindings.target.prepare(
+      `SELECT cache.generated_at,cache.payload_json
+         FROM analytics_admin_metrics_history_cache cache
+         JOIN analytics_runtime_sources source ON source.source_id=cache.source_id
+        WHERE cache.source_id=?1 AND source.source_namespace=?2
+          AND source.contract_version=1 AND length(cache.payload_json)<=?3
+        LIMIT 1`,
+    ).bind(bindings.sourceId, bindings.sourceNamespace, HISTORY_CACHE_JSON_LIMIT_BYTES)
+      .first<{ generated_at: string; payload_json: string }>();
   } catch {
-    return cacheUnavailable();
+    throw new ApiError(503, "ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE");
   }
-  if (!validCachedAdminMetricsHistory(parsed, row.generated_at, nowEpoch)) {
-    return cacheUnavailable();
-  }
-  return parsed;
+  return parseCachedHistoryRow(row, nowEpoch);
 }
 
 export interface AdminMetricsHistoryCacheResult {
@@ -684,6 +803,23 @@ export interface AdminMetricsHistoryCacheResult {
     | "HISTORY_CACHE_REFRESHED"
     | "HISTORY_CACHE_CURRENT"
     | "HISTORY_CACHE_UNAVAILABLE";
+}
+
+async function storageAdminSourceMatches(
+  bindings: StorageAnalyticsBindings,
+): Promise<boolean> {
+  if (bindings.source === bindings.target) return false;
+  const ready = await bindings.source.prepare(
+    `SELECT 1 AS ready FROM storage_source_state source
+       JOIN typed_v1_admission_state v1 ON v1.id=1
+         AND v1.runtime_contract_version=1
+       JOIN typed_v11_admission_state v11 ON v11.id=1
+         AND v11.runtime_contract_version=1
+      WHERE source.singleton=1 AND source.source_id=?1
+        AND v1.source_namespace=?2 AND v11.source_namespace=?2
+      LIMIT 1`,
+  ).bind(bindings.sourceId, bindings.sourceNamespace).first<number>("ready");
+  return ready === 1;
 }
 
 /**
@@ -736,6 +872,75 @@ export async function warmAdminMetricsHistoryCache(
          generated_at = excluded.generated_at,
          payload_json = excluded.payload_json`,
     ).bind(history.generatedAt, payloadJson).run();
+    return write.meta.changes === 1
+      ? { code: "HISTORY_CACHE_REFRESHED" }
+      : { code: "HISTORY_CACHE_UNAVAILABLE" };
+  } catch {
+    return { code: "HISTORY_CACHE_UNAVAILABLE" };
+  }
+}
+
+/** Typed scheduled cache refresh. Retained events come from ingestion while
+ * the aggregate cache and its post-migration gauge history stay in analytics. */
+export async function warmStorageAdminMetricsHistoryCache(
+  bindings: StorageAnalyticsBindings,
+  nowEpoch: number,
+): Promise<AdminMetricsHistoryCacheResult> {
+  try {
+    if (!await storageAdminSourceMatches(bindings)) {
+      return { code: "HISTORY_CACHE_UNAVAILABLE" };
+    }
+    const existing = await bindings.target.prepare(
+      `SELECT cache.generated_at,cache.payload_json
+         FROM analytics_runtime_sources source
+         LEFT JOIN analytics_admin_metrics_history_cache cache
+           ON cache.source_id=source.source_id
+        WHERE source.source_id=?1 AND source.source_namespace=?2
+          AND source.contract_version=1
+          AND (cache.payload_json IS NULL OR length(cache.payload_json)<=?3)
+        LIMIT 1`,
+    ).bind(bindings.sourceId, bindings.sourceNamespace, HISTORY_CACHE_JSON_LIMIT_BYTES)
+      .first<{ generated_at: string | null; payload_json: string | null }>();
+    if (existing === null) return { code: "HISTORY_CACHE_UNAVAILABLE" };
+    const existingEpoch = Date.parse(existing.generated_at ?? "");
+    let existingPayload: unknown = null;
+    try {
+      existingPayload = JSON.parse(existing.payload_json ?? "");
+    } catch {
+      // A corrupt cache is rebuilt immediately when bounded source evidence is
+      // available; it is never served merely because it is recent.
+    }
+    if (typeof existing.generated_at === "string"
+        && Number.isFinite(existingEpoch)
+        && existingEpoch <= nowEpoch + HISTORY_CACHE_MAX_FUTURE_SKEW_MILLISECONDS
+        && nowEpoch - existingEpoch < HISTORY_CACHE_MIN_INTERVAL_MILLISECONDS
+        && validCachedAdminMetricsHistory(
+          existingPayload,
+          existing.generated_at,
+          nowEpoch,
+        )) {
+      return { code: "HISTORY_CACHE_CURRENT" };
+    }
+
+    const history = await readStorageAdminMetricsHistory(bindings, nowEpoch);
+    // Gauge history starts at the first successful typed capture. An empty
+    // target must remain unavailable rather than look like proven zero history.
+    if (history.gauges.snapshots.length === 0) {
+      return { code: "HISTORY_CACHE_UNAVAILABLE" };
+    }
+    const payloadJson = JSON.stringify(history);
+    if (new TextEncoder().encode(payloadJson).byteLength
+          > HISTORY_CACHE_JSON_LIMIT_BYTES
+        || !validCachedAdminMetricsHistory(history, history.generatedAt, nowEpoch)) {
+      return { code: "HISTORY_CACHE_UNAVAILABLE" };
+    }
+    const write = await bindings.target.prepare(
+      `INSERT INTO analytics_admin_metrics_history_cache(
+         source_id,generated_at,payload_json
+       ) VALUES(?1,?2,?3)
+       ON CONFLICT(source_id) DO UPDATE SET
+         generated_at=excluded.generated_at,payload_json=excluded.payload_json`,
+    ).bind(bindings.sourceId, history.generatedAt, payloadJson).run();
     return write.meta.changes === 1
       ? { code: "HISTORY_CACHE_REFRESHED" }
       : { code: "HISTORY_CACHE_UNAVAILABLE" };
@@ -798,6 +1003,51 @@ async function readGaugeSnapshots(
   }
 }
 
+async function readStorageGaugeSnapshots(
+  db: D1Database,
+  sourceId: string,
+  nowEpoch: number,
+): Promise<AdminMetricsHistory["gauges"]["snapshots"]> {
+  const fullResolutionSince = iso(
+    nowEpoch - SNAPSHOT_FULL_RESOLUTION_DAYS * DAY_MILLISECONDS,
+  );
+  const historySince = iso(
+    nowEpoch - SNAPSHOT_HISTORY_DAYS * DAY_MILLISECONDS,
+  );
+  const rows = await db.prepare(
+    `SELECT captured_at,metrics_json FROM (
+       SELECT captured_at,metrics_json
+         FROM analytics_admin_metric_snapshots
+        WHERE source_id=?1 AND captured_at>=?2
+       UNION ALL
+       SELECT captured_at,metrics_json
+         FROM analytics_admin_metric_snapshots
+        WHERE source_id=?1 AND captured_at>=?3 AND captured_at<?2
+          AND captured_at IN (
+            SELECT MAX(captured_at) FROM analytics_admin_metric_snapshots
+             WHERE source_id=?1 AND captured_at>=?3 AND captured_at<?2
+             GROUP BY substr(captured_at,1,10)
+          )
+       ORDER BY captured_at DESC LIMIT ?4
+     ) ORDER BY captured_at`,
+  ).bind(sourceId, fullResolutionSince, historySince, SNAPSHOT_RESULT_LIMIT)
+    .all<{ captured_at: string; metrics_json: string }>();
+  const snapshots: AdminMetricsHistory["gauges"]["snapshots"] = [];
+  for (const row of rows.results) {
+    try {
+      const metrics = JSON.parse(row.metrics_json) as Record<string, unknown>;
+      const clean: Record<string, number> = {};
+      for (const [key, value] of Object.entries(metrics)) {
+        if (typeof value === "number" && Number.isFinite(value)) clean[key] = value;
+      }
+      snapshots.push({ capturedAt: row.captured_at, metrics: clean });
+    } catch {
+      // One corrupt aggregate row cannot smuggle fields or hide valid rows.
+    }
+  }
+  return snapshots;
+}
+
 export interface AdminMetricSnapshotResult {
   code: "SNAPSHOT_CAPTURED" | "SNAPSHOT_CURRENT" | "SNAPSHOT_UNAVAILABLE";
 }
@@ -815,6 +1065,9 @@ interface AdminMetricGaugeRow {
   quarantine_within_grace: number;
   quarantine_due_referenced: number;
   quarantine_due_unreferenced: number;
+  participant_rows: number;
+  chunk_rows: number;
+  legacy_contribution_rows: number;
 }
 
 /**
@@ -825,32 +1078,73 @@ interface AdminMetricGaugeRow {
 async function readCurrentStateGauges(
   db: D1Database,
   nowEpoch: number,
+  maximumRows?: number,
+  includeV11 = false,
 ): Promise<Record<string, number>> {
   const cutoffAt = iso(
     nowEpoch - QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS,
   );
+  const participantRelation = maximumRows === undefined
+    ? "participants" : "bounded_participants";
+  const chunkRelation = includeV11
+    ? "typed_chunk_headers"
+    : maximumRows === undefined ? "telemetry_v1_chunks" : "bounded_chunks";
+  const legacyContributionRelation = maximumRows === undefined
+    ? "telemetry_contributions" : "bounded_legacy_contributions";
+  const boundedSourceRelations = maximumRows === undefined ? "" : `
+     bounded_participants AS (
+       SELECT state FROM participants ORDER BY id LIMIT ${maximumRows + 1}
+     ),
+     ${includeV11 ? `typed_chunk_headers AS (
+       SELECT participant_id,accepted_record_count AS record_count
+         FROM telemetry_v1_chunks
+       UNION ALL
+       SELECT participant_id,record_count
+         FROM telemetry_v11_chunks
+     )` : `bounded_chunks AS (
+       SELECT id,participant_id,record_count,superseded_at,r2_key,created_at
+         FROM telemetry_v1_chunks ORDER BY created_at DESC,id DESC
+        LIMIT ${maximumRows + 1}
+     )`},
+     bounded_legacy_contributions AS (
+       SELECT participant_id,status,r2_key FROM telemetry_contributions
+        ORDER BY created_at DESC,id DESC LIMIT ${maximumRows + 1}
+     ),`;
+  const legacyContributionMetrics = maximumRows === undefined
+    ? "SELECT 0 AS total"
+    : `SELECT COUNT(*) AS total FROM ${legacyContributionRelation}`;
   const row = await db.prepare(
-    `WITH participant_metrics AS (
+    `WITH ${boundedSourceRelations} participant_metrics AS (
        SELECT COUNT(*) AS total,
               COALESCE(SUM(CASE WHEN state = 'active' THEN 1 ELSE 0 END), 0)
                 AS active
-         FROM participants
+         FROM ${participantRelation}
      ),
      chunk_metrics AS (
-       SELECT COUNT(*) AS chunks,
-              COALESCE(SUM(CASE WHEN superseded_at IS NULL THEN 1 ELSE 0 END), 0)
+       ${includeV11 ? `SELECT COUNT(*) AS chunks,
+              (SELECT COUNT(*) FROM telemetry_analytical_chunks)
                 AS current_chunks,
-              COALESCE(SUM(CASE WHEN superseded_at IS NULL THEN record_count ELSE 0 END), 0)
+              COALESCE((SELECT SUM(accepted_record_count)
+                FROM telemetry_analytical_chunks),0) AS current_records
+         FROM typed_chunk_headers` : `SELECT COUNT(*) AS chunks,
+              COALESCE(SUM(CASE WHEN superseded_at IS NULL
+                THEN 1 ELSE 0 END), 0)
+                AS current_chunks,
+              COALESCE(SUM(CASE WHEN superseded_at IS NULL
+                THEN record_count ELSE 0 END), 0)
                 AS current_records
-         FROM telemetry_v1_chunks
+         FROM ${chunkRelation}`}
+     ),
+     legacy_contribution_metrics AS (
+       ${legacyContributionMetrics}
      ),
      contributing_accounts_raw AS (
        SELECT COUNT(*) AS total FROM (
          SELECT participant_id FROM (
-           SELECT participant_id FROM telemetry_contributions
+           SELECT participant_id FROM ${legacyContributionRelation}
             WHERE status = 'accepted'
            UNION
-           SELECT participant_id FROM telemetry_v1_chunks
+           SELECT participant_id FROM ${chunkRelation}
          )
          ORDER BY participant_id
          LIMIT 10001
@@ -881,6 +1175,10 @@ async function readCurrentStateGauges(
                   SELECT 1 FROM telemetry_v1_chunks
                    WHERE r2_key = pending.r2_key
                 )
+                OR EXISTS (
+                  SELECT 1 FROM telemetry_v11_chunks
+                   WHERE r2_key = pending.r2_key
+                )
               ) THEN 1 ELSE 0 END), 0) AS due_referenced,
               COALESCE(SUM(CASE WHEN registered_at <= ?1
                 AND NOT EXISTS (
@@ -892,6 +1190,10 @@ async function readCurrentStateGauges(
                 )
                 AND NOT EXISTS (
                   SELECT 1 FROM telemetry_v1_chunks
+                   WHERE r2_key = pending.r2_key
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM telemetry_v11_chunks
                    WHERE r2_key = pending.r2_key
                 )
                 THEN 1 ELSE 0 END), 0) AS due_unreferenced
@@ -920,11 +1222,20 @@ async function readCurrentStateGauges(
             quarantine_metrics.bounded AS quarantine_pending_objects_bounded,
             quarantine_metrics.within_grace AS quarantine_within_grace,
             quarantine_metrics.due_referenced AS quarantine_due_referenced,
-            quarantine_metrics.due_unreferenced AS quarantine_due_unreferenced
+            quarantine_metrics.due_unreferenced AS quarantine_due_unreferenced,
+            participant_metrics.total AS participant_rows,
+            chunk_metrics.chunks AS chunk_rows,
+            legacy_contribution_metrics.total AS legacy_contribution_rows
        FROM participant_metrics, chunk_metrics, contributing_accounts,
-            quarantine_metrics`,
+            quarantine_metrics, legacy_contribution_metrics`,
   ).bind(cutoffAt).first<AdminMetricGaugeRow>();
   if (!row) throw new Error("admin metric gauges unavailable");
+  if (maximumRows !== undefined
+      && (Number(row.participant_rows) > maximumRows
+        || (!includeV11 && Number(row.chunk_rows) > maximumRows)
+        || Number(row.legacy_contribution_rows) > maximumRows)) {
+    throw new Error("admin metric source bound exceeded");
+  }
   const gauges = {
     participantsTotal: Number(row.participants_total),
     participantsActive: Number(row.participants_active),
@@ -989,6 +1300,85 @@ export async function captureAdminMetricSnapshot(
     return { code: "SNAPSHOT_CAPTURED" };
   } catch {
     return { code: "SNAPSHOT_UNAVAILABLE" };
+  }
+}
+
+/** Typed hourly capture. Operational counts remain source-owned; only the
+ * small source-keyed aggregate row crosses into analytics storage. */
+export async function captureStorageAdminMetricSnapshot(
+  bindings: StorageAnalyticsBindings,
+  nowEpoch: number,
+): Promise<AdminMetricSnapshotResult> {
+  try {
+    if (!await storageAdminSourceMatches(bindings)) {
+      return { code: "SNAPSHOT_UNAVAILABLE" };
+    }
+    const registered = await bindings.target.prepare(
+      `SELECT 1 AS ready FROM analytics_runtime_sources
+        WHERE source_id=?1 AND source_namespace=?2 AND contract_version=1
+        LIMIT 1`,
+    ).bind(bindings.sourceId, bindings.sourceNamespace).first<number>("ready");
+    if (registered !== 1) return { code: "SNAPSHOT_UNAVAILABLE" };
+    const latest = await bindings.target.prepare(
+      `SELECT MAX(captured_at) AS captured_at
+         FROM analytics_admin_metric_snapshots WHERE source_id=?1`,
+    ).bind(bindings.sourceId).first<{ captured_at: string | null }>();
+    const latestEpoch = Date.parse(latest?.captured_at ?? "");
+    if (Number.isFinite(latestEpoch)
+        && nowEpoch - latestEpoch < SNAPSHOT_MIN_INTERVAL_MILLISECONDS) {
+      return { code: "SNAPSHOT_CURRENT" };
+    }
+    const [current, band] = await Promise.all([
+      readCurrentStateGauges(
+        bindings.source,
+        nowEpoch,
+        STORAGE_ADMIN_SOURCE_ROW_LIMIT,
+        true,
+      ),
+      readStoragePublishedBandGauges(bindings, nowEpoch),
+    ]);
+    const metricsJson = JSON.stringify({ ...current, ...band });
+    if (metricsJson.length > SNAPSHOT_JSON_LIMIT_BYTES) {
+      return { code: "SNAPSHOT_UNAVAILABLE" };
+    }
+    const write = await bindings.target.prepare(
+      `INSERT INTO analytics_admin_metric_snapshots(
+         source_id,captured_at,metrics_json
+       ) VALUES(?1,?2,?3)
+       ON CONFLICT(source_id,captured_at) DO NOTHING`,
+    ).bind(bindings.sourceId, iso(nowEpoch), metricsJson).run();
+    return write.meta.changes === 1
+      ? { code: "SNAPSHOT_CAPTURED" }
+      : { code: "SNAPSHOT_CURRENT" };
+  } catch {
+    return { code: "SNAPSHOT_UNAVAILABLE" };
+  }
+}
+
+async function readStoragePublishedBandGauges(
+  bindings: StorageAnalyticsBindings,
+  nowEpoch: number,
+): Promise<Record<string, number>> {
+  try {
+    const preview = await readPublishedStorageCommunityAdminPreview(
+      bindings,
+      nowEpoch,
+    );
+    const latest = preview?.days.at(-1)?.combined;
+    if (!latest
+        || !Number.isSafeInteger(latest.fitCount) || latest.fitCount < 0
+        || !Number.isSafeInteger(latest.participantCount)
+        || latest.participantCount < 0
+        || latest.participantCount > latest.fitCount) {
+      return {};
+    }
+    return {
+      bandFitCount: latest.fitCount,
+      bandParticipantCount: latest.participantCount,
+    };
+  } catch {
+    // Publication absence leaves these gauges unavailable, never zero.
+    return {};
   }
 }
 

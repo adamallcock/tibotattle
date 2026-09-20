@@ -139,6 +139,7 @@ export const LOCAL_REVIEW_WORKSPACE_RUNTIME_FILES = Object.freeze({
     "src/quota-rolling.js",
     "src/quota-tracks.js",
     "src/quota-windows.js",
+    "src/reset-events.js",
   ]),
   "@app-usagemonitor/telemetry-contract": Object.freeze([
     "index.js",

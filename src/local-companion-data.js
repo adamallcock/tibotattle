@@ -13,6 +13,10 @@ import {
   inferFastModeFromCalibrationWindows,
   summarizeQuotaWeightedAccounting,
 } from "@app-usagemonitor/accounting";
+import {
+  FIVE_HOUR_WINDOW_MINUTES,
+  SEVEN_DAY_WINDOW_MINUTES,
+} from "@app-usagemonitor/quota-analysis";
 import { codexPrimaryAllowanceBasis } from "./codex-primary-allowance-basis.js";
 import {
   deterministicSample,
@@ -575,12 +579,22 @@ function validWeeklyComposition(value) {
   ));
 }
 
-function validLiveWeeklyCalibration(weekly, { population = false } = {}) {
+function validLiveWeeklyCalibration(
+  weekly,
+  {
+    population = false,
+    windowDurationMinutes = SEVEN_DAY_WINDOW_MINUTES,
+  } = {},
+) {
   if (!weekly || typeof weekly !== "object" || Array.isArray(weekly)
       || (!population && !validWeeklyPlanPopulations(weekly, (value) => (
-        validLiveWeeklyCalibration(value, { population: true })
+        validLiveWeeklyCalibration(value, {
+          population: true,
+          windowDurationMinutes,
+        })
       )))
       || weekly.schemaVersion !== "weekly-calibration-summary-v0.1"
+      || weekly.windowDurationMinutes !== windowDurationMinutes
       || !["estimated", "insufficient_evidence"].includes(weekly.status)
       || canonicalWeeklyInstant(weekly.generatedAt) === null
       || weekly.evidenceBasis
@@ -650,7 +664,14 @@ function validLiveWeeklyCalibration(weekly, { population = false } = {}) {
   );
 }
 
-function projectLiveWeeklyCalibration(cache, cacheReadErrorCode = null, { population = false } = {}) {
+function projectLiveWeeklyCalibration(
+  cache,
+  cacheReadErrorCode = null,
+  {
+    population = false,
+    windowDurationMinutes = SEVEN_DAY_WINDOW_MINUTES,
+  } = {},
+) {
   const weekly = cache?.weeklyCalibration;
   if (!weekly) {
     return unavailableLiveWeekly(
@@ -663,17 +684,24 @@ function projectLiveWeeklyCalibration(cache, cacheReadErrorCode = null, { popula
         : "live_cache_missing",
     );
   }
-  if (!validLiveWeeklyCalibration(weekly, { population })) {
+  if (!validLiveWeeklyCalibration(weekly, {
+    population,
+    windowDurationMinutes,
+  })) {
     return unavailableLiveWeekly("live_cache_invalid");
   }
   const estimate = weekly.estimate;
   return {
+    windowDurationMinutes: weekly.windowDurationMinutes ?? null,
     planType: weekly.planType,
     selectedPlanType: weekly.selectedPlanType ?? weekly.planType,
     planAttribution: { ...weekly.planAttribution },
     ...(!population ? {
       planPopulations: weekly.planPopulations.map((value) => projectLiveWeeklyCalibration(
-        { weeklyCalibration: value }, null, { population: true },
+        { weeklyCalibration: value }, null, {
+          population: true,
+          windowDurationMinutes,
+        },
       )),
     } : {}),
     status: weekly.status === "estimated" ? "available" : "insufficient_evidence",
@@ -793,6 +821,36 @@ function projectSelectedAllowanceWeeklyCalibration(
       basisId: expected.basisId,
     },
   };
+}
+
+function projectFiveHourAllowanceCalibration(
+  cache,
+  cacheReadErrorCode = null,
+) {
+  const fiveHour = cache?.fiveHourAllowanceCalibration;
+  if (fiveHour?.windowDurationMinutes !== FIVE_HOUR_WINDOW_MINUTES) {
+    return unavailableLiveWeekly(
+      cacheReadErrorCode === "cache_invalid"
+        || cacheReadErrorCode === "cache_malformed"
+        || cacheReadErrorCode === "cache_invalid_size"
+        || cacheReadErrorCode === "cache_price_registry_outdated"
+        || cacheReadErrorCode === "cache_accounting_semantics_outdated"
+        ? "live_cache_invalid"
+        : "five_hour_allowance_cache_unavailable",
+    );
+  }
+  return projectLiveWeeklyCalibration({
+    weeklyCalibration: fiveHour,
+  }, cacheReadErrorCode, {
+    windowDurationMinutes: FIVE_HOUR_WINDOW_MINUTES,
+  });
+}
+
+function hasFittedAllowancePopulation(history) {
+  return history?.status === "available"
+    || history?.planPopulations?.some((population) => (
+      population?.status === "available"
+    )) === true;
 }
 
 function allowanceBasisMatches(value, scenario) {
@@ -1424,6 +1482,23 @@ export function projectTrayCacheSummary(impact) {
   };
 }
 
+function projectCacheContinuityCohort(cohort, periodId, allowanceCapacity) {
+  const { byModel: _byModel, ...summary } = cohort;
+  const projected = {
+    ...summary,
+    allowanceWeighting: projectCachePremiumWeighting(cohort.allowanceWeighting),
+    coveredSubtotal: projectCacheCoveredSubtotal(cohort.coveredSubtotal, cohort.pricedDrops),
+    byGapBand: projectCacheImpactBreakdown(cohort.byGapBand),
+    byOutcomeBucket: projectCacheImpactBreakdown(cohort.byOutcomeBucket),
+  };
+  return {
+    ...projected,
+    allowanceImpact: cacheSwitchAllowanceImpact(
+      { ...projected, periodId }, allowanceCapacity,
+    ),
+  };
+}
+
 function cacheContinuityImpactProjection(
   impact,
   selectedPeriodId,
@@ -1446,26 +1521,18 @@ function cacheContinuityImpactProjection(
       allowanceImpact: unavailableCacheSwitchAllowance(
         "cache_continuity_impact_unavailable",
       ),
+      byModel: null,
       periods: [],
     };
   }
   const periods = impact.periods.map((period) => {
-    const allowanceWeighting = projectCachePremiumWeighting(
-      period.allowanceWeighting,
-    );
-    const projected = {
-      ...period,
-      allowanceWeighting,
-      coveredSubtotal: projectCacheCoveredSubtotal(period.coveredSubtotal, period.pricedDrops),
-      byGapBand: projectCacheImpactBreakdown(period.byGapBand),
-      byOutcomeBucket: projectCacheImpactBreakdown(period.byOutcomeBucket),
-    };
     return {
-      ...projected,
-      allowanceImpact: cacheSwitchAllowanceImpact(
-        projected,
-        allowanceCapacity,
-      ),
+      ...projectCacheContinuityCohort(period, period.periodId, allowanceCapacity),
+      byModel: Array.isArray(period.byModel) && period.byModel.length <= 128
+        ? period.byModel.map((cohort) => projectCacheContinuityCohort(
+          cohort, period.periodId, allowanceCapacity,
+        ))
+        : null,
     };
   });
   const selected = periods.find((period) => period.periodId === selectedPeriodId)
@@ -1481,6 +1548,7 @@ function cacheContinuityImpactProjection(
       allowanceImpact: unavailableCacheSwitchAllowance(
         "cache_continuity_impact_unavailable",
       ),
+      byModel: null,
       periods: [],
     };
   }
@@ -1516,6 +1584,7 @@ function cacheContinuityImpactProjection(
     postCompactionCacheReadDrops: selected.postCompactionCacheReadDrops,
     byGapBand: selected.byGapBand,
     byOutcomeBucket: selected.byOutcomeBucket,
+    byModel: selected.byModel,
     recent: selected.recent,
     allowanceImpact: selected.allowanceImpact,
     periods,
@@ -2102,6 +2171,8 @@ const UNIFIED_SCHEMA_NEWER_WARNING =
   "This local history was created by a newer TiboTattle build. This build cannot refresh its usage totals or timelines; install a compatible newer build. The retained local history has not been deleted.";
 const HISTORY_TOTALS_HIDDEN_WARNING =
   "History indexing is still advancing. Complete historical totals stay hidden until an indexed aggregate is available.";
+const HISTORY_AGGREGATE_UNAVAILABLE_WARNING =
+  "The history scan is complete, but the current accounting summary is unavailable. Update local usage to retry.";
 export const RETAINED_EVIDENCE_RELABELED_WARNINGS = Object.freeze([
   UNIFIED_DEFERRED_LOADING_WARNING,
   UNIFIED_WITHHELD_PARTIAL_WARNING,
@@ -2115,7 +2186,7 @@ export const RETAINED_EVIDENCE_RELABELED_WARNINGS = Object.freeze([
 export const RETAINED_EVIDENCE_REFRESH_WARNING =
   "The full history projection is still being recalculated in the background. The figures shown are the most recent completed projection and are replaced automatically when it finishes.";
 
-function unifiedHistoryState({ cache, unified, cacheErrorCode }) {
+function unifiedHistoryState({ cache, unified, cacheErrorCode, generationReady }) {
   const history = cache?.history;
   const descriptor = cache?.sourceDescriptor;
   const generationMatched = descriptor?.generationMatched === true;
@@ -2170,6 +2241,13 @@ function unifiedHistoryState({ cache, unified, cacheErrorCode }) {
         ? cacheErrorCode
         : "accounting_unified_history_unavailable";
   const terminalUnavailable = !available && unified?.status === "unavailable";
+  // Source ingestion and the generation-bound accounting cache are separate
+  // publications. A missing cache does not undo a completed, validated scan;
+  // its unified usage projection may already supply the displayed figures.
+  const aggregateUnavailable = !available
+    && generationReady === true
+    && indexedSourceCount + skippedSourceCount === sourceCount
+    && indexedSourceBytes + skippedSourceBytes === sourceBytes;
   return {
     accounting: available
       ? {
@@ -2192,9 +2270,11 @@ function unifiedHistoryState({ cache, unified, cacheErrorCode }) {
         ? "partial_terminal"
         : available
           ? "complete"
-          : terminalUnavailable
-            ? "invalid"
-            : cache === null ? "not_started" : "unavailable",
+          : aggregateUnavailable
+            ? "aggregate_unavailable"
+            : terminalUnavailable
+              ? "invalid"
+              : cache === null ? "not_started" : "unavailable",
       errorCode,
       generatedAt: available ? history.coverage.generatedAt : null,
       coveredAt,
@@ -2450,6 +2530,7 @@ export async function buildLocalCompanionSnapshot({
       cache: replaySafeCache,
       unified,
       cacheErrorCode: replaySafeAccounting.errorCode,
+      generationReady: unifiedGenerationReady,
     })
     : {
       accounting: archiveAccounting,
@@ -2501,6 +2582,10 @@ export async function buildLocalCompanionSnapshot({
     replaySafeCache,
     replaySafeAccounting.errorCode,
   );
+  let allowanceFiveHour = projectFiveHourAllowanceCalibration(
+    replaySafeCache,
+    replaySafeAccounting.errorCode,
+  );
   let allowanceCapacity = projectAllowanceCapacity(
     replaySafeCache?.allowanceCapacityByScenario,
     replaySafeCache?.sourceDescriptor,
@@ -2518,6 +2603,16 @@ export async function buildLocalCompanionSnapshot({
     );
     if (staleWeekly.status !== "unavailable") {
       allowanceWeekly = { ...staleWeekly, stale: staleProvenance };
+    }
+    const staleFiveHour = projectFiveHourAllowanceCalibration(
+      staleReplaySafe.cache,
+      null,
+    );
+    if (hasFittedAllowancePopulation(staleFiveHour)) {
+      allowanceFiveHour = {
+        ...staleFiveHour,
+        stale: staleProvenance,
+      };
     }
     const staleCapacity = projectAllowanceCapacity(
       staleReplaySafe.cache?.allowanceCapacityByScenario,
@@ -2537,6 +2632,7 @@ export async function buildLocalCompanionSnapshot({
   // withhold would be worse than an alarming one.
   const staleServeActive = staleAccountingServe !== null
     || allowanceWeekly.stale !== undefined
+    || allowanceFiveHour.stale !== undefined
     || allowanceCapacity.stale !== undefined;
   const accountingProjectionReason = unifiedAccountingWithheld
     ? unified.status === "deferred"
@@ -2568,6 +2664,11 @@ export async function buildLocalCompanionSnapshot({
     ...weeklyBase,
     paceForecast: collector.paceForecast,
     paceOutlook: collector.paceOutlook,
+    allowanceHistoryByWindow: !hasFittedAllowancePopulation(allowanceFiveHour)
+      ? {}
+      : {
+        [FIVE_HOUR_WINDOW_MINUTES]: allowanceFiveHour,
+      },
   };
   const collectorLatestRecordAt = collector.latestRecordAt;
   const unifiedLatestExportableMs = accountingSourceMode === "unified"
@@ -2940,6 +3041,13 @@ export async function buildLocalCompanionSnapshot({
           `Indexed-history totals currently cover ${historyCoverage.indexedSourceCount}/${historyCoverage.sourceCount} discovered sources and expand as later foreground refreshes advance the index.`,
         );
       }
+    } else if (historyCoverage.phase === "aggregate_unavailable") {
+      warnings.push(HISTORY_AGGREGATE_UNAVAILABLE_WARNING);
+      if (historyCoverage.skippedSourceCount > 0) {
+        warnings.push(
+          `Excluded from indexed history: ${historyCoverage.skippedSourceCount} ${historyCoverage.skippedSourceCount === 1 ? "source" : "sources"} across ${historyCoverage.skippedThreadCount} ${historyCoverage.skippedThreadCount === 1 ? "thread" : "threads"} did not pass local validation. Their usage remains unavailable.`,
+        );
+      }
     } else if (historyCoverage.phase !== "invalid") {
       // A read failure is terminal for this refresh. Saying it is "still
       // advancing" would send the reader to wait for a pass that has already
@@ -3046,6 +3154,15 @@ export async function buildLocalCompanionSnapshot({
       accounting: {
         projection: accountingProjection,
         sourceMode: accountingSourceMode,
+        // Cache-drop rows come from the unified diagnostic projection, not the
+        // optional replay-safe accounting cache. Bind local navigation to that
+        // projection even while the separate accounting cache is unavailable.
+        cacheDiagnosticsSource: unifiedGenerationReady
+          ? {
+            generation: unified.generation.id,
+            generationFingerprint: unified.generation.fingerprint,
+          }
+          : null,
         readerVersion: accountingDescriptor?.readerVersion ?? null,
         compatibilityBehavior:
           accountingDescriptor?.contextBehavior ?? null,
@@ -3125,6 +3242,21 @@ export async function buildLocalCompanionSnapshot({
         periods: usage.map((period) => ({
           periodId: period.id,
           periodLabel: period.label,
+          reportingWindow: (() => {
+            const endAt = period.id === "history"
+              ? historyAccounting.generatedAt
+              : period.id === "all" && unifiedAvailable
+                ? unified.generatedAt
+                : replaySafeCache?.generatedAt
+                  ?? (unifiedAvailable ? unified.generatedAt : null);
+            const endMs = Date.parse(endAt ?? "");
+            if (!Number.isFinite(endMs)) return null;
+            const days = { "24h": 1, "7d": 7, "30d": 30 }[period.id];
+            return {
+              startAt: days ? new Date(Math.max(0, endMs - days * 86_400_000)).toISOString() : null,
+              endAt: new Date(endMs).toISOString(),
+            };
+          })(),
           events: period.events,
           totalTokens: period.totalTokens,
           apiPriceEquivalentUsd: period.apiPriceEquivalentUsd,

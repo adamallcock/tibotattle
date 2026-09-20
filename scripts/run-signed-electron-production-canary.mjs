@@ -13,6 +13,7 @@ import { macOSCredentialApplicationVerificationArguments } from '../apps/electro
 import { validateProductionDistributionMetadata } from '../apps/electron/desktop-updater.js';
 import { launchVerifiedMacSharingApp, stopOwnedMacSharingApp, signedStagingChildEnvironment, signedStagingFixture } from './run-signed-electron-staging.mjs';
 import { waitFor } from './smoke-electron-macos.mjs';
+import distributionPolicy from '../config/electron-production-distribution.cjs';
 
 const ORIGIN = 'https://tibotattle.com';
 const CONFIRMATION = 'RUN_ONE_SYNTHETIC_PRODUCTION_CANARY';
@@ -74,6 +75,10 @@ export function validateCanaryManifest(manifest, sourceRevision) {
   if (manifest?.name !== 'app-usagemonitor' || Object.keys(manifest).some((key) => key.startsWith('tibotattleAccountless'))
     || manifest?.tibotattleDistribution?.sourceRevision !== sourceRevision) fail('artifact_metadata');
   const metadata = validateProductionDistributionMetadata(manifest.tibotattleDistribution, { platform: 'darwin', architecture: 'arm64' });
+  // Handover fixtures deliberately disable production enrollment/uploads.
+  // Valid signatures and distribution metadata alone cannot qualify this journey.
+  if (metadata.channel !== distributionPolicy.PRODUCTION_ELECTRON_CHANNEL
+    || metadata.contributionPolicy !== distributionPolicy.PRODUCTION_ELECTRON_CONTRIBUTION_POLICY) fail('artifact_uploads_disabled');
   if (metadata.semanticVersion !== undefined && manifest.version !== metadata.semanticVersion) fail('artifact_metadata');
   return metadata;
 }

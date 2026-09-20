@@ -183,7 +183,11 @@ test('effective analytics and control migration files preserve exact split-quali
    for(const name of (await readdir(join(actualWorker,directory))).filter(name=>name.endsWith('.sql')).sort()){
     const sql=await readFile(join(actualWorker,directory,name),'utf8');
     whole.exec(sql); for(const statement of split(sql))qualified.exec(statement);
-    assert.deepEqual(inventory(whole),inventory(qualified),`${directory}/${name}: file-import DDL must equal qualification DDL, including comments and whitespace`);
+    // The usual cause is a `--` comment INSIDE a statement: D1 applies a
+    // migration one statement at a time, its splitter drops such a comment,
+    // and SQLite then stores DDL that a whole-file import does not reproduce.
+    // Keep field notes above the statement. Whitespace differences count too.
+    assert.deepEqual(inventory(whole),inventory(qualified),`${directory}/${name}: file-import DDL must equal qualification DDL, including comments and whitespace — a comment inside a statement is the usual cause, move it above the statement`);
    }
   } finally {whole.close();qualified.close();}
  }

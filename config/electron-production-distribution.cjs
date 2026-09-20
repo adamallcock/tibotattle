@@ -1,5 +1,7 @@
 "use strict";
 
+const { SIGNED_MACOS_BUNDLE_VERSION_PLAN } = require("./macos-bundle-version-plan.cjs");
+
 /**
  * Closed production distribution policy shared by the Electron builder and
  * the main-process updater.  Development packages intentionally do not read
@@ -15,6 +17,12 @@ const PRODUCTION_ELECTRON_APP_ID = "com.usagemonitor.local";
 const PRODUCTION_ELECTRON_WINDOWS_TOAST_ACTIVATOR_CLSID =
   "FDA705D7-5644-50E8-8CD2-3005D51B98C5";
 const PRODUCTION_ELECTRON_CHANNEL = "stable";
+// Public verification key retained from the signed native stable predecessor.
+// Sparkle checks its preservation while installing an incoming upgrade, even
+// when the archive and Developer ID signatures are valid. This passive plist
+// value does not enable Sparkle or change Electron's outgoing updater.
+const PRODUCTION_ELECTRON_NATIVE_SPARKLE_PUBLIC_ED_KEY =
+  "jhgPwmvWLMr7TGURJUoi6sXias7YP1F+hejZawKVTGw=";
 const PRODUCTION_ELECTRON_CONTRIBUTION_POLICY = "accountless-opt-out-v1";
 const PRODUCTION_ELECTRON_UPDATE_ORIGIN = "https://updates.tibotattle.com";
 // This is a separately packaged, unsigned development-only selection for
@@ -73,11 +81,9 @@ const PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_CANDIDATES = Obj
   current: "current",
   next: "next",
 });
-// This is deliberately a supplied candidate input rather than a release
-// allocation in source control. It is limited to ten decimal digits because
-// the macOS handover validator compares CFBundleVersion components as bounded
-// numeric values. A candidate still has to prove it is newer than the actual
-// installed native application before a handover can proceed.
+// Immutable artifact/source-candidate identity, independent of the canonical
+// macOS bundle allocation. Retain the historical ten-digit bound for receipt
+// compatibility; a timestamp must not become a new Apple CFBundleVersion.
 const PRODUCTION_ELECTRON_BUILD_NUMBER_PATTERN = /^[1-9][0-9]{0,9}$/u;
 const PRODUCTION_ELECTRON_RELEASE_VERSION_PATTERN =
   /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
@@ -310,7 +316,7 @@ function productionElectronWindowsFileVersion(buildNumber) {
 
 /**
  * Return the target-specific value passed to electron-builder's buildVersion.
- * macOS retains the supplied integer as CFBundleVersion for native handover
+ * macOS uses the reviewed signed release allocation for native Sparkle
  * ordering. Windows receives four valid PE components, and AppImage carries
  * both the release version and exact candidate identifier.
  */
@@ -322,11 +328,44 @@ function productionElectronBuildVersionForTarget({ target, version, buildNumber 
     throw new TypeError("target and release version are required");
   }
   const selectedBuildNumber = assertProductionBuildNumber(buildNumber);
-  if (targetSpec.platform === "darwin") return selectedBuildNumber;
+  if (targetSpec.platform === "darwin") {
+    const allocation = SIGNED_MACOS_BUNDLE_VERSION_PLAN[version]?.stable;
+    if (allocation !== undefined) return allocation;
+    // Retain already-frozen Electron 019/020 receipts and named private
+    // rehearsal fixtures. These historical timestamps are not allocations
+    // for future stable releases or native Sparkle publication.
+    if (["0.1.19", "0.1.20"].includes(version)
+        || parseNativeToElectronHandoverRehearsalVersion(version) !== null) {
+      return selectedBuildNumber;
+    }
+    throw new TypeError("macOS release requires an explicit signed bundle version allocation");
+  }
   if (targetSpec.platform === "win32") {
     return productionElectronWindowsFileVersion(selectedBuildNumber);
   }
   return `${version}.${selectedBuildNumber}`;
+}
+
+/** Validate actual signed/installed plist values without confusing provenance
+ * buildNumber with the platform's bundle allocation. */
+function assertProductionElectronMacOSBundleMetadata({
+  target, version, buildNumber, bundleVersion, bundleShortVersion,
+} = {}) {
+  const expectedShortVersion = productionElectronMacOSBundleShortVersionForTarget({ target, version });
+  const expectedBundleVersion = productionElectronBuildVersionForTarget({ target, version, buildNumber });
+  if (bundleVersion !== expectedBundleVersion || bundleShortVersion !== expectedShortVersion) {
+    throw new TypeError("macOS bundle metadata does not match the reviewed production allocation");
+  }
+  return Object.freeze({ bundleVersion, bundleShortVersion });
+}
+
+/** Validate the actual mounted stable Mac app's incoming-upgrade trust key. */
+function assertProductionElectronMacOSIncomingUpgradeMetadata({ target, publicEDKey } = {}) {
+  if (!["darwin-arm64", "darwin-x64"].includes(target)
+      || publicEDKey !== PRODUCTION_ELECTRON_NATIVE_SPARKLE_PUBLIC_ED_KEY) {
+    throw new TypeError("macOS incoming upgrade must retain the native stable public key");
+  }
+  return Object.freeze({ publicEDKey });
 }
 
 /**
@@ -349,6 +388,7 @@ function productionElectronMacOSBundleShortVersionForTarget({ target, version } 
 }
 
 module.exports = Object.freeze({
+  PRODUCTION_ELECTRON_NATIVE_SPARKLE_PUBLIC_ED_KEY,
   ACCOUNTLESS_HOSTED_REHEARSAL_APP_ID,
   ACCOUNTLESS_HOSTED_REHEARSAL_CHANNEL,
   ACCOUNTLESS_HOSTED_REHEARSAL_CREDENTIAL_STORAGE,
@@ -381,6 +421,8 @@ module.exports = Object.freeze({
   accountlessSignedStagingRehearsalForTarget,
   accountlessSignedStagingRehearsalStagingPathSegments,
   productionElectronBuildVersionForTarget,
+  assertProductionElectronMacOSBundleMetadata,
+  assertProductionElectronMacOSIncomingUpgradeMetadata,
   productionElectronDistributionForTarget,
   productionElectronFeedForTarget,
   productionElectronMacOSBundleShortVersionForTarget,

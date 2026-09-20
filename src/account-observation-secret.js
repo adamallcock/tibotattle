@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, unlink } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { defaultExportStateDirectory } from "./export-identity.js";
 import {
   isWindowsAccountObservationBrokerBackend,
@@ -424,7 +424,120 @@ export function createAccountObservationSecretLoader({
 
 export function createDevelopmentAccountObservationSecretLoader(secret) {
   const copy = copySecret(secret);
-  return async function loadDevelopmentAccountObservationSecret() {
+  let disposed = false;
+  const load = async function loadDevelopmentAccountObservationSecret() {
+    if (disposed) fail("account_observation_credential_unavailable");
     return Buffer.from(copy);
   };
+  load.dispose = () => {
+    disposed = true;
+    copy.fill(0);
+  };
+  return load;
+}
+
+function assertDevelopmentFile(stats, bytes) {
+  if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1
+      || stats.size !== bytes || (stats.mode & 0o777) !== 0o600
+      || typeof process.getuid !== "function" || stats.uid !== process.getuid()) {
+    fail("account_observation_credential_unavailable");
+  }
+}
+
+async function developmentIdentityDirectories(directory) {
+  const result = [];
+  for (let path = directory; ; path = dirname(path)) {
+    const stats = await lstat(path);
+    if (!stats.isDirectory() || stats.isSymbolicLink()
+        || (path === directory && ((stats.mode & 0o777) !== 0o700
+          || typeof process.getuid !== "function" || stats.uid !== process.getuid()))) {
+      fail("account_observation_credential_unavailable");
+    }
+    result.push({ path, stats });
+    if (dirname(path) === path) return result;
+  }
+}
+
+async function readDevelopmentFile(path, expectedBytes) {
+  const before = await lstat(path);
+  assertDevelopmentFile(before, expectedBytes);
+  let handle;
+  const bytes = Buffer.alloc(expectedBytes + 1);
+  try {
+    handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const opened = await handle.stat();
+    assertDevelopmentFile(opened, expectedBytes);
+    if (!sameIdentity(before, opened) || before.mtimeMs !== opened.mtimeMs
+        || before.ctimeMs !== opened.ctimeMs) fail("account_observation_credential_unavailable");
+    let length = 0;
+    while (length < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, length, bytes.length - length, length);
+      if (bytesRead === 0) break;
+      length += bytesRead;
+    }
+    const after = await handle.stat();
+    const current = await lstat(path);
+    assertDevelopmentFile(after, expectedBytes);
+    assertDevelopmentFile(current, expectedBytes);
+    if (length !== expectedBytes || !sameIdentity(opened, after) || !sameIdentity(opened, current)
+        || opened.mtimeMs !== after.mtimeMs || opened.ctimeMs !== after.ctimeMs
+        || after.mtimeMs !== current.mtimeMs || after.ctimeMs !== current.ctimeMs) {
+      fail("account_observation_credential_unavailable");
+    }
+    return { bytes: Buffer.from(bytes.subarray(0, expectedBytes)), stats: current };
+  } finally {
+    bytes.fill(0);
+    await handle?.close().catch(() => {});
+  }
+}
+
+// Read-only opt-in for an isolated development profile. Account identity must
+// be independent of its export identity; this helper never creates either key
+// and never reaches a platform credential backend.
+export async function readDevelopmentAccountObservationSecretFile(path, { exportIdentityFile } = {}) {
+  let account = null;
+  let exported = null;
+  let exportSecret = null;
+  try {
+    for (const file of [path, exportIdentityFile]) {
+      if (typeof file !== "string" || !isAbsolute(file) || file.includes("\0")
+          || resolve(file) !== file) fail("account_observation_credential_unavailable");
+    }
+    const directory = dirname(exportIdentityFile);
+    if (basename(directory) !== "identity" || basename(exportIdentityFile) !== "export-identity"
+        || path !== join(directory, "account-observation-development")) {
+      fail("account_observation_credential_unavailable");
+    }
+    const directories = await developmentIdentityDirectories(directory);
+    account = await readDevelopmentFile(path, SECRET_BYTES);
+    exported = await readDevelopmentFile(exportIdentityFile, 44);
+    const encoded = exported.bytes.toString("utf8");
+    if (!/^[A-Za-z0-9_-]{43}\n$/u.test(encoded)) fail("account_observation_credential_unavailable");
+    exportSecret = Buffer.from(encoded.slice(0, -1), "base64url");
+    if (exportSecret.byteLength !== SECRET_BYTES
+        || `${exportSecret.toString("base64url")}\n` !== encoded
+        || account.bytes.equals(exportSecret) || sameIdentity(account.stats, exported.stats)) {
+      fail("account_observation_credential_unavailable");
+    }
+    const rechecked = await developmentIdentityDirectories(directory);
+    if (directories.length !== rechecked.length || directories.some((entry, index) =>
+      entry.path !== rechecked[index].path || !sameIdentity(entry.stats, rechecked[index].stats))) {
+      fail("account_observation_credential_unavailable");
+    }
+    for (const [file, previous, length] of [
+      [path, account.stats, SECRET_BYTES], [exportIdentityFile, exported.stats, 44],
+    ]) {
+      const current = await lstat(file);
+      assertDevelopmentFile(current, length);
+      if (!sameIdentity(previous, current) || previous.mtimeMs !== current.mtimeMs
+          || previous.ctimeMs !== current.ctimeMs) fail("account_observation_credential_unavailable");
+    }
+    return Buffer.from(account.bytes);
+  } catch {
+    fail("account_observation_credential_unavailable");
+  } finally {
+    account?.bytes.fill(0);
+    exported?.bytes.fill(0);
+    exportSecret?.fill(0);
+  }
 }

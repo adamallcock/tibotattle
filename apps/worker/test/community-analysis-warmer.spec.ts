@@ -241,7 +241,7 @@ describe("scheduled analysis warmer and atomic cache promotion",()=>{
       fixedNow:new Date(NOW).toISOString(),observedAtCutoff:`${FROM}T00:00:00.000Z`,
       resetsAtCutoff:new Date(Date.parse(`${FROM}T00:00:00.000Z`)+7*86_400_000).toISOString(),windowMinutes:10080,maxQuotaRows:60000};
     expect((await beginCommunityAnalysisWork(db(),work,{version:V1_QUOTA_ACQUISITION_VERSION,phase:"plan",
-      cursor:{observedAt:work.observedAtCutoff,resetsAt:work.resetsAtCutoff,id:0},planTime:null,reset:null},allocation())).status).toBe("ready");
+      cursor:{observedAt:work.observedAtCutoff,resetsAt:work.resetsAtCutoff,id:0},clusterCursor:null,planTime:null,reset:null},allocation())).status).toBe("ready");
     const tables=["telemetry_v1_chunks","telemetry_v1_records","community_allowance_fit_cache",
       "community_model_composition_cache","community_analysis_work","participants"];
     const snapshot=()=>Promise.all(tables.map(async table=>(await db().prepare(`SELECT * FROM ${table}`).all()).results));

@@ -324,11 +324,15 @@ export function createCacheReuseMatrix({
         text(w - 18, cursor + 36, tr("n", { count: formatNumber(row.comparableReturns) }), "cache-matrix-muted", "end");
         cursor += rowHeight;
       } else {
-        const band = (w - 32) / 9;
-        const center = 16 + (index + .5) * band;
+        // The column pitch is the SAME slot the cell size was derived from, so
+        // the two cannot disagree about how many buckets there are. A fixed
+        // nine outlived the nine-row tail merge and drew the tenth bucket
+        // entirely past the right edge of the plot, where a measured bucket is
+        // indistinguishable from one with no evidence.
+        const center = 16 + (index + .5) * slot;
         gx = center - gridWidth / 2;
         gy = baseline - pixelHeight;
-        box = { x: 16 + index * band + 2, y: 12, width: band - 4, height: baseline + 39 };
+        box = { x: 16 + index * slot + 2, y: 12, width: slot - 4, height: baseline + 39 };
         text(center, 32, rate(row.reusedMoreThanHalfReturns, row.comparableReturns), "cache-matrix-rate", "middle");
         text(center, 52, tr("n", { count: formatNumber(row.comparableReturns) }), "cache-matrix-muted", "middle");
         text(center, baseline + 25, tr(`short.${row.label}`), "cache-matrix-gap", "middle");

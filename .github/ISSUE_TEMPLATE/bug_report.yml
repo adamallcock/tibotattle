@@ -27,6 +27,44 @@ body:
         - Preview / development build
     validations:
       required: true
+  - type: input
+    id: operating-system
+    attributes:
+      label: Operating system and exact build
+      description: On macOS, include both ProductVersion and BuildVersion from `sw_vers`.
+      placeholder: macOS 26.4 (BuildVersion 25E...)
+    validations:
+      required: true
+  - type: dropdown
+    id: architecture
+    attributes:
+      label: Architecture
+      options:
+        - Apple silicon (arm64)
+        - Intel Mac (x64)
+        - Windows (x64)
+        - Linux (x64)
+        - Linux (arm64)
+        - Other / not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: installation-history
+    attributes:
+      label: Installation history
+      options:
+        - Updated over an older TiboTattle version
+        - Fresh install with no previous TiboTattle version
+        - Reinstalled the same version
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: previous-version
+    attributes:
+      label: Previous app version
+      description: If this was an update, give the last TiboTattle version that opened successfully.
+      placeholder: vX.Y.Z or not applicable
   - type: textarea
     id: repro
     attributes:
@@ -50,7 +88,8 @@ body:
       description: |
         What happened instead. If relevant, include output from the built-in
         diagnostics: `npm run diagnose:dashboard` from a source checkout.
-        Review it and any screenshot for private data before sharing.
+        If startup shows a fixed support code, include that code. Review all
+        diagnostics and screenshots for private data before sharing.
     validations:
       required: true
   - type: checkboxes

@@ -43,8 +43,8 @@ import { currentAnalysisPublicationStatements, type CurrentAnalysisQueueClaim } 
  * `summarizeTrack` (median across reset fits, q10–q90 band).
  *
  * Honesty note carried into the published payload: qualification is the
- * shared package's fit gates plus a 40pp observed-span floor — the same
- * floor the app's public share card names ("40pp span") — so the published
+ * shared package's fit gates plus a 25pp observed-span floor — the same
+ * floor the app's public share card names — so the published
  * community figure and the numbers people screenshot from their own app are
  * the same methodology. `spanFloorPp` carries the floor explicitly.
  *
@@ -66,12 +66,25 @@ export const COMMUNITY_ALLOWANCE_TRAILING_DAYS = 30;
 export const COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS =
   V1_ANALYSIS_WINDOW_DAYS - COMMUNITY_ALLOWANCE_TRAILING_DAYS;
 export const COMMUNITY_ALLOWANCE_QUALIFICATION =
-  "shared_reset_fit_gates_40pp_span_floor";
-// The same observed-span floor the app's public share card names ("40pp
-// span"): short-span fits extrapolate a whole week from a sliver of quota
-// movement and are the noisiest inputs to the published median, and the
+  "shared_reset_fit_gates_25pp_span_floor";
+// The same observed-span floor the app's public share card names: short-span
+// fits extrapolate a whole week from a sliver of quota movement, and the
 // community figure must be the same methodology a reader's own app shows.
-export const COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP = 40;
+//
+// MEASURED, 2026-09-18. Replaying 56 long-arc resets truncated to every shorter
+// span and refitting them (3,702 refits) puts the estimator in two regimes.
+// Below ~20pp it is biased LOW — median signed error -10.2% at 5-10pp, -6.0% at
+// 10-15pp — and `error x span` climbs, so extra span buys less than
+// proportionally. From 20pp to 45pp that product is flat at 291-320: a clean
+// `error ~ 300/span %` decay with no bias. 40 was an arbitrary point on that
+// smooth stretch, not a knee. 25 clears the measured turn with margin.
+//
+// The cost is bounded: newly admitted fits carry 10.9% median relative error
+// against 7.5% for those already admitted at 40-45pp, but each cohort's
+// published median moves by no more than 0.6% and the band's spread is
+// unchanged. What it buys is density inside cohorts that already qualify, not
+// new contributors — those were unchanged at every floor from 5 to 40.
+export const COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP = 25;
 // Mirrors MINIMUM_RESETS_FOR_UNCERTAINTY in the shared calibration package:
 // below three fits a q10–q90 band is an artifact of interpolation, not a
 // spread, so the band is withheld and only the central estimate publishes.
@@ -106,6 +119,27 @@ export const COMMUNITY_ATTRIBUTION_METHOD_VERSION =
 // which starved the admin allowance preview).
 export const V1_FIT_CACHE_KEY_SUFFIX =
   `${APP_PRICE_REGISTRY_MANIFEST.sha256}:${FIT_ADAPTER_VERSION}:${SERVER_PRICING_METHOD_VERSION}:${COMMUNITY_ATTRIBUTION_METHOD_VERSION}`;
+
+/** What a published FIT means: the gates above plus the reset-evidence method
+ * beneath them. Bump this on any change to either.
+ *
+ * It is deliberately NOT part of `communityAnalysisCacheVersion()`. That string
+ * feeds `STORAGE_GRAPH_METHOD`, so folding this into it would retire every
+ * MODEL result and publication as well — and the model composition never reads
+ * reset evidence (`buildResetEvidence` is reached only from the scalar half).
+ * Scoping the change to the fits identity lets the by-model corpus stand while
+ * fits recompute, which is the difference between a day's rebuild and none.
+ *
+ * `fit-gates-2` is the 25pp span floor replacing 40pp; `cycle-split-1` is the
+ * reset evidence splitting a `resetsAt` group at a genuine cycle restart and
+ * collapsing duplicate instants, instead of refusing the group outright. */
+export const COMMUNITY_ALLOWANCE_FIT_METHOD = "fit-gates-2:cycle-split-1";
+
+/** The fit cache key. The base suffix alone would let a fit computed under the
+ * previous gates be served beside one computed under the current gates, under
+ * an identity claiming they are the same statistic. */
+export const V1_FIT_CACHE_KEY =
+  `${V1_FIT_CACHE_KEY_SUFFIX}:${COMMUNITY_ALLOWANCE_FIT_METHOD}`;
 
 function analysisFromDay(nowMs: number): string {
   if (!Number.isFinite(nowMs)) throw new TypeError("analysis time invalid");
@@ -422,7 +456,7 @@ export async function collectCommunityAllowanceFits(
     // Source pinning is correctness, not an optional cache optimization.
     // An unavailable or changing source cannot become a fabricated zero-fit result.
     const { sourcePin, fingerprint } = await loadCommunitySourcePin(db, row.participant_id, fromDay, row.source);
-    const cacheKey = sourceCacheKey(sourcePin, fromDay, V1_FIT_CACHE_KEY_SUFFIX, row.source);
+    const cacheKey = sourceCacheKey(sourcePin, fromDay, V1_FIT_CACHE_KEY, row.source);
     let cachedFits: CommunityAllowanceFit[] | null = null;
     try {
       const cached = await db.prepare(
@@ -543,7 +577,7 @@ export async function readCachedCommunityAllowanceCorpus(
         ORDER BY sources.participant_id`,
     ).bind(
       analysisFromDay(nowMs),
-      V1_FIT_CACHE_KEY_SUFFIX,
+      V1_FIT_CACHE_KEY,
     ).all<CachedCommunityAllowanceFitRow>();
     if (!Array.isArray(result.results)) return null;
     rows = result.results;
@@ -873,7 +907,7 @@ async function readBoundedCommunityAllowanceCorpus(db: D1Database, nowMs: number
         if (![row.has_legacy, row.has_v1, row.has_v11].every(flag => flag === 0 || flag === 1)) return null;
         if (!row.has_legacy && !row.has_v1 && !row.has_v11) continue;
         const source: LegacySource = row.has_v11 ? "v1.1" : row.has_v1 ? row.has_legacy ? "mixed" : "v1" : "v0.2";
-        if (!cacheCount(row.input_revision) || row.cache_key !== `${source}:${row.input_revision}:${fromDay}:${V1_FIT_CACHE_KEY_SUFFIX}`
+        if (!cacheCount(row.input_revision) || row.cache_key !== `${source}:${row.input_revision}:${fromDay}:${V1_FIT_CACHE_KEY}`
             || row.source_method_version !== COMMUNITY_ATTRIBUTION_METHOD_VERSION
             || typeof row.input_fingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(row.input_fingerprint)
             || !cacheCount(row.fits_bytes) || row.fits_bytes! > maxBytes - bytes) return null;
@@ -977,6 +1011,13 @@ const SCALAR_CACHE_REFUSALS: Record<"v0.2" | "v1" | "v1.1", ReadonlySet<string>>
     "session_interval_scope_limit_exceeded", "supported_quota_track_unavailable", "attribution_hazard_limit_exceeded",
     "usage_cost_limit_exceeded", "reduced_usage_limit_exceeded"]),
 };
+
+/** The composition refusal vocabulary, exposed for owner-only progress
+ * counting. A reader that meets a reason outside this set must report it as
+ * unknown rather than widening the vocabulary or dropping the refusal. There
+ * is no fits counterpart: a current fit is cached as the selected-fit array,
+ * so a refused scalar analysis is stored as an empty array with no reason. */
+export const COMMUNITY_MODEL_REFUSAL_REASONS: ReadonlySet<string> = COMPOSITION_CACHE_REFUSALS;
 
 export function validCompleteScalarAnalysis(value: unknown, source: "v0.2" | "v1" | "v1.1", fingerprint: string,
   sourceOnly = false): boolean {
@@ -1109,7 +1150,7 @@ export async function completedCommunityAnalysisCachesCurrent(db: D1Database,
       AND NOT EXISTS (SELECT 1 FROM telemetry_contributions
         WHERE participant_id = ?1 AND status = 'accepted' AND transport_schema_version = 'telemetry-contribution-v0.2')
     LIMIT 1`).bind(participantId, inputRevision,
-      `v1:${inputRevision}:${fromDay}:${V1_FIT_CACHE_KEY_SUFFIX}`,
+      `v1:${inputRevision}:${fromDay}:${V1_FIT_CACHE_KEY}`,
       `v1:${inputRevision}:${fromDay}:${COMPOSITION_CACHE_KEY_SUFFIX}`,
       COMMUNITY_ATTRIBUTION_METHOD_VERSION, V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
       COMMUNITY_MODEL_CACHE_MAX_BYTES, COMPOSITION_CACHE_JSON_LIMIT_BYTES, `${fromDay}T00:00:00.000Z`)
@@ -1133,7 +1174,7 @@ export async function completedCommunityAnalysisCachesCurrent(db: D1Database,
 export async function communityAnalysisCachesCurrent(db: D1Database,
   identity: CommunityAnalysisCacheIdentity): Promise<boolean> {
   const { participantId, source, sourcePin, fitFingerprint, fromDay } = identity;
-  const fitKey = sourceCacheKey(sourcePin, fromDay, V1_FIT_CACHE_KEY_SUFFIX, source);
+  const fitKey = sourceCacheKey(sourcePin, fromDay, V1_FIT_CACHE_KEY, source);
   const fit = await db.prepare(`SELECT CASE WHEN length(CAST(fits_json AS BLOB)) <= ?5 THEN fits_json ELSE NULL END AS fits_json
     FROM community_allowance_fit_cache WHERE participant_id=?1 AND cache_key=?2 AND input_fingerprint=?3 AND source_method_version=?4`)
     .bind(participantId, fitKey, fitFingerprint, COMMUNITY_ATTRIBUTION_METHOD_VERSION, COMMUNITY_MODEL_CACHE_MAX_BYTES)
@@ -1202,7 +1243,7 @@ export async function publishCommunityAnalysisCaches(db: D1Database,
     ON CONFLICT(participant_id) DO UPDATE SET cache_key=excluded.cache_key,fits_json=excluded.fits_json,
       computed_at=excluded.computed_at,input_fingerprint=excluded.input_fingerprint,source_method_version=excluded.source_method_version
     RETURNING participant_id`)
-    .bind(participantId, sourceCacheKey(sourcePin, fromDay, V1_FIT_CACHE_KEY_SUFFIX, source), fitsJson,
+    .bind(participantId, sourceCacheKey(sourcePin, fromDay, V1_FIT_CACHE_KEY, source), fitsJson,
       fitFingerprint, COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourcePin.inputRevision, isV11Pin(sourcePin) ? 1 : 0, maintenanceLease)];
   if (identity.compositionSupported) statements.push(db.prepare(`INSERT INTO community_model_composition_cache
       (participant_id,cache_key,composition_json,computed_at,input_fingerprint,source_method_version)

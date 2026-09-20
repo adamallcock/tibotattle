@@ -58,6 +58,81 @@ export function sameStorageCommunityAuthority(a: StorageCommunityAuthority, b: S
     && (!exactInputs || (a.sequence === b.sequence && a.sourceEpoch === b.sourceEpoch));
 }
 
+/** Per-owner calculations are identified by their exact source pin and input
+ * revision. Unrelated owners may therefore advance the global publication
+ * epochs without invalidating completed private work. Policy and collection
+ * changes remain calculation-wide fences; publication retains the full global
+ * authority comparison below. */
+export function sameStorageCommunityCalculationAuthority(a: StorageCommunityAuthority,
+  b: StorageCommunityAuthority): boolean {
+  return a.sourceId === b.sourceId && a.sourceNamespace === b.sourceNamespace
+    && a.policyRevision === b.policyRevision && a.collectionRevision === b.collectionRevision;
+}
+
+/** Hard publication authority. A completed public aggregate becomes
+ * incompatible, rather than merely older, only across a source identity,
+ * policy or collection revision change. Ordinary accepted uploads and
+ * corrections advance the public epoch; queued work replaces the aggregate
+ * atomically instead of withdrawing it. */
+export function sameStorageCommunityHardAuthority(a: StorageCommunityAuthority,
+  b: StorageCommunityAuthority): boolean {
+  return sameStorageCommunityCalculationAuthority(a, b);
+}
+
+/** Source-ahead containment: a terminal (owner-withdrawn/erased) already
+ * journaled by the source withholds every aggregate pinned below it even
+ * before ordered delivery. One bounded aggregate read; no owner identity. */
+export async function readStorageCommunitySourceTerminalEpoch(source: D1Database): Promise<number> {
+  const row = await source.prepare(`SELECT COALESCE(MAX(public_authority_epoch),0) AS epoch
+    FROM storage_ingestion_changes WHERE kind IN('owner-withdrawn','owner-erased')`).first<{ epoch: number }>();
+  if (!row || !count(row.epoch)) throw unavailable();
+  return row.epoch;
+}
+
+/** Highest containment epoch the analytics target has delivered or fenced.
+ * Migration 0018 maintains it transactionally with the terminal itself. */
+export async function readStorageCommunityDeliveredTerminalEpoch(target: D1Database, sourceId: string): Promise<number> {
+  const row = await target.prepare(`SELECT terminal_public_authority_epoch AS epoch
+    FROM analytics_community_terminal_watermarks WHERE source_id=?`).bind(sourceId).first<{ epoch: number }>();
+  if (row === null) return 0;
+  if (!row || !count(row.epoch)) throw unavailable();
+  return row.epoch;
+}
+
+/** A completed publication remains servable while its hard authority matches,
+ * it was pinned at or after every applicable containment epoch, and it does
+ * not claim inputs newer than the source. Older epochs alone never hide it. */
+export function storageCommunityPublicationVisible(pin: StorageCommunityAuthority, current: StorageCommunityAuthority,
+  terminalPublicAuthorityEpoch: number): boolean {
+  return sameStorageCommunityHardAuthority(pin, current)
+    && count(pin.publicAuthorityEpoch) && count(pin.sourceEpoch) && count(pin.sequence) && count(terminalPublicAuthorityEpoch)
+    && pin.publicAuthorityEpoch >= terminalPublicAuthorityEpoch && pin.publicAuthorityEpoch <= current.publicAuthorityEpoch
+    && pin.sourceEpoch <= current.sourceEpoch && pin.sequence <= current.sequence;
+}
+
+/** Lightweight final fence for private per-owner work. This deliberately does
+ * not scan the ingestion journal or compare global owner mutation epochs. The
+ * caller must also assert its exact owner source pin. */
+export async function storageCommunityCalculationAuthorityIsCurrent(source:D1Database,
+  snapshot:StorageCommunityAuthority):Promise<boolean> {
+  const controls=await readCollectionControls(source);
+  if(!controls.publication)throw unavailable();
+  const row=await source.prepare(`SELECT s.source_id AS sourceId,a.source_namespace AS sourceNamespace,
+    i.policy_revision AS policyRevision,c.revision AS collectionRevision
+    FROM storage_source_state s
+    JOIN typed_v1_admission_state a ON a.id=1 AND a.runtime_contract_version=1
+    JOIN typed_v11_admission_state b ON b.id=1 AND b.runtime_contract_version=1 AND b.source_namespace=a.source_namespace
+    JOIN ingestion_analytics_separation i ON i.id=1
+    JOIN collection_controls c ON c.singleton=1 AND c.publication_enabled=1
+    JOIN community_public_source_bootstrap p ON p.singleton=1 AND p.completed=1 AND p.policy_version=?
+    WHERE s.singleton=1`).bind(COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION).first<Pick<StorageCommunityAuthority,
+      'sourceId'|'sourceNamespace'|'policyRevision'|'collectionRevision'>>();
+  return !!row&&row.collectionRevision===controls.revision
+    &&typeof row.sourceId==='string'&&typeof row.sourceNamespace==='string'
+    &&count(row.policyRevision)&&row.policyRevision>=1&&count(row.collectionRevision)&&row.collectionRevision>=1
+    &&sameStorageCommunityCalculationAuthority(snapshot,{...snapshot,...row});
+}
+
 /** The final source read is the operation's authority linearization point.
  * Append-only data may leave an older published revision visible. Revocation,
  * deletion, exclusions, policy or collection changes may not. */

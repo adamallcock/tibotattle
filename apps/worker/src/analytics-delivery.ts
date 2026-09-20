@@ -10,6 +10,7 @@ export interface StorageAnalyticsBindings {
 export const STORAGE_OPERATING_BUDGET_BYTES = 9_000_000_000;
 export const MAX_DELIVERY_PAGE = 100;
 export const MAX_PROJECTION_STATEMENTS = 800;
+export const MAX_ANALYTICS_CHANGE_PAGE = 16;
 export type StorageChangeKind = "source-updated" | "owner-active" | "owner-withdrawn" | "owner-erased";
 export interface StorageChangeInput {
   sourceId: string;
@@ -47,14 +48,16 @@ function validate(input: StorageChangeInput): void {
   integer(input.revision, 1); integer(input.recordedMs);
   if (!kinds.has(input.kind)) throw new Error("STORAGE_CHANGE_INVALID");
 }
-function decode(id: string, row: ChangeRow): StorageChange {
+export function decodeStorageChangeRow(id: string, input: unknown): StorageChange {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("STORAGE_CHANGE_INVALID");
+  const row = input as ChangeRow;
   const value = { sourceId: id, sequence: row.sequence, eventDigest: row.event_digest,
     ownerDigest: row.owner_digest, revision: row.revision, kind: row.kind,
     objectDigest: row.object_digest, contentDigest: row.content_digest,
     authorityEpoch: row.authority_epoch, publicAuthorityEpoch: row.public_authority_epoch,
     recordedMs: row.recorded_ms };
   validate(value); integer(value.sequence, 1); integer(value.authorityEpoch, 1); integer(value.publicAuthorityEpoch, 1);
-  return value;
+  return Object.freeze(value);
 }
 
 export async function initializeStorageSource(db: D1Database, id: string): Promise<void> {
@@ -81,11 +84,22 @@ export function prepareIngestionChange(db: D1Database, input: StorageChangeInput
 export async function readIngestionChanges(db: D1Database, id: string, afterSequence: number, limit = MAX_DELIVERY_PAGE): Promise<StorageChange[]> {
   sourceId(id); integer(afterSequence); integer(limit, 1);
   if (limit > MAX_DELIVERY_PAGE) throw new Error("STORAGE_PAGE_LIMIT");
-  const state = await db.prepare("SELECT source_id FROM storage_source_state WHERE singleton=1").first<{ source_id: string }>();
+  // These reads are independent and D1 batch gives them one binding round trip
+  // and one ordered snapshot. Keep validating the source row before decoding
+  // any returned event; a missing or mismatched source is never an empty page.
+  const results = await db.batch([
+    db.prepare("SELECT source_id FROM storage_source_state WHERE singleton=1"),
+    db.prepare("SELECT * FROM storage_ingestion_changes WHERE sequence>? ORDER BY sequence LIMIT ?")
+      .bind(afterSequence, limit),
+  ]);
+  if (!Array.isArray(results) || results.length !== 2
+      || results.some(result => result?.success !== true || !Array.isArray(result.results))) {
+    throw new Error("STORAGE_SOURCE_MISMATCH");
+  }
+  const [stateResult, rowsResult] = results;
+  const state = stateResult?.results[0] as { source_id?: unknown } | undefined;
   if (state?.source_id !== id) throw new Error("STORAGE_SOURCE_MISMATCH");
-  const rows = await db.prepare("SELECT * FROM storage_ingestion_changes WHERE sequence>? ORDER BY sequence LIMIT ?")
-    .bind(afterSequence, limit).all<ChangeRow>();
-  return rows.results.map(row => decode(id, row));
+  return rowsResult!.results.map(row => decodeStorageChangeRow(id, row));
 }
 
 function equal(a: StorageChange, b: StorageChange): boolean {
@@ -98,10 +112,51 @@ function equal(a: StorageChange, b: StorageChange): boolean {
 async function receipt(db: D1Database, change: StorageChange): Promise<StorageChange | null> {
   const row = await db.prepare("SELECT * FROM analytics_applied_events WHERE source_id=? AND sequence=?")
     .bind(change.sourceId, change.sequence).first<ChangeRow>();
-  return row ? decode(change.sourceId, row) : null;
+  return row ? decodeStorageChangeRow(change.sourceId, row) : null;
 }
 
 export type PrepareAnalyticsProjection = (target: D1Database, change: Readonly<StorageChange>) => Promise<D1PreparedStatement[]>;
+
+async function receipts(target:D1Database,changes:readonly StorageChange[]):Promise<(StorageChange|null)[]>{
+ if(!changes.length)return [];
+ const id=changes[0]!.sourceId;if(changes.some(change=>change.sourceId!==id))throw new Error("ANALYTICS_SOURCE_MISMATCH");
+ const rows=(await target.prepare(`SELECT * FROM analytics_applied_events WHERE source_id=? AND sequence BETWEEN ? AND ? ORDER BY sequence`)
+  .bind(id,changes[0]!.sequence,changes.at(-1)!.sequence).all<ChangeRow>()).results;
+ const bySequence=new Map(rows.map(row=>[row.sequence,decodeStorageChangeRow(id,row)]));
+ return changes.map(change=>bySequence.get(change.sequence)??null);
+}
+
+/** Commits a short contiguous projection page as one D1 transaction while
+ * preserving the exact per-event guards and receipts. Unknown responses are
+ * acknowledged only when every durable receipt matches the submitted page. */
+export async function applyAnalyticsChangePage(target:D1Database,changes:readonly StorageChange[],
+ prepareProjection:PrepareAnalyticsProjection):Promise<{applied:number;alreadyApplied:number}>{
+ if(!Array.isArray(changes)||changes.length<1||changes.length>MAX_ANALYTICS_CHANGE_PAGE)throw new Error("ANALYTICS_PROJECTION_LIMIT");
+ changes.forEach((change,index)=>{validate(change);integer(change.sequence,1);integer(change.authorityEpoch,1);
+  integer(change.publicAuthorityEpoch,1);if(index&&change.sequence!==changes[index-1]!.sequence+1)throw new Error("ANALYTICS_SOURCE_GAP");});
+ const prior=await receipts(target,changes);
+ if(prior.some(Boolean)){
+  if(prior.every((value,index)=>value&&equal(value,changes[index]!)))return {applied:0,alreadyApplied:changes.length};
+  throw new Error("ANALYTICS_RECEIPT_CONFLICT");
+ }
+ const statements:D1PreparedStatement[]=[];
+ for(const change of changes){
+  const projection=await prepareProjection(target,Object.freeze({...change}));
+  if(!Array.isArray(projection)||projection.length>MAX_PROJECTION_STATEMENTS)throw new Error("ANALYTICS_PROJECTION_LIMIT");
+  if(change.kind!=="owner-active"&&!projection.length)throw new Error("ANALYTICS_PROJECTION_MISSING");
+  statements.push(target.prepare(`INSERT INTO analytics_applied_events
+   (source_id,sequence,event_digest,owner_digest,revision,kind,object_digest,content_digest,authority_epoch,public_authority_epoch,recorded_ms)
+   VALUES(?,?,?,?,?,?,?,?,?,?,?)`).bind(change.sourceId,change.sequence,change.eventDigest,change.ownerDigest,change.revision,
+    change.kind,change.objectDigest,change.contentDigest,change.authorityEpoch,change.publicAuthorityEpoch,change.recordedMs),...projection);
+ }
+ if(statements.length>MAX_PROJECTION_STATEMENTS)throw new Error("ANALYTICS_PROJECTION_LIMIT");
+ try{await target.batch(statements);return {applied:changes.length,alreadyApplied:0};}
+ catch{
+  const durable=await receipts(target,changes);
+  if(durable.every((value,index)=>value&&equal(value,changes[index]!)))return {applied:0,alreadyApplied:changes.length};
+  throw new Error("ANALYTICS_DELIVERY_UNACKNOWLEDGED");
+ }
+}
 
 export async function applyAnalyticsChange(
   target: D1Database, change: StorageChange, prepareProjection: PrepareAnalyticsProjection,

@@ -9,9 +9,11 @@ import { createV11DailyProjectionValues, mergeV11DailyProjectionValues, validate
 import { readV11ProjectedOwnerDays } from './v11-daily-projection';
 import { readV1ProjectedChunkPage } from './v1-daily-projection';
 import { readPublishedStorageCommunityGraph } from './storage-community-graph-publication';
+import { readCacheRetentionCommunitySeries } from './cache-retention-day';
+
 import { captureStorageCommunityAuthority, captureStorageCommunityRetirementAuthority, readStorageCommunityOwnerPage,
-  sameStorageCommunityAuthority, storageCommunityAuthorityIsCurrent,
-  type StorageCommunityAuthority, type StorageCommunityOwner } from './storage-community-authority';
+  readStorageCommunitySourceTerminalEpoch, sameStorageCommunityHardAuthority, storageCommunityCalculationAuthorityIsCurrent,
+  storageCommunityPublicationVisible, type StorageCommunityAuthority, type StorageCommunityOwner } from './storage-community-authority';
 
 export interface StorageCommunityDailyBindings {
   source: D1Database; target: D1Database; sourceId: string; sourceNamespace: string;
@@ -95,8 +97,17 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
     if (read.state !== 'available' || read.values.length > 1) return 'deferred';
     values=read.values[0]??createV11DailyProjectionValues(observedDay);
   } else {
-    const read=await readV1ProjectedChunkPage({source,target,sourceId,sourceNamespace,ownerDigest,day:observedDay,
-      afterIndex:reuse?old.next_index:0,limit:50,...(reuse&&old.fingerprint?{fingerprint:old.fingerprint}:{})});
+    const page=(afterIndex:number,requested?:string|null)=>readV1ProjectedChunkPage({source,target,sourceId,sourceNamespace,
+      ownerDigest,day:observedDay,afterIndex,limit:50,...(requested?{fingerprint:requested}:{})});
+    let read:Awaited<ReturnType<typeof page>>;
+    try { read=await page(reuse?old.next_index:0,reuse?old.fingerprint:null); }
+    catch (error) {
+      // The immutable chunk vector behind a partially folded day changed, for
+      // example a correction of this owner landed between pages. Restart the
+      // fold from its first page instead of failing every later attempt.
+      if(!(error instanceof Error)||error.message!=='V1_PROJECTION_PAGE_CHANGED')throw error;
+      values=createV11DailyProjectionValues(observedDay);read=await page(0);
+    }
     if (!read) return 'deferred';
     for (const value of read.values) values=mergeV11DailyProjectionValues(values,value);
     nextIndex=read.nextIndex??0; fingerprint=read.fingerprint; complete=read.nextIndex===null;
@@ -166,28 +177,49 @@ export interface StorageCommunityDailyProgress {
   reason?:'projection_pending'|'source_changed'|'capacity';
 }
 
+/** The per-day containment epoch: the highest terminal epoch of any owner whose
+ * folded values a day's publication may embed. Ordinary epochs never appear here. */
+const CONTAINMENT_EPOCH_SQL=`COALESCE((SELECT MAX(c.terminal_public_authority_epoch)
+      FROM analytics_community_daily_containment c WHERE c.source_id=p.source_id AND c.day=p.day),0)`;
+const hardAuthority=(authority:StorageCommunityAuthority)=>({sourceId:authority.sourceId,sourceNamespace:authority.sourceNamespace,
+  policyRevision:authority.policyRevision,collectionRevision:authority.collectionRevision});
+
 /** Independent scheduler entry: new/corrected projections enqueue their days
- * transactionally. Policy changes revisit old heads without any ingestion-side
- * analytical write, and only one day advances in this call. */
+ * transactionally. Policy changes and containment revisit old heads without
+ * any ingestion-side analytical write, and only one day advances in this call.
+ * An older public epoch alone is not staleness: the durable per-day queue
+ * already names every day whose inputs actually changed. */
 export async function advanceNextStorageCommunityDaily(options:StorageCommunityDailyBindings & {
-  nowMs?:number;maxOwners?:number;
-}):Promise<StorageCommunityDailyProgress|{state:'idle';ownersAdvanced:0}> {
+  nowMs?:number;maxOwners?:number;preferStaleHead?:boolean;
+  /** Days already deferred in this pass; they yield to the next candidate. */
+  skipDays?:readonly string[];
+}):Promise<(StorageCommunityDailyProgress&{day:string})|{state:'idle';ownersAdvanced:0}> {
+  if(options.preferStaleHead!==undefined&&typeof options.preferStaleHead!=='boolean')throw unavailable();
+  const skipDays=options.skipDays??[];
+  if(!Array.isArray(skipDays)||skipDays.length>64)throw unavailable();
+  for(const value of skipDays)day(value);
+  const skipJson=JSON.stringify(skipDays);
   await assertTarget(options);
   const authority=await captureStorageCommunityAuthority(options.source,options);
-  let observedDay=await options.target.prepare(`SELECT day FROM analytics_community_daily_queue
-    WHERE source_id=? ORDER BY day LIMIT 1`).bind(options.sourceId).first<string>('day');
-  if(observedDay===null){
-    observedDay=await options.target.prepare(`SELECT h.day FROM analytics_community_daily_heads h
+  const queuedDay=()=>options.target.prepare(`SELECT day FROM analytics_community_daily_queue
+    WHERE source_id=? AND day NOT IN(SELECT value FROM json_each(?)) ORDER BY day LIMIT 1`)
+    .bind(options.sourceId,skipJson).first<string>('day');
+  const staleHead=()=>options.target.prepare(`SELECT h.day FROM analytics_community_daily_heads h
       LEFT JOIN analytics_community_daily_publications p ON p.source_id=h.source_id AND p.day=h.day AND p.revision=h.revision
-      WHERE h.source_id=? AND (p.revision IS NULL OR json_extract(p.authority_json,'$.publicAuthorityEpoch')!=?
-       OR json_extract(p.authority_json,'$.policyRevision')!=? OR json_extract(p.authority_json,'$.collectionRevision')!=?
-       OR json_extract(p.authority_json,'$.graphInvalidationEpoch')!=?
+      WHERE h.source_id=? AND h.day NOT IN(SELECT value FROM json_each(?)) AND (p.revision IS NULL
+       OR json_extract(p.authority_json,'$.sourceId') IS NOT ? OR json_extract(p.authority_json,'$.sourceNamespace') IS NOT ?
+       OR json_extract(p.authority_json,'$.policyRevision') IS NOT ? OR json_extract(p.authority_json,'$.collectionRevision') IS NOT ?
+       OR COALESCE(json_extract(p.authority_json,'$.publicAuthorityEpoch'),-1)<${CONTAINMENT_EPOCH_SQL}
        OR json_extract(p.payload_json,'$.apiEquivalentSpend.pricingMethodVersion')!=?
-       OR json_extract(p.payload_json,'$.apiEquivalentSpend.registrySha256')!=?) ORDER BY h.day LIMIT 1`)
-      .bind(options.sourceId,authority.publicAuthorityEpoch,authority.policyRevision,authority.collectionRevision,
-        authority.graphInvalidationEpoch,COMMUNITY_DAILY_SPEND_PRICING_METHOD,COMMUNITY_DAILY_SPEND_REGISTRY_SHA256).first<string>('day');
-  }
-  return observedDay===null?{state:'idle',ownersAdvanced:0}:advanceStorageCommunityDaily({...options,day:observedDay});
+       OR json_extract(p.payload_json,'$.apiEquivalentSpend.registrySha256')!=?)
+       AND NOT EXISTS(SELECT 1 FROM analytics_community_daily_queue q WHERE q.source_id=h.source_id AND q.day=h.day)
+       ORDER BY h.day DESC LIMIT 1`)
+      .bind(options.sourceId,skipJson,authority.sourceId,authority.sourceNamespace,authority.policyRevision,authority.collectionRevision,
+        COMMUNITY_DAILY_SPEND_PRICING_METHOD,COMMUNITY_DAILY_SPEND_REGISTRY_SHA256).first<string>('day');
+  let observedDay=options.preferStaleHead?await staleHead():await queuedDay();
+  if(observedDay===null)observedDay=options.preferStaleHead?await queuedDay():await staleHead();
+  if(observedDay===null)return {state:'idle',ownersAdvanced:0};
+  return {...await advanceStorageCommunityDaily({...options,day:observedDay}),day:observedDay};
 }
 /** One bounded derived step. Completed owner folds survive other owners'
  * appends; a large v1 day resumes at its exact immutable chunk fingerprint. */
@@ -201,7 +233,7 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
   const deferred=(reason:NonNullable<StorageCommunityDailyProgress['reason']>,ownersAdvanced=0):StorageCommunityDailyProgress=>
     ({state:reason==='projection_pending'&&ownersAdvanced>0?'progress':'deferred',reason,ownersAdvanced});
   if(!owners)return deferred('capacity');
-  if(!await storageCommunityAuthorityIsCurrent(source,authority,true))return deferred('source_changed');
+  if(!await storageCommunityCalculationAuthorityIsCurrent(source,authority))return deferred('source_changed');
   const requested=owners.map(member), requestJson=canonicalJson(requested);
   const rowset=(await target.prepare(`SELECT owner_digest,input_revision,owner_revision,source_format,method,
     progress_revision,next_index,fingerprint,complete,'' AS values_json FROM analytics_community_daily_owners
@@ -238,18 +270,24 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
   for(const row of rows){if(!current(row,byOwner.get(row.owner_digest)!)||row.complete!==1)return deferred('projection_pending',ownersAdvanced);
     if(typeof row.values_json!=='string')return deferred('capacity',ownersAdvanced);
     bytes+=byteLength(row.values_json);if(bytes>STORAGE_DAILY_CAPTURE_BYTES)return deferred('capacity',ownersAdvanced);}
-  const cohortDigest=await sha256Hex(canonicalJson({members:requested,method:METHOD,
-    authority:{...authority,sourceEpoch:0,sequence:0}}));
+  // Identity of an unchanged result: exact members and method under the hard
+  // authority. Epoch churn alone never forces a new revision or release time.
+  const cohortDigest=await sha256Hex(canonicalJson({members:requested,method:METHOD,authority:hardAuthority(authority)}));
   const nowMs=options.nowMs??Date.now();if(!Number.isFinite(nowMs))throw unavailable();
   const revision=(previous?.revision??0)+1,releasedAt=new Date(nowMs).toISOString();
   const payload=buildCommunityDailyPayload({day:options.day,revision,releasedAt,
     ...publicInputs(rows.map(row=>JSON.parse(row.values_json) as V11DailyProjectionValues))});
   const payloadJson=canonicalJson(payload),payloadHash=await sha256Hex(payloadJson);
   // Source metadata is reread after all target data. A changed member, policy,
-  // revocation or collection revision cannot authorize this publication.
+  // revocation or collection revision cannot authorize this publication. Every
+  // member's exact input revision is enforced again inside the commit, so an
+  // unrelated concurrent upload defers nothing; the fresh stamp pins the epoch
+  // this exact member set was verified against.
   const finalOwners=await cohort(source);
+  let pinned:StorageCommunityAuthority;
+  try{pinned=await captureStorageCommunityAuthority(source,options);}catch{return deferred('source_changed',ownersAdvanced);}
   if(!finalOwners || canonicalJson(finalOwners.map(member))!==requestJson
-    || !await storageCommunityAuthorityIsCurrent(source,authority,true))return deferred('source_changed',ownersAdvanced);
+    || !sameStorageCommunityHardAuthority(pinned,authority))return deferred('source_changed',ownersAdvanced);
   const unchanged=previous?.cohort_digest===cohortDigest&&typeof previous.payload_json==='string'
     &&await sha256Hex(previous.payload_json)===previous.payload_sha256;
   const commit=target.prepare(`INSERT INTO analytics_community_daily_publications
@@ -260,7 +298,7 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
       ON c.source_id=? AND c.day=? AND c.owner_digest=json_extract(m.value,'$.ownerDigest')
       WHERE c.owner_digest IS NULL OR c.input_revision!=json_extract(m.value,'$.inputRevision')
        OR c.owner_revision!=json_extract(m.value,'$.ownerRevision') OR c.complete!=1 OR c.method!=?)`)
-    .bind(sourceId,options.day,revision,cohortDigest,canonicalJson(authority),payloadJson,payloadHash,releasedAt,unchanged?1:0,
+    .bind(sourceId,options.day,revision,cohortDigest,canonicalJson(pinned),payloadJson,payloadHash,releasedAt,unchanged?1:0,
       sourceId,options.day,revision,requestJson,sourceId,options.day,METHOD);
   try {await target.batch([commit,target.prepare(`DELETE FROM analytics_community_daily_queue
     WHERE source_id=? AND day=? AND revision=? AND EXISTS(SELECT 1 FROM analytics_community_daily_publications
@@ -284,16 +322,25 @@ export async function readPublishedStorageCommunityDaily(options:StorageCommunit
   const range=(Date.parse(options.throughDay)-Date.parse(options.fromDay))/86_400_000+1;
   if(!Number.isSafeInteger(range)||range<1||range>366)throw unavailable();
   const authority=await captureStorageCommunityAuthority(options.source,options);
-  const rows=(await options.target.prepare(`SELECT p.* FROM analytics_community_daily_publications p
+  const sourceTerminal=await readStorageCommunitySourceTerminalEpoch(options.source);
+  const rows=(await options.target.prepare(`SELECT p.*,${CONTAINMENT_EPOCH_SQL} AS containment_epoch,
+      COALESCE((SELECT w.terminal_public_authority_epoch FROM analytics_community_terminal_watermarks w
+        WHERE w.source_id=p.source_id),0) AS delivered_terminal_epoch
+    FROM analytics_community_daily_publications p
     WHERE p.source_id=? AND p.day BETWEEN ? AND ? AND p.revision=(SELECT MAX(n.revision)
       FROM analytics_community_daily_publications n WHERE n.source_id=p.source_id AND n.day=p.day)
     ORDER BY p.day`).bind(options.sourceId,options.fromDay,options.throughDay).all<{
       day:string;revision:number;authority_json:string;payload_json:string;payload_sha256:string;released_at:string;
+      containment_epoch:number;delivered_terminal_epoch:number;
     }>()).results;
   const visible=[];
   for(const row of rows){
     const pin=JSON.parse(row.authority_json) as StorageCommunityAuthority;
-    if(!sameStorageCommunityAuthority(pin,authority))continue;
+    // Until the source's newest terminal has been delivered its affected days
+    // are unknown, so everything pinned below it is withheld. Afterwards only
+    // the days that folded a terminated owner stay hidden until rebuilt.
+    const terminal=row.delivered_terminal_epoch>=sourceTerminal?row.containment_epoch:sourceTerminal;
+    if(!storageCommunityPublicationVisible(pin,authority,terminal))continue;
     if(await sha256Hex(row.payload_json)!==row.payload_sha256)throw unavailable();
     visible.push({day:row.day,revision:row.revision,payload_json:row.payload_json,released_at:row.released_at});
   }
@@ -302,14 +349,33 @@ export async function readPublishedStorageCommunityDaily(options:StorageCommunit
     // Optional graph failure preserves verified activity; the final source
     // fence below still rejects a revocation which raced either target read.
   }
-  if(!await storageCommunityAuthorityIsCurrent(options.source,authority))throw unavailable();
-  return {rows:visible,allowancePublicationState:null,allowanceBreakdownsCache,
+  // The cache-retention curve is community-wide rather than per-day, so it is
+  // read here beside the breakdowns instead of being stamped into a day's
+  // immutable payload, where it would age in place. Optional on exactly the
+  // same terms: its absence is reported as absence and never withholds a day.
+  let cacheRetention:PublishedCommunityDailyRead['cacheRetention']=null;
+  try {
+    // Every window and every model in one bounded read. Absence is reported
+    // as absence: a lane that has published nothing returns null rather than
+    // four windows of ten zeroes, which would be a different claim.
+    cacheRetention=await readCacheRetentionCommunitySeries({target:options.target,
+      sourceId:options.sourceId,nowMs:Date.now()});
+  }catch{
+    cacheRetention=null;
+  }
+  // Final source fence: a containment terminal or hard-authority change that
+  // raced the target reads fails closed. An ordinary upload does not.
+  if(await readStorageCommunitySourceTerminalEpoch(options.source)!==sourceTerminal
+    ||!await storageCommunityCalculationAuthorityIsCurrent(options.source,authority))throw unavailable();
+  return {rows:visible,allowancePublicationState:null,allowanceBreakdownsCache,cacheRetention,
     allowanceReadState:allowanceBreakdownsCache===null?'temporarily_unavailable':'confirmed'};
 }
 
-/** Bounded retirement after hard invalidation; append-only revisions need only
- * retain the latest day value. Owner digests are erased when their source owner
- * is erased, without delaying the source upload/erasure transaction. */
+/** Bounded retirement of superseded, incompatible or contained revisions. The
+ * latest completed revision of a day is never retired merely because the
+ * public epoch moved on; a queued rebuild replaces it atomically. Owner rows
+ * are erased when their source owner is erased, after their day membership was
+ * captured as containment, without delaying the source upload/erasure transaction. */
 export async function retireStorageCommunityDailyPage(options:StorageCommunityDailyBindings):Promise<number> {
   const authority=await captureStorageCommunityRetirementAuthority(options.source,options);
   const result=await options.target.batch([
@@ -319,12 +385,13 @@ export async function retireStorageCommunityDailyPage(options:StorageCommunityDa
       WHERE c.source_id=? AND (o.state='erased' OR EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
         WHERE f.source_id=c.source_id AND f.owner_digest=c.owner_digest)) LIMIT 16)`).bind(options.sourceId),
     options.target.prepare(`DELETE FROM analytics_community_daily_publications WHERE (source_id,day,revision) IN(
-      SELECT p.source_id,p.day,p.revision FROM analytics_community_daily_publications p WHERE p.source_id=? AND (
-       json_extract(p.authority_json,'$.publicAuthorityEpoch')!=? OR json_extract(p.authority_json,'$.policyRevision')!=?
-       OR json_extract(p.authority_json,'$.collectionRevision')!=? OR json_extract(p.authority_json,'$.graphInvalidationEpoch')!=?
+      SELECT p.source_id,p.day,p.revision FROM analytics_community_daily_publications p WHERE p.source_id=?1 AND (
+       json_extract(p.authority_json,'$.sourceId') IS NOT ?1 OR json_extract(p.authority_json,'$.sourceNamespace') IS NOT ?2
+       OR json_extract(p.authority_json,'$.policyRevision') IS NOT ?3 OR json_extract(p.authority_json,'$.collectionRevision') IS NOT ?4
+       OR COALESCE(json_extract(p.authority_json,'$.publicAuthorityEpoch'),-1)<${CONTAINMENT_EPOCH_SQL}
        OR EXISTS(SELECT 1 FROM analytics_community_daily_publications n WHERE n.source_id=p.source_id AND n.day=p.day AND n.revision>p.revision))
-      ORDER BY p.day,p.revision LIMIT 4)`).bind(options.sourceId,authority.publicAuthorityEpoch,authority.policyRevision,
-        authority.collectionRevision,authority.graphInvalidationEpoch),
+      ORDER BY p.day,p.revision LIMIT 4)`).bind(options.sourceId,authority.sourceNamespace,authority.policyRevision,
+        authority.collectionRevision),
   ]);
   return result.reduce((n,row)=>n+row.meta.changes,0);
 }

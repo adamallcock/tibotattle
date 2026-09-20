@@ -527,6 +527,39 @@ function defaultRunGenerateAppcastTool({
   ], { label: "generate_appcast", timeout: GENERATE_APPCAST_TIMEOUT_MS });
 }
 
+/** Sign an official generated Electron entry without changing the signed app. */
+export async function signElectronTransitionFeed({ appcastOutputPath, dmgPath, account = null,
+  edKeyFile = null, sparklePublicEdKey, signUpdatePath, runSignUpdate = (path, args) => runTool(path, args,
+    { label: "sign_update transition", timeout: SIGN_TIMEOUT_MS }) }) {
+  const keys = edKeyFile !== null ? ["--ed-key-file", edKeyFile]
+    : account !== null ? ["--account", account] : [];
+  const text = await readFile(appcastOutputPath, "utf8");
+  // A successor retaining the native public key lets the official generator
+  // sign its enclosure. A fully signed feed is adopted unchanged and both
+  // signatures are checked by validateSignedSparkleFeed below.
+  if (text.includes("sparkle-signatures:")) return;
+  const enclosures = [...text.matchAll(/<enclosure\b([^>]*?)>/gu)];
+  if (enclosures.length !== 1 || /<!DOCTYPE|<!ENTITY/u.test(text)) {
+    fail("Transition requires one official enclosure", "SPARKLE_TRANSITION_FEED_INVALID");
+  }
+  const enclosure = enclosures[0][0];
+  const signatures = [...enclosure.matchAll(/sparkle:edSignature="([^"]+)"/gu)];
+  if (signatures.length > 1 || (text.match(/sparkle:edSignature=/gu) ?? []).length !== signatures.length) {
+    fail("Unexpected official enclosure signature", "SPARKLE_TRANSITION_FEED_INVALID");
+  }
+  const signature = normalizeSignature(signatures.length === 1 ? signatures[0][1]
+    : await runSignUpdate(signUpdatePath, [...keys, "-p", dmgPath]), "Transition archive");
+  const publicKey = importPublicEdKey(sparklePublicEdKey);
+  if (publicKey === null) fail("Transition requires the pinned public key", "SPARKLE_TRANSITION_FEED_INVALID");
+  assertLocalSignature({ bytes: await readFile(dmgPath), signature, publicKey, label: "Transition archive" });
+  // Normalize self-closing unsigned output before the official feed signature.
+  const ending = enclosure.endsWith("/>") ? "/>" : ">";
+  const attributes = enclosure.slice(0, -ending.length);
+  await writeFile(appcastOutputPath, text.replace(enclosure,
+    `${attributes}${signatures.length === 0 ? ` sparkle:edSignature="${signature}"` : ""}>${ending === "/>" ? "</enclosure>" : ""}`));
+  await runSignUpdate(signUpdatePath, [...keys, appcastOutputPath]);
+}
+
 /**
  * Produce a named channel's feed-signed appcast by driving the pinned
  * official Sparkle generate_appcast binary, then validating its output
@@ -543,6 +576,7 @@ async function generateOfficialSignedAppcast({
   generateAppcastPath,
   options,
   runGenerateAppcastTool,
+  signUpdatePath,
 }) {
   const downloadURLPrefix = `${channel.sparkle.origin}/${channel.sparkle.objectPrefix}/${options.bundleVersion}/${dmg.sha256}/`;
   const workRoot = await mkdtemp(
@@ -563,6 +597,11 @@ async function generateOfficialSignedAppcast({
       generateAppcastPath,
       stagingDirectory,
     });
+    if (options.electronTransition) {
+      await signElectronTransitionFeed({ appcastOutputPath, dmgPath: join(stagingDirectory, dmgFileName),
+        account: options.account, edKeyFile: options.edKeyFile, sparklePublicEdKey: options.sparklePublicEdKey, signUpdatePath,
+        runSignUpdate: options.runSignUpdate });
+    }
     const bytes = await readFile(appcastOutputPath).catch(() => null);
     if (bytes === null) {
       fail(
@@ -614,9 +653,9 @@ async function generateOfficialSignedAppcast({
     }
     // Self-check with the exact validation the publisher applies, so a
     // generated appcast can never be shaped in a way the publisher rejects.
-    validateCandidateAppcastShape(text, channel.name, {
-      architecture: channel.architecture,
-    });
+    if (!options.electronTransitionTestSource) {
+      validateCandidateAppcastShape(text, channel.name, { architecture: channel.architecture });
+    }
     return Object.freeze({ bytes, validated });
   } finally {
     await rm(workRoot, { recursive: true, force: true });
@@ -666,6 +705,16 @@ ${deltasBlock}</item></channel></rss>
 `;
 }
 
+function validateTransitionOptions(options) {
+  if (options.electronTransition && (options.channel !== "stable" || options.sparklePublicEdKey === null)) {
+    fail("Electron transition requires stable incoming key verification");
+  }
+  if (options.electronTransitionTestSource != null && (!options.electronTransition || !options.skipRetain
+      || !/^[a-f0-9]{40}$/u.test(options.electronTransitionTestSource))) {
+    fail("Transition rehearsal requires exact source, --electron-transition and --skip-retain");
+  }
+}
+
 export function parseGenerateSparkleAppcastArguments(argv) {
   const options = {
     account: null,
@@ -676,6 +725,8 @@ export function parseGenerateSparkleAppcastArguments(argv) {
     channel: null,
     dmgPath: null,
     edKeyFile: null,
+    electronTransition: false,
+    electronTransitionTestSource: null,
     maxDeltas: null,
     output: null,
     replace: false,
@@ -694,6 +745,7 @@ export function parseGenerateSparkleAppcastArguments(argv) {
     ["--channel", "channel"],
     ["--dmg", "dmgPath"],
     ["--ed-key-file", "edKeyFile"],
+    ["--electron-transition-test-source", "electronTransitionTestSource"],
     ["--max-deltas", "maxDeltas"],
     ["--output", "output"],
     ["--short-version", "shortVersion"],
@@ -708,6 +760,8 @@ export function parseGenerateSparkleAppcastArguments(argv) {
         fail(`${argument} must be supplied exactly once with a value`);
       }
       options[key] = argv[++index];
+    } else if (argument === "--electron-transition" && !options.electronTransition) {
+      options.electronTransition = true;
     } else if (argument === "--replace" && !options.replace) {
       options.replace = true;
     } else if (argument === "--skip-apply-check" && !options.skipApplyCheck) {
@@ -728,6 +782,7 @@ export function parseGenerateSparkleAppcastArguments(argv) {
       fail(`${flag} is required`);
     }
   }
+  validateTransitionOptions(options);
   options.architecture = normalizeReleaseArchitecture(options.architecture ?? "arm64");
   if (!isAppleMacOSBundleVersion(options.bundleVersion)) {
     fail("--bundle-version must be an Apple-compatible CFBundleVersion");
@@ -767,6 +822,7 @@ export function parseGenerateSparkleAppcastArguments(argv) {
 }
 
 export async function generateSparkleAppcast(options) {
+  validateTransitionOptions(options);
   const channel = resolveReleaseChannel(options.channel, {
     architecture: options.architecture,
   });
@@ -825,9 +881,13 @@ export async function generateSparkleAppcast(options) {
       ]);
     }
     const official = await generateOfficialSignedAppcast({
-      channel,
+      channel: options.electronTransitionTestSource
+        ? { ...channel, sparkle: { ...channel.sparkle,
+          objectPrefix: `electron/test/native-sparkle/${options.electronTransitionTestSource}` } }
+        : channel,
       dmg,
       dmgFileName,
+      signUpdatePath: injectedGenerateAppcastTool === null ? toolPath("sign_update") : null,
       generateAppcastPath: injectedGenerateAppcastTool === null
         ? toolPath("generate_appcast")
         : null,

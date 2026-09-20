@@ -1,5 +1,6 @@
 import { publishStorageCommunityModelDay, publishStorageCommunityGraphPreview, readPublishedStorageCommunityGraph,
-  readPublishedStorageCommunityAdminPreview, retireStorageCommunityGraphPublications } from '../src/storage-community-graph-publication';
+  readPublishedStorageCommunityAdminPreview, retireStorageCommunityGraphPublications,
+  storageCommunityGraphPreviewReadyHint } from '../src/storage-community-graph-publication';
 import { advanceStorageCommunityDaily } from '../src/storage-community-daily';
 import { handleRequest } from '../src/index';
 import { captureStorageCommunityAuthority } from '../src/storage-community-authority';
@@ -15,8 +16,9 @@ import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from 
 import { sha256Hex } from "../src/crypto";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
-import { initializeStorageAnalyticsRuntime, advanceStorageAnalytics } from "../src/storage-analytics-runtime";
-import { captureStorageGraphScope, computeStorageGraphResult } from "../src/storage-community-graph";
+import { initializeStorageAnalyticsRuntime, advanceStorageAnalytics, runStorageAnalyticsPass } from "../src/storage-analytics-runtime";
+import { captureStorageGraphScope, computeStorageGraphResult, STORAGE_GRAPH_METHOD,
+  STORAGE_GRAPH_V11_CHECKPOINT_METHOD } from "../src/storage-community-graph";
 import { readStorageCommunityOwnerPage } from "../src/storage-community-authority";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
 import { createV11DeviceFixture, makeV11Day, stageV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
@@ -25,6 +27,10 @@ import { eraseParticipantAsOwner } from '../src/participant-erasure';
 import { canonicalJson } from '../src/canonical-json';
 import { readStorageCommunityProgress } from '../src/storage-community-progress';
 import { advanceStorageCommunityGraphWork } from '../src/storage-community-graph-work';
+import {loadTypedV11GenerationSnapshot} from '../src/typed-v11-quota-reader';
+import {storageHistoryKeyDigest,type StorageHistoryKey} from '../src/storage-history-checkpoint';
+import {claimStorageGraphWorkSelection,ensureStorageGraphWorkSelection,loadLiveStorageGraphWorkSelection,readStorageGraphWorkSelection,
+  type StorageGraphWorkEnvelope} from '../src/storage-community-graph-selection';
 
 const b=env as Env & { STORAGE_INGESTION_A:D1Database; TEST_MIGRATIONS:D1Migration[];
   TEST_TYPED_INGESTION_MIGRATIONS:D1Migration[]; TEST_INGESTION_BRIDGE_MIGRATIONS:D1Migration[];
@@ -132,14 +138,14 @@ async function modelFixture(){
  for(let n=0;n<40;n++){if((await advanceStorageAnalytics(bindings())).state==='idle')break;}
  await advanceStorageCommunityDaily({...bindings(),day:day()});return f;
 }
-async function activateDays(f:Fixture,days:Array<{day:string;manifestId:string;manifestDigest:string}>){
- const prior=await createTelemetryV11DomainPredecessor(typed(),f),ordered=[...days].sort((a,b)=>a.day.localeCompare(b.day));
+async function activateDays(f:Fixture,days:Array<{day:string;manifestId:string;manifestDigest:string}>,nowMs=Date.now()){
+ const prior=await createTelemetryV11DomainPredecessor(typed(),f,nowMs),ordered=[...days].sort((a,b)=>a.day.localeCompare(b.day));
  const manifest:TelemetryV11DomainManifest={schemaVersion:'telemetry-domain-manifest-v1.1',
   fromDay:ordered[0]!.day,throughDay:ordered.at(-1)!.day,predecessor:{token:prior.token,
    previousGenerationId:prior.previousGenerationId,legacyFingerprint:prior.legacyFingerprint},
   days:ordered.map(({day,manifestId,manifestDigest})=>({day,manifestId,manifestDigest})),manifestDigest:'0'.repeat(64)};
  manifest.manifestDigest=await sha256Hex(telemetryV11DomainManifestDigestInput(manifest));
- return activateTelemetryV11Domain(typed(),f,manifest);
+ return activateTelemetryV11Domain(typed(),f,manifest,nowMs);
 }
 async function activeDays(f:Fixture){
  return (await typed().prepare(`SELECT d.observed_day AS day,m.id AS manifestId,m.manifest_digest AS manifestDigest
@@ -213,6 +219,22 @@ async function compute(metric:'fits'|'model',date=metric==='fits'?today():day(),
  const scope=await captureStorageGraphScope(typed(),{owner,day:date,metric,sourceId:namespace,sourceNamespace:namespace});
  return computeStorageGraphResult(bindings(),scope);
 }
+async function selectedEnvelope(metric:'fits'|'model',date=metric==='fits'?today():day()){
+ const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+ const scope=await captureStorageGraphScope(typed(),{owner,day:date,metric,sourceId:namespace,sourceNamespace:namespace});
+ if(!('source'in scope.pin))throw new Error('synthetic v1.1 scope unavailable');
+ const snapshot=await loadTypedV11GenerationSnapshot(typed(),{sourceNamespace:namespace,pin:scope.pin});
+ const authorityEpoch=await b.STORAGE_ANALYTICS_DB.prepare(`SELECT authority_epoch FROM analytics_owner_state
+  WHERE source_id=? AND owner_digest=? AND state='active'`).bind(namespace,owner.ownerDigest).first<number>('authority_epoch');
+ if(!Number.isSafeInteger(authorityEpoch)||authorityEpoch!<1)throw new Error('synthetic owner authority unavailable');
+ const key:StorageHistoryKey={sourceId:namespace,sourceNamespace:namespace,ownerDigest:owner.ownerDigest!,day:scope.day,
+  dependencyDigest:scope.checkpointDependencyDigest,method:STORAGE_GRAPH_V11_CHECKPOINT_METHOD};
+ const envelope:StorageGraphWorkEnvelope={version:1,source:'v1.1',sourceId:namespace,sourceNamespace:namespace,
+  ownerDigest:owner.ownerDigest!,day:scope.day,metric,fixedNow:scope.fixedNow,dependencyDigest:scope.dependencyDigest,
+  checkpointDependencyDigest:scope.checkpointDependencyDigest,checkpointMethod:key.method,
+  checkpointKeyDigest:await storageHistoryKeyDigest(key),targetAuthorityEpoch:authorityEpoch as number,snapshot};
+ return {owner,scope,envelope};
+}
 async function api(){
  const configured={...b,USAGE_MONITOR_DB:typed(),ENVIRONMENT:'synthetic-development',ACCOUNT_SCOPED_INGEST_MODE:'disabled'} as Env;
  Reflect.set(configured,'TELEMETRY_STORAGE_MODE','typed');Reflect.set(configured,'TELEMETRY_STORAGE_NAMESPACE',namespace);
@@ -220,6 +242,48 @@ async function api(){
  return handleRequest(new Request(`https://synthetic.example.test/api/v1/community/daily?from=${day()}&to=${day()}`),configured);
 }
 describe('isolated allowance graph publication',()=>{
+ it('uses an aggregate hint and publishes ready fits before later graph work',async()=>{
+  await fixture();
+  const incompleteMeter=createD1InvocationBudget(10);
+  expect(await storageCommunityGraphPreviewReadyHint({...bindings(),source:incompleteMeter.wrap(typed()),
+   target:incompleteMeter.wrap(b.STORAGE_ANALYTICS_DB)})).toBe(false);
+  expect(incompleteMeter.queriesUsed).toBe(2);
+  await compute('fits');
+  let reachedHeavyGraph=false;
+  const laterUnavailable=new Proxy(b.STORAGE_ANALYTICS_DB,{get(db,key){
+   if(key==='prepare')return(sql:string)=>{if(sql.includes('INSERT INTO analytics_community_graph_scan')){
+    reachedHeavyGraph=true;throw new Error('synthetic later graph unavailable');}
+    return db.prepare(sql);};
+   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+  }});
+  // A failure inside the graph lane is recorded with its closed stage and the
+  // pass completes; the ready fits were already published before that lane.
+  const pass=await runStorageAnalyticsPass({...bindings(),target:laterUnavailable,publishCommunity:true,maxSteps:1,
+   deadlineMs:Date.now()+20_000});
+  expect(pass.graphFailure).toEqual({phase:'graph_work',reason:'application'});
+  expect(reachedHeavyGraph).toBe(true);
+  expect(await readPublishedStorageCommunityGraph(bindings())).not.toBeNull();
+ });
+ it('treats a positive hint as advisory and cannot publish a false cohort',async()=>{
+  await fixture();await compute('fits');
+  const template=(await b.STORAGE_ANALYTICS_DB.prepare("SELECT * FROM analytics_community_graph_results WHERE metric='fits'")
+   .first<Record<string,unknown>>())!;
+  await fixture('participant:second-hint-member');
+  const fake={...template,owner_digest:'f'.repeat(64)};
+  await b.STORAGE_ANALYTICS_DB.prepare(`INSERT INTO analytics_community_graph_results
+    (${Object.keys(fake).join(',')}) VALUES(${Object.keys(fake).map(()=>'?').join(',')})`).bind(...Object.values(fake)).run();
+  expect(await storageCommunityGraphPreviewReadyHint(bindings())).toBe(true);
+  expect(await publishStorageCommunityGraphPreview(bindings()))
+   .toMatchObject({state:'deferred',reason:'cache_pending'});
+  expect(await readPublishedStorageCommunityGraph(bindings())).toBeNull();
+ });
+ it('rechecks privacy authority after a positive hint',async()=>{
+  await fixture();await compute('fits');
+  expect(await storageCommunityGraphPreviewReadyHint(bindings())).toBe(true);
+  await typed().prepare("UPDATE collection_controls SET publication_enabled=0,control_state='degraded',revision=revision+1 WHERE singleton=1").run();
+  await expect(publishStorageCommunityGraphPreview(bindings())).rejects.toThrow('STORAGE_COMMUNITY_AUTHORITY_UNAVAILABLE');
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT count(*) n FROM analytics_community_graph_previews').first('n')).toBe(0);
+ });
  it('publishes actual fitted allowance through the real daily route while missing historical models remain gaps',async()=>{
   const f=await fixture();
   expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'deferred',reason:'cache_pending'});
@@ -259,9 +323,9 @@ describe('isolated allowance graph publication',()=>{
    .toMatchObject({state:'published',memberCount:16});
   expect({owners:16,modelQueries:modelMeter.queriesUsed,previewQueries:previewMeter.queriesUsed}).toMatchInlineSnapshot(`
     {
-      "modelQueries": 11,
+      "modelQueries": 14,
       "owners": 16,
-      "previewQueries": 13,
+      "previewQueries": 16,
     }
   `);
   expect(modelMeter.queriesUsed).toBeLessThanOrEqual(250);expect(previewMeter.queriesUsed).toBeLessThanOrEqual(250);
@@ -291,7 +355,7 @@ describe('isolated allowance graph publication',()=>{
   expect({owners:1000,previewQueries:meter.queriesUsed}).toMatchInlineSnapshot(`
     {
       "owners": 1000,
-      "previewQueries": 74,
+      "previewQueries": 77,
     }
   `);
   expect(meter.queriesUsed).toBeLessThanOrEqual(100);
@@ -314,16 +378,187 @@ describe('isolated allowance graph publication',()=>{
   expect(meter.queriesUsed).toBeLessThan(250);
   expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT count(*) n FROM analytics_community_graph_previews').first('n')).toBe(0);
  });
- it('requires the complete uploading cohort and hides old publication after new authority appears',async()=>{
+ it('keeps the last preview visible while another owner joins, then republishes the enlarged cohort',async()=>{
   await fixture();await compute('fits');await publishStorageCommunityGraphPreview(bindings());
   await fixture('participant:second-synthetic');
-  expect(await readPublishedStorageCommunityGraph(bindings())).toBeNull();
-  await compute('fits',today(),0);
+  const held=await readPublishedStorageCommunityGraph(bindings());expect(held).not.toBeNull();
+  expect(JSON.parse(held!.payload_json).coverage).toMatchObject({uploadingParticipantCount:1,cachedParticipantCount:1});
   expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'deferred',reason:'cache_pending'});
-  await compute('fits',today(),1);
+  expect(await readPublishedStorageCommunityGraph(bindings())).not.toBeNull();
+  await compute('fits',today(),0);
   expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'published',memberCount:2});
   const row=(await readPublishedStorageCommunityGraph(bindings()))!;
   expect(JSON.parse(row.payload_json).coverage).toMatchObject({uploadingParticipantCount:2,cachedParticipantCount:2});
+ });
+ it('finishes an exact owner pin across another owner hard change and rejects a same-owner correction',async()=>{
+  const first=await fixture('participant:calculation-owner-a');
+  const second=await fixture('participant:calculation-owner-b');
+  const owner=(await readStorageCommunityOwnerPage(typed())).find(value=>value.participantId===first.participantId)!;
+  const scope=await captureStorageGraphScope(typed(),{owner,day:today(),metric:'fits',
+   sourceId:namespace,sourceNamespace:namespace});
+  const before=await captureStorageCommunityAuthority(typed());
+  const secondDays=await activeDays(second),secondCorrected=evidence();
+  for(const record of [...secondCorrected.quota,...secondCorrected.usage])record.accountPlanAttribution={
+   ...record.accountPlanAttribution,accountTrackId:'account-track:v2:'+'c'.repeat(64)};
+  const secondRevision=await stage(typed(),second,await makeV11Day(day(),secondCorrected),true);
+  await activateDays(second,[...secondDays.filter(value=>value.day!==day()),secondRevision]);
+  expect((await captureStorageCommunityAuthority(typed())).publicAuthorityEpoch).toBeGreaterThan(before.publicAuthorityEpoch);
+  expect(await computeStorageGraphResult(bindings(),scope)).toMatchObject({state:'complete'});
+  const firstDays=await activeDays(first),firstCorrected=evidence();
+  for(const record of [...firstCorrected.quota,...firstCorrected.usage])record.accountPlanAttribution={
+   ...record.accountPlanAttribution,accountTrackId:'account-track:v2:'+'d'.repeat(64)};
+  const firstRevision=await stage(typed(),first,await makeV11Day(day(),firstCorrected),true);
+  await activateDays(first,[...firstDays.filter(value=>value.day!==day()),firstRevision]);
+  await expect(computeStorageGraphResult(bindings(),scope)).rejects.toThrow('v11 source changed during analysis');
+ });
+ it('finishes a selected retained generation after an append, then selects the queued successor',async()=>{
+  const f=await fixture('participant:selected-generation');
+  const initial=await selectedEnvelope('fits',today());
+  expect(await typed().prepare(`SELECT r.authority_epoch,x.device_id,x.generation_id,x.manifest_digest,x.from_day,x.through_day
+   FROM storage_v11_owner_links l JOIN storage_owner_revisions r ON r.owner_digest=l.owner_digest
+   JOIN storage_v11_event_sources x ON x.owner_digest=l.owner_digest AND x.participant_id=l.participant_id
+   WHERE l.owner_digest=? AND l.state='active' AND r.state='active' ORDER BY x.recorded_ms DESC LIMIT 1`)
+   .bind(initial.owner.ownerDigest).first()).toMatchObject({authority_epoch:initial.envelope.targetAuthorityEpoch,
+    device_id:initial.envelope.snapshot.deviceId,
+    generation_id:initial.envelope.snapshot.generationId,manifest_digest:initial.envelope.snapshot.manifestDigest,
+    from_day:initial.envelope.snapshot.fromDay,through_day:initial.envelope.snapshot.throughDay});
+  const created=await ensureStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,
+   envelope:initial.envelope,nowMs:10});
+  expect(created.status).toBe('created');
+  await appendToday(f,3);
+  const current=(await readStorageCommunityOwnerPage(typed()))[0]!;
+  expect(current.inputRevision).toBeGreaterThan(initial.envelope.snapshot.inputRevision);
+  await b.STORAGE_ANALYTICS_DB.prepare(`INSERT INTO analytics_community_graph_scan
+   (source_id,revision,tick,current_position,history_position) VALUES(?,1,0,0,0)
+   ON CONFLICT(source_id) DO UPDATE SET revision=revision+1,tick=0,current_position=0`).bind(namespace).run();
+  expect(await advanceStorageCommunityGraphWork(bindings())).toMatchObject({state:'complete',metric:'fits',day:today()});
+  const firstResult=await b.STORAGE_ANALYTICS_DB.prepare(`SELECT input_revision,payload_fingerprint
+   FROM analytics_community_graph_results WHERE source_id=? AND owner_digest=? AND metric='fits' AND day=?`)
+   .bind(namespace,initial.owner.ownerDigest,today()).first<{input_revision:number;payload_fingerprint:string}>();
+  expect(firstResult).toMatchObject({input_revision:initial.envelope.snapshot.inputRevision,
+   payload_fingerprint:initial.envelope.snapshot.fingerprint});
+  expect(await readStorageGraphWorkSelection(b.STORAGE_ANALYTICS_DB,{sourceId:namespace,
+   ownerDigest:initial.owner.ownerDigest!,day:today(),metric:'fits'})).toBeNull();
+  expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'published',memberCount:1});
+
+  const queued=await selectedEnvelope('fits',today());
+  expect(queued.envelope.snapshot.inputRevision).toBe(current.inputRevision);
+  await b.STORAGE_ANALYTICS_DB.prepare(`UPDATE analytics_community_graph_scan
+   SET revision=revision+1,tick=0,current_position=0`).run();
+  expect(await advanceStorageCommunityGraphWork(bindings())).toMatchObject({state:'complete',metric:'fits',day:today()});
+  expect(queued.envelope.snapshot.fingerprint).not.toBe(initial.envelope.snapshot.fingerprint);
+  expect(await readStorageGraphWorkSelection(b.STORAGE_ANALYTICS_DB,{sourceId:namespace,
+   ownerDigest:initial.owner.ownerDigest!,day:today(),metric:'fits'})).toBeNull();
+  expect(await b.STORAGE_ANALYTICS_DB.prepare(`SELECT input_revision FROM analytics_community_graph_results
+   WHERE source_id=? AND owner_digest=? AND metric='fits' AND day=?`).bind(namespace,initial.owner.ownerDigest,today())
+   .first('input_revision')).toBe(current.inputRevision);
+ });
+ it('selects a dormant owner when the calculation day is after its last uploaded day',async()=>{
+  const f=await createV11DeviceFixture(typed(),{participantId:'participant:selected-dormant',grant:true});
+  const uploaded=await stage(typed(),f,await makeV11Day(day(),evidence()),true);
+  await activateDays(f,[uploaded],Date.parse(day()+'T12:00:00.000Z'));
+  for(let pass=0;pass<32;pass++)if((await advanceStorageAnalytics(bindings())).state==='idle')break;
+  const selected=await selectedEnvelope('fits',today());
+  expect(selected.envelope.snapshot.throughDay).toBe(day());
+  expect(selected.envelope.day).toBe(today());
+  expect(selected.envelope.day>selected.envelope.snapshot.throughDay).toBe(true);
+  const ensured=await ensureStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,
+   envelope:selected.envelope,nowMs:10});
+  expect(ensured.status).toBe('created');
+  await b.STORAGE_ANALYTICS_DB.prepare(`INSERT INTO analytics_community_graph_scan
+   (source_id,revision,tick,current_position,history_position) VALUES(?,1,0,0,0)
+   ON CONFLICT(source_id) DO UPDATE SET revision=revision+1,tick=0,current_position=0`).bind(namespace).run();
+  expect(await advanceStorageCommunityGraphWork(bindings())).toMatchObject({state:'complete',metric:'fits',day:today()});
+ });
+ it('invalidates a claimed snapshot across an authority epoch and cannot resurrect it after reactivation',async()=>{
+  await fixture('participant:selected-revocation');
+  const {owner,envelope}=await selectedEnvelope('model',day());
+  const ensured=await ensureStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,envelope,nowMs:10});
+  if(!('selection'in ensured)||!ensured.selection)throw new Error('synthetic selection unavailable');
+  const claimed=await claimStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,
+   selection:ensured.selection,claimToken:'synthetic-claim-token',nowMs:11});
+  expect(claimed.status).toBe('claimed');
+  // Simulate withdrawal followed by reactivation at the next hard epoch. An
+  // ordinary source append leaves this epoch unchanged and does not take this path.
+  await typed().prepare(`UPDATE storage_owner_revisions SET authority_epoch=authority_epoch+1
+   WHERE owner_digest=?`).bind(owner.ownerDigest).run();
+  expect(await loadLiveStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,
+   key:{sourceId:namespace,ownerDigest:owner.ownerDigest!,day:day(),metric:'model'},nowMs:12})).toBeNull();
+  await b.STORAGE_ANALYTICS_DB.prepare(`UPDATE analytics_owner_state SET authority_epoch=authority_epoch+1
+   WHERE source_id=? AND owner_digest=?`).bind(namespace,owner.ownerDigest).run();
+  expect(await readStorageGraphWorkSelection(b.STORAGE_ANALYTICS_DB,{sourceId:namespace,
+   ownerDigest:owner.ownerDigest!,day:day(),metric:'model'})).toBeNull();
+  expect((await ensureStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,
+   envelope,nowMs:13})).status).toBe('blocked');
+ });
+ it('admits one exact snapshot claimant and recovers an expired claim without forking work',async()=>{
+  await fixture('participant:selected-claim-cas');
+  const {owner,envelope}=await selectedEnvelope('fits',today());
+  const ensured=await ensureStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,envelope,nowMs:10});
+  if(!('selection'in ensured)||!ensured.selection)throw new Error('synthetic selection unavailable');
+  const [first,second]=await Promise.all([
+   claimStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,selection:ensured.selection,
+    claimToken:'synthetic-claim-token-a',nowMs:11,leaseMs:20}),
+   claimStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,selection:ensured.selection,
+    claimToken:'synthetic-claim-token-b',nowMs:11,leaseMs:20}),
+  ]);
+  expect([first.status,second.status].sort()).toEqual(['busy','claimed']);
+  const recovered=await loadLiveStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,
+   key:{sourceId:namespace,ownerDigest:owner.ownerDigest!,day:today(),metric:'fits'},nowMs:31});
+  expect(recovered).toMatchObject({state:'pending'});
+  const next=await claimStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,selection:recovered!,
+   claimToken:'synthetic-claim-token-c',nowMs:32,leaseMs:20});
+  expect(next).toMatchObject({status:'claimed',selection:{envelopeSha256:ensured.selection.envelopeSha256}});
+  await expect(readStorageGraphWorkSelection(legacy(),{sourceId:namespace,ownerDigest:owner.ownerDigest!,
+   day:today(),metric:'fits'})).rejects.toThrow();
+ });
+ it('replaces a selection pinned by an earlier build instead of failing that lane every pass',async()=>{
+  await fixture('participant:selected-retired-method');
+  const {owner,envelope}=await selectedEnvelope('fits',today());
+  const key={sourceId:namespace,ownerDigest:owner.ownerDigest!,day:today(),metric:'fits' as const};
+  // A row recorded before the checkpoint method and the dependency digests
+  // changed: well formed and still live, but pinning values this build no
+  // longer computes, so every claim of that owner-day used to fail the lane.
+  const stale={...envelope,checkpointMethod:'v11-shared-checkpoint-2',
+   dependencyDigest:'b'.repeat(64),checkpointDependencyDigest:'c'.repeat(64)};
+  expect((await ensureStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,
+   envelope:stale,nowMs:10})).status).toBe('created');
+  const pin=()=>b.STORAGE_ANALYTICS_DB.prepare(`INSERT INTO analytics_community_graph_scan
+   (source_id,revision,tick,current_position,history_position) VALUES(?,1,0,0,0)
+   ON CONFLICT(source_id) DO UPDATE SET revision=revision+1,tick=0,current_position=0`).bind(namespace).run();
+  await pin();
+  expect(await advanceStorageCommunityGraphWork(bindings()))
+   .toMatchObject({state:'deferred',metric:'fits',day:today(),reason:'selection_changed'});
+  expect(await readStorageGraphWorkSelection(b.STORAGE_ANALYTICS_DB,key)).toBeNull();
+  await pin();
+  expect(await advanceStorageCommunityGraphWork(bindings())).toMatchObject({state:'complete',metric:'fits',day:today()});
+  expect(await b.STORAGE_ANALYTICS_DB.prepare(`SELECT count(*) n FROM analytics_community_graph_results
+   WHERE source_id=? AND owner_digest=? AND metric='fits' AND day=?`).bind(namespace,owner.ownerDigest,today()).first('n')).toBe(1);
+  expect(await readStorageGraphWorkSelection(b.STORAGE_ANALYTICS_DB,key)).toBeNull();
+ });
+ it('holds a long claim lease against a second claimant until it expires',async()=>{
+  await fixture('participant:selected-long-lease');
+  const {owner,envelope}=await selectedEnvelope('fits',today());
+  const ensured=await ensureStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,envelope,nowMs:10});
+  if(!('selection'in ensured)||!ensured.selection)throw new Error('synthetic selection unavailable');
+  // The long graph-only pass claims for twelve minutes so its own nine-minute
+  // window cannot end with another pass already holding the same owner-day.
+  const lease=12*60_000,key={sourceId:namespace,ownerDigest:owner.ownerDigest!,day:today(),metric:'fits' as const};
+  const claimed=await claimStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,
+   selection:ensured.selection,claimToken:'synthetic-long-claim-a',nowMs:10,leaseMs:lease});
+  expect(claimed).toMatchObject({status:'claimed',selection:{state:'claimed',claimExpiresMs:10+lease}});
+  // Past the default five-minute lease the claim is still live, so a second
+  // claimant is refused instead of forking the same owner-day work.
+  expect(await loadLiveStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,key,nowMs:10+300_001}))
+   .toMatchObject({state:'claimed'});
+  expect((await claimStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,
+   selection:claimed.selection!,claimToken:'synthetic-long-claim-b',nowMs:10+300_001,leaseMs:lease})).status).toBe('busy');
+  // An abandoned long claim still recovers on its own once the lease expires.
+  const recovered=await loadLiveStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,key,nowMs:11+lease});
+  expect(recovered).toMatchObject({state:'pending'});
+  expect(await claimStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,selection:recovered!,
+   claimToken:'synthetic-long-claim-c',nowMs:12+lease,leaseMs:lease}))
+   .toMatchObject({status:'claimed',selection:{envelopeSha256:ensured.selection.envelopeSha256}});
  });
  it('repairs corrupt completed days instead of permanently skipping them',async()=>{
   await fixture();await compute('model');await compute('fits');
@@ -361,7 +596,7 @@ describe('isolated allowance graph publication',()=>{
   await retireStorageCommunityGraphPublications(bindings());
   expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT count(*) n FROM analytics_community_graph_previews').first('n')).toBe(0);
  });
- it('retains a proved historical point across a real outside-window append, but hides attribution corrections',async()=>{
+ it('retains a proved historical point across a real outside-window append and keeps it visible while a correction recomputes',async()=>{
   const f=await fixture();await compute('model');await compute('fits');
   await publishStorageCommunityModelDay(bindings(),{day:day()});await publishStorageCommunityGraphPreview(bindings());
   const old=await b.STORAGE_ANALYTICS_DB.prepare('SELECT * FROM analytics_community_model_publications').first();
@@ -384,9 +619,17 @@ describe('isolated allowance graph publication',()=>{
   await activateDays(f,[revised,current]);
   const after=await captureStorageCommunityAuthority(typed());
   expect(after.graphInvalidationEpoch).toBeGreaterThan(appended.graphInvalidationEpoch);
-  expect(await readPublishedStorageCommunityGraph(bindings())).toBeNull();
+  // The correction queues that owner's recalculation. The completed point and
+  // the preview remain the last good result; the preview now reports that its
+  // inputs are no longer current instead of disappearing.
+  expect(await readPublishedStorageCommunityGraph(bindings())).not.toBeNull();
+  expect(await publishStorageCommunityModelDay(bindings(),{day:day()})).toMatchObject({state:'deferred',reason:'cache_pending'});
+  expect(['published','unchanged']).toContain((await publishStorageCommunityGraphPreview(bindings())).state);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT inputs_current FROM analytics_community_graph_previews').first('inputs_current')).toBe(0);
+  expect(await readPublishedStorageCommunityGraph(bindings())).not.toBeNull();
   await retireStorageCommunityGraphPublications(bindings());
-  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT count(*) n FROM analytics_community_model_publications').first('n')).toBe(0);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT * FROM analytics_community_model_publications').first()).toEqual(old);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT count(*) n FROM analytics_community_graph_previews').first('n')).toBe(1);
  });
  it('publishes closed history for two active owners while both append today before every attempt',async()=>{
   const fixtures=[await fixture('participant:continuous-a'),await fixture('participant:continuous-b')];
@@ -439,6 +682,127 @@ describe('isolated allowance graph publication',()=>{
   expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'published'});
   expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT inputs_current FROM analytics_community_graph_previews').first('inputs_current')).toBe(1);
   expect((await readStorageCommunityProgress(bindings(),Date.now())).work.phase).toBe('history');
+ });
+ it('retries one current-authority race from a fresh graph scope',async()=>{
+  await fixture();let authorityReads=0,changed=false;
+  const source=observed(typed(),async(sql,moment)=>{
+   if(moment!=='before'||!sql.includes('SELECT s.source_id AS sourceId'))return;
+   authorityReads++;
+   if(authorityReads===2){changed=true;await typed().prepare(`UPDATE ingestion_analytics_separation
+     SET policy_revision=policy_revision+1 WHERE id=1`).run();}
+  });
+  expect(await advanceStorageCommunityGraphWork({...bindings(),source}))
+   .toMatchObject({state:'complete',metric:'fits',day:today()});
+  expect(changed).toBe(true);
+  expect(authorityReads).toBeGreaterThanOrEqual(5);
+ });
+ it('bounds graph scope authority retry and reports a second race as source changed',async()=>{
+  await fixture();let authorityReads=0;
+  const source=observed(typed(),async(sql,moment)=>{
+   if(moment!=='before'||!sql.includes('SELECT s.source_id AS sourceId'))return;
+   authorityReads++;
+   if(authorityReads===2||authorityReads===4)await typed().prepare(`UPDATE ingestion_analytics_separation
+     SET policy_revision=policy_revision+1 WHERE id=1`).run();
+  });
+  await expect(advanceStorageCommunityGraphWork({...bindings(),source}))
+   .rejects.toMatchObject({stage:'graph_scope',reason:'source_changed'});
+  expect(authorityReads).toBe(4);
+ });
+ it('prioritizes missing current fits without changing the four-history, one-fit, one-model cadence',async()=>{
+  for(const suffix of ['a','b','c'])await fixture(`participant:fit-priority-${suffix}`);
+  const owners=await readStorageCommunityOwnerPage(typed());expect(owners).toHaveLength(3);
+  for(let index=0;index<owners.length;index++)expect((await compute('fits',today(),index)).state).toBe('complete');
+  expect(owners[0]!.inputRevision).toBeGreaterThan(0);
+  await b.STORAGE_ANALYTICS_DB.prepare(`UPDATE analytics_community_graph_results SET input_revision=?
+    WHERE owner_digest=? AND metric='fits'`).bind(owners[0]!.inputRevision-1,owners[0]!.ownerDigest).run();
+  await b.STORAGE_ANALYTICS_DB.prepare(`UPDATE analytics_community_graph_results SET source_kind='v1'
+    WHERE owner_digest=? AND metric='fits'`).bind(owners[1]!.ownerDigest).run();
+  await b.STORAGE_ANALYTICS_DB.prepare(`UPDATE analytics_community_graph_results SET method='obsolete'
+    WHERE owner_digest=? AND metric='fits'`).bind(owners[2]!.ownerDigest).run();
+  await b.STORAGE_ANALYTICS_DB.prepare(`UPDATE analytics_community_graph_scan
+    SET revision=revision+1,tick=0,current_position=0,history_position=0`).run();
+
+  let failedOwner='';
+  const unavailable=new Proxy(b.STORAGE_ANALYTICS_DB,{get(db,key){
+   if(key==='prepare')return(sql:string)=>{
+    const statement=db.prepare(sql);
+    if(!sql.includes('owner_digest=? AND metric=? AND day=?'))return statement;
+    return new Proxy(statement,{get(s,property){
+     if(property==='bind')return(...args:unknown[])=>{
+      const bound=s.bind(...args);return new Proxy(bound,{get(original,member){
+       if(member==='first')return async()=>{failedOwner=String(args[1]);throw new Error('synthetic fit read unavailable');};
+       const value=Reflect.get(original,member);return typeof value==='function'?value.bind(original):value;
+      }});
+     };
+     const value=Reflect.get(s,property);return typeof value==='function'?value.bind(s):value;
+    }});
+   };
+   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+  }});
+  await expect(advanceStorageCommunityGraphWork({...bindings(),target:unavailable})).rejects.toThrow();
+  expect(failedOwner).toBe(owners[1]!.ownerDigest);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT tick,current_position,history_position FROM analytics_community_graph_scan')
+   .first()).toMatchObject({tick:1,current_position:3,history_position:0});
+
+  const intervening=[];
+  for(let claim=0;claim<5;claim++)intervening.push(await advanceStorageCommunityGraphWork(bindings()));
+  expect(intervening.map(result=>[result.metric,result.day])).toEqual([
+   ['model',day()],['model',day()],['model',today()],['model',day()],['model',day()]
+  ]);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT tick,current_position,history_position FROM analytics_community_graph_scan')
+   .first()).toMatchObject({tick:0,current_position:4,history_position:1});
+  expect(await advanceStorageCommunityGraphWork(bindings())).toMatchObject({metric:'fits',day:today()});
+  expect(await b.STORAGE_ANALYTICS_DB.prepare(`SELECT method,source_kind FROM analytics_community_graph_results
+    WHERE owner_digest=? AND metric='fits'`).bind(owners[2]!.ownerDigest).first())
+   .toMatchObject({method:STORAGE_GRAPH_METHOD,source_kind:'v1.1'});
+
+  expect((await compute('fits',today(),1)).state).toBe('complete');
+  await b.STORAGE_ANALYTICS_DB.prepare(`UPDATE analytics_community_graph_scan
+    SET revision=revision+1,tick=0,current_position=0`).run();
+  const target=capturedQueries();
+  expect(await advanceStorageCommunityGraphWork({...bindings(),target:target.database}))
+   .toMatchObject({state:'reused',metric:'fits',day:today()});
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT tick,current_position,history_position FROM analytics_community_graph_scan')
+   .first()).toMatchObject({tick:1,current_position:1,history_position:1});
+  const cacheRead=target.queries.find(query=>query.sql.includes("metric='fits'")&&query.sql.includes('owner_digest IN'))!;
+  expect(cacheRead.args.slice(0,3)).toEqual([namespace,today(),STORAGE_GRAPH_METHOD]);
+  const plan=JSON.stringify((await b.STORAGE_ANALYTICS_DB.prepare('EXPLAIN QUERY PLAN '+cacheRead.sql)
+   .bind(...cacheRead.args).all()).results);
+  expect(plan).toMatch(/SEARCH analytics_community_graph_results USING (PRIMARY KEY|INDEX analytics_community_graph_day)/);
+  expect(plan).not.toMatch(/SCAN analytics_community_graph_results/);
+ });
+ it('prioritizes missing historical models while retaining the durable history cadence',async()=>{
+  for(const suffix of ['a','b','c'])await fixture(`participant:model-priority-${suffix}`);
+  const owners=await readStorageCommunityOwnerPage(typed());expect(owners).toHaveLength(3);
+  for(let index=0;index<owners.length;index++)expect((await compute('model',day(),index)).state).toBe('complete');
+  await b.STORAGE_ANALYTICS_DB.prepare(`DELETE FROM analytics_community_graph_results
+    WHERE source_id=? AND owner_digest=? AND metric='model' AND day=?`).bind(namespace,owners[1]!.ownerDigest,day()).run();
+  await b.STORAGE_ANALYTICS_DB.prepare(`INSERT INTO analytics_community_graph_scan
+    (source_id,revision,tick,current_position,history_position) VALUES(?,1,1,0,0)
+    ON CONFLICT(source_id) DO UPDATE SET revision=revision+1,tick=1,current_position=0,history_position=0`)
+   .bind(namespace).run();
+
+  let failedOwner='';
+  const unavailable=new Proxy(b.STORAGE_ANALYTICS_DB,{get(db,key){
+  if(key==='prepare')return(sql:string)=>{
+   const statement=db.prepare(sql);
+   if(!sql.includes('owner_digest=? AND metric=? AND day=?'))return statement;
+    return new Proxy(statement,{get(s,property){
+     if(property==='bind')return(...args:unknown[])=>{
+      const bound=s.bind(...args);return new Proxy(bound,{get(original,member){
+       if(member==='first')return async()=>{failedOwner=String(args[1]);throw new Error('synthetic model read unavailable');};
+       const value=Reflect.get(original,member);return typeof value==='function'?value.bind(original):value;
+      }});
+     };
+     const value=Reflect.get(s,property);return typeof value==='function'?value.bind(s):value;
+    }});
+   };
+   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+  }});
+  await expect(advanceStorageCommunityGraphWork({...bindings(),target:unavailable})).rejects.toThrow();
+  expect(failedOwner).toBe(owners[1]!.ownerDigest);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT tick,current_position,history_position FROM analytics_community_graph_scan')
+   .first()).toMatchObject({tick:2,current_position:0,history_position:2});
  });
  it('refreshes only the proof of an unchanged preview after an actual outside-window append',async()=>{
   const f=await fixture(),days=await activeDays(f);
@@ -588,4 +952,21 @@ describe('isolated allowance graph publication',()=>{
   });
   expect(await readPublishedStorageCommunityAdminPreview({...bindings(),target:readRace})).toBeNull();expect(raced).toBe(true);
  });
+});
+
+
+it('admits a real graph calculation with pending delivery after the scheduler reserves 175 statements',async()=>{
+ await fixture();
+ const incoming=await createV11DeviceFixture(typed(),{participantId:'participant:z-busy',grant:true});
+ await activate(typed(),incoming,await makeV11Day(day(),evidence()),true);
+ const meter=createD1InvocationBudget(900);
+ const scoped={...bindings(),source:meter.wrap(typed()),target:meter.wrap(b.STORAGE_ANALYTICS_DB),
+  ledger:meter.wrap(b.DELETION_LEDGER)};
+ for(let i=0;i<175;i++)await scoped.source.prepare('SELECT 1').run();
+ const result=await runStorageAnalyticsPass({...scoped,publishCommunity:true,maxQueries:meter.remainingQueries,
+  maxSteps:1,deadlineMs:Date.now()+20_000});
+ expect(result.graphCalculations).toBe(1);
+ expect(meter.queriesUsed).toBeLessThanOrEqual(900);
+ expect(await b.STORAGE_ANALYTICS_DB.prepare(
+  "SELECT COUNT(*) AS n FROM analytics_community_graph_results WHERE metric='fits'").first<number>('n')).toBe(1);
 });

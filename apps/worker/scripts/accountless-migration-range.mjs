@@ -2,6 +2,20 @@
 const quote = s => '"'+s.replaceAll('"','""')+'"';
 const check = (ok,code) => {if(!ok)throw Error('ACCOUNTLESS_RANGE_'+code);};
 const prefix='_accountless_move_';
+/** Keep SQLite expression depth logarithmic for source-pinned wide rows/tables.
+ * Integer byte terms are nonnegative and bounded; IS predicates preserve NULLs.
+ */
+export function balancedSqlExpression(terms,operator) {
+  check(Array.isArray(terms)&&terms.every(term=>typeof term==='string'&&term.length>0)&&['+','AND'].includes(operator),'EXPRESSION');
+  if(!terms.length)return operator==='+'?'0':'1';
+  function combine(from,to) {
+    if(to-from===1)return '('+terms[from]+')';
+    const middle=from+Math.floor((to-from)/2);
+    return '('+combine(from,middle)+' '+operator+' '+combine(middle,to)+')';
+  }
+  return combine(0,terms.length);
+}
+
 export function usesRangeRecordBatch(current) {
   const order=current.phase==='evacuate'?[...current.order].reverse():current.order;
   return current.rangeRecordBatches===true && order[current.tableIndex]==='telemetry_v1_records';
@@ -13,7 +27,7 @@ function context(current) {
   check(Number.isSafeInteger(current.revision)&&current.revision>=0&&Number.isSafeInteger(current.cursor)&&current.cursor>=0,'COUNTER');
   return {table,d,evacuating,from:evacuating?table:prefix+table,to:evacuating?prefix+table:table,key:evacuating?'rowid':'_move_key'};
 }
-const bytes=d=>d.columns.map(c=>`COALESCE(length(CAST(${quote(c)} AS BLOB)),0)`).join('+');
+const bytes=d=>balancedSqlExpression(d.columns.map(c=>`COALESCE(length(CAST(${quote(c)} AS BLOB)),0)`),'+');
 const limitRows=n=>check(Number.isSafeInteger(n)&&n>0&&n<=8192,'ROWS');
 export function accountlessRangeSelection(current,{maxRows=1024}={}) {
   limitRows(maxRows);const {from,key,d}=context(current);
@@ -41,7 +55,7 @@ export function planAccountlessRangeBatch({current,selection,expectedRevision,ma
     if(evacuating)add(`INSERT INTO ${quote(to)} (_move_key,_original_rowid,${cols}) SELECT rowid,rowid,${cols} FROM ${quote(from)} WHERE ${where}`,...bounds);
     else add(`INSERT INTO ${quote(to)} (rowid,${cols}) SELECT _original_rowid,${cols} FROM ${quote(from)} WHERE ${where}`,...bounds);
     assert('changes()=?',count);
-    const equal=d.columns.map(c=>`a.${quote(c)} IS b.${quote(c)}`).join(' AND ');
+    const equal=balancedSqlExpression(d.columns.map(c=>`a.${quote(c)} IS b.${quote(c)}`),'AND');
     assert(`SELECT COUNT(*)=? FROM ${quote(prefix+table)} b JOIN ${quote(table)} a ON a.rowid=b._original_rowid WHERE b._move_key BETWEEN CAST(? AS INTEGER) AND CAST(? AS INTEGER) AND ${equal}`,count,...bounds);
     add(`DELETE FROM ${quote(from)} WHERE ${where}`,...bounds);assert('changes()=?',count);
   } else assert(`NOT EXISTS(SELECT 1 FROM ${quote(from)} LIMIT 1)`);

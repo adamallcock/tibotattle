@@ -16,14 +16,17 @@ const source=()=>bindings.USAGE_MONITOR_DB, namespace='synthetic-v1-source', sou
 const day=()=>new Date().toISOString().slice(0,10);
 const changes=()=>readIngestionChanges(source(),sourceId,0);
 const count=(table:string)=>source().prepare(`SELECT count(*) n FROM ${table}`).first<number>('n');
-beforeEach(async()=>{
- await reset();await applyD1Migrations(source(),bindings.TEST_MIGRATIONS);
+async function migrate(isolation=bindings.TEST_INGESTION_ISOLATION_MIGRATIONS){
+ await applyD1Migrations(source(),bindings.TEST_MIGRATIONS);
  await applyD1Migrations(source(),bindings.TEST_TYPED_INGESTION_MIGRATIONS);
  await applyD1Migrations(source(),bindings.TEST_INGESTION_BRIDGE_MIGRATIONS);
  await applyD1Migrations(source(),bindings.TEST_TYPED_V11_ADMISSION_MIGRATIONS);
  await applyD1Migrations(source(),bindings.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
- await applyD1Migrations(source(),bindings.TEST_INGESTION_ISOLATION_MIGRATIONS);
+ await applyD1Migrations(source(),isolation);
  await initializeStorageSource(source(),sourceId);await initializeTypedV1Admission(source(),namespace);
+}
+beforeEach(async()=>{
+ await reset();await migrate();
 });
 function withBatch(batch:D1Database['batch']):D1Database{return new Proxy(source(),{get(db,key){if(key==='batch')return batch;
  const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;}});}
@@ -55,6 +58,17 @@ async function stamp(){return {
  authority:await source().prepare('SELECT authority_epoch FROM storage_source_state').first<number>('authority_epoch'),
  hard:await source().prepare('SELECT graph_invalidation_epoch FROM community_snapshot_mutation_control').first<number>('graph_invalidation_epoch')};}
 describe('isolated typed v1 conservative append classification',()=>{
+ it('replaces the classifier over retained v1 rows without rewriting source data',async()=>{
+  await reset();await migrate(bindings.TEST_INGESTION_ISOLATION_MIGRATIONS.filter(m=>/^000[1-3]_/.test(m.name)));
+  const first=await seed();await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);const before=await stamp();
+  const other=await createV11DeviceFixture(source(),{participantId:first.fixture.participantId});
+  const next=await seed('usage',1,other,1,1,4);
+  await applyD1Migrations(source(),bindings.TEST_INGESTION_ISOLATION_MIGRATIONS.filter(m=>/^0004_/.test(m.name)));
+  expect(await count('telemetry_v1_chunks')).toBe(1);expect(await count('typed_telemetry_records')).toBe(1);
+  await insertTypedTelemetryV1Chunk(source(),next.insert,namespace);
+  expect((await changes()).map(event=>event.kind)).toEqual(['owner-active','source-updated']);
+  expect(await stamp()).toEqual(before);expect(await count('typed_telemetry_records')).toBe(2);
+ });
  it('keeps a completed owner authority across 200-record append with one event and exact receipt replay',async()=>{
   const first=await seed();await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);const before=await stamp();
   const next=await seed('usage',200,first.fixture,1,1,1);
@@ -74,12 +88,28 @@ describe('isolated typed v1 conservative append classification',()=>{
   expect((await changes()).map(e=>e.kind)).toEqual(['owner-active','owner-active']);
   expect((await stamp()).authority).toBeGreaterThan(before.authority!);
  });
- it('keeps another device hard even with disjoint occurrences and a unique chunk slot',async()=>{
-  const first=await seed();await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);const before=await stamp();
+ it('keeps authority stable when a newer device wins one changed day, while a correction remains hard',async()=>{
+  const first=await seed();first.insert.createdAt=`${day()}T01:00:00.000Z`;
+  await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);const before=await stamp();
+  const {loadV1SourcePin}=await import('../src/telemetry-v1-source-selection');
+  const beforePin=await loadV1SourcePin(source(),{participantId:first.fixture.participantId},{includeDayDependencies:true});
   const other=await createV11DeviceFixture(source(),{participantId:first.fixture.participantId});
-  const next=await seed('usage',1,other,1,1,4);await insertTypedTelemetryV1Chunk(source(),next.insert,namespace);
-  expect((await changes()).at(-1)!.kind).toBe('owner-active');expect((await stamp()).authority).toBeGreaterThan(before.authority!);
+  const next=await seed('usage',1,other,1,1,4);next.insert.createdAt=`${day()}T02:00:00.000Z`;
+  await insertTypedTelemetryV1Chunk(source(),next.insert,namespace);
+  const afterPin=await loadV1SourcePin(source(),{participantId:first.fixture.participantId},{includeDayDependencies:true});
+  expect((await changes()).map(event=>event.kind)).toEqual(['owner-active','source-updated']);
+  expect(await stamp()).toEqual(before);
+  expect(beforePin.winners).toEqual([expect.objectContaining({device_id:first.fixture.deviceId})]);
+  expect(afterPin.winners).toEqual([expect.objectContaining({device_id:other.deviceId})]);
+  expect(afterPin.fingerprint).not.toBe(beforePin.fingerprint);
+  expect(afterPin.dayDependencies).toEqual([expect.objectContaining({day:day(),deviceId:other.deviceId})]);
   expect(await count('typed_telemetry_records')).toBe(2);
+  const correction=await seed('usage',1,other,2,1,4);
+  correction.insert.createdAt=`${day()}T03:00:00.000Z`;
+  correction.insert.supersedes=await currentTelemetryV1Chunk(source(),other.participantId,other.deviceId,'usage',day(),1);
+  await insertTypedTelemetryV1Chunk(source(),correction.insert,namespace);
+  expect((await changes()).at(-1)!.kind).toBe('owner-active');
+  expect((await stamp()).authority).toBeGreaterThan(before.authority!);
  });
  it('keeps a legacy-format crossover hard even for a unique same-device append',async()=>{
   const first=await seed();await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);

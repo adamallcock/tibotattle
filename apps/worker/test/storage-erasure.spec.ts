@@ -1,5 +1,6 @@
 import {captureStorageCommunityAuthority} from '../src/storage-community-authority';
 import {saveStorageHistoryCheckpoint} from '../src/storage-history-checkpoint';
+import {reduceGraphDayProjection,writeGraphDayProjection} from '../src/graph-day-projection';
 import {createV1QuotaAcquisitionCheckpoint} from '../src/quota-analysis-v1-reader';
 import {MODEL_HISTORY_METHOD_VERSION} from '../src/quota-analysis-v1';
 import {env,reset,applyD1Migrations,type D1Migration} from 'cloudflare:test';
@@ -53,6 +54,17 @@ async function deliver(){for(let i=0;i<30;i++)if((await advanceStorageAnalytics(
 const count=(table:string)=>target().prepare(`SELECT COUNT(*) n FROM ${table}`).first<number>('n');
 async function drain(){for(let n=0;n<20;n++)if(!(await advanceStorageErasureJobs(bindings())).pending)return;throw new Error('synthetic erasure bound');}
 describe('cross-store physical erasure completion',()=>{
+ it('accepts only a structurally successful empty ledger result',async()=>{
+  const malformed=new Proxy(b.DELETION_LEDGER,{get(db,key){if(key==='prepare')return(sql:string)=>{
+   const statement=db.prepare(sql);if(!sql.includes("FROM storage_erasure_jobs WHERE source_id=? AND state='pending'"))return statement;
+   return new Proxy(statement,{get(value,member){if(member==='bind')return(...args:unknown[])=>new Proxy(value.bind(...args),{
+    get(bound,boundMember){if(boundMember==='all')return async()=>({success:false,results:[]});
+     const candidate=Reflect.get(bound,boundMember);return typeof candidate==='function'?candidate.bind(bound):candidate;}});
+    const candidate=Reflect.get(value,member);return typeof candidate==='function'?candidate.bind(value):candidate;}});};
+   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;}});
+  await expect(advanceStorageErasureJobs({...bindings(),ledger:malformed})).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+  expect(await advanceStorageErasureJobs(bindings())).toEqual({completed:0,pending:false});
+ });
  it('fails closed when analytics is offline, then resumes from independent mapping after source deletion',async()=>{
   const f=await fixture(5);await deliver();expect(await count('analytics_v11_value_pages')).toBe(5);
   const offline=new Proxy(target(),{get(db,key){if(key==='prepare')return()=>{throw new Error('synthetic analytics offline');};const v=Reflect.get(db,key);return typeof v==='function'?v.bind(db):v;}});
@@ -143,6 +155,44 @@ describe('cross-store physical erasure completion',()=>{
   expect(await count('analytics_storage_erasure_receipts')).toBe(1);expect(await count('analytics_storage_erasure_fences')).toBe(1);
   await expect(saveStorageHistoryCheckpoint({target:target(),key,checkpoint,expectedHead:null})).rejects.toThrow();
   await expect(target().prepare('INSERT INTO analytics_community_graph_execution VALUES(?,?,?,?,?)').bind(sourceId,o,today(),d,'checkpoint').run()).rejects.toThrow('storage_owner_erased');
+ });
+ it('refuses to complete while a prepared graph day survives, then removes it',async()=>{
+  const f=await fixture();await deliver();const o=f.event.ownerDigest;
+  const day='2026-09-10',dayMs=Date.parse(`${day}T00:00:00.000Z`);
+  const projectionKey={sourceId,sourceLayout:'typed-v11' as const,sourceNamespace,ownerDigest:o,
+   deviceId:'synthetic-device',manifestId:'synthetic-manifest',manifestDigest:'b'.repeat(64),day};
+  const projection=reduceGraphDayProjection(day,[{sourceRowId:1,observedAtMs:dayMs+60000,
+   anchor:{contextKey:'openai_codex|codex',observedAtMs:dayMs+60000,planType:'pro',planVariant:'unknown',
+    continuityId:null,conflicted:false,accountScopeId:null,planBasis:'same_source_occurrence'},
+   row:{occurrence_id:'occ-00000001',observed_at:new Date(dayMs+60000).toISOString(),provider:'openai_codex',
+    account_scope_id:null,limit_id:'codex',plan_type:'pro',plan_variant:'unknown',continuity_id:null,
+    plan_basis:'same_source_occurrence',slot:'primary',used_percent:12.5,window_duration_minutes:10080,
+    resets_at:new Date(dayMs+7*86400000).toISOString()}}]);
+  expect(await writeGraphDayProjection({target:target(),key:projectionKey,projection}))
+   .toMatchObject({status:'stored'});
+  expect(await count('analytics_graph_day_values')).toBe(1);
+  // Hold the prepared day past one cleanup page. Erasure must not write a
+  // completion receipt while any derived graph payload for this owner survives.
+  let held=false;
+  const stalled=new Proxy(target(),{get(db,key){if(key==='prepare')return(sql:string)=>{
+   const statement=db.prepare(sql);
+   if(held||!sql.includes('DELETE FROM analytics_graph_day_values'))return statement;
+   return new Proxy(statement,{get(value,member){if(member==='bind')return(...args:unknown[])=>new Proxy(value.bind(...args),{
+    get(bound,boundMember){if(boundMember==='all')return async()=>{held=true;return {success:true,results:[],meta:{}};};
+     const candidate=Reflect.get(bound,boundMember);return typeof candidate==='function'?candidate.bind(bound):candidate;}});
+    const candidate=Reflect.get(value,member);return typeof candidate==='function'?candidate.bind(value):candidate;}});};
+   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;}});
+  await expect(eraseParticipantAsOwner(runtime(stalled),'synthetic-admin',f.participantId)).rejects.toThrow();
+  expect(held).toBe(true);
+  expect(await count('analytics_storage_erasure_fences')).toBe(1);
+  expect(await count('analytics_storage_erasure_receipts')).toBe(0);
+  expect(await count('analytics_graph_day_values')).toBe(1);
+  expect(await count('analytics_graph_day_pages')).toBeGreaterThan(0);
+  await drain();await requireStorageParticipantErasureComplete(b.DELETION_LEDGER,f.participantId,bindings());
+  expect(await count('analytics_graph_day_values')).toBe(0);expect(await count('analytics_graph_day_pages')).toBe(0);
+  expect(await count('analytics_storage_erasure_receipts')).toBe(1);
+  await expect(writeGraphDayProjection({target:target(),key:projectionKey,projection}))
+   .rejects.toThrow();
  });
  it('uses the same durable mapping and completion gate during restore replay',async()=>{
   const f=await fixture(5);await deliver();await recordDeletionTombstone(b.DELETION_LEDGER,f.participantId);

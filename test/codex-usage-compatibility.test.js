@@ -77,11 +77,11 @@ test("missing cache components remain null; explicit zero remains observed acros
     const refreshed = await ingestLocalUnifiedIndexIncrement({ ...options, indexFile: incremental });
     assert.equal(refreshed.sourcesReparsedForParserVersion, 1);
     assert.deepEqual(rows(incremental), expected);
-    assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v15");
+    assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v16");
   } finally { await rm(value.root, { recursive: true }); }
 });
 
-test("null and inconsistent provider components cannot manufacture measured cache evidence", async () => {
+test("unknown and inconsistent cache evidence stays null apart from the approved cache-write assumption", async () => {
   const bad = [
     { ...vector(100), cached_input_tokens: null },
     { ...vector(100), cache_write_input_tokens: null },
@@ -93,10 +93,13 @@ test("null and inconsistent provider components cannot manufacture measured cach
     const events = [];
     await extractRolloutUsage(value.path, { size: (await stat(value.path)).size, onEvent: (event) => events.push(event) });
     assert.equal(events.length, 3);
-    assert.equal(events.every((event) => event.components.inputUncachedTokens === null), true);
+    assert.deepEqual(events.map((event) => event.components.inputUncachedTokens), [null, 100, null]);
     assert.equal(events[0].components.inputCacheReadTokens, null);
-    assert.equal(events[1].components.inputCacheWriteTokens, null);
+    assert.equal(events[1].components.inputCacheWriteTokens, 0);
+    assert.deepEqual(events.map((event) => event.cacheWriteAssumedZero === true), [false, true, false]);
     assert.equal(events[2].components.inputCacheReadTokens, null);
+    // The raw provider adapter retains missingness; the typed index records
+    // the product assumption explicitly after selecting the charged usage.
     const provider = [];
     await localCodexLogScanner.scanCodexLogEvents({ codexHome: value.root, startAt: stamp(0), endAt: stamp(59), onUsage: (event) => provider.push(event) });
     assert.equal(provider.length, 3);

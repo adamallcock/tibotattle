@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   CATALOGS,
+  canonicalizeLocale,
   DEFAULT_LOCALE,
   EN_US_CATALOG,
   ES_CATALOG,
@@ -37,6 +38,10 @@ test("i18n is a dependency-free workspace package with complete initial catalogs
   assert.equal(CATALOGS[DEFAULT_LOCALE], EN_US_CATALOG);
   assert.equal(CATALOGS["zh-Hans"], ZH_HANS_CATALOG);
   assert.equal(CATALOGS.es, ES_CATALOG);
+  assert.equal(canonicalizeLocale(" EN_us "), null);
+  assert.equal(canonicalizeLocale("en-us"), "en-US");
+  assert.equal(canonicalizeLocale("zh-hant-tw"), "zh-Hant-TW");
+  assert.equal(canonicalizeLocale(null), null);
   assert.equal(EN_US_CATALOG["app.name"], "TiboTattle");
   const completeness = assertCatalogCompleteness();
   assert.deepEqual(completeness.locales, ["en-US", "zh-Hans", "es"]);

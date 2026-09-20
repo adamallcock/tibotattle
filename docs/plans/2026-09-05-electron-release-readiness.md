@@ -7,15 +7,70 @@ status: in-progress
 
 # Objective and current position
 
-Updated 2026-09-09. Deliver one primary Electron application for Apple Silicon
+Updated 2026-09-10. Deliver one primary Electron application for Apple Silicon
 Mac, Intel Mac, Windows x64 and Linux x64, with one shared product and release
 process. Provider support stays inside that app. The accepted
 [sharing policy](../decisions/2026-09-04-accountless-sharing-policy.md) remains
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-Current checkpoint, 2026-09-09 (supersedes the historical entries below):
+Current checkpoint, 2026-09-10 (supersedes earlier platform status below):
 
+- Final application source is `178315c49f432c8c1ed84f8c982d1c57aed8a094`,
+  version **0.1.19**, build **2026091002**. Later release-operator changes bind
+  this same application source; they do not rebuild a different app revision.
+- Both Mac installers are signed, notarized and stapled. Final verification
+  checks 18 architecture-correct native binaries per app, strict signatures,
+  Gatekeeper, ZIP and read-only mounted DMG contents, plus manifests and
+  blockmaps bound to the final installer bytes.
+- [Final signed Windows qualification](https://github.com/adamallcock/tibotattle/actions/runs/34476779939)
+  passes installation, rendering, synthetic ingestion, retained totals/settings
+  and opt-out across restart, uninstall and cleanup. Downloaded installer and
+  manifest hashes match the hosted receipts. Native credential persistence
+  retains its earlier qualification; this run did not repeat that separate test.
+- [Final Linux packaging](https://github.com/adamallcock/tibotattle/actions/runs/34478874912)
+  passes native credential-mutex qualification and exact AppImage/update-manifest
+  binding. The [rendered update/restart journey](https://github.com/adamallcock/tibotattle/actions/runs/34476683890)
+  passes on the same application source, including the corrected Settings update
+  status and retained settings/opt-out. Earlier packaging validator failures are
+  preserved; the corrected validator accepts the pinned builder's bounded
+  embedded block-map metadata.
+- The signed stable Mac app passes local production-canary artifact admission.
+  The earlier `.18` handover build is ineligible: its rehearsal channel disables
+  production scheduling. The canary now rejects that selection. Artifact
+  admission does not prove enrollment, upload, restart credential reuse or opt-out
+  against production; the actual signed stable journey remains to execute.
+- The bounded production migration and activation operation is prepared but its
+  exact live-operation approval is pending. Production remains at primary 0057 /
+  deletion ledger 0002 with accountless admission disabled. Final four-target
+  publication preparation and protected qualification remain separate from
+  production contribution proof. No stable Electron feed has been published.
+- Mac outside-click dismissal is accepted and physical Intel acceptance is an
+  explicit owner assumption. Windows/Linux notification appearance and remaining
+  physical desktop acceptance are deferred by the owner.
+
+Latest continuation, 2026-09-10:
+
+- The corrected larger hosted rehearsal reached canonical 0058. Its CLI output
+  exceeded the harness capture bound, but independent readback confirms the
+  expected post-migration checkpoint and retained reference counts. The remaining
+  48 synthetic steps passed under the explicit continuation approval, including
+  restoration, 0059 and final integrity checks. The temporary database was
+  deleted and its exact absence verified. The complete 178-step evidence chain
+  preserves the earlier capture failure and its reconciliation. Production and
+  staging are unchanged.
+- Source `d77cf16a` passes all 1,001 Worker tests and the complete owning gate,
+  including clean-tree production/staging dry builds. The larger complete CLI
+  response bound is now integrated, with failed artifact retention unchanged
+  and late-response errors still rejected. Production operation completion and
+  activation remain the immediate work; the [bounded plan](./2026-09-09-bounded-accountless-migration.md)
+  owns exact rehearsal outcomes.
+- Protected R7 regeneration completed: all ten receipts validate on both pinned
+  runtimes and are committed at `3264c018`. Its existing `release_open` resource
+  decision is preserved. Runtime-pair and engineering-rounding decisions are
+  explicitly open in the current implementation; another unchanged long run
+  would not resolve them. Receipt freshness is now proven, not resource promotion
+  or public release approval.
 
 Latest continuation, 2026-09-09:
 

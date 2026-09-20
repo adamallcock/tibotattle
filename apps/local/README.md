@@ -30,11 +30,31 @@ the source databases. Missing metadata does not fail an accounting refresh. See 
 
 ## Run
 
+Standard dashboard periods are supplied by the shared dashboard projection.
+After the initial dashboard paints, the separate Performance and Projects &
+threads views prepare their selected and other fixed periods before the first
+visit. Their browser caches are bounded and memory-only; speculative browser
+requests pause when the app document is hidden. A measurement history pass that
+has already started can finish independently. Performance reuses the
+worker's existing three-period snapshots. Projects & threads uses related
+period queries anchored to the selected report, preserving generation checks
+and the two-report server capacity; cached display values do not authorize
+drill-down through an expired report. No additional log scan is required to
+change a warmed period.
+
 ```bash
 USAGE_MONITOR_PORT=8791 node ./apps/local/server.js
 ```
 
 Then open `http://127.0.0.1:8791/`.
+
+The packaged Electron companion also owns the closed, read-only agent protocol
+used by the Codex plugin. `--agent-protocol 1` selects exactly `status`,
+`explain-usage-plans`, `explain-usage`, or `explain-usage-evidence` and writes
+one content-free JSON result instead of binding a server. It accepts no generic
+path, command, SQL, refresh, settings, or upload input. Normal companion startup
+is unchanged when the selector is absent. See the maintained
+[Codex plugin reference](../../docs/reference/codex-plugin.md).
 
 Startup defers the full-history projection so the first local dashboard does
 not wait for it. A validated last-authoritative snapshot may supply retained
@@ -177,12 +197,15 @@ checkpoint. A later **Update local usage** resumes from that checkpoint. Raw
 prompts, responses, commands, source paths, repository names, and local files
 are not served to the browser or sent to a hosted service.
 
-The same lineage-aware raw-log pass now captures weekly rate-limit snapshots
-while it computes API-price-equivalent usage. It atomically writes only an
-owner-readable, versioned, content-free accounting cache. The weekly view uses
-that live cache and labels older observations as account-unattributed and
-potentially spanning multiple accounts. It does not read the replay-heavy
-collector record store as a substitute or perform a second raw-log pass.
+The same lineage-aware accounting pass captures both five-hour and seven-day main
+allowance snapshots while it computes API-price-equivalent usage. It folds both
+durations into bounded, plan-separated calibrations and atomically writes only
+an owner-readable, versioned, content-free accounting cache. The Allowance view
+uses that live cache and labels older observations as account-unattributed and
+potentially spanning multiple accounts. Five-hour history is published only
+after one plan-specific reset has enough observed movement to qualify for a
+fit. It does not read the replay-heavy collector record store as a substitute
+or perform a second raw-log pass.
 
 An automatic quick refresh preserves the last authoritative accounting
 projection while publishing the newly observed quota card; it never advances

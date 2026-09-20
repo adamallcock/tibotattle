@@ -4,12 +4,16 @@ import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   createMacOSKeychainAdapterFacade,
+  isMacOSKeychainAdapterContractError,
   MACOS_KEYCHAIN_ADAPTER_ACCOUNTLESS_INSTALLATION_CAPABILITY,
   MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES,
   MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES,
 } from "../../native/macos-keychain/contract.js";
 import { CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER } from "../../src/platform/index.js";
 import { PRODUCTION_ELECTRON_APP_ID } from "./desktop-updater.js";
+import {
+  classifyDesktopSecureStorageFailure,
+} from "./desktop-secure-storage-readiness.js";
 import distribution from "../../config/electron-production-distribution.cjs";
 
 const require = createRequire(import.meta.url);
@@ -18,14 +22,19 @@ const MAX_ADAPTER_BYTES = 5 * 1024 * 1024;
 export const DESKTOP_MACOS_KEYCHAIN_RESOURCE_PATH =
   distribution.PRODUCTION_ELECTRON_MACOS_KEYCHAIN_ADAPTER_RESOURCE_RELATIVE_PATH;
 
-function failure(code = "KEYCHAIN_DENIED") {
-  return Object.assign(new Error("Desktop credentials are unavailable"), { code });
+function failure(code = "KEYCHAIN_DENIED", reason) {
+  return Object.assign(new Error("Desktop credentials are unavailable"), {
+    code,
+    secureStorageReason: reason
+      ?? classifyDesktopSecureStorageFailure({ code }),
+  });
 }
 
 function assertStatus(status) {
   if (status === "locked") throw failure("KEYCHAIN_LOCKED");
   if (status === "denied") throw failure("KEYCHAIN_DENIED");
   if (status === "migration_required") throw failure("KEYCHAIN_MIGRATION_REQUIRED");
+  if (status === "invalid") throw failure("KEYCHAIN_CREDENTIAL_INVALID");
   throw failure("broker_unavailable");
 }
 
@@ -38,6 +47,7 @@ function accountlessFailure({
   recoveryRequired = false,
   retryable = false,
   knownNonMutation = false,
+  reason = recoveryRequired ? "migration_required" : "security_unavailable",
 } = {}) {
   const error = Object.assign(new Error(recoveryRequired
     ? "Installation credential recovery is required"
@@ -46,6 +56,7 @@ function accountlessFailure({
       ? "contribution_device_credential_recovery_required"
       : "contribution_device_credential_unavailable",
     retryable: recoveryRequired ? false : retryable,
+    secureStorageReason: reason,
   });
   // A native locked result is returned before a conditional Keychain mutation
   // completes. Keep that fact main-process-only so FD3 can retry instead of
@@ -58,10 +69,20 @@ function accountlessFailure({
 
 function assertAccountlessStatus(status, { knownNonMutation = false } = {}) {
   if (status === "locked") {
-    throw accountlessFailure({ retryable: true, knownNonMutation });
+    throw accountlessFailure({
+      retryable: true,
+      knownNonMutation,
+      reason: "locked",
+    });
   }
-  if (status === "migration_required") throw accountlessFailure({ recoveryRequired: true });
-  throw accountlessFailure();
+  if (status === "denied") throw accountlessFailure({ reason: "denied" });
+  if (status === "migration_required") {
+    throw accountlessFailure({ recoveryRequired: true });
+  }
+  if (status === "invalid") {
+    throw accountlessFailure({ reason: "credential_invalid" });
+  }
+  throw accountlessFailure({ reason: "security_unavailable" });
 }
 
 async function assertLegacyCredentialAbsent(legacyCredentialProbe) {
@@ -71,6 +92,17 @@ async function assertLegacyCredentialAbsent(legacyCredentialProbe) {
   if (status === "absent") return;
   if (status === "present") throw accountlessFailure({ recoveryRequired: true });
   throw accountlessFailure();
+}
+
+async function invokeAccountlessAdapter(operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    if (isMacOSKeychainAdapterContractError(error)) {
+      throw accountlessFailure({ reason: "adapter_integrity_failed" });
+    }
+    throw error;
+  }
 }
 
 function createDesktopMacOSCredentialBackendFromAdapter(adapter) {
@@ -116,9 +148,9 @@ function createDesktopMacOSAccountlessCredentialBackendFromAdapter(
   return Object.freeze({
     async read() {
       await assertLegacyCredentialAbsent(legacyCredentialProbe);
-      const result = await adapter.read(
+      const result = await invokeAccountlessAdapter(() => adapter.read(
         MACOS_KEYCHAIN_ADAPTER_ACCOUNTLESS_INSTALLATION_CAPABILITY,
-      );
+      ));
       if (result.status === "absent") return null;
       if (result.status !== "present") return assertAccountlessStatus(result.status);
       try { return Buffer.from(result.value); }
@@ -127,10 +159,10 @@ function createDesktopMacOSAccountlessCredentialBackendFromAdapter(
     async createIfMissing(value) {
       await assertLegacyCredentialAbsent(legacyCredentialProbe);
       if (!Buffer.isBuffer(value) || value.length !== 32) throw accountlessFailure();
-      const status = await adapter.createIfMissing(
+      const status = await invokeAccountlessAdapter(() => adapter.createIfMissing(
         MACOS_KEYCHAIN_ADAPTER_ACCOUNTLESS_INSTALLATION_CAPABILITY,
         value,
-      );
+      ));
       if (status !== "created" && status !== "existing") {
         assertAccountlessStatus(status, { knownNonMutation: true });
       }
@@ -139,10 +171,10 @@ function createDesktopMacOSAccountlessCredentialBackendFromAdapter(
     async deleteExact(value) {
       await assertLegacyCredentialAbsent(legacyCredentialProbe);
       if (!Buffer.isBuffer(value) || value.length !== 32) throw accountlessFailure();
-      const status = await adapter.deleteExact(
+      const status = await invokeAccountlessAdapter(() => adapter.deleteExact(
         MACOS_KEYCHAIN_ADAPTER_ACCOUNTLESS_INSTALLATION_CAPABILITY,
         value,
-      );
+      ));
       if (!["deleted", "missing", "mismatch"].includes(status)) {
         assertAccountlessStatus(status);
       }
@@ -154,7 +186,9 @@ function createDesktopMacOSAccountlessCredentialBackendFromAdapter(
 /** Map the native fixed-capability adapter onto the existing broker port. */
 export function createDesktopMacOSCredentialBackend({ binding } = {}) {
   const adapter = createMacOSKeychainAdapterFacade(binding);
-  if (adapter.identityStatus() !== "valid") throw failure();
+  if (adapter.identityStatus() !== "valid") {
+    throw failure("adapter_integrity_failed");
+  }
   return createDesktopMacOSCredentialBackendFromAdapter(adapter);
 }
 
@@ -164,7 +198,9 @@ export function createDesktopMacOSAccountlessCredentialBackend({
   legacyCredentialProbe,
 } = {}) {
   const adapter = createMacOSKeychainAdapterFacade(binding);
-  if (adapter.identityStatus() !== "valid") throw accountlessFailure();
+  if (adapter.identityStatus() !== "valid") {
+    throw accountlessFailure({ reason: "adapter_integrity_failed" });
+  }
   return createDesktopMacOSAccountlessCredentialBackendFromAdapter(adapter, {
     legacyCredentialProbe,
   });
@@ -172,7 +208,9 @@ export function createDesktopMacOSAccountlessCredentialBackend({
 
 function createDesktopMacOSCredentialBackends({ binding } = {}) {
   const adapter = createMacOSKeychainAdapterFacade(binding);
-  if (adapter.identityStatus() !== "valid") throw failure("broker_unavailable");
+  if (adapter.identityStatus() !== "valid") {
+    throw failure("adapter_integrity_failed");
+  }
   const broker = createDesktopMacOSCredentialBackendFromAdapter(adapter);
   return Object.freeze({
     broker,
@@ -246,6 +284,7 @@ export async function loadDesktopMacOSCredentialBackends({
   requireBinding = (path) => require(path),
   inspectFile = lstat,
   resolveRealPath = realpath,
+  preflightTimeoutMs = TIMEOUT_MS,
 } = {}) {
   if (preflightBroker !== true && preflightBroker !== false) {
     throw failure("broker_unavailable");
@@ -253,8 +292,10 @@ export async function loadDesktopMacOSCredentialBackends({
   if (platform !== "darwin" || !["arm64", "x64"].includes(architecture)
       || app?.isPackaged !== true || typeof resourcesPath !== "string"
       || !isAbsolute(resourcesPath) || resourcesPath.includes("\0")
-      || basename(resourcesPath) !== "Resources" || basename(dirname(resourcesPath)) !== "Contents") {
-    throw failure("broker_unavailable");
+      || basename(resourcesPath) !== "Resources" || basename(dirname(resourcesPath)) !== "Contents"
+      || !Number.isInteger(preflightTimeoutMs) || preflightTimeoutMs < 1
+      || preflightTimeoutMs > TIMEOUT_MS) {
+    throw failure("adapter_integrity_failed");
   }
   const appBundle = dirname(dirname(resourcesPath));
   const binary = join(resourcesPath, ...DESKTOP_MACOS_KEYCHAIN_RESOURCE_PATH);
@@ -262,15 +303,23 @@ export async function loadDesktopMacOSCredentialBackends({
     const appPath = app.getAppPath?.();
     if (!appBundle.endsWith(".app") || typeof appPath !== "string"
         || !isAbsolute(appPath) || appPath.includes("\0")
-        || resolve(appPath) !== join(resourcesPath, "app.asar")) throw failure("broker_unavailable");
+        || resolve(appPath) !== join(resourcesPath, "app.asar")) {
+      throw failure("adapter_integrity_failed");
+    }
     const before = await inspectFile(binary);
     if (!safeBinary(before) || await resolveRealPath(binary) !== binary
-        || await verifyApplication(appBundle) !== true) throw failure("broker_unavailable");
+        || await verifyApplication(appBundle) !== true) {
+      throw failure("adapter_integrity_failed");
+    }
     const verified = await inspectFile(binary);
-    if (!safeBinary(verified) || !sameFile(before, verified)) throw failure("broker_unavailable");
+    if (!safeBinary(verified) || !sameFile(before, verified)) {
+      throw failure("adapter_integrity_failed");
+    }
     const binding = requireBinding(binary);
     const after = await inspectFile(binary);
-    if (!safeBinary(after) || !sameFile(verified, after)) throw failure("broker_unavailable");
+    if (!safeBinary(after) || !sameFile(verified, after)) {
+      throw failure("adapter_integrity_failed");
+    }
     const backends = createDesktopMacOSCredentialBackends({ binding });
     // Accountless signed staging verifies this exact adapter before using its
     // main-process installation capability, but does not need normal FD4
@@ -280,14 +329,27 @@ export async function loadDesktopMacOSCredentialBackends({
       try {
         await Promise.race([
           backends.broker.preflight(),
-          new Promise((_, reject) => { timer = setTimeout(() => reject(failure("broker_timeout")), TIMEOUT_MS); }),
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(failure("broker_timeout")),
+              preflightTimeoutMs,
+            );
+          }),
         ]);
       } finally { clearTimeout(timer); }
     }
     return backends;
   } catch (error) {
-    if (["KEYCHAIN_LOCKED", "KEYCHAIN_DENIED", "KEYCHAIN_MIGRATION_REQUIRED", "broker_timeout"].includes(error?.code)) throw error;
-    throw failure("broker_unavailable");
+    if ([
+      "KEYCHAIN_LOCKED",
+      "KEYCHAIN_DENIED",
+      "KEYCHAIN_MIGRATION_REQUIRED",
+      "KEYCHAIN_CREDENTIAL_INVALID",
+      "broker_timeout",
+      "broker_unavailable",
+      "adapter_integrity_failed",
+    ].includes(error?.code)) throw error;
+    throw failure("adapter_integrity_failed");
   }
 }
 

@@ -388,7 +388,48 @@ export async function revokeAccountlessEnrollment(
   }
   try {
     const now = new Date(nowEpoch).toISOString();
+    // Read the head in the same batch as revocation. A missing final bridge
+    // makes an existing head fail the marker's NOT NULL contract; no head
+    // produces no marker row and remains a valid no-history disconnect.
+    const retainHistory = reason === "user_opt_out" ? [db.prepare(`
+      INSERT INTO accountless_public_history_retention (
+        participant_id, enrollment_device_id, device_credential_id,
+        generation_id, head_revision, retained_at
+      )
+      SELECT owner.participant_id, owner.enrollment_device_id,
+             owner.device_credential_id,
+             CASE WHEN (
+               SELECT COUNT(*) = 5
+                 FROM sqlite_schema
+                WHERE type = 'trigger'
+                  AND name IN (
+                    'accountless_public_history_retention_withdraw_delete',
+                    'storage_v11_ledger_withdraw_update',
+                    'storage_v11_owner_withdraw_update',
+                    'storage_v11_grant_withdraw_update',
+                    'storage_v11_device_withdraw_update'
+                  )
+                  AND (
+                    name = 'accountless_public_history_retention_withdraw_delete'
+                    OR instr(sql, 'accountless_public_history_retention') > 0
+                  )
+             ) THEN head.generation_id ELSE NULL END,
+             head.revision, ?
+        FROM accountless_upload_owners owner
+        JOIN telemetry_v11_domain_heads head
+          ON head.participant_id = owner.participant_id
+       WHERE owner.enrollment_device_id = ?
+         AND owner.state = 'active'
+         AND owner.revoked_at IS NULL
+         AND owner.revocation_reason IS NULL
+    `).bind(now, deviceId)] : [];
+    const retireHistory = reason === "user_opt_out" ? [] : [db.prepare(`
+      DELETE FROM accountless_public_history_retention
+       WHERE enrollment_device_id = ?
+    `).bind(deviceId)];
     const results = await db.batch<{ device_id: string }>([
+      ...retainHistory,
+      ...retireHistory,
       db.prepare(`
         UPDATE accountless_enrollment_ledger
            SET state = 'revoked', revoked_at = ?, revocation_reason = ?
@@ -435,7 +476,8 @@ export async function revokeAccountlessEnrollment(
     ]);
     // Authority-withdrawal triggers may change many rows in this transaction.
     // Acknowledge the exact enrollment transition, not that aggregate count.
-    return results[0]?.results.length === 1 && results[0].results[0]?.device_id === deviceId;
+    const ledgerResult = results[retainHistory.length + retireHistory.length];
+    return ledgerResult?.results.length === 1 && ledgerResult.results[0]?.device_id === deviceId;
   } catch {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   }

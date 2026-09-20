@@ -1,6 +1,6 @@
 import { projectAdminModelHistoryDay } from '@app-usagemonitor/telemetry-contract';
 import { sha256Hex } from './crypto';
-import { sameStorageCommunityAuthority, type StorageCommunityAuthority } from './storage-community-authority';
+import { storageCommunityPublicationVisible, type StorageCommunityAuthority } from './storage-community-authority';
 
 export interface StorageModelPublicationValue {
   day: string;
@@ -10,16 +10,14 @@ export interface StorageModelPublicationValue {
 }
 
 /** A corrupt derived row is unfinished work, not a permanently completed day.
- * The schema limits each payload to 16 KiB; callers bound the history window. */
+ * The schema limits each payload to 16 KiB; callers bound the history window.
+ * A completed day stays valid across ordinary uploads; only containment newer
+ * than its pin, or a hard authority change, makes it unfinished again. */
 export async function validStorageModelPublication(row: StorageModelPublicationValue,
-  authority: StorageCommunityAuthority): Promise<boolean> {
+  authority: StorageCommunityAuthority, terminalPublicAuthorityEpoch: number): Promise<boolean> {
   try {
     const recorded = JSON.parse(row.authority_json) as StorageCommunityAuthority;
-    if (!sameStorageCommunityAuthority(recorded, authority)
-        || !Number.isSafeInteger(recorded.sourceEpoch) || recorded.sourceEpoch < 0
-        || recorded.sourceEpoch > authority.sourceEpoch
-        || !Number.isSafeInteger(recorded.sequence) || recorded.sequence < 0
-        || recorded.sequence > authority.sequence
+    if (!storageCommunityPublicationVisible(recorded, authority, terminalPublicAuthorityEpoch)
         || new TextEncoder().encode(row.payload_json).byteLength > 16 * 1024
         || await sha256Hex(row.payload_json) !== row.payload_sha256) return false;
     const value = projectAdminModelHistoryDay(JSON.parse(row.payload_json));

@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { RELEASE_VERSION } from '../config/release-manifest.js';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, privateDecrypt, createDecipheriv } from 'node:crypto';
 import { parseProductionCanaryArguments, validateCanaryHost, validateCanaryManifest, sealCanaryCleanup } from '../scripts/run-signed-electron-production-canary.mjs';
@@ -31,11 +32,24 @@ test('a normal local account or forged HOME cannot authorize production canary l
 
 test('ordinary signed manifest validation refuses staging or source confusion', () => {
   const metadata = createProductionDistributionMetadata({ target: 'darwin-arm64', sourceRevision: 'a'.repeat(40), buildNumber: '2026090920' });
-  const manifest = { name: 'app-usagemonitor', version: '0.1.18', tibotattleDistribution: metadata };
+  const manifest = { name: 'app-usagemonitor', version: RELEASE_VERSION, tibotattleDistribution: metadata };
   assert.equal(validateCanaryManifest(manifest, 'a'.repeat(40)).target, 'darwin-arm64');
   assert.throws(() => validateCanaryManifest(manifest, 'd'.repeat(40)));
   assert.throws(() => validateCanaryManifest({ ...manifest, tibotattleAccountlessSignedStagingRehearsal: {} }, 'a'.repeat(40)));
   assert.throws(() => validateCanaryManifest({ ...manifest, tibotattleDistribution: { ...metadata, updateFeed: 'https://other.test' } }, 'a'.repeat(40)));
+});
+
+test('signed handover fixtures cannot stand in for a production enrollment canary', () => {
+  // The installed .18 handover app has this valid distribution family, but
+  // main.js intentionally selects no accountless production scheduler for it.
+  const futureCore = RELEASE_VERSION.replace(/\d+$/u, patch => String(Number(patch) + 1));
+  const metadata = createProductionDistributionMetadata({ target: 'darwin-arm64',
+    sourceRevision: 'a'.repeat(40), buildNumber: '2026090920', rehearsal: 'next',
+    rehearsalCurrentVersion: `${futureCore}-native-to-electron-handover.17`,
+    rehearsalNextVersion: `${futureCore}-native-to-electron-handover.18` });
+  assert.throws(() => validateCanaryManifest({ name: 'app-usagemonitor',
+    version: metadata.semanticVersion, tibotattleDistribution: metadata }, 'a'.repeat(40)),
+  { canaryStage: 'artifact_uploads_disabled' });
 });
 
 test('cleanup handoff encrypts only the exact synthetic target and authenticates ciphertext', () => {
@@ -79,12 +93,12 @@ test('dispatch intake rejects unapproved source, destination, key and execution 
   assert.equal(workflow.includes('--location'), false);
   const directory = await mkdtemp(join(tmpdir(), 'canary-intake-refusal-'));
   const environment = { PATH: process.env.PATH, RUNNER_TEMP: directory, GITHUB_SHA: 'a'.repeat(40),
-    SELECTED_RUNNER: 'a'.repeat(40), SELECTED_SOURCE: '7293828ade187f6fd9e50c67d7018704150ca156', SELECTED_ARCHIVE: '98d32e2a25b4d860d1a60cbdc94fc2a2dbb2dc3e0af58510a0e85e6d1fa24936',
-    SELECTED_ASAR: 'e7c725a0902a18a0970265a8b32535fbe8e447829754592af91fc709eb0a987e', CLEANUP_KEY_SHA256: 'e'.repeat(64), SELECTED_MODE: 'execute',
+    SELECTED_RUNNER: 'a'.repeat(40), SELECTED_SOURCE: '178315c49f432c8c1ed84f8c982d1c57aed8a094', SELECTED_ARCHIVE: 'b85988831c5d0efd5750ed027e651d29942c268158949f76f9e497ef26f81f6b',
+    SELECTED_ASAR: 'd850f0b13ba116b43b36c4e6a5fedabdfe25af35b072dd7b0b5d7fd535319dc3', CLEANUP_KEY_SHA256: 'e'.repeat(64), SELECTED_MODE: 'execute',
     EXECUTION_CONFIRMATION: 'RUN_ONE_SYNTHETIC_PRODUCTION_CANARY', CLEANUP_PUBLIC_KEY: 'aW52YWxpZA==',
-    SELECTED_URL: 'https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/darwin-arm64/TiboTattle-0.1.19-native-to-electron-handover.18-mac-arm64.zip' };
+    SELECTED_URL: 'https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/production-canary/178315c49f432c8c1ed84f8c982d1c57aed8a094/b85988831c5d0efd5750ed027e651d29942c268158949f76f9e497ef26f81f6b.zip' };
   try {
-    for (const changed of [ { SELECTED_RUNNER: 'f'.repeat(40) }, { SELECTED_URL: 'https://other.test/app.zip' },
+    for (const changed of [ { SELECTED_RUNNER: 'f'.repeat(40) }, { SELECTED_SOURCE: 'f'.repeat(40) }, { SELECTED_ARCHIVE: 'f'.repeat(64) }, { SELECTED_ASAR: 'f'.repeat(64) }, { SELECTED_URL: 'https://other.test/app.zip' },
       { EXECUTION_CONFIRMATION: '' }, { CLEANUP_PUBLIC_KEY: Buffer.from('-----BEGIN PRIVATE KEY-----\n').toString('base64') } ]) {
       assert.throws(() => execFileSync('python3', ['-c', python], { env: { ...environment, ...changed }, stdio: 'ignore', timeout: 3000 }));
       assert.deepEqual(await readdir(directory), []);

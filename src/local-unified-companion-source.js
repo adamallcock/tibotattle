@@ -1,3 +1,4 @@
+import { prepareWorkUsageCollector } from "./local-work-usage-source.js";
 import { lstat } from "node:fs/promises";
 import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 import {
@@ -231,13 +232,16 @@ function cooperativeYield() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-async function* usageBatches(database) {
+async function* usageBatches(database, includeWorkUsage = false) {
   // Rowid keyset pagination: bounded memory (one batch of typed rows) with no
   // per-batch sort. The aggregation downstream is order-independent — periods
   // and timeline buckets key on the row's own timestamp — so arrival order is
   // free to be storage order.
   const statement = database.prepare(`
     SELECT u.rowid AS row_id,
+           ${includeWorkUsage ? `u.source_local, u.source_ordinal, u.source_offset,
+           u.session_local, u.account_scope_id, u.quota_observation_id,
+           i.session_uuid, p.parser_version,` : ""}
            u.observed_at_ms AS observed_at_ms,
            m.model_id AS model_id,
            t.codex_speed_mode AS codex_speed_mode,
@@ -258,6 +262,8 @@ async function* usageBatches(database) {
     JOIN tier_semantics t ON t.id = u.tier_id
     JOIN surface_class s ON s.id = u.surface_id
     JOIN account_scope a ON a.id = u.account_scope_id
+    ${includeWorkUsage ? `LEFT JOIN parser_version p ON p.id=u.parser_version_id
+    LEFT JOIN session_identity i ON i.session_local=u.session_local` : ""}
     WHERE u.rowid > ?
     ORDER BY u.rowid
     LIMIT ${USAGE_READ_BATCH_ROWS}`);
@@ -276,6 +282,10 @@ function tokenCount(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
+function nullableTokenCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
 function recordShape(row) {
   return {
     observedAt: new Date(Number(row.observed_at_ms)).toISOString(),
@@ -284,12 +294,12 @@ function recordShape(row) {
     // retain observed context, but never re-infer a NULL from component sums.
     totalInputContextTokens: row.total_input_context ?? 0,
     components: {
-      input_uncached_tokens: tokenCount(row.tokens_in_uncached),
-      input_cache_read_tokens: tokenCount(row.tokens_in_cache_read),
-      input_cache_write_tokens: tokenCount(row.tokens_in_cache_write),
-      output_text_tokens: tokenCount(row.tokens_out_text),
-      output_reasoning_tokens: tokenCount(row.tokens_out_reasoning),
-      output_combined_tokens: tokenCount(row.tokens_out_combined),
+      input_uncached_tokens: nullableTokenCount(row.tokens_in_uncached),
+      input_cache_read_tokens: nullableTokenCount(row.tokens_in_cache_read),
+      input_cache_write_tokens: nullableTokenCount(row.tokens_in_cache_write),
+      output_text_tokens: nullableTokenCount(row.tokens_out_text),
+      output_reasoning_tokens: nullableTokenCount(row.tokens_out_reasoning),
+      output_combined_tokens: nullableTokenCount(row.tokens_out_combined),
     },
     tierSemantics: {
       codexSpeedMode: row.codex_speed_mode,
@@ -415,7 +425,17 @@ export async function readLocalUnifiedCompanionProjection({
   nowMs = Date.now(),
   declaredSpeedBaselines = [],
   mode = "full",
+  includeWorkUsage = false,
+  codexHome,
+  secretFile = null,
+  signal = null,
+  workUsageMetadataCache = null,
 } = {}) {
+  const complete = (companion, workUsage = null) => includeWorkUsage
+    ? { companion, workUsage: workUsage ?? { status: companion.status === "available" ? "unavailable" : companion.status, asOfMs: nowMs } }
+    : companion;
+  if (includeWorkUsage && typeof codexHome !== "string") throw new TypeError("codexHome must be a string");
+  signal?.throwIfAborted();
   if (typeof indexFile !== "string" || indexFile.length < 1) {
     throw new TypeError("indexFile must be a non-empty string");
   }
@@ -431,7 +451,7 @@ export async function readLocalUnifiedCompanionProjection({
   // labels the full-history projection as loading. The terminal refresh calls
   // this reader in full mode and replaces that provisional snapshot.
   if (mode === "deferred") {
-    return unavailable("deferred", "local_unified_index_deferred");
+    return complete(unavailable("deferred", "local_unified_index_deferred"));
   }
   const baselines = Array.isArray(declaredSpeedBaselines)
     ? declaredSpeedBaselines
@@ -440,21 +460,21 @@ export async function readLocalUnifiedCompanionProjection({
   try {
     metadata = await lstat(indexFile);
   } catch (error) {
-    if (error?.code === "ENOENT") return unavailable("missing");
-    return unavailable("unavailable", "local_unified_index_unavailable");
+    if (error?.code === "ENOENT") return complete(unavailable("missing"));
+    return complete(unavailable("unavailable", "local_unified_index_unavailable"));
   }
   if (!metadata.isFile() || metadata.isSymbolicLink()) {
-    return unavailable("unavailable", "local_unified_index_unavailable");
+    return complete(unavailable("unavailable", "local_unified_index_unavailable"));
   }
   const startedAt = performance.now();
   let database;
   try {
     database = openLocalUnifiedIndex(indexFile, { readOnly: true });
   } catch (error) {
-    return unavailable(
+    return complete(unavailable(
       "unavailable",
       error?.code ?? "local_unified_index_unavailable",
-    );
+    ));
   }
   try {
     await revalidatePublishedPath(indexFile, metadata);
@@ -467,6 +487,24 @@ export async function readLocalUnifiedCompanionProjection({
       generation = readUnifiedIndexGenerationDescriptor(database);
     } catch {
       generation = null;
+    }
+    let workCollector = null;
+    let workUsage = null;
+    const workUnavailable = (error) => ({
+      status: "unavailable",
+      asOfMs: nowMs,
+      errorCode: error?.code === "work_usage_capacity_exceeded"
+        ? error.code : "work_usage_unavailable",
+    });
+    if (includeWorkUsage) {
+      try {
+        workCollector = await prepareWorkUsageCollector({
+          database, generation, indexFile, codexHome, secretFile, nowMs, signal, workUsageMetadataCache,
+        });
+      } catch (error) {
+        signal?.throwIfAborted();
+        workUsage = workUnavailable(error);
+      }
     }
     const periods = [
       { summary: newUsagePeriod("24h", "Last 24 hours"), start: nowMs - 24 * 60 * 60 * 1_000 },
@@ -488,7 +526,7 @@ export async function readLocalUnifiedCompanionProjection({
     let firstObservedMs = null;
     let lastObservedMs = null;
     const futureLimitMs = nowMs + 5 * 60_000;
-    for await (const batch of usageBatches(database)) {
+    for await (const batch of usageBatches(database, includeWorkUsage)) {
       let rowsSinceYield = 0;
       for (const row of batch) {
         if (rowsSinceYield === USAGE_PROCESS_YIELD_ROWS) {
@@ -496,6 +534,7 @@ export async function readLocalUnifiedCompanionProjection({
           rowsSinceYield = 0;
         }
         rowsSinceYield += 1;
+        signal?.throwIfAborted();
         const observedMs = Number(row.observed_at_ms);
         if (!Number.isSafeInteger(observedMs) || observedMs > futureLimitMs) {
           continue;
@@ -518,6 +557,15 @@ export async function readLocalUnifiedCompanionProjection({
             : "unknown",
           pricer,
         );
+        if (workCollector) {
+          try {
+            workCollector.add(row, projection);
+          } catch (error) {
+            signal?.throwIfAborted();
+            workUsage = workUnavailable(error);
+            workCollector = null;
+          }
+        }
         if (projection === null) continue;
         for (const period of periods) {
           if (observedMs >= period.start) {
@@ -529,6 +577,14 @@ export async function readLocalUnifiedCompanionProjection({
           observedMs,
           projection,
         );
+      }
+    }
+    if (workCollector) {
+      try {
+        workUsage = await workCollector.finish();
+      } catch (error) {
+        signal?.throwIfAborted();
+        workUsage = workUnavailable(error);
       }
     }
     let cacheSwitchImpact;
@@ -638,10 +694,10 @@ export async function readLocalUnifiedCompanionProjection({
       throw fixedError("local_unified_index_generation_mismatch");
     }
     await revalidatePublishedPath(indexFile, metadata);
-    return result;
+    return complete(result, workUsage);
   } catch (error) {
     if (error?.code?.startsWith("local_unified_index_")) {
-      return unavailable("unavailable", error.code);
+      return complete(unavailable("unavailable", error.code));
     }
     throw fixedError("local_unified_index_unavailable");
   } finally {

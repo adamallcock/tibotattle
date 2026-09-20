@@ -28,8 +28,8 @@ import {
 } from "../scripts/macos-release-core.js";
 import { SPARKLE_VERSION } from "../scripts/macos-updater-core.js";
 import {
-  collectMacOSWebModuleGraph,
-} from "../scripts/build-macos-app.js";
+  collectWebModuleGraph,
+} from "../scripts/lib/runtime-closure.mjs";
 import {
   PUBLIC_RELEASE_MANIFEST_SCHEMA,
   PUBLIC_RELEASE_SOURCE_PROVENANCE_SCHEMA,
@@ -1080,6 +1080,7 @@ test("public static routes keep root, community, docs, privacy, and fallback out
     "app.js",
     "data-client.js",
     "lib.js",
+    "work-usage-view.js",
     "navigation.js",
     "telemetry-envelope.js",
     "telemetry-shared.generated.js",
@@ -1187,7 +1188,7 @@ test("checked-in public source satisfies the complete release contract", async (
   const result = await buildFixtureSite(
     releaseArgs(value, { source: PUBLIC_SOURCE }),
   );
-  assert.equal(result.fileCount, 40);
+  assert.equal(result.fileCount, 41);
   const manifest = JSON.parse(
     await readFile(join(value.output, "release-site-manifest.json"), "utf8"),
   );
@@ -1208,6 +1209,7 @@ test("checked-in public source satisfies the complete release contract", async (
       "community-view.js",
       "community.html",
       "community.js",
+      "dashboard-ui.js",
       "docs.html",
       "feature-allowance.jpg",
       "feature-allowance.mp4",
@@ -1248,8 +1250,9 @@ test("checked-in public source satisfies the complete release contract", async (
   ]) {
     assert.ok(publishedNames.has(publicAsset), `Missing public asset ${publicAsset}`);
   }
-  const communityClosure = await collectMacOSWebModuleGraph({
+  const communityClosure = await collectWebModuleGraph({
     entrypoints: ["apps/web/public/community.js"],
+    surface: "public release",
   });
   for (const relativeFile of communityClosure.relativeFiles) {
     const name = relativeFile.slice("apps/web/public/".length);
@@ -1341,6 +1344,7 @@ test("checked-in public source satisfies the complete release contract", async (
     "app.js",
     "data-client.js",
     "lib.js",
+    "work-usage-view.js",
     "navigation.js",
     "telemetry-envelope.js",
     "telemetry-shared.generated.js",

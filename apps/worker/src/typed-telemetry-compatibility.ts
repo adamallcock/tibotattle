@@ -12,6 +12,8 @@ import {
 export const TYPED_TELEMETRY_COMPATIBILITY_VIEW = "typed_telemetry_compatibility_records";
 export const TYPED_TELEMETRY_SESSION_TOOLS_VIEW = "typed_telemetry_compatibility_session_tools";
 export const MAX_TYPED_TELEMETRY_COMPATIBILITY_PAGE = 200;
+export const MAX_TYPED_TELEMETRY_STORAGE_ID_PAGES = 16;
+export const MAX_TYPED_TELEMETRY_STORAGE_IDS = 3_200;
 export const TYPED_TELEMETRY_COMPATIBILITY_COLUMNS = [
   "storage_row_id", "namespace_id", "owner_id", "format_code", "stream_code", "source_namespace", "format",
   "source_row_id", "id", "participant_id", "device_id", "chunk_row_id", "manifest_id", "stream", "schema_version",
@@ -200,25 +202,36 @@ export async function readTypedTelemetryCompatibilityPage(db: D1Database, option
 /** Shared bounded decoder. Exact source membership is checked before returning
  * any reconstructed canonical/legacy bytes. Callers supply trusted internal
  * IDs selected through their own immutable chunk/domain authority. */
-async function decodeRows(db: D1Database, rows: Row[], options: {
-  sourceNamespace: string; participantId: string; stream?: "usage" | "quota" | "session";
-}): Promise<TypedTelemetryCompatibilityRecord[]> {
+async function readSessionTools(db: D1Database, rows: Row[]): Promise<Map<number, Record<string, number>>> {
   const sessions = rows.filter((row) => row.stream === "session").map((row) => integer(row.storage_row_id, 1, Number.MAX_SAFE_INTEGER));
   const tools = new Map<number, Record<string, number>>();
+  const statements: D1PreparedStatement[] = [];
+  const groups: number[][] = [];
   for (let offset = 0; offset < sessions.length; offset += 90) {
-    const group = sessions.slice(offset, offset + 90);
-    const result = await db.prepare(`SELECT storage_row_id, tool_class, count FROM typed_telemetry_compatibility_session_tools
+    const group = sessions.slice(offset, offset + 90); groups.push(group);
+    statements.push(db.prepare(`SELECT storage_row_id, tool_class, count FROM typed_telemetry_compatibility_session_tools
       WHERE storage_row_id IN (${group.map(() => "?").join(",")}) ORDER BY storage_row_id, tool_class COLLATE BINARY LIMIT ?`)
-      .bind(...group, group.length * 32 + 1).all<Row>();
-    if (result.results.length > group.length * 32) fail();
-    for (const row of result.results) {
+      .bind(...group, group.length * 32 + 1));
+  }
+  const results = statements.length ? await db.batch<Row>(statements) : [];
+  for (let index = 0; index < results.length; index++) {
+    const group = groups[index]!; const rows = results[index]!.results;
+    if (rows.length > group.length * 32) fail();
+    for (const row of rows) {
       const key = integer(row.storage_row_id, 1, Number.MAX_SAFE_INTEGER);
+      if (!group.includes(key)) fail();
       const values = tools.get(key) ?? Object.create(null) as Record<string, number>;
       const tool = text(row, "tool_class");
       if (Object.hasOwn(values, tool)) fail();
       values[tool] = integer(row.count, 0, 1_000_000_000); tools.set(key, values);
     }
   }
+  return tools;
+}
+async function decodeRows(db: D1Database, rows: Row[], options: {
+  sourceNamespace: string; participantId: string; stream?: "usage" | "quota" | "session";
+}, preloadedTools?: Map<number, Record<string, number>>): Promise<TypedTelemetryCompatibilityRecord[]> {
+  const tools = preloadedTools ?? await readSessionTools(db, rows);
   const records: TypedTelemetryCompatibilityRecord[] = [];
   for (const row of rows) {
     const recordFormat = format(row.format);
@@ -314,6 +327,44 @@ export async function readTypedTelemetryRowsByStorageIds(db: D1Database, options
     if (error instanceof TypedTelemetryError) throw error;
     throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE");
   }
+}
+
+export interface TypedTelemetryStorageIdPage {
+  sourceNamespace: string; participantId: string; storageRowIds: readonly number[];
+}
+
+/** Up to sixteen separately authorized v1 chunks, decoded with three binding
+ * round trips: one schema read, one records batch and, when needed, one tools
+ * batch. D1 still meters every statement; this only removes network latency. */
+export async function readTypedTelemetryRowsByStorageIdPages(db:D1Database,
+ pages:readonly TypedTelemetryStorageIdPage[]):Promise<TypedTelemetryCompatibilityRecord[][]>{
+ if(!Array.isArray(pages)||pages.length<1||pages.length>MAX_TYPED_TELEMETRY_STORAGE_ID_PAGES)fail();
+ const normalized=pages.map(page=>{
+  encodeTypedTelemetryId(page.sourceNamespace);encodeTypedTelemetryId(page.participantId);
+  if(!Array.isArray(page.storageRowIds)||page.storageRowIds.length<1||page.storageRowIds.length>MAX_TYPED_TELEMETRY_COMPATIBILITY_PAGE)fail();
+  const ids=(page.storageRowIds as readonly number[]).map((value:number)=>integer(value,1,Number.MAX_SAFE_INTEGER));
+  if(new Set(ids).size!==ids.length)fail();return {...page,ids};
+ });
+ const allIds=normalized.flatMap(page=>page.ids);
+ if(new Set(allIds).size!==allIds.length||allIds.length>MAX_TYPED_TELEMETRY_STORAGE_IDS)fail();
+ try{
+  if(await db.prepare("SELECT version FROM typed_telemetry_schema WHERE id=1").first<number>("version")!==1)
+   throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE");
+  const statements:D1PreparedStatement[]=[];const groups:{page:number;ids:number[]}[]=[];
+  normalized.forEach((page,pageIndex)=>{for(let offset=0;offset<page.ids.length;offset+=90){
+   const ids=page.ids.slice(offset,offset+90);groups.push({page:pageIndex,ids});
+   statements.push(db.prepare(`SELECT * FROM typed_telemetry_compatibility_records
+    WHERE storage_row_id IN (${ids.map(()=>"?").join(",")}) LIMIT ?`).bind(...ids,ids.length+1));
+  }});
+  const results=await db.batch<Row>(statements);const found=normalized.map(()=>new Map<number,Row>());
+  results.forEach((result,index)=>{const group=groups[index]!;if(result.results.length>group.ids.length)fail();
+   for(const row of result.results){const id=integer(row.storage_row_id,1,Number.MAX_SAFE_INTEGER);
+    if(!group.ids.includes(id)||found[group.page]!.has(id))fail();found[group.page]!.set(id,row);}});
+  const ordered=normalized.map((page,index)=>{const rows=page.ids.map((id:number)=>found[index]!.get(id));
+   if(rows.some((row:Row|undefined)=>!row))throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE");return rows as Row[];});
+  const tools=await readSessionTools(db,ordered.flat());
+  return Promise.all(ordered.map((rows,index)=>decodeRows(db,rows,normalized[index]!,tools)));
+ }catch(error){if(error instanceof TypedTelemetryError)throw error;throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE");}
 }
 
 /** Internal usage-only analytical page. SQL has already bounded and pinned its

@@ -31,6 +31,8 @@ import {
   createCollectorQualityAccumulator,
   renderMonitoringQualityReport,
   renderWeeklyCalibrationReport,
+  USAGE_EXPLAINER_SCHEMA_VERSION,
+  usageExplanationCatalog,
 } from "./reporting/index.js";
 import { createActivityMarker } from "./activity-markers.js";
 import {
@@ -82,6 +84,7 @@ import {
   runCollectorForeground,
   runCollectorOnce,
 } from "./passive-collector.js";
+import { createResetEventClassifier } from "@app-usagemonitor/quota-analysis";
 import {
   forEachLocalCollectorRecord,
   inspectLocalCollectorStateStorage,
@@ -125,6 +128,7 @@ import {
   recoverOwnerOnlyPairTransactions,
   withOwnerOnlyFileLock,
 } from "./storage.js";
+import { createLocalUsageExplainer } from "./local-usage-explainer.js";
 
 const {
   appendedRolloutSourcesAreAfterEnd,
@@ -170,6 +174,9 @@ function usage() {
   usage-monitor doctor
   usage-monitor capture [--label TEXT] [--controlled] [--offline] [--data-file PATH]
   usage-monitor report [--json] [--data-file PATH] [--corrections PATH]
+  usage-monitor explain-usage-plans
+  usage-monitor explain-usage --plan data_health|current_usage|top_work|period_drivers|model_effort_mix|pricing_coverage|parent_subworker_usage|allowance_movement [--period 24h|7d|30d|all] [--limit N] [--cursor CURSOR] [--index-file PATH] [--codex-home PATH]
+  usage-monitor explain-usage-evidence --selector SELECTOR [--index-file PATH] [--codex-home PATH]
   usage-monitor transitions --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--offline] [--compact] [--window-minutes N] [--output PATH] [--audit-file PATH]
   usage-monitor infer [--input PATH] [--output PATH] [--report-file PATH]
   usage-monitor history [--input PATH] [--output PATH] [--report-file PATH]
@@ -223,6 +230,14 @@ function readOptionValue(argv, index, option) {
 function readNonNegativeNumber(argv, index, option) {
   const value = Number(readOptionValue(argv, index, option));
   if (!Number.isFinite(value) || value < 0) throw new Error(`${option} requires a non-negative number`);
+  return value;
+}
+
+function readPositiveInteger(argv, index, option) {
+  const value = Number(readOptionValue(argv, index, option));
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${option} requires a positive integer`);
+  }
   return value;
 }
 
@@ -287,6 +302,12 @@ export function parseArgs(argv) {
     intervalSeconds: null,
     maximumUploadsPerPass: null,
     maximumUploadBytesPerPass: null,
+    usagePlan: null,
+    usagePeriod: null,
+    usageLimit: null,
+    usageSelector: null,
+    usageCursor: null,
+    indexFile: null,
   };
   for (let index = 1; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -307,6 +328,7 @@ export function parseArgs(argv) {
     else if (arg === "--claude-usage") result.claudeUsage = true;
     else if (arg === "--label") result.label = readOptionValue(argv, index++, arg);
     else if (arg === "--data-file") result.dataFile = resolve(readOptionValue(argv, index++, arg));
+    else if (arg === "--index-file") result.indexFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--state-file") result.stateFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--since") result.startAt = readOptionValue(argv, index++, arg);
     else if (arg === "--until") result.endAt = readOptionValue(argv, index++, arg);
@@ -351,7 +373,32 @@ export function parseArgs(argv) {
     else if (arg === "--interval-seconds") result.intervalSeconds = readNonNegativeNumber(argv, index++, arg);
     else if (arg === "--max-uploads-per-pass") result.maximumUploadsPerPass = readNonNegativeNumber(argv, index++, arg);
     else if (arg === "--max-upload-bytes-per-pass") result.maximumUploadBytesPerPass = readNonNegativeNumber(argv, index++, arg);
+    else if (arg === "--plan") result.usagePlan = readOptionValue(argv, index++, arg);
+    else if (arg === "--period") result.usagePeriod = readOptionValue(argv, index++, arg);
+    else if (arg === "--limit") result.usageLimit = readPositiveInteger(argv, index++, arg);
+    else if (arg === "--selector") result.usageSelector = readOptionValue(argv, index++, arg);
+    else if (arg === "--cursor") result.usageCursor = readOptionValue(argv, index++, arg);
     else throw new Error(`Unknown argument: ${arg}`);
+  }
+  const usageQuery = result.command === "explain-usage";
+  const usageEvidence = result.command === "explain-usage-evidence";
+  if (result.indexFile !== null && !usageQuery && !usageEvidence) {
+    throw new Error("--index-file is available only for usage explanation commands");
+  }
+  if (result.usagePlan !== null && !usageQuery) {
+    throw new Error("--plan is available only for explain-usage");
+  }
+  if (result.usagePeriod !== null && !usageQuery) {
+    throw new Error("--period is available only for explain-usage");
+  }
+  if (result.usageLimit !== null && !usageQuery) {
+    throw new Error("--limit is available only for explain-usage");
+  }
+  if (result.usageSelector !== null && !usageEvidence) {
+    throw new Error("--selector is available only for explain-usage-evidence");
+  }
+  if (result.usageCursor !== null && !usageQuery) {
+    throw new Error("--cursor is available only for explain-usage");
   }
   if (result.claudeStatus && result.claudeStateDirectory !== null) {
     throw new Error("export-set accepts either --claude-status or --claude-state-dir, not both");
@@ -578,6 +625,7 @@ export async function run(
       }
       throw new Error("benchmark-r7 profile is not implemented");
     },
+    createUsageExplainer = createLocalUsageExplainer,
   } = {},
 ) {
   const args = parseArgs(argv);
@@ -594,6 +642,42 @@ export async function run(
   }
   if (args.command === "help" || args.command === "--help" || args.command === "-h") {
     usage();
+    return;
+  }
+  if (args.command === "explain-usage-plans") {
+    console.log(JSON.stringify(usageExplanationCatalog()));
+    return;
+  }
+  if (args.command === "explain-usage") {
+    if (args.usagePlan === null) throw new Error("explain-usage requires --plan");
+    const explainer = createUsageExplainer({
+      indexFile: args.indexFile,
+      codexHome: args.codexHome,
+    });
+    const request = {
+      schemaVersion: USAGE_EXPLAINER_SCHEMA_VERSION,
+      plan: args.usagePlan,
+      period: args.usagePeriod ?? "7d",
+      limit: args.usageLimit ?? 10,
+    };
+    if (args.usageCursor !== null) request.cursor = args.usageCursor;
+    const result = await explainer.query(request);
+    console.log(JSON.stringify(result));
+    return;
+  }
+  if (args.command === "explain-usage-evidence") {
+    if (args.usageSelector === null) {
+      throw new Error("explain-usage-evidence requires --selector");
+    }
+    const explainer = createUsageExplainer({
+      indexFile: args.indexFile,
+      codexHome: args.codexHome,
+    });
+    const result = await explainer.evidence({
+      schemaVersion: USAGE_EXPLAINER_SCHEMA_VERSION,
+      selector: args.usageSelector,
+    });
+    console.log(JSON.stringify(result));
     return;
   }
   if (args.command === "benchmark-r7") {
@@ -1406,6 +1490,7 @@ export async function run(
       refreshStale: args.refreshStale,
       backfill: args.backfill,
       loadAccountObservationSecret: selection.loadAccountObservationSecret,
+      resetEventClassifier: createResetEventClassifier(),
     });
     console.log(`Collector run-once: ${result.rolloutRecordsWritten} rollout record(s); refresh ${result.refresh.attempted ? (result.refresh.errorCode ?? (result.refresh.recordWritten ? "recorded" : "deduplicated")) : "not needed"}.`);
     console.log(`State: ${result.stateFile}`);
@@ -1425,6 +1510,7 @@ export async function run(
         reconciliationMs: args.reconciliationMs,
         signal: controller.signal,
         loadAccountObservationSecret: selection.loadAccountObservationSecret,
+        resetEventClassifier: createResetEventClassifier(),
       });
       console.log(`Collector foreground exited cleanly: ${result.rolloutRecordsWritten} rollout record(s), ${result.appServerRecordsWritten} app-server record(s), ${result.reconnectAttempts} reconnect attempt(s).`);
     } finally {

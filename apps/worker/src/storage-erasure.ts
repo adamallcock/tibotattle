@@ -7,6 +7,7 @@ import {lookupV11StorageSource} from './v11-storage-journal';
 import {prepareV1ProjectionOwnerFence,retireV1DailyProjectionPage} from './v1-daily-projection';
 import {retireV11DailyProjectionPage} from './v11-daily-projection';
 import {retireStorageGraphPage} from './storage-graph-retirement';
+import {retireGraphDayProjectionPage} from './graph-day-projection';
 import {retireStorageCommunityDailyPage} from './storage-community-daily';
 import {retireStorageCommunityGraphPublications} from './storage-community-graph-publication';
 import type {StorageAnalyticsBindings} from './analytics-delivery';
@@ -53,12 +54,15 @@ const payloadAbsence=`
  AND NOT EXISTS(SELECT 1 FROM analytics_v11_projection_work WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_v11_reusable_values WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_v11_value_pages WHERE source_id=?1 AND owner_digest=?2)
+ AND NOT EXISTS(SELECT 1 FROM analytics_graph_day_values WHERE source_id=?1 AND owner_digest=?2)
+ AND NOT EXISTS(SELECT 1 FROM analytics_graph_day_pages WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_results WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_execution WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_history_checkpoint_stages WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_community_daily_owners WHERE source_id=?1 AND owner_digest=?2)
- AND NOT EXISTS(SELECT 1 FROM analytics_community_daily_publications WHERE source_id=?1
-   AND COALESCE(json_extract(authority_json,'$.publicAuthorityEpoch'),-1)<?4)
+ AND NOT EXISTS(SELECT 1 FROM analytics_community_daily_publications p
+   JOIN analytics_community_daily_containment c ON c.source_id=p.source_id AND c.day=p.day AND c.owner_digest=?2
+   WHERE p.source_id=?1 AND COALESCE(json_extract(p.authority_json,'$.publicAuthorityEpoch'),-1)<c.terminal_public_authority_epoch)
  AND NOT EXISTS(SELECT 1 FROM analytics_community_model_publications WHERE source_id=?1
    AND COALESCE(json_extract(authority_json,'$.publicAuthorityEpoch'),-1)<?4)
  AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_previews WHERE source_id=?1
@@ -122,6 +126,11 @@ async function advanceJob(b:StorageErasureBindings,job:Job):Promise<boolean>{
  await retireV1DailyProjectionPage(b.target,b.sourceId);
  await retireV11DailyProjectionPage(b.target,b.sourceId);
  await retireStorageGraphPage(b.target,b.sourceId);
+ // Prepared graph payload is derived input, not a result cache: without this
+ // page the absence list above could never clear and erasure would never
+ // complete, and without the absence list erasure would complete while the
+ // owner's prepared days survived.
+ await retireGraphDayProjectionPage(b.target,b.sourceId);
  await retireStorageCommunityDailyPage(b);
  await retireStorageCommunityGraphPublications(b);
  await b.target.prepare(`INSERT INTO analytics_storage_erasure_receipts(source_id,owner_digest,terminal_event_digest,payload_contract)
@@ -137,8 +146,10 @@ async function advanceJob(b:StorageErasureBindings,job:Job):Promise<boolean>{
 /** One automatic bounded retry page, independent of ordered ingestion backlog. */
 export async function advanceStorageErasureJobs(b:StorageErasureBindings,options:{maxJobs?:number}={}):Promise<{completed:number;pending:boolean}>{
  const max=options.maxJobs??1;if(!Number.isSafeInteger(max)||max<1||max>4)throw unavailable();
- const jobs=(await b.ledger.prepare(`SELECT * FROM storage_erasure_jobs WHERE source_id=? AND state='pending'
- ORDER BY attempted_ms,participant_digest,owner_digest LIMIT ?`).bind(b.sourceId,max).all<Job>()).results;
+ const result=await b.ledger.prepare(`SELECT * FROM storage_erasure_jobs WHERE source_id=? AND state='pending'
+ ORDER BY attempted_ms,participant_digest,owner_digest LIMIT ?`).bind(b.sourceId,max).all<Job>();
+ if(result.success!==true||!Array.isArray(result.results))throw unavailable();const jobs=result.results;
+ if(jobs.length===0)return {completed:0,pending:false};
  let completed=0;for(const job of jobs){
   // A mapping saved before an interrupted source deletion must not starve
   // already-erased owners later in the independent queue.

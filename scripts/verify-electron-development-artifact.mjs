@@ -43,6 +43,8 @@ import {
 import {
   WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION,
   WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
+  WINDOWS_SOURCE_READ_APPROVED,
+  WINDOWS_SOURCE_READ_CONTRACT,
 } from "../src/platform/windows-filesystem.js";
 import {
   LINUX_CREDENTIAL_MUTEX_BINDING_RELATIVE_PATH as LINUX_BINDING_PATH,
@@ -72,6 +74,7 @@ const TARGETS = Object.freeze(Object.fromEntries(
 ));
 export const ELECTRON_SHELL_FILES = Object.freeze([
   "config/electron-production-distribution.cjs",
+  "config/macos-bundle-version-plan.cjs",
   "config/deployment-endpoints.js",
   "native/macos-keychain/contract.js",
   "apps/electron/companion-supervisor.js",
@@ -100,6 +103,7 @@ export const ELECTRON_SHELL_FILES = Object.freeze([
   "apps/electron/desktop-menu.js",
   "apps/electron/desktop-lifecycle.js",
   "apps/electron/desktop-macos-keychain.js",
+  "apps/electron/desktop-secure-storage-readiness.js",
   "apps/electron/desktop-native-migration.js",
   "apps/electron/desktop-native-migration-macos.js",
   "apps/electron/desktop-notification-coordinator.js",
@@ -159,6 +163,7 @@ export const ELECTRON_SHELL_FILES = Object.freeze([
   "src/platform/windows-credential-mutex.js",
   "src/platform/windows-credential-operation-audit.js",
   "src/platform/windows-credential-audit-file-guard.js",
+  "src/platform/windows-protected-sqlite.js",
 ]);
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const INVENTORY_KINDS = new Set([
@@ -194,6 +199,10 @@ const WINDOWS_NATIVE_MANIFEST_KEYS = Object.freeze([
   "requiredMethods",
   "nativeClaims",
   "approvedPolicy",
+]);
+const WINDOWS_SOURCE_READ_MANIFEST_KEYS = Object.freeze([
+  "approved",
+  "contractVersion",
 ]);
 const WINDOWS_UNQUALIFIED_BINDING_PROVENANCE = Object.freeze({
   contractVersion: "windows-binding-provenance-v1",
@@ -637,7 +646,14 @@ function validateNativeManifestShape(value) {
   const exactBooleanShape = (candidate, keys) =>
     exactObjectKeys(candidate, keys)
       && keys.every((key) => typeof candidate[key] === "boolean");
-  if (!exactObjectKeys(value, WINDOWS_NATIVE_MANIFEST_KEYS)
+  const hasSourceRead = Object.hasOwn(value, "sourceRead");
+  const manifestKeys = hasSourceRead
+    ? [...WINDOWS_NATIVE_MANIFEST_KEYS, "sourceRead"]
+    : WINDOWS_NATIVE_MANIFEST_KEYS;
+  if (!exactObjectKeys(value, manifestKeys)
+      || (hasSourceRead && (!exactObjectKeys(value.sourceRead, WINDOWS_SOURCE_READ_MANIFEST_KEYS)
+        || value.sourceRead.contractVersion !== WINDOWS_SOURCE_READ_CONTRACT
+        || value.sourceRead.approved !== WINDOWS_SOURCE_READ_APPROVED))
       || value.schemaVersion !== WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION
       || value.bindingFile !== "windows_filesystem.node"
       || value.platform !== "win32"

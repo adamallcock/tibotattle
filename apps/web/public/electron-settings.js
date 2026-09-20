@@ -1152,7 +1152,13 @@ export async function mountSettingsPage({
     );
   }
 
-  const refresh = async () => {
+  // Updater progress can change more quickly than the trusted bridge answers.
+  // Keep one read active and retain one trailing refresh, so an earlier
+  // snapshot cannot overwrite a later downloaded/installable state.
+  let refreshOperation = null;
+  let refreshQueued = false;
+
+  const refreshOnce = async () => {
     if (!settingsBridge) return currentState;
     try {
       const next = await settingsBridge.getSettings();
@@ -1216,6 +1222,24 @@ export async function mountSettingsPage({
       );
       return currentState;
     }
+  };
+
+  const refresh = () => {
+    if (!settingsBridge) return Promise.resolve(currentState);
+    refreshQueued = true;
+    if (refreshOperation !== null) return refreshOperation;
+    refreshOperation = (async () => {
+      try {
+        do {
+          refreshQueued = false;
+          await refreshOnce();
+        } while (refreshQueued);
+        return currentState;
+      } finally {
+        refreshOperation = null;
+      }
+    })();
+    return refreshOperation;
   };
 
   invoke = async (actionName, value) => {
@@ -1307,6 +1331,7 @@ export async function mountSettingsPage({
   if (settingsBridge && typeof settingsBridge.onCommand === "function") {
     try {
       const unsubscribe = settingsBridge.onCommand((command) => {
+        if (command?.command === "refresh") { void refresh(); return; }
         if (command?.command === "tray") { void refresh(); return; }
         if (command?.command === "appearance"
             && SETTINGS_APPEARANCE_VALUES.includes(command.preference)

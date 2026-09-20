@@ -1,3 +1,18 @@
+import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
+import {
+  addQuotaFragmentValue,
+  addQuotaReset,
+  closeQuotaClusterSpacing,
+  createQuotaClusterSpacing,
+  createQuotaResetClusterState,
+  offerQuotaClusterEndpoint,
+  quotaFragmentEligible,
+  quotaResetRepresentativeMs,
+  type QuotaClusterSpacing,
+  type QuotaEndpointRun,
+  type QuotaFragmentStats,
+} from "./quota-endpoint-collapse";
+import { invalidV1QuotaAcquisition } from "./quota-analysis-v1-reader";
 import { loadTypedV1AnalysisScope, readTypedV1UsageAnalysisPage, type TypedV1AnalysisScope } from './typed-v1-analysis-reader';
 import {
   MODEL_COMPOSITION_POLICY,
@@ -307,6 +322,222 @@ export interface V1AnalysisOptions {
   /** Reuse the collector's exact day/device vector; never re-elect mid-read. */
   sourcePin?: V1SourcePin;
   preparedEvidence?: V1PreparedFinishEvidence;
+}
+
+/** Compact, replayable state for the current-fit v1 usage fold. It retains the
+ * keyset cursor, session tails needed for equal-time interval attribution, and
+ * aggregate cost buckets only. Raw usage rows are never copied into the
+ * checkpoint. */
+export interface V1UsageReductionPrice {
+  costNanousd: number;
+  fullyPriced: boolean;
+}
+
+export interface V1UsageReductionPending {
+  occurrence: string;
+  provider: string;
+  observedAtMs: number;
+  intervalStartMs: number | null;
+  priced: V1UsageReductionPrice | null;
+}
+
+export interface V1UsageReductionSession {
+  key: string;
+  time: number | null;
+  pending: V1UsageReductionPending | null;
+}
+
+export interface V1UsageReductionScope {
+  key: string;
+  provider: string;
+  planEraKey: string | null;
+}
+
+export interface V1UsageReductionBucket {
+  key: string;
+  scopeKey: string;
+  provider: string;
+  planEraKey: string | null;
+  anchorMs: number;
+  placementMs: number;
+  costNanousd: number;
+  allFullyPriced: boolean;
+  singleton: boolean;
+}
+
+export type V1UsageReductionReason =
+  | "supported_quota_track_unavailable"
+  | "plan_attribution_limit_exceeded"
+  | "downsampled_quota_limit_exceeded"
+  | "windowed_usage_limit_exceeded"
+  | "session_interval_scope_limit_exceeded"
+  | "usage_cost_limit_exceeded"
+  | "reduced_usage_limit_exceeded";
+const V1_USAGE_REDUCTION_REASONS: ReadonlySet<string> = new Set([
+  "supported_quota_track_unavailable", "plan_attribution_limit_exceeded",
+  "downsampled_quota_limit_exceeded", "windowed_usage_limit_exceeded",
+  "session_interval_scope_limit_exceeded", "usage_cost_limit_exceeded",
+  "reduced_usage_limit_exceeded",
+]);
+
+export interface V1UsageReductionCheckpoint {
+  version: 1;
+  identity: V1QuotaAcquisitionIdentity;
+  cursorObservedAt: string;
+  cursorId: number;
+  rowsRead: number;
+  complete: boolean;
+  commonRefusal: V1UsageReductionReason | null;
+  costLimitExceeded: boolean;
+  pendingObservedAt: string | null;
+  sessions: V1UsageReductionSession[];
+  scopes: V1UsageReductionScope[];
+  buckets: V1UsageReductionBucket[];
+}
+
+export type V1UsageReductionStep =
+  | { status: "deferred"; checkpoint: V1UsageReductionCheckpoint }
+  | { status: "complete"; analysis: object };
+
+export const V1_USAGE_REDUCTION_COMPONENTS = ["usage-sessions", "usage-scopes", "usage-buckets"] as const;
+export const MAX_V1_USAGE_REDUCTION_CHECKPOINT_BYTES = 8 * 1024 * 1024;
+const MAX_V1_USAGE_REDUCTION_BUCKETS = 120_000;
+
+function validV1UsageIdentity(value: unknown): value is V1QuotaAcquisitionIdentity {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== ["inputFingerprint", "maxQuotaRows", "observedAtCutoff",
+        "participantId", "resetsAtCutoff", "sourceMethodVersion", "windowMinutes"].sort().join(",")) return false;
+  const row = value as V1QuotaAcquisitionIdentity;
+  return typeof row.participantId === "string" && row.participantId.length > 0 && row.participantId.length <= 256
+    && typeof row.inputFingerprint === "string" && /^[a-f0-9]{64}$/u.test(row.inputFingerprint)
+    && typeof row.sourceMethodVersion === "string" && row.sourceMethodVersion.length > 0 && row.sourceMethodVersion.length <= 256
+    && typeof row.observedAtCutoff === "string" && Number.isSafeInteger(Date.parse(row.observedAtCutoff))
+    && typeof row.resetsAtCutoff === "string" && Number.isSafeInteger(Date.parse(row.resetsAtCutoff))
+    && Number.isSafeInteger(row.windowMinutes) && row.windowMinutes > 0
+    && Number.isSafeInteger(row.maxQuotaRows) && row.maxQuotaRows > 0;
+}
+
+function validV1UsagePrice(value: unknown): value is V1UsageReductionPrice {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== "costNanousd,fullyPriced") return false;
+  const row = value as V1UsageReductionPrice;
+  return Number.isSafeInteger(row.costNanousd) && row.costNanousd >= 0
+    && row.costNanousd <= MAX_SCALAR_BUCKET_COST_NANOUSD && typeof row.fullyPriced === "boolean";
+}
+
+function validV1UsageSessionKey(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 1024) return false;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) && parsed.length === 2 && typeof parsed[0] === "string"
+      && SAFE_TOKEN.test(parsed[0]) && typeof parsed[1] === "string" && parsed[1].length <= 512
+      && JSON.stringify(parsed) === value;
+  } catch { return false; }
+}
+
+function validV1UsagePending(value: unknown): value is V1UsageReductionPending {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== "intervalStartMs,observedAtMs,occurrence,priced,provider") return false;
+  const row = value as V1UsageReductionPending;
+  return typeof row.occurrence === "string" && row.occurrence.length <= 1024
+    && SAFE_TOKEN.test(row.provider) && Number.isSafeInteger(row.observedAtMs)
+    && (row.intervalStartMs === null || Number.isSafeInteger(row.intervalStartMs))
+    && (row.priced === null || validV1UsagePrice(row.priced));
+}
+
+function validV1UsageSession(value: unknown): value is V1UsageReductionSession {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== "key,pending,time") return false;
+  const row = value as V1UsageReductionSession;
+  if (!validV1UsageSessionKey(row.key) || (row.time !== null && !Number.isSafeInteger(row.time))
+      || (row.pending !== null && !validV1UsagePending(row.pending))) return false;
+  const parsed = JSON.parse(row.key) as [string, string];
+  return row.pending === null || row.time !== null && row.pending.provider === parsed[0]
+    && row.pending.observedAtMs === row.time
+    && (row.pending.intervalStartMs === null || row.pending.intervalStartMs <= row.time);
+}
+
+function validV1UsageScope(value: unknown): value is V1UsageReductionScope {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== "key,planEraKey,provider") return false;
+  const row = value as V1UsageReductionScope;
+  if (typeof row.key !== "string" || row.key.length > 1024 || !SAFE_TOKEN.test(row.provider)
+      || (row.planEraKey !== null && typeof row.planEraKey !== "string")) return false;
+  try {
+    const parsed: unknown = JSON.parse(row.key);
+    return Array.isArray(parsed) && parsed.length === 2 && parsed[0] === row.provider
+      && parsed[1] === row.planEraKey && JSON.stringify(parsed) === row.key;
+  } catch { return false; }
+}
+
+function validV1UsageBucket(value: unknown): value is V1UsageReductionBucket {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== "allFullyPriced,anchorMs,costNanousd,key,placementMs,planEraKey,provider,scopeKey,singleton") return false;
+  const row = value as V1UsageReductionBucket;
+  if (!(typeof row.key === "string" && row.key.length <= 2048 && validV1UsageScope({
+    key: row.scopeKey, provider: row.provider, planEraKey: row.planEraKey,
+  }) && Number.isSafeInteger(row.anchorMs) && Number.isSafeInteger(row.placementMs) && Number.isSafeInteger(row.costNanousd)
+    && row.costNanousd >= 0 && row.costNanousd <= MAX_SCALAR_BUCKET_COST_NANOUSD
+    && typeof row.allFullyPriced === "boolean" && typeof row.singleton === "boolean")) return false;
+  try {
+    const parsed: unknown = JSON.parse(row.key);
+    return Array.isArray(parsed) && parsed.length === 3
+      && parsed[0] === (row.singleton ? "s" : "b") && parsed[1] === row.scopeKey
+      && parsed[2] === row.anchorMs
+      && (row.singleton ? row.placementMs === row.anchorMs : row.placementMs < row.anchorMs);
+  } catch { return false; }
+}
+
+/** Closed validation is used again by the durable checkpoint decoder. */
+export function validateV1UsageReductionCheckpoint(value: unknown): value is V1UsageReductionCheckpoint {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as V1UsageReductionCheckpoint;
+  if (Object.keys(row).sort().join(",") !== ["buckets", "commonRefusal", "complete", "costLimitExceeded", "cursorId",
+    "cursorObservedAt", "identity", "pendingObservedAt", "rowsRead", "scopes", "sessions", "version"].sort().join(",")
+      || row.version !== 1 || !validV1UsageIdentity(row.identity)
+      || typeof row.cursorObservedAt !== "string" || !Number.isSafeInteger(Date.parse(row.cursorObservedAt))
+      || !Number.isSafeInteger(row.cursorId) || row.cursorId < 0 || !Number.isSafeInteger(row.rowsRead)
+      || row.rowsRead < 0 || row.rowsRead > MAX_WINDOWED_USAGE_ROWS || typeof row.complete !== "boolean"
+      || typeof row.costLimitExceeded !== "boolean"
+      || (row.commonRefusal !== null && (typeof row.commonRefusal !== "string"
+        || !V1_USAGE_REDUCTION_REASONS.has(row.commonRefusal)))
+      || (row.pendingObservedAt !== null && (typeof row.pendingObservedAt !== "string"
+        || !Number.isSafeInteger(Date.parse(row.pendingObservedAt))))
+      || !Array.isArray(row.sessions) || row.sessions.length > MAX_SESSION_INTERVAL_SCOPES
+      || !row.sessions.every(validV1UsageSession) || !Array.isArray(row.scopes)
+      || row.scopes.length > MAX_V1_USAGE_REDUCTION_BUCKETS || !row.scopes.every(validV1UsageScope)
+      || !Array.isArray(row.buckets) || row.buckets.length > MAX_V1_USAGE_REDUCTION_BUCKETS
+      || !row.buckets.every(validV1UsageBucket)) return false;
+  const scopeByKey = new Map(row.scopes.map(scope => [scope.key, scope]));
+  return new Set(row.sessions.map(entry => entry.key)).size === row.sessions.length
+    && scopeByKey.size === row.scopes.length
+    && new Set(row.buckets.map(entry => entry.key)).size === row.buckets.length
+    && row.buckets.every(bucket => {
+      const scope = scopeByKey.get(bucket.scopeKey);
+      return scope?.provider === bucket.provider && scope.planEraKey === bucket.planEraKey;
+    });
+}
+
+export function encodeV1UsageReductionCheckpoint(checkpoint: V1UsageReductionCheckpoint): {
+  control: Omit<V1UsageReductionCheckpoint, "sessions" | "scopes" | "buckets">;
+  components: Record<(typeof V1_USAGE_REDUCTION_COMPONENTS)[number], unknown[]>;
+} {
+  if (!validateV1UsageReductionCheckpoint(checkpoint)) throw new Error("v1 usage reduction checkpoint invalid");
+  const { sessions, scopes, buckets, ...control } = structuredClone(checkpoint);
+  return { control, components: { "usage-sessions": sessions, "usage-scopes": scopes, "usage-buckets": buckets } };
+}
+
+export function decodeV1UsageReductionCheckpoint(control: unknown, components: Record<string, unknown[]>): V1UsageReductionCheckpoint {
+  if (!control || typeof control !== "object" || Object.keys(components).some(key =>
+    !V1_USAGE_REDUCTION_COMPONENTS.includes(key as (typeof V1_USAGE_REDUCTION_COMPONENTS)[number]))) {
+    throw new Error("v1 usage reduction checkpoint invalid");
+  }
+  const checkpoint = { ...(control as Omit<V1UsageReductionCheckpoint, "sessions" | "scopes" | "buckets">),
+    sessions: components["usage-sessions"] ?? [], scopes: components["usage-scopes"] ?? [],
+    buckets: components["usage-buckets"] ?? [],
+  } as V1UsageReductionCheckpoint;
+  if (!validateV1UsageReductionCheckpoint(checkpoint)) throw new Error("v1 usage reduction checkpoint invalid");
+  return checkpoint;
 }
 
 export interface V1AcquiredQuotaEvidence {
@@ -700,10 +931,26 @@ async function loadPlanAttributionIndex(
   db: D1Database, participantId: string, winnersJson: string, observedAtCutoff: string, observedAtBefore?:string,
 ): Promise<PlanAttributionIndex | null> {
   const typed=await loadTypedV1AnalysisScope(db,participantId);
-  let sql=typed?PLAN_EVIDENCE_SQL.replaceAll('telemetry_v1_records','typed_v1_current_records'):PLAN_EVIDENCE_SQL;
+  let sql=PLAN_EVIDENCE_SQL;
   if(observedAtBefore)sql=sql.replace('r.observed_at >= ?', 'r.observed_at >= ? AND r.observed_at < ?');
+  const bindings:unknown[]=[winnersJson,participantId,observedAtCutoff,
+    ...(observedAtBefore?[observedAtBefore]:[]),MAX_PLAN_ATTRIBUTION_ROWS+1];
+  if(typed){
+    let parameter=0;sql=sql.replace(/\?/g,()=>`?${++parameter}`);
+    const ownerParameter=++parameter,fromParameter=++parameter,toParameter=observedAtBefore?++parameter:null;
+    sql=sql.replace('WITH plan_times',`WITH typed_plan_input AS MATERIALIZED (
+      SELECT v.observed_at,v.provider,v.limit_id,v.plan_type,v.plan_variant,
+        v.participant_id,v.device_id,v.observed_day,v.stream
+      FROM typed_telemetry_records base INDEXED BY typed_v1_owner_observed
+      CROSS JOIN typed_v1_current_records v
+      WHERE v.storage_row_id=base.id
+        AND base.format=10 AND base.owner_id=?${ownerParameter} AND base.stream=2
+        AND base.observed_at_ms>=?${fromParameter}${toParameter===null?'':` AND base.observed_at_ms<?${toParameter}`}
+    ), plan_times`).replaceAll('telemetry_v1_records','typed_plan_input');
+    bindings.push(typed.ownerId,Date.parse(observedAtCutoff),...(observedAtBefore?[Date.parse(observedAtBefore)]:[]));
+  }
   const result = await db.prepare(sql)
-    .bind(winnersJson, participantId, observedAtCutoff, ...(observedAtBefore?[observedAtBefore]:[]), MAX_PLAN_ATTRIBUTION_ROWS + 1)
+    .bind(...bindings)
     .all<PlanEvidenceRow>();
   if (result.results.length > MAX_PLAN_ATTRIBUTION_ROWS) return null;
   const index = buildPlanAttributionIndex(result.results.map(planObservation));
@@ -752,6 +999,96 @@ function attributeSnapshot(
 // numbering across the CTE chain buys nothing. `scoped` is MATERIALIZED so its
 // winner-filtered index scan runs once rather than being re-evaluated by both
 // `fitable` and `survivors`.
+/** Mirrors of the paged reader's row rejections, kept local so the two v1
+ * quota paths can be compared without reading the other module. v1 carries no
+ * account scope, so the reader's account-track check has nothing to mirror,
+ * and v1 deliberately retains arbitrary slot tokens rather than a closed set. */
+const DIRECT_V1_SOURCE_TOKEN = /^[A-Za-z0-9._:-]{1,64}$/u;
+const DIRECT_V1_PLAN_TYPES = new Set<string>(TELEMETRY_PLAN_TYPES);
+
+/** The direct read returns run endpoints collapsed by the restated instant,
+ * because SQL cannot cluster pools. Re-derive exactly what the paged
+ * acquisition derives: pool hulls over every valid row, the fitable refusal on
+ * the clustered key (the `fitable` stage this SQL no longer carries), then run
+ * collapse inside each restated instant's block and cluster-scoped spacing.
+ * The rows are first put into the reader's own `(resets_at, observed_at, id)`
+ * order, so both paths make the same greedy decisions; the SQL already orders
+ * by `(observed_at, id)` and the sort is stable, so ties keep that order.
+ * Null means the pool bound was exceeded: unavailable, not absent. */
+function collapseDirectV1QuotaRows(rows: readonly DownsampledQuotaRow[],
+  index: PlanAttributionIndex): DownsampledQuotaRow[] | null {
+  interface Candidate {
+    row: DownsampledQuotaRow; id: number; eraKey: string; resetsAt: string; resetMs: number;
+    observedAtMs: number; reset: string;
+  }
+  const valid: Candidate[] = [];
+  for (const row of rows) {
+    const observedAtMs = Date.parse(row.observed_at), resetMs = Date.parse(row.resets_at);
+    if (!SAFE_TOKEN.test(row.provider) || row.limit_id !== "codex"
+        || !DIRECT_V1_PLAN_TYPES.has(row.plan_type) || !SAFE_TOKEN.test(row.plan_variant)
+        || !DIRECT_V1_SOURCE_TOKEN.test(row.slot) || resetMs <= observedAtMs
+        || typeof row.used_percent !== "number" || !Number.isFinite(row.used_percent)
+        || row.used_percent < 0 || row.used_percent > 100) continue;
+    const match = planEraForInterval(index, {
+      contextKey: `${row.provider}|${row.limit_id}`, observedAtMs,
+    });
+    if (match.status !== "matched" || match.era.eraKey !== row.plan_era_key
+        || match.era.planType !== row.plan_type || match.era.planVariant !== row.plan_variant) continue;
+    valid.push({ row, id: 0, eraKey: row.plan_era_key, resetsAt: row.resets_at, resetMs,
+      observedAtMs, reset: "" });
+  }
+  valid.sort((left, right) => (left.resetsAt < right.resetsAt ? -1 : left.resetsAt > right.resetsAt ? 1 : 0)
+    || left.observedAtMs - right.observedAtMs);
+  for (let index = 0; index < valid.length; index += 1) valid[index]!.id = index + 1;
+  const clusters = createQuotaResetClusterState();
+  for (const entry of valid) if (!addQuotaReset(clusters, entry.eraKey, entry.resetMs)) return null;
+  const stats = new Map<string, QuotaFragmentStats>();
+  for (const entry of valid) {
+    const representative = quotaResetRepresentativeMs(clusters, entry.eraKey, entry.resetMs);
+    if (representative === null) invalidV1QuotaAcquisition();
+    entry.reset = new Date(representative).toISOString();
+    addQuotaFragmentValue(stats, JSON.stringify([entry.reset, entry.eraKey]), entry.row.used_percent);
+  }
+  const eligible = new Set([...stats].filter(([, stat]) => quotaFragmentEligible(stat)).map(([key]) => key));
+  const view = (entry: Candidate) => ({ id: entry.id, observedAtMs: entry.observedAtMs,
+    usedPercent: entry.row.used_percent });
+  // Runs stay keyed by the restated instant, the only stretch the reader
+  // delivers in observation order; the cluster spacing then rides on top.
+  const runs = new Map<string, QuotaEndpointRun<Candidate>>();
+  const spacing = new Map<string, QuotaClusterSpacing<Candidate>>();
+  const kept: Candidate[] = [];
+  const emit = (entry: Candidate) => { kept.push(entry); return true; };
+  const offer = (entry: Candidate): boolean => {
+    const key = JSON.stringify([entry.eraKey, entry.row.slot, entry.reset]);
+    let cluster = spacing.get(key);
+    if (!cluster) { cluster = createQuotaClusterSpacing(); spacing.set(key, cluster); }
+    return offerQuotaClusterEndpoint(cluster, entry, view, emit);
+  };
+  let block: string | null = null;
+  for (const entry of valid) {
+    if (!eligible.has(JSON.stringify([entry.reset, entry.eraKey]))) continue;
+    if (block !== null && block !== entry.resetsAt) {
+      for (const run of runs.values()) if (view(run.last).id !== run.firstId && !offer(run.last)) return null;
+      runs.clear();
+    }
+    block = entry.resetsAt;
+    const key = JSON.stringify([entry.eraKey, entry.row.slot]);
+    const run = runs.get(key);
+    if (run && view(run.last).usedPercent === entry.row.used_percent) run.last = entry;
+    else {
+      if (run && view(run.last).id !== run.firstId && !offer(run.last)) return null;
+      if (!offer(entry)) return null;
+      runs.set(key, { firstId: entry.id, last: entry, keptAtMs: 0, keptValues: [],
+        keptMinimum: 0, keptMaximum: 0, holdMinimum: null, holdMaximum: null, pending: null });
+    }
+  }
+  for (const run of runs.values()) if (view(run.last).id !== run.firstId && !offer(run.last)) return null;
+  for (const cluster of spacing.values()) if (!closeQuotaClusterSpacing(cluster, view, emit)) return null;
+  return kept
+    .sort((left, right) => left.observedAtMs - right.observedAtMs || left.id - right.id)
+    .map((entry) => ({ ...entry.row, resets_at: entry.reset }));
+}
+
 export const QUOTA_DOWNSAMPLE_SQL = `WITH era_markers AS MATERIALIZED (
     SELECT json_extract(e.value, '$[0]') AS provider,
       json_extract(e.value, '$[1]') AS limit_id,
@@ -808,35 +1145,11 @@ export const QUOTA_DOWNSAMPLE_SQL = `WITH era_markers AS MATERIALIZED (
     WHERE a.is_marker = 0 AND a.plan_type = e.plan_type
       AND a.plan_variant = e.plan_variant AND a.observed_at >= e.lower_bound
       AND (e.upper_bound IS NULL OR a.observed_at <= e.upper_bound)
-  ), fragment_stats AS (
-    SELECT provider, plan_type, plan_variant, limit_id,
-           window_duration_minutes, resets_at, plan_era_key,
-           COUNT(DISTINCT used_percent) AS boundary_count,
-           MAX(used_percent) - MIN(used_percent) AS displayed_span,
-           MAX(observed_at) AS last_observed_at
-      FROM scoped
-     GROUP BY provider, plan_type, plan_variant, limit_id,
-              window_duration_minutes, resets_at, plan_era_key
-  ), fitable AS (
-    SELECT * FROM fragment_stats WHERE boundary_count >= ? AND displayed_span >= ?
-  ),
-  survivors AS (
-    SELECT s.*
-      FROM scoped s
-      JOIN fitable f
-        ON f.provider = s.provider
-       AND f.plan_type = s.plan_type
-       AND f.plan_variant = s.plan_variant
-       AND f.limit_id = s.limit_id
-       AND f.window_duration_minutes = s.window_duration_minutes
-       AND f.resets_at = s.resets_at
-       AND f.plan_era_key = s.plan_era_key
-  ),
-  marked AS (
-    SELECT survivors.*,
+  ), marked AS (
+    SELECT scoped.*,
            LAG(used_percent) OVER win AS prev_up,
            LEAD(used_percent) OVER win AS next_up
-      FROM survivors
+      FROM scoped
     WINDOW win AS (
       PARTITION BY provider, plan_type, plan_variant, limit_id,
                    window_duration_minutes, resets_at, slot, plan_era_key
@@ -888,21 +1201,26 @@ export const V1_HISTORY_USAGE_PAGE_AFTER_TIME_SQL = `${V1_USAGE_PAGE_SELECT_SQL}
      AND r.observed_at > ? AND r.observed_at < ?
    ORDER BY r.observed_at, r.id LIMIT ?`;
 
-async function v1QuotaAnalysisSql(db:D1Database,participantId:string,sql:string):Promise<string>{
-  if(!await loadTypedV1AnalysisScope(db,participantId))return sql;
+async function v1QuotaAnalysisSql(db:D1Database,participantId:string,sql:string,observedAtCutoff:string,
+ observedAtBefore?:string):Promise<{sql:string;typedBindings:unknown[]}>{
+  const typed=await loadTypedV1AnalysisScope(db,participantId);if(!typed)return {sql,typedBindings:[]};
   // Materialize the narrow owner/window once before the shared multi-stage
   // reduction. Flattening the full compatibility view through every window
   // expression makes SQLite exhaust its query-planner memory on a tiny corpus.
   // Explicit positions preserve the existing call's parameter order.
   let parameter=0;
   const positioned=sql.replace(/\?/g,()=>`?${++parameter}`);
-  const upper=sql.includes('r.observed_at >= ? AND r.observed_at < ?');
-  return positioned.replace('WITH era_markers',`WITH typed_quota_input AS MATERIALIZED (
-    SELECT occurrence_id,observed_at,provider,plan_type,plan_variant,limit_id,slot,
-      used_percent,window_duration_minutes,resets_at,id,participant_id,device_id,observed_day,stream
-    FROM typed_v1_current_records WHERE participant_id=?3 AND stream='quota' AND observed_at>=?4
-      ${upper?'AND observed_at<?5':''}
-  ), era_markers`).replaceAll('telemetry_v1_records','typed_quota_input');
+  const ownerParameter=++parameter,fromParameter=++parameter,toParameter=observedAtBefore?++parameter:null;
+  return {sql:positioned.replace('WITH era_markers',`WITH typed_quota_input AS MATERIALIZED (
+    SELECT v.occurrence_id,v.observed_at,v.provider,v.plan_type,v.plan_variant,v.limit_id,v.slot,
+      v.used_percent,v.window_duration_minutes,v.resets_at,v.id,v.participant_id,v.device_id,v.observed_day,v.stream
+    FROM typed_telemetry_records base INDEXED BY typed_v1_owner_observed
+    CROSS JOIN typed_v1_current_records v
+    WHERE v.storage_row_id=base.id
+      AND base.format=10 AND base.owner_id=?${ownerParameter} AND base.stream=2
+      AND base.observed_at_ms>=?${fromParameter}${toParameter===null?'':` AND base.observed_at_ms<?${toParameter}`}
+  ), era_markers`).replaceAll('telemetry_v1_records','typed_quota_input'),
+  typedBindings:[typed.ownerId,Date.parse(observedAtCutoff),...(observedAtBefore?[Date.parse(observedAtBefore)]:[])]};
 }
 /** Shared page/cursor contract for both scalar and model-composition readers. */
 export async function readV1UsagePage(
@@ -1302,6 +1620,295 @@ async function readAndBucketUsage(
   return usageEvents;
 }
 
+export function createV1UsageReductionCheckpoint(identity: V1QuotaAcquisitionIdentity): V1UsageReductionCheckpoint {
+  return { version: 1, identity: structuredClone(identity), cursorObservedAt: identity.observedAtCutoff, cursorId: 0,
+    rowsRead: 0, complete: false, commonRefusal: null, costLimitExceeded: false, pendingObservedAt: null,
+    sessions: [], scopes: [], buckets: [] };
+}
+
+interface V1UsageReductionContext {
+  db: D1Database;
+  participantId: string;
+  sourcePin: V1SourcePin;
+  observedAtCutoff: string;
+  resetsAtCutoff: string;
+  attributionIndex: PlanAttributionIndex;
+  rows: DownsampledQuotaRow[];
+  datasetId: string;
+  accountTrackByProvider: Map<string, string>;
+  gridByProvider: Map<string, ProviderGrid>;
+  selectedLayout: TypedV1AnalysisScope | null;
+  refusal: V1UsageReductionReason | null;
+}
+
+function sameV1UsageIdentity(left: V1QuotaAcquisitionIdentity, right: V1QuotaAcquisitionIdentity): boolean {
+  const keys = Object.keys(left) as Array<keyof V1QuotaAcquisitionIdentity>;
+  return keys.length === Object.keys(right).length && keys.every(key => left[key] === right[key]);
+}
+
+/** Prepare only the acquired quota evidence needed by the resumable scalar
+ * usage fold. This mirrors the scalar branch of collectAcquiredAnalyses and
+ * deliberately performs the source checks on every resumed invocation. */
+async function prepareV1UsageReductionContext(
+  db: D1Database, participantId: string, evidence: V1AcquiredQuotaEvidence,
+  options: V1AnalysisOptions & { sourcePin: V1SourcePin },
+): Promise<V1UsageReductionContext> {
+  const nowMs = options.nowMs ?? Date.now();
+  if (!Number.isSafeInteger(nowMs)) throw new TypeError("v1 usage reduction clock invalid");
+  const observedAtCutoff = new Date(nowMs - V1_ANALYSIS_WINDOW_MS).toISOString().slice(0, 10) + "T00:00:00.000Z";
+  const resetsAtCutoff = new Date(Date.parse(observedAtCutoff) + SEVEN_DAY_WINDOW_MS).toISOString();
+  const sourcePin = await analysisSourcePin(db, participantId, observedAtCutoff, options.sourcePin);
+  const prepared = await validateAcquiredQuotaEvidence(db, participantId, evidence, sourcePin,
+    observedAtCutoff, resetsAtCutoff, options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS);
+  const { attributionIndex, results: rows } = prepared;
+  let refusal: V1UsageReductionReason | null = null;
+  if (sourcePin.winners.length === 0) refusal = "supported_quota_track_unavailable";
+  else if (attributionIndex.status === "limit_exceeded") refusal = "plan_attribution_limit_exceeded";
+  const datasetId = await v1DatasetId(participantId);
+  const accountTrackByProvider = new Map<string, string>();
+  const quotaSnapshots: AttributedQuotaSnapshot[] = [];
+  const gridByProvider = new Map<string, ProviderGrid>();
+  if (refusal === null) {
+    for (const row of rows) {
+      if (!validQuotaSnapshotRow(row)) continue;
+      const match = planEraForInterval(attributionIndex, {
+        contextKey: planAttributionContextKey(row.provider, row.limit_id), observedAtMs: Date.parse(row.observed_at),
+      });
+      if (match.status !== "matched" || match.era.planType !== row.plan_type || match.era.planVariant !== row.plan_variant) continue;
+      let accountTrackId = accountTrackByProvider.get(row.provider);
+      if (accountTrackId === undefined) {
+        accountTrackId = await v1AccountTrackId(participantId, row.provider);
+        accountTrackByProvider.set(row.provider, accountTrackId);
+      }
+      const snapshot = await buildQuotaSnapshotInput(row, accountTrackId, datasetId);
+      const attributed = snapshot ? attributeSnapshot(snapshot, attributionIndex) : null;
+      if (attributed) quotaSnapshots.push(attributed);
+    }
+    if (quotaSnapshots.length === 0) refusal = "supported_quota_track_unavailable";
+    else {
+      const built = buildGridByProvider(quotaSnapshots);
+      for (const [provider, grid] of built) gridByProvider.set(provider, grid);
+    }
+  }
+  const selectedLayout = refusal === null ? await loadTypedV1AnalysisScope(db, participantId) : null;
+  return { db, participantId, sourcePin, observedAtCutoff, resetsAtCutoff, attributionIndex, rows, datasetId,
+    accountTrackByProvider, gridByProvider, selectedLayout, refusal };
+}
+
+function reducedUsagePrice(priced: ReturnType<typeof priceChunkUsageRecord>): V1UsageReductionPrice | null {
+  return priced === null ? null : { costNanousd: priced.costNanousd, fullyPriced: priced.pricingStatus === "fully_priced" };
+}
+
+function v1UsageReductionPayloadBytes(state: V1UsageReductionCheckpoint): number {
+  return new TextEncoder().encode(JSON.stringify({ sessions: state.sessions, scopes: state.scopes, buckets: state.buckets })).byteLength;
+}
+
+async function synthesizeV1UsageReduction(
+  context: V1UsageReductionContext, state: V1UsageReductionCheckpoint,
+): Promise<AttributedUsageEventPartial[]> {
+  const usageEvents: AttributedUsageEventPartial[] = [];
+  const bucketsByScope = new Map<string, { singletons: V1UsageReductionBucket[]; intervals: V1UsageReductionBucket[] }>();
+  for (const bucket of state.buckets) {
+    const group = bucketsByScope.get(bucket.scopeKey) ?? { singletons: [], intervals: [] };
+    (bucket.singleton ? group.singletons : group.intervals).push(bucket);
+    bucketsByScope.set(bucket.scopeKey, group);
+  }
+  for (const scope of state.scopes) {
+    const accountTrackId = context.accountTrackByProvider.get(scope.provider);
+    if (accountTrackId === undefined) continue;
+    const grouped = bucketsByScope.get(scope.key);
+    for (const bucket of grouped?.singletons ?? []) {
+      usageEvents.push(await synthUsageRow(accountTrackId, context.datasetId, bucket.provider,
+        { costNanousd: bucket.costNanousd, allFullyPriced: bucket.allFullyPriced, placementMs: bucket.placementMs },
+        `s|${bucket.anchorMs}|${bucket.planEraKey}`, bucket.planEraKey));
+    }
+    for (const bucket of grouped?.intervals ?? []) {
+      usageEvents.push(await synthUsageRow(accountTrackId, context.datasetId, bucket.provider,
+        { costNanousd: bucket.costNanousd, allFullyPriced: bucket.allFullyPriced, placementMs: bucket.placementMs },
+        `b|${bucket.anchorMs}|${bucket.planEraKey}`, bucket.planEraKey));
+    }
+  }
+  return usageEvents;
+}
+
+async function finishV1UsageReduction(
+  context: V1UsageReductionContext, state: V1UsageReductionCheckpoint, budget: V1QuotaInvocationBudget,
+): Promise<object | null> {
+  const now = budget.now ?? Date.now;
+  if (budget.remainingQueries < 2 || now() >= budget.deadlineMs) return null;
+  budget.remainingQueries -= 2;
+  let analysis: object;
+  if (state.commonRefusal !== null) analysis = notTestable(state.commonRefusal);
+  else if (state.costLimitExceeded) analysis = notTestable("usage_cost_limit_exceeded");
+  else analysis = await finishAcquiredScalar(context.rows, context.attributionIndex, context.datasetId,
+    context.accountTrackByProvider, await synthesizeV1UsageReduction(context, state));
+  await assertV1SourcePinCurrent(context.db, context.sourcePin);
+  return { ...analysis, attributionMethod: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
+    inputFingerprint: context.sourcePin.fingerprint };
+}
+
+/** Advance a bounded current-fit usage fold. Each successful page is represented
+ * by its keyset cursor and compact reducer state before the caller persists it;
+ * no raw usage row is retained. */
+export async function advanceV1UsageReduction(
+  db: D1Database, participantId: string, evidence: V1AcquiredQuotaEvidence,
+  budget: V1QuotaInvocationBudget, options: V1AnalysisOptions & { sourcePin: V1SourcePin },
+  prior?: V1UsageReductionCheckpoint | null, maxPages = 1,
+): Promise<V1UsageReductionStep> {
+  if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 32
+      || !Number.isSafeInteger(budget.remainingQueries) || budget.remainingQueries < 0
+      || !Number.isFinite(budget.deadlineMs)) throw new Error("v1 usage reduction budget invalid");
+  const maxWindowedUsageRows = options.maxWindowedUsageRows ?? MAX_WINDOWED_USAGE_ROWS;
+  if (!Number.isSafeInteger(maxWindowedUsageRows) || maxWindowedUsageRows < 1
+      || maxWindowedUsageRows > MAX_WINDOWED_USAGE_ROWS) throw new Error("v1 usage reduction row bound invalid");
+  if (options.preparedEvidence) throw new Error("v1 usage reduction does not accept prepared evidence");
+  const state = prior ? structuredClone(prior) : createV1UsageReductionCheckpoint(evidence.identity);
+  if (!validateV1UsageReductionCheckpoint(state) || !sameV1UsageIdentity(state.identity, evidence.identity)) {
+    throw new Error("v1 usage reduction checkpoint invalid");
+  }
+  const now = budget.now ?? Date.now;
+  const PREPARE_QUERIES = 7, PAGE_QUERIES = 2, FINAL_QUERIES = 2;
+  if (budget.remainingQueries < PREPARE_QUERIES || now() >= budget.deadlineMs) {
+    return { status: "deferred", checkpoint: state };
+  }
+  budget.remainingQueries -= PREPARE_QUERIES;
+  const context = await prepareV1UsageReductionContext(db, participantId, evidence, options);
+  if (context.refusal !== null) {
+    state.commonRefusal = context.refusal;
+    state.complete = true;
+    state.sessions = []; state.scopes = []; state.buckets = []; state.pendingObservedAt = null;
+  }
+  const sessions = new Map(state.sessions.map(entry => [entry.key, entry]));
+  const scopes = new Map(state.scopes.map(entry => [entry.key, entry]));
+  const buckets = new Map(state.buckets.map(entry => [entry.key, entry]));
+  const clearReducer = () => {
+    sessions.clear(); scopes.clear(); buckets.clear(); state.sessions = []; state.scopes = []; state.buckets = [];
+    state.pendingObservedAt = null;
+  };
+  const foldPoint = (provider: string, observedAtMs: number, priced: V1UsageReductionPrice | null,
+    intervalStartMs: number | undefined): void => {
+    if (priced === null || state.commonRefusal === "session_interval_scope_limit_exceeded") return;
+    const grid = context.gridByProvider.get(provider);
+    if (!grid || grid.sortedMs.length === 0 || observedAtMs > grid.sortedMs[grid.sortedMs.length - 1]!) return;
+    const match = planEraForInterval(context.attributionIndex, {
+      contextKey: planAttributionContextKey(provider, "codex"), observedAtMs, intervalStartMs,
+    });
+    const planEraKey = match.status === "matched" ? match.era.eraKey : null;
+    const scopeKey = JSON.stringify([provider, planEraKey]);
+    if (!scopes.has(scopeKey)) scopes.set(scopeKey, { key: scopeKey, provider, planEraKey });
+    const singleton = grid.set.has(observedAtMs);
+    const placementMs = singleton ? observedAtMs : ceilingGrid(grid.sortedMs, observedAtMs);
+    if (placementMs === null) return;
+    const key = JSON.stringify([singleton ? "s" : "b", scopeKey, placementMs]);
+    const existing = buckets.get(key);
+    if (!Number.isSafeInteger(priced.costNanousd) || priced.costNanousd < 0
+        || priced.costNanousd > MAX_SCALAR_BUCKET_COST_NANOUSD - (existing?.costNanousd ?? 0)) {
+      state.costLimitExceeded = true;
+      return;
+    }
+    if (existing) {
+      existing.costNanousd += priced.costNanousd;
+      existing.allFullyPriced = existing.allFullyPriced && priced.fullyPriced;
+      existing.placementMs = Math.max(existing.placementMs, observedAtMs);
+    } else {
+      buckets.set(key, { key, scopeKey, provider, planEraKey, anchorMs: placementMs, placementMs: observedAtMs,
+        costNanousd: priced.costNanousd, allFullyPriced: priced.fullyPriced, singleton });
+      if (buckets.size > MAX_V1_USAGE_REDUCTION_BUCKETS) {
+        state.commonRefusal = "reduced_usage_limit_exceeded"; state.complete = true; clearReducer();
+      }
+    }
+  };
+  const flushPending = (): void => {
+    for (const session of sessions.values()) {
+      const pending = session.pending;
+      if (!pending) continue;
+      foldPoint(pending.provider, session.time!, pending.priced,
+        pending.intervalStartMs === null ? undefined : pending.intervalStartMs);
+      session.pending = null;
+      if (state.complete) break;
+    }
+  };
+  pages: for (let page = 0; page < maxPages && !state.complete; page += 1) {
+    if (budget.remainingQueries < PAGE_QUERIES || now() >= budget.deadlineMs) break;
+    budget.remainingQueries -= PAGE_QUERIES;
+    const rows = await readV1UsagePage(db, context.sourcePin.winnersJson, participantId,
+      state.cursorObservedAt, state.cursorId, USAGE_PAGE_SIZE, undefined, context.selectedLayout);
+    if (rows.length > USAGE_PAGE_SIZE) throw new Error("v1 usage reduction page overflow");
+    state.rowsRead += rows.length;
+    if (state.rowsRead > maxWindowedUsageRows) {
+      state.rowsRead = maxWindowedUsageRows;
+      state.commonRefusal = "windowed_usage_limit_exceeded"; state.complete = true; clearReducer(); break;
+    }
+    for (const row of rows) {
+      if (!SAFE_TOKEN.test(row.provider)) continue;
+      const observedAtMs = Date.parse(row.observed_at);
+      if (!Number.isSafeInteger(observedAtMs)) continue;
+      if (state.pendingObservedAt !== row.observed_at) {
+        flushPending();
+        state.pendingObservedAt = row.observed_at;
+      }
+      let session: V1UsageReductionSession | null = null;
+      if (row.session_uuid !== null) {
+        const key = JSON.stringify([row.provider, row.session_uuid]);
+        session = sessions.get(key) ?? null;
+        if (!session) {
+          if (sessions.size >= MAX_SESSION_INTERVAL_SCOPES) {
+            state.commonRefusal = "session_interval_scope_limit_exceeded"; state.complete = true; clearReducer(); break pages;
+          }
+          session = { key, time: null, pending: null }; sessions.set(key, session);
+        }
+      }
+      const grid = context.gridByProvider.get(row.provider);
+      const scalarPriceNeeded = state.commonRefusal !== "session_interval_scope_limit_exceeded"
+        && grid !== undefined && grid.sortedMs.length > 0 && observedAtMs <= grid.sortedMs[grid.sortedMs.length - 1]!;
+      const priced = scalarPriceNeeded ? reducedUsagePrice(priceChunkUsageRecord(row.record_json, row.observed_at)) : null;
+      if (session) {
+        const intervalStartMs = session.time === null ? undefined : session.time;
+        session.time = observedAtMs;
+        if (!scalarPriceNeeded) continue;
+        if (!session.pending) {
+          const era = (start: number | undefined) => {
+            const match = planEraForInterval(context.attributionIndex, {
+              contextKey: planAttributionContextKey(row.provider, "codex"), observedAtMs, intervalStartMs: start,
+            });
+            return match.status === "matched" ? match.era.eraKey : null;
+          };
+          if (intervalStartMs === undefined || intervalStartMs === observedAtMs || era(intervalStartMs) === era(observedAtMs)) {
+            foldPoint(row.provider, observedAtMs, priced, intervalStartMs);
+          } else {
+            session.pending = { occurrence: row.occurrence_id, provider: row.provider, observedAtMs,
+              intervalStartMs, priced };
+          }
+        } else if (row.occurrence_id < session.pending.occurrence) {
+          foldPoint(session.pending.provider, observedAtMs, session.pending.priced, observedAtMs);
+          session.pending = { occurrence: row.occurrence_id, provider: row.provider, observedAtMs,
+              intervalStartMs: session.pending.intervalStartMs, priced };
+        } else {
+          foldPoint(row.provider, observedAtMs, priced, observedAtMs);
+        }
+      } else if (scalarPriceNeeded) {
+        foldPoint(row.provider, observedAtMs, priced, undefined);
+      }
+      if (state.complete) break pages;
+    }
+    if (state.complete) break;
+    if (rows.length < USAGE_PAGE_SIZE) {
+      flushPending(); sessions.clear(); state.pendingObservedAt = null; state.complete = true; break;
+    }
+    const last = rows[rows.length - 1]!;
+    state.cursorObservedAt = last.observed_at; state.cursorId = last.id;
+  }
+  state.sessions = [...sessions.values()]; state.scopes = [...scopes.values()]; state.buckets = [...buckets.values()];
+  if (v1UsageReductionPayloadBytes(state) > MAX_V1_USAGE_REDUCTION_CHECKPOINT_BYTES) {
+    state.commonRefusal = "reduced_usage_limit_exceeded"; state.complete = true; clearReducer();
+  }
+  if (!validateV1UsageReductionCheckpoint(state)) throw new Error("v1 usage reduction successor invalid");
+  if (!state.complete) return { status: "deferred", checkpoint: state };
+  if (budget.remainingQueries < FINAL_QUERIES || now() >= budget.deadlineMs) return { status: "deferred", checkpoint: state };
+  const analysis = await finishV1UsageReduction(context, state, budget);
+  return analysis === null ? { status: "deferred", checkpoint: state } : { status: "complete", analysis };
+}
+
 async function synthUsageRow(
   accountTrackId: string,
   datasetId: string,
@@ -1547,22 +2154,36 @@ async function analyzeAccountScopedQuotaV1(
   if (attributionIndex === null) return notTestable("plan_attribution_limit_exceeded");
   if (attributionIndex.status === "limit_exceeded") return notTestable("plan_attribution_limit_exceeded");
 
-  const quotaResult = prepared ?? await db.prepare(await v1QuotaAnalysisSql(db,participantId,QUOTA_DOWNSAMPLE_SQL)).bind(
+  const quotaQuery=prepared?null:await v1QuotaAnalysisSql(db,participantId,QUOTA_DOWNSAMPLE_SQL,observedAtCutoff);
+  const quotaResult = prepared ?? await db.prepare(quotaQuery!.sql).bind(
     eraMarkersJson(attributionIndex),
     sourcePin.winnersJson,
     participantId,
     observedAtCutoff,
     resetsAtCutoff,
     SEVEN_DAY_WINDOW_MINUTES,
-    MINIMUM_BOUNDARIES,
-    MINIMUM_DISPLAYED_SPAN_PP,
-    maxDownsampledQuotaRows + 1,
+    maxDownsampledQuotaRows + 1,...quotaQuery!.typedBindings,
   ).all<DownsampledQuotaRow>();
 
+  // The pre-collapse bound is a memory budget on the rows this statement
+  // decodes, not an analytical refusal, so overflowing it must not become a
+  // published `not_testable` day: `downsampled_quota_limit_exceeded` is a
+  // cacheable composition refusal. It is raised as unavailability instead, so
+  // the graph's next pass takes the resumable reader, which pages and can
+  // complete owners this single read cannot. The analytical bound is applied
+  // below, on the clustered rows, and means the same thing on both paths.
+  if (!prepared && quotaResult.results.length > maxDownsampledQuotaRows) {
+    throw new Error("v1 downsampled quota read unavailable");
+  }
   if (quotaResult.results.length > maxDownsampledQuotaRows) {
     return notTestable("downsampled_quota_limit_exceeded");
   }
-  if (quotaResult.results.length === 0) {
+  const quotaRows = prepared ? quotaResult.results
+    : collapseDirectV1QuotaRows(quotaResult.results, attributionIndex);
+  if (quotaRows === null || quotaRows.length > maxDownsampledQuotaRows) {
+    return notTestable("downsampled_quota_limit_exceeded");
+  }
+  if (quotaRows.length === 0) {
     return notTestable("supported_quota_track_unavailable");
   }
 
@@ -1570,7 +2191,7 @@ async function analyzeAccountScopedQuotaV1(
   const datasets = [{ datasetId, complete: true }];
   const accountTrackByProvider = new Map<string, string>();
   const quotaSnapshots: AttributedQuotaSnapshot[] = [];
-  for (const row of quotaResult.results) {
+  for (const row of quotaRows) {
     let accountTrackId = accountTrackByProvider.get(row.provider);
     if (accountTrackId === undefined) {
       accountTrackId = await v1AccountTrackId(participantId, row.provider);
@@ -1628,18 +2249,20 @@ export async function downsampleQuotaForTest(
   if (sourcePin.winners.length === 0) return [];
   const attributionIndex = await loadPlanAttributionIndex(db, participantId, sourcePin.winnersJson, observedAtCutoff);
   if (!attributionIndex) return [];
-  const result = await db.prepare(await v1QuotaAnalysisSql(db,participantId,QUOTA_DOWNSAMPLE_SQL)).bind(
+  const quotaQuery=await v1QuotaAnalysisSql(db,participantId,QUOTA_DOWNSAMPLE_SQL,observedAtCutoff);
+  const result = await db.prepare(quotaQuery.sql).bind(
     eraMarkersJson(attributionIndex),
     sourcePin.winnersJson,
     participantId,
     observedAtCutoff,
     resetsAtCutoff,
     SEVEN_DAY_WINDOW_MINUTES,
-    MINIMUM_BOUNDARIES,
-    MINIMUM_DISPLAYED_SPAN_PP,
-    MAX_DOWNSAMPLED_QUOTA_ROWS + 1,
+    MAX_DOWNSAMPLED_QUOTA_ROWS + 1,...quotaQuery.typedBindings,
   ).all<DownsampledQuotaRow>();
-  return result.results;
+  const collapsed = collapseDirectV1QuotaRows(result.results, attributionIndex);
+  // Past the pool bound this owner's evidence is unavailable, not absent.
+  if (collapsed === null) throw new Error("v1 downsampled quota limit exceeded");
+  return collapsed;
 }
 
 /**
@@ -2109,9 +2732,9 @@ async function analyzeAccountScopedModelCompositionV1(
     return { status: "not_testable", reason: "multi_provider_window_unsupported" };
   }
 
-  let quotaSql=history?QUOTA_DOWNSAMPLE_SQL.replace('r.observed_at >= ?', 'r.observed_at >= ? AND r.observed_at < ?'):QUOTA_DOWNSAMPLE_SQL;
-  quotaSql=await v1QuotaAnalysisSql(db,participantId,quotaSql);
-  const quotaResult = prepared ?? await db.prepare(quotaSql).bind(
+  const quotaSql=history?QUOTA_DOWNSAMPLE_SQL.replace('r.observed_at >= ?', 'r.observed_at >= ? AND r.observed_at < ?'):QUOTA_DOWNSAMPLE_SQL;
+  const quotaQuery=prepared?null:await v1QuotaAnalysisSql(db,participantId,quotaSql,observedAtCutoff,history?.observedAtBefore);
+  const quotaResult = prepared ?? await db.prepare(quotaQuery!.sql).bind(
     eraMarkersJson(attributionIndex),
     winnersJsonArg,
     participantId,
@@ -2119,11 +2742,20 @@ async function analyzeAccountScopedModelCompositionV1(
     ...(history?[history.observedAtBefore]:[]),
     resetsAtCutoff,
     SEVEN_DAY_WINDOW_MINUTES,
-    MINIMUM_BOUNDARIES,
-    MINIMUM_DISPLAYED_SPAN_PP,
-    maxDownsampledQuotaRows + 1,
+    maxDownsampledQuotaRows + 1,...quotaQuery!.typedBindings,
   ).all<DownsampledQuotaRow>();
+  // Memory budget before the collapse, raised as unavailability so a day is
+  // never published as refused because one statement decoded too much; the
+  // clustered bound below is the analytical refusal.
+  if (!prepared && quotaResult.results.length > maxDownsampledQuotaRows) {
+    throw new Error("v1 downsampled quota read unavailable");
+  }
   if (quotaResult.results.length > maxDownsampledQuotaRows) {
+    return { status: "not_testable", reason: "downsampled_quota_limit_exceeded" };
+  }
+  const downsampled = prepared ? quotaResult.results
+    : collapseDirectV1QuotaRows(quotaResult.results, attributionIndex);
+  if (downsampled === null || downsampled.length > maxDownsampledQuotaRows) {
     return { status: "not_testable", reason: "downsampled_quota_limit_exceeded" };
   }
 
@@ -2135,7 +2767,7 @@ async function analyzeAccountScopedModelCompositionV1(
   const quotaRows: CompositionQuotaRow[] = [];
   const quotaProviders = new Set<string>();
   const planCounts = new Map<string, number>();
-  for (const row of quotaResult.results) {
+  for (const row of downsampled) {
     if (typeof row.observed_at !== "string" || typeof row.resets_at !== "string") continue;
     const observedAtMs = Date.parse(row.observed_at);
     const resetsAtMs = Date.parse(row.resets_at);

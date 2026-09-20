@@ -1,4 +1,13 @@
+import { observationFreshness } from "./dashboard-ui.js";
+import { createReportingPeriod, reportingDays, reportingSelection, mountReportingPeriodDismissal } from "./reporting-period.js";
+import { createCacheReuseMatrix } from "./cache-reuse-matrix.js";
+import { cacheReuseMetricLines, cacheReuseCoverageNote } from "./cache-reuse-metrics.js";
+import { mountTrendsHorizon, createSpendRateLookup } from "./trends-horizon.js";
+import { mountAllowanceTanks } from "./allowance-tanks.js";
 import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
+import { mountWorkUsageView } from "./work-usage-view.js";
+import { mountModelPerformance } from "./model-performance.js";
+import { createDashboardReportPreloader } from "./dashboard-report-preload.js";
 import {
   CommunityClient,
   isPrimaryCodexQuotaWindow,
@@ -40,6 +49,7 @@ import {
 import {
   mountDashboardNavigation,
 } from "./navigation.js";
+import { resolveElectronStartupAppearance } from "./desktop-appearance.js";
 import {
   renderInstallerJourney as renderSharedInstallerJourney,
 } from "./install-cta.js";
@@ -54,24 +64,35 @@ import {
 } from "./telemetry-shared.generated.js";
 import {
   compact,
+  formatCodexThreadParts,
+  formatApiMoney,
+  formatSharePercent,
   adaptiveChartTickCount,
   classifyTimelineEvidence,
   createDomHelpers,
   finite,
   formatAge,
   formatChartTimestamp,
+  formatChartTimeLabel,
+  formatCount,
+  formatDecimal,
+  formatMoney,
+  formatPercent,
+  formatPp,
   formatLocal,
   formatModelName,
   formatNumber,
   formatReportingTime,
+  formatSignedPp,
+  formatSignedPpHours,
+  formatSpanLength,
+  formatTimeRemaining,
+  dateTimeFormatter,
   formatTimeZoneLabel,
   getFormattingLocale,
   localCalendarParts,
-  numberFormatter,
-  selectAvailableAccountingPeriod,
   setFormattingLocale,
   setMessageLocale,
-  REPORTING_TIME_ZONE,
   USER_TIME_ZONE,
 } from "./ui-format.js";
 
@@ -89,11 +110,14 @@ function applyNativeAppearanceTheme(theme) {
 }
 
 // WKWebView installs this handoff at document start, before the stylesheet can
-// paint. Reapplying it here owns live Settings changes and keeps the browser
-// metadata in step without reloading a dashboard or losing in-memory state.
+// paint. Electron applies nativeTheme before creating its BrowserWindow, so
+// Chromium's effective color-scheme synchronously covers its first render.
+// Reapplying both here owns live Settings changes and keeps the browser metadata
+// in step without reloading a dashboard or losing in-memory state.
 applyNativeAppearanceTheme(
   globalThis.__TIBOTATTLE_APPEARANCE__?.resolvedTheme,
 );
+applyNativeAppearanceTheme(resolveElectronStartupAppearance());
 window.addEventListener("tibotattle:appearance-override", (event) => {
   applyNativeAppearanceTheme(event.detail?.resolvedTheme);
 });
@@ -197,6 +221,7 @@ let dashboard = null;
 const cacheDropThreadLinks = {
   dashboard: null,
   generation: null,
+  generationFingerprint: null,
   requestToken: 0,
   loadToken: 0,
   requested: false,
@@ -220,6 +245,11 @@ let activeAccountingPeriod = "7d";
 // visible reason, which is the inconsistency this settles.
 let activeWeeklyRangeDays = 30;
 let activeWeeklyMinimumObservedSpanPp = 50;
+// The seven-day allowance stays the preferred initial view whenever it has
+// evidence. A user's explicit window choice survives redraws and refreshes;
+// if that duration disappears from a later payload, resolution falls back to
+// the best available window instead of leaving a stale selection on screen.
+let activeAllowanceWindowMinutes = null;
 // Null follows the latest observed plan, including an insufficient one. An
 // explicit choice stays in memory across refreshes, ranges and locale changes.
 let activeWeeklyPlanType = null;
@@ -650,13 +680,120 @@ function localAnalysisLabel() {
     : "Analyze local usage";
 }
 
+// Keep phase, count and elapsed time in stable slots across refresh updates.
+function renderRefreshProgress(button, phase, { processed = null, selected = null, elapsedSeconds = null } = {}) {
+  button.classList.add("refresh-progress");
+  const label = node("span", "refresh-progress-phase", phase);
+  const count = node("span", "refresh-progress-count");
+  if (processed !== null && selected !== null) {
+    const current = node("span", "refresh-progress-current", String(processed));
+    current.style.minWidth = `${String(selected).length}ch`;
+    count.append(current, document.createTextNode(`/${selected}`));
+  }
+  const elapsed = elapsedSeconds === null ? "" :
+    `${Math.floor(elapsedSeconds / 60)}:${String(elapsedSeconds % 60).padStart(2, "0")}`;
+  const timer = node("span", "refresh-progress-time", elapsed);
+  const description = [phase, count.textContent, elapsed].filter(Boolean).join(" · ");
+  button.title = description;
+  button.setAttribute("aria-label", description);
+  button.replaceChildren(label, count, timer);
+}
+
+/**
+ * Keep the elapsed display on wall-clock second boundaries instead of tying it
+ * to the 750 ms companion-status poll. The self-correcting timeout deliberately
+ * recalculates its next boundary after every callback: a delayed renderer may
+ * skip a hidden second, but it does not accumulate drift or create a repeating
+ * fast-fast-fast-slow beat.
+ */
+function startRefreshProgressClock(button, phase, options = {}) {
+  let {
+    processed = null,
+    selected = null,
+    startedAtMs = Date.now(),
+    now = () => Date.now(),
+    schedule = (callback, delayMs) => window.setTimeout(callback, delayMs),
+    cancel = (timer) => window.clearTimeout(timer),
+  } = options;
+  let active = true;
+  let timer = null;
+  let currentPhase = phase;
+  let currentProcessed = processed;
+  let currentSelected = selected;
+
+  const elapsedMilliseconds = () => Math.max(0, now() - startedAtMs);
+  const paint = () => {
+    renderRefreshProgress(button, currentPhase, {
+      processed: currentProcessed,
+      selected: currentSelected,
+      elapsedSeconds: Math.floor(elapsedMilliseconds() / 1_000),
+    });
+  };
+  const scheduleNextBoundary = () => {
+    if (!active) return;
+    const remainder = elapsedMilliseconds() % 1_000;
+    const delayMs = remainder === 0 ? 1_000 : 1_000 - remainder;
+    timer = schedule(tick, Math.max(1, Math.ceil(delayMs)));
+  };
+  function tick() {
+    timer = null;
+    if (!active) return;
+    paint();
+    scheduleNextBoundary();
+  }
+
+  paint();
+  scheduleNextBoundary();
+  return Object.freeze({
+    update(nextPhase, { processed: nextProcessed = null, selected: nextSelected = null } = {}) {
+      if (!active) return;
+      currentPhase = nextPhase;
+      currentProcessed = nextProcessed;
+      currentSelected = nextSelected;
+      paint();
+    },
+    reset(nextPhase, { processed: nextProcessed = null, selected: nextSelected = null } = {}) {
+      if (!active) return;
+      if (timer !== null) cancel(timer);
+      timer = null;
+      startedAtMs = now();
+      currentPhase = nextPhase;
+      currentProcessed = nextProcessed;
+      currentSelected = nextSelected;
+      paint();
+      scheduleNextBoundary();
+    },
+    stop() {
+      if (!active) return;
+      active = false;
+      if (timer !== null) cancel(timer);
+      timer = null;
+    },
+  });
+}
+
 function updateLocalActionButtons() {
   const allowed = localAnalysisAllowed();
   const label = localAnalysisLabel();
+  const refreshActive = localRefreshInProgress;
   for (const selector of ["#refresh-button", "#setup-refresh"]) {
     const button = $(selector);
-    button.disabled = localActionBusy || !allowed;
-    if (!localActionBusy) button.textContent = label;
+    // A refresh owns both visible controls for its whole lifetime. The
+    // progress renderer and cancel action are deliberately independent of the
+    // primary load lock, because a terminal dashboard reload can release that
+    // lock before the refresh's finalizer clears its own lifecycle state.
+    button.disabled = localActionBusy || refreshActive || !allowed;
+    if (refreshActive && !button.classList.contains("refresh-progress")) {
+      // Recover a progress affordance if a nested dashboard render released
+      // the primary load lock after the refresh began.
+      renderRefreshProgress(button, "Update running…");
+    }
+    if (!localActionBusy && !refreshActive) {
+      button.textContent = label;
+      button.classList.remove("refresh-progress");
+      button.removeAttribute("aria-label");
+      button.removeAttribute("title");
+    }
   }
   const setupCheck = $("#setup-check-again");
   if (setupCheck) setupCheck.disabled = localActionBusy;
@@ -681,129 +818,6 @@ function setCommunitySession(value) {
     communitySessionMintedAt = null;
     renderContributionActionState();
   }
-}
-
-function formatMoney(value, digits = 0) {
-  const number = finite(value);
-  return number === null
-    ? "—"
-    : formatNumber(number, {
-      style: "currency",
-      currency: "USD",
-      minimumFractionDigits: digits,
-      maximumFractionDigits: digits,
-    });
-}
-
-function formatApiMoney(value) {
-  const number = finite(value);
-  if (number === null) return "—";
-  if (number > 0 && number < .01) {
-    return `<${formatNumber(.01, {
-      style: "currency",
-      currency: "USD",
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    })}`;
-  }
-  return formatNumber(number, {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-}
-
-/**
- * A percentage near an end of the scale must not be printed as if it were at
- * that end. `Intl` rounds 99.96 to "100%" and 0.04 to "0%", and on this
- * dashboard both ends are load-bearing claims rather than cosmetics:
- *
- *   100% price coverage means every usage change carries a reviewed price,
- *        which is why the rounded "100%" sat next to a note saying coverage
- *        was partial - the note was right and the number was rounded.
- *     0% remaining means the allowance is gone, which is a different fact
- *        from "a sliver is left".
- *
- * So only an exact 0 or 100 may print as 0% or 100%. Anything strictly
- * between prints as a bounded "<" or ">" reading, the same idiom
- * `formatApiMoney` already uses for amounts under a cent.
- */
-function formatPercent(value, digits = 0) {
-  const number = finite(value);
-  if (number === null) return "—";
-  const places = Number.isInteger(number) ? 0 : digits;
-  const percentFormatter = numberFormatter({
-    maximumFractionDigits: places,
-    minimumFractionDigits: 0,
-    style: "percent",
-  });
-  const format = (amount) => percentFormatter.format(amount / 100);
-  // The test is whether this value *renders* as an endpoint, not whether it
-  // is near one: at whole-number precision 99.2 renders as "99%", which is
-  // honest and needs no bound, while 99.5 renders as "100%", which is not.
-  // Comparing rendered strings also keeps this agreeing with whatever
-  // rounding mode the locale's formatter uses.
-  const step = 10 ** -places;
-  const rendered = format(number);
-  if (number > 0 && rendered === format(0)) return `<${format(step)}`;
-  if (number < 100 && rendered === format(100)) return `>${format(100 - step)}`;
-  return rendered;
-}
-
-/**
- * A share for a table column, always at one decimal place.
- *
- * `formatPercent` drops to whole numbers whenever the value happens to be an
- * integer, which is right for a sentence and wrong for a column: it renders
- * "20%" directly above "20.9%", so the decimal point moves down the page and
- * two figures that exist to be compared have to be read digit by digit. Here
- * the precision is fixed, and the same bounded "<" idiom keeps a sliver from
- * rendering as an exact zero it is not.
- *
- * Returns `null` when the denominator cannot carry a share at all, so callers
- * withhold the cell rather than printing a share of nothing.
- */
-function formatSharePercent(part, whole) {
-  const numerator = finite(part);
-  const denominator = finite(whole);
-  if (numerator === null || denominator === null || denominator <= 0) return null;
-  if (numerator < 0) return null;
-  const percentFormatter = numberFormatter({
-    maximumFractionDigits: 1,
-    minimumFractionDigits: 1,
-    style: "percent",
-  });
-  const format = (amount) => percentFormatter.format(amount / 100);
-  const value = numerator / denominator * 100;
-  const rendered = format(value);
-  if (value > 0 && rendered === format(0)) return `<${format(.1)}`;
-  if (value < 100 && rendered === format(100)) return `>${format(99.9)}`;
-  return rendered;
-}
-
-/**
- * One whole-number formatter for tabular counts.
- *
- * `compact` is right for a headline chip, where a single number stands alone.
- * It is wrong for a column: it renders "154.9K" next to "74" and silently
- * changes precision partway down the table, so nothing can be compared or
- * added up by eye. Grouped exact integers stay comparable at every magnitude.
- */
-function formatCount(value) {
-  const number = finite(value);
-  if (number === null || number < 0) return t("accounting.model.notReported");
-  return formatNumber(Math.trunc(number), { maximumFractionDigits: 0 });
-}
-
-function formatDecimal(value, digits = 0) {
-  const number = finite(value);
-  return number === null
-    ? "—"
-    : numberFormatter({
-      maximumFractionDigits: digits,
-      minimumFractionDigits: digits,
-    }).format(number);
 }
 
 let activeInformationPopover = null;
@@ -854,13 +868,15 @@ function openInformationPopover(button) {
   positionInformationPopover(popover, button);
 }
 
-function informationLabel(label, explanation) {
+function informationLabel(label, explanation, accessibleLabel = label) {
   const fragment = document.createDocumentFragment();
   fragment.append(document.createTextNode(label));
   const button = node("button", "info-button", "i");
   button.type = "button";
   button.dataset.informationExplanation = explanation;
-  button.setAttribute("aria-label", t("aria.moreInformation", { label }));
+  button.setAttribute("aria-label", t("aria.moreInformation", {
+    label: accessibleLabel,
+  }));
   button.setAttribute("aria-expanded", "false");
   button.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -868,11 +884,6 @@ function informationLabel(label, explanation) {
   });
   fragment.append(button);
   return fragment;
-}
-
-function formatPp(value, digits = 1) {
-  const number = finite(value);
-  return number === null ? "—" : `${formatDecimal(number, digits)} pp`;
 }
 
 const COMPONENT_LABELS = Object.freeze({
@@ -886,34 +897,6 @@ const COMPONENT_LABELS = Object.freeze({
 
 function componentLabel(value) {
   return COMPONENT_LABELS[value] ?? humanize(value);
-}
-
-function formatTimeRemaining(value) {
-  const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp)) return t("format.timeUnavailable");
-  const remainingMs = timestamp - Date.now();
-  if (remainingMs <= 0) return t("format.resetDue");
-  const totalMinutes = Math.ceil(remainingMs / 60_000);
-  const days = Math.floor(totalMinutes / 1_440);
-  const hours = Math.floor((totalMinutes % 1_440) / 60);
-  const minutes = totalMinutes % 60;
-  if (days > 0) return t("format.remainingDays", { days, hours });
-  if (hours > 0) return t("format.remainingHours", { hours, minutes });
-  return t("format.remainingMinutes", { minutes });
-}
-
-function formatSpanLength(spanMs) {
-  const minutes = Math.max(1, Math.round(spanMs / 60_000));
-  if (minutes < 90) return tPlural("format.durationMinute", minutes);
-  const hours = minutes / 60;
-  if (hours < 48) {
-    const value = Number(hours.toFixed(hours < 10 ? 1 : 0));
-    return tPlural("format.durationHour", value, {
-      count: formatDecimal(value, hours < 10 ? 1 : 0),
-    });
-  }
-  const value = Number((hours / 24).toFixed(1));
-  return tPlural("format.durationDay", value, { count: formatDecimal(value, 1) });
 }
 
 function setGlobalState(state, { companionReachable = false } = {}) {
@@ -934,7 +917,9 @@ function renderHistoryIndexBadge(data) {
   const total = finite(history?.sourceCount, null);
   const complete = history?.status === "complete"
     || (indexed !== null && total !== null && total > 0 && indexed >= total);
-  const partialTerminal = history?.phase === "partial_terminal";
+  const partialTerminal = history?.phase === "partial_terminal"
+    || (history?.phase === "aggregate_unavailable"
+      && finite(history?.skippedSourceCount, 0) > 0);
   if (data?.mode === "demo" || complete
       || indexed === null || total === null || total <= 0) {
     badge.hidden = true;
@@ -966,10 +951,11 @@ function renderGlobalState() {
   };
   const pill = $("#global-state");
   if (!pill) return;
-  pill.className = `state-pill state-${globalState.state}`;
+  const state = localRefreshInProgress ? "updating" : globalState.state;
+  pill.className = `state-pill state-${state}`;
   pill.replaceChildren(
     node("span", "state-dot"),
-    document.createTextNode(t(keys[globalState.state] ?? "status.unknown")),
+    document.createTextNode(t(keys[state] ?? "status.unknown")),
   );
 }
 
@@ -1065,7 +1051,7 @@ function applyElectronAccountlessContributionMode() {
   if (community) {
     community.setAttribute(
       "aria-labelledby",
-      electronMode ? "electron-accountless-community-title" : "contribution-cta-title",
+      "community-page-title",
     );
   }
   const legacySurfaces = [
@@ -1445,6 +1431,47 @@ function onboardingSourceGuidance(value) {
   };
 }
 
+let reportingWindow = null;
+let reportingAccountingPeriod = null;
+const reportingPeriod = createReportingPeriod({
+  onChange: () => {
+    resetTimelineViewport();
+    resetUsageTimelineViewport();
+    timelineSeriesMemo = null;
+    if (dashboard) renderDashboard(dashboard);
+    else renderReportingPeriod();
+  },
+});
+
+function renderReportingPeriod(data = dashboard) {
+  const selection = reportingSelection(data, reportingPeriod.period);
+  reportingWindow = selection.window;
+  reportingAccountingPeriod = selection.accountingPeriod;
+  activeAccountingPeriod = reportingAccountingPeriod;
+  activeUsageRangeDays = reportingDays(selection.period);
+  activeCalibrationRangeDays = activeUsageRangeDays;
+  activeWeeklyRangeDays = activeUsageRangeDays;
+  if (data) {
+    data.reportingWindow = reportingWindow;
+    data.reportingAccountingPeriod = reportingAccountingPeriod;
+  }
+  for (const control of document.querySelectorAll("#reporting-period-controls button")) {
+    const selected = control.dataset.period === selection.period;
+    control.classList.toggle("active", selected);
+    control.setAttribute("aria-pressed", String(selected));
+  }
+  const range = document.querySelector("#reporting-period-range");
+  if (range) range.textContent = reportingWindow
+    ? reportingWindow.startAt
+      ? t("reporting.range", { start: formatLocal(reportingWindow.startAt), end: formatLocal(reportingWindow.endAt) })
+      : t("reporting.allThrough", { end: formatLocal(reportingWindow.endAt) })
+    : t("reporting.waiting");
+  const rangeToggle = document.querySelector(".reporting-period-details > summary");
+  if (rangeToggle && range) rangeToggle.title = range.textContent;
+  workUsageView.setReportingWindow(reportingWindow);
+  modelPerformance.setReportingWindow(reportingWindow);
+}
+
 function renderLocalOnboarding(value) {
   localOnboarding = value;
   const card = $("#setup-card");
@@ -1487,13 +1514,19 @@ function renderLocalOnboarding(value) {
   card.hidden = false;
   card.removeAttribute("aria-hidden");
   card.classList.toggle("needs-attention", !ready);
+  // Preserve a manual disclosure choice while readiness stays unchanged.
+  const compactSetup = ready && !boundedPause && Boolean(dashboard);
+  const setupMode = compactSetup ? "ready" : "attention";
+  if (card.dataset.setupMode !== setupMode) card.open = !compactSetup;
+  card.dataset.setupMode = setupMode;
   $("#setup-title").textContent = boundedPause
     ? "Continue your local analysis"
     : ready
-      ? "This Mac is ready"
+      ? t("setup.title")
       : value.stateStatus === "unwritable" && sourceReady
         ? "Local app state needs attention"
         : sourceGuidance.title;
+  $("#setup-ready-label").hidden = !ready || boundedPause;
   $("#setup-summary").textContent = boundedPause
     ? `A bounded pass completed safely: ${compact(indexing.filesProcessed)} of ${compact(indexing.filesSelected)} recent rollout files are analyzed. Continue when convenient; existing results remain usable.`
     : ready
@@ -1539,11 +1572,14 @@ function renderLocalOnboarding(value) {
 }
 
 function renderDashboard(data) {
+  renderReportingPeriod(data);
   dashboardUnavailableState = null;
   dashboard = data;
-  if (!isCacheDropThreadDashboard(data) || data?.accounting?.generationMatched !== true
+  if (!isCacheDropThreadDashboard(data) || !data?.accounting?.cacheDiagnosticsSource
       || cacheDropThreadLinks.dashboard !== data
-      || cacheDropThreadLinks.generation !== data?.accounting?.generation) {
+      || cacheDropThreadLinks.generation !== data?.accounting?.cacheDiagnosticsSource?.generation
+      || cacheDropThreadLinks.generationFingerprint
+        !== data?.accounting?.cacheDiagnosticsSource?.generationFingerprint) {
     resetCacheDropThreadLinks(data);
   }
   if (data.mode === "demo") {
@@ -1554,6 +1590,9 @@ function renderDashboard(data) {
     companionReachable: data.mode !== "demo"
   });
   renderHistoryIndexBadge(data);
+  $(".freshness-card").dataset.freshness = observationFreshness(data);
+  setLocalizedText($(".freshness-card > span"), observationFreshness(data) === "stale"
+    ? "dashboard.freshness.stale" : "dashboard.freshness.observation");
   $("#latest-observation").textContent = data.freshness.latestObservedAt
     ? formatAge(data.freshness.ageSeconds ?? (Date.now() - Date.parse(data.freshness.latestObservedAt)) / 1000)
     : "No timestamp";
@@ -1577,19 +1616,21 @@ function renderDashboard(data) {
     // the observation is old in that case is simply untrue, and it is the
     // reason a refresh appears to change nothing: the observation was never
     // what was stale.
-    const observationIsCurrent = finite(data.freshness.ageSeconds) !== null
-      && finite(data.freshness.staleAfterSeconds) !== null
-      && data.freshness.ageSeconds <= data.freshness.staleAfterSeconds;
+    const observationIsCurrent = observationFreshness(data) === "current";
     if (observationIsCurrent && data.freshness.accountingStatus === "stale") {
       showConnectionNotice({
         copyKey: "dashboard.stale.accountingCopy",
         kind: "warning",
         titleKey: "dashboard.stale.accountingTitle",
       });
+    } else if (observationFreshness(data) === "stale") {
+      // Timestamp and card qualifiers already identify old observations. Keep
+      // published coverage warnings, without repeating a generic banner.
+      hideConnectionNotice();
     } else {
       showConnectionNotice({
-        title: "The local evidence is stale",
-        copy: "The dashboard is showing real local artifacts, but the latest collector observation is older than its freshness threshold.",
+        titleKey: "dashboard.stale.observationTitle",
+        copyKey: "dashboard.stale.observationCopy",
         kind: "warning"
       });
     }
@@ -1604,7 +1645,12 @@ function renderDashboard(data) {
     hideConnectionNotice();
   }
 
+  $("#connection-notice").classList.toggle("notice-compact", data.state === "stale");
+
+  allowanceTankView?.dispose();
   renderQuotaCards(data);
+  renderWeeklyPaceForecast(data);
+  allowanceTankView = mountAllowanceTanks($("#quota-cards"), $("#weekly-pace-forecast"), { t });
   renderEvidenceWarnings(data);
   renderPricing(data);
   renderComparison(data);
@@ -1620,9 +1666,13 @@ function renderDashboard(data) {
   void loadCacheDropThreadLinks(data);
 }
 
+let allowanceTankView = null;
+
 function renderQuotaCards(data) {
+  closeInformationPopover();
   const container = $("#quota-cards");
   clear(container);
+  if ($("#allowance-context")) $("#allowance-context").hidden = true;
   const normalWindows = data.quotaWindows.filter(isPrimaryCodexQuotaWindow);
   const sparkWindows = data.quotaWindows.filter((window) => (
     isSparkQuotaLimitId(window?.limitId)
@@ -1639,12 +1689,9 @@ function renderQuotaCards(data) {
     : [primaryWindow, ...normalWindows.filter((window) => window !== primaryWindow)];
   // Spark is a separate provider limit. Keep it out of the normal allowance
   // selection so it cannot be mistaken for the five-hour or seven-day track.
-  // Owner-directed 2026-08-20 card order: the Spark cards lead, shortest
-  // window first, and the normal-Codex allowance follows. Ordering on the
-  // duration rather than trusting the provider's slot assignment holds that
-  // order even if Spark's slots move again, as they did when the five-hour
-  // window returned on 2026-08-19. The filter above already required a valid
-  // duration on every window here, so the comparison never sees a null.
+  // The forecast's primary pool leads the tanks. Within Spark, order by
+  // duration rather than the provider's slot assignment. Future pools follow
+  // both reviewed groups and never enter primary selection or calibration.
   const sparkOrderedWindows = [...sparkWindows].sort((left, right) => (
     finite(left.durationMinutes) - finite(right.durationMinutes)
   ));
@@ -1657,8 +1704,8 @@ function renderQuotaCards(data) {
       || String(left.slot).localeCompare(String(right.slot))
   ));
   const windows = [
-    ...sparkOrderedWindows,
     ...normalOrderedWindows,
+    ...sparkOrderedWindows,
     ...otherOrderedWindows,
   ];
   if (!windows.length) {
@@ -1676,67 +1723,75 @@ function renderQuotaCards(data) {
     container.append(card);
     return;
   }
+  const context = $("#allowance-context");
+  if (context) {
+    context.textContent = data.mode === "demo" ? t("dashboard.quota.demo") : "";
+    context.hidden = !context.textContent;
+  }
   for (const window of windows) {
-    const remaining = finite(window.remainingPercent);
+    const reportedRemaining = finite(window.remainingPercent);
+    const remaining = reportedRemaining !== null
+      && reportedRemaining >= 0 && reportedRemaining <= 100
+      ? reportedRemaining : null;
     const spark = isSparkQuotaLimitId(window.limitId);
     const card = node("article", [
-      "metric-card",
-      window.status === "stale" ? "stale" : "",
+      "metric-card quota-tank",
       spark ? "quota-card-spark" : "",
+      window.status === "stale" ? "stale" : "",
+      remaining === null ? "insufficient" : "",
     ].filter(Boolean).join(" "));
-    const header = node("div", "metric-card-header");
-    const name = node("span", "metric-name", localizedQuotaWindowLabel(window));
-    const plan = node("span", "evidence-chip");
-    const reportedPlan = providerReportedPlanEvidence(window.planType);
+    card.setAttribute("aria-label", spark
+      ? `GPT-5.3 Codex Spark · ${localizedQuotaWindowDuration(window.durationMinutes)}`
+      : localizedQuotaWindowLabel(window));
+    card.dataset.shortWindow = String(window.durationMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES);
+    card.dataset.remaining = remaining === null ? "" : String(remaining);
+    card.dataset.forecastPool = String(isPrimaryCodexWeeklyQuotaWindow(window));
+    card.dataset.resetAt = String(forecastTimestamp(window.resetAt) ?? "");
+    card.dataset.stale = String(window.status === "stale");
+    if (remaining !== null) {
+      const fuel = node("div", "quota-tank-fuel");
+      fuel.style.blockSize = `${remaining}%`;
+      fuel.setAttribute("aria-hidden", "true");
+      card.append(fuel);
+    }
+    const header = node("div", "quota-tank-header");
+    const family = node("span", "quota-tank-family");
     if (spark) {
-      setLocalizedText(plan, "dashboard.quota.spark");
-    } else if (data.mode === "demo") {
-      setLocalizedText(plan, "dashboard.quota.demo");
-    } else if (reportedPlan) {
-      plan.textContent = reportedPlan;
+      family.className += " allowance-model-spark";
+      family.append(modelThemeIcon(document, "spark"), node("span", "", "GPT-5.3 Codex Spark"));
+    } else if (isPrimaryCodexQuotaWindow(window)) {
+      const logo = node("img", "quota-codex-icon");
+      logo.setAttribute("src", "./codex-color.svg");
+      logo.setAttribute("alt", "");
+      logo.setAttribute("aria-hidden", "true");
+      family.append(logo, node("span", "", "Codex"));
     } else {
-      setLocalizedText(plan, "dashboard.quota.observed");
+      family.textContent = window.limitName || t("dashboard.quota.windowOther");
     }
-    header.append(
-      name,
-      plan,
-    );
-    const value = node("strong", "metric-value");
-    setLocalizedText(value, "dashboard.quota.remaining", {
-      value: remaining === null
-        ? "—"
-        : formatPercent(remaining, window.precision ?? 0),
-    });
-    const progress = node("div", "mini-progress");
-    const fill = node("i");
-    fill.style.width = `${Math.max(0, Math.min(100, remaining ?? 0))}%`;
-    progress.append(fill);
-    const meta = node("div", "metric-meta");
-    meta.append(
-      node(
-        "span",
-        "",
-        window.usedPercent === null
-          ? t("dashboard.quota.usedUnknown")
-          : t("dashboard.quota.used", {
-            value: formatPercent(window.usedPercent),
-          }),
-      ),
-      node(
-        "span",
-        "",
-        window.resetAt
-          ? t("dashboard.quota.resets", { time: formatLocal(window.resetAt) })
-          : t("dashboard.quota.resetUnknown"),
-      ),
-    );
-    card.append(header, value, progress, meta);
-    if (window.resetAt) card.append(node("p", "", formatTimeRemaining(window.resetAt)));
-    if (window.observedAt) {
-      card.append(node("p", "", t("dashboard.quota.observedAtPlain", {
-        time: formatLocal(window.observedAt),
-      })));
+    header.append(family);
+    header.append(node("span", "quota-tank-period",
+      localizedQuotaWindowDuration(window.durationMinutes)));
+    if (window.status === "stale") {
+      header.append(node("span", "evidence-chip", t("allowance.stale")));
     }
+    const bottom = node("div", "quota-tank-bottom");
+    const amount = node("div");
+    amount.append(node("strong", "quota-tank-value", remaining === null
+      ? "—" : formatPercent(remaining, window.precision ?? 0)));
+    amount.append(node("span", "quota-tank-caption", t(remaining === null
+      ? "allowance.unknown" : "allowance.remaining")));
+    const reset = node("div", "quota-tank-reset");
+    const resetAt = forecastTimestamp(window.resetAt);
+    const hoursLeft = resetAt === null ? null : (resetAt - Date.now()) / 3_600_000;
+    reset.append(node("span", "", t(hoursLeft !== null && hoursLeft > 0
+      ? "allowance.resetsIn" : resetAt !== null ? "allowance.resets" : "dashboard.quota.resetUnknown")));
+    if (hoursLeft !== null && hoursLeft > 0) {
+      reset.append(allowanceTimestamp(formatAllowanceDuration(hoursLeft), resetAt));
+    } else if (resetAt !== null) {
+      reset.append(allowanceTimestamp(t("allowance.resetPassed"), resetAt));
+    }
+    bottom.append(amount, reset);
+    card.append(header, bottom);
     container.append(card);
   }
 }
@@ -1827,10 +1882,26 @@ function projectionUnavailableCopyKey(data) {
 }
 
 function renderPricing(data) {
-  const pricing = data.pricing;
+  const selected = data.reportingWindow ? accountingPeriod(data) : null;
+  if (data.reportingWindow && selected === null) {
+    setRawText($("#cost-period"), t("reporting.unavailable"));
+    $("#cost-total").textContent = "—";
+    clear($("#cost-components"));
+    $("#cost-components").append(node("p", "empty-inline", t("reporting.unavailable")));
+    renderHistoryProgress(data);
+    return;
+  }
+  const pricing = selected ? {
+    ...data.pricing,
+    periodLabel: t(`reporting.${data.reportingWindow.period}`),
+    totalCostUsd: selected.apiPriceEquivalentUsd,
+    quotaWeightedTotalCostUsd: selected.quotaWeightedApiPriceEquivalentUsd,
+    fastMode: selected.fastMode,
+    components: Object.entries(selected.componentCosts).map(([name, row]) => ({ name, ...row })),
+  } : data.pricing;
   const projection = dashboardAccountingProjection(data);
   const retainedPeriod = projection.status === "retained"
-    ? staleAccountingServePeriod(data) ?? data.accounting
+    ? data.reportingWindow ? selected : staleAccountingServePeriod(data) ?? data.accounting
     : null;
   const retainedEvidence = retainedPeriod !== null
     && finite(retainedPeriod.apiPriceEquivalentUsd, 0) > 0;
@@ -1958,8 +2029,8 @@ function formatBytes(value) {
  * sources it discovered and how many it has indexed, and the share is that
  * division. Nothing estimates a finish time, because none is known — a
  * progress bar that implied one would be the same invention this product
- * refuses everywhere else. The block is absent entirely once the index is
- * complete, and absent when there is no denominator to divide by.
+ * refuses everywhere else. The block is absent once both indexed history and
+ * its accounting summary are available, or there is no measured denominator.
  *
  * It sits with the API-price-equivalent total because that total, and every
  * figure derived from it, covers only the indexed share.
@@ -1973,6 +2044,7 @@ function renderHistoryProgress(data) {
   const total = finite(history?.sourceCount, 0);
   const indexed = finite(history?.indexedSourceCount, 0);
   const partialTerminal = history?.phase === "partial_terminal";
+  const aggregateUnavailable = history?.phase === "aggregate_unavailable";
   if (history === null || history.status === "complete" || total <= 0) {
     container.hidden = true;
     return false;
@@ -1985,7 +2057,12 @@ function renderHistoryProgress(data) {
     skippedSourceCount,
     { count: formatNumber(skippedSourceCount) },
   );
-  if (partialTerminal) {
+  if (aggregateUnavailable) {
+    setLocalizedText(
+      $("#history-progress-headline"),
+      "dashboard.history.scanFinished",
+    );
+  } else if (partialTerminal) {
     setRawText(
       $("#history-progress-headline"),
       t("dashboard.history.partialHeadline", {
@@ -2003,12 +2080,17 @@ function renderHistoryProgress(data) {
       { percent: formatPercent(percent, 1) },
     );
   }
-  container.classList.toggle("active", archiveHistoryScanActive);
+  container.classList.toggle(
+    "active", archiveHistoryScanActive && !aggregateUnavailable,
+  );
   const track = $("#history-progress-track");
   track.setAttribute("aria-valuenow", String(Math.round(percent)));
   const coverageKey = partialTerminal
+      || (aggregateUnavailable && skippedSourceCount > 0)
     ? "dashboard.history.partialSources"
-    : "dashboard.history.indexingSources";
+    : aggregateUnavailable
+      ? "dashboard.history.indexedSources"
+      : "dashboard.history.indexingSources";
   const coverageValues = {
     bytesIndexed: formatBytes(history.indexedBytes),
     bytesTotal: formatBytes(history.sourceBytes),
@@ -2024,7 +2106,12 @@ function renderHistoryProgress(data) {
   $("#history-progress-fill").style.width =
     `${indexed > 0 ? Math.max(1.5, percent) : 0}%`;
   setLocalizedText($("#history-progress-detail"), coverageKey, coverageValues);
-  if (partialTerminal) {
+  if (aggregateUnavailable) {
+    setLocalizedText(
+      $("#history-progress-note"),
+      "dashboard.history.summaryUnavailable",
+    );
+  } else if (partialTerminal) {
     const affectedThreads = finite(history?.skippedThreadCount, 0);
     setRawText(
       $("#history-progress-note"),
@@ -3646,8 +3733,13 @@ const SHARE_CARD_RANGE_PERIODS = Object.freeze({
 function shareCardActivitySelection(data, rangeDays) {
   const projection = dashboardAccountingProjection(data);
   if (projection.status === "unavailable") return null;
-  const selected = SHARE_CARD_RANGE_PERIODS[rangeDays]
-    ?? { id: "all", labelKey: "share.period.allRecorded" };
+  const selected = { ...(SHARE_CARD_RANGE_PERIODS[rangeDays]
+    ?? { id: "all", labelKey: "share.period.allRecorded" }) };
+  if (data.reportingWindow) {
+    const matched = data.accounting.periods.find(row => row.periodId === data.reportingAccountingPeriod);
+    if (!matched) return null;
+    selected.id = matched.periodId;
+  }
   const period = (Array.isArray(data?.accounting?.periods)
     ? data.accounting.periods
     : []).find((row) => row?.periodId === selected.id) ?? null;
@@ -3883,7 +3975,9 @@ function latestTimelineObservationMs(data) {
 }
 
 function timelineCutoffMs(data, rangeDays) {
-  const latestMs = latestTimelineObservationMs(data);
+  const selectedEnd = Date.parse(data.reportingWindow?.endAt ?? "");
+  const latestMs = Number.isFinite(selectedEnd) ? selectedEnd : latestTimelineObservationMs(data);
+  if (data.reportingWindow?.startAt === null) return Number.NEGATIVE_INFINITY;
   return latestMs === null
     ? Number.NEGATIVE_INFINITY
     : latestMs - rangeDays * 24 * 60 * 60 * 1_000;
@@ -4024,13 +4118,13 @@ function resetTimelineViewport() {
  */
 const CALIBRATION_CHART_VIEWPORT = Object.freeze({
   read: () => timelineViewport,
-  write: (value) => { timelineViewport = value; },
-  render: () => scheduleTimelineRender(),
+  write: (value) => { timelineViewport = value; usageTimelineViewport = value; },
+  render: () => scheduleUsageTimelineRender(),
 });
 
 const USAGE_CHART_VIEWPORT = Object.freeze({
   read: () => usageTimelineViewport,
-  write: (value) => { usageTimelineViewport = value; },
+  write: (value) => { usageTimelineViewport = value; timelineViewport = value; },
   render: () => scheduleUsageTimelineRender(),
 });
 
@@ -4300,6 +4394,26 @@ function timelineComparisonInterval(data, startMs, endMs) {
   return interval && endMs <= interval[1] ? interval : false;
 }
 
+// Reset classification comes from the validated companion DTO. Quota boundary
+// events follow the selected main weekly plan; credits belong to the account
+// and are explicitly labelled that way in the Horizon inspection text.
+function timelineTypedResetEvents(data) {
+  const planType = data.allowancePlanSelection?.planType ?? data.weekly?.planType;
+  return (data.timeline.resetEvents ?? []).flatMap(event => {
+    const lifecycle = event.kind === "reset_credit_granted" || event.kind === "reset_credit_expired";
+    if (!lifecycle && (event.planType !== planType || !isPrimaryCodexWeeklyQuotaWindow({
+      limitId: event.limitId, durationMinutes: event.windowDurationMins,
+    }))) return [];
+    return [{ ...event,
+      // An interval observation cannot provide an exact reset instant. Locate
+      // its marker at the confirming observation and show both interval ends.
+      timestampMs: Date.parse(event.precision === "observation_interval" ? event.observedAt : event.occurredAt),
+      observedAtMs: Date.parse(event.observedAt),
+      intervalStartedAtMs: Date.parse(event.intervalStartedAt),
+    }];
+  });
+}
+
 function liveTimelinePoints(
   data,
   {
@@ -4382,7 +4496,7 @@ function liveTimelinePoints(
       rollingEvents -= usage[startIndex].usageEvents;
       startIndex += 1;
     }
-    if (endMs < cutoff) continue;
+    if (endMs < cutoff || endMs > Date.parse(data.reportingWindow?.endAt ?? "9999-12-31")) continue;
     const startMs = endMs - windowMs;
     const afterMatch = quotaLookup.atOrBefore(endMs);
     const maximumBracketGapMs = Math.max(30 * 60 * 1_000, windowMs);
@@ -4506,6 +4620,7 @@ function liveTimelinePoints(
     // that crosses a boundary is never read as one continuous period across the
     // reset. Stamped on the point so the flag survives viewport filtering.
     let driftReanchor = false;
+    let resetEvent = null;
     if (capacity !== null && capacity > 0
         && currentWeightedCost !== null
         && after !== null
@@ -4531,6 +4646,17 @@ function liveTimelinePoints(
         && after.usedPercent
           <= driftAnchor.pendingDrop.usedPercent + RESET_DECREASE_THRESHOLD_PP;
       if (boundaryChanged || confirmedReset) {
+        // Expose the existing anchor decision; do not classify scheduled/banked
+        // resets without provider evidence. Initial anchors and recovery after
+        // missing pricing or a plan transition are not reset events.
+        if (driftAnchor !== null) {
+          resetEvent = {
+            timestampMs: confirmedReset ? driftAnchor.pendingDrop.timestampMs : afterMatch.timestampMs,
+            confirmedAtMs: afterMatch.timestampMs,
+            kind: confirmedReset || after.usedPercent < driftAnchor.maxUsedPercent - RESET_DECREASE_THRESHOLD_PP
+              ? "observed_reset" : "window_change",
+          };
+        }
         // A boundary or track change re-anchors the accumulation: drift is
         // zero by definition at the first observation of a new reset.
         driftAnchor = {
@@ -4590,6 +4716,7 @@ function liveTimelinePoints(
       residual: evidence.residual,
       cumulativeResidual,
       driftReanchor,
+      resetEvent,
       // Kept under the legacy internal key for downstream chart diagnostics,
       // but this is now the selected speed-priced amount, never Standard
       // dollars paired with a Fast-adjusted capacity.
@@ -4617,7 +4744,8 @@ function groupedUsageTimeline(data) {
   const groups = new Map();
   for (const row of allowanceTimelineUsage(data)) {
     const timestamp = Date.parse(row.startAt);
-    if (!Number.isFinite(timestamp) || timestamp < cutoff) continue;
+    if (!Number.isFinite(timestamp) || timestamp < cutoff
+        || Date.parse(row.endAt) > Date.parse(data.reportingWindow?.endAt ?? "9999-12-31")) continue;
     let key;
     let sortMs;
     if (activeUsageGrouping === "hour") {
@@ -4690,14 +4818,21 @@ function usagePointsWithAllowance(data, points, includeAllowance) {
     day: 12 * 60 * 60 * 1_000,
     week: 24 * 60 * 60 * 1_000
   }[activeUsageGrouping] ?? 6 * 60 * 60 * 1_000;
+  let allowanceSegment = 0;
+  let lastResetAt = null;
   return points.map((point) => {
     const endMs = Date.parse(point.periodEndAt ?? point.timestamp);
     const observationMatch = quotaLookup.atOrBefore(endMs);
     const observationAge = observationMatch
       ? endMs - observationMatch.timestampMs
       : Number.POSITIVE_INFINITY;
+    const resetAt = observationMatch?.row.resetAt ?? null;
+    if (lastResetAt !== null && !sameResetBoundary(lastResetAt, resetAt)) allowanceSegment += 1;
+    lastResetAt = resetAt;
     return {
       ...point,
+      allowanceSegment,
+      allowanceObservedAt: observationMatch?.row.observedAt ?? null,
       allowanceRemaining: includeAllowance
           && point.quotaWeightedCostUsd !== null
           && observationAge <= maximumObservationAgeMs
@@ -4774,6 +4909,7 @@ function usageChartAxisLabels(
 let usageSeriesMemo = null;
 
 function selectedUsagePoints(data) {
+  data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
   if (usageSeriesMemo !== null
       && usageSeriesMemo.data === data
       && usageSeriesMemo.grouping === activeUsageGrouping
@@ -4801,16 +4937,18 @@ function scheduleUsageTimelineRender() {
   if (!dashboard) return;
   if (typeof requestAnimationFrame !== "function") {
     renderUsageTimeline(dashboard);
+    renderTimeline(dashboard);
     return;
   }
   if (usageRenderFrame !== 0) return;
   usageRenderFrame = requestAnimationFrame(() => {
     usageRenderFrame = 0;
-    if (dashboard) renderUsageTimeline(dashboard);
+    if (dashboard) { renderUsageTimeline(dashboard); renderTimeline(dashboard); }
   });
 }
 
 function resetUsageTimelineViewport() {
+  timelineViewport = null;
   usageTimelineViewport = null;
 }
 
@@ -4825,6 +4963,7 @@ function completeUsageTimelineTotal(points, key) {
 }
 
 function renderUsageTimeline(data) {
+  data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
   syncUsageGroupingControls();
   const points = selectedUsagePoints(data);
   const viewport = withChartViewport(
@@ -4845,19 +4984,30 @@ function renderUsageTimeline(data) {
       : "chart.series.standardApiUsage",
   );
   $("#usage-allowance-legend").hidden = !quotaComparable;
+  // The shared header owns the reporting period; a numerical "All" sentinel
+  // must never become a user-visible duration in a chart heading.
   setLocalizedText(
     $("#usage-timeline-title"),
-    quotaComparable ? "chart.usage.heading" : "chart.usage.standardHeading",
-    {
-    unit,
-    range: tPlural("format.durationDay", activeUsageRangeDays, {
-      count: formatDecimal(activeUsageRangeDays, 0),
-    }),
-    },
+    "trends.allowanceActivity",
   );
+  const allowanceShell = $("#allowance-timeline-chart");
+  const hasAllowance = visiblePoints.some(point => finite(point.allowanceRemaining) !== null);
+  allowanceShell.hidden = !hasAllowance;
+  $("#allowance-timeline-empty").hidden = hasAllowance;
+  if (hasAllowance) drawChart(allowanceShell, lineChart({
+    points: visiblePoints,
+    series: [{ key: "allowanceRemaining", className: "chart-line-observed", label: { key: "trends.allowance" },
+      pointStyle: CHART_POINT_STYLE.HOVER_ONLY, format: value => formatPercent(value, 1),
+      segmentKey: "allowanceSegment", maxGapMs: { hour: 6, day: 36, week: 192 }[activeUsageGrouping] * 3_600_000 }],
+    yLabel: { key: "trends.remainingPercent" }, title: { key: "trends.allowance" },
+    description: { key: "trends.allowanceDescription" },
+    yDomain: { low: 0, high: 100, ticks: [0, 25, 50, 75, 100] }, height: 260, xDomain: viewport,
+    width: Math.max(360, allowanceShell.clientWidth || 900),
+  }));
   if (!visiblePoints.length) {
     shell.hidden = true;
     empty.hidden = false;
+    empty.dataset.state = unavailable ? "unavailable" : "empty";
     empty.querySelector("strong").textContent = unavailable
       ? t(accountingRequiresNewerBuild(data)
         ? "chart.usage.newerBuildTitle"
@@ -4879,20 +5029,12 @@ function renderUsageTimeline(data) {
             ? "chart.series.quotaWeightedUsage"
             : "chart.series.standardApiUsage",
         },
-        // Dense per-interval samples: dots would merge into a solid band, so
-        // the line carries the shape and each sample stays hoverable. This is
-        // the opposite of the allowance history chart, on purpose.
+        // Bars carry per-interval activity; hover targets retain exact values.
         pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+        connect: false,
         format: (value) => formatApiMoney(value),
       }],
       yLabel: axisLabels.primary,
-      secondarySeries: quotaComparable ? [{
-        key: "allowanceRemaining",
-        className: "chart-line-allowance",
-        label: { key: "chart.series.sevenDayAllowanceRemaining" },
-        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
-      }] : [],
-      secondaryYLabel: quotaComparable ? axisLabels.secondary : null,
       yTickFormat: (value) => formatApiMoney(value),
       title: {
         key: quotaComparable
@@ -4906,7 +5048,8 @@ function renderUsageTimeline(data) {
         values: { unit, timeZone: formatTimeZoneLabel() },
       },
       includeZero: true,
-      height: TIMELINE_CHART_HEIGHT,
+      height: 150,
+      width: Math.max(360, shell.clientWidth || 900),
       xDomain: viewport,
     }));
     bindUsageTimelineInteractions(shell, points, viewport);
@@ -5157,6 +5300,24 @@ function selectedTimelinePoints(data) {
   return selection;
 }
 
+let spendRateMemo = null;
+function selectedSpendRateLookup(data) {
+  if (spendRateMemo?.data === data) return spendRateMemo.lookup;
+  const capacity = timelineCalibrationCapacity(data);
+  const buckets = allowanceTimelineUsage(data).map(row => ({
+    startMs: Date.parse(row.startAt), endMs: Date.parse(row.endAt),
+    usd: timelineAllowanceWeightedCost(row, capacity),
+  }));
+  const lookup = createSpendRateLookup(buckets, {
+    intervals: data.allowancePlanSelection ? data.timeline.comparisonIntervals ?? [] : undefined,
+    // The plan-scoped contract publishes fixed fifteen-minute buckets even
+    // when the legacy all-plan timeline uses a different grouping.
+    bucketMs: data.allowancePlanSelection ? 900_000 : (data.timeline.bucketMinutes ?? 15) * 60_000,
+  });
+  spendRateMemo = { data, lookup };
+  return lookup;
+}
+
 function renderTimeline(data) {
   data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
   const {
@@ -5165,7 +5326,8 @@ function renderTimeline(data) {
     usingLive,
     sideChatAdjusted,
   } = selectedTimelinePoints(data);
-  const viewport = normalizeTimelineViewport(points);
+  const usageBounds = timelineBounds(selectedUsagePoints(data));
+  const viewport = usageTimelineViewport ?? timelineViewport ?? usageBounds ?? normalizeTimelineViewport(points);
   const visiblePoints = timelinePointsInViewport(points, viewport);
   const visibleBaselinePoints = timelinePointsInViewport(
     baselinePoints,
@@ -5197,6 +5359,7 @@ function renderTimeline(data) {
   if (!visiblePoints.length || (usingLive && matchedVisible.length === 0)) {
     shell.hidden = true;
     empty.hidden = false;
+    empty.dataset.state = unavailable ? "unavailable" : "empty";
     empty.querySelector("strong").textContent = unavailable
       ? t(accountingRequiresNewerBuild(data)
         ? "dashboard.timeline.newerBuildTitle"
@@ -5221,6 +5384,7 @@ function renderTimeline(data) {
           key: "observed",
           className: "chart-line-observed",
           label: { key: "dashboard.timeline.observedQuota" },
+          segmentKey: "residualSegment",
           pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
           format: formatPp,
         },
@@ -5228,6 +5392,7 @@ function renderTimeline(data) {
           key: "expected",
           className: "chart-line-expected",
           label: { key: "dashboard.timeline.expectedCost" },
+          segmentKey: "residualSegment",
           pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
           format: formatPp,
         }
@@ -5242,13 +5407,14 @@ function renderTimeline(data) {
         values: { timeZone: formatTimeZoneLabel() },
       },
       includeZero: true,
-      height: TIMELINE_CHART_HEIGHT,
+      height: 270,
+      width: Math.max(360, shell.clientWidth || 900),
       xDomain: viewport,
       statusIntervals: usingLive && viewport !== null
         ? timelineStatusIntervals(points, viewport)
         : [],
     }));
-    bindTimelineInteractions(shell, points, viewport);
+    bindTimelineInteractions(shell, selectedUsagePoints(data).length > 1 ? selectedUsagePoints(data) : points, viewport);
   }
   renderSeriesCoverage(
     $("#timeline-coverage"),
@@ -5257,11 +5423,34 @@ function renderTimeline(data) {
   );
   renderTimelineSummary(data, visiblePoints, visibleBaselinePoints, usingLive);
   renderTimelineConfidence(data, points, visiblePoints, usingLive, viewport);
+  const differenceShell = $("#difference-timeline-chart");
+  const differenceLimit = visiblePoints.reduce((maximum, point) => Math.max(maximum, Math.abs(finite(point.residual, 0))), 1) * 1.1;
+  differenceShell.hidden = shell.hidden;
+  if (!shell.hidden) drawChart(differenceShell, lineChart({
+    points: visiblePoints,
+    series: [{ key: "residual", className: "chart-line-value", label: { key: "trends.difference" },
+      pointStyle: CHART_POINT_STYLE.HOVER_ONLY, format: formatPp, connect: false }],
+    yLabel: { key: "dashboard.timeline.percentagePoints" }, title: { key: "trends.difference" },
+    description: { key: "trends.differenceDescription" }, includeZero: true, height: 125, xDomain: viewport,
+    width: Math.max(360, differenceShell.clientWidth || 900),
+    yDomain: { low: -differenceLimit, high: differenceLimit },
+  }));
   renderResiduals(data, visiblePoints, viewport);
   // The divergence panel reads the whole selected calibration range, not the
   // zoomed viewport: it answers "across this range, where did observed and
   // priced usage persistently disagree", so pan and zoom must not reshape it.
   renderDivergencePeriods(data, points);
+  trendsHorizonView?.setSpendLookup(selectedSpendRateLookup(data));
+  // The instrument reads observations, not the end-of-hour/day chart buckets.
+  // Incompatible intervals explicitly interrupt the sample stream.
+  trendsHorizonView?.setAllowanceSamples(mainWeeklyQuotaTrack(data.timeline.quota).map(row => {
+    const timestampMs = Date.parse(row.observedAt);
+    return { timestampMs, allowanceRemaining:
+      timelineComparisonInterval(data, timestampMs, timestampMs) !== false
+        ? finite(row.remainingPercent) : null };
+  }));
+  trendsHorizonView?.setEvents(timelineTypedResetEvents(data));
+  trendsHorizonView?.refresh();
 }
 
 // The copy names each exclusion mechanism that actually fired, in classifier
@@ -5412,6 +5601,7 @@ function bindTimelineInteractions(shell, points, viewport) {
     } else if (event.key === "Home") {
       event.preventDefault();
       resetTimelineViewport();
+      renderUsageTimeline(dashboard);
       renderTimeline(dashboard);
     }
   };
@@ -5441,25 +5631,6 @@ function signedResidualAucPpHours(matched) {
       / 2;
   }
   return area;
-}
-
-// A signed pp·hours figure keeps its sign visible: "+" is printed explicitly
-// because the sign IS the finding — which side of the cost-implied line the
-// observed movement accumulated on.
-function formatSignedPpHours(value) {
-  const number = finite(value);
-  if (number === null) return "—";
-  return t("format.ppHours", {
-    value: `${number < 0 ? "" : "+"}${formatDecimal(number, 1)}`,
-  });
-}
-
-// A signed percentage-point figure, same convention as the pp·hours reading:
-// the "+" or "−" is which side of the cost-implied line the drift sits on.
-function formatSignedPp(value) {
-  const number = finite(value);
-  if (number === null) return "—";
-  return `${number < 0 ? "" : "+"}${formatPp(number)}`;
 }
 
 function renderTimelineSummary(
@@ -5686,7 +5857,7 @@ function renderResiduals(data, points, viewport = null) {
   const domain = viewport ?? timelineBounds(points);
   const empty = $("#residual-empty");
   const shell = $("#residual-chart");
-  if (!computed.length) {
+  if (!residuals.some(row => finite(row.cumulativeResidual) !== null)) {
     empty.hidden = false;
     shell.hidden = true;
   } else {
@@ -5695,40 +5866,28 @@ function renderResiduals(data, points, viewport = null) {
     drawChart(shell, lineChart({
       points: residuals,
       series: [{
-        key: "residual",
-        className: "chart-line-value",
-        label: { key: "chart.residual.series" },
-        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
-        format: formatPp,
-      }, {
-        // The designed cumulative view (owner-directed, 2026-08-08): the
-        // running sum of per-bucket observed-minus-expected movement,
-        // re-anchored at each reset boundary or track change — computed in
-        // liveTimelinePoints beside the evidence it reads. Live points only:
-        // the historical artifact view carries no per-window reset
-        // annotations, so its rows have no such key and this series simply
-        // draws nothing there instead of inventing anchors.
-        key: "cumulativeResidual",
-        className: "chart-line-expected",
-        label: { key: "chart.residual.cumulativeSeries" },
-        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
-        format: formatPp,
+        key: "cumulativeResidual", className: "chart-line-observed",
+        label: { key: "trends.drift" }, pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+        format: formatPp, breakBefore: "driftReanchor",
       }],
       yLabel: { key: "dashboard.timeline.percentagePoints" },
-      title: { key: "chart.residual.title" },
+      title: { key: "trends.drift" },
       description: {
-        key: "chart.residual.description",
+        key: "trends.driftCopy",
         values: { timeZone: formatTimeZoneLabel() },
       },
       includeZero: true,
-      height: COMPACT_CHART_HEIGHT,
+      height: 230,
+      width: Math.max(360, shell.clientWidth || 900),
       xDomain: domain,
-      statusIntervals: domain === null
-        ? []
-        : timelineStatusIntervals(residuals, domain),
+
     }));
   }
   renderResidualCoverage(residuals, computed);
+  setLocalizedText($("#trends-drift-coverage"), "trends.driftCoverage", {
+    computed: formatNumber(residuals.filter(row => finite(row.cumulativeResidual) !== null).length),
+    total: formatNumber(residuals.length),
+  });
   const unmatched = points
     .filter((point) => point.timestamp && point.status
       && !["matched", "inactive"].includes(point.status))
@@ -5760,6 +5919,28 @@ function renderResiduals(data, points, viewport = null) {
   renderResidualInspectionTable();
 }
 
+// Explain the existing classification; do not promote absent quality metadata
+// or an absent estimate into a comparable window.
+function residualEvidence(row) {
+  const status = row.status;
+  if (status === "matched") {
+    if (finite(row.observed) === null) return ["trends.evidenceMissing", "trends.evidenceMissingWhy"];
+    if (finite(row.expected) === null) return ["trends.evidenceEstimate", "trends.evidenceEstimateWhy"];
+    return ["trends.evidenceComparable", "trends.evidenceComparableWhy"];
+  }
+  const keys = {
+    missing_quota_bracket: ["trends.evidenceMissing", "trends.evidenceMissingWhy"],
+    reset_or_track_change: ["trends.evidenceReset", "trends.evidenceResetWhy"],
+    backward_or_ambiguous: ["trends.evidenceBackward", "trends.evidenceBackwardWhy"],
+    pool_saturated: ["trends.evidenceExhausted", "trends.evidenceExhaustedWhy"],
+    quota_weighting_unavailable: ["trends.evidencePricing", "trends.evidencePricingWhy"],
+    unpriced_local_activity: ["trends.evidenceUnpriced", "trends.evidenceUnpricedWhy"],
+    unexplained_without_local_activity: ["trends.evidenceUnrecorded", "trends.evidenceUnrecordedWhy"],
+    inactive: ["trends.evidenceQuiet", "trends.evidenceQuietWhy"],
+  };
+  return Object.hasOwn(keys, status) ? keys[status] : ["trends.evidenceUnknown", "trends.evidenceUnknownWhy"];
+}
+
 /**
  * One page of the exact-windows inspection table, plus the pager beneath it.
  * Rendered from the module-held row set so Prev/Next can redraw the table
@@ -5788,12 +5969,19 @@ function renderResidualInspectionTable() {
     const residual = item.observed === null || item.expected === null
       ? null
       : item.residual;
+    const [labelKey, detailKey] = residualEvidence(item);
+    const evidence = node("td", "residual-evidence");
+    evidence.append(node("strong", "residual-evidence-label", t(labelKey)),
+      node("span", "residual-evidence-detail", t(detailKey)));
+    const time = node("td", "residual-window-time", formatChartTimestamp(item.timestamp));
+    if (finite(item.measuredSpanMs) > 0) time.append(node("small", "residual-window-span",
+      t("trends.measuredSpan", { duration: formatSpanLength(item.measuredSpanMs) })));
     row.append(
-      node("td", "", formatChartTimestamp(item.timestamp)),
+      time,
       node("td", "", formatPp(item.observed)),
       node("td", "", formatPp(item.expected)),
       node("td", residual === null ? "" : residual >= 0 ? "positive" : "negative", residual === null ? t("residual.table.notComparable") : `${residual >= 0 ? "+" : ""}${formatPp(residual)}`),
-      node("td", "", timelineStatusLabel(item.status ?? "matched")),
+      evidence,
     );
     table.append(row);
   }
@@ -5821,15 +6009,34 @@ function renderResidualInspectionTable() {
  * exact cost/token/unpriced mix from its buckets; this line adds the range's
  * dominant priced model and observed speed as clearly-marked context.
  */
-// One id per rendered divergence period, so each period's expandable breakdown
-// panel has a stable target for its toggle's `aria-controls`.
+function focusTrendsPeriod(period) {
+  if (!dashboard) return;
+  const padding = Math.max(30 * 60_000, period.durationMs * .12);
+  updateTimelineViewport(selectedUsagePoints(dashboard), () => ({
+    startMs: period.startMs - padding, endMs: period.endMs + padding,
+  }));
+  requestAnimationFrame(() => {
+    trendsHorizonView?.select(period.endMs, true);
+    $("#timeline").scrollIntoView({ block: "start", behavior: "instant" });
+    $("#trends-time").focus({ preventScroll: true });
+  });
+}
+
+// One id per rendered divergence period, so each expandable breakdown has a
+// stable target for its toggle's aria-controls.
 let nextDivergenceBreakdownId = 0;
 
-// Display-only state for the detector's bounded set of visible windows. Index
-// revisions refresh details without changing a window's identity; a changed
-// population or contributor mix cannot inherit another window's answer.
+// Display-only state for the detector's ranked windows. Index revisions refresh
+// details without changing a window's identity; a changed population or
+// contributor mix cannot inherit another window's answer. Pagination controls
+// readability without dropping evidence from the detector result.
 const divergenceDetails = new Map();
-const MAX_DIVERGENCE_DETAILS = 20;
+const DIVERGENCE_PAGE_SIZE = 10;
+let divergenceTablePage = 0;
+let divergencePeriodRows = [];
+let divergencePeriodDetailScope = "";
+let divergencePeriodRangeContext = null;
+let divergencePeriodSignature = "";
 
 function divergenceDetailScope(data) {
   const scope = data?.timeline?.planScoped?.planScope;
@@ -5856,7 +6063,7 @@ function prepareDivergenceDetails(data, periods) {
     : JSON.stringify([generation, data?.accounting?.generationFingerprint,
       planScope?.sourceGeneration, planScope?.sourceGenerationFingerprint]);
   const retained = new Set();
-  for (const period of periods.slice(0, MAX_DIVERGENCE_DETAILS)) {
+  for (const period of periods) {
     const key = divergenceDetailKey(period, scope);
     retained.add(key);
     let state = divergenceDetails.get(key);
@@ -5941,8 +6148,8 @@ function divergencePeriodItem(period, rangeContext, state) {
     "p",
     "divergence-period-finding",
     period.direction === "under_costed"
-      ? "divergence.underCosted"
-      : "divergence.overCosted",
+      ? "trends.faster"
+      : "trends.slower",
     { pp: formatPp(period.absPeakDriftPp) },
   );
 
@@ -5963,7 +6170,14 @@ function divergencePeriodItem(period, rangeContext, state) {
     events: compact(contributors.usageEvents),
   });
 
-  item.append(header, finding, magnitude, mix);
+  const gap = node("div", "divergence-gap");
+  gap.append(rawNode("strong", "divergence-gap-value", formatSignedPp(period.peakDriftPp)),
+    localizedNode("span", "", "trends.maxGap"));
+  gap.setAttribute("title", t("trends.gapExplanation"));
+  const focus = localizedNode("button", "button button-quiet compact divergence-focus", "trends.viewPeriod");
+  focus.type = "button";
+  focus.addEventListener("click", () => focusTrendsPeriod(period));
+  item.append(header, gap, finding, focus);
 
   if (contributors.unpricedEventShare !== null
       && contributors.unpricedEvents > 0) {
@@ -6002,6 +6216,17 @@ function divergencePeriodItem(period, rangeContext, state) {
         "divergence.breakdown.loading",
       ));
     }
+    panel.append(magnitude, mix);
+    if (state.failed && !state.pending && state.local) {
+      if (state.breakdown) panel.append(localizedNode("p", "divergence-breakdown-status", "trends.mixRetained"));
+      const retry = localizedNode("button", "button button-quiet compact divergence-retry", "trends.mixRetry");
+      retry.type = "button";
+      retry.addEventListener("click", () => {
+        state.toggle.focus({ preventScroll: true });
+        state.load();
+      });
+      panel.append(retry);
+    }
   };
   state.render = renderBreakdown;
   const loadBreakdown = async () => {
@@ -6009,6 +6234,7 @@ function divergencePeriodItem(period, rangeContext, state) {
         || state.loadedRevision === state.revision) return;
     const revision = state.revision;
     state.pending = true;
+    state.failed = false;
     renderBreakdown();
     let breakdown = null;
     try {
@@ -6022,6 +6248,7 @@ function divergencePeriodItem(period, rangeContext, state) {
       if (state.expanded) state.load();
       return;
     }
+    state.failed = breakdown?.status !== "available";
     if (breakdown?.status === "available") {
       state.breakdown = breakdown;
       state.loadedRevision = revision;
@@ -6065,6 +6292,7 @@ function divergenceModelLabel(model) {
 
 function renderDivergenceBreakdown(panel, breakdown, rangeContext) {
   clear(panel);
+  panel.append(localizedNode("p", "divergence-breakdown-purpose", "trends.mixPurpose"));
   if (!breakdown || breakdown.status !== "available") {
     panel.append(rangeContext !== null
       ? localizedNode(
@@ -6110,7 +6338,8 @@ function renderDivergenceBreakdown(panel, breakdown, rangeContext) {
   }
   panel.append(modelList);
 
-  const speedEntries = Object.values(breakdown.bySpeed)
+  const speedEntries = Object.entries(breakdown.bySpeed)
+    .map(([speed, row]) => ({ ...row, speed }))
     .filter((row) => row.events > 0)
     .sort((left, right) => right.costUsd - left.costUsd);
   if (speedEntries.length) {
@@ -6153,6 +6382,71 @@ function renderDivergenceBreakdown(panel, breakdown, rangeContext) {
   }
 }
 
+function divergenceRowsSignature(periods, detailScope) {
+  return JSON.stringify([
+    detailScope,
+    periods.map((period) => [
+      period.startMs,
+      period.endMs,
+      period.contributors,
+    ]),
+  ]);
+}
+
+/**
+ * Render one readable page of the complete, widest-first divergence set.
+ * Detail state is retained for every detected window, so a reader can page
+ * away from an expanded row and return without losing its loaded evidence.
+ */
+function renderDivergencePeriodPage({ focusedKey = null } = {}) {
+  const list = $("#divergence-list");
+  const pagination = $("#divergence-pagination");
+  if (!list) return;
+  clear(list);
+
+  const pageCount = Math.max(
+    1,
+    Math.ceil(divergencePeriodRows.length / DIVERGENCE_PAGE_SIZE),
+  );
+  divergenceTablePage = Math.min(
+    Math.max(0, divergenceTablePage),
+    pageCount - 1,
+  );
+  const start = divergenceTablePage * DIVERGENCE_PAGE_SIZE;
+  const pageRows = divergencePeriodRows.slice(
+    start,
+    start + DIVERGENCE_PAGE_SIZE,
+  );
+
+  for (const period of pageRows) {
+    const key = divergenceDetailKey(period, divergencePeriodDetailScope);
+    const state = divergenceDetails.get(key);
+    list.append(divergencePeriodItem(
+      period,
+      divergencePeriodRangeContext,
+      state,
+    ));
+    if (key === focusedKey) state.toggle.focus({ preventScroll: true });
+  }
+
+  if (!pagination) return;
+  pagination.hidden = pageCount <= 1;
+  if (pagination.hidden) return;
+  setLocalizedText(
+    $("#divergence-page-status"),
+    "divergence.pagination.page",
+    {
+      start: formatNumber(start + 1),
+      end: formatNumber(start + pageRows.length),
+      total: formatNumber(divergencePeriodRows.length),
+    },
+  );
+  const previous = $("#divergence-page-prev");
+  const next = $("#divergence-page-next");
+  if (previous) previous.disabled = divergenceTablePage === 0;
+  if (next) next.disabled = divergenceTablePage >= pageCount - 1;
+}
+
 /**
  * The "Where observed and priced usage diverge" panel. It runs the pure
  * detector over the whole selected calibration range and lists each sustained
@@ -6163,6 +6457,7 @@ function renderDivergencePeriods(data, points) {
   const empty = $("#divergence-empty");
   const summary = $("#divergence-summary");
   const caveat = $("#divergence-caveat");
+  const pagination = $("#divergence-pagination");
   if (!list || !empty || !summary) return;
   const focusedKey = [...divergenceDetails.values()]
     .find((state) => state.toggle === document.activeElement)?.key;
@@ -6172,10 +6467,19 @@ function renderDivergencePeriods(data, points) {
     usageBuckets: data?.timeline?.usage ?? [],
   });
   const detailScope = prepareDivergenceDetails(data, result.periods);
+  const signature = divergenceRowsSignature(result.periods, detailScope);
+  if (signature !== divergencePeriodSignature) {
+    divergencePeriodSignature = signature;
+    divergenceTablePage = 0;
+  }
+  divergencePeriodRows = result.periods;
+  divergencePeriodDetailScope = detailScope;
+  divergencePeriodRangeContext = divergenceRangeContext(data);
 
   if (!result.periods.length) {
     list.hidden = true;
     summary.hidden = true;
+    if (pagination) pagination.hidden = true;
     if (caveat) caveat.hidden = true;
     empty.hidden = false;
     // "Nothing diverged" and "there is no drift series to judge" are different
@@ -6198,110 +6502,12 @@ function renderDivergencePeriods(data, points) {
   // expected line ships, every listed period carries this caveat.
   if (caveat) {
     caveat.hidden = false;
-    setLocalizedText(caveat, "divergence.methodCaveat");
+    setLocalizedText(caveat, "trends.divergenceBasis");
   }
-  if (result.truncated) {
-    setLocalizedText(summary, "divergence.truncated", {
-      shown: formatNumber(result.periods.length),
-      total: formatNumber(result.totalFound),
-    });
-    // No silent truncation: the cap is a display bound, and the full count is
-    // both stated above and recorded here.
-    console.info(
-      `[divergence] ${result.totalFound} periods detected; showing the `
-        + `${result.periods.length} widest.`,
-    );
-  } else {
-    setLocalizedPluralText(summary, "divergence.count", result.totalFound, {
-      count: formatNumber(result.totalFound),
-    });
-  }
-
-  const rangeContext = divergenceRangeContext(data);
-  for (const period of result.periods.slice(0, MAX_DIVERGENCE_DETAILS)) {
-    const key = divergenceDetailKey(period, detailScope);
-    const state = divergenceDetails.get(key);
-    list.append(divergencePeriodItem(period, rangeContext, state));
-    if (key === focusedKey) state.toggle.focus({ preventScroll: true });
-  }
-}
-
-// A tick label's resolution follows the span the axis actually covers, so
-// every tick on one axis has the same compact shape instead of each one
-// carrying a full date and time.
-const CHART_TICK_TIME_ONLY_SPAN_MS = 36 * 60 * 60 * 1_000;
-const CHART_TICK_MONTH_ONLY_SPAN_MS = 365 * 24 * 60 * 60 * 1_000;
-
-// The three tick shapes, hoisted so each one is a stable object rather than a
-// literal rebuilt per call, and one live formatter per (locale, shape).
-// `formatChartTimeLabel` runs once per tick and per rendered frame; building an
-// `Intl.DateTimeFormat` for each half of each label was a measurable share of
-// the pan and zoom cost, and nothing about the formatter depends on the instant
-// being formatted. Keying on the live formatting locale means a language change
-// needs no invalidation — it simply misses the cache once per shape.
-const CHART_TICK_SHAPES = Object.freeze({
-  day: Object.freeze({ month: "short", day: "numeric" }),
-  clock: Object.freeze({ hour: "numeric", minute: "2-digit" }),
-  month: Object.freeze({ month: "short", year: "numeric" }),
-});
-
-const chartTickFormatters = new Map();
-
-function chartTickFormatter(shape) {
-  const locale = getFormattingLocale();
-  const key = `${locale} ${shape}`;
-  const cached = chartTickFormatters.get(key);
-  if (cached !== undefined) return cached;
-  const formatter = new Intl.DateTimeFormat(locale, {
-    timeZone: USER_TIME_ZONE,
-    ...CHART_TICK_SHAPES[shape],
+  setLocalizedPluralText(summary, "divergence.count", result.totalFound, {
+    count: formatNumber(result.totalFound),
   });
-  chartTickFormatters.set(key, formatter);
-  return formatter;
-}
-
-/**
- * The one axis-tick label formatter.
- *
- * Two properties are deliberate and both were reported as defects:
- *
- * 1. No tick carries a time-zone name. A chart states its zone exactly once,
- *    in its caption, through `formatTimeZoneLabel()` — which reads
- *    `Intl.DateTimeFormat().resolvedOptions().timeZone`, so it is correct for
- *    whatever zone the reader's Mac is in and is never assumed. Repeating a
- *    short name ("EDT") on ticks while the caption said a long generic name
- *    ("Eastern Time") stated the same fact two different ways.
- *
- * 2. The date and time halves are formatted independently and joined with a
- *    separator chosen here. Asking one `Intl.DateTimeFormat` for both halves
- *    delegates the join to ICU, and WebKit's ICU supplies a localized
- *    connective — "Jan 5 at 3:04 PM" — that Node's ICU does not, so no Node
- *    test can see it. Composing the halves removes that glue by construction
- *    rather than by rewriting a string after the fact.
- */
-function formatChartTimeLabel(value, { dateOnly = false, spanMs = null } = {}) {
-  const timestamp = value instanceof Date
-    ? value.valueOf()
-    : typeof value === "number"
-      ? value
-      : Date.parse(value);
-  if (!Number.isFinite(timestamp)) return t("format.unknown");
-  const span = finite(spanMs);
-  const resolution = dateOnly ? "date"
-    : span === null ? "dateAndTime"
-      : span <= CHART_TICK_TIME_ONLY_SPAN_MS ? "time"
-        : span <= CHART_TICK_MONTH_ONLY_SPAN_MS ? "date"
-          : "month";
-  try {
-    const instant = new Date(timestamp);
-    const part = (shape) => chartTickFormatter(shape).format(instant);
-    if (resolution === "time") return part("clock");
-    if (resolution === "month") return part("month");
-    if (resolution === "date") return part("day");
-    return `${part("day")} · ${part("clock")}`;
-  } catch {
-    return formatChartTimestamp(new Date(timestamp).toISOString(), { dateOnly });
-  }
+  renderDivergencePeriodPage({ focusedKey });
 }
 
 /**
@@ -6376,11 +6582,19 @@ function pointTimestampMs(point) {
  * without this the page kept one live observer per rendered frame, each still
  * watching a detached tree and each waking on the next real resize.
  */
+let trendsHorizonView = null;
+
 function drawChart(shell, chart) {
   for (const previous of shell.children ?? []) {
     previous.chartTickDensityObserver?.disconnect();
   }
   shell.replaceChildren(chart);
+  if (shell.closest?.("#timeline") && chart.timelinePresentation) {
+    trendsHorizonView ??= mountTrendsHorizon($("#timeline"), { t, locale: getFormattingLocale(), timeZone: USER_TIME_ZONE,
+      formatMoney: formatApiMoney, formatPercent, formatDuration: formatSpanLength });
+    trendsHorizonView.refreshLocale(getFormattingLocale());
+    trendsHorizonView.register(shell, chart.timelinePresentation);
+  }
 }
 
 function chartSeriesDrawsPoints(item, field) {
@@ -6489,6 +6703,7 @@ function lineChart({
   // pins an explicit height keeps the default, because raising this without
   // raising that one only reintroduces the letterbox it is meant to remove.
   height = 300,
+  width = 900,
 }) {
   // Hover, keyboard focus, and the accessible name are unconditional. Only the
   // visible dot is a per-chart decision, and every series has to state it.
@@ -6506,7 +6721,6 @@ function lineChart({
     focusable: item.focusable !== false,
     tooltip: item.tooltip !== false,
   }));
-  const width = 900;
   const hasSecondary = chartSecondarySeries.length > 0;
   const margin = {
     top: 12,
@@ -6633,7 +6847,7 @@ function lineChart({
     svg.setAttribute("aria-description", chartDescription);
   }
 
-  const tooltipWidth = 330;
+  const tooltipWidth = Math.min(330, width - margin.left - margin.right);
   const tooltipHeight = 48;
   const tooltip = document.createElementNS(svg.namespaceURI, "g");
   tooltip.setAttribute("class", "chart-hover-tooltip");
@@ -6655,8 +6869,8 @@ function lineChart({
       ? yPosition + 10
       : yPosition - tooltipHeight - 10;
     tooltip.setAttribute("transform", `translate(${tooltipX} ${tooltipY})`);
-    tooltipHeading.textContent = heading.slice(0, 72);
-    tooltipDetail.textContent = detail.slice(0, 86);
+    tooltipHeading.textContent = heading.slice(0, Math.min(72, Math.floor((tooltipWidth - 20) / 6)));
+    tooltipDetail.textContent = detail.slice(0, Math.min(86, Math.floor((tooltipWidth - 20) / 5.5)));
     tooltip.setAttribute("visibility", "visible");
     tooltip.setAttribute("aria-hidden", "false");
   };
@@ -6988,6 +7202,13 @@ function lineChart({
     let segment = [];
     points.forEach((point, index) => {
       const value = finite(point[item.key]);
+      const previous = segment.at(-1);
+      if (previous && ((item.segmentKey && previous.point[item.segmentKey] !== point[item.segmentKey])
+          || (item.breakBefore && point[item.breakBefore])
+          || (Number.isFinite(item.maxGapMs) && pointTimestampMs(point) - pointTimestampMs(previous.point) > item.maxGapMs))) {
+        segments.push(segment);
+        segment = [];
+      }
       if (value === null) {
         if (segment.length) segments.push(segment);
         segment = [];
@@ -7070,10 +7291,14 @@ function lineChart({
           : `${item.className} chart-point chart-point-hit-target`);
         const timestamp = point.timestamp ?? point.date;
         const heading = chartSeriesCaption(item.label, format(value));
-        const detail = [
-          item.detail ? chartText(item.detail(point), "series detail") : null,
-          timestamp ? formatChartTimestamp(timestamp) : null,
-        ].filter(Boolean).join(" · ");
+        const timestampDetail = timestamp ? formatChartTimestamp(timestamp) : null;
+        const seriesDetail = item.detail
+          ? chartText(item.detail(point), "series detail")
+          : null;
+        const detail = (item.timestampFirst
+          ? [timestampDetail, seriesDetail]
+          : [seriesDetail, timestampDetail]
+        ).filter(Boolean).join(" · ");
         const caption = [heading, detail].filter(Boolean).join(" · ");
         // Deliberately no native <title> on a point: the styled hover shows
         // this caption immediately, and the browser's delayed grey tooltip
@@ -7191,6 +7416,12 @@ function lineChart({
     }
   }
   svg.append(tooltip);
+  svg.timelinePresentation = {
+    svg, points: points.map((point, index) => ({ ...point, timestampMs: timestamps[index] })),
+    series: chartSeries.map(item => ({ ...item, format: item.format ?? formatMoney })),
+    x: point => margin.left + (point.timestampMs - domainStartMs) / (safeDomainEndMs - domainStartMs) * plotWidth,
+    y, domain: { startMs: domainStartMs, endMs: safeDomainEndMs }, margin, width, height,
+  };
   return svg;
 }
 
@@ -7263,13 +7494,14 @@ function allowanceHistoryChartModel(data, {
     })
     .filter((point) => point !== null)
     .sort((left, right) => left.at - right.at);
-  const latestObservedAt = allPoints.at(-1)?.at ?? null;
+  const selectedEnd = Date.parse(data.reportingWindow?.endAt ?? "");
+  const latestObservedAt = Number.isFinite(selectedEnd) ? selectedEnd : allPoints.at(-1)?.at ?? null;
   const validRangeDays = Number.isFinite(rangeDays) && rangeDays > 0 ? rangeDays : null;
   const boundedRangeDays = validRangeDays !== null
     && validRangeDays < ALL_HISTORY_RANGE_DAYS
     ? validRangeDays
     : null;
-  const cutoffAt = latestObservedAt === null || validRangeDays === null
+  const cutoffAt = latestObservedAt === null || boundedRangeDays === null
     ? Number.NEGATIVE_INFINITY
     : latestObservedAt - validRangeDays * 24 * 60 * 60 * 1_000;
   // A 7-day window over a roughly weekly per-reset series holds one or two
@@ -7283,7 +7515,8 @@ function allowanceHistoryChartModel(data, {
   const spanFloorPp = boundedRangeDays !== null && boundedRangeDays <= 7
     ? 0
     : activeWeeklyMinimumObservedSpanPp;
-  const inRange = allPoints.filter((point) => point.at >= cutoffAt);
+  const inRange = allPoints.filter((point) => point.at >= cutoffAt
+    && (latestObservedAt === null || point.at <= latestObservedAt));
   const points = inRange.filter((point) => (
     spanFloorPp === 0
       || (point.observedSpanPp !== null
@@ -7297,8 +7530,8 @@ function allowanceHistoryChartModel(data, {
     xTicks: allowanceHistoryDateTicks(points),
     // The population facts the sentences around this model state: the corpus
     // size, how many fits fall in the selected range, the span floor that was
-    // actually applied, the bounded range (null for "All"), and the newest
-    // fit the range is anchored at.
+    // actually applied, the bounded range (null for "All"), and the selected
+    // reporting end (falling back to the newest fit for standalone charts).
     totalCount: allPoints.length,
     inRangeCount: inRange.length,
     spanFloorPp,
@@ -7436,7 +7669,11 @@ function weeklyPointDetail(point) {
   };
 }
 
-function renderAllowanceHistoryChart(history) {
+function renderAllowanceHistoryChart(
+  history,
+  windowMinutes = CODEX_WEEKLY_ALLOWANCE_MINUTES,
+) {
+  const fiveHour = windowMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES;
   return lineChart({
     points: history.points,
     series: [
@@ -7467,6 +7704,7 @@ function renderAllowanceHistoryChart(history) {
         pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
         format: (value) => formatMoney(value),
         detail: weeklyPointDetail,
+        timestampFirst: true,
         pointFilter: (point) => point.wellObserved,
         markerRadius: (point) => point.wellObserved ? 4 : 0,
       },
@@ -7478,6 +7716,7 @@ function renderAllowanceHistoryChart(history) {
         pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
         format: (value) => formatMoney(value),
         detail: weeklyPointDetail,
+        timestampFirst: true,
         pointFilter: (point) => !point.wellObserved,
         markerRadius: (point) => point.wellObserved ? 0 : 4,
       },
@@ -7502,10 +7741,16 @@ function renderAllowanceHistoryChart(history) {
     xTicks: history.xTicks,
     yDomain: history.axis,
     yTickFormat: (value, digits) => formatMoney(value, digits),
-    yLabel: { key: "chart.axis.apiEquivalentPerSevenDays" },
-    title: { key: "weekly.chart.title" },
+    yLabel: { key: fiveHour
+      ? "weekly.chart.fiveHourAxis"
+      : "chart.axis.apiEquivalentPerSevenDays" },
+    title: { key: fiveHour
+      ? "weekly.chart.fiveHourTitle"
+      : "weekly.chart.title" },
     description: {
-      key: "weekly.chart.description",
+      key: fiveHour
+        ? "weekly.chart.fiveHourDescription"
+        : "weekly.chart.description",
       values: {
         span: spanFloorSentenceLabel(history.spanFloorPp),
         timeZone: formatTimeZoneLabel(),
@@ -7542,6 +7787,44 @@ function forecastTimestamp(...values) {
   return null;
 }
 
+function formatAllowanceDuration(hours) {
+  const value = finite(hours);
+  if (value === null || value < 0) return null;
+  if (value < 1) return t("allowance.lessThanHour");
+  const wholeHours = Math.floor(value + 1e-8);
+  const days = Math.floor(wholeHours / 24);
+  return days > 0
+    ? t("allowance.daysHours", { days: formatDecimal(days), hours: formatDecimal(wholeHours % 24) })
+    : t("allowance.hours", { hours: formatDecimal(wholeHours) });
+}
+
+function allowanceTimestamp(label, timestamp) {
+  if (timestamp === null) return node("span", "", label);
+  const button = node("button", "allowance-timestamp", label);
+  button.type = "button";
+  const exact = dateTimeFormatter({
+    timeZone: USER_TIME_ZONE, year: "numeric", month: "short", day: "numeric",
+    hour: "numeric", minute: "2-digit", timeZoneName: "short",
+  }).format(new Date(timestamp));
+  button.dataset.informationExplanation = exact;
+  button.setAttribute("aria-label", `${label} · ${exact}`);
+  button.setAttribute("aria-expanded", "false");
+  const show = () => {
+    if (activeInformationPopover?.button !== button) openInformationPopover(button);
+  };
+  const hide = () => {
+    if (activeInformationPopover?.button === button) closeInformationPopover();
+  };
+  button.addEventListener("mouseenter", show);
+  button.addEventListener("mouseleave", () => {
+    if (document.activeElement !== button) hide();
+  });
+  button.addEventListener("focus", show);
+  button.addEventListener("blur", hide);
+  button.addEventListener("click", (event) => { event.stopPropagation(); show(); });
+  return button;
+}
+
 function formatForecastDuration(hours) {
   const value = finite(hours);
   if (value === null || value <= 0) return null;
@@ -7554,8 +7837,10 @@ function formatForecastDuration(hours) {
   return `${minutes}m`;
 }
 
+let weeklyPaceDetailsOpen = false;
+
 function ensureWeeklyPaceForecastCard() {
-  const hero = $(".weekly-hero");
+  const hero = $("#quota-cards");
   if (!hero?.parentNode) return null;
   let card = $("#weekly-pace-forecast");
   if (!card) {
@@ -7589,9 +7874,9 @@ const PACE_CRITICAL_RATIO = 2;
 // engine's active-interval pace and the card keeps saying it is early.
 const PACE_AVERAGE_MINIMUM_HOURS = 1;
 const PACE_STATE_LABELS = Object.freeze({
-  over: "Over pace",
-  on: "On pace",
-  under: "Under pace",
+  over: "allowance.over",
+  on: "allowance.on",
+  under: "allowance.under",
 });
 
 /**
@@ -7608,8 +7893,8 @@ const PACE_STATE_LABELS = Object.freeze({
  * `pace.overallPercentagePointsPerHour` is the same window's rate with idle
  * time included, and since quota-pace-forecast-v0.2 it is what the engine's
  * own `etaAt` and `status` are built from. That is the honest headline; the
- * active rate stays on the card as the without-pausing edge, drawn as a
- * separate mark on the track.
+ * active rate remains in the evidence disclosure as the without-pausing edge.
+ * Only the headline run-out is marked on the track.
  *
  * The `movementPp / elapsedHours` fallback covers a payload that predates the
  * named rates. It carries a minimum-span guard the engine field does not need,
@@ -7701,65 +7986,78 @@ function formatPaceRatio(ratio) {
  * heading and this track's own label all state the standing in words, so
  * colour is never the only carrier.
  */
-function weeklyPaceTrack(standing, hoursToReset, activePace, remainingPercent) {
+function weeklyPaceTrack(standing, hoursToReset, resetAt) {
   const hoursLeft = finite(hoursToReset);
   if (!standing || hoursLeft === null || hoursLeft <= 0) return null;
   const coveredShare = Math.max(0, Math.min(1, standing.coveredHours / hoursLeft));
   const track = node("div", "weekly-pace-track");
+  track.style.setProperty("--pace-covered", `${(coveredShare * 100).toFixed(2)}%`);
+  // Near either edge, stack callouts and retain the exact marker position.
+  // This avoids overlapping labels without falsifying the time geometry.
+  track.classList.toggle("is-edge", coveredShare < .22 || coveredShare > .78);
+  const labels = node("div", "weekly-pace-track-labels");
+  const dry = standing.dryHours > 0;
+  if (dry) {
+    const runout = node("div", "weekly-pace-track-runout");
+    runout.append(node("span", "", t("allowance.runout")),
+      allowanceTimestamp(t("allowance.inDuration", {
+        duration: formatAllowanceDuration(standing.coveredHours),
+      }), resetAt - standing.dryHours * 3_600_000));
+    labels.append(runout);
+  }
+  const reset = node("div", "weekly-pace-track-reset");
+  reset.append(node("span", "", t("allowance.resets")),
+    allowanceTimestamp(t("allowance.inDuration", {
+      duration: formatAllowanceDuration(hoursLeft),
+    }), resetAt));
+  labels.append(reset);
   const bar = node("div", "weekly-pace-track-bar");
   const covered = node("div", "weekly-pace-track-covered");
   covered.style.inlineSize = `${(coveredShare * 100).toFixed(2)}%`;
   bar.append(covered);
-
-  // The engine's active-interval pace, drawn only where it would run the
-  // allowance out sooner than the headline rate does. It is the edge of the
-  // estimate, not the estimate: it answers "and if I do not stop?".
-  const remaining = finite(remainingPercent);
-  const active = finite(activePace);
-  const flatOutHours = active !== null && active > 0 && remaining !== null
-    ? remaining / active
-    : null;
-  let flatOutLabel = null;
-  if (flatOutHours !== null && flatOutHours < standing.coveredHours * .95) {
-    const flatOutShare = Math.max(0, Math.min(1, flatOutHours / hoursLeft));
+  if (dry) {
     const mark = node("div", "weekly-pace-track-mark");
-    mark.style.insetInlineStart = `${(flatOutShare * 100).toFixed(2)}%`;
+    mark.style.insetInlineStart = `${(coveredShare * 100).toFixed(2)}%`;
     bar.append(mark);
-    flatOutLabel = formatForecastDuration(flatOutHours);
   }
-
-  const resetDuration = formatForecastDuration(hoursLeft);
-  const coveredDuration = formatForecastDuration(standing.coveredHours);
-  const dryDuration = formatForecastDuration(standing.dryHours);
   bar.setAttribute("role", "img");
-  bar.setAttribute(
-    "aria-label",
-    // Whether a gap exists is arithmetic, not a state name: the on-pace band
-    // straddles the point where the allowance lands exactly on the reset, so
-    // an on-pace card can still end with a short dry stretch.
-    dryDuration
-      ? `Of the ${resetDuration ?? "time"} left before the reset, the remaining allowance covers about ${coveredDuration ?? "none of it"}, leaving about ${dryDuration} with none left.`
-      : `The remaining allowance covers all ${resetDuration ?? "of the time"} left before the reset.`,
-  );
-
+  bar.setAttribute("aria-label", t(dry ? "allowance.trackDry" : "allowance.trackCovered", {
+    reset: formatAllowanceDuration(hoursLeft),
+    covered: formatAllowanceDuration(standing.coveredHours),
+    dry: formatAllowanceDuration(standing.dryHours),
+  }));
   const scale = node("div", "weekly-pace-track-scale");
-  scale.append(
-    node("span", "", "Now"),
-    node(
-      "span",
-      "weekly-pace-track-scale-end",
-      resetDuration ? `Reset in ${resetDuration}` : "Reset",
-    ),
-  );
-  track.append(bar, scale);
-  if (flatOutLabel) {
-    track.append(node(
-      "p",
-      "weekly-pace-track-note",
-      `The mark is where the allowance ends if the recent active pace continues without a pause: about ${flatOutLabel} from now.`,
-    ));
-  }
+  scale.append(node("span", "", t("allowance.now")));
+  scale.append(node("span", "weekly-pace-track-gap", dry
+    ? t("allowance.dryDuration", { duration: formatAllowanceDuration(standing.dryHours) })
+    : t("allowance.untilReset")));
+  track.append(labels, bar, scale);
   return track;
+}
+
+function renderWeeklyPaceWaiting(card, data) {
+  const primary = Array.isArray(data?.quotaWindows)
+    ? data.quotaWindows.find(isPrimaryCodexWeeklyQuotaWindow)
+    : null;
+  if (!primary) return;
+  const stale = primary.status === "stale";
+  const heading = node("div", "weekly-pace-forecast-heading");
+  const kicker = node("p", "panel-kicker");
+  const logo = node("img", "quota-codex-icon");
+  logo.setAttribute("src", "./codex-color.svg");
+  logo.setAttribute("alt", "");
+  logo.setAttribute("aria-hidden", "true");
+  kicker.append(logo, node("span", "", t("allowance.forecast")));
+  heading.append(kicker, node("span", "evidence-chip weekly-pace-forecast-collecting-chip",
+    t(stale ? "allowance.stale" : "allowance.waiting")));
+  const title = node("h3", "weekly-pace-forecast-title",
+    t(stale ? "allowance.waitingStaleTitle" : "allowance.waitingTitle"));
+  title.id = "weekly-pace-forecast-title";
+  card.setAttribute("aria-labelledby", title.id);
+  card.className = "weekly-pace-forecast is-insufficient is-waiting";
+  card.append(heading, title, node("p", "weekly-pace-forecast-copy",
+    t(stale ? "allowance.waitingStaleCopy" : "allowance.waitingCopy")));
+  card.hidden = false;
 }
 
 function renderWeeklyPaceForecast(data) {
@@ -7767,11 +8065,19 @@ function renderWeeklyPaceForecast(data) {
   if (!card) return;
   card.hidden = true;
   card.className = "weekly-pace-forecast";
+  delete card.dataset.tankRatio;
+  delete card.dataset.tankReset;
+  delete card.dataset.tankRemaining;
   card.removeAttribute("aria-labelledby");
   clear(card);
 
   const forecast = data?.weekly?.paceForecast;
-  if (!forecast || typeof forecast !== "object" || Array.isArray(forecast)) return;
+  const stalePrimary = Array.isArray(data?.quotaWindows)
+    && data.quotaWindows.some(window => isPrimaryCodexWeeklyQuotaWindow(window)
+      && window.status === "stale");
+  if (stalePrimary || !forecast || typeof forecast !== "object" || Array.isArray(forecast)) {
+    return renderWeeklyPaceWaiting(card, data);
+  }
   const pace = forecast.pace && typeof forecast.pace === "object"
     ? forecast.pace
     : {};
@@ -7787,7 +8093,7 @@ function renderWeeklyPaceForecast(data) {
     forecast.reset_at,
   );
   const now = Date.now();
-  if (resetAt === null || resetAt <= now) return;
+  if (resetAt === null || resetAt <= now) return renderWeeklyPaceWaiting(card, data);
 
   let remaining = firstFiniteForecastNumber(
     forecast.remainingPercent,
@@ -7845,13 +8151,13 @@ function renderWeeklyPaceForecast(data) {
   );
   // A contradiction between the status and dates is an integration error, not
   // a reason to show a confident-looking card. Wait for the next refresh.
-  if (available && (etaAt === null || etaAt <= now || etaAt > resetAt)) return;
-  if (!available && !reachesResetFirst && !collectingEvidence) return;
-  if (collectingEvidence && remaining === null) return;
+  if (available && (etaAt === null || etaAt <= now || etaAt > resetAt)) return renderWeeklyPaceWaiting(card, data);
+  if (!available && !reachesResetFirst && !collectingEvidence) return renderWeeklyPaceWaiting(card, data);
+  if (collectingEvidence && remaining === null) return renderWeeklyPaceWaiting(card, data);
   if (!collectingEvidence
       && remaining === null
       && headlinePace === null
-      && !reachesResetFirst) return;
+      && !reachesResetFirst) return renderWeeklyPaceWaiting(card, data);
 
   // The standing is computed from the headline rate, so the card's colour,
   // its heading and its arithmetic all come from one number. The engine's own
@@ -7866,6 +8172,11 @@ function renderWeeklyPaceForecast(data) {
       hoursToReset,
       pacePpPerHour: headlinePace,
     });
+  if (standing) {
+    card.dataset.tankRatio = String(standing.ratio);
+    card.dataset.tankReset = String(resetAt);
+    card.dataset.tankRemaining = String(remaining);
+  }
   const paceState = standing?.state
     ?? (collectingEvidence ? null : reachesResetFirst ? "under" : null);
   const projectedEtaAt = standing !== null && standing.state === "over"
@@ -7876,29 +8187,39 @@ function renderWeeklyPaceForecast(data) {
   const cardId = "weekly-pace-forecast-title";
   title.id = cardId;
   title.textContent = collectingEvidence
-    ? "Pace estimate ready after one more refresh"
+    ? t("allowance.collectingTitle")
     : paceState === "over"
       ? projectedEtaAt === null
-        ? "At this pace the weekly allowance runs out before the reset"
-        : `At this pace the weekly allowance runs out ${formatReportingTime(projectedEtaAt)}`
+        ? t("allowance.beforeReset")
+        : t("allowance.headline", { duration: formatAllowanceDuration(standing.coveredHours) })
       : paceState === "on"
-        ? "At this pace the weekly allowance runs close to the reset"
-        : "At this pace the weekly allowance lasts to the reset with room to spare";
+        ? t("allowance.nearReset")
+        : t("allowance.spareTitle");
+  if (projectedEtaAt !== null) {
+    const [before, after] = t("allowance.headline", { duration: "{duration}" }).split("{duration}");
+    title.replaceChildren(document.createTextNode(before),
+      allowanceTimestamp(formatAllowanceDuration(standing.coveredHours), projectedEtaAt),
+      document.createTextNode(after ?? ""));
+  }
   card.setAttribute("aria-labelledby", cardId);
 
   const heading = node("div", "weekly-pace-forecast-heading");
-  heading.append(
-    node(
-      "p",
-      "panel-kicker",
-      collectingEvidence ? "Collecting forecast evidence" : "Forecast from recent pace",
-    ),
-  );
+  const kicker = node("p", "panel-kicker");
+  if (collectingEvidence) {
+    kicker.textContent = t("allowance.collecting");
+  } else {
+    const logo = node("img", "quota-codex-icon");
+    logo.setAttribute("src", "./codex-color.svg");
+    logo.setAttribute("alt", "");
+    logo.setAttribute("aria-hidden", "true");
+    kicker.append(logo, node("span", "", t("allowance.forecast")));
+  }
+  heading.append(kicker);
   if (collectingEvidence) {
     heading.append(node(
       "span",
       "evidence-chip weekly-pace-forecast-collecting-chip",
-      "One more refresh",
+      t("allowance.oneMore"),
     ));
   } else if (paceState) {
     // The standing is named in words on the chip as well as carried in the
@@ -7907,33 +8228,33 @@ function renderWeeklyPaceForecast(data) {
     heading.append(node(
       "span",
       "evidence-chip weekly-pace-forecast-state-chip",
-      PACE_STATE_LABELS[paceState],
+      t(standing?.critical ? "allowance.wayOver" : PACE_STATE_LABELS[paceState]),
     ));
   }
   if (earlyEstimate) {
     heading.append(node(
       "span",
       "evidence-chip weekly-pace-forecast-early-chip",
-      "Early estimate",
+      t("allowance.early"),
     ));
   }
 
   const ratioLabel = standing === null ? null : formatPaceRatio(standing.ratio);
   const dryDuration = standing === null
     ? null
-    : formatForecastDuration(standing.dryHours);
+    : standing.dryHours > 0 ? formatAllowanceDuration(standing.dryHours) : null;
   const copy = node("p", "weekly-pace-forecast-copy");
   copy.textContent = collectingEvidence
-    ? "One clean weekly allowance observation is saved. The next fresh observation for this account and reset will establish its pace."
+    ? t("allowance.collectingCopy")
     : standing === null
-      ? "Recent allowance movement is not fast enough to exhaust this window before its reset."
+      ? t("allowance.slowCopy")
       : standing.state === "over"
-        ? `Recent use is running about ${ratioLabel} the pace this window can still sustain${dryDuration ? `, which leaves roughly ${dryDuration} with none left before the reset` : ""}.`
+        ? t("allowance.overCopy", { ratio: ratioLabel, gap: dryDuration ? t("allowance.gapCopy", { duration: dryDuration }) : "" })
         : standing.state === "on"
-          ? `Recent use is close to the pace this window can still sustain, so the allowance should land near the reset with little to spare.`
-          : `Recent use is running about ${ratioLabel} the pace this window can still sustain, so some of the allowance should still be unused at the reset.`;
+          ? t("allowance.onCopy")
+          : t("allowance.underCopy", { ratio: ratioLabel });
   if (earlyEstimate) {
-    copy.textContent += " This is an early estimate from a small amount of recent evidence; it will settle as more observations arrive.";
+    copy.textContent += ` ${t("allowance.earlyCopy")}`;
   }
 
   const metrics = node("div", "weekly-pace-forecast-metrics");
@@ -7942,25 +8263,25 @@ function renderWeeklyPaceForecast(data) {
     item.append(node("span", "", label), node("strong", "", value));
     metrics.append(item);
   };
-  if (remaining !== null) addMetric("Allowance left", formatPercent(remaining));
-  const resetDuration = formatForecastDuration(hoursToReset);
-  if (resetDuration) addMetric("Reset", `in ${resetDuration}`);
+  if (remaining !== null) addMetric(t("allowance.left"), formatPercent(remaining));
+  const resetDuration = formatAllowanceDuration(hoursToReset);
+  if (resetDuration) addMetric(t("allowance.resetsIn"), resetDuration);
   if (collectingEvidence) {
-    addMetric("Evidence", "1 saved");
+    addMetric(t("allowance.evidence"), t("allowance.oneSaved"));
   } else if (dryDuration) {
     // A dry stretch and spare allowance are mutually exclusive, and the tile
     // reports whichever one the reading actually produced rather than pinning
     // itself to the state name.
-    addMetric("Nothing left for", dryDuration);
+    addMetric(t("allowance.dry"), dryDuration);
   } else if (standing !== null) {
-    addMetric("Spare at reset", formatPercent(standing.sparePercent));
+    addMetric(t("allowance.spare"), formatPercent(standing.sparePercent));
   } else if (headlinePace !== null && headlinePace > 0) {
-    addMetric("Recent pace", `${formatDecimal(headlinePace, 1)} pp/hour`);
+    addMetric(t("allowance.recentPace"), t("allowance.rate", { rate: formatDecimal(headlinePace, 1) }));
   }
 
   const track = collectingEvidence
     ? null
-    : weeklyPaceTrack(standing, hoursToReset, rates.active, remaining);
+    : weeklyPaceTrack(standing, hoursToReset, resetAt);
 
   // The evidence line names both rates. A reader who wondered why the old
   // card's forecast kept arriving early can see the difference between the
@@ -7969,18 +8290,18 @@ function renderWeeklyPaceForecast(data) {
   const observationDuration = formatForecastDuration(paceElapsedHours);
   const rateSentences = [];
   if (rates.average !== null) {
-    rateSentences.push(`${formatDecimal(rates.average, 1)} pp/hour overall`);
+    rateSentences.push(t("allowance.overallRate", { rate: formatDecimal(rates.average, 1) }));
   }
   if (rates.active !== null) {
-    rateSentences.push(`${formatDecimal(rates.active, 1)} pp/hour while active`);
+    rateSentences.push(t("allowance.activeRate", { rate: formatDecimal(rates.active, 1) }));
   }
   const evidence = observations !== null && observations >= 1
     ? node(
       "p",
       "weekly-pace-forecast-evidence",
       collectingEvidence
-        ? "One fresh allowance observation is saved for this weekly reset."
-        : `Based on ${formatDecimal(Math.round(observations), 0)} recent allowance observation${Math.round(observations) === 1 ? "" : "s"}${observationDuration ? ` over ${observationDuration}` : ""}${rateSentences.length > 0 ? `: ${rateSentences.join(", ")}` : ""}.`,
+        ? t("allowance.oneObservation")
+        : t("allowance.observations", { count: formatDecimal(Math.round(observations), 0), duration: observationDuration ? t("allowance.overDuration", { duration: observationDuration }) : "", rates: rateSentences.length > 0 ? `: ${rateSentences.join(", ")}` : "" }),
     )
     : null;
   card.className = [
@@ -7997,10 +8318,111 @@ function renderWeeklyPaceForecast(data) {
     reachesResetFirst ? "is-reset-first" : "",
     available ? "is-available" : "",
   ].filter(Boolean).join(" ");
-  card.append(heading, title, copy, metrics);
+  card.append(heading, title, copy);
   if (track) card.append(track);
-  if (evidence) card.append(evidence);
+  const details = node("details", "weekly-pace-details");
+  details.open = weeklyPaceDetailsOpen;
+  details.addEventListener("toggle", () => { weeklyPaceDetailsOpen = details.open; });
+  details.append(node("summary", "", t("allowance.basis")), metrics);
+  if (evidence) details.append(evidence);
+  if (rates.active !== null && remaining !== null && rates.active > 0) {
+    details.append(node("p", "weekly-pace-track-note", t("allowance.active", {
+      duration: formatAllowanceDuration(remaining / rates.active),
+    })));
+  }
+  card.append(details);
   card.hidden = false;
+}
+
+function allowanceHistoryForWindow(data, windowMinutes) {
+  if (windowMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES) return data?.weekly ?? null;
+  if (windowMinutes !== CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) return null;
+  return data?.allowanceHistoryByWindow?.[
+    CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+  ] ?? null;
+}
+
+function allowanceHistoryHasEvidence(history) {
+  return history !== null && (
+    history?.status === "available"
+    || (Array.isArray(history?.weeklyValues) && history.weeklyValues.length > 0)
+  );
+}
+
+function resolvedAllowanceWindowMinutes(data) {
+  const fiveHour = allowanceHistoryForWindow(
+    data,
+    CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
+  );
+  if (activeAllowanceWindowMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+      && fiveHour !== null) return CODEX_FIVE_HOUR_ALLOWANCE_MINUTES;
+  if (activeAllowanceWindowMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
+    return allowanceHistoryHasEvidence(data?.weekly) || fiveHour === null
+      ? CODEX_WEEKLY_ALLOWANCE_MINUTES
+      : CODEX_FIVE_HOUR_ALLOWANCE_MINUTES;
+  }
+  if (allowanceHistoryHasEvidence(data?.weekly)) {
+    return CODEX_WEEKLY_ALLOWANCE_MINUTES;
+  }
+  return fiveHour !== null
+    ? CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+    : CODEX_WEEKLY_ALLOWANCE_MINUTES;
+}
+
+function allowanceWindowView(data) {
+  const windowMinutes = resolvedAllowanceWindowMinutes(data);
+  if (windowMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
+    return {
+      ...selectAllowancePlanPopulation(data, activeWeeklyPlanType),
+      allowanceWindowDurationMinutes: windowMinutes,
+    };
+  }
+  const windowData = {
+    ...data,
+    weekly: allowanceHistoryForWindow(data, windowMinutes),
+    quotaWindows: (Array.isArray(data?.quotaWindows) ? data.quotaWindows : [])
+      .filter((window) => (
+        isPrimaryCodexQuotaWindow(window)
+        && finite(window?.durationMinutes) === windowMinutes
+      )),
+    allowanceWindowDurationMinutes: windowMinutes,
+  };
+  return selectAllowancePlanPopulation(windowData, activeWeeklyPlanType);
+}
+
+function renderAllowanceWindowChrome(data, windowMinutes) {
+  const fiveHourSelected = windowMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES;
+  const fiveHourAvailable = allowanceHistoryForWindow(
+    data,
+    CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
+  ) !== null;
+  const controls = $("#allowance-window-controls");
+  const buttons = typeof controls?.querySelectorAll === "function"
+    ? controls.querySelectorAll("button[data-window-minutes]")
+    : [];
+  for (const button of buttons) {
+    const duration = Number(button.dataset.windowMinutes);
+    const active = duration === windowMinutes;
+    const unavailable = duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+      && !fiveHourAvailable;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+    button.disabled = unavailable;
+    button.title = unavailable ? t("weekly.window.unavailable") : "";
+    setLocalizedText(button, duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+      ? "weekly.window.fiveHour"
+      : "weekly.window.sevenDay");
+  }
+  setLocalizedText($("#weekly-title"), "page.weekly.title");
+  const note = $("#allowance-window-note");
+  note.hidden = !fiveHourSelected && fiveHourAvailable;
+  if (!note.hidden) setLocalizedText(note, fiveHourSelected
+    ? "weekly.window.historyOnly"
+    : "weekly.window.unavailable");
+  $("#share-panel").hidden = fiveHourSelected;
+  setLocalizedText($("#weekly-table-caption"), fiveHourSelected
+    ? "weekly.table.fiveHourCaption"
+    : "weekly.table.sevenDayCaption");
 }
 
 function renderWeeklyPlanControl(data) {
@@ -8009,9 +8431,26 @@ function renderWeeklyPlanControl(data) {
   const note = $("#weekly-plan-note");
   if (!control || !select || !note) return;
   const selection = data.allowancePlanSelection;
-  control.hidden = !selection;
+  const previewPlan = data.mode === "demo"
+    ? shareCardPlanLabel(data?.weekly?.planType)
+    : "";
+  control.hidden = !selection && previewPlan === "";
   note.hidden = !selection;
-  if (!selection) return;
+  if (!selection) {
+    if (previewPlan !== "") {
+      const signature = `preview:${data.weekly.planType}:${localization.locale()}`;
+      if (select.dataset.populationSignature !== signature) {
+        const option = node("option");
+        option.value = data.weekly.planType;
+        option.textContent = t("weekly.plan.latestOption", { plan: previewPlan });
+        select.replaceChildren(option);
+        select.dataset.populationSignature = signature;
+      }
+      select.value = data.weekly.planType;
+      select.disabled = true;
+    }
+    return;
+  }
   const populations = data.weekly.planPopulations ?? [];
   const signature = JSON.stringify([
     populations.map((row) => row.planType),
@@ -8039,9 +8478,11 @@ function renderWeeklyPlanControl(data) {
 }
 
 function renderWeekly(data) {
-  data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
+  const rootData = data;
+  data = allowanceWindowView(data);
+  const windowMinutes = data.allowanceWindowDurationMinutes;
+  renderAllowanceWindowChrome(rootData, windowMinutes);
   renderWeeklyPlanControl(data);
-  renderWeeklyPaceForecast(data);
   // A weekly estimate carried over from the previous app version while the
   // recalculation runs announces itself here, quietly.
   renderStaleServeNote(
@@ -8085,9 +8526,8 @@ function renderWeekly(data) {
       shown: formatDecimal(chartValues.length, 0),
       total: formatDecimal(values.length, 0),
       // The floor the model actually applied — a short range relaxes it —
-      // and the newest fit the range is anchored at, so "7d" reads as seven
-      // days back from that fit rather than from today (estimator audit,
-      // 2026-08-08).
+      // and the selected reporting end. Standalone charts fall back to the
+      // newest fit, while the dashboard follows the shared reporting window.
       span: spanFloorSentenceLabel(history.spanFloorPp),
       anchor: history.anchorAt === null
         ? "—"
@@ -8118,7 +8558,9 @@ function renderWeekly(data) {
     // no fits fall in the selected range at all, or fits are in range and the
     // span floor filtered every one of them (estimator audit, 2026-08-08).
     if (values.length === 0) {
-      setLocalizedText(empty, "weekly.chart.empty");
+      setLocalizedText(empty, windowMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+        ? "weekly.chart.fiveHourEmpty"
+        : "weekly.chart.empty");
     } else if (history.inRangeCount === 0) {
       setLocalizedText(empty, "weekly.chart.emptyRange");
     } else {
@@ -8132,9 +8574,9 @@ function renderWeekly(data) {
   } else {
     empty.hidden = true;
     shell.hidden = false;
-    shell.replaceChildren(renderAllowanceHistoryChart(history));
+    shell.replaceChildren(renderAllowanceHistoryChart(history, windowMinutes));
   }
-  renderWeeklyTable(values);
+  renderWeeklyTable(values, windowMinutes);
   // The chart renderer owns the card re-render (owner-verified regression,
   // 2026-08-08). The old wiring re-rendered the card only where a caller
   // remembered to, so a path that redrew the chart without the extra call
@@ -8142,7 +8584,9 @@ function renderWeekly(data) {
   // the allowance history — the range buttons, the span slider, a dashboard
   // load, a locale change — now redraws the card from the SAME model
   // instance, so the two surfaces cannot disagree.
-  renderShareCard(data, { history });
+  if (windowMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
+    renderShareCard(data, { history });
+  }
 }
 
 // The Allowance page's reset-estimate table pages through its full row set
@@ -8154,8 +8598,9 @@ const WEEKLY_TABLE_PAGE_SIZE = 20;
 let weeklyTablePage = 0;
 let weeklyTableRows = [];
 let weeklyTableSignature = "";
+let weeklyTableWindowMinutes = CODEX_WEEKLY_ALLOWANCE_MINUTES;
 
-function renderWeeklyTable(values) {
+function renderWeeklyTable(values, windowMinutes = CODEX_WEEKLY_ALLOWANCE_MINUTES) {
   // Newest first over the FULL set: the old `.slice(-14)` silently dropped
   // every earlier reset estimate. A changed row set restarts at the first
   // page, exactly like the exact-windows inspection table: a page index only
@@ -8169,6 +8614,7 @@ function renderWeeklyTable(values) {
     weeklyTablePage = 0;
   }
   weeklyTableRows = rows;
+  weeklyTableWindowMinutes = windowMinutes;
   renderWeeklyTablePage();
 }
 
@@ -8181,7 +8627,11 @@ function renderWeeklyTablePage() {
   if (!rows.length) {
     if (pagination) pagination.hidden = true;
     const row = node("tr");
-    const cell = node("td", "empty-cell", t("weekly.table.empty"));
+    const cell = node("td", "empty-cell", t(
+      weeklyTableWindowMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+        ? "weekly.table.fiveHourEmpty"
+        : "weekly.table.empty",
+    ));
     cell.colSpan = 5;
     row.append(cell);
     table.append(row);
@@ -8337,35 +8787,6 @@ function accountingPeriod(data) {
     replayExclusionDiagnostics: data.accounting.replayExclusionDiagnostics,
     accountingSource: data.accounting.accountingSource,
   };
-}
-
-function syncAccountingPeriodControls(data) {
-  const controls = $("#accounting-period-controls");
-  if (!controls) return;
-  const periods = Array.isArray(data?.accounting?.periods)
-    ? data.accounting.periods
-    : [];
-  const available = new Set(
-    periods
-      .map((period) => period?.periodId)
-      .filter((periodId) => typeof periodId === "string" && periodId !== ""),
-  );
-  if (!available.has(activeAccountingPeriod)) {
-    activeAccountingPeriod = selectAvailableAccountingPeriod(periods, activeAccountingPeriod);
-  }
-  for (const control of controls.querySelectorAll("button")) {
-    const periodId = control.dataset.period;
-    const present = available.has(periodId);
-    // The indexed-history option is a capability, not a promise made by the
-    // static page. If the payload does not carry it, keep the control out of
-    // the UI rather than making the 31-day cache look like full history.
-    control.hidden = periodId === "history" && !present;
-    control.disabled = !present;
-    control.setAttribute("aria-disabled", String(!present));
-    const active = present && periodId === activeAccountingPeriod;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-  }
 }
 
 function renderAccountingDimension(containerSelector, dimension, {
@@ -8757,60 +9178,8 @@ function isCacheDropThreadDashboard(data) {
 
 const CACHE_DROP_AUTO_REVIEW_LABEL = "Auto review";
 
-function cacheDropThreadId(value) {
-  return typeof value === "string"
-      && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value)
-    ? value.toLowerCase()
-    : null;
-}
-
-function cacheDropThreadName(thread) {
-  return typeof thread?.name === "string" && thread.name.trim()
-    ? thread.name.trim()
-    : t("accounting.cacheDropThread.fallback", {
-      id: cacheDropThreadId(thread?.id)?.slice(0, 8) ?? "",
-    });
-}
-
 function cacheDropThreadParts(thread) {
-  const id = cacheDropThreadId(thread?.id);
-  if (id === null) return [];
-  const parentId = cacheDropThreadId(thread.parent?.id);
-  const parent = parentId !== null && parentId !== id ? thread.parent : null;
-  if (thread?.origin === "auto_review") {
-    // The internal guardian-review thread has no user-visible conversation of
-    // its own. Its resolver supplies a parent only after Codex metadata proves
-    // that parent remains accessible; do not fall back to the internal UUID.
-    return parent === null ? [{
-      name: CACHE_DROP_AUTO_REVIEW_LABEL,
-      href: null,
-      autoReview: true,
-    }] : [{
-      name: cacheDropThreadName(parent),
-      href: `codex://threads/${parentId}`,
-      worker: false,
-      autoReview: true,
-    }];
-  }
-  const nickname = typeof thread.nickname === "string"
-    ? thread.nickname.trim()
-    : "";
-  const worker = parent !== null || nickname !== "";
-  const parts = parent === null ? [] : [{
-    name: cacheDropThreadName(parent),
-    href: `codex://threads/${parentId}`,
-    worker: false,
-  }];
-  parts.push({
-    name: worker
-      ? t("accounting.cacheDropThread.subworker", {
-        name: nickname || cacheDropThreadName(thread),
-      })
-      : cacheDropThreadName(thread),
-    href: `codex://threads/${id}`,
-    worker,
-  });
-  return parts;
+  return formatCodexThreadParts(thread, t);
 }
 
 function fillCacheDropThreadCell(cell, thread, observedAt) {
@@ -8923,16 +9292,24 @@ function cacheDropThreadKeys(data) {
 
 function resetCacheDropThreadLinks(data = null) {
   const sameDashboard = cacheDropThreadLinks.dashboard === data;
+  const previousGeneration = cacheDropThreadLinks.generation;
+  const previousFingerprint = cacheDropThreadLinks.generationFingerprint;
   cacheDropThreadLinks.requestToken += 1;
   cacheDropThreadLinks.dashboard = data;
   cacheDropThreadLinks.generation = isCacheDropThreadDashboard(data)
-      && typeof data.accounting?.generation === "string"
-    ? data.accounting.generation
+      && typeof data.accounting?.cacheDiagnosticsSource?.generation === "string"
+    ? data.accounting.cacheDiagnosticsSource.generation
     : null;
+  cacheDropThreadLinks.generationFingerprint =
+    data?.accounting?.cacheDiagnosticsSource?.generationFingerprint ?? null;
   cacheDropThreadLinks.requested = false;
-  // A new accounting generation does not change an already resolved thread.
-  // Reuse only exact event-pair keys still present in the local snapshot, across
-  // all selectable periods. New/changed rows must resolve independently.
+  // An unchanged tuple can become ambiguous when another source is indexed.
+  // Reuse navigation only within the same attested diagnostic publication;
+  // a changed or missing proof requires a new successful identity lookup.
+  if (previousGeneration !== cacheDropThreadLinks.generation
+      || previousFingerprint !== cacheDropThreadLinks.generationFingerprint) {
+    cacheDropThreadLinks.entries.clear();
+  }
   const retainedKeys = cacheDropThreadKeys(data);
   for (const key of cacheDropThreadLinks.entries.keys()) {
     if (!retainedKeys.has(key)) cacheDropThreadLinks.entries.delete(key);
@@ -8943,10 +9320,13 @@ function resetCacheDropThreadLinks(data = null) {
 
 async function loadCacheDropThreadLinks(data) {
   const generation = cacheDropThreadLinks.generation;
+  const fingerprint = cacheDropThreadLinks.generationFingerprint;
   if (data !== dashboard || data !== cacheDropThreadLinks.dashboard
       || !isCacheDropThreadDashboard(data) || !isLoopbackDashboard()
       || generation === null || generation === ""
-      || data.accounting?.generationMatched !== true
+      || fingerprint === null
+      || generation !== data.accounting?.cacheDiagnosticsSource?.generation
+      || fingerprint !== data.accounting?.cacheDiagnosticsSource?.generationFingerprint
       || cacheDropThreadLinks.requested
       || typeof localClient.cacheDropThreadLinks !== "function") return;
   cacheDropThreadLinks.requested = true;
@@ -8959,17 +9339,18 @@ async function loadCacheDropThreadLinks(data) {
         || loadToken !== cacheDropThreadLinks.loadToken
         || data !== dashboard || data !== cacheDropThreadLinks.dashboard
         || !isCacheDropThreadDashboard(data) || !isLoopbackDashboard()
-        || generation !== data.accounting?.generation
-        || data.accounting?.generationMatched !== true
+        || generation !== data.accounting?.cacheDiagnosticsSource?.generation
+        || fingerprint !== data.accounting?.cacheDiagnosticsSource?.generationFingerprint
         || result?.status !== "available"
         || result.generation !== generation) return;
     const selectedKeys = cacheDropThreadKeys(data);
+    const resolvedEntries = new Map();
     for (const { key, thread } of result.entries) {
       if (!selectedKeys.has(key)) continue;
       const previous = cacheDropThreadLinks.entries.get(key);
       // Optional name-store failures must not erase details already known for
       // this UUID. A newly resolved identity replaces the old entry outright.
-      cacheDropThreadLinks.entries.set(key, previous?.id === thread.id ? {
+      resolvedEntries.set(key, previous?.id === thread.id ? {
         ...thread,
         name: thread.name ?? previous.name,
         nickname: thread.nickname ?? previous.nickname,
@@ -8980,6 +9361,9 @@ async function loadCacheDropThreadLinks(data) {
         },
       } : thread);
     }
+    // A qualified empty/partial result withdraws unresolved identities. It is
+    // different from a failed lookup, which leaves same-publication UI intact.
+    cacheDropThreadLinks.entries = resolvedEntries;
     completed = true;
     updateCacheDropThreadCells();
   } catch {
@@ -9225,735 +9609,25 @@ function cacheContinuityConfigurationDescription(row) {
   });
 }
 
-const CACHE_REUSE_OUTCOME_BUCKET_UI = Object.freeze([
-  Object.freeze({
-    id: "under_one_minute",
-    labelKey: "accounting.cacheContinuity.outcome.bucket.underOneMinute",
-    startSeconds: 0,
-    endSeconds: 60,
-  }),
-  Object.freeze({
-    id: "one_to_two_minutes",
-    labelKey: "accounting.cacheContinuity.outcome.bucket.oneToTwoMinutes",
-    startSeconds: 60,
-    endSeconds: 120,
-  }),
-  Object.freeze({
-    id: "two_to_five_minutes",
-    labelKey: "accounting.cacheContinuity.outcome.bucket.twoToFiveMinutes",
-    startSeconds: 120,
-    endSeconds: 300,
-  }),
-  Object.freeze({
-    id: "five_to_ten_minutes",
-    labelKey: "accounting.cacheContinuity.outcome.bucket.fiveToTenMinutes",
-    startSeconds: 300,
-    endSeconds: 600,
-  }),
-  Object.freeze({
-    id: "ten_to_thirty_minutes",
-    labelKey: "accounting.cacheContinuity.outcome.bucket.tenToThirtyMinutes",
-    startSeconds: 600,
-    endSeconds: 1_800,
-  }),
-  Object.freeze({
-    id: "thirty_minutes_to_one_hour",
-    labelKey:
-      "accounting.cacheContinuity.outcome.bucket.thirtyMinutesToOneHour",
-    startSeconds: 1_800,
-    endSeconds: 3_600,
-  }),
-  Object.freeze({
-    id: "one_to_six_hours",
-    labelKey: "accounting.cacheContinuity.outcome.bucket.oneToSixHours",
-    startSeconds: 3_600,
-    endSeconds: 21_600,
-  }),
-  Object.freeze({
-    id: "six_to_twenty_four_hours",
-    labelKey:
-      "accounting.cacheContinuity.outcome.bucket.sixToTwentyFourHours",
-    startSeconds: 21_600,
-    endSeconds: 86_400,
-  }),
-  Object.freeze({
-    id: "one_to_three_days",
-    labelKey: "accounting.cacheContinuity.outcome.bucket.oneToThreeDays",
-    startSeconds: 86_400,
-    endSeconds: 259_200,
-  }),
-  Object.freeze({
-    id: "over_three_days",
-    labelKey: "accounting.cacheContinuity.outcome.bucket.overThreeDays",
-    startSeconds: 259_200,
-    endSeconds: null,
-  }),
-]);
-const CACHE_REUSE_RASTER_HEIGHT = 376;
-const CACHE_REUSE_DEFAULT_BUCKET_INDEX = 2;
-const CACHE_REUSE_X_TICKS = Object.freeze([
-  60,
-  300,
-  1_800,
-  3_600,
-  21_600,
-  86_400,
-  604_800,
-]);
-let cacheReuseSelectedBucketIndex = CACHE_REUSE_DEFAULT_BUCKET_INDEX;
-let cacheReuseRenderedPeriodId = null;
-let cacheReuseCurrentImpact = null;
-let cacheReuseRasterLayout = null;
-let cacheReuseResizeObserver = null;
-let cacheReuseObservedWidth = 0;
-let cacheReuseReadoutVisible = false;
-
-function cacheReuseOutcomeBuckets(impact) {
-  if (impact?.status !== "available"
-      || !Number.isSafeInteger(impact.comparableReturns)
-      || !Number.isSafeInteger(impact.reusedMoreThanHalfReturns)
-      || !Number.isSafeInteger(impact.reusedHalfOrLessReturns)
-      || !Number.isSafeInteger(impact.matchedOrExceededReturns)
-      || !Number.isSafeInteger(impact.reusedBetweenHalfAndPreviousReturns)
-      || impact.comparableReturns < 0
-      || impact.reusedMoreThanHalfReturns < 0
-      || impact.reusedHalfOrLessReturns < 0
-      || impact.matchedOrExceededReturns < 0
-      || impact.reusedBetweenHalfAndPreviousReturns < 0
-      || impact.reusedMoreThanHalfReturns + impact.reusedHalfOrLessReturns
-        !== impact.comparableReturns
-      || impact.matchedOrExceededReturns
-        + impact.reusedBetweenHalfAndPreviousReturns
-          !== impact.reusedMoreThanHalfReturns
-      || typeof impact.byOutcomeBucket !== "object"
-      || impact.byOutcomeBucket === null
-      || Array.isArray(impact.byOutcomeBucket)
-      || impact.outcomeDisplayMaximumGapSeconds !== 604_800) return null;
-  const validCount = (value) => Number.isSafeInteger(value) && value >= 0;
-  const buckets = [];
-  for (const definition of CACHE_REUSE_OUTCOME_BUCKET_UI) {
-    if (!Object.hasOwn(impact.byOutcomeBucket, definition.id)) return null;
-    const summary = impact.byOutcomeBucket[definition.id];
-    const premium = summary?.estimatedPremiumUsd;
-    if (typeof summary !== "object"
-        || summary === null
-        || Array.isArray(summary)
-        || summary.startSeconds !== definition.startSeconds
-        || summary.endSeconds !== definition.endSeconds
-        || !validCount(summary.comparableReturns)
-        || !validCount(summary.reusedMoreThanHalfReturns)
-        || !validCount(summary.reusedHalfOrLessReturns)
-        || !validCount(summary.matchedOrExceededReturns)
-        || !validCount(summary.reusedBetweenHalfAndPreviousReturns)
-        || !validCount(summary.cacheReadDrops)
-        || !validCount(summary.lostCacheTokens)
-        || !validCount(summary.pricedDrops)
-        || !validCount(summary.unpricedDrops)
-        || summary.reusedMoreThanHalfReturns
-          + summary.reusedHalfOrLessReturns !== summary.comparableReturns
-        || summary.matchedOrExceededReturns
-          + summary.reusedBetweenHalfAndPreviousReturns
-            !== summary.reusedMoreThanHalfReturns
-        || summary.cacheReadDrops !== summary.reusedHalfOrLessReturns
-        || summary.pricedDrops + summary.unpricedDrops
-          !== summary.cacheReadDrops
-        || (summary.cacheReadDrops === 0 && summary.lostCacheTokens !== 0)
-        || (summary.cacheReadDrops > 0 && summary.lostCacheTokens === 0)
-        || (summary.coverageStatus !== "complete"
-          && summary.coverageStatus !== "incomplete")
-        || (premium !== null
-          && (typeof premium !== "number"
-            || !Number.isFinite(premium)
-            || premium < 0))
-        || (summary.cacheReadDrops === 0
-          && premium !== null
-          && premium !== 0)
-        || (premium === null
-          && summary.coverageStatus === "complete"
-          && summary.unpricedDrops === 0)
-        || (premium !== null
-          && (summary.coverageStatus !== "complete"
-            || summary.unpricedDrops > 0))) return null;
-    buckets.push({ ...definition, ...summary });
-  }
-  for (const field of [
-    "comparableReturns",
-    "reusedMoreThanHalfReturns",
-    "reusedHalfOrLessReturns",
-    "matchedOrExceededReturns",
-    "reusedBetweenHalfAndPreviousReturns",
-    "cacheReadDrops",
-    "lostCacheTokens",
-    "pricedDrops",
-    "unpricedDrops",
-  ]) {
-    if (buckets.reduce((sum, bucket) => sum + bucket[field], 0)
-        !== impact[field]) return null;
-  }
-  return buckets;
-}
-
-function cacheReusePercent(count, total) {
-  return formatPercent(total === 0 ? 0 : count / total * 100, 1);
-}
-
-function chooseCacheReuseMarkUnit(total) {
-  const raw = Math.max(1, total / 600);
-  const magnitude = 10 ** Math.floor(Math.log10(raw));
-  const scaled = raw / magnitude;
-  const nice = scaled <= 1 ? 1 : scaled <= 2 ? 2 : scaled <= 5 ? 5 : 10;
-  return Math.max(1, nice * magnitude);
-}
-
-function cacheReuseHexagonPath(context, x, y, radius) {
-  context.beginPath();
-  for (let point = 0; point < 6; point += 1) {
-    const angle = Math.PI / 3 * point;
-    const pointX = x + radius * Math.cos(angle);
-    const pointY = y + radius * Math.sin(angle);
-    if (point === 0) context.moveTo(pointX, pointY);
-    else context.lineTo(pointX, pointY);
-  }
-  context.closePath();
-}
-
-function drawCacheReuseHexagon(context, x, y, radius, color, fraction = 1) {
-  context.save();
-  cacheReuseHexagonPath(context, x, y, radius);
-  context.fillStyle = color;
-  context.globalAlpha = .1;
-  context.fill();
-  context.globalAlpha = .2;
-  context.lineWidth = .7;
-  context.strokeStyle = color;
-  context.stroke();
-  context.restore();
-
-  context.save();
-  cacheReuseHexagonPath(context, x, y, radius);
-  context.clip();
-  context.fillStyle = color;
-  context.globalAlpha = .8;
-  context.fillRect(
-    x - radius,
-    y - radius,
-    radius * 2 * Math.max(0, Math.min(1, fraction)),
-    radius * 2,
-  );
-  context.restore();
-}
-
-function drawCacheReuseBucketMarks(context, {
-  count,
-  unit,
-  x,
-  width,
-  centerY,
-  areaHeight,
-  color,
-}) {
-  if (count <= 0) return;
-  const fullMarks = Math.floor(count / unit);
-  const remainder = count % unit;
-  const markCount = fullMarks + (remainder > 0 ? 1 : 0);
-  const availableWidth = Math.max(8, width - 7);
-  let radius = 4.6;
-  let columns;
-  let rows;
-  do {
-    columns = Math.max(1, Math.floor(availableWidth / (radius * 1.75)));
-    rows = Math.ceil(markCount / columns);
-    if ((rows - 1) * radius * 1.55 + radius * 2 <= areaHeight
-        || radius <= 1.4) break;
-    radius -= .2;
-  } while (radius > 1.3);
-  const horizontalStep = columns === 1
-    ? 0
-    : Math.min(
-      radius * 1.75,
-      (availableWidth - radius * 2) / (columns - 1),
-    );
-  const verticalStep = radius * 1.55;
-  const renderedRows = Math.ceil(markCount / columns);
-  const totalHeight = (renderedRows - 1) * verticalStep + radius * 2;
-  const startY = centerY - totalHeight / 2 + radius;
-  for (let mark = 0; mark < markCount; mark += 1) {
-    const row = Math.floor(mark / columns);
-    const column = mark % columns;
-    const rowCount = Math.min(columns, markCount - row * columns);
-    const rowWidth = (rowCount - 1) * horizontalStep;
-    const markX = x + width / 2 - rowWidth / 2 + column * horizontalStep;
-    const markY = startY + row * verticalStep
-      + (column % 2 ? radius * .12 : 0);
-    drawCacheReuseHexagon(
-      context,
-      markX,
-      markY,
-      radius,
-      color,
-      mark < fullMarks ? 1 : remainder / unit,
-    );
-  }
-}
-
-function cacheReuseWrappedLines(context, text, maximumWidth) {
-  const words = String(text).split(/\s+/u).filter(Boolean);
-  if (words.length <= 1 && context.measureText(text).width > maximumWidth) {
-    return [...String(text)].reduce((lines, character) => {
-      const last = lines.at(-1) ?? "";
-      if (last && context.measureText(last + character).width > maximumWidth) {
-        lines.push(character);
-      } else if (lines.length === 0) {
-        lines.push(character);
-      } else {
-        lines[lines.length - 1] = last + character;
-      }
-      return lines;
-    }, []);
-  }
-  return words.reduce((lines, word) => {
-    const last = lines.at(-1) ?? "";
-    const next = last ? `${last} ${word}` : word;
-    if (last && context.measureText(next).width > maximumWidth) {
-      lines.push(word);
-    } else if (lines.length === 0) {
-      lines.push(word);
-    } else {
-      lines[lines.length - 1] = next;
-    }
-    return lines;
-  }, []);
-}
-
-function drawCacheReuseLaneLabel(context, text, percentText, centerY, color,
-  maximumWidth) {
-  context.save();
-  context.fillStyle = color;
-  context.textAlign = "start";
-  context.textBaseline = "top";
-  context.font = `700 12px ${getComputedStyle(document.documentElement)
-    .getPropertyValue("--sans")}`;
-  const lines = cacheReuseWrappedLines(context, text, maximumWidth).slice(0, 3);
-  const startY = centerY - 34;
-  lines.forEach((line, index) => context.fillText(line, 4, startY + index * 14));
-  context.font = `600 11px ${getComputedStyle(document.documentElement)
-    .getPropertyValue("--sans")}`;
-  context.fillText(percentText, 4, centerY + 20);
-  context.restore();
-}
-
-function drawCacheReuseLegend(context, width, markUnit, color, muted, font) {
-  const text = t("accounting.cacheContinuity.outcome.legendInline", {
-    count: formatCount(markUnit),
-  });
-  context.save();
-  context.font = `500 10px ${font}`;
-  const textWidth = context.measureText(text).width;
-  const startX = Math.max(5, width - textWidth - 22);
-  drawCacheReuseHexagon(context, startX + 5, 15, 4.5, color);
-  context.fillStyle = muted;
-  context.textAlign = "start";
-  context.textBaseline = "middle";
-  context.fillText(text, startX + 14, 15);
-  context.restore();
-}
-
-function renderCacheReuseReadout(bucket, width, selectedRange,
-  completeCoverage) {
-  const total = bucket.comparableReturns;
-  const morePercent = cacheReusePercent(bucket.reusedMoreThanHalfReturns, total);
-  const lessPercent = cacheReusePercent(bucket.reusedHalfOrLessReturns, total);
-  setLocalizedText($("#cache-reuse-readout-bucket"), bucket.labelKey);
-  setLocalizedText(
-    $("#cache-reuse-readout-checked"),
-    "accounting.cacheContinuity.outcome.readoutChecked",
-    { count: formatCount(total) },
-  );
-  setLocalizedText(
-    $("#cache-reuse-readout-more"),
-    "accounting.cacheContinuity.outcome.readoutMore",
-    {
-      count: formatCount(bucket.reusedMoreThanHalfReturns),
-      percent: morePercent,
-    },
-  );
-  setLocalizedText(
-    $("#cache-reuse-readout-less"),
-    "accounting.cacheContinuity.outcome.readoutLess",
-    {
-      count: formatCount(bucket.reusedHalfOrLessReturns),
-      percent: lessPercent,
-    },
-  );
-  setLocalizedText(
-    $("#cache-reuse-readout-lost"),
-    "accounting.cacheContinuity.outcome.readoutLost",
-    { tokens: formatCount(bucket.lostCacheTokens) },
-  );
-  const subtotalScope = !completeCoverage
-    || bucket.coverageStatus !== "complete" || bucket.unpricedDrops > 0;
-  // A global ordering gap has no honest bucket assignment. It withholds the
-  // period total, not the independently admitted comparisons in this bucket.
-  const premium = bucket.comparableReturns === 0 ? null
-    : subtotalScope
-      ? bucket.coveredSubtotal?.standardApiPremiumUsd
-        ?? (bucket.coverageStatus === "complete" && bucket.unpricedDrops === 0
-          ? bucket.estimatedPremiumUsd : null)
-      : bucket.estimatedPremiumUsd;
-  setLocalizedText(
-    $("#cache-reuse-readout-api"),
-    subtotalScope
-      ? bucket.unpricedDrops > 0
-        ? "accounting.cacheContinuity.outcome.readoutSubtotalUnpriced"
-        : "accounting.cacheContinuity.outcome.readoutSubtotal"
-      : "accounting.cacheContinuity.outcome.readoutApi",
-    {
-      amount: premium === null || premium === undefined
-        ? t("accounting.cacheContinuity.premiumUnavailable")
-        : formatApiMoney(premium),
-      priced: formatCount(bucket.pricedDrops),
-      unpriced: formatCount(bucket.unpricedDrops),
-    },
-  );
-  const stage = $("#cache-reuse-raster-stage");
-  if (!stage) return;
-  const cardHalfWidth = Math.min(130, Math.max(90, (width - 16) / 2));
-  const selectedCenter = selectedRange.start
-    + (selectedRange.end - selectedRange.start) / 2;
-  const desiredCenter = selectedCenter <= width / 2
-    ? selectedRange.end + cardHalfWidth + 10
-    : selectedRange.start - cardHalfWidth - 10;
-  stage.style.setProperty(
-    "--cache-reuse-card-x",
-    `${Math.max(
-      cardHalfWidth + 8,
-      Math.min(width - cardHalfWidth - 8, desiredCenter),
-    )}px`,
-  );
-}
-
-function setCacheReuseReadoutVisible(visible) {
-  cacheReuseReadoutVisible = visible;
-  const rail = $("#cache-reuse-readout-rail");
-  if (rail) rail.hidden = !visible;
-}
-
-function drawCacheReuseRaster(impact, buckets, markUnit) {
-  const scroll = $("#cache-reuse-raster-scroll");
-  const stage = $("#cache-reuse-raster-stage");
-  const canvas = $("#cache-reuse-canvas");
-  if (!scroll || !stage || !canvas || typeof canvas.getContext !== "function") {
-    return;
-  }
-  const measuredWidth = Math.round(scroll.clientWidth || stage.clientWidth || 0);
-  const width = measuredWidth > 0 ? measuredWidth : 680;
-  cacheReuseObservedWidth = Math.round(scroll.clientWidth || 0);
-  stage.style.width = `${width}px`;
-  const pixelRatio = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
-  canvas.width = Math.round(width * pixelRatio);
-  canvas.height = Math.round(CACHE_REUSE_RASTER_HEIGHT * pixelRatio);
-  canvas.style.width = `${width}px`;
-  canvas.style.height = `${CACHE_REUSE_RASTER_HEIGHT}px`;
-  const context = canvas.getContext("2d");
-  if (!context) return;
-  context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-  context.clearRect(0, 0, width, CACHE_REUSE_RASTER_HEIGHT);
-  const styles = getComputedStyle(document.documentElement);
-  const color = (name, fallback) => styles.getPropertyValue(name).trim()
-    || fallback;
-  const green = color("--green", "#174f45");
-  const greenSoft = color("--chart-accent", "#3e8577");
-  const rust = color("--rust", "#97402a");
-  const rustSoft = "#c9826f";
-  const ink = color("--ink", "#17211e");
-  const muted = color("--muted", "#57625c");
-  const line = color("--line", "rgba(23,33,30,.14)");
-  const plotLeft = width < 520 ? 104 : width < 700 ? 118 : width < 860 ? 154 : 184;
-  const plotRight = width < 700 ? 12 : 22;
-  const plotWidth = width - plotLeft - plotRight;
-  const plotTop = 34;
-  const plotBottom = 307;
-  const axisY = 324;
-  const topCenter = 111;
-  const bottomCenter = 246;
-  const laneHeight = 92;
-  const displayMaximum = impact.outcomeDisplayMaximumGapSeconds;
-  const xPosition = (seconds) => plotLeft
-    + Math.log1p(Math.min(seconds, displayMaximum))
-      / Math.log1p(displayMaximum) * plotWidth;
-  const bucketRanges = buckets.map((bucket) => ({
-    start: xPosition(bucket.startSeconds),
-    end: xPosition(bucket.endSeconds ?? displayMaximum),
-  }));
-  cacheReuseSelectedBucketIndex = Math.max(
-    0,
-    Math.min(buckets.length - 1, cacheReuseSelectedBucketIndex),
-  );
-  cacheReuseRasterLayout = { bucketRanges, plotLeft, plotWidth };
-  const selectedRange = bucketRanges[cacheReuseSelectedBucketIndex];
-  const selectedX = selectedRange.start;
-  const selectedWidth = selectedRange.end - selectedRange.start;
-  context.save();
-  context.globalAlpha = .62;
-  context.fillStyle = color("--green-soft", "#dfece6");
-  context.fillRect(
-    selectedX + 1,
-    plotTop,
-    Math.max(1, selectedWidth - 2),
-    plotBottom - plotTop,
-  );
-  context.restore();
-  context.strokeStyle = green;
-  context.lineWidth = 1.2;
-  context.strokeRect(
-    selectedX + .5,
-    plotTop + .5,
-    Math.max(1, selectedWidth - 1),
-    plotBottom - plotTop - 1,
-  );
-  context.strokeStyle = line;
-  context.lineWidth = .8;
-  for (const range of bucketRanges.slice(0, -1)) {
-    context.beginPath();
-    context.moveTo(range.end, plotTop + 12);
-    context.lineTo(range.end, plotBottom);
-    context.stroke();
-  }
-  context.save();
-  context.setLineDash([2, 3]);
-  context.strokeStyle = line;
-  context.lineWidth = 1;
-  context.textAlign = "center";
-  context.textBaseline = "top";
-  context.fillStyle = ink;
-  const tickFontSize = width < 700 ? 10 : 12;
-  context.font = `600 ${tickFontSize}px ${styles.getPropertyValue("--sans")}`;
-  CACHE_REUSE_X_TICKS.forEach((seconds, index) => {
-    const tickX = xPosition(seconds);
-    let labelX = tickX;
-    context.beginPath();
-    context.moveTo(tickX, plotTop + 12);
-    context.lineTo(tickX, plotBottom);
-    context.stroke();
-    if (width < 700 && seconds === 1_800) {
-      context.textAlign = "end";
-      labelX -= 4;
-    } else if (width < 700 && seconds === 3_600) {
-      context.textAlign = "start";
-      labelX += 4;
-    } else {
-      context.textAlign = index === CACHE_REUSE_X_TICKS.length - 1
-        ? "end"
-        : "center";
-    }
-    const tickLabel = seconds === displayMaximum
-      ? `${formatCacheContinuityGap(seconds)}+`
-      : formatCacheContinuityGap(seconds);
-    context.fillText(tickLabel, labelX, axisY);
-  });
-  context.restore();
-  drawCacheReuseLegend(
-    context,
-    width,
-    markUnit,
-    greenSoft,
-    muted,
-    styles.getPropertyValue("--sans"),
-  );
-  const total = impact.comparableReturns;
-  drawCacheReuseLaneLabel(
-    context,
-    t("accounting.cacheContinuity.outcome.laneMore"),
-    t("accounting.cacheContinuity.outcome.lanePercent", {
-      percent: cacheReusePercent(impact.reusedMoreThanHalfReturns, total),
-    }),
-    topCenter,
-    green,
-    plotLeft - 18,
-  );
-  drawCacheReuseLaneLabel(
-    context,
-    t("accounting.cacheContinuity.outcome.laneLess"),
-    t("accounting.cacheContinuity.outcome.lanePercent", {
-      percent: cacheReusePercent(impact.reusedHalfOrLessReturns, total),
-    }),
-    bottomCenter,
-    rust,
-    plotLeft - 18,
-  );
-  buckets.forEach((bucket, index) => {
-    const range = bucketRanges[index];
-    const isSelected = index === cacheReuseSelectedBucketIndex;
-    drawCacheReuseBucketMarks(context, {
-      count: bucket.reusedMoreThanHalfReturns,
-      unit: markUnit,
-      x: range.start,
-      width: Math.max(2, range.end - range.start),
-      centerY: topCenter,
-      areaHeight: laneHeight,
-      color: isSelected ? green : greenSoft,
-    });
-    drawCacheReuseBucketMarks(context, {
-      count: bucket.reusedHalfOrLessReturns,
-      unit: markUnit,
-      x: range.start,
-      width: Math.max(2, range.end - range.start),
-      centerY: bottomCenter,
-      areaHeight: laneHeight,
-      color: isSelected ? rust : rustSoft,
-    });
-  });
-  context.textAlign = "center";
-  context.textBaseline = "top";
-  context.fillStyle = muted;
-  context.font = `500 11px ${styles.getPropertyValue("--sans")}`;
-  context.fillText(
-    t("accounting.cacheContinuity.outcome.axisLabel"),
-    plotLeft + plotWidth / 2,
-    351,
-  );
-  canvas.setAttribute("role", "img");
-  canvas.setAttribute(
-    "aria-label",
-    t("accounting.cacheContinuity.outcome.canvasLabel", {
-      more: formatCount(impact.reusedMoreThanHalfReturns),
-      less: formatCount(impact.reusedHalfOrLessReturns),
-      unit: formatCount(markUnit),
-    }),
-  );
-  renderCacheReuseReadout(
-    buckets[cacheReuseSelectedBucketIndex],
-    width,
-    selectedRange,
-    impact.coverageStatus === "complete",
-  );
-  setCacheReuseReadoutVisible(cacheReuseReadoutVisible);
-}
-
-function ensureCacheReuseResizeObserver() {
-  const scroll = $("#cache-reuse-raster-scroll");
-  if (!scroll || cacheReuseResizeObserver !== null
-      || typeof ResizeObserver !== "function") return;
-  cacheReuseResizeObserver = new ResizeObserver((entries) => {
-    const width = Math.round(entries[0]?.contentRect?.width ?? 0);
-    if (width <= 0 || width === cacheReuseObservedWidth
-        || cacheReuseCurrentImpact === null) return;
-    renderAccountingCacheReuseOutcome(cacheReuseCurrentImpact);
-  });
-  cacheReuseResizeObserver.observe(scroll);
-}
-
-function cacheReuseCoverageNote(impact) {
-  if (impact?.status !== "available") return "";
-  const exclusions = [
-    [impact.orderingCoverageGaps, "ordering"],
-    [impact.uncoveredReturns, "boundary"],
-    [impact.unpricedDrops, "pricing"],
-  ].filter(([count]) => count > 0);
-  if (impact.coverageStatus === "complete" && exclusions.length === 0) return "";
-  return [
-    t("accounting.cacheContinuity.outcome.coverage.partial"),
-    ...exclusions.map(([count, kind]) => t(
-      `accounting.cacheContinuity.outcome.coverage.${kind}`,
-      { count: formatCount(count) },
-    )),
-  ].join(" ");
-}
+let cacheReuseMatrix = null;
 
 function renderAccountingCacheReuseOutcome(impact) {
   const outcome = $("#cache-reuse-outcome");
-  const raster = $("#cache-reuse-raster");
-  const empty = $("#cache-reuse-empty");
-  if (!outcome || !raster || !empty) return;
-  const buckets = cacheReuseOutcomeBuckets(impact);
-  outcome.hidden = buckets === null;
-  const coverage = $("#cache-reuse-coverage");
-  if (coverage) {
-    const note = buckets === null ? "" : cacheReuseCoverageNote(impact);
-    setRawText(coverage, note);
-    coverage.hidden = note === "";
-  }
-  if (buckets === null) {
-    cacheReuseCurrentImpact = null;
-    return;
-  }
-  cacheReuseCurrentImpact = impact;
-  if (cacheReuseRenderedPeriodId !== impact.periodId) {
-    cacheReuseRenderedPeriodId = impact.periodId;
-    cacheReuseSelectedBucketIndex = CACHE_REUSE_DEFAULT_BUCKET_INDEX;
-  }
-  const total = impact.comparableReturns;
-  // A known empty denominator is neither zero reuse nor unavailable data. The
-  // companion has evaluated the period, but no eligible follow-up can support
-  // a percentage. Keep the explicit empty state and withhold the percentage
-  // cards and their denominator-dependent interpretation.
-  const metrics = outcome.querySelector(".cache-reuse-metrics");
-  if (metrics) metrics.hidden = total === 0;
-  empty.hidden = total !== 0;
-  raster.hidden = total === 0;
-  if (total === 0) return;
-  const morePercent = cacheReusePercent(impact.reusedMoreThanHalfReturns, total);
-  const lessPercent = cacheReusePercent(impact.reusedHalfOrLessReturns, total);
-  setRawText($("#cache-reuse-more-percent"), morePercent);
-  setRawText($("#cache-reuse-less-percent"), lessPercent);
-  setRawText(
-    $("#cache-reuse-overhead"),
-    cacheContinuityStandardMetricValue(impact),
-  );
-  setLocalizedText(
-    $("#cache-reuse-more-count"),
-    "accounting.cacheContinuity.outcome.followUps",
-    { count: formatCount(impact.reusedMoreThanHalfReturns) },
-  );
-  setLocalizedText(
-    $("#cache-reuse-less-count"),
-    "accounting.cacheContinuity.outcome.followUps",
-    { count: formatCount(impact.reusedHalfOrLessReturns) },
-  );
-  setLocalizedText(
-    $("#cache-reuse-explanation"),
-    "accounting.cacheContinuity.outcome.howToRead",
-    {
-      percent: morePercent,
-      matched: formatCount(impact.matchedOrExceededReturns),
-      between: formatCount(impact.reusedBetweenHalfAndPreviousReturns),
-    },
-  );
-  const markUnit = chooseCacheReuseMarkUnit(total);
-  drawCacheReuseRaster(impact, buckets, markUnit);
-  ensureCacheReuseResizeObserver();
-}
-
-function selectCacheReuseBucketFromPointer(event) {
-  if (event.type === "pointermove" && event.pointerType === "touch") return;
-  setCacheReuseReadoutVisible(true);
-  const canvas = $("#cache-reuse-canvas");
-  if (!canvas || cacheReuseRasterLayout === null
-      || cacheReuseCurrentImpact === null) return;
-  const bounds = canvas.getBoundingClientRect();
-  const pointerX = event.clientX - bounds.left;
-  const next = cacheReuseRasterLayout.bucketRanges.findIndex(
-    (range, index) => pointerX >= range.start
-      && (pointerX < range.end
-        || index === cacheReuseRasterLayout.bucketRanges.length - 1),
-  );
-  if (next < 0 || next === cacheReuseSelectedBucketIndex) return;
-  cacheReuseSelectedBucketIndex = next;
-  renderAccountingCacheReuseOutcome(cacheReuseCurrentImpact);
-}
-
-function moveCacheReuseBucketSelection(direction) {
-  if (cacheReuseCurrentImpact === null) return;
-  const next = Math.max(
-    0,
-    Math.min(
-      CACHE_REUSE_OUTCOME_BUCKET_UI.length - 1,
-      cacheReuseSelectedBucketIndex + direction,
-    ),
-  );
-  if (next === cacheReuseSelectedBucketIndex) return;
-  cacheReuseSelectedBucketIndex = next;
-  renderAccountingCacheReuseOutcome(cacheReuseCurrentImpact);
+  const container = $("#cache-reuse-matrix");
+  if (!outcome || !container) return;
+  outcome.hidden = false;
+  cacheReuseMatrix ??= createCacheReuseMatrix({
+    container,
+    t,
+    formatNumber: formatCount,
+    formatPercent: (value) => formatPercent(value, 1),
+    formatModelName,
+    formatMetric: (summary, selectedImpact) => [
+      ...cacheReuseMetricLines(summary, selectedImpact, { t, formatCount, formatApiMoney }),
+      cacheReuseCoverageNote(selectedImpact, { t, formatCount }),
+    ].filter(Boolean),
+  });
+  cacheReuseMatrix.render({ impact });
 }
 
 function renderAccountingCacheContinuityDetails(impact) {
@@ -10617,14 +10291,13 @@ function accountingPriceHeadline(accounting) {
 }
 
 function renderAccounting(data) {
-  syncAccountingPeriodControls(data);
   const projection = dashboardAccountingProjection(data);
   // The prior-version figures stand in only while the current channels are
   // genuinely empty: no current cache AND no events from any live source for
   // the selected period. The moment a current source serves (unified index or
   // a fresh cache), it wins and the stale label leaves this section.
   const livePeriod = accountingPeriod(data);
-  const staleRow = projection.status !== "available"
+  const staleRow = !data.reportingWindow && projection.status !== "available"
       && data?.accounting?.accountingCacheStatus === "unavailable"
       && (livePeriod === null || finite(livePeriod.events, 0) === 0)
     ? staleAccountingServePeriod(data)
@@ -10648,14 +10321,16 @@ function renderAccounting(data) {
   });
   const accounting = livePeriod;
   if (accounting === null || (projection.status !== "available" && !retainedEvidence)) {
+    const unavailableCopy = accounting === null && data.reportingWindow
+      ? t("reporting.unavailable") : t(projectionUnavailableCopyKey(data));
     const summary = $("#accounting-summary");
     clear(summary);
     for (const [label, explanation] of [
       [
         t("accounting.projection.metricUnavailable"),
-        t(projectionUnavailableCopyKey(data)),
+        unavailableCopy,
       ],
-      ["Tokens", t(projectionUnavailableCopyKey(data))],
+      ["Tokens", unavailableCopy],
     ]) {
       const card = node("article", "metric-card compact-metric");
       const metricLabel = node("span", "metric-name");
@@ -10663,7 +10338,7 @@ function renderAccounting(data) {
       card.append(
         metricLabel,
         node("strong", "metric-value", "—"),
-        node("p", "", t(projectionUnavailableCopyKey(data))),
+        node("p", "", unavailableCopy),
       );
       summary.append(card);
     }
@@ -10925,7 +10600,7 @@ function modelHasComparableCost(row) {
 }
 
 function modelApiEquivalentCell(row) {
-  const cell = node("td", "model-api-equivalent");
+  const cell = node("td", "model-api-equivalent data-value-unavailable");
   if (modelRowIsSeparateAllowance(row)) {
     setLocalizedText(cell, "accounting.model.separateAllowance");
     cell.title = t("accounting.model.separateAllowanceTitle");
@@ -10952,6 +10627,7 @@ function modelApiEquivalentCell(row) {
     cell.title = t("accounting.model.notReportedTitle");
     return cell;
   }
+  cell.className = "model-api-equivalent";
   setRawText(cell, formatApiMoney(amount));
   if (amount === 0) cell.title = t("accounting.model.zeroTitle");
   return cell;
@@ -11079,11 +10755,11 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
   clear(models);
   const coverage = $("#accounting-price-coverage");
   if (coverage) {
-    const note = pricingCoverageNote(accounting);
+    const note = unavailable ? null : pricingCoverageNote(accounting);
     setRawText(coverage, note ?? "");
     coverage.hidden = note === null;
   }
-  const modelRows = modelUsageRows(accounting);
+  const modelRows = unavailable ? [] : modelUsageRows(accounting);
   const page = paginateCacheImpactRows(
     modelRows,
     accountingModelsTablePagination,
@@ -11158,8 +10834,16 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
     const separate = modelRowIsSeparateAllowance(model);
     row.append(
       identity,
-      rawNode("td", "numeric-cell", formatCount(model.events)),
-      rawNode("td", "numeric-cell", formatCount(model.totalTokens)),
+      rawNode(
+        "td",
+        "numeric-cell",
+        formatCount(model.events, { missing: t("accounting.model.notReported") }),
+      ),
+      rawNode(
+        "td",
+        "numeric-cell",
+        formatCount(model.totalTokens, { missing: t("accounting.model.notReported") }),
+      ),
       separate
         ? localizedNode("td", "numeric-cell model-share", "accounting.model.shareWithheld")
         : modelShareCell(model.totalTokens, totals.tokens),
@@ -11960,7 +11644,8 @@ async function loadLocalDashboard() {
   let primaryAvailable = false;
   localActionBusy = true;
   const button = $("#refresh-button");
-  button.textContent = "Connecting…";
+  if (localRefreshInProgress) renderRefreshProgress(button, "Loading evidence…");
+  else button.textContent = "Connecting…";
   updateLocalActionButtons();
   try {
     const loadDashboardData = async () => {
@@ -11985,6 +11670,7 @@ async function loadLocalDashboard() {
     renderLocalOnboarding(localOnboarding);
     markLocalDashboardReady();
     primaryAvailable = true;
+    dashboardReportPreloader.schedule();
   } catch {
     if (!isCurrent()) return;
     dashboard = null;
@@ -12023,6 +11709,12 @@ async function loadLocalDashboard() {
 // identity_migration_required sentence on the approve card.
 
 function renderDashboardSkeleton() {
+  closeInformationPopover();
+  allowanceTankView?.dispose();
+  allowanceTankView = null;
+  const forecast = $("#weekly-pace-forecast");
+  if (forecast) { forecast.hidden = true; clear(forecast); }
+  if ($("#allowance-context")) $("#allowance-context").hidden = true;
   const container = $("#quota-cards");
   clear(container);
   const card = node("article", "metric-card insufficient");
@@ -12047,6 +11739,7 @@ async function loadQuickResultDashboard() {
     if (!isCurrent()) return;
     renderDashboard(data);
     renderLocalOnboarding(localOnboarding);
+    dashboardReportPreloader.schedule();
   } finally {
     // This generation replaces any pending startup reads too. Keep optional
     // recovery alive without making native evidence reloads wait for it.
@@ -12187,6 +11880,7 @@ function signalElectronRefreshLifecycle(action, args = [], options = {}) {
 
 async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
   if (localActionBusy) return;
+  const previousGlobalState = globalState;
   // Fence continuation against the exact coverage visible before this pass.
   // If the terminal reload presents the same generation/count/byte receipt,
   // scheduleReindexAutoContinuation stops immediately instead of spending the
@@ -12215,6 +11909,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
   let refreshStartSignal = Promise.resolve(null);
   let lateRefreshLease = null;
   let refreshLifecycleFinished = false;
+  let refreshProgressClock = null;
   const handleLateRefreshLease = (lease) => {
     if (!Number.isSafeInteger(lease) || lease <= 0) return;
     if (!refreshLifecycleFinished) {
@@ -12229,9 +11924,9 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
   localRefreshInProgress = true;
   localRefreshCancelRequested = false;
   archiveHistoryScanActive = false;
-  button.textContent = detailed
+  renderRefreshProgress(button, detailed
     ? "Starting detailed accounting…"
-    : "Starting local analysis…";
+    : "Starting local analysis…");
   updateLocalActionButtons();
   setGlobalState("updating");
   try {
@@ -12248,7 +11943,9 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
         { onLateValue: handleLateRefreshLease },
       );
     }
-    let activePassStartedMs = Date.now();
+    refreshProgressClock = startRefreshProgressClock(button, detailed
+      ? "Starting detailed accounting…"
+      : "Starting local analysis…");
     const pollingBudget = createRefreshPollingBudget();
     let consecutiveStatusFailures = 0;
     let outcome = "running";
@@ -12268,7 +11965,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
         consecutiveStatusFailures = 0;
       } catch (error) {
         consecutiveStatusFailures += 1;
-        button.textContent = "Update running; reconnecting…";
+        refreshProgressClock.update("Update running; reconnecting…");
         if (consecutiveStatusFailures >= 8) throw error;
         continue;
       }
@@ -12298,15 +11995,8 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
           // deep accounting finishes, and no partial replacement is invented.
         }
       }
-      const elapsedSeconds = Math.max(
-        0,
-        Math.floor((Date.now() - activePassStartedMs) / 1_000),
-      );
-      const elapsedLabel = elapsedSeconds >= 60
-        ? `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`
-        : `${elapsedSeconds}s`;
       const accountingStatus = outcome === "running"
-        ? refreshAccountingStatus({ progress, elapsedLabel })
+        ? refreshAccountingStatus({ progress })
         : null;
       const countedProgress = collectorProgress || unifiedIndexScanning;
       const processed = countedProgress
@@ -12315,24 +12005,24 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       const selected = countedProgress
           && Number.isSafeInteger(progress?.filesSelected)
         ? progress.filesSelected : null;
-      button.textContent = outcome === "cancelling"
+      const phase = outcome === "cancelling"
         ? "Stopping safely…"
         : accountingStatus !== null
           ? accountingStatus
         : archiveScanning
-          ? `Indexing archive history… ${elapsedLabel}`
+          ? "Indexing archive history…"
         : collectorProgress && progress?.phase === "quick_result"
           ? refreshQuickResultStatus({
               dashboardLoaded: quickResultLoaded,
-              elapsedLabel,
             })
         : unifiedIndexScanning && (selected === null || selected === 0)
-          ? `Scanning local history… ${elapsedLabel}`
+          ? "Scanning local history…"
         : processed !== null && selected !== null
         ? selected > 0 && processed >= selected
-          ? `Calculating usage and allowance… ${elapsedLabel}`
-          : `Analyzing ${processed}/${selected} files… ${elapsedLabel}`
-        : pollCount < 3 ? "Analyzing local evidence…" : `Analyzing… ${elapsedLabel}`;
+          ? "Calculating usage and allowance…"
+          : "Analyzing files…"
+        : pollCount < 3 ? "Analyzing local evidence…" : "Analyzing…";
+      refreshProgressClock.update(phase, { processed, selected });
       if (refreshNeedsContinuation({
         outcome,
         errorCode: refresh.errorCode,
@@ -12347,9 +12037,8 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
             ? localClient.recalculateDetailedAccounting()
             : localClient.refresh());
           pollingBudget.noteContinuation();
-          activePassStartedMs = Date.now();
           timeoutSettlementNoted = false;
-          button.textContent = "Continuing local analysis…";
+          refreshProgressClock.reset("Continuing local analysis…");
         } catch (error) {
           // A 409 means a timed-out pass is still finishing its durable
           // checkpoint. Keep polling until it becomes resumable.
@@ -12364,7 +12053,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       }
       if (outcome === "failed"
           && refresh.errorCode === "refresh_timed_out") {
-        button.textContent = "Finalizing bounded pause…";
+        refreshProgressClock.update("Finalizing bounded pause…");
         if (!timeoutSettlementNoted) {
           pollingBudget.noteSettling();
           timeoutSettlementNoted = true;
@@ -12374,7 +12063,9 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     }
     cancelled = outcome === "cancelled";
     if (cancelled) {
-      button.textContent = "Loading saved results…";
+      refreshProgressClock.stop();
+      refreshProgressClock = null;
+      renderRefreshProgress(button, "Loading saved results…");
       await loadLocalDashboard();
       showConnectionNotice({
         title: "Local analysis cancelled",
@@ -12385,7 +12076,9 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     }
     if (outcome === "failed"
         && finalErrorCode === "refresh_resource_limited") {
-      button.textContent = "Loading saved results…";
+      refreshProgressClock.stop();
+      refreshProgressClock = null;
+      renderRefreshProgress(button, "Loading saved results…");
       await loadLocalDashboard();
       showConnectionNotice({
         title: "This scan paused to protect your Mac",
@@ -12395,7 +12088,9 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       return;
     }
     if (outcome === "degraded") {
-      button.textContent = t("refresh.degradedLoading");
+      refreshProgressClock.stop();
+      refreshProgressClock = null;
+      renderRefreshProgress(button, t("refresh.degradedLoading"));
       await loadLocalDashboard();
       lastReindexProgressReceipt = historyProgressReceipt();
       const history = dashboard?.pricing?.historyCoverage
@@ -12444,7 +12139,9 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       throw failure;
     }
     archiveHistoryScanActive = false;
-    button.textContent = "Loading updated evidence…";
+    refreshProgressClock.stop();
+    refreshProgressClock = null;
+    renderRefreshProgress(button, "Loading updated evidence…");
     await loadLocalDashboard();
     if (detailed) scheduleReindexAutoContinuation();
   } catch (error) {
@@ -12495,6 +12192,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       showDemo: !dashboard
     });
   } finally {
+    refreshProgressClock?.stop();
     if (electronRefresh && refreshAccepted) {
       let lease = await refreshStartSignal;
       if (!Number.isSafeInteger(lease) || lease <= 0) lease = lateRefreshLease;
@@ -12510,6 +12208,21 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     localRefreshInProgress = false;
     localRefreshCancelRequested = false;
     updateLocalActionButtons();
+    // The updating pill is derived from the renderer-owned lifecycle flag.
+    // Restore the dashboard's last verified status after the refresh reaches a
+    // terminal state so it cannot remain stuck on "Running" beside the idle
+    // action button.
+    const stableState = [dashboard?.state, globalState?.state, previousGlobalState?.state]
+      .find((state) => state && state !== "updating");
+    const candidateState = stableState ?? "insufficient";
+    setGlobalState(
+      candidateState,
+      {
+        companionReachable: dashboard
+          ? dashboard.mode !== "demo"
+          : previousGlobalState?.companionReachable ?? false,
+      },
+    );
   }
 }
 
@@ -15686,28 +15399,7 @@ $("#disconnect-device-dialog").addEventListener("keydown", (event) => {
 $("#disconnect-device-confirm").addEventListener("click", () => {
   void disconnectCommunityDevice();
 });
-$("#range-controls").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-days]");
-  if (!button || !dashboard) return;
-  activeUsageRangeDays = Number(button.dataset.days);
-  for (const control of $("#range-controls").querySelectorAll("button")) {
-    const active = control === button;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-  }
-  // Choosing a date range restates what the chart should cover, so a zoom left
-  // over from the previous range cannot survive it. This is the same rule the
-  // calibration range control follows.
-  resetUsageTimelineViewport();
-  renderUsageTimeline(dashboard);
-  renderComparison(dashboard);
-  // The share card's activity figure follows this same selection
-  // (owner-directed, 2026-08-10). The chart renderer owns the card
-  // re-render, so this goes through renderWeekly — the same rule the weekly
-  // range and span handlers follow — rather than a direct card call a new
-  // path could forget.
-  renderWeekly(dashboard);
-});
+
 $("#usage-zoom-in").addEventListener("click", () => {
   if (!dashboard) return;
   zoomUsageTimeline(selectedUsagePoints(dashboard), 1 / TIMELINE_BUTTON_ZOOM_STEP);
@@ -15726,20 +15418,10 @@ $("#usage-pan-forward").addEventListener("click", () => {
 });
 $("#usage-reset-zoom").addEventListener("click", () => {
   resetUsageTimelineViewport();
-  if (dashboard) renderUsageTimeline(dashboard);
-});
-$("#calibration-range-controls").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-days]");
-  if (!button || !dashboard) return;
-  activeCalibrationRangeDays = Number(button.dataset.days);
-  for (const control of $("#calibration-range-controls").querySelectorAll("button")) {
-    const active = control === button;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-  }
   resetTimelineViewport();
-  renderTimeline(dashboard);
+  if (dashboard) { renderUsageTimeline(dashboard); renderTimeline(dashboard); }
 });
+
 $("#timeline-zoom-in").addEventListener("click", () => {
   if (!dashboard) return;
   zoomTimeline(selectedTimelinePoints(dashboard).points, 1 / TIMELINE_BUTTON_ZOOM_STEP);
@@ -15758,7 +15440,7 @@ $("#timeline-pan-forward").addEventListener("click", () => {
 });
 $("#timeline-reset-zoom").addEventListener("click", () => {
   resetTimelineViewport();
-  if (dashboard) renderTimeline(dashboard);
+  if (dashboard) { renderUsageTimeline(dashboard); renderTimeline(dashboard); }
 });
 // The exact-windows pager (owner-directed, 2026-08-08). The page index is
 // clamped inside the renderer, so a click at either end can never leave the
@@ -15779,6 +15461,14 @@ $("#weekly-table-prev").addEventListener("click", () => {
 $("#weekly-table-next").addEventListener("click", () => {
   weeklyTablePage += 1;
   renderWeeklyTablePage();
+});
+$("#divergence-page-prev").addEventListener("click", () => {
+  divergenceTablePage -= 1;
+  renderDivergencePeriodPage();
+});
+$("#divergence-page-next").addEventListener("click", () => {
+  divergenceTablePage += 1;
+  renderDivergencePeriodPage();
 });
 $("#accounting-model-page-prev").addEventListener("click", () => {
   accountingModelsTablePagination.page -= 1;
@@ -15820,29 +15510,6 @@ $("#cache-continuity-page-next").addEventListener("click", () => {
       : accountingPeriod(dashboard)?.cacheContinuityImpact,
   );
 });
-const cacheReuseCanvas = $("#cache-reuse-canvas");
-cacheReuseCanvas?.addEventListener("pointermove", selectCacheReuseBucketFromPointer);
-cacheReuseCanvas?.addEventListener("click", selectCacheReuseBucketFromPointer);
-cacheReuseCanvas?.addEventListener("pointerleave", () => {
-  setCacheReuseReadoutVisible(false);
-});
-cacheReuseCanvas?.addEventListener("focus", () => {
-  setCacheReuseReadoutVisible(true);
-});
-cacheReuseCanvas?.addEventListener("blur", () => {
-  setCacheReuseReadoutVisible(false);
-});
-cacheReuseCanvas?.addEventListener("keydown", (event) => {
-  if (event.key === "ArrowLeft") {
-    event.preventDefault();
-    setCacheReuseReadoutVisible(true);
-    moveCacheReuseBucketSelection(-1);
-  } else if (event.key === "ArrowRight") {
-    event.preventDefault();
-    setCacheReuseReadoutVisible(true);
-    moveCacheReuseBucketSelection(1);
-  }
-});
 $("#side-chat-page-prev").addEventListener("click", () => {
   sideChatTablePagination.page -= 1;
   renderAccountingSideChatDetails(
@@ -15868,17 +15535,12 @@ $("#side-chat-historical-gap-focus").addEventListener("click", () => {
   if (probe?.status !== "available"
       || !Number.isFinite(startMs) || !Number.isFinite(endMs)
       || endMs <= startMs) return;
-  activeCalibrationRangeDays = ALL_HISTORY_RANGE_DAYS;
-  for (const control of $("#calibration-range-controls").querySelectorAll(
-    "button",
-  )) {
-    const active = Number(control.dataset.days) === ALL_HISTORY_RANGE_DAYS;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-  }
+  reportingPeriod.select("all");
   timelineViewport = { startMs, endMs };
+  usageTimelineViewport = { startMs, endMs };
   timelineSeriesMemo = null;
   window.location.hash = "#timeline";
+  renderUsageTimeline(dashboard);
   renderTimeline(dashboard);
 });
 $("#usage-group-controls").addEventListener("click", (event) => {
@@ -15891,20 +15553,17 @@ $("#usage-group-controls").addEventListener("click", (event) => {
     control.setAttribute("aria-pressed", String(active));
   }
   resetUsageTimelineViewport();
+  resetTimelineViewport();
   renderUsageTimeline(dashboard);
+  renderTimeline(dashboard);
 });
-$("#weekly-range-controls").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-days]");
-  if (!button || !dashboard) return;
-  activeWeeklyRangeDays = Number(button.dataset.days);
-  for (const control of $("#weekly-range-controls").querySelectorAll("button")) {
-    const active = control === button;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-  }
-  // renderWeekly itself re-renders the share card from the same model
-  // (owner-verified regression, 2026-08-08), so a control cannot redraw the
-  // chart while leaving the card on the previous filters.
+$("#allowance-window-controls")?.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-window-minutes]");
+  if (!button || !dashboard || button.disabled) return;
+  const windowMinutes = Number(button.dataset.windowMinutes);
+  if (![CODEX_FIVE_HOUR_ALLOWANCE_MINUTES, CODEX_WEEKLY_ALLOWANCE_MINUTES]
+      .includes(windowMinutes)) return;
+  activeAllowanceWindowMinutes = windowMinutes;
   renderWeekly(dashboard);
 });
 $("#weekly-plan-select")?.addEventListener("change", (event) => {
@@ -15914,6 +15573,8 @@ $("#weekly-plan-select")?.addEventListener("change", (event) => {
   activeWeeklyPlanType = event.target.value;
   timelineSeriesMemo = null;
   renderComparison(dashboard);
+  resetTimelineViewport();
+  renderUsageTimeline(dashboard);
   renderTimeline(dashboard);
   renderWeekly(dashboard);
 });
@@ -15922,20 +15583,7 @@ $("#weekly-span-control").addEventListener("input", (event) => {
   activeWeeklyMinimumObservedSpanPp = Math.min(99, Math.max(0, Number(event.target.value)));
   renderWeekly(dashboard);
 });
-$("#accounting-period-controls").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-period]");
-  if (!button || !dashboard) return;
-  const available = new Set(
-    (Array.isArray(dashboard.accounting?.periods) ? dashboard.accounting.periods : [])
-      .map((period) => period?.periodId),
-  );
-  if (!available.has(button.dataset.period) || button.disabled) {
-    syncAccountingPeriodControls(dashboard);
-    return;
-  }
-  activeAccountingPeriod = button.dataset.period;
-  renderAccounting(dashboard);
-});
+
 $("#share-card-download").addEventListener("click", downloadShareCard);
 $("#share-card-copy").addEventListener("click", copyShareCardImage);
 document.addEventListener("click", (event) => {
@@ -15950,6 +15598,7 @@ document.addEventListener("keydown", (event) => {
   closeInformationPopover({ restoreFocus: true });
 });
 window.addEventListener("resize", () => {
+  if (dashboard && !$("#timeline").inert) scheduleUsageTimelineRender();
   const current = activeInformationPopover;
   if (current) positionInformationPopover(current.popover, current.button);
 });
@@ -15957,6 +15606,23 @@ document.addEventListener("scroll", () => {
   const current = activeInformationPopover;
   if (current) positionInformationPopover(current.popover, current.button);
 }, true);
+
+const workUsageView = mountWorkUsageView({ root: document.querySelector("#projects"), t, renderInformationLabel: informationLabel, sharedReporting: true, reportingWindow: null });
+const modelPerformance = mountModelPerformance({
+  root: document.querySelector("#performance"), client: localClient,
+  t, locale: () => localization.formatLocale(), sharedReporting: true, reportingWindow: null,
+});
+window.addEventListener("tibotattle:locale-change", () => {
+  modelPerformance.render();
+  renderReportingPeriod();
+});
+mountReportingPeriodDismissal(document);
+document.querySelector("#reporting-period-controls").addEventListener("click", event => {
+  const button = event.target.closest("button[data-period]");
+  if (button) reportingPeriod.select(button.dataset.period);
+});
+renderReportingPeriod();
+const dashboardReportPreloader = createDashboardReportPreloader({ reports: [workUsageView, modelPerformance] });
 
 mountDashboardNavigation({
   documentRef: document,

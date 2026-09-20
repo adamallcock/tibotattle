@@ -103,11 +103,11 @@ jobs:
           assert e['EXECUTION_CONFIRMATION']==('RUN_ONE_SYNTHETIC_PRODUCTION_CANARY' if e['SELECTED_MODE']=='execute' else '')
           url=e['SELECTED_URL']
           # One reviewed archive only. Inputs bind approval; they do not select arbitrary signed payloads.
-          assert source=='7293828ade187f6fd9e50c67d7018704150ca156'
-          assert digest=='98d32e2a25b4d860d1a60cbdc94fc2a2dbb2dc3e0af58510a0e85e6d1fa24936'
-          assert asar=='e7c725a0902a18a0970265a8b32535fbe8e447829754592af91fc709eb0a987e'
-          assert url=='https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/darwin-arm64/TiboTattle-0.1.19-native-to-electron-handover.18-mac-arm64.zip'
-          assert re.fullmatch(r'https://updates\.tibotattle\.com/electron/rehearsal/native-to-electron-handover-v1/darwin-arm64/TiboTattle-[A-Za-z0-9.-]+-mac-arm64\.zip',url)
+          assert source=='178315c49f432c8c1ed84f8c982d1c57aed8a094'
+          assert digest=='b85988831c5d0efd5750ed027e651d29942c268158949f76f9e497ef26f81f6b'
+          assert asar=='d850f0b13ba116b43b36c4e6a5fedabdfe25af35b072dd7b0b5d7fd535319dc3'
+          assert url=='https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/production-canary/178315c49f432c8c1ed84f8c982d1c57aed8a094/b85988831c5d0efd5750ed027e651d29942c268158949f76f9e497ef26f81f6b.zip'
+          assert re.fullmatch(r'https://updates\.tibotattle\.com/electron/rehearsal/native-to-electron-handover-v1/production-canary/[0-9a-f]{40}/[0-9a-f]{64}\.zip',url)
           key=base64.b64decode(e['CLEANUP_PUBLIC_KEY'],validate=True)
           assert len(key)<=16384 and key.startswith(b'-----BEGIN PUBLIC KEY-----\n') and hashlib.sha256(key).hexdigest()==key_digest
           root=pathlib.Path(e['RUNNER_TEMP'])/'production-canary-intake';root.mkdir(mode=0o700)

@@ -18,7 +18,7 @@ export {
   validateSyntheticFixture,
 } from "./telemetry-envelope.js";
 
-import { formatNumber } from "./ui-format.js";
+import { compact } from "./ui-format.js";
 
 const JSON_WHITESPACE = new Set([" ", "\t", "\n", "\r"]);
 const JSON_SIMPLE_ESCAPES = Object.freeze({
@@ -491,6 +491,7 @@ export function historyIndexContinuationDecision({
     && safeHistory?.phase === "partial_terminal";
   const incomplete = safeHistory?.status !== "complete"
     && !terminalGap
+    && safeHistory?.phase !== "aggregate_unavailable"
     && indexedSourceCount !== null
     && sourceCount !== null
     && sourceCount > 0
@@ -504,11 +505,26 @@ export function historyIndexContinuationDecision({
 }
 
 export function formatTokenTotal(usage) {
-  const total = usage.inputUncachedTokens
-    + usage.inputCachedTokens
-    + usage.outputTextTokens
-    + usage.outputReasoningTokens;
-  return formatNumber(total, { notation: "compact", maximumFractionDigits: 1 });
+  if (usage === null || typeof usage !== "object" || Array.isArray(usage)) {
+    return compact(null);
+  }
+  let total = 0;
+  // This legacy projection has one combined cached-input field and split text /
+  // reasoning output. Every component must be present: an omitted component is
+  // unknown evidence, not a zero contribution. Combined output is intentionally
+  // not added a second time when split components are available.
+  for (const key of [
+    "inputUncachedTokens",
+    "inputCachedTokens",
+    "outputTextTokens",
+    "outputReasoningTokens",
+  ]) {
+    const value = usage[key];
+    if (!Number.isSafeInteger(value) || value < 0) return compact(null);
+    total += value;
+    if (!Number.isSafeInteger(total)) return compact(null);
+  }
+  return compact(total);
 }
 
 export function safeFilename(participantId) {
@@ -654,10 +670,6 @@ export const DEVIATION_MIN_DURATION_MS = 2 * 60 * 60 * 1_000;
 // buckets — long enough to bridge a shallow wobble, short enough that a real
 // return to zero still ends the period.
 export const DEVIATION_MERGE_GAP_MS = 45 * 60 * 1_000;
-// The list is capped so the panel stays readable. Anything beyond the cap is
-// counted and reported (see `totalFound`/`truncated`), never silently dropped.
-export const DEVIATION_MAX_PERIODS = 20;
-
 function deviationNumberOrNull(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -778,7 +790,9 @@ export function detectDeviationPeriods(points, {
   thresholdPp = DEVIATION_DRIFT_THRESHOLD_PP,
   minDurationMs = DEVIATION_MIN_DURATION_MS,
   mergeGapMs = DEVIATION_MERGE_GAP_MS,
-  maxPeriods = DEVIATION_MAX_PERIODS,
+  // Preserve the full ranked result for pageable consumers. Callers that need
+  // a diagnostic bound can still pass an explicit finite cap.
+  maxPeriods = Number.POSITIVE_INFINITY,
 } = {}) {
   const series = (Array.isArray(points) ? points : [])
     .map((point) => ({

@@ -22,16 +22,20 @@ an informal archive.
 | Privacy | [Local data, network, and privacy](./reference/local-data-and-privacy.md) | Exact source reads, local and hosted stores, Keychain, network, retention, deletion, and uninstall boundaries |
 | Electron sharing policy | [Accountless sharing defaults](./decisions/2026-09-04-accountless-sharing-policy.md) | Accepted fresh-install default-on and three-notice existing-install transition; persistent opt-out, no sign-in, and distinct source/release gates |
 | Public contribution sources | [Shared public community sample](./decisions/2026-09-11-public-contribution-sources.md) | Accepted inclusion of durable accountless sources in current public calculations; source identity, withdrawal, suppression, and activation gates |
+| Published graph continuity | [Published analytics remain visible during recalculation](./decisions/2026-09-16-published-analytics-continuity.md) | Accepted last-completed-result and atomic replacement contract; ordinary input changes queue work without withdrawing published days; implemented by analytics migration 0018 and the last-good publication readers, deployment tracked separately |
+| Opt-out retention | [Opt-out stops future uploads](./decisions/2026-09-15-opt-out-stops-future-uploads.md) | Accepted separation of future upload permission from retained-history eligibility and published graph continuity; implementation and deployment tracked separately |
 | Hosted erasure | [Self-service deletion retirement](./decisions/2026-08-30-self-service-deletion-retirement.md) | Accepted source contract: confirmed device disconnect, private owner erasure, and retained restore safeguards; not deployment evidence |
 | Calibration semantics | [Composition-aware expected-line contract](./design/composition-aware-expected-line.md) | Maintained model-mix, saturation, reset, and lineage carry-forward interpretation; not a provider capacity claim |
 | APIs | [API and integration surface](./reference/api-surface.md) | Stable entry point for the source-checked HTTP, native, process, package, schema, binding, and external-service inventory |
 | Detailed API inventory | [Source-backed API surface reference](./reference/2026-08-26-api-surface-reference.md) | Complete inventory maintained with source-parity tests; implemented source is not deployment or release proof |
 | Commands | [Command-line reference](./reference/cli-reference.md) | Source-checked `usage-monitor` command inventory and safety classes |
+| Usage coaching | [Usage explainer agent protocol](./reference/usage-explainer-agent-protocol.md) | Maintained plan selection, pagination, evidence lookup, model-synthesis, and claim boundaries for agents |
+| Codex plugin | [Codex plugin and installed agent interface](./reference/codex-plugin.md) | Self-contained skill, local MCP tools, installed Electron agent protocol, and confirmation-bound macOS installation |
 | Schemas | [Schema and contract lifecycle](./reference/schema-contracts.md) | Canonical owners, mirrors, generators, versioning, and retirement |
 | Local index | [Unified local index schema](./reference/unified-index-schema.md) | Current schema family, physical/parser versions, tables, generation, and migration rules; includes the accepted schema-11 cleanup indexes |
 | Local recovery | [Unified index preservation and recovery](./runbooks/unified-index-recovery.md) | Preservation-first diagnosis and candidate rebuild; never relabel or destroy the only index |
 | Sidebar recovery | [Collapsed dashboard sidebar rescue](./runbooks/sidebar-stranded-collapsed-rescue.md) | Current 0.1.16 recovery for persisted collapsed navigation; removes only exact window-geometry defaults |
-| Platform support | [Platform support and qualification](./reference/platform-support.md) | Published native macOS 14+ Apple silicon and Intel support, plus the evidence ladder Windows, Linux and Electron must satisfy before any claim |
+| Platform support | [Platform support and qualification](./reference/platform-support.md) | Released Electron 0.1.22 across four targets, exact artifact assurances and owner-accepted physical limits |
 | Production | [Production service operations](./runbooks/production-operations.md) | Read-only observation, deploy/migration gates, private owner erasure, containment, rollback, and recovery boundaries |
 | Community diagnostics | [Community allowance-band diagnosis](./runbooks/2026-08-13-community-allowance-band-diagnosis.md) | Current fit-cache and aggregate diagnosis; production writes remain owner-run |
 | Retired hosted APIs | [Hosted API retirement data gates](./runbooks/2026-08-27-hosted-api-retirement-data-gates.md) | Owner-run read-only D1 checks required before any future deletion of data retained after source-route retirement |
@@ -47,7 +51,7 @@ an informal archive.
 | macOS distribution | [Homebrew distribution and macOS support](./decisions/2026-08-15-homebrew-distribution-and-macos-support.md) | First-party tap, uninstall boundary, and supported macOS floor |
 | Public-site preview | [Public site local preview](./runbooks/2026-08-17-public-site-local-preview.md) | Maintained local rendering/inspection path; not deployment proof |
 | Web-only release | [Web-only release](./runbooks/2026-08-17-web-only-release.md) | Maintained website publication lane and its release boundaries |
-| Windows readiness | [Windows portability environments](./runbooks/2026-08-17-windows-portability-environments.md) | Development/qualification environments only; Windows remains unsupported |
+| Windows readiness | [Windows portability environments](./runbooks/2026-08-17-windows-portability-environments.md) | Development/qualification environments only; current release support is defined by the platform authority |
 | R7 evidence | [R7 release-evidence receipt maintenance](./runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md) | Staleness rule and protected dual-runtime regeneration; not a routine documentation check |
 
 ## Lifecycle evidence

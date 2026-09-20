@@ -152,11 +152,16 @@ test("main-only accountless credentials use native conditional operations and pr
     "legacy recovery must block native reads and writes without replacing identity");
 });
 
-test("locked accountless credentials are retryable while denial and recovery remain terminal", async () => {
-  for (const [status, code, retryable] of [
-    ["locked", "contribution_device_credential_unavailable", true],
-    ["denied", "contribution_device_credential_unavailable", false],
-    ["migration_required", "contribution_device_credential_recovery_required", false],
+test("accountless credential failures preserve fixed readiness reasons without mutation", async () => {
+  for (const [status, code, retryable, reason] of [
+    ["locked", "contribution_device_credential_unavailable", true, "locked"],
+    ["denied", "contribution_device_credential_unavailable", false, "denied"],
+    ["migration_required", "contribution_device_credential_recovery_required", false,
+      "migration_required"],
+    ["invalid", "contribution_device_credential_unavailable", false,
+      "credential_invalid"],
+    ["unknown", "contribution_device_credential_unavailable", false,
+      "security_unavailable"],
   ]) {
     const f = bindingFixture();
     f.binding.read = async () => ({ status, value: null });
@@ -165,7 +170,8 @@ test("locked accountless credentials are retryable while denial and recovery rem
       legacyCredentialProbe: async () => "absent",
     });
     await assert.rejects(accountless.read(), (error) => error?.code === code
-      && error.retryable === retryable);
+      && error.retryable === retryable
+      && error.secureStorageReason === reason);
   }
 
   const f = bindingFixture();
@@ -181,8 +187,27 @@ test("locked accountless credentials are retryable while denial and recovery rem
   assert.equal(f.items.size, 0, "a locked conditional write must not mint a replacement identity");
 });
 
-test("startup preflight remains read-only and blocks unavailable active credentials", async () => {
-  for (const [status, code] of [["locked", "KEYCHAIN_LOCKED"], ["denied", "KEYCHAIN_DENIED"], ["unknown", "broker_unavailable"], ["migration_required", "KEYCHAIN_MIGRATION_REQUIRED"]]) {
+test("malformed accountless adapter replies are classified as integrity failures", async () => {
+  const f = bindingFixture();
+  f.binding.read = async () => ({ status: "present", value: Buffer.alloc(31) });
+  const accountless = createDesktopMacOSAccountlessCredentialBackend({
+    binding: f.binding,
+    legacyCredentialProbe: async () => "absent",
+  });
+
+  await assert.rejects(accountless.read(), (error) =>
+    error?.code === "contribution_device_credential_unavailable"
+      && error.secureStorageReason === "adapter_integrity_failed");
+});
+
+test("startup preflight remains read-only and classifies unavailable active credentials", async () => {
+  for (const [status, code, reason] of [
+    ["locked", "KEYCHAIN_LOCKED", "locked"],
+    ["denied", "KEYCHAIN_DENIED", "denied"],
+    ["unknown", "broker_unavailable", "security_unavailable"],
+    ["migration_required", "KEYCHAIN_MIGRATION_REQUIRED", "migration_required"],
+    ["invalid", "KEYCHAIN_CREDENTIAL_INVALID", "credential_invalid"],
+  ]) {
     for (const blockedCapability of MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES) {
       const f = bindingFixture();
       f.binding.read = async (capability) => {
@@ -193,7 +218,8 @@ test("startup preflight remains read-only and blocks unavailable active credenti
         };
       };
       const backend = createDesktopMacOSCredentialBackend({ binding: f.binding });
-      await assert.rejects(backend.preflight(), { code });
+      await assert.rejects(backend.preflight(), (error) => error?.code === code
+        && error.secureStorageReason === reason);
       assert.equal(f.items.size, 0);
       assert.equal(f.calls.some(([operation]) => operation === "store"), false);
       assert.equal(f.calls.some(([, capability]) => !MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES
@@ -279,7 +305,7 @@ test("the default application verifier uses native codesign requirement syntax",
       bindingLoaded = true;
       return bindingFixture().binding;
     },
-  }), { code: "broker_unavailable" });
+  }), { code: "adapter_integrity_failed" });
   assert.equal(bindingLoaded, false,
     "the real default verifier must refuse before loading a native credential adapter");
 });
@@ -300,6 +326,28 @@ test("both Mac targets verify the enclosing application before loading and prefl
     assert.equal(f.calls.length, MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES.length);
     assert.equal(await backend.get("export_identity"), null);
   }
+});
+
+test("a bounded startup preflight reports timeout without starting a write", async () => {
+  const f = bindingFixture();
+  f.binding.read = async (capability) => {
+    f.calls.push(["read", capability]);
+    return new Promise(() => {});
+  };
+  await assert.rejects(loadDesktopMacOSCredentialBackend({
+    app: { isPackaged: true, getAppPath: () => `${RESOURCES}/app.asar` },
+    resourcesPath: RESOURCES,
+    platform: "darwin",
+    architecture: "arm64",
+    preflightTimeoutMs: 5,
+    inspectFile: async () => METADATA,
+    resolveRealPath: async (path) => path,
+    verifyApplication: async () => true,
+    requireBinding: () => f.binding,
+  }), (error) => error?.code === "broker_timeout"
+    && error.secureStorageReason === "timeout");
+  assert.deepEqual(f.calls, [["read", "account_observation"]]);
+  assert.equal(f.calls.some(([operation]) => operation !== "read"), false);
 });
 
 test("verified adapter loading exposes a separate accountless factory without preflighting it", async () => {
@@ -364,7 +412,7 @@ test("unsigned, replaced, linked, development and wrong-target candidates cannot
     let loaded = false;
     await assert.rejects(loadDesktopMacOSCredentialBackend({ ...base, ...patch,
       requireBinding() { loaded = true; return bindingFixture().binding; },
-    }), { code: "broker_unavailable" });
+    }), { code: "adapter_integrity_failed" });
     assert.equal(loaded, false);
   }
 });
@@ -505,6 +553,7 @@ test("production composition blocks a required credential before handover or wri
 
   assert.deepEqual(await bridge.prepareNativeHandover({ homeDirectory: "/synthetic/home" }), {
     status: "credential_preflight_blocked",
+    reason: "migration_required",
   });
   assert.equal(handovers, 0);
   assert.equal(f.items.size, 0);
@@ -512,13 +561,15 @@ test("production composition blocks a required credential before handover or wri
   assert.deepEqual(f.calls, [["read", "account_observation"]]);
 });
 
-test("fixed credential preflight failures never start handover or open a child credential channel", async () => {
-  for (const code of [
-    "KEYCHAIN_LOCKED",
-    "KEYCHAIN_DENIED",
-    "KEYCHAIN_MIGRATION_REQUIRED",
-    "broker_timeout",
-    "broker_unavailable",
+test("fixed credential preflight reasons never start handover or open a child channel", async () => {
+  for (const [code, reason] of [
+    ["KEYCHAIN_LOCKED", "locked"],
+    ["KEYCHAIN_DENIED", "denied"],
+    ["KEYCHAIN_MIGRATION_REQUIRED", "migration_required"],
+    ["KEYCHAIN_CREDENTIAL_INVALID", "credential_invalid"],
+    ["broker_timeout", "timeout"],
+    ["broker_unavailable", "security_unavailable"],
+    ["adapter_integrity_failed", "adapter_integrity_failed"],
   ]) {
     let handovers = 0;
     const bridge = createProductionMacCredentialHandover({
@@ -532,6 +583,7 @@ test("fixed credential preflight failures never start handover or open a child c
     });
     assert.deepEqual(await bridge.prepareNativeHandover({ homeDirectory: "/synthetic/home" }), {
       status: "credential_preflight_blocked",
+      reason,
     });
     assert.equal(handovers, 0);
     assert.throws(() => bridge.attachCredentialBroker({}));

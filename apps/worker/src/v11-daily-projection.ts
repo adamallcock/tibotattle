@@ -4,13 +4,17 @@ import { analyticsAuthorityIsCurrent, applyAnalyticsChange, readIngestionChanges
 import { canonicalJson } from "./canonical-json";
 import { sha256Hex } from "./crypto";
 import { createV11DailyProjectionValues, foldV11DailyProjectionValues, mergeV11DailyProjectionValues } from "./v11-daily-projection-values";
-import { lookupV11StorageSource } from "./v11-storage-journal";
+import { lookupV11StorageSource, type V11StorageDiscard, type V11StorageGeneration } from "./v11-storage-journal";
 import { readTypedV11ManifestPage } from "./typed-v11-record-reader";
 import { encodeTypedTelemetryId } from "./typed-telemetry-codec";
 
 export type V11ProjectionSourceLayout = { kind: "json-v11" } | { kind: "typed-v11"; sourceNamespace: string };
 
 const PAGE_SIZE = 200;
+const MAX_PHYSICAL_PAGE_GROUP = 5;
+const MAX_PAGE_VALUE_BYTES = 262_144;
+const FINAL_PROOF_HEADROOM_MS = 2_500;
+const textEncoder = new TextEncoder();
 const DAY_MS = 86_400_000;
 interface Work {
   source_id: string; event_digest: string; owner_digest: string; generation_id: string;
@@ -25,8 +29,8 @@ interface Day {
 }
 interface RecordRow { stream: string; occurrence_id: string; record_json: string; }
 type Values = ReturnType<typeof createV11DailyProjectionValues>;
-type SourceLookup = Awaited<ReturnType<typeof lookupV11StorageSource>>;
-type Generation = Extract<SourceLookup, { disposition: "generation" }>;
+type SourceLookup = V11StorageGeneration | V11StorageDiscard;
+type Generation = V11StorageGeneration;
 
 function int(value: number, minimum = 0): void {
   if (!Number.isSafeInteger(value) || value < minimum) throw new Error("V11_PROJECTION_INTEGER_INVALID");
@@ -52,6 +56,15 @@ function validateWork(work: Work, source: Generation, layout: V11ProjectionSourc
 }
 
 async function initializeWork(target: D1Database, change: StorageChange, source: Generation, layout: V11ProjectionSourceLayout): Promise<Work | null> {
+  let work = await readWork(target, change);
+  if (work && work.phase !== "retiring") {
+    validateWork(work, source, layout);
+    return work;
+  }
+  if (work?.phase === "retiring") {
+    await applyAnalyticsChange(target, change, async () => { throw new Error("V11_PROJECTION_STATE_MISSING"); });
+    return null;
+  }
   await target.prepare(`INSERT INTO analytics_v11_projection_work
     (source_id,event_digest,owner_digest,generation_id,manifest_digest,from_day,through_day,next_day,values_json,source_layout,source_namespace)
     SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM analytics_applied_events WHERE source_id=? AND event_digest=?)
@@ -63,7 +76,7 @@ async function initializeWork(target: D1Database, change: StorageChange, source:
       canonicalJson(createV11DailyProjectionValues(source.fromDay)), layout.kind, layout.kind === "typed-v11" ? layout.sourceNamespace : null,
       change.sourceId, change.eventDigest,
       change.sequence, change.sourceId, change.sourceId, change.eventDigest).run();
-  const work = await readWork(target, change);
+  work = await readWork(target, change);
   if (!work || work.phase === "retiring") {
     // Another consumer may have finalized or discarded this exact event while
     // source metadata was being read. Verify its receipt rather than recreating
@@ -171,53 +184,207 @@ export interface V11DailyProjectionStep {
   completedDay?: string;
 }
 
-/** One bounded scheduled step, not a complete backfill per invocation. Source
- * activation never calls or waits for this function. A receipt advances only
- * after every day is complete or a newer authoritative withdrawal proves that
- * the old event must be discarded. Retries do not accumulate a page twice.
- */
-export async function advanceV11DailyProjection(options: {
-  source: D1Database; target: D1Database; sourceId: string; signal?: AbortSignal; sourceLayout?: V11ProjectionSourceLayout;
-}): Promise<V11DailyProjectionStep> {
-  const { source, target, sourceId } = options;
-  const requested = options.sourceLayout;
-  if (requested && requested.kind !== "typed-v11" && requested.kind !== "json-v11") {
-    throw new Error("V11_PROJECTION_SOURCE_LAYOUT_CONFLICT");
+export class V11ProjectionDeadlineExceededError extends Error {
+  constructor() { super("V11_PROJECTION_DEADLINE_EXCEEDED"); }
+}
+
+function validateAdmission(sourceId: string, change: StorageChange, input: SourceLookup): void {
+  const fail = () => { throw new Error("V11_PROJECTION_SOURCE_CONFLICT"); };
+  const digest = /^[0-9a-f]{64}$/;
+  const id = (value: unknown, maximum = 256) => typeof value === "string" && value.length > 0 && value.length <= maximum;
+  const integer = (value: unknown, minimum = 0) => Number.isSafeInteger(value) && (value as number) >= minimum;
+  const day = (value: unknown) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)
+    && Number.isFinite(Date.parse(`${value}T00:00:00.000Z`))
+    && new Date(Date.parse(`${value}T00:00:00.000Z`)).toISOString().slice(0,10) === value;
+  const changeKeys = ["authorityEpoch","contentDigest","eventDigest","kind","objectDigest","ownerDigest",
+    "publicAuthorityEpoch","recordedMs","revision","sequence","sourceId"];
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,127}$/.test(sourceId)
+      || Object.keys(change).sort().join() !== changeKeys.sort().join() || change.sourceId !== sourceId
+      || !integer(change.sequence, 1) || !integer(change.revision, 1) || !integer(change.recordedMs)
+      || !integer(change.authorityEpoch, 1) || !integer(change.publicAuthorityEpoch, 1)
+      || ![change.eventDigest,change.ownerDigest,change.objectDigest,change.contentDigest].every(value => digest.test(value))
+      || !["source-updated","owner-active","owner-withdrawn","owner-erased"].includes(change.kind)
+      || input.sourceId !== sourceId || input.ownerDigest !== change.ownerDigest) fail();
+  if (input.disposition === "generation") {
+    const keys = ["authorityEpoch","deviceId","disposition","eventDigest","fromDay","generationId","headRevision",
+      "inputRevision","manifestDigest","ownerDigest","participantId","publicAuthorityEpoch","sourceId","throughDay"];
+    if (Object.keys(input).sort().join() !== keys.sort().join() || !["source-updated","owner-active"].includes(change.kind)
+        || input.eventDigest !== change.eventDigest || input.eventDigest !== change.objectDigest
+        || input.manifestDigest !== change.contentDigest || input.authorityEpoch !== change.authorityEpoch
+        || input.publicAuthorityEpoch !== change.publicAuthorityEpoch || !id(input.generationId) || !id(input.participantId)
+        || !id(input.deviceId) || !digest.test(input.manifestDigest) || !integer(input.headRevision, 1)
+        || !integer(input.inputRevision) || !day(input.fromDay) || !day(input.throughDay)
+        || input.fromDay > input.throughDay) fail();
+    return;
   }
-  // Detach the internal caller's object before asynchronous source checks.
-  const layout: V11ProjectionSourceLayout = requested?.kind === "typed-v11"
-    ? { kind: "typed-v11", sourceNamespace: requested.sourceNamespace } : { kind: "json-v11" };
-  if (layout.kind === "typed-v11") encodeTypedTelemetryId(layout.sourceNamespace);
-  options.signal?.throwIfAborted();
-  const cursor = await target.prepare("SELECT sequence FROM analytics_source_cursors WHERE source_id=?")
-    .bind(sourceId).first<{ sequence: number }>();
-  const sequence = cursor?.sequence ?? 0;
-  int(sequence);
-  const change = (await readIngestionChanges(source, sourceId, sequence, 1))[0];
-  if (!change) return { state: "idle", sequence, recordsRead: 0 };
-  if (change.sequence !== sequence + 1) throw new Error("ANALYTICS_SOURCE_GAP");
-  const input = await lookupV11StorageSource(source, change);
-  if (input.disposition === "discard") {
-    await discard(target, change, input);
-    return { state: "discarded", sequence: change.sequence, recordsRead: 0 };
+  const keys = ["authorityEpoch","disposition","ownerDigest","publicAuthorityEpoch","reason","sourceId",
+    "terminalRevision","terminalSequence"];
+  if (Object.keys(input).sort().join() !== keys.sort().join() || !integer(input.terminalSequence, 1)
+      || !integer(input.terminalRevision, 1) || !integer(input.authorityEpoch, 1)
+      || !integer(input.publicAuthorityEpoch, 1) || !["owner-withdrawn","owner-erased"].includes(input.reason)) fail();
+  if (change.kind === "owner-withdrawn" || change.kind === "owner-erased") {
+    if (input.reason !== change.kind || input.terminalSequence !== change.sequence || input.terminalRevision !== change.revision
+        || input.authorityEpoch !== change.authorityEpoch || input.publicAuthorityEpoch !== change.publicAuthorityEpoch) fail();
+  } else if (input.terminalSequence <= change.sequence || input.terminalRevision <= change.revision
+      || input.authorityEpoch <= change.authorityEpoch || input.publicAuthorityEpoch <= change.publicAuthorityEpoch) fail();
+}
+
+async function validateSourceLayout(source: D1Database, layout: V11ProjectionSourceLayout): Promise<void> {
+  if (layout.kind === "typed-v11") {
+    let typedNamespace: string | null = null;
+    try {
+      typedNamespace = await source.prepare("SELECT source_namespace FROM typed_v11_admission_state WHERE id=1 AND runtime_contract_version=1")
+        .first<string>("source_namespace");
+    } catch { throw new Error("V11_PROJECTION_SOURCE_LAYOUT_CONFLICT"); }
+    if (typedNamespace !== layout.sourceNamespace) throw new Error("V11_PROJECTION_SOURCE_LAYOUT_CONFLICT");
+    return;
   }
   const typedTable = await source.prepare(
     "SELECT 1 AS present FROM sqlite_schema WHERE type='table' AND name='typed_v11_admission_state'",
   ).first();
-  const typedNamespace = typedTable ? await source.prepare(
-    "SELECT source_namespace FROM typed_v11_admission_state WHERE id=1",
-  ).first<string>("source_namespace") : null;
-  if (layout.kind === "typed-v11" ? typedNamespace !== layout.sourceNamespace : typedNamespace !== null) {
-    // Reject wrong layout/namespace before pinning any target work. In
-    // particular, a typed empty day must not appear to pass via an empty JSON
-    // table just because the deployment forgot to select its storage adapter.
+  if (typedTable) throw new Error("V11_PROJECTION_SOURCE_LAYOUT_CONFLICT");
+}
+
+interface PhysicalPagePlan {
+  revision: number; stepDigest: string; pageIndex: number; pageDigest: string;
+  pageJson: string; afterStream: string; afterOccurrence: string;
+  recordCount: number; valuesJson: string;
+}
+
+/** A group contains only full physical pages from one immutable day. The final
+ * partial/empty page and every day transition retain the existing one-page
+ * path. D1 executes the per-page statements sequentially in one transaction. */
+async function advancePhysicalPageGroup(options: {
+  source: D1Database; target: D1Database; sourceId: string; change: StorageChange;
+  input: Generation; layout: Extract<V11ProjectionSourceLayout, { kind: "typed-v11" }>;
+  work: Work; day: Day; identity: ReuseIdentity; priorValues: Values;
+  maxPages: number; deadlineMs: number; signal?: AbortSignal;
+}): Promise<V11DailyProjectionStep | null> {
+  const { source, target, sourceId, change, input, layout, work, day } = options;
+  if (work.day_records % PAGE_SIZE !== 0) throw new Error("V11_PROJECTION_STATE_INVALID");
+  if (day.expected_records - work.day_records < PAGE_SIZE) return null;
+  if (Date.now() >= options.deadlineMs - FINAL_PROOF_HEADROOM_MS) {
+    throw new V11ProjectionDeadlineExceededError();
+  }
+  let virtual = { ...work }, values = options.priorValues, bytes = 0;
+  const plans: PhysicalPagePlan[] = [];
+  for (let index = 0; index < options.maxPages; index += 1) {
+    if (index > 0 && Date.now() >= options.deadlineMs - FINAL_PROOF_HEADROOM_MS) break;
+    if (day.expected_records - virtual.day_records < PAGE_SIZE) break;
+    options.signal?.throwIfAborted();
+    const rows = await sourcePage(source, input, virtual, layout, day);
+    if (rows.length !== PAGE_SIZE) throw new Error("V11_PROJECTION_SOURCE_INCOMPLETE");
+    const pageValues = foldV11DailyProjectionValues(createV11DailyProjectionValues(virtual.next_day),
+      rows.map(row => JSON.parse(row.record_json) as TelemetryV11Record));
+    const pageJson = canonicalJson(pageValues);
+    const pageBytes = textEncoder.encode(pageJson).byteLength;
+    if (pageBytes > MAX_PAGE_VALUE_BYTES || bytes + pageBytes > MAX_PHYSICAL_PAGE_GROUP * MAX_PAGE_VALUE_BYTES) {
+      throw new Error("V11_PROJECTION_PAGE_LIMIT");
+    }
+    bytes += pageBytes;
+    const pageDigest = await sha256Hex(pageJson);
+    values = mergeV11DailyProjectionValues(values, pageValues);
+    const recordCount = virtual.day_records + rows.length;
+    if (recordCount > day.expected_records) throw new Error("V11_PROJECTION_SOURCE_INCOMPLETE");
+    const last = rows.at(-1)!;
+    const revision = virtual.revision + 1;
+    const stepDigest = await sha256Hex(canonicalJson({ eventDigest: change.eventDigest, revision,
+      day: virtual.next_day, afterStream: last.stream, afterOccurrence: last.occurrence_id,
+      recordCount, completeDay: false, valueKey: options.identity.value_key, pageDigest, values }));
+    const valuesJson = canonicalJson(values);
+    plans.push({ revision, stepDigest, pageIndex: virtual.day_records / PAGE_SIZE, pageDigest,
+      pageJson, afterStream: last.stream, afterOccurrence: last.occurrence_id, recordCount, valuesJson });
+    virtual = { ...virtual, revision, after_stream: last.stream, after_occurrence: last.occurrence_id,
+      day_records: recordCount, values_json: valuesJson };
+  }
+  if (plans.length === 0) return null;
+  options.signal?.throwIfAborted();
+  const current = await lookupV11StorageSource(source, change);
+  if (current.disposition === "discard") {
+    await discard(target, change, current);
+    return { state: "discarded", sequence: change.sequence, recordsRead: plans.length * PAGE_SIZE };
+  }
+  validateAdmission(sourceId, change, current);
+  if (canonicalJson(current) !== canonicalJson(input)) throw new Error("V11_PROJECTION_SOURCE_CONFLICT");
+  validateWork(work, current, layout);
+  if (Date.now() >= options.deadlineMs) throw new V11ProjectionDeadlineExceededError();
+  const statements: D1PreparedStatement[] = [];
+  for (const plan of plans) {
+    statements.push(
+      target.prepare(`INSERT INTO analytics_v11_projection_steps(source_id,event_digest,revision,step_digest)
+        VALUES(?,?,?,?)`).bind(sourceId, change.eventDigest, plan.revision, plan.stepDigest),
+      target.prepare(`INSERT INTO analytics_v11_value_pages
+        (value_key,page_index,source_id,owner_digest,producer_event,day,record_count,page_digest,values_json)
+        VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(value_key,page_index) DO UPDATE SET
+          record_count=excluded.record_count,page_digest=excluded.page_digest,values_json=excluded.values_json`)
+        .bind(options.identity.value_key, plan.pageIndex, sourceId, change.ownerDigest, change.eventDigest,
+          work.next_day, PAGE_SIZE, plan.pageDigest, plan.pageJson),
+      target.prepare(`UPDATE analytics_v11_projection_work SET
+        after_stream=?,after_occurrence=?,day_records=?,values_json=?,revision=revision+1
+        WHERE source_id=? AND event_digest=? AND revision=? AND phase='building' AND next_day=?`)
+        .bind(plan.afterStream, plan.afterOccurrence, plan.recordCount, plan.valuesJson,
+          sourceId, change.eventDigest, plan.revision - 1, work.next_day),
+    );
+  }
+  try {
+    const results = await target.batch(statements);
+    if (!Array.isArray(results) || results.length !== statements.length
+        || results.some(result => result?.success !== true)
+        || plans.some((_plan, index) => results[index * 3 + 2]?.meta?.changes !== 1)) {
+      throw new Error("V11_PROJECTION_STEP_UNACKNOWLEDGED");
+    }
+  } catch {
+    const receipts = await target.prepare(`SELECT revision,step_digest FROM analytics_v11_projection_steps
+      WHERE source_id=? AND event_digest=? AND revision BETWEEN ? AND ? ORDER BY revision LIMIT ?`)
+      .bind(sourceId, change.eventDigest, plans[0]!.revision, plans.at(-1)!.revision, plans.length + 1)
+      .all<{ revision: number; step_digest: string }>();
+    const exact = receipts.success === true && Array.isArray(receipts.results) && receipts.results.length === plans.length
+      && receipts.results.every((receipt, index) => receipt.revision === plans[index]!.revision
+        && receipt.step_digest === plans[index]!.stepDigest);
+    if (!exact) {
+      await applyAnalyticsChange(target, change, async () => { throw new Error("V11_PROJECTION_STEP_UNACKNOWLEDGED"); });
+      return { state: "applied", sequence: change.sequence, recordsRead: plans.length * PAGE_SIZE };
+    }
+  }
+  return { state: "building", sequence: change.sequence - 1, recordsRead: plans.length * PAGE_SIZE };
+}
+
+/** Internal format-dispatch seam. Its change and source proof must have been
+ * read from the current source immediately before this call. They are checked
+ * again after the record page and before any target write. */
+export async function advanceAdmittedV11DailyProjection(options: {
+  source: D1Database; target: D1Database; sourceId: string; change: StorageChange; input: SourceLookup;
+  signal?: AbortSignal; sourceLayout?: V11ProjectionSourceLayout; maxPhysicalPages?: number; deadlineMs?: number;
+}): Promise<V11DailyProjectionStep> {
+  const { source, target, sourceId } = options;
+  const change = Object.freeze(structuredClone(options.change)), input = Object.freeze(structuredClone(options.input));
+  validateAdmission(sourceId, change, input);
+  const maxPhysicalPages = options.maxPhysicalPages ?? 1;
+  const deadlineMs = options.deadlineMs ?? Number.MAX_SAFE_INTEGER;
+  if (!Number.isSafeInteger(maxPhysicalPages) || maxPhysicalPages < 1 || maxPhysicalPages > MAX_PHYSICAL_PAGE_GROUP
+      || !Number.isFinite(deadlineMs)) throw new Error("V11_PROJECTION_PAGE_LIMIT");
+  const requested = options.sourceLayout;
+  if (requested && requested.kind !== "typed-v11" && requested.kind !== "json-v11") {
     throw new Error("V11_PROJECTION_SOURCE_LAYOUT_CONFLICT");
   }
+  const layout: V11ProjectionSourceLayout = requested?.kind === "typed-v11"
+    ? { kind: "typed-v11", sourceNamespace: requested.sourceNamespace } : { kind: "json-v11" };
+  if (layout.kind === "typed-v11") encodeTypedTelemetryId(layout.sourceNamespace);
+  options.signal?.throwIfAborted();
+  if (input.disposition === "discard") {
+    await discard(target, change, input);
+    return { state: "discarded", sequence: change.sequence, recordsRead: 0 };
+  }
+  await validateSourceLayout(source, layout);
   const work = await initializeWork(target, change, input, layout);
   if (!work) return { state: "applied", sequence: change.sequence, recordsRead: 0 };
   if (work.phase === "ready") {
-    // The exact source/terminal check above precedes the final receipt. A revoke
-    // racing after it still changes source authority, blocking public serving.
+    const current = await lookupV11StorageSource(source, change);
+    if (current.disposition === "discard") {
+      await discard(target, change, current);
+      return { state: "discarded", sequence: change.sequence, recordsRead: 0 };
+    }
+    validateWork(work, current, layout);
     await applyAnalyticsChange(target, change, async db => [
       db.prepare(`UPDATE analytics_v11_projection_work SET phase='retiring'
         WHERE source_id=? AND event_digest=(SELECT event_digest FROM analytics_v11_owner_heads WHERE source_id=? AND owner_digest=?)
@@ -231,10 +398,13 @@ export async function advanceV11DailyProjection(options: {
   }
   const day = await sourceDay(source, input, work);
   const identity = await reuseIdentity(input, layout, day, work.next_day);
-  // Validate the saved method/counters even when a concurrent generation has
-  // since completed this same immutable day. Reuse cannot hide corrupt work.
   const priorValues = foldV11DailyProjectionValues(JSON.parse(work.values_json) as Values, []);
   const cached = await reusableValue(target, identity, day.expected_records);
+  if (!cached && layout.kind === "typed-v11" && maxPhysicalPages > 1) {
+    const grouped = await advancePhysicalPageGroup({ source, target, sourceId, change, input, layout, work, day, identity,
+      priorValues, maxPages: maxPhysicalPages, deadlineMs, signal: options.signal });
+    if (grouped) return grouped;
+  }
   const rows = cached ? [] : await sourcePage(source, input, work, layout, day);
   options.signal?.throwIfAborted();
   const pageValues = cached ? null : foldV11DailyProjectionValues(createV11DailyProjectionValues(work.next_day),
@@ -248,9 +418,6 @@ export async function advanceV11DailyProjection(options: {
   if (recordCount > day.expected_records || (completeDay && recordCount !== day.expected_records)) {
     throw new Error("V11_PROJECTION_SOURCE_INCOMPLETE");
   }
-  // Do not save more calculated content after a withdrawal was observed during
-  // the source read. The lookup proves an explicit discard; it never swaps in
-  // another mutable generation's records.
   const current = await lookupV11StorageSource(source, change);
   if (current.disposition === "discard") {
     await discard(target, change, current);
@@ -294,15 +461,33 @@ export async function advanceV11DailyProjection(options: {
       WHERE source_id=? AND event_digest=? AND revision=?`).bind(sourceId, change.eventDigest, work.revision + 1)
       .first<{ step_digest: string }>();
     if (receipt?.step_digest !== stepDigest) {
-      // A competing consumer can finalize, withdraw and physically retire this
-      // generation. Its exact final receipt is still durable; the old page must
-      // not be written after that cleanup.
       await applyAnalyticsChange(target, change, async () => { throw new Error("V11_PROJECTION_STEP_UNACKNOWLEDGED"); });
       return { state: "applied", sequence: change.sequence, recordsRead: rows.length };
     }
   }
-  return { state: "building", sequence, recordsRead: rows.length,
+  return { state: "building", sequence: change.sequence - 1, recordsRead: rows.length,
     ...(completeDay ? { completedDay: work.next_day } : {}) };
+}
+
+/** One bounded scheduled step, not a complete backfill per invocation. Source
+ * activation never calls or waits for this function. A receipt advances only
+ * after every day is complete or a newer authoritative withdrawal proves that
+ * the old event must be discarded. Retries do not accumulate a page twice.
+ */
+export async function advanceV11DailyProjection(options: {
+  source: D1Database; target: D1Database; sourceId: string; signal?: AbortSignal; sourceLayout?: V11ProjectionSourceLayout;
+}): Promise<V11DailyProjectionStep> {
+  const { source, target, sourceId } = options;
+  options.signal?.throwIfAborted();
+  const cursor = await target.prepare("SELECT sequence FROM analytics_source_cursors WHERE source_id=?")
+    .bind(sourceId).first<{ sequence: number }>();
+  const sequence = cursor?.sequence ?? 0;
+  int(sequence);
+  const change = (await readIngestionChanges(source, sourceId, sequence, 1))[0];
+  if (!change) return { state: "idle", sequence, recordsRead: 0 };
+  if (change.sequence !== sequence + 1) throw new Error("ANALYTICS_SOURCE_GAP");
+  const input = await lookupV11StorageSource(source, change);
+  return advanceAdmittedV11DailyProjection({...options,change,input});
 }
 
 /** Separate bounded physical cleanup. Withdrawing the head is atomic and fast;

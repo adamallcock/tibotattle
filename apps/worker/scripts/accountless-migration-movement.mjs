@@ -1,7 +1,7 @@
 /** Pure migration plans and local SQLite wrappers. No remote transport or maintenance authority. */
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { usesRangeRecordBatch } from './accountless-migration-range.mjs';
+import { usesRangeRecordBatch, balancedSqlExpression } from './accountless-migration-range.mjs';
 const hash = value => createHash('sha256').update(value).digest('hex');
 const quote = value => '"' + value.replaceAll('"', '""') + '"';
 const prefix = '_accountless_move_';
@@ -92,7 +92,7 @@ export function accountlessMovementSelection(current, { maxRows = 32 } = {}) {
   const { from, keys, integerKeys, d } = batchContext(current);
   return { sql: `SELECT ${keys.map((k,i) => `${integerKeys.includes(k) ? `CAST(${quote(k)} AS TEXT)` : quote(k)} AS _key${i}`).join(',')},(${rowBytes(d)}) AS _bytes FROM ${quote(from)} ORDER BY ${keys.map(quote).join(',')} LIMIT ${maxRows}`, params: [] };
 }
-function rowBytes(d) { return d.columns.map(c => `COALESCE(length(CAST(${quote(c)} AS BLOB)),0)`).join('+'); }
+function rowBytes(d) { return balancedSqlExpression(d.columns.map(c => `COALESCE(length(CAST(${quote(c)} AS BLOB)),0)`),'+'); }
 function batchContext(current) {
   check(['evacuate','restore'].includes(current.phase), 'PHASE_INVALID');
   const order = current.phase === 'evacuate' ? [...current.order].reverse() : current.order;
@@ -127,14 +127,14 @@ export function planAccountlessMovementBatch({ current, selectedRows, expectedRe
       else check(typeof value==='string' && Buffer.byteLength(value)<=4096,'KEY_INVALID');
       return value;
     });
-    const where=keys.map(k=>`${quote(k)} IS ${integerKeys.includes(k)?'CAST(? AS INTEGER)':'?'}`).join(' AND '),cols=d.columns.map(quote).join(',');
+    const where=balancedSqlExpression(keys.map(k=>`${quote(k)} IS ${integerKeys.includes(k)?'CAST(? AS INTEGER)':'?'}`),'AND'),cols=d.columns.map(quote).join(',');
     const moveKey=evacuating?current.cursor+rows+1:values[0];
     check(!evacuating || Number.isSafeInteger(moveKey),'COUNTER_EXHAUSTED');
     if(evacuating)add(`INSERT INTO ${quote(to)} (_move_key,_original_rowid,${cols}) SELECT CAST(? AS INTEGER),${d.hasRowid?'rowid':'NULL'},${cols} FROM ${quote(from)} WHERE ${where} AND (${rowBytes(d)})=?`,moveKey,...values,row._bytes);
     else add(`INSERT INTO ${quote(to)} (${d.hasRowid?'rowid,':''}${cols}) SELECT ${d.hasRowid?'_original_rowid,':''}${cols} FROM ${quote(from)} WHERE ${where} AND (${rowBytes(d)})=?`,...values,row._bytes);
     assertion('changes()=1');
-    const identity=d.hasRowid?'a.rowid IS b._original_rowid':d.keys.map(k=>`a.${quote(k)} IS b.${quote(k)}`).join(' AND ');
-    const equal=d.columns.map(c=>`a.${quote(c)} IS b.${quote(c)}`).join(' AND ');
+    const identity=d.hasRowid?'a.rowid IS b._original_rowid':balancedSqlExpression(d.keys.map(k=>`a.${quote(k)} IS b.${quote(k)}`),'AND');
+    const equal=balancedSqlExpression(d.columns.map(c=>`a.${quote(c)} IS b.${quote(c)}`),'AND');
     assertion(`EXISTS(SELECT 1 FROM ${quote(table)} a JOIN ${quote(prefix+table)} b ON ${identity} WHERE b._move_key=CAST(? AS INTEGER) AND ${equal})`,moveKey);
     add(`DELETE FROM ${quote(from)} WHERE ${where}`,...values); assertion('changes()=1');
     rows++;bytes+=row._bytes;
@@ -179,13 +179,13 @@ export function planAccountlessMovementTransition({sources,current,expectedRevis
   check(replayManifest.length===90&&hash(JSON.stringify(replayManifest))==='659563de82b31bbb8cd5b5488d29c46847dd16ff51904ecf7d159dad00f33d60','CANONICAL_OBJECTS_INVALID');
   next.canonicalObjects=null;
   if(old.phase==='evacuate') {
-    w.assertion(old.order.map(table=>`NOT EXISTS(SELECT 1 FROM ${quote(table)} LIMIT 1)`).join(' AND '));
+    w.assertion(balancedSqlExpression(old.order.map(table=>`NOT EXISTS(SELECT 1 FROM ${quote(table)} LIMIT 1)`),'AND'));
     w.statements.push({sql:sources[57].sql,params:[],compound:true});
     w.add('INSERT INTO d1_migrations(name) VALUES(?)',sources[57].name);
     for(const drop of drops)w.add(drop.sql);
     next.phase='restore';next.tableIndex=0;next.cursor=0;
   } else {
-    w.assertion(old.order.map(table=>`NOT EXISTS(SELECT 1 FROM ${quote(prefix+table)} LIMIT 1)`).join(' AND '));
+    w.assertion(balancedSqlExpression(old.order.map(table=>`NOT EXISTS(SELECT 1 FROM ${quote(prefix+table)} LIMIT 1)`),'AND'));
     for(const object of replayObjects)w.add(object.sql);
     for(const {name,seq} of old.sequences) {
       check(typeof seq==='string'&&/^(0|[1-9][0-9]*)$/.test(seq)&&BigInt(seq)<=9223372036854775807n,'SEQUENCE_INVALID');

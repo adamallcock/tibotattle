@@ -46,16 +46,20 @@ import {
   LOCAL_COMPANION_STATIC_FILES,
 } from "../apps/local/static-assets.js";
 import {
-  MACOS_ACCOUNTING_RUNTIME_FILES,
-  MACOS_IDENTITY_CORE_RUNTIME_FILES,
-  MACOS_QUOTA_ANALYSIS_RUNTIME_FILES,
-  MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES,
-  captureMacOSWorkspaceRuntimePackages,
-  collectMacOSRuntimeGraph,
-  collectMacOSWebModuleGraph,
+  RUNTIME_ACCOUNTING_FILES,
+  RUNTIME_IDENTITY_CORE_FILES,
+  RUNTIME_QUOTA_ANALYSIS_FILES,
+  RUNTIME_TELEMETRY_CONTRACT_FILES,
+  captureWorkspaceRuntimePackages,
+  collectRuntimeGraph,
+  collectWebModuleGraph,
   pinnedPackage,
   pinnedPackageTreeDigest,
-} from "./build-macos-app.js";
+} from "./lib/runtime-closure.mjs";
+import {
+  assertSurfaceProjection,
+  surfaceFiles,
+} from "./lib/surface-manifest.mjs";
 import {
   canonicalElectronBuilderPackageJsonBytes,
   ELECTRON_BUILDER_PACKAGE_PROFILES,
@@ -174,6 +178,7 @@ const NATIVE_PATH_MODULE = Object.freeze({
 });
 export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "config/electron-production-distribution.cjs",
+  "config/macos-bundle-version-plan.cjs",
   "config/deployment-endpoints.js",
   "native/macos-keychain/contract.js",
   "apps/electron/companion-supervisor.js",
@@ -202,6 +207,7 @@ export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "apps/electron/desktop-menu.js",
   "apps/electron/desktop-lifecycle.js",
   "apps/electron/desktop-macos-keychain.js",
+  "apps/electron/desktop-secure-storage-readiness.js",
   "apps/electron/desktop-native-migration.js",
   "apps/electron/desktop-native-migration-macos.js",
   "apps/electron/desktop-notification-coordinator.js",
@@ -261,6 +267,7 @@ export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "src/platform/windows-credential-mutex.js",
   "src/platform/windows-credential-operation-audit.js",
   "src/platform/windows-credential-audit-file-guard.js",
+  "src/platform/windows-protected-sqlite.js",
 ]);
 // Existing outputs are authenticated against their own complete manifest and
 // payload before replacement. Keep this stable identity subset separate from
@@ -323,10 +330,10 @@ const FORBIDDEN_SEGMENTS = new Set([
 ]);
 
 const WORKSPACE_RUNTIME_PACKAGE_FILES = Object.freeze({
-  "@app-usagemonitor/accounting": MACOS_ACCOUNTING_RUNTIME_FILES,
-  "@app-usagemonitor/identity-core": MACOS_IDENTITY_CORE_RUNTIME_FILES,
-  "@app-usagemonitor/quota-analysis": MACOS_QUOTA_ANALYSIS_RUNTIME_FILES,
-  "@app-usagemonitor/telemetry-contract": MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES,
+  "@app-usagemonitor/accounting": RUNTIME_ACCOUNTING_FILES,
+  "@app-usagemonitor/identity-core": RUNTIME_IDENTITY_CORE_FILES,
+  "@app-usagemonitor/quota-analysis": RUNTIME_QUOTA_ANALYSIS_FILES,
+  "@app-usagemonitor/telemetry-contract": RUNTIME_TELEMETRY_CONTRACT_FILES,
 });
 
 const SOURCE_FILE_KIND = "companion_source";
@@ -1736,8 +1743,12 @@ export async function buildElectronRuntime({
   ));
   let committed = false;
   try {
-    const runtimeGraph = await collectMacOSRuntimeGraph();
-    const webGraph = await collectMacOSWebModuleGraph();
+    const runtimeGraph = await collectRuntimeGraph({
+      surface: "Electron runtime",
+    });
+    const webGraph = await collectWebModuleGraph({
+      surface: "Electron runtime",
+    });
     const staged = [];
     const stagedRepositoryPaths = new Set();
     const stageUniqueRepositoryFile = async (options) => {
@@ -1760,11 +1771,23 @@ export async function buildElectronRuntime({
       });
       if (result) staged.push(result);
     }
+    const localCompanionFiles = Object.values(LOCAL_COMPANION_STATIC_FILES).map(
+      ({ file }) => `apps/web/public/${file}`,
+    );
+    assertSurfaceProjection(
+      "local-companion",
+      localCompanionFiles,
+      { label: "local companion static-file projection" },
+    );
     const webFiles = new Set([
       ...webGraph.relativeFiles,
-      ...Object.values(LOCAL_COMPANION_STATIC_FILES).map(({ file }) =>
-        `apps/web/public/${file}`),
+      ...surfaceFiles("electron-runtime"),
     ]);
+    assertSurfaceProjection(
+      "electron-runtime",
+      webFiles,
+      { label: "Electron runtime web-file projection" },
+    );
     for (const relativePath of [...webFiles].sort(comparePathBytes)) {
       const result = await stageUniqueRepositoryFile({
         repositoryRoot: REPOSITORY_ROOT,
@@ -1787,7 +1810,9 @@ export async function buildElectronRuntime({
       }
     }
 
-    const captures = await captureMacOSWorkspaceRuntimePackages();
+    const captures = await captureWorkspaceRuntimePackages({
+      surface: "Electron runtime",
+    });
     staged.push(...await stageCapturedWorkspacePackages({
       stagingRoot: temporaryRoot,
       captures,

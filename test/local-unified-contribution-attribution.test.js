@@ -1,4 +1,6 @@
 import test from "node:test";
+import { createHash } from "node:crypto";
+import { buildPlanAttributionIndex, planAttributionContextKey } from "@app-usagemonitor/quota-analysis";
 import assert from "node:assert/strict";
 import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,7 +9,7 @@ import {
   beginUnifiedIndexGeneration, createUnifiedIndexWriter, openLocalUnifiedIndex,
   LOCAL_UNIFIED_INDEX_PARSER_VERSION, outcomeName, reasoningEffortName,
 } from "../src/local-unified-index.js";
-import { createLocalUnifiedTelemetryV11Reader } from "../src/local-unified-contribution-attribution.js";
+import { compactQuotaPlanEvidence, createLocalUnifiedTelemetryV11Reader } from "../src/local-unified-contribution-attribution.js";
 import { createLocalUnifiedUsageAttributionReader } from "../src/local-unified-accounting-source.js";
 import { createTelemetryV1IndexReader } from "../src/contribution/telemetry-v1-chunks.js";
 import { createTelemetryV11Day } from "../src/contribution/index.js";
@@ -360,6 +362,39 @@ test("untrusted plan and marker extras cannot enter content-free prepared record
   assert.equal(JSON.stringify(result).includes("rawPath"), false);
 });
 
+test("private projection evidence is stable for equivalent markers and binds every effective attribution input", async (t) => {
+  const { file } = await writeFixture(t, { records: [
+    { at: 0, quotas: [{ plan: "pro" }] }, { at: 1_000, quotas: [{ plan: "pro" }] },
+  ] });
+  const markers = [marker(), marker({ capturedAt: stamp(500) })];
+  const readEvidence = (accountMarkers, selectedBinding = binding) => {
+    const { reader } = readFixture(t, file, { accountMarkers });
+    return reader.projectionEvidence({ binding: selectedBinding });
+  };
+  const evidence = readEvidence(markers);
+  assert.deepEqual(Object.keys(evidence).sort(), ["boundDays", "fingerprint"]);
+  assert.match(evidence.fingerprint, /^[0-9a-f]{64}$/u);
+  assert.deepEqual(evidence.boundDays, [DAY]);
+  assert.ok(Object.isFrozen(evidence) && Object.isFrozen(evidence.boundDays));
+  assert.deepEqual(readEvidence([...markers].reverse().map((value) => ({ ...value,
+    source: "active-account", rawPath: "/PRIVATE_SYNTHETIC_CONTENT",
+    accountScope: { ...value.accountScope, rawEmail: "PRIVATE_SYNTHETIC_CONTENT@example.test" },
+  }))), evidence);
+  assert.equal(readEvidence([...markers, marker({ observationBinding: null })]).fingerprint, evidence.fingerprint);
+  for (const changed of [
+    [marker({ accountScope: scope(8) }), markers[1]],
+    [marker({ receivedAt: stamp(1_500) }), markers[1]],
+    [marker({ observationBinding: { ...binding, enrollmentNamespace: "synthetic_enrollment_0002" } }), markers[1]],
+    [markers[0]],
+  ]) assert.notEqual(readEvidence(changed).fingerprint, evidence.fingerprint);
+  assert.deepEqual(readEvidence(markers, { ...binding, enrollmentNamespace: "synthetic_enrollment_0002" }).boundDays, []);
+  assert.deepEqual(readEvidence([marker({ accountScope: scope(7, "plus") })]), readEvidence([]),
+    "a marker contradicted by indexed quota cannot affect projection");
+  const { reader } = readFixture(t, file, { accountMarkers: markers });
+  assert.throws(() => reader.projectionEvidence({ binding: null }), { code: "local_telemetry_v11_invalid_binding" });
+  assert.doesNotMatch(JSON.stringify(evidence), /PRIVATE|scopeId|accountScope|enrollment|destination|account:v1/iu);
+});
+
 test("old, future, expired, conflicting, and reversed-clock markers do not acquire historical ownership", async (t) => {
   const { file } = await writeFixture(t, { records: [
     { at: 0, quotas: [{ plan: "pro" }] }, { at: 1_000, quotas: [{ plan: "pro" }] },
@@ -434,4 +469,92 @@ test("acquisition bounds fail closed without dropping records or mutating the in
   assert.throws(() => createLocalUnifiedTelemetryV11Reader(database, { ...codecs, limits: { dayRows: Infinity } }), {
     code: "local_telemetry_v11_invalid_limits",
   });
+});
+
+
+test("streamed quota anchors match the eager policy across runs, unknowns and equal-time contradictions", () => {
+  const hash = parts => createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+  const contextKey = planAttributionContextKey("openai_codex", "account-plan");
+  // Repeated positive anchors, ignored unknowns, tied same-plan different
+  // sources, paired slots, contradictions and subsequent era restarts.
+  const cases = [
+    ["unknown", "unknown", "unknown"],
+    ["pro", "pro", "unknown", "pro", "plus", "plus", "pro"],
+    ["unknown", ["pro", "unknown"], "pro", ["unknown", "plus"], "plus"],
+    ["pro", ["pro", "pro"], ["pro", "plus"], "pro", "pro", "unknown"],
+    [["pro", "pro"], "pro", "plus", "unknown", "plus"],
+  ];
+  for (const plans of cases) {
+    const rows = plans.flatMap((entry, time) => (Array.isArray(entry) ? entry : [entry])
+      .map((plan, tie) => ({ observed_at_ms: START + time, plan_type: plan, limit_id: "codex",
+        source_local: Buffer.alloc(32, tie + 1), source_offset: time + 1, source_ordinal: tie })));
+    const eager = rows.map(row => ({ contextKey, accountScopeId: null,
+      observedAtMs: row.observed_at_ms, planType: row.plan_type, planVariant: "unknown" }));
+    const expected = buildPlanAttributionIndex(eager);
+    const compact = compactQuotaPlanEvidence(rows.values(), [], 100);
+    const actual = buildPlanAttributionIndex(compact.observations);
+    assert.deepEqual(actual.eras, expected.eras);
+    assert.deepEqual(actual.conflicts, expected.conflicts);
+    assert.deepEqual(actual.contexts, expected.contexts);
+    for (const era of expected.eras) {
+      const anchors = rows.filter(row => row.observed_at_ms === era.firstObservedAtMs && row.plan_type === era.planType);
+      const digests = new Set(anchors.map(row => hash(["local-quota-record-v1", row.source_local.toString("hex"),
+        row.source_offset, row.source_ordinal, row.observed_at_ms])));
+      assert.equal(compact.seeds.get(JSON.stringify([contextKey, null, era.planType, era.firstObservedAtMs])),
+        digests.size === 1 ? [...digests][0] : null);
+    }
+  }
+});
+
+test("quota iteration retains two anchors beyond the former acquisition cap and refuses genuine transition overflow", () => {
+  let acquired = 0;
+  function* repeated() {
+    for (let i = 0; i < 1_000_001; i += 1) {
+      acquired += 1;
+      yield { observed_at_ms: START + i, plan_type: "pro", limit_id: "codex",
+        source_local: Buffer.alloc(32, 1), source_offset: i, source_ordinal: 0 };
+    }
+  }
+  const compact = compactQuotaPlanEvidence(repeated(), [], 2);
+  assert.equal(acquired, 1_000_001);
+  assert.equal(compact.observations.length, 2);
+  assert.equal(compact.seeds.size, 1);
+  assert.equal(compact.observations[0].observedAtMs, START);
+  assert.equal(compact.observations[1].observedAtMs, START + 1_000_000);
+  const alternating = ["pro", "plus", "pro"].map((plan, i) => ({observed_at_ms: START+i,
+    plan_type:plan,limit_id:"codex",source_local:Buffer.alloc(32,1),source_offset:i,source_ordinal:0}));
+  assert.throws(() => compactQuotaPlanEvidence(alternating, [], 2), {code:"local_telemetry_v11_quota_limit_exceeded"});
+});
+
+test("small anchor budget exports every quota record and preserves marker conflicts without eager corpus acquisition", async t => {
+  const records = Array.from({length:40}, (_, i) => ({at:i*1_000,quotas:[{plan:"pro"}]}));
+  // A contradictory observation invalidates the captured account bracket,
+  // including earlier records; streaming must inspect the entire bracket.
+  records.at(-1).quotas = [{plan:"plus"}];
+  const {file} = await writeFixture(t, {records});
+  const markers = [marker({receivedAt:stamp(39_000)})];
+  const reference = readFixture(t,file,{accountMarkers:markers});
+  const expected = project(reference.reader.readDay(DAY));
+  const database = openLocalUnifiedIndex(file,{readOnly:true});
+  t.after(() => database.close());
+  let streamed = 0;
+  const guarded = new Proxy(database, {get(target,key) {
+    if (key !== "prepare") { const value=Reflect.get(target,key,target); return typeof value === "function" ? value.bind(target) : value; }
+    return sql => {
+      const statement=target.prepare(sql);
+      const corpusQuota=sql.includes("FROM quota_occurrence q") && sql.includes("ORDER BY q.observed_at_ms") && !sql.includes("q.observed_at_ms >=");
+      if (!corpusQuota) return statement;
+      return new Proxy(statement,{get(inner,method) {
+        if(method==="all") return () => assert.fail("quota corpus must never be acquired eagerly");
+        if(method==="iterate") return (...args) => {streamed+=1; return inner.iterate(...args);};
+        const value=Reflect.get(inner,method,inner);return typeof value === "function" ? value.bind(inner):value;
+      }});
+    };
+  }});
+  const reader=createLocalUnifiedTelemetryV11Reader(guarded,{...codecs,accountMarkers:markers,limits:{quotaObservations:3}});
+  assert.deepEqual(reader.days(),[DAY]);
+  assert.deepEqual(project(reader.readDay(DAY)),expected);
+  assert.equal(reader.readDay(DAY).recordsByStream.quota.length,40);
+  assert.equal(streamed,2,"two streaming passes in one pinned snapshot, reused by later day reads");
+  assert.ok(stream(expected,"quota").every(row=>row.accountPlanAttribution.accountTrackId===null));
 });

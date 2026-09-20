@@ -1,0 +1,228 @@
+import { resolve } from 'node:path';
+import { createTimingFilesystem } from './inference-timing-filesystem.js';
+import { configureGuardedSqliteConnection } from './windows-protected-sqlite.js';
+import { randomBytes } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
+import { forEachRolloutLine } from './rollout-line-reader.js';
+
+
+const APPLICATION = 0x54425450;
+const CHUNK = 16 * 1024 * 1024;
+const safe = (ok, code) => { if (!ok) throw new Error(code); };
+
+function databaseIsClosed(database) {
+  if (database === undefined || database === null) return true;
+  try { return database.isOpen === false; } catch { return false; }
+}
+
+function setAttemptedBytes(error, attemptedBytes) {
+  try {
+    if (error !== null && (typeof error === 'object' || typeof error === 'function')) {
+      Object.defineProperty(error, 'attemptedBytes', {
+        configurable: true, enumerable: false, value: attemptedBytes, writable: true,
+      });
+    }
+  } catch { /* Preserve arbitrary thrown values and frozen errors. */ }
+}
+
+export async function openTimingStore(directory, { createParser, digest, METHOD, MAX_STATE_BYTES,
+  filesystem = createTimingFilesystem(),
+  databaseFactory = (file, options) => new DatabaseSync(file, options) }) {
+  const lease = await filesystem.prepare(directory);
+  const { file, created } = lease;
+  let db;
+  let dbClosed = false;
+  let leaseReleaseAttempted = false;
+  let leaseReleaseError = null;
+
+  // SQLite must be closed before its native file guards are released. If a
+  // close failure leaves the database open, retain the lease and let a caller
+  // retry close rather than allowing another owner to reach the file.
+  function closeOwnedResources(primaryError = null) {
+    let firstError = primaryError;
+    if (!dbClosed && db !== undefined) {
+      try {
+        db.close();
+        dbClosed = databaseIsClosed(db);
+        if (!dbClosed && firstError === null) firstError = new Error('database_close_incomplete');
+      } catch (error) {
+        if (firstError === null) firstError = error;
+        dbClosed = databaseIsClosed(db);
+      }
+    } else if (db === undefined) {
+      dbClosed = true;
+    }
+    if (dbClosed && !leaseReleaseAttempted) {
+      leaseReleaseAttempted = true;
+      try {
+        lease.release();
+      } catch (error) {
+        leaseReleaseError = error;
+        if (firstError === null) firstError = error;
+      }
+    }
+    if (firstError === null && leaseReleaseError !== null) firstError = leaseReleaseError;
+    return firstError;
+  }
+
+  try {
+    db = databaseFactory(file, { timeout: 100 });
+    if (lease.persistentJournal) configureGuardedSqliteConnection(db);
+    const version = db.prepare('PRAGMA user_version').get().user_version;
+    const application = db.prepare('PRAGMA application_id').get().application_id;
+    safe(created || (version === METHOD && application === APPLICATION), 'incompatible_database');
+    db.exec('PRAGMA busy_timeout=100; PRAGMA cache_size=-2048; PRAGMA synchronous=FULL; PRAGMA max_page_count=65536;');
+    if (created) {
+      db.exec(`BEGIN IMMEDIATE;
+        CREATE TABLE metadata (key BLOB NOT NULL CHECK(length(key)=32));
+        CREATE TABLE source (id INTEGER PRIMARY KEY, digest BLOB UNIQUE NOT NULL,
+          fingerprint TEXT NOT NULL, cursor INTEGER NOT NULL, snapshot TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(length(state)<=${MAX_STATE_BYTES}));
+        CREATE TABLE turn (key BLOB PRIMARY KEY, source INTEGER NOT NULL, offset INTEGER NOT NULL,
+          at INTEGER NOT NULL, model TEXT, effort TEXT, tokens INTEGER, reasoning INTEGER,
+          duration INTEGER, ttft INTEGER, responses INTEGER NOT NULL, covered INTEGER NOT NULL,
+          quality TEXT NOT NULL, sample_tokens INTEGER, sample_reasoning INTEGER,
+          sample_duration INTEGER, sample_responses INTEGER NOT NULL,
+          sample_total_responses INTEGER NOT NULL, sample_method TEXT) WITHOUT ROWID;
+        CREATE INDEX turn_time ON turn(at);
+        PRAGMA application_id=${APPLICATION}; PRAGMA user_version=${METHOD};`);
+      db.prepare('INSERT INTO metadata VALUES (?)').run(randomBytes(32));
+      db.exec('COMMIT');
+    }
+    const key = Buffer.from(db.prepare('SELECT key FROM metadata').get().key);
+    safe(key.length === 32, 'invalid_metadata');
+    return { db, key, file, createParser, digest, filesystem, method: METHOD, close: () => {
+      const error = closeOwnedResources();
+      if (error !== null) throw error;
+    } };
+  } catch (e) {
+    closeOwnedResources(e);
+    throw e;
+  }
+}
+
+const snapshot = s => ({ dev: s.dev, ino: s.ino, birth: s.birthtimeMs,
+  size: s.size, mtime: s.mtimeMs, ctime: s.ctimeMs });
+const sameFile = (a, b) => a.dev === b.dev && a.ino === b.ino && a.birth === b.birth;
+async function fingerprint(handle, cursor, key, digest) {
+  const first = Buffer.alloc(Math.min(cursor, 4096));
+  const tail = Buffer.alloc(Math.min(cursor, 4096));
+  if (first.length) {
+    safe((await handle.read(first, 0, first.length, 0)).bytesRead === first.length, 'source_changed');
+    safe((await handle.read(tail, 0, tail.length, cursor - tail.length)).bytesRead === tail.length, 'source_changed');
+  }
+  return digest(key, 'prefix-tail', Buffer.concat([first, tail]));
+}
+
+export async function ingestTimingFile(store, path, { maxBytes = CHUNK, signal, onReadLine } = {}) {
+  safe(Number.isSafeInteger(maxBytes) && maxBytes > 0 && maxBytes <= CHUNK, 'invalid_budget');
+  const { db, key, createParser, digest } = store;
+  const handle = await store.filesystem.openSource(path);
+  let attemptedBytes = 0;
+  let primaryError = null;
+  try {
+    const stat = await handle.stat();
+    const before = snapshot(stat);
+    const sourceKey = Buffer.from(digest(key, 'source-path', resolve(path)), 'hex');
+    const old = db.prepare('SELECT * FROM source WHERE digest=?').get(sourceKey);
+    const cursor = old?.cursor ?? 0;
+    if (old) {
+      const previous = JSON.parse(old.snapshot);
+      safe(sameFile(before, previous) && before.size >= previous.size, 'source_replaced');
+      if (before.size === previous.size) {
+        safe(before.mtime === previous.mtime && before.ctime === previous.ctime, 'source_rewritten');
+        if (cursor === before.size || previous.exhausted === true) return { bytes: 0, unchanged: true };
+      }
+      safe(await fingerprint(handle, cursor, key, digest) === old.fingerprint, 'source_rewritten');
+    }
+    if (signal?.aborted) throw new Error('cancelled');
+    const end = Math.min(before.size, cursor + maxBytes);
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      if (!old) db.prepare('INSERT INTO source(digest,fingerprint,cursor,snapshot,state) VALUES (?,?,?,?,?)')
+        .run(sourceKey, '', 0, JSON.stringify(before), '{}');
+      const source = old?.id ?? Number(db.prepare('SELECT last_insert_rowid() AS id').get().id);
+      const insert = db.prepare('INSERT OR IGNORE INTO turn VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+      const existing = db.prepare('SELECT at,model,effort,tokens,reasoning,duration,ttft,responses,covered,quality,sample_tokens,sample_reasoning,sample_duration,sample_responses,sample_total_responses,sample_method FROM turn WHERE key=?');
+      const conflict = db.prepare("UPDATE turn SET model=NULL,effort=NULL,duration=NULL,ttft=NULL,sample_tokens=NULL,sample_reasoning=NULL,sample_duration=NULL,sample_responses=0,sample_method=NULL,quality='conflicting_duplicate' WHERE key=?");
+      const saved = old ? JSON.parse(old.state) : null;
+      let discardLine = saved?.discardLine === true;
+      const parser = createParser(key, saved, t => {
+        const turnKey = Buffer.from(t.key, 'hex');
+        const prior = existing.get(turnKey);
+        if (prior) {
+          if (Object.keys(prior).some(k => prior[k] !== t[k])) conflict.run(turnKey);
+        } else insert.run(turnKey, source, t.offset, t.at, t.model, t.effort, t.tokens,
+          t.reasoning, t.duration, t.ttft, t.responses, t.covered, t.quality,
+          t.sample_tokens, t.sample_reasoning, t.sample_duration, t.sample_responses,
+          t.sample_total_responses, t.sample_method);
+      });
+      attemptedBytes = end - cursor;
+      const receipt = await forEachRolloutLine(handle, { start: cursor, end, signal,
+        onLine: (line, offset, partial) => {
+          if (discardLine) discardLine = false;
+          else parser.line(line, offset, partial);
+          onReadLine?.();
+        } });
+      if (receipt.aborted || signal?.aborted) throw new Error('cancelled');
+      const after = snapshot(await handle.stat());
+      const named = snapshot(await store.filesystem.namedStat(path, handle));
+      safe(sameFile(before, after) && sameFile(before, named)
+        && before.size === after.size && before.mtime === after.mtime
+        && before.ctime === after.ctime, 'source_changed');
+      let nextOffset = receipt.nextOffset;
+      // Persist only the fact that an oversized line is being discarded. This
+      // allows arbitrarily large content lines without retaining their bytes or
+      // repeatedly reading the same prefix. Resume parsing after its newline.
+      if (nextOffset === cursor && (discardLine || end - cursor > 64 * 1024)) {
+        if (!discardLine) parser.line(Buffer.alloc(0), end, true);
+        discardLine = true; nextOffset = end;
+      }
+      const state = parser.state(); state.discardLine = discardLine;
+      after.exhausted = end === before.size;
+      db.prepare('UPDATE source SET fingerprint=?,cursor=?,snapshot=?,state=? WHERE id=?')
+        .run(await fingerprint(handle, nextOffset, key, digest), nextOffset,
+          JSON.stringify(after), JSON.stringify(state), source);
+      if (state.blocked) db.prepare("UPDATE turn SET model=NULL,effort=NULL,duration=NULL,ttft=NULL,sample_tokens=NULL,sample_reasoning=NULL,sample_duration=NULL,sample_responses=0,sample_method=NULL,quality='blocked_source' WHERE source=?").run(source);
+      db.exec('COMMIT');
+      return { bytes: end - cursor, unchanged: false, cursor: nextOffset,
+        remaining: before.size - nextOffset, partial: receipt.partialDeferred };
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch { /* Preserve the operation failure. */ }
+      throw e;
+    }
+  } catch (e) {
+    primaryError = e;
+    setAttemptedBytes(e, attemptedBytes);
+    throw e;
+  } finally {
+    try {
+      await handle.close();
+    } catch (e) {
+      if (primaryError === null) {
+        setAttemptedBytes(e, attemptedBytes);
+        throw e;
+      }
+      // A cleanup failure must not replace the parser, read, or transaction
+      // error that the caller uses to account for attempted bytes.
+    }
+  }
+}
+
+export function readTimingRows(store) {
+  const rows = store.db.prepare(`SELECT at,model,effort,tokens,reasoning,duration,ttft,
+    responses,covered,quality,sample_tokens,sample_reasoning,sample_duration,
+    sample_responses,sample_total_responses,sample_method FROM turn ORDER BY at LIMIT 100001`).all();
+  safe(rows.length <= 100000, 'export_limit');
+  return rows;
+}
+
+export function timingReport(store) {
+  const rows = readTimingRows(store);
+  const diagnostics = {};
+  for (const row of store.db.prepare('SELECT state FROM source').iterate()) {
+    for (const [k, v] of Object.entries(JSON.parse(row.state).diagnostics ?? {}))
+      diagnostics[k] = (diagnostics[k] ?? 0) + v;
+  }
+  return { method: store.method, diagnostics, turns: rows };
+}

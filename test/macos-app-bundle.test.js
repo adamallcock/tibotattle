@@ -1490,7 +1490,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(destinationSource, /case community\b/u);
   assert.deepEqual(
     [...destinationSource.matchAll(/^\s*case (\w+)$/gmu)].map((match) => match[1]),
-    ["overview", "weekly", "trends", "method", "community"],
+    ["overview", "weekly", "trends", "performance", "method", "community"],
   );
   assert.match(source, /private final class NativeDashboardReportPane/u);
   // The chrome is an NSSplitViewController with a real sidebar item, so the
@@ -4612,61 +4612,71 @@ test("corrected 0.1.18 RC3 orders after signed RC1 and RC2 and before stable", (
 });
 
 test("macOS release metadata validates versions, production mode, and Keychain references", async () => {
+  // Historical native allocations stay fixed as the current Electron version advances.
+  const historicalDogfoodBundleVersion = resolveSignedMacOSBundleVersion(
+    "0.1.18", INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+  );
   assert.equal(normalizeMacOSBundleVersion(), DERIVED_MACOS_BUNDLE_VERSION);
-  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1025.2");
-  assert.equal(STABLE_SIGNED_BUNDLE_VERSION, "1026");
+  assert.equal(historicalDogfoodBundleVersion, "1025.2");
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.18", STABLE_RELEASE_CHANNEL), "1026");
+  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, null);
+  assert.throws(
+    () => readMacOSReleaseBuildConfiguration({}, INTERNAL_DOGFOOD_RELEASE_CHANNEL),
+    { code: "MACOS_SIGNED_BUNDLE_VERSION_UNPLANNED" },
+    "the current Electron release must not invent a native dogfood allocation",
+  );
   assert.equal(resolveSignedMacOSBundleVersion("0.1.17", INTERNAL_DOGFOOD_RELEASE_CHANNEL), "1023.7");
   assert.equal(resolveSignedMacOSBundleVersion("0.1.17", STABLE_RELEASE_CHANNEL), "1024");
   assert.equal(
-    normalizeMacOSBundleVersion(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    normalizeMacOSBundleVersion(historicalDogfoodBundleVersion),
     "1025.2",
   );
   assert.equal(
     compareMacOSBundleVersions(
-      INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION,
+      historicalDogfoodBundleVersion,
       "1022",
     ) > 0,
     true,
   );
   assert.equal(
-    compareMacOSBundleVersions("1023", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    compareMacOSBundleVersions("1023", historicalDogfoodBundleVersion),
     -1,
     "the corrective dogfood must be strictly newer than the retained RC2",
   );
   assert.equal(
-    compareMacOSBundleVersions("1023.1", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    compareMacOSBundleVersions("1023.1", historicalDogfoodBundleVersion),
     -1,
     "the corrective dogfood must be strictly newer than the installed RC3",
   );
   assert.equal(
-    compareMacOSBundleVersions("1023.2", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    compareMacOSBundleVersions("1023.2", historicalDogfoodBundleVersion),
     -1,
     "the final integrated dogfood must be strictly newer than startup-recovery RC4",
   );
   assert.equal(
-    compareMacOSBundleVersions("1023.3", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    compareMacOSBundleVersions("1023.3", historicalDogfoodBundleVersion),
     -1,
     "the accounting-deadline correction must be strictly newer than installed RC5",
   );
   assert.equal(
-    compareMacOSBundleVersions("1023.4", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    compareMacOSBundleVersions("1023.4", historicalDogfoodBundleVersion),
     -1,
     "the retired-checkpoint correction must be strictly newer than installed RC6",
   );
   assert.equal(
-    compareMacOSBundleVersions("1023.5", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    compareMacOSBundleVersions("1023.5", historicalDogfoodBundleVersion),
     -1,
     "the fitted-transition correction must be strictly newer than installed RC7",
   );
   assert.equal(
-    compareMacOSBundleVersions("1023.6", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    compareMacOSBundleVersions("1023.6", historicalDogfoodBundleVersion),
     -1,
     "the refresh-policy RC9 allocation must be strictly newer than RC8",
   );
   assert.equal(
     compareMacOSBundleVersions(
       STABLE_SIGNED_BUNDLE_VERSION,
-      INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION,
+      historicalDogfoodBundleVersion,
     ) > 0,
     true,
   );
@@ -4674,7 +4684,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     assert.throws(
       () => readMacOSReleaseBuildConfiguration({
         USAGE_MONITOR_BUNDLE_VERSION: unallocated,
-      }, INTERNAL_DOGFOOD_RELEASE_CHANNEL),
+      }, STABLE_RELEASE_CHANNEL),
       { code: "MACOS_BUNDLE_VERSION_MISMATCH" },
       "operator overrides cannot reuse an earlier RC, alias the allocation, or consume stable/preview builds",
     );
@@ -5511,6 +5521,14 @@ test("Login Item release CLI carries release identity to both validators and ref
 });
 
 test("signed updater replacement contract validates upgrade and rollback artifacts", async () => {
+  // This fixture exercises the retained native dogfood upgrade, not a new dogfood release.
+  const RELEASE_VERSION = "0.1.18";
+  const INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION = resolveSignedMacOSBundleVersion(
+    RELEASE_VERSION, INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+  );
+  const STABLE_SIGNED_BUNDLE_VERSION = resolveSignedMacOSBundleVersion(
+    RELEASE_VERSION, STABLE_RELEASE_CHANNEL,
+  );
   assert.equal(compareMacOSBundleVersions("1", "1.0.0"), 0);
   assert.equal(compareMacOSBundleVersions("1.2", "1.1.99"), 1);
   assert.equal(compareMacOSBundleVersions("2", "2.0.1"), -1);
@@ -7242,6 +7260,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "src/application/local-contribution-preparation.js",
     "src/application/local-export-set-verification.js",
     "src/application/local-prepared-contribution.js",
+    "src/application/work-usage.js",
     "src/contribution/telemetry-v11-chunks.js",
     "src/contribution/telemetry-v11-sync.js",
     "src/export/compression.js",
@@ -7251,6 +7270,9 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "src/platform/owner-only-prepared-contribution-storage.js",
     "src/platform/telemetry-v11-envelope.js",
     "src/local-unified-contribution-attribution.js",
+    "src/local-work-usage-source.js",
+    "src/platform/work-usage-projects.js",
+    "src/reporting/work-usage.js",
     "src/prepared-contribution-compatibility-internal.js",
   ]) {
     assert.equal(graph.relativeFiles.includes(ownedFile), true, ownedFile);
@@ -7279,9 +7301,16 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   // dependencies. The Electron bridge is inert without its preload; the
   // community entry stays website-only.
   assert.deepEqual(webModules.relativeFiles, [
+    "apps/web/public/allowance-tank-renderer.js",
+    "apps/web/public/allowance-tanks.js",
     "apps/web/public/app.js",
+    "apps/web/public/cache-reuse-matrix.js",
+    "apps/web/public/cache-reuse-metrics.js",
     "apps/web/public/community-data.js",
+    "apps/web/public/dashboard-report-preload.js",
+    "apps/web/public/dashboard-ui.js",
     "apps/web/public/data-client.js",
+    "apps/web/public/desktop-appearance.js",
     "apps/web/public/desktop-shell.js",
     "apps/web/public/electron-settings.js",
     "apps/web/public/electron-tray-popup.js",
@@ -7292,10 +7321,15 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/lib.js",
     "apps/web/public/localization.js",
     "apps/web/public/model-catalog.generated.js",
+    "apps/web/public/model-performance.js",
+    "apps/web/public/model-visuals.js",
     "apps/web/public/navigation.js",
+    "apps/web/public/reporting-period.js",
     "apps/web/public/telemetry-envelope.js",
     "apps/web/public/telemetry-shared.generated.js",
+    "apps/web/public/trends-horizon.js",
     "apps/web/public/ui-format.js",
+    "apps/web/public/work-usage-view.js",
   ]);
   assert.equal(
     webModules.relativeFiles.includes("apps/web/public/community.js"),
@@ -7325,9 +7359,18 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   ]);
   assert.deepEqual(runtimeAssets, [
     "apps/macos/reset-local-keychain.js",
+    "apps/web/public/allowance-tank-renderer.js",
+    "apps/web/public/allowance-tanks.js",
     "apps/web/public/app.js",
+    "apps/web/public/cache-reuse-matrix.css",
+    "apps/web/public/cache-reuse-matrix.js",
+    "apps/web/public/cache-reuse-metrics.js",
+    "apps/web/public/codex-color.svg",
     "apps/web/public/community-data.js",
+    "apps/web/public/dashboard-report-preload.js",
+    "apps/web/public/dashboard-ui.js",
     "apps/web/public/data-client.js",
+    "apps/web/public/desktop-appearance.js",
     "apps/web/public/desktop-shell.js",
     "apps/web/public/electron-settings.css",
     "apps/web/public/electron-settings.html",
@@ -7346,12 +7389,18 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/lib.js",
     "apps/web/public/localization.js",
     "apps/web/public/model-catalog.generated.js",
+    "apps/web/public/model-performance.css",
+    "apps/web/public/model-performance.js",
+    "apps/web/public/model-visuals.js",
     "apps/web/public/navigation.js",
+    "apps/web/public/reporting-period.js",
     "apps/web/public/styles.css",
     "apps/web/public/telemetry-envelope.js",
     "apps/web/public/telemetry-shared.generated.js",
     "apps/web/public/tibotattle-icon.png",
+    "apps/web/public/trends-horizon.js",
     "apps/web/public/ui-format.js",
+    "apps/web/public/work-usage-view.js",
   ]);
   assert.deepEqual(
     graph.relativeFiles.filter((path) =>
@@ -8039,10 +8088,14 @@ test("macOS Swift discovery rejects candidates in unknown top-level directories"
       join(sourceRoot, "FutureFeature", "Runtime", "Coordinator.swift"),
       "struct Coordinator {}\n",
     );
-    await assert.rejects(
-      collectMacOSSwiftSources(options),
-      /Unreviewed top-level macOS directory contains Swift source candidates/u,
-    );
+    await assert.rejects(collectMacOSSwiftSources(options), (error) => {
+      assert.equal(error.code, "MACOS_APP_BUILD_FAILED");
+      assert.match(
+        error.message,
+        /Unreviewed top-level macOS directory contains Swift source candidates/u,
+      );
+      return true;
+    });
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
@@ -8264,6 +8317,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       "config/product-brand.js",
       "scripts/build-macos-app.js",
       "scripts/lib/captured-utf8-source.mjs",
+      "scripts/lib/runtime-closure.mjs",
       "apps/macos/Assets/AppIcon.icns",
       "apps/macos/Assets/AppIcon.provenance.txt",
       ...swiftSources.relativeFiles,

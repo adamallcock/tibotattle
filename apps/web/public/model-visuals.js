@@ -36,6 +36,21 @@ export function modelUsagePresentation(modelId) {
   return presentation.theme ? presentation : { theme: "generic", className: "allowance-model-classic" };
 }
 
+// Keep known families in the same order as the shared model identity catalog.
+// Preserve exact IDs (including aliases) because these are filter values.
+export function compareModelPresentation(left, right) {
+  const rank = (id) => {
+    const aliases = { "gpt-5.5-codex": "gpt-5.5", "gpt-5.6-sol-wm": "gpt-5.6-sol" };
+    const index = MODEL_PRESENTATION_ORDER.indexOf(aliases[id] ?? id);
+    return index < 0
+      ? MODEL_PRESENTATION_ORDER.length + (modelUsagePresentation(id).theme === "generic" ? 1 : 0)
+      : index;
+  };
+  return rank(left) - rank(right)
+    || (right.startsWith(`${left}-`) ? -1 : left.startsWith(`${right}-`) ? 1 : 0)
+    || right.localeCompare(left, "en", { numeric: true });
+}
+
 export function modelThemeIcon(documentRef, theme) {
   const paths = {
     astra: "M12 3 14.5 9.5 21 12 14.5 14.5 12 21 9.5 14.5 3 12 9.5 9.5Z",
@@ -63,17 +78,4 @@ export function modelThemeIcon(documentRef, theme) {
   path.setAttribute("d", paths[theme]);
   icon.append(path);
   return icon;
-}
-
-export function compareModelPresentation(left, right) {
-  const rank = (id) => {
-    const aliases = { "gpt-5.5-codex": "gpt-5.5", "gpt-5.6-sol-wm": "gpt-5.6-sol" };
-    const index = MODEL_PRESENTATION_ORDER.indexOf(aliases[id] ?? id);
-    return index < 0
-      ? MODEL_PRESENTATION_ORDER.length + (modelUsagePresentation(id).theme === "generic" ? 1 : 0)
-      : index;
-  };
-  return rank(left) - rank(right)
-    || (right.startsWith(`${left}-`) ? -1 : left.startsWith(`${right}-`) ? 1 : 0)
-    || right.localeCompare(left, "en", { numeric: true });
 }

@@ -52,7 +52,18 @@ export async function prepareRetainedReferenceQualification({outputDirectory}={}
   if(references)check(JSON.stringify(db.prepare(referenceRead).all())===references,'REFERENCE_DRIFT');
   const expectedRows=db.prepare(readback).all();steps.push({name,sql,sqlSha256:sha(sql),sqlBytes:Buffer.byteLength(sql),readback,expectedRows,expectedFailure:Boolean(expectedError),expectedError,localDurationMs:Math.ceil(performance.now()-start)});
  }
- function groups(name,statements,readback=ledgerRead){let sql='',index=0;for(const statement of statements){check(Buffer.byteLength(statement)<64*1024,'FIXTURE_STATEMENT_BOUND');if(sql&&Buffer.byteLength(sql+statement)>64*1024){step(`${name}-${index++}`,sql,readback);sql='';}sql+=statement+'\n;\n';}if(sql)step(`${name}-${index}`,sql,readback);}
+ function groups(name,statements,readback=ledgerRead){
+  let sql='',index=0;
+  for(const statement of statements){
+   // Seed statements and the shared renderer already terminate their SQL.
+   // Adding another delimiter emits an empty statement rejected by D1.
+   const terminated=renderMovementSql([{sql:statement,params:[],compound:true}])+'\n';
+   check(Buffer.byteLength(terminated)<64*1024,'FIXTURE_STATEMENT_BOUND');
+   if(sql&&Buffer.byteLength(sql+terminated)>64*1024){step(`${name}-${index++}`,sql,readback);sql='';}
+   sql+=terminated;
+  }
+  if(sql)step(`${name}-${index}`,sql,readback);
+ }
  function insert(table,overrides){const info=db.prepare(`PRAGMA table_info(${q(table)})`).all();const fields=Object.fromEntries(info.filter(c=>c.notnull&&c.dflt_value===null).map(c=>[c.name,c.type==='BLOB'?null:['INTEGER','REAL'].includes(c.type)?0:'synthetic']));Object.assign(fields,overrides);return `INSERT INTO ${q(table)}(${Object.keys(fields).map(q).join(',')}) VALUES(${Object.entries(fields).map(([key,value])=>value===null&&info.find(c=>c.name===key).type==='BLOB'?'zeroblob(32)':literal(value)).join(',')});`;}
  try {
   step('create-ledger','CREATE TABLE d1_migrations(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE,applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL);');
@@ -76,7 +87,7 @@ export async function prepareRetainedReferenceQualification({outputDirectory}={}
   ]);
   for(let offset=0;offset<26000;offset+=2000){let sql='';for(const table of ['device_upload_authorizations','telemetry_v1_chunks']){
    const columns=db.prepare(`PRAGMA table_info(${q(table)})`).all().map(c=>c.name);
-   const expression=c=>c==='id'?"'synthetic-residual-'||n":['envelope_digest','chunk_digest'].includes(c)?"printf('%064x',n+100000)":c==='chunk_seq'?'n+1000':c==='device_upload_authorization_id'?"'synthetic-residual-'||n":c==='r2_key'?"'synthetic/residual/'||n":c==='record_count'?'1':c==='accepted_record_count'?'0':'b.'+q(c);
+   const expression=c=>c==='id'?(table==='device_upload_authorizations'?"'synthetic-residual-'||printf('%077d',n)":"'synthetic-residual-'||n"):['envelope_digest','chunk_digest'].includes(c)?"printf('%064x',n+100000)":c==='chunk_seq'?'n+1000':c==='device_upload_authorization_id'?"'synthetic-residual-'||printf('%077d',n)":c==='r2_key'?"'synthetic/residual/'||n||printf('%.*c',64,'x')":c==='record_count'?'1':c==='accepted_record_count'?'0':'b.'+q(c);
    sql+=`WITH RECURSIVE numbers(n) AS(SELECT ${offset+1} UNION ALL SELECT n+1 FROM numbers WHERE n<${offset+2000}) INSERT INTO ${q(table)}(${columns.map(q).join(',')}) SELECT ${columns.map(expression).join(',')} FROM numbers CROSS JOIN (SELECT * FROM ${q(table)} ORDER BY rowid LIMIT 1) b;\n`;
   }step(`residual-seed-${offset/2000}`,sql,'SELECT (SELECT COUNT(*) FROM device_upload_authorizations) AS authorizations,(SELECT COUNT(*) FROM telemetry_v1_chunks) AS chunks');}
   const recordColumns=db.prepare('PRAGMA table_info(telemetry_v1_records)').all().map(c=>c.name);
@@ -129,7 +140,7 @@ export async function prepareRetainedReferenceQualification({outputDirectory}={}
   const records=[];for(const [index,{sql,...entry}] of steps.entries()){const file=`sql/${String(index).padStart(3,'0')}.sql`;await writeFile(join(directory,file),sql,{mode:0o600,flag:'wx'});records.push({...entry,file});}
   const code=await Promise.all(RETAINED_QUALIFICATION_CODE_FILES.map(async file=>{const data=await readFile(join(root,file));const committed=spawnSync('git',['show',`${sourceRevision}:${posix.normalize('apps/worker/'+file)}`],{cwd:root,timeout:5000,maxBuffer:2*1024*1024});return{file,sha256:sha(data),matchesCommit:committed.status===0&&sha(committed.stdout)===sha(data)};}));
   const manifest={schemaVersion:'retained-reference-qualification-v1',mode:'plan-only',databaseName:RETAINED_QUALIFICATION_NAME,sourceRevision,code,codeCommitted:code.every(c=>c.matchesCommit),canonicalCommitted:sources.every(s=>s.matchesCommit),migrations:sources.map(({name,sha256,matchesCommit})=>({name,sha256,matchesCommit})),steps:records,
-   limits:{maxQueryBytes:256*1024,maxSteps:256,queryTimeoutMs:45000,totalTimeoutMs:600000},fixture:{addedAuthorizations:26000,addedV1Chunks:26000,addedRangeRecords:8192,rangeRecordPaddingBytes:1024,localOriginalValuesAndMovedRowidsPreserved:true,retainedTables:retained,movedTables:setup.current.order,referenceCounts},localOnlyPassed:true,hostedExecuted:false,productionReady:false,localDurationMs:Math.ceil(performance.now()-started),peakRssBytes:peakRss,
+   limits:{maxQueryBytes:256*1024,maxSteps:256,queryTimeoutMs:45000,totalTimeoutMs:600000},fixture:{addedAuthorizations:26000,addedV1Chunks:26000,syntheticAuthorizationIdLength:96,syntheticR2KeyPaddingBytes:64,addedRangeRecords:8192,rangeRecordPaddingBytes:1024,localOriginalValuesAndMovedRowidsPreserved:true,retainedTables:retained,movedTables:setup.current.order,referenceCounts},localOnlyPassed:true,hostedExecuted:false,productionReady:false,localDurationMs:Math.ceil(performance.now()-started),peakRssBytes:peakRss,
    proofBoundary:'Synthetic retained-reference SQL qualification only; no production traffic, production size/CPU, R2 lock activation or drain guarantee. Historical fixtures bypass then restore source triggers before installing every product mutation guard.'};
   const data=JSON.stringify(manifest,null,2)+'\n';await writeFile(join(directory,'manifest.json'),data,{mode:0o600,flag:'wx'});return{manifestSha256:sha(data),steps:records.length,maxQueryBytes:Math.max(...records.map(r=>r.sqlBytes)),localOnlyPassed:true,hostedExecuted:false};
  }finally{db.close();control.close();}

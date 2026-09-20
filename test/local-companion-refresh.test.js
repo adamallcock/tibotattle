@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   mkdir,
   mkdtemp,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -4628,4 +4629,115 @@ test("Claude usage shadow failure is contained and abort releases a non-cooperat
   const result = await running;
   assert.equal(result.rolloutRecordsWritten, 1);
   assert.equal(Object.hasOwn(result, "claudeShadow"), false);
+});
+
+
+test("interactive macOS QA uses a separate prospective account key and disposes each refresh loader", async (t) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "refresh-development-account-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const identity = join(root, "identity");
+  await mkdir(identity, { mode: 0o700 });
+  const accountFile = join(identity, "account-observation-development");
+  const exportFile = join(identity, "export-identity");
+  const secret = Buffer.alloc(32, 17);
+  await writeFile(accountFile, secret, { mode: 0o600 });
+  await writeFile(exportFile, `${Buffer.alloc(32, 18).toString("base64url")}\n`, { mode: 0o600 });
+  const environment = {
+    USAGE_MONITOR_TEST_LANE: "macos-electron-local-qa-v1",
+    USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+    USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: accountFile,
+    USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: exportFile,
+  };
+  let loader;
+  let failCollector = false;
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified", environment, platform: "darwin",
+    selectAccountObservationSecret: () => assert.fail("QA must never select production credentials"),
+    runCollector: async (options) => {
+      loader = options.loadAccountObservationSecret;
+      const loaded = await loader();
+      assert.deepEqual(loaded, secret);
+      loaded.fill(0);
+      if (failCollector) throw new Error("synthetic collector failure");
+      return { rolloutRecordsWritten: 0, filesDiscovered: 0,
+        refresh: { attempted: true, recordWritten: true, errorCode: null }, indexing: COMPLETE_INDEX };
+    },
+  });
+  await runner({ mode: "quick" });
+  await assert.rejects(loader(), { code: "account_observation_credential_unavailable" });
+  failCollector = true;
+  await assert.rejects(runner({ mode: "quick" }), /synthetic collector failure/u);
+  await assert.rejects(loader(), { code: "account_observation_credential_unavailable" });
+
+  for (const patch of [
+    { platform: "linux" },
+    { platform: "win32" },
+    { USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: undefined },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: `${accountFile}-absent` },
+    { USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: undefined },
+    { USAGE_MONITOR_CENTRAL_ORIGIN: "https://example.invalid" },
+    { USAGE_MONITOR_ACCOUNTLESS_MODE: "production-v1" },
+    { APP_USAGEMONITOR_EXPORT_SECRET: "synthetic-ambient-secret" },
+  ]) {
+    const closed = createLocalCollectorRefreshRunner({
+      accountingSourceMode: "unified", platform: patch.platform ?? "darwin",
+      environment: { ...environment, ...patch },
+      selectAccountObservationSecret: () => assert.fail("invalid QA cannot fall back to Keychain"),
+      runCollector: async (options) => {
+        assert.equal(options.loadAccountObservationSecret, null);
+        return { rolloutRecordsWritten: 0, filesDiscovered: 0,
+          refresh: { attempted: true, recordWritten: true, errorCode: null }, indexing: COMPLETE_INDEX };
+      },
+    });
+    await closed({ mode: "quick" });
+  }
+
+  let productionSelections = 0;
+  const productionLoader = async () => null;
+  const ordinary = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified", platform: "darwin",
+    environment: { ...environment, USAGE_MONITOR_TEST_LANE: undefined },
+    selectAccountObservationSecret: (options) => {
+      productionSelections += 1;
+      assert.deepEqual(options, {});
+      return { loadAccountObservationSecret: productionLoader };
+    },
+    runCollector: async (options) => {
+      assert.equal(options.loadAccountObservationSecret, productionLoader);
+      return { rolloutRecordsWritten: 0, filesDiscovered: 0,
+        refresh: { attempted: true, recordWritten: true, errorCode: null }, indexing: COMPLETE_INDEX };
+    },
+  });
+  await ordinary({ mode: "quick" });
+  assert.equal(productionSelections, 1);
+});
+
+test("quick polling omits reset details only after a successful startup read; detailed refreshes retain them", async () => {
+  const optionsSeen = [];
+  const classifiersSeen = [];
+  let succeeds = false;
+  const makeRunner = () => createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+    runCollector: async (options) => {
+      optionsSeen.push(options.excludeResetCreditDetails);
+      classifiersSeen.push(options.resetEventClassifier);
+      return { refresh: { attempted: true, recordWritten: succeeds, errorCode: succeeds ? null : "app_server_unavailable" } };
+    },
+    readAccountingCache: async () => null,
+  });
+  const runner = makeRunner();
+  await runner({ mode: "quick" });
+  succeeds = true;
+  await runner({ mode: "quick" });
+  await runner({ mode: "quick" });
+  await runner({ mode: "detailed" });
+  await makeRunner()({ mode: "quick" });
+  assert.deepEqual(optionsSeen, [false, false, true, false, false]);
+  assert.equal(classifiersSeen.slice(0, 4).every(
+    (classifier) => classifier === classifiersSeen[0],
+  ), true, "one volatile baseline is reused across a companion runner's polls");
+  assert.notEqual(classifiersSeen[4], classifiersSeen[0]);
+  assert.equal(typeof classifiersSeen[0].observe, "function");
+  assert.equal(typeof classifiersSeen[0].reset, "function");
 });

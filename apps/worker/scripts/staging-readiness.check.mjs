@@ -6,6 +6,13 @@ import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import {
+  ACCOUNTLESS_HISTORY_ATTRIBUTION_SCHEMA_PROBE_SQL,
+  ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL,
+  ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_SQL,
+  accountlessHistoryRetentionSchemaComplete,
+  V1_ACQUISITION_VOCABULARY_SCHEMA_SQL,
+  V1_ACQUISITION_VOCABULARY_SCHEMA_PROBE_SQL,
+  v1AcquisitionVocabularySchemaComplete,
   assessStagingConfiguration,
   ATTRIBUTION_SCHEMA_COLUMNS,
   ATTRIBUTION_SCHEMA_OBJECTS,
@@ -14,6 +21,7 @@ import {
   COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL,
   COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL,
   POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL,
+  PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL,
   CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL,
   CURRENT_SCALE_SCHEMA_PROBE_SQL,
   PUBLIC_SOURCE_SCHEMA_PROBE_SQL,
@@ -109,7 +117,7 @@ test("staging rejects missing, disabled, or unknown public analytics deployment 
 });
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
-  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-18), [
+  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-20), [
     "0043_analytical_input_fencing.sql",
     "0044_attribution_transport_staging.sql",
     "0045_attribution_domain_activation.sql",
@@ -128,6 +136,8 @@ test("migration inventory is exact and rejects missing or unreviewed files", () 
     "0058_accountless_upload_ownership.sql",
     "0059_accountless_upload_renewal.sql",
     "0060_public_contribution_sources.sql",
+    "0061_accountless_history_retention.sql",
+    "0062_v1_acquisition_vocabulary.sql",
   ]);
   const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
@@ -229,6 +239,8 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0057_accountless_enrollment_ledger.sql": "5cbf718449688bffc0fc5cf63d1de17351acb915f44459f1b32f3202c7378cd5",
     "0058_accountless_upload_ownership.sql": "b435fd92d41e7ce8067cc183d7ac153359a9c130a971cba2e1b8b8c1c9cab61b",
     "0059_accountless_upload_renewal.sql": "98afb99dd91e56a96960e6d99096e44c41eec0cd52d5a1e2969dea4ddee3d312",
+    "0061_accountless_history_retention.sql": "0d6d9d23390770aab5c2cb9b1bbb27586ed72b9921a420468efb05ee225435d6",
+    "0062_v1_acquisition_vocabulary.sql": "50efab3fcea61ea4a425c4a88c57364a35bd2095d8bb748acebf5bff228df66b",
   };
   const legacyDigests = {
     "0046_accountless_enrollment_ledger.sql": "aa8b6542a3d5fcadad24a5c7be59f2ed0b727e491c454705f37b9d00502a4b6c",
@@ -236,11 +248,12 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0048_accountless_upload_renewal.sql": "82297298f937489275756da93d9b116a7b83b280482000b0df51abd5c598d9b7",
   };
   const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
-  assert.equal(names.length, 60);
+  assert.equal(names.length, 62);
   assert.deepEqual(names.slice(40, 45), Object.keys(expectedDigests).slice(0, 5));
-  assert.deepEqual(names.slice(56, 59), Object.keys(expectedDigests).slice(-3));
+  assert.deepEqual(names.slice(56, 59), Object.keys(expectedDigests).slice(-5, -2));
+  assert.equal(names.at(-1), Object.keys(expectedDigests).at(-1));
   assert.deepEqual(names.map((name) => name.slice(0, 4)),
-    Array.from({ length: 60 }, (_, index) => String(index + 1).padStart(4, "0")));
+    Array.from({ length: 62 }, (_, index) => String(index + 1).padStart(4, "0")));
   // Unique numeric prefixes make staging, production and Wrangler ordering
   // agree; never admit two differently authored migrations numbered 0041.
   assert.deepEqual([...names].sort(), [...names].sort((a, b) => a.localeCompare(b, "en")));
@@ -2320,10 +2333,11 @@ test("current 0060 readiness binds the exact eligibility, bootstrap and withdraw
     database.exec("SAVEPOINT public_source_format;");
     for (const sql of unstable_splitSqlQuery(readFileSync(join(workerDirectory, "migrations", "0060_public_contribution_sources.sql"), "utf8"))) database.exec(sql);
     assert.deepEqual(Object.fromEntries(Object.entries(snapshot()).filter(([name, sql]) => before[name] !== sql)), PUBLIC_SOURCE_SCHEMA_SQL);
-    for (const probe of [CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL, CURRENT_SCALE_SCHEMA_PROBE_SQL, PUBLIC_SOURCE_SCHEMA_PROBE_SQL]) {
+    for (const probe of [PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL, CURRENT_SCALE_SCHEMA_PROBE_SQL, PUBLIC_SOURCE_SCHEMA_PROBE_SQL]) {
       assert.ok(Buffer.byteLength(probe) < 100_000, "separate bounded metadata queries");
     }
-    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.equal(attributionSchemaComplete(database.prepare(PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
     assert.equal(scaleSchemaComplete(database.prepare(CURRENT_SCALE_SCHEMA_PROBE_SQL).get()), true);
     assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), true);
     for (const [name, sql] of Object.entries(PUBLIC_SOURCE_SCHEMA_SQL)) {
@@ -2356,6 +2370,128 @@ test("current 0060 readiness binds the exact eligibility, bootstrap and withdraw
       database.exec(altered);
       assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), false, `remote altered ${name}`);
       database.exec("ROLLBACK TO altered_remote_source; RELEASE altered_remote_source;");
+    }
+  } finally { database.close(); }
+});
+
+test("current 0061 readiness binds the exact history-retention table and guards", async () => {
+  const { unstable_splitSqlQuery } = await import("wrangler");
+  const database = new DatabaseSync(":memory:");
+  try {
+    const snapshot = () => Object.fromEntries(database.prepare(
+      "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name",
+    ).all().map(({ name, sql }) => [name, sql]));
+    // Everything before the migration under test, named rather than counted so
+    // a later migration does not silently change what this applies.
+    for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0,
+      EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.indexOf("0061_accountless_history_retention.sql"))) {
+      const sql = readFileSync(join(workerDirectory, "migrations", name), "utf8");
+      database.exec(name.startsWith("0058_") ? `BEGIN;${sql}COMMIT;` : sql);
+    }
+    const before = snapshot();
+    assert.equal(accountlessHistoryRetentionSchemaComplete(
+      database.prepare(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL).get(),
+    ), false);
+    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+    for (const sql of unstable_splitSqlQuery(readFileSync(
+      join(workerDirectory, "migrations", "0061_accountless_history_retention.sql"), "utf8",
+    ))) database.exec(sql);
+    assert.deepEqual(
+      Object.fromEntries(Object.entries(snapshot()).filter(([name, sql]) => before[name] !== sql)),
+      ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_SQL,
+    );
+    assert.ok(Buffer.byteLength(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL) < 100_000);
+    assert.equal(accountlessHistoryRetentionSchemaComplete(
+      database.prepare(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL).get(),
+    ), true);
+    // 0061 completes its own point in the chain; the current contract needs 0062 too.
+    assert.equal(attributionSchemaComplete(
+      database.prepare(ACCOUNTLESS_HISTORY_ATTRIBUTION_SCHEMA_PROBE_SQL).get(),
+    ), true);
+    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+    for (const [name, sql] of Object.entries(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_SQL)) {
+      const type = /^CREATE (TABLE|TRIGGER)/u.exec(sql)[1];
+      database.exec(`SAVEPOINT altered_history_retention; DROP ${type} ${name};`);
+      assert.equal(accountlessHistoryRetentionSchemaComplete(
+        database.prepare(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL).get(),
+      ), false, `missing ${name}`);
+      const altered = type === "TRIGGER"
+        ? `${sql.slice(0, sql.indexOf("BEGIN"))}BEGIN SELECT 1; END`
+        : "CREATE TABLE accountless_public_history_retention(participant_id TEXT PRIMARY KEY)";
+      database.exec(altered);
+      assert.equal(accountlessHistoryRetentionSchemaComplete(
+        database.prepare(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL).get(),
+      ), false, `altered ${name}`);
+      assert.equal(attributionSchemaComplete(
+        database.prepare(ACCOUNTLESS_HISTORY_ATTRIBUTION_SCHEMA_PROBE_SQL).get(),
+      ), false);
+      database.exec("ROLLBACK TO altered_history_retention; RELEASE altered_history_retention;");
+    }
+    for (const row of [undefined, {}, { accountless_history_retention_objects: true },
+      { accountless_history_retention_objects: 0 }]) {
+      assert.equal(accountlessHistoryRetentionSchemaComplete(row), false);
+    }
+  } finally { database.close(); }
+});
+
+test("current 0062 readiness binds the exact widened part vocabularies", async () => {
+  const { unstable_splitSqlQuery } = await import("wrangler");
+  const database = new DatabaseSync(":memory:");
+  try {
+    const snapshot = () => Object.fromEntries(database.prepare(
+      "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name",
+    ).all().map(({ name, sql }) => [name, sql]));
+    // Everything before the migration under test, named rather than counted so
+    // a later migration does not silently change what this applies.
+    for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0,
+      EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.indexOf("0062_v1_acquisition_vocabulary.sql"))) {
+      const sql = readFileSync(join(workerDirectory, "migrations", name), "utf8");
+      database.exec(name.startsWith("0058_") ? `BEGIN;${sql}COMMIT;` : sql);
+    }
+    const before = snapshot();
+    assert.equal(v1AcquisitionVocabularySchemaComplete(
+      database.prepare(V1_ACQUISITION_VOCABULARY_SCHEMA_PROBE_SQL).get(),
+    ), false);
+    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+    for (const sql of unstable_splitSqlQuery(readFileSync(
+      join(workerDirectory, "migrations", "0062_v1_acquisition_vocabulary.sql"), "utf8",
+    ))) database.exec(sql);
+    // The two part tables are the only objects whose definition moves: the
+    // parents, the stage tables and both immutable triggers come back byte for
+    // byte, and nothing on `participants` is touched at all.
+    assert.deepEqual(
+      Object.fromEntries(Object.entries(snapshot()).filter(([name, sql]) => before[name] !== sql)),
+      V1_ACQUISITION_VOCABULARY_SCHEMA_SQL,
+    );
+    assert.deepEqual(Object.keys(before).sort(), Object.keys(snapshot()).sort());
+    assert.ok(Buffer.byteLength(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL) < 100_000,
+      "one bounded metadata query");
+    assert.equal(v1AcquisitionVocabularySchemaComplete(
+      database.prepare(V1_ACQUISITION_VOCABULARY_SCHEMA_PROBE_SQL).get(),
+    ), true);
+    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    // A part table that is missing, narrowed back, or widened further fails.
+    for (const [name, sql] of Object.entries(V1_ACQUISITION_VOCABULARY_SCHEMA_SQL)) {
+      database.exec(`SAVEPOINT altered_vocabulary; DROP TABLE ${name};`);
+      assert.equal(v1AcquisitionVocabularySchemaComplete(
+        database.prepare(V1_ACQUISITION_VOCABULARY_SCHEMA_PROBE_SQL).get(),
+      ), false, `missing ${name}`);
+      database.exec(before[name]);
+      assert.equal(v1AcquisitionVocabularySchemaComplete(
+        database.prepare(V1_ACQUISITION_VOCABULARY_SCHEMA_PROBE_SQL).get(),
+      ), false, `narrowed ${name}`);
+      assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+      database.exec("ROLLBACK TO altered_vocabulary; RELEASE altered_vocabulary;");
+      database.exec(`SAVEPOINT widened_vocabulary; DROP TABLE ${name};`);
+      database.exec(sql.replace("'endpoints'", "'endpoints', 'invented'"));
+      assert.equal(v1AcquisitionVocabularySchemaComplete(
+        database.prepare(V1_ACQUISITION_VOCABULARY_SCHEMA_PROBE_SQL).get(),
+      ), false, `widened ${name}`);
+      database.exec("ROLLBACK TO widened_vocabulary; RELEASE widened_vocabulary;");
+    }
+    for (const row of [undefined, {}, { v1_acquisition_vocabulary_objects: true },
+      { v1_acquisition_vocabulary_objects: 0 }]) {
+      assert.equal(v1AcquisitionVocabularySchemaComplete(row), false);
     }
   } finally { database.close(); }
 });

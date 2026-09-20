@@ -15,7 +15,7 @@
 
 namespace {
 
-constexpr char kContractVersion[] = "tibotattle-macos-keychain-v2";
+constexpr char kContractVersion[] = "tibotattle-macos-keychain-v3";
 constexpr char kBundleIdentifier[] = "com.usagemonitor.local";
 constexpr char kTeamIdentifier[] = "43RTH622SB";
 constexpr char kAccount[] = "installation";
@@ -47,6 +47,7 @@ enum class ItemStatus {
   kLocked,
   kDenied,
   kMigrationRequired,
+  kInvalid,
   kUnknown,
 };
 
@@ -96,6 +97,8 @@ const char* StatusName(ItemStatus status) {
       return "denied";
     case ItemStatus::kMigrationRequired:
       return "migration_required";
+    case ItemStatus::kInvalid:
+      return "invalid";
     case ItemStatus::kUnknown:
       return "unknown";
   }
@@ -144,6 +147,8 @@ ConditionalStatus ConditionalStatusFromItemStatus(ItemStatus status) {
       return ConditionalStatus::kDenied;
     case ItemStatus::kMigrationRequired:
       return ConditionalStatus::kMigrationRequired;
+    case ItemStatus::kInvalid:
+      return ConditionalStatus::kUnknown;
     case ItemStatus::kUnknown:
       return ConditionalStatus::kUnknown;
     case ItemStatus::kAbsent:
@@ -616,7 +621,7 @@ ReadResult ReadModernSecret(const CapabilitySpec& capability) {
     } else if (status == errSecSuccess) {
       if (item == nullptr || CFGetTypeID(item) != CFDataGetTypeID()
           || !DecodeStoredSecret(static_cast<CFDataRef>(item), &result.secret)) {
-        result.status = ItemStatus::kUnknown;
+        result.status = ItemStatus::kInvalid;
         SecureClear(result.secret.data(), result.secret.size());
       }
     }

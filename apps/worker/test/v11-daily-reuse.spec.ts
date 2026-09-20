@@ -7,12 +7,12 @@ import { lookupV11StorageSource } from "../src/v11-storage-journal";
 import { createV11DailyProjectionValues, foldV11DailyProjectionValues } from "../src/v11-daily-projection-values";
 import { sha256Hex } from "../src/crypto";
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from "../src/telemetry-v11-domain";
-import { advanceV11DailyProjection, readV11ProjectedOwnerDays, retireV11DailyProjectionPage } from "../src/v11-daily-projection";
+import { advanceAdmittedV11DailyProjection, advanceV11DailyProjection, readV11ProjectedOwnerDays, retireV11DailyProjectionPage } from "../src/v11-daily-projection";
 import { createV11DeviceFixture, makeV11Day, stageV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 
 const b = env as Env & { STORAGE_ANALYTICS_DB: D1Database; TEST_MIGRATIONS: D1Migration[];
   TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[]; TEST_ANALYTICS_MIGRATIONS: D1Migration[];
-  TEST_INGESTION_BRIDGE_MIGRATIONS: D1Migration[] };
+  TEST_INGESTION_BRIDGE_MIGRATIONS: D1Migration[]; TEST_TYPED_V11_ADMISSION_MIGRATIONS: D1Migration[] };
 const source = () => b.USAGE_MONITOR_DB, target = () => b.STORAGE_ANALYTICS_DB;
 const sourceId = "synthetic-v11-daily", today = () => new Date().toISOString().slice(0, 10);
 const step = (db = target()) => advanceV11DailyProjection({ source: source(), target: db, sourceId });
@@ -100,6 +100,64 @@ async function seedDifferentCache(value: Awaited<ReturnType<typeof active>>, ove
 }
 
 describe("immutable v11 daily value reuse", () => {
+  it("keeps an admitted page bound to its generation when a successor activates during the read", async () => {
+    const value = await active(203);
+    const admitted = await lookupV11StorageSource(source(), value.event);
+    if (admitted.disposition !== "generation") throw new Error("synthetic generation missing");
+    const replacement = await stageV11Day(source(), value.fixture, await makeV11Day(today(), {
+      usage: Array.from({ length: 204 }, (_, n) => v11UsageRecord(today(), "a", {
+        eventId: `event:v2:${n.toString(16).padStart(64, "0")}`,
+      })),
+    }));
+    let activated = false;
+    const wrap = (statement: D1PreparedStatement): D1PreparedStatement => new Proxy(statement, { get(current, key) {
+      if (key === "bind") return (...values: Parameters<D1PreparedStatement["bind"]>) => wrap(current.bind(...values));
+      if (key === "all") return async () => {
+        const rows = await current.all();
+        if (!activated) {
+          activated = true;
+          await successor(value, [{ day: replacement.day, manifestId: replacement.manifestId,
+            manifestDigest: replacement.manifestDigest }]);
+        }
+        return rows;
+      };
+      const member = Reflect.get(current, key); return typeof member === "function" ? member.bind(current) : member;
+    } });
+    const racingSource = new Proxy(source(), { get(database, key) {
+      if (key === "prepare") return (sql: string) => sql.startsWith("SELECT stream,occurrence_id,record_json FROM telemetry_v11_records")
+        ? wrap(database.prepare(sql)) : database.prepare(sql);
+      const member = Reflect.get(database, key); return typeof member === "function" ? member.bind(database) : member;
+    } });
+    expect(await advanceAdmittedV11DailyProjection({ source: racingSource, target: target(), sourceId,
+      change: value.event, input: admitted })).toMatchObject({ state: "building", sequence: 0, recordsRead: 200 });
+    expect(activated).toBe(true);
+    expect(await target().prepare(`SELECT generation_id,manifest_digest,day_records FROM analytics_v11_projection_work
+      WHERE source_id=? AND event_digest=?`).bind(sourceId,value.event.eventDigest).first()).toEqual({
+      generation_id: admitted.generationId, manifest_digest: admitted.manifestDigest, day_records: 200,
+    });
+    expect((await target().prepare(`SELECT DISTINCT producer_event FROM analytics_v11_value_pages
+      WHERE source_id=?`).bind(sourceId).all()).results).toEqual([{ producer_event: value.event.eventDigest }]);
+    expect((await readIngestionChanges(source(),sourceId,0)).map(event=>event.sequence)).toEqual([1,2]);
+    expect(await target().prepare("SELECT sequence FROM analytics_source_cursors WHERE source_id=?")
+      .bind(sourceId).first("sequence")).toBeNull();
+    await drain();
+    expect((await target().prepare(`SELECT sequence,event_digest FROM analytics_applied_events
+      WHERE source_id=? ORDER BY sequence`).bind(sourceId).all()).results).toEqual([
+      { sequence: 1, event_digest: value.event.eventDigest },
+      { sequence: 2, event_digest: (await readIngestionChanges(source(),sourceId,1,1))[0]!.eventDigest },
+    ]);
+    expect((await read(value.event.ownerDigest)).values[0]!.counts.usage).toBe(204);
+  });
+
+  it("does not reinterpret an uninitialized typed-v11 schema as JSON", async () => {
+    await active();
+    await applyD1Migrations(source(), b.TEST_TYPED_INGESTION_MIGRATIONS);
+    await applyD1Migrations(source(), b.TEST_TYPED_V11_ADMISSION_MIGRATIONS);
+    expect(await source().prepare("SELECT COUNT(*) n FROM typed_v11_admission_state").first<number>("n")).toBe(0);
+    await expect(step()).rejects.toThrow("V11_PROJECTION_SOURCE_LAYOUT_CONFLICT");
+    expect(await target().prepare("SELECT COUNT(*) n FROM analytics_applied_events").first<number>("n")).toBe(0);
+  });
+
   it("retains every cell of a 401-model multi-chunk day, resumes pages, reuses them and advances the next event",async()=>{
     const value=await active(401,yesterday(),true);
     expect(await step()).toMatchObject({state:'building',recordsRead:200});
