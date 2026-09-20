@@ -15,6 +15,7 @@ import {
   type CacheRetentionEvent,
   type CacheRetentionItem,
   type CacheRetentionRecordedRefusal,
+  type CacheRetentionBandRow,
 } from "./cache-retention-values";
 import { parseStoredRecordJson } from "./stored-record";
 import { loadV11SourcePin } from "./telemetry-v11-domain";
@@ -903,4 +904,45 @@ export async function advanceCacheRetentionDayLane(options: {
   // selection excludes. Reporting idle there would claim the lane is complete.
   return idle("progress", candidates.length < maxDays ? "complete" : "day_limit",
     candidates.length, spent());
+}
+
+/** The whole community's band rows, one per (owner, band), ready for
+ * `mergeCacheRetentionBands`.
+ *
+ * Every retained day is included. There is no window: a display window is not
+ * a retention policy, and a convenience-sized one here would quietly change
+ * the published figure every time the lane caught up. The lane's own
+ * retirement sweep is what bounds this table.
+ *
+ * One aggregate statement. The result is at most one row per owner per band,
+ * so it is bounded by the participant count and cannot grow with the corpus.
+ */
+export async function readCacheRetentionCommunityBands(input: {
+  target: D1Database; sourceId: string; methodVersion?: string;
+}): Promise<readonly CacheRetentionBandRow[]> {
+  const method = input.methodVersion ?? CACHE_RETENTION_METHOD.version;
+  if (typeof input.sourceId !== "string" || input.sourceId.length === 0
+    || typeof method !== "string" || method.length === 0) throw fail();
+  const rows = (await input.target.prepare(`SELECT owner_digest,band,
+      SUM(adjacencies) adjacencies, SUM(reused_more_than_half) reused_more_than_half,
+      SUM(matched_or_exceeded) matched_or_exceeded, SUM(unordered_ties) unordered_ties,
+      SUM(excluded_insufficient_evidence) excluded_insufficient_evidence,
+      SUM(excluded_context_contracted) excluded_context_contracted, SUM(sessions) sessions
+    FROM analytics_cache_retention_day_bands
+    WHERE source_id=? AND method_version=?
+    GROUP BY owner_digest,band ORDER BY owner_digest,band`)
+    .bind(input.sourceId, method)
+    .all<{ owner_digest: string; band: string; adjacencies: number; reused_more_than_half: number;
+      matched_or_exceeded: number; unordered_ties: number; excluded_insufficient_evidence: number;
+      excluded_context_contracted: number; sessions: number }>()).results;
+  return rows.map((row) => {
+    if (!CACHE_RETENTION_BAND_IDS.includes(row.band as CacheRetentionBandId)) throw fail();
+    return {
+      ownerDigest: row.owner_digest, band: row.band as CacheRetentionBandId,
+      adjacencies: row.adjacencies, reusedMoreThanHalf: row.reused_more_than_half,
+      matchedOrExceeded: row.matched_or_exceeded, unorderedTies: row.unordered_ties,
+      excludedInsufficientEvidence: row.excluded_insufficient_evidence,
+      excludedContextContracted: row.excluded_context_contracted, sessions: row.sessions,
+    };
+  });
 }

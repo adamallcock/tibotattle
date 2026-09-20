@@ -31,6 +31,7 @@ import {
  createCacheRetentionDayBuild,
  createCacheRetentionDaySourceBuild,
  readCacheRetentionCarryDays,
+ readCacheRetentionCommunityBands,
  readCacheRetentionDay,
  retireCacheRetentionDayPage,
  writeCacheRetentionDay,
@@ -394,6 +395,51 @@ describe('the prepared cache-retention store',()=>{
   expect(rows).toBe(20);
   expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_carry')
    .first<number>('n')).toBe(7);
+ });
+ it('pools every retained owner-day into one band row per owner',async()=>{
+  // The community reader: what the published curve is computed from. Two
+  // owners, two days each, so the aggregate has to fold across BOTH axes -- a
+  // reader that grouped by day, or dropped an owner, still returns rows.
+  const dayAggregate=(day:string)=>{
+   const shift=Date.parse(`${day}T00:00:00.000Z`)-DAY_MS;
+   return reduceCacheRetentionDay({day,carry:[],eventsRead:9,events:[
+    ev(shift,{cacheReadTokens:1_000}),ev(shift+1_000,{cacheReadTokens:1_000}),
+    ev(shift+3*3_600_000,{cacheReadTokens:100}),
+    ev(shift+3*3_600_000+1_000,{sessionDigest:SESSION_B,model:'gpt-5.6-terra',cacheReadTokens:1_000}),
+    ev(shift+3*3_600_000+2_000,{sessionDigest:SESSION_B,model:'gpt-5.6-terra',cacheReadTokens:900})]});
+  };
+  const second='9'.repeat(64),days=['2026-09-10','2026-09-11'];
+  for(const owner of [OWNER,second]){
+   for(const day of days){
+    await writeCacheRetentionDay({target:target(),key:key({ownerDigest:owner,day}),
+     carry:carryFor(day),aggregate:dayAggregate(day)});
+   }
+  }
+  const rows=await readCacheRetentionCommunityBands({target:target(),sourceId});
+  expect(new Set(rows.map(row=>row.ownerDigest))).toEqual(new Set([OWNER,second]));
+  // One row per (owner, band), never one per day: the count cannot grow with
+  // the corpus, which is what makes a single statement safe here.
+  expect(rows.length).toBeLessThanOrEqual(2*CACHE_RETENTION_BAND_IDS.length);
+  expect(rows.every(row=>CACHE_RETENTION_BAND_IDS.includes(row.band))).toBe(true);
+  const merged=mergeCacheRetentionBands(rows);
+  const alone=mergeCacheRetentionBands(rows.filter(row=>row.ownerDigest===OWNER));
+  let evidence=0;
+  for(const band of merged){
+   const single=alone.find(other=>other.band===band.band)!;
+   // Two identical owners, so every total doubles...
+   expect(band.adjacencies).toBe(single.adjacencies*2);
+   // ...and pooling equal contributors must not move the rate.
+   expect(band.reusedMoreThanHalfRate).toBe(single.reusedMoreThanHalfRate);
+   if(band.adjacencies>0){
+    evidence+=1;
+    expect(band.contributors).toBe(2);
+    expect(band.topContributorShare).toBeCloseTo(0.5,10);
+   }
+  }
+  expect(evidence).toBeGreaterThan(0);
+  // A method version nothing wrote returns nothing, rather than everything.
+  expect(await readCacheRetentionCommunityBands({target:target(),sourceId,
+   methodVersion:`${CACHE_RETENTION_METHOD.version}-successor`})).toEqual([]);
  });
  it('is replay-safe, and refuses different bytes under the same identity',async()=>{
   const carry=carryFor();
