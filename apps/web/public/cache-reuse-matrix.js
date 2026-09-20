@@ -116,7 +116,12 @@ export function cacheReuseMatrixCellScale(lights, { width, height, cell, gap }) 
 export function cacheReuseMatrixLights(summary, unit) {
   if (!count(summary?.comparableReturns) || !count(summary?.reusedMoreThanHalfReturns)
     || summary.reusedMoreThanHalfReturns > summary.comparableReturns || !amount(unit) || unit < 1
-    || Math.ceil(summary.comparableReturns / unit) > 900) return [];
+    // Tied to the unit chooser, which never asks for more lights than this.
+    // The two used to disagree -- the chooser targeted the box while this held
+    // the old 900 -- and a bucket over the cap returned NO lights, so the
+    // busiest bucket in the corpus rendered as if it had no evidence at all.
+    // An empty stack and an enormous one must never look the same.
+    || Math.ceil(summary.comparableReturns / unit) > CACHE_REUSE_MATRIX_STACK_CAPACITY) return [];
   const result = [];
   for (let index = 0; index < Math.ceil(summary.comparableReturns / unit); index += 1) {
     const start = index * unit;
@@ -260,7 +265,7 @@ export function createCacheReuseMatrix({
     const gap = narrow ? 1.8 : 2;
     const pitch = ch + gap;
     const narrowStackHeight = 96;
-    const gridWidth = columns * cw + (columns - 1) * gap;
+    const gridWidth = columns * baseCw + (columns - 1) * gap;
     const wholeRows = cacheReuseMatrixBuckets(impact) ?? rows;
     // The plot's height is FIXED rather than following the tallest bucket.
     // One unit across every bucket means the tall one has genuinely more
