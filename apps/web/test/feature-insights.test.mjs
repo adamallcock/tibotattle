@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cacheImpactFromHostedCurve, exampleCacheImpact, exampleModelSpeeds } from '../public/feature-insights.js';
+import { cacheImpactFromHostedCurve, cacheImpactFromHostedWindow, exampleCacheImpact, exampleModelSpeeds, hostedCacheWindow } from '../public/feature-insights.js';
 import { cacheReuseMatrixBuckets } from '../public/cache-reuse-matrix.js';
 import { normalizeModelPerformance } from '../public/model-performance.js';
 test('synthetic cohorts satisfy the real cache matrix contract and preserve volumes',()=>{
@@ -88,4 +88,43 @@ test('an inconsistent or foreign hosted curve is refused rather than clamped',()
  const overMatched=hostedCurve();
  overMatched.bands[0]={...overMatched.bands[0],matchedOrExceeded:100};
  assert.equal(cacheImpactFromHostedCurve(overMatched),null);
+});
+
+const hostedSeries=(overrides={})=>({measures:'consecutive_requests',
+ windows:[{window:'all',days:null,modelsTruncated:false,bands:hostedCurve().bands,
+  byModel:[{model:'gpt-5.6-sol',bands:hostedCurve().bands},
+   {model:'gpt-5.6-terra',bands:hostedCurve().bands}]},
+  {window:'week',days:7,modelsTruncated:false,
+   bands:hostedCurve().bands.map(b=>({...b,adjacencies:0,reusedMoreThanHalf:0,matchedOrExceeded:0})),
+   byModel:[]}],
+ ...overrides});
+
+test('a window is selected by name and never silently substituted',()=>{
+ const series=hostedSeries();
+ assert.equal(hostedCacheWindow(series,'all').window,'all');
+ // A span the series does not carry returns null rather than another span:
+ // a reader who chose 7 days must never be shown all time under that label.
+ assert.equal(hostedCacheWindow(series,'month'),null);
+ assert.equal(hostedCacheWindow({measures:'user_turns',windows:[]},'all'),null);
+ assert.equal(hostedCacheWindow(null,'all'),null);
+});
+
+test('per-model cohorts go through the same contract as the pooled figure',()=>{
+ const impact=cacheImpactFromHostedWindow(hostedCacheWindow(hostedSeries(),'all'));
+ assert.equal(cacheReuseMatrixBuckets(impact).length,10);
+ assert.deepEqual(impact.byModel.map(m=>m.model),['gpt-5.6-sol','gpt-5.6-terra']);
+ // A cohort has to satisfy the whole contract, not a weaker one.
+ for(const cohort of impact.byModel)assert.equal(cacheReuseMatrixBuckets(cohort).length,10);
+ // A cohort that cannot be mapped is dropped; the pooled curve is still true
+ // and the picker simply will not offer that model.
+ const broken=hostedSeries();
+ broken.windows[0].byModel[1].bands=broken.windows[0].byModel[1].bands.map(
+  (b,i)=>i===0?{...b,reusedMoreThanHalf:b.adjacencies+1}:b);
+ const partial=cacheImpactFromHostedWindow(hostedCacheWindow(broken,'all'));
+ assert.deepEqual(partial.byModel.map(m=>m.model),['gpt-5.6-sol']);
+ assert.ok(partial.comparableReturns>0);
+ // An empty window maps to zero rather than to null, so the caller can say
+ // "nothing measured in this period" instead of falling back to another.
+ const empty=cacheImpactFromHostedWindow(hostedCacheWindow(hostedSeries(),'week'));
+ assert.equal(empty.comparableReturns,0);
 });

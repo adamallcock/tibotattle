@@ -62,12 +62,47 @@ export function mountExampleInsights(doc,t,loadHostedCurve) {
   const demo=doc.querySelector('#cache-demo');
   const label=demo?.querySelector('.insight-demo-label');
   if(typeof loadHostedCurve==='function'){
-    Promise.resolve().then(loadHostedCurve).then(curve=>{
-      const measured=cacheImpactFromHostedCurve(curve);
+    Promise.resolve().then(loadHostedCurve).then(series=>{
+      // Default to every retained day: the long bands are where this curve
+      // answers anything, and they are the ones a short window empties.
+      let period='all';
+      const windowFor=id=>cacheImpactFromHostedWindow(hostedCacheWindow(series,id));
+      const measured=windowFor(period);
       if(!measured||measured.comparableReturns===0)return;
       impact=measured;
       if(label)label.textContent=t('site.features.insightMeasured');
       matrix.render({impact});
+      // The period control only appears once measured data is in hand. On the
+      // illustration it would be a filter over nothing.
+      const chooser=doc.createElement('div');
+      chooser.className='insight-demo-periods';
+      const group=doc.createElement('div');
+      group.setAttribute('role','group');
+      group.setAttribute('aria-label',t('accounting.cacheContinuity.matrix.periodLabel'));
+      const note=doc.createElement('p');
+      note.className='insight-demo-period-note';
+      note.hidden=true;
+      const buttons=['day','week','month','all'].map(id=>{
+        const button=doc.createElement('button');
+        button.type='button';
+        button.textContent=t(`accounting.cacheContinuity.matrix.period.${id}`);
+        button.setAttribute('aria-pressed',String(id===period));
+        button.addEventListener('click',()=>{
+          const next=windowFor(id);
+          period=id;
+          for(const other of buttons)other.setAttribute('aria-pressed',String(other===button));
+          // A window with no evidence says so. Falling back to another span
+          // would show a reader "all time" under the label they did not pick.
+          const empty=!next||next.comparableReturns===0;
+          note.hidden=!empty;
+          note.textContent=empty?t('accounting.cacheContinuity.matrix.periodEmpty'):'';
+          if(!empty){impact=next;matrix.render({impact});}
+        });
+        group.append(button);
+        return button;
+      });
+      chooser.append(group,note);
+      demo?.insertBefore(chooser,demo.querySelector('[data-cache-demo]'));
     }).catch(()=>{});
   }
   const win=doc.defaultView;
@@ -129,4 +164,41 @@ export function cacheImpactFromHostedCurve(curve) {
   }
   return { ...totals, byOutcomeBucket, model: "", coverageStatus: "incomplete",
     estimatedPremiumUsd: null, status: "available", byModel: [] };
+}
+
+
+/**
+ * Map one window of the hosted series onto the matrix's impact contract,
+ * pooled figure and per-model cuts together.
+ *
+ * The model cohorts go through the SAME mapper as the pooled figure, so a
+ * cohort cannot satisfy a weaker contract than the whole. A cohort that fails
+ * is dropped rather than the window being refused: the pooled curve is still
+ * true, and the model picker simply will not offer that model.
+ */
+export function cacheImpactFromHostedWindow(window) {
+  if (!window || typeof window !== "object") return null;
+  const pooled = cacheImpactFromHostedCurve({ measures: "consecutive_requests", bands: window.bands });
+  if (!pooled) return null;
+  const byModel = (Array.isArray(window.byModel) ? window.byModel : [])
+    .map((cohort) => {
+      if (!cohort || typeof cohort.model !== "string" || cohort.model.length === 0) return null;
+      const mapped = cacheImpactFromHostedCurve({ measures: "consecutive_requests", bands: cohort.bands });
+      return mapped && mapped.comparableReturns > 0 ? { ...mapped, model: cohort.model } : null;
+    })
+    .filter(Boolean);
+  return { ...pooled, byModel };
+}
+
+/**
+ * Pick a window out of the hosted series by its id.
+ *
+ * Returns null when the series does not carry that window, rather than
+ * quietly falling back to another span -- a reader who chose "7 days" must
+ * never be shown "all time" under that label.
+ */
+export function hostedCacheWindow(series, windowId) {
+  if (!series || !Array.isArray(series.windows)) return null;
+  if (series.measures !== "consecutive_requests") return null;
+  return series.windows.find((window) => window && window.window === windowId) ?? null;
 }
