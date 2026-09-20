@@ -1427,6 +1427,37 @@ export const WEB_MESSAGES = Object.freeze({
   "community.daily.day": ["Day", "日期", "Día"],
   "community.daily.quotaObservations": ["Quota observations", "额度观测", "Observaciones de cuota"],
   "community.daily.contributingDevices": ["Contributing devices", "贡献设备", "Dispositivos contribuyentes"],
+  // The community cache-retention lane. The two rate columns keep the names
+  // the lane publishes rather than a friendlier reading of them: the site
+  // presents the published claim and does not redefine it. The measurement
+  // caveats below are part of the claim, not decoration — the gap basis
+  // overstates a real idle pause, so the short bands must not be read as an
+  // answer to "how long can I wait".
+  "community.cacheRetention.summary": ["Cache retention by pause length", "按暂停时长划分的缓存保留情况", "Retención de caché por duración de la pausa"],
+  "community.cacheRetention.caption": ["Cached input kept across pauses between consecutive requests", "连续请求之间的暂停期内保留的缓存输入", "Entrada en caché conservada durante las pausas entre solicitudes consecutivas"],
+  "community.cacheRetention.measuresCopy": ["Each row groups the gaps between two consecutive requests, not the pauses between your turns. A single turn can send several requests, so a row does not describe how you work.", "每一行汇总的是两次连续请求之间的间隔，而不是你两个轮次之间的停顿。一个轮次可能发送多次请求，因此某一行并不能描述你的工作方式。", "Cada fila agrupa los intervalos entre dos solicitudes consecutivas, no las pausas entre tus turnos. Un solo turno puede enviar varias solicitudes, así que una fila no describe cómo trabajas."],
+  "community.cacheRetention.gapBasisCaveat": ["Every gap is measured from the end of one response to the end of the next, so it overstates the real idle pause by the later request\u2019s own duration. That error grows with response time, so the bands under ten minutes do not answer how long you can wait; the bands from ten minutes up do.", "每个间隔都是从上一次响应结束测量到下一次响应结束，因此会把真实的空闲停顿高估后一次请求本身的耗时。该误差随响应时间增大，所以十分钟以下的区间无法回答你能等多久；十分钟及以上的区间可以。", "Cada intervalo se mide desde el final de una respuesta hasta el final de la siguiente, por lo que sobrestima la pausa real en la duración de la solicitud posterior. Ese error crece con el tiempo de respuesta, así que las bandas de menos de diez minutos no responden cuánto puedes esperar; las de diez minutos en adelante sí."],
+  "community.cacheRetention.noEvidenceNote": ["A dash means no gap of that length was measured. It is not a reuse rate of 0%.", "短横线表示未测到该长度的间隔，并不表示复用率为 0%。", "Un guion significa que no se midió ningún intervalo de esa duración. No es una tasa de reutilización del 0 %."],
+  "community.cacheRetention.concentrationNote": ["Sources counts the distinct participants behind a band, and Largest source is the biggest single share of it. A band with few sources, or one dominant source, describes those contributors rather than the community.", "“来源数”表示某个区间背后的不同参与者数量，“最大来源占比”表示其中单个来源所占的最大份额。来源很少或存在一个主导来源的区间，描述的是这些贡献者，而不是整个社区。", "«Fuentes» cuenta los participantes distintos detrás de una banda y «Fuente mayor» es la mayor porción individual. Una banda con pocas fuentes, o con una dominante, describe a esos contribuyentes y no a la comunidad."],
+  "community.cacheRetention.excludedNote": ["Excluded before these rates: {insufficient} without enough evidence, {contracted} where the context contracted, and {ties} unordered ties.", "在计算这些比率前已排除：{insufficient} 个证据不足，{contracted} 个上下文收缩，{ties} 个顺序无法判定。", "Excluidos antes de estas tasas: {insufficient} sin evidencia suficiente, {contracted} con contexto contraído y {ties} empates sin orden."],
+  "community.cacheRetention.column.pause": ["Pause between requests", "请求之间的暂停", "Pausa entre solicitudes"],
+  "community.cacheRetention.column.reusedMoreThanHalf": ["Reused over half", "复用超过一半", "Reutilizó más de la mitad"],
+  "community.cacheRetention.columnNote": ["Both columns compare against the PREVIOUS request's cached amount: over half means more than half of it was still cached, and all of it means at least as much was. The second is a subset of the first.", "两列均与上一次请求的缓存量比较：“复用超过一半”表示其中超过一半仍被缓存，“全部复用”表示缓存量不少于上一次。后者是前者的子集。", "Ambas columnas se comparan con la cantidad en caché de la solicitud ANTERIOR: «más de la mitad» significa que más de la mitad seguía en caché y «todo» que había al menos la misma cantidad. La segunda es un subconjunto de la primera."],
+  "community.cacheRetention.column.matchedOrExceeded": ["Reused all of it", "全部复用", "Reutilizó todo"],
+  "community.cacheRetention.column.adjacencies": ["Gaps measured", "已测间隔数", "Intervalos medidos"],
+  "community.cacheRetention.column.sessions": ["Sessions", "会话数", "Sesiones"],
+  "community.cacheRetention.column.contributors": ["Sources", "来源数", "Fuentes"],
+  "community.cacheRetention.column.topContributorShare": ["Largest source", "最大来源占比", "Fuente mayor"],
+  "community.cacheRetention.band.underOneMinute": ["Under 1 minute", "1 分钟以内", "Menos de 1 minuto"],
+  "community.cacheRetention.band.oneToTwoMinutes": ["1\u20132 minutes", "1\u20132 分钟", "1\u20132 minutos"],
+  "community.cacheRetention.band.twoToFiveMinutes": ["2\u20135 minutes", "2\u20135 分钟", "2\u20135 minutos"],
+  "community.cacheRetention.band.fiveToTenMinutes": ["5\u201310 minutes", "5\u201310 分钟", "5\u201310 minutos"],
+  "community.cacheRetention.band.tenToThirtyMinutes": ["10\u201330 minutes", "10\u201330 分钟", "10\u201330 minutos"],
+  "community.cacheRetention.band.thirtyMinutesToOneHour": ["30 minutes\u20131 hour", "30 分钟\u20131 小时", "30 minutos\u20131 hora"],
+  "community.cacheRetention.band.oneToTwoHours": ["1\u20132 hours", "1\u20132 小时", "1\u20132 horas"],
+  "community.cacheRetention.band.twoToSixHours": ["2\u20136 hours", "2\u20136 小时", "2\u20136 horas"],
+  "community.cacheRetention.band.sixToTwentyFourHours": ["6\u201324 hours", "6\u201324 小时", "6\u201324 horas"],
+  "community.cacheRetention.band.overTwentyFourHours": ["24 hours to 7 days", "24 小时至 7 天", "De 24 horas a 7 días"],
   // The community allowance series. Aggregate dollar-equivalent estimates and
   // participant counts are owner-approved for publication; the participant
   // count is part of the claim and always rendered as visible copy.
