@@ -10,6 +10,7 @@ import {
   ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
   ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
   ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+  runTelemetryV11Sync,
 } from "../src/contribution/index.js";
 import { beginUnifiedIndexGeneration, openLocalUnifiedIndex } from "../src/local-unified-index.js";
 import {
@@ -269,6 +270,143 @@ test("marker presence changes revalidate an interrupted public sync without chan
     assert.ok(leasedRoots.every((root) => root.every((byte) => byte === 0)));
     assert.equal(await readFile(journalFile, "utf8"), "null");
   });
+});
+
+test("unchanged nonempty marker/root evidence resumes budgeted prefix validation across fresh public runner passes", async (t) => {
+  const { options, service } = await fixture(t, { plans: ["pro", "pro"], fromDay: "2026-06-01", throughDay: "2026-08-01" });
+  let rootValue = 9;
+  let clock = start;
+  const roots = [];
+  const selected = { ...options, now: () => clock,
+    readAccountMarkers: async () => [attributionFixtureMarker()],
+    loadExistingAccountObservationSecret: async () => {
+      const value = Buffer.alloc(32, rootValue); roots.push(value); return value;
+    },
+  };
+  const first = await runIncrementalContributionSyncOnce({ ...selected, maximumChunks: 1,
+    maximumDurationMilliseconds: 300_000 });
+  assert.equal(first.status, "partial");
+  const file = `${options.indexFile}.telemetry-v11-progress.json`;
+  const initial = JSON.parse(await readFile(file, "utf8"));
+  assert.equal(initial.days.length, 61);
+  assert.equal(initial.validatedDays, 61);
+  assert.equal(service.active(), null);
+  // A real root change invalidates the old projection once. Its 61-day prefix
+  // now takes >60 logical seconds to validate, exceeding every 20s pass below.
+  // Unchanged nonempty markers must not reset each subsequent checkpoint.
+  rootValue = 10;
+  let previous = initial;
+  let result;
+  let passes = 0;
+  for (; passes < 6; passes += 1) {
+    const reads = [];
+    result = await runIncrementalContributionSyncOnce({ ...selected, maximumDurationMilliseconds: 20_000,
+      runV11Sync: (value) => runTelemetryV11Sync({ ...value,
+        readDay: async (...args) => {
+          reads.push(args[0]); clock += 1_000;
+          return value.readDay(...args);
+        },
+      }),
+    });
+    assert.equal(reads[0], previous.days[passes === 0 ? 0 : previous.validatedDays].day);
+    assert.ok(roots.every((root) => root.every((byte) => byte === 0)), "each completed pass clears its root lease");
+    if (result.status === "complete") break;
+    assert.equal(result.status, "partial");
+    const saved = JSON.parse(await readFile(file, "utf8"));
+    assert.equal(saved.days.length, 61);
+    assert.ok(saved.validatedDays > (passes === 0 ? 0 : previous.validatedDays));
+    if (passes === 0) assert.notEqual(saved.sourceFingerprint, initial.sourceFingerprint);
+    else assert.equal(saved.sourceFingerprint, previous.sourceFingerprint);
+    assert.equal(service.active(), null);
+    previous = saved;
+  }
+  assert.ok(passes >= 2 && passes < 6, "validation really spans multiple bounded passes");
+  assert.equal(result.status, "complete");
+  assert.equal(result.daysSynced, 62);
+  assert.equal(service.active().throughDay, "2026-08-01");
+  assert.equal(await readFile(file, "utf8"), "null");
+  assert.equal(roots.length, passes + 2, "one existing-only root lease per fresh invocation");
+});
+
+test("changed marker contents and root availability or identity invalidate a staged projection with unchanged indexed facts", async (t) => {
+  for (const change of ["marker-scope", "marker-bracket", "root-identity", "root-lost", "root-readable"]) {
+    await t.test(change, async (t) => {
+      const { options, service } = await fixture(t, { plans: ["pro", "pro"] });
+      let marker = attributionFixtureMarker();
+      let rootValue = change === "root-readable" ? null : 9;
+      let clock = start, discovery = 0;
+      const roots = [];
+      const selected = { ...options, now: () => clock, readAccountMarkers: async () => [marker],
+        loadExistingAccountObservationSecret: async () => {
+          if (rootValue === null) return null;
+          const value = Buffer.alloc(32, rootValue); roots.push(value); return value;
+        },
+        fetchImpl: async (url, request) => {
+          const response = await service.fetchImpl(url, request);
+          if (new URL(url).pathname === "/api/v1/device/sync-capabilities" && ++discovery === 2) clock += 60_000;
+          return response;
+        },
+      };
+      const first = await runIncrementalContributionSyncOnce(selected);
+      assert.equal(first.status, "partial");
+      const file = `${options.indexFile}.telemetry-v11-progress.json`;
+      const saved = JSON.parse(await readFile(file, "utf8"));
+      assert.equal(saved.validatedDays, 1);
+      const priorChunks = [...service.envelopes.values()];
+      if (change === "marker-scope") marker = attributionFixtureMarker({ accountScope: {
+        ...marker.accountScope, scopeId: `openai-account:v1:${Buffer.alloc(32, 8).toString("base64url")}`,
+      } });
+      if (change === "marker-bracket") marker = attributionFixtureMarker({ receivedAt: new Date(start + 500).toISOString() });
+      if (change === "root-identity") rootValue = 10;
+      if (change === "root-lost") rootValue = null;
+      if (change === "root-readable") rootValue = 9;
+      const calls = service.calls.length;
+      const second = await runIncrementalContributionSyncOnce(selected);
+      assert.equal(second.status, "complete");
+      const candidates = service.calls.slice(calls).filter((call) => call.path.endsWith("day-manifests"));
+      assert.equal(candidates.length, 1);
+      assert.notEqual(candidates[0].body.manifestDigest, saved.days[0].manifestDigest);
+      const active = service.calls.at(-1).body.days[0];
+      assert.equal(active.manifestDigest, candidates[0].body.manifestDigest);
+      const beforeUsage = priorChunks.flatMap((chunk) => chunk.records).filter((row) => row.schemaVersion === "usage-event-v1.1");
+      const afterUsage = [...service.envelopes.values()].filter((chunk) => chunk.manifestDigest === active.manifestDigest)
+        .flatMap((chunk) => chunk.records).filter((row) => row.schemaVersion === "usage-event-v1.1");
+      assert.deepEqual(afterUsage.map((row) => row.eventId), beforeUsage.map((row) => row.eventId));
+      assert.deepEqual(afterUsage.map((row) => row.components), beforeUsage.map((row) => row.components));
+      if (change === "root-lost") assert.ok(afterUsage.every((row) => row.accountPlanAttribution.accountTrackId === null));
+      if (change === "root-readable") assert.ok(afterUsage.some((row) => row.accountPlanAttribution.accountTrackId !== null));
+      assert.ok(roots.every((root) => root.every((byte) => byte === 0)));
+      const text = JSON.stringify(saved);
+      assert.doesNotMatch(text, /scopeId|capturedAt|receivedAt|accountTrackId|enrollmentNamespace|um_device|secret/u);
+      assert.ok(!text.includes(Buffer.alloc(32, 9).toString("base64url")));
+    });
+  }
+});
+
+test("projection pins an existing root before resume and clears a lease arriving after cancellation", async (t) => {
+  const { options, service } = await fixture(t, { plans: ["pro", "pro"] });
+  const controller = new AbortController();
+  let rootStarted, releaseRoot;
+  const started = new Promise((resolve) => { rootStarted = resolve; });
+  const released = new Promise((resolve) => { releaseRoot = resolve; });
+  let value;
+  const pending = runIncrementalContributionSyncOnce({ ...options, signal: controller.signal,
+    readAccountMarkers: async () => [attributionFixtureMarker()],
+    loadExistingAccountObservationSecret: async () => {
+      rootStarted(); await released; value = Buffer.alloc(32, 9); return value;
+    },
+  });
+  await started;
+  assert.deepEqual(service.calls.map((call) => call.path), ["/api/v1/device/sync-capabilities"]);
+  controller.abort();
+  const result = await pending;
+  assert.equal(result.status, "partial");
+  assert.equal(result.failure.code, "interrupted");
+  releaseRoot();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(value.every((byte) => byte === 0));
+  assert.equal(service.active(), null);
+  assert.equal(service.calls.some((call) => call.path.endsWith("day-manifests")), false);
 });
 
 test("staged metadata cannot traverse a symlink or accept unclosed private fields", async (t) => {

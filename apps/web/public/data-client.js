@@ -2171,6 +2171,7 @@ const CACHE_SWITCH_RECENT_LIMIT = 20;
 const CACHE_SWITCH_PROXIMITY_CEILING_SECONDS = 300;
 const CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO = 0.5;
 const CACHE_CONTINUITY_MINIMUM_GAP_SECONDS = 0;
+const MAX_CACHE_CONTINUITY_MODELS = 128;
 const CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_SECONDS = 7 * 24 * 60 * 60;
 const CACHE_CONTINUITY_GAP_BANDS = Object.freeze({
   under_one_minute: [0, 60],
@@ -2686,6 +2687,17 @@ function normalizeAccountingGeneration(value) {
   return Number.isSafeInteger(numeric) && numeric > 0 ? String(numeric) : null;
 }
 
+function normalizeCacheDiagnosticsSource(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== "generation,generationFingerprint"
+      || typeof value.generationFingerprint !== "string"
+      || !/^generation-v2-[a-f0-9]{64}$/u.test(value.generationFingerprint)) return null;
+  const generation = normalizeAccountingGeneration(value.generation);
+  return generation === null ? null : {
+    generation, generationFingerprint: value.generationFingerprint
+  };
+}
+
 /** Mirrors the companion's content-free event-pair key, never an identity. */
 export function cacheDropThreadLookupKey(kind, row) {
   if (!["switch", "continuity"].includes(kind)
@@ -3102,7 +3114,59 @@ function normalizeCacheContinuityRecent(rows, maximumRows) {
     .slice(0, Math.min(CACHE_SWITCH_RECENT_LIMIT, maximumRows));
 }
 
-function normalizeCacheContinuitySummary(value) {
+function cacheContinuityCohortsMatch(total, cohorts) {
+  if (CACHE_CONTINUITY_BREAKDOWN_FIELDS.some((field) => cohorts.reduce(
+    (sum, cohort) => sum + cohort[field], 0
+  ) !== total[field])) return false;
+  if (!cacheCoveredSubtotalsMatch(total, cohorts)) return false;
+  if (total.estimatedPremiumUsd !== null && (cohorts.some(
+    (cohort) => cohort.estimatedPremiumUsd === null
+  ) || Math.abs(cohorts.reduce((sum, cohort) => sum + cohort.estimatedPremiumUsd, 0)
+    - total.estimatedPremiumUsd) > 1e-9)) return false;
+  return true;
+}
+
+function normalizeCacheContinuityModels(value, total) {
+  // Missing older snapshots remain useful for All models; they do not
+  // masquerade as a completed model breakdown with zero evidence.
+  if (!Array.isArray(value?.byModel)
+      || value.byModel.length > MAX_CACHE_CONTINUITY_MODELS) return null;
+  const models = new Set();
+  const cohorts = [];
+  for (const candidate of value.byModel) {
+    const model = candidate?.model;
+    if (model === "unknown" || !LOCAL_MODELS.has(model) || models.has(model)) return null;
+    const summary = normalizeCacheContinuitySummary(candidate, false);
+    if (summary === null || summary.sameConfigurationReturns === 0
+        || summary.orderingCoverageGaps !== total.orderingCoverageGaps
+        || summary.recent.some((row) => row.configuration.model !== model)) return null;
+    models.add(model);
+    cohorts.push({
+      model,
+      ...summary,
+      allowanceImpact: value.periodId === "7d"
+        ? summary.allowanceImpact
+        : unavailableAllowanceImpact("period_denominator_mismatch")
+    });
+  }
+  if (!cacheContinuityCohortsMatch(total, cohorts)) return null;
+  // Compaction-only models are not picker options, so these counts may be a
+  // subset of the all-model total, but they must never exceed it.
+  if (["postCompactionRequests", "postCompactionCacheReadDrops"].some(
+    (field) => cohorts.reduce((sum, cohort) => sum + cohort[field], 0) > total[field]
+  )) return null;
+  for (const [field, keys] of [
+    ["byGapBand", CACHE_CONTINUITY_GAP_BAND_IDS],
+    ["byOutcomeBucket", CACHE_CONTINUITY_OUTCOME_BUCKET_IDS]
+  ]) {
+    if (keys.some((key) => !cacheContinuityCohortsMatch(
+      total[field][key], cohorts.map((cohort) => cohort[field][key])
+    ))) return null;
+  }
+  return cohorts;
+}
+
+function normalizeCacheContinuitySummary(value, includeModels = true) {
   const totals = normalizeCacheContinuityBreakdown(value, true);
   if (totals === null) return null;
   const allowanceWeighting = normalizeCachePremiumWeighting(
@@ -3170,7 +3234,7 @@ function normalizeCacheContinuitySummary(value) {
   if (postCompactionRequests === null
       || postCompactionCacheReadDrops === null
       || postCompactionCacheReadDrops > postCompactionRequests) return null;
-  return {
+  const summary = {
     ...totals,
     standardApiPremiumUsd: totals.estimatedPremiumUsd,
     allowanceWeighting,
@@ -3182,6 +3246,10 @@ function normalizeCacheContinuitySummary(value) {
     allowanceImpact: totals.estimatedPremiumUsd === null
       ? unavailableAllowanceImpact("weighting_evidence_incomplete")
       : normalizeCacheSwitchAllowanceImpact(value?.allowanceImpact)
+  };
+  return {
+    ...summary,
+    ...(includeModels ? { byModel: normalizeCacheContinuityModels(value, summary) } : {})
   };
 }
 
@@ -3217,6 +3285,7 @@ function unavailableCacheContinuityImpact(errorCode = null) {
     postCompactionCacheReadDrops: 0,
     byGapBand: {},
     byOutcomeBucket: {},
+    byModel: null,
     recent: [],
     allowanceImpact: unavailableAllowanceImpact(),
     minimumGapSeconds: CACHE_CONTINUITY_MINIMUM_GAP_SECONDS,
@@ -4200,11 +4269,102 @@ function normalizeLocalTimeline(value = {}) {
     allowanceCapacity,
     planScoped,
     quota,
+    resetEvents: normalizeLocalResetEvents(value.resetEvents),
     history: normalizeTimelineHistory({
       ...value.history,
       source: value.history?.source ?? value.source,
     })
   };
+}
+
+const LOCAL_RESET_EVENT_CONTRACT = Object.freeze({
+  scheduled_reset: Object.freeze({
+    precision: "provider_schedule",
+    reasons: Object.freeze(["scheduled_boundary"]),
+    lifecycle: false
+  }),
+  banked_reset_used: Object.freeze({
+    precision: "observation_interval",
+    reasons: Object.freeze(["credit_count_decreased_before_expiry"]),
+    lifecycle: false
+  }),
+  unknown_reset: Object.freeze({
+    precision: null,
+    reasons: Object.freeze([
+      "confirmed_unscheduled_quota_drop",
+      "overlapping_scheduled_and_credit_evidence"
+    ]),
+    lifecycle: false
+  }),
+  reset_credit_granted: Object.freeze({
+    precision: "provider_timestamp",
+    reasons: Object.freeze(["reset_credit_id_added"]),
+    lifecycle: true
+  }),
+  reset_credit_expired: Object.freeze({
+    precision: "provider_timestamp",
+    reasons: Object.freeze(["reset_credit_expiry_elapsed"]),
+    lifecycle: true
+  })
+});
+
+const LOCAL_RESET_EVENT_KEYS = Object.freeze([
+  "schemaVersion", "kind", "occurredAt", "observedAt", "intervalStartedAt",
+  "precision", "reason", "provider", "planType", "limitId", "windowDurationMins"
+]);
+
+function normalizeLocalResetEvents(value, maximumRows = 100_000) {
+  return array(value).slice(-maximumRows).flatMap((row) => {
+    if (!row || typeof row !== "object" || Array.isArray(row)
+        || Object.keys(row).length !== LOCAL_RESET_EVENT_KEYS.length
+        || LOCAL_RESET_EVENT_KEYS.some(key => !Object.hasOwn(row, key))) return [];
+    const contract = Object.hasOwn(LOCAL_RESET_EVENT_CONTRACT, row.kind)
+      ? LOCAL_RESET_EVENT_CONTRACT[row.kind] : undefined;
+    const occurredAt = canonicalInstant(row?.occurredAt);
+    const observedAt = canonicalInstant(row?.observedAt);
+    const intervalStartedAt = canonicalInstant(row?.intervalStartedAt);
+    if (row?.schemaVersion !== "quota-reset-event-v0.1"
+        || contract === undefined
+        || occurredAt === null || observedAt === null
+        || intervalStartedAt === null
+        || Date.parse(intervalStartedAt) >= Date.parse(observedAt)
+        || Date.parse(occurredAt) < Date.parse(intervalStartedAt)
+        || Date.parse(occurredAt) > Date.parse(observedAt)
+        || row.provider !== "openai_codex"
+        || !contract.reasons.includes(row.reason)
+        || !["provider_schedule", "observation_interval", "provider_timestamp"]
+          .includes(row.precision)
+        || (contract.precision !== null && row.precision !== contract.precision)) {
+      return [];
+    }
+    const planType = row.planType === null ? null : normalizePlanType(row.planType);
+    const limitId = row.limitId === null ? null : normalizeQuotaLimitId(row.limitId);
+    const windowDurationMins = row.windowDurationMins;
+    if (contract.lifecycle
+      ? planType !== null || limitId !== null || windowDurationMins !== null
+      : planType === null || row.planType !== planType
+        || limitId === null || row.limitId !== limitId
+        || !isValidQuotaWindowDuration(windowDurationMins)) return [];
+    if (row.kind === "unknown_reset"
+        && row.reason === "overlapping_scheduled_and_credit_evidence"
+        && row.precision !== "provider_schedule") return [];
+    if (row.kind === "unknown_reset"
+        && row.reason === "confirmed_unscheduled_quota_drop"
+        && row.precision !== "observation_interval") return [];
+    return [{
+      schemaVersion: "quota-reset-event-v0.1",
+      kind: row.kind,
+      occurredAt,
+      observedAt,
+      intervalStartedAt,
+      precision: row.precision,
+      reason: row.reason,
+      provider: "openai_codex",
+      planType,
+      limitId,
+      windowDurationMins
+    }];
+  });
 }
 
 function normalizeLocalQuotaTimeline(value, maximumRows = 10_000) {
@@ -5187,6 +5347,7 @@ function normalizeLocalAccounting(value = {}, {
   const normalized = {
     generation: normalizeAccountingGeneration(value.generation),
     generationMatched: value.generationMatched === true,
+    cacheDiagnosticsSource: normalizeCacheDiagnosticsSource(value.cacheDiagnosticsSource),
     projection: normalizeAccountingProjection(value.projection, {
       allowImplicitDemoProjection
     }),
@@ -5316,6 +5477,15 @@ function normalizeLocalAccounting(value = {}, {
       && /^\d{4}-\d{2}-\d{2}$/u.test(value.evidenceStartDate)
       ? value.evidenceStartDate
       : null,
+    reportingWindow: (() => {
+      const endAt = canonicalInstant(value.reportingWindow?.endAt);
+      const startAt = canonicalInstant(value.reportingWindow?.startAt);
+      const days = { "24h": 1, "7d": 7, "30d": 30 }[value.periodId];
+      if (!endAt || (days && (!startAt
+          || Date.parse(startAt) !== Math.max(0, Date.parse(endAt) - days * 86_400_000)))) return null;
+      if (!days && value.reportingWindow?.startAt !== null) return null;
+      return { startAt: days ? startAt : null, endAt };
+    })(),
     generatedAt: text(value.generatedAt, ""),
     coveredAt: {
       startAt: text(value?.coveredAt?.startAt, ""),
@@ -5428,11 +5598,24 @@ function normalizeHistoryCoverage(value = {}) {
     "local_unified_index_schema_invalid",
     "local_unified_index_schema_newer",
     "local_unified_index_unavailable",
+    "accounting_unified_history_unavailable",
+    "cache_missing",
+    "cache_unavailable",
+    "cache_generation_unavailable",
+    "cache_generation_mismatch",
+    "cache_fallback_disallowed",
+    "cache_source_mode_mismatch",
+    "cache_context_behavior_mismatch",
+    "cache_accounting_semantics_outdated",
+    "cache_price_registry_outdated",
+    "cache_invalid",
+    "cache_from_future",
+    "cache_stale",
   ].includes(value?.errorCode)
     ? value.errorCode
     : null;
-  // `partial_terminal` is the one non-progress state whose missing sources
-  // remain intentionally visible. Admit it only with a coherent quarantine
+  // `partial_terminal` keeps excluded sources visible alongside available
+  // accounting. Admit it only with a coherent quarantine
   // receipt: otherwise an arbitrary partial payload could turn off automatic
   // refreshes or manufacture a skipped-source explanation in the browser.
   const terminalGap = value?.status === "partial"
@@ -5452,7 +5635,30 @@ function normalizeHistoryCoverage(value = {}) {
     && indexedBytes !== null
     && skippedSourceBytes !== null
     && indexedBytes + skippedSourceBytes === sourceBytes;
-  const phase = terminalGap ? "partial_terminal" : admittedPhase;
+  // A finished source scan can precede the separate accounting summary. Keep
+  // that unavailable summary distinct from both an unstarted scan and an
+  // available aggregate. As for terminal gaps, the counts must balance.
+  const aggregateUnavailable = value?.status === "partial"
+    && value?.phase === "aggregate_unavailable"
+    && value?.sourceMode === "unified"
+    && sourceCount !== null
+    && sourceCount > 0
+    && indexedSourceCount !== null
+    && pendingSourceCount === 0
+    && skippedSourceCount !== null
+    && indexedSourceCount + skippedSourceCount === sourceCount
+    && skippedThreadCount !== null
+    && (skippedSourceCount === 0
+      ? skippedThreadCount === 0
+      : skippedThreadCount > 0 && skippedThreadCount <= skippedSourceCount)
+    && sourceBytes !== null
+    && indexedBytes !== null
+    && skippedSourceBytes !== null
+    && indexedBytes + skippedSourceBytes === sourceBytes;
+  const phase = terminalGap
+    ? "partial_terminal"
+    : aggregateUnavailable ? "aggregate_unavailable" : admittedPhase;
+  const explainedSkippedSources = terminalGap || aggregateUnavailable;
   const coherent = sourceCount !== null
     && indexedSourceCount !== null
     && pendingSourceCount !== null
@@ -5483,9 +5689,9 @@ function normalizeHistoryCoverage(value = {}) {
     pendingSourceCount: sourceCount === null || pendingSourceCount === null
       ? 0
       : Math.min(pendingSourceCount, sourceCount),
-    skippedSourceCount: terminalGap ? skippedSourceCount : 0,
-    skippedSourceBytes: terminalGap ? skippedSourceBytes : 0,
-    skippedThreadCount: terminalGap ? skippedThreadCount : 0,
+    skippedSourceCount: explainedSkippedSources ? skippedSourceCount : 0,
+    skippedSourceBytes: explainedSkippedSources ? skippedSourceBytes : 0,
+    skippedThreadCount: explainedSkippedSources ? skippedThreadCount : 0,
     sourceBytes: sourceBytes ?? 0,
     indexedBytes: sourceBytes === null || indexedBytes === null
       ? 0
@@ -6033,6 +6239,25 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
     observedAt: window?.observedAt ?? quota?.observedAt,
     accountAttribution: window?.accountAttribution ?? quota?.accountAttribution
   }, index));
+  const weekly = normalizeWeekly(payload?.weekly ?? fragments.weekly);
+  // The companion keeps the established seven-day artifact at `weekly` and
+  // publishes a separately fitted five-hour history in this duration-keyed
+  // lane. Keeping the two inputs distinct prevents a shorter window from
+  // being relabeled as weekly; unknown durations are omitted.
+  const allowanceHistoryByWindow = {
+    [CODEX_WEEKLY_ALLOWANCE_MINUTES]: weekly,
+  };
+  const fiveHourHistory = (
+    payload?.allowanceHistoryByWindow
+    ?? payload?.weekly?.allowanceHistoryByWindow
+    ?? fragments.weekly?.allowanceHistoryByWindow
+    ?? fragments.weekly?.weekly?.allowanceHistoryByWindow
+  )?.[String(CODEX_FIVE_HOUR_ALLOWANCE_MINUTES)];
+  if (fiveHourHistory && typeof fiveHourHistory === "object"
+      && !Array.isArray(fiveHourHistory)) {
+    allowanceHistoryByWindow[CODEX_FIVE_HOUR_ALLOWANCE_MINUTES] =
+      normalizeWeekly(fiveHourHistory);
+  }
   return {
     schemaVersion: text(overview?.schemaVersion ?? payload?.schemaVersion, "local-dashboard-unknown"),
     mode,
@@ -6152,7 +6377,8 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
       }
     },
     gradient: normalizeGradient(payload?.gradient ?? fragments.gradient),
-    weekly: normalizeWeekly(payload?.weekly ?? fragments.weekly),
+    weekly,
+    allowanceHistoryByWindow: Object.freeze(allowanceHistoryByWindow),
     quality: normalizeQuality(payload?.quality ?? fragments.quality)
   };
 }
@@ -6266,6 +6492,20 @@ export class LocalCompanionClient {
     ]));
     if (!fragments.overview) throw new Error("The local companion did not return an overview.");
     return normalizeDashboardPayload({}, fragments);
+  }
+
+  modelPerformance(period = "all", { signal, endAt } = {}) {
+    if (!["1", "7", "30", "all"].includes(period)) throw new RangeError("Unsupported display period");
+    const query = new URLSearchParams({ period });
+    if (endAt !== undefined) {
+      const end = Date.parse(endAt);
+      if (typeof endAt !== "string" || !Number.isSafeInteger(end) || end < 0
+          || new Date(end).toISOString() !== endAt) throw new RangeError("Unsupported display window");
+      query.set("endAt", endAt);
+    }
+    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/model-performance?${query}`, {
+      cache: "no-store", signal, headers: { "X-Usage-Monitor-Local": "1" },
+    });
   }
 
   health() {
@@ -6873,6 +7113,25 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       eligible_transitions: 70 + index * 9
     };
   });
+  // Labeled preview evidence for the selected UI prototype. It is reachable
+  // only through demoDashboard(), never through a production fallback, so an
+  // absent five-hour artifact remains honestly unavailable in the live app.
+  const fiveHourValues = Array.from({ length: 30 }, (_, index) => {
+    const dueMs = nowMs - (29 - index) * 5 * HOUR - HOUR;
+    const value = 116 + Math.sin(index / 3) * 8 + Math.cos(index / 5) * 4;
+    return {
+      sequence: index + 1,
+      reset_due_at: iso(dueMs),
+      first_observed_at: iso(dueMs - 5 * HOUR),
+      last_observed_at: iso(dueMs),
+      displayed_span_pp: 58 + (index * 11) % 39,
+      value_usd: Number(value.toFixed(2)),
+      pairwise_p10_usd: Number((value * .86).toFixed(2)),
+      pairwise_p90_usd: Number((value * 1.14).toFixed(2)),
+      holdout_mae_pp: Number((1.7 + (index % 5) * .2).toFixed(1)),
+      eligible_transitions: 18 + index,
+    };
+  });
   const lastResetMs = nowMs - 3 * DAY - 2 * HOUR;
   const componentShares = {
     input_uncached_tokens: .1408,
@@ -7096,6 +7355,10 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
         duplicateSnapshotsExcluded: Math.round(11_800 * factor),
         missingLineageParents: Math.round(37 * factor)
       },
+      reportingWindow: {
+        startAt: id === "all" ? null : iso(nowMs - ({ "24h": 1, "7d": 7, "30d": 30 }[id]) * DAY),
+        endAt: nowIso,
+      },
       generatedAt: nowIso,
       coveredAt: { startAt: iso(nowMs - 7 * DAY), endAt: nowIso },
       unknownModelEvents: Math.round(events * .05),
@@ -7194,8 +7457,24 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       window_sensitivity: [{ smoothing_hours: 1, mae_pp: 3.1 }, { smoothing_hours: 2, mae_pp: 2.4 }, { smoothing_hours: 3, mae_pp: 2.7 }]
     },
     weekly: {
+      planType: "pro",
       summary: [{ median_weekly_value_usd: 1878.75, lower_80_across_resets_usd: 1640.96, upper_80_across_resets_usd: 2280.38, qualifying_resets: 14, selected_holdout_mae_pp: 2.16, prior_reset_p80_absolute_error_pp: 7.39 }],
       weekly_values: weeklyValues
+    },
+    allowanceHistoryByWindow: {
+      [CODEX_FIVE_HOUR_ALLOWANCE_MINUTES]: {
+        planType: "pro",
+        status: "available",
+        summary: [{
+          median_weekly_value_usd: 116.4,
+          lower_80_across_resets_usd: 101.2,
+          upper_80_across_resets_usd: 130.8,
+          qualifying_resets: fiveHourValues.length,
+          selected_holdout_mae_pp: 2.1,
+          prior_reset_p80_absolute_error_pp: 6.8,
+        }],
+        weekly_values: fiveHourValues,
+      },
     },
     quality: {
       summary: [{ fit_eligible_fraction: .0088, known_speed_fraction: .912, collector_age_hours: 0.1 }],

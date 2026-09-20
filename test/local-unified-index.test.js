@@ -71,6 +71,7 @@ import {
   REASONING_EFFORTS,
   reasoningEffortOrdinal,
   sessionLocal,
+  withReadOnlyUnifiedIndex,
 } from "../src/local-unified-index.js";
 import { readLocalUnifiedWindowBreakdown } from "../src/local-unified-window-breakdown.js";
 
@@ -445,6 +446,125 @@ async function build(root, extra = {}) {
     ...extra,
   });
 }
+
+function instrumentReadOnlyIndex(indexFile, {
+  failRollback = false,
+  failClose = false,
+} = {}) {
+  const calls = [];
+  const connection = openLocalUnifiedIndex(indexFile, { readOnly: true });
+  const cleanupError = new Error("synthetic read-only cleanup failure");
+  return {
+    calls,
+    cleanupError,
+    database: {
+      get isOpen() {
+        return connection.isOpen;
+      },
+      exec(sql) {
+        calls.push(sql);
+        if (failRollback && sql === "ROLLBACK") throw cleanupError;
+        return connection.exec(sql);
+      },
+      prepare(...args) {
+        return connection.prepare(...args);
+      },
+      close() {
+        calls.push("close");
+        connection.close();
+        if (failClose) throw cleanupError;
+      },
+    },
+  };
+}
+
+test("read-only unified-index transactions stay open through async callbacks and clean up in order", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-read-only-helper.jsonl": [
+      sessionMeta("session-read-only-helper"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100), usage(100)),
+    ],
+  });
+  try {
+    await build(root);
+    const indexFile = join(root, "index.sqlite");
+    const instrumented = instrumentReadOnlyIndex(indexFile);
+    const result = await withReadOnlyUnifiedIndex(
+      indexFile,
+      async ({ database, generation }) => {
+        assert.equal(database.isOpen, true);
+        assert.equal(generation.status, "complete");
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(database.isOpen, true);
+        return generation.id;
+      },
+      { openIndex: () => instrumented.database },
+    );
+    assert.equal(result, 1);
+    assert.deepEqual(instrumented.calls, ["BEGIN", "ROLLBACK", "close"]);
+
+    await assert.rejects(
+      withReadOnlyUnifiedIndex(indexFile, ({ database }) =>
+        database.exec("CREATE TABLE forbidden_read_only_write(value INTEGER)")),
+      (error) => error.code === "ERR_SQLITE_ERROR"
+        && /readonly database/u.test(error.message),
+    );
+
+    const primary = new Error("synthetic callback failure");
+    const primaryInstrumented = instrumentReadOnlyIndex(indexFile, { failRollback: true });
+    await assert.rejects(
+      withReadOnlyUnifiedIndex(
+        indexFile,
+        async () => {
+          await new Promise((resolve) => setImmediate(resolve));
+          throw primary;
+        },
+        { openIndex: () => primaryInstrumented.database },
+      ),
+      (error) => error === primary,
+    );
+    assert.deepEqual(primaryInstrumented.calls, ["BEGIN", "ROLLBACK", "close"]);
+
+    const cleanupInstrumented = instrumentReadOnlyIndex(indexFile, { failRollback: true });
+    await assert.rejects(
+      withReadOnlyUnifiedIndex(
+        indexFile,
+        () => "result",
+        { openIndex: () => cleanupInstrumented.database },
+      ),
+      (error) => error === cleanupInstrumented.cleanupError,
+    );
+    assert.deepEqual(cleanupInstrumented.calls, ["BEGIN", "ROLLBACK", "close"]);
+
+    const closeInstrumented = instrumentReadOnlyIndex(indexFile, { failClose: true });
+    await assert.rejects(
+      withReadOnlyUnifiedIndex(
+        indexFile,
+        () => "result",
+        { openIndex: () => closeInstrumented.database },
+      ),
+      (error) => error === closeInstrumented.cleanupError,
+    );
+    assert.deepEqual(closeInstrumented.calls, ["BEGIN", "ROLLBACK", "close"]);
+
+    const primaryWithCloseFailure = new Error("synthetic callback close failure");
+    const primaryCloseInstrumented = instrumentReadOnlyIndex(indexFile, { failClose: true });
+    await assert.rejects(
+      withReadOnlyUnifiedIndex(
+        indexFile,
+        () => {
+          throw primaryWithCloseFailure;
+        },
+        { openIndex: () => primaryCloseInstrumented.database },
+      ),
+      (error) => error === primaryWithCloseFailure,
+    );
+    assert.deepEqual(primaryCloseInstrumented.calls, ["BEGIN", "ROLLBACK", "close"]);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
 
 function promiseWithin(promise, timeoutMs, message) {
   let timer;
@@ -2020,7 +2140,7 @@ for (const history of ["reset", "anchored-null"]) {
             FROM usage_event u JOIN parser_version p ON p.id = u.parser_version_id
             WHERE u.observed_at_ms = ?`).get(Date.parse("2026-07-25T01:00:01.000Z"));
           assert.equal(stamp.parser_version, history === "reset"
-            ? "unified-rollout-typed-v15-parent-model" : LOCAL_UNIFIED_INDEX_PARSER_VERSION);
+            ? "unified-rollout-typed-v16-parent-model" : LOCAL_UNIFIED_INDEX_PARSER_VERSION);
         } finally { provenance.close(); }
 
         if (pipeline !== "incremental") return;
@@ -2065,7 +2185,7 @@ for (const history of ["reset", "anchored-null"]) {
         const raw = openLocalUnifiedIndex(indexFile, { readOnly: false });
         try {
           raw.prepare(
-            "UPDATE parser_version SET parser_version = replace(parser_version, 'v15', 'v13')",
+            "UPDATE parser_version SET parser_version = replace(parser_version, 'v16', 'v13')",
           ).run();
         } finally {
           raw.close();

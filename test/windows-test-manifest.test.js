@@ -7,6 +7,20 @@ import {
   WINDOWS_PORTABLE_TEST_FILES,
 } from "../scripts/portable-test-manifest.mjs";
 
+test("Windows qualification includes collector recovery and shared timing storage regressions", () => {
+  for (const file of [
+    "test/local-collector-large-identity.test.js",
+    "test/local-collector-lock-cleanup.test.js",
+    "test/local-collector-state-integrity-off-main.test.js",
+    "test/local-collector-state-session.test.js",
+    "test/source-file-access.test.js",
+    "test/windows-inference-timing.test.js",
+    "test/windows-protected-sqlite.test.js",
+  ]) {
+    assert.equal(WINDOWS_PORTABLE_TEST_FILES.includes(file), true, file);
+  }
+});
+
 test("Windows portable test deferrals are explicit, unique, and bounded", () => {
   assert.equal(WINDOWS_DEFERRED_TESTS.length, 1);
   const deferred = new Set();

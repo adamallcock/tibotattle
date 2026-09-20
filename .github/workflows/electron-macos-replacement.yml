@@ -1,0 +1,139 @@
+name: Electron signed Mac replacement
+on:
+  push:
+    branches: [codex/electron-direct-upgrade]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Verify only or execute on a disposable hosted Mac
+        type: choice
+        options: [plan, execute]
+        default: plan
+        required: true
+      runner_revision:
+        description: Exact reviewed workflow commit
+        type: string
+        required: true
+      source_revision:
+        description: Exact signed application source commit
+        type: string
+        required: true
+      archive_url:
+        description: Approved ZIP below the fixed native-replacement test path
+        type: string
+        required: true
+      archive_sha256:
+        description: Exact approved ZIP SHA-256
+        type: string
+        required: true
+      asar_sha256:
+        description: Exact approved ASAR SHA-256
+        type: string
+        required: true
+      confirmation:
+        description: Execute requires RUN_DISPOSABLE_SIGNED_REPLACEMENT
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: electron-signed-macos-replacement
+  cancel-in-progress: false
+jobs:
+  registration:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Register manual qualification without executing it
+        run: echo "Signed replacement qualification requires a reviewed manual dispatch."
+  replacement:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-26
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      SELECTED_MODE: ${{ inputs.mode }}
+      SELECTED_RUNNER: ${{ inputs.runner_revision }}
+      SELECTED_SOURCE: ${{ inputs.source_revision }}
+      SELECTED_URL: ${{ inputs.archive_url }}
+      SELECTED_ARCHIVE: ${{ inputs.archive_sha256 }}
+      SELECTED_ASAR: ${{ inputs.asar_sha256 }}
+      EXECUTION_CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - name: Check out the exact reviewed runner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: arm64
+          package-manager-cache: false
+      - name: Install locked verification dependencies
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Intake exact reviewed signed test artifact
+        run: |
+          umask 077
+          mkdir -m 700 replacement-receipts
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,posixpath,re,stat,subprocess,zipfile
+          e=os.environ; runner=e['SELECTED_RUNNER']; source=e['SELECTED_SOURCE']
+          digest=e['SELECTED_ARCHIVE']; asar=e['SELECTED_ASAR']; url=e['SELECTED_URL']
+          assert re.fullmatch('[0-9a-f]{40}',runner) and runner==e['GITHUB_SHA']
+          assert re.fullmatch('[0-9a-f]{40}',source)
+          assert all(re.fullmatch('[0-9a-f]{64}',v) for v in [digest,asar])
+          assert e['SELECTED_MODE'] in ['plan','execute']
+          assert e['EXECUTION_CONFIRMATION']==('RUN_DISPOSABLE_SIGNED_REPLACEMENT' if e['SELECTED_MODE']=='execute' else '')
+          assert url==f'https://updates.tibotattle.com/electron/test/native-replacement/{source}/{digest}.zip'
+          root=pathlib.Path(e['RUNNER_TEMP'])/'signed-replacement-intake'; root.mkdir(mode=0o700)
+          archive=root/'app.zip'
+          result=subprocess.run(['/usr/bin/curl','--disable','--fail','--silent','--show-error','--proto','=https',
+            '--max-time','120','--max-filesize',str(1024**3),'--output',str(archive),'--write-out','%{http_code}',url+'?sha256='+digest],
+            capture_output=True,text=True,check=True,timeout=130)
+          assert result.stdout=='200' and archive.stat().st_size<=1024**3
+          with archive.open('rb') as stream: assert hashlib.file_digest(stream,'sha256').hexdigest()==digest
+          with zipfile.ZipFile(archive) as z:
+            entries=z.infolist()
+            assert len(entries)<20000 and sum(v.file_size for v in entries)<3*1024**3
+            assert len({v.filename for v in entries})==len(entries)
+            for item in entries:
+              path=pathlib.PurePosixPath(item.filename); mode=stat.S_IFMT(item.external_attr>>16)
+              assert not path.is_absolute() and '..' not in path.parts and path.parts[0]=='TiboTattle.app'
+              assert mode in [0,stat.S_IFREG,stat.S_IFDIR,stat.S_IFLNK]
+              if mode==stat.S_IFLNK:
+                assert item.file_size<4096
+                target=z.read(item).decode('utf-8')
+                normalized=posixpath.normpath(posixpath.join(str(path.parent),target))
+                assert not target.startswith('/') and normalized.startswith('TiboTattle.app/')
+          extracted=root/'verified'; extracted.mkdir(mode=0o700)
+          subprocess.run(['/usr/bin/ditto','-x','-k',str(archive),str(extracted)],check=True,timeout=120)
+          pathlib.Path('replacement-receipts/intake.json').write_text(json.dumps({'runnerRevision':runner,'sourceRevision':source,
+            'archiveSha256':digest,'asarSha256':asar,'archiveVerified':True})+'\n')
+          PY
+      - name: Verify or rehearse ordinary signed replacement and restart
+        run: |
+          umask 077
+          args=(--plan)
+          if [[ "$SELECTED_MODE" == execute ]]; then
+            args=(--execute --confirm "$EXECUTION_CONFIRMATION")
+          fi
+          node scripts/smoke-electron-macos-replacement.mjs "${args[@]}" \
+            --app "$RUNNER_TEMP/signed-replacement-intake/verified/TiboTattle.app" \
+            --archive "$RUNNER_TEMP/signed-replacement-intake/app.zip" \
+            --archive-sha256 "$SELECTED_ARCHIVE" --source-revision "$SELECTED_SOURCE" \
+            --asar-sha256 "$SELECTED_ASAR" > replacement-receipts/execution.json
+      - name: Retain content-free qualification receipt only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-macos-replacement-${{ github.run_id }}
+          path: replacement-receipts/*.json
+          if-no-files-found: error
+          retention-days: 14

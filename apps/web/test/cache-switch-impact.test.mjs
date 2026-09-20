@@ -1,3 +1,4 @@
+import { cacheReuseMetricLines } from "../public/cache-reuse-metrics.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -1316,33 +1317,12 @@ test("subtotal notes explain the ordering gap, Standard counterfactual and exclu
 });
 
 test("cache chart readout shows valid bucket subtotals despite a global gap and never fabricates an unpriced zero", async () => {
-  const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  const start = source.indexOf("function renderCacheReuseReadout(bucket, width, selectedRange,");
-  const end = source.indexOf("\nfunction setCacheReuseReadoutVisible", start);
-  assert.ok(start >= 0 && end > start);
-  const nodes = new Map();
-  const render = Function(
-    "$", "cacheReusePercent", "setLocalizedText", "formatCount", "t", "formatApiMoney",
-    `${source.slice(start, end)}\nreturn renderCacheReuseReadout;`,
-  )(
-    (selector) => {
-      if (selector === "#cache-reuse-raster-stage") return null;
-      if (!nodes.has(selector)) nodes.set(selector, { textContent: "" });
-      return nodes.get(selector);
-    },
-    (count, total) => total === 0 ? "0%" : `${count / total * 100}%`,
-    (element, key, values) => { element.textContent = translate(key, values, "en"); },
-    String,
-    (key, values) => translate(key, values, "en"),
-    (value) => `$${value.toFixed(2)}`,
-  );
-  const moneyText = (bucket, completeCoverage) => {
-    render({
-      labelKey: "accounting.cacheContinuity.outcome.bucket.underOneMinute",
-      ...bucket,
-    }, 600, { start: 100, end: 150 }, completeCoverage);
-    return nodes.get("#cache-reuse-readout-api").textContent;
-  };
+  const moneyText = (bucket, completeCoverage) => cacheReuseMetricLines(bucket,
+    { coverageStatus: completeCoverage ? "complete" : "incomplete" }, {
+      t: (key, values) => translate(key, values, "en"),
+      formatCount: String,
+      formatApiMoney: (value) => `$${value.toFixed(2)}`,
+    }).at(-1);
   const good = continuitySubtotalPeriod().byOutcomeBucket.under_one_minute;
   assert.equal(moneyText(good, true), "Standard API equivalent: $0.01");
   assert.equal(moneyText(good, false), "Covered subtotal at Standard rates: $0.01 · 1 priced drops.");
@@ -1367,7 +1347,7 @@ test("cache chart readout shows valid bucket subtotals despite a global gap and 
 test("the history selector reads the analyzer's all-indexed period", async () => {
   const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const start = source.indexOf("function accountingPeriod(data) {");
-  const end = source.indexOf("\nfunction syncAccountingPeriodControls", start);
+  const end = source.indexOf("\nfunction renderAccountingDimension", start);
   assert.ok(start >= 0 && end > start, "accounting period selector is available");
   const select = Function(
     `${source.slice(start, end)}\nlet activeAccountingPeriod = "history";`
@@ -1617,34 +1597,14 @@ test("cache-impact UI copy has three-locale parity and collapsed evidence tables
   );
   assert.doesNotMatch(continuityDetails, /id="cache-reuse-outcome"/u);
   assert.match(continuityDetails, /See recent large cache drops/u);
-  assert.match(continuityOutcome, /<canvas id="cache-reuse-canvas"/u);
-  assert.match(continuityOutcome, /id="cache-reuse-readout"/u);
-  assert.match(
-    continuityOutcome,
-    /id="cache-reuse-readout-rail"[^>]+hidden/u,
-  );
-  assert.match(continuityOutcome, /id="cache-reuse-readout-lost"/u);
-  assert.match(continuityOutcome, /id="cache-reuse-readout-api"/u);
-  assert.match(continuityOutcome, /id="cache-reuse-overhead"/u);
-  assert.doesNotMatch(continuityOutcome, /id="cache-reuse-checked"/u);
-  assert.doesNotMatch(continuityOutcome, /id="cache-reuse-mark-unit"/u);
-  assert.doesNotMatch(continuityOutcome, /cache-reuse-(?:privacy|timeout-note|detail)/u);
+  assert.match(continuityOutcome, /id="cache-reuse-matrix"/u);
+  assert.match(html, /href=".\/cache-reuse-matrix.css"/u);
+  assert.doesNotMatch(continuityOutcome, /cache-reuse-(?:canvas|readout|metrics)/u);
   assert.doesNotMatch(
     continuityDetails,
     /accounting\.cacheContinuity\.detailsExplanation/u,
   );
-  assert.match(
-    styles,
-    /\.cache-reuse-metrics\s*\{[^}]*grid-template-columns:\s*repeat\(3,/u,
-  );
-  assert.match(
-    styles,
-    /\.cache-reuse-raster-scroll\s*\{[^}]*overflow:\s*visible/u,
-  );
-  assert.match(
-    styles,
-    /\.cache-reuse-raster-stage\s*\{[^}]*min-width:\s*0/u,
-  );
+  assert.match(styles, /\.cache-reuse-outcome\s*\{/u);
   assert.doesNotMatch(continuityOutcome, /cache-continuity-gap-(?:rows|pagination|page)/u);
   assert.doesNotMatch(continuityOutcome, /cache-continuity-gap-table/u);
   assert.match(html, /<tbody id="cache-continuity-rows"><\/tbody>/u);
@@ -1652,4 +1612,71 @@ test("cache-impact UI copy has three-locale parity and collapsed evidence tables
   assert.match(continuityDetails, /id="cache-continuity-page-prev"/u);
   assert.match(continuityDetails, /id="cache-continuity-page-next"/u);
   assert.match(html, /Time between turns/u);
+});
+
+test("model continuity breakdowns retain only validated complete cohort partitions", () => {
+  const source = continuityImpact();
+  const cohort = { ...continuityPeriod(), model: "gpt-5.6-sol",
+    prompt: "PRIVATE_PROMPT_SENTINEL", nested: { path: "/PRIVATE_PATH_SENTINEL" } };
+  source.byModel = [cohort];
+  source.periods[0].byModel = [cohort];
+  const normalized = normalizedContinuityImpact(source);
+  assert.equal(normalized.status, "available");
+  assert.equal(normalized.byModel.length, 1);
+  assert.equal(normalized.byModel[0].model, "gpt-5.6-sol");
+  assert.equal(normalized.byModel[0].comparableReturns, 1);
+  assert.deepEqual(normalized.byModel[0].byOutcomeBucket, normalized.byOutcomeBucket);
+  assert.deepEqual(normalized.periods[0].byModel, normalized.byModel);
+  assert.doesNotMatch(JSON.stringify(normalized), /PRIVATE_|private|secret-session|rolloutPath/u);
+  assert.equal(Object.hasOwn(normalized.byModel[0], "byModel"), false);
+
+  for (const mutate of [
+    (value) => { value.byModel[0].model = "unknown"; },
+    (value) => { value.byModel[0].model = "PRIVATE_MODEL_SENTINEL"; },
+    (value) => { value.byModel.push(structuredClone(value.byModel[0])); },
+    (value) => { value.byModel.push({ ...structuredClone(value.byModel[0]), model: "gpt-5.4" }); },
+    (value) => { value.byModel[0].comparableReturns += 1; },
+    (value) => { value.byModel[0].postCompactionRequests += 1; },
+    (value) => { value.byModel[0].recent[0].configuration.model = "gpt-5.4"; },
+    (value) => { value.byModel = Array.from({ length: 129 }, () => value.byModel[0]); },
+    (value) => {
+      const buckets = value.byModel[0].byOutcomeBucket;
+      const active = structuredClone(buckets.under_one_minute);
+      buckets.under_one_minute = { ...zeroContinuityBreakdown(), startSeconds: 0, endSeconds: 60 };
+      buckets.one_to_two_minutes = { ...active, startSeconds: 60, endSeconds: 120 };
+    },
+  ]) {
+    const invalid = structuredClone(source);
+    mutate(invalid);
+    const result = normalizedContinuityImpact(invalid);
+    assert.equal(result.status, "available", "a malformed optional filter must preserve validated all-model evidence");
+    assert.equal(result.byModel, null);
+    assert.equal(result.comparableReturns, 1);
+  }
+});
+
+test("older continuity snapshots explicitly lack model evidence and ordering gaps cannot vanish in a model filter", () => {
+  const older = normalizedContinuityImpact(continuityImpact());
+  assert.equal(older.status, "available");
+  assert.equal(older.byModel, null);
+  assert.equal(older.periods[0].byModel, null);
+  const incomplete = continuitySubtotalPeriod({ ordering: 1 });
+  const source = continuityImpact({ ...incomplete, periods: [incomplete],
+    byModel: [{ ...structuredClone(incomplete), model: "gpt-5.6-sol" }] });
+  const result = normalizedContinuityImpact(source);
+  assert.equal(result.byModel.length, 1);
+  assert.equal(result.byModel[0].coverageStatus, "incomplete");
+  assert.equal(result.byModel[0].orderingCoverageGaps, 1);
+  assert.equal(result.byModel[0].estimatedPremiumUsd, null);
+  assert.equal(result.byModel[0].coveredSubtotal.standardApiPremiumUsd, 0.01);
+  source.byModel = [{ ...continuityPeriod(), model: "gpt-5.6-sol" }];
+  assert.equal(normalizedContinuityImpact(source).byModel, null);
+});
+
+test("non-weekly model cohorts cannot retain a weekly allowance conversion", () => {
+  const selected = continuityPeriod({ periodId: "30d", model: "gpt-5.6-sol" });
+  const result = normalizedContinuityImpact(continuityImpact({ periodId: "30d", byModel: [selected] }));
+  assert.equal(result.byModel.length, 1);
+  assert.equal(result.byModel[0].allowanceImpact.status, "unavailable");
+  assert.equal(result.byModel[0].allowanceImpact.reason, "period_denominator_mismatch");
 });

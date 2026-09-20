@@ -40,7 +40,7 @@ import {
 const DEFAULT_WINDOW_OPTIONS = Object.freeze({
   width: 1_180,
   height: 820,
-  minWidth: 720,
+  minWidth: 960,
   minHeight: 520,
 });
 
@@ -63,6 +63,7 @@ const DASHBOARD_SECTIONS = Object.freeze([
   "weekly",
   "timeline",
   "accounting",
+  "projects",
   "community",
 ]);
 
@@ -435,6 +436,19 @@ export function createDesktopLifecycle({
     return delivered;
   }
 
+  // An updater state change carries no renderer-provided data. Refresh only an
+  // already-open trusted Settings surface, using the existing fixed command;
+  // do not reload, focus, or broadcast it to the dashboard.
+  function refreshSettings() {
+    if (!isLiveBrowserWindow(settingsWindow)
+        || typeof settingsWindow.webContents?.send !== "function") return false;
+    settingsWindow.webContents.send(
+      DESKTOP_COMMAND_CHANNEL,
+      validateDesktopCommand({ command: "refresh" }),
+    );
+    return true;
+  }
+
   // Keep native dashboard navigation bounded to the shell's fixed views. The
   // renderer owns the page state and existing projections; the main process
   // only requests a fixed hash after bringing the dashboard window to the
@@ -797,6 +811,7 @@ export function createDesktopLifecycle({
       weekly: suppliedActions.weekly ?? (() => navigateDashboardSection("weekly")),
       timeline: suppliedActions.timeline ?? (() => navigateDashboardSection("timeline")),
       accounting: suppliedActions.accounting ?? (() => navigateDashboardSection("accounting")),
+      projects: suppliedActions.projects ?? (() => navigateDashboardSection("projects")),
       toggleSidebar: suppliedActions.toggleSidebar ?? (() => false),
       retry: suppliedActions.retry ?? (() => retry()),
       settings: suppliedActions.settings ?? (() => showSettingsWindow()),
@@ -974,6 +989,15 @@ export function createDesktopLifecycle({
       },
       show: false,
     };
+    // Keep the dashboard readable without forcing it beyond a small display.
+    const display = screen?.getDisplayNearestPoint && screen?.getCursorScreenPoint
+      ? screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
+      : screen?.getPrimaryDisplay?.();
+    const availableWidth = display?.workAreaSize?.width ?? display?.workArea?.width;
+    if (Number.isFinite(availableWidth) && availableWidth > 0) {
+      selectedOptions.minWidth = Math.min(selectedOptions.minWidth, availableWidth);
+      selectedOptions.width = Math.min(selectedOptions.width, availableWidth);
+    }
     window = new BrowserWindow(selectedOptions);
     dashboardReady = false;
     const webContents = window.webContents;
@@ -1723,6 +1747,7 @@ export function createDesktopLifecycle({
     hideWindow,
     toggleWindow,
     sendDashboardCommand,
+    refreshSettings,
     navigateDashboardSection,
     setDesktopLanguage,
     setDesktopTrayPreferences,

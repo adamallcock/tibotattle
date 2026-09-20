@@ -1388,6 +1388,7 @@ async function assertDashboardShell(cdp) {
       topbar: visible(document.querySelector(".topbar")),
       sidebar: visible(document.querySelector(".dashboard-sidebar")),
       navCount: navLinks.length,
+      navKeys: navLinks.map((link) => link.dataset.nav).join(","),
       activeLinkCount: navLinks.filter((link) => link.classList.contains("active")
         && link.getAttribute("aria-current") === "page").length,
       activePageCount: document.querySelectorAll(
@@ -1402,7 +1403,8 @@ async function assertDashboardShell(cdp) {
   })()`);
   if (snapshot?.topbar !== true
       || snapshot?.sidebar !== true
-      || snapshot?.navCount !== 5
+      || snapshot?.navCount !== 7
+      || snapshot?.navKeys !== "overview,weekly,trends,performance,method,projects,community"
       || snapshot?.activeLinkCount !== 1
       || snapshot?.activePageCount !== 1
       || snapshot?.refresh !== true
@@ -1532,11 +1534,66 @@ export function classifyMacDashboardParityEvidence({
   return Object.freeze({ status: "passed", reason: null });
 }
 
+// Only content-free source availability leaves the page. Optional panels must
+// match the selected accounting period; CSS invisibility alone proves nothing.
+export function macUsageOptionalPanelExpectations(overview, reportingPeriod) {
+  if (!["24h", "7d", "30d", "all"].includes(reportingPeriod)) return null;
+  const accounting = overview?.accounting;
+  const periodId = reportingPeriod === "all" ? "history" : reportingPeriod;
+  const selected = Array.isArray(accounting?.periods)
+    ? accounting.periods.find((period) => period?.periodId === periodId) : null;
+  if (!selected) return null;
+  const coverage = selected.pricingCoverage ?? accounting.pricingCoverage;
+  const events = selected.events ?? accounting.events;
+  if (!Number.isSafeInteger(events) || events < 0) return null;
+  if (!Number.isSafeInteger(coverage?.unpricedEvents) || coverage.unpricedEvents < 0) return null;
+  const unavailable = (field) => {
+    const root = accounting[field];
+    const period = Array.isArray(root?.periods)
+      ? root.periods.find((entry) => entry?.periodId === reportingPeriod) : null;
+    const candidates = [selected[field], period, root?.periodId === reportingPeriod ? root : null];
+    if (candidates.some((entry) => entry?.status === "available")) return false;
+    return candidates.some((entry) => entry?.status === "unavailable") || root?.status === "unavailable"
+      ? true : null;
+  };
+  return {
+    priceWarningExpected: events > 0 && coverage.unpricedEvents > 0,
+    switchUnavailable: unavailable("cacheSwitchImpact"),
+    continuityUnavailable: unavailable("cacheContinuityImpact"),
+  };
+}
+
+export function macOptionalPanelStateValid(panel, unavailable) {
+  if (panel?.present !== true || typeof unavailable !== "boolean") return false;
+  return unavailable
+    ? panel.hidden === true && panel.visible === false
+    : panel.visible === true && panel.explicitContent === true;
+}
+
+export function macCacheMatrixStateValid(matrix) {
+  return matrix?.present === true && matrix.visible === true
+    && ((matrix.plotVisible === true && matrix.plotPopulated === true)
+      || (matrix.emptyVisible === true && matrix.emptyContent === true));
+}
+
+export function macPriceCoverageStateValid(panel, warningExpected) {
+  if (panel?.present !== true || typeof warningExpected !== "boolean") return false;
+  return warningExpected
+    ? panel.visible === true && panel.explicitContent === true
+    : panel.hidden === true && panel.visible === false && panel.explicitContent === false;
+}
+
 async function assertDashboardParitySurfaces(cdp, health, startupRefresh = {}) {
 
   const usage = await waitFor(async () => {
-    const snapshot = await cdp.evaluate(`(() => {
+    const snapshot = await cdp.evaluate(`(async () => {
       const visible = ${visible.toString()};
+      document.querySelector('[data-nav="method"]')?.click();
+      const period = document.querySelector('#reporting-period-controls [aria-pressed="true"]')?.dataset.period;
+      const response = await fetch('/api/local/overview', { cache: 'no-store', redirect: 'error' });
+      if (!response.ok) return null;
+      const expected = (${macUsageOptionalPanelExpectations.toString()})(await response.json(), period);
+      if (expected === null || period !== document.querySelector('#reporting-period-controls [aria-pressed="true"]')?.dataset.period) return null;
       const positiveNumber = (value) => {
         const matches = String(value ?? "").match(/(?:^|[^0-9])([1-9][0-9]*(?:[.,][0-9]+)?|0\\.[0-9]+)/u);
         return matches !== null
@@ -1562,6 +1619,7 @@ async function assertDashboardParitySurfaces(cdp, health, startupRefresh = {}) {
         const text = element?.textContent?.trim() ?? "";
         return {
           present: element !== null,
+          hidden: element?.hidden === true,
           visible: visible(element),
           explicitContent: text.length > 0,
           explicitUnavailable: /no eligible|no .* (?:available|priced|reported)|unavailable|not available|insufficient/iu.test(text),
@@ -1569,7 +1627,6 @@ async function assertDashboardParitySurfaces(cdp, health, startupRefresh = {}) {
       });
       const indexDetail = document.querySelector("#journey-stage-index-detail")
         ?.textContent?.trim() ?? "";
-      document.querySelector('[data-nav="method"]')?.click();
       const page = document.querySelector('#accounting[data-dashboard-page="method"]');
       const tokenRows = document.querySelectorAll('#accounting-component-counts .component-row');
       const costRows = document.querySelectorAll('#accounting-component-costs .component-row');
@@ -1578,10 +1635,21 @@ async function assertDashboardParitySurfaces(cdp, health, startupRefresh = {}) {
           ':scope > .model-identity:not(.model-component-identity)',
         ));
       const priceCoverage = document.querySelector('#accounting-price-coverage');
+      const matrix = document.querySelector('#cache-reuse-matrix');
+      const matrixPlot = matrix?.querySelector('.cache-matrix-plot');
+      const matrixEmpty = matrix?.querySelector('.cache-matrix-empty');
+      const matrixReady = (${macCacheMatrixStateValid.toString()})({
+        present: matrix !== null,
+        visible: visible(matrix),
+        plotVisible: visible(matrixPlot),
+        plotPopulated: (matrixPlot?.childElementCount ?? 0) > 0,
+        emptyVisible: visible(matrixEmpty),
+        emptyContent: (matrixEmpty?.textContent?.trim() ?? '').length > 0,
+      });
       return {
         route: location.hash,
         pageVisible: visible(page) && page?.inert !== true,
-        periodCount: document.querySelectorAll('#accounting-period-controls [data-period]').length,
+        periodCount: document.querySelectorAll('#reporting-period-controls [data-period]').length,
         summaryCardCount: document.querySelectorAll('#accounting-summary .metric-card').length,
         tokenCountRows: tokenRows.length,
         costContributionRows: costRows.length,
@@ -1593,8 +1661,12 @@ async function assertDashboardParitySurfaces(cdp, health, startupRefresh = {}) {
         meaningfulModelRows: modelRows.filter((row) => [...row.querySelectorAll(
           ':scope > .numeric-cell',
         )].some((cell) => positiveNumber(cell.textContent))).length,
-        priceCoverage: visible(priceCoverage)
-          && (priceCoverage.textContent?.trim() ?? "").length > 0,
+        priceCoverage: (${macPriceCoverageStateValid.toString()})({
+          present: priceCoverage !== null,
+          hidden: priceCoverage?.hidden === true,
+          visible: visible(priceCoverage),
+          explicitContent: (priceCoverage?.textContent?.trim() ?? "").length > 0,
+        }, expected.priceWarningExpected),
         advancedModuleShellCount: advancedModules.filter((module) => module.present).length,
         advancedModuleAvailableCount: advancedModules.filter(
           (module) => module.visible
@@ -1602,14 +1674,15 @@ async function assertDashboardParitySurfaces(cdp, health, startupRefresh = {}) {
             && !module.explicitUnavailable,
         ).length,
         advancedModuleUnavailableCount: advancedModules.filter(
-          (module) => module.visible
-            && module.explicitContent
-            && module.explicitUnavailable,
+          (module, index) => (index === 0 && expected.switchUnavailable === true)
+            || (index === 2 && expected.continuityUnavailable === true)
+            || (module.visible && module.explicitContent && module.explicitUnavailable),
         ).length,
         advancedModulesReady: advancedModules.length === 3
-          && advancedModules.every((module) => module.present
-            && module.visible
-            && module.explicitContent),
+          && (${macOptionalPanelStateValid.toString()})(advancedModules[0], expected.switchUnavailable)
+          && (${macOptionalPanelStateValid.toString()})(advancedModules[2], expected.continuityUnavailable)
+          && advancedModules[1].present && advancedModules[1].visible
+          && advancedModules[1].explicitContent && matrixReady,
         indexDetail: indexDetail.length > 0,
         partialHistoryDetail: /partial|quarantined/iu.test(indexDetail),
       };

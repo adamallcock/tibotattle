@@ -1200,20 +1200,30 @@ export function createDesktopController({
     },
     async setStartAtLogin({ enabled }) {
       return enqueue(async () => {
-        const previousSettings = await store.getSettings();
+        await store.getSettings();
+        // Persisted preferences may be unapplied defaults after native migration
+        // or may differ from changes made in OS Settings. Only the observed OS
+        // state can authorize a compensating change if persistence fails.
+        const previousLogin = platform.loginItemStatus();
+        const previousEnabled = previousLogin?.status === "enabled"
+          ? true
+          : previousLogin?.status === "disabled" ? false : null;
         const result = platform.setStartAtLogin(enabled);
         const accepted = loginItemChangeAccepted(result, enabled);
         if (!accepted) throw controllerError("desktop_start_at_login_unconfirmed");
         try {
           await store.setStartAtLogin(enabled);
         } catch {
+          if (previousEnabled === null) {
+            throw controllerError("desktop_start_at_login_rollback_failed");
+          }
           let rollback;
           try {
-            rollback = platform.setStartAtLogin(previousSettings.startAtLogin);
+            rollback = platform.setStartAtLogin(previousEnabled);
           } catch {
             rollback = null;
           }
-          if (!loginItemChangeAccepted(rollback, previousSettings.startAtLogin)) {
+          if (!loginItemChangeAccepted(rollback, previousEnabled)) {
             throw controllerError("desktop_start_at_login_rollback_failed");
           }
           throw controllerError("desktop_start_at_login_persistence_failed");

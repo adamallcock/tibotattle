@@ -57,6 +57,13 @@ import { createDesktopNotificationDelivery } from "./desktop-notification-delive
 import { prepareWindowsNotificationIdentity } from "./desktop-windows-notification-identity.js";
 import { shellError } from "./errors.js";
 import {
+  awaitDesktopSecureStorageOperation,
+  classifyDesktopSecureStorageFailure,
+  createDesktopSecureStorageDialog,
+  createDesktopSecureStorageFailure,
+  normalizeDesktopSecureStorageFailureReason,
+} from "./desktop-secure-storage-readiness.js";
+import {
   createProductionDesktopUpdater,
   PRODUCTION_ELECTRON_CHANNEL,
   validateProductionDistributionMetadata,
@@ -110,6 +117,7 @@ const ACCOUNTLESS_HOSTED_REHEARSAL_ENVIRONMENT_KEYS = Object.freeze([
   "USAGE_MONITOR_CENTRAL_ORIGIN",
   "USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE",
   "USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE",
+  "USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE",
   "USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY",
   "USAGE_MONITOR_PREPARED_DIRECTORY",
   "USAGE_MONITOR_RESOURCE_ROOT",
@@ -145,6 +153,30 @@ function assertObject(value, label) {
     throw new TypeError(`${label} must be an object`);
   }
   return value;
+}
+
+async function requestDesktopSecureStorageRecovery(dialog, reason) {
+  const response = await dialog?.showMessageBox?.(
+    createDesktopSecureStorageDialog(reason),
+  );
+  return response?.response === 1 ? "retry" : "quit";
+}
+
+async function preflightAccountlessCredential(backend) {
+  let credential = null;
+  try {
+    credential = await awaitDesktopSecureStorageOperation(() => backend.read(), {
+      disposeLateResult(value) {
+        value?.fill?.(0);
+      },
+    });
+    if (credential === null) return;
+    if (!Buffer.isBuffer(credential) || credential.length !== 32) {
+      throw createDesktopSecureStorageFailure("credential_invalid");
+    }
+  } finally {
+    credential?.fill?.(0);
+  }
 }
 
 function hasExactKeys(value, keys) {
@@ -913,6 +945,7 @@ export async function launchDesktopRuntime({
   });
   if (productionDistribution !== undefined) {
     childEnvironment.USAGE_MONITOR_STATE_ROOT = join(userDataPath(app), "companion-state");
+    delete childEnvironment.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE;
   }
   const sharingDestinationOrigin = selectedAccountlessRehearsal?.origin
     ?? accountlessProduction?.origin ?? accountlessLaboratory?.origin
@@ -967,6 +1000,7 @@ export async function launchDesktopRuntime({
     args: companionArgs,
     cwd: paths.companionCwd,
     environment: childEnvironment,
+    platform,
     attachPrivateChannel: accountlessEnabled ? (channel) => attachAccountlessParentChannel({
       channel,
       readPreference: () => sharingCoordinator.readAuthorization(),
@@ -1066,27 +1100,53 @@ export async function launchDesktopRuntime({
   // does not start the companion, register a login item, or enable updates.
   await app.whenReady?.();
   if (prepareNativeHandover !== undefined) {
-    let handover;
-    try {
-      handover = await prepareNativeHandover({
-        homeDirectory: runtimeHomeDirectory({ platform, environment: runtimeEnvironment }),
-      });
-    } catch {
-      handover = { status: "migration_blocked" };
-    }
-    if (!["no_legacy_state", "migrated", "already_migrated"].includes(handover?.status)) {
-      const credentialPreflightBlocked = handover?.status === "credential_preflight_blocked";
+    while (true) {
+      let handover;
+      try {
+        handover = await prepareNativeHandover({
+          homeDirectory: runtimeHomeDirectory({
+            platform,
+            environment: runtimeEnvironment,
+          }),
+        });
+      } catch {
+        handover = { status: "migration_blocked" };
+      }
+      if (["no_legacy_state", "migrated", "already_migrated"].includes(
+        handover?.status,
+      )) break;
+      const credentialPreflightBlocked =
+        handover?.status === "credential_preflight_blocked";
+      if (credentialPreflightBlocked) {
+        const reason = normalizeDesktopSecureStorageFailureReason(handover?.reason);
+        if (await requestDesktopSecureStorageRecovery(runtime.dialog, reason) === "retry") {
+          continue;
+        }
+        deepLinkIntakeCleanup();
+        app.quit?.();
+        return Object.freeze({
+          status: "native_handover_blocked",
+          secureStorageReason: reason,
+          firstRun: null,
+          lifecycle: null,
+          supervisor: null,
+          controller: null,
+          settingsStore: null,
+          settingsBackend: null,
+          ipc: createNoopIpcInstallation(),
+          childEnvironment: null,
+        });
+      }
       await runtime.dialog?.showMessageBox?.({
         type: "warning",
-        title: credentialPreflightBlocked
-          ? "Unable to prepare secure storage"
-          : "Finish moving to TiboTattle",
-        message: credentialPreflightBlocked
-          ? "TiboTattle could not complete its secure startup checks."
-          : "Your Mac app data needs to be transferred before TiboTattle can start.",
-        detail: credentialPreflightBlocked
-          ? "Your existing app data has not been changed. Quit and try again."
-          : "Run the guided migration again. Your existing data has been preserved.",
+        title: "Unable to finish updating TiboTattle",
+        message: "TiboTattle could not finish transferring your existing data.",
+        detail: "Your history and settings have been preserved. Quit and reopen TiboTattle to try again. If this continues, contact support."
+          + (["TRANSFER_IDENTITY", "TRANSFER_NATIVE_APPLICATION", "TRANSFER_LOGIN_ITEM_UNREGISTER",
+            "TRANSFER_LOGIN_ITEM_STATUS", "TRANSFER_LOGIN_ITEM_REQUIRES_APPROVAL", "TRANSFER_LOGIN_ITEM_NOT_FOUND",
+            "TRANSFER_LOGIN_ITEM_STATUS_UNKNOWN", "TRANSFER_NATIVE_WRITER", "TRANSFER_OTHER_SAME_IDENTITY_RUNNING",
+            "TRANSFER_PREFERENCES", "TRANSFER_INVALID_REQUEST", "TRANSFER_UNKNOWN"].includes(handover?.supportCode)
+            ? ` Support code: ${handover.supportCode}.` : ""),
         buttons: ["Quit"], defaultId: 0, cancelId: 0, noLink: true,
       });
       deepLinkIntakeCleanup();
@@ -1223,6 +1283,7 @@ export async function launchDesktopRuntime({
       childEnvironment,
     });
   }
+  let initialSharingSnapshot = null;
   try {
     const selectedSharingBackend = sharingBackend ?? (injectedSettings
       ? { load: async () => { throw new Error("Sharing unavailable"); },
@@ -1232,7 +1293,7 @@ export async function launchDesktopRuntime({
     sharingCoordinator = createDesktopSharingCoordinator({ backend: selectedSharingBackend,
       installationState, destinationOrigin: sharingDestinationOrigin,
       onAuthorizationChanged: () => supervisor.invalidatePrivateChannel() });
-    await sharingCoordinator.initialize();
+    initialSharingSnapshot = await sharingCoordinator.initialize();
   } catch {
     // Preference or protected-store failure blocks contribution, never local use.
     const unavailable = async () => { throw shellError("desktop_sharing_unavailable"); };
@@ -1241,6 +1302,34 @@ export async function launchDesktopRuntime({
       readAuthorization: async () => ({ available: false, current: false,
         enabled: false, policyVersion: null, destinationOrigin: null }),
       updateTransport() {}, dispose() {} };
+  }
+  if (accountlessNativeCredentialUsesMac && initialSharingSnapshot?.enabled === true) {
+    while (true) {
+      try {
+        await preflightAccountlessCredential(installationCredentialBackend);
+        break;
+      } catch (error) {
+        const reason = classifyDesktopSecureStorageFailure(error);
+        if (await requestDesktopSecureStorageRecovery(runtime.dialog, reason) === "retry") {
+          continue;
+        }
+        deepLinkIntakeCleanup();
+        sharingCoordinator.dispose();
+        app.quit?.();
+        return Object.freeze({
+          status: "secure_storage_blocked",
+          secureStorageReason: reason,
+          firstRun,
+          lifecycle: null,
+          supervisor: null,
+          controller: null,
+          settingsStore: null,
+          settingsBackend: null,
+          ipc: createNoopIpcInstallation(),
+          childEnvironment: null,
+        });
+      }
+    }
   }
   const runtimeOwnedDownloadsRegistry = await createRuntimeOwnedDownloadsRegistry({
     app,
@@ -1768,6 +1857,7 @@ export async function launchDesktopRuntime({
         }),
         prepareForUpdate: () => lifecycle.prepareForUpdate(),
         cancelPreparedUpdate: () => lifecycle.cancelUpdatePreparation(),
+        onStatus: () => lifecycle.refreshSettings(),
       });
       await updater.start();
     }

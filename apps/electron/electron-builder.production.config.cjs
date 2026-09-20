@@ -317,9 +317,9 @@ const configuration = {
   artifactName: "TiboTattle-${version}-${os}-${arch}.${ext}",
   buildNumber: INPUTS.buildNumber,
   // electron-builder uses this for CFBundleVersion and PE FileVersion. The
-  // closed policy maps the same explicit candidate input to each platform's
-  // accepted numeric representation; ambient CI build-number variables cannot
-  // affect it.
+  // closed policy uses the canonical signed allocation on macOS and encodes
+  // the separate candidate identifier on Windows; ambient CI variables cannot
+  // affect either value.
   buildVersion: targetBuildVersion,
   directories: {
     app: path.join(targetDirectory, "app"),
@@ -388,6 +388,17 @@ if (INPUTS.targetSpec.platform === "darwin") {
     to: nativeMacOSKeychainAdapterResourcesPath,
   }];
   configuration.mac = {
+    // Preserve the native predecessor's archive-verification identity for its
+    // incoming Sparkle upgrade. No Sparkle framework/feed is installed, and
+    // electron-updater remains the only outgoing updater. Isolated rehearsal
+    // and signed staging packages do not inherit this stable trust metadata.
+    ...(!INPUTS.signedStaging
+      && INPUTS.distributionSelection.channel === distribution.PRODUCTION_ELECTRON_CHANNEL
+      ? { extendInfo: { SUPublicEDKey: distribution.PRODUCTION_ELECTRON_NATIVE_SPARKLE_PUBLIC_ED_KEY } }
+      : {}),
+    // Match the supported platform floor in the signed bundle metadata, so
+    // macOS and package managers can reject unsupported systems accurately.
+    minimumSystemVersion: "14.0",
     // electron-updater uses the prerelease package version. The guided native
     // handover reads the numeric plist fields, so tie both values to this one
     // reviewed selection rather than letting electron-builder derive one from

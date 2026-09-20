@@ -24,6 +24,10 @@ import { runProductionNativeMacHandover } from "./desktop-native-migration-macos
 import { attachDesktopKeychainBroker } from "./desktop-keychain-broker.js";
 import { loadDesktopMacOSCredentialBackends } from "./desktop-macos-keychain.js";
 import {
+  classifyDesktopSecureStorageFailure,
+  isDesktopSecureStorageFailure,
+} from "./desktop-secure-storage-readiness.js";
+import {
   createLinuxProductionCredentialHandover,
   createLinuxQualificationAccountObservationHandover,
 } from "./desktop-linux-secret-service.js";
@@ -93,14 +97,6 @@ const WINDOWS_ELECTRON_SMOKE_CREDENTIAL_OPERATIONS = Object.freeze({
   "credential-read-v1": "read-v1",
   "credential-delete-v1": "delete-v1",
 });
-const MACOS_CREDENTIAL_PREFLIGHT_FAILURE_CODES = new Set([
-  "KEYCHAIN_LOCKED",
-  "KEYCHAIN_DENIED",
-  "KEYCHAIN_MIGRATION_REQUIRED",
-  "broker_timeout",
-  "broker_unavailable",
-]);
-
 function isPackagedElectronApp(app) {
   return app?.isPackaged === true;
 }
@@ -975,8 +971,11 @@ export function createProductionMacCredentialHandover({
           ...(credentialBrokerEnabled ? {} : { preflightBroker: false }),
         });
       } catch (error) {
-        if (MACOS_CREDENTIAL_PREFLIGHT_FAILURE_CODES.has(error?.code)) {
-          return Object.freeze({ status: "credential_preflight_blocked" });
+        if (isDesktopSecureStorageFailure(error)) {
+          return Object.freeze({
+            status: "credential_preflight_blocked",
+            reason: classifyDesktopSecureStorageFailure(error),
+          });
         }
         throw error;
       }

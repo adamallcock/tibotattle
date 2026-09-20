@@ -34,6 +34,8 @@ export const ROOT_WORKSPACE_POLICY = Object.freeze({
     "pnpm-workspace.yaml",
   ]),
   directories: Object.freeze([
+    // Repository-scoped Codex skills are reviewed, versioned project inputs.
+    ".agents",
     ".claude",
     ".github",
     "apps",
@@ -46,6 +48,8 @@ export const ROOT_WORKSPACE_POLICY = Object.freeze({
     "local-review",
     "native",
     "packages",
+    // Repository-scoped Codex plugin source is reviewed product structure.
+    "plugins",
     // Per-version release notes. The macOS stable release runbook requires a
     // release-notes/X.Y.Z.md for every version, so this is deliberate project
     // structure rather than a generated report.

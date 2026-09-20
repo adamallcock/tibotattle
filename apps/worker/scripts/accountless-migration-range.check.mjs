@@ -1,5 +1,5 @@
 import test from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';
-import {accountlessRangeSelection,planAccountlessRangeBatch,usesRangeRecordBatch} from './accountless-migration-range.mjs';
+import {accountlessRangeSelection,planAccountlessRangeBatch,usesRangeRecordBatch,balancedSqlExpression} from './accountless-migration-range.mjs';
 const columns=['id','chunk_id','record_json','nullable_value','blob_value'];
 function fixture(){
  const db=new DatabaseSync(':memory:');db.exec(`PRAGMA foreign_keys=ON;CREATE TABLE telemetry_v1_records(id INTEGER PRIMARY KEY,chunk_id TEXT NOT NULL,record_json TEXT NOT NULL,nullable_value TEXT,blob_value BLOB);CREATE TABLE _accountless_move_telemetry_v1_records(_move_key INTEGER PRIMARY KEY,_original_rowid INTEGER,id,chunk_id,record_json,nullable_value,blob_value);CREATE TABLE _accountless_move_journal(id INTEGER PRIMARY KEY CHECK(id=1),metadata TEXT NOT NULL);CREATE TABLE _accountless_move_assertion(id INTEGER PRIMARY KEY CHECK(id=1),ok INTEGER NOT NULL CHECK(ok=1));`);
@@ -69,5 +69,17 @@ test('stale selected ranges that gain rows roll back, while a truly empty table 
   const batch=plan(db,current,{maxRows:2});db.prepare('INSERT INTO telemetry_v1_records VALUES(?,?,?,?,?)').run(-10000,'synthetic-gap','{}',null,null);const before=snapshot(db);
   assert.throws(()=>execute(db,batch),/CHECK constraint failed/);assert.deepEqual(snapshot(db),before);assert.deepEqual(state(db),current);
   db.exec('DELETE FROM telemetry_v1_records');const empty=plan(db,current,{maxRows:2});assert.equal(empty.result.rows,0);execute(db,empty);assert.equal(state(db).tableIndex,1);assert.equal(state(db).cursor,0);assert.throws(()=>execute(db,empty),/CHECK constraint failed/);
+ }finally{db.close();}
+});
+
+
+test('balanced SQL retains every term while avoiding SQLite depth failure for wide sums and conjunctions',()=>{
+ const db=new DatabaseSync(':memory:');try{
+  const terms=Array.from({length:1100},()=> '1');
+  assert.throws(()=>db.prepare('SELECT '+terms.join('+')),/Expression tree is too large/);
+  assert.equal(db.prepare('SELECT '+balancedSqlExpression(terms,'+')+' AS total').get().total,1100);
+  assert.equal(db.prepare('SELECT '+balancedSqlExpression([...terms,'0'],'AND')+' AS okay').get().okay,0);
+  assert.equal(db.prepare('SELECT '+balancedSqlExpression(terms,'AND')+' AS okay').get().okay,1);
+  assert.throws(()=>balancedSqlExpression(terms,'OR'),/EXPRESSION/);
  }finally{db.close();}
 });

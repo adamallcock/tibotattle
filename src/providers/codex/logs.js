@@ -139,3 +139,5 @@ export {
   unknownCodexTier,
   validateTierDeclaration,
 } from "./tier-normalization.js";
+
+export { createParser, digest, METHOD, MAX_STATE_BYTES } from './inference-timing.js';

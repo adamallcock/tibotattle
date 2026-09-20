@@ -58,16 +58,61 @@ export function windowsSignedInstalledNormalReceiptPath(workspace) {
   return win32.join(path(workspace), '.release-build', 'electron-windows-normal-candidate',
     'normal-candidate-smoke.json');
 }
-async function safePath(value, directory = false) {
+async function safePath(value, directory = false, inspect = lstat) {
   path(value);
   let current = win32.parse(value).root;
   const parts = value.slice(current.length).split('\\').filter(Boolean);
   for (let index = 0; index < parts.length; index += 1) {
     current = win32.join(current, parts[index]);
-    const info = await lstat(current);
+    const info = await inspect(current);
     const isDirectory = index < parts.length - 1 || directory;
     if (info.isSymbolicLink() || (isDirectory ? !info.isDirectory() : !info.isFile() || info.nlink !== 1)) fail('PATH_INVALID');
   }
+}
+function sameEvidenceFile(left, right) {
+  return right.isFile() && !right.isSymbolicLink() && right.nlink === 1n
+    && ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].every((key) => left[key] === right[key]);
+}
+async function boundedEvidence(value, maximum, { inspect = lstat, openFile = open } = {}) {
+  await safePath(value, false, inspect);
+  const before = await inspect(value, { bigint: true });
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n
+      || before.size < 1n || before.size > BigInt(maximum)) fail('EVIDENCE_FILE_INVALID');
+  const handle = await openFile(value, 'r');
+  try {
+    if (!sameEvidenceFile(before, await handle.stat({ bigint: true }))) fail('EVIDENCE_FILE_CHANGED');
+    const bytes = Buffer.alloc(Number(before.size) + 1);
+    let count = 0;
+    while (count < bytes.length) {
+      const result = await handle.read(bytes, count, bytes.length - count, count);
+      if (result.bytesRead === 0) break;
+      count += result.bytesRead;
+    }
+    if (count !== Number(before.size) || !sameEvidenceFile(before, await handle.stat({ bigint: true }))
+        || !sameEvidenceFile(before, await inspect(value, { bigint: true }))) fail('EVIDENCE_FILE_CHANGED');
+    return bytes.subarray(0, count);
+  } finally { await handle.close(); }
+}
+
+/** Preserve only the updater bytes already verified inside this installed app.
+ * The default filesystem path remains Windows-only; injection is for synthetic
+ * filesystem tests, never an alternate release execution profile. */
+export async function retainWindowsInstalledUpdateConfiguration({ installedAppPath, sourceCandidatePath,
+  expectedSha256 }, fileSystem = {}) {
+  if (!SHA256.test(expectedSha256 ?? '')) fail('UPDATER_EVIDENCE_INVALID');
+  path(installedAppPath); path(sourceCandidatePath);
+  const input = win32.join(win32.dirname(installedAppPath), 'resources', 'app-update.yml');
+  const output = win32.join(win32.dirname(sourceCandidatePath), 'app-update.yml');
+  const bytes = await boundedEvidence(input, 64 * 1024, fileSystem);
+  if (createHash('sha256').update(bytes).digest('hex') !== expectedSha256) fail('UPDATER_EVIDENCE_CHANGED');
+  await safePath(win32.dirname(output), true, fileSystem.inspect ?? lstat);
+  const handle = await (fileSystem.openFile ?? open)(output, 'wx', 0o600);
+  try { await handle.writeFile(bytes); await handle.sync(); }
+  finally { await handle.close(); }
+  const retained = await boundedEvidence(output, 64 * 1024, fileSystem);
+  if (!retained.equals(bytes)) fail('UPDATER_EVIDENCE_CHANGED');
+  return Object.freeze({ file: 'app-update.yml', bytes: bytes.length, sha256: expectedSha256,
+    origin: 'verified_installed_resources' });
 }
 async function digest(value) {
   await safePath(value);
@@ -157,13 +202,15 @@ export async function runWindowsSignedInstalled(options, {
   const receipt = { schemaVersion: 'tibotattle-windows-signed-installed-v1', status: 'failed',
     sourceRevision: options.sourceRevision, installerSha256: options.installerSha256,
     signedInstallerVerified: false, signedInstalledClosureVerified: false,
-    updaterArtifacts: null,
+    updaterArtifacts: null, sourceCandidateSha256: null, retainedAppUpdate: null,
     installation: false, normalJourney: false, uninstall: false, cleanup: false,
     credentialPersistence: 'not_requalified_by_this_normal_journey',
     hostedEnrollment: 'not_exercised', notificationDelivery: 'requires_user_test', productionReady: false };
   let ownedRoot = null, installRoot = null, installAttempted = false, installSettled = false;
   let safeToUninstall = true, errorCode = null;
   try {
+    const sourceCandidateBytes = await boundedEvidence(options.sourceCandidatePath, 128 * 1024);
+    receipt.sourceCandidateSha256 = createHash('sha256').update(sourceCandidateBytes).digest('hex');
     if (await digest(options.installerPath) !== options.installerSha256) fail('INSTALLER_HASH_MISMATCH');
     await verifySignature(options.installerPath, environment, runProgram);
     receipt.signedInstallerVerified = true;
@@ -174,7 +221,10 @@ export async function runWindowsSignedInstalled(options, {
     if (await registry(installRoot, environment, runProgram) !== 'absent-v1') fail('REGISTRY_DIRTY');
     if (await digest(options.installerPath) !== options.installerSha256) fail('INSTALLER_CHANGED');
     installAttempted = true;
-    const result = await runProgram(options.installerPath, buildWindowsNsisInstallArguments(installRoot), { environment, timeoutMs: 180_000 });
+    // The frozen signed installer completed successfully at 196 seconds on
+    // windows-2025 (2026-09-11). Keep the operation bounded while allowing the
+    // observed installer work; signature, ownership and postconditions stay strict.
+    const result = await runProgram(options.installerPath, buildWindowsNsisInstallArguments(installRoot), { environment, timeoutMs: 300_000 });
     installSettled = result?.settled === true && result.timedOut === false;
     if (!successful(result)) fail('INSTALL_FAILED');
     if (await registry(installRoot, environment, runProgram) !== 'expected-v1') fail('INSTALL_REGISTRY_INVALID');
@@ -204,6 +254,11 @@ export async function runWindowsSignedInstalled(options, {
     const after = await verifyWindowsNormalCandidateSmokePackage(normalOptions);
     if (JSON.stringify(before) !== JSON.stringify(after) || normal.artifactSha256 !== before.artifactSha256
         || normal.executableSha256 !== before.executableSha256) fail('INSTALLED_BYTES_CHANGED');
+    if (!(await boundedEvidence(options.sourceCandidatePath, 128 * 1024)).equals(sourceCandidateBytes)) fail('SOURCE_CANDIDATE_CHANGED');
+    receipt.retainedAppUpdate = await retainWindowsInstalledUpdateConfiguration({
+      installedAppPath: appPath, sourceCandidatePath: options.sourceCandidatePath,
+      expectedSha256: receipt.updaterArtifacts.packagedUpdaterConfigurationSha256,
+    });
     receipt.normalJourney = true;
     receipt.artifactSha256 = normal.artifactSha256;
     receipt.executableSha256 = normal.executableSha256;

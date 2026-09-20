@@ -5,6 +5,11 @@
  * fixed dashboard panel.
  */
 
+import {
+  isElectronDashboard,
+  resolveDesktopAppearance,
+} from "./desktop-appearance.js";
+
 const ELECTRON_API_VERSION = "v1";
 const LANGUAGE_VALUES = new Set(["system", "en", "zh-Hans", "es"]);
 const LANGUAGE_PICKER_VALUES = Object.freeze({
@@ -22,19 +27,10 @@ const DASHBOARD_SECTION_HASHES = Object.freeze({
   weekly: "#weekly",
   timeline: "#timeline",
   accounting: "#accounting",
+  projects: "#projects",
   community: "#community",
 });
 const mountedDocuments = new WeakMap();
-
-function electronDashboard(documentRef, windowRef) {
-  // The sandboxed preload exposes this exact, frozen-versioned bridge
-  // synchronously. It is the strongest startup proof: the DOM marker can be
-  // delayed because preload and page DOM events run in isolated worlds.
-  const bridge = windowRef?.tibotattleDesktop;
-  if (bridge?.version === ELECTRON_API_VERSION) return true;
-  return documentRef?.documentElement?.classList?.contains("electron-dashboard") === true
-    || documentRef?.body?.classList?.contains("electron-dashboard") === true;
-}
 
 function focusSharePanel(documentRef, windowRef) {
   const panel = documentRef?.querySelector?.("#share-panel");
@@ -143,13 +139,15 @@ function applySidebarState(documentRef, collapsed) {
   return true;
 }
 
-function readPersistedSettings(bridge, applyLanguage, applySidebar) {
+function readPersistedSettings(bridge, applyLanguage, applySidebar, applyAppearance) {
   if (typeof bridge?.getSettings !== "function") return;
   void bridge.getSettings().then((state) => {
     const candidate = state?.settings?.language ?? state?.language;
     applyLanguage(candidate);
     const sidebarCollapsed = state?.settings?.sidebarCollapsed ?? state?.sidebarCollapsed;
     applySidebar(sidebarCollapsed);
+    const appearance = state?.settings?.appearance ?? state?.appearance;
+    applyAppearance(appearance);
   }).catch(() => {});
 }
 
@@ -260,7 +258,7 @@ export function mountDesktopShell({
   documentRef = globalThis.document,
   windowRef = globalThis.window,
 } = {}) {
-  if (!electronDashboard(documentRef, windowRef)) {
+  if (!isElectronDashboard(documentRef, windowRef)) {
     return Object.freeze({ teardown() {} });
   }
   const existing = mountedDocuments.get(documentRef);
@@ -292,6 +290,11 @@ export function mountDesktopShell({
   communityLink?.addEventListener?.("click", onCommunity);
   const picker = documentRef.querySelector?.("[data-language-picker]");
   const applySidebar = (collapsed) => applySidebarState(documentRef, collapsed);
+  const applyAppearance = (preference) => {
+    const resolvedTheme = resolveDesktopAppearance(preference, { windowRef });
+    if (resolvedTheme === null) return false;
+    return dispatchAppearanceOverride(windowRef, { preference, resolvedTheme });
+  };
   let applyingLanguage = false;
   const applyLanguage = (value) => {
     if (!LANGUAGE_VALUES.has(value) || !picker) return;
@@ -316,7 +319,7 @@ export function mountDesktopShell({
   shareButton?.addEventListener?.("click", onShare);
   settingsButton.addEventListener("click", onSettings);
   picker?.addEventListener?.("change", onLanguageChange);
-  readPersistedSettings(bridge, applyLanguage, applySidebar);
+  readPersistedSettings(bridge, applyLanguage, applySidebar, applyAppearance);
   const unsubscribeCommand = installCommandBridge(
     documentRef,
     windowRef,

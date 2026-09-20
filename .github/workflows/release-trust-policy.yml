@@ -8,6 +8,10 @@ on:
       - "config/release-evidence.js"
       - "release-notes/**"
       - "scripts/check-release-notes.mjs"
+      - "scripts/lib/electron-macos-qualification-identity.mjs"
+      - "scripts/macos-bundle-version.js"
+      - "config/macos-bundle-version-plan.cjs"
+      - "config/electron-production-distribution.cjs"
       - "schemas/release-evidence-v1/**"
       - "scripts/check-release-workflow-policy.mjs"
       - "scripts/release-attestation-evidence.mjs"
@@ -20,6 +24,7 @@ on:
       - "tools/operations/validate-documentation.mjs"
       - "test/documentation-governance.test.js"
       - "test/release-*.test.js"
+      - "test/electron-macos-qualification-identity.test.mjs"
       - "test/macos-app-bundle.test.js"
       - "test/public-release-site.test.js"
       - "README.md"
@@ -38,6 +43,10 @@ on:
       - "config/release-evidence.js"
       - "release-notes/**"
       - "scripts/check-release-notes.mjs"
+      - "scripts/lib/electron-macos-qualification-identity.mjs"
+      - "scripts/macos-bundle-version.js"
+      - "config/macos-bundle-version-plan.cjs"
+      - "config/electron-production-distribution.cjs"
       - "schemas/release-evidence-v1/**"
       - "scripts/check-release-workflow-policy.mjs"
       - "scripts/release-attestation-evidence.mjs"
@@ -50,6 +59,7 @@ on:
       - "tools/operations/validate-documentation.mjs"
       - "test/documentation-governance.test.js"
       - "test/release-*.test.js"
+      - "test/electron-macos-qualification-identity.test.mjs"
       - "test/macos-app-bundle.test.js"
       - "test/public-release-site.test.js"
       - "README.md"
@@ -98,14 +108,22 @@ jobs:
       - name: Enforce immutable workflow dependencies and runner policy
         run: node ./scripts/check-release-workflow-policy.mjs
 
-      - name: Check release documentation
+      - name: Check pull-request release documentation against its ancestry
+        if: github.event_name == 'pull_request'
+        run: node ./scripts/check-release-notes.mjs --reachable-tags
+
+      - name: Check complete release documentation before publication
+        if: github.event_name != 'pull_request'
         run: node ./scripts/check-release-notes.mjs
+
+      - name: Test future-release Mac qualification admission
+        run: node --test test/electron-macos-qualification-identity.test.mjs
 
       - name: Check the checked-in Codex contract
         run: npm run codex:contract:check
 
       - name: Test release evidence and attestation contracts
-        run: node --test test/codex-contract-drift.test.js test/release-workflow-policy.test.js test/release-evidence.test.js test/release-attestation-action.test.js test/release-sbom-action.test.js
+        run: node --test test/codex-contract-drift.test.js test/release-workflow-policy.test.js test/release-evidence.test.js test/release-attestation-action.test.js test/release-sbom-action.test.js test/release-notes.test.js
 
       - name: Test public verification documentation
         run: node --test apps/web/test/community-site.test.mjs

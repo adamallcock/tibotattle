@@ -16,6 +16,10 @@ import {
   MACOS_SMOKE_RELAUNCH_FAILURE_STAGES,
   MACOS_SMOKE_TRAY_EVIDENCE_KEYS,
   macSmokeProcessAlive,
+  macUsageOptionalPanelExpectations,
+  macOptionalPanelStateValid,
+  macPriceCoverageStateValid,
+  macCacheMatrixStateValid,
   observeMacSmokeChildExit,
   readMacSyntheticFixtureTray,
   buildClosedReceipt,
@@ -1631,4 +1635,84 @@ test("tray smoke fixture reader returns only the validated preference and reject
     await writeFile(fixture.settingsPath, JSON.stringify(stored));
     await assert.rejects(readMacSyntheticFixtureTray(fixture.settingsPath), TypeError);
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test("the packaged dashboard navigation gate matches every shipped page in order", async () => {
+  const source = await readFile("scripts/smoke-electron-macos.mjs", "utf8");
+  const html = await readFile("apps/web/public/index.html", "utf8");
+  const pageKeys = [...html.matchAll(/data-nav="([^"]+)"/gu)].map((match) => match[1]);
+  const requiredKeys = source.match(/snapshot\?\.navKeys !== "([^"]+)"/u)?.[1].split(",");
+  const requiredCount = Number(source.match(/snapshot\?\.navCount !== (\d+)/u)?.[1]);
+  assert.deepEqual(requiredKeys, pageKeys);
+  assert.equal(requiredCount, pageKeys.length);
+});
+
+
+test("optional Mac usage panels follow source availability for the selected period", () => {
+  const overview = { accounting: {
+    periods: [{ periodId: "7d", events: 5, pricingCoverage: { unpricedEvents: 0 } },
+      { periodId: "history", events: 9, pricingCoverage: { unpricedEvents: 3 } }],
+    cacheSwitchImpact: { status: "available", periodId: "7d",
+      periods: [{ periodId: "all", status: "unavailable" }] },
+    cacheContinuityImpact: { status: "unavailable",
+      periods: [{ periodId: "all", status: "available" }] },
+  } };
+  assert.deepEqual(macUsageOptionalPanelExpectations(overview, "7d"), {
+    priceWarningExpected: false, switchUnavailable: false, continuityUnavailable: true,
+  });
+  assert.deepEqual(macUsageOptionalPanelExpectations(overview, "all"), {
+    priceWarningExpected: true, switchUnavailable: true, continuityUnavailable: false,
+  });
+  assert.equal(macUsageOptionalPanelExpectations(overview, "30d"), null);
+  assert.equal(macUsageOptionalPanelExpectations(overview, "unknown"), null);
+  assert.equal(macUsageOptionalPanelExpectations({}, "7d"), null);
+  assert.equal(macUsageOptionalPanelExpectations({ accounting: { periods: {} } }, "7d"), null);
+  const missingEvents = structuredClone(overview);
+  delete missingEvents.accounting.periods[0].events;
+  assert.equal(macUsageOptionalPanelExpectations(missingEvents, "7d"), null);
+  const missingCoverage = structuredClone(overview);
+  delete missingCoverage.accounting.periods[0].pricingCoverage;
+  assert.equal(macUsageOptionalPanelExpectations(missingCoverage, "7d"), null);
+  const unknown = structuredClone(overview);
+  delete unknown.accounting.cacheSwitchImpact;
+  assert.equal(macUsageOptionalPanelExpectations(unknown, "7d").switchUnavailable, null);
+  const otherPeriod = structuredClone(overview);
+  otherPeriod.accounting.cacheSwitchImpact.periodId = "24h";
+  assert.equal(macUsageOptionalPanelExpectations(otherPeriod, "7d").switchUnavailable, null);
+});
+
+test("Mac usage smoke refuses hidden available panels and absent or wrongly hidden price warnings", () => {
+  const hidden = { present: true, hidden: true, visible: false, explicitContent: false };
+  const visible = { present: true, hidden: false, visible: true, explicitContent: true };
+  assert.equal(macOptionalPanelStateValid(hidden, true), true);
+  assert.equal(macOptionalPanelStateValid(visible, false), true);
+  for (const panel of [hidden, { ...visible, present: false }, { ...visible, explicitContent: false }]) {
+    assert.equal(macOptionalPanelStateValid(panel, false), false);
+  }
+  assert.equal(macOptionalPanelStateValid({ ...hidden, hidden: false }, true), false);
+  assert.equal(macOptionalPanelStateValid({ ...hidden, present: false }, true), false);
+  assert.equal(macOptionalPanelStateValid(hidden, null), false);
+  assert.equal(macPriceCoverageStateValid(hidden, false), true);
+  assert.equal(macPriceCoverageStateValid(visible, true), true);
+  assert.equal(macPriceCoverageStateValid(hidden, true), false);
+  assert.equal(macPriceCoverageStateValid(visible, false), false);
+  assert.equal(macPriceCoverageStateValid({ ...hidden, present: false }, false), false);
+  assert.equal(macPriceCoverageStateValid({ ...hidden, explicitContent: true }, false), false);
+  assert.equal(macPriceCoverageStateValid(hidden, null), false);
+});
+
+
+test("Mac usage smoke requires the rendered memory matrix or a visible explicit empty state", () => {
+  const plot = { present: true, visible: true, plotVisible: true, plotPopulated: true,
+    emptyVisible: false, emptyContent: false };
+  assert.equal(macCacheMatrixStateValid(plot), true);
+  assert.equal(macCacheMatrixStateValid({ ...plot, plotVisible: false, plotPopulated: false,
+    emptyVisible: true, emptyContent: true }), true);
+  for (const patch of [{ present: false }, { visible: false }, { plotVisible: false }, { plotPopulated: false }]) {
+    assert.equal(macCacheMatrixStateValid({ ...plot, ...patch }), false);
+  }
+  assert.equal(macCacheMatrixStateValid({ ...plot, plotVisible: false, plotPopulated: false,
+    emptyVisible: false, emptyContent: true }), false);
+  assert.equal(macCacheMatrixStateValid({ ...plot, plotVisible: false, plotPopulated: false,
+    emptyVisible: true, emptyContent: false }), false);
 });

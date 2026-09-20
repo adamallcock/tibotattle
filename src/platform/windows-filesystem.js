@@ -51,6 +51,14 @@ const BINDING_PROVENANCE = Object.freeze({
   status: "unqualified",
   source: "unsigned-development-binding",
 });
+export const WINDOWS_SOURCE_READ_CONTRACT = 'windows-source-read-v1';
+export const WINDOWS_SOURCE_READ_METHODS = Object.freeze([
+  'openSourceFile', 'statSourceFile', 'readSourceFile', 'closeSourceFile',
+]);
+// Narrow approval, deliberately independent of unrelated filesystem writes.
+// Change only after exact-native source-reader and packaged-runtime qualification.
+export const WINDOWS_SOURCE_READ_APPROVED = false;
+
 const MANIFEST_KEYS = Object.freeze([
   "schemaVersion",
   "bindingFile",
@@ -134,7 +142,13 @@ function assertBindingManifest(manifest) {
   const bindingProvenance = manifest.bindingProvenance;
   const requiredMethods = manifest.requiredMethods;
   const manifestKeys = Object.keys(manifest);
-  const valid = manifestKeys.length === MANIFEST_KEYS.length
+  const hasSourceRead = Object.hasOwn(manifest, 'sourceRead');
+  const sourceRead = manifest.sourceRead;
+  const valid = manifestKeys.length === MANIFEST_KEYS.length + (hasSourceRead ? 1 : 0)
+    && (!hasSourceRead || (sourceRead !== null && typeof sourceRead === 'object'
+      && !Array.isArray(sourceRead) && Object.keys(sourceRead).sort().join(',') === 'approved,contractVersion'
+      && sourceRead.contractVersion === WINDOWS_SOURCE_READ_CONTRACT
+      && sourceRead.approved === WINDOWS_SOURCE_READ_APPROVED))
     && MANIFEST_KEYS.every((key) => manifestKeys.includes(key))
     && manifest.schemaVersion === BINDING_MANIFEST_SCHEMA_VERSION
     && manifest.bindingFile === BINDING_FILE_NAME
@@ -191,6 +205,7 @@ function assertBindingManifest(manifest) {
     nativeClaims: Object.freeze({ ...nativeClaims }),
     approvedPolicy: Object.freeze({ ...approvedPolicy }),
     requiredMethods: Object.freeze([...requiredMethods]),
+    ...(hasSourceRead ? { sourceRead: Object.freeze({ ...sourceRead }) } : {}),
   });
 }
 
@@ -269,6 +284,10 @@ function verifyBindingIntegrity({
       || binding.credentialMutexContractVersion !== manifest.credentialMutexContractVersion) {
     throw failure("MANIFEST_BINDING_MISMATCH");
   }
+  if (manifest.sourceRead && (binding.sourceReadContractVersion !== manifest.sourceRead.contractVersion
+      || !WINDOWS_SOURCE_READ_METHODS.every(name => typeof binding[name] === 'function'))) {
+    throw failure('MANIFEST_BINDING_MISMATCH');
+  }
   return Object.freeze({ binding, manifest });
 }
 
@@ -317,6 +336,17 @@ function loadVerifiedWindowsFilesystemBinding({
 
 export function loadWindowsFilesystemBinding(options = {}) {
   return loadVerifiedWindowsFilesystemBinding(options).binding;
+}
+
+// A read capability must be explicitly qualified by the manifest and code
+// policy. Old binaries remain compatible for their existing consumers.
+export function loadWindowsSourceReadBinding(options = {}) {
+  const { binding, manifest } = loadVerifiedWindowsFilesystemBinding(options);
+  if (manifest.sourceRead?.approved !== true
+      || manifest.approvedPolicy.credentialAuditFileGuardSafe !== true) {
+    throw failure('SOURCE_READ_UNQUALIFIED');
+  }
+  return binding;
 }
 
 function fixedOperationError(code) {

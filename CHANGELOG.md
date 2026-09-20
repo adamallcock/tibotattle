@@ -35,12 +35,38 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
+No additional changes recorded.
+
+## [0.1.23](./release-notes/0.1.23.md) - 2026-09-14
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.23) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.23) ·
+[changes since v0.1.22](https://github.com/adamallcock/tibotattle/compare/v0.1.22...v0.1.23)
+
+- Redesign remaining allowances as animated fuel tanks with one shared pace
+  forecast, explicit waiting states, reset countdowns and run-out timing.
+- Add the interactive Trends horizon with linked allowance, spending, quota
+  comparison and cumulative-drift charts, plus typed reset evidence.
+- Rename Allowance to Allowance Value and add plan-specific five-hour history
+  alongside seven-day estimates.
+- Add the cache continuity matrix with all time buckets visible, sample counts,
+  percentage-first inspection and model filtering.
+- Unify dashboard headers, reporting periods, model pickers, tables and loading
+  states; preload reports and preserve cached results during refresh.
+- Add the local usage coach and Codex plugin through the bounded, content-free
+  agent protocol.
+- Preserve exact Windows file identities and recover collector/model-timing
+  storage safely. Windows model performance remains unavailable until its
+  separate native qualification gate passes.
+- Restore four-platform release reconciliation and strengthen Mac update and
+  empty-profile qualification, with final-package Linux runtime checks.
 No changes yet.
 
 ## [0.1.22](./release-notes/0.1.22.md) - 2026-09-11
 
 **Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.22) ·
 [annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.22) ·
+[exact application source](https://github.com/adamallcock/tibotattle/commit/16a0d4dffad4b1213b28adaae139fc9ee6705837) ·
 [changes since v0.1.21](https://github.com/adamallcock/tibotattle/compare/v0.1.21...v0.1.22)
 
 Add Projects & threads and local model-performance views, with scoped cached
@@ -53,6 +79,7 @@ See the [release notes](./release-notes/0.1.22.md).
 
 **Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.21) ·
 [annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.21) ·
+[exact application source](https://github.com/adamallcock/tibotattle/commit/a651ea130dd1460e4443a037c4434f57b911fec4) ·
 [changes since v0.1.20](https://github.com/adamallcock/tibotattle/compare/v0.1.20...v0.1.21)
 
 Complete native 0.1.18's update path to Electron, preserving local history,
@@ -95,6 +122,7 @@ compact website download controls with GitHub asset links. See the
 
 This release's native Mac handover requires preserving the old app and does not
 provide an ordinary replacement upgrade. Native Sparkle updates remain separate.
+The 0.1.20 release above addresses that limitation; the checked-in 0.1.19 notes
 The 0.1.20 candidate above addresses that limitation; the checked-in 0.1.19 notes
 preserve the published release wording.
 

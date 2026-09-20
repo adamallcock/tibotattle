@@ -80,6 +80,9 @@ test("native navigation accepts only the fixed dashboard destinations", () => {
   assert.equal(windowRef.location.hash, "#timeline");
   assert.equal(navigateToDashboardSection({}, windowRef, "accounting"), true);
   assert.equal(windowRef.location.hash, "#accounting");
+  assert.equal(navigateToDashboardSection({}, windowRef, "projects"), true);
+  assert.equal(windowRef.location.hash, "#projects");
+  assert.equal(navigateToDashboardSection({}, windowRef, "#projects"), false);
   assert.equal(navigateToDashboardSection({}, windowRef, "#weekly"), false);
   assert.equal(navigateToDashboardSection({}, {}, "weekly"), false);
 });
@@ -96,6 +99,8 @@ test("desktop command bridge navigates the dashboard through the fixed section m
   assert.equal(windowRef.location.hash, "#timeline");
   commandListeners[0]({ command: "dashboardSection", section: "accounting" });
   assert.equal(windowRef.location.hash, "#accounting");
+  commandListeners[0]({ command: "dashboardSection", section: "projects" });
+  assert.equal(windowRef.location.hash, "#projects");
   commandListeners[0]({ command: "dashboardSection", section: "community" });
   assert.equal(windowRef.location.hash, "#community");
   commandListeners[0]({ command: "dashboardSection", section: "weekly", path: "/private/secret" });
@@ -122,6 +127,25 @@ test("desktop command bridge forwards only the closed automatic refresh mode", (
     { type: "tibotattle:automatic-refresh", detail: { mode: "quick" } },
     { type: "tibotattle:automatic-refresh", detail: { mode: "detailed" } },
   ]);
+  mounted.teardown();
+});
+
+test("desktop startup reapplies the persisted forced appearance", async () => {
+  const { events, windowRef } = fakeWindow();
+  windowRef.matchMedia = () => ({ matches: true });
+  windowRef.tibotattleDesktop.getSettings = async () => ({
+    settings: { appearance: "light" },
+  });
+  const mounted = mountDesktopShell({
+    documentRef: fakeDocument(),
+    windowRef,
+  });
+
+  await Promise.resolve();
+  assert.deepEqual(events.map(({ type, detail }) => ({ type, detail })), [{
+    type: "tibotattle:appearance-override",
+    detail: { preference: "light", resolvedTheme: "light" },
+  }]);
   mounted.teardown();
 });
 

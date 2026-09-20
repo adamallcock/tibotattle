@@ -467,15 +467,18 @@ export async function runTelemetryV11Sync({
   maxChunks = 500, maxDurationMs = 60_000, requestTimeoutMs = 30_000,
   maxDays = MAX_TELEMETRY_V11_DOMAIN_DAYS,
   progressStore = null, sourcePublication = null, revalidateProgress = false,
+  preparePublication = null,
 } = {}) {
   const selectedAuthorization = transportAuthorization({ consent, authorization, laboratory, rehearsal, production, serverBaseUrl });
   if (!integer(maxChunks, 2_000) || maxChunks < 1 || !integer(maxDurationMs, 300_000) || maxDurationMs < 1
       || !integer(maxDays, MAX_TELEMETRY_V11_DOMAIN_DAYS) || maxDays < 1
       || !Array.isArray(days) || days.length > maxDays || typeof readDay !== "function" || typeof createEnvelope !== "function"
       || days.some((day, index) => !dayValid(day) || (index > 0 && day <= days[index - 1]))) invalidConfiguration();
-  if (typeof revalidateProgress !== "boolean" || (progressStore !== null && (!plain(progressStore)
+  if (typeof revalidateProgress !== "boolean"
+      || (preparePublication !== null && (typeof preparePublication !== "function" || sourcePublication !== null))
+      || (progressStore !== null && (!plain(progressStore)
       || typeof progressStore.read !== "function" || typeof progressStore.write !== "function"))) invalidConfiguration();
-  const publication = progressStore === null ? null : publicationSnapshot(sourcePublication);
+  let publication = progressStore === null || preparePublication !== null ? null : publicationSnapshot(sourcePublication);
   const localDays = [...days];
   const client = transport({ serverBaseUrl, deviceAuthorization, fetchImpl, signal, clock, requestTimeoutMs }, maxDurationMs);
   let daysTotal = localDays.length;
@@ -509,6 +512,17 @@ export async function runTelemetryV11Sync({
     const capability = capabilities(await client.request("/api/v1/device/sync-capabilities"), client.origin);
     requireTransportAdmission(capability, authorization !== undefined);
     const binding = Object.freeze({ destinationOrigin: capability.destinationOrigin, enrollmentNamespace: capability.enrollmentNamespace });
+    // The local projection can depend on an existing account root as well as
+    // indexed facts. Resolve and pin that evidence under the authenticated
+    // binding before any saved prefix is trusted. The hook is pass-bounded.
+    if (preparePublication !== null) {
+      try { publication = publicationSnapshot(await client.bounded(() => preparePublication({ binding }))); }
+      catch (error) {
+        if (error instanceof SyncFailure || error instanceof PassBudgetReached) throw error;
+        stop((error?.code ?? error?.failureCode) === "local_index_changed" ? "local_index_changed" : "index_unavailable",
+          { retryable: true });
+      }
+    }
     let before = predecessor(await client.request("/api/v1/me/telemetry-v11/domain-predecessor", { body: {} }), clock);
     const fromDay = localDays.length ? [before.fromDay, localDays[0]].sort()[0] : before.fromDay;
     const throughDay = localDays.length ? [before.throughDay, localDays.at(-1)].sort().at(-1) : before.throughDay;

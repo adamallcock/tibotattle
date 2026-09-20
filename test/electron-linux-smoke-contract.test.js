@@ -1106,3 +1106,14 @@ test("Linux Electron smoke diagnostics and renderer network evidence stay closed
   assert.equal(isAllowedRendererNetworkURL("wss://example.invalid/socket", origin), false);
   assert.equal(isAllowedRendererNetworkURL("not a URL", origin), false);
 });
+
+
+test("the Linux package navigation gate matches every shipped page in order", async () => {
+  const source = await readFile("scripts/smoke-electron-linux.mjs", "utf8");
+  const html = await readFile("apps/web/public/index.html", "utf8");
+  const pageKeys = [...html.matchAll(/data-nav="([^"]+)"/gu)].map((match) => match[1]);
+  const requiredKeys = source.match(/snapshot\?\.navKeys !== "([^"]+)"/u)?.[1].split(",");
+  const requiredCount = Number(source.match(/snapshot\?\.navCount !== (\d+)/u)?.[1]);
+  assert.deepEqual(requiredKeys, pageKeys);
+  assert.equal(requiredCount, pageKeys.length);
+});

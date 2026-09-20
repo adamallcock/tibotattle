@@ -1518,7 +1518,10 @@ export function reserveLinuxInspectablePageTargets(
 function assertRendererShellSnapshot(snapshot) {
   if (snapshot?.topbar !== true) fail("Electron Linux top bar is not visible");
   if (snapshot?.sidebar !== true) fail("Electron Linux sidebar is not visible");
-  if (snapshot?.navCount !== 5) fail("Electron Linux navigation count is invalid");
+  if (snapshot?.navCount !== 7
+      || snapshot?.navKeys !== "overview,weekly,trends,performance,method,projects,community") {
+    fail("Electron Linux navigation count is invalid");
+  }
   if (snapshot?.activeLinkCount !== 1) fail("Electron Linux active navigation is invalid");
   if (snapshot?.activePageCount !== 1) fail("Electron Linux active page is invalid");
   if (snapshot?.refresh !== true) fail("Electron Linux refresh control is missing");
@@ -1549,6 +1552,7 @@ async function assertRendererShell(cdp) {
       topbar: visible(document.querySelector(".topbar")),
       sidebar: visible(document.querySelector(".dashboard-sidebar")),
       navCount: navLinks.length,
+      navKeys: navLinks.map((link) => link.dataset.nav).join(","),
       activeLinkCount: navLinks.filter((link) =>
         link.classList.contains("active")
         && link.getAttribute("aria-current") === "page",

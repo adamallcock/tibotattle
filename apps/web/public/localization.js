@@ -3,29 +3,39 @@
 // surfaces are shipped as ordinary static ES modules, and a locale choice must
 // work while the local companion is offline.
 
-import { CATALOGS } from "./i18n.generated.js";
+import {
+  CATALOGS,
+  canonicalizeLocale,
+  DEFAULT_LOCALE as CANONICAL_DEFAULT_LOCALE,
+  isLanguagePreference as canonicalIsLanguagePreference,
+  LANGUAGE_OPTIONS as CANONICAL_LANGUAGE_OPTIONS,
+  negotiateLocale as canonicalNegotiateLocale,
+  SUPPORTED_LOCALES as CANONICAL_SUPPORTED_LOCALES,
+  SYSTEM_LOCALE_PREFERENCE,
+} from "./i18n.generated.js";
 
 export const LOCALIZATION_SCHEMA_VERSION = "tibotattle-localization-v2";
-export const SYSTEM_LANGUAGE_PREFERENCE = "system";
-export const DEFAULT_LOCALE = "en-US";
-export const SUPPORTED_LOCALES = Object.freeze([
-  "en-US",
-  "zh-Hans",
-  "es",
-]);
+// Keep these browser names stable while the package owns the locale policy.
+// The generated mirror is static so this remains safe for the offline/public
+// browser boundary.
+export const SYSTEM_LANGUAGE_PREFERENCE = SYSTEM_LOCALE_PREFERENCE;
+export const DEFAULT_LOCALE = CANONICAL_DEFAULT_LOCALE;
+export const SUPPORTED_LOCALES = CANONICAL_SUPPORTED_LOCALES;
 export const LANGUAGE_PREFERENCE_STORAGE_KEY =
   "tibotattle.language-preference.v1";
 
-export const LANGUAGE_OPTIONS = Object.freeze([
+const BROWSER_LANGUAGE_LABELS = Object.freeze({
+  [SYSTEM_LANGUAGE_PREFERENCE]: "System",
+  "en-US": "English",
+  "zh-Hans": "Simplified Chinese",
+  es: "Spanish",
+});
+export const LANGUAGE_OPTIONS = Object.freeze(CANONICAL_LANGUAGE_OPTIONS.map((option) =>
   Object.freeze({
-    id: SYSTEM_LANGUAGE_PREFERENCE,
-    label: "System",
-    nativeLabel: "System",
-  }),
-  Object.freeze({ id: "en-US", label: "English", nativeLabel: "English" }),
-  Object.freeze({ id: "zh-Hans", label: "Simplified Chinese", nativeLabel: "简体中文" }),
-  Object.freeze({ id: "es", label: "Spanish", nativeLabel: "Español" }),
-]);
+    ...option,
+    label: BROWSER_LANGUAGE_LABELS[option.id],
+  })
+));
 
 // These mirror the minimum point/span gates in `fitReset` in the weekly
 // calibration contract. The browser catalog cannot import the Node-only
@@ -59,19 +69,7 @@ const RTL_LANGUAGES = new Set([
 ]);
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 
-export function canonicalLocale(value) {
-  if (typeof value !== "string" || value.trim() === "") return null;
-  try {
-    return Intl.getCanonicalLocales(value.trim())[0] ?? null;
-  } catch {
-    return null;
-  }
-}
-
-function requestedValues(value) {
-  if (Array.isArray(value)) return value;
-  return value == null ? [] : [value];
-}
+export const canonicalLocale = canonicalizeLocale;
 
 function localeParts(value) {
   const canonical = canonicalLocale(value);
@@ -93,64 +91,14 @@ function localeParts(value) {
   };
 }
 
-function normalizedSupportedLocales(supportedLocales) {
-  if (!Array.isArray(supportedLocales) || supportedLocales.length === 0) {
-    throw new TypeError("At least one supported locale is required");
-  }
-  const result = [];
-  for (const value of supportedLocales) {
-    const canonical = canonicalLocale(value);
-    if (canonical === null) {
-      throw new RangeError("Supported locales must be valid BCP 47 tags");
-    }
-    if (!result.includes(canonical)) result.push(canonical);
-  }
-  return result;
-}
-
-/**
- * Resolve a requested locale without treating Traditional Chinese as a match
- * for a Simplified-Chinese translation. Generic `zh` is intentionally not
- * enough evidence to select `zh-Hans`: its script is ambiguous.
- */
-export function negotiateLocale(
-  requestedLocales,
-  supportedLocales = SUPPORTED_LOCALES,
-  fallbackLocale = DEFAULT_LOCALE,
-) {
-  const supported = normalizedSupportedLocales(supportedLocales);
-  const fallback = canonicalLocale(fallbackLocale);
-  const resolvedFallback = fallback && supported.includes(fallback)
-    ? fallback
-    : supported[0];
-
-  for (const requestedValue of requestedValues(requestedLocales)) {
-    const requested = localeParts(requestedValue);
-    if (requested === null) continue;
-    if (supported.includes(requested.canonical)) return requested.canonical;
-
-    if (requested.language === "zh") {
-      const isSimplified = requested.script === "Hans"
-        || ["CN", "SG"].includes(requested.region);
-      if (isSimplified && supported.includes("zh-Hans")) return "zh-Hans";
-      continue;
-    }
-
-    const languageMatch = supported.find((candidate) =>
-      localeParts(candidate)?.language === requested.language);
-    if (languageMatch) return languageMatch;
-  }
-  return resolvedFallback;
-}
+export const negotiateLocale = canonicalNegotiateLocale;
 
 export function directionForLocale(locale) {
   const language = localeParts(locale)?.language;
   return language && RTL_LANGUAGES.has(language) ? "rtl" : "ltr";
 }
 
-export function isLanguagePreference(value) {
-  return value === SYSTEM_LANGUAGE_PREFERENCE || SUPPORTED_LOCALES.includes(value);
-}
+export const isLanguagePreference = canonicalIsLanguagePreference;
 
 function interpolate(message, values = {}) {
   if (typeof message !== "string") return "";
@@ -167,11 +115,19 @@ function interpolate(message, values = {}) {
 // product-owned legacy nodes only.
 export const WEB_MESSAGES = Object.freeze({
   ...Object.fromEntries(Object.keys(CATALOGS[DEFAULT_LOCALE])
-    .filter((key) => key.startsWith("contribution.")
+    .filter((key) => key.startsWith("allowance.")
+      || key.startsWith("trends.")
+      || key.startsWith("contribution.")
+      || key.startsWith("page.")
+      || key.startsWith("reporting.")
+      || key.startsWith("setup.")
+      || key.startsWith("workUsage.")
+      || key.startsWith("performance.")
       || key.startsWith("appearance.")
       || key.startsWith("electron.")
-      || key.startsWith("weekly.controls.")
-      || key.startsWith("accounting.cacheImpact.bullet"))
+      || key.startsWith("weekly.")
+      || key.startsWith("accounting.cacheImpact.bullet")
+      || key.startsWith("accounting.cacheContinuity.matrix."))
     .map((key) => [key, SUPPORTED_LOCALES.map((locale) => CATALOGS[locale][key])])),
   "dashboard.title": ["Usage overview", "使用概览", "Resumen de uso"],
   "usage.events": ["Usage events: {count}", "使用事件：{count}", "Eventos de uso: {count}"],
@@ -233,6 +189,11 @@ export const WEB_MESSAGES = Object.freeze({
   "dashboard.quota.providerPlan": ["Provider-reported plan: {plan}", "提供方报告的方案：{plan}", "Plan informado por el proveedor: {plan}"],
   "dashboard.quota.providerPlanUnavailable": ["Provider-reported plan unavailable", "提供方报告的方案不可用", "Plan informado por el proveedor no disponible"],
   "shareCard.showInFinder": ["Show in Finder", "在访达中显示", "Mostrar en Finder"],
+  "dashboard.quota.stale": ["Out of date", "已过期", "Desactualizado"],
+  "dashboard.freshness.observation": ["Latest observation", "最新观测", "Última observación"],
+  "dashboard.freshness.stale": ["Observation out of date", "观测数据已过期", "Observación desactualizada"],
+  "dashboard.stale.observationTitle": ["Results need an update", "结果需要更新", "Los resultados necesitan actualizarse"],
+  "dashboard.stale.observationCopy": ["Showing the last available results. Update local usage to check for newer measurements.", "显示最近可用的结果。更新本地使用量以检查更新的测量数据。", "Se muestran los últimos resultados disponibles. Actualiza el uso local para comprobar si hay mediciones más recientes."],
   "dashboard.quota.remaining": ["{value} remaining", "剩余 {value}", "{value} restante"],
   "dashboard.quota.used": ["{value} used", "已使用 {value}", "{value} usado"],
   "dashboard.quota.usedUnknown": ["Used unknown", "已用量未知", "Uso desconocido"],
@@ -277,6 +238,21 @@ export const WEB_MESSAGES = Object.freeze({
     "Your older history has not been indexed yet",
     "尚未索引你更早的历史记录",
     "Tu historial anterior aún no se ha indexado",
+  ],
+  "dashboard.history.scanFinished": [
+    "History scan finished",
+    "历史记录扫描已完成",
+    "Exploración del historial finalizada",
+  ],
+  "dashboard.history.indexedSources": [
+    "{indexed} of {total} discovered sources indexed ({bytesIndexed} of {bytesTotal}).",
+    "已索引 {total} 个已发现来源中的 {indexed} 个（{bytesIndexed}/{bytesTotal}）。",
+    "{indexed} de {total} fuentes descubiertas indexadas ({bytesIndexed} de {bytesTotal}).",
+  ],
+  "dashboard.history.summaryUnavailable": [
+    "The current accounting summary is unavailable. Update local usage to retry.",
+    "当前核算摘要不可用。请更新本地使用情况以重试。",
+    "El resumen contable actual no está disponible. Actualiza el uso local para reintentarlo.",
   ],
   "dashboard.history.partialHeadline": [
     "Local history available · {sources} unavailable",
@@ -678,14 +654,14 @@ export const WEB_MESSAGES = Object.freeze({
   // the `data-i18n-skip` attribute the SVG text nodes must keep.
   "chart.seriesValue": ["{label}: {value}", "{label}：{value}", "{label}: {value}"],
   "chart.timeZoneNote": ["Times shown in {timeZone}.", "时间显示为 {timeZone}。", "Las horas se muestran en {timeZone}."],
-  "chart.axis.apiEquivalentPerHour": ["$ Standard API equivalent per hour", "每小时的 Standard API 等价美元", "$ equivalente de API Standard por hora"],
-  "chart.axis.apiEquivalentPerDay": ["$ Standard API equivalent per day", "每天的 Standard API 等价美元", "$ equivalente de API Standard por día"],
-  "chart.axis.apiEquivalentPerWeek": ["$ Standard API equivalent per week", "每周的 Standard API 等价美元", "$ equivalente de API Standard por semana"],
-  "chart.axis.apiEquivalentPerInterval": ["$ Standard API equivalent per interval", "每个间隔的 Standard API 等价美元", "$ equivalente de API Standard por intervalo"],
-  "chart.axis.quotaWeightedPerHour": ["$ speed-priced API equivalent per hour", "每小时的按速度档定价 API 等价美元", "$ equivalente de API con precio según velocidad por hora"],
-  "chart.axis.quotaWeightedPerDay": ["$ speed-priced API equivalent per day", "每天的按速度档定价 API 等价美元", "$ equivalente de API con precio según velocidad por día"],
-  "chart.axis.quotaWeightedPerWeek": ["$ speed-priced API equivalent per week", "每周的按速度档定价 API 等价美元", "$ equivalente de API con precio según velocidad por semana"],
-  "chart.axis.quotaWeightedPerInterval": ["$ speed-priced API equivalent per interval", "每个间隔的按速度档定价 API 等价美元", "$ equivalente de API con precio según velocidad por intervalo"],
+  "chart.axis.apiEquivalentPerHour": ["API equivalent per hour", "每小时 API 等值", "Equivalente de API por hora"],
+  "chart.axis.apiEquivalentPerDay": ["API equivalent per day", "每天 API 等值", "Equivalente de API por día"],
+  "chart.axis.apiEquivalentPerWeek": ["API equivalent per week", "每周 API 等值", "Equivalente de API por semana"],
+  "chart.axis.apiEquivalentPerInterval": ["API equivalent per interval", "每间隔 API 等值", "Equivalente de API por intervalo"],
+  "chart.axis.quotaWeightedPerHour": ["API equivalent per hour", "每小时 API 等值", "Equivalente de API por hora"],
+  "chart.axis.quotaWeightedPerDay": ["API equivalent per day", "每天 API 等值", "Equivalente de API por día"],
+  "chart.axis.quotaWeightedPerWeek": ["API equivalent per week", "每周 API 等值", "Equivalente de API por semana"],
+  "chart.axis.quotaWeightedPerInterval": ["API equivalent per interval", "每间隔 API 等值", "Equivalente de API por intervalo"],
   "chart.axis.apiEquivalentPerSevenDays": ["$ speed-priced API equivalent per seven-day allowance", "每个七天额度的按速度档定价 API 等价美元", "$ equivalente de API con precio según velocidad por asignación de siete días"],
   "chart.axis.sevenDayAllowanceRemaining": ["Seven-day allowance remaining (%)", "七天额度剩余（%）", "Asignación de siete días restante (%)"],
   "chart.series.apiEquivalentUsage": ["API-price-equivalent usage", "API 价格等价使用量", "Uso equivalente al precio de API"],
@@ -694,10 +670,10 @@ export const WEB_MESSAGES = Object.freeze({
   "chart.series.sevenDayAllowanceRemaining": ["Seven-day allowance remaining", "七天额度剩余", "Asignación de siete días restante"],
   "chart.usage.title": ["Real local speed-priced API-equivalent usage over time", "真实本地按速度档定价 API 等价使用量随时间变化", "Uso local real equivalente de API con precio según velocidad a lo largo del tiempo"],
   "chart.usage.description": ["Local speed-priced API-equivalent usage per {unit}, using recorded or selected Codex speed and published Fast (Priority) price ratios, with the provider-observed seven-day allowance remaining on the right axis. Times are shown in {timeZone}.", "按{unit}显示的本地按速度档定价 API 等价使用量，使用已记录或所选的 Codex 速度及经审核的 Fast 倍数；右轴为提供方观测到的七天额度剩余。时间显示为 {timeZone}。", "Uso local equivalente de API con precio según velocidad por {unit}, con la velocidad de Codex registrada o seleccionada y multiplicadores de precio Fast (Priority) publicados; la cuota restante de siete días observada por el proveedor aparece en el eje derecho. Las horas se muestran en {timeZone}."],
-  "chart.usage.heading": ["Speed-priced API-equivalent usage by {unit} · latest {range}", "按{unit}的按速度档定价 API 等价使用量 · 最近 {range}", "Uso equivalente de API con precio según velocidad por {unit} · periodo reciente: {range}"],
+  "chart.usage.heading": ["Speed-priced API-equivalent usage by {unit}", "按{unit}的按速度档定价 API 等价使用量", "Uso equivalente de API con precio según velocidad por {unit}"],
   "chart.usage.standardTitle": ["Standard-rate API-equivalent usage over time", "Standard 费率 API 等价使用量随时间变化", "Uso equivalente de API con tarifa Standard a lo largo del tiempo"],
   "chart.usage.standardDescription": ["Local Standard-rate API-equivalent usage per {unit}. The allowance series is omitted because no matching speed-priced capacity is available. Times are shown in {timeZone}.", "按{unit}显示的本地 Standard 费率 API 等价使用量。由于没有匹配的按速度档定价容量，因此不显示额度序列。时间显示为 {timeZone}。", "Uso local equivalente de API con tarifa Standard por {unit}. Se omite la serie de cuota porque no hay una capacidad ponderada coincidente. Las horas se muestran en {timeZone}."],
-  "chart.usage.standardHeading": ["Standard-rate API-equivalent usage by {unit} · latest {range}", "按{unit}的 Standard 费率 API 等价使用量 · 最近 {range}", "Uso equivalente de API con tarifa Standard por {unit} · periodo reciente: {range}"],
+  "chart.usage.standardHeading": ["Standard-rate API-equivalent usage by {unit}", "按{unit}的 Standard 费率 API 等价使用量", "Uso equivalente de API con tarifa Standard por {unit}"],
   "chart.usage.emptyTitle": ["No real usage timeline loaded", "未加载真实使用情况时间线", "No se cargó ninguna cronología de uso real"],
   "chart.usage.emptyCopy": ["Analyze local usage to build recent content-free usage buckets.", "分析本地使用情况以构建近期不含内容的使用分桶。", "Analiza el uso local para crear intervalos recientes de uso sin contenido."],
   "chart.usage.newerBuildTitle": ["A newer build is required to read this usage history", "需要较新版本才能读取此使用历史记录", "Se necesita una versión más reciente para leer este historial de uso"],
@@ -746,7 +722,7 @@ export const WEB_MESSAGES = Object.freeze({
   "weekly.headline.insufficient": ["Insufficient evidence", "证据不足", "Evidencia insuficiente"],
   "weekly.headline.range": ["80% across-reset range, all data: {lower}–{upper}", "全部数据的 80% 跨重置区间：{lower}–{upper}", "Intervalo del 80 % entre restablecimientos, todos los datos: {lower}–{upper}"],
   "weekly.headline.rangeUnavailable": ["No evidence interval available", "没有可用的证据区间", "No hay intervalo de evidencia disponible"],
-  "weekly.headline.relationship": ["The headline is the median of all {qualifying} qualifying reset estimates and never moves with the controls below. The chart is currently drawing {shown} of {total} estimates: the selected range, anchored at the newest fit ({anchor}), with observed quota spans of {span}.", "标题为全部 {qualifying} 个合格重置估计的中位数，不会随下方控件变化。图表当前绘制 {total} 个估计中的 {shown} 个：所选范围以最新拟合（{anchor}）为锚点，且观测额度跨度为{span}。", "El titular es la mediana de las {qualifying} estimaciones de restablecimiento válidas y nunca cambia con los controles de abajo. El gráfico dibuja actualmente {shown} de {total} estimaciones: el intervalo seleccionado, anclado en el ajuste más reciente ({anchor}), con intervalos de cuota observada de {span}."],
+  "weekly.headline.relationship": ["The headline is the median of all {qualifying} qualifying reset estimates and never moves with the controls below. The chart is currently drawing {shown} of {total} estimates: the selected reporting range through {anchor}, with observed quota spans of {span}.", "标题为全部 {qualifying} 个合格重置估计的中位数，不会随下方控件变化。图表当前绘制 {total} 个估计中的 {shown} 个：所选报告范围截至 {anchor}，且观测额度跨度为{span}。", "El titular es la mediana de las {qualifying} estimaciones de restablecimiento válidas y nunca cambia con los controles de abajo. El gráfico dibuja actualmente {shown} de {total} estimaciones: el rango de informe seleccionado hasta {anchor}, con intervalos de cuota observada de {span}."],
   "weekly.headline.pending": ["The estimate will appear when enough quota transitions can be matched to priced usage. The headline will then summarize all data, while the controls below filter only the chart.", "当有足够的额度变化可以与已定价的使用量匹配时，估计值就会出现。届时标题将汇总全部数据，而下方控件只会筛选图表。", "La estimación aparecerá cuando haya suficientes transiciones de cuota que puedan asociarse a uso con precio. Entonces el titular resumirá todos los datos, mientras que los controles de abajo solo filtran el gráfico."],
   "weekly.span.all": ["All spans", "全部跨度", "Todos los intervalos"],
   // The slider's own readout says "All spans"; a sentence has to say the same
@@ -835,14 +811,14 @@ export const WEB_MESSAGES = Object.freeze({
     "Mezcla del intervalo (todo el período seleccionado, no solo esta ventana): sobre todo {model}, velocidad {speed}.",
   ],
   "divergence.breakdown.show": [
-    "Show this window's cost mix",
-    "显示此窗口的成本构成",
-    "Mostrar la mezcla de costes de esta ventana",
+    "Models & speeds",
+    "模型与速度",
+    "Modelos y velocidades",
   ],
   "divergence.breakdown.hide": [
-    "Hide this window's cost mix",
-    "隐藏此窗口的成本构成",
-    "Ocultar la mezcla de costes de esta ventana",
+    "Hide breakdown",
+    "隐藏明细",
+    "Ocultar desglose",
   ],
   "divergence.breakdown.loading": [
     "Repricing this window…",
@@ -885,14 +861,14 @@ export const WEB_MESSAGES = Object.freeze({
     "No hay eventos de uso con precio en esta ventana.",
   ],
   "divergence.breakdown.unavailable": [
-    "Per-window cost mix is unavailable from this companion — range mix instead: mostly {model}, {speed} speed.",
-    "此伴随程序无法提供逐窗口成本构成——改用范围构成：以 {model} 为主，{speed} 速度。",
-    "La mezcla de costes por ventana no está disponible en este acompañante; en su lugar, la mezcla del intervalo: sobre todo {model}, velocidad {speed}.",
+    "This period’s breakdown could not be loaded. For context, the whole selected range is mostly {model}, {speed} speed; that does not describe this period.",
+    "无法加载此时段明细。作为背景，整个所选范围以 {model}、{speed} 速度为主，但这不代表此时段。",
+    "No se pudo cargar el desglose del período. Como contexto, todo el intervalo seleccionado usa principalmente {model}, velocidad {speed}; esto no describe este período.",
   ],
   "divergence.breakdown.unavailablePlain": [
-    "Per-window cost mix is unavailable from this companion.",
-    "此伴随程序无法提供逐窗口成本构成。",
-    "La mezcla de costes por ventana no está disponible en este acompañante.",
+    "This period’s breakdown could not be loaded.",
+    "无法加载此时段明细。",
+    "No se pudo cargar el desglose del período.",
   ],
   "divergence.empty": [
     "No sustained divergence in this range — observed and priced usage track within the noise band.",
@@ -904,10 +880,10 @@ export const WEB_MESSAGES = Object.freeze({
     "此范围尚无累计漂移序列——请在已连接本地伴随程序的情况下打开，以检测背离时段。",
     "Aún no hay una serie de deriva acumulada para este intervalo: ábrelo con el acompañante local conectado para detectar períodos de divergencia.",
   ],
-  "divergence.truncated": [
-    "Showing the {shown} widest of {total} detected periods.",
-    "在检测到的 {total} 个时段中显示最显著的 {shown} 个。",
-    "Mostrando los {shown} más amplios de {total} períodos detectados.",
+  "divergence.pagination.page": [
+    "{start}–{end} of {total} periods · largest gap first",
+    "第 {start}–{end} 个，共 {total} 个时段 · 最大差距优先",
+    "{start}–{end} de {total} períodos · mayor diferencia primero",
   ],
   "divergence.methodCaveat": [
     "Known limitation: the expected line prices every model at one blended rate, so a stretch dominated by a single model can read as divergence. A per-model expected line is planned.",

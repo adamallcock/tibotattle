@@ -1,6 +1,6 @@
 {
   "schemaVersion": "tool-inventory-v0.1",
-  "reviewedAt": "2026-08-27",
+  "reviewedAt": "2026-09-14",
   "scope": "Executable and executable-adjacent sources under root scripts/** and tools/**, legacy root report builders and verifiers, and product contribution preparation.",
   "records": [
     {
@@ -12,7 +12,8 @@
       "additionalAliases": [],
       "callers": [
         "test/release-publication.test.js",
-        "docs/runbooks/release-publication-reconciliation.md"
+        "docs/runbooks/release-publication-reconciliation.md",
+        "scripts/publish-electron-stable-feed.mjs"
       ],
       "decision": "retain_as_reviewed_release_support",
       "provenance": "docs/runbooks/release-publication-reconciliation.md",
@@ -123,6 +124,9 @@
         "scripts/lib/release-qualification-cache.mjs",
         "test/release-qualification-cache.test.js",
         "test/release-publication.test.js",
+        "scripts/prepare-electron-stable-publication.mjs",
+        "scripts/publish-electron-stable-feed.mjs",
+        "test/electron-stable-writer.test.js",
         "scripts/lib/electron-public-site.mjs",
         "test/electron-public-site.test.js"
       ],
@@ -243,14 +247,11 @@
       ],
       "callers": [
         "apps/local/README.md",
-        "apps/local/electron-static-assets.test.mjs",
         "apps/macos/README.md",
         "apps/worker/scripts/check-deployment-endpoints.mjs",
         "package.json#scripts.product:macos:build",
         "package.json#scripts.product:macos:preview:build",
         "package.json#scripts.product:macos:preview:validate",
-        "scripts/build-electron-runtime.mjs",
-        "scripts/build-public-release-site.js",
         "scripts/install-macos-preview-app.js",
         "scripts/macos-release-core.js",
         "scripts/package-macos-dmg.js",
@@ -258,12 +259,11 @@
         "scripts/validate-macos-install.js",
         "scripts/validate-macos-login-item-release.js",
         "scripts/verify-macos-preview-remote.js",
-        "test/browser-module-serving-parity.test.js",
         "test/macos-app-bundle.test.js",
         "test/macos-keychain-migration-artifact.test.js",
         "test/macos-localization.test.js",
         "test/macos-test-build.test.mjs",
-        "test/public-release-site.test.js",
+        "test/surface-manifest.test.js",
         "test/weekly-pace-macos-runtime.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
@@ -535,6 +535,7 @@
         ".github/workflows/release-trust-policy.yml",
         "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
         "docs/runbooks/macos-stable-release-runbook.md",
+        "scripts/publish-electron-stable-feed.mjs",
         "test/release-notes.test.js"
       ],
       "decision": "retain_as_release_documentation_gate",
@@ -567,6 +568,7 @@
       "callers": [
         "apps/local/electron-static-assets.test.mjs",
         "test/export-tibotattle.test.js",
+        "test/surface-manifest.test.js",
         "test/weekly-pace-macos-runtime.test.js"
       ],
       "decision": "retain_until_client_repository_cutover",
@@ -592,6 +594,25 @@
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
       "provenanceReason": "Generated browser mirror has a canonical package source and parity test, but no separate dated provenance artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "telemetry_contract",
+      "canonicalPath": "scripts/generate-i18n-electron-copy.js",
+      "stableAlias": "i18n:electron:generate",
+      "stableAliasReason": null,
+      "additionalAliases": [
+        "i18n:electron:check"
+      ],
+      "callers": [
+        "apps/electron/test/i18n-copy.test.mjs",
+        "package.json#scripts.i18n:electron:check",
+        "package.json#scripts.i18n:electron:generate"
+      ],
+      "decision": "retain_as_generated_localization_support",
+      "provenance": "docs/decisions/2026-09-13-engineering-simplification-evaluation.md",
+      "provenanceReason": null,
       "legacyPaths": []
     },
     {
@@ -697,7 +718,8 @@
         "scripts/smoke-electron-windows-normal-candidate.mjs",
         "scripts/smoke-electron-windows-nsis-lifecycle.mjs",
         "test/electron-windows-accountless-smoke.test.js",
-        "test/electron-windows-normal-candidate.test.js"
+        "test/electron-windows-normal-candidate.test.js",
+        "scripts/smoke-electron-windows-signed-installed.mjs"
       ],
       "decision": "retain_as_development_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -746,11 +768,52 @@
       "callers": [
         "scripts/build-local-review-artifact.js",
         "scripts/build-macos-app.js",
+        "scripts/lib/runtime-closure.mjs",
         "test/captured-utf8-source.test.js"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": null,
       "provenanceReason": "The helper binds captured workspace-package bytes into local-review and macOS release provenance.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_architecture",
+      "canonicalPath": "scripts/lib/runtime-closure.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Shared runtime closure and byte-capture policy is imported by surface builders and tests, not invoked as a command.",
+      "additionalAliases": [],
+      "callers": [
+        "apps/local/electron-static-assets.test.mjs",
+        "scripts/build-electron-runtime.mjs",
+        "scripts/build-macos-app.js",
+        "scripts/build-public-release-site.js",
+        "test/browser-module-serving-parity.test.js",
+        "test/public-release-site.test.js",
+        "test/surface-manifest.test.js",
+        "test/weekly-pace-macos-runtime.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/decisions/2026-09-13-engineering-simplification-evaluation.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_architecture",
+      "canonicalPath": "scripts/lib/surface-manifest.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Exact surface-manifest projections are imported by builders and tests, not invoked as a command.",
+      "additionalAliases": [],
+      "callers": [
+        "apps/local/electron-static-assets.test.mjs",
+        "scripts/build-electron-runtime.mjs",
+        "scripts/export-tibotattle.mjs",
+        "test/surface-manifest.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/decisions/2026-09-13-engineering-simplification-evaluation.md",
+      "provenanceReason": null,
       "legacyPaths": []
     },
     {
@@ -767,6 +830,7 @@
         "scripts/build-macos-app.js",
         "scripts/check-architecture-boundaries.mjs",
         "scripts/export-tibotattle.mjs",
+        "scripts/lib/runtime-closure.mjs",
         "test/application-quota-sensitivity.test.js",
         "test/architecture-boundaries.test.js",
         "test/codex-local-usage-analysis-boundary.test.js",
@@ -780,7 +844,8 @@
         "test/reporting-owner-boundary.test.js",
         "test/tool-inventory.test.js",
         "scripts/lib/release-qualification-inputs.mjs",
-        "scripts/build-electron-runtime.mjs"
+        "scripts/build-electron-runtime.mjs",
+        "test/windows-electron-release-config.test.js"
       ],
       "decision": "retain_as_internal_tooling_support",
       "provenance": null,
@@ -948,6 +1013,25 @@
     {
       "classification": "build_release_operation",
       "owner": "macos_release",
+      "canonicalPath": "scripts/lib/electron-macos-qualification-identity.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Read-only current-candidate identity admission shared by Mac qualification workflows; not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-macos-empty-profile.yml",
+        ".github/workflows/electron-macos-production-update.yml",
+        ".github/workflows/electron-macos-sparkle-transition.yml",
+        "test/electron-macos-qualification-identity.test.mjs",
+        "docs/runbooks/macos-stable-release-runbook.md"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
       "canonicalPath": "scripts/macos-bundle-version.js",
       "stableAlias": null,
       "stableAliasReason": "Internal Apple bundle-version grammar, migration epoch, and comparator shared by macOS release tools; it is not a standalone command.",
@@ -961,7 +1045,13 @@
         "scripts/sparkle-signed-feed-validation.js",
         "scripts/verify-macos-preview-remote.js",
         "test/macos-app-bundle.test.js",
-        "scripts/reconcile-release-publication.mjs"
+        "scripts/reconcile-release-publication.mjs",
+        "scripts/electron-sparkle-transition.js",
+        "test/electron-production-distribution.test.js",
+        "scripts/smoke-electron-macos-empty-profile.mjs",
+        "scripts/smoke-electron-macos-production-update.mjs",
+        "scripts/smoke-electron-macos-sparkle-transition.mjs",
+        "scripts/lib/electron-macos-qualification-identity.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/decisions/2026-08-27-local-state-schema-and-release-channel-isolation.md",
@@ -991,7 +1081,8 @@
         "test/macos-app-bundle.test.js",
         "test/macos-keychain-migration-artifact.test.js",
         "test/public-release-site.test.js",
-        "test/publish-sparkle-update.test.js"
+        "test/publish-sparkle-update.test.js",
+        "scripts/electron-sparkle-transition.js"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/runbooks/macos-stable-release-runbook.md",
@@ -1302,7 +1393,8 @@
         "scripts/generate-sparkle-appcast.js",
         "scripts/publish-sparkle-update.js",
         "test/generate-sparkle-appcast-stable-feed.test.js",
-        "test/sparkle-signed-feed-validation.test.js"
+        "test/sparkle-signed-feed-validation.test.js",
+        "scripts/smoke-electron-macos-sparkle-transition.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": null,
@@ -1999,7 +2091,8 @@
         ".github/workflows/linux-portability.yml",
         "package.json#scripts.container:electron-linux:build",
         "package.json#scripts.container:electron-linux:build:amd64",
-        "test/linux-portability-workflow.test.js"
+        "test/linux-portability-workflow.test.js",
+        ".github/workflows/electron-linux-production-package.yml"
       ],
       "decision": "retain_as_development_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -2150,7 +2243,9 @@
       "callers": [
         ".github/workflows/electron-development-packages.yml",
         "test/electron-linux-normal-packaged-smoke.test.js",
-        "scripts/smoke-electron-linux-real-appimage-updater.mjs"
+        "scripts/smoke-electron-linux-real-appimage-updater.mjs",
+        "scripts/qualify-electron-linux-final-appimage.mjs",
+        ".github/workflows/electron-linux-production-package.yml"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2182,7 +2277,8 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/electron-development-packages.yml",
-        "test/electron-windows-normal-candidate.test.js"
+        "test/electron-windows-normal-candidate.test.js",
+        "scripts/smoke-electron-windows-signed-installed.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2199,7 +2295,8 @@
       "callers": [
         ".github/workflows/electron-development-packages.yml",
         "scripts/smoke-electron-windows-normal-candidate.mjs",
-        "test/electron-windows-nsis-lifecycle.test.js"
+        "test/electron-windows-nsis-lifecycle.test.js",
+        "scripts/smoke-electron-windows-signed-installed.mjs"
       ],
       "decision": "retain_as_development_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2268,7 +2365,9 @@
       "callers": [
         "package.json#scripts.smoke:electron:macos",
         "test/electron-macos-smoke-contract.test.js",
-        "scripts/run-signed-electron-staging.mjs"
+        "scripts/run-signed-electron-staging.mjs",
+        "scripts/smoke-electron-macos-replacement.mjs",
+        "scripts/run-signed-electron-production-canary.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -2370,7 +2469,9 @@
         ".github/workflows/electron-development-packages.yml",
         "test/linux-credential-mutex-manifest.test.js",
         "test/helpers/linux-packaging-binding.js",
-        "test/linux-credential-mutex-staging.test.js"
+        "test/linux-credential-mutex-staging.test.js",
+        ".github/workflows/electron-linux-production-package.yml",
+        ".github/workflows/electron-production-source-preparation.yml"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2395,7 +2496,14 @@
         "test/electron-windows-production-signing.test.js",
         "test/windows-electron-release-config.test.js",
         "test/electron-windows-native-rebinding.test.js",
-        ".github/workflows/electron-windows-signing.yml"
+        ".github/workflows/electron-windows-signing.yml",
+        ".github/workflows/electron-linux-production-package.yml",
+        "scripts/qualify-electron-windows-frozen-installer.mjs",
+        "scripts/prepare-electron-stable-publication.mjs",
+        "test/electron-stable-publication.test.js",
+        "test/electron-stable-writer.test.js",
+        "scripts/qualify-electron-linux-final-appimage.mjs",
+        "test/electron-linux-final-appimage.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2427,7 +2535,9 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/electron-development-packages.yml",
-        "test/linux-credential-mutex-qualification.test.js"
+        "test/linux-credential-mutex-qualification.test.js",
+        ".github/workflows/electron-linux-production-package.yml",
+        ".github/workflows/electron-production-source-preparation.yml"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2443,7 +2553,9 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/electron-development-packages.yml",
-        "test/linux-credential-mutex-staging.test.js"
+        "test/linux-credential-mutex-staging.test.js",
+        ".github/workflows/electron-linux-production-package.yml",
+        ".github/workflows/electron-production-source-preparation.yml"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2524,9 +2636,13 @@
       "stableAliasReason": "Explicit disposable platform qualification; retained evidence is scoped to the exact source and artifacts.",
       "additionalAliases": [],
       "callers": [
+        "scripts/smoke-electron-macos-empty-profile.mjs",
         ".github/workflows/electron-signed-staging.yml",
         "test/electron-signed-staging-execution.test.js",
-        "scripts/run-signed-electron-production-canary.mjs"
+        "scripts/run-signed-electron-production-canary.mjs",
+        "scripts/smoke-electron-macos-production-update.mjs",
+        "scripts/smoke-electron-macos-replacement.mjs",
+        "scripts/smoke-electron-macos-sparkle-transition.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2543,7 +2659,10 @@
       "callers": [
         ".github/workflows/electron-development-packages.yml",
         "test/electron-linux-real-appimage-updater.test.js",
-        "scripts/smoke-electron-linux-real-appimage-updater.mjs"
+        "scripts/smoke-electron-linux-real-appimage-updater.mjs",
+        ".github/workflows/electron-linux-production-package.yml",
+        "scripts/qualify-electron-linux-final-appimage.mjs",
+        "test/electron-linux-final-appimage.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2576,7 +2695,9 @@
       "callers": [
         ".github/workflows/electron-production-canary.yml",
         "test/electron-production-canary.test.js",
-        "docs/plans/2026-09-09-production-accountless-activation-proposal.md"
+        "docs/plans/2026-09-09-production-accountless-activation-proposal.md",
+        "scripts/smoke-electron-macos-replacement.mjs",
+        "test/smoke-electron-macos-replacement.test.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-09-production-accountless-activation-proposal.md",
@@ -2592,7 +2713,8 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/electron-windows-signing.yml",
-        "test/electron-windows-signed-installed.test.js"
+        "test/electron-windows-signed-installed.test.js",
+        "scripts/qualify-electron-windows-frozen-installer.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2608,12 +2730,228 @@
       "additionalAliases": [],
       "callers": [
         "scripts/smoke-electron-windows-signed-installed.mjs",
-        "test/electron-windows-update-artifacts.test.js"
+        "test/electron-windows-update-artifacts.test.js",
+        ".github/workflows/electron-linux-production-package.yml",
+        "scripts/electron-sparkle-transition.js",
+        "scripts/smoke-electron-macos-production-update.mjs",
+        "scripts/prepare-electron-stable-publication.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
       "provenanceReason": null,
       "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/prepare-electron-stable-publication.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Local stable final-byte preparation and explicit GET-only readback; no publication writer.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-stable-publication.test.js",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+        "scripts/publish-electron-stable-feed.mjs",
+        "test/electron-stable-writer.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/publish-electron-stable-feed.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Protected exact-plan stable R2 publication and explicit rollback require a held shared coordination lock.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-stable-writer.test.js",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_timing_research",
+      "canonicalPath": "tools/reports/inference-timing/parser.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Opt-in local timing experiment; not loaded by the app or a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/inference-timing-experiment.test.js"
+      ],
+      "decision": "retain_as_reusable_timing_research_instrument",
+      "provenance": "docs/plans/2026-09-09-local-inference-timing.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_timing_research",
+      "canonicalPath": "tools/reports/inference-timing/store.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Opt-in local timing experiment; not loaded by the app or a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/inference-timing-experiment.test.js",
+        "tools/reports/inference-timing/run.mjs"
+      ],
+      "decision": "retain_as_reusable_timing_research_instrument",
+      "provenance": "docs/plans/2026-09-09-local-inference-timing.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_timing_research",
+      "canonicalPath": "tools/reports/inference-timing/run.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Opt-in local timing experiment; not loaded by the app or a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/inference-timing-experiment.test.js"
+      ],
+      "decision": "retain_as_reusable_timing_research_instrument",
+      "provenance": "docs/plans/2026-09-09-local-inference-timing.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_timing_research",
+      "canonicalPath": "tools/reports/inference-timing/plot.py",
+      "stableAlias": null,
+      "stableAliasReason": "Opt-in local timing experiment; not loaded by the app or a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "docs/plans/2026-09-09-local-inference-timing.md"
+      ],
+      "decision": "retain_as_reusable_timing_research_instrument",
+      "provenance": "docs/plans/2026-09-09-local-inference-timing.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/electron-sparkle-transition.js",
+      "stableAlias": null,
+      "stableAliasReason": "Internal validation of signed Electron replacements delivered by the native Sparkle publisher; not a standalone product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/publish-sparkle-update.js",
+        "scripts/reconcile-release-publication.mjs",
+        "test/electron-sparkle-transition.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/qualify-electron-windows-frozen-installer.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Restricted disposable Windows qualification of an exact previously signed installer; does not rebuild, sign, or publish it.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-windows-installer-diagnostic.yml"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": ".github/workflows/electron-windows-installer-diagnostic.yml",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/smoke-electron-macos-production-update.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit disposable post-activation acceptance of the pinned production update journey; does not publish a feed or install the candidate itself.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-macos-production-update.yml",
+        "test/smoke-electron-macos-production-update.test.mjs"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": ".github/workflows/electron-macos-production-update.yml",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/smoke-electron-macos-replacement.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit disposable signed replacement qualification with synthetic native state; never uses an existing user profile.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-macos-replacement.yml",
+        "scripts/smoke-electron-macos-production-update.mjs",
+        "scripts/smoke-electron-macos-sparkle-transition.mjs",
+        "test/smoke-electron-macos-replacement.test.mjs",
+        "test/smoke-electron-macos-sparkle-transition.test.mjs"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": ".github/workflows/electron-macos-replacement.yml",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/smoke-electron-macos-sparkle-transition.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit disposable native Sparkle-to-Electron qualification; preserves signed bytes and lets Sparkle perform the replacement.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/smoke-electron-macos-empty-profile.mjs",
+        ".github/workflows/electron-macos-sparkle-transition.yml",
+        "scripts/smoke-electron-macos-production-update.mjs",
+        "test/smoke-electron-macos-sparkle-transition.test.mjs"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": ".github/workflows/electron-macos-sparkle-transition.yml",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit release qualification helper; not a product command.",
+      "additionalAliases": [],
+      "decision": "retain_as_reviewed_release_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": [],
+      "canonicalPath": "scripts/lib/macos-transition-ui-diagnostics.mjs",
+      "callers": [
+        "scripts/smoke-electron-macos-sparkle-transition.mjs",
+        "test/macos-transition-ui-diagnostics.test.mjs"
+      ]
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit release qualification helper; not a product command.",
+      "additionalAliases": [],
+      "decision": "retain_as_reviewed_release_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": [],
+      "canonicalPath": "scripts/smoke-electron-macos-empty-profile.mjs",
+      "callers": [
+        ".github/workflows/electron-macos-empty-profile.yml",
+        "test/smoke-electron-macos-empty-profile.test.mjs"
+      ]
     },
     {
       "classification": "build_release_operation",
@@ -2628,6 +2966,91 @@
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/runbooks/2026-08-17-web-only-release.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/qualify-electron-linux-final-appimage.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Binds the isolated normal Linux runtime qualification to the exact final AppImage; does not rebuild, sign, publish, or exercise a public predecessor update.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-linux-production-package.yml",
+        "test/electron-linux-final-appimage.test.js",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/prepare-electron-macos-credential-fixture.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Compile a nonce-bound synthetic hosted credential fixture without signing or Keychain execution.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/smoke-electron-macos-credentials.mjs",
+        "scripts/lib/macos-credential-qualification-intake.mjs",
+        "test/smoke-electron-macos-credentials.test.mjs",
+        "test/fixtures/macos-keychain-migration/README.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/smoke-electron-macos-credentials.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicitly qualify scoped credential continuity with unchanged signed apps in a disposable hosted ARM account; no production upload.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-macos-credentials.yml",
+        "test/smoke-electron-macos-credentials.test.mjs"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/lib/macos-loopback-qualification.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Fixed inherited outbound denial and an actual bounded kernel enforcement probe for synthetic credential qualification.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/smoke-electron-macos-credentials.mjs",
+        "scripts/run-signed-electron-staging.mjs",
+        "test/smoke-electron-macos-credentials.test.mjs"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/lib/macos-credential-qualification-intake.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Dependency-free closed fixture intake and reuse of source/package admission before dependencies or downloads.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-macos-credentials.yml",
+        "scripts/smoke-electron-macos-credentials.mjs",
+        "test/smoke-electron-macos-credentials.test.mjs"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
       "provenanceReason": null,
       "legacyPaths": []
     }

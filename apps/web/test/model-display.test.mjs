@@ -85,6 +85,9 @@ test("model table preserves unavailable, unreviewed, separate-allowance and pric
     const astra = byName("GPT-6 Astra");
     assert.equal(astra.children[0].children[2].title, "gpt-6-astra");
     assert.equal(contents(astra.children[4]), "$5.00");
+    const astraIcon = astra.children[0].children.find((child) => child.getAttribute("class") === "allowance-model-icon");
+    assert.equal(astraIcon.getAttribute("aria-hidden"), "true");
+    assert.equal(astraIcon.getAttribute("focusable"), "false");
     const unavailable = byName(t("accounting.model.identityUnavailable"));
     assert.ok(unavailable, locale);
     assert.equal(unavailable.children[0].children[1].tag, "svg");
@@ -103,9 +106,35 @@ test("model table preserves unavailable, unreviewed, separate-allowance and pric
     assert.equal(contents(byName("GPT-5.3 Codex Spark").children[4]), t("accounting.model.separateAllowance"));
     assert.equal(contents(byName("Codex Auto Review").children[4]), t("accounting.model.noPublishedPrice"));
     assert.equal(contents(byName("GPT-5.5").children[4]), "$0.00");
+    for (const name of [t("accounting.model.identityUnavailable"), t("accounting.model.unrecognized"), "Codex Auto Review"]) {
+      const icon = byName(name).children[0].children.find((child) => child.getAttribute("class") === "allowance-model-icon");
+      assert.ok(icon, name);
+      assert.equal(icon.getAttribute("aria-hidden"), "true");
+      assert.equal(icon.getAttribute("focusable"), "false");
+    }
+    assert.ok(byName("GPT-5.3 Codex Spark").children[0].children.some((child) => child.getAttribute("class") === "allowance-model-icon"));
     render({ modelUsage: [] }, { unavailable: true });
     assert.equal(contents(body), t("accounting.model.unavailable"));
     render({ modelUsage: [] });
     assert.equal(contents(body), t("accounting.model.noneInPeriod"));
   }
+});
+
+test("shared model icons preserve established aliases without inventing unknown identities", () => {
+  const documentRef = { createElementNS: (_namespace, tag) => element(tag) };
+  for (const [id, theme] of [
+    ["gpt-6-astra", "astra"], ["gpt-5.6-sol-wm", "sol"],
+    ["gpt-5.6-terra", "terra"], ["gpt-5.6-luna", "luna"],
+    ["gpt-5.5-codex", "classic"], ["gpt-5.3-codex-spark", "spark"],
+  ]) {
+    const presentation = modelUsagePresentation(id);
+    assert.equal(presentation.theme, theme);
+    assert.equal(modelThemeIcon(documentRef, presentation.theme).tag, "svg");
+  }
+  for (const id of ["unknown", "gpt-6-unreviewed", null]) {
+    assert.equal(modelUsagePresentation(id).theme, "generic");
+    assert.equal(modelThemeIcon(documentRef, modelUsagePresentation(id).theme).tag, "svg");
+  }
+  assert.equal(modelUsagePresentation("codex-auto-review").theme, "review");
+  assert.equal(modelThemeIcon(documentRef, "review").tag, "svg");
 });

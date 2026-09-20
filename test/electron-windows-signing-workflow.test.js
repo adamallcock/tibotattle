@@ -106,3 +106,32 @@ test("Windows signing workflow registers safely, while signing stays manual and 
   assert.match(retained, /evidence\/windows-builder-failure\.envelope\.json/u);
   assert.match(retained, /electron-windows-normal-candidate\/normal-candidate-smoke\.json/u);
 });
+
+test("signed Windows artifact retention includes only explicit final evidence paths", async () => {
+  const workflow = await readFile(workflowPath, "utf8");
+  const retained = workflow.slice(workflow.indexOf("      - name: Retain the signed installer and content-free evidence"));
+  const paths = retained.split("          path: |\n")[1].split("          if-no-files-found:")[0]
+    .trim().split("\n").map((line) => line.trim());
+  const root = ".release-build/electron-production/win32-x64";
+  assert.deepEqual(paths, [
+    `${root}/artifacts/TiboTattle-*-Windows-x64.exe`,
+    `${root}/artifacts/TiboTattle-*-Windows-x64.exe.blockmap`,
+    `${root}/artifacts/latest.yml`,
+    `${root}/production-source-candidate.json`,
+    `${root}/app-update.yml`,
+    `${root}/evidence/windows-signing-operation-ledger.json`,
+    `${root}/evidence/windows-builder-failure.envelope.json`,
+    `${root}/windows-native-rebinding/rebound.json`,
+    `${root}/evidence/windows-signed-installed.json`,
+    ".release-build/electron-windows-normal-candidate/normal-candidate-smoke.json",
+  ]);
+  // The actual installed configuration is retained before the owned app is
+  // uninstalled, and only against the digest from final-byte verification.
+  const harness = await readFile(new URL("../scripts/smoke-electron-windows-signed-installed.mjs", import.meta.url), "utf8");
+  const run = harness.slice(harness.indexOf("export async function runWindowsSignedInstalled("));
+  assert.match(run, /sourceCandidateSha256 = createHash\('sha256'\)\.update\(sourceCandidateBytes\)/u);
+  assert.match(run, /boundedEvidence\(options\.sourceCandidatePath, 128 \* 1024\)\)\.equals\(sourceCandidateBytes\)/u);
+  assert.match(run, /expectedSha256: receipt\.updaterArtifacts\.packagedUpdaterConfigurationSha256/u);
+  assert.ok(run.indexOf("receipt.retainedAppUpdate = await retainWindowsInstalledUpdateConfiguration")
+    < run.indexOf("buildWindowsNsisUninstallArguments(installRoot)"));
+});

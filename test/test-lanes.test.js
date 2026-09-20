@@ -81,6 +81,10 @@ test("test-lane arguments retain explicit paths and reject ambiguous input", () 
     parseTestLaneArguments(["--help"]),
     { command: "help", base: null, full: false, paths: [] },
   );
+  assert.deepEqual(
+    parseTestLaneArguments(["i18n"]),
+    { command: "i18n", base: null, full: false, paths: [] },
+  );
   for (const argv of [
     ["changed", "--unexpected"],
     ["unknown"],
@@ -161,6 +165,14 @@ test("test-lane selection narrows only paths with complete executable coverage",
     selectTestLanes(["packages/i18n/index.js"]).lanes,
     ["i18n"],
   );
+  for (const path of [
+    "scripts/generate-i18n-browser-mirror.js",
+    "scripts/generate-i18n-electron-copy.js",
+    "apps/electron/desktop-copy-source.js",
+    "apps/electron/desktop-copy.js",
+  ]) {
+    assert.deepEqual(selectTestLanes([path]).lanes, ["i18n"], path);
+  }
   for (const path of [
     "apps/web/public/app.js",
     "apps/local/server.js",

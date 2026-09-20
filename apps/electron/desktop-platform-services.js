@@ -82,8 +82,10 @@ function normalizeMacLoginItem(settings) {
   const status = settings?.status;
   if (status === "requires-approval") return "needs-approval";
   if (status === "enabled" && settings?.openAtLogin === true) return "enabled";
-  if (status === "not-registered" || status === "not-found"
-      || settings?.openAtLogin === false) return "disabled";
+  // A missing ServiceManagement entry does not establish the user's startup
+  // preference. Preserve that uncertainty instead of presenting an opt-out.
+  if (status === "not-found") return "unavailable";
+  if (status === "not-registered" && settings?.openAtLogin === false) return "disabled";
   return "error";
 }
 

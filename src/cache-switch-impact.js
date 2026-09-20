@@ -1,4 +1,7 @@
-import { codexCacheReasoningConfiguration } from "@app-usagemonitor/telemetry-contract";
+import {
+  codexCacheReasoningConfiguration,
+  REVIEWED_CODEX_MODEL_IDS,
+} from "@app-usagemonitor/telemetry-contract";
 import {
   emptySpeedWeightingCrossing,
   fastModeModelFamilyKey,
@@ -25,10 +28,18 @@ export const MAX_CACHE_SWITCH_RECENT_DETAILS = 20;
 // product show how the pattern changes with age without asserting a cache TTL.
 export const CACHE_CONTINUITY_MINIMUM_GAP_MS = 0;
 export const MAX_CACHE_CONTINUITY_RECENT_DETAILS = 20;
+export const MAX_CACHE_CONTINUITY_MODELS = 128;
+const CONTINUITY_MODELS = new Set(REVIEWED_CODEX_MODEL_IDS);
 export const CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_MS =
   7 * 24 * 60 * 60_000;
 
 const FUTURE_EVIDENCE_TOLERANCE_MS = 5 * 60_000;
+const COMPACTION_AWARE_PARSERS = new Set([
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
+].flatMap((version) => [version, `${version}-cache-write-zero`]));
 const CHANGE_TYPES = Object.freeze([
   "reasoning_only",
   "model_only",
@@ -256,10 +267,7 @@ function sameContinuityConfiguration(row) {
 }
 
 function compactionAwareParser(value) {
-  return value === LOCAL_UNIFIED_INDEX_PARSER_VERSION
-    || value === LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION
-    || value === LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION
-    || value === LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION;
+  return COMPACTION_AWARE_PARSERS.has(value);
 }
 
 function componentsFor(row) {
@@ -645,13 +653,8 @@ function newContinuitySummary() {
   };
 }
 
-function newContinuityPeriod(period, nowMs) {
+function newContinuityCohort() {
   return {
-    periodId: period.id,
-    periodLabel: period.label,
-    startMs: period.durationMs === null
-      ? Number.NEGATIVE_INFINITY
-      : nowMs - period.durationMs,
     summary: newContinuitySummary(),
     byGapBand: Object.fromEntries(CONTINUITY_GAP_BANDS.map((band) => [
       band.id,
@@ -672,6 +675,60 @@ function newContinuityPeriod(period, nowMs) {
     postCompactionRequests: 0,
     postCompactionCacheReadDrops: 0,
     recent: [],
+  };
+}
+
+function newContinuityPeriod(period, nowMs) {
+  return {
+    periodId: period.id,
+    periodLabel: period.label,
+    startMs: period.durationMs === null
+      ? Number.NEGATIVE_INFINITY
+      : nowMs - period.durationMs,
+    ...newContinuityCohort(),
+    byModel: new Map(),
+  };
+}
+
+function continuityModelCohort(period, model) {
+  if (period.byModel === null) return null;
+  // Model labels are registry values, never arbitrary provider strings. Keep
+  // the all-model evidence readable if a future model exceeds this contract.
+  if (!CONTINUITY_MODELS.has(model)
+      || (!period.byModel.has(model)
+        && period.byModel.size >= MAX_CACHE_CONTINUITY_MODELS)) {
+    period.byModel = null;
+    return null;
+  }
+  if (!period.byModel.has(model)) period.byModel.set(model, newContinuityCohort());
+  return period.byModel.get(model);
+}
+
+function finalizeContinuityCohort(cohort) {
+  return {
+    ...finalizeContinuitySummary(cohort.summary),
+    orderingCoverageGaps: 0,
+    postCompactionRequests: cohort.postCompactionRequests,
+    postCompactionCacheReadDrops: cohort.postCompactionCacheReadDrops,
+    byGapBand: Object.fromEntries(CONTINUITY_GAP_BANDS.map((band) => [
+      band.id,
+      {
+        gapBandLabel: cohort.byGapBand[band.id].gapBandLabel,
+        ...finalizeContinuitySummary(cohort.byGapBand[band.id].summary),
+      },
+    ])),
+    byOutcomeBucket: Object.fromEntries(CONTINUITY_OUTCOME_BUCKETS.map(
+      (bucket) => [
+        bucket.id,
+        {
+          outcomeBucketLabel: cohort.byOutcomeBucket[bucket.id].outcomeBucketLabel,
+          startSeconds: bucket.startMs / 1_000,
+          endSeconds: Number.isFinite(bucket.endMs) ? bucket.endMs / 1_000 : null,
+          ...finalizeContinuitySummary(cohort.byOutcomeBucket[bucket.id].summary),
+        },
+      ],
+    )),
+    recent: [...cohort.recent].reverse(),
   };
 }
 
@@ -914,9 +971,14 @@ export function analyzeCacheContinuityRows(rows, {
     if (compactionBetween) {
       const postCompactionDrop = materialDropFor(row);
       for (const period of applicablePeriods) {
-        period.postCompactionRequests += 1;
-        if (postCompactionDrop !== null) {
-          period.postCompactionCacheReadDrops += 1;
+        const model = CONTINUITY_MODELS.has(row.model_id)
+          ? continuityModelCohort(period, row.model_id)
+          : null;
+        for (const cohort of [period, model].filter(Boolean)) {
+          cohort.postCompactionRequests += 1;
+          if (postCompactionDrop !== null) {
+            cohort.postCompactionCacheReadDrops += 1;
+          }
         }
       }
     }
@@ -931,10 +993,15 @@ export function analyzeCacheContinuityRows(rows, {
     const outcomeBucket = outcomeBucketFor(gapMs);
     if (gapBand === null || outcomeBucket === null) continue;
 
-    const targets = applicablePeriods.flatMap((period) => [
-      period.summary,
-      period.byGapBand[gapBand.id].summary,
-      period.byOutcomeBucket[outcomeBucket.id].summary,
+    // Accumulate from the complete evidence stream; the recent drop list is
+    // bounded and cannot supply either model choices or cohort denominators.
+    const cohorts = applicablePeriods.flatMap((period) => [
+      period, continuityModelCohort(period, row.model_id),
+    ]).filter(Boolean);
+    const targets = cohorts.flatMap((cohort) => [
+      cohort.summary,
+      cohort.byGapBand[gapBand.id].summary,
+      cohort.byOutcomeBucket[outcomeBucket.id].summary,
     ]);
     if (!compactionAwareParser(row.previous_parser_version)
         || !compactionAwareParser(row.parser_version)) {
@@ -978,7 +1045,7 @@ export function analyzeCacheContinuityRows(rows, {
       addContinuityDrop(summary, drop.lostCacheTokens, premiumNanos);
       addPremiumCrossing(summary, premiumCrossing);
     }
-    for (const period of applicablePeriods) retainContinuityRecent(period, detail);
+    for (const cohort of cohorts) retainContinuityRecent(cohort, detail);
   }
   return {
     status: "available",
@@ -991,36 +1058,11 @@ export function analyzeCacheContinuityRows(rows, {
     periods: periods.map((period) => ({
       periodId: period.periodId,
       periodLabel: period.periodLabel,
-      ...finalizeContinuitySummary(period.summary),
-      // Kept only at the period total: an unorderable adjacency has no honest
-      // elapsed-time band.
-      orderingCoverageGaps: 0,
-      postCompactionRequests: period.postCompactionRequests,
-      postCompactionCacheReadDrops: period.postCompactionCacheReadDrops,
-      byGapBand: Object.fromEntries(CONTINUITY_GAP_BANDS.map((band) => [
-        band.id,
-        {
-          gapBandLabel: period.byGapBand[band.id].gapBandLabel,
-          ...finalizeContinuitySummary(period.byGapBand[band.id].summary),
-        },
-      ])),
-      byOutcomeBucket: Object.fromEntries(CONTINUITY_OUTCOME_BUCKETS.map(
-        (bucket) => [
-          bucket.id,
-          {
-            outcomeBucketLabel:
-              period.byOutcomeBucket[bucket.id].outcomeBucketLabel,
-            startSeconds: bucket.startMs / 1_000,
-            endSeconds: Number.isFinite(bucket.endMs)
-              ? bucket.endMs / 1_000
-              : null,
-            ...finalizeContinuitySummary(
-              period.byOutcomeBucket[bucket.id].summary,
-            ),
-          },
-        ],
-      )),
-      recent: [...period.recent].reverse(),
+      ...finalizeContinuityCohort(period),
+      byModel: period.byModel === null ? null : [...period.byModel]
+        .filter(([, cohort]) => cohort.summary.sameConfigurationReturns > 0)
+        .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+        .map(([model, cohort]) => ({ model, ...finalizeContinuityCohort(cohort) })),
     })),
   };
 }
@@ -1048,33 +1090,43 @@ function applyOrderingCoverage(projection, gapObservedAtMs, nowMs) {
         (count, observedAtMs) => count + (observedAtMs >= startMs ? 1 : 0),
         0,
       );
-      if (orderingCoverageGaps === 0) {
-        return { ...period, orderingCoverageGaps: 0 };
-      }
+      const withCoverage = (cohort) => {
+        if (orderingCoverageGaps === 0) {
+          return { ...cohort, orderingCoverageGaps: 0 };
+        }
+        return {
+          ...cohort,
+          orderingCoverageGaps,
+          coverageStatus: "incomplete",
+          estimatedPremiumUsd: null,
+          estimatedPremiumUsdExact: null,
+          standardApiPremiumUsd: null,
+          allowanceWeighting: {
+            status: "unavailable",
+            reasonCode: "weighting_evidence_incomplete",
+            basisFamilyId: cohort.allowanceWeighting?.basisFamilyId
+              ?? codexPrimaryAllowanceBasis(
+                "unresolved_as_standard",
+              ).basisFamilyId,
+            scenarios: Object.fromEntries(ALLOWANCE_SCENARIOS.map((scenario) => {
+              const existing = cohort.allowanceWeighting?.scenarios?.[scenario];
+              return [scenario, {
+                ...(existing ?? {}),
+                status: "unavailable",
+                reasonCode: "weighting_evidence_incomplete",
+                quotaWeightedPremiumUsd: null,
+              }];
+            })),
+          },
+        };
+      };
       return {
-        ...period,
-        orderingCoverageGaps,
-        coverageStatus: "incomplete",
-        estimatedPremiumUsd: null,
-        estimatedPremiumUsdExact: null,
-        standardApiPremiumUsd: null,
-        allowanceWeighting: {
-          status: "unavailable",
-          reasonCode: "weighting_evidence_incomplete",
-          basisFamilyId: period.allowanceWeighting?.basisFamilyId
-            ?? codexPrimaryAllowanceBasis(
-              "unresolved_as_standard",
-            ).basisFamilyId,
-          scenarios: Object.fromEntries(ALLOWANCE_SCENARIOS.map((scenario) => {
-            const existing = period.allowanceWeighting?.scenarios?.[scenario];
-            return [scenario, {
-              ...(existing ?? {}),
-              status: "unavailable",
-              reasonCode: "weighting_evidence_incomplete",
-              quotaWeightedPremiumUsd: null,
-            }];
-          })),
-        },
+        ...withCoverage(period),
+        ...(Array.isArray(period.byModel) ? {
+          // Unordered sessions have no reliable model attribution. The gap
+          // qualifies every model total; it never invents bucket membership.
+          byModel: period.byModel.map(withCoverage),
+        } : {}),
       };
     }),
   };

@@ -23,7 +23,11 @@ const REPORTING_IMPLEMENTATIONS = Object.freeze({
   // reads it from that package's public entrypoint instead of restating
   // 10_080 and letting the two definitions drift apart.
   "src/reporting/weekly-calibration.js": Object.freeze([
+    "@app-usagemonitor/accounting",
     "@app-usagemonitor/quota-analysis",
+  ]),
+  "src/reporting/work-usage.js": Object.freeze([
+    "@app-usagemonitor/accounting",
   ]),
 });
 const REPORTING_ALLOWED_PACKAGES = Object.freeze([
@@ -33,29 +37,56 @@ const REPORTING_ALLOWED_PACKAGES = Object.freeze([
 const REPORTING_PUBLIC_EXPORTS = Object.freeze([
   "BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT",
   "CANDIDATES",
+  "USAGE_EXPLAINER_FRESHNESS_MS",
+  "USAGE_EXPLAINER_MAX_RESPONSE_BYTES",
+  "USAGE_EXPLAINER_MAX_ROWS",
+  "USAGE_EXPLAINER_PLANS",
+  "USAGE_EXPLAINER_SCHEMA_VERSION",
+  "WORK_USAGE_COMPONENTS",
+  "WORK_USAGE_SCHEMA",
   "analyzeMonitoringQuality",
   "analyzeWeeklyCalibration",
+  "assessUsageExplanationCoverage",
   "classifyMonitoringInterval",
   "createCollectorQualityAccumulator",
+  "createUsageExplainerSelectorCodec",
+  "createWorkUsageAccumulator",
+  "modelPerformanceProjection",
+  "parseUsageExplainerCursor",
   "projectBoundedWeeklyCalibrationSummary",
+  "projectRecordedTokenComponents",
+  "projectUsageExplanation",
+  "queryWorkUsageSnapshot",
   "renderMonitoringQualityReport",
   "renderWeeklyCalibrationReport",
+  "unavailableUsageExplanation",
+  "usageExplanationBounds",
+  "usageExplanationCatalog",
   "validWeeklyPlanPopulations",
+  "validateUsageExplanationFixedBounds",
+  "validateUsageExplanationRequest",
+  "workUsageError",
 ]);
 const REPORTING_CALLERS = Object.freeze([
+  "apps/local/work-usage.test.mjs",
+  "apps/web/test/work-usage-view.test.mjs",
+  "src/application/work-usage.js",
   "src/cli.js",
   "src/local-companion-data.js",
+  "src/local-work-usage-source.js",
   "src/minimization-ablation.js",
   "src/replay-safe-accounting-cache.js",
   "test/monitoring-quality.test.js",
   "test/weekly-calibration.test.js",
+  "test/work-usage-source.test.js",
+  "test/work-usage.test.js",
 ]);
 
 async function source(relativePath) {
   return readFile(join(REPOSITORY_ROOT, relativePath), "utf8");
 }
 
-test("reporting publishes only the reviewed monitoring and weekly calibration API", () => {
+test("reporting publishes only the reviewed monitoring, calibration, work usage and explanation API", () => {
   assert.deepEqual(Object.keys(reporting).sort(), REPORTING_PUBLIC_EXPORTS);
 });
 
@@ -96,7 +127,7 @@ test("all reporting callers enter through the public index", async () => {
     assert.match(callerSource, /reporting\/index\.js/u, caller);
     assert.doesNotMatch(
       callerSource,
-      /(?:\.\/|\.\.\/src\/)(?:monitoring-quality|weekly-calibration)\.js/u,
+      /(?:\.\/|\.\.\/src\/|reporting\/)(?:monitoring-quality|weekly-calibration|work-usage)\.js/u,
       caller,
     );
   }

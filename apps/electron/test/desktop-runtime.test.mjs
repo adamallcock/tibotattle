@@ -525,6 +525,7 @@ test("compiled hosted rehearsal owns every history, state and private scheduler 
       USAGE_MONITOR_CENTRAL_ORIGIN: "https://unreviewed.example",
       USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE: "/ambient/queue",
       USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "/ambient/export-secret",
+      USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/ambient/account-secret",
       USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
       USAGE_MONITOR_PREPARED_DIRECTORY: "/ambient/prepared",
       USAGE_MONITOR_RESOURCE_ROOT: "/ambient/resources",
@@ -565,6 +566,7 @@ test("compiled hosted rehearsal owns every history, state and private scheduler 
     "USAGE_MONITOR_CENTRAL_ORIGIN",
     "USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE",
     "USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE",
+    "USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE",
     "USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY",
     "USAGE_MONITOR_PREPARED_DIRECTORY",
     "USAGE_MONITOR_TEST_LANE",
@@ -822,7 +824,7 @@ test("macOS production runtime connects updater controls to protected preference
     assert.equal(handoverCompleted, true);
     return null;
   },
-    environment: { HOME: profile },
+    environment: { HOME: profile, USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/ambient/account-secret" },
     runtimeOverrides: { autoUpdater: nativeAutoUpdater, dialog: {
       showMessageBox: async (options) => { firstRunDisclosures.push(options); return { response: 0 }; },
       showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
@@ -838,11 +840,18 @@ test("macOS production runtime connects updater controls to protected preference
       return { status: "already_migrated" };
     },
   });
+  assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE, undefined);
   assert.equal(firstRunDisclosures[0].title, "Welcome to TiboTattle");
   assert.doesNotMatch(firstRunDisclosures[0].detail, /Uploads are not available|development build/u);
   assert.equal(autoUpdater.autoInstallOnAppQuit, false);
   assert.equal(autoUpdater.autoDownload, true);
   assert.equal(nativeAutoUpdater.listenerCount("checking-for-update"), 0);
+  assert.equal(fixture.desktop.lifecycle.showSettingsWindow("about"), true);
+  const settings = FakeWindow.instances.find((candidate) => (
+    candidate.webContents.url.endsWith("/electron-settings.html#about")
+  ));
+  assert.notEqual(settings, undefined);
+  const settingsURL = settings.webContents.url;
   await fixture.desktop.controller.handlers.setAutomaticDownload({ enabled: false });
   assert.equal(autoUpdater.autoDownload, false);
   const saved = JSON.parse(await readFile(join(profile, "desktop-settings", "update-preferences-v1.json"), "utf8"));
@@ -850,6 +859,11 @@ test("macOS production runtime connects updater controls to protected preference
   await fixture.desktop.controller.handlers.checkForUpdates({});
   assert.ok(checks >= 1);
   await fixture.desktop.controller.handlers.downloadUpdate({});
+  assert.deepEqual(settings.webContents.commands.at(-1), {
+    channel: "tibotattle:desktop-command:v1",
+    value: { command: "refresh" },
+  });
+  assert.equal(settings.webContents.url, settingsURL, "an updater status change must not reload Settings");
   await fixture.desktop.controller.handlers.installUpdateAndRestart({});
   assert.equal(installs, 1);
   assert.equal(fixture.desktop.lifecycle.state.preparingForUpdate, false);
@@ -932,7 +946,7 @@ test("native handover blocks before settings writes and companion start when exi
       assert.equal(app.ready, true);
       assert.equal(app.lockCalls, 1);
       assert.equal(homeDirectory, profile);
-      return { status: "bridge_unavailable" };
+      return { status: "bridge_unavailable", supportCode: "TRANSFER_IDENTITY" };
     },
   });
   assert.equal(fixture.desktop.status, "native_handover_blocked");
@@ -940,7 +954,8 @@ test("native handover blocks before settings writes and companion start when exi
   assert.equal(settingsReads, 0);
   assert.equal(settingsWrites, 0);
   assert.equal(app.quitCalls, 1);
-  assert.match(notices[0].detail, /existing data has been preserved/u);
+  assert.match(notices[0].detail, /history and settings have been preserved/u);
+  assert.match(notices[0].detail, /Support code: TRANSFER_IDENTITY/u);
 });
 
 test("credential preflight blocks before settings writes without mislabeling it as migration", {
@@ -966,9 +981,13 @@ test("credential preflight blocks before settings writes without mislabeling it 
     productionDistribution: createProductionDistributionMetadata({
       target: `darwin-${process.arch}`, sourceRevision: "e".repeat(40), buildNumber: "20260906",
     }),
-    prepareNativeHandover: async () => ({ status: "credential_preflight_blocked" }),
+    prepareNativeHandover: async () => ({
+      status: "credential_preflight_blocked",
+      reason: "locked",
+    }),
   });
   assert.equal(fixture.desktop.status, "native_handover_blocked");
+  assert.equal(fixture.desktop.secureStorageReason, "locked");
   assert.equal(fixture.children.length, 0);
   assert.equal(settingsReads, 0);
   assert.equal(settingsWrites, 0);
@@ -976,13 +995,61 @@ test("credential preflight blocks before settings writes without mislabeling it 
   assert.deepEqual(notices[0], {
     type: "warning",
     title: "Unable to prepare secure storage",
-    message: "TiboTattle could not complete its secure startup checks.",
-    detail: "Your existing app data has not been changed. Quit and try again.",
-    buttons: ["Quit"],
+    message: "A Keychain required by TiboTattle is locked.",
+    detail: "Open Keychain Access and unlock your login Keychain and any custom Keychains in its search list, then choose Retry. No credential was created, replaced, or deleted. Support code: SECURE_STORAGE_LOCKED.",
+    buttons: ["Quit", "Retry"],
     defaultId: 0,
     cancelId: 0,
     noLink: true,
   });
+});
+
+test("credential preflight retries only after the user asks and then continues startup", {
+  skip: process.platform === "win32" ? "Exercises macOS handover composition" : false,
+}, async (t) => {
+  const profile = await mkdtemp(join(tmpdir(), "native-credential-retry-runtime-"));
+  t.after(() => rm(profile, { recursive: true, force: true }));
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  app.getPath = () => profile;
+  let attempts = 0;
+  const notices = [];
+  const updater = new EventEmitter();
+  updater.checkForUpdates = async () => null;
+  updater.downloadUpdate = async () => [];
+  updater.quitAndInstall = () => {};
+  const fixture = await launchFixture({
+    app,
+    load: async () => null,
+    environment: { HOME: profile },
+    runtimeOverrides: {
+      dialog: {
+        showMessageBox: async (notice) => {
+          notices.push(notice);
+          return { response: 1 };
+        },
+        showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
+      },
+    },
+    productionDistribution: createProductionDistributionMetadata({
+      target: `darwin-${process.arch}`,
+      sourceRevision: "f".repeat(40),
+      buildNumber: "20260912",
+    }),
+    prepareNativeHandover: async () => {
+      attempts += 1;
+      return attempts === 1
+        ? { status: "credential_preflight_blocked", reason: "locked" }
+        : { status: "no_legacy_state" };
+    },
+    loadProductionUpdater: async () => ({ default: { autoUpdater: updater } }),
+  });
+  t.after(() => fixture.desktop.lifecycle.requestQuit());
+  assert.equal(attempts, 2);
+  assert.equal(notices.length, 1);
+  assert.equal(fixture.children.length, 1);
+  assert.equal(app.quitCalls, 0);
 });
 
 test("handover rehearsal keeps the packaged updater but omits the FD3 accountless path", async (t) => {
@@ -1140,6 +1207,133 @@ test("macOS production composes the main-only credential backend without touchin
     authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
   }), { code: "accountless_signin_unavailable" });
   await fixture.desktop.lifecycle.requestQuit();
+});
+
+test("active macOS sharing blocks before child startup when its credential is denied", async () => {
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  let reads = 0;
+  const notices = [];
+  const fixture = await launchFixture({
+    app,
+    load: async () => null,
+    environment: { HOME: "/synthetic" },
+    runtimeOverrides: {
+      dialog: {
+        showMessageBox: async (notice) => {
+          notices.push(notice);
+          return { response: 0 };
+        },
+        showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
+      },
+    },
+    sharingBackend: { load: async () => null, save: async () => {} },
+    sharingInstallationState: "fresh",
+    accountlessProduction: {
+      origin: "https://tibotattle.com",
+      policyVersion: "accountless-opt-out-v1",
+      createMacOSCredentialBackend() {
+        return {
+          async read() {
+            reads += 1;
+            throw Object.assign(new Error("private Keychain detail"), {
+              code: "contribution_device_credential_unavailable",
+              secureStorageReason: "denied",
+            });
+          },
+          createIfMissing: async () => "created",
+          deleteExact: async () => "missing",
+        };
+      },
+    },
+  });
+  assert.equal(fixture.desktop.status, "secure_storage_blocked");
+  assert.equal(fixture.desktop.secureStorageReason, "denied");
+  assert.equal(reads, 1);
+  assert.equal(fixture.children.length, 0);
+  assert.equal(app.quitCalls, 1);
+  assert.equal(notices.length, 1);
+  assert.match(notices[0].detail, /SECURE_STORAGE_DENIED/u);
+  assert.doesNotMatch(JSON.stringify(notices[0]), /private Keychain detail/u);
+});
+
+test("active macOS sharing retries after unlock before starting the child", async (t) => {
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  let reads = 0;
+  const notices = [];
+  const fixture = await launchFixture({
+    app,
+    load: async () => null,
+    environment: { HOME: "/synthetic" },
+    runtimeOverrides: {
+      dialog: {
+        showMessageBox: async (notice) => {
+          notices.push(notice);
+          return { response: 1 };
+        },
+        showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
+      },
+    },
+    sharingBackend: { load: async () => null, save: async () => {} },
+    sharingInstallationState: "fresh",
+    accountlessProduction: {
+      origin: "https://tibotattle.com",
+      policyVersion: "accountless-opt-out-v1",
+      createMacOSCredentialBackend() {
+        return {
+          async read() {
+            reads += 1;
+            if (reads === 1) {
+              throw Object.assign(new Error("locked"), {
+                code: "contribution_device_credential_unavailable",
+                secureStorageReason: "locked",
+              });
+            }
+            return null;
+          },
+          createIfMissing: async () => "created",
+          deleteExact: async () => "missing",
+        };
+      },
+    },
+  });
+  t.after(() => fixture.desktop.lifecycle.requestQuit());
+  assert.equal(reads, 2);
+  assert.equal(notices.length, 1);
+  assert.equal(fixture.children.length, 1);
+  assert.equal(app.quitCalls, 0);
+});
+
+test("inactive macOS sharing does not access its accountless credential", async (t) => {
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  let reads = 0;
+  const fixture = await launchFixture({
+    app,
+    load: async () => null,
+    environment: { HOME: "/synthetic" },
+    sharingBackend: { load: async () => null, save: async () => {} },
+    sharingInstallationState: "existing_unselected",
+    accountlessProduction: {
+      origin: "https://tibotattle.com",
+      policyVersion: "accountless-opt-out-v1",
+      createMacOSCredentialBackend() {
+        return {
+          read: async () => { reads += 1; return null; },
+          createIfMissing: async () => "created",
+          deleteExact: async () => "missing",
+        };
+      },
+    },
+  });
+  t.after(() => fixture.desktop.lifecycle.requestQuit());
+  assert.equal((await fixture.desktop.sharingCoordinator.inspect()).enabled, false);
+  assert.equal(reads, 0);
+  assert.equal(fixture.children.length, 1);
 });
 
 test("macOS production fails closed when its main-only credential backend cannot compose", async () => {
@@ -1599,7 +1793,10 @@ for (const production of [false, true]) test(`desktop ${production ? "production
       return { result: Buffer.concat([decipher.update(bytes.subarray(28)), decipher.final()]).toString("utf8"), shouldReEncrypt: false };
     },
   };
-  let nativeAvailable = false;
+  // Production now proves the active accountless Keychain path before the
+  // companion starts. The dedicated blocked/retry tests above cover its
+  // unavailable transition; this end-to-end fixture starts ready.
+  let nativeAvailable = production;
   let nativeSecret = null;
   let nativeCreates = 0;
   const nativeUnavailable = () => Object.assign(new Error("native credential unavailable"), {
@@ -1659,11 +1856,20 @@ for (const production of [false, true]) test(`desktop ${production ? "production
   const first = await launchFixture(options);
   launched.push(first);
   assert.deepEqual(first.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc"]);
-  await waitFor(async () => (await first.desktop.sharingCoordinator.inspect()).transportStatus === "retry_wait");
-  assert.equal(encryptions, 0, "unavailable credentials must not create a credential or block local launch");
-  if (production) nativeAvailable = true;
-  else encryptionAvailable = true;
-  first.children[0].send({ schemaVersion: "synthetic-accountless-runtime-control-v1", action: "run" });
+  if (production) {
+    await waitFor(async () =>
+      (await first.desktop.sharingCoordinator.inspect()).transportStatus === "up_to_date");
+  } else {
+    await waitFor(async () =>
+      (await first.desktop.sharingCoordinator.inspect()).transportStatus === "retry_wait");
+    assert.equal(encryptions, 0,
+      "unavailable laboratory credentials must not mint an installation");
+    encryptionAvailable = true;
+    first.children[0].send({
+      schemaVersion: "synthetic-accountless-runtime-control-v1",
+      action: "run",
+    });
+  }
   await waitFor(async () => (await first.desktop.sharingCoordinator.inspect()).transportStatus === "up_to_date");
   const credentialPath = join(profile, "desktop-settings", "accountless-installation-credential-v1.json");
   let stored = null;
@@ -1854,6 +2060,28 @@ test("runtime persists the fixed Electron appearance and updates live renderers"
     ))
   )));
   await desktop.lifecycle.dispose();
+});
+
+test("runtime applies the persisted appearance before creating the first window", async () => {
+  for (const appearance of ["system", "light", "dark"]) {
+    const nativeTheme = new EventEmitter();
+    nativeTheme.themeSource = "system";
+    nativeTheme.shouldUseDarkColors = true;
+    const themeSourcesAtWindowCreation = [];
+    class AppearanceWindow extends FakeWindow {
+      constructor(options) {
+        themeSourcesAtWindowCreation.push(nativeTheme.themeSource);
+        super(options);
+      }
+    }
+    const { desktop } = await launchFixture({
+      load: async () => ({ ...DESKTOP_DEFAULT_SETTINGS, appearance }),
+      runtimeOverrides: { BrowserWindow: AppearanceWindow, nativeTheme },
+    });
+
+    assert.equal(themeSourcesAtWindowCreation[0], appearance);
+    await desktop.lifecycle.dispose();
+  }
 });
 
 test("runtime accepts Codex handoff only from the ready dashboard main frame", async () => {
@@ -2638,4 +2866,24 @@ test("runtime authorizes a manual notification test only from the live Settings 
     (error) => error?.code === "desktop_ipc_untrusted_context",
   );
   await desktop.lifecycle.dispose();
+});
+
+
+test("development desktop forwards prospective account identity only to the private macOS QA companion", async () => {
+  const accountFile = "/private/fixture/identity/account-observation-development";
+  const fixture = await launchFixture({
+    platform: "darwin", load: async () => null,
+    environment: {
+      USAGE_MONITOR_TEST_LANE: "macos-electron-local-qa-v1",
+      USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+      USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "/private/fixture/identity/export-identity",
+      USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: accountFile,
+    },
+  });
+  try {
+    assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE, accountFile);
+    assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_KEYCHAIN_BROKER_FD, undefined);
+  } finally {
+    await fixture.desktop.lifecycle.requestQuit();
+  }
 });

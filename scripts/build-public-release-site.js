@@ -27,8 +27,8 @@ import {
 } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  collectMacOSWebModuleGraph,
-} from "./build-macos-app.js";
+  collectWebModuleGraph,
+} from "./lib/runtime-closure.mjs";
 import {
   validateMacOSDMG,
   validateMacOSSignedReleaseArtifact,
@@ -89,6 +89,14 @@ const APP_ONLY_SOURCE_BASENAMES = Object.freeze([
   "admin.html",
   "admin.js",
   "app.js",
+  "cache-reuse-matrix.js",
+  "cache-reuse-matrix.css",
+  "cache-reuse-metrics.js",
+  "allowance-tanks.js",
+  "allowance-tank-renderer.js",
+  "work-usage-view.js",
+  "reporting-period.js",
+  "dashboard-ui.js",
   "data-client.js",
   "index.html",
   "lib.js",
@@ -1178,10 +1186,11 @@ function assertStaticAuxiliaryPublicHtml(sourceHtml, basename) {
 async function collectPublicSourceFiles({ source, sourceHtml }) {
   const sourceParent = dirname(source);
   const entrypoint = `${relative(sourceParent, source).split(sep).join("/")}/${SITE_ENTRY_MODULE_BASENAME}`;
-  const moduleGraph = await collectMacOSWebModuleGraph({
+  const moduleGraph = await collectWebModuleGraph({
     allowedRoot: source,
     entrypoints: [entrypoint],
     repositoryRoot: sourceParent,
+    surface: "public release",
   });
   const files = new Set(moduleGraph.files.map((file) => resolve(file)));
   const pending = [

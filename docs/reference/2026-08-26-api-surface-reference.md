@@ -39,14 +39,14 @@ Those remain separate verification gates in the relevant runbooks.
 
 | Surface | Boundary | Implemented surface |
 |---|---|---:|
-| Local companion API | Browser/native shell → loopback Node companion | 27 paths, 29 method/path operations |
+| Local companion API | Browser/native shell → loopback Node companion | 29 paths, 31 method/path operations |
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
 | Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
 | Hosted Worker API | Internet/native collector → Cloudflare Worker | 39 API paths, 40 method/path operations |
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 4 message handlers, 4 DOM events, 1 fixed URL scheme |
-| Process protocols | Native shell, companion, analysis owners ↔ child/worker | 8 explicit runtime protocol families |
+| Process protocols | Native shell, Codex plugin, companion, analysis owners ↔ child/worker | 11 explicit runtime protocol families |
 | Cloudflare service bindings | Worker → platform-managed resources | 3 D1 bindings, 3 production R2 bindings, 1 Durable Object, 8 rate limiters, 1 assets binding, 1 cron schedule |
 | Reviewed code APIs | App/source owners → reusable modules | 5 workspace packages and 24 reviewed source-owner entrypoints |
 | JSON/wire contracts | Collectors, exports, release tooling, hosted intake | Closed versioned families, including generated staged v1.1 and frozen code-defined telemetry v1.0; see schema lifecycle inventory |
@@ -146,10 +146,14 @@ permission. Non-`GET` local mutations require the same origin and the fixed
 `X-Usage-Monitor-Local: 1` header; handlers that accept bodies additionally
 enforce their closed JSON shape and byte ceiling.
 
-`GET /api/local/timeline/window-breakdown` is the sole local API route that
-accepts a query string, and only `from` and `to` as bounded base-ten safe
-integers. Health, desktop status, contribution diagnostics, diagnostic notes, and the
-hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
+`GET /api/local/timeline/window-breakdown` accepts only `from` and `to` as
+bounded base-ten safe integers. `GET /api/local/model-performance` requires
+exactly one `period` parameter with value `1`, `7`, `30`, or `all`, and optionally
+a canonical ISO `endAt` no later than the current time. An explicit end uses
+rolling 24-hour, 7-day or 30-day bounds; omitted ends preserve legacy calendar
+windows for 7/30-day consumers. Other query shapes are rejected. Health, desktop status, contribution diagnostics, diagnostic notes, the
+hosted-sign-in handoff, and model performance can answer without a completed
+Codex accounting snapshot.
 
 ### Local route inventory
 
@@ -163,6 +167,8 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | `GET` | `/api/local/onboarding` | Local installation and evidence-source readiness |
 | `GET` | `/api/local/overview` | Personal dashboard headline and evidence coverage |
 | `GET` | `/api/local/cache-drop-thread-links` | Optional, generation-bound local thread-name/parent lookup for the two recent cache-drop tables; requires `X-Usage-Monitor-Local: 1` and no foreign Origin |
+| `POST` | `/api/local/work-usage/query` | Read-only local project/worktree/thread reports; optional canonical ISO `endAt` pins the selected period and rejects older snapshot substitution; closed JSON, local header and Origin/Host checks; bounded cancellable snapshots with lightweight `touch` lease renewal, transient names and bounded project/task name search before pagination |
+| `GET` | `/api/local/model-performance` | Independent device-local Codex timing aggregates for `period=1`, `period=7`, `period=30`, or `period=all`, optionally pinned by `endAt`; reads renew a 60-second background-worker lease |
 | `GET` | `/api/local/gradient` | Quota-versus-cost gradient report data |
 | `GET` | `/api/local/weekly` | Weekly calibration report data |
 | `GET` | `/api/local/weekly-pace-outlook` | Privacy-safe weekly allowance pace projection bound to the current observed window |
@@ -214,6 +220,15 @@ unprovable session order still withholds the whole-period money/allowance
 claim. Clients must identify the subtotal's scope and must not substitute it
 into `allowanceImpact` or hide excluded sessions. No priced observations means
 `coveredSubtotal: null`, not a zero-valued placeholder.
+
+Cache continuity also carries an optional `byModel` array on the selected
+impact and each reporting period. Each reviewed model ID has the same aggregate
+counts, gap/outcome buckets, pricing, coverage and bounded recent-detail shape.
+Cohorts partition the complete comparable evidence, never the recent-detail
+sample. Unattributable ordering gaps conservatively qualify every model total.
+The breakdown is bounded to 128 models; missing, unsupported or inconsistent
+breakdowns normalize to `null` while All models remains available. An empty
+array means no eligible same-configuration models were found.
 
 When contribution preparation encounters a preserved legacy export identity
 whose bounded silent migration has not completed, it returns the fixed
@@ -699,6 +714,33 @@ accountless channel, never renderer IPC or HTTP. `productionSafe` remains
 manifest, security, physical-runner, installed-lifecycle, signing, and release
 evidence.
 
+### Codex plugin MCP and installed-agent protocols
+
+**Sources of truth:**
+[`plugins/tibotattle/mcp/server.mjs`](../../plugins/tibotattle/mcp/server.mjs),
+[`plugins/tibotattle/lib/installed-agent.mjs`](../../plugins/tibotattle/lib/installed-agent.mjs),
+and [`apps/local/agent-cli.js`](../../apps/local/agent-cli.js).
+
+The Codex host starts the plugin's dependency-free local MCP server over stdio.
+It exposes six closed tools: status, plan discovery, one usage query, one
+evidence lookup, install planning, and confirmed installation. MCP input lines
+are bounded to 128 KiB. Analysis tools are read-only and offline; only install
+planning reads the public GitHub release manifest and Homebrew cask. The install
+tool is separately marked destructive and requires a single-use, expiring token
+bound to the exact release, source commit, artifact size and architecture SHA.
+
+For analysis, the plugin locates only reviewed TiboTattle application bundles,
+selects the highest semantic version when system and user installations coexist,
+starts that Electron executable with `ELECTRON_RUN_AS_NODE=1`, and selects
+packaged companion protocol v1. The subprocess accepts only `status`,
+`explain-usage-plans`, `explain-usage`, and `explain-usage-evidence`, with their
+closed plan/period/page/cursor/selector arguments. It returns exactly one JSON
+record with a 64 KiB parent-side ceiling and 30-second timeout. The child
+environment is allowlisted; unexpected errors are collapsed to fixed codes.
+Neither boundary accepts an arbitrary executable, path, shell command, SQL,
+refresh, settings mutation, or upload instruction. The
+[plugin reference](./codex-plugin.md) owns installation and release boundaries.
+
 ### Codex app-server subprocess protocol
 
 **Sources of truth:**
@@ -755,6 +797,7 @@ module facades, but their message shapes are security- and resource-relevant:
 | Owner / source | Input boundary | Output boundary |
 |---|---|---|
 | [Replay-safe accounting rebuild child](../../src/replay-safe-accounting-rebuild-child.js) | Two owner-private temporary paths on argv: versioned JSON request and exclusive result target; parent-held stdin is the death watchdog | Canonical result file plus one bounded stdout envelope containing status and either byte count/SHA-256 or a fixed error code |
+| [Model performance worker](../../apps/local/model-performance-worker.js) | Fixed private state and Codex-home anchors, then bounded reporting-window requests or a `stop` message; starts only through a recent timing-page reader | Bounded timing aggregate snapshots for four periods and at most eight pinned windows, or a fixed unavailable indication; one independent sidecar, no accounting/contribution data flow |
 | [Unified-index worker](../../src/local-unified-index-worker.js) | `workerData` with bounded lineage components, source paths/sizes, and maximum line bytes | Typed `batch` messages containing minimized events/boundaries/tools/snapshot keys, or one content-free `failed` code |
 | [Local-analysis extraction worker](../../src/local-analysis-extract-worker.js) | `workerData` with an owner-private shard path and bounded source byte-range tasks | One `{ok: true, result}` aggregate or `{ok: false, code}` fixed failure |
 
@@ -837,10 +880,10 @@ topology and calibration policy.
 
 `deriveExportPseudonym`, `deriveExportPseudonymV2`.
 
-#### `@app-usagemonitor/i18n` — 17 public symbols
+#### `@app-usagemonitor/i18n` — 18 public symbols
 
 - Catalogs and policy: `DEFAULT_LOCALE`, `SYSTEM_LOCALE_PREFERENCE`, `SUPPORTED_LOCALES`, `LANGUAGE_OPTIONS`, `EN_US_CATALOG`, `ZH_HANS_CATALOG`, `ES_CATALOG`, `CATALOGS`.
-- Resolution and copy: `negotiateLocale`, `resolveLocalePreference`, `isLanguagePreference`, `getMessage`, `interpolateMessage`, `translate`.
+- Resolution and copy: `canonicalizeLocale`, `negotiateLocale`, `resolveLocalePreference`, `isLanguagePreference`, `getMessage`, `interpolateMessage`, `translate`.
 - Formatting: `formatNumber`, `formatPercent`, `formatDate`.
 
 The accounting and quota package roots were narrowed by 20 and 7 symbols
@@ -920,6 +963,7 @@ The owned local SQLite surfaces are:
 | Domain | Storage owners |
 |---|---|
 | Local evidence and accounting | [`local-collector-state.js`](../../src/local-collector-state.js), [`local-unified-index.js`](../../src/local-unified-index.js), [`local-analysis-index.js`](../../src/local-analysis-index.js), and its private [`local-analysis-extract-worker.js`](../../src/local-analysis-extract-worker.js) shard writer |
+| Model performance timing | [`inference-timing-store.js`](../../src/platform/inference-timing-store.js): owner-only `inference-timing-v2/timing-experiment.sqlite` below the companion state root; method and SQLite user version 2, maximum 256 MiB |
 | Claude shadow pipeline | [`claude-desktop-incremental-canonicalizer.js`](../../src/claude-desktop-incremental-canonicalizer.js), [`claude-desktop-ledger-prototype.js`](../../src/claude-desktop-ledger-prototype.js), [`claude-desktop-pricing-cache.js`](../../src/claude-desktop-pricing-cache.js), [`claude-desktop-shadow-store.js`](../../src/claude-desktop-shadow-store.js) |
 | Contribution and export | [`local-contribution-sync-queue-storage.js`](../../src/platform/local-contribution-sync-queue-storage.js), [`owner-only-export-workspace-storage.js`](../../src/platform/owner-only-export-workspace-storage.js), [`export-set-verification-storage.js`](../../src/platform/export-set-verification-storage.js) |
 | Windows qualification | [`windows-credential-operation-audit.js`](../../src/platform/windows-credential-operation-audit.js), a bounded local audit store rather than a shipping credential backend |
@@ -929,6 +973,13 @@ migration or replacement. Temporary local-analysis shards are part of the
 local-analysis schema contract; the worker is not an independent public
 database API. The replay-safe accounting cache is stored through the local
 collector-state owner rather than creating another general-purpose store.
+
+The timing sidecar stores one aggregate per completed turn, local HMAC keys,
+source cursors, and bounded pending reconstruction state. It retains no raw
+session content or identifiers. Version 1 or otherwise incompatible stores
+are preserved and refused; the accounting index is not migrated. Its POSIX
+permission contract remains unavailable on Windows until a platform adapter
+is qualified. This source inventory does not qualify an installed release.
 
 Generated or mirrored schemas must be changed through their generation/check
 commands rather than edited into divergence:

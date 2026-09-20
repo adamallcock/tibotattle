@@ -463,7 +463,7 @@ test("localizer is root-bounded, preserves raw-data boundaries, and never interp
   assert.match(appSource, /setRawText\(\$\("#identity-account-provider"\)/u);
   assert.match(
     appSource,
-    /node\("span", "metric-name", localizedQuotaWindowLabel\(window\)\)/u,
+    /node\("span", "quota-tank-period",\s*localizedQuotaWindowDuration\(window\.durationMinutes\)\)/u,
   );
   // The SVG <title>/<desc> pair used to be asserted as `setRawText(titleNode,
   // title)` — an assertion that the chart's accessible name was whatever raw

@@ -64,6 +64,23 @@ diagnostics, and contributions. It never uses the prompt-bearing `threads.title`
 as a display-name fallback. A clicked canonical Codex deep link stays a local
 application handoff.
 
+The owner-approved Projects & threads view (2026-09-08) also reads the explicit
+working directory from bounded, retained session metadata, turn-context records
+and applied thread settings. It uses the
+existing discovery and stable-source reader, then local read-only Git resolution.
+The owner also approved bounded Codex `threads.title` fallbacks for this view
+on 2026-09-08 when explicit names are missing. Titles can contain opening-message
+text, so they are read only for displayed rows and their parents, rendered as
+text, and never exported or uploaded. Ancestry-only reads and cache-drop tables
+retain their title-free contract.
+Directory basenames and thread display labels are transient metadata; paths,
+names and project handles are never written into the accounting index, exports,
+diagnostics, contributions or browser storage. Repository grouping describes
+last-observed local workspace mappings, not verified historical ownership.
+The new POST query route requires the local header and existing Origin/Host
+checks. Reports are bounded process-local snapshots; publication/scope/filter
+identity and opaque cursors prevent mixing totals across reads.
+
 ## Do not include session content in reports
 
 TiboTattle's whole purpose is keeping coding-agent session content private.
