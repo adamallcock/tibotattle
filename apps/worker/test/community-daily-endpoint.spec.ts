@@ -37,6 +37,7 @@ interface TestBindings extends Env {
 function testBindings(overrides: Partial<Env> = {}): Env {
   const bindings = env as TestBindings;
   return {
+    PUBLIC_ANALYTICS_MODE: "enabled",
     ASSETS: bindings.ASSETS,
     DELETION_LEDGER: bindings.DELETION_LEDGER,
     ENROLLMENT_MODE: bindings.ENROLLMENT_MODE,
@@ -518,8 +519,8 @@ describe("GET /api/v1/community/daily", () => {
       normalization: "pro_x1_prolite_x4_plus_x20",
       windowDurationMinutes: 10_080,
       trailingDays: 30,
-      qualification: "shared_reset_fit_gates_40pp_span_floor",
-      spanFloorPp: 40,
+      qualification: "shared_reset_fit_gates_25pp_span_floor",
+      spanFloorPp: 25,
       fitCount: 8,
       participantCount: 4,
       centralUsd: 2_232,
@@ -695,5 +696,37 @@ describe("GET /api/v1/community/daily", () => {
     await expect(response.json()).resolves.toMatchObject({
       error: { code: "PUBLICATION_DISABLED" },
     });
+  });
+
+  it("fails closed at the deployment gate before database and rate-limit reads", async () => {
+    const calls: string[] = [];
+    const limiter = {
+      async limit(): Promise<{ success: boolean }> {
+        calls.push("rate-limit");
+        return { success: true };
+      },
+    } satisfies RateLimit;
+    const unavailable = {
+      prepare(): never {
+        calls.push("database");
+        throw new Error("database must not be read");
+      },
+    } as unknown as D1Database;
+    for (const mode of [undefined, "disabled", "unexpected"] as const) {
+      const response = await api(
+        "/api/v1/community/daily?from=2026-08-01&to=2026-08-02",
+        {},
+        testBindings({
+          PUBLIC_ANALYTICS_MODE: mode,
+          PUBLIC_READ_RATE_LIMIT: limiter,
+          USAGE_MONITOR_DB: unavailable,
+        } as Partial<Env>),
+      );
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "PUBLICATION_DISABLED" },
+      });
+    }
+    expect(calls).toEqual([]);
   });
 });

@@ -3,7 +3,10 @@ import {
   expandAdminModelHistoryDay,
 } from "./telemetry-shared.generated.js";
 
-const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.3";
+const ADMIN_OVERVIEW_SCHEMA_VERSIONS = new Set([
+  "admin-overview-v0.3",
+  "admin-overview-v0.4",
+]);
 const ADMIN_RECONSTRUCTION_SCHEMA_VERSION = "admin-reconstruction-progress-v0.1";
 const ADMIN_RECONSTRUCTION_STATUSES = new Set(["available", "unavailable"]);
 const ADMIN_RECONSTRUCTION_MODES = new Set([
@@ -33,6 +36,16 @@ const ADMIN_ALLOWANCE_MODELS_BASIS =
 const ADMIN_ALLOWANCE_MODELS_GATE =
   "shared_composition_kernel_identification";
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
+const ADMIN_GRAPH_WORK_STATES = new Set(["building", "queued", "idle"]);
+const ADMIN_GRAPH_METRICS = new Set(["model", "fits"]);
+// Refusal reasons and checkpoint phases are closed code words, not free text:
+// bounded snake_case tokens that carry no identifier, path or raw error. The
+// set itself stays open so a newly coded upstream reason reaches the operator
+// as its code rather than silently disappearing from the refusal totals.
+const ADMIN_GRAPH_CODE_PATTERN = /^[a-z][a-z0-9_]{2,63}$/u;
+const ADMIN_GRAPH_MAX_WINDOW_DAYS = 400;
+const ADMIN_GRAPH_MAX_REFUSALS = 64;
+const ADMIN_GRAPH_MAX_PHASES = 32;
 const ADMIN_ACTIONS = new Set([
   "set_collection_controls",
   "run_maintenance",
@@ -216,10 +229,15 @@ export function projectAdminReconstructionProgress(value) {
   const nullableCount = value => value === null ? null : count(value, code);
   const nullableEnum = (value, values) => value === null ? null : enumValue(value, new Set(values), code);
   const candidate = record(value, code);
-  if (candidate.schemaVersion !== 1 && candidate.schemaVersion !== 2) invalid(code);
+  if (![1, 2, 3].includes(candidate.schemaVersion)) invalid(code);
+  // v3 keeps every v2 key and adds `graph`; `preparation` becomes optional
+  // there, so a v2 payload relabelled as v3 still fails the closed-key check.
+  const optionalPreparation = candidate.schemaVersion === 3
+    && Object.hasOwn(candidate, "preparation");
   const progress = closed(candidate, [
     "schemaVersion", "generatedAt", "publication", "work", "history",
-    ...(candidate.schemaVersion === 2 ? ["preparation"] : []),
+    ...(candidate.schemaVersion === 2 || optionalPreparation ? ["preparation"] : []),
+    ...(candidate.schemaVersion === 3 ? ["graph"] : []),
   ]);
   const publication = closed(progress.publication, [
     "state", "requestedGeneration", "preparedGeneration", "publishedGeneration", "publishedAt",
@@ -250,7 +268,8 @@ export function projectAdminReconstructionProgress(value) {
       || (projectedHistory.completeAccounts !== null && projectedHistory.requiredAccounts !== null
         && projectedHistory.completeAccounts > projectedHistory.requiredAccounts)) invalid(code);
   let preparation = null;
-  if (progress.schemaVersion === 2 && progress.preparation !== null) {
+  const hasPreparation = progress.schemaVersion === 2 || optionalPreparation;
+  if (hasPreparation && progress.preparation !== null) {
     const source = closed(progress.preparation, [
       "trackedDays", "completeDays", "buildingDays", "retiringDays", "checkpointSteps",
       "quotaObservations", "usageEvents",
@@ -279,7 +298,148 @@ export function projectAdminReconstructionProgress(value) {
       restartReason: nullableEnum(work.restartReason, ["input_changed", "lease_expired", "method_changed", "retry"]),
     }),
     history: projectedHistory,
-    ...(progress.schemaVersion === 2 ? { preparation } : {}),
+    ...(hasPreparation ? { preparation } : {}),
+    ...(progress.schemaVersion === 3
+      ? { graph: projectGraphRebuild(progress.graph, code, closed, nullableTime) }
+      : {}),
+  });
+}
+
+/** The typed-storage rebuild view: a closed, aggregate-only description of the
+ * graph window. Every count is an exact integer the reader recorded, so a
+ * violated invariant is a broken read, never something to round or infer. */
+function projectGraphRebuild(value, code, closed, nullableTime) {
+  const graph = closed(value, [
+    "window", "owners", "currentFits", "days", "refusals", "work",
+    "throughput", "retirement",
+  ]);
+  const codeWord = candidate => {
+    if (!ADMIN_GRAPH_CODE_PATTERN.test(string(candidate, code))) invalid(code);
+    return candidate;
+  };
+  const nullableCount = candidate => candidate === null ? null : count(candidate, code);
+  const source = closed(graph.window, ["days", "from", "to"]);
+  const window = Object.freeze({
+    days: count(source.days, code),
+    from: calendarDay(source.from, code),
+    to: calendarDay(source.to, code),
+  });
+  const span = (Date.parse(`${window.to}T00:00:00.000Z`)
+    - Date.parse(`${window.from}T00:00:00.000Z`)) / 86_400_000;
+  if (window.days > ADMIN_GRAPH_MAX_WINDOW_DAYS || span !== window.days - 1) invalid(code);
+  const owners = Object.freeze({
+    active: count(closed(graph.owners, ["active"]).active, code),
+  });
+  // Fits are stored as JSON arrays, so an unusable fit is an empty array with
+  // no recorded reason: the day-level refusal buckets have no fits counterpart.
+  const fitsSource = closed(graph.currentFits, ["day", "ready", "noFit", "missing"]);
+  const currentFits = Object.freeze({
+    day: calendarDay(fitsSource.day, code),
+    ready: count(fitsSource.ready, code),
+    noFit: count(fitsSource.noFit, code),
+    missing: count(fitsSource.missing, code),
+  });
+  if (currentFits.ready + currentFits.noFit + currentFits.missing !== owners.active) invalid(code);
+  const entries = array(graph.days, code);
+  if (entries.length !== window.days) invalid(code);
+  const days = Object.freeze(entries.map((candidate, index) => {
+    const entry = closed(candidate, [
+      "day", "ready", "refused", "unsupported", "missing", "published", "publishedAt",
+    ]);
+    const projected = Object.freeze({
+      day: calendarDay(entry.day, code),
+      ready: count(entry.ready, code),
+      refused: count(entry.refused, code),
+      unsupported: count(entry.unsupported, code),
+      missing: count(entry.missing, code),
+      published: boolean(entry.published, code),
+      publishedAt: nullableTime(entry.publishedAt),
+    });
+    if (projected.ready + projected.refused + projected.unsupported + projected.missing
+        !== owners.active) invalid(code);
+    // Newest first, strictly descending, anchored on the declared window.
+    const expectedEdge = index === 0 ? window.to : index === entries.length - 1 ? window.from : null;
+    if (expectedEdge !== null && projected.day !== expectedEdge) invalid(code);
+    if (index > 0 && projected.day >= calendarDay(entries[index - 1].day, code)) invalid(code);
+    return projected;
+  }));
+  const refusalEntries = boundedArray(graph.refusals, ADMIN_GRAPH_MAX_REFUSALS, code);
+  const seenRefusals = new Set();
+  const refusals = Object.freeze(refusalEntries.map(candidate => {
+    const refusal = closed(candidate, ["reason", "owners"]);
+    const projected = Object.freeze({
+      reason: codeWord(refusal.reason),
+      owners: count(refusal.owners, code),
+    });
+    if (seenRefusals.has(projected.reason)) invalid(code);
+    seenRefusals.add(projected.reason);
+    return projected;
+  }));
+  const work = closed(graph.work, [
+    "state", "activeDay", "activeMetric", "leaseExpiresAt", "selections", "checkpoints",
+  ]);
+  const selections = closed(work.selections, ["pending", "claimed"]);
+  // A counter the reader could not finish within its cap is null, never 0.
+  const checkpoints = work.checkpoints === null
+    ? null
+    : closed(work.checkpoints, ["stages", "parts", "bytes", "phases"]);
+  const phases = checkpoints === null
+    ? []
+    : boundedArray(checkpoints.phases, ADMIN_GRAPH_MAX_PHASES, code);
+  const seenPhases = new Set();
+  const throughput = closed(graph.throughput, [
+    "resultsLastHour", "resultsLast6Hours", "remainingResults", "estimatedHoursRemaining",
+  ]);
+  const resultsLastHour = nullableCount(throughput.resultsLastHour);
+  const resultsLast6Hours = nullableCount(throughput.resultsLast6Hours);
+  const estimate = throughput.estimatedHoursRemaining;
+  if (estimate !== null
+      && (typeof estimate !== "number" || !Number.isFinite(estimate) || estimate < 0)) invalid(code);
+  // An estimate cannot survive the rate it was derived from going uncounted.
+  if (estimate !== null && (resultsLastHour === null || resultsLast6Hours === null)) invalid(code);
+  return Object.freeze({
+    window,
+    owners,
+    currentFits,
+    days,
+    refusals,
+    work: Object.freeze({
+      state: enumValue(work.state, ADMIN_GRAPH_WORK_STATES, code),
+      activeDay: work.activeDay === null ? null : calendarDay(work.activeDay, code),
+      activeMetric: work.activeMetric === null
+        ? null
+        : enumValue(work.activeMetric, ADMIN_GRAPH_METRICS, code),
+      leaseExpiresAt: nullableTime(work.leaseExpiresAt),
+      selections: Object.freeze({
+        pending: count(selections.pending, code),
+        claimed: count(selections.claimed, code),
+      }),
+      checkpoints: checkpoints === null ? null : Object.freeze({
+        stages: count(checkpoints.stages, code),
+        parts: count(checkpoints.parts, code),
+        bytes: count(checkpoints.bytes, code),
+        phases: Object.freeze(phases.map(candidate => {
+          const entry = closed(candidate, ["phase", "stages", "parts"]);
+          const phase = codeWord(entry.phase);
+          if (seenPhases.has(phase)) invalid(code);
+          seenPhases.add(phase);
+          return Object.freeze({
+            phase,
+            stages: count(entry.stages, code),
+            parts: count(entry.parts, code),
+          });
+        })),
+      }),
+    }),
+    throughput: Object.freeze({
+      resultsLastHour,
+      resultsLast6Hours,
+      remainingResults: count(throughput.remainingResults, code),
+      estimatedHoursRemaining: estimate,
+    }),
+    retirement: Object.freeze({
+      staleResults: nullableCount(closed(graph.retirement, ["staleResults"]).staleResults),
+    }),
   });
 }
 
@@ -414,8 +574,8 @@ export function projectAdminAllowancePreview(value) {
       || preview.basis !== ADMIN_ALLOWANCE_PREVIEW_BASIS
       || preview.referencePlanType !== "pro"
       || preview.trailingDays !== 30
-      || preview.qualification !== "shared_reset_fit_gates_40pp_span_floor"
-      || preview.spanFloorPp !== 40) {
+      || preview.qualification !== "shared_reset_fit_gates_25pp_span_floor"
+      || preview.spanFloorPp !== 25) {
     invalid(code);
   }
   const from = calendarDay(preview.from, code);
@@ -809,6 +969,38 @@ function projectDailyPublication(value) {
     ),
     pendingRebuildsBounded: boolean(
       publication.pendingRebuildsBounded,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+  });
+}
+
+function projectHistoricalPublication(value) {
+  if (value === null) return null;
+  const publication = record(value, "ADMIN_OVERVIEW_INVALID");
+  return Object.freeze({
+    publishedDays: count(
+      publication.publishedDays,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    publishedDaysBounded: boolean(
+      publication.publishedDaysBounded,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    latestEvidenceDay: nullableString(
+      publication.latestEvidenceDay,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    latestComputedAt: nullableString(
+      publication.latestComputedAt,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    previewState: enumValue(
+      publication.previewState,
+      new Set(["current", "stale", "not_published"]),
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    previewGeneratedAt: nullableString(
+      publication.previewGeneratedAt,
       "ADMIN_OVERVIEW_INVALID",
     ),
   });
@@ -1432,10 +1624,14 @@ function projectErrors(value) {
  */
 export function projectAdminOverview(value) {
   const overview = record(value, "ADMIN_OVERVIEW_INVALID");
-  if (overview.schemaVersion !== ADMIN_OVERVIEW_SCHEMA_VERSION) {
+  if (!ADMIN_OVERVIEW_SCHEMA_VERSIONS.has(overview.schemaVersion)) {
     invalid("ADMIN_OVERVIEW_INVALID");
   }
+  const typed = overview.schemaVersion === "admin-overview-v0.4";
   const service = record(overview.service, "ADMIN_OVERVIEW_INVALID");
+  if (typed && service.telemetryStorageMode !== "typed") {
+    invalid("ADMIN_OVERVIEW_INVALID");
+  }
   const snapshots = array(overview.snapshots, "ADMIN_OVERVIEW_INVALID").map((value) => {
     const snapshot = record(value, "ADMIN_OVERVIEW_INVALID");
     return Object.freeze({
@@ -1459,10 +1655,17 @@ export function projectAdminOverview(value) {
       createdAt: string(item.createdAt, "ADMIN_OVERVIEW_INVALID"),
     });
   });
+  const historicalPublication = typed
+    ? projectHistoricalPublication(overview.historicalPublication)
+    : null;
+  if (typed && historicalPublication === null) {
+    invalid("ADMIN_OVERVIEW_INVALID");
+  }
   return Object.freeze({
     generatedAt: string(overview.generatedAt, "ADMIN_OVERVIEW_INVALID"),
     service: Object.freeze({
       environment: string(service.environment, "ADMIN_OVERVIEW_INVALID"),
+      telemetryStorageMode: typed ? "typed" : "json",
     }),
     collection: projectCollection(overview.collection),
     counts: projectOverviewCounts(overview.counts),
@@ -1474,10 +1677,12 @@ export function projectAdminOverview(value) {
     distribution: projectDistribution(overview.distribution),
     snapshots: Object.freeze(snapshots),
     dailyPublication: projectDailyPublication(overview.dailyPublication),
-    pendingHistoricalRebuilds: count(
-      overview.pendingHistoricalRebuilds,
-      "ADMIN_OVERVIEW_INVALID",
-    ),
+    pendingHistoricalRebuilds: typed
+      ? overview.pendingHistoricalRebuilds === null
+        ? null
+        : invalid("ADMIN_OVERVIEW_INVALID")
+      : count(overview.pendingHistoricalRebuilds, "ADMIN_OVERVIEW_INVALID"),
+    historicalPublication,
     errors: projectErrors(overview.errors),
     audit: Object.freeze(audit),
   });

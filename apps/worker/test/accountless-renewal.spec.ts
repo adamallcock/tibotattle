@@ -21,6 +21,7 @@ import {
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest, runScheduledMaintenance } from "../src/index";
 import { authenticateDevice, createDeviceUploadAuthorization, purgeStaleDeviceLifecycleRows } from "../src/device-auth";
+import { initializeStorageSource } from "../src/analytics-delivery";
 import { makeV11Day, stageV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 import { createTelemetryV11DomainPredecessor, activateTelemetryV11Domain } from "../src/telemetry-v11-domain";
 import { telemetryV11DomainManifestDigestInput } from "@app-usagemonitor/telemetry-contract";
@@ -29,9 +30,13 @@ import { eraseParticipantAsOwner } from "../src/participant-erasure";
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
   TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[];
+  TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[];
+  TEST_INGESTION_BRIDGE_MIGRATIONS: D1Migration[];
+  TEST_INGESTION_ISOLATION_MIGRATIONS: D1Migration[];
 }
 
 const ORIGIN = "https://renewal.example.test";
+const STORAGE_SOURCE_ID = "synthetic-accountless-renewal-source";
 const DAY = 24 * 60 * 60 * 1000;
 const RENEWAL_BODY = Object.freeze({
   schemaVersion: ACCOUNTLESS_RENEWAL_SCHEMA_VERSION,
@@ -329,12 +334,22 @@ describe("accountless owner lease renewal", () => {
     }
   });
 
-  it("keeps accepted public data through scheduled lease expiry, renews, then withdraws on explicit disconnect", async () => {
+  it("keeps accepted public data through scheduled lease expiry, renewal, and disconnect", async () => {
     const wallClock = Date.now();
     const deviceId = crypto.randomUUID();
     const secret = crypto.getRandomValues(new Uint8Array(32));
     const clock = vi.spyOn(Date, "now").mockReturnValue(wallClock - 23 * DAY);
     try {
+      await applyD1Migrations(
+        db(),
+        bindings().TEST_TYPED_INGESTION_MIGRATIONS.filter((item) => item.name.startsWith("0002_")),
+      );
+      await applyD1Migrations(db(), bindings().TEST_INGESTION_BRIDGE_MIGRATIONS);
+      await applyD1Migrations(
+        db(),
+        bindings().TEST_INGESTION_ISOLATION_MIGRATIONS.filter((item) => item.name.startsWith("0005_")),
+      );
+      await initializeStorageSource(db(), STORAGE_SOURCE_ID);
       const { authorization, participantId } = await enrollAndOwn(deviceId, secret);
       clock.mockReturnValue(wallClock);
       const sourceDay = new Date(wallClock).toISOString().slice(0,10);
@@ -376,7 +391,13 @@ describe("accountless owner lease renewal", () => {
       expect(await eligible()).toEqual({participant_id:participantId,device_id:deviceId});
       const disconnected = await api("/api/v1/device/disconnect", {method:"POST",headers:{authorization}});
       expect(disconnected.status,await disconnected.clone().text()).toBe(200);
-      expect(await eligible()).toBeNull();
+      expect(await eligible()).toEqual({participant_id:participantId,device_id:deviceId});
+      expect(await db().prepare("SELECT generation_id,head_revision FROM accountless_public_history_retention WHERE participant_id=?")
+        .bind(participantId).first()).toMatchObject({generation_id:head?.generation_id,head_revision:head?.revision});
+      expect(await db().prepare("SELECT count(*) n FROM telemetry_v11_records")
+        .first("n")).toBeGreaterThan(0);
+      expect(await db().prepare("SELECT generation_id,revision FROM telemetry_v11_domain_heads WHERE participant_id=?")
+        .bind(participantId).first()).toEqual(head);
       await expect(authenticateDevice(db(),authorization)).rejects.toMatchObject({code:"DEVICE_AUTH_INVALID"});
       expect(await db().prepare("SELECT maintenance_lease_token FROM retention_state WHERE singleton=1").first())
         .toEqual({maintenance_lease_token:null});

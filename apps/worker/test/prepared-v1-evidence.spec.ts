@@ -287,13 +287,23 @@ describe("reusable elected source-day preparation", () => {
       usageFragments:prepared.usageBins.fragmentCount}));
     expect(evidence).toEqual(rawEvidence); expect(actual).toEqual(expected);
     expect(actual).toMatchObject({status:"complete",analysis:{status:"ready",usageEventCount:12120}});
-    expect(raw.stats.rows).toBe(18183); expect(measured.stats.rows).toBeLessThan(200);
-    expect(measured.stats.queries).toBe(3); expect(raw.stats.queries).toBe(18);
+    // The raw statement no longer carries the `fitable` pre-filter: it returns
+    // every scoped run endpoint and the eligibility refusal is decided in JS on
+    // the clustered pool key, so the raw path now decodes 24,244 rows where it
+    // decoded 18,183. Prepared evidence is unaffected, which is the reduction
+    // this test exists to measure, and both paths still agree exactly above.
+    expect(raw.stats.rows).toBe(24244); expect(measured.stats.rows).toBeLessThan(200);
+    // The acquisition's anchor phase now has a second leg that sweeps the
+    // source once to settle pool hulls before any key is derived from a
+    // restated instant: one extra page for the day-sized prepared reader, and
+    // a whole extra pass (18 -> 24 pages) for the raw physical reader.
+    expect(measured.stats.queries).toBe(4); expect(raw.stats.queries).toBe(24);
     expect(prepared.usageBins.fragmentCount).toBeLessThan(200);
     expect(preparedMeter.queriesUsed-beforePreparedFinish).toBe(6); // Five fences plus one fragment page.
-    // Raw: five fences + two initial seeks + one full equal-time tie page +
-    // two final seeks. The short final page ends the scan without an EOF read.
-    expect(rawMeter.queriesUsed).toBe(10);
+    // Raw: five fences + one typed-layout discovery + two initial seeks +
+    // one full equal-time tie page + two final seeks. The short final page ends
+    // the scan without an EOF read; prepared evidence needs no layout discovery.
+    expect(rawMeter.queriesUsed).toBe(11);
     expect(await prepare(await pin("2026-09-06"))).toMatchObject({status:"complete",pagesRun:0,queriesUsed:1});
     console.log(JSON.stringify({benchmark:"synthetic-prepared-history-18061",rawElapsedMs,preparedElapsedMs,
       rawAcquisition:raw.stats,preparedAcquisition:measured.stats,rawFinishQueries:rawMeter.queriesUsed,

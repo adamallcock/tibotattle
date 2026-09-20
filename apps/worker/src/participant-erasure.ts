@@ -1,3 +1,4 @@
+import {storageErasureBindings,prepareStorageParticipantErasure,requireStorageParticipantErasureComplete} from './storage-erasure';
 import { beginAdminOperation, finishAdminOperation } from "./admin-operations";
 import { revokeAccountlessEnrollment } from "./accountless-enrollment";
 import { MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT } from "./constants";
@@ -69,6 +70,7 @@ async function eraseParticipantData(
   participantId: string,
   operationId: string,
 ): Promise<ErasureResult> {
+  const storage=await storageErasureBindings(env);
   const participant = await env.USAGE_MONITOR_DB.prepare(
     `SELECT participant.state,
             participant.deletion_session_id,
@@ -88,6 +90,7 @@ async function eraseParticipantData(
     if (!await hasDeletionTombstone(env.DELETION_LEDGER, participantId)) {
       throw new ApiError(404, "NOT_FOUND");
     }
+    await requireStorageParticipantErasureComplete(env.DELETION_LEDGER,participantId,storage);
     // A lost response can be retried, but the removed rows cannot provide a
     // historical contribution count. Unknown is not zero.
     return { deleted: true, alreadyDeleted: true, contributionsDeleted: null };
@@ -157,6 +160,7 @@ async function eraseParticipantData(
         )`,
   ).bind(new Date().toISOString(), participantId, participantId, deletionFence).run();
   await recordDeletionTombstone(env.DELETION_LEDGER, participantId);
+  if(storage)await prepareStorageParticipantErasure(storage,participantId);
   const identityLinkKey = await participantIdentityLinkKeyForDeletion(
     env.USAGE_MONITOR_DB, participantId, deletionFence,
   );
@@ -216,6 +220,7 @@ async function eraseParticipantData(
     throw new ApiError(409, "UPLOAD_IN_PROGRESS");
   }
   await finishParticipantDeletion(env.USAGE_MONITOR_DB, participantId, deletionFence);
+  await requireStorageParticipantErasureComplete(env.DELETION_LEDGER,participantId,storage);
   return {
     deleted: true,
     alreadyDeleted: false,

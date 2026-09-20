@@ -105,6 +105,11 @@ async function bundles(workerRoot, throughMigration = null) {
     const end = result.USAGE_MONITOR_DB.findIndex(row => row.name === throughMigration);
     if (end !== 58) fail("REHEARSAL_TARGET_INVALID");
     result.USAGE_MONITOR_DB = result.USAGE_MONITOR_DB.slice(0, end + 1);
+    // This fixed historical scale rehearsal predates the additive typed erasure
+    // ledger. Current/default rehearsals continue to apply the full inventory.
+    const ledgerEnd = result.DELETION_LEDGER.findIndex(row => row.name === "0002_identity_reenrollment_cooldown.sql");
+    if (ledgerEnd !== 1) fail("REHEARSAL_TARGET_INVALID");
+    result.DELETION_LEDGER = result.DELETION_LEDGER.slice(0, ledgerEnd + 1);
   }
   return result;
 }

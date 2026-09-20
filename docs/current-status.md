@@ -15,7 +15,7 @@ x64 and Linux x64. Source, published assets, installed behavior, update feeds an
 observations remain separate evidence; recheck the relevant boundary before a
 new operational decision.
 
-## Source boundary and reconciliation status
+## Current release and hosted boundary
 
 This status records application source revision `53abbbe1` on 2026-09-13. The
 published 0.1.22 artifacts are instead bound to immutable source

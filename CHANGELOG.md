@@ -60,6 +60,7 @@ No additional changes recorded.
   separate native qualification gate passes.
 - Restore four-platform release reconciliation and strengthen Mac update and
   empty-profile qualification, with final-package Linux runtime checks.
+No changes yet.
 
 ## [0.1.22](./release-notes/0.1.22.md) - 2026-09-11
 
@@ -122,6 +123,7 @@ compact website download controls with GitHub asset links. See the
 This release's native Mac handover requires preserving the old app and does not
 provide an ordinary replacement upgrade. Native Sparkle updates remain separate.
 The 0.1.20 release above addresses that limitation; the checked-in 0.1.19 notes
+The 0.1.20 candidate above addresses that limitation; the checked-in 0.1.19 notes
 preserve the published release wording.
 
 ## [0.1.18](./release-notes/0.1.18.md) - 2026-09-05

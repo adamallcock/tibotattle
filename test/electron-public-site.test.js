@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { deflateSync } from 'node:zlib';
 import { mkdtemp, mkdir, readFile, writeFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +10,23 @@ import { identityDigest } from '../scripts/lib/release-operation.mjs';
 import { buildPublicReleaseSite, parseArgs } from '../scripts/build-public-release-site.js';
 
 const hash = b => createHash('sha256').update(b).digest('hex');
+// Synthetic PNG/JPEG bytes only; no rendered or hand-copied card enters the repository.
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) { crc ^= byte; for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0); }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+function pngChunk(type, data) {
+  const typeBytes = Buffer.from(type, 'ascii'), length = Buffer.alloc(4), checksum = Buffer.alloc(4);
+  length.writeUInt32BE(data.length); checksum.writeUInt32BE(crc32(Buffer.concat([typeBytes, data])));
+  return Buffer.concat([length, typeBytes, data, checksum]);
+}
+function grayscalePng(width, height) {
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(width, 0); ihdr.writeUInt32BE(height, 4); ihdr[8] = 8; ihdr[9] = 0;
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(Buffer.alloc((width + 1) * height))), pngChunk('IEND', Buffer.alloc(0))]);
+}
+const SOURCE_SOCIAL_ALT = 'The TiboTattle homepage: the community-fitted seven-day Codex allowance in API-equivalent dollars, with its plausible range and daily history, beside the macOS download';
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(),'electron-site-'));t.after(()=>rm(root,{recursive:true,force:true}));
   const origin='https://updates.tibotattle.com', targets=[];
@@ -101,4 +119,51 @@ test('Electron Privacy localization preserves all source content and uses only t
     'privacy sections and content must not receive the Docs-specific rewrites');
   for (const key of ['sample', 'smallSample', 'publicationRules']) assert.ok(rendered.includes(`data-i18n="community.privacy.${key}"`));
   assert.equal(renderElectronSiteDocumentation('<body><p>Unrelated resource</p></body>'), '<body><p>Unrelated resource</p></body>');
+});
+
+async function electronSiteArgs(f, socialBytes) {
+  const social = join(f.root, 'social.png');
+  await writeFile(social, socialBytes);
+  return { output: join(f.root, 'output'), siteUrl: 'https://tibotattle.com/',
+    releaseNotesUrl: 'https://github.com/adamallcock/tibotattle/releases/tag/v0.1.20',
+    privacyUrl: 'https://tibotattle.com/privacy', securityUrl: 'https://tibotattle.com/docs',
+    supportUrl: 'https://github.com/adamallcock/tibotattle/issues', socialImage: social,
+    electronPublicationPlan: f.planPath, electronPublicationRoot: f.root,
+    electronApprovedPlanSha256: f.options.approvedPlanSha256 };
+}
+
+test('Electron mode keeps the large card for a rendered 1200x630 homepage preview', async t => {
+  const f = await fixture(t);
+  const args = await electronSiteArgs(f, grayscalePng(1200, 630));
+  await buildPublicReleaseSite(args, { verifyPublishedInstaller: async value =>
+    ({ bytes: value.expectedBytes, sha256: value.expectedSha256, published: false }) });
+  const html = await readFile(join(args.output, 'index.html'), 'utf8');
+  assert.match(html, /<meta name="twitter:card" content="summary_large_image">/u);
+  assert.match(html, /<meta property="og:image:width" content="1200">/u);
+  assert.match(html, /<meta property="og:image:height" content="630">/u);
+  assert.doesNotMatch(html, /content="1024"|content="summary">/u);
+  // The rendered card pictures this page, so it keeps the source-owned alt text.
+  assert.match(html, new RegExp(`<meta property="og:image:alt" content="${SOURCE_SOCIAL_ALT}">`, 'u'));
+  assert.doesNotMatch(html, /og:image:alt" content="TiboTattle logo"/u);
+  assert.equal((html.match(/data-electron-download=/gu) || []).length, 4);
+  assert.deepEqual(await readFile(join(args.output, 'social-preview.png')), grayscalePng(1200, 630));
+  const manifest = JSON.parse(await readFile(join(args.output, 'release-site-manifest.json'), 'utf8'));
+  assert.equal(manifest.site.socialPreview.width, 1200);
+  assert.equal(manifest.site.socialPreview.height, 630);
+});
+
+test('Electron mode refuses any social image that is neither the brand icon nor a rendered card', async t => {
+  const f = await fixture(t);
+  const verifyPublishedInstaller = async value =>
+    ({ bytes: value.expectedBytes, sha256: value.expectedSha256, published: false });
+  for (const bytes of [grayscalePng(1200, 631), grayscalePng(1024, 1023), grayscalePng(1201, 630)]) {
+    await assert.rejects(buildPublicReleaseSite(await electronSiteArgs(f, bytes), { verifyPublishedInstaller }),
+      /Electron social preview must be the 1024x1024 brand icon or a rendered 1200x630 card/u);
+  }
+  const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(64, 0x20), Buffer.from([0xff, 0xd9])]);
+  await assert.rejects(buildPublicReleaseSite(await electronSiteArgs(f, jpeg), { verifyPublishedInstaller }),
+    /Social preview must be a complete PNG file/u);
+  // A square image that is not the reviewed icon still fails the byte pin.
+  await assert.rejects(buildPublicReleaseSite(await electronSiteArgs(f, grayscalePng(1024, 1024)), { verifyPublishedInstaller }),
+    /Electron social preview must match the reviewed public brand icon/u);
 });

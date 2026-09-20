@@ -188,12 +188,33 @@ code or unrelated translations in that shared file still fail admission.
 The generated mirror remains subject to the i18n mirror check. A local-preview
 manifest is refused by the web-release receipt writer.
 
-Electron mode uses an exact copy of the existing 1024×1024 public brand PNG
-(outside the source/output roots) for `--social-image`. It verifies those bytes
-against `tibotattle-icon.png` and emits square Open Graph dimensions, logo alt
-text, and a summary Twitter card. Native generation retains its 1200×630 card.
-This avoids presenting an older native-version screenshot as the Electron
-release. Retained-state admission uses the app's schema compatibility check;
+Refresh the social share card before an Electron-mode build. It is the
+og:image/twitter:image for every link preview of the site, and its headline
+figure is a published estimate that moves daily, so it goes stale on its own
+between releases:
+
+```bash
+npm run product:social-preview -- \
+  --output "$PWD/.release-build/social-preview/social-preview.png" --replace
+```
+
+It renders the live homepage with local headless Chrome and refuses to write a
+card whose allowance figure had not loaded, or whose page still advertises the
+download as unavailable. Pass its absolute output path as `--social-image`.
+
+`--social-image` accepts exactly two reviewed shapes, chosen by the PNG's own
+dimensions. A 1200×630 render keeps the `summary_large_image` Twitter card, the
+1200×630 Open Graph dimensions and the source-owned alt text; this is the shape
+X/Twitter renders as a full-width card and is the expected input. A 1024×1024
+image is the fallback for a publication with no fresh render: the generator
+verifies those bytes against `tibotattle-icon.png` and emits square Open Graph
+dimensions, logo alt text and a summary Twitter card, which previews only as a
+small thumbnail. Every other size, a non-PNG, or an oversize file is refused, so
+an older native-version screenshot still cannot reach the site. Either file must
+sit outside the source and output roots. Native generation is unchanged and
+always requires the 1200×630 card.
+
+Retained-state admission uses the app's schema compatibility check;
 users do not need an intermediate native version or a preserved predecessor
 executable. The 0.1.19 release cannot use these automatic-upgrade instructions.
 
