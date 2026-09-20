@@ -356,6 +356,8 @@ import {
   rebuildPendingCommunityDailyAggregates,
 } from "./community-daily-aggregates";
 import { isCurrentCommunityDailySpend } from "./community-daily-spend";
+import { CACHE_RETENTION_BAND_IDS, CACHE_RETENTION_METHOD,
+  CACHE_RETENTION_PUBLIC_SCHEMA_VERSION } from "./cache-retention-values";
 import { captureStorageCommunityAuthority } from "./storage-community-authority";
 import { readPublishedStorageCommunityDaily } from "./storage-community-daily";
 import { projectPublicAllowanceGraph } from "./public-allowance-breakdowns";
@@ -3610,6 +3612,17 @@ async function handleCommunityDaily(
     }
     day.payload = publicPayload;
   }
+  // The curve is computed from rows written under the CURRENT method, so a
+  // deploy mid-read cannot serve a figure measured under the previous one.
+  // Checked here rather than trusted from the reader, on the same principle as
+  // the spend block above: the gate that decides what the public sees lives at
+  // the boundary it is published across.
+  const curve = read.cacheRetention ?? null;
+  const cacheRetention = curve !== null
+    && curve.schemaVersion === CACHE_RETENTION_PUBLIC_SCHEMA_VERSION
+    && curve.methodVersion === CACHE_RETENTION_METHOD.version
+    && curve.bands.length === CACHE_RETENTION_BAND_IDS.length
+    ? curve : null;
   return jsonResponse(
     {
       schemaVersion: "community-daily-read-v1.0",
@@ -3618,6 +3631,12 @@ async function handleCommunityDaily(
       allowanceState,
       allowanceReadState: read.allowanceReadState,
       ...(allowanceBreakdowns === null ? {} : { allowanceBreakdowns }),
+      // Community-wide, like the breakdowns, and omitted entirely when the
+      // lane has published nothing. Omission is the honest signal: an empty
+      // curve and a curve of zeroes are different claims, and only one of them
+      // is true here. The projection carries counts and contributor shares
+      // only, never an owner digest.
+      ...(cacheRetention === null ? {} : { cacheRetention }),
       days,
     },
     200,

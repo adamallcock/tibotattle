@@ -9,6 +9,9 @@ import { createV11DailyProjectionValues, mergeV11DailyProjectionValues, validate
 import { readV11ProjectedOwnerDays } from './v11-daily-projection';
 import { readV1ProjectedChunkPage } from './v1-daily-projection';
 import { readPublishedStorageCommunityGraph } from './storage-community-graph-publication';
+import { readCacheRetentionCommunityBands } from './cache-retention-day';
+import { CACHE_RETENTION_METHOD, mergeCacheRetentionBands,
+  publicCacheRetentionCurve } from './cache-retention-values';
 import { captureStorageCommunityAuthority, captureStorageCommunityRetirementAuthority, readStorageCommunityOwnerPage,
   readStorageCommunitySourceTerminalEpoch, sameStorageCommunityHardAuthority, storageCommunityCalculationAuthorityIsCurrent,
   storageCommunityPublicationVisible, type StorageCommunityAuthority, type StorageCommunityOwner } from './storage-community-authority';
@@ -347,11 +350,25 @@ export async function readPublishedStorageCommunityDaily(options:StorageCommunit
     // Optional graph failure preserves verified activity; the final source
     // fence below still rejects a revocation which raced either target read.
   }
+  // The cache-retention curve is community-wide rather than per-day, so it is
+  // read here beside the breakdowns instead of being stamped into a day's
+  // immutable payload, where it would age in place. Optional on exactly the
+  // same terms: its absence is reported as absence and never withholds a day.
+  let cacheRetention:PublishedCommunityDailyRead['cacheRetention']=null;
+  try {
+    const bands=await readCacheRetentionCommunityBands({target:options.target,sourceId:options.sourceId});
+    // No evidence is not an empty curve. A lane that has published nothing
+    // reports null, so the page can say so rather than draw ten zeroes.
+    cacheRetention=bands.length===0?null
+      :publicCacheRetentionCurve(mergeCacheRetentionBands(bands),CACHE_RETENTION_METHOD.version);
+  }catch{
+    cacheRetention=null;
+  }
   // Final source fence: a containment terminal or hard-authority change that
   // raced the target reads fails closed. An ordinary upload does not.
   if(await readStorageCommunitySourceTerminalEpoch(options.source)!==sourceTerminal
     ||!await storageCommunityCalculationAuthorityIsCurrent(options.source,authority))throw unavailable();
-  return {rows:visible,allowancePublicationState:null,allowanceBreakdownsCache,
+  return {rows:visible,allowancePublicationState:null,allowanceBreakdownsCache,cacheRetention,
     allowanceReadState:allowanceBreakdownsCache===null?'temporarily_unavailable':'confirmed'};
 }
 

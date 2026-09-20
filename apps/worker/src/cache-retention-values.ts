@@ -577,3 +577,83 @@ export function mergeCacheRetentionBands(
       topContributorShare: totals.adjacencies === 0 ? null : top / totals.adjacencies };
   });
 }
+
+/** The published schema of the community curve. Additive changes keep this
+ * string; a change to what a field MEANS must move it. */
+export const CACHE_RETENTION_PUBLIC_SCHEMA_VERSION = "community-cache-retention-v1.0";
+
+export interface PublicCacheRetentionCurve {
+  readonly schemaVersion: typeof CACHE_RETENTION_PUBLIC_SCHEMA_VERSION;
+  readonly metric: typeof CACHE_RETENTION_METRIC_ID;
+  readonly methodVersion: string;
+  /** What an adjacency IS, carried on the payload rather than left to the
+   * caption, so a reader holding only the JSON cannot mistake this for the
+   * local dashboard's turn-scoped figure. */
+  readonly measures: "consecutive_requests";
+  /** The gap is measured between the two events' observed instants, and the
+   * only instant uploaded is written when a response FINISHES. So a gap is
+   * end-to-end and overstates the idle pause by the later request's duration.
+   * The error is proportional to response time, which is why the short bands
+   * are not a usable answer to "how long may I wait" and the long ones are. */
+  readonly gapBasis: "response_end_to_response_end";
+  readonly bands: readonly PublicCacheRetentionBand[];
+}
+
+export interface PublicCacheRetentionBand {
+  readonly band: CacheRetentionBandId;
+  readonly startMs: number;
+  readonly endMs: number;
+  readonly adjacencies: number;
+  readonly sessions: number;
+  readonly contributors: number;
+  readonly reusedMoreThanHalfRate: number | null;
+  readonly matchedOrExceededRate: number | null;
+  readonly topContributorShare: number | null;
+  readonly excludedInsufficientEvidence: number;
+  readonly excludedContextContracted: number;
+  readonly unorderedTies: number;
+}
+
+/**
+ * Project merged bands for publication.
+ *
+ * Nothing is withheld and nothing is rounded away: a band with two
+ * contributors publishes with `contributors: 2` rather than being suppressed,
+ * because `contributors` and `topContributorShare` are exactly what let a
+ * reader judge it. A band with no adjacency publishes a NULL rate, never a
+ * zero — no reuse and no evidence are different claims.
+ *
+ * The owner digests that `mergeCacheRetentionBands` folded over do not appear
+ * and cannot: it returns counts and shares only.
+ */
+export function publicCacheRetentionCurve(
+  bands: readonly CacheRetentionCommunityBand[], methodVersion: string,
+): PublicCacheRetentionCurve {
+  if (typeof methodVersion !== "string" || methodVersion.length === 0) {
+    throw new TypeError("CACHE_RETENTION_METHOD_VERSION_INVALID");
+  }
+  const byId = new Map(bands.map((band) => [band.band, band]));
+  return {
+    schemaVersion: CACHE_RETENTION_PUBLIC_SCHEMA_VERSION,
+    metric: CACHE_RETENTION_METRIC_ID,
+    methodVersion,
+    measures: "consecutive_requests",
+    gapBasis: "response_end_to_response_end",
+    // Every band, in the method's own order, whether or not it has evidence.
+    // A curve that omitted its empty bands would read as a shorter curve.
+    bands: CACHE_RETENTION_BANDS.map((definition) => {
+      const merged = byId.get(definition.id);
+      return {
+        band: definition.id, startMs: definition.startMs, endMs: definition.endMs,
+        adjacencies: merged?.adjacencies ?? 0, sessions: merged?.sessions ?? 0,
+        contributors: merged?.contributors ?? 0,
+        reusedMoreThanHalfRate: merged?.reusedMoreThanHalfRate ?? null,
+        matchedOrExceededRate: merged?.matchedOrExceededRate ?? null,
+        topContributorShare: merged?.topContributorShare ?? null,
+        excludedInsufficientEvidence: merged?.excludedInsufficientEvidence ?? 0,
+        excludedContextContracted: merged?.excludedContextContracted ?? 0,
+        unorderedTies: merged?.unorderedTies ?? 0,
+      };
+    }),
+  };
+}

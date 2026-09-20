@@ -12,6 +12,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { telemetryV11DomainManifestDigestInput, type TelemetryV11DomainManifest } from "@app-usagemonitor/telemetry-contract";
 import { authenticateDevice, createDeviceUploadAuthorization, claimDeviceUploadAuthorization } from "../src/device-auth";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
+import { CACHE_RETENTION_BAND_IDS, CACHE_RETENTION_METHOD,
+  CACHE_RETENTION_PUBLIC_SCHEMA_VERSION } from "../src/cache-retention-values";
+import { reduceCacheRetentionDay } from "../src/cache-retention-values";
+import { cacheRetentionLookbackDays, writeCacheRetentionDay } from "../src/cache-retention-day";
 import { handleRequest } from "../src/index";
 import { initializeStorageSource, prepareIngestionChange, readIngestionChanges } from "../src/analytics-delivery";
 import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../src/typed-v11-admission";
@@ -679,6 +683,77 @@ describe('independent public daily publication',()=>{
     expect((await publish()).state).toBe('published');
     expect(JSON.parse((await publicRead()).rows[0]!.payload_json).totals.usageEvents).toBe(0);
   });
+  it('serves the community cache-retention curve beside the days, or omits it',async()=>{
+    await fixture();await ready();await publish();
+    // Nothing published yet: the key is ABSENT, never an empty curve. A curve
+    // of ten zeroes would claim the provider evicts everything, which is the
+    // opposite of "we have no evidence".
+    expect(Object.hasOwn(await (await api()).json<Record<string,unknown>>(),'cacheRetention')).toBe(false);
+    expect((await publicRead()).cacheRetention).toBe(null);
+
+    // Two owners through the REAL writer, so the served figure is a pooled
+    // fold over rows that satisfied every retention trigger on the way in.
+    const dayMs=Date.parse(`${today()}T00:00:00.000Z`);
+    const seed=async(owner:string,secondRead:number)=>{
+      const event=(offsetMs:number,cacheReadTokens:number,uncachedTokens:number)=>({
+        sessionDigest:owner,observedAtMs:dayMs+offsetMs,orderKey:`occ-${owner.slice(0,4)}-${offsetMs}`,
+        model:'gpt-5.6-sol',effort:'high',speedMode:'standard',surface:'local_interactive_unclassified',
+        cacheReadTokens,uncachedTokens,cacheWriteTokens:0});
+      // Fifteen minutes apart, so the pair lands in `ten_to_thirty_minutes`.
+      const events=[event(0,1_000,100),event(15*60_000,secondRead,1_000)];
+      await writeCacheRetentionDay({target:target(),
+        key:{sourceId,sourceLayout:'typed-v11',sourceNamespace:namespace,ownerDigest:owner,
+          deviceId:'device-1',manifestId:'manifest-1',manifestDigest:'c'.repeat(64),day:today()},
+        carry:cacheRetentionLookbackDays(today()).map(back=>({day:back,manifestDigest:''})),
+        aggregate:reduceCacheRetentionDay({day:today(),events,carry:[],eventsRead:events.length})});
+    };
+    const ownerA='a'.repeat(64),ownerB='b'.repeat(64);
+    // A reuses more than half of its prefix; B does not. One of two, so the
+    // pooled rate has to be exactly a half or the fold is wrong.
+    await seed(ownerA,1_000);
+    await seed(ownerB,100);
+
+    const body=await (await api()).json<{cacheRetention:{schemaVersion:string;methodVersion:string;
+      measures:string;gapBasis:string;bands:Array<Record<string,unknown>>}}>();
+    const curve=body.cacheRetention;
+    expect(curve.schemaVersion).toBe(CACHE_RETENTION_PUBLIC_SCHEMA_VERSION);
+    expect(curve.methodVersion).toBe(CACHE_RETENTION_METHOD.version);
+    // The payload states what it measures, so a reader holding only the JSON
+    // cannot mistake it for the local dashboard's turn-scoped figure.
+    expect(curve.measures).toBe('consecutive_requests');
+    expect(curve.gapBasis).toBe('response_end_to_response_end');
+    // Every band, in the method's order, including the ones with no evidence:
+    // a curve that dropped its empty bands would read as a shorter curve.
+    expect(curve.bands.map(band=>band.band)).toEqual([...CACHE_RETENTION_BAND_IDS]);
+
+    const tenToThirty=curve.bands.find(band=>band.band==='ten_to_thirty_minutes')!;
+    expect(tenToThirty.adjacencies).toBe(2);
+    expect(tenToThirty.reusedMoreThanHalfRate).toBeCloseTo(0.5,10);
+    expect(tenToThirty.contributors).toBe(2);
+    expect(tenToThirty.topContributorShare).toBeCloseTo(0.5,10);
+
+    // A band with no adjacency publishes NULL, never zero: no reuse and no
+    // evidence are different claims and only one of them is being made.
+    const empty=curve.bands.find(band=>band.band==='over_twenty_four_hours')!;
+    expect(empty.adjacencies).toBe(0);
+    expect(empty.reusedMoreThanHalfRate).toBe(null);
+    expect(empty.matchedOrExceededRate).toBe(null);
+    expect(empty.contributors).toBe(0);
+
+    // Pseudonymity: the merge folds over owner digests and must publish none.
+    const serialized=JSON.stringify(body);
+    expect(serialized).not.toContain(ownerA);
+    expect(serialized).not.toContain(ownerB);
+
+    // A superseded method is not this method's evidence, but band rows are
+    // immutable while their values row exists -- relabelling one is refused by
+    // `analytics_cache_retention_day_bands_immutable`, which is the guard
+    // working. The method gate is proven at the reader instead, where a
+    // version nothing wrote returns no rows at all.
+    await expect(target().prepare('UPDATE analytics_cache_retention_day_bands SET method_version=?')
+      .bind('cache-retention-v3').run()).rejects.toThrow('analytics_cache_retention_day_band_retained');
+  });
+
   it('uses indexed owner/day and latest-revision reads with no raw telemetry read on the public route',async()=>{
     await fixture();await ready();await publish();
     const captured:string[]=[];
