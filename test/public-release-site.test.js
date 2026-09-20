@@ -1188,7 +1188,7 @@ test("checked-in public source satisfies the complete release contract", async (
   const result = await buildFixtureSite(
     releaseArgs(value, { source: PUBLIC_SOURCE }),
   );
-  assert.equal(result.fileCount, 24);
+  assert.equal(result.fileCount, 41);
   const manifest = JSON.parse(
     await readFile(join(value.output, "release-site-manifest.json"), "utf8"),
   );
@@ -1198,19 +1198,35 @@ test("checked-in public source satisfies the complete release contract", async (
     manifest.files.map(({ path }) => path),
     [
       "404.html",
+      "allowance-tank-renderer.js",
+      "allowance-tanks.js",
       "apple.svg",
+      "cache-reuse-matrix.css",
+      "cache-reuse-matrix.js",
+      "codex-color.svg",
       "community-data.js",
       "community-refresh.js",
       "community-view.js",
       "community.html",
       "community.js",
+      "dashboard-ui.js",
       "docs.html",
+      "feature-allowance.jpg",
+      "feature-allowance.mp4",
+      "feature-insights.js",
+      "feature-tour.css",
+      "feature-tour.js",
+      "feature-value.jpg",
+      "feature-week.js",
       "github.svg",
       "i18n.generated.js",
       "index.html",
       "install-cta.js",
+      "last-known-good.js",
       "localization.js",
       "model-catalog.generated.js",
+      "model-performance.css",
+      "model-performance.js",
       "model-visuals.js",
       "privacy.html",
       "robots.txt",
@@ -1218,6 +1234,7 @@ test("checked-in public source satisfies the complete release contract", async (
       "social-preview.png",
       "styles.css",
       "tibotattle-icon.png",
+      "trends-horizon.js",
       "ui-format.js",
       "x.svg",
     ],

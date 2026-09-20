@@ -119,7 +119,31 @@
   .cache-matrix-model-picker selectedcontent > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .cache-matrix-model-picker selectedcontent .allowance-model-icon { width: 28px; height: 28px; padding: 5px; }
 }
-.cache-matrix-view { position: relative; width: 100%; }
+/* The plot switches to its stacked layout on its own measured width, not on a
+   viewport breakpoint, so the watermark asks the same question the renderer
+   does. `inline-size` containment is safe here: the view takes its width from
+   the stage and its height from the drawn plot. */
+.cache-matrix-view { position: relative; width: 100%; container-type: inline-size; }
+/* The credit's own treatment is shared with the page's other figures; only
+   its position belongs to this chart. Bottom right: the long-gap columns end
+   the row with the fewest lights, and the axis caption stays centred, so
+   nothing is drawn there at any width the wide layout covers. */
+.cache-matrix-view::after {
+  inset-block-end: 12px;
+  inset-inline-end: 16px;
+}
+/* Below 520px the renderer stacks one row per gap: the right edge then
+   carries every row's rate and sample count, and the caption can reach the
+   bottom corner on a narrow phone. The only reliably empty band is the lead
+   in above the first row. This is the renderer's own threshold; keep the two
+   together. */
+@container (max-width: 519px) {
+  .cache-matrix-view::after {
+    inset-block-start: 3px;
+    inset-block-end: auto;
+    inset-inline-end: 12px;
+  }
+}
 .cache-matrix-plot { display: block; width: 100%; overflow: visible; }
 .cache-matrix-plot text { font-family: inherit; font-size: 11px; fill: var(--matrix-light); }
 .cache-matrix-plot .cache-matrix-muted { fill: var(--matrix-dim); font-variant-numeric: tabular-nums; }
@@ -200,6 +224,10 @@
   .cache-matrix-selection { transition: none; }
 }
 @media (forced-colors: active) {
+  /* The credit duplicates the wordmark in the page header and footer, and a
+     forced palette would repaint it as solid text over the plot, so it is
+     withdrawn rather than fought with. */
+  .cache-matrix-view::after { content: none; }
   .cache-matrix-stage { border: 1px solid CanvasText; }
   .cache-matrix-cell-more { fill: LinkText; }
   .cache-matrix-cell-less { fill: Mark; }

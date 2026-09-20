@@ -8,10 +8,13 @@ const BUCKETS = Object.freeze([
   ["five_to_ten_minutes", "fiveToTenMinutes", 300, 600],
   ["ten_to_thirty_minutes", "tenToThirtyMinutes", 600, 1_800],
   ["thirty_minutes_to_one_hour", "thirtyMinutesToOneHour", 1_800, 3_600],
-  ["one_to_six_hours", "oneToSixHours", 3_600, 21_600],
+  ["one_to_two_hours", "oneToTwoHours", 3_600, 7_200],
+  ["two_to_six_hours", "twoToSixHours", 7_200, 21_600],
   ["six_to_twenty_four_hours", "sixToTwentyFourHours", 21_600, 86_400],
-  ["one_to_three_days", "oneToThreeDays", 86_400, 259_200],
-  ["over_three_days", "overThreeDays", 259_200, null],
+  // Closed at seven days, which is the hosted lane's lookback: a longer gap
+  // is not measured at all rather than counted in this band. The old vocabulary
+  // ended in an unbounded `over_three_days`, which this cannot claim.
+  ["over_twenty_four_hours", "twentyFourHoursPlus", 86_400, 604_800],
 ]);
 const COUNT_FIELDS = [
   "comparableReturns", "reusedMoreThanHalfReturns", "reusedHalfOrLessReturns",
@@ -21,30 +24,11 @@ const COUNT_FIELDS = [
 const count = (value) => Number.isSafeInteger(value) && value >= 0;
 const amount = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
 const sum = (values) => values.reduce((total, value) => total + value, 0);
-const sumAmounts = (values) => values.every(amount) && amount(sum(values)) ? sum(values) : null;
 const validCounts = (row) => row && COUNT_FIELDS.every((field) => count(row[field]))
   && row.reusedMoreThanHalfReturns + row.reusedHalfOrLessReturns === row.comparableReturns
   && row.matchedOrExceededReturns + row.reusedBetweenHalfAndPreviousReturns === row.reusedMoreThanHalfReturns
   && row.cacheReadDrops === row.reusedHalfOrLessReturns
   && row.pricedDrops + row.unpricedDrops === row.cacheReadDrops;
-
-// Presentation-only regrouping of two already classified, disjoint cohorts.
-// Missing amounts remain unknown; they must never become a zero-priced tail.
-function mergeTail(rows) {
-  const merged = Object.fromEntries(COUNT_FIELDS.map((field) => [field, sum(rows.map((row) => row[field]))]));
-  merged.startSeconds = 86_400;
-  merged.endSeconds = null;
-  merged.coverageStatus = rows.every((row) => row.coverageStatus === "complete") ? "complete" : "incomplete";
-  merged.estimatedPremiumUsd = sumAmounts(rows.map((row) => row.estimatedPremiumUsd));
-  const subtotals = rows.map((row) => row.coveredSubtotal?.standardApiPremiumUsd
-    ?? (row.coverageStatus === "complete" && row.unpricedDrops === 0 ? row.estimatedPremiumUsd : null));
-  merged.coveredSubtotal = {
-    standardApiPremiumUsd: sumAmounts(subtotals),
-    pricedDrops: merged.pricedDrops,
-    unpricedDrops: merged.unpricedDrops,
-  };
-  return merged;
-}
 
 export function cacheReuseMatrixBuckets(impact) {
   if (!validCounts(impact) || !impact.byOutcomeBucket) return null;
@@ -57,28 +41,87 @@ export function cacheReuseMatrixBuckets(impact) {
     rows.push({ ...row, id, label });
   }
   if (COUNT_FIELDS.some((field) => sum(rows.map((row) => row[field])) !== impact[field])) return null;
-  return [...rows.slice(0, 8), {
-    ...mergeTail(rows.slice(8)), id: "twenty_four_hours_plus", label: "twentyFourHoursPlus",
-  }];
+  // Every bucket is rendered as measured. The previous vocabulary ended in two
+  // day-scale buckets that were merged back together for display; this one ends
+  // in the single bucket the evidence is actually cut into, so there is nothing
+  // to merge and nothing that could disagree with what was measured.
+  return rows;
 }
 
 // Keep volume comparable between model selections. The unit is chosen from
 // the whole selected reporting period, never from the active model alone.
-export function chooseCacheReuseMatrixUnit(impact) {
+/** The unit used to be chosen so the tallest bucket fitted at the BASE cell
+ * size, which is why a hosted corpus broke the chart: with 818,269 sub-minute
+ * adjacencies against 692 in one-to-two hours, that unit left every later
+ * bucket with a fraction of a single light and the decay the chart exists to
+ * show was invisible. Letting the tall bucket draw SMALLER lights instead
+ * keeps "1 light = N follow-ups" exactly true across every bucket while
+ * freeing the unit to be ~25x finer. */
+/** Below this a light stops reading as a light. A column that would need to go
+ * smaller is drawn at this size and clipped, which the caller reports. */
+export const CACHE_REUSE_MATRIX_MINIMUM_CELL = 1.3;
+/** The tallest a bucket's stack is drawn, in light-rows. Caps the plot so one
+ * enormous bucket cannot push the rest of the chart below the fold. */
+const MAX_PIXEL_ROWS = 46;
+
+/** Lights the tallest bucket can physically hold, at the smallest cell size a
+ * light is still legible at. This is the real constraint and it is worth
+ * stating: with one shared unit, a fixed box and a 1,200:1 spread between the
+ * tallest and shortest bucket, NO unit shows both a full stack in the tallest
+ * and several lights in the shortest. Something has to give, so the unit is
+ * set by what can actually be drawn, which maximises the lights every other
+ * bucket gets. */
+export const CACHE_REUSE_MATRIX_STACK_CAPACITY = 4_400;
+
+export function chooseCacheReuseMatrixUnit(impact, capacity = CACHE_REUSE_MATRIX_STACK_CAPACITY) {
   const rows = cacheReuseMatrixBuckets(impact);
   if (!rows) return 1;
-  const raw = Math.max(1, impact.comparableReturns / 900,
-    ...rows.map((row) => row.comparableReturns / 360));
+  const populated = rows.map((row) => row.comparableReturns).filter((count) => count > 0);
+  if (populated.length === 0) return 1;
+  // The TALLEST bucket sets the unit, because it is the one that can overflow
+  // the box. Every shorter bucket then gets as many lights as that allows,
+  // which is what makes the later columns readable at all.
+  const raw = Math.max(1, Math.max(...populated) / capacity);
   const magnitude = 10 ** Math.floor(Math.log10(raw));
   const scaled = raw / magnitude;
+  // Round UP: rounding down would put the tallest bucket back over capacity,
+  // which is the constraint being solved here.
   const nice = [1, 2, 5, 10].find((value) => value >= scaled) ?? 10;
   return nice * magnitude;
+}
+
+/** The cell size a bucket is drawn at, given the space every bucket shares.
+ *
+ * All buckets share ONE unit, so a tall bucket has genuinely more lights and
+ * has to draw them smaller to fit. The count stays exact; what varies is the
+ * size of a light. Cross-column ink area is therefore no longer comparable --
+ * the column labels and `n=` carry volume instead -- and that is the trade the
+ * alternative (a per-column unit) would have made silently and in the numbers
+ * rather than visibly and in the geometry. */
+export function cacheReuseMatrixCellScale(lights, { width, height, cell, gap }) {
+  if (!Number.isFinite(lights) || lights <= 0) return 1;
+  const perRow = Math.max(1, Math.floor((width + gap) / (cell + gap)));
+  if (Math.ceil(lights / perRow) * (cell + gap) - gap <= height) return 1;
+  // Solve for the largest scale that fits, then floor it at a visible size.
+  let low = CACHE_REUSE_MATRIX_MINIMUM_CELL / cell, high = 1;
+  for (let step = 0; step < 24; step += 1) {
+    const mid = (low + high) / 2;
+    const fitted = Math.max(1, Math.floor((width + gap * mid) / (cell * mid + gap * mid)));
+    if (Math.ceil(lights / fitted) * (cell * mid + gap * mid) - gap * mid <= height) low = mid;
+    else high = mid;
+  }
+  return low;
 }
 
 export function cacheReuseMatrixLights(summary, unit) {
   if (!count(summary?.comparableReturns) || !count(summary?.reusedMoreThanHalfReturns)
     || summary.reusedMoreThanHalfReturns > summary.comparableReturns || !amount(unit) || unit < 1
-    || Math.ceil(summary.comparableReturns / unit) > 900) return [];
+    // Tied to the unit chooser, which never asks for more lights than this.
+    // The two used to disagree -- the chooser targeted the box while this held
+    // the old 900 -- and a bucket over the cap returned NO lights, so the
+    // busiest bucket in the corpus rendered as if it had no evidence at all.
+    // An empty stack and an enormous one must never look the same.
+    || Math.ceil(summary.comparableReturns / unit) > CACHE_REUSE_MATRIX_STACK_CAPACITY) return [];
   const result = [];
   for (let index = 0; index < Math.ceil(summary.comparableReturns / unit); index += 1) {
     const start = index * unit;
@@ -215,18 +258,33 @@ export function createCacheReuseMatrix({
     geometry = [];
     buttons = [];
     const narrow = w < 520;
-    const columns = narrow ? Math.max(10, Math.floor((w - 125) / 6.4)) : 7;
-    const cw = narrow ? 3.8 : Math.min(4.8, ((w - 32) / 9 - 18 - (columns - 1) * 2) / columns);
-    const ch = narrow ? 3.8 : 4.8;
+    // Lights per row. Wide mode used a fixed seven, which left a bucket's
+    // stack 46px wide inside a slot nearer 140 -- and because a tall bucket
+    // scales its cells down to fit the box, that wasted width was paid for
+    // directly in dot size. Filling the slot lets the SAME number of lights
+    // spread over a wider box, so every cell is drawn larger.
+    const slot = (w - 32) / Math.max(1, rows.length);
+    const columns = narrow ? Math.max(10, Math.floor((w - 125) / 6.4))
+      : Math.max(7, Math.min(30, Math.floor((slot * 0.84) / 6.8)));
+    const baseCw = narrow ? 3.8 : Math.min(4.8, (slot - 18 - (columns - 1) * 2) / columns);
+    const baseCh = narrow ? 3.8 : 4.8;
+    const ch = baseCh;
     const gap = narrow ? 1.8 : 2;
     const pitch = ch + gap;
-    const gridWidth = columns * cw + (columns - 1) * gap;
+    const narrowStackHeight = 96;
+    const gridWidth = columns * baseCw + (columns - 1) * gap;
     const wholeRows = cacheReuseMatrixBuckets(impact) ?? rows;
-    const maxRows = Math.max(1, ...wholeRows.map((row) => Math.ceil(Math.ceil(row.comparableReturns / unit) / columns)));
-    const baseline = 86 + Math.max(115, maxRows * pitch);
+    // The plot's height is FIXED rather than following the tallest bucket.
+    // One unit across every bucket means the tall one has genuinely more
+    // lights, and it now draws them smaller to fit instead of stretching the
+    // chart past the fold and squeezing every other bucket into a fraction of
+    // one light.
+    const stackRows = Math.min(MAX_PIXEL_ROWS,
+      Math.max(1, ...wholeRows.map((row) => Math.ceil(Math.ceil(row.comparableReturns / unit) / columns))));
+    const stackHeight = Math.max(115, stackRows * pitch);
+    const baseline = 86 + stackHeight;
     let height = baseline + 66;
-    if (narrow) height = rows.reduce((total, row) => total
-      + Math.max(67, Math.ceil(Math.ceil(row.comparableReturns / unit) / columns) * pitch + 35), 26) + 40;
+    if (narrow) height = rows.length * (narrowStackHeight + 35) + 26 + 40;
     plot.setAttribute("viewBox", `0 0 ${w} ${height}`);
     plot.style.height = `${height}px`;
     view.style.minHeight = `${height}px`;
@@ -244,8 +302,17 @@ export function createCacheReuseMatrix({
     let cursor = 26;
     rows.forEach((row, index) => {
       const lights = cacheReuseMatrixLights(row, unit);
-      const pixelRows = Math.ceil(lights.length / columns);
-      const pixelHeight = Math.max(ch, pixelRows * pitch - gap);
+      // Per-bucket, because the unit is shared: a bucket with more lights
+      // draws them smaller. `n=` above each column carries the volume the ink
+      // no longer can.
+      const stackBox = narrow ? narrowStackHeight : stackHeight;
+      const scale = cacheReuseMatrixCellScale(lights.length,
+        { width: gridWidth, height: stackBox, cell: ch, gap });
+      const cw = baseCw * scale, ch2 = baseCh * scale, gap2 = gap * scale;
+      const pitch2 = ch2 + gap2;
+      const columns2 = Math.max(1, Math.floor((gridWidth + gap2) / (cw + gap2)));
+      const pixelRows = Math.ceil(lights.length / columns2);
+      const pixelHeight = Math.max(ch2, pixelRows * pitch2 - gap2);
       let gx, gy, box;
       if (narrow) {
         const rowHeight = Math.max(67, pixelHeight + 35);
@@ -257,22 +324,28 @@ export function createCacheReuseMatrix({
         text(w - 18, cursor + 36, tr("n", { count: formatNumber(row.comparableReturns) }), "cache-matrix-muted", "end");
         cursor += rowHeight;
       } else {
-        const band = (w - 32) / 9;
-        const center = 16 + (index + .5) * band;
+        // The column pitch is the SAME slot the cell size was derived from, so
+        // the two cannot disagree about how many buckets there are. A fixed
+        // nine outlived the nine-row tail merge and drew the tenth bucket
+        // entirely past the right edge of the plot, where a measured bucket is
+        // indistinguishable from one with no evidence.
+        const center = 16 + (index + .5) * slot;
         gx = center - gridWidth / 2;
         gy = baseline - pixelHeight;
-        box = { x: 16 + index * band + 2, y: 12, width: band - 4, height: baseline + 39 };
+        box = { x: 16 + index * slot + 2, y: 12, width: slot - 4, height: baseline + 39 };
         text(center, 32, rate(row.reusedMoreThanHalfReturns, row.comparableReturns), "cache-matrix-rate", "middle");
         text(center, 52, tr("n", { count: formatNumber(row.comparableReturns) }), "cache-matrix-muted", "middle");
         text(center, baseline + 25, tr(`short.${row.label}`), "cache-matrix-gap", "middle");
       }
       const cells = svgEl("g", { class: "cache-matrix-cells" });
       lights.forEach((light, i) => {
-        const x = gx + (i % columns) * (cw + gap);
-        const y = narrow ? gy + Math.floor(i / columns) * pitch : baseline - ch - Math.floor(i / columns) * pitch;
+        const x = gx + (i % columns2) * (cw + gap2);
+        const y = narrow ? gy + Math.floor(i / columns2) * pitch2
+          : baseline - ch2 - Math.floor(i / columns2) * pitch2;
         for (const [key, offset] of [["more", 0], ["less", light.more]]) {
           if (light[key] > 0) cells.append(svgEl("rect", {
-            x: x + offset * cw, y, width: cw * light[key], height: ch, rx: .55, class: `cache-matrix-cell-${key}`,
+            x: x + offset * cw, y, width: cw * light[key], height: ch2,
+            rx: Math.min(.55, ch2 / 4), class: `cache-matrix-cell-${key}`,
           }));
         }
       });
@@ -353,7 +426,9 @@ export function createCacheReuseMatrix({
     metrics.hidden = unavailable;
     legend.hidden = unavailable;
     note.hidden = unavailable;
-    unitLabel.textContent = tr("unit", { count: formatNumber(unit) });
+    // A unit of one is a real state on a small corpus -- one light per
+    // follow-up -- and "1 light = 1 checked follow-ups" is not a sentence.
+    unitLabel.textContent = unit === 1 ? tr("unitOne") : tr("unit", { count: formatNumber(unit) });
     pickerLabel.textContent = tr("model");
     const modelBreakdownAvailable = Array.isArray(impact?.byModel);
     modelNote.hidden = impact?.status !== "available" || modelBreakdownAvailable;

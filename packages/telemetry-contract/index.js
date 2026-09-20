@@ -17,6 +17,10 @@ export {
 } from "./src/model-catalog.js";
 
 export {
+  assertReviewedModelCatalogCompleteness,
+} from "./src/model-catalog-contract.js";
+
+export {
   ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
   ACCOUNT_SCOPED_TELEMETRY_ENVELOPE_SCHEMA_VERSION,
   ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION,

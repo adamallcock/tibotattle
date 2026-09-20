@@ -43,12 +43,115 @@ dependency update, or Wrangler configuration change.
   can serve.
 - The generator, provenance/staging/deployment guards, their focused tests, and
   the release-lane runbooks.
+- The canonical message catalogue `packages/i18n/index.js`, paired with its
+  regenerated browser mirror `apps/web/public/i18n.generated.js`.
+- The canonical model catalogue `packages/telemetry-contract/src/model-catalog.js`,
+  paired with both mirrors regenerated from it:
+  `apps/web/public/model-catalog.generated.js` and
+  `apps/web/public/telemetry-shared.generated.js`.
 
 It rejects every other path, including `apps/macos/`, Worker source/runtime
-code, migrations, package-lock files, and deployment configuration. If
-`package.json` appears in the candidate, the guard also requires every package
-field and unrelated script to remain semantically unchanged; only the exact
-release-lane script entries are allowed.
+code, migrations, package-lock files, and deployment configuration. No other
+file under `packages/` is admitted: not `packages/i18n/index.d.ts`, not
+`packages/telemetry-contract/index.js`, its typings, package manifest, JSON
+schemas or any other module under `packages/telemetry-contract/src/`, and no
+other workspace package. If `package.json` appears in the candidate, the guard
+also requires every package field and unrelated script to remain semantically
+unchanged; only the exact release-lane script entries are allowed.
+
+### Site copy changes
+
+Site copy lives in the canonical catalogue, so a copy change edits
+`packages/i18n/index.js` first, updates every shipped locale, and then
+regenerates the mirror with `npm run i18n:browser:generate`. Never hand-edit
+`apps/web/public/i18n.generated.js`: the generator overwrites it and the lane
+refuses it. Commit both files in the same candidate.
+
+The lane proves that pairing rather than trusting it. It refuses a candidate
+that:
+
+- changes `packages/i18n/index.js` without its regenerated mirror, or the mirror
+  without a matching canonical change;
+- ships a mirror that does not match the canonical source, checked by running
+  the generator's own `--check` comparison against both blobs at the candidate
+  commit, not by a restatement of it;
+- leaves a shipped locale incomplete, checked with the i18n package's own
+  exported `assertCatalogCompleteness` contract: every locale carries the exact
+  canonical key set, non-blank values, and the same placeholder names;
+- changes anything in `packages/i18n/index.js` other than literal top-level
+  catalogue entries. Negotiation, formatting, interpolation and the completeness
+  contract itself must stay byte-identical to the deployed base, so runtime code
+  cannot ride along with copy.
+
+These proofs run at both ends of the receipt: preparation cannot write a receipt
+without them, and `product:web-release:deploy` repeats them before it delegates
+to the production guard. A change to i18n runtime code, the package typings, or
+any other workspace package is not a web-only release; take it through the
+normal review and release path.
+
+### Model vocabulary changes
+
+Model names shown on the public site come from the reviewed identity
+vocabulary, so a change edits
+`packages/telemetry-contract/src/model-catalog.js` first and then regenerates
+the mirrors with `npm run telemetry:browser:generate`. Never hand-edit
+`apps/web/public/model-catalog.generated.js`.
+
+That generator writes two mirrors from the same canonical module. Only
+`model-catalog.generated.js` is a public site asset;
+`telemetry-shared.generated.js` is app-only and is never published - the
+release-site build and the production staging guard both refuse it by name. The
+lane admits it anyway, because a candidate that regenerated only the public
+mirror would leave the shared one stale and fail `telemetry:browser:check`.
+Commit all three files in the same candidate.
+
+Admitting an app-only file into a web-only candidate is deliberate, not an
+oversight to tidy away. It is contained: the mirror is admitted only as a proven
+paired regeneration, it moves only alongside a canonical change that is itself
+restricted to literal reviewed rows, its bytes are checked by the generator, and
+it remains unpublishable by two independent guards. It therefore carries nothing
+the canonical module did not already carry. Removing it would not tighten the
+lane - it would only send model-name changes back outside it.
+
+The lane proves that pairing rather than trusting it. It refuses a candidate
+that:
+
+- changes the canonical module without either regenerated mirror, or changes a
+  mirror without a matching canonical change, including a rename away from any
+  of the three paths;
+- ships a mirror that does not match the canonical source, checked by running
+  the telemetry generator's own `--check` against the candidate's canonical
+  source tree - `buildPublicModelCatalogMirror` for the public model mirror and
+  the default build for the shared mirror - not by a restatement of it;
+- changes anything in the canonical module other than literal reviewed identity
+  rows. The catalogue version, the derived exports, the allowance-track and
+  pricing projections, and the reasoning-effort runtime must stay byte-identical
+  to the deployed base, so contract code cannot ride along with a site-visible
+  model name. A label is literal text with no quote or escape, so presentation
+  cannot carry an expression;
+- leaves the reviewed vocabulary incomplete, or moves it at all. Both the
+  candidate and the deployed base are validated with the telemetry-contract
+  package's own exported `assertReviewedModelCatalogCompleteness`, and their
+  identity projections must match exactly.
+
+That last refusal is the boundary of this lane. A **label** is site-visible
+copy and may change. The **vocabulary** - a model id, its provider, allowance
+track, pricing status, price identity, or its position in the catalogue - is
+reviewed against the accounting price cards, `src/export/registries.js` and the
+closed v0.2 `modelId` enum, none of which are in the web-only scope. Adding,
+removing, repricing or re-providering an identity is a normal review and release
+change; it also needs the v0.2 `usage-event.schema.json` enum updated and
+`npm test` run, so the lane refuses it by name rather than letting it ship
+half-bound.
+
+`packages/telemetry-contract/src/model-catalog-contract.js` holds that validator
+and is deliberately *not* an admissible candidate path, so a candidate cannot
+weaken the contract it is judged by. It is mirrored into the app-only
+`telemetry-shared.generated.js`, which carries the whole package contract, but
+deliberately not into the public `model-catalog.generated.js`, which carries the
+vocabulary alone: gate-time validation is never served to the public site. A
+deployed base that predates the contract cannot be used for a model-catalogue
+candidate; the lane says so rather than skipping the proof.
 
 ## 2. Reuse the existing installer evidence
 
@@ -95,10 +198,16 @@ Run the focused checks from the candidate worktree:
 ```bash
 npm run product:release-site:test
 npm run product:web-release:test
+npm run i18n:browser:check
+npm run telemetry:browser:check
 node apps/worker/scripts/stage-production-assets.mjs
 git diff --check
 git status --porcelain=v1 --untracked-files=all
 ```
+
+`i18n:browser:check` and `telemetry:browser:check` cover the checked-out mirrors
+whether or not this candidate touched them; the lane's own proofs are scoped to
+the candidate diff.
 
 The final `git status` must print nothing; generated `.release-build` output is
 ignored. Inspect the generated page with the normal local preview workflow and
@@ -182,11 +291,11 @@ preview using the frozen local bytes. Such output displays a preview warning
 and records `publishedInstallersVerified: false`; it is not a production
 publication receipt. The ordinary CLI always uses real HTTPS verification.
 
-The web-only scope admits the explicit Electron intake helper/test and the
-canonical i18n file only for literal `electron.site.*` catalog entries; runtime
-code or unrelated translations in that shared file still fail admission.
-The generated mirror remains subject to the i18n mirror check. A local-preview
-manifest is refused by the web-release receipt writer.
+The web-only scope admits the explicit Electron intake helper/test. The
+`electron.site.*` download strings are ordinary catalogue copy and follow the
+canonical-then-regenerate rule above, with the same paired mirror and
+completeness proofs; runtime code in that shared file still fails admission. A
+local-preview manifest is refused by the web-release receipt writer.
 
 Refresh the social share card before an Electron-mode build. It is the
 og:image/twitter:image for every link preview of the site, and its headline

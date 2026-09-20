@@ -115,6 +115,17 @@ export const REVIEWED_MODEL_CATALOG: readonly ReviewedModelIdentity[];
 export const REVIEWED_CODEX_MODEL_IDS: readonly Exclude<TelemetryModelId, "unknown">[];
 export const REVIEWED_CLAUDE_MODEL_IDS: readonly Exclude<TelemetryModelId, "unknown">[];
 export function reviewedModelIdentity(value: unknown): ReviewedModelIdentity | null;
+export type ReviewedModelVocabularyEntry =
+  Omit<ReviewedModelIdentity, "label">;
+export interface ReviewedModelCatalogCompleteness {
+  readonly version: typeof REVIEWED_MODEL_CATALOG_VERSION;
+  readonly identityCount: number;
+  readonly modelIds: readonly string[];
+  readonly identities: readonly ReviewedModelVocabularyEntry[];
+}
+export function assertReviewedModelCatalogCompleteness(
+  options?: { catalog?: readonly ReviewedModelIdentity[] },
+): ReviewedModelCatalogCompleteness;
 export function codexRequestReasoningEffort(modelId: unknown, effort: unknown):
   "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "unknown" | null;
 export function codexCacheReasoningConfiguration(modelId: unknown, effort: unknown):

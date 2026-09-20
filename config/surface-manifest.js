@@ -59,6 +59,11 @@ const HISTORY_FREE_EXPORT_ONLY_WEB_FILES = Object.freeze([
   "apps/web/public/community-view.js",
   "apps/web/public/community.html",
   "apps/web/public/community.js",
+  "apps/web/public/feature-insights.js",
+  "apps/web/public/feature-tour.css",
+  "apps/web/public/feature-tour.js",
+  "apps/web/public/feature-week.js",
+  "apps/web/public/last-known-good.js",
 ]);
 
 // The export intentionally omits the dashboard icon: the icon is authenticated

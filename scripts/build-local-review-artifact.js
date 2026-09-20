@@ -148,6 +148,7 @@ export const LOCAL_REVIEW_WORKSPACE_RUNTIME_FILES = Object.freeze({
     "src/constants.js",
     "src/envelope.js",
     "src/errors.js",
+    "src/model-catalog-contract.js",
     "src/model-catalog.js",
     "src/primitives.js",
     "src/telemetry-v0.1.js",

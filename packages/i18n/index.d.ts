@@ -36,6 +36,21 @@ export function resolveLocalePreference(
 
 export function isLanguagePreference(value: unknown): boolean;
 
+export interface CatalogCompletenessOptions {
+  catalogs?: MessageCatalogs;
+  supportedLocales?: readonly string[];
+  defaultLocale?: string;
+}
+
+export interface CatalogCompleteness {
+  readonly locales: readonly string[];
+  readonly keyCount: number;
+}
+
+export function assertCatalogCompleteness(
+  options?: CatalogCompletenessOptions,
+): CatalogCompleteness;
+
 export function getMessage(
   catalog: MessageCatalog,
   key: string,

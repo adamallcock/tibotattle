@@ -89,14 +89,9 @@ const APP_ONLY_SOURCE_BASENAMES = Object.freeze([
   "admin.html",
   "admin.js",
   "app.js",
-  "cache-reuse-matrix.js",
-  "cache-reuse-matrix.css",
   "cache-reuse-metrics.js",
-  "allowance-tanks.js",
-  "allowance-tank-renderer.js",
   "work-usage-view.js",
   "reporting-period.js",
-  "dashboard-ui.js",
   "data-client.js",
   "index.html",
   "lib.js",
@@ -1093,7 +1088,7 @@ function localPublicReferences(
       /url\(\s*["']?\.\/([^"'()?#]+)(?:[?#][^"'()]*)?["']?\s*\)/gu,
     )].map((match) => match[1])
     : [...source.matchAll(
-      /\b(?:href|src)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/gu,
+      /\b(?:href|src|poster)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/gu,
     )]
       .map((match) => match[1] ?? match[2] ?? match[3])
       .filter((value) => value.startsWith("./"))
@@ -1103,7 +1098,7 @@ function localPublicReferences(
     if (!name
         || name.includes("/")
         || name.includes("\\")
-        || ![".css", ".html", ".ico", ".jpeg", ".jpg", ".js", ".png", ".svg", ".webp"]
+        || ![".css", ".html", ".ico", ".jpeg", ".jpg", ".js", ".mp4", ".png", ".svg", ".webp"]
           .includes(extname(name).toLowerCase())) {
       throw new TypeError(`Public source contains an unreviewed local reference: ${name}`);
     }

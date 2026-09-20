@@ -95,10 +95,14 @@ test('rendered mixed badges never imply credits are allowance resets and clear o
     domain: { startMs: 0, endMs: 1000 }, margin: { top: 12, bottom: 30, left: 72, right: 24 }, width: 1100, height: 270 });
   const credit = marker({ kind: 'reset_credit_granted', precision: 'provider_timestamp', planType: null, limitId: null, windowDurationMins: null });
   controller.setEvents([marker(), credit, { kind: 'window_change', timestampMs: 101 }]);
-  assert.equal(elements.get('#trends-reset-count').textContent, 'Resets: 1 · Credit events: 1');
+  // The copy deliberately says "reset / window-change observations" rather
+  // than "Resets", because the count includes window changes and this test
+  // exists to stop the badge implying every observation is an allowance reset.
+  assert.equal(elements.get('#trends-reset-count').textContent,
+    '1 reset / window-change observations · Credit events: 1');
   const badge = svg.querySelector('.trends-reset-layer').children[0];
   assert.equal(badge.children.find(child => child.tag === 'text').textContent, '⋯');
-  assert.match(badge.attributes['aria-label'], /Resets: 1 · Credit events: 1/);
+  assert.match(badge.attributes['aria-label'], /1 reset \/ window-change observations · Credit events: 1/);
   let prevented = false;
   badge.listeners.keydown({ key: 'Enter', preventDefault() { prevented = true; }, stopPropagation() {} });
   assert.equal(prevented, true);

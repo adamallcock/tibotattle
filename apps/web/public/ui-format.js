@@ -339,6 +339,23 @@ export function compact(value) {
     });
 }
 
+/** `compact`, but never rounded down to a single significant figure.
+ *
+ * The headline stat cards were reporting a million-odd turns as "1M", which
+ * reads as a placeholder rather than a measurement and hides a range of nearly
+ * two to one. Two significant figures is the least that carries information;
+ * three is allowed so a value already at that precision is not coarsened. */
+export function compactPrecise(value) {
+  const number = finite(value);
+  return number === null
+    ? "—"
+    : formatNumber(number, {
+      notation: "compact",
+      minimumSignificantDigits: 2,
+      maximumSignificantDigits: 3,
+    });
+}
+
 const LOCAL_DATE_OPTIONS = Object.freeze({
   ...USER_TIME_ZONE_OPTION,
   month: "short",

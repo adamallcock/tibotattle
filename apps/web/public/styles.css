@@ -105,6 +105,10 @@
 }
 
 * { box-sizing: border-box; }
+/* This padding is what every in-page anchor lands against, so the sticky
+   header never covers the top of a section a pasted link points at. Targets
+   must not add a `scroll-margin-top` of their own: it stacks on this and
+   drops each destination about a header's height too low. */
 html { scroll-behavior: smooth; scroll-padding-top: 95px; }
 body {
   margin: 0;
@@ -3246,6 +3250,89 @@ footer p { margin: 0; }
   color: rgba(255, 253, 247, .7);
   font-size: .7rem;
 }
+/*
+ * The community's contribution totals, in the hero below the download. The
+ * daily renderer writes the same `dl` it writes into the activity band, so
+ * this styles that markup for a dark, narrow context rather than expecting
+ * different DOM.
+ *
+ * It follows the community link and shares its rule: the link states the
+ * freshness of exactly these figures, so a second separator between them
+ * would split one claim into two.
+ *
+ * Hidden unless the page is holding current evidence. The renderer leaves the
+ * host untouched on an unavailable answer, and it does not label retained
+ * figures here the way the band does, so an unqualified claim in the hero
+ * would outlive the evidence behind it. `data-live` is the same signal the
+ * community link uses. A browser without `:has()` keeps the band hidden,
+ * which fails in the safe direction.
+ */
+.community-site .hero-contribution { display: none; }
+.community-site:has(.community-inline[data-live="true"]) .hero-contribution {
+  display: block;
+  max-width: 620px;
+  margin-top: 18px;
+}
+.community-site .hero-contribution h2 {
+  margin: 0;
+  color: rgba(255, 253, 247, .58);
+  font-family: var(--sans);
+  font-size: .69rem;
+  font-weight: var(--weight-semibold);
+  letter-spacing: .04em;
+  line-height: 1.4;
+  text-transform: uppercase;
+}
+.community-site .hero-contribution .snapshot-quality-grid {
+  grid-template-rows: auto auto auto;
+  gap: 16px 18px;
+  margin: 11px 0 0;
+}
+/* Tiles would be a second card inside a hero that is already one surface;
+   here the figures read directly off the dark ground. Sharing the grid's rows
+   keeps the four values on one line even when a label wraps and another does
+   not -- without it the longest label pushes its figure out of the row. */
+.community-site .hero-contribution .snapshot-quality-grid > div {
+  grid-row: span 3;
+  display: grid;
+  grid-template-rows: subgrid;
+  row-gap: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+}
+.community-site .hero-contribution .snapshot-quality-grid dt {
+  color: rgba(255, 253, 247, .5);
+  font-size: .5rem;
+  letter-spacing: .08em;
+}
+.community-site .hero-contribution .snapshot-quality-grid dd {
+  margin-top: 3px;
+  color: var(--site-paper);
+  font-family: var(--serif);
+  font-size: clamp(1.08rem, 1.5vw, 1.4rem);
+  font-weight: var(--weight-regular);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.02em;
+  line-height: 1.05;
+}
+/* The qualifier travels with the figure: a spend total that does not say it
+   is not a bill, or a count that does not say across how many shared days,
+   is a stronger claim than the evidence supports. */
+.community-site .hero-contribution .snapshot-quality-grid small {
+  display: block;
+  margin-top: 4px;
+  color: rgba(255, 253, 247, .45);
+  font-size: .53rem;
+  line-height: 1.35;
+}
+@media (max-width: 700px) {
+  /* Two up on a phone. Four stacked figures would push the download most of a
+     screen down, and each value still has room for its qualifier. */
+  .community-site .hero-contribution .snapshot-quality-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
 .community-site .community-inline {
   display: grid;
   grid-template-columns: auto auto minmax(0, 1fr);
@@ -3517,6 +3604,19 @@ footer p { margin: 0; }
 .community-site .community-method-body {
   padding: 2px 18px 20px;
 }
+/*
+ * Open is the default state, so the summary reads as the band's own rule and
+ * the activity heading does not repeat it. Collapsed, the heading keeps the
+ * separator it needs when the summary has no bottom edge of its own.
+ */
+.community-site .community-method[open] > summary {
+  padding-bottom: 13px;
+  border-bottom: 1px solid var(--line);
+}
+.community-site .community-method[open] .activity-heading {
+  padding-top: 14px;
+  border-top: 0;
+}
 .community-site .activity-heading {
   display: flex;
   justify-content: space-between;
@@ -3548,15 +3648,90 @@ footer p { margin: 0; }
 .community-site .snapshot-quality-grid {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
-.community-site .community-proof .snapshot-quality-grid dd {
-  font-size: .9rem;
+/*
+ * With the figures hosted in the hero, the band now opens on its chart. The
+ * activity heading already carries the gap above it, so the chart does not
+ * add a second one where the figures used to sit.
+ */
+.community-site .community-proof .community-daily-chart:first-child {
+  margin-top: 0;
 }
-.community-site .community-proof .snapshot-quality-grid small {
-  display: block;
-  margin-top: 5px;
-  color: var(--muted);
-  font-size: .61rem;
-  line-height: 1.35;
+
+/*
+ * Chart credit: the mark and the wordmark on the figure itself, the way a
+ * published chart carries its source. It is meant to be read, so it is set in
+ * the page's own display face at a legible size rather than washed into the
+ * background.
+ *
+ * It is decoration -- it repeats the wordmark already in the header, the
+ * footer and the hero -- so the empty alternative text keeps it out of the
+ * accessible tree, and it takes no pointer target over the chart's own hit
+ * areas beneath it. `--chart-credit-ink` defaults to whatever the chart's own
+ * muted tone is, which is already contrast-checked against that surface.
+ *
+ * Each position below was chosen against a measured empty region of that
+ * chart, not a house rule: these figures have different shapes and their busy
+ * corners are in different places.
+ */
+.community-site .cache-matrix-view::after,
+.community-site .performance-plot::after,
+.community-site #usage-timeline-chart::after,
+.community-site .community-daily-chart::after {
+  content: "TiboTattle" / "";
+  position: absolute;
+  z-index: 2;
+  padding-inline-start: 17px;
+  background: url("./tibotattle-icon.png") no-repeat left center / 13px 13px;
+  color: var(--chart-credit-ink, var(--muted));
+  font-family: var(--serif);
+  font-size: 11px;
+  font-weight: var(--weight-medium);
+  line-height: 15px;
+  white-space: nowrap;
+  pointer-events: none;
+  user-select: none;
+}
+.community-site .cache-matrix-view { --chart-credit-ink: var(--matrix-light, #ecf6ea); }
+/* The medians ride the middle of the plot; only the top axis rule reaches
+   this corner, and a credit may sit on a rule. */
+.community-site .performance-plot::after {
+  inset-block-start: 2px;
+  inset-inline-end: 6px;
+}
+/* The week figure stacks two lanes. The lower lane's top right is the one
+   corner of the pair with no series, no axis label and no reset marker. */
+.community-site #usage-timeline-chart { position: relative; container-type: inline-size; }
+.community-site #usage-timeline-chart::after {
+  inset-block-start: 2px;
+  inset-inline-end: 8px;
+}
+@container (max-width: 399px) {
+  /* This lane keeps a 900:150 ratio, so by here it is barely seventy pixels
+     tall and the activity fill reaches its own top right. Every corner is
+     over data. A credit that covers the series is worse than none, and the
+     page states the wordmark in four other places. */
+  .community-site #usage-timeline-chart::after { content: none; }
+}
+/* Level with the legend, at the end of the row the legend leaves empty. */
+.community-site .community-daily-chart { position: relative; }
+.community-site .community-daily-chart::after {
+  inset-block-start: 12px;
+  inset-inline-end: 14px;
+}
+/* The hero window states the wordmark in its own title bar a few pixels
+   above this chart. A second one inside the same panel is clutter, not
+   attribution. The expanded dialog has no such bar and keeps its credit. */
+.community-site .hero-community-allowance .community-daily-chart::after {
+  content: none;
+}
+@media (forced-colors: active) {
+  /* A forced palette repaints the credit as solid text over the plot, and it
+     only repeats a wordmark the page states elsewhere. */
+  .community-site .performance-plot::after,
+  .community-site #usage-timeline-chart::after,
+  .community-site .community-daily-chart::after {
+    content: none;
+  }
 }
 .community-site .table-wrap {
   margin-top: 16px;
@@ -3644,12 +3819,18 @@ footer p { margin: 0; }
 .community-site .community-chart-dialog-toolbar { flex-wrap: wrap; }
 .allowance-summary-cards {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr));
-  gap: 10px;
+  /* Three abreast wherever there is room for them. The old 190px floor wrapped
+     to 2 + 1 inside the embedded card column, which cost a whole row of height
+     and made the third plan look like an afterthought. */
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
   margin-top: 8px;
 }
+@media (max-width: 460px) {
+  .allowance-summary-cards { grid-template-columns: minmax(0, 1fr); }
+}
 .allowance-summary-card {
-  padding: 12px 14px;
+  padding: 10px 11px;
   border: 1px solid var(--line);
   border-top: 3px solid var(--allowance-color, var(--green));
   border-radius: var(--radius-sm);
@@ -3657,10 +3838,10 @@ footer p { margin: 0; }
   min-width: 0;
 }
 .allowance-summary-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
-.allowance-summary-card h3 { font-size: .875rem; margin: 0; }
+.allowance-summary-card h3 { font-size: .8rem; margin: 0; }
 .allowance-summary-card p { font-size: .72rem; line-height: 1.4; margin: 4px 0 0; }
 .allowance-summary-card .allowance-plan-value { color: var(--ink); }
-.allowance-summary-value { font-family: var(--serif); font-size: 2rem; line-height: 1.15; }
+.allowance-summary-value { font-family: var(--serif); font-size: 1.6rem; line-height: 1.1; }
 .allowance-summary-caption { color: var(--muted); font-size: .72rem; font-weight: var(--weight-semibold); margin: 12px 0 0; }
 .allowance-model-icon { width: 24px; height: 24px; flex: 0 0 auto; fill: none; stroke: var(--allowance-color); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .allowance-model-astra { --allowance-color: #365f69; }
@@ -3691,7 +3872,47 @@ footer p { margin: 0; }
 .community-site .allowance-legend-button:hover,
 .community-site .allowance-legend-button[aria-pressed="true"] { color: var(--ink); background: var(--surface-raised); border-color: var(--line-strong); }
 .community-site .allowance-legend-button:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
-.community-site .allowance-legend-hint { margin: 0 0 10px; font-size: .65rem; color: var(--muted); }
+/* (4) The legend sat in its own block above the plot and cost ~40px of height
+   before a single datapoint was drawn. Overlaying it on the figure reclaims
+   that, and the buttons stay real buttons so focus and keyboard use are
+   unchanged. */
+.community-site .community-allowance-chart { position: relative; }
+.community-site .allowance-series-legend {
+  margin: 0;
+  gap: 2px;
+  position: absolute;
+  inset: 2px 6px auto auto;
+  z-index: 1;
+  background: color-mix(in srgb, var(--site-paper, #fffdf7) 88%, transparent);
+  border-radius: var(--radius-xs);
+  padding: 1px 3px;
+}
+.community-site .allowance-legend-button { min-height: 26px; padding: 2px 6px; font-size: .72rem; }
+
+/* Closed, this is one quiet line — it inherited the journey card treatment and
+   stood 105px tall shut, which is worse than the prose it replaced. */
+.community-site .snapshot-disclosure-details { margin: 6px 0 2px; border: 0; padding: 0; background: none; }
+.community-site .snapshot-disclosure-details > summary {
+  display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
+  padding: 0; margin: 0; list-style: none;
+  font-size: .68rem; color: var(--muted); text-decoration: underline dotted;
+}
+.community-site .snapshot-disclosure-details > summary::-webkit-details-marker { display: none; }
+.community-site .snapshot-disclosure-details > summary:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+.community-site .snapshot-disclosure-details[open] > summary { margin-bottom: 4px; }
+.community-site .snapshot-disclosure-details .snapshot-disclosure { margin: 0 0 4px; font-size: .68rem; }
+
+/* (5) Small multiples: one panel per plan, each with its own value axis. */
+.allowance-small-multiples { display: grid; gap: 10px; margin-top: 10px; }
+.allowance-panel { min-width: 0; }
+.allowance-panel-title {
+  margin: 0 0 2px;
+  font-size: .74rem;
+  font-weight: var(--weight-semibold);
+  color: var(--allowance-color, var(--ink));
+}
+.allowance-panel .community-allowance-chart { margin: 0; }
+.allowance-panel .allowance-series-legend { display: none; }
 .community-site .community-allowance-chart [data-muted="true"] { opacity: .07; }
 
 /*

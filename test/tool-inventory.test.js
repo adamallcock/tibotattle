@@ -303,7 +303,7 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 164 records / 165 executable paths: release-documentation, Codex contract,
+  // 168 records / 169 executable paths: release-documentation, Codex contract,
   // documentation governance, repository-layout, macOS bundle-version, and
   // local index-recovery gates are reviewed repository operations invoked by
   // CI, release runbooks, or supported internal product tooling.
@@ -325,8 +325,10 @@ test("the checked-in inventory classifies every retained tool entry point and np
   // journeys, and qualification of an already signed Windows installer.
   // The final Linux AppImage qualifier binds the unchanged normal runtime
   // journey to final package bytes without rebuilding or publishing them.
-  assert.equal(result.records, 164);
-  assert.equal(result.candidates.length, 165);
+  // The last four are the macOS credential qualification set: the fixture
+  // preparer, the credentials smoke, and the loopback/intake helpers.
+  assert.equal(result.records, 168);
+  assert.equal(result.candidates.length, 169);
   assert.ok(result.aliases >= 25);
 });
 

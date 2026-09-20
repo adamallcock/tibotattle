@@ -144,7 +144,7 @@ function render(block, lang = "en-US") {
 // The lane's own disclosure is the last one appended, so the existing day
 // breakdown stays the first `details` in the container.
 function retentionDisclosure(container) {
-  return container.descendants().filter((element) => element.tag === "details").at(-1);
+  return cacheLanes(container).at(-1);
 }
 
 function retentionRows(container) {
@@ -152,6 +152,18 @@ function retentionRows(container) {
   const body = disclosure?.descendants().find((element) => element.tag === "tbody");
   return body?.children ?? [];
 }
+
+/** The cache-retention lane's own disclosure, identified by its summary rather
+ * than by counting every `<details>` on the page. The count was a proxy for
+ * "the lane rendered nothing", and it broke the moment another section grew a
+ * disclosure of its own — which says nothing about this lane. Matching the
+ * summary asserts the same thing and keeps asserting it. */
+const LANE_SUMMARIES = WEB_MESSAGES["community.cacheRetention.summary"];
+const cacheLanes = (container) => container.descendants().filter((element) =>
+  element.tag === "details"
+  && element.descendants().some((child) => child.tag === "summary"
+    && child.descendants().some((span) => LANE_SUMMARIES.some((summary) =>
+      (span.textContent ?? "").includes(summary)))));
 
 test("the published cache-retention block is a community-wide field beside the series state, never per day", () => {
   const value = normalizeCommunityDailySeries(series(retention()));
@@ -186,9 +198,9 @@ test("an absent block leaves the rest of the daily series untouched and renders 
 
   const { container } = render(undefined);
   assert.equal(
-    container.descendants().filter((element) => element.tag === "details").length,
-    1,
-    "only the existing day breakdown is rendered",
+    cacheLanes(container).length,
+    0,
+    "the cache-retention lane renders nothing at all",
   );
   assert.doesNotMatch(container.text, /Cache retention by pause length/u);
   // An unpublished lane must not become a claim about cache behaviour.
@@ -350,9 +362,13 @@ test("a malformed block is refused whole and never partially trusted", () => {
     assert.equal(value.state, "published", JSON.stringify(block)?.slice(0, 80));
     assert.equal(value.cacheRetention, null, JSON.stringify(block)?.slice(0, 80));
     assert.equal(value.days[0].totals.inputUncachedTokens, 100);
+    // A refused block renders no lane at all. The old assertion counted one
+    // `<details>` on the whole page -- the day breakdown -- which meant the
+    // same thing before another section grew a disclosure of its own.
     assert.equal(
-      render(block).container.descendants().filter((element) => element.tag === "details").length,
-      1,
+      cacheLanes(render(block).container).length,
+      0,
+      "a refused block renders no cache-retention lane",
     );
   }
 });
