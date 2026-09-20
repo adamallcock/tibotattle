@@ -124,34 +124,25 @@
    does. `inline-size` containment is safe here: the view takes its width from
    the stage and its height from the drawn plot. */
 .cache-matrix-view { position: relative; width: 100%; container-type: inline-size; }
-/* Quiet brand mark, set at the plot's origin so the cell stacks rise out of
-   it. It is furniture, not a stamp: it paints behind the plot inside the
-   stage's own stacking context, takes no pointer target, and its empty
-   alternative text keeps it out of the accessible tree. A browser without
-   the alternative-text syntax drops the declaration and simply draws no
-   watermark, which is the safe way to fail. */
-.cache-matrix-view::before {
-  content: "TiboTattle" / "";
-  position: absolute;
-  z-index: -1;
-  inset-block-end: 62px;
-  inset-inline-start: 16px;
-  max-width: calc(100% - 32px);
-  overflow: hidden;
-  color: rgb(236 246 234 / 7%);
-  font-family: var(--serif, Georgia, "Times New Roman", serif);
-  font-size: clamp(21px, 5.4cqi, 44px);
-  line-height: 1;
-  letter-spacing: -.02em;
-  white-space: nowrap;
-  pointer-events: none;
-  user-select: none;
+/* The credit's own treatment is shared with the page's other figures; only
+   its position belongs to this chart. Bottom right: the long-gap columns end
+   the row with the fewest lights, and the axis caption stays centred, so
+   nothing is drawn there at any width the wide layout covers. */
+.cache-matrix-view::after {
+  inset-block-end: 12px;
+  inset-inline-end: 16px;
 }
-/* Below 520px the renderer stacks one row per gap and drops the shared
-   baseline, so the mark moves into the corner above the axis caption. This is
-   the renderer's own threshold; keep the two together. */
+/* Below 520px the renderer stacks one row per gap: the right edge then
+   carries every row's rate and sample count, and the caption can reach the
+   bottom corner on a narrow phone. The only reliably empty band is the lead
+   in above the first row. This is the renderer's own threshold; keep the two
+   together. */
 @container (max-width: 519px) {
-  .cache-matrix-view::before { inset-block-end: 24px; inset-inline-start: 10px; font-size: 20px; }
+  .cache-matrix-view::after {
+    inset-block-start: 3px;
+    inset-block-end: auto;
+    inset-inline-end: 12px;
+  }
 }
 .cache-matrix-plot { display: block; width: 100%; overflow: visible; }
 .cache-matrix-plot text { font-family: inherit; font-size: 11px; fill: var(--matrix-light); }
@@ -233,9 +224,10 @@
   .cache-matrix-selection { transition: none; }
 }
 @media (forced-colors: active) {
-  /* Decoration only: forced palettes would render it as solid text behind the
-     cells, so it is withdrawn rather than fought with. */
-  .cache-matrix-view::before { content: none; }
+  /* The credit duplicates the wordmark in the page header and footer, and a
+     forced palette would repaint it as solid text over the plot, so it is
+     withdrawn rather than fought with. */
+  .cache-matrix-view::after { content: none; }
   .cache-matrix-stage { border: 1px solid CanvasText; }
   .cache-matrix-cell-more { fill: LinkText; }
   .cache-matrix-cell-less { fill: Mark; }

@@ -123,29 +123,6 @@
             calculates your personal dashboard locally on your computer.
           </p>
 
-          <!--
-            The community's contribution totals, in the hero because that is
-            what they are for: evidence of how much has been shared before the
-            reader is asked to download anything. The daily renderer writes its
-            four figures into the host below and replaces them on each refresh;
-            the heading is what stops them reading as the reader's own numbers.
-
-            The host stays empty until a published day exists, and the renderer
-            leaves it untouched on an unavailable or retained answer, so the
-            band is hidden unless the page is holding current evidence. The
-            community link further down reports the state either way.
-          -->
-          <section
-            class="hero-contribution"
-            aria-labelledby="hero-contribution-heading"
-          >
-            <h2
-              id="hero-contribution-heading"
-              data-i18n="community.contribution.heroHeading"
-            >Contributed by the community so far</h2>
-            <div id="community-contribution-summary"></div>
-          </section>
-
           <div
             class="install-cluster"
             id="download"
@@ -436,6 +413,32 @@
             <span>Latest community evidence</span>
             <strong id="community-daily-hero">Checking daily activity</strong>
           </a>
+          <!--
+            The community's contribution totals, below the download rather than
+            above it: they are the evidence behind the offer, not a step on the
+            way to it, and nothing here may push the download off the first
+            screen. The daily renderer writes its four figures into the host
+            and replaces them on each refresh; the heading is what stops them
+            reading as the reader's own numbers.
+
+            It sits after the community link, which is both where the freshness
+            label already lives and outside the slice the published-platform
+            contract reads between the last platform panel and that link.
+
+            The host stays empty until a published day exists, and the renderer
+            leaves it untouched on an unavailable or retained answer, so the
+            band is hidden unless the page is holding current evidence.
+          -->
+          <section
+            class="hero-contribution"
+            aria-labelledby="hero-contribution-heading"
+          >
+            <h2
+              id="hero-contribution-heading"
+              data-i18n="community.contribution.heroHeading"
+            >Contributed by the community so far</h2>
+            <div id="community-contribution-summary"></div>
+          </section>
         </div>
 
         <section class="community-window" id="allowance" tabindex="-1" aria-labelledby="community-allowance-heading">

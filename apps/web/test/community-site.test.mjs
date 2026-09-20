@@ -2619,60 +2619,131 @@ function insideClosedDetails(html, index) {
   return open.some((isOpen) => isOpen === false);
 }
 
-test("the cache chart carries a quiet brand mark behind its origin", async () => {
-  const styles = await readFile(
+test("every figure on the page carries a legible TiboTattle credit", async () => {
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  const matrix = await readFile(
     new URL("../public/cache-reuse-matrix.css", import.meta.url),
     "utf8",
   );
-  const rule = styles.match(/\.cache-matrix-view::before \{([\s\S]*?)\}/u);
-  assert.ok(rule, "the plot view carries a watermark pseudo-element");
-  const declarations = rule[1];
+  const html = await readFile(SITE_HTML, "utf8");
+
+  // One treatment, shared by every figure that carries it.
+  const shared = styles.match(
+    /\.community-site \.cache-matrix-view::after,\n\.community-site \.performance-plot::after,\n\.community-site #usage-timeline-chart::after,\n\.community-site \.community-daily-chart::after \{([\s\S]*?)\n\}/u,
+  );
+  assert.ok(shared, "the page's figures share one credit treatment");
+  const credit = shared[1];
   // The empty alternative text is what keeps generated content out of the
-  // accessible tree; plain `content: "TiboTattle"` would be announced.
-  assert.match(declarations, /content:\s*"TiboTattle"\s*\/\s*"";/u);
-  assert.match(declarations, /pointer-events:\s*none;/u);
-  assert.match(declarations, /user-select:\s*none;/u);
-  // Negative z-index inside the stage's isolated stacking context puts the
-  // mark behind the plot and its cells, above the stage background.
-  assert.match(declarations, /z-index:\s*-1;/u);
-  assert.match(declarations, /position:\s*absolute;/u);
-  // Toward the origin: bottom-left, and logical so it follows writing mode.
-  assert.match(declarations, /inset-block-end:\s*62px;/u);
-  assert.match(declarations, /inset-inline-start:\s*16px;/u);
-  assert.doesNotMatch(declarations, /inset-block-start|inset-inline-end/u);
-  // It must read as the instrument's own furniture, not as a stamp.
-  assert.match(declarations, /color:\s*rgb\(236 246 234 \/ 7%\);/u);
-  assert.match(declarations, /font-family:\s*var\(--serif/u);
-  // The renderer switches to its stacked layout on the plot's own measured
-  // width, so the mark follows the same measurement rather than a viewport
-  // breakpoint that only happens to line up on one page.
+  // accessible tree; plain `content: "TiboTattle"` would be announced, and it
+  // only repeats the wordmark the header and footer already state.
+  assert.match(credit, /content:\s*"TiboTattle"\s*\/\s*"";/u);
+  // It sits on top of the plot, so it must not take the chart's own hits.
+  assert.match(credit, /pointer-events:\s*none;/u);
+  assert.match(credit, /user-select:\s*none;/u);
+  assert.match(credit, /position:\s*absolute;/u);
+  assert.match(credit, /z-index:\s*2;/u);
+  // Icon and wordmark, not a wash: the shipped mark at a real size, in the
+  // page's display face, with no transparency dialled into it.
+  assert.match(credit, /background:\s*url\("\.\/tibotattle-icon\.png"\)[^;]*13px 13px;/u);
+  assert.match(credit, /font-family:\s*var\(--serif\);/u);
+  assert.match(credit, /font-size:\s*11px;/u);
+  assert.doesNotMatch(credit, /opacity|filter|rgb\([^)]*\/\s*\d?\d%\)/u);
+  assert.ok(
+    html.includes('src="./tibotattle-icon.png"'),
+    "the mark the credit draws is already shipped with the page",
+  );
+
+  // Each figure is positioned against its own empty region. Identical offsets
+  // across four differently shaped charts would mean none of them was placed.
+  const position = (selector, expected = 1) => {
+    const sheet = selector.startsWith(".cache-matrix") ? matrix : styles;
+    // The shared treatment ends with one of these selectors too, so take the
+    // block that actually places the credit rather than the first match.
+    // `#` is not an escapable character in a unicode-mode pattern.
+    const pattern = new RegExp(
+      `${selector.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}::after \\{([\\s\\S]*?)\\n\\}`,
+      "gu",
+    );
+    const bodies = [...sheet.matchAll(pattern)]
+      .map((match) => match[1].replace(/\s+/gu, " ").trim())
+      .filter((body) => /inset-/u.test(body) && !body.includes("content:"));
+    assert.equal(
+      bodies.length,
+      expected,
+      `${selector} states where its credit sits, once per layout it has`,
+    );
+    return bodies[0];
+  };
+  const positions = [
+    // Two: the wide plot and the stacked one, switched by container width.
+    position(".cache-matrix-view", 2),
+    position(".community-site .performance-plot"),
+    position(".community-site #usage-timeline-chart"),
+    position(".community-site .community-daily-chart"),
+  ];
+  for (const rule of positions) {
+    assert.match(rule, /inset-(block|inline)-(start|end):/u);
+  }
+  assert.ok(
+    new Set(positions).size > 1,
+    "the four figures do not all take the same corner",
+  );
+  // The two charts that are not positioned containers of their own have to
+  // become one, or the credit escapes to the nearest ancestor that is.
+  assert.match(styles, /\.community-site \.community-daily-chart \{ position: relative; \}/u);
+  assert.match(
+    styles,
+    /\.community-site #usage-timeline-chart \{ position: relative; container-type: inline-size; \}/u,
+  );
+  // That lane holds a 900:150 ratio, so on a phone it is barely seventy
+  // pixels tall and its series reaches every corner. The credit withdraws on
+  // the lane's own width rather than covering the data it is crediting.
+  assert.match(
+    styles,
+    /@container \(max-width: 399px\) \{[\s\S]*?\.community-site #usage-timeline-chart::after \{ content: none; \}/u,
+  );
+
+  // The cache plot switches layout on its own measured width, so its credit
+  // follows the same measurement rather than a viewport breakpoint that only
+  // happens to line up on one page.
   const renderer = await readFile(
     new URL("../public/cache-reuse-matrix.js", import.meta.url),
     "utf8",
   );
   const narrowAt = renderer.match(/const narrow = w < (\d+);/u);
   assert.ok(narrowAt, "the renderer states the width at which it stacks rows");
-  assert.match(styles, /\.cache-matrix-view \{[^}]*container-type: inline-size;/u);
-  assert.match(declarations, /font-size:\s*clamp\(21px, 5\.4cqi, 44px\);/u);
+  assert.match(matrix, /\.cache-matrix-view \{[^}]*container-type: inline-size;/u);
   assert.match(
-    styles,
+    matrix,
     new RegExp(
-      `@container \\(max-width: ${Number(narrowAt[1]) - 1}px\\) \\{\\s*\\.cache-matrix-view::before \\{[^}]*inset-block-end: 24px;`,
+      `@container \\(max-width: ${Number(narrowAt[1]) - 1}px\\) \\{\\s*\\.cache-matrix-view::after \\{[^}]*inset-block-start: 3px;`,
       "u",
     ),
-    "the stacked layout moves the mark into the corner at the renderer's own threshold",
+    "the stacked layout moves the credit at the renderer's own threshold",
   );
-  const viewportBlock = styles.match(/@media \(max-width: 540px\) \{([\s\S]*?)\n\}/u);
+  const viewportBlock = matrix.match(/@media \(max-width: 540px\) \{([\s\S]*?)\n\}/u);
   assert.ok(viewportBlock, "the instrument keeps its narrow viewport rules");
   assert.doesNotMatch(
     viewportBlock[1],
-    /cache-matrix-view::before/u,
-    "the mark does not also answer to a viewport breakpoint",
+    /cache-matrix-view::after/u,
+    "the credit does not also answer to a viewport breakpoint",
   );
-  // Forced palettes would paint it solid, so it withdraws instead.
+
+  // The hero window states the wordmark in its own title bar, so the chart
+  // inside it does not state it twice.
   assert.match(
     styles,
-    /@media \(forced-colors: active\) \{[\s\S]*?\.cache-matrix-view::before \{ content: none; \}/u,
+    /\.community-site \.hero-community-allowance \.community-daily-chart::after \{\s*content: none;/u,
+  );
+  assert.match(html, /class="community-window-brand">\s*<img src="\.\/tibotattle-icon\.png"/u);
+  // Forced palettes repaint it as solid text over the plot, so it withdraws.
+  assert.match(
+    matrix,
+    /@media \(forced-colors: active\) \{[\s\S]*?\.cache-matrix-view::after \{ content: none; \}/u,
+  );
+  assert.match(
+    styles,
+    /@media \(forced-colors: active\) \{[\s\S]*?\.community-site \.community-daily-chart::after \{\s*content: none;/u,
   );
 });
 
@@ -2803,28 +2874,39 @@ test("the two closing tour cards are one component pair", async () => {
   assert.doesNotMatch(styles, /\.tour-local \{[^}]*float:/u);
 });
 
-test("the community's contribution figures lead the hero, above the download", async () => {
+test("the community's contribution figures sit in the hero, below the download", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
   const source = await readFile(SITE_SOURCE, "utf8");
   const view = await readFile(new URL("../public/community-view.js", import.meta.url), "utf8");
 
-  // The host is in the hero's copy column, after the lede and before the
-  // download: that ordering is the whole point, so it is asserted, not the
-  // mere presence of the id.
+  // The host is in the hero's copy column, below the whole download cluster:
+  // that ordering is the whole point, so it is asserted, not the mere
+  // presence of the id. Nothing the figures do may push the download down.
   const heroStart = html.indexOf('class="product-hero"');
   const ledeIndex = html.indexOf('class="hero-lede"');
   const hostIndex = html.indexOf('id="community-contribution-summary"');
   const downloadIndex = html.indexOf('id="download"');
+  const lastPanelIndex = html.indexOf('id="platform-panel-linux"');
+  const heroColumnEnd = html.indexOf('class="community-window"');
   const bandIndex = html.indexOf('id="community-daily-result"');
   assert.ok(hostIndex >= 0, "the hero carries the contribution host");
   assert.ok(heroStart >= 0 && ledeIndex > heroStart);
-  assert.ok(hostIndex > ledeIndex, "the figures follow the hero lede");
-  assert.ok(hostIndex < downloadIndex, "the figures come before the download");
-  assert.ok(downloadIndex < bandIndex, "the activity band still follows the hero");
-  // Placing the host before the platform panels keeps it outside the slice
-  // the published-platform contract reads between them and the community link.
-  assert.ok(hostIndex < html.indexOf('id="platform-panel-macos"'));
+  assert.ok(downloadIndex > ledeIndex, "the download still follows the hero lede");
+  assert.ok(lastPanelIndex > downloadIndex, "the platform panels are the download cluster");
+  assert.ok(hostIndex > lastPanelIndex, "the figures come after the whole download cluster");
+  assert.ok(hostIndex < heroColumnEnd, "the figures stay in the hero's copy column");
+  assert.ok(heroColumnEnd < bandIndex, "the activity band still follows the hero");
+  // The published-platform contract slices between the last platform panel
+  // and the community link and asserts what each panel does and does not
+  // contain. Keeping the host after that link is what keeps it out of the
+  // Linux panel's slice; before it, this markup would be read as part of it.
+  const communityLinkIndex = html.indexOf('class="community-inline"');
+  assert.ok(communityLinkIndex > lastPanelIndex);
+  assert.ok(
+    hostIndex > communityLinkIndex,
+    "the figures stay outside the slice the platform contract reads",
+  );
   assert.equal(
     insideClosedDetails(html, hostIndex),
     false,

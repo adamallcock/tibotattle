@@ -2992,12 +2992,8 @@ footer p { margin: 0; }
   gap: clamp(42px, 4.5vw, 68px);
   align-items: start;
   min-height: min(790px, calc(100vh - 74px));
-  /* The top inset was tuned when the headline was the first thing in this
-     column. It now carries the contribution figures and the download above
-     the fold as well, and 104px of air below a 64px sticky header was the
-     cheapest space on the page to spend on that. */
   padding:
-    clamp(60px, 5.6vw, 84px)
+    clamp(62px, 8vw, 104px)
     max(24px, calc((100vw - 1180px) / 2))
     clamp(66px, 8vw, 102px);
   overflow: hidden;
@@ -3362,27 +3358,28 @@ footer p { margin: 0; }
   font-size: .7rem;
 }
 /*
- * The community's contribution totals, in the hero above the download. The
+ * The community's contribution totals, in the hero below the download. The
  * daily renderer writes the same `dl` it writes into the activity band, so
- * this styles that markup for a dark, narrow, above-the-fold context rather
- * than expecting different DOM.
+ * this styles that markup for a dark, narrow context rather than expecting
+ * different DOM.
+ *
+ * It follows the community link and shares its rule: the link states the
+ * freshness of exactly these figures, so a second separator between them
+ * would split one claim into two.
  *
  * Hidden unless the page is holding current evidence. The renderer leaves the
  * host untouched on an unavailable answer, and it does not label retained
  * figures here the way the band does, so an unqualified claim in the hero
  * would outlive the evidence behind it. `data-live` is the same signal the
- * community link below uses. A browser without `:has()` keeps the band
- * hidden, which fails in the safe direction.
+ * community link uses. A browser without `:has()` keeps the band hidden,
+ * which fails in the safe direction.
  */
 .community-site .hero-contribution { display: none; }
 .community-site:has(.community-inline[data-live="true"]) .hero-contribution {
   display: block;
   max-width: 620px;
-  margin-top: 20px;
-  padding-top: 12px;
-  border-top: 1px solid rgba(255, 253, 247, .16);
+  margin-top: 18px;
 }
-.community-site .hero-contribution + .install-cluster { margin-top: 24px; }
 .community-site .hero-contribution h2 {
   margin: 0;
   color: rgba(255, 253, 247, .58);
@@ -3765,6 +3762,83 @@ footer p { margin: 0; }
  */
 .community-site .community-proof .community-daily-chart:first-child {
   margin-top: 0;
+}
+
+/*
+ * Chart credit: the mark and the wordmark on the figure itself, the way a
+ * published chart carries its source. It is meant to be read, so it is set in
+ * the page's own display face at a legible size rather than washed into the
+ * background.
+ *
+ * It is decoration -- it repeats the wordmark already in the header, the
+ * footer and the hero -- so the empty alternative text keeps it out of the
+ * accessible tree, and it takes no pointer target over the chart's own hit
+ * areas beneath it. `--chart-credit-ink` defaults to whatever the chart's own
+ * muted tone is, which is already contrast-checked against that surface.
+ *
+ * Each position below was chosen against a measured empty region of that
+ * chart, not a house rule: these figures have different shapes and their busy
+ * corners are in different places.
+ */
+.community-site .cache-matrix-view::after,
+.community-site .performance-plot::after,
+.community-site #usage-timeline-chart::after,
+.community-site .community-daily-chart::after {
+  content: "TiboTattle" / "";
+  position: absolute;
+  z-index: 2;
+  padding-inline-start: 17px;
+  background: url("./tibotattle-icon.png") no-repeat left center / 13px 13px;
+  color: var(--chart-credit-ink, var(--muted));
+  font-family: var(--serif);
+  font-size: 11px;
+  font-weight: var(--weight-medium);
+  line-height: 15px;
+  white-space: nowrap;
+  pointer-events: none;
+  user-select: none;
+}
+.community-site .cache-matrix-view { --chart-credit-ink: var(--matrix-light, #ecf6ea); }
+/* The medians ride the middle of the plot; only the top axis rule reaches
+   this corner, and a credit may sit on a rule. */
+.community-site .performance-plot::after {
+  inset-block-start: 2px;
+  inset-inline-end: 6px;
+}
+/* The week figure stacks two lanes. The lower lane's top right is the one
+   corner of the pair with no series, no axis label and no reset marker. */
+.community-site #usage-timeline-chart { position: relative; container-type: inline-size; }
+.community-site #usage-timeline-chart::after {
+  inset-block-start: 2px;
+  inset-inline-end: 8px;
+}
+@container (max-width: 399px) {
+  /* This lane keeps a 900:150 ratio, so by here it is barely seventy pixels
+     tall and the activity fill reaches its own top right. Every corner is
+     over data. A credit that covers the series is worse than none, and the
+     page states the wordmark in four other places. */
+  .community-site #usage-timeline-chart::after { content: none; }
+}
+/* Level with the legend, at the end of the row the legend leaves empty. */
+.community-site .community-daily-chart { position: relative; }
+.community-site .community-daily-chart::after {
+  inset-block-start: 12px;
+  inset-inline-end: 14px;
+}
+/* The hero window states the wordmark in its own title bar a few pixels
+   above this chart. A second one inside the same panel is clutter, not
+   attribution. The expanded dialog has no such bar and keeps its credit. */
+.community-site .hero-community-allowance .community-daily-chart::after {
+  content: none;
+}
+@media (forced-colors: active) {
+  /* A forced palette repaints the credit as solid text over the plot, and it
+     only repeats a wordmark the page states elsewhere. */
+  .community-site .performance-plot::after,
+  .community-site #usage-timeline-chart::after,
+  .community-site .community-daily-chart::after {
+    content: none;
+  }
 }
 .community-site .table-wrap {
   margin-top: 16px;
