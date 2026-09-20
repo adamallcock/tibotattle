@@ -134,10 +134,9 @@ describe('the cache-retention method contract',()=>{
   // a separate constant named the key -- and this is what makes that
   // impossible here.
   expect(await sha256Hex(canonicalJson(CACHE_RETENTION_METHOD)))
-   .toBe('6d9e5786476624564231381dc903482eba3df789a37163df44ae09d4b8cdf5a1');
-  expect(CACHE_RETENTION_METHOD.version).toBe('cache-retention-v3');
+   .toBe('52e81da46d7b09607d1382ddd9f375f4a8e08689d6d6ff06f1d3dfb92938748e');
+  expect(CACHE_RETENTION_METHOD.version).toBe('cache-retention-v2');
   expect(CACHE_RETENTION_METHOD.merge).toBe('pooled');
-  expect(CACHE_RETENTION_METHOD.agentScope).toBe('root');
   expect(CACHE_RETENTION_METHOD.lookbackDays).toBe(7);
   expect(CACHE_RETENTION_METHOD.minimumGapMs).toBe(0);
  });
@@ -317,27 +316,6 @@ describe('the cache-retention reduction',()=>{
   expect(cacheRetentionEventFromRecord({sessionDigest:SESSION_A,observedAtMs:DAY_MS,orderKey:'occ-2',
    recordJson:JSON.stringify({...record,components:{...record.components,inputUncachedTokens:0,
     inputCacheReadTokens:0,inputCacheWriteTokens:0}})})).toBeNull();
-  // Outside the population for the same reason, and the one that matters to
-  // the published number: a subagent or scheduled-task request is
-  // machine-driven, so nobody was waiting on it. It is dropped rather than
-  // made a break, which is what keeps the root requests either side of a
-  // subagent burst genuinely adjacent.
-  for(const scope of ['subagent','automation']){
-   expect(cacheRetentionEventFromRecord({sessionDigest:SESSION_A,observedAtMs:DAY_MS,orderKey:'occ-3',
-    recordJson:JSON.stringify({...record,agentScope:scope})})).toBeNull();
-  }
-  // `unknown` is not proof of root. Admitting it would be inferring the
-  // attribution the contract declined to make.
-  expect(cacheRetentionEventFromRecord({sessionDigest:SESSION_A,observedAtMs:DAY_MS,orderKey:'occ-4',
-   recordJson:JSON.stringify({...record,agentScope:'unknown'})})).toBeNull();
-  // A MALFORMED scope is different from a known non-root one: the contract
-  // requires the field, so its absence is a storage-integrity failure and
-  // breaks the chain rather than silently dropping a request that did happen.
-  for(const scope of [undefined,null,'a scope with spaces','']){
-   expect(cacheRetentionEventFromRecord({sessionDigest:SESSION_A,observedAtMs:DAY_MS,orderKey:'occ-5',
-    recordJson:JSON.stringify({...record,agentScope:scope})}))
-    .toEqual({sessionDigest:SESSION_A,observedAtMs:DAY_MS,orderKey:'occ-5',unreadable:true});
-  }
   // Unreadable configuration is a break, never a guess.
   for(const broken of ['not json',JSON.stringify({schemaVersion:'usage-event-v1.0'}),
    JSON.stringify({...record,modelId:'a model with spaces'}),

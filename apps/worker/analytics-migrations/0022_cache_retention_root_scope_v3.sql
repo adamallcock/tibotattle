@@ -1,43 +1,31 @@
--- 0022: restrict the cache-retention population to the root agent.
-
--- The lane counted every uploaded usage event. Measured over fourteen days of
--- the live corpus, 48% of those are `agent_scope = 'subagent'`, 0.3% are
--- `automation` and 9% are `unknown`. A subagent or scheduled-task request is
--- machine-driven — nobody is waiting on it — so it cannot answer the question
--- the curve is published to answer: how long a person may pause before their
--- cached prefix is gone.
+-- 0022: widen the method vocabulary, and retire v1 from it.
 --
--- Those events are DROPPED from a session's sequence rather than made a break.
--- A subagent call is a different conversation with its own prefix, so the root
--- requests either side of it are genuinely adjacent, and dropping it is what
--- makes that true. `unknown` is dropped as well: it is not proof of root, and
--- admitting it on the assumption that it probably was is exactly the inference
--- this repository refuses elsewhere.
+-- APPLIED IN PRODUCTION 2026-09-20. Its motivating behaviour was REVERTED the
+-- same day and this header is rewritten to say what the migration actually
+-- leaves behind, rather than what it was written for.
 --
--- WHAT THIS DOES NOT FIX, stated so no reader mistakes it for accuracy. It
--- does not separate turns. A root agent's own tool loop is root, and over
--- three days 13,584 of 14,041 root adjacencies were under one minute, so the
--- short bands remain dominated by within-turn requests. It does not move the
--- endpoint either: the only instant uploaded is the token-count record, which
--- Codex writes when a response finishes, so every gap is end-to-end and
--- overstates the true pause by the duration of the later request. Both limits
--- are proportional to response time, which is why the curve is only reliable
--- from about ten minutes upward.
+-- What it was for: a `cache-retention-v3` that measured the curve over the
+-- root agent's requests only, dropping `subagent`, `automation` and `unknown`.
+-- Why that was reverted: the curve measures the PROVIDER's cache, and a gap in
+-- a subagent conversation tests that cache exactly as a human gap does, so the
+-- filter discarded valid evidence. It also did not fix what it was meant to --
+-- 13,584 of 14,041 root adjacencies over three days were under a minute, so
+-- the short bands stay dominated by a root agent's own tool loop -- and
+-- `agentScope` is only classified from 2026-05 onward, so it silently emptied
+-- every earlier day. Whether subagent conversations cache differently is a
+-- real question, and deleting the rows would have made it unanswerable.
 --
--- The cost is measured, not assumed: root is 78-87% of adjacencies in every
--- band, so this removes roughly a sixth of the observations rather than the
--- half its corpus share suggests.
+-- What it leaves: the four tables recreated with the closed vocabulary
+-- ('cache-retention-v2','cache-retention-v3'). v1 is gone because no
+-- deployable worker could write it. v3 is admitted and UNUSED -- nothing
+-- writes it, and a later change must not reuse that name for different
+-- semantics. The live method is v2, unchanged from 0021.
 --
--- SQLite cannot widen a CHECK constraint in place, so the four tables are
--- recreated. Nothing is copied: every existing row carries
--- `method_version = 'cache-retention-v2'` and was measured over a population
--- that includes traffic v3 excludes, so no row could be served under v3. The
--- lane's retirement sweep already condemns rows under a non-current method;
--- this does it in one step. The content is derived and recomputable in full.
+-- The rows this dropped were derived and are recomputable in full; the lane
+-- refills them from source. That cost is already paid.
 --
--- v1 leaves the vocabulary because no deployable worker can write it: v2 is
--- live. v2 stays so a reader mid-deploy is never refused by the schema while
--- the worker rolls forward.
+-- SQLite cannot widen a CHECK constraint in place, so the tables are
+-- recreated rather than altered.
 DROP TABLE IF EXISTS analytics_cache_retention_day_bands;
 DROP TABLE IF EXISTS analytics_cache_retention_day_values;
 DROP TABLE IF EXISTS analytics_cache_retention_day_carry;

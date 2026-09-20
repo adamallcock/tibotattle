@@ -94,25 +94,11 @@ export const CACHE_RETENTION_BAND_IDS: readonly CacheRetentionBandId[] =
  * widened to admit it.
  */
 export const CACHE_RETENTION_METHOD = Object.freeze({
-  version: "cache-retention-v3",
+  version: "cache-retention-v2",
   metric: CACHE_RETENTION_METRIC_ID,
   /** Positive-input requests only: quota-only and bookkeeping rows must not
    * consume an adjacency boundary. */
   population: "input_uncached+input_cache_read+input_cache_write>0",
-  /** The root agent's own requests only.
-   *
-   * A subagent or scheduled-task request is machine-driven: nobody is waiting
-   * on it, so it cannot answer how long a person may pause before losing their
-   * cache. It is DROPPED from the session's sequence rather than made a break,
-   * because it belongs to a different conversation with its own prefix — so
-   * the root requests either side of it are genuinely adjacent.
-   *
-   * `unknown` is not proof of root and is dropped too. This is a real change
-   * of population, not a tidy-up: measured over fourteen days, 48% of uploaded
-   * usage events are `subagent`, 9% are `unknown` and 0.3% are `automation`.
-   * It does NOT separate turns — a root agent's own tool loop is root — and
-   * the short bands stay dominated by within-turn adjacency. */
-  agentScope: "root",
   /** Fields that must be unchanged across the pair for it to be an adjacency
    * at all. Speed mode and surface are filters, not stored dimensions. */
   sameConfiguration: Object.freeze(["modelId", "reasoningEffort", "speedMode", "surface"]),
