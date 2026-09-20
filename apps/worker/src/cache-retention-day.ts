@@ -25,7 +25,11 @@ import {
   type PublicCacheRetentionWindow,
 } from "./cache-retention-values";
 import { parseStoredRecordJson } from "./stored-record";
+import { assertV1SourcePinCurrent, loadV1SourcePin,
+  type V1SourcePin } from "./telemetry-v1-source-selection";
 import { loadV11SourcePin } from "./telemetry-v11-domain";
+import { loadTypedV1AnalysisScope, readTypedV1UsageAnalysisPage,
+  type TypedV1AnalysisScope } from "./typed-v1-analysis-reader";
 import { readTypedV11UsageAnalysisPage, TYPED_V11_ANALYSIS_PAGE_SIZE } from "./typed-v11-analysis-reader";
 import { assertTypedV11GenerationSnapshotLive, loadTypedV11GenerationSnapshot,
   type V11GenerationSnapshot } from "./typed-v11-quota-reader";
@@ -69,6 +73,56 @@ export const CACHE_RETENTION_MAX_WRITES = 64;
  * leading hex characters of the owner digest give 256 uniform buckets. */
 export const CACHE_RETENTION_MAX_SHARDS = 256;
 
+/**
+ * The delivered layouts a prepared day may be built from.
+ *
+ * The measurement is identical for both — same population filter, same
+ * same-configuration fields, same bands, same order — so widening this list
+ * does NOT change `CACHE_RETENTION_METHOD` and must not bump its version. What
+ * differs is only where the day's events and the day's identity are read from,
+ * and `source_layout` is in the mark identity so the two never collide.
+ */
+export const CACHE_RETENTION_SOURCE_LAYOUTS = ["typed-v11", "typed-v1"] as const;
+export type CacheRetentionSourceLayout = (typeof CACHE_RETENTION_SOURCE_LAYOUTS)[number];
+
+/**
+ * The two key fields v1 has no delivered value for.
+ *
+ * A v1 day is delivered as a VECTOR of chunks rather than one manifest, and
+ * its device is ELECTED from the source chunk headers at read time
+ * (`selectV1WinningDevices`) rather than pinned by the delivery. Both are a
+ * function of the day's chunk vector, which `manifestDigest` already covers,
+ * so recording them as layout constants keeps exactly one candidate per
+ * (owner, day). Carrying the per-device digest instead would make one day
+ * several candidates and the pooled community merge would count it twice.
+ */
+export const CACHE_RETENTION_V1_DEVICE_ID = "v1-elected-at-read";
+export const CACHE_RETENTION_V1_MANIFEST_ID = "v1-chunk-vector";
+
+/**
+ * The v1 day identity, as one SQL expression.
+ *
+ * v1 delivers no day manifest, so there is no digest to read; this derives the
+ * equivalent. `analytics_v1_chunk_values.owner_revision` is the owner's journal
+ * revision of the change that wrote the row, revisions are per-owner
+ * monotonic, and `analytics_v1_chunk_forward` requires a strictly increasing
+ * one on every update, so ANY write to ANY chunk of a day carries a revision
+ * greater than every row that owner already holds. `MAX(owner_revision)` over
+ * one (owner, day) therefore changes exactly when that day's chunk set changes
+ * — a restatement, a new chunk, or a first delivery — and never when another
+ * day's does. That is precisely the property v1.1 gets from `manifest_digest`.
+ * `COUNT(*)` travels with it as an independent witness.
+ *
+ * It is an exact fixed-width encoding of two integers, not a hash: there is
+ * nothing to collide. `printf` emits lowercase hex, which is the shape the
+ * mark column's CHECK admits, and both halves are wide enough that no real
+ * revision or row count can overflow its field.
+ */
+const V1_DAY_REVISION = "printf('%032x%032x',COUNT(*),MAX(owner_revision))";
+/** The same expression where the aggregated table needs an alias. */
+const v1DayRevision = (alias: string): string =>
+  `printf('%032x%032x',COUNT(*),MAX(${alias}.owner_revision))`;
+
 const HASH = /^[a-f0-9]{64}$/u;
 const fail = (): Error => new Error("CACHE_RETENTION_UNAVAILABLE");
 function bounded(value: number, min: number, max: number): void {
@@ -85,7 +139,7 @@ function bounded(value: number, min: number, max: number): void {
  */
 export interface CacheRetentionDayKey {
   sourceId: string;
-  sourceLayout: "typed-v11";
+  sourceLayout: CacheRetentionSourceLayout;
   sourceNamespace: string;
   ownerDigest: string;
   deviceId: string;
@@ -101,11 +155,16 @@ function checkKey(key: CacheRetentionDayKey): void {
     || Object.keys(key).sort().join(",") !== [...KEY_FIELDS].sort().join(",")
     || typeof key.sourceId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/u.test(key.sourceId)
     || !HASH.test(key.ownerDigest) || !HASH.test(key.manifestDigest)
-    || key.sourceLayout !== "typed-v11"
+    || !CACHE_RETENTION_SOURCE_LAYOUTS.includes(key.sourceLayout)
     || typeof key.sourceNamespace !== "string" || key.sourceNamespace.length < 1
     || key.sourceNamespace.length > 256
     || typeof key.deviceId !== "string" || key.deviceId.length < 1 || key.deviceId.length > 256
     || typeof key.manifestId !== "string" || key.manifestId.length < 1 || key.manifestId.length > 256
+    // v1 pins neither a device nor a manifest, so the layout constants are the
+    // only admissible values. A per-device key would make one day several
+    // candidates and the pooled merge would count it twice.
+    || (key.sourceLayout === "typed-v1" && (key.deviceId !== CACHE_RETENTION_V1_DEVICE_ID
+      || key.manifestId !== CACHE_RETENTION_V1_MANIFEST_ID))
     || !validCacheRetentionDayLabel(key.day)) throw fail();
 }
 
@@ -194,13 +253,23 @@ export async function readCacheRetentionCarryDays(target: D1Database,
   key: CacheRetentionDayKey): Promise<readonly CacheRetentionCarryDay[]> {
   checkKey(key);
   const days = cacheRetentionLookbackDays(key.day);
-  const rows = (await target.prepare(`SELECT day,MAX(manifest_digest) AS manifest_digest
-    FROM analytics_v11_reusable_values
-    WHERE source_id=?1 AND owner_digest=?2 AND device_id=?3 AND day>=?4 AND day<?5
-      AND source_layout='typed-v11' AND source_namespace=?6
-    GROUP BY day`)
-    .bind(key.sourceId, key.ownerDigest, key.deviceId, days[0]!, key.day, key.sourceNamespace)
-    .all<{ day: string; manifest_digest: string }>()).results;
+  // Still one statement per layout. The v1 arm derives the same per-day
+  // identity the selection derives, from the same rows, so a lookback day's
+  // recorded dependency and its selected identity can never disagree.
+  const rows = (key.sourceLayout === "typed-v11"
+    ? await target.prepare(`SELECT day,MAX(manifest_digest) AS manifest_digest
+      FROM analytics_v11_reusable_values
+      WHERE source_id=?1 AND owner_digest=?2 AND device_id=?3 AND day>=?4 AND day<?5
+        AND source_layout='typed-v11' AND source_namespace=?6
+      GROUP BY day`)
+      .bind(key.sourceId, key.ownerDigest, key.deviceId, days[0]!, key.day, key.sourceNamespace)
+      .all<{ day: string; manifest_digest: string }>()
+    : await target.prepare(`SELECT observed_day AS day,${V1_DAY_REVISION} AS manifest_digest
+      FROM analytics_v1_chunk_values
+      WHERE source_id=?1 AND owner_digest=?2 AND observed_day>=?3 AND observed_day<?4
+      GROUP BY observed_day`)
+      .bind(key.sourceId, key.ownerDigest, days[0]!, key.day)
+      .all<{ day: string; manifest_digest: string }>()).results;
   const delivered = new Map(rows.map((row) => [row.day, row.manifest_digest]));
   const carry = days.map((day) => ({ day, manifestDigest: delivered.get(day) ?? "" }));
   checkCarry(key, carry);
@@ -496,11 +565,18 @@ export async function retireCacheRetentionDayPage(target: D1Database, sourceId: 
       WHERE m.source_id=?1 AND (m.method_version!=?2
         OR EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
           WHERE f.source_id=m.source_id AND f.owner_digest=m.owner_digest)
-        OR NOT EXISTS(SELECT 1 FROM analytics_v11_reusable_values v
+        OR (m.source_layout='typed-v11' AND NOT EXISTS(
+          SELECT 1 FROM analytics_v11_reusable_values v
           WHERE v.source_id=m.source_id AND v.source_layout=m.source_layout
             AND v.source_namespace=m.source_namespace AND v.owner_digest=m.owner_digest
             AND v.device_id=m.device_id AND v.manifest_id=m.manifest_id
             AND v.manifest_digest=m.manifest_digest AND v.day=m.day))
+        OR (m.source_layout='typed-v1' AND NOT EXISTS(
+          SELECT 1 FROM analytics_v1_chunk_values c
+          WHERE c.source_id=m.source_id AND c.owner_digest=m.owner_digest
+            AND c.observed_day=m.day
+          GROUP BY c.owner_digest,c.observed_day
+          HAVING ${v1DayRevision("c")}=m.manifest_digest)))
       ORDER BY m.owner_digest,m.day,m.mark_key LIMIT ?3) RETURNING mark_key`)
     .bind(sourceId, version, limit).all()).results.length;
   const values = (await target.prepare(`DELETE FROM analytics_cache_retention_day_values
@@ -567,6 +643,22 @@ const TOKENS = (value: unknown): number | null => {
     ? value as number : null;
 };
 
+/**
+ * The stored usage-event schemas this mapper reads.
+ *
+ * Both are admitted because the fields this measurement uses are the SAME
+ * fields, under the same names, with the same closed per-field validators: v1's
+ * `parseUsageEvent` and v1.1's `parseTelemetryV11UsageEvent` both require
+ * `sessionUuid`, `modelId`, `reasoningEffort`, `speedMode` and `surface` as
+ * bounded tokens and all three input components as nullable token counts. The
+ * only usage-stream field v1.1 adds is `accountPlanAttribution`, which this
+ * measurement never reads. Admitting v1.0 therefore widens the INPUT and not
+ * the method, and nothing below is relaxed: an unknown schema version is still
+ * unreadable, and so is any admitted record whose fields do not validate.
+ */
+export const CACHE_RETENTION_RECORD_SCHEMAS: ReadonlySet<string> =
+  new Set(["usage-event-v1.1", "usage-event-v1.0"]);
+
 /** Map one stored usage record to the lens's own event, or report that it
  * cannot be read. Only allowlisted fields are consulted and none is coerced: an
  * absent token component stays `null`, and an absent or malformed configuration
@@ -576,7 +668,8 @@ export function cacheRetentionEventFromRecord(input: { sessionDigest: string; ob
   const record = parseStoredRecordJson(input.recordJson) as Record<string, unknown> | null;
   const unreadable: CacheRetentionItem = { sessionDigest: input.sessionDigest,
     observedAtMs: input.observedAtMs, orderKey: input.orderKey, unreadable: true };
-  if (!record || record.schemaVersion !== "usage-event-v1.1") return unreadable;
+  if (!record || typeof record.schemaVersion !== "string"
+    || !CACHE_RETENTION_RECORD_SCHEMAS.has(record.schemaVersion)) return unreadable;
   const components = record.components;
   if (!components || typeof components !== "object" || Array.isArray(components)) return unreadable;
   const { modelId, reasoningEffort, speedMode, surface } = record;
@@ -674,6 +767,97 @@ export function createCacheRetentionDayReader(options: {
   };
 }
 
+/**
+ * The production v1 day reader: one UTC day of v1.0 usage rows, paged through
+ * `readTypedV1UsageAnalysisPage` with the same `cacheRetentionSessionDigest`
+ * hook, so no raw `sessionUuid` crosses this boundary either.
+ *
+ * Three things differ from the v1.1 reader, all of them properties of the
+ * layout rather than of the measurement:
+ *
+ * - The day is expressed as an instant range plus the day's ELECTED winning
+ *   device, because v1 has no manifest to page within. The winner comes from
+ *   the pinned chunk-header vector, so a day with no winner delivered nothing
+ *   and reads as empty rather than as an error.
+ * - The source keyset is `(observed_at_ms, source_row_id)`, which agrees with
+ *   the method on the instant and differs only in the tiebreak, so the reader
+ *   applies the method's own tiebreak — the occurrence id — to the day it
+ *   collected. The v1.1 reader gets that ordering from its proof index. Equal
+ *   instants stay `unorderedTies`; nothing here claims an order it lacks.
+ * - The liveness fence is the source pin rather than a generation snapshot. A
+ *   pin that moved under the read makes the day a skip, never a short day.
+ */
+export function createCacheRetentionV1DayReader(options: {
+  source: D1Database; sourceNamespace: string; scope: TypedV1AnalysisScope; pin: V1SourcePin;
+  ownerDigest: string; maxPages?: number;
+}): CacheRetentionDayReader {
+  const maxPages = options.maxPages ?? CACHE_RETENTION_DAY_PAGES;
+  bounded(maxPages, 1, 1_024);
+  // The pin and the analysis scope must name the same participant, or the
+  // winner vector would be fencing a different owner's uploads.
+  if (!HASH.test(options.ownerDigest) || options.scope.sourceNamespace !== options.sourceNamespace
+    || !("participantId" in options.pin.scope)
+    || options.pin.scope.participantId !== options.scope.participantId) throw fail();
+  const scope = { ...options.scope };
+  const pin = options.pin;
+  return async ({ day, sessions, budget, now }) => {
+    if (!validCacheRetentionDayLabel(day)) throw fail();
+    // One triple, not the whole history: the pinned vector already elected this
+    // day's device, and binding only the day being read keeps the filter small
+    // and makes a day nobody won read as empty.
+    const winners = pin.winners.filter((winner) => winner.observed_day === day);
+    if (winners.length > 1) throw fail();
+    if (winners.length === 0) return { items: [], rowsRead: 0 };
+    const winnersJson = JSON.stringify(winners.map((winner) =>
+      [winner.participant_id, winner.observed_day, winner.device_id]));
+    const fromMs = Date.parse(`${day}T00:00:00.000Z`);
+    const items: CacheRetentionItem[] = [];
+    const seen = new Set<string>();
+    let rowsRead = 0, afterTime = new Date(fromMs).toISOString(), afterId = 0;
+    for (let page = 0; page < maxPages; page += 1) {
+      // Two legs, one statement each: the reader splits an equal-instant page
+      // from the page after it, exactly as the quota path does.
+      spend(budget, now);
+      spend(budget, now);
+      const rows = await readTypedV1UsageAnalysisPage(options.source, scope, winnersJson,
+        afterTime, afterId, TYPED_V11_ANALYSIS_PAGE_SIZE,
+        new Date(fromMs + 86_400_000).toISOString());
+      for (const row of rows) {
+        rowsRead += 1;
+        afterTime = row.observed_at;
+        afterId = row.id;
+        if (seen.has(row.occurrence_id)) continue;
+        seen.add(row.occurrence_id);
+        if (seen.size > TYPED_V11_ANALYSIS_PAGE_SIZE * maxPages) {
+          throw new CacheRetentionRefusedError("day_page_limit_exceeded");
+        }
+        if (row.session_uuid === null) continue;
+        const sessionDigest = await cacheRetentionSessionDigest({ ownerDigest: options.ownerDigest,
+          provider: row.provider, sessionUuid: row.session_uuid });
+        if (sessions !== null && !sessions.has(sessionDigest)) continue;
+        const observedAtMs = Date.parse(row.observed_at);
+        if (!Number.isSafeInteger(observedAtMs)) throw new CacheRetentionRefusedError("usage_row_refused");
+        const item = cacheRetentionEventFromRecord({ sessionDigest, observedAtMs,
+          orderKey: row.occurrence_id, recordJson: row.record_json });
+        if (item !== null) items.push(item);
+      }
+      if (rows.length < TYPED_V11_ANALYSIS_PAGE_SIZE) {
+        spend(budget, now);
+        spend(budget, now);
+        await assertV1SourcePinCurrent(options.source, pin);
+        // The method's order, applied once to the whole day. The source keyset
+        // already fixed the instants; only the tiebreak between equal ones can
+        // differ from it, and that is a total order over distinct occurrence
+        // ids, so this never reorders two events across different instants.
+        items.sort((left, right) => left.observedAtMs - right.observedAtMs
+          || (left.orderKey < right.orderKey ? -1 : left.orderKey > right.orderKey ? 1 : 0));
+        return { items, rowsRead };
+      }
+    }
+    throw new CacheRetentionRefusedError("day_page_limit_exceeded");
+  };
+}
+
 /** One candidate day. */
 export interface CacheRetentionDayCandidate extends CacheRetentionDayKey {}
 export type CacheRetentionDayBuild = (candidate: CacheRetentionDayCandidate,
@@ -695,14 +879,23 @@ export function createCacheRetentionDayBuild(options: {
   /** Test seam only: production derives the reader from the source. */
   read?: CacheRetentionDayReader;
 }): CacheRetentionDayBuild {
-  const read = options.read ?? createCacheRetentionDayReader({ source: options.source,
-    sourceNamespace: options.sourceNamespace, snapshot: options.snapshot,
-    ownerDigest: options.ownerDigest });
-  const now = options.now ?? Date.now;
+  return cacheRetentionBuildFromReader(options.read ?? createCacheRetentionDayReader({
+    source: options.source, sourceNamespace: options.sourceNamespace, snapshot: options.snapshot,
+    ownerDigest: options.ownerDigest }), options.sourceNamespace, options.now ?? Date.now);
+}
+
+/**
+ * The layout-independent half of the build: the day's own read, the bounded
+ * lookback, and the reduction. Only the reader knows which layout it is
+ * reading, which is exactly why the measurement is the same for both and why
+ * adding a layout does not touch `CACHE_RETENTION_METHOD`.
+ */
+function cacheRetentionBuildFromReader(read: CacheRetentionDayReader, sourceNamespace: string,
+  now: () => number): CacheRetentionDayBuild {
   return async (candidate, carry, budget) => {
     checkKey(candidate);
     checkCarry(candidate, carry);
-    if (candidate.sourceNamespace !== options.sourceNamespace || !Number.isFinite(budget.deadlineMs)
+    if (candidate.sourceNamespace !== sourceNamespace || !Number.isFinite(budget.deadlineMs)
       || !Number.isSafeInteger(budget.remainingQueries)) throw fail();
     const own = await read({ day: candidate.day, sessions: null, budget, now });
     const sessions = new Set(own.items.map((item) => item.sessionDigest));
@@ -724,14 +917,35 @@ export function createCacheRetentionDayBuild(options: {
   };
 }
 
+/** The production v1 day builder. Same reduction, same lookback, same budget;
+ * only the reader differs. */
+export function createCacheRetentionV1DayBuild(options: {
+  source: D1Database; sourceNamespace: string; scope: TypedV1AnalysisScope; pin: V1SourcePin;
+  ownerDigest: string; now?: () => number;
+  /** Test seam only: production derives the reader from the source. */
+  read?: CacheRetentionDayReader;
+}): CacheRetentionDayBuild {
+  return cacheRetentionBuildFromReader(options.read ?? createCacheRetentionV1DayReader({
+    source: options.source, sourceNamespace: options.sourceNamespace, scope: options.scope,
+    pin: options.pin, ownerDigest: options.ownerDigest }), options.sourceNamespace,
+    options.now ?? Date.now);
+}
+
 /**
  * The production build for a WHOLE source, resolving each candidate owner's
- * generation snapshot itself.
+ * source itself.
  *
  * Analytics never holds a participant identifier, so the owner digest is
  * bridged back through `storage_v11_owner_links` in the source database — the
- * same mapping owner erasure uses. Resolution is memoized per pass. An owner
- * whose link, pin or snapshot is absent is skipped rather than guessed at.
+ * same mapping owner erasure uses. Resolution is memoized per pass and per
+ * layout. An owner whose link, pin, snapshot or analysis scope is absent is
+ * skipped rather than guessed at.
+ *
+ * The two layouts are exclusive and the source decides which: a live v1.1
+ * generation pin IS the v1.1 layout, and its absence is what makes an owner a
+ * v1 one. `typed_v1_v11_transition_unqualified` refuses a v1.1 domain for a
+ * participant holding typed v1 evidence, so no owner can answer to both and
+ * the pooled merge cannot read one owner-day twice.
  */
 export function createCacheRetentionDaySourceBuild(options: {
   source: D1Database; sourceNamespace: string; now?: () => number;
@@ -741,7 +955,10 @@ export function createCacheRetentionDaySourceBuild(options: {
   return async (candidate, carry, budget) => {
     checkKey(candidate);
     if (candidate.sourceNamespace !== options.sourceNamespace) throw fail();
-    let build = resolved.get(candidate.ownerDigest);
+    // Memoized per layout as well as per owner: a build reads one layout, and
+    // a candidate must never be served by the other layout's reader.
+    const memo = `${candidate.sourceLayout} ${candidate.ownerDigest}`;
+    let build = resolved.get(memo);
     if (build === undefined) {
       build = null;
       spend(budget, now);
@@ -751,17 +968,33 @@ export function createCacheRetentionDaySourceBuild(options: {
       if (link) {
         spend(budget, now);
         const pin = await loadV11SourcePin(options.source, link);
-        if (pin && pin.source === "v1.1") {
+        if (candidate.sourceLayout === "typed-v11") {
+          if (pin && pin.source === "v1.1") {
+            spend(budget, now);
+            spend(budget, now);
+            const snapshot = await loadTypedV11GenerationSnapshot(options.source,
+              { sourceNamespace: options.sourceNamespace, pin });
+            build = createCacheRetentionDayBuild({ source: options.source,
+              sourceNamespace: options.sourceNamespace, snapshot,
+              ownerDigest: candidate.ownerDigest, now });
+          }
+        } else if (pin === null) {
           spend(budget, now);
-          spend(budget, now);
-          const snapshot = await loadTypedV11GenerationSnapshot(options.source,
-            { sourceNamespace: options.sourceNamespace, pin });
-          build = createCacheRetentionDayBuild({ source: options.source,
-            sourceNamespace: options.sourceNamespace, snapshot,
-            ownerDigest: candidate.ownerDigest, now });
+          const scope = await loadTypedV1AnalysisScope(options.source, link);
+          if (scope && scope.sourceNamespace === options.sourceNamespace) {
+            // The pin is scoped to the participant, so it fences every day the
+            // pass reads for this owner and one unrelated upload retries the
+            // owner rather than half-building a day from two vectors.
+            spend(budget, now);
+            spend(budget, now);
+            const sourcePin = await loadV1SourcePin(options.source, { participantId: link });
+            build = createCacheRetentionV1DayBuild({ source: options.source,
+              sourceNamespace: options.sourceNamespace, scope, pin: sourcePin,
+              ownerDigest: candidate.ownerDigest, now });
+          }
         }
       }
-      resolved.set(candidate.ownerDigest, build);
+      resolved.set(memo, build);
     }
     if (build === null) throw new CacheRetentionRefusedError("owner_source_unavailable");
     return build(candidate, carry, budget);
@@ -787,28 +1020,87 @@ export interface CacheRetentionDayLaneResult {
   sourceQueriesUsed: number;
 }
 
-const SELECTION_SQL = `SELECT DISTINCT v.source_id,v.source_layout,v.source_namespace,v.owner_digest,
-    v.device_id,v.manifest_id,v.manifest_digest,v.day
-  FROM analytics_v11_reusable_values v
-  JOIN analytics_owner_state o ON o.source_id=v.source_id AND o.owner_digest=v.owner_digest
-    AND o.state='active'
-  WHERE v.source_id=?1 AND v.source_layout='typed-v11' AND (?2 IS NULL OR v.day>=?2)
-    AND NOT EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
-      WHERE f.source_id=v.source_id AND f.owner_digest=v.owner_digest)
-    AND NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_marks m
-      WHERE m.source_id=v.source_id AND m.owner_digest=v.owner_digest AND m.day=v.day
-        AND m.method_version=?3 AND m.source_layout=v.source_layout
-        AND m.source_namespace=v.source_namespace AND m.device_id=v.device_id
-        AND m.manifest_id=v.manifest_id AND m.manifest_digest=v.manifest_digest
-        AND NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_carry c
-          WHERE c.mark_key=m.mark_key AND c.manifest_digest!=COALESCE(
-            (SELECT MAX(w.manifest_digest) FROM analytics_v11_reusable_values w
+/** Deterministic owner sharding, identical for both layouts. */
+const shardSql = (column: string): string =>
+  `(?5=1 OR ((instr('0123456789abcdef',substr(${column},1,1))-1)*16
+    +(instr('0123456789abcdef',substr(${column},2,1))-1))%?5=?6)`;
+
+/**
+ * The candidate selection: oldest day first across BOTH delivered layouts.
+ *
+ * Each arm is limited on its own before the union, so the compound never
+ * materializes more than `2 * maxDays` rows; taking the oldest N of each arm
+ * and then the oldest N of the union is the oldest N overall.
+ *
+ * The v1 arm derives its day identity rather than reading one, for the reason
+ * `V1_DAY_REVISION` states, and aggregates before it filters because that
+ * identity is an aggregate over the day's chunk rows. Its `source_namespace`
+ * comes from the runtime source row the marks table already keys on by foreign
+ * key, so no second copy of that name enters the lane.
+ *
+ * The arm also excludes any owner that has v1.1 rows. `typed_v1_v11_transition_
+ * unqualified` already refuses a v1.1 domain for a participant holding typed v1
+ * evidence, so the two can never both be delivered — but the pooled community
+ * merge sums every mark, and an owner-day appearing under both layouts would be
+ * counted twice. That is the one failure this selection can rule out itself
+ * rather than inherit, so it does.
+ */
+const SELECTION_SQL = `SELECT * FROM (
+    SELECT DISTINCT v.source_id AS source_id,v.source_layout AS source_layout,
+      v.source_namespace AS source_namespace,v.owner_digest AS owner_digest,
+      v.device_id AS device_id,v.manifest_id AS manifest_id,
+      v.manifest_digest AS manifest_digest,v.day AS day
+    FROM analytics_v11_reusable_values v
+    JOIN analytics_owner_state o ON o.source_id=v.source_id AND o.owner_digest=v.owner_digest
+      AND o.state='active'
+    WHERE v.source_id=?1 AND v.source_layout='typed-v11' AND (?2 IS NULL OR v.day>=?2)
+      AND NOT EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
+        WHERE f.source_id=v.source_id AND f.owner_digest=v.owner_digest)
+      AND NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_marks m
+        WHERE m.source_id=v.source_id AND m.owner_digest=v.owner_digest AND m.day=v.day
+          AND m.method_version=?3 AND m.source_layout=v.source_layout
+          AND m.source_namespace=v.source_namespace AND m.device_id=v.device_id
+          AND m.manifest_id=v.manifest_id AND m.manifest_digest=v.manifest_digest
+          AND NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_carry c
+            WHERE c.mark_key=m.mark_key AND c.manifest_digest!=COALESCE(
+              (SELECT MAX(w.manifest_digest) FROM analytics_v11_reusable_values w
+                WHERE w.source_id=m.source_id AND w.owner_digest=m.owner_digest
+                  AND w.device_id=m.device_id AND w.day=c.day
+                  AND w.source_layout='typed-v11' AND w.source_namespace=m.source_namespace),'')))
+      AND ${shardSql("v.owner_digest")}
+    ORDER BY v.day,v.owner_digest,v.device_id LIMIT ?4)
+  UNION ALL
+  SELECT * FROM (
+    SELECT d.source_id AS source_id,'typed-v1' AS source_layout,
+      (SELECT r.source_namespace FROM analytics_runtime_sources r
+        WHERE r.source_id=d.source_id) AS source_namespace,
+      d.owner_digest AS owner_digest,'${CACHE_RETENTION_V1_DEVICE_ID}' AS device_id,
+      '${CACHE_RETENTION_V1_MANIFEST_ID}' AS manifest_id,
+      d.manifest_digest AS manifest_digest,d.day AS day
+    FROM (SELECT c.source_id AS source_id,c.owner_digest AS owner_digest,
+        c.observed_day AS day,${v1DayRevision("c")} AS manifest_digest
+      FROM analytics_v1_chunk_values c
+      WHERE c.source_id=?1 AND (?2 IS NULL OR c.observed_day>=?2)
+        AND ${shardSql("c.owner_digest")}
+        AND EXISTS(SELECT 1 FROM analytics_owner_state o WHERE o.source_id=c.source_id
+          AND o.owner_digest=c.owner_digest AND o.state='active')
+        AND NOT EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
+          WHERE f.source_id=c.source_id AND f.owner_digest=c.owner_digest)
+        AND NOT EXISTS(SELECT 1 FROM analytics_v11_reusable_values x
+          WHERE x.source_id=c.source_id AND x.owner_digest=c.owner_digest)
+      GROUP BY c.source_id,c.owner_digest,c.observed_day) d
+    WHERE NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_marks m
+      WHERE m.source_id=d.source_id AND m.owner_digest=d.owner_digest AND m.day=d.day
+        AND m.method_version=?3 AND m.source_layout='typed-v1'
+        AND m.manifest_digest=d.manifest_digest
+        AND NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_carry y
+          WHERE y.mark_key=m.mark_key AND y.manifest_digest!=COALESCE(
+            (SELECT ${v1DayRevision("w")} FROM analytics_v1_chunk_values w
               WHERE w.source_id=m.source_id AND w.owner_digest=m.owner_digest
-                AND w.device_id=m.device_id AND w.day=c.day
-                AND w.source_layout='typed-v11' AND w.source_namespace=m.source_namespace),'')))
-    AND (?5=1 OR ((instr('0123456789abcdef',substr(v.owner_digest,1,1))-1)*16
-      +(instr('0123456789abcdef',substr(v.owner_digest,2,1))-1))%?5=?6)
-  ORDER BY v.day,v.owner_digest,v.device_id LIMIT ?4`;
+                AND w.observed_day=y.day
+              GROUP BY w.owner_digest,w.observed_day),'')))
+    ORDER BY d.day,d.owner_digest LIMIT ?4)
+  ORDER BY day,owner_digest,device_id LIMIT ?4`;
 
 /**
  * One bounded, resumable preparation page.
@@ -875,8 +1167,11 @@ export async function advanceCacheRetentionDayLane(options: {
     if (now() >= options.deadlineMs) {
       return idle(built + staged ? "progress" : "deferred", "deadline", candidates.length, spent());
     }
-    if (row.source_id !== sourceId || row.source_layout !== "typed-v11") throw fail();
-    const candidate: CacheRetentionDayCandidate = { sourceId, sourceLayout: "typed-v11",
+    if (row.source_id !== sourceId
+      || !CACHE_RETENTION_SOURCE_LAYOUTS.includes(
+        row.source_layout as CacheRetentionSourceLayout)) throw fail();
+    const candidate: CacheRetentionDayCandidate = { sourceId,
+      sourceLayout: row.source_layout as CacheRetentionSourceLayout,
       sourceNamespace: row.source_namespace, ownerDigest: row.owner_digest, deviceId: row.device_id,
       manifestId: row.manifest_id, manifestDigest: row.manifest_digest, day: row.day };
     checkKey(candidate);

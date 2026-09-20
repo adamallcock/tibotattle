@@ -51,13 +51,20 @@ export function cacheRetentionBuildEnabled(env:unknown):boolean{
  * is 53 target statements a day, and the 650-statement target half affords 12.
  *
  * SOURCE, per day: this lane reads EIGHT days for every day it prepares — its
- * own plus the seven-day lookback a cross-midnight pair needs — at one page
- * per 5,000 usage rows and one generation fence each. A typical owner-day is
- * about 16 statements and the densest measured one about 32, so the
- * 350-statement source half affords between 10 and 21 days and is the bound
- * that actually binds on a dense owner. That eightfold read is the real cost of
- * attributing a pair to the current event's day, and it is why `maxDays` is 12
- * here where the prepared-graph-day lane affords 32.
+ * own plus the seven-day lookback a cross-midnight pair needs. A v1.1 day costs
+ * one page statement per 5,000 usage rows plus one generation fence each, so a
+ * typical owner-day is about 16 statements and the densest measured one about
+ * 32, and the 350-statement source half affords between 10 and 21 days.
+ *
+ * A v1 day costs roughly twice that: its reader splits each page into an
+ * equal-instant leg and an after-instant leg, and its liveness fence reloads a
+ * two-statement source pin rather than checking one generation row. A pass of
+ * v1 days therefore affords about half as many as a pass of v1.1 ones and ends
+ * on `query_budget` sooner. That is deferral, not failure — the lane reports
+ * which bound stopped it, keeps its staged rows, and resumes next pass — and it
+ * is why `maxDays` stays 12 here where the prepared-graph-day lane affords 32.
+ * Raising either half is a budget decision to take against measured passes, not
+ * a change to make blind.
  *
  * The four-minute window affords far more than 12 days of mostly waiting, so
  * the statement meter, not the clock, is the binding constraint on an ordinary

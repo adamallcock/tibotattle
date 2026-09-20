@@ -20,7 +20,12 @@ import {
  type CacheRetentionItem,
 } from '../src/cache-retention-values';
 import {
+ CACHE_RETENTION_RECORD_SCHEMAS,
  CACHE_RETENTION_SESSION_DIGEST_METHOD,
+ CACHE_RETENTION_SOURCE_LAYOUTS,
+ CACHE_RETENTION_V1_DEVICE_ID,
+ CACHE_RETENTION_V1_MANIFEST_ID,
+ createCacheRetentionV1DayBuild,
  advanceCacheRetentionDayLane,
  cacheRetentionCarryDigest,
  cacheRetentionDayMarkKey,
@@ -43,7 +48,13 @@ import {cacheRetentionBuildEnabled,runCacheRetentionDaySchedule} from '../src/ca
 import {initializeStorageSource,readIngestionChanges} from '../src/analytics-delivery';
 import {initializeStorageAnalyticsRuntime,advanceStorageAnalytics} from '../src/storage-analytics-runtime';
 import {initializeTypedV11Admission,persistTypedV11StagedChunk} from '../src/typed-v11-admission';
-import {initializeTypedV1Admission} from '../src/typed-v1-admission';
+import {initializeTypedV1Admission,insertTypedTelemetryV1Chunk} from '../src/typed-v1-admission';
+import {parseTelemetryV1Chunk,type TelemetryV1Record} from '../src/telemetry-v1';
+import {type TelemetryV1ChunkInsert} from '../src/telemetry-v1-repository';
+import {telemetryV11LegacyProjection} from '../src/telemetry-v11-repository';
+import {loadTypedV1AnalysisScope} from '../src/typed-v1-analysis-reader';
+import {loadV1SourcePin} from '../src/telemetry-v1-source-selection';
+import {canonicalTelemetryV11Json} from '@app-usagemonitor/telemetry-contract';
 import {registerTelemetryV11DayManifest} from '../src/telemetry-v11-repository';
 import {activateTelemetryV11Domain,createTelemetryV11DomainPredecessor,loadV11SourcePin} from '../src/telemetry-v11-domain';
 import {loadTypedV11GenerationSnapshot} from '../src/typed-v11-quota-reader';
@@ -870,5 +881,230 @@ describe('the cache-retention builder over the real source readers',()=>{
   await expect(runCacheRetentionDaySchedule({...env2,CACHE_RETENTION_BUILD:'enabled',
    CACHE_RETENTION_SHARDS:'2',CACHE_RETENTION_SHARD:'2'}))
    .rejects.toThrow('CACHE_RETENTION_CONFIGURATION_INVALID');
+ });
+});
+
+describe('the v1 delivery layout',()=>{
+ const v1Key=(overrides:Partial<CacheRetentionDayCandidate>={}):CacheRetentionDayCandidate=>({
+  sourceId,sourceLayout:'typed-v1',sourceNamespace,ownerDigest:OWNER,
+  deviceId:CACHE_RETENTION_V1_DEVICE_ID,manifestId:CACHE_RETENTION_V1_MANIFEST_ID,
+  manifestDigest:MANIFEST,day:DAY,...overrides});
+
+ /** One delivered v1 chunk row, in the shape the v1 projection writes. */
+ const deliverV1Chunk=async(day:string,slot:string,ownerRevision:number,owner=OWNER)=>
+  target().prepare(`INSERT INTO analytics_v1_chunk_values(source_id,owner_digest,slot_digest,
+    namespace_digest,device_digest,chunk_digest,event_digest,content_digest,observed_day,
+    chunk_revision,owner_revision,values_json) VALUES(?,?,?,?,?,?,?,?,?,1,?,'{}')`)
+   .bind(sourceId,owner,await sha256Hex(`${owner}:${day}:${slot}`),'n'.repeat(64),'d'.repeat(64),
+    'c'.repeat(64),'e'.repeat(64),'f'.repeat(64),day,ownerRevision).run();
+ /** The derived day identity the lane uses, restated independently here. */
+ const v1DayDigest=(chunks:number,maxOwnerRevision:number):string =>
+  chunks.toString(16).padStart(32,'0')+maxOwnerRevision.toString(16).padStart(32,'0');
+
+ it('admits exactly two layouts, and holds v1 to its two key constants',async()=>{
+  expect([...CACHE_RETENTION_SOURCE_LAYOUTS]).toEqual(['typed-v11','typed-v1']);
+  // v1 pins neither a device nor a manifest, so anything else in those two
+  // fields would make one owner-day several candidates and the pooled merge
+  // would read that day once per device.
+  await expect(readCacheRetentionCarryDays(target(),v1Key({deviceId:'device-1'})))
+   .rejects.toThrow('CACHE_RETENTION_UNAVAILABLE');
+  await expect(readCacheRetentionCarryDays(target(),v1Key({manifestId:'manifest-1'})))
+   .rejects.toThrow('CACHE_RETENTION_UNAVAILABLE');
+  await expect(readCacheRetentionCarryDays(target(),
+   v1Key({sourceLayout:'json-v11' as unknown as 'typed-v1'})))
+   .rejects.toThrow('CACHE_RETENTION_UNAVAILABLE');
+ });
+
+ it('maps a v1.0 usage record to the same event a v1.1 one maps to',()=>{
+  // The record the two layouts actually differ by: the legacy projection is
+  // the production v1.1 -> v1.0 downgrade, and for the usage stream its WHOLE
+  // transformation is dropping `accountPlanAttribution` and rewriting
+  // `schemaVersion`. Neither is a field this measurement reads, which is why
+  // the method does not move when the input widens.
+  const v11=v11UsageRecord(DAY);
+  const v1=JSON.parse(telemetryV11LegacyProjection('usage',v11)!.canonicalRecord) as
+   Record<string,unknown>;
+  expect(v1.schemaVersion).toBe('usage-event-v1.0');
+  expect(v1).not.toHaveProperty('accountPlanAttribution');
+  const map=(record:unknown)=>cacheRetentionEventFromRecord({sessionDigest:SESSION_A,
+   observedAtMs:DAY_MS,orderKey:'occ-1',recordJson:JSON.stringify(record)});
+  expect(map(v1)).toEqual(map(v11));
+  expect(map(v1)).toMatchObject({model:'gpt-5.6-sol',effort:'high',speedMode:'standard',
+   surface:'local_interactive_unclassified',cacheReadTokens:900,uncachedTokens:100});
+  // Widening the allowlist did not relax anything below it: an unknown schema
+  // is still unreadable, and so is an admitted one whose fields do not hold.
+  expect([...CACHE_RETENTION_RECORD_SCHEMAS].sort())
+   .toEqual(['usage-event-v1.0','usage-event-v1.1']);
+  for(const broken of [{...v1,schemaVersion:'usage-event-v0.1'},
+   {...v1,modelId:'a model with spaces'},{...v1,components:null},
+   {...v1,reasoningEffort:undefined}]){
+   expect(map(broken)).toMatchObject({unreadable:true});
+  }
+ });
+
+ it('derives the day identity from the delivered chunk vector, not from a manifest',async()=>{
+  const lookback=cacheRetentionLookbackDays(DAY);
+  await deliverV1Chunk(lookback[6]!,'usage-0',4);
+  await deliverV1Chunk(lookback[6]!,'quota-0',5);
+  await deliverV1Chunk(lookback[0]!,'usage-0',2);
+  const carry=await readCacheRetentionCarryDays(target(),v1Key());
+  expect(carry).toEqual(lookback.map(day=>({day,manifestDigest:
+   day===lookback[0]?v1DayDigest(1,2):day===lookback[6]?v1DayDigest(2,5):''})));
+  // A restatement of one day moves that day's identity and no other's, which
+  // is the whole property v1.1 gets from its delivered manifest digest.
+  await target().prepare(`UPDATE analytics_v1_chunk_values SET chunk_revision=2,owner_revision=9
+    WHERE source_id=? AND owner_digest=? AND observed_day=?`)
+   .bind(sourceId,OWNER,lookback[6]!).run();
+  const restated=await readCacheRetentionCarryDays(target(),v1Key());
+  expect(restated[6]!.manifestDigest).toBe(v1DayDigest(2,9));
+  expect(restated[0]!.manifestDigest).toBe(carry[0]!.manifestDigest);
+ });
+
+ it('selects one candidate per owner-day whatever the day\'s device count',async()=>{
+  // Three chunks across two devices on one day. v1.1 would be three delivered
+  // rows and three keys; here the day is one candidate, so the pooled merge
+  // cannot read the same events twice.
+  await deliverV1Chunk(DAY,'usage-0',3);
+  await deliverV1Chunk(DAY,'usage-1',4);
+  await deliverV1Chunk(DAY,'usage-2',7);
+  const seen:CacheRetentionDayCandidate[]=[];
+  const build:CacheRetentionDayBuild=async candidate=>{
+   seen.push(candidate);
+   throw new CacheRetentionRefusedError('owner_source_unavailable');
+  };
+  const lane=await advanceCacheRetentionDayLane({target:target(),sourceId,build,
+   deadlineMs:Date.now()+30_000,remainingQueries:900});
+  expect(lane.candidates).toBe(1);
+  expect(seen).toEqual([v1Key({manifestDigest:v1DayDigest(3,7)})]);
+  // The same owner sharding the v1.1 arm gets, so two instances can neither
+  // both take a v1 day nor leave one unreachable. 'a'*64 is bucket 170, which
+  // is even, so shard 0 of 2 owns it and shard 1 sees nothing.
+  const shard=async(index:number)=>(await advanceCacheRetentionDayLane({target:target(),
+   sourceId,build,deadlineMs:Date.now()+30_000,remainingQueries:900,
+   shardCount:2,shardIndex:index})).candidates;
+  expect(await shard(0)).toBe(1);
+  expect(await shard(1)).toBe(0);
+ });
+});
+
+describe('the cache-retention builder over the real v1 source reader',()=>{
+ const sourceDb=()=>b.USAGE_MONITOR_DB;
+ const bindings=()=>({source:sourceDb(),target:target(),sourceId,sourceNamespace});
+ let occurrence=0;
+ const eventId=()=>`event:v1:${(occurrence+=1).toString(16).padStart(64,'0')}`;
+ /** Three same-configuration requests in one session: two 30 seconds apart,
+  * then one an hour later whose prefix mostly survived. Byte-for-byte the
+  * shape the v1.1 harness stages, downgraded by the production projection. */
+ const dayRecords=(day:string):TelemetryV1Record[]=>([
+  ['09:00:00',100,1000],['09:00:30',100,1000],['10:00:30',400,800],
+ ] as const).map(([time,uncached,cacheRead])=>JSON.parse(telemetryV11LegacyProjection('usage',
+  v11UsageRecord(day,'a',{eventId:eventId(),eventTime:`${day}T${time}.000Z`,
+   components:{inputUncachedTokens:uncached,inputCacheReadTokens:cacheRead,
+    inputCacheWriteTokens:0,outputTextTokens:50,outputReasoningTokens:25,
+    outputCombinedTokens:null}}))!.canonicalRecord) as TelemetryV1Record);
+
+ async function v1Source(days:number){
+  for(const migrations of [b.TEST_MIGRATIONS,b.TEST_TYPED_INGESTION_MIGRATIONS,
+   b.TEST_INGESTION_BRIDGE_MIGRATIONS,b.TEST_TYPED_V11_ADMISSION_MIGRATIONS,
+   b.TEST_TYPED_V1_ADMISSION_MIGRATIONS])await applyD1Migrations(sourceDb(),migrations);
+  await initializeStorageSource(sourceDb(),sourceId);
+  await initializeTypedV11Admission(sourceDb(),sourceNamespace);
+  await initializeTypedV1Admission(sourceDb(),sourceNamespace);
+  await applyD1Migrations(sourceDb(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+  await applyD1Migrations(b.DELETION_LEDGER,b.TEST_DELETION_LEDGER_MIGRATIONS);
+  await initializeStorageAnalyticsRuntime(bindings());
+  const device=await createV11DeviceFixture(sourceDb());
+  const today=new Date().toISOString().slice(0,10);
+  const dayList:string[]=[];
+  for(let n=days-1;n>=0;n--){
+   const day=new Date(Date.parse(today)-n*86_400_000).toISOString().slice(0,10);
+   dayList.push(day);
+   const records=dayRecords(day);
+   const envelopeDigest=await sha256Hex(`synthetic-v1-${crypto.randomUUID()}`);
+   const upload=await createDeviceUploadAuthorization(sourceDb(),
+    await authenticateDevice(sourceDb(),device.authorization),envelopeDigest,200);
+   const claim=await claimDeviceUploadAuthorization(sourceDb(),`Upload ${upload.uploadAuthorization}`,
+    {envelopeDigest,bodyBytes:200,contentType:'application/json'});
+   const chunk=parseTelemetryV1Chunk({schemaVersion:'telemetry-contribution-v1.0',
+    chunkId:`usage:${day}:0`,chunkRevision:1,
+    chunkDigest:await sha256Hex(canonicalTelemetryV11Json(records)),
+    parserVersion:'synthetic-v1',consent:{telemetrySchemaVersion:'telemetry-contribution-v1.0',
+     fieldDictionaryVersion:'telemetry-v1.0-registry-2026-08-07.1',
+     privacyContractVersion:'ongoing-privacy-safe-telemetry-v1.0'},records});
+   await insertTypedTelemetryV1Chunk(sourceDb(),{chunkRowId:`chunk:${crypto.randomUUID()}`,
+    participantId:device.participantId,deviceId:device.deviceId,chunk,envelopeDigest,
+    r2Key:`synthetic/v1-${crypto.randomUUID()}`,deviceUploadAuthorizationId:claim.authorizationId,
+    createdAt:new Date().toISOString(),supersedes:null} as TelemetryV1ChunkInsert,sourceNamespace);
+  }
+  for(let i=0;i<40;i++)if((await advanceStorageAnalytics(bindings())).state==='idle')break;
+  const ownerDigest=(await readIngestionChanges(sourceDb(),sourceId,0)).at(-1)!.ownerDigest;
+  return {device,ownerDigest,days:dayList};
+ }
+
+ it('prepares a v1 owner-day end to end, and reads back what the reduction produced',async()=>{
+  const fixture=await v1Source(2);
+  const build=createCacheRetentionDaySourceBuild({source:sourceDb(),sourceNamespace});
+  const lane=await advanceCacheRetentionDayLane({target:target(),sourceId,build,
+   deadlineMs:Date.now()+60_000,remainingQueries:900,sourceQueries:900});
+  expect(lane).toMatchObject({state:'progress',built:2,staged:0,refused:0,skipped:0});
+  const rows=(await target().prepare(`SELECT source_layout,owner_digest,device_id,manifest_id,
+     manifest_digest,day,method_version,events_read FROM analytics_cache_retention_day_marks
+    ORDER BY day`).all<Record<string,string|number>>()).results;
+  expect(rows.map(row=>row.day)).toEqual(fixture.days);
+  for(const row of rows){
+   expect(row).toMatchObject({source_layout:'typed-v1',device_id:CACHE_RETENTION_V1_DEVICE_ID,
+    manifest_id:CACHE_RETENTION_V1_MANIFEST_ID,owner_digest:fixture.ownerDigest,
+    // A wider input is not a different measurement.
+    method_version:CACHE_RETENTION_METHOD.version,events_read:3});
+  }
+  for(const [index,row] of rows.entries()){
+   const dayKey={sourceId,sourceLayout:'typed-v1' as const,sourceNamespace,
+    ownerDigest:String(row.owner_digest),deviceId:CACHE_RETENTION_V1_DEVICE_ID,
+    manifestId:CACHE_RETENTION_V1_MANIFEST_ID,manifestDigest:String(row.manifest_digest),
+    day:String(row.day)};
+   const carry=await readCacheRetentionCarryDays(target(),dayKey);
+   const stored=await readCacheRetentionDay({target:target(),key:dayKey,carry});
+   expect(stored.status).toBe('ready');
+   if(stored.status!=='ready')throw new Error('unreachable');
+   const direct=await build(dayKey,carry,{deadlineMs:Date.now()+60_000,remainingQueries:256});
+   expect(canonicalJson(stored.aggregate)).toBe(canonicalJson(direct));
+   const group=stored.aggregate.groups[0]!;
+   expect(group).toMatchObject({model:'gpt-5.6-sol',effort:'high',sessions:1});
+   // The SAME numbers the v1.1 harness proves for the same three requests:
+   // one sub-minute pair, one hour-scale pair, and on the second day one more
+   // that crosses midnight through the bounded lookback.
+   expect(group.bands.find(band=>band.band==='under_one_minute'))
+    .toMatchObject({adjacencies:1,reusedMoreThanHalf:1,matchedOrExceeded:1});
+   expect(group.bands.find(band=>band.band==='one_to_two_hours'))
+    .toMatchObject({adjacencies:1,reusedMoreThanHalf:1,matchedOrExceeded:0});
+   expect(group.adjacencies).toBe(index===0?2:3);
+   expect(group.bands.find(band=>band.band==='six_to_twenty_four_hours')!.adjacencies)
+    .toBe(index===0?0:1);
+  }
+ });
+
+ it('keeps no session identifier, occurrence id or raw device id in a v1 row',async()=>{
+  await v1Source(1);
+  await advanceCacheRetentionDayLane({target:target(),sourceId,
+   build:createCacheRetentionDaySourceBuild({source:sourceDb(),sourceNamespace}),
+   deadlineMs:Date.now()+60_000,remainingQueries:900,sourceQueries:900});
+  const raw=v11UsageRecord('2026-01-01').sessionUuid;
+  for(const table of ['marks','carry','values','bands']){
+   const stored=(await target().prepare(`SELECT * FROM analytics_cache_retention_day_${table}`)
+    .all<Record<string,unknown>>()).results;
+   expect(stored.length).toBeGreaterThan(0);
+   const text=JSON.stringify(stored);
+   expect(text).not.toContain(raw);
+   expect(text).not.toContain('event:v1:');
+  }
+ });
+
+ it('refuses to build a v1 day through a reader pinned to another participant',async()=>{
+  const fixture=await v1Source(1);
+  const scope=(await loadTypedV1AnalysisScope(sourceDb(),fixture.device.participantId))!;
+  const other=await createV11DeviceFixture(sourceDb());
+  const pin=await loadV1SourcePin(sourceDb(),{participantId:other.participantId});
+  expect(()=>createCacheRetentionV1DayBuild({source:sourceDb(),sourceNamespace,scope,pin,
+   ownerDigest:fixture.ownerDigest})).toThrow('CACHE_RETENTION_UNAVAILABLE');
  });
 });
