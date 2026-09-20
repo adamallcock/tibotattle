@@ -8,10 +8,13 @@ const BUCKETS = Object.freeze([
   ["five_to_ten_minutes", "fiveToTenMinutes", 300, 600],
   ["ten_to_thirty_minutes", "tenToThirtyMinutes", 600, 1_800],
   ["thirty_minutes_to_one_hour", "thirtyMinutesToOneHour", 1_800, 3_600],
-  ["one_to_six_hours", "oneToSixHours", 3_600, 21_600],
+  ["one_to_two_hours", "oneToTwoHours", 3_600, 7_200],
+  ["two_to_six_hours", "twoToSixHours", 7_200, 21_600],
   ["six_to_twenty_four_hours", "sixToTwentyFourHours", 21_600, 86_400],
-  ["one_to_three_days", "oneToThreeDays", 86_400, 259_200],
-  ["over_three_days", "overThreeDays", 259_200, null],
+  // Closed at seven days, which is the hosted lane's lookback: a longer gap
+  // is not measured at all rather than counted in this band. The old vocabulary
+  // ended in an unbounded `over_three_days`, which this cannot claim.
+  ["over_twenty_four_hours", "twentyFourHoursPlus", 86_400, 604_800],
 ]);
 const COUNT_FIELDS = [
   "comparableReturns", "reusedMoreThanHalfReturns", "reusedHalfOrLessReturns",
@@ -21,30 +24,11 @@ const COUNT_FIELDS = [
 const count = (value) => Number.isSafeInteger(value) && value >= 0;
 const amount = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
 const sum = (values) => values.reduce((total, value) => total + value, 0);
-const sumAmounts = (values) => values.every(amount) && amount(sum(values)) ? sum(values) : null;
 const validCounts = (row) => row && COUNT_FIELDS.every((field) => count(row[field]))
   && row.reusedMoreThanHalfReturns + row.reusedHalfOrLessReturns === row.comparableReturns
   && row.matchedOrExceededReturns + row.reusedBetweenHalfAndPreviousReturns === row.reusedMoreThanHalfReturns
   && row.cacheReadDrops === row.reusedHalfOrLessReturns
   && row.pricedDrops + row.unpricedDrops === row.cacheReadDrops;
-
-// Presentation-only regrouping of two already classified, disjoint cohorts.
-// Missing amounts remain unknown; they must never become a zero-priced tail.
-function mergeTail(rows) {
-  const merged = Object.fromEntries(COUNT_FIELDS.map((field) => [field, sum(rows.map((row) => row[field]))]));
-  merged.startSeconds = 86_400;
-  merged.endSeconds = null;
-  merged.coverageStatus = rows.every((row) => row.coverageStatus === "complete") ? "complete" : "incomplete";
-  merged.estimatedPremiumUsd = sumAmounts(rows.map((row) => row.estimatedPremiumUsd));
-  const subtotals = rows.map((row) => row.coveredSubtotal?.standardApiPremiumUsd
-    ?? (row.coverageStatus === "complete" && row.unpricedDrops === 0 ? row.estimatedPremiumUsd : null));
-  merged.coveredSubtotal = {
-    standardApiPremiumUsd: sumAmounts(subtotals),
-    pricedDrops: merged.pricedDrops,
-    unpricedDrops: merged.unpricedDrops,
-  };
-  return merged;
-}
 
 export function cacheReuseMatrixBuckets(impact) {
   if (!validCounts(impact) || !impact.byOutcomeBucket) return null;
@@ -57,9 +41,11 @@ export function cacheReuseMatrixBuckets(impact) {
     rows.push({ ...row, id, label });
   }
   if (COUNT_FIELDS.some((field) => sum(rows.map((row) => row[field])) !== impact[field])) return null;
-  return [...rows.slice(0, 8), {
-    ...mergeTail(rows.slice(8)), id: "twenty_four_hours_plus", label: "twentyFourHoursPlus",
-  }];
+  // Every bucket is rendered as measured. The previous vocabulary ended in two
+  // day-scale buckets that were merged back together for display; this one ends
+  // in the single bucket the evidence is actually cut into, so there is nothing
+  // to merge and nothing that could disagree with what was measured.
+  return rows;
 }
 
 // Keep volume comparable between model selections. The unit is chosen from

@@ -4,9 +4,11 @@ import { formatModelName } from './ui-format.js';
 
 // Isolated, deterministic illustration inputs. No companion or hosted requests.
 export function exampleCacheImpact() {
-  const ids=['under_one_minute','one_to_two_minutes','two_to_five_minutes','five_to_ten_minutes','ten_to_thirty_minutes','thirty_minutes_to_one_hour','one_to_six_hours','six_to_twenty_four_hours','one_to_three_days','over_three_days'];
-  const edges=[0,60,120,300,600,1800,3600,21600,86400,259200,null];
-  const counts=[1400,620,490,320,240,150,90,40,12,4], rates=[.99,.98,.97,.94,.85,.72,.38,.1,0,0];
+  // The same ten buckets the hosted lane measures, so the illustration cannot
+  // show a shape the real curve is incapable of producing.
+  const ids=['under_one_minute','one_to_two_minutes','two_to_five_minutes','five_to_ten_minutes','ten_to_thirty_minutes','thirty_minutes_to_one_hour','one_to_two_hours','two_to_six_hours','six_to_twenty_four_hours','over_twenty_four_hours'];
+  const edges=[0,60,120,300,600,1800,3600,7200,21600,86400,604800];
+  const counts=[1400,620,490,320,240,150,60,30,40,16], rates=[.99,.98,.97,.94,.85,.72,.45,.31,.1,.04];
   const cohort=(model,factor)=>{
     const byOutcomeBucket={};
     ids.forEach((id,i)=>{
@@ -48,13 +50,83 @@ export function exampleModelSpeeds(period='all') {
       return {id,label,turns:speedTurns+days*2,speedTurns,ttftTurns,timedResponses:ttftTurns,speed:[{method:'speed',points:history.map(p=>p.speed)}],ttft:history.map(p=>p.ttft)};
     })};
 }
-export function mountExampleInsights(doc,t) {
+export function mountExampleInsights(doc,t,loadHostedCurve) {
   const locale=()=>doc.documentElement.lang||'en-US';
   const container=doc.querySelector('[data-cache-demo]');
   const matrix=createCacheReuseMatrix({container,t,formatNumber:n=>new Intl.NumberFormat(locale()).format(n),formatPercent:n=>new Intl.NumberFormat(locale(),{maximumFractionDigits:1}).format(n)+'%',formatModelName});
-  const impact=exampleCacheImpact(); matrix.render({impact});
+  // The illustration renders immediately so the section is never blank, and
+  // the measured curve replaces it if and when one arrives. A hosted lane that
+  // has published nothing leaves the synthetic demonstration in place, still
+  // labelled as one -- it is never relabelled as real.
+  let impact=exampleCacheImpact(); matrix.render({impact});
+  const demo=doc.querySelector('#cache-demo');
+  const label=demo?.querySelector('.insight-demo-label');
+  if(typeof loadHostedCurve==='function'){
+    Promise.resolve().then(loadHostedCurve).then(curve=>{
+      const measured=cacheImpactFromHostedCurve(curve);
+      if(!measured||measured.comparableReturns===0)return;
+      impact=measured;
+      if(label)label.textContent=t('site.features.insightMeasured');
+      matrix.render({impact});
+    }).catch(()=>{});
+  }
   const win=doc.defaultView;
   const localWindow={MutationObserver:win.MutationObserver,setTimeout:win.setTimeout.bind(win),clearTimeout:win.clearTimeout.bind(win),localStorage:{getItem:()=>null,setItem:()=>{}}};
   const speed=mountModelPerformance({root:doc.querySelector('[data-speeds-demo]'),client:{modelPerformance:async period=>exampleModelSpeeds(period)},t,locale,windowRef:localWindow});
   win.addEventListener('tibotattle:locale-change',()=>{matrix.render({impact});speed.render();});
+}
+
+/**
+ * Map the hosted community cache-retention curve onto the matrix's impact
+ * contract.
+ *
+ * The two vocabularies are the same ten buckets, so this is a rename and a
+ * unit change, never a regrouping: nothing is summed, split or interpolated.
+ * `reusedMoreThanHalf` and `matchedOrExceeded` arrive as COUNTS for exactly
+ * this reason — multiplying a rounded rate back out would invent the numbers
+ * the contract then checks add up.
+ *
+ * What the hosted lane does not measure stays unmeasured. There is no pricing
+ * evidence behind a hosted gap, so `coverageStatus` is `incomplete` and
+ * `estimatedPremiumUsd` is null rather than zero; `lostCacheTokens` is not
+ * observed hosted-side and is not drawn, and the null premium beside it is
+ * what stops a reader taking its zero for a finding.
+ *
+ * Returns null on anything unexpected, so the page falls back rather than
+ * rendering a partly trusted curve.
+ */
+export function cacheImpactFromHostedCurve(curve) {
+  if (!curve || typeof curve !== "object" || !Array.isArray(curve.bands)) return null;
+  if (curve.measures !== "consecutive_requests") return null;
+  const count = (value) => Number.isSafeInteger(value) && value >= 0;
+  const byOutcomeBucket = {};
+  const totals = { comparableReturns: 0, reusedMoreThanHalfReturns: 0, reusedHalfOrLessReturns: 0,
+    matchedOrExceededReturns: 0, reusedBetweenHalfAndPreviousReturns: 0,
+    cacheReadDrops: 0, lostCacheTokens: 0, pricedDrops: 0, unpricedDrops: 0 };
+  for (const band of curve.bands) {
+    if (!band || typeof band.band !== "string"
+      || !count(band.adjacencies) || !count(band.reusedMoreThanHalf) || !count(band.matchedOrExceeded)
+      || !count(band.startMs) || !count(band.endMs)) return null;
+    // The parts have to be consistent at the source. A band whose reused count
+    // exceeds its adjacencies, or whose matched count exceeds its reused, is
+    // not a rounding artefact to be clamped -- it is evidence something
+    // upstream is wrong, and it fails the whole curve.
+    if (band.reusedMoreThanHalf > band.adjacencies
+      || band.matchedOrExceeded > band.reusedMoreThanHalf) return null;
+    const less = band.adjacencies - band.reusedMoreThanHalf;
+    const row = {
+      startSeconds: band.startMs / 1_000, endSeconds: band.endMs / 1_000,
+      comparableReturns: band.adjacencies,
+      reusedMoreThanHalfReturns: band.reusedMoreThanHalf,
+      reusedHalfOrLessReturns: less,
+      matchedOrExceededReturns: band.matchedOrExceeded,
+      reusedBetweenHalfAndPreviousReturns: band.reusedMoreThanHalf - band.matchedOrExceeded,
+      cacheReadDrops: less, lostCacheTokens: 0, pricedDrops: 0, unpricedDrops: less,
+      coverageStatus: "incomplete", estimatedPremiumUsd: null,
+    };
+    byOutcomeBucket[band.band] = row;
+    for (const key of Object.keys(totals)) totals[key] += row[key];
+  }
+  return { ...totals, byOutcomeBucket, model: "", coverageStatus: "incomplete",
+    estimatedPremiumUsd: null, status: "available", byModel: [] };
 }
