@@ -13,6 +13,7 @@ import {
   analyzeCacheSwitchRows,
   CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_MS,
   CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+  MAX_CACHE_CONTINUITY_RECENT_DETAILS,
   MAX_CACHE_SWITCH_RECENT_DETAILS,
   readCacheImpacts,
 } from "../src/cache-switch-impact.js";
@@ -32,6 +33,11 @@ import {
 } from "../src/local-unified-index.js";
 
 const NOW_MS = Date.parse("2026-08-08T12:00:00.000Z");
+
+test("cache impact detail windows retain 250 rows for paginated inspection", () => {
+  assert.equal(MAX_CACHE_SWITCH_RECENT_DETAILS, 250);
+  assert.equal(MAX_CACHE_CONTINUITY_RECENT_DETAILS, 250);
+});
 
 function usdFromNanos(value) {
   const whole = Math.floor(value / 1_000_000_000);
@@ -1153,7 +1159,7 @@ test("model continuity cohorts use full-period evidence, including warm returns 
   assert.equal(sol.reusedMoreThanHalfReturns, 12);
   assert.equal(sol.matchedOrExceededReturns, 6);
   assert.equal(sol.reusedBetweenHalfAndPreviousReturns, 6);
-  assert.equal(sol.recent.length, MAX_CACHE_SWITCH_RECENT_DETAILS);
+  assert.equal(sol.recent.length, 24);
   assert.equal(sol.cacheReadDrops, 24);
   assert.equal(sol.byOutcomeBucket.under_one_minute.comparableReturns, 36);
   assert.equal(gpt54.comparableReturns, 1);

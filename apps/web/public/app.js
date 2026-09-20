@@ -9305,11 +9305,11 @@ function cacheDropThreadKeys(data) {
     if (impact?.status !== "available") continue;
     const periods = Array.isArray(impact.periods) ? impact.periods.slice(0, 4) : [];
     for (const period of [impact, ...periods]) {
-      const recent = Array.isArray(period?.recent) ? period.recent.slice(0, 20) : [];
+      const recent = Array.isArray(period?.recent) ? period.recent.slice(0, 250) : [];
       for (const row of recent) {
         const key = cacheDropThreadLookupKey(kind, row);
         if (key !== null) keys.add(key);
-        if (keys.size === 160) return keys;
+        if (keys.size === 2_000) return keys;
       }
     }
   }

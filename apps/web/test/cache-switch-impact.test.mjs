@@ -218,7 +218,7 @@ function impact(overrides = {}) {
     periodLabel: selected.periodLabel,
     proximityCeilingSeconds: 300,
     maximumRetainedCacheRatio: 0.5,
-    recentDetailLimit: 20,
+    recentDetailLimit: 250,
     ...selected,
     periods: [selected],
     ...overrides,
@@ -356,7 +356,7 @@ function continuityImpact(overrides = {}) {
     minimumGapSeconds: 0,
     maximumRetainedCacheRatio: 0.5,
     outcomeDisplayMaximumGapSeconds: 604_800,
-    recentDetailLimit: 20,
+    recentDetailLimit: 250,
     ...selected,
     periods: [selected],
     ...overrides,
@@ -443,7 +443,8 @@ test("cache-switch evidence is bounded and projects no local identifiers", () =>
   assert.equal(result.maximumRetainedCacheRatio, 0.5);
   assert.equal(result.proximityCeilingSeconds, 300);
   assert.equal(result.orderingCoverageGaps, 0);
-  assert.equal(result.recent.length, 20);
+  assert.equal(result.recentDetailLimit, 250);
+  assert.equal(result.recent.length, 25);
   assert.deepEqual(Object.keys(result.recent[0]).sort(), [
     "changeType",
     "current",

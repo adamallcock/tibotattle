@@ -2167,7 +2167,7 @@ const CACHE_SWITCH_CHANGE_TYPES = Object.freeze([
 ]);
 const CACHE_SWITCH_CHANGE_TYPE_SET = new Set(CACHE_SWITCH_CHANGE_TYPES);
 const CACHE_SWITCH_PERIOD_IDS = new Set(["24h", "7d", "30d", "all", "history"]);
-const CACHE_SWITCH_RECENT_LIMIT = 20;
+const CACHE_SWITCH_RECENT_LIMIT = 250;
 const CACHE_SWITCH_PROXIMITY_CEILING_SECONDS = 300;
 const CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO = 0.5;
 const CACHE_CONTINUITY_MINIMUM_GAP_SECONDS = 0;
@@ -2677,7 +2677,7 @@ function normalizeCacheSwitchState(value) {
 // its names or raw thread identifiers to normalized accounting/report DTOs.
 const LOCAL_CACHE_DROP_THREAD_LINKS_SCHEMA = "local-cache-drop-thread-links-v1";
 const CACHE_DROP_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-const MAX_CACHE_DROP_THREAD_LINKS = 160;
+const MAX_CACHE_DROP_THREAD_LINKS = 2_000;
 
 function normalizeAccountingGeneration(value) {
   if (typeof value !== "number"
