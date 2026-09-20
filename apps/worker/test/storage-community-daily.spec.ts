@@ -728,7 +728,12 @@ describe('independent public daily publication',()=>{
 
     const tenToThirty=curve.bands.find(band=>band.band==='ten_to_thirty_minutes')!;
     expect(tenToThirty.adjacencies).toBe(2);
+    // The published counts are the rate's own numerator and denominator, so a
+    // reader can check the figure instead of trusting it.
+    expect(tenToThirty.reusedMoreThanHalf).toBe(1);
     expect(tenToThirty.reusedMoreThanHalfRate).toBeCloseTo(0.5,10);
+    expect((tenToThirty.reusedMoreThanHalf as number)/(tenToThirty.adjacencies as number))
+      .toBeCloseTo(tenToThirty.reusedMoreThanHalfRate as number,10);
     expect(tenToThirty.contributors).toBe(2);
     expect(tenToThirty.topContributorShare).toBeCloseTo(0.5,10);
 

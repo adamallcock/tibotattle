@@ -606,6 +606,12 @@ export interface PublicCacheRetentionBand {
   readonly adjacencies: number;
   readonly sessions: number;
   readonly contributors: number;
+  /** The raw counts behind the rates. Published because a rate alone cannot be
+   * checked, cannot be re-pooled against another band, and cannot be rendered
+   * by anything that needs the parts to sum -- and because deriving a count by
+   * multiplying a rounded rate back out invents a number. */
+  readonly reusedMoreThanHalf: number;
+  readonly matchedOrExceeded: number;
   readonly reusedMoreThanHalfRate: number | null;
   readonly matchedOrExceededRate: number | null;
   readonly topContributorShare: number | null;
@@ -647,6 +653,8 @@ export function publicCacheRetentionCurve(
         band: definition.id, startMs: definition.startMs, endMs: definition.endMs,
         adjacencies: merged?.adjacencies ?? 0, sessions: merged?.sessions ?? 0,
         contributors: merged?.contributors ?? 0,
+        reusedMoreThanHalf: merged?.reusedMoreThanHalf ?? 0,
+        matchedOrExceeded: merged?.matchedOrExceeded ?? 0,
         reusedMoreThanHalfRate: merged?.reusedMoreThanHalfRate ?? null,
         matchedOrExceededRate: merged?.matchedOrExceededRate ?? null,
         topContributorShare: merged?.topContributorShare ?? null,
