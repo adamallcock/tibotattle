@@ -422,7 +422,9 @@ export function createCacheReuseMatrix({
     metrics.hidden = unavailable;
     legend.hidden = unavailable;
     note.hidden = unavailable;
-    unitLabel.textContent = tr("unit", { count: formatNumber(unit) });
+    // A unit of one is a real state on a small corpus -- one light per
+    // follow-up -- and "1 light = 1 checked follow-ups" is not a sentence.
+    unitLabel.textContent = unit === 1 ? tr("unitOne") : tr("unit", { count: formatNumber(unit) });
     pickerLabel.textContent = tr("model");
     const modelBreakdownAvailable = Array.isArray(impact?.byModel);
     modelNote.hidden = impact?.status !== "available" || modelBreakdownAvailable;

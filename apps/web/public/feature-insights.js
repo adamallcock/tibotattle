@@ -103,6 +103,22 @@ export function mountExampleInsights(doc,t,loadHostedCurve) {
       });
       chooser.append(group,note);
       demo?.insertBefore(chooser,demo.querySelector('[data-cache-demo]'));
+      // Stated from the measurement, never a fixed figure: it moves with the
+      // period, and on a corpus with no ties it says nothing at all rather
+      // than disclosing a caveat that does not apply.
+      const ties=doc.createElement('p');
+      ties.className='insight-demo-ties';
+      const showTies=()=>{
+        const total=impact.comparableReturns,count=impact.unorderedTies??0;
+        const share=total>0?count/total:0;
+        ties.hidden=count===0;
+        ties.textContent=count===0?'':t('accounting.cacheContinuity.matrix.unorderedTies',
+          {count:new Intl.NumberFormat(locale()).format(count),
+           percent:new Intl.NumberFormat(locale(),{maximumFractionDigits:1}).format(share*100)+'%'});
+      };
+      showTies();
+      for(const button of buttons)button.addEventListener('click',showTies);
+      demo?.insertBefore(ties,demo.querySelector('[data-cache-demo]'));
     }).catch(()=>{});
   }
   const win=doc.defaultView;
@@ -138,6 +154,12 @@ export function cacheImpactFromHostedCurve(curve) {
   const totals = { comparableReturns: 0, reusedMoreThanHalfReturns: 0, reusedHalfOrLessReturns: 0,
     matchedOrExceededReturns: 0, reusedBetweenHalfAndPreviousReturns: 0,
     cacheReadDrops: 0, lostCacheTokens: 0, pricedDrops: 0, unpricedDrops: 0 };
+  // Adjacencies whose two requests share an observed millisecond. The hosted
+  // record carries no ordering field beyond the instant, so for these the
+  // order genuinely is not established -- not merely unrecorded. Counted
+  // separately because a reader deserves to know what fraction of the
+  // headline bucket rests on a pair nobody can put in sequence.
+  let unorderedTies = 0;
   for (const band of curve.bands) {
     if (!band || typeof band.band !== "string"
       || !count(band.adjacencies) || !count(band.reusedMoreThanHalf) || !count(band.matchedOrExceeded)
@@ -161,9 +183,12 @@ export function cacheImpactFromHostedCurve(curve) {
     };
     byOutcomeBucket[band.band] = row;
     for (const key of Object.keys(totals)) totals[key] += row[key];
+    if (Number.isSafeInteger(band.unorderedTies) && band.unorderedTies >= 0) {
+      unorderedTies += band.unorderedTies;
+    }
   }
   return { ...totals, byOutcomeBucket, model: "", coverageStatus: "incomplete",
-    estimatedPremiumUsd: null, status: "available", byModel: [] };
+    estimatedPremiumUsd: null, status: "available", byModel: [], unorderedTies };
 }
 
 
