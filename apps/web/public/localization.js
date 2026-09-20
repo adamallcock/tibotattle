@@ -1412,6 +1412,10 @@ export const WEB_MESSAGES = Object.freeze({
   "community.cached.chip": ["Showing cached figures", "显示缓存数据", "Mostrando cifras en caché"],
   "community.cached.notice": ["The service could not be reached, so these are the figures this browser last received, {age}. They are not current, and nothing has been estimated to fill the gap.", "无法连接服务，因此这里显示的是此浏览器上次收到的数据，时间为{age}。这些数据不是最新的，也没有通过估算来填补缺口。", "No se pudo contactar con el servicio, así que estas son las cifras que este navegador recibió por última vez, {age}. No están actualizadas y no se ha estimado nada para rellenar el hueco."],
   "community.daily.failedLoad": ["The daily community series could not be loaded. Nothing is inferred from a failed request.", "无法加载每日社区序列。失败的请求不会推断任何结果。", "No se pudo cargar la serie comunitaria diaria. No se infiere nada de una solicitud fallida."],
+  // Frames the four figures wherever they are shown outside the activity
+  // band. In the hero they sit above the download, where an unlabelled set of
+  // totals would read as the reader's own usage rather than the community's.
+  "community.contribution.heroHeading": ["Contributed by the community so far", "社区迄今的贡献", "Aportado por la comunidad hasta ahora"],
   "community.daily.activitySummary": ["See community activity", "查看社区活动", "Ver la actividad de la comunidad"],
   "community.daily.activityHeading": ["Community activity over time", "社区活动趋势", "Actividad de la comunidad a lo largo del tiempo"],
   "community.daily.activityCopy": ["Delayed, aggregate daily totals from optional contributions. This public view includes no prompts, responses, or account details.", "来自可选贡献的延迟汇总每日总量。此公开视图不包含提示词、回复或账户详情。", "Totales diarios agregados y diferidos de contribuciones opcionales. Esta vista pública no incluye prompts, respuestas ni datos de cuentas."],

@@ -2992,8 +2992,12 @@ footer p { margin: 0; }
   gap: clamp(42px, 4.5vw, 68px);
   align-items: start;
   min-height: min(790px, calc(100vh - 74px));
+  /* The top inset was tuned when the headline was the first thing in this
+     column. It now carries the contribution figures and the download above
+     the fold as well, and 104px of air below a 64px sticky header was the
+     cheapest space on the page to spend on that. */
   padding:
-    clamp(62px, 8vw, 104px)
+    clamp(60px, 5.6vw, 84px)
     max(24px, calc((100vw - 1180px) / 2))
     clamp(66px, 8vw, 102px);
   overflow: hidden;
@@ -3357,6 +3361,88 @@ footer p { margin: 0; }
   color: rgba(255, 253, 247, .7);
   font-size: .7rem;
 }
+/*
+ * The community's contribution totals, in the hero above the download. The
+ * daily renderer writes the same `dl` it writes into the activity band, so
+ * this styles that markup for a dark, narrow, above-the-fold context rather
+ * than expecting different DOM.
+ *
+ * Hidden unless the page is holding current evidence. The renderer leaves the
+ * host untouched on an unavailable answer, and it does not label retained
+ * figures here the way the band does, so an unqualified claim in the hero
+ * would outlive the evidence behind it. `data-live` is the same signal the
+ * community link below uses. A browser without `:has()` keeps the band
+ * hidden, which fails in the safe direction.
+ */
+.community-site .hero-contribution { display: none; }
+.community-site:has(.community-inline[data-live="true"]) .hero-contribution {
+  display: block;
+  max-width: 620px;
+  margin-top: 20px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 253, 247, .16);
+}
+.community-site .hero-contribution + .install-cluster { margin-top: 24px; }
+.community-site .hero-contribution h2 {
+  margin: 0;
+  color: rgba(255, 253, 247, .58);
+  font-family: var(--sans);
+  font-size: .69rem;
+  font-weight: var(--weight-semibold);
+  letter-spacing: .04em;
+  line-height: 1.4;
+  text-transform: uppercase;
+}
+.community-site .hero-contribution .snapshot-quality-grid {
+  grid-template-rows: auto auto auto;
+  gap: 16px 18px;
+  margin: 11px 0 0;
+}
+/* Tiles would be a second card inside a hero that is already one surface;
+   here the figures read directly off the dark ground. Sharing the grid's rows
+   keeps the four values on one line even when a label wraps and another does
+   not -- without it the longest label pushes its figure out of the row. */
+.community-site .hero-contribution .snapshot-quality-grid > div {
+  grid-row: span 3;
+  display: grid;
+  grid-template-rows: subgrid;
+  row-gap: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+}
+.community-site .hero-contribution .snapshot-quality-grid dt {
+  color: rgba(255, 253, 247, .5);
+  font-size: .5rem;
+  letter-spacing: .08em;
+}
+.community-site .hero-contribution .snapshot-quality-grid dd {
+  margin-top: 3px;
+  color: var(--site-paper);
+  font-family: var(--serif);
+  font-size: clamp(1.08rem, 1.5vw, 1.4rem);
+  font-weight: var(--weight-regular);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.02em;
+  line-height: 1.05;
+}
+/* The qualifier travels with the figure: a spend total that does not say it
+   is not a bill, or a count that does not say across how many shared days,
+   is a stronger claim than the evidence supports. */
+.community-site .hero-contribution .snapshot-quality-grid small {
+  display: block;
+  margin-top: 4px;
+  color: rgba(255, 253, 247, .45);
+  font-size: .53rem;
+  line-height: 1.35;
+}
+@media (max-width: 700px) {
+  /* Two up on a phone. Four stacked figures would push the download most of a
+     screen down, and each value still has room for its qualifier. */
+  .community-site .hero-contribution .snapshot-quality-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
 .community-site .community-inline {
   display: grid;
   grid-template-columns: auto auto minmax(0, 1fr);
@@ -3673,41 +3759,12 @@ footer p { margin: 0; }
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 /*
- * The four community figures are this page's social evidence, so the band
- * opens on them and sets them at a size a reader takes in at a glance. They
- * are the first thing the daily renderer writes into the result container,
- * which is why promoting the band promotes them.
+ * With the figures hosted in the hero, the band now opens on its chart. The
+ * activity heading already carries the gap above it, so the chart does not
+ * add a second one where the figures used to sit.
  */
-.community-site .community-proof .snapshot-quality-grid {
-  gap: 10px;
-  /* The result container already carries the gap below the band's intro; a
-     second margin here only pushes the figures further down the page. */
-  margin: 4px 0 0;
-}
-.community-site .community-proof .snapshot-quality-grid > div {
-  padding: 13px 15px;
-  border-radius: var(--radius-md);
-  background: var(--surface-quiet);
-}
-.community-site .community-proof .snapshot-quality-grid dt {
-  font-size: .58rem;
-  letter-spacing: .07em;
-}
-.community-site .community-proof .snapshot-quality-grid dd {
-  margin-top: 7px;
-  font-family: var(--serif);
-  font-size: clamp(1.22rem, 2vw, 1.6rem);
-  font-weight: var(--weight-regular);
-  font-variant-numeric: tabular-nums;
-  letter-spacing: -.02em;
-  line-height: 1.08;
-}
-.community-site .community-proof .snapshot-quality-grid small {
-  display: block;
-  margin-top: 6px;
-  color: var(--muted);
-  font-size: .61rem;
-  line-height: 1.35;
+.community-site .community-proof .community-daily-chart:first-child {
+  margin-top: 0;
 }
 .community-site .table-wrap {
   margin-top: 16px;

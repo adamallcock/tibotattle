@@ -123,6 +123,29 @@
             calculates your personal dashboard locally on your computer.
           </p>
 
+          <!--
+            The community's contribution totals, in the hero because that is
+            what they are for: evidence of how much has been shared before the
+            reader is asked to download anything. The daily renderer writes its
+            four figures into the host below and replaces them on each refresh;
+            the heading is what stops them reading as the reader's own numbers.
+
+            The host stays empty until a published day exists, and the renderer
+            leaves it untouched on an unavailable or retained answer, so the
+            band is hidden unless the page is holding current evidence. The
+            community link further down reports the state either way.
+          -->
+          <section
+            class="hero-contribution"
+            aria-labelledby="hero-contribution-heading"
+          >
+            <h2
+              id="hero-contribution-heading"
+              data-i18n="community.contribution.heroHeading"
+            >Contributed by the community so far</h2>
+            <div id="community-contribution-summary"></div>
+          </section>
+
           <div
             class="install-cluster"
             id="download"

@@ -18,7 +18,7 @@ import {
   renderCommunityAllowanceSection,
   renderCommunityDailySeries,
 } from "../public/community-view.js";
-import { translate } from "../public/localization.js";
+import { SUPPORTED_LOCALES, translate } from "../public/localization.js";
 import {
   HOMEBREW_INSTALL_COMMAND,
   copyInstallerChecksum,
@@ -2676,7 +2676,7 @@ test("the cache chart carries a quiet brand mark behind its origin", async () =>
   );
 });
 
-test("the community band opens on its four figures", async () => {
+test("the band opens on its chart, with its figures hosted in the hero", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
   // The disclosure stays -- the published-site contract pins its summary --
@@ -2691,14 +2691,12 @@ test("the community band opens on its four figures", async () => {
     false,
     "the figures the daily renderer writes are not behind a closed disclosure",
   );
-  // The figures lead the band at a size a reader takes in at a glance.
-  const figure = styles.match(
-    /\.community-site \.community-proof \.snapshot-quality-grid dd \{([\s\S]*?)\}/u,
+  // The figures now lead the hero instead, so the band opens on its chart and
+  // must not keep a gap where they used to sit.
+  assert.match(
+    styles,
+    /\.community-site \.community-proof \.community-daily-chart:first-child \{\s*margin-top: 0;/u,
   );
-  assert.ok(figure, "the community figures carry their own type scale");
-  assert.match(figure[1], /font-size:\s*clamp\(1\.22rem, 2vw, 1\.6rem\);/u);
-  assert.match(figure[1], /font-family:\s*var\(--serif\);/u);
-  assert.match(figure[1], /font-variant-numeric:\s*tabular-nums;/u);
   // Open by default, the summary is the band's rule, so the heading below it
   // does not draw a second one.
   assert.match(
@@ -2803,4 +2801,90 @@ test("the two closing tour cards are one component pair", async () => {
     /\.community-site \.tour-bottom article h3 \{[^}]*font-size: clamp\(22px, 2\.2vw, 30px\);/u,
   );
   assert.doesNotMatch(styles, /\.tour-local \{[^}]*float:/u);
+});
+
+test("the community's contribution figures lead the hero, above the download", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  const source = await readFile(SITE_SOURCE, "utf8");
+  const view = await readFile(new URL("../public/community-view.js", import.meta.url), "utf8");
+
+  // The host is in the hero's copy column, after the lede and before the
+  // download: that ordering is the whole point, so it is asserted, not the
+  // mere presence of the id.
+  const heroStart = html.indexOf('class="product-hero"');
+  const ledeIndex = html.indexOf('class="hero-lede"');
+  const hostIndex = html.indexOf('id="community-contribution-summary"');
+  const downloadIndex = html.indexOf('id="download"');
+  const bandIndex = html.indexOf('id="community-daily-result"');
+  assert.ok(hostIndex >= 0, "the hero carries the contribution host");
+  assert.ok(heroStart >= 0 && ledeIndex > heroStart);
+  assert.ok(hostIndex > ledeIndex, "the figures follow the hero lede");
+  assert.ok(hostIndex < downloadIndex, "the figures come before the download");
+  assert.ok(downloadIndex < bandIndex, "the activity band still follows the hero");
+  // Placing the host before the platform panels keeps it outside the slice
+  // the published-platform contract reads between them and the community link.
+  assert.ok(hostIndex < html.indexOf('id="platform-panel-macos"'));
+  assert.equal(
+    insideClosedDetails(html, hostIndex),
+    false,
+    "the hero figures are not behind a disclosure that starts closed",
+  );
+
+  // The page and the renderer have to agree on the host, or the figures
+  // silently stay in the band.
+  assert.match(source, /summaryContainer: \$\("#community-contribution-summary"\)/u);
+  // A hero host outside the rebuilt container must be replaced, never
+  // appended to, or every refresh stacks another copy of the figures.
+  assert.match(view, /summaryContainer\.replaceChildren\(quality\);/u);
+  assert.doesNotMatch(view, /summaryContainer\.append\(/u);
+
+  // Unlabelled in the hero, four totals read as the reader's own usage. The
+  // frame is translated copy, not a literal.
+  assert.match(
+    html,
+    /<h2\s+id="hero-contribution-heading"\s+data-i18n="community\.contribution\.heroHeading"\s*>Contributed by the community so far<\/h2>/u,
+  );
+  assert.match(html, /aria-labelledby="hero-contribution-heading"/u);
+  const headings = SUPPORTED_LOCALES.map(
+    (locale) => translate("community.contribution.heroHeading", {}, locale),
+  );
+  assert.equal(headings.length, 3);
+  for (const heading of headings) {
+    assert.notEqual(heading, "community.contribution.heroHeading");
+    assert.doesNotMatch(heading, /\{/u, "the frame takes no placeholders");
+  }
+  assert.equal(new Set(headings).size, 3, "each locale states it in its own words");
+
+  // Hidden unless the page holds current evidence. The renderer leaves the
+  // host untouched on an unavailable or retained answer, so without this the
+  // hero would keep claiming figures the page can no longer stand behind.
+  assert.match(styles, /\.community-site \.hero-contribution \{ display: none; \}/u);
+  assert.match(
+    styles,
+    /\.community-site:has\(\.community-inline\[data-live="true"\]\) \.hero-contribution \{\s*display: block;/u,
+  );
+
+  // The renderer hands over the same `dl` it writes into the band, so the
+  // hero styles that markup rather than expecting different DOM.
+  const cell = styles.match(
+    /\.community-site \.hero-contribution \.snapshot-quality-grid > div \{([\s\S]*?)\n\}/u,
+  );
+  assert.ok(cell, "the hero styles the renderer's own cells");
+  assert.match(cell[1], /grid-template-rows: subgrid;/u);
+  assert.match(cell[1], /grid-row: span 3;/u);
+  const figure = styles.match(
+    /\.community-site \.hero-contribution \.snapshot-quality-grid dd \{([\s\S]*?)\n\}/u,
+  );
+  assert.ok(figure, "the hero figures carry their own type scale");
+  assert.match(figure[1], /font-family:\s*var\(--serif\);/u);
+  assert.match(figure[1], /font-variant-numeric:\s*tabular-nums;/u);
+  // Each figure keeps its qualifier: a spend total that does not say it is
+  // not a bill, or a count with no stated window, overstates the evidence.
+  const detail = styles.match(
+    /\.community-site \.hero-contribution \.snapshot-quality-grid small \{([\s\S]*?)\n\}/u,
+  );
+  assert.ok(detail, "the hero keeps the qualifier under each figure");
+  assert.match(detail[1], /display: block;/u);
+  assert.doesNotMatch(detail[1], /display: none|visibility: hidden|content-visibility/u);
 });
