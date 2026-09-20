@@ -258,8 +258,15 @@ export function createCacheReuseMatrix({
     geometry = [];
     buttons = [];
     const narrow = w < 520;
-    const columns = narrow ? Math.max(10, Math.floor((w - 125) / 6.4)) : 7;
-    const baseCw = narrow ? 3.8 : Math.min(4.8, ((w - 32) / 9 - 18 - (columns - 1) * 2) / columns);
+    // Lights per row. Wide mode used a fixed seven, which left a bucket's
+    // stack 46px wide inside a slot nearer 140 -- and because a tall bucket
+    // scales its cells down to fit the box, that wasted width was paid for
+    // directly in dot size. Filling the slot lets the SAME number of lights
+    // spread over a wider box, so every cell is drawn larger.
+    const slot = (w - 32) / Math.max(1, rows.length);
+    const columns = narrow ? Math.max(10, Math.floor((w - 125) / 6.4))
+      : Math.max(7, Math.min(30, Math.floor((slot * 0.84) / 6.8)));
+    const baseCw = narrow ? 3.8 : Math.min(4.8, (slot - 18 - (columns - 1) * 2) / columns);
     const baseCh = narrow ? 3.8 : 4.8;
     const ch = baseCh;
     const gap = narrow ? 1.8 : 2;
