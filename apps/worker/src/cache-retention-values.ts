@@ -500,6 +500,8 @@ export function reduceCacheRetentionDay(input: {
 /** One stored band row, as the merge reads it back. */
 export interface CacheRetentionBandRow extends CacheRetentionBandCounters {
   readonly ownerDigest: string;
+  /** Present only when the reader grouped by model. */
+  readonly model?: string;
 }
 
 /**
@@ -618,6 +620,94 @@ export interface PublicCacheRetentionBand {
   readonly excludedInsufficientEvidence: number;
   readonly excludedContextContracted: number;
   readonly unorderedTies: number;
+}
+
+
+/** The windows the published series carries, matching the local dashboard's
+ * own controls so a reader comparing the two is comparing the same spans.
+ * `null` days means every retained day; it is not a 365-day window wearing
+ * another name. */
+export const CACHE_RETENTION_WINDOWS = Object.freeze([
+  Object.freeze({ id: "day" as const, days: 1 }),
+  Object.freeze({ id: "week" as const, days: 7 }),
+  Object.freeze({ id: "month" as const, days: 30 }),
+  Object.freeze({ id: "all" as const, days: null }),
+]);
+export type CacheRetentionWindowId = typeof CACHE_RETENTION_WINDOWS[number]["id"];
+
+/** How many models a window publishes beside its pooled figure.
+ *
+ * A bound, not a preference: the payload is a public read and its size must
+ * not follow the model catalogue. Models are taken in descending adjacency
+ * order, so the ones a reader is most likely to look for are the ones kept,
+ * and `modelsTruncated` says plainly when any were dropped rather than
+ * letting the list read as complete. */
+export const CACHE_RETENTION_PUBLIC_MODEL_LIMIT = 8;
+
+export interface PublicCacheRetentionWindow {
+  readonly window: CacheRetentionWindowId;
+  /** Calendar days the window spans, or null for every retained day. */
+  readonly days: number | null;
+  readonly bands: readonly PublicCacheRetentionBand[];
+  readonly byModel: readonly PublicCacheRetentionModel[];
+  readonly modelsTruncated: boolean;
+}
+
+export interface PublicCacheRetentionModel {
+  readonly model: string;
+  readonly bands: readonly PublicCacheRetentionBand[];
+}
+
+export interface PublicCacheRetentionSeries {
+  readonly schemaVersion: typeof CACHE_RETENTION_PUBLIC_SCHEMA_VERSION;
+  readonly metric: typeof CACHE_RETENTION_METRIC_ID;
+  readonly methodVersion: string;
+  readonly measures: "consecutive_requests";
+  readonly gapBasis: "response_end_to_response_end";
+  readonly windows: readonly PublicCacheRetentionWindow[];
+}
+
+/** Project one window's rows, pooled and then cut by model.
+ *
+ * The per-model cut is the SAME rows regrouped, never a second measurement:
+ * a model's bands and the pooled bands are built by one merge from one read,
+ * so a reader adding the models up gets the pooled figure back (except where
+ * truncation dropped a model, which `modelsTruncated` declares).
+ */
+export function publicCacheRetentionWindow(input: {
+  window: CacheRetentionWindowId; days: number | null;
+  pooled: readonly CacheRetentionCommunityBand[];
+  modelRows: readonly CacheRetentionBandRow[];
+  modelLimit?: number;
+}): PublicCacheRetentionWindow {
+  const limit = input.modelLimit ?? CACHE_RETENTION_PUBLIC_MODEL_LIMIT;
+  const byModel = new Map<string, CacheRetentionBandRow[]>();
+  for (const row of input.modelRows) {
+    if (typeof row.model !== "string" || row.model.length === 0) continue;
+    const held = byModel.get(row.model);
+    if (held === undefined) byModel.set(row.model, [row]); else held.push(row);
+  }
+  const ranked = [...byModel.entries()]
+    .map(([model, rows]) => ({ model, rows,
+      adjacencies: rows.reduce((total, row) => total + row.adjacencies, 0) }))
+    // Adjacency first, then the name, so the order is total rather than
+    // dependent on how the rows happened to arrive.
+    .sort((left, right) => right.adjacencies - left.adjacencies
+      || (left.model < right.model ? -1 : left.model > right.model ? 1 : 0))
+    .filter((entry) => entry.adjacencies > 0);
+  return {
+    window: input.window, days: input.days,
+    bands: publicCacheRetentionCurve(input.pooled, "unused").bands,
+    // `model` is stripped before merging: the merge validates a CLOSED
+    // counter shape, and an extra key is rejected there rather than ignored.
+    // That strictness is the point -- it is what stops an unvetted field
+    // riding into a published figure -- so the caller drops the grouping key
+    // it added rather than the validator being loosened to admit it.
+    byModel: ranked.slice(0, limit).map((entry) => ({ model: entry.model,
+      bands: publicCacheRetentionCurve(mergeCacheRetentionBands(
+        entry.rows.map(({ model: _grouping, ...counters }) => counters)), "unused").bands })),
+    modelsTruncated: ranked.length > limit,
+  };
 }
 
 /**

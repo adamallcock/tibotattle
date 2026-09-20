@@ -357,7 +357,7 @@ import {
 } from "./community-daily-aggregates";
 import { isCurrentCommunityDailySpend } from "./community-daily-spend";
 import { CACHE_RETENTION_BAND_IDS, CACHE_RETENTION_METHOD,
-  CACHE_RETENTION_PUBLIC_SCHEMA_VERSION } from "./cache-retention-values";
+  CACHE_RETENTION_PUBLIC_SCHEMA_VERSION, CACHE_RETENTION_WINDOWS } from "./cache-retention-values";
 import { captureStorageCommunityAuthority } from "./storage-community-authority";
 import { readPublishedStorageCommunityDaily } from "./storage-community-daily";
 import { projectPublicAllowanceGraph } from "./public-allowance-breakdowns";
@@ -3617,12 +3617,18 @@ async function handleCommunityDaily(
   // Checked here rather than trusted from the reader, on the same principle as
   // the spend block above: the gate that decides what the public sees lives at
   // the boundary it is published across.
-  const curve = read.cacheRetention ?? null;
-  const cacheRetention = curve !== null
-    && curve.schemaVersion === CACHE_RETENTION_PUBLIC_SCHEMA_VERSION
-    && curve.methodVersion === CACHE_RETENTION_METHOD.version
-    && curve.bands.length === CACHE_RETENTION_BAND_IDS.length
-    ? curve : null;
+  const series = read.cacheRetention ?? null;
+  const cacheRetention = series !== null
+    && series.schemaVersion === CACHE_RETENTION_PUBLIC_SCHEMA_VERSION
+    && series.methodVersion === CACHE_RETENTION_METHOD.version
+    && series.windows.length === CACHE_RETENTION_WINDOWS.length
+    // Every window, and every model inside it, carries the whole band
+    // vocabulary. A short curve anywhere would render as a different shape
+    // from the one measured, so the whole series is withheld rather than
+    // served partly right.
+    && series.windows.every((window) => window.bands.length === CACHE_RETENTION_BAND_IDS.length
+      && window.byModel.every((model) => model.bands.length === CACHE_RETENTION_BAND_IDS.length))
+    ? series : null;
   return jsonResponse(
     {
       schemaVersion: "community-daily-read-v1.0",

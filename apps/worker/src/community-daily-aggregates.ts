@@ -14,7 +14,7 @@ import { advanceCommunityPublication, readCapturedCommunityPublication,community
   type CapturedCommunityPublication } from "./community-publication";
 import { COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL, PREVIEW_CACHE_JSON_LIMIT_BYTES } from "./admin-community-allowance";
 import type { PublicAllowanceBreakdownsCacheRow } from "./public-allowance-breakdowns";
-import type { PublicCacheRetentionCurve } from "./cache-retention-values";
+import type { PublicCacheRetentionSeries } from "./cache-retention-values";
 import { sha256Hex } from "./crypto";
 import {
   DAILY_SPEND_CHUNKS_PER_PASS,
@@ -878,7 +878,7 @@ export interface PublishedCommunityDailyRead {
    * nothing or its read failed. Community-wide rather than per-day, so it
    * travels beside the rows exactly as the allowance breakdowns do, and its
    * absence never withholds a day that was published. */
-  cacheRetention?: PublicCacheRetentionCurve | null;
+  cacheRetention?: PublicCacheRetentionSeries | null;
 }
 
 interface PublishedCommunityDailyQueryRow {

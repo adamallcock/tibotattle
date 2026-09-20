@@ -16,6 +16,13 @@ import {
   type CacheRetentionItem,
   type CacheRetentionRecordedRefusal,
   type CacheRetentionBandRow,
+  CACHE_RETENTION_METRIC_ID,
+  CACHE_RETENTION_PUBLIC_SCHEMA_VERSION,
+  CACHE_RETENTION_WINDOWS,
+  mergeCacheRetentionBands,
+  publicCacheRetentionWindow,
+  type PublicCacheRetentionSeries,
+  type PublicCacheRetentionWindow,
 } from "./cache-retention-values";
 import { parseStoredRecordJson } from "./stored-record";
 import { loadV11SourcePin } from "./telemetry-v11-domain";
@@ -919,22 +926,33 @@ export async function advanceCacheRetentionDayLane(options: {
  */
 export async function readCacheRetentionCommunityBands(input: {
   target: D1Database; sourceId: string; methodVersion?: string;
+  /** Inclusive lower day bound. Absent means every retained day. */
+  fromDay?: string;
+  /** Group by the values row's model as well as the owner. Effort is summed
+   * over: a reader choosing a model is not choosing a reasoning effort. */
+  byModel?: boolean;
 }): Promise<readonly CacheRetentionBandRow[]> {
   const method = input.methodVersion ?? CACHE_RETENTION_METHOD.version;
   if (typeof input.sourceId !== "string" || input.sourceId.length === 0
     || typeof method !== "string" || method.length === 0) throw fail();
-  const rows = (await input.target.prepare(`SELECT owner_digest,band,
-      SUM(adjacencies) adjacencies, SUM(reused_more_than_half) reused_more_than_half,
-      SUM(matched_or_exceeded) matched_or_exceeded, SUM(unordered_ties) unordered_ties,
-      SUM(excluded_insufficient_evidence) excluded_insufficient_evidence,
-      SUM(excluded_context_contracted) excluded_context_contracted, SUM(sessions) sessions
-    FROM analytics_cache_retention_day_bands
-    WHERE source_id=? AND method_version=?
-    GROUP BY owner_digest,band ORDER BY owner_digest,band`)
-    .bind(input.sourceId, method)
+  if (input.fromDay !== undefined && !validCacheRetentionDayLabel(input.fromDay)) throw fail();
+  const model = input.byModel === true;
+  // The model lives on the values row, so grouping by it costs a join. The
+  // bound stays the same either way: at most one row per owner, model and
+  // band, so the result cannot grow with the corpus.
+  const rows = (await input.target.prepare(`SELECT b.owner_digest,b.band,${model ? "v.model model," : ""}
+      SUM(b.adjacencies) adjacencies, SUM(b.reused_more_than_half) reused_more_than_half,
+      SUM(b.matched_or_exceeded) matched_or_exceeded, SUM(b.unordered_ties) unordered_ties,
+      SUM(b.excluded_insufficient_evidence) excluded_insufficient_evidence,
+      SUM(b.excluded_context_contracted) excluded_context_contracted, SUM(b.sessions) sessions
+    FROM analytics_cache_retention_day_bands b${model
+      ? " JOIN analytics_cache_retention_day_values v ON v.value_key=b.value_key" : ""}
+    WHERE b.source_id=? AND b.method_version=?${input.fromDay === undefined ? "" : " AND b.day>=?"}
+    GROUP BY b.owner_digest,b.band${model ? ",v.model" : ""} ORDER BY b.owner_digest,b.band`)
+    .bind(...[input.sourceId, method, ...(input.fromDay === undefined ? [] : [input.fromDay])])
     .all<{ owner_digest: string; band: string; adjacencies: number; reused_more_than_half: number;
       matched_or_exceeded: number; unordered_ties: number; excluded_insufficient_evidence: number;
-      excluded_context_contracted: number; sessions: number }>()).results;
+      excluded_context_contracted: number; sessions: number; model?: string }>()).results;
   return rows.map((row) => {
     if (!CACHE_RETENTION_BAND_IDS.includes(row.band as CacheRetentionBandId)) throw fail();
     return {
@@ -943,6 +961,51 @@ export async function readCacheRetentionCommunityBands(input: {
       matchedOrExceeded: row.matched_or_exceeded, unorderedTies: row.unordered_ties,
       excludedInsufficientEvidence: row.excluded_insufficient_evidence,
       excludedContextContracted: row.excluded_context_contracted, sessions: row.sessions,
+      ...(model ? { model: row.model as string } : {}),
     };
   });
+}
+
+/**
+ * The whole published series: every window, pooled and cut by model.
+ *
+ * Two reads per window — one pooled, one grouped by model — because the
+ * per-model read cannot produce the pooled `sessions` figure. `sessions` is a
+ * DISTINCT count per stored row, so summing it across models would count a
+ * session that used two models twice. The pooled read sums the same rows
+ * without the model split and is the one that answers "how many sessions".
+ *
+ * Eight statements for four windows, bounded and independent of corpus size.
+ */
+export async function readCacheRetentionCommunitySeries(input: {
+  target: D1Database; sourceId: string; nowMs: number; methodVersion?: string;
+}): Promise<PublicCacheRetentionSeries | null> {
+  const method = input.methodVersion ?? CACHE_RETENTION_METHOD.version;
+  if (!Number.isSafeInteger(input.nowMs)) throw fail();
+  const windows: PublicCacheRetentionWindow[] = [];
+  let anyEvidence = false;
+  for (const span of CACHE_RETENTION_WINDOWS) {
+    // The window is calendar days ending today inclusive, so a one-day window
+    // is today itself rather than the last 24 hours. That matches how the
+    // stored rows are cut; a rolling hour boundary would silently include or
+    // exclude part of a day depending on when the page was read.
+    const fromDay = span.days === null ? undefined
+      : new Date(input.nowMs - (span.days - 1) * 86_400_000).toISOString().slice(0, 10);
+    const pooled = await readCacheRetentionCommunityBands({ target: input.target,
+      sourceId: input.sourceId, methodVersion: method, ...(fromDay === undefined ? {} : { fromDay }) });
+    const modelRows = await readCacheRetentionCommunityBands({ target: input.target,
+      sourceId: input.sourceId, methodVersion: method, byModel: true,
+      ...(fromDay === undefined ? {} : { fromDay }) });
+    if (pooled.length > 0) anyEvidence = true;
+    windows.push(publicCacheRetentionWindow({ window: span.id, days: span.days,
+      pooled: mergeCacheRetentionBands(pooled), modelRows }));
+  }
+  // No evidence in ANY window is absence, not a series of empty curves.
+  if (!anyEvidence) return null;
+  return {
+    schemaVersion: CACHE_RETENTION_PUBLIC_SCHEMA_VERSION,
+    metric: CACHE_RETENTION_METRIC_ID, methodVersion: method,
+    measures: "consecutive_requests", gapBasis: "response_end_to_response_end",
+    windows,
+  };
 }

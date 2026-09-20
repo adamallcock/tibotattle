@@ -714,8 +714,16 @@ describe('independent public daily publication',()=>{
     await seed(ownerB,100);
 
     const body=await (await api()).json<{cacheRetention:{schemaVersion:string;methodVersion:string;
-      measures:string;gapBasis:string;bands:Array<Record<string,unknown>>}}>();
-    const curve=body.cacheRetention;
+      measures:string;gapBasis:string;windows:Array<{window:string;days:number|null;
+        modelsTruncated:boolean;bands:Array<Record<string,unknown>>;
+        byModel:Array<{model:string;bands:Array<Record<string,unknown>>}>}>}}>();
+    const series=body.cacheRetention;
+    // Every window the local dashboard offers, so a reader comparing the two
+    // is comparing the same spans rather than two different "recent".
+    expect(series.windows.map(window=>window.window)).toEqual(['day','week','month','all']);
+    expect(series.windows.map(window=>window.days)).toEqual([1,7,30,null]);
+    const all=series.windows.find(window=>window.window==='all')!;
+    const curve={...series,bands:all.bands};
     expect(curve.schemaVersion).toBe(CACHE_RETENTION_PUBLIC_SCHEMA_VERSION);
     expect(curve.methodVersion).toBe(CACHE_RETENTION_METHOD.version);
     // The payload states what it measures, so a reader holding only the JSON
@@ -724,9 +732,9 @@ describe('independent public daily publication',()=>{
     expect(curve.gapBasis).toBe('response_end_to_response_end');
     // Every band, in the method's order, including the ones with no evidence:
     // a curve that dropped its empty bands would read as a shorter curve.
-    expect(curve.bands.map(band=>band.band)).toEqual([...CACHE_RETENTION_BAND_IDS]);
+    expect(all.bands.map(band=>band.band)).toEqual([...CACHE_RETENTION_BAND_IDS]);
 
-    const tenToThirty=curve.bands.find(band=>band.band==='ten_to_thirty_minutes')!;
+    const tenToThirty=all.bands.find(band=>band.band==='ten_to_thirty_minutes')!;
     expect(tenToThirty.adjacencies).toBe(2);
     // The published counts are the rate's own numerator and denominator, so a
     // reader can check the figure instead of trusting it.
@@ -739,11 +747,21 @@ describe('independent public daily publication',()=>{
 
     // A band with no adjacency publishes NULL, never zero: no reuse and no
     // evidence are different claims and only one of them is being made.
-    const empty=curve.bands.find(band=>band.band==='over_twenty_four_hours')!;
+    const empty=all.bands.find(band=>band.band==='over_twenty_four_hours')!;
     expect(empty.adjacencies).toBe(0);
     expect(empty.reusedMoreThanHalfRate).toBe(null);
     expect(empty.matchedOrExceededRate).toBe(null);
     expect(empty.contributors).toBe(0);
+
+    // The per-model cut is the same rows regrouped, never a second
+    // measurement: one model here, so its bands must equal the pooled ones.
+    expect(all.byModel.map(model=>model.model)).toEqual(['gpt-5.6-sol']);
+    expect(all.byModel[0]!.bands).toEqual(all.bands);
+    expect(all.modelsTruncated).toBe(false);
+    // A one-day window cannot see days outside it. The fixture writes today,
+    // so the day window carries the same evidence and the month window agrees.
+    const day=series.windows.find(window=>window.window==='day')!;
+    expect(day.bands.find(band=>band.band==='ten_to_thirty_minutes')!.adjacencies).toBe(2);
 
     // Pseudonymity: the merge folds over owner digests and must publish none.
     const serialized=JSON.stringify(body);
