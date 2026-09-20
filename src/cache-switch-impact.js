@@ -22,12 +22,12 @@ import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 
 export const CACHE_SWITCH_PROXIMITY_MS = 5 * 60_000;
 export const CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO = 0.5;
-export const MAX_CACHE_SWITCH_RECENT_DETAILS = 20;
+export const MAX_CACHE_SWITCH_RECENT_DETAILS = 250;
 // Elapsed time is evidence, not an eligibility gate. A same-configuration
 // cache collapse can be observed on the very next user turn; gap bands let the
 // product show how the pattern changes with age without asserting a cache TTL.
 export const CACHE_CONTINUITY_MINIMUM_GAP_MS = 0;
-export const MAX_CACHE_CONTINUITY_RECENT_DETAILS = 20;
+export const MAX_CACHE_CONTINUITY_RECENT_DETAILS = 250;
 export const MAX_CACHE_CONTINUITY_MODELS = 128;
 const CONTINUITY_MODELS = new Set(REVIEWED_CODEX_MODEL_IDS);
 export const CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_MS =

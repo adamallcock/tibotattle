@@ -73,6 +73,7 @@ export async function readCodexSelectedRolloutNames(codexHome) {
 }
 
 const MAX_LOCAL_THREAD_LOOKUPS = 160;
+const MAX_CACHE_DROP_THREAD_LOOKUPS = 2_000;
 const MAX_SESSION_INDEX_BYTES = 32 * 1024 * 1024;
 const MAX_SESSION_INDEX_LINE_BYTES = 64 * 1024;
 const MAX_SESSION_INDEX_LINES = 200_000;
@@ -384,11 +385,21 @@ async function readSelectedSessionIndexNames(codexHome, selectedIds) {
  * Codex titles. No transcript/body is read; display text and ancestry must
  * never enter accounting caches, derived indexes, or exports. Name search may
  * explicitly request up to 25,000 selected IDs in one bounded, transient pass;
+ * cache-drop navigation may request the closed 2,000-reference envelope, and
  * ordinary row display remains capped at 160 IDs.
  */
-export async function readCodexLocalThreadMetadata(codexHome, threadIds, { allowTitleFallback = false, forNameSearch = false } = {}) {
+export async function readCodexLocalThreadMetadata(codexHome, threadIds, {
+  allowTitleFallback = false,
+  forNameSearch = false,
+  forCacheDropLinks = false,
+} = {}) {
+  const maximumLookups = forNameSearch === true
+    ? 25_000
+    : forCacheDropLinks === true
+      ? MAX_CACHE_DROP_THREAD_LOOKUPS
+      : MAX_LOCAL_THREAD_LOOKUPS;
   if (!Array.isArray(threadIds) || threadIds.length === 0
-      || threadIds.length > (forNameSearch === true ? 25_000 : MAX_LOCAL_THREAD_LOOKUPS)
+      || threadIds.length > maximumLookups
       || !await ownerControlledCodexHome(codexHome)) return new Map();
   const ids = [...new Set(threadIds.map(threadId))];
   if (ids.includes(null)) return new Map();

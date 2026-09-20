@@ -13,8 +13,8 @@ import {
 import { readCodexLocalThreadMetadata } from "./platform/index.js";
 
 export const LOCAL_CACHE_DROP_THREAD_LINKS_SCHEMA = "local-cache-drop-thread-links-v1";
-const MAX_REFERENCES = 160;
-const MAX_RECENT_ROWS = 20;
+const MAX_REFERENCES = 2_000;
+const MAX_RECENT_ROWS = 250;
 const MAX_CANDIDATES_PER_REFERENCE = 8;
 const MAX_SESSION_ROWS = 25_000;
 const MAX_TOTAL_SESSION_ROWS = 100_000;
@@ -337,7 +337,11 @@ export async function buildLocalCacheDropThreadLinks({
   if (matches === null) return unavailable();
   let metadata = null;
   try {
-    metadata = await readThreadMetadata(codexHome, [...new Set(matches.map((row) => row.id))]);
+    metadata = await readThreadMetadata(
+      codexHome,
+      [...new Set(matches.map((row) => row.id))],
+      { forCacheDropLinks: true },
+    );
   } catch {
     // Thread names are optional; exact local IDs remain useful when the Codex
     // display-name store is unavailable. No error text enters the response.

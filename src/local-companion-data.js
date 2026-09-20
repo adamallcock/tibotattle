@@ -1375,7 +1375,7 @@ function cacheSwitchImpactProjection(
       proximityCeilingSeconds: impact?.proximityCeilingSeconds ?? 300,
       maximumRetainedCacheRatio:
         impact?.maximumRetainedCacheRatio ?? 0.5,
-      recentDetailLimit: impact?.recentDetailLimit ?? 20,
+      recentDetailLimit: impact?.recentDetailLimit ?? 250,
       allowanceImpact: unavailableCacheSwitchAllowance(
         "cache_switch_impact_unavailable",
       ),
@@ -1509,7 +1509,7 @@ function cacheContinuityImpactProjection(
     maximumRetainedCacheRatio: impact?.maximumRetainedCacheRatio ?? 0.5,
     outcomeDisplayMaximumGapSeconds:
       impact?.outcomeDisplayMaximumGapSeconds ?? 7 * 24 * 60 * 60,
-    recentDetailLimit: impact?.recentDetailLimit ?? 20,
+    recentDetailLimit: impact?.recentDetailLimit ?? 250,
   };
   if (impact?.status !== "available" || !Array.isArray(impact.periods)) {
     return {
