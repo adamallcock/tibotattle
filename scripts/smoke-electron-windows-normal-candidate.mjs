@@ -74,49 +74,82 @@ const FIRST_RUN_ACKNOWLEDGEMENT = validateDesktopFirstRunReceipt({
   schemaVersion: DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
   acknowledged: true,
 });
-const SYNTHETIC_CODEX_SESSION_FILE =
-  "rollout-2026-09-08T00-00-00-70000000-0000-4000-8000-000000000001.jsonl";
 const SYNTHETIC_CODEX_SESSION_ID = "70000000-0000-4000-8000-000000000001";
-// This fixed source contains no user content, account identity, or real usage.
-// Its filename and event shape are the smallest accepted by both Codex rollout
-// discovery and the unified local-index refresh path.
-const SYNTHETIC_CODEX_SESSION = `${[
-  {
-    timestamp: "2026-09-08T00:00:00.000Z",
-    type: "session_meta",
-    payload: { id: SYNTHETIC_CODEX_SESSION_ID },
-  },
-  {
-    timestamp: "2026-09-08T00:00:01.000Z",
-    type: "turn_context",
-    payload: { model: "gpt-5.6-sol" },
-  },
-  {
-    timestamp: "2026-09-08T00:01:00.000Z",
-    type: "event_msg",
-    payload: {
-      type: "token_count",
-      info: {
-        total_token_usage: {
-          input_tokens: 100,
-          cached_input_tokens: 40,
-          cache_write_input_tokens: 0,
-          output_tokens: 20,
-          reasoning_output_tokens: 8,
-          total_tokens: 120,
-        },
-        last_token_usage: {
-          input_tokens: 100,
-          cached_input_tokens: 40,
-          cache_write_input_tokens: 0,
-          output_tokens: 20,
-          reasoning_output_tokens: 8,
-          total_tokens: 120,
+// The ingestion proof reads the rolling seven-day accounting period, so a
+// source pinned to a fixed calendar date silently leaves the window this smoke
+// was written to observe. Anchor the fixture two days before the run instead:
+// always in the past on any runner clock, and still five days clear of the
+// window edge when a candidate journey runs long.
+const SYNTHETIC_CODEX_SESSION_AGE_MS = 2 * 24 * 60 * 60 * 1_000;
+const SYNTHETIC_CODEX_TURN_CONTEXT_OFFSET_MS = 1_000;
+const SYNTHETIC_CODEX_TOKEN_COUNT_OFFSET_MS = 60_000;
+
+/** Codex names a canonical rollout after its session start, to whole seconds. */
+function syntheticCodexRolloutName(startedAtMs) {
+  const stamp = new Date(startedAtMs).toISOString().slice(0, 19).replaceAll(":", "-");
+  return `rollout-${stamp}-${SYNTHETIC_CODEX_SESSION_ID}.jsonl`;
+}
+
+/**
+ * Build the one content-free source the candidate must ingest. It carries no
+ * user content, account identity, or real usage. Its filename and event shape
+ * are the smallest accepted by both Codex rollout discovery and the unified
+ * local-index refresh path, and its timestamps are derived from the run clock
+ * so the single event always falls inside the seven-day accounting period the
+ * ingestion proof reads back.
+ */
+export function buildWindowsNormalCandidateCodexFixture(nowMs = Date.now()) {
+  if (!Number.isSafeInteger(nowMs) || nowMs <= SYNTHETIC_CODEX_SESSION_AGE_MS) {
+    fail("SYNTHETIC_FIXTURE_UNAVAILABLE");
+  }
+  const startedAtMs = Math.floor(
+    (nowMs - SYNTHETIC_CODEX_SESSION_AGE_MS) / 1_000,
+  ) * 1_000;
+  const at = (offsetMs) => new Date(startedAtMs + offsetMs).toISOString();
+  const content = `${[
+    {
+      timestamp: at(0),
+      type: "session_meta",
+      payload: { id: SYNTHETIC_CODEX_SESSION_ID },
+    },
+    {
+      timestamp: at(SYNTHETIC_CODEX_TURN_CONTEXT_OFFSET_MS),
+      type: "turn_context",
+      payload: { model: "gpt-5.6-sol" },
+    },
+    {
+      timestamp: at(SYNTHETIC_CODEX_TOKEN_COUNT_OFFSET_MS),
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            input_tokens: 100,
+            cached_input_tokens: 40,
+            cache_write_input_tokens: 0,
+            output_tokens: 20,
+            reasoning_output_tokens: 8,
+            total_tokens: 120,
+          },
+          last_token_usage: {
+            input_tokens: 100,
+            cached_input_tokens: 40,
+            cache_write_input_tokens: 0,
+            output_tokens: 20,
+            reasoning_output_tokens: 8,
+            total_tokens: 120,
+          },
         },
       },
     },
-  },
-].map((record) => JSON.stringify(record)).join("\n")}\n`;
+  ].map((record) => JSON.stringify(record)).join("\n")}\n`;
+  return Object.freeze({
+    content,
+    fileName: syntheticCodexRolloutName(startedAtMs),
+    sessionId: SYNTHETIC_CODEX_SESSION_ID,
+    startedAtMs,
+  });
+}
 // The closed fixture is intentionally small enough to make its ingestion
 // contract auditable without retaining source rows or account data in a CI
 // receipt. These values are asserted from the app's existing loopback API.
@@ -853,30 +886,33 @@ export async function seedWindowsNormalCandidateCodexFixture({ profile } = {}, {
   createDirectory = mkdir,
   metadata = lstat,
   writeFixture = writeFile,
+  now = Date.now,
 } = {}) {
   const home = exactWindowsPath(profile?.home);
   if (home === null || typeof createDirectory !== "function"
-      || typeof metadata !== "function" || typeof writeFixture !== "function") {
+      || typeof metadata !== "function" || typeof writeFixture !== "function"
+      || typeof now !== "function") {
     fail("PROFILE_INVALID");
   }
+  const source = buildWindowsNormalCandidateCodexFixture(now());
   // The normal app's default-root settings select HOME/.codex before spawning
   // its companion. Seed that actual root, not the development override.
   const codexHome = win32.join(home, ".codex");
   const sessions = win32.join(codexHome, "sessions");
-  const fixture = win32.join(sessions, SYNTHETIC_CODEX_SESSION_FILE);
+  const fixture = win32.join(sessions, source.fileName);
   try {
     await createDirectory(sessions, { recursive: true, mode: 0o700 });
     const directory = await metadata(sessions);
     if (!directory?.isDirectory?.() || directory.isSymbolicLink?.()) {
       fail("SYNTHETIC_FIXTURE_UNAVAILABLE");
     }
-    await writeFixture(fixture, SYNTHETIC_CODEX_SESSION, {
+    await writeFixture(fixture, source.content, {
       mode: 0o600,
       flag: "wx",
     });
     const file = await metadata(fixture);
     if (!file?.isFile?.() || file.isSymbolicLink?.() || file.nlink !== 1
-        || file.size !== Buffer.byteLength(SYNTHETIC_CODEX_SESSION)) {
+        || file.size !== Buffer.byteLength(source.content)) {
       fail("SYNTHETIC_FIXTURE_UNAVAILABLE");
     }
   } catch (error) {

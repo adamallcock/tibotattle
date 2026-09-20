@@ -9576,10 +9576,12 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
 
 macOSArtifactTest("preview distribution builds use an isolated identity and reject production validation", {
   skip: BUILD_SUPPORTED ? false : "requires pinned macOS arm64 Node v26.2.0 builder",
-  // This performs two complete preview builds plus DMG packaging. A warm
-  // arm64 development host can legitimately approach two minutes, so retain
-  // enough margin for CI load without weakening any build assertion.
-  timeout: 240_000,
+  // This performs two complete preview builds plus DMG packaging. Measured on
+  // the pinned builder (macOS arm64, Node v26.2.0): 227s warm and 260s cold,
+  // so the former two-minute estimate under-sized the budget and the gate
+  // cancelled itself on an ordinary cold run. This is a hang guard, not a
+  // performance budget; every build assertion below is unchanged.
+  timeout: 420_000,
 }, async (context) => {
   const preparedFramework = join(
     REPOSITORY_ROOT,
