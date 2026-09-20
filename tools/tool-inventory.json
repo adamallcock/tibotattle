@@ -128,7 +128,35 @@
         "scripts/publish-electron-stable-feed.mjs",
         "test/electron-stable-writer.test.js",
         "scripts/lib/electron-public-site.mjs",
-        "test/electron-public-site.test.js"
+        "test/electron-public-site.test.js",
+        "apps/worker/scripts/d1-storage-migration-continuation.check.mjs",
+        "apps/worker/scripts/d1-storage-migration-continuation.mjs",
+        "apps/worker/scripts/d1-storage-migration-package.mjs",
+        "apps/worker/scripts/d1-storage-migration-placed.check.mjs",
+        "apps/worker/scripts/d1-storage-migration-worker.check.mjs",
+        "apps/worker/scripts/d1-storage-operator.check.mjs",
+        "apps/worker/scripts/d1-storage-operator.mjs",
+        "apps/worker/scripts/d1-storage-plan.mjs",
+        "apps/worker/scripts/d1-storage-qualify-role.mjs",
+        "apps/worker/scripts/d1-storage-restore.check.mjs",
+        "apps/worker/scripts/d1-storage-restore.mjs",
+        "apps/worker/scripts/d1-storage-role.mjs",
+        "apps/worker/scripts/d1-storage-staging-preparation.mjs",
+        "apps/worker/scripts/d1-storage-wrangler.check.mjs",
+        "apps/worker/scripts/production-maintenance-analytics-provider.mjs",
+        "apps/worker/scripts/production-maintenance-analytics-registration.mjs",
+        "apps/worker/scripts/production-maintenance-cutover-proof.check.mjs",
+        "apps/worker/scripts/production-maintenance-cutover-proof.mjs",
+        "apps/worker/scripts/production-maintenance-cutover-provider.mjs",
+        "apps/worker/scripts/production-maintenance-cutover.check.mjs",
+        "apps/worker/scripts/production-maintenance-cutover.mjs",
+        "apps/worker/scripts/production-maintenance-provider.check.mjs",
+        "apps/worker/scripts/production-maintenance-provider.mjs",
+        "apps/worker/scripts/production-maintenance-source-recovery.check.mjs",
+        "apps/worker/scripts/production-maintenance-source-recovery.mjs",
+        "apps/worker/scripts/production-maintenance-transport.mjs",
+        "apps/worker/scripts/production-maintenance.check.mjs",
+        "apps/worker/scripts/production-maintenance.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/runbooks/agent-release-operations.md",
@@ -589,7 +617,9 @@
         "apps/web/test/i18n-browser-parity.test.mjs",
         "package.json#scripts.i18n:browser:check",
         "package.json#scripts.i18n:browser:generate",
-        "scripts/export-tibotattle.mjs"
+        "scripts/export-tibotattle.mjs",
+        "scripts/web-release-lane.js",
+        "test/web-release-lane.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
@@ -647,7 +677,9 @@
         "scripts/build-macos-app.js",
         "scripts/build-public-release-site.js",
         "test/macos-app-bundle.test.js",
-        "test/public-release-site.test.js"
+        "test/public-release-site.test.js",
+        "scripts/web-release-lane.js",
+        "test/web-release-lane.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
@@ -1022,7 +1054,8 @@
         ".github/workflows/electron-macos-production-update.yml",
         ".github/workflows/electron-macos-sparkle-transition.yml",
         "test/electron-macos-qualification-identity.test.mjs",
-        "docs/runbooks/macos-stable-release-runbook.md"
+        "docs/runbooks/macos-stable-release-runbook.md",
+        "scripts/lib/macos-credential-qualification-intake.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/runbooks/macos-stable-release-runbook.md",
@@ -1051,7 +1084,8 @@
         "scripts/smoke-electron-macos-empty-profile.mjs",
         "scripts/smoke-electron-macos-production-update.mjs",
         "scripts/smoke-electron-macos-sparkle-transition.mjs",
-        "scripts/lib/electron-macos-qualification-identity.mjs"
+        "scripts/lib/electron-macos-qualification-identity.mjs",
+        "scripts/lib/macos-credential-qualification-intake.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/decisions/2026-08-27-local-state-schema-and-release-channel-isolation.md",
@@ -2642,7 +2676,9 @@
         "scripts/run-signed-electron-production-canary.mjs",
         "scripts/smoke-electron-macos-production-update.mjs",
         "scripts/smoke-electron-macos-replacement.mjs",
-        "scripts/smoke-electron-macos-sparkle-transition.mjs"
+        "scripts/smoke-electron-macos-sparkle-transition.mjs",
+        "scripts/smoke-electron-macos-credentials.mjs",
+        "test/smoke-electron-macos-credentials.test.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2877,7 +2913,8 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/electron-macos-production-update.yml",
-        "test/smoke-electron-macos-production-update.test.mjs"
+        "test/smoke-electron-macos-production-update.test.mjs",
+        "scripts/smoke-electron-macos-credentials.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": ".github/workflows/electron-macos-production-update.yml",
@@ -2914,7 +2951,8 @@
         "scripts/smoke-electron-macos-empty-profile.mjs",
         ".github/workflows/electron-macos-sparkle-transition.yml",
         "scripts/smoke-electron-macos-production-update.mjs",
-        "test/smoke-electron-macos-sparkle-transition.test.mjs"
+        "test/smoke-electron-macos-sparkle-transition.test.mjs",
+        "scripts/smoke-electron-macos-credentials.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": ".github/workflows/electron-macos-sparkle-transition.yml",
@@ -2950,7 +2988,9 @@
       "canonicalPath": "scripts/smoke-electron-macos-empty-profile.mjs",
       "callers": [
         ".github/workflows/electron-macos-empty-profile.yml",
-        "test/smoke-electron-macos-empty-profile.test.mjs"
+        "test/smoke-electron-macos-empty-profile.test.mjs",
+        "scripts/smoke-electron-macos-credentials.mjs",
+        "test/smoke-electron-macos-credentials.test.mjs"
       ]
     },
     {
