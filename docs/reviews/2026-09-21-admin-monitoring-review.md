@@ -15,8 +15,8 @@ Changes are local; this is not a deployment, uptime or release-readiness receipt
 The patch was then integrated onto current `main` (`8a340061`). Read-only
 production health reported source `0fb6a5e6`, verified as an ancestor of that base.
 The integration preserves typed v1/v1.1 counting, historical publication and
-graph-preview readiness, schema-v3 graph rebuild progress, and the system-health
-panel. Overview v0.5 explicitly identifies the storage mode rather than reusing
+graph-preview readiness, schema-v3 graph rebuild progress, and operational
+readiness. Overview v0.5 explicitly identifies the storage mode rather than reusing
 production’s typed-only v0.4 identifier. No production control was changed.
 
 ## Component coverage

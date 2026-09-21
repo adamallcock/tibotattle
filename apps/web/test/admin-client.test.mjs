@@ -870,6 +870,16 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
   assert.equal(Object.isFrozen(overview.collection), true);
 });
 
+test("expanded overview uses a new schema and requires an explicit recognized storage mode", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  for (const version of ["admin-overview-v0.3", "admin-overview-v0.4", "admin-overview-v0.6"]) {
+    assert.throws(() => projectAdminOverview({ ...payload, schemaVersion: version }), /ADMIN_OVERVIEW_INVALID/u);
+  }
+  for (const mode of [undefined, "unknown"]) {
+    assert.throws(() => projectAdminOverview({ ...payload, service: { ...payload.service, telemetryStorageMode: mode } }), /ADMIN_OVERVIEW_INVALID/u);
+  }
+});
+
 test("typed admin overview projects target publication evidence without a legacy queue zero", async () => {
   const payload = await fixture("admin-overview-valid.json");
   payload.schemaVersion = "admin-overview-v0.5";
@@ -892,6 +902,8 @@ test("typed admin overview projects target publication evidence without a legacy
 
   for (const mutate of [
     value => { value.pendingHistoricalRebuilds = 0; },
+    value => { value.pendingHistoricalRebuildsBounded = false; },
+    value => { value.historicalPublication = null; },
     value => { value.historicalPublication.previewState = "unknown"; },
     value => { value.service.telemetryStorageMode = "json"; },
   ]) {
