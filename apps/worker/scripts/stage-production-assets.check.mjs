@@ -65,7 +65,21 @@ async function fixture() {
     "social-preview.png": "reviewed social preview\n",
     "styles.css": "body { color: green; }\n",
     "tibotattle-icon.png": Buffer.from("reviewed public brand asset\n"),
-    "tibotattle-weekly-preview.jpg": "reviewed weekly preview\n",
+    "allowance-tank-renderer.js": "export const allowanceTankRenderer = true;\n",
+    "allowance-tanks.js": "export const allowanceTanks = true;\n",
+    "cache-reuse-matrix.css": ".cache-reuse-matrix { color: green; }\n",
+    "cache-reuse-matrix.js": "export const cacheReuseMatrix = true;\n",
+    "codex-color.svg": "<svg></svg>\n",
+    "feature-allowance.jpg": Buffer.from("reviewed feature poster\n"),
+    "feature-allowance.mp4": Buffer.from("reviewed feature recording\n"),
+    "feature-insights.js": "export const featureInsights = true;\n",
+    "feature-tour.css": ".feature-tour { color: green; }\n",
+    "feature-tour.js": "export const featureTour = true;\n",
+    "feature-value.jpg": Buffer.from("reviewed feature still\n"),
+    "feature-week.js": "export const featureWeek = true;\n",
+    "model-performance.css": ".performance-card { color: green; }\n",
+    "model-performance.js": "export const modelPerformance = true;\n",
+    "trends-horizon.js": "export const trendsHorizon = true;\n",
     "ui-format.js": "export const uiFormat = true;\n",
     "x.svg": "<svg></svg>\n",
   };
@@ -222,6 +236,13 @@ test("stages only verified generated public assets and maps the community entry 
     await readFile(join(value.destination, "tibotattle-icon.png")),
     value.generatedFiles["tibotattle-icon.png"],
   );
+  for (const media of ["feature-allowance.mp4", "feature-allowance.jpg", "feature-value.jpg"]) {
+    assert.deepEqual(
+      await readFile(join(value.destination, media)),
+      value.generatedFiles[media],
+      media,
+    );
+  }
   for (const publicRoute of [
     "404.html",
     "community.html",

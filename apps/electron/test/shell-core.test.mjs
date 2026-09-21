@@ -2690,6 +2690,7 @@ test("desktop lifecycle composes secure window, tray, single instance, retry, an
     candidate.options.webPreferences.preload === "/private/preload.cjs"
   ));
   const firstDashboard = dashboard();
+  assert.equal(firstDashboard.options.minWidth, 960);
   assert.equal(trays.length, 1);
   assert.equal(trays[0].menu.template.some((item) => item.label === "Retry"), false);
   assert.equal(firstDashboard.options.webPreferences.nodeIntegration, false);
@@ -5146,4 +5147,81 @@ test("preload marks both document roots as electron-dashboard across DOM readine
   assert.equal(document.body.classList.contains("electron-dashboard"), true);
   assert.equal(documentElement.classList.contains("native-dashboard"), false);
   assert.equal(document.body.classList.contains("native-dashboard"), false);
+});
+
+test("dashboard minimum width fits smaller display work areas", async () => {
+  const windows = [];
+  const lifecycle = createDesktopLifecycle({
+    app: new FakeApp(),
+    BrowserWindow: class extends FakeWindow {
+      constructor(options) { super(options); windows.push(this); }
+    },
+    Tray: FakeTray,
+    Menu: { buildFromTemplate: template => ({ template }) },
+    icon: "empty-icon", preloadPath: "/private/preload.cjs",
+    screen: { getPrimaryDisplay: () => ({ workAreaSize: { width: 800, height: 600 } }) },
+    supervisor: { async start() { return { origin: "http://127.0.0.1:4999" }; }, async stop() {} },
+  });
+  await lifecycle.start();
+  const dashboard = windows.find(window => window.options.webPreferences.preload === "/private/preload.cjs");
+  assert.equal(dashboard.options.minWidth, 800);
+  assert.equal(dashboard.options.width, 800);
+  await lifecycle.requestQuit();
+});
+
+
+test("companion supervisor confines prospective development account keys to explicit private macOS QA", async () => {
+  const pair = {
+    USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+    USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "/private/fixture/identity/export-identity",
+    USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/private/fixture/identity/account-observation-development",
+  };
+  for (const lane of [undefined, "windows-electron-smoke", "macos-electron-local-qa-v1"]) {
+    const child = new FakeChild();
+    let selected;
+    const supervisor = createCompanionSupervisor({
+      platform: "darwin",
+      environment: { ...pair, USAGE_MONITOR_TEST_LANE: lane },
+      spawnChild(_command, _args, { env }) { selected = env; return child; },
+    });
+    const ready = supervisor.start();
+    child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4545/\n"));
+    await ready;
+    assert.equal(selected.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE,
+      lane === "macos-electron-local-qa-v1" ? pair.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE : undefined);
+    const stopped = supervisor.stop();
+    child.emit("exit", 0, null);
+    await stopped;
+  }
+  for (const patch of [
+    { platform: "linux" },
+    { platform: "win32" },
+    { USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: undefined },
+    { USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: undefined },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "relative" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/private/fixture/identity/export-identity" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/private/other/identity/account-observation-development" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/private/fixture/identity/./account-observation-development" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/private/fixture/identity/../identity/account-observation-development" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/private/fixture/identity//account-observation-development" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/private/fixture/identity/account-observation-development/" },
+    { USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "/private/fixture/identity/./export-identity" },
+    { USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "/private/fixture/identity/../identity/export-identity" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "C:/private/fixture/identity/account-observation-development" },
+    { USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "C:/private/fixture/identity/export-identity" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "\\\\server\\share\\identity\\account-observation-development" },
+    { USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "\\\\server\\share\\identity\\export-identity" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "//server/share/identity/account-observation-development" },
+    { USAGE_MONITOR_ACCOUNTLESS_ORIGIN: "https://example.invalid" },
+    { USAGE_MONITOR_ACCOUNTLESS_MODE: "production-v1" },
+  ]) {
+    let spawned = false;
+    const supervisor = createCompanionSupervisor({
+      platform: patch.platform ?? "darwin",
+      environment: { ...pair, USAGE_MONITOR_TEST_LANE: "macos-electron-local-qa-v1", ...patch },
+      spawnChild() { spawned = true; return new FakeChild(); },
+    });
+    await assert.rejects(supervisor.start(), { code: "electron_shell_companion_spawn_failed" });
+    assert.equal(spawned, false);
+  }
 });

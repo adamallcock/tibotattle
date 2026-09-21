@@ -5,6 +5,7 @@ import Ajv from "ajv";
 import { APP_OFFICIAL_PRICE_CARDS } from "@app-usagemonitor/accounting";
 import {
   REVIEWED_MODEL_CATALOG, REVIEWED_CODEX_MODEL_IDS, TELEMETRY_MODEL_IDS,
+  REVIEWED_MODEL_CATALOG_VERSION, assertReviewedModelCatalogCompleteness,
   reviewedModelIdentity, codexRequestReasoningEffort, parseTelemetryContribution,
   codexCacheReasoningConfiguration,
 } from "@app-usagemonitor/telemetry-contract";
@@ -78,4 +79,49 @@ test("requested effort mapping is model-specific and does not assert cache or ef
   assert.equal(codexCacheReasoningConfiguration("gpt-6t", "ultra"), "ultra");
   assert.equal(codexCacheReasoningConfiguration("gpt-6-astra", "unreviewed"), null);
   assert.equal(browser.codexCacheReasoningConfiguration("gpt-6-astra", "ultra"), "ultra");
+});
+
+test("the exported vocabulary contract accepts the shipped catalog and refuses broken identities", () => {
+  const complete = assertReviewedModelCatalogCompleteness();
+  assert.equal(complete.version, REVIEWED_MODEL_CATALOG_VERSION);
+  assert.equal(complete.identityCount, REVIEWED_MODEL_CATALOG.length);
+  assert.deepEqual(complete.modelIds, REVIEWED_MODEL_CATALOG.map((entry) => entry.id));
+  assert.equal(Object.isFrozen(complete.identities), true);
+  // A label is site-visible copy, deliberately outside the compared vocabulary.
+  assert.equal(Object.hasOwn(complete.identities[0], "label"), false);
+  assert.deepEqual(complete.identities[0], {
+    id: REVIEWED_MODEL_CATALOG[0].id,
+    provider: REVIEWED_MODEL_CATALOG[0].provider,
+    allowanceTrack: REVIEWED_MODEL_CATALOG[0].allowanceTrack,
+    pricingStatus: REVIEWED_MODEL_CATALOG[0].pricingStatus,
+    priceModelId: REVIEWED_MODEL_CATALOG[0].priceModelId,
+  });
+
+  const entry = (overrides = {}) => Object.freeze({
+    id: "gpt-x", label: "GPT X", provider: "openai_codex",
+    allowanceTrack: "primary", pricingStatus: "published", priceModelId: "gpt-x",
+    ...overrides,
+  });
+  const refuses = (catalog, pattern) =>
+    assert.throws(() => assertReviewedModelCatalogCompleteness({ catalog }), pattern);
+  assert.doesNotThrow(() => assertReviewedModelCatalogCompleteness({ catalog: [entry()] }));
+  assert.doesNotThrow(() => assertReviewedModelCatalogCompleteness({
+    catalog: [entry(), entry({ id: "gpt-x-mini", priceModelId: "gpt-x" })],
+  }));
+  refuses([], /non-empty array/u);
+  refuses("not-a-catalog", /non-empty array/u);
+  refuses([null], /must be an object/u);
+  refuses([entry(), entry()], /is listed more than once/u);
+  refuses([entry({ id: "GPT-X" })], /bounded lowercase identity/u);
+  refuses([entry({ id: `gpt-${"x".repeat(90)}` })], /bounded lowercase identity/u);
+  refuses([entry({ label: "" })], /bounded single-line label/u);
+  refuses([entry({ label: "  padded  " })], /bounded single-line label/u);
+  refuses([entry({ label: "line\nbreak" })], /bounded single-line label/u);
+  refuses([entry({ provider: "openai" })], /unreviewed provider/u);
+  refuses([entry({ allowanceTrack: "bonus" })], /unreviewed allowance track/u);
+  refuses([entry({ pricingStatus: "free" })], /unreviewed pricing status/u);
+  refuses([entry({ pricingStatus: "unpriced" })], /pricing status with a price identity/u);
+  refuses([entry({ priceModelId: "gpt-absent" })], /prices against an unreviewed/u);
+  refuses([{ ...entry() }], /is not frozen/u);
+  refuses([Object.freeze({ ...entry(), extra: 1 })], /does not carry exactly/u);
 });

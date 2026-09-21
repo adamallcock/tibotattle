@@ -40,7 +40,7 @@ import {
 const DEFAULT_WINDOW_OPTIONS = Object.freeze({
   width: 1_180,
   height: 820,
-  minWidth: 720,
+  minWidth: 960,
   minHeight: 520,
 });
 
@@ -989,6 +989,15 @@ export function createDesktopLifecycle({
       },
       show: false,
     };
+    // Keep the dashboard readable without forcing it beyond a small display.
+    const display = screen?.getDisplayNearestPoint && screen?.getCursorScreenPoint
+      ? screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
+      : screen?.getPrimaryDisplay?.();
+    const availableWidth = display?.workAreaSize?.width ?? display?.workArea?.width;
+    if (Number.isFinite(availableWidth) && availableWidth > 0) {
+      selectedOptions.minWidth = Math.min(selectedOptions.minWidth, availableWidth);
+      selectedOptions.width = Math.min(selectedOptions.width, availableWidth);
+    }
     window = new BrowserWindow(selectedOptions);
     dashboardReady = false;
     const webContents = window.webContents;

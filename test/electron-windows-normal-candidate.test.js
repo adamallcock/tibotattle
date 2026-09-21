@@ -28,6 +28,7 @@ import {
   prepareWindowsDevelopmentProfile,
 } from "../scripts/launch-electron-windows-development.mjs";
 import {
+  buildWindowsNormalCandidateCodexFixture,
   buildWindowsNormalCandidateFirewallCreateArguments,
   buildWindowsNormalCandidateFirewallRemoveArguments,
   buildWindowsNormalCandidateStartupNativeProbeArguments,
@@ -1111,6 +1112,12 @@ const NORMAL_CANDIDATE_PROFILE = Object.freeze({
   userData: String.raw`C:\tibotattle-normal-candidate-test-${randomUUID()}\user-data`,
 });
 
+// Pinning the clock keeps the source byte-exact under assertion while the
+// smoke itself derives the fixture from the run clock. This instant is two
+// days after the date the fixture was originally written to, so the exact
+// bytes asserted below are the ones that shipped.
+const NORMAL_CANDIDATE_FIXTURE_CLOCK_MS = Date.parse("2026-09-10T00:00:00.000Z");
+
 test("normal candidate adds one content-free Codex source before launch", async () => {
   const profile = Object.freeze({
     codex: String.raw`C:\runner\owned\profile\codex`,
@@ -1119,6 +1126,7 @@ test("normal candidate adds one content-free Codex source before launch", async 
   const calls = [];
   let fixtureContent = null;
   const fixture = await seedWindowsNormalCandidateCodexFixture({ profile }, {
+    now: () => NORMAL_CANDIDATE_FIXTURE_CLOCK_MS,
     createDirectory: async (path, options) => {
       calls.push({ kind: "directory", path, options });
     },
@@ -1163,10 +1171,41 @@ test("normal candidate adds one content-free Codex source before launch", async 
     },
   ]);
   await assert.rejects(seedWindowsNormalCandidateCodexFixture({ profile }, {
+    now: () => NORMAL_CANDIDATE_FIXTURE_CLOCK_MS,
     createDirectory: async () => {},
     metadata: async () => ({ isDirectory: () => false, isSymbolicLink: () => false }),
     writeFixture: async () => {},
   }), {
+    code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_SYNTHETIC_FIXTURE_UNAVAILABLE",
+  });
+});
+
+// The ingestion proof reads the rolling seven-day accounting period, so the
+// fixture must keep landing inside that window on whatever day the smoke runs.
+// A fixed calendar date silently stopped satisfying this once it aged out.
+test("normal candidate fixture stays inside the rolling seven-day window", () => {
+  const sevenDaysMs = 7 * 24 * 60 * 60 * 1_000;
+  for (const nowMs of [
+    Date.now(),
+    Date.parse("2026-09-10T00:00:00.000Z"),
+    Date.parse("2027-03-01T23:59:59.999Z"),
+  ]) {
+    const source = buildWindowsNormalCandidateCodexFixture(nowMs);
+    const records = source.content.trim().split("\n").map((line) => JSON.parse(line));
+    const stamps = records.map((record) => Date.parse(record.timestamp));
+    assert.equal(stamps.every(Number.isSafeInteger), true);
+    for (const stamp of stamps) {
+      assert.ok(stamp < nowMs, "fixture events must already have happened");
+      assert.ok(stamp > nowMs - sevenDaysMs, "fixture events must stay inside 7d");
+    }
+    // Codex names a canonical rollout after its session start.
+    assert.equal(
+      source.fileName,
+      `rollout-${new Date(stamps[0]).toISOString().slice(0, 19).replaceAll(":", "-")}-${source.sessionId}.jsonl`,
+    );
+    assert.equal(source.startedAtMs, stamps[0]);
+  }
+  assert.throws(() => buildWindowsNormalCandidateCodexFixture(Number.NaN), {
     code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_SYNTHETIC_FIXTURE_UNAVAILABLE",
   });
 });

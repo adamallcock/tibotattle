@@ -83,6 +83,7 @@ const VALID_COMMANDS = new Set([
   "macos-artifact",
   "public-site",
   "worker",
+  "i18n",
 ]);
 
 // These paths belong only to the hosted/public build boundary. Shared browser
@@ -196,7 +197,10 @@ function classifyKnownPath(path, lanes) {
     return true;
   }
   if (path.startsWith("packages/i18n/")
-      || path === "scripts/generate-i18n-browser-mirror.js") {
+      || path === "scripts/generate-i18n-browser-mirror.js"
+      || path === "scripts/generate-i18n-electron-copy.js"
+      || path === "apps/electron/desktop-copy-source.js"
+      || path === "apps/electron/desktop-copy.js") {
     lanes.add("i18n");
     return true;
   }
@@ -442,7 +446,14 @@ async function runLane(lane) {
     return;
   }
   if (lane === "i18n") {
-    await runNodeTests(["--test-concurrency=1", "test/i18n-foundation.test.js"]);
+    await runCommand(NPM_COMMAND, ["run", "i18n:browser:check"]);
+    await runCommand(NPM_COMMAND, ["run", "i18n:electron:check"]);
+    await runNodeTests([
+      "--test-concurrency=1",
+      "test/i18n-foundation.test.js",
+      "apps/electron/test/i18n-copy.test.mjs",
+      "apps/electron/test/desktop-menu-tray.test.mjs",
+    ]);
     await runCommand(NPM_COMMAND, ["run", "product:ui:test"]);
     return;
   }
@@ -551,6 +562,7 @@ Lanes:
   macos-source    Run only source/configuration assertions from the macOS suite.
   macos-smoke     Build one test-profile development app and smoke it (pinned builder only).
   macos-artifact  Prepare Sparkle and run the native artifact and updater tests.
+  i18n            Run canonical browser and Electron localization parity gates.
   worker          Run the complete Worker owning gate, including dry builds.
   public-site     Run public-site/UI and Worker owning gates without native signing.
 

@@ -176,6 +176,131 @@ test("preparation progress rejects cross-version fields, unknown fields, invalid
   }
 });
 
+test("graph rebuild progress accepts the exact v3 window extension and keeps preparation optional", async () => {
+  const payload = await fixture("admin-reconstruction-graph-valid.json");
+  const projected = projectAdminReconstructionProgress(structuredClone(payload));
+  assert.deepEqual(projected, payload);
+  assert.equal(Object.hasOwn(projected, "preparation"), false, "v3 omits the optional section it was not given");
+  for (const frozen of [projected.graph, projected.graph.window, projected.graph.days,
+    projected.graph.days[0], projected.graph.work.checkpoints, projected.graph.throughput]) {
+    assert.equal(Object.isFrozen(frozen), true);
+  }
+  assert.equal(projected.graph.days.length, projected.graph.window.days);
+  assert.equal(projected.graph.days.at(0).day, projected.graph.window.to);
+  assert.equal(projected.graph.days.at(-1).day, projected.graph.window.from);
+  assert.deepEqual(projected.history, {
+    resolvedDays: 6, requiredDays: 69, activeDay: "2026-09-04",
+    completeAccounts: 8, requiredAccounts: 19,
+  }, "v3 reports real account numbers rather than the typed-storage nulls");
+  const withPreparation = structuredClone(payload);
+  withPreparation.preparation = {
+    trackedDays: 4, completeDays: 3, buildingDays: 1, retiringDays: 0,
+    checkpointSteps: 9, quotaObservations: 40, usageEvents: 22,
+  };
+  assert.deepEqual(projectAdminReconstructionProgress(withPreparation).preparation, withPreparation.preparation);
+  for (const relax of [
+    value => { value.graph.throughput.estimatedHoursRemaining = null; },
+    value => { value.graph.throughput.estimatedHoursRemaining = 0; },
+    value => { value.graph.work.state = "idle"; value.graph.work.activeDay = null; value.graph.work.activeMetric = null; value.graph.work.leaseExpiresAt = null; },
+    value => { value.graph.refusals = []; },
+    value => { value.graph.work.checkpoints.phases = []; },
+    value => { value.graph.work.checkpoints = null; },
+    value => { value.graph.retirement.staleResults = null; },
+  ]) {
+    const relaxed = structuredClone(payload);
+    relax(relaxed);
+    assert.deepEqual(projectAdminReconstructionProgress(relaxed), relaxed);
+  }
+});
+
+test("a capped graph read keeps its display-only counters null instead of collapsing them to zero", async () => {
+  const payload = await fixture("admin-reconstruction-graph-capped.json");
+  const projected = projectAdminReconstructionProgress(structuredClone(payload));
+  assert.deepEqual(projected, payload);
+  assert.equal(projected.graph.work.checkpoints, null);
+  assert.equal(projected.graph.retirement.staleResults, null);
+  assert.deepEqual(
+    [projected.graph.throughput.resultsLastHour, projected.graph.throughput.resultsLast6Hours,
+      projected.graph.throughput.estimatedHoursRemaining],
+    [null, null, null],
+  );
+  assert.equal(projected.graph.throughput.remainingResults, 1042, "the remaining count is not display-only");
+  for (const mutate of [
+    value => { value.graph.throughput.estimatedHoursRemaining = 30.1; },
+    value => { value.graph.throughput.resultsLastHour = 23; value.graph.throughput.estimatedHoursRemaining = 30.1; },
+    value => { value.graph.work.checkpoints = []; },
+    value => { value.graph.retirement.staleResults = -1; },
+  ]) {
+    const invalid = structuredClone(payload);
+    mutate(invalid);
+    assert.throws(() => projectAdminReconstructionProgress(invalid), error => error.code === "ADMIN_RECONSTRUCTION_PROGRESS_INVALID");
+  }
+});
+
+test("graph rebuild progress rejects unknown keys, broken day invariants and non-member codes", async () => {
+  const payload = await fixture("admin-reconstruction-graph-valid.json");
+  const mutations = [
+    value => { delete value.graph; },
+    value => { value.graph = null; },
+    value => { value.graph = []; },
+    value => { value.graph.participantId = "synthetic-unexpected"; },
+    value => { value.graph.work.rawError = "synthetic-unexpected"; },
+    value => { value.graph.window.label = "synthetic-unexpected"; },
+    value => { value.graph.days[0].accountId = "synthetic-unexpected"; },
+    value => { value.graph.days.pop(); },
+    value => { value.graph.days.push(structuredClone(value.graph.days[0])); },
+    // The window must span exactly as many calendar days as it declares.
+    value => { value.graph.window.days -= 1; },
+    value => { value.graph.window.days = 401; },
+    value => { value.graph.window.from = "2026-07-11"; },
+    value => { value.graph.window.to = "2026-09-17"; },
+    value => { value.graph.window.from = "2026-02-30"; },
+    value => { value.graph.window.from = value.graph.window.to; },
+    value => { value.graph.days.reverse(); },
+    value => { value.graph.days[3].day = value.graph.days[2].day; },
+    value => { value.graph.days[0].ready += 1; },
+    value => { value.graph.days[0].missing -= 1; },
+    value => { value.graph.days[0].unsupported += 1; },
+    value => { delete value.graph.days[0].unsupported; },
+    value => { value.graph.owners.active += 1; },
+    value => { value.graph.days[0].published = "true"; },
+    value => { value.graph.days[0].publishedAt = "yesterday"; },
+    // Fits carry no per-owner reason, so `refused` is not one of their keys.
+    value => { value.graph.currentFits.noFit += 1; },
+    value => { value.graph.currentFits.refused = 0; },
+    value => { delete value.graph.currentFits.noFit; },
+    value => { value.graph.work.state = "paused"; },
+    value => { value.graph.work.activeMetric = "cost"; },
+    value => { value.graph.work.leaseExpiresAt = "2026-09-17T12:04:00Z"; },
+    value => { value.graph.refusals[0].metric = "model"; },
+    value => { value.graph.refusals[0].reason = "Refused: /Users/owner/.codex"; },
+    value => { value.graph.refusals[0].reason = ""; },
+    value => { value.graph.refusals[0].reason = "ab"; },
+    value => { value.graph.refusals[1] = structuredClone(value.graph.refusals[0]); },
+    value => { value.graph.refusals[0].owners = -1; },
+    value => { value.graph.work.checkpoints.phases[1].phase = "usage"; },
+    value => { value.graph.work.checkpoints.phases[0].parts = 1.5; },
+    value => { value.graph.throughput.estimatedHoursRemaining = -0.1; },
+    value => { value.graph.throughput.estimatedHoursRemaining = Infinity; },
+    value => { value.graph.throughput.estimatedHoursRemaining = "12"; },
+    value => { value.graph.throughput.resultsLastHour = null; },
+    value => { value.graph.throughput.resultsLast6Hours = null; },
+    value => { value.graph.throughput.remainingResults = null; },
+    value => { value.graph.throughput.remainingResults = Number.MAX_SAFE_INTEGER + 1; },
+    value => { value.graph.retirement.staleResults = "216"; },
+  ];
+  for (const section of ["selections", "checkpoints"]) {
+    for (const key of Object.keys(payload.graph.work[section])) {
+      mutations.push(value => { delete value.graph.work[section][key]; });
+    }
+  }
+  for (const mutate of mutations) {
+    const invalid = structuredClone(payload);
+    mutate(invalid);
+    assert.throws(() => projectAdminReconstructionProgress(invalid), error => error.code === "ADMIN_RECONSTRUCTION_PROGRESS_INVALID");
+  }
+});
+
 function reconstructionPayload() {
   return {
     schemaVersion: "admin-reconstruction-progress-v0.1",
@@ -264,8 +389,8 @@ function allowancePreviewPayload() {
     basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview",
     referencePlanType: "pro",
     trailingDays: 30,
-    qualification: "shared_reset_fit_gates_40pp_span_floor",
-    spanFloorPp: 40,
+    qualification: "shared_reset_fit_gates_25pp_span_floor",
+    spanFloorPp: 25,
     plans: [
       { planType: "pro", label: "Pro 20x", multiplier: 1 },
       { planType: "prolite", label: "Pro 5x", multiplier: 4 },
@@ -491,7 +616,7 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
   assert.deepEqual(overview, {
     generatedAt: "2026-08-17T12:00:00.000Z",
     reconstruction: null,
-    service: { environment: "production" },
+    service: { environment: "production", telemetryStorageMode: "json" },
     collection: {
       state: "operational",
       revision: 7,
@@ -684,6 +809,7 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
       pendingRebuildsBounded: false,
     },
     pendingHistoricalRebuilds: 0,
+    historicalPublication: null,
     errors: {
       retentionDays: 30,
       sampled: true,
@@ -714,6 +840,36 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
   });
   assert.equal(Object.isFrozen(overview), true);
   assert.equal(Object.isFrozen(overview.collection), true);
+});
+
+test("typed admin overview projects target publication evidence without a legacy queue zero", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  payload.schemaVersion = "admin-overview-v0.4";
+  payload.service.telemetryStorageMode = "typed";
+  payload.snapshots = [];
+  payload.pendingHistoricalRebuilds = null;
+  payload.historicalPublication = {
+    publishedDays: 69,
+    publishedDaysBounded: false,
+    latestEvidenceDay: "2026-08-16",
+    latestComputedAt: "2026-08-17T11:55:00.000Z",
+    previewState: "current",
+    previewGeneratedAt: "2026-08-17T11:56:00.000Z",
+  };
+  const overview = projectAdminOverview(payload);
+  assert.equal(overview.service.telemetryStorageMode, "typed");
+  assert.equal(overview.pendingHistoricalRebuilds, null);
+  assert.deepEqual(overview.historicalPublication, payload.historicalPublication);
+
+  for (const mutate of [
+    value => { value.pendingHistoricalRebuilds = 0; },
+    value => { value.historicalPublication.previewState = "unknown"; },
+    value => { value.service.telemetryStorageMode = "json"; },
+  ]) {
+    const invalid = structuredClone(payload);
+    mutate(invalid);
+    assert.throws(() => projectAdminOverview(invalid), /ADMIN_OVERVIEW_INVALID/u);
+  }
 });
 
 test("admin overview projects isolated reconstruction evidence and omits unknown fields", async () => {

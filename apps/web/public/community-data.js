@@ -331,16 +331,31 @@ function publicAllowanceSummary(value) {
     fitCount: value.fitCount, band80Usd };
 }
 
+// The published breakdown contract versions this reader honours, and the two
+// fixed method claims inside them. Named because the cache projection has to
+// rebuild the exact wire shape it accepted, and a second spelling of a claim
+// is a second thing that can drift.
+export const COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS = Object.freeze([
+  "community-allowance-breakdowns-v1.0",
+  "community-allowance-breakdowns-v1.1",
+]);
+const COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION =
+  "community-allowance-breakdowns-v1.1";
+const COMMUNITY_ALLOWANCE_MODEL_BASIS =
+  "seven_day_codex_pro20x_equivalent_per_model_composition";
+const COMMUNITY_ALLOWANCE_MODEL_GATE =
+  "shared_composition_kernel_identification";
+
 /** New public contract, never the private preview. Invalid optional breakdowns
  * cannot hide the separately validated daily activity or aggregate estimates. */
 export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs = Date.now()) {
   if (!exactObject(value, ["schemaVersion", "basis", "referencePlanType", "normalization",
     "modelBasis", "modelGate", "generatedAt", "days"])
-      || !["community-allowance-breakdowns-v1.0", "community-allowance-breakdowns-v1.1"].includes(value.schemaVersion)
+      || !COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS.includes(value.schemaVersion)
       || value.basis !== COMMUNITY_ALLOWANCE_BASIS || value.referencePlanType !== "pro"
       || value.normalization !== COMMUNITY_ALLOWANCE_NORMALIZATION
-      || value.modelBasis !== "seven_day_codex_pro20x_equivalent_per_model_composition"
-      || value.modelGate !== "shared_composition_kernel_identification"
+      || value.modelBasis !== COMMUNITY_ALLOWANCE_MODEL_BASIS
+      || value.modelGate !== COMMUNITY_ALLOWANCE_MODEL_GATE
       || typeof value.generatedAt !== "string" || !Number.isFinite(nowMs)
       || !Array.isArray(value.days) || value.days.length > 70) return null;
   const generatedMs = Date.parse(value.generatedAt);
@@ -354,7 +369,7 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
     - 69 * MILLISECONDS_PER_DAY).toISOString().slice(0, 10);
   const allowedDays = new Set(publishedDays);
   const days = [];
-  const hasCombined = value.schemaVersion === "community-allowance-breakdowns-v1.1";
+  const hasCombined = value.schemaVersion === COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION;
   for (const row of value.days) {
     if (!exactObject(row, hasCombined ? ["day", "combined", "byPlanType", "models"] : ["day", "byPlanType", "models"]) || !publicDay(row.day)
         || !allowedDays.has(row.day) || row.day < earliestDay || row.day >= today || row.day >= generatedDay
@@ -476,6 +491,160 @@ function normalizedDailySpend(candidate, usageEvents) {
   };
 }
 
+// The community cache-retention lane. It is additive and optional: the key is
+// absent until the lane publishes, so an older cached response must stay
+// renderable rather than degrade the whole series.
+export const COMMUNITY_CACHE_RETENTION_SCHEMA_VERSION = "community-cache-retention-v1.0";
+const COMMUNITY_CACHE_RETENTION_METRIC = "cache_retention_by_pause";
+const COMMUNITY_CACHE_RETENTION_MEASURES = "consecutive_requests";
+// The gap basis is a load-bearing claim, not a label. The browser's caveat —
+// that a response-end-to-response-end gap overstates the real idle pause by
+// the later request's own duration — is only true for this basis, so any
+// other basis must reject rather than inherit the sentence.
+const COMMUNITY_CACHE_RETENTION_GAP_BASIS = "response_end_to_response_end";
+const COMMUNITY_CACHE_RETENTION_METHOD_PATTERN = /^cache-retention-v[1-9]\d{0,2}$/u;
+
+/**
+ * Exactly ten ordered bands, always all ten, even with no evidence. Each
+ * band's `endMs` is the next band's `startMs`. The final band is CLOSED, not
+ * open-ended: the lane's lookback is seven days, so a gap longer than that is
+ * not measured at all rather than counted here.
+ */
+export const COMMUNITY_CACHE_RETENTION_BANDS = Object.freeze([
+  Object.freeze({ band: "under_one_minute", startMs: 0, endMs: 60_000 }),
+  Object.freeze({ band: "one_to_two_minutes", startMs: 60_000, endMs: 120_000 }),
+  Object.freeze({ band: "two_to_five_minutes", startMs: 120_000, endMs: 300_000 }),
+  Object.freeze({ band: "five_to_ten_minutes", startMs: 300_000, endMs: 600_000 }),
+  Object.freeze({ band: "ten_to_thirty_minutes", startMs: 600_000, endMs: 1_800_000 }),
+  Object.freeze({ band: "thirty_minutes_to_one_hour", startMs: 1_800_000, endMs: 3_600_000 }),
+  Object.freeze({ band: "one_to_two_hours", startMs: 3_600_000, endMs: 7_200_000 }),
+  Object.freeze({ band: "two_to_six_hours", startMs: 7_200_000, endMs: 21_600_000 }),
+  Object.freeze({ band: "six_to_twenty_four_hours", startMs: 21_600_000, endMs: 86_400_000 }),
+  // 24 hours to SEVEN DAYS, not "24 hours and up". The worker's
+  // `MAXIMUM_GAP_MS` is `lookbackDays * 86_400_000`, and a longer gap falls
+  // outside the lens entirely.
+  Object.freeze({ band: "over_twenty_four_hours", startMs: 86_400_000, endMs: 604_800_000 }),
+]);
+
+// Counters for evidence the lane deliberately did not measure. They qualify
+// every rate above them, so they are carried, never dropped.
+const COMMUNITY_CACHE_RETENTION_EXCLUSION_FIELDS = Object.freeze([
+  "excludedInsufficientEvidence",
+  "excludedContextContracted",
+  "unorderedTies",
+]);
+
+const COMMUNITY_CACHE_RETENTION_RATE_FIELDS = Object.freeze([
+  "reusedMoreThanHalfRate",
+  "matchedOrExceededRate",
+]);
+
+function normalizedCacheRetentionBand(candidate, expected) {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return null;
+  }
+  // Every boundary is exact, the last one included. Accepting a null there
+  // would admit a payload claiming an unbounded band, which the lane cannot
+  // produce and which would overstate what the curve covers.
+  if (candidate.band !== expected.band
+      || candidate.startMs !== expected.startMs
+      || candidate.endMs !== expected.endMs) {
+    return null;
+  }
+  const counts = [
+    candidate.adjacencies,
+    candidate.sessions,
+    candidate.contributors,
+    ...COMMUNITY_CACHE_RETENTION_EXCLUSION_FIELDS.map((field) => candidate[field]),
+  ];
+  if (!counts.every((value) => Number.isSafeInteger(value) && value >= 0)) {
+    return null;
+  }
+  const [adjacencies, sessions, contributors] = counts;
+  // An empty band is published with explicit nulls: "no gap was measured" and
+  // "the cache was not reused" are different claims. Where gaps were measured,
+  // they came from at least one session, and distinct participants cannot
+  // outnumber the sessions they fed.
+  if (adjacencies === 0
+    ? sessions !== 0 || contributors !== 0
+    : sessions < 1 || contributors < 1 || contributors > sessions) {
+    return null;
+  }
+  const rates = {};
+  for (const field of COMMUNITY_CACHE_RETENTION_RATE_FIELDS) {
+    const value = candidate[field];
+    if (adjacencies === 0) {
+      if (value !== null) return null;
+      rates[field] = null;
+      continue;
+    }
+    if (typeof value !== "number"
+        || !Number.isFinite(value)
+        || value < 0
+        || value > 1) {
+      return null;
+    }
+    rates[field] = value;
+  }
+  // The largest single share of a band cannot exist without a contributor and
+  // cannot be zero, but the lane may decline to publish it at all.
+  const topContributorShare = candidate.topContributorShare;
+  if (topContributorShare !== null
+      && (contributors === 0
+        || typeof topContributorShare !== "number"
+        || !Number.isFinite(topContributorShare)
+        || topContributorShare <= 0
+        || topContributorShare > 1)) {
+    return null;
+  }
+  return {
+    band: expected.band,
+    startMs: expected.startMs,
+    endMs: expected.endMs,
+    adjacencies,
+    sessions,
+    contributors,
+    ...rates,
+    topContributorShare,
+    ...Object.fromEntries(COMMUNITY_CACHE_RETENTION_EXCLUSION_FIELDS
+      .map((field) => [field, candidate[field]])),
+  };
+}
+
+/**
+ * Normalizes the optional cache-retention block into a closed, render-safe
+ * shape. Unknown fields never reach the UI, and a block that disagrees with
+ * the published contract in any way is refused whole: a partially trusted
+ * retention claim is worse than none.
+ */
+function normalizedCacheRetention(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (value.schemaVersion !== COMMUNITY_CACHE_RETENTION_SCHEMA_VERSION
+      || value.metric !== COMMUNITY_CACHE_RETENTION_METRIC
+      || value.measures !== COMMUNITY_CACHE_RETENTION_MEASURES
+      || value.gapBasis !== COMMUNITY_CACHE_RETENTION_GAP_BASIS
+      || typeof value.methodVersion !== "string"
+      || !COMMUNITY_CACHE_RETENTION_METHOD_PATTERN.test(value.methodVersion)
+      || !Array.isArray(value.bands)
+      || value.bands.length !== COMMUNITY_CACHE_RETENTION_BANDS.length) {
+    return null;
+  }
+  const bands = [];
+  for (const [index, expected] of COMMUNITY_CACHE_RETENTION_BANDS.entries()) {
+    const band = normalizedCacheRetentionBand(value.bands[index], expected);
+    if (band === null) return null;
+    bands.push(band);
+  }
+  return {
+    schemaVersion: COMMUNITY_CACHE_RETENTION_SCHEMA_VERSION,
+    metric: COMMUNITY_CACHE_RETENTION_METRIC,
+    methodVersion: value.methodVersion,
+    measures: COMMUNITY_CACHE_RETENTION_MEASURES,
+    gapBasis: COMMUNITY_CACHE_RETENTION_GAP_BASIS,
+    bands,
+  };
+}
+
 function normalizedDailyDay(candidate) {
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
     return null;
@@ -553,7 +722,126 @@ export function normalizeCommunityDailySeries(payload, { nowMs = Date.now() } = 
     allowanceState: payload.allowanceState,
     breakdowns: payload.allowanceState === "ready"
       ? normalizePublicAllowanceBreakdowns(payload.allowanceBreakdowns, days.map(day => day.day), nowMs) : null,
+    // Community-wide, not per-day: the lane measures gaps between consecutive
+    // requests across the whole published window.
+    cacheRetention: normalizedCacheRetention(payload.cacheRetention),
     days,
+  };
+}
+
+// Everything this reader must still agree with before a payload retained by
+// an earlier visit may be rendered under today's meanings. Every published
+// contract version and method claim the daily series depends on is folded in,
+// so widening any one of them refuses the previous deploy's cache instead of
+// reinterpreting it.
+export const COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY = [
+  COMMUNITY_DAILY_READ_SCHEMA_VERSION,
+  COMMUNITY_DAILY_AGGREGATE_SCHEMA_VERSION,
+  COMMUNITY_DAILY_POLICY_VERSION,
+  COMMUNITY_ALLOWANCE_BASIS,
+  COMMUNITY_ALLOWANCE_NORMALIZATION,
+  COMMUNITY_DAILY_SPEND_BASIS,
+  ...COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS,
+].join("|");
+
+function cachedAllowanceBlock(allowance) {
+  if (allowance === null) return null;
+  return {
+    basis: COMMUNITY_ALLOWANCE_BASIS,
+    referencePlanType: COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE,
+    normalization: COMMUNITY_ALLOWANCE_NORMALIZATION,
+    fitCount: allowance.fitCount,
+    participantCount: allowance.participantCount,
+    centralUsd: allowance.centralUsd,
+    band80Usd: allowance.band80Usd === null
+      ? null
+      : { lowerUsd: allowance.band80Usd.lowerUsd, upperUsd: allowance.band80Usd.upperUsd },
+  };
+}
+
+function cachedBreakdowns(breakdowns) {
+  return {
+    schemaVersion: breakdowns.hasCombined
+      ? COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION
+      : COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS[0],
+    basis: COMMUNITY_ALLOWANCE_BASIS,
+    referencePlanType: COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE,
+    normalization: COMMUNITY_ALLOWANCE_NORMALIZATION,
+    modelBasis: COMMUNITY_ALLOWANCE_MODEL_BASIS,
+    modelGate: COMMUNITY_ALLOWANCE_MODEL_GATE,
+    generatedAt: breakdowns.generatedAt,
+    // `modelConfig` is this build's reviewed catalog, not published data, so
+    // it is never stored: the reader supplies it again on the way back out.
+    days: breakdowns.days.map(row => ({
+      day: row.day,
+      ...(breakdowns.hasCombined ? { combined: row.combined } : {}),
+      byPlanType: row.byPlanType,
+      models: row.models,
+    })),
+  };
+}
+
+function cachedDay(day) {
+  return {
+    day: day.day,
+    revision: day.revision,
+    releasedAt: day.releasedAt,
+    payload: {
+      schemaVersion: COMMUNITY_DAILY_AGGREGATE_SCHEMA_VERSION,
+      policyVersion: COMMUNITY_DAILY_POLICY_VERSION,
+      immutableRevision: true,
+      recomputesOnLateData: true,
+      day: day.day,
+      revision: day.revision,
+      totals: day.totals,
+      allowance: cachedAllowanceBlock(day.allowance),
+      ...(day.apiEquivalentSpend === null
+        ? {}
+        : { apiEquivalentSpend: day.apiEquivalentSpend }),
+    },
+  };
+}
+
+/**
+ * The storable form of one /community/daily response: the wire shape rebuilt
+ * from the normalized value and from this module's own contract constants,
+ * and nothing else.
+ *
+ * Rebuilding rather than copying is the point. The normalizer's output is a
+ * closed shape, so no unknown upstream field, private diagnostic or
+ * unvalidated block can reach storage by construction — only figures this
+ * page would have rendered. A block the normalizer declined, such as an
+ * allowance breakdown that failed its checks, is absent here exactly as it
+ * was absent from the render; it is never repaired or filled in.
+ *
+ * The result re-normalizes to the same series the original did, which is what
+ * makes a cached render identical to the live one rather than a second,
+ * looser interpretation. Re-normalizing later only ever gets stricter: the
+ * breakdown checks that depend on the current day move against acceptance,
+ * never towards it, so time cannot promote a refused payload.
+ *
+ * Returns null for anything this reader could not honestly interpret, which
+ * the cache treats as a refusal to store.
+ */
+export function projectCommunityDailyPayloadForCache(payload, { nowMs = Date.now() } = {}) {
+  const series = normalizeCommunityDailySeries(payload, { nowMs });
+  if (series.state !== "published" && series.state !== "none_published") return null;
+  // Validated by the normalizer above, but not carried on its result, and the
+  // public site reads it to keep an activity-only answer from being mistaken
+  // for a withdrawn allowance.
+  const readState = payload?.allowanceReadState;
+  return {
+    schemaVersion: COMMUNITY_DAILY_READ_SCHEMA_VERSION,
+    from: series.from,
+    to: series.to,
+    allowanceState: series.allowanceState,
+    ...(readState === "confirmed" || readState === "temporarily_unavailable"
+      ? { allowanceReadState: readState }
+      : {}),
+    ...(series.breakdowns === null
+      ? {}
+      : { allowanceBreakdowns: cachedBreakdowns(series.breakdowns) }),
+    days: series.days.map(cachedDay),
   };
 }
 

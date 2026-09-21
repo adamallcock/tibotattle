@@ -2007,6 +2007,7 @@ async function uiSnapshot(session) {
     return {
       ready: document.documentElement?.dataset?.localDashboardReady === "true",
       refreshText: refresh?.textContent?.replace(/\\s+/gu, " ").trim() ?? "",
+      refreshTimerText: refresh?.querySelector('.refresh-progress-time')?.textContent?.trim() ?? null,
       refreshDisabled: Boolean(refresh?.disabled),
       cancelHidden: Boolean(cancel?.hidden),
       cancelDisabled: Boolean(cancel?.disabled),
@@ -2030,7 +2031,12 @@ export async function sampleAdvancingTimer(session, {
     // The first cancel closes this generation synchronously. A CDP read that
     // completes afterward cannot add cancellation or retry/reset evidence.
     if (signal?.aborted === true || now() >= deadline) break;
-    const elapsed = elapsedSeconds(snapshot?.refreshText);
+    // Read the dedicated clock slot: adjacent count/phase spans have no text
+    // separators, and must never be mistaken for elapsed-time evidence.
+    const clock = /^(\d+):([0-5]\d)$/u.exec(snapshot?.refreshTimerText ?? "");
+    const elapsed = snapshot?.refreshTimerText != null
+      ? clock ? Number(clock[1]) * 60 + Number(clock[2]) : null
+      : elapsedSeconds(snapshot?.refreshText);
     if (elapsed !== null) {
       const previous = values.at(-1);
       if (previous !== undefined && elapsed < previous) break;
@@ -2399,6 +2405,37 @@ export function classifyAdvancedModuleText(value) {
   });
 }
 
+function nonNegativeSafeInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+// The pricing note is optional by design: the renderer hides it when every
+// event in the selected period is fully priced. Keep the QA contract bound to
+// the aggregate API evidence so a hidden note is accepted only for complete
+// coverage, while a period with unpriced events must show its explanation.
+export function pricingCoverageSnapshotValid(snapshot) {
+  const coverage = snapshot?.pricingCoverage;
+  const events = coverage?.events;
+  const fullyPricedEvents = coverage?.fullyPricedEvents;
+  const partiallyPricedEvents = coverage?.partiallyPricedEvents;
+  const unpricedEvents = coverage?.unpricedEvents;
+  const counts = [
+    events,
+    fullyPricedEvents,
+    partiallyPricedEvents,
+    unpricedEvents,
+  ];
+  if (!counts.every(nonNegativeSafeInteger)
+      || fullyPricedEvents + partiallyPricedEvents + unpricedEvents !== events) {
+    return false;
+  }
+  const warningExpected = unpricedEvents > 0;
+  return snapshot?.priceCoverageElementPresent === true
+    && snapshot?.priceCoverageVisible === warningExpected
+    && snapshot?.priceCoverageTextPresent === warningExpected
+    && snapshot?.priceCoverage === warningExpected;
+}
+
 export function usageParitySnapshotValid(snapshot) {
   return snapshot?.route === "#accounting"
     && snapshot?.pageVisible === true
@@ -2412,7 +2449,7 @@ export function usageParitySnapshotValid(snapshot) {
     && snapshot?.meaningfulModelRows >= 1
     && Number.isSafeInteger(snapshot?.meaningfulModelMetricCells)
     && snapshot.meaningfulModelMetricCells >= 2
-    && snapshot?.priceCoverage === true
+    && pricingCoverageSnapshotValid(snapshot)
     && snapshot?.advancedModuleShellCount === 3
     && snapshot?.advancedModulesExplicit === true
     && snapshot?.advancedModulesReady === true;
@@ -2523,7 +2560,7 @@ export function localQaCommunityParitySnapshotValid(
 async function assertUsage(session) {
   let usage;
   try {
-    usage = await waitForUsageParitySnapshot(async () => session.cdp.evaluate(`(() => {
+    usage = await waitForUsageParitySnapshot(async () => session.cdp.evaluate(`(async () => {
     const visible = ${visibleInRenderer.toString()};
     const positiveNumber = (value) => {
       const matches = String(value ?? '').match(/(?:^|[^0-9])([1-9][0-9]*(?:[.,][0-9]+)?|0\\.[0-9]+)/u);
@@ -2540,6 +2577,46 @@ async function assertUsage(session) {
     const modelMetricCells = modelRows.flatMap((row) => [...row.querySelectorAll(
       ':scope > .numeric-cell',
     )]);
+    const selectedPeriod = document.querySelector(
+      '#reporting-period-controls button[aria-pressed="true"]',
+    )?.dataset.period ?? null;
+    let pricingCoverage = null;
+    try {
+      const response = await fetch('/api/local/overview', { cache: 'no-store' });
+      if (response.ok) {
+        const overview = await response.json();
+        const periods = Array.isArray(overview?.accounting?.periods)
+          ? overview.accounting.periods
+          : [];
+        const candidateIds = selectedPeriod === 'all'
+          ? ['history', 'all']
+          : [selectedPeriod];
+        const accounting = candidateIds
+          .map((periodId) => periods.find((period) => period?.periodId === periodId))
+          .find((period) => period !== undefined);
+        const coverage = accounting?.pricingCoverage;
+        const values = [
+          accounting?.events,
+          coverage?.fullyPricedEvents,
+          coverage?.partiallyPricedEvents,
+          coverage?.unpricedEvents,
+        ];
+        if (values.every((value) => Number.isSafeInteger(value) && value >= 0)) {
+          pricingCoverage = {
+            events: accounting.events,
+            fullyPricedEvents: coverage.fullyPricedEvents,
+            partiallyPricedEvents: coverage.partiallyPricedEvents,
+            unpricedEvents: coverage.unpricedEvents,
+          };
+        }
+      }
+    } catch {
+      // A missing aggregate source is an invalid parity snapshot below; keep
+      // the failure content-free rather than returning the response payload.
+    }
+    const priceCoverageElement = document.querySelector('#accounting-price-coverage');
+    const priceCoverageText = priceCoverageElement?.textContent?.trim() ?? '';
+    const priceCoverageVisible = visible(priceCoverageElement);
     const advanced = [
       '#cache-switch-details',
       '#cache-reuse-outcome',
@@ -2557,7 +2634,7 @@ async function assertUsage(session) {
     return {
       route: location.hash,
       pageVisible: visible(page) && page?.inert !== true,
-      periodCount: document.querySelectorAll('#accounting-period-controls [data-period]').length,
+      periodCount: document.querySelectorAll('#reporting-period-controls [data-period]').length,
       summaryCardCount: document.querySelectorAll('#accounting-summary .metric-card').length,
       tokenCountRows: tokenRows.length,
       costContributionRows: costRows.length,
@@ -2568,8 +2645,11 @@ async function assertUsage(session) {
         ':scope > .numeric-cell',
       )].some((cell) => positiveNumber(cell.textContent))).length,
       meaningfulModelMetricCells: modelMetricCells.filter((cell) => positiveNumber(cell.textContent)).length,
-      priceCoverage: visible(document.querySelector('#accounting-price-coverage'))
-        && (document.querySelector('#accounting-price-coverage')?.textContent?.trim() ?? '').length > 0,
+      pricingCoverage,
+      priceCoverageElementPresent: priceCoverageElement !== null,
+      priceCoverageVisible,
+      priceCoverageTextPresent: priceCoverageText.length > 0,
+      priceCoverage: priceCoverageVisible && priceCoverageText.length > 0,
       advancedModuleShellCount: advanced.filter((item) => item.present).length,
       advancedModuleAvailableCount: advanced.filter((item) => item.present
         && item.visible && item.explicitContent && !item.explicitUnavailable).length,

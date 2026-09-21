@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   telemetryV11DomainManifestDigestInput,
   type TelemetryV11Attribution,
+  type TelemetryV11DomainManifest,
   type TelemetryV11QuotaObservation,
   type TelemetryV11UsageEvent,
 } from "@app-usagemonitor/telemetry-contract";
@@ -12,9 +13,15 @@ import { sha256Hex } from "../src/crypto";
 import {
   accountScopedModelCompositionV11,
   accountScopedQuotaAnalysisV11,
+  TYPED_V11_PLAN_SQL,
+  TYPED_V11_QUOTA_SQL,
   V11_PLAN_ATTRIBUTION_ADAPTER_VERSION,
   V11_USAGE_PAGE_SQL,
 } from "../src/quota-analysis-v11";
+import { authenticateDevice, claimDeviceUploadAuthorization, createDeviceUploadAuthorization } from "../src/device-auth";
+import { initializeStorageSource } from "../src/analytics-delivery";
+import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../src/typed-v11-admission";
+import { registerTelemetryV11DayManifest } from "../src/telemetry-v11-repository";
 import {
   activateTelemetryV11Domain,
   assertV11SourcePinCurrent,
@@ -23,7 +30,13 @@ import {
 } from "../src/telemetry-v11-domain";
 import { createV11DeviceFixture, makeV11Day, stageV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 
-interface TestBindings extends Env { TEST_MIGRATIONS: D1Migration[] }
+interface TestBindings extends Env {
+  TEST_MIGRATIONS: D1Migration[];
+  STORAGE_INGESTION_A: D1Database;
+  TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[];
+  TEST_INGESTION_BRIDGE_MIGRATIONS: D1Migration[];
+  TEST_TYPED_V11_ADMISSION_MIGRATIONS: D1Migration[];
+}
 const DAY_MS = 86_400_000;
 const MINUTE = 60_000;
 const DAY = new Date(Date.now() - 10 * DAY_MS).toISOString().slice(0, 10);
@@ -34,6 +47,8 @@ const ACCOUNT_B = "account-track:v2:" + "b".repeat(64);
 type Fixture = Awaited<ReturnType<typeof createV11DeviceFixture>>;
 type Candidate = Awaited<ReturnType<typeof stageV11Day>>;
 function db(): D1Database { return (env as TestBindings).USAGE_MONITOR_DB; }
+function typedDb(): D1Database { return (env as TestBindings).STORAGE_INGESTION_A; }
+const TYPED_NAMESPACE = "synthetic-v11-quota-source";
 
 function series(ordinal: number, options: {
   plan?: "pro" | "plus" | "unknown"; account?: string | null; accountBasis?: TelemetryV11Attribution["accountBasis"];
@@ -95,6 +110,80 @@ async function activate(fixture: Fixture, candidates: Candidate[]) {
   };
   manifest.manifestDigest = await sha256Hex(telemetryV11DomainManifestDigestInput(manifest));
   return activateTelemetryV11Domain(db(), fixture, manifest);
+}
+
+async function prepareTypedV11() {
+  const bindings = env as TestBindings;
+  await applyD1Migrations(typedDb(), bindings.TEST_MIGRATIONS);
+  await applyD1Migrations(typedDb(), bindings.TEST_TYPED_INGESTION_MIGRATIONS);
+  await applyD1Migrations(typedDb(), bindings.TEST_INGESTION_BRIDGE_MIGRATIONS);
+  await applyD1Migrations(typedDb(), bindings.TEST_TYPED_V11_ADMISSION_MIGRATIONS);
+  await initializeStorageSource(typedDb(), TYPED_NAMESPACE);
+  await initializeTypedV11Admission(typedDb(), TYPED_NAMESPACE);
+}
+
+async function stageTypedV11(fixture: Fixture, prepared: Awaited<ReturnType<typeof makeV11Day>>) {
+  await registerTelemetryV11DayManifest(typedDb(), fixture, prepared.manifest);
+  for (const chunk of prepared.chunks) {
+    const envelopeDigest = await sha256Hex(`synthetic-v11-plan-${crypto.randomUUID()}`);
+    const principal = await authenticateDevice(typedDb(), fixture.authorization);
+    const upload = await createDeviceUploadAuthorization(typedDb(), principal, envelopeDigest, 200);
+    const claimed = await claimDeviceUploadAuthorization(typedDb(), `Upload ${upload.uploadAuthorization}`, {
+      envelopeDigest, bodyBytes: 200, contentType: "application/json",
+    });
+    await persistTypedV11StagedChunk(typedDb(), principal, chunk, {
+      sourceNamespace: TYPED_NAMESPACE, chunkRowId: `chunk:${crypto.randomUUID()}`,
+      r2Key: `synthetic/v11-plan/${crypto.randomUUID()}`, envelopeDigest,
+      deviceUploadAuthorizationId: claimed.authorizationId,
+    });
+  }
+  return registerTelemetryV11DayManifest(typedDb(), fixture, prepared.manifest);
+}
+
+async function activateTypedV11(fixture: Fixture, candidates: Candidate[]) {
+  const predecessor = await createTelemetryV11DomainPredecessor(typedDb(), fixture);
+  const byDay = new Map(candidates.map((candidate) => [candidate.day, candidate]));
+  const sorted = [predecessor.fromDay, predecessor.throughDay, ...byDay.keys()].sort();
+  const fromDay = sorted[0]!;
+  const throughDay = sorted[sorted.length - 1]!;
+  const days = [];
+  for (let time = Date.parse(fromDay); time <= Date.parse(throughDay); time += DAY_MS) {
+    const candidateDay = new Date(time).toISOString().slice(0, 10);
+    const candidate = byDay.get(candidateDay) ?? await stageTypedV11(fixture, await makeV11Day(candidateDay, {}));
+    days.push({ day: candidateDay, manifestId: candidate.manifestId, manifestDigest: candidate.manifestDigest });
+  }
+  const manifest: TelemetryV11DomainManifest = {
+    schemaVersion: "telemetry-domain-manifest-v1.1", fromDay, throughDay,
+    predecessor: { token: predecessor.token, previousGenerationId: predecessor.previousGenerationId,
+      legacyFingerprint: predecessor.legacyFingerprint }, days, manifestDigest: "0".repeat(64),
+  };
+  manifest.manifestDigest = await sha256Hex(telemetryV11DomainManifestDigestInput(manifest));
+  return activateTelemetryV11Domain(typedDb(), fixture, manifest);
+}
+
+function observeTypedV11Plans(database: D1Database) {
+  const plans: { sql: string; details: string[] }[] = [];
+  const statement = (inner: D1PreparedStatement, sql: string, args: unknown[] = []): D1PreparedStatement =>
+    new Proxy(inner, { get(value, key) {
+      if (key === "bind") return (...bindings: unknown[]) => statement(value.bind(...bindings), sql, bindings);
+      if (key === "all") return async (...call: unknown[]) => {
+        if (sql === TYPED_V11_PLAN_SQL || sql === TYPED_V11_QUOTA_SQL) {
+          const explained = await database.prepare(`EXPLAIN QUERY PLAN ${sql}`).bind(...args).all<{ detail: string }>();
+          plans.push({ sql, details: explained.results.map((row) => row.detail) });
+        }
+        return Reflect.apply(Reflect.get(value, key) as Function, value, call);
+      };
+      const member = Reflect.get(value, key);
+      return typeof member === "function" ? member.bind(value) : member;
+    } });
+  return {
+    database: new Proxy(database, { get(value, key) {
+      if (key === "prepare") return (sql: string) => statement(value.prepare(sql), sql);
+      const member = Reflect.get(value, key);
+      return typeof member === "function" ? member.bind(value) : member;
+    } }),
+    plans,
+  };
 }
 
 interface Analysis {
@@ -269,6 +358,46 @@ describe("activated v1.1 account and plan attribution", () => {
       { nowMs: NOW, maxWindowedUsageRows: 5_005 }))
       .toMatchObject({ status: "not_testable", reason: "windowed_usage_limit_exceeded", tracks: [] });
   });
+
+  it("keeps typed quota analysis owner-first after ANALYZE and matches the legacy result", async () => {
+    await prepareTypedV11();
+
+    const participantId = "participant:synthetic-v11-quota-plan";
+    const legacyFixture = await createV11DeviceFixture(db(), { participantId, grant: true });
+    const typedFixture = await createV11DeviceFixture(typedDb(), { participantId, grant: true });
+    const prepared = await makeV11Day(DAY, series(0));
+    await activate(legacyFixture, [await stageV11Day(db(), legacyFixture, prepared)]);
+    await activateTypedV11(typedFixture, [await stageTypedV11(typedFixture, prepared)]);
+
+    // Give the planner a separate, unrelated owner with a sizeable admitted
+    // corpus. The source reader must remain bounded to the requested owner.
+    const unrelated = await createV11DeviceFixture(typedDb(), { grant: true });
+    await activateTypedV11(unrelated, [await stageTypedV11(unrelated,
+      await makeV11Day(DAY, series(1, { account: null, flatCopies: 100 })))]);
+    await typedDb().prepare("ANALYZE").run();
+
+    const observed = observeTypedV11Plans(typedDb());
+    const typed = await accountScopedQuotaAnalysisV11(observed.database, participantId, { nowMs: NOW });
+    const legacy = await accountScopedQuotaAnalysisV11(db(), participantId, { nowMs: NOW });
+    expect(observed.plans.map((plan) => plan.sql === TYPED_V11_PLAN_SQL ? "plan" : "quota").sort())
+      .toEqual(["plan", "quota"]);
+    for (const plan of observed.plans) {
+      const ownerSeek = plan.details.findIndex((detail) => detail.includes("SEARCH base USING")
+        && detail.includes("typed_telemetry_owner_time"));
+      const compatibilityRow = plan.details.findIndex((detail) => detail.includes("SEARCH r USING INTEGER PRIMARY KEY"));
+      expect(ownerSeek, JSON.stringify(plan.details)).toBeGreaterThan(-1);
+      expect(compatibilityRow, JSON.stringify(plan.details)).toBeGreaterThan(ownerSeek);
+      expect(plan.details.some((detail) => detail.includes("SCAN base"))).toBe(false);
+      expect(plan.details.some((detail) => detail.includes("sqlite_autoindex_typed_telemetry_records_1 (namespace_id=")))
+        .toBe(false);
+    }
+    const withoutFingerprint = (value: object) => {
+      const { inputFingerprint, ...rest } = value as Record<string, unknown>;
+      expect(inputFingerprint).toMatch(/^[0-9a-f]{64}$/u);
+      return rest;
+    };
+    expect(withoutFingerprint(typed)).toEqual(withoutFingerprint(legacy));
+  }, 60_000);
 
   it("uses tiny quota-only conflicts before fitability and separates same-plan continuity returns", async () => {
     const fixture = await createV11DeviceFixture(db(), { grant: true });

@@ -115,6 +115,10 @@ const INFO_HINTS = Object.freeze({
   "Quarantine reconciliation": "The latest upload-object housekeeping state and whether its bounded pass cleared all eligible work.",
   "Latest accepted upload": "The newest accepted whole contribution or incremental chunk received by the service.",
   "Weekly rebuild queue": "Weekly community snapshots waiting to be rebuilt from accepted evidence.",
+  "Historical model days": "Dated model-composition publications retained in the typed analytics store. This is recorded publication evidence, not a count of work remaining.",
+  "Latest historical evidence": "The newest evidence day with a retained typed model-composition publication.",
+  "Latest historical calculation": "The most recent calculation time across retained typed model-composition publications.",
+  "Historical graph preview": "Whether the latest typed analytics preview is current with its captured inputs, stale, or not yet published.",
   "Daily rebuild queue": "Daily community aggregates waiting to be rebuilt from accepted evidence.",
   "Latest daily evidence": "The newest evidence day represented by a published daily community aggregate.",
   "Latest daily publication": "When a daily community aggregate was most recently published.",
@@ -1289,7 +1293,7 @@ function collectAttentionItems(overview) {
     );
   }
 
-  const queuedRebuilds = overview.pendingHistoricalRebuilds
+  const queuedRebuilds = (overview.pendingHistoricalRebuilds ?? 0)
     + daily.pendingRebuilds;
   if (queuedRebuilds > 0) {
     addAttentionItem(
@@ -1298,7 +1302,9 @@ function collectAttentionItems(overview) {
       "maintenance",
       "warning",
       `${queuedRebuilds} publication ${queuedRebuilds === 1 ? "rebuild is" : "rebuilds are"} queued`,
-      `${overview.pendingHistoricalRebuilds} weekly · ${daily.pendingRebuilds} daily.`,
+      overview.pendingHistoricalRebuilds === null
+        ? `${daily.pendingRebuilds} daily. Typed historical work is measured by completed publication evidence.`
+        : `${overview.pendingHistoricalRebuilds} weekly · ${daily.pendingRebuilds} daily.`,
       "#readiness-title",
       "Review queues",
     );
@@ -1837,13 +1843,27 @@ function renderOperational(overview) {
   const lifecycle = overview.lifecycle;
   const reconciliation = overview.reconciliation;
   const daily = overview.dailyPublication;
+  const historical = overview.historicalPublication;
+  const publicationRows = historical
+    ? [
+      ["Historical model days", count(
+        historical.publishedDays,
+        historical.publishedDaysBounded,
+      )],
+      ["Latest historical evidence", text(historical.latestEvidenceDay)],
+      ["Latest historical calculation", formatTime(historical.latestComputedAt)],
+      ["Historical graph preview", historical.previewState === "not_published"
+        ? "not published"
+        : `${historical.previewState} · ${formatTime(historical.previewGeneratedAt)}`],
+    ]
+    : [["Weekly rebuild queue", text(overview.pendingHistoricalRebuilds)]];
   $("#lifecycle-status").replaceChildren(
     ...[
       ["Retention lifecycle", `${lifecycle.state} · ${lifecycle.quarantineRetentionComplete ? "complete" : "incomplete"}`],
       ["Restore replay", lifecycle.restoreReplayComplete ? "complete" : "incomplete"],
       ["Quarantine reconciliation", `${reconciliation.state} · ${reconciliation.reconciliationComplete ? "complete" : "incomplete"}`],
       ["Latest accepted upload", formatTime(overview.counts.contributions.latestAcceptedAt)],
-      ["Weekly rebuild queue", text(overview.pendingHistoricalRebuilds)],
+      ...publicationRows,
       ["Daily rebuild queue", count(daily.pendingRebuilds, daily.pendingRebuildsBounded)],
       ["Latest daily evidence", text(daily.latestEvidenceDay)],
       ["Latest daily publication", formatTime(daily.latestReleasedAt)],
@@ -1858,6 +1878,9 @@ function renderOperational(overview) {
     snapshot.releaseState,
     formatTime(snapshot.releasedAt),
   ])));
+  $("#snapshot-empty").textContent = historical
+    ? "Typed analytics publishes dated model history instead of legacy weekly snapshots."
+    : "No immutable snapshot has been sealed.";
   $("#snapshot-empty").hidden = rows.length !== 0;
 }
 
@@ -2983,6 +3006,8 @@ function renderReconstructionProgress(progress, { stale = false } = {}) {
   const details = $("#admin-reconstruction-details");
   if (!panel || !badge || !details) return;
   panel.className = `admin-reconstruction${stale ? " admin-reconstruction-stale" : ""}`;
+  const heading = $("#admin-reconstruction-title");
+  if (heading) heading.textContent = "Graph reconstruction";
   details.replaceChildren();
   const paragraph = (parent, text, className = "") => {
     const node = document.createElement("p");
@@ -3058,6 +3083,216 @@ function renderReconstructionProgress(progress, { stale = false } = {}) {
     "admin-reconstruction-freshness");
 }
 
+// Closed refusal codes carry no owner identity and no raw error. An unmapped
+// code renders verbatim so a newly coded upstream reason stays visible as
+// itself rather than vanishing from the refusal totals.
+const GRAPH_REFUSAL_LABELS = Object.freeze({
+  multi_plan_window_unsupported: "window spans more than one plan",
+  supported_quota_track_unavailable: "no supported quota track",
+  downsampled_quota_limit_exceeded: "too many quota observations",
+  windowed_usage_limit_exceeded: "too many usage events",
+  plan_attribution_limit_exceeded: "plan attribution limit",
+  multi_provider_window_unsupported: "window spans more than one provider",
+  multi_account_window_unsupported: "window spans more than one account",
+  multi_era_window_unsupported: "window spans more than one era",
+  continuity_track_limit_exceeded: "continuity track limit",
+  usage_cost_limit_exceeded: "usage cost limit",
+  other: "other reason",
+});
+const GRAPH_DAY_STATE_LABELS = Object.freeze({
+  published: "Published",
+  complete: "Complete, awaiting publication",
+  partial: "Some results",
+  none: "No results yet",
+});
+
+function graphDayState(day) {
+  if (day.published) return "published";
+  if (day.missing === 0) return "complete";
+  return day.ready + day.refused + day.unsupported > 0 ? "partial" : "none";
+}
+
+/** A day's publication clock is stated in UTC, the basis the rebuild records,
+ * rather than re-expressed in the reader's zone where it would imply a
+ * precision the stored stamp does not carry. */
+function graphUtcClock(value) {
+  const epoch = value === null ? Number.NaN : Date.parse(value);
+  return Number.isFinite(epoch)
+    ? `${new Date(epoch).toISOString().slice(11, 16)} UTC`
+    : "time not recorded";
+}
+
+function graphDayTitle(day) {
+  const state = graphDayState(day);
+  const outcome = {
+    published: `published ${graphUtcClock(day.publishedAt)}`,
+    complete: "complete, awaiting publication",
+    partial: "in progress",
+    none: "no results yet",
+  }[state];
+  return `${day.day} · ${formatNumber(day.ready)} ready · ${formatNumber(day.refused)} refused`
+    + ` · ${formatNumber(day.unsupported)} unsupported · ${formatNumber(day.missing)} missing · ${outcome}`;
+}
+
+function graphCheckpointSize(bytes) {
+  if (bytes < 1024) return `${formatNumber(bytes)} bytes`;
+  if (bytes < 1_048_576) return `${formatNumber(Math.round(bytes / 1024))} KiB`;
+  return `${formatNumber(Math.round(bytes / 1_048_576))} MiB`;
+}
+
+/** Lease remaining is measured against the read instant, not the page clock, so
+ * a stale panel keeps stating what was true when the payload was observed
+ * rather than counting a lease down against time it never saw. */
+function graphLeaseText(expiresAt, observedAt) {
+  const epoch = expiresAt === null ? Number.NaN : Date.parse(expiresAt);
+  const observed = Date.parse(observedAt);
+  if (!Number.isFinite(epoch) || !Number.isFinite(observed)) return "no lease recorded";
+  const remaining = epoch - observed;
+  return remaining <= 0
+    ? "lease expired at last read"
+    : `lease ${formatNumber(Math.ceil(remaining / 60_000))} min at last read`;
+}
+
+function renderGraphRebuild(progress, panel, badge, details) {
+  const { graph, work } = progress;
+  const { window, owners, currentFits, days, refusals, throughput, retirement } = graph;
+  const { selections, checkpoints } = graph.work;
+  panel.className = "admin-reconstruction admin-reconstruction-graph";
+  const heading = $("#admin-reconstruction-title");
+  if (heading) heading.textContent = "Graph rebuild";
+  badge.className = `admin-source-badge admin-source-${graph.work.state === "idle" ? "available" : "partial"}`;
+  badge.textContent = {
+    building: "Rebuilding", queued: "Waiting for a pass", idle: "Up to date",
+  }[graph.work.state];
+  const paragraph = (text, className) => {
+    const node = document.createElement("p");
+    node.textContent = text;
+    if (className) node.className = className;
+    return node;
+  };
+  const publishedDays = days.filter(day => day.published).length;
+  const completeDays = days.filter(day => !day.published && day.missing === 0).length;
+  const subtitle = paragraph(
+    `${formatNumber(publishedDays)} of ${formatNumber(window.days)} days published`
+    + ` · ${formatNumber(completeDays)} complete, awaiting publication`,
+    "admin-graph-subtitle",
+  );
+  const strip = document.createElement("div");
+  strip.className = "admin-graph-strip";
+  strip.setAttribute("role", "img");
+  const readout = document.createElement("ul");
+  readout.className = "admin-graph-readout sr-only";
+  const stateCounts = { published: 0, complete: 0, partial: 0, none: 0 };
+  // Oldest on the left, newest on the right; the contract orders days newest
+  // first, so the strip reverses the projected list rather than the source.
+  for (const day of [...days].reverse()) {
+    const dayState = graphDayState(day);
+    stateCounts[dayState] += 1;
+    const title = graphDayTitle(day);
+    const cell = document.createElement("span");
+    cell.className = `admin-graph-day admin-graph-day-${dayState}`;
+    cell.setAttribute("title", title);
+    cell.setAttribute("aria-hidden", "true");
+    strip.append(cell);
+    const item = document.createElement("li");
+    item.textContent = title;
+    readout.append(item);
+  }
+  strip.setAttribute("aria-label",
+    `${formatNumber(window.days)} days from ${window.from} to ${window.to}:`
+    + ` ${formatNumber(stateCounts.published)} published,`
+    + ` ${formatNumber(stateCounts.complete)} complete awaiting publication,`
+    + ` ${formatNumber(stateCounts.partial)} with some results,`
+    + ` ${formatNumber(stateCounts.none)} with no results yet`);
+  const legend = document.createElement("ul");
+  legend.className = "admin-graph-legend";
+  for (const [dayState, label] of Object.entries(GRAPH_DAY_STATE_LABELS)) {
+    const item = document.createElement("li");
+    const key = document.createElement("span");
+    key.className = `admin-graph-key admin-graph-day-${dayState}`;
+    key.setAttribute("aria-hidden", "true");
+    const text = document.createElement("span");
+    text.textContent = `${label} · ${formatNumber(stateCounts[dayState])}`;
+    item.append(key, text);
+    legend.append(item);
+  }
+  const grid = document.createElement("dl");
+  grid.className = "admin-reconstruction-grid admin-graph-grid";
+  const metric = (label, text) => {
+    const group = document.createElement("div");
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const description = document.createElement("dd");
+    description.textContent = text;
+    group.append(term, description);
+    grid.append(group);
+    return group;
+  };
+  const fitsGroup = metric("Today's fits",
+    `${formatNumber(currentFits.ready)} ready · ${formatNumber(currentFits.noFit)} without a usable fit`
+    + ` · ${formatNumber(currentFits.missing)} missing of ${formatNumber(owners.active)} owners`);
+  fitsGroup.append(paragraph(`Current fits for ${currentFits.day}.`));
+  if (currentFits.missing > 0) {
+    fitsGroup.append(paragraph("A graph preview needs a result for every owner"));
+  }
+  const ownersGroup = metric("Owners", `${formatNumber(owners.active)} active`);
+  if (refusals.length === 0) {
+    ownersGroup.append(paragraph("No refusals recorded."));
+  } else {
+    const list = document.createElement("ul");
+    list.className = "admin-graph-refusals";
+    for (const refusal of refusals) {
+      const item = document.createElement("li");
+      item.textContent = "Model graph"
+        + ` · ${GRAPH_REFUSAL_LABELS[refusal.reason] ?? refusal.reason}`
+        + ` · ${formatNumber(refusal.owners)} ${refusal.owners === 1 ? "owner" : "owners"}`;
+      item.setAttribute("title", refusal.reason);
+      list.append(item);
+    }
+    ownersGroup.append(list);
+  }
+  const activity = graph.work.activeMetric === null
+    ? "Nothing claimed"
+    : graph.work.activeMetric === "fits"
+      ? "current fits"
+      : graph.work.activeDay === null
+        ? "model day not recorded"
+        : `model day ${graph.work.activeDay}`;
+  const activeGroup = metric("In progress", activity);
+  activeGroup.append(paragraph(`${graphLeaseText(graph.work.leaseExpiresAt, progress.generatedAt)}`
+    + ` · ${formatNumber(selections.pending)} selections pending`
+    + ` · ${formatNumber(selections.claimed)} claimed`));
+  activeGroup.append(paragraph(checkpoints === null
+    ? "checkpoints not counted"
+    : `${formatNumber(checkpoints.stages)} stages`
+      + ` · ${formatNumber(checkpoints.parts)} parts · ${graphCheckpointSize(checkpoints.bytes)}`));
+  if (checkpoints !== null && checkpoints.phases.length > 0) {
+    activeGroup.append(paragraph(`Checkpoint phases: ${checkpoints.phases
+      .map(phase => `${phase.phase} ${formatNumber(phase.stages)} stages, ${formatNumber(phase.parts)} parts`)
+      .join(" · ")}`));
+  }
+  const throughputGroup = metric("Throughput",
+    `${throughput.resultsLastHour === null
+      ? "results in the last hour not counted"
+      : `${formatNumber(throughput.resultsLastHour)} results in the last hour`}`
+    + ` · ${throughput.resultsLast6Hours === null
+      ? "6-hour total not counted"
+      : `${formatNumber(throughput.resultsLast6Hours)} in 6 h`}`);
+  throughputGroup.append(paragraph(`${formatNumber(throughput.remainingResults)} results remaining`));
+  throughputGroup.append(paragraph(`Estimate only: ${throughput.estimatedHoursRemaining === null
+    ? "no estimate yet"
+    : `about ${formatNumber(throughput.estimatedHoursRemaining, { maximumFractionDigits: 1 })} h remaining at the 6-hour rate`}.`));
+  const freshness = paragraph(`${state.reconstructionProgressFailed ? "Progress refresh unavailable. " : ""}Observed ${formatTime(progress.generatedAt)}${work.updatedAt === null ? "" : ` · work updated ${formatTime(work.updatedAt)}`}. Window ${window.from} to ${window.to}.`, "admin-reconstruction-freshness");
+  details.replaceChildren(subtitle, strip, readout, legend, grid,
+    ...(retirement.staleResults === null
+      ? [paragraph("retirement backlog not counted", "admin-graph-retirement")]
+      : retirement.staleResults > 0
+        ? [paragraph(`${formatNumber(retirement.staleResults)} results from a previous build awaiting retirement`,
+          "admin-graph-retirement")]
+        : []),
+    freshness);
+}
+
 function renderCurrentReconstructionProgress() {
   const progress = state.reconstructionProgress;
   if (progress === null) {
@@ -3068,8 +3303,14 @@ function renderCurrentReconstructionProgress() {
   const badge = $("#admin-reconstruction-status");
   const details = $("#admin-reconstruction-details");
   if (!panel || !badge || !details) return;
+  if (progress.schemaVersion === 3 && progress.graph) {
+    renderGraphRebuild(progress, panel, badge, details);
+    return;
+  }
   const { publication, work, history } = progress;
   panel.className = "admin-reconstruction";
+  const heading = $("#admin-reconstruction-title");
+  if (heading) heading.textContent = "Graph reconstruction";
   badge.className = `admin-source-badge admin-source-${work.state === "unavailable" || work.state === "paused" ? "partial" : "available"}`;
   const workLabel = {
     idle: "Up to date", queued: "Update queued", building: "Updating",

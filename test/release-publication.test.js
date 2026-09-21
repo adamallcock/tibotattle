@@ -193,6 +193,26 @@ test("one feed failure preserves earlier successes and never blindly retries unc
   assert.equal(third.complete, true); assert.equal(server.writes.filter((step) => step === "feed-arm64").length, 1);
 });
 
+test("mutation diagnostics retain only closed error codes without relaxing uncertain recovery", async (t) => {
+  for (const code of ["SPARKLE_UPDATE_ATOMIC_GUARD_TOKEN_REQUIRED", "PRIVATE_SYNTHETIC_SECRET_ABC123"]) {
+    const f = await fixture(t), server = remote(f.plan);
+    server.adapters.publishFeed = async (_prepared, architecture) => {
+      server.writes.push(`feed-${architecture}`);
+      if (architecture === "arm64") { server.state.arm64 = true; return; }
+      throw Object.assign(new Error("private synthetic diagnostics"), { code });
+    };
+    const result = await reconcilePublication(options(f, server));
+    assert.equal(result.code, "RELEASE_PUBLICATION_UNCERTAIN_RECONCILE_REQUIRED");
+    assert.deepEqual(result.mutationFailure, { step: "feed-x64", code: code.startsWith("SPARKLE_") ? code : "RELEASE_PUBLICATION_MUTATION_FAILED" });
+    assert.equal((await readOperation(f.operationDirectory)).state.steps["feed-x64"], "intent");
+    const resumed = await reconcilePublication({ ...options(f, server), resume: true, executorStopped: true });
+    assert.equal(resumed.complete, false);
+    assert.equal(server.writes.filter(step => step === "feed-x64").length, 1);
+    assert.ok(!JSON.stringify(result).includes("private synthetic diagnostics"));
+    assert.ok(!JSON.stringify(result).includes("PRIVATE_SYNTHETIC_SECRET_ABC123"));
+  }
+});
+
 test("asynchronous tap dispatch is recorded once and read back on resume", async (t) => {
   const f = await fixture(t), server = remote(f.plan);
   server.adapters.publishTap = async () => { server.writes.push("tap-dispatch"); };
@@ -297,9 +317,143 @@ test("draft admission refuses promoting an older version to latest", async (t) =
   const adapter = createPublicationAdapters({ spawn: (_command, args) => {
     assert.equal(args[2], "GET");
     if (args[3].includes("/releases/tags/")) return { status: 1, stderr: "HTTP 404" };
+    if (args[3] === "repos/adamallcock/tibotattle") return { status: 0, stdout: JSON.stringify({ full_name: "adamallcock/tibotattle", permissions: { push: true } }) };
+    if (args[3].includes("/releases?")) return { status: 0, stdout: "[]" };
     return { status: 0, stdout: JSON.stringify(args[3].endsWith("/immutable-releases") ? { enabled: true } : { tag_name: "v1.2.4" }) };
   } });
   await assert.rejects(adapter.github({ plan: f.plan }), /DOWNGRADE_REFUSED/);
+});
+
+function draftDiscoverySpawn({ pages = [[]], byId, repository = { full_name: "adamallcock/tibotattle", permissions: { push: true } }, byTag, calls = [] } = {}) {
+  return (command, args) => {
+    assert.equal(command, "gh"); assert.equal(args[0], "api"); assert.equal(args[2], "GET");
+    const route = args[3]; calls.push(route);
+    if (route === "repos/adamallcock/tibotattle/releases/tags/v1.2.3") return byTag ?? { status: 1, stderr: "HTTP 404" };
+    if (route === "repos/adamallcock/tibotattle") return { status: 0, stdout: JSON.stringify(repository) };
+    const page = /^repos\/adamallcock\/tibotattle\/releases\?per_page=100&page=(\d+)$/u.exec(route);
+    if (page) return { status: 0, stdout: JSON.stringify(pages[Number(page[1]) - 1]) };
+    if (route === "repos/adamallcock/tibotattle/releases/7") return byId?.status !== undefined ? byId : { status: 0, stdout: JSON.stringify(byId) };
+    if (route === "repos/adamallcock/tibotattle/releases/7/assets?per_page=100&page=1") return { status: 0, stdout: "[]" };
+    if (route === "repos/adamallcock/tibotattle/immutable-releases") return { status: 0, stdout: '{"enabled":true}' };
+    if (route === "repos/adamallcock/tibotattle/releases/latest") return { status: 0, stdout: '{"tag_name":"v1.2.2"}' };
+    assert.fail("Unexpected remote request");
+  };
+}
+const discoveryDraft = () => ({ id: 7, tag_name: "v1.2.3", draft: true, prerelease: false,
+  name: "TiboTattle 1.2.3", body: "Synthetic release notes" });
+const unrelatedReleases = (page) => Array.from({ length: 100 }, (_, index) => ({
+  id: page * 100 + index + 100, tag_name: `other-${page}-${index}`, draft: false, prerelease: false,
+}));
+
+test("GitHub draft discovery scans beyond page one, re-reads exact ID and remains read-only", async (t) => {
+  const f = await fixture(t), calls = [], draft = discoveryDraft();
+  const adapter = createPublicationAdapters({ spawn: draftDiscoverySpawn({ pages: [unrelatedReleases(1), [draft]], byId: draft, calls }) });
+  const result = await adapter.github({ plan: f.plan });
+  assert.equal(result.status, "draft"); assert.equal(result.release.id, 7); assert.deepEqual(result.assets, []);
+  assert.ok(calls.includes("repos/adamallcock/tibotattle/releases?per_page=100&page=2"));
+  assert.ok(calls.indexOf("repos/adamallcock/tibotattle/releases/7") > calls.indexOf("repos/adamallcock/tibotattle/releases?per_page=100&page=2"));
+});
+
+test("GitHub draft discovery proves absence only after complete visible listing", async (t) => {
+  const f = await fixture(t), calls = [];
+  const adapter = createPublicationAdapters({ spawn: draftDiscoverySpawn({ pages: [[{ ...discoveryDraft(), tag_name: "v1.2.30" }]], calls }) });
+  assert.deepEqual(await adapter.github({ plan: f.plan }), { status: "missing", release: null, assets: [] });
+  assert.ok(!calls.includes("repos/adamallcock/tibotattle/releases/7"));
+  for (const repository of [{}, { full_name: "elsewhere/repository", permissions: { push: true } },
+    { full_name: "adamallcock/tibotattle", permissions: { push: false } },
+    { full_name: "adamallcock/tibotattle", permissions: { push: "true" } }]) {
+    const calls = [];
+    await assert.rejects(createPublicationAdapters({ spawn: draftDiscoverySpawn({ repository, calls }) }).github({ plan: f.plan }), /DRAFT_VISIBILITY_REQUIRED/u);
+    assert.equal(calls.length, 2);
+  }
+});
+
+test("GitHub draft discovery refuses malformed lists, duplicate IDs/tags and pagination overflow", async (t) => {
+  const f = await fixture(t), draft = discoveryDraft();
+  for (const pages of [[{}], [[null]], [[{ ...draft, id: 0 }]], [[{ ...draft, id: "7" }]],
+    [[{ ...draft, tag_name: null }]], [[{ ...draft, draft: undefined }]], [[{ ...draft, prerelease: "false" }]],
+    [[draft, draft]], [[draft, { ...draft, id: 8 }]],
+    [[draft, ...unrelatedReleases(1).slice(0, 99)], [{ ...draft, id: 8 }]],
+    [unrelatedReleases(1), [unrelatedReleases(1)[0]]],
+    [Array.from({ length: 101 }, (_, index) => ({ ...draft, id: index + 1 }))]]) {
+    const calls = [];
+    await assert.rejects(createPublicationAdapters({ spawn: draftDiscoverySpawn({ pages, byId: draft, calls }) }).github({ plan: f.plan }), /RELEASE_LIST_(INVALID|CONFLICT)/u);
+    assert.ok(!calls.includes("repos/adamallcock/tibotattle/releases/7"));
+  }
+  const calls = [], pages = Array.from({ length: 20 }, (_, index) => unrelatedReleases(index + 1));
+  pages[0][0] = draft;
+  await assert.rejects(createPublicationAdapters({ spawn: draftDiscoverySpawn({ pages, byId: draft, calls }) }).github({ plan: f.plan }), /RELEASE_LIST_TOO_LARGE/u);
+  assert.equal(calls.filter(route => route.includes("/releases?")).length, 20);
+  assert.ok(!calls.includes("repos/adamallcock/tibotattle/releases/7"));
+});
+
+test("GitHub draft discovery rejects changed or unavailable ID readback and preserves title/body/asset checks", async (t) => {
+  const f = await fixture(t), draft = discoveryDraft();
+  for (const [byId, expected] of [[{ ...draft, id: 8 }, /DISCOVERY_CHANGED/u],
+    [{ ...draft, tag_name: "v9.9.9" }, /DISCOVERY_CHANGED/u], [{ ...draft, draft: false }, /DISCOVERY_CHANGED/u],
+    [{ ...draft, prerelease: true }, /DISCOVERY_CHANGED/u], [{ ...draft, name: "Unexpected title" }, /IDENTITY_CONFLICT/u],
+    [{ ...draft, body: "Unreviewed notes" }, /IDENTITY_CONFLICT/u], [null, /REMOTE_JSON_INVALID/u],
+    [{ status: 1, stderr: "HTTP 404" }, /REMOTE_COMMAND_FAILED/u]]) {
+    await assert.rejects(createPublicationAdapters({ spawn: draftDiscoverySpawn({ pages: [[draft]], byId }) }).github({ plan: f.plan }), expected);
+  }
+  for (const malformed of [false, 0, "", []]) {
+    const calls = [], byTag = { status: 0, stdout: JSON.stringify(malformed) };
+    await assert.rejects(createPublicationAdapters({ spawn: draftDiscoverySpawn({ byTag, calls }) }).github({ plan: f.plan }), /IDENTITY_CONFLICT/u);
+    assert.equal(calls.length, 1);
+  }
+  for (const change of [{ id: 0 }, { draft: undefined }, { draft: "false" }, { body: {} }]) {
+    const calls = [], byTag = { status: 0, stdout: JSON.stringify({ ...draft, ...change }) };
+    await assert.rejects(createPublicationAdapters({ spawn: draftDiscoverySpawn({ byTag, calls }) }).github({ plan: f.plan }), /IDENTITY_CONFLICT/u);
+    assert.equal(calls.length, 1);
+  }
+  for (const byTag of [{ status: 0, stdout: "null" }, { status: 0, stdout: "" }, { status: 0, stdout: "{" },
+    { status: 1, stderr: "HTTP 403" }]) {
+    const calls = [];
+    await assert.rejects(createPublicationAdapters({ spawn: draftDiscoverySpawn({ byTag, calls }) }).github({ plan: f.plan }), /REMOTE_(JSON_INVALID|COMMAND_FAILED)/u);
+    assert.equal(calls.length, 1);
+  }
+});
+
+test("draft provisional asset URLs bind the exact draft page and still require downloaded API bytes", async (t) => {
+  const f = await fixture(t), expected = f.plan.assets[0], contents = await readFile(expected.path);
+  const token = "untagged-0123456789abcdefabcd";
+  const page = `https://github.com/adamallcock/tibotattle/releases/tag/${token}`;
+  const url = `https://github.com/adamallcock/tibotattle/releases/download/${token}/${expected.name}`;
+  async function inspect({ htmlUrl = page, assetUrl = url, draft = true, wrongBytes = false } = {}) {
+    let downloads = 0;
+    const release = { ...discoveryDraft(), html_url: htmlUrl, draft };
+    const delegate = draftDiscoverySpawn({ pages: [[release]], byId: release });
+    const asset = { name: expected.name, id: 10, size: expected.bytes, state: "uploaded", browser_download_url: assetUrl };
+    const adapter = createPublicationAdapters({ spawn: (command, args, options) => {
+      if (args.includes("Accept: application/octet-stream")) {
+        assert.equal(command, "gh"); assert.equal(args[1], "repos/adamallcock/tibotattle/releases/assets/10");
+        downloads += 1; writeSync(options.stdio[1], wrongBytes ? Buffer.from("altered bytes") : contents);
+        return { status: 0, stdout: "" };
+      }
+      if (args[3] === "repos/adamallcock/tibotattle/releases/7/assets?per_page=100&page=1") {
+        assert.equal(args[2], "GET"); return { status: 0, stdout: JSON.stringify([asset]) };
+      }
+      return delegate(command, args, options);
+    } });
+    try { return { result: await adapter.github({ plan: f.plan }), downloads }; }
+    catch (error) { return { error, downloads }; }
+  }
+  const passed = await inspect();
+  assert.equal(passed.result.status, "draft"); assert.equal(passed.downloads, 1);
+  assert.equal(passed.result.assets[0].browser_download_url, url); // Keep provisional evidence truthful.
+  for (const change of [{ draft: false }, { htmlUrl: undefined, assetUrl: url.replace(token, "untagged-abcdef0123456789abcd") },
+    { htmlUrl: page + "?other=1" }, { htmlUrl: page + "\n" }, { htmlUrl: page.replace(token, "untagged-ABCDEF0123456789ABCD") },
+    { htmlUrl: page.replace(token, "untagged-0123456789abcdefabc") },
+    { htmlUrl: page.replace("adamallcock/tibotattle", "elsewhere/tibotattle") },
+    { htmlUrl: null }, { assetUrl: url + "?other=1" }, { assetUrl: url + "#fragment" },
+    { assetUrl: url.replace("github.com", "github.example") }, { assetUrl: url.replace(expected.name, "unexpected.zip") }]) {
+    const refused = await inspect(change);
+    assert.match(refused.error?.code ?? refused.error?.message ?? "", /GITHUB_ASSET_METADATA_CONFLICT/u);
+    assert.equal(refused.downloads, 0);
+  }
+  const altered = await inspect({ wrongBytes: true });
+  assert.match(altered.error?.code ?? altered.error?.message ?? "", /IMMUTABLE_BYTES_CONFLICT/u);
+  assert.equal(altered.downloads, 1);
 });
 
 test("tap adapter detects stale Intel bytes and dispatches only the pinned existing updater", async (t) => {
@@ -324,34 +478,155 @@ test("tap adapter detects stale Intel bytes and dispatches only the pinned exist
 
 test("real feed and website adapters delegate current guarded entrypoint contracts", async (t) => {
   const f = await fixture(t), prepared = await preparePublication(f.plan, f.prepareOptions), feedCalls = [], siteCalls = [];
+  const previousToken = process.env.SPARKLE_APPCAST_GUARD_TOKEN;
+  const token = "synthetic-two-target-guard-token-0123456789";
+  process.env.SPARKLE_APPCAST_GUARD_TOKEN = token;
+  t.after(() => {
+    if (previousToken === undefined) delete process.env.SPARKLE_APPCAST_GUARD_TOKEN;
+    else process.env.SPARKLE_APPCAST_GUARD_TOKEN = previousToken;
+  });
   const adapter = createPublicationAdapters({ publishFeed: async (options) => { feedCalls.push(options); return { verified: true }; },
     deploySite: async (options) => { siteCalls.push(options); return { deployment: { ok: true } }; } });
+  assert.equal(process.env.SPARKLE_APPCAST_GUARD_TOKEN, token); // Read-only construction does not consume it.
+  await adapter.publishFeed(prepared, "arm64");
+  assert.equal(process.env.SPARKLE_APPCAST_GUARD_TOKEN, undefined);
   await adapter.publishFeed(prepared, "x64");
-  assert.equal(feedCalls[0].architecture, "x64"); assert.equal(feedCalls[0].publish, true); assert.equal(feedCalls[0].replaceAppcast, true);
-  assert.equal(feedCalls[0].atomicAppcastGuardEndpoint, "https://tibotattle.com/api/v1/internal/release/appcast");
-  assert.equal(feedCalls[0].atomicAppcastGuardTokenEnv, "SPARKLE_APPCAST_GUARD_TOKEN");
-  assert.equal(feedCalls[0].releaseManifestPath, f.plan.targets[1].feedManifest.path);
+  assert.deepEqual(feedCalls.map(call => call.architecture), ["arm64", "x64"]);
+  assert.equal(feedCalls[1].publish, true); assert.equal(feedCalls[1].replaceAppcast, true);
+  assert.equal(feedCalls[0].atomicAppcastGuard, feedCalls[1].atomicAppcastGuard);
+  assert.equal(typeof feedCalls[1].atomicAppcastGuard.compareAndSwap, "function");
+  assert.equal(feedCalls[1].atomicAppcastGuardTokenEnv, undefined);
+  assert.ok(!JSON.stringify(feedCalls).includes(token));
+  assert.equal(feedCalls[1].releaseManifestPath, f.plan.targets[1].feedManifest.path);
   await adapter.publishWebsite(prepared);
   assert.equal(siteCalls[0].repositoryRoot, f.root); assert.equal(siteCalls[0].receiptPath, f.plan.website.receipt.path);
   assert.ok(siteCalls[0].confirmation.includes("PRODUCTION"));
   await writeFile(f.plan.targets[1].feedManifest.path, "changed local feed manifest");
-  await assert.rejects(adapter.publishFeed(prepared, "x64"), /LOCAL_BYTES_MISMATCH/); assert.equal(feedCalls.length, 1);
+  await assert.rejects(adapter.publishFeed(prepared, "x64"), /LOCAL_BYTES_MISMATCH/); assert.equal(feedCalls.length, 2);
 });
 
 test("website readback checks every prepared file and current healthy deployment source", async (t) => {
-  const f = await fixture(t), prepared = await preparePublication(f.plan, f.prepareOptions);
+  const f = await fixture(t);
+  const site = JSON.parse(await readFile(f.plan.website.manifest.path, "utf8"));
+  for (const path of ["docs.html", "privacy.html", "community.html", "404.html", "styles.css"]) {
+    site.files.push({ ...await f.file(path, `Synthetic ${path} bytes`), path });
+  }
+  f.plan.website.manifest = await f.file("release-site-manifest.json", JSON.stringify(site));
+  f.plan.website.receipt = await f.file("web-release-receipt.json", JSON.stringify({ sourceCommit: "c".repeat(40), site: { manifestSha256: f.plan.website.manifest.sha256 } }));
+  const prepared = await preparePublication(f.plan, f.prepareOptions);
   let healthySource = prepared.websiteSourceCommit;
   const reads = [];
-  const adapter = createPublicationAdapters({ fetchImpl: async (input) => {
+  const adapter = createPublicationAdapters({ fetchImpl: async (input, options) => {
     const url = new URL(input); reads.push(url.pathname);
+    assert.equal(options.redirect, "error");
+    // The live host redirects .html requests; the verifier must request the
+    // canonical route rather than following arbitrary remote locations.
+    if (url.pathname.endsWith(".html")) throw new TypeError("unexpected redirect");
     if (url.pathname === "/api/health") {
       const response = new Response(JSON.stringify({ status: "ok", deployment: { sourceCommit: healthySource } }), { headers: { "content-type": "application/json", "cache-control": "no-store", "referrer-policy": "no-referrer", "x-content-type-options": "nosniff" } });
       Object.defineProperty(response, "url", { value: String(input) }); return response;
     }
-    const path = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
+    const path = url.pathname === "/" ? "index.html"
+      : ["/docs", "/privacy", "/community", "/404"].includes(url.pathname) ? `${url.pathname.slice(1)}.html` : url.pathname.slice(1);
     return new Response(await readFile(join(f.root, path)));
   } });
   assert.equal((await adapter.website(prepared)).status, "matches");
-  assert.deepEqual(reads, ["/release-site-manifest.json", "/", "/api/health"]);
+  assert.deepEqual(reads, ["/release-site-manifest.json", "/", "/docs", "/privacy", "/community", "/404", "/styles.css", "/api/health"]);
   healthySource = "e".repeat(40); assert.equal((await adapter.website(prepared)).status, "pending");
+  healthySource = prepared.websiteSourceCommit;
+  await writeFile(join(f.root, "docs.html"), "Different published documentation");
+  assert.equal((await adapter.website(prepared)).status, "pending");
+});
+
+test("website admission refuses canonical route collisions and transformed dot paths", async (t) => {
+  for (const paths of [["docs", "docs.html"], ["..html"], ["...html"]]) {
+    const f = await fixture(t), site = JSON.parse(await readFile(f.plan.website.manifest.path, "utf8"));
+    for (const path of paths) site.files.push({ ...await f.file(path, `Synthetic ${path}`), path });
+    f.plan.website.manifest = await f.file("release-site-manifest.json", JSON.stringify(site));
+    f.plan.website.receipt = await f.file("web-release-receipt.json", JSON.stringify({ sourceCommit: "c".repeat(40), site: { manifestSha256: f.plan.website.manifest.sha256 } }));
+    await assert.rejects(preparePublication(f.plan, f.prepareOptions), /SITE_FILES_INVALID/);
+  }
+});
+
+async function electronFixture(t) {
+  const f = await fixture(t), { plan, file } = f;
+  const canonical = JSON.parse(await readFile(plan.assets.find(a => a.name === 'release-manifest.json').path));
+  const put = async (name, bytes) => { const entry = { name, ...await file(name, bytes) }; const i = plan.assets.findIndex(a => a.name === name); if (i < 0) plan.assets.push(entry); else plan.assets[i] = entry; return entry; };
+  for (const target of plan.targets) {
+    const old = plan.assets.find(a => a.name === target.dmgName), bytes = await readFile(old.path);
+    target.sparkleDmg = { path: old.path, bytes: old.bytes, sha256: old.sha256 };
+    plan.assets.splice(plan.assets.indexOf(old), 1);
+    target.dmgName = `TiboTattle-1.2.3-mac-${target.architecture}.dmg`;
+    const dmg = await put(target.dmgName, bytes);
+    const a = canonical.artifacts.find(a => a.architecture === target.architecture);
+    a.fileName = dmg.name; a.downloadUrl = `${source.repository}/releases/download/v1.2.3/${dmg.name}`;
+    a.build = { sourceManifestSha256: sha('synthetic source'), finalArtifactSha256: dmg.sha256 };
+    const metadata = await put(`TiboTattle-1.2.3-darwin-${target.architecture}-update.yml`, 'synthetic Electron updater metadata');
+    a.updater = { enabled: true, mechanism: 'electron-updater', metadata: { fileName: metadata.name, bytes: metadata.bytes, sha256: metadata.sha256, subjectSha256: dmg.sha256 } };
+    for (const suffix of ['zip', 'zip.blockmap', 'dmg.blockmap']) await put(`TiboTattle-1.2.3-mac-${target.architecture}.${suffix}`, `synthetic ${suffix}`);
+    const manifest = JSON.parse(await readFile(target.feedManifest.path));manifest.schemaVersion = 'tibotattle-electron-sparkle-transition-v1';manifest.electron={buildNumber:'2026091107'};
+    target.feedManifest = await file(`feed-manifest-${target.architecture}.json`, JSON.stringify(manifest));
+  }
+  for (const platform of ['windows', 'linux']) {
+    const windows = platform === 'windows', target = windows ? 'win32-x64' : 'linux-x64';
+    const dmg = await put(`TiboTattle-1.2.3-${windows ? 'Windows-x64.exe' : 'linux-x86_64.AppImage'}`, `synthetic ${platform}`);
+    const metadata = await put(`TiboTattle-1.2.3-${target}-update.yml`, `synthetic ${platform} metadata`);
+    canonical.artifacts.push({ ...structuredClone(canonical.artifacts[0]), platform, architecture:'x64', format:windows?'exe':'appimage', fileName:dmg.name, bytes:dmg.bytes, sha256:dmg.sha256,
+      downloadUrl:`${source.repository}/releases/download/v1.2.3/${dmg.name}`,
+      nativeTrust:windows?{publisher:'Synthetic',certificateSha256:sha('certificate')}:{scheme:'none'},
+      assurances:windows?{cleanInstallSmokePassed:true,authenticodeSigned:true,timestamped:true}:{cleanInstallSmokePassed:true,artifactIntegrityVerified:true},
+      build:{sourceManifestSha256:sha('source'),finalArtifactSha256:dmg.sha256},
+      updater:{enabled:true,mechanism:'electron-updater',metadata:{fileName:metadata.name,bytes:metadata.bytes,sha256:metadata.sha256,subjectSha256:dmg.sha256}} });
+  }
+  const { compareArtifactIdentity } = await import('../scripts/release-evidence.js');canonical.artifacts.sort(compareArtifactIdentity);
+  await put('release-manifest.json', `${stableStringify(canonical)}\n`);await put('SHA256SUMS',buildSha256Sums(canonical));
+  const all = plan.assets.filter(a => !['release-manifest.json','SHA256SUMS','verify-release.md'].includes(a.name)).map(a => `${a.sha256}  ${a.name}`).sort().join('\n')+'\n';await put('SHA256SUMS-ALL-RELEASE-FILES',all);
+  const site = JSON.parse(await readFile(plan.website.manifest.path));delete site.installer;delete site.intelInstaller;
+  site.electronRelease={version:'1.2.3',buildNumber:'2026091107',publishedInstallersVerified:true,
+    verificationScope:['reviewed-publication-plan','local-artifact-bytes','published-installer-bytes'],
+    downloads:canonical.artifacts.map(a=>({target:`${{macos:'darwin',windows:'win32',linux:'linux'}[a.platform]}-${a.architecture}`,url:a.downloadUrl,bytes:a.bytes,sha256:a.sha256}))};
+  plan.website.manifest=await file('release-site-manifest.json',JSON.stringify(site));plan.website.receipt=await file('web-release-receipt.json',JSON.stringify({sourceCommit:'c'.repeat(40),site:{manifestSha256:plan.website.manifest.sha256}}));
+  plan.tap={...await file('tibotattle.rb',(await readFile(plan.tap.path,'utf8')).replace('-macOS-','-mac-')),workflowSha256:plan.tap.workflowSha256};
+  return {...f,put};
+}
+
+test('Electron transition admits four platforms, exact auxiliary files, incoming alias and outgoing YAML separately', async t => {
+  const f = await electronFixture(t);assert.equal(f.plan.assets.length,20);
+  const calls=[];const prepared=await preparePublication(f.plan,{...f.prepareOptions,publishFeed:async options=>{calls.push(options);return f.prepareOptions.publishFeed(options);}});
+  assert.equal(calls.length,2);assert.equal(calls[1].dmgPath,f.plan.targets[1].sparkleDmg.path);
+  assert.equal(prepared.plan.assets.some(a=>a.name==='TiboTattle-1.2.3-darwin-arm64-update.yml'),true);
+});
+
+test('Electron transition refuses alias substitution, missing incoming XML, unsigned inventory and wrong feed discriminator', async t => {
+  for(const change of ['alias','missing_xml','extra','sums','discriminator']) {
+    const f=await electronFixture(t);
+    if(change==='alias')f.plan.targets[1].sparkleDmg=await f.file('wrong.dmg','unrelated signed bytes');
+    if(change==='missing_xml')f.plan.assets=f.plan.assets.filter(a=>a.name!==f.plan.targets[0].appcastName);
+    if(change==='extra')await f.put('unreviewed.txt','extra');
+    if(change==='sums')await f.put('SHA256SUMS-ALL-RELEASE-FILES','wrong');
+    if(change==='discriminator'){const m=JSON.parse(await readFile(f.plan.targets[0].feedManifest.path));delete m.schemaVersion;f.plan.targets[0].feedManifest=await f.file('feed-manifest-arm64.json',JSON.stringify(m));}
+    await assert.rejects(preparePublication(f.plan,f.prepareOptions),/RELEASE_PUBLICATION_/);
+  }
+});
+
+
+test('Electron website binds the actual four-download schema and rejects stale or unverified rows', async t => {
+  for(const change of ['legacy','version','build','unverified','scope','duplicate','missing','extra','windows_hash','linux_url','arm_size','intel_hash']) {
+    const f=await electronFixture(t), site=JSON.parse(await readFile(f.plan.website.manifest.path)), release=site.electronRelease;
+    if(change==='legacy'){delete site.electronRelease;site.installer={version:'1.2.3'};}
+    if(change==='version')release.version='1.2.2';
+    if(change==='build')release.buildNumber='2026091106';
+    if(change==='unverified')release.publishedInstallersVerified=false;
+    if(change==='scope')release.verificationScope.pop();
+    if(change==='duplicate')release.downloads[1]={...release.downloads[0]};
+    if(change==='missing')release.downloads.pop();
+    if(change==='extra')release.downloads[0].unreviewed=true;
+    if(change==='windows_hash')release.downloads.find(r=>r.target==='win32-x64').sha256=sha('wrong');
+    if(change==='linux_url')release.downloads.find(r=>r.target==='linux-x64').url='https://updates.tibotattle.com/wrong';
+    if(change==='arm_size')release.downloads.find(r=>r.target==='darwin-arm64').bytes++;
+    if(change==='intel_hash')release.downloads.find(r=>r.target==='darwin-x64').sha256=sha('wrong');
+    f.plan.website.manifest=await f.file('release-site-manifest.json',JSON.stringify(site));
+    f.plan.website.receipt=await f.file('web-release-receipt.json',JSON.stringify({sourceCommit:'c'.repeat(40),site:{manifestSha256:f.plan.website.manifest.sha256}}));
+    await assert.rejects(preparePublication(f.plan,f.prepareOptions),{code:'RELEASE_PUBLICATION_SITE_INSTALLER_MISMATCH'},change);
+  }
 });

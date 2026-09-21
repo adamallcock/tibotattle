@@ -101,3 +101,18 @@ test("timing failures return a fixed content-free error without changing account
   const health = await fetch(`${base}/api/local/health`).then((value) => value.json());
   assert.equal(health.snapshot.status, "ready");
 });
+
+test("model performance accepts an exact rolling anchor and rejects ambiguous bounds", async (t) => {
+  const calls = [];
+  const { base } = await fixture(t, { modelPerformanceProvider: async (period, options) => {
+    calls.push({ period, options }); return { status: 'loading', models: [] };
+  } });
+  const endAt = '2026-09-01T12:34:56.000Z';
+  const route = `${base}/api/local/model-performance?period=1`;
+  assert.equal((await fetch(`${route}&endAt=${encodeURIComponent(endAt)}`)).status, 200);
+  assert.deepEqual(calls, [{ period: '1', options: { endAt } }]);
+  for (const query of ['&endAt=2026-09-01', '&endAt=', `&endAt=${endAt}&endAt=${endAt}`, '&endAt=9999-01-01T00:00:00.000Z']) {
+    assert.equal((await fetch(`${route}${query}`)).status, 400);
+  }
+  assert.equal(calls.length, 1);
+});

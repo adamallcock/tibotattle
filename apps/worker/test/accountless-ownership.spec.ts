@@ -19,21 +19,28 @@ import {
   ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
   ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
 } from "../src/accountless-ownership";
+import { initializeStorageSource } from "../src/analytics-delivery";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
 import { eraseParticipantAsOwner } from "../src/participant-erasure";
 import { accountScopedModelCompositionV11, accountScopedQuotaAnalysisV11 } from "../src/quota-analysis-v11";
 import { collectCommunityAllowanceFits, publishCommunityAnalysisCaches } from "../src/community-allowance";
-import { advanceCommunityPublication } from "../src/community-publication";
+import { advanceCommunityPublication, readCapturedCommunityPublication,
+  markCommunityPublicationPublished } from "../src/community-publication";
+import { V1_ANALYSIS_WINDOW_DAYS } from "../src/quota-analysis-v1";
 import { loadV11SourcePin } from "../src/telemetry-v11-domain";
 import { makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
   TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[];
+  TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[];
+  TEST_INGESTION_BRIDGE_MIGRATIONS: D1Migration[];
+  TEST_INGESTION_ISOLATION_MIGRATIONS: D1Migration[];
 }
 
 const ORIGIN = "https://example.test";
+const STORAGE_SOURCE_ID = "synthetic-accountless-ownership-source";
 const DAY_MILLISECONDS = 86_400_000;
 const PUBLIC_FIXTURE_AT = "2026-09-01T12:00:00.000Z";
 let publicJwk: JsonWebKey;
@@ -429,7 +436,17 @@ describe("accountless owner-to-v1.1 transport", () => {
     }
   });
 
-  it("creates a direct owner, accepts encrypted usage and quota exactly once, then revokes every active authority", async () => {
+  it("creates a direct owner, accepts encrypted usage and quota exactly once, then retains accepted history while revoking upload authority", async () => {
+    await applyD1Migrations(
+      db(),
+      bindings().TEST_TYPED_INGESTION_MIGRATIONS.filter((item) => item.name.startsWith("0002_")),
+    );
+    await applyD1Migrations(db(), bindings().TEST_INGESTION_BRIDGE_MIGRATIONS);
+    await applyD1Migrations(
+      db(),
+      bindings().TEST_INGESTION_ISOLATION_MIGRATIONS.filter((item) => item.name.startsWith("0005_")),
+    );
+    await initializeStorageSource(db(), STORAGE_SOURCE_ID);
     const deviceId = crypto.randomUUID();
     const secret = crypto.getRandomValues(new Uint8Array(32));
     const authorization = `Device um_device_${deviceId}.${encodeBase64Url(secret)}`;
@@ -671,12 +688,16 @@ describe("accountless owner-to-v1.1 transport", () => {
       ]);
       expect(await accountScopedQuotaAnalysisV11(db(), participantId!))
         .toMatchObject({ status: "ready" });
-      expect(await publicPublicationSnapshot()).toEqual(publicBeforeActivation);
+      expect(await db().prepare(`SELECT participant_id, owner_kind, device_id
+        FROM community_public_source_owners WHERE participant_id = ?`)
+        .bind(participantId).first()).toEqual({
+        participant_id: participantId, owner_kind: "accountless", device_id: deviceId,
+      });
+      const publicAfterActivation = await publicPublicationSnapshot();
+      expect(publicAfterActivation.mutationEpoch).not.toEqual(publicBeforeActivation.mutationEpoch);
 
-      // A populated accountless v1.1 source remains private even if an old
-      // scheduler invocation reaches the cache/publication helpers directly.
-      // The source gates must repeat the owner boundary rather than relying on
-      // enrollment's ordinary absence of a queue row.
+      // The real encrypted upload, its exact replay, and complete-domain
+      // activation now schedule one public source without social consent.
       const accountlessSourcePin = await loadV11SourcePin(db(), participantId!);
       if (accountlessSourcePin === null) throw new Error("synthetic accountless source missing");
       const accountlessAnalysis = await accountScopedQuotaAnalysisV11(db(), participantId!, {
@@ -689,43 +710,39 @@ describe("accountless owner-to-v1.1 transport", () => {
       await db().prepare(`UPDATE retention_state
         SET maintenance_lease_token = ?, maintenance_lease_expires_at = '2030-01-01T00:00:00.000Z'
         WHERE singleton = 1`).bind(accountlessLease).run();
+      const publicationTime = Date.now();
+      const publicationFromDay = new Date(publicationTime
+        - V1_ANALYSIS_WINDOW_DAYS * DAY_MILLISECONDS).toISOString().slice(0, 10);
       expect(await publishCommunityAnalysisCaches(db(), {
         participantId: participantId!,
         source: "v1.1",
         sourcePin: accountlessSourcePin,
         fitFingerprint: accountlessSourcePin.fingerprint,
-        fromDay: accountlessSourcePin.fromDay,
+        fromDay: publicationFromDay,
         compositionSupported: true,
-      }, [{ source: "v1.1", analysis: accountlessAnalysis }], accountlessComposition, accountlessLease)).toBe(false);
-      await db().prepare(`INSERT INTO community_current_analysis_queue
-        (participant_id, dirty_generation, window_generation, pending, last_served_sequence)
-        VALUES (?, 1, 0, 1, 0)`).bind(participantId).run();
-      await advanceCommunityPublication(db(), Date.now(), {
+      }, [{ source: "v1.1", analysis: accountlessAnalysis }], accountlessComposition, accountlessLease)).toBe(true);
+      expect(await advanceCommunityPublication(db(), publicationTime, {
         budget: { remainingQueries: 64, deadlineMs: Date.now() + 30_000 },
-        maxPages: 4,
+        maxPages: 8,
+      })).toMatchObject({ status: "ready", memberCount: 1, preparedCount: 1 });
+      const captured = await readCapturedCommunityPublication(db(), publicationTime, {
+        budget: { remainingQueries: 64, deadlineMs: Date.now() + 30_000 },
       });
-
-      // The populated private v1.1 domain creates no queue work itself. The
-      // one row below is an intentionally injected stale scheduler record; it
-      // remains pending and cannot enter the captured public cohort.
+      expect(captured?.corpus.participantIds).toEqual([participantId]);
       expect(await db().prepare(`SELECT COUNT(*) AS count
         FROM community_current_analysis_queue WHERE participant_id = ?`)
         .bind(participantId).first()).toEqual({ count: 1 });
       expect(await db().prepare(`SELECT COUNT(*) AS count
         FROM community_publication_members WHERE participant_id = ?`)
-        .bind(participantId).first()).toEqual({ count: 0 });
+        .bind(participantId).first()).toEqual({ count: 1 });
       expect(await db().prepare(`SELECT COUNT(*) AS count
         FROM community_allowance_fit_cache WHERE participant_id = ?`)
-        .bind(participantId).first()).toEqual({ count: 0 });
+        .bind(participantId).first()).toEqual({ count: 1 });
       expect(await db().prepare(`SELECT COUNT(*) AS count
         FROM community_model_composition_cache WHERE participant_id = ?`)
-        .bind(participantId).first()).toEqual({ count: 0 });
-
-      // Accountless evidence remains eligible for its private, internal
-      // v1.1 analytical domain, but its owner kind is deliberately excluded
-      // from the public allowance cohort until an independent eligibility
-      // decision exists.
-      expect(await collectCommunityAllowanceFits(db())).toEqual([]);
+        .bind(participantId).first()).toEqual({ count: 1 });
+      expect(await collectCommunityAllowanceFits(db(), publicationTime))
+        .toEqual(captured!.corpus.fits);
 
       const pendingEnvelope = JSON.stringify(await encrypted(prepared.chunks[0]));
       const pendingRegistration = await registerDeviceUpload(authorization, pendingEnvelope);
@@ -768,6 +785,42 @@ describe("accountless owner-to-v1.1 transport", () => {
         pending_upload_state: "revoked",
         consumed_uploads: prepared.chunks.length + 1,
       });
+      // Ordinary opt-out revokes future upload authority while the exact
+      // accepted head remains eligible for historical analytics and public
+      // source selection.
+      expect(await db().prepare(`SELECT generation_id, head_revision
+        FROM accountless_public_history_retention WHERE participant_id = ?`)
+        .bind(participantId).first()).toEqual({
+          generation_id: accountlessSourcePin.generationId,
+          head_revision: 1,
+        });
+      expect(await db().prepare(`SELECT state FROM storage_v11_owner_links
+        WHERE participant_id = ?`).bind(participantId).first()).toEqual({ state: "active" });
+      expect(await db().prepare(`SELECT participant_id, owner_kind, device_id
+        FROM community_public_source_owners WHERE participant_id = ?`)
+        .bind(participantId).first()).toEqual({
+          participant_id: participantId,
+          owner_kind: "accountless",
+          device_id: deviceId,
+        });
+      // This encrypted-transport fixture keeps the legacy single-database
+      // publication helpers. Their withdrawal triggers are removed by
+      // isolation 0001 in production; isolated publication retention is covered
+      // by the typed projection and storage journal suites. Keep the legacy
+      // refusal assertions here without claiming this checkpoint is retained.
+      expect(await readCapturedCommunityPublication(db(), publicationTime, {
+        budget: { remainingQueries: 64, deadlineMs: Date.now() + 30_000 },
+      })).toBeNull();
+      expect((await db().batch([markCommunityPublicationPublished(db(), captured!)]))[0]!.results)
+        .toHaveLength(0);
+      expect(await collectCommunityAllowanceFits(db(), publicationTime))
+        .toEqual(captured!.corpus.fits);
+      expect(await db().prepare(`SELECT COUNT(*) AS count FROM telemetry_v11_active_records
+        WHERE participant_id = ?`).bind(participantId).first()).toEqual({ count: 17 });
+      const publicAfterInvalidation = await publicPublicationSnapshot();
+      expect(publicAfterInvalidation.daily).toEqual(expect.arrayContaining([
+        expect.objectContaining({ aggregate_id: "public-daily-fixture", release_state: "withdrawn" }),
+      ]));
 
       const blockedOwnership = await api("/api/v1/accountless/ownership", {
         method: "POST",
@@ -793,15 +846,17 @@ describe("accountless owner-to-v1.1 transport", () => {
       expect(await errorCode(blockedPending)).toBe("UPLOAD_AUTH_INVALID");
 
       // The direct authority root was already revoked by the device opt-out.
-      // Operator erasure removes its private participant subtree without
-      // withdrawing or invalidating any social public publication surface.
+      // Operator erasure removes the retained participant subtree and the
+      // captured generation as a separate action after ordinary opt-out.
       const erased = await eraseParticipantAsOwner(
         runtime(),
         "e".repeat(64),
         participantId!,
       );
       expect(erased).toMatchObject({ deleted: true, alreadyDeleted: false });
-      expect(await publicPublicationSnapshot()).toEqual(publicBeforeActivation);
+      expect(await readCapturedCommunityPublication(db(), publicationTime, {
+        budget: { remainingQueries: 64, deadlineMs: Date.now() + 30_000 },
+      })).toBeNull();
       expect(await db().prepare("SELECT id FROM participants WHERE id = ?")
         .bind(participantId).first()).toBeNull();
     } finally {

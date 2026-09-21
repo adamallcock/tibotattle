@@ -1,4 +1,4 @@
-import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
+import { compareModelPresentation, modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import {
   formatNumber,
   formatLocal,
@@ -7,7 +7,28 @@ import {
   formatApiMoney,
   formatSharePercent,
 } from "./ui-format.js";
+import {
+  REPORTING_PERIODS,
+  REPORTING_DURATION_MS,
+  normalizeReportingWindow,
+  appendEvidenceRow,
+  createEvidenceList,
+} from "./dashboard-ui.js";
+export { normalizeReportingWindow } from "./dashboard-ui.js";
 const SCHEMA = "local-work-usage-v1";
+const PERIOD_IDS = REPORTING_PERIODS;
+// Give the selected report a chance to paint before the bounded background
+// warm-up starts. The warm-up is deliberately sequential: the local service
+// already shares one all-period projection, while each report still occupies
+// one of its two live snapshot slots.
+const PERIOD_PRELOAD_DELAY_MS = 250;
+const PREPARING_POLL_DELAY_MS = 750;
+const MAX_PREPARING_POLLS = 20;
+const COVERAGE_NOTICE_THRESHOLD = 0.95;
+// Cold accounting can take minutes. Spread the same bounded request budget
+// over that work instead of exhausting it in the first fifteen seconds.
+const preloadPollDelay = attempt => Math.min(10_000, PREPARING_POLL_DELAY_MS * 2 ** attempt);
+const PRELOAD_REQUEST_TIMEOUT_MS = 10_000;
 const COMPONENTS = [
   "input_uncached_tokens",
   "input_cache_read_tokens",
@@ -148,14 +169,18 @@ export function validateWorkUsageResponse(value) {
   }
   return value;
 }
-export function mountWorkUsageView({
-  root,
-  t,
-  windowRef = window,
-  fetchRef = (input, init) => windowRef.fetch(input, init),
-}) {
+export function mountWorkUsageView(options = {}) {
+  const {
+    root,
+    t,
+    windowRef = window,
+    fetchRef = (input, init) => windowRef.fetch(input, init),
+  } = options;
   const documentRef = root.ownerDocument;
+  let sharedReporting = options.sharedReporting === true || Object.hasOwn(options, "reportingWindow");
+  let reportingWindow = sharedReporting ? normalizeReportingWindow(options.reportingWindow) : null;
   const tr = (key, values) => t(`workUsage.${key}`, values);
+  const reportTranslate = (key, values) => t(`reporting.${key}`, values);
   const el = (tag, className, text) => {
     const node = documentRef.createElement(tag);
     if (className) node.className = className;
@@ -164,15 +189,27 @@ export function mountWorkUsageView({
   };
   let query = {
     schemaVersion: SCHEMA,
-    period: "7d",
+    period: sharedReporting ? reportingWindow?.period ?? null : "7d",
     grouping: "project",
     sort: "tokens",
     pageSize: 25,
   };
+  if (sharedReporting && reportingWindow) query.endAt = reportingWindow.endAt;
   let response = null;
   let responseQueryKey = null;
+  // Work Usage responses are immutable, bounded page DTOs. Their snapshot
+  // ids are leases owned by the service and may be evicted as the next warm
+  // report is created, so the displayed cache is kept separate from the one
+  // live foreground anchor used to create a fresh report.
+  const periodCache = new Map();
+  let periodCacheFamilyKey = null;
+  let periodCacheAnchor = null;
+  let liveAnchor = null;
   const queryKey = () => JSON.stringify(Object.entries(query)
     .filter(([key]) => !["snapshotId", "sourceSnapshotId"].includes(key))
+    .sort(([left], [right]) => left.localeCompare(right)));
+  const queryFamilyKey = (value = query) => JSON.stringify(Object.entries(value)
+    .filter(([key]) => !["period", "cursor", "snapshotId", "sourceSnapshotId"].includes(key))
     .sort(([left], [right]) => left.localeCompare(right)));
   let serial = 0;
   let controller = null;
@@ -193,9 +230,266 @@ export function mountWorkUsageView({
   let searchTimer = null;
   let searchPending = false;
   let composing = false;
+  let periodPreloadTimer = null;
+  let periodPreloadController = null;
+  let periodPreloadSerial = 0;
+  let periodPreloadInFlight = null;
+  let periodPreloadAllowInactive = false;
+  let loadInFlight = null;
+  let loadInFlightKey = null;
+  let loadInFlightBackground = false;
+  let foregroundLoadQueued = false;
+  let preloadInFlight = null;
+  let needsLeaseValidation = false;
   const scheduleLease = windowRef.setTimeout?.bind(windowRef) ?? setTimeout;
   const clearLeaseTimer = windowRef.clearTimeout?.bind(windowRef) ?? clearTimeout;
   const visible = () => !destroyed && !root.inert && documentRef.visibilityState !== "hidden";
+  const documentVisible = () => !destroyed && documentRef.visibilityState !== "hidden";
+
+  function generationKey(value) {
+    const generation = value?.generation;
+    if (typeof generation === "string" && shortText(generation)) return `string:${generation}`;
+    if (!generation || typeof generation !== "object" || Array.isArray(generation)) return "unknown";
+    if (shortText(generation.fingerprint)) return `fingerprint:${generation.fingerprint}`;
+    if (shortText(generation.id)) return `id:${generation.id}`;
+    if (Number.isSafeInteger(generation.id)) return `id:${generation.id}`;
+    return "unknown";
+  }
+
+  function responseAnchor(value, snapshotId = value?.snapshotId) {
+    if (!value || !shortText(snapshotId) || !timestamp(value.toMs)) return null;
+    return {
+      snapshotId,
+      generation: generationKey(value),
+      toMs: value.toMs,
+    };
+  }
+
+  function stableAnchor(anchor) {
+    return anchor !== null && anchor.generation !== "unknown";
+  }
+
+  function sameAnchor(left, right) {
+    return left !== null && right !== null
+      && left.generation === right.generation
+      && left.toMs === right.toMs;
+  }
+
+  function clearPeriodCache() {
+    periodCache.clear();
+    periodCacheFamilyKey = null;
+    periodCacheAnchor = null;
+  }
+
+  function cachePeriod(periodId, value, familyKey, anchor) {
+    if (!stableAnchor(anchor) || !PERIOD_IDS.includes(periodId) || value?.status !== "available"
+        || !sameAnchor(anchor, responseAnchor(value))) return;
+    if (periodCacheFamilyKey !== familyKey || !sameAnchor(periodCacheAnchor, anchor)) {
+      periodCache.clear();
+      periodCacheFamilyKey = familyKey;
+      periodCacheAnchor = { ...anchor };
+    }
+    periodCache.set(periodId, structuredClone(value));
+  }
+
+  function cachedPeriod(periodId, familyKey, anchor) {
+    if (periodCacheFamilyKey !== familyKey || !sameAnchor(periodCacheAnchor, anchor)) return null;
+    const value = periodCache.get(periodId);
+    return value ? structuredClone(value) : null;
+  }
+
+  function stopPeriodPreload() {
+    clearLeaseTimer(periodPreloadTimer);
+    periodPreloadTimer = null;
+    periodPreloadSerial += 1;
+    periodPreloadController?.abort();
+    periodPreloadController = null;
+    periodPreloadInFlight = null;
+    periodPreloadAllowInactive = false;
+  }
+
+  function delayPeriodPreload(milliseconds, signal) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timerId = null;
+      let abort;
+      const cleanup = () => {
+        if (abort) signal?.removeEventListener?.("abort", abort);
+      };
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      abort = () => {
+        if (settled) return;
+        settled = true;
+        clearLeaseTimer(timerId);
+        timerId = null;
+        cleanup();
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        reject(error);
+      };
+      timerId = scheduleLease(finish, milliseconds);
+      timerId?.unref?.();
+      signal?.addEventListener?.("abort", abort, { once: true });
+      if (signal?.aborted) abort();
+    });
+  }
+
+  async function requestPeriodPreload(periodId, baseQuery, anchor, signal) {
+    let bodyQuery = {
+      ...baseQuery,
+      period: periodId,
+      sourceSnapshotId: anchor.snapshotId,
+    };
+    for (let attempt = 0; attempt <= MAX_PREPARING_POLLS; attempt += 1) {
+      if (signal.aborted) throw Object.assign(new Error("aborted"), { name: "AbortError" });
+      const requestController = new AbortController();
+      const forwardAbort = () => requestController.abort();
+      const requestTimer = scheduleLease(
+        () => requestController.abort(),
+        PRELOAD_REQUEST_TIMEOUT_MS,
+      );
+      requestTimer?.unref?.();
+      signal.addEventListener("abort", forwardAbort, { once: true });
+      try {
+        const http = await fetchRef("/api/local/work-usage/query", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-usage-monitor-local": "1",
+          },
+          cache: "no-store",
+          body: JSON.stringify(bodyQuery),
+          signal: requestController.signal,
+        });
+        if (requestController.signal.aborted)
+          throw Object.assign(new Error("aborted"), { name: "AbortError" });
+        const payload = http.status === 409
+          ? await http.json().catch(() => null)
+          : http.ok ? await http.json() : null;
+        if (requestController.signal.aborted)
+          throw Object.assign(new Error("aborted"), { name: "AbortError" });
+        if (http.status === 409) {
+          return {
+            result: null,
+            invalidated: !bodyQuery.snapshotId && bodyQuery.sourceSnapshotId === anchor.snapshotId
+              && [
+              "work_usage_snapshot_expired",
+              "work_usage_snapshot_changed",
+              ].includes(payload?.error?.code),
+          };
+        }
+        if (!http.ok) return {
+          result: null,
+          invalidated: http.status === 401 || http.status === 403,
+        };
+        const result = validateWorkUsageResponse(payload);
+        if (result.status !== "preparing") {
+          if (result.status === "available" && !sameAnchor(anchor, responseAnchor(result))) {
+            return { result: null, invalidated: true };
+          }
+          return { result, invalidated: false };
+        }
+        if (attempt === MAX_PREPARING_POLLS) return { result: null, invalidated: false };
+        await delayPeriodPreload(preloadPollDelay(attempt), signal);
+        bodyQuery = {
+          ...baseQuery,
+          period: periodId,
+          snapshotId: result.snapshotId,
+        };
+      } finally {
+        clearLeaseTimer(requestTimer);
+        signal.removeEventListener("abort", forwardAbort);
+      }
+    }
+    return { result: null, invalidated: false };
+  }
+
+  async function runPeriodPreload({ allowInactive = false } = {}) {
+    const canRun = allowInactive ? documentVisible() : visible();
+    if (!canRun || statusKey !== "snapshot" || !liveAnchor || !stableAnchor(liveAnchor)
+        || !response || query.cursor) return false;
+    const token = ++periodPreloadSerial;
+    const anchor = { ...liveAnchor };
+    const familyKey = queryFamilyKey();
+    if (periodCacheFamilyKey !== familyKey || !sameAnchor(periodCacheAnchor, anchor)) {
+      clearPeriodCache();
+    }
+    const baseQuery = Object.fromEntries(Object.entries(query)
+      .filter(([key]) => !["period", "cursor", "snapshotId", "sourceSnapshotId"].includes(key)));
+    const controllerRef = new AbortController();
+    periodPreloadController = controllerRef;
+    try {
+      for (const periodId of PERIOD_IDS) {
+        const stillVisible = allowInactive ? documentVisible() : visible();
+        if (token !== periodPreloadSerial || !stillVisible || !liveAnchor
+            || liveAnchor.snapshotId !== anchor.snapshotId
+            || queryFamilyKey() !== familyKey) return;
+        if (periodCache.has(periodId)) continue;
+        const { result, invalidated } = await requestPeriodPreload(
+          periodId,
+          baseQuery,
+          anchor,
+          controllerRef.signal,
+        );
+        if (token !== periodPreloadSerial || controllerRef.signal.aborted) return;
+        if (invalidated) {
+          if (liveAnchor?.snapshotId === anchor.snapshotId) {
+            clearPeriodCache();
+            liveAnchor = null;
+            body.inert = true;
+            refresh();
+          }
+          return;
+        }
+        if (result?.status === "available") cachePeriod(periodId, result, familyKey, anchor);
+      }
+    } catch (error) {
+      if (error?.name !== "AbortError") {
+        // Warm-up is opportunistic. A failed speculative request must not
+        // replace the visible report or turn a transient source failure into
+        // a page-level error.
+      }
+    } finally {
+      if (periodPreloadController === controllerRef) periodPreloadController = null;
+    }
+    return true;
+  }
+
+  function preloadPeriods(options = {}) {
+    const allowInactive = options.allowInactive === true;
+    if (periodPreloadInFlight) {
+      if (!allowInactive || periodPreloadAllowInactive) return periodPreloadInFlight;
+      stopPeriodPreload();
+    }
+    const promise = runPeriodPreload(options);
+    const tracked = promise.finally(() => {
+      if (periodPreloadInFlight === tracked) periodPreloadInFlight = null;
+    });
+    periodPreloadInFlight = tracked;
+    periodPreloadAllowInactive = allowInactive;
+    return tracked;
+  }
+
+  function schedulePeriodPreload() {
+    clearLeaseTimer(periodPreloadTimer);
+    periodPreloadTimer = null;
+    if (!visible() || statusKey !== "snapshot" || !liveAnchor || !stableAnchor(liveAnchor)
+        || !response || query.cursor) return;
+    const familyKey = queryFamilyKey();
+    if (periodCacheFamilyKey !== familyKey || !sameAnchor(periodCacheAnchor, liveAnchor)
+        || PERIOD_IDS.some((periodId) => !periodCache.has(periodId))) {
+      periodPreloadTimer = scheduleLease(() => {
+        periodPreloadTimer = null;
+        void preloadPeriods();
+      }, PERIOD_PRELOAD_DELAY_MS);
+      periodPreloadTimer?.unref?.();
+    }
+  }
   function stopLease() {
     clearLeaseTimer(leaseTimer);
     leaseTimer = null;
@@ -227,7 +521,11 @@ export function mountWorkUsageView({
       if (http.status === 409 && token === serial && !requestController.signal.aborted && visible()) {
         const error = await http.json();
         if (error.error?.code === "work_usage_snapshot_expired" && token === serial
-            && !requestController.signal.aborted && visible()) refresh();
+            && !requestController.signal.aborted && visible()) {
+          liveAnchor = null;
+          clearPeriodCache();
+          refresh();
+        }
       }
     } catch {} // A transient lease failure must not erase the displayed report.
     finally {
@@ -241,7 +539,13 @@ export function mountWorkUsageView({
   const setStatus = (key, values) => {
     statusKey = key;
     statusValues = values;
-    message.textContent = tr(key, values);
+    const messageKey = key === "error" ? "error" : key;
+    message.textContent = key === "waiting"
+      ? reportTranslate("waiting")
+      : sharedReporting && key === "missing"
+        ? reportTranslate("unavailable")
+        : tr(messageKey, values);
+    message.dataset.state = key === "snapshot" ? "ready" : key === "preparing" ? "loading" : key;
   };
   const button = (label, action, className = "button button-secondary") => {
     const b = el("button", className, label);
@@ -249,26 +553,39 @@ export function mountWorkUsageView({
     b.addEventListener("click", action);
     return b;
   };
-  const heading = el("div", "work-usage-heading");
+  const heading = el("div", "dashboard-page-header");
   const headingText = el("div");
   const title = el("h2", null, tr("title"));
   title.id = "work-usage-title";
-  headingText.append(title, el("p", "section-description", tr("subtitle")));
-  const period = el("div", "work-usage-period");
+  headingText.append(title, el("p", "page-description", tr("subtitle")));
+  const period = el("div", "segmented-control");
   period.setAttribute("role", "group");
   period.setAttribute("aria-label", tr("period"));
-  for (const id of ["24h", "7d", "30d", "all"]) {
+  for (const id of PERIOD_IDS) {
     const b = button(id === "all" ? tr("all") : id, () => {
       query = { ...query, period: id };
       delete query.scope;
-      refresh(response?.snapshotId);
+      resetPage();
+      const anchor = liveAnchor?.snapshotId ?? null;
+      const cached = cachedPeriod(id, queryFamilyKey(), liveAnchor);
+      if (cached) {
+        response = cached;
+        responseQueryKey = queryKey();
+        body.hidden = false;
+        body.inert = true;
+        render();
+      }
+      refresh(anchor, { preservePeriodCache: true });
     });
     b.dataset.period = id;
     period.append(b);
   }
-  heading.append(headingText, period);
+  heading.append(headingText);
+  if (!sharedReporting) heading.append(period);
   const toolbar = el("div", "work-usage-toolbar");
-  const views = el("div", "work-usage-period");
+  const views = el("div", "work-usage-period segmented-control");
+  views.setAttribute("role", "group");
+  views.setAttribute("aria-label", tr("title"));
   for (const id of ["project", "thread"]) {
     const viewButton = button(
       tr(id === "project" ? "projects" : "threads"),
@@ -323,19 +640,43 @@ export function mountWorkUsageView({
     resetPage();
     load();
   });
+  model.control.classList.add("model-picker");
+  function renderModelOptions(ids) {
+    model.control.replaceChildren(
+      ...[
+        ["", tr("allModels")],
+        ...[...ids].sort(compareModelPresentation).map((id) => [id, formatModelName(id)]),
+      ].map(([value, text]) => {
+        const option = el("option", null, text);
+        option.value = value;
+        option.title = value || text;
+        const presentation = value ? modelUsagePresentation(value)
+          : { theme: "layers", className: "allowance-model-classic" };
+        const icon = modelThemeIcon(documentRef, presentation.theme);
+        if (icon) {
+          icon.classList.add(presentation.className);
+          option.replaceChildren(icon, el("span", null, text));
+        }
+        return option;
+      }),
+    );
+    // Customizable native selects retain platform keyboard/dismiss behavior
+    // while allowing the same SVG identity in the list and selected value.
+    if (windowRef.CSS?.supports("appearance", "base-select")) {
+      const selected = el("button");
+      selected.type = "button";
+      selected.append(el("selectedcontent"));
+      model.control.prepend(selected);
+    }
+    model.control.value = query.model ?? "";
+  }
+  renderModelOptions([]);
   const scope = select(tr("scope"), [], (value) => {
     query.scope = value;
-    refresh(response?.snapshotId);
+    refresh(liveAnchor?.snapshotId ?? null);
   });
   scope.wrapper.hidden = true;
   const refreshButton = button(tr("refresh"), refresh);
-  toolbar.append(
-    views,
-    sort.wrapper,
-    model.wrapper,
-    scope.wrapper,
-    refreshButton,
-  );
   const form = el("form", "work-usage-find");
   const input = el("input");
   input.type = "text";
@@ -343,6 +684,9 @@ export function mountWorkUsageView({
   input.placeholder = tr("findHint");
   input.setAttribute("aria-label", tr("findHint"));
   form.append(input);
+  const filters = el("div", "work-usage-filter-controls");
+  filters.append(sort.wrapper, model.wrapper, scope.wrapper, refreshButton);
+  toolbar.append(views, form, filters);
   function clearSearchTimer() {
     clearLeaseTimer(searchTimer);
     searchTimer = null;
@@ -414,6 +758,7 @@ export function mountWorkUsageView({
     clearNested();
     controller?.abort();
     clearTimeout(timer);
+    stopPeriodPreload();
     if (query.snapshotId) {
       try {
         await fetchRef("/api/local/work-usage/query", {
@@ -431,35 +776,41 @@ export function mountWorkUsageView({
       } catch {}
     }
     delete query.snapshotId;
+    delete query.sourceSnapshotId;
+    liveAnchor = null;
+    clearPeriodCache();
     cancel.hidden = true;
     root.removeAttribute("aria-busy");
     // Retained values stay readable, but their cancelled/expired report must
     // not regain active drill-down controls until a fresh query succeeds.
     body.inert = response !== null;
+    body.dataset.state = "cancelled";
     setStatus("cancelled");
   });
   cancel.hidden = true;
   const body = el("div");
-  const eyebrow = el("p", "eyebrow", tr("local"));
+  const eyebrow = el("p", "annotation", tr("local"));
+  const actions = el("div", "dashboard-actions work-usage-actions");
+  actions.append(message, cancel);
   root.replaceChildren(
     heading,
     eyebrow,
     toolbar,
-    form,
-    message,
-    cancel,
+    actions,
     body,
   );
   function resetPage() {
     delete query.cursor;
     pages = [];
   }
-  function refresh(sourceSnapshotId = null) {
+  function refresh(sourceSnapshotId = null, { preservePeriodCache = false } = {}) {
+    stopPeriodPreload();
+    if (!preservePeriodCache) clearPeriodCache();
     delete query.snapshotId;
     delete query.sourceSnapshotId;
     if (typeof sourceSnapshotId === "string") query.sourceSnapshotId = sourceSnapshotId;
     resetPage();
-    load();
+    load(true, { force: true });
   }
   function descend(row, grouping = null) {
     ancestors.push({
@@ -490,6 +841,57 @@ export function mountWorkUsageView({
           `${tr(row.kind === "project" ? "projects" : row.kind === "worktree" ? "worktrees" : "threads")} · ${display?.shortId ?? row.id.slice(-10)}`);
   }
   const quantity = (n) => (n === null ? "—" : formatNumber(n));
+  const resultCount = (count, grouping) => tr(
+    `${grouping}Count${count === 1 ? "One" : "Other"}`, { count: quantity(count) },
+  );
+  const expectedReportingBounds = (window) => {
+    if (!window) return null;
+    const endMs = Date.parse(window.endAt);
+    if (!Number.isSafeInteger(endMs) || endMs < 0) return null;
+    const fromMs = window.period === "all"
+      ? (window.startAt === null ? null : Date.parse(window.startAt))
+      : Math.max(0, endMs - REPORTING_DURATION_MS[window.period]);
+    return { fromMs, toMs: endMs };
+  };
+  const assertExactReportingBounds = (result) => {
+    if (!sharedReporting || !reportingWindow || result.status !== "available") return;
+    const expected = expectedReportingBounds(reportingWindow);
+    if (!expected || result.toMs !== expected.toMs
+        || expected.fromMs !== null && result.fromMs !== expected.fromMs)
+      throw new Error("unavailable");
+  };
+  function appendUsageEvidence() {
+    const evidence = createEvidenceList(documentRef, "work-usage-evidence");
+    const totalEvents = response?.totals?.events;
+    const incompleteEvents = response?.totals?.incompleteEvents;
+    if (count(totalEvents) && count(incompleteEvents) && incompleteEvents <= totalEvents) {
+      const complete = totalEvents - incompleteEvents;
+      if (totalEvents > 0 && complete / totalEvents < COVERAGE_NOTICE_THRESHOLD) {
+        appendEvidenceRow(documentRef, evidence, {
+          kind: "token-coverage",
+          label: tr("coverage", { known: quantity(complete), total: quantity(totalEvents) }),
+          value: "",
+          state: "partial",
+        });
+      }
+    }
+    const unpricedEvents = response?.totals?.unpricedEvents;
+    const priced = count(totalEvents) && count(unpricedEvents) && unpricedEvents <= totalEvents
+      ? totalEvents - unpricedEvents
+      : response?.totals?.priceStatus === "complete" && count(totalEvents)
+        ? totalEvents
+        : null;
+    if (priced !== null && totalEvents > 0
+        && priced / totalEvents < COVERAGE_NOTICE_THRESHOLD) {
+      appendEvidenceRow(documentRef, evidence, {
+        kind: "price-coverage",
+        label: tr("priceCoverage", { priced: quantity(priced), total: quantity(totalEvents) }),
+        value: "",
+        state: "partial",
+      });
+    }
+    return evidence.children.length ? evidence : null;
+  }
   function appendModelIcon(target, id) {
     const presentation = modelUsagePresentation(id);
     const icon = modelThemeIcon(documentRef, presentation.theme);
@@ -584,6 +986,8 @@ export function mountWorkUsageView({
   }
   function render() {
     body.replaceChildren();
+    const evidence = appendUsageEvidence();
+    if (evidence) body.append(evidence);
     let focusTarget;
     if (ancestors.length)
       body.append(
@@ -601,6 +1005,29 @@ export function mountWorkUsageView({
       detailTitle.tabIndex = -1;
       body.append(detailTitle);
       if (pendingFocus === "heading") focusTarget = detailTitle;
+    }
+    if (!response.rowCount) {
+      body.dataset.state = "empty";
+      const searching = Boolean(query.search || query.findThread);
+      const empty = el("div", "work-usage-empty dashboard-state");
+      empty.dataset.state = "empty";
+      const copy = el("p", null, tr(searching ? "searchEmpty" : "empty"));
+      copy.setAttribute("role", "status");
+      empty.append(copy);
+      if (searching) {
+        const recovery = el("div", "dashboard-state-actions");
+        recovery.append(button(tr("clearSearch"), () => {
+          input.value = "";
+          searchPending = true;
+          input.focus();
+          load();
+        }));
+        empty.append(recovery);
+      }
+      body.append(empty);
+      focusTarget?.focus();
+      pendingFocus = null;
+      return;
     }
     const summaries = el("div", "work-usage-summary");
     for (const [label, n] of [
@@ -679,8 +1106,11 @@ export function mountWorkUsageView({
       }
     }
     const panel = el("div", "accounting-models-panel work-usage-table-panel");
-    const wrap = el("div", "table-wrap");
-    const table = el("table", "work-usage-table");
+    const wrap = el("div", "table-wrap dashboard-table-scroll");
+    wrap.tabIndex = 0;
+    wrap.setAttribute("role", "region");
+    wrap.setAttribute("aria-label", tr("title"));
+    const table = el("table", "work-usage-table dashboard-data-table");
     table.setAttribute("aria-label", tr("title"));
     const head = el("thead");
     const header = el("tr");
@@ -696,12 +1126,18 @@ export function mountWorkUsageView({
       const isShare = index === 3 || index === 5;
       const th = el(
         "th",
-        isShare ? "model-share-head" : null,
+        index === 0 ? null : isShare ? "numeric-cell model-share-head" : "numeric-cell",
         isShare ? tr("shareColumn") : name,
       );
       if (isShare) th.setAttribute("aria-label", name);
       th.scope = "col";
-      if (index === 3 || index === 5) th.title = tr("shareNote");
+      if (isShare) {
+        if (options.renderInformationLabel) {
+          th.replaceChildren(options.renderInformationLabel(tr("shareColumn"), tr("shareNote"), name));
+        } else {
+          th.title = tr("shareNote");
+        }
+      }
       header.append(th);
     });
     head.append(header);
@@ -961,12 +1397,16 @@ export function mountWorkUsageView({
         next.disabled = !entry.response.nextCursor;
         for (const button of [previous, next])
           button.setAttribute("aria-controls", entry.regionId);
+        const singlePage = entry.response.offset === 0 && !entry.pages.length
+          && !entry.response.nextCursor && entry.response.rowCount <= entry.response.rows.length;
+        previous.hidden = singlePage;
+        next.hidden = singlePage;
         page.append(
           previous,
           el(
             "span",
             "table-pagination-status",
-            tr("rows", {
+            singlePage ? resultCount(entry.response.rowCount, "thread") : tr("rows", {
               from: entry.response.rowCount ? entry.response.offset + 1 : 0,
               to: Math.min(
                 entry.response.offset + query.pageSize,
@@ -993,9 +1433,7 @@ export function mountWorkUsageView({
     wrap.append(table);
     panel.append(wrap);
     body.append(panel);
-    body.append(el("p", "annotation", tr("shareNote")));
-    if (!response.rowCount)
-      body.append(el("p", "work-usage-empty", tr(query.search ? "searchEmpty" : "empty")));
+    body.dataset.state = "ready";
     const pagination = el("div", "table-pagination");
     const previous = quietButton(tr("previous"), () => {
       pendingFocus = "first-row";
@@ -1012,12 +1450,16 @@ export function mountWorkUsageView({
       load();
     });
     next.disabled = !response.nextCursor;
+    const singlePage = response.offset === 0 && !pages.length
+      && !response.nextCursor && response.rowCount <= response.rows.length;
+    previous.hidden = singlePage;
+    next.hidden = singlePage;
     pagination.append(
       previous,
       el(
         "span",
         "table-pagination-status",
-        tr("rows", {
+        singlePage ? resultCount(response.rowCount, query.grouping) : tr("rows", {
           from: response.rowCount ? response.offset + 1 : 0,
           to: Math.min(response.offset + query.pageSize, response.rowCount),
           total: response.rowCount,
@@ -1026,21 +1468,53 @@ export function mountWorkUsageView({
       next,
     );
     body.append(pagination);
-    body.append(
-      el(
-        "p",
-        "work-usage-caption",
-        tr("observed", {
-          date: formatLocal(
-            new Date(response.metadata.observedAt).toISOString(),
-          ),
-        }),
-      ),
-    );
     focusTarget?.focus();
     pendingFocus = null;
   }
-  async function load(recoverExpired = true) {
+  function load(recoverExpired = true, options = {}) {
+    const background = options.background === true;
+    const force = options.force === true;
+    if (force) foregroundLoadQueued = false;
+    if (loadInFlight && !force) {
+      if (loadInFlightKey === queryKey() && !background && loadInFlightBackground) {
+        foregroundLoadQueued = true;
+        const current = loadInFlight;
+        return current.then(() => {
+          if (!foregroundLoadQueued || destroyed) return undefined;
+          foregroundLoadQueued = false;
+          return load(recoverExpired);
+        });
+      }
+      if (loadInFlightKey === queryKey()) return loadInFlight;
+      serial++;
+      controller?.abort();
+      clearTimeout(timer);
+      timer = null;
+      loadInFlight = null;
+      loadInFlightKey = null;
+      loadInFlightBackground = false;
+      foregroundLoadQueued = false;
+    }
+    const promise = performLoad(recoverExpired, { background, preparingAttempt: 0 });
+    const key = queryKey();
+    let tracked;
+    tracked = promise.finally(() => {
+      if (loadInFlight === tracked) {
+        loadInFlight = null;
+        loadInFlightKey = null;
+        loadInFlightBackground = false;
+      }
+    });
+    loadInFlight = tracked;
+    loadInFlightKey = key;
+    loadInFlightBackground = background;
+    return tracked;
+  }
+
+  async function performLoad(
+    recoverExpired = true,
+    { background = false, preparingAttempt = 0 } = {},
+  ) {
     if (destroyed || composing) return;
     clearSearchTimer();
     if (searchPending) {
@@ -1055,20 +1529,42 @@ export function mountWorkUsageView({
         return;
       }
     }
+    if (sharedReporting && !reportingWindow) {
+      started = false;
+      stopLease();
+      serial++;
+      controller?.abort();
+      controller = null;
+      clearTimeout(timer);
+      timer = null;
+      clearNested();
+      body.replaceChildren();
+      body.hidden = true;
+      body.inert = true;
+      body.dataset.state = "waiting";
+      cancel.hidden = true;
+      root.removeAttribute("aria-busy");
+      setStatus("waiting");
+      return;
+    }
     stopLease();
+    stopPeriodPreload();
+    const familyKey = queryFamilyKey();
+    if (periodCacheFamilyKey !== null && periodCacheFamilyKey !== familyKey) clearPeriodCache();
     started = true;
     clearNested();
     const token = ++serial;
     controller?.abort();
     clearTimeout(timer);
     controller = new AbortController();
+    const loadController = controller;
     setStatus("preparing");
+    body.dataset.state = "loading";
     body.inert = true;
     // Keep the exact query's previous report visible during revalidation, but
     // disable old snapshot controls until the replacement is authoritative.
     // Scope, filters, grouping, period and page are all part of this key.
-    body.hidden = !response || responseQueryKey !== queryKey()
-      || Boolean(query.sourceSnapshotId && query.sourceSnapshotId !== response.snapshotId);
+    body.hidden = !response || responseQueryKey !== queryKey();
     cancel.hidden = false;
     root.setAttribute("aria-busy", "true");
     for (const b of views.children)
@@ -1082,66 +1578,98 @@ export function mountWorkUsageView({
       b.setAttribute("aria-pressed", String(b.dataset.period === query.period));
     sort.control.value = query.sort;
     try {
-      const http = await fetchRef("/api/local/work-usage/query", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-usage-monitor-local": "1",
-        },
-        cache: "no-store",
-        body: JSON.stringify(query),
-        signal: controller.signal,
-      });
+      const requestController = background ? new AbortController() : loadController;
+      const requestSignal = requestController.signal;
+      const forwardAbort = background ? () => requestController.abort() : null;
+      const requestTimer = background
+        ? scheduleLease(() => requestController.abort(), PRELOAD_REQUEST_TIMEOUT_MS)
+        : null;
+      requestTimer?.unref?.();
+      if (forwardAbort) loadController.signal.addEventListener("abort", forwardAbort, { once: true });
+      let http;
+      let payload = null;
+      try {
+        http = await fetchRef("/api/local/work-usage/query", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-usage-monitor-local": "1",
+          },
+          cache: "no-store",
+          body: JSON.stringify(query),
+          signal: requestSignal,
+        });
+        if (requestSignal.aborted)
+          throw Object.assign(new Error("aborted"), { name: "AbortError" });
+        if (http.status === 409 || http.ok) payload = await http.json();
+        if (requestSignal.aborted)
+          throw Object.assign(new Error("aborted"), { name: "AbortError" });
+      } finally {
+        clearLeaseTimer(requestTimer);
+        if (forwardAbort) loadController.signal.removeEventListener("abort", forwardAbort);
+      }
       if (token !== serial) return;
       if (!http.ok && http.status === 409 && recoverExpired) {
-        const error = await http.json();
+        const error = payload;
         if (token !== serial) return;
         if (error.error?.code === "work_usage_snapshot_expired") {
+          liveAnchor = null;
+          clearPeriodCache();
           delete query.snapshotId;
           delete query.sourceSnapshotId;
           resetPage();
-          return load(false);
+          return performLoad(false, { background, preparingAttempt: 0 });
         }
       }
       if (!http.ok) {
         if (http.status === 409 || http.status === 401 || http.status === 403) {
+          liveAnchor = null;
+          clearPeriodCache();
           response = null;
           responseQueryKey = null;
           body.hidden = true;
+          body.dataset.state = http.status === 409 ? "expired" : "unavailable";
         }
         throw new Error(http.status === 409 ? "expired" : "unavailable");
       }
-      const result = validateWorkUsageResponse(await http.json());
+      const result = validateWorkUsageResponse(payload);
       if (token !== serial) return;
+      assertExactReportingBounds(result);
       query.snapshotId = result.snapshotId;
       delete query.sourceSnapshotId;
       if (result.status === "preparing") {
-        timer = setTimeout(() => load(recoverExpired), 750);
+        if (background) {
+          if (preparingAttempt >= MAX_PREPARING_POLLS) return;
+          await delayPeriodPreload(preloadPollDelay(preparingAttempt), loadController.signal);
+          return performLoad(recoverExpired, {
+            background,
+            preparingAttempt: preparingAttempt + 1,
+          });
+        }
+        timer = setTimeout(
+          () => load(recoverExpired, { background }),
+          PREPARING_POLL_DELAY_MS,
+        );
         return;
       }
       if (result.status !== "available") {
+        liveAnchor = null;
+        clearPeriodCache();
         response = null;
         responseQueryKey = null;
         body.hidden = true;
+        body.dataset.state = result.status === "missing" ? "missing" : "unavailable";
         setStatus(result.status === "missing" ? "missing" : "unavailable");
         return;
       }
       response = result;
       responseQueryKey = queryKey();
+      liveAnchor = responseAnchor(result);
+      if (!query.cursor) cachePeriod(query.period, result, familyKey, liveAnchor);
       setStatus("snapshot", {
         date: formatLocal(new Date(result.toMs).toISOString()),
       });
-      model.control.replaceChildren(
-        ...[
-          ["", tr("allModels")],
-          ...result.models.map((id) => [id, formatModelName(id)]),
-        ].map(([value, text]) => {
-          const option = el("option", null, text);
-          option.value = value;
-          return option;
-        }),
-      );
-      model.control.value = query.model ?? "";
+      renderModelOptions(result.models);
       scope.control.replaceChildren(
         ...result.scopes.map((s, i) => {
           const option = el(
@@ -1158,12 +1686,22 @@ export function mountWorkUsageView({
       scope.control.value = result.scope;
       scope.wrapper.hidden = result.scopes.length < 2;
       body.hidden = false;
-      body.inert = false;
+      const retainForInactive = !visible() && (background || needsLeaseValidation);
+      if (retainForInactive) needsLeaseValidation = true;
+      else needsLeaseValidation = false;
+      body.inert = retainForInactive;
       render();
-      queueLease();
+      if (retainForInactive) {
+        stopLease();
+        stopPeriodPreload();
+      } else {
+        queueLease();
+        schedulePeriodPreload();
+      }
     } catch (error) {
       if (token !== serial || error.name === "AbortError") return;
-      setStatus(error.message === "expired" ? "expired" : "unavailable");
+      setStatus(error.message === "expired" ? "expired" : "error");
+      body.dataset.state = error.message === "expired" ? "expired" : "error";
     } finally {
       if (token === serial) {
         cancel.hidden =
@@ -1174,18 +1712,118 @@ export function mountWorkUsageView({
       }
     }
   }
+  function setReportingWindow(value) {
+    const next = normalizeReportingWindow(value);
+    const previousKey = queryKey();
+    sharedReporting = true;
+    reportingWindow = next;
+    query = { ...query, period: next?.period ?? null };
+    if (next) query.endAt = next.endAt;
+    else delete query.endAt;
+    const nextKey = queryKey();
+    if (previousKey === nextKey) {
+      if (next === null) setStatus("waiting");
+      return next !== null;
+    }
+    stopLease();
+    stopPeriodPreload();
+    preloadInFlight = null;
+    liveAnchor = null;
+    needsLeaseValidation = false;
+    clearPeriodCache();
+    // A reporting-window change is a new exact evidence scope. Fence every
+    // old request before replacing the query so a late response cannot revive
+    // a snapshot or period cache from the previous window.
+    serial++;
+    controller?.abort();
+    controller = null;
+    clearTimeout(timer);
+    timer = null;
+    clearSearchTimer();
+    searchPending = false;
+    clearNested();
+    delete query.snapshotId;
+    delete query.sourceSnapshotId;
+    resetPage();
+    ancestors = [];
+    selectedTitle = null;
+    response = null;
+    responseQueryKey = null;
+    started = false;
+    cancel.hidden = true;
+    root.removeAttribute("aria-busy");
+    body.replaceChildren();
+    body.hidden = true;
+    body.inert = true;
+    body.dataset.state = next === null ? "waiting" : "loading";
+    if (next === null) {
+      setStatus("waiting");
+      return false;
+    }
+    if (visible()) load();
+    return true;
+  }
+
+  function preload() {
+    if (preloadInFlight) return preloadInFlight;
+    if (!documentVisible()) return Promise.resolve(false);
+    if (!visible()) {
+      needsLeaseValidation = true;
+      body.inert = true;
+    }
+    const operation = (async () => {
+      if (statusKey !== "snapshot" || !response || !liveAnchor)
+        await load(true, { background: true });
+      if (!documentVisible() || !response || statusKey !== "snapshot" || !liveAnchor)
+        return false;
+      if (!visible()) {
+        needsLeaseValidation = true;
+        body.inert = true;
+      } else if (needsLeaseValidation) {
+        await load();
+        if (!documentVisible() || statusKey !== "snapshot" || !response || !liveAnchor)
+          return false;
+      }
+      await preloadPeriods({ allowInactive: true });
+      return PERIOD_IDS.every((periodId) => periodCache.has(periodId));
+    })();
+    const tracked = operation.finally(() => {
+      if (preloadInFlight === tracked) preloadInFlight = null;
+    });
+    preloadInFlight = tracked;
+    return tracked;
+  }
+
   function visibilityChanged() {
     stopLease();
-    if (!visible()) return;
-    if (!started) load();
-    else keepReportAlive();
+    if (!documentVisible()) {
+      stopPeriodPreload();
+      foregroundLoadQueued = false;
+      if (loadInFlightBackground) {
+        serial++;
+        controller?.abort();
+        clearTimeout(timer);
+        timer = null;
+      }
+      return;
+    }
+    if (!visible()) {
+      if (!periodPreloadAllowInactive) stopPeriodPreload();
+      return;
+    }
+    if (!started || !response || responseQueryKey !== queryKey() || needsLeaseValidation) load();
+    else {
+      keepReportAlive();
+      schedulePeriodPreload();
+    }
   }
   const observer = new windowRef.MutationObserver(visibilityChanged);
   observer.observe(root, {
     attributes: true,
     attributeFilter: ["aria-hidden"],
   });
-  if (!root.inert) load();
+  if (visible()) load();
+  else if (sharedReporting && !reportingWindow) setStatus("waiting");
   documentRef.addEventListener?.("visibilitychange", visibilityChanged);
   windowRef.addEventListener("pageshow", visibilityChanged);
   function relocalize() {
@@ -1193,7 +1831,7 @@ export function mountWorkUsageView({
     title.textContent = tr("title");
     headingText.lastChild.textContent = tr("subtitle");
     period.setAttribute("aria-label", tr("period"));
-    period.lastChild.textContent = tr("all");
+    if (period.lastChild) period.lastChild.textContent = tr("all");
     for (const b of views.children)
       b.textContent = tr(
         b.dataset.grouping === "project" ? "projects" : "threads",
@@ -1204,8 +1842,7 @@ export function mountWorkUsageView({
     });
     model.wrapper.firstChild.textContent = tr("model");
     scope.wrapper.firstChild.textContent = tr("scope");
-    if (model.control.options[0])
-      model.control.options[0].textContent = tr("allModels");
+    renderModelOptions([...model.control.options].map(option => option.value).filter(Boolean));
     [...scope.control.options].forEach((option, i) => {
       option.textContent =
         response?.scopes[i]?.status === "unavailable"
@@ -1226,10 +1863,15 @@ export function mountWorkUsageView({
   windowRef.addEventListener("tibotattle:locale-change", relocalize);
   return {
     refresh,
+    setReportingWindow,
+    preload,
     destroy() {
       destroyed = true;
       clearSearchTimer();
       stopLease();
+      stopPeriodPreload();
+      liveAnchor = null;
+      clearPeriodCache();
       serial++;
       clearNested();
       controller?.abort();

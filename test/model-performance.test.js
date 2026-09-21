@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { modelPerformanceProjection } from '../src/reporting/index.js';
 import { createModelPerformanceController } from '../apps/local/model-performance-controller.js';
+import { loadWindowsSourceReadBinding } from '../src/platform/windows-filesystem.js';
 
 const NOW = Date.parse('2026-09-09T12:00:00Z'), DAY = 86400000;
 const row = (patch = {}) => ({ at: NOW, model: 'gpt-5.6-sol', sample_method: 'receipt',
@@ -146,11 +147,11 @@ test('an explicitly requested initial history pass finishes after the reader lea
   assert.equal(stops, 1, 'completed worker observes the ordinary idle stop');
   await controller.close();
 });
-test('Windows returns the closed unavailable DTO immediately without a timing worker', async () => {
+test('missing timing capability returns unavailable with bounded worker retry', async () => {
   let workers = 0;
   const controller = createModelPerformanceController({
-    directory: 'unused', codexHome: 'unused', platform: 'win32',
-    workerFactory: () => { workers++; throw new Error('must not start'); },
+    directory: 'unused', codexHome: 'unused',
+    workerFactory: () => { workers++; throw new Error('native capability unavailable'); },
   });
   try {
     for (const period of ['7', '30', 'all', 'all']) {
@@ -167,10 +168,10 @@ test('Windows returns the closed unavailable DTO immediately without a timing wo
       assert.deepEqual(result.models, []);
     }
     await assert.rejects(controller.read('90'), /invalid_timing_period/u);
-    assert.equal(workers, 0);
+    assert.equal(workers, 1, 'missing capability is attempted once during the backoff');
   } finally { await controller.close(); }
   assert.equal((await controller.read('all')).status, 'unavailable');
-  assert.equal(workers, 0);
+  assert.equal(workers, 1, 'missing capability is attempted once during the backoff');
 });
 
 test('actual worker reconstructs synthetic logs off-main, persists, and shuts down', async t => {
@@ -201,6 +202,23 @@ test('actual worker reconstructs synthetic logs off-main, persists, and shuts do
   }
   let controller = createModelPerformanceController(options);
   try {
+    if (process.platform === 'win32') {
+      let unavailable = false;
+      try { loadWindowsSourceReadBinding(); } catch { unavailable = true; }
+      if (unavailable) {
+        const deadline = Date.now() + 10000;
+        let result;
+        do {
+          result = await controller.read('all');
+          if (result.status === 'unavailable') break;
+          await new Promise(resolve => setTimeout(resolve, 20));
+        } while (Date.now() < deadline);
+        assert.equal(result.status, 'unavailable');
+        assert.deepEqual(result.models, []);
+        assert.equal(result.historyProgress, null, 'unsupported worker never scans sources');
+        return;
+      }
+    }
     let result = await readReady(controller);
     assert.equal(result.schemaVersion, 3);
     assert.deepEqual(result.historyProgress, { checked: 1, total: 1 });
@@ -212,5 +230,39 @@ test('actual worker reconstructs synthetic logs off-main, persists, and shuts do
     result = await readReady(controller);
     assert.equal(result.models[0].turns, 1);
     assert.ok(!JSON.stringify(result).includes(thread));
+  } finally { await controller.close(); }
+});
+
+test('explicit reporting windows include exactly the rolling duration and no later samples', () => {
+  for (const period of ['1', '7', '30']) {
+    const start = NOW - Number(period) * DAY;
+    const result = modelPerformanceProjection([row({ at: start - 1 }), row({ at: start }), row(), row({ at: NOW + 1 })], { period, now: NOW, rolling: true });
+    assert.equal(result.start, start);
+    assert.equal(result.end, NOW);
+    assert.equal(result.models[0].turns, 2);
+  }
+});
+
+test('controller caches each exact reporting window independently and rejects malformed anchors', async () => {
+  const messages = [];
+  class FakeWorker extends EventEmitter {
+    unref() {}
+    postMessage(message) { messages.push(message); if (message.type === 'stop') queueMicrotask(() => this.emit('exit', 0)); }
+  }
+  const worker = new FakeWorker();
+  const controller = createModelPerformanceController({ directory: 'unused', codexHome: 'unused', workerFactory: () => worker });
+  try {
+    const endAt = new Date(NOW).toISOString();
+    const prior = new Date(NOW - DAY).toISOString();
+    const loading = await controller.read('1', { endAt });
+    assert.equal(loading.end, NOW);
+    assert.equal(loading.start, NOW - DAY);
+    const request = messages.find(message => message.type === 'window');
+    worker.emit('message', { type: 'snapshots', values: [{ ...modelPerformanceProjection([row()], { period: '1', now: NOW }), requestKey: request.requestKey }] });
+    assert.equal((await controller.read('1', { endAt })).models[0].turns, 1);
+    assert.equal((await controller.read('1', { endAt: prior })).status, 'loading');
+    assert.equal((await controller.read('1')).status, 'loading');
+    await assert.rejects(controller.read('1', { endAt: '2026-09-10' }), /invalid_timing_window/);
+    await assert.rejects(controller.read('1', { endAt: new Date(Date.now() + DAY).toISOString() }), /invalid_timing_window/);
   } finally { await controller.close(); }
 });

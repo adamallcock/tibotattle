@@ -525,6 +525,7 @@ test("compiled hosted rehearsal owns every history, state and private scheduler 
       USAGE_MONITOR_CENTRAL_ORIGIN: "https://unreviewed.example",
       USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE: "/ambient/queue",
       USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "/ambient/export-secret",
+      USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/ambient/account-secret",
       USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
       USAGE_MONITOR_PREPARED_DIRECTORY: "/ambient/prepared",
       USAGE_MONITOR_RESOURCE_ROOT: "/ambient/resources",
@@ -565,6 +566,7 @@ test("compiled hosted rehearsal owns every history, state and private scheduler 
     "USAGE_MONITOR_CENTRAL_ORIGIN",
     "USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE",
     "USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE",
+    "USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE",
     "USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY",
     "USAGE_MONITOR_PREPARED_DIRECTORY",
     "USAGE_MONITOR_TEST_LANE",
@@ -822,7 +824,7 @@ test("macOS production runtime connects updater controls to protected preference
     assert.equal(handoverCompleted, true);
     return null;
   },
-    environment: { HOME: profile },
+    environment: { HOME: profile, USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/ambient/account-secret" },
     runtimeOverrides: { autoUpdater: nativeAutoUpdater, dialog: {
       showMessageBox: async (options) => { firstRunDisclosures.push(options); return { response: 0 }; },
       showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
@@ -838,6 +840,7 @@ test("macOS production runtime connects updater controls to protected preference
       return { status: "already_migrated" };
     },
   });
+  assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE, undefined);
   assert.equal(firstRunDisclosures[0].title, "Welcome to TiboTattle");
   assert.doesNotMatch(firstRunDisclosures[0].detail, /Uploads are not available|development build/u);
   assert.equal(autoUpdater.autoInstallOnAppQuit, false);
@@ -2059,6 +2062,28 @@ test("runtime persists the fixed Electron appearance and updates live renderers"
   await desktop.lifecycle.dispose();
 });
 
+test("runtime applies the persisted appearance before creating the first window", async () => {
+  for (const appearance of ["system", "light", "dark"]) {
+    const nativeTheme = new EventEmitter();
+    nativeTheme.themeSource = "system";
+    nativeTheme.shouldUseDarkColors = true;
+    const themeSourcesAtWindowCreation = [];
+    class AppearanceWindow extends FakeWindow {
+      constructor(options) {
+        themeSourcesAtWindowCreation.push(nativeTheme.themeSource);
+        super(options);
+      }
+    }
+    const { desktop } = await launchFixture({
+      load: async () => ({ ...DESKTOP_DEFAULT_SETTINGS, appearance }),
+      runtimeOverrides: { BrowserWindow: AppearanceWindow, nativeTheme },
+    });
+
+    assert.equal(themeSourcesAtWindowCreation[0], appearance);
+    await desktop.lifecycle.dispose();
+  }
+});
+
 test("runtime accepts Codex handoff only from the ready dashboard main frame", async () => {
   const opened = [];
   const ipcMain = {
@@ -2841,4 +2866,24 @@ test("runtime authorizes a manual notification test only from the live Settings 
     (error) => error?.code === "desktop_ipc_untrusted_context",
   );
   await desktop.lifecycle.dispose();
+});
+
+
+test("development desktop forwards prospective account identity only to the private macOS QA companion", async () => {
+  const accountFile = "/private/fixture/identity/account-observation-development";
+  const fixture = await launchFixture({
+    platform: "darwin", load: async () => null,
+    environment: {
+      USAGE_MONITOR_TEST_LANE: "macos-electron-local-qa-v1",
+      USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+      USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "/private/fixture/identity/export-identity",
+      USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: accountFile,
+    },
+  });
+  try {
+    assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE, accountFile);
+    assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_KEYCHAIN_BROKER_FD, undefined);
+  } finally {
+    await fixture.desktop.lifecycle.requestQuit();
+  }
 });

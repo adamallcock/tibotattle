@@ -13,6 +13,10 @@ import {
   inferFastModeFromCalibrationWindows,
   summarizeQuotaWeightedAccounting,
 } from "@app-usagemonitor/accounting";
+import {
+  FIVE_HOUR_WINDOW_MINUTES,
+  SEVEN_DAY_WINDOW_MINUTES,
+} from "@app-usagemonitor/quota-analysis";
 import { codexPrimaryAllowanceBasis } from "./codex-primary-allowance-basis.js";
 import {
   deterministicSample,
@@ -575,12 +579,22 @@ function validWeeklyComposition(value) {
   ));
 }
 
-function validLiveWeeklyCalibration(weekly, { population = false } = {}) {
+function validLiveWeeklyCalibration(
+  weekly,
+  {
+    population = false,
+    windowDurationMinutes = SEVEN_DAY_WINDOW_MINUTES,
+  } = {},
+) {
   if (!weekly || typeof weekly !== "object" || Array.isArray(weekly)
       || (!population && !validWeeklyPlanPopulations(weekly, (value) => (
-        validLiveWeeklyCalibration(value, { population: true })
+        validLiveWeeklyCalibration(value, {
+          population: true,
+          windowDurationMinutes,
+        })
       )))
       || weekly.schemaVersion !== "weekly-calibration-summary-v0.1"
+      || weekly.windowDurationMinutes !== windowDurationMinutes
       || !["estimated", "insufficient_evidence"].includes(weekly.status)
       || canonicalWeeklyInstant(weekly.generatedAt) === null
       || weekly.evidenceBasis
@@ -650,7 +664,14 @@ function validLiveWeeklyCalibration(weekly, { population = false } = {}) {
   );
 }
 
-function projectLiveWeeklyCalibration(cache, cacheReadErrorCode = null, { population = false } = {}) {
+function projectLiveWeeklyCalibration(
+  cache,
+  cacheReadErrorCode = null,
+  {
+    population = false,
+    windowDurationMinutes = SEVEN_DAY_WINDOW_MINUTES,
+  } = {},
+) {
   const weekly = cache?.weeklyCalibration;
   if (!weekly) {
     return unavailableLiveWeekly(
@@ -663,17 +684,24 @@ function projectLiveWeeklyCalibration(cache, cacheReadErrorCode = null, { popula
         : "live_cache_missing",
     );
   }
-  if (!validLiveWeeklyCalibration(weekly, { population })) {
+  if (!validLiveWeeklyCalibration(weekly, {
+    population,
+    windowDurationMinutes,
+  })) {
     return unavailableLiveWeekly("live_cache_invalid");
   }
   const estimate = weekly.estimate;
   return {
+    windowDurationMinutes: weekly.windowDurationMinutes ?? null,
     planType: weekly.planType,
     selectedPlanType: weekly.selectedPlanType ?? weekly.planType,
     planAttribution: { ...weekly.planAttribution },
     ...(!population ? {
       planPopulations: weekly.planPopulations.map((value) => projectLiveWeeklyCalibration(
-        { weeklyCalibration: value }, null, { population: true },
+        { weeklyCalibration: value }, null, {
+          population: true,
+          windowDurationMinutes,
+        },
       )),
     } : {}),
     status: weekly.status === "estimated" ? "available" : "insufficient_evidence",
@@ -793,6 +821,36 @@ function projectSelectedAllowanceWeeklyCalibration(
       basisId: expected.basisId,
     },
   };
+}
+
+function projectFiveHourAllowanceCalibration(
+  cache,
+  cacheReadErrorCode = null,
+) {
+  const fiveHour = cache?.fiveHourAllowanceCalibration;
+  if (fiveHour?.windowDurationMinutes !== FIVE_HOUR_WINDOW_MINUTES) {
+    return unavailableLiveWeekly(
+      cacheReadErrorCode === "cache_invalid"
+        || cacheReadErrorCode === "cache_malformed"
+        || cacheReadErrorCode === "cache_invalid_size"
+        || cacheReadErrorCode === "cache_price_registry_outdated"
+        || cacheReadErrorCode === "cache_accounting_semantics_outdated"
+        ? "live_cache_invalid"
+        : "five_hour_allowance_cache_unavailable",
+    );
+  }
+  return projectLiveWeeklyCalibration({
+    weeklyCalibration: fiveHour,
+  }, cacheReadErrorCode, {
+    windowDurationMinutes: FIVE_HOUR_WINDOW_MINUTES,
+  });
+}
+
+function hasFittedAllowancePopulation(history) {
+  return history?.status === "available"
+    || history?.planPopulations?.some((population) => (
+      population?.status === "available"
+    )) === true;
 }
 
 function allowanceBasisMatches(value, scenario) {
@@ -1317,7 +1375,7 @@ function cacheSwitchImpactProjection(
       proximityCeilingSeconds: impact?.proximityCeilingSeconds ?? 300,
       maximumRetainedCacheRatio:
         impact?.maximumRetainedCacheRatio ?? 0.5,
-      recentDetailLimit: impact?.recentDetailLimit ?? 20,
+      recentDetailLimit: impact?.recentDetailLimit ?? 250,
       allowanceImpact: unavailableCacheSwitchAllowance(
         "cache_switch_impact_unavailable",
       ),
@@ -1424,6 +1482,23 @@ export function projectTrayCacheSummary(impact) {
   };
 }
 
+function projectCacheContinuityCohort(cohort, periodId, allowanceCapacity) {
+  const { byModel: _byModel, ...summary } = cohort;
+  const projected = {
+    ...summary,
+    allowanceWeighting: projectCachePremiumWeighting(cohort.allowanceWeighting),
+    coveredSubtotal: projectCacheCoveredSubtotal(cohort.coveredSubtotal, cohort.pricedDrops),
+    byGapBand: projectCacheImpactBreakdown(cohort.byGapBand),
+    byOutcomeBucket: projectCacheImpactBreakdown(cohort.byOutcomeBucket),
+  };
+  return {
+    ...projected,
+    allowanceImpact: cacheSwitchAllowanceImpact(
+      { ...projected, periodId }, allowanceCapacity,
+    ),
+  };
+}
+
 function cacheContinuityImpactProjection(
   impact,
   selectedPeriodId,
@@ -1434,7 +1509,7 @@ function cacheContinuityImpactProjection(
     maximumRetainedCacheRatio: impact?.maximumRetainedCacheRatio ?? 0.5,
     outcomeDisplayMaximumGapSeconds:
       impact?.outcomeDisplayMaximumGapSeconds ?? 7 * 24 * 60 * 60,
-    recentDetailLimit: impact?.recentDetailLimit ?? 20,
+    recentDetailLimit: impact?.recentDetailLimit ?? 250,
   };
   if (impact?.status !== "available" || !Array.isArray(impact.periods)) {
     return {
@@ -1446,26 +1521,18 @@ function cacheContinuityImpactProjection(
       allowanceImpact: unavailableCacheSwitchAllowance(
         "cache_continuity_impact_unavailable",
       ),
+      byModel: null,
       periods: [],
     };
   }
   const periods = impact.periods.map((period) => {
-    const allowanceWeighting = projectCachePremiumWeighting(
-      period.allowanceWeighting,
-    );
-    const projected = {
-      ...period,
-      allowanceWeighting,
-      coveredSubtotal: projectCacheCoveredSubtotal(period.coveredSubtotal, period.pricedDrops),
-      byGapBand: projectCacheImpactBreakdown(period.byGapBand),
-      byOutcomeBucket: projectCacheImpactBreakdown(period.byOutcomeBucket),
-    };
     return {
-      ...projected,
-      allowanceImpact: cacheSwitchAllowanceImpact(
-        projected,
-        allowanceCapacity,
-      ),
+      ...projectCacheContinuityCohort(period, period.periodId, allowanceCapacity),
+      byModel: Array.isArray(period.byModel) && period.byModel.length <= 128
+        ? period.byModel.map((cohort) => projectCacheContinuityCohort(
+          cohort, period.periodId, allowanceCapacity,
+        ))
+        : null,
     };
   });
   const selected = periods.find((period) => period.periodId === selectedPeriodId)
@@ -1481,6 +1548,7 @@ function cacheContinuityImpactProjection(
       allowanceImpact: unavailableCacheSwitchAllowance(
         "cache_continuity_impact_unavailable",
       ),
+      byModel: null,
       periods: [],
     };
   }
@@ -1516,6 +1584,7 @@ function cacheContinuityImpactProjection(
     postCompactionCacheReadDrops: selected.postCompactionCacheReadDrops,
     byGapBand: selected.byGapBand,
     byOutcomeBucket: selected.byOutcomeBucket,
+    byModel: selected.byModel,
     recent: selected.recent,
     allowanceImpact: selected.allowanceImpact,
     periods,
@@ -2513,6 +2582,10 @@ export async function buildLocalCompanionSnapshot({
     replaySafeCache,
     replaySafeAccounting.errorCode,
   );
+  let allowanceFiveHour = projectFiveHourAllowanceCalibration(
+    replaySafeCache,
+    replaySafeAccounting.errorCode,
+  );
   let allowanceCapacity = projectAllowanceCapacity(
     replaySafeCache?.allowanceCapacityByScenario,
     replaySafeCache?.sourceDescriptor,
@@ -2530,6 +2603,16 @@ export async function buildLocalCompanionSnapshot({
     );
     if (staleWeekly.status !== "unavailable") {
       allowanceWeekly = { ...staleWeekly, stale: staleProvenance };
+    }
+    const staleFiveHour = projectFiveHourAllowanceCalibration(
+      staleReplaySafe.cache,
+      null,
+    );
+    if (hasFittedAllowancePopulation(staleFiveHour)) {
+      allowanceFiveHour = {
+        ...staleFiveHour,
+        stale: staleProvenance,
+      };
     }
     const staleCapacity = projectAllowanceCapacity(
       staleReplaySafe.cache?.allowanceCapacityByScenario,
@@ -2549,6 +2632,7 @@ export async function buildLocalCompanionSnapshot({
   // withhold would be worse than an alarming one.
   const staleServeActive = staleAccountingServe !== null
     || allowanceWeekly.stale !== undefined
+    || allowanceFiveHour.stale !== undefined
     || allowanceCapacity.stale !== undefined;
   const accountingProjectionReason = unifiedAccountingWithheld
     ? unified.status === "deferred"
@@ -2580,6 +2664,11 @@ export async function buildLocalCompanionSnapshot({
     ...weeklyBase,
     paceForecast: collector.paceForecast,
     paceOutlook: collector.paceOutlook,
+    allowanceHistoryByWindow: !hasFittedAllowancePopulation(allowanceFiveHour)
+      ? {}
+      : {
+        [FIVE_HOUR_WINDOW_MINUTES]: allowanceFiveHour,
+      },
   };
   const collectorLatestRecordAt = collector.latestRecordAt;
   const unifiedLatestExportableMs = accountingSourceMode === "unified"
@@ -3153,6 +3242,21 @@ export async function buildLocalCompanionSnapshot({
         periods: usage.map((period) => ({
           periodId: period.id,
           periodLabel: period.label,
+          reportingWindow: (() => {
+            const endAt = period.id === "history"
+              ? historyAccounting.generatedAt
+              : period.id === "all" && unifiedAvailable
+                ? unified.generatedAt
+                : replaySafeCache?.generatedAt
+                  ?? (unifiedAvailable ? unified.generatedAt : null);
+            const endMs = Date.parse(endAt ?? "");
+            if (!Number.isFinite(endMs)) return null;
+            const days = { "24h": 1, "7d": 7, "30d": 30 }[period.id];
+            return {
+              startAt: days ? new Date(Math.max(0, endMs - days * 86_400_000)).toISOString() : null,
+              endAt: new Date(endMs).toISOString(),
+            };
+          })(),
           events: period.events,
           totalTokens: period.totalTokens,
           apiPriceEquivalentUsd: period.apiPriceEquivalentUsd,

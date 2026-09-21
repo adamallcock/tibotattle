@@ -57,6 +57,12 @@
       "followUp": "Replace omitted mode-bit assertions with native owner ACL validation."
     },
     {
+      "file": "test/local-collector-large-identity.test.js",
+      "win32BranchCount": 1,
+      "classification": "windows-equivalent-needed",
+      "followUp": "Run exact large-ID collection on native Windows and qualify owner ACL protection; POSIX mode and UID checks do not establish Windows permissions."
+    },
+    {
       "file": "test/local-collector-state.test.js",
       "win32BranchCount": 2,
       "classification": "windows-equivalent-needed",

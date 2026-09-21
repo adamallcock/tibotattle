@@ -7301,9 +7301,16 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   // dependencies. The Electron bridge is inert without its preload; the
   // community entry stays website-only.
   assert.deepEqual(webModules.relativeFiles, [
+    "apps/web/public/allowance-tank-renderer.js",
+    "apps/web/public/allowance-tanks.js",
     "apps/web/public/app.js",
+    "apps/web/public/cache-reuse-matrix.js",
+    "apps/web/public/cache-reuse-metrics.js",
     "apps/web/public/community-data.js",
+    "apps/web/public/dashboard-report-preload.js",
+    "apps/web/public/dashboard-ui.js",
     "apps/web/public/data-client.js",
+    "apps/web/public/desktop-appearance.js",
     "apps/web/public/desktop-shell.js",
     "apps/web/public/electron-settings.js",
     "apps/web/public/electron-tray-popup.js",
@@ -7317,8 +7324,10 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/model-performance.js",
     "apps/web/public/model-visuals.js",
     "apps/web/public/navigation.js",
+    "apps/web/public/reporting-period.js",
     "apps/web/public/telemetry-envelope.js",
     "apps/web/public/telemetry-shared.generated.js",
+    "apps/web/public/trends-horizon.js",
     "apps/web/public/ui-format.js",
     "apps/web/public/work-usage-view.js",
   ]);
@@ -7350,9 +7359,18 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   ]);
   assert.deepEqual(runtimeAssets, [
     "apps/macos/reset-local-keychain.js",
+    "apps/web/public/allowance-tank-renderer.js",
+    "apps/web/public/allowance-tanks.js",
     "apps/web/public/app.js",
+    "apps/web/public/cache-reuse-matrix.css",
+    "apps/web/public/cache-reuse-matrix.js",
+    "apps/web/public/cache-reuse-metrics.js",
+    "apps/web/public/codex-color.svg",
     "apps/web/public/community-data.js",
+    "apps/web/public/dashboard-report-preload.js",
+    "apps/web/public/dashboard-ui.js",
     "apps/web/public/data-client.js",
+    "apps/web/public/desktop-appearance.js",
     "apps/web/public/desktop-shell.js",
     "apps/web/public/electron-settings.css",
     "apps/web/public/electron-settings.html",
@@ -7375,10 +7393,12 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/model-performance.js",
     "apps/web/public/model-visuals.js",
     "apps/web/public/navigation.js",
+    "apps/web/public/reporting-period.js",
     "apps/web/public/styles.css",
     "apps/web/public/telemetry-envelope.js",
     "apps/web/public/telemetry-shared.generated.js",
     "apps/web/public/tibotattle-icon.png",
+    "apps/web/public/trends-horizon.js",
     "apps/web/public/ui-format.js",
     "apps/web/public/work-usage-view.js",
   ]);
@@ -8068,10 +8088,14 @@ test("macOS Swift discovery rejects candidates in unknown top-level directories"
       join(sourceRoot, "FutureFeature", "Runtime", "Coordinator.swift"),
       "struct Coordinator {}\n",
     );
-    await assert.rejects(
-      collectMacOSSwiftSources(options),
-      /Unreviewed top-level macOS directory contains Swift source candidates/u,
-    );
+    await assert.rejects(collectMacOSSwiftSources(options), (error) => {
+      assert.equal(error.code, "MACOS_APP_BUILD_FAILED");
+      assert.match(
+        error.message,
+        /Unreviewed top-level macOS directory contains Swift source candidates/u,
+      );
+      return true;
+    });
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
@@ -8293,6 +8317,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       "config/product-brand.js",
       "scripts/build-macos-app.js",
       "scripts/lib/captured-utf8-source.mjs",
+      "scripts/lib/runtime-closure.mjs",
       "apps/macos/Assets/AppIcon.icns",
       "apps/macos/Assets/AppIcon.provenance.txt",
       ...swiftSources.relativeFiles,
@@ -9551,10 +9576,12 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
 
 macOSArtifactTest("preview distribution builds use an isolated identity and reject production validation", {
   skip: BUILD_SUPPORTED ? false : "requires pinned macOS arm64 Node v26.2.0 builder",
-  // This performs two complete preview builds plus DMG packaging. A warm
-  // arm64 development host can legitimately approach two minutes, so retain
-  // enough margin for CI load without weakening any build assertion.
-  timeout: 240_000,
+  // This performs two complete preview builds plus DMG packaging. Measured on
+  // the pinned builder (macOS arm64, Node v26.2.0): 227s warm and 260s cold,
+  // so the former two-minute estimate under-sized the budget and the gate
+  // cancelled itself on an ordinary cold run. This is a hang guard, not a
+  // performance budget; every build assertion below is unchanged.
+  timeout: 420_000,
 }, async (context) => {
   const preparedFramework = join(
     REPOSITORY_ROOT,

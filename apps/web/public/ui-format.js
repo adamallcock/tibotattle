@@ -2,7 +2,16 @@
 // community surface. Translation language and regional formatting remain
 // separate: choosing Spanish or Simplified Chinese never changes an instant,
 // accounting value, or the browser/Mac regional number convention.
-import { DEFAULT_LOCALE, canonicalLocale, translate } from "./localization.js";
+import {
+  DEFAULT_LOCALE,
+  canonicalLocale,
+  translate,
+  translatePlural,
+} from "./localization.js";
+
+// All display helpers use the same marker for an unavailable or unreported
+// value. A numeric zero remains a real reading and is formatted as `0`.
+export const UNKNOWN_DISPLAY_VALUE = "—";
 
 function browserLocale() {
   if (typeof navigator === "undefined") return DEFAULT_LOCALE;
@@ -77,6 +86,7 @@ const intlOptionKeys = new WeakMap();
 
 function intlOptionKey(options) {
   if (options === null || options === undefined) return "";
+  if (typeof options !== "object") return String(options);
   const remembered = intlOptionKeys.get(options);
   if (remembered !== undefined) return remembered;
   const key = JSON.stringify(options);
@@ -85,10 +95,11 @@ function intlOptionKey(options) {
 }
 
 function intlFormatter(Factory, kind, locale, options) {
-  const key = `${kind}·${locale}·${intlOptionKey(options)}`;
+  const selectedLocale = canonicalLocale(locale) ?? DEFAULT_LOCALE;
+  const key = `${kind}·${selectedLocale}·${intlOptionKey(options)}`;
   const cached = intlFormatters.get(key);
   if (cached !== undefined) return cached;
-  const formatter = new Factory(locale, options);
+  const formatter = new Factory(selectedLocale, options);
   intlFormatters.set(key, formatter);
   return formatter;
 }
@@ -101,14 +112,47 @@ export function numberFormatter(options = undefined, locale = formattingLocale) 
   return intlFormatter(Intl.NumberFormat, "number", locale, options);
 }
 
+export function relativeTimeFormatter(
+  options = undefined,
+  locale = messageLocale,
+) {
+  return intlFormatter(Intl.RelativeTimeFormat, "relative", locale, options);
+}
+
 function instant(value) {
   if (value === null || value === undefined || value === "") return null;
   const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
   return Number.isNaN(date.valueOf()) ? null : date;
 }
 
+const DECIMAL_NUMBER_PATTERN = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/iu;
+
+/**
+ * Accept finite numbers and decimal strings emitted by accounting APIs. The
+ * string branch is deliberately narrower than `Number(value)`: values such as
+ * `"0x10"` or an empty string are not displayable measurements.
+ */
+function numericValue(value) {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value !== "string") return null;
+  const candidate = value.trim();
+  if (candidate === "" || !DECIMAL_NUMBER_PATTERN.test(candidate)) return null;
+  const number = Number(candidate);
+  return Number.isFinite(number) ? number : null;
+}
+
 export function formatNumber(value, options = undefined) {
-  return numberFormatter(options).format(value);
+  const number = numericValue(value);
+  return number === null
+    ? UNKNOWN_DISPLAY_VALUE
+    // Intl preserves decimal strings beyond JavaScript's safe-integer range;
+    // keep the validated source string for accounting values instead of
+    // needlessly rounding it through Number first.
+    : numberFormatter(options).format(
+      typeof value === "string" ? value.trim() : number,
+    );
 }
 
 export function formatDate(value, options = undefined) {
@@ -121,13 +165,194 @@ export function finite(value, fallback = null) {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+function decimalPlaces(value) {
+  if (!Number.isInteger(value) || value < 0 || value > 20) {
+    throw new RangeError("Fraction digits must be an integer from 0 to 20");
+  }
+  return value;
+}
+
+/**
+ * Format a count with grouping and no fractional part. Counts are exact
+ * display facts: an absent count stays unavailable, while zero remains zero.
+ * `missing` may be set to `null` when a caller needs to withhold the cell.
+ */
+export function formatCount(value, { missing = UNKNOWN_DISPLAY_VALUE } = {}) {
+  const number = numericValue(value);
+  if (number === null || number < 0) return missing;
+  return formatNumber(Math.trunc(number), { maximumFractionDigits: 0 });
+}
+
+/** Format a finite decimal with fixed locale-aware precision. */
+export function formatDecimal(value, digits = 0) {
+  const number = numericValue(value);
+  if (number === null) return UNKNOWN_DISPLAY_VALUE;
+  const places = decimalPlaces(digits);
+  return formatNumber(value, {
+    maximumFractionDigits: places,
+    minimumFractionDigits: places,
+  });
+}
+
+/**
+ * Format a USD amount using the requested fixed precision. API-equivalent
+ * amounts have their own `formatApiMoney` helper below because it preserves a
+ * visible under-one-cent bound at its fixed two-decimal precision.
+ */
+export function formatMoney(value, digits = 0) {
+  const number = numericValue(value);
+  if (number === null) return UNKNOWN_DISPLAY_VALUE;
+  const places = decimalPlaces(digits);
+  return formatNumber(value, {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: places,
+    maximumFractionDigits: places,
+  });
+}
+
+/**
+ * Format a percentage expressed in percentage points (0–100), never as a
+ * fractional input. Rounded interior values that would look like an endpoint
+ * retain a bound so a sliver is not presented as exact zero or full coverage.
+ */
+export function formatPercent(value, digits = 0) {
+  const number = numericValue(value);
+  if (number === null) return UNKNOWN_DISPLAY_VALUE;
+  const requestedPlaces = decimalPlaces(digits);
+  // Whole values are easier to scan as whole percentages, matching the
+  // established dashboard copy. Fractional values retain the requested detail.
+  const places = Number.isInteger(number) ? 0 : requestedPlaces;
+  const percentFormatter = numberFormatter({
+    maximumFractionDigits: places,
+    minimumFractionDigits: 0,
+    style: "percent",
+  });
+  const format = (amount) => percentFormatter.format(amount / 100);
+  const step = 10 ** -places;
+  const rendered = format(number);
+  if (number > 0 && rendered === format(0)) return `<${format(step)}`;
+  if (number < 100 && rendered === format(100)) return `>${format(100 - step)}`;
+  return rendered;
+}
+
+/** Format a percentage-point diagnostic with its unit. */
+export function formatPp(value, digits = 1) {
+  const number = numericValue(value);
+  return number === null
+    ? UNKNOWN_DISPLAY_VALUE
+    : `${formatDecimal(number, digits)} pp`;
+}
+
+/** Keep the sign visible because it identifies the side of the baseline. */
+export function formatSignedPp(value, digits = 1) {
+  const number = numericValue(value);
+  return number === null
+    ? UNKNOWN_DISPLAY_VALUE
+    : `${number < 0 ? "" : "+"}${formatPp(number, digits)}`;
+}
+
+/** Format a signed percentage-point-hour diagnostic through localized copy. */
+export function formatSignedPpHours(value, digits = 1) {
+  const number = numericValue(value);
+  if (number === null) return UNKNOWN_DISPLAY_VALUE;
+  return translate("format.ppHours", {
+    value: `${number < 0 ? "" : "+"}${formatDecimal(number, digits)}`,
+  }, messageLocale);
+}
+
+/**
+ * Format a duration in milliseconds with localized plural units. A missing or
+ * negative duration is unavailable; one or more milliseconds always reports at
+ * least one minute, matching the dashboard's established span convention.
+ */
+export function formatSpanLength(spanMs) {
+  const milliseconds = numericValue(spanMs);
+  if (milliseconds === null || milliseconds < 0) return UNKNOWN_DISPLAY_VALUE;
+  const minutes = Math.max(1, Math.round(milliseconds / 60_000));
+  if (minutes < 90) {
+    return translatePlural("format.durationMinute", minutes, {
+      count: formatCount(minutes),
+    }, messageLocale);
+  }
+  const hours = minutes / 60;
+  if (hours < 48) {
+    const value = Number(hours.toFixed(hours < 10 ? 1 : 0));
+    return translatePlural("format.durationHour", value, {
+      count: formatDecimal(value, hours < 10 ? 1 : 0),
+    }, messageLocale);
+  }
+  const value = Number((hours / 24).toFixed(1));
+  return translatePlural("format.durationDay", value, {
+    count: formatDecimal(value, 1),
+  }, messageLocale);
+}
+
+/**
+ * Format the time until an ISO timestamp (or Date/epoch value). `now` is
+ * injectable for deterministic callers and tests; the timestamp's own instant
+ * remains untouched by locale or time-zone presentation.
+ */
+export function formatTimeRemaining(value, { now = Date.now() } = {}) {
+  const timestamp = instant(value)?.valueOf();
+  const current = now instanceof Date
+    ? now.valueOf()
+    : typeof now === "string"
+      ? instant(now)?.valueOf()
+      : numericValue(now);
+  if (timestamp === undefined || current === null) {
+    return translate("format.timeUnavailable", {}, messageLocale);
+  }
+  if (!Number.isFinite(current)) {
+    return translate("format.timeUnavailable", {}, messageLocale);
+  }
+  const remainingMs = timestamp - current;
+  if (remainingMs <= 0) return translate("format.resetDue", {}, messageLocale);
+  const totalMinutes = Math.ceil(remainingMs / 60_000);
+  const days = Math.floor(totalMinutes / 1_440);
+  const hours = Math.floor((totalMinutes % 1_440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) {
+    return translate("format.remainingDays", {
+      days: formatCount(days),
+      hours: formatCount(hours),
+    }, messageLocale);
+  }
+  if (hours > 0) {
+    return translate("format.remainingHours", {
+      hours: formatCount(hours),
+      minutes: formatCount(minutes),
+    }, messageLocale);
+  }
+  return translate("format.remainingMinutes", {
+    minutes: formatCount(minutes),
+  }, messageLocale);
+}
+
 export function compact(value) {
+  const number = numericValue(value);
+  return number === null
+    ? UNKNOWN_DISPLAY_VALUE
+    : formatNumber(number, {
+      notation: "compact",
+      maximumFractionDigits: 1,
+    });
+}
+
+/** `compact`, but never rounded down to a single significant figure.
+ *
+ * The headline stat cards were reporting a million-odd turns as "1M", which
+ * reads as a placeholder rather than a measurement and hides a range of nearly
+ * two to one. Two significant figures is the least that carries information;
+ * three is allowed so a value already at that precision is not coarsened. */
+export function compactPrecise(value) {
   const number = finite(value);
   return number === null
     ? "—"
     : formatNumber(number, {
       notation: "compact",
-      maximumFractionDigits: 1,
+      minimumSignificantDigits: 2,
+      maximumSignificantDigits: 3,
     });
 }
 
@@ -220,6 +445,9 @@ export const CHART_MONTH_OPTIONS = Object.freeze({
   year: "numeric",
 });
 
+export const CHART_TICK_TIME_ONLY_SPAN_MS = 36 * 60 * 60 * 1_000;
+export const CHART_TICK_MONTH_ONLY_SPAN_MS = 365 * 24 * 60 * 60 * 1_000;
+
 export function formatChartTimestamp(value, { dateOnly = false } = {}) {
   const date = instant(value);
   if (date === null) return translate("format.unknown", {}, messageLocale);
@@ -227,6 +455,35 @@ export function formatChartTimestamp(value, { dateOnly = false } = {}) {
   if (dateOnly) return day;
   const time = dateTimeFormatter(CHART_CLOCK_OPTIONS).format(date);
   return `${day} · ${time}`;
+}
+
+/**
+ * Choose a stable axis-tick shape from the displayed domain. Short spans use
+ * clock time, ordinary spans use a day, and long spans use month plus year.
+ * Date-only callers always use the local calendar day. All shapes retain the
+ * reader's detected time zone and selected number/date locale.
+ */
+export function formatChartTimeLabel(
+  value,
+  { dateOnly = false, spanMs = null } = {},
+) {
+  const date = instant(value);
+  if (date === null) return translate("format.unknown", {}, messageLocale);
+  const span = numericValue(spanMs);
+  const resolution = dateOnly ? "date"
+    : span === null ? "dateAndTime"
+      : span <= CHART_TICK_TIME_ONLY_SPAN_MS ? "time"
+        : span <= CHART_TICK_MONTH_ONLY_SPAN_MS ? "date"
+          : "month";
+  if (resolution === "time") {
+    return dateTimeFormatter(CHART_CLOCK_OPTIONS).format(date);
+  }
+  if (resolution === "month") {
+    return dateTimeFormatter(CHART_MONTH_OPTIONS).format(date);
+  }
+  const day = dateTimeFormatter(CHART_DAY_OPTIONS).format(date);
+  if (resolution === "date") return day;
+  return `${day} · ${dateTimeFormatter(CHART_CLOCK_OPTIONS).format(date)}`;
 }
 
 export function formatTimeZoneLabel({
@@ -237,10 +494,10 @@ export function formatTimeZoneLabel({
   try {
     const date = instant(value) ?? new Date();
     const selectedLocale = canonicalLocale(locale) ?? formattingLocale;
-    const parts = new Intl.DateTimeFormat(selectedLocale, {
+    const parts = dateTimeFormatter({
       timeZone,
       timeZoneName: "longGeneric",
-    }).formatToParts(date);
+    }, selectedLocale).formatToParts(date);
     const label = parts.find((part) => part.type === "timeZoneName")?.value;
     return typeof label === "string" && label.trim() !== ""
       ? label
@@ -344,14 +601,14 @@ export function selectAvailableAccountingPeriod(periods, requested = "7d") {
 }
 
 export function formatAge(value) {
-  const seconds = finite(value);
+  const seconds = numericValue(value);
   if (seconds === null) {
     return translate("format.unknownAge", {}, messageLocale);
   }
-  const formatter = new Intl.RelativeTimeFormat(messageLocale, {
+  const formatter = relativeTimeFormatter({
     numeric: "always",
     style: "long",
-  });
+  }, messageLocale);
   if (seconds < 90) return formatter.format(-1, "minute");
   if (seconds < 7200) return formatter.format(-Math.round(seconds / 60), "minute");
   if (seconds < 172800) return formatter.format(-Number((seconds / 3600).toFixed(1)), "hour");
@@ -455,23 +712,12 @@ export function createDomHelpers(documentRef) {
 // Shared accounting-table formats: fixed precision and honest endpoint bounds.
 export function formatApiMoney(value) {
   // Decimal accounting strings stay exact through Intl display rounding.
-  const exact = typeof value === "string" && /^\d+(?:\.\d+)?$/u.test(value) && value.length <= 100;
-  const number = exact ? Number(value) : finite(value);
-  if (number === null) return "—";
+  const number = numericValue(value);
+  if (number === null) return UNKNOWN_DISPLAY_VALUE;
   if (number > 0 && number < .01) {
-    return `<${formatNumber(.01, {
-      style: "currency",
-      currency: "USD",
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    })}`;
+    return `<${formatMoney(.01, 2)}`;
   }
-  return formatNumber(exact ? value : number, {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
+  return formatMoney(value, 2);
 }
 
 /**
@@ -488,8 +734,8 @@ export function formatApiMoney(value) {
  * withhold the cell rather than printing a share of nothing.
  */
 export function formatSharePercent(part, whole) {
-  const numerator = finite(part);
-  const denominator = finite(whole);
+  const numerator = numericValue(part);
+  const denominator = numericValue(whole);
   if (numerator === null || denominator === null || denominator <= 0) return null;
   if (numerator < 0) return null;
   const percentFormatter = numberFormatter({

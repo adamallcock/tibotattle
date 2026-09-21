@@ -9,7 +9,13 @@ import {
   sanitizeBracketedCodexAccountSnapshotWithSecretLoader,
   sanitizeRateLimit,
   sanitizeAccountScope,
+  volatileResetCreditInventory,
 } from "./providers/codex/account.js";
+import {
+  createResetEventClassifier,
+  normalizeQuotaResetEvent,
+  normalizeResetEventContinuity,
+} from "@app-usagemonitor/quota-analysis";
 import {
   canonicalComponentAvailability,
   canonicalComponents,
@@ -207,6 +213,7 @@ function emptyCheckpoint(nowIso, backfill, backfillSinceAt = null) {
     recentEventKeys: [],
     lastQuotaObservedAt: null,
     accountScopeMarker: null,
+    resetEventContinuity: null,
     diagnostics: {
       filesDiscovered: 0,
       filesInitializedAtEnd: 0,
@@ -1351,6 +1358,7 @@ function quotaWindowIdentityProjection(windows) {
 
 export function appServerSnapshotRecord(payload, { source, receivedAt }) {
   const accountSnapshot = payload?.accountScope ? payload : null;
+  const accountScope = sanitizeAccountScope(accountSnapshot?.accountScope);
   const windows = windowsFromAppPayload(accountSnapshot?.byLimitId ? {
     rateLimits: accountSnapshot.canonical,
     rateLimitsByLimitId: accountSnapshot.byLimitId,
@@ -1366,7 +1374,13 @@ export function appServerSnapshotRecord(payload, { source, receivedAt }) {
     source,
     windows,
     providerSurface: "account_shared_unallocated",
-    accountScope: sanitizeAccountScope(accountSnapshot?.accountScope),
+    accountScope,
+    // Historical permission at observedAt, never authorization to resume now.
+    // Sparse notifications and unscoped observations cannot carry permission.
+    ordinaryUsageAllowed: source === "app_server_read"
+      && accountScope.status === "available"
+      && typeof accountSnapshot.ordinaryUsageAllowed === "boolean"
+      ? accountSnapshot.ordinaryUsageAllowed : null,
     officialDailyTokens: source === "app_server_read" ? (accountSnapshot?.officialDailyTokens ?? []) : [],
     officialUsageSummary: source === "app_server_read" ? (accountSnapshot?.officialUsageSummary ?? null) : null,
     controlledState: "unknown",
@@ -1494,11 +1508,11 @@ function matchingCapturedBinding(before, after) {
 }
 
 async function readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret,
-  readAccountAttributionBinding = null, clock = () => Date.now()) {
+  readAccountAttributionBinding = null, clock = () => Date.now(), excludeResetCreditDetails = false) {
   const bindingBefore = await captureAttributionBinding(readAccountAttributionBinding);
   const accountBefore = await readOptionalAccount(client);
   const [rateLimits, accountUsage] = await Promise.all([
-    client.readRateLimits(),
+    client.readRateLimits({ excludeResetCreditDetails }),
     typeof client.readAccountUsage === "function" ? client.readAccountUsage().catch(() => null) : Promise.resolve(null),
   ]);
   const accountAfter = await readOptionalAccount(client);
@@ -1512,7 +1526,65 @@ async function readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObs
     observationBinding: matchingCapturedBinding(bindingBefore, bindingAfter) };
 }
 
-async function appendAppRecord({ payload, source, checkpoint, clock, commitRecord }) {
+function derivedResetEventsForAppRecord(payload, record, classifier) {
+  if (record.source !== "app_server_read" || classifier === null) return [];
+  try {
+    const values = classifier.observe({
+      observedAt: record.observedAt,
+      accountScopeId: record.accountScope?.status === "available"
+        ? record.accountScope.scopeId
+        : null,
+      windows: record.windows,
+      resetCredits: volatileResetCreditInventory(payload),
+    });
+    if (!Array.isArray(values)) {
+      classifier.reset();
+      return [];
+    }
+    return values.map(normalizeQuotaResetEvent).filter(Boolean);
+  } catch {
+    classifier.reset();
+    return [];
+  }
+}
+
+function classifierContinuity(classifier) {
+  if (classifier === null) return null;
+  try {
+    const value = normalizeResetEventContinuity(classifier.snapshot());
+    return value?.timeline.length > 0 ? value : null;
+  } catch {
+    classifier.reset();
+    return null;
+  }
+}
+
+function restoreClassifierContinuity(checkpoint, classifier) {
+  if (classifier === null) return;
+  const value = normalizeResetEventContinuity(
+    checkpoint.resetEventContinuity,
+  );
+  try {
+    if (value === null || classifier.restore(value) !== true) {
+      classifier.reset();
+      checkpoint.resetEventContinuity = null;
+      return;
+    }
+    checkpoint.resetEventContinuity = value;
+  } catch {
+    classifier.reset();
+    checkpoint.resetEventContinuity = null;
+  }
+}
+
+async function appendAppRecord({
+  payload,
+  source,
+  checkpoint,
+  clock,
+  commitRecord,
+  resetEventClassifier = null,
+}) {
   if (typeof commitRecord !== "function") {
     throw new TypeError("commitRecord must be a function");
   }
@@ -1552,6 +1624,17 @@ async function appendAppRecord({ payload, source, checkpoint, clock, commitRecor
     checkpoint.diagnostics.duplicateEventsSkipped += 1;
     return null;
   }
+  const resetEvents = derivedResetEventsForAppRecord(
+    payload,
+    record,
+    resetEventClassifier,
+  );
+  if (resetEvents.length > 0) record.resetEvents = resetEvents;
+  if (resetEventClassifier !== null) {
+    checkpoint.resetEventContinuity = classifierContinuity(
+      resetEventClassifier,
+    );
+  }
   addRecentKey(checkpoint, record.eventKey, recentSet);
   trimRecentKeys(checkpoint, recentSet, MAX_RECENT_EVENT_KEYS);
   checkpoint.lastQuotaObservedAt = record.observedAt;
@@ -1575,10 +1658,44 @@ function safeErrorCode(error) {
 
 function recordAppServerError(checkpoint, error) {
   checkpoint.accountScopeMarker = null;
+  checkpoint.resetEventContinuity = null;
   checkpoint.diagnostics.appServerErrorCounts ??= {};
   const code = safeErrorCode(error);
   checkpoint.diagnostics.appServerErrorCounts[code] = (checkpoint.diagnostics.appServerErrorCounts[code] ?? 0) + 1;
   return code;
+}
+
+function rememberCleanupError(primary, cleanup) {
+  if (primary === null || primary === undefined || cleanup === null || cleanup === undefined
+      || primary === cleanup) return;
+  if (typeof primary !== "object" && typeof primary !== "function") return;
+  try {
+    if (primary.cleanupError === undefined) {
+      Object.defineProperty(primary, "cleanupError", {
+        value: cleanup,
+        configurable: true,
+        enumerable: false,
+        writable: true,
+      });
+    } else if (Array.isArray(primary.cleanupError)) {
+      primary.cleanupError.push(cleanup);
+    } else {
+      primary.cleanupError = [primary.cleanupError, cleanup];
+    }
+  } catch {
+    // Preserve the original error even when a provider supplies a frozen error
+    // object or a non-standard throw value.
+  }
+}
+
+async function closeResource(resource) {
+  try {
+    if (resource === null || resource === undefined || typeof resource.close !== "function") return null;
+    await resource.close();
+    return null;
+  } catch (error) {
+    return error;
+  }
 }
 
 // A failed app-server refresh leaves the in-memory checkpoint speculatively
@@ -1617,6 +1734,7 @@ export async function runCollectorOnce({
   stateFile = defaultCollectorStateFile(),
   staleAfterMs = 60_000,
   refreshStale = true,
+  excludeResetCreditDetails = false,
   backfill = false,
   backfillSinceAt = null,
   // Unified-index authority does not need the legacy rollout ledger. This
@@ -1640,6 +1758,7 @@ export async function runCollectorOnce({
   appServerFactory = () => new CodexAppServerClient(),
   loadAccountObservationSecret = null,
   readAccountAttributionBinding = null,
+  resetEventClassifier = null,
   commitState = commitLocalCollectorState,
   saveState = saveLocalCollectorCheckpoint,
   integrityVerifier = verifyLocalCollectorStateIntegrityOffMain,
@@ -1654,6 +1773,16 @@ export async function runCollectorOnce({
   }
   if (typeof skipRolloutIngestion !== "boolean") {
     throw new TypeError("skipRolloutIngestion must be boolean");
+  }
+  if (resetEventClassifier !== null
+      && (typeof resetEventClassifier !== "object"
+        || typeof resetEventClassifier.observe !== "function"
+        || typeof resetEventClassifier.reset !== "function"
+        || typeof resetEventClassifier.snapshot !== "function"
+        || typeof resetEventClassifier.restore !== "function")) {
+    throw new TypeError(
+      "resetEventClassifier must expose observe, reset, snapshot, and restore",
+    );
   }
   if (typeof stateFile !== "string" || stateFile.length < 1) {
     throw new TypeError("stateFile must be a non-empty string");
@@ -1678,16 +1807,20 @@ export async function runCollectorOnce({
   // check even when the enclosing refresh is cancelled or fails. Deliberately
   // do not pass `signal` to the worker verifier: cancellation cannot shorten
   // that mandatory settle, and the lock remains held until it completes.
-  const pooled = commitState === commitLocalCollectorState
-    && saveState === saveLocalCollectorCheckpoint
-    ? await openLocalCollectorStateSession({
-      stateFile,
-      clock,
-      integrityVerifier,
-    })
-    : null;
+  let pooled = null;
   let sessionSettled = false;
+  let primaryError = null;
   try {
+    // Opening the pooled session is part of the lock's cleanup scope. A failed
+    // identity check or database open must still release the instance row.
+    pooled = commitState === commitLocalCollectorState
+      && saveState === saveLocalCollectorCheckpoint
+      ? await openLocalCollectorStateSession({
+        stateFile,
+        clock,
+        integrityVerifier,
+      })
+      : null;
     const nowIso = new Date(clock()).toISOString();
     const existing = await readLocalCollectorCheckpoint({ stateFile });
     const saveCheckpoint = async () => {
@@ -1701,6 +1834,7 @@ export async function runCollectorOnce({
       : null;
     const checkpoint = existing
       ?? emptyCheckpoint(nowIso, backfill, requestedBackfillStart);
+    restoreClassifierContinuity(checkpoint, resetEventClassifier);
     const indexing = ensureCheckpointIndexing(checkpoint, {
       created: existing === null,
       backfill,
@@ -1732,7 +1866,7 @@ export async function runCollectorOnce({
         refresh.attempted = true;
         try {
           client = appServerFactory();
-          abortClient = () => client?.close();
+          abortClient = () => { void closeResource(client); };
           signal?.addEventListener("abort", abortClient, { once: true });
           await client.start();
           if (signal?.aborted) throw new Error("collector_aborted");
@@ -1743,6 +1877,7 @@ export async function runCollectorOnce({
             loadAccountObservationSecret,
             readAccountAttributionBinding,
             clock,
+            excludeResetCreditDetails,
           );
           if (signal?.aborted) throw new Error("collector_aborted");
           const record = await appendAppRecord({
@@ -1751,6 +1886,7 @@ export async function runCollectorOnce({
             checkpoint,
             clock,
             commitRecord: commitRecords,
+            resetEventClassifier,
           });
           refresh.recordWritten = record !== null;
           if (record !== null) {
@@ -1760,6 +1896,7 @@ export async function runCollectorOnce({
             }
           }
         } catch (error) {
+          resetEventClassifier?.reset();
           await rewindCheckpointAfterAppRecordFailure({
             stateFile,
             checkpoint,
@@ -1769,7 +1906,6 @@ export async function runCollectorOnce({
         } finally {
           signal?.removeEventListener("abort", abortClient);
           abortClient = null;
-          client?.close();
         }
       }
       checkpoint.savedAt = new Date(clock()).toISOString();
@@ -1960,13 +2096,13 @@ export async function runCollectorOnce({
       refresh.attempted = true;
       try {
         client = appServerFactory();
-        abortClient = () => client?.close();
+        abortClient = () => { void closeResource(client); };
         signal?.addEventListener("abort", abortClient, { once: true });
         await client.start();
         if (signal?.aborted) throw new Error("collector_aborted");
         const capturedAt = new Date(clock()).toISOString();
         const payload = await readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret,
-          readAccountAttributionBinding, clock);
+          readAccountAttributionBinding, clock, excludeResetCreditDetails);
         if (signal?.aborted) throw new Error("collector_aborted");
         const record = await appendAppRecord({
           payload,
@@ -1974,6 +2110,7 @@ export async function runCollectorOnce({
           checkpoint,
           clock,
           commitRecord: commitRecords,
+          resetEventClassifier,
         });
         refresh.recordWritten = record !== null;
         if (record !== null) {
@@ -1983,6 +2120,7 @@ export async function runCollectorOnce({
           }
         }
       } catch (error) {
+        resetEventClassifier?.reset();
         await rewindCheckpointAfterAppRecordFailure({
           stateFile,
           checkpoint,
@@ -1992,7 +2130,6 @@ export async function runCollectorOnce({
       } finally {
         signal?.removeEventListener("abort", abortClient);
         abortClient = null;
-        client?.close();
       }
     }
     if (indexingRun) {
@@ -2034,21 +2171,52 @@ export async function runCollectorOnce({
       result.pauseReason = result.resourceLimit?.code ?? "collector_aborted";
     }
     return resultStateProperties(result, { stateFile });
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    signal?.removeEventListener("abort", abortClient);
-    client?.close();
-    if (pooled !== null && !sessionSettled) {
-      sessionSettled = true;
-      // A run that is exiting through an error path still owes the store its
-      // settle: everything already committed stays committed, and the
-      // integrity check is not skipped just because the run did not finish.
+    let cleanupError = null;
+    try {
       try {
-        await pooled.close();
-      } catch {
-        await pooled.abort().catch(() => {});
+        signal?.removeEventListener("abort", abortClient);
+      } catch (error) {
+        cleanupError = error;
+      }
+      const clientCloseError = await closeResource(client);
+      if (clientCloseError !== null) {
+        if (cleanupError === null) cleanupError = clientCloseError;
+        else rememberCleanupError(cleanupError, clientCloseError);
+      }
+      if (pooled !== null && !sessionSettled) {
+        sessionSettled = true;
+        // A run that is exiting through an error path still owes the store its
+        // settle: everything already committed stays committed, and the
+        // integrity check is not skipped just because the run did not finish.
+        try {
+          await pooled.close();
+        } catch (error) {
+          if (cleanupError === null) cleanupError = error;
+          else rememberCleanupError(cleanupError, error);
+          try {
+            await pooled.abort();
+          } catch (abortError) {
+            if (cleanupError === null) cleanupError = abortError;
+            else rememberCleanupError(cleanupError, abortError);
+          }
+        }
+      }
+    } finally {
+      try {
+        await release();
+      } catch (error) {
+        if (cleanupError === null) cleanupError = error;
+        else rememberCleanupError(cleanupError, error);
       }
     }
-    await release();
+    if (cleanupError !== null) {
+      if (primaryError !== null) rememberCleanupError(primaryError, cleanupError);
+      else throw cleanupError;
+    }
   }
 }
 
@@ -2082,6 +2250,7 @@ export async function runCollectorForeground({
   watchRoot = watch,
   loadAccountObservationSecret = null,
   readAccountAttributionBinding = null,
+  resetEventClassifier = createResetEventClassifier(),
   ingestUpdates = ingestRolloutUpdates,
   maximumRecordBatchSize = MAX_RECORD_BATCH_SIZE,
   maximumRecentEventKeys = MAX_RECENT_EVENT_KEYS,
@@ -2092,13 +2261,37 @@ export async function runCollectorForeground({
   saveState = saveLocalCollectorCheckpoint,
 } = {}) {
   if (typeof watchRoot !== "function") throw new TypeError("watchRoot must be a function");
+  if (resetEventClassifier !== null
+      && (typeof resetEventClassifier !== "object"
+        || typeof resetEventClassifier.observe !== "function"
+        || typeof resetEventClassifier.reset !== "function"
+        || typeof resetEventClassifier.snapshot !== "function"
+        || typeof resetEventClassifier.restore !== "function")) {
+    throw new TypeError(
+      "resetEventClassifier must expose observe, reset, snapshot, and restore",
+    );
+  }
   if (typeof stateFile !== "string" || stateFile.length < 1) {
     throw new TypeError("stateFile must be a non-empty string");
   }
   await prepareLocalCollectorState({ stateFile, clock });
   const release = await acquireLocalCollectorStateLock(stateFile, { clock });
-  const existing = await readLocalCollectorCheckpoint({ stateFile });
-  const checkpoint = existing ?? emptyCheckpoint(new Date(clock()).toISOString(), false);
+  let existing;
+  let checkpoint;
+  try {
+    existing = await readLocalCollectorCheckpoint({ stateFile });
+    checkpoint = existing ?? emptyCheckpoint(new Date(clock()).toISOString(), false);
+    restoreClassifierContinuity(checkpoint, resetEventClassifier);
+    checkpoint.diagnostics.ingestionErrorCounts ??= {};
+    checkpoint.diagnostics.watcherErrorCounts ??= {};
+  } catch (error) {
+    try {
+      await release();
+    } catch (cleanupError) {
+      rememberCleanupError(error, cleanupError);
+    }
+    throw error;
+  }
   let client = null;
   let reconnectAttempts = 0;
   let totalReconnectAttempts = 0;
@@ -2130,9 +2323,6 @@ export async function runCollectorForeground({
   let accountInvalidationDirty = false;
   const watchers = [];
 
-  checkpoint.diagnostics.ingestionErrorCounts ??= {};
-  checkpoint.diagnostics.watcherErrorCounts ??= {};
-
   async function save() {
     checkpoint.savedAt = new Date(clock()).toISOString();
     await saveState({ stateFile, checkpoint, clock });
@@ -2151,6 +2341,7 @@ export async function runCollectorForeground({
     checkpoint.accountScopeMarker = null;
     checkpoint.diagnostics.ingestionErrorCounts ??= {};
     checkpoint.diagnostics.watcherErrorCounts ??= {};
+    restoreClassifierContinuity(checkpoint, resetEventClassifier);
   }
 
   async function appendForegroundAppRecord(payload, source) {
@@ -2160,6 +2351,7 @@ export async function runCollectorForeground({
         source,
         checkpoint,
         clock,
+        resetEventClassifier,
         commitRecord: async (records) => {
           await commitState({ stateFile, records, checkpoint, clock });
           checkpointWrites += 1;
@@ -2377,7 +2569,10 @@ export async function runCollectorForeground({
   }
 
   async function connect({ afterReconnect = false } = {}) {
-    client?.close();
+    const previousClient = client;
+    client = null;
+    const previousClientCloseError = await closeResource(previousClient);
+    if (previousClientCloseError !== null) throw previousClientCloseError;
     client = appServerFactory();
     const connectedClient = client;
     rateLimitNotificationsPaused = true;
@@ -2388,6 +2583,8 @@ export async function runCollectorForeground({
       if (connectedClient !== client) return;
       accountObservationEpoch += 1;
       checkpoint.accountScopeMarker = null;
+      checkpoint.resetEventContinuity = null;
+      resetEventClassifier?.reset();
       accountInvalidationDirty = true;
       if (accountInvalidationQueued) return;
       accountInvalidationQueued = true;
@@ -2435,11 +2632,13 @@ export async function runCollectorForeground({
     }
   }
 
+  let primaryError = null;
   try {
     await queueIngestion();
     try {
       await connect();
     } catch (error) {
+      resetEventClassifier?.reset();
       recordAppServerError(checkpoint, error);
       client = null;
       reconnectAttempts = 1;
@@ -2454,7 +2653,7 @@ export async function runCollectorForeground({
         watcher.on("error", (error) => {
           recordWatcherError(error);
           activateWatcherFallback();
-          watcher.close();
+          void closeResource(watcher);
         });
         watchers.push(watcher);
       } catch (error) {
@@ -2474,6 +2673,7 @@ export async function runCollectorForeground({
         try {
           await connect({ afterReconnect: true });
         } catch (error) {
+          resetEventClassifier?.reset();
           recordAppServerError(checkpoint, error);
           reconnectAttempts += 1;
           totalReconnectAttempts += 1;
@@ -2509,11 +2709,37 @@ export async function runCollectorForeground({
         maximumPendingRateLimitNotifications,
       },
     };
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    for (const watcher of watchers) watcher.close();
-    client?.close();
-    await drainOperations().catch(() => {});
-    if (!finalized) await save().catch(() => {});
-    await release();
+    let cleanupError = null;
+    try {
+      for (const watcher of watchers) {
+        const watcherCloseError = await closeResource(watcher);
+        if (watcherCloseError !== null) {
+          if (cleanupError === null) cleanupError = watcherCloseError;
+          else rememberCleanupError(cleanupError, watcherCloseError);
+        }
+      }
+      const clientCloseError = await closeResource(client);
+      if (clientCloseError !== null) {
+        if (cleanupError === null) cleanupError = clientCloseError;
+        else rememberCleanupError(cleanupError, clientCloseError);
+      }
+      await drainOperations().catch(() => {});
+      if (!finalized) await save().catch(() => {});
+    } finally {
+      try {
+        await release();
+      } catch (error) {
+        if (cleanupError === null) cleanupError = error;
+        else rememberCleanupError(cleanupError, error);
+      }
+    }
+    if (cleanupError !== null) {
+      if (primaryError !== null) rememberCleanupError(primaryError, cleanupError);
+      else throw cleanupError;
+    }
   }
 }

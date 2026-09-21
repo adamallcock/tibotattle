@@ -1,0 +1,17 @@
+*
+!scripts/
+!scripts/**
+!test/
+!test/fixtures/
+!test/fixtures/linux-packaged-codex/
+!test/fixtures/linux-packaged-codex/codex
+!.release-build/
+!.release-build/electron-production/
+!.release-build/electron-production/linux-x64/
+!.release-build/electron-production/linux-x64/app/
+!.release-build/electron-production/linux-x64/app/**
+!.release-build/electron-production/linux-x64/production-source-candidate.json
+!.release-build/electron-production/linux-x64/final-runtime/
+!.release-build/electron-production/linux-x64/final-runtime/extracted/
+!.release-build/electron-production/linux-x64/final-runtime/extracted/squashfs-root/
+!.release-build/electron-production/linux-x64/final-runtime/extracted/squashfs-root/**

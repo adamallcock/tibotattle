@@ -36,7 +36,15 @@ import {
   telemetryContributionAdmission,
   telemetryContributionAdmissionWindow,
 } from "../src/telemetry-repository";
-import { warmAdminMetricsHistoryCache } from "../src/admin-metrics-history";
+import {
+  captureStorageAdminMetricSnapshot,
+  warmAdminMetricsHistoryCache,
+  warmStorageAdminMetricsHistoryCache,
+} from "../src/admin-metrics-history";
+import { initializeStorageSource } from "../src/analytics-delivery";
+import { initializeStorageAnalyticsRuntime } from "../src/storage-analytics-runtime";
+import { initializeTypedV1Admission } from "../src/typed-v1-admission";
+import { initializeTypedV11Admission } from "../src/typed-v11-admission";
 import { ownerErase, ownerErasureRequest } from "./helpers/owner-erasure";
 import { beginAdminOperation } from "../src/admin-operations";
 import { finishParticipantDeletion, markParticipantDeleting } from "../src/repository";
@@ -45,8 +53,15 @@ import {
 } from "../src/admin-community-allowance";
 
 interface TestBindings extends Env {
+  STORAGE_ANALYTICS_DB: D1Database;
   TEST_MIGRATIONS: D1Migration[];
   TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[];
+  TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[];
+  TEST_INGESTION_BRIDGE_MIGRATIONS: D1Migration[];
+  TEST_TYPED_V1_ADMISSION_MIGRATIONS: D1Migration[];
+  TEST_TYPED_V11_ADMISSION_MIGRATIONS: D1Migration[];
+  TEST_INGESTION_ISOLATION_MIGRATIONS: D1Migration[];
+  TEST_ANALYTICS_MIGRATIONS: D1Migration[];
 }
 
 // Production deliberately permits deployment without an owner allowlist. The
@@ -78,6 +93,7 @@ function testBindings(
 ): Env {
   const bindings = env as TestBindings;
   return {
+    PUBLIC_ANALYTICS_MODE: "enabled",
     ASSETS: bindings.ASSETS,
     DELETION_LEDGER: bindings.DELETION_LEDGER,
     ENROLLMENT_MODE: bindings.ENROLLMENT_MODE,
@@ -2087,6 +2103,29 @@ describe("synthetic usage monitor service", () => {
     });
   });
 
+  it("reports uploads open and public analytics paused when the deployment gate is disabled", async () => {
+    const response = await api("/api/health", {}, testBindings({
+      PUBLIC_ANALYTICS_MODE:
+        "disabled" as unknown as Env["PUBLIC_ANALYTICS_MODE"],
+    }));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      status: "ok",
+      collectionControls: {
+        state: "degraded",
+        enrollment: true,
+        uploadRegistration: true,
+        processing: true,
+        publication: false,
+      },
+      capabilities: {
+        encryptedUpload: true,
+        communityDaily: false,
+        ongoingDeviceUploadRegistration: true,
+      },
+    });
+  });
+
   it("fails health closed for an invalid configured deployment source commit", async () => {
     const response = await api("/api/health", {}, testBindings({
       DEPLOYMENT_SOURCE_COMMIT: "not-a-commit",
@@ -2529,6 +2568,83 @@ describe("synthetic usage monitor service", () => {
       capturedAt: "2026-08-21T11:00:00.000Z",
       metrics: { bandParticipantCount: 1 },
     }]);
+  });
+
+  it("serves typed owner metrics history only from the analytics target", async () => {
+    const participant = await enrollTelemetry();
+    const adminIdentityKey = "a".repeat(64);
+    const bindings = env as TestBindings;
+    await bindings.USAGE_MONITOR_DB.prepare(
+      "UPDATE participants SET identity_link_key=? WHERE id=?",
+    ).bind(adminIdentityKey, participant.participantId).run();
+    await applyD1Migrations(bindings.USAGE_MONITOR_DB, bindings.TEST_TYPED_INGESTION_MIGRATIONS);
+    await applyD1Migrations(bindings.USAGE_MONITOR_DB, bindings.TEST_INGESTION_BRIDGE_MIGRATIONS);
+    await applyD1Migrations(bindings.USAGE_MONITOR_DB, bindings.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await applyD1Migrations(bindings.USAGE_MONITOR_DB, bindings.TEST_TYPED_V11_ADMISSION_MIGRATIONS);
+    await applyD1Migrations(bindings.STORAGE_ANALYTICS_DB, bindings.TEST_ANALYTICS_MIGRATIONS);
+    const sourceId = "synthetic-worker-admin-history";
+    const sourceNamespace = "synthetic-worker-admin-namespace";
+    await initializeStorageSource(bindings.USAGE_MONITOR_DB, sourceId);
+    await initializeTypedV1Admission(bindings.USAGE_MONITOR_DB, sourceNamespace);
+    await initializeTypedV11Admission(bindings.USAGE_MONITOR_DB, sourceNamespace);
+    await applyD1Migrations(bindings.USAGE_MONITOR_DB, bindings.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    const storage = {
+      source: bindings.USAGE_MONITOR_DB,
+      target: bindings.STORAGE_ANALYTICS_DB,
+      sourceId,
+      sourceNamespace,
+    };
+    await initializeStorageAnalyticsRuntime(storage);
+    expect((await captureStorageAdminMetricSnapshot(storage, Date.now())).code)
+      .toBe("SNAPSHOT_CAPTURED");
+    expect(await warmStorageAdminMetricsHistoryCache(storage, Date.now()))
+      .toEqual({ code: "HISTORY_CACHE_REFRESHED" });
+    expect(await bindings.USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS n FROM admin_metrics_history_cache",
+    ).first<number>("n")).toBe(0);
+    await bindings.USAGE_MONITOR_DB.prepare(
+      `UPDATE collection_controls SET control_state='degraded',
+        publication_enabled=0 WHERE singleton=1`,
+    ).run();
+
+    const response = await api(
+      "/api/v1/admin/metrics/history",
+      { headers: personalHeaders(participant) },
+      testBindings({
+        ADMIN_IDENTITY_LINK_KEY: adminIdentityKey,
+        TELEMETRY_STORAGE_MODE: "typed",
+        TELEMETRY_STORAGE_NAMESPACE: sourceNamespace,
+        ANALYTICS_DB: bindings.STORAGE_ANALYTICS_DB,
+      } as unknown as Partial<Env & OptionalAdminBinding>),
+    );
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      schemaVersion: "admin-metrics-history-v0.2",
+      events: { participants: { total: 1 } },
+      gauges: { snapshots: [{ metrics: { participantsTotal: 1 } }] },
+    });
+
+    const overview = await api(
+      "/api/v1/admin/overview",
+      { headers: personalHeaders(participant) },
+      testBindings({
+        ADMIN_IDENTITY_LINK_KEY: adminIdentityKey,
+        TELEMETRY_STORAGE_MODE: "typed",
+        TELEMETRY_STORAGE_NAMESPACE: sourceNamespace,
+        ANALYTICS_DB: bindings.STORAGE_ANALYTICS_DB,
+      } as unknown as Partial<Env & OptionalAdminBinding>),
+    );
+    expect(overview.status).toBe(200);
+    await expect(overview.json()).resolves.toMatchObject({
+      schemaVersion: "admin-overview-v0.4",
+      service: { telemetryStorageMode: "typed" },
+      counts: { contributions: { storedTelemetryRecords: 0 } },
+      pendingHistoricalRebuilds: null,
+      historicalPublication: {
+        publishedDays: 0,
+        previewState: "not_published",
+      },
+    });
   });
 
   it("serves the owner-only allowance merge preview without publishing it", async () => {
@@ -3092,13 +3208,31 @@ describe("synthetic usage monitor service", () => {
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
   });
   it("isolates an allowance-preview cache failure from scheduled maintenance", async () => {
-    await testBindings().USAGE_MONITOR_DB.prepare(
-      "DROP TABLE admin_community_allowance_preview_cache",
-    ).run();
+    // The cache table is also a dependency of required withdrawal triggers.
+    // Dropping it corrupts that schema and makes SQLite reject device updates
+    // before their WHERE/trigger WHEN clauses run. Model an optional cache
+    // operation failing while preserving those mandatory privacy fences.
+    let failedCacheOperations = 0;
+    const database = testBindings().USAGE_MONITOR_DB;
+    const unavailableCache = new Proxy(database, { get(target, property) {
+      if (property === "prepare") return (sql: string) => {
+        if (/^\s*(SELECT|INSERT)\b/iu.test(sql) && sql.includes("admin_community_allowance_preview_cache")) {
+          failedCacheOperations++;
+          throw new Error("synthetic optional preview cache unavailable");
+        }
+        return target.prepare(sql);
+      };
+      const value: unknown = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+    const runtime = new Proxy(testBindings(), { get(target, property) {
+      return property === "USAGE_MONITOR_DB" ? unavailableCache : Reflect.get(target, property);
+    } });
     const result = await runScheduledMaintenance(
-      testBindings(),
+      runtime,
       Date.parse("2026-08-23T12:00:00.000Z"),
     );
+    expect(failedCacheOperations).toBeGreaterThan(0);
     expect(result).toMatchObject({
       outcome: "success",
       event: "scheduled_backend_maintenance",

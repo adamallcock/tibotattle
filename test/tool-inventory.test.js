@@ -303,7 +303,7 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 156 records / 157 executable paths: release-documentation, Codex contract,
+  // 168 records / 169 executable paths: release-documentation, Codex contract,
   // documentation governance, repository-layout, macOS bundle-version, and
   // local index-recovery gates are reviewed repository operations invoked by
   // CI, release runbooks, or supported internal product tooling.
@@ -323,8 +323,12 @@ test("the checked-in inventory classifies every retained tool entry point and np
   // purchased-credit drawdown analyzer. The five retained 0.1.21 release tools
   // cover incoming Sparkle validation, three disposable Mac replacement/update
   // journeys, and qualification of an already signed Windows installer.
-  assert.equal(result.records, 156);
-  assert.equal(result.candidates.length, 157);
+  // The final Linux AppImage qualifier binds the unchanged normal runtime
+  // journey to final package bytes without rebuilding or publishing them.
+  // The last four are the macOS credential qualification set: the fixture
+  // preparer, the credentials smoke, and the loopback/intake helpers.
+  assert.equal(result.records, 168);
+  assert.equal(result.candidates.length, 169);
   assert.ok(result.aliases >= 25);
 });
 

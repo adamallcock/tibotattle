@@ -117,6 +117,7 @@ const ACCOUNTLESS_HOSTED_REHEARSAL_ENVIRONMENT_KEYS = Object.freeze([
   "USAGE_MONITOR_CENTRAL_ORIGIN",
   "USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE",
   "USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE",
+  "USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE",
   "USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY",
   "USAGE_MONITOR_PREPARED_DIRECTORY",
   "USAGE_MONITOR_RESOURCE_ROOT",
@@ -944,6 +945,7 @@ export async function launchDesktopRuntime({
   });
   if (productionDistribution !== undefined) {
     childEnvironment.USAGE_MONITOR_STATE_ROOT = join(userDataPath(app), "companion-state");
+    delete childEnvironment.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE;
   }
   const sharingDestinationOrigin = selectedAccountlessRehearsal?.origin
     ?? accountlessProduction?.origin ?? accountlessLaboratory?.origin
@@ -998,6 +1000,7 @@ export async function launchDesktopRuntime({
     args: companionArgs,
     cwd: paths.companionCwd,
     environment: childEnvironment,
+    platform,
     attachPrivateChannel: accountlessEnabled ? (channel) => attachAccountlessParentChannel({
       channel,
       readPreference: () => sharingCoordinator.readAuthorization(),
