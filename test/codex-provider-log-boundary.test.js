@@ -33,6 +33,7 @@ const PROVIDER_PUBLIC_EXPORTS = [
   "codexSessionMetaIdentity",
   "codexRolloutDiscoveryReceipt",
   "createCodexLogScanner",
+  "createCodexPerformanceTimingParser",
   "createLeadingRateLimitGate",
   "createSnapshotLineage",
   "cumulativeSnapshotKey",

@@ -127,7 +127,10 @@ export const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION =
 // v15 (2026-09-07): parent model declarations at/before the event and fork
 // boundary recover missing paginated-fork models. Explicit child selections
 // supersede the default. Counters, effort, tier and replay remain independent.
-export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v15";
+// v16 (2026-09-20): retain exact selected input/output totals in the existing
+// total columns. Reject contradictory totals without inventing missing splits.
+// Replay identity, additive components, and boundary semantics are unchanged.
+export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v16";
 export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
   "codex-immutable-rollout-v1";
 
@@ -138,14 +141,33 @@ export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
 // degraded row is recorded. Kept in lockstep with the main constant: salvaged
 // rows run the same delta derivation.
 export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v15-partial";
+  "unified-rollout-typed-v16-partial";
 
 // Per-row provenance variants retain the inherited-model assumption without
-// changing the physical schema. Ingest cursors keep the base v15 stamp.
+// changing the physical schema. Ingest cursors keep the base v16 stamp.
 export const LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION =
-  "unified-rollout-typed-v15-parent-model";
+  "unified-rollout-typed-v16-parent-model";
 export const LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v15-parent-model-partial";
+  "unified-rollout-typed-v16-parent-model-partial";
+
+// Cache continuity and dormant successor preparation both accept these exact
+// row-level provenance variants. Keep the legacy v15 family readable after a
+// v16 reparse; future parser labels remain unsupported until their semantics
+// are reviewed explicitly.
+const QUALIFIED_LOCAL_PARSER_VERSIONS = new Set([
+  "unified-rollout-typed-v15",
+  "unified-rollout-typed-v15-partial",
+  "unified-rollout-typed-v15-parent-model",
+  "unified-rollout-typed-v15-parent-model-partial",
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
+]);
+
+export function isLocalUnifiedIndexBoundaryParserVersion(value) {
+  return QUALIFIED_LOCAL_PARSER_VERSIONS.has(value);
+}
 
 export const LOCAL_UNIFIED_INDEX_APPLICATION_ID = 0x554d5549;
 const INDEX_APPLICATION_ID = LOCAL_UNIFIED_INDEX_APPLICATION_ID;

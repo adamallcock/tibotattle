@@ -20,6 +20,8 @@ versioning, and retirement rules.
 | Telemetry v0.1 export | `schemas/telemetry-v0.1/*.schema.json` plus `contracts/telemetry-v0.1/field-policy.json` | `generated/telemetry-v0.1-field-dictionary.json` and `generated/telemetry-v0.1-compatibility.json` | `npm run telemetry:check` |
 | Telemetry contribution v0.2 | `packages/telemetry-contract/schemas/v0.2/*.schema.json` and package source | `schemas/telemetry-contribution-v0.2/*.schema.json` byte-canonical mirrors | `npm run telemetry:upload-schemas:check` |
 | Attribution contribution v1.1 (staged) | `packages/telemetry-contract/src/telemetry-v1.1.js`, `telemetry-v1.1-domain.js`, and `telemetry-v1.1-schemas.js` | Eight package JSON Schemas and eight root mirrors in `schemas/telemetry-contribution-v1.1/` | `npm run telemetry:upload-schemas:check`, contract and Worker staging/activation tests |
+| Continuity contribution v1.2 (staged) | `packages/telemetry-contract/src/telemetry-v1.2.js`, `telemetry-v1.2-domain.js`, and `telemetry-v1.2-schemas.js` | Eight package JSON Schemas and eight root mirrors in `schemas/telemetry-contribution-v1.2/` | Upload/browser mirror checks and v1.2 contract tests; hosted activation remains unavailable |
+| Daily model performance (staged) | `packages/telemetry-contract/src/performance-histogram.js`, `telemetry-performance-v1.js`, and `telemetry-performance-v1-schemas.js` | Two package JSON Schemas and two root mirrors in `schemas/telemetry-performance-v1/` | Histogram/record tests and schema/browser parity; no transport or source-coverage authority |
 | Telemetry browser mirror | Telemetry contract package/source | Browser-consumable generated mirror | `npm run telemetry:browser:check` |
 | Public model identity mirror | `packages/telemetry-contract/src/model-catalog.js` only | `apps/web/public/model-catalog.generated.js`; excludes telemetry and admin-history contracts | `npm run telemetry:browser:check` and browser parity/public-asset isolation tests |
 | Reviewed model identities and admin history | `packages/telemetry-contract/src/model-catalog.js` and `admin-model-history.js` | Public package exports and the telemetry browser mirror; closed export/upload model enums checked against the catalog | Catalog tests, `npm run telemetry:check`, browser and upload mirror checks |
@@ -47,6 +49,8 @@ The root schema families are grouped as follows:
 | `telemetry-v0.1/` | 6 | Activity, usage, quota, bundle, compatibility, and privacy receipt for the original reviewed export. |
 | `telemetry-contribution-v0.2/` | 4 | Mirrored activity, usage, quota, and contribution upload schemas. |
 | `telemetry-contribution-v1.1/` | 8 | Generated attribution, usage, quota, session, chunk, envelope, day-manifest and complete-domain-manifest contracts. |
+| `telemetry-contribution-v1.2/` | 8 | Staged successor with nullable continuity and non-additive cache-write TTL detail; no new upload authority. |
+| `telemetry-performance-v1/` | 2 | Independent staged daily measurement and histogram contracts; not a v1.2 usage stream. |
 | `export-deletion-v0.1/` | 4 | Recoverable deletion preflight/journal/commit/receipt. |
 | `export-workspace-discard-v0.1/` | 4 | Recoverable workspace-discard preflight/journal/commit/receipt. |
 | `export-set-v0.1/`, `export-set-v0.2/` | 2 | Versioned export-set manifests. |
@@ -54,19 +58,24 @@ The root schema families are grouped as follows:
 | Claude, provider accounting, release manifest, R7 release, R7 resource | 5 | One schema per listed family. |
 
 Package-owned schema copies are not additional independent contracts. v0.2
-package JSON files are canonical; v1.1 JSON files are generated from its package
-schema factory. Telemetry v1.0 remains code-defined and frozen; the v1.1 family
-does not reinterpret existing v1.0 bytes or consent.
+package JSON files are canonical; v1.1, v1.2 and performance JSON files are generated from their
+package schema factories. Telemetry v1.0 remains code-defined and frozen.
+Successors do not reinterpret earlier bytes or consent.
 
 ## Canonical versus generated
 
 - Change the canonical package/schema/policy source first.
-- Never hand-edit `generated/`, root telemetry mirrors, or generated v1.1 package schemas.
+- Never hand-edit `generated/`, root telemetry mirrors, or generated v1.1/v1.2/performance package schemas.
 - Run the named generator, inspect its diff, then run the check mode.
 - A mirror must remain byte-canonical after normalized JSON formatting; do not
   add explanatory fields to only the mirror.
 - Human explanations belong here or in source policy metadata, not in a second
   manually maintained field dictionary.
+
+The Worker embeds the admin module graph, including the telemetry browser
+mirror. After regenerating that mirror, run
+`node apps/worker/scripts/generate-admin-ui-assets.mjs` from the repository
+root. The Worker check verifies this additional generated copy.
 
 ## Closed privacy contract
 
@@ -153,6 +162,84 @@ is required, not permission to delete it to make an upgrade succeed.
 The v1.1 wire format does not carry a complete quantity-interval proof. Hosted
 allowance remains explicitly conditional even when a record has an account
 pseudonym. This is not a provider-authoritative account billing contract.
+
+## Staged continuity successor v1.2
+
+The v1.2 contract adds three required nullable usage fields:
+
+- `boundaryFlags`: integer 0–3; bit 0 records a user-turn boundary and bit 1
+  records compaction. Null means boundary coverage is unreported.
+- `tieOrder`: integer 0–819,199, bounded by the maximum records in a day.
+  It ranks only usage sharing a session and millisecond. A complete group is
+  all null or has exactly the ranks 0 through its size minus one. This rule
+  applies across chunk boundaries.
+- `cacheWriteTtl`: null or the closed object
+  `{ fiveMinuteTokens, oneHourTokens }`. Both counts must be reported and sum
+  to the non-null aggregate cache-write count. They are subdivisions, never
+  additional usage. Codex has no qualified TTL source and supplies null.
+
+Historical restatement keeps its usage rows and reports null continuity before
+the client's persisted activation instant. Local preparation accepts an explicit
+cutoff but does not create or persist policy authority. V1 and v1.1 bytes,
+validators and grants remain separate.
+
+The local attribution reader exposes opt-in `readDayWithV12Evidence(day)` for
+dormant preparation. It joins emitted usage identities to index boundary rows
+and qualified source coordinates within the same published-generation snapshot.
+Missing lookup coverage, unknown parser provenance and ambiguous ordering stay
+null. Ordinary `readDay(day)` retains its existing query and result shape.
+
+Code and generated schemas are staged only. Negotiation, upload admission,
+typed storage, every analytics reader, owner-day occurrence preservation,
+restore and erasure still require the implementation and qualification in the
+[v1.2 plan](../plans/2026-09-20-turn-boundary-telemetry-plan.md). No v1.2 grant,
+client writer or hosted migration is activated by this source change.
+The parser-v16 total repair also needs current v1/v1.1 correction admission:
+existing v1.1 domain closure rejects changed base bytes, and v1 replacement
+must preserve repaired evidence when older clients upload again. Those gates
+must pass before a repaired client ships; staged v1.2 validators do not solve them.
+
+The dormant ingestion-isolation migration `0006_usage_correction_facts.sql`
+introduces a compact archive for typed v1 sources that replacement
+would otherwise delete. It retains original source digests and counters;
+derived facts reference that history without rewriting upload bytes. V1.1 and
+v1.2 archive capture remain refused. The typed v1 writer captures its prior
+usage chunk in the replacement transaction only when the correction runtime
+is active. Database guards protect chunk, record, admission and allocation
+retirement, and protected owner erasure
+removes its history and facts. The runtime remains staged by default. Legacy
+restore initializes that staged runtime; typed correction-source restore is
+refused until reference preservation is qualified. Effective occurrence readers
+and current-family correction admission remain prerequisites for activation.
+
+`cache-retention-v2` remains request-scoped and ignores continuity; a later
+calculation requires a separate decision after sufficient collected history.
+
+## Staged daily model performance
+
+`model-performance-daily-v1` groups qualified measurements by UTC completion
+day, provider, model, reasoning effort, speed method, speed mode/evidence source
+and API tier. Its independent TPS, TTFT and full-completion histograms retain
+eligible sample counts, conservative integer extrema and speed token/duration
+sums. Completion is positive integer milliseconds; measured zero TTFT is valid. `performance-histogram-v1` fixes the bucket
+edges for every contributor/client and includes explicit tails. Counts and integer units remain bounded by
+JavaScript's safe-integer range; future physical storage is not selected here.
+
+The helper merges already-qualified distributions and returns approximate
+Type-7 P10/P25/median/P75/P90 estimates with bounds and method metadata. Bands
+are null below five observations; a sparse median remains available. It does
+not deduplicate sources or establish that reports may be pooled. A measurement
+digest identifies canonical content, not unique source membership.
+
+This family is staged independently of usage v1.2. It adds no upload grant,
+capability response, prepared-set discovery, transport, typed storage or chart
+publication. The staged Codex parser and pure daily projection carry event-time
+mode and full completion evidence; persistent timing-store/application
+integration remains open. Old rows retain existing TPS/TTFT with unavailable
+new fields. The field dictionary is `telemetry-performance-registry-2026-09-21.1`.
+The [performance specification](../design/2026-09-20-performance-telemetry-contract.md)
+records the remaining overlap, policy, delivery, erasure, restore and UI gates.
+Those gates must not delay continuity collection or alter cache calculations.
 
 ## Retirement
 

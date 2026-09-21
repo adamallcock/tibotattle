@@ -456,7 +456,11 @@ describe('isolated allowance graph publication',()=>{
  it('selects a dormant owner when the calculation day is after its last uploaded day',async()=>{
   const f=await createV11DeviceFixture(typed(),{participantId:'participant:selected-dormant',grant:true});
   const uploaded=await stage(typed(),f,await makeV11Day(day(),evidence()),true);
-  await activateDays(f,[uploaded],Date.parse(day()+'T12:00:00.000Z'));
+  // Keep the predecessor's through-day at the uploaded day while minting it
+  // late enough that its one-day capability is still live when this test
+  // reads the dormant owner.
+  const activationNow = Date.parse(`${day()}T23:59:59.000Z`);
+  await activateDays(f,[uploaded],activationNow);
   for(let pass=0;pass<32;pass++)if((await advanceStorageAnalytics(bindings())).state==='idle')break;
   const selected=await selectedEnvelope('fits',today());
   expect(selected.envelope.snapshot.throughDay).toBe(day());

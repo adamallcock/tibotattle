@@ -17,15 +17,59 @@ export const MAX_AUTHORITY_COPY_ROWS = 32;
 export const MAX_AUTHORITY_COPY_BYTES = 1_048_576;
 const PREFIX = '_authority_stage_';
 const OWNED = '_authority_';
+export const TELEMETRY_USAGE_CORRECTION_TABLES = Object.freeze([
+  'telemetry_usage_correction_cas_guard',
+  'telemetry_usage_correction_facts',
+  'telemetry_usage_correction_history',
+  'telemetry_usage_correction_runtime',
+]);
+export const TELEMETRY_USAGE_CORRECTION_SCHEMA_OBJECTS = Object.freeze([
+  ...TELEMETRY_USAGE_CORRECTION_TABLES,
+  'telemetry_usage_correction_effective_facts',
+  'telemetry_usage_correction_facts_history',
+  'telemetry_usage_correction_history_identity',
+  'telemetry_usage_correction_history_owner_time',
+  'telemetry_usage_correction_history_source',
+  'telemetry_usage_correction_cas_guard_consume',
+  'telemetry_usage_correction_cas_guard_validate',
+  'telemetry_usage_correction_allocation_retirement',
+  'telemetry_usage_correction_admission_retirement',
+  'telemetry_usage_correction_chunk_retirement',
+  'telemetry_usage_correction_fact_erasure',
+  'telemetry_usage_correction_fact_immutable',
+  'telemetry_usage_correction_fact_provenance',
+  'telemetry_usage_correction_history_erasure',
+  'telemetry_usage_correction_history_fact',
+  'telemetry_usage_correction_history_immutable',
+  'telemetry_usage_correction_history_provenance',
+  'telemetry_usage_correction_participant_erasure',
+  'telemetry_usage_correction_record_retirement',
+  'telemetry_usage_correction_runtime_immutable',
+  'telemetry_usage_correction_runtime_retained',
+]);
 const AUTHORITY_TABLES = new Set(`accountless_enrollment_issuance accountless_enrollment_ledger accountless_public_history_retention accountless_upload_owners accountless_v11_device_authorizations attribution_enrollments collection_controls device_credential_rotations device_credentials device_pairing_events device_pairings device_upload_authorizations enrollment_grants identity_link_secret_configuration identity_reenrollment_cooldowns participant_community_eligibility participants pending_quarantine_objects quarantine_reconciliation_state recovery_retry_receipts retention_state telemetry_contribution_admission_windows telemetry_transport_floor_rollbacks telemetry_transport_formats telemetry_transport_participant_floors telemetry_v11_device_consents telemetry_v1_chunk_admission_windows telemetry_v1_device_consents upload_authorizations web_sessions telemetry_v11_chunks telemetry_v11_day_manifests telemetry_v11_domain_days telemetry_v11_domain_heads telemetry_v11_domain_predecessors telemetry_v11_domains telemetry_v1_chunks community_analytical_input_versions community_graph_update_scope community_snapshot_mutation_control community_aggregate_exclusions community_snapshot_policy admin_action_audit contributions telemetry_contributions telemetry_records telemetry_contribution_occurrences apple_signin_handoffs google_signin_handoffs sign_in_start_admission_windows sparkle_appcast_guard_nonces diagnostic_error_events github_distribution_snapshots github_distribution_sync_state github_release_asset_snapshots github_release_snapshots`.split(' '));
 const DERIVED_TABLES = new Set(`admin_community_allowance_preview_cache admin_community_allowance_preview_refresh_state admin_metric_snapshots admin_metrics_history_cache community_allowance_fit_cache community_allowance_publication_state community_analysis_work community_analysis_work_parts community_analysis_work_stage community_current_analysis_queue community_current_analysis_queue_state community_daily_aggregate_rebuilds community_daily_aggregates community_model_composition_cache community_model_composition_days community_model_history_dependencies community_model_history_results community_model_history_work community_model_history_work_parts community_model_history_work_stage community_preparation_progress_counters community_prepared_fit_rows community_prepared_plan_rows community_prepared_source_days community_prepared_usage_bins community_prepared_usage_rows community_public_source_bootstrap community_publication_changes community_publication_generation community_publication_members community_refresh_lanes community_snapshot_builders community_weekly_snapshot_rebuilds community_weekly_snapshots telemetry_v1_quota_fit_backfill telemetry_v1_quota_fit_rows`.split(' '));
 export const authorityRestoreRetainedTableNames = ():readonly string[] => Object.freeze([...AUTHORITY_TABLES].sort());
 const EXCLUDED_RAW = new Set(['telemetry_v1_records', 'telemetry_v11_records']);
 const q = (name: string): string => { if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name)) fail(); return `"${name}"`; };
 function fail(): never { throw new Error('AUTHORITY_RESTORE_EVIDENCE_MISMATCH'); }
+function failTypedCorrection(): never { throw new Error('AUTHORITY_RESTORE_TYPED_CORRECTION_UNQUALIFIED'); }
 const hash = (value: unknown) => sha256Hex(canonicalJson(value));
 const digest = (value: string) => { if (!/^[0-9a-f]{64}$/.test(value)) fail(); };
 const operation = (value: string) => { if (!/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/.test(value)) fail(); };
+function correctionSchemaPresent(objects: readonly AuthoritySchemaObject[]): boolean {
+  const names = new Set(objects.map((object) => object.name));
+  const hasCorrectionObject = objects.some((object) => object.name.startsWith('telemetry_usage_correction_'));
+  if (!hasCorrectionObject) return false;
+  // A predecessor database may legitimately predate the dormant correction
+  // migration. Once any correction object is present, however, the restore
+  // contract must describe the complete migration, including its view,
+  // indexes, and triggers. A partial or hand-created archive is not evidence.
+  const tableCount = TELEMETRY_USAGE_CORRECTION_TABLES.filter((name) => names.has(name)).length;
+  if (tableCount !== TELEMETRY_USAGE_CORRECTION_TABLES.length
+      || TELEMETRY_USAGE_CORRECTION_SCHEMA_OBJECTS.some((name) => !names.has(name))) failTypedCorrection();
+  return true;
+}
 export const AUTHORITY_OPERATOR_LEDGER_SQL = 'CREATE TABLE d1_storage_migrations (name TEXT PRIMARY KEY NOT NULL, sha256 TEXT NOT NULL CHECK(length(sha256)=64)) STRICT';
 export interface AuthoritySchemaObject { type: 'table'|'index'|'view'|'trigger'; name: string; tbl_name: string; sql: string; }
 export interface AuthorityRestoreContract {
@@ -70,6 +114,14 @@ async function validate(contract: AuthorityRestoreContract, expectedDigest: stri
     if (!Array.isArray(objects) || objects.length > 1024 || new Set(objects.map(x=>x.name)).size !== objects.length || await hash(objects) !== pin) fail();
     for (const object of objects) { q(object.name); q(object.tbl_name); if (object.name.startsWith(OWNED) || !['table','index','view','trigger'].includes(object.type) || typeof object.sql !== 'string' || object.sql.length > 100_000) fail(); }
   }
+  const sourceHasCorrectionSchema = correctionSchemaPresent(contract.sourceSchema);
+  correctionSchemaPresent(contract.finalSchema);
+  // The current restore role can copy legacy authority and bootstrap typed
+  // admission, but cannot remap the integer dictionary/identifier references
+  // held by correction history. Keep the archive operationally readable while
+  // refusing to qualify a source snapshot until a typed-to-typed restore role
+  // supplies that remapping proof.
+  if (sourceHasCorrectionSchema) failTypedCorrection();
   const tables = contract.sourceSchema.filter(x=>x.type==='table').map(x=>x.name).sort();
   if (canonicalJson(tables) !== canonicalJson(contract.tables.map(x=>x.name).sort()) || new Set(contract.tables.map(x=>x.name)).size !== tables.length || tables.length > 128) fail();
   for (const table of contract.tables) {
@@ -330,6 +382,10 @@ export async function promoteAuthorityRestore(source:D1Database,target:D1Databas
   for(const d of desc)statements.push(target.prepare(`ALTER TABLE ${q(PREFIX+d.name)} RENAME TO ${q(d.name)}`));
   const existing=new Set([...contract.targetBaseSchema.map(x=>x.name),...desc.map(x=>x.name)]);
   for(const type of ['table','index','view','trigger'])for(const object of contract.finalSchema)if(object.type===type&&!existing.has(object.name))statements.push(target.prepare(object.sql));
+  if(contract.finalSchema.some(object=>object.type==='table'&&object.name==='telemetry_usage_correction_runtime'))statements.push(target.prepare(`INSERT INTO telemetry_usage_correction_runtime
+    (id,schema_version,method_version,state,max_capture_rows,max_history_page)
+    SELECT 1,'telemetry-usage-correction-v1','usage-total-correction-v1','staged',200,200
+     WHERE NOT EXISTS(SELECT 1 FROM telemetry_usage_correction_runtime WHERE id=1)`));
   for(const object of contract.finalSchema.filter(x=>x.type==='table'&&!existing.has(x.name)))for(const verb of ['INSERT','UPDATE','DELETE']){const guard=frozenTrigger(verb,object.name,'_authority_final_guard_');statements.push(target.prepare(guard.sql));guardProofs.push({...guard,tbl_name:object.name});}
   for(let offset=0;offset<guardProofs.length;offset+=30){const page=guardProofs.slice(offset,offset+30);statements.push(target.prepare(`INSERT INTO _authority_restore_installed_guards VALUES ${page.map(()=>'(?,?,?)').join(',')}`).bind(...page.flatMap(x=>[x.name,x.sql,x.tbl_name])));}
   statements.push(target.prepare("UPDATE _authority_restore_run SET phase='installed' WHERE id=1"));
@@ -340,8 +396,8 @@ export async function promoteAuthorityRestore(source:D1Database,target:D1Databas
 
 export async function finalizeAuthorityRestore(source:D1Database,target:D1Database,contract:AuthorityRestoreContract,pin:string){
  await validate(contract,pin);await assertFrozen(source,contract,pin);const state=await runState(target,contract,pin);
- if(state.phase==='ready'){await checkFinal(target,contract);return;}
- if(state.phase!=='installed')fail();await finishPromotion(target,contract,pin);
+ if(state.phase==='ready'){await ensureDormantCorrectionRuntime(target,contract);await checkFinal(target,contract);return;}
+ if(state.phase!=='installed')fail();await ensureDormantCorrectionRuntime(target,contract);await finishPromotion(target,contract,pin);
 }
 
 /** D1 forbids table-valued PRAGMAs in triggers. These physical checks run while
@@ -357,6 +413,18 @@ async function checkFinal(db:D1Database,contract:AuthorityRestoreContract){
  await assertOperatorLedger(db,contract);
  await checkCapacity(db,contract);
  if(await hash(await authoritySchemaInventory(db))!==contract.finalSchemaDigest||(await db.prepare('PRAGMA foreign_key_check').all()).results.length)throw new Error('AUTHORITY_RESTORE_FINAL_CHECK_FAILED');
+}
+async function ensureDormantCorrectionRuntime(target:D1Database,contract:AuthorityRestoreContract):Promise<void>{
+ const runtime=contract.finalSchema.some(object=>object.type==='table'&&object.name==='telemetry_usage_correction_runtime');
+ if(!runtime)return;
+ const rows=(await target.prepare(`SELECT id,schema_version,method_version,state,max_capture_rows,max_history_page
+   FROM telemetry_usage_correction_runtime LIMIT 2`).all<{id:number;schema_version:string;method_version:string;state:string;max_capture_rows:number;max_history_page:number}>()).results;
+ if(rows.length!==1)fail();
+ const row=await target.prepare(`SELECT id,schema_version,method_version,state,max_capture_rows,max_history_page
+   FROM telemetry_usage_correction_runtime WHERE id=1`).first<{id:number;schema_version:string;method_version:string;state:string;max_capture_rows:number;max_history_page:number}>();
+ if(!row||row.id!==1||row.schema_version!=='telemetry-usage-correction-v1'
+   ||row.method_version!=='usage-total-correction-v1'||row.state!=='staged'
+   ||row.max_capture_rows!==200||row.max_history_page!==200)fail();
 }
 async function finishPromotion(db:D1Database,contract:AuthorityRestoreContract,pin:string){
  await checkFinal(db,contract);

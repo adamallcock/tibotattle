@@ -359,12 +359,18 @@ export const MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES = Object.freeze([
   "src/envelope.js",
   "src/errors.js",
   "src/model-catalog.js",
+  "src/performance-histogram.js",
   "src/primitives.js",
+  "src/telemetry-performance-v1-schemas.js",
+  "src/telemetry-performance-v1.js",
   "src/telemetry-v0.1.js",
   "src/telemetry-v0.2.js",
   "src/telemetry-v1.1-domain.js",
   "src/telemetry-v1.1-schemas.js",
   "src/telemetry-v1.1.js",
+  "src/telemetry-v1.2-domain.js",
+  "src/telemetry-v1.2-schemas.js",
+  "src/telemetry-v1.2.js",
   "src/upload.js",
 ]);
 

@@ -6,10 +6,7 @@ import {
 } from "@app-usagemonitor/accounting";
 import { codexPrimaryAllowanceBasis } from "./codex-primary-allowance-basis.js";
 import {
-  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
-  LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
-  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
-  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
+  isLocalUnifiedIndexBoundaryParserVersion,
   reasoningEffortName,
 } from "./local-unified-index.js";
 import {
@@ -256,10 +253,9 @@ function sameContinuityConfiguration(row) {
 }
 
 function compactionAwareParser(value) {
-  return value === LOCAL_UNIFIED_INDEX_PARSER_VERSION
-    || value === LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION
-    || value === LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION
-    || value === LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION;
+  // v16 adds exact totals only. Retained v15 rows still prove the same
+  // boundaries when their raw source has rotated away and cannot be reparsed.
+  return isLocalUnifiedIndexBoundaryParserVersion(value);
 }
 
 function componentsFor(row) {

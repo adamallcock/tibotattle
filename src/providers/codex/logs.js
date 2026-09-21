@@ -139,3 +139,7 @@ export {
   unknownCodexTier,
   validateTierDeclaration,
 } from "./tier-normalization.js";
+
+// The performance parser is deliberately exposed under a projection-specific
+// name so callers cannot mistake it for the accounting/log-normalization path.
+export { createParser as createCodexPerformanceTimingParser } from "./inference-timing.js";
