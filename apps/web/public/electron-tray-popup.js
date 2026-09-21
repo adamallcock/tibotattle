@@ -1285,7 +1285,9 @@ function renderWeeklyPace(documentRef, projection, t, numberFormatter, localForm
     && pace.outlook.coveredFraction !== null;
   const insufficient = pace.status === "insufficient_observations"
     && weeklyAllowance !== undefined;
-  setHidden(documentRef, "pace-section", !available && !insufficient);
+  const unavailable = pace.status === "unavailable"
+    && weeklyAllowance !== undefined;
+  setHidden(documentRef, "pace-section", !available && !insufficient && !unavailable);
   setHidden(documentRef, "pace-timeline", !detailed);
   setHidden(documentRef, "pace-evidence", !detailed || !pace.outlook.earlyEstimate);
   if (!available) {
@@ -1306,6 +1308,10 @@ function renderWeeklyPace(documentRef, projection, t, numberFormatter, localForm
       if (section) section.dataset.paceTone = "insufficient";
       setElementText(documentRef, "pace-state", t("weekly.headline.insufficient"));
       setElementText(documentRef, "pace-headline", t("electron.trayPopover.paceNeedsEvidence"));
+    } else if (unavailable) {
+      if (section) section.dataset.paceTone = "unavailable";
+      setElementText(documentRef, "pace-state", t("electron.trayPopover.paceUnavailable"));
+      setElementText(documentRef, "pace-headline", t("electron.trayPopover.paceRefreshNeeded"));
     }
     return;
   }
@@ -1717,6 +1723,7 @@ export async function bootstrapTrayPopup({
       formattingLocale: localization.locale(),
       preferences,
     });
+    return projection;
   };
   const loadData = async () => {
     const sequence = ++loadSequence;
@@ -1767,7 +1774,14 @@ export async function bootstrapTrayPopup({
       const prior = range;
       setElementText(documentRef, "tray-popup-operation-error", "");
       range = button.dataset.historyRange;
-      render();
+      const projection = render();
+      if (projection.weeklyPace.status === "unavailable"
+          && projection.allowances.some((allowance) =>
+            allowance.durationMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES && !allowance.stale)) {
+        // The companion re-projects the reset geometry at request time. A
+        // history-only repaint must not strand an aged forecast indefinitely.
+        void requestLoad();
+      }
       if (typeof bridge?.setHistoryRange !== "function") return;
       rangeSaving = true;
       try {

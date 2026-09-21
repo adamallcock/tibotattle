@@ -428,7 +428,7 @@ test("content-height reporting follows intrinsic changes through the narrow brid
   assert.equal(FakeResizeObserver.latest.disconnected, true);
 });
 
-test("the popup's three new messages stay translated in every shipped locale", () => {
+test("the popup's pacing and history messages stay translated in every shipped locale", () => {
   for (const locale of SUPPORTED_LOCALES) {
     for (const key of [
       "electron.trayPopover.weeklyPace",
@@ -439,6 +439,8 @@ test("the popup's three new messages stay translated in every shipped locale", (
       "electron.trayPopover.notSubscriptionBill",
       "electron.trayPopover.retainedHistory",
       "electron.trayPopover.refresh",
+      "electron.trayPopover.paceUnavailable",
+      "electron.trayPopover.paceRefreshNeeded",
     ]) {
       const value = translate(key, {}, locale);
       assert.equal(typeof value, "string");
@@ -735,12 +737,54 @@ test("pace outlook expires when its reset binding is stale or already passed", (
     timeZone: "UTC",
   });
   assert.equal(stale.weeklyPace.status, "unavailable");
+  assert.equal(stale.allowances.find((allowance) => allowance.durationMinutes === 10_080)?.stale, true);
+
+  const agedOutlook = createTrayPopupProjection(fixture(), {
+    now: "2026-09-04T18:03:00.000Z",
+    timeZone: "UTC",
+  });
+  assert.equal(agedOutlook.weeklyPace.status, "unavailable");
+  const agedDocument = new FakeDocument();
+  renderTrayPopup(agedDocument, agedOutlook);
+  assert.equal(agedDocument.getElementById("pace-section").hidden, false);
+  assert.equal(agedDocument.getElementById("pace-timeline").hidden, true);
+  assert.match(agedDocument.getElementById("pace-headline").textContent, /Refresh to check/u);
 
   const expired = createTrayPopupProjection(fixture(), {
     now: "2026-09-08T00:00:00.000Z",
     timeZone: "UTC",
   });
   assert.equal(expired.weeklyPace.status, "unavailable");
+});
+
+test("a history-range repaint reloads an aged outlook from the companion", async () => {
+  const shiftFixture = (ageMs) => {
+    const offset = Date.now() - ageMs - Date.parse(NOW);
+    return JSON.parse(JSON.stringify(fixture()).replace(
+      /2026-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/gu,
+      (value) => new Date(Date.parse(value) + offset).toISOString(),
+    ));
+  };
+  const documentRef = new FakeDocument();
+  let calls = 0;
+  const client = {
+    async load() {
+      calls += 1;
+      return shiftFixture(calls === 1 ? 3 * 60_000 : 5_000);
+    },
+  };
+  await bootstrapTrayPopup({ windowRef: fakeWindow(), documentRef, client });
+  assert.equal(calls, 1);
+  assert.equal(documentRef.getElementById("pace-section").hidden, false);
+  assert.equal(documentRef.getElementById("pace-timeline").hidden, true);
+
+  documentRef.ranges[1].dispatch("click");
+  await tick();
+  assert.equal(calls, 2);
+  assert.equal(documentRef.getElementById("history-period").textContent, "Last 30 days");
+  assert.equal(documentRef.getElementById("pace-section").hidden, false);
+  assert.equal(documentRef.getElementById("pace-timeline").hidden, false);
+  assert.match(documentRef.getElementById("pace-headline").textContent, /lasts to the reset/u);
 });
 
 test("history uses existing 15-minute buckets, preserves measured zero, and leaves gaps unknown", () => {

@@ -246,6 +246,11 @@ body {
   --pace-hatch: rgba(229, 43, 33, .2);
 }
 
+.electron-tray-popup-pace[data-pace-tone="unavailable"] {
+  --pace-color: var(--tray-muted);
+  --pace-wash: rgba(117, 114, 106, .065);
+}
+
 .electron-tray-popup-pace > h2 { margin-bottom: 7px; }
 
 .electron-tray-popup-pace-heading {
