@@ -9006,14 +9006,8 @@ function cacheImpactMetricBullets(impact, appendDetails) {
     ? "accounting.cacheImpact.bulletPartial" : "accounting.cacheImpact.bulletPriced", {
     priced: formatCount(cost.pricedDrops ?? impact.pricedDrops),
   }));
-  if (cost.standardApiPremiumUsd !== null) {
-    list.append(localizedNode("li", "", "accounting.cacheImpact.bulletStandard", {
-      amount: formatApiMoney(cost.standardApiPremiumUsd),
-    }));
-  }
   const excluded = [];
   for (const [count, key] of [
-    [impact.orderingCoverageGaps, "accounting.cacheImpact.bulletOrdering"],
     [impact.unpricedDrops, "accounting.cacheImpact.bulletUnpriced"],
     [impact.uncoveredConfigurationChanges ?? impact.uncoveredReturns, "accounting.cacheImpact.bulletUncovered"],
   ]) {
@@ -10438,16 +10432,13 @@ function renderAccounting(data) {
     );
     summary.append(card);
   }
-  // Speed-mode attribution disclosure. The former preference control is gone
-  // (the speed mode is Codex's own toggle), so the coverage split and the
-  // diagnostic inference verdict live directly beside the number they explain,
-  // together with any assumed-ratio share.
+  // Keep the visible attribution note focused on what changed the headline:
+  // directly known speed, the Standard fallback, and any genuinely unweighted
+  // usage. Calibration diagnostics remain available in the accounting data but
+  // do not help a reader interpret this number.
   if (staleRow === null) {
     const attributionNote = node("p", "annotation accounting-speed-coverage");
-    const sentences = [
-      fastModeCoverageSentence(fastMode),
-      fastModeInferenceSentence(fastMode),
-    ];
+    const sentences = [fastModeCoverageSentence(fastMode)];
     if (fastMode.assumedRatioStandardApiPriceEquivalentUsd > 0) {
       sentences.push(t("accounting.fastMode.assumedRatio", {
         amount: formatApiMoney(
@@ -10955,57 +10946,32 @@ function fastModeCoverageSentence(fastMode) {
   if (coverage.totalEvents === 0) {
     return t("accounting.fastMode.noUsage");
   }
-  const parts = [
-    t("accounting.fastMode.observed", {
-      count: compact(coverage.observedEvents),
-    }),
-    t("accounting.fastMode.declaredFromConfig", {
-      count: compact(coverage.declaredFromConfigEvents),
-    }),
-    t("accounting.fastMode.stated", {
+  const knownEvents = coverage.observedEvents + coverage.declaredFromConfigEvents;
+  const sentences = [t("accounting.fastMode.coverageSummary", {
+    known: compact(knownEvents),
+    total: compact(coverage.totalEvents),
+  })];
+  if (coverage.assumedEvents > 0) {
+    sentences.push(t("accounting.fastMode.coverageAssumed", {
       count: compact(coverage.assumedEvents),
-    }),
-    t("accounting.fastMode.inferred", {
-      count: compact(coverage.inferredEvents),
-    }),
-    t("accounting.fastMode.unknown", {
-      count: compact(coverage.unknownEvents),
-    })
-  ];
-  const share = coverage.unknownSharePercent === null
-    ? ""
-    : t("accounting.fastMode.unknownShare", {
-      percent: formatPercent(coverage.unknownSharePercent, 1),
-    });
-  const unweighted = fastMode.unweightedUnknownApiPriceEquivalentUsd > 0
-    ? t("accounting.fastMode.unweighted", {
+    }));
+  }
+  if (coverage.unknownEvents === 0) {
+    sentences.push(t("accounting.fastMode.coverageComplete"));
+    return sentences.join(" ");
+  }
+  sentences.push(t("accounting.fastMode.coverageUnknown", {
+    count: compact(coverage.unknownEvents),
+    percent: coverage.unknownSharePercent === null
+      ? "—"
+      : formatPercent(coverage.unknownSharePercent, 1),
+  }));
+  sentences.push(fastMode.unweightedUnknownApiPriceEquivalentUsd > 0
+    ? t("accounting.fastMode.coverageUnknownCost", {
       amount: formatApiMoney(fastMode.unweightedUnknownApiPriceEquivalentUsd),
     })
-    : "";
-  return t("accounting.fastMode.coverage", {
-    total: compact(coverage.totalEvents),
-    parts: parts.join(", "),
-    share,
-    unweighted,
-  });
-}
-
-function fastModeInferenceSentence(fastMode) {
-  const inference = fastMode.inference;
-  if (inference.status !== "inferred") {
-    return t("accounting.fastMode.inferenceNotRun");
-  }
-  if (inference.inferredFastWindows === 0) {
-    return t("accounting.fastMode.inferenceNone", {
-      scored: compact(inference.scoredWindowCount),
-      reference: compact(inference.referenceWindowCount),
-    });
-  }
-  return t("accounting.fastMode.inferenceSome", {
-    fast: compact(inference.inferredFastWindows),
-    scored: compact(inference.scoredWindowCount),
-    reference: compact(inference.referenceWindowCount),
-  });
+    : t("accounting.fastMode.coverageUnknownExcluded"));
+  return sentences.join(" ");
 }
 
 
