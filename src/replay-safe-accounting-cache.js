@@ -74,6 +74,7 @@ import {
   defaultLocalCollectorStatePath,
   prepareLocalCollectorState,
   readLocalCollectorAccountingCache,
+  serializeLocalCollectorAccountingCache,
   writeLocalCollectorAccountingCache,
 } from "./local-collector-state.js";
 import { stableJson } from "./storage.js";
@@ -187,7 +188,10 @@ const ACCOUNTING_SOURCE_ERROR_CODES = Object.freeze({
 const HISTORICAL_PRICE_EPOCH_BASIS =
   "event_time_when_registry_has_effective_evidence";
 
-const MAX_CACHE_BYTES = 16 * 1024 * 1024;
+// Bound the compact durable cache, independently of the rebuild's RSS guards
+// and the optional plan-scoped lane's own row/byte limits. This is a resource
+// ceiling, not a history window or a preallocated memory budget.
+const MAX_CACHE_BYTES = 128 * 1024 * 1024;
 // Standing owner rule (2026-08-08, stated after five rounds of cap-shuffling):
 // NEVER introduce or retain small data-window caps. A history limit is either
 // absent or extreme (365+ days), never convenience-sized — 31 and 93 were
@@ -504,11 +508,10 @@ const ACCOUNTING_REBUILD_CHILD_KILL_GRACE_MS = 5_000;
 // this is not speaking the protocol, and the read stops charging memory for
 // its output at this bound.
 const ACCOUNTING_REBUILD_ENVELOPE_LIMIT_BYTES = 64 * 1024;
-// Transport ceiling for the result payload read-back. The durable cache gate
-// stays MAX_CACHE_BYTES (enforced by the caller exactly as for an in-process
-// build); this larger bound only refuses a runaway result file before the
-// parent would buffer it.
-const ACCOUNTING_REBUILD_RESULT_LIMIT_BYTES = 64 * 1024 * 1024;
+// The child and SQLite writer use the same compact representation. Keep the
+// transport bound aligned so a valid durable cache can cross the process
+// boundary; refuse oversized files before buffering them in the parent.
+const ACCOUNTING_REBUILD_RESULT_LIMIT_BYTES = MAX_CACHE_BYTES;
 export const REPLAY_SAFE_ACCOUNTING_REBUILD_REQUEST_VERSION =
   "replay-safe-accounting-rebuild-request-v1";
 // This scanner runs inside the same process that immediately expands the
@@ -5034,7 +5037,7 @@ export async function buildReplaySafeAccountingCache({
     diagnostics: publicDiagnostics(scanned?.diagnostics),
   };
   if (cache.planScopedTimeline.status === "available"
-      && Buffer.byteLength(stableJson(cache)) > MAX_CACHE_BYTES) {
+      && Buffer.byteLength(serializeLocalCollectorAccountingCache(cache)) > MAX_CACHE_BYTES) {
     cache.planScopedTimeline = unavailablePlanTimeline("plan_scoped_resource_limit");
   }
   return cache;
@@ -5219,6 +5222,11 @@ async function buildReplaySafeAccountingCacheInSubprocess({
         && closed.killSignal === null) {
       let payload;
       try {
+        const metadata = await lstat(resultFile);
+        if (!metadata.isFile() || metadata.size !== envelope.resultBytes
+            || metadata.size > ACCOUNTING_REBUILD_RESULT_LIMIT_BYTES) {
+          throw fixedError("accounting_rebuild_subprocess_failed");
+        }
         payload = await readFile(resultFile);
       } catch {
         throw fixedError("accounting_rebuild_subprocess_failed");
@@ -5553,7 +5561,7 @@ export async function refreshReplaySafeAccountingCache({
   // atomic, but atomicity alone would preserve a newly-created invalid cache;
   // fail closed here so a bad build leaves the prior valid state untouched.
   assertReplaySafeAccountingCache(cache);
-  if (Buffer.byteLength(stableJson(cache)) > MAX_CACHE_BYTES) {
+  if (Buffer.byteLength(serializeLocalCollectorAccountingCache(cache)) > MAX_CACHE_BYTES) {
     throw fixedError("cache_invalid_size");
   }
   // A timeout/cancel can arrive after the isolated child has returned a valid
