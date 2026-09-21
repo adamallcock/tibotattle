@@ -126,6 +126,37 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
   outline: 3px solid rgba(49, 95, 132, .42);
   outline-offset: 3px;
 }
+
+/* Page navigation moves focus to the destination heading so assistive
+ * technology announces the new view. Chromium's automatic outline follows
+ * the heading's line boxes, which produces a large, notched rectangle that
+ * looks like an accidental selection. Keep the focus handoff, but represent
+ * keyboard-visible focus with one stable marker beside the heading. */
+[data-dashboard-page] :is(h1, h2)[tabindex="-1"]:focus {
+  outline: none;
+}
+[data-dashboard-page] :is(h1, h2)[tabindex="-1"]:focus-visible {
+  position: relative;
+}
+[data-dashboard-page] :is(h1, h2)[tabindex="-1"]:focus-visible::before {
+  position: absolute;
+  inset-block: .08em;
+  inset-inline-start: -.34em;
+  width: 3px;
+  border-radius: var(--radius-pill);
+  background: var(--blue);
+  content: "";
+  pointer-events: none;
+}
+@media (forced-colors: active) {
+  [data-dashboard-page] :is(h1, h2)[tabindex="-1"]:focus-visible {
+    outline: 2px solid CanvasText;
+    outline-offset: 4px;
+  }
+  [data-dashboard-page] :is(h1, h2)[tabindex="-1"]:focus-visible::before {
+    display: none;
+  }
+}
 [hidden] { display: none !important; }
 
 /* The desktop shell adds Settings to the shared dashboard only after its
