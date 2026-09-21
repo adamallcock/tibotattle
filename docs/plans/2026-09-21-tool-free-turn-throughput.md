@@ -96,4 +96,11 @@ Clarified combined-chart implementation (2026-09-21):
 - A read-only projection over the completed real-data sidecars returned 235
   Output speed measurements from 5,501 GPT-5.5 turns, all 235 full-turn estimates,
   with 5,000 TTFT measurements. No parser or persistent-store change was needed.
+- Integrated main revision `ecf1b31e`, including source-scoped timing stores and
+  persisted reports. Updated snapshot validation for the new display contract;
+  old aggregate receipts cannot be pooled accurately and remain preserved until
+  a valid reconstruction replaces them.
+- Integrated validation: 36 focused snapshot/controller/worker/route tests,
+  377 companion tests, 976 UI tests, and 13 translation tests passed. Original
+  parser/Windows-adapter/reporting boundary checks: 46 passed.
 - Refreshed installed QA rendering remains to be checked.

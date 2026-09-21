@@ -186,10 +186,13 @@ test('saved complete measurements are immediately available after restart with a
     assert.ok(!disk.includes(fixture.options.directory));
   } finally { await controller.close(); }
 });
-test('both throughput populations persist and remain visible when an additive refresh fails', async t => {
+test('combined speed and its fallback subset persist when an additive refresh fails', async t => {
   const fixture = await snapshotFixture(t);
   let controller = fixture.create();
-  const latest = modelPerformanceProjection([row({ tool_free_tokens: 100, tool_free_duration: 2000 })], {
+  const latest = modelPerformanceProjection([
+    row({ tool_free_tokens: 100, tool_free_duration: 2000 }),
+    row({ sample_duration: null, tool_free_tokens: 100, tool_free_duration: 2000 }),
+  ], {
     now: NOW + DAY,
   });
   try {
@@ -198,9 +201,11 @@ test('both throughput populations persist and remain visible when an additive re
     await controller.close();
     controller = fixture.create();
     let result = await controller.read('all');
-    assert.equal(result.schemaVersion, 3);
-    assert.equal(result.method, 4);
-    assert.equal(result.models[0].speed[0].points[0].median, 100);
+    assert.equal(result.schemaVersion, 4);
+    assert.equal(result.method, 5);
+    assert.equal(result.models[0].speedTurns, 2);
+    assert.equal(result.models[0].speed[0].points[0].n, 2);
+    assert.equal(result.models[0].speed[0].points[0].median, 75);
     assert.equal(result.models[0].toolFree[0].median, 50);
     assert.equal(result.models[0].toolFreeTurns, 1);
     fixture.worker().emit('message', { type: 'snapshots', values: [{
@@ -256,7 +261,7 @@ test('pinned retained cache is bounded to eight exact windows plus four live per
     }
     await controller.close();
     const receipt = JSON.parse(await readFile(fixture.file, 'utf8'));
-    assert.equal(receipt.schemaVersion, 'local-model-performance-snapshot-v3');
+    assert.equal(receipt.schemaVersion, 'local-model-performance-snapshot-v4');
     assert.equal(receipt.snapshot.values.length, 12);
     assert.equal(receipt.snapshot.values.filter(value => Object.hasOwn(value, 'requestKey')).length, 8);
     assert.equal(receipt.snapshot.values.some(value => value.requestKey === `1:${NOW}`), false);
@@ -368,6 +373,35 @@ test('rebuilding and failed measurements retain complete results and only comple
     assert.deepEqual(result.models, []);
   } finally { await controller.close(); }
 });
+test('old independent-distribution receipts are preserved until combined samples are rebuilt', async t => {
+  const fixture = await snapshotFixture(t);
+  const envelope = JSON.parse(await readFile(fixture.file, 'utf8'));
+  envelope.schemaVersion = 'local-model-performance-snapshot-v3';
+  for (const value of envelope.snapshot.values) {
+    value.schemaVersion = 3; value.method = 4;
+    for (const model of value.models) {
+      model.toolFreeTurns = 1;
+      model.toolFree = structuredClone(model.speed[0].points);
+    }
+  }
+  envelope.digest = createHash('sha256').update(JSON.stringify(envelope.snapshot)).digest('hex');
+  const old = JSON.stringify(envelope);
+  await writeFile(fixture.file, old);
+  let controller = fixture.create();
+  try {
+    assert.equal((await controller.read('all')).status, 'loading');
+    assert.equal(await readFile(fixture.file, 'utf8'), old, 'read cannot relabel or delete old percentiles');
+  } finally { await controller.close(); }
+  assert.equal(await readFile(fixture.file, 'utf8'), old, 'close without rebuilt evidence preserves the receipt');
+  controller = fixture.create();
+  try {
+    await controller.read('all');
+    fixture.worker().emit('message', { type: 'snapshots', values: fixture.complete });
+  } finally { await controller.close(); }
+  const rebuilt = JSON.parse(await readFile(fixture.file, 'utf8'));
+  assert.equal(rebuilt.schemaVersion, 'local-model-performance-snapshot-v4');
+  assert.deepEqual(rebuilt.snapshot.values, fixture.complete);
+});
 test('source changes, corrupted receipts and incompatible schemas fail closed without waiting for the worker', async t => {
   const fixture = await snapshotFixture(t);
   const saved = await readFile(fixture.file, 'utf8');
@@ -376,10 +410,11 @@ test('source changes, corrupted receipts and incompatible schemas fail closed wi
     () => '{broken',
     value => JSON.stringify({ ...JSON.parse(value), schemaVersion: 'future' }),
     value => JSON.stringify({ ...JSON.parse(value), schemaVersion: 'local-model-performance-snapshot-v2' }),
+    value => JSON.stringify({ ...JSON.parse(value), schemaVersion: 'local-model-performance-snapshot-v3' }),
     value => JSON.stringify({ ...JSON.parse(value), digest: '0'.repeat(64) }),
     value => {
       const envelope = JSON.parse(value);
-      envelope.snapshot.values[0].method = 5;
+      envelope.snapshot.values[0].method = 4;
       envelope.digest = createHash('sha256').update(JSON.stringify(envelope.snapshot)).digest('hex');
       return JSON.stringify(envelope);
     },
@@ -388,7 +423,19 @@ test('source changes, corrupted receipts and incompatible schemas fail closed wi
         value.schemaVersion = 2; value.method = 3;
         for (const model of value.models) { delete model.toolFreeTurns; delete model.toolFree; }
       },
+      value => { value.schemaVersion = 3; value.method = 4; },
       value => { value.models[0].toolFreeTurns = value.models[0].turns + 1; },
+      value => { value.models[0].speedTurns = 0; },
+      value => { value.models[0].ttftTurns = 0; },
+      value => { value.models[0].timedResponses = 0; },
+      value => { value.models[0].speed = []; },
+      value => { value.models[0].toolFreeTurns = 1; },
+      value => {
+        const model = value.models[0];
+        model.toolFreeTurns = 1; model.timedResponses = 0;
+        model.toolFree = structuredClone(model.speed[0].points);
+        model.toolFree[0].at -= DAY;
+      },
       value => { value.models[0].toolFree = value.models[0].speed[0].points; },
       value => { value.models[0].toolFreePrivateText = 'synthetic forbidden content'; },
     ].map(mutate => value => {

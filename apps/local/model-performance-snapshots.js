@@ -21,7 +21,7 @@ const exact = (value, keys) => value !== null && typeof value === 'object' && !A
 export function isModelPerformanceSnapshot(value) {
   if (!exact(value, ['schemaVersion', 'method', 'status', 'collecting', 'stale', 'updatedAt',
     'period', 'interval', 'start', 'end', 'historyProgress', 'models'])
-      || value.schemaVersion !== 3 || value.method !== 4 || value.status !== 'ready'
+      || value.schemaVersion !== 4 || value.method !== 5 || value.status !== 'ready'
       || typeof value.collecting !== 'boolean' || typeof value.stale !== 'boolean'
       || !MODEL_PERFORMANCE_PERIODS.includes(value.period) || !['day', 'week'].includes(value.interval)
       || !timestamp(value.end) || !(value.start === null || timestamp(value.start) && value.start <= value.end)
@@ -48,7 +48,7 @@ export function isModelPerformanceSnapshot(value) {
       previous = point.at;
       total += point.n;
     }
-    return total <= maximum;
+    return total === maximum;
   };
   const seen = new Set();
   for (const model of value.models) {
@@ -56,7 +56,9 @@ export function isModelPerformanceSnapshot(value) {
       'toolFreeTurns', 'toolFree'])
         || !Object.hasOwn(MODEL_NAMES, model.id) || model.label !== MODEL_NAMES[model.id] || seen.has(model.id)
         || ![model.turns, model.speedTurns, model.ttftTurns, model.timedResponses, model.toolFreeTurns].every(count)
-        || model.speedTurns > model.turns || model.ttftTurns > model.turns || model.toolFreeTurns > model.turns
+        || model.speedTurns > model.turns || model.ttftTurns > model.turns || model.toolFreeTurns > model.speedTurns
+        || model.timedResponses < model.speedTurns - model.toolFreeTurns
+        || model.speedTurns === model.toolFreeTurns && model.timedResponses !== 0
         || !Array.isArray(model.speed) || model.speed.length > 1 || !validPoints(model.ttft, model.ttftTurns)
         || !validPoints(model.toolFree, model.toolFreeTurns)) return false;
     seen.add(model.id);
@@ -64,6 +66,9 @@ export function isModelPerformanceSnapshot(value) {
       if (!exact(series, ['method', 'points']) || series.method !== 'speed'
           || !validPoints(series.points, model.speedTurns)) return false;
     }
+    const speedBins = new Map(model.speed.flatMap(series => series.points).map(point => [point.at, point.n]));
+    if (model.speed.length === 0 && model.speedTurns !== 0
+        || model.toolFree.some(point => point.n > (speedBins.get(point.at) ?? 0))) return false;
   }
   return true;
 }
@@ -99,7 +104,9 @@ export function createModelPerformanceSnapshotStore({ directory, codexHome, now 
   const source = modelPerformanceSourceScope(codexHome);
   const store = createValidatedSnapshotStore({
     snapshotFile: join(directory, 'model-performance-snapshot.json'),
-    schemaVersion: 'local-model-performance-snapshot-v3',
+    // Earlier receipts hold independent percentile distributions. Rebuild from
+    // retained turn evidence; never relabel those aggregates as combined speed.
+    schemaVersion: 'local-model-performance-snapshot-v4',
     maximumBytes: 4 * 1024 * 1024,
     now,
     validate: value => {

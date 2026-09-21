@@ -202,7 +202,7 @@ const performanceClient = handler => {
 
 test('background history scan reports honest bounded progress while keeping charts visible', async () => {
   const dom = focusHarness();
-  const data = { ...toolFreePayload(), collecting: true, historyProgress: { checked: 629, total: 9026 } };
+  const data = { ...combinedPayload(), collecting: true, historyProgress: { checked: 629, total: 9026 } };
   const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => data },
     t: (key, values) => translate(key, values, 'en-US') });
   dom.show(); await controller.refresh();
@@ -212,7 +212,8 @@ test('background history scan reports honest bounded progress while keeping char
   assert.equal(dom.root.all().find(node => node.className === 'performance-status').textContent,
     `Building earlier history · 629 of 9,026 sessions checked · ${updated}`);
   assert.ok(dom.root.all().some(node => node.id === 'performance-model-panel'));
-  assert.equal(dom.root.all().filter(node => node.className === 'performance-card chart-card').length, 3);
+  assert.equal(dom.root.all().filter(node => node.className === 'performance-card chart-card').length, 2);
+  assert.ok(dom.root.all().some(node => node.className === 'performance-unit' && node.textContent.includes('2 full-turn estimates')));
   controller.destroy();
 });
 test('recovered estimates stay in one output-speed chart with explicit population coverage', async () => {
@@ -259,7 +260,7 @@ test('legacy independent distributions remain response-only without mixing aggre
 
 test('retained measurements show their original update date alongside refresh while loading and failure stay distinct', async () => {
   const dom = focusHarness();
-  let response = { ...toolFreePayload(), status: 'loading', updatedAt: null, models: [] };
+  let response = { ...combinedPayload(), status: 'loading', updatedAt: null, models: [] };
   let failure = false;
   const controller = mountModelPerformance({ ...dom, client: {
     modelPerformance: async () => { if (failure) throw new Error('synthetic failure'); return response; },
@@ -267,21 +268,22 @@ test('retained measurements show their original update date alongside refresh wh
   const status = () => dom.root.all().find(node => node.className === 'performance-status').textContent;
   dom.show(); await controller.refresh();
   assert.equal(status(), translate('performance.updating', {}, 'en-US'));
-  response = { ...toolFreePayload(), collecting: true };
+  response = { ...combinedPayload(), collecting: true };
   await controller.refresh();
   const updated = translate('performance.updated', { date: new Intl.DateTimeFormat('en-US', {
     dateStyle: 'medium', timeStyle: 'short',
   }).format(new Date(response.updatedAt)) }, 'en-US');
   assert.equal(status(), `${translate('performance.updating', {}, 'en-US')} · ${updated}`);
   assert.ok(dom.root.all().some(node => node.id === 'performance-model-panel'));
-  assert.equal(dom.root.all().filter(node => node.className === 'performance-card chart-card').length, 3);
-  response = toolFreePayload(); await controller.refresh();
+  assert.equal(dom.root.all().filter(node => node.className === 'performance-card chart-card').length, 2);
+  response = combinedPayload(); await controller.refresh();
   assert.equal(status(), updated, 'a fresh report shows its date without an updating claim');
   failure = true; await controller.refresh();
   assert.equal(status(), translate('performance.failed', {}, 'en-US'));
   assert.ok(dom.root.all().some(node => node.id === 'performance-model-panel'));
-  assert.equal(dom.root.all().filter(node => node.className === 'performance-card chart-card').length, 3);
-  failure = false; response = { ...toolFreePayload(), status: 'unavailable', updatedAt: null, models: [] };
+  assert.equal(dom.root.all().filter(node => node.className === 'performance-card chart-card').length, 2);
+  assert.ok(dom.root.all().some(node => node.className === 'performance-unit' && node.textContent.includes('2 full-turn estimates')));
+  failure = false; response = { ...combinedPayload(), status: 'unavailable', updatedAt: null, models: [] };
   await controller.refresh();
   assert.equal(status(), translate('performance.unavailable', {}, 'en-US'));
   controller.destroy();
@@ -497,8 +499,9 @@ test('advancing a shared end bound retains dated charts under their original bou
   const dom = focusHarness();
   const end = 9 * DAY;
   const windowAt = value => ({ period: '24h', startAt: new Date(value - DAY).toISOString(), endAt: new Date(value).toISOString() });
-  const exactAt = value => ({ ...toolFreePayload(), period: '1', start: value - DAY, end: value,
-    models: toolFreePayload().models.map(model => ({ ...model, speed: [{method: 'speed', points: [point(value - DAY)]}], ttft: [point(value - DAY)], toolFree: [point(value - DAY, 2)] })) });
+  const exactAt = value => ({ ...combinedPayload(), period: '1', start: value - DAY, end: value,
+    models: combinedPayload().models.map(model => ({ ...model, speedTurns: 5, ttftTurns: 5,
+      speed: [{method: 'speed', points: [point(value - DAY)]}], ttft: [point(value - DAY)], toolFree: [point(value - DAY, 2)] })) });
   const calls = [];
   let response = exactAt(end);
   const controller = mountModelPerformance({ ...dom, reportingWindow: windowAt(end),
@@ -506,7 +509,7 @@ test('advancing a shared end bound retains dated charts under their original bou
     t: (key, values) => translate(key, values, 'en-US') });
   dom.show(); await controller.refresh();
   const panel = () => dom.root.all().find(node => node.id === 'performance-model-panel');
-  const toolFreeVisible = () => dom.root.all().some(node => node.tagName === 'h4' && node.textContent === 'Tool-free turn throughput');
+  const toolFreeVisible = () => dom.root.all().some(node => node.className === 'performance-unit' && node.textContent.includes('2 full-turn estimates'));
   const status = () => dom.root.all().find(node => node.className === 'performance-status').textContent;
   const pending = Promise.withResolvers(); response = pending.promise;
   controller.setReportingWindow(windowAt(end + DAY));
@@ -542,7 +545,7 @@ test('advancing a shared end bound retains dated charts under their original bou
   response = { ...exactAt(end + 2 * DAY), status: 'unavailable', models: [] };
   await controller.refresh();
   assert.ok(panel(), 'an unavailable replacement keeps the old explicitly dated window');
-  assert.ok(toolFreeVisible(), 'unavailable does not drop the second throughput metric');
+  assert.ok(toolFreeVisible(), 'unavailable does not drop recovered estimates from the retained speed chart');
   assert.match(status(), /Timing measurements are unavailable/);
   assert.ok(dom.find('retry'));
   assert.ok(dom.root.all().some(node => node.dataset.evidence === 'period'));
