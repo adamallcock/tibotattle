@@ -24,6 +24,7 @@ const PERIOD_IDS = REPORTING_PERIODS;
 const PERIOD_PRELOAD_DELAY_MS = 250;
 const PREPARING_POLL_DELAY_MS = 750;
 const MAX_PREPARING_POLLS = 20;
+const COVERAGE_NOTICE_THRESHOLD = 0.95;
 // Cold accounting can take minutes. Spread the same bounded request budget
 // over that work instead of exhausting it in the first fifteen seconds.
 const preloadPollDelay = attempt => Math.min(10_000, PREPARING_POLL_DELAY_MS * 2 ** attempt);
@@ -865,12 +866,14 @@ export function mountWorkUsageView(options = {}) {
     const incompleteEvents = response?.totals?.incompleteEvents;
     if (count(totalEvents) && count(incompleteEvents) && incompleteEvents <= totalEvents) {
       const complete = totalEvents - incompleteEvents;
-      appendEvidenceRow(documentRef, evidence, {
-        kind: "token-coverage",
-        label: tr("coverage", { known: quantity(complete), total: quantity(totalEvents) }),
-        value: complete === totalEvents ? tr("complete") : tr("partial"),
-        state: complete === totalEvents ? "complete" : "partial",
-      });
+      if (totalEvents > 0 && complete / totalEvents < COVERAGE_NOTICE_THRESHOLD) {
+        appendEvidenceRow(documentRef, evidence, {
+          kind: "token-coverage",
+          label: tr("coverage", { known: quantity(complete), total: quantity(totalEvents) }),
+          value: "",
+          state: "partial",
+        });
+      }
     }
     const unpricedEvents = response?.totals?.unpricedEvents;
     const priced = count(totalEvents) && count(unpricedEvents) && unpricedEvents <= totalEvents
@@ -878,12 +881,13 @@ export function mountWorkUsageView(options = {}) {
       : response?.totals?.priceStatus === "complete" && count(totalEvents)
         ? totalEvents
         : null;
-    if (priced !== null) {
+    if (priced !== null && totalEvents > 0
+        && priced / totalEvents < COVERAGE_NOTICE_THRESHOLD) {
       appendEvidenceRow(documentRef, evidence, {
         kind: "price-coverage",
         label: tr("priceCoverage", { priced: quantity(priced), total: quantity(totalEvents) }),
-        value: priced === totalEvents ? tr("complete") : tr("partial"),
-        state: priced === totalEvents ? "complete" : "partial",
+        value: "",
+        state: "partial",
       });
     }
     return evidence.children.length ? evidence : null;

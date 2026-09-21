@@ -1139,6 +1139,33 @@ test("assumptions stay distinct from missing data and the non-project bucket is 
   view.destroy();
 });
 
+test("coverage notices only show below 95 percent without repeated partial labels", async (t) => {
+  const cases = [
+    { name: "both at threshold", incompleteEvents: 5, unpricedEvents: 5, tokenNotices: 0, priceNotices: 0 },
+    { name: "near-complete report", totalEvents: 918_411, incompleteEvents: 209, unpricedEvents: 196, tokenNotices: 0, priceNotices: 0 },
+    { name: "only token counts below threshold", incompleteEvents: 6, unpricedEvents: 5, tokenNotices: 1, priceNotices: 0 },
+    { name: "both below threshold", incompleteEvents: 6, unpricedEvents: 6, tokenNotices: 1, priceNotices: 1 },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const response = structuredClone(PROJECT_ROWS_RESPONSE);
+      response.totals.events = scenario.totalEvents ?? 100;
+      response.totals.incompleteEvents = scenario.incompleteEvents;
+      response.totals.unpricedEvents = scenario.unpricedEvents;
+      response.totals.priceStatus = "partial";
+      const { root, windowRef } = mountedRoot();
+      const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+        fetchRef: async () => httpResponse(response) });
+      try {
+        await settleMountedView();
+        assert.equal(findMounted(root, node => node.dataset?.evidence === "token-coverage").length, scenario.tokenNotices);
+        assert.equal(findMounted(root, node => node.dataset?.evidence === "price-coverage").length, scenario.priceNotices);
+        assert.doesNotMatch(root.textContent, /Partial data/u);
+      } finally { view.destroy(); }
+    });
+  }
+});
+
 test("name search keeps the report snapshot and nested filter, and clearing restores project view", async () => {
   const clock = mountedLeaseRoot();
   const { root, windowRef } = clock; const requests = [];
@@ -1624,7 +1651,7 @@ test("an available shared-period search with no rows is empty rather than unavai
     assert.equal(findMounted(root, node => node.tagName === "TABLE").length, 0);
     assert.equal(findMounted(root, node => node.classList.contains("work-usage-summary")).length, 0);
     assert.ok(root.textContent.includes(mountedTranslator("workUsage.snapshot", { date: formatLocal(NOW) })));
-    assert.equal(findMounted(root, node => node.dataset?.evidence === "token-coverage").length, 1);
+    assert.equal(findMounted(root, node => node.dataset?.evidence === "token-coverage").length, 0);
     assert.doesNotMatch(root.textContent, /Mapping observed/u);
     const clearSearch = findMounted(state, node => node.tagName === "BUTTON")[0];
     assert.equal(clearSearch.textContent, mountedTranslator("workUsage.clearSearch"));
