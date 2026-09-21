@@ -132,6 +132,14 @@ owner-only permissions. Important entries include:
 | Diagnostics log | Fixed error/status codes and opaque support references. | Bounded, content-free local diagnostics only. |
 | WebKit website data | Loopback dashboard session/local storage and short-lived hosted web session state. | Cleared by **Erase local data**; provider pages use the system browser. |
 
+The derived accounting cache inside collector state uses compact JSON with a
+128 MiB publication and child-result transport ceiling. Existing pretty-printed
+caches remain readable without migration; observation values, source records,
+checkpoint hashes and export serialization are unchanged. The selected-plan
+comparison retains its separate 100,000-row and 4 MiB limits, the retained
+dashboard snapshot retains its 16 MiB limit, and rebuild RSS limits remain
+independent. These resource bounds do not authorize history deletion.
+
 The standalone CLI/developer default uses the platform-specific
 `app-usagemonitor` state directory. The installed app supplies the stable
 `Usage Monitor` state root. Documentation and support instructions must not

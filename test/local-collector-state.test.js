@@ -22,6 +22,8 @@ import {
   readLocalCollectorRolloutStalenessSummary,
   readLocalCollectorState,
   recordLocalCollectorLegacyRefreshAttempt,
+  serializeLocalCollectorAccountingCache,
+  writeLocalCollectorAccountingCache,
 } from "../src/local-collector-state.js";
 import { stableJson } from "../src/storage.js";
 
@@ -71,6 +73,46 @@ async function fixture() {
     stateFile: defaultLocalCollectorStatePath(root),
   };
 }
+
+test("accounting caches use compact JSON while old caches and canonical collector bytes remain compatible", async () => {
+  const value = await fixture();
+  const cache = {
+    timeline: [[1_700_000_000_000, 0, 1.25, null], [1_700_000_900_000, 2, 0, 100]],
+    metadata: { z: "synthetic café\nreading", a: true },
+  };
+  const first = checkpoint();
+  const event = record("compact-cache-compatibility");
+  try {
+    await commitLocalCollectorState({ stateFile: value.stateFile, checkpoint: first, records: [event] });
+    let database = new DatabaseSync(value.stateFile);
+    let before;
+    try {
+      database.prepare("INSERT INTO meta(key, value_json) VALUES ('accounting_cache', ?)")
+        .run(stableJson(cache));
+      before = database.prepare("SELECT record_json, record_digest FROM records").get();
+      assert.equal(before.record_json, stableJson(event));
+      assert.equal(database.prepare("SELECT value_json FROM meta WHERE key = 'checkpoint'").get().value_json,
+        stableJson(first));
+    } finally { database.close(); }
+    assert.deepEqual((await readLocalCollectorState({ stateFile: value.stateFile })).accountingCache, cache);
+    await writeLocalCollectorAccountingCache({ stateFile: value.stateFile, cache });
+    database = new DatabaseSync(value.stateFile);
+    try {
+      const stored = database.prepare("SELECT value_json FROM meta WHERE key = 'accounting_cache'").get().value_json;
+      assert.equal(stored, JSON.stringify(cache));
+      assert.equal(stored, serializeLocalCollectorAccountingCache(cache));
+      assert.ok(Buffer.byteLength(stored) < Buffer.byteLength(stableJson(cache)));
+      assert.ok(Buffer.byteLength(stored) > stored.length, "non-ASCII cache values are counted in UTF-8 bytes");
+      assert.deepEqual(JSON.parse(stored), cache);
+      assert.deepEqual(database.prepare("SELECT record_json, record_digest FROM records").get(), before);
+      assert.equal(database.prepare("SELECT value_json FROM meta WHERE key = 'checkpoint'").get().value_json,
+        stableJson(first));
+    } finally { database.close(); }
+    assert.deepEqual((await readLocalCollectorState({ stateFile: value.stateFile })).accountingCache, cache);
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
 
 test("SQLite commits collector records and checkpoints atomically", async () => {
   const value = await fixture();

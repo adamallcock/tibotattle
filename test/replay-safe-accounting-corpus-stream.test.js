@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,6 +12,7 @@ import {
   refreshReplaySafeAccountingCache,
   readReplaySafeAccountingCache,
   REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY,
+  REPLAY_SAFE_ACCOUNTING_REBUILD_REQUEST_VERSION,
   REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
 } from "../src/replay-safe-accounting-cache.js";
 import {
@@ -19,6 +22,8 @@ import {
   readUnifiedIndexGenerationDescriptor,
 } from "../src/local-unified-index.js";
 import { stableJson } from "../src/storage.js";
+import { serializeLocalCollectorAccountingCache } from "../src/local-collector-state.js";
+import { runReplaySafeAccountingRebuildChild } from "../src/replay-safe-accounting-rebuild-child.js";
 import {
   createLocalUnifiedAccountingSource,
 } from "../src/local-unified-accounting-source.js";
@@ -741,6 +746,34 @@ test("the default production rebuild is isolated in a child and byte-identical t
     // timelines, calibration, allowance scenarios, provenance — across the
     // process boundary, not merely calibration equality.
     assert.equal(stableJson(viaSubprocess), stableJson(inProcess));
+    const database = new DatabaseSync(stateFile);
+    try {
+      assert.equal(database.prepare("SELECT value_json FROM meta WHERE key = 'accounting_cache'").get().value_json,
+        serializeLocalCollectorAccountingCache(inProcess));
+    } finally { database.close(); }
+    // Inspect the real child payload as well as the durable row: publication
+    // could otherwise hide a child that still transports pretty-printed JSON.
+    const requestFile = join(directory, "direct-request.json");
+    const resultFile = join(directory, "direct-result.json");
+    await writeFile(requestFile, JSON.stringify({
+      version: REPLAY_SAFE_ACCOUNTING_REBUILD_REQUEST_VERSION,
+      nowMs: NOW,
+      windowDays: 365,
+      sourceMode: "unified",
+      contextBehavior: "legacy_zero",
+      codexHome: directory,
+      unifiedIndexFile: fixture.indexFile,
+      expectedGeneration: fixture.expectedGeneration,
+      declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
+      maximumRssBytes: null,
+      transitionResourceLimits: null,
+    }), { mode: 0o600 });
+    const envelope = await runReplaySafeAccountingRebuildChild({ requestFile, resultFile });
+    assert.equal(envelope.status, "ok");
+    const payload = await readFile(resultFile, "utf8");
+    assert.equal(payload, serializeLocalCollectorAccountingCache(inProcess));
+    assert.equal(envelope.resultBytes, Buffer.byteLength(payload));
+    assert.equal(envelope.resultSha256, createHash("sha256").update(payload).digest("hex"));
     assert.equal(viaSubprocess.schemaVersion, REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION);
     assert.equal(viaSubprocess.weeklyCalibrationInput.source, "unified_index");
     assert.equal(
@@ -1149,6 +1182,61 @@ test("a dead or lying rebuild child fails closed to the deferral and retains the
     const served = await readReplaySafeAccountingCache({ stateFile });
     assert.equal(served.status, "available");
     assert.deepEqual(served.cache, prior);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("child transport accepts 128 MiB and refuses larger or misreported files without replacing the cache", { timeout: 120_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rebuild-transport-budget-"));
+  const ceiling = 128 * 1024 * 1024;
+  const stateFile = join(directory, "state.sqlite");
+  const fixtureFile = join(directory, "cache-fixture.json");
+  const entry = join(directory, "sized-child.mjs");
+  try {
+    const prior = await refreshReplaySafeAccountingCache({
+      stateFile, now: () => NOW,
+      scan: async ({ onUsage }) => {
+        onUsage({ timestamp: new Date(NOW).toISOString(), model: "gpt-5.6-sol",
+          components: { input_uncached_tokens: 1_000 } });
+        return { diagnostics: {} };
+      },
+    });
+    await writeFile(fixtureFile, JSON.stringify(prior), { mode: 0o600 });
+    // JSON whitespace pads a genuine cache to the exact transport boundary
+    // without inventing unknown schema fields or building a huge corpus.
+    await writeFile(entry, [
+      'import { readFile, writeFile } from "node:fs/promises";',
+      'import { createHash } from "node:crypto";',
+      `const payload = (await readFile(${JSON.stringify(fixtureFile)}, "utf8")).padEnd(${ceiling}, " ");`,
+      'await writeFile(process.argv[3], payload, { mode: 0o600, flag: "wx" });',
+      'process.stdout.write(JSON.stringify({ status: "ok", resultBytes: Buffer.byteLength(payload),',
+      'resultSha256: createHash("sha256").update(payload).digest("hex") }) + "\\n");',
+    ].join("\n"));
+    const options = { stateFile, codexHome: directory, sourceMode: "legacy",
+      now: () => NOW, rebuildSubprocessEntry: entry };
+    assert.deepEqual(await refreshReplaySafeAccountingCache(options), prior);
+    const database = new DatabaseSync(stateFile);
+    try {
+      assert.equal(database.prepare("SELECT value_json FROM meta WHERE key = 'accounting_cache'").get().value_json,
+        JSON.stringify(prior), "transport whitespace is not retained in SQLite");
+    } finally { database.close(); }
+    for (const declaredBytes of [ceiling + 1, 2]) {
+      // A sparse oversized file proves both envelope rejection and actual
+      // file-size verification, without allocating another large fixture.
+      await writeFile(entry, [
+        'import { open } from "node:fs/promises";',
+        'const file = await open(process.argv[3], "wx", 0o600);',
+        `await file.truncate(${ceiling + 1}); await file.close();`,
+        `process.stdout.write(JSON.stringify({ status: "ok", resultBytes: ${declaredBytes},`,
+        'resultSha256: "0".repeat(64) }) + "\\n");',
+      ].join("\n"));
+      const refused = await refreshReplaySafeAccountingCache(options);
+      assert.equal(refused.status, "accounting_rebuild_deferred");
+      assert.equal(refused.reason, "accounting_rebuild_subprocess_failed");
+      assert.equal(refused.retained, true);
+      assert.deepEqual((await readReplaySafeAccountingCache({ stateFile })).cache, prior);
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

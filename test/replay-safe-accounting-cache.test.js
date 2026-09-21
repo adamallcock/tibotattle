@@ -16,8 +16,10 @@ import {
   refreshReplaySafeAccountingCache as refreshReplaySafeAccountingCacheImpl,
 } from "../src/replay-safe-accounting-cache.js";
 import { addUsdStrings } from "@app-usagemonitor/accounting";
+import { stableJson } from "../src/storage.js";
 import {
   readLocalCollectorAccountingCache,
+  serializeLocalCollectorAccountingCache,
   writeLocalCollectorAccountingCache,
 } from "../src/local-collector-state.js";
 import {
@@ -56,6 +58,37 @@ async function writeTestCache(stateFile, cache) {
 async function readTestCache(stateFile) {
   return (await readLocalCollectorAccountingCache({ stateFile })).cache;
 }
+
+test("a full year of usage can publish a compact cache above the former 16 MiB ceiling", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-cache-byte-budget-"));
+  const stateFile = join(directory, "state.sqlite");
+  const bucketCount = 365 * 24 * 4;
+  try {
+    const cache = await refreshReplaySafeAccountingCache({
+      cacheFile: stateFile,
+      now: () => NOW,
+      scan: async ({ onUsage }) => {
+        for (let bucket = 0; bucket < bucketCount; bucket += 1) {
+          onUsage(usageEvent({
+            timestamp: new Date(NOW - bucket * 15 * 60_000).toISOString(),
+            components: { input_uncached_tokens: 1_000 },
+          }));
+        }
+        return { diagnostics: {} };
+      },
+    });
+    const size = Buffer.byteLength(serializeLocalCollectorAccountingCache(cache));
+    assert.ok(size > 16 * 1024 * 1024, "the actual compact cache crosses the former publication ceiling");
+    assert.ok(size < 128 * 1024 * 1024);
+    assert.equal(cache.timeline.length, bucketCount);
+    assert.equal(cache.periods.find((period) => period.id === "all").events, bucketCount);
+    const read = await readReplaySafeAccountingCache({ cacheFile: stateFile, now: () => NOW });
+    assert.equal(read.status, "available");
+    assert.deepEqual(read.cache, cache);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("production replay-cache APIs reject the retired JSON cacheFile option", async () => {
   await assert.rejects(
@@ -2066,11 +2099,12 @@ async function writeUnifiedCalibrationFixture(indexFile, {
   resets,
   boundaries = 10,
   durationMinutes = 10_080,
+  earlierPlanBuckets = 0,
 }) {
   const database = openLocalUnifiedIndex(indexFile, { create: true });
   const sourceLocal = Buffer.alloc(32, 8);
   const sessionLocal = Buffer.alloc(32, 7);
-  const sourceBytes = resets.length * boundaries * 256;
+  const sourceBytes = (earlierPlanBuckets + resets.length * boundaries) * 256;
   const sourceCount = sourceBytes > 0 ? 1 : 0;
   const generation = beginUnifiedIndexGeneration(database, {
     contractVersion: "unified-calibration-test-v1",
@@ -2104,6 +2138,61 @@ async function writeUnifiedCalibrationFixture(indexFile, {
     scopeLocal: null,
   });
   let eventNumber = 0;
+  for (let bucket = 0; bucket < earlierPlanBuckets; bucket += 1) {
+    const observedMs = resets[0] - (earlierPlanBuckets - bucket) * 15 * 60_000;
+    const resetsAtMs = observedMs + 7 * 24 * 60 * 60 * 1_000;
+    const isPlanAnchor = bucket === 0 || bucket === earlierPlanBuckets - 1;
+    const canonicalObservationId = isPlanAnchor ? writer.internQuota({
+      observedAtMs: observedMs,
+      limitId: "codex",
+      slot: "secondary",
+      planType: "plus",
+      usedPercent: 0,
+      resetsAtMs,
+      durationMins: 10_080,
+    }) : null;
+    eventNumber += 1;
+    const eventKey = Buffer.alloc(32);
+    eventKey.writeUInt32BE(eventNumber);
+    const sourceOffset = (eventNumber - 1) * 256;
+    writer.writeUsageEvent({
+      eventKey,
+      generationId: generation.generationId,
+      sourceLocal,
+      sourceOffset,
+      sourceOrdinal: 0,
+      observedAtMs: observedMs,
+      sessionLocal,
+      accountScopeId,
+      modelId,
+      tierId,
+      surfaceId,
+      quotaObservationId: canonicalObservationId,
+      reasoningEffort: 8,
+      outcome: 5,
+      tokensInUncached: 1_000,
+    });
+    if (isPlanAnchor) {
+      writer.writeQuotaOccurrence({
+        generationId: generation.generationId,
+        sourceLocal,
+        sourceOffset,
+        sourceOrdinal: 0,
+        surfaceId,
+        canonicalObservationId,
+        observedAtMs: observedMs,
+        provider: "openai_codex",
+        planType: "plus",
+        limitId: "codex",
+        slot: "secondary",
+        slotOrder: 0,
+        usedPercent: 0,
+        resetsAtMs,
+        durationMins: 10_080,
+        admission: "admitted",
+      });
+    }
+  }
   for (const [resetIndex, resetStartMs] of resets.entries()) {
     const resetsAtMs = resetStartMs + durationMinutes * 60 * 1_000;
     const boundaryIntervalMinutes = durationMinutes === 300 ? 20 : 60;
@@ -2221,17 +2310,24 @@ test("a fitted unified plan timeline survives cache validation and the productio
   t.after(() => rm(directory, { recursive: true, force: true }));
   const indexFile = join(directory, "local-unified-index-v1.sqlite");
   const stateFile = join(directory, "local-collector-state-v1.sqlite");
+  const earlierPlanBuckets = 365 * 24 * 4;
   await writeUnifiedCalibrationFixture(indexFile, {
     resets: [1, 8, 15].map((day) => Date.UTC(2026, 7, day)), boundaries: 10,
+    earlierPlanBuckets,
   });
   const now = () => Date.parse("2026-08-30T12:00:00Z");
   const cache = await refreshReplaySafeAccountingCacheImpl({
     sourceMode: "unified", unifiedIndexFile: indexFile, expectedGeneration: 1,
-    stateFile, now,
+    stateFile, now, windowDays: 730,
   });
+  assert.ok(Buffer.byteLength(serializeLocalCollectorAccountingCache(cache)) > 16 * 1024 * 1024,
+    "ordinary all-plan history crosses the former ceiling without dropping the valid comparison lane");
+  assert.equal(cache.timeline.length, earlierPlanBuckets + 27);
   assert.equal(cache.planScopedTimeline.status, "available");
   assert.equal(cache.planScopedTimeline.encoding, "plan_bucket_v1");
   assert.equal(cache.planScopedTimeline.usage.length, 27);
+  assert.ok(Buffer.byteLength(stableJson(cache.planScopedTimeline)) < 4 * 1024 * 1024,
+    "the selected Pro comparison remains inside its independent unchanged lane budget");
   assert.ok(cache.planScopedTimeline.quota.length > 0);
   assert.doesNotThrow(() => assertReplaySafeAccountingCache(cache));
   const read = await readReplaySafeAccountingCacheImpl({ stateFile, sourceMode: "unified", expectedGeneration: 1, now });

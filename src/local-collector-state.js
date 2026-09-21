@@ -589,11 +589,20 @@ function readMeta(database, key) {
   }
 }
 
+// Cache storage and rebuild transport share these bytes. JSON member order is
+// not part of the cache schema; readers (including legacy migration parity)
+// compare parsed values. Keep the shared canonical export serializer unchanged.
+export function serializeLocalCollectorAccountingCache(cache) {
+  return JSON.stringify(cache);
+}
+
 function writeMeta(database, key, value) {
   database.prepare(`
     INSERT INTO meta(key, value_json) VALUES (?, ?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json
-  `).run(key, stableJson(value));
+  `).run(key, key === "accounting_cache"
+    ? serializeLocalCollectorAccountingCache(value)
+    : stableJson(value));
 }
 
 function recordInsertStatement(database) {
