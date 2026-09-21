@@ -317,6 +317,16 @@ and bounded blob downloads. Provider sign-in opens in the system browser.
 | Native to web | `tibotattle:locale-override` | Closed language preference plus locale table metadata. |
 | Native to web | `tibotattle:appearance-override` | Closed appearance preference and resolved theme. |
 
+The sandboxed Electron preload exposes the same fixed `v1` bridge version and
+one fixed IPC channel. Its refresh subset is dashboard-frame-only:
+
+| Direction | Action | Payload boundary |
+| --- | --- | --- |
+| Renderer to main | `getRefreshStatus` | No arguments; returns the content-free timer/watchdog projection without a lease value. |
+| Renderer to main | `refreshStarted` | Exact `{ mode }`, where mode is `quick` or `detailed`; returns one positive integer lease. |
+| Renderer to main | `refreshHeartbeat` | Exact `{ lease }` with one positive safe integer; renews only the matching missing-heartbeat watchdog. |
+| Renderer to main | `refreshSettled` | Exact `{ lease }` with one positive safe integer; matching terminal settlement is idempotent. |
+
 ## Process and provider protocols
 
 | Boundary | Caller | Contract |

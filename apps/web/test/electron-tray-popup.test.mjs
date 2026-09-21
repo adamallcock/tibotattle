@@ -468,7 +468,7 @@ test("weekly pace renders only for a current allowance bound to its valid outloo
   assert.equal(documentRef.getElementById("pace-track").attributes.get("aria-valuenow"), "100");
 
   const stale = fixture();
-  stale.freshness.status = "stale";
+  stale.freshness.latestObservedAt = "2026-09-04T17:29:59.000Z";
   const staleDocument = new FakeDocument();
   renderTrayPopup(staleDocument, createTrayPopupProjection(stale, { now: NOW, timeZone: "UTC" }));
   assert.equal(staleDocument.getElementById("pace-section").hidden, true);
@@ -540,11 +540,32 @@ test("allowance claims retain stale observations only until their own future res
   );
 
   const stale = fixture();
-  stale.freshness.status = "stale";
+  stale.freshness.latestObservedAt = "2026-09-04T17:29:59.000Z";
   assert.deepEqual(
     createTrayPopupProjection(stale, { now: NOW, timeZone: "UTC" }).allowances.map(row => row.stale),
     [true, true],
   );
+});
+
+test("tray freshness follows wall time instead of a frozen serialized status or age", () => {
+  const data = fixture();
+  data.freshness.status = "live";
+  data.freshness.ageSeconds = 1;
+  const stale = createTrayPopupProjection(data, {
+    now: "2026-09-04T18:30:00.001Z",
+    timeZone: "UTC",
+  });
+  assert.equal(stale.freshness.status, "stale");
+  assert.equal(stale.freshness.ageSeconds, 1_800.001);
+  assert.deepEqual(stale.allowances.map((row) => row.stale), [true, true]);
+  assert.equal(stale.weeklyPace.status, "unavailable");
+
+  data.freshness.status = "stale";
+  data.freshness.ageSeconds = 999_999;
+  const current = createTrayPopupProjection(data, { now: NOW, timeZone: "UTC" });
+  assert.equal(current.freshness.status, "live");
+  assert.deepEqual(current.allowances.map((row) => row.stale), [false, false]);
+  assert.equal(current.weeklyPace.status, "available");
 });
 
 test("allowance admission rejects an inconsistent percentage and an overlong provider window", () => {

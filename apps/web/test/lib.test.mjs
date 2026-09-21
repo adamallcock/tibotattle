@@ -5228,6 +5228,10 @@ async function createDashboardStartupHarness({
     localCompanionHealth: initialHealth,
     localOnboarding: null,
     dashboard: null,
+    lastObservationPresentationStatus: null,
+    observationFreshnessClock: {
+      stop() { state.events.push(["freshness-stop"]); },
+    },
     accountingRebuildDeferral: { consecutive: 2 },
     incrementalSyncStatus: null,
     incrementalConsentApproved: initialConsentApproved,
@@ -5373,6 +5377,8 @@ test("primary startup failure renders unavailable without waiting on optional re
     assert.deepEqual(harness.state.events.filter(([kind]) => kind === "unavailable"), [
       ["unavailable", "companion-unavailable"],
     ]);
+    assert.equal(harness.state.events.filter(([kind]) => kind === "freshness-stop").length, 1,
+      "the unavailable path stops the live freshness clock");
     assert.equal(harness.context.document.documentElement.dataset.localDashboardReady, "true");
     assert.equal(completed, true);
     assert.equal(harness.context.localActionBusy, false);

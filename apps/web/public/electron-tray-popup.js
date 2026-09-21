@@ -17,6 +17,7 @@ import {
   DEFAULT_LOCALE,
   translate,
 } from "./localization.js";
+import { observationRecency } from "./dashboard-ui.js";
 import {
   compact,
   formatAge,
@@ -999,30 +1000,56 @@ export function createTrayPopupProjection(data = {}, {
   const retained = projection === "retained"
     || isObject(accounting?.staleServe);
   const accountingState = retained ? "retained" : projection === "available" ? "current" : "unavailable";
-  const freshnessStatus = ["live", "stale", "demo", "offline", "insufficient"]
+  const sourceFreshnessStatus = ["live", "stale", "demo", "offline", "insufficient", "unavailable"]
     .includes(data?.freshness?.status) ? data.freshness.status
-    : ["live", "stale", "demo", "offline", "insufficient"].includes(data?.state)
+    : ["live", "stale", "demo", "offline", "insufficient", "unavailable"].includes(data?.state)
       ? data.state : "insufficient";
-  const latestObservedAt = isoInstant(data?.freshness?.latestObservedAt);
-  const latestObservedMs = instantMs(latestObservedAt);
-  const ageSeconds = latestObservedMs !== null && latestObservedMs <= nowMs
-    ? (nowMs - latestObservedMs) / 1_000 : null;
+  const staleAfterSeconds = nonNegativeNumber(data?.freshness?.staleAfterSeconds)
+    ?? DEFAULT_ALLOWANCE_STALE_AFTER_SECONDS;
+  const recency = observationRecency({
+    ...data,
+    freshness: { ...data?.freshness, staleAfterSeconds },
+  }, nowMs);
+  const freshnessStatus = sourceFreshnessStatus === "demo"
+    ? "demo"
+    : sourceFreshnessStatus === "offline"
+      ? "offline"
+      : sourceFreshnessStatus === "unavailable"
+        ? "insufficient"
+        : recency.status === "current"
+          ? "live"
+          : recency.status === "stale"
+            ? "stale"
+            : "insufficient";
   const freshness = Object.freeze({
     status: freshnessStatus,
-    latestObservedAt,
-    ageSeconds,
-    staleAfterSeconds: nonNegativeNumber(data?.freshness?.staleAfterSeconds)
-      ?? DEFAULT_ALLOWANCE_STALE_AFTER_SECONDS,
+    latestObservedAt: recency.latestObservedAt,
+    ageSeconds: recency.ageSeconds,
+    staleAfterSeconds,
     accountingStatus: ACCOUNTING_STATUSES.has(data?.freshness?.accountingStatus)
       ? data.freshness.accountingStatus : "",
     accountingAgeSeconds: nonNegativeNumber(data?.freshness?.accountingAgeSeconds),
   });
+  const freshnessBoundData = {
+    ...data,
+    freshness: { ...data?.freshness, status: freshnessStatus, staleAfterSeconds },
+  };
   return deepFreeze({
     schemaVersion: TRAY_POPUP_SCHEMA_VERSION,
     state: freshnessStatus,
     freshness,
-    allowances: Object.freeze(buildAllowances(data, nowMs, selectedAllowanceLanes)),
-    weeklyPace: buildWeeklyPace(data, nowMs, selectedAllowanceLanes),
+    allowances: Object.freeze(buildAllowances(
+      freshnessBoundData,
+      nowMs,
+      selectedAllowanceLanes,
+    )),
+    weeklyPace: buildWeeklyPace(
+      freshnessStatus === "live"
+        ? freshnessBoundData
+        : { ...freshnessBoundData, weekly: {} },
+      nowMs,
+      selectedAllowanceLanes,
+    ),
     accounting: Object.freeze({
       status: accountingState,
       retained,

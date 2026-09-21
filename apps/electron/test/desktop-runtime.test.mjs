@@ -1012,6 +1012,7 @@ test("credential preflight retries only after the user asks and then continues s
   const app = new FakeApp();
   app.isPackaged = true;
   app.getName = () => "TiboTattle";
+  app.getVersion = () => "0.1.19";
   app.getPath = () => profile;
   let attempts = 0;
   const notices = [];
@@ -2389,7 +2390,8 @@ test("runtime wires safe browser, diagnostics, and local-data actions", async ()
   assert.equal(dialogs.length, 1);
   assert.equal(copied.length, 1);
   assert.equal(copied[0], dialogs[0].detail);
-  assert.match(dialogs[0].detail, /tibotattle-electron-diagnostics-v1/u);
+  assert.match(dialogs[0].detail, /tibotattle-electron-diagnostics-v2/u);
+  assert.match(dialogs[0].detail, /"cadenceTimerArmed": true/u);
   assert.doesNotMatch(dialogs[0].detail, /Users|127\.0\.0\.1|codex-first/u);
   await fixture.desktop.lifecycle.dispose();
 });
@@ -2433,7 +2435,7 @@ test("runtime invalidates a dashboard refresh lease when its renderer is replace
   ));
   assert.notEqual(dashboard, undefined);
   dashboard.emit("ready-to-show");
-  const lease = await fixture.desktop.controller.handlers.refreshStarted();
+  const lease = await fixture.desktop.controller.handlers.refreshStarted({ mode: "quick" });
   dashboard.webContents.emit("render-process-gone", {}, {
     reason: "crashed",
     exitCode: 17,

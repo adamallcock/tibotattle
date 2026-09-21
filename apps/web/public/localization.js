@@ -195,6 +195,8 @@ export const WEB_MESSAGES = Object.freeze({
   "dashboard.quota.stale": ["Out of date", "已过期", "Desactualizado"],
   "dashboard.freshness.observation": ["Latest observation", "最新观测", "Última observación"],
   "dashboard.freshness.stale": ["Observation out of date", "观测数据已过期", "Observación desactualizada"],
+  "dashboard.refresh.recovering": ["Automatic refresh is recovering. The next scheduled update will resume after the safety timer releases this pass.", "自动刷新正在恢复。安全计时器释放本次任务后，将恢复下一次计划更新。", "La actualización automática se está recuperando. La siguiente actualización programada se reanudará cuando el temporizador de seguridad libere esta ejecución."],
+  "dashboard.refresh.waitingForRecovery": ["Automatic refresh is waiting for safety recovery before the next scheduled update.", "自动刷新正在等待安全恢复，然后再进行下一次计划更新。", "La actualización automática espera la recuperación de seguridad antes de la siguiente actualización programada."],
   "dashboard.stale.observationTitle": ["Results need an update", "结果需要更新", "Los resultados necesitan actualizarse"],
   "dashboard.stale.observationCopy": ["Showing the last available results. Update local usage to check for newer measurements.", "显示最近可用的结果。更新本地使用量以检查更新的测量数据。", "Se muestran los últimos resultados disponibles. Actualiza el uso local para comprobar si hay mediciones más recientes."],
   "dashboard.quota.remaining": ["{value} remaining", "剩余 {value}", "{value} restante"],

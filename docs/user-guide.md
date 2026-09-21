@@ -312,6 +312,24 @@ cancelled, and interrupted detailed attempts count toward that hour so they do
 not become a retry loop. After an already-running quick quota check finishes,
 you can choose Refresh again to request detailed work.
 
+In the Electron app, the shell pauses its one-shot schedule only after the
+dashboard's local request has been accepted. The dashboard then sends a
+content-free heartbeat while that exact quick or detailed pass is active. A
+missing heartbeat recovers quickly; an independent 243-minute limit releases
+even a continuously renewed pass after the dashboard's 241-minute polling
+window. Replacing the dashboard also releases the reservation. Recovery rearms
+one timer from the latest saved interval and never starts a second companion
+operation while the first remains authoritative.
+
+The Overview timestamp and the menu-bar popup calculate observation age from
+the same recorded timestamp and current clock. An open window therefore changes
+to stale, qualifies its allowance values, and removes the current pacing claim
+without waiting for another response. If a completed dashboard operation still
+has an Electron reservation, the freshness card says automatic refresh is
+waiting for safety recovery. **Show diagnostics** reports only timer/watchdog
+state, mode, age, timestamps and a fixed recovery reason; it never includes the
+lease value, paths, accounts, credentials or session content.
+
 Trends shows three linked views: **Allowance and activity**, the **three-hour
 observed versus calculated comparison**, and **Cumulative drift**. The first
 view keeps remaining percentage separate from API-price-equivalent activity.

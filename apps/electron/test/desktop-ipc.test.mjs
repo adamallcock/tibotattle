@@ -76,7 +76,9 @@ test("desktop IPC restricts dashboard-owned actions to the active dashboard fram
     trustedSender: (sender) => sender === dashboardSender || sender === settingsSender,
     trustedFrame: (frame) => frame === dashboardFrame || frame === settingsFrame,
     trustedAction: (action, event) => (
-      action !== "refreshStarted"
+      action !== "getRefreshStatus"
+      && action !== "refreshStarted"
+      && action !== "refreshHeartbeat"
       && action !== "refreshSettled"
       && action !== "toggleSidebar"
     ) || (event.sender === dashboardSender && event.senderFrame === dashboardFrame),
@@ -84,6 +86,14 @@ test("desktop IPC restricts dashboard-owned actions to the active dashboard fram
       refreshStarted() {
         calls.push("started");
         return 1;
+      },
+      getRefreshStatus() {
+        calls.push("status");
+        return { state: "running" };
+      },
+      refreshHeartbeat() {
+        calls.push("heartbeat");
+        return true;
       },
       refreshSettled() {
         calls.push("settled");
@@ -99,7 +109,7 @@ test("desktop IPC restricts dashboard-owned actions to the active dashboard fram
   await assert.rejects(
     handler(
       { sender: settingsSender, senderFrame: settingsFrame },
-      { action: "refreshStarted", args: {} },
+      { action: "refreshStarted", args: { mode: "quick" } },
     ),
     errorCode("desktop_ipc_untrusted_context"),
   );
@@ -113,9 +123,23 @@ test("desktop IPC restricts dashboard-owned actions to the active dashboard fram
   assert.deepEqual(
     await handler(
       { sender: dashboardSender, senderFrame: dashboardFrame },
-      { action: "refreshStarted", args: {} },
+      { action: "refreshStarted", args: { mode: "quick" } },
     ),
     1,
+  );
+  assert.deepEqual(
+    await handler(
+      { sender: dashboardSender, senderFrame: dashboardFrame },
+      { action: "refreshHeartbeat", args: { lease: 1 } },
+    ),
+    true,
+  );
+  assert.deepEqual(
+    await handler(
+      { sender: dashboardSender, senderFrame: dashboardFrame },
+      { action: "getRefreshStatus", args: {} },
+    ),
+    { state: "running" },
   );
   assert.deepEqual(
     await handler(
@@ -131,7 +155,7 @@ test("desktop IPC restricts dashboard-owned actions to the active dashboard fram
     ),
     true,
   );
-  assert.deepEqual(calls, ["started", "settled", "sidebar"]);
+  assert.deepEqual(calls, ["started", "heartbeat", "status", "settled", "sidebar"]);
 });
 
 test("desktop IPC accepts Codex handoff only from the active dashboard frame", async () => {
