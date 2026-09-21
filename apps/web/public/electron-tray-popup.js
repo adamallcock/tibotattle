@@ -1268,6 +1268,13 @@ function renderAllowances(documentRef, projection, t, numberFormatter, preferenc
  */
 function renderWeeklyPace(documentRef, projection, t, numberFormatter, localFormatter) {
   const section = documentRef.getElementById("pace-section");
+  const runoutDuration = documentRef.getElementById("pace-outlook-duration");
+  runoutDuration?.removeAttribute("title");
+  runoutDuration?.removeAttribute("aria-label");
+  runoutDuration?.removeAttribute("tabindex");
+  setHidden(documentRef, "pace-outlook-caption", true);
+  setElementText(documentRef, "pace-outlook-caption", "");
+  setElementText(documentRef, "pace-outlook-duration", "");
   const pace = projection.weeklyPace;
   const weeklyAllowance = projection.allowances.find((allowance) =>
     allowance.durationMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES && !allowance.stale);
@@ -1296,7 +1303,6 @@ function renderWeeklyPace(documentRef, projection, t, numberFormatter, localForm
     setElementText(documentRef, "pace-headline", "");
     setElementText(documentRef, "pace-explanation", "");
     setElementText(documentRef, "pace-evidence", "");
-    setElementText(documentRef, "pace-outlook", "");
     setElementText(documentRef, "pace-reset", "");
     setElementText(documentRef, "pace-outcome", "");
     documentRef.getElementById("pace-track")?.removeAttribute("aria-label");
@@ -1364,13 +1370,24 @@ function renderWeeklyPace(documentRef, projection, t, numberFormatter, localForm
   setElementText(documentRef, "pace-explanation", explanation);
   setElementText(documentRef, "pace-evidence", pace.outlook.earlyEstimate
     ? t("electron.trayPopover.paceEarly") : "");
-  const outlookCopy = pace.outlook.kind === "reset_first"
-    ? t("electron.trayPopover.paceUntilReset")
-    : pace.outlook.projectedExhaustionAt
-      ? t("electron.trayPopover.paceExhaustion", {
-        time: localFormatter(pace.outlook.projectedExhaustionAt),
-      }) : t("weekly.headline.insufficient");
-  setElementText(documentRef, "pace-outlook", outlookCopy);
+  const hasRunout = pace.outlook.kind === "exhaustion"
+    && pace.outlook.projectedExhaustionAt !== null;
+  const runoutCaption = hasRunout
+    ? t("electron.trayPopover.paceEstimatedRunout") : "";
+  const runoutCopy = hasRunout
+    ? t("electron.trayPopover.paceInDuration", { duration: coveredDuration })
+    : t("electron.trayPopover.paceUntilReset");
+  setHidden(documentRef, "pace-outlook-caption", !hasRunout);
+  setElementText(documentRef, "pace-outlook-caption", runoutCaption);
+  setElementText(documentRef, "pace-outlook-duration", runoutCopy);
+  if (hasRunout && runoutDuration) {
+    const exactTime = t("electron.trayPopover.paceExhaustion", {
+      time: localFormatter(pace.outlook.projectedExhaustionAt),
+    });
+    runoutDuration.setAttribute("title", exactTime);
+    runoutDuration.setAttribute("aria-label", `${runoutCaption}. ${runoutCopy}. ${exactTime}`);
+    runoutDuration.setAttribute("tabindex", "0");
+  }
   setElementText(documentRef, "pace-reset", resetCopy);
   setElementText(documentRef, "pace-now", t("electron.trayPopover.paceNow"));
   setElementText(documentRef, "pace-outcome", outcome);

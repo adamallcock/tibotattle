@@ -302,7 +302,11 @@ body {
 .electron-tray-popup-pace-timeline-foot { margin-top: 4px; color: var(--tray-muted); }
 .electron-tray-popup-pace-timeline-labels span,
 .electron-tray-popup-pace-timeline-foot span { min-width: 0; overflow-wrap: anywhere; }
-#pace-outlook { color: var(--pace-color); font-weight: 650; }
+#pace-outlook { display: flex; flex-direction: column; align-items: flex-start; color: var(--pace-color); }
+#pace-outlook-caption { font-weight: 500; }
+#pace-outlook-duration { font-size: 10px; font-weight: 700; }
+#pace-outlook-duration[title] { text-decoration: underline dotted; text-underline-offset: 2px; cursor: help; }
+#pace-outlook-duration:focus-visible { outline: 2px solid var(--pace-color); outline-offset: 2px; }
 #pace-reset, #pace-outcome { text-align: right; }
 
 .electron-tray-popup-pace-track {

@@ -255,7 +255,8 @@ class FakeDocument {
       "history-period", "history-tokens", "history-events", "history-price",
       "history-start", "history-end", "history-coverage", "history-retained",
       "history-bars", "history-bar-detail", "pace-section", "pace-state", "pace-headline",
-      "pace-explanation", "pace-evidence", "pace-timeline", "pace-outlook", "pace-reset",
+      "pace-explanation", "pace-evidence", "pace-timeline", "pace-outlook",
+      "pace-outlook-caption", "pace-outlook-duration", "pace-reset",
       "pace-track", "pace-now", "pace-outcome",
       "pace-fill", "pace-active-marker", "tray-popup-freshness", "tray-popup-live",
     ]) this.elements.set(id, new FakeElement());
@@ -323,6 +324,7 @@ test("tray popup assets are local, bounded, and wired as a visual surface", asyn
   assert.match(html, /id="pace-headline"/u);
   assert.match(html, /id="pace-outcome"/u);
   assert.match(html, /id="pace-track"/u);
+  assert.match(html, /id="pace-outlook-duration"/u);
   assert.match(html, /id="history-bars"/u);
   assert.match(html, /data-history-range="7d"/u);
   assert.match(html, /data-history-range="30d"/u);
@@ -441,8 +443,10 @@ test("the popup's pacing and history messages stay translated in every shipped l
       "electron.trayPopover.refresh",
       "electron.trayPopover.paceUnavailable",
       "electron.trayPopover.paceRefreshNeeded",
+      "electron.trayPopover.paceEstimatedRunout",
+      "electron.trayPopover.paceInDuration",
     ]) {
-      const value = translate(key, {}, locale);
+      const value = translate(key, { duration: "2d 3h" }, locale);
       assert.equal(typeof value, "string");
       assert.notEqual(value.trim(), "", `${locale} ${key}`);
       assert.doesNotMatch(value, /\{[A-Za-z]/u, `${locale} ${key}`);
@@ -478,6 +482,9 @@ test("weekly pace renders only for a current allowance bound to its valid outloo
   assert.equal(documentRef.getElementById("pace-outcome").textContent, "About 45% left at reset");
   assert.equal(documentRef.getElementById("pace-timeline").hidden, false);
   assert.equal(documentRef.getElementById("pace-fill").style.width, "100%");
+  assert.equal(documentRef.getElementById("pace-outlook-caption").hidden, true);
+  assert.equal(documentRef.getElementById("pace-outlook-duration").textContent, "Allowance lasts to reset");
+  assert.equal(documentRef.getElementById("pace-outlook-duration").attributes.has("title"), false);
   assert.match(documentRef.getElementById("pace-track").attributes.get("aria-label"), /Resets in 3d 2h/u);
   assert.equal(documentRef.getElementById("pace-track").attributes.has("aria-valuenow"), false);
 
@@ -553,17 +560,31 @@ test("critical weekly pace explains the dry stretch with matching timeline geome
   const projection = createTrayPopupProjection(data, { now: NOW, timeZone: "UTC" });
   assert.equal(projection.weeklyPace.status, "available");
   const documentRef = new FakeDocument();
-  renderTrayPopup(documentRef, projection);
+  renderTrayPopup(documentRef, projection, {
+    localFormatter: () => "Sep 6, 12:00 AM EDT",
+  });
   assert.equal(documentRef.getElementById("pace-section").dataset.paceTone, "critical");
   assert.equal(documentRef.getElementById("pace-headline").textContent,
     "At this pace, the weekly allowance runs out in 1d 6h.");
   assert.equal(documentRef.getElementById("pace-outcome").textContent, "Nothing left for 1d 20h");
+  assert.equal(documentRef.getElementById("pace-outlook-caption").textContent, "Estimated run-out");
+  assert.equal(documentRef.getElementById("pace-outlook-duration").textContent, "In 1d 6h");
+  assert.equal(documentRef.getElementById("pace-outlook-duration").attributes.get("title"),
+    "Projected exhaustion Sep 6, 12:00 AM EDT");
+  assert.match(documentRef.getElementById("pace-outlook-duration").attributes.get("aria-label"),
+    /In 1d 6h.*Sep 6, 12:00 AM EDT/u);
+  assert.equal(documentRef.getElementById("pace-outlook-duration").attributes.get("tabindex"), "0");
   assert.match(documentRef.getElementById("pace-explanation").textContent, /2\.5×/u);
   assert.equal(documentRef.getElementById("pace-fill").style.width, `${(30 / 74) * 100}%`);
   assert.equal(documentRef.getElementById("pace-active-marker").style.left, `${(20 / 74) * 100}%`);
   assert.match(documentRef.getElementById("pace-track").attributes.get("aria-label"), /Nothing left for 1d 20h/u);
   assert.match(css, /data-pace-tone="critical"/u);
   assert.match(css, /background-image: repeating-linear-gradient/u);
+
+  renderTrayPopup(documentRef, createTrayPopupProjection(fixture(), { now: NOW, timeZone: "UTC" }));
+  assert.equal(documentRef.getElementById("pace-outlook-caption").hidden, true);
+  assert.equal(documentRef.getElementById("pace-outlook-duration").attributes.has("title"), false);
+  assert.equal(documentRef.getElementById("pace-outlook-duration").attributes.has("tabindex"), false);
 });
 
 test("an early pace estimate stays visibly qualified", () => {
