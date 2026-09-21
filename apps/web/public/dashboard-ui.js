@@ -109,13 +109,113 @@ export function createEvidenceList(documentRef, className = "performance-evidenc
   return list;
 }
 
-/** Observation recency is independent of a running job or stale cost cache. */
-export function observationFreshness(data) {
-  if (data?.mode === "demo") return "demo";
+/**
+ * Observation recency is independent of a running job or stale cost cache.
+ * Derive age from the timestamp every time so an open surface cannot remain
+ * visually fresh merely because its serialized `ageSeconds` stopped changing.
+ */
+export function observationRecency(data, now = Date.now()) {
+  if (data?.mode === "demo") {
+    return Object.freeze({
+      status: "demo",
+      latestObservedAt: null,
+      ageSeconds: null,
+      staleAfterSeconds: null,
+    });
+  }
   const freshness = data?.freshness;
-  if (!freshness?.latestObservedAt || !Number.isFinite(Date.parse(freshness.latestObservedAt))) return "unknown";
-  const age = freshness.ageSeconds;
-  const threshold = freshness.staleAfterSeconds;
-  if (!Number.isFinite(age) || age < 0 || !Number.isFinite(threshold) || threshold < 0) return "unknown";
-  return age <= threshold ? "current" : "stale";
+  const latestObservedAt = freshness?.latestObservedAt;
+  const observedAt = typeof latestObservedAt === "string"
+    ? Date.parse(latestObservedAt)
+    : Number.NaN;
+  const nowMs = now instanceof Date ? now.getTime() : now;
+  const staleAfterSeconds = freshness?.staleAfterSeconds;
+  if (!Number.isFinite(observedAt)
+      || !Number.isFinite(nowMs)
+      || observedAt > nowMs
+      || !Number.isFinite(staleAfterSeconds)
+      || staleAfterSeconds < 0) {
+    return Object.freeze({
+      status: "unknown",
+      latestObservedAt: null,
+      ageSeconds: null,
+      staleAfterSeconds: null,
+    });
+  }
+  const ageSeconds = (nowMs - observedAt) / 1_000;
+  return Object.freeze({
+    status: ageSeconds <= staleAfterSeconds ? "current" : "stale",
+    latestObservedAt: new Date(observedAt).toISOString(),
+    ageSeconds,
+    staleAfterSeconds,
+  });
+}
+
+export function observationFreshness(data, now = Date.now()) {
+  return observationRecency(data, now).status;
+}
+
+/**
+ * Keep one bounded, one-shot clock for open dashboard freshness. It wakes at
+ * least once a minute and exactly when a current observation crosses its stale
+ * boundary. Updating the source replaces the prior timer.
+ */
+export function createObservationFreshnessClock({
+  onTick,
+  now = () => Date.now(),
+  schedule = setTimeout,
+  cancel = clearTimeout,
+  intervalMs = 60_000,
+} = {}) {
+  if (typeof onTick !== "function"
+      || typeof now !== "function"
+      || typeof schedule !== "function"
+      || typeof cancel !== "function"
+      || !Number.isSafeInteger(intervalMs)
+      || intervalMs <= 0) {
+    throw new TypeError("freshness clock options are invalid");
+  }
+  let source = null;
+  let timer = null;
+  let stopped = false;
+
+  const clearTimer = () => {
+    if (timer === null) return;
+    cancel(timer);
+    timer = null;
+  };
+
+  const arm = () => {
+    clearTimer();
+    if (stopped || source === null) return;
+    const nowMs = now();
+    const recency = observationRecency(source, nowMs);
+    let delay = intervalMs;
+    if (recency.status === "current") {
+      const staleAt = Date.parse(recency.latestObservedAt)
+        + recency.staleAfterSeconds * 1_000;
+      delay = Math.min(intervalMs, Math.max(1, Math.floor(staleAt - nowMs) + 1));
+    }
+    timer = schedule(() => {
+      timer = null;
+      if (stopped || source === null) return;
+      onTick(observationRecency(source, now()), source);
+      arm();
+    }, delay);
+    timer?.unref?.();
+  };
+
+  return Object.freeze({
+    update(next) {
+      source = next;
+      stopped = false;
+      onTick(observationRecency(source, now()), source);
+      arm();
+    },
+    stop() {
+      stopped = true;
+      source = null;
+      clearTimer();
+    },
+  });
 }

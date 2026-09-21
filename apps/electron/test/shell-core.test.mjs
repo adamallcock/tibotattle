@@ -4620,7 +4620,9 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     "openDashboardInBrowser",
     "showDiagnostics",
     "revealLocalData",
+    "getRefreshStatus",
     "refreshStarted",
+    "refreshHeartbeat",
     "refreshSettled",
   ]);
   assert.equal(bridge.version, "v1");
@@ -4716,7 +4718,9 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   await bridge.openDashboardInBrowser();
   await bridge.showDiagnostics();
   await bridge.revealLocalData();
-  await bridge.refreshStarted();
+  await bridge.getRefreshStatus();
+  await bridge.refreshStarted("quick");
+  await bridge.refreshHeartbeat(1);
   await bridge.refreshSettled(1);
   assert.deepEqual(JSON.parse(JSON.stringify(calls.map(({ channel, request }) => ({ channel, request })))), [
     { channel: "tibotattle:desktop:v1", request: { action: "getSettings", args: {} } },
@@ -4794,7 +4798,9 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     { channel: "tibotattle:desktop:v1", request: { action: "openDashboardInBrowser", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "showDiagnostics", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "revealLocalData", args: {} } },
-    { channel: "tibotattle:desktop:v1", request: { action: "refreshStarted", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "getRefreshStatus", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "refreshStarted", args: { mode: "quick" } } },
+    { channel: "tibotattle:desktop:v1", request: { action: "refreshHeartbeat", args: { lease: 1 } } },
     { channel: "tibotattle:desktop:v1", request: { action: "refreshSettled", args: { lease: 1 } } },
   ]);
   await assert.rejects(
@@ -4837,7 +4843,12 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     () => bridge.openCommunity("extra"),
     () => bridge.showDiagnostics("extra"),
     () => bridge.revealLocalData("extra"),
+    () => bridge.getRefreshStatus("extra"),
+    () => bridge.refreshStarted(),
     () => bridge.refreshStarted("extra"),
+    () => bridge.refreshStarted("quick", "extra"),
+    () => bridge.refreshHeartbeat("extra"),
+    () => bridge.refreshHeartbeat(0),
     () => bridge.refreshSettled("extra"),
     () => bridge.refreshSettled(0),
     () => bridge.setSharingEnabled("true"),

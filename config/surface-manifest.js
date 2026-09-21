@@ -23,6 +23,7 @@ const SHARED_WEB_FILES = Object.freeze([
   "apps/web/public/dashboard-report-preload.js",
   "apps/web/public/dashboard-ui.js",
   "apps/web/public/desktop-shell.js",
+  "apps/web/public/electron-refresh-lifecycle.js",
   "apps/web/public/electron-settings.css",
   "apps/web/public/electron-settings.html",
   "apps/web/public/electron-settings.js",

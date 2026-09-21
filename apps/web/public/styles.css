@@ -610,6 +610,11 @@ h1 {
   font-size: 1.3rem;
   font-weight: var(--weight-display);
 }
+.freshness-card .automatic-refresh-health {
+  max-width: 260px;
+  color: var(--amber);
+  font-weight: var(--weight-strong);
+}
 /* Observation colour follows its own timestamp, never accounting or job state. */
 .freshness-card[data-freshness="current"] { --freshness-accent: var(--green); }
 .freshness-card[data-freshness="stale"] { --freshness-accent: var(--amber); }

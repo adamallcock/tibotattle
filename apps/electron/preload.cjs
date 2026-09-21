@@ -413,7 +413,17 @@ function installDesktopBridge() {
     ),
     showDiagnostics: (...values) => noArguments("showDiagnostics", values),
     revealLocalData: (...values) => noArguments("revealLocalData", values),
-    refreshStarted: (...values) => noArguments("refreshStarted", values),
+    getRefreshStatus: (...values) => noArguments("getRefreshStatus", values),
+    refreshStarted: (...values) => oneArgument(
+      "refreshStarted",
+      values,
+      (mode) => enumMethod("refreshStarted", mode, AUTOMATIC_REFRESH_MODES, "mode"),
+    ),
+    refreshHeartbeat: (...values) => oneArgument(
+      "refreshHeartbeat",
+      values,
+      (lease) => refreshLeaseMethod("refreshHeartbeat", lease),
+    ),
     refreshSettled: (...values) => oneArgument(
       "refreshSettled",
       values,

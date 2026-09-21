@@ -4,7 +4,9 @@ import test from "node:test";
 import { createContext, runInContext } from "node:vm";
 import { SUPPORTED_LOCALES, translate } from "../public/localization.js";
 import { refreshAccountingStatus, refreshQuickResultStatus } from "../public/lib.js";
+import { observationRecency } from "../public/dashboard-ui.js";
 import { createDomHelpers } from "../public/ui-format.js";
+import { createElectronRefreshLease } from "../public/electron-refresh-lifecycle.js";
 
 const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
 
@@ -85,8 +87,13 @@ function refreshHarness({
     electronStartupRefreshDeferred: false,
     activeLocalDashboardLoad: null,
     globalState: { state: "stale", companionReachable: true },
-    ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS: 1_000,
+    electronRefreshLifecycleState: null,
     tibotattleDesktop: bridge,
+    createElectronRefreshLease: (options) => createElectronRefreshLease({
+      ...options,
+      heartbeatIntervalMs: 60_000,
+      signalTimeoutMs: 1,
+    }),
     document,
     ...createDomHelpers(document),
     $: (selector) => {
@@ -128,6 +135,7 @@ function refreshHarness({
     runsInsideElectronDashboard: () => electron,
     refreshAccountingStatus,
     refreshQuickResultStatus,
+    observationRecency,
     setGlobalState(state, options = {}) {
       globalStates.push({ state, ...options });
       context.globalState = { state, ...options };
@@ -143,6 +151,9 @@ function refreshHarness({
     scheduleReindexAutoContinuation: () => calls.push("continuation-check"),
     loadLocalDashboard: async () => calls.push("reload"),
     describeFailure: async () => { calls.push("diagnostic"); return { text: "An update could not be started." }; },
+    setLocalizedText(element, key) {
+      element.textContent = translate(key, {}, "en-US");
+    },
     t: (key) => translate(key, {}, "en-US"),
   });
   for (const name of [
@@ -153,7 +164,8 @@ function refreshHarness({
   ]) {
     runInContext(productionFunction(name), context);
   }
-  runInContext(productionFunction("signalElectronRefreshLifecycle"), context);
+  runInContext(productionFunction("refreshElectronCadenceHealth"), context);
+  runInContext(productionFunction("dashboardObservationPresentation"), context);
   runInContext(productionFunction("requestRefresh"), context);
   runInContext(productionFunction("scheduleReturningUserRefresh"), context);
   return { context, calls, routes, notices, timers, buttons, priorDashboard, progressFrames, globalStates };
@@ -491,9 +503,13 @@ test("accepted Electron refreshes acquire and settle the main-process lease", as
   const harness = refreshHarness({
     electron: true,
     bridge: {
-      refreshStarted() {
-        lifecycle.push("started");
+      refreshStarted(mode) {
+        lifecycle.push(["started", mode]);
         return 41;
+      },
+      refreshHeartbeat() {
+        lifecycle.push("heartbeat");
+        return true;
       },
       refreshSettled(lease) {
         assert.equal(Number.isSafeInteger(lease), true,
@@ -508,7 +524,29 @@ test("accepted Electron refreshes acquire and settle the main-process lease", as
   await new Promise(setImmediate);
 
   assert.deepEqual(harness.calls, ["quick", "status", "reload"]);
-  assert.deepEqual(lifecycle, ["started", ["settled", 41]]);
+  assert.deepEqual(lifecycle, [["started", "quick"], ["settled", 41]]);
+});
+
+test("a stranded main-process lease is visible until cadence recovery is armed", async () => {
+  let status = {
+    schemaVersion: "tibotattle-desktop-refresh-status-v1",
+    activeLease: true,
+    cadenceTimerArmed: false,
+  };
+  const harness = refreshHarness({
+    electron: true,
+    bridge: {
+      getRefreshStatus: async () => status,
+    },
+  });
+  await harness.context.refreshElectronCadenceHealth();
+  const health = harness.context.$("#automatic-refresh-health");
+  assert.equal(health.hidden, false);
+  assert.match(health.textContent, /waiting for safety recovery/u);
+
+  status = { ...status, activeLease: false, cadenceTimerArmed: true };
+  await harness.context.refreshElectronCadenceHealth();
+  assert.equal(health.hidden, true);
 });
 
 test("a late Electron lease is settled with the preload's numeric contract", async () => {
@@ -518,7 +556,11 @@ test("a late Electron lease is settled with the preload's numeric contract", asy
   const harness = refreshHarness({
     electron: true,
     bridge: {
-      refreshStarted: () => started,
+      refreshStarted: (mode) => {
+        assert.equal(mode, "quick");
+        return started;
+      },
+      refreshHeartbeat: () => true,
       refreshSettled(lease) {
         assert.equal(Number.isSafeInteger(lease), true);
         settled.push(lease);

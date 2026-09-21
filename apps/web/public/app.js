@@ -1,4 +1,8 @@
-import { observationFreshness } from "./dashboard-ui.js";
+import {
+  createObservationFreshnessClock,
+  observationRecency,
+} from "./dashboard-ui.js";
+import { createElectronRefreshLease } from "./electron-refresh-lifecycle.js";
 import { createReportingPeriod, reportingDays, reportingSelection, mountReportingPeriodDismissal } from "./reporting-period.js";
 import { createCacheReuseMatrix } from "./cache-reuse-matrix.js";
 import { cacheReuseMetricLines, cacheReuseCoverageNote } from "./cache-reuse-metrics.js";
@@ -460,11 +464,10 @@ let localRefreshCancelRequested = false;
 let archiveHistoryScanActive = false;
 let returnRefreshScheduled = false;
 let returnRefreshDeferrals = 0;
-// Electron's main process owns the recurring cadence. A renderer refresh must
-// hand it a bounded lease after the companion accepts the POST, otherwise a
-// one-shot timer can fire again while the same accounting pass is still
-// running. The controller watchdog remains the outer safety bound.
-const ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS = 1_000;
+// Electron's main process owns the recurring cadence. The renderer lifecycle
+// module keeps the accepted companion operation heartbeating without exposing
+// its lease value to presentation state.
+let electronRefreshLifecycleState = null;
 let electronStartupRefreshTriggered = false;
 // A qualified startup observer can release while the first local-dashboard
 // load still owns the action lock. Keep that one launch pass pending until the
@@ -474,9 +477,17 @@ let electronStartupRefreshDeferred = false;
 let globalState = null;
 let visibleConnectionNotice = null;
 let dashboardUnavailableState = null;
+let lastObservationPresentationStatus = null;
 
 const $ = (selector) => document.querySelector(selector);
 const { clear, node } = createDomHelpers(document);
+const observationFreshnessClock = createObservationFreshnessClock({
+  onTick(recency, source) {
+    if (source !== dashboard) return;
+    renderLiveObservationPresentation(source, recency);
+    void refreshElectronCadenceHealth();
+  },
+});
 
 // Product-owned legacy copy stays explicitly registered with the bounded
 // migration bridge. Values originating in a local report, provider response,
@@ -1597,38 +1608,39 @@ function renderLocalOnboarding(value) {
   updateLocalActionButtons();
 }
 
-function renderDashboard(data) {
-  renderReportingPeriod(data);
-  dashboardUnavailableState = null;
-  dashboard = data;
-  if (!isCacheDropThreadDashboard(data) || !data?.accounting?.cacheDiagnosticsSource
-      || cacheDropThreadLinks.dashboard !== data
-      || cacheDropThreadLinks.generation !== data?.accounting?.cacheDiagnosticsSource?.generation
-      || cacheDropThreadLinks.generationFingerprint
-        !== data?.accounting?.cacheDiagnosticsSource?.generationFingerprint) {
-    resetCacheDropThreadLinks(data);
-  }
-  if (data.mode === "demo") {
-    setJourneyState("demo-mode");
-    $("#setup-card").hidden = true;
-  }
-  setGlobalState(data.state, {
-    companionReachable: data.mode !== "demo"
-  });
-  renderHistoryIndexBadge(data);
-  $(".freshness-card").dataset.freshness = observationFreshness(data);
-  setLocalizedText($(".freshness-card > span"), observationFreshness(data) === "stale"
-    ? "dashboard.freshness.stale" : "dashboard.freshness.observation");
-  $("#latest-observation").textContent = data.freshness.latestObservedAt
-    ? formatAge(data.freshness.ageSeconds ?? (Date.now() - Date.parse(data.freshness.latestObservedAt)) / 1000)
-    : "No timestamp";
-  $("#data-source").textContent = data.mode === "demo"
-    ? "Illustrative fixture — not your usage"
-    : `${formatLocal(data.freshness.latestObservedAt)} · local companion`;
-  // The footer's "Dashboard contract" line is gone (owner-directed,
-  // 2026-08-08): the version stays machine-discoverable on data.schemaVersion
-  // and in the share card's text transcript, and was never a user fact.
+function dashboardObservationPresentation(data, recency) {
+  const observationStale = recency.status === "stale";
+  const observationUnavailable = recency.status === "unknown";
+  const observationNotCurrent = observationStale || observationUnavailable;
+  const freshnessStatus = recency.status === "current"
+    ? "live"
+    : observationStale
+      ? "stale"
+      : observationUnavailable
+        ? "insufficient"
+        : data?.freshness?.status;
+  return {
+    ...data,
+    state: observationNotCurrent && data?.state === "live"
+      ? (observationStale ? "stale" : "insufficient")
+      : data?.state,
+    freshness: {
+      ...data?.freshness,
+      status: freshnessStatus,
+      latestObservedAt: recency.latestObservedAt ?? data?.freshness?.latestObservedAt ?? null,
+      ageSeconds: recency.ageSeconds,
+      staleAfterSeconds: recency.staleAfterSeconds ?? data?.freshness?.staleAfterSeconds,
+    },
+    quotaWindows: observationNotCurrent
+      ? (Array.isArray(data?.quotaWindows) ? data.quotaWindows : []).map((window) => ({
+        ...window,
+        status: window?.status === "live" ? "stale" : window?.status,
+      }))
+      : data?.quotaWindows,
+  };
+}
 
+function renderObservationConnectionState(data, recency) {
   if (data.mode === "demo") {
     showConnectionNotice({
       title: "You are exploring a labeled demonstration",
@@ -1637,22 +1649,12 @@ function renderDashboard(data) {
       showCheck: true
     });
   } else if (data.state === "stale") {
-    // A stale cached accounting result makes the companion's single freshness
-    // verdict "stale" even when the newest observation is seconds old. Saying
-    // the observation is old in that case is simply untrue, and it is the
-    // reason a refresh appears to change nothing: the observation was never
-    // what was stale.
-    const observationIsCurrent = observationFreshness(data) === "current";
-    if (observationIsCurrent && data.freshness.accountingStatus === "stale") {
+    if (recency.status === "current" && data.freshness.accountingStatus === "stale") {
       showConnectionNotice({
         copyKey: "dashboard.stale.accountingCopy",
         kind: "warning",
         titleKey: "dashboard.stale.accountingTitle",
       });
-    } else if (observationFreshness(data) === "stale") {
-      // Timestamp and card qualifiers already identify old observations. Keep
-      // published coverage warnings, without repeating a generic banner.
-      hideConnectionNotice();
     } else {
       showConnectionNotice({
         titleKey: "dashboard.stale.observationTitle",
@@ -1670,13 +1672,90 @@ function renderDashboard(data) {
   } else {
     hideConnectionNotice();
   }
-
   $("#connection-notice").classList.toggle("notice-compact", data.state === "stale");
+}
 
-  allowanceTankView?.dispose();
-  renderQuotaCards(data);
-  renderWeeklyPaceForecast(data);
-  allowanceTankView = mountAllowanceTanks($("#quota-cards"), $("#weekly-pace-forecast"), { t });
+function renderLiveObservationPresentation(data, recency = observationRecency(data)) {
+  const presentation = dashboardObservationPresentation(data, recency);
+  const priorStatus = lastObservationPresentationStatus;
+  lastObservationPresentationStatus = recency.status;
+  const card = $(".freshness-card");
+  card.dataset.freshness = recency.status;
+  setLocalizedText(card.querySelector("span"), recency.status === "stale"
+    ? "dashboard.freshness.stale" : "dashboard.freshness.observation");
+  $("#latest-observation").textContent = recency.ageSeconds !== null
+    ? formatAge(recency.ageSeconds)
+    : "No timestamp";
+  $("#data-source").textContent = data.mode === "demo"
+    ? "Illustrative fixture — not your usage"
+    : `${formatLocal(data.freshness.latestObservedAt)} · local companion`;
+
+  if (priorStatus !== recency.status) {
+    setGlobalState(presentation.state, {
+      companionReachable: data.mode !== "demo"
+    });
+    renderObservationConnectionState(presentation, recency);
+    allowanceTankView?.dispose();
+    renderQuotaCards(presentation);
+    renderWeeklyPaceForecast(presentation);
+    allowanceTankView = mountAllowanceTanks(
+      $("#quota-cards"),
+      $("#weekly-pace-forecast"),
+      { t },
+    );
+  }
+}
+
+async function refreshElectronCadenceHealth() {
+  const element = $("#automatic-refresh-health");
+  if (!element) return;
+  const bridge = runsInsideElectronDashboard() ? globalThis.tibotattleDesktop : null;
+  if (localRefreshInProgress || typeof bridge?.getRefreshStatus !== "function") {
+    element.hidden = true;
+    return;
+  }
+  let status = null;
+  try {
+    status = await bridge.getRefreshStatus();
+  } catch {
+    status = null;
+  }
+  const leaseAwaitingRecovery = status?.schemaVersion === "tibotattle-desktop-refresh-status-v1"
+    && status.activeLease === true
+    && status.cadenceTimerArmed === false;
+  if (!leaseAwaitingRecovery) {
+    element.hidden = true;
+    return;
+  }
+  setLocalizedText(element, electronRefreshLifecycleState?.reason === "settlement_failed"
+    ? "dashboard.refresh.recovering"
+    : "dashboard.refresh.waitingForRecovery");
+  element.hidden = false;
+}
+
+function renderDashboard(data) {
+  renderReportingPeriod(data);
+  dashboardUnavailableState = null;
+  dashboard = data;
+  if (!isCacheDropThreadDashboard(data) || !data?.accounting?.cacheDiagnosticsSource
+      || cacheDropThreadLinks.dashboard !== data
+      || cacheDropThreadLinks.generation !== data?.accounting?.cacheDiagnosticsSource?.generation
+      || cacheDropThreadLinks.generationFingerprint
+        !== data?.accounting?.cacheDiagnosticsSource?.generationFingerprint) {
+    resetCacheDropThreadLinks(data);
+  }
+  if (data.mode === "demo") {
+    setJourneyState("demo-mode");
+    $("#setup-card").hidden = true;
+  }
+  renderHistoryIndexBadge(data);
+  const recency = observationRecency(data);
+  lastObservationPresentationStatus = null;
+  renderLiveObservationPresentation(data, recency);
+  // The footer's "Dashboard contract" line is gone (owner-directed,
+  // 2026-08-08): the version stays machine-discoverable on data.schemaVersion
+  // and in the share card's text transcript, and was never a user fact.
+
   renderEvidenceWarnings(data);
   renderPricing(data);
   renderComparison(data);
@@ -1687,6 +1766,7 @@ function renderDashboard(data) {
   renderWeekly(data);
   renderAccounting(data);
   renderCommunityJourney();
+  observationFreshnessClock.update(data);
   // This optional lookup must never delay the native readiness marker or the
   // accounting render. Only the first-column cells are updated when it lands.
   void loadCacheDropThreadLinks(data);
@@ -11666,6 +11746,8 @@ async function loadLocalDashboard() {
   } catch {
     if (!isCurrent()) return;
     dashboard = null;
+    observationFreshnessClock.stop();
+    lastObservationPresentationStatus = null;
     renderLocalOnboarding(localOnboarding);
     renderDashboardUnavailableState(
       localCompanionHealth ? "dashboard-unavailable" : "companion-unavailable",
@@ -11815,61 +11897,6 @@ function scheduleReindexAutoContinuation() {
   }, REINDEX_AUTO_CONTINUE_DELAY_MS);
 }
 
-/**
- * Notify Electron main that a renderer-owned refresh has crossed its accepted
- * POST boundary, or that the leased pass reached a terminal state. The
- * renderer never waits indefinitely for cadence bookkeeping: a delayed start
- * response is settled after the renderer finishes through the late-value
- * callback below.
- */
-function signalElectronRefreshLifecycle(action, args = [], options = {}) {
-  if (!runsInsideElectronDashboard()) return Promise.resolve(null);
-  const bridge = globalThis.tibotattleDesktop;
-  if (typeof bridge?.[action] !== "function" || !Array.isArray(args)) {
-    return Promise.resolve(null);
-  }
-  const onLateValue = typeof options?.onLateValue === "function"
-    ? options.onLateValue
-    : null;
-  let call;
-  try {
-    call = Promise.resolve(bridge[action](...args));
-  } catch {
-    return Promise.resolve(null);
-  }
-  return new Promise((resolve) => {
-    let settled = false;
-    let timedOut = false;
-    const reportLateValue = (value) => {
-      if (!onLateValue) return;
-      try {
-        onLateValue(value);
-      } catch {
-        // Cadence cleanup is best effort and must not affect the refresh.
-      }
-    };
-    const timer = setTimeout(() => {
-      settled = true;
-      timedOut = true;
-      resolve(null);
-    }, ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS);
-    call.then((value) => {
-      if (settled) {
-        if (timedOut) reportLateValue(value);
-        return;
-      }
-      settled = true;
-      clearTimeout(timer);
-      resolve(value);
-    }, () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(null);
-    });
-  });
-}
-
 async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
   if (localActionBusy) return;
   const previousGlobalState = globalState;
@@ -11898,20 +11925,8 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
   let cancelled = false;
   let quickResultLoaded = false;
   let continuationLimitReached = false;
-  let refreshStartSignal = Promise.resolve(null);
-  let lateRefreshLease = null;
-  let refreshLifecycleFinished = false;
+  let refreshLeaseSession = null;
   let refreshProgressClock = null;
-  const handleLateRefreshLease = (lease) => {
-    if (!Number.isSafeInteger(lease) || lease <= 0) return;
-    if (!refreshLifecycleFinished) {
-      lateRefreshLease = lease;
-      return;
-    }
-    // The renderer may finish while the main-process start reply is still
-    // crossing its bounded bridge timeout. Settle that late lease directly.
-    void signalElectronRefreshLifecycle("refreshSettled", [lease]);
-  };
   localActionBusy = true;
   localRefreshInProgress = true;
   localRefreshCancelRequested = false;
@@ -11927,13 +11942,17 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       : localClient.refresh());
     refreshAccepted = true;
     if (electronRefresh) {
-      // Do not delay status polling on cadence bookkeeping. A late lease is
-      // settled from the finally block or its callback above.
-      refreshStartSignal = signalElectronRefreshLifecycle(
-        "refreshStarted",
-        [],
-        { onLateValue: handleLateRefreshLease },
-      );
+      refreshLeaseSession = createElectronRefreshLease({
+        bridge: globalThis.tibotattleDesktop,
+        mode: detailed ? "detailed" : "quick",
+        onState(next) {
+          electronRefreshLifecycleState = next;
+          if (!localRefreshInProgress) void refreshElectronCadenceHealth();
+        },
+      });
+      // Cadence bookkeeping must never delay companion polling. A bounded late
+      // start reply is still settled by the lifecycle module after completion.
+      void refreshLeaseSession.start();
     }
     refreshProgressClock = startRefreshProgressClock(button, detailed
       ? "Starting detailed accounting…"
@@ -12138,7 +12157,11 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     if (detailed) scheduleReindexAutoContinuation();
   } catch (error) {
     if (dashboard) {
-      setGlobalState(dashboard.state, {
+      const presentation = dashboardObservationPresentation(
+        dashboard,
+        observationRecency(dashboard),
+      );
+      setGlobalState(presentation.state, {
         companionReachable: dashboard.mode !== "demo",
       });
     }
@@ -12185,14 +12208,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     });
   } finally {
     refreshProgressClock?.stop();
-    if (electronRefresh && refreshAccepted) {
-      let lease = await refreshStartSignal;
-      if (!Number.isSafeInteger(lease) || lease <= 0) lease = lateRefreshLease;
-      if (Number.isSafeInteger(lease) && lease > 0) {
-        await signalElectronRefreshLifecycle("refreshSettled", [lease]);
-      }
-      refreshLifecycleFinished = true;
-    }
+    if (electronRefresh && refreshAccepted) await refreshLeaseSession?.finish();
     const wasArchiveScanning = archiveHistoryScanActive;
     archiveHistoryScanActive = false;
     if (wasArchiveScanning && dashboard) renderPricing(dashboard);
@@ -12200,11 +12216,15 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     localRefreshInProgress = false;
     localRefreshCancelRequested = false;
     updateLocalActionButtons();
+    void refreshElectronCadenceHealth();
     // The updating pill is derived from the renderer-owned lifecycle flag.
     // Restore the dashboard's last verified status after the refresh reaches a
     // terminal state so it cannot remain stuck on "Running" beside the idle
     // action button.
-    const stableState = [dashboard?.state, globalState?.state, previousGlobalState?.state]
+    const currentDashboardState = dashboard
+      ? dashboardObservationPresentation(dashboard, observationRecency(dashboard)).state
+      : null;
+    const stableState = [currentDashboardState, globalState?.state, previousGlobalState?.state]
       .find((state) => state && state !== "updating");
     const candidateState = stableState ?? "insufficient";
     setGlobalState(

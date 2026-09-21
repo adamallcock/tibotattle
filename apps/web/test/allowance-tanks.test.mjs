@@ -177,7 +177,10 @@ test("one forecast preserves pace, evidence and early/unknown gates across refre
   assert.equal(h.card.children.length, 0);
 });
 test("the Overview owns current pace independently of historical plan selection", () => {
-  assert.match(declaration("renderDashboard"), /renderQuotaCards\(data\);\s+renderWeeklyPaceForecast\(data\);/u);
+  assert.match(
+    declaration("renderLiveObservationPresentation"),
+    /renderQuotaCards\(presentation\);\s+renderWeeklyPaceForecast\(presentation\);/u,
+  );
   assert.doesNotMatch(declaration("renderWeekly"), /renderWeeklyPaceForecast/u);
   assert.match(declaration("ensureWeeklyPaceForecastCard"), /#quota-cards/u);
   assert.match(declaration("renderDashboardSkeleton"), /forecast.hidden = true; clear\(forecast\)/u);

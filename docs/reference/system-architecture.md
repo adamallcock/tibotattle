@@ -53,6 +53,7 @@ navigation allowlist.
 | `apps/local/` | Loopback HTTP composition, refresh lifecycle, dashboard projections, and fixed relays. | Arbitrary proxying or hosted persistence. |
 | `apps/web/` | Shared dashboard/static public UI and browser localization. | Local filesystem or platform credential access. |
 | `apps/macos/` | Native lifecycle, menus/settings, login item, Keychain broker, updater, and WKWebView policy. | Accounting semantics or hosted authorization. |
+| `apps/electron/` | Cross-platform shell lifecycle, exact preload/IPC bridge, tray popup, settings, updater composition, and automatic-refresh cadence. | Local analysis, provider parsing, or arbitrary renderer commands. |
 | `apps/worker/` | Public website, identity, participant/session/device lifecycle, ingestion, aggregates, admin operations, D1/R2/DO composition. | Local source discovery or private Mac state. |
 | `packages/` | Runtime-neutral accounting, quota, identity, localization, and telemetry public APIs. | App-to-app imports or platform-specific side effects. |
 | `scripts/` and `tools/` | Build, validation, release, migration, and operator entrypoints. | Runtime product dependencies. |
@@ -84,6 +85,21 @@ The WKWebView admits only its current loopback origin, `about:`, and bounded
 blob downloads. Provider identity pages open in the system browser. Native/web
 bridge messages use a closed vocabulary documented in
 [`api-surface.md`](./api-surface.md).
+
+Electron main owns one persisted automatic-refresh cadence timer. After the
+loopback companion accepts a renderer request, the renderer acquires a closed
+`quick` or `detailed` lease through the exact preload and IPC boundary and sends
+a numeric heartbeat every 30 seconds. Main applies a three-minute quick or
+ten-minute detailed missing-heartbeat watchdog plus a non-renewable 243-minute
+operation deadline. Settlement is idempotent for the latest lease; heartbeat
+timeout, absolute deadline and dashboard replacement release an abandoned lease
+and rearm one timer. Main diagnostics project only closed state, booleans,
+mode, age, canonical timestamps and a fixed recovery reason.
+
+Dashboard and tray freshness both derive observation age from
+`latestObservedAt` against the live clock. The serialized age remains transport
+evidence rather than a presentation clock, so an open surface crosses the stale
+boundary and withdraws current allowance/pacing claims without a new payload.
 
 ## Independent model performance diagnostics
 

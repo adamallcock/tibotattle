@@ -1,20 +1,97 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { observationFreshness } from "../public/dashboard-ui.js";
+import {
+  createObservationFreshnessClock,
+  observationFreshness,
+  observationRecency,
+} from "../public/dashboard-ui.js";
 const fresh = { latestObservedAt: "2026-09-13T12:00:00Z", ageSeconds: 60, staleAfterSeconds: 1800 };
 test("observation freshness stays independent of accounting and running jobs", () => {
+  const now = Date.parse(fresh.latestObservedAt) + 60_000;
   for (const state of ["live", "stale", "updating", "insufficient"]) {
-    assert.equal(observationFreshness({ state, freshness: { ...fresh, accountingStatus: "stale" } }), "current");
+    assert.equal(observationFreshness(
+      { state, freshness: { ...fresh, accountingStatus: "stale", ageSeconds: 999_999 } },
+      now,
+    ), "current");
   }
-  assert.equal(observationFreshness({ freshness: { ...fresh, ageSeconds: 1800 } }), "current");
-  assert.equal(observationFreshness({ freshness: { ...fresh, ageSeconds: 1801 } }), "stale");
+  assert.equal(observationFreshness({ freshness: fresh }, Date.parse(fresh.latestObservedAt) + 1_800_000), "current");
+  assert.equal(observationFreshness({ freshness: fresh }, Date.parse(fresh.latestObservedAt) + 1_800_001), "stale");
 });
 test("missing or invalid observation evidence never claims current", () => {
-  for (const replacement of [{ latestObservedAt: null }, { latestObservedAt: "bad" }, { ageSeconds: null }, { ageSeconds: -1 }, { ageSeconds: "60" }, { staleAfterSeconds: undefined }, { staleAfterSeconds: -1 }]) {
-    assert.equal(observationFreshness({ freshness: { ...fresh, ...replacement } }), "unknown");
+  const now = Date.parse(fresh.latestObservedAt) + 60_000;
+  for (const replacement of [{ latestObservedAt: null }, { latestObservedAt: "bad" }, { staleAfterSeconds: undefined }, { staleAfterSeconds: -1 }]) {
+    assert.equal(observationFreshness({ freshness: { ...fresh, ...replacement } }, now), "unknown");
   }
-  assert.equal(observationFreshness(null), "unknown");
-  assert.equal(observationFreshness({ mode: "demo", freshness: fresh }), "demo");
+  assert.equal(observationFreshness({ freshness: fresh }, Number.NaN), "unknown");
+  assert.equal(observationFreshness({ freshness: fresh }, Date.parse(fresh.latestObservedAt) - 1), "unknown");
+  assert.equal(observationFreshness(null, now), "unknown");
+  assert.equal(observationFreshness({ mode: "demo", freshness: fresh }, now), "demo");
+});
+
+test("an open freshness clock crosses the stale boundary without a new payload", () => {
+  let now = Date.parse(fresh.latestObservedAt) + 1_799_000;
+  const timers = [];
+  const cancelled = [];
+  const states = [];
+  const clock = createObservationFreshnessClock({
+    onTick: (recency) => states.push(recency.status),
+    now: () => now,
+    schedule(callback, delay) {
+      const timer = { callback, delay };
+      timers.push(timer);
+      return timer;
+    },
+    cancel: (timer) => cancelled.push(timer),
+  });
+  clock.update({ freshness: fresh });
+  assert.deepEqual(states, ["current"]);
+  assert.equal(timers[0].delay, 1_001);
+
+  now += 1_001;
+  timers.shift().callback();
+  assert.deepEqual(states, ["current", "stale"]);
+  assert.equal(observationRecency({ freshness: fresh }, now).ageSeconds, 1800.001);
+  clock.stop();
+  assert.equal(cancelled.length, 1);
+});
+
+test("dashboard stale transition qualifies allowance and pacing inputs together", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const body = source.slice(
+    source.indexOf("function dashboardObservationPresentation"),
+    source.indexOf("\nfunction renderObservationConnectionState"),
+  );
+  const project = new Function(`${body}; return dashboardObservationPresentation;`)();
+  const input = {
+    state: "live",
+    freshness: { status: "live", latestObservedAt: fresh.latestObservedAt, staleAfterSeconds: 1800 },
+    quotaWindows: [
+      { id: "weekly", status: "live" },
+      { id: "retained", status: "stale" },
+    ],
+  };
+  const output = project(input, {
+    status: "stale",
+    latestObservedAt: "2026-09-13T12:00:00.000Z",
+    ageSeconds: 1800.001,
+    staleAfterSeconds: 1800,
+  });
+  assert.equal(output.state, "stale");
+  assert.equal(output.freshness.status, "stale");
+  assert.deepEqual(output.quotaWindows.map((window) => window.status), ["stale", "stale"]);
+  assert.equal(input.state, "live");
+  assert.equal(input.quotaWindows[0].status, "live");
+
+  const unknown = project(input, {
+    status: "unknown",
+    latestObservedAt: null,
+    ageSeconds: null,
+    staleAfterSeconds: null,
+  });
+  assert.equal(unknown.state, "insufficient");
+  assert.equal(unknown.freshness.status, "insufficient");
+  assert.equal(unknown.quotaWindows[0].status, "stale");
 });
 
 test("quota cards preserve unknown percentages and label stale observations", async () => {

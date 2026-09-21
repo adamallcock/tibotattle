@@ -1425,6 +1425,7 @@ export async function launchDesktopRuntime({
       build: snapshot?.about?.build ?? environment.TIBOTATTLE_BUILD_ID,
       lifecycle: lifecycle?.state,
       settings: snapshot?.settings,
+      refresh: controller?.refreshStatus?.(),
     }));
   }
 
@@ -1810,7 +1811,9 @@ export async function launchDesktopRuntime({
               { sender: event?.sender },
             ) === true;
           }
-          if (action !== "refreshStarted"
+          if (action !== "getRefreshStatus"
+              && action !== "refreshStarted"
+              && action !== "refreshHeartbeat"
               && action !== "refreshSettled"
               && action !== "toggleSidebar") return true;
           return lifecycle?.isAuthorizedDashboardFrame?.(
