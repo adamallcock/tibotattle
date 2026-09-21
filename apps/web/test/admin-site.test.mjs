@@ -312,7 +312,7 @@ async function waitFor(predicate) {
   assert.fail("timed out waiting for the admin view to render");
 }
 
-async function withAdminPage(fetchResponse, check) {
+async function withAdminPage(fetchResponse, check, preferences = {}) {
   const documentRef = fakeDocument();
   const html = await readFile(new URL("../public/admin.html", import.meta.url), "utf8");
   for (const [, id] of html.matchAll(/\bid="([\w-]+)"/gu)) {
@@ -332,6 +332,7 @@ async function withAdminPage(fetchResponse, check) {
   const storedPreferences = new Map([
     ["tibotattle-admin-auto-refresh-minutes-v1", "0"],
   ]);
+  for (const [key, value] of Object.entries(preferences)) storedPreferences.set(key, value);
   const windowListeners = new Map();
   const replacements = {
     document: documentRef,
@@ -762,6 +763,7 @@ test("overview success, failed refresh, and recovery preserve then replace the l
   overview.reconstruction = await fixture("admin-reconstruction-valid.json");
   const recovered = structuredClone(overview);
   recovered.generatedAt = "2026-08-18T12:00:00.000Z";
+  recovered.lifecycle.lastCompletedAt = recovered.generatedAt;
   recovered.counts.contributions.acceptedLast24Hours += 1;
   recovered.reconstruction.observedAt = "2026-09-06T12:05:00.000Z";
   recovered.reconstruction.calculations.completedAccounts += 1;
@@ -778,7 +780,7 @@ test("overview success, failed refresh, and recovery preserve then replace the l
     const lastRefresh = documentRef.byId.get("last-refresh").textContent;
     const preferences = [...storedPreferences];
     assert.equal(documentRef.byId.get("service-state").textContent, "production · operational");
-    assert.equal(documentRef.byId.get("operator-attention-badge").textContent, "No action indicated");
+    assert.equal(documentRef.byId.get("operator-attention-badge").textContent, "Review · 3");
     assert.match(reconstructionText(documentRef), /3 of 8 tracked accounts/u);
 
     await documentRef.byId.get("refresh").listeners.get("click")();
@@ -803,15 +805,15 @@ test("overview success, failed refresh, and recovery preserve then replace the l
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(overviewRequests, 3);
     assert.equal(documentRef.byId.get("service-state").textContent, "production · operational");
-    assert.equal(documentRef.byId.get("operator-attention-badge").textContent, "No action indicated");
+    assert.equal(documentRef.byId.get("operator-attention-badge").textContent, "Review · 3");
     assert.equal(documentRef.byId.get("operator-attention-badge").className,
-      "admin-source-badge admin-source-available");
+      "admin-source-badge admin-source-partial");
     assert.equal(documentRef.byId.get("last-refresh").textContent, formatReportingTime(recovered.generatedAt));
     assert.notEqual(documentRef.byId.get("last-refresh").textContent, lastRefresh);
     assert.deepEqual(metricTexts(documentRef, "counts").find(([label]) => label === "Accepted uploads last 24h"),
       ["Accepted uploads last 24h", "6", "14 in the last 7 days"]);
     assert.equal(documentRef.byId.get("notice").hidden, true);
-    assert.equal(documentRef.title, "TiboTattle operations");
+    assert.equal(documentRef.title, "• TiboTattle operations");
     assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Resumable calculation");
     assert.doesNotMatch(documentRef.byId.get("admin-reconstruction-progress").className, /stale/u);
     assert.match(reconstructionText(documentRef), /4 of 8 tracked accounts/u);
@@ -834,12 +836,12 @@ test("an independent allowance-preview failure does not mark a successful overvi
       && documentRef.byId.get("growth-status").textContent === "History unavailable");
     assert.deepEqual(requests, ADMIN_READ_PATHS);
     assert.equal(documentRef.byId.get("service-state").textContent, "production · operational");
-    assert.equal(documentRef.byId.get("operator-attention-badge").textContent, "No action indicated");
+    assert.equal(documentRef.byId.get("operator-attention-badge").textContent, "Review · 3");
     assert.equal(documentRef.byId.get("operator-attention-badge").className,
-      "admin-source-badge admin-source-available");
+      "admin-source-badge admin-source-partial");
     assert.equal(documentRef.byId.get("notice").hidden, true);
     assert.equal(documentRef.byId.get("last-refresh").textContent, formatReportingTime(overview.generatedAt));
-    assert.equal(documentRef.title, "TiboTattle operations");
+    assert.equal(documentRef.title, "• TiboTattle operations");
     assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Resumable calculation");
     assert.match(reconstructionText(documentRef), /3 of 8 tracked accounts/u);
     assert.equal(documentRef.byId.get("admin-reconstruction-progress").hidden, false);
@@ -999,6 +1001,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
         activeSourceAddresses: null,
         preflight: null,
         sparkleChecks: null,
+        electronChecks: null,
         sparkleDownloads: null,
         currentVersion: null,
         currentVersionSourceAddresses: null,
@@ -1059,10 +1062,11 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     },
   };
   const typedOverview = structuredClone(overview);
-  typedOverview.schemaVersion = "admin-overview-v0.4";
+  typedOverview.schemaVersion = "admin-overview-v0.5";
   typedOverview.service.telemetryStorageMode = "typed";
   typedOverview.snapshots = [];
   typedOverview.pendingHistoricalRebuilds = null;
+  typedOverview.pendingHistoricalRebuildsBounded = null;
   typedOverview.historicalPublication = {
     publishedDays: 69,
     publishedDaysBounded: false,
@@ -1109,23 +1113,27 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     const snapshot = overview.snapshots[0];
     assert.deepEqual(tableTexts(documentRef, "snapshot-rows"), [[
       snapshot.snapshotId,
-      `${snapshot.weekStart} → ${snapshot.weekEnd}`,
+      `${snapshot.weekStart.slice(0, 10)} → ${snapshot.weekEnd.slice(0, 10)}`,
       snapshot.releaseState,
       formatReportingTime(snapshot.releasedAt),
     ]]);
 
     assert.deepEqual(tableTexts(documentRef, "distribution-version-rows"), [
-      ["0.1.12", "66%", "19", "64"],
-      ["0.1.11", "17%", "5", "9"],
+      ["Native", "macOS", "0.1.12", "66%", "19", "64"],
+      ["Electron", "macOS", "0.1.23", "24%", "7", "12"],
+      ["Native", "macOS", "0.1.11", "17%", "5", "9"],
+      ["Electron", "Windows", "0.1.23", "14%", "4", "8"],
+      ["Electron", "Linux", "Unknown", "7%", "2", "3"],
     ]);
     assert.deepEqual(
       metricTexts(documentRef, "distribution-counts"),
       [
-        ["Active-install proxy", "19", "29 distinct source addresses in 7 days"],
-        ["App preflight call-ins", "22", "16 addresses · 78 requests/7d"],
-        ["Sparkle update checks", "14", "13 addresses · 40 checks/7d"],
-        ["Sparkle artifact fetches", "3", "3 addresses · 3 fetches/7d"],
-        ["Current-version reach", "18", "v0.1.12 · 19 addresses/7d"],
+        ["Active-install proxy", "19", "Last 24h above · 29 distinct source addresses/7d"],
+        ["App preflight call-ins", "22", "Last 24h above · 16 addresses · 78 requests/7d"],
+        ["Sparkle update checks", "14", "Last 24h above · 13 addresses · 40 checks/7d"],
+        ["Electron update checks", "11", "Last 24h above · 9 addresses · 23 checks/7d"],
+        ["Sparkle artifact fetches", "3", "Last 24h above · 3 addresses · 3 fetches/7d"],
+        ["Latest GitHub tag match", "18", "v0.1.12 · last 24h above · 19 addresses/7d"],
         ["GitHub DMG downloads", "110", "2 releases · 2 DMG assets · all time"],
         ["GitHub DMG downloads since prior snapshot", "6", `${formatReportingTime("2026-08-16T12:00:00.000Z")} → ${formatReportingTime("2026-08-17T12:00:00.000Z")}`],
       ],
@@ -1163,7 +1171,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
         .map((node) => node.textContent),
       [
         "No current action is indicated by this snapshot",
-        "Collection is operational, no reconciliation or rebuild work is due, first-party activity evidence is available, and no sampled 5xx event was retained in the last 24 hours.",
+        "Collection is operational, no reconciliation or rebuild work is due, first-party activity evidence is available, and no sampled 5xx group has a retained event in the last 24 hours. This is not an uptime or end-to-end readiness check.",
       ],
     );
     assert.equal(
@@ -1481,7 +1489,8 @@ test("admin refresh preserves the exact allowance DOM on transport failures and 
       await documentRef.byId.get("refresh").listeners.get("click")();
       await new Promise(resolve => setImmediate(resolve));
       assert.equal(previewRequests, ++expectedRequests);
-      assert.equal(badge.textContent, "Admin preview available");
+      assert.equal(badge.textContent, "Refresh failed · previous preview");
+      assert.match(documentRef.byId.get("admin-community-freshness").textContent, /Refresh failed/u);
       assert.equal(container.querySelector('svg[role="img"]'), graph);
       assert.deepEqual(container.children, children);
       assert.equal(documentRef.activeElement, focused);
@@ -1731,6 +1740,217 @@ test("rendered admin charts size their coordinate system to the container instea
       selectAllowanceControl(documentRef, "admin-community-mode-controls", `button[data-allowance-mode="${mode}"]`);
       assert.equal(container.querySelector('svg[role="img"]').getAttribute("viewBox"), `0 0 ${expectedWidth} 300`);
       assert.ok(container.querySelectorAll(".chart-axis-label").length > 0);
+    }
+  });
+});
+
+function allText(node) {
+  return descendantNodes(node).map(item => item.textContent).filter(Boolean).join(" ");
+}
+
+async function healthyAdminRead(path, overview) {
+  if (path === ADMIN_READ_PATHS[0]) return response(overview);
+  if (path === ADMIN_READ_PATHS[1]) return response(createAdminAllowancePreviewPayload());
+  if (path === ADMIN_READ_PATHS[2]) return response(metricsHistoryPayload());
+  assert.equal(path, ADMIN_READ_PATHS[3]);
+  return response(await fixture("admin-reconstruction-progress-valid.json"));
+}
+
+test("attention cannot give all-clear until independent sources recover", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  let failed = true;
+  await withAdminPage(async path => failed && path !== ADMIN_READ_PATHS[0]
+    ? unavailableResponse() : healthyAdminRead(path, overview), async documentRef => {
+    await waitFor(() => documentRef.byId.get("operator-attention-badge").textContent === "Review · 3");
+    const attention = allText(documentRef.byId.get("operator-attention"));
+    assert.match(attention, /Growth history: unavailable/u);
+    assert.match(attention, /Allowance preview: unavailable/u);
+    assert.match(attention, /Graph reconstruction progress: unavailable/u);
+    failed = false;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => documentRef.byId.get("operator-attention-badge").textContent === "No action indicated");
+    assert.match(documentRef.byId.get("admin-community-freshness").textContent, /Calculated/u);
+  });
+});
+
+test("maintenance freshness, restore replay, ingress saturation and sampled error groups reach attention", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  overview.lifecycle.lastCompletedAt = "2026-08-17T09:00:00.000Z";
+  overview.lifecycle.restoreReplayComplete = false;
+  overview.ingress.availableStartTokens = 0;
+  overview.errors.recentDiagnostics = [];
+  overview.errors.groups[0].latestAt = "2026-08-17T11:30:00.000Z";
+  overview.distribution.cloudflare.bounded = true;
+  overview.distribution.cloudflare.observedVersionsBounded = true;
+  await withAdminPage(async path => healthyAdminRead(path, overview), async documentRef => {
+    await waitFor(() => allText(documentRef.byId.get("operator-attention")).includes("Sampled server failures recorded"));
+    const attention = allText(documentRef.byId.get("operator-attention"));
+    for (const text of ["Maintenance observation needs a refresh", "Maintenance readiness is incomplete",
+      "Upload admission is at capacity", "App activity evidence has coverage limits",
+      "Sampled server failures recorded in the last 24 hours"]) assert.ok(attention.includes(text), text);
+    assert.match(attention, /bounded sample, not a full error rate/u);
+    assert.equal(documentRef.byId.get("distribution-status").textContent, "Available · review source limits");
+    assert.match(documentRef.byId.get("distribution-version-coverage").textContent, /Version list capped/u);
+  });
+});
+
+test("collection drafts survive refresh and a conflicting revision requires discard", async () => {
+  let overview = await fixture("admin-overview-valid.json");
+  await withAdminPage(async path => healthyAdminRead(path, overview), async documentRef => {
+    await waitFor(() => !documentRef.byId.get("controls-fields").disabled);
+    const processing = documentRef.querySelector('input[name="processing"]');
+    processing.checked = false;
+    documentRef.byId.get("controls-form").listeners.get("change")();
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.equal(processing.checked, false);
+    assert.equal(documentRef.byId.get("save-controls").disabled, false);
+    assert.match(documentRef.byId.get("controls-status").textContent, /Unsaved changes based on revision 7/u);
+    overview = structuredClone(overview);
+    overview.collection.revision = 8;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.equal(processing.checked, false);
+    assert.equal(documentRef.byId.get("save-controls").disabled, true);
+    assert.match(documentRef.byId.get("controls-status").textContent, /Service controls changed/u);
+    documentRef.byId.get("discard-controls").listeners.get("click")();
+    assert.equal(processing.checked, true);
+    assert.match(documentRef.byId.get("controls-status").textContent, /Current revision 8/u);
+  });
+});
+
+test("saving captures enabled form fields before disabling controls and preserves the draft revision", async () => {
+  let overview = await fixture("admin-overview-valid.json");
+  let posted;
+  await withAdminPage(async (path, init) => {
+    if (init.method === "POST") {
+      posted = JSON.parse(init.body);
+      overview = structuredClone(overview);
+      overview.collection = { ...overview.collection, revision: 8, processing: false, state: "degraded" };
+      return response({ schemaVersion: "admin-action-v0.1", action: "set_collection_controls", collection: overview.collection });
+    }
+    return healthyAdminRead(path, overview);
+  }, async documentRef => {
+    const original = globalThis.FormData;
+    globalThis.FormData = class {
+      constructor() { assert.equal(documentRef.byId.get("controls-fields").disabled, false); }
+      get(name) { return name === "reasonCode" ? "maintenance" : documentRef.querySelector(`input[name="${name}"]`).checked ? "on" : null; }
+    };
+    try {
+      documentRef.querySelector('input[name="processing"]').checked = false;
+      documentRef.byId.get("controls-form").listeners.get("change")();
+      await documentRef.byId.get("controls-form").listeners.get("submit")({ preventDefault() {}, currentTarget: documentRef.byId.get("controls-form") });
+      assert.deepEqual(posted, { action: "set_collection_controls", expectedRevision: 7, enrollment: true, uploadRegistration: true, processing: false, publication: true, reasonCode: "maintenance" });
+      assert.equal(documentRef.byId.get("notice").textContent, "Collection state saved and audited.");
+      assert.equal(documentRef.byId.get("save-controls").disabled, true);
+    } finally { globalThis.FormData = original; }
+  });
+});
+
+test("maintenance incomplete and already-running responses do not claim completion", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  let code = "MAINTENANCE_INCOMPLETE";
+  await withAdminPage(async (path, init) => init.method === "POST"
+    ? response({ schemaVersion: "admin-action-v0.1", action: "run_maintenance", result: { code } })
+    : healthyAdminRead(path, overview), async documentRef => {
+    const run = documentRef.byId.get("run-maintenance").listeners.get("click");
+    await run();
+    assert.match(documentRef.byId.get("maintenance-result").textContent, /^Follow-up needed:/u);
+    code = "MAINTENANCE_IN_PROGRESS";
+    await run();
+    assert.match(documentRef.byId.get("maintenance-result").textContent, /^Already running:/u);
+    code = "OK";
+    await run();
+    assert.match(documentRef.byId.get("maintenance-result").textContent, /^Completed:/u);
+  });
+});
+
+test("unavailable overview prevents actions and transient history failures are visibly stale", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  let unavailable = false;
+  const writes = [];
+  await withAdminPage(async (path, init) => {
+    if (init.method === "POST") writes.push(path);
+    return unavailable ? unavailableResponse() : healthyAdminRead(path, overview);
+  }, async documentRef => {
+    await waitFor(() => documentRef.byId.get("operator-attention-badge").textContent === "No action indicated");
+    const graph = documentRef.byId.get("growth-cards").children[0];
+    unavailable = true;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.equal(documentRef.byId.get("growth-cards").children[0], graph);
+    assert.match(documentRef.byId.get("growth-status").textContent, /Refresh failed · history through/u);
+    for (const id of ["controls-fields", "save-controls", "run-maintenance", "sync-distribution"]) assert.equal(documentRef.byId.get(id).disabled, true, id);
+    await documentRef.byId.get("run-maintenance").listeners.get("click")();
+    assert.deepEqual(writes, []);
+    assert.equal(documentRef.byId.get("operator-attention-badge").textContent, "Stale · refresh unavailable");
+  });
+});
+
+test("healthy initial loading does not send desktop notifications before independent reads settle", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const progress = await fixture("admin-reconstruction-progress-valid.json");
+  const delivered = [];
+  const original = Object.getOwnPropertyDescriptor(globalThis, "Notification");
+  class TestNotification { static permission = "granted"; constructor(title) { delivered.push(title); } }
+  Object.defineProperty(globalThis, "Notification", { configurable: true, value: TestNotification });
+  let finishProgress;
+  try {
+    await withAdminPage(async path => path === ADMIN_READ_PATHS[3]
+      ? new Promise(resolve => { finishProgress = resolve; })
+      : healthyAdminRead(path, overview), async documentRef => {
+      assert.match(allText(documentRef.byId.get("operator-attention")), /waiting for evidence/u);
+      assert.deepEqual(delivered, []);
+      finishProgress(response(progress));
+      await waitFor(() => documentRef.byId.get("operator-attention-badge").textContent === "No action indicated");
+      assert.deepEqual(delivered, []);
+    }, { "tibotattle-admin-notifications-v2": JSON.stringify({ enabled: true, topics: ["collection", "maintenance", "evidence", "failures"], repeatMinutes: 0 }) });
+  } finally {
+    if (original) Object.defineProperty(globalThis, "Notification", original);
+    else delete globalThis.Notification;
+  }
+});
+
+test("weekly queue bounds and old successful evidence stay explicit", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  overview.generatedAt = "2026-09-21T12:00:00.000Z";
+  overview.lifecycle.lastCompletedAt = overview.generatedAt;
+  overview.pendingHistoricalRebuilds = 10000;
+  overview.pendingHistoricalRebuildsBounded = true;
+  await withAdminPage(path => healthyAdminRead(path, overview), async documentRef => {
+    await waitFor(() => allText(documentRef.byId.get("operator-attention")).includes("Growth history: older than 24 hours"));
+    assert.match(allText(documentRef.byId.get("operator-attention")), /10000\+ publication rebuilds are queued/u);
+    assert.ok(statusTexts(documentRef, "lifecycle-status").some(([label, value]) => label === "Weekly rebuild queue: " && value === "10000+"));
+    assert.equal(documentRef.byId.get("growth-cards").children.length, 8);
+  });
+});
+
+test("owner refusal clears the allowance timestamp as well as the graph", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  let refused = false;
+  await withAdminPage(async path => refused
+    ? { ok: false, status: 403, json: async () => ({ error: { code: "FORBIDDEN" } }) }
+    : healthyAdminRead(path, overview), async documentRef => {
+    assert.match(documentRef.byId.get("admin-community-freshness").textContent, /Calculated/u);
+    refused = true;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.equal(documentRef.byId.get("admin-community-freshness").textContent, "No usable allowance preview loaded.");
+    assert.equal(documentRef.byId.get("run-maintenance").disabled, true);
+  });
+});
+
+test("plan-switch cohorts retain known totals and first snapshots have no comparison", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const history = metricsHistoryPayload();
+  history.gauges.snapshots = [{ capturedAt: history.generatedAt, metrics: { bandParticipantCount: 3, cohortParticipants_pro: 3, cohortMedianUsd_plus: 250 } }];
+  history.downloads = { available: true, byDayStartsAt: "2026-08-09", byDay: [{ day: "2026-09-07", cumulativeDmgDownloads: 10, deltaDmgDownloads: 0 }] };
+  await withAdminPage(async path => path === ADMIN_READ_PATHS[2] ? response(history) : healthyAdminRead(path, overview), async documentRef => {
+    const cards = documentRef.byId.get("growth-cards").children;
+    const cohort = cards.find(card => allText(card).includes("Plan cohorts"));
+    assert.equal(cohort.children[1].textContent, "3");
+    assert.match(allText(cohort), /0 on plan · ~\$250\/window/u);
+    assert.match(allText(cohort), /3 on plan/u);
+    for (const label of ["DMG downloads", "Published band cohort"]) {
+      const card = cards.find(item => item.children[0].children[0].textContent === label);
+      assert.match(allText(card), /Comparison unavailable/u);
+      assert.doesNotMatch(allText(card), /0 last 24h/u);
     }
   });
 });

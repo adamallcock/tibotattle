@@ -3,10 +3,7 @@ import {
   expandAdminModelHistoryDay,
 } from "./telemetry-shared.generated.js";
 
-const ADMIN_OVERVIEW_SCHEMA_VERSIONS = new Set([
-  "admin-overview-v0.3",
-  "admin-overview-v0.4",
-]);
+const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.5";
 const ADMIN_RECONSTRUCTION_SCHEMA_VERSION = "admin-reconstruction-progress-v0.1";
 const ADMIN_RECONSTRUCTION_STATUSES = new Set(["available", "unavailable"]);
 const ADMIN_RECONSTRUCTION_MODES = new Set([
@@ -66,6 +63,8 @@ const DISTRIBUTION_SOURCE_STATUSES = new Set([
   "not_configured",
   "unavailable",
 ]);
+const DISTRIBUTION_CLIENTS = new Set(["native", "electron"]);
+const DISTRIBUTION_OPERATING_SYSTEMS = new Set(["macos", "windows", "linux"]);
 const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{2,79}$/u;
 const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
@@ -1046,7 +1045,17 @@ function projectDistribution(value) {
   ).map((value) => {
     const version = record(value, "ADMIN_OVERVIEW_INVALID");
     return Object.freeze({
-      version: string(version.version, "ADMIN_OVERVIEW_INVALID"),
+      client: enumValue(
+        version.client,
+        DISTRIBUTION_CLIENTS,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      operatingSystem: enumValue(
+        version.operatingSystem,
+        DISTRIBUTION_OPERATING_SYSTEMS,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      version: nullableString(version.version, "ADMIN_OVERVIEW_INVALID"),
       requestsLast7Days: count(
         version.requestsLast7Days,
         "ADMIN_OVERVIEW_INVALID",
@@ -1078,6 +1087,10 @@ function projectDistribution(value) {
         segment.sparkleCheckRequests,
         "ADMIN_OVERVIEW_INVALID",
       ),
+      electronCheckRequests: count(
+        segment.electronCheckRequests,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
       sparkleDownloadRequests: count(
         segment.sparkleDownloadRequests,
         "ADMIN_OVERVIEW_INVALID",
@@ -1099,6 +1112,7 @@ function projectDistribution(value) {
   let activeSourceAddresses = null;
   let preflight = null;
   let sparkleChecks = null;
+  let electronChecks = null;
   let sparkleDownloads = null;
   if (cloudflareStatus === "available") {
     if (cloudflare.reasonCode !== null
@@ -1112,11 +1126,13 @@ function projectDistribution(value) {
     );
     preflight = projectDistributionRequests(cloudflare.preflight);
     sparkleChecks = projectDistributionRequests(cloudflare.sparkleChecks);
+    electronChecks = projectDistributionRequests(cloudflare.electronChecks);
     sparkleDownloads = projectDistributionRequests(cloudflare.sparkleDownloads);
   } else if (cloudflare.window !== null
       || cloudflare.activeSourceAddresses !== null
       || cloudflare.preflight !== null
       || cloudflare.sparkleChecks !== null
+      || cloudflare.electronChecks !== null
       || cloudflare.sparkleDownloads !== null
       || cloudflare.sampled !== null
       || cloudflare.bounded !== null
@@ -1347,6 +1363,7 @@ function projectDistribution(value) {
       activeSourceAddresses,
       preflight,
       sparkleChecks,
+      electronChecks,
       sparkleDownloads,
       currentVersion,
       currentVersionSourceAddresses,
@@ -1383,6 +1400,7 @@ function projectLifecycle(value) {
       lifecycle.restoreReplayComplete,
       "ADMIN_OVERVIEW_INVALID",
     ),
+    lastCompletedAt: nullableString(lifecycle.lastCompletedAt ?? null, "ADMIN_OVERVIEW_INVALID"),
     maintenanceRunAt: nullableString(
       lifecycle.maintenanceRunAt,
       "ADMIN_OVERVIEW_INVALID",
@@ -1624,12 +1642,13 @@ function projectErrors(value) {
  */
 export function projectAdminOverview(value) {
   const overview = record(value, "ADMIN_OVERVIEW_INVALID");
-  if (!ADMIN_OVERVIEW_SCHEMA_VERSIONS.has(overview.schemaVersion)) {
+  if (overview.schemaVersion !== ADMIN_OVERVIEW_SCHEMA_VERSION) {
     invalid("ADMIN_OVERVIEW_INVALID");
   }
-  const typed = overview.schemaVersion === "admin-overview-v0.4";
   const service = record(overview.service, "ADMIN_OVERVIEW_INVALID");
-  if (typed && service.telemetryStorageMode !== "typed") {
+  const storageMode = enumValue(service.telemetryStorageMode, new Set(["json", "typed"]), "ADMIN_OVERVIEW_INVALID");
+  const typed = storageMode === "typed";
+  if (!typed && overview.historicalPublication !== null) {
     invalid("ADMIN_OVERVIEW_INVALID");
   }
   const snapshots = array(overview.snapshots, "ADMIN_OVERVIEW_INVALID").map((value) => {
@@ -1677,6 +1696,9 @@ export function projectAdminOverview(value) {
     distribution: projectDistribution(overview.distribution),
     snapshots: Object.freeze(snapshots),
     dailyPublication: projectDailyPublication(overview.dailyPublication),
+    pendingHistoricalRebuildsBounded: typed
+      ? overview.pendingHistoricalRebuildsBounded === null ? null : invalid("ADMIN_OVERVIEW_INVALID")
+      : boolean(overview.pendingHistoricalRebuildsBounded, "ADMIN_OVERVIEW_INVALID"),
     pendingHistoricalRebuilds: typed
       ? overview.pendingHistoricalRebuilds === null
         ? null

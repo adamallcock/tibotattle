@@ -699,7 +699,7 @@ export async function readAdminOverview(
     || boundedCount(incrementalChunks).bounded;
   const contributions = typed?.contributions;
   return {
-    schemaVersion: typed ? "admin-overview-v0.4" : "admin-overview-v0.3",
+    schemaVersion: "admin-overview-v0.5",
     generatedAt: now,
     service: {
       environment: options.environment,

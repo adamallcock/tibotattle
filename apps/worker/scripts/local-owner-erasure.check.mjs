@@ -179,6 +179,9 @@ test("owner overview accepts legacy v0.3 and validates the typed v0.4 extension"
     service: { environment: "local-development" },
   }));
   assert.doesNotThrow(() => assertLocalOwnerOverview(typed));
+  assert.doesNotThrow(() => assertLocalOwnerOverview({ ...typed, schemaVersion: "admin-overview-v0.5" }));
+  assert.doesNotThrow(() => assertLocalOwnerOverview({ schemaVersion: "admin-overview-v0.5", service: { telemetryStorageMode: "json" } }));
+  assert.throws(() => assertLocalOwnerOverview({ schemaVersion: "admin-overview-v0.5", service: { telemetryStorageMode: "unknown" } }), hasCode("LOCAL_OWNER_NOT_AUTHORIZED"));
   for (const invalid of [
     { ...typed, service: { ...typed.service, telemetryStorageMode: "json" } },
     { ...typed, pendingHistoricalRebuilds: 0 },

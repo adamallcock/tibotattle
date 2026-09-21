@@ -95,7 +95,12 @@ function packagedUpdater({
   clearIntervalImpl,
   distributionMetadata = metadata(),
 } = {}) {
-  const app = { isPackaged: true, quitCalls: 0, quit() { this.quitCalls += 1; } };
+  const app = {
+    isPackaged: true,
+    quitCalls: 0,
+    getVersion: () => "0.1.18",
+    quit() { this.quitCalls += 1; },
+  };
   return {
     app,
     autoUpdater,
@@ -188,6 +193,9 @@ test("packaged updater configures the real EventEmitter adapter and performs one
   assert.equal(autoUpdater.autoInstallOnAppQuit, false);
   assert.equal(autoUpdater.allowPrerelease, false);
   assert.equal(autoUpdater.allowDowngrade, false);
+  assert.deepEqual(autoUpdater.requestHeaders, {
+    "User-Agent": "TiboTattle/0.1.18 electron-updater",
+  });
   assert.equal(typeof autoUpdater.setFeedURL, "undefined");
   await nextTurn();
   assert.equal(autoUpdater.checks, 1);
@@ -210,6 +218,9 @@ test("packaged rehearsal updater enables prerelease ordering without accepting f
   assert.equal(autoUpdater.allowPrerelease, true);
   assert.equal(autoUpdater.allowDowngrade, false);
   assert.equal(autoUpdater.autoDownload, false);
+  assert.deepEqual(autoUpdater.requestHeaders, {
+    "User-Agent": `TiboTattle/${REHEARSAL_CURRENT_VERSION} electron-updater`,
+  });
   assert.equal(updater.getStatus().automaticDownload, false);
   assert.equal(updater.getStatus().automaticDownloadAvailable, false);
   assert.equal(typeof autoUpdater.setFeedURL, "undefined");

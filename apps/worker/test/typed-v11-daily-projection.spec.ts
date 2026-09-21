@@ -194,7 +194,7 @@ describe("typed accountless upload to isolated projection", () => {
         sourceId, sourceNamespace: namespace },
     }) as Record<string, any>;
     expect(overview).toMatchObject({
-      schemaVersion: "admin-overview-v0.4",
+      schemaVersion: "admin-overview-v0.5",
       service: { telemetryStorageMode: "typed" },
       counts: { contributions: {
         contributingAccounts: { total: 1, bounded: false },

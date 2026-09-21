@@ -74,11 +74,14 @@ function validDay(value) {
 
 /** The erasure harness needs only proof that owner access reached a recognized
  * local Admin contract. Keep v0.3 compatibility; v0.4 must carry its typed
- * storage marker and exact unavailable/publication extension. */
+ * storage marker and exact unavailable/publication extension. v0.5 uses an
+ * explicit storage mode for the expanded distribution contract. */
 export function assertLocalOwnerOverview(value) {
   if (value?.schemaVersion === "admin-overview-v0.3") return;
+  const current = value?.schemaVersion === "admin-overview-v0.5";
+  if (current && value?.service?.telemetryStorageMode === "json") return;
   const historical = value?.historicalPublication;
-  if (value?.schemaVersion !== "admin-overview-v0.4"
+  if ((!current && value?.schemaVersion !== "admin-overview-v0.4")
       || value?.service?.telemetryStorageMode !== "typed"
       || value.pendingHistoricalRebuilds !== null
       || value.pendingHistoricalRebuildsBounded !== null
