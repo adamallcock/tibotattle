@@ -97,6 +97,14 @@ sources across accounts, independently of account-scoped accounting.
 The worker starts on a timing-page read and stops after a 60-second idle lease.
 It scans plain session/archive JSONL in bounded, checkpointed passes and stores
 one aggregate per turn in an owner-only, capped version-2 timing database.
+A version-3 supplement under `inference-timing-v2/tool-free-v1/` independently
+backfills single-response turns without tools, using the original sidecar's
+private correlation key. Its own cursor and pending state do not change original
+measurements or checkpoints. Joins require matching turn identity and original
+scalar evidence. The schema-3/method-4 display contract adds separately binned
+full-turn throughput, including initial waiting, while preserving speed and TTFT.
+If the supplement cannot open or be read, the worker still serves the original
+measurements with an explicit stale state.
 Neither timing data nor failures enter accounting or contribution; no network
 service is involved. Incompatible storage is preserved and refused. See the
 [privacy inventory](./local-data-and-privacy.md#model-performance-timing-in-development-source)

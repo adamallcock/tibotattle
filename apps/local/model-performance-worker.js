@@ -12,7 +12,7 @@ import { createModelPerformanceContext } from '../../src/application/index.js';
 async function run() {
   const context = createModelPerformanceContext({ openStore: openTimingStore });
   const abort = new AbortController();
-  let timer, store, files = null, cursor = 0, discoveryAt = 0, stopped = false, degraded = false, passFailed = false;
+  let timer, store, supplement, files = null, cursor = 0, discoveryAt = 0, stopped = false, degraded = false, passFailed = false;
   const windows = new Map();
   let windowsChanged = false;
   const stop = () => { stopped = true; clearTimeout(timer); abort.abort(); };
@@ -48,7 +48,10 @@ async function run() {
   }
   let lastPublished = 0, lastCollecting = null;
   function publish(collecting) {
-    const rows = readTimingRows(store), now = Date.now();
+    let rows;
+    try { rows = readTimingRows(store, { supplement }); }
+    catch { degraded = true; passFailed = true; rows = readTimingRows(store); }
+    const now = Date.now();
     lastPublished = now; lastCollecting = collecting; windowsChanged = false;
     parentPort.postMessage({ type: 'snapshots', values: [
       ...['1', '7', '30', 'all'].map(period => ({ period, end: now })), ...windows.values(),
@@ -62,17 +65,31 @@ async function run() {
   try {
     store = await context.open(workerData.directory);
     publish(true);
+    // Additive, independently checkpointed backfill. Failure leaves all original
+    // saved measurements usable. The original store/schema is never converted.
+    try { supplement = await context.openSupplement(join(workerData.directory, 'tool-free-v1'), store.key); }
+    catch { degraded = true; }
     while (!stopped) {
       try {
         if (files === null || (cursor >= files.length && Date.now() - discoveryAt >= 60_000)) {
-          files = await discover(); cursor = 0; discoveryAt = Date.now(); passFailed = false;
+          files = await discover(); cursor = 0; discoveryAt = Date.now(); passFailed = !supplement;
         }
         const started = performance.now(); let bytes = 0;
         while (!stopped && cursor < files.length && bytes < 32 * 1024 ** 2 && performance.now() - started < 750) {
           try {
-            const result = await ingestTimingFile(store, files[cursor].path, { maxBytes: 4 * 1024 ** 2, signal: abort.signal });
-            bytes += result.bytes;
-            if (!result.remaining || result.unchanged || (result.partial && result.bytes < 4 * 1024 ** 2)) cursor++;
+            let done = true;
+            // Two 2-MiB chunks preserve the original total 4-MiB slice budget.
+            for (const target of [store, supplement].filter(Boolean)) {
+              try {
+                const result = await ingestTimingFile(target, files[cursor].path, { maxBytes: 2 * 1024 ** 2, signal: abort.signal });
+                bytes += result.bytes;
+                if (result.remaining && !result.unchanged && !(result.partial && result.bytes < 2 * 1024 ** 2)) done = false;
+              } catch (e) {
+                if (stopped) break;
+                bytes += e.attemptedBytes ?? 0; degraded = true; passFailed = true;
+              }
+            }
+            if (done) cursor++;
           } catch (e) {
             if (stopped) break;
             bytes += e.attemptedBytes ?? 0; cursor++; degraded = true; passFailed = true;
@@ -94,6 +111,6 @@ async function run() {
       });
     }
   } catch { parentPort.postMessage({ type: 'unavailable' }); }
-  finally { store?.close(); parentPort.close(); }
+  finally { try { supplement?.close(); } finally { store?.close(); parentPort.close(); } }
 }
 if (!isMainThread && workerData?.modelPerformance === true) void run();

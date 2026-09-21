@@ -9,7 +9,7 @@ export function createModelPerformanceController({ directory, codexHome,
   const cache = new Map();
   const windows = new Map();
   let worker = null, idle = null, closed = false, failedAt = 0, stopping = null;
-  const empty = (period, status) => ({ schemaVersion: 2, method: 3, status, collecting: false, stale: false,
+  const empty = (period, status) => ({ schemaVersion: 3, method: 4, status, collecting: false, stale: false,
     updatedAt: null, period, interval: 'day', start: null, end: Date.now(), historyProgress: null, models: [] });
   function fail() {
     failedAt = Date.now();
