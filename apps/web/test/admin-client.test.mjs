@@ -676,6 +676,7 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
     },
     lifecycle: {
       state: "completed",
+      lastCompletedAt: "2026-08-17T11:59:00.000Z",
       quarantineRetentionComplete: true,
       restoreReplayComplete: true,
       maintenanceRunAt: "2026-08-17T11:59:00.000Z",
@@ -725,6 +726,10 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
           requests: { last24Hours: 14, last7Days: 40 },
           sourceAddresses: { last24Hours: 13, last7Days: 21 },
         },
+        electronChecks: {
+          requests: { last24Hours: 11, last7Days: 23 },
+          sourceAddresses: { last24Hours: 9, last7Days: 13 },
+        },
         sparkleDownloads: {
           requests: { last24Hours: 3, last7Days: 3 },
           sourceAddresses: { last24Hours: 3, last7Days: 3 },
@@ -732,13 +737,35 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
         currentVersion: "0.1.12",
         currentVersionSourceAddresses: { last24Hours: 18, last7Days: 19 },
         observedVersions: [{
+          client: "native",
+          operatingSystem: "macos",
           version: "0.1.12",
           requestsLast7Days: 64,
           sourceAddressesLast7Days: 19,
         }, {
+          client: "electron",
+          operatingSystem: "macos",
+          version: "0.1.23",
+          requestsLast7Days: 12,
+          sourceAddressesLast7Days: 7,
+        }, {
+          client: "native",
+          operatingSystem: "macos",
           version: "0.1.11",
           requestsLast7Days: 9,
           sourceAddressesLast7Days: 5,
+        }, {
+          client: "electron",
+          operatingSystem: "windows",
+          version: "0.1.23",
+          requestsLast7Days: 8,
+          sourceAddressesLast7Days: 4,
+        }, {
+          client: "electron",
+          operatingSystem: "linux",
+          version: null,
+          requestsLast7Days: 3,
+          sourceAddressesLast7Days: 2,
         }],
         bySegment: [],
         observedVersionsBounded: false,
@@ -808,6 +835,7 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
       pendingRebuilds: 0,
       pendingRebuildsBounded: false,
     },
+    pendingHistoricalRebuildsBounded: false,
     pendingHistoricalRebuilds: 0,
     historicalPublication: null,
     errors: {
@@ -844,10 +872,11 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
 
 test("typed admin overview projects target publication evidence without a legacy queue zero", async () => {
   const payload = await fixture("admin-overview-valid.json");
-  payload.schemaVersion = "admin-overview-v0.4";
+  payload.schemaVersion = "admin-overview-v0.5";
   payload.service.telemetryStorageMode = "typed";
   payload.snapshots = [];
   payload.pendingHistoricalRebuilds = null;
+  payload.pendingHistoricalRebuildsBounded = null;
   payload.historicalPublication = {
     publishedDays: 69,
     publishedDaysBounded: false,
@@ -1076,6 +1105,7 @@ test("distribution sources may degrade without invalidating exact D1 counts", as
     activeSourceAddresses: null,
     preflight: null,
     sparkleChecks: null,
+    electronChecks: null,
     sparkleDownloads: null,
     currentVersion: null,
     currentVersionSourceAddresses: null,
@@ -1097,6 +1127,7 @@ test("Cloudflare activity stays available when GitHub has no current release", a
     activeSourceAddresses: 19,
     preflightRequests: 22,
     sparkleCheckRequests: 14,
+    electronCheckRequests: 11,
     sparkleDownloadRequests: 3,
     currentVersionSourceAddresses: null,
   }];
@@ -1140,11 +1171,29 @@ test("distribution segments agree with current-version availability", async () =
     activeSourceAddresses: 19,
     preflightRequests: 22,
     sparkleCheckRequests: 14,
+    electronCheckRequests: 11,
     sparkleDownloadRequests: 3,
     currentVersionSourceAddresses: null,
   }];
   assert.throws(
     () => projectAdminOverview(payload),
+    /ADMIN_OVERVIEW_INVALID/u,
+  );
+});
+
+test("distribution version rows require a known app and operating system", async () => {
+  const unknownClient = await fixture("admin-overview-valid.json");
+  unknownClient.distribution.cloudflare.observedVersions[0].client = "desktop";
+  assert.throws(
+    () => projectAdminOverview(unknownClient),
+    /ADMIN_OVERVIEW_INVALID/u,
+  );
+
+  const unknownOperatingSystem = await fixture("admin-overview-valid.json");
+  unknownOperatingSystem.distribution.cloudflare.observedVersions[0]
+    .operatingSystem = "darwin";
+  assert.throws(
+    () => projectAdminOverview(unknownOperatingSystem),
     /ADMIN_OVERVIEW_INVALID/u,
   );
 });

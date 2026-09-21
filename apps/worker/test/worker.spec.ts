@@ -2233,7 +2233,7 @@ describe("synthetic usage monitor service", () => {
       ingress: { lastDeniedAt: unknown } | null;
     }>();
     expect(overviewBody).toMatchObject({
-      schemaVersion: "admin-overview-v0.3",
+      schemaVersion: "admin-overview-v0.5",
       collection: {
         state: "operational",
         enrollment: true,
@@ -2339,7 +2339,7 @@ describe("synthetic usage monitor service", () => {
     );
     expect(overviewWithoutBudget.status).toBe(200);
     await expect(overviewWithoutBudget.json()).resolves.toMatchObject({
-      schemaVersion: "admin-overview-v0.3",
+      schemaVersion: "admin-overview-v0.5",
       ingress: null,
     });
 
@@ -2519,7 +2519,7 @@ describe("synthetic usage monitor service", () => {
       `INSERT INTO admin_metric_snapshots (captured_at, metrics_json)
        VALUES (?, ?)`,
     ).bind(
-      "2026-08-21T11:00:00.000Z",
+      new Date(Date.now() - 60 * 60 * 1000).toISOString(),
       JSON.stringify({ bandParticipantCount: 1, smuggled: "text" }),
     ).run();
     expect((await warmAdminMetricsHistoryCache(
@@ -2636,7 +2636,7 @@ describe("synthetic usage monitor service", () => {
     );
     expect(overview.status).toBe(200);
     await expect(overview.json()).resolves.toMatchObject({
-      schemaVersion: "admin-overview-v0.4",
+      schemaVersion: "admin-overview-v0.5",
       service: { telemetryStorageMode: "typed" },
       counts: { contributions: { storedTelemetryRecords: 0 } },
       pendingHistoricalRebuilds: null,

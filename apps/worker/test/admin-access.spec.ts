@@ -352,7 +352,7 @@ describe("admin surface hostname gating", () => {
     expect(available.status).toBe(200);
     expect(available.headers.get("cache-control")).toBe("no-store");
     await expect(available.json()).resolves.toMatchObject({
-      schemaVersion: "admin-overview-v0.3",
+      schemaVersion: "admin-overview-v0.5",
       reconstruction: { schemaVersion: "admin-reconstruction-progress-v0.1", status: "available",
         mode: "resumable", calculations: { trackedAccounts: 0, completedAccounts: 0 } },
     });
@@ -362,7 +362,7 @@ describe("admin surface hostname gating", () => {
     const unavailable = await overview();
     expect(unavailable.status).toBe(200);
     await expect(unavailable.json()).resolves.toMatchObject({
-      schemaVersion: "admin-overview-v0.3",
+      schemaVersion: "admin-overview-v0.5",
       reconstruction: { status: "unavailable", mode: "resumable" },
       dailyPublication: { pendingRebuilds: 0 },
     });
@@ -435,7 +435,7 @@ describe("admin surface hostname gating", () => {
     );
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      schemaVersion: "admin-overview-v0.3",
+      schemaVersion: "admin-overview-v0.5",
     });
   });
 

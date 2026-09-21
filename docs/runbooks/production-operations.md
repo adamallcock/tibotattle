@@ -231,7 +231,32 @@ single-flight browser request lanes with a 15-second request timeout, not a
 15-second polling interval. Automatic polling retains the owner's existing
 cadence and pauses when hidden/offline. Temporary storage/network failure
 preserves the prior validated graph; confirmed invalidation or lost owner
-access clears it. Growth snapshots have no age-only read expiry.
+access clears it. A retained graph after a failed refresh is explicitly marked
+as previous dated evidence, and the attention list reports unavailable history,
+allowance and reconstruction sources. Growth snapshots have no age-only read expiry.
+
+The owner page is an observation surface, not an uptime monitor: automatic reads
+pause when its tab is hidden or offline, and browser alerts depend on those reads.
+The attention list checks retention completion freshness against the service's
+two-hour policy, incomplete maintenance cycles, admission saturation, bounded
+analytics and recently retained 5xx error groups. Sampled diagnostics are not a
+complete error rate. Consult `/ready` for the service's authoritative readiness
+checks rather than treating the page's absence of warnings as proof.
+
+Growth headlines count retained identities/events, with recent UTC-day charts;
+legacy web sign-in, pairing and consent counters do not measure accountless
+Electron enrollment. Accepted-data counters follow the active storage mode: legacy whole
+contributions/v1.0 chunks, or typed v1/v1.1 upload headers. Distribution separates
+native and Electron manifest checks by OS and reported version. Address reach
+can overlap between rows, and a latest-GitHub-tag match does not establish that
+each platform is on its own current feed version. GitHub download counters cover
+macOS DMG assets only, not Windows/Linux adoption or completed installations.
+
+Collection drafts survive refreshes and retain the revision on which editing
+started. A conflicting revision must be discarded and reviewed before saving.
+Actions require a usable overview; a bounded maintenance pass can return
+incomplete or already-running rather than completed. Ordinary maintenance never
+initiates participant erasure.
 
 The admin client requests `?detail=preparation` for the backward-compatible
 version-2 progress view. Query-free version 1 remains unchanged. Retained
@@ -254,7 +279,11 @@ The display survives an unavailable allowance preview; a failed overview refresh
 labels its last observation stale. Missing diagnostics do not take Operations
 down or become zero work. Refresh never starts a calculation.
 
-In typed-storage mode, admin overview v0.4 keeps operational authority in the
+Admin overview v0.5 identifies JSON or typed storage explicitly in
+`service.telemetryStorageMode` and adds native/Electron distribution by OS.
+The Worker and bundled admin client must be deployed together; older open tabs
+reject the new schema and need a reload. The prior v0.3/v0.4 schema identifiers
+are not repurposed. In typed-storage mode, the overview keeps operational authority in the
 ingestion source and reads derived publication state only from that source's
 registered analytics target. Current account, upload, chunk and stored-record
 counts come from compact v1/v1.1 upload headers; the interactive route never
