@@ -59,15 +59,16 @@ export function modelPerformanceProjection(rows, { period = 'all', now = Date.no
       && count(r.sample_total_responses) && r.sample_responses <= r.sample_total_responses) {
       m.speedTurns++; m.timedResponses += r.sample_responses;
       add(m.speed, at, r.sample_tokens * 1000 / r.sample_duration);
+    } else if (positive(r.tool_free_tokens) && positive(r.tool_free_duration)) {
+      // Prefer response timing; use full-turn throughput only as a fallback.
+      // Each turn contributes once, before computing the combined percentiles.
+      const value = r.tool_free_tokens * 1000 / r.tool_free_duration;
+      m.speedTurns++; m.toolFreeTurns++;
+      add(m.speed, at, value); add(m.toolFree, at, value);
     }
     if (count(r.ttft)) { m.ttftTurns++; add(m.latency, at, r.ttft / 1000); }
-    // This separate population includes the full turn, including initial waiting.
-    // Eligibility is established by the provider parser, never inferred here.
-    if (positive(r.tool_free_tokens) && positive(r.tool_free_duration)) {
-      m.toolFreeTurns++; add(m.toolFree, at, r.tool_free_tokens * 1000 / r.tool_free_duration);
-    }
   }
-  return { schemaVersion: 3, method: 4, status: 'ready', collecting: false, stale: false,
+  return { schemaVersion: 4, method: 5, status: 'ready', collecting: false, stale: false,
     updatedAt: new Date(now).toISOString(), period, interval, start, end, historyProgress,
     models: [...LABELS.keys()].filter(id => groups.has(id)).map(id => {
       const { speed, latency, toolFree, ...m } = groups.get(id);

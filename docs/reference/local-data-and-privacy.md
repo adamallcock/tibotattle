@@ -118,7 +118,9 @@ requested history pass, and then stops after the idle lease expires.
 The supplement observes only allowlisted activity kinds and scalar counters;
 unknown activity, tools, steering, ambiguous tokens, or incomplete evidence
 excludes a turn. Full-turn duration includes initial waiting; TTFT is never
-subtracted. Supplemental values remain a separate distribution. It does not feed accounting, contribution,
+subtracted. Output speed uses response timing when available, otherwise an eligible
+supplemental full-turn estimate. Each turn is counted once; the display discloses
+the fallback count and its inclusion of initial waiting. It does not feed accounting, contribution,
 or network requests. Failures preserve available saved evidence with its
 stale/unavailable state. Windows remains unavailable until its protected-state
 adapter is qualified. These are source behavior, not installed-release proof.
@@ -131,7 +133,7 @@ owner-only permissions. Important entries include:
 | State | Purpose | Retention behavior |
 | --- | --- | --- |
 | `local-unified-index-v1.sqlite` plus device salt | Canonical replay-safe Codex usage/quota/tool projection and source provenance. | Accumulates locally; the 30-day UI horizon is not retention. |
-| `inference-timing-v2/model-performance-snapshot.json` | At most four rolling-period and eight exact-window completed timing projections, fixed model IDs and numeric bins; 4 MiB owner-only, schema/digest-checked envelope bound to the configured Codex source. | Uses the same atomic snapshot transport as Overview. Restored measurements keep their observation date while background scanning runs or fails; incomplete scans cannot replace them. First result saves immediately, then hourly, with latest completed results flushed on clean shutdown. |
+| `inference-timing-v2/model-performance-snapshot.json` | At most four rolling-period and eight exact-window completed timing projections, fixed model IDs and numeric bins; 4 MiB owner-only, schema/digest-checked v4 envelope bound to the configured Codex source. | Uses the same atomic snapshot transport as Overview. Earlier independent-distribution receipts are preserved and refused until valid per-turn reconstruction produces a v4 replacement. Restored measurements keep their observation date while background scanning runs or fails; incomplete scans cannot replace them. First result saves immediately, then hourly, with latest completed results flushed on clean shutdown. |
 | `inference-timing-v2/source-<Codex-home digest>/timing-experiment.sqlite` (development source) | Separate owner-only timing sidecar: one row per completed turn, counts/durations/coverage, local HMAC keys, source cursors and bounded pending state. No raw content or IDs. | Maximum 256 MiB per selected source; method/SQLite user version 2. The legacy unscoped sidecar is preserved without reading or migrating its unknown source provenance; first use rebuilds measurements from retained source logs. Incompatible stores, including version 1, are preserved and refused. Display periods do not delete evidence or migrate the accounting index. |
 | `inference-timing-v2/source-<Codex-home digest>/tool-free-v1/timing-experiment.sqlite` (development source) | Independent supplement for reconciled single-response turns without tools, plus its own source cursors and bounded scalar pending state. Shares the original private timing correlation key for local joins only. | Maximum 256 MiB; SQLite user version 3. Original version-2 data is preserved. An incompatible or unavailable supplement does not hide original measurements. |
 | `local-collector-state-v1.sqlite` | App-server quota observations, checkpoints, dedupe, locks, and replay-safe collector state. | Accumulates until explicit local erase or a reviewed migration/retention workflow. |

@@ -1,15 +1,16 @@
 ---
-title: Add tool-free turn throughput beside response speed
+title: Include tool-free fallback estimates in Output speed
 date: 2026-09-21
 type: plan
 status: validated-local
 ---
 
-The owner requested additive recovery of useful measurements from older Codex
-logs for turns without tools. Preserve existing output speed, TTFT, counts, and
-saved timing evidence. Add a separate distribution for a single response with
-reconciled output tokens divided by the complete turn duration, including initial
-waiting. Do not subtract TTFT or pool this metric with response-window speed.
+The owner clarified that additive recovery means one Output speed graph containing
+response-timed measurements plus eligible tool-free full-turn estimates, not a
+third graph. Each turn contributes once, preferring response timing. Fallbacks
+include initial waiting; counts and methodology disclose this distinction.
+Original parser/store evidence and TTFT remain unchanged. The projection computes
+combined percentiles from per-turn samples under schema 4/method 5.
 
 Acceptance:
 
@@ -24,13 +25,14 @@ Acceptance:
   total-turn or TTFT counts; existing response-speed fields remain unchanged.
 - Keep original saved measurements readable if supplemental collection fails.
   Both scans stay bounded, cancellable, lazy, and resumable.
-- Render a separately labelled chart with explicit initial-wait semantics.
+- Render one Output speed chart with a method breakdown and explicit initial-wait semantics.
   Verify synthetic negative cases, restart/replay, sidecar compatibility,
   existing evidence conservation, and rendered real-data aggregates.
 
 Source changes and local validation do not install or publish a release.
 
-Validation snapshot (2026-09-21), integrated with main at
+Prior implementation snapshot (2026-09-21), before the clarified combined-chart
+request. Its three-chart UI evidence does not qualify the revised UI. Integrated with main at
 `8a340061` in source revision `dc38f3859d030b76f2fc977f358476097d2ae861`:
 
 - Integrated parser/store/controller/reporting checks: 58 passed. Additional
@@ -78,5 +80,37 @@ Validation snapshot (2026-09-21), integrated with main at
   provenance has 408 inputs whereas current main has 409. No R7 receipts were
   regenerated or relabelled. The full root gate is therefore not claimed green.
 
-The source change is locally qualified for review and merge. No signed release,
-production replacement, or updater publication is included.
+The prior source change was merged in PR #182. Revised combined-chart validation
+is pending below. No signed release, production replacement, or updater
+publication is included.
+
+
+Clarified combined-chart implementation (2026-09-21):
+
+- Schema 4/method 5 prefers response timing, otherwise admits an eligible
+  tool-free full-turn estimate. One sample per turn feeds the pooled percentiles;
+  fallback counts remain explicit. The third chart is removed.
+- Synthetic projection/worker/restart tests: 22 passed. Companion: 363 passed.
+  Browser UI: 944 passed. Translation tests: 13 passed; mirror check passed.
+  Architecture and documentation preflight passed.
+- A read-only projection over the completed real-data sidecars returned 235
+  Output speed measurements from 5,501 GPT-5.5 turns, all 235 full-turn estimates,
+  with 5,000 TTFT measurements. No parser or persistent-store change was needed.
+- Integrated main revision `ecf1b31e`, including source-scoped timing stores and
+  persisted reports. Updated snapshot validation for the new display contract;
+  old aggregate receipts cannot be pooled accurately and remain preserved until
+  a valid reconstruction replaces them.
+- Integrated validation: 36 focused snapshot/controller/worker/route tests,
+  377 companion tests, 976 UI tests, and 13 translation tests passed. Original
+  parser/Windows-adapter/reporting boundary checks: 46 passed.
+- Fresh macOS arm64 unsigned QA package from source `45f22958` passed artifact
+  verification. ASAR SHA-256:
+  `9b18729f88ccc9a00fc28e740e4a2c62cbd07cdc552a17692f31374fc47cd9ec`.
+  The previous QA app was preserved. The isolated copied profile was seeded
+  from the same verified source's completed sidecars in its scoped directory.
+- Native all-history GPT-5.5 inspection showed Output speed populated with
+  235 of 5,501 turns, explicitly 0 response-timed and 235 full-turn estimates;
+  TTFT remained 5,000 of 5,501. Only two metric cards rendered. The installed
+  QA companion independently returned the matching schema-4/method-5 counts.
+  Existing source-replacement refusals continue to produce the honest saved-data
+  warning; the guards were not weakened. The QA app is left open for review.
