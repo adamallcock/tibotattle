@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { modelPerformanceProjection } from '../src/reporting/index.js';
@@ -90,6 +91,257 @@ test('controller is lazy, coalesces reads, retains good snapshots on failure, an
   await c.close(); assert.equal((await c.read('all')).status, 'unavailable');
   await assert.rejects(c.read('90'));
 });
+class BlockedWorker extends EventEmitter {
+  unref() {}
+  postMessage(message) {
+    if (message.type === 'window') return;
+    assert.equal(message.type, 'stop');
+    queueMicrotask(() => this.emit('exit', 0));
+  }
+}
+async function waitForSavedSnapshot(file, updatedAt) {
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    try {
+      const receipt = JSON.parse(await readFile(file, 'utf8'));
+      if (receipt.snapshot.values.some(value => value.updatedAt === updatedAt)) return receipt;
+    } catch { /* The first atomic receipt may not exist yet. */ }
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  assert.fail('complete snapshot was not persisted');
+}
+async function snapshotFixture(t) {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'model-speed-snapshot-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const options = { directory: join(root, 'timing'), codexHome: join(root, 'codex'), platform: 'darwin' };
+  let worker;
+  const create = patch => createModelPerformanceController({ ...options,
+    workerFactory: () => worker = new BlockedWorker(), ...patch });
+  const complete = ['1', '7', '30', 'all'].map(period => modelPerformanceProjection([row()], {
+    now: NOW, period, historyProgress: { checked: 1, total: 1 },
+  }));
+  const initial = create();
+  assert.equal((await initial.read('all')).status, 'loading');
+  worker.emit('message', { type: 'snapshots', values: complete });
+  await initial.close();
+  return { root, options, create, complete, worker: () => worker,
+    file: join(options.directory, 'model-performance-snapshot.json') };
+}
+test('saved complete measurements are immediately available after restart with a blocked worker', async t => {
+  const fixture = await snapshotFixture(t);
+  const controller = fixture.create();
+  try {
+    for (const period of ['1', '7', '30', 'all']) {
+      const result = await controller.read(period);
+      assert.equal(result.status, 'ready');
+      assert.equal(result.collecting, true);
+      assert.equal(result.historyProgress, null, 'saved scan progress is not current progress');
+      assert.equal(result.stale, false);
+      assert.equal(result.updatedAt, new Date(NOW).toISOString());
+      assert.equal(result.models[0].turns, 1);
+    }
+    const disk = await readFile(fixture.file, 'utf8');
+    assert.ok(!disk.includes(fixture.options.codexHome));
+    assert.ok(!disk.includes(fixture.options.directory));
+  } finally { await controller.close(); }
+});
+test('saved pinned windows restore only their exact period and end independently of live periods', async t => {
+  const fixture = await snapshotFixture(t);
+  const endAt = new Date(NOW).toISOString(), collectedAt = new Date(NOW + 60_000).toISOString();
+  const pinned = { ...modelPerformanceProjection([row(), row()], { period: '1', now: NOW, rolling: true }),
+    updatedAt: collectedAt, requestKey: `1:${NOW}` };
+  let controller = fixture.create();
+  try {
+    assert.equal((await controller.read('1', { endAt })).status, 'loading');
+    fixture.worker().emit('message', { type: 'snapshots', values: [pinned] });
+    assert.equal((await controller.read('1', { endAt })).models[0].turns, 2);
+    await controller.close();
+    controller = fixture.create();
+    const restored = await controller.read('1', { endAt });
+    assert.equal(restored.collecting, true);
+    assert.equal(restored.end, NOW);
+    assert.equal(restored.start, NOW - DAY);
+    assert.equal(restored.updatedAt, collectedAt);
+    assert.equal(restored.models[0].turns, 2);
+    assert.equal(Object.hasOwn(restored, 'requestKey'), false, 'internal cache keys do not change the response DTO');
+    assert.equal((await controller.read('1')).models[0].turns, 1);
+    const other = await controller.read('1', { endAt: new Date(NOW - 1).toISOString() });
+    assert.equal(other.status, 'loading');
+    assert.equal(other.end, NOW - 1);
+    assert.deepEqual(other.models, []);
+    fixture.worker().emit('message', { type: 'snapshots', values: [{ ...pinned, requestKey: `1:${NOW - 1}` }] });
+    const rejected = await controller.read('1', { endAt });
+    assert.equal(rejected.stale, true);
+    assert.equal(rejected.models[0].turns, 2, 'mismatched worker window cannot replace the saved value');
+  } finally { await controller.close(); }
+});
+test('pinned retained cache is bounded to eight exact windows plus four live periods', async t => {
+  const fixture = await snapshotFixture(t);
+  let controller = fixture.create();
+  try {
+    for (let index = 0; index < 9; index++) {
+      const end = NOW - index * DAY;
+      await controller.read('1', { endAt: new Date(end).toISOString() });
+      fixture.worker().emit('message', { type: 'snapshots', values: [{
+        ...modelPerformanceProjection([row({ at: end })], { period: '1', now: end, rolling: true }),
+        updatedAt: new Date(NOW).toISOString(), requestKey: `1:${end}`,
+      }] });
+    }
+    await controller.close();
+    const receipt = JSON.parse(await readFile(fixture.file, 'utf8'));
+    assert.equal(receipt.schemaVersion, 'local-model-performance-snapshot-v2');
+    assert.equal(receipt.snapshot.values.length, 12);
+    assert.equal(receipt.snapshot.values.filter(value => Object.hasOwn(value, 'requestKey')).length, 8);
+    assert.equal(receipt.snapshot.values.some(value => value.requestKey === `1:${NOW}`), false);
+    controller = fixture.create();
+    assert.equal((await controller.read('1', { endAt: new Date(NOW - 8 * DAY).toISOString() })).models[0].turns, 1);
+    assert.equal((await controller.read('1', { endAt: new Date(NOW).toISOString() })).status, 'loading');
+  } finally { await controller.close(); }
+});
+test('pinned cache receipts reject mismatched keys and rolling bounds even with a valid digest', async t => {
+  const fixture = await snapshotFixture(t);
+  const endAt = new Date(NOW).toISOString();
+  let controller = fixture.create();
+  await controller.read('1', { endAt });
+  fixture.worker().emit('message', { type: 'snapshots', values: [{
+    ...modelPerformanceProjection([row()], { period: '1', now: NOW, rolling: true }), requestKey: `1:${NOW}`,
+  }] });
+  await controller.close();
+  const saved = await readFile(fixture.file, 'utf8');
+  for (const change of [
+    value => { value.requestKey = `1:${NOW - 1}`; },
+    value => { value.start++; },
+  ]) {
+    const receipt = JSON.parse(saved);
+    change(receipt.snapshot.values.find(value => Object.hasOwn(value, 'requestKey')));
+    receipt.digest = createHash('sha256').update(JSON.stringify(receipt.snapshot)).digest('hex');
+    await writeFile(fixture.file, JSON.stringify(receipt));
+    controller = fixture.create();
+    try {
+      const result = await controller.read('1', { endAt });
+      assert.equal(result.status, 'loading');
+      assert.equal(result.end, NOW);
+      assert.deepEqual(result.models, []);
+    } finally { await controller.close(); }
+  }
+});
+test('complete measurements persist immediately, then hourly, and flush the latest value on close', async t => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'model-speed-cadence-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const directory = join(root, 'timing'), file = join(directory, 'model-performance-snapshot.json');
+  let now = NOW, worker;
+  const options = { directory, codexHome: join(root, 'codex'), platform: 'darwin', snapshotNow: () => now,
+    workerFactory: () => worker = new BlockedWorker() };
+  let controller = createModelPerformanceController(options);
+  const publish = count => worker.emit('message', { type: 'snapshots', values: [
+    modelPerformanceProjection(Array.from({ length: count }, () => row()), { now }),
+  ] });
+  try {
+    await controller.read('all');
+    publish(1);
+    const first = await waitForSavedSnapshot(file, new Date(now).toISOString());
+    assert.equal(first.savedAt, new Date(now).toISOString());
+    now += 5_000;
+    publish(2);
+    assert.equal((await controller.read('all')).models[0].turns, 2, 'live results are never throttled');
+    assert.equal(JSON.parse(await readFile(file, 'utf8')).snapshot.values[0].models[0].turns, 1);
+    now = NOW + 60 * 60 * 1_000;
+    publish(3);
+    await waitForSavedSnapshot(file, new Date(now).toISOString());
+    now += 5_000;
+    publish(4);
+    await controller.close();
+    const closed = JSON.parse(await readFile(file, 'utf8'));
+    assert.equal(closed.snapshot.values[0].models[0].turns, 4, 'close flushes the latest completed value');
+    assert.equal(closed.savedAt, new Date(now).toISOString());
+    controller = createModelPerformanceController(options);
+    assert.equal((await controller.read('all')).models[0].turns, 4);
+    now += 5_000;
+    publish(5);
+    assert.equal((await controller.read('all')).models[0].turns, 5);
+    assert.equal(JSON.parse(await readFile(file, 'utf8')).snapshot.values[0].models[0].turns, 4,
+      'restart preserves the persisted write interval');
+  } finally { await controller.close(); }
+});
+test('rebuilding and failed measurements retain complete results and only complete empty results replace them', async t => {
+  const fixture = await snapshotFixture(t);
+  let controller = fixture.create();
+  try {
+    await controller.read('all');
+    fixture.worker().emit('message', { type: 'snapshots', values: [
+      { ...modelPerformanceProjection([], { now: NOW + DAY }), collecting: true,
+        historyProgress: { checked: 0, total: 1 } },
+    ] });
+    let result = await controller.read('all');
+    assert.equal(result.models[0].turns, 1);
+    assert.equal(result.updatedAt, new Date(NOW).toISOString());
+    assert.equal(result.collecting, true);
+    fixture.worker().emit('message', { type: 'snapshots', values: [
+      { ...modelPerformanceProjection([], { now: NOW + DAY }), stale: true },
+    ] });
+    result = await controller.read('all');
+    assert.equal(result.models[0].turns, 1);
+    assert.equal(result.stale, true);
+    fixture.worker().emit('error', new Error('synthetic private error'));
+    result = await controller.read('all');
+    assert.equal(result.collecting, false);
+    assert.equal(result.stale, true);
+    await controller.close();
+    controller = fixture.create();
+    assert.equal((await controller.read('all')).models[0].turns, 1);
+    fixture.worker().emit('message', { type: 'snapshots', values: [
+      modelPerformanceProjection([], { now: NOW + DAY }),
+    ] });
+    assert.deepEqual((await controller.read('all')).models, []);
+    await controller.close();
+    controller = fixture.create();
+    result = await controller.read('all');
+    assert.equal(result.status, 'ready');
+    assert.equal(result.updatedAt, new Date(NOW + DAY).toISOString());
+    assert.deepEqual(result.models, []);
+  } finally { await controller.close(); }
+});
+test('source changes, corrupted receipts and incompatible schemas fail closed without waiting for the worker', async t => {
+  const fixture = await snapshotFixture(t);
+  const saved = await readFile(fixture.file, 'utf8');
+  for (const mutation of [
+    null,
+    () => '{broken',
+    value => JSON.stringify({ ...JSON.parse(value), schemaVersion: 'future' }),
+    value => JSON.stringify({ ...JSON.parse(value), digest: '0'.repeat(64) }),
+    value => {
+      const envelope = JSON.parse(value);
+      envelope.snapshot.values[0].method = 4;
+      envelope.digest = createHash('sha256').update(JSON.stringify(envelope.snapshot)).digest('hex');
+      return JSON.stringify(envelope);
+    },
+  ]) {
+    if (mutation) await writeFile(fixture.file, mutation(saved));
+    const controller = fixture.create(mutation ? {} : { codexHome: join(fixture.root, 'another-source') });
+    try {
+      const started = Date.now();
+      const result = await controller.read('all');
+      assert.equal(result.status, 'loading');
+      assert.deepEqual(result.models, []);
+      assert.ok(Date.now() - started < 500, 'does not wait for a worker response');
+    } finally { await controller.close(); }
+  }
+});
+test('late messages after cancellation and invalid worker payloads cannot replace a saved snapshot', async t => {
+  const fixture = await snapshotFixture(t);
+  let controller = fixture.create();
+  await controller.read('all');
+  const worker = fixture.worker();
+  worker.emit('message', { type: 'snapshots', values: [
+    { ...fixture.complete.find(value => value.period === 'all'), privateText: 'synthetic private value' },
+  ] });
+  assert.equal((await controller.read('all')).stale, true);
+  await controller.close();
+  worker.emit('message', { type: 'snapshots', values: [modelPerformanceProjection([], { now: NOW + DAY })] });
+  controller = fixture.create();
+  try { assert.equal((await controller.read('all')).models[0].turns, 1); }
+  finally { await controller.close(); }
+});
 test('an explicitly requested initial history pass finishes after the reader lease expires', async () => {
   class FakeWorker extends EventEmitter {
     unref() {}
@@ -143,7 +395,7 @@ test('missing timing capability returns unavailable with bounded worker retry', 
   assert.equal(workers, 1, 'missing capability is attempted once during the backoff');
 });
 
-test('actual worker reconstructs synthetic logs off-main, persists, and shuts down', async t => {
+test('actual worker persists separate Codex sources and preserves the unscoped legacy sidecar', async t => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'model-speed-')));
   t.after(() => rm(root, { recursive: true, force: true }));
   const codexHome = join(root, 'codex'); await mkdir(join(codexHome, 'sessions'), { recursive: true });
@@ -160,11 +412,16 @@ test('actual worker reconstructs synthetic logs off-main, persists, and shuts do
     rec(1000, 'event_msg', { type: 'task_complete', turn_id: turn, duration_ms: 1000, time_to_first_token_ms: 200 })];
   await writeFile(join(codexHome, 'sessions', 'synthetic.jsonl'), rows.map(r => JSON.stringify(r)).join('\n') + '\n');
   const options = { directory: join(root, 'timing'), codexHome };
-  async function readReady(c) {
+  await mkdir(options.directory, { mode: 0o700 });
+  const legacyFile = join(options.directory, 'timing-experiment.sqlite');
+  const legacyBytes = Buffer.from('synthetic legacy sidecar with unknown source provenance');
+  await writeFile(legacyFile, legacyBytes, { mode: 0o600 });
+  async function readReady(c, expectedModels = 1) {
     const deadline = Date.now() + 10000;
     while (Date.now() < deadline) {
       const r = await c.read('all');
-      if (r.status === 'ready' && r.models.length) return r;
+      if (expectedModels === 0) assert.deepEqual(r.models, [], 'another source cannot leak during startup');
+      if (r.status === 'ready' && !r.collecting && !r.stale && r.models.length === expectedModels) return r;
       await new Promise(resolve => setTimeout(resolve, 20));
     }
     assert.fail('worker failed to publish reconstructed data');
@@ -199,6 +456,18 @@ test('actual worker reconstructs synthetic logs off-main, persists, and shuts do
     result = await readReady(controller);
     assert.equal(result.models[0].turns, 1);
     assert.ok(!JSON.stringify(result).includes(thread));
+    await controller.close();
+    const emptyHome = join(root, 'empty-codex');
+    await mkdir(join(emptyHome, 'sessions'), { recursive: true });
+    controller = createModelPerformanceController({ ...options, codexHome: emptyHome });
+    result = await readReady(controller, 0);
+    assert.deepEqual(result.historyProgress, { checked: 0, total: 0 });
+    await controller.close();
+    controller = createModelPerformanceController(options);
+    result = await readReady(controller);
+    assert.equal(result.models[0].id, 'gpt-5.6-sol');
+    assert.equal(result.models[0].turns, 1, 'switching back preserves the original source sidecar');
+    assert.deepEqual(await readFile(legacyFile), legacyBytes, 'unscoped evidence is neither read nor mutated');
   } finally { await controller.close(); }
 });
 

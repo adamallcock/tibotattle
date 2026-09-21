@@ -87,6 +87,18 @@ export function validateWorkUsageResponse(value) {
     )
   )
     throw new Error("invalid_response");
+  for (const key of ["retained", "refreshing", "namesAvailable"])
+    if (value[key] !== undefined && typeof value[key] !== "boolean")
+      throw new Error("invalid_response");
+  if (
+    (value.retained === true && (value.status !== "available"
+      || typeof value.refreshing !== "boolean" || typeof value.namesAvailable !== "boolean"))
+    || (value.refreshing === true && value.retained !== true)
+    || (value.namesAvailable === false && value.retained !== true)
+    || (value.refreshSnapshotId != null && (!value.retained || !value.refreshing
+      || !shortText(value.refreshSnapshotId) || value.refreshSnapshotId === value.snapshotId))
+    || (value.refreshing === true && !shortText(value.refreshSnapshotId))
+  ) throw new Error("invalid_response");
   if (value.status === "cancelled") return value;
   if (!shortText(value.snapshotId)) throw new Error("invalid_response");
   if (value.status !== "available") return value;
@@ -118,6 +130,9 @@ export function validateWorkUsageResponse(value) {
     !count(value.totals.activeThreads) ||
     !count(value.totals.activeProjects)
   )
+    throw new Error("invalid_response");
+  if (value.namesAvailable === false && (Object.keys(value.display).length !== 0
+    || value.scopes.length !== 0 || value.nextCursor !== null))
     throw new Error("invalid_response");
   for (const row of value.rows) {
     if (row.subworkerCount !== undefined && !count(row.subworkerCount)) throw new Error("invalid_response");
@@ -197,6 +212,7 @@ export function mountWorkUsageView(options = {}) {
   if (sharedReporting && reportingWindow) query.endAt = reportingWindow.endAt;
   let response = null;
   let responseQueryKey = null;
+  let retainedWindowQueryKey = null;
   // Work Usage responses are immutable, bounded page DTOs. Their snapshot
   // ids are leases owned by the service and may be evicted as the next warm
   // report is created, so the displayed cache is kept separate from the one
@@ -208,6 +224,9 @@ export function mountWorkUsageView(options = {}) {
   const queryKey = () => JSON.stringify(Object.entries(query)
     .filter(([key]) => !["snapshotId", "sourceSnapshotId"].includes(key))
     .sort(([left], [right]) => left.localeCompare(right)));
+  const retainedReport = () => Boolean(response?.retained || retainedWindowQueryKey !== null);
+  const displayedForQuery = () => response !== null
+    && (responseQueryKey === queryKey() || retainedWindowQueryKey === queryKey());
   const queryFamilyKey = (value = query) => JSON.stringify(Object.entries(value)
     .filter(([key]) => !["period", "cursor", "snapshotId", "sourceSnapshotId"].includes(key))
     .sort(([left], [right]) => left.localeCompare(right)));
@@ -257,7 +276,7 @@ export function mountWorkUsageView(options = {}) {
   }
 
   function responseAnchor(value, snapshotId = value?.snapshotId) {
-    if (!value || !shortText(snapshotId) || !timestamp(value.toMs)) return null;
+    if (!value || value.retained || !shortText(snapshotId) || !timestamp(value.toMs)) return null;
     return {
       snapshotId,
       generation: generationKey(value),
@@ -388,6 +407,9 @@ export function mountWorkUsageView(options = {}) {
           invalidated: http.status === 401 || http.status === 403,
         };
         const result = validateWorkUsageResponse(payload);
+        // A saved report cannot anchor speculative periods or become a live
+        // report through warming. Its replacement belongs to the foreground.
+        if (result.retained) return { result: null, invalidated: false };
         if (result.status !== "preparing") {
           if (result.status === "available" && !sameAnchor(anchor, responseAnchor(result))) {
             return { result: null, invalidated: true };
@@ -672,6 +694,7 @@ export function mountWorkUsageView(options = {}) {
   }
   renderModelOptions([]);
   const scope = select(tr("scope"), [], (value) => {
+    if (retainedReport()) return;
     query.scope = value;
     refresh(liveAnchor?.snapshotId ?? null);
   });
@@ -704,7 +727,8 @@ export function mountWorkUsageView(options = {}) {
     // Fence old responses as soon as the text changes, before the debounce fires.
     serial++;
     controller?.abort();
-    clearTimeout(timer);
+    clearLeaseTimer(timer);
+    timer = null;
     stopLease();
     clearNested();
     body.hidden = true;
@@ -757,7 +781,8 @@ export function mountWorkUsageView(options = {}) {
     serial++;
     clearNested();
     controller?.abort();
-    clearTimeout(timer);
+    clearLeaseTimer(timer);
+    timer = null;
     stopPeriodPreload();
     if (query.snapshotId) {
       try {
@@ -808,11 +833,12 @@ export function mountWorkUsageView(options = {}) {
     if (!preservePeriodCache) clearPeriodCache();
     delete query.snapshotId;
     delete query.sourceSnapshotId;
-    if (typeof sourceSnapshotId === "string") query.sourceSnapshotId = sourceSnapshotId;
+    if (typeof sourceSnapshotId === "string" && !retainedReport()) query.sourceSnapshotId = sourceSnapshotId;
     resetPage();
     load(true, { force: true });
   }
   function descend(row, grouping = null) {
+    if (retainedReport()) return;
     ancestors.push({
       query: { ...query },
       pages: [...pages],
@@ -834,6 +860,10 @@ export function mountWorkUsageView(options = {}) {
   }
   function label(row, report = response) {
     const display = report?.display[row.id];
+    if (report?.namesAvailable === false && !["unassigned", "non-project"].includes(row.id))
+      return tr(row.kind === "project" ? "savedProject" : row.kind === "worktree" ? "savedWorktree" : "savedThread", {
+        number: report.offset + report.rows.indexOf(row) + 1,
+      });
     return row.id === "unassigned"
       ? tr("unassigned")
       : row.id === "non-project" ? tr("nonProject")
@@ -908,6 +938,7 @@ export function mountWorkUsageView(options = {}) {
     nested = null;
   }
   function toggleProject(row) {
+    if (retainedReport()) return;
     if (nested?.project === row.id) clearNested();
     else {
       clearNested();
@@ -1436,6 +1467,7 @@ export function mountWorkUsageView(options = {}) {
     body.dataset.state = "ready";
     const pagination = el("div", "table-pagination");
     const previous = quietButton(tr("previous"), () => {
+      if (retainedReport()) return;
       pendingFocus = "first-row";
       const cursor = pages.pop();
       if (cursor) query.cursor = cursor;
@@ -1444,6 +1476,7 @@ export function mountWorkUsageView(options = {}) {
     });
     previous.disabled = !pages.length;
     const next = quietButton(tr("next"), () => {
+      if (retainedReport()) return;
       pendingFocus = "first-row";
       pages.push(query.cursor ?? null);
       query.cursor = response.nextCursor;
@@ -1468,6 +1501,8 @@ export function mountWorkUsageView(options = {}) {
       next,
     );
     body.append(pagination);
+    if (response.namesAvailable === false)
+      body.append(el("p", "work-usage-caption", tr("savedNamesUnavailable")));
     focusTarget?.focus();
     pendingFocus = null;
   }
@@ -1488,7 +1523,7 @@ export function mountWorkUsageView(options = {}) {
       if (loadInFlightKey === queryKey()) return loadInFlight;
       serial++;
       controller?.abort();
-      clearTimeout(timer);
+      clearLeaseTimer(timer);
       timer = null;
       loadInFlight = null;
       loadInFlightKey = null;
@@ -1522,7 +1557,8 @@ export function mountWorkUsageView(options = {}) {
       if (!applySearch()) {
         serial++;
         controller?.abort();
-        clearTimeout(timer);
+        clearLeaseTimer(timer);
+        timer = null;
         stopLease();
         cancel.hidden = true;
         root.removeAttribute("aria-busy");
@@ -1535,7 +1571,7 @@ export function mountWorkUsageView(options = {}) {
       serial++;
       controller?.abort();
       controller = null;
-      clearTimeout(timer);
+      clearLeaseTimer(timer);
       timer = null;
       clearNested();
       body.replaceChildren();
@@ -1555,16 +1591,18 @@ export function mountWorkUsageView(options = {}) {
     clearNested();
     const token = ++serial;
     controller?.abort();
-    clearTimeout(timer);
+    clearLeaseTimer(timer);
+    timer = null;
     controller = new AbortController();
     const loadController = controller;
-    setStatus("preparing");
     body.dataset.state = "loading";
     body.inert = true;
     // Keep the exact query's previous report visible during revalidation, but
     // disable old snapshot controls until the replacement is authoritative.
     // Scope, filters, grouping, period and page are all part of this key.
-    body.hidden = !response || responseQueryKey !== queryKey();
+    body.hidden = !displayedForQuery();
+    setStatus(retainedReport() && !body.hidden ? "savedUpdating" : "preparing", response
+      ? { date: formatLocal(new Date(response.toMs).toISOString()) } : undefined);
     cancel.hidden = false;
     root.setAttribute("aria-busy", "true");
     for (const b of views.children)
@@ -1627,6 +1665,7 @@ export function mountWorkUsageView(options = {}) {
           clearPeriodCache();
           response = null;
           responseQueryKey = null;
+          retainedWindowQueryKey = null;
           body.hidden = true;
           body.dataset.state = http.status === 409 ? "expired" : "unavailable";
         }
@@ -1646,7 +1685,7 @@ export function mountWorkUsageView(options = {}) {
             preparingAttempt: preparingAttempt + 1,
           });
         }
-        timer = setTimeout(
+        timer = scheduleLease(
           () => load(recoverExpired, { background }),
           PREPARING_POLL_DELAY_MS,
         );
@@ -1655,8 +1694,14 @@ export function mountWorkUsageView(options = {}) {
       if (result.status !== "available") {
         liveAnchor = null;
         clearPeriodCache();
+        if (retainedReport() && !body.hidden && displayedForQuery()) {
+          setStatus("savedUnavailable", { date: formatLocal(new Date(response.toMs).toISOString()) });
+          body.dataset.state = "error";
+          return;
+        }
         response = null;
         responseQueryKey = null;
+        retainedWindowQueryKey = null;
         body.hidden = true;
         body.dataset.state = result.status === "missing" ? "missing" : "unavailable";
         setStatus(result.status === "missing" ? "missing" : "unavailable");
@@ -1664,9 +1709,11 @@ export function mountWorkUsageView(options = {}) {
       }
       response = result;
       responseQueryKey = queryKey();
-      liveAnchor = responseAnchor(result);
-      if (!query.cursor) cachePeriod(query.period, result, familyKey, liveAnchor);
-      setStatus("snapshot", {
+      retainedWindowQueryKey = null;
+      liveAnchor = result.retained ? null : responseAnchor(result);
+      if (result.retained) clearPeriodCache();
+      else if (!query.cursor) cachePeriod(query.period, result, familyKey, liveAnchor);
+      setStatus(result.retained ? (result.refreshing ? "savedUpdating" : "savedUnavailable") : "snapshot", {
         date: formatLocal(new Date(result.toMs).toISOString()),
       });
       renderModelOptions(result.models);
@@ -1684,14 +1731,27 @@ export function mountWorkUsageView(options = {}) {
         }),
       );
       scope.control.value = result.scope;
-      scope.wrapper.hidden = result.scopes.length < 2;
+      scope.wrapper.hidden = Boolean(result.retained) || result.scopes.length < 2;
+      for (const control of [views, sort.wrapper, model.wrapper, scope.wrapper, form])
+        control.inert = Boolean(result.retained);
       body.hidden = false;
       const retainForInactive = !visible() && (background || needsLeaseValidation);
       if (retainForInactive) needsLeaseValidation = true;
       else needsLeaseValidation = false;
-      body.inert = retainForInactive;
+      body.inert = Boolean(result.retained) || retainForInactive;
       render();
-      if (retainForInactive) {
+      if (result.retained) {
+        body.dataset.state = result.refreshing ? "loading" : "error";
+        if (result.refreshing) {
+          query.snapshotId = result.refreshSnapshotId;
+          if (background) {
+            if (preparingAttempt >= MAX_PREPARING_POLLS) return;
+            await delayPeriodPreload(preloadPollDelay(preparingAttempt), loadController.signal);
+            return performLoad(recoverExpired, { background, preparingAttempt: preparingAttempt + 1 });
+          }
+          timer = scheduleLease(() => load(recoverExpired), PREPARING_POLL_DELAY_MS);
+        }
+      } else if (retainForInactive) {
         stopLease();
         stopPeriodPreload();
       } else {
@@ -1700,20 +1760,21 @@ export function mountWorkUsageView(options = {}) {
       }
     } catch (error) {
       if (token !== serial || error.name === "AbortError") return;
-      setStatus(error.message === "expired" ? "expired" : "error");
+      if (retainedReport() && !body.hidden && displayedForQuery())
+        setStatus("savedUnavailable", { date: formatLocal(new Date(response.toMs).toISOString()) });
+      else setStatus(error.message === "expired" ? "expired" : "error");
       body.dataset.state = error.message === "expired" ? "expired" : "error";
     } finally {
       if (token === serial) {
-        cancel.hidden =
-          timer !== null && message.textContent === tr("preparing")
-            ? false
-            : true;
+        cancel.hidden = timer === null;
         if (cancel.hidden) root.removeAttribute("aria-busy");
       }
     }
   }
   function setReportingWindow(value) {
     const next = normalizeReportingWindow(value);
+    const retainPrevious = next && reportingWindow && next.period === reportingWindow.period
+      && Date.parse(next.endAt) > Date.parse(reportingWindow.endAt) && displayedForQuery();
     const previousKey = queryKey();
     sharedReporting = true;
     reportingWindow = next;
@@ -1737,7 +1798,7 @@ export function mountWorkUsageView(options = {}) {
     serial++;
     controller?.abort();
     controller = null;
-    clearTimeout(timer);
+    clearLeaseTimer(timer);
     timer = null;
     clearSearchTimer();
     searchPending = false;
@@ -1747,18 +1808,26 @@ export function mountWorkUsageView(options = {}) {
     resetPage();
     ancestors = [];
     selectedTitle = null;
-    response = null;
-    responseQueryKey = null;
+    if (!retainPrevious) {
+      response = null;
+      responseQueryKey = null;
+    }
+    retainedWindowQueryKey = retainPrevious ? queryKey() : null;
     started = false;
     cancel.hidden = true;
     root.removeAttribute("aria-busy");
-    body.replaceChildren();
-    body.hidden = true;
+    if (!retainPrevious) body.replaceChildren();
+    body.hidden = !retainPrevious;
     body.inert = true;
     body.dataset.state = next === null ? "waiting" : "loading";
     if (next === null) {
       setStatus("waiting");
       return false;
+    }
+    if (retainPrevious) {
+      setStatus("savedUpdating", { date: formatLocal(new Date(response.toMs).toISOString()) });
+      scope.wrapper.hidden = true;
+      for (const control of [views, sort.wrapper, model.wrapper, scope.wrapper, form]) control.inert = true;
     }
     if (visible()) load();
     return true;
@@ -1802,7 +1871,7 @@ export function mountWorkUsageView(options = {}) {
       if (loadInFlightBackground) {
         serial++;
         controller?.abort();
-        clearTimeout(timer);
+        clearLeaseTimer(timer);
         timer = null;
       }
       return;
@@ -1853,7 +1922,7 @@ export function mountWorkUsageView(options = {}) {
     input.placeholder = tr("findHint");
     input.setAttribute("aria-label", tr("findHint"));
     cancel.textContent = tr("cancel");
-    if (statusKey === "snapshot" && response)
+    if (["snapshot", "savedUpdating", "savedUnavailable"].includes(statusKey) && response)
       statusValues = {
         date: formatLocal(new Date(response.toMs).toISOString()),
       };
@@ -1875,7 +1944,8 @@ export function mountWorkUsageView(options = {}) {
       serial++;
       clearNested();
       controller?.abort();
-      clearTimeout(timer);
+      clearLeaseTimer(timer);
+      timer = null;
       observer.disconnect();
       documentRef.removeEventListener?.("visibilitychange", visibilityChanged);
       windowRef.removeEventListener("pageshow", visibilityChanged);

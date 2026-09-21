@@ -1,6 +1,6 @@
 import { parentPort, workerData, isMainThread } from 'node:worker_threads';
-import { opendir, lstat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { opendir, lstat, mkdir, realpath } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { openTimingStore, ingestTimingFile, readTimingRows } from '../../src/platform/index.js';
@@ -60,6 +60,16 @@ async function run() {
     })) });
   }
   try {
+    // Windows' qualified filesystem adapter creates and verifies both parent
+    // directories through its native owner-protection boundary inside open().
+    if (process.platform !== 'win32' && workerData.timingRoot !== undefined) {
+      const root = resolve(workerData.timingRoot);
+      if (await realpath(dirname(root)) !== dirname(root)) throw new Error('unsafe_directory');
+      await mkdir(root, { mode: 0o700 }).catch(error => { if (error.code !== 'EEXIST') throw error; });
+      const metadata = await lstat(root);
+      if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.uid !== process.getuid()
+          || (metadata.mode & 0o077)) throw new Error('unsafe_directory');
+    }
     store = await context.open(workerData.directory);
     publish(true);
     while (!stopped) {

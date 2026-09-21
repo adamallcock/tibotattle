@@ -125,7 +125,8 @@ owner-only permissions. Important entries include:
 | State | Purpose | Retention behavior |
 | --- | --- | --- |
 | `local-unified-index-v1.sqlite` plus device salt | Canonical replay-safe Codex usage/quota/tool projection and source provenance. | Accumulates locally; the 30-day UI horizon is not retention. |
-| `inference-timing-v2/timing-experiment.sqlite` (development source) | Separate owner-only timing sidecar: one row per completed turn, counts/durations/coverage, local HMAC keys, source cursors and bounded pending state. No raw content or IDs. | Maximum 256 MiB; method/SQLite user version 2. Incompatible stores, including version 1, are preserved and refused. Display periods do not delete evidence or migrate the accounting index. |
+| `inference-timing-v2/model-performance-snapshot.json` | At most four rolling-period and eight exact-window completed timing projections, fixed model IDs and numeric bins; 4 MiB owner-only, schema/digest-checked envelope bound to the configured Codex source. | Uses the same atomic snapshot transport as Overview. Restored measurements keep their observation date while background scanning runs or fails; incomplete scans cannot replace them. First result saves immediately, then hourly, with latest completed results flushed on clean shutdown. |
+| `inference-timing-v2/source-<Codex-home digest>/timing-experiment.sqlite` (development source) | Separate owner-only timing sidecar: one row per completed turn, counts/durations/coverage, local HMAC keys, source cursors and bounded pending state. No raw content or IDs. | Maximum 256 MiB per selected source; method/SQLite user version 2. The legacy unscoped sidecar is preserved without reading or migrating its unknown source provenance; first use rebuilds measurements from retained source logs. Incompatible stores, including version 1, are preserved and refused. Display periods do not delete evidence or migrate the accounting index. |
 | `local-collector-state-v1.sqlite` | App-server quota observations, checkpoints, dedupe, locks, and replay-safe collector state. | Accumulates until explicit local erase or a reviewed migration/retention workflow. |
 | `private/` settings/handoff state | Automatic/incremental contribution settings, bounded OAuth restart handle, fast-mode preference, and speed baselines. | Settings persist; the OAuth handle expires and is bounded. |
 | Prepared contribution/review directories and queue | Exact local review, delivery, retry, and audit state. | Retained for replay-safe completion, explicit cleanup, or local erase. |
@@ -417,8 +418,22 @@ report. It expires or is evicted with the report. Search matches are applied
 before pagination and family/project summation, preserving global share
 denominators. Neither search text nor the lookup is serialized, exported or
 uploaded. Refreshing creates a new lookup when names need to be reread.
-Attribution reports are immutable and expire after five minutes without a query
-or lease renewal, with at most two retained per process. The visible Projects &
+Interactive attribution reports are immutable and expire after five minutes without
+a query or lease renewal, with at most two addressable reports per process. Two
+additional last-completed reports may remain in memory for reload continuity;
+search indices are not retained with them. A separate `work-usage-snapshot.json`
+stores at most four completed period/scope projections in a 16 MiB owner-only,
+digest-checked envelope. Project/worktree/thread handles are replaced by anonymous
+snapshot-local aliases before writing; names, raw UUIDs, paths, display metadata
+and search text are absent. Requests match a hashed period/scope key and configured
+source binding; an explicit `endAt` additionally requires the exact saved window. Restored figures retain their original interval and observation
+time and stay read-only while a separate refresh job runs. On companion restart,
+labels explicitly remain anonymous until live enrichment completes. When the
+shared reporting end advances within the same period, the view can keep the dated
+previous figures visible while fetching the exact new window; those figures
+never become the new query's source, cursor or cache entry. Failed,
+cancelled or partial builds preserve the last completed result; an authoritative
+empty result replaces it. The visible Projects &
 threads page renews its lease every minute through a closed, content-free
 `touch` request containing only the schema, action and snapshot handle. This
 performs no aggregation, enrichment or source scan, stops when the page is hidden

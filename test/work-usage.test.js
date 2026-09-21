@@ -79,12 +79,12 @@ function availableResult(events, overrides = {}) {
 
 async function waitForAvailable(service, request) {
   const preparing = await service.query(request);
-  assert.equal(preparing.status, "preparing");
-  const pinnedRequest = { ...request, snapshotId: preparing.snapshotId };
+  assert.ok(preparing.status === "preparing" || preparing.retained === true);
+  const pinnedRequest = { ...request, snapshotId: preparing.refreshSnapshotId ?? preparing.snapshotId };
   for (let attempt = 0; attempt < 5; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 0));
     const result = await service.query(pinnedRequest);
-    if (result.status === "available") return result;
+    if (result.status === "available" && !result.retained) return result;
   }
   assert.fail("work-usage build did not become available");
 }

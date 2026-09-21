@@ -163,9 +163,40 @@ test('background history scan reports honest bounded progress while keeping char
   const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => data },
     t: (key, values) => translate(key, values, 'en-US') });
   dom.show(); await controller.refresh();
+  const updated = translate('performance.updated', { date: new Intl.DateTimeFormat('en-US', {
+    dateStyle: 'medium', timeStyle: 'short',
+  }).format(new Date(data.updatedAt)) }, 'en-US');
   assert.equal(dom.root.all().find(node => node.className === 'performance-status').textContent,
-    'Building earlier history · 629 of 9,026 sessions checked');
+    `Building earlier history · 629 of 9,026 sessions checked · ${updated}`);
   assert.ok(dom.root.all().some(node => node.id === 'performance-model-panel'));
+  controller.destroy();
+});
+
+test('retained measurements show their original update date alongside refresh while loading and failure stay distinct', async () => {
+  const dom = focusHarness();
+  let response = { ...payload(), status: 'loading', updatedAt: null, models: [] };
+  let failure = false;
+  const controller = mountModelPerformance({ ...dom, client: {
+    modelPerformance: async () => { if (failure) throw new Error('synthetic failure'); return response; },
+  }, t: (key, values) => translate(key, values, 'en-US') });
+  const status = () => dom.root.all().find(node => node.className === 'performance-status').textContent;
+  dom.show(); await controller.refresh();
+  assert.equal(status(), translate('performance.updating', {}, 'en-US'));
+  response = { ...payload(), collecting: true };
+  await controller.refresh();
+  const updated = translate('performance.updated', { date: new Intl.DateTimeFormat('en-US', {
+    dateStyle: 'medium', timeStyle: 'short',
+  }).format(new Date(response.updatedAt)) }, 'en-US');
+  assert.equal(status(), `${translate('performance.updating', {}, 'en-US')} · ${updated}`);
+  assert.ok(dom.root.all().some(node => node.id === 'performance-model-panel'));
+  response = payload(); await controller.refresh();
+  assert.equal(status(), updated, 'a fresh report shows its date without an updating claim');
+  failure = true; await controller.refresh();
+  assert.equal(status(), translate('performance.failed', {}, 'en-US'));
+  assert.ok(dom.root.all().some(node => node.id === 'performance-model-panel'));
+  failure = false; response = { ...payload(), status: 'unavailable', updatedAt: null, models: [] };
+  await controller.refresh();
+  assert.equal(status(), translate('performance.unavailable', {}, 'en-US'));
   controller.destroy();
 });
 
@@ -372,6 +403,60 @@ test('shared reporting waits for its bound, maps 24h to the rolling backend peri
   assert.equal(dom.root.all().some(node => node.dataset.performanceFocus?.startsWith('period-')), false);
   assert.equal(dom.root.all().some(node => node.dataset.evidence === 'period'), false, 'the shared header owns the reporting range');
   assert.equal(dom.root.all().filter(node => node.className === 'performance-unit').length, 2, 'coverage remains beside each chart');
+  controller.destroy();
+});
+
+test('advancing a shared end bound retains dated charts under their original bounds and fences cancelled replacements', async () => {
+  const dom = focusHarness();
+  const end = 9 * DAY;
+  const windowAt = value => ({ period: '24h', startAt: new Date(value - DAY).toISOString(), endAt: new Date(value).toISOString() });
+  const exactAt = value => ({ ...payload(), period: '1', start: value - DAY, end: value,
+    models: payload().models.map(model => ({ ...model, speed: [{method: 'speed', points: [point(value - DAY)]}], ttft: [point(value - DAY)] })) });
+  const calls = [];
+  let response = exactAt(end);
+  const controller = mountModelPerformance({ ...dom, reportingWindow: windowAt(end),
+    client: { modelPerformance: async (period, options) => { calls.push({period, options}); return response; } },
+    t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh();
+  const panel = () => dom.root.all().find(node => node.id === 'performance-model-panel');
+  const status = () => dom.root.all().find(node => node.className === 'performance-status').textContent;
+  const pending = Promise.withResolvers(); response = pending.promise;
+  controller.setReportingWindow(windowAt(end + DAY));
+  assert.ok(panel());
+  assert.match(status(), /Updating measurements.+Updated/);
+  const priorBounds = dom.root.all().find(node => node.dataset.evidence === 'period');
+  assert.ok(priorBounds, 'retained charts identify their old bounds even with a shared header');
+  assert.equal(calls.at(-1).options.endAt, windowAt(end + DAY).endAt);
+  pending.resolve(exactAt(end + DAY));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(panel());
+  assert.doesNotMatch(status(), /Updating/);
+  assert.equal(dom.root.all().some(node => node.dataset.evidence === 'period'), false);
+
+  const cancelled = Promise.withResolvers(); response = cancelled.promise;
+  controller.setReportingWindow(windowAt(end + 2 * DAY));
+  controller.cancel();
+  assert.match(status(), /cancelled/i);
+  cancelled.resolve({ ...exactAt(end + 2 * DAY), models: [] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(panel(), 'late cancelled result cannot remove the retained chart');
+  assert.match(status(), /cancelled/i);
+
+  response = exactAt(end);
+  await controller.refresh();
+  assert.ok(panel());
+  assert.match(status(), /Could not update/, 'an old-window response cannot be accepted as the new window');
+  assert.ok(dom.root.all().some(node => node.dataset.evidence === 'period'));
+  response = { ...exactAt(end + 2 * DAY), status: 'unavailable', models: [] };
+  await controller.refresh();
+  assert.ok(panel(), 'an unavailable replacement keeps the old explicitly dated window');
+  assert.match(status(), /Timing measurements are unavailable/);
+  assert.ok(dom.find('retry'));
+  assert.ok(dom.root.all().some(node => node.dataset.evidence === 'period'));
+  response = { ...exactAt(end + 2 * DAY), models: [] };
+  await controller.refresh();
+  assert.equal(panel(), undefined, 'an authoritative empty replacement still clears the old chart');
+  assert.equal(dom.root.all().some(node => node.dataset.evidence === 'period'), false);
   controller.destroy();
 });
 
