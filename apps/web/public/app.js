@@ -11944,7 +11944,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     }
     // The renderer may finish while the main-process start reply is still
     // crossing its bounded bridge timeout. Settle that late lease directly.
-    void signalElectronRefreshLifecycle("refreshSettled", [{ lease }]);
+    void signalElectronRefreshLifecycle("refreshSettled", [lease]);
   };
   localActionBusy = true;
   localRefreshInProgress = true;
@@ -12223,7 +12223,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       let lease = await refreshStartSignal;
       if (!Number.isSafeInteger(lease) || lease <= 0) lease = lateRefreshLease;
       if (Number.isSafeInteger(lease) && lease > 0) {
-        await signalElectronRefreshLifecycle("refreshSettled", [{ lease }]);
+        await signalElectronRefreshLifecycle("refreshSettled", [lease]);
       }
       refreshLifecycleFinished = true;
     }

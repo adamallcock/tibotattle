@@ -495,7 +495,9 @@ test("accepted Electron refreshes acquire and settle the main-process lease", as
         lifecycle.push("started");
         return 41;
       },
-      refreshSettled({ lease }) {
+      refreshSettled(lease) {
+        assert.equal(Number.isSafeInteger(lease), true,
+          "the renderer must pass the numeric lease accepted by the preload bridge");
         lifecycle.push(["settled", lease]);
         return true;
       },
@@ -507,6 +509,30 @@ test("accepted Electron refreshes acquire and settle the main-process lease", as
 
   assert.deepEqual(harness.calls, ["quick", "status", "reload"]);
   assert.deepEqual(lifecycle, ["started", ["settled", 41]]);
+});
+
+test("a late Electron lease is settled with the preload's numeric contract", async () => {
+  let releaseLease;
+  const started = new Promise((resolve) => { releaseLease = resolve; });
+  const settled = [];
+  const harness = refreshHarness({
+    electron: true,
+    bridge: {
+      refreshStarted: () => started,
+      refreshSettled(lease) {
+        assert.equal(Number.isSafeInteger(lease), true);
+        settled.push(lease);
+        return true;
+      },
+    },
+  });
+
+  await harness.context.requestRefresh();
+  assert.deepEqual(settled, []);
+  releaseLease(73);
+  await new Promise(setImmediate);
+
+  assert.deepEqual(settled, [73]);
 });
 
 test("an initial controller conflict is informational and cannot queue detailed work", async () => {
