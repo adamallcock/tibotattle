@@ -2018,11 +2018,10 @@ tbody tr:last-child td { border-bottom: 0; }
 .lead-chart-panel .weekly-history-chart svg { height: clamp(270px, 30vw, 330px); }
 
 .accounting-disclosure { margin-top: -12px; }
-/* Adaptive rather than a fixed three. Price coverage moved out of this row to
-   a caption beside the model rows, and a hard `repeat(3, 1fr)` left the two
-   remaining cards occupying two thirds of the width with a hole where the
-   third used to be. The row now fills whatever cards it is given. */
-.accounting-summary { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+/* Two cards form each accounting row. Auto-fit created four columns on wide
+   windows, leaving both the headline and overhead pairs stranded in the left
+   half of the available space. */
+.accounting-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .accounting-summary > .accounting-speed-coverage { grid-column: 1 / -1; margin: 0; }
 .compact-metric { min-height: 150px; }
 .compact-metric .metric-value { margin: 16px 0 8px; font-size: 2rem; }

@@ -2312,12 +2312,17 @@ test("config-only speed provenance survives normalization and appears in the ren
     (key, values) => translate(key, values, "en"),
     String, (value) => `${value}%`, String,
   );
-  assert.match(render(result.accounting.fastMode), /4 declared by timestamped Codex config/u);
+  assert.equal(
+    render(result.accounting.fastMode),
+    "Speed coverage: 4 of 4 usage increments have a recorded or configured speed. All usage is included.",
+  );
   for (const locale of SUPPORTED_LOCALES) {
-    const sentence = translate("accounting.fastMode.declaredFromConfig", { count: "4" }, locale);
+    const sentence = translate("accounting.fastMode.coverageSummary", {
+      known: "4",
+      total: "4",
+    }, locale);
     assert.ok(sentence.includes("4"));
-    assert.ok(sentence.includes("Codex"));
-    assert.notEqual(sentence, "accounting.fastMode.declaredFromConfig");
+    assert.notEqual(sentence, "accounting.fastMode.coverageSummary");
   }
 });
 

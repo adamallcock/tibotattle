@@ -191,6 +191,11 @@ test("speed attribution occupies a disclosure row without displacing overhead ca
     styles,
     /\.accounting-summary > \.accounting-speed-coverage\s*\{[^}]*grid-column:\s*1\s*\/\s*-1;/u,
   );
+  assert.match(
+    styles,
+    /\.accounting-summary\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/u,
+  );
+  assert.doesNotMatch(styles, /\.accounting-summary\s*\{[^}]*auto-fit/u);
   // This rule still stretches a lone allowance card, but must not mistake the
   // accounting disclosure for a card when deciding which metric is alone.
   assert.match(
@@ -198,4 +203,38 @@ test("speed attribution occupies a disclosure row without displacing overhead ca
     /\.metric-grid:not\(\.accounting-summary\) > :last-child:nth-child\(odd\)/u,
   );
   assert.doesNotMatch(styles, /\.metric-grid > :last-child:nth-child\(odd\)/u);
+});
+
+test("overhead cards keep only the speed-priced amount and actionable coverage gaps", () => {
+  const element = (tagName, className = "", textContent = "") => ({
+    tagName,
+    className,
+    textContent,
+    title: "",
+    children: [],
+    append(...items) { this.children.push(...items); },
+  });
+  const render = appFunction("cacheImpactMetricBullets", "formatCacheSwitchPercentagePoints", {
+    node: element,
+    localizedNode: (tagName, className, key, values) => (
+      element(tagName, className, translate(key, values, "en-US"))
+    ),
+    cacheImpactCostView: () => ({
+      isSubtotal: false,
+      pricedDrops: 124,
+      standardApiPremiumUsd: 50.4,
+    }),
+    finite: (value, fallback = 0) => Number.isFinite(value) ? value : fallback,
+    formatCount: String,
+    t: (key, values) => translate(key, values, "en-US"),
+  });
+  const list = render({
+    orderingCoverageGaps: 2,
+    unpricedDrops: 0,
+    uncoveredConfigurationChanges: 0,
+  }, (details) => { details.textContent = "Full diagnostic detail"; });
+
+  assert.deepEqual(list.children.map((item) => item.textContent), ["124 priced drops"]);
+  assert.doesNotMatch(list.children.map((item) => item.textContent).join(" "), /Standard|sessions excluded/u);
+  assert.equal(list.title, "Full diagnostic detail");
 });
