@@ -842,6 +842,18 @@ export const EN_US_CATALOG = Object.freeze({
   "electron.trayPopover.paceResetFirst": "Projected to reach reset before exhaustion",
   "electron.trayPopover.paceExhaustion": "Projected exhaustion {time}",
   "electron.trayPopover.paceEarly": "Early estimate",
+  "electron.trayPopover.paceNeedsEvidence": "Two fresh weekly allowance observations are needed to estimate pace.",
+  "electron.trayPopover.paceRunsOut": "At this pace, the weekly allowance runs out in {duration}.",
+  "electron.trayPopover.paceNearReset": "At this pace, the weekly allowance runs close to the reset.",
+  "electron.trayPopover.paceLastsToReset": "At this pace, the weekly allowance lasts to the reset.",
+  "electron.trayPopover.paceCompared": "Recent use is about {ratio}× the pace this window can still sustain.",
+  "electron.trayPopover.paceUntilReset": "Allowance lasts to reset",
+  "electron.trayPopover.paceDryStretch": "Nothing left for {duration}",
+  "electron.trayPopover.paceSpare": "About {percent} left at reset",
+  "electron.trayPopover.paceNow": "Now",
+  "electron.trayPopover.paceDurationDaysHours": "{days}d {hours}h",
+  "electron.trayPopover.paceDurationHoursMinutes": "{hours}h {minutes}m",
+  "electron.trayPopover.paceDurationMinutes": "{minutes}m",
 });
 
 export const ZH_HANS_CATALOG = Object.freeze({
@@ -1667,6 +1679,18 @@ export const ZH_HANS_CATALOG = Object.freeze({
   "electron.trayPopover.paceResetFirst": "预计会先达到重置时间",
   "electron.trayPopover.paceExhaustion": "预计耗尽时间：{time}",
   "electron.trayPopover.paceEarly": "早期估计",
+  "electron.trayPopover.paceNeedsEvidence": "需要两次最新的每周额度观测，才能估计使用速度。",
+  "electron.trayPopover.paceRunsOut": "按当前速度，每周额度将在 {duration} 后耗尽。",
+  "electron.trayPopover.paceNearReset": "按当前速度，每周额度将在重置前后用尽。",
+  "electron.trayPopover.paceLastsToReset": "按当前速度，每周额度足以持续到重置。",
+  "electron.trayPopover.paceCompared": "最近用量约为当前可持续速度的 {ratio} 倍。",
+  "electron.trayPopover.paceUntilReset": "额度足以持续到重置",
+  "electron.trayPopover.paceDryStretch": "重置前约 {duration} 无剩余额度",
+  "electron.trayPopover.paceSpare": "重置时预计剩余约 {percent}",
+  "electron.trayPopover.paceNow": "现在",
+  "electron.trayPopover.paceDurationDaysHours": "{days} 天 {hours} 小时",
+  "electron.trayPopover.paceDurationHoursMinutes": "{hours} 小时 {minutes} 分钟",
+  "electron.trayPopover.paceDurationMinutes": "{minutes} 分钟",
 });
 
 export const ES_CATALOG = Object.freeze({
@@ -2492,6 +2516,18 @@ export const ES_CATALOG = Object.freeze({
   "electron.trayPopover.paceResetFirst": "Se prevé que llegue primero al restablecimiento",
   "electron.trayPopover.paceExhaustion": "Agotamiento previsto {time}",
   "electron.trayPopover.paceEarly": "Estimación inicial",
+  "electron.trayPopover.paceNeedsEvidence": "Se necesitan dos observaciones recientes de la asignación semanal para estimar el ritmo.",
+  "electron.trayPopover.paceRunsOut": "A este ritmo, la asignación semanal se agota en {duration}.",
+  "electron.trayPopover.paceNearReset": "A este ritmo, la asignación semanal se agota cerca del reinicio.",
+  "electron.trayPopover.paceLastsToReset": "A este ritmo, la asignación semanal dura hasta el reinicio.",
+  "electron.trayPopover.paceCompared": "El uso reciente es unas {ratio} veces el ritmo que aún puede sostenerse.",
+  "electron.trayPopover.paceUntilReset": "La asignación dura hasta el reinicio",
+  "electron.trayPopover.paceDryStretch": "Sin asignación durante {duration}",
+  "electron.trayPopover.paceSpare": "Quedará cerca del {percent} al reiniciarse",
+  "electron.trayPopover.paceNow": "Ahora",
+  "electron.trayPopover.paceDurationDaysHours": "{days} d {hours} h",
+  "electron.trayPopover.paceDurationHoursMinutes": "{hours} h {minutes} min",
+  "electron.trayPopover.paceDurationMinutes": "{minutes} min",
 });
 
 export const CATALOGS = Object.freeze({

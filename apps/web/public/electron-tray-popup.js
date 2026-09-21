@@ -492,6 +492,7 @@ function buildWeeklyPace(
       outlook: Object.freeze({
         kind: "unavailable",
         standing: null,
+        ratio: null,
         critical: false,
         earlyEstimate: false,
         projectedExhaustionAt: null,
@@ -620,6 +621,7 @@ function buildWeeklyPace(
         outlook: Object.freeze({
           kind: "unavailable",
           standing: null,
+          ratio: null,
           critical: false,
           earlyEstimate: false,
           projectedExhaustionAt: null,
@@ -702,6 +704,7 @@ function buildWeeklyPace(
         outlook: Object.freeze({
           kind: "unavailable",
           standing: null,
+          ratio: null,
           critical: false,
           earlyEstimate: false,
           projectedExhaustionAt: null,
@@ -734,6 +737,7 @@ function buildWeeklyPace(
       outlook: {
         kind: projectedExhaustionAt === null ? "reset_first" : "exhaustion",
         standing,
+        ratio,
         critical: outlook.critical,
         earlyEstimate: outlook.earlyEstimate,
         projectedExhaustionAt,
@@ -772,6 +776,7 @@ function buildWeeklyPace(
       kind: status === "will_reach_reset_first" ? "reset_first"
         : isoInstant(forecast?.etaAt) === null ? "unavailable" : "exhaustion",
       standing: null,
+      ratio: null,
       critical: false,
       earlyEstimate: false,
       projectedExhaustionAt: isoInstant(forecast?.etaAt),
@@ -1155,6 +1160,22 @@ function resetCountdown(seconds, t, numberFormatter) {
   return t("electron.trayPopover.resetMinutes", { minutes: count(minutes) });
 }
 
+function paceDuration(hours, t, numberFormatter) {
+  if (!Number.isFinite(hours) || hours <= 0) return "";
+  const totalMinutes = Math.max(1, Math.ceil(hours * 60));
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const remainingHours = Math.floor(totalMinutes % (24 * 60) / 60);
+  const minutes = totalMinutes % 60;
+  const count = (value) => numberFormatter(value, { maximumFractionDigits: 0 });
+  if (days > 0) return t("electron.trayPopover.paceDurationDaysHours", {
+    days: count(days), hours: count(remainingHours),
+  });
+  if (remainingHours > 0) return t("electron.trayPopover.paceDurationHoursMinutes", {
+    hours: count(remainingHours), minutes: count(minutes),
+  });
+  return t("electron.trayPopover.paceDurationMinutes", { minutes: count(minutes) });
+}
+
 function historyCoverageCounts(days) {
   return days.reduce((counts, day) => {
     if (day?.evidence === "available") counts.complete += 1;
@@ -1258,17 +1279,47 @@ function renderWeeklyPace(documentRef, projection, t, numberFormatter, localForm
   const available = pace.status === "available"
     && hasBoundOutlook
     && resetMatches;
+  const detailed = available
+    && pace.outlook.ratio > 0
+    && pace.outlook.coveredHours > 0
+    && pace.outlook.coveredFraction !== null;
   const insufficient = pace.status === "insufficient_observations"
     && weeklyAllowance !== undefined;
   setHidden(documentRef, "pace-section", !available && !insufficient);
-  setHidden(documentRef, "pace-metrics", !available);
-  setHidden(documentRef, "pace-track", !available);
+  setHidden(documentRef, "pace-timeline", !detailed);
+  setHidden(documentRef, "pace-evidence", !detailed || !pace.outlook.earlyEstimate);
   if (!available) {
+    if (section) delete section.dataset.paceTone;
+    setElementText(documentRef, "pace-state", "");
+    setElementText(documentRef, "pace-headline", "");
+    setElementText(documentRef, "pace-explanation", "");
+    setElementText(documentRef, "pace-evidence", "");
+    setElementText(documentRef, "pace-outlook", "");
+    setElementText(documentRef, "pace-reset", "");
+    setElementText(documentRef, "pace-outcome", "");
+    documentRef.getElementById("pace-track")?.removeAttribute("aria-label");
+    const fill = documentRef.getElementById("pace-fill");
+    if (fill) fill.style.width = "0%";
+    const marker = documentRef.getElementById("pace-active-marker");
+    if (marker) marker.hidden = true;
     if (insufficient) {
       if (section) section.dataset.paceTone = "insufficient";
       setElementText(documentRef, "pace-state", t("weekly.headline.insufficient"));
-      setElementText(documentRef, "pace-outlook", "");
+      setElementText(documentRef, "pace-headline", t("electron.trayPopover.paceNeedsEvidence"));
     }
+    return;
+  }
+
+  if (!detailed) {
+    if (section) delete section.dataset.paceTone;
+    setElementText(documentRef, "pace-state", "");
+    setElementText(documentRef, "pace-headline", pace.outlook.projectedExhaustionAt
+      ? t("electron.trayPopover.paceExhaustion", {
+        time: localFormatter(pace.outlook.projectedExhaustionAt),
+      })
+      : t("electron.trayPopover.paceResetFirst"));
+    setElementText(documentRef, "pace-explanation", "");
+    setElementText(documentRef, "pace-evidence", "");
     return;
   }
 
@@ -1286,40 +1337,42 @@ function renderWeeklyPace(documentRef, projection, t, numberFormatter, localForm
         ? "electron.trayPopover.paceOn"
         : "electron.trayPopover.paceUnder";
   setElementText(documentRef, "pace-state", t(standingKey));
+  const coveredDuration = paceDuration(pace.outlook.coveredHours, t, numberFormatter);
+  const dryDuration = paceDuration(pace.outlook.dryHours, t, numberFormatter);
+  const resetCopy = t("electron.trayPopover.resets", {
+    time: resetCountdown(weeklyAllowance.resetInSeconds, t, numberFormatter),
+  });
+  const ratio = numberFormatter(pace.outlook.ratio, { maximumFractionDigits: 1 });
+  const headline = pace.outlook.standing === "over"
+    ? t("electron.trayPopover.paceRunsOut", { duration: coveredDuration })
+    : pace.outlook.standing === "on"
+      ? t("electron.trayPopover.paceNearReset")
+      : t("electron.trayPopover.paceLastsToReset");
+  const explanation = t("electron.trayPopover.paceCompared", { ratio });
+  const outcome = dryDuration
+    ? t("electron.trayPopover.paceDryStretch", { duration: dryDuration })
+    : t("electron.trayPopover.paceSpare", {
+      percent: displayPercent(pace.outlook.sparePercent, numberFormatter),
+    });
+  setElementText(documentRef, "pace-headline", headline);
+  setElementText(documentRef, "pace-explanation", explanation);
+  setElementText(documentRef, "pace-evidence", pace.outlook.earlyEstimate
+    ? t("electron.trayPopover.paceEarly") : "");
   const outlookCopy = pace.outlook.kind === "reset_first"
-    ? t("electron.trayPopover.paceResetFirst")
+    ? t("electron.trayPopover.paceUntilReset")
     : pace.outlook.projectedExhaustionAt
       ? t("electron.trayPopover.paceExhaustion", {
         time: localFormatter(pace.outlook.projectedExhaustionAt),
       }) : t("weekly.headline.insufficient");
   setElementText(documentRef, "pace-outlook", outlookCopy);
-  setElementText(documentRef, "pace-used", t("dashboard.quota.used", {
-    value: displayPercent(pace.currentUsedPercent, numberFormatter),
-  }));
-  setElementText(documentRef, "pace-remaining", t("electron.trayPopover.remaining", {
-    value: displayPercent(pace.remainingPercent, numberFormatter),
-  }));
-  const rate = pace.pace.overallPercentagePointsPerHour;
-  setElementText(documentRef, "pace-rate", rate === null
-    ? "—"
-    : `${numberFormatter(rate, { maximumFractionDigits: 1 })} pp/h`);
-  setElementText(documentRef, "pace-reset", t("electron.trayPopover.resets", {
-    time: resetCountdown(weeklyAllowance.resetInSeconds, t, numberFormatter),
-  }));
+  setElementText(documentRef, "pace-reset", resetCopy);
+  setElementText(documentRef, "pace-now", t("electron.trayPopover.paceNow"));
+  setElementText(documentRef, "pace-outcome", outcome);
   const track = documentRef.getElementById("pace-track");
   const coveredPercent = pace.outlook.coveredFraction === null
     ? null : pace.outlook.coveredFraction * 100;
   if (track) {
-    track.setAttribute("role", "progressbar");
-    track.setAttribute("aria-valuemin", "0");
-    track.setAttribute("aria-valuemax", "100");
-    if (coveredPercent === null) {
-      track.removeAttribute("aria-valuenow");
-      track.setAttribute("aria-valuetext", t("weekly.headline.insufficient"));
-    } else {
-      track.setAttribute("aria-valuenow", String(coveredPercent));
-      track.setAttribute("aria-valuetext", displayPercent(coveredPercent, numberFormatter));
-    }
+    track.setAttribute("aria-label", `${headline} ${explanation} ${outcome}. ${resetCopy}.`);
   }
   const fill = documentRef.getElementById("pace-fill");
   if (fill) fill.style.width = coveredPercent === null ? "0%" : `${coveredPercent}%`;
@@ -1533,7 +1586,9 @@ export function renderTrayPopup(documentRef, projection, {
   renderWeeklyPace(documentRef, projection, translated, formatNumberImpl, formatLocalImpl);
   renderHistory(documentRef, projection, translated, formatNumberImpl, formattingLocale);
   applyTrayPopupPreferences(documentRef, projection, preferences, translated, formatNumberImpl);
-  if (preferences.resetFormat === "clock" && projection.weeklyPace.resetsAt) {
+  if (preferences.resetFormat === "clock"
+      && projection.weeklyPace.resetsAt
+      && documentRef.getElementById("pace-timeline")?.hidden === false) {
     setElementText(documentRef, "pace-reset", translated("electron.trayCustomization.resetAt", { time: formatLocalImpl(projection.weeklyPace.resetsAt) }));
   }
   const freshness = projection.freshness;

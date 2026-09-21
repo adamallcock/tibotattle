@@ -36,17 +36,23 @@
         <h2 id="pace-heading" data-i18n="electron.trayPopover.weeklyPace">Weekly pace</h2>
         <div class="electron-tray-popup-pace-heading">
           <p id="pace-state"></p>
-          <p id="pace-outlook" class="electron-tray-popup-muted"></p>
+          <p id="pace-headline"></p>
+          <p id="pace-explanation" class="electron-tray-popup-muted"></p>
+          <p id="pace-evidence" class="electron-tray-popup-muted" hidden></p>
         </div>
-        <div id="pace-metrics" class="electron-tray-popup-pace-metrics">
-          <span id="pace-used"></span>
-          <span id="pace-remaining"></span>
-          <span id="pace-rate"></span>
-          <span id="pace-reset"></span>
-        </div>
-        <div id="pace-track" class="electron-tray-popup-pace-track">
-          <span id="pace-fill" class="electron-tray-popup-pace-fill"></span>
-          <span id="pace-active-marker" class="electron-tray-popup-pace-active-marker" aria-hidden="true"></span>
+        <div id="pace-timeline" class="electron-tray-popup-pace-timeline" hidden>
+          <div class="electron-tray-popup-pace-timeline-labels">
+            <span id="pace-outlook"></span>
+            <span id="pace-reset"></span>
+          </div>
+          <div id="pace-track" class="electron-tray-popup-pace-track" role="img">
+            <span id="pace-fill" class="electron-tray-popup-pace-fill"></span>
+            <span id="pace-active-marker" class="electron-tray-popup-pace-active-marker" aria-hidden="true"></span>
+          </div>
+          <div class="electron-tray-popup-pace-timeline-foot">
+            <span id="pace-now"></span>
+            <span id="pace-outcome"></span>
+          </div>
         </div>
       </section>
 

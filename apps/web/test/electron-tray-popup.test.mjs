@@ -15,6 +15,7 @@ import {
   SUPPORTED_LOCALES,
   translate,
 } from "../public/localization.js";
+import { TRAY_DEFAULTS } from "../public/electron-tray-preferences.js";
 
 const NOW = "2026-09-04T18:00:00.000Z";
 
@@ -253,8 +254,9 @@ class FakeDocument {
       "history-unavailable", "history-unavailable-title", "history-unavailable-body",
       "history-period", "history-tokens", "history-events", "history-price",
       "history-start", "history-end", "history-coverage", "history-retained",
-      "history-bars", "history-bar-detail", "pace-section", "pace-state", "pace-outlook", "pace-metrics",
-      "pace-used", "pace-remaining", "pace-rate", "pace-reset", "pace-track",
+      "history-bars", "history-bar-detail", "pace-section", "pace-state", "pace-headline",
+      "pace-explanation", "pace-evidence", "pace-timeline", "pace-outlook", "pace-reset",
+      "pace-track", "pace-now", "pace-outcome",
       "pace-fill", "pace-active-marker", "tray-popup-freshness", "tray-popup-live",
     ]) this.elements.set(id, new FakeElement());
     this.ranges = [new FakeElement({ historyRange: "7d" }), new FakeElement({ historyRange: "30d" })];
@@ -318,6 +320,8 @@ test("tray popup assets are local, bounded, and wired as a visual surface", asyn
   // The compact pace feature is initially hidden and becomes visible only
   // after a current weekly allowance binds the validated outlook.
   assert.match(html, /id="pace-section"[^>]*hidden/u);
+  assert.match(html, /id="pace-headline"/u);
+  assert.match(html, /id="pace-outcome"/u);
   assert.match(html, /id="pace-track"/u);
   assert.match(html, /id="history-bars"/u);
   assert.match(html, /data-history-range="7d"/u);
@@ -454,6 +458,7 @@ test("projection keeps the normal Codex lanes and exact shared pace outlook", ()
   assert.equal(projection.weeklyPace.resetsAt, "2026-09-07T20:00:00.000Z");
   assert.equal(projection.weeklyPace.outlook.kind, "reset_first");
   assert.equal(projection.weeklyPace.outlook.standing, "under");
+  assert.equal(projection.weeklyPace.outlook.ratio, 0.2 / (60 / 74));
   assert.equal(projection.weeklyPace.outlook.coveredFraction, 1);
   assert.equal(Object.hasOwn(projection, "accountId"), false);
   assert.equal(Object.hasOwn(projection, "raw"), false);
@@ -465,7 +470,14 @@ test("weekly pace renders only for a current allowance bound to its valid outloo
   assert.equal(documentRef.getElementById("pace-section").hidden, false);
   assert.equal(documentRef.getElementById("pace-state").textContent, "Under sustainable pace");
   assert.equal(documentRef.getElementById("pace-section").dataset.paceTone, "under");
-  assert.equal(documentRef.getElementById("pace-track").attributes.get("aria-valuenow"), "100");
+  assert.equal(documentRef.getElementById("pace-headline").textContent,
+    "At this pace, the weekly allowance lasts to the reset.");
+  assert.match(documentRef.getElementById("pace-explanation").textContent, /0\.2×/u);
+  assert.equal(documentRef.getElementById("pace-outcome").textContent, "About 45% left at reset");
+  assert.equal(documentRef.getElementById("pace-timeline").hidden, false);
+  assert.equal(documentRef.getElementById("pace-fill").style.width, "100%");
+  assert.match(documentRef.getElementById("pace-track").attributes.get("aria-label"), /Resets in 3d 2h/u);
+  assert.equal(documentRef.getElementById("pace-track").attributes.has("aria-valuenow"), false);
 
   const stale = fixture();
   stale.freshness.latestObservedAt = "2026-09-04T17:29:59.000Z";
@@ -499,26 +511,73 @@ test("weekly pace explains a verified zero-observation state without estimating"
   renderTrayPopup(documentRef, projection);
   assert.equal(documentRef.getElementById("pace-section").hidden, false);
   assert.equal(documentRef.getElementById("pace-state").textContent, "Insufficient evidence");
-  assert.equal(documentRef.getElementById("pace-metrics").hidden, true);
-  assert.equal(documentRef.getElementById("pace-track").hidden, true);
+  assert.match(documentRef.getElementById("pace-headline").textContent, /Two fresh weekly allowance observations/u);
+  assert.equal(documentRef.getElementById("pace-timeline").hidden, true);
 });
 
-test("critical weekly pace uses the dedicated urgency treatment", async () => {
+test("critical weekly pace explains the dry stretch with matching timeline geometry", async () => {
   const css = await readFile(new URL("../public/electron-tray-popup.css", import.meta.url), "utf8");
-  const base = createTrayPopupProjection(fixture(), { now: NOW, timeZone: "UTC" });
-  const projection = {
-    ...base,
-    weeklyPace: {
-      ...base.weeklyPace,
-      outlook: { ...base.weeklyPace.outlook, standing: "over", critical: true },
-    },
-  };
+  const data = fixture();
+  const outlook = data.weekly.paceOutlook;
+  outlook.standing = "over";
+  outlook.critical = true;
+  outlook.rates.activePercentagePointsPerHour = 3;
+  outlook.rates.overallPercentagePointsPerHour = 2;
+  outlook.rates.headlinePercentagePointsPerHour = 2;
+  outlook.rates.ratio = 2 / (60 / 74);
+  outlook.projection.coveredHours = 30;
+  outlook.projection.dryHours = 44;
+  outlook.projection.sparePercent = 0;
+  outlook.projection.projectedExhaustionAt = "2026-09-06T00:00:00.000Z";
+  outlook.track.coveredFraction = 30 / 74;
+  outlook.track.activeExhaustionFraction = 20 / 74;
+  const projection = createTrayPopupProjection(data, { now: NOW, timeZone: "UTC" });
+  assert.equal(projection.weeklyPace.status, "available");
   const documentRef = new FakeDocument();
   renderTrayPopup(documentRef, projection);
   assert.equal(documentRef.getElementById("pace-section").dataset.paceTone, "critical");
-  assert.match(css, /data-pace-tone="critical"[\s\S]*#pace-state/u);
-  assert.match(css, /data-pace-tone="critical"[\s\S]*pace-fill/u);
-  assert.match(css, /#pace-outlook[\s\S]*overflow-wrap:\s*anywhere/u);
+  assert.equal(documentRef.getElementById("pace-headline").textContent,
+    "At this pace, the weekly allowance runs out in 1d 6h.");
+  assert.equal(documentRef.getElementById("pace-outcome").textContent, "Nothing left for 1d 20h");
+  assert.match(documentRef.getElementById("pace-explanation").textContent, /2\.5×/u);
+  assert.equal(documentRef.getElementById("pace-fill").style.width, `${(30 / 74) * 100}%`);
+  assert.equal(documentRef.getElementById("pace-active-marker").style.left, `${(20 / 74) * 100}%`);
+  assert.match(documentRef.getElementById("pace-track").attributes.get("aria-label"), /Nothing left for 1d 20h/u);
+  assert.match(css, /data-pace-tone="critical"/u);
+  assert.match(css, /background-image: repeating-linear-gradient/u);
+});
+
+test("an early pace estimate stays visibly qualified", () => {
+  const data = fixture();
+  data.weekly.paceOutlook.observationCount = 2;
+  data.weekly.paceOutlook.earlyEstimate = true;
+  const documentRef = new FakeDocument();
+  renderTrayPopup(documentRef, createTrayPopupProjection(data, { now: NOW, timeZone: "UTC" }));
+  assert.equal(documentRef.getElementById("pace-evidence").hidden, false);
+  assert.equal(documentRef.getElementById("pace-evidence").textContent, "Early estimate");
+});
+
+test("an older forecast remains readable without inventing timeline geometry", () => {
+  const data = fixture();
+  delete data.weekly.paceOutlook;
+  const projection = createTrayPopupProjection(data, { now: NOW, timeZone: "UTC" });
+  assert.equal(projection.weeklyPace.status, "available");
+  const documentRef = new FakeDocument();
+  renderTrayPopup(documentRef, projection);
+  assert.equal(documentRef.getElementById("pace-section").hidden, false);
+  assert.match(documentRef.getElementById("pace-headline").textContent, /Projected exhaustion/u);
+  assert.equal(documentRef.getElementById("pace-timeline").hidden, true);
+  assert.equal(documentRef.getElementById("pace-explanation").textContent, "");
+});
+
+test("clock-format customization updates the timeline reset label", () => {
+  const documentRef = new FakeDocument();
+  renderTrayPopup(documentRef, createTrayPopupProjection(fixture(), { now: NOW, timeZone: "UTC" }), {
+    preferences: { ...TRAY_DEFAULTS, resetFormat: "clock" },
+    localFormatter: () => "Sep 7, 4:00 PM",
+  });
+  assert.equal(documentRef.getElementById("pace-reset").textContent, "Resets at Sep 7, 4:00 PM");
+  assert.equal(documentRef.getElementById("pace-timeline").hidden, false);
 });
 
 test("allowance claims retain stale observations only until their own future reset", () => {
