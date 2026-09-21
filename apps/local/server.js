@@ -1,4 +1,5 @@
 import { createWorkUsageService } from "../../src/application/index.js";
+import { createWorkUsageSnapshotStore } from "./work-usage-snapshots.js";
 import { enrichWorkUsageRows } from "../../src/local-work-usage-source.js";
 import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
@@ -4348,7 +4349,14 @@ function createPreparedLocalCompanionServer({
     return authorization;
   };
 
-  const workUsage = createWorkUsageService({ build: workUsageBuild, enrich: workUsageEnrich });
+  const workUsage = createWorkUsageService({ build: workUsageBuild, enrich: workUsageEnrich,
+    snapshotStore: createWorkUsageSnapshotStore({
+      snapshotFile: join(stateRoot, "work-usage-snapshot.json"),
+      codexHome, indexFile: statePaths.unifiedIndexFile,
+    }),
+  });
+  let workUsageShutdown = null;
+  const closeWorkUsage = () => workUsageShutdown ??= workUsage.close();
   const server = createServer(async (request, response) => {
     try {
       if (!isLoopbackPeer(request)) {
@@ -5547,7 +5555,7 @@ function createPreparedLocalCompanionServer({
   });
 
   server.on("close", () => {
-    workUsage.close();
+    void closeWorkUsage().catch(() => onError("work_usage_shutdown_failed"));
     void Promise.resolve(sharedProjectionReader.close?.()).catch(() => onError("local_projection_shutdown_failed"));
   });
 
@@ -5571,6 +5579,7 @@ function createPreparedLocalCompanionServer({
     ),
     shutdownContributionRuntime,
     closeModelPerformance,
+    closeWorkUsage,
   };
 }
 
@@ -5643,6 +5652,7 @@ export async function startLocalCompanionServer({
       await closeHttpServer(app.server);
       await Promise.all([
         app.closeModelPerformance(),
+        app.closeWorkUsage(),
         app.shutdownContributionRuntime(),
       ]);
     },

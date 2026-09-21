@@ -107,7 +107,7 @@ test("service reports cached accounting bounds and passes the selected period", 
     const query = { schemaVersion: WORK_USAGE_SCHEMA, period: "all" };
     const pending = await service.query(query);
     await new Promise(resolve => setImmediate(resolve));
-    const result = await service.query({ ...query, snapshotId: pending.snapshotId });
+    const result = await service.query({ ...query, snapshotId: pending.refreshSnapshotId ?? pending.snapshotId });
     assert.equal(input.period, "all");
     assert.equal(result.status, "available");
     assert.equal(result.fromMs, 0);
@@ -201,7 +201,7 @@ test("related periods reuse accounting even when a cold build outlasts moving-wi
   async function settle(query) {
     const pending = await service.query({ schemaVersion: WORK_USAGE_SCHEMA, ...query });
     await new Promise(resolve => setImmediate(resolve));
-    return service.query({ schemaVersion: WORK_USAGE_SCHEMA, period: query.period, snapshotId: pending.snapshotId });
+    return service.query({ schemaVersion: WORK_USAGE_SCHEMA, period: query.period, snapshotId: pending.refreshSnapshotId ?? pending.snapshotId });
   }
   try {
     let report = await settle({ period: "7d" });

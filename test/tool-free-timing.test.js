@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm, realpath } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rename, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createParser, createToolFreeParser, digest, METHOD, TOOL_FREE_METHOD, MAX_STATE_BYTES } from '../src/providers/codex/logs.js';
 import { openTimingStore, ingestTimingFile, readTimingRows } from '../src/platform/index.js';
 import { createModelPerformanceController } from '../apps/local/model-performance-controller.js';
+import { modelPerformanceSourceScope } from '../apps/local/model-performance-snapshots.js';
 
 const BASE = Date.parse('2026-06-01T12:00:00Z');
 const key = Buffer.alloc(32, 7);
@@ -178,11 +179,12 @@ test('real worker backfills the supplement beside saved measurements and preserv
   await ingestTimingFile(primary, source);
   const before = readTimingRows(primary);
   const options = { directory: join(dir, 'primary'), codexHome };
-  const ready = async controller => {
+  const ready = async (controller, expectedModels = 1) => {
     const deadline = Date.now() + 10000;
     while (Date.now() < deadline) {
       const result = await controller.read('all');
-      if (result.status === 'ready' && !result.collecting && result.models.length) return result;
+      if (expectedModels === 0) assert.deepEqual(result.models, [], 'another source cannot supply either throughput population');
+      if (result.status === 'ready' && !result.collecting && result.models.length === expectedModels) return result;
       await new Promise(resolve => setTimeout(resolve, 20));
     }
     assert.fail('worker did not complete the additive scan');
@@ -197,13 +199,47 @@ test('real worker backfills the supplement beside saved measurements and preserv
       assert.deepEqual(readTimingRows(primary), before);
     } finally { await controller.close(); }
   }
-  // Forward/incompatible supplemental state must not hide original metrics.
-  const extra = await openTimingStore(join(options.directory, 'tool-free-v1'), extraConfig(primary.key));
-  extra.db.exec('PRAGMA user_version=999'); extra.close();
-  const controller = createModelPerformanceController(options);
+  const emptyHome = join(dir, 'empty-codex');
+  await mkdir(join(emptyHome, 'sessions'), { recursive: true });
+  for (const [home, expectedModels] of [[emptyHome, 0], [codexHome, 1]]) {
+    const controller = createModelPerformanceController({ ...options, codexHome: home });
+    try {
+      const result = await ready(controller, expectedModels);
+      assert.equal(result.stale, false);
+      if (expectedModels) {
+        assert.equal(result.models[0].toolFreeTurns, 1);
+        assert.equal(result.models[0].toolFree[0].median, 100, 'returning to the original source preserves its supplement');
+      }
+    } finally { await controller.close(); }
+  }
+  // Each Codex root owns both of its additive sidecars; the unscoped original
+  // remains untouched because it cannot prove which root produced its rows.
+  const scopedDirectory = join(options.directory, `source-${modelPerformanceSourceScope(codexHome)}`);
+  const scopedPrimary = await openTimingStore(scopedDirectory, primaryConfig);
+  try {
+    const extra = await openTimingStore(join(scopedDirectory, 'tool-free-v1'), extraConfig(scopedPrimary.key));
+    extra.db.exec('PRAGMA user_version=999'); extra.close();
+    assert.equal(scopedPrimary.db.prepare('PRAGMA user_version').get().user_version, METHOD);
+  } finally { scopedPrimary.close(); }
+  const snapshotFile = join(options.directory, 'model-performance-snapshot.json');
+  const saved = await readFile(snapshotFile, 'utf8');
+  let controller = createModelPerformanceController(options);
+  try {
+    const result = await ready(controller);
+    assert.equal(result.stale, true); assert.equal(result.models[0].ttftTurns, 1);
+    assert.equal(result.models[0].turns, 1); assert.equal(result.models[0].toolFreeTurns, 1);
+    assert.equal(result.models[0].toolFree[0].median, 100, 'last completed supplement stays visible with stale label');
+  } finally { await controller.close(); }
+  assert.equal(await readFile(snapshotFile, 'utf8'), saved, 'failed supplement cannot replace the saved completion');
+  // Without a retained completion, an incompatible supplement still leaves the
+  // original metrics available; no new throughput evidence is manufactured.
+  await rename(snapshotFile, join(options.directory, 'preserved-snapshot.json'));
+  controller = createModelPerformanceController(options);
   try {
     const result = await ready(controller);
     assert.equal(result.stale, true); assert.equal(result.models[0].ttftTurns, 1);
     assert.equal(result.models[0].turns, 1); assert.equal(result.models[0].toolFreeTurns, 0);
+    assert.deepEqual(result.models[0].toolFree, []);
+    assert.deepEqual(readTimingRows(primary), before, 'legacy original metrics remain unchanged');
   } finally { await controller.close(); }
 });

@@ -2049,3 +2049,256 @@ test("cold startup polls back off while retaining a fixed request budget", async
     });
   }
 });
+
+function retainedResponse({ namesAvailable = false, refreshing = true } = {}) {
+  const result = structuredClone(PROJECT_ROWS_RESPONSE);
+  result.snapshotId = "saved-report";
+  result.retained = true;
+  result.refreshing = refreshing;
+  result.refreshSnapshotId = refreshing ? "pending-report" : null;
+  result.namesAvailable = namesAvailable;
+  if (!namesAvailable) {
+    result.rows.forEach((row, index) => { row.id = `p-${index}`; });
+    result.display = {};
+    result.scopes = [];
+    result.nextCursor = null;
+  }
+  return result;
+}
+
+test("the browser validates saved report refresh and anonymous display boundaries", () => {
+  for (const options of [{}, { namesAvailable: true }, { refreshing: false }]) {
+    const value = retainedResponse(options);
+    assert.equal(validateWorkUsageResponse(value), value);
+  }
+  for (const [label, mutate] of [
+    ["retained boolean", value => { value.retained = "true"; }],
+    ["refreshing boolean", value => { value.refreshing = 1; }],
+    ["names boolean", value => { value.namesAvailable = null; }],
+    ["missing names state", value => { delete value.namesAvailable; }],
+    ["missing refresh state", value => { delete value.refreshing; }],
+    ["missing refresh target", value => { delete value.refreshSnapshotId; }],
+    ["same refresh target", value => { value.refreshSnapshotId = value.snapshotId; }],
+    ["target after failure", value => { value.refreshing = false; }],
+    ["anonymous decorations", value => { value.display = { "p-0": { name: "Unexpected name" } }; }],
+    ["anonymous scope", value => { value.scopes = PROJECT_ROWS_RESPONSE.scopes; }],
+    ["anonymous cursor", value => { value.nextCursor = "old-cursor"; }],
+    ["retained non-report", value => { value.status = "preparing"; }],
+  ]) {
+    const value = retainedResponse(); mutate(value); assertInvalid(value, label);
+  }
+});
+
+test("first load shows anonymous saved figures while polling the replacement snapshot", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, windowRef } = harness;
+  const calls = [];
+  const replacement = { ...PROJECT_ROWS_RESPONSE, snapshotId: "pending-report" };
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      calls.push(JSON.parse(init.body));
+      return httpResponse(calls.length === 1 ? retainedResponse() : replacement);
+    },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  const body = root.children.at(-1);
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true);
+  assert.match(root.textContent, /Saved report as of .+Updating/);
+  assert.match(body.textContent, /Saved project 1/);
+  assert.match(body.textContent, /Saved project 2/);
+  assert.match(body.textContent, /names will return after the report refreshes/);
+  assert.doesNotMatch(body.textContent, /p-0|p-1|Project A|Project B/);
+  assert.equal(findMounted(root, node => node.classList.contains("work-usage-select"))
+    .find(node => node.firstChild.textContent === "Account scope").hidden, true);
+  assert.equal(findMounted(root, node => node.tagName === "FORM")[0].inert, true);
+  findMounted(body, node => node.classList.contains("work-usage-project-toggle"))[0].click();
+  assert.equal(calls.length, 1, "saved identities cannot start a drilldown");
+  await harness.runTimer(750);
+  await settleMountedView();
+  assert.equal(calls[1].snapshotId, "pending-report");
+  assert.equal(calls[1].sourceSnapshotId, undefined);
+  assert.equal(body.inert, false);
+  assert.match(body.textContent, /Project A/);
+  assert.doesNotMatch(root.textContent, /Saved report|names will return/);
+  assert.equal(findMounted(root, node => node.tagName === "FORM")[0].inert, false);
+  assert.equal([...harness.timers.values()].some(timer => timer.delay === 750), false);
+});
+
+test("saved in-memory reports retain names and failures remain visible without polling", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, windowRef } = harness;
+  const calls = [];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      calls.push(JSON.parse(init.body));
+      return httpResponse(retainedResponse({ namesAvailable: true, refreshing: false }));
+    },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  const body = root.children.at(-1);
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true);
+  assert.match(body.textContent, /Project A/);
+  assert.match(root.textContent, /Saved report as of .+Update unavailable/);
+  assert.doesNotMatch(root.textContent, /names will return/);
+  assert.equal(harness.timers.size, 0);
+  assert.equal(root.getAttribute("aria-busy"), null);
+  view.refresh(); await settleMountedView();
+  assert.equal(calls[1].snapshotId, undefined);
+  assert.equal(calls[1].sourceSnapshotId, undefined);
+});
+
+test("a failed replacement poll keeps the exact saved figures and a fresh empty report replaces them", async (t) => {
+  for (const failure of [new Error("temporary failure"), httpResponse({
+    schemaVersion: WORK_USAGE_SCHEMA, status: "unavailable", snapshotId: "pending-report",
+  })]) {
+    await t.test(failure instanceof Error ? "network failure" : "unavailable response", async (t) => {
+      const harness = mountedLeaseRoot();
+      const { root, windowRef } = harness;
+      let calls = 0;
+      const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+        fetchRef: async () => {
+          if (++calls === 1) return httpResponse(retainedResponse());
+          if (calls === 2) { if (failure instanceof Error) throw failure; return failure; }
+          return httpResponse({ ...PROJECT_ROWS_RESPONSE, rows: [], rowCount: 0,
+            snapshotId: "empty-fresh-report", display: {} });
+        },
+      });
+      t.after(() => view.destroy());
+      await settleMountedView();
+      const body = root.children.at(-1);
+      const old = body.textContent;
+      await harness.runTimer(750); await settleMountedView();
+      assert.equal(body.hidden, false);
+      assert.equal(body.textContent, old);
+      assert.match(root.textContent, /Saved report as of .+Update unavailable/);
+      assert.equal(harness.timers.size, 0);
+      view.refresh(); await settleMountedView();
+      assert.equal(body.inert, false);
+      assert.match(body.textContent, /No recorded usage matches this view/);
+      assert.doesNotMatch(root.textContent, /Saved project|Saved report/);
+    });
+  }
+});
+
+test("period changes discard the saved source anchor and late saved responses cannot replace the new report", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, windowRef } = harness;
+  const pending = deferred();
+  const calls = [];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      calls.push(JSON.parse(init.body));
+      if (calls.length === 1) return httpResponse(retainedResponse());
+      if (calls.length === 2) return pending.promise;
+      return httpResponse({ ...PROJECT_ROWS_RESPONSE, snapshotId: "new-period-report" });
+    },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  harness.runTimer(750);
+  await settleMountedView();
+  findMounted(root, node => node.dataset?.period === "all")[0].click();
+  assert.equal(root.children.at(-1).hidden, true);
+  await settleMountedView();
+  assert.equal(calls[2].period, "all");
+  assert.equal(calls[2].snapshotId, undefined);
+  assert.equal(calls[2].sourceSnapshotId, undefined);
+  pending.resolve(httpResponse(retainedResponse()));
+  await settleMountedView();
+  assert.equal(root.children.at(-1).inert, false);
+  assert.match(root.textContent, /Project A/);
+  assert.doesNotMatch(root.textContent, /Saved report/);
+});
+
+test("cold preload retains saved figures while polling the replacement before warming sibling periods", async (t) => {
+  const harness = mountedLeaseRoot();
+  harness.root.inert = true;
+  const calls = [];
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body); calls.push(query);
+      if (calls.length <= 2) return httpResponse(retainedResponse());
+      return httpResponse(warmReport(query.sourceSnapshotId ? `warm-${query.period}` : "pending-report", "Fresh report"));
+    },
+  });
+  t.after(() => view.destroy());
+  const preloading = view.preload();
+  await settleMountedView();
+  assert.match(harness.root.textContent, /Saved project 1/);
+  assert.equal(harness.root.children.at(-1).inert, true);
+  assert.equal(calls.length, 1);
+  harness.runTimer(750); await settleMountedView();
+  assert.equal(calls[1].snapshotId, "pending-report");
+  assert.equal(calls[1].sourceSnapshotId, undefined);
+  assert.equal(calls.length, 2, "retained replies do not anchor speculative period queries");
+  harness.runTimer(1500); await settleMountedView();
+  assert.equal(await preloading, true);
+  assert.equal(calls[2].snapshotId, "pending-report");
+  assert.ok(calls.slice(3).every(query => query.sourceSnapshotId === "pending-report"));
+  assert.match(harness.root.textContent, /Fresh report/);
+  assert.doesNotMatch(harness.root.textContent, /Saved report/);
+  assert.equal(harness.root.children.at(-1).inert, true, "inactive report still needs lease validation");
+});
+
+test("advancing the shared end bound keeps the dated previous report read-only until the exact replacement arrives", async (t) => {
+  const harness = mountedLeaseRoot();
+  const calls = [];
+  const windowAt = end => ({ period: "24h", startAt: new Date(end - 86_400_000).toISOString(), endAt: new Date(end).toISOString() });
+  const pending = deferred();
+  let reply = httpResponse(PROJECT_ROWS_RESPONSE);
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator, reportingWindow: windowAt(NOW),
+    fetchRef: async (_url, init) => { calls.push(JSON.parse(init.body)); return reply; },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  const body = harness.root.children.at(-1);
+  const previous = body.textContent;
+  reply = pending.promise;
+  view.setReportingWindow(windowAt(NOW + 1000));
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true);
+  assert.equal(body.textContent, previous);
+  assert.match(harness.root.textContent, /Saved report as of .+Updating/);
+  assert.equal(calls[1].endAt, windowAt(NOW + 1000).endAt);
+  assert.equal(calls[1].snapshotId, undefined);
+  assert.equal(calls[1].sourceSnapshotId, undefined);
+  assert.equal(calls[1].cursor, undefined);
+  pending.resolve(httpResponse({ ...PROJECT_ROWS_RESPONSE, snapshotId: "exact-new-report", toMs: NOW + 1000,
+    fromMs: NOW + 1000 - 86_400_000 }));
+  await settleMountedView();
+  assert.equal(body.inert, false);
+  assert.doesNotMatch(harness.root.textContent, /Saved report/);
+
+  const cancelled = deferred(); reply = cancelled.promise;
+  view.setReportingWindow(windowAt(NOW + 2000));
+  findMounted(harness.root, node => node.tagName === "BUTTON" && node.textContent === "Cancel")[0].click();
+  const beforeLate = body.textContent;
+  cancelled.resolve(httpResponse({ ...PROJECT_ROWS_RESPONSE, snapshotId: "late-report", rows: [], rowCount: 0,
+    toMs: NOW + 2000, fromMs: NOW + 2000 - 86_400_000 }));
+  await settleMountedView();
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true);
+  assert.equal(body.textContent, beforeLate);
+  assert.match(harness.root.textContent, /cancelled/i);
+});
+
+test("wrong-window replacements fail closed while leaving the prior shared report explicitly saved", async (t) => {
+  const harness = mountedLeaseRoot();
+  const windowAt = end => ({ period: "24h", startAt: new Date(end - 86_400_000).toISOString(), endAt: new Date(end).toISOString() });
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator, reportingWindow: windowAt(NOW),
+    fetchRef: async () => httpResponse(PROJECT_ROWS_RESPONSE),
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  view.setReportingWindow(windowAt(NOW + 1000));
+  await settleMountedView();
+  assert.equal(harness.root.children.at(-1).hidden, false);
+  assert.equal(harness.root.children.at(-1).inert, true);
+  assert.match(harness.root.textContent, /Saved report as of .+Update unavailable/);
+  view.setReportingWindow({ period: "7d", startAt: new Date(NOW - 7 * 86_400_000).toISOString(), endAt: new Date(NOW).toISOString() });
+  assert.equal(harness.root.children.at(-1).hidden, true, "changing the period cannot borrow old figures");
+});

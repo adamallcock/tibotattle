@@ -9,6 +9,7 @@ export {
   readBoundedUtf8Lines,
 } from "./bounded-jsonl-reader.js";
 export { readBoundedDirectoryEntries } from "./bounded-directory-reader.js";
+export { createValidatedSnapshotStore } from "./validated-snapshot-store.js";
 export {
   COMPRESSED_ROLLOUT_LIMITS,
   compressedRolloutHandle,

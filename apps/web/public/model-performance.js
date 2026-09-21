@@ -179,6 +179,8 @@ export function mountModelPerformance(options = {}) {
   let reportingWindow = sharedReporting ? normalizeReportingWindow(options.reportingWindow) : null;
   let modelId = Object.hasOwn(MODEL_NAMES, saved.model) ? saved.model : null;
   let payload = null, loading = false, failed = false, cancelled = false, request = 0, timer = null;
+  let retainedWindowKey = null;
+  let retainedWindowUnavailable = false;
   let foregroundKey = null;
   // Retain only a bounded set of exact reporting windows for this mounted
   // local view. Shared end bounds can change as accounting snapshots advance.
@@ -260,7 +262,7 @@ export function mountModelPerformance(options = {}) {
     return reportTranslate("range", { start: fullDateFormat.format(new Date(startAt)), end });
   };
   const appendReportingEvidence = (container, selected = null) => {
-    if (!sharedReporting && selected) {
+    if ((!sharedReporting || retainedWindowKey !== null) && selected) {
       const fallback = { period: selected.period === "1" ? "24h" : selected.period === "7" ? "7d" : selected.period === "30" ? "30d" : "all", start: selected.start, end: selected.end };
       container.append(evidenceRow("period", reportTranslate("period"), `${reportingPeriodLabel(fallback.period, (key) => reportTranslate(key))} · ${reportingRange(null, fallback)}`));
     }
@@ -479,9 +481,14 @@ export function mountModelPerformance(options = {}) {
     const collectingLabel = progress?.total
       ? translate("buildingHistory", { checked: number(progress.checked), total: number(progress.total) })
       : translate("updating");
-    const statusState = cancelled ? "cancelled" : failed ? "error" : loading && !payload ? "loading" : payload?.collecting || payload?.status === "loading" ? "updating" : payload?.status === "unavailable" ? "unavailable" : payload?.updatedAt ? "ready" : sharedReporting && !reportingWindow ? "waiting" : "";
+    const updatedLabel = payload?.updatedAt ? translate("updated", {
+      date: new Intl.DateTimeFormat(locale(), { dateStyle: "medium", timeStyle: "short" }).format(new Date(payload.updatedAt)),
+    }) : "";
+    const collectingStatus = payload?.status === "ready" && updatedLabel
+      ? `${collectingLabel} · ${updatedLabel}` : collectingLabel;
+    const statusState = cancelled ? "cancelled" : failed ? "error" : retainedWindowUnavailable ? "unavailable" : loading && !payload ? "loading" : payload?.collecting || payload?.status === "loading" ? "updating" : payload?.status === "unavailable" ? "unavailable" : payload?.updatedAt ? "ready" : sharedReporting && !reportingWindow ? "waiting" : "";
     status.dataset.state = statusState;
-    status.textContent = cancelled ? translate("cancelled") : failed ? translate("failed") : loading && !payload ? translate("loading") : payload?.collecting || payload?.status === "loading" ? collectingLabel : payload?.status === "unavailable" ? translate("unavailable") : payload?.updatedAt ? translate("updated", { date: new Intl.DateTimeFormat(locale(), { dateStyle: "medium", timeStyle: "short" }).format(new Date(payload.updatedAt)) }) : sharedReporting && !reportingWindow ? reportTranslate("waiting") : "";
+    status.textContent = cancelled ? translate("cancelled") : failed ? translate("failed") : retainedWindowUnavailable ? translate("unavailable") : loading && !payload ? translate("loading") : payload?.collecting || payload?.status === "loading" ? collectingStatus : payload?.status === "unavailable" ? translate("unavailable") : updatedLabel ? updatedLabel : sharedReporting && !reportingWindow ? reportTranslate("waiting") : "";
     const actions = element("div", "dashboard-actions performance-actions");
     actions.append(status);
     root.append(actions);
@@ -492,7 +499,7 @@ export function mountModelPerformance(options = {}) {
     }
     if (loading) {
       const cancel = element("button", "button button-secondary compact", translate("cancel")); cancel.type = "button"; cancel.dataset.performanceFocus = "cancel"; cancel.addEventListener("click", cancelRefresh); actions.append(cancel);
-    } else if (failed || payload?.status === "unavailable") {
+    } else if (failed || retainedWindowUnavailable || payload?.status === "unavailable") {
       const retry = element("button", "button button-secondary compact", translate("retry")); retry.type = "button"; retry.dataset.performanceFocus = "retry"; retry.addEventListener("click", refresh); actions.append(retry);
     }
     if (payload) {
@@ -604,6 +611,7 @@ export function mountModelPerformance(options = {}) {
     for (const finish of preloadWaiters.values()) finish(false);
   };
   const invalidateScope = (sourcePeriod, unavailable, sourceKey) => {
+    if (retainedWindowKey !== reportingKey() || payload?.status !== "ready") retainedWindowKey = null;
     scopeGeneration++;
     scopeUnavailable = true;
     preloadComplete = false;
@@ -631,7 +639,17 @@ export function mountModelPerformance(options = {}) {
   const presentResult = (value, result) => {
     if (!result || value !== selectedRequestPeriod()) return false;
     if (result.status === "unavailable") readyPeriods.clear();
-    const retained = result.status === "loading" ? cachedPayload(value) : null;
+    if (result.status === "unavailable" && retainedWindowKey === reportingKey() && payload?.status === "ready") {
+      // An unavailable new window withdraws live caches, but the previous
+      // window remains readable as dated historical evidence until retry.
+      payload = { ...payload, collecting: false, stale: true };
+      retainedWindowUnavailable = true;
+      return true;
+    }
+    retainedWindowUnavailable = false;
+    const retained = result.status === "loading" ? cachedPayload(value)
+      ?? (retainedWindowKey === reportingKey() && payload?.status === "ready" ? payload : null) : null;
+    if (result.status !== "loading") retainedWindowKey = null;
     const next = retained ? { ...retained, collecting: true, stale: true } : result;
     const changed = JSON.stringify({ ...next, updatedAt: null }) !== JSON.stringify(payload ? { ...payload, updatedAt: null } : null);
     payload = next;
@@ -786,7 +804,10 @@ export function mountModelPerformance(options = {}) {
     if (!targetPeriod) return;
     const targetKey = cacheKeyFor(targetPeriod);
     foregroundKey = targetKey;
-    const hadFailure = failed;
+    const hadFailure = failed || retainedWindowUnavailable;
+    retainedWindowUnavailable = false;
+    if (retainedWindowKey === reportingKey() && payload?.status === "ready")
+      payload = { ...payload, collecting: true, stale: true };
     scopeUnavailable = false;
     loading = true; failed = false; cancelled = false; windowRef.clearTimeout(timer);
     // A cached period remains visible while its replacement is fetched.
@@ -858,6 +879,9 @@ export function mountModelPerformance(options = {}) {
   };
   function setReportingWindow(value) {
     const next = normalizeReportingWindow(value);
+    const retainPrevious = next && reportingWindow && next.period === reportingWindow.period
+      && Date.parse(next.endAt) > Date.parse(reportingWindow.endAt) && payload?.status === "ready";
+    const previousPayload = retainPrevious ? payload : null;
     const previousKey = reportingKey();
     sharedReporting = true;
     reportingWindow = next;
@@ -888,6 +912,14 @@ export function mountModelPerformance(options = {}) {
     payload = next === null
       ? null
       : readyPeriods.get(cacheKeyFor(selectedRequestPeriod()))?.payload ?? null;
+    retainedWindowKey = null;
+    retainedWindowUnavailable = false;
+    if (!payload && previousPayload) {
+      // Show the prior report under its own bounds while the new exact
+      // window loads. It must never become a cache entry for the new window.
+      payload = { ...previousPayload, collecting: true, stale: true };
+      retainedWindowKey = nextKey;
+    }
     render();
     if (next !== null && visible()) refresh();
     return next !== null;
