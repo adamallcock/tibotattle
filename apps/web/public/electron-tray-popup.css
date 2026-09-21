@@ -312,11 +312,33 @@ body {
 }
 
 .electron-tray-popup-pace-fill {
+  position: relative;
   display: block;
+  overflow: hidden;
   height: 100%;
   border-radius: inherit;
   background: var(--pace-color);
   transition: width 180ms ease;
+}
+
+/* Repeating soft bands show flow without moving the forecast's covered/dry edge. */
+.electron-tray-popup-pace-fill::after {
+  position: absolute;
+  inset: 0;
+  content: "";
+  background: linear-gradient(105deg,
+    transparent 0 22%,
+    rgba(255, 255, 255, .08) 34%,
+    rgba(255, 255, 255, .36) 47%,
+    rgba(255, 255, 255, .1) 60%,
+    transparent 72% 100%);
+  background-size: 88px 100%;
+  animation: electron-tray-pace-flow 1.8s linear infinite;
+  pointer-events: none;
+}
+
+@keyframes electron-tray-pace-flow {
+  to { background-position-x: 88px; }
 }
 
 .electron-tray-popup-pace-active-marker {
@@ -598,6 +620,11 @@ button:focus-visible {
   .electron-tray-popup-progress-fill,
   .electron-tray-popup-pace-fill {
     transition: none;
+  }
+
+  .electron-tray-popup-pace-fill::after {
+    animation: none;
+    content: none;
   }
 }
 
