@@ -17,6 +17,26 @@ function toolFreePayload() {
   Object.assign(data.models[0], { toolFreeTurns: 2, toolFree: [point(DAY, 2)] });
   return data;
 }
+function combinedPayload() {
+  const data = toolFreePayload(); data.schemaVersion = 4; data.method = 5;
+  data.models[0].speedTurns = 12;
+  data.models[0].speed[0].points.unshift(point(DAY, 2));
+  return data;
+}
+test('combined DTO accepts fallback subsets and refuses impossible or cross-version populations', () => {
+  const data = combinedPayload();
+  assert.equal(normalizeModelPerformance(data), data);
+  for (const mutate of [
+    x => { x.method = 4; }, x => { x.schemaVersion = 3; },
+    x => { x.models[0].toolFreeTurns = 13; },
+    x => { x.models[0].toolFree[0].at = 5 * DAY; },
+    x => { x.models[0].toolFree[0].n = 3; },
+  ]) { const invalid = combinedPayload(); mutate(invalid); assert.equal(normalizeModelPerformance(invalid), null); }
+  for (const period of ['1', '7', '30']) {
+    const pinned = combinedPayload(); pinned.period = period;
+    assert.equal(normalizeModelPerformance(pinned), pinned);
+  }
+});
 test('tool-free DTO uses a closed versioned contract and an independent bounded population', () => {
   const data = toolFreePayload();
   assert.equal(normalizeModelPerformance(data), data);
@@ -92,7 +112,7 @@ test('client requests only an enum period, is abortable, and reports endpoint fa
 });
 test('every supported locale preserves coverage and measurement meaning', () => {
   for (const locale of SUPPORTED_LOCALES) {
-    for (const key of ['title', 'speedEmpty', 'ttftEmpty', 'methodology', 'variance', 'speedSummary', 'latencySummary', 'toolFree', 'toolFreeSummary', 'toolFreeMethodology', 'outerBand', 'innerBand', 'medianP50', 'percentileValues', 'percentilesUnavailable', 'buildingHistory', 'unavailable', 'stale']) {
+    for (const key of ['title', 'speedEmpty', 'ttftEmpty', 'methodology', 'variance', 'speedSummary', 'latencySummary', 'combinedSpeedSummary', 'combinedSpeedMethodology', 'combinedSpeedEmpty', 'combinedMethodology', 'outerBand', 'innerBand', 'medianP50', 'percentileValues', 'percentilesUnavailable', 'buildingHistory', 'unavailable', 'stale']) {
       const value = translate(`performance.${key}`, {}, locale);
       assert.notEqual(value, `performance.${key}`);
     }
@@ -195,30 +215,45 @@ test('background history scan reports honest bounded progress while keeping char
   assert.equal(dom.root.all().filter(node => node.className === 'performance-card chart-card').length, 3);
   controller.destroy();
 });
-test('tool-free throughput adds a third qualified card and retains both original metrics', async () => {
-  const dom = focusHarness(); let response = toolFreePayload();
+test('recovered estimates stay in one output-speed chart with explicit population coverage', async () => {
+  const dom = focusHarness(); let response = combinedPayload();
   response.models[0].ttftTurns = response.models[0].turns;
   const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => response },
     t: (key, values) => translate(key, values, 'en-US') });
   dom.show(); await controller.refresh();
   assert.deepEqual(dom.root.all().filter(node => node.tagName === 'h4').map(node => node.textContent),
-    ['Output speed', 'First-token latency', 'Tool-free turn throughput']);
+    ['Output speed', 'First-token latency']);
   assert.equal(dom.root.all().find(node => node.className === 'performance-method-note').textContent,
-    'Output tokens over the full duration of a single-response turn with no tools. Includes initial waiting; not directly comparable with output speed.');
-  assert.match(dom.root.all().filter(node => node.className === 'performance-unit')[2].textContent, /2 of 20 turns eligible/u);
+    'When response timing is unavailable, eligible single-response turns without tools provide full-turn estimates. These include initial waiting and can be lower than response-timed speed.');
+  assert.equal(dom.root.all().filter(node => node.className === 'performance-unit')[0].textContent,
+    'tokens/s · 12 of 20 turns measured · 10 response-timed · 2 full-turn estimates');
   assert.deepEqual(dom.root.all().filter(node => node.className === 'performance-unit').map(node => node.dataset.state),
-    ['partial', 'complete', 'partial'], 'each metric retains its own coverage state');
+    ['partial', 'complete'], 'speed and latency retain their own coverage state');
   const cards = dom.root.all().filter(node => node.className === 'performance-card chart-card');
-  assert.equal(cards.length, 3);
+  assert.equal(cards.length, 2);
   assert.ok(cards.every(card => card.children[0].className === 'performance-card-heading chart-card-header'
     && card.children[1].className === 'performance-legend chart-card-legend'), 'all cards retain the compact shared chart layout');
   const plots = dom.root.all().filter(node => node.tagName === 'svg' && node.listeners.pointermove);
-  assert.equal(plots.length, 3);
-  assert.equal(plots[2].attributes['aria-label'], 'Tool-free turn throughput');
-  assert.match(plots[2].all().find(node => node.className === 'performance-point').attributes['aria-label'], /Tool-free turn throughput/u);
-  response = toolFreePayload(); response.models[0].toolFree = []; response.models[0].toolFreeTurns = 0;
+  assert.equal(plots.length, 2);
+  assert.equal(plots[0].attributes['aria-label'], 'Output speed');
+  assert.equal(plots[0].all().filter(node => node.className === 'performance-point').length, 3,
+    'pooled points render once; diagnostic fallback percentiles are not drawn again');
+  response = combinedPayload(); response.models[0].toolFree = []; response.models[0].toolFreeTurns = 0;
   await controller.refresh();
-  assert.equal(dom.root.all().filter(node => node.tagName === 'h4').length, 2, 'no extra empty card without eligible evidence');
+  assert.equal(dom.root.all().filter(node => node.tagName === 'h4').length, 2);
+  assert.equal(dom.root.all().some(node => node.className === 'performance-method-note'), false);
+  controller.destroy();
+});
+test('legacy independent distributions remain response-only without mixing aggregate percentiles', async () => {
+  const dom = focusHarness(), data = toolFreePayload();
+  const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => data },
+    t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh();
+  assert.deepEqual(performanceDomain(data, data.models[0]), { start: 2 * DAY, end: data.end });
+  assert.equal(dom.root.all().filter(node => node.tagName === 'h4').length, 2);
+  assert.equal(dom.root.all().some(node => node.className === 'performance-method-note'), false);
+  assert.equal(dom.root.all().filter(node => node.className === 'performance-unit')[0].textContent,
+    'tokens/s · Higher is faster · 10 of 20 turns measured');
   controller.destroy();
 });
 

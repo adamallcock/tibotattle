@@ -117,8 +117,12 @@ A version-3 supplement under `inference-timing-v2/source-<Codex-home digest>/too
 backfills single-response turns without tools, using the original sidecar's
 private correlation key. Its own cursor and pending state do not change original
 measurements or checkpoints. Joins require matching turn identity and original
-scalar evidence. The schema-3/method-4 display contract adds separately binned
-full-turn throughput, including initial waiting, while preserving speed and TTFT.
+scalar evidence. The schema-4/method-5 display contract combines response speed and full-turn
+throughput in one Output speed distribution. Response timing takes precedence
+per turn; eligible tool-free throughput is used only as a fallback, including
+initial waiting. Percentiles are computed from individual samples, never merged
+from aggregate percentiles. The fallback count and bins identify that subset;
+TTFT and original stored measurements remain unchanged.
 If the supplement cannot open or be read, the worker still serves the original
 measurements with an explicit stale state.
 Neither timing data nor failures enter accounting or contribution; no network

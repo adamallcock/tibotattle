@@ -118,7 +118,9 @@ requested history pass, and then stops after the idle lease expires.
 The supplement observes only allowlisted activity kinds and scalar counters;
 unknown activity, tools, steering, ambiguous tokens, or incomplete evidence
 excludes a turn. Full-turn duration includes initial waiting; TTFT is never
-subtracted. Supplemental values remain a separate distribution. It does not feed accounting, contribution,
+subtracted. Output speed uses response timing when available, otherwise an eligible
+supplemental full-turn estimate. Each turn is counted once; the display discloses
+the fallback count and its inclusion of initial waiting. It does not feed accounting, contribution,
 or network requests. Failures preserve available saved evidence with its
 stale/unavailable state. Windows remains unavailable until its protected-state
 adapter is qualified. These are source behavior, not installed-release proof.

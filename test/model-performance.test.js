@@ -44,21 +44,26 @@ test('all compatible speed observations form one percentile distribution', () =>
     p90: 460,
   });
 });
-test('tool-free throughput is additive with independent coverage and percentiles', () => {
+test('output speed adds tool-free fallback once per turn and computes percentiles from samples', () => {
   const rows = [10, 20, 30, 40, 50].map(tokens => row({
     tool_free_tokens: tokens, tool_free_duration: 2000,
   }));
   rows.push(row({ sample_duration: null, ttft: null, tool_free_tokens: 120, tool_free_duration: 4000 }));
   const model = modelPerformanceProjection(rows, { now: NOW }).models[0];
   assert.equal(model.turns, 6);
-  assert.equal(model.speedTurns, 5);
+  assert.equal(model.speedTurns, 6);
   assert.equal(model.ttftTurns, 5);
-  assert.equal(model.toolFreeTurns, 6);
+  assert.equal(model.toolFreeTurns, 1);
+  assert.equal(model.timedResponses, 5);
+  assert.deepEqual(model.speed[0].points[0], {
+    at: Math.floor(NOW / DAY) * DAY, n: 6,
+    p10: 65, p25: 100, median: 100, p75: 100, p90: 100,
+  });
   assert.equal(model.speed[0].points[0].median, 100);
   assert.equal(model.ttft[0].median, 5);
   assert.deepEqual(model.toolFree[0], {
-    at: Math.floor(NOW / DAY) * DAY, n: 6,
-    p10: 7.5, p25: 11.25, median: 17.5, p75: 23.75, p90: 27.5,
+    at: Math.floor(NOW / DAY) * DAY, n: 1,
+    p10: null, p25: null, median: 30, p75: null, p90: null,
   });
 });
 test('invalid or missing tool-free evidence does not invent throughput or alter existing speed', () => {
@@ -73,6 +78,11 @@ test('invalid or missing tool-free evidence does not invent throughput or alter 
   assert.deepEqual(model.toolFree, []);
   assert.equal(model.speedTurns, rows.length);
   assert.equal(model.speed[0].points[0].median, 100);
+  const fallback = modelPerformanceProjection(rows.map(r => ({ ...r, sample_duration: null })), { now: NOW }).models[0];
+  assert.equal(fallback.speedTurns, 0);
+  assert.equal(fallback.toolFreeTurns, 0);
+  assert.deepEqual(fallback.speed[0].points, []);
+  assert.deepEqual(fallback.toolFree, []);
 });
 test('five percentile summary resists extremes without manufacturing missing bins or sparse bands', () => {
   const rows = [1,2,3,4,100000].map(n => row({ ttft: n * 1000 }));
@@ -96,8 +106,8 @@ test('all history uses bounded weekly bins and excludes missing or invalid sampl
 test('history scan progress is explicit and fails closed', () => {
   const historyProgress = { checked: 629, total: 9026 };
   const result = modelPerformanceProjection([], { now: NOW, historyProgress });
-  assert.equal(result.schemaVersion, 3);
-  assert.equal(result.method, 4);
+  assert.equal(result.schemaVersion, 4);
+  assert.equal(result.method, 5);
   assert.equal(result.historyProgress, historyProgress);
   for (const invalid of [
     { checked: 2, total: 1 }, { checked: -1, total: 1 }, { checked: 0.5, total: 1 },
@@ -518,7 +528,7 @@ test('actual worker persists separate Codex sources and preserves the unscoped l
       }
     }
     let result = await readReady(controller);
-    assert.equal(result.schemaVersion, 3);
+    assert.equal(result.schemaVersion, 4);
     assert.deepEqual(result.historyProgress, { checked: 1, total: 1 });
     assert.equal(result.models[0].speed[0].points[0].median, 100);
     assert.equal(result.models[0].ttft[0].median, .2);

@@ -194,8 +194,9 @@ test('real worker backfills the supplement beside saved measurements and preserv
     try {
       const result = await ready(controller), model = result.models[0];
       assert.equal(result.stale, false); assert.equal(model.turns, 1);
-      assert.equal(model.speedTurns, 0); assert.equal(model.ttftTurns, 1); assert.equal(model.toolFreeTurns, 1);
+      assert.equal(model.speedTurns, 1); assert.equal(model.ttftTurns, 1); assert.equal(model.toolFreeTurns, 1);
       assert.equal(model.toolFree[0].median, 100);
+      assert.equal(model.speed[0].points[0].median, 100);
       assert.deepEqual(readTimingRows(primary), before);
     } finally { await controller.close(); }
   }
