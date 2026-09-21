@@ -22,7 +22,7 @@ export function createModelPerformanceController({ directory, codexHome,
   let worker = null, idle = null, closed = false, failedAt = 0, stopping = null;
   let restoration = null, writing = null, pending = null;
   let lastPersistedAt = null, revision = 0, savedRevision = -1;
-  const empty = (period, status) => ({ schemaVersion: 2, method: 3, status, collecting: false, stale: false,
+  const empty = (period, status) => ({ schemaVersion: 3, method: 4, status, collecting: false, stale: false,
     updatedAt: null, period, interval: 'day', start: null, end: Date.now(), historyProgress: null, models: [] });
   function restore() {
     restoration ??= (async () => {

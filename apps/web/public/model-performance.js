@@ -40,7 +40,8 @@ export { reportingRequestPeriod } from "./dashboard-ui.js";
 /** A closed, bounded display contract: never pass arbitrary source text to DOM. */
 export function normalizeModelPerformance(value) {
   if (!exact(value, ["schemaVersion", "method", "status", "collecting", "stale", "updatedAt", "period", "interval", "start", "end", "historyProgress", "models"])
-      || value.schemaVersion !== 2 || value.method !== 3 || !["ready", "loading", "unavailable"].includes(value.status)
+      || !(value.schemaVersion === 2 && value.method === 3 || value.schemaVersion === 3 && value.method === 4)
+      || !["ready", "loading", "unavailable"].includes(value.status)
       || typeof value.collecting !== "boolean" || typeof value.stale !== "boolean" || !PERIODS.includes(value.period)
       || !["day", "week"].includes(value.interval) || !timestamp(value.end)
       || !(value.start === null || timestamp(value.start) && value.start <= value.end)
@@ -68,12 +69,16 @@ export function normalizeModelPerformance(value) {
     }
     return total <= maximum;
   };
+  const toolFreeSupported = value.schemaVersion === 3;
   for (const model of value.models) {
-    if (!exact(model, ["id", "label", "turns", "speedTurns", "ttftTurns", "timedResponses", "speed", "ttft"])
+    if (!exact(model, ["id", "label", "turns", "speedTurns", "ttftTurns", "timedResponses", "speed", "ttft",
+      ...(toolFreeSupported ? ["toolFreeTurns", "toolFree"] : [])])
         || !Object.hasOwn(MODEL_NAMES, model.id) || model.label !== MODEL_NAMES[model.id] || seen.has(model.id)
         || ![model.turns, model.speedTurns, model.ttftTurns, model.timedResponses].every(count)
         || model.speedTurns > model.turns || model.ttftTurns > model.turns
         || !Array.isArray(model.speed) || model.speed.length > 1 || !validPoints(model.ttft, model.ttftTurns)) return null;
+    if (toolFreeSupported && (!count(model.toolFreeTurns) || model.toolFreeTurns > model.turns
+        || !validPoints(model.toolFree, model.toolFreeTurns))) return null;
     seen.add(model.id);
     let speedCount = 0;
     for (const series of model.speed) {
@@ -95,13 +100,14 @@ export function performanceSegments(points, interval) {
   });
 }
 
-/** All-time focuses this model's measured era; both metrics retain one domain. */
+/** All-time focuses this model's measured era; all metrics retain one domain. */
 export function performanceDomain(payload, model) {
   let start = payload.start;
   if (payload.period === "all") {
     let first = Infinity;
     for (const series of model.speed) if (series.points.length) first = Math.min(first, series.points[0].at);
     if (model.ttft.length) first = Math.min(first, model.ttft[0].at);
+    if (model.toolFree?.length) first = Math.min(first, model.toolFree[0].at);
     if (Number.isFinite(first)) start = first;
   }
   return { start: start ?? payload.end, end: payload.end };
@@ -214,7 +220,7 @@ export function mountModelPerformance(options = {}) {
     }
   }
   const number = (value) => { formatters(); return numberFormat.format(value); };
-  const metricNumber = (value, metric) => { formatters(); return (metric === "speed" ? integerFormat : numberFormat).format(value); };
+  const metricNumber = (value, metric) => { formatters(); return (metric === "latency" ? numberFormat : integerFormat).format(value); };
   const date = (value) => { formatters(); return dateFormat.format(value); };
   const visible = () => !root.classList.contains("dashboard-page-inactive") && !documentRef.hidden;
   const remember = () => {
@@ -279,11 +285,11 @@ export function mountModelPerformance(options = {}) {
     const holder = element("div", "performance-plot");
     const points = series.flatMap((item) => item.points);
     if (!points.length) { holder.append(element("p", "performance-empty", translate(metric === "speed" ? "speedEmpty" : "ttftEmpty"))); return holder; }
-    const svg = svgElement("svg", { viewBox: "0 0 800 256", role: "group", "aria-label": translate(metric === "speed" ? "speed" : "latency") });
+    const svg = svgElement("svg", { viewBox: "0 0 800 256", role: "group", "aria-label": translate(metric) });
     formatters();
     const { start, end } = domain;
     const scale = performanceYScale(points.map(point => point.p90 ?? point.median));
-    const axisNumber = new Intl.NumberFormat(locale(), { maximumFractionDigits: metric === "speed" ? 0 : Math.min(20, scale.digits) });
+    const axisNumber = new Intl.NumberFormat(locale(), { maximumFractionDigits: metric === "latency" ? Math.min(20, scale.digits) : 0 });
     const plotLeft = 52, plotRight = 708, plotWidth = plotRight - plotLeft;
     const x = value => plotLeft + Math.max(0, Math.min(1, (value - start) / Math.max(1, end - start))) * plotWidth;
     const y = value => 214 - value / scale.maximum * 190;
@@ -313,7 +319,7 @@ export function mountModelPerformance(options = {}) {
     const percentileValues = point => point.p10 === null ? translate("percentilesUnavailable") : translate("percentileValues", {
       p10: metricNumber(point.p10, metric), p25: metricNumber(point.p25, metric), p75: metricNumber(point.p75, metric), p90: metricNumber(point.p90, metric),
     });
-    const formatPoint = (point, method) => translate("point", { date: fullDateFormat.format(point.at), method: method === "ttft" ? translate("latency") : translate("speed"), median: metricNumber(point.median, metric), percentiles: percentileValues(point), count: number(point.n) });
+    const formatPoint = (point) => translate("point", { date: fullDateFormat.format(point.at), method: translate(metric), median: metricNumber(point.median, metric), percentiles: percentileValues(point), count: number(point.n) });
     const cursor = svgElement("line", { x1: 0, x2: 0, y1: 24, y2: 214, class: "performance-cursor", visibility: "hidden" });
     const markers = [];
     for (const item of series) {
@@ -371,7 +377,7 @@ export function mountModelPerformance(options = {}) {
     markers[0]?.node.setAttribute("tabindex", "0");
     const latest = [...(series[0]?.points ?? [])].reverse().find(point => point.p10 !== null);
     if (latest) {
-      const unit = translate(metric === "speed" ? "speedShortUnit" : "latencyShortUnit");
+      const unit = translate(metric === "latency" ? "latencyShortUnit" : "speedShortUnit");
       const labels = [["p90", "P90"], ["p75", "P75"], ["median", "P50"], ["p25", "P25"], ["p10", "P10"]]
         .map(([key, label]) => ({ key, label, actualY: y(latest[key]), labelY: y(latest[key]) }))
         .sort((a, b) => a.labelY - b.labelY);
@@ -406,7 +412,7 @@ export function mountModelPerformance(options = {}) {
       if (!matches.length) tooltip.append(element("p", "", translate("noBin")));
       for (const { point, method } of matches) {
         const row = element("div", "performance-tooltip-row");
-        const unit = translate(metric === "speed" ? "speedShortUnit" : "latencyShortUnit");
+        const unit = translate(metric === "latency" ? "latencyShortUnit" : "speedShortUnit");
         row.append(element("span", "performance-tooltip-method", method === "ttft" ? translate("latency") : translate("medianP50")),
           element("strong", "performance-tooltip-value", `${metricNumber(point.median, metric)} ${unit}`));
         const distribution = element("div", "performance-tooltip-percentiles");
@@ -542,16 +548,19 @@ export function mountModelPerformance(options = {}) {
     if (selectedIcon) { selectedIcon.setAttribute("class", `allowance-model-icon performance-model-icon ${selectedPresentation.className}`); identity.append(selectedIcon); }
     identity.append(element("span", "", selectedName));
     subheading.append(identity, element("span", "", translate(payload.interval))); panel.append(subheading);
-    for (const metric of ["speed", "latency"]) {
+    for (const metric of ["speed", "latency", ...(selected.toolFree?.length ? ["toolFree"] : [])]) {
       const card = element("article", "performance-card chart-card");
       const cardHeading = element("div", "performance-card-heading chart-card-header"), cardTitle = element("div");
       const summary = metric === "speed"
         ? translate("speedSummary", { measured: number(selected.speedTurns), total: number(selected.turns) })
+        : metric === "toolFree"
+        ? translate("toolFreeSummary", { measured: number(selected.toolFreeTurns), total: number(selected.turns) })
         : translate("latencySummary", { measured: number(selected.ttftTurns), total: number(selected.turns), responses: number(selected.timedResponses) });
       const coverage = element("p", "performance-unit", summary);
-      const measured = metric === "speed" ? selected.speedTurns : selected.ttftTurns;
+      const measured = metric === "speed" ? selected.speedTurns : metric === "toolFree" ? selected.toolFreeTurns : selected.ttftTurns;
       coverage.dataset.state = measured < selected.turns ? "partial" : "complete";
       cardTitle.append(element("h4", "chart-card-title", translate(metric)), coverage);
+      if (metric === "toolFree") cardTitle.append(element("p", "performance-method-note", translate("toolFreeMethodology")));
       const legend = element("div", "performance-legend chart-card-legend");
       for (const method of ["outerBand", "innerBand", "medianP50"]) {
         const entry = element("span", "performance-legend-item");
@@ -565,7 +574,8 @@ export function mountModelPerformance(options = {}) {
         entry.append(swatch, element("span", "", translate(method))); legend.append(entry);
       }
       cardHeading.append(cardTitle); card.append(cardHeading, legend,
-        plot(metric === "speed" ? selected.speed : [{ method: "ttft", points: selected.ttft }], metric, "var(--allowance-color)", domain));
+        plot(metric === "speed" ? selected.speed : metric === "toolFree"
+          ? [{ method: "toolFree", points: selected.toolFree }] : [{ method: "ttft", points: selected.ttft }], metric, "var(--allowance-color)", domain));
       panel.append(card);
     }
     const aboutSummary = element("summary", "", translate("about")); aboutSummary.dataset.performanceFocus = "about";

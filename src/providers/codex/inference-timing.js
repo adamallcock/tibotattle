@@ -17,10 +17,13 @@ const integer = x => Number.isSafeInteger(x) && x >= 0;
 const stamp = x => typeof x === 'string' ? Date.parse(x) : NaN;
 const id = x => typeof x === 'string' && x.length > 0 && x.length <= 256;
 
-export function createParser(key, saved, onTurn) {
+export function createParser(key, saved, onTurn, { toolFree = false } = {}) {
   const s = saved ?? { own: null, blocked: false, model: null, effort: null, turns: {},
     legacyTotal: null,
     diagnostics: { malformed: 0, oversized: 0, orphan: 0, capacity: 0, completed: 0 } };
+  const rejectToolFree = () => {
+    for (const t of Object.values(s.turns)) if (t.toolFree) t.toolFree.bad = true;
+  };
   const hash = (domain, value) => digest(key, domain, value);
   const bad = (t, reason) => {
     t.bad = true; t.problem ??= reason; t.windowBad = true;
@@ -28,6 +31,7 @@ export function createParser(key, saved, onTurn) {
   };
   const invalidate = () => {
     for (const t of Object.values(s.turns)) { bad(t, 'unreadable_evidence'); t.legacy.windowBad = true; }
+    rejectToolFree();
     s.legacyTotal = null;
   };
   const resetLegacy = (t, at) => {
@@ -41,6 +45,7 @@ export function createParser(key, saved, onTurn) {
       ? { output: total.output_tokens, reasoning: total.reasoning_output_tokens } : null;
     const active = Object.values(s.turns);
     if (!s.legacyTotal || !before) {
+      rejectToolFree();
       for (const t of active) {
         if (integer(last?.output_tokens) && last.output_tokens > 0) t.legacy.observed++;
         resetLegacy(t, at); t.legacy.windowBad = !integer(at);
@@ -50,6 +55,7 @@ export function createParser(key, saved, onTurn) {
     const n = s.legacyTotal.output - before.output, reasoning = s.legacyTotal.reasoning - before.reasoning;
     if (n === 0 && reasoning === 0) return; // Repeated snapshots are not responses.
     if (active.length !== 1) {
+      rejectToolFree();
       for (const t of active) { resetLegacy(t, at); t.legacy.windowBad = true; }
       return;
     }
@@ -57,6 +63,14 @@ export function createParser(key, saved, onTurn) {
     if (++l.observed > 512) { bad(t, 'response_limit'); return; }
     const matched = integer(n) && n > 0 && integer(reasoning) && reasoning <= n
       && n === last?.output_tokens && reasoning === last?.reasoning_output_tokens;
+    if (t.toolFree) {
+      if (!matched) t.toolFree.bad = true;
+      else {
+        t.toolFree.counts++;
+        t.toolFree.tokens += n;
+        t.toolFree.reasoning += reasoning;
+      }
+    }
     if (matched && !l.windowBad && integer(at) && l.first !== null && l.end > l.first
       && l.lastItem <= l.end && l.end <= at && l.first >= l.previous) {
       l.tokens += n; l.reasoning += reasoning; l.duration += l.end - l.first; l.covered++;
@@ -66,6 +80,7 @@ export function createParser(key, saved, onTurn) {
   function line(bytes, offset, partial) {
     if (s.blocked) return;
     if (partial) {
+      rejectToolFree();
       s.diagnostics.oversized++;
       // Only a verified top-level header can establish irrelevance. In
       // particular, a tool result mentioning a timing event is not that event.
@@ -78,12 +93,12 @@ export function createParser(key, saved, onTurn) {
       }
       invalidate(); return;
     }
-    if (!NEEDLES.some(n => bytes.includes(n))) return;
+    if (!toolFree && !NEEDLES.some(n => bytes.includes(n))) return;
     let r;
     try { r = JSON.parse(bytes.toString('utf8')); } catch { s.diagnostics.malformed++; invalidate(); return; }
-    if (!r || typeof r !== 'object') return;
+    if (!r || typeof r !== 'object') { rejectToolFree(); return; }
     const p = r.payload;
-    if (!p || typeof p !== 'object') return;
+    if (!p || typeof p !== 'object') { rejectToolFree(); return; }
     const at = stamp(r.timestamp);
     if (r.type === 'session_meta') {
       if (s.own || !id(p.id) || p.forked_from_id) { s.blocked = true; s.turns = {}; return; }
@@ -92,6 +107,37 @@ export function createParser(key, saved, onTurn) {
     if (!s.own) return;
     if (r.type === 'compacted') { invalidate(); return; }
     const tid = id(p.turn_id) ? hash('turn', `${s.own}/${p.turn_id}`) : null;
+    if (toolFree) {
+      // Absence of known tool names is insufficient: admit only understood
+      // activity. These scalar observations live only in the new sidecar.
+      const response = r.type === 'response_item';
+      const output = response && (p.type === 'reasoning' || p.type === 'message' && p.role === 'assistant');
+      const input = response && p.type === 'message' && ['user', 'system', 'developer'].includes(p.role);
+      const event = r.type === 'event_msg';
+      const allowed = response ? output || input : r.type === 'turn_context'
+        || r.type === 'token_usage_record' || event && ['task_started', 'task_complete',
+          'turn_aborted', 'token_count', 'item_completed', 'agent_message', 'user_message',
+          'thread_goal_updated'].includes(p.type);
+      if (!allowed || event && p.type === 'item_completed'
+        && !['Reasoning', 'AgentMessage', 'UserMessage'].includes(p.item?.type)) rejectToolFree();
+      for (const [turnKey, t] of Object.entries(s.turns)) {
+        const f = t.toolFree;
+        if (!f) continue;
+        if (!integer(at) || at < f.lastAt) f.bad = true;
+        else f.lastAt = at;
+        if (input || event && (p.type === 'user_message' || p.type === 'item_completed' && p.item?.type === 'UserMessage')) {
+          if (f.outputSeen || f.counts || t.responses) f.bad = true;
+        }
+        if (output) {
+          if (f.counts > 0 || t.responses > 0) f.bad = true;
+          const sourceTurn = p.internal_chat_message_metadata_passthrough?.turn_id;
+          if (sourceTurn !== undefined && (!id(sourceTurn) || hash('turn', `${s.own}/${sourceTurn}`) !== turnKey)) f.bad = true;
+          f.outputSeen = true;
+        }
+        if ((event && p.type === 'item_completed' || r.type === 'token_usage_record') && tid !== turnKey) f.bad = true;
+        if (r.type === 'turn_context' && f.outputSeen && (p.model !== t.model || p.effort !== t.effort)) f.bad = true;
+      }
+    }
     if (r.type === 'response_item') {
       if (['function_call_output', 'custom_tool_call_output'].includes(p.type)) {
         for (const t of Object.values(s.turns)) t.legacy.toolSeen = true;
@@ -144,8 +190,9 @@ export function createParser(key, saved, onTurn) {
       if (Object.keys(s.turns).length >= 8) { s.diagnostics.capacity++; invalidate(); return; }
       if (!integer(at)) return;
       const concurrent = Object.keys(s.turns).length > 0;
-      if (concurrent) for (const t of Object.values(s.turns)) t.legacy.windowBad = true;
+      if (concurrent) { rejectToolFree(); for (const t of Object.values(s.turns)) t.legacy.windowBad = true; }
       s.turns[tid] = { start: at, model: s.model, effort: s.effort, mixed: false,
+        ...(toolFree ? { toolFree: { bad: concurrent, outputSeen: false, lastAt: at, counts: 0, tokens: 0, reasoning: 0 } } : {}),
         bad: false, fatal: false, windowBad: false, first: null, lastItem: null, previous: at, tokens: 0, reasoning: 0,
         finalTokens: null, finalReasoning: null, duration: 0, responses: 0,
         covered: 0, coveredTokens: 0, coveredReasoning: 0, seen: {}, modernSeen: false,
@@ -222,6 +269,11 @@ export function createParser(key, saved, onTurn) {
       const legacy = boundary && !t.modernSeen && !t.fatal && !t.mixed && !p.error
         && t.legacy.covered > 0 && t.legacy.duration > 0 && t.legacy.duration <= elapsed + 2000
         && Number.isSafeInteger(t.legacy.tokens) && Number.isSafeInteger(t.legacy.reasoning);
+      const f = t.toolFree;
+      const single = t.modernSeen ? reconciled && t.responses === 1 && t.tokens > 0
+        : f?.counts === 1 && f.tokens > 0 && integer(f.tokens) && integer(f.reasoning);
+      const throughput = toolFree && f && !f.bad && f.outputSeen && single
+        && boundary && !t.fatal && !t.mixed && !p.error && t.model !== null;
       // A fresh allowlist; never spread provider records into retained data.
       if (integer(at)) onTurn({ key: tid, offset, at, model: t.mixed ? null : t.model,
         effort: t.mixed ? null : t.effort, tokens: reconciled ? t.tokens : null,
@@ -234,7 +286,16 @@ export function createParser(key, saved, onTurn) {
         sample_total_responses: t.modernSeen ? t.responses : t.legacy.observed,
         sample_method: sampled ? 'receipt' : legacy ? 'legacy' : null,
         quality: valid ? 'complete' : !boundary ? 'invalid_boundary' : !reconciled ? 'usage_mismatch'
-          : t.mixed ? 'mixed_model' : t.bad ? t.problem ?? 'invalid_evidence' : 'missing_window' });
+          : t.mixed ? 'mixed_model' : t.bad ? t.problem ?? 'invalid_evidence' : 'missing_window',
+        ...(toolFree ? {
+          sample_tokens: throughput ? t.modernSeen ? t.tokens : f.tokens : null,
+          sample_reasoning: throughput ? t.modernSeen ? t.reasoning : f.reasoning : null,
+          sample_duration: throughput ? elapsed : null,
+          sample_responses: throughput ? 1 : 0,
+          sample_total_responses: throughput ? 1 : 0,
+          sample_method: throughput ? 'tool_free' : null,
+        } : {}),
+      });
       delete s.turns[tid]; s.diagnostics.completed++;
     }
   }
@@ -245,3 +306,8 @@ export function createParser(key, saved, onTurn) {
     return s;
   } };
 }
+
+// Separate pending-state format and store version; original method stays intact.
+export const TOOL_FREE_METHOD = 3;
+export const createToolFreeParser = (key, saved, onTurn) =>
+  createParser(key, saved, onTurn, { toolFree: true });

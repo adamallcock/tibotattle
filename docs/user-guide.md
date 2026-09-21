@@ -173,11 +173,18 @@ page cache. Speculative report requests pause while the app document is hidden.
 
 **Output speed** estimates tokens per second from covered response windows.
 **First-token latency** uses independently available turn timing, so its sample
-count can be much larger. The plots show median trends and middle-50% bands
-where enough observations exist. Newer and older timing methods stay separate;
-missing timing is unavailable, never zero.
+count can be much larger. When eligible evidence exists, **Tool-free turn
+throughput** adds a third chart for completed, single-response turns without
+tools. It divides reconciled output tokens by the full turn duration, including
+initial waiting. It can recover observations from older logs but is not directly
+comparable with output speed. Its counts and distribution stay separate; existing
+speed and latency measurements are preserved. Reasoning tokens are included
+once in both rates. Missing evidence remains unavailable, never zero.
 
-Sweep horizontally anywhere in a chart to inspect the same date in both metrics.
+The plots show daily or weekly medians and percentile bands where enough
+observations exist.
+
+Sweep horizontally anywhere in a chart to inspect the same date across the charts.
 Use arrow keys after focusing a chart point, or Escape to dismiss the tooltip.
 Empty dates explicitly show no measurements. Expand **About these measurements**
 for interpretation and coverage.
@@ -186,8 +193,9 @@ These diagnostics cover Codex files on this device across accounts. Tool waits
 are excluded from matched output windows, but the estimate is not a provider
 benchmark or a billing measure. All reasoning efforts remain included. Opening
 the page collects timing in bounded background passes; saved data can appear
-before collection finishes. Leaving the page lets the worker stop, and a later
-visit resumes progress. Timing failures do not block usage accounting.
+before collection finishes. An explicitly requested history pass finishes even after leaving the page;
+once complete, the worker stops after its idle lease expires. Later visits resume
+from saved checkpoints. Timing failures do not block usage accounting.
 
 ## Customize the menu bar and popup
 

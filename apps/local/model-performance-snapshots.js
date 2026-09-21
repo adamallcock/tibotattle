@@ -21,7 +21,7 @@ const exact = (value, keys) => value !== null && typeof value === 'object' && !A
 export function isModelPerformanceSnapshot(value) {
   if (!exact(value, ['schemaVersion', 'method', 'status', 'collecting', 'stale', 'updatedAt',
     'period', 'interval', 'start', 'end', 'historyProgress', 'models'])
-      || value.schemaVersion !== 2 || value.method !== 3 || value.status !== 'ready'
+      || value.schemaVersion !== 3 || value.method !== 4 || value.status !== 'ready'
       || typeof value.collecting !== 'boolean' || typeof value.stale !== 'boolean'
       || !MODEL_PERFORMANCE_PERIODS.includes(value.period) || !['day', 'week'].includes(value.interval)
       || !timestamp(value.end) || !(value.start === null || timestamp(value.start) && value.start <= value.end)
@@ -52,11 +52,13 @@ export function isModelPerformanceSnapshot(value) {
   };
   const seen = new Set();
   for (const model of value.models) {
-    if (!exact(model, ['id', 'label', 'turns', 'speedTurns', 'ttftTurns', 'timedResponses', 'speed', 'ttft'])
+    if (!exact(model, ['id', 'label', 'turns', 'speedTurns', 'ttftTurns', 'timedResponses', 'speed', 'ttft',
+      'toolFreeTurns', 'toolFree'])
         || !Object.hasOwn(MODEL_NAMES, model.id) || model.label !== MODEL_NAMES[model.id] || seen.has(model.id)
-        || ![model.turns, model.speedTurns, model.ttftTurns, model.timedResponses].every(count)
-        || model.speedTurns > model.turns || model.ttftTurns > model.turns
-        || !Array.isArray(model.speed) || model.speed.length > 1 || !validPoints(model.ttft, model.ttftTurns)) return false;
+        || ![model.turns, model.speedTurns, model.ttftTurns, model.timedResponses, model.toolFreeTurns].every(count)
+        || model.speedTurns > model.turns || model.ttftTurns > model.turns || model.toolFreeTurns > model.turns
+        || !Array.isArray(model.speed) || model.speed.length > 1 || !validPoints(model.ttft, model.ttftTurns)
+        || !validPoints(model.toolFree, model.toolFreeTurns)) return false;
     seen.add(model.id);
     for (const series of model.speed) {
       if (!exact(series, ['method', 'points']) || series.method !== 'speed'
@@ -97,7 +99,7 @@ export function createModelPerformanceSnapshotStore({ directory, codexHome, now 
   const source = modelPerformanceSourceScope(codexHome);
   const store = createValidatedSnapshotStore({
     snapshotFile: join(directory, 'model-performance-snapshot.json'),
-    schemaVersion: 'local-model-performance-snapshot-v2',
+    schemaVersion: 'local-model-performance-snapshot-v3',
     maximumBytes: 4 * 1024 * 1024,
     now,
     validate: value => {

@@ -140,4 +140,4 @@ export {
   validateTierDeclaration,
 } from "./tier-normalization.js";
 
-export { createParser, digest, METHOD, MAX_STATE_BYTES } from './inference-timing.js';
+export { createParser, createToolFreeParser, digest, METHOD, TOOL_FREE_METHOD, MAX_STATE_BYTES } from './inference-timing.js';
