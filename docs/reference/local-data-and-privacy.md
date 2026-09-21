@@ -101,8 +101,14 @@ Compressed-only histories and missing timing remain unavailable.
 
 Reads renew a 60-second page lease. Discovery is capped at 50,000 entries;
 scan passes target at most 32 MiB or 750 ms, checking between chunks of at most
-4 MiB and pausing five seconds between passes. The worker checkpoints progress
-and stops after the lease expires. It does not feed accounting, contribution,
+two 2-MiB reads per source (original timing and supplemental throughput). It
+pauses 250 ms during history collection and five seconds after catching up.
+The worker checkpoints each store independently, finishes an explicitly
+requested history pass, and then stops after the idle lease expires.
+The supplement observes only allowlisted activity kinds and scalar counters;
+unknown activity, tools, steering, ambiguous tokens, or incomplete evidence
+excludes a turn. Full-turn duration includes initial waiting; TTFT is never
+subtracted. Supplemental values remain a separate distribution. It does not feed accounting, contribution,
 or network requests. Failures preserve available saved evidence with its
 stale/unavailable state. Windows remains unavailable until its protected-state
 adapter is qualified. These are source behavior, not installed-release proof.
@@ -116,6 +122,7 @@ owner-only permissions. Important entries include:
 | --- | --- | --- |
 | `local-unified-index-v1.sqlite` plus device salt | Canonical replay-safe Codex usage/quota/tool projection and source provenance. | Accumulates locally; the 30-day UI horizon is not retention. |
 | `inference-timing-v2/timing-experiment.sqlite` (development source) | Separate owner-only timing sidecar: one row per completed turn, counts/durations/coverage, local HMAC keys, source cursors and bounded pending state. No raw content or IDs. | Maximum 256 MiB; method/SQLite user version 2. Incompatible stores, including version 1, are preserved and refused. Display periods do not delete evidence or migrate the accounting index. |
+| `inference-timing-v2/tool-free-v1/timing-experiment.sqlite` (development source) | Independent supplement for reconciled single-response turns without tools, plus its own source cursors and bounded scalar pending state. Shares the original private timing correlation key for local joins only. | Maximum 256 MiB; SQLite user version 3. Original version-2 data is preserved. An incompatible or unavailable supplement does not hide original measurements. |
 | `local-collector-state-v1.sqlite` | App-server quota observations, checkpoints, dedupe, locks, and replay-safe collector state. | Accumulates until explicit local erase or a reviewed migration/retention workflow. |
 | `private/` settings/handoff state | Automatic/incremental contribution settings, bounded OAuth restart handle, fast-mode preference, and speed baselines. | Settings persist; the OAuth handle expires and is bounded. |
 | Prepared contribution/review directories and queue | Exact local review, delivery, retry, and audit state. | Retained for replay-safe completion, explicit cleanup, or local erase. |

@@ -166,7 +166,7 @@ Codex accounting snapshot.
 | `GET` | `/api/local/overview` | Personal dashboard headline and evidence coverage |
 | `GET` | `/api/local/cache-drop-thread-links` | Optional, generation-bound local thread-name/parent lookup for the two recent cache-drop tables; requires `X-Usage-Monitor-Local: 1` and no foreign Origin |
 | `POST` | `/api/local/work-usage/query` | Read-only local project/worktree/thread reports; closed JSON, local header and Origin/Host checks; bounded cancellable snapshots with lightweight `touch` lease renewal, transient names and bounded project/task name search before pagination |
-| `GET` | `/api/local/model-performance` | Independent device-local Codex timing aggregates for `period=7`, `period=30`, or `period=all`; reads renew a 60-second background-worker lease |
+| `GET` | `/api/local/model-performance` | Independent device-local Codex timing aggregates for `period=7`, `period=30`, or `period=all`; reads renew a 60-second background-worker lease; schema 3/method 4 adds separately counted tool-free throughput alongside existing response speed and TTFT |
 | `GET` | `/api/local/gradient` | Quota-versus-cost gradient report data |
 | `GET` | `/api/local/weekly` | Weekly calibration report data |
 | `GET` | `/api/local/weekly-pace-outlook` | Privacy-safe weekly allowance pace projection bound to the current observed window |
@@ -786,7 +786,7 @@ module facades, but their message shapes are security- and resource-relevant:
 | Owner / source | Input boundary | Output boundary |
 |---|---|---|
 | [Replay-safe accounting rebuild child](../../src/replay-safe-accounting-rebuild-child.js) | Two owner-private temporary paths on argv: versioned JSON request and exclusive result target; parent-held stdin is the death watchdog | Canonical result file plus one bounded stdout envelope containing status and either byte count/SHA-256 or a fixed error code |
-| [Model performance worker](../../apps/local/model-performance-worker.js) | Fixed private state and Codex-home anchors, then a `stop` message; starts only through a recent timing-page reader | Bounded timing aggregate snapshots for three periods, or a fixed unavailable indication; one independent sidecar, no accounting/contribution data flow |
+| [Model performance worker](../../apps/local/model-performance-worker.js) | Fixed private state and Codex-home anchors, then a `stop` message; starts only through a recent timing-page reader | Bounded timing aggregate snapshots for three periods, or a fixed unavailable indication; original timing and independent tool-free supplement, no accounting/contribution data flow |
 | [Unified-index worker](../../src/local-unified-index-worker.js) | `workerData` with bounded lineage components, source paths/sizes, and maximum line bytes | Typed `batch` messages containing minimized events/boundaries/tools/snapshot keys, or one content-free `failed` code |
 | [Local-analysis extraction worker](../../src/local-analysis-extract-worker.js) | `workerData` with an owner-private shard path and bounded source byte-range tasks | One `{ok: true, result}` aggregate or `{ok: false, code}` fixed failure |
 
@@ -952,7 +952,7 @@ The owned local SQLite surfaces are:
 | Domain | Storage owners |
 |---|---|
 | Local evidence and accounting | [`local-collector-state.js`](../../src/local-collector-state.js), [`local-unified-index.js`](../../src/local-unified-index.js), [`local-analysis-index.js`](../../src/local-analysis-index.js), and its private [`local-analysis-extract-worker.js`](../../src/local-analysis-extract-worker.js) shard writer |
-| Model performance timing | [`inference-timing-store.js`](../../src/platform/inference-timing-store.js): owner-only `inference-timing-v2/timing-experiment.sqlite` below the companion state root; method and SQLite user version 2, maximum 256 MiB |
+| Model performance timing | [`inference-timing-store.js`](../../src/platform/inference-timing-store.js): owner-only `inference-timing-v2/timing-experiment.sqlite` below the companion state root; method and SQLite user version 2, maximum 256 MiB; additive `tool-free-v1/timing-experiment.sqlite` below it uses version 3 and its own 256 MiB cap, preserving the original store |
 | Claude shadow pipeline | [`claude-desktop-incremental-canonicalizer.js`](../../src/claude-desktop-incremental-canonicalizer.js), [`claude-desktop-ledger-prototype.js`](../../src/claude-desktop-ledger-prototype.js), [`claude-desktop-pricing-cache.js`](../../src/claude-desktop-pricing-cache.js), [`claude-desktop-shadow-store.js`](../../src/claude-desktop-shadow-store.js) |
 | Contribution and export | [`local-contribution-sync-queue-storage.js`](../../src/platform/local-contribution-sync-queue-storage.js), [`owner-only-export-workspace-storage.js`](../../src/platform/owner-only-export-workspace-storage.js), [`export-set-verification-storage.js`](../../src/platform/export-set-verification-storage.js) |
 | Windows qualification | [`windows-credential-operation-audit.js`](../../src/platform/windows-credential-operation-audit.js), a bounded local audit store rather than a shipping credential backend |

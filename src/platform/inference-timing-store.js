@@ -12,7 +12,8 @@ const safe = (ok, code) => { if (!ok) throw new Error(code); };
 function ownerFile(s) {
   return s.isFile() && s.nlink === 1 && s.uid === process.getuid() && !(s.mode & 0o077);
 }
-export async function openTimingStore(directory, { createParser, digest, METHOD, MAX_STATE_BYTES }) {
+export async function openTimingStore(directory, { createParser, digest, METHOD, MAX_STATE_BYTES, correlationKey }) {
+  safe(correlationKey === undefined || Buffer.isBuffer(correlationKey) && correlationKey.length === 32, 'invalid_metadata');
   const dir = resolve(directory);
   // Parent must exist and every resolved component must be the requested path.
   const parent = resolve(dir, '..');
@@ -47,11 +48,12 @@ export async function openTimingStore(directory, { createParser, digest, METHOD,
           sample_total_responses INTEGER NOT NULL, sample_method TEXT) WITHOUT ROWID;
         CREATE INDEX turn_time ON turn(at);
         PRAGMA application_id=${APPLICATION}; PRAGMA user_version=${METHOD};`);
-      db.prepare('INSERT INTO metadata VALUES (?)').run(randomBytes(32));
+      db.prepare('INSERT INTO metadata VALUES (?)').run(correlationKey ?? randomBytes(32));
       db.exec('COMMIT');
     }
     const key = Buffer.from(db.prepare('SELECT key FROM metadata').get().key);
     safe(key.length === 32, 'invalid_metadata');
+    safe(correlationKey === undefined || key.equals(correlationKey), 'correlation_mismatch');
     return { db, key, file, createParser, digest, method: METHOD, close: () => db.close() };
   } catch (e) { db.close(); throw e; }
 }
@@ -147,12 +149,31 @@ export async function ingestTimingFile(store, path, { maxBytes = CHUNK, signal, 
   finally { await handle.close(); }
 }
 
-export function readTimingRows(store) {
-  const rows = store.db.prepare(`SELECT at,model,effort,tokens,reasoning,duration,ttft,
+export function readTimingRows(store, { supplement = null } = {}) {
+  // Correlation handles remain local. Only joined numeric observations leave
+  // this owner; a supplemental scan cannot add turns or replace old metrics.
+  let extras = null;
+  if (supplement) {
+    safe(store.key.equals(supplement.key), 'correlation_mismatch');
+    const candidates = supplement.db.prepare(`SELECT key,at,model,effort,tokens,reasoning,duration,ttft,
+      responses,covered,quality,sample_tokens,sample_duration FROM turn
+      WHERE sample_method='tool_free' LIMIT 100001`).all();
+    safe(candidates.length <= 100000, 'export_limit');
+    extras = new Map(candidates.map(row => [Buffer.from(row.key).toString('hex'), row]));
+  }
+  const rows = store.db.prepare(`SELECT key,at,model,effort,tokens,reasoning,duration,ttft,
     responses,covered,quality,sample_tokens,sample_reasoning,sample_duration,
     sample_responses,sample_total_responses,sample_method FROM turn ORDER BY at LIMIT 100001`).all();
   safe(rows.length <= 100000, 'export_limit');
-  return rows;
+  return rows.map(({ key, ...row }) => {
+    const extra = extras?.get(Buffer.from(key).toString('hex'));
+    if (extra && row.model !== null && ['at', 'model', 'effort', 'tokens', 'reasoning',
+      'duration', 'ttft', 'responses', 'covered', 'quality'].every(field => row[field] === extra[field])) {
+      row.tool_free_tokens = extra.sample_tokens;
+      row.tool_free_duration = extra.sample_duration;
+    }
+    return row;
+  });
 }
 
 export function timingReport(store) {

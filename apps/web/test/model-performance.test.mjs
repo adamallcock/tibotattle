@@ -12,6 +12,29 @@ function payload() {
     models: [{ id: 'gpt-5.6-sol', label: 'Sol', turns: 20, speedTurns: 10, ttftTurns: 15, timedResponses: 45,
       speed: [{ method: 'speed', points: [point(), point(3 * DAY)] }], ttft: [point(), point(3 * DAY), point(4 * DAY)] }] };
 }
+function toolFreePayload() {
+  const data = payload(); data.schemaVersion = 3; data.method = 4;
+  Object.assign(data.models[0], { toolFreeTurns: 2, toolFree: [point(DAY, 2)] });
+  return data;
+}
+test('tool-free DTO uses a closed versioned contract and an independent bounded population', () => {
+  const data = toolFreePayload();
+  assert.equal(normalizeModelPerformance(data), data);
+  for (const mutate of [
+    x => { x.schemaVersion = 2; }, x => { x.method = 3; },
+    x => { delete x.models[0].toolFree; }, x => { delete x.models[0].toolFreeTurns; },
+    x => { x.models[0].toolFreeTurns = 21; }, x => { x.models[0].toolFreeTurns = -1; },
+    x => { x.models[0].toolFreeTurns = 1; },
+    x => { x.models[0].toolFree[0].p90 = 1; },
+    x => { x.models[0].toolFree[0].privatePath = '/synthetic/private'; },
+    x => { x.models[0].toolFree.push(point(DAY, 1)); },
+  ]) { const invalid = toolFreePayload(); mutate(invalid); assert.equal(normalizeModelPerformance(invalid), null); }
+  const legacy = payload(); legacy.models[0].toolFreeTurns = 0;
+  assert.equal(normalizeModelPerformance(legacy), null, 'old schema cannot carry undeclared evidence');
+  Object.assign(data.models[0], { speedTurns: 0, speed: [], ttftTurns: 0, ttft: [] });
+  assert.equal(normalizeModelPerformance(data), data, 'historical throughput needs no reconstructed response timing');
+  assert.deepEqual(performanceDomain(data, data.models[0]), { start: DAY, end: data.end });
+});
 test('bounded contract preserves independent populations and one combined speed series', () => {
   const data = payload();
   assert.equal(normalizeModelPerformance(data), data);
@@ -69,7 +92,7 @@ test('client requests only an enum period, is abortable, and reports endpoint fa
 });
 test('every supported locale preserves coverage and measurement meaning', () => {
   for (const locale of SUPPORTED_LOCALES) {
-    for (const key of ['title', 'speedEmpty', 'ttftEmpty', 'methodology', 'variance', 'speedSummary', 'latencySummary', 'outerBand', 'innerBand', 'medianP50', 'percentileValues', 'percentilesUnavailable', 'buildingHistory', 'unavailable', 'stale']) {
+    for (const key of ['title', 'speedEmpty', 'ttftEmpty', 'methodology', 'variance', 'speedSummary', 'latencySummary', 'toolFree', 'toolFreeSummary', 'toolFreeMethodology', 'outerBand', 'innerBand', 'medianP50', 'percentileValues', 'percentilesUnavailable', 'buildingHistory', 'unavailable', 'stale']) {
       const value = translate(`performance.${key}`, {}, locale);
       assert.notEqual(value, `performance.${key}`);
     }
@@ -152,6 +175,25 @@ test('background history scan reports honest bounded progress while keeping char
   assert.equal(dom.root.all().find(node => node.className === 'performance-status').textContent,
     'Building earlier history · 629 of 9,026 sessions checked');
   assert.ok(dom.root.all().some(node => node.id === 'performance-model-panel'));
+  controller.destroy();
+});
+test('tool-free throughput adds a third qualified card and retains both original metrics', async () => {
+  const dom = focusHarness(); let response = toolFreePayload();
+  const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => response },
+    t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh();
+  assert.deepEqual(dom.root.all().filter(node => node.tagName === 'h4').map(node => node.textContent),
+    ['Output speed', 'First-token latency', 'Tool-free turn throughput']);
+  assert.equal(dom.root.all().find(node => node.className === 'performance-method-note').textContent,
+    'Output tokens over the full duration of a single-response turn with no tools. Includes initial waiting; not directly comparable with output speed.');
+  assert.match(dom.root.all().filter(node => node.className === 'performance-unit')[2].textContent, /2 of 20 turns eligible/u);
+  const plots = dom.root.all().filter(node => node.tagName === 'svg' && node.listeners.pointermove);
+  assert.equal(plots.length, 3);
+  assert.equal(plots[2].attributes['aria-label'], 'Tool-free turn throughput');
+  assert.match(plots[2].all().find(node => node.className === 'performance-point').attributes['aria-label'], /Tool-free turn throughput/u);
+  response = toolFreePayload(); response.models[0].toolFree = []; response.models[0].toolFreeTurns = 0;
+  await controller.refresh();
+  assert.equal(dom.root.all().filter(node => node.tagName === 'h4').length, 2, 'no extra empty card without eligible evidence');
   controller.destroy();
 });
 

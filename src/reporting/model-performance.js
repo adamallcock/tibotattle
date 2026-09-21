@@ -49,8 +49,8 @@ export function modelPerformanceProjection(rows, { period = 'all', now = Date.no
   for (const r of known) {
     if (r.at < start) continue;
     if (!groups.has(r.model)) groups.set(r.model, { id: r.model, label: LABELS.get(r.model),
-      turns: 0, speedTurns: 0, ttftTurns: 0, timedResponses: 0,
-      speed: new Map(), latency: new Map() });
+      turns: 0, speedTurns: 0, ttftTurns: 0, timedResponses: 0, toolFreeTurns: 0,
+      speed: new Map(), latency: new Map(), toolFree: new Map() });
     const m = groups.get(r.model), at = Math.floor((r.at - anchor) / size) * size + anchor;
     m.turns++;
     if (['receipt', 'legacy'].includes(r.sample_method) && positive(r.sample_tokens)
@@ -60,12 +60,17 @@ export function modelPerformanceProjection(rows, { period = 'all', now = Date.no
       add(m.speed, at, r.sample_tokens * 1000 / r.sample_duration);
     }
     if (count(r.ttft)) { m.ttftTurns++; add(m.latency, at, r.ttft / 1000); }
+    // This separate population includes the full turn, including initial waiting.
+    // Eligibility is established by the provider parser, never inferred here.
+    if (positive(r.tool_free_tokens) && positive(r.tool_free_duration)) {
+      m.toolFreeTurns++; add(m.toolFree, at, r.tool_free_tokens * 1000 / r.tool_free_duration);
+    }
   }
-  return { schemaVersion: 2, method: 3, status: 'ready', collecting: false, stale: false,
+  return { schemaVersion: 3, method: 4, status: 'ready', collecting: false, stale: false,
     updatedAt: new Date(now).toISOString(), period, interval, start, end, historyProgress,
     models: [...LABELS.keys()].filter(id => groups.has(id)).map(id => {
-      const { speed, latency, ...m } = groups.get(id);
+      const { speed, latency, toolFree, ...m } = groups.get(id);
       return { ...m, speed: [{ method: 'speed', points: points(speed) }],
-        ttft: points(latency) };
+        ttft: points(latency), toolFree: points(toolFree) };
     }) };
 }
