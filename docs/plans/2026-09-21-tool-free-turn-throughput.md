@@ -2,7 +2,7 @@
 title: Include tool-free fallback estimates in Output speed
 date: 2026-09-21
 type: plan
-status: in-progress
+status: validated-local
 ---
 
 The owner clarified that additive recovery means one Output speed graph containing
@@ -103,4 +103,14 @@ Clarified combined-chart implementation (2026-09-21):
 - Integrated validation: 36 focused snapshot/controller/worker/route tests,
   377 companion tests, 976 UI tests, and 13 translation tests passed. Original
   parser/Windows-adapter/reporting boundary checks: 46 passed.
-- Refreshed installed QA rendering remains to be checked.
+- Fresh macOS arm64 unsigned QA package from source `45f22958` passed artifact
+  verification. ASAR SHA-256:
+  `9b18729f88ccc9a00fc28e740e4a2c62cbd07cdc552a17692f31374fc47cd9ec`.
+  The previous QA app was preserved. The isolated copied profile was seeded
+  from the same verified source's completed sidecars in its scoped directory.
+- Native all-history GPT-5.5 inspection showed Output speed populated with
+  235 of 5,501 turns, explicitly 0 response-timed and 235 full-turn estimates;
+  TTFT remained 5,000 of 5,501. Only two metric cards rendered. The installed
+  QA companion independently returned the matching schema-4/method-5 counts.
+  Existing source-replacement refusals continue to produce the honest saved-data
+  warning; the guards were not weakened. The QA app is left open for review.
