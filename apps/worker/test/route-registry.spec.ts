@@ -45,6 +45,18 @@ const EXACT_ROUTES = [
     authority: "accountless_ownership",
   },
   {
+    pathname: "/api/v1/accountless/telemetry-v1.2-authorization",
+    id: "accountless_telemetry_v12_authorization",
+    methods: ["POST"],
+    authority: "accountless_ownership",
+  },
+  {
+    pathname: "/api/v1/accountless/telemetry-performance-authorization",
+    id: "accountless_telemetry_performance_authorization",
+    methods: ["POST"],
+    authority: "accountless_ownership",
+  },
+  {
     pathname: "/api/v1/accountless/renewal",
     id: "accountless_renewal",
     methods: ["POST"],
@@ -183,14 +195,50 @@ const EXACT_ROUTES = [
     authority: "device",
   },
   {
+    pathname: "/api/v1/device/sync-capabilities-v1.2",
+    id: "device_sync_capabilities_v12",
+    methods: ["GET"],
+    authority: "device",
+  },
+  {
+    pathname: "/api/v1/device/telemetry/performance/capabilities",
+    id: "telemetry_performance_capabilities",
+    methods: ["GET"],
+    authority: "device",
+  },
+  {
+    pathname: "/api/v1/me/device-telemetry-performance-consents",
+    id: "telemetry_performance_consent",
+    methods: ["POST"],
+    authority: "session",
+  },
+  {
+    pathname: "/api/v1/device/telemetry/performance/reports",
+    id: "telemetry_performance_reports",
+    methods: ["GET", "POST"],
+    authority: "device",
+  },
+  {
     pathname: "/api/v1/me/device-telemetry-consents",
     id: "telemetry_v11_consent",
     methods: ["POST"],
     authority: "session",
   },
   {
+    pathname: "/api/v1/me/device-telemetry-v12-consents",
+    id: "telemetry_v12_consent",
+    methods: ["POST"],
+    authority: "session",
+  },
+  {
     pathname: "/api/v1/device/telemetry/v1.1/day-manifests",
     id: "telemetry_v11_day_manifests",
+    methods: ["GET", "POST"],
+    authority: "device",
+  },
+  {
+    pathname: "/api/v1/device/telemetry/v1.2/day-manifests",
+    id: "telemetry_v12_day_manifests",
     methods: ["GET", "POST"],
     authority: "device",
   },
@@ -203,6 +251,18 @@ const EXACT_ROUTES = [
   {
     pathname: "/api/v1/me/telemetry-v11/domain-activate",
     id: "telemetry_v11_domain_activate",
+    methods: ["POST"],
+    authority: "device",
+  },
+  {
+    pathname: "/api/v1/me/telemetry-v12/domain-predecessor",
+    id: "telemetry_v12_domain_predecessor",
+    methods: ["POST"],
+    authority: "device",
+  },
+  {
+    pathname: "/api/v1/me/telemetry-v12/domain-activate",
+    id: "telemetry_v12_domain_activate",
     methods: ["POST"],
     authority: "device",
   },
@@ -252,7 +312,7 @@ const EXACT_ROUTES = [
 
 describe("Worker route registry", () => {
   it("recognizes every exact route and preserves stable log classifications", () => {
-    expect(EXACT_ROUTES).toHaveLength(40);
+    expect(EXACT_ROUTES).toHaveLength(50);
     expect(WORKER_ROUTE_POLICY).toEqual(EXACT_ROUTES);
     expect(Object.isFrozen(WORKER_ROUTE_POLICY)).toBe(true);
     for (const definition of WORKER_ROUTE_POLICY) {

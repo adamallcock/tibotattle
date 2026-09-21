@@ -20,11 +20,13 @@ const EXPECTED_ROUTES = [
   { pathname: "/api/v1/logout", methods: ["POST"] },
   { pathname: "/api/v1/me/device-pairings", methods: ["POST"] },
   { pathname: "/api/v1/me/device-telemetry-consents", methods: ["POST"] },
+  { pathname: "/api/v1/me/device-telemetry-v12-consents", methods: ["POST"] },
+  { pathname: "/api/v1/me/device-telemetry-performance-consents", methods: ["POST"] },
 ];
 
 test("participant relay route policy preserves the exact allowlist", () => {
-  assert.equal(EXPECTED_ROUTES.length, 9);
-  assert.equal(PARTICIPANT_RELAY_ROUTE_POLICY.length, 9);
+  assert.equal(EXPECTED_ROUTES.length, 11);
+  assert.equal(PARTICIPANT_RELAY_ROUTE_POLICY.length, 11);
   assert.deepEqual(PARTICIPANT_RELAY_ROUTE_POLICY, EXPECTED_ROUTES);
   assert.equal(Object.isFrozen(PARTICIPANT_RELAY_ROUTE_POLICY), true);
   for (const policy of PARTICIPANT_RELAY_ROUTE_POLICY) {

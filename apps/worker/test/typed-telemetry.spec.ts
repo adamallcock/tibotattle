@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { canonicalTelemetryV11Json, type TelemetryV11Attribution } from "@app-usagemonitor/telemetry-contract";
 import {
   decodeTypedTelemetryId, encodeTypedTelemetryId, encodeTypedTelemetryRecord, typedTelemetryCanonicalRecords,
-  typedTelemetryDayNumber, typedTelemetryDayString, type TypedTelemetryFormat,
+  typedTelemetryDayNumber, typedTelemetryDayString, typedTelemetryIdSql, type TypedTelemetryFormat,
 } from "../src/typed-telemetry-codec";
 import {
   MAX_TYPED_TELEMETRY_BATCH_RECORDS, MAX_TYPED_TELEMETRY_BATCH_STATEMENTS,
@@ -388,4 +388,17 @@ describe("typed target D1", () => {
     await reset();
     await expect(persistTypedTelemetryBatch(db(), [row])).rejects.toMatchObject({ code: "TYPED_TELEMETRY_UNAVAILABLE" });
   });
+});
+
+
+it('projects every compact identifier form into the same text used by occurrence cursors',async()=>{
+ const values=[uuid,...['participant:','device:','v1:','contribution:','chunk:'].map(prefix=>prefix+uuid),
+   ...['','event:v2:','quota-occurrence:v1:','account-track:v2:','plan-era:v1:'].map(prefix=>prefix+'a'.repeat(64)),
+   'synthetic:raw-identifier',uuid.toUpperCase()];
+ for(const id of values){
+   const projected=await db().prepare(`SELECT ${typedTelemetryIdSql('value')} AS decoded FROM (SELECT ? AS value)`)
+     .bind(Uint8Array.from(encodeTypedTelemetryId(id)).buffer).first<string>('decoded');
+   expect(projected).toBe(id);
+ }
+ expect(()=>typedTelemetryIdSql('value; DELETE FROM x')).toThrow();
 });

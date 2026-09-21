@@ -117,8 +117,12 @@ A version-3 supplement under `inference-timing-v2/source-<Codex-home digest>/too
 backfills single-response turns without tools, using the original sidecar's
 private correlation key. Its own cursor and pending state do not change original
 measurements or checkpoints. Joins require matching turn identity and original
-scalar evidence. The schema-3/method-4 display contract adds separately binned
-full-turn throughput, including initial waiting, while preserving speed and TTFT.
+scalar evidence. The schema-4/method-5 display contract combines response speed and full-turn
+throughput in one Output speed distribution. Response timing takes precedence
+per turn; eligible tool-free throughput is used only as a fallback, including
+initial waiting. Percentiles are computed from individual samples, never merged
+from aggregate percentiles. The fallback count and bins identify that subset;
+TTFT and original stored measurements remain unchanged.
 If the supplement cannot open or be read, the worker still serves the original
 measurements with an explicit stale state.
 Neither timing data nor failures enter accounting or contribution; no network
@@ -231,8 +235,12 @@ and existing cohort limits are unchanged.
 The staged v1.1 path adds immutable day manifests and a complete-domain head.
 First activation uses a null predecessor plus the observed legacy fingerprint;
 successors preserve every selected prior occurrence's base accounting. Candidate
-arrival is not publication. A transactional head switch selects v1.1 for the
-whole participant domain, queues daily rebuilds and invalidates prior caches.
+arrival is not publication. A transactional head switch records the new v1.1 write cursor, queues daily
+rebuilds and invalidates prior caches. With the correction runtime staged, the
+legacy reader selects that complete participant domain. Once the correction
+runtime is active, effective readers retain all admitted v1/v1.1 device
+generations and activated v1.2 generations, grouping observations by occurrence
+before folding. A newer device head cannot discard unique older-device rows.
 Even an explicit admission-floor rollback cannot silently select a legacy day
 outside that domain. Any accepted v0.2 corpus prevents a v1.1 consent upgrade
 and activation until a semantic replacement mapping is proven, including when
@@ -253,6 +261,24 @@ records); larger transfers pause without deleting or silently truncating history
 Hosted fitting has a bounded 100-day evidence horizon and remains conditional:
 the wire format does not prove complete historical quantity intervals. No
 scoped-primary account billing claim is introduced by the new transport.
+
+The v1.2 source path adds independent successor capability and authorization,
+an exact local field review, a separate progress journal, encrypted transport,
+typed admission and complete-domain activation. Its three usage extensions are
+continuity bits, same-time order and non-additive cache-write TTL detail. They
+are excluded from current cache arithmetic. Exact-total corrections preserve
+immutable source variants so later older-client uploads cannot erase known
+totals or their own unique occurrences. Every analytical pathway must use the
+qualified occurrence reader before the correction runtime is activated; see the
+[current implementation plan](../plans/2026-09-20-turn-boundary-telemetry-plan.md).
+
+Daily performance is a separate stream with its own policy, grants, encrypted
+reports and typed cohort/bucket storage. It has fixed mergeable distributions
+for TPS, TTFT and full turn duration, plus measurement and mode provenance.
+Per-device report revisions are idempotent; pooled values describe reported
+samples and may include cross-device overlap. Timing fields do not enter usage
+events. Both new runtimes start staged, and source availability proves neither
+hosted activation nor installed-client operation.
 
 ## Hosted storage
 

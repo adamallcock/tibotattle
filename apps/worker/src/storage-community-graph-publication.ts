@@ -11,6 +11,7 @@ import { COMMUNITY_MODEL_CACHE_MAX_PAGES, parsedCachedFits, validCompleteCachedC
 import { MODEL_HISTORY_METHOD_VERSION, type V1ModelCompositionResult } from './quota-analysis-v1';
 import { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from './quota-analysis-v11';
 import { STORAGE_GRAPH_METHOD, storageGraphDependencyDigest } from './storage-community-graph';
+import { effectiveHistoryDependency } from './storage-effective-history';
 import { modelHistoryWindow } from './model-history-window';
 import { MAX_V1_SOURCE_CHUNKS, selectV1SourceDayDependencies, type V1SourceChunk } from './telemetry-v1-source-selection';
 import { captureStorageCommunityAuthority, captureStorageCommunityRetirementAuthority, readStorageCommunityOwnerPage,
@@ -66,7 +67,8 @@ export async function storageCommunityGraphPreviewReadyHint(bindings:StorageAnal
 }
 function identity(owner:StorageCommunityOwner) {
   return {ownerDigest:owner.ownerDigest,inputRevision:owner.inputRevision,ownerRevision:owner.ownerRevision,
-    hasV1:owner.hasV1,hasV11:owner.hasV11,hasLegacy:owner.hasLegacy};
+    authorityEpoch:owner.authorityEpoch,hasV1:owner.hasV1,hasV11:owner.hasV11,hasV12:owner.hasV12,
+    hasEffective:owner.hasEffective===true,hasLegacy:owner.hasLegacy};
 }
 async function owners(source:D1Database):Promise<StorageCommunityOwner[]|null|'capacity'> {
   const result:StorageCommunityOwner[]=[];let after='',size=0;
@@ -75,7 +77,7 @@ async function owners(source:D1Database):Promise<StorageCommunityOwner[]|null|'c
     for(const owner of page){
       // Enrollment alone is not an uploading cohort member. A legacy uploader
       // without its journal bootstrap remains pending, never silently excluded.
-      if(!owner.hasV1&&!owner.hasV11&&!owner.hasLegacy)continue;
+      if(!owner.hasV1&&!owner.hasV11&&!owner.hasV12&&!owner.hasEffective&&!owner.hasLegacy)continue;
       if(!owner.ownerDigest)return null;
       size+=bytes(canonicalJson(identity(owner)));if(size>MAX_COHORT_BYTES)return 'capacity';
       result.push(owner);
@@ -88,7 +90,7 @@ async function ready(bindings:StorageAnalyticsBindings):Promise<void> {
     WHERE source_id=? AND source_namespace=? AND contract_version=1`).bind(bindings.sourceId,bindings.sourceNamespace).first())throw fail();
 }
 interface CapturedResult {
-  owner:StorageCommunityOwner; source:'v0.2'|'v1'|'v1.1'|'mixed'; dependencyDigest:string;
+  owner:StorageCommunityOwner; source:'v0.2'|'v1'|'v1.1'|'mixed'|'effective'; dependencyDigest:string;
   fits:CommunityAllowanceFit[]|null;composition:V1ModelCompositionResult|null;unsupportedSource?:boolean;
   inputCurrent:boolean;computedMs:number;sourceEpoch:number;sequence:number;
 }
@@ -130,8 +132,26 @@ async function dependencyMetadata<T>(source:D1Database,sql:string,args:Array<str
 async function closedDependencies(bindings:StorageAnalyticsBindings,authority:StorageCommunityAuthority,
   page:StorageCommunityOwner[],day:string,budget:{remaining:number}):Promise<Map<string,string>|'capacity'|null> {
   const window=modelHistoryWindow(day),result=new Map<string,string>();
-  if(page.some(owner=>!owner.hasV11&&(owner.hasLegacy||!owner.hasV1)))return null;
-  const v11=page.filter(owner=>owner.hasV11);
+  // Effective owners use the same closed-window metadata builder as graph
+  // scope capture. This keeps publication revalidation byte-identical to the
+  // dependency used by resumable work and retains every admitted source family.
+  if(page.some(owner=>(owner.hasV12&&!owner.hasEffective)
+      ||(!owner.hasEffective&&!owner.hasV11&&(owner.hasLegacy||!owner.hasV1))))return null;
+  for(const owner of page.filter(owner=>owner.hasEffective)){
+    const dependency=await effectiveHistoryDependency(bindings.source,owner,bindings.sourceNamespace,
+      window.fromDay,window.day);
+    // Effective history returns the same immutable, canonical metadata used
+    // by the resumable graph reader. Charge its serialized bytes against the
+    // publication-wide dependency budget before doing any more per-owner
+    // work; otherwise a page containing effective owners could bypass the
+    // bound enforced by dependencyMetadata for legacy sources.
+    const dependencySize=bytes(canonicalJson(dependency));
+    if(dependencySize>budget.remaining)return 'capacity';
+    budget.remaining-=dependencySize;
+    result.set(owner.ownerDigest!,await storageGraphDependencyDigest({authority,ownerDigest:owner.ownerDigest!,
+      source:'effective',metric:'model',day,dependency}));
+  }
+  const v11=page.filter(owner=>!owner.hasEffective&&owner.hasV11);
   if(v11.length){
     type Day={participant_id:string;observed_day:string;id:string;manifest_digest:string;device_id:string};
     const rows=await dependencyMetadata<Day>(bindings.source,`SELECT json_object(
@@ -150,7 +170,7 @@ async function closedDependencies(bindings:StorageAnalyticsBindings,authority:St
         source:'v1.1',metric:'model',day,dependency}));
     }
   }
-  const v1=page.filter(owner=>!owner.hasV11);
+  const v1=page.filter(owner=>!owner.hasEffective&&!owner.hasV11);
   if(v1.length){
     const rows=await dependencyMetadata<V1SourceChunk>(bindings.source,`SELECT json_object(
       'id',c.id,'participant_id',c.participant_id,'device_id',c.device_id,'chunk_day',c.chunk_day,
@@ -203,7 +223,7 @@ async function capture(bindings:StorageAnalyticsBindings,day:string,metric:'fits
     for(const owner of page){
       const row=byOwner.get(owner.ownerDigest!);
       if(row?.payload_json===null)return {deferred:'capacity',memberCount:members.length};
-      const source=owner.hasV11?'v1.1':owner.hasV1?owner.hasLegacy?'mixed':'v1':'v0.2';
+      const source=owner.hasEffective?'effective':owner.hasV11?'v1.1':owner.hasV1?owner.hasLegacy?'mixed':'v1':'v0.2';
       const rowAuthority=row?JSON.parse(row.authority_json) as StorageCommunityAuthority:null;
       if(!row||row.input_revision>owner.inputRevision
         ||!Number.isSafeInteger(row.input_revision)||row.input_revision<0||row.source_kind!==source

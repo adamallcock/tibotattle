@@ -171,15 +171,15 @@ changing period displays its cached chart immediately while checking for
 updates. These results stay in memory only; restarting the app starts a fresh
 page cache. Speculative report requests pause while the app document is hidden.
 
-**Output speed** estimates tokens per second from covered response windows.
+**Output speed** includes response-timed measurements plus eligible tool-free
+turn estimates from older logs. Each turn contributes once: covered response
+windows take precedence; otherwise a completed, single-response turn without
+tools may use reconciled output tokens divided by its full duration. These
+fallback estimates include initial waiting and can be lower than response-timed
+speed. The chart identifies how many measurements use each method; its medians
+and bands summarize the combined population. Reasoning tokens are included once.
 **First-token latency** uses independently available turn timing, so its sample
-count can be much larger. When eligible evidence exists, **Tool-free turn
-throughput** adds a third chart for completed, single-response turns without
-tools. It divides reconciled output tokens by the full turn duration, including
-initial waiting. It can recover observations from older logs but is not directly
-comparable with output speed. Its counts and distribution stay separate; existing
-speed and latency measurements are preserved. Reasoning tokens are included
-once in both rates. Missing evidence remains unavailable, never zero.
+count can be larger. Missing evidence remains unavailable, never zero.
 
 The plots show daily or weekly medians and percentile bands where enough
 observations exist.

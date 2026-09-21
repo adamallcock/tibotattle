@@ -1,18 +1,23 @@
 import {env,reset,applyD1Migrations,type D1Migration} from 'cloudflare:test';
 import {beforeEach,it,expect} from 'vitest';
-import {createV11DeviceFixture,v11UsageRecord} from './helpers/telemetry-v11';
+import {createV11DeviceFixture,makeV11Day,v11UsageRecord} from './helpers/telemetry-v11';
 import {pricedModelHistoryUsage,MODEL_HISTORY_TEST_CAPACITIES} from './helpers/model-history';
 import {createV1QuotaAcquisitionCheckpoint,V1_QUOTA_ACQUISITION_VERSION} from '../src/quota-analysis-v1-reader';
 import {V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION} from '../src/quota-analysis-v11';
 import {modelHistoryWindow} from '../src/model-history-window';
 import {accountScopedQuotaAnalysisV1,MODEL_HISTORY_METHOD_VERSION} from '../src/quota-analysis-v1';
 import {selectCommunityAllowanceAnalysisFits} from '../src/community-allowance';
-import {authenticateDevice,createDeviceUploadAuthorization,claimDeviceUploadAuthorization} from '../src/device-auth';
+import {authenticateDevice,createDeviceUploadAuthorization,claimDeviceUploadAuthorization,revokeParticipantDevice} from '../src/device-auth';
 import {parseTelemetryV1Chunk,type TelemetryV1Record} from '../src/telemetry-v1';
 import type {V1SourcePin} from '../src/telemetry-v1-source-selection';
 import {initializeTypedV1Admission,insertTypedTelemetryV1Chunk} from '../src/typed-v1-admission';
 import {initializeTypedV11Admission} from '../src/typed-v11-admission';
-import {telemetryV11LegacyProjection} from '../src/telemetry-v11-repository';
+import {registerTelemetryV11DayManifest,telemetryV11LegacyProjection} from '../src/telemetry-v11-repository';
+import {persistTypedV11StagedChunk} from '../src/typed-v11-admission';
+import {activateTelemetryV11Domain,createTelemetryV11DomainPredecessor} from '../src/telemetry-v11-domain';
+import {readEffectiveUsageOwnerDayPage} from '../src/telemetry-usage-effective-reader';
+import {readTypedTelemetryRowsByStorageIds} from '../src/typed-telemetry-compatibility';
+import {parseTelemetryV11Record,telemetryV11DomainManifestDigestInput,type TelemetryV11DomainManifest,type TelemetryV11Record} from '@app-usagemonitor/telemetry-contract';
 import {canonicalJson} from '../src/canonical-json';
 import {sha256Hex} from '../src/crypto';
 import {initializeStorageSource} from '../src/analytics-delivery';
@@ -101,13 +106,14 @@ beforeEach(async()=>{
  expect((await drainCommunityPublicSourceBootstrap(source())).completed).toBe(true);
  await initializeStorageAnalyticsRuntime(bindings());
 });
-async function fixture(extraUsageCount=0){
+async function fixture(extraUsageCount=0,v11CompatibleQuota=false){
  const owner=await createV11DeviceFixture(source()),groups=new Map<string,TelemetryV1Record[]>();
  const base=Date.parse('2026-09-01T00:00:00Z'),at=(h:number)=>new Date(base+h*3600000).toISOString();
  const push=(stream:string,time:string,record:TelemetryV1Record)=>{const key=`${stream}:${time.slice(0,10)}`;
   const group=groups.get(key)??[];group.push(record);groups.set(key,group);};
  let percent=0;
- const quota=(time:string)=>push('quota',time,{schemaVersion:'quota-observation-v1.0',observationId:`synthetic:${time}`,
+ const quota=(time:string)=>push('quota',time,{schemaVersion:'quota-observation-v1.0',observationId:v11CompatibleQuota
+   ?`q:${Date.parse(time)}:codex:seven_day`:`synthetic:${time}`,
   observedTime:time,provider:'openai_codex',planType:'pro',planVariant:'unknown',limitId:'codex',slot:'seven_day',
   usedPercent:percent,windowDurationMinutes:10080,resetsAt:at(168)});
  quota(at(0));
@@ -417,3 +423,178 @@ it('starts v1 checkpoint work under new keys when the acquisition contract chang
   STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD].map(method=>storageHistoryKeyDigest(key(method))));
  expect(new Set(digests).size).toBe(digests.length);
 });
+
+
+it('routes correction-active owners through a resumable effective graph without v1.2 uploads',async()=>{
+ await fixture();
+ await source().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+ const owner=(await readStorageCommunityOwnerPage(source()))[0]!;
+ expect(owner).toMatchObject({hasV1:true,hasV12:false,hasEffective:true});
+ const scope=await captureStorageGraphScope(source(),{owner,day,metric:'model',sourceId,sourceNamespace:namespace});
+ expect(scope.source).toBe('effective');
+ let result:Awaited<ReturnType<typeof computeStorageGraphResult>>|undefined;
+ let checkpointCount=0;
+ for(let attempt=0;attempt<12;attempt++){
+   const meter=createD1InvocationBudget(900);
+   result=await computeStorageGraphResult({...bindings(),source:meter.wrap(source()),target:meter.wrap(target())},scope,
+     {maxQueries:900,deadlineMs:Date.now()+60000});
+   expect(meter.queriesUsed).toBeLessThanOrEqual(900);
+   checkpointCount=await target().prepare("SELECT count(*) n FROM analytics_history_checkpoint_heads h JOIN analytics_history_checkpoint_stages s ON s.key_digest=h.key_digest AND s.generation=h.generation WHERE s.method LIKE '%effective-model-checkpoint%'")
+     .first<number>('n')??0;
+   if(result.state==='complete')break;
+   expect(result.reason).toBe('effective_checkpoint');
+ }
+ expect(checkpointCount).toBeGreaterThan(0);
+ expect(result?.state).toBe('complete');
+ if(result?.state!=='complete')throw new Error('effective graph did not finish');
+ expect(result.result.composition?.status).toBe('ready');
+ expect(await readStorageGraphResult(bindings(),scope)).not.toBeNull();
+ expect(await target().prepare("SELECT source_kind FROM analytics_community_graph_results WHERE owner_digest=? AND metric='model'")
+   .bind(owner.ownerDigest).first<string>('source_kind')).toBe('effective');
+ const replay=await computeStorageGraphResult(bindings(),scope);
+ expect(replay).toMatchObject({state:'complete',reused:true});
+ await source().prepare("UPDATE storage_owner_revisions SET revision=revision+1 WHERE owner_digest=?").bind(owner.ownerDigest).run();
+ await expect(readStorageGraphResult(bindings(),scope)).rejects.toThrow();
+},90000);
+
+it('folds mixed v1 and v1.1 evidence once through resumable model and fit graphs',async()=>{
+ await fixture(0,true);
+ await source().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+ const before=(await readStorageCommunityOwnerPage(source())).find(row=>row.hasV1)!;
+ expect(before).toMatchObject({hasV1:true,hasV11:false,hasEffective:true});
+
+ // The fixture's v1 records were produced from complete v1.1-shaped source
+ // records before the legacy projection. Rehydrate every admitted v1 row as
+ // its v1.1 variant: domain activation requires the successor to preserve
+ // each winning legacy occurrence, not merely one overlap sample.
+ const metadata=(await source().prepare(`SELECT storage_row_id,stream,observed_day
+   FROM typed_telemetry_compatibility_records
+   WHERE source_namespace=? AND participant_id=? AND format='v1' AND stream IN ('usage','quota')
+   ORDER BY observed_day,observed_at,occurrence_id`).bind(namespace,before.participantId)
+   .all<{storage_row_id:number;stream:'usage'|'quota';observed_day:string}>()).results;
+ const decoded=[];
+ for(let offset=0;offset<metadata.length;offset+=200){
+   decoded.push(...await readTypedTelemetryRowsByStorageIds(source(),{sourceNamespace:namespace,
+     participantId:before.participantId,storageRowIds:metadata.slice(offset,offset+200).map(row=>row.storage_row_id)}));
+ }
+ if(decoded.length!==metadata.length||decoded.length<1)throw new Error('mixed graph fixture lost typed v1 rows');
+ const byDay=new Map<string,{quota:TelemetryV11Record[];usage:TelemetryV11Record[]}>();
+ for(const row of decoded){
+   if(row.stream!=='usage'&&row.stream!=='quota')continue;
+   const value={...JSON.parse(row.record_json) as Record<string,unknown>};
+   if(typeof value.schemaVersion!=='string'||!value.schemaVersion.endsWith('-v1.0'))throw new Error('mixed graph fixture has an unexpected v1 schema');
+   value.schemaVersion=`${value.schemaVersion.slice(0,-4)}v1.1`;
+   const planType=row.stream==='quota'&&typeof value.planType==='string'?value.planType:'unknown';
+   value.accountPlanAttribution={accountBasis:'unavailable',accountTrackId:null,
+     planBasis:planType==='unknown'?'unavailable':'same_source_occurrence',planType,planEraId:null};
+   const group=byDay.get(row.observed_day)??{quota:[],usage:[]};
+   group[row.stream].push(parseTelemetryV11Record(row.stream,value));byDay.set(row.observed_day,group);
+ }
+ const duplicateSource=decoded.find(row=>row.stream==='usage'&&row.observed_day===day);
+ if(!duplicateSource)throw new Error('mixed graph fixture lost its target-day v1 usage row');
+ const duplicateRecord=JSON.parse(duplicateSource.record_json) as {eventId:string;eventTime:string};
+
+ // A separately granted device proves that the effective path can combine
+ // concurrent client families without raising a new owner-wide v1 floor.
+ const v11Device=await createV11DeviceFixture(source(),{participantId:before.participantId,grant:true});
+ const predecessor=await createTelemetryV11DomainPredecessor(source(),v11Device);
+ const stageTypedDay=async(prepared:Awaited<ReturnType<typeof makeV11Day>>)=>{
+   const candidate=await registerTelemetryV11DayManifest(source(),v11Device,prepared.manifest);
+   for(const chunk of prepared.chunks){
+     const raw=canonicalJson({syntheticTestEnvelope:chunk.chunkDigest,manifestDigest:chunk.manifestDigest,nonce:crypto.randomUUID()});
+     const envelopeDigest=await sha256Hex(raw);
+     const principal=await authenticateDevice(source(),v11Device.authorization);
+     const upload=await createDeviceUploadAuthorization(source(),principal,envelopeDigest,new TextEncoder().encode(raw).byteLength);
+     const claimed=await claimDeviceUploadAuthorization(source(),`Upload ${upload.uploadAuthorization}`,{
+       envelopeDigest,bodyBytes:new TextEncoder().encode(raw).byteLength,contentType:'application/json'});
+     await persistTypedV11StagedChunk(source(),principal,chunk,{sourceNamespace:namespace,
+       chunkRowId:`chunk:${crypto.randomUUID()}`,r2Key:`synthetic/mixed-graph/${crypto.randomUUID()}`,
+       envelopeDigest,deviceUploadAuthorizationId:claimed.authorizationId});
+   }
+   return candidate;
+ };
+ const days:string[]=[];
+ for(let cursor=predecessor.fromDay;;){
+   days.push(cursor);
+   if(cursor===predecessor.throughDay)break;
+   cursor=new Date(Date.parse(`${cursor}T00:00:00.000Z`)+86_400_000).toISOString().slice(0,10);
+ }
+ const candidates=[];
+ for(const candidateDay of days){
+   const prepared=await makeV11Day(candidateDay,byDay.get(candidateDay)??{});
+   candidates.push(await stageTypedDay(prepared));
+ }
+ const manifest:TelemetryV11DomainManifest={schemaVersion:'telemetry-domain-manifest-v1.1',
+   fromDay:predecessor.fromDay,throughDay:predecessor.throughDay,
+   predecessor:{token:predecessor.token,previousGenerationId:predecessor.previousGenerationId,
+     legacyFingerprint:predecessor.legacyFingerprint},
+   days:candidates.sort((left,right)=>left.day.localeCompare(right.day)).map(candidate=>({
+     day:candidate.day,manifestId:candidate.manifestId,manifestDigest:candidate.manifestDigest,
+   })),manifestDigest:'0'.repeat(64)};
+ manifest.manifestDigest=await sha256Hex(telemetryV11DomainManifestDigestInput(manifest));
+ const proofs=await source().prepare(`SELECT old.occurrence_id AS old_occurrence,old.canonical_sha256 AS old_digest,
+     new.legacy_occurrence_id AS new_occurrence,lower(hex(new.legacy_digest)) AS new_digest
+   FROM typed_telemetry_compatibility_records old
+   JOIN typed_v1_record_admissions old_admission ON old_admission.typed_record_id=old.storage_row_id
+   JOIN telemetry_v11_day_manifests m ON m.participant_id=old.participant_id AND m.device_id=?
+     AND m.chunk_day=old.observed_day
+   JOIN typed_v11_record_admissions new ON new.manifest_id=m.id AND new.stream=old.stream
+     AND new.legacy_occurrence_id=old.occurrence_id
+   WHERE old.source_namespace=? AND old.participant_id=? AND old.format='v1' AND old.stream IN ('usage','quota')`)
+   .bind(v11Device.deviceId,namespace,before.participantId).all<{old_occurrence:string;old_digest:string;new_occurrence:string;new_digest:string}>();
+ const digestMismatches=proofs.results.filter(row=>row.old_digest!==row.new_digest);
+ expect({sourceRows:metadata.length,proofRows:proofs.results.length,digestMismatches:digestMismatches.slice(0,3)})
+   .toEqual({sourceRows:metadata.length,proofRows:metadata.length,digestMismatches:[]});
+ await activateTelemetryV11Domain(source(),v11Device,manifest);
+ for(let attempt=0;attempt<30;attempt++)if((await advanceStorageAnalytics(bindings())).state==='idle')break;
+
+ const owner=(await readStorageCommunityOwnerPage(source())).find(row=>row.participantId===before.participantId)!;
+ expect(owner).toMatchObject({hasV1:true,hasV11:true,hasEffective:true});
+ const usage=await readEffectiveUsageOwnerDayPage(source(),{sourceNamespace:namespace,
+   ownerDigest:owner.ownerDigest!,ownerRevision:owner.ownerRevision,authorityEpoch:owner.authorityEpoch,
+   day,stream:'usage',limit:200});
+ const overlap=usage.rows.find(row=>row.occurrenceId===duplicateRecord.eventId);
+ expect(overlap).toMatchObject({status:'compatible',sourceCount:2,sourceFormats:['v1','v11']});
+ expect(new Set(usage.rows.map(row=>row.occurrenceId)).size).toBe(usage.rows.length);
+ const last=usage.rows.at(-1)!;
+ expect(last.eventTime).not.toBeNull();
+ const noProgress=await readEffectiveUsageOwnerDayPage(source(),{sourceNamespace:namespace,
+   ownerDigest:owner.ownerDigest!,ownerRevision:owner.ownerRevision,authorityEpoch:owner.authorityEpoch,
+   day,stream:'usage',limit:200,after:{observedAtMs:Date.parse(last.eventTime!),occurrenceId:last.occurrenceId}});
+ expect(noProgress.rows).toHaveLength(0);
+ expect(noProgress.next).toBeNull();
+
+ const compute=async(metric:'model'|'fits')=>{
+   const scope=await captureStorageGraphScope(source(),{owner,day,metric,sourceId,sourceNamespace:namespace});
+   let result:Awaited<ReturnType<typeof computeStorageGraphResult>>|undefined;
+   for(let attempt=0;attempt<16;attempt++){
+     result=await computeStorageGraphResult(bindings(),scope,{maxQueries:900,deadlineMs:Date.now()+60_000});
+     if(result.state==='complete'){
+       const replay=await computeStorageGraphResult(bindings(),scope);
+       expect(replay).toMatchObject({state:'complete',reused:true});
+       return {result,scope};
+     }
+     expect(result.reason).toBe('effective_checkpoint');
+   }
+   throw new Error(`mixed ${metric} graph did not finish`);
+ };
+ const model=await compute('model');
+ expect(model.result.state).toBe('complete');
+ if(model.result.state!=='complete')throw new Error('mixed model graph did not complete');
+ expect(model.result.result.composition?.status).toBe('ready');
+ if(model.result.result.composition?.status!=='ready')throw new Error('mixed model composition not ready');
+ expect(model.result.result.composition.usageEventCount).toBe(metadata.filter(row=>row.stream==='usage').length);
+ expect(model.result.result.composition.quotaRowCount).toBeGreaterThan(0);
+ const fits=await compute('fits');
+ expect(fits.result.state).toBe('complete');
+ if(fits.result.state!=='complete')throw new Error('mixed fit graph did not complete');
+ expect(fits.result.result.fits).not.toBeNull();
+ // Disconnect changes future upload authority, not accepted analytical history.
+ await revokeParticipantDevice(source(), before.participantId, v11Device.deviceId);
+ const retainedOwner=(await readStorageCommunityOwnerPage(source())).find(row=>row.participantId===before.participantId)!;
+ const retained=await readEffectiveUsageOwnerDayPage(source(),{sourceNamespace:namespace,
+   ownerDigest:retainedOwner.ownerDigest!,ownerRevision:retainedOwner.ownerRevision,authorityEpoch:retainedOwner.authorityEpoch,
+   day,stream:'usage',limit:200});
+ expect(retained.rows.find(row=>row.occurrenceId===duplicateRecord.eventId))
+   .toMatchObject({status:'compatible',sourceCount:2,sourceFormats:['v1','v11']});
+},180000);

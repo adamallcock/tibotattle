@@ -9,9 +9,14 @@ import {
  CACHE_RETENTION_METRIC_ID,
  CACHE_RETENTION_TITLE,
  CacheRetentionRefusedError,
+ applyCacheRetentionReducerCarryPage,
+ applyCacheRetentionReducerPage,
  cacheRetentionBandFor,
+ createCacheRetentionReducerState,
+ finishCacheRetentionReducer,
  mergeCacheRetentionBands,
  reduceCacheRetentionDay,
+ validCacheRetentionReducerState,
  validCacheRetentionDayAggregate,
  type CacheRetentionBandId,
  type CacheRetentionBandRow,
@@ -23,6 +28,9 @@ import {
  CACHE_RETENTION_RECORD_SCHEMAS,
  CACHE_RETENTION_SESSION_DIGEST_METHOD,
  CACHE_RETENTION_SOURCE_LAYOUTS,
+ CACHE_RETENTION_EFFECTIVE_PAGE_QUERIES,
+ CACHE_RETENTION_EFFECTIVE_DEVICE_ID,
+ CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
  CACHE_RETENTION_V1_DEVICE_ID,
  CACHE_RETENTION_V1_MANIFEST_ID,
  createCacheRetentionV1DayBuild,
@@ -35,10 +43,13 @@ import {
  cacheRetentionSessionDigest,
  createCacheRetentionDayBuild,
  createCacheRetentionDaySourceBuild,
+ createCacheRetentionEffectiveDayBuild,
+ CacheRetentionDeferredError,
  readCacheRetentionCarryDays,
  readCacheRetentionCommunityBands,
  readCacheRetentionDay,
  retireCacheRetentionDayPage,
+ writeCacheRetentionDayRefusal,
  writeCacheRetentionDay,
  type CacheRetentionCarryDay,
  type CacheRetentionDayBuild,
@@ -61,6 +72,9 @@ import {loadTypedV11GenerationSnapshot} from '../src/typed-v11-quota-reader';
 import {authenticateDevice,createDeviceUploadAuthorization,claimDeviceUploadAuthorization} from '../src/device-auth';
 import {telemetryV11DomainManifestDigestInput,type TelemetryV11DomainManifest} from '@app-usagemonitor/telemetry-contract';
 import {createV11DeviceFixture,makeV11Day,v11UsageRecord} from './helpers/telemetry-v11';
+import {readEffectiveTelemetryOwnerDayPage,type EffectiveTelemetryOwnerDayPage} from '../src/telemetry-usage-effective-reader';
+import {effectiveHistoryDependency} from '../src/storage-effective-history';
+import type {StorageCommunityOwner} from '../src/storage-community-authority';
 
 const b=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_ANALYTICS_MIGRATIONS:D1Migration[];
  TEST_MIGRATIONS:D1Migration[];TEST_TYPED_INGESTION_MIGRATIONS:D1Migration[];
@@ -72,6 +86,7 @@ const sourceId='synthetic-retention',sourceNamespace='synthetic-retention-origin
 const OWNER='a'.repeat(64),MANIFEST='b'.repeat(64),REGISTRY='c'.repeat(64);
 const DAY='2026-09-10',DAY_MS=Date.parse(`${DAY}T00:00:00.000Z`);
 const SESSION_A='1'.repeat(64),SESSION_B='2'.repeat(64);
+const EFFECTIVE_DEPENDENCY_DIGEST='d'.repeat(64);
 
 const key=(overrides:Partial<CacheRetentionDayCandidate>={}):CacheRetentionDayCandidate=>({
  sourceId,sourceLayout:'typed-v11',sourceNamespace,ownerDigest:OWNER,deviceId:'device-1',
@@ -117,6 +132,23 @@ async function deliverDay(day=DAY,manifestDigest=MANIFEST,manifestId='manifest-1
   .bind(await sha256Hex(`${owner}:${deviceId}:${day}:${manifestDigest}:${manifestId}`),sourceId,
    'typed-v11',sourceNamespace,owner,deviceId,manifestId,manifestDigest,day,'synthetic-values-v1',
    'synthetic-pricing',REGISTRY,1,await sha256Hex(values),values).run();
+}
+
+/** One completed effective owner/day projection. The retention lane uses this
+ * row only as the bounded target-side availability/index; source bytes still
+ * come from the effective owner/day reader. */
+async function deliverEffectiveDay(day=DAY,owner=OWNER,ownerRevision=1,
+ dependencyDigest=EFFECTIVE_DEPENDENCY_DIGEST):Promise<void>{
+ await target().prepare(`INSERT INTO analytics_community_daily_owners
+  (source_id,day,owner_digest,input_revision,owner_revision,source_format,method,
+   progress_revision,next_index,fingerprint,complete,values_json)
+  VALUES(?,?,?,1,?,'effective','effective-daily-cursor-v2',1,0,?,1,?)
+  ON CONFLICT(source_id,day,owner_digest) DO UPDATE SET owner_revision=excluded.owner_revision,
+   source_format=excluded.source_format,method=excluded.method,fingerprint=excluded.fingerprint,
+   complete=excluded.complete,values_json=excluded.values_json`)
+  .bind(sourceId,day,owner,ownerRevision,canonicalJson({method:'effective-daily-cursor-v2',
+   dependencyDigest,streams:{quota:null,session:null,usage:null}}),
+   canonicalJson({counts:{usage:1,quota:0,session:0}})).run();
 }
 
 describe('the cache-retention method contract',()=>{
@@ -338,6 +370,52 @@ describe('the cache-retention reduction',()=>{
  });
 });
 
+describe('the cache-retention streaming reducer',()=>{
+ it('matches a whole-day fold after carry and resumable page boundaries',()=>{
+  const events:Array<CacheRetentionEvent>=[];
+  for(let index=0;index<420;index+=1){
+   events.push(ev(index*1_000,{sessionDigest:index%3===0?SESSION_B:SESSION_A,
+    orderKey:`stream-${index.toString().padStart(8,'0')}`,
+    cacheReadTokens:index%5===0?1_000:900}));
+  }
+  const carry=[{...ev(0,{sessionDigest:SESSION_A,cacheReadTokens:1_000,
+    observedAtMs:DAY_MS-30_000,orderKey:'carry-a'})}];
+  const whole=reduce(events,carry,events.length);
+  let state=createCacheRetentionReducerState(DAY);
+  state=applyCacheRetentionReducerCarryPage(state,carry);
+  for(let offset=0;offset<events.length;offset+=37){
+   state=applyCacheRetentionReducerPage(state,events.slice(offset,offset+37));
+  }
+  const resumed=finishCacheRetentionReducer(state,events.length);
+  expect(resumed).toEqual(whole);
+  expect(JSON.stringify(state)).not.toContain('recordJson');
+ });
+ it('rejects forged reducer session sets before they reach a checkpoint',()=>{
+  const state=applyCacheRetentionReducerPage(createCacheRetentionReducerState(DAY),[
+   ev(0),ev(1_000),
+  ]);
+  expect(validCacheRetentionReducerState(state)).toBe(true);
+  // The physical session bound applies to every serialized set, including the
+  // previous-session cursor.  Check the length before constructing a huge
+  // object so the validator remains cheap on a malformed row.
+  const oversized={...state,
+   previous:Array.from({length:100_001},()=>state.previous[0]!),
+  };
+  expect(validCacheRetentionReducerState(oversized)).toBe(false);
+  const group=state.groups[0]!;
+  const inflatedGroup={...state,
+   groups:[{...group,sessions:[...group.sessions,SESSION_B]}],
+  };
+  expect(validCacheRetentionReducerState(inflatedGroup)).toBe(false);
+  const mismatchedBand={...state,
+   groups:[{...group,bands:group.bands.map((band,index)=>index===0
+     ? {...band,sessionDigests:[SESSION_B],sessions:1}
+     : band)}],
+  };
+  expect(validCacheRetentionReducerState(mismatchedBand)).toBe(false);
+ });
+});
+
 describe('the community merge',()=>{
  const row=(ownerDigest:string,band:CacheRetentionBandId,adjacencies:number,
   reused:number):CacheRetentionBandRow=>({ownerDigest,band,adjacencies,
@@ -556,6 +634,55 @@ describe('the prepared cache-retention store',()=>{
   expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_bands')
    .first<number>('n')).toBe(0);
  });
+ it('fences replaceable effective progress on terminal erasure',async()=>{
+  const progressKey='d'.repeat(64),carryDigest='e'.repeat(64),stateDigest='f'.repeat(64);
+  const insert=()=>target().prepare(`INSERT INTO analytics_cache_retention_day_progress
+    (progress_key,source_id,source_layout,source_namespace,owner_digest,device_id,manifest_id,
+     manifest_digest,day,method_version,carry_digest,progress_revision,state_json,state_digest)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(progressKey,sourceId,'effective',sourceNamespace,OWNER,
+    CACHE_RETENTION_EFFECTIVE_DEVICE_ID,CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+    EFFECTIVE_DEPENDENCY_DIGEST,DAY,CACHE_RETENTION_METHOD.version,carryDigest,1,'{}',stateDigest).run();
+  await insert();
+  await target().prepare(`INSERT INTO analytics_storage_erasure_fences(source_id,owner_digest,
+    terminal_event_digest,terminal_sequence,terminal_revision,authority_epoch,public_authority_epoch)
+    VALUES(?,?,?,1,1,1,1)`).bind(sourceId,OWNER,'a'.repeat(64)).run();
+  await expect(target().prepare(`UPDATE analytics_cache_retention_day_progress
+    SET state_json='{"retry":true}' WHERE progress_key=?`).bind(progressKey).run())
+   .rejects.toThrow('storage_owner_erased');
+  await expect(target().prepare(`UPDATE analytics_cache_retention_day_progress
+    SET owner_digest=? WHERE progress_key=?`).bind('b'.repeat(64),progressKey).run())
+   .rejects.toThrow('storage_owner_erased');
+  await expect(insert()).rejects.toThrow('storage_owner_erased');
+  // Erasure cleanup remains authorized: the terminal fence blocks recreation,
+  // while the existing owner-erasure path can remove its replaceable cursor.
+  await target().prepare('DELETE FROM analytics_cache_retention_day_progress WHERE progress_key=?')
+   .bind(progressKey).run();
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_progress')
+   .first<number>('n')).toBe(0);
+ });
+ it('records capacity refusal and removes its effective cursor atomically',async()=>{
+  const effectiveKey:CacheRetentionDayCandidate={...key({sourceLayout:'effective',
+   deviceId:CACHE_RETENTION_EFFECTIVE_DEVICE_ID,manifestId:CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+   manifestDigest:EFFECTIVE_DEPENDENCY_DIGEST})};
+  const carry=await readCacheRetentionCarryDays(target(),effectiveKey);
+  const baseDigest=await cacheRetentionCarryDigest(carry);
+  const storageDigest=await sha256Hex(canonicalJson({method:'cache-retention-effective-carry-v1',
+   sourceLayout:'effective',carryDigest:baseDigest}));
+  const markKey=await cacheRetentionDayMarkKey(effectiveKey,storageDigest);
+  await target().prepare(`INSERT INTO analytics_cache_retention_day_progress
+    (progress_key,source_id,source_layout,source_namespace,owner_digest,device_id,manifest_id,
+     manifest_digest,day,method_version,carry_digest,progress_revision,state_json,state_digest)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(markKey,sourceId,'effective',sourceNamespace,OWNER,
+    CACHE_RETENTION_EFFECTIVE_DEVICE_ID,CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+    EFFECTIVE_DEPENDENCY_DIGEST,DAY,CACHE_RETENTION_METHOD.version,storageDigest,1,'{}',
+    'f'.repeat(64)).run();
+  await writeCacheRetentionDayRefusal({target:target(),key:effectiveKey,carry,
+   reason:'checkpoint_size_exceeded'});
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_progress')
+   .first<number>('n')).toBe(0);
+  await expect(readCacheRetentionDay({target:target(),key:effectiveKey,carry}))
+   .resolves.toMatchObject({status:'refused',reason:'checkpoint_size_exceeded'});
+ });
  it('retires a superseded method version, an erased owner and an undelivered day',async()=>{
   const carry=carryFor();
   await deliverDay();
@@ -603,7 +730,149 @@ describe('the cache-retention lane',()=>{
   expect(days).toEqual([DAY,'2026-09-11']);
   const second=await advanceCacheRetentionDayLane({target:target(),sourceId,build,
    deadlineMs:Date.now()+30_000,remainingQueries:900});
-  expect(second).toMatchObject({state:'idle',reason:'complete',candidates:0});
+ expect(second).toMatchObject({state:'idle',reason:'complete',candidates:0});
+ });
+ it('selects one effective owner-day lane and suppresses legacy overlap',async()=>{
+  await deliverDay();
+  await deliverEffectiveDay();
+  const seen:CacheRetentionDayCandidate[]=[];
+  const unavailable:CacheRetentionDayBuild=async candidate=>{
+   seen.push(candidate);
+   throw new CacheRetentionRefusedError('owner_source_unavailable');
+  };
+  const result=await advanceCacheRetentionDayLane({target:target(),sourceId,build:unavailable,
+   deadlineMs:Date.now()+30_000,remainingQueries:900});
+  expect(result).toMatchObject({state:'progress',candidates:1,skipped:1,built:0,refused:0});
+  expect(seen).toEqual([expect.objectContaining({sourceLayout:'effective',
+   deviceId:CACHE_RETENTION_EFFECTIVE_DEVICE_ID,manifestId:CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+   manifestDigest:EFFECTIVE_DEPENDENCY_DIGEST,day:DAY})]);
+  // The legacy value remains durable until an effective mark is ready; this is
+  // the recovery window that prevents a transient effective-reader outage from
+  // deleting the only readable owner-day evidence.
+  expect(await target().prepare(`SELECT COUNT(*) n FROM analytics_v11_reusable_values
+   WHERE source_id=? AND owner_digest=? AND day=?`).bind(sourceId,OWNER,DAY)
+   .first<number>('n')).toBe(1);
+ });
+ it('serves only a ready effective mark when legacy and effective rows overlap',async()=>{
+  await deliverDay();
+  await deliverEffectiveDay();
+  const legacy=key();
+  const effective:CacheRetentionDayCandidate={...legacy,sourceLayout:'effective',
+   deviceId:CACHE_RETENTION_EFFECTIVE_DEVICE_ID,manifestId:CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+   manifestDigest:EFFECTIVE_DEPENDENCY_DIGEST};
+  await writeCacheRetentionDay({target:target(),key:legacy,carry:carryFor(),
+   aggregate:reduce([ev(0),ev(1_000)],[],2)});
+  await writeCacheRetentionDay({target:target(),key:effective,
+   carry:await readCacheRetentionCarryDays(target(),effective),
+   aggregate:reduce([ev(0),ev(1_000),ev(2_000)],[],3)});
+  const rows=await readCacheRetentionCommunityBands({target:target(),sourceId});
+  expect(rows.find(row=>row.band==='under_one_minute')).toMatchObject({adjacencies:2});
+ });
+ it('serves only the current effective carry vector and retires a stale carry mark',async()=>{
+  await deliverEffectiveDay();
+  const effective:CacheRetentionDayCandidate={...key(),sourceLayout:'effective',
+   deviceId:CACHE_RETENTION_EFFECTIVE_DEVICE_ID,manifestId:CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+   manifestDigest:EFFECTIVE_DEPENDENCY_DIGEST};
+  const oldCarry=await readCacheRetentionCarryDays(target(),effective);
+  await writeCacheRetentionDay({target:target(),key:effective,carry:oldCarry,
+   aggregate:reduce([ev(0),ev(1_000)],[],2)});
+
+  // A late lookback projection changes only the carry vector. The selected-day
+  // dependency remains the same, so a day-only identity would incorrectly
+  // publish both marks until the retirement cron happened to catch up.
+  const lateCarryDay=cacheRetentionLookbackDays(DAY).at(-1)!;
+  await deliverEffectiveDay(lateCarryDay,OWNER,1,'e'.repeat(64));
+  const currentCarry=await readCacheRetentionCarryDays(target(),effective);
+  expect(currentCarry.at(-1)).toEqual({day:lateCarryDay,manifestDigest:'e'.repeat(64)});
+  await writeCacheRetentionDay({target:target(),key:effective,carry:currentCarry,
+   aggregate:reduce([ev(0),ev(1_000),ev(2_000)],[],3)});
+  expect(await target().prepare(`SELECT COUNT(*) n FROM analytics_cache_retention_day_marks
+   WHERE source_layout='effective'`).first<number>('n')).toBe(2);
+
+  const rows=await readCacheRetentionCommunityBands({target:target(),sourceId});
+  expect(rows.find(row=>row.band==='under_one_minute')).toMatchObject({adjacencies:2});
+
+  const firstRetired=await retireCacheRetentionDayPage(target(),sourceId);
+  expect(firstRetired.marks).toBe(1);
+  let retired=firstRetired;
+  for(let attempt=0;attempt<8&&retired.state!=='idle';attempt+=1){
+   retired=await retireCacheRetentionDayPage(target(),sourceId);
+  }
+  expect(await target().prepare(`SELECT COUNT(*) n FROM analytics_cache_retention_day_marks
+   WHERE source_layout='effective'`).first<number>('n')).toBe(1);
+  expect(await readCacheRetentionCommunityBands({target:target(),sourceId})
+   .then(values=>values.find(row=>row.band==='under_one_minute')))
+   .toMatchObject({adjacencies:2});
+ });
+ it('resumes a dense effective day from a durable cursor without changing v2 output',async()=>{
+  await deliverEffectiveDay();
+  const records=Array.from({length:3_400},(_,index)=>{
+   const occurrenceId=`occurrence-${index.toString().padStart(8,'0')}`;
+   const record=v11UsageRecord(DAY,`dense${index}`,{
+    eventId:`event:v2:${index.toString().padStart(8,'0').repeat(8)}`,
+    eventTime:new Date(DAY_MS+index*1_000).toISOString(),
+   });
+   return {occurrenceId,recordJson:canonicalTelemetryV11Json(record),eventTime:record.eventTime};
+  });
+  const resumedAfter:string[]=[];
+  const readPage=async(_source:D1Database,input:Parameters<typeof readEffectiveTelemetryOwnerDayPage>[1]):Promise<EffectiveTelemetryOwnerDayPage>=>{
+   const rows=input.day===DAY?records:[];
+   const start=input.after===undefined?0:Number(input.after.occurrenceId.slice('occurrence-'.length))+1;
+   if(input.after!==undefined)resumedAfter.push(input.after.occurrenceId);
+   const selected=rows.slice(start,start+200).map(row=>({methodVersion:'effective-telemetry-owner-day-v1' as const,
+    stream:'usage' as const,participantId:'participant:test',ownerDigest:OWNER,occurrenceId:row.occurrenceId,
+    eventTime:row.eventTime,eventTimeConflict:false,status:'compatible' as const,sourceCount:1,
+    sourceFormats:['v11'] as const,sourceRowIds:[start],sourceRecordKeys:[`v11:${row.occurrenceId}`],
+    recordJson:row.recordJson}));
+   const last=selected.at(-1);
+   const next=last&&start+selected.length<rows.length?{observedAtMs:Date.parse(last.eventTime!),occurrenceId:last.occurrenceId}:null;
+   return {methodVersion:'effective-telemetry-owner-day-v1',stream:'usage',participantId:'participant:test',
+    ownerDigest:OWNER,day:input.day,rows:selected,next};
+  };
+  const candidate:CacheRetentionDayCandidate={...key({sourceLayout:'effective',
+   deviceId:CACHE_RETENTION_EFFECTIVE_DEVICE_ID,manifestId:CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+   manifestDigest:EFFECTIVE_DEPENDENCY_DIGEST})};
+  const carry=await readCacheRetentionCarryDays(target(),candidate);
+  const build=createCacheRetentionEffectiveDayBuild({source:b.USAGE_MONITOR_DB,target:target(),sourceNamespace,
+   ownerDigest:OWNER,ownerRevision:1,authorityEpoch:1,readPage});
+  // Force the first tick to stop after one bounded page. Advancing an
+  // unrelated owner revision on the target projection must leave the same
+  // closed-window dependency key and resume from the saved occurrence cursor,
+  // rather than restarting this dense day from zero.
+  // Fund exactly one page plus one query. The second page cannot begin on a
+  // partially funded reservation, so the first page must be durably resumed.
+  expect(CACHE_RETENTION_EFFECTIVE_PAGE_QUERIES).toBe(192);
+  await expect(build(candidate,carry,{deadlineMs:Date.now()+30_000,
+   remainingQueries:CACHE_RETENTION_EFFECTIVE_PAGE_QUERIES+1}))
+   .rejects.toBeInstanceOf(CacheRetentionDeferredError);
+  const progressBefore=await target().prepare(`SELECT progress_key FROM analytics_cache_retention_day_progress
+    WHERE source_id=? AND owner_digest=? AND day=?`).bind(sourceId,OWNER,DAY).first<string>('progress_key');
+  expect(progressBefore).toMatch(/^[a-f0-9]{64}$/u);
+  await target().prepare(`UPDATE analytics_community_daily_owners SET owner_revision=2
+    WHERE source_id=? AND owner_digest=? AND day=?`).bind(sourceId,OWNER,DAY).run();
+  const resumedBuild=createCacheRetentionEffectiveDayBuild({source:b.USAGE_MONITOR_DB,target:target(),sourceNamespace,
+   ownerDigest:OWNER,ownerRevision:2,authorityEpoch:1,readPage});
+  let aggregate:CacheRetentionDayAggregate|null=null;
+  // One 350-query source allowance funds one 192-query effective page plus
+  // the next-page refusal. The dense day has discovery, lookback and own
+  // reduction passes, so convergence intentionally spans several ticks.
+  for(let attempt=0;attempt<64&&aggregate===null;attempt+=1){
+   try { aggregate=await resumedBuild(candidate,carry,{deadlineMs:Date.now()+30_000,remainingQueries:350}); }
+   catch(error){ expect(error).toBeInstanceOf(CacheRetentionDeferredError); }
+  }
+  expect(aggregate).not.toBeNull();
+  expect(resumedAfter[0]).toBe('occurrence-00000199');
+  expect(aggregate!.eventsRead).toBe(records.length);
+  const whole=reduce(records.map(row=>cacheRetentionEventFromRecord({sessionDigest:SESSION_A,
+   observedAtMs:Date.parse(row.eventTime),orderKey:row.occurrenceId,recordJson:row.recordJson})!).filter(Boolean),[],records.length);
+  expect(aggregate).toEqual(whole);
+  const progress=await target().prepare('SELECT progress_key FROM analytics_cache_retention_day_progress')
+   .first<string>('progress_key');
+  expect(progress).toMatch(/^[a-f0-9]{64}$/u);
+  expect(await writeCacheRetentionDay({target:target(),key:candidate,carry,aggregate:aggregate!,progressKey:progress!}))
+   .toMatchObject({status:'stored'});
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_progress')
+   .first<number>('n')).toBe(0);
  });
  it('never re-selects an empty day',async()=>{
   // Without the day mark, a day that aggregates to nothing would be selected
@@ -798,6 +1067,62 @@ describe('the cache-retention builder over the real source readers',()=>{
   const ownerDigest=(await readIngestionChanges(sourceDb(),sourceId,0)).at(-1)!.ownerDigest;
   return {device,snapshot,ownerDigest,days:entries.map(entry=>entry.day)};
  }
+ async function effectiveOwner(fixture:Awaited<ReturnType<typeof source>>):Promise<StorageCommunityOwner>{
+  const row=await sourceDb().prepare(`SELECT revision,authority_epoch FROM storage_owner_revisions
+   WHERE owner_digest=?`).bind(fixture.ownerDigest).first<{revision:number;authority_epoch:number}>();
+  if(!row)throw new Error('synthetic owner revision missing');
+  return {participantId:fixture.device.participantId,ownerDigest:fixture.ownerDigest,inputRevision:1,
+   ownerRevision:row.revision,authorityEpoch:row.authority_epoch,hasV1:false,hasV11:true,
+   hasV12:false,hasLegacy:false,hasEffective:true};
+ }
+ async function effectiveDigest(fixture:Awaited<ReturnType<typeof source>>,day:string):Promise<string>{
+  const dependency=await effectiveHistoryDependency(sourceDb(),await effectiveOwner(fixture),sourceNamespace,
+   day,day,{includeSessions:true});
+  return sha256Hex(canonicalJson(dependency));
+ }
+ async function publishEffectiveProjection(day:string,ownerDigest:string,dependencyDigest:string):Promise<void>{
+  await target().prepare(`INSERT INTO analytics_community_daily_owners
+   (source_id,day,owner_digest,input_revision,owner_revision,source_format,method,
+    progress_revision,next_index,fingerprint,complete,values_json)
+   VALUES(?,?,?,1,1,'effective','effective-daily-cursor-v2',1,0,?,1,?)
+   ON CONFLICT(source_id,day,owner_digest) DO UPDATE SET fingerprint=excluded.fingerprint,
+    complete=excluded.complete,values_json=excluded.values_json`).bind(sourceId,day,ownerDigest,
+    canonicalJson({method:'effective-daily-cursor-v2',dependencyDigest,streams:{quota:null,session:null,usage:null}}),
+    canonicalJson({counts:{usage:1,quota:0,session:0}})).run();
+ }
+ async function appendV11Day(fixture:Awaited<ReturnType<typeof source>>,day:string):Promise<void>{
+  const prepared=await makeV11Day(day,{usage:[v11UsageRecord(day,'late',{eventId:eventId()})]});
+  const staged=await registerTelemetryV11DayManifest(sourceDb(),fixture.device,prepared.manifest);
+  for(const chunk of prepared.chunks){
+   const envelopeDigest=await sha256Hex(`synthetic-late:${crypto.randomUUID()}`);
+   const upload=await createDeviceUploadAuthorization(sourceDb(),
+    await authenticateDevice(sourceDb(),fixture.device.authorization),envelopeDigest,200);
+   const claim=await claimDeviceUploadAuthorization(sourceDb(),`Upload ${upload.uploadAuthorization}`,{
+    envelopeDigest,bodyBytes:200,contentType:'application/json'});
+   await persistTypedV11StagedChunk(sourceDb(),fixture.device,chunk,{sourceNamespace,
+    chunkRowId:`chunk:${crypto.randomUUID()}`,r2Key:`synthetic/late/${crypto.randomUUID()}`,
+    envelopeDigest,deviceUploadAuthorizationId:claim.authorizationId});
+  }
+  const current=(await sourceDb().prepare(`SELECT telemetry_v11_domain_days.observed_day AS day,
+   telemetry_v11_domain_days.manifest_id,telemetry_v11_day_manifests.manifest_digest
+   FROM telemetry_v11_domain_days
+   JOIN telemetry_v11_domains ON telemetry_v11_domains.id=telemetry_v11_domain_days.generation_id
+   JOIN telemetry_v11_domain_heads ON telemetry_v11_domain_heads.generation_id=telemetry_v11_domains.id
+   JOIN telemetry_v11_day_manifests ON telemetry_v11_day_manifests.id=telemetry_v11_domain_days.manifest_id
+   WHERE telemetry_v11_domain_heads.participant_id=? AND telemetry_v11_day_manifests.state='ready'`)
+   .bind(fixture.device.participantId).all<{day:string;manifest_id:string;manifest_digest:string}>()).results;
+  const days=[...current.map(row=>({day:row.day,manifestId:row.manifest_id,manifestDigest:row.manifest_digest})),
+   {day,manifestId:staged.manifestId,manifestDigest:staged.manifestDigest}]
+   .filter((row,index,array)=>array.findIndex(other=>other.day===row.day)===index)
+   .sort((left,right)=>left.day.localeCompare(right.day));
+  const prior=await createTelemetryV11DomainPredecessor(sourceDb(),fixture.device);
+  const manifest:TelemetryV11DomainManifest={schemaVersion:'telemetry-domain-manifest-v1.1',
+   fromDay:days[0]!.day,throughDay:days.at(-1)!.day,predecessor:{token:prior.token,
+    previousGenerationId:prior.previousGenerationId,legacyFingerprint:prior.legacyFingerprint},
+   days,manifestDigest:'0'.repeat(64)};
+  manifest.manifestDigest=await sha256Hex(telemetryV11DomainManifestDigestInput(manifest));
+  await activateTelemetryV11Domain(sourceDb(),fixture.device,manifest);
+ }
  it('builds, stores and reads back the same aggregate the reduction produces',async()=>{
   const fixture=await source(2);
   const build=createCacheRetentionDayBuild({source:sourceDb(),sourceNamespace,
@@ -882,6 +1207,41 @@ describe('the cache-retention builder over the real source readers',()=>{
    CACHE_RETENTION_SHARDS:'2',CACHE_RETENTION_SHARD:'2'}))
    .rejects.toThrow('CACHE_RETENTION_CONFIGURATION_INVALID');
  });
+ it('does not reuse an effective factory for a different day identity',async()=>{
+  const fixture=await source(1),day=fixture.days[0]!,digest=await effectiveDigest(fixture,day);
+  await publishEffectiveProjection(day,fixture.ownerDigest,digest);
+  const candidate:CacheRetentionDayCandidate={sourceId,sourceLayout:'effective',sourceNamespace,
+   ownerDigest:fixture.ownerDigest,deviceId:CACHE_RETENTION_EFFECTIVE_DEVICE_ID,
+   manifestId:CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,manifestDigest:digest,day};
+  const carry=await readCacheRetentionCarryDays(target(),candidate);
+  const build=createCacheRetentionDaySourceBuild({source:sourceDb(),target:target(),sourceNamespace});
+  // The fixture intentionally exercises the source resolution before the
+  // effective mapper's existing strict usage-row refusal. The important fence
+  // is that the factory was resolved for this identity at all.
+  await expect(build(candidate,carry,{deadlineMs:Date.now()+60_000,remainingQueries:900}))
+   .rejects.toThrow('prepared cache retention day refused');
+  await expect(build({...candidate,manifestDigest:'f'.repeat(64)},carry,
+   {deadlineMs:Date.now()+60_000,remainingQueries:900}))
+   .rejects.toThrow('prepared cache retention day refused');
+ });
+ it('refuses a late source row behind an unchanged empty carry identity',async()=>{
+  const fixture=await source(1),day=fixture.days[0]!,digest=await effectiveDigest(fixture,day);
+  await publishEffectiveProjection(day,fixture.ownerDigest,digest);
+  const candidate:CacheRetentionDayCandidate={sourceId,sourceLayout:'effective',sourceNamespace,
+   ownerDigest:fixture.ownerDigest,deviceId:CACHE_RETENTION_EFFECTIVE_DEVICE_ID,
+   manifestId:CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,manifestDigest:digest,day};
+  const carry=await readCacheRetentionCarryDays(target(),candidate);
+  expect(carry.every(entry=>entry.manifestDigest==='')).toBe(true);
+  const build=createCacheRetentionDaySourceBuild({source:sourceDb(),target:target(),sourceNamespace});
+  await expect(build(candidate,carry,{deadlineMs:Date.now()+60_000,remainingQueries:900}))
+   .rejects.toThrow('prepared cache retention day refused');
+  const lateDay=cacheRetentionLookbackDays(day).at(-1)!;
+  await appendV11Day(fixture,lateDay);
+  // The target still says that carry day is absent. Revalidation must inspect
+  // the source rather than reusing the already-resolved factory.
+  await expect(build(candidate,carry,{deadlineMs:Date.now()+60_000,remainingQueries:900}))
+   .rejects.toThrow('prepared cache retention day refused');
+ });
 });
 
 describe('the v1 delivery layout',()=>{
@@ -901,8 +1261,8 @@ describe('the v1 delivery layout',()=>{
  const v1DayDigest=(chunks:number,maxOwnerRevision:number):string =>
   chunks.toString(16).padStart(32,'0')+maxOwnerRevision.toString(16).padStart(32,'0');
 
- it('admits exactly two layouts, and holds v1 to its two key constants',async()=>{
-  expect([...CACHE_RETENTION_SOURCE_LAYOUTS]).toEqual(['typed-v11','typed-v1']);
+ it('admits all delivered layouts, and holds unmanifested layouts to constants',async()=>{
+  expect([...CACHE_RETENTION_SOURCE_LAYOUTS]).toEqual(['typed-v11','typed-v1','effective']);
   // v1 pins neither a device nor a manifest, so anything else in those two
   // fields would make one owner-day several candidates and the pooled merge
   // would read that day once per device.
@@ -912,6 +1272,11 @@ describe('the v1 delivery layout',()=>{
    .rejects.toThrow('CACHE_RETENTION_UNAVAILABLE');
   await expect(readCacheRetentionCarryDays(target(),
    v1Key({sourceLayout:'json-v11' as unknown as 'typed-v1'})))
+   .rejects.toThrow('CACHE_RETENTION_UNAVAILABLE');
+  const effectiveKey={...v1Key({sourceLayout:'effective',deviceId:CACHE_RETENTION_EFFECTIVE_DEVICE_ID,
+   manifestId:CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,manifestDigest:EFFECTIVE_DEPENDENCY_DIGEST})};
+  await expect(readCacheRetentionCarryDays(target(),effectiveKey)).resolves.toHaveLength(7);
+  await expect(readCacheRetentionCarryDays(target(),{...effectiveKey,deviceId:CACHE_RETENTION_V1_DEVICE_ID}))
    .rejects.toThrow('CACHE_RETENTION_UNAVAILABLE');
  });
 

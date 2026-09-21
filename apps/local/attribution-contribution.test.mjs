@@ -40,7 +40,7 @@ function legacyReview() {
     reviewBinding: { jobId: "11111111-1111-4111-8111-111111111111", contributionSha256: "a".repeat(64) } };
 }
 
-async function fixture(t, { accepted = true, granted = false, staleSuccessorRepair = false } = {}) {
+async function fixture(t, { accepted = true, granted = false, staleSuccessorRepair = false, successor = false } = {}) {
   const root = await mkdtemp(join(tmpdir(), "attribution-http-"));
   const resourceRoot = join(root, "resources");
   const staticRoot = join(resourceRoot, "public");
@@ -52,7 +52,7 @@ async function fixture(t, { accepted = true, granted = false, staleSuccessorRepa
   const paths = localCompanionStatePaths(stateRoot);
   await writeAttributionFixture(paths.unifiedIndexFile);
   const backend = await createAttributionFixtureDevice(paths.contributionDeviceStateFile);
-  const service = createAttributionFixtureService({ accepted, granted });
+  const service = createAttributionFixtureService({ accepted, granted, successor });
   await writeFile(paths.incrementalContributionSyncSettingsFile, JSON.stringify({
     schemaVersion: "incremental-contribution-sync-settings-v1.0",
     consent: { ...(staleSuccessorRepair
@@ -75,7 +75,7 @@ async function fixture(t, { accepted = true, granted = false, staleSuccessorRepa
     readContributionAccountMarkers: async () => [],
     clock: () => start,
     incrementalContributionRunner: (options) => runIncrementalContributionSyncOnce({
-      ...options, now: () => start, createV11Envelope: service.createEnvelope,
+      ...options, now: () => start, createV11Envelope: service.createEnvelope, createV12Envelope: service.createEnvelope,
     }),
     contributionSyncExactReviewProvider: async () => legacyReview(),
     dataStore: {
@@ -227,4 +227,21 @@ test("new review route retains method, origin, local capability, exact-body and 
   });
   assert.equal(response.status, 400);
   assert.equal(service.calls.some((call) => call.path.endsWith("device-telemetry-consents")), false);
+});
+
+test("v1.2 review grants only the successor and survives the grant activation instant", async (t) => {
+  const { local, hosted, service } = await fixture(t, { successor: true });
+  const before = await local.incrementalContributionSyncStatus();
+  assert.equal(before.attributionUpgradeVersion, "telemetry-contribution-v1.2");
+  const review = await local.reviewAttributionContribution(before.attributionUpgradeVersion);
+  assert.ok(review.inventory.fields.usage.includes("boundaryFlags"));
+  assert.ok(review.inventory.fields.usage.includes("cacheWriteTtl"));
+  assert.equal(review.consent.telemetrySchemaVersion, "telemetry-contribution-v1.2");
+  await assert.rejects(local.approveAttributionContribution(review), { code: "hosted_consent_required" });
+  const fresh = await local.reviewAttributionContribution(before.attributionUpgradeVersion);
+  await hosted.grantAttributionContribution(fresh);
+  const approved = await local.approveAttributionContribution(fresh);
+  assert.equal(approved.contractVersion, "telemetry-contribution-v1.2");
+  assert.equal(service.calls.some(call => call.path === "/api/v1/me/device-telemetry-consents"), false);
+  assert.equal(service.calls.filter(call => call.path === "/api/v1/me/device-telemetry-v12-consents").length, 1);
 });

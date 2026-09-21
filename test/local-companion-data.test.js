@@ -2689,9 +2689,25 @@ test("full unified snapshot prices stored context like the same-generation repla
     assert.equal(built.usageEvents, cases.length);
     const database = openLocalUnifiedIndex(indexFile, { readOnly: false });
     try {
-      // The current Codex parser reports no context. Seed the two observed
-      // contexts only in this synthetic index to exercise the typed read
-      // contract; the legacy NULL rows must remain NULL on disk.
+      // Parser16 now preserves exact source totals. Assert that positive
+      // current-parser evidence first, including the repaired output total.
+      const currentRows = database.prepare(`
+        SELECT total_input_context AS context, tokens_out_combined AS output
+        FROM usage_event ORDER BY observed_at_ms
+      `).all();
+      assert.deepEqual(currentRows.map((row) => row.context), cases.map((row) => row.input));
+      assert.deepEqual(currentRows.map((row) => row.output), cases.map(() => 20));
+
+      // Recreate the historical missing-evidence rows explicitly so this
+      // pricing regression still proves legacy NULL semantics. The final two
+      // rows retain their observed context totals for the contrasting case.
+      for (const { at } of cases.filter((row) => row.context === null)) {
+        database.prepare(`
+          UPDATE usage_event
+          SET total_input_context = NULL, tokens_out_combined = NULL
+          WHERE observed_at_ms = ?
+        `).run(Date.parse(at));
+      }
       for (const { at, context } of cases.filter((row) => row.context !== null)) {
         database.prepare(`
           UPDATE usage_event SET total_input_context = ? WHERE observed_at_ms = ?

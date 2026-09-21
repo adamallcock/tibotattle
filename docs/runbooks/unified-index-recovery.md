@@ -79,17 +79,23 @@ Compare the copy with the current constants in `src/local-unified-index.js`:
 
 - schema family `local-unified-index-v2`;
 - `user_version` 11;
-- parser `unified-rollout-typed-v15`; and
+- parser `unified-rollout-typed-v17`; and
 - source identity `codex-immutable-rollout-v1`.
 
 A physical schema-11 index can still need older-parser sources reparsed under
-v15. Still-present sources are rescanned; facts whose sources have rotated away
+v16. Still-present sources are rescanned; facts whose sources have rotated away
 retain their original parser provenance. Parser v12 preserves missing counters
 as unknown rather than zero, and v13 recognizes ordinal-bearing compaction
 headers. Parser v14 prevents paginated resets or unknown physical-base settings
-from inheriting a logical parent's later model, effort or speed. Only the
-explicit physical history boundary or the segment's own observations/cursor
-can supply paginated carried settings. Missing evidence remains unknown.
+from inheriting a logical parent's later model, effort or speed. Parser v15
+adds the reviewed model-only fallback for paginated forks without an exact
+history base. Parser v16 restores exact selected input/output totals in the
+existing nullable total columns, while contradictory totals remain unknown and
+missing cache-write TTL is never inferred. None of these changes reconstructs
+missing splits or changes replay, order, boundary, or cache-retention
+semantics. Only the explicit physical history boundary or the segment's own
+observations/cursor can supply paginated carried settings. Missing evidence
+remains unknown.
 Descendants also stop tier and replay-snapshot inheritance at the selected
 paginated history. A retired physical export remains counted but cannot replace
 the explicitly resolved logical head, regardless of scan order. Ambiguous heads
@@ -105,8 +111,8 @@ These interpretation changes do not change the physical schema or the
 facts to the new parser.
 
 The companion grants the bounded four-hour cold-refresh deadline only to the
-reviewed published v10/v11/v12/v13/v14-to-v15 parser transitions. The target is pinned
-to v15; a future parser must review its predecessor set explicitly. Physical
+reviewed published v10/v11/v12/v13/v14/v15-to-v16 parser transitions. The target is pinned
+to v16; a future parser must review its predecessor set explicitly. Physical
 schema, reader/writer compatibility, source identity, and telemetry contracts
 must match, and the published generation must be complete or one of the
 already supported quarantine/tool-provenance partial states. Only the current

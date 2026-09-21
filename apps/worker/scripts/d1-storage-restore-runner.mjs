@@ -4,12 +4,16 @@ const storageError=code=>Object.assign(new Error(`D1_STORAGE_${code}`),{code:`D1
 export const STORAGE_RESTORE_STAGES=Object.freeze(['freeze-source','begin','copy-authority','copy-v1','copy-v11',
  'adopt-v1','adopt-v11','seal','verify-authority','verify-v1','verify-v11','verify-adoption-v1','verify-adoption-v11',
  'verify-complete','install-role','finalize-role','initialize-bootstrap','bootstrap','verify-ready']);
+const TYPED_EVIDENCE_STAGES=Object.freeze(['freeze-source','begin','copy-authority','seal',
+ 'verify-authority','verify-complete','install-role','finalize-role','verify-ready']);
+export const storageRestoreStages=contract=>contract?.version==='typed-evidence-restore-v1'?TYPED_EVIDENCE_STAGES:STORAGE_RESTORE_STAGES;
 const fail=()=>storageError('RESTORE_STEP_INVALID');
 /** The adapter supplies genuine D1 bindings: prepare/bind/batch are not rewritten
  * as Wrangler SQL strings. These APIs depend on D1.batch atomicity. This runner
  * neither chooses a remote target nor grants source-freeze/restore permission. */
 export async function runStorageRestoreStep({api,source,target,contract,contractDigest,stage}){
- if(!STORAGE_RESTORE_STAGES.includes(stage)||source===target||!source||!target||typeof api?.authorityRestoreContractDigest!=='function'
+ const stages=storageRestoreStages(contract);
+ if(!stages.includes(stage)||source===target||!source||!target||typeof api?.authorityRestoreContractDigest!=='function'
   ||await api.authorityRestoreContractDigest(contract)!==contractDigest)throw fail();
  const call=(name,...args)=>{if(typeof api?.[name]!=='function')throw fail();return api[name](...args);};
  let result,complete=true;
@@ -36,7 +40,7 @@ export async function runStorageRestoreStep({api,source,target,contract,contract
  const counters={};for(const key of ['records','copied','verified','chunks','owners']){
   const value=result?.[key];if(value!==undefined){if(!Number.isSafeInteger(value)||value<0)throw fail();counters[key]=value;}
  }
- return {stage,complete,counters,nextStage:complete?STORAGE_RESTORE_STAGES[STORAGE_RESTORE_STAGES.indexOf(stage)+1]??null:stage};
+ return {stage,complete,counters,nextStage:complete?stages[stages.indexOf(stage)+1]??null:stage};
 }
 
 /** Bounded injected execution for the local rehearsal and a future separately
@@ -44,7 +48,7 @@ export async function runStorageRestoreStep({api,source,target,contract,contract
  * retain the same stage for exact API reconciliation; no blind write replay. */
 export async function runStorageRestorePage({state,save,api,source,target,contract,contractDigest,maxSteps=1}){
  if(!state||state.schema!=='d1-storage-restore-progress-v1'||state.contractDigest!==contractDigest
-  ||!Number.isSafeInteger(state.steps)||state.steps<0||!(state.stage===null||STORAGE_RESTORE_STAGES.includes(state.stage))
+  ||!Number.isSafeInteger(state.steps)||state.steps<0||!(state.stage===null||storageRestoreStages(contract).includes(state.stage))
   ||!Number.isSafeInteger(maxSteps)||maxSteps<1||maxSteps>32||typeof save!=='function')throw fail();
  if(state.intent!==null)throw storageError('RESTORE_RECONCILE_REQUIRED');
  let current=structuredClone(state);

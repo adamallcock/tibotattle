@@ -175,6 +175,7 @@ test("production-v1 companion retains account-observation ports while closing le
       preparedContributionDirectory: "also-relative",
       legacyContributionDeviceStateFile: "also-relative",
       contributionPreparationOptions: { activityFile: "also-relative" },
+      accountlessPerformanceEnabled: false,
       contributionDeviceBackendFactory: () => {
         calls.legacyBackend += 1;
         throw new Error("legacy backend");

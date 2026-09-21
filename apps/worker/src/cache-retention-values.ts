@@ -359,9 +359,10 @@ const emptyBand = (): MutableBand => ({ adjacencies: 0, reusedMoreThanHalf: 0, m
  */
 export const CACHE_RETENTION_RECORDED_REFUSALS: ReadonlySet<string> = new Set([
   "group_limit_exceeded", "session_limit_exceeded", "usage_row_refused", "day_page_limit_exceeded",
+  "checkpoint_size_exceeded",
 ]);
 export type CacheRetentionRecordedRefusal = "group_limit_exceeded" | "session_limit_exceeded"
-  | "usage_row_refused" | "day_page_limit_exceeded";
+  | "usage_row_refused" | "day_page_limit_exceeded" | "checkpoint_size_exceeded";
 export class CacheRetentionRefusedError extends Error {
   readonly code = "CACHE_RETENTION_REFUSED";
   constructor(readonly reason: CacheRetentionRecordedRefusal | "owner_source_unavailable") {
@@ -495,6 +496,292 @@ export function reduceCacheRetentionDay(input: {
   };
   if (!validCacheRetentionDayAggregate(aggregate)) throw new TypeError("CACHE_RETENTION_AGGREGATE_INVALID");
   return aggregate;
+}
+
+/**
+ * Content-free streaming state for the same cache-retention-v2 reducer.
+ *
+ * A dense effective owner-day can exceed one Worker invocation's source
+ * budget.  The state contains only the opaque session cursor, the current
+ * counters, and the last event needed to score the next page; it never keeps
+ * source JSON or a second event corpus.  The ordinary reducer below remains
+ * the compatibility entry point and is implemented in terms of the same
+ * transition rules, so a page-by-page fold can be compared with a whole-day
+ * fold byte-for-byte.
+ */
+export interface CacheRetentionReducerState {
+  readonly schemaVersion: "cache-retention-reducer-v1";
+  readonly day: string;
+  readonly previous: readonly CacheRetentionEvent[];
+  readonly groups: readonly CacheRetentionReducerGroup[];
+  readonly unreadableEvents: number;
+  readonly lastOrder: string;
+}
+
+export interface CacheRetentionReducerGroup {
+  readonly model: string;
+  readonly effort: string;
+  readonly sessions: readonly string[];
+  readonly bands: readonly CacheRetentionReducerBand[];
+}
+
+export interface CacheRetentionReducerBand extends CacheRetentionBandCounters {
+  readonly sessionDigests: readonly string[];
+}
+
+const REDUCER_STATE_VERSION = "cache-retention-reducer-v1" as const;
+
+function reducerStateFailure(): never {
+  throw new TypeError("CACHE_RETENTION_REDUCER_STATE_INVALID");
+}
+
+function sortedUniqueStrings(values: readonly string[]): readonly string[] {
+  const output = [...new Set(values)];
+  output.sort();
+  return output;
+}
+
+function reducerBandSnapshot(id: CacheRetentionBandId, band: MutableBand): CacheRetentionReducerBand {
+  return {
+    band: id,
+    adjacencies: band.adjacencies,
+    reusedMoreThanHalf: band.reusedMoreThanHalf,
+    matchedOrExceeded: band.matchedOrExceeded,
+    unorderedTies: band.unorderedTies,
+    excludedInsufficientEvidence: band.excludedInsufficientEvidence,
+    excludedContextContracted: band.excludedContextContracted,
+    sessions: band.sessions.size,
+    sessionDigests: sortedUniqueStrings([...band.sessions]),
+  };
+}
+
+function reducerStateSnapshot(day: string, previous: Map<string, CacheRetentionEvent>,
+  groups: Map<string, MutableGroup>, unreadableEvents: number, lastOrder: string,
+): CacheRetentionReducerState {
+  return {
+    schemaVersion: REDUCER_STATE_VERSION,
+    day,
+    previous: [...previous.values()].sort((left, right) => left.sessionDigest < right.sessionDigest ? -1
+      : left.sessionDigest > right.sessionDigest ? 1 : 0),
+    groups: [...groups.values()].map((group) => ({
+      model: group.model, effort: group.effort,
+      sessions: sortedUniqueStrings([...group.sessions]),
+      bands: CACHE_RETENTION_BAND_IDS.map((id) => reducerBandSnapshot(id, group.bands.get(id)!)),
+    })).sort((left, right) => cacheRetentionGroupOrder(left) < cacheRetentionGroupOrder(right) ? -1 : 1),
+    unreadableEvents,
+    lastOrder,
+  };
+}
+
+function mutableReducerState(state: CacheRetentionReducerState): {
+  previous: Map<string, CacheRetentionEvent>; groups: Map<string, MutableGroup>;
+  unreadableEvents: number; lastOrder: string;
+} {
+  if (!validCacheRetentionReducerState(state)) reducerStateFailure();
+  const previous = new Map(state.previous.map((event) => [event.sessionDigest, event]));
+  const groups = new Map<string, MutableGroup>();
+  for (const input of state.groups) {
+    const bands = new Map<CacheRetentionBandId, MutableBand>();
+    for (const band of input.bands) {
+      bands.set(band.band, {
+        adjacencies: band.adjacencies,
+        reusedMoreThanHalf: band.reusedMoreThanHalf,
+        matchedOrExceeded: band.matchedOrExceeded,
+        unorderedTies: band.unorderedTies,
+        excludedInsufficientEvidence: band.excludedInsufficientEvidence,
+        excludedContextContracted: band.excludedContextContracted,
+        sessions: new Set(band.sessionDigests),
+      });
+    }
+    groups.set(cacheRetentionGroupOrder(input), {
+      model: input.model, effort: input.effort, bands, sessions: new Set(input.sessions),
+    });
+  }
+  return { previous, groups, unreadableEvents: state.unreadableEvents, lastOrder: state.lastOrder };
+}
+
+/** Create empty streaming state. Carry events are applied separately because
+ * they seed the previous-session cursor but must never create an adjacency. */
+export function createCacheRetentionReducerState(day: string): CacheRetentionReducerState {
+  if (!validCacheRetentionDayLabel(day)) reducerStateFailure();
+  return reducerStateSnapshot(day, new Map(), new Map(), 0, "");
+}
+
+/** Apply one chronological lookback page. It only updates the session tail. */
+export function applyCacheRetentionReducerCarryPage(state: CacheRetentionReducerState,
+  items: readonly CacheRetentionItem[],
+): CacheRetentionReducerState {
+  const mutable = mutableReducerState(state);
+  const dayStartMs = Date.parse(`${state.day}T00:00:00.000Z`);
+  let lastOrder = "";
+  for (const item of items) {
+    const readable = validCacheRetentionEvent(item);
+    if (!readable && !validCacheRetentionSessionBreak(item)) reducerStateFailure();
+    if (item.observedAtMs >= dayStartMs
+      || item.observedAtMs < dayStartMs - CACHE_RETENTION_METHOD.maximumGapMs) reducerStateFailure();
+    const order = `${String(item.observedAtMs).padStart(16, "0")}\0${item.orderKey}`;
+    if (order <= lastOrder) reducerStateFailure();
+    lastOrder = order;
+    if (!readable) mutable.previous.delete(item.sessionDigest);
+    else mutable.previous.set(item.sessionDigest, item);
+    if (mutable.previous.size > CACHE_RETENTION_SESSION_LIMIT) {
+      throw new CacheRetentionRefusedError("session_limit_exceeded");
+    }
+  }
+  return reducerStateSnapshot(state.day, mutable.previous, mutable.groups,
+    mutable.unreadableEvents, state.lastOrder);
+}
+
+/** Apply one chronological own-day page, using the exact v2 transition rules. */
+export function applyCacheRetentionReducerPage(state: CacheRetentionReducerState,
+  items: readonly CacheRetentionItem[],
+): CacheRetentionReducerState {
+  const mutable = mutableReducerState(state);
+  const dayStartMs = Date.parse(`${state.day}T00:00:00.000Z`);
+  const dayEndMs = dayStartMs + 86_400_000;
+  for (const item of items) {
+    const readable = validCacheRetentionEvent(item);
+    if (!readable && !validCacheRetentionSessionBreak(item)) reducerStateFailure();
+    if (item.observedAtMs < dayStartMs || item.observedAtMs >= dayEndMs) reducerStateFailure();
+    const order = `${String(item.observedAtMs).padStart(16, "0")}\0${item.orderKey}`;
+    if (order <= mutable.lastOrder) throw new TypeError("CACHE_RETENTION_ORDER_INVALID");
+    mutable.lastOrder = order;
+    if (!readable) {
+      mutable.unreadableEvents += 1;
+      mutable.previous.delete(item.sessionDigest);
+      continue;
+    }
+    const event = item;
+    const prior = mutable.previous.get(event.sessionDigest);
+    if (!mutable.previous.has(event.sessionDigest) && mutable.previous.size >= CACHE_RETENTION_SESSION_LIMIT) {
+      throw new CacheRetentionRefusedError("session_limit_exceeded");
+    }
+    mutable.previous.set(event.sessionDigest, event);
+    if (prior === undefined) continue;
+    if (prior.model !== event.model || prior.effort !== event.effort
+      || prior.speedMode !== event.speedMode || prior.surface !== event.surface) continue;
+    const gapMs = event.observedAtMs - prior.observedAtMs;
+    const bandId = cacheRetentionBandFor(gapMs);
+    if (bandId === null) continue;
+    const key = cacheRetentionGroupOrder(event);
+    let group = mutable.groups.get(key);
+    if (group === undefined) {
+      if (mutable.groups.size >= CACHE_RETENTION_GROUP_LIMIT) {
+        throw new CacheRetentionRefusedError("group_limit_exceeded");
+      }
+      group = { model: event.model, effort: event.effort,
+        bands: new Map(CACHE_RETENTION_BAND_IDS.map((id) => [id, emptyBand()])), sessions: new Set() };
+      mutable.groups.set(key, group);
+    }
+    const band = group.bands.get(bandId)!;
+    if (prior.cacheReadTokens === null || prior.cacheReadTokens === 0
+      || event.cacheReadTokens === null || event.uncachedTokens === null
+      || event.cacheWriteTokens === null) {
+      band.excludedInsufficientEvidence += 1;
+      continue;
+    }
+    const totalInput = event.uncachedTokens + event.cacheReadTokens + event.cacheWriteTokens;
+    if (totalInput < prior.cacheReadTokens) {
+      band.excludedContextContracted += 1;
+      continue;
+    }
+    band.adjacencies += 1;
+    band.sessions.add(event.sessionDigest);
+    group.sessions.add(event.sessionDigest);
+    if (gapMs === 0) band.unorderedTies += 1;
+    if (event.cacheReadTokens > prior.cacheReadTokens * CACHE_RETENTION_METHOD.reusedMoreThanHalfRatio) {
+      band.reusedMoreThanHalf += 1;
+      if (event.cacheReadTokens >= prior.cacheReadTokens) band.matchedOrExceeded += 1;
+    }
+  }
+  return reducerStateSnapshot(state.day, mutable.previous, mutable.groups,
+    mutable.unreadableEvents, mutable.lastOrder);
+}
+
+/** Finish a state without changing any counter arithmetic. */
+export function finishCacheRetentionReducer(state: CacheRetentionReducerState,
+  eventsRead: number,
+): CacheRetentionDayAggregate {
+  if (!validCount(eventsRead)) reducerStateFailure();
+  const mutable = mutableReducerState(state);
+  const aggregate: CacheRetentionDayAggregate = {
+    methodVersion: CACHE_RETENTION_METHOD.version, day: state.day,
+    eventsRead, unreadableEvents: mutable.unreadableEvents,
+    groups: [...mutable.groups.values()].map((group) => {
+      const bands = CACHE_RETENTION_BAND_IDS.map((id) => {
+        const band = group.bands.get(id)!;
+        return { band: id, adjacencies: band.adjacencies,
+          reusedMoreThanHalf: band.reusedMoreThanHalf, matchedOrExceeded: band.matchedOrExceeded,
+          unorderedTies: band.unorderedTies,
+          excludedInsufficientEvidence: band.excludedInsufficientEvidence,
+          excludedContextContracted: band.excludedContextContracted, sessions: band.sessions.size };
+      });
+      return { model: group.model, effort: group.effort,
+        adjacencies: bands.reduce((total, band) => total + band.adjacencies, 0),
+        sessions: group.sessions.size, bands };
+    }).sort((left, right) => (cacheRetentionGroupOrder(left) < cacheRetentionGroupOrder(right) ? -1 : 1)),
+  };
+  if (!validCacheRetentionDayAggregate(aggregate)) reducerStateFailure();
+  return aggregate;
+}
+
+export function validCacheRetentionReducerState(value: unknown): value is CacheRetentionReducerState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const state = value as Record<string, unknown>;
+  if (Object.keys(state).sort().join(",") !== "day,groups,lastOrder,previous,schemaVersion,unreadableEvents"
+    || state.schemaVersion !== REDUCER_STATE_VERSION
+    || !validCacheRetentionDayLabel(state.day)
+    || !Array.isArray(state.previous) || state.previous.length > CACHE_RETENTION_SESSION_LIMIT
+    || !validCount(state.unreadableEvents)
+    || typeof state.lastOrder !== "string" || state.lastOrder.length > 512) return false;
+  let previousOrder = "";
+  for (const event of state.previous) {
+    if (!validCacheRetentionEvent(event) || event.sessionDigest <= previousOrder) return false;
+    previousOrder = event.sessionDigest;
+  }
+  if (!Array.isArray(state.groups) || state.groups.length > CACHE_RETENTION_GROUP_LIMIT) return false;
+  let previousGroup = "";
+  for (const group of state.groups) {
+    if (!group || typeof group !== "object" || Array.isArray(group)) return false;
+    const candidate = group as Record<string, unknown>;
+    if (Object.keys(candidate).sort().join(",") !== "bands,effort,model,sessions"
+      || !validCacheRetentionToken(candidate.model) || !validCacheRetentionToken(candidate.effort)
+      || cacheRetentionGroupOrder(candidate as { model: string; effort: string }) <= previousGroup
+      || !Array.isArray(candidate.sessions) || candidate.sessions.length > CACHE_RETENTION_SESSION_LIMIT
+      || !candidate.sessions.every((item) => typeof item === "string"
+        && /^[0-9a-f]{64}$/u.test(item))
+      || candidate.sessions.some((item, itemIndex, all) => itemIndex > 0 && item <= all[itemIndex - 1]!)
+      || !Array.isArray(candidate.bands) || candidate.bands.length !== CACHE_RETENTION_BAND_IDS.length) return false;
+    previousGroup = cacheRetentionGroupOrder(candidate as { model: string; effort: string });
+    let previousBand = -1;
+    for (const band of candidate.bands) {
+      if (!band || typeof band !== "object" || Array.isArray(band)) return false;
+      const row = band as Record<string, unknown>;
+      const index = CACHE_RETENTION_BAND_IDS.indexOf(row.band as CacheRetentionBandId);
+      const { sessionDigests, ...counters } = row;
+      if (index <= previousBand || !validCacheRetentionBandCounters(counters)
+        || !Array.isArray(row.sessionDigests) || !row.sessionDigests.every((item) => typeof item === "string"
+          && /^[0-9a-f]{64}$/u.test(item))) return false;
+      previousBand = index;
+      if (row.sessionDigests.length > CACHE_RETENTION_SESSION_LIMIT
+        || row.sessions !== row.sessionDigests.length) return false;
+      if (row.sessionDigests.some((item, itemIndex, all) => itemIndex > 0 && item <= all[itemIndex - 1]!)) {
+        return false;
+      }
+      // The band session set is a subset of the group's set.  Requiring the
+      // exact union below also prevents a forged checkpoint from inflating the
+      // group count with a session that never contributed an adjacency.
+      if (row.sessionDigests.some((item) => !(candidate.sessions as string[]).includes(item))) return false;
+    }
+    const groupSessions = new Set(candidate.sessions as string[]);
+    const bandSessions = new Set<string>();
+    for (const band of candidate.bands as Record<string, unknown>[]) {
+      for (const digest of band.sessionDigests as string[]) bandSessions.add(digest);
+    }
+    if (groupSessions.size !== bandSessions.size
+      || [...groupSessions].some((digest) => !bandSessions.has(digest))) return false;
+  }
+  return true;
 }
 
 /** One stored band row, as the merge reads it back. */

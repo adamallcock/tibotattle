@@ -273,6 +273,88 @@ describe("server pricing", () => {
     }
   });
 
+  it("projects only redundant OpenAI combined output at the Worker pricing boundary", () => {
+    const consistent = fixture({
+      components: {
+        ...fixture().components,
+        outputCombinedTokens: 75,
+      },
+    });
+    const consistentBefore = structuredClone(consistent);
+    const withoutAggregate = fixture();
+    expect(priceTelemetryUsageEvent(consistent)).toEqual(priceTelemetryUsageEvent(withoutAggregate));
+    expect(consistent).toEqual(consistentBefore);
+
+    const zeroCombined = fixture({
+      components: {
+        ...fixture().components,
+        outputTextTokens: 0,
+        outputReasoningTokens: 0,
+        outputCombinedTokens: 0,
+      },
+    });
+    const zeroWithoutAggregate = fixture({
+      components: {
+        ...fixture().components,
+        outputTextTokens: 0,
+        outputReasoningTokens: 0,
+        outputCombinedTokens: null,
+      },
+    });
+    expect(priceTelemetryUsageEvent(zeroCombined)).toEqual(priceTelemetryUsageEvent(zeroWithoutAggregate));
+
+    const mismatch = priceTelemetryUsageEvent(fixture({
+      components: {
+        ...fixture().components,
+        outputCombinedTokens: 76,
+      },
+    }));
+    expect(mismatch.coverageStatus).toBe("partially_priced");
+    expect(mismatch.unpricedReasonCodes).toContain("unknown_component");
+
+    const missingSplit = priceTelemetryUsageEvent(fixture({
+      components: {
+        ...fixture().components,
+        outputReasoningTokens: null,
+        outputCombinedTokens: 50,
+      },
+    }));
+    expect(missingSplit.coverageStatus).toBe("partially_priced");
+    expect(missingSplit.unpricedReasonCodes).toContain("unknown_component");
+    expect(missingSplit.unknownBillableUnits).toBe(50);
+
+    const anthropic = validateIngestibleEvent(fixture({
+      provider: "anthropic_claude_code",
+      modelId: "claude-sonnet-4-6",
+      billingSurface: "claude_subscription",
+      speedMode: "standard",
+      apiServiceTier: "unknown",
+      reasoningEffort: "unknown",
+      components: {
+        inputUncachedTokens: 100,
+        inputCacheReadTokens: 900,
+        inputCacheWriteTokens: 0,
+        inputCacheWrite5mTokens: 0,
+        inputCacheWrite1hTokens: 0,
+        outputTextTokens: null,
+        outputReasoningTokens: null,
+        outputCombinedTokens: 75,
+      },
+    }));
+    const anthropicBefore = structuredClone(anthropic);
+    const anthropicWithCombined = priceTelemetryUsageEvent(anthropic);
+    const anthropicWithoutCombined = priceTelemetryUsageEvent({
+      ...anthropic,
+      components: { ...anthropic.components, outputCombinedTokens: null },
+    });
+    expect(anthropicWithCombined).toMatchObject({
+      exactCostUsd: "0.001695",
+      coverageStatus: "fully_priced",
+    });
+    expect(anthropicWithCombined.exactCostUsd).not.toBe(anthropicWithoutCombined.exactCostUsd);
+    expect(anthropic).toEqual(anthropicBefore);
+  });
+
   it("rejects unsupported providers instead of pricing them as Anthropic", () => {
     const knownClaude = validateIngestibleEvent(fixture({
       provider: "anthropic_claude_code",

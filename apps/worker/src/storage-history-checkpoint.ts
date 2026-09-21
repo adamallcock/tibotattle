@@ -12,7 +12,9 @@ import { decodeV1UsageReductionCheckpoint,encodeV1UsageReductionCheckpoint,
 import type { StorageV1HistoryCheckpoint } from './storage-v1-history';
 import type { StorageV11HistoryCheckpoint } from './storage-v11-history';
 import { isV11GenerationSnapshot } from './typed-v11-quota-reader';
-export type StorageHistoryCheckpoint=StorageV1HistoryCheckpoint|StorageV11HistoryCheckpoint;
+import { validEffectiveDays,validEffectiveQuotaCursor } from './storage-effective-history';
+import type { StorageEffectiveHistoryCheckpoint } from './storage-effective-history';
+export type StorageHistoryCheckpoint=StorageV1HistoryCheckpoint|StorageV11HistoryCheckpoint|StorageEffectiveHistoryCheckpoint;
 export const STORAGE_HISTORY_PART_BYTES=128*1024,STORAGE_HISTORY_CONTROL_BYTES=16*1024;
 export const STORAGE_HISTORY_MAX_PARTS=1024,STORAGE_HISTORY_MAX_WRITES=32;
 // A load reads up to 16 immutable 128 KiB parts (2 MiB) per statement. Its
@@ -55,6 +57,33 @@ function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistor
  for(let i=0;i<parts.length;i++){
   const part=parse(parts[i]!);if(!Array.isArray(part))throw fail();
   (components[manifest[i]!.component]??=[]).push(...part);
+ }
+ if(control.source==='effective'){
+  if(typeof control.layout!=='string'||!control.layout.startsWith('effective:')
+   ||!control.layout.slice('effective:'.length).length
+   ||Object.hasOwn(control,'snapshot')||!validEffectiveQuotaCursor(control.effectiveCursor)
+   ||typeof control.identity?.observedAtCutoff!=='string'
+   ||!validEffectiveDays(control.effectiveDays,control.identity.observedAtCutoff.slice(0,10),control.day))throw fail();
+  try{encodeTypedTelemetryId(control.layout.slice('effective:'.length));}catch{throw fail();}
+  createV11QuotaAcquisitionCheckpoint(control.identity);
+  if(control.phase==='acquisition'){
+   for(const name of V11_QUOTA_WORK_COMPONENTS)components[name]??=[];
+   return {version:1,source:'effective',day:control.day,layout:control.layout,identity:control.identity,
+    effectiveCursor:control.effectiveCursor,effectiveDays:control.effectiveDays,phase:'acquisition',acquisition:decodeV11QuotaWorkCheckpoint(control.identity,control.acquisition,components)};
+  }
+  const acquisition={identity:control.identity,planAnchors:components.planAnchors??[],quotaRows:components.quotaRows??[]};
+  if(!validateV11CompletedQuotaAcquisition(acquisition)
+   ||Object.keys(components).some(k=>!['planAnchors','quotaRows',...V11_USAGE_REDUCTION_COMPONENTS].includes(k)))throw fail();
+  if(control.phase==='usage'){
+   const usage=decodeV11UsageReductionCheckpoint(control.usage,
+    Object.fromEntries(V11_USAGE_REDUCTION_COMPONENTS.map(name=>[name,components[name]??[]])));
+   if(!same(usage.identity,control.identity))throw fail();
+   return {version:1,source:'effective',day:control.day,layout:control.layout,identity:control.identity,
+    effectiveCursor:control.effectiveCursor,effectiveDays:control.effectiveDays,phase:'usage',acquisition,usage};
+  }
+  if(Object.keys(components).some(k=>!['planAnchors','quotaRows'].includes(k)))throw fail();
+  return {version:1,source:'effective',day:control.day,layout:control.layout,identity:control.identity,
+   effectiveCursor:control.effectiveCursor,effectiveDays:control.effectiveDays,phase:'finish',acquisition};
  }
  if(control.source==='v1.1'){
   createV11QuotaAcquisitionCheckpoint(control.identity);
@@ -100,6 +129,33 @@ function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistor
 async function frame(key:StorageHistoryKey,checkpoint:StorageHistoryCheckpoint):Promise<Frame>{
  if(checkpoint.version!==1||checkpoint.day!==key.day)throw fail();
  if('source'in checkpoint){
+  if(checkpoint.source==='effective'){
+   if(checkpoint.layout!==`effective:${key.sourceNamespace}`||Object.hasOwn(checkpoint,'snapshot')
+    ||!validEffectiveQuotaCursor(checkpoint.effectiveCursor)
+    ||!validEffectiveDays(checkpoint.effectiveDays,checkpoint.identity.observedAtCutoff.slice(0,10),key.day))throw fail();
+   createV11QuotaAcquisitionCheckpoint(checkpoint.identity);
+   const usage=checkpoint.phase==='usage'?encodeV11UsageReductionCheckpoint(checkpoint.usage):null;
+   const components:Record<string,unknown[]>=checkpoint.phase==='acquisition'
+    ?{...encodeV11QuotaWorkCheckpoint(checkpoint.acquisition).components}
+    :{planAnchors:checkpoint.acquisition.planAnchors,quotaRows:checkpoint.acquisition.quotaRows,
+      ...(usage?.components??{})};
+   const control=canonicalJson({version:1,source:'effective',day:checkpoint.day,layout:checkpoint.layout,
+    identity:checkpoint.identity,effectiveCursor:checkpoint.effectiveCursor,effectiveDays:checkpoint.effectiveDays,phase:checkpoint.phase,
+    acquisition:checkpoint.phase==='acquisition'?encodeV11QuotaWorkCheckpoint(checkpoint.acquisition).control:null,
+    usage:usage?.control??null});
+   if(size(control)>STORAGE_HISTORY_CONTROL_BYTES)throw fail();
+   const manifest:Part[]=[],parts:string[]=[];
+   for(const component of Object.keys(components).sort()){
+    const entries=components[component];if(!Array.isArray(entries))throw fail();let chunk:unknown[]=[],bytes=2;
+    const emit=async()=>{const text=canonicalJson(chunk);parts.push(text);manifest.push({component,sha256:await sha256Hex(text),bytes:size(text)});
+     if(parts.length>STORAGE_HISTORY_MAX_PARTS)throw fail();chunk=[];bytes=2;};
+    for(const entry of entries){const length=size(canonicalJson(entry));if(length+2>STORAGE_HISTORY_PART_BYTES)throw fail();
+     if(bytes+length+(chunk.length?1:0)>STORAGE_HISTORY_PART_BYTES)await emit();bytes+=length+(chunk.length?1:0);chunk.push(entry);}
+    if(chunk.length)await emit();
+   }
+   if(size(canonicalJson(manifest))>STORAGE_HISTORY_PART_BYTES)throw fail();
+   if(!await sameByDigest(decode(control,manifest,parts),checkpoint))throw fail();return {control,manifest,parts};
+  }
   if(checkpoint.source!=='v1.1')throw fail();
   if(checkpoint.layout!==`typed-v11:${key.sourceNamespace}`)throw fail();
   if(checkpoint.snapshot!==undefined&&(!isV11GenerationSnapshot(checkpoint.snapshot)

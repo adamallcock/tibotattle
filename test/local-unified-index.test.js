@@ -1100,12 +1100,11 @@ test("a rebuild indexes typed usage events and never stores content", async () =
       assert.equal(rows[0].iu, 100);
       assert.equal(rows[0].ot, 10);
       assert.notEqual(rows[0].quota, null);
-      // Codex reports neither a provider total input context, nor a
-      // cache-write TTL split, nor a combined output figure. NULL must stay
-      // distinguishable from an observed zero.
-      assert.equal(rows[0].tic, null);
+      // Exact raw totals survive; unavailable cache-write TTL splits remain
+      // distinct from observed zero.
+      assert.equal(rows[0].tic, 100);
       assert.equal(rows[0].w5, null);
-      assert.equal(rows[0].oc, null);
+      assert.equal(rows[0].oc, 10);
       assert.equal(rows[1].quota, null);
       assert.equal(rows[1].iu, 200);
 
@@ -2140,7 +2139,7 @@ for (const history of ["reset", "anchored-null"]) {
             FROM usage_event u JOIN parser_version p ON p.id = u.parser_version_id
             WHERE u.observed_at_ms = ?`).get(Date.parse("2026-07-25T01:00:01.000Z"));
           assert.equal(stamp.parser_version, history === "reset"
-            ? "unified-rollout-typed-v16-parent-model" : LOCAL_UNIFIED_INDEX_PARSER_VERSION);
+            ? "unified-rollout-typed-v17-parent-model" : LOCAL_UNIFIED_INDEX_PARSER_VERSION);
         } finally { provenance.close(); }
 
         if (pipeline !== "incremental") return;
@@ -2185,8 +2184,8 @@ for (const history of ["reset", "anchored-null"]) {
         const raw = openLocalUnifiedIndex(indexFile, { readOnly: false });
         try {
           raw.prepare(
-            "UPDATE parser_version SET parser_version = replace(parser_version, 'v16', 'v13')",
-          ).run();
+            "UPDATE parser_version SET parser_version = replace(parser_version, ?, ?)",
+          ).run(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v13");
         } finally {
           raw.close();
         }

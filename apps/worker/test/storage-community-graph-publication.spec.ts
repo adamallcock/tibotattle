@@ -341,7 +341,8 @@ describe('isolated allowance graph publication',()=>{
   let statements:D1PreparedStatement[]=[];
   for(let i=0;i<1000;i++){
    const participantId=`participant:controlled-scale-${String(i).padStart(4,'0')}`,ownerDigest=await sha256Hex(participantId);
-   rows.push({...base,participantId,ownerDigest,hasV1:0,hasV11:1,hasLegacy:0});
+   rows.push({...base,participantId,ownerDigest,authorityEpoch:base.authorityEpoch,
+    hasV1:0,hasV11:1,hasV12:0,hasEffective:0,hasLegacy:0});
    const payload=canonicalJson((JSON.parse(String(template.payload_json)) as Array<Record<string,unknown>>)
     .map(fit=>({...fit,participantId:ownerDigest})));
    const row={...template,owner_digest:ownerDigest,payload_json:payload,payload_sha256:await sha256Hex(payload)};
@@ -371,7 +372,7 @@ describe('isolated allowance graph publication',()=>{
  it('reports an oversized metadata cohort as capacity and never publishes a prefix',async()=>{
   await fixture();const base=(await readStorageCommunityOwnerPage(typed()))[0]!;
   const rows=Array.from({length:20_000},(_,i)=>({...base,participantId:`participant:oversize-${String(i).padStart(5,'0')}`,
-   ownerDigest:i.toString(16).padStart(64,'0'),hasV1:0,hasV11:1,hasLegacy:0}));
+   ownerDigest:i.toString(16).padStart(64,'0'),authorityEpoch:base.authorityEpoch,hasV1:0,hasV11:1,hasV12:0,hasEffective:0,hasLegacy:0}));
   const meter=createD1InvocationBudget(900);
   expect(await publishStorageCommunityGraphPreview({...bindings(),source:meter.wrap(cohortMetadataSource(rows)),
    target:meter.wrap(b.STORAGE_ANALYTICS_DB)})).toMatchObject({state:'deferred',reason:'capacity'});
@@ -456,7 +457,11 @@ describe('isolated allowance graph publication',()=>{
  it('selects a dormant owner when the calculation day is after its last uploaded day',async()=>{
   const f=await createV11DeviceFixture(typed(),{participantId:'participant:selected-dormant',grant:true});
   const uploaded=await stage(typed(),f,await makeV11Day(day(),evidence()),true);
-  await activateDays(f,[uploaded],Date.parse(day()+'T12:00:00.000Z'));
+  // Keep the predecessor's through-day at the uploaded day while minting it
+  // late enough that its one-day capability is still live when this test
+  // reads the dormant owner.
+  const activationNow = Date.parse(`${day()}T23:59:59.000Z`);
+  await activateDays(f,[uploaded],activationNow);
   for(let pass=0;pass<32;pass++)if((await advanceStorageAnalytics(bindings())).state==='idle')break;
   const selected=await selectedEnvelope('fits',today());
   expect(selected.envelope.snapshot.throughDay).toBe(day());

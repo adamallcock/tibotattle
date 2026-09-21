@@ -1418,7 +1418,7 @@ test("unsupported mixed parser stamps stay blocked even alongside an attested so
         `${LOCAL_UNIFIED_INDEX_PARSER_VERSION}-partial-cache-write-zero`,
         `${LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION}-cache-write-zero`,
         "unified-rollout-typed-v15-cache-write-zero",
-        "unified-rollout-typed-v17-cache-write-zero",
+        "unified-rollout-typed-v18-cache-write-zero",
         `${LOCAL_UNIFIED_INDEX_PARSER_VERSION}-cache-write-zero-unknown`,
         "unknown-parser-cache-write-zero",
       ]) {

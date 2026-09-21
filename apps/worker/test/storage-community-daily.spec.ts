@@ -245,6 +245,57 @@ describe('independent public daily publication',()=>{
     expect(payload.apiEquivalentSpend).toMatchObject({usageEvents:51,fullyPricedUsageEvents:51});
     expect((await advanceNextStorageCommunityDaily(options())).state).toBe('idle');
   });
+  it('resumes effective daily pages after unrelated uploads and restarts only changed day evidence',async()=>{
+    await source().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    const first=await seedV1('usage',120);
+    await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);
+    await ready();
+    const count=async()=>JSON.parse((await target().prepare(
+      'SELECT values_json FROM analytics_community_daily_owners WHERE day=?')
+      .bind(today()).first<string>('values_json'))!).counts.usage;
+    expect((await publish()).state).toBe('progress');
+    expect(await count()).toBe(50);
+    const yesterday=new Date(Date.parse(today())-86400000).toISOString().slice(0,10);
+    const outside=await seedV1('usage',1,first.fixture,1,2,yesterday);
+    await insertTypedTelemetryV1Chunk(source(),outside.insert,namespace);
+    await ready();
+    expect((await publish()).state).toBe('progress');
+    expect(await count()).toBe(100);
+    const inside=await seedV1('usage',1,first.fixture,1,1);
+    await insertTypedTelemetryV1Chunk(source(),inside.insert,namespace);
+    await ready();
+    expect((await publish()).state).toBe('progress');
+    expect(await count()).toBe(50);
+    expect((await publish()).state).toBe('progress');
+    expect(await count()).toBe(100);
+    expect((await publish()).state).toBe('published');
+    expect(JSON.parse((await publicRead()).rows[0]!.payload_json).totals.usageEvents).toBe(121);
+  });
+  it('never folds a valid prefix twice when a later effective page contains a conflict',async()=>{
+    const first=await seedV1('usage',120);
+    await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);
+    const sibling=await createV11DeviceFixture(source(),{participantId:first.fixture.participantId});
+    const duplicate=await seedV1('usage',1,sibling);
+    const original=duplicate.insert.chunk.records[0]!;
+    const records=[{...original,eventId:`event:v2:${(60).toString(16).padStart(64,'0')}`,
+      modelId:'synthetic-conflicting-model'}];
+    const {schemaVersion,chunkId,chunkRevision,parserVersion,consent}=duplicate.insert.chunk;
+    const chunk=parseTelemetryV1Chunk({schemaVersion,chunkId,chunkRevision,parserVersion,consent,records,
+      chunkDigest:await sha256Hex(canonicalTelemetryV11Json(records))});
+    await insertTypedTelemetryV1Chunk(source(),{...duplicate.insert,chunk},namespace);
+    await source().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    await ready();
+    const count=async()=>JSON.parse((await target().prepare(
+      'SELECT values_json FROM analytics_community_daily_owners WHERE day=?')
+      .bind(today()).first<string>('values_json'))!).counts.usage;
+    expect((await publish()).state).toBe('progress');
+    expect(await count()).toBe(50);
+    for(let retry=0;retry<3;retry++){
+      expect(await publish()).toMatchObject({state:'deferred',reason:'projection_pending',ownersAdvanced:0});
+      expect(await count()).toBe(50);
+      expect((await publicRead()).rows).toEqual([]);
+    }
+  });
   it('prioritizes a stale visible head without starving the durable day queue',async()=>{
     await fixture();await ready();await publish();
     await source().prepare('UPDATE community_snapshot_policy SET maturity_days=maturity_days+1 WHERE singleton_id=1').run();
