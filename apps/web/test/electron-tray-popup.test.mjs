@@ -492,6 +492,23 @@ test("weekly pace renders only for a current allowance bound to its valid outloo
   assert.equal(mismatchedDocument.getElementById("pace-section").hidden, true);
 });
 
+test("switching usage history range preserves the same current weekly pace", () => {
+  const data = fixture();
+  const seven = createTrayPopupProjection(data, { now: NOW, range: "7d", timeZone: "UTC" });
+  const thirty = createTrayPopupProjection(data, { now: NOW, range: "30d", timeZone: "UTC" });
+  assert.deepEqual(thirty.weeklyPace, seven.weeklyPace);
+  assert.equal(seven.history.dayCount, 7);
+  assert.equal(thirty.history.dayCount, 30);
+
+  const documentRef = new FakeDocument();
+  renderTrayPopup(documentRef, seven);
+  const headline = documentRef.getElementById("pace-headline").textContent;
+  renderTrayPopup(documentRef, thirty);
+  assert.equal(documentRef.getElementById("pace-section").hidden, false);
+  assert.equal(documentRef.getElementById("pace-headline").textContent, headline);
+  assert.equal(documentRef.getElementById("history-period").textContent, "Last 30 days");
+});
+
 test("weekly pace explains a verified zero-observation state without estimating", () => {
   const data = fixture();
   const outlook = data.weekly.paceOutlook;
