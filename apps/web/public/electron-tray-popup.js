@@ -1372,7 +1372,7 @@ function renderWeeklyPace(documentRef, projection, t, numberFormatter, localForm
   const coveredPercent = pace.outlook.coveredFraction === null
     ? null : pace.outlook.coveredFraction * 100;
   if (track) {
-    track.setAttribute("aria-label", `${headline} ${explanation} ${outcome}. ${resetCopy}.`);
+    track.setAttribute("aria-label", [headline, explanation, outcome, resetCopy].join(" "));
   }
   const fill = documentRef.getElementById("pace-fill");
   if (fill) fill.style.width = coveredPercent === null ? "0%" : `${coveredPercent}%`;
