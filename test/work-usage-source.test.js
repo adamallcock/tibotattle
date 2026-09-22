@@ -10,7 +10,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, win32 } from "node:path";
+import { join, posix, win32 } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 
@@ -1224,81 +1224,86 @@ test("repository grouping joins linked worktrees but keeps distinct clones separ
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
-test("Windows Git paths and CRLF output group linked worktrees with the repository name", async () => {
-  const { createWorkUsageProjectResolver } = await import("../src/platform/index.js");
-  const main = "C:\\synthetic\\main";
-  const linked = "C:\\synthetic\\feature";
-  const common = win32.join(main, ".git");
-  const calls = [];
-  const resolveProject = createWorkUsageProjectResolver({
-    digest: (kind, value) => `${kind}:${value}`,
-    paths: win32,
-    filesystem: {
-      async realpath(path) {
-        assert.ok(!path.includes("\r"), "line terminators must not become path bytes");
-        return win32.normalize(path);
+for (const { platform, paths, root, newline } of [
+  { platform: "macOS", paths: posix, root: "/synthetic", newline: "\n" },
+  { platform: "Windows", paths: win32, root: "C:\\synthetic", newline: "\r\n" },
+]) {
+  test(`${platform} Git paths group linked worktrees with the repository name`, async () => {
+    const { createWorkUsageProjectResolver } = await import("../src/platform/index.js");
+    const main = paths.join(root, "main");
+    const linked = paths.join(root, "feature");
+    const common = paths.join(main, ".git");
+    const calls = [];
+    const resolveProject = createWorkUsageProjectResolver({
+      digest: (kind, value) => `${kind}:${value}`,
+      paths,
+      filesystem: {
+        async realpath(path) {
+          assert.ok(!path.includes("\r"), "line terminators must not become path bytes");
+          return paths.normalize(path);
+        },
+        async stat() { return { isDirectory: () => true, dev: 1, ino: 2, birthtimeMs: 3 }; },
       },
-      async stat() { return { isDirectory: () => true, dev: 1, ino: 2, birthtimeMs: 3 }; },
-    },
-    async runCommand(command, args) {
-      calls.push(args);
-      assert.equal(command, "git");
-      if (args.includes("config")) throw Object.assign(new Error("no_origin"), { code: 1 });
-      return { stdout: `${common.replaceAll("\\", "/")}\r\n${args[1].replaceAll("\\", "/")}\r\n` };
-    },
-  });
-  const first = await resolveProject(main);
-  const second = await resolveProject(linked);
-  assert.equal(first.method, "git_observation");
-  assert.equal(first.projectName, "main");
-  assert.equal(first.worktreeName, "main");
-  assert.equal(second.projectName, "main");
-  assert.equal(second.worktreeName, "feature");
-  assert.equal(second.project, first.project);
-  assert.notEqual(second.worktree, first.worktree);
-  assert.equal(calls.filter(args => args.includes("config")).length, 1);
-});
-
-test("missing Git uses a saved origin while current Git failures preserve non-project status", async () => {
-  const { createWorkUsageProjectResolver } = await import("../src/platform/index.js");
-  const location = "C:\\synthetic\\main";
-  const origin = "https://example.invalid/team/main.git";
-  const missingGit = { code: "ENOENT", syscall: "spawn git" };
-  const options = {
-    digest: (kind, value) => `${kind}:${value}`,
-    paths: win32,
-    repositoryOrigins: new Map([[location, origin]]),
-    filesystem: {
-      async realpath(path) { return path; },
-      async stat() { return { isDirectory: () => true }; },
-    },
-  };
-  const missingResolver = createWorkUsageProjectResolver({ ...options,
-    async runCommand() { throw Object.assign(new Error("git_unavailable"), missingGit); },
-  });
-  const retained = await missingResolver(location);
-  assert.equal(retained.method, "retained_git_origin");
-  assert.equal(retained.projectName, "main");
-  assert.equal(retained.project, "repository-origin:https://example.invalid/team/main");
-  assert.equal(retained.worktreeName, "main");
-  for (const failure of [
-    { code: 128 }, // Current Git reports that this directory is not a repository.
-    { code: "EACCES", syscall: "spawn git" },
-    { code: "ENOENT", syscall: "realpath" },
-    { code: "ETIMEDOUT" },
-  ]) {
-    const resolveProject = createWorkUsageProjectResolver({ ...options,
-      async runCommand() { throw Object.assign(new Error("git_failed"), failure); },
+      async runCommand(command, args) {
+        calls.push(args);
+        assert.equal(command, "git");
+        if (args.includes("config")) throw Object.assign(new Error("no_origin"), { code: 1 });
+        return { stdout: `${common.replaceAll("\\", "/")}${newline}${args[1].replaceAll("\\", "/")}${newline}` };
+      },
     });
-    assert.equal((await resolveProject(location)).method, "non_project");
-  }
-  for (const repositoryOrigins of [new Map(), new Map([[location, "file:///synthetic/main"]])]) {
-    const resolveProject = createWorkUsageProjectResolver({ ...options, repositoryOrigins,
+    const first = await resolveProject(main);
+    const second = await resolveProject(linked);
+    assert.equal(first.method, "git_observation");
+    assert.equal(first.projectName, "main");
+    assert.equal(first.worktreeName, "main");
+    assert.equal(second.projectName, "main");
+    assert.equal(second.worktreeName, "feature");
+    assert.equal(second.project, first.project);
+    assert.notEqual(second.worktree, first.worktree);
+    assert.equal(calls.filter(args => args.includes("config")).length, 1);
+  });
+
+  test(`${platform} missing Git uses a saved origin while current Git failures preserve non-project status`, async () => {
+    const { createWorkUsageProjectResolver } = await import("../src/platform/index.js");
+    const location = paths.join(root, "main");
+    const origin = "https://example.invalid/team/main.git";
+    const missingGit = { code: "ENOENT", syscall: "spawn git" };
+    const options = {
+      digest: (kind, value) => `${kind}:${value}`,
+      paths,
+      repositoryOrigins: new Map([[location, origin]]),
+      filesystem: {
+        async realpath(path) { return path; },
+        async stat() { return { isDirectory: () => true }; },
+      },
+    };
+    const missingResolver = createWorkUsageProjectResolver({ ...options,
       async runCommand() { throw Object.assign(new Error("git_unavailable"), missingGit); },
     });
-    assert.equal((await resolveProject(location)).method, "non_project");
-  }
-});
+    const retained = await missingResolver(location);
+    assert.equal(retained.method, "retained_git_origin");
+    assert.equal(retained.projectName, "main");
+    assert.equal(retained.project, "repository-origin:https://example.invalid/team/main");
+    assert.equal(retained.worktreeName, "main");
+    for (const failure of [
+      { code: 128 }, // Current Git reports that this directory is not a repository.
+      { code: "EACCES", syscall: "spawn git" },
+      { code: "ENOENT", syscall: "realpath" },
+      { code: "ETIMEDOUT" },
+    ]) {
+      const resolveProject = createWorkUsageProjectResolver({ ...options,
+        async runCommand() { throw Object.assign(new Error("git_failed"), failure); },
+      });
+      assert.equal((await resolveProject(location)).method, "non_project");
+    }
+    for (const repositoryOrigins of [new Map(), new Map([[location, "file:///synthetic/main"]])]) {
+      const resolveProject = createWorkUsageProjectResolver({ ...options, repositoryOrigins,
+        async runCommand() { throw Object.assign(new Error("git_unavailable"), missingGit); },
+      });
+      assert.equal((await resolveProject(location)).method, "non_project");
+    }
+  });
+}
 
 test("canonical source groups unavailable non-project folders and conserves usage", async () => {
   const absentRoot = await mkdtemp(join(tmpdir(), "work-usage-absent-"));

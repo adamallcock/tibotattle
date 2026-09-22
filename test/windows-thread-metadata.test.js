@@ -5,7 +5,7 @@ import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { readCodexLocalThreadMetadata, readCodexLocalThreadAncestry,
+import { readCodexSelectedRolloutNames, readCodexLocalThreadMetadata, readCodexLocalThreadAncestry,
   readCodexLocalRepositoryOrigins } from "../src/platform/local-codex-thread-store.js";
 
 const ROOT = "11111111-1111-4111-8111-111111111111";
@@ -14,7 +14,7 @@ const REVIEW = "33333333-3333-4333-8333-333333333333";
 const PRIVATE = "synthetic-private-prompt-canary";
 
 // Portable orchestration coverage only. Native owner/reparse/link and Windows
-// kernel rename denial are exercised by windows-work-usage-native.test.js.
+// kernel rename denial are exercised by work-usage-platform-parity.test.js.
 async function fixture(t, { wal = false } = {}) {
   const home = await realpath(await mkdtemp(join(tmpdir(), "windows-thread-metadata-")));
   const leases = new Map(), opened = [], reads = [];
@@ -146,6 +146,7 @@ test("Windows missing binding fails closed for names and ancestry without a POSI
   assert.equal(result.get(ROOT).name, null);
   assert.equal((await readCodexLocalThreadAncestry(f.home, [WORKER], options)).get(WORKER), WORKER);
   assert.equal((await readCodexLocalRepositoryOrigins(f.home, options)).size, 0);
+  assert.equal(await readCodexSelectedRolloutNames(f.home, options), null);
   assert.equal(f.leases.size, 0);
 });
 
@@ -155,6 +156,31 @@ test("Windows native refusal of a database or sidecar releases partial leases an
     f.refuse(file => file === `${f.path}${suffix}`);
     const result = await readCodexLocalThreadMetadata(f.home, [WORKER], f.options);
     assert.equal(result.get(WORKER).parent, null);
+    assert.equal(await readCodexSelectedRolloutNames(f.home, f.options), null);
+    assert.equal(f.leases.size, 0);
+  }
+});
+
+test("Windows selected rollout heads share guarded live and closed database reads without titles", async t => {
+  for (const wal of [false, true]) {
+    const f = await fixture(t, { wal });
+    const name = `rollout-2026-09-22T10-00-00-${ROOT}.jsonl`;
+    const writer = wal ? f.db : new DatabaseSync(f.path);
+    writer.prepare("UPDATE threads SET rollout_path = ? WHERE id = ?")
+      .run(join(f.home, "sessions", name), ROOT);
+    if (!wal) writer.close();
+    const factory = wrappedDatabase(db => ({
+      get isOpen() { return db.isOpen; }, exec: db.exec.bind(db), prepare(sql) {
+        assert.doesNotMatch(sql, /SELECT.*(?:title|cwd|source)/iu);
+        return db.prepare(sql);
+      },
+      close() {
+        assert.ok(f.leases.size >= (wal ? 3 : 1));
+        db.close();
+      },
+    }));
+    assert.deepEqual(await readCodexSelectedRolloutNames(f.home,
+      { ...f.options, databaseFactory: factory }), new Map([[ROOT, name]]));
     assert.equal(f.leases.size, 0);
   }
 });

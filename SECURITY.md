@@ -80,7 +80,11 @@ last-observed local workspace mappings, not verified historical ownership.
 On Windows, transient metadata uses the approved native source reader's
 current-owner, single-link and reparse-point checks instead of Unix mode bits.
 Existing SQLite files are held through connection close; metadata never changes
-source permissions or journal mode. Missing or unsafe native access preserves
+source permissions or journal mode. Selected rollout-head reads use the same
+boundary and never read titles. On both macOS and Windows, closed databases
+without sidecars use immutable reads with file-state revalidation; live WAL
+reads require existing WAL/SHM files and may update SHM coordination bytes.
+Missing or unsafe native access preserves
 anonymous fallback labels. A saved, unambiguous Codex repository origin may
 supply project grouping when Git is absent from the app's executable search
 path; a current Git rejection is not overridden by that historical observation.

@@ -25,7 +25,7 @@ export function createLocalCodexMetadataFilesystem({
   async function openFile(path) {
     if (windows) {
       const handle = await sources().open(path);
-      try { return { handle, before: await handle.stat() }; }
+      try { return { path, handle, before: await handle.stat() }; }
       catch (error) { await handle.close(); throw error; }
     }
     const before = await lstat(path);
@@ -33,21 +33,13 @@ export function createLocalCodexMetadataFilesystem({
     const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     try {
       if (!same(before, await handle.stat())) throw new Error("unsafe_metadata_source");
-      return { handle, before };
+      return { path, handle, before };
     } catch (error) { await handle.close(); throw error; }
   }
 
   async function sidecarExists(path) {
     try { await lstat(path); return true; }
     catch (error) { if (error?.code === "ENOENT") return false; throw error; }
-  }
-
-  async function safePosixSidecars(path) {
-    for (const suffix of SIDECARS) {
-      try { if (!ownerControlledRegularFile(await lstat(`${path}${suffix}`))) return false; }
-      catch (error) { if (error?.code !== "ENOENT") return false; }
-    }
-    return true;
   }
 
   return Object.freeze({
@@ -66,14 +58,6 @@ export function createLocalCodexMetadataFilesystem({
     same,
     namedStat: (path, handle) => windows ? sources().namedStat(path, handle) : lstat(path),
     async guardDatabase(path) {
-      if (!windows) {
-        const before = await lstat(path);
-        if (!ownerControlledRegularFile(before) || !await safePosixSidecars(path)) {
-          throw new Error("unsafe_metadata_database");
-        }
-        return { databasePath: path, validate: async () => same(before, await lstat(path))
-          && await safePosixSidecars(path), release: async () => {} };
-      }
       const held = [];
       const absent = [];
       const release = async () => {
@@ -111,7 +95,8 @@ export function createLocalCodexMetadataFilesystem({
             && (absent.includes(`${path}-wal`) || absent.includes(`${path}-shm`))) {
           throw new Error("unsafe_metadata_database");
         }
-        // Existing files and ancestors cannot be replaced until release. An
+        // Windows leases prevent replacement of existing files and ancestors;
+        // POSIX paths are revalidated against held descriptors. An
         // absent sidecar cannot be leased without mutating Codex's source; a
         // changed sidecar set therefore refuses this optional result. This does
         // not claim protection against a transient create/remove of an absent
@@ -123,6 +108,7 @@ export function createLocalCodexMetadataFilesystem({
             for (const entry of held) {
               const after = await entry.handle.stat();
               if (!same(entry.before, after)) return false;
+              if (!windows && !same(entry.before, await lstat(entry.path))) return false;
               if (immutable && (entry.before.size !== after.size
                   || entry.before.mtimeMs !== after.mtimeMs
                   || entry.before.ctimeMs !== after.ctimeMs)) return false;

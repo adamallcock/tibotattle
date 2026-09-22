@@ -34,6 +34,10 @@ as Windows ACL evidence. Projects & threads also permits its existing bounded
 title fallback and uses a saved, unambiguous repository origin when Git cannot
 be launched because it is absent. An actual Git rejection remains non-project.
 These names and repository hints remain transient and local-only.
+Selected rollout-head reads use the same platform-aware metadata boundary, so
+valid paginated forks can resolve on Windows as on macOS. Both platforms run the
+shared native metadata contract; closed databases are read without creating
+source sidecars. Native Windows and packaged UI execution remain separate gates.
 
 ## Run
 

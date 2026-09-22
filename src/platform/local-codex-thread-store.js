@@ -1,9 +1,9 @@
-import { lstat, realpath } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { normalizeWorkUsageRepositoryOrigin } from "./work-usage-projects.js";
 import { readBoundedUtf8LineEntries } from "./bounded-jsonl-reader.js";
-import { createLocalCodexMetadataFilesystem, ownerControlledRegularFile } from "./local-codex-metadata-filesystem.js";
+import { createLocalCodexMetadataFilesystem } from "./local-codex-metadata-filesystem.js";
 
 const CODEX_THREAD_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -23,19 +23,23 @@ const CODEX_SELECTED_ROLLOUT_NAME = new RegExp(
  * selected head only disambiguates which physical generation should provide
  * carried state to a later logical fork.
  */
-export async function readCodexSelectedRolloutNames(codexHome) {
-  if (typeof codexHome !== "string" || codexHome.length < 1) return null;
+export async function readCodexSelectedRolloutNames(codexHome, {
+  platform = process.platform, loadWindowsBinding, databaseFactory = openMetadataDatabase,
+} = {}) {
+  const filesystem = createLocalCodexMetadataFilesystem({ platform, loadWindowsBinding });
+  if (!await filesystem.validHome(codexHome)) return null;
   const databaseFile = join(codexHome, "state_5.sqlite");
-  let stats;
-  try {
-    stats = await lstat(databaseFile);
-  } catch {
-    return null;
-  }
-  if (!ownerControlledRegularFile(stats)) return null;
   let database;
+  let guard;
+  let slot;
   try {
-    database = new DatabaseSync(databaseFile, { readOnly: true, timeout: 2_000 });
+    await retryMetadataDatabaseCloses();
+    slot = reserveMetadataDatabaseSlot();
+    guard = await filesystem.guardDatabase(databaseFile);
+    if (!await guard.validate()) return null;
+    database = databaseFactory(guard.databasePath, { readOnly: true, timeout: 2_000 });
+    if (!await guard.validate()) return null;
+    database.exec("BEGIN");
     const columns = new Set(database.prepare("PRAGMA table_info(threads)")
       .all().map((row) => row.name));
     if (!columns.has("id") || !columns.has("rollout_path")) return null;
@@ -55,11 +59,11 @@ export async function readCodexSelectedRolloutNames(codexHome) {
           || selectedMatch[1].toLowerCase() !== row.id.toLowerCase()) continue;
       selected.set(row.id.toLowerCase(), selectedName);
     }
-    return selected;
+    return await guard.validate() ? selected : null;
   } catch {
     return null;
   } finally {
-    database?.close();
+    await closeMetadataDatabase(database, guard, slot);
   }
 }
 

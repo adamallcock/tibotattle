@@ -36,14 +36,14 @@ remaining native qualification gate here before handoff.
   revalidation. Failed closes retain bounded strong references until retry.
 - Missing Git can use a saved unambiguous origin. Current Git rejection remains
   non-project; CRLF output and Windows repository basenames are handled.
-- Native qualification includes four metadata cases. The packaged normal journey
+- Native qualification includes a shared macOS/Windows metadata contract. The packaged normal journey
   now checks real Git grouping, saved task name and the rendered task link on both
   launches. The signed-installed validator requires that content-free receipt.
 - Database/WAL content and journal mode are preserved. Normal read-only WAL
   connections may update existing SHM coordination bytes; no source permissions
   are changed and absent sidecars are not created.
 
-## Validation on macOS, Node 26.2.0
+## Initial implementation validation on macOS, Node 26.2.0
 
 - Metadata/privacy/discovery: 90 passed, including 12 Windows orchestration cases.
 - Project/source accounting: 51 passed, including actual Git repositories.
@@ -64,6 +64,29 @@ remaining native qualification gate here before handoff.
   [release PR #204](https://github.com/adamallcock/tibotattle/pull/204). Retained
   receipt regeneration was not performed. The initial full root run is not a
   passing release gate; targeted reruns are separate evidence.
+
+## macOS and Windows parity follow-up
+
+The parity audit found a remaining POSIX-only check in selected rollout-head
+lookup. Windows could refuse an otherwise valid database, preventing resolution
+of a paginated replacement and its inline child. The reader now uses the same
+guarded database boundary as names, ancestry and repository hints, while querying
+only IDs and rollout paths. Both platforms also use validated immutable reads
+when sidecars are absent, avoiding source coordination-file creation on macOS.
+
+The shared `test/work-usage-platform-parity.test.js` runs the same nine cases
+against each platform's real filesystem adapter. It covers saved and explicit
+names, opt-in titles, rename refresh, timestamp conflicts, malformed metadata,
+nested workers, guardian navigation, origin ambiguity, live and checkpointed WAL,
+hardlink refusal, and actual database-to-discovery paginated-fork resolution.
+Portable Git cases now run both path conventions against identical grouping and
+missing-Git expectations. Native Windows qualification requires this shared suite.
+
+The final focused run passed all 204 metadata, discovery, project, accounting,
+qualification and inventory tests, including all nine native cases on macOS.
+The local companion passed all 398 tests. Architecture and preflight passed.
+These results do not establish a Windows execution result; the Windows native
+and packaged checks below remain required. No broad root-suite success is claimed.
 
 ## Remaining release gate
 
