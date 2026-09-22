@@ -61,13 +61,16 @@ Electron static-asset tests. The package from clean commit `4ac41d6a` verifies
 its artifact and passes the disposable macOS packaged smoke outside the sandbox;
 the sandboxed smoke could not reach its loopback debugging endpoint. The native
 artifact lane then found one stale LOWESS membership expectation. Both exact
-expected inventories are corrected, and their focused runtime-graph test passes;
-the full artifact lane needs a final rerun. A separate native Keychain migration
-UI smoke aborts or times out during AppKit/LaunchServices alert initialization
-inside the sandbox; its focused source tests pass. R7 retained receipts describe
-an older source closure. Its synthetic resource and process-owner tests pass
-outside the sandbox, confirming the earlier RSS/process failures were environment
-restrictions. Neither guard nor protected receipt has been weakened or regenerated.
+expected inventories were corrected. On clean commit `f21e8c94`, the full macOS
+artifact lane passes 101 artifact and 9 updater tests, the native development
+smoke passes, and a fresh unsigned Electron package passes its packaged smoke.
+Production and staging Worker dry runs also pass on that commit. A native
+Keychain migration UI smoke aborts or times out during AppKit/LaunchServices
+alert initialization inside the sandbox; the artifact lane succeeds outside it.
+R7 retained receipts describe an older source closure. Its synthetic resource
+and process-owner tests pass outside the sandbox, confirming the earlier RSS/
+process failures were environment restrictions. Neither guard nor protected
+receipt has been weakened or regenerated.
 
 Public health on 2026-09-21 reported production source `0fb6a5e6` and an
 operational collection state. That observation does not reveal the live D1
