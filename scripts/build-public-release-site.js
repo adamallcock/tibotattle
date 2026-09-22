@@ -84,6 +84,7 @@ const PUBLIC_PAGE_ROUTE_BY_SOURCE_BASENAME = Object.freeze({
  * cannot silently publish an app-only surface.
  */
 const APP_ONLY_SOURCE_BASENAMES = Object.freeze([
+  "allowance-trends.js",
   "admin-client.js",
   "admin.css",
   "admin.html",

@@ -499,12 +499,14 @@
           <p id="weekly-span-note" class="small muted" hidden></p>
           <div class="legend weekly-legend chart-card-legend" aria-label="Weekly estimate chart legend" data-i18n-aria-label="aria.weeklyEstimateLegend">
             <span><i class="legend-dot weekly-center"></i>All-data median</span>
+            <span id="weekly-lowess-legend"><i class="legend-dot weekly-lowess"></i><span data-i18n="weekly.controls.lowess">Robust LOWESS</span></span>
             <span><i class="legend-dot weekly-mature"></i><span id="weekly-span-legend">Observed across 50+ points</span></span>
             <span id="weekly-partial-legend" hidden><i class="legend-dot weekly-partial"></i>Short observation</span>
             <span><i class="legend-dot weekly-error-bar"></i>Slope-agreement range</span>
           </div>
           <div class="dashboard-state chart-empty small" id="weekly-empty" role="status" data-state="empty">No weekly estimates loaded.</div>
           <div class="chart-shell weekly-history-chart" id="weekly-chart" hidden></div>
+          <p class="annotation" id="weekly-trend-note" aria-live="polite" hidden></p>
           <!--
             Honest naming for the per-reset bars: they are the 10th-to-90th
             percentile spread of slopes formed from different pairs of observed
