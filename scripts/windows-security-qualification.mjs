@@ -255,7 +255,9 @@ function fileIndexFromTapLocation(location) {
 }
 
 function sourceLocationFromTapStackFrame(line) {
-  if (typeof line !== "string" || !/^\s+at(?:\s|$)/u.test(line)) return null;
+  // Node 26's TAP stack omits the `at` prefix from frames. Both forms remain
+  // inside the YAML stack and are reduced to a reviewed file index and line.
+  if (typeof line !== "string" || !/^ {4,}(?:at\s+|[A-Za-z][\w.<>]*\s+\()/u.test(line)) return null;
   const normalized = line.replaceAll("\\", "/").replace(/\/{2,}/gu, "/");
   for (const [file, index] of QUALIFICATION_FILE_INDEX) {
     const marker = `/${file}:`;

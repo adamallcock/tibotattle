@@ -288,6 +288,17 @@ test("qualification TAP failure diagnostics retain only bounded structural index
     failureType: null,
     errorName: null,
   });
+  const node26 = parseTapFailureDiagnostic([
+    "not ok 15 - PRIVATE-CADENCE",
+    "  ---",
+    "  location: 'D:\\\\runner\\\\test\\\\model-performance.test.js:310:1'",
+    "  stack: |-",
+    "    AssertionError: PRIVATE-DETAIL",
+    "    waitForSavedSnapshot (file:///D:/runner/test/model-performance.test.js:164:3)",
+    "  ...",
+  ].join("\n"));
+  assert.equal(node26.fileIndex, 1);
+  assert.equal(node26.sourceLine, 164);
   assert.deepEqual(
     parseTapFailureDiagnostic("not ok 3 - PRIVATE-WITHOUT-LOCATION\n  ..."),
     {
