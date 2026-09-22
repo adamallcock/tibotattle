@@ -7309,6 +7309,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   assert.deepEqual(webModules.relativeFiles, [
     "apps/web/public/allowance-tank-renderer.js",
     "apps/web/public/allowance-tanks.js",
+    "apps/web/public/allowance-trends.js",
     "apps/web/public/app.js",
     "apps/web/public/cache-reuse-matrix.js",
     "apps/web/public/cache-reuse-metrics.js",
@@ -7368,6 +7369,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/macos/reset-local-keychain.js",
     "apps/web/public/allowance-tank-renderer.js",
     "apps/web/public/allowance-tanks.js",
+    "apps/web/public/allowance-trends.js",
     "apps/web/public/app.js",
     "apps/web/public/cache-reuse-matrix.css",
     "apps/web/public/cache-reuse-matrix.js",

@@ -56,13 +56,18 @@ local source and package behavior, not live database compatibility or
 authorization to deploy.
 
 The unsigned macOS package first refused the upstream LOWESS asset because the
-reviewed surface manifest omitted it. The exact-list repair passes the surface
-and Electron static-asset tests; artifact packaging must be rerun from a clean
-commit. The native Keychain migration UI smoke still aborts or times out during
-macOS AppKit/LaunchServices alert initialization on this host; its focused
-source tests pass. R7 retained receipts describe an older source closure, while
-the sandbox blocks the external RSS/process probe. Neither guard nor protected
-receipt has been weakened or regenerated.
+reviewed surface manifest omitted it. Its exact-list repair passes surface and
+Electron static-asset tests. The package from clean commit `4ac41d6a` verifies
+its artifact and passes the disposable macOS packaged smoke outside the sandbox;
+the sandboxed smoke could not reach its loopback debugging endpoint. The native
+artifact lane then found one stale LOWESS membership expectation. Both exact
+expected inventories are corrected, and their focused runtime-graph test passes;
+the full artifact lane needs a final rerun. A separate native Keychain migration
+UI smoke aborts or times out during AppKit/LaunchServices alert initialization
+inside the sandbox; its focused source tests pass. R7 retained receipts describe
+an older source closure. Its synthetic resource and process-owner tests pass
+outside the sandbox, confirming the earlier RSS/process failures were environment
+restrictions. Neither guard nor protected receipt has been weakened or regenerated.
 
 Public health on 2026-09-21 reported production source `0fb6a5e6` and an
 operational collection state. That observation does not reveal the live D1
