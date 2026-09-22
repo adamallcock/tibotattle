@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { buildAllowanceTrends } from "../public/allowance-trends.js";
 import { createContext, runInContext } from "node:vm";
 import { FAST_MODE_QUOTA_MULTIPLIERS } from "@app-usagemonitor/accounting";
 import {
@@ -364,7 +365,7 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US", planT
         hidden: false,
         setAttribute() {},
         removeAttribute() {},
-        replaceChildren() {},
+        replaceChildren(...children) { this.children = children; },
         append() {},
       });
     }
@@ -396,9 +397,10 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US", planT
     "activeAllowanceWindowMinutes", "CODEX_FIVE_HOUR_ALLOWANCE_MINUTES",
     "CODEX_WEEKLY_ALLOWANCE_MINUTES", "isPrimaryCodexQuotaWindow",
     "renderWeeklyPlanControl", "shareCardPlanLabel",
+    "buildAllowanceTrends",
     `${section}\nreturn renderWeekly;`,
   )(
-    { createElementNS: () => new FakeSvgElement("g") },
+    { createElementNS: (_namespace, tagName) => new FakeSvgElement(tagName) },
     FakeResizeObserver,
     () => 5,
     (value, fallback = null) => typeof value === "number" && Number.isFinite(value) ? value : fallback,
@@ -437,6 +439,7 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US", planT
     () => true,
     () => {},
     shareCardPlanLabel,
+    buildAllowanceTrends,
   )(data);
 
   return {
@@ -448,6 +451,9 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US", planT
     spanLabel: element("#weekly-span-label").textContent,
     spanNote: element("#weekly-span-note"),
     empty: element("#weekly-empty"),
+    chart: element("#weekly-chart").children?.[0],
+    trendNote: element("#weekly-trend-note"),
+    lowessLegend: element("#weekly-lowess-legend"),
     shared,
     paceData,
   };
@@ -9216,6 +9222,7 @@ test("a posted results card can carry only fixed copy and formatted figures", as
     [
       "point?.acrossResetHigh",
       "point?.acrossResetLow",
+      "point?.allowanceLowess",
       "point?.at",
       "point?.high",
       "point?.historicalMedian",
@@ -9470,6 +9477,8 @@ async function loadShareCardTrendHelpers() {
     "shareCardTrend",
     "shareCardTrendLegend",
     "shareCardTrendShortText",
+    "shareCardTrendLineLegend",
+    "shareCardTrendFitText",
   ];
   return Function(
     "finite",
@@ -13700,6 +13709,111 @@ test("Forest Ink dark appearance is explicit, balanced, and live-updateable", as
     appSource,
     /theme === "dark" \? "#141a17" : "#f5f1e8"/u,
   );
+});
+
+test("LOWESS is shared exactly between allowance and social graphs after filtering", async () => {
+  const weeklyValues = Array.from({ length: 16 }, (_, index) => ({
+    last_observed_at: new Date(Date.UTC(2026, 0, 1 + index * 5)).toISOString(),
+    value_usd: index < 8 ? 2200 : 1400,
+    displayed_span_pp: index === 10 ? 40 : 70,
+    pairwise_p10_usd: index < 8 ? 2100 : 1300,
+    pairwise_p90_usd: index < 8 ? 2300 : 1500,
+  }));
+  const data = { weekly: { summary: { median_weekly_value_usd: 1800, qualifying_resets: 16 }, weeklyValues } };
+  const { shareCardTrend, shareCardTrendLineLegend, shareCardTrendFitText } = await loadShareCardTrendHelpers();
+  for (const [span, rangeDays] of [[50, 36_500], [0, 36_500], [50, 30], [50, 7]]) {
+    const view = await renderWeeklyHero(data, { span, rangeDays });
+    const history = view.shared.history;
+    const cardTrend = shareCardTrend(history);
+    assert.deepEqual(cardTrend.points.map(p => p.allowanceLowess), history.points.map(p => p.allowanceLowess));
+    assert.deepEqual(cardTrend.points.map(p => p.at), history.points.map(p => p.at));
+    assert.deepEqual(cardTrend.axis, history.axis);
+    assert.equal(view.estimate, '$1800 API equivalent');
+    const fitted = history.lowessCount > 0;
+    assert.equal(view.chart.querySelectorAll('polyline.chart-line-weekly-lowess').length, fitted ? 1 : 0);
+    assert.equal(view.chart.querySelectorAll('circle.chart-point-weekly-mature').filter(el => Number(el.getAttribute('r')) > 0).length, history.points.filter(p => p.wellObserved).length);
+    assert.equal(view.chart.querySelectorAll('g.chart-error-bar-weekly').length, history.points.length);
+    assert.equal(view.lowessLegend.hidden, !fitted);
+    assert.equal(shareCardTrendLineLegend(cardTrend).at(-1).kind, fitted ? 'lowess' : 'unavailable');
+    assert.equal(shareCardTrendFitText({ trend: cardTrend }), view.trendNote.textContent);
+    assert.ok(Object.isFrozen(history.points) && history.points.every(Object.isFrozen));
+  }
+  const empty = await renderWeeklyHero(data, { span: 99, rangeDays: 36_500 });
+  assert.equal(empty.empty.hidden, false);
+  assert.equal(empty.trendNote.hidden, true);
+  assert.equal(shareCardTrend(empty.shared.history), null);
+});
+
+test("a narrow allowance chart uses its actual drawing width", async () => {
+  const { lineChart, CHART_POINT_STYLE } = await loadLineChartRenderer(new FakeSvgDocument(320));
+  const chart = lineChart({
+    width: 320,
+    points: [{ timestamp: '2026-01-01T00:00:00Z', value: 2200 }, { timestamp: '2026-02-01T00:00:00Z', value: 1400 }],
+    series: [{ key: 'value', className: 'chart-line-weekly-lowess', label: { key: 'weekly.controls.lowess' }, pointStyle: CHART_POINT_STYLE.HOVER_ONLY }],
+    title: { key: 'weekly.chart.title' }, description: { key: 'weekly.chart.description' }, yLabel: { key: 'chart.axis.apiEquivalentPerSevenDays' },
+  });
+  assert.equal(chart.getAttribute('viewBox'), '0 0 320 300');
+  const line = chart.querySelector('polyline.chart-line-weekly-lowess');
+  const vertices = line.getAttribute('points').split(' ').map(point => point.split(',').map(Number));
+  assert.equal(vertices[0][0], 72);
+  assert.equal(vertices[1][0], 296);
+  assert.ok(vertices.every(([x, y]) => x >= 0 && x <= 320 && y >= 0 && y <= 300));
+});
+
+test("social LOWESS draws the shared coordinates and preserves null gaps", async () => {
+  const source = await readFile(new URL('../public/app.js', import.meta.url), 'utf8');
+  const drawSource = source.match(/function drawShareCardTrend\([\s\S]*?\n\}/u)?.[0];
+  assert.ok(drawSource);
+  const draw = Function('drawShareCardPanel', 'shareCardFont', 'finite', 't', 'formatMoney', `${drawSource}\nreturn drawShareCardTrend;`)(
+    () => {}, () => '13px sans-serif', finite, (key) => translate(key), (value) => `$${value}`,
+  );
+  const { shareCardTrend, shareCardTrendLineLegend, shareCardTrendFitText } = await loadShareCardTrendHelpers();
+  const history = shareCardTrendHistory([false, false, false, false, false]);
+  const fitted = [1800, 1825, null, 1900, 1950];
+  history.points = history.points.map((point, index) => ({ ...point, allowanceLowess: fitted[index] }));
+  const trend = shareCardTrend(history);
+  const strokes = [], labels = [];
+  let path = [];
+  const context = {
+    save() {}, restore() {}, fillRect() {}, fill() {}, arc() {},
+    beginPath() { path = []; },
+    moveTo(x, y) { path.push(['move', x, y]); },
+    lineTo(x, y) { path.push(['line', x, y]); },
+    stroke() { strokes.push({ color: this.strokeStyle, path: [...path] }); },
+    fillText(text) { labels.push(text); },
+    measureText(text) { return { width: String(text).length * 7 }; },
+  };
+  const card = { trend, trendLegend: [], trendLineLegend: shareCardTrendLineLegend(trend) };
+  draw(context, card, 0, 0, 1000, 300);
+  const curve = strokes.find(stroke => stroke.color === '#97402a' && stroke.path.length === 4);
+  assert.ok(curve, 'export canvas paints the fitted line');
+  assert.deepEqual(curve.path.map(([kind]) => kind), ['move', 'line', 'move', 'line']);
+  const plot = { left: 92, right: 980, top: 64, bottom: 246 };
+  const expected = [0, 1, 3, 4].map(index => [
+    index === 0 || index === 3 ? 'move' : 'line',
+    plot.left + index / 4 * (plot.right - plot.left),
+    plot.bottom - (fitted[index] - 1000) / 2000 * (plot.bottom - plot.top),
+  ]);
+  assert.deepEqual(curve.path, expected, 'canvas plots the exact shared timestamps and fitted dollars');
+  assert.ok(labels.includes(translate('weekly.controls.lowess')));
+  assert.match(shareCardTrendFitText(card), /same fitted values and gaps/u);
+
+  // Card admission omits invalid raw estimates but must not join across the
+  // missing source point, even when the adjacent LOWESS predictions are valid.
+  history.points[2] = { ...history.points[2], value: 0 };
+  const omitted = shareCardTrend(history);
+  assert.deepEqual(omitted.points.map(point => point.lowessBreakBefore), [false, false, true, false]);
+  strokes.length = 0;
+  draw(context, { trend: omitted, trendLegend: [], trendLineLegend: shareCardTrendLineLegend(omitted) }, 0, 0, 1000, 300);
+  assert.deepEqual(strokes.find(stroke => stroke.color === '#97402a' && stroke.path.length === 4).path.map(([kind]) => kind), ['move', 'line', 'move', 'line']);
+
+  history.points = history.points.map(point => ({ ...point, allowanceLowess: null }));
+  history.lowessReason = 'tooMany';
+  const unavailable = shareCardTrend(history);
+  assert.equal(unavailable.lowessCount, 0);
+  assert.equal(shareCardTrendLineLegend(unavailable).at(-1).kind, 'unavailable');
+  assert.equal(shareCardTrendLineLegend(unavailable).at(-1).label, translate('weekly.controls.lowessTooMany'));
+  assert.match(shareCardTrendFitText({ trend: unavailable }), /250/u);
 });
 
 test("responsive charts keep tooltips in bounds and interrupt an anchored cycle", async () => {

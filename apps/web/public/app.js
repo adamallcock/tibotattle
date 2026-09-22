@@ -9,6 +9,7 @@ import { cacheReuseMetricLines, cacheReuseCoverageNote } from "./cache-reuse-met
 import { mountTrendsHorizon, createSpendRateLookup } from "./trends-horizon.js";
 import { mountAllowanceTanks } from "./allowance-tanks.js";
 import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
+import { buildAllowanceTrends } from "./allowance-trends.js";
 import { mountWorkUsageView } from "./work-usage-view.js";
 import { mountModelPerformance } from "./model-performance.js";
 import { createDashboardReportPreloader } from "./dashboard-report-preload.js";
@@ -2873,12 +2874,18 @@ function shareCardTrend(history) {
   // The card is a compact rendering of the exact series on Allowance estimate
   // history. It must not silently remove shorter fits, change the active
   // period, or rescale the chart just because it is being shared.
+  let skippedPoint = false;
   const points = (Array.isArray(history?.points) ? history.points : [])
     .map((point) => {
       const value = finite(point?.value);
-      if (!Number.isFinite(point?.at) || value === null || value <= 0) return null;
+      if (!Number.isFinite(point?.at) || value === null || value <= 0) {
+        skippedPoint = true;
+        return null;
+      }
       const low = finite(point?.low);
       const high = finite(point?.high);
+      const lowessBreakBefore = skippedPoint;
+      skippedPoint = false;
       return Object.freeze({
         at: point.at,
         dateLabel: point.dateLabel,
@@ -2886,6 +2893,8 @@ function shareCardTrend(history) {
         low,
         high,
         historicalMedian: finite(point?.historicalMedian),
+        allowanceLowess: finite(point?.allowanceLowess),
+        lowessBreakBefore,
         acrossResetLow: finite(point?.acrossResetLow),
         acrossResetHigh: finite(point?.acrossResetHigh),
         wellObserved: point.wellObserved === true,
@@ -2913,6 +2922,8 @@ function shareCardTrend(history) {
     }),
     xTicks: Object.freeze([...(history?.xTicks ?? [])]),
     count: points.length,
+    lowessCount: points.filter((point) => point.allowanceLowess !== null).length,
+    lowessReason: history?.lowessReason === "tooMany" ? "tooMany" : null,
     // How many plotted fits carry the outlined short-observation marker, and
     // the floor that classified them. The outline is a claim about evidence
     // quality that the picture cannot explain on its own, so the key beside
@@ -3141,6 +3152,7 @@ function buildShareCard(data, {
     // follows: a card whose fits are all well observed carries no key, and
     // the labels are the chart's own, so the two surfaces say one thing.
     trendLegend: shareCardTrendLegend(trend),
+    trendLineLegend: shareCardTrendLineLegend(trend),
     // The count sentence mirrors the Allowance hero's phrasing: shown of
     // total, plus the range and span filter the shared model applied. A bare
     // subset count beside the page's corpus count read as two different
@@ -3215,6 +3227,27 @@ function shareCardTrendLegend(trend) {
   ]);
 }
 
+/** Fixed, localized labels for the same reference and fit drawn by the page. */
+function shareCardTrendLineLegend(trend) {
+  if (trend === null) return Object.freeze([]);
+  const entries = [];
+  if (finite(trend.points[0]?.historicalMedian) !== null) {
+    entries.push(Object.freeze({ kind: "median", label: t("weekly.series.allDataMedian") }));
+  }
+  entries.push(Object.freeze({
+    kind: trend.lowessCount > 0 ? "lowess" : "unavailable",
+    label: t(trend.lowessCount > 0 ? "weekly.controls.lowess"
+      : trend.lowessReason === "tooMany" ? "weekly.controls.lowessTooMany" : "weekly.controls.lowessUnavailable"),
+  }));
+  return Object.freeze(entries);
+}
+
+function shareCardTrendFitText(card) {
+  if (card.trend === null) return "";
+  return t(card.trend.lowessCount > 0 ? "weekly.controls.trendNote"
+    : card.trend.lowessReason === "tooMany" ? "weekly.controls.trendTooMany" : "weekly.controls.trendSparse");
+}
+
 /**
  * The same card as a sentence, for a screen reader and for a text-only post.
  */
@@ -3236,6 +3269,7 @@ function shareCardText(card) {
     figures,
     shareCardTrendText(card),
     shareCardTrendShortText(card),
+    shareCardTrendFitText(card),
     card.caveats.join(" "),
     t("share.text.trailer", { trailer }),
     card.home === "" ? "" : t("share.text.more", { home: card.home }),
@@ -3430,7 +3464,7 @@ function drawShareCardTrend(context, card, x, y, width, height) {
   const { points, axis, xTicks } = card.trend;
   const xAxisLabel = t("share.axis.resetEstimateDate");
   const yAxisLabel = t("share.axis.allowance");
-  const padTop = 40;
+  const padTop = 64;
   const padBottom = 54;
   const padLeft = 92;
   const padRight = 20;
@@ -3511,6 +3545,24 @@ function drawShareCardTrend(context, card, x, y, width, height) {
     context.stroke();
   }
 
+  // Consume the shared fit; never refit, interpolate nulls or bridge a gap
+  // when exporting the image. Geometry uses the same dates and axis as SVG.
+  context.strokeStyle = "#97402a";
+  context.lineWidth = 3;
+  context.beginPath();
+  let connected = false;
+  for (const point of points) {
+    // If card admission omitted an invalid raw estimate, keep the source
+    // chart's break even though that null point is absent from this projection.
+    if (point.lowessBreakBefore) connected = false;
+    const value = finite(point.allowanceLowess);
+    if (value === null) { connected = false; continue; }
+    if (connected) context.lineTo(positionX(point), positionY(value));
+    else context.moveTo(positionX(point), positionY(value));
+    connected = true;
+  }
+  context.stroke();
+
   for (const point of points) {
     const pointX = Math.round(positionX(point)) + .5;
     context.fillStyle = point.wellObserved ? "#315f84" : "#fffef9";
@@ -3569,6 +3621,25 @@ function drawShareCardTrend(context, card, x, y, width, height) {
       cursor += widths[index] + between;
     });
     context.restore();
+  }
+
+  // A separate row keeps trend labels clear of the observation-marker key.
+  context.font = shareCardFont(600, 13);
+  context.textAlign = "left";
+  let lineCursor = plotLeft;
+  for (const entry of card.trendLineLegend) {
+    if (entry.kind !== "unavailable") {
+      context.strokeStyle = entry.kind === "lowess" ? "#97402a" : "#174f45";
+      context.lineWidth = 3;
+      context.beginPath();
+      context.moveTo(lineCursor, y + 43);
+      context.lineTo(lineCursor + 20, y + 43);
+      context.stroke();
+      lineCursor += 27;
+    }
+    context.fillStyle = "#65706b";
+    context.fillText(entry.label, lineCursor, y + 47);
+    lineCursor += context.measureText(entry.label).width + 20;
   }
 
   for (const tick of xTicks) {
@@ -7634,10 +7705,15 @@ function allowanceHistoryChartModel(data, {
       || (point.observedSpanPp !== null
         && point.observedSpanPp >= spanFloorPp)
   ));
-  const axis = allowanceHistoryAxis(points);
+  // Fit once after population/range/span selection. Both the dashboard and
+  // the social image consume these exact values, including null gap breaks.
+  const trends = buildAllowanceTrends(points);
+  const axis = allowanceHistoryAxis(trends.points);
   return Object.freeze({
     allPoints: Object.freeze(allPoints),
-    points: Object.freeze(points),
+    points: Object.freeze(trends.points.map((point) => Object.freeze(point))),
+    lowessCount: trends.lowessCount,
+    lowessReason: trends.reason,
     axis,
     xTicks: allowanceHistoryDateTicks(points),
     // The population facts the sentences around this model state: the corpus
@@ -7786,8 +7862,18 @@ function renderAllowanceHistoryChart(
   windowMinutes = CODEX_WEEKLY_ALLOWANCE_MINUTES,
 ) {
   const fiveHour = windowMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES;
+  const lowessLegend = $("#weekly-lowess-legend");
+  if (lowessLegend) lowessLegend.hidden = history.lowessCount === 0;
+  const note = $("#weekly-trend-note");
+  if (note) {
+    note.hidden = false;
+    setLocalizedText(note, history.lowessReason === "tooMany"
+      ? "weekly.controls.trendTooMany"
+      : history.lowessCount === 0 ? "weekly.controls.trendSparse" : "weekly.controls.trendNote");
+  }
   return lineChart({
     points: history.points,
+    width: Math.max(240, $("#weekly-chart")?.clientWidth || 900),
     series: [
       {
         key: "historicalMedian",
@@ -7801,6 +7887,13 @@ function renderAllowanceHistoryChart(
           key: "share.resetFit",
           plural: points.length,
         }),
+        format: (value) => formatMoney(value),
+      },
+      {
+        key: "allowanceLowess",
+        className: "chart-line-weekly-lowess",
+        label: { key: "weekly.controls.lowess" },
+        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
         format: (value) => formatMoney(value),
       },
       {
@@ -8664,6 +8757,8 @@ function renderWeekly(data) {
   const empty = $("#weekly-empty");
   const shell = $("#weekly-chart");
   if (!chartValues.length) {
+    $("#weekly-lowess-legend").hidden = true;
+    $("#weekly-trend-note").hidden = true;
     empty.hidden = false;
     shell.hidden = true;
     // An empty chart names its reason instead of the generic sentence: either
@@ -15769,6 +15864,18 @@ window.addEventListener("resize", () => {
   if (dashboard && !$("#timeline").inert) scheduleUsageTimelineRender();
   const current = activeInformationPopover;
   if (current) positionInformationPopover(current.popover, current.button);
+});
+let allowanceChartResizeFrame = null;
+window.addEventListener("resize", () => {
+  if (allowanceChartResizeFrame !== null) cancelAnimationFrame(allowanceChartResizeFrame);
+  allowanceChartResizeFrame = requestAnimationFrame(() => {
+    allowanceChartResizeFrame = null;
+    const shell = $("#weekly-chart");
+    if (!dashboard || !shell || shell.hidden || !shell.getClientRects().length) return;
+    const data = allowanceWindowView(dashboard);
+    const history = allowanceHistoryChartModel(data);
+    drawChart(shell, renderAllowanceHistoryChart(history, data.allowanceWindowDurationMinutes));
+  });
 });
 document.addEventListener("scroll", () => {
   const current = activeInformationPopover;
