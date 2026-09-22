@@ -28,8 +28,14 @@ unavailable preference fails closed. Other platforms do not offer this capture
 path yet.
 
 This captures crashes only after the reporter starts and does not diagnose
-every failure that prevents app startup. For a macOS launch failure, Apple
-Console → Crash Reports remains the fallback; share only reviewed exception
-type, termination reason, and crashed-thread top frames. Source tests validate
-the preference and projection boundaries. Packaged, installed, signed-release,
-and updater behavior require separate evidence.
+every failure that prevents app startup. The source checkout now has a separate
+read-only macOS command, `npm run diagnose:desktop-crash`, which runs under Node
+without starting Electron. It reads recent Apple crash reports through a bounded
+allowlist, and inspects the local capture preference and dump counts without
+reading dump bytes. It never changes preferences or sends data. Reports it cannot
+parse stay unavailable; the user can inspect them in Console and share only
+reviewed exception type, termination reason, and crashed-thread top frames.
+This source command does not make the in-app doctor available during a launch
+crash, and it is not an installed-app feature. Source tests validate the
+preference and projection boundaries. Packaged, installed, signed-release, and
+updater behavior require separate evidence.

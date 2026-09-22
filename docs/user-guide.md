@@ -332,7 +332,9 @@ status. It never includes the lease value, paths, accounts, credentials, session
 content, or a native crash dump. You can review and copy the report or prepare
 an editable GitHub support issue. On macOS, local crash capture is a separate
 off-by-default choice that takes effect after restart. See [support](../SUPPORT.md)
-before sharing a native report.
+before sharing a native report. If the app will not open, the source checkout's
+independent macOS crash doctor can inspect Apple reports without launching it;
+the support page gives the exact command.
 
 Trends shows three linked views: **Allowance and activity**, the **three-hour
 observed versus calculated comparison**, and **Cumulative drift**. The first
