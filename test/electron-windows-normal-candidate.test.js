@@ -22,6 +22,7 @@ import {
 } from "../src/local-installation-diagnostics.js";
 import { localCodexLogScanner } from "../src/local-node-runtime.js";
 import { WindowsProtectedStateStoreError } from "../src/platform/windows-protected-state-store.js";
+import { loadWindowsSourceReadBinding } from "../src/platform/windows-filesystem.js";
 import {
   buildWindowsNormalCandidateEnvironment,
   buildWindowsNormalCandidateLaunchSpec,
@@ -1368,21 +1369,30 @@ test("normal candidate fixture passes Codex discovery, onboarding, and local ref
       launch: "first",
       expectedRefreshId: terminal.refreshId,
     }), true);
+    let nativeTimingAvailable = true;
+    if (process.platform === "win32") {
+      try { loadWindowsSourceReadBinding(); } catch { nativeTimingAvailable = false; }
+    }
     let performance = null;
     const timingDeadline = Date.now() + 10_000;
     while (Date.now() < timingDeadline) {
       performance = await fetch(`${base}/api/local/model-performance?period=all`).then((value) => value.json());
-      if (performance.status === "ready" && !performance.collecting) break;
+      if ((!nativeTimingAvailable && performance.status === "unavailable")
+          || (nativeTimingAvailable && performance.status === "ready" && !performance.collecting)) break;
       await new Promise((resolveWait) => setTimeout(resolveWait, 25));
     }
-    assert.equal(performance?.status, "ready");
-    assert.equal(performance.stale, false);
-    assert.equal(performance.models.length, 1);
-    assert.equal(performance.models[0].id, "gpt-5.6-sol");
-    assert.equal(performance.models[0].turns, 1);
-    assert.ok(performance.models[0].speed.some((series) => series.points.some((point) => point.median > 0)));
-    assert.ok(performance.models[0].ttft.some((point) => point.median > 0));
-    assert.equal(verifyWindowsNormalCandidateModelPerformance(performance), true);
+    if (!nativeTimingAvailable) {
+      assert.equal(performance?.status, "unavailable", "the pre-binding Windows contract stays fail closed");
+    } else {
+      assert.equal(performance?.status, "ready");
+      assert.equal(performance.stale, false);
+      assert.equal(performance.models.length, 1);
+      assert.equal(performance.models[0].id, "gpt-5.6-sol");
+      assert.equal(performance.models[0].turns, 1);
+      assert.ok(performance.models[0].speed.some((series) => series.points.some((point) => point.median > 0)));
+      assert.ok(performance.models[0].ttft.some((point) => point.median > 0));
+      assert.equal(verifyWindowsNormalCandidateModelPerformance(performance), true);
+    }
     await app.close();
     app = await startLocalCompanionServer(serverOptions);
     const restartedBase = `http://127.0.0.1:${app.port}`;
