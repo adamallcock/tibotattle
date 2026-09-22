@@ -41,6 +41,7 @@ export const CLIENT_MANIFEST_FILE = "client-export-manifest.json";
  */
 export const CLIENT_RUNTIME_FILES = Object.freeze([
   "apps/local/accountless-contribution.js",
+  "apps/local/accountless-diagnostics.js",
   "apps/local/agent-cli.js",
   "apps/local/model-performance-controller.js",
   "apps/local/model-performance-snapshots.js",
@@ -461,6 +462,7 @@ export const CLIENT_SCRIPT_FILES = Object.freeze([
 ]);
 
 export const CLIENT_TEST_FILES = Object.freeze([
+  "apps/local/accountless-diagnostics.test.mjs",
   "apps/local/agent-cli.test.mjs",
   "apps/local/participant-relay-routes.test.mjs",
   "apps/local/participant-session-cookie-bridge.test.mjs",

@@ -55,6 +55,8 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
     for (const path of [
       "config/electron-production-distribution.cjs",
       "config/macos-bundle-version-plan.cjs",
+      "apps/local/accountless-diagnostics.js",
+      "apps/local/accountless-diagnostics.test.mjs",
       "apps/local/agent-cli.js",
       "apps/local/agent-cli.test.mjs",
       "src/platform/windows-native-unsigned-content.js",
