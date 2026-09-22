@@ -21,6 +21,33 @@ export interface AppleDeliveredSignInHandoff {
   readonly proof: string;
 }
 
+export interface GoogleSignInHandoffInsert {
+  readonly state: string;
+  readonly codeVerifier: string;
+  readonly bindingHash: string;
+  readonly createdAt: string;
+  readonly expiresAt: string;
+}
+
+export interface GooglePendingSignInHandoff {
+  readonly state: string;
+  readonly codeVerifier: string;
+}
+
+export interface GoogleDeliveredSignInHandoff {
+  readonly proof: string;
+}
+
+export interface SignInHandoffConsumedIdentity {
+  readonly linkKeyHex: string;
+}
+
+export interface SignInHandoffConsumeInput {
+  readonly proof: string;
+  readonly bindingHash: string;
+  readonly nowIso: string;
+}
+
 export interface AppleSignInHandoffStore {
   insert(input: AppleSignInHandoffInsert): Promise<void>;
   readPending(input: {
@@ -47,6 +74,45 @@ export interface AppleSignInHandoffStore {
     readonly nowIso: string;
     readonly bindingHash: string;
   }): Promise<AppleDeliveredSignInHandoff | null>;
+  consume(input: SignInHandoffConsumeInput): Promise<SignInHandoffConsumedIdentity | null>;
+  hasExpired(input: { readonly nowIso: string }): Promise<boolean>;
+  discardPending(input: { readonly state: string; readonly nowIso: string }): Promise<void>;
+  discardClaimed(input: {
+    readonly state: string;
+    readonly claimId: string;
+    readonly nowIso: string;
+  }): Promise<void>;
+  purge(input: { readonly nowIso: string; readonly maximumRows: number }): Promise<number>;
+}
+
+export interface GoogleSignInHandoffStore {
+  insert(input: GoogleSignInHandoffInsert): Promise<void>;
+  readPending(input: {
+    readonly state: string;
+    readonly nowIso: string;
+    readonly bindingHash?: string;
+  }): Promise<GooglePendingSignInHandoff | null>;
+  claim(input: {
+    readonly state: string;
+    readonly claimId: string;
+    readonly nowIso: string;
+    readonly staleClaimBeforeIso: string;
+  }): Promise<GooglePendingSignInHandoff | null>;
+  complete(input: {
+    readonly state: string;
+    readonly claimId: string;
+    readonly identityLinkKey: string;
+    readonly proof: string;
+    readonly nowIso: string;
+    readonly deliveryExpiresAtIso: string;
+  }): Promise<boolean>;
+  deliver(input: {
+    readonly state: string;
+    readonly nowIso: string;
+    readonly bindingHash: string;
+  }): Promise<GoogleDeliveredSignInHandoff | null>;
+  consume(input: SignInHandoffConsumeInput): Promise<SignInHandoffConsumedIdentity | null>;
+  hasExpired(input: { readonly nowIso: string }): Promise<boolean>;
   discardPending(input: { readonly state: string; readonly nowIso: string }): Promise<void>;
   discardClaimed(input: {
     readonly state: string;
@@ -58,4 +124,5 @@ export interface AppleSignInHandoffStore {
 
 export interface IdentityHandoffBackend {
   readonly apple: AppleSignInHandoffStore;
+  readonly google: GoogleSignInHandoffStore;
 }

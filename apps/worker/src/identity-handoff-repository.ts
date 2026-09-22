@@ -1,5 +1,12 @@
 import { ApiError } from "./errors";
-import type { AppleSignInHandoffStore } from "./identity-handoff-backend";
+import type {
+  AppleSignInHandoffStore,
+  GoogleDeliveredSignInHandoff,
+  GooglePendingSignInHandoff,
+  GoogleSignInHandoffInsert,
+  GoogleSignInHandoffStore,
+  IdentityHandoffBackend,
+} from "./identity-handoff-backend";
 import { createD1IdentityHandoffBackend } from "./d1-identity-handoff-backend";
 
 /**
@@ -27,13 +34,44 @@ const PROOF_PATTERN = /^[A-Za-z0-9_-]{64}$/u;
 // on the initiating client; the raw verifier never reaches this table.
 const BINDING_HASH_PATTERN = /^[0-9a-f]{64}$/u;
 
-type AppleHandoffSource = D1Database | AppleSignInHandoffStore;
+type AppleHandoffSource = D1Database | AppleSignInHandoffStore | IdentityHandoffBackend;
+type GoogleHandoffSource = D1Database | GoogleSignInHandoffStore | IdentityHandoffBackend;
+export type IdentityHandoffSource = D1Database | IdentityHandoffBackend;
 
 function handoffStore(source: AppleHandoffSource): AppleSignInHandoffStore {
+  if (typeof (source as Partial<IdentityHandoffBackend>).apple?.readPending === "function") {
+    return (source as IdentityHandoffBackend).apple;
+  }
   if (typeof (source as Partial<AppleSignInHandoffStore>).readPending === "function") {
     return source as AppleSignInHandoffStore;
   }
   return createD1IdentityHandoffBackend(source as D1Database).apple;
+}
+
+function googleHandoffStore(source: GoogleHandoffSource): GoogleSignInHandoffStore {
+  if (typeof (source as Partial<IdentityHandoffBackend>).google?.readPending === "function") {
+    return (source as IdentityHandoffBackend).google;
+  }
+  if (typeof (source as Partial<GoogleSignInHandoffStore>).readPending === "function") {
+    return source as GoogleSignInHandoffStore;
+  }
+  return createD1IdentityHandoffBackend(source as D1Database).google;
+}
+
+function providerStore(
+  source: IdentityHandoffSource,
+  provider: "apple" | "google",
+): AppleSignInHandoffStore | GoogleSignInHandoffStore {
+  if (provider === "apple") {
+    if (typeof (source as Partial<IdentityHandoffBackend>).apple?.readPending === "function") {
+      return (source as IdentityHandoffBackend).apple;
+    }
+    return createD1IdentityHandoffBackend(source as D1Database).apple;
+  }
+  if (typeof (source as Partial<IdentityHandoffBackend>).google?.readPending === "function") {
+    return (source as IdentityHandoffBackend).google;
+  }
+  return createD1IdentityHandoffBackend(source as D1Database).google;
 }
 
 export interface AppleSignInHandoffInsert {
@@ -191,6 +229,28 @@ export async function deliverAppleSignInHandoff(
   return row;
 }
 
+export async function consumeAppleSignInHandoff(
+  db: AppleHandoffSource,
+  proof: string,
+  bindingHash: string,
+  nowIso: string,
+): Promise<{ linkKeyHex: string } | null> {
+  assertProof(proof);
+  assertBindingHash(bindingHash);
+  assertInstant(nowIso);
+  const row = await handoffStore(db).consume({ proof, bindingHash, nowIso });
+  if (!row || !LINK_KEY_PATTERN.test(row.linkKeyHex)) return null;
+  return row;
+}
+
+export async function hasExpiredAppleSignInHandoffs(
+  db: AppleHandoffSource,
+  nowIso: string,
+): Promise<boolean> {
+  assertInstant(nowIso);
+  return handoffStore(db).hasExpired({ nowIso });
+}
+
 /**
  * Deletes a live, still-empty, UNCLAIMED handoff after a provider cancellation
  * that arrives before any callback has claimed the row. The `claim_id IS NULL`
@@ -232,4 +292,152 @@ export async function deleteExpiredAppleSignInHandoffs(
     internalError();
   }
   return handoffStore(db).purge({ nowIso, maximumRows });
+}
+
+const VERIFIER_PATTERN = /^[A-Za-z0-9_-]{43,128}$/u;
+
+export async function insertGoogleSignInHandoff(
+  db: GoogleHandoffSource,
+  handoff: GoogleSignInHandoffInsert,
+): Promise<void> {
+  if (!VERIFIER_PATTERN.test(handoff.codeVerifier)) internalError();
+  assertBindingHash(handoff.bindingHash);
+  await googleHandoffStore(db).insert(handoff);
+}
+
+export async function readPendingGoogleSignInHandoff(
+  db: GoogleHandoffSource,
+  state: string,
+  nowIso: string,
+  bindingHash?: string,
+): Promise<GooglePendingSignInHandoff | null> {
+  const bindingProvided = bindingHash !== undefined;
+  if (bindingProvided) assertBindingHash(bindingHash);
+  assertInstant(nowIso);
+  const row = await googleHandoffStore(db).readPending({
+    state,
+    nowIso,
+    ...(bindingProvided ? { bindingHash } : {}),
+  });
+  if (!row || !VERIFIER_PATTERN.test(row.codeVerifier)) return null;
+  return row;
+}
+
+export async function claimPendingGoogleSignInHandoff(
+  db: GoogleHandoffSource,
+  state: string,
+  claimId: string,
+  nowIso: string,
+  staleClaimBeforeIso: string,
+): Promise<GooglePendingSignInHandoff | null> {
+  assertProof(claimId);
+  assertInstant(nowIso);
+  assertInstant(staleClaimBeforeIso);
+  const row = await googleHandoffStore(db).claim({
+    state, claimId, nowIso, staleClaimBeforeIso,
+  });
+  if (!row || !VERIFIER_PATTERN.test(row.codeVerifier)) return null;
+  return row;
+}
+
+export async function completeGoogleSignInHandoff(
+  db: GoogleHandoffSource,
+  state: string,
+  claimId: string,
+  identityLinkKey: string,
+  proof: string,
+  nowIso: string,
+  deliveryExpiresAtIso: string,
+): Promise<boolean> {
+  assertProof(claimId);
+  assertIdentityLinkKey(identityLinkKey);
+  assertProof(proof);
+  assertInstant(nowIso);
+  assertInstant(deliveryExpiresAtIso);
+  if (!(deliveryExpiresAtIso > nowIso)) internalError();
+  return googleHandoffStore(db).complete({
+    state, claimId, identityLinkKey, proof, nowIso, deliveryExpiresAtIso,
+  });
+}
+
+export async function deliverGoogleSignInHandoff(
+  db: GoogleHandoffSource,
+  state: string,
+  nowIso: string,
+  bindingHash: string,
+): Promise<GoogleDeliveredSignInHandoff | null> {
+  assertBindingHash(bindingHash);
+  assertInstant(nowIso);
+  const row = await googleHandoffStore(db).deliver({ state, nowIso, bindingHash });
+  if (!row || !PROOF_PATTERN.test(row.proof)) return null;
+  return row;
+}
+
+export async function consumeGoogleSignInHandoff(
+  db: GoogleHandoffSource,
+  proof: string,
+  bindingHash: string,
+  nowIso: string,
+): Promise<{ linkKeyHex: string } | null> {
+  assertProof(proof);
+  assertBindingHash(bindingHash);
+  assertInstant(nowIso);
+  const row = await googleHandoffStore(db).consume({ proof, bindingHash, nowIso });
+  if (!row || !LINK_KEY_PATTERN.test(row.linkKeyHex)) return null;
+  return row;
+}
+
+export async function hasExpiredGoogleSignInHandoffs(
+  db: GoogleHandoffSource,
+  nowIso: string,
+): Promise<boolean> {
+  assertInstant(nowIso);
+  return googleHandoffStore(db).hasExpired({ nowIso });
+}
+
+export async function discardPendingGoogleSignInHandoff(
+  db: GoogleHandoffSource,
+  state: string,
+  nowIso: string,
+): Promise<void> {
+  assertInstant(nowIso);
+  await googleHandoffStore(db).discardPending({ state, nowIso });
+}
+
+export async function discardClaimedGoogleSignInHandoff(
+  db: GoogleHandoffSource,
+  state: string,
+  claimId: string,
+  nowIso: string,
+): Promise<void> {
+  assertProof(claimId);
+  assertInstant(nowIso);
+  await googleHandoffStore(db).discardClaimed({ state, claimId, nowIso });
+}
+
+export async function deleteExpiredGoogleSignInHandoffs(
+  db: GoogleHandoffSource,
+  nowIso: string,
+  maximumRows = 100,
+): Promise<number> {
+  if (!Number.isInteger(maximumRows) || maximumRows < 1 || maximumRows > 1000) {
+    internalError();
+  }
+  assertInstant(nowIso);
+  return googleHandoffStore(db).purge({ nowIso, maximumRows });
+}
+
+export async function consumeHostedSignInHandoff(
+  db: IdentityHandoffSource,
+  provider: "apple" | "google",
+  proof: string,
+  bindingHash: string,
+  nowIso: string,
+): Promise<{ linkKeyHex: string } | null> {
+  assertProof(proof);
+  assertBindingHash(bindingHash);
+  assertInstant(nowIso);
+  const row = await providerStore(db, provider).consume({ proof, bindingHash, nowIso });
+  if (!row || !LINK_KEY_PATTERN.test(row.linkKeyHex)) return null;
+  return row;
 }

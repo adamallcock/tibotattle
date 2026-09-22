@@ -210,12 +210,24 @@ import { parseTelemetryStorageMode, resolveTelemetryStorageMode, readTelemetryV1
 import {
   claimPendingAppleSignInHandoff,
   completeAppleSignInHandoff,
+  completeGoogleSignInHandoff,
+  consumeHostedSignInHandoff,
+  deleteExpiredGoogleSignInHandoffs,
   deleteExpiredAppleSignInHandoffs,
   deliverAppleSignInHandoff,
+  deliverGoogleSignInHandoff,
   discardClaimedAppleSignInHandoff,
+  discardClaimedGoogleSignInHandoff,
   discardPendingAppleSignInHandoff,
+  discardPendingGoogleSignInHandoff,
+  claimPendingGoogleSignInHandoff,
+  hasExpiredAppleSignInHandoffs,
+  hasExpiredGoogleSignInHandoffs,
   insertAppleSignInHandoff,
+  insertGoogleSignInHandoff,
+  readPendingGoogleSignInHandoff,
   readPendingAppleSignInHandoff,
+  type IdentityHandoffSource,
 } from "./identity-handoff-repository";
 import {
   clearPendingQuarantineObject,
@@ -831,7 +843,10 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
     );
   }
   const verifiedIdentity = identityProvided
-    ? await consumeHostedIdentityProof(env.USAGE_MONITOR_DB, identityValue)
+    ? await consumeHostedIdentityProof(
+      readWorkerBackend(env)?.identity ?? env.USAGE_MONITOR_DB,
+      identityValue,
+    )
     : null;
   const identityCooldownDigest = verifiedIdentity !== null
     ? await assertIdentityReenrollmentAllowed(
@@ -1057,28 +1072,23 @@ function hostedIdentityProof(value: unknown): {
 }
 
 async function consumeHostedIdentityProof(
-  db: D1Database,
+  db: IdentityHandoffSource,
   identity: unknown,
 ): Promise<{ provider: "apple" | "google"; linkKeyHex: string }> {
   const { provider, proof, verifier } = hostedIdentityProof(identity);
-  const table = provider === "apple"
-    ? "apple_signin_handoffs"
-    : "google_signin_handoffs";
   const nowIso = new Date().toISOString();
   // Consumption carries the initiator binding through to the sink: the delivered
   // proof is a bearer credential, so a leaked proof alone cannot reattach a
   // participant — the same verifier that collected it must be re-presented here.
   const bindingHash = await sha256Hex(verifier);
-  const claimed = await db.prepare(
-    `DELETE FROM ${table}
-      WHERE proof = ?
-        AND binding_hash = ?
-        AND identity_link_key IS NOT NULL
-        AND delivered_at IS NOT NULL
-        AND expires_at > ?
-      RETURNING identity_link_key AS linkKeyHex`,
-  ).bind(proof, bindingHash, nowIso).first<{ linkKeyHex: string }>();
-  if (!claimed || !/^[0-9a-f]{64}$/u.test(claimed.linkKeyHex)) {
+  const claimed = await consumeHostedSignInHandoff(
+    db,
+    provider,
+    proof,
+    bindingHash,
+    nowIso,
+  );
+  if (!claimed) {
     throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
   }
   return { provider, linkKeyHex: claimed.linkKeyHex };
@@ -1165,13 +1175,17 @@ async function verifiedHostedCallbackIdentity(
 
 const MAX_EXPIRED_SIGNIN_HANDOFFS_PER_PROVIDER = 100;
 
+function identityHandoffSource(env: Env): IdentityHandoffSource {
+  return readWorkerBackend(env)?.identity ?? env.USAGE_MONITOR_DB;
+}
+
 interface ExpiredIdentityHandoffPurge {
   purged: number;
   complete: boolean;
 }
 
 async function deleteExpiredAppleHandoffs(
-  db: D1Database,
+  db: IdentityHandoffSource,
   nowIso: string,
   maximumRows = MAX_EXPIRED_SIGNIN_HANDOFFS_PER_PROVIDER,
 ): Promise<number> {
@@ -1179,20 +1193,11 @@ async function deleteExpiredAppleHandoffs(
 }
 
 async function deleteExpiredGoogleHandoffs(
-  db: D1Database,
+  db: IdentityHandoffSource,
   nowIso: string,
   maximumRows = MAX_EXPIRED_SIGNIN_HANDOFFS_PER_PROVIDER,
 ): Promise<number> {
-  const result = await db.prepare(
-    `DELETE FROM google_signin_handoffs
-      WHERE state IN (
-        SELECT state FROM google_signin_handoffs
-         WHERE expires_at <= ?
-         ORDER BY expires_at, state
-         LIMIT ?
-      )`,
-  ).bind(nowIso, maximumRows).run();
-  return result.meta.changes;
+  return deleteExpiredGoogleSignInHandoffs(db, nowIso, maximumRows);
 }
 
 /**
@@ -1203,7 +1208,7 @@ async function deleteExpiredGoogleHandoffs(
  * late cancellation can never undo a completed or delivered sign-in.
  */
 async function discardPendingAppleHandoff(
-  db: D1Database,
+  db: IdentityHandoffSource,
   state: string,
   nowIso: string,
 ): Promise<void> {
@@ -1218,19 +1223,11 @@ async function discardPendingAppleHandoff(
  * `discardClaimedGoogleHandoff`.
  */
 async function discardPendingGoogleHandoff(
-  db: D1Database,
+  db: IdentityHandoffSource,
   state: string,
   nowIso: string,
 ): Promise<void> {
-  await db.prepare(
-    `DELETE FROM google_signin_handoffs
-      WHERE state = ?
-        AND claim_id IS NULL
-        AND identity_link_key IS NULL
-        AND proof IS NULL
-        AND delivered_at IS NULL
-        AND expires_at > ?`,
-  ).bind(state, nowIso).run();
+  await discardPendingGoogleSignInHandoff(db, state, nowIso);
 }
 
 /**
@@ -1239,36 +1236,24 @@ async function discardPendingGoogleHandoff(
  * claim to a lease-expiry re-claim deletes nothing.
  */
 async function discardClaimedGoogleHandoff(
-  db: D1Database,
+  db: IdentityHandoffSource,
   state: string,
   claimId: string,
   nowIso: string,
 ): Promise<void> {
-  await db.prepare(
-    `DELETE FROM google_signin_handoffs
-      WHERE state = ?
-        AND claim_id = ?
-        AND identity_link_key IS NULL
-        AND proof IS NULL
-        AND delivered_at IS NULL
-        AND expires_at > ?`,
-  ).bind(state, claimId, nowIso).run();
+  await discardClaimedGoogleSignInHandoff(db, state, claimId, nowIso);
 }
 
-async function hasExpiredAppleHandoffs(db: D1Database, nowIso: string): Promise<boolean> {
-  return Boolean(await db.prepare(
-    "SELECT 1 AS found FROM apple_signin_handoffs WHERE expires_at <= ? LIMIT 1",
-  ).bind(nowIso).first<{ found: number }>());
+async function hasExpiredAppleHandoffs(db: IdentityHandoffSource, nowIso: string): Promise<boolean> {
+  return hasExpiredAppleSignInHandoffs(db, nowIso);
 }
 
-async function hasExpiredGoogleHandoffs(db: D1Database, nowIso: string): Promise<boolean> {
-  return Boolean(await db.prepare(
-    "SELECT 1 AS found FROM google_signin_handoffs WHERE expires_at <= ? LIMIT 1",
-  ).bind(nowIso).first<{ found: number }>());
+async function hasExpiredGoogleHandoffs(db: IdentityHandoffSource, nowIso: string): Promise<boolean> {
+  return hasExpiredGoogleSignInHandoffs(db, nowIso);
 }
 
 async function purgeExpiredIdentityHandoffs(
-  db: D1Database,
+  db: IdentityHandoffSource,
   nowIso: string,
 ): Promise<ExpiredIdentityHandoffPurge> {
   const [applePurged, googlePurged] = await Promise.all([
@@ -1393,12 +1378,12 @@ async function handleIdentityAppleStart(
   await assertSignInStartAdmission(env.USAGE_MONITOR_DB, env);
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
-  await deleteExpiredAppleHandoffs(env.USAGE_MONITOR_DB, nowIso);
+  await deleteExpiredAppleHandoffs(identityHandoffSource(env), nowIso);
   // 48 random bytes render as 64 base64url characters.
   const state = randomSecret(48);
   const nonce = generateAppleSignInNonce();
   const nonceHash = await hashAppleSignInNonce(nonce);
-  await insertAppleSignInHandoff(env.USAGE_MONITOR_DB, {
+  await insertAppleSignInHandoff(identityHandoffSource(env), {
     state,
     nonceHash,
     bindingHash: binding,
@@ -1439,7 +1424,7 @@ async function handleIdentityAppleCallback(
   }
   const nowIso = new Date().toISOString();
   if (form.get("error") !== null) {
-    await discardPendingAppleHandoff(env.USAGE_MONITOR_DB, state, nowIso);
+    await discardPendingAppleHandoff(identityHandoffSource(env), state, nowIso);
     return failure;
   }
   if (typeof code !== "string" || code.length === 0) return failure;
@@ -1448,7 +1433,7 @@ async function handleIdentityAppleCallback(
   // the rest see no change here and stop, so provider work cannot fan out.
   const claimId = randomSecret(48);
   const pending = await claimPendingAppleSignInHandoff(
-    env.USAGE_MONITOR_DB,
+    identityHandoffSource(env),
     state,
     claimId,
     nowIso,
@@ -1479,7 +1464,7 @@ async function handleIdentityAppleCallback(
     // was preempted by a lease-expiry re-claim can never delete the new
     // claimant's row.
     await discardClaimedAppleSignInHandoff(
-      env.USAGE_MONITOR_DB,
+      identityHandoffSource(env),
       state,
       claimId,
       new Date().toISOString(),
@@ -1494,7 +1479,7 @@ async function handleIdentityAppleCallback(
   // round trip took.
   const filledAtMs = Date.now();
   const stored = await completeAppleSignInHandoff(
-    env.USAGE_MONITOR_DB,
+    identityHandoffSource(env),
     state,
     claimId,
     verified.linkKeyHex,
@@ -1540,9 +1525,9 @@ async function handleIdentityAppleResult(
   }
   const bindingHash = await sha256Hex(verifier);
   const nowIso = new Date().toISOString();
-  await deleteExpiredAppleHandoffs(env.USAGE_MONITOR_DB, nowIso);
+  await deleteExpiredAppleHandoffs(identityHandoffSource(env), nowIso);
   const delivered = await deliverAppleSignInHandoff(
-    env.USAGE_MONITOR_DB,
+    identityHandoffSource(env),
     state,
     nowIso,
     bindingHash,
@@ -1554,7 +1539,7 @@ async function handleIdentityAppleResult(
     });
   }
   const pending = await readPendingAppleSignInHandoff(
-    env.USAGE_MONITOR_DB,
+    identityHandoffSource(env),
     state,
     nowIso,
     bindingHash,
@@ -1605,24 +1590,20 @@ async function handleIdentityGoogleStart(
   await assertSignInStartAdmission(env.USAGE_MONITOR_DB, env);
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
-  await deleteExpiredGoogleHandoffs(env.USAGE_MONITOR_DB, nowIso);
+  await deleteExpiredGoogleHandoffs(identityHandoffSource(env), nowIso);
   // 48 random bytes render as 64 base64url characters, which satisfies both
   // the state pattern and RFC 7636's 43-128 character verifier range.
   const state = randomSecret(48);
   const codeVerifier = randomSecret(48);
-  await env.USAGE_MONITOR_DB.prepare(
-    `INSERT INTO google_signin_handoffs
-       (state, code_verifier, binding_hash, identity_link_key, proof, created_at, expires_at, delivered_at)
-       VALUES (?, ?, ?, NULL, NULL, ?, ?, NULL)`,
-  ).bind(
+  await insertGoogleSignInHandoff(identityHandoffSource(env), {
     state,
     codeVerifier,
-    binding,
-    nowIso,
-    new Date(
+    bindingHash: binding,
+    createdAt: nowIso,
+    expiresAt: new Date(
       nowMs + SIGNIN_HANDOFF_AUTHORIZATION_TTL_MILLISECONDS,
     ).toISOString(),
-  ).run();
+  });
   return jsonResponse({
     schemaVersion: "identity-google-start-v0.1",
     state,
@@ -1662,7 +1643,7 @@ async function handleIdentityGoogleCallback(
   }
   const nowIso = new Date().toISOString();
   if (parameters.get("error") !== null) {
-    await discardPendingGoogleHandoff(env.USAGE_MONITOR_DB, state, nowIso);
+    await discardPendingGoogleHandoff(identityHandoffSource(env), state, nowIso);
     return failure;
   }
   if (typeof code !== "string" || code.length === 0) return failure;
@@ -1675,18 +1656,13 @@ async function handleIdentityGoogleCallback(
   const staleClaimBeforeIso = new Date(
     Date.now() - SIGNIN_HANDOFF_PROCESSING_LEASE_MILLISECONDS,
   ).toISOString();
-  const pending = await env.USAGE_MONITOR_DB.prepare(
-    `UPDATE google_signin_handoffs
-        SET claim_id = ?, claimed_at = ?
-      WHERE state = ?
-        AND identity_link_key IS NULL
-        AND proof IS NULL
-        AND delivered_at IS NULL
-        AND expires_at > ?
-        AND (claim_id IS NULL OR claimed_at <= ?)
-      RETURNING code_verifier AS codeVerifier`,
-  ).bind(claimId, nowIso, state, nowIso, staleClaimBeforeIso)
-    .first<{ codeVerifier: string }>();
+  const pending = await claimPendingGoogleSignInHandoff(
+    identityHandoffSource(env),
+    state,
+    claimId,
+    nowIso,
+    staleClaimBeforeIso,
+  );
   if (!pending) return failure;
   let verified: { provider: "apple" | "google"; linkKeyHex: string };
   try {
@@ -1710,7 +1686,7 @@ async function handleIdentityGoogleCallback(
     // discard is fenced to this callback's own claim, so a preempted callback
     // can never delete the row the new claimant is processing.
     await discardClaimedGoogleHandoff(
-      env.USAGE_MONITOR_DB,
+      identityHandoffSource(env),
       state,
       claimId,
       new Date().toISOString(),
@@ -1727,24 +1703,16 @@ async function handleIdentityGoogleCallback(
   const filledAtMs = Date.now();
   // Completion is fenced to this claim: a callback whose claim was preempted by
   // a lease-expiry re-claim writes zero rows and reports failure.
-  const stored = await env.USAGE_MONITOR_DB.prepare(
-    `UPDATE google_signin_handoffs
-        SET code_verifier = NULL, identity_link_key = ?, proof = ?, expires_at = ?
-      WHERE state = ?
-        AND claim_id = ?
-        AND identity_link_key IS NULL
-        AND proof IS NULL
-        AND delivered_at IS NULL
-        AND expires_at > ?`,
-  ).bind(
-    verified.linkKeyHex,
-    randomSecret(48),
-    new Date(filledAtMs + SIGNIN_HANDOFF_DELIVERY_TTL_MILLISECONDS).toISOString(),
+  const stored = await completeGoogleSignInHandoff(
+    identityHandoffSource(env),
     state,
     claimId,
+    verified.linkKeyHex,
+    randomSecret(48),
     new Date(filledAtMs).toISOString(),
-  ).run();
-  if (stored.meta.changes !== 1) return failure;
+    new Date(filledAtMs + SIGNIN_HANDOFF_DELIVERY_TTL_MILLISECONDS).toISOString(),
+  );
+  if (!stored) return failure;
   return signInCallbackPage(SIGNIN_COMPLETED_MESSAGE, { completed: true });
 }
 
@@ -1778,20 +1746,16 @@ async function handleIdentityGoogleResult(
   }
   const bindingHash = await sha256Hex(verifier);
   const nowIso = new Date().toISOString();
-  await deleteExpiredGoogleHandoffs(env.USAGE_MONITOR_DB, nowIso);
+  await deleteExpiredGoogleHandoffs(identityHandoffSource(env), nowIso);
   // The proof is released only to a caller re-presenting the initiator's
   // verifier: a mismatched or absent binding updates zero rows, so the proof is
   // neither delivered nor consumed and stays collectable by the initiator.
-  const delivered = await env.USAGE_MONITOR_DB.prepare(
-    `UPDATE google_signin_handoffs
-        SET delivered_at = COALESCE(delivered_at, ?)
-      WHERE state = ?
-        AND binding_hash = ?
-        AND identity_link_key IS NOT NULL
-        AND proof IS NOT NULL
-        AND expires_at > ?
-      RETURNING proof`,
-  ).bind(nowIso, state, bindingHash, nowIso).first<{ proof: string }>();
+  const delivered = await deliverGoogleSignInHandoff(
+    identityHandoffSource(env),
+    state,
+    nowIso,
+    bindingHash,
+  );
   if (delivered) {
     return jsonResponse({
       schemaVersion: "identity-google-result-v0.1",
@@ -1800,15 +1764,12 @@ async function handleIdentityGoogleResult(
   }
   // A caller holding the state but not the verifier cannot even learn that a
   // sign-in is pending: the binding is required here too.
-  const pending = await env.USAGE_MONITOR_DB.prepare(
-    `SELECT state FROM google_signin_handoffs
-      WHERE state = ?
-        AND binding_hash = ?
-        AND identity_link_key IS NULL
-        AND proof IS NULL
-        AND delivered_at IS NULL
-        AND expires_at > ?`,
-  ).bind(state, bindingHash, nowIso).first<{ state: string }>();
+  const pending = await readPendingGoogleSignInHandoff(
+    identityHandoffSource(env),
+    state,
+    nowIso,
+    bindingHash,
+  );
   if (pending) throw new ApiError(404, "IDENTITY_RESULT_PENDING");
   throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
 }
@@ -4507,7 +4468,7 @@ export async function runScheduledMaintenance(
     // Catching a memory/time failure after the fact cannot protect work that
     // never got a chance to execute.
     const handoffPurge = await purgeExpiredIdentityHandoffs(
-      env.USAGE_MONITOR_DB,
+      identityHandoffSource(env),
       // A delayed Cron invocation must still clear handoffs that have expired
       // by the time the Worker actually runs; snapshot construction continues
       // to use the scheduled timestamp for deterministic reporting periods.

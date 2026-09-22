@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import pg from "pg";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 
@@ -8,6 +8,14 @@ import worker from "../src/index.ts";
 import { createPostgresWorkerBackend } from "../src/backend-composition.ts";
 import { deviceHash } from "../src/device-auth.ts";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import {
+  claimPendingGoogleSignInHandoff,
+  completeGoogleSignInHandoff,
+  consumeGoogleSignInHandoff,
+  deliverGoogleSignInHandoff,
+  insertGoogleSignInHandoff,
+  readPendingGoogleSignInHandoff,
+} from "../src/identity-handoff-repository.ts";
 import {
   createSessionMaterialFromSecret,
   sessionCookie,
@@ -233,6 +241,67 @@ describe("PostgreSQL-backed Worker route composition", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ loggedOut: true });
     expect((await backend.authority.sessions.read(sessionId))?.state).toBe("revoked");
+    expect(d1Touches).toBe(0);
+  });
+
+  it("runs the Google handoff claim, delivery, and one-use consume through PostgreSQL", async () => {
+    const verifier = randomBytes(48).toString("base64url");
+    const bindingHash = createHash("sha256").update(verifier).digest("hex");
+    const state = randomBytes(48).toString("base64url");
+    const claimId = randomBytes(48).toString("base64url");
+    const proof = randomBytes(48).toString("base64url");
+    const nowIso = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const deliveryExpiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    const identityLinkKey = "ab".repeat(32);
+
+    await insertGoogleSignInHandoff(backend.identity, {
+      state,
+      codeVerifier: verifier,
+      bindingHash,
+      createdAt: nowIso,
+      expiresAt,
+    });
+    expect(await readPendingGoogleSignInHandoff(
+      backend.identity,
+      state,
+      nowIso,
+      bindingHash,
+    )).toEqual({ state, codeVerifier: verifier });
+    expect(await claimPendingGoogleSignInHandoff(
+      backend.identity,
+      state,
+      claimId,
+      nowIso,
+      new Date(Date.now() - 60_000).toISOString(),
+    )).toEqual({ state, codeVerifier: verifier });
+    expect(await completeGoogleSignInHandoff(
+      backend.identity,
+      state,
+      claimId,
+      identityLinkKey,
+      proof,
+      nowIso,
+      deliveryExpiresAt,
+    )).toBe(true);
+    expect(await deliverGoogleSignInHandoff(
+      backend.identity,
+      state,
+      nowIso,
+      bindingHash,
+    )).toEqual({ proof });
+    expect(await consumeGoogleSignInHandoff(
+      backend.identity,
+      proof,
+      bindingHash,
+      nowIso,
+    )).toEqual({ linkKeyHex: identityLinkKey });
+    expect(await consumeGoogleSignInHandoff(
+      backend.identity,
+      proof,
+      bindingHash,
+      nowIso,
+    )).toBeNull();
     expect(d1Touches).toBe(0);
   });
 });
