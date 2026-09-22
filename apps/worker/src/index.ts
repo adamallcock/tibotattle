@@ -1,5 +1,6 @@
 import { createD1TelemetryV1Backend } from "./d1-telemetry-v1-backend";
 import type { TelemetryV1Backend } from "./telemetry-v1-backend";
+import { readWorkerBackend } from "./backend-composition";
 import type { TelemetryV1ContributionStore } from "./telemetry-v1-contribution-store";
 import type {
   StoredTelemetryV1Chunk,
@@ -230,6 +231,7 @@ import {
   hasIdentityReenrollmentCooldownDigest,
   hasDeletionTombstone,
   identityReenrollmentCooldownDigest,
+  participantDeletionDigest,
   purgeExpiredDeletionTombstones,
   purgeExpiredIdentityReenrollmentCooldowns,
   purgeExpiredPrimaryIdentityReenrollmentCooldowns,
@@ -296,6 +298,8 @@ function quarantineObjectStore(env: Env): QuarantineObjectStore {
 
 /** Explicit v1 provider composition; authorization remains at the route boundary. */
 function telemetryV1Backend(env: Env): TelemetryV1Backend {
+  const backend = readWorkerBackend(env);
+  if (backend !== null) return backend.telemetryV1;
   return createD1TelemetryV1Backend(env.USAGE_MONITOR_DB);
 }
 
@@ -1826,16 +1830,31 @@ async function personalSession(
   allowDeletionOnly = false,
 ): Promise<SessionPrincipal> {
   if (request.headers.has("authorization")) throw new ApiError(401, "AUTH_INVALID");
+  const backend = readWorkerBackend(env);
   const session = await authenticateSession(
-    env.USAGE_MONITOR_DB,
+    backend?.authority ?? env.USAGE_MONITOR_DB,
     request.headers.get("cookie"),
     { allowDeleting, allowDeletionOnly },
   );
   if (!allowDeleting
-      && await hasDeletionTombstone(env.DELETION_LEDGER, session.participantId)) {
+      && await hasDeletionTombstoneForParticipant(env, session.participantId)) {
     throw new ApiError(401, "AUTH_INVALID");
   }
   return session;
+}
+
+async function hasDeletionTombstoneForParticipant(
+  env: Env,
+  participantId: string,
+): Promise<boolean> {
+  const backend = readWorkerBackend(env);
+  if (backend !== null) {
+    return backend.storage.lifecycle.hasDeletionTombstone({
+      participantDigest: await participantDeletionDigest(participantId),
+      now: new Date().toISOString(),
+    });
+  }
+  return hasDeletionTombstone(env.DELETION_LEDGER, participantId);
 }
 
 async function handleSession(request: Request, env: Env): Promise<Response> {
@@ -1864,7 +1883,16 @@ async function handleLogout(request: Request, env: Env): Promise<Response> {
     );
   }
   assertCsrf(request, session);
-  await revokeSession(env.USAGE_MONITOR_DB, session.participantId, session.sessionId);
+  const backend = readWorkerBackend(env);
+  if (backend !== null) {
+    const revoked = await backend.authority.sessions.revoke(
+      session.sessionId,
+      new Date().toISOString(),
+    );
+    if (!revoked) throw new ApiError(401, "AUTH_INVALID");
+  } else {
+    await revokeSession(env.USAGE_MONITOR_DB, session.participantId, session.sessionId);
+  }
   return jsonResponse(
     { loggedOut: true },
     200,
@@ -2774,11 +2802,12 @@ async function deviceSyncPrincipal(
   if (request.headers.has("cookie")) {
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
+  const backend = readWorkerBackend(env);
   const device = await authenticateDevice(
-    env.USAGE_MONITOR_DB,
+    backend?.authority ?? env.USAGE_MONITOR_DB,
     request.headers.get("authorization"),
   );
-  if (await hasDeletionTombstone(env.DELETION_LEDGER, device.participantId)) {
+  if (await hasDeletionTombstoneForParticipant(env, device.participantId)) {
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
   return device;
@@ -2812,6 +2841,18 @@ async function handleDeviceSyncCapabilities(request: Request, env: Env): Promise
   const destinationOrigin = identityRequired(env) ? Reflect.get(env, "PUBLIC_ORIGIN") : requestOrigin;
   if (typeof destinationOrigin !== "string" || destinationOrigin !== requestOrigin) {
     throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
+  }
+  const backend = readWorkerBackend(env);
+  if (backend !== null) {
+    return jsonResponse(await backend.authority.transport.capabilities({
+      principal: {
+        participantId: device.participantId,
+        deviceId: device.deviceId,
+      },
+      destinationOrigin,
+      now: new Date().toISOString(),
+      schemaVersion: "telemetry-contribution-v1.2",
+    }));
   }
   return jsonResponse(await telemetryTransportCapabilities(env.USAGE_MONITOR_DB, device, destinationOrigin));
 }
@@ -3898,6 +3939,10 @@ export async function handleRequest(
     ));
   }
   try {
+    // Validate an explicitly supplied host backend before redirects, route
+    // handlers, or diagnostic writes. An absent extension keeps the deployed
+    // D1 composition; a partial extension is a closed configuration error.
+    readWorkerBackend(env);
     const canonicalRedirectUrl = canonicalPublicRedirectUrl(url, env);
     if (canonicalRedirectUrl !== null) {
       return Response.redirect(canonicalRedirectUrl, 308);
@@ -4102,6 +4147,9 @@ export async function handleRequest(
     const apiError = error instanceof ApiError
       ? error
       : new ApiError(500, "INTERNAL_ERROR");
+    if (apiError.code === "POSTGRES_BACKEND_INVALID") {
+      return noStore(errorResponse(apiError, requestId));
+    }
     if (apiError.code === "IDENTITY_RESULT_PENDING") {
       // The desktop polls this route while the provider is still open. A 404
       // here is flow control, not a support incident: keep one structured

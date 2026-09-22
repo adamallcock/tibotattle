@@ -1086,7 +1086,7 @@ async function credentialReuseDetected(
 }
 
 export async function authenticateDevice(
-  db: D1Database,
+  db: DeviceSource,
   authorizationHeader: string | null,
   options: DeviceLifecycleOptions = {},
 ): Promise<DevicePrincipal> {
@@ -1094,7 +1094,71 @@ export async function authenticateDevice(
   const nowEpoch = options.nowEpoch ?? Date.now();
   const now = epochIso(nowEpoch);
   const parsed = parseDeviceAuthorization(authorizationHeader);
-  const row = await db.prepare(
+  const backend = authorityBackend(db);
+  if (backend) {
+    const row = await backend.devices.readDevice(parsed.id);
+    const presentedHash = await deviceHash(parsed.id, parsed.secret);
+    if (!row || !timingSafeEqual(presentedHash, row.secretHash)
+        || row.state !== "active"
+        || row.participantState !== "active"
+        || !futureInstant(row.expiresAt, nowEpoch)) {
+      throw new ApiError(401, "DEVICE_AUTH_INVALID");
+    }
+    if (row.authorityKind === "accountless") {
+      if (row.ownerKind !== "accountless"
+          || row.accountlessEnrollmentDeviceId !== row.id
+          || row.accountlessLedgerState !== "active"
+          || row.accountlessOwnerState !== "active"
+          || row.accountlessAuthorizationState !== "active"
+          || row.accountlessLedgerExpiresAt !== row.expiresAt
+          || row.accountlessOwnerExpiresAt !== row.expiresAt
+          || row.accountlessAuthorizationExpiresAt !== row.expiresAt) {
+        throw new ApiError(401, "DEVICE_AUTH_INVALID");
+      }
+      return {
+        deviceId: row.id,
+        participantId: row.participantId,
+        participantConsentVersion: null,
+        expiresAt: row.expiresAt,
+        credentialGeneration: row.credentialGeneration,
+        socialVerifiedAt: null,
+        authorityKind: "accountless",
+      };
+    }
+    const socialVerifiedAt = row.socialVerifiedAt ?? row.issuedAt;
+    if (row.ownerKind !== "social"
+        || row.participantConsentVersion === null
+        || ongoingConsentForParticipant(row.participantConsentVersion) === null
+        || !recentInstant(row.lastUsedAt, nowEpoch, policy.idleMilliseconds)
+        || !recentInstant(socialVerifiedAt, nowEpoch, policy.socialRecheckMaxAgeMilliseconds)) {
+      throw new ApiError(401, "DEVICE_AUTH_INVALID");
+    }
+    const socialRecheckDeadline = Date.parse(socialVerifiedAt)
+      + policy.socialRecheckMaxAgeMilliseconds;
+    const renewedExpiry = epochIso(Math.min(
+      nowEpoch + DEVICE_CREDENTIAL_TTL_MILLISECONDS,
+      socialRecheckDeadline,
+    ));
+    if (!futureInstant(renewedExpiry, nowEpoch)
+        || !await backend.devices.touchDevice({
+          deviceId: row.id,
+          now,
+          expiresAt: renewedExpiry,
+        })) {
+      throw new ApiError(401, "DEVICE_AUTH_INVALID");
+    }
+    return {
+      deviceId: row.id,
+      participantId: row.participantId,
+      participantConsentVersion: row.participantConsentVersion,
+      expiresAt: renewedExpiry,
+      credentialGeneration: row.credentialGeneration,
+      socialVerifiedAt,
+      authorityKind: "social",
+    };
+  }
+  const d1 = db as D1Database;
+  const row = await d1.prepare(
     `SELECT device.*, participant.state AS participant_state,
             participant.consent_version AS participant_consent_version,
             participant.owner_kind AS participant_owner_kind,
@@ -1127,7 +1191,7 @@ export async function authenticateDevice(
     // A previous secret is a signal that a rotated credential was reused.
     // Revoke the current device lineage before returning the same neutral
     // auth failure used for every other invalid bearer.
-    await credentialReuseDetected(db, row.id, presentedHash);
+    await credentialReuseDetected(d1, row.id, presentedHash);
   }
   if (row?.authority_kind === "accountless") {
     if (!currentSecretMatches
@@ -1145,7 +1209,7 @@ export async function authenticateDevice(
         || !futureInstant(row.expires_at, nowEpoch)) {
       throw new ApiError(401, "DEVICE_AUTH_INVALID");
     }
-    const used = await db.prepare(
+    const used = await d1.prepare(
       `UPDATE device_credentials
           SET last_used_at = ?
         WHERE id = ? AND state = 'active' AND authority_kind = 'accountless'
@@ -1216,7 +1280,7 @@ export async function authenticateDevice(
   if (!futureInstant(renewedExpiry, nowEpoch)) {
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
-  const used = await db.prepare(
+  const used = await d1.prepare(
     `UPDATE device_credentials
         SET last_used_at = ?, expires_at = ?
       WHERE id = ? AND state = 'active' AND expires_at > ?
