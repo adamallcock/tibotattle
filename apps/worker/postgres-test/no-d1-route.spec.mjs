@@ -320,7 +320,8 @@ describe("PostgreSQL-backed Worker route composition", () => {
       const proof = randomBytes(48).toString("base64url");
       const nowIso = new Date().toISOString();
       const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-      const deliveryExpiresAt = new Date(Date.now() + 250).toISOString();
+      const deliveryExpiresAtMs = Date.now() + 1_500;
+      const deliveryExpiresAt = new Date(deliveryExpiresAtMs).toISOString();
       const identityLinkKey = "cd".repeat(32);
       const nonceHash = createHash("sha256").update(randomBytes(32)).digest("hex");
 
@@ -359,7 +360,7 @@ describe("PostgreSQL-backed Worker route composition", () => {
         nowIso,
         bindingHash,
       )).toEqual({ proof });
-      return { bindingHash, proof };
+      return { bindingHash, proof, deliveryExpiresAtMs };
     }
 
     async function createDeliveredGoogleHandoff() {
@@ -370,7 +371,8 @@ describe("PostgreSQL-backed Worker route composition", () => {
       const proof = randomBytes(48).toString("base64url");
       const nowIso = new Date().toISOString();
       const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-      const deliveryExpiresAt = new Date(Date.now() + 250).toISOString();
+      const deliveryExpiresAtMs = Date.now() + 1_500;
+      const deliveryExpiresAt = new Date(deliveryExpiresAtMs).toISOString();
       const identityLinkKey = "ef".repeat(32);
 
       await insertGoogleSignInHandoff(backend.identity, {
@@ -408,10 +410,16 @@ describe("PostgreSQL-backed Worker route composition", () => {
         nowIso,
         bindingHash,
       )).toEqual({ proof });
-      return { bindingHash, proof };
+      return { bindingHash, proof, deliveryExpiresAtMs };
     }
 
-    async function expectExpiredAfterLock(tableName, proof, bindingHash, consume) {
+    async function expectExpiredAfterLock(
+      tableName,
+      proof,
+      bindingHash,
+      deliveryExpiresAtMs,
+      consume,
+    ) {
       const locker = await primary.connect();
       try {
         await locker.query("BEGIN");
@@ -421,9 +429,29 @@ describe("PostgreSQL-backed Worker route composition", () => {
         );
         expect(locked.rowCount).toBe(1);
         const consuming = consume(proof, bindingHash, new Date().toISOString());
-        // Keep the row locked beyond the short delivery deadline. The consume
+        // Prove the consume transaction reached the row lock while its
+        // delivery deadline was still live. A fixed sleep alone could pass if
+        // a broken implementation did not start until after expiry.
+        const queryPattern = `%FROM "${primarySchema}"."${tableName}"%`;
+        let waitingForRowLock = false;
+        const pollUntil = deliveryExpiresAtMs - 100;
+        while (Date.now() < pollUntil) {
+          const activity = await locker.query(`SELECT wait_event_type, state
+            FROM pg_stat_activity
+            WHERE datname = current_database() AND pid <> pg_backend_pid()
+              AND wait_event_type = 'Lock' AND state = 'active'
+              AND query LIKE $1`, [queryPattern]);
+          if (activity.rowCount === 1) {
+            waitingForRowLock = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(waitingForRowLock).toBe(true);
+        expect(Date.now()).toBeLessThan(deliveryExpiresAtMs);
+        // Keep the row locked beyond the delivery deadline. The consume
         // transaction must acquire the row first, then evaluate clock_timestamp().
-        await locker.query("SELECT pg_sleep(0.5)");
+        await locker.query("SELECT pg_sleep(1.75)");
         await locker.query("ROLLBACK");
         expect(await consuming).toBeNull();
       } finally {
@@ -437,6 +465,7 @@ describe("PostgreSQL-backed Worker route composition", () => {
       "apple_signin_handoffs",
       apple.proof,
       apple.bindingHash,
+      apple.deliveryExpiresAtMs,
       (proof, bindingHash, nowIso) => consumeAppleSignInHandoff(
         backend.identity,
         proof,
@@ -450,6 +479,7 @@ describe("PostgreSQL-backed Worker route composition", () => {
       "google_signin_handoffs",
       google.proof,
       google.bindingHash,
+      google.deliveryExpiresAtMs,
       (proof, bindingHash, nowIso) => consumeGoogleSignInHandoff(
         backend.identity,
         proof,
