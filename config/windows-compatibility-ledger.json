@@ -4,21 +4,27 @@
   "entries": [
     {
       "file": "apps/local/server.test.mjs",
-      "win32BranchCount": 3,
+      "win32BranchCount": 4,
       "classification": "posix-only-assertion",
-      "followUp": "Replace omitted owner-mode and development identity assertions with Windows ACL contract tests."
+      "followUp": "Replace omitted owner-mode and development identity assertions with Windows ACL contract tests; the unreadable fixture uses a synthetic EACCES inspector on Windows."
     },
     {
       "file": "test/account-observation-secret.test.js",
-      "win32BranchCount": 1,
+      "win32BranchCount": 3,
       "classification": "posix-only-assertion",
-      "followUp": "Replace the omitted secret-file mode assertion with a native owner ACL assertion."
+      "followUp": "Keep the development secret-file reader fail-closed on Windows until a native owner ACL assertion replaces POSIX mode checks."
     },
     {
       "file": "test/codex-config-service-tier-privacy.test.js",
       "win32BranchCount": 1,
       "classification": "windows-equivalent-needed",
       "followUp": "Replace O_NOFOLLOW coverage with native Windows reparse-point refusal."
+    },
+    {
+      "file": "test/codex-log-scan-discovery.test.js",
+      "win32BranchCount": 1,
+      "classification": "windows-equivalent-needed",
+      "followUp": "Keep selected-head SQLite hints unavailable on Windows until a native owner ACL and reparse-point reader qualifies them; ordinary rollout discovery remains available."
     },
     {
       "file": "test/codex-log-scan-source-consistency.test.js",
@@ -67,6 +73,18 @@
       "win32BranchCount": 2,
       "classification": "windows-equivalent-needed",
       "followUp": "Add a native Windows abrupt-process-termination SQLite recovery fixture."
+    },
+    {
+      "file": "test/local-companion-data.test.js",
+      "win32BranchCount": 1,
+      "classification": "windows-equivalent-needed",
+      "followUp": "Replace the POSIX open-SQLite rename race with native Windows handle-sharing and replacement qualification."
+    },
+    {
+      "file": "test/local-companion-refresh.test.js",
+      "win32BranchCount": 1,
+      "classification": "posix-only-assertion",
+      "followUp": "Keep interactive macOS development identity QA in its macOS lane; qualify Windows account observation through native credentials."
     },
     {
       "file": "test/local-contribution-preparation.test.js",

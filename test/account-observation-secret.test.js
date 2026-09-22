@@ -982,7 +982,7 @@ test("doctor reports credential recovery states as distinct content-free codes",
 });
 
 
-test("development account file reads a distinct private key without mutating files", async (t) => {
+test("development account file enforces platform security without mutating files", async (t) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "development-account-key-")));
   t.after(() => rm(root, { recursive: true, force: true }));
   const identity = join(root, "identity");
@@ -993,6 +993,18 @@ test("development account file reads a distinct private key without mutating fil
   const encoded = `${Buffer.alloc(32, 8).toString("base64url")}\n`;
   await writeFile(path, expected, { mode: 0o600 });
   await writeFile(exportIdentityFile, encoded, { mode: 0o600 });
+  const isWindows = process.platform === "win32";
+  if (isWindows) {
+    // Windows mode bits do not prove the owner-only ACL required by this
+    // POSIX development-file reader, so the portable path must fail closed.
+    await assert.rejects(
+      readDevelopmentAccountObservationSecretFile(path, { exportIdentityFile }),
+      { code: "account_observation_credential_unavailable" },
+    );
+    assert.deepEqual(await readFile(path), expected);
+    assert.equal(await readFile(exportIdentityFile, "utf8"), encoded);
+    return;
+  }
   const loaded = await readDevelopmentAccountObservationSecretFile(path, { exportIdentityFile });
   assert.deepEqual(loaded, expected);
   const loader = createDevelopmentAccountObservationSecretLoader(loaded);
@@ -1006,7 +1018,11 @@ test("development account file reads a distinct private key without mutating fil
   assert.equal(await readFile(exportIdentityFile, "utf8"), encoded);
 });
 
-test("development account file rejects unsafe, malformed, missing and reused identities", async (t) => {
+test("development account file rejects unsafe, malformed, missing and reused identities", {
+  skip: process.platform === "win32"
+    ? "POSIX development identity checks require owner and mode metadata"
+    : false,
+}, async (t) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "development-account-key-invalid-")));
   t.after(() => rm(root, { recursive: true, force: true }));
   for (const scenario of [
