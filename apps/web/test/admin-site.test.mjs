@@ -1964,7 +1964,7 @@ test("database checks remain independent, label stale data and recover", async (
   let reply = () => response(healthy);
   await withAdminPage(async () => unavailableResponse(), async documentRef => {
     const status = documentRef.byId.get("database-health-status");
-    await waitFor(() => status.textContent === "All required databases readable");
+    await waitFor(() => status.textContent === "All required API databases readable");
     assert.deepEqual(tableTexts(documentRef, "database-health-rows")[0],
       ["Primary service and telemetry", "Readable", "12 ms", "100 MiB"]);
     assert.equal(tableTexts(documentRef, "database-health-rows")[2][3], "Unavailable");
@@ -1982,7 +1982,7 @@ test("database checks remain independent, label stale data and recover", async (
     assert.equal(tableTexts(documentRef, "database-health-rows")[1][1], "Timed out (5 seconds)");
     reply = () => response(healthy);
     await documentRef.byId.get("refresh").listeners.get("click")();
-    await waitFor(() => status.textContent === "All required databases readable");
+    await waitFor(() => status.textContent === "All required API databases readable");
     reply = () => ({ ok: false, status: 403, json: async () => ({ error: { code: "ADMIN_DENIED" } }) });
     await documentRef.byId.get("refresh").listeners.get("click")();
     await waitFor(() => tableTexts(documentRef, "database-health-rows").length === 0);
@@ -2005,4 +2005,60 @@ test("database failures reach attention and older Workers show unavailable witho
     assert.match(documentRef.byId.get("database-health-freshness").textContent, /older deployments/u);
     assert.ok(documentRef.byId.get("counts").children.length > 0);
   }, {}, () => reply());
+});
+
+
+test("platform and overall totals use the API union and clear on access refusal", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  overview.distribution.cloudflare.observedTotals = {
+    platforms: [
+      { operatingSystem: "macos", requestsLast7Days: 85, sourceAddressesLast7Days: 25 },
+      { operatingSystem: "windows", requestsLast7Days: 8, sourceAddressesLast7Days: 4 },
+      { operatingSystem: "linux", requestsLast7Days: 3, sourceAddressesLast7Days: 2 },
+    ], overall: { requestsLast7Days: 96, sourceAddressesLast7Days: 29 },
+  };
+  let refused = false;
+  await withAdminPage(async path => refused
+    ? { ok: false, status: 403, json: async () => ({ error: { code: "ADMIN_DENIED" } }) }
+    : healthyAdminRead(path, overview), async documentRef => {
+    assert.deepEqual(tableTexts(documentRef, "distribution-total-rows"), [
+      ["Platform total", "macOS", "All versions", "86%", "25", "85"],
+      ["Platform total", "Windows", "All versions", "14%", "4", "8"],
+      ["Platform total", "Linux", "All versions", "7%", "2", "3"],
+      ["Overall total", "All OS", "All versions", "100%", "29", "96"],
+    ]);
+    refused = true;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => tableTexts(documentRef, "distribution-total-rows").length === 0);
+    assert.equal(documentRef.byId.get("distribution-source-summary").children.length, 0);
+  });
+});
+
+test("sampled traffic explains approximations once and keeps source failures visible", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  overview.distribution.cloudflare.sampled = true;
+  overview.distribution.github.sync.lastFailureCode = "GITHUB_UNAVAILABLE";
+  await withAdminPage(async path => healthyAdminRead(path, overview), async documentRef => {
+    assert.match(documentRef.byId.get("distribution-estimate-note").textContent, /≈ marks sampled Cloudflare traffic/u);
+    assert.match(documentRef.byId.get("distribution-estimate-note").textContent, /only the returned sample/u);
+    assert.match(documentRef.byId.get("distribution-source-summary").textContent, /GitHub sync failed/u);
+    const cards = documentRef.byId.get("distribution-counts").children.slice(0, 6);
+    assert.ok(cards.every(card => !allText(card).includes("Recent history unavailable")));
+    assert.ok(cards[0].children[1].textContent.startsWith("≈"));
+    assert.match(documentRef.byId.get("distribution-version-coverage").textContent, /Totals are unavailable/u);
+  });
+});
+
+
+test("distribution quality summary labels retained evidence after a failed refresh", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  let failed = false;
+  await withAdminPage(async path => failed ? unavailableResponse() : healthyAdminRead(path, overview), async documentRef => {
+    failed = true;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => documentRef.byId.get("distribution-source-summary").textContent.startsWith("Refresh failed"));
+    failed = false;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => !documentRef.byId.get("distribution-source-summary").textContent.startsWith("Refresh failed"));
+  });
 });

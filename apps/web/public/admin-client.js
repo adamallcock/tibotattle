@@ -1095,6 +1095,32 @@ function projectDistribution(value) {
       ),
     });
   });
+  // Older overview caches do not include totals. Never sum version rows: addresses overlap.
+  let observedTotals = null;
+  if (cloudflare.observedTotals != null) {
+    const totals = record(cloudflare.observedTotals, "ADMIN_OVERVIEW_INVALID");
+    const projectCounts = (value) => {
+      const row = record(value, "ADMIN_OVERVIEW_INVALID");
+      return Object.freeze({
+        requestsLast7Days: count(row.requestsLast7Days, "ADMIN_OVERVIEW_INVALID"),
+        sourceAddressesLast7Days: count(row.sourceAddressesLast7Days, "ADMIN_OVERVIEW_INVALID"),
+      });
+    };
+    const overall = projectCounts(totals.overall);
+    const platforms = boundedArray(totals.platforms, 3, "ADMIN_OVERVIEW_INVALID").map(value => {
+      const row = record(value, "ADMIN_OVERVIEW_INVALID");
+      return Object.freeze({
+        operatingSystem: enumValue(row.operatingSystem, DISTRIBUTION_OPERATING_SYSTEMS, "ADMIN_OVERVIEW_INVALID"),
+        ...projectCounts(row),
+      });
+    });
+    if (platforms.length !== 3 || new Set(platforms.map(row => row.operatingSystem)).size !== 3
+        || platforms.some(row => row.sourceAddressesLast7Days > overall.sourceAddressesLast7Days)
+        || platforms.reduce((sum, row) => sum + row.requestsLast7Days, 0) !== overall.requestsLast7Days) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
+    observedTotals = Object.freeze({ platforms: Object.freeze(platforms), overall });
+  }
   const bySegment = boundedArray(
     cloudflare.bySegment ?? [],
     32,
@@ -1153,6 +1179,9 @@ function projectDistribution(value) {
     activeSourceAddresses = projectDistributionWindow(
       cloudflare.activeSourceAddresses,
     );
+    if (observedTotals && observedTotals.overall.sourceAddressesLast7Days !== activeSourceAddresses.last7Days) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
     preflight = projectDistributionRequests(cloudflare.preflight);
     sparkleChecks = projectDistributionRequests(cloudflare.sparkleChecks);
     electronChecks = projectDistributionRequests(cloudflare.electronChecks);
@@ -1167,6 +1196,7 @@ function projectDistribution(value) {
       || cloudflare.bounded !== null
       || cloudflare.currentVersion !== null
       || cloudflare.currentVersionSourceAddresses !== null
+      || observedTotals !== null
       || observedVersions.length !== 0
       || bySegment.length !== 0
       || cloudflare.observedVersionsBounded !== false
@@ -1397,6 +1427,7 @@ function projectDistribution(value) {
       currentVersion,
       currentVersionSourceAddresses,
       observedVersions: Object.freeze(observedVersions),
+      observedTotals,
       bySegment: Object.freeze(bySegment),
       observedVersionsBounded: boolean(
         cloudflare.observedVersionsBounded,
