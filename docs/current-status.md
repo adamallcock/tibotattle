@@ -1,100 +1,87 @@
 ---
 title: Current product and release status
-date: 2026-09-13
+date: 2026-09-22
 type: status
 status: current
-source_commit: 53abbbe19ac905abcab161b9afd9d368676697fe
-observation_date: 2026-09-13
+source_commit: c93a5a513890be5d4db97de5bcc9a684cbb91f18
+observation_date: 2026-09-22
 ---
 
 # Current product and release status
 
-[TiboTattle 0.1.22](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.22)
+[TiboTattle 0.1.23](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.23)
 is the public Electron release for macOS Apple silicon, macOS Intel, Windows
-x64 and Linux x64. Source, published assets, installed behavior, update feeds and hosted service
-observations remain separate evidence; recheck the relevant boundary before a
-new operational decision.
+x64 and Linux x64. Preparation of 0.1.24 is in progress. Source, published
+assets, installed behavior, update feeds and hosted service observations remain
+separate evidence; recheck the relevant boundary before an operational decision.
 
 ## Current release and hosted boundary
 
-This status records application source revision `53abbbe1` on 2026-09-13. The
-published 0.1.22 artifacts are instead bound to immutable source
-`16a0d4dffad4b1213b28adaae139fc9ee6705837`. Current source includes the secure
-startup diagnostics and the not-yet-released Codex plugin/agent interface; it
-does not retroactively change those artifacts. The plugin requires installed
-agent protocol v1 and therefore refuses 0.1.22; its first compatible public
-release must be 0.1.23 or later and must pass its own release gates.
+This snapshot records source `c93a5a513890be5d4db97de5bcc9a684cbb91f18` on
+2026-09-22. Published 0.1.23 artifacts are bound to immutable source
+`dd4ca80510ddf0834baa55294ce1b2487cd473b7`. Later Windows Model performance,
+refresh recovery and desktop changes do not retroactively change those artifacts.
+The 0.1.23 source includes agent protocol v1; installed compatibility still
+requires its actual protocol handshake.
 
-The hosted policy and publication tools use separate source boundaries. Do not
-deploy the application checkout's Worker or infer a hosted migration from an
-application merge.
+The public [Worker health endpoint](https://tibotattle.com/api/health) returned
+`ok` with deployment source `c93a5a513890be5d4db97de5bcc9a684cbb91f18` at this
+observation. The admin deployment is complete. This observation does not
+establish telemetry v1.2 activation or authorize replay of applied migrations.
+Required v1.2 work and the Standard/Fast performance correction must be integrated
+and qualified before freezing 0.1.24. The independent GCP/PostgreSQL experiment
+is outside the desktop release scope.
 
 ## Published Electron release
 
-The public release was published at **2026-09-11 17:25:49 UTC**. Refreshed
-GitHub metadata confirms 20 assets and neither draft nor prerelease status.
-The release is immutable. Its [canonical manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.22/release-manifest.json)
-binds the four installers to source
-`16a0d4dffad4b1213b28adaae139fc9ee6705837`; its SHA-256 is
-`fb042e0d60dca1e468ec7480690cfc5396e5f9408541ee7e500c027fa0d67843`.
-The Mac bundle version is `1029`, separate from build provenance `2026091108`.
+The public release was published at **2026-09-14 16:12:59 UTC** and contains
+20 assets. Its [canonical manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.23/release-manifest.json)
+binds all four installers to source
+`dd4ca80510ddf0834baa55294ce1b2487cd473b7`; its freshly downloaded SHA-256 is
+`30c90c7b13fc7e6d15772ae0e9b00438c181b252de4dc84e461e6957e116eda2`.
+The Mac bundle version is `1030`, separate from build provenance `2026091401`.
 
-| Published target | Retained final-artifact evidence | Remaining acceptance boundary |
+| Published target | Final-artifact evidence recorded by the manifest | Remaining boundary |
 |---|---|---|
-| macOS 14+ Apple silicon | Clean-install smoke, Developer ID signing, hardened runtime, notarization, stapling and Gatekeeper checks passed | Later source and a future plugin-compatible release require their own qualification |
-| macOS 14+ Intel | The same final trust and clean-install checks passed for the distinct Intel artifact | Owner accepted the remaining physical/manual Intel observations; that is not a new passed test |
-| Windows x64 | Authenticode signing, timestamp and clean-install smoke passed for the published installer | Physical desktop notification/update acceptance remains owner-accepted; the signed normal journey did not requalify credential persistence or hosted enrollment |
-| Linux x64 AppImage | Final artifact integrity verified; the manifest explicitly records `cleanInstallSmokePassed: false` and no native signing scheme | Released with explicit owner acceptance of remaining physical desktop/lifecycle observations; package evidence does not turn them into passed tests |
+| macOS 14+ Apple silicon | Clean-install smoke, Developer ID signing, hardened runtime, notarization, stapling and Gatekeeper | Exact installed credential and updater scenarios need their own receipts; source tests do not qualify them |
+| macOS 14+ Intel | Separate native trust and clean-install smoke for the Intel artifact | A later source or artifact needs fresh qualification |
+| Windows x64 | Authenticode signing, timestamp and clean-install smoke | Model performance is not in the published installer; its successor source qualification is separate |
+| Linux x64 AppImage | Exact artifact integrity; `cleanInstallSmokePassed: false`; no native signing scheme | The release-specific acceptance records unperformed physical AppImage launcher, desktop and predecessor-update tests |
 
-All four manifest entries bind their own Electron updater metadata. Actual
-production Mac upgrade journeys passed for native 0.1.18 to Electron 0.1.21 on
-[Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/34568465222)
-and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/34569099253),
-and for Electron 0.1.20 to 0.1.21 on
-[Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/34568883471)
-and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/34568884736).
-These 0.1.21 upgrade receipts do not prove a 0.1.22 upgrade or a Windows/Linux
-notification appearance. See the [platform authority](./reference/platform-support.md)
-and [artifact verification guide](./verify-release.md).
+All four Electron stable feeds currently advertise 0.1.23 and their downloaded
+bytes match the updater metadata digests in that manifest. Both native Sparkle
+appcasts advertise 0.1.23 / 1030. Feed readback proves current discovery metadata;
+it does not prove a new installed upgrade journey. The manifest explicitly
+records null SBOM and provenance fields; do not claim build attestations.
 
 ## Hosted contribution and public sample
 
-The separately deployed Worker/site source is `03d4217f`, as recorded by the
-2026-09-11 hosted verification. Accountless enrollment and ownership are enabled.
-The completed `0057`–`0059` production migration must not be repeated.
-[PR #120](https://github.com/adamallcock/tibotattle/pull/120) records the separate
-public-source policy and `0060` activation; its branch includes the hosted
-policy decision and retained verification that are absent from this app branch.
+Local analysis remains independent of hosted availability. Accountless sharing
+and source eligibility follow the maintained
+[sharing policy](./decisions/2026-09-04-accountless-sharing-policy.md) and
+[public-source decision](./decisions/2026-09-11-public-contribution-sources.md).
+An installation/provider-account source is not a verified person or globally
+unique account. A healthy Worker is not proof of complete public calculations.
 
-Eligible accountless v1.1 sources now enter the shared public sample under the
-existing suppression, replay, withdrawal and erasure rules. A source represents
-an installation/provider-account track, not a verified person or a globally
-unique account. Eligibility does not imply that an accountless source has
-already appeared in published figures.
-
-The recorded rebuild prepared 15 source members and published 319 daily rows,
-with no retained days left in its rebuild queue; the September 5–11 public API
-returned ready results. Those are dated observations, not a promise that the
-queue remains empty. The 0.1.22 source includes the large-history preparation
-and upload-resume corrections. Its release manifest proves the published
-artifact boundary; it does not by itself prove a later live contribution canary.
+Do not replay historical migrations, infer v1.2 readiness from v1.1 source tests,
+or substitute a source merge for a production migration or activation receipt.
+Use [production operations](./runbooks/production-operations.md) for current
+inventory, guarded deployment and recovery.
 
 ## Historical native and recovery evidence
 
 [Native 0.1.18](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.18)
-remains an immutable predecessor at source `55c813a1bf7e67c00e47410b760104c0d9fbc0ea`,
-bundle `1026`. Its [signed RC3 candidates](./receipts/2026-09-04-macos-combined-rc3-signed-candidates.md),
-[installed ARM receipt](./receipts/2026-09-05-macos-rc3-installed-runtime.md)
-and [release-specific manual waiver](./decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
-retain their historical scope; they are not the current Electron artifacts.
-The [September 8 hosted publication receipt](./receipts/2026-09-08-thousand-contributor-publication.md)
-similarly records an earlier migration boundary, not current activation.
-Applied migrations and retained evidence must not be rewritten or replayed.
+remains an immutable predecessor at source
+`55c813a1bf7e67c00e47410b760104c0d9fbc0ea`, bundle `1026`. Earlier release
+qualification and owner waivers retain their named source and artifact scope;
+they do not qualify 0.1.24 or permit unexpected Keychain prompts, data loss or
+weakened updater integrity.
 
 ## Maintaining this snapshot
 
-The [documentation index](./README.md) identifies maintained authorities.
-Preserve exact source/artifact bindings, retained local data, durable opt-outs,
-credential protections and update integrity. Owner acceptance of named manual
-observations does not waive those engineering requirements or expand support
-to other operating systems or architectures.
+Update this authority from verified source, final manifests, live readback and
+installed receipts. Keep unavailable evidence explicit. The
+[platform authority](./reference/platform-support.md),
+[artifact verification guide](./verify-release.md) and
+[publication runbook](./runbooks/2026-08-18-cross-platform-release-publication.md)
+define the retained support and release boundaries.
