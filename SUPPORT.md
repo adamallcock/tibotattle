@@ -47,6 +47,20 @@ install, or direct DMG replacement.
 Run `npm run diagnose:dashboard` only from a source checkout. Review its output
 before sharing it. Use synthetic examples where possible.
 
+In the Electron app, open **Settings → General → Local tools → Show diagnostics**
+to run the doctor. Review its content-free report, then choose **Copy diagnostics**
+or **Prepare support issue…**. The latter opens an editable GitHub issue form
+with only that report; GitHub receives the form URL when it opens. Describe the
+problem and review the form before submitting. The doctor does not include or
+upload a native crash report.
+
+On macOS, that dialog can also opt in to **local crash capture for the next
+launch**. It is off by default, separate from contribution sharing, and never
+uploads dumps. Restart after changing it. **Open local crash reports** reveals
+the Crashpad folder for manual inspection. A dump may contain process memory,
+so do not attach or share it unreviewed. Disabling capture also takes effect
+after restart; existing local dumps are preserved for your review.
+
 Never paste prompts, model responses, credentials, OAuth material, account
 identifiers, real session paths, repository names, or unredacted local files
 into an issue or pull request. A screenshot can contain private data even when

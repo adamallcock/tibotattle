@@ -704,6 +704,7 @@ export async function launchDesktopRuntime({
   firstRunReceiptBackend,
   ownedDownloadsRegistry,
   automaticRefreshCadence,
+  crashCapture = null,
   argv,
   accountlessLaboratory,
   accountlessProduction,
@@ -1437,21 +1438,65 @@ export async function launchDesktopRuntime({
       locale: activeDesktopLocale,
       systemLocales: desktopSystemLocales,
     };
-    const detail = await collectDesktopDiagnostics();
+    const capture = crashCapture === null ? null : await crashCapture.get();
+    const detail = `${await collectDesktopDiagnostics()}\n`
+      + `crash_capture_available: ${capture?.available === true}\n`
+      + `crash_capture_next_launch: ${platform !== "darwin" ? "unsupported"
+        : capture?.available !== true ? "unavailable" : capture.enabled}\n`
+      + `crash_capture_active_this_launch: ${capture?.active === true}\n`
+      + "crash_report_upload: false\n";
+    const captureAction = capture?.available === true
+      ? desktopText(capture.enabled
+        ? "electron.diagnostics.disableCapture" : "electron.diagnostics.enableCapture", {}, textOptions)
+      : null;
+    const openCrashFolder = platform === "darwin"
+      && capture !== null
+      && typeof runtime.shell?.openPath === "function";
+    const actions = ["copy", ...(captureAction === null ? [] : ["capture"]),
+      ...(openCrashFolder ? ["folder"] : []), "support", "done"];
+    const buttons = actions.map((action) => action === "capture" ? captureAction
+      : desktopText(`electron.diagnostics.${action === "folder" ? "openCrashFolder"
+        : action === "support" ? "prepareSupportIssue" : action}`, {}, textOptions));
     const response = await runtime.dialog.showMessageBox({
       type: "info",
       title: desktopText("electron.diagnostics.title", {}, textOptions),
       message: desktopText("electron.diagnostics.message", {}, textOptions),
       detail,
-      buttons: [
-        desktopText("electron.diagnostics.copy", {}, textOptions),
-        desktopText("electron.diagnostics.done", {}, textOptions),
-      ],
-      defaultId: 1,
-      cancelId: 1,
+      buttons,
+      defaultId: buttons.length - 1,
+      cancelId: buttons.length - 1,
       noLink: true,
     });
-    if (response?.response !== 0) return Object.freeze({ status: "shown" });
+    const action = actions[response?.response] ?? "done";
+    if (action === "capture") {
+      const next = await crashCapture.setEnabled(!capture.enabled);
+      return Object.freeze({ status: next.enabled === capture.enabled
+        ? "capture_preference_unavailable" : "capture_changed_next_launch" });
+    }
+    if (action === "folder") {
+      try {
+        const error = await runtime.shell.openPath(app.getPath("crashDumps"));
+        return Object.freeze({ status: error === ""
+          ? "crash_folder_opened" : "crash_folder_unavailable" });
+      } catch {
+        return Object.freeze({ status: "crash_folder_unavailable" });
+      }
+    }
+    if (action === "support") {
+      const url = new URL("https://github.com/adamallcock/tibotattle/issues/new");
+      url.searchParams.set("title", "TiboTattle doctor report");
+      url.searchParams.set("body", `Please describe what happened and review this report before submitting. Do not attach raw crash dumps or unreviewed Apple reports.\n\n\`\`\`text\n${detail}\`\`\``);
+      if (url.href.length > 4096 || typeof runtime.shell?.openExternal !== "function") {
+        return Object.freeze({ status: "support_unavailable" });
+      }
+      try {
+        await runtime.shell.openExternal(url.href);
+        return Object.freeze({ status: "support_prepared" });
+      } catch {
+        return Object.freeze({ status: "support_unavailable" });
+      }
+    }
+    if (action !== "copy") return Object.freeze({ status: "shown" });
     if (typeof runtime.clipboard?.writeText !== "function") {
       return Object.freeze({ status: "copy_unavailable" });
     }

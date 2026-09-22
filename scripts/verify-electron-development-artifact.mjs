@@ -82,6 +82,7 @@ export const ELECTRON_SHELL_FILES = Object.freeze([
   "apps/electron/desktop-command.js",
   "apps/electron/desktop-contract.js",
   "apps/electron/desktop-contribution-credential.js",
+  "apps/electron/desktop-crash-capture.js",
   "apps/electron/desktop-codex-roots.js",
   "apps/electron/desktop-deep-links.js",
   "apps/electron/desktop-diagnostics.js",
