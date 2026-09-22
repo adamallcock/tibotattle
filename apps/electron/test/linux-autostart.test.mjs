@@ -90,6 +90,20 @@ test("Linux autostart is dormant and round-trips in an uncontended owner-only fi
   }
 });
 
+test("Linux autostart creates a missing XDG config root only after explicit enable", async () => {
+  const value = await fixture();
+  await rm(value.configRoot, { recursive: true });
+  try {
+    assert.equal((await value.owner.status()).status, "disabled");
+    assert.equal(await lstat(value.configRoot).catch(() => null), null);
+    assert.equal((await value.owner.enable()).status, "enabled");
+    assert.equal((await value.owner.status()).status, "enabled");
+    assert.equal((await value.owner.disable()).status, "disabled");
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
 test("Linux autostart preserves a safe malformed entry without treating ownership as authority", async () => {
   const value = await fixture();
   try {

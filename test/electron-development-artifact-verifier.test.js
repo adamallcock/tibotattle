@@ -83,6 +83,7 @@ const SHELL_FILES = [
   "apps/electron/desktop-notification-policy.js",
   "apps/electron/desktop-windows-notification-identity.js",
   "apps/electron/desktop-platform-services.js",
+  "apps/electron/linux-autostart.js",
   "apps/electron/desktop-runtime.js",
   "apps/electron/desktop-settings-backends.js",
   "apps/electron/desktop-settings-store.js",

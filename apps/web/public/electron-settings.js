@@ -167,7 +167,7 @@ const LOGIN_ITEM_LABELS = Object.freeze({
   enabled: "TiboTattle starts when you sign in.",
   disabled: "TiboTattle will not start automatically.",
   "needs-approval": "Your operating system needs approval in Login Items before this can take effect.",
-  unavailable: "Login item status is unavailable. Open your operating system Login Items settings to review it.",
+  unavailable: "Start at login status is unavailable on this system.",
   error: "The operating system did not confirm the current Login Item status. Review it before relying on start at login.",
 });
 
@@ -445,6 +445,7 @@ export function normalizeSettingsState(raw, settingsRoots = null) {
     startAtLogin: Object.freeze({
       status: loginStatus,
       canSet: startAtLogin.canSet === true,
+      canOpenSettings: startAtLogin.canOpenSettings === true,
       detail: safeText(startAtLogin.detail, LOGIN_ITEM_LABELS[loginStatus]),
     }),
     notifications: Object.freeze({
@@ -933,6 +934,8 @@ function renderSettingsState(
   const refresh = queryRequired(documentRef, "#settings-refresh-interval");
   const loginSwitch = queryRequired(documentRef, "#settings-start-at-login");
   const loginSummary = queryRequired(documentRef, "#settings-start-at-login-summary");
+  const openLoginItems = queryRequired(documentRef, "#settings-open-login-items");
+  const retryLoginStatus = queryRequired(documentRef, "#settings-refresh-login-status");
   const notificationsSwitch = queryRequired(documentRef, "#settings-notifications-enabled");
   const notificationDetail = queryRequired(documentRef, "#settings-notifications-detail");
   const thresholdInputs = [...documentRef.querySelectorAll(
@@ -963,6 +966,8 @@ function renderSettingsState(
   refresh.value = String(state.refreshIntervalSeconds);
   loginSwitch.checked = state.startAtLogin.status === "enabled";
   loginSwitch.disabled = !bridgeAvailable || !state.startAtLogin.canSet;
+  openLoginItems.hidden = !bridgeAvailable || !state.startAtLogin.canOpenSettings;
+  retryLoginStatus.hidden = !bridgeAvailable || state.startAtLogin.status !== "error";
   loginSummary.textContent = translateSettingsMessage(
     localizer,
     LOGIN_STATUS_KEYS[state.startAtLogin.status] ?? LOGIN_STATUS_KEYS.unavailable,
@@ -1220,6 +1225,9 @@ export async function mountSettingsPage({
         currentSharingPreference,
         settingsSharingBridge !== null,
       );
+      // The bridge exists but its read failed. Keep one explicit retry for
+      // this error state; normal focus and switch changes refresh automatically.
+      queryRequired(documentRef, "#settings-refresh-login-status").hidden = false;
       return currentState;
     }
   };

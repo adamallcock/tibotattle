@@ -230,6 +230,7 @@ export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "apps/electron/desktop-update-preferences.js",
   "apps/electron/desktop-updater.js",
   "apps/electron/errors.js",
+  "apps/electron/linux-autostart.js",
   "apps/electron/linux-qualification.js",
   "apps/electron/linux-secret-service-qualification-smoke-child.mjs",
   "apps/electron/linux-account-observation-qualification-smoke-child.mjs",

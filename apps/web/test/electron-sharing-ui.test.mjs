@@ -480,8 +480,12 @@ test("Settings coalesces trusted updater status refreshes and renders a later do
   const rootId = "00000000-0000-4000-8000-000000000001";
   let downloaded = false;
   let failRead = false;
+  let loginStatus = "disabled";
+  let canOpenLoginSettings = true;
+  const windowListeners = new Map();
   let refreshCommand = null;
   let reads = 0;
+  let failNextRead = false;
   let activeReads = 0;
   let maximumActiveReads = 0;
   let resolveStaleRefresh = null;
@@ -490,7 +494,11 @@ test("Settings coalesces trusted updater status refreshes and renders a later do
       language: "en", appearance: "system", refreshIntervalSeconds: 300,
       codexHomes: { activityRoots: [{ rootId, kind: "default", path: null, enabled: true }], primaryRootId: rootId },
       codexFolder: { kind: "default" },
-      startAtLogin: { status: "disabled", canSet: false },
+      startAtLogin: {
+        status: loginStatus,
+        canSet: true,
+        canOpenSettings: canOpenLoginSettings,
+      },
       notifications: { enabled: false, threshold: "off", canSet: false },
     },
     about: {
@@ -510,6 +518,10 @@ test("Settings coalesces trusted updater status refreshes and renders a later do
     getSettings: async () => {
       reads += 1;
       if (failRead) throw new Error("synthetic settings read failure");
+      if (failNextRead) {
+        failNextRead = false;
+        throw new Error("synthetic bridge read failure");
+      }
       activeReads += 1;
       maximumActiveReads = Math.max(maximumActiveReads, activeReads);
       const response = snapshot();
@@ -524,7 +536,12 @@ test("Settings coalesces trusted updater status refreshes and renders a later do
   };
   const mounted = await mountSettingsPage({
     documentRef,
-    windowRef: { tibotattleDesktop: bridge, location: { hash: "#about" } },
+    windowRef: {
+      tibotattleDesktop: bridge,
+      location: { hash: "#about" },
+      addEventListener(type, handler) { windowListeners.set(type, handler); },
+      removeEventListener(type) { windowListeners.delete(type); },
+    },
     bridge,
   });
   assert.equal(elements.get("#settings-bridge-status").hidden, true);
@@ -556,6 +573,32 @@ test("Settings coalesces trusted updater status refreshes and renders a later do
   refreshCommand({ command: "refresh" });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(elements.get("#settings-bridge-status").hidden, true);
+  const loginSwitch = elements.get("#settings-start-at-login");
+  const openLoginSettings = elements.get("#settings-open-login-items");
+  const retryLoginStatus = elements.get("#settings-refresh-login-status");
+  assert.equal(loginSwitch.checked, false);
+  assert.equal(retryLoginStatus.hidden, true);
+  loginStatus = "enabled";
+  windowListeners.get("focus")();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(loginSwitch.checked, true, "returning from OS settings re-reads login status");
+  loginStatus = "error";
+  windowListeners.get("focus")();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(retryLoginStatus.hidden, false, "retry is only offered for a failed status read");
+  loginStatus = "disabled";
+  canOpenLoginSettings = false;
+  windowListeners.get("focus")();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(retryLoginStatus.hidden, true);
+  assert.equal(openLoginSettings.hidden, true, "Linux has no single system startup page");
+  failNextRead = true;
+  windowListeners.get("focus")();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(retryLoginStatus.hidden, false, "failed bridge reads offer a retry");
+  windowListeners.get("focus")();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(retryLoginStatus.hidden, true, "a successful read clears the retry");
   mounted.teardown();
 });
 
