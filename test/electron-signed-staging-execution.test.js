@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseSignedStagingExecutionArguments, signedStagingChildEnvironment, signedStagingFixture, signedStagingNativeIntroScript, interpretSignedStagingNativeIntroResult, assertSignedStagingFreshProjection } from '../scripts/run-signed-electron-staging.mjs';
+import { parseSignedStagingExecutionArguments, signedStagingChildEnvironment, signedStagingFixture, signedStagingNativeIntroScript, interpretSignedStagingNativeIntroResult, assertSignedStagingFreshProjection, waitForSignedStagingNativeIntro, signedStagingNativeIntroDiagnosticScript, sanitizeSignedStagingNativeIntroDiagnostic } from '../scripts/run-signed-electron-staging.mjs';
 const identity = ['--app', '/tmp/reviewed/TiboTattle.app', '--source-revision', 'a'.repeat(40), '--asar-sha256', 'b'.repeat(64)];
 test('execution requires an explicit staging mutation mode and exact artifact inputs', () => {
   assert.throws(() => parseSignedStagingExecutionArguments(identity));
@@ -119,4 +119,80 @@ test('unverified launch cleanup refuses surviving detached descendants without s
   await assert.rejects(stopOwnedMacSharingApp(state, { processTableImpl: () => [{ pid: 1235, group: 1234 }] }),
     { stage: 'unverified_group_remaining' });
   assert.equal(await stopOwnedMacSharingApp(state, { processTableImpl: () => [{ pid: 9999, group: 9999 }] }), true);
+});
+
+
+test('native intro waiter preserves terminal refusals instead of swallowing their stage', async () => {
+  for (const stage of ['native_intro_closed', 'native_intro_identity', 'native_intro_automation_unavailable']) {
+    let calls = 0;
+    const error = Object.assign(new Error('private details must not reach proof'), { stage });
+    await assert.rejects(waitForSignedStagingNativeIntro(() => { calls++; throw error; },
+      { now: () => 0, wait: () => assert.fail('terminal refusal must not retry') }), received => received === error);
+    assert.equal(calls, 1);
+  }
+  for (const [result, stage] of [['unavailable', 'native_intro_automation_unavailable'], ['unexpected', 'native_intro_unexpected']]) {
+    await assert.rejects(waitForSignedStagingNativeIntro(() => result,
+      { now: () => 0, wait: () => assert.fail('terminal result must not retry') }), { stage });
+  }
+});
+
+test('native intro waiter keeps the 60 second deadline and 100 ms cadence for waiting only', async () => {
+  let time = 0, calls = 0;
+  await assert.rejects(waitForSignedStagingNativeIntro(() => { calls++; return 'waiting'; }, {
+    now: () => time, wait: async ms => { assert.equal(ms, 100); time += ms; },
+  }), { stage: 'native_intro_timeout' });
+  assert.equal(time, 60_000); assert.equal(calls, 600);
+  time = 0; calls = 0;
+  await waitForSignedStagingNativeIntro(() => ++calls === 3 ? 'continued' : 'waiting', {
+    now: () => time, wait: async ms => { time += ms; },
+  });
+  assert.equal(calls, 3); assert.equal(time, 200);
+});
+
+test('native intro failure snapshot is read-only, PID-scoped and content-free', async () => {
+  const { runInNewContext } = await import('node:vm');
+  const { desktopFirstRunDialogCopy } = await import('../apps/electron/desktop-first-run.js');
+  const copy = desktopFirstRunDialogCopy({ production: true, locale: 'en-US' });
+  let message = copy.message;
+  let controls = [
+    { role: () => 'AXStaticText', value: () => message },
+    ...copy.buttons.map(name => ({ role: () => 'AXButton', name: () => name })),
+    { role: () => 'AXCheckBox', name: () => copy.checkboxLabel },
+    { role: () => 'AXTextField', value: () => { throw Error('must not read credential fields'); } },
+  ];
+  let enabled = true, windows = [{ entireContents: () => controls }];
+  const script = signedStagingNativeIntroDiagnosticScript(12345);
+  const execute = () => JSON.parse(runInNewContext(script + '; run();', { Application(name) {
+    assert.equal(name, 'System Events'); return { uiElementsEnabled: () => enabled,
+      applicationProcesses: { whose(query) { assert.equal(query.unixId, 12345);
+        assert.deepEqual(Object.keys(query), ['unixId']); return () => [{ windows: () => windows }]; } } };
+  } }));
+  const result = execute();
+  assert.deepEqual(result, { status: 'observed', windowCount: 1, staticTextCount: 1, buttonCount: 2,
+    checkboxCount: 1, introMessage: true, continueButton: true, quitButton: true, loginCheckbox: true,
+    secureStorageRefusal: false, handoverRefusal: false, privacyRefusal: false });
+  assert.deepEqual(sanitizeSignedStagingNativeIntroDiagnostic(result), result);
+  assert.doesNotMatch(script, /\.click\(|keystroke|keyCode|setValue/u);
+  message = 'TiboTattle could not complete its secure startup checks.';
+  assert.equal(execute().secureStorageRefusal, true); assert.equal(execute().introMessage, false);
+  const { DESKTOP_SECURE_STORAGE_FAILURE_REASONS, createDesktopSecureStorageDialog } =
+    await import('../apps/electron/desktop-secure-storage-readiness.js');
+  for (const reason of DESKTOP_SECURE_STORAGE_FAILURE_REASONS) {
+    message = createDesktopSecureStorageDialog(reason).message;
+    assert.equal(execute().secureStorageRefusal, true);
+    assert.equal(execute().introMessage, false);
+  }
+  message = 'PRIVATE_SENTINEL /private/secret';
+  assert.equal(JSON.stringify(execute()).includes('PRIVATE_SENTINEL'), false);
+  enabled = false;
+  assert.equal(execute().status, 'automation_unavailable'); assert.equal(execute().windowCount, null);
+  enabled = true; windows = Array(4).fill(windows[0]);
+  assert.equal(execute().status, 'overflow'); assert.equal(execute().buttonCount, null);
+  windows = [{ entireContents: () => Array(501).fill(controls[0]) }];
+  assert.equal(execute().status, 'overflow');
+  for (const invalid of [{ ...result, rawText: 'PRIVATE_SENTINEL' }, { ...result, windowCount: 4 },
+    { ...result, buttonCount: 1501 }, { ...result, checkboxCount: -1 }, { ...result, introMessage: 'true' },
+    { ...result, status: 'automation_unavailable' }, null]) {
+    assert.equal(sanitizeSignedStagingNativeIntroDiagnostic(invalid), null);
+  }
 });

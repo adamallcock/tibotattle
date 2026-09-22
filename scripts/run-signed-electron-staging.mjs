@@ -10,6 +10,7 @@ import { userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { connectCdp, selectMacDashboardTarget, selectMacSettingsTarget, waitFor } from './smoke-electron-macos.mjs';
 import { desktopFirstRunDialogCopy, validateDesktopFirstRunReceipt } from '../apps/electron/desktop-first-run.js';
+import { DESKTOP_SECURE_STORAGE_FAILURE_REASONS, createDesktopSecureStorageDialog } from '../apps/electron/desktop-secure-storage-readiness.js';
 import { classifyDesktopSharingInstallation } from '../apps/electron/desktop-sharing-installation.js';
 import { verifySignedStagingLaunchInputs, prepareSignedStagingDisposableProfile, parseSignedStagingConsumerArguments } from './consume-signed-electron-staging.mjs';
 import { macOSLoopbackLaunch, MACOS_LOOPBACK_MODE } from './lib/macos-loopback-qualification.mjs';
@@ -134,8 +135,111 @@ export function interpretSignedStagingNativeIntroResult(value) {
   fail(value === 'unavailable' ? 'native_intro_automation_unavailable' : 'native_intro_unexpected');
 }
 
+// Unlike the general smoke waiter, native-intro failures are terminal. Do not
+// turn an ownership/AX/dialog refusal into a generic timeout with no stage.
+export async function waitForSignedStagingNativeIntro(poll, { now = Date.now, wait = delay } = {}) {
+  const started = now();
+  while (now() - started < STARTUP) {
+    if (interpretSignedStagingNativeIntroResult(await poll())) return;
+    await wait(100);
+  }
+  fail('native_intro_timeout');
+}
+
+const INTRO_COUNT_KEYS = ['windowCount', 'staticTextCount', 'buttonCount', 'checkboxCount'];
+const INTRO_FLAG_KEYS = ['introMessage', 'continueButton', 'quitButton', 'loginCheckbox',
+  'secureStorageRefusal', 'handoverRefusal', 'privacyRefusal'];
+const INTRO_DIAGNOSTIC_KEYS = ['status', ...INTRO_COUNT_KEYS, ...INTRO_FLAG_KEYS];
+function unavailableIntroDiagnostic(status) {
+  return Object.fromEntries([['status', status], ...INTRO_DIAGNOSTIC_KEYS.slice(1).map(key => [key, null])]);
+}
+
+// A closed receipt boundary: never retain arbitrary AX fields or exception data.
+export function sanitizeSignedStagingNativeIntroDiagnostic(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).sort().join() !== [...INTRO_DIAGNOSTIC_KEYS].sort().join()
+    || !['observed', 'automation_unavailable', 'owner_unavailable', 'overflow', 'inspection_failed'].includes(value.status)) return null;
+  if (value.status !== 'observed') {
+    return INTRO_DIAGNOSTIC_KEYS.slice(1).every(key => value[key] === null)
+      ? unavailableIntroDiagnostic(value.status) : null;
+  }
+  if (!INTRO_COUNT_KEYS.every(key => Number.isSafeInteger(value[key]) && value[key] >= 0
+      && value[key] <= (key === 'windowCount' ? 3 : 1500))
+    || !INTRO_FLAG_KEYS.every(key => typeof value[key] === 'boolean')) return null;
+  return Object.fromEntries(INTRO_DIAGNOSTIC_KEYS.map(key => [key, value[key]]));
+}
+
+export function signedStagingNativeIntroDiagnosticScript(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) fail('native_intro_identity');
+  const copies = ['en-US', 'zh-Hans', 'es'].map(locale => {
+    const copy = desktopFirstRunDialogCopy({ production: true, locale });
+    return { message: copy.message, buttons: copy.buttons, checkbox: copy.checkboxLabel,
+      privacyFailure: copy.failureMessage };
+  });
+  const secureStorageMessages = DESKTOP_SECURE_STORAGE_FAILURE_REASONS.map(reason => createDesktopSecureStorageDialog(reason).message);
+  // Exact published 0.1.20 predecessor (ASAR 2b98b1d1...) predates the reason-
+  // specific dialog API. This is diagnosis only, never a dialog action/approval.
+  secureStorageMessages.push('TiboTattle could not complete its secure startup checks.');
+  return `function run() {
+    var countKeys = ${JSON.stringify(INTRO_COUNT_KEYS)};
+    var flagKeys = ${JSON.stringify(INTRO_FLAG_KEYS)};
+    function unavailable(status) {
+      var result = { status: status };
+      countKeys.concat(flagKeys).forEach(function(key) { result[key] = null; });
+      return JSON.stringify(result);
+    }
+    var events = Application('System Events');
+    if (!events.uiElementsEnabled()) return unavailable('automation_unavailable');
+    var matches = events.applicationProcesses.whose({ unixId: ${pid} })();
+    if (matches.length !== 1) return unavailable('owner_unavailable');
+    var windows = matches[0].windows();
+    if (windows.length > 3) return unavailable('overflow');
+    var result = { status: 'observed', windowCount: windows.length };
+    countKeys.slice(1).forEach(function(key) { result[key] = 0; });
+    flagKeys.forEach(function(key) { result[key] = false; });
+    var copies = ${JSON.stringify(copies)};
+    var secureStorageMessages = ${JSON.stringify(secureStorageMessages)};
+    for (var w = 0; w < windows.length; w++) {
+      var elements = windows[w].entireContents();
+      if (elements.length > 500) return unavailable('overflow');
+      var texts = elements.filter(function(e) { return e.role() === 'AXStaticText'; });
+      var buttons = elements.filter(function(e) { return e.role() === 'AXButton'; });
+      var checks = elements.filter(function(e) { return e.role() === 'AXCheckBox'; });
+      result.staticTextCount += texts.length; result.buttonCount += buttons.length;
+      result.checkboxCount += checks.length;
+      function hasText(value) { return texts.some(function(e) { return e.value() === value; }); }
+      result.secureStorageRefusal = result.secureStorageRefusal
+        || secureStorageMessages.some(hasText);
+      result.handoverRefusal = result.handoverRefusal
+        || hasText('TiboTattle could not finish transferring your existing data.');
+      for (var c = 0; c < copies.length; c++) {
+        var copy = copies[c];
+        result.introMessage = result.introMessage || hasText(copy.message);
+        result.privacyRefusal = result.privacyRefusal || hasText(copy.privacyFailure);
+        result.continueButton = result.continueButton || buttons.some(function(e) { return e.name() === copy.buttons[0]; });
+        result.quitButton = result.quitButton || buttons.some(function(e) { return e.name() === copy.buttons[1]; });
+        result.loginCheckbox = result.loginCheckbox || checks.some(function(e) { return e.name() === copy.checkbox; });
+      }
+    }
+    return JSON.stringify(result);
+  }`;
+}
+
+function nativeIntroFailureDiagnostic(state, verified) {
+  const owned = () => !state.stopped() && processTable().some(row => row.pid === state.pid
+    && row.group === state.pid && row.command === verified.executable);
+  try {
+    if (!owned()) return unavailableIntroDiagnostic('owner_unavailable');
+    const result = execFileSync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', signedStagingNativeIntroDiagnosticScript(state.pid)],
+      { encoding: 'utf8', timeout: OPERATION, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] });
+    if (!owned()) return unavailableIntroDiagnostic('owner_unavailable');
+    return sanitizeSignedStagingNativeIntroDiagnostic(JSON.parse(result))
+      ?? unavailableIntroDiagnostic('inspection_failed');
+  } catch { return unavailableIntroDiagnostic('inspection_failed'); }
+}
+
 async function continueNativeIntro(state, verified) {
-  await waitFor(() => {
+  await waitForSignedStagingNativeIntro(() => {
     if (state.stopped()) fail('native_intro_closed');
     const row = processTable().find((entry) => entry.pid === state.pid);
     if (row?.group !== state.pid || row.command !== verified.executable) fail('native_intro_identity');
@@ -144,8 +248,8 @@ async function continueNativeIntro(state, verified) {
       result = execFileSync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', signedStagingNativeIntroScript(state.pid)],
         { encoding: 'utf8', timeout: OPERATION, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
     } catch { fail('native_intro_automation_unavailable'); }
-    return interpretSignedStagingNativeIntroResult(result);
-  }, STARTUP, 'native introduction');
+    return result;
+  });
   state.nativeIntroContinued = true;
 }
 
@@ -225,6 +329,7 @@ async function launch(verified, environment, { untouched = false, onFailure, lau
     return state;
   } catch (error) {
     error.signedLaunchStage = launchStage;
+    if (launchStage === 'native_intro') error.signedNativeIntroDiagnostic = nativeIntroFailureDiagnostic(state, verified);
     if (onFailure) { try { await onFailure({ pid: state.pid, stage: launchStage }); } catch {} }
     const stopped = await stop(state);
     error.ownedMacProcessesStopped = stopped === true;
