@@ -739,6 +739,21 @@ export async function runProtectedTelemetryRuntimeActivation({
       fail("ACTIVATION_RECONCILE_REQUIRED");
     }
     if (state.status === "admin_intent") {
+      if (reconcileOnly) {
+        // Explicit reconciliation is read-only. Never replay the admin route
+        // here: a started intent may represent a request that never reached
+        // the Worker, and a new POST would turn recovery into a mutation.
+        const reconciled = await reconcileUncertainAdminIntent();
+        if (reconciled !== null) {
+          if (reconciled.kind === "refused") {
+            await releaseReconciledRefusal();
+          } else {
+            await releaseSuccessfulMutation(reconciled.result);
+          }
+          return reconciled.result;
+        }
+        fail("ACTIVATION_RECONCILE_REQUIRED");
+      }
       // The Worker has a unique durable audit row for this exact request. An
       // idempotent replay is therefore the only safe way to resolve a stale
       // proof or a lost response after the POST boundary. Do it before any

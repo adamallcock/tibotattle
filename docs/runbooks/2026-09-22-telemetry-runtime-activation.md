@@ -225,8 +225,8 @@ first retries the exact same request. A completed Worker replay returns the
 durable success before mutable proof checks, journals `release_intent`, and
 releases the lock even when the deployment has since drifted. If the replay is
 refused or its response is lost, use the separate reviewed reconciliation
-mode, which reads the fixed target runtime and exact audit row under the held
-lock:
+mode. Reconciliation mode never posts to the admin route: it reads the fixed
+target runtime and exact audit row under the held lock:
 
 ```sh
 node apps/worker/scripts/telemetry-runtime-reconciliation.mjs \

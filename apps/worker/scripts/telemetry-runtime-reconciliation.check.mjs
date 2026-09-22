@@ -534,6 +534,87 @@ test("reconciles a no-request-reached intent after later deployment drift and re
   }
 });
 
+test("read-only reconcile never POSTs an ambiguous started intent", async () => {
+  const captured = await runFixture();
+  const request = activationRequest(captured.proof, "dddddddd-dddd-4ddd-8ddd-dddddddddddd");
+  const operation = operationHarness();
+  const lock = lockHarness();
+  let posts = 0;
+  let reconciliationReads = 0;
+  try {
+    await assert.rejects(runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT,
+      workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory: "/private/tmp/synthetic-operation",
+      request,
+      session: adminSession(),
+      provider: liveProvider(inventory()),
+      lockFactory: () => lock,
+      operationFactory: operation.factory,
+      postAdmin: async () => { posts += 1; throw new Error("request never reached admin"); },
+    }), { code: "TELEMETRY_RUNTIME_RECONCILIATION_ACTIVATION_RESULT_UNCERTAIN" });
+    assert.equal(operation.state.status, "admin_intent");
+    assert.equal(posts, 1);
+
+    const activation = request.telemetryRuntimeActivation;
+    const details = {
+      schemaVersion: "telemetry-runtime-activation-v1",
+      task: "telemetry_runtime_activation",
+      idempotencyKey: activation.idempotencyKey,
+      target: activation.target,
+      expectedRevision: activation.expectedRevision,
+      reconciliation: activation.reconciliation,
+    };
+    await assert.rejects(runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT,
+      workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory: "/private/tmp/synthetic-operation",
+      request,
+      session: adminSession(),
+      resume: true,
+      reconcileOnly: true,
+      environment: { CLOUDFLARE_API_TOKEN: "synthetic-provider-token" },
+      provider: liveProvider(inventory()),
+      lockFactory: () => lock,
+      operationFactory: operation.factory,
+      postAdmin: async () => {
+        posts += 1;
+        assert.fail("read-only reconcile must never POST to the admin route");
+      },
+      fetchImpl: async (url, options) => {
+        reconciliationReads += 1;
+        assert.match(url, new RegExp(`/accounts/${ACCOUNT}/d1/database/${PRIMARY}/query$`));
+        assert.equal(options.method, "POST");
+        const body = JSON.parse(options.body);
+        assert.match(body.sql, /telemetry_v12_runtime/u);
+        assert.deepEqual(body.params, [activation.idempotencyKey]);
+        return Response.json({
+          success: true,
+          result: [{
+            success: true,
+            results: [{
+              audit_action: "run_maintenance",
+              audit_details_json: JSON.stringify(details),
+              audit_operation_id: activation.idempotencyKey,
+              audit_outcome: "started",
+              runtime_policy_revision: activation.expectedRevision,
+              runtime_state: "staged",
+            }],
+          }],
+        });
+      },
+    }), { code: "TELEMETRY_RUNTIME_RECONCILIATION_ACTIVATION_RECONCILE_REQUIRED" });
+    assert.equal(posts, 1);
+    assert.equal(reconciliationReads, 1);
+    assert.notEqual(lock.owner, null);
+    assert.equal(operation.state.status, "admin_intent");
+  } finally {
+    await captured.cleanup();
+  }
+});
+
 test("uses the fixed D1 audit/runtime read before releasing a durable failure", async () => {
   const captured = await runFixture();
   const request = activationRequest(captured.proof);
