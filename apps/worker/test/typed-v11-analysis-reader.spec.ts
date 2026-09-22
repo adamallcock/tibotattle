@@ -41,6 +41,7 @@ import {loadTypedV11GenerationSnapshot,TYPED_V11_QUOTA_PAGE_SIZE} from '../src/t
 import { handleRequest } from "../src/index";
 import { runBackendLifecycle } from "../src/retention";
 import { reconcilePendingQuarantineObjects } from "../src/quarantine-reconciliation";
+import { createR2QuarantineObjectStore } from "../src/r2-quarantine-object-store";
 import { createV11DeviceFixture, makeV11Day, stageV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 
 const b=env as Env & { STORAGE_INGESTION_A:D1Database; TEST_MIGRATIONS:D1Migration[];
@@ -48,6 +49,7 @@ const b=env as Env & { STORAGE_INGESTION_A:D1Database; TEST_MIGRATIONS:D1Migrati
   TEST_TYPED_V11_ADMISSION_MIGRATIONS:D1Migration[];TEST_TYPED_V1_ADMISSION_MIGRATIONS:D1Migration[];
   TEST_INGESTION_ISOLATION_MIGRATIONS:D1Migration[];TEST_ANALYTICS_MIGRATIONS:D1Migration[];
   STORAGE_ANALYTICS_DB:D1Database;TEST_DELETION_LEDGER_MIGRATIONS:D1Migration[] };
+const quarantine=()=>createR2QuarantineObjectStore(b.QUARANTINE);
 const typed=()=>b.STORAGE_INGESTION_A, legacy=()=>b.USAGE_MONITOR_DB;
 const namespace="synthetic-analysis-source", participantId="participant:synthetic-analysis";
 const day=()=>new Date().toISOString().slice(0,10);
@@ -196,8 +198,8 @@ describe("typed active-domain analytical reads",()=>{
     await initializeTypedV1Admission(typed(),namespace);
     await applyD1Migrations(b.DELETION_LEDGER,b.TEST_DELETION_LEDGER_MIGRATIONS);
     const now=Date.now();
-    await runBackendLifecycle(typed(),b.DELETION_LEDGER,b.QUARANTINE,now);
-    await reconcilePendingQuarantineObjects(typed(),b.QUARANTINE,now);
+    await runBackendLifecycle(typed(),b.DELETION_LEDGER,quarantine(),now);
+    await reconcilePendingQuarantineObjects(typed(),quarantine(),now);
     const settings:Env={...b,USAGE_MONITOR_DB:typed()};
     Reflect.set(settings,'TELEMETRY_STORAGE_MODE','typed');
     Reflect.set(settings,'TELEMETRY_STORAGE_NAMESPACE',namespace);

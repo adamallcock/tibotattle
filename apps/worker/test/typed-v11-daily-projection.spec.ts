@@ -11,6 +11,7 @@ import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from 
 import { advanceAdmittedV11DailyProjection, advanceV11DailyProjection, readV11ProjectedOwnerDays, retireV11DailyProjectionPage } from "../src/v11-daily-projection";
 import { revokeAccountlessEnrollment } from "../src/accountless-enrollment";
 import { eraseParticipantAsOwner } from "../src/participant-erasure";
+import { createR2QuarantineObjectStore } from "../src/r2-quarantine-object-store";
 import { readTypedV11ManifestPage, TYPED_V11_MANIFEST_PAGE_SQL } from "../src/typed-v11-record-reader";
 import { makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
@@ -25,6 +26,7 @@ interface Bindings extends Env { STORAGE_ANALYTICS_DB: D1Database; TEST_MIGRATIO
   TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[];TEST_TYPED_V1_ADMISSION_MIGRATIONS:D1Migration[];
   TEST_INGESTION_ISOLATION_MIGRATIONS:D1Migration[] }
 const b = env as Bindings, source = () => b.USAGE_MONITOR_DB, target = () => b.STORAGE_ANALYTICS_DB;
+const quarantine = () => createR2QuarantineObjectStore(b.QUARANTINE);
 const sourceId = "synthetic-typed-source", namespace = "synthetic-original-typed-source";
 const sourceLayout = { kind: "typed-v11" as const, sourceNamespace: namespace };
 const today = () => new Date().toISOString().slice(0, 10);
@@ -691,7 +693,7 @@ describe("typed accountless upload to isolated projection", () => {
 
   it("removes typed evidence through real owner erasure and drains terminal proof without resurrecting it", async () => {
     const value = await fixture(); await step();
-    await expect(eraseParticipantAsOwner(runtime(), "e".repeat(64), value.participantId)).resolves.toMatchObject({ deleted: true });
+    await expect(eraseParticipantAsOwner(runtime(), "e".repeat(64), value.participantId, quarantine())).resolves.toMatchObject({ deleted: true });
     await drain();
     expect((await read(value.event.ownerDigest)).values).toEqual([]);
     for (const table of ["typed_v11_record_admissions", "typed_telemetry_records", "typed_telemetry_owners", "typed_telemetry_devices"]) {

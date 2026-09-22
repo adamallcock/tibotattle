@@ -24,6 +24,7 @@ import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from 
 import { advanceV11DailyProjection, readV11ProjectedOwnerDays, retireV11DailyProjectionPage } from "../src/v11-daily-projection";
 import { revokeAccountlessEnrollment } from "../src/accountless-enrollment";
 import { eraseParticipantAsOwner } from "../src/participant-erasure";
+import { createR2QuarantineObjectStore } from "../src/r2-quarantine-object-store";
 import { advanceStorageErasureJobs, requireStorageParticipantErasureComplete } from "../src/storage-erasure";
 import { readTypedV11ManifestPage, TYPED_V11_MANIFEST_PAGE_SQL } from "../src/typed-v11-record-reader";
 import { makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
@@ -42,6 +43,7 @@ const sourceLayout = { kind: "typed-v11" as const, sourceNamespace: namespace };
 const today = () => new Date().toISOString().slice(0, 10);
 const runtime = () => ({ ...b, ENVIRONMENT: "synthetic-development", ACCOUNT_SCOPED_INGEST_MODE: "disabled",
   ACCOUNTLESS_ENROLLMENT_MODE: "enabled", ACCOUNTLESS_OWNERSHIP_MODE: "enabled" } as Env);
+const quarantine = () => createR2QuarantineObjectStore(b.QUARANTINE);
 const step = (db = target()) => advanceV11DailyProjection({ source: source(), target: db, sourceId, sourceLayout });
 const read = (ownerDigest: string) => readV11ProjectedOwnerDays({ source: source(), target: target(), sourceId,
   ownerDigest, fromDay: today(), throughDay: today() });
@@ -374,7 +376,7 @@ describe('independent public daily publication',()=>{
     const range=async()=>(await readPublishedStorageCommunityDaily({...options(),fromDay:priorDay,throughDay:today()}))
       .rows.map(row=>[row.day,row.revision]);
     expect(await range()).toEqual([[priorDay,1],[today(),1]]);
-    expect(await eraseParticipantAsOwner(runtime(),'e'.repeat(64),a.fixture.participantId)).toMatchObject({deleted:true});
+    expect(await eraseParticipantAsOwner(runtime(),'e'.repeat(64),a.fixture.participantId,quarantine())).toMatchObject({deleted:true});
     // Before delivery the affected days are unknown: everything older than the
     // source terminal is withheld. Delivery then narrows that to the one day
     // which folded the erased owner's records; the empty prior-day fold is not containment.
@@ -645,7 +647,7 @@ describe('independent public daily publication',()=>{
   });
   it('removes derived owner data after the real independent-ledger erasure operation',async()=>{
     const value=await fixture();await ready();await publish();
-    expect(await eraseParticipantAsOwner(runtime(),'e'.repeat(64),value.participantId)).toMatchObject({deleted:true});
+    expect(await eraseParticipantAsOwner(runtime(),'e'.repeat(64),value.participantId,quarantine())).toMatchObject({deleted:true});
     expect((await publicRead()).rows).toEqual([]);await ready();
     await retireStorageCommunityDailyPage(options());
     expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_owners').first('n')).toBe(0);
@@ -658,7 +660,7 @@ describe('independent public daily publication',()=>{
     const owner=(await target().prepare('SELECT * FROM analytics_community_daily_owners').first<Record<string,unknown>>())!;
     const publication=(await target().prepare('SELECT * FROM analytics_community_daily_publications').first<Record<string,unknown>>())!;
     const cursor=await target().prepare('SELECT sequence FROM analytics_source_cursors').first('sequence');
-    await eraseParticipantAsOwner(runtime(),'e'.repeat(64),value.participantId);
+    await eraseParticipantAsOwner(runtime(),'e'.repeat(64),value.participantId,quarantine());
     const terminal=(await readIngestionChanges(source(),sourceId,0)).at(-1)!;expect(terminal.kind).toBe('owner-erased');
     await target().prepare('INSERT INTO analytics_storage_erasure_fences VALUES(?,?,?,?,?,?,?)')
       .bind(sourceId,terminal.ownerDigest,terminal.eventDigest,terminal.sequence,terminal.revision,

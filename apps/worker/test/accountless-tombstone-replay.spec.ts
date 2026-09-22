@@ -5,6 +5,7 @@ import {createAccountlessUploadOwner} from '../src/accountless-ownership';
 import {recordDeletionTombstone,replayDeletionTombstones,hasDeletionTombstone,participantDeletionDigest} from '../src/retention';
 import {encodeBase64Url,sha256Hex} from '../src/crypto';
 import {createV11DeviceFixture} from './helpers/telemetry-v11';
+import {createR2QuarantineObjectStore} from '../src/r2-quarantine-object-store';
 const b=env as Env&{TEST_MIGRATIONS:D1Migration[];TEST_DELETION_LEDGER_MIGRATIONS:D1Migration[]};
 const db=()=>b.USAGE_MONITOR_DB;
 beforeEach(async()=>{await reset();await applyD1Migrations(db(),b.TEST_MIGRATIONS);await applyD1Migrations(b.DELETION_LEDGER,b.TEST_DELETION_LEDGER_MIGRATIONS);});
@@ -17,7 +18,7 @@ async function owner(){
  const participantId=(await db().prepare('SELECT participant_id FROM accountless_upload_owners WHERE enrollment_device_id=?').bind(deviceId).first<string>('participant_id'))!;
  return {deviceId,participantId};
 }
-const replay=()=>replayDeletionTombstones(db(),b.DELETION_LEDGER,b.QUARANTINE);
+const replay=()=>replayDeletionTombstones(db(),b.DELETION_LEDGER,createR2QuarantineObjectStore(b.QUARANTINE));
 describe('restored accountless authority behind independent tombstones',()=>{
  it('revokes authority before deleting only the ledger-proven restored owner',async()=>{
   const erased=await owner(),retained=await owner();await recordDeletionTombstone(b.DELETION_LEDGER,erased.participantId);

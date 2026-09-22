@@ -24,6 +24,7 @@ import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggr
 import { createV11DeviceFixture, makeV11Day, stageV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 import { MODEL_HISTORY_TEST_CAPACITIES, pricedModelHistoryUsage } from './helpers/model-history';
 import { eraseParticipantAsOwner } from '../src/participant-erasure';
+import { createR2QuarantineObjectStore } from '../src/r2-quarantine-object-store';
 import { canonicalJson } from '../src/canonical-json';
 import { readStorageCommunityProgress } from '../src/storage-community-progress';
 import { advanceStorageCommunityGraphWork } from '../src/storage-community-graph-work';
@@ -37,6 +38,7 @@ const b=env as Env & { STORAGE_INGESTION_A:D1Database; TEST_MIGRATIONS:D1Migrati
   TEST_TYPED_V11_ADMISSION_MIGRATIONS:D1Migration[];TEST_TYPED_V1_ADMISSION_MIGRATIONS:D1Migration[];
   TEST_INGESTION_ISOLATION_MIGRATIONS:D1Migration[];TEST_ANALYTICS_MIGRATIONS:D1Migration[];
   STORAGE_ANALYTICS_DB:D1Database; TEST_DELETION_LEDGER_MIGRATIONS:D1Migration[] };
+const quarantine=()=>createR2QuarantineObjectStore(b.QUARANTINE);
 const typed=()=>b.STORAGE_INGESTION_A, legacy=()=>b.USAGE_MONITOR_DB;
 const namespace="synthetic-analysis-source", participantId="participant:synthetic-analysis";
 const today=()=>new Date().toISOString().slice(0,10);
@@ -857,7 +859,7 @@ describe('isolated allowance graph publication',()=>{
   }
   await publishStorageCommunityGraphPreview(bindings());
   const runtime={...b,USAGE_MONITOR_DB:typed(),ENVIRONMENT:'synthetic-development',ACCOUNT_SCOPED_INGEST_MODE:'disabled'} as Env;
-  expect(await eraseParticipantAsOwner(runtime,'e'.repeat(64),f.participantId)).toMatchObject({deleted:true});
+  expect(await eraseParticipantAsOwner(runtime,'e'.repeat(64),f.participantId,quarantine())).toMatchObject({deleted:true});
   // Source authority withholds the old aggregate before any target delivery or cleanup.
   expect(await readPublishedStorageCommunityGraph(bindings())).toBeNull();
   // D1 changes includes each point's model-revision trigger: four point
@@ -875,7 +877,7 @@ describe('isolated allowance graph publication',()=>{
   const preview=(await b.STORAGE_ANALYTICS_DB.prepare('SELECT * FROM analytics_community_graph_previews').first<Record<string,unknown>>())!;
   const cursor=await b.STORAGE_ANALYTICS_DB.prepare('SELECT sequence FROM analytics_source_cursors').first('sequence');
   const runtime={...b,USAGE_MONITOR_DB:typed(),ENVIRONMENT:'synthetic-development',ACCOUNT_SCOPED_INGEST_MODE:'disabled'} as Env;
-  await eraseParticipantAsOwner(runtime,'e'.repeat(64),f.participantId);
+  await eraseParticipantAsOwner(runtime,'e'.repeat(64),f.participantId,quarantine());
   const terminal=(await readIngestionChanges(typed(),namespace,0)).at(-1)!;expect(terminal.kind).toBe('owner-erased');
   // Unit-test the target guard with the exact terminal source receipt. The
   // coordinator's separate suite owns discovery/authentication of this fence.

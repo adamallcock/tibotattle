@@ -2,10 +2,12 @@ import { env,reset,applyD1Migrations,type D1Migration } from 'cloudflare:test';
 import { beforeEach,describe,expect,it } from 'vitest';
 import { createV11DeviceFixture } from './helpers/telemetry-v11';
 import { eraseParticipantAsOwner } from '../src/participant-erasure';
+import { createR2QuarantineObjectStore } from '../src/r2-quarantine-object-store';
 import { initializeStorageSource,readIngestionChanges } from '../src/analytics-delivery';
 import { bootstrapLegacyStorageOwner,advanceLegacyStorageAcknowledgement } from '../src/legacy-storage-journal';
 const b=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_MIGRATIONS:D1Migration[];TEST_TYPED_INGESTION_MIGRATIONS:D1Migration[];TEST_INGESTION_BRIDGE_MIGRATIONS:D1Migration[];TEST_ANALYTICS_MIGRATIONS:D1Migration[];TEST_DELETION_LEDGER_MIGRATIONS:D1Migration[]};
 const db=()=>b.USAGE_MONITOR_DB,target=()=>b.STORAGE_ANALYTICS_DB,id='synthetic-legacy-source';
+const quarantine=()=>createR2QuarantineObjectStore(b.QUARANTINE);
 const changes=()=>readIngestionChanges(db(),id,0);
 beforeEach(async()=>{
  await reset();await applyD1Migrations(db(),b.TEST_MIGRATIONS);
@@ -110,7 +112,7 @@ describe('legacy fit-only authority bridge',()=>{
  });
  it('acknowledges delayed legacy events after exact owner erasure without retaining raw identities in analytics',async()=>{
   const owner=await createV11DeviceFixture(db());await insert(owner);
-  await expect(eraseParticipantAsOwner({...b,ENVIRONMENT:'synthetic-development'},'e'.repeat(64),owner.participantId)).resolves.toMatchObject({deleted:true});
+  await expect(eraseParticipantAsOwner({...b,ENVIRONMENT:'synthetic-development'},'e'.repeat(64),owner.participantId,quarantine())).resolves.toMatchObject({deleted:true});
   expect((await changes()).at(-1)?.kind).toBe('owner-erased');
   expect(await db().prepare('SELECT count(*) n FROM storage_legacy_event_sources').first('n')).toBe(0);
   expect(await db().prepare('SELECT count(*) n FROM telemetry_records').first('n')).toBe(0);

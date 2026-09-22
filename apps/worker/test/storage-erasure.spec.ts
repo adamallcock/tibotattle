@@ -16,6 +16,7 @@ import {authenticateDevice,createDeviceUploadAuthorization,claimDeviceUploadAuth
 import {sha256Hex} from '../src/crypto';
 import {initializeStorageAnalyticsRuntime,advanceStorageAnalytics} from '../src/storage-analytics-runtime';
 import {eraseParticipantAsOwner} from '../src/participant-erasure';
+import {createR2QuarantineObjectStore} from '../src/r2-quarantine-object-store';
 import {advanceStorageErasureJobs,prepareStorageParticipantErasure,requireStorageParticipantErasureComplete} from '../src/storage-erasure';
 import {recordDeletionTombstone,purgeExpiredDeletionTombstones,hasDeletionTombstone,participantDeletionDigest,replayDeletionTombstones} from '../src/retention';
 const b=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_MIGRATIONS:D1Migration[];TEST_TYPED_INGESTION_MIGRATIONS:D1Migration[];
@@ -25,6 +26,7 @@ const source=()=>b.USAGE_MONITOR_DB,target=()=>b.STORAGE_ANALYTICS_DB,sourceId='
 const bindings=()=>({source:source(),target:target(),ledger:b.DELETION_LEDGER,sourceId,sourceNamespace});
 const runtime=(t=target())=>{const configured={...b,ENVIRONMENT:'synthetic-development'} as Env;
  Reflect.set(configured,'TELEMETRY_STORAGE_MODE','typed');Reflect.set(configured,'TELEMETRY_STORAGE_NAMESPACE',sourceNamespace);Reflect.set(configured,'ANALYTICS_DB',t);return configured;};
+const quarantine=()=>createR2QuarantineObjectStore(b.QUARANTINE);
 const today=()=>new Date().toISOString().slice(0,10);
 beforeEach(async()=>{
  await reset();for(const migrations of [b.TEST_MIGRATIONS,b.TEST_TYPED_INGESTION_MIGRATIONS,b.TEST_INGESTION_BRIDGE_MIGRATIONS,b.TEST_TYPED_V11_ADMISSION_MIGRATIONS,b.TEST_TYPED_V1_ADMISSION_MIGRATIONS])await applyD1Migrations(source(),migrations);
@@ -68,7 +70,7 @@ describe('cross-store physical erasure completion',()=>{
  it('fails closed when analytics is offline, then resumes from independent mapping after source deletion',async()=>{
   const f=await fixture(5);await deliver();expect(await count('analytics_v11_value_pages')).toBe(5);
   const offline=new Proxy(target(),{get(db,key){if(key==='prepare')return()=>{throw new Error('synthetic analytics offline');};const v=Reflect.get(db,key);return typeof v==='function'?v.bind(db):v;}});
-  await expect(eraseParticipantAsOwner(runtime(offline),'synthetic-admin',f.participantId)).rejects.toThrow();
+  await expect(eraseParticipantAsOwner(runtime(offline),'synthetic-admin',f.participantId,quarantine())).rejects.toThrow();
   expect(await source().prepare('SELECT 1 FROM participants WHERE id=?').bind(f.participantId).first()).toBeNull();
   expect(await source().prepare('SELECT 1 FROM storage_v11_owner_links WHERE participant_id=?').bind(f.participantId).first()).toBeNull();
   expect(await b.DELETION_LEDGER.prepare('SELECT state FROM storage_erasure_jobs').first('state')).toBe('pending');
@@ -79,11 +81,11 @@ describe('cross-store physical erasure completion',()=>{
   expect(await count('analytics_v11_value_pages')).toBe(1);
   await drain();expect(await count('analytics_v11_value_pages')).toBe(0);expect(await count('analytics_v11_reusable_values')).toBe(0);
   expect(await count('analytics_v11_projection_work')).toBe(0);expect(await count('analytics_storage_erasure_receipts')).toBe(1);
-  expect(await eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId)).toMatchObject({deleted:true,alreadyDeleted:true,contributionsDeleted:null});
+  expect(await eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId,quarantine())).toMatchObject({deleted:true,alreadyDeleted:true,contributionsDeleted:null});
  });
  it('prioritizes erasure before any ordered delivery and does not invent a cursor acknowledgement',async()=>{
   const f=await fixture();
-  expect(await eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId)).toMatchObject({deleted:true});
+  expect(await eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId,quarantine())).toMatchObject({deleted:true});
   expect(await count('analytics_source_cursors')).toBe(0);expect(await count('analytics_storage_erasure_receipts')).toBe(1);
   // Delayed legitimate source callbacks acknowledge only their exact ordered
   // source-proven discards and cannot recreate a removed payload.
@@ -98,12 +100,12 @@ describe('cross-store physical erasure completion',()=>{
   const flaky=new Proxy(target(),{get(db,key){if(key==='batch')return async(statements:D1PreparedStatement[])=>{
    const result=await db.batch(statements);if(!lost){lost=true;throw new Error('synthetic lost committed fence');}return result;};
    const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;}});
-  await expect(eraseParticipantAsOwner(runtime(flaky),'synthetic-admin',f.participantId)).rejects.toThrow();
+  await expect(eraseParticipantAsOwner(runtime(flaky),'synthetic-admin',f.participantId,quarantine())).rejects.toThrow();
   expect(await count('analytics_storage_erasure_fences')).toBe(1);expect(await count('analytics_v11_value_pages')).toBe(1);
   await expect(advanceStorageErasureJobs({...bindings(),sourceNamespace:'synthetic-wrong'})).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
   await drain();expect(await count('analytics_storage_erasure_fences')).toBe(1);expect(await count('analytics_storage_erasure_receipts')).toBe(1);
   expect(await count('analytics_v11_value_pages')).toBe(0);
-  expect(await eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId)).toMatchObject({deleted:true,alreadyDeleted:true});
+  expect(await eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId,quarantine())).toMatchObject({deleted:true,alreadyDeleted:true});
  });
  it('retains pending independent recipes past expiry and releases only completed tombstones',async()=>{
   const f=await fixture();await recordDeletionTombstone(b.DELETION_LEDGER,f.participantId);
@@ -113,7 +115,7 @@ describe('cross-store physical erasure completion',()=>{
   expect(await hasDeletionTombstone(b.DELETION_LEDGER,f.participantId,future)).toBe(true);
   await expect(b.DELETION_LEDGER.prepare('DELETE FROM deletion_tombstones').run()).rejects.toThrow('storage_erasure_pending');
   await expect(requireStorageParticipantErasureComplete(b.DELETION_LEDGER,f.participantId,null)).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
-  await eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId);
+  await eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId,quarantine());
   expect((await purgeExpiredDeletionTombstones(b.DELETION_LEDGER,future)).purged).toBe(1);
   expect(await b.DELETION_LEDGER.prepare('SELECT COUNT(*) n FROM storage_erasure_jobs').first('n')).toBe(0);
  });
@@ -121,7 +123,7 @@ describe('cross-store physical erasure completion',()=>{
   const a=await fixture(),z=await fixture();await recordDeletionTombstone(b.DELETION_LEDGER,a.participantId);
   await prepareStorageParticipantErasure(bindings(),a.participantId);
   const offline=new Proxy(target(),{get(db,key){if(key==='prepare')return()=>{throw new Error('synthetic offline');};const v=Reflect.get(db,key);return typeof v==='function'?v.bind(db):v;}});
-  await expect(eraseParticipantAsOwner(runtime(offline),'synthetic-admin',z.participantId)).rejects.toThrow();
+  await expect(eraseParticipantAsOwner(runtime(offline),'synthetic-admin',z.participantId,quarantine())).rejects.toThrow();
   // Pin the interrupted owner first regardless of random participant IDs.
   await b.DELETION_LEDGER.prepare('UPDATE storage_erasure_jobs SET attempted_ms=CASE owner_digest WHEN ? THEN 0 ELSE 1 END').bind(a.event.ownerDigest).run();
   expect((await advanceStorageErasureJobs(bindings())).completed).toBe(0);
@@ -147,7 +149,7 @@ describe('cross-store physical erasure completion',()=>{
   checkpoint.acquisition.plan.anchors=Array.from({length:1000},(_,i)=>({sourceContext:'["openai_codex","codex"]',contextKey:'openai_codex|codex',observedAtMs:Date.parse('2026-09-01T00:00:00Z')+i,planType:'pro',planVariant:'unknown',accountScopeId:null}));
   await saveStorageHistoryCheckpoint({target:target(),key,checkpoint,expectedHead:null});
   expect(await count('analytics_history_checkpoint_parts')).toBeGreaterThan(0);
-  try{await eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId);}catch{/* Finite cleanup may require another job step. */}
+  try{await eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId,quarantine());}catch{/* Finite cleanup may require another job step. */}
   await drain();await requireStorageParticipantErasureComplete(b.DELETION_LEDGER,f.participantId,bindings());
   for(const table of ['analytics_v1_chunk_values','analytics_v11_projection_work','analytics_v11_value_pages','analytics_v11_reusable_values',
    'analytics_community_graph_results','analytics_community_graph_execution','analytics_history_checkpoint_stages','analytics_history_checkpoint_parts',
@@ -182,7 +184,7 @@ describe('cross-store physical erasure completion',()=>{
      const candidate=Reflect.get(bound,boundMember);return typeof candidate==='function'?candidate.bind(bound):candidate;}});
     const candidate=Reflect.get(value,member);return typeof candidate==='function'?candidate.bind(value):candidate;}});};
    const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;}});
-  await expect(eraseParticipantAsOwner(runtime(stalled),'synthetic-admin',f.participantId)).rejects.toThrow();
+  await expect(eraseParticipantAsOwner(runtime(stalled),'synthetic-admin',f.participantId,quarantine())).rejects.toThrow();
   expect(held).toBe(true);
   expect(await count('analytics_storage_erasure_fences')).toBe(1);
   expect(await count('analytics_storage_erasure_receipts')).toBe(0);
@@ -196,7 +198,7 @@ describe('cross-store physical erasure completion',()=>{
  });
  it('uses the same durable mapping and completion gate during restore replay',async()=>{
   const f=await fixture(5);await deliver();await recordDeletionTombstone(b.DELETION_LEDGER,f.participantId);
-  await expect(replayDeletionTombstones(source(),b.DELETION_LEDGER,b.QUARANTINE,Date.now(),undefined,true,bindings())).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+  await expect(replayDeletionTombstones(source(),b.DELETION_LEDGER,quarantine(),Date.now(),undefined,true,bindings())).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
   expect(await b.DELETION_LEDGER.prepare('SELECT participant_digest FROM storage_erasure_jobs').first('participant_digest')).toBe(await participantDeletionDigest(f.participantId));
   await drain();await requireStorageParticipantErasureComplete(b.DELETION_LEDGER,f.participantId,bindings());
   expect(await count('analytics_v11_value_pages')).toBe(0);

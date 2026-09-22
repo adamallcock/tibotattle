@@ -9,12 +9,14 @@ import { encodeBase64Url, sha256Hex } from '../src/crypto';
 import { handleRequest } from '../src/index';
 import { revokeAccountlessEnrollment } from '../src/accountless-enrollment';
 import { eraseParticipantAsOwner } from '../src/participant-erasure';
+import { createR2QuarantineObjectStore } from '../src/r2-quarantine-object-store';
 import { authenticateDevice } from '../src/device-auth';
 
 interface Bindings extends Env { TEST_MIGRATIONS: D1Migration[]; TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[];
   TEST_INGESTION_BRIDGE_MIGRATIONS: D1Migration[]; TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[];
   TEST_INGESTION_ISOLATION_MIGRATIONS:D1Migration[]; }
 const bindings = env as Bindings, db = () => bindings.USAGE_MONITOR_DB;
+const quarantine = () => createR2QuarantineObjectStore(bindings.QUARANTINE);
 const sourceId = 'synthetic-v11-source';
 const changes = () => readIngestionChanges(db(), sourceId, 0);
 const today = () => new Date().toISOString().slice(0, 10);
@@ -182,7 +184,7 @@ describe('optional baseline v1.1 storage journal bridge', () => {
       expect(await lookupV11StorageSource(db(), event)).toMatchObject({ disposition: 'generation', generationId: first.result.generationId });
     }
     expect(await db().prepare('SELECT count(*) n FROM telemetry_v11_records WHERE manifest_id=?').bind(manifestId).first('n')).toBe(1);
-    await expect(eraseParticipantAsOwner(runtime(), 'e'.repeat(64), fixture.participantId)).resolves.toMatchObject({ deleted: true });
+    await expect(eraseParticipantAsOwner(runtime(), 'e'.repeat(64), fixture.participantId, quarantine())).resolves.toMatchObject({ deleted: true });
     expect(await lookupV11StorageSource(db(), event)).toMatchObject({ disposition: 'discard', reason: 'owner-erased' });
     for (const table of ['telemetry_v11_domains', 'telemetry_v11_domain_days', 'telemetry_v11_day_manifests', 'telemetry_v11_chunks', 'telemetry_v11_records']) {
       expect(await db().prepare(`SELECT count(*) n FROM ${table}`).first('n')).toBe(0);
@@ -278,7 +280,7 @@ describe('optional baseline v1.1 storage journal bridge', () => {
   it('keeps source-proven terminal erasure after metadata and owner mapping are physically deleted', async () => {
     const fixture = await accountlessFixture(); await activate(fixture); await activate(fixture, ['a', 'b']);
     const old = (await changes())[1]!;
-    await expect(eraseParticipantAsOwner(runtime(), 'e'.repeat(64), fixture.participantId)).resolves.toMatchObject({ deleted: true });
+    await expect(eraseParticipantAsOwner(runtime(), 'e'.repeat(64), fixture.participantId, quarantine())).resolves.toMatchObject({ deleted: true });
     expect(await db().prepare('SELECT count(*) n FROM storage_v11_owner_links').first('n')).toBe(0);
     expect(await db().prepare('SELECT count(*) n FROM storage_v11_event_sources').first('n')).toBe(0);
     const events = await changes(); expect(events.at(-1)!.kind).toBe('owner-erased');
