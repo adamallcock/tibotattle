@@ -35,8 +35,8 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-0.1.24 release preparation is in progress. The final candidate requires telemetry
-v1.2 and the Standard/Fast timing correction before source freeze.
+0.1.24 source integration includes telemetry v1.2 and the Standard/Fast timing
+correction. Hosted rollout and final artifact qualification remain in progress.
 See the [candidate release notes](./release-notes/0.1.24.md).
 
 - Enable local Model performance on Windows, following protected-reader and
