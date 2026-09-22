@@ -163,6 +163,7 @@ jobs:
           candidate_root=/workspace/.release-build/electron-production/linux-x64
           host_receipt=.release-build/electron-production/linux-x64/final-runtime/normal-packaged-smoke.json
           timeout 600s docker run --rm --init --platform=linux/amd64 --cap-add=SYS_ADMIN --network none \
+            --shm-size=512m \
             --tmpfs /home/node:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700 \
             --tmpfs /run/user/1000:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700 \
             --env HOME=/home/node --env TMPDIR=/run/user/1000 \
