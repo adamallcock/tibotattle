@@ -53,10 +53,17 @@ remaining native qualification gate here before handoff.
 - Export/release/qualification contracts: 27 passed; four native Windows tests
   correctly require Windows x64 and were not executed on this host.
 - Architecture, documentation and preflight passed.
-- The broad root suite is being checked separately; two initial missing Worker
-  dependency failures passed all seven owning tests after the locked dependency
-  install. Its native macOS watchdog smoke failed, matching an unresolved gate
-  already disclosed in release PR #204; final root results remain to be recorded.
+- The full root run reported 5,946 passed, 14 failed and 53 skipped. Targeted
+  reruns resolved two missing Worker dependency failures (seven tests passed)
+  after installing the locked dependencies. Synthetic R7 environment/sampler
+  tests passed outside the outer sandbox (31 and 13 tests), as did the native
+  audit and macOS watchdog smoke (one test each).
+- The root run also found an omitted tool-inventory caller for the new native
+  Windows test. The inventory is corrected; all six owning tests passed.
+- Two retained R7 receipt assertions remain stale, as already disclosed in
+  [release PR #204](https://github.com/adamallcock/tibotattle/pull/204). Retained
+  receipt regeneration was not performed. The initial full root run is not a
+  passing release gate; targeted reruns are separate evidence.
 
 ## Remaining release gate
 
