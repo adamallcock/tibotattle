@@ -17,6 +17,7 @@ const SHARED_WEB_FILES = Object.freeze([
   "apps/web/public/trends-horizon.js",
   "apps/web/public/allowance-tanks.js",
   "apps/web/public/allowance-tank-renderer.js",
+  "apps/web/public/allowance-trends.js",
   "apps/web/public/community-data.js",
   "apps/web/public/data-client.js",
   "apps/web/public/desktop-appearance.js",

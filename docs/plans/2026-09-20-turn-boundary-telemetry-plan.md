@@ -7,17 +7,18 @@ status: in-progress
 
 # Telemetry v1.2 implementation and compatibility plan
 
-Implementation is preserved at local checkpoint `8c0dd392` on
-`codex/telemetry-v12-integration`, with the remote snapshot `6d061b57`
-(2026-09-21, through PR #194) integrated by merge `123360b4`. The staging asset
-repair is committed as `c3bd6f21`. The original foundation remains at
+Implementation is on `codex/telemetry-v12-integration`. The current local
+candidate incorporates `origin/main` through `d7849e8f` (PR #198) and retains
+the earlier `6d061b57` snapshot (through PR #194), staging asset repair, and
+the mixed-client regression. The original foundation remains at
 `fb778d17` in `codex/telemetry-v12-foundation`; the dirty local main checkout is
 untouched. Exact-total capture uses parser v17 and preserves the remote parser
 v16 missing-cache-write assumption and provenance. Integration retains newer
 tool-free speed reporting, Electron tray/startup behavior, allowance animation,
-admin database health and opt-in crash diagnostics. The incoming crash labels
-are now owned by the canonical localization source so regeneration preserves
-their actions and privacy warning.
+admin database health, opt-in crash diagnostics and LOWESS allowance trends.
+Canonical localization regenerates both browser and Electron copies. The local
+static-asset projection and reviewed surface manifest both include the LOWESS
+module, including Electron, native and history-free export membership.
 
 **Client release remains blocked until the gates below pass.** The integration
 must preserve all supported client versions and current cache calculations.
@@ -42,6 +43,35 @@ activation remain separate; no deployment or remote migration is authorized.
 
 The dated checkpoints below describe their original foundation revision; they
 are not evidence that the rebased integration candidate has passed those gates.
+
+## Latest local qualification checkpoint — 2026-09-22
+
+At clean local commit `35507980`, the `d7849e8f` integration passes 1,009
+browser and 381 local tests, architecture, documentation and preflight checks.
+The Worker owning gate passes 1,925 tests across 152 files, including the
+three-device v1/v1.1/v1.2 regression; its asset staging and production/staging
+Wrangler dry runs pass. The read-only production reconciliation script passes
+34 tests, and a disposable local D1 migration run succeeds. These establish
+local source and package behavior, not live database compatibility or
+authorization to deploy.
+
+The unsigned macOS package first refused the upstream LOWESS asset because the
+reviewed surface manifest omitted it. The exact-list repair passes the surface
+and Electron static-asset tests; artifact packaging must be rerun from a clean
+commit. The native Keychain migration UI smoke still aborts or times out during
+macOS AppKit/LaunchServices alert initialization on this host; its focused
+source tests pass. R7 retained receipts describe an older source closure, while
+the sandbox blocks the external RSS/process probe. Neither guard nor protected
+receipt has been weakened or regenerated.
+
+Public health on 2026-09-21 reported production source `0fb6a5e6` and an
+operational collection state. That observation does not reveal the live D1
+schema. The read-only production reconciliation requires a reviewed private
+resource inventory and credential, which are not present in this workspace.
+Installed-client qualification, live schema compatibility, protected R7/native
+release qualification, remote migrations, deployment and publication remain
+separate gates. Usage v1.2 and performance capabilities remain staged; current
+cache calculations are unchanged.
 
 ## Fixed decisions
 
