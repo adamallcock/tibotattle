@@ -20,6 +20,7 @@ import { validateProductionDistributionMetadata } from '../apps/electron/desktop
 import distributionPolicy from '../config/electron-production-distribution.cjs';
 import { compareAppleMacOSBundleVersions, resolveSignedMacOSBundleVersion } from './macos-bundle-version.js';
 import { collectMacOSTransitionUIDiagnostics } from './lib/macos-transition-ui-diagnostics.mjs';
+import { inspectStartupDiagnostic } from './diagnose-desktop-crash.mjs';
 
 export const NATIVE_SPARKLE_TRANSITION_SCHEMA = 'tibotattle-signed-macos-sparkle-transition-v1';
 export const NATIVE_018_DMG_SHA256 = '2ea8eca02df7cc5210b6b6ce3d6e44016bffd9d081544a4efc6fa1afeeb0f1ae';
@@ -388,6 +389,17 @@ export async function seedNativeSparkleTransitionState(nativeRoot, codexHome) {
   return readSignedReplacementState(nativeRoot);
 }
 
+// Reuse the content-free doctor projection; never retain journal paths or raw errors.
+export async function inspectMacTransitionMigration(homeDirectory,
+  uid = typeof process.getuid === 'function' ? process.getuid() : null) {
+  return {
+    completionStatus: (await inspectNativeElectronHandoverCompletion({
+      userDataRoot: join(homeDirectory, 'Library', 'Application Support', 'TiboTattle'),
+    })).status,
+    startup: await inspectStartupDiagnostic(homeDirectory, uid, 'stable'),
+  };
+}
+
 export async function runSparkleTransition(options) {
   const proof = { schemaVersion: NATIVE_SPARKLE_TRANSITION_SCHEMA, status: 'failed', nativeVersion: '0.1.18',
     nativeSparkleUpdateCompleted: false, productionFeedVerified: false,
@@ -395,8 +407,8 @@ export async function runSparkleTransition(options) {
     installUpdateClicked: false, updaterRelaunchedCandidate: false, candidateCopiedByRunner: false,
     migrationCompleted: false, retainedRowsPreserved: false, saltPreserved: false,
     preferencesPreserved: false, optOutPreserved: false, restartNoDuplicates: false,
-    sourceUntouched: false, ownedProcessesStopped: false, existingCredentialFixture: false, failureStage: null };
-  let active, installedExecutable, ownedPid, installedApp, selectedInput, stage = 'intake';
+    sourceUntouched: false, ownedProcessesStopped: false, existingCredentialFixture: false, failureStage: null, migrationDiagnostics: null };
+  let active, installedExecutable, ownedPid, installedApp, selectedInput, selectedHome, stage = 'intake';
   const knownProcesses = new Map();
   try {
     await fileHash(options.intakePath, 16384);
@@ -405,6 +417,7 @@ export async function runSparkleTransition(options) {
     let home;
     if (options.execute) home = validateSparkleTransitionHost({ target: input.target, platform: process.platform,
       architecture: process.arch, nodeVersion: process.version, environment: process.env, account: userInfo() });
+    selectedHome = home;
     Object.assign(proof, { target: input.target, sourceRevision: input.sourceRevision, dmgSha256: input.dmgSha256,
       asarSha256: input.asarSha256, feedSha256: input.feedSha256, version: input.version, bundleVersion: input.bundleVersion,
       buildNumber: input.buildNumber, nativeDmgSha256: input.nativeDmgSha256, feedScope: input.feedScope, feedOverrideApplied: false });
@@ -531,6 +544,10 @@ export async function runSparkleTransition(options) {
     proof.productionFeedVerified = input.feedScope === 'production_feed'; proof.status = 'passed';
   } catch (error) {
     proof.failureStage = error?.transitionStage ?? stage;
+    if (stage === 'first_migration' && selectedHome) {
+      try { proof.migrationDiagnostics = await inspectMacTransitionMigration(selectedHome); }
+      catch { proof.migrationDiagnostics = { unavailable: true }; }
+    }
     if (ownedPid) {
       proof.uiState = collectMacOSTransitionUIDiagnostics({ pid: ownedPid, verifyOwnedProcess: pid => {
         const expected = knownProcesses.get(pid);

@@ -101,6 +101,7 @@ async function writeOwnerOnlyRecord(rootPath, filename, record, uid) {
 
 /**
  * Keep one bounded, content-free startup result outside the companion process.
+ * Keep its directory separate from state/settings targets owned by native handover.
  * Failures in this optional journal never affect application startup.
  */
 export function createDesktopStartupDiagnostics({
@@ -154,7 +155,7 @@ export function createDesktopStartupDiagnostics({
       if (startedAt !== null) return false;
       try {
         selectedRoot = resolve(rootPath
-          ?? join(app.getPath("userData"), "desktop-settings"));
+          ?? join(app.getPath("userData"), "startup-diagnostics"));
       } catch {
         selectedRoot = null;
       }

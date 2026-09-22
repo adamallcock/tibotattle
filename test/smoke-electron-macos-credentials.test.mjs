@@ -10,7 +10,7 @@ import test from 'node:test';
 import vm from 'node:vm';
 import { validateMacCredentialIntake, parseMacCredentialArguments, runMacCredentialQualification,
   MAC_CREDENTIAL_CONFIRMATION, credentialFixtureArchiveInspectionScript, validateCredentialSnapshot,
-  expectedCredentialReason, macCredentialDialogScript, exerciseCredentialRefresh,
+  expectedCredentialReason, macCredentialDialogScript, exerciseCredentialRefresh, macCredentialFailureDiagnostics,
   validateCredentialFixtureReply, validateCredentialScope, MAC_CREDENTIAL_FIXTURE_FAILURE_CODES } from '../scripts/smoke-electron-macos-credentials.mjs';
 import { CREDENTIAL_FIXTURE_CASES, credentialFixtureRoot, credentialFixtureConfiguration,
   parseCredentialFixtureArguments, compileCredentialFixture } from '../scripts/prepare-electron-macos-credential-fixture.mjs';
@@ -326,4 +326,24 @@ test('manual hosted workflow has no production upload, secret provisioning or ar
   assert.match(source, /steps\.qualification\.outputs\.identity/u);
   assert.doesNotMatch(source, /secrets\.|id-token:|contents: write|pull_request_target|r2 |wrangler|security add/u);
   assert.match(source, /path: credential-receipts\/\*\.json/u);
+});
+
+
+test('credential failure diagnostics preserve fixed launch/settings stages and cleanup without raw errors', () => {
+  assert.deepEqual(macCredentialFailureDiagnostics({ signedLaunchStage: 'native_intro',
+    stage: 'native_intro_unexpected', ownedMacProcessesStopped: true,
+    message: '/Users/PRIVATE_SENTINEL', stderr: 'SECRET' }), {
+    launchStage: 'native_intro', launchCode: 'native_intro_unexpected', settingsStage: null,
+    launchOwnedProcessesStopped: true,
+  });
+  assert.deepEqual(macCredentialFailureDiagnostics({ emptyProfileStage: 'settings_effect',
+    ownedMacProcessesStopped: false }), {
+    launchStage: null, launchCode: null, settingsStage: 'settings_effect', launchOwnedProcessesStopped: false,
+  });
+  for (const error of [null, {}, { signedLaunchStage: 'PRIVATE_SENTINEL', stage: 'PRIVATE_SENTINEL',
+    emptyProfileStage: 'PRIVATE_SENTINEL', ownedMacProcessesStopped: 'true' }]) {
+    assert.deepEqual(macCredentialFailureDiagnostics(error), {
+      launchStage: null, launchCode: null, settingsStage: null, launchOwnedProcessesStopped: null,
+    });
+  }
 });

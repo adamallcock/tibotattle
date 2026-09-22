@@ -199,7 +199,10 @@ async function launch(verified, environment, { untouched = false, onFailure, lau
       state.startupObservation = await observeBeforeDashboard(state.pid);
       if (state.startupObservation !== null) return state;
     }
-    if (untouched) await continueNativeIntro(state, verified);
+    if (untouched) {
+      launchStage = 'native_intro';
+      await continueNativeIntro(state, verified);
+    }
     launchStage = 'owned_debugger';
     await waitFor(() => listenerOwned(state.pid, port), STARTUP, 'owned debugger');
     launchStage = 'dashboard_target';

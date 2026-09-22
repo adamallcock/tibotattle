@@ -321,12 +321,24 @@ async function inspectCapture(homeDirectory, uid, profile) {
   return { capturePreference, crashpad: counts };
 }
 
-async function inspectStartupDiagnostic(homeDirectory, uid, profile) {
-  const path = join(userDataPath(homeDirectory, profile), "desktop-settings",
-    "startup-diagnostic-v1.json");
+async function readStartupDiagnosticBytes(userData, uid) {
+  // Older builds stored this record in the migration-owned settings directory.
+  // Fall back only when the current record is absent, never when it is unsafe.
+  for (const directory of ["startup-diagnostics", "desktop-settings"]) {
+    try {
+      return await readOwnedBytes(join(userData, directory, "startup-diagnostic-v1.json"),
+        uid, 4096, { ownerOnly: true });
+    } catch (error) {
+      if (error?.code !== "ENOENT" || directory === "desktop-settings") throw error;
+    }
+  }
+}
+
+export async function inspectStartupDiagnostic(homeDirectory, uid, profile) {
   let raw;
   try {
-    raw = await readOwnedFile(path, uid, 4096, { ownerOnly: true });
+    raw = (await readStartupDiagnosticBytes(userDataPath(homeDirectory, profile), uid))
+      ?.toString("utf8") ?? null;
     if (raw === null) return { profile, status: "unavailable", record: null };
   } catch (error) {
     return { profile, status: error?.code === "ENOENT" ? "missing" : "unavailable",
@@ -532,8 +544,7 @@ export async function exportPrivateCrashEvidence({
       continue;
     }
     try {
-      const bytes = await readOwnedBytes(join(userData, "desktop-settings",
-        "startup-diagnostic-v1.json"), uid, 4096, { ownerOnly: true });
+      const bytes = await readStartupDiagnosticBytes(userData, uid);
       if (bytes === null) skippedFiles += 1;
       else sources.push({ name: `startup-${profile}.json`, bytes });
     } catch (error) { if (error?.code !== "ENOENT") skippedFiles += 1; }

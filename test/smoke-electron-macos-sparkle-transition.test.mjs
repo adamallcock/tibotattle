@@ -8,6 +8,7 @@ import { runInNewContext } from 'node:vm';
 import * as runner from '../scripts/smoke-electron-macos-sparkle-transition.mjs';
 import { retireAutomaticContributionState } from '../src/automatic-contribution-retirement.js';
 import { readSignedReplacementState } from '../scripts/smoke-electron-macos-replacement.mjs';
+import { createDesktopStartupDiagnostics } from '../apps/electron/desktop-startup-diagnostics.js';
 
 const source = 'a'.repeat(40);
 const nativeDigests = {
@@ -348,4 +349,26 @@ test('workflow download planning matches the runner for both architectures and s
       for (const key of ['sourceRevision', 'version', 'bundleVersion', 'buildNumber']) assert.equal(receipt[key], value[key]);
     } finally { await rm(root, { recursive: true, force: true }); }
   }
+});
+
+
+test('migration failure diagnostics retain only completion status and validated startup evidence', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'sparkle-diagnostic-private-sentinel-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const missing = await runner.inspectMacTransitionMigration(home);
+  assert.equal(missing.completionStatus, 'absent');
+  assert.equal(missing.startup.status, 'missing');
+  const diagnostics = createDesktopStartupDiagnostics({ app: {
+    getPath: () => join(home, 'Library', 'Application Support', 'TiboTattle'),
+    getVersion: () => '0.1.24',
+  } });
+  assert.equal(await diagnostics.start(), true);
+  diagnostics.mark('native_handover');
+  assert.equal(await diagnostics.stop('native_handover_blocked'), true);
+  const result = await runner.inspectMacTransitionMigration(home);
+  assert.equal(result.completionStatus, 'absent');
+  assert.equal(result.startup.status, 'available');
+  assert.equal(result.startup.record.phase, 'native_handover');
+  assert.equal(result.startup.record.code, 'native_handover_blocked');
+  assert.doesNotMatch(JSON.stringify(result), /private-sentinel|Application Support|startup-diagnostic-v1/u);
 });
