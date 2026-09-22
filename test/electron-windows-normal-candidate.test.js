@@ -65,6 +65,7 @@ import {
   selectWindowsNormalCandidateSettingsTarget,
   validateWindowsNormalCandidateSmokeMetadata,
   verifyWindowsNormalCandidateSyntheticIngestion,
+  verifyWindowsNormalCandidateModelPerformance,
   verifyWindowsNormalCandidateOptOut,
   verifyWindowsNormalCandidateSmokePackage,
   WINDOWS_NORMAL_CANDIDATE_FIREWALL_TIMEOUT_MS,
@@ -76,6 +77,21 @@ const STAGED_APP_PATH = String.raw`C:\candidate\app`;
 const SOURCE_CANDIDATE_PATH = String.raw`C:\candidate\production-source-candidate.json`;
 const RECEIPT_PATH = String.raw`C:\workspace\.release-build\electron-windows-normal-candidate\normal-candidate-smoke.json`;
 const FIREWALL_RULE = "tibotattle-normal-candidate-550e8400-e29b-41d4-a716-446655440000";
+
+test("packaged Windows timing smoke requires a complete ready source scan", () => {
+  const ready = { schemaVersion: 4, method: 5, status: "ready", collecting: false,
+    stale: false, period: "all", models: [], historyProgress: { checked: 1, total: 1 } };
+  assert.equal(verifyWindowsNormalCandidateModelPerformance(ready), true);
+  for (const value of [null, { ...ready, schemaVersion: 2 }, { ...ready, method: 3 },
+    { ...ready, status: "unavailable" },
+    { ...ready, status: "loading" }, { ...ready, stale: true },
+    { ...ready, historyProgress: null },
+    { ...ready, historyProgress: { checked: 0, total: 1 } },
+    { ...ready, historyProgress: { checked: 0, total: 0 } },
+    { ...ready, models: null }]) {
+    assert.equal(verifyWindowsNormalCandidateModelPerformance(value), false);
+  }
+});
 
 test("startup failure diagnostics retain only fixed categories and booleans", () => {
   const value = { launch: "restart", requests: "zero", refreshStatus: "idle",

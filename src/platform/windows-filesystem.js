@@ -55,9 +55,9 @@ export const WINDOWS_SOURCE_READ_CONTRACT = 'windows-source-read-v1';
 export const WINDOWS_SOURCE_READ_METHODS = Object.freeze([
   'openSourceFile', 'statSourceFile', 'readSourceFile', 'closeSourceFile',
 ]);
-// Narrow approval, deliberately independent of unrelated filesystem writes.
-// Change only after exact-native source-reader and packaged-runtime qualification.
-export const WINDOWS_SOURCE_READ_APPROVED = false;
+// Narrow source-read capability, independent of unrelated filesystem writes.
+// The exact native binding and manifest must still verify at runtime.
+export const WINDOWS_SOURCE_READ_APPROVED = true;
 
 const MANIFEST_KEYS = Object.freeze([
   "schemaVersion",

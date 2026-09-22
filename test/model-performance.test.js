@@ -560,6 +560,9 @@ test('actual worker persists separate Codex sources and preserves the unscoped l
     if (process.platform === 'win32') {
       let unavailable = false;
       try { loadWindowsSourceReadBinding(); } catch { unavailable = true; }
+      if (process.env.USAGE_MONITOR_WINDOWS_QUALIFICATION === '1') {
+        assert.equal(unavailable, false, 'native Windows qualification requires the exact source-read binding');
+      }
       if (unavailable) {
         const deadline = Date.now() + 10000;
         let result;

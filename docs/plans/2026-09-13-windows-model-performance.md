@@ -5,11 +5,11 @@ type: plan
 status: native-qualification-pending
 ---
 
-The local implementation on `codex/windows-model-performance` now uses shared
-filesystem and SQLite primitives. Windows model performance remains unavailable
-until native qualification; this is not release or installed-artifact evidence.
-The isolated branch starts at `9385bad2` and preserves the main checkout's
-uncommitted work. Accounting and timing schemas are unchanged.
+The shared filesystem and SQLite implementation is present on main. The
+unreleased Windows source candidate enables its narrow source-read capability;
+native and packaged qualification remain open. The released 0.1.22 Windows
+model-performance page remains unavailable. Accounting and timing schemas are
+unchanged by this capability switch.
 
 ## Implemented boundaries
 
@@ -39,9 +39,9 @@ uncommitted work. Accounting and timing schemas are unchanged.
   tied to the exact native contract and all four methods. Older manifests remain
   compatible for their existing consumers. The source-read loader requires narrow
   approval and existing audit-guard approval, without enabling unrelated native
-  write/path-walk policy. `WINDOWS_SOURCE_READ_APPROVED` remains false; edited
-  sidecar approval is rejected. Qualification must explicitly change that reviewed
-  policy and regenerate the binary-bound manifest.
+  write/path-walk policy. `WINDOWS_SOURCE_READ_APPROVED` is true in the source
+  candidate; an edited or mismatched sidecar is rejected. Qualification builds
+  the binary-bound manifest from this exact reviewed source.
 - Electron runtime, qualification authority and artifact verification include the
   shared SQLite helper. Worker capability failure occurs before source discovery
   and remains bounded, retryable and explicitly unavailable.
@@ -68,7 +68,8 @@ this change does not remove resource limits or reinterpret them as retention.
 
 ## Validation and remaining gates
 
-On macOS with Node 26.2.0, the focused shared SQLite, audit, loader, manifest,
+The earlier source-preparation run on macOS with Node 26.2.0 passed the focused
+shared SQLite, audit, loader, manifest,
 source/rollout/compressed-reader and timing suite passed 92 tests. Synthetic
 bindings test orchestration and real SQLite behavior, not Windows ACLs.
 The full local companion suite passed 356 tests. Electron staging/package tests
@@ -82,5 +83,9 @@ Remaining native gates: build the exact Windows x64 binary and sidecar; run
 junction/hard-link refusal, foreign leases, guarded journaling and hot-journal
 crash recovery; complete native policy review; then run the packaged timing
 worker against synthetic logs and verify TPS/TTFT, restart and graceful refusal.
-Only after that evidence should narrow source-read approval or the visible
-Windows availability claim change. No signing, install, push or release occurred.
+The source candidate now requires the real model-performance worker in native
+Windows qualification and a complete model-performance scan with a rendered
+ready page in the unsigned packaged Electron normal journey, on launch and
+restart. Those are merge gates.
+The visible claim in a released app changes only when a qualified new artifact
+is published; no signing, install or release is part of this candidate.

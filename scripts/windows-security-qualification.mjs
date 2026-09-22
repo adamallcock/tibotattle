@@ -15,6 +15,10 @@ import { readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  WINDOWS_SOURCE_READ_APPROVED,
+  WINDOWS_SOURCE_READ_CONTRACT,
+} from "../src/platform/windows-filesystem.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -30,6 +34,7 @@ const FILESYSTEM_SECURITY_TEST_FILE = /^windows-(?:filesystem|security)(?:-[a-z0
 const CREDENTIAL_TEST_FILE = /^windows-(?:credential|production-credential|accountless-installation-credential)(?:-[a-z0-9-]+)?\.test\.(?:js|mjs)$/u;
 const ACCOUNTLESS_CREDENTIAL_TEST_FILE = /^windows-accountless-installation-credential(?:-[a-z0-9-]+)?\.test\.(?:js|mjs)$/u;
 const QUALIFICATION_TEST_FILES = Object.freeze([
+  "test/model-performance.test.js",
   "test/windows-credential-manager-probe.test.js",
   "test/windows-credential-audit-file-guard.test.js",
   "test/windows-credential-manager.test.js",
@@ -75,7 +80,7 @@ function fixedError(status) {
   return error;
 }
 
-async function readVerifiedBindingManifest({
+export async function readVerifiedBindingManifest({
   manifestPath = BINDING_MANIFEST_PATH,
   readManifest = readFile,
 } = {}) {
@@ -103,7 +108,10 @@ async function readVerifiedBindingManifest({
     && manifest.nativeClaims?.credentialAuditFileGuardSafe === true
     && manifest.credentialAuditFileGuardContractVersion
       === "windows-credential-audit-file-guard-v1"
-    && manifest.credentialMutexContractVersion === "windows-credential-mutex-v1";
+    && manifest.credentialMutexContractVersion === "windows-credential-mutex-v1"
+    && manifest.sourceRead?.contractVersion === WINDOWS_SOURCE_READ_CONTRACT
+    && manifest.sourceRead?.approved === WINDOWS_SOURCE_READ_APPROVED
+    && Object.keys(manifest.sourceRead).sort().join(",") === "approved,contractVersion";
   if (!valid) throw fixedError(FIXED_STATUS.manifestInvalid);
   return Object.freeze({
     bytes: manifest.bytes,

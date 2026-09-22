@@ -196,6 +196,7 @@ const NORMAL_CANDIDATE_STARTUP_PHASES = new Set([
   "startup_refresh_completion",
   "explicit_refresh_acceptance",
   "explicit_refresh_completion",
+  "model_performance",
   "sharing_opt_out",
   "process_proof",
   "settings_target",
@@ -349,6 +350,7 @@ const FAILURE_CODES = new Set([
   "LOCAL_EXPLICIT_REFRESH_ACCEPTANCE_UNAVAILABLE",
   "LOCAL_EXPLICIT_REFRESH_COMPLETION_UNAVAILABLE",
   "LOCAL_SYNTHETIC_INGESTION_UNAVAILABLE",
+  "LOCAL_MODEL_PERFORMANCE_UNAVAILABLE",
   "SETTINGS_UNAVAILABLE",
   "SETTINGS_PERSISTENCE_INVALID",
   "CLEAN_QUIT_INVALID",
@@ -2788,6 +2790,18 @@ export function verifyWindowsNormalCandidateSyntheticIngestion({
     && history.totalTokens === expected.totalTokens;
 }
 
+// A ready, complete scan proves the packaged timing worker opened its guarded
+// database and read the disposable Codex source through the native capability.
+// The smoke records only this boolean, never model or source data.
+export function verifyWindowsNormalCandidateModelPerformance(value) {
+  const progress = value?.historyProgress;
+  return value?.schemaVersion === 4 && value.method === 5
+    && value.status === 'ready' && value.collecting === false && value.stale === false
+    && value.period === 'all' && Array.isArray(value.models)
+    && Number.isSafeInteger(progress?.total) && progress.total > 0
+    && progress.checked === progress.total;
+}
+
 async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () => {} }) {
   const dashboard = exactLoopbackRootPage(target.url);
   if (dashboard === null) fail("DASHBOARD_INVALID");
@@ -2919,6 +2933,27 @@ async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () =>
     })) {
       fail("LOCAL_SYNTHETIC_INGESTION_UNAVAILABLE");
     }
+    onPhase("model_performance");
+    const timing = await waitFor(async () => {
+      const value = await jsonFetch(new URL("/api/local/model-performance?period=all", dashboard), { fetchImpl });
+      return verifyWindowsNormalCandidateModelPerformance(value);
+    }, OPERATION_TIMEOUT_MS);
+    if (timing !== true) fail("LOCAL_MODEL_PERFORMANCE_UNAVAILABLE");
+    const openedPerformance = await cdp.evaluate(`(() => {
+      const link = document.querySelector('[data-nav="performance"]');
+      if (!link) return false;
+      link.click();
+      return true;
+    })()`);
+    if (openedPerformance !== true) fail("LOCAL_MODEL_PERFORMANCE_UNAVAILABLE");
+    const renderedPerformance = await waitFor(() => cdp.evaluate(`(() => {
+      const section = document.querySelector('#performance');
+      const provider = section?.querySelector('.performance-provider');
+      const status = section?.querySelector('.performance-status');
+      return Boolean(section && !section.inert && section.getAttribute('aria-hidden') !== 'true'
+        && provider?.textContent?.trim() && status?.dataset?.state === 'ready');
+    })()`), OPERATION_TIMEOUT_MS);
+    if (renderedPerformance !== true) fail("LOCAL_MODEL_PERFORMANCE_UNAVAILABLE");
     if (!observer.valid()) fail("DASHBOARD_INVALID");
     preloadContexts?.dispose?.();
     return Object.freeze({

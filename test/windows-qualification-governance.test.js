@@ -8,6 +8,7 @@ import {
   FIXED_STATUS,
   WINDOWS_SECURITY_QUALIFICATION_TEST_FILES,
   parseTapSummary,
+  readVerifiedBindingManifest,
   qualificationReceiptMetadata,
   qualificationTestFiles,
 } from "../scripts/windows-security-qualification.mjs";
@@ -16,6 +17,27 @@ const REPOSITORY_ROOT = resolve(
   dirname(fileURLToPath(import.meta.url)),
   "..",
 );
+
+test("Windows qualification requires the exact approved source-read capability", async () => {
+  const manifest = {
+    schemaVersion: "windows-filesystem-binding-manifest-v1",
+    bindingFile: "windows_filesystem.node", platform: "win32", architecture: "x64",
+    bytes: 1, sha256: "0".repeat(64),
+    approvedPolicy: { productionSafe: false, pathWalkRaceSafe: false,
+      credentialMutexSafe: true, credentialAuditFileGuardSafe: true },
+    nativeClaims: { credentialAuditFileGuardSafe: true },
+    credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    credentialMutexContractVersion: "windows-credential-mutex-v1",
+    sourceRead: { contractVersion: "windows-source-read-v1", approved: true },
+  };
+  const read = value => readVerifiedBindingManifest({ readManifest: async () => JSON.stringify(value) });
+  assert.deepEqual(await read(manifest), { bytes: 1, sha256: "0".repeat(64) });
+  for (const sourceRead of [undefined, { ...manifest.sourceRead, approved: false },
+    { ...manifest.sourceRead, contractVersion: "future" },
+    { ...manifest.sourceRead, extra: false }]) {
+    await assert.rejects(read({ ...manifest, sourceRead }), { code: FIXED_STATUS.manifestInvalid });
+  }
+});
 
 test("Windows security workflow is manual, pinned, read-only, and content-free", async () => {
   const workflow = await readFile(
@@ -99,6 +121,7 @@ test("qualification selection is the exact reviewed Windows test set", async () 
   });
   assert.deepEqual(selected.files, WINDOWS_SECURITY_QUALIFICATION_TEST_FILES);
   assert.deepEqual(selected.files, [
+    "test/model-performance.test.js",
     "test/windows-credential-manager-probe.test.js",
     "test/windows-credential-audit-file-guard.test.js",
     "test/windows-credential-manager.test.js",
