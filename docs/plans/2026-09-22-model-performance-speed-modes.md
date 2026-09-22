@@ -29,13 +29,13 @@ was ported onto `1d61581b` as `a950be37`, then integrated with the corrected
 v1.2 parser at `fc6a414c`. The release owner included both in the 0.1.24 candidate.
 
 Source and browser validation do not qualify an installed native application or
-release. The release owner is coordinating possible inclusion in 0.1.24.
+release. The release owner is qualifying the combined 0.1.24 candidate separately.
 
 Validation:
 
 - Before integration: web suite 1,011 passed; local suite 378 passed; public-site
   gate 68 passed. After integration: web suite 1,016 passed; focused timing,
-  parser, store, route and telemetry-worker checks 72 passed.
+  parser, store, route and telemetry-worker checks 72 passed; local suite 382 passed.
 - Focused mode UI: 51 passed; i18n/Electron copy: 6 passed.
 - Architecture, documentation governance, preflight, and both i18n mirrors pass.
 - In-app browser: default Standard, sparse Fast, explicit empty Fast, and Spanish
@@ -44,8 +44,16 @@ Validation:
 - The shared parser correction was committed in `fc6a414c`; explicit task-boundary
   overrides and contradictory/malformed evidence have regression coverage. The
   real-source browser sample was regenerated using that exact committed parser.
-- The prior full root run was interrupted before changing the integration base;
-  it is not a passing receipt. A fresh complete root run is in progress.
+- The prior full root run was interrupted before changing the integration base.
+  The complete integrated root run at `090942d8` had 5,822 passed, 13 failed and
+  49 skipped. It is not a passing root receipt. Two failures exposed synthetic
+  fixtures without explicit Standard evidence and a stale Windows smoke DTO
+  check. Corrected the fixtures and required schema 5, Standard mode and zero
+  excluded turns; both owning files then passed all 55 tests.
+- The remaining root failures were two stale retained R7 receipts, seven R7
+  measurement/process-owner checks, a denied native sandbox operation and a
+  native migration UI smoke timeout. These were handed to the release owner
+  for its normal-host gates; no protected receipts were regenerated here.
 - Installed/native, signed-release and updater gates belong to the release
   owner's final candidate; this record does not claim those gates passed.
 

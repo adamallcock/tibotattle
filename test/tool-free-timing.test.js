@@ -17,7 +17,7 @@ const count = (at, total, last) => rec(at, 'event_msg', { type: 'token_count', i
   last_token_usage: { output_tokens: last, reasoning_output_tokens: last / 2 },
 } });
 const fixture = () => [rec(-100, 'session_meta', { id: 'session' }), count(-100, 1000, 10),
-  event(0, 'task_started'), rec(0, 'turn_context', { turn_id: 'turn', model: 'gpt-5.5', effort: 'high' }),
+  event(0, 'task_started'), rec(0, 'turn_context', { turn_id: 'turn', model: 'gpt-5.5', effort: 'high', service_tier: 'default' }),
   event(1000, 'item_completed', { thread_id: 'session', item: { type: 'AgentMessage' }, completed_at_ms: BASE + 1000 }),
   rec(1000, 'response_item', { type: 'message', role: 'assistant', content: [] }),
   count(1000, 1120, 120), event(1200, 'task_complete', { duration_ms: 1200, time_to_first_token_ms: 200 })];
