@@ -15,36 +15,56 @@ import type {
   PostgresTelemetryV1Pool,
   PostgresTelemetryV1QueryResult,
 } from "./postgres-telemetry-v1-contribution-store";
+import {
+  quotePostgresIdentifier,
+  type PostgresSchemaOptions,
+} from "./postgres-client";
+import { resolvePostgresTelemetryV1Tables } from "./postgres-telemetry-v1-schema";
 
-const SCHEMA = "tibotattle_v1_test";
 const MAX_READER_PAGE_SIZE = 1_024;
 
-const STATE_SQL = `SELECT through_record_id, last_record_id, is_complete
-  FROM ${SCHEMA}.telemetry_v1_quota_fit_backfill WHERE singleton_id = 1`;
+interface QuotaTables {
+  readonly backfill: string;
+  readonly rows: string;
+  readonly records: string;
+  readonly participants: string;
+}
 
-// LIMIT is applied to canonical rows before eligibility filtering. Ineligible
-// and losing-device rows therefore advance the finite source high-water page.
-// FOR SHARE keeps a source correction/deletion from committing between this
-// snapshot and the projection upsert; its trigger then owns the post-copy
-// mutation once this bounded transaction commits.
-export const POSTGRES_V1_QUOTA_PROJECTION_BACKFILL_INSERT_SQL = `
+function resolveQuotaTables(schemaOptions: PostgresSchemaOptions = {}): QuotaTables {
+  const telemetry = resolvePostgresTelemetryV1Tables(schemaOptions);
+  const schema = quotePostgresIdentifier(telemetry.primarySchema);
+  return Object.freeze({
+    backfill: `${schema}."telemetry_v1_quota_fit_backfill"`,
+    rows: `${schema}."telemetry_v1_quota_fit_rows"`,
+    records: telemetry.records,
+    participants: `${schema}."participants"`,
+  });
+}
+
+function stateSql(tables: QuotaTables): string {
+  return `SELECT through_record_id, last_record_id, is_complete
+  FROM ${tables.backfill} WHERE singleton_id = 1`;
+}
+
+function backfillInsertSql(tables: QuotaTables): string {
+  return `
   WITH page AS MATERIALIZED (
     SELECT r.id, r.participant_id, r.resets_at,
       r.observed_at
-    FROM ${SCHEMA}.records r
+    FROM ${tables.records} r
     WHERE r.id > $1 AND r.id <= $2
-      AND EXISTS (SELECT 1 FROM ${SCHEMA}.telemetry_v1_quota_fit_backfill
+      AND EXISTS (SELECT 1 FROM ${tables.backfill}
         WHERE singleton_id = 1 AND last_record_id = $1
           AND through_record_id = $2 AND is_complete = 0)
     ORDER BY r.id LIMIT $3
     FOR SHARE OF r
   )
-  INSERT INTO ${SCHEMA}.telemetry_v1_quota_fit_rows
+  INSERT INTO ${tables.rows}
     (record_id, participant_id, resets_at, observed_at)
   SELECT r.id, r.participant_id, r.resets_at, r.observed_at
   FROM page r
   WHERE EXISTS (
-    SELECT 1 FROM ${SCHEMA}.records source
+    SELECT 1 FROM ${tables.records} source
     WHERE source.id = r.id AND source.stream = 'quota'
       AND source.limit_id = 'codex'
       AND source.window_duration_minutes = 10080
@@ -57,19 +77,45 @@ export const POSTGRES_V1_QUOTA_PROJECTION_BACKFILL_INSERT_SQL = `
   )
   ON CONFLICT(record_id) DO UPDATE SET participant_id = EXCLUDED.participant_id,
     resets_at = EXCLUDED.resets_at, observed_at = EXCLUDED.observed_at`;
+}
 
-export const POSTGRES_V1_QUOTA_PROJECTION_BACKFILL_ADVANCE_SQL = `
+function backfillAdvanceSql(tables: QuotaTables): string {
+  return `
   WITH next_cursor AS MATERIALIZED (
     SELECT COALESCE(MAX(id), $2) AS id FROM (
-      SELECT id FROM ${SCHEMA}.records WHERE id > $1 AND id <= $2
+      SELECT id FROM ${tables.records} WHERE id > $1 AND id <= $2
       ORDER BY id LIMIT $3
     ) page
   )
-  UPDATE ${SCHEMA}.telemetry_v1_quota_fit_backfill
+  UPDATE ${tables.backfill}
   SET last_record_id = (SELECT id FROM next_cursor),
       is_complete = CASE WHEN (SELECT id FROM next_cursor) = through_record_id THEN 1 ELSE 0 END
   WHERE singleton_id = 1 AND last_record_id = $1
     AND through_record_id = $2 AND is_complete = 0`;
+}
+
+// LIMIT is applied to canonical rows before eligibility filtering. Ineligible
+// and losing-device rows therefore advance the finite source high-water page.
+// FOR SHARE keeps a source correction/deletion from committing between this
+// snapshot and the projection upsert; its trigger then owns the post-copy
+// mutation once this bounded transaction commits.
+export const POSTGRES_V1_QUOTA_PROJECTION_BACKFILL_INSERT_SQL =
+  backfillInsertSql(resolveQuotaTables());
+export const POSTGRES_V1_QUOTA_PROJECTION_BACKFILL_ADVANCE_SQL =
+  backfillAdvanceSql(resolveQuotaTables());
+
+/** SQL builders used by a schema-isolated qualification harness. */
+export function buildPostgresV1QuotaProjectionBackfillInsertSql(
+  schemaOptions: PostgresSchemaOptions = {},
+): string {
+  return backfillInsertSql(resolveQuotaTables(schemaOptions));
+}
+
+export function buildPostgresV1QuotaProjectionBackfillAdvanceSql(
+  schemaOptions: PostgresSchemaOptions = {},
+): string {
+  return backfillAdvanceSql(resolveQuotaTables(schemaOptions));
+}
 
 function unsupported(): V1QuotaFitProjectionUnavailableError {
   return new V1QuotaFitProjectionUnavailableError();
@@ -184,14 +230,18 @@ async function readOne<T>(
   return result;
 }
 
-async function readState(pool: PostgresTelemetryV1Pool): Promise<ValidBackfillState> {
-  return readOne(pool, STATE_SQL, [], decodeState);
+async function readState(
+  pool: PostgresTelemetryV1Pool,
+  tables: QuotaTables,
+): Promise<ValidBackfillState> {
+  return readOne(pool, stateSql(tables), [], decodeState);
 }
 
 async function pageTransaction(
   pool: PostgresTelemetryV1Pool,
   previous: ValidBackfillState,
   pageSize: number,
+  tables: QuotaTables,
 ): Promise<ValidBackfillState> {
   const client = await connect(pool);
   let transactionOpen = false;
@@ -202,11 +252,11 @@ async function pageTransaction(
     transactionOpen = true;
     await client.query("SET LOCAL statement_timeout='10s'");
     await client.query("SET LOCAL lock_timeout='5s'");
-    await client.query(POSTGRES_V1_QUOTA_PROJECTION_BACKFILL_INSERT_SQL,
+    await client.query(backfillInsertSql(tables),
       [previous.lastRecordId, previous.throughRecordId, pageSize]);
-    await client.query(POSTGRES_V1_QUOTA_PROJECTION_BACKFILL_ADVANCE_SQL,
+    await client.query(backfillAdvanceSql(tables),
       [previous.lastRecordId, previous.throughRecordId, pageSize]);
-    state = decodeState(await client.query(STATE_SQL));
+    state = decodeState(await client.query(stateSql(tables)));
     commitAttempted = true;
     await client.query("COMMIT");
     transactionOpen = false;
@@ -233,14 +283,16 @@ async function pageTransaction(
 export async function backfillPostgresV1QuotaFitProjection(
   pool: PostgresTelemetryV1Pool,
   options: { maxPages?: number; pageSize?: number } = {},
+  schemaOptions: PostgresSchemaOptions = {},
 ): Promise<{ status: "complete" | "deferred"; pagesRun: number; queriesUsed: number;
   lastRecordId: number; throughRecordId: number }> {
   const { maxPages, pageSize } = validateBackfillOptions(options);
-  let state = await readState(pool);
+  const tables = resolveQuotaTables(schemaOptions);
+  let state = await readState(pool, tables);
   let pagesRun = 0;
   while (state.isComplete === 0 && pagesRun < maxPages) {
     const previous = state;
-    state = await pageTransaction(pool, previous, pageSize);
+    state = await pageTransaction(pool, previous, pageSize, tables);
     if (state.throughRecordId !== previous.throughRecordId
         || state.lastRecordId < previous.lastRecordId
         || (state.isComplete === 0 && state.lastRecordId === previous.lastRecordId)) {
@@ -303,13 +355,13 @@ function fitRow(row: Record<string, unknown>): V1FitSourceRow {
   };
 }
 
-function planSql(historical: boolean): string {
+function planSql(historical: boolean, tables: QuotaTables): string {
   const cutoff = historical ? " AND r.observed_at < NULLIF($5, '')::timestamptz" : "";
   return `WITH same_time AS MATERIALIZED (
   SELECT r.id, to_char(r.observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS observed_at,
     to_char((r.observed_at AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS observed_day, r.device_id,
     r.provider, r.limit_id, r.plan_type, r.plan_variant, r.stream
-  FROM ${SCHEMA}.records r
+  FROM ${tables.records} r
   WHERE r.participant_id = $1 AND r.stream = 'quota'
     AND NULLIF($2, '')::timestamptz IS NOT NULL
     AND r.observed_at = NULLIF($2, '')::timestamptz AND r.id > $3${cutoff}
@@ -318,7 +370,7 @@ function planSql(historical: boolean): string {
   SELECT r.id, to_char(r.observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS observed_at,
     to_char((r.observed_at AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS observed_day, r.device_id,
     r.provider, r.limit_id, r.plan_type, r.plan_variant, r.stream
-  FROM ${SCHEMA}.records r
+  FROM ${tables.records} r
   WHERE r.participant_id = $1 AND r.stream = 'quota'
     AND (NULLIF($2, '')::timestamptz IS NULL OR r.observed_at > NULLIF($2, '')::timestamptz)${cutoff}
     ORDER BY r.observed_at, r.id LIMIT GREATEST(0, $4 - (SELECT COUNT(*) FROM same_time))
@@ -326,19 +378,17 @@ function planSql(historical: boolean): string {
 SELECT * FROM same_time UNION ALL SELECT * FROM later ORDER BY observed_at, id`;
 }
 
-const PLAN_SQL = planSql(false);
-const HISTORY_PLAN_SQL = planSql(true);
-
-const FIT_SQL = `WITH same_key AS MATERIALIZED (
+function fitSql(tables: QuotaTables): string {
+  return `WITH same_key AS MATERIALIZED (
   SELECT p.record_id, p.resets_at, p.observed_at
-  FROM ${SCHEMA}.telemetry_v1_quota_fit_rows p
+  FROM ${tables.rows} p
   WHERE p.participant_id = $1 AND NULLIF($2, '')::timestamptz IS NOT NULL
     AND p.resets_at = NULLIF($2, '')::timestamptz
     AND p.observed_at = NULLIF($3, '')::timestamptz AND p.record_id > $4
   ORDER BY p.record_id LIMIT $5
 ), later AS MATERIALIZED (
   SELECT p.record_id, p.resets_at, p.observed_at
-  FROM ${SCHEMA}.telemetry_v1_quota_fit_rows p
+  FROM ${tables.rows} p
   WHERE p.participant_id = $1
     AND (NULLIF($2, '')::timestamptz IS NULL OR p.resets_at > NULLIF($2, '')::timestamptz
       OR (p.resets_at = NULLIF($2, '')::timestamptz
@@ -358,13 +408,18 @@ SELECT p.record_id AS id,
   r.occurrence_id, r.slot, r.used_percent, r.window_duration_minutes,
   to_char(r.resets_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS resets_at,
   r.stream
-FROM page p LEFT JOIN ${SCHEMA}.records r ON r.id = p.record_id
+FROM page p LEFT JOIN ${tables.records} r ON r.id = p.record_id
 ORDER BY p.resets_at, p.observed_at, p.record_id`;
+}
 
-async function readiness(pool: PostgresTelemetryV1Pool, participantId: string): Promise<void> {
+async function readiness(
+  pool: PostgresTelemetryV1Pool,
+  participantId: string,
+  tables: QuotaTables,
+): Promise<void> {
   await readOne(pool, `SELECT b.through_record_id, b.last_record_id, b.is_complete
-    FROM ${SCHEMA}.telemetry_v1_quota_fit_backfill b
-    JOIN ${SCHEMA}.participants p ON p.id = $1 AND p.state = 'active'
+    FROM ${tables.backfill} b
+    JOIN ${tables.participants} p ON p.id = $1 AND p.state = 'active'
     WHERE b.singleton_id = 1`, [participantId], result => {
     const state = decodeState(result);
     if (state.isComplete !== 1) throw unsupported();
@@ -381,14 +436,16 @@ export async function createPostgresV1QuotaPageReader(
   pool: PostgresTelemetryV1Pool,
   participantId: string,
   observedAtBefore?: string,
+  schemaOptions: PostgresSchemaOptions = {},
 ): Promise<V1QuotaPageReader> {
   if (typeof participantId !== "string" || participantId.length === 0) throw new TypeError("participant required");
   validUpperBound(observedAtBefore);
-  await readiness(pool, participantId);
+  const tables = resolveQuotaTables(schemaOptions);
+  await readiness(pool, participantId, tables);
   return {
     async readPlanPage(cursor, limit) {
       validatePage(cursor, limit);
-      const sql = observedAtBefore === undefined ? PLAN_SQL : HISTORY_PLAN_SQL;
+      const sql = planSql(observedAtBefore !== undefined, tables);
       const values = observedAtBefore === undefined
         ? [participantId, cursor.observedAt, cursor.id, limit]
         : [participantId, cursor.observedAt, cursor.id, limit, observedAtBefore];
@@ -399,7 +456,7 @@ export async function createPostgresV1QuotaPageReader(
     async readFitPage(cursor: V1ResetCursor, limit) {
       validatePage(cursor, limit);
       if (typeof cursor.resetsAt !== "string") throw new TypeError("reset cursor required");
-      const result = await readOne(pool, FIT_SQL,
+      const result = await readOne(pool, fitSql(tables),
         [participantId, cursor.resetsAt, cursor.observedAt, cursor.id, limit], value => value);
       if (result.rows.length > limit) throw unsupported();
       return result.rows.map(row => {

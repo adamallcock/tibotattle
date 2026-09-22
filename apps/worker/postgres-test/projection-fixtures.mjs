@@ -2,10 +2,24 @@ import {expect,it} from 'vitest';
 export const projectionTables=['legacy_sources','v11_domain_heads','mutation_control','graph_scope','publication_state',
   'preview_cache','daily_rebuilds','current_queue_state','current_queue','refresh_lanes','prepared_source_days','preparation_counters'];
 export async function resetProjectionState(pool,schema) {
-  await pool.query(`INSERT INTO ${schema}.mutation_control(singleton_id) VALUES(1);
-    INSERT INTO ${schema}.publication_state VALUES(1,'ready',clock_timestamp());
-    INSERT INTO ${schema}.current_queue_state VALUES(1,1);
-    INSERT INTO ${schema}.preparation_counters VALUES(1,true,0,0,0,0,0,0,0)`);
+  // These singleton rows belong to the operational migration.  Reset their
+  // state between qualification cases instead of inserting duplicate marker
+  // rows into a persistent schema.
+  await pool.query(`TRUNCATE ${schema}.graph_scope,${schema}.preview_cache,
+    ${schema}.daily_rebuilds,${schema}.current_queue,${schema}.refresh_lanes,
+    ${schema}.prepared_source_days,${schema}.community_model_history_dependencies,
+    ${schema}.community_model_composition_days,
+    ${schema}.telemetry_v1_quota_fit_rows,${schema}.telemetry_v1_quota_fit_backfill`);
+  await pool.query(`UPDATE ${schema}.mutation_control SET mutation_epoch=0,
+    graph_append_epoch=-1,graph_invalidation_epoch=0,graph_append_reason=NULL,
+    graph_last_change_reason=NULL,graph_last_change_at=NULL,
+    graph_last_invalidated_at=NULL WHERE singleton_id=1;
+    UPDATE ${schema}.publication_state SET publication_state='ready',changed_at=clock_timestamp()
+      WHERE singleton=1;
+    UPDATE ${schema}.current_queue_state SET window_generation=1 WHERE singleton_id=1;
+    UPDATE ${schema}.preparation_counters SET is_exact=true,tracked_days=0,
+      complete_days=0,building_days=0,retiring_days=0,checkpoint_steps=0,
+      quota_observations=0,usage_events=0 WHERE singleton_id=1`);
 }
 export function registerProjectionTests({pool:getPool,store:getStore,input,grant,rows,snapshot,schema,pid,did}) {
   const pool=()=>getPool(),store=()=>getStore(),day='2026-09-01';
@@ -31,7 +45,7 @@ export function registerProjectionTests({pool:getPool,store:getStore,input,grant
   });
   it('hard invalidates an unrecognized mutation and removes inactive owners from the analysis queue',async()=>{
     const value=await grant(await input());await store().insert(value);await preview();
-    await pool().query(`UPDATE ${schema}.chunks SET parser_version='changed' WHERE id=$1`,[value.chunkId]);
+    await pool().query(`UPDATE ${schema}.telemetry_v1_chunks SET parser_version='changed' WHERE id=$1`,[value.chunkId]);
     expect((await rows('mutation_control'))[0].graph_invalidation_epoch).toBe('2');
     expect(await rows('preview_cache')).toHaveLength(0);
     await pool().query(`UPDATE ${schema}.participants SET state='deleting' WHERE id=$1`,[pid]);
@@ -61,9 +75,31 @@ export function registerProjectionTests({pool:getPool,store:getStore,input,grant
   });
   it('serializes concurrent owners at the shared graph epoch without losing either append',async()=>{
     const otherPid='synthetic-projection-owner',otherDid='synthetic-projection-device';
-    await pool().query(`INSERT INTO ${schema}.participants VALUES($1,'active','social',10)`,[otherPid]);
-    await pool().query(`INSERT INTO ${schema}.devices VALUES($1,$2,'active',clock_timestamp()-interval '30 days',clock_timestamp()+interval '1 day')`,[otherDid,otherPid]);
-    await pool().query(`INSERT INTO ${schema}.consents SELECT $1,$2,schema_version,dictionary_version,privacy_version FROM ${schema}.consents WHERE participant_id=$3`,[otherPid,otherDid,pid]);
+    await pool().query(`INSERT INTO ${schema}.participants
+      (id,state,owner_kind,created_at) VALUES($1,'active','social',clock_timestamp())`,[otherPid]);
+    await pool().query(`INSERT INTO ${schema}.web_sessions
+      (id,participant_id,secret_hash,csrf_hash,scope,state,issued_at,expires_at,last_used_at)
+      VALUES($1,$2,decode(repeat('61',32),'hex'),decode(repeat('62',32),'hex'),
+        'personal','active',clock_timestamp(),clock_timestamp()+interval '1 day',clock_timestamp())`,
+    [`session-${otherPid}`,otherPid]);
+    await pool().query(`INSERT INTO ${schema}.device_pairings
+      (id,participant_id,issued_by_session_id,secret_hash,consent_version,
+       transport_consent_version,state,issued_at,expires_at,claimed_device_id)
+      VALUES($1,$2,$3,decode(repeat('63',32),'hex'),
+        'ongoing-privacy-safe-telemetry-v1.0','telemetry-contribution-v1.0',
+        'consumed',clock_timestamp(),clock_timestamp()+interval '1 day',$4)`,
+    [`pair-${otherDid}`,otherPid,`session-${otherPid}`,otherDid]);
+    await pool().query(`INSERT INTO ${schema}.device_credentials
+      (id,participant_id,authority_kind,paired_via_pairing_id,secret_hash,state,issued_at,expires_at,last_used_at)
+      VALUES($1,$2,'social',$3,decode(repeat('11',32),'hex'),'active',
+        clock_timestamp()-interval '30 days',clock_timestamp()+interval '1 day',clock_timestamp())`,
+    [otherDid,otherPid,`pair-${otherDid}`]);
+    await pool().query(`INSERT INTO ${schema}.telemetry_v1_device_consents
+      (participant_id,device_id,telemetry_schema_version,field_dictionary_version,
+       privacy_contract_version,consented_at)
+      SELECT $1,$2,telemetry_schema_version,field_dictionary_version,
+        privacy_contract_version,consented_at
+      FROM ${schema}.telemetry_v1_device_consents WHERE participant_id=$3`,[otherPid,otherDid,pid]);
     const a=await grant(await input()),b=await grant({...await input(),participantId:otherPid,deviceId:otherDid});
     const blocker=await pool().connect();let outcome;
     try {
@@ -104,7 +140,8 @@ export function registerProjectionTests({pool:getPool,store:getStore,input,grant
   });
   it('invalidates social deletion even without chunks and removes counters before owner loss',async()=>{
     const owner='synthetic-empty-owner';
-    await pool().query(`INSERT INTO ${schema}.participants(id,state,owner_kind) VALUES($1,'active','social')`,[owner]);
+    await pool().query(`INSERT INTO ${schema}.participants(id,state,owner_kind,created_at)
+      VALUES($1,'active','social',clock_timestamp())`,[owner]);
     await pool().query(`INSERT INTO ${schema}.prepared_source_days VALUES($1,'2026-09-01','complete',2,3,4)`,[owner]);
     await preview();
     await pool().query(`INSERT INTO ${schema}.community_model_composition_days VALUES('2026-09-01','{}',clock_timestamp(),'synthetic')`);
@@ -116,9 +153,9 @@ export function registerProjectionTests({pool:getPool,store:getStore,input,grant
   });
   it('invalidates the persisted prepared-source day when observed timestamps differ',async()=>{
     const value=await grant(await input());await store().insert(value);
-    await pool().query(`UPDATE ${schema}.records SET observed_day='2026-08-31' WHERE participant_id=$1`,[pid]);
+    await pool().query(`UPDATE ${schema}.telemetry_v1_records SET observed_day='2026-08-31' WHERE participant_id=$1`,[pid]);
     await pool().query(`INSERT INTO ${schema}.prepared_source_days VALUES($1,'2026-08-31','complete',1,0,0)`,[pid]);
-    await pool().query(`DELETE FROM ${schema}.records WHERE participant_id=$1`,[pid]);
+    await pool().query(`DELETE FROM ${schema}.telemetry_v1_records WHERE participant_id=$1`,[pid]);
     expect((await rows('prepared_source_days'))[0]).toMatchObject({source_day:'2026-08-31',phase:'discarding',progress_revision:'2'});
   });
 

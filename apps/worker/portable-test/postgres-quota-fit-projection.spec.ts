@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   backfillPostgresV1QuotaFitProjection,
+  buildPostgresV1QuotaProjectionBackfillInsertSql,
+  buildPostgresV1QuotaProjectionBackfillAdvanceSql,
   createPostgresV1QuotaPageReader,
-  POSTGRES_V1_QUOTA_PROJECTION_BACKFILL_ADVANCE_SQL,
-  POSTGRES_V1_QUOTA_PROJECTION_BACKFILL_INSERT_SQL,
 } from "../src/postgres-quota-fit-projection";
 import type {
   PostgresClient,
@@ -40,22 +40,26 @@ function mockPool(
 }
 
 describe("experimental PostgreSQL quota-fit projection", () => {
+  const schemaOptions = { primarySchema: "tibotattle_v1_test" };
+
   it("resumes bounded backfill pages and reports the D1 logical query budget", async () => {
+    const insertSql = buildPostgresV1QuotaProjectionBackfillInsertSql(schemaOptions);
+    const advanceSql = buildPostgresV1QuotaProjectionBackfillAdvanceSql(schemaOptions);
     const mocked = mockPool(async (text) => {
       if (text === "BEGIN" || text.startsWith("SET LOCAL")
-          || text === POSTGRES_V1_QUOTA_PROJECTION_BACKFILL_INSERT_SQL
-          || text === POSTGRES_V1_QUOTA_PROJECTION_BACKFILL_ADVANCE_SQL
+          || text === insertSql
+          || text === advanceSql
           || text === "COMMIT") return result([]);
-      if (text.includes("FROM tibotattle_v1_test.telemetry_v1_quota_fit_backfill")) {
-        const stateCalls = mocked.calls.filter(call => call.text.includes("FROM tibotattle_v1_test.telemetry_v1_quota_fit_backfill"));
+      if (text.includes('FROM "tibotattle_v1_test"."telemetry_v1_quota_fit_backfill"')) {
+        const stateCalls = mocked.calls.filter(call => call.text.includes('FROM "tibotattle_v1_test"."telemetry_v1_quota_fit_backfill"'));
         return stateCalls.length === 1 ? state("8", "0", 0) : state("8", "3", 0);
       }
       throw new Error("unexpected SQL");
     });
 
-    await expect(backfillPostgresV1QuotaFitProjection(mocked.pool, { maxPages: 1, pageSize: 3 }))
+    await expect(backfillPostgresV1QuotaFitProjection(mocked.pool, { maxPages: 1, pageSize: 3 }, schemaOptions))
       .resolves.toEqual({ status: "deferred", pagesRun: 1, queriesUsed: 4, lastRecordId: 3, throughRecordId: 8 });
-    expect(mocked.calls.find(call => call.text === POSTGRES_V1_QUOTA_PROJECTION_BACKFILL_INSERT_SQL)?.values)
+    expect(mocked.calls.find(call => call.text === insertSql)?.values)
       .toEqual([0, 8, 3]);
     expect(mocked.releases).toEqual([false, false]);
   });
@@ -82,12 +86,12 @@ describe("experimental PostgreSQL quota-fit projection", () => {
       window_duration_minutes: 10080, resets_at: "2026-08-08T00:00:00.000Z", stream: "quota",
     };
     const mocked = mockPool(async (text) => {
-      if (text.includes("JOIN tibotattle_v1_test.participants")) return state("8", "8", 1);
+      if (text.includes('JOIN "tibotattle_v1_test"."participants"')) return state("8", "8", 1);
       if (text.includes("same_time AS MATERIALIZED")) return result([planRow]);
       if (text.includes("same_key AS MATERIALIZED")) return result([fitRow]);
       throw new Error("unexpected SQL");
     });
-    const reader = await createPostgresV1QuotaPageReader(mocked.pool, "participant-1");
+    const reader = await createPostgresV1QuotaPageReader(mocked.pool, "participant-1", undefined, schemaOptions);
     await expect(reader.readPlanPage({ observedAt: "", id: 0 }, 128)).resolves.toEqual([{
       id: 1, observed_at: planRow.observed_at, observed_day: planRow.observed_day, device_id: planRow.device_id,
       provider: null, limit_id: "other", plan_type: null, plan_variant: null,
@@ -104,13 +108,13 @@ describe("experimental PostgreSQL quota-fit projection", () => {
   });
 
   it("fails closed on incomplete readiness, corrupt fit identity, and provider errors", async () => {
-    const incomplete = mockPool(async text => text.includes("JOIN tibotattle_v1_test.participants")
+    const incomplete = mockPool(async text => text.includes('JOIN "tibotattle_v1_test"."participants"')
       ? state("8", "3", 0) : result([]));
-    await expect(createPostgresV1QuotaPageReader(incomplete.pool, "participant-1"))
+    await expect(createPostgresV1QuotaPageReader(incomplete.pool, "participant-1", undefined, schemaOptions))
       .rejects.toMatchObject({ code: "V1_QUOTA_FIT_PROJECTION_UNAVAILABLE" });
 
     const corrupt = mockPool(async text => {
-      if (text.includes("JOIN tibotattle_v1_test.participants")) return state("8", "8", 1);
+      if (text.includes('JOIN "tibotattle_v1_test"."participants"')) return state("8", "8", 1);
       if (text.includes("same_key AS MATERIALIZED")) return result([{
         id: "1", projection_resets_at: "2026-08-08T00:00:00.000Z",
         projection_observed_at: "2026-08-01T00:00:00.000Z", source_participant_id: "other",
@@ -121,7 +125,7 @@ describe("experimental PostgreSQL quota-fit projection", () => {
       }]);
       throw new Error("synthetic provider details");
     });
-    const reader = await createPostgresV1QuotaPageReader(corrupt.pool, "participant-1");
+    const reader = await createPostgresV1QuotaPageReader(corrupt.pool, "participant-1", undefined, schemaOptions);
     const error = await reader.readFitPage({ resetsAt: "", observedAt: "", id: 0 }, 128).catch(value => value);
     expect(error).toMatchObject({ code: "V1_QUOTA_FIT_PROJECTION_UNAVAILABLE" });
     expect(String(error)).not.toContain("synthetic provider details");

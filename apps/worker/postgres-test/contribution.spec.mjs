@@ -54,7 +54,7 @@ beforeAll(async () => {
     if (key.startsWith('PG') && !key.startsWith('PG_TEST_')) vi.stubEnv(key, undefined);
   }
   const options = {host:socket, port, user:'postgres', password:'synthetic-local-only', database:'postgres',
-    ssl:false, options:'', application_name:'tibotattle-pg-test',
+    ssl:false, options:`-c search_path="${schema}",pg_catalog`, application_name:'tibotattle-pg-test',
     types:{getTypeParser(oid,format){return oid===1082 ? value=>value : pg.types.getTypeParser(oid,format);}},
     connectionTimeoutMillis:3000, statement_timeout:12000, idleTimeoutMillis:1000, max:6};
   admin = new pg.Pool(options);
@@ -63,14 +63,25 @@ beforeAll(async () => {
   created = true;
   await admin.query(`CREATE DATABASE "${ledgerDatabase}"`);
   ledgerCreated = true;
-  ledgerPool = new pg.Pool({...options, database: ledgerDatabase});
+  ledgerPool = new pg.Pool({...options, database: ledgerDatabase,
+    options:`-c search_path="${ledgerSchema}",pg_catalog`});
   pool = new pg.Pool({...options, database});
   await pool.query(`CREATE SCHEMA "${schema}"`);
   await ledgerPool.query(`CREATE SCHEMA "${ledgerSchema}"`);
   const primaryMigrations = await applyPostgresMigrations({ role: 'primary', schema, pool });
   const ledgerMigrations = await applyPostgresMigrations({ role: 'ledger', schema: ledgerSchema, pool: ledgerPool });
-  expect(primaryMigrations.applied).toBeGreaterThanOrEqual(4);
-  expect(ledgerMigrations.applied).toBeGreaterThanOrEqual(3);
+  expect(primaryMigrations.applied).toBe(primaryMigrations.migrations.length);
+  expect(primaryMigrations.migrations.map(migration => migration.version))
+    .toEqual(primaryMigrations.migrations.map((_, index) => index + 1));
+  expect(primaryMigrations.migrations.slice(-3).map(migration => migration.name))
+    .toEqual([
+      '0008_pending_object_reconciliation.sql',
+      '0009_owner_scoped_analytics.sql',
+      '0010_v1_analytical_side_effects.sql',
+    ]);
+  expect(ledgerMigrations.applied).toBe(ledgerMigrations.migrations.length);
+  expect(ledgerMigrations.migrations.map(migration => migration.version))
+    .toEqual(ledgerMigrations.migrations.map((_, index) => index + 1));
   backend = createExperimentalPostgresTelemetryV1Backend(pool, {
     primarySchema: schema,
     ledgerSchema,
@@ -92,6 +103,7 @@ beforeEach(async () => {
   await pool.query(`TRUNCATE ${schema}.participants, ${schema}.pending_objects CASCADE`);
   await resetProjectionState(pool,schema);
   const issuedAt = new Date().toISOString();
+  const deviceIssuedAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
   await pool.query(`INSERT INTO ${schema}.participants
     (id,state,owner_kind,consent_version,consented_at,created_at)
@@ -110,7 +122,10 @@ beforeEach(async () => {
     (id,participant_id,authority_kind,paired_via_pairing_id,secret_hash,state,
       issued_at,expires_at,last_used_at,social_verified_at)
     VALUES($1,$2,'social',$3,$4,'active',$5,$6,$5,$5)`,
-  [did, pid, `pairing-${did}`, Buffer.alloc(32, 4), issuedAt, expiresAt]);
+  [did, pid, `pairing-${did}`, Buffer.alloc(32, 4), deviceIssuedAt, expiresAt]);
+  await pool.query(`INSERT INTO ${schema}.telemetry_transport_participant_floors
+    (participant_id,minimum_rank,revision,changed_at)
+    VALUES($1,1,0,$2)`, [pid, issuedAt]);
   await pool.query(`INSERT INTO ${schema}.telemetry_v1_device_consents
     (participant_id,device_id,telemetry_schema_version,field_dictionary_version,
       privacy_contract_version,consented_at)
@@ -154,7 +169,7 @@ async function rows(table) {
     chunks: `SELECT *, r2_key AS object_key, device_upload_authorization_id AS authorization_id
       FROM ${schema}.telemetry_v1_chunks`,
     records: `SELECT id,chunk_row_id AS chunk_id,participant_id,device_id,stream,occurrence_id,
-      observed_at,payload_json AS payload,observed_day,provider,model_id,session_uuid,plan_type,
+      observed_at,record_json AS payload,observed_day,provider,model_id,session_uuid,plan_type,
       plan_variant,limit_id,slot,used_percent,window_duration_minutes,resets_at
       FROM ${schema}.telemetry_v1_records`,
     devices: `SELECT id,participant_id,state,issued_at,expires_at FROM ${schema}.device_credentials`,
@@ -254,7 +269,7 @@ it.each([
   ['expired lease',`UPDATE ${schema}.device_upload_authorizations SET consume_lease_expires_at=clock_timestamp()-interval '1 second'`,'UPLOAD_AUTH_INVALID'],
   ['expired upload',`UPDATE ${schema}.device_upload_authorizations SET expires_at=clock_timestamp()-interval '1 second'`,'UPLOAD_AUTH_INVALID'],
   ['wrong digest',`UPDATE ${schema}.device_upload_authorizations SET envelope_digest='${'f'.repeat(64)}'`,'UPLOAD_AUTH_INVALID'],
-  ['consent drift',`UPDATE ${schema}.telemetry_v1_device_consents SET field_dictionary_version='stale'`,'TELEMETRY_CONSENT_INVALID'],
+  ['missing consent',`DELETE FROM ${schema}.telemetry_v1_device_consents`,'TELEMETRY_CONSENT_INVALID'],
 ])('refuses %s without any partial state',async(_label,sql,code)=> {
   const value=await grant(await input()); await pool.query(sql); const before=await snapshot();
   await expect(store.insert(value)).rejects.toMatchObject({code}); expect(await snapshot()).toEqual(before);
@@ -293,7 +308,7 @@ it('reconciles a real commit whose acknowledgement is lost, with no automatic re
       const result=await client.query(sql,values);
       if(sql==='COMMIT'){commits++;throw new Error('synthetic lost acknowledgement');} return result;
     },release(discard){discarded=discard;client.release(discard);}};
-  }});
+  }}, { primarySchema: schema });
   const value=await grant(await input());
   await expect(uncertain.insert(value)).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
   expect(commits).toBe(1);expect(discarded).toBe(true);
@@ -314,14 +329,15 @@ it('rolls back a real transaction if its connection is lost before commit',async
       if(sql.startsWith('SELECT accepted_records')) {await client.end();throw new Error('synthetic disconnect');}
       return result;
     },release(discard){client.release(discard);}};
-  }});
+  }}, { primarySchema: schema });
   const value=await grant(await input()),before=await snapshot();
   await expect(broken.insert(value)).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
   expect(await snapshot()).toEqual(before);
 });
 it('checks authorization expiry after waiting for a participant lock',async()=> {
   const value=await grant(await input());
-  await pool.query(`UPDATE ${schema}.authorizations SET lease_expires_at=clock_timestamp()+interval '1 second'`);
+  await pool.query(`UPDATE ${schema}.device_upload_authorizations
+    SET consume_lease_expires_at=clock_timestamp()+interval '1 second'`);
   const before=await snapshot(), blocker=await pool.connect();
   let outcome;
   try {

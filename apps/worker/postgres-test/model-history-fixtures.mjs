@@ -85,14 +85,23 @@ export function registerModelHistoryTests({
   did,
 }) {
   const schema = identifier(schemaValue, 'schema');
-  const table = (name) => `${schema}.${identifier(name, 'table')}`;
+  const table = (name) => {
+    const canonical = {
+      chunks: 'telemetry_v1_chunks',
+      records: 'telemetry_v1_records',
+      devices: 'device_credentials',
+      consents: 'telemetry_v1_device_consents',
+      authorizations: 'device_upload_authorizations',
+    }[name] ?? name;
+    return `${schema}.${identifier(canonical, 'table')}`;
+  };
   const pool = () => resolve(poolGetter);
   const store = () => resolve(storeGetter);
   const day = '2026-09-01';
 
   it('invalidates participant dependencies through inclusive day +100 and evicts social composition days globally', async () => {
-    await pool().query(`INSERT INTO ${table('participants')}(id,state,owner_kind)
-      VALUES($1,'active','social')`, [OTHER_PARTICIPANT]);
+    await pool().query(`INSERT INTO ${table('participants')}(id,state,owner_kind,created_at)
+      VALUES($1,'active','social',clock_timestamp())`, [OTHER_PARTICIPANT]);
     await seedDependencies(pool(), schema, pid, day);
     await seedDependencies(pool(), schema, OTHER_PARTICIPANT, day);
     await seedCompositionDays(pool(), schema, day);
@@ -169,7 +178,7 @@ export function registerModelHistoryTests({
     await seedCompositionDays(pool(), schema, day);
 
     await pool().query(`UPDATE ${table('chunks')}
-      SET object_key=$1,envelope_digest=$2 WHERE id=$3`, [
+      SET r2_key=$1,envelope_digest=$2 WHERE id=$3`, [
       `${value.objectKey}-metadata-reconciled`, 'c'.repeat(64), value.chunkId,
     ]);
 
@@ -190,7 +199,7 @@ export function registerModelHistoryTests({
 
     // The qualification schema intentionally keeps records restrictive, so
     // remove child records before exercising the source-chunk delete trigger.
-    await pool().query(`DELETE FROM ${table('records')} WHERE chunk_id=$1`, [value.chunkId]);
+    await pool().query(`DELETE FROM ${table('records')} WHERE chunk_row_id=$1`, [value.chunkId]);
     await pool().query(`DELETE FROM ${table('chunks')} WHERE id=$1`, [value.chunkId]);
 
     const dependencies = (await historyRows(rows, 'community_model_history_dependencies'))
@@ -220,7 +229,7 @@ export function registerModelHistoryTests({
     await seedDependencies(pool(), schema, pid, day);
     await seedCompositionDays(pool(), schema, day);
 
-    await pool().query(`DELETE FROM ${table('records')} WHERE chunk_id=$1`, [first.chunkId]);
+    await pool().query(`DELETE FROM ${table('records')} WHERE chunk_row_id=$1`, [first.chunkId]);
     await pool().query(`DELETE FROM ${table('chunks')} WHERE id=$1`, [first.chunkId]);
 
     const dependencies = (await historyRows(rows, 'community_model_history_dependencies'))
@@ -234,20 +243,35 @@ export function registerModelHistoryTests({
 
   it('invalidates accountless dependencies without evicting social composition history', async () => {
     const accountlessObject = 'model-history-accountless-object';
-    await pool().query(`INSERT INTO ${table('participants')}(id,state,owner_kind)
-      VALUES($1,'active','accountless')`, [ACCOUNTLESS_PARTICIPANT]);
-    await pool().query(`INSERT INTO ${table('devices')}(id,participant_id,state,issued_at,expires_at)
-      VALUES($1,$2,'active',clock_timestamp()-interval '1 day',clock_timestamp()+interval '1 day')`,
+    await pool().query(`INSERT INTO ${table('participants')}(id,state,owner_kind,created_at)
+      VALUES($1,'active','accountless',clock_timestamp())`, [ACCOUNTLESS_PARTICIPANT]);
+    await pool().query(`INSERT INTO ${schema}.accountless_enrollment_ledger
+      (device_id,device_secret_hash,installation_principal_id,schema_version,
+       policy_version,authorization_basis,state,issued_at,expires_at)
+      VALUES($1,decode(repeat('33',32),'hex'),$2,'telemetry-v1',
+       'accountless-opt-out-v1','accountless-policy-v1','active',
+       clock_timestamp()-interval '1 day',clock_timestamp()+interval '1 day')`,
+    [ACCOUNTLESS_DEVICE, `${ACCOUNTLESS_DEVICE}-installation`]);
+    await pool().query(`INSERT INTO ${table('devices')}
+      (id,participant_id,authority_kind,accountless_enrollment_device_id,
+       secret_hash,state,issued_at,expires_at,last_used_at)
+      VALUES($1,$2,'accountless',$1,decode(repeat('44',32),'hex'),'active',
+        clock_timestamp()-interval '1 day',clock_timestamp()+interval '1 day',clock_timestamp())`,
     [ACCOUNTLESS_DEVICE, ACCOUNTLESS_PARTICIPANT]);
     await pool().query(`INSERT INTO ${table('authorizations')}
-      (id,participant_id,device_id,envelope_digest,state,lease_expires_at,expires_at)
-      VALUES($1,$2,$3,$4,'consuming',clock_timestamp()+interval '5 minutes',clock_timestamp()+interval '10 minutes')`,
+      (id,participant_id,issued_by_device_id,secret_hash,envelope_digest,body_bytes,
+       content_type,state,issued_at,consume_lease_expires_at,expires_at)
+      VALUES($1,$2,$3,decode(repeat('55',32),'hex'),$4,1024,'application/json',
+       'consuming',clock_timestamp(),clock_timestamp()+interval '5 minutes',
+       clock_timestamp()+interval '10 minutes')`,
     [ACCOUNTLESS_AUTHORIZATION, ACCOUNTLESS_PARTICIPANT, ACCOUNTLESS_DEVICE, HEX64]);
+    await pool().query(`INSERT INTO ${schema}.pending_objects
+      (contribution_id,object_key) VALUES($1,$2)`, ['model-history-accountless-chunk', accountlessObject]);
     await seedDependencies(pool(), schema, ACCOUNTLESS_PARTICIPANT, day);
     await seedCompositionDays(pool(), schema, day);
     await pool().query(`INSERT INTO ${table('chunks')}
       (id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,chunk_digest,envelope_digest,
-       parser_version,record_count,accepted_record_count,object_key,authorization_id,created_at)
+       parser_version,record_count,accepted_record_count,r2_key,device_upload_authorization_id,created_at)
       VALUES($1,$2,$3,'session',$4,0,1,$5,$6,'synthetic',1,1,$7,$8,clock_timestamp())`, [
       'model-history-accountless-chunk', ACCOUNTLESS_PARTICIPANT, ACCOUNTLESS_DEVICE, day,
       HEX64, 'b'.repeat(64), accountlessObject, ACCOUNTLESS_AUTHORIZATION,

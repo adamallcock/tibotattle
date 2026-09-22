@@ -206,10 +206,21 @@ beforeAll(async () => {
   await ledger.query(`CREATE SCHEMA ${ledgerSchema}`);
   const primaryResult = await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: primary });
   const ledgerResult = await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: ledger });
-  expect(primaryResult.applied).toBe(7);
-  expect(ledgerResult.applied).toBe(3);
-  expect((await queryRows(primary, `SELECT version, name, checksum_sha256 FROM ${primarySchema}._tibotattle_migration_history ORDER BY version`)).length).toBe(7);
-  expect((await queryRows(ledger, `SELECT version, name, checksum_sha256 FROM ${ledgerSchema}._tibotattle_migration_history ORDER BY version`)).length).toBe(3);
+  expect(primaryResult.applied).toBe(primaryResult.migrations.length);
+  expect(primaryResult.migrations.map(migration => migration.version))
+    .toEqual(primaryResult.migrations.map((_, index) => index + 1));
+  expect(primaryResult.migrations.slice(-3).map(migration => migration.name)).toEqual([
+    "0008_pending_object_reconciliation.sql",
+    "0009_owner_scoped_analytics.sql",
+    "0010_v1_analytical_side_effects.sql",
+  ]);
+  expect(ledgerResult.applied).toBe(ledgerResult.migrations.length);
+  expect(ledgerResult.migrations.map(migration => migration.version))
+    .toEqual(ledgerResult.migrations.map((_, index) => index + 1));
+  expect((await queryRows(primary, `SELECT version, name, checksum_sha256 FROM ${primarySchema}._tibotattle_migration_history ORDER BY version`)).length)
+    .toBe(primaryResult.migrations.length);
+  expect((await queryRows(ledger, `SELECT version, name, checksum_sha256 FROM ${ledgerSchema}._tibotattle_migration_history ORDER BY version`)).length)
+    .toBe(ledgerResult.migrations.length);
   await insertAuthorityRows();
 });
 
