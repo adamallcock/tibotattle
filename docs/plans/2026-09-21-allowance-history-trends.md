@@ -28,10 +28,15 @@ translated line labels; real-data dashboard and social-image inspection. Use a
 read-only loopback preview without writes to installed state. Installed/native
 rendering, packaging, release and deployment remain separate gates.
 
-Validated in the working checkout: 739 browser UI tests, five i18n and module
+Validated in the working checkout: 1,004 browser UI tests, 377 local companion tests, six i18n and module
 serving tests, architecture checks and generated-catalog parity. The final
 255-test chart suite also verifies that filtering invalid raw estimates cannot
 join disconnected LOWESS segments in the social image. Numerical fixtures are
 synthetic; real derived data was inspected only in the read-only browser preview.
 Rendered checks covered the allowance and social graphs, desktop and narrow
 layouts, English and Spanish labels, and the insufficient-history state.
+
+Integration with current main preserves the five-hour/seven-day window selection
+on chart resize. Both graph legends now use the plain Robust LOWESS label, with
+the statistical interpretation explained in the caption. Canonical browser and
+Electron localization copies were regenerated and checked.
