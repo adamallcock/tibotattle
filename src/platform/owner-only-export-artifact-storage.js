@@ -279,7 +279,9 @@ export function createOwnerOnlyExportArtifactStorageContext(configuration = {}) 
 
   function requireDestination(destination) {
     const state = destinationStates.get(destination);
-    if (!state) throw new Error("Owner-only export destination capability is invalid");
+    if (!state || (state.batch && !state.batch.active)) {
+      throw new Error("Owner-only export destination capability is invalid");
+    }
     return state;
   }
 
@@ -591,20 +593,23 @@ export function createOwnerOnlyExportArtifactStorageContext(configuration = {}) 
     return "same_inode";
   }
   
-  async function cleanupPairTransaction(transactionDirectory, transactionRoot, destinationDirectory, manifest, options) {
+  async function cleanupPairTransaction(transactionDirectory, transactionRoot, destinationDirectory, manifest, options, batch = null) {
+    if (batch) await assertPinnedBatch(batch);
     await unlink(join(transactionDirectory, "manifest.json"));
     await callFailpoint(options, "after_manifest_cleanup");
     await unlink(join(transactionDirectory, manifest.artifacts.bundle.stageName));
     await unlink(join(transactionDirectory, manifest.artifacts.receipt.stageName));
     await rmdir(transactionDirectory);
     await synchronizeDirectory(transactionRoot);
-    await rmdir(transactionRoot).catch((error) => {
+    if (batch) await assertPinnedBatch(batch);
+    else await rmdir(transactionRoot).catch((error) => {
       if (error.code !== "ENOTEMPTY" && error.code !== "EEXIST") throw error;
     });
     await synchronizeDirectory(destinationDirectory);
   }
   
-  async function abandonUncommittedTransaction(transactionDirectory, transactionRoot) {
+  async function abandonUncommittedTransaction(transactionDirectory, transactionRoot, batch = null) {
+    if (batch) await assertPinnedBatch(batch);
     for (const name of ["manifest.json", "manifest.prepared", "bundle.stage", "receipt.stage"]) {
       await unlink(join(transactionDirectory, name)).catch((error) => {
         if (error.code !== "ENOENT") throw error;
@@ -614,7 +619,8 @@ export function createOwnerOnlyExportArtifactStorageContext(configuration = {}) 
       if (error.code !== "ENOENT") throw error;
     });
     await synchronizeDirectory(transactionRoot).catch(() => {});
-    await rmdir(transactionRoot).catch((error) => {
+    if (batch) await assertPinnedBatch(batch);
+    else await rmdir(transactionRoot).catch((error) => {
       if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "EEXIST") throw error;
     });
   }
@@ -794,7 +800,7 @@ export function createOwnerOnlyExportArtifactStorageContext(configuration = {}) 
     let result;
     let primaryError;
     try {
-      result = await callback();
+      result = await callback(lockOwnership);
     } catch (error) {
       primaryError = error;
     }
@@ -907,8 +913,16 @@ export function createOwnerOnlyExportArtifactStorageContext(configuration = {}) 
       return Object.freeze([]);
     }
     await assertPinnedDestination(state);
+    if (state.batch) await assertPinnedBatch(state.batch);
     const entries = await boundedDirectoryEntries(state.directory, { sort: true });
     await assertPinnedDestination(state);
+    if (state.batch) {
+      await assertPinnedBatch(state.batch);
+      // Keep the physical reader bound unchanged. The logical artifact listing
+      // excludes only the exact internal entries owned by this active lease.
+      return Object.freeze(entries.filter((name) => name !== EXPORT_TRANSACTION_DIRECTORY
+        && name !== EXPORT_DESTINATION_LOCK));
+    }
     return Object.freeze([...entries]);
   }
 
@@ -957,7 +971,7 @@ export function createOwnerOnlyExportArtifactStorageContext(configuration = {}) 
     await unlink(path);
   }
   
-  async function writeOwnerOnlyPairNoClobberUnlocked(pair, options) {
+  async function writeOwnerOnlyPairNoClobberUnlocked(pair, options, batch = null) {
     const { firstPath, firstContent, secondPath, secondContent } = pair;
     const firstBytes = pairContentByteLength(firstContent);
     const secondBytes = pairContentByteLength(secondContent);
@@ -993,10 +1007,15 @@ export function createOwnerOnlyExportArtifactStorageContext(configuration = {}) 
   
     const destinationDirectory = dirname(firstResolved);
     const transactionRoot = join(destinationDirectory, EXPORT_TRANSACTION_DIRECTORY);
-    await mkdir(transactionRoot, { recursive: true, mode: 0o700 });
-    await assertOwnerControlledDirectory(transactionRoot);
-    await chmod(transactionRoot, 0o700);
-    await assertOwnerControlledDirectory(transactionRoot);
+    if (batch) {
+      if (transactionRoot !== batch.root) throw new Error("Export batch destination mismatch");
+      await assertPinnedBatch(batch);
+    } else {
+      await mkdir(transactionRoot, { recursive: true, mode: 0o700 });
+      await assertOwnerControlledDirectory(transactionRoot);
+      await chmod(transactionRoot, 0o700);
+      await assertOwnerControlledDirectory(transactionRoot);
+    }
     const transactionId = `${process.pid}.${randomUUID()}`;
     const transactionDirectory = join(transactionRoot, transactionId);
     await mkdir(transactionDirectory, { mode: 0o700 });
@@ -1045,9 +1064,9 @@ export function createOwnerOnlyExportArtifactStorageContext(configuration = {}) 
       await callLinkFile(options, bundleStage, firstResolved);
       await synchronizeDirectory(destinationDirectory);
       await callFailpoint(options, "after_bundle");
-      await cleanupPairTransaction(transactionDirectory, transactionRoot, destinationDirectory, manifest, options);
+      await cleanupPairTransaction(transactionDirectory, transactionRoot, destinationDirectory, manifest, options, batch);
     } catch (error) {
-      if (!transactionPrepared) await abandonUncommittedTransaction(transactionDirectory, transactionRoot);
+      if (!transactionPrepared) await abandonUncommittedTransaction(transactionDirectory, transactionRoot, batch);
       throw error;
     }
   }
@@ -1106,7 +1125,8 @@ export function createOwnerOnlyExportArtifactStorageContext(configuration = {}) 
     }, selectedOptions);
   }
   
-  async function recoverOwnerOnlyPairTransactionsUnlocked(request, options) {
+  async function recoverOwnerOnlyPairTransactionsUnlocked(request, options, batch = null) {
+    if (batch) await assertPinnedBatch(batch);
     const { directory } = request;
     if (!directory) throw new Error("Export recovery directory is required");
     const destinationDirectory = resolve(directory);
@@ -1185,10 +1205,11 @@ export function createOwnerOnlyExportArtifactStorageContext(configuration = {}) 
         await synchronizeDirectory(destinationResolved);
         await callFailpoint(options, "after_bundle");
       }
-      await cleanupPairTransaction(transactionDirectory, transactionRoot, destinationResolved, manifest, options);
+      await cleanupPairTransaction(transactionDirectory, transactionRoot, destinationResolved, manifest, options, batch);
       recovered += 1;
     }
-    await rmdir(transactionRoot).catch((error) => {
+    if (batch) await assertPinnedBatch(batch);
+    else await rmdir(transactionRoot).catch((error) => {
       if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "EEXIST") throw error;
     });
     await synchronizeDirectory(destinationResolved);
@@ -1220,12 +1241,108 @@ export function createOwnerOnlyExportArtifactStorageContext(configuration = {}) 
     return recoverOwnerOnlyPairTransactionsUnlocked({ directory: canonicalDirectory }, selectedOptions);
   }
 
+  async function assertPinnedBatch(batch) {
+    await assertPinnedDestination(batch.destination);
+    const current = await lstat(batch.root);
+    assertOwnerControlledDirectoryStats(current);
+    if (!sameDirectoryIdentity(current, batch.identity)
+        || await realpath(batch.root) !== batch.root) {
+      throw new Error("Owner-only export transaction root changed");
+    }
+    const lock = await readExportDestinationLock(join(batch.destination.directory, EXPORT_DESTINATION_LOCK));
+    if (lock.stats.dev !== batch.lockIdentity.dev || lock.stats.ino !== batch.lockIdentity.ino) {
+      throw new Error("Owner-only export batch lock changed");
+    }
+  }
+
+  function runBatchOperation(batch, operation) {
+    if (!batch.active || batch.pending !== null || batch.failure !== null) {
+      throw new Error("Owner-only export batch operation is unavailable");
+    }
+    const pending = (async () => {
+      await assertPinnedBatch(batch);
+      const result = await operation();
+      await assertPinnedBatch(batch);
+      return result;
+    })();
+    batch.pending = pending;
+    // Attach handlers immediately: even an unawaited callback operation remains
+    // owned and drained before its destination lock can be released.
+    pending.then(
+      () => { batch.pending = null; },
+      (error) => { batch.failure = { error }; batch.pending = null; },
+    );
+    return pending;
+  }
+
+  /** Keep one transaction-root generation for an entire multi-pair operation. */
+  async function withOwnerOnlyExportDestinationBatch(destination, callback, options = undefined) {
+    const state = requireDestination(destination);
+    const selectedCallback = guardedFunction(callback, "Export destination batch callback is required");
+    const selectedOptions = snapshotOperationOptions(options);
+    if (state.batch) throw new Error("Nested export destination batches are unsupported");
+    const directory = await ensureWritableDestination(state);
+    const rejectionMarker = Object.freeze({});
+    let batchRejection = null;
+    return withExportDestinationLock(directory, async (lockIdentity) => {
+      await assertPinnedDestination(state);
+      const root = join(directory, EXPORT_TRANSACTION_DIRECTORY);
+      try { await mkdir(root, { mode: 0o700 }); }
+      catch (error) { if (error.code !== "EEXIST") throw error; }
+      const rootStats = await lstat(root);
+      assertOwnerControlledDirectoryStats(rootStats);
+      const batch = { active: true, pending: null, failure: null, root,
+        identity: snapshotDirectoryIdentity(rootStats), lockIdentity, destination: state };
+      await assertPinnedBatch(batch);
+      await chmod(root, 0o700);
+      await assertPinnedBatch(batch);
+      await synchronizeDirectory(directory);
+      const capability = Object.freeze(Object.create(null));
+      destinationStates.set(capability, { ...state, batch });
+      let result;
+      let primaryFailure = null;
+      try { result = await REFLECT_APPLY(selectedCallback, undefined, [capability]); }
+      catch (error) { primaryFailure = { error }; }
+      batch.active = false;
+      const unfinished = batch.pending;
+      if (unfinished !== null) {
+        try { await unfinished; } catch (error) { primaryFailure ??= { error }; }
+        primaryFailure ??= { error: new Error("Export destination batch callback left an unfinished operation") };
+      }
+      primaryFailure ??= batch.failure;
+      try {
+        await assertPinnedBatch(batch);
+        // Never remove a journal or unknown entry. Nonempty roots remain for
+        // existing recovery; successful pair cleanup leaves this root empty.
+        await rmdir(root).catch((error) => {
+          if (error.code !== "ENOTEMPTY" && error.code !== "EEXIST") throw error;
+          if (primaryFailure === null) throw new Error("Export destination batch retained incomplete transactions");
+        });
+        await synchronizeDirectory(directory);
+        await assertPinnedDestination(state);
+      } catch (error) { primaryFailure ??= { error }; }
+      if (primaryFailure) {
+        batchRejection = primaryFailure;
+        throw rejectionMarker;
+      }
+      return result;
+    }, selectedOptions).catch((error) => {
+      if (error === rejectionMarker) throw batchRejection.error;
+      throw error;
+    });
+  }
+
   async function recoverOwnerOnlyPairTransactionsForDestination(destination, options = undefined) {
     const state = requireDestination(destination);
     const selectedOptions = snapshotOperationOptions(options);
     if (state.status === "absent") {
       await assertPinnedAbsentDestinationParent(state);
       return { recovered: 0, transactionsFound: 0 };
+    }
+    if (state.batch) {
+      return runBatchOperation(state.batch, () => recoverOwnerOnlyPairTransactionsUnlocked(
+        { directory: state.directory }, selectedOptions, state.batch,
+      ));
     }
     await assertPinnedDestination(state);
     return withExportDestinationLock(state.directory, async () => {
@@ -1247,6 +1364,14 @@ export function createOwnerOnlyExportArtifactStorageContext(configuration = {}) 
     const state = requireDestination(destination);
     const selectedPair = snapshotDestinationPair(pair);
     const selectedOptions = snapshotOperationOptions(options);
+    if (state.batch) {
+      return runBatchOperation(state.batch, () => writeOwnerOnlyPairNoClobberUnlocked({
+        firstPath: join(state.directory, selectedPair.firstBasename),
+        firstContent: selectedPair.firstContent,
+        secondPath: join(state.directory, selectedPair.secondBasename),
+        secondContent: selectedPair.secondContent,
+      }, selectedOptions, state.batch));
+    }
     const directory = await ensureWritableDestination(state);
     const result = await withExportDestinationLock(directory, async () => {
       await assertPinnedDestination(state);
@@ -1274,6 +1399,7 @@ export function createOwnerOnlyExportArtifactStorageContext(configuration = {}) 
     recoverOwnerOnlyPairTransactions,
     recoverOwnerOnlyPairTransactionsUnderLease,
     withExportDestinationLease,
+    withOwnerOnlyExportDestinationBatch,
     writeOwnerOnlyPairNoClobberForDestination,
     writeOwnerOnlyPairNoClobber,
     writeOwnerOnlyPairNoClobberUnderLease,
