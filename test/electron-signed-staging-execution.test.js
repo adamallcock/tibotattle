@@ -202,7 +202,12 @@ test('direct-child stderr classifier handles split literals without exporting co
   const { EventEmitter } = await import('node:events');
   for (const [literal, flag] of [['electron_shell_entry_failed', 'electronEntryFailure'], ['sandbox_apply:', 'sandboxApplyMessage'], ['sandbox_init() failed', 'sandboxInitializationMessage'],
     ['InitializeSandbox() failed', 'sandboxInitializationMessage'], ['SeatbeltExec:', 'seatbeltMessage'],
-    ['Operation not permitted', 'operationNotPermitted'], ['Library not loaded:', 'dynamicLibraryMissing']]) {
+    ['Operation not permitted', 'operationNotPermitted'], ['Library not loaded:', 'dynamicLibraryMissing'],
+    ['SandboxSerializer: Failed to deserialize policy:', 'sandboxPolicyDeserializeFailure'],
+    ['SandboxSerializer: Failed to apply compiled policy:', 'sandboxCompiledPolicyFailure'],
+    ['SandboxSerializer: Failed to initialize sandbox with source mode policy:', 'sandboxSourcePolicyFailure'],
+    ['bootstrap_check_in ', 'machBootstrapCheck'], ["GPU process isn't usable. Goodbye.", 'gpuProcessUnusable'],
+    [':FATAL:', 'chromiumFatal'], ['Check failed:', 'chromiumCheckFailure']]) {
     for (let split = 1; split < literal.length; split++) {
       const child = new EventEmitter(); child.stderr = new EventEmitter();
       const snapshot = observeSignedStagingProcess(child);
@@ -257,6 +262,13 @@ test('process diagnostic rejects unknown fields, unbounded values and contradict
   const child = new EventEmitter(); child.stderr = new EventEmitter();
   const value = observeSignedStagingProcess(child)();
   assert.deepEqual(sanitizeSignedStagingProcessDiagnostic(value), value);
+  for (const flag of ['sandboxPolicyDeserializeFailure', 'sandboxCompiledPolicyFailure', 'sandboxSourcePolicyFailure',
+    'machBootstrapCheck', 'gpuProcessUnusable', 'chromiumFatal', 'chromiumCheckFailure']) {
+    assert.equal(value[flag], false);
+    assert.equal(sanitizeSignedStagingProcessDiagnostic({ ...value, [flag]: 'true' }), null);
+    const missing = { ...value }; delete missing[flag];
+    assert.equal(sanitizeSignedStagingProcessDiagnostic(missing), null);
+  }
   for (const extra of [{ raw: 'PRIVATE_SENTINEL' }, { [Symbol('private')]: true }, { exitCode: 256 }, { exitSignal: 'PRIVATE_SENTINEL' },
     { stderrBytesScanned: 65537 }, { stderrBytesScanned: -1 }, { stderrComplete: 'yes' },
     { stderrTruncated: true }, { exited: true, exitSignal: 'SIGABRT', unknownExitSignal: true },
@@ -276,4 +288,22 @@ test('real stderr stream drains beyond scan cap and never stitches a literal acr
   const result = read();
   assert.equal(result.stderrBytesScanned, 65536); assert.equal(result.stderrTruncated, true);
   assert.equal(result.stderrComplete, true); assert.equal(result.sandboxApplyMessage, false);
+});
+
+test('long Chromium policy marker is recognized only when wholly within the scan bound', async () => {
+  const { EventEmitter } = await import('node:events');
+  const literal = 'SandboxSerializer: Failed to initialize sandbox with source mode policy:';
+  for (const beyondBound of [false, true]) {
+    const child = new EventEmitter(); child.stderr = new EventEmitter();
+    const snapshot = observeSignedStagingProcess(child);
+    child.stderr.emit('data', Buffer.alloc(65536 - literal.length + Number(beyondBound), 120));
+    // Bytewise delivery exercises the longest overlap rather than only two chunks.
+    for (const character of literal) child.stderr.emit('data', Buffer.from(character));
+    child.stderr.emit('end');
+    const value = snapshot();
+    assert.equal(value.stderrBytesScanned, 65536);
+    assert.equal(value.sandboxSourcePolicyFailure, !beyondBound);
+    assert.equal(value.stderrTruncated, beyondBound);
+    assert.equal(value.stderrComplete, true);
+  }
 });

@@ -266,7 +266,13 @@ const STDERR_SCAN_LIMIT = 64 * 1024;
 const STDERR_MARKERS = Object.freeze({ electronEntryFailure: [ELECTRON_ENTRY_FAILURE_DIAGNOSTIC], sandboxApplyMessage: ['sandbox_apply:'],
   sandboxInitializationMessage: ['sandbox_init() failed', 'InitializeSandbox() failed'],
   seatbeltMessage: ['SeatbeltExec:'], operationNotPermitted: ['Operation not permitted'],
-  dynamicLibraryMissing: ['Library not loaded:'] });
+  dynamicLibraryMissing: ['Library not loaded:'],
+  sandboxPolicyDeserializeFailure: ['SandboxSerializer: Failed to deserialize policy:'],
+  sandboxCompiledPolicyFailure: ['SandboxSerializer: Failed to apply compiled policy:'],
+  sandboxSourcePolicyFailure: ['SandboxSerializer: Failed to initialize sandbox with source mode policy:'],
+  machBootstrapCheck: ['bootstrap_check_in '],
+  gpuProcessUnusable: ["GPU process isn't usable. Goodbye."],
+  chromiumFatal: [':FATAL:'], chromiumCheckFailure: ['Check failed:'] });
 const EXIT_SIGNALS = ['SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGILL', 'SIGTRAP', 'SIGABRT', 'SIGBUS',
   'SIGFPE', 'SIGKILL', 'SIGSEGV', 'SIGPIPE', 'SIGALRM', 'SIGTERM', 'SIGXCPU', 'SIGXFSZ', 'SIGSYS'];
 const EXIT_BOOLEANS = ['exited', 'spawnFailed', 'unknownExitSignal', 'stderrTruncated', 'stderrComplete',
