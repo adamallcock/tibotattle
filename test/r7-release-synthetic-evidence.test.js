@@ -42,6 +42,13 @@ test("R7 release semantics evidence is two-pass deterministic, bounded, and cont
       && operation.filesystem.sampledHighWaterBytes >= operation.filesystem.afterBytes,
   )), true);
   assert.equal(value.passes.every((pass) => pass.producedChunks <= 16), true);
+  // Volatile workspace reservations remain measured even though they are not
+  // content identity: their serialized elapsed/RSS digit widths can differ.
+  for (const pass of value.passes) {
+    for (const name of ["source_scan", "checkpoint_resume"]) {
+      assert.ok(pass.operations.find((row) => row.name === name).workspaceHighWaterBytes > 0);
+    }
+  }
   assert.equal(value.passes.every(
     (pass) => Object.values(pass.semanticOutcomes.cases).every(Boolean),
   ), true);
