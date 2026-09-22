@@ -316,9 +316,11 @@ export function createD1TelemetryAuthorityBackend(db: D1Database): TelemetryAuth
     },
     async abandon(input): Promise<boolean> {
       try {
-        const result = await db.prepare(`UPDATE upload_authorizations
+          const result = await db.prepare(`UPDATE upload_authorizations
           SET state = 'revoked', revoked_at = ?, consume_lease_expires_at = NULL
-          WHERE id = ? AND state = 'consuming' AND consume_lease_expires_at = ?${input.participantId ? " AND participant_id = ?" : ""}`)
+          WHERE id = ? AND state = 'consuming'
+            AND (consume_lease_expires_at = ?
+              OR consume_lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))${input.participantId ? " AND participant_id = ?" : ""}`)
           .bind(...(input.participantId
             ? [input.now, input.authorizationId, input.leaseExpiresAt, input.participantId]
             : [input.now, input.authorizationId, input.leaseExpiresAt])).run();
@@ -508,7 +510,9 @@ export function createD1TelemetryAuthorityBackend(db: D1Database): TelemetryAuth
       try {
         const result = await db.prepare(`UPDATE device_upload_authorizations
           SET state = 'revoked', revoked_at = ?, consume_lease_expires_at = NULL
-          WHERE id = ? AND state = 'consuming' AND consume_lease_expires_at = ?${input.participantId ? " AND participant_id = ?" : ""}`)
+          WHERE id = ? AND state = 'consuming'
+            AND (consume_lease_expires_at = ?
+              OR consume_lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))${input.participantId ? " AND participant_id = ?" : ""}`)
           .bind(...(input.participantId
             ? [input.now, input.authorizationId, input.leaseExpiresAt, input.participantId]
             : [input.now, input.authorizationId, input.leaseExpiresAt])).run();

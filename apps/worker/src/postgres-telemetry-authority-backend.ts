@@ -477,7 +477,8 @@ export function createPostgresTelemetryAuthorityBackend(
         : [snapshot.now, snapshot.authorizationId, snapshot.leaseExpiresAt];
       return mutate(pool, async (client) => changes(await client.query(`UPDATE ${tables.uploadAuthorizations}
         SET state = 'revoked', revoked_at = $1, consume_lease_expires_at = NULL
-        WHERE id = $2 AND state = 'consuming' AND consume_lease_expires_at = $3${owner}`, values)) === 1);
+        WHERE id = $2 AND state = 'consuming'
+          AND (consume_lease_expires_at = $3 OR consume_lease_expires_at <= clock_timestamp())${owner}`, values)) === 1);
     },
   };
 
@@ -685,7 +686,8 @@ export function createPostgresTelemetryAuthorityBackend(
         : [snapshot.now, snapshot.authorizationId, snapshot.leaseExpiresAt];
       return mutate(pool, async (client) => changes(await client.query(`UPDATE ${tables.deviceUploadAuthorizations}
         SET state = 'revoked', revoked_at = $1, consume_lease_expires_at = NULL
-        WHERE id = $2 AND state = 'consuming' AND consume_lease_expires_at = $3${owner}`, values)) === 1);
+        WHERE id = $2 AND state = 'consuming'
+          AND (consume_lease_expires_at = $3 OR consume_lease_expires_at <= clock_timestamp())${owner}`, values)) === 1);
     },
   };
 
