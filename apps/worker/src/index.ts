@@ -252,6 +252,10 @@ import {
 } from "./retention";
 import { eraseParticipantAsOwner, parseParticipantErasureRequest } from "./participant-erasure";
 import {
+  activateTelemetryRuntimeAsOwner,
+  parseTelemetryRuntimeActivationRequest,
+} from "./telemetry-runtime-activation";
+import {
   assertSignInStartAdmission,
   assertSignInStartAdmissionConfiguration,
   purgeExpiredSignInStartAdmissions,
@@ -3756,6 +3760,20 @@ async function handleAdminAction(
     throw new ApiError(400, "BODY_INVALID");
   }
   if (action === "run_maintenance") {
+    if (Object.hasOwn(body.value, "telemetryRuntimeActivation")) {
+      const target = parseTelemetryRuntimeActivationRequest(body.value);
+      const result = await activateTelemetryRuntimeAsOwner(
+        env.USAGE_MONITOR_DB,
+        env,
+        identityKey,
+        target,
+      );
+      return jsonResponse(
+        { schemaVersion: "admin-action-v0.1", action, result },
+        200,
+        { "cache-control": "no-store", vary: "Cookie" },
+      );
+    }
     if (Object.hasOwn(body.value, "transportRollback")) {
       const target = parseTelemetryTransportRollbackRequest(body.value);
       const result = await rollbackTelemetryTransportAsOwner(env.USAGE_MONITOR_DB, identityKey, target);
