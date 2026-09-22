@@ -195,6 +195,8 @@
         "apps/worker/scripts/production-maintenance.check.mjs",
         "apps/worker/scripts/production-maintenance.mjs",
         "apps/worker/scripts/production-typed-schema.mjs",
+        "apps/worker/scripts/production-collection-control.check.mjs",
+        "apps/worker/scripts/production-collection-control.mjs",
         "apps/worker/scripts/telemetry-runtime-reconciliation.check.mjs",
         "apps/worker/scripts/telemetry-runtime-reconciliation.mjs",
         "apps/worker/scripts/typed-forward-migration.check.mjs",

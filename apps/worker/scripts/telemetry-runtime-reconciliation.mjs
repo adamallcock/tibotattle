@@ -79,7 +79,7 @@ function schemaRows(value) {
 }
 
 function ledgerRows(value) {
-  const rows = queryRows(value, 129);
+  const rows = queryRows(value, 128);
   for (const row of rows) {
     if (!object(row)
         || Object.keys(row).sort().join(",") !== "name,sha256"

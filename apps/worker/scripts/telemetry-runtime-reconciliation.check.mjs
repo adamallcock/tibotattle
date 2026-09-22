@@ -246,6 +246,44 @@ for (const role of ["primary", "analytics"]) {
   });
 }
 
+for (const [role, databaseId] of [["primary", PRIMARY], ["analytics", ANALYTICS]]) {
+  for (const count of [128, 129]) {
+    test(`${role} reconciliation ${count === 128 ? "accepts the ledger boundary" : "refuses the overflow sentinel"}`, async () => {
+      const root = await mkdtemp("/private/tmp/telemetry-runtime-ledger-boundary-");
+      await chmod(root, 0o700);
+      const output = join(root, "proof.json");
+      const fixture = fixtureFetch();
+      const fetchImpl = async (url, options) => {
+        if (new URL(url).pathname.endsWith(`/d1/database/${databaseId}/query`)
+            && JSON.parse(options.body).sql === TYPED_PRODUCTION_QUERIES.ledger) {
+          return Response.json({ success: true, result: [{ success: true,
+            results: Array.from({ length: count }, (_, index) => ({
+              name: `migration-${index}`, sha256: "a".repeat(64),
+            })),
+          }] });
+        }
+        return fixture.fakeFetch(url, options);
+      };
+      try {
+        const capture = captureTelemetryRuntimeReconciliation({
+          accountId: ACCOUNT, workerName: WORKER, output,
+          environment: { CLOUDFLARE_API_TOKEN: "synthetic-provider-token" },
+          fetchImpl, now: () => "2026-09-22T15:00:00.000Z",
+        });
+        if (count === 128) {
+          const proof = await capture;
+          assert.equal(JSON.parse(await readFile(output, "utf8")).proofSha256, proof.proofSha256);
+        } else {
+          await assert.rejects(capture, { code: "TELEMETRY_RUNTIME_RECONCILIATION_QUERY_RESULT_INVALID" });
+          await assert.rejects(readFile(output), { code: "ENOENT" });
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
 test("publishes one receipt when concurrent writers race for the same destination", async () => {
   const root = await mkdtemp("/private/tmp/telemetry-runtime-reconciliation-race-");
   await chmod(root, 0o700);
