@@ -248,6 +248,25 @@ describe("owner distribution analytics", () => {
         requestsLast7Days: 1,
         sourceAddressesLast7Days: 1,
       }],
+      observedTotals: {
+        platforms: [{
+          operatingSystem: "macos",
+          requestsLast7Days: 24,
+          sourceAddressesLast7Days: 6,
+        }, {
+          operatingSystem: "windows",
+          requestsLast7Days: 2,
+          sourceAddressesLast7Days: 1,
+        }, {
+          operatingSystem: "linux",
+          requestsLast7Days: 1,
+          sourceAddressesLast7Days: 1,
+        }],
+        overall: {
+          requestsLast7Days: 27,
+          sourceAddressesLast7Days: 8,
+        },
+      },
     });
     expect(overview.cloudflare.bySegment).toHaveLength(7);
     expect(overview.cloudflare.bySegment.slice(0, 2)).toEqual([{
@@ -307,6 +326,110 @@ describe("owner distribution analytics", () => {
     expect(serialized).not.toContain("analytics-secret");
   });
 
+  it("deduplicates observed totals across apps, versions, platforms, and segments before the version cap", async () => {
+    const dayMilliseconds = 24 * 60 * 60 * 1_000;
+    const segmentStarts = Array.from({ length: 7 }, (_, index) =>
+      new Date(NOW - 7 * dayMilliseconds + index * dayMilliseconds).toISOString());
+    const segmentStart = (index: number): string => {
+      const value = segmentStarts[index];
+      if (value === undefined) throw new Error("missing analytics segment");
+      return value;
+    };
+    const rowsBySegment = new Map(segmentStarts.map((startsAt) => [
+      startsAt,
+      {
+        nativeArm64: [] as object[],
+        nativeX64: [] as object[],
+        electronMacArm64: [] as object[],
+        electronMacX64: [] as object[],
+        electronWindowsX64: [] as object[],
+        electronLinuxX64: [] as object[],
+      },
+    ]));
+    rowsBySegment.get(segmentStart(0))?.nativeArm64.push(analyticsRow({
+      count: 2,
+      clientIP: "198.51.100.1",
+      userAgent: "TiboTattle/1.0.0 CFNetwork/1",
+    }));
+    rowsBySegment.get(segmentStart(1))?.nativeX64.push(analyticsRow({
+      count: 3,
+      clientIP: "198.51.100.1",
+      userAgent: "TiboTattle/1.1.0 CFNetwork/1",
+    }));
+    rowsBySegment.get(segmentStart(2))?.electronMacArm64.push(analyticsRow({
+      count: 4,
+      clientIP: "198.51.100.1",
+      userAgent: "TiboTattle/2.0.0 electron-updater",
+    }));
+    rowsBySegment.get(segmentStart(3))?.electronWindowsX64.push(analyticsRow({
+      count: 5,
+      clientIP: "198.51.100.1",
+      userAgent: "TiboTattle/3.0.0 electron-updater",
+    }));
+    rowsBySegment.get(segmentStart(4))?.electronLinuxX64.push(analyticsRow({
+      count: 6,
+      clientIP: "198.51.100.1",
+      userAgent: "Electron/39.0.0 electron-updater",
+    }));
+    rowsBySegment.get(segmentStart(6))?.nativeArm64.push(...Array.from(
+      { length: 20 },
+      (_, index) => analyticsRow({
+        clientIP: `198.51.100.${index + 2}`,
+        userAgent: `TiboTattle/9.${index}.0 CFNetwork/1`,
+      }),
+    ));
+
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === GITHUB_ENDPOINT) return jsonResponse(githubRelease());
+      expect(url).toBe(ANALYTICS_ENDPOINT);
+      const body = JSON.parse(String(init?.body)) as {
+        variables: { start: string };
+      };
+      const rows = rowsBySegment.get(body.variables.start);
+      if (rows === undefined) throw new Error("unexpected analytics segment");
+      return jsonResponse({
+        data: { viewer: { zones: [{
+          ...rows,
+          releases: [],
+          intelReleases: [],
+        }] } },
+        errors: null,
+      });
+    }) as unknown as typeof fetch;
+
+    const overview = await readDistributionAnalytics({
+      enabled: true,
+      cloudflareZoneId: "zone-id",
+      cloudflareApiToken: "analytics-secret",
+    }, NOW, fetcher);
+
+    expect(overview.cloudflare).toMatchObject({
+      status: "available",
+      observedVersionsBounded: true,
+      observedTotals: {
+        platforms: [{
+          operatingSystem: "macos",
+          requestsLast7Days: 29,
+          sourceAddressesLast7Days: 21,
+        }, {
+          operatingSystem: "windows",
+          requestsLast7Days: 5,
+          sourceAddressesLast7Days: 1,
+        }, {
+          operatingSystem: "linux",
+          requestsLast7Days: 6,
+          sourceAddressesLast7Days: 1,
+        }],
+        overall: {
+          requestsLast7Days: 40,
+          sourceAddressesLast7Days: 21,
+        },
+      },
+    });
+    expect(overview.cloudflare.observedVersions).toHaveLength(12);
+  });
+
   it("does no external work when distribution evidence is disabled", async () => {
     const fetcher = vi.fn() as unknown as typeof fetch;
     const overview = await readDistributionAnalytics(
@@ -318,6 +441,7 @@ describe("owner distribution analytics", () => {
     expect(overview.cloudflare).toMatchObject({
       status: "not_configured",
       reasonCode: "DISTRIBUTION_DISABLED",
+      observedTotals: null,
     });
     expect(overview.github.status).toBe("not_configured");
   });
@@ -419,6 +543,22 @@ describe("owner distribution analytics", () => {
       currentVersion: "0.1.12",
       currentVersionSourceAddresses: { last24Hours: 0, last7Days: 0 },
       observedVersions: [],
+      observedTotals: {
+        platforms: [{
+          operatingSystem: "macos",
+          requestsLast7Days: 0,
+          sourceAddressesLast7Days: 0,
+        }, {
+          operatingSystem: "windows",
+          requestsLast7Days: 0,
+          sourceAddressesLast7Days: 0,
+        }, {
+          operatingSystem: "linux",
+          requestsLast7Days: 0,
+          sourceAddressesLast7Days: 0,
+        }],
+        overall: { requestsLast7Days: 0, sourceAddressesLast7Days: 0 },
+      },
     });
     expect(overview.cloudflare.bySegment).toHaveLength(7);
     expect(overview.cloudflare.bySegment.every((segment) => (
@@ -445,6 +585,7 @@ describe("owner distribution analytics", () => {
       status: "unavailable",
       reasonCode: "ANALYTICS_UNAVAILABLE",
       bySegment: [],
+      observedTotals: null,
     });
     expect(overview.github).toMatchObject({
       status: "unavailable",

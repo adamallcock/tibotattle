@@ -248,7 +248,8 @@
 }
 
 /* Keep operator actions compact and make the long page navigable. */
-.admin-section-nav { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 18px 0; font-size: .78rem; }
+.admin-section-nav { position: sticky; top: 76px; z-index: 19; display: flex; flex-wrap: nowrap; overflow-x: auto; gap: 8px 16px; margin: 0; padding: 14px 0; border-bottom: 1px solid var(--line); background: var(--paper, #f5f1e8); font-size: .78rem; }
+.admin-section-nav a { flex-shrink: 0; }
 .admin-section-nav a { color: var(--green); text-underline-offset: 3px; }
 .admin-toolbar-group { align-content: start; align-items: center; }
 .admin-toolbar-group .admin-toolbar-status { align-self: center; }
@@ -256,8 +257,14 @@
 .admin-form legend { margin-bottom: 12px; color: var(--muted); font-size: .75rem; }
 .admin-control-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .admin-operator-page :is(button, input, select, a):focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
-.admin-operator-page h2, .admin-operator-page h4 { scroll-margin-top: 24px; }
+.admin-operator-page h2, .admin-operator-page h4 { scroll-margin-top: 150px; }
 
 @media (max-width: 1100px) {
   .admin-section[aria-labelledby="readiness-title"] .admin-two-column { grid-template-columns: 1fr; }
 }
+
+#distribution-total-rows { border-top: 2px solid var(--line); font-weight: 700; }
+#distribution-total-rows tr:last-child { background: var(--paper, #f5f1e8); }
+.admin-evidence-card summary, .admin-diagnostic-details summary { cursor: pointer; color: var(--green); font-weight: 700; }
+.admin-evidence-card details[open] summary, .admin-diagnostic-details[open] summary { margin-bottom: 16px; }
+.admin-evidence-card { align-self: start; }

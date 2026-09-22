@@ -16,6 +16,7 @@ const GRAPHQL_ROW_LIMIT = 10_000;
 const MAX_RESPONSE_BYTES = 2 * 1_024 * 1_024;
 const FETCH_TIMEOUT_MILLISECONDS = 8_000;
 const MAX_RENDERED_VERSIONS = 12;
+const OBSERVED_OPERATING_SYSTEMS = ["macos", "windows", "linux"] as const;
 
 const ANALYTICS_QUERY = `
   query TiboTattleDistribution($zoneTag: string, $start: Time, $end: Time) {
@@ -172,6 +173,20 @@ export interface DistributionVersionActivity {
   readonly sourceAddressesLast7Days: number;
 }
 
+export interface DistributionObservedPlatformTotals {
+  readonly operatingSystem: DistributionVersionActivity["operatingSystem"];
+  readonly requestsLast7Days: number;
+  readonly sourceAddressesLast7Days: number;
+}
+
+export interface DistributionObservedTotals {
+  readonly platforms: readonly DistributionObservedPlatformTotals[];
+  readonly overall: {
+    readonly requestsLast7Days: number;
+    readonly sourceAddressesLast7Days: number;
+  };
+}
+
 export interface DistributionActivitySegment {
   readonly startsAt: string;
   readonly endsAt: string;
@@ -207,6 +222,7 @@ export interface CloudflareDistributionAnalytics {
   readonly bySegment: readonly DistributionActivitySegment[];
   readonly observedVersions: readonly DistributionVersionActivity[];
   readonly observedVersionsBounded: boolean;
+  readonly observedTotals: DistributionObservedTotals | null;
 }
 
 export interface DistributionAnalyticsOverview {
@@ -238,6 +254,11 @@ interface AnalyticsSegment {
 interface VersionAccumulator {
   requestsLast7Days: number;
   readonly sourceAddressesLast24Hours: Set<string>;
+  readonly sourceAddressesLast7Days: Set<string>;
+}
+
+interface ObservedTotalsAccumulator {
+  requestsLast7Days: number;
   readonly sourceAddressesLast7Days: Set<string>;
 }
 
@@ -309,6 +330,7 @@ function sourceUnavailable(
     bySegment: [],
     observedVersions: [],
     observedVersionsBounded: false,
+    observedTotals: null,
   };
 }
 
@@ -576,6 +598,22 @@ function aggregateAnalytics(
   const sparkleDownloads = requestAccumulator();
   const bySegment: DistributionActivitySegment[] = [];
   const versions = new Map<string, VersionAccumulator>();
+  const observedTotalsByOperatingSystem = new Map<
+    DistributionVersionActivity["operatingSystem"],
+    ObservedTotalsAccumulator
+  >(
+    OBSERVED_OPERATING_SYSTEMS.map((operatingSystem) => [
+      operatingSystem,
+      {
+        requestsLast7Days: 0,
+        sourceAddressesLast7Days: new Set<string>(),
+      },
+    ]),
+  );
+  const observedTotalsOverall: ObservedTotalsAccumulator = {
+    requestsLast7Days: 0,
+    sourceAddressesLast7Days: new Set<string>(),
+  };
   let sampled = false;
   let bounded = false;
 
@@ -611,6 +649,22 @@ function aggregateAnalytics(
         activeAddressesLast7Days.add(row.clientIP);
         segmentActiveAddresses.add(row.clientIP);
         if (inLast24Hours) activeAddressesLast24Hours.add(row.clientIP);
+        const observedPlatformTotals = observedTotalsByOperatingSystem.get(
+          group.operatingSystem,
+        );
+        if (observedPlatformTotals === undefined) {
+          throw new Error("unknown observed operating system");
+        }
+        observedPlatformTotals.requestsLast7Days = safeAdd(
+          observedPlatformTotals.requestsLast7Days,
+          row.count,
+        );
+        observedPlatformTotals.sourceAddressesLast7Days.add(row.clientIP);
+        observedTotalsOverall.requestsLast7Days = safeAdd(
+          observedTotalsOverall.requestsLast7Days,
+          row.count,
+        );
+        observedTotalsOverall.sourceAddressesLast7Days.add(row.clientIP);
         if (group.client === "electron") {
           addRequest(row, inLast24Hours, electronChecks);
           segmentElectronCheckRequests = safeAdd(
@@ -697,6 +751,24 @@ function aggregateAnalytics(
       || left.operatingSystem.localeCompare(right.operatingSystem)
       || (left.version ?? "").localeCompare(right.version ?? ""))
     .slice(0, MAX_RENDERED_VERSIONS);
+  const observedTotals: DistributionObservedTotals = {
+    platforms: OBSERVED_OPERATING_SYSTEMS.map((operatingSystem) => {
+      const totals = observedTotalsByOperatingSystem.get(operatingSystem);
+      if (totals === undefined) {
+        throw new Error("unknown observed operating system");
+      }
+      return {
+        operatingSystem,
+        requestsLast7Days: totals.requestsLast7Days,
+        sourceAddressesLast7Days: totals.sourceAddressesLast7Days.size,
+      };
+    }),
+    overall: {
+      requestsLast7Days: observedTotalsOverall.requestsLast7Days,
+      sourceAddressesLast7Days:
+        observedTotalsOverall.sourceAddressesLast7Days.size,
+    },
+  };
   const currentVersionAddressesLast24Hours = new Set<string>();
   const currentVersionAddressesLast7Days = new Set<string>();
   if (currentVersion !== null) {
@@ -738,6 +810,7 @@ function aggregateAnalytics(
     bySegment,
     observedVersions,
     observedVersionsBounded: versions.size > MAX_RENDERED_VERSIONS,
+    observedTotals,
   };
 }
 
