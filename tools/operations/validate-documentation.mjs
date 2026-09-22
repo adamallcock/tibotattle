@@ -333,7 +333,29 @@ async function lstatIfPresent(path) {
   try {
     return await lstat(path);
   } catch (error) {
-    if (error?.code === "ENOENT") return null;
+    if (error?.code === "ENOENT") {
+      // Windows can report ENOENT for a child of a regular file, where POSIX
+      // reports ENOTDIR. Preserve the fail-closed distinction from an absent
+      // target by checking the first existing ancestor.
+      let parent = dirname(path);
+      while (true) {
+        try {
+          const ancestor = await lstat(parent);
+          if (!ancestor.isDirectory() || ancestor.isSymbolicLink()) {
+            const invalid = new Error("documentation ancestor is not a directory");
+            invalid.code = "ENOTDIR";
+            throw invalid;
+          }
+          break;
+        } catch (ancestorError) {
+          if (ancestorError?.code !== "ENOENT") throw ancestorError;
+          const next = dirname(parent);
+          if (next === parent) break;
+          parent = next;
+        }
+      }
+      return null;
+    }
     throw error;
   }
 }

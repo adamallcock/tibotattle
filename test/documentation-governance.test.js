@@ -164,6 +164,7 @@ test("link validation reports missing files, missing anchors, and escapes", asyn
   const selected = await fixture({
     "README.md": [
       "[missing](./missing.md)",
+      "[missing nested](./absent/child.md)",
       "[bad anchor](./target.md#not-there)",
       "[escape](../outside.md)",
     ].join("\n"),
@@ -173,8 +174,9 @@ test("link validation reports missing files, missing anchors, and escapes", asyn
   const result = await validateDocumentation({ ...selected, linksOnly: true });
   assert.deepEqual(result.failures, [
     "README.md:1: local link target does not exist: ./missing.md",
-    "README.md:2: Markdown anchor does not exist: ./target.md#not-there",
-    "README.md:3: local link escapes the repository: ../outside.md",
+    "README.md:2: local link target does not exist: ./absent/child.md",
+    "README.md:3: Markdown anchor does not exist: ./target.md#not-there",
+    "README.md:4: local link escapes the repository: ../outside.md",
   ]);
 });
 
