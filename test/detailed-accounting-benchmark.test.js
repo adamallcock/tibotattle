@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { chmod, link, mkdir, mkdtemp, open, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
@@ -28,6 +28,27 @@ const approvedArgs = ["--allow-private-index-benchmark", "--baseline-root", "/sy
   "--candidate-root", "/synthetic/candidate", "--index", "/synthetic/input.sqlite",
   "--output-dir", "/synthetic/output", "--now", "2026-09-02T00:00:00.000Z", "--window-days", "365"];
 const codeIs = (code) => (error) => error.code === code && error.message === code;
+
+function detailedAccountingBenchmarkSkipReason() {
+  if (process.platform !== "darwin") return "requires macOS";
+  if (process.arch !== "arm64") return "requires macOS arm64";
+  if (process.version !== "v26.2.0") return "requires Node.js v26.2.0";
+  let probe;
+  try {
+    probe = spawnSync("/usr/bin/time", ["-l", "/usr/bin/true"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    return "macOS /usr/bin/time -l RSS metrics are unavailable in this environment";
+  }
+  if (probe.status !== 0
+      || !/^\s*\d+(?:\.\d+)?\s+real\s+/mu.test(probe.stderr)
+      || !/^\s*\d+\s+maximum resident set size\s*$/mu.test(probe.stderr)) {
+    return "macOS /usr/bin/time -l RSS metrics are unavailable in this environment";
+  }
+  return false;
+}
 
 test("private operation is explicit and argument parsing pins an exact clock and window", async () => {
   assert.throws(() => parseDetailedAccountingBenchmarkArguments([]), codeIs("approval_required"));
@@ -424,7 +445,7 @@ test("tool-only partial publication remains partial rather than being relabeled 
 });
 
 test("synthetic substitute revisions exercise the complete private runner without reading real history", {
-  skip: process.platform !== "darwin" || process.arch !== "arm64" || process.version !== "v26.2.0",
+  skip: detailedAccountingBenchmarkSkipReason(),
 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "accounting-benchmark-runner-test-"));
   try {

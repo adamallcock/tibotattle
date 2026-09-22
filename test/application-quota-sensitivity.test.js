@@ -46,6 +46,7 @@ const APPLICATION_PUBLIC_EXPORTS = [
   "createModelPerformanceContext",
   "createUsageExplainerService",
   "createWorkUsageService",
+  "createWorkUsageSnapshotStore",
   "validateWorkUsageQuery",
   "fitUsageExplanationEnvelope",
   "selectProductionParticipantIdentity",

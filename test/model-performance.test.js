@@ -9,6 +9,7 @@ import { modelPerformanceProjection } from '../src/reporting/index.js';
 import { createModelPerformanceController } from '../apps/local/model-performance-controller.js';
 import { modelPerformanceSupplementDirectory } from '../apps/local/model-performance-worker.js';
 import { loadWindowsSourceReadBinding } from '../src/platform/windows-filesystem.js';
+import { ensureWindowsSyntheticSourceOwner } from '../scripts/lib/windows-synthetic-source-owner.mjs';
 
 const NOW = Date.parse('2026-09-09T12:00:00Z'), DAY = 86400000;
 const row = (patch = {}) => ({ at: NOW, model: 'gpt-5.6-sol', sample_method: 'receipt',
@@ -549,6 +550,7 @@ test('actual worker persists separate Codex sources and preserves the unscoped l
       turn_token_usage: { output_tokens: 100, reasoning_output_tokens: 50 } }),
     rec(1000, 'event_msg', { type: 'task_complete', turn_id: turn, duration_ms: 1000, time_to_first_token_ms: 200 })];
   await writeFile(join(codexHome, 'sessions', 'synthetic.jsonl'), rows.map(r => JSON.stringify(r)).join('\n') + '\n');
+  if (process.platform === 'win32') ensureWindowsSyntheticSourceOwner(join(codexHome, 'sessions', 'synthetic.jsonl'));
   const options = { directory: join(root, 'timing'), codexHome };
   await mkdir(options.directory, { mode: 0o700 });
   const legacyFile = join(options.directory, 'timing-experiment.sqlite');

@@ -27,6 +27,7 @@ import {
   buildWindowsNormalCandidateLaunchSpec,
   prepareWindowsDevelopmentProfile,
 } from "../scripts/launch-electron-windows-development.mjs";
+import { ensureWindowsSyntheticSourceOwner } from "../scripts/lib/windows-synthetic-source-owner.mjs";
 import {
   buildWindowsNormalCandidateCodexFixture,
   buildWindowsNormalCandidateFirewallCreateArguments,
@@ -79,9 +80,32 @@ const SOURCE_CANDIDATE_PATH = String.raw`C:\candidate\production-source-candidat
 const RECEIPT_PATH = String.raw`C:\workspace\.release-build\electron-windows-normal-candidate\normal-candidate-smoke.json`;
 const FIREWALL_RULE = "tibotattle-normal-candidate-550e8400-e29b-41d4-a716-446655440000";
 
+test("disposable Windows source owner setup preserves ACLs and emits fixed errors", () => {
+  const path = String.raw`C:\runner\owned\synthetic.jsonl`;
+  let invocation;
+  ensureWindowsSyntheticSourceOwner(path, {
+    environment: { PSModulePath: "private-module-path", SystemRoot: String.raw`C:\Windows` },
+    run: (command, args, options) => {
+      invocation = { command, args, options };
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.equal(invocation.command, "powershell.exe");
+  assert.equal(invocation.options.env.TIBOTATTLE_SYNTHETIC_SOURCE_FILE, path);
+  assert.equal(Object.hasOwn(invocation.options.env, "PSModulePath"), false);
+  assert.match(invocation.args.at(-1), /GetSecurityDescriptorSddlForm/u);
+  assert.match(invocation.args.at(-1), /setowner/u);
+  assert.throws(() => ensureWindowsSyntheticSourceOwner(path, {
+    run: () => ({ status: 40, stdout: "", stderr: "private-ACL-value" }),
+  }), /synthetic_owner_dacl_changed/u);
+  assert.throws(() => ensureWindowsSyntheticSourceOwner("relative.jsonl"), /synthetic_owner_invalid_path/u);
+});
+
 test("packaged Windows timing smoke requires a complete ready source scan", () => {
   const ready = { schemaVersion: 4, method: 5, status: "ready", collecting: false,
-    stale: false, period: "all", models: [], historyProgress: { checked: 1, total: 1 } };
+    stale: false, period: "all", models: [{ id: "gpt-5.6-sol", turns: 1,
+      speed: [{ points: [{ median: 13.3 }] }], ttft: [{ median: 1 }] }],
+    historyProgress: { checked: 1, total: 1 } };
   assert.equal(verifyWindowsNormalCandidateModelPerformance(ready), true);
   for (const value of [null, { ...ready, schemaVersion: 2 }, { ...ready, method: 3 },
     { ...ready, status: "unavailable" },
@@ -89,7 +113,9 @@ test("packaged Windows timing smoke requires a complete ready source scan", () =
     { ...ready, historyProgress: null },
     { ...ready, historyProgress: { checked: 0, total: 1 } },
     { ...ready, historyProgress: { checked: 0, total: 0 } },
-    { ...ready, models: null }]) {
+    { ...ready, models: null }, { ...ready, models: [] },
+    { ...ready, models: [{ ...ready.models[0], speed: [] }] },
+    { ...ready, models: [{ ...ready.models[0], ttft: [] }] }]) {
     assert.equal(verifyWindowsNormalCandidateModelPerformance(value), false);
   }
   assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "unavailable" }), "UNAVAILABLE");
@@ -1164,6 +1190,7 @@ test("normal candidate adds one content-free Codex source before launch", async 
       fixtureContent = value;
       calls.push({ kind: "file", path, value, options });
     },
+    normalizeOwner: (path) => calls.push({ kind: "owner", path }),
   });
   assert.equal(fixture.codexHome, win32.join(profile.home, ".codex"));
   assert.notEqual(fixture.codexHome, profile.codex);
@@ -1174,11 +1201,12 @@ test("normal candidate adds one content-free Codex source before launch", async 
   );
   const records = fixtureContent.trim().split("\n").map((line) => JSON.parse(line));
   assert.deepEqual(records.map((record) => record.type), [
-    "session_meta", "turn_context", "event_msg",
+    "session_meta", "event_msg", "event_msg", "turn_context", "event_msg",
+    "response_item", "event_msg", "event_msg",
   ]);
   assert.equal(records[0].payload.id, "70000000-0000-4000-8000-000000000001");
-  assert.equal(records[1].payload.model, "gpt-5.6-sol");
-  assert.equal(records[2].payload.info.total_token_usage.total_tokens, 120);
+  assert.equal(records[3].payload.model, "gpt-5.6-sol");
+  assert.equal(records[6].payload.info.total_token_usage.total_tokens, 120);
   assert.deepEqual(calls, [
     {
       kind: "directory",
@@ -1191,6 +1219,7 @@ test("normal candidate adds one content-free Codex source before launch", async 
       value: fixtureContent,
       options: { mode: 0o600, flag: "wx" },
     },
+    { kind: "owner", path: fixture.fixture },
   ]);
   await assert.rejects(seedWindowsNormalCandidateCodexFixture({ profile }, {
     now: () => NORMAL_CANDIDATE_FIXTURE_CLOCK_MS,
@@ -1250,6 +1279,7 @@ test("normal candidate fixture passes Codex discovery, onboarding, and local ref
       captured.fileName = win32.basename(path);
       captured.content = value;
     },
+    normalizeOwner: () => {},
   });
   const root = await mkdtemp(join(await realpath(tmpdir()), "tibotattle-windows-normal-fixture-"));
   const codexHome = join(root, "codex");
@@ -1338,6 +1368,21 @@ test("normal candidate fixture passes Codex discovery, onboarding, and local ref
       launch: "first",
       expectedRefreshId: terminal.refreshId,
     }), true);
+    let performance = null;
+    const timingDeadline = Date.now() + 10_000;
+    while (Date.now() < timingDeadline) {
+      performance = await fetch(`${base}/api/local/model-performance?period=all`).then((value) => value.json());
+      if (performance.status === "ready" && !performance.collecting) break;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+    }
+    assert.equal(performance?.status, "ready");
+    assert.equal(performance.stale, false);
+    assert.equal(performance.models.length, 1);
+    assert.equal(performance.models[0].id, "gpt-5.6-sol");
+    assert.equal(performance.models[0].turns, 1);
+    assert.ok(performance.models[0].speed.some((series) => series.points.some((point) => point.median > 0)));
+    assert.ok(performance.models[0].ttft.some((point) => point.median > 0));
+    assert.equal(verifyWindowsNormalCandidateModelPerformance(performance), true);
     await app.close();
     app = await startLocalCompanionServer(serverOptions);
     const restartedBase = `http://127.0.0.1:${app.port}`;

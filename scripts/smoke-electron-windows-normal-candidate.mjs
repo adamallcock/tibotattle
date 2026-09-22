@@ -61,6 +61,7 @@ import {
   parseWindowsProcessSnapshot,
   runWindowsNsisLifecycleProgram,
 } from "./smoke-electron-windows-nsis-lifecycle.mjs";
+import { ensureWindowsSyntheticSourceOwner } from "./lib/windows-synthetic-source-owner.mjs";
 
 const require = createRequire(import.meta.url);
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
@@ -82,6 +83,7 @@ const SYNTHETIC_CODEX_SESSION_ID = "70000000-0000-4000-8000-000000000001";
 // window edge when a candidate journey runs long.
 const SYNTHETIC_CODEX_SESSION_AGE_MS = 2 * 24 * 60 * 60 * 1_000;
 const SYNTHETIC_CODEX_TURN_CONTEXT_OFFSET_MS = 1_000;
+const SYNTHETIC_CODEX_TURN_ID = "synthetic-turn";
 const SYNTHETIC_CODEX_TOKEN_COUNT_OFFSET_MS = 60_000;
 
 /** Codex names a canonical rollout after its session start, to whole seconds. */
@@ -113,9 +115,41 @@ export function buildWindowsNormalCandidateCodexFixture(nowMs = Date.now()) {
       payload: { id: SYNTHETIC_CODEX_SESSION_ID },
     },
     {
+      timestamp: at(0),
+      type: "event_msg",
+      payload: { type: "token_count", info: {
+        total_token_usage: { input_tokens: 0, cached_input_tokens: 0,
+          cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0,
+          total_tokens: 0 },
+        last_token_usage: { input_tokens: 0, cached_input_tokens: 0,
+          cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0,
+          total_tokens: 0 },
+      } },
+    },
+    {
+      timestamp: at(SYNTHETIC_CODEX_TURN_CONTEXT_OFFSET_MS),
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: SYNTHETIC_CODEX_TURN_ID },
+    },
+    {
       timestamp: at(SYNTHETIC_CODEX_TURN_CONTEXT_OFFSET_MS),
       type: "turn_context",
-      payload: { model: "gpt-5.6-sol" },
+      payload: { turn_id: SYNTHETIC_CODEX_TURN_ID, model: "gpt-5.6-sol", effort: "high" },
+    },
+    {
+      timestamp: at(3_000),
+      type: "event_msg",
+      payload: { type: "item_completed", thread_id: SYNTHETIC_CODEX_SESSION_ID,
+        turn_id: SYNTHETIC_CODEX_TURN_ID,
+        item: { type: "Reasoning" }, started_at_ms: startedAtMs + 2_000,
+        completed_at_ms: startedAtMs + 3_000 },
+    },
+    {
+      timestamp: at(3_500),
+      type: "response_item",
+      payload: { type: "reasoning", internal_chat_message_metadata_passthrough: {
+        turn_id: SYNTHETIC_CODEX_TURN_ID,
+      } },
     },
     {
       timestamp: at(SYNTHETIC_CODEX_TOKEN_COUNT_OFFSET_MS),
@@ -141,6 +175,13 @@ export function buildWindowsNormalCandidateCodexFixture(nowMs = Date.now()) {
           },
         },
       },
+    },
+    {
+      timestamp: at(SYNTHETIC_CODEX_TOKEN_COUNT_OFFSET_MS + 1_000),
+      type: "event_msg",
+      payload: { type: "task_complete", turn_id: SYNTHETIC_CODEX_TURN_ID,
+        duration_ms: SYNTHETIC_CODEX_TOKEN_COUNT_OFFSET_MS,
+        time_to_first_token_ms: 1_000 },
     },
   ].map((record) => JSON.stringify(record)).join("\n")}\n`;
   return Object.freeze({
@@ -893,11 +934,13 @@ export async function seedWindowsNormalCandidateCodexFixture({ profile } = {}, {
   createDirectory = mkdir,
   metadata = lstat,
   writeFixture = writeFile,
+  normalizeOwner = process.platform === "win32" ? ensureWindowsSyntheticSourceOwner : () => {},
   now = Date.now,
 } = {}) {
   const home = exactWindowsPath(profile?.home);
   if (home === null || typeof createDirectory !== "function"
       || typeof metadata !== "function" || typeof writeFixture !== "function"
+      || typeof normalizeOwner !== "function"
       || typeof now !== "function") {
     fail("PROFILE_INVALID");
   }
@@ -917,6 +960,10 @@ export async function seedWindowsNormalCandidateCodexFixture({ profile } = {}, {
       mode: 0o600,
       flag: "wx",
     });
+    // The hosted runner can create a source owned by its Administrators group.
+    // Native source reads require the current-user owner, so normalize this
+    // disposable fixture while retaining its inherited source ACL.
+    normalizeOwner(fixture);
     const file = await metadata(fixture);
     if (!file?.isFile?.() || file.isSymbolicLink?.() || file.nlink !== 1
         || file.size !== Buffer.byteLength(source.content)) {
@@ -2795,14 +2842,21 @@ export function verifyWindowsNormalCandidateSyntheticIngestion({
     && history.totalTokens === expected.totalTokens;
 }
 
-// A ready, complete scan proves the packaged timing worker opened its guarded
-// database and read the disposable Codex source through the native capability.
-// The smoke records only this boolean, never model or source data.
+// The fixture has one timed, content-free turn. Require its measured speed and
+// first-token latency, not merely an empty ready page. The smoke records only
+// this boolean, never model or source data.
 export function verifyWindowsNormalCandidateModelPerformance(value) {
   const progress = value?.historyProgress;
+  const measured = value?.models?.some((model) => model?.id === 'gpt-5.6-sol'
+    && model.turns === 1
+    && Array.isArray(model.speed)
+    && model.speed.some((series) => Array.isArray(series?.points)
+      && series.points.some((point) => Number.isFinite(point?.median) && point.median > 0))
+    && Array.isArray(model.ttft)
+    && model.ttft.some((point) => Number.isFinite(point?.median) && point.median > 0));
   return value?.schemaVersion === 4 && value.method === 5
     && value.status === 'ready' && value.collecting === false && value.stale === false
-    && value.period === 'all' && Array.isArray(value.models)
+    && value.period === 'all' && measured === true
     && Number.isSafeInteger(progress?.total) && progress.total > 0
     && progress.checked === progress.total;
 }
