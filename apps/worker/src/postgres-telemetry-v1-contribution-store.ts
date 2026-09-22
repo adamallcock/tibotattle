@@ -1,42 +1,27 @@
 import { ApiError } from "./errors";
 import {
+  quotePostgresIdentifier,
+  withPostgresMutation,
+  type PostgresClient,
+  type PostgresPool,
+  type PostgresQueryResult,
+  type PostgresSchemaOptions,
+} from "./postgres-client";
+import {
   MAX_TELEMETRY_V1_CHUNK_RECORDS,
   type TelemetryV1Chunk,
 } from "./telemetry-v1";
+import { resolvePostgresTelemetryV1Tables } from "./postgres-telemetry-v1-schema";
 import type {
   TelemetryV1ContributionReceipt,
   TelemetryV1ContributionStore,
   TelemetryV1ContributionWrite,
 } from "./telemetry-v1-contribution-store";
 
-/**
- * Structural subset of a node-postgres pool. The qualification laboratory
- * supplies the driver; this candidate deliberately has no pg runtime import.
- */
-export interface PostgresTelemetryV1Pool {
-  connect(): Promise<PostgresTelemetryV1Client>;
-}
-
-export interface PostgresTelemetryV1Client {
-  query(
-    text: string,
-    values?: unknown[],
-  ): Promise<PostgresTelemetryV1QueryResult>;
-  release(discard?: boolean): void | Promise<void>;
-}
-
-export interface PostgresTelemetryV1QueryResult {
-  rows: Record<string, unknown>[];
-  rowCount: number | null;
-}
-
-const BEGIN = "BEGIN";
-const STATEMENT_TIMEOUT = "SET LOCAL statement_timeout='10s'";
-const LOCK_TIMEOUT = "SET LOCAL lock_timeout='5s'";
-const INSERT_CONTRIBUTION =
-  "SELECT accepted_records FROM tibotattle_v1_test.insert_contribution($1::jsonb)";
-const COMMIT = "COMMIT";
-const ROLLBACK = "ROLLBACK";
+/** Compatibility aliases retained for qualification callers. */
+export type PostgresTelemetryV1Pool = PostgresPool;
+export type PostgresTelemetryV1Client = PostgresClient;
+export type PostgresTelemetryV1QueryResult = PostgresQueryResult<Record<string, unknown>>;
 
 function storageUnavailable(): ApiError {
   return new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
@@ -50,6 +35,11 @@ function sqlState(error: unknown): string | null {
   } catch {
     return null;
   }
+}
+
+function preserveSafeError(error: unknown): Error | null {
+  if (error instanceof ApiError) return error;
+  return mapSqlState(error);
 }
 
 /**
@@ -105,6 +95,7 @@ function snapshotContribution(
       participantId: input.participantId,
       deviceId: input.deviceId,
       uploadAuthorizationId: input.uploadAuthorizationId,
+      uploadAuthorizationLeaseExpiresAt: input.uploadAuthorizationLeaseExpiresAt,
       chunkId: input.chunkId,
       objectKey: input.objectKey,
       envelopeDigest: input.envelopeDigest,
@@ -150,71 +141,40 @@ function acceptedRecordCount(
   }
 }
 
-async function releaseClient(
-  client: PostgresTelemetryV1Client,
-  discard: boolean,
-): Promise<boolean> {
-  try {
-    await client.release(discard);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /**
- * Qualification-only PostgreSQL candidate. The function is deliberately
- * pinned to the test schema and no production Worker composition imports this
- * adapter; the schema does not claim full D1 projection or graph parity.
+ * PostgreSQL v1 contribution store. The default is the operational primary
+ * schema; test harnesses must pass an explicit validated schema option.
  */
 export function createExperimentalPostgresTelemetryV1ContributionStore(
   pool: PostgresTelemetryV1Pool,
+  schemaOptions: PostgresSchemaOptions = {},
 ): TelemetryV1ContributionStore {
+  const tables = resolvePostgresTelemetryV1Tables(schemaOptions);
+  const insertContribution = `SELECT accepted_records FROM ${tables.insertContribution}($1::jsonb)`;
   return {
     async insert(input): Promise<TelemetryV1ContributionReceipt> {
       // This is synchronous work by construction: no await precedes it.
       const snapshot = snapshotContribution(input);
-      let client: PostgresTelemetryV1Client;
       try {
-        client = await pool.connect();
-      } catch {
-        throw storageUnavailable();
-      }
-
-      let receipt: TelemetryV1ContributionReceipt | null = null;
-      let commitAttempted = false;
-      try {
-        await client.query(BEGIN);
-        await client.query(STATEMENT_TIMEOUT);
-        await client.query(LOCK_TIMEOUT);
-        const result = await client.query(INSERT_CONTRIBUTION, [snapshot.json]);
-        receipt = {
-          acceptedRecords: acceptedRecordCount(result, snapshot.expectedRecords),
-        };
-        // Set this immediately before COMMIT: a rejection after this point has
-        // an uncertain outcome and the connection must be destroyed.
-        commitAttempted = true;
-        await client.query(COMMIT);
+        return await withPostgresMutation(pool, async (client) => {
+          // The migration binds the function's row types to the configured
+          // schema but leaves table lookup to the caller's transaction. Set a
+          // validated local path before invoking it; it cannot escape COMMIT.
+          await client.query(
+            `SET LOCAL search_path TO ${quotePostgresIdentifier(tables.primarySchema)}, pg_catalog`,
+          );
+          const result = await client.query(insertContribution, [snapshot.json]);
+          return {
+            acceptedRecords: acceptedRecordCount(result, snapshot.expectedRecords),
+          };
+        }, {
+          operation: "telemetry.v1.insert",
+          preserveSafeError,
+        });
       } catch (error) {
-        let rollbackFailed = false;
-        try {
-          await client.query(ROLLBACK);
-        } catch {
-          rollbackFailed = true;
-        }
-        const discarded = commitAttempted || rollbackFailed;
-        const released = await releaseClient(client, discarded);
-        if (!released || discarded) throw storageUnavailable();
-        throw mapSqlState(error);
-      }
-
-      // A successful commit is known; release failures still fail closed, but
-      // are handled outside the transaction catch to avoid a second release or
-      // an invalid rollback after COMMIT.
-      if (!await releaseClient(client, false) || receipt === null) {
+        if (error instanceof ApiError) throw error;
         throw storageUnavailable();
       }
-      return receipt;
     },
   };
 }

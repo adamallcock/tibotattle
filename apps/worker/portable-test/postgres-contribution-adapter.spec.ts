@@ -62,6 +62,7 @@ function contribution(): TelemetryV1ContributionWrite {
     participantId: "participant-0001",
     deviceId: "device-0001",
     uploadAuthorizationId: "authorization-0001",
+    uploadAuthorizationLeaseExpiresAt: "2026-09-15T00:30:00.000Z",
     chunkId: chunk.chunkId,
     objectKey: "telemetry/participant-0001/chunk-0001",
     envelopeDigest: "b".repeat(64),
@@ -77,9 +78,12 @@ function mockPool(
   const calls: Array<{ text: string; values?: unknown[] }> = [];
   const releases: boolean[] = [];
   const client: PostgresTelemetryV1Client = {
-    async query(text, values) {
+    async query<Row extends object = Record<string, unknown>>(text: string, values?: unknown[]) {
       calls.push({ text, values });
-      return query(text, values);
+      return query(text, values) as unknown as {
+        readonly rows: readonly Row[];
+        readonly rowCount: number | null;
+      };
     },
     release(discard = false) {
       releases.push(discard);
@@ -98,7 +102,7 @@ describe("experimental PostgreSQL telemetry v1 contribution adapter", () => {
   it("uses one transaction, neutral JSON names, and the exact receipt", async () => {
     const fixture = contribution();
     const mocked = mockPool(async (text) => {
-      if (text === "SELECT accepted_records FROM tibotattle_v1_test.insert_contribution($1::jsonb)") {
+      if (text === "SELECT accepted_records FROM \"tibotattle\".\"insert_telemetry_v1_contribution\"($1::jsonb)") {
         return queryReceipt;
       }
       return { rows: [], rowCount: 0 };
@@ -109,18 +113,20 @@ describe("experimental PostgreSQL telemetry v1 contribution adapter", () => {
     ).resolves.toEqual({ acceptedRecords: 1 });
     expect(mocked.calls.map(({ text }) => text)).toEqual([
       "BEGIN",
-      "SET LOCAL statement_timeout='10s'",
-      "SET LOCAL lock_timeout='5s'",
-      "SELECT accepted_records FROM tibotattle_v1_test.insert_contribution($1::jsonb)",
+      "SET LOCAL statement_timeout='10000ms'",
+      "SET LOCAL lock_timeout='5000ms'",
+      "SET LOCAL search_path TO \"tibotattle\", pg_catalog",
+      "SELECT accepted_records FROM \"tibotattle\".\"insert_telemetry_v1_contribution\"($1::jsonb)",
       "COMMIT",
     ]);
     expect(mocked.releases).toEqual([false]);
-    const select = mocked.calls[3];
+    const select = mocked.calls[4];
     const payload = JSON.parse(String(select?.values?.[0])) as Record<string, unknown>;
     expect(payload).toMatchObject({
       participantId: fixture.participantId,
       deviceId: fixture.deviceId,
       uploadAuthorizationId: fixture.uploadAuthorizationId,
+      uploadAuthorizationLeaseExpiresAt: fixture.uploadAuthorizationLeaseExpiresAt,
       objectKey: fixture.objectKey,
       envelopeDigest: fixture.envelopeDigest,
       supersedes: null,
@@ -140,7 +146,7 @@ describe("experimental PostgreSQL telemetry v1 contribution adapter", () => {
     ["P1007", 409, "TELEMETRY_TRANSPORT_BLOCKED"],
   ] as const)("maps SQLSTATE %s without exposing provider text", async (sqlState, status, code) => {
     const mocked = mockPool(async (text) => {
-      if (text === "SELECT accepted_records FROM tibotattle_v1_test.insert_contribution($1::jsonb)") {
+      if (text === "SELECT accepted_records FROM \"tibotattle\".\"insert_telemetry_v1_contribution\"($1::jsonb)") {
         throw errorWithSqlState(sqlState);
       }
       return { rows: [], rowCount: 0 };
@@ -159,7 +165,7 @@ describe("experimental PostgreSQL telemetry v1 contribution adapter", () => {
 
   it("sanitizes unknown SQL errors and connection acquisition failures", async () => {
     const unknown = mockPool(async (text) => {
-      if (text === "SELECT accepted_records FROM tibotattle_v1_test.insert_contribution($1::jsonb)") {
+      if (text === "SELECT accepted_records FROM \"tibotattle\".\"insert_telemetry_v1_contribution\"($1::jsonb)") {
         throw errorWithSqlState("23505", "secret table and participant details");
       }
       return { rows: [], rowCount: 0 };
@@ -180,7 +186,7 @@ describe("experimental PostgreSQL telemetry v1 contribution adapter", () => {
 
   it("rolls back malformed receipts before commit", async () => {
     const mocked = mockPool(async (text) => {
-      if (text === "SELECT accepted_records FROM tibotattle_v1_test.insert_contribution($1::jsonb)") {
+      if (text === "SELECT accepted_records FROM \"tibotattle\".\"insert_telemetry_v1_contribution\"($1::jsonb)") {
         return { rows: [{ accepted_records: 1 }, { accepted_records: 1 }], rowCount: 2 };
       }
       return { rows: [], rowCount: 0 };
@@ -198,7 +204,7 @@ describe("experimental PostgreSQL telemetry v1 contribution adapter", () => {
     const fixture = contribution();
     let selectCalls = 0;
     const mocked = mockPool(async (text) => {
-      if (text === "SELECT accepted_records FROM tibotattle_v1_test.insert_contribution($1::jsonb)") {
+      if (text === "SELECT accepted_records FROM \"tibotattle\".\"insert_telemetry_v1_contribution\"($1::jsonb)") {
         selectCalls++;
         return queryReceipt;
       }
@@ -212,18 +218,18 @@ describe("experimental PostgreSQL telemetry v1 contribution adapter", () => {
     expect(selectCalls).toBe(1);
     expect(mocked.calls.map(({ text }) => text)).toEqual([
       "BEGIN",
-      "SET LOCAL statement_timeout='10s'",
-      "SET LOCAL lock_timeout='5s'",
-      "SELECT accepted_records FROM tibotattle_v1_test.insert_contribution($1::jsonb)",
+      "SET LOCAL statement_timeout='10000ms'",
+      "SET LOCAL lock_timeout='5000ms'",
+      "SET LOCAL search_path TO \"tibotattle\", pg_catalog",
+      "SELECT accepted_records FROM \"tibotattle\".\"insert_telemetry_v1_contribution\"($1::jsonb)",
       "COMMIT",
-      "ROLLBACK",
     ]);
     expect(mocked.releases).toEqual([true]);
   });
 
   it("discards the client when rollback itself fails", async () => {
     const mocked = mockPool(async (text) => {
-      if (text === "SELECT accepted_records FROM tibotattle_v1_test.insert_contribution($1::jsonb)") {
+      if (text === "SELECT accepted_records FROM \"tibotattle\".\"insert_telemetry_v1_contribution\"($1::jsonb)") {
         throw new Error("private provider failure");
       }
       if (text === "ROLLBACK") throw new Error("private rollback failure");
@@ -245,11 +251,15 @@ describe("experimental PostgreSQL telemetry v1 contribution adapter", () => {
     });
     const calls: Array<{ text: string; values?: unknown[] }> = [];
     const client: PostgresTelemetryV1Client = {
-      async query(text, values) {
+      async query<Row extends object = Record<string, unknown>>(text: string, values?: unknown[]) {
         calls.push({ text, values });
-        return text === "SELECT accepted_records FROM tibotattle_v1_test.insert_contribution($1::jsonb)"
+        const result = text === "SELECT accepted_records FROM \"tibotattle\".\"insert_telemetry_v1_contribution\"($1::jsonb)"
           ? queryReceipt
           : { rows: [], rowCount: 0 };
+        return result as unknown as {
+          readonly rows: readonly Row[];
+          readonly rowCount: number | null;
+        };
       },
       release() {},
     };

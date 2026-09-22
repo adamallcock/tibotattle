@@ -37,15 +37,15 @@ function fixture(
   const queries: Array<{ sql: string; values?: unknown[] }> = [];
   const releases: boolean[] = [];
   const client: PostgresTelemetryV1Client = {
-    async query(sql, values) {
+    async query<Row extends object = Record<string, unknown>>(sql: string, values?: unknown[]) {
       queries.push({ sql, values });
       if (sql === failAt || (sql === "ROLLBACK" && rollbackFails)) {
         throw new Error("synthetic-private-driver-details");
       }
-      if (sql.startsWith("SELECT")) {
-        return sql.includes("admission_windows") ? admissionResult : result;
-      }
-      return { rows: [], rowCount: null };
+      const response = sql.startsWith("SELECT")
+        ? sql.includes("admission_windows") ? admissionResult : result
+        : { rows: [], rowCount: null };
+      return response as unknown as { readonly rows: readonly Row[]; readonly rowCount: number | null };
     },
     release(discard = false) {
       releases.push(discard);
@@ -73,9 +73,9 @@ describe("experimental PostgreSQL telemetry v1 sync store", () => {
       chunkCount: 3,
     });
     expect(f.queries.slice(0, 3).map(({ sql }) => sql)).toEqual([
-      "BEGIN READ ONLY",
-      "SET LOCAL statement_timeout='10s'",
-      "SET LOCAL lock_timeout='5s'",
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+      "SET LOCAL statement_timeout='10000ms'",
+      "SET LOCAL lock_timeout='5000ms'",
     ]);
     expect(f.queries[3]?.values).toEqual([
       "synthetic-participant",

@@ -9,10 +9,11 @@ const identity = {participantId:"synthetic-owner",deviceId:"synthetic-device",st
 function fixture(result: PostgresTelemetryV1QueryResult = {rows:[row],rowCount:1}, fail?: string, rollbackFails=false) {
   const queries: Array<{sql:string;values?:unknown[]}> = [], releases:boolean[]=[];
   const reader=createExperimentalPostgresTelemetryV1ContributionReader({async connect(){return {
-    async query(sql,values){
+    async query<Row extends object = Record<string, unknown>>(sql: string, values?: unknown[]) {
       queries.push({sql,values});
       if(sql===fail || (sql==='ROLLBACK' && rollbackFails)) throw new Error('synthetic-private-driver-details');
-      return sql.startsWith('SELECT') ? result : {rows:[],rowCount:null};
+      const response = sql.startsWith('SELECT') ? result : {rows:[],rowCount:null};
+      return response as unknown as { readonly rows: readonly Row[]; readonly rowCount: number | null };
     }, release(discard){releases.push(Boolean(discard));},
   };}});
   return {reader,queries,releases};
@@ -22,7 +23,7 @@ describe('PostgreSQL contribution read boundary',()=>{
     const f=fixture();
     expect(await f.reader.current(identity)).toEqual({id:row.id,...identity,revision:1,chunkDigest:row.chunk_digest,
       recordCount:2,acceptedRecords:2,supersededAt:null});
-    expect(f.queries.map(q=>q.sql).slice(0,3)).toEqual(['BEGIN READ ONLY',"SET LOCAL statement_timeout='10s'","SET LOCAL lock_timeout='5s'"]);
+    expect(f.queries.map(q=>q.sql).slice(0,3)).toEqual(['BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY',"SET LOCAL statement_timeout='10000ms'","SET LOCAL lock_timeout='5000ms'"]);
     expect(f.queries[3]!.values).toEqual(Object.values(identity));
     expect(f.queries.at(-1)!.sql).toBe('COMMIT');expect(f.releases).toEqual([false]);
   });
@@ -55,10 +56,10 @@ describe('PostgreSQL contribution read boundary',()=>{
     const f=fixture({rows:[],rowCount:0});
     await expect(f.reader.acknowledgedThroughDay('synthetic-owner','synthetic-device')).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
   });
-  it.each(['BEGIN READ ONLY','COMMIT'])('sanitizes failures at %s without retry',async sql=>{
+  it.each(['BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY','COMMIT'])('sanitizes failures at %s without retry',async sql=>{
     const f=fixture(undefined,sql);
     await expect(f.reader.current(identity)).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE',message:'BACKEND_STORAGE_UNAVAILABLE'});
-    expect(f.releases).toEqual([sql==='COMMIT']);
+    expect(f.releases).toEqual([true]);
     expect(f.queries.filter(q=>q.sql===sql)).toHaveLength(1);
   });
   it('discards a connection when rollback fails',async()=>{

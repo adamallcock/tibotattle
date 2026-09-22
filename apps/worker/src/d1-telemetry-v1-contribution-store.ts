@@ -103,16 +103,18 @@ function mapTelemetryV1BatchError(error: unknown): unknown {
   return error;
 }
 
-/**
- * Journal + current-view write, atomic in one D1 batch. Supersession marks
- * the prior revision superseded and removes exactly its records before the
- * new revision's records land; the daily-aggregate rebuild for the chunk's
- * day is enqueued by the journal trigger inside the same transaction.
- */
-async function insertD1TelemetryV1Contribution(
+export interface D1TelemetryV1PreparedRecords {
+  readonly insertStatements: readonly D1PreparedStatement[];
+  readonly authorizationEnvelopeDigest?: string;
+  readonly deleteSupersededStatements: readonly D1PreparedStatement[];
+}
+
+/** Prepare the canonical D1 v1 journal/current-view batch for a caller. */
+export function prepareD1TelemetryV1ChunkWrite(
   db: D1Database,
   input: TelemetryV1ContributionWrite,
-): Promise<TelemetryV1ContributionReceipt> {
+  records?: D1TelemetryV1PreparedRecords,
+): { statements: D1PreparedStatement[]; chunkStatementIndex: number } {
   const { chunk } = input;
   const statements: D1PreparedStatement[] = [];
   // Scoped preservation is not an authorization bypass: the normal admission
@@ -122,17 +124,18 @@ async function insertD1TelemetryV1Contribution(
   statements.push(db.prepare(`INSERT INTO community_graph_update_scope
     (singleton,participant_id,device_id,stream,chunk_day,chunk_seq,old_chunk_id,new_chunk_id,
       new_revision,chunk_digest,parser_version,record_count,authorization_id,envelope_digest,created_at,expected_epoch,phase)
-    SELECT 1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,s.mutation_epoch,?15
+    SELECT 1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?15,s.mutation_epoch,?16
     FROM community_snapshot_mutation_control s
     JOIN participants p ON p.id=?1 AND p.state='active'
     JOIN device_credentials d ON d.id=?2 AND d.participant_id=p.id AND d.state='active'
       AND d.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
     JOIN device_upload_authorizations a ON a.id=?12 AND a.participant_id=p.id
-      AND a.issued_by_device_id=d.id AND a.state='consuming' AND a.envelope_digest=?13
+      AND a.issued_by_device_id=d.id AND a.state='consuming' AND a.envelope_digest=?20
+      AND a.consume_lease_expires_at=?14
       AND a.consume_lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
     JOIN telemetry_v1_device_consents consent ON consent.participant_id=p.id AND consent.device_id=d.id
-      AND consent.telemetry_schema_version=?16 AND consent.field_dictionary_version=?17
-      AND consent.privacy_contract_version=?18
+      AND consent.telemetry_schema_version=?17 AND consent.field_dictionary_version=?18
+      AND consent.privacy_contract_version=?19
     WHERE s.singleton_id=1
       AND NOT EXISTS (SELECT 1 FROM telemetry_v11_domain_heads WHERE participant_id=p.id)
       AND NOT EXISTS (SELECT 1 FROM telemetry_contributions WHERE participant_id=p.id AND status='accepted')
@@ -144,8 +147,10 @@ async function insertD1TelemetryV1Contribution(
     .bind(input.participantId, input.deviceId, chunk.stream, chunk.chunkDay, chunk.chunkSeq,
       input.supersedes?.id ?? null, input.chunkId, chunk.chunkRevision, chunk.chunkDigest,
       chunk.parserVersion, chunk.records.length, input.uploadAuthorizationId, input.envelopeDigest,
-      input.createdAt, input.supersedes ? "supersede" : "insert", TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
-      TELEMETRY_V1_FIELD_DICTIONARY_VERSION, TELEMETRY_V1_PRIVACY_CONTRACT_VERSION));
+      input.uploadAuthorizationLeaseExpiresAt, input.createdAt,
+      input.supersedes ? "supersede" : "insert", TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+      TELEMETRY_V1_FIELD_DICTIONARY_VERSION, TELEMETRY_V1_PRIVACY_CONTRACT_VERSION,
+      records?.authorizationEnvelopeDigest ?? input.envelopeDigest));
   // The prior revision leaves the current view before the new revision
   // enters it: the partial current-identity uniqueness would otherwise see
   // two current rows for one chunk mid-batch. The batch is one transaction,
@@ -156,7 +161,8 @@ async function insertD1TelemetryV1Contribution(
           SET superseded_at = ?
         WHERE id = ? AND participant_id = ? AND superseded_at IS NULL`,
     ).bind(input.createdAt, input.supersedes.id, input.participantId));
-    statements.push(db.prepare(
+    if (records) statements.push(...records.deleteSupersededStatements);
+    else statements.push(db.prepare(
       "DELETE FROM telemetry_v1_records WHERE chunk_row_id = ?",
     ).bind(input.supersedes.id));
   }
@@ -185,7 +191,8 @@ async function insertD1TelemetryV1Contribution(
     input.uploadAuthorizationId,
     input.createdAt,
   ));
-  for (const record of chunk.records) {
+  if (records) statements.push(...records.insertStatements);
+  else for (const record of chunk.records) {
     statements.push(recordStatement(
       db,
       input.chunkId,
@@ -197,6 +204,16 @@ async function insertD1TelemetryV1Contribution(
   }
   statements.push(db.prepare("DELETE FROM community_graph_update_scope WHERE new_chunk_id = ?")
     .bind(input.chunkId));
+  return { statements, chunkStatementIndex };
+}
+
+/** Execute a prepared canonical batch atomically and map D1 constraint errors. */
+async function insertD1TelemetryV1Contribution(
+  db: D1Database,
+  input: TelemetryV1ContributionWrite,
+): Promise<TelemetryV1ContributionReceipt> {
+  const { chunk } = input;
+  const { statements, chunkStatementIndex } = prepareD1TelemetryV1ChunkWrite(db, input);
   let results: D1Result<unknown>[];
   try {
     results = await db.batch(statements);

@@ -21,6 +21,8 @@ export interface TelemetryV1ContributionWrite {
   participantId: string;
   deviceId: string;
   uploadAuthorizationId: string;
+  /** The lease returned by the one-use claim; never reread for a writer. */
+  uploadAuthorizationLeaseExpiresAt: string;
   chunkId: string;
   objectKey: string;
   envelopeDigest: string;

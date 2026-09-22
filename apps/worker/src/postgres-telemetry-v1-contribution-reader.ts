@@ -1,5 +1,10 @@
 import { ApiError } from "./errors";
-import type { PostgresTelemetryV1Client, PostgresTelemetryV1Pool } from "./postgres-telemetry-v1-contribution-store";
+import {
+  withPostgresRead,
+  type PostgresSchemaOptions,
+} from "./postgres-client";
+import type { PostgresTelemetryV1Pool } from "./postgres-telemetry-v1-contribution-store";
+import { resolvePostgresTelemetryV1Tables } from "./postgres-telemetry-v1-schema";
 import type {
   StoredTelemetryV1Chunk,
   TelemetryV1ContributionReader,
@@ -41,55 +46,59 @@ function chunk(row: Record<string, unknown>): StoredTelemetryV1Chunk {
   };
 }
 
+function preserveSafeError(error: unknown): Error | null {
+  return error instanceof ApiError ? error : null;
+}
+
 /**
- * Qualification-only reads. Callers must authenticate before invoking this
- * trusted port. Envelope replay is participant-wide, including superseded rows,
- * as on D1; current identity and acknowledgement are device-scoped.
+ * Reads. Callers must authenticate before invoking this trusted port. Envelope
+ * replay is participant-wide, including superseded rows, as on D1; current
+ * identity and acknowledgement are device-scoped.
  * No result here authorizes quarantine deletion or owner erasure.
  */
 export function createExperimentalPostgresTelemetryV1ContributionReader(
   pool: PostgresTelemetryV1Pool,
+  schemaOptions: PostgresSchemaOptions = {},
 ): TelemetryV1ContributionReader {
-  async function read<T>(sql: string, values: unknown[], decode: (rows: Record<string, unknown>[]) => T): Promise<T> {
-    let client: PostgresTelemetryV1Client;
-    try { client = await pool.connect(); } catch { throw unavailable(); }
-    let commitAttempted = false;
-    let result: T;
+  const tables = resolvePostgresTelemetryV1Tables(schemaOptions);
+  async function read<T>(
+    sql: string,
+    values: unknown[],
+    decode: (rows: readonly Record<string, unknown>[]) => T,
+  ): Promise<T> {
     try {
-      await client.query("BEGIN READ ONLY");
-      await client.query("SET LOCAL statement_timeout='10s'");
-      await client.query("SET LOCAL lock_timeout='5s'");
-      const response = await client.query(sql, values);
-      if (!Array.isArray(response.rows) || response.rowCount !== response.rows.length || response.rows.length > 1) throw unavailable();
-      result = decode(response.rows);
-      commitAttempted = true;
-      await client.query("COMMIT");
-    } catch {
-      let discard = commitAttempted;
-      try { await client.query("ROLLBACK"); } catch { discard = true; }
-      try { await client.release(discard); } catch { /* never expose pool diagnostics */ }
+      return await withPostgresRead(pool, async (client) => {
+        const response = await client.query(sql, values);
+        if (!Array.isArray(response.rows)
+            || response.rowCount !== response.rows.length
+            || response.rows.length > 1) throw unavailable();
+        return decode(response.rows);
+      }, {
+        operation: "telemetry.v1.read",
+        preserveSafeError,
+      });
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
       throw unavailable();
     }
-    try { await client.release(false); } catch { throw unavailable(); }
-    return result;
   }
   return {
     byEnvelope(participantId, envelopeDigest) {
-      return read(`SELECT ${columns} FROM tibotattle_v1_test.chunks
+      return read(`SELECT ${columns} FROM ${tables.chunks}
         WHERE participant_id=$1 AND envelope_digest=$2 LIMIT 2`,
       [participantId, envelopeDigest], rows => rows.length === 0 ? null : chunk(rows[0]!));
     },
     current(identity) {
       // Capture scalar identity before any asynchronous pool acquisition.
       const { participantId, deviceId, stream, chunkDay, chunkSeq } = identity;
-      return read(`SELECT ${columns} FROM tibotattle_v1_test.chunks
+      return read(`SELECT ${columns} FROM ${tables.chunks}
         WHERE participant_id=$1 AND device_id=$2 AND stream=$3 AND chunk_day=$4
           AND chunk_seq=$5 AND superseded_at IS NULL LIMIT 2`,
       [participantId, deviceId, stream, chunkDay, chunkSeq], rows => rows.length === 0 ? null : chunk(rows[0]!));
     },
     acknowledgedThroughDay(participantId, deviceId) {
       return read(`SELECT to_char(MAX(chunk_day), 'YYYY-MM-DD') AS through_day
-        FROM tibotattle_v1_test.chunks WHERE participant_id=$1 AND device_id=$2
+        FROM ${tables.chunks} WHERE participant_id=$1 AND device_id=$2
           AND superseded_at IS NULL`, [participantId, deviceId], rows => {
         if (rows.length !== 1) throw unavailable();
         return rows[0]!.through_day === null ? null : day(rows[0]!.through_day);

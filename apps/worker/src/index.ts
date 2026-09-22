@@ -2166,6 +2166,7 @@ async function handleSyntheticContribution(
   uploadAuthorization: {
     authorizationId: string;
     authorizationKind: "session" | "device";
+    leaseExpiresAt: string;
   },
   env: Env,
   quarantine: QuarantineObjectStore,
@@ -2262,6 +2263,7 @@ async function handleTelemetryContribution(
   uploadAuthorization: {
     authorizationId: string;
     authorizationKind: "session" | "device";
+    leaseExpiresAt: string;
   },
   env: Env,
   quarantine: QuarantineObjectStore,
@@ -2558,6 +2560,7 @@ async function handleTelemetryV1Contribution(
   uploadAuthorization: {
     authorizationId: string;
     authorizationKind: "session" | "device";
+    leaseExpiresAt: string;
   },
   env: Env,
   quarantine: QuarantineObjectStore,
@@ -2671,6 +2674,7 @@ async function handleTelemetryV1Contribution(
       participantId: participant.id,
       deviceId,
       uploadAuthorizationId: uploadAuthorization.authorizationId,
+      uploadAuthorizationLeaseExpiresAt: uploadAuthorization.leaseExpiresAt,
       chunkId: chunkRowId,
       objectKey: r2Key,
       envelopeDigest: envelopeDigestValue,
@@ -2919,6 +2923,7 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
     authorizationId: string;
     participantId: string;
     authorizationKind: "device";
+    leaseExpiresAt: string;
   } | null = null;
   try {
     const body = await readBoundedJson(request, bodyReadPolicy);
@@ -2984,6 +2989,7 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
       env.USAGE_MONITOR_DB,
       claimed.authorizationId,
       receipt.contributionId,
+      claimed.leaseExpiresAt,
     );
     completed = true;
     return response;
@@ -2993,6 +2999,8 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
         await abandonDeviceUploadAuthorization(
           env.USAGE_MONITOR_DB,
           claimed.authorizationId,
+          claimed.participantId,
+          claimed.leaseExpiresAt,
         );
       }
     } catch {

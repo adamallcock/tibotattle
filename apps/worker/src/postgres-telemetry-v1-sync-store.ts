@@ -1,9 +1,13 @@
 import { ApiError } from "./errors";
+import {
+  withPostgresRead,
+  type PostgresSchemaOptions,
+} from "./postgres-client";
 import type {
-  PostgresTelemetryV1Client,
   PostgresTelemetryV1Pool,
   PostgresTelemetryV1QueryResult,
 } from "./postgres-telemetry-v1-contribution-store";
+import { resolvePostgresTelemetryV1Tables } from "./postgres-telemetry-v1-schema";
 import {
   buildTelemetryV1SyncAdmission,
   buildTelemetryV1SyncManifest,
@@ -18,21 +22,10 @@ import {
 } from "./telemetry-v1-sync-store";
 import type { TelemetryV1SyncStore } from "./telemetry-v1-sync-store";
 
-const BEGIN_READ_ONLY = "BEGIN READ ONLY";
-const STATEMENT_TIMEOUT = "SET LOCAL statement_timeout='10s'";
-const LOCK_TIMEOUT = "SET LOCAL lock_timeout='5s'";
-const COMMIT = "COMMIT";
-const ROLLBACK = "ROLLBACK";
 const DAY = /^\d{4}-\d{2}-\d{2}$/u;
 const DIGEST = /^[0-9a-f]{64}$/u;
 const COLUMNS = `to_char(chunk_day, 'YYYY-MM-DD') AS chunk_day,
   stream, chunk_seq, chunk_digest, revision, record_count`;
-const ADMISSION = `SELECT a.accepted_count AS accepted_count,
-  to_char(d.issued_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS device_issued_at
-  FROM tibotattle_v1_test.devices d
-  LEFT JOIN tibotattle_v1_test.admission_windows a
-    ON a.participant_id=$1 AND a.device_id=d.id AND a.window_day=$3::date
-  WHERE d.id=$2 AND d.participant_id=$1`;
 
 function unavailable(): ApiError {
   return new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
@@ -130,20 +123,9 @@ function decodeAdmission(
   return { acceptedChunks, deviceIssuedAt };
 }
 
-async function releaseClient(
-  client: PostgresTelemetryV1Client,
-  discard: boolean,
-): Promise<boolean> {
-  try {
-    await client.release(discard);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 async function readCurrentChunkDigests(
   pool: PostgresTelemetryV1Pool,
+  tables: ReturnType<typeof resolvePostgresTelemetryV1Tables>,
   participantId: string,
   deviceId: string,
   range: { fromDay: string; toDay: string } | null,
@@ -161,47 +143,29 @@ async function readCurrentChunkDigests(
     : " AND chunk_day >= $3::date AND chunk_day <= $4::date";
   const limitPlaceholder = range === null ? "$3" : "$5";
   const sql = `SELECT ${COLUMNS}
-    FROM tibotattle_v1_test.chunks
+    FROM ${tables.chunks}
     WHERE participant_id=$1 AND device_id=$2 AND superseded_at IS NULL${rangePredicate}
     ORDER BY chunk_day ASC, stream ASC, chunk_seq ASC
     LIMIT ${limitPlaceholder}`;
 
-  let client: PostgresTelemetryV1Client;
   try {
-    client = await pool.connect();
-  } catch {
-    throw unavailable();
-  }
-  let commitAttempted = false;
-  let rows: TelemetryV1SyncChunkDigest[];
-  try {
-    await client.query(BEGIN_READ_ONLY);
-    await client.query(STATEMENT_TIMEOUT);
-    await client.query(LOCK_TIMEOUT);
-    rows = decodeRows(await client.query(sql, values), maximumRows);
-    commitAttempted = true;
-    await client.query(COMMIT);
+    return await withPostgresRead(pool, async (client) => {
+      return decodeRows(await client.query(sql, values), maximumRows);
+    }, {
+      operation: "telemetry.v1.sync.read",
+      preserveSafeError: (error) => error instanceof ApiError ? error : null,
+    });
   } catch (error) {
-    let rollbackFailed = false;
-    try {
-      await client.query(ROLLBACK);
-    } catch {
-      rollbackFailed = true;
-    }
-    const discard = commitAttempted || rollbackFailed;
-    const released = await releaseClient(client, discard);
-    if (!released || discard) throw unavailable();
     if (error instanceof ApiError && error.code === "LIFECYCLE_BOUNDS_EXCEEDED") {
       throw error;
     }
     throw unavailable();
   }
-  if (!await releaseClient(client, false)) throw unavailable();
-  return rows;
 }
 
 async function readAdmission(
   pool: PostgresTelemetryV1Pool,
+  tables: ReturnType<typeof resolvePostgresTelemetryV1Tables>,
   participantId: string,
   deviceId: string,
   nowEpoch: number,
@@ -212,58 +176,48 @@ async function readAdmission(
   }
   // Match D1's invalid-clock handling before acquiring a provider connection.
   const windowDay = telemetryV1SyncAdmissionWindowDay(nowEpoch);
-  let client: PostgresTelemetryV1Client;
+  const sql = `SELECT a.accepted_count AS accepted_count,
+    to_char(d.issued_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS device_issued_at
+    FROM ${tables.devices} d
+    LEFT JOIN ${tables.admissionWindows} a
+      ON a.participant_id=$1 AND a.device_id=d.id AND a.window_day=$3::date
+    WHERE d.id=$2 AND d.participant_id=$1`;
   try {
-    client = await pool.connect();
-  } catch {
-    throw unavailable();
-  }
-  let commitAttempted = false;
-  let admission: TelemetryV1SyncAdmission;
-  try {
-    await client.query(BEGIN_READ_ONLY);
-    await client.query(STATEMENT_TIMEOUT);
-    await client.query(LOCK_TIMEOUT);
-    const snapshot = decodeAdmission(await client.query(ADMISSION, [
-      participantId,
-      deviceId,
-      windowDay,
-    ]));
-    // Construct before COMMIT so malformed calculation inputs still roll back.
-    admission = buildTelemetryV1SyncAdmission(snapshot, nowEpoch);
-    commitAttempted = true;
-    await client.query(COMMIT);
+    return await withPostgresRead(pool, async (client) => {
+      const snapshot = decodeAdmission(await client.query(sql, [
+        participantId,
+        deviceId,
+        windowDay,
+      ]));
+      // Construct before COMMIT so malformed calculation inputs still roll back.
+      return buildTelemetryV1SyncAdmission(snapshot, nowEpoch);
+    }, {
+      operation: "telemetry.v1.sync.admission",
+      preserveSafeError: (error) => error instanceof ApiError ? error : null,
+    });
   } catch (error) {
-    let rollbackFailed = false;
-    try {
-      await client.query(ROLLBACK);
-    } catch {
-      rollbackFailed = true;
-    }
-    const discard = commitAttempted || rollbackFailed;
-    const released = await releaseClient(client, discard);
-    if (!released || discard) throw unavailable();
     if (error instanceof ApiError
         && (error.code === "UPLOAD_AUTH_INVALID" || error.code === "INTERNAL_ERROR")) {
       throw error;
     }
     throw unavailable();
   }
-  if (!await releaseClient(client, false)) throw unavailable();
-  return admission;
 }
 
 /**
- * Qualification-only PostgreSQL sync reads. The fixed test schema and
- * read-only transaction are deliberate; production remains D1.
+ * PostgreSQL v1 sync reads. The default is the operational primary schema;
+ * test harnesses must pass an explicit validated schema option.
  */
 export function createExperimentalPostgresTelemetryV1SyncStore(
   pool: PostgresTelemetryV1Pool,
+  schemaOptions: PostgresSchemaOptions = {},
 ): TelemetryV1SyncStore {
+  const tables = resolvePostgresTelemetryV1Tables(schemaOptions);
   return {
     async state(participantId, deviceId) {
       return buildTelemetryV1SyncState(await readCurrentChunkDigests(
         pool,
+        tables,
         participantId,
         deviceId,
         null,
@@ -274,6 +228,7 @@ export function createExperimentalPostgresTelemetryV1SyncStore(
       return buildTelemetryV1SyncManifest(
         await readCurrentChunkDigests(
           pool,
+          tables,
           participantId,
           deviceId,
           { fromDay, toDay },
@@ -286,6 +241,7 @@ export function createExperimentalPostgresTelemetryV1SyncStore(
     admission(participantId, deviceId, nowEpoch) {
       return readAdmission(
         pool,
+        tables,
         participantId,
         deviceId,
         nowEpoch === undefined ? Date.now() : nowEpoch,
