@@ -11048,6 +11048,7 @@ async function loadContributionCeremony(harness) {
     "loadIncrementalSyncStatus", "scheduleIncrementalSyncStatusPoll",
     "showFailure", "describeFailure", "formatLocal", "t", "node",
     `const TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION = "telemetry-contribution-v1.1";
+const TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION = "telemetry-contribution-v1.2";
 let incrementalConsentBusy = false;
 let communityConnectBusy = false;
 let contributionDisconnectBusy = false;

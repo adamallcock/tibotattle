@@ -63,5 +63,24 @@ export {
   usageExplanationCatalog,
 } from "./usage-explainer.js";
 export { createModelPerformanceContext } from './model-performance.js';
+export {
+  createTelemetryPerformanceDayRunner,
+  createTelemetryPerformanceScheduler,
+} from "./telemetry-performance-scheduler.js";
+export {
+  TELEMETRY_PERFORMANCE_AUTHORIZATION_VERSION,
+  TELEMETRY_PERFORMANCE_CAPABILITIES_VERSION,
+  TELEMETRY_PERFORMANCE_METHOD_VERSION,
+  TELEMETRY_PERFORMANCE_PRIVACY_CONTRACT_VERSION,
+  TELEMETRY_PERFORMANCE_REPORT_SCHEMA_VERSION,
+  TELEMETRY_PERFORMANCE_SCOPE,
+  TELEMETRY_PERFORMANCE_SUPPORTED_SPEED_METHODS,
+  TELEMETRY_PERFORMANCE_SYNC_STATE_VERSION,
+  prepareTelemetryPerformanceDay,
+  projectTelemetryPerformanceDay,
+  initialTelemetryPerformanceSyncState,
+  parseTelemetryPerformanceSyncState,
+} from "../contribution/index.js";
+export { createTelemetryPerformanceClient } from "./telemetry-performance-client.js";
 
 export { createWorkUsageSnapshotStore } from "./work-usage-snapshots.js";

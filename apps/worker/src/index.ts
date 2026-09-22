@@ -177,11 +177,20 @@ import {
   TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION,
 } from "@app-usagemonitor/telemetry-contract";
 import {
+  validateTelemetryV12Envelope,
+  TELEMETRY_V12_ENVELOPE_SCHEMA_VERSION,
+} from "@app-usagemonitor/telemetry-contract";
+import { validateTelemetryPerformanceEnvelope } from "./telemetry-performance-envelope";
+import {
   assertTelemetryTransportWriteAllowed,
+  grantTelemetryV12Consent,
+  grantTelemetryV12AccountlessAuthorization,
+  parseTelemetryV12AccountlessAuthorizationJson,
   grantTelemetryV11Consent,
   parseTelemetryTransportRollbackRequest,
   rollbackTelemetryTransportAsOwner,
   telemetryTransportCapabilities,
+  telemetryTransportV12Capabilities,
   telemetryTransportSchemaForEnvelope,
   telemetryTransportSchemaVersion,
 } from "./telemetry-transport-policy";
@@ -192,8 +201,29 @@ import {
   telemetryV11ExportEntries,
   validateTelemetryV11StagedChunk,
 } from "./telemetry-v11-repository";
+import {
+  existingTelemetryV12StagedChunk,
+  readTelemetryV12DayCandidates,
+  readTelemetryV12DayChunkVector,
+  registerTelemetryV12DayManifest,
+  persistTelemetryV12StagedChunk,
+  validateTelemetryV12StagedChunk,
+} from "./telemetry-v12-repository";
+import {
+  admitTelemetryPerformanceReport,
+  readTelemetryPerformanceReports,
+} from "./telemetry-performance-repository";
+import {
+  readTelemetryPerformanceCapability,
+  grantTelemetryPerformanceSocialAuthorization,
+  grantTelemetryPerformanceAccountlessAuthorization,
+  ACCOUNTLESS_TELEMETRY_PERFORMANCE_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_TELEMETRY_PERFORMANCE_POLICY_VERSION,
+  ACCOUNTLESS_TELEMETRY_PERFORMANCE_SCHEMA_VERSION,
+} from "./telemetry-performance-policy";
 import { createTelemetryV11DomainPredecessor, activateTelemetryV11Domain } from "./telemetry-v11-domain";
-import { parseTelemetryStorageMode, resolveTelemetryStorageMode, readTelemetryV11StorageReplay, persistTelemetryV11StorageChunk,
+import { createTelemetryV12DomainPredecessor, activateTelemetryV12Domain } from "./telemetry-v12-domain";
+import { parseTelemetryStorageMode, resolveTelemetryStorageMode, requireTelemetryV12StorageMode, requireTelemetryPerformanceStorageMode, readTelemetryV11StorageReplay, persistTelemetryV11StorageChunk,
   readTelemetryV1StorageReceipt, persistTelemetryV1StorageChunk } from "./telemetry-storage-mode";
 import {
   claimPendingAppleSignInHandoff,
@@ -493,6 +523,56 @@ async function readBoundedAccountlessOwnershipJson(
   }
 }
 
+async function readBoundedAccountlessTelemetryV12AuthorizationJson(
+  request: Request,
+) {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+  if (contentType !== "application/json") {
+    throw new ApiError(415, "CONTENT_TYPE_INVALID");
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    if (length > ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES) {
+      throw new ApiError(413, "BODY_TOO_LARGE");
+    }
+  }
+  const combined = await readBoundedRequestBody(
+    request,
+    ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES,
+    CONTROL_BODY_READ_POLICY,
+  );
+  return parseTelemetryV12AccountlessAuthorizationJson(
+    new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(combined),
+  );
+}
+
+async function readBoundedAccountlessTelemetryPerformanceAuthorizationJson(
+  request: Request,
+): Promise<{
+  schemaVersion: typeof ACCOUNTLESS_TELEMETRY_PERFORMANCE_SCHEMA_VERSION;
+  policyVersion: typeof ACCOUNTLESS_TELEMETRY_PERFORMANCE_POLICY_VERSION;
+  authorizationBasis: typeof ACCOUNTLESS_TELEMETRY_PERFORMANCE_AUTHORIZATION_BASIS;
+}> {
+  const { value } = await readBoundedJson(request);
+  if (typeof value !== "object" || value === null || Array.isArray(value)
+      || Object.keys(value).length !== 3
+      || Object.keys(value).some((key) => !["schemaVersion", "policyVersion", "authorizationBasis"].includes(key))
+      || Reflect.get(value, "schemaVersion") !== ACCOUNTLESS_TELEMETRY_PERFORMANCE_SCHEMA_VERSION
+      || Reflect.get(value, "policyVersion") !== ACCOUNTLESS_TELEMETRY_PERFORMANCE_POLICY_VERSION
+      || Reflect.get(value, "authorizationBasis") !== ACCOUNTLESS_TELEMETRY_PERFORMANCE_AUTHORIZATION_BASIS) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  return value as {
+    schemaVersion: typeof ACCOUNTLESS_TELEMETRY_PERFORMANCE_SCHEMA_VERSION;
+    policyVersion: typeof ACCOUNTLESS_TELEMETRY_PERFORMANCE_POLICY_VERSION;
+    authorizationBasis: typeof ACCOUNTLESS_TELEMETRY_PERFORMANCE_AUTHORIZATION_BASIS;
+  };
+}
+
 async function readBoundedAccountlessRenewalJson(
   request: Request,
 ): Promise<AccountlessRenewalRequest> {
@@ -672,6 +752,81 @@ async function handleAccountlessOwnership(
     body,
   );
   return jsonResponse(result.response, result.status);
+}
+
+async function handleAccountlessTelemetryV12Authorization(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  if (hasSessionCookie(request.headers.get("cookie"))) {
+    throw new ApiError(401, "AUTH_INVALID");
+  }
+  assertAccountlessOwnershipEnabled(env);
+  assertAdmissionBindings(env);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "uploadRegistration");
+  await assertAttemptAllowed(
+    env.RECOVERY_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "accountless_ownership",
+  );
+  const authorization = await authenticateDevice(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+  );
+  if (authorization.authorityKind !== "accountless"
+      || await hasDeletionTombstone(env.DELETION_LEDGER, authorization.participantId)) {
+    throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  }
+  await requireTelemetryV12StorageMode(env.USAGE_MONITOR_DB, env);
+  const body = await readBoundedAccountlessTelemetryV12AuthorizationJson(request);
+  await grantTelemetryV12AccountlessAuthorization(
+    env.USAGE_MONITOR_DB,
+    { participantId: authorization.participantId, deviceId: authorization.deviceId },
+    body,
+  );
+  // Return exactly the four authorization fields the client journals. The
+  // persisted activation instant is exposed by successor capabilities, so a
+  // retry cannot manufacture a new local cutoff from this response.
+  return jsonResponse(body, 201);
+}
+
+async function handleAccountlessTelemetryPerformanceAuthorization(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  if (hasSessionCookie(request.headers.get("cookie"))) {
+    throw new ApiError(401, "AUTH_INVALID");
+  }
+  assertAccountlessOwnershipEnabled(env);
+  assertAdmissionBindings(env);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "uploadRegistration");
+  await assertAttemptAllowed(
+    env.RECOVERY_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "accountless_ownership",
+  );
+  const authorization = await authenticateDevice(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+  );
+  if (authorization.authorityKind !== "accountless"
+      || await hasDeletionTombstone(env.DELETION_LEDGER, authorization.participantId)) {
+    throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  }
+  await requireTelemetryPerformanceStorageMode(env.USAGE_MONITOR_DB, env);
+  const body = await readBoundedAccountlessTelemetryPerformanceAuthorizationJson(request);
+  await grantTelemetryPerformanceAccountlessAuthorization(
+    env.USAGE_MONITOR_DB,
+    { participantId: authorization.participantId, deviceId: authorization.deviceId },
+    body,
+  );
+  return jsonResponse(body, 201);
 }
 
 async function handleAccountlessRenewal(
@@ -2542,6 +2697,87 @@ async function handleTelemetryV11Contribution(
   }
 }
 
+async function handleTelemetryV12Contribution(
+  body: { raw: string; value: unknown },
+  participant: {
+    id: string;
+    consentVersion: string | null;
+    ownerKind: "social" | "accountless";
+  },
+  deviceId: string,
+  authorizationId: string,
+  env: Env,
+): Promise<Response> {
+  if ((participant.ownerKind === "social"
+      && participant.consentVersion !== TELEMETRY_CONSENT_VERSION)
+      || (participant.ownerKind === "accountless" && participant.consentVersion !== null)) {
+    throw new ApiError(400, "TELEMETRY_REQUIRED");
+  }
+  await requireTelemetryV12StorageMode(env.USAGE_MONITOR_DB, env);
+  const principal = { participantId: participant.id, deviceId };
+  const envelope = validateTelemetryV12Envelope(body.value);
+  const plaintext = await decryptSyntheticEnvelope(
+    envelope, env.ENVELOPE_PUBLIC_JWK, env.ENVELOPE_PRIVATE_JWK,
+  );
+  const chunk = await validateTelemetryV12StagedChunk(plaintext);
+  const receipt = (contributionId: string, manifestId: string, replayed: boolean) => jsonResponse({
+    schemaVersion: "telemetry-chunk-receipt-v1.2",
+    contributionId,
+    manifestId,
+    chunkId: chunk.chunkId,
+    chunkRevision: 1,
+    status: "staged",
+    replayed,
+    recordCounts: { declared: chunk.records.length, accepted: chunk.records.length },
+  }, 202, replayed ? { "idempotency-replayed": "true" } : undefined);
+  const chunkRowId = `chunk:${crypto.randomUUID()}`;
+  const r2Key = `telemetry/v12-${crypto.randomUUID()}`;
+  const envelopeDigest = await sha256Hex(body.raw);
+  await putTrackedQuarantineObject(env.USAGE_MONITOR_DB, env.QUARANTINE, {
+    contributionId: chunkRowId,
+    objectKind: "telemetry",
+    r2Key,
+    registeredAt: new Date().toISOString(),
+  }, body.raw, {
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: {
+      contributionId: chunkRowId,
+      schemaVersion: TELEMETRY_V12_ENVELOPE_SCHEMA_VERSION,
+      plaintextSchemaVersion: chunk.schemaVersion,
+      synthetic: "false",
+    },
+  });
+  try {
+    const result = await persistTelemetryV12StagedChunk(env.USAGE_MONITOR_DB, principal, chunk, {
+      chunkRowId,
+      r2Key,
+      envelopeDigest,
+      deviceUploadAuthorizationId: authorizationId,
+    });
+    if (result.replay && result.contributionId !== chunkRowId) {
+      await env.QUARANTINE.delete(r2Key);
+      await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, { contributionId: chunkRowId, r2Key });
+    }
+    return receipt(result.contributionId, result.manifestId, result.replay);
+  } catch (error) {
+    const retained = await existingTelemetryV12StagedChunk(env.USAGE_MONITOR_DB, principal, chunk);
+    if (retained && retained.chunk_digest === chunk.chunkDigest) {
+      if (retained.id !== chunkRowId) {
+        try {
+          await env.QUARANTINE.delete(r2Key);
+          await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, { contributionId: chunkRowId, r2Key });
+        } catch { /* reconciliation retains the cleanup journal */ }
+      }
+      return receipt(retained.id, retained.manifest_id, true);
+    }
+    try {
+      await env.QUARANTINE.delete(r2Key);
+      await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, { contributionId: chunkRowId, r2Key });
+    } catch { /* durable pending registration retains the cleanup obligation */ }
+    throw error;
+  }
+}
+
 /**
  * telemetry-contribution-v1.0 incremental chunk ingest. Additive alongside
  * the deployed v0.1 prepared-sample path: v1.0 envelopes carry their own
@@ -2832,6 +3068,128 @@ async function handleDeviceSyncCapabilities(request: Request, env: Env): Promise
   return jsonResponse(await telemetryTransportCapabilities(env.USAGE_MONITOR_DB, device, destinationOrigin));
 }
 
+async function handleDeviceSyncCapabilitiesV12(request: Request, env: Env): Promise<Response> {
+  const device = await deviceSyncPrincipal(request, env);
+  await requireTelemetryV12StorageMode(env.USAGE_MONITOR_DB, env);
+  const requestOrigin = new URL(request.url).origin;
+  const destinationOrigin = identityRequired(env) ? Reflect.get(env, "PUBLIC_ORIGIN") : requestOrigin;
+  if (typeof destinationOrigin !== "string" || destinationOrigin !== requestOrigin) {
+    throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
+  }
+  return jsonResponse(await telemetryTransportV12Capabilities(
+    env.USAGE_MONITOR_DB, device, destinationOrigin,
+  ));
+}
+
+/**
+ * Performance is an independent, opt-in dialect.  Its capability read does
+ * not consult the v1/v1.1/v1.2 usage grants; accountless devices are admitted
+ * only when their separate performance owner-policy row is current.
+ */
+async function handleTelemetryPerformanceCapabilities(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const device = await deviceSyncPrincipal(request, env);
+  await requireTelemetryPerformanceStorageMode(env.USAGE_MONITOR_DB, env);
+  return jsonResponse(await readTelemetryPerformanceCapability(
+    env.USAGE_MONITOR_DB,
+    { participantId: device.participantId, deviceId: device.deviceId },
+  ));
+}
+
+async function handleTelemetryPerformanceConsent(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  const session = await personalSession(request, env);
+  assertCsrf(request, session);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "uploadRegistration");
+  await requireTelemetryPerformanceStorageMode(env.USAGE_MONITOR_DB, env);
+  const body = await readBoundedJson(request);
+  if (typeof body.value !== "object" || body.value === null || Array.isArray(body.value)
+      || Object.keys(body.value).length !== 3
+      || Object.keys(body.value).some((key) => !["deviceId", "consent", "ongoingUpload"].includes(key))
+      || typeof Reflect.get(body.value, "deviceId") !== "string"
+      || Reflect.get(body.value, "ongoingUpload") !== true) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const capability = await grantTelemetryPerformanceSocialAuthorization(
+    env.USAGE_MONITOR_DB,
+    {
+      participantId: session.participantId,
+      deviceId: Reflect.get(body.value, "deviceId") as string,
+    },
+    Reflect.get(body.value, "consent"),
+  );
+  return jsonResponse({ consent: capability.requiredConsent, capability }, 201, { vary: "Cookie" });
+}
+
+async function handleTelemetryPerformanceReports(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "GET" && request.method !== "POST") {
+    methodNotAllowed(["GET", "POST"]);
+  }
+  const device = await deviceSyncPrincipal(request, env, request.method as "GET" | "POST");
+  await requireTelemetryPerformanceStorageMode(env.USAGE_MONITOR_DB, env);
+  const principal = { participantId: device.participantId, deviceId: device.deviceId };
+  if (request.method === "GET") {
+    const query = new URL(request.url).searchParams;
+    if ([...query.keys()].some((key) => !["fromDay", "throughDay", "includeSuperseded"].includes(key))
+        || query.getAll("fromDay").length > 1
+        || query.getAll("throughDay").length > 1
+        || query.getAll("includeSuperseded").length > 1) {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    const includeSuperseded = query.get("includeSuperseded");
+    if (includeSuperseded !== null && includeSuperseded !== "true" && includeSuperseded !== "false") {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    return jsonResponse(await readTelemetryPerformanceReports(
+      env.USAGE_MONITOR_DB,
+      device.participantId,
+      {
+        fromDay: query.get("fromDay") ?? undefined,
+        throughDay: query.get("throughDay") ?? undefined,
+        deviceId: device.deviceId,
+        ...(includeSuperseded === null ? {} : { includeSuperseded: includeSuperseded === "true" }),
+      },
+    ));
+  }
+
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "processing");
+  const body = await readBoundedJson(request);
+  const envelope = validateTelemetryPerformanceEnvelope(body.value);
+  // Resolve the current capability immediately before decryption, and let the
+  // repository repeat the exact fence before insertion.  The envelope does
+  // not carry a second mutable authorization object, so stale clients cannot
+  // smuggle a different revision through the performance transport.
+  const capability = await readTelemetryPerformanceCapability(
+    env.USAGE_MONITOR_DB,
+    principal,
+  );
+  const plaintext = await decryptSyntheticEnvelope(
+    envelope,
+    env.ENVELOPE_PUBLIC_JWK,
+    env.ENVELOPE_PRIVATE_JWK,
+  );
+  const result = await admitTelemetryPerformanceReport(
+    env.USAGE_MONITOR_DB,
+    principal,
+    plaintext,
+    capability.authorization,
+    await sha256Hex(body.bytes),
+  );
+  return jsonResponse({
+    schemaVersion: "telemetry-performance-receipt-v1",
+    ...result,
+    replayed: result.status === "idempotent",
+  }, 202, result.status === "idempotent" ? { "idempotency-replayed": "true" } : undefined);
+}
+
 async function handleTelemetryV11Consent(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
   const session = await personalSession(request, env);
@@ -2846,6 +3204,26 @@ async function handleTelemetryV11Consent(request: Request, env: Env): Promise<Re
       || Reflect.get(value, "ongoingUpload") !== true) throw new ApiError(400, "BODY_INVALID");
   return jsonResponse(await grantTelemetryV11Consent(env.USAGE_MONITOR_DB, {
     participantId: session.participantId, sessionId: session.sessionId,
+    deviceId: Reflect.get(value, "deviceId") as string,
+  }, Reflect.get(value, "consent")), 201, { vary: "Cookie" });
+}
+
+async function handleTelemetryV12Consent(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  const session = await personalSession(request, env);
+  assertCsrf(request, session);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "uploadRegistration");
+  if (session.consentVersion !== TELEMETRY_CONSENT_VERSION) throw new ApiError(400, "TELEMETRY_REQUIRED");
+  await requireTelemetryV12StorageMode(env.USAGE_MONITOR_DB, env);
+  const { value } = await readBoundedJson(request);
+  if (typeof value !== "object" || value === null || Array.isArray(value)
+      || Object.keys(value).length !== 3
+      || Object.keys(value).some((key) => !["deviceId", "consent", "ongoingUpload"].includes(key))
+      || typeof Reflect.get(value, "deviceId") !== "string"
+      || Reflect.get(value, "ongoingUpload") !== true) throw new ApiError(400, "BODY_INVALID");
+  return jsonResponse(await grantTelemetryV12Consent(env.USAGE_MONITOR_DB, {
+    participantId: session.participantId,
+    sessionId: session.sessionId,
     deviceId: Reflect.get(value, "deviceId") as string,
   }, Reflect.get(value, "consent")), 201, { vary: "Cookie" });
 }
@@ -2868,6 +3246,42 @@ async function handleTelemetryV11DayManifests(request: Request, env: Env): Promi
   return jsonResponse(await readTelemetryV11DayCandidates(env.USAGE_MONITOR_DB, device, {
     fromDay: query.get("fromDay")!, toDay: query.get("toDay")!,
   }));
+}
+
+async function handleTelemetryV12DayManifests(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET" && request.method !== "POST") methodNotAllowed(["GET", "POST"]);
+  const device = await deviceSyncPrincipal(request, env, request.method);
+  await requireTelemetryV12StorageMode(env.USAGE_MONITOR_DB, env);
+  if (request.method === "POST") {
+    await assertCollectionControl(env.USAGE_MONITOR_DB, "processing");
+    const body = await readBoundedJson(request);
+    const candidate = await registerTelemetryV12DayManifest(env.USAGE_MONITOR_DB, device, body.value);
+    const stagedChunks = await readTelemetryV12DayChunkVector(env.USAGE_MONITOR_DB, device, candidate.manifestId);
+    return jsonResponse({ ...candidate, stagedChunks }, 201);
+  }
+  const query = new URL(request.url).searchParams;
+  if ([...query.keys()].some((key) => !["fromDay", "toDay"].includes(key))
+      || query.getAll("fromDay").length !== 1 || query.getAll("toDay").length !== 1) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  return jsonResponse(await readTelemetryV12DayCandidates(env.USAGE_MONITOR_DB, device, {
+    fromDay: query.get("fromDay")!, toDay: query.get("toDay")!,
+  }));
+}
+
+async function handleTelemetryV12Domain(request: Request, env: Env, activate: boolean): Promise<Response> {
+  const device = await deviceSyncPrincipal(request, env, "POST");
+  await requireTelemetryV12StorageMode(env.USAGE_MONITOR_DB, env);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "processing");
+  const body = await readBoundedJson(request);
+  if (activate) return jsonResponse(await activateTelemetryV12Domain(
+    env.USAGE_MONITOR_DB, device, body.value,
+  ), 201);
+  if (typeof body.value !== "object" || body.value === null || Array.isArray(body.value)
+      || Object.keys(body.value).length !== 0) throw new ApiError(400, "BODY_INVALID");
+  return jsonResponse(await createTelemetryV12DomainPredecessor(
+    env.USAGE_MONITOR_DB, device,
+  ), 201);
 }
 
 async function handleTelemetryV11Domain(request: Request, env: Env, activate: boolean): Promise<Response> {
@@ -2982,8 +3396,10 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
       ? await handleTelemetryContribution(request, body, participant, claimed, env)
       : declaredEnvelopeVersion === TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION
         ? await handleTelemetryV1Contribution(body, participant, claimed, env)
-        : declaredEnvelopeVersion === TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION
+      : declaredEnvelopeVersion === TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION
           ? await handleTelemetryV11Contribution(body, participant, sourceDeviceId, claimed.authorizationId, env)
+          : declaredEnvelopeVersion === TELEMETRY_V12_ENVELOPE_SCHEMA_VERSION
+            ? await handleTelemetryV12Contribution(body, participant, sourceDeviceId, claimed.authorizationId, env)
           : await handleSyntheticContribution(body, participant, claimed, env);
     await heartbeat.assertActive();
     const receipt = await response.clone().json<{ contributionId?: unknown }>();
@@ -3806,6 +4222,10 @@ async function routeApi(
       return handleAccountlessEnrollment(request, env);
     case "accountless_ownership":
       return handleAccountlessOwnership(request, env);
+    case "accountless_telemetry_v12_authorization":
+      return handleAccountlessTelemetryV12Authorization(request, env);
+    case "accountless_telemetry_performance_authorization":
+      return handleAccountlessTelemetryPerformanceAuthorization(request, env);
     case "accountless_renewal":
       return handleAccountlessRenewal(request, env);
     case "sparkle_appcast_guard":
@@ -3856,14 +4276,30 @@ async function routeApi(
       return handleDeviceSyncManifest(request, env);
     case "device_sync_capabilities":
       return handleDeviceSyncCapabilities(request, env);
+    case "device_sync_capabilities_v12":
+      return handleDeviceSyncCapabilitiesV12(request, env);
+    case "telemetry_performance_capabilities":
+      return handleTelemetryPerformanceCapabilities(request, env);
+    case "telemetry_performance_consent":
+      return handleTelemetryPerformanceConsent(request, env);
+    case "telemetry_performance_reports":
+      return handleTelemetryPerformanceReports(request, env);
     case "telemetry_v11_consent":
       return handleTelemetryV11Consent(request, env);
+    case "telemetry_v12_consent":
+      return handleTelemetryV12Consent(request, env);
     case "telemetry_v11_day_manifests":
       return handleTelemetryV11DayManifests(request, env);
+    case "telemetry_v12_day_manifests":
+      return handleTelemetryV12DayManifests(request, env);
     case "telemetry_v11_domain_predecessor":
       return handleTelemetryV11Domain(request, env, false);
     case "telemetry_v11_domain_activate":
       return handleTelemetryV11Domain(request, env, true);
+    case "telemetry_v12_domain_predecessor":
+      return handleTelemetryV12Domain(request, env, false);
+    case "telemetry_v12_domain_activate":
+      return handleTelemetryV12Domain(request, env, true);
     case "participant_devices":
       return handleDevices(request, env);
     case "participant_device_revocation":

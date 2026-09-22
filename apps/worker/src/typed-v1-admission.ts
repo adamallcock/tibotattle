@@ -10,6 +10,7 @@ import { MAX_STORAGE_TRANSACTION_STATEMENTS } from './storage-routing-batch-budg
 import { prepareTelemetryV1ChunkWrite, existingTelemetryV1ChunkByEnvelopeDigest, type TelemetryV1ChunkInsert, type TelemetryV1ChunkRow } from './telemetry-v1-repository';
 import { parseTelemetryV1Chunk, assertTelemetryV1ConsentCurrent } from './telemetry-v1';
 import { readIngestionChanges, type StorageChange } from './analytics-delivery';
+import { prepareTelemetryUsageCorrectionForV1Replacement } from './telemetry-usage-correction-repository';
 
 const encoded = (value: string): ArrayBuffer => Uint8Array.from(encodeTypedTelemetryId(value)).buffer;
 const conflict = () => new TypedTelemetryError('TYPED_TELEMETRY_CONFLICT');
@@ -124,8 +125,15 @@ export async function insertTypedTelemetryV1Chunk(db: D1Database, value: Telemet
  VALUES(?,?,?,?,?,?)`).bind(insert.chunkRowId,insert.participantId,insert.deviceId,insert.deviceUploadAuthorizationId,authorizationEnvelopeDigest,insert.envelopeDigest));
  statements.push(db.prepare('DELETE FROM typed_v1_authority_requests WHERE chunk_id=?').bind(insert.chunkRowId));
  if(statements.length>MAX_STORAGE_TRANSACTION_STATEMENTS) throw new TypedTelemetryError('TYPED_TELEMETRY_LIMIT');
+ let correction: Awaited<ReturnType<typeof prepareTelemetryUsageCorrectionForV1Replacement>> = null;
  try {
-  const results=await db.batch(statements);
+  correction=prior && chunk.stream==='usage'
+   ? await prepareTelemetryUsageCorrectionForV1Replacement(db,{participantId:insert.participantId,deviceId:insert.deviceId,
+     sourceNamespace,chunkRowId:prior.id})
+   : null;
+  const results=correction
+   ? (await correction.commitWithResults(statements)).results
+   : await db.batch(statements);
   if(results.some(r=>!r.success) || results[chunkStatementIndex+1]?.results.length!==1) throw conflict();
  } catch(error) {
   if(await replay(db,insert,sourceNamespace)) return {acceptedRecords:rows.length,replay:true};

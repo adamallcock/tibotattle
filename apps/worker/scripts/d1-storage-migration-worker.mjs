@@ -1,4 +1,4 @@
-import { runStorageRestoreStep, STORAGE_RESTORE_STAGES } from './d1-storage-restore-runner.mjs';
+import { runStorageRestoreStep, storageRestoreStages } from './d1-storage-restore-runner.mjs';
 
 const TABLE='_authority_operator_progress';
 export const MIGRATION_JOURNAL_DDL=`CREATE TABLE ${TABLE}(id INTEGER PRIMARY KEY CHECK(id=1),contract_digest TEXT NOT NULL,execution_digest TEXT NOT NULL,stage TEXT,steps INTEGER NOT NULL CHECK(steps>=0),intent TEXT) STRICT`;
@@ -14,7 +14,7 @@ const fail=code=>{throw new Error(`D1_STORAGE_${code}`);};
  * A private queue advances pages immediately. Cron only repairs a lost wakeup;
  * it never replays an uncertain page or paces the whole copy one page/minute. */
 export function createStorageMigrationWorker({api,contract,contractDigest,executionDigest=contractDigest,expiresAt,frozenSource=false,clock=()=>Date.now()}){
- const fixed=structuredClone(contract);
+ const fixed=structuredClone(contract),stages=storageRestoreStages(fixed);
  if(!/^[a-f0-9]{64}$/.test(executionDigest)||!/^[a-f0-9]{64}$/.test(contractDigest)||!Number.isSafeInteger(expiresAt))fail('MIGRATION_CONFIGURATION_INVALID');
  const enabled=async env=>{
    if(env.STORAGE_RESTORE_MODE===undefined||env.STORAGE_RESTORE_MODE==='disabled')return;
@@ -32,7 +32,7 @@ export function createStorageMigrationWorker({api,contract,contractDigest,execut
    }else if(objects.length!==1||objects[0].type!=='table'||objects[0].name!==TABLE||objects[0].sql!==DDL)fail('MIGRATION_JOURNAL_INVALID');
    const state=await target.prepare(`SELECT contract_digest,execution_digest,stage,steps,intent FROM ${TABLE} WHERE id=1`).first();
    if(!state||state.contract_digest!==contractDigest||state.execution_digest!==executionDigest||!Number.isSafeInteger(state.steps)||state.steps<0
-    ||state.steps===Number.MAX_SAFE_INTEGER||!(state.stage===null||STORAGE_RESTORE_STAGES.includes(state.stage))
+    ||state.steps===Number.MAX_SAFE_INTEGER||!(state.stage===null||stages.includes(state.stage))
     ||!(state.intent===null||state.intent===state.stage))fail('MIGRATION_JOURNAL_INVALID');
    return state;
  };
@@ -57,7 +57,7 @@ export function createStorageMigrationWorker({api,contract,contractDigest,execut
    const message=batch.messages[0],body=message.body;
    if(!body||Object.keys(body).sort().join()!=='contractDigest,schema,stage,steps'
     ||body.schema!=='d1-storage-restore-wakeup-v1'||body.contractDigest!==contractDigest
-    ||!Number.isSafeInteger(body.steps)||body.steps<0||!STORAGE_RESTORE_STAGES.includes(body.stage)
+    ||!Number.isSafeInteger(body.steps)||body.steps<0||!stages.includes(body.stage)
     ||typeof message.ack!=='function')fail('MIGRATION_MESSAGE_INVALID');
    const source=env.SOURCE,target=env.TARGET,state=await readState(target);
    // Lost send/ack responses may duplicate a wakeup. It names an exact step,

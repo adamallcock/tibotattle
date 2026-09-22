@@ -134,6 +134,7 @@ test('additive sidecar resumes and joins without changing original rows, version
   const path = join(dir, 'supplement');
   let extra = await openTimingStore(path, extraConfig(primary.key));
   try {
+    assert.equal(extra.db.prepare('PRAGMA user_version').get().user_version, 5);
     await ingestTimingFile(extra, file, { maxBytes: Buffer.byteLength(lines(fixture().slice(0, 6))) });
   } finally { extra.close(); }
   extra = await openTimingStore(path, extraConfig(primary.key));
@@ -143,7 +144,7 @@ test('additive sidecar resumes and joins without changing original rows, version
     assert.equal(joined.length, 1); assert.equal(joined[0].tool_free_tokens, 120); assert.equal(joined[0].tool_free_duration, 1200);
     const { tool_free_tokens, tool_free_duration, ...original } = joined[0];
     assert.deepEqual(original, before[0]); assert.deepEqual(readTimingRows(primary), before);
-    assert.equal(primary.db.prepare('PRAGMA user_version').get().user_version, METHOD);
+    assert.equal(primary.db.prepare('PRAGMA user_version').get().user_version, 4);
     assert.equal((await ingestTimingFile(extra, file)).bytes, 0);
     await assert.rejects(openTimingStore(path, primaryConfig), /incompatible_database/);
     await assert.rejects(openTimingStore(path, extraConfig(Buffer.alloc(32))), /correlation_mismatch/);
@@ -220,7 +221,7 @@ test('real worker backfills the supplement beside saved measurements and preserv
   try {
     const extra = await openTimingStore(join(scopedDirectory, 'tool-free-v1'), extraConfig(scopedPrimary.key));
     extra.db.exec('PRAGMA user_version=999'); extra.close();
-    assert.equal(scopedPrimary.db.prepare('PRAGMA user_version').get().user_version, METHOD);
+    assert.equal(scopedPrimary.db.prepare('PRAGMA user_version').get().user_version, 4);
   } finally { scopedPrimary.close(); }
   const snapshotFile = join(options.directory, 'model-performance-snapshot.json');
   const saved = await readFile(snapshotFile, 'utf8');

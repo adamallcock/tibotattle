@@ -125,31 +125,48 @@ async function fileReceipt(
   indexFile,
   unified = false,
   contextBehavior = "source_native",
+  { omitTotalInputContext = false } = {},
 ) {
   const scan = unified
     ? createLocalUnifiedAccountingSource({ indexFile, contextBehavior })
     : createLocalAnalysisIndexReadScan({ indexFile, requireComplete: true });
+  const selectedScan = omitTotalInputContext
+    ? async ({ onUsage, ...options }) => scan({
+      ...options,
+      onUsage: (row) => {
+        const { totalInputContextTokens: omitted, ...withoutTotal } = row;
+        void omitted;
+        return onUsage(withoutTotal);
+      },
+    })
+    : scan;
   return createLocalAccountingSemanticReceipt({
-    scan,
+    scan: selectedScan,
     startAt: START_AT,
     endAt: END_AT,
     byteKey: PARITY_KEY,
   });
 }
 
-function assertContextPresenceMismatch(legacyReceipt, unifiedReceipt) {
+function assertContextPresenceMismatch(legacyReceipt, incompleteUnifiedReceipt) {
   assert.equal(legacyReceipt.usage.missingTotalInputContextCount, 0);
-  assert.equal(legacyReceipt.usage.count, unifiedReceipt.usage.count);
+  assert.equal(legacyReceipt.usage.count, incompleteUnifiedReceipt.usage.count);
   assert.equal(
-    unifiedReceipt.usage.missingTotalInputContextCount,
-    unifiedReceipt.usage.count,
+    incompleteUnifiedReceipt.usage.missingTotalInputContextCount,
+    incompleteUnifiedReceipt.usage.count,
   );
+  assert.equal(incompleteUnifiedReceipt.usage.totalInputContextTokens, 0);
   // This is a known cutover blocker: the legacy reader materializes a missing
   // context value as explicit zero, while unified preserves SQL NULL as an
-  // omitted callback field. Keep the mismatch classified; do not canonicalize
-  // it away in the test or production reader.
+  // omitted callback field. The omitted callback is deliberate in this test;
+  // normal v16 capture below proves that published rows now carry their
+  // selected totals. Keep the mismatch classified; do not canonicalize it
+  // away in the test or production reader.
   assert.deepEqual(
-    compareLocalAccountingSemanticReceipts(legacyReceipt, unifiedReceipt),
+    compareLocalAccountingSemanticReceipts(
+      legacyReceipt,
+      incompleteUnifiedReceipt,
+    ),
     {
       equal: false,
       mismatchCategories: [
@@ -161,7 +178,7 @@ function assertContextPresenceMismatch(legacyReceipt, unifiedReceipt) {
   );
 }
 
-test("published legacy and unified indexes classify context-presence mismatch that blocks cutover", async () => {
+test("published v16 capture is known while deliberate missing context blocks cutover", async () => {
   const { root, codexHome, state } = await createCorpus();
   const legacyIndexFile = join(state, "local-analysis-index-v2.sqlite");
   const legacySecretFile = join(state, "local-analysis-index-secret-v2");
@@ -242,15 +259,37 @@ test("published legacy and unified indexes classify context-presence mismatch th
       true,
       "legacy_zero",
     );
+    const incompleteUnifiedReceipt = await fileReceipt(
+      unifiedIndexFile,
+      true,
+      "source_native",
+      { omitTotalInputContext: true },
+    );
     assert.equal(legacyReceipt.version, LOCAL_ACCOUNTING_PARITY_RECEIPT_VERSION);
     assert.equal(unifiedReceipt.version, LOCAL_ACCOUNTING_PARITY_RECEIPT_VERSION);
-    assertContextPresenceMismatch(legacyReceipt, unifiedReceipt);
+    assert.equal(unifiedReceipt.usage.missingTotalInputContextCount, 0);
+    assert.equal(unifiedReceipt.usage.totalInputContextTokens, 180);
     assert.deepEqual(
       compareLocalAccountingSemanticReceipts(
-        legacyReceipt,
+        unifiedReceipt,
         unifiedLegacyZeroReceipt,
       ),
       { equal: true, mismatchCategories: [] },
+    );
+    assertContextPresenceMismatch(legacyReceipt, incompleteUnifiedReceipt);
+    assert.deepEqual(
+      compareLocalAccountingSemanticReceipts(
+        legacyReceipt,
+        unifiedReceipt,
+      ),
+      {
+        equal: false,
+        mismatchCategories: [
+          "usage_tokens",
+          "usage_digest",
+          "usage_dimensions",
+        ],
+      },
     );
 
     const legacyCache = await buildReplaySafeAccountingCache({
@@ -347,6 +386,12 @@ test("published readers stay usable after raw fixture sources disappear", async 
       true,
       "legacy_zero",
     );
+    const expectedIncompleteUnified = await fileReceipt(
+      unifiedIndexFile,
+      true,
+      "source_native",
+      { omitTotalInputContext: true },
+    );
     await rm(codexHome, { recursive: true, force: true });
 
     const actualLegacy = await fileReceipt(legacyIndexFile);
@@ -360,13 +405,22 @@ test("published readers stay usable after raw fixture sources disappear", async 
       true,
       "legacy_zero",
     );
+    const actualIncompleteUnified = await fileReceipt(
+      unifiedIndexFile,
+      true,
+      "source_native",
+      { omitTotalInputContext: true },
+    );
     assert.deepEqual(actualLegacy, expectedLegacy);
     assert.deepEqual(actualUnified, expectedUnified);
     assert.deepEqual(actualUnifiedLegacyZero, expectedUnifiedLegacyZero);
-    assertContextPresenceMismatch(actualLegacy, actualUnified);
+    assert.deepEqual(actualIncompleteUnified, expectedIncompleteUnified);
+    assert.equal(actualUnified.usage.missingTotalInputContextCount, 0);
+    assert.equal(actualUnified.usage.totalInputContextTokens, 180);
+    assertContextPresenceMismatch(actualLegacy, actualIncompleteUnified);
     assert.deepEqual(
       compareLocalAccountingSemanticReceipts(
-        actualLegacy,
+        actualUnified,
         actualUnifiedLegacyZero,
       ),
       { equal: true, mismatchCategories: [] },

@@ -93,6 +93,31 @@ export interface TelemetryV11DomainPredecessor {
 }
 
 /**
+ * The legacy source selector elects one device for analytical day readers.
+ * That election is useful for the old facade, but it is not an occurrence
+ * closure proof when two devices upload complementary usage. Once the
+ * correction runtime is explicitly active, a successor predecessor must pin
+ * every admitted source tuple so v1.1 activation cannot silently drop the
+ * nonwinning device's unique rows. The runtime gate keeps older staged
+ * deployments byte-compatible until that reader/retention contract is active.
+ */
+function allAdmittedSourceTuples(chunks: readonly V1SourceChunk[]): V1SourceChunk[] {
+  const tuples = new Map<string, V1SourceChunk>();
+  for (const chunk of chunks) {
+    const key = JSON.stringify([chunk.participant_id, chunk.chunk_day, chunk.device_id]);
+    const previous = tuples.get(key);
+    if (!previous || (previous.stream === "session" && chunk.stream !== "session")
+        || chunk.created_at > previous.created_at) {
+      tuples.set(key, chunk);
+    }
+  }
+  return [...tuples.values()].sort((left, right) =>
+    left.participant_id.localeCompare(right.participant_id)
+    || left.chunk_day.localeCompare(right.chunk_day)
+    || left.device_id.localeCompare(right.device_id));
+}
+
+/**
  * Authenticated bootstrap/successor token. Snapshot only chunk journals, not a
  * million-row corpus. A single D1 batch pins both the old-format vector and the
  * participant revision. Final activation repeats semantic proof transactionally.
@@ -101,7 +126,13 @@ export async function createTelemetryV11DomainPredecessor(
   db: D1Database, principal: TelemetryTransportPrincipal, nowEpoch = Date.now(),
 ): Promise<TelemetryV11DomainPredecessor> {
   await assertTelemetryTransportWriteAllowed(db, principal, TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION);
-  const result = await db.batch<SourceState | V1SourceChunk | LegacyRange>([
+  // The correction runtime is optional during the staged rollout. Include its
+  // state in the same source snapshot when the migration exists; an older
+  // database simply retains the original one-device election.
+  const correctionRuntimeExists = await db.prepare(
+    "SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name='telemetry_usage_correction_runtime' LIMIT 1",
+  ).first<{ present: number }>();
+  const result = await db.batch<SourceState | V1SourceChunk | LegacyRange | { state: string }>([
     stateStatement(db, principal.participantId),
     db.prepare(`SELECT c.id, c.participant_id, c.device_id, c.chunk_day, c.stream,
       c.revision, c.chunk_digest, c.parser_version, c.accepted_record_count, c.created_at
@@ -113,6 +144,9 @@ export async function createTelemetryV11DomainPredecessor(
       WHERE participant_id = ? AND status = 'accepted'
         AND transport_schema_version = 'telemetry-contribution-v0.2'`)
       .bind(principal.participantId),
+    ...(correctionRuntimeExists ? [db.prepare(
+      "SELECT state FROM telemetry_usage_correction_runtime WHERE id=1",
+    )] : []),
   ]);
   const state = result[0]?.results[0] as SourceState | undefined;
   const chunks = result[1]?.results as V1SourceChunk[] | undefined;
@@ -122,8 +156,14 @@ export async function createTelemetryV11DomainPredecessor(
     .some((day) => day !== null && !utcDay(day))) throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
   if (chunks.length > MAX_V1_SOURCE_CHUNKS) throw new ApiError(400, "SYNC_RANGE_TOO_LARGE");
   const winners = selectV1WinningDevices(chunks);
+  const correctionRuntime = correctionRuntimeExists
+    ? result[3]?.results[0] as { state: string } | undefined : undefined;
+  const allSourceTuples = correctionRuntime?.state === "active"
+    ? allAdmittedSourceTuples(chunks) : null;
+  const closureDevices = allSourceTuples ?? winners;
   const today = new Date(nowEpoch).toISOString().slice(0, 10);
-  const knownDays = [today, ...winners.map((winner) => winner.observed_day),
+  const knownDays = [today, ...closureDevices.map((winner) =>
+    "chunk_day" in winner ? winner.chunk_day : winner.observed_day),
     ...[state.from_day, state.through_day, legacyRange.from_day, legacyRange.through_day]
       .filter((day): day is string => day !== null)].sort();
   const fromDay = knownDays[0]!;
@@ -134,12 +174,13 @@ export async function createTelemetryV11DomainPredecessor(
   const legacyFingerprint = await sha256Hex(canonicalJson({method: V11_DOMAIN_METHOD_VERSION,
     participantId: principal.participantId, inputRevision: state.input_revision,
     previousGenerationId: state.generation_id, previousManifestDigest: state.manifest_digest,
-    chunks, winners, legacyRange}));
+    chunks, winners: closureDevices, legacyRange}));
   const token = crypto.randomUUID();
   const tokenHash = await sha256Hex(token);
   const now = new Date(nowEpoch).toISOString();
   const expiresAt = new Date(nowEpoch + PREDECESSOR_TTL_MS).toISOString();
-  const winnersJson = JSON.stringify(winners.map((winner) => [winner.participant_id, winner.observed_day, winner.device_id]));
+  const winnersJson = JSON.stringify(closureDevices.map((winner) => [winner.participant_id,
+    "chunk_day" in winner ? winner.chunk_day : winner.observed_day, winner.device_id]));
   const rows = await db.batch([
     db.prepare(`DELETE FROM telemetry_v11_domain_predecessors
       WHERE participant_id = ? AND device_id = ? AND consumed_at IS NULL

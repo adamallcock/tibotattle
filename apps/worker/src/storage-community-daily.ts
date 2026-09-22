@@ -4,7 +4,8 @@ import { buildCommunityDailyPayload, type DailyTotalsRow, type DailyCellRow,
   type PublishedCommunityDailyRead } from './community-daily-aggregates';
 import { finalizeCommunityDailySpend, COMMUNITY_DAILY_SPEND_PRICING_METHOD,
   COMMUNITY_DAILY_SPEND_REGISTRY_SHA256 } from './community-daily-spend';
-import { createV11DailyProjectionValues, mergeV11DailyProjectionValues, validateV11DailyProjectionValues,
+import { createV11DailyProjectionValues, foldV11DailyProjectionValues,
+  mergeV11DailyProjectionValues, validateV11DailyProjectionValues,
   V11_DAILY_VALUES_SCHEMA, type V11DailyProjectionValues } from './v11-daily-projection-values';
 import { readV11ProjectedOwnerDays } from './v11-daily-projection';
 import { readV1ProjectedChunkPage } from './v1-daily-projection';
@@ -14,6 +15,9 @@ import { readCacheRetentionCommunitySeries } from './cache-retention-day';
 import { captureStorageCommunityAuthority, captureStorageCommunityRetirementAuthority, readStorageCommunityOwnerPage,
   readStorageCommunitySourceTerminalEpoch, sameStorageCommunityHardAuthority, storageCommunityCalculationAuthorityIsCurrent,
   storageCommunityPublicationVisible, type StorageCommunityAuthority, type StorageCommunityOwner } from './storage-community-authority';
+import { readEffectiveTelemetryOwnerDayPage, type EffectiveTelemetryStream } from './telemetry-usage-effective-reader';
+import type { EffectiveUsageReaderCursor } from './telemetry-usage-effective-reader';
+import { effectiveHistoryDependency } from './storage-effective-history';
 
 export interface StorageCommunityDailyBindings {
   source: D1Database; target: D1Database; sourceId: string; sourceNamespace: string;
@@ -38,28 +42,48 @@ function numeric(value: string): number {
   return Number(n);
 }
 interface OwnerCache {
-  owner_digest: string; input_revision: number; owner_revision: number; source_format: 'v1'|'v11';
+  owner_digest: string; input_revision: number; owner_revision: number; source_format: 'v1'|'v11'|'effective';
   method: string; progress_revision: number; next_index: number; fingerprint: string|null;
   complete: number; values_json: string;
 }
-function current(row: OwnerCache|undefined, owner: StorageCommunityOwner): row is OwnerCache {
+type EffectiveCursorState = {
+  usage: EffectiveUsageReaderCursor | null | undefined;
+  quota: EffectiveUsageReaderCursor | null | undefined;
+  session: EffectiveUsageReaderCursor | null | undefined;
+};
+const EFFECTIVE_DAILY_CURSOR_METHOD = 'effective-daily-cursor-v2';
+const EFFECTIVE_STREAMS: readonly EffectiveTelemetryStream[] = ['usage','quota','session'];
+function usesEffectiveReader(owner: StorageCommunityOwner, effectiveEnabled: boolean): boolean {
+  // A v11-only owner already has one complete immutable family and keeps the
+  // established projection budget. The effective lane is needed when there
+  // are complementary typed families (or the successor) whose occurrences
+  // must be unioned before folding. The authority owner selector sets this
+  // flag for all typed legacy families while correction admission is active,
+  // and for a retained successor domain independently of that runtime.
+  return effectiveEnabled && owner.hasEffective === true;
+}
+function sourceFormat(owner: StorageCommunityOwner, effectiveEnabled: boolean): OwnerCache['source_format'] {
+  return usesEffectiveReader(owner, effectiveEnabled) ? 'effective' : owner.hasV11 ? 'v11' : 'v1';
+}
+function current(row: OwnerCache|undefined, owner: StorageCommunityOwner, effectiveEnabled: boolean): row is OwnerCache {
   return row !== undefined && row.input_revision === owner.inputRevision && row.owner_revision === owner.ownerRevision
-    && row.source_format === (owner.hasV11 ? 'v11':'v1') && row.method === METHOD;
+    && row.source_format === sourceFormat(owner, effectiveEnabled) && row.method === METHOD;
 }
-function member(owner: StorageCommunityOwner) {
+function member(owner: StorageCommunityOwner, effectiveEnabled: boolean) {
   return {ownerDigest:owner.ownerDigest,inputRevision:owner.inputRevision,ownerRevision:owner.ownerRevision,
-    hasV1:owner.hasV1,hasV11:owner.hasV11};
+    authorityEpoch:owner.authorityEpoch,hasV1:owner.hasV1,hasV11:owner.hasV11,hasV12:owner.hasV12,
+    hasEffective:owner.hasEffective===true,effectiveReader:usesEffectiveReader(owner,effectiveEnabled)};
 }
-async function cohort(source: D1Database): Promise<StorageCommunityOwner[]|null> {
+async function cohort(source: D1Database, effectiveEnabled: boolean): Promise<StorageCommunityOwner[]|null> {
   const owners: StorageCommunityOwner[] = []; let after = '', bytes = 0;
   for (;;) {
     const page = await readStorageCommunityOwnerPage(source,{afterParticipantId:after});
     for (const owner of page) {
-      // The established daily activity population is the analytical v1/v11
-      // union. Legacy evidence feeds allowance, never an extra usage copy.
-      if (!owner.hasV1 && !owner.hasV11) continue;
+      // The daily activity population is the version-neutral typed union.
+      // Legacy evidence feeds allowance, never an extra usage copy.
+      if (!owner.hasV1 && !owner.hasV11 && !owner.hasV12) continue;
       if (!owner.ownerDigest || owner.ownerRevision < 1) throw unavailable();
-      bytes += byteLength(canonicalJson(member(owner)));
+      bytes += byteLength(canonicalJson(member(owner,effectiveEnabled)));
       if (bytes > STORAGE_DAILY_CAPTURE_BYTES) return null;
       owners.push(owner);
     }
@@ -75,10 +99,84 @@ async function assertTarget(options: StorageCommunityDailyBindings): Promise<voi
   if (!row) throw unavailable();
 }
 
+function emptyEffectiveCursor(): EffectiveCursorState {
+  return {usage:undefined, quota:undefined, session:undefined};
+}
+
+function readEffectiveCursor(value: string|null|undefined, dependencyDigest: string): EffectiveCursorState|null {
+  if (value === null || value === undefined) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+        || Object.keys(parsed).sort().join(',') !== 'dependencyDigest,method,streams'
+        || (parsed as {method?:unknown}).method !== EFFECTIVE_DAILY_CURSOR_METHOD
+        || (parsed as {dependencyDigest?:unknown}).dependencyDigest !== dependencyDigest) return null;
+    const streams = (parsed as {streams?:unknown}).streams;
+    if (!streams || typeof streams !== 'object' || Array.isArray(streams)
+        || Object.keys(streams).sort().join(',') !== 'quota,session,usage') return null;
+    const cursor: EffectiveCursorState = emptyEffectiveCursor();
+    for (const stream of EFFECTIVE_STREAMS) {
+      const item = (streams as Record<string,unknown>)[stream];
+      if (item === null) { cursor[stream] = null; continue; }
+      if (item === undefined) continue;
+      if (!item || typeof item !== 'object' || Array.isArray(item)
+          || Object.keys(item).sort().join(',') !== 'observedAtMs,occurrenceId') return null;
+      const observedAtMs = (item as {observedAtMs?:unknown}).observedAtMs;
+      const occurrenceId = (item as {occurrenceId?:unknown}).occurrenceId;
+      if (!Number.isSafeInteger(observedAtMs) || typeof occurrenceId !== 'string'
+          || !/^[A-Za-z0-9._:-]{8,128}$/u.test(occurrenceId)) return null;
+      cursor[stream] = {observedAtMs:observedAtMs as number,occurrenceId};
+    }
+    return cursor;
+  } catch { return null; }
+}
+
+function effectiveCursorJson(cursor: EffectiveCursorState, dependencyDigest: string): string {
+  return canonicalJson({method:EFFECTIVE_DAILY_CURSOR_METHOD,dependencyDigest,streams:cursor});
+}
+
+/** One bounded page per stream. The occurrence reader has already selected all
+ * source families and refuses conflicts; this adapter only folds its
+ * canonical analytical records into the existing v1.1 daily value state. */
+async function advanceEffectiveDailyValues(options: StorageCommunityDailyBindings, dayValue: string,
+  owner: StorageCommunityOwner, values: V11DailyProjectionValues, cursor: EffectiveCursorState):
+  Promise<{values:V11DailyProjectionValues;complete:boolean;blocked:boolean}> {
+  for (const stream of EFFECTIVE_STREAMS) {
+    const after = cursor[stream];
+    if (after === null) continue;
+    const page = await readEffectiveTelemetryOwnerDayPage(options.source, {
+      sourceNamespace: options.sourceNamespace, ownerDigest: owner.ownerDigest!,
+      ownerRevision: owner.ownerRevision, authorityEpoch: owner.authorityEpoch,
+      day: dayValue, stream, limit: 50, ...(after === undefined ? {} : {after}),
+    });
+    // Do not persist a folded prefix without its cursor: retrying a page that
+    // contains a conflict must never count its preceding valid rows twice.
+    if (page.rows.some(row => row.status !== 'compatible' || row.recordJson === null)) return {values,complete:false,blocked:true};
+    for (const row of page.rows) {
+      const record = JSON.parse(row.recordJson!) as unknown;
+      // The public effective reader normalizes every stream to the v1.1
+      // analytical shape. This includes v1 correction facts, so the daily
+      // fold applies one validator and preserves the existing v1.1 arithmetic.
+      values = foldV11DailyProjectionValues(values, [record]);
+    }
+    cursor[stream] = page.next;
+  }
+  return {values,complete:EFFECTIVE_STREAMS.every(stream => cursor[stream] === null),blocked:false};
+}
+
 async function ownerPage(options: StorageCommunityDailyBindings, observedDay: string,
-  owner: StorageCommunityOwner, old?: OwnerCache): Promise<'advanced'|'deferred'> {
+  owner: StorageCommunityOwner, effectiveEnabled: boolean, old?: OwnerCache): Promise<'advanced'|'deferred'> {
   const {source,target,sourceId,sourceNamespace}=options, ownerDigest=owner.ownerDigest!;
-  const reuse = current(old,owner), progress = old?.progress_revision ?? 0;
+  const effective = usesEffectiveReader(owner,effectiveEnabled);
+  const dependencyDigest = effective ? await sha256Hex(canonicalJson(await effectiveHistoryDependency(
+    source,owner,sourceNamespace,observedDay,observedDay,{includeSessions:true}))) : null;
+  const oldCursor = effective && old?.source_format === 'effective' && old.method === METHOD
+    ? readEffectiveCursor(old.fingerprint,dependencyDigest!) : null;
+  // A later upload for another day advances the owner's authority revision,
+  // but does not discard a partial fold of this unchanged closed day. The
+  // occurrence reader and publication still enforce the fresh authority CAS.
+  const reuse = effective ? oldCursor !== null : current(old,owner,effectiveEnabled);
+  const progress = old?.progress_revision ?? 0;
   const retained=reuse?await target.prepare(`SELECT CASE WHEN length(CAST(values_json AS BLOB))<=? THEN values_json ELSE NULL END AS values_json
     FROM analytics_community_daily_owners WHERE source_id=? AND day=? AND owner_digest=? AND progress_revision=?`)
     .bind(STORAGE_DAILY_CAPTURE_BYTES,sourceId,observedDay,ownerDigest,progress).first<string>('values_json'):null;
@@ -86,7 +184,20 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
   let values = reuse ? JSON.parse(retained!) as V11DailyProjectionValues : createV11DailyProjectionValues(observedDay);
   validateV11DailyProjectionValues(values);
   let nextIndex = 0, fingerprint: string|null = null, complete = true;
-  if (owner.hasV11) {
+  if (usesEffectiveReader(owner,effectiveEnabled)) {
+    let cursor = reuse ? oldCursor : emptyEffectiveCursor();
+    if (cursor === null) {
+      // A malformed or pre-contract cursor cannot be treated as complete. The
+      // existing value is discarded and the bounded source fold restarts.
+      values = createV11DailyProjectionValues(observedDay);
+      cursor = emptyEffectiveCursor();
+    }
+    const advanced = await advanceEffectiveDailyValues(options, observedDay, owner, values, cursor);
+    if (advanced.blocked) return 'deferred';
+    values = advanced.values;
+    fingerprint = effectiveCursorJson(cursor,dependencyDigest!);
+    complete = advanced.complete;
+  } else if (owner.hasV11) {
     const ready = await target.prepare(`SELECT 1 AS ready FROM analytics_owner_state o
       JOIN analytics_v11_owner_heads h ON h.source_id=o.source_id AND h.owner_digest=o.owner_digest
       JOIN analytics_applied_events e ON e.source_id=h.source_id AND e.sequence=h.sequence AND e.revision=o.revision
@@ -100,7 +211,7 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
     const page=(afterIndex:number,requested?:string|null)=>readV1ProjectedChunkPage({source,target,sourceId,sourceNamespace,
       ownerDigest,day:observedDay,afterIndex,limit:50,...(requested?{fingerprint:requested}:{})});
     let read:Awaited<ReturnType<typeof page>>;
-    try { read=await page(reuse?old.next_index:0,reuse?old.fingerprint:null); }
+    try { read=await page(reuse?old!.next_index:0,reuse?old!.fingerprint:null); }
     catch (error) {
       // The immutable chunk vector behind a partially folded day changed, for
       // example a correction of this owner landed between pages. Restart the
@@ -122,11 +233,11 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
       method=excluded.method,progress_revision=excluded.progress_revision,next_index=excluded.next_index,
       fingerprint=excluded.fingerprint,complete=excluded.complete,values_json=excluded.values_json
     WHERE analytics_community_daily_owners.progress_revision=?`).bind(sourceId,observedDay,ownerDigest,
-      owner.inputRevision,owner.ownerRevision,owner.hasV11?'v11':'v1',METHOD,progress+1,nextIndex,fingerprint,complete?1:0,valuesJson,progress);
+      owner.inputRevision,owner.ownerRevision,sourceFormat(owner,effectiveEnabled),METHOD,progress+1,nextIndex,fingerprint,complete?1:0,valuesJson,progress);
   try { await statement.run(); } catch { /* Only exact readback acknowledges a lost response or concurrent writer. */ }
   const receipt=await target.prepare(`SELECT * FROM analytics_community_daily_owners WHERE source_id=? AND day=? AND owner_digest=?`)
     .bind(sourceId,observedDay,ownerDigest).first<OwnerCache>();
-  return receipt && current(receipt,owner) && receipt.progress_revision===progress+1
+  return receipt && current(receipt,owner,effectiveEnabled) && receipt.progress_revision===progress+1
     && receipt.next_index===nextIndex && receipt.fingerprint===fingerprint && receipt.complete===(complete?1:0)
     && receipt.values_json===valuesJson ? 'advanced':'deferred';
 }
@@ -229,12 +340,21 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
   const {source,target,sourceId}=options;day(options.day);await assertTarget(options);
   const maxOwners=options.maxOwners??4;
   if(!Number.isSafeInteger(maxOwners)||maxOwners<1||maxOwners>16)throw unavailable();
-  const authority=await captureStorageCommunityAuthority(source,options), owners=await cohort(source);
+  const initialOwners=await cohort(source,false);
+  const mayNeedEffective=initialOwners?.some(owner=>owner.hasEffective===true
+    ||owner.hasV12||owner.hasV1||owner.hasV11)??false;
+  // The authority owner query already evaluated the exact correction runtime
+  // and successor schema. Re-probing sqlite_master here would spend one
+  // statement per pass and could starve an otherwise bounded daily sweep.
+  const effectiveAvailable=mayNeedEffective && initialOwners?.some(owner=>owner.hasEffective===true) === true;
+  const needsEffective=effectiveAvailable && (initialOwners?.some(owner=>owner.hasEffective===true)??false);
+  const effectiveEnabled=needsEffective;
+  const authority=await captureStorageCommunityAuthority(source,options), owners=initialOwners;
   const deferred=(reason:NonNullable<StorageCommunityDailyProgress['reason']>,ownersAdvanced=0):StorageCommunityDailyProgress=>
     ({state:reason==='projection_pending'&&ownersAdvanced>0?'progress':'deferred',reason,ownersAdvanced});
   if(!owners)return deferred('capacity');
   if(!await storageCommunityCalculationAuthorityIsCurrent(source,authority))return deferred('source_changed');
-  const requested=owners.map(member), requestJson=canonicalJson(requested);
+  const requested=owners.map(owner=>member(owner,effectiveEnabled)), requestJson=canonicalJson(requested);
   const rowset=(await target.prepare(`SELECT owner_digest,input_revision,owner_revision,source_format,method,
     progress_revision,next_index,fingerprint,complete,'' AS values_json FROM analytics_community_daily_owners
     WHERE source_id=? AND day=? AND owner_digest IN(SELECT json_extract(value,'$.ownerDigest') FROM json_each(?))`)
@@ -242,9 +362,9 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
   const cache=new Map(rowset.map(row=>[row.owner_digest,row]));let ownersAdvanced=0;
   for(const owner of owners) {
     const row=cache.get(owner.ownerDigest!);
-    if(current(row,owner)&&row.complete===1)continue;
+    if(current(row,owner,effectiveEnabled)&&row.complete===1)continue;
     if(ownersAdvanced>=maxOwners)return {state:'progress',ownersAdvanced};
-    if(await ownerPage(options,options.day,owner,row)==='deferred')return deferred('projection_pending',ownersAdvanced);
+    if(await ownerPage(options,options.day,owner,effectiveEnabled,row)==='deferred')return deferred('projection_pending',ownersAdvanced);
     ownersAdvanced++;
   }
   // Read all selected values and the queue revision in one target snapshot.
@@ -267,7 +387,7 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
   const previous=result[2]!.results[0] as {revision:number;cohort_digest:string;payload_json:string|null;payload_sha256:string|null}|undefined;
   if(rows.length!==owners.length)return deferred('projection_pending',ownersAdvanced);
   const byOwner=new Map(owners.map(owner=>[owner.ownerDigest!,owner]));let bytes=0;
-  for(const row of rows){if(!current(row,byOwner.get(row.owner_digest)!)||row.complete!==1)return deferred('projection_pending',ownersAdvanced);
+  for(const row of rows){if(!current(row,byOwner.get(row.owner_digest)!,effectiveEnabled)||row.complete!==1)return deferred('projection_pending',ownersAdvanced);
     if(typeof row.values_json!=='string')return deferred('capacity',ownersAdvanced);
     bytes+=byteLength(row.values_json);if(bytes>STORAGE_DAILY_CAPTURE_BYTES)return deferred('capacity',ownersAdvanced);}
   // Identity of an unchanged result: exact members and method under the hard
@@ -283,10 +403,18 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
   // member's exact input revision is enforced again inside the commit, so an
   // unrelated concurrent upload defers nothing; the fresh stamp pins the epoch
   // this exact member set was verified against.
-  const finalOwners=await cohort(source);
+  const finalInitialOwners=await cohort(source,false);
+  const finalMayNeedEffective=finalInitialOwners?.some(owner=>owner.hasEffective===true
+    ||owner.hasV12||owner.hasV1||owner.hasV11)??false;
+  const finalEffectiveAvailable=finalMayNeedEffective
+    && finalInitialOwners?.some(owner=>owner.hasEffective===true) === true;
+  const finalNeedsEffective=finalEffectiveAvailable
+    && (finalInitialOwners?.some(owner=>owner.hasEffective===true)??false);
+  const finalEffectiveEnabled=finalNeedsEffective;
+  const finalOwners=finalInitialOwners;
   let pinned:StorageCommunityAuthority;
   try{pinned=await captureStorageCommunityAuthority(source,options);}catch{return deferred('source_changed',ownersAdvanced);}
-  if(!finalOwners || canonicalJson(finalOwners.map(member))!==requestJson
+  if(!finalOwners || canonicalJson(finalOwners.map(owner=>member(owner,finalEffectiveEnabled)))!==requestJson
     || !sameStorageCommunityHardAuthority(pinned,authority))return deferred('source_changed',ownersAdvanced);
   const unchanged=previous?.cohort_digest===cohortDigest&&typeof previous.payload_json==='string'
     &&await sha256Hex(previous.payload_json)===previous.payload_sha256;

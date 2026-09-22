@@ -40,7 +40,7 @@ import * as bootstrap from './src/authority-restore-bootstrap.ts';
   'migration-backend.mjs':`${api}import {createStorageMigrationBackend} from './scripts/d1-storage-migration-placed.mjs';
 export default createStorageMigrationBackend({api:{...restore,...bootstrap},executionDigest:${JSON.stringify(executionDigest)},${fixed}});`,
   'migration-worker.mjs':`import {createStorageMigrationFront} from './scripts/d1-storage-migration-placed.mjs';
-export default createStorageMigrationFront({executionDigest:${JSON.stringify(executionDigest)},contractDigest:${JSON.stringify(contractDigest)},expiresAt:${expiresAt}});`,
+export default createStorageMigrationFront({contractVersion:${JSON.stringify(contract.version)},executionDigest:${JSON.stringify(executionDigest)},contractDigest:${JSON.stringify(contractDigest)},expiresAt:${expiresAt}});`,
  }:{'migration-worker.mjs':`${api}import {createStorageMigrationWorker} from './scripts/d1-storage-migration-worker.mjs';
 export default createStorageMigrationWorker({api:{...restore,...bootstrap},${fixed}});`};
  const bundles={};
@@ -72,7 +72,7 @@ export async function prepareStorageMigrationWorker({workerRoot,contractPath,con
     throw storageError('MIGRATION_EXECUTION_PROTOCOL_INVALID');
   }
  }
- if(identityDigest(contract)!==contractDigest||contract.version!=='authority-restore-v1'
+ if(identityDigest(contract)!==contractDigest||!['authority-restore-v1','typed-evidence-restore-v1'].includes(contract.version)
   ||typeof contract.sourceId!=='string'||!/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/.test(contract.sourceId)||!/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/.test(contract.runId??'')
   ||typeof contract.sourceNamespace!=='string'||!/^[A-Za-z0-9._:-]{1,256}$/.test(contract.sourceNamespace)
   ||identityDigest(contract.sourceSchema)!==contract.sourceSchemaDigest||identityDigest(contract.targetBaseSchema)!==contract.targetBaseSchemaDigest

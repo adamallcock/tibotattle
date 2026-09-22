@@ -40,6 +40,46 @@ const EXPECTED_OVERRIDES = {
     "es": "Usar esta carpeta",
   },
 };
+const CRASH_COPY_KEYS = [
+  "electron.diagnostics.enableCapture",
+  "electron.diagnostics.disableCapture",
+  "electron.diagnostics.openCrashFolder",
+  "electron.diagnostics.prepareSupportIssue",
+  "electron.diagnostics.message",
+  "electron.diagnostics.title",
+];
+const EXPECTED_CRASH_COPY = {
+  "electron.diagnostics.enableCapture": {
+    "en-US": "Enable local crash capture next launch",
+    "zh-Hans": "下次启动时启用本地崩溃捕获",
+    "es": "Activar captura local al reiniciar",
+  },
+  "electron.diagnostics.disableCapture": {
+    "en-US": "Disable local crash capture next launch",
+    "zh-Hans": "下次启动时停用本地崩溃捕获",
+    "es": "Desactivar captura local al reiniciar",
+  },
+  "electron.diagnostics.openCrashFolder": {
+    "en-US": "Open local crash reports",
+    "zh-Hans": "打开本地崩溃报告",
+    "es": "Abrir informes de fallos locales",
+  },
+  "electron.diagnostics.prepareSupportIssue": {
+    "en-US": "Prepare public GitHub issue…",
+    "zh-Hans": "准备公开的 GitHub 问题…",
+    "es": "Preparar incidencia pública en GitHub…",
+  },
+  "electron.diagnostics.message": {
+    "en-US": "Review this content-free report. Preparing a public issue sends it to GitHub in the URL; review the form before submitting. Local crash dumps may contain private data and are not uploaded by TiboTattle. Capture changes take effect after restart.",
+    "zh-Hans": "请查看这份不含内容的报告。准备公开问题会通过网址将报告发送给 GitHub；提交前请检查表单。本地崩溃转储可能包含私密数据，TiboTattle 不会上传它们。捕获设置会在重启后生效。",
+    "es": "Revisa este informe sin contenido. Preparar una incidencia pública lo envía a GitHub en la URL; revisa el formulario antes de publicarlo. Los volcados locales pueden contener datos privados y TiboTattle no los sube. Los cambios de captura se aplican tras reiniciar.",
+  },
+  "electron.diagnostics.title": {
+    "en-US": "TiboTattle doctor",
+    "zh-Hans": "TiboTattle 诊断工具",
+    "es": "Diagnóstico de TiboTattle",
+  },
+};
 
 function placeholders(value) {
   return [...String(value).matchAll(/\{([A-Za-z][A-Za-z0-9_.-]*)\}/gu)]
@@ -51,12 +91,16 @@ test("Electron localization is generated, bounded, and ownership-stable", async 
   assert.equal(await checkI18nElectronCopy(), true);
   assert.equal(I18N_ELECTRON_COPY_FILE.endsWith("apps/electron/desktop-copy.js"), true);
   assert.equal(DESKTOP_SHARED_KEYS.length, 39);
-  assert.equal(Object.keys(DESKTOP_OVERLAY_MESSAGES).length, 86);
+  assert.equal(Object.keys(DESKTOP_OVERLAY_MESSAGES).length, 90);
   assert.deepEqual(Object.keys(DESKTOP_OVERRIDES).sort(), [...OVERRIDE_KEYS].sort());
   assert.deepEqual(DESKTOP_SHARED_KEYS, desktopOwnership.DESKTOP_SHARED_KEYS);
   assert.deepEqual(DESKTOP_OVERLAY_MESSAGES, desktopOwnership.DESKTOP_OVERLAY_MESSAGES);
   assert.deepEqual(DESKTOP_OVERRIDES, desktopOwnership.DESKTOP_OVERRIDES);
-  assert.equal(Object.keys(DESKTOP_MESSAGES).length, 128);
+  assert.equal(Object.keys(DESKTOP_MESSAGES).length, 132);
+  assert.deepEqual(
+    Object.fromEntries(CRASH_COPY_KEYS.map((key) => [key, DESKTOP_OVERLAY_MESSAGES[key]])),
+    EXPECTED_CRASH_COPY,
+  );
 
   for (const key of DESKTOP_SHARED_KEYS) {
     for (const locale of DESKTOP_SUPPORTED_LOCALES) {

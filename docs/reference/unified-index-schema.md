@@ -31,7 +31,7 @@ one another:
 | Stable filename | `local-unified-index-v1.sqlite` | Machine path continuity across app releases. |
 | Schema-family metadata | `local-unified-index-v2` | Logical family stored in `meta.schema_version`. |
 | SQLite `PRAGMA user_version` | `11` | Physical table/index/migration generation. |
-| Parser version | `unified-rollout-typed-v16` | Meaning and provenance of facts extracted from rollout sources, including ordinal-bearing compaction headers and settings pinned to paginated history boundaries. |
+| Parser version | `unified-rollout-typed-v17` | Meaning and provenance of facts extracted from rollout sources, including ordinal-bearing compaction headers, settings pinned to paginated history boundaries, and exact selected input/output totals. |
 | Source identity version | `codex-immutable-rollout-v1` | Rules for physical rollout identity/generation. |
 
 The application id is a separate SQLite format guard. A file with the wrong
@@ -104,12 +104,12 @@ keep the default; custom/unreviewed selections block a previously reviewed model
 An exact history base, including an unknown model, retains its prior semantics.
 Tier, effort, cumulative counters and replay admission are unchanged.
 
-The per-event parser stamps `unified-rollout-typed-v16-parent-model` and
-`unified-rollout-typed-v16-parent-model-partial` record the inherited assumption;
-other records retain the base and `-partial` v16 stamps. These suffixes
-identify the new fallback; they do not reclassify legacy inline inheritance.
-These are local provenance variants, not new physical schemas or telemetry
-fields. Cursor/generation stamps remain the base v16 so warm refresh does not
+Parser v15 introduced the per-event `-parent-model` and
+`-parent-model-partial` suffixes to record the inherited assumption;
+other records use the base and `-partial` stamps. Parsers v16 and v17 retain these
+suffixes with its own version prefix. They do not reclassify legacy inline
+inheritance. These are local provenance variants, not new physical schemas or
+telemetry fields. Cursor/generation stamps use the base parser version so warm refresh does not
 mistake an assumed-model row for an obsolete parser. Model lookup retains at
 most 128 timelines of 4,096 transitions and traverses at most 128 ancestors.
 Missing/ambiguous parents, invalid metadata, clock regression and exceeded
@@ -125,6 +125,26 @@ appended after any parent-model/partial provenance; report `assumedEvents` count
 these records independently of remaining incomplete records. No physical schema
 or telemetry field changes. Present sources reparse; unavailable historical
 sources keep their original facts and parser stamps.
+
+Parser v17 preserves the exact selected `input_tokens` and `output_tokens`
+values in the existing `usage_event.total_input_context` and
+`usage_event.tokens_out_combined` columns. These totals remain independent of
+the additive cache and reasoning splits: an unavailable split stays `NULL`,
+while a total whose known components contradict it is withheld as `NULL`.
+The parser never reconstructs a total from a partial vector, treats an absent
+cache-write TTL as zero, or changes replay identity, event order, boundaries,
+or cache-retention calculations. This is an interpretation change only; the
+physical schema remains SQLite user version 11. Present sources are reparsed so
+the new totals can be recovered. Rotated sources retain their prior totals and
+parser provenance.
+
+The opt-in local contribution reader `readDayWithV12Evidence(day)` derives
+successor boundary masks and same-session/millisecond ranks from these existing
+index facts; it adds no physical columns. It uses the same exact v15/v16/v17 boundary
+parser qualification as local cache analysis. A completed event-key boundary
+join can prove absence; an unavailable join cannot. Source generation/cursor
+ambiguity withholds order. This reader supplies evidence to dormant preparation
+and does not activate uploads or change the current cache method.
 
 Parser v12 additionally preserves omitted or null usage counters as SQL NULL,
 including the cumulative cursor carried across refreshes. Explicit zero remains
@@ -156,12 +176,13 @@ effort. No effective-effort carry is inferred across compaction, fork or resume.
 Actual application/eligible-mode and installed-client evidence remains a
 qualification gate, separate from catalogue recognition.
 
-The foreground companion treats verified published v10/v11/v12/v13/v14/v15-to-v16 parser
-upgrades as cold work even when the physical schema is already 11. The target
-and predecessor set are deliberately closed; current, unknown, malformed and
-future parser evidence cannot obtain a longer deadline. That run receives the
-same bounded four-hour deadline as an absent or supported older-schema index;
-subsequent current-parser refreshes retain the normal five-minute deadline.
+The foreground companion treats verified published v10/v11/v12/v13/v14/v15/v16-to-v17
+parser upgrades as cold work even when the physical schema is already 11. The
+target and predecessor set are deliberately closed; current, unknown, malformed
+and future parser evidence cannot obtain a longer deadline. That run receives
+the same bounded four-hour deadline as an absent or supported older-schema
+index; subsequent current-parser refreshes retain the normal five-minute
+deadline.
 Only the published generation selects this budget. Older parser rows retained
 for rotated sources do not keep extending ordinary refreshes. This metadata-only
 decision does not replace the worker's full compatibility, integrity, or

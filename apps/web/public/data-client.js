@@ -21,9 +21,11 @@ import {
   REVIEWED_CODEX_MODEL_IDS,
   TELEMETRY_PLAN_TYPES,
   TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
+  TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
   TELEMETRY_V11_ACCOUNT_BASES,
   TELEMETRY_V11_PLAN_BASES,
   telemetryV11RequiredConsent,
+  telemetryV12RequiredConsent,
 } from "./telemetry-shared.generated.js";
 
 export {
@@ -874,11 +876,11 @@ export function normalizeIncrementalContributionSyncStatus(payload) {
   return Object.freeze({
     status: "available",
     keychainPrompt,
-    ...(payload.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+    ...([TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION].includes(payload.contractVersion)
       ? { contractVersion: payload.contractVersion } : {}),
     ...(payload.attributionUpgrade?.available === true
-      && payload.attributionUpgrade?.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
-      ? { attributionUpgradeAvailable: true } : {}),
+      && [TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION].includes(payload.attributionUpgrade?.contractVersion)
+      ? { attributionUpgradeAvailable: true, attributionUpgradeVersion: payload.attributionUpgrade.contractVersion } : {}),
     consent: Object.freeze({
       approved: payload.consent.approved,
       current: payload.consent.current,
@@ -898,7 +900,8 @@ export function normalizeIncrementalContributionSyncStatus(payload) {
 }
 
 export function normalizeAttributionContributionReview(payload) {
-  const required = telemetryV11RequiredConsent();
+  const successor = payload?.schemaVersion === "local-incremental-contribution-review-v1.2";
+  const required = (successor ? telemetryV12RequiredConsent : telemetryV11RequiredConsent)();
   const consent = payload?.consent;
   const inventory = payload?.inventory;
   const fields = inventory?.fields;
@@ -906,7 +909,7 @@ export function normalizeAttributionContributionReview(payload) {
   try { destination = new URL(consent?.destinationOrigin); } catch { return null; }
   const loopback = destination.protocol === "http:"
     && ["localhost", "127.0.0.1", "[::1]"].includes(destination.hostname);
-  if (payload?.schemaVersion !== "local-incremental-contribution-review-v1.1" || payload.status !== "ready"
+  if ((!successor && payload?.schemaVersion !== "local-incremental-contribution-review-v1.1") || payload.status !== "ready"
       || payload.includesContent !== false || payload.includesPaths !== false
       || payload.includesAccountIdentifiers !== false || payload.includesCredentials !== false
       || !/^[A-Za-z0-9_-]{43}$/u.test(payload.reviewToken ?? "")
@@ -914,7 +917,7 @@ export function normalizeAttributionContributionReview(payload) {
       || (destination.protocol !== "https:" && !loopback) || destination.origin !== consent.destinationOrigin
       || !consent || Object.keys(consent).length !== 4
       || Object.entries(required).some(([key, value]) => consent[key] !== value || inventory?.consent?.[key] !== value)
-      || inventory?.schemaVersion !== "telemetry-field-inventory-v1.1"
+      || inventory?.schemaVersion !== (successor ? "telemetry-field-inventory-v1.2" : "telemetry-field-inventory-v1.1")
       || !/^[0-9a-f]{64}$/u.test(inventory.inventoryDigest ?? "")
       || !fields || Object.keys(fields).length !== 4
       || ["usage", "quota", "session", "accountPlanAttribution"].some((stream) =>
@@ -940,6 +943,118 @@ export function normalizeAttributionContributionReview(payload) {
       recordCounts: Object.freeze(Object.fromEntries(["usage", "quota", "session"]
         .map((stream) => [stream, payload.sample.recordCounts[stream]]))) }),
     hostedConsentCurrent: payload.hostedConsentCurrent,
+  });
+}
+
+const PERFORMANCE_SPEED_METHODS = Object.freeze(["receipt", "tool_free"]);
+const PERFORMANCE_METHOD_VERSION = "performance-daily-histogram-v1";
+const PERFORMANCE_SCOPE = "model-performance-daily";
+const PERFORMANCE_RECORD_SCHEMA_VERSION = "model-performance-daily-v1";
+const PERFORMANCE_FIELD_DICTIONARY_VERSION = "telemetry-performance-registry-2026-09-21.1";
+const PERFORMANCE_PRIVACY_CONTRACT_VERSION = "privacy-safe-model-performance-v1";
+
+function performanceOrigin(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = new URL(value);
+    if (!parsed.origin || !["http:", "https:"].includes(parsed.protocol)
+        || parsed.origin !== value) return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+function performanceBinding(value) {
+  const destinationOrigin = performanceOrigin(value?.destinationOrigin);
+  if (destinationOrigin === null
+      || !hasExactKeys(value, [
+        "destinationOrigin", "fieldDictionaryVersion", "methodVersion",
+        "privacyContractVersion", "scope", "stream", "supportedSpeedMethods",
+      ])
+      || value.destinationOrigin !== destinationOrigin
+      || value.fieldDictionaryVersion !== PERFORMANCE_FIELD_DICTIONARY_VERSION
+      || value.methodVersion !== PERFORMANCE_METHOD_VERSION
+      || value.privacyContractVersion !== PERFORMANCE_PRIVACY_CONTRACT_VERSION
+      || value.scope !== PERFORMANCE_SCOPE
+      || value.stream !== PERFORMANCE_SCOPE
+      || JSON.stringify(value.supportedSpeedMethods) !== JSON.stringify(PERFORMANCE_SPEED_METHODS)) {
+    return null;
+  }
+  return Object.freeze({
+    ...value,
+    supportedSpeedMethods: Object.freeze([...PERFORMANCE_SPEED_METHODS]),
+  });
+}
+
+export function normalizeTelemetryPerformanceReview(payload) {
+  const required = {
+    schemaVersion: PERFORMANCE_RECORD_SCHEMA_VERSION,
+    fieldDictionaryVersion: PERFORMANCE_FIELD_DICTIONARY_VERSION,
+    privacyContractVersion: PERFORMANCE_PRIVACY_CONTRACT_VERSION,
+    scope: PERFORMANCE_SCOPE,
+  };
+  const binding = performanceBinding(payload?.binding);
+  if (payload?.schemaVersion !== "local-telemetry-performance-review-v1"
+      || payload.status !== "ready"
+      || !/^[A-Za-z0-9_-]{43}$/u.test(payload.reviewToken ?? "")
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(payload.grantDeviceId ?? "")
+      || !hasExactKeys(payload.consent, Object.keys(required))
+      || Object.entries(required).some(([key, value]) => payload.consent[key] !== value)
+      || binding === null
+      || payload.grantDeviceId === ""
+      || payload.includesContent !== false
+      || payload.includesPaths !== false
+      || payload.includesIdentifiers !== false
+      || payload.includesCredentials !== false
+      || !payload.sample || payload.sample.status !== "available"
+      || !INCREMENTAL_SYNC_DAY_PATTERN.test(payload.sample.day ?? "")
+      || payload.sample.recordCount !== null
+      || payload.sample.content !== false) return null;
+  return Object.freeze({
+    reviewToken: payload.reviewToken,
+    grantDeviceId: payload.grantDeviceId,
+    consent: Object.freeze({ ...required }),
+    binding,
+    sample: Object.freeze({ ...payload.sample }),
+  });
+}
+
+export function normalizeTelemetryPerformanceStatus(payload) {
+  const unavailable = Object.freeze({
+    configured: false,
+    destinationOrigin: null,
+    supportedSpeedMethods: Object.freeze([]),
+    consent: Object.freeze({ approved: false, current: false, approvedAt: null }),
+    scheduler: Object.freeze({ state: "off", lastAcceptedAt: null, nextAttemptAt: null }),
+  });
+  const destinationOrigin = performanceOrigin(payload?.destinationOrigin);
+  if (payload?.schemaVersion !== "local-telemetry-performance-status-v1"
+      || typeof payload.configured !== "boolean"
+      || (payload.destinationOrigin !== null && destinationOrigin === null)
+      || JSON.stringify(payload.supportedSpeedMethods) !== JSON.stringify(PERFORMANCE_SPEED_METHODS)
+      || !payload.consent || typeof payload.consent.approved !== "boolean"
+      || typeof payload.consent.current !== "boolean"
+      || (payload.consent.approvedAt !== null && !Number.isFinite(Date.parse(payload.consent.approvedAt)))
+      || !payload.scheduler || !["off", "up_to_date", "retry_wait", "paused"].includes(payload.scheduler.state)
+      || (payload.scheduler.lastAcceptedAt !== null && !Number.isFinite(Date.parse(payload.scheduler.lastAcceptedAt)))
+      || (payload.scheduler.nextAttemptAt !== null && !Number.isFinite(Date.parse(payload.scheduler.nextAttemptAt)))) {
+    return unavailable;
+  }
+  return Object.freeze({
+    configured: payload.configured,
+    destinationOrigin,
+    supportedSpeedMethods: Object.freeze([...PERFORMANCE_SPEED_METHODS]),
+    consent: Object.freeze({
+      approved: payload.consent.approved,
+      current: payload.consent.current,
+      approvedAt: payload.consent.approvedAt,
+    }),
+    scheduler: Object.freeze({
+      state: payload.scheduler.state,
+      lastAcceptedAt: payload.scheduler.lastAcceptedAt,
+      nextAttemptAt: payload.scheduler.nextAttemptAt,
+    }),
   });
 }
 
@@ -6849,9 +6964,10 @@ export class LocalCompanionClient {
     });
   }
 
-  async reviewAttributionContribution() {
+  async reviewAttributionContribution(contractVersion = TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION) {
+    if (![TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION].includes(contractVersion)) throw new TypeError("Unsupported contribution review.");
     const review = normalizeAttributionContributionReview(
-      await this.localContributionMutation("incremental-review-v11"),
+      await this.localContributionMutation(contractVersion === TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION ? "incremental-review-v12" : "incremental-review-v11"),
     );
     if (review === null) throw new Error("Attribution review is unavailable.");
     return review;
@@ -6864,6 +6980,36 @@ export class LocalCompanionClient {
     });
   }
 
+  async telemetryPerformanceStatus() {
+    try {
+      return normalizeTelemetryPerformanceStatus(await fetchJson(
+        this.fetchImpl, `${LOCAL_ROOT}/performance/status`, { cache: "no-store" },
+      ));
+    } catch {
+      return normalizeTelemetryPerformanceStatus(null);
+    }
+  }
+
+  async reviewTelemetryPerformance() {
+    const review = normalizeTelemetryPerformanceReview(
+      await this.localPerformanceMutation("review"),
+    );
+    if (review === null) throw new Error("Telemetry performance review is unavailable.");
+    return review;
+  }
+
+  approveTelemetryPerformance(review) {
+    if (!review || typeof review !== "object") {
+      throw new TypeError("Telemetry performance approval requires a review.");
+    }
+    return this.localPerformanceMutation("approve", {
+      reviewToken: review.reviewToken,
+      consent: review.consent,
+      binding: review.binding,
+      grantDeviceId: review.grantDeviceId,
+    });
+  }
+
   localContributionMutation(path, body = {}) {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/contribution/${path}`, {
       method: "POST",
@@ -6872,6 +7018,20 @@ export class LocalCompanionClient {
         "X-Usage-Monitor-Local": "1"
       },
       body: JSON.stringify(body)
+    });
+  }
+
+  localPerformanceMutation(path, body = {}) {
+    if (!["review", "approve"].includes(path)) {
+      throw new TypeError("Unsupported local performance mutation.");
+    }
+    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/performance/${path}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+      },
+      body: JSON.stringify(body),
     });
   }
 
@@ -7048,12 +7208,33 @@ export class CommunityClient {
   }
 
   grantAttributionContribution(review) {
-    const consent = telemetryV11RequiredConsent();
+    const successor = review?.consent?.telemetrySchemaVersion === TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION;
+    const consent = (successor ? telemetryV12RequiredConsent : telemetryV11RequiredConsent)();
     if (!review || Object.entries(consent).some(([key, value]) => review.consent?.[key] !== value)
         || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(review.grantDeviceId ?? "")) {
       throw new TypeError("Attribution consent requires a reviewed device target.");
     }
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/device-telemetry-consents`, this.mutationOptions({
+    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/${successor ? "device-telemetry-v12-consents" : "device-telemetry-consents"}`, this.mutationOptions({
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId: review.grantDeviceId, consent, ongoingUpload: true }),
+    }));
+  }
+
+  grantTelemetryPerformanceContribution(review) {
+    const consent = {
+      schemaVersion: PERFORMANCE_RECORD_SCHEMA_VERSION,
+      fieldDictionaryVersion: PERFORMANCE_FIELD_DICTIONARY_VERSION,
+      privacyContractVersion: PERFORMANCE_PRIVACY_CONTRACT_VERSION,
+      scope: PERFORMANCE_SCOPE,
+    };
+    if (!review
+        || !review.binding
+        || Object.entries(consent).some(([key, value]) => review.consent?.[key] !== value)
+        || performanceBinding(review.binding) === null
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(review.grantDeviceId ?? "")) {
+      throw new TypeError("Telemetry performance consent requires a reviewed device target.");
+    }
+    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/device-telemetry-performance-consents`, this.mutationOptions({
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ deviceId: review.grantDeviceId, consent, ongoingUpload: true }),
     }));

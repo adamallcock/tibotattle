@@ -6,6 +6,7 @@ import { ApiError } from "./errors";
 import { finishParticipantDeletion } from "./repository";
 import { telemetryV1ChunkR2KeyPage } from "./telemetry-v1-repository";
 import { telemetryV11ChunkR2KeyPage } from "./telemetry-v11-repository";
+import { telemetryV12ChunkR2KeyPage } from "./telemetry-v12-repository";
 import { QUARANTINE_RETENTION_MILLISECONDS } from "./constants";
 
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
@@ -490,6 +491,14 @@ async function suppressRestoredParticipant(
     chunkPages += 1;
     if (chunkPages > MAX_LIFECYCLE_ROWS / 100) throw new ApiError(503, "LIFECYCLE_BOUNDS_EXCEEDED");
   } while (stagedCursor);
+  let successorCursor: { createdAt: string; chunkRowId: string } | null = null;
+  do {
+    const page = await telemetryV12ChunkR2KeyPage(db, participantId, successorCursor);
+    if (page.rows.length > 0) await quarantine.delete(page.rows.map((row) => row.r2Key));
+    successorCursor = page.nextCursor;
+    chunkPages += 1;
+    if (chunkPages > MAX_LIFECYCLE_ROWS / 100) throw new ApiError(503, "LIFECYCLE_BOUNDS_EXCEEDED");
+  } while (successorCursor);
   const participant = await db.prepare(
     `SELECT identity_link_key
        FROM participants

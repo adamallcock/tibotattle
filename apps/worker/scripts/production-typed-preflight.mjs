@@ -100,7 +100,7 @@ function validateExpectedSchemas(expectedSchemas) {
     if (!Array.isArray(optionalObjects) || optionalObjects.length > 4096) return 'EXPECTED_SCHEMAS_INVALID';
     if (expected.restoredSchemaSha256 !== undefined
         && (role !== 'primary' || !optionalObjects.length || !Array.isArray(expected.restoredSchemaSha256)
-          || expected.restoredSchemaSha256.length < 1 || expected.restoredSchemaSha256.length > 2
+          || expected.restoredSchemaSha256.length < 1 || expected.restoredSchemaSha256.length > 3
           || !expected.restoredSchemaSha256.every(value => typeof value === 'string' && SHA256.test(value)))) return 'EXPECTED_SCHEMAS_INVALID';
     for (const objectDescriptor of optionalObjects) {
       if (!exactKeys(objectDescriptor, ['type', 'name', 'tbl_name', 'sql'])

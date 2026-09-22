@@ -139,6 +139,12 @@ describe('cross-store physical erasure completion',()=>{
    target().prepare('INSERT INTO analytics_community_daily_publications VALUES(?,?,?,?,?,?,?,?)').bind(sourceId,today(),1,d,authority,'{}',d,new Date().toISOString()),
    target().prepare('INSERT INTO analytics_community_model_publications VALUES(?,?,?,?,?,?,?,?,?)').bind(sourceId,today(),1,'synthetic',d,authority,'{}',d,Date.now()),
    target().prepare('INSERT INTO analytics_community_graph_previews VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)').bind(sourceId,1,'synthetic',d,authority,1,'{}',d,new Date().toISOString(),JSON.parse(authority).publicAuthorityEpoch,1,Date.now(),Date.now()),
+   target().prepare(`INSERT INTO analytics_cache_retention_day_progress
+    (progress_key,source_id,source_layout,source_namespace,owner_digest,device_id,manifest_id,
+     manifest_digest,day,method_version,carry_digest,progress_revision,state_json,state_digest)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+     'e'.repeat(64),sourceId,'effective',sourceNamespace,o,'effective-owner','effective-owner-day',
+     d,today(),'cache-retention-v2',d,1,'{}',d),
   ]);
   const key={sourceId,ownerDigest:o,day:'2026-09-05',dependencyDigest:d,sourceNamespace,method:'synthetic-history'};
   const identity={participantId:'synthetic-history-participant',inputFingerprint:d,sourceMethodVersion:MODEL_HISTORY_METHOD_VERSION,
@@ -151,7 +157,8 @@ describe('cross-store physical erasure completion',()=>{
   await drain();await requireStorageParticipantErasureComplete(b.DELETION_LEDGER,f.participantId,bindings());
   for(const table of ['analytics_v1_chunk_values','analytics_v11_projection_work','analytics_v11_value_pages','analytics_v11_reusable_values',
    'analytics_community_graph_results','analytics_community_graph_execution','analytics_history_checkpoint_stages','analytics_history_checkpoint_parts',
-   'analytics_community_daily_owners','analytics_community_daily_publications','analytics_community_model_publications','analytics_community_graph_previews'])expect(await count(table),table).toBe(0);
+   'analytics_community_daily_owners','analytics_community_daily_publications','analytics_community_model_publications','analytics_community_graph_previews',
+   'analytics_cache_retention_day_progress'])expect(await count(table),table).toBe(0);
   expect(await count('analytics_storage_erasure_receipts')).toBe(1);expect(await count('analytics_storage_erasure_fences')).toBe(1);
   await expect(saveStorageHistoryCheckpoint({target:target(),key,checkpoint,expectedHead:null})).rejects.toThrow();
   await expect(target().prepare('INSERT INTO analytics_community_graph_execution VALUES(?,?,?,?,?)').bind(sourceId,o,today(),d,'checkpoint').run()).rejects.toThrow('storage_owner_erased');

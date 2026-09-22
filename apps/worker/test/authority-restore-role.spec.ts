@@ -16,7 +16,8 @@ import { bootstrapV11StorageHead } from '../src/v11-storage-journal';
 import { prepareAuthorityRoleTarget } from '../src/authority-restore-role';
 import { AUTHORITY_OPERATOR_LEDGER_SQL,authoritySchemaInventory, authoritySchemaDigest, authorityRestoreContractDigest, authorityRestoreRetainedTableNames,
  freezeAuthorityRestoreSource,beginAuthorityRestore,copyAuthorityPage,copyAuthorityTypedPage,adoptAuthorityTypedPage,
- sealAuthorityRestore,verifyAuthorityTypedPage,completeAuthorityVerification,finalizeAuthorityRestore,promoteAuthorityRestore,type AuthorityRestoreContract } from '../src/authority-restore';
+ sealAuthorityRestore,verifyAuthorityTypedPage,completeAuthorityVerification,finalizeAuthorityRestore,promoteAuthorityRestore,
+ TELEMETRY_USAGE_CORRECTION_SCHEMA_OBJECTS,type AuthorityRestoreContract } from '../src/authority-restore';
 const b=env as Env&{STORAGE_INGESTION_A:D1Database;STORAGE_INGESTION_B:D1Database;TEST_MIGRATIONS:D1Migration[];TEST_TYPED_INGESTION_MIGRATIONS:D1Migration[];TEST_INGESTION_BRIDGE_MIGRATIONS:D1Migration[];TEST_TYPED_V11_ADMISSION_MIGRATIONS:D1Migration[];TEST_TYPED_V1_ADMISSION_MIGRATIONS:D1Migration[];TEST_INGESTION_ISOLATION_MIGRATIONS:D1Migration[]};
 const source=()=>b.USAGE_MONITOR_DB,target=()=>b.STORAGE_INGESTION_A,reference=()=>b.STORAGE_INGESTION_B;
 const today=()=>new Date().toISOString().slice(0,10);
@@ -63,8 +64,43 @@ async function prepare(withV1=false){
  const contract:AuthorityRestoreContract={targetOperatorLedgerDigest:await sha256Hex(canonicalTelemetryV11Json(ledgerRows)),version:'authority-restore-v1',runId:'synthetic-real-role',sourceId:'synthetic-restored-journal',sourceNamespace,sourceSnapshotDigest,sourceSchema,sourceSchemaDigest:await authoritySchemaDigest(sourceSchema),targetBaseSchema:role.baseSchema,targetBaseSchemaDigest:await authoritySchemaDigest(role.baseSchema),tables,finalSchema:role.finalSchema,finalSchemaDigest:await authoritySchemaDigest(role.finalSchema),typedCopies:['v1','v11'].map(format=>({runId:`restore-${format}`,sourceNamespace,sourceSnapshotDigest,format:format as 'v1'|'v11'})),authoritySequences,admissionContract:'typed-v1-v11-restore-v1',operatingLimitBytes:64*1024*1024};
  return {fixture,records,original,legacyChunk,contract,pin:await authorityRestoreContractDigest(contract)};
 }
+async function contractWithCorrectionSourceSchema(contract:AuthorityRestoreContract,names:readonly string[]) {
+ const wanted=new Set(names),objects=contract.finalSchema.filter(object=>wanted.has(object.name));
+ if(objects.length!==wanted.size)throw new Error('Synthetic correction schema fixture is incomplete');
+ const sourceSchema=[...contract.sourceSchema,...objects],next={...contract,sourceSchema,sourceSchemaDigest:await authoritySchemaDigest(sourceSchema)};
+ return {contract:next,pin:await authorityRestoreContractDigest(next)};
+}
 async function drain(step:()=>Promise<boolean>){for(let n=0;n<256;n++)if(await step())return;throw new Error('Synthetic bounded operation did not complete');}
 describe('actual baseline to typed ingestion role',()=>{
+ it('refuses a complete correction source before freeze or restore staging writes',async()=>{
+  const f=await prepare();
+  const qualified=await contractWithCorrectionSourceSchema(f.contract,TELEMETRY_USAGE_CORRECTION_SCHEMA_OBJECTS);
+  await expect(beginAuthorityRestore(source(),target(),qualified.contract,qualified.pin)).rejects.toThrow('AUTHORITY_RESTORE_TYPED_CORRECTION_UNQUALIFIED');
+  await expect(freezeAuthorityRestoreSource(source(),qualified.contract,qualified.pin)).rejects.toThrow('AUTHORITY_RESTORE_TYPED_CORRECTION_UNQUALIFIED');
+  expect(await source().prepare("SELECT 1 FROM sqlite_master WHERE name='_authority_snapshot'").first()).toBeNull();
+  expect(await source().prepare("SELECT count(*) n FROM sqlite_master WHERE type='trigger' AND name GLOB '_authority_freeze_*'").first('n')).toBe(0);
+  expect(await target().prepare("SELECT 1 FROM sqlite_master WHERE name='_authority_restore_run'").first()).toBeNull();
+ });
+ it('rejects a view-only correction source directly in authority restore validation',async()=>{
+  const f=await prepare();
+  const qualified=await contractWithCorrectionSourceSchema(f.contract,['telemetry_usage_correction_effective_facts']);
+  await expect(freezeAuthorityRestoreSource(source(),qualified.contract,qualified.pin)).rejects.toThrow('AUTHORITY_RESTORE_TYPED_CORRECTION_UNQUALIFIED');
+  expect(await source().prepare("SELECT 1 FROM sqlite_master WHERE name='_authority_snapshot'").first()).toBeNull();
+ });
+ it('rejects a partial correction source directly in authority restore validation',async()=>{
+  const f=await prepare();
+  const qualified=await contractWithCorrectionSourceSchema(f.contract,['telemetry_usage_correction_runtime']);
+  await expect(freezeAuthorityRestoreSource(source(),qualified.contract,qualified.pin)).rejects.toThrow('AUTHORITY_RESTORE_TYPED_CORRECTION_UNQUALIFIED');
+  expect(await source().prepare("SELECT 1 FROM sqlite_master WHERE name='_authority_snapshot'").first()).toBeNull();
+ });
+ it('keeps the TypeScript correction inventory equal to migration 0006',async()=>{
+  const migration=b.TEST_INGESTION_ISOLATION_MIGRATIONS.find(item=>item.name==='0006_usage_correction_facts.sql');
+  expect(migration).toBeDefined();
+  const sql=migration!.queries.join('\n');
+  const names=[...sql.matchAll(/\bCREATE\s+(?:UNIQUE\s+)?(?:TABLE|VIEW|INDEX|TRIGGER)\s+(?:"([A-Za-z_][A-Za-z0-9_]*)"|([A-Za-z_][A-Za-z0-9_]*))/gi)]
+   .map(match=>match[1]??match[2]).filter((name):name is string=>typeof name==='string'&&name.startsWith('telemetry_usage_correction_')).sort();
+  expect(names).toEqual([...TELEMETRY_USAGE_CORRECTION_SCHEMA_OBJECTS].sort());
+ });
  it('preserves a real accepted head and credentials, adopts typed history and accepts an ordinary successor',async()=>{
   const f=await prepare(true);
   const {targetOperatorLedgerDigest:excluded,...missing}=f.contract;void excluded;await expect(freezeAuthorityRestoreSource(source(),missing,await authorityRestoreContractDigest(missing))).rejects.toThrow();
@@ -79,6 +115,9 @@ describe('actual baseline to typed ingestion role',()=>{
   await drain(async()=>(await copyAuthorityPage(source(),target(),f.contract,f.pin,'verify')).state==='complete');
   for(const format of ['v1','v11'] as const){await drain(async()=>(await verifyAuthorityTypedPage(source(),target(),f.contract,f.pin,format)).reachedEnd);await drain(async()=>(await adoptAuthorityTypedPage(source(),target(),f.contract,f.pin,format,true)).done);}
   await completeAuthorityVerification(source(),target(),f.contract,f.pin);await promoteAuthorityRestore(source(),target(),f.contract,f.pin);await finalizeAuthorityRestore(source(),target(),f.contract,f.pin);
+  expect(await target().prepare('SELECT id,schema_version,method_version,state,max_capture_rows,max_history_page FROM telemetry_usage_correction_runtime').first()).toEqual({
+   id:1,schema_version:'telemetry-usage-correction-v1',method_version:'usage-total-correction-v1',state:'staged',max_capture_rows:200,max_history_page:200,
+  });
   expect(await target().prepare('SELECT id,used_percent,record_json FROM telemetry_records').first()).toEqual({id:41,used_percent:0.30000000000000004,record_json:'{"synthetic":true,"value":0.30000000000000004}'});
   expect(await target().prepare('SELECT count(*) n FROM telemetry_contribution_occurrences').first('n')).toBe(1);
   expect(await target().prepare("SELECT state FROM upload_authorizations WHERE consumed_contribution_id IS NOT NULL").first('state')).toBe('consumed');

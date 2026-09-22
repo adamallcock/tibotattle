@@ -10,6 +10,7 @@ import {retireStorageGraphPage} from './storage-graph-retirement';
 import {retireGraphDayProjectionPage} from './graph-day-projection';
 import {retireStorageCommunityDailyPage} from './storage-community-daily';
 import {retireStorageCommunityGraphPublications} from './storage-community-graph-publication';
+import {retireCacheRetentionDayPage} from './cache-retention-day';
 import type {StorageAnalyticsBindings} from './analytics-delivery';
 export type StorageErasureBindings=StorageAnalyticsBindings&{ledger:D1Database};
 interface Job {participant_digest:string;source_id:string;owner_digest:string;source_namespace:string;
@@ -49,7 +50,21 @@ export async function prepareStorageParticipantErasure(b:StorageErasureBindings,
  .bind(participantDigest,b.sourceId,link.owner_digest).first<Job>();
  if(!job||job.source_namespace!==b.sourceNamespace||job.state!=='pending')throw unavailable();
 }
-const payloadAbsence=`
+const CACHE_RETENTION_ERASURE_TABLES = Object.freeze([
+ 'analytics_cache_retention_day_marks','analytics_cache_retention_day_carry',
+ 'analytics_cache_retention_day_values','analytics_cache_retention_day_bands',
+ 'analytics_cache_retention_day_progress',
+]);
+async function cacheRetentionErasureTables(target:D1Database):Promise<readonly string[]> {
+ const rows=(await target.prepare(`SELECT name FROM sqlite_schema
+   WHERE type='table' AND name IN (${CACHE_RETENTION_ERASURE_TABLES.map(()=>'?').join(',')})`)
+   .bind(...CACHE_RETENTION_ERASURE_TABLES).all<{name:string}>()).results;
+ const present=new Set(rows.map(row=>row.name));
+ const required=CACHE_RETENTION_ERASURE_TABLES.slice(0,4);
+ if (present.size>0 && required.some(name=>!present.has(name))) throw unavailable();
+ return Object.freeze(CACHE_RETENTION_ERASURE_TABLES.filter(name=>present.has(name)));
+}
+const payloadAbsence=(cacheTables:readonly string[]=[]):string=>`
  NOT EXISTS(SELECT 1 FROM analytics_v1_chunk_values WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_v11_projection_work WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_v11_reusable_values WHERE source_id=?1 AND owner_digest=?2)
@@ -66,13 +81,15 @@ const payloadAbsence=`
  AND NOT EXISTS(SELECT 1 FROM analytics_community_model_publications WHERE source_id=?1
    AND COALESCE(json_extract(authority_json,'$.publicAuthorityEpoch'),-1)<?4)
  AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_previews WHERE source_id=?1
-   AND COALESCE(json_extract(authority_json,'$.publicAuthorityEpoch'),-1)<?4)`;
-async function readCompletion(b:StorageErasureBindings,job:Job,change:StorageChange):Promise<boolean>{
+   AND COALESCE(json_extract(authority_json,'$.publicAuthorityEpoch'),-1)<?4)
+ ${cacheTables.map(table=>` AND NOT EXISTS(SELECT 1 FROM ${table} WHERE source_id=?1 AND owner_digest=?2)`).join('\n')}`;
+async function readCompletion(b:StorageErasureBindings,job:Job,change:StorageChange,
+ cacheTables:readonly string[]=[]):Promise<boolean>{
  return !!await b.target.prepare(`SELECT 1 AS complete FROM analytics_storage_erasure_receipts r
  JOIN analytics_storage_erasure_fences f ON f.source_id=r.source_id AND f.owner_digest=r.owner_digest
   AND f.terminal_event_digest=r.terminal_event_digest
  WHERE r.source_id=?1 AND r.owner_digest=?2 AND r.terminal_event_digest=?3 AND r.payload_contract=1
-  AND f.public_authority_epoch=?4 AND ${payloadAbsence}`)
+  AND f.public_authority_epoch=?4 AND ${payloadAbsence(cacheTables)}`)
   .bind(b.sourceId,job.owner_digest,change.eventDigest,change.publicAuthorityEpoch).first();
 }
 function terminal(value:unknown,job:Job):StorageChange{
@@ -90,6 +107,7 @@ async function advanceJob(b:StorageErasureBindings,job:Job):Promise<boolean>{
  const ready=await b.target.prepare('SELECT source_namespace,contract_version FROM analytics_runtime_sources WHERE source_id=?')
   .bind(b.sourceId).first<{source_namespace:string;contract_version:number}>();
  if(!ready||ready.source_namespace!==b.sourceNamespace||ready.contract_version!==1)throw unavailable();
+ const cacheTables=await cacheRetentionErasureTables(b.target);
  const current=await b.source.prepare(`SELECT c.sequence FROM storage_owner_revisions r
  JOIN storage_ingestion_changes c ON c.owner_digest=r.owner_digest AND c.revision=r.revision
  WHERE r.owner_digest=? AND r.state='erased' AND c.kind='owner-erased'`).bind(job.owner_digest).first<{sequence:number}>();
@@ -133,11 +151,12 @@ async function advanceJob(b:StorageErasureBindings,job:Job):Promise<boolean>{
  await retireGraphDayProjectionPage(b.target,b.sourceId);
  await retireStorageCommunityDailyPage(b);
  await retireStorageCommunityGraphPublications(b);
+ if(cacheTables.length>0) await retireCacheRetentionDayPage(b.target,b.sourceId);
  await b.target.prepare(`INSERT INTO analytics_storage_erasure_receipts(source_id,owner_digest,terminal_event_digest,payload_contract)
  SELECT ?1,?2,?3,1 WHERE EXISTS(SELECT 1 FROM analytics_storage_erasure_fences
- WHERE source_id=?1 AND owner_digest=?2 AND terminal_event_digest=?3 AND public_authority_epoch=?4) AND ${payloadAbsence}
+ WHERE source_id=?1 AND owner_digest=?2 AND terminal_event_digest=?3 AND public_authority_epoch=?4) AND ${payloadAbsence(cacheTables)}
  ON CONFLICT(source_id,owner_digest) DO NOTHING`).bind(b.sourceId,job.owner_digest,change.eventDigest,change.publicAuthorityEpoch).run();
- const complete=await readCompletion(b,job,change);
+ const complete=await readCompletion(b,job,change,cacheTables);
  if(!complete)return false;
  await b.ledger.prepare(`UPDATE storage_erasure_jobs SET state='complete',completed_at=?
  WHERE participant_digest=? AND source_id=? AND owner_digest=? AND terminal_json=?`).bind(new Date().toISOString(),job.participant_digest,b.sourceId,job.owner_digest,json).run();

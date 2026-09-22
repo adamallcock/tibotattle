@@ -22,7 +22,18 @@ export function createModelPerformanceController({ directory, codexHome,
   const workerDirectory = timingRoot === undefined ? directory : join(timingRoot, `source-${sourceScope}`);
   let worker = null, idle = null, closed = false, failedAt = 0, stopping = null;
   let restoration = null, writing = null, pending = null;
-  let lastPersistedAt = null, revision = 0, savedRevision = -1;
+  let performanceRequest = 0;
+  const performanceWaiters = new Map();
+  let lastPersistedAt = null, revision = 0, savedRevision = -1, sourceRevision = null;
+  function invalidateCachedProjection(nextSourceRevision) {
+    if (sourceRevision === nextSourceRevision) return false;
+    sourceRevision = nextSourceRevision;
+    // A replay can remove a previously emitted turn or invalidate its timing.
+    // Do not serve the old complete projection while the worker rebuilds; the
+    // next validated snapshot repopulates both caches.
+    complete.clear(); cache.clear(); revision++; savedRevision = -1;
+    return true;
+  }
   const empty = (period, status) => ({ schemaVersion: 4, method: 5, status, collecting: false, stale: false,
     updatedAt: null, period, interval: 'day', start: null, end: Date.now(), historyProgress: null, models: [] });
   function restore() {
@@ -78,6 +89,11 @@ export function createModelPerformanceController({ directory, codexHome,
   function fail() {
     failedAt = Date.now();
     for (const [period, value] of cache) cache.set(period, { ...value, collecting: false, stale: true });
+    for (const [requestId, waiter] of performanceWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error('model_performance_unavailable'));
+      performanceWaiters.delete(requestId);
+    }
   }
   function scheduleIdleStop() {
     clearTimeout(idle);
@@ -114,7 +130,30 @@ export function createModelPerformanceController({ directory, codexHome,
       for (const [period, value] of complete) cache.set(period, { ...value, collecting: true, historyProgress: null });
       current.on('message', message => {
         if (closed || worker !== current) return;
+        if (message?.type === 'performance-report' && typeof message.requestId === 'string') {
+          const waiter = performanceWaiters.get(message.requestId);
+          if (!waiter) return;
+          performanceWaiters.delete(message.requestId);
+          clearTimeout(waiter.timer);
+          waiter.resolve(message.report);
+          return;
+        }
+        if (message?.type === 'performance-unavailable' && typeof message.requestId === 'string') {
+          const waiter = performanceWaiters.get(message.requestId);
+          if (!waiter) return;
+          performanceWaiters.delete(message.requestId);
+          clearTimeout(waiter.timer);
+          waiter.reject(new Error('model_performance_unavailable'));
+          return;
+        }
+        if (message?.type === 'invalidate' && typeof message.revision === 'string') {
+          invalidateCachedProjection(message.revision);
+          return;
+        }
         if (message?.type === 'snapshots' && Array.isArray(message.values)) {
+          if (typeof message.revision === 'string' && sourceRevision !== null
+              && sourceRevision !== message.revision) invalidateCachedProjection(message.revision);
+          if (typeof message.revision === 'string') sourceRevision = message.revision;
           if (message.values.length > MAX_WINDOWS + PERIODS.length) { fail(); return; }
           const entries = message.values.map(readModelPerformanceSnapshotEntry);
           if (entries.some(value => value === null)
@@ -141,6 +180,11 @@ export function createModelPerformanceController({ directory, codexHome,
       current.on('exit', code => {
         if (worker === current) {
           worker = null;
+          for (const [requestId, waiter] of performanceWaiters) {
+            clearTimeout(waiter.timer);
+            waiter.reject(new Error('model_performance_unavailable'));
+            performanceWaiters.delete(requestId);
+          }
           if (code !== 0) fail();
         }
       });
@@ -173,8 +217,37 @@ export function createModelPerformanceController({ directory, codexHome,
       scheduleIdleStop();
       return cache.get(key) ?? fallback(failedAt ? 'unavailable' : 'loading');
     },
+    async preparePerformanceDay({ day, provider = 'openai_codex', nowEpoch = Date.now() } = {}) {
+      if (typeof day !== 'string' || !/^\d{4}-\d{2}-\d{2}$/u.test(day)
+          || provider !== 'openai_codex' || !Number.isSafeInteger(nowEpoch)
+          || nowEpoch < 0 || nowEpoch > Date.now()) {
+        throw new Error('invalid_timing_window');
+      }
+      if (closed) throw new Error('model_performance_unavailable');
+      await restore();
+      if (closed) throw new Error('model_performance_unavailable');
+      start();
+      scheduleIdleStop();
+      const current = worker;
+      if (!current) throw new Error('model_performance_unavailable');
+      const requestId = `performance:${++performanceRequest}`;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          performanceWaiters.delete(requestId);
+          reject(new Error('model_performance_unavailable'));
+        }, 20_000);
+        timer.unref?.();
+        performanceWaiters.set(requestId, { resolve, reject, timer });
+        current.postMessage({ type: 'performance-day', requestId, day, provider, nowEpoch });
+      });
+    },
     async close() {
       closed = true;
+      for (const [requestId, waiter] of performanceWaiters) {
+        clearTimeout(waiter.timer);
+        waiter.reject(new Error('model_performance_unavailable'));
+        performanceWaiters.delete(requestId);
+      }
       await stop();
       await restoration;
       persist(true);

@@ -47,6 +47,7 @@ async function fixture() {
     "community-view.js": "export const communityView = true;\n",
     "community.html": '<!doctype html><script type="module" src="./community.js"></script>\n',
     "community.js": 'import "./install-cta.js";\nconsole.log("community");\n',
+    "dashboard-ui.js": "export const dashboardUi = true;\n",
     "docs.html": "<!doctype html><title>public docs</title>\n",
     "github.svg": "<svg></svg>\n",
     "i18n.generated.js": "export const messages = {};\n",

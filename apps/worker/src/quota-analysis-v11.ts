@@ -109,6 +109,13 @@ export interface V11AnalysisOptions {
    * is skipped; the caller remains responsible for source-pin fences and any
    * resumable checkpoint durability. */
   quotaAcquisition?: V11CompletedQuotaAcquisition;
+  /** Group-complete, owner-fenced pages from the version-neutral reader. */
+  effectiveUsageReader?: {
+    days: readonly string[];
+    readPage(input: { day: string; afterTime: string; afterOccurrence: string }): Promise<{
+      rows: readonly UsageRow[]; complete: boolean;
+    }>;
+  };
   /** Compute the scalar fit half of the usage reduction. Default true.
    *
    * `false` is the model-only mode the v1 historical path already takes
@@ -1412,7 +1419,7 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
   if (!state) {
     if (budget.remainingQueries < 1 || now() >= budget.deadlineMs) throw new Error("v11 usage reduction initialization unavailable");
     budget.remainingQueries -= 1;
-    const selected = await usageDays(db, context);
+    const selected = options.effectiveUsageReader ? [...options.effectiveUsageReader.days] : await usageDays(db, context);
     if (!Array.isArray(selected)) return { version:1,identity:structuredClone(reductionIdentity),days:[], dayIndex:0, cursorTime:context.start,
       cursorOccurrence:"", rowsRead:0, complete:true, commonRefusal:selected.reason,
       scalarReduced, scalarRefusal:null,
@@ -1437,7 +1444,10 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
     if (budget.remainingQueries < 1 || now() >= budget.deadlineMs) break;
     const day = state.days[state.dayIndex]!;
     budget.remainingQueries -= 1;
-    const rows = options.typedSourceNamespace ? await readTypedV11UsageAnalysisPage(db, { sourceNamespace:options.typedSourceNamespace,
+    const effectivePage = options.effectiveUsageReader ? await options.effectiveUsageReader.readPage({
+      day, afterTime: state.cursorTime, afterOccurrence: state.cursorOccurrence,
+    }) : null;
+    const rows = effectivePage ? effectivePage.rows : options.typedSourceNamespace ? await readTypedV11UsageAnalysisPage(db, { sourceNamespace:options.typedSourceNamespace,
       ...(options.generationSnapshot ? { snapshot:options.generationSnapshot,
         fenceSnapshot:!options.generationSnapshotFenced } : { pin }),
       day, from:context.start, to:context.end, afterTime:state.cursorTime, afterOccurrence:state.cursorOccurrence })
@@ -1460,7 +1470,7 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
     }
     if (state.complete) break;
     const pageSize = options.typedSourceNamespace ? TYPED_V11_ANALYSIS_PAGE_SIZE : PAGE_SIZE;
-    if (rows.length < pageSize) {
+    if (effectivePage ? effectivePage.complete : rows.length < pageSize) {
       state.dayIndex += 1;
       state.cursorTime = state.days[state.dayIndex] ? `${state.days[state.dayIndex]}T00:00:00.000Z` : context.end;
       state.cursorOccurrence = "";

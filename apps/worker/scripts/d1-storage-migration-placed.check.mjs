@@ -143,3 +143,15 @@ test('malformed private success JSON cannot leak its text in the front error',as
  await assert.rejects(f.deliver(wake()),error=>error.message==='D1_STORAGE_PRIVATE_EXECUTION_UNCERTAIN');
  assert.equal(f.acks(),0);assert.equal(f.pending.length,0);
 });
+
+test('typed restore front follows the preserved-evidence sequence and refuses legacy stages',async()=>{
+ const sent=[],front=createStorageMigrationFront({contractDigest,executionDigest:contractDigest,expiresAt,contractVersion:'typed-evidence-restore-v1'});
+ let nextStage='seal',acked=0;
+ const env={STORAGE_RESTORE_MODE:'enabled',STORAGE_RESTORE_QUEUE:{send:async next=>sent.push(next)},
+  STORAGE_RESTORE_EXECUTOR:{fetch:async request=>{const body=await request.json();return Response.json({
+   schema:'d1-storage-private-execution-v1',contractDigest,executionDigest:contractDigest,request:body,next:wake(body.message.steps+1,nextStage)});}}};
+ const deliver=stage=>front.queue({messages:[{body:wake(2,stage),ack(){acked++;}}]},env);
+ await deliver('copy-authority');assert.equal(sent[0].stage,'seal');assert.equal(acked,1);
+ nextStage='copy-v1';await assert.rejects(deliver('copy-authority'),/PRIVATE_EXECUTION_UNCERTAIN/);
+ await assert.rejects(deliver('bootstrap'),/PRIVATE_EXECUTION_UNCERTAIN/);assert.equal(acked,1);
+});

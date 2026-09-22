@@ -2515,17 +2515,18 @@ describe("synthetic usage monitor service", () => {
     expect(cacheFailureDiagnostics?.n).toBe(0);
 
     // A stored gauge snapshot rides along; non-numeric values never leave D1.
-    const capturedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const gaugeNow = Date.now();
+    const gaugeCapturedAt = new Date(gaugeNow - 60_000).toISOString();
     await testBindings().USAGE_MONITOR_DB.prepare(
       `INSERT INTO admin_metric_snapshots (captured_at, metrics_json)
        VALUES (?, ?)`,
     ).bind(
-      capturedAt,
+      gaugeCapturedAt,
       JSON.stringify({ bandParticipantCount: 1, smuggled: "text" }),
     ).run();
     expect((await warmAdminMetricsHistoryCache(
       testBindings().USAGE_MONITOR_DB,
-      Date.now(),
+      gaugeNow,
     )).code).toBe("HISTORY_CACHE_REFRESHED");
 
     const history = await api(
@@ -2566,7 +2567,7 @@ describe("synthetic usage monitor service", () => {
       expect(Array.isArray(series.byDay)).toBe(true);
     }
     expect(body.gauges.snapshots).toEqual([{
-      capturedAt,
+      capturedAt: gaugeCapturedAt,
       metrics: { bandParticipantCount: 1 },
     }]);
   });

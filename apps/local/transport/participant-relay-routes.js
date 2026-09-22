@@ -20,6 +20,11 @@ export const PARTICIPANT_RELAY_ROUTE_POLICY = Object.freeze([
   // A successor grant is a separate explicit, CSRF-protected hosted-session
   // action. The device credential must never authorize its own consent.
   defineParticipantRelayRoute("/api/v1/me/device-telemetry-consents", ["POST"]),
+  defineParticipantRelayRoute("/api/v1/me/device-telemetry-v12-consents", ["POST"]),
+  // Performance measurement has its own consent, destination, and fixed
+  // method declaration. It must remain independently reviewable from usage
+  // and successor telemetry consent.
+  defineParticipantRelayRoute("/api/v1/me/device-telemetry-performance-consents", ["POST"]),
 ]);
 
 const PARTICIPANT_RELAY_ROUTES = new Map();

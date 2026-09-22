@@ -580,3 +580,234 @@ export interface TelemetryV11DomainManifest {
 }
 export function parseTelemetryV11DomainManifest(value: unknown): TelemetryV11DomainManifest;
 export function telemetryV11DomainManifestDigestInput(value: TelemetryV11DomainManifest): string;
+
+export const TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION: "telemetry-contribution-v1.2";
+export const TELEMETRY_V12_ENVELOPE_SCHEMA_VERSION: "telemetry-envelope-v1.2";
+export const TELEMETRY_V12_DAY_MANIFEST_SCHEMA_VERSION: "telemetry-day-manifest-v1.2";
+export const TELEMETRY_V12_FIELD_DICTIONARY_VERSION: "telemetry-v1.2-registry-2026-09-20.1";
+export const TELEMETRY_V12_PRIVACY_CONTRACT_VERSION: "ongoing-privacy-safe-telemetry-v1.2";
+export const TELEMETRY_V12_CONTRACT_STATE: "staged";
+export const MAX_TELEMETRY_V12_CHUNK_RECORDS: 200;
+export const MAX_TELEMETRY_V12_CHUNK_CANONICAL_BYTES: 1250000;
+export const MAX_TELEMETRY_V12_DAY_CHUNKS: 4096;
+export const MAX_TELEMETRY_V12_DAY_CANONICAL_BYTES: 64000000;
+export const MAX_TELEMETRY_V12_TIE_ORDER: 819199;
+export const TELEMETRY_V12_STREAMS: readonly ["quota", "session", "usage"];
+export const TELEMETRY_V12_ACCOUNT_BASES: readonly ["same_source", "provisional_marker", "unavailable"];
+export const TELEMETRY_V12_PLAN_BASES: readonly ["same_source_occurrence", "provisional_marker", "conflicted", "unavailable"];
+export type TelemetryV12Stream = typeof TELEMETRY_V12_STREAMS[number];
+export type TelemetryV12AccountBasis = typeof TELEMETRY_V12_ACCOUNT_BASES[number];
+export type TelemetryV12PlanBasis = typeof TELEMETRY_V12_PLAN_BASES[number];
+export interface TelemetryV12Attribution {
+  accountBasis: TelemetryV12AccountBasis;
+  accountTrackId: string | null;
+  planBasis: TelemetryV12PlanBasis;
+  planType: TelemetryPlanType;
+  planEraId: string | null;
+}
+export interface TelemetryV12Consent {
+  telemetrySchemaVersion: typeof TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION;
+  fieldDictionaryVersion: typeof TELEMETRY_V12_FIELD_DICTIONARY_VERSION;
+  privacyContractVersion: typeof TELEMETRY_V12_PRIVACY_CONTRACT_VERSION;
+}
+export interface TelemetryV12UsageEvent {
+  schemaVersion: "usage-event-v1.2";
+  eventId: string;
+  eventTime: string;
+  sessionUuid: string;
+  provider: string;
+  modelId: string;
+  speedMode: string;
+  apiServiceTier: string;
+  surface: string;
+  billingSurface: string;
+  reasoningEffort: string;
+  agentScope: string;
+  outcome: string;
+  totalInputContextTokens: number | null;
+  components: {
+    inputUncachedTokens: number | null;
+    inputCacheReadTokens: number | null;
+    inputCacheWriteTokens: number | null;
+    outputTextTokens: number | null;
+    outputReasoningTokens: number | null;
+    outputCombinedTokens: number | null;
+  };
+  accountPlanAttribution: TelemetryV12Attribution;
+  boundaryFlags: 0 | 1 | 2 | 3 | null;
+  tieOrder: number | null;
+  cacheWriteTtl: {
+    fiveMinuteTokens: number;
+    oneHourTokens: number;
+  } | null;
+}
+export interface TelemetryV12QuotaObservation {
+  schemaVersion: "quota-observation-v1.2";
+  observationId: string;
+  observedTime: string;
+  provider: string;
+  planType: TelemetryPlanType;
+  planVariant: string;
+  limitId: string;
+  slot: string;
+  usedPercent: number | null;
+  windowDurationMinutes: number | null;
+  resetsAt: string | null;
+  accountPlanAttribution: TelemetryV12Attribution;
+}
+export interface TelemetryV12SessionDimension {
+  schemaVersion: "session-dimension-v1.2";
+  sessionUuid: string;
+  firstEventTime: string;
+  provider: string;
+  toolClassCounts: Record<string, number>;
+}
+export type TelemetryV12Record = TelemetryV12UsageEvent | TelemetryV12QuotaObservation | TelemetryV12SessionDimension;
+export interface TelemetryV12Chunk {
+  schemaVersion: typeof TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION;
+  manifestDigest: string;
+  chunkId: string;
+  chunkRevision: 1;
+  chunkDigest: string;
+  parserVersion: string;
+  consent: TelemetryV12Consent;
+  records: TelemetryV12Record[];
+}
+export interface TelemetryV12DayManifest {
+  schemaVersion: typeof TELEMETRY_V12_DAY_MANIFEST_SCHEMA_VERSION;
+  day: string;
+  parserVersion: string;
+  consent: TelemetryV12Consent;
+  chunks: {chunkId: string; chunkDigest: string; recordCount: number}[];
+  excluded: Record<TelemetryV12Stream, number>;
+  manifestDigest: string;
+}
+export interface TelemetryV12Envelope {
+  schemaVersion: typeof TELEMETRY_V12_ENVELOPE_SCHEMA_VERSION;
+  synthetic: false;
+  keyId: string;
+  wrappedKey: string;
+  iv: string;
+  ciphertext: string;
+}
+export function telemetryV12RequiredConsent(): Readonly<TelemetryV12Consent>;
+export function isTelemetryV12ConsentCurrent(value: unknown): value is TelemetryV12Consent;
+export function parseTelemetryV12Attribution(value: unknown): TelemetryV12Attribution;
+export function parseTelemetryV12Record(stream: TelemetryV12Stream, value: unknown): TelemetryV12Record;
+export function parseTelemetryV12ChunkId(value: unknown): {stream: TelemetryV12Stream; day: string; seq: number};
+export function parseTelemetryV12Chunk(value: unknown): TelemetryV12Chunk;
+export function parseTelemetryV12DayManifest(value: unknown): TelemetryV12DayManifest;
+export function validateTelemetryV12DayUsageOrder(day: string, records: readonly TelemetryV12UsageEvent[]): readonly TelemetryV12UsageEvent[];
+export function telemetryV12RecordAnchor(stream: TelemetryV12Stream, record: TelemetryV12Record): {occurrenceId: string; observedAt: string};
+export function canonicalTelemetryV12Json(value: unknown): string;
+export function telemetryV12DayManifestDigestInput(value: TelemetryV12DayManifest): string;
+export function validateTelemetryV12Envelope(value: unknown): TelemetryV12Envelope;
+export const TELEMETRY_V12_DOMAIN_MANIFEST_SCHEMA_VERSION: "telemetry-domain-manifest-v1.2";
+export const MAX_TELEMETRY_V12_DOMAIN_DAYS: 4096;
+export interface TelemetryV12DomainManifest {
+  schemaVersion: typeof TELEMETRY_V12_DOMAIN_MANIFEST_SCHEMA_VERSION;
+  fromDay: string;
+  throughDay: string;
+  predecessor: {token: string; previousGenerationId: string | null; legacyFingerprint: string};
+  days: {day: string; manifestId: string; manifestDigest: string}[];
+  manifestDigest: string;
+}
+export function parseTelemetryV12DomainManifest(value: unknown): TelemetryV12DomainManifest;
+export function telemetryV12DomainManifestDigestInput(value: TelemetryV12DomainManifest): string;
+
+export const PERFORMANCE_RECORD_SCHEMA_VERSION: "model-performance-daily-v1";
+export const PERFORMANCE_MEASUREMENT_VERSION: "model-performance-samples-v1";
+export const PERFORMANCE_BUCKET_SCHEME_VERSION: "performance-histogram-v1";
+export const PERFORMANCE_FIELD_DICTIONARY_VERSION: "telemetry-performance-registry-2026-09-21.1";
+export const PERFORMANCE_PRIVACY_CONTRACT_VERSION: "privacy-safe-model-performance-v1";
+export const PERFORMANCE_CONTRACT_STATE: "staged";
+export const PERFORMANCE_HISTOGRAM_SCHEMA_VERSION: "performance-histogram-v1";
+export const MAX_PERFORMANCE_RECORD_CANONICAL_BYTES: 32768;
+export const MAX_PERFORMANCE_HISTOGRAM_BUCKETS: 61;
+export const MAX_PERFORMANCE_COUNT: 9007199254740991;
+export const MAX_PERFORMANCE_SPEED_CENTI_TOKENS_PER_SECOND: 9007199254740991;
+export const MAX_PERFORMANCE_TURN_DURATION_MILLISECONDS: 9007199254740991;
+export const MAX_PERFORMANCE_TTFT_MILLISECONDS: 9007199254740991;
+export const PERFORMANCE_API_SERVICE_TIERS: readonly [
+  "standard", "priority", "flex", "batch", "unknown", "other", "mixed"
+];
+export const PERFORMANCE_SPEED_METHODS: readonly ["receipt", "legacy", "tool_free", "unavailable"];
+export const PERFORMANCE_SPEED_MODE_SOURCES: readonly [
+  "rollout_thread_settings", "lineage_inherited", "unobserved", "mixed"
+];
+export const PERFORMANCE_SPEED_MODES: readonly [
+  "fast", "standard", "unknown", "other", "mixed"
+];
+export const PERFORMANCE_REASONING_EFFORTS: readonly [
+  "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "unknown"
+];
+export type PerformanceSpeedMethod = typeof PERFORMANCE_SPEED_METHODS[number];
+export type PerformanceReasoningEffort = typeof PERFORMANCE_REASONING_EFFORTS[number];
+export type PerformanceSpeedMode = typeof PERFORMANCE_SPEED_MODES[number];
+export type PerformanceSpeedModeSource = typeof PERFORMANCE_SPEED_MODE_SOURCES[number];
+export type PerformanceApiServiceTier = typeof PERFORMANCE_API_SERVICE_TIERS[number];
+export type PerformanceHistogramMetric = "speed" | "ttft" | "turnDuration";
+export interface PerformanceHistogram {
+  schemaVersion: typeof PERFORMANCE_HISTOGRAM_SCHEMA_VERSION;
+  metric: PerformanceHistogramMetric;
+  sampleCount: number;
+  buckets: Readonly<Record<string, number>>;
+  min: number | null;
+  max: number | null;
+}
+export interface PerformanceHistogramQuantileBand {
+  estimate: number;
+  lower: number;
+  upper: number;
+}
+export interface PerformanceHistogramQuantiles {
+  methodVersion: "performance-histogram-type7-bounds-v1";
+  approximate: true;
+  unit: "tokens_per_second" | "milliseconds";
+  sampleCount: number;
+  p10: PerformanceHistogramQuantileBand | null;
+  p25: PerformanceHistogramQuantileBand | null;
+  median: PerformanceHistogramQuantileBand | null;
+  p75: PerformanceHistogramQuantileBand | null;
+  p90: PerformanceHistogramQuantileBand | null;
+}
+export const PERFORMANCE_HISTOGRAM_SCHEME_VERSION: "performance-histogram-v1";
+export const SPEED_BUCKET_UPPER_CENTI_TPS: readonly number[];
+export const TTFT_BUCKET_UPPER_MS: readonly number[];
+export const TURN_DURATION_BUCKET_UPPER_MS: readonly number[];
+export function buildPerformanceHistogram(
+  metric: PerformanceHistogramMetric,
+  values: readonly number[],
+): PerformanceHistogram;
+export function mergePerformanceHistograms(
+  histograms: readonly PerformanceHistogram[],
+): PerformanceHistogram;
+export function parsePerformanceHistogram(value: unknown): PerformanceHistogram;
+export function performanceHistogramQuantiles(value: unknown): PerformanceHistogramQuantiles;
+export interface TelemetryPerformanceRecord {
+  schemaVersion: typeof PERFORMANCE_RECORD_SCHEMA_VERSION;
+  day: string;
+  provider: string;
+  modelId: string;
+  reasoningEffort: PerformanceReasoningEffort;
+  speedMethod: PerformanceSpeedMethod;
+  speedMode: PerformanceSpeedMode;
+  speedModeSource: PerformanceSpeedModeSource;
+  apiServiceTier: PerformanceApiServiceTier;
+  measurementVersion: typeof PERFORMANCE_MEASUREMENT_VERSION;
+  bucketSchemeVersion: typeof PERFORMANCE_BUCKET_SCHEME_VERSION;
+  turns: number;
+  speedTurns: number;
+  ttftTurns: number;
+  completionTurns: number;
+  timedResponses: number;
+  speedTokens: number;
+  speedDurationMs: number;
+  speedHistogram: PerformanceHistogram;
+  ttftHistogram: PerformanceHistogram;
+  completionHistogram: PerformanceHistogram;
+}
+export function parseTelemetryPerformanceHistogram(value: unknown): PerformanceHistogram;
+export function parseTelemetryPerformanceRecord(value: unknown): TelemetryPerformanceRecord;
+export function canonicalTelemetryPerformanceJson(value: unknown): string;
+export function telemetryPerformanceRowDigestInput(value: TelemetryPerformanceRecord): string;

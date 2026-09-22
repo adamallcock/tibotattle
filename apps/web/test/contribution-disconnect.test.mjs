@@ -110,9 +110,14 @@ function createDisconnectHarness({
     } },
     INCREMENTAL_SYNC_CONTRACT: "telemetry-contribution-v1.0",
     TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION: "telemetry-contribution-v1.1",
+    TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION: "telemetry-contribution-v1.2",
     hasCommunitySession: () => context.communitySession !== null,
     hostedSignInRequired: () => context.communitySession === null,
     keychainPromptSurface: () => "none",
+    // Disconnect/repair tests intentionally omit the performance consent DOM;
+    // its production renderer is an independent surface refreshed alongside
+    // this action state.
+    renderTelemetryPerformanceContribution() {},
     renderCommunityJourney() {},
     approveIncrementalContribution() { state.repairs += 1; },
     forgetLocalizedNode() {},

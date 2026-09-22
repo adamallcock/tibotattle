@@ -2,9 +2,88 @@ import { join } from "node:path";
 import {
   accountlessTransportOrigin,
   createAccountlessContributionScheduler,
+  createTelemetryPerformanceClient,
+  createTelemetryPerformanceScheduler,
+  initialTelemetryPerformanceSyncState,
+  parseTelemetryPerformanceSyncState,
 } from "../../src/application/index.js";
-import { createAccountlessChildChannel } from "../../src/platform/index.js";
+import {
+  createAccountlessChildChannel,
+  createTelemetryPerformanceEnvelope,
+} from "../../src/platform/index.js";
 import { runAccountlessContributionSyncOnce } from "../../src/contribution-accountless-client.js";
+import { withContributionDeviceSecret } from "../../src/contribution-device-capability.js";
+import { readJsonIfExists, writeJsonOwnerOnlyAtomic } from "../../src/storage.js";
+
+const PERFORMANCE_AUTHORIZATION = Object.freeze({
+  schemaVersion: "accountless-performance-owner-v1",
+  policyVersion: "accountless-telemetry-performance-policy-v1",
+  authorizationBasis: "accountless-performance-policy-v1",
+});
+const PERFORMANCE_AUTHORIZATION_PATH = "/api/v1/accountless/telemetry-performance-authorization";
+const PERFORMANCE_ENVELOPE_KEY_PATH = "/api/v1/envelope-key";
+const DEVICE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+function performanceError(code) {
+  const error = new Error("Accountless performance authorization unavailable");
+  error.code = code;
+  return error;
+}
+
+function assertPerformancePreference(value, origin) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.available !== true || value.current !== true
+      || value.enabled !== true
+      || value.policyVersion !== "accountless-opt-out-v1"
+      || value.destinationOrigin !== origin) {
+    throw performanceError("telemetry_performance_authorization_rejected");
+  }
+}
+
+async function readBoundedJson(response, maximumBytes = 16_384) {
+  if (!response || typeof response.status !== "number"
+      || typeof response.text !== "function") {
+    throw performanceError("telemetry_performance_response_invalid");
+  }
+  const text = await response.text();
+  if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > maximumBytes) {
+    throw performanceError("telemetry_performance_response_invalid");
+  }
+  try {
+    return text.length === 0 ? null : JSON.parse(text);
+  } catch {
+    throw performanceError("telemetry_performance_response_invalid");
+  }
+}
+
+async function readPerformanceState(path) {
+  try {
+    const value = await readJsonIfExists(path, null);
+    return value === null ? initialTelemetryPerformanceSyncState()
+      : parseTelemetryPerformanceSyncState(value);
+  } catch {
+    // A corrupt private cursor cannot authorize a request or suppress a
+    // server-side revision replacement. Rebuild the bounded cursor and let
+    // the report revision/idempotency fence decide whether work is new.
+    return initialTelemetryPerformanceSyncState();
+  }
+}
+
+async function writePerformanceState(path, value) {
+  const parsed = parseTelemetryPerformanceSyncState(value);
+  await writeJsonOwnerOnlyAtomic(path, parsed);
+}
+
+function assertPerformanceEnvelopeKey(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.algorithm !== "RSA-OAEP-256"
+      || typeof value.keyId !== "string" || !/^key:[A-Za-z0-9._-]{1,64}$/u.test(value.keyId)
+      || !value.publicJwk || typeof value.publicJwk !== "object"
+      || Array.isArray(value.publicJwk)) {
+    throw performanceError("telemetry_performance_response_invalid");
+  }
+  return Object.freeze({ keyId: value.keyId, publicJwk: value.publicJwk });
+}
 
 function accountlessConfigurationError() {
   return new TypeError("Invalid accountless contribution configuration");
@@ -64,6 +143,7 @@ export function createLocalAccountlessContribution({
   environment, stateRoot, indexFile, channel = process,
   readAccountMarkers, loadExistingAccountObservationSecret,
   runner = runAccountlessContributionSyncOnce, schedulerOptions = {},
+  performanceOptions = null,
 } = {}) {
   const selectedMode = environment?.USAGE_MONITOR_ACCOUNTLESS_MODE;
   const production = selectedMode === "rehearsal-v1" ? false
@@ -79,25 +159,169 @@ export function createLocalAccountlessContribution({
       || typeof channel.send !== "function" || channel.connected !== true) {
     throw accountlessConfigurationError();
   }
+  if (performanceOptions !== null
+      && (!performanceOptions || typeof performanceOptions !== "object"
+        || Array.isArray(performanceOptions)
+        || typeof performanceOptions.readPreparedDay !== "function"
+        || (performanceOptions.schedulerOptions !== undefined
+          && (!performanceOptions.schedulerOptions
+            || typeof performanceOptions.schedulerOptions !== "object"
+            || Array.isArray(performanceOptions.schedulerOptions)))
+        || (performanceOptions.fetchImpl !== undefined
+          && typeof performanceOptions.fetchImpl !== "function")
+        || (performanceOptions.createEnvelope !== undefined
+          && typeof performanceOptions.createEnvelope !== "function")
+        || (performanceOptions.stateFile !== undefined
+          && (typeof performanceOptions.stateFile !== "string"
+            || performanceOptions.stateFile.length < 1)))) {
+    throw accountlessConfigurationError();
+  }
   let scheduler;
+  let performanceScheduler;
+  let performanceGrantGeneration = 0;
+  let performanceGrantedGeneration = -1;
+  let performanceResumeRequested = false;
   const bridge = createAccountlessChildChannel({ channel,
-    onInvalidated: () => scheduler?.preferenceChanged() });
+    onInvalidated: () => {
+      performanceGrantGeneration += 1;
+      performanceGrantedGeneration = -1;
+      performanceResumeRequested = true;
+      scheduler?.preferenceChanged();
+      performanceScheduler?.preferenceChanged();
+    },
+  });
   scheduler = createAccountlessContributionScheduler({
     ...schedulerOptions, origin,
     readPreference: bridge.readPreference,
     runner: ({ signal }) => runner({ laboratory, rehearsal, production, origin, indexFile,
+      negotiateSuccessors: true,
       stateFile: join(stateRoot, "accountless-device-binding-v1.json"),
       progressFile: join(stateRoot, "private", "accountless-upload-progress-v1.json"),
       backend: bridge.backend, readPreference: bridge.readPreference, signal,
       readAccountMarkers, loadExistingAccountObservationSecret }),
     onStatus: (status) => { void bridge.reportStatus(status).catch(() => {}); },
   });
+  if (performanceOptions !== null) {
+    const fetchImpl = performanceOptions.fetchImpl ?? globalThis.fetch;
+    if (typeof fetchImpl !== "function") throw accountlessConfigurationError();
+    const createEnvelope = performanceOptions.createEnvelope
+      ?? createTelemetryPerformanceEnvelope;
+    const performanceStateFile = performanceOptions.stateFile
+      ?? join(stateRoot, "private", "accountless-performance-sync-state-v1.json");
+    const performanceFetch = async (...args) => {
+      const preference = await bridge.readPreference();
+      assertPerformancePreference(preference, origin);
+      const response = await fetchImpl(...args);
+      // A preference transition may race the response. Do not let a stale
+      // capability or envelope key authorize a subsequent operation.
+      assertPerformancePreference(await bridge.readPreference(), origin);
+      return response;
+    };
+    const withSecret = (operation) => withContributionDeviceSecret({
+      backend: bridge.backend,
+      stateFile: join(stateRoot, "accountless-device-binding-v1.json"),
+      expectedOrigin: origin,
+      operation,
+    });
+    const readAuthorization = async () => {
+      const generation = performanceGrantGeneration;
+      const preference = await bridge.readPreference();
+      assertPerformancePreference(preference, origin);
+      // The grant route is idempotent and is intentionally independent of
+      // usage authorization. Re-prove it once per protected preference
+      // generation so an accountless opt-out cannot leave a performance grant
+      // as a hidden upload path, while one day pass does not create a grant
+      // request for every capability/report lease.
+      if (performanceGrantedGeneration !== generation) {
+        const grant = await withSecret(async (secret, binding) => {
+          if (!binding || !DEVICE_ID.test(binding.deviceId)) {
+            throw performanceError("telemetry_performance_authorization_rejected");
+          }
+          const response = await performanceFetch(new URL(
+            PERFORMANCE_AUTHORIZATION_PATH, origin,
+          ), {
+            method: "POST",
+            cache: "no-store",
+            headers: {
+              Accept: "application/json",
+              "Content-Type": "application/json",
+              Authorization: `Device um_device_${binding.deviceId}.${secret.toString("base64url")}`,
+            },
+            body: JSON.stringify(PERFORMANCE_AUTHORIZATION),
+          });
+          return Object.freeze({
+            status: response.status,
+            payload: response.status >= 200 && response.status < 300
+              ? await readBoundedJson(response)
+              : null,
+          });
+        }).catch(() => null);
+        if (generation !== performanceGrantGeneration
+            || !grant || ![200, 201].includes(grant.status)) {
+          throw performanceError("telemetry_performance_authorization_rejected");
+        }
+        performanceGrantedGeneration = generation;
+      }
+      assertPerformancePreference(await bridge.readPreference(), origin);
+      return withSecret(async (secret, binding) => (
+        `Device um_device_${binding.deviceId}.${secret.toString("base64url")}`
+      ));
+    };
+    const readEnvelopeKey = async () => {
+      const response = await performanceFetch(new URL(
+        PERFORMANCE_ENVELOPE_KEY_PATH, origin,
+      ), { method: "GET", headers: { Accept: "application/json" } });
+      if (response.status !== 200) {
+        throw performanceError("telemetry_performance_capability_unavailable");
+      }
+      return assertPerformanceEnvelopeKey(await readBoundedJson(response));
+    };
+    const client = createTelemetryPerformanceClient({
+      origin,
+      fetchImpl: performanceFetch,
+      readAuthorization,
+      readPreparedDay: performanceOptions.readPreparedDay,
+      readState: async () => {
+        const state = await readPerformanceState(performanceStateFile);
+        if (!performanceResumeRequested) return state;
+        let preference = null;
+        try { preference = await bridge.readPreference(); } catch { /* sync remains paused */ }
+        if (preference?.enabled !== true) return state;
+        performanceResumeRequested = false;
+        if (state.paused && [
+          "authorization_rejected", "device_disconnected", "global_paused",
+          "retry_exhausted",
+        ].includes(state.pausedReason)) return initialTelemetryPerformanceSyncState();
+        return state;
+      },
+      saveState: (value) => writePerformanceState(performanceStateFile, value),
+      createEnvelope: async ({ report }) => {
+        const key = await readEnvelopeKey();
+        return createEnvelope({ report, ...key });
+      },
+    });
+    performanceScheduler = createTelemetryPerformanceScheduler({
+      ...performanceOptions.schedulerOptions,
+      runner: ({ day, nowEpoch }) => client.runDay({ day, nowEpoch }),
+      backfillDays: performanceOptions.schedulerOptions?.backfillDays ?? 7,
+      includeCurrentDay: performanceOptions.schedulerOptions?.includeCurrentDay ?? true,
+    });
+  }
   return Object.freeze({
-    start: scheduler.start,
+    start() {
+      const status = scheduler.start();
+      performanceScheduler?.start();
+      return status;
+    },
     inspect: scheduler.inspect,
     runNow: scheduler.runNow,
+    performanceInspect: () => performanceScheduler?.inspect() ?? Object.freeze({ state: "off", lastAcceptedAt: null, nextAttemptAt: null }),
+    performanceRunNow: () => performanceScheduler?.runNow() ?? Promise.resolve(Object.freeze({ state: "off", lastAcceptedAt: null, nextAttemptAt: null })),
     async stop() {
-      try { await scheduler.stop(); }
+      try {
+        await performanceScheduler?.stop();
+        await scheduler.stop();
+      }
       finally { bridge.dispose(); }
     },
   });

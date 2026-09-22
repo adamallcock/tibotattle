@@ -118,9 +118,9 @@ function validateOwnership({ sharedKeys, overlay, overrides }, catalogs) {
   const shared = new Set(sharedKeys);
   const overlayKeys = Object.keys(overlay);
   const overrideKeys = Object.keys(overrides);
-  assert.equal(shared.size + overlayKeys.length + overrideKeys.length, 128,
-    "desktop localization ownership must retain all 128 entries");
-  assert.equal(new Set([...sharedKeys, ...overlayKeys, ...overrideKeys]).size, 128,
+  assert.equal(shared.size + overlayKeys.length + overrideKeys.length, 132,
+    "desktop localization ownership must retain all 132 entries");
+  assert.equal(new Set([...sharedKeys, ...overlayKeys, ...overrideKeys]).size, 132,
     "desktop localization ownership must not overlap");
   assert.deepEqual(overrideKeys, [...OVERRIDE_KEYS].sort(), "named desktop overrides changed");
   for (const key of sharedKeys) {

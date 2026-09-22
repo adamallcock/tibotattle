@@ -22,7 +22,7 @@ export function attributionFixtureMarker(overrides = {}) {
 /** Synthetic, content-free schema-11 publication through the real writer. */
 export async function writeAttributionFixture(
   file,
-  { plans = ["pro", "plus"], publish = true, observedAtMs = ATTRIBUTION_FIXTURE_START } = {},
+  { plans = ["pro", "plus"], publish = true, observedAtMs = ATTRIBUTION_FIXTURE_START, boundaryFlags = [] } = {},
 ) {
   if (!Number.isSafeInteger(observedAtMs) || observedAtMs < 0) {
     throw new TypeError("observedAtMs must be a non-negative safe integer");
@@ -56,6 +56,12 @@ export async function writeAttributionFixture(
       tokensInUncached: 10, tokensInCacheRead: 20, tokensInCacheWrite: 0, tokensInCacheWrite5m: null,
       tokensInCacheWrite1h: null, tokensOutText: 1, tokensOutReasoning: 0, tokensOutCombined: null,
       totalInputContext: null, partial: false });
+    const flags = boundaryFlags[index] ?? 0;
+    if (flags) writer.writeUsageEventBoundary({
+      currentEventKey: eventKey, sessionLocal: source.sessionLocal,
+      turnContextBefore: Boolean(flags & 1), compactionBefore: Boolean(flags & 2),
+      compactedAtMs: flags & 2 ? eventObservedAtMs - 1 : null,
+    });
   }
   writer.recordSessionIdentity(source.sessionLocal, "11111111-2222-4333-8444-000000000001");
   writer.writeToolClassFact({ ...source, eventKey: Buffer.alloc(32, 71), sourceOffset: 1,

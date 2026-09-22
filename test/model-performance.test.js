@@ -143,6 +143,27 @@ test('controller is lazy, coalesces reads, retains good snapshots on failure, an
   await c.close(); assert.equal((await c.read('all')).status, 'unavailable');
   await assert.rejects(c.read('90'));
 });
+test('source revision invalidation drops a cached completion until replay publishes replacement', async () => {
+  class FakeWorker extends EventEmitter {
+    unref() {}
+    postMessage(message) { if (message.type === 'stop') queueMicrotask(() => this.emit('exit', 0)); }
+  }
+  let worker;
+  const c = createModelPerformanceController({ directory: 'unused', codexHome: 'unused',
+    workerFactory: () => worker = new FakeWorker() });
+  try {
+    await c.read('all');
+    const complete = modelPerformanceProjection([row()], { now: NOW });
+    worker.emit('message', { type: 'snapshots', revision: '0', values: [complete] });
+    assert.equal((await c.read('all')).models[0].turns, 1);
+    worker.emit('message', { type: 'invalidate', revision: '1' });
+    const rebuilding = await c.read('all');
+    assert.equal(rebuilding.status, 'loading');
+    assert.deepEqual(rebuilding.models, []);
+    worker.emit('message', { type: 'snapshots', revision: '1', values: [complete] });
+    assert.equal((await c.read('all')).models[0].turns, 1);
+  } finally { await c.close(); }
+});
 class BlockedWorker extends EventEmitter {
   unref() {}
   postMessage(message) {

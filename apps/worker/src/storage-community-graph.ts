@@ -22,6 +22,8 @@ import { advanceStorageV1CurrentFitAnalysis,advanceStorageV1HistoricalAnalysis,t
 import { V1_QUOTA_ACQUISITION_VERSION } from './quota-analysis-v1-reader';
 import { advanceStorageV11Analysis,loadStorageV11PreparedDays,STORAGE_V11_PREPARED_FOLD,
   type StorageV11HistoryCheckpoint } from './storage-v11-history';
+import { advanceStorageEffectiveAnalysis, assertEffectiveHistoryOwner, effectiveHistoryDependency,
+  effectiveHistoryPin, type StorageEffectiveHistoryCheckpoint } from './storage-effective-history';
 import type { GraphDayProjection } from './graph-day-projection-values';
 import { loadStorageHistoryCheckpoint, readStorageHistoryCheckpointHead, saveStorageHistoryCheckpoint,
   storageHistoryCheckpointParts,
@@ -44,6 +46,8 @@ export const STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD 
 // a computed day; the checkpoint FORMAT is what a resumed acquisition would
 // mix, so only this separate namespace moves. In-flight parts under -3 are
 // abandoned, which is the documented purpose of this namespace.
+export const STORAGE_GRAPH_EFFECTIVE_FITS_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':effective-fits-checkpoint-1';
+export const STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':effective-model-checkpoint-1';
 export const STORAGE_GRAPH_V11_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':v11-shared-checkpoint-4';
 /** The v1.1 checkpoint namespaces, as a pure rule so both branches can be
  * proven rather than described.
@@ -104,6 +108,7 @@ export const STORAGE_GRAPH_V11_FITS_CHECKPOINT_METHODS = Object.freeze([
  * path rather than be reclaimed on sight the moment the flag moves. */
 export const STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS = Object.freeze([
   STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD, STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,
+  STORAGE_GRAPH_EFFECTIVE_FITS_CHECKPOINT_METHOD, STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD,
   ...new Set([...storageGraphV11CheckpointMethods(false).live,
     ...storageGraphV11CheckpointMethods(true).live])]);
 // Execution-only revision for the single optimistic direct historical read.
@@ -251,7 +256,7 @@ export function storageGraphV11PartialGroupPages(input:{nowMs:number;deadlineMs:
  return {estimateMs,maxPages:byQueries<1?0:Math.max(1,Math.min(byTime,byQueries))};
 }
 const scopeChanged = () => new Error('storage graph scope changed');
-export type StorageGraphSource = 'v0.2' | 'v1' | 'v1.1' | 'mixed';
+export type StorageGraphSource = 'v0.2' | 'v1' | 'v1.1' | 'mixed' | 'effective';
 type Source = StorageGraphSource;
 type Pin = Awaited<ReturnType<typeof loadCommunitySourcePin>>['sourcePin'];
 export interface StorageGraphScope {
@@ -287,7 +292,7 @@ export async function storageGraphDependencyDigest(options:{
     // this into STORAGE_GRAPH_METHOD instead would retire the whole by-model
     // corpus to recompute a statistic the model metric does not contain.
     ...(options.metric==='fits'?[COMMUNITY_ALLOWANCE_FIT_METHOD]:[]),
-    ...(options.source==='v1.1'?[V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION]:[]),
+    ...(['v1.1','effective'].includes(options.source)?[V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION]:[]),
     ...(options.source==='v1'?[V1_QUOTA_ACQUISITION_VERSION]:[])]));
 }
 
@@ -329,7 +334,17 @@ export async function captureStorageGraphScope(sourceDb:D1Database, options:{
   if(!owner.ownerDigest || !/^[a-f0-9]{64}$/.test(owner.ownerDigest)
     || !['fits','model'].includes(options.metric))throw fail();
   const authority=await captureStorageCommunityAuthority(sourceDb,options);
-  const source:Source=owner.hasV11?'v1.1':owner.hasV1?owner.hasLegacy?'mixed':'v1':'v0.2';
+  const source:Source=owner.hasEffective?'effective':owner.hasV11?'v1.1':owner.hasV1?owner.hasLegacy?'mixed':'v1':'v0.2';
+  if(source==='effective') {
+    await assertEffectiveHistoryOwner(sourceDb,owner);
+    const dependency=await effectiveHistoryDependency(sourceDb,owner,authority.sourceNamespace,history.fromDay,history.day);
+    const pin=await effectiveHistoryPin(owner,history.fromDay,history.day,dependency);
+    const dependencyDigest=await storageGraphDependencyDigest({authority,ownerDigest:owner.ownerDigest,
+      source,metric:options.metric,day:history.day,dependency});
+    if(!await storageCommunityCalculationAuthorityIsCurrent(sourceDb,authority))throw scopeChanged();
+    return {authority,owner:owner as StorageGraphScope['owner'],source,pin,day:history.day,
+      fixedNow:history.fixedNow,metric:options.metric,dependencyDigest,checkpointDependencyDigest:dependencyDigest};
+  }
   // Pure-v1 history depends only on the closed model window. Loading the
   // current-fit adapter first materialized the wider open-ended chunk vector,
   // scanned irrelevant legacy metadata, reloaded that vector as an assertion,
@@ -415,7 +430,8 @@ async function selectedOwnerAuthorityIsCurrent(source:D1Database,scope:StorageGr
 }
 
 async function current(source:D1Database,scope:StorageGraphScope):Promise<boolean> {
-  if(scope.snapshot)await assertTypedV11GenerationSnapshotLive(source,scope.snapshot);
+  if(scope.source==='effective')await assertEffectiveHistoryOwner(source,scope.owner);
+  else if(scope.snapshot)await assertTypedV11GenerationSnapshotLive(source,scope.snapshot);
   else if('source' in scope.pin)await assertV11SourcePinCurrent(source,scope.pin);
   else await assertV1SourcePinCurrent(source,scope.pin);
   return await selectedOwnerAuthorityIsCurrent(source,scope)
@@ -443,7 +459,7 @@ function decoded(row:{payload_json:string;payload_fingerprint:string;source_kind
   if(canonicalJson(composition)==='{"reason":"legacy_source_overlap","status":"unsupported_source"}') {
     return scope.source==='v0.2'||scope.source==='mixed'?{scope,fits:null,composition:null,unsupportedSource:true}:null;
   }
-  const method=scope.source==='v1.1'?V11_PLAN_ATTRIBUTION_ADAPTER_VERSION:MODEL_HISTORY_METHOD_VERSION;
+  const method=['v1.1','effective'].includes(scope.source)?V11_PLAN_ATTRIBUTION_ADAPTER_VERSION:MODEL_HISTORY_METHOD_VERSION;
   return validCompleteCachedComposition(composition,row.payload_fingerprint,method)
     ?{scope,fits:null,composition}:null;
 }
@@ -525,6 +541,45 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       throw error;
     }
     return {state:'deferred',reason};
+  };
+  const computeEffective=async(metric:'fits'|'model',pin:V11SourcePin):Promise<
+    {state:'complete';analysis:object}|{state:'deferred';reason:string;failure?:StorageGraphFailureFields}>=>{
+    const ownerReady=await bindings.target.prepare(`SELECT 1 AS ready FROM analytics_owner_state
+      WHERE source_id=? AND owner_digest=? AND state='active' AND authority_epoch=?`)
+      .bind(bindings.sourceId,scope.owner.ownerDigest,scope.owner.authorityEpoch).first<number>('ready');
+    if(ownerReady!==1)return {state:'deferred',reason:'effective_owner_pending'};
+    const key:StorageHistoryKey={sourceId:bindings.sourceId,sourceNamespace:bindings.sourceNamespace,
+      ownerDigest:scope.owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
+      method:metric==='fits'?STORAGE_GRAPH_EFFECTIVE_FITS_CHECKPOINT_METHOD:STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD};
+    let cursor:StorageHistoryLoadCursor|undefined,head:string|null=null,checkpoint:StorageEffectiveHistoryCheckpoint|undefined;
+    for(;;){
+      if(meter.remainingQueries<50||now()>=checkpointWorkDeadlineMs)return {state:'deferred',reason:'effective_checkpoint_read_budget'};
+      const loaded=await withStorageGraphFailureStage('graph_checkpoint_load',
+        ()=>loadStorageHistoryCheckpoint({target:bindings.target,key,cursor}));
+      if(loaded.status==='deferred'){cursor=loaded.cursor;continue;}
+      head=loaded.headDigest??null;
+      if(loaded.status==='ready'){
+        if(!('source'in loaded.checkpoint)||loaded.checkpoint.source!=='effective')throw fail();
+        checkpoint=loaded.checkpoint;
+      }
+      cursor=undefined;break;
+    }
+    // Each step is one deterministic occurrence page. Promote it before
+    // another page so a timeout or retry never loses already acquired work.
+    // Reproducing a partially staged successor is independent of time budget.
+    for(;;){
+      if(meter.remainingQueries<200||now()>=checkpointWorkDeadlineMs)
+        return {state:'deferred',reason:'effective_checkpoint'};
+      const next=await advanceStorageEffectiveAnalysis({source,sourceNamespace:bindings.sourceNamespace,
+        owner:scope.owner,pin,day:scope.day,metric,nowMs,checkpoint,
+        budget:{remainingQueries:meter.remainingQueries-80,deadlineMs:checkpointWorkDeadlineMs,now}});
+      if(next.status==='complete')return {state:'complete',analysis:next.analysis};
+      if(!next.checkpoint)return {state:'deferred',reason:'effective_checkpoint'};
+      const saved=await persistCheckpoint(key,next.checkpoint,head,'effective_checkpoint');
+      if(saved.state==='deferred')return saved;
+      if(saved.head===head)return {state:'deferred',reason:'effective_checkpoint'};
+      head=saved.head;checkpoint=next.checkpoint;
+    }
   };
   let v11CompletedFingerprint:string|null=null;
   const computeV11=async(metric:'fits'|'model',pin:Extract<Pin,{source:'v1.1'}>):Promise<
@@ -650,7 +705,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
   if(scope.metric==='fits') {
     const analyses:Array<{source:'v0.2'|'v1'|'v1.1';analysis:object}>=[];
     if('source' in scope.pin){
-      const next=await computeV11('fits',scope.pin);if(next.state==='deferred')return next;
+      const next=await (scope.source==='effective'?computeEffective('fits',scope.pin):computeV11('fits',scope.pin));if(next.state==='deferred')return next;
       analyses.push({source:'v1.1',analysis:next.analysis});
     }
     else if(scope.source==='v1'){
@@ -713,7 +768,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
   } else {
     let composition:V1ModelCompositionResult | null=null;
     if('source' in scope.pin){
-      const next=await computeV11('model',scope.pin);if(next.state==='deferred')return next;
+      const next=await (scope.source==='effective'?computeEffective('model',scope.pin):computeV11('model',scope.pin));if(next.state==='deferred')return next;
       composition=next.analysis as V1ModelCompositionResult;
     }
     else {
@@ -785,7 +840,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
         }
       }
     }
-    const method=scope.source==='v1.1'?V11_PLAN_ATTRIBUTION_ADAPTER_VERSION:MODEL_HISTORY_METHOD_VERSION;
+    const method=['v1.1','effective'].includes(scope.source)?V11_PLAN_ATTRIBUTION_ADAPTER_VERSION:MODEL_HISTORY_METHOD_VERSION;
     if(composition!==null) {
       const completedFingerprint=scope.source==='v1.1'?v11CompletedFingerprint:scope.pin.fingerprint;
       if(!completedFingerprint||!validCompleteCachedComposition(composition,completedFingerprint,method))throw fail();

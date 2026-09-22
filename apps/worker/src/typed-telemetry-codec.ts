@@ -93,6 +93,21 @@ export function decodeTypedTelemetryId(value: Uint8Array): string {
   return result;
 }
 
+/** SQL projection of the same reversible ID codec. The expression is a
+ * reviewed column reference, never user text. Readers still decode the BLOB
+ * in JavaScript to reject alternate/noncanonical spellings. */
+export function typedTelemetryIdSql(column: string): string {
+  if (!/^[a-z_][a-z0-9_.]*$/u.test(column)) invalid();
+  const hex = `lower(hex(substr(${column},2)))`;
+  const cases = ID_FORMS.map((form,index) => {
+    const body = form.uuid
+      ? `substr(${hex},1,8)||'-'||substr(${hex},9,4)||'-'||substr(${hex},13,4)||'-'||substr(${hex},17,4)||'-'||substr(${hex},21,12)`
+      : hex;
+    return `WHEN hex(substr(${column},1,1))='${(index+1).toString(16).padStart(2,'0').toUpperCase()}' AND length(${column})=${form.bytes+1} THEN '${form.prefix}'||(${body})`;
+  });
+  return `(CASE WHEN hex(substr(${column},1,1))='00' THEN CAST(substr(${column},2) AS TEXT) ${cases.join(' ')} ELSE NULL END)`;
+}
+
 export function typedTelemetryDayNumber(value: string): number {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/u.test(value)) invalid();
   const milliseconds = Date.parse(`${value}T00:00:00.000Z`);

@@ -29,6 +29,9 @@ import {
 } from "../src/local-unified-index-build.js";
 import {
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
   reasoningEffortOrdinal,
 } from "../src/local-unified-index.js";
 
@@ -691,6 +694,69 @@ test("older parser coverage withholds both continuity and switch premiums", () =
   assert.equal(switched.cacheReadDrops, 0);
   assert.equal(switched.estimatedPremiumUsd, null);
   assert.equal(switched.coveredSubtotal, null);
+});
+
+test("retained v15/v16 parser suffixes retain cache continuity coverage after the v17 totals upgrade", () => {
+  const retainedV15 = [
+    "unified-rollout-typed-v15",
+    "unified-rollout-typed-v15-partial",
+    "unified-rollout-typed-v15-parent-model",
+    "unified-rollout-typed-v15-parent-model-partial",
+  ];
+  const currentV17 = [
+    LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+    LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
+    LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+    LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
+  ];
+
+  const retainedV16 = retainedV15.map((version) => version.replace("v15", "v16"))
+    .flatMap((version) => [version, `${version}-cache-write-zero`]);
+  for (const parserVersion of [...retainedV15, ...retainedV16,
+    ...currentV17.flatMap((version) => [version, `${version}-cache-write-zero`])]) {
+    const continuity = analyzeCacheContinuityRows([continuityRow({
+      parser_version: parserVersion,
+      previous_parser_version: parserVersion,
+    })], { nowMs: NOW_MS, pricer: fullyPriced })
+      .periods.find((candidate) => candidate.periodId === "all");
+    assert.equal(continuity.coverageStatus, "complete", parserVersion);
+    assert.equal(continuity.uncoveredReturns, 0, parserVersion);
+    assert.equal(continuity.comparableReturns, 1, parserVersion);
+    assert.equal(continuity.cacheReadDrops, 1, parserVersion);
+
+    const switched = analyzeCacheSwitchRows([row({
+      parser_version: parserVersion,
+      previous_parser_version: parserVersion,
+    })], { nowMs: NOW_MS, pricer: fullyPriced })
+      .periods.find((candidate) => candidate.periodId === "all");
+    assert.equal(switched.coverageStatus, "complete", parserVersion);
+    assert.equal(switched.uncoveredConfigurationChanges, 0, parserVersion);
+    assert.equal(switched.cacheReadDrops, 1, parserVersion);
+  }
+
+  for (const parserVersion of [
+    "unified-rollout-typed-v18",
+    "unified-rollout-typed-v18-partial",
+    "unified-rollout-typed-v17-future",
+  ]) {
+    const continuity = analyzeCacheContinuityRows([continuityRow({
+      parser_version: parserVersion,
+      previous_parser_version: parserVersion,
+    })], { nowMs: NOW_MS, pricer: fullyPriced })
+      .periods.find((candidate) => candidate.periodId === "all");
+    assert.equal(continuity.coverageStatus, "incomplete", parserVersion);
+    assert.equal(continuity.uncoveredReturns, 1, parserVersion);
+    assert.equal(continuity.cacheReadDrops, 0, parserVersion);
+
+    const switched = analyzeCacheSwitchRows([row({
+      parser_version: parserVersion,
+      previous_parser_version: parserVersion,
+    })], { nowMs: NOW_MS, pricer: fullyPriced })
+      .periods.find((candidate) => candidate.periodId === "all");
+    assert.equal(switched.coverageStatus, "incomplete", parserVersion);
+    assert.equal(switched.uncoveredConfigurationChanges, 1, parserVersion);
+    assert.equal(switched.cacheReadDrops, 0, parserVersion);
+  }
 });
 
 for (const [name, analyze, makeRow, premiumNanos] of [

@@ -1,6 +1,6 @@
 import {
   COMMUNITY_ATTRIBUTION_METHOD_VERSION, COMMUNITY_MODEL_CACHE_MAX_BYTES,
-  COMPOSITION_CACHE_KEY_SUFFIX, V1_FIT_CACHE_KEY_SUFFIX, parsedCachedFits,
+  COMPOSITION_CACHE_KEY_SUFFIX, V1_FIT_CACHE_KEY, parsedCachedFits,
   validCompleteCachedComposition,
   type CachedCommunityAllowanceCorpus, type CachedCommunityModelCompositions,
   type CommunityAllowanceFit, type CommunityModelCacheReadBudget,
@@ -214,10 +214,10 @@ async function loadPage(db: D1Database, head: Head, budget: CommunityModelCacheR
     if (row.running_bytes > COMMUNITY_PUBLICATION_PAGE_BYTES && row !== rows[0]) { blockedByBytes = true; break; }
     if (row.row_bytes>COMMUNITY_MODEL_CACHE_MAX_BYTES-head.payload_bytes) throw new Error("publication member byte limit");
     cursor = row.member_id;
-    const revision = cacheRevision(row.fit_key, row.source, head.from_day, V1_FIT_CACHE_KEY_SUFFIX);
+    const revision = cacheRevision(row.fit_key, row.source, head.from_day, V1_FIT_CACHE_KEY);
     if(revision===null && row.fit_method===COMMUNITY_ATTRIBUTION_METHOD_VERSION && fingerprint(row.fit_fingerprint)) {
       const changedFamily=(["v0.2","v1","mixed","v1.1"] as const).some(source=>{
-        const other=source===row.source?null:cacheRevision(row.fit_key,source,head.from_day,V1_FIT_CACHE_KEY_SUFFIX);
+        const other=source===row.source?null:cacheRevision(row.fit_key,source,head.from_day,V1_FIT_CACHE_KEY);
         return other!==null&&other>=row.minimum_revision&&other<=row.input_revision;
       });
       if(changedFamily) {
