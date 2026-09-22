@@ -23,6 +23,7 @@ const PERIOD_CACHE_TTL_MS = 60_000;
 const PRELOAD_MAX_ATTEMPTS = 3;
 const PRELOAD_RETRY_DELAY_MS = 5_000;
 const SPEED_METHOD = "speed";
+const SPEED_MODES = ["standard", "fast"];
 const MODEL_NAMES = Object.freeze({
   "gpt-6-astra": "Astra", "gpt-5.6-sol": "Sol", "gpt-5.6-terra": "Terra",
   "gpt-5.6-luna": "Luna", "gpt-5.5": "GPT-5.5", "gpt-5.4": "GPT-5.4",
@@ -39,9 +40,9 @@ export { reportingRequestPeriod } from "./dashboard-ui.js";
 
 /** A closed, bounded display contract: never pass arbitrary source text to DOM. */
 export function normalizeModelPerformance(value) {
-  if (!exact(value, ["schemaVersion", "method", "status", "collecting", "stale", "updatedAt", "period", "interval", "start", "end", "historyProgress", "models"])
-      || !(value.schemaVersion === 2 && value.method === 3 || value.schemaVersion === 3 && value.method === 4
-        || value.schemaVersion === 4 && value.method === 5)
+  if (!exact(value, ["schemaVersion", "method", "status", "collecting", "stale", "updatedAt", "period", "interval", "start", "end", "historyProgress", "speedMode", "excludedUnknownTurns", "models"])
+      || value.schemaVersion !== 5 || value.method !== 5
+      || !SPEED_MODES.includes(value.speedMode) || !count(value.excludedUnknownTurns)
       || !["ready", "loading", "unavailable"].includes(value.status)
       || typeof value.collecting !== "boolean" || typeof value.stale !== "boolean" || !PERIODS.includes(value.period)
       || !["day", "week"].includes(value.interval) || !timestamp(value.end)
@@ -70,16 +71,14 @@ export function normalizeModelPerformance(value) {
     }
     return total <= maximum;
   };
-  const toolFreeSupported = value.schemaVersion >= 3;
   for (const model of value.models) {
-    if (!exact(model, ["id", "label", "turns", "speedTurns", "ttftTurns", "timedResponses", "speed", "ttft",
-      ...(toolFreeSupported ? ["toolFreeTurns", "toolFree"] : [])])
+    if (!exact(model, ["id", "label", "turns", "speedTurns", "ttftTurns", "timedResponses", "speed", "ttft", "toolFreeTurns", "toolFree"])
         || !Object.hasOwn(MODEL_NAMES, model.id) || model.label !== MODEL_NAMES[model.id] || seen.has(model.id)
         || ![model.turns, model.speedTurns, model.ttftTurns, model.timedResponses].every(count)
         || model.speedTurns > model.turns || model.ttftTurns > model.turns
         || !Array.isArray(model.speed) || model.speed.length > 1 || !validPoints(model.ttft, model.ttftTurns)) return null;
-    if (toolFreeSupported && (!count(model.toolFreeTurns) || model.toolFreeTurns > model.turns
-        || !validPoints(model.toolFree, model.toolFreeTurns))) return null;
+    if (!count(model.toolFreeTurns) || model.toolFreeTurns > model.turns
+        || !validPoints(model.toolFree, model.toolFreeTurns)) return null;
     seen.add(model.id);
     let speedCount = 0;
     for (const series of model.speed) {
@@ -88,11 +87,9 @@ export function normalizeModelPerformance(value) {
       speedCount += series.points.reduce((sum, point) => sum + point.n, 0);
     }
     if (speedCount > model.speedTurns) return null;
-    if (value.schemaVersion === 4) {
-      if (model.toolFreeTurns > model.speedTurns) return null;
-      const speedBins = new Map(model.speed.flatMap(series => series.points).map(point => [point.at, point.n]));
-      if (model.toolFree.some(point => point.n > (speedBins.get(point.at) ?? 0))) return null;
-    }
+    if (model.toolFreeTurns > model.speedTurns) return null;
+    const speedBins = new Map(model.speed.flatMap(series => series.points).map(point => [point.at, point.n]));
+    if (model.toolFree.some(point => point.n > (speedBins.get(point.at) ?? 0))) return null;
   }
   return value;
 }
@@ -183,6 +180,7 @@ export function mountModelPerformance(options = {}) {
   let period = STANDALONE_PERIODS.includes(saved.period) ? saved.period : "all";
   let reportingWindow = sharedReporting ? normalizeReportingWindow(options.reportingWindow) : null;
   let modelId = Object.hasOwn(MODEL_NAMES, saved.model) ? saved.model : null;
+  let speedMode = "standard";
   let payload = null, loading = false, failed = false, cancelled = false, request = 0, timer = null;
   let retainedWindowKey = null;
   let retainedWindowUnavailable = false;
@@ -290,7 +288,7 @@ export function mountModelPerformance(options = {}) {
     const holder = element("div", "performance-plot");
     const points = series.flatMap((item) => item.points);
     if (!points.length) { holder.append(element("p", "performance-empty", translate(metric === "speed"
-      ? payload.schemaVersion === 4 ? "combinedSpeedEmpty" : "speedEmpty" : "ttftEmpty"))); return holder; }
+      ? "combinedSpeedEmpty" : "ttftEmpty"))); return holder; }
     const svg = svgElement("svg", { viewBox: "0 0 800 256", role: "group", "aria-label": translate(metric) });
     formatters();
     const { start, end } = domain;
@@ -475,13 +473,37 @@ export function mountModelPerformance(options = {}) {
       button.addEventListener("click", () => {
         if (period === value) return;
         period = value;
-        payload = readyPeriods.get(value)?.payload ?? null;
+        payload = cachedPayload(value);
         remember(); render(); refresh();
       }); periods.append(button);
     }
     heading.append(title);
     if (!sharedReporting) heading.append(periods);
     root.append(heading, element("p", "performance-provider", translate("provider")));
+    const modeControls = element("div", "performance-mode-controls");
+    const modes = element("div", "segmented-control performance-modes");
+    modes.setAttribute("role", "group"); modes.setAttribute("aria-label", translate("mode"));
+    for (const value of SPEED_MODES) {
+      const button = element("button", value === speedMode ? "active" : "", translate(value));
+      button.type = "button"; button.setAttribute("aria-pressed", String(speedMode === value));
+      button.dataset.performanceFocus = `mode-${value}`;
+      button.addEventListener("click", () => {
+        if (speedMode === value) return;
+        speedMode = value;
+        request++; scopeGeneration++;
+        cancelPending(); cancelPreloadWaits();
+        preloadPromise = null; preloadComplete = false; foregroundKey = null;
+        windowRef.clearTimeout(timer); timer = null;
+        retainedWindowKey = null; retainedWindowUnavailable = false;
+        payload = cachedPayload(selectedRequestPeriod());
+        loading = false; failed = false; cancelled = false; scopeUnavailable = false;
+        render(); refresh();
+      });
+      modes.append(button);
+    }
+    modeControls.append(modes, element("p", "performance-mode-note", translate(speedMode === "fast" ? "fastNote" : "standardNote")));
+    root.append(modeControls);
+    if (payload?.excludedUnknownTurns) root.append(element("p", "performance-mode-note", translate("unknownMode", { count: number(payload.excludedUnknownTurns) })));
     const status = element("p", "performance-status"); status.setAttribute("role", "status");
     const progress = payload?.historyProgress;
     const collectingLabel = progress?.total
@@ -516,9 +538,7 @@ export function mountModelPerformance(options = {}) {
     const models = [...(payload?.models ?? [])].sort((a, b) => MODEL_ORDER.indexOf(a.id) - MODEL_ORDER.indexOf(b.id));
     if (!models.length) {
       if (payload?.status === "ready") {
-        const empty = element("p", "performance-empty", sharedReporting
-          ? reportTranslate("unavailable")
-          : translate("empty"));
+        const empty = element("p", "performance-empty", translate("modeEmpty", { mode: translate(speedMode) }));
         empty.dataset.state = "empty";
         root.append(empty);
       }
@@ -558,16 +578,14 @@ export function mountModelPerformance(options = {}) {
       const card = element("article", "performance-card chart-card");
       const cardHeading = element("div", "performance-card-heading chart-card-header"), cardTitle = element("div");
       const summary = metric === "speed"
-        ? payload.schemaVersion === 4
-          ? translate("combinedSpeedSummary", { measured: number(selected.speedTurns), total: number(selected.turns),
+        ? translate("combinedSpeedSummary", { measured: number(selected.speedTurns), total: number(selected.turns),
             responses: number(selected.speedTurns - selected.toolFreeTurns), estimates: number(selected.toolFreeTurns) })
-          : translate("speedSummary", { measured: number(selected.speedTurns), total: number(selected.turns) })
         : translate("latencySummary", { measured: number(selected.ttftTurns), total: number(selected.turns), responses: number(selected.timedResponses) });
       const coverage = element("p", "performance-unit", summary);
       const measured = metric === "speed" ? selected.speedTurns : selected.ttftTurns;
       coverage.dataset.state = measured < selected.turns ? "partial" : "complete";
       cardTitle.append(element("h4", "chart-card-title", translate(metric)), coverage);
-      if (metric === "speed" && payload.schemaVersion === 4 && selected.toolFreeTurns > 0)
+      if (metric === "speed" && selected.toolFreeTurns > 0)
         cardTitle.append(element("p", "performance-method-note", translate("combinedSpeedMethodology")));
       const legend = element("div", "performance-legend chart-card-legend");
       for (const method of ["outerBand", "innerBand", "medianP50"]) {
@@ -582,19 +600,16 @@ export function mountModelPerformance(options = {}) {
         entry.append(swatch, element("span", "", translate(method))); legend.append(entry);
       }
       cardHeading.append(cardTitle); card.append(cardHeading, legend,
-        // Older DTOs carry independent, potentially overlapping populations.
-        // Preserve their original speed series; never merge aggregate percentiles.
+        // Each selected mode carries one combined, non-overlapping speed population.
         plot(metric === "speed" ? selected.speed : [{ method: "ttft", points: selected.ttft }], metric, "var(--allowance-color)", domain));
       panel.append(card);
     }
     const aboutSummary = element("summary", "", translate("about")); aboutSummary.dataset.performanceFocus = "about";
-    const about = element("details", "performance-details"); about.open = aboutOpen; about.append(aboutSummary, element("p", "", translate(payload.schemaVersion === 4 ? "combinedMethodology" : "methodology")), element("p", "", translate("variance"))); about.addEventListener("toggle", () => { aboutOpen = about.open; }); panel.append(about);
+    const about = element("details", "performance-details"); about.open = aboutOpen; about.append(aboutSummary, element("p", "", translate("combinedMethodology")), element("p", "", translate("variance"))); about.addEventListener("toggle", () => { aboutOpen = about.open; }); panel.append(about);
     root.append(panel);
     restoreFocus();
   }
-  const cacheKeyFor = value => sharedReporting
-    ? `${reportingKey()}::${value}`
-    : value;
+  const cacheKeyFor = value => `${speedMode}::${sharedReporting ? `${reportingKey()}::${value}` : value}`;
   const cachedPayload = value => readyPeriods.get(cacheKeyFor(value))?.payload ?? null;
   const cacheFresh = entry => entry && Date.now() - entry.cachedAt < PERIOD_CACHE_TTL_MS;
   const preloadValues = () => {
@@ -646,7 +661,7 @@ export function mountModelPerformance(options = {}) {
     }
   };
   const presentResult = (value, result) => {
-    if (!result || value !== selectedRequestPeriod()) return false;
+    if (!result || value !== selectedRequestPeriod() || result.speedMode !== speedMode) return false;
     if (result.status === "unavailable") readyPeriods.clear();
     if (result.status === "unavailable" && retainedWindowKey === reportingKey() && payload?.status === "ready") {
       // An unavailable new window withdraws live caches, but the previous
@@ -673,6 +688,7 @@ export function mountModelPerformance(options = {}) {
     if (existing) return existing.promise;
     const entry = readyPeriods.get(cacheKey);
     if (!force && cacheFresh(entry)) return Promise.resolve(entry.payload);
+    const expectedMode = speedMode;
     const expectedWindow = sharedReporting ? reportingWindow : null;
     const expectedEndAt = expectedWindow?.endAt ?? null;
     const expectedStartAt = expectedWindow?.startAt ?? null;
@@ -685,10 +701,10 @@ export function mountModelPerformance(options = {}) {
     const promise = (async () => {
       try {
         const result = normalizeModelPerformance(await client.modelPerformance(value, {
-          signal: controller.signal,
+          signal: controller.signal, speedMode: expectedMode,
           ...(expectedEndAt ? { endAt: expectedEndAt } : {}),
         }));
-        if (!result || result.period !== value
+        if (!result || result.period !== value || result.speedMode !== expectedMode
             || (expectedEndAt && result.end !== Date.parse(expectedEndAt))
             || (expectedStartAt !== null && result.start !== Date.parse(expectedStartAt))) {
           throw new Error("Invalid timing contract");

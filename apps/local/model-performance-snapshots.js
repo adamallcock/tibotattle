@@ -4,6 +4,8 @@ import { createValidatedSnapshotStore } from '../../src/platform/index.js';
 
 export const MODEL_PERFORMANCE_PERIODS = Object.freeze(['1', '7', '30', 'all']);
 export const MODEL_PERFORMANCE_MAX_WINDOWS = 8;
+export const MODEL_PERFORMANCE_SPEED_MODES = Object.freeze(['standard', 'fast']);
+export const modelPerformanceSnapshotKey = (period, speedMode) => `${period}:${speedMode}`;
 const DAY = 86_400_000;
 const MODEL_NAMES = Object.freeze({
   'gpt-5.6-luna': 'Luna', 'gpt-5.6-terra': 'Terra', 'gpt-5.6-sol': 'Sol',
@@ -20,9 +22,10 @@ const exact = (value, keys) => value !== null && typeof value === 'object' && !A
 // disk receipts so future or malformed projections cannot become saved state.
 export function isModelPerformanceSnapshot(value) {
   if (!exact(value, ['schemaVersion', 'method', 'status', 'collecting', 'stale', 'updatedAt',
-    'period', 'interval', 'start', 'end', 'historyProgress', 'models'])
-      || value.schemaVersion !== 4 || value.method !== 5 || value.status !== 'ready'
+    'period', 'speedMode', 'excludedUnknownTurns', 'interval', 'start', 'end', 'historyProgress', 'models'])
+      || value.schemaVersion !== 5 || value.method !== 5 || value.status !== 'ready'
       || typeof value.collecting !== 'boolean' || typeof value.stale !== 'boolean'
+      || !MODEL_PERFORMANCE_SPEED_MODES.includes(value.speedMode) || !count(value.excludedUnknownTurns)
       || !MODEL_PERFORMANCE_PERIODS.includes(value.period) || !['day', 'week'].includes(value.interval)
       || !timestamp(value.end) || !(value.start === null || timestamp(value.start) && value.start <= value.end)
       || typeof value.updatedAt !== 'string' || !Number.isFinite(Date.parse(value.updatedAt))
@@ -84,11 +87,11 @@ export function readModelPerformanceSnapshotEntry(value) {
   const { requestKey, ...snapshot } = value;
   if (!isModelPerformanceSnapshot(snapshot)) return null;
   if (Object.hasOwn(value, 'requestKey')) {
-    if (requestKey !== `${snapshot.period}:${snapshot.end}`
+    if (requestKey !== `${modelPerformanceSnapshotKey(snapshot.period, snapshot.speedMode)}:${snapshot.end}`
         || (snapshot.period !== 'all' && snapshot.start !== Math.max(0, snapshot.end - Number(snapshot.period) * DAY))) return null;
     return { key: requestKey, snapshot };
   }
-  return Date.parse(snapshot.updatedAt) === snapshot.end ? { key: snapshot.period, snapshot } : null;
+  return Date.parse(snapshot.updatedAt) === snapshot.end ? { key: modelPerformanceSnapshotKey(snapshot.period, snapshot.speedMode), snapshot } : null;
 }
 
 export function modelPerformanceSourceScope(codexHome) {
@@ -104,19 +107,19 @@ export function createModelPerformanceSnapshotStore({ directory, codexHome, now 
   const source = modelPerformanceSourceScope(codexHome);
   const store = createValidatedSnapshotStore({
     snapshotFile: join(directory, 'model-performance-snapshot.json'),
-    // Earlier receipts hold independent percentile distributions. Rebuild from
-    // retained turn evidence; never relabel those aggregates as combined speed.
-    schemaVersion: 'local-model-performance-snapshot-v4',
+    // Earlier receipts combine speed modes. Rebuild from retained turn evidence;
+    // never relabel old aggregates as measurements for a single mode.
+    schemaVersion: 'local-model-performance-snapshot-v5',
     maximumBytes: 4 * 1024 * 1024,
     now,
     validate: value => {
       if (!exact(value, ['source', 'values']) || value.source !== source
           || !Array.isArray(value.values) || value.values.length < 1
-          || value.values.length > MODEL_PERFORMANCE_PERIODS.length + MODEL_PERFORMANCE_MAX_WINDOWS) return false;
+          || value.values.length > MODEL_PERFORMANCE_PERIODS.length * MODEL_PERFORMANCE_SPEED_MODES.length + MODEL_PERFORMANCE_MAX_WINDOWS) return false;
       const entries = value.values.map(readModelPerformanceSnapshotEntry);
       return entries.every(entry => entry && isCompleteModelPerformanceSnapshot(entry.snapshot))
         && new Set(entries.map(entry => entry.key)).size === entries.length
-        && entries.filter(entry => entry.key !== entry.snapshot.period).length <= MODEL_PERFORMANCE_MAX_WINDOWS;
+        && entries.filter(entry => entry.key !== modelPerformanceSnapshotKey(entry.snapshot.period, entry.snapshot.speedMode)).length <= MODEL_PERFORMANCE_MAX_WINDOWS;
     },
   });
   return {

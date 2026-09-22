@@ -178,6 +178,14 @@ and use the shared **Reporting period** above the page. The web and native navig
 include this page in development source; an installed release must contain
 these changes before the page is available there.
 
+The page starts in **Standard** mode. Use the **Standard / Fast** toggle to show
+only the selected mode; counts, medians, bands and both charts use that same
+population. The choice lasts while the page is mounted, including period/model
+changes and refreshes. Fast mode can have few or no observations. Hollow points
+have fewer than five measured turns, and those bins have no percentile bands.
+Unknown or mixed modes are excluded from both views, with their excluded turn
+count shown. Older saved measurements without mode evidence stay unclassified.
+
 After the initial dashboard loads, the app prepares this page and its standard
 periods in the background before you visit. Once ready, opening the page or
 changing period displays its cached chart immediately while checking for

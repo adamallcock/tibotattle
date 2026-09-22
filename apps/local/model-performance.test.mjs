@@ -31,9 +31,9 @@ async function fixture(t, options = {}) {
 test("model performance accepts only one standard period and preserves read guards", async (t) => {
   const requests = [];
   const { base } = await fixture(t, {
-    modelPerformanceProvider: async (period) => {
-      requests.push(period);
-      return { schemaVersion: "model-performance-v1", status: "available", period, models: [] };
+    modelPerformanceProvider: async (period, options) => {
+      requests.push({ period, ...options });
+      return { schemaVersion: 5, status: "ready", period, ...options, models: [] };
     },
   });
   const route = `${base}/api/local/model-performance`;
@@ -44,7 +44,7 @@ test("model performance accepts only one standard period and preserves read guar
     assert.equal(response.headers.get("cache-control"), "no-store");
     assert.equal(response.headers.get("access-control-allow-origin"), null);
   }
-  assert.deepEqual(requests, ["7", "30", "all"]);
+  assert.deepEqual(requests, ["7", "30", "all"].map(period => ({ period, speedMode: "standard" })));
   for (const query of ["", "?period=", "?period=90", "?period=ALL", "?period=7.0",
     "?period=7&period=7", "?period=7&path=synthetic", "?from=7", "?period=all&model=sol"]) {
     assert.equal((await fetch(`${route}${query}`)).status, 400, query);
@@ -62,7 +62,7 @@ test("model performance accepts only one standard period and preserves read guar
     request.end();
   });
   assert.equal(refused, 403);
-  assert.deepEqual(requests, ["7", "30", "all"]);
+  assert.deepEqual(requests, ["7", "30", "all"].map(period => ({ period, speedMode: "standard" })));
 });
 
 test("model performance remains readable while accounting builds and after it fails", async (t) => {
@@ -110,9 +110,29 @@ test("model performance accepts an exact rolling anchor and rejects ambiguous bo
   const endAt = '2026-09-01T12:34:56.000Z';
   const route = `${base}/api/local/model-performance?period=1`;
   assert.equal((await fetch(`${route}&endAt=${encodeURIComponent(endAt)}`)).status, 200);
-  assert.deepEqual(calls, [{ period: '1', options: { endAt } }]);
+  assert.deepEqual(calls, [{ period: '1', options: { endAt, speedMode: 'standard' } }]);
   for (const query of ['&endAt=2026-09-01', '&endAt=', `&endAt=${endAt}&endAt=${endAt}`, '&endAt=9999-01-01T00:00:00.000Z']) {
     assert.equal((await fetch(`${route}${query}`)).status, 400);
   }
   assert.equal(calls.length, 1);
+});
+
+test("model performance mode selectors preserve optional exact windows and reject ambiguous modes", async t => {
+  const calls = [];
+  const { base } = await fixture(t, { modelPerformanceProvider: async (period, options) => {
+    calls.push({ period, ...options }); return { period, ...options };
+  } });
+  const endAt = '2026-09-01T12:34:56.000Z';
+  const route = `${base}/api/local/model-performance`;
+  for (const speedMode of ['standard', 'fast']) for (const anchored of [false, true]) {
+    const response = await fetch(`${route}?period=1&speedMode=${speedMode}${anchored ? `&endAt=${endAt}` : ''}`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { period: '1', speedMode, ...(anchored ? { endAt } : {}) });
+  }
+  for (const query of ['speedMode=', 'speedMode=mixed', 'speedMode=FAST', 'speedMode=unknown',
+    'speedMode=fast&speedMode=fast', 'speedMode=fast&speedMode=standard',
+    'speedMode=fast&period=all', 'speedMode=fast&extra=1']) {
+    assert.equal((await fetch(`${route}?period=all&${query}`)).status, 400, query);
+  }
+  assert.equal(calls.length, 4);
 });

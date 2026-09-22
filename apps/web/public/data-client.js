@@ -6609,9 +6609,10 @@ export class LocalCompanionClient {
     return normalizeDashboardPayload({}, fragments);
   }
 
-  modelPerformance(period = "all", { signal, endAt } = {}) {
+  modelPerformance(period = "all", { signal, endAt, speedMode = "standard" } = {}) {
     if (!["1", "7", "30", "all"].includes(period)) throw new RangeError("Unsupported display period");
-    const query = new URLSearchParams({ period });
+    if (!["standard", "fast"].includes(speedMode)) throw new RangeError("Unsupported speed mode");
+    const query = new URLSearchParams({ period, speedMode });
     if (endAt !== undefined) {
       const end = Date.parse(endAt);
       if (typeof endAt !== "string" || !Number.isSafeInteger(end) || end < 0

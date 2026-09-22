@@ -91,7 +91,8 @@ async function run() {
     if (message?.type === 'stop') stop();
     else if (message?.type === 'window' && ['1','7','30','all'].includes(message.period)
       && Number.isSafeInteger(message.end) && message.end >= 0 && message.end <= Date.now()
-      && message.requestKey === `${message.period}:${message.end}`) {
+      && ['standard', 'fast'].includes(message.speedMode)
+      && message.requestKey === `${message.period}:${message.speedMode}:${message.end}`) {
       windows.set(message.requestKey, message); windowsChanged = true;
       while (windows.size > 8) windows.delete(windows.keys().next().value);
     } else if (message?.type === 'performance-day') {
@@ -147,10 +148,10 @@ async function run() {
     const now = Date.now();
     lastPublished = now; lastCollecting = collecting; windowsChanged = false;
     parentPort.postMessage({ type: 'snapshots', revision, values: [
-      ...['1', '7', '30', 'all'].map(period => ({ period, end: now })), ...windows.values(),
-    ].map(({period, end, requestKey}) => ({
+      ...['1', '7', '30', 'all'].flatMap(period => ['standard', 'fast'].map(speedMode => ({ period, speedMode, end: now }))), ...windows.values(),
+    ].map(({period, speedMode, end, requestKey}) => ({
       ...(requestKey ? { requestKey } : {}),
-      ...context.project(rows, { period, now: end, rolling: Boolean(requestKey), historyProgress: files === null ? null : {
+      ...context.project(rows, { period, speedMode, now: end, rolling: Boolean(requestKey), historyProgress: files === null ? null : {
         checked: Math.min(cursor, files.length), total: files.length,
       } }), updatedAt: new Date(now).toISOString(), collecting, stale: degraded,
     })) });
