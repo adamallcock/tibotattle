@@ -60,6 +60,7 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /windows-security-qualification\.mjs/u);
   assert.match(workflow, /\$nodeGypScript rebuild --directory native\/windows-filesystem/u);
   assert.match(workflow, /ref: \$\{\{ github\.sha \}\}/u);
+  assert.match(workflow, /fetch-depth: 0/u);
   assert.match(workflow, /persist-credentials: false/u);
   assert.match(workflow, /WINDOWS_QUALIFICATION_REVISION_MISMATCH/u);
   assert.match(workflow, /build-windows-filesystem-manifest\.mjs/u);
