@@ -475,12 +475,16 @@ environment before proceeding; the ordered-prefix guard remains unchanged.
 
 The typed v1.2 successor has a separate existing-role operator. It is a
 forward-only, populated-schema operation for the exact predecessor source
-`c93a5a513890be5d4db97de5bcc9a684cbb91f18`. It applies the four primary
+`eaf6f521fb9842399da512fd1ad5020c7b706f5b`. It applies the four primary
 `ingestion-isolation-migrations/0006`–`0009` files, then the three analytics
 `analytics-migrations/0024`–`0026` files, in that order. The operator binds each
 SQL digest, the candidate clean `HEAD`, the exact database IDs and names, the
-prior schema/data/ledger receipts, a 9 GB capacity budget, and a rehearsal
-receipt. It never creates or repairs a missing prior ledger.
+prior schema/data/ledger receipts, the reviewed inventory bytes hash, a 9 GB
+capacity budget, and a rehearsal receipt. It never creates or repairs a
+missing prior ledger. The active Worker predecessor, version, canonical live
+configuration fingerprint, contained collection hold, and reviewed D1
+Time Travel receipt are re-read under the shared production lock before the
+first D1 write and before every later write.
 
 Run the local populated rehearsal from the repository root. It uses
 synthetic content-free rows, enables foreign-key checks, verifies every mapped
@@ -491,6 +495,26 @@ remote work:
 ```sh
 node apps/worker/scripts/typed-forward-migration.mjs --mode rehearse \
   --worker-root apps/worker
+```
+
+Capture the reviewed D1 Time Travel receipt separately before preparing the
+plan. The targets file must be a mode-0600 JSON array in this exact order,
+containing only the reviewed `role`, binding, database `name`, and
+`databaseId` for `primary` then `analytics`. The capture uses one timestamp,
+the pinned Wrangler CLI, and read-only `time-travel info` calls; it never
+restores or mutates a database. The output is a mode-0600
+`typed-forward-backup-receipt-v2` artifact with one exact bookmark per target
+and a digest:
+
+```sh
+node apps/worker/scripts/typed-forward-migration.mjs --mode capture-backup \
+  --targets /absolute/private/typed-forward-target-identities.json \
+  --operation /absolute/private/typed-forward-backup-capture \
+  --cli /absolute/wrangler-dist/cli.js \
+  --account-id ACCOUNT_ID --wrangler-sha256 WRANGLER_SHA256 \
+  --captured-at 2026-09-22T12:00:00.000Z \
+  --expires-at 2026-09-23T12:00:00.000Z \
+  --output /absolute/private/typed-forward-backup-receipt.json
 ```
 
 A reviewed operator captures the read-only inventory and prior receipts into
@@ -510,12 +534,19 @@ node apps/worker/scripts/typed-forward-migration.mjs --mode prepare \
 
 Inspecting a plan is read-only and does not acquire the shared production
 deployment lock. The remote path is a separate explicitly confirmed command.
-It first rechecks the pinned clean source, exact inventory, prior receipt,
-schema prefix and content-free invariants. Each migration writes a durable
-intent before one provider file operation that includes the migration SQL and
-its ledger receipt. Afterward it reads the exact schema, ledger prefix and
-invariants before advancing the intent. The shared lock remains held on any
-failure or uncertain response:
+It first rechecks the pinned clean source, exact inventory bytes hash, prior
+receipt, schema prefix and content-free invariants. Each migration file is
+split using the pinned Wrangler splitter. A durable intent is written before
+each bounded mutation request, and the migration ledger insert is its own
+final statement checkpoint. Former foreign-key-off rebuild regions are
+rehearsed and coalesced into one atomic request containing
+`PRAGMA defer_foreign_keys = ON` followed by the complete rebuild region; D1
+runs that request in one implicit transaction and the transport decodes the
+exact result count with every result successful. User `PRAGMA foreign_keys`
+changes and standalone deferral requests are never sent. After every mutation
+it reads the exact schema and ledger/progress checkpoint, and after each ledger
+checkpoint it runs a bounded remote foreign-key check. The shared lock remains
+held on any failure or uncertain response:
 
 ```sh
 node apps/worker/scripts/typed-forward-migration.mjs --mode execute \
@@ -531,8 +562,13 @@ After an uncertain result, stop and rerun the same plan with `--resume`. Resume
 reads first and accepts only the exact before or after state recorded by the
 durable intent; it never blindly retries a provider operation. A completed
 release-intent resumes by observing lock ownership and releases only the
-original owner. Typed deployment, client rollout and staged activation remain
-separate gates after both ledgers have been read back.
+original owner. An expired plan can only resume reads/reconciliation; writes
+require a separately approved, chained extension of at most 24 hours. The
+concrete transport also rechecks the active Worker through the canonical
+read-only production inventory provider and verifies a Time Travel bookmark at
+the receipt capture time for each exact database. Typed deployment, client
+rollout and staged activation remain separate gates after both ledgers have
+been read back.
 
 ## Owner deployment
 
