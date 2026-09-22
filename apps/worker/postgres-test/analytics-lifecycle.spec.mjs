@@ -396,7 +396,9 @@ it("reclaims an expired checkpointing lease and rejects stale completion", async
     authorityEpoch: 1,
   };
   const store = createPostgresAnalyticalWorkStore(adapterPool, { primarySchema, ledgerSchema });
-  const claim = await store.claim({ identity, nowMs: 100, leaseMs: 10 });
+  // The adapter must ignore this synthetic caller clock for lease decisions;
+  // PostgreSQL supplies the mutation-time clock instead.
+  const claim = await store.claim({ identity, nowMs: 0, leaseMs: 60_000 });
   expect(claim).not.toBeNull();
   const payloadJson = "[]";
   const sha256 = createHash("sha256").update(payloadJson).digest("hex");
@@ -405,15 +407,65 @@ it("reclaims an expired checkpointing lease and rejects stale completion", async
     parts: [{ index: 0, sha256, payloadJson }], complete: false,
   };
   const checkpointed = await store.saveCheckpoint({
-    identity, claimToken: claim.claimToken, expectedRevision: claim.revision, nowMs: 105, checkpoint,
+    identity, claimToken: claim.claimToken, expectedRevision: claim.revision, nowMs: 0, checkpoint,
   });
   expect(checkpointed.state).toBe("checkpointing");
+  await pool.query(`UPDATE analytics_analysis_work_heads
+    SET lease_expires_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint - 1
+    WHERE source_id=$1 AND owner_digest=$2 AND day=$3 AND metric=$4`,
+  [identity.sourceId, identity.ownerDigest, identity.day, identity.metric]);
   await expect(store.complete({ identity, claimToken: claim.claimToken, expectedRevision: checkpointed.revision,
-    nowMs: 120, resultDigest: "1".repeat(64) })).rejects.toMatchObject({ storageCode: "conflict" });
-  const resumedClaim = await store.claim({ identity, nowMs: 120, leaseMs: 100 });
+    nowMs: 0, resultDigest: "1".repeat(64) })).rejects.toMatchObject({ storageCode: "conflict" });
+  const resumedClaim = await store.claim({ identity, nowMs: 0, leaseMs: 100 });
   expect(resumedClaim).not.toBeNull();
   const resumed = await store.read(identity);
   expect(resumed).toMatchObject({ state: "claimed", checkpoint: { generation: "checkpoint-1", complete: false } });
+});
+
+it("reclaims after a blocked row lock using the database clock", async () => {
+  const identity = {
+    sourceId: "blocked-lease-restart",
+    sourceNamespace: "community-analysis-v1",
+    ownerDigest: "e".repeat(64),
+    day: "2026-09-21",
+    metric: "fits",
+    inputRevision: 1,
+    ownerRevision: 1,
+    dependencyDigest: "e".repeat(64),
+    method: "provider-prepared-v1",
+    authorityEpoch: 1,
+  };
+  const store = createPostgresAnalyticalWorkStore(adapterPool, { primarySchema, ledgerSchema });
+  const claim = await store.claim({ identity, nowMs: 0, leaseMs: 40 });
+  expect(claim).not.toBeNull();
+  const blocker = await rawPool.connect();
+  let reclaimPromise;
+  try {
+    await blocker.query("BEGIN");
+    await blocker.query(`SELECT source_id FROM ${primarySchema}.analytics_analysis_work_heads
+      WHERE source_id=$1 AND owner_digest=$2 AND day=$3 AND metric=$4 FOR UPDATE`,
+    [identity.sourceId, identity.ownerDigest, identity.day, identity.metric]);
+    reclaimPromise = store.claim({ identity, nowMs: 0, leaseMs: 5_000 });
+    let observedLockWait = false;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const waitRows = (await admin.query(`SELECT 1 FROM pg_stat_activity
+        WHERE datname=$1 AND pid <> pg_backend_pid() AND wait_event_type='Lock'
+          AND query LIKE '%analytics_analysis_work_heads%'`, [primaryDatabaseName])).rows;
+      if (waitRows.length !== 0) {
+        observedLockWait = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(observedLockWait).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    await blocker.query("COMMIT");
+    const resumed = await reclaimPromise;
+    expect(resumed).toMatchObject({ revision: claim.revision + 1, identity });
+  } finally {
+    await blocker.query("ROLLBACK").catch(() => {});
+    blocker.release();
+  }
 });
 
 it("consumes release nonces once, replaces an expired nonce, and serializes races", async () => {

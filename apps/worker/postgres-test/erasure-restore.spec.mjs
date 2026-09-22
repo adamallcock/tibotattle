@@ -78,6 +78,8 @@ async function seedParticipant() {
        state,issued_at,expires_at) VALUES($1,$2,$3,$4,$5,1,'application/json','unused',$6,$7)`,
     [id, participantId, deviceId, secret, envelope, issued, expires]);
   }
+  await primary.query(`INSERT INTO ${primarySchema}.pending_objects(contribution_id,object_key)
+    VALUES('chunk-v1','objects/v1'),('chunk-v11','objects/v11'),('chunk-v12','objects/v12')`);
   await primary.query(`INSERT INTO ${primarySchema}.telemetry_v1_chunks
     (id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,chunk_digest,envelope_digest,
      parser_version,record_count,accepted_record_count,r2_key,device_upload_authorization_id,created_at)
@@ -103,8 +105,6 @@ async function seedParticipant() {
      envelope_digest,parser_version,record_count,r2_key,device_upload_authorization_id,created_at)
     VALUES('chunk-v12',$1,$2,$3,'quota','2026-09-21',1,'chunk-v12',$4,$5,'test',1,'objects/v12','auth-v12',$6)`,
   [manifestV12, participantId, deviceId, "7".repeat(64), "8".repeat(64), issued]);
-  await primary.query(`INSERT INTO ${primarySchema}.pending_objects(contribution_id,object_key)
-    VALUES('chunk-v1','objects/v1'),('chunk-v11','objects/v11'),('chunk-v12','objects/v12')`);
   await primary.query(`INSERT INTO ${primarySchema}.storage_source_state(singleton,source_id,authority_epoch)
     VALUES(1,$1,1)`, [sourceId]);
   await primary.query(`INSERT INTO ${primarySchema}.storage_v11_owner_links
@@ -208,6 +208,50 @@ it("retries owner erasure, then suppresses a restored primary from the independe
     registeredAt: referencedRegisteredAt,
     leaseId: "referenced-lease",
   })).toBe("referenced");
+  await primary.query(`INSERT INTO ${primarySchema}.device_upload_authorizations
+    (id,participant_id,issued_by_device_id,secret_hash,envelope_digest,body_bytes,content_type,
+     state,issued_at,expires_at) VALUES('auth-writer-first',$1,$2,$3,$4,1,'application/json','unused',$5,$6)`,
+  [participantId, deviceId, Buffer.alloc(32, 1), "a".repeat(64), new Date(now), new Date(now + 86_400_000)]);
+  const writerFirstRegisteredAt = new Date(now + 1).toISOString();
+  await primary.query(`INSERT INTO ${primarySchema}.pending_objects
+    (contribution_id,object_key,object_kind,registered_at,reconciliation_state)
+    VALUES('chunk-writer-first','objects/writer-first','telemetry_v1',$1,'registered')`,
+  [writerFirstRegisteredAt]);
+  const writer = await primary.connect();
+  let cleanupBeforeWriterCommit;
+  try {
+    await writer.query("BEGIN");
+    await writer.query(`SELECT object_key FROM ${primarySchema}.pending_objects
+      WHERE contribution_id='chunk-writer-first' FOR UPDATE`);
+    cleanupBeforeWriterCommit = lifecycle.claimQuarantine({
+      objectKey: "objects/writer-first",
+      registeredAt: writerFirstRegisteredAt,
+      leaseId: "writer-first-lease",
+    });
+    let observedLockWait = false;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const waitRows = (await admin.query(`SELECT 1 FROM pg_stat_activity
+        WHERE datname=$1 AND pid <> pg_backend_pid() AND wait_event_type='Lock'
+          AND query LIKE '%pending_objects%'`, [primaryDatabaseName])).rows;
+      if (waitRows.length !== 0) {
+        observedLockWait = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(observedLockWait).toBe(true);
+    await writer.query(`INSERT INTO ${primarySchema}.telemetry_v1_chunks
+      (id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,chunk_digest,envelope_digest,
+       parser_version,record_count,accepted_record_count,r2_key,device_upload_authorization_id,created_at)
+      VALUES('chunk-writer-first',$1,$2,'quota','2026-09-21',98,1,$3,$4,'test',1,1,
+        'objects/writer-first','auth-writer-first',$5)`,
+    [participantId, deviceId, "c".repeat(64), "a".repeat(64), new Date(now + 1)]);
+    await writer.query("COMMIT");
+    expect(await cleanupBeforeWriterCommit).toBe("referenced");
+  } finally {
+    await writer.query("ROLLBACK").catch(() => {});
+    writer.release();
+  }
   const raceRegisteredAt = new Date(now).toISOString();
   await lifecycle.registerQuarantine({
     objectKind: "telemetry_v1",
@@ -275,8 +319,8 @@ it("retries owner erasure, then suppresses a restored primary from the independe
   const retry = await eraseParticipantWithStore(
     dependencies, participantId, "00000000-0000-4000-8000-000000000102", now + 1_000,
   );
-  expect(retry).toMatchObject({ deleted: true, contributionsDeleted: 3 });
-  expect(deleted.map((row) => row.source)).toEqual(["telemetry_v1", "telemetry_v11", "telemetry_v12"]);
+  expect(retry).toMatchObject({ deleted: true, contributionsDeleted: 4 });
+  expect(deleted.map((row) => row.source)).toEqual(["telemetry_v1", "telemetry_v1", "telemetry_v11", "telemetry_v12"]);
   expect((await primary.query(`SELECT COUNT(*)::int AS count FROM ${primarySchema}.analytics_owner_state`)).rows[0].count)
     .toBe(1);
   expect((await primary.query(`SELECT owner_digest FROM ${primarySchema}.analytics_owner_state`)).rows[0].owner_digest)

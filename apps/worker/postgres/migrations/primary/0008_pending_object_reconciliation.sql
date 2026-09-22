@@ -22,13 +22,15 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  blocked boolean;
+  object_key_value text;
+  reconciliation_state_value text;
 BEGIN
   EXECUTE format(
-    'SELECT EXISTS (SELECT 1 FROM %I.pending_objects WHERE contribution_id=$1 AND reconciliation_state=''deleting'')',
+    'SELECT object_key,reconciliation_state FROM %I.pending_objects WHERE contribution_id=$1 FOR UPDATE',
     TG_TABLE_SCHEMA
-  ) INTO blocked USING NEW.id;
-  IF blocked THEN
+  ) INTO object_key_value,reconciliation_state_value USING NEW.id;
+  IF object_key_value IS NULL OR object_key_value IS DISTINCT FROM NEW.r2_key
+      OR reconciliation_state_value <> 'registered' THEN
     RAISE EXCEPTION USING ERRCODE = 'P1005';
   END IF;
   RETURN NEW;

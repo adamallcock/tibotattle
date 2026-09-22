@@ -155,6 +155,11 @@ function statement(text: string, ...values: readonly unknown[]): PostgresStateme
   return Object.freeze({ text, values: Object.freeze(values) });
 }
 
+// Lease decisions must use the database clock at the point the mutation
+// obtains its row lock. A caller-provided timestamp can be stale while a
+// blocked UPDATE waits behind another worker.
+const POSTGRES_NOW_MS = "floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint";
+
 function safeInteger(value: unknown, operation: string): number {
   const number = typeof value === "number" ? value : typeof value === "string" && /^-?\d+$/u.test(value) ? Number(value) : NaN;
   if (!Number.isSafeInteger(number)) throw new PostgresStorageError("incomplete", operation);
@@ -923,17 +928,18 @@ export function createPostgresAnalyticalWorkStore(
       const result = await executeMutation<Record<string, unknown>>(database, operation, statement(`
         INSERT INTO analytics_analysis_work_heads
           (source_id,owner_digest,day,metric,identity_json,state,revision,claim_token,lease_expires_ms)
-        VALUES ($1,$2,$3,$4,$5,'claimed',1,$6,$7)
+        VALUES ($1,$2,$3,$4,$5,'claimed',1,$6,${POSTGRES_NOW_MS} + $7)
         ON CONFLICT (source_id,owner_digest,day,metric) DO UPDATE
           SET identity_json = EXCLUDED.identity_json,
               state = 'claimed', revision = analytics_analysis_work_heads.revision + 1,
               claim_token = EXCLUDED.claim_token, lease_expires_ms = EXCLUDED.lease_expires_ms
         WHERE analytics_analysis_work_heads.identity_json = EXCLUDED.identity_json
           AND analytics_analysis_work_heads.state IN ('pending','claimed','checkpointing')
-          AND (analytics_analysis_work_heads.state = 'pending' OR analytics_analysis_work_heads.lease_expires_ms <= $8)
+          AND (analytics_analysis_work_heads.state = 'pending'
+            OR analytics_analysis_work_heads.lease_expires_ms <= ${POSTGRES_NOW_MS})
         RETURNING identity_json,state,revision,claim_token,lease_expires_ms`,
       identity.sourceId, identity.ownerDigest, identity.day, identity.metric,
-      workIdentityJson(identity, operation), token, nowMs + leaseMs, nowMs));
+      workIdentityJson(identity, operation), token, leaseMs));
       const row = result.rows[0];
       if (!row) return null;
       const head = workHeadFromRow(row, operation);
@@ -955,14 +961,14 @@ export function createPostgresAnalyticalWorkStore(
       }
       const result = await executeMutation<Record<string, unknown>>(database, operation, statement(`
         UPDATE analytics_analysis_work_heads
-           SET lease_expires_ms = $1, revision = revision + 1
+           SET lease_expires_ms = ${POSTGRES_NOW_MS} + $1, revision = revision + 1
          WHERE source_id = $2 AND owner_digest = $3 AND day = $4 AND metric = $5
            AND state IN ('claimed','checkpointing') AND claim_token = $6 AND revision = $7
-           AND identity_json = $9
-           AND lease_expires_ms > $8
-         RETURNING identity_json,revision,claim_token,lease_expires_ms`, nowMs + leaseMs,
+           AND identity_json = $8
+           AND lease_expires_ms > ${POSTGRES_NOW_MS}
+         RETURNING identity_json,revision,claim_token,lease_expires_ms`, leaseMs,
       identity.sourceId, identity.ownerDigest, identity.day, identity.metric,
-      claimToken, expectedRevision, nowMs, workIdentityJson(identity, operation)));
+      claimToken, expectedRevision, workIdentityJson(identity, operation)));
       const row = result.rows[0];
       if (!row) throw new PostgresStorageError("conflict", operation, { retryable: true });
       return Object.freeze({
@@ -1025,12 +1031,15 @@ export function createPostgresAnalyticalWorkStore(
               FROM analytics_analysis_work_heads
              WHERE source_id=$1 AND owner_digest=$2 AND day=$3 AND metric=$4
              FOR UPDATE`, identity.sourceId, identity.ownerDigest, identity.day, identity.metric));
+          const databaseClock = await execute<Record<string, unknown>>(transaction, operation, statement(
+            `SELECT ${POSTGRES_NOW_MS} AS now_ms`));
+          const dbNowMs = safeInteger(databaseClock.rows[0]?.now_ms, operation);
           const currentRow = current.rows[0];
           if (!currentRow || safeString(currentRow.identity_json, operation) !== identityJson
               || !["claimed", "checkpointing"].includes(safeString(currentRow.state, operation))
               || safeInteger(currentRow.revision, operation) !== expectedRevision
               || safeString(currentRow.claim_token, operation) !== claimToken
-              || safeInteger(currentRow.lease_expires_ms, operation) <= nowMs
+              || safeInteger(currentRow.lease_expires_ms, operation) <= dbNowMs
               || (currentRow.head_digest === null ? null : safeString(currentRow.head_digest, operation)) !== checkpoint.expectedHead) {
             throw new PostgresStorageError("conflict", operation, { retryable: true });
           }
@@ -1074,11 +1083,11 @@ export function createPostgresAnalyticalWorkStore(
                    head_digest = $1, checkpoint_generation = $1
              WHERE source_id = $2 AND owner_digest = $3 AND day = $4 AND metric = $5
                AND state IN ('claimed','checkpointing') AND claim_token = $6 AND revision = $7
-               AND identity_json = $8 AND lease_expires_ms > $9
-               AND head_digest IS NOT DISTINCT FROM $10
+               AND identity_json = $8 AND lease_expires_ms > ${POSTGRES_NOW_MS}
+               AND head_digest IS NOT DISTINCT FROM $9
              RETURNING identity_json,state,revision,head_digest,claim_token,lease_expires_ms`,
           checkpoint.generation, identity.sourceId, identity.ownerDigest,
-          identity.day, identity.metric, claimToken, expectedRevision, identityJson, nowMs,
+          identity.day, identity.metric, claimToken, expectedRevision, identityJson,
           checkpoint.expectedHead));
           const row = result.rows[0];
           if (!row) throw new PostgresStorageError("conflict", operation, { retryable: true });
@@ -1107,10 +1116,10 @@ export function createPostgresAnalyticalWorkStore(
                claim_token = NULL, lease_expires_ms = NULL
          WHERE source_id = $2 AND owner_digest = $3 AND day = $4 AND metric = $5
            AND state IN ('claimed','checkpointing') AND claim_token = $6 AND revision = $7
-           AND identity_json = $8 AND lease_expires_ms > $9 AND checkpoint_generation IS NOT NULL
-         RETURNING identity_json,state,revision,head_digest,claim_token,lease_expires_ms`, resultDigest,
+           AND identity_json = $8 AND lease_expires_ms > ${POSTGRES_NOW_MS} AND checkpoint_generation IS NOT NULL
+           RETURNING identity_json,state,revision,head_digest,claim_token,lease_expires_ms`, resultDigest,
       identity.sourceId, identity.ownerDigest, identity.day, identity.metric,
-      claimToken, expectedRevision, identityJson, nowMs));
+      claimToken, expectedRevision, identityJson));
       const row = result.rows[0];
       if (!row) throw new PostgresStorageError("conflict", operation, { retryable: true });
       return workHeadFromRow(row, operation);
@@ -1504,12 +1513,6 @@ async function quarantineReferenceTables(
   return Object.freeze([...tableColumns.keys()]);
 }
 
-function quarantineReferencePredicate(tableNames: readonly string[], objectExpression: string): string {
-  return tableNames.map((tableName) =>
-    `NOT EXISTS (SELECT 1 FROM ${quotePostgresIdentifier(tableName)} c WHERE c.r2_key=${objectExpression})`,
-  ).join(" AND ");
-}
-
 function quarantineReferenceQuery(tableNames: readonly string[]): string {
   return tableNames.map((tableName) =>
     `SELECT 1 FROM ${quotePostgresIdentifier(tableName)} c WHERE c.r2_key=$1`,
@@ -1559,20 +1562,34 @@ export function createPostgresLifecycleStore(
       const operation = "lifecycle.claim_quarantine";
       return inTransaction(primaryDatabase, operation, async (transaction) => {
         const tableNames = await quarantineReferenceTables(transaction, operation);
-        const result = await execute(transaction, operation, statement(`
-          UPDATE pending_objects q
-             SET reconciliation_state='deleting',reconciliation_lease_id=$1
-           WHERE q.object_key=$2 AND q.registered_at=$3
-             AND q.reconciliation_state IN ('registered','deleting')
-             AND ${quarantineReferencePredicate(tableNames, "q.object_key")}
-           RETURNING q.object_key`, input.leaseId, input.objectKey, input.registeredAt));
-        if (result.rowCount === 1) return "claimed";
-        const referenced = await execute(transaction, operation, statement(`
+        // Lock the journal row before checking references. The reference query
+        // is a separate READ COMMITTED statement, so a writer that held this
+        // row lock while admitting its chunk is visible after the lock wait.
+        // Combining the lock and NOT EXISTS in one UPDATE would retain the
+        // pre-wait snapshot and could delete an object with a newly committed
+        // chunk behind it.
+        const pending = await execute<Record<string, unknown>>(transaction, operation, statement(`
+          SELECT object_key,reconciliation_state,reconciliation_lease_id
+            FROM pending_objects
+           WHERE object_key=$1 AND registered_at=$2
+           FOR UPDATE`, input.objectKey, input.registeredAt));
+        const references = await execute(transaction, operation, statement(`
           ${quarantineReferenceQuery(tableNames)}
           LIMIT 1`, input.objectKey));
-        if (referenced.rows.length) return "referenced";
-        const pending = await execute(transaction, operation, statement(`SELECT 1 FROM pending_objects WHERE object_key=$1`, input.objectKey));
-        return pending.rows.length ? "referenced" : "gone";
+        if (references.rows.length) return "referenced";
+        if (pending.rows.length !== 1) return "gone";
+        const state = safeString(pending.rows[0]?.reconciliation_state, operation);
+        if (state !== "registered" && state !== "deleting") {
+          throw new PostgresStorageError("incomplete", operation);
+        }
+        const result = await execute(transaction, operation, statement(`
+          UPDATE pending_objects
+             SET reconciliation_state='deleting',reconciliation_lease_id=$1
+           WHERE object_key=$2 AND registered_at=$3
+             AND reconciliation_state IN ('registered','deleting')
+           RETURNING object_key`, input.leaseId, input.objectKey, input.registeredAt));
+        if (result.rowCount === 1) return "claimed";
+        throw new PostgresStorageError("conflict", operation, { retryable: true });
       });
     },
     async clearQuarantine(input): Promise<void> {
