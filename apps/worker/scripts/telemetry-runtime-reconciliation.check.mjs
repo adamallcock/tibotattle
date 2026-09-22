@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
 import { statSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
-import { identityDigest } from "../../../scripts/lib/release-operation.mjs";
+import {
+  identityDigest,
+  openOperation,
+  readOperation,
+} from "../../../scripts/lib/release-operation.mjs";
 import { DEPLOYMENT_ENDPOINTS } from "../../../config/deployment-endpoints.js";
 import {
   captureTelemetryRuntimeReconciliation,
@@ -108,6 +113,20 @@ test("requires the maintained activation operator arguments", () => {
     "--admin-session-file", "/private/tmp/admin-session.json",
     "--resume", "true",
   ]), { code: "TELEMETRY_RUNTIME_RECONCILIATION_ARGUMENTS_INVALID" });
+  assert.deepEqual(parseTelemetryRuntimeActivationOperatorArguments([
+    "--account-id", ACCOUNT,
+    "--worker-name", WORKER,
+    "--repository-root", "/private/tmp/checkout",
+    "--operation-directory", "/private/tmp/activation-operation",
+    "--request-file", "/private/tmp/activation-request.json",
+  ]), {
+    "--account-id": ACCOUNT,
+    "--worker-name": WORKER,
+    "--repository-root": "/private/tmp/checkout",
+    "--operation-directory": "/private/tmp/activation-operation",
+    "--request-file": "/private/tmp/activation-request.json",
+    resume: false,
+  });
 });
 
 function inventory(versionId = VERSION, sourceCommit = SOURCE) {
@@ -898,3 +917,474 @@ test("posts the exact-origin admin request with the owner Access guard", async (
     await captured.cleanup();
   }
 });
+
+function browserHandoffResult(request) {
+  const activation = request.telemetryRuntimeActivation;
+  return {
+    status: "action_required",
+    transport: "same_origin_browser",
+    origin: DEPLOYMENT_ENDPOINTS.admin.origin,
+    path: "/api/v1/admin/action",
+    method: "POST",
+    operationId: activation.idempotencyKey,
+    target: activation.target,
+    expectedRevision: activation.expectedRevision,
+    requestSha256: identityDigest(request),
+    proofSha256: activation.reconciliation.proofSha256,
+    attestationSha256: activation.reconciliation.deploymentAttestation.attestationSha256,
+  };
+}
+
+function browserAuditDetails(request, code = null) {
+  const activation = request.telemetryRuntimeActivation;
+  return {
+    schemaVersion: "telemetry-runtime-activation-v1",
+    task: "telemetry_runtime_activation",
+    idempotencyKey: activation.idempotencyKey,
+    target: activation.target,
+    expectedRevision: activation.expectedRevision,
+    reconciliation: activation.reconciliation,
+    ...(code === null ? {
+      state: "active",
+      fromRevision: activation.expectedRevision,
+      toRevision: activation.expectedRevision + 1,
+    } : {}),
+    ...(code === null ? {} : { code }),
+  };
+}
+
+async function armBrowserFixture({ requestSha256 = null } = {}) {
+  const captured = await runFixture();
+  const request = activationRequest(captured.proof, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
+  const operation = operationHarness();
+  const lock = lockHarness();
+  const result = await runProtectedTelemetryRuntimeActivation({
+    accountId: ACCOUNT,
+    workerName: WORKER,
+    repositoryRoot: "/private/tmp/synthetic-checkout",
+    operationDirectory: "/private/tmp/synthetic-operation",
+    request,
+    session: null,
+    requestSha256: requestSha256 ?? undefined,
+    transport: "browser",
+    provider: liveProvider(inventory(), inventory()),
+    lockFactory: () => lock,
+    operationFactory: operation.factory,
+    postAdmin: async () => assert.fail("browser arm must never POST"),
+  });
+  return { captured, request, operation, lock, result };
+}
+
+test("arms a content-free same-origin browser handoff and journals before action", async () => {
+  const fixture = await armBrowserFixture();
+  try {
+    assert.deepEqual(fixture.result, browserHandoffResult(fixture.request));
+    assert.equal(fixture.operation.state.status, "browser_action_required");
+    assert.notEqual(fixture.lock.owner, null);
+    const serialized = JSON.stringify({ result: fixture.result, state: fixture.operation.state });
+    assert.doesNotMatch(serialized, /cookie|jwt|token|authorization/iu);
+    assert.deepEqual(fixture.operation.state.browserHandoff, {
+      schema: "telemetry-runtime-browser-handoff-v1",
+      origin: DEPLOYMENT_ENDPOINTS.admin.origin,
+      path: "/api/v1/admin/action",
+      method: "POST",
+      operationId: fixture.request.telemetryRuntimeActivation.idempotencyKey,
+      target: "usage_v12",
+      expectedRevision: 1,
+      requestSha256: identityDigest(fixture.request),
+      proofSha256: fixture.request.telemetryRuntimeActivation.reconciliation.proofSha256,
+      attestationSha256: fixture.request.telemetryRuntimeActivation.reconciliation.deploymentAttestation.attestationSha256,
+      sourceCommit: SOURCE,
+      versionId: VERSION,
+      configSha256: fixture.request.telemetryRuntimeActivation.reconciliation.configSha256,
+    });
+  } finally {
+    await fixture.captured.cleanup();
+  }
+});
+
+test("persists browser action intent to the owner operation journal", async () => {
+  const captured = await runFixture();
+  const root = await mkdtemp("/private/tmp/telemetry-browser-journal-");
+  await chmod(root, 0o700);
+  const operationDirectory = join(root, "activation");
+  const request = activationRequest(captured.proof, "99999999-9999-4999-8999-999999999999");
+  const lock = lockHarness();
+  try {
+    const result = await runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT,
+      workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory,
+      request,
+      session: null,
+      transport: "browser",
+      provider: liveProvider(inventory()),
+      lockFactory: () => lock,
+      operationFactory: openOperation,
+      postAdmin: async () => assert.fail("browser arm must never POST"),
+    });
+    const journal = await readOperation(operationDirectory);
+    assert.equal(result.status, "action_required");
+    assert.equal(journal.state.status, "browser_action_required");
+    assert.equal(journal.state.browserHandoff.requestSha256, identityDigest(request));
+    assert.notEqual(lock.owner, null);
+  } finally {
+    await captured.cleanup();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("binds the browser handoff to the exact request-file bytes", async () => {
+  const captured = await runFixture();
+  const request = activationRequest(captured.proof, "ffffffff-ffff-4fff-8fff-ffffffffffff");
+  const requestBytes = Buffer.from(`${JSON.stringify(request)}\n`, "utf8");
+  const requestSha256 = createHash("sha256").update(requestBytes).digest("hex");
+  const operation = operationHarness();
+  const lock = lockHarness();
+  try {
+    const result = await runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT,
+      workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory: "/private/tmp/synthetic-operation",
+      request,
+      requestSha256,
+      session: null,
+      transport: "browser",
+      provider: liveProvider(inventory()),
+      lockFactory: () => lock,
+      operationFactory: operation.factory,
+      postAdmin: async () => assert.fail("browser arm must never POST"),
+    });
+    assert.equal(result.requestSha256, requestSha256);
+    assert.equal(operation.state.browserHandoff.requestSha256, requestSha256);
+  } finally {
+    await captured.cleanup();
+  }
+});
+
+test("requires a private session for the existing transport but not browser arm", async () => {
+  const browser = await armBrowserFixture();
+  try {
+    assert.equal(browser.result.transport, "same_origin_browser");
+    await assert.rejects(runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT,
+      workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory: "/private/tmp/other-synthetic-operation",
+      request: activationRequest(browser.captured.proof),
+      session: null,
+      provider: liveProvider(inventory()),
+      lockFactory: () => lockHarness(),
+      operationFactory: operationHarness().factory,
+      postAdmin: async () => assert.fail("missing session must fail before POST"),
+    }), { code: "TELEMETRY_RUNTIME_RECONCILIATION_ADMIN_SESSION_INVALID" });
+  } finally {
+    await browser.captured.cleanup();
+  }
+});
+
+test("resumes a browser arm without reading credentials or posting", async () => {
+  const fixture = await armBrowserFixture();
+  try {
+    const resumed = await runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT,
+      workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory: "/private/tmp/synthetic-operation",
+      request: fixture.request,
+      session: null,
+      transport: "browser",
+      resume: true,
+      provider: liveProvider(inventory()),
+      lockFactory: () => fixture.lock,
+      operationFactory: fixture.operation.factory,
+      postAdmin: async () => assert.fail("browser resume must never POST"),
+    });
+    assert.deepEqual(resumed, fixture.result);
+    assert.notEqual(fixture.lock.owner, null);
+    assert.equal(fixture.operation.state.status, "browser_action_required");
+  } finally {
+    await fixture.captured.cleanup();
+  }
+});
+
+test("resumes a browser arm after an uncertain lock acquisition", async () => {
+  const captured = await runFixture();
+  const request = activationRequest(captured.proof, "abababab-abab-4aba-8aba-abababababab");
+  const operation = operationHarness();
+  const lock = lockHarness();
+  lock.failAcquire = true;
+  try {
+    await assert.rejects(runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT,
+      workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory: "/private/tmp/synthetic-operation",
+      request,
+      session: null,
+      transport: "browser",
+      provider: liveProvider(inventory()),
+      lockFactory: () => lock,
+      operationFactory: operation.factory,
+      postAdmin: async () => assert.fail("browser arm must never POST"),
+    }), { code: "TELEMETRY_RUNTIME_RECONCILIATION_ACTIVATION_UNAVAILABLE" });
+    assert.equal(operation.state.status, "lock_intent");
+    const result = await runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT,
+      workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory: "/private/tmp/synthetic-operation",
+      request,
+      session: null,
+      transport: "browser",
+      resume: true,
+      provider: liveProvider(inventory()),
+      lockFactory: () => lock,
+      operationFactory: operation.factory,
+      postAdmin: async () => assert.fail("browser arm must never POST"),
+    });
+    assert.deepEqual(result, browserHandoffResult(request));
+    assert.equal(operation.state.status, "browser_action_required");
+    assert.notEqual(lock.owner, null);
+  } finally {
+    await captured.cleanup();
+  }
+});
+
+test("refuses source or config drift before arming a browser handoff", async () => {
+  const captured = await runFixture();
+  try {
+    for (const changed of [
+      inventory("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+      inventory(VERSION, "c".repeat(40)),
+    ]) {
+      const request = activationRequest(captured.proof);
+      const operation = operationHarness();
+      const lock = lockHarness();
+      await assert.rejects(runProtectedTelemetryRuntimeActivation({
+        accountId: ACCOUNT,
+        workerName: WORKER,
+        repositoryRoot: "/private/tmp/synthetic-checkout",
+        operationDirectory: "/private/tmp/synthetic-operation",
+        request,
+        session: null,
+        transport: "browser",
+        provider: liveProvider(changed),
+        lockFactory: () => lock,
+        operationFactory: operation.factory,
+        postAdmin: async () => assert.fail("drift must fail before browser handoff"),
+      }), { code: "TELEMETRY_RUNTIME_RECONCILIATION_LIVE_DEPLOYMENT_DRIFT" });
+      assert.equal(lock.owner, null);
+      assert.deepEqual(operation.state.result, { status: "refused" });
+    }
+  } finally {
+    await captured.cleanup();
+  }
+});
+
+for (const [outcome, rowState, rowRevision, expected] of [
+  ["success", "active", 2, { kind: "success" }],
+  ["failure", "staged", 1, { kind: "refused" }],
+]) {
+  test(`browser reconcile releases a durable ${outcome} outcome`, async () => {
+    const fixture = await armBrowserFixture();
+    try {
+      const activation = fixture.request.telemetryRuntimeActivation;
+      let posts = 0;
+      const result = await runProtectedTelemetryRuntimeActivation({
+        accountId: ACCOUNT,
+        workerName: WORKER,
+        repositoryRoot: "/private/tmp/synthetic-checkout",
+        operationDirectory: "/private/tmp/synthetic-operation",
+        request: fixture.request,
+        session: null,
+        resume: true,
+        reconcileOnly: true,
+        environment: { CLOUDFLARE_API_TOKEN: "synthetic-provider-token" },
+        provider: liveProvider(inventory()),
+        lockFactory: () => fixture.lock,
+        operationFactory: fixture.operation.factory,
+        postAdmin: async () => { posts += 1; assert.fail("browser reconcile must never POST"); },
+        fetchImpl: async (url, options) => {
+          assert.match(url, new RegExp(`/accounts/${ACCOUNT}/d1/database/${PRIMARY}/query$`));
+          assert.equal(options.method, "POST");
+          const body = JSON.parse(options.body);
+          assert.deepEqual(body.params, [activation.idempotencyKey]);
+          const details = browserAuditDetails(fixture.request, outcome === "failure"
+            ? "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE" : null);
+          return Response.json({ success: true, result: [{
+            success: true,
+            results: [{
+              audit_action: "run_maintenance",
+              audit_details_json: JSON.stringify(details),
+              audit_operation_id: activation.idempotencyKey,
+              audit_outcome: outcome,
+              runtime_policy_revision: rowRevision,
+              runtime_state: rowState,
+            }],
+          }] });
+        },
+      });
+      assert.deepEqual(result, expected.kind === "success" ? resultFor(fixture.request) : { status: "refused" });
+      assert.equal(posts, 0);
+      assert.equal(fixture.lock.owner, null);
+      assert.equal(fixture.operation.state.status, "completed");
+    } finally {
+      await fixture.captured.cleanup();
+    }
+  });
+}
+
+for (const [outcome, rowState, rowRevision] of [
+  ["success", "active", 2],
+  ["failure", "staged", 1],
+]) {
+  test(`browser reconcile retains the lock when deployment drifts during ${outcome} audit read`, async () => {
+    const fixture = await armBrowserFixture();
+    try {
+      const activation = fixture.request.telemetryRuntimeActivation;
+      let reads = 0;
+      await assert.rejects(runProtectedTelemetryRuntimeActivation({
+        accountId: ACCOUNT,
+        workerName: WORKER,
+        repositoryRoot: "/private/tmp/synthetic-checkout",
+        operationDirectory: "/private/tmp/synthetic-operation",
+        request: fixture.request,
+        session: null,
+        resume: true,
+        reconcileOnly: true,
+        environment: { CLOUDFLARE_API_TOKEN: "synthetic-provider-token" },
+        provider: liveProvider(
+          inventory(),
+          inventory("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+        ),
+        lockFactory: () => fixture.lock,
+        operationFactory: fixture.operation.factory,
+        postAdmin: async () => assert.fail("browser reconcile must never POST"),
+        fetchImpl: async () => {
+          reads += 1;
+          return Response.json({ success: true, result: [{
+            success: true,
+            results: [{
+              audit_action: "run_maintenance",
+              audit_details_json: JSON.stringify(browserAuditDetails(
+                fixture.request,
+                outcome === "failure" ? "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE" : null,
+              )),
+              audit_operation_id: activation.idempotencyKey,
+              audit_outcome: outcome,
+              runtime_policy_revision: rowRevision,
+              runtime_state: rowState,
+            }],
+          }] });
+        },
+      }), { code: "TELEMETRY_RUNTIME_RECONCILIATION_ACTIVATION_RECONCILE_REQUIRED" });
+      assert.equal(reads, 1);
+      assert.notEqual(fixture.lock.owner, null);
+      assert.equal(fixture.operation.state.status, "browser_action_required");
+    } finally {
+      await fixture.captured.cleanup();
+    }
+  });
+}
+
+test("browser reconcile retains the lock when the post-read deployment capture fails", async () => {
+  const fixture = await armBrowserFixture();
+  try {
+    const activation = fixture.request.telemetryRuntimeActivation;
+    let captures = 0;
+    let reads = 0;
+    let posts = 0;
+    await assert.rejects(runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT,
+      workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory: "/private/tmp/synthetic-operation",
+      request: fixture.request,
+      session: null,
+      resume: true,
+      reconcileOnly: true,
+      environment: { CLOUDFLARE_API_TOKEN: "synthetic-provider-token" },
+      provider: {
+        capture: async () => {
+          captures += 1;
+          if (captures === 1) return inventory();
+          throw new Error("post-read deployment capture failed");
+        },
+      },
+      lockFactory: () => fixture.lock,
+      operationFactory: fixture.operation.factory,
+      postAdmin: async () => {
+        posts += 1;
+        assert.fail("browser reconcile must never POST");
+      },
+      fetchImpl: async () => {
+        reads += 1;
+        return Response.json({ success: true, result: [{
+          success: true,
+          results: [{
+            audit_action: "run_maintenance",
+            audit_details_json: JSON.stringify(browserAuditDetails(fixture.request)),
+            audit_operation_id: activation.idempotencyKey,
+            audit_outcome: "success",
+            runtime_policy_revision: 2,
+            runtime_state: "active",
+          }],
+        }] });
+      },
+    }), { code: "TELEMETRY_RUNTIME_RECONCILIATION_ACTIVATION_RECONCILE_REQUIRED" });
+    assert.equal(captures, 2);
+    assert.equal(reads, 1);
+    assert.equal(posts, 0);
+    assert.notEqual(fixture.lock.owner, null);
+    assert.equal(fixture.operation.state.status, "browser_action_required");
+  } finally {
+    await fixture.captured.cleanup();
+  }
+});
+
+for (const [label, rows, provider] of [
+  ["started", [{ audit_outcome: "started", runtime_policy_revision: 1, runtime_state: "staged" }], liveProvider(inventory())],
+  ["missing", [], liveProvider(inventory())],
+  ["drift", [{ audit_outcome: "success", runtime_policy_revision: 2, runtime_state: "active" }], liveProvider(inventory("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"))],
+]) {
+  test(`browser reconcile retains the lock for ${label} or ambiguous evidence`, async () => {
+    const fixture = await armBrowserFixture();
+    try {
+      const activation = fixture.request.telemetryRuntimeActivation;
+      let reads = 0;
+      await assert.rejects(runProtectedTelemetryRuntimeActivation({
+        accountId: ACCOUNT,
+        workerName: WORKER,
+        repositoryRoot: "/private/tmp/synthetic-checkout",
+        operationDirectory: "/private/tmp/synthetic-operation",
+        request: fixture.request,
+        session: null,
+        resume: true,
+        reconcileOnly: true,
+        environment: { CLOUDFLARE_API_TOKEN: "synthetic-provider-token" },
+        provider,
+        lockFactory: () => fixture.lock,
+        operationFactory: fixture.operation.factory,
+        postAdmin: async () => assert.fail("browser reconcile must never POST"),
+        fetchImpl: async () => {
+          reads += 1;
+          const row = rows[0] === undefined ? [] : [{
+            audit_action: "run_maintenance",
+            audit_details_json: JSON.stringify(browserAuditDetails(fixture.request)),
+            audit_operation_id: activation.idempotencyKey,
+            ...rows[0],
+          }];
+          return Response.json({ success: true, result: [{ success: true, results: row }] });
+        },
+      }), { code: "TELEMETRY_RUNTIME_RECONCILIATION_ACTIVATION_RECONCILE_REQUIRED" });
+      assert.equal(label === "drift" ? reads : reads, label === "drift" ? 0 : 1);
+      assert.notEqual(fixture.lock.owner, null);
+      assert.equal(fixture.operation.state.status, "browser_action_required");
+    } finally {
+      await fixture.captured.cleanup();
+    }
+  });
+}

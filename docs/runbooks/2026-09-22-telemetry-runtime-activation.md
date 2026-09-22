@@ -167,6 +167,71 @@ produce an activation success.
    The batch either commits all of those changes or commits none. It writes
    only the closed, content-free activation request envelope and singleton
    runtime row; no participant or event payload is included.
+
+   When the owner has an authenticated admin tab in Chrome but cannot provide
+   a private session file, use the journaled browser handoff. It performs the
+   same live source/version/config and request/proof checks, acquires the
+   shared production lock, and durably records the exact action before it
+   returns. It never reads or writes cookies, Access JWTs, or browser state and
+   it never sends the request itself:
+
+   ```sh
+   node apps/worker/scripts/telemetry-runtime-reconciliation.mjs \
+     --mode browser-arm \
+     --account-id <account-id> \
+     --worker-name <production-worker-name> \
+     --repository-root "$PWD" \
+     --operation-directory <owner-private-directory>/telemetry-runtime-activation \
+     --request-file <owner-private-directory>/telemetry-runtime-activation-request.json
+   ```
+
+   The bounded result is `status: "action_required"` with the fixed
+   same-origin route, target, revision, idempotency key, request digest, proof
+   digest, and deployment-attestation digest. It does not print the request
+   body or any authentication material. Keep the operation directory and the
+   shared lock in place while the browser action is pending.
+
+   From the already authenticated `https://admin.tibotattle.com` page, use
+   that page's own same-origin context to select the exact request file and
+   post its unchanged UTF-8 bytes. This browser-side helper verifies the file
+   digest printed by `browser-arm` before sending; it does not inspect or copy
+   cookies or JWTs:
+
+   ```js
+   const expectedRequestSha256 = "<requestSha256 from action-required output>";
+   const picker = Object.assign(document.createElement("input"), {
+     type: "file",
+     accept: "application/json",
+   });
+   picker.onchange = async () => {
+     const file = picker.files?.[0];
+     if (!file) throw new Error("request file required");
+     const bytes = new Uint8Array(await file.arrayBuffer());
+     const digestBytes = new Uint8Array(
+       await crypto.subtle.digest("SHA-256", bytes),
+     );
+     const digest = [...digestBytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+     if (digest !== expectedRequestSha256) throw new Error("request digest mismatch");
+     const response = await fetch("/api/v1/admin/action", {
+       method: "POST",
+       credentials: "same-origin",
+       headers: {
+         "content-type": "application/json",
+         "x-usage-monitor-admin": "1",
+       },
+       body: new TextDecoder().decode(bytes),
+     });
+     const body = await response.json();
+     if (!response.ok) throw new Error(`admin action refused (${response.status})`);
+     console.log(body);
+   };
+   picker.click();
+   ```
+
+   The browser POST is the only external action in this handoff. After it
+   completes, run the read-only reconciliation command below. Do not use the
+   ordinary `activate` command for a browser-armed operation, and do not
+   release the shared lock manually.
 7. Verify the response and runtime row read-only. Confirm `state = active` and
    the revision increased by exactly one. When the performance stream is
    installed, its independent row must remain staged during usage activation;
@@ -235,14 +300,19 @@ node apps/worker/scripts/telemetry-runtime-reconciliation.mjs \
   --worker-name <production-worker-name> \
   --repository-root "$PWD" \
   --operation-directory <owner-private-directory>/telemetry-runtime-activation \
-  --request-file <owner-private-directory>/telemetry-runtime-activation-request.json \
-  --admin-session-file <owner-private-directory>/telemetry-runtime-admin-session.json
+  --request-file <owner-private-directory>/telemetry-runtime-activation-request.json
 ```
 
-That mode releases only after a durable success with the expected active
+That mode is read-only for both private-session and browser handoffs. It
+releases only after a durable success with the expected active
 revision or a durable failure with the original staged revision. A still
 started audit, an active revision without matching success, a missing audit,
 or any read uncertainty remains fail-closed and retains the lock for review.
+For a browser handoff, source/version/config drift between arming and
+reconciliation is also ambiguous and retains the lock. A browser-arm journal
+can be resumed with `--mode browser-arm --resume` to re-emit the same bounded
+action-required details after a process interruption; it will not post or
+change the request.
 If it exits with `release_intent`, `--resume` releases or reconciles that exact
 owner and returns the stored result without posting again.
 

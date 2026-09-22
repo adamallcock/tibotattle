@@ -906,6 +906,126 @@ reviewed, revision-checked D1 operation and a valid reason code. It does not sto
 all lifecycle, request, scheduled, or Durable Object writers. Restoration is a
 separate decision; never treat “contain” as permission to “restore.”
 
+### Production collection-control operator
+
+`apps/worker/scripts/production-collection-control.mjs` is the only maintained
+production collection-control wrapper. It targets the already deployed owner
+route `POST https://admin.tibotattle.com/api/v1/admin/action` and acquires the
+same shared production deployment lock used by typed-forward operations. The
+operator always reads the live source, version, and configuration identity at
+the lock boundary and reads the exact `collection_controls` row from the
+canonical primary D1. A scripted session transport also performs the exact
+owner overview GET before and after the action; browser handoff requires the
+owner to perform those overview checks in the authenticated admin tab because
+Access cookies and JWTs must remain inside that browser.
+
+The default invocation is read-only inspection. `contain` requires
+`CONTAIN_PRODUCTION_COLLECTION`; `restore` requires
+`RESTORE_PRODUCTION_COLLECTION`. Containment always targets all four flags
+false with reason `maintenance` and records the complete original tuple and
+revision. Restoration uses that recorded tuple and the verified contained
+revision; it never assumes that the original state was all enabled. Before
+restoration, the operator also requires the typed usage runtime to remain
+`staged`.
+
+The cutover sequence is strictly ordered: contain and reconcile first, then run
+the reviewed migration and deploy the successor while collection remains
+contained. After the successor is live, run the read-only
+`--mode prepare-successor --successor-output <private-0600-successor.json>`
+capture. It records the successor source commit, version, configuration digest,
+the contained revision, and proof that `telemetry_v12_runtime` is staged. The
+artifact is private, mode `0600`, and no-clobber; a reviewer approves its exact
+`approvedSuccessorSha256` digest. Restore then requires that artifact and digest
+alongside `RESTORE_PRODUCTION_COLLECTION`. Restore is bound to the approved
+successor identity and rechecks it before the owner action and before terminal
+reconciliation, so it does not require the pre-containment deployment identity.
+If the successor changes, prepare a new artifact and obtain a new review; do
+not reuse the old one.
+
+The browser transport is the preferred path when the owner already has a live
+Access session. The command acquires the lock, writes the action intent, and
+prints only the expected revision, target flags, reason, and fixed route. It
+does not POST or ask for cookies. In the exact owner-only admin tab, refresh
+the overview, verify the displayed revision and original/target state, submit
+the matching collection-controls form with reason `maintenance`, then run
+read-only reconciliation. Use the same tab for restoration after the typed
+runtime and contained revision have been independently verified. The browser
+action is a separately authorized owner action; an action-required receipt is
+not proof that the mutation happened.
+
+The session transport is available only when a fresh owner Access session has
+already been exported into a mode-0600 owner-private JSON file. The file is
+validated for exact admin origin, `CF_Authorization` cookie, owner-only mode,
+regular-file identity, and no hard links. It is never copied into the journal,
+receipt, shell arguments, or output. The owner-local credential helper example
+for the Cloudflare provider is:
+
+```sh
+/Users/adamallcock/.codex/bin/secret run cloudflare \
+  --service cloudflare.api_token \
+  --env CLOUDFLARE_API_TOKEN -- \
+  node apps/worker/scripts/production-collection-control.mjs \
+  --mode inspect --transport session \
+  --account-id <private-account-id> --worker-name <production-worker> \
+  --repository-root <clean-checkout> \
+  --operation-directory <new-private-operation-directory> \
+  --admin-session-file <private-0600-session.json>
+```
+
+For a post-deploy successor capture, use the same owner-local helper without an
+admin session export when the read-only canonical provider path is sufficient:
+
+```sh
+/Users/adamallcock/.codex/bin/secret run cloudflare \
+  --service cloudflare.api_token \
+  --env CLOUDFLARE_API_TOKEN -- \
+  node apps/worker/scripts/production-collection-control.mjs \
+  --mode prepare-successor \
+  --account-id <private-account-id> --worker-name <production-worker> \
+  --repository-root <clean-checkout> \
+  --successor-output <private-0600-successor.json>
+```
+
+Use the approved digest from that receipt with the restore operation:
+
+```sh
+node apps/worker/scripts/production-collection-control.mjs \
+  --mode restore --transport browser \
+  --account-id <private-account-id> --worker-name <production-worker> \
+  --repository-root <clean-checkout> \
+  --operation-directory <private-containment-operation-directory> \
+  --successor-artifact <private-0600-successor.json> \
+  --approved-successor-sha256 <reviewed-artifact-digest> \
+  --confirm RESTORE_PRODUCTION_COLLECTION
+```
+
+The helper and the session file are owner-local inputs, not repository
+authority. Keep the account and session paths private. Add the explicit
+confirmation and `--mode contain` only after the live inventory and source
+bracket have been reviewed.
+
+Every mutation writes a durable private journal before the external POST and a
+no-clobber receipt for each intent and terminal result. A 409 is a stop; the
+operator never retries it blindly. A lost response is classified only by a
+fresh exact read: the original tuple at revision `R` remains pending and can
+be retried only by an explicit `--resume` under the same lock, the exact target
+at `R+1` is committed, and any other tuple or revision is ambiguous and keeps
+the lock. `--mode reconcile` is read-only and never posts. Reconciliation
+releases the shared lock only after stable source/version/config identity and
+the exact target readback; uncertainty, drift, or missing evidence keeps it.
+Receipt publication also records the exact private temporary path, destination,
+byte length, and digest in that journal before linking. Recovery removes or
+adopts only that exact journal-bound inode after matching its bytes; arbitrary
+hard links remain refused. If a process stops before the initial containment
+preimage is saved, only the same confirmed `contain --resume` path may finish
+the original-owner live/D1 bracket. Reconcile and restore remain refused until
+that preimage exists.
+
+Containment is a collection-control fence, not a global drain. It does not
+cancel already-running requests, scheduled work, Durable Object alarms, or
+other writers. Preserve the journal and perform a separately reviewed restore
+after the typed-forward operation is complete.
+
 ### Journaled maintenance version
 
 `apps/worker/scripts/production-maintenance.mjs` is a distinct maintenance

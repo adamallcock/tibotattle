@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { isAbsolute, dirname, join } from "node:path";
 import { link, lstat, open, unlink } from "node:fs/promises";
@@ -29,12 +29,21 @@ const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u;
 const UUID_V4 = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
 const ADMIN_SESSION_SCHEMA = "telemetry-runtime-admin-session-v1";
 const OPERATION_SCHEMA = "telemetry-runtime-activation-operation-v1";
+const BROWSER_HANDOFF_SCHEMA = "telemetry-runtime-browser-handoff-v1";
+const ADMIN_ACTION_PATH = "/api/v1/admin/action";
 const MAX_JSON_BYTES = 1_024 * 1_024;
 
 function fail(code) {
   const error = new Error(`TELEMETRY_RUNTIME_RECONCILIATION_${code}`);
   error.code = error.message;
   throw error;
+}
+
+function safeAbsolutePath(value) {
+  return typeof value === "string"
+    && value.length <= 4096
+    && !/[\0\r\n]/u.test(value)
+    && isAbsolute(value);
 }
 
 function object(value) {
@@ -259,6 +268,69 @@ function deploymentIdentity(inventory) {
   return identity;
 }
 
+function browserHandoffFor(request, beforeIdentity, requestSha256 = identityDigest(request)) {
+  const activation = request.telemetryRuntimeActivation;
+  return {
+    schema: BROWSER_HANDOFF_SCHEMA,
+    origin: DEPLOYMENT_ENDPOINTS.admin.origin,
+    path: ADMIN_ACTION_PATH,
+    method: "POST",
+    operationId: activation.idempotencyKey,
+    target: activation.target,
+    expectedRevision: activation.expectedRevision,
+    requestSha256,
+    proofSha256: activation.reconciliation.proofSha256,
+    attestationSha256: activation.reconciliation.deploymentAttestation.attestationSha256,
+    sourceCommit: beforeIdentity.sourceCommit,
+    versionId: beforeIdentity.versionId,
+    configSha256: beforeIdentity.configSha256,
+  };
+}
+
+function validateBrowserHandoff(value, activation) {
+  if (!exactKeys(value, [
+    "attestationSha256", "configSha256", "expectedRevision", "method", "operationId",
+    "origin", "path", "proofSha256", "requestSha256", "schema", "sourceCommit", "target",
+    "versionId",
+  ])
+      || value.schema !== BROWSER_HANDOFF_SCHEMA
+      || value.origin !== DEPLOYMENT_ENDPOINTS.admin.origin
+      || value.path !== ADMIN_ACTION_PATH
+      || value.method !== "POST"
+      || value.operationId !== activation.idempotencyKey
+      || value.target !== activation.target
+      || value.expectedRevision !== activation.expectedRevision
+      || !UUID_V4.test(value.operationId ?? "")
+      || !COMMIT.test(value.sourceCommit ?? "")
+      || !UUID_V4.test(value.versionId ?? "")
+      || !SHA256.test(value.configSha256 ?? "")
+      || value.proofSha256 !== activation.reconciliation.proofSha256
+      || value.attestationSha256 !== activation.reconciliation.deploymentAttestation.attestationSha256
+      || !SHA256.test(value.requestSha256 ?? "")) {
+    fail("BROWSER_HANDOFF_INVALID");
+  }
+  return value;
+}
+
+function browserActionRequiredResult(request, handoff, requestSha256 = identityDigest(request)) {
+  const activation = request.telemetryRuntimeActivation;
+  validateBrowserHandoff(handoff, activation);
+  if (handoff.requestSha256 !== requestSha256) fail("BROWSER_HANDOFF_INVALID");
+  return {
+    status: "action_required",
+    transport: "same_origin_browser",
+    origin: handoff.origin,
+    path: handoff.path,
+    method: handoff.method,
+    operationId: handoff.operationId,
+    target: handoff.target,
+    expectedRevision: handoff.expectedRevision,
+    requestSha256: handoff.requestSha256,
+    proofSha256: handoff.proofSha256,
+    attestationSha256: handoff.attestationSha256,
+  };
+}
+
 function assertDeploymentMatchesProof(identity, proof) {
   const attestation = proof.deploymentAttestation;
   if (identity.sourceCommit !== attestation.sourceCommit
@@ -309,7 +381,7 @@ function validateAdminSession(value) {
   return value;
 }
 
-async function readOwnerPrivateJson(path) {
+async function readOwnerPrivateJson(path, { withDigest = false } = {}) {
   if (!isAbsolute(path ?? "")) fail("PRIVATE_FILE_INVALID");
   let info;
   try { info = await lstat(path); } catch { fail("PRIVATE_FILE_INVALID"); }
@@ -327,7 +399,11 @@ async function readOwnerPrivateJson(path) {
     bytes = await handle.readFile();
   } finally { await handle.close(); }
   if (bytes.length !== info.size) fail("PRIVATE_FILE_INVALID");
-  try { return JSON.parse(bytes.toString("utf8")); } catch { fail("PRIVATE_FILE_INVALID"); }
+  let value;
+  try { value = JSON.parse(bytes.toString("utf8")); } catch { fail("PRIVATE_FILE_INVALID"); }
+  return withDigest
+    ? { value, sha256: createHash("sha256").update(bytes).digest("hex") }
+    : value;
 }
 
 async function postTelemetryRuntimeAdminAction({ session, request, fetchImpl = globalThis.fetch }) {
@@ -536,9 +612,12 @@ async function readExactActivationOutcome({
   return exactActivationOutcome(rows[0], activation);
 }
 
-function assertOperationState(state, activation) {
+function assertOperationState(state, activation, requestSha256 = identityDigest({
+  action: "run_maintenance",
+  telemetryRuntimeActivation: activation,
+})) {
   if (!object(state)
-      || !["lock_intent", "held", "admin_intent", "release_intent", "completed"].includes(state.status)
+      || !["lock_intent", "held", "admin_intent", "browser_action_required", "release_intent", "completed"].includes(state.status)
       || !COMMIT.test(state.owner ?? "")) {
     fail("OPERATION_STATE_INVALID");
   }
@@ -547,6 +626,21 @@ function assertOperationState(state, activation) {
   if (state.status === "admin_intent"
       && (!exactKeys(state, ["beforeIdentity", "owner", "status"])
         || !deploymentIdentityShape(state.beforeIdentity))) fail("OPERATION_STATE_INVALID");
+  if (state.status === "browser_action_required"
+      && (!exactKeys(state, ["beforeIdentity", "browserHandoff", "owner", "status"])
+        || !deploymentIdentityShape(state.beforeIdentity))) fail("OPERATION_STATE_INVALID");
+  if (state.status === "browser_action_required") {
+    validateBrowserHandoff(state.browserHandoff, activation);
+    if (state.browserHandoff.sourceCommit !== state.beforeIdentity.sourceCommit
+        || state.browserHandoff.versionId !== state.beforeIdentity.versionId
+        || state.browserHandoff.configSha256 !== state.beforeIdentity.configSha256
+        || state.browserHandoff.sourceCommit !== activation.reconciliation.deploymentAttestation.sourceCommit
+        || state.browserHandoff.versionId !== activation.reconciliation.deploymentAttestation.versionId
+        || state.browserHandoff.configSha256 !== activation.reconciliation.deploymentAttestation.configSha256
+        || state.browserHandoff.requestSha256 !== requestSha256) {
+      fail("OPERATION_STATE_INVALID");
+    }
+  }
   if (state.status === "release_intent"
       && exactKeys(state, ["owner", "result", "status"])
       && exactKeys(state.result, ["status"])
@@ -578,6 +672,8 @@ export async function runProtectedTelemetryRuntimeActivation({
   operationDirectory,
   request,
   session,
+  requestSha256 = null,
+  transport = "session",
   resume = false,
   reconcileOnly = false,
   environment = process.env,
@@ -593,10 +689,17 @@ export async function runProtectedTelemetryRuntimeActivation({
   if (!/^[a-f0-9]{32}$/u.test(accountId ?? "")
       || !/^[A-Za-z0-9_-]{1,63}$/u.test(workerName ?? "")
       || !isAbsolute(repositoryRoot ?? "")
-      || !isAbsolute(operationDirectory ?? "")) fail("ARGUMENTS_INVALID");
+      || !isAbsolute(operationDirectory ?? "")
+      || !["session", "browser"].includes(transport)) fail("ARGUMENTS_INVALID");
   validateActivationRequest(request);
-  validateAdminSession(session);
+  if (transport === "browser") {
+    if (session !== null && session !== undefined) fail("ADMIN_SESSION_INVALID");
+  } else if (!reconcileOnly) {
+    validateAdminSession(session);
+  }
   const activation = request.telemetryRuntimeActivation;
+  requestSha256 ??= identityDigest(request);
+  if (!SHA256.test(requestSha256)) fail("BROWSER_HANDOFF_INVALID");
   const proof = activation.reconciliation;
   const binding = operationBinding({ accountId, workerName, request });
   const operation = await operationFactory({
@@ -607,7 +710,14 @@ export async function runProtectedTelemetryRuntimeActivation({
   });
   let state = operation.record.state;
   const newOperation = Object.keys(state).length === 0;
-  if (!newOperation || resume) assertOperationState(state, activation);
+  if (!newOperation || resume) assertOperationState(state, activation, requestSha256);
+  const browserTransport = transport === "browser"
+    || state.status === "browser_action_required";
+  if (transport === "browser" && !newOperation
+      && !["lock_intent", "held", "browser_action_required"].includes(state.status)) {
+    operation.close();
+    fail("BROWSER_HANDOFF_INVALID");
+  }
   if (state.status === "completed") {
     if (!activationResultShape(state.result, activation)
         && !(exactKeys(state.result, ["status"]) && state.result.status === "refused")) {
@@ -629,7 +739,8 @@ export async function runProtectedTelemetryRuntimeActivation({
   };
   const lock = lockFactory({ repositoryRoot });
   let lockHeld = false;
-  let adminAttempted = state.status === "admin_intent";
+  let adminAttempted = state.status === "admin_intent"
+    || state.status === "browser_action_required";
   let acquisitionPending = newOperation;
   const releaseBeforeMutation = async () => {
     if (!lockHeld) return;
@@ -663,6 +774,15 @@ export async function runProtectedTelemetryRuntimeActivation({
     let inventory;
     try {
       inventory = await captureLive();
+      let browserReadIdentity = null;
+      if (state.status === "browser_action_required") {
+        browserReadIdentity = deploymentIdentity(inventory);
+        if (browserReadIdentity.sourceCommit !== state.beforeIdentity.sourceCommit
+            || browserReadIdentity.versionId !== state.beforeIdentity.versionId
+            || browserReadIdentity.configSha256 !== state.beforeIdentity.configSha256) {
+          return null;
+        }
+      }
       const outcome = reconcileOutcome === null
           ? await readExactActivationOutcome({
             accountId,
@@ -670,9 +790,25 @@ export async function runProtectedTelemetryRuntimeActivation({
             activation,
           inventory,
           environment,
-          fetchImpl,
-        })
+            fetchImpl,
+          })
         : await reconcileOutcome({ activation, inventory });
+      if (state.status === "browser_action_required") {
+        // The browser request happens outside this process.  Bracket the
+        // fixed audit/runtime read with fresh deployment captures so a
+        // deployment/config change during the browser action cannot be
+        // mistaken for evidence about the armed request.
+        const afterInventory = await captureLive();
+        const afterIdentity = deploymentIdentity(afterInventory);
+        if (afterIdentity.sourceCommit !== state.beforeIdentity.sourceCommit
+            || afterIdentity.versionId !== state.beforeIdentity.versionId
+            || afterIdentity.configSha256 !== state.beforeIdentity.configSha256
+            || afterIdentity.sourceCommit !== browserReadIdentity.sourceCommit
+            || afterIdentity.versionId !== browserReadIdentity.versionId
+            || afterIdentity.configSha256 !== browserReadIdentity.configSha256) {
+          return null;
+        }
+      }
       if (outcome?.kind === "success" && activationResultShape(outcome.result, activation)) {
         return { kind: "success", result: outcome.result };
       }
@@ -735,8 +871,36 @@ export async function runProtectedTelemetryRuntimeActivation({
         await operation.save(state);
       }
     }
-    if (reconcileOnly && state.status !== "admin_intent") {
+    if (reconcileOnly && !["admin_intent", "browser_action_required"].includes(state.status)) {
       fail("ACTIVATION_RECONCILE_REQUIRED");
+    }
+    if (state.status === "browser_action_required") {
+      if (reconcileOnly) {
+        // Browser transport has no private session to replay.  Reconciliation
+        // is the only follow-up and remains read-only until the exact audit
+        // row proves a success or a non-commit failure.
+        const reconciled = await reconcileUncertainAdminIntent();
+        if (reconciled !== null) {
+          if (reconciled.kind === "refused") {
+            await releaseReconciledRefusal();
+          } else {
+            await releaseSuccessfulMutation(reconciled.result);
+          }
+          return reconciled.result;
+        }
+        fail("ACTIVATION_RECONCILE_REQUIRED");
+      }
+      // A browser arm is deliberately a two-process boundary.  Resuming the
+      // journal only revalidates the live deployment and re-emits the bounded
+      // handoff; it never posts or reads browser credentials.
+      const currentInventory = await captureLive();
+      const currentIdentity = deploymentIdentity(currentInventory);
+      if (currentIdentity.sourceCommit !== state.beforeIdentity.sourceCommit
+          || currentIdentity.versionId !== state.beforeIdentity.versionId
+          || currentIdentity.configSha256 !== state.beforeIdentity.configSha256) {
+        fail("LIVE_DEPLOYMENT_DRIFT");
+      }
+      return browserActionRequiredResult(request, state.browserHandoff, requestSha256);
     }
     if (state.status === "admin_intent") {
       if (reconcileOnly) {
@@ -781,6 +945,17 @@ export async function runProtectedTelemetryRuntimeActivation({
     const beforeInventory = await captureLive();
     const beforeIdentity = deploymentIdentity(beforeInventory);
     assertDeploymentMatchesProof(beforeIdentity, proof);
+    if (browserTransport) {
+      // The journal write below is the browser handoff's mutation boundary.
+      // It happens before the CLI returns an action-required result, so a
+      // browser operator can never act without a durable owner and exact
+      // request/proof binding.
+      adminAttempted = true;
+      const browserHandoff = browserHandoffFor(request, beforeIdentity, requestSha256);
+      state = { ...state, status: "browser_action_required", beforeIdentity, browserHandoff };
+      await operation.save(state);
+      return browserActionRequiredResult(request, browserHandoff, requestSha256);
+    }
     // From this point onward the durable owner has crossed the admin mutation
     // boundary. If the intent save itself loses its response, retain the lock
     // and require an exact resume rather than releasing a possibly committed
@@ -827,7 +1002,7 @@ export function parseTelemetryRuntimeReconciliationArguments(argv) {
   }
   if (!/^[a-f0-9]{32}$/u.test(result["--account-id"] ?? "")
       || !/^[A-Za-z0-9_-]{1,63}$/u.test(result["--worker-name"] ?? "")
-      || !isAbsolute(result["--output"] ?? "")) {
+      || !safeAbsolutePath(result["--output"] ?? "")) {
     fail("ARGUMENTS_INVALID");
   }
   // Keep the account identity check explicit so malformed account IDs never
@@ -857,10 +1032,11 @@ export function parseTelemetryRuntimeActivationOperatorArguments(argv) {
   }
   if (!/^[a-f0-9]{32}$/u.test(result["--account-id"] ?? "")
       || !/^[A-Za-z0-9_-]{1,63}$/u.test(result["--worker-name"] ?? "")
-      || !isAbsolute(result["--repository-root"] ?? "")
-      || !isAbsolute(result["--operation-directory"] ?? "")
-      || !isAbsolute(result["--request-file"] ?? "")
-      || !isAbsolute(result["--admin-session-file"] ?? "")) {
+      || !safeAbsolutePath(result["--repository-root"] ?? "")
+      || !safeAbsolutePath(result["--operation-directory"] ?? "")
+      || !safeAbsolutePath(result["--request-file"] ?? "")
+      || (result["--admin-session-file"] !== undefined
+        && !safeAbsolutePath(result["--admin-session-file"]))) {
     fail("ARGUMENTS_INVALID");
   }
   return result;
@@ -937,10 +1113,27 @@ async function main() {
   const argv = process.argv.slice(2);
   if (argv[0] === "--mode") {
     const mode = argv[1];
-    if (mode !== "activate" && mode !== "reconcile") fail("ARGUMENTS_INVALID");
+    if (mode !== "activate" && mode !== "browser-arm" && mode !== "reconcile") {
+      fail("ARGUMENTS_INVALID");
+    }
     const args = parseTelemetryRuntimeActivationOperatorArguments(argv.slice(2));
-    const request = await readOwnerPrivateJson(args["--request-file"]);
-    const session = await readOwnerPrivateJson(args["--admin-session-file"]);
+    const requestFile = await readOwnerPrivateJson(args["--request-file"], { withDigest: true });
+    const request = requestFile.value;
+    if (mode === "activate" && args["--admin-session-file"] === undefined) {
+      fail("ARGUMENTS_INVALID");
+    }
+    if (mode === "browser-arm" && args["--admin-session-file"] !== undefined) {
+      // A browser handoff must never even open a private session file.
+      fail("ARGUMENTS_INVALID");
+    }
+    if (mode === "reconcile" && args["--admin-session-file"] !== undefined) {
+      // Reconciliation is read-only for both transports and never needs
+      // cookies or Access JWT material.  Reject the path before opening it.
+      fail("ARGUMENTS_INVALID");
+    }
+    const session = args["--admin-session-file"] === undefined
+      ? null
+      : await readOwnerPrivateJson(args["--admin-session-file"]);
     const result = await runProtectedTelemetryRuntimeActivation({
       accountId: args["--account-id"],
       workerName: args["--worker-name"],
@@ -948,10 +1141,20 @@ async function main() {
       operationDirectory: args["--operation-directory"],
       request,
       session,
+      requestSha256: requestFile.sha256,
+      transport: mode === "browser-arm" ? "browser" : "session",
       resume: mode === "reconcile" ? true : args.resume,
       reconcileOnly: mode === "reconcile",
     });
-    process.stdout.write(`${JSON.stringify({ status: "completed", result })}\n`);
+    const output = mode === "browser-arm"
+      ? {
+        status: "action_required",
+        result,
+        requestFile: args["--request-file"],
+        operationDirectory: args["--operation-directory"],
+      }
+      : { status: "completed", result };
+    process.stdout.write(`${JSON.stringify(output)}\n`);
     return;
   }
   const args = parseTelemetryRuntimeReconciliationArguments(argv);
