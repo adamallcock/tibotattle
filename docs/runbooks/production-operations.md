@@ -471,6 +471,175 @@ and are not aliases. Do not edit an applied ledger, ignore an unknown name, or
 apply this sequence to an alternative history. Stop and review that exact
 environment before proceeding; the ordered-prefix guard remains unchanged.
 
+### Typed v1.2 existing-role forward migration
+
+The typed v1.2 successor has a separate existing-role operator. It is a
+forward-only, populated-schema operation for the exact predecessor source
+`eaf6f521fb9842399da512fd1ad5020c7b706f5b`. It applies the four primary
+`ingestion-isolation-migrations/0006`–`0009` files, then the three analytics
+`analytics-migrations/0024`–`0026` files, in that order. The operator binds each
+SQL digest, the candidate clean `HEAD`, the exact database IDs and names, the
+prior schema/data/ledger receipts, the reviewed canonical inventory digest, a 9 GB
+capacity budget, and a rehearsal receipt. It never creates or repairs a
+missing prior ledger. The active Worker predecessor, version, canonical live
+configuration fingerprint, contained collection hold, and reviewed D1
+Time Travel receipt are re-read under the shared production lock before the
+first D1 write and before every later write. The plan's `inventorySha256` is
+the canonical digest of the embedded inventory object, so execution also
+detects an edited or internally inconsistent plan.
+
+Run the local populated rehearsal from the repository root. It uses
+synthetic content-free rows, enables foreign-key checks, verifies every mapped
+column and staged/default value, and proves the carried analytics columns with
+per-column aggregate invariants. This mode never reads credentials or performs
+remote work:
+
+```sh
+mkdir -m 700 /absolute/private/typed-forward-rehearsal
+node apps/worker/scripts/typed-forward-migration.mjs --mode rehearse \
+  --worker-root apps/worker \
+  --output /absolute/private/typed-forward-rehearsal/rehearsal.json
+```
+
+The explicit output is a mode-0600 private artifact written atomically; use
+its path in prepare rather than relying on terminal output.
+
+Capture the reviewed D1 Time Travel receipt separately before preparing the
+plan. The targets file must be a mode-0600 JSON array in this exact order,
+containing only the reviewed `role`, binding, database `name`, and
+`databaseId` for `primary` then `analytics`. The capture uses one timestamp,
+the pinned Wrangler CLI, and read-only `time-travel info` calls; it never
+restores or mutates a database. The output is a mode-0600
+`typed-forward-backup-receipt-v2` artifact with one exact bookmark per target
+and a digest:
+
+```sh
+node apps/worker/scripts/typed-forward-migration.mjs --mode capture-backup \
+  --targets /absolute/private/typed-forward-target-identities.json \
+  --operation /absolute/private/typed-forward-backup-capture \
+  --cli /absolute/wrangler-dist/cli.js \
+  --account-id ACCOUNT_ID --wrangler-sha256 WRANGLER_SHA256 \
+  --captured-at 2026-09-22T12:00:00.000Z \
+  --expires-at 2026-09-23T12:00:00.000Z \
+  --output /absolute/private/typed-forward-backup-receipt.json
+```
+
+A maintained read-only capture brackets the active Worker and the two target
+roles, checks that collection is already contained, and writes three new
+mode-0600 artifacts: the enriched `inventory.json`, the exact ordered
+`targets.json` with populated schema/data/ledger receipts, and the v2 Time
+Travel backup receipt. It performs no remote writes. The growth budget is an
+explicit reviewed number and must leave the 9 GB operating cap below its
+limit:
+
+```sh
+mkdir -m 700 /absolute/private/typed-forward-capture
+node apps/worker/scripts/typed-forward-migration.mjs --mode capture-inventory \
+  --operation /absolute/private/typed-forward-capture \
+  --cli /absolute/wrangler-dist/cli.js \
+  --account-id ACCOUNT_ID --worker-name WORKER_NAME \
+  --wrangler-sha256 WRANGLER_SHA256 --growth-budget-bytes 1000000000 \
+  --inventory-output /absolute/private/typed-forward-capture/inventory.json \
+  --targets-output /absolute/private/typed-forward-capture/targets.json \
+  --backup-output /absolute/private/typed-forward-capture/backup-receipt.json
+```
+
+The capture preflights all three destination parents before any Worker or D1
+read. It stages the three files and publishes each with a no-clobber commit;
+`typed-forward-inventory-publication.json` is a private durable journal in the
+operation directory bound to the account, Worker, CLI path and digest, growth
+budget, exact output paths, and explicit capture-time inputs. If a later destination fails, stop with the journal in
+`partial` state and rerun the exact command with the same operation and output
+paths. The operator resumes the staged local publication after checking the
+journal and does not repeat the remote reads. A destination created or changed
+while publication is in progress is refused and remains untouched.
+
+The capture does two canonical Worker/config reads and rechecks both target
+binding IDs/names, the contained control revision, and the exact prior
+schema/data/ledger observations for both roles after the backup and hold edge.
+Any source,
+version, configuration, role, hold, or backup drift leaves no newly written
+artifact. Prepare then writes a mode-0600 closed plan only from a clean
+checkout whose `HEAD` equals the candidate source pin:
+
+```sh
+node apps/worker/scripts/typed-forward-migration.mjs --mode prepare \
+  --worker-root apps/worker --repository-root /absolute/candidate-checkout \
+  --inventory /absolute/private/inventory.json \
+  --targets /absolute/private/targets.json \
+  --rehearsal /absolute/private/typed-forward-rehearsal/rehearsal.json \
+  --candidate-source CANDIDATE_COMMIT --account-id ACCOUNT_ID \
+  --worker-name WORKER_NAME --wrangler-sha256 WRANGLER_SHA256 \
+  --output /absolute/private/typed-forward-plan.json
+```
+
+Inspecting a plan is read-only and does not acquire the shared production
+deployment lock. The remote path is a separate explicitly confirmed command.
+It first rechecks the pinned clean source, canonical embedded inventory digest, prior
+receipt, schema prefix and content-free invariants. Each migration file is
+split using the pinned Wrangler splitter. A durable intent is written before
+each bounded mutation request, and the migration ledger insert is its own
+final statement checkpoint. Former foreign-key-off rebuild regions are
+rehearsed and coalesced into one atomic request containing
+`PRAGMA defer_foreign_keys = ON` followed by the complete rebuild region; D1
+runs that request in one implicit transaction and the transport decodes the
+exact result count with every result successful. User `PRAGMA foreign_keys`
+changes and standalone deferral requests are never sent. After every mutation
+it reads the exact schema and ledger/progress checkpoint, and after each ledger
+checkpoint it runs a bounded remote foreign-key check. The shared lock remains
+held on any failure or uncertain response:
+
+```sh
+node apps/worker/scripts/typed-forward-migration.mjs --mode execute \
+  --plan /absolute/private/typed-forward-plan.json \
+  --worker-root apps/worker --repository-root /absolute/candidate-checkout \
+  --operation /absolute/private/typed-forward-operation \
+  --cli /absolute/wrangler-dist/cli.js \
+  --confirmation EXECUTE_REVIEWED_TYPED_FORWARD_MIGRATION \
+  --approved-plan-sha256 PLAN_SHA256
+```
+
+After an uncertain result, stop and rerun the same plan with `--resume`. Resume
+reads first and accepts only the exact before or after state recorded by the
+durable intent; it never blindly retries a provider operation. A completed
+release-intent resumes by observing lock ownership and releases only the
+original owner. An expired plan can only resume reads/reconciliation. A write
+extension is admitted only on that existing expired operation, with an
+`approvedAt` at or after the prior deadline, the exact previous-extension
+digest, and a new window of at most 24 hours. Verify the private artifacts and
+their canonical digests before the explicitly protected resume command:
+
+An active chained extension renews the write approval for the original
+contained hold and captured Time Travel bookmarks. It does not replace those
+recovery anchors: each write re-reads the exact control revision and resolves
+the original bookmark at its original capture timestamp. Their capture
+timestamps may be older than the new boundary only while that extension is
+active; any control or bookmark drift still refuses the write.
+
+```sh
+test -f /absolute/private/typed-forward-plan.json \
+  && test "$(stat -f '%Lp' /absolute/private/typed-forward-plan.json)" = 600
+test -f /absolute/private/typed-forward-extension.json \
+  && test "$(stat -f '%Lp' /absolute/private/typed-forward-extension.json)" = 600
+PLAN_SHA256="$(node --input-type=module -e 'import { readFileSync } from "node:fs"; import { identityDigest } from "./scripts/lib/release-operation.mjs"; process.stdout.write(identityDigest(JSON.parse(readFileSync(process.argv[1], "utf8"))))' /absolute/private/typed-forward-plan.json)"
+EXTENSION_SHA256="$(node --input-type=module -e 'import { readFileSync } from "node:fs"; import { identityDigest } from "./scripts/lib/release-operation.mjs"; process.stdout.write(identityDigest(JSON.parse(readFileSync(process.argv[1], "utf8"))))' /absolute/private/typed-forward-extension.json)"
+node apps/worker/scripts/typed-forward-migration.mjs --mode execute --resume \
+  --plan /absolute/private/typed-forward-plan.json \
+  --worker-root apps/worker --repository-root /absolute/candidate-checkout \
+  --operation /absolute/private/typed-forward-operation \
+  --cli /absolute/wrangler-dist/cli.js \
+  --confirmation EXECUTE_REVIEWED_TYPED_FORWARD_MIGRATION \
+  --approved-plan-sha256 "$PLAN_SHA256" \
+  --extension /absolute/private/typed-forward-extension.json \
+  --approved-extension-sha256 "$EXTENSION_SHA256"
+```
+
+The concrete transport also rechecks the active Worker through the canonical
+read-only production inventory provider and verifies a Time Travel bookmark at
+the receipt capture time for each exact database. Typed deployment, client
+rollout and staged activation remain separate gates after both ledgers have
+been read back.
+
 ## Owner deployment
 
 ### Attribution successor cutover and rollback

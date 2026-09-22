@@ -221,7 +221,32 @@ export async function beginAdminOperation(
   details: unknown,
   nowEpoch = Date.now(),
 ): Promise<string> {
-  const operationId = crypto.randomUUID();
+  return beginAdminOperationWithId(
+    db,
+    crypto.randomUUID(),
+    actorIdentityKey,
+    action,
+    details,
+    nowEpoch,
+  );
+}
+
+/**
+ * Begin an owner operation with a caller-supplied idempotency key. The key is
+ * the audit row's unique operation_id, so a retry can reconcile one exact
+ * attempt without scanning bounded JSON details or creating a second intent.
+ */
+export async function beginAdminOperationWithId(
+  db: D1Database,
+  operationId: string,
+  actorIdentityKey: string,
+  action: AdminAction,
+  details: unknown,
+  nowEpoch = Date.now(),
+): Promise<string> {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(operationId)) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
   const actorIdentityDigest = await adminIdentityDigest(actorIdentityKey);
   await db.prepare(
     `INSERT INTO admin_action_audit (

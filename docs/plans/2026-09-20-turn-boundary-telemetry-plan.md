@@ -8,12 +8,13 @@ status: in-progress
 # Telemetry v1.2 implementation and compatibility plan
 
 Implementation is on `codex/telemetry-v12-integration`. The current local
-candidate incorporates `origin/main` through `e70cff4d` (PR #200) and retains
-the earlier `6d061b57` snapshot (through PR #194), staging asset repair, and
-the mixed-client regression. The original foundation remains at
-`fb778d17` in `codex/telemetry-v12-foundation`; the dirty local main checkout is
-untouched. Exact-total capture uses parser v17 and preserves the remote parser
-v16 missing-cache-write assumption and provenance. Integration retains newer
+candidate incorporates `origin/main` through
+`8b7ac4c1fd593c2c84aa35a23b48faef8f52eaac` and retains the mixed-client
+regression, staging asset repair and the other release-base changes. The
+original foundation remains at `fb778d17` in
+`codex/telemetry-v12-foundation`; the dirty local main checkout is untouched.
+Exact-total capture uses parser v17 and preserves the remote parser v16
+missing-cache-write assumption and provenance. Integration retains newer
 tool-free speed reporting, Electron tray/startup behavior, allowance animation,
 admin database health, opt-in crash diagnostics and LOWESS allowance trends.
 Canonical localization regenerates both browser and Electron copies. The local
@@ -24,6 +25,65 @@ module, including Electron, native and history-free export membership.
 must preserve all supported client versions and current cache calculations.
 Source qualification, installed-client qualification, publication and hosted
 activation remain separate; no deployment or remote migration is authorized.
+
+## Current integrated candidate and operational boundary — 2026-09-22
+
+The source prerequisites for the v1.2 successor are complete in this candidate.
+The typed-forward capture, backup, rehearsal, extension and recovery path was
+audited through `ce044bd8`. Protected runtime activation, exact replay,
+target-specific usage/performance gates and read-only reconciliation were
+audited through `59d01799`. These are source and package qualifications only;
+they do not prove the live D1 schema, a deployed Worker, an installed client or
+an activated capability.
+
+The primary migration sequence is forward-only and must be applied in this
+order, with the recorded SQL digests checked against the contained plan:
+
+1. `0006_usage_correction_facts.sql` —
+   `cbcac1caef1e854686752d0d025967b4a74102d1297253f31b2ac2ecb42f6d2d`.
+2. `0007_usage_correction_admission.sql` —
+   `3893f350f4c76481a1a0fcc88fd8b5516ec8239fb100f21942c35105263f19ba`.
+3. `0008_telemetry_v12.sql` —
+   `d5802b4a1d228c8b4388b5effe67cbf4e61605628eec00d54f0d1669c988c9e1`.
+4. `0009_performance_reports.sql` —
+   `cfd43797151ea3d5a6740da9792be49bf897968094347cd6fbbb9a0cf6510825`.
+
+The analytics sequence follows the primary sequence: `0024_effective_owner_daily_cursor.sql`
+(`f4eef3495ae3e5f1088ddea695607471dcbc2ea871291274ce50ef1295a05e68`),
+`0025_effective_graph_source.sql`
+(`a99ba82106e53ac2eda3ac9078784e22774ba0fc099265a66dacc5b1765fe84b`), and
+`0026_cache_retention_effective_layout.sql`
+(`bac1838613b292b97bfee5022f6b43b6f52c9bc225d6d26f918cdcd7e454a2a1`).
+
+The live evidence currently available is point-in-time only: production source
+was `eaf6f521fb9842399da512fd1ad5020c7b706f5b`, with inventory digest
+`89df7a420927391c7dbdde73053fc96d52709a120ea41d87b9ff790a568bbc2b` and
+configuration fingerprint
+`777bbb7f718ffe5005fa8991eed5603995e79e24d86d74d8baa59d2743ae315f`.
+Those values must be freshly recaptured against the merged candidate before any
+remote action. No production migration, deployment or capability activation has
+occurred, and client publication remains held.
+
+The remaining work is live operational qualification, in this exact order:
+
+1. Capture a contained inventory and backup.
+2. Run the private rehearsal and prepare/inspect the exact migration plan.
+3. Apply the reviewed migration plan, then perform a read-only reconciliation.
+4. Deploy the reviewed candidate and perform post-deploy reconciliation.
+5. Optionally activate usage v1.2 after its owner and evidence gates pass.
+6. Separately and optionally activate the performance stream after its own
+   schema, permission and evidence gates pass.
+
+Usage activation is independent of the performance schema at the runtime gate,
+although the current migration package still includes both `0008` and `0009`.
+V1, v1.1 and v1.2 clients continue to coexist, and unsupported clients retain
+their existing readers and upload behavior. Cache calculations remain exactly
+as they are until a significant back catalog supports a separate decision.
+Historical timing rows without qualified source evidence remain unknown; no
+forced reparse is implied. Performance remains staged with the same fixed,
+mergeable histogram ranges for every contributor, covering TTFT, TPS and full
+turn completion, with fast/standard, source, tier and reasoning cuts. Its daily
+reports remain independent of continuity collection.
 
 ## Implementation scope — 2026-09-21
 
@@ -44,7 +104,7 @@ activation remain separate; no deployment or remote migration is authorized.
 The dated checkpoints below describe their original foundation revision; they
 are not evidence that the rebased integration candidate has passed those gates.
 
-## Latest local qualification checkpoint — 2026-09-22
+## Historical local qualification checkpoint — 2026-09-22
 
 At clean local commit `35507980`, the `d7849e8f` integration passes 1,009
 browser and 381 local tests, architecture, documentation and preflight checks.
@@ -81,15 +141,16 @@ source transform, while still refusing forged schema digests. The deployment
 API rejects contradictory predecessor pins before any snapshot or Wrangler
 call. This integration does not activate v1.2 or apply a remote migration.
 
-Public health on 2026-09-22 still reported production source `0fb6a5e6`,
+At that earlier checkpoint, public health reported production source `0fb6a5e6`,
 operational collection controls, and accepted contribution v0.1. That
-observation does not reveal the live D1
-schema. The read-only production reconciliation requires a reviewed private
-resource inventory and credential, which are not present in this workspace.
-Installed-client qualification, live schema compatibility, protected R7/native
-release qualification, remote migrations, deployment and publication remain
-separate gates. Usage v1.2 and performance capabilities remain staged; current
-cache calculations are unchanged.
+observation did not reveal the live D1 schema and predates the later point-in-
+time production evidence recorded in the current operational boundary above.
+The read-only production reconciliation still requires a freshly reviewed
+private resource inventory and credential. Installed-client qualification, live
+schema compatibility, protected R7/native release qualification, remote
+migrations, deployment and publication remain separate gates. Usage v1.2 and
+performance capabilities remain staged; current cache calculations are
+unchanged.
 
 ## Fixed decisions
 
@@ -519,7 +580,8 @@ authority. Each read snapshots its owner, revision, epoch and pagination once,
 then checks that authority before and after the page query and after digest
 reconstruction. The runtime starts staged and effective-fact reads require
 active state. The typed v1 writer uses the capture API; no production analytical
-reader consumes the archive yet, so capture activation remains blocked.
+reader has not been activated in production, so capture activation remains a
+live operational gate.
 An owner can have several current chunks: its latest journal event is not a
 coverage proof for all of them. Capture checks each chunk's own complete,
 unsuperseded admission and immutable digests under the current owner revision.
@@ -548,16 +610,21 @@ real writer passes a replacement test with 200 distinct sessions/models.
 
 ## Remaining implementation work
 
-Capture is connected to the real typed v1 replacement transaction and its
-erasure/schema inventory is covered. Typed-source restore and effective
-readers remain prerequisites before enabling the runtime. Admission must
-continue accepting useful older-client records;
-rejecting a whole upload because an overlap has null totals would also discard
-its new occurrences. Reader qualification must therefore precede relaxation of
-v1.1 closure guards. Existing per-chunk arithmetic summaries, single-device
-selection and owner-wide v1/v1.1 choice cannot establish the required
-occurrence-preserving result. Keep this source integration staged until those
-dependencies are implemented and tested together.
+The source prerequisites described by this section are complete in the current
+candidate: typed-source capture and recovery, effective readers,
+occurrence-preserving mixed-version reconciliation, and the protected runtime
+activation/reconciliation path are implemented and audited. The requirements
+table below is retained as historical design inventory; its imperative wording
+does not identify missing source work. The remaining gates are live inventory,
+backup, migration, deployment, post-deploy proof and separately authorized
+capability activation, as recorded in the current operational boundary above.
+
+Admission continues accepting useful older-client records. Rejecting a whole
+upload because an overlap has null totals would discard its new occurrences,
+so the implementation preserves explicit unknowns while retaining
+occurrence-preserving reconciliation. Existing per-chunk arithmetic summaries,
+single-device selection and owner-wide v1/v1.1 choice are not used as coverage
+proofs.
 
 Active capture has database guards on chunk, record, admission and allocation
 retirement.

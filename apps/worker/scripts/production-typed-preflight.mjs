@@ -23,6 +23,7 @@ export const TYPED_PRODUCTION_ROLE_BINDINGS = Object.freeze({
 export const TYPED_PRODUCTION_PREFLIGHT_SQL = Object.freeze({
   probe: 'SELECT 1 AS typed_preflight_probe',
   schema: "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' AND tbl_name <> 'd1_storage_migrations' ORDER BY type,name LIMIT 4097",
+  ledger: 'SELECT name,sha256 FROM d1_storage_migrations ORDER BY rowid LIMIT 129',
   sourceState: 'SELECT singleton,source_id,authority_epoch FROM storage_source_state WHERE singleton=1',
   v1Admission: 'SELECT id,source_namespace,namespace_id,runtime_contract_version FROM typed_v1_admission_state WHERE id=1',
   v11Admission: 'SELECT id,source_namespace,namespace_id,runtime_contract_version FROM typed_v11_admission_state WHERE id=1',
