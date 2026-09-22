@@ -1385,6 +1385,77 @@ export interface PostgresLifecycleStoreOptions {
   readonly schemaOptions?: PostgresSchemaOptions;
 }
 
+const QUARANTINE_REFERENCE_TABLES = Object.freeze([
+  "contributions",
+  "telemetry_contributions",
+  "telemetry_v1_chunks",
+  "telemetry_v11_chunks",
+  "telemetry_v12_chunks",
+] as const);
+
+const REQUIRED_QUARANTINE_REFERENCE_TABLES = new Set([
+  "telemetry_v1_chunks",
+  "telemetry_v11_chunks",
+  "telemetry_v12_chunks",
+]);
+
+/**
+ * Resolve only the fixed source tables used by quarantine cleanup.  Older
+ * hosted schemas may not have the v0 tables, but an incomplete canonical
+ * schema must never turn an unknown reference into an orphan claim.  The
+ * result is consumed only to compose fixed, quoted identifiers below; callers
+ * cannot supply SQL or table names through a storage port.
+ */
+async function quarantineReferenceTables(
+  transaction: PostgresTransactionExecutor,
+  operation: string,
+): Promise<readonly string[]> {
+  const result = await execute<{ table_name: unknown; column_name: unknown }>(transaction, operation, statement(`
+    SELECT t.table_name,c.column_name
+      FROM information_schema.tables t
+      LEFT JOIN information_schema.columns c
+        ON c.table_schema=t.table_schema
+       AND c.table_name=t.table_name
+       AND c.column_name='r2_key'
+     WHERE t.table_schema=current_schema()
+       AND t.table_name = ANY($1::text[])
+     ORDER BY t.table_name`, [...QUARANTINE_REFERENCE_TABLES]));
+  const tableColumns = new Map<string, string | null>();
+  for (const row of result.rows) {
+    const tableName = safeString(row.table_name, operation);
+    const columnName = row.column_name === null ? null : safeString(row.column_name, operation);
+    if (!QUARANTINE_REFERENCE_TABLES.includes(tableName as typeof QUARANTINE_REFERENCE_TABLES[number])) {
+      throw new PostgresStorageError("incomplete", operation);
+    }
+    const prior = tableColumns.get(tableName);
+    if (prior !== undefined && prior !== columnName) {
+      throw new PostgresStorageError("incomplete", operation);
+    }
+    tableColumns.set(tableName, columnName);
+  }
+  for (const required of REQUIRED_QUARANTINE_REFERENCE_TABLES) {
+    if (tableColumns.get(required) !== "r2_key") {
+      throw new PostgresStorageError("unavailable", operation);
+    }
+  }
+  for (const [tableName, columnName] of tableColumns) {
+    if (columnName !== "r2_key") throw new PostgresStorageError("incomplete", operation);
+  }
+  return Object.freeze([...tableColumns.keys()]);
+}
+
+function quarantineReferencePredicate(tableNames: readonly string[], objectExpression: string): string {
+  return tableNames.map((tableName) =>
+    `NOT EXISTS (SELECT 1 FROM ${quotePostgresIdentifier(tableName)} c WHERE c.r2_key=${objectExpression})`,
+  ).join(" AND ");
+}
+
+function quarantineReferenceQuery(tableNames: readonly string[]): string {
+  return tableNames.map((tableName) =>
+    `SELECT 1 FROM ${quotePostgresIdentifier(tableName)} c WHERE c.r2_key=$1`,
+  ).join(" UNION ALL ");
+}
+
 /**
  * Lifecycle state spans two authorities. Tombstones and identity cooldowns
  * are written to the independent ledger pool/schema; quarantine and
@@ -1421,37 +1492,33 @@ export function createPostgresLifecycleStore(
     },
     async registerQuarantine(input: StorageQuarantineRegistration): Promise<void> {
       await executeMutation(primaryDatabase, "lifecycle.register_quarantine", statement(`
-        INSERT INTO pending_quarantine_objects(r2_key,contribution_id,object_kind,registered_at,reconciliation_state)
+        INSERT INTO pending_objects(object_key,contribution_id,object_kind,registered_at,reconciliation_state)
         VALUES($1,$2,$3,$4,'registered')`, input.objectKey, input.contributionId, input.objectKind, input.registeredAt));
     },
     async claimQuarantine(input): Promise<"claimed" | "referenced" | "gone"> {
-      const result = await executeMutation(primaryDatabase, "lifecycle.claim_quarantine", statement(`
-        UPDATE pending_quarantine_objects q
-           SET reconciliation_state='deleting',reconciliation_lease_id=$1
-         WHERE q.r2_key=$2 AND q.registered_at=$3
-           AND q.reconciliation_state IN ('registered','deleting')
-           AND NOT EXISTS (SELECT 1 FROM contributions c WHERE c.r2_key=q.r2_key)
-           AND NOT EXISTS (SELECT 1 FROM telemetry_contributions c WHERE c.r2_key=q.r2_key)
-           AND NOT EXISTS (SELECT 1 FROM telemetry_v1_chunks c WHERE c.r2_key=q.r2_key)
-           AND NOT EXISTS (SELECT 1 FROM telemetry_v11_chunks c WHERE c.r2_key=q.r2_key)
-           AND NOT EXISTS (SELECT 1 FROM telemetry_v12_chunks c WHERE c.r2_key=q.r2_key)
-         RETURNING q.r2_key`, input.leaseId, input.objectKey, input.registeredAt));
-      if (result.rowCount === 1) return "claimed";
-      const referenced = await execute(primaryDatabase, "lifecycle.claim_quarantine", statement(`
-        SELECT 1 FROM contributions c WHERE c.r2_key=$1
-        UNION ALL SELECT 1 FROM telemetry_contributions c WHERE c.r2_key=$1
-        UNION ALL SELECT 1 FROM telemetry_v1_chunks c WHERE c.r2_key=$1
-        UNION ALL SELECT 1 FROM telemetry_v11_chunks c WHERE c.r2_key=$1
-        UNION ALL SELECT 1 FROM telemetry_v12_chunks c WHERE c.r2_key=$1
-        LIMIT 1`, input.objectKey));
-      if (referenced.rows.length) return "referenced";
-      const pending = await execute(primaryDatabase, "lifecycle.claim_quarantine", statement(`SELECT 1 FROM pending_quarantine_objects WHERE r2_key=$1`, input.objectKey));
-      return pending.rows.length ? "referenced" : "gone";
+      const operation = "lifecycle.claim_quarantine";
+      return inTransaction(primaryDatabase, operation, async (transaction) => {
+        const tableNames = await quarantineReferenceTables(transaction, operation);
+        const result = await execute(transaction, operation, statement(`
+          UPDATE pending_objects q
+             SET reconciliation_state='deleting',reconciliation_lease_id=$1
+           WHERE q.object_key=$2 AND q.registered_at=$3
+             AND q.reconciliation_state IN ('registered','deleting')
+             AND ${quarantineReferencePredicate(tableNames, "q.object_key")}
+           RETURNING q.object_key`, input.leaseId, input.objectKey, input.registeredAt));
+        if (result.rowCount === 1) return "claimed";
+        const referenced = await execute(transaction, operation, statement(`
+          ${quarantineReferenceQuery(tableNames)}
+          LIMIT 1`, input.objectKey));
+        if (referenced.rows.length) return "referenced";
+        const pending = await execute(transaction, operation, statement(`SELECT 1 FROM pending_objects WHERE object_key=$1`, input.objectKey));
+        return pending.rows.length ? "referenced" : "gone";
+      });
     },
     async clearQuarantine(input): Promise<void> {
       const result = await executeMutation(primaryDatabase, "lifecycle.clear_quarantine", statement(`
-        DELETE FROM pending_quarantine_objects
-         WHERE r2_key=$1 AND ($2::text IS NULL OR reconciliation_lease_id=$2)`, input.objectKey, input.leaseId ?? null));
+        DELETE FROM pending_objects
+         WHERE object_key=$1 AND ($2::text IS NULL OR reconciliation_lease_id=$2)`, input.objectKey, input.leaseId ?? null));
       if (result.rowCount !== 1) throw new PostgresStorageError("conflict", "lifecycle.clear_quarantine", { retryable: true });
     },
     async beginMaintenance(input): Promise<boolean> {

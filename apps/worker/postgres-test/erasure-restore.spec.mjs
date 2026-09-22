@@ -8,6 +8,7 @@ import { ApiError } from "../src/errors.ts";
 import { eraseParticipantWithStore } from "../src/participant-erasure-store.ts";
 import { createPostgresParticipantErasureStores } from "../src/postgres-participant-erasure-canonical.ts";
 import { createPostgresRestoreSuppressionGate } from "../src/postgres-participant-erasure-canonical.ts";
+import { createPostgresLifecycleStore } from "../src/postgres-storage-provider.ts";
 import {
   preparePostgresStorageParticipantErasure,
   requirePostgresStorageParticipantErasureComplete,
@@ -152,6 +153,32 @@ afterAll(async () => {
 
 it("retries owner erasure, then suppresses a restored primary from the independent ledger", async () => {
   await seedParticipant();
+  const lifecycle = createPostgresLifecycleStore({
+    primaryPool: primary,
+    ledgerPool: ledger,
+    schemaOptions: { primarySchema, ledgerSchema },
+  });
+  const orphanRegisteredAt = new Date(now).toISOString();
+  await lifecycle.registerQuarantine({
+    objectKind: "telemetry_v12",
+    contributionId: "orphan-quarantine",
+    objectKey: "objects/orphan",
+    registeredAt: orphanRegisteredAt,
+  });
+  expect(await lifecycle.claimQuarantine({
+    objectKey: "objects/orphan",
+    registeredAt: orphanRegisteredAt,
+    leaseId: "orphan-lease",
+  })).toBe("claimed");
+  await lifecycle.clearQuarantine({ objectKey: "objects/orphan", leaseId: "orphan-lease" });
+  const referencedRegisteredAt = (await primary.query(
+    `SELECT registered_at FROM ${primarySchema}.pending_objects WHERE object_key='objects/v1'`,
+  )).rows[0].registered_at.toISOString();
+  expect(await lifecycle.claimQuarantine({
+    objectKey: "objects/v1",
+    registeredAt: referencedRegisteredAt,
+    leaseId: "referenced-lease",
+  })).toBe("referenced");
   const stores = createPostgresParticipantErasureStores(primary, ledger, {
     schemaOptions: { primarySchema, ledgerSchema },
   });
