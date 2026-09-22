@@ -9,11 +9,17 @@ import { createPostgresWorkerBackend } from "../src/backend-composition.ts";
 import { deviceHash } from "../src/device-auth.ts";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import {
+  claimPendingAppleSignInHandoff,
   claimPendingGoogleSignInHandoff,
+  completeAppleSignInHandoff,
   completeGoogleSignInHandoff,
+  consumeAppleSignInHandoff,
   consumeGoogleSignInHandoff,
+  deliverAppleSignInHandoff,
   deliverGoogleSignInHandoff,
+  insertAppleSignInHandoff,
   insertGoogleSignInHandoff,
+  readPendingAppleSignInHandoff,
   readPendingGoogleSignInHandoff,
 } from "../src/identity-handoff-repository.ts";
 import {
@@ -302,6 +308,155 @@ describe("PostgreSQL-backed Worker route composition", () => {
       bindingHash,
       nowIso,
     )).toBeNull();
+    expect(d1Touches).toBe(0);
+  });
+
+  it("rechecks Apple and Google proof expiry after a concurrent row lock", async () => {
+    async function createDeliveredAppleHandoff() {
+      const verifier = randomBytes(48).toString("base64url");
+      const bindingHash = createHash("sha256").update(verifier).digest("hex");
+      const state = randomBytes(48).toString("base64url");
+      const claimId = randomBytes(48).toString("base64url");
+      const proof = randomBytes(48).toString("base64url");
+      const nowIso = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+      const deliveryExpiresAt = new Date(Date.now() + 250).toISOString();
+      const identityLinkKey = "cd".repeat(32);
+      const nonceHash = createHash("sha256").update(randomBytes(32)).digest("hex");
+
+      await insertAppleSignInHandoff(backend.identity, {
+        state,
+        nonceHash,
+        bindingHash,
+        createdAt: nowIso,
+        expiresAt,
+      });
+      expect(await readPendingAppleSignInHandoff(
+        backend.identity,
+        state,
+        nowIso,
+        bindingHash,
+      )).toEqual({ state, nonceHash });
+      expect(await claimPendingAppleSignInHandoff(
+        backend.identity,
+        state,
+        claimId,
+        nowIso,
+        new Date(Date.now() - 60_000).toISOString(),
+      )).toEqual({ state, nonceHash });
+      expect(await completeAppleSignInHandoff(
+        backend.identity,
+        state,
+        claimId,
+        identityLinkKey,
+        proof,
+        nowIso,
+        deliveryExpiresAt,
+      )).toBe(true);
+      expect(await deliverAppleSignInHandoff(
+        backend.identity,
+        state,
+        nowIso,
+        bindingHash,
+      )).toEqual({ proof });
+      return { bindingHash, proof };
+    }
+
+    async function createDeliveredGoogleHandoff() {
+      const verifier = randomBytes(48).toString("base64url");
+      const bindingHash = createHash("sha256").update(verifier).digest("hex");
+      const state = randomBytes(48).toString("base64url");
+      const claimId = randomBytes(48).toString("base64url");
+      const proof = randomBytes(48).toString("base64url");
+      const nowIso = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+      const deliveryExpiresAt = new Date(Date.now() + 250).toISOString();
+      const identityLinkKey = "ef".repeat(32);
+
+      await insertGoogleSignInHandoff(backend.identity, {
+        state,
+        codeVerifier: verifier,
+        bindingHash,
+        createdAt: nowIso,
+        expiresAt,
+      });
+      expect(await readPendingGoogleSignInHandoff(
+        backend.identity,
+        state,
+        nowIso,
+        bindingHash,
+      )).toEqual({ state, codeVerifier: verifier });
+      expect(await claimPendingGoogleSignInHandoff(
+        backend.identity,
+        state,
+        claimId,
+        nowIso,
+        new Date(Date.now() - 60_000).toISOString(),
+      )).toEqual({ state, codeVerifier: verifier });
+      expect(await completeGoogleSignInHandoff(
+        backend.identity,
+        state,
+        claimId,
+        identityLinkKey,
+        proof,
+        nowIso,
+        deliveryExpiresAt,
+      )).toBe(true);
+      expect(await deliverGoogleSignInHandoff(
+        backend.identity,
+        state,
+        nowIso,
+        bindingHash,
+      )).toEqual({ proof });
+      return { bindingHash, proof };
+    }
+
+    async function expectExpiredAfterLock(tableName, proof, bindingHash, consume) {
+      const locker = await primary.connect();
+      try {
+        await locker.query("BEGIN");
+        const locked = await locker.query(
+          `SELECT state FROM "${primarySchema}"."${tableName}" WHERE proof = $1 FOR UPDATE`,
+          [proof],
+        );
+        expect(locked.rowCount).toBe(1);
+        const consuming = consume(proof, bindingHash, new Date().toISOString());
+        // Keep the row locked beyond the short delivery deadline. The consume
+        // transaction must acquire the row first, then evaluate clock_timestamp().
+        await locker.query("SELECT pg_sleep(0.5)");
+        await locker.query("ROLLBACK");
+        expect(await consuming).toBeNull();
+      } finally {
+        await locker.query("ROLLBACK").catch(() => {});
+        locker.release();
+      }
+    }
+
+    const apple = await createDeliveredAppleHandoff();
+    await expectExpiredAfterLock(
+      "apple_signin_handoffs",
+      apple.proof,
+      apple.bindingHash,
+      (proof, bindingHash, nowIso) => consumeAppleSignInHandoff(
+        backend.identity,
+        proof,
+        bindingHash,
+        nowIso,
+      ),
+    );
+
+    const google = await createDeliveredGoogleHandoff();
+    await expectExpiredAfterLock(
+      "google_signin_handoffs",
+      google.proof,
+      google.bindingHash,
+      (proof, bindingHash, nowIso) => consumeGoogleSignInHandoff(
+        backend.identity,
+        proof,
+        bindingHash,
+        nowIso,
+      ),
+    );
     expect(d1Touches).toBe(0);
   });
 });

@@ -150,6 +150,12 @@ export function createPostgresIdentityHandoffBackend(
     consume(input): Promise<SignInHandoffConsumedIdentity | null> {
       const snapshot = { ...input };
       return withPostgresMutation(pool, async (client) => {
+        // Acquire the proof row before evaluating the live deadline.  If a
+        // concurrent lifecycle writer holds this row lock until the proof
+        // expires, the final DELETE must see that expiry after the wait.
+        await client.query(`SELECT state FROM ${handoffs}
+          WHERE proof = $1 AND binding_hash = $2 AND identity_link_key IS NOT NULL
+            AND delivered_at IS NOT NULL FOR UPDATE`, [snapshot.proof, snapshot.bindingHash]);
         const result = await client.query(`DELETE FROM ${handoffs}
           WHERE proof = $1 AND binding_hash = $2 AND identity_link_key IS NOT NULL
             AND delivered_at IS NOT NULL AND expires_at > clock_timestamp()
@@ -281,6 +287,9 @@ export function createPostgresIdentityHandoffBackend(
     consume(input): Promise<SignInHandoffConsumedIdentity | null> {
       const snapshot = { ...input };
       return withPostgresMutation(pool, async (client) => {
+        await client.query(`SELECT state FROM ${googleHandoffs}
+          WHERE proof = $1 AND binding_hash = $2 AND identity_link_key IS NOT NULL
+            AND delivered_at IS NOT NULL FOR UPDATE`, [snapshot.proof, snapshot.bindingHash]);
         const result = await client.query(`DELETE FROM ${googleHandoffs}
           WHERE proof = $1 AND binding_hash = $2 AND identity_link_key IS NOT NULL
             AND delivered_at IS NOT NULL AND expires_at > clock_timestamp()
