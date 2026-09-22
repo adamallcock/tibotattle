@@ -241,7 +241,9 @@ parameters). It performs one constant `SELECT 1` per API-bound D1 role: primary
 service/telemetry, deletion ledger, and the separate analytics database in typed
 storage mode. JSON mode explicitly marks separate analytics as not applicable.
 Other Workers' databases, including the catchup control journal, are outside this
-probe's coverage. The existing Access owner pin protects the route; the public
+probe's coverage. The page is explicit that this is not an account-wide database
+inventory; retained recovery copies, staging databases, R2 and Durable Objects
+are not covered by the D1 read check. The existing Access owner pin protects the route; the public
 hostname returns 404 and responses are never cached.
 
 Each check reports read availability, elapsed round-trip milliseconds, D1-reported
@@ -269,10 +271,24 @@ Growth headlines count retained identities/events, with recent UTC-day charts;
 legacy web sign-in, pairing and consent counters do not measure accountless
 Electron enrollment. Accepted-data counters follow the active storage mode: legacy whole
 contributions/v1.0 chunks, or typed v1/v1.1 upload headers. Distribution separates
-native and Electron manifest checks by OS and reported version. Address reach
-can overlap between rows, and a latest-GitHub-tag match does not establish that
+native and Electron manifest checks by OS and reported version. The version table
+includes per-OS and overall seven-day totals. The Worker unions addresses across
+apps, versions and query segments before applying the displayed version-row cap;
+never add version-row address counts in the browser. Older overview snapshots
+without `observedTotals` show totals as unavailable. Unknown versions mean the
+request lacked a usable `TiboTattle/<version>` token, not that the client uses the
+latest feed version. Address reach can overlap between rows and OS totals, and a latest-GitHub-tag match does not establish that
 each platform is on its own current feed version. GitHub download counters cover
 macOS DMG assets only, not Windows/Linux adoption or completed installations.
+
+Cloudflare's sampled results carry `≈`; distinct addresses represent the returned
+sample, not an extrapolated device census. A query row cap adds `+`. Incomplete
+traffic coverage suppresses sparklines, with one explanation above the cards.
+The source-quality card keeps failures and staleness visible while detailed
+freshness and provenance are expandable. Failure groups remain visible; individual
+retained request IDs are an expandable drill-down into the same sampled events.
+The section navigator appears before the page heading and stays visible while
+scrolling, with horizontal scrolling on narrow screens.
 
 Collection drafts survive refreshes and retain the revision on which editing
 started. A conflicting revision must be discarded and reviewed before saving.

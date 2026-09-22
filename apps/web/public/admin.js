@@ -710,8 +710,10 @@ function renderMetricCards(selector, metrics) {
       name,
       number,
       caption,
-      recentHistory(points, label, valueFormatter, historyUnavailable),
     );
+    if (!(selector === "#distribution-counts" && historyUnavailable)) {
+      card.append(recentHistory(points, label, valueFormatter, historyUnavailable));
+    }
     return card;
   }));
 }
@@ -1292,10 +1294,10 @@ function renderDatabaseHealth() {
   const badge = $("#database-health-status");
   badge.className = `admin-source-badge ${health === "available" && snapshot?.status === "available" ? "admin-source-available" : "admin-source-partial"}`;
   badge.textContent = health === "stale" ? "Refresh failed · previous checks"
-    : snapshot ? snapshot.status === "available" ? "All required databases readable" : "Database checks need attention"
+    : snapshot ? snapshot.status === "available" ? "All required API databases readable" : "Database checks need attention"
     : health === "loading" ? "Waiting for database checks" : "Database checks unavailable";
   $("#database-health-freshness").textContent = snapshot
-    ? `Checked ${formatTime(snapshot.observedAt)} · Storage mode: ${snapshot.storageMode}.${health === "stale" ? " These are previous results, not current health." : ""}`
+    ? `Checked ${formatTime(snapshot.observedAt)} · ${snapshot.databases.length} API database roles · Storage mode: ${snapshot.storageMode}.${health === "stale" ? " These are previous results, not current health." : ""}`
     : "No usable database check loaded. Refresh to retry; older deployments may not provide this endpoint.";
   const labels = { primary: "Primary service and telemetry", deletion_ledger: "Deletion ledger", analytics: "Separate analytics" };
   const statuses = { reachable: "Readable", unavailable: "Read failed", timeout: "Timed out (5 seconds)", not_configured: "Binding unavailable", not_applicable: "Not used in JSON mode" };
@@ -1775,6 +1777,22 @@ function renderDistribution(distribution) {
     ],
   ]);
 
+  if (isAdminPage) {
+    $("#distribution-estimate-note").textContent = !cloudflareAvailable
+      ? "Update traffic is unavailable. GitHub download counts are a separate source."
+      : `${cloudflare.sampled ? "≈ marks sampled Cloudflare traffic: requests are estimates and distinct addresses cover only the returned sample. " : "Cloudflare returned unsampled traffic for this window. "}${cloudflare.bounded ? "+ marks a query row cap: more traffic may be missing. " : ""}${cloudflareHistoryUnavailable ? "Traffic trends are hidden while coverage is incomplete. " : ""}GitHub download counters are not sampled.`;
+    const syncStatus = github.sync.lastFailureCode
+      ? `GitHub sync failed (${github.sync.lastFailureCode}); check the source details and retry sync.`
+      : github.sync.stale
+        ? "GitHub snapshot is stale; sync releases to refresh it."
+        : githubAvailable ? "GitHub release data is current." : "GitHub release data is unavailable.";
+    $("#distribution-source-summary").textContent = `${cloudflareAvailable
+      ? cloudflare.sampled || cloudflare.bounded
+        ? "Traffic has coverage limits; use it as an activity signal, not an installation count."
+        : "Traffic is available without sampling or a query row cap."
+      : "Traffic analytics are unavailable; activity cannot be assessed."} ${syncStatus}${history.counterRegressions > 0 ? ` ${history.counterRegressions} download counters decreased; comparisons need review.` : ""}`;
+  }
+
   const versions = cloudflare.observedVersions;
   const activeAddresses = active?.last7Days ?? 0;
   $("#distribution-version-rows").replaceChildren(
@@ -1789,12 +1807,28 @@ function renderDistribution(distribution) {
       distributionCount(version.requestsLast7Days, cloudflare),
     ])),
   );
+  if (isAdminPage) {
+    const totals = cloudflare.observedTotals;
+    const platformName = os => ({ macos: "macOS", windows: "Windows", linux: "Linux" })[os];
+    $("#distribution-total-rows").replaceChildren(...(totals ? [
+      ...totals.platforms.map(row => tableRow([
+        "Platform total", platformName(row.operatingSystem), "All versions",
+        percentage(row.sourceAddressesLast7Days, activeAddresses),
+        distributionCount(row.sourceAddressesLast7Days, cloudflare),
+        distributionCount(row.requestsLast7Days, cloudflare),
+      ])),
+      tableRow(["Overall total", "All OS", "All versions",
+        percentage(totals.overall.sourceAddressesLast7Days, activeAddresses),
+        distributionCount(totals.overall.sourceAddressesLast7Days, cloudflare),
+        distributionCount(totals.overall.requestsLast7Days, cloudflare)]),
+    ] : []));
+  }
   $("#distribution-version-empty").hidden = versions.length !== 0;
   $("#distribution-version-empty").textContent = cloudflareAvailable
     ? "No recognized app-version traffic was observed in this window."
     : "App-version evidence is unavailable; this does not mean there are no active apps.";
   if (isAdminPage) $("#distribution-version-coverage").textContent =
-    `${cloudflare.observedVersionsBounded ? "Version list capped; additional rows are omitted. " : ""}Address reach uses all observed active addresses as its denominator. One address can occur in several app, OS or version rows, so percentages need not sum to 100%. Unknown means the updater did not report an app version.`;
+    `${cloudflare.observedVersionsBounded ? "Version list capped; additional rows are omitted. " : ""}Address reach uses all observed active addresses as its denominator. One address can occur in several app, OS or version rows, so percentages need not sum to 100%. Each total counts an address once across all included apps and versions; platform totals can overlap. ${cloudflare.observedTotals ? "" : "Totals are unavailable from this snapshot. "}Unknown means no usable TiboTattle app version was present in the updater request; it cannot be recovered from the OS or update feed.`;
 
   const releases = github.releases;
   $("#github-release-rows").replaceChildren(
@@ -3607,6 +3641,11 @@ function renderOverviewUnavailable() {
   state.overviewUnavailable = true;
   renderControlStatus();
   const hasPreviousData = state.overview !== null;
+  if (isAdminPage && hasPreviousData) {
+    const summary = $("#distribution-source-summary");
+    const stalePrefix = "Refresh failed — previous dated evidence. ";
+    if (!summary.textContent.startsWith(stalePrefix)) summary.textContent = stalePrefix + summary.textContent;
+  }
   if (state.reconstructionProgress === null) {
     renderReconstructionProgress(state.overview?.reconstruction, { stale: hasPreviousData });
   }
@@ -3646,7 +3685,8 @@ function refuseAdminAccess(error) {
   state.auditRows = [];
   for (const id of [
     "counts", "quarantine-counts", "quarantine-status", "distribution-counts",
-    "distribution-version-rows", "distribution-source-status", "github-release-rows",
+    "distribution-version-rows", "distribution-total-rows", "distribution-source-status",
+    "distribution-source-summary", "distribution-estimate-note", "github-release-rows",
     "ingress-status", "lifecycle-status", "snapshot-rows", "error-groups",
     "recent-diagnostic-rows", "diagnostic-lookup", "audit-rows", "operator-attention",
   ]) $(`#${id}`)?.replaceChildren();

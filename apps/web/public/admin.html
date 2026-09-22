@@ -22,6 +22,13 @@
     </header>
 
     <main id="main" class="admin-main">
+      <nav class="admin-section-nav" aria-label="Monitoring sections">
+        <a href="#operator-attention-title">Attention</a><a href="#counts-title">Contributors</a>
+        <a href="#growth-title">Activity</a><a href="#storage-safety-title">Storage</a>
+        <a href="#distribution-title">Apps &amp; updates</a><a href="#admin-community-title">Allowance</a>
+        <a href="#controls-title">Controls</a><a href="#ingress-title">Ingress</a>
+        <a href="#database-health-title">Databases</a><a href="#readiness-title">Readiness</a><a href="#errors-title">Failures</a><a href="#audit-title">Audit</a>
+      </nav>
       <div class="page-heading admin-heading">
         <div>
           <p class="eyebrow">Owner-only operations</p>
@@ -38,13 +45,7 @@
         </div>
       </div>
 
-      <nav class="admin-section-nav" aria-label="Monitoring sections">
-        <a href="#operator-attention-title">Attention</a><a href="#counts-title">Contributors</a>
-        <a href="#growth-title">Activity</a><a href="#storage-safety-title">Storage</a>
-        <a href="#distribution-title">Apps &amp; updates</a><a href="#admin-community-title">Allowance</a>
-        <a href="#controls-title">Controls</a><a href="#ingress-title">Ingress</a>
-        <a href="#database-health-title">Databases</a><a href="#readiness-title">Readiness</a><a href="#errors-title">Failures</a><a href="#audit-title">Audit</a>
-      </nav>
+
 
       <div id="notice" class="notice notice-warning" role="status" hidden></div>
 
@@ -184,6 +185,7 @@
           estimate in either direction. Raw addresses are reduced in memory and
           are never returned by this API or stored by this dashboard.
         </p>
+        <p class="admin-copy" id="distribution-estimate-note"></p>
         <div class="admin-card-grid admin-distribution-grid" id="distribution-counts" aria-live="polite"></div>
         <div class="admin-two-column admin-distribution-details">
           <div class="admin-card admin-table-wrap" tabindex="0" role="region" aria-label="Observed app versions table">
@@ -191,13 +193,21 @@
             <table>
               <thead><tr><th>App</th><th>OS</th><th>Version</th><th>Address reach · 7d</th><th>Source addresses · 7d</th><th>Checks · 7d</th></tr></thead>
               <tbody id="distribution-version-rows"></tbody>
+              <tfoot id="distribution-total-rows"></tfoot>
             </table>
             <p class="admin-copy" id="distribution-version-coverage"></p>
             <p class="admin-empty" id="distribution-version-empty">
               No app-version evidence is available in this window.
             </p>
           </div>
-          <div class="admin-card" id="distribution-source-status" aria-live="polite"></div>
+          <div class="admin-card admin-evidence-card">
+            <h3>Can I trust these figures?</h3>
+            <p class="admin-copy" id="distribution-source-summary" aria-live="polite"></p>
+            <details>
+              <summary>Source details and freshness</summary>
+              <div id="distribution-source-status"></div>
+            </details>
+          </div>
         </div>
         <div class="admin-card admin-table-wrap admin-github-release-table" tabindex="0" role="region" aria-label="GitHub DMG downloads table">
           <div class="section-heading admin-table-heading">
@@ -316,7 +326,7 @@
       <section class="admin-section" aria-labelledby="database-health-title">
         <p class="eyebrow">Live read checks</p>
         <h2 id="database-health-title">Database health</h2>
-        <p class="admin-copy">A lightweight read checks each database bound to the API Worker independently when this page refreshes. Response time includes the database round trip; size is reported by D1. Successful reads do not verify writes, backups, schema compatibility or end-to-end service readiness.</p>
+        <p class="admin-copy">Coverage: D1 databases bound to this API Worker, including separate analytics in typed storage mode. This is not an account-wide database inventory. Each role is read independently when this page refreshes. Response time includes the database round trip; size is reported by D1. Successful reads do not verify writes, backups, schema compatibility or end-to-end service readiness.</p>
         <p id="database-health-status" class="admin-source-badge" aria-live="polite">Waiting for database checks</p>
         <p id="database-health-freshness" class="admin-copy">No database check loaded.</p>
         <div class="admin-card admin-table-wrap" tabindex="0" role="region" aria-label="Database health table">
@@ -325,6 +335,7 @@
             <tbody id="database-health-rows"></tbody>
           </table>
         </div>
+        <p class="admin-copy">Other Workers’ databases, retained recovery copies and staging databases are outside these checks. R2 object storage and Durable Objects are separate resources.</p>
         <p class="admin-copy">If a read fails or exceeds five seconds, check Cloudflare D1 availability and the deployed bindings, then refresh. Size alone does not indicate remaining capacity; review D1 limits and storage trends in Cloudflare.</p>
       </section>
 
@@ -372,13 +383,15 @@
           <p class="admin-empty" id="error-empty">No retained errors in the window.</p>
           <div id="diagnostic-lookup" class="diagnostic-lookup" hidden></div>
         </div>
-        <div class="admin-card admin-table-wrap">
+        <details class="admin-card admin-table-wrap admin-diagnostic-details">
+          <summary>Individual retained failures · request IDs for investigation</summary>
+          <p class="admin-copy">The summary above groups these same events by route and error. Expand individual events when tracing a specific request.</p>
           <table>
             <thead><tr><th>Retained service request ID</th><th>Route</th><th>Error</th><th>HTTP</th><th>Time</th></tr></thead>
             <tbody id="recent-diagnostic-rows"></tbody>
           </table>
           <p class="admin-empty" id="recent-diagnostic-empty">No sampled failures retained.</p>
-        </div>
+        </details>
       </section>
 
       <section class="admin-section" aria-labelledby="audit-title">
