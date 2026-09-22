@@ -1507,6 +1507,13 @@ h2 {
   stroke-width: 3;
   vector-effect: non-scaling-stroke;
 }
+.chart-line-weekly-lowess {
+  fill: none;
+  stroke: var(--rust);
+  stroke-width: 3;
+  vector-effect: non-scaling-stroke;
+}
+.legend-dot.weekly-lowess { background: var(--rust); }
 .chart-point-weekly-mature {
   fill: var(--blue);
   stroke: var(--white);

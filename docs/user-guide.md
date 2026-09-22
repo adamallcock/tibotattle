@@ -67,6 +67,20 @@ selected population. The newest observed plan is selected even if it does not
 yet have enough usable evidence; older-plan estimates remain selectable rather
 than being presented as the current plan's allowance.
 
+The allowance history automatically draws a **Robust LOWESS** trend alongside
+its all-data median reference, raw dots and slope-agreement ranges. It uses only
+the selected plan and visible, filtered reset estimates. The social share graph
+uses exactly the same fitted values, gaps, axes and date range; saving or copying
+the image needs no separate trend setting. The headline remains the all-data
+median. LOWESS is not a confidence interval or proof that the
+provider changed a limit.
+
+LOWESS requires six distinct reset timestamps spanning 14 days. Gaps longer
+than 28 days interrupt fitting, and ambiguous duplicate timestamps are excluded
+from the fit. Above 250 visible resets, select a shorter range to enable fitting.
+Both graphs explicitly label insufficient evidence and preserve raw estimates
+instead of extrapolating through unsupported history.
+
 These historical estimates are conditional on the locally observed plan, not
 proof of which provider account generated every token. Known plan switches and
 ambiguous boundary quantities are excluded narrowly; coherent older history is

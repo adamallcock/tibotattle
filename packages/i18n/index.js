@@ -20,6 +20,12 @@ export const LANGUAGE_OPTIONS = Object.freeze([
 ]);
 
 export const EN_US_CATALOG = Object.freeze({
+  "weekly.controls.lowessTooMany": "LOWESS unavailable · over 250 resets",
+  "weekly.controls.lowessUnavailable": "LOWESS unavailable · insufficient evidence",
+  "weekly.controls.lowess": "Robust LOWESS",
+  "weekly.controls.trendNote": "Robust LOWESS summarises the visible reset estimates. The dashboard and social share graph use the same fitted values and gaps. This trend is not a confidence interval or proof of a provider limit change.",
+  "weekly.controls.trendSparse": "LOWESS has insufficient evidence: it needs 6 distinct resets spanning at least 14 days. Gaps over 28 days break the fit. Raw estimates remain visible on both graphs.",
+  "weekly.controls.trendTooMany": "LOWESS is unavailable above 250 visible resets. Select a shorter range; raw estimates remain visible on both graphs.",
   "electron.sharing.publicFeatureTitle": "Control your sharing",
   "electron.sharing.publicFeatureCopy": "Fresh Electron installations share content-free measurements automatically. You can keep sharing off in Settings.",
   "accounting.cacheImpact.bulletSample": "Showing the {shown} most recent of {total} drops. Summary amounts use all covered drops in the selected period.",
@@ -512,6 +518,12 @@ export const EN_US_CATALOG = Object.freeze({
 });
 
 export const ZH_HANS_CATALOG = Object.freeze({
+  "weekly.controls.lowessTooMany": "LOWESS 不可用 · 超过 250 次重置",
+  "weekly.controls.lowessUnavailable": "LOWESS 不可用 · 证据不足",
+  "weekly.controls.lowess": "稳健 LOWESS",
+  "weekly.controls.trendNote": "稳健 LOWESS 概括可见的重置估计。仪表板和社交分享图使用相同的拟合值和空隙。这一趋势不是置信区间，也不能证明提供商限额已变化。",
+  "weekly.controls.trendSparse": "LOWESS 的证据不足：需要 6 次时间不同且跨度至少 14 天的重置。超过 28 天的空隙会中断拟合。两个图中仍显示原始估计。",
+  "weekly.controls.trendTooMany": "可见重置超过 250 次时，LOWESS 不可用。请选择较短的范围；两个图中仍显示原始估计。",
   "electron.sharing.publicFeatureTitle": "掌控共享设置",
   "electron.sharing.publicFeatureCopy": "全新安装的 Electron 应用会自动共享不含对话内容的测量数据。你可以在设置中关闭共享，并保留这一选择。",
   "accounting.cacheImpact.bulletSample": "显示 {total} 次下降中最近的 {shown} 次。汇总金额使用所选期间内所有已覆盖的下降。",
@@ -1004,6 +1016,12 @@ export const ZH_HANS_CATALOG = Object.freeze({
 });
 
 export const ES_CATALOG = Object.freeze({
+  "weekly.controls.lowessTooMany": "LOWESS no disponible · más de 250 reinicios",
+  "weekly.controls.lowessUnavailable": "LOWESS no disponible · evidencia insuficiente",
+  "weekly.controls.lowess": "LOWESS robusto",
+  "weekly.controls.trendNote": "LOWESS robusto resume las estimaciones visibles. El panel y el gráfico para compartir usan los mismos valores ajustados y huecos. Esta tendencia no es un intervalo de confianza ni prueba un cambio del límite del proveedor.",
+  "weekly.controls.trendSparse": "LOWESS no tiene evidencia suficiente: necesita 6 reinicios distintos que abarquen al menos 14 días. Los huecos de más de 28 días interrumpen el ajuste. Ambos gráficos conservan las estimaciones originales.",
+  "weekly.controls.trendTooMany": "LOWESS no está disponible con más de 250 reinicios visibles. Selecciona un intervalo menor; ambos gráficos conservan las estimaciones originales.",
   "electron.sharing.publicFeatureTitle": "Controla lo que compartes",
   "electron.sharing.publicFeatureCopy": "Las instalaciones nuevas de Electron comparten automáticamente mediciones sin contenido de conversaciones. Puedes mantener desactivado el envío en Ajustes.",
   "accounting.cacheImpact.bulletSample": "Se muestran las {shown} caídas más recientes de {total}. Los importes resumen todas las caídas con cobertura del período seleccionado.",
