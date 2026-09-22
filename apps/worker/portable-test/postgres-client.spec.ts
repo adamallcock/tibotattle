@@ -15,6 +15,8 @@ interface ClientFixture {
   readonly client: PostgresClient;
   readonly calls: string[];
   readonly releases: boolean[];
+  failBegin?: boolean;
+  failStatement?: boolean;
   failRollback?: boolean;
   failCommit?: boolean;
   failRelease?: boolean;
@@ -29,6 +31,8 @@ function fixture(): ClientFixture {
     client: {
       async query(text) {
         calls.push(text);
+        if (state.failBegin && text.startsWith("BEGIN")) throw new Error("private begin detail");
+        if (state.failStatement && text.startsWith("SET LOCAL")) throw new Error("private SET detail");
         if (state.failRollback && text === "ROLLBACK") throw new Error("private rollback detail");
         if (state.failCommit && text === "COMMIT") throw new Error("private commit detail");
         return { rows: [], rowCount: 0 };
@@ -83,7 +87,7 @@ describe("shared PostgreSQL client boundary", () => {
       },
     )).resolves.toBe("read");
     expect(state.calls).toEqual([
-      "BEGIN READ ONLY",
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
       "SET LOCAL statement_timeout='123ms'",
       "SET LOCAL lock_timeout='45ms'",
       "SELECT 1",
@@ -106,6 +110,30 @@ describe("shared PostgreSQL client boundary", () => {
       operation: "writer",
       message: "POSTGRES_CONFLICT:writer",
     });
+    expect(state.calls.at(-1)).toBe("ROLLBACK");
+    expect(state.releases).toEqual([false]);
+  });
+
+  it("fails closed on BEGIN failure and discards the acquired client", async () => {
+    const state = fixture();
+    state.failBegin = true;
+    await expect(withPostgresMutation(
+      poolFor(state),
+      async () => "unreachable",
+      { operation: "writer" },
+    )).rejects.toMatchObject({ code: "unavailable", operation: "writer.begin" });
+    expect(state.calls).toEqual(["BEGIN"]);
+    expect(state.releases).toEqual([true]);
+  });
+
+  it("rolls back a failed timeout setup", async () => {
+    const state = fixture();
+    state.failStatement = true;
+    await expect(withPostgresMutation(
+      poolFor(state),
+      async () => "unreachable",
+      { operation: "writer" },
+    )).rejects.toMatchObject({ code: "unavailable", operation: "writer" });
     expect(state.calls.at(-1)).toBe("ROLLBACK");
     expect(state.releases).toEqual([false]);
   });
@@ -139,6 +167,33 @@ describe("shared PostgreSQL client boundary", () => {
     expect(state.releases).toEqual([true]);
   });
 
+  it("does not release a second time when a healthy release reports failure", async () => {
+    const state = fixture();
+    state.failRelease = true;
+    await expect(withPostgresMutation(
+      poolFor(state),
+      async () => "written",
+      { operation: "writer" },
+    )).rejects.toMatchObject({ code: "unavailable", operation: "writer.commit" });
+    expect(state.releases).toEqual([false]);
+    expect(state.calls).not.toContain("ROLLBACK");
+  });
+
+  it("preserves a caller-mapped closed domain error after rollback", async () => {
+    const state = fixture();
+    const providerError = new Error("private provider detail");
+    const domainError = new Error("SAFE_DOMAIN_ERROR");
+    await expect(withPostgresMutation(
+      poolFor(state),
+      async () => { throw providerError; },
+      {
+        operation: "writer",
+        preserveSafeError: (error) => error === providerError ? domainError : null,
+      },
+    )).rejects.toBe(domainError);
+    expect(state.releases).toEqual([false]);
+  });
+
   it("maps an arbitrary provider failure without retaining its message", () => {
     const error = normalizePostgresError(
       Object.assign(new Error("password=secret host=private"), { code: "XX000" }),
@@ -147,5 +202,31 @@ describe("shared PostgreSQL client boundary", () => {
     expect(error).toBeInstanceOf(PostgresStorageError);
     expect(error.message).toBe("POSTGRES_UNAVAILABLE:reader");
     expect(error.message).not.toContain("password");
+  });
+
+  it("does not trust a hostile SQLSTATE getter", () => {
+    const error = new Error("private provider detail");
+    Object.defineProperty(error, "code", {
+      get() { throw new Error("getter detail"); },
+    });
+    expect(normalizePostgresError(error, "reader")).toMatchObject({
+      code: "unavailable",
+      operation: "reader",
+    });
+  });
+
+  it("rejects invalid options before acquiring a client", async () => {
+    let connections = 0;
+    const pool: PostgresPool = {
+      async connect() {
+        connections += 1;
+        return fixture().client;
+      },
+    };
+    await expect(withPostgresMutation(pool, async () => "unreachable", {
+      operation: "writer",
+      lockTimeoutMilliseconds: 0,
+    })).rejects.toThrow(TypeError);
+    expect(connections).toBe(0);
   });
 });

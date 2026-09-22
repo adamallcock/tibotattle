@@ -43,6 +43,13 @@ export const DEFAULT_POSTGRES_SCHEMA_CONFIG: PostgresSchemaConfig = Object.freez
 
 const SCHEMA_IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
 
+function reservedSchemaIdentifier(value: string): boolean {
+  return value === "pg_catalog"
+    || value === "pg_toast"
+    || value === "information_schema"
+    || value.startsWith("pg_");
+}
+
 function validSchemaIdentifier(value: unknown): value is string {
   return typeof value === "string" && SCHEMA_IDENTIFIER.test(value);
 }
@@ -62,6 +69,7 @@ export function createPostgresSchemaConfig(
     ? DEFAULT_POSTGRES_SCHEMA_CONFIG.ledgerSchema
     : options.ledgerSchema;
   if (!validSchemaIdentifier(primarySchema) || !validSchemaIdentifier(ledgerSchema)
+      || reservedSchemaIdentifier(primarySchema) || reservedSchemaIdentifier(ledgerSchema)
       || primarySchema === ledgerSchema) {
     throw new TypeError("invalid PostgreSQL schema configuration");
   }
@@ -79,10 +87,17 @@ export function quotePostgresIdentifier(identifier: unknown): string {
 
 export interface PostgresTransactionOptions {
   readonly readOnly?: boolean;
+  readonly isolationLevel?: "read_committed" | "repeatable_read";
   readonly statementTimeoutMilliseconds?: number;
   readonly lockTimeoutMilliseconds?: number;
   /** A short fixed label used only in sanitized local errors. */
   readonly operation?: string;
+  /**
+   * Optional caller-owned mapper for a reviewed closed domain error. It must
+   * return only a safe application error such as an ApiError; provider errors
+   * and arbitrary messages must return null.
+   */
+  readonly preserveSafeError?: (error: unknown) => Error | null;
 }
 
 export const DEFAULT_POSTGRES_TRANSACTION_OPTIONS: Required<
@@ -136,11 +151,23 @@ function timeoutMilliseconds(value: unknown, fallback: number): number {
   return timeout as number;
 }
 
-function transactionOptions(options: PostgresTransactionOptions): Required<
-  Pick<PostgresTransactionOptions, "readOnly" | "statementTimeoutMilliseconds" | "lockTimeoutMilliseconds">
-> & { readonly operation: string } {
+interface NormalizedPostgresTransactionOptions {
+  readonly readOnly: boolean;
+  readonly isolationLevel: "read_committed" | "repeatable_read";
+  readonly statementTimeoutMilliseconds: number;
+  readonly lockTimeoutMilliseconds: number;
+  readonly operation: string;
+  readonly preserveSafeError: ((error: unknown) => Error | null) | undefined;
+}
+
+function transactionOptions(options: PostgresTransactionOptions): NormalizedPostgresTransactionOptions {
+  const isolationLevel = options.isolationLevel ?? "read_committed";
+  if (isolationLevel !== "read_committed" && isolationLevel !== "repeatable_read") {
+    throw new TypeError("invalid PostgreSQL isolation level");
+  }
   return {
     readOnly: options.readOnly ?? false,
+    isolationLevel,
     statementTimeoutMilliseconds: timeoutMilliseconds(
       options.statementTimeoutMilliseconds,
       DEFAULT_POSTGRES_TRANSACTION_OPTIONS.statementTimeoutMilliseconds,
@@ -150,6 +177,7 @@ function transactionOptions(options: PostgresTransactionOptions): Required<
       DEFAULT_POSTGRES_TRANSACTION_OPTIONS.lockTimeoutMilliseconds,
     ),
     operation: operationLabel(options.operation),
+    preserveSafeError: options.preserveSafeError,
   };
 }
 
@@ -190,6 +218,18 @@ export function normalizePostgresError(
 
 function timeoutStatement(name: "statement_timeout" | "lock_timeout", milliseconds: number): string {
   return `SET LOCAL ${name}='${milliseconds}ms'`;
+}
+
+function beginStatement(
+  readOnly: boolean,
+  isolationLevel: "read_committed" | "repeatable_read",
+): string {
+  if (isolationLevel === "repeatable_read") {
+    return readOnly
+      ? "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
+      : "BEGIN ISOLATION LEVEL REPEATABLE READ";
+  }
+  return readOnly ? "BEGIN READ ONLY" : "BEGIN";
 }
 
 async function releaseOnce(
@@ -233,7 +273,7 @@ export async function withPostgresTransaction<T>(
   let commitAttempted = false;
   try {
     beginAttempted = true;
-    await client.query(config.readOnly ? "BEGIN READ ONLY" : "BEGIN");
+    await client.query(beginStatement(config.readOnly, config.isolationLevel));
     transactionStarted = true;
     await client.query(
       timeoutStatement("statement_timeout", config.statementTimeoutMilliseconds),
@@ -267,6 +307,16 @@ export async function withPostgresTransaction<T>(
       throw new PostgresStorageError("unavailable", `${config.operation}.begin`, { retryable: true });
     }
     if (releaseError !== null) throw releaseError;
+    if (!commitAttempted && !rollbackFailed && config.preserveSafeError !== undefined) {
+      let safeError: Error | null = null;
+      try {
+        safeError = config.preserveSafeError(error);
+      } catch {
+        // A mapper is an optional convenience; a broken mapper cannot expose
+        // provider details or replace the sanitized storage error.
+      }
+      if (safeError instanceof Error) throw safeError;
+    }
     throw normalizePostgresError(error, config.operation);
   }
 }
@@ -277,7 +327,11 @@ export function withPostgresRead<T>(
   operation: (client: PostgresClient) => Promise<T>,
   options: Omit<PostgresTransactionOptions, "readOnly"> = {},
 ): Promise<T> {
-  return withPostgresTransaction(pool, operation, { ...options, readOnly: true });
+  return withPostgresTransaction(pool, operation, {
+    ...options,
+    readOnly: true,
+    isolationLevel: options.isolationLevel ?? "repeatable_read",
+  });
 }
 
 /** Execute a bounded mutation transaction. */
