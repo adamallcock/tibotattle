@@ -106,6 +106,7 @@ test("Electron builder configuration is an unsigned macOS arm64 directory build"
         "package.json",
         "electron-runtime-manifest.json",
         "apps/electron/**",
+        "scripts/diagnose-desktop-crash.mjs",
         "apps/local/**",
         "apps/web/public/**",
         "config/**",

@@ -168,6 +168,34 @@ test("a source-only version change does not change the deployment fingerprint", 
   assert.equal(before.versionId, after.versionId);
 });
 
+test("the API root asset base path is equivalent to its absent form", () => {
+  const before = baseline();
+  const withRootBasePath = inventory();
+  withRootBasePath.version.resources.script_runtime = {
+    ...runtime,
+    assets: { ...runtime.assets, base_path: "/" },
+  };
+  const after = createProductionLiveConfigSnapshot(withRootBasePath);
+  assert.deepEqual(after.runtime.assets, before.runtime.assets);
+  assert.equal(after.fingerprint, before.fingerprint);
+});
+
+test("non-root and unknown asset runtime fields fail closed", () => {
+  const nonRoot = inventory();
+  nonRoot.version.resources.script_runtime = {
+    ...runtime,
+    assets: { ...runtime.assets, base_path: "/assets" },
+  };
+  assert.throws(() => createProductionLiveConfigSnapshot(nonRoot), { code: "PRODUCTION_LIVE_CONFIG_RUNTIME_INVALID" });
+
+  const unknown = inventory();
+  unknown.version.resources.script_runtime = {
+    ...runtime,
+    assets: { ...runtime.assets, unexpected: true },
+  };
+  assert.throws(() => createProductionLiveConfigSnapshot(unknown), { code: "PRODUCTION_LIVE_CONFIG_RUNTIME_INVALID" });
+});
+
 test("unknown binding types fail closed without exposing private values", () => {
   const value = inventory();
   value.version.resources.bindings.push({ name: "PRIVATE_SENTINEL", type: "unknown_binding", text: "private-value" });

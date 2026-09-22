@@ -76,6 +76,16 @@ read-only doctor **without opening TiboTattle**:
 npm run diagnose:desktop-crash -- --hours 72
 ```
 
+Builds that include the packaged doctor can run the same script through the
+installed Electron executable's separate Node mode. This bypasses TiboTattle's
+main process, so it still works when the app exits during bootstrap:
+
+```sh
+ELECTRON_RUN_AS_NODE=1 "/Applications/TiboTattle.app/Contents/MacOS/TiboTattle" \
+  "/Applications/TiboTattle.app/Contents/Resources/app.asar/scripts/diagnose-desktop-crash.mjs" \
+  --hours 72 --verbose
+```
+
 It checks recently modified TiboTattle Apple crash reports, prints only an allowlisted
 exception type, termination namespace/code, and up to five safe crashed-thread
 symbol names, then reports the local crash-capture preference and dump counts.
@@ -83,7 +93,10 @@ Add `--verbose` for up to 20 crashed-thread frames per report, allowlisted app
 and macOS version fields, and up to 40 recent entries from the companion's
 owner-only diagnostics log. Those entries contain fixed codes and opaque
 support references, not raw session content; malformed or unknown fields are
-omitted. The doctor reports when a log is missing or entries could not be read.
+omitted. It also reads one owner-only, content-free startup result written by
+the Electron main process. That result identifies the last startup phase,
+outcome, and fixed failure code even when the companion never started. The
+doctor reports when either source is missing or could not be read.
 The verbose output still needs review before posting to a public issue.
 If deeper private review is needed, an affected user can explicitly create a
 local owner-only evidence directory at a new, absolute path outside the source
@@ -93,9 +106,9 @@ checkout:
 node scripts/diagnose-desktop-crash.mjs --hours 72 --verbose --export-private "$HOME/Desktop/TiboTattle-private-evidence"
 ```
 
-This copies at most ten matching Apple reports and the current/previous bounded
-companion diagnostics logs into that directory with fixed filenames and a hash
-manifest. Add `--include-dumps` only when native Crashpad dumps are needed; at
+This copies at most ten matching Apple reports, the current/previous bounded
+companion diagnostics logs, and the bounded startup result into that directory
+with fixed filenames and a hash manifest. Add `--include-dumps` only when native Crashpad dumps are needed; at
 most four recent dumps are copied, subject to a 64 MiB bundle limit. The
 destination must not already exist. The manifest records skipped evidence,
 so a bounded export must not be described as every system log. TiboTattle does
@@ -119,7 +132,9 @@ crash happened; it takes effect only after an app launch. A displayed report
 timestamp is its file modification time, which may differ from the crash time.
 Review the output before sharing it. The existing `npm run doctor` checks Codex
 tool readiness; it is unrelated to desktop crash diagnosis. This source command
-is available before a new app release, but requires a current source checkout.
+is available before a new app release. The installed-app command requires a
+release whose packaged runtime contains the doctor; older releases still need
+a current source checkout.
 
 If the CLI finds no matching report, or a report uses a newer Apple format it
 cannot read, open **Console** with Spotlight, select **Crash Reports**, and look

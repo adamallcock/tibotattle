@@ -18,7 +18,9 @@ The separate `npm run diagnose:desktop-crash -- --hours 72` source command is a
 read-only macOS support tool for an app that will not open. It does not run
 Electron or the `usage-monitor doctor` command. See [support](../../SUPPORT.md)
 for its privacy boundary, `--verbose` option, direct Node `--json` invocation,
-and separate `--export-private` local evidence action.
+and separate `--export-private` local evidence action. Electron packages also
+carry this script in `Resources/app.asar/scripts/`; invoking it with the packaged
+executable under `ELECTRON_RUN_AS_NODE=1` bypasses the desktop main process.
 
 Commands operate on local files unless a documented `--origin` or explicit
 live-experiment flag is supplied. Paths can contain sensitive derived evidence:
