@@ -1269,12 +1269,14 @@ function renderAllowances(documentRef, projection, t, numberFormatter, preferenc
 function renderWeeklyPace(documentRef, projection, t, numberFormatter, localFormatter) {
   const section = documentRef.getElementById("pace-section");
   const runoutDuration = documentRef.getElementById("pace-outlook-duration");
-  runoutDuration?.removeAttribute("title");
   runoutDuration?.removeAttribute("aria-label");
   runoutDuration?.removeAttribute("tabindex");
   setHidden(documentRef, "pace-outlook-caption", true);
   setElementText(documentRef, "pace-outlook-caption", "");
   setElementText(documentRef, "pace-outlook-duration", "");
+  setElementText(documentRef, "pace-outlook-tooltip", "");
+  setHidden(documentRef, "pace-marker-note", true);
+  setElementText(documentRef, "pace-marker-note", "");
   const pace = projection.weeklyPace;
   const weeklyAllowance = projection.allowances.find((allowance) =>
     allowance.durationMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES && !allowance.stale);
@@ -1384,7 +1386,7 @@ function renderWeeklyPace(documentRef, projection, t, numberFormatter, localForm
     const exactTime = t("electron.trayPopover.paceExhaustion", {
       time: localFormatter(pace.outlook.projectedExhaustionAt),
     });
-    runoutDuration.setAttribute("title", exactTime);
+    setElementText(documentRef, "pace-outlook-tooltip", exactTime);
     runoutDuration.setAttribute("aria-label", `${runoutCaption}. ${runoutCopy}. ${exactTime}`);
     runoutDuration.setAttribute("tabindex", "0");
   }
@@ -1404,6 +1406,9 @@ function renderWeeklyPace(documentRef, projection, t, numberFormatter, localForm
     const activeFraction = pace.outlook.activeExhaustionFraction;
     marker.hidden = activeFraction === null;
     if (activeFraction !== null) marker.style.left = `${activeFraction * 100}%`;
+    setHidden(documentRef, "pace-marker-note", activeFraction === null);
+    setElementText(documentRef, "pace-marker-note", activeFraction === null
+      ? "" : t("electron.trayPopover.paceActiveMarker"));
   }
 }
 

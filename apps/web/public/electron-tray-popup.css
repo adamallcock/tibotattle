@@ -302,11 +302,41 @@ body {
 .electron-tray-popup-pace-timeline-foot { margin-top: 4px; color: var(--tray-muted); }
 .electron-tray-popup-pace-timeline-labels span,
 .electron-tray-popup-pace-timeline-foot span { min-width: 0; overflow-wrap: anywhere; }
-#pace-outlook { display: flex; flex-direction: column; align-items: flex-start; color: var(--pace-color); }
+#pace-outlook { position: relative; display: flex; flex-direction: column; align-items: flex-start; color: var(--pace-color); }
 #pace-outlook-caption { font-weight: 500; }
 #pace-outlook-duration { font-size: 10px; font-weight: 700; }
-#pace-outlook-duration[title] { text-decoration: underline dotted; text-underline-offset: 2px; cursor: help; }
+#pace-outlook-duration[tabindex] { text-decoration: underline dotted; text-underline-offset: 2px; cursor: help; }
 #pace-outlook-duration:focus-visible { outline: 2px solid var(--pace-color); outline-offset: 2px; }
+#pace-outlook-tooltip {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 2;
+  visibility: hidden;
+  width: max-content;
+  max-width: min(280px, calc(100vw - 48px));
+  padding: 6px 8px;
+  border-radius: 5px;
+  background: #26312b;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, .22);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.35;
+  opacity: 0;
+  pointer-events: none;
+  white-space: normal;
+}
+#pace-outlook-duration:is(:hover, :focus-visible) + #pace-outlook-tooltip {
+  visibility: visible;
+  opacity: 1;
+}
+.electron-tray-popup-pace-marker-note {
+  margin: 7px 0 0;
+  color: var(--tray-muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
 #pace-reset, #pace-outcome { text-align: right; }
 
 .electron-tray-popup-pace-track {
