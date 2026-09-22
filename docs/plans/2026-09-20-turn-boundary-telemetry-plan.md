@@ -9,7 +9,8 @@ status: in-progress
 
 Implementation is preserved at local checkpoint `8c0dd392` on
 `codex/telemetry-v12-integration`, with the remote snapshot `6d061b57`
-(2026-09-21, through PR #194) integrated. The original foundation remains at
+(2026-09-21, through PR #194) integrated by merge `123360b4`. The staging asset
+repair is committed as `c3bd6f21`. The original foundation remains at
 `fb778d17` in `codex/telemetry-v12-foundation`; the dirty local main checkout is
 untouched. Exact-total capture uses parser v17 and preserves the remote parser
 v16 missing-cache-write assumption and provenance. Integration retains newer
@@ -136,7 +137,17 @@ artifact proof. The first merged Worker run completed 1,924 tests: 1,922 passed,
 one publication fixture timed out at five seconds, and one namespace inventory
 still expected only the older readers. The inventory now includes the two
 effective-reader namespaces. Both affected files pass focused reruns (34 and
-11 tests); a clean full rerun is in progress without competing test jobs.
+11 tests). The clean full rerun passes all **1,924 tests across 152 files**,
+without changing the five-second timeout or weakening assertions.
+
+Local deployment dry checks now pass for the default and staging configurations
+after repairing the closed asset allowlist to include the builder's existing
+`dashboard-ui.js` and `last-known-good.js` public dependencies. Two staging
+regressions pass and the generated 41-file site is accepted with source-digest
+verification intact. This local candidate uses an existing 1,200-by-630 public
+image and no installer metadata; it is not a reviewed website publication or
+client release candidate. No remote writes were made.
+
 The broad root run recorded 5,826 tests: 5,754 passed, 24 failed and 48 skipped.
 The twelve browser harness failures were subsequently fixed and the full browser
 suite passed; the synthetic accounting benchmark passed outside the restricted
@@ -144,6 +155,10 @@ sandbox. Eleven native/release checks remain unqualified: a Keychain migration
 UI subprocess timeout, a nested network-sandbox failure, two retained R7 receipt
 source-hash mismatches, and seven R7 resource/process-monitor checks. The UI
 subprocess timeout is unresolved, not established as an environmental failure.
+Its six source-contract checks pass. Read-only diagnosis confirms the native
+smoke uses injected callbacks and no real Keychain operations; the five-second
+timeout occurs at an unqualified AppKit process boundary. This does not prove
+signed-upgrade or installed-client behavior.
 Protected receipts were not regenerated and no test assertions were weakened.
 
 These checks do not establish installed-client, protected release or deployment
