@@ -33,13 +33,19 @@ function add(bins, at, value) {
   if (!bins.has(at)) bins.set(at, []);
   bins.get(at).push(value);
 }
-export function modelPerformanceProjection(rows, { period = 'all', now = Date.now(), historyProgress = null, rolling = false } = {}) {
-  if (!['1', '7', '30', 'all'].includes(period) || !count(now) || !Array.isArray(rows) || rows.length > 100000
+export function modelPerformanceProjection(rows, { period = 'all', speedMode = 'standard', now = Date.now(), historyProgress = null, rolling = false } = {}) {
+  if (!['1', '7', '30', 'all'].includes(period) || !['standard', 'fast'].includes(speedMode) || !count(now) || !Array.isArray(rows) || rows.length > 100000
       || !progress(historyProgress) || typeof rolling !== 'boolean')
     throw new Error('invalid_timing_projection');
-  const known = rows.filter(r => LABELS.has(r.model) && count(r.at) && r.at <= now);
+  const known = rows.filter(r => r && LABELS.has(r.model) && count(r.at) && r.at <= now);
+  const selected = known.filter(r => r.speed_mode === speedMode);
+  const windowStart = period === 'all' ? 0
+    : rolling || period === '1' ? Math.max(0, now - Number(period) * DAY)
+    : Math.floor(now / DAY) * DAY - (Number(period) - 1) * DAY;
+  const excludedUnknownTurns = known.filter(r => !['standard', 'fast'].includes(r.speed_mode)
+    && r.at >= windowStart).length;
   const end = now;
-  const start = period === 'all' ? (known.length ? known.reduce((min, r) => Math.min(min, r.at), now) : null)
+  const start = period === 'all' ? (selected.length ? selected.reduce((min, r) => Math.min(min, r.at), now) : null)
     : rolling || period === '1' ? Math.max(0, now - Number(period) * DAY)
     : Math.floor(now / DAY) * DAY - (Number(period) - 1) * DAY;
   const interval = period === 'all' && start !== null && end - start > 366 * DAY ? 'week' : 'day';
@@ -47,7 +53,7 @@ export function modelPerformanceProjection(rows, { period = 'all', now = Date.no
   // Align weeks to Monday UTC; daily bins to midnight UTC.
   const anchor = interval === 'week' ? 4 * DAY : 0;
   const groups = new Map();
-  for (const r of known) {
+  for (const r of selected) {
     if (r.at < start) continue;
     if (!groups.has(r.model)) groups.set(r.model, { id: r.model, label: LABELS.get(r.model),
       turns: 0, speedTurns: 0, ttftTurns: 0, timedResponses: 0, toolFreeTurns: 0,
@@ -68,8 +74,8 @@ export function modelPerformanceProjection(rows, { period = 'all', now = Date.no
     }
     if (count(r.ttft)) { m.ttftTurns++; add(m.latency, at, r.ttft / 1000); }
   }
-  return { schemaVersion: 4, method: 5, status: 'ready', collecting: false, stale: false,
-    updatedAt: new Date(now).toISOString(), period, interval, start, end, historyProgress,
+  return { schemaVersion: 5, method: 5, status: 'ready', collecting: false, stale: false,
+    updatedAt: new Date(now).toISOString(), period, speedMode, excludedUnknownTurns, interval, start, end, historyProgress,
     models: [...LABELS.keys()].filter(id => groups.has(id)).map(id => {
       const { speed, latency, toolFree, ...m } = groups.get(id);
       return { ...m, speed: [{ method: 'speed', points: points(speed) }],

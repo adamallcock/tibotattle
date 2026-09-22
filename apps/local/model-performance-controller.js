@@ -3,7 +3,8 @@ import { join } from 'node:path';
 // Keep the worker reachable to the native runtime dependency scanner.
 import './model-performance-worker.js';
 import { createModelPerformanceSnapshotStore, isCompleteModelPerformanceSnapshot,
-  readModelPerformanceSnapshotEntry, modelPerformanceSourceScope,
+  readModelPerformanceSnapshotEntry, modelPerformanceSourceScope, modelPerformanceSnapshotKey,
+  MODEL_PERFORMANCE_SPEED_MODES as SPEED_MODES,
   MODEL_PERFORMANCE_MAX_WINDOWS as MAX_WINDOWS, MODEL_PERFORMANCE_PERIODS as PERIODS } from './model-performance-snapshots.js';
 
 export function createModelPerformanceController({ directory, codexHome,
@@ -34,8 +35,8 @@ export function createModelPerformanceController({ directory, codexHome,
     complete.clear(); cache.clear(); revision++; savedRevision = -1;
     return true;
   }
-  const empty = (period, status) => ({ schemaVersion: 4, method: 5, status, collecting: false, stale: false,
-    updatedAt: null, period, interval: 'day', start: null, end: Date.now(), historyProgress: null, models: [] });
+  const empty = (period, speedMode, status) => ({ schemaVersion: 5, method: 5, status, collecting: false, stale: false,
+    updatedAt: null, period, speedMode, excludedUnknownTurns: 0, interval: 'day', start: null, end: Date.now(), historyProgress: null, models: [] });
   function restore() {
     restoration ??= (async () => {
       try {
@@ -45,7 +46,7 @@ export function createModelPerformanceController({ directory, codexHome,
         savedRevision = revision;
         for (const entry of receipt.values) {
           const { key, snapshot: value } = readModelPerformanceSnapshotEntry(entry);
-          if (key !== value.period) windows.set(key, { period: value.period, end: value.end, requestKey: key });
+          if (key !== modelPerformanceSnapshotKey(value.period, value.speedMode)) windows.set(key, { period: value.period, speedMode: value.speedMode, end: value.end, requestKey: key });
           complete.set(key, value);
           cache.set(key, { ...value, collecting: true, historyProgress: null });
         }
@@ -64,7 +65,7 @@ export function createModelPerformanceController({ directory, codexHome,
     if (!Number.isFinite(nowMs) || (!force && withinWriteInterval(nowMs))) return;
     // Keep one queued immutable candidate: a slow disk cannot accumulate an
     // unbounded write queue, and older writes can never overtake newer ones.
-    pending = { values: structuredClone([...complete].map(([key, snapshot]) => key === snapshot.period
+    pending = { values: structuredClone([...complete].map(([key, snapshot]) => key === modelPerformanceSnapshotKey(snapshot.period, snapshot.speedMode)
       ? snapshot : { ...snapshot, requestKey: key })), revision, nowMs, force };
     if (writing) return;
     writing = (async () => {
@@ -154,7 +155,7 @@ export function createModelPerformanceController({ directory, codexHome,
           if (typeof message.revision === 'string' && sourceRevision !== null
               && sourceRevision !== message.revision) invalidateCachedProjection(message.revision);
           if (typeof message.revision === 'string') sourceRevision = message.revision;
-          if (message.values.length > MAX_WINDOWS + PERIODS.length) { fail(); return; }
+          if (message.values.length > MAX_WINDOWS + PERIODS.length * SPEED_MODES.length) { fail(); return; }
           const entries = message.values.map(readModelPerformanceSnapshotEntry);
           if (entries.some(value => value === null)
               || new Set(entries.map(value => value.key)).size !== entries.length) { fail(); return; }
@@ -162,7 +163,7 @@ export function createModelPerformanceController({ directory, codexHome,
           for (const { key, snapshot: value } of entries) {
             // A late projection for an evicted window cannot resurrect it or
             // replace the requested period's independently keyed snapshot.
-            if (key !== value.period && !windows.has(key)) continue;
+            if (key !== modelPerformanceSnapshotKey(value.period, value.speedMode) && !windows.has(key)) continue;
             const previous = complete.get(key);
             if (isCompleteModelPerformanceSnapshot(value)) {
               complete.set(key, value);
@@ -193,25 +194,27 @@ export function createModelPerformanceController({ directory, codexHome,
     } catch { fail(); }
   }
   return {
-    async read(period, { endAt } = {}) {
+    async read(period, { endAt, speedMode = 'standard' } = {}) {
       if (!PERIODS.includes(period)) throw new Error('invalid_timing_period');
+      if (!SPEED_MODES.includes(speedMode)) throw new Error('invalid_timing_speed_mode');
       const end = endAt === undefined ? null : Date.parse(endAt);
       if (endAt !== undefined && (typeof endAt !== 'string' || !Number.isSafeInteger(end)
           || end < 0 || end > Date.now() || new Date(end).toISOString() !== endAt)) throw new Error('invalid_timing_window');
-      const key = end === null ? period : `${period}:${end}`;
-      const fallback = status => ({ ...empty(period, status), ...(end === null ? {} : { end, start: period === 'all' ? null : Math.max(0, end - Number(period) * 86400000) }) });
+      const baseKey = modelPerformanceSnapshotKey(period, speedMode);
+      const key = end === null ? baseKey : `${baseKey}:${end}`;
+      const fallback = status => ({ ...empty(period, speedMode, status), ...(end === null ? {} : { end, start: period === 'all' ? null : Math.max(0, end - Number(period) * 86400000) }) });
       // Platform capability is checked inside the worker before source discovery.
       if (closed) return fallback('unavailable');
       await restore();
       if (closed) return fallback('unavailable');
       if (end !== null && !windows.has(key)) {
-        windows.set(key, { period, end, requestKey: key });
+        windows.set(key, { period, speedMode, end, requestKey: key });
         while (windows.size > MAX_WINDOWS) {
           const oldest = windows.keys().next().value;
           windows.delete(oldest); cache.delete(oldest);
           if (complete.delete(oldest)) revision++;
         }
-        worker?.postMessage({ type: 'window', period, end, requestKey: key });
+        worker?.postMessage({ type: 'window', period, speedMode, end, requestKey: key });
       }
       start();
       scheduleIdleStop();

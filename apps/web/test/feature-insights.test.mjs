@@ -23,7 +23,7 @@ test('synthetic cohorts satisfy the real cache matrix contract and preserve volu
  for(const model of impact.byModel)assert.equal(cacheReuseMatrixBuckets(model).length,10);
 });
 test('all example speed periods satisfy the actual closed app contract',()=>{
- for(const period of ['7','30','all']) {const payload=exampleModelSpeeds(period);assert.equal(normalizeModelPerformance(payload),payload);}
+ for(const period of ['7','30','all']) for(const speedMode of ['standard','fast']) {const payload=exampleModelSpeeds(period,speedMode);assert.equal(normalizeModelPerformance(payload),payload);assert.equal(payload.speedMode,speedMode);if(speedMode==='fast')assert.deepEqual(payload.models,[]);}
 });
 test('changing period preserves the same daily observations and varying sample sizes',()=>{
  const week=exampleModelSpeeds('7'),month=exampleModelSpeeds('30');
