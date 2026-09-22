@@ -52,6 +52,15 @@ identifiers, real session paths, repository names, or unredacted local files
 into an issue or pull request. A screenshot can contain private data even when
 the diagnostic text is safe.
 
+If TiboTattle closes during launch, note whether a native alert shows the fixed
+support code `electron_shell_entry_failed`. This means startup stopped before
+the dashboard opened; it does not identify the underlying cause. On macOS,
+open **Console** with Spotlight, select **Crash Reports** in the sidebar, and
+look for a TiboTattle report at the launch time. After reviewing it for private
+paths and content, share only the exception type, termination reason, and top
+frames of the crashed thread. If there is no matching report, say so. A full
+unreviewed report is not needed for initial triage.
+
 ## Supported surface
 
 The published product supports macOS 14 or later on Apple silicon and Intel.
