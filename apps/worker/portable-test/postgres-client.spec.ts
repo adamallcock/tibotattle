@@ -215,6 +215,13 @@ describe("shared PostgreSQL client boundary", () => {
     });
   });
 
+  it("classifies PostgreSQL lock timeout as a bounded retryable timeout", () => {
+    expect(normalizePostgresError(
+      Object.assign(new Error("private lock detail"), { code: "55P03" }),
+      "reader",
+    )).toMatchObject({ code: "timeout", retryable: true, operation: "reader" });
+  });
+
   it("rejects invalid options before acquiring a client", async () => {
     let connections = 0;
     const pool: PostgresPool = {

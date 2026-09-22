@@ -206,6 +206,7 @@ export function normalizePostgresError(
     case "23514":
       return new PostgresStorageError("conflict", operation, { retryable: true });
     case "57014":
+    case "55P03":
       return new PostgresStorageError("timeout", operation, { retryable: true });
     case "22P02":
     case "23502":
