@@ -237,22 +237,25 @@ test("qualification TAP failure diagnostics retain only bounded structural index
     "  duration_ms: 0.12",
     "  location: '/private/tmp/PRIVATE/test/model-performance.test.js:123:4'",
     "  failureType: 'testCodeFailure'",
+    "  stack: |-",
+    "    Error: PRIVATE-STACK",
+    "        at TestContext.<anonymous> (file:///D:/runner/PRIVATE/test/model-performance.test.js:321:9)",
     "  ...",
     "1..18",
   ].join("\n");
   const diagnostic = parseTapFailureDiagnostic(output);
-  assert.deepEqual(diagnostic, { fileIndex: 1, testOrdinal: 4 });
+  assert.deepEqual(diagnostic, { fileIndex: 1, testOrdinal: 4, sourceLine: 321 });
   const formatted = formatQualificationFailureDiagnostic(diagnostic);
-  assert.equal(formatted, "file_index=1 test_ordinal=4");
+  assert.equal(formatted, "file_index=1 test_ordinal=4 source_line=321");
   assert.doesNotMatch(formatted, /PRIVATE|secret|Users|TAP/u);
 
   const fileOnly = parseTapFailureDiagnostic([
     "not ok 14 - PRIVATE-FILE-FAILURE",
     "  ---",
-    "  location: 'C:\\runner\\_work\\repo\\test\\windows-filesystem-security.test.js:8:2'",
+    "  location: 'C:\\\\runner\\\\_work\\\\repo\\\\test\\\\windows-filesystem-security.test.js:8:2'",
     "  ...",
   ].join("\n"));
-  assert.deepEqual(fileOnly, { fileIndex: 14, testOrdinal: 14 });
+  assert.deepEqual(fileOnly, { fileIndex: 14, testOrdinal: 14, sourceLine: null });
 
   const unknown = parseTapFailureDiagnostic([
     "not ok 1 - PRIVATE-FAILURE",
@@ -260,17 +263,29 @@ test("qualification TAP failure diagnostics retain only bounded structural index
     "  location: 'C:\\Users\\PRIVATE\\unapproved.test.js:1:2'",
     "  ...",
   ].join("\n"));
-  assert.deepEqual(unknown, { fileIndex: null, testOrdinal: 1 });
+  assert.deepEqual(unknown, { fileIndex: null, testOrdinal: 1, sourceLine: null });
   assert.deepEqual(
     parseTapFailureDiagnostic("not ok 3 - PRIVATE-WITHOUT-LOCATION\n  ..."),
-    { fileIndex: null, testOrdinal: 3 },
+    { fileIndex: null, testOrdinal: 3, sourceLine: null },
+  );
+  assert.deepEqual(
+    parseTapFailureDiagnostic([
+      "not ok 2 - PRIVATE-MISMATCHED-FRAME",
+      "  ---",
+      "  location: 'file:///D:/runner/test/model-performance.test.js:10:2'",
+      "  stack: |-",
+      "        at TestContext.<anonymous> (file:///D:/runner/test/windows-filesystem-security.test.js:91:4)",
+      "  ...",
+    ].join("\n")),
+    { fileIndex: 1, testOrdinal: 2, sourceLine: null },
   );
   assert.equal(
     formatQualificationFailureDiagnostic({
       fileIndex: 999_999,
       testOrdinal: 1_000_000,
+      sourceLine: 1_000_000,
       title: canary,
     }),
-    "file_index=unavailable test_ordinal=unavailable",
+    "file_index=unavailable test_ordinal=unavailable source_line=unavailable",
   );
 });

@@ -58,6 +58,7 @@ const QUALIFICATION_ENVIRONMENT = "USAGE_MONITOR_WINDOWS_QUALIFICATION";
 const QUALIFICATION_REVISION_ENVIRONMENT = "TIBOTATTLE_QUALIFICATION_REVISION";
 const QUALIFICATION_CACHE_MODE_ENVIRONMENT = "TIBOTATTLE_QUALIFICATION_CACHE_MODE";
 const MAXIMUM_TAP_FAILURE_TEST_ORDINAL = 999_999;
+const MAXIMUM_TAP_FAILURE_SOURCE_LINE = 999_999;
 const QUALIFICATION_FILE_INDEX = new Map(
   QUALIFICATION_TEST_FILES.map((file, index) => [file, index + 1]),
 );
@@ -216,10 +217,11 @@ export function parseTapSummary(output) {
   return result;
 }
 
-const QUALIFICATION_FAILURE_DIAGNOSTIC_FORMAT = /^file_index=(?:unavailable|[1-9]\d{0,2}) test_ordinal=(?:unavailable|[1-9]\d{0,5})$/u;
+const QUALIFICATION_FAILURE_DIAGNOSTIC_FORMAT = /^file_index=(?:unavailable|[1-9]\d{0,2}) test_ordinal=(?:unavailable|[1-9]\d{0,5}) source_line=(?:unavailable|[1-9]\d{0,5})$/u;
 const TAP_FAILURE_RESULT = /^not ok ([1-9]\d{0,6})(?:\s+-[^\r\n]*)?$/u;
 const TAP_RESULT = /^(?:ok|not ok) [1-9]\d{0,6}(?:\s+-[^\r\n]*)?$/u;
 const TAP_LOCATION = /^\s+location:\s+(['"])([^'"\r\n]{1,2048})\1$/u;
+const TAP_STACK_HEADER = /^ {2}stack:\s*(?:[|>][-+]?\s*)?$/u;
 
 function boundedTapFailureOrdinal(value) {
   const ordinal = Number.parseInt(value, 10);
@@ -232,13 +234,33 @@ function boundedTapFailureOrdinal(value) {
 
 function fileIndexFromTapLocation(location) {
   if (typeof location !== "string") return null;
-  const normalized = location.replaceAll("\\", "/");
+  const normalized = location.replaceAll("\\", "/").replace(/\/{2,}/gu, "/");
   for (const [file, index] of QUALIFICATION_FILE_INDEX) {
     const marker = `/${file}:`;
     const markerIndex = normalized.lastIndexOf(marker);
     if (markerIndex < 0) continue;
     const lineAndColumn = normalized.slice(markerIndex + marker.length);
     if (/^\d{1,9}:\d{1,9}$/u.test(lineAndColumn)) return index;
+  }
+  return null;
+}
+
+function sourceLocationFromTapStackFrame(line) {
+  if (typeof line !== "string" || !/^\s+at(?:\s|$)/u.test(line)) return null;
+  const normalized = line.replaceAll("\\", "/").replace(/\/{2,}/gu, "/");
+  for (const [file, index] of QUALIFICATION_FILE_INDEX) {
+    const marker = `/${file}:`;
+    const markerIndex = normalized.lastIndexOf(marker);
+    if (markerIndex < 0) continue;
+    const locationTail = normalized.slice(markerIndex + marker.length);
+    const match = /^(\d{1,9}):(\d{1,9})\)?\s*$/u.exec(locationTail);
+    if (!match) continue;
+    const sourceLine = Number.parseInt(match[1], 10);
+    return Number.isSafeInteger(sourceLine)
+        && sourceLine >= 1
+        && sourceLine <= MAXIMUM_TAP_FAILURE_SOURCE_LINE
+      ? { fileIndex: index, sourceLine }
+      : { fileIndex: index, sourceLine: null };
   }
   return null;
 }
@@ -251,11 +273,15 @@ function fileIndexFromTapLocation(location) {
  * titles, arbitrary paths, and assertion output are deliberately ignored.
  */
 export function parseTapFailureDiagnostic(output) {
-  const empty = Object.freeze({ fileIndex: null, testOrdinal: null });
+  const empty = Object.freeze({ fileIndex: null, testOrdinal: null, sourceLine: null });
   if (typeof output !== "string" || output.length > 5_000_000) return empty;
 
   let failureOrdinal = null;
+  let fileIndex = null;
+  let sourceLine = null;
   let failureBlock = false;
+  let inStack = false;
+  let sourceFrameSeen = false;
   for (const line of output.split(/\r?\n/u)) {
     if (!failureBlock) {
       const failure = TAP_FAILURE_RESULT.exec(line);
@@ -267,16 +293,34 @@ export function parseTapFailureDiagnostic(output) {
 
     const location = TAP_LOCATION.exec(line);
     if (location) {
-      return Object.freeze({
-        fileIndex: fileIndexFromTapLocation(location[2]),
-        testOrdinal: failureOrdinal,
-      });
+      fileIndex ??= fileIndexFromTapLocation(location[2]);
+      continue;
+    }
+    if (TAP_STACK_HEADER.test(line)) {
+      inStack = true;
+      continue;
+    }
+    if (inStack) {
+      if (line === "" || /^ {4,}/u.test(line)) {
+        if (!sourceFrameSeen) {
+          const frame = sourceLocationFromTapStackFrame(line);
+          if (frame) {
+            sourceFrameSeen = true;
+            if (fileIndex === null || fileIndex === frame.fileIndex) {
+              fileIndex ??= frame.fileIndex;
+              sourceLine = frame.sourceLine;
+            }
+          }
+        }
+        continue;
+      }
+      inStack = false;
     }
     // Do not scan into the next TAP result or a later test's YAML payload.
     if (TAP_RESULT.test(line) || /^\s+\.\.\.$/u.test(line)) break;
   }
   return failureBlock
-    ? Object.freeze({ fileIndex: null, testOrdinal: failureOrdinal })
+    ? Object.freeze({ fileIndex, testOrdinal: failureOrdinal, sourceLine })
     : empty;
 }
 
@@ -292,10 +336,15 @@ export function formatQualificationFailureDiagnostic(value) {
       && value.testOrdinal <= MAXIMUM_TAP_FAILURE_TEST_ORDINAL
     ? value.testOrdinal
     : null;
-  const formatted = `file_index=${fileIndex ?? "unavailable"} test_ordinal=${testOrdinal ?? "unavailable"}`;
+  const sourceLine = Number.isSafeInteger(value?.sourceLine)
+      && value.sourceLine >= 1
+      && value.sourceLine <= MAXIMUM_TAP_FAILURE_SOURCE_LINE
+    ? value.sourceLine
+    : null;
+  const formatted = `file_index=${fileIndex ?? "unavailable"} test_ordinal=${testOrdinal ?? "unavailable"} source_line=${sourceLine ?? "unavailable"}`;
   return QUALIFICATION_FAILURE_DIAGNOSTIC_FORMAT.test(formatted)
     ? formatted
-    : "file_index=unavailable test_ordinal=unavailable";
+    : "file_index=unavailable test_ordinal=unavailable source_line=unavailable";
 }
 
 function runNodeTests(files, {
