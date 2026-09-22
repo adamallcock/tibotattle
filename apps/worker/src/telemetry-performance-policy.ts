@@ -174,6 +174,63 @@ interface PerformanceCapabilityRow {
   authority_kind: "social" | "accountless";
 }
 
+interface PerformanceGrantHead {
+  capability_revision: number;
+  authority_epoch: number;
+  state: "accepted" | "active" | "revoked";
+  expires_at: string;
+}
+
+function nextGrantTuple(
+  heads: readonly (PerformanceGrantHead | null)[],
+): { capabilityRevision: number; authorityEpoch: number } {
+  const present = heads.filter((head): head is PerformanceGrantHead => head !== null);
+  if (present.length !== 0 && present.length !== heads.length) {
+    invalid("TELEMETRY_CONSENT_INVALID");
+  }
+  if (present.length > 1 && present.some((head) =>
+    head.capability_revision !== present[0]!.capability_revision
+      || head.authority_epoch !== present[0]!.authority_epoch
+      || (head.state === "revoked") !== (present[0]!.state === "revoked"))) {
+    invalid("TELEMETRY_CONSENT_INVALID");
+  }
+  const current = present[0];
+  const capabilityRevision = (current?.capability_revision ?? 0) + 1;
+  const authorityEpoch = (current?.authority_epoch ?? 0)
+    + (current === undefined ? 1 : current.state === "revoked" ? 1 : 0);
+  if (!integer(capabilityRevision, 1, MAX_REVISION)
+      || !integer(authorityEpoch, 1, MAX_REVISION)) {
+    invalid("TELEMETRY_CONSENT_INVALID");
+  }
+  return { capabilityRevision, authorityEpoch };
+}
+
+async function readPerformanceCapabilityHead(
+  db: D1Database,
+  principal: TelemetryPerformancePrincipal,
+): Promise<PerformanceGrantHead | null> {
+  return db.prepare(
+    `SELECT capability_revision, authority_epoch, state, expires_at
+       FROM telemetry_performance_device_capabilities
+      WHERE participant_id = ? AND device_id = ?
+      ORDER BY capability_revision DESC, authority_epoch DESC
+      LIMIT 1`,
+  ).bind(principal.participantId, principal.deviceId).first<PerformanceGrantHead>();
+}
+
+async function readAccountlessPerformanceAuthorizationHead(
+  db: D1Database,
+  principal: TelemetryPerformancePrincipal,
+): Promise<PerformanceGrantHead | null> {
+  return db.prepare(
+    `SELECT a.capability_revision, a.authority_epoch, a.state, a.expires_at
+       FROM accountless_telemetry_performance_authorizations a
+      WHERE a.participant_id = ? AND a.device_credential_id = ?
+      ORDER BY a.capability_revision DESC, a.authority_epoch DESC
+      LIMIT 1`,
+  ).bind(principal.participantId, principal.deviceId).first<PerformanceGrantHead>();
+}
+
 async function readPerformanceCapabilityRow(
   db: D1Database,
   principal: TelemetryPerformancePrincipal,
@@ -190,9 +247,33 @@ async function readPerformanceCapabilityRow(
        JOIN device_credentials d ON d.id = ? AND d.participant_id = p.id
        JOIN telemetry_performance_device_capabilities c
          ON c.participant_id = p.id AND c.device_id = d.id
+        AND c.capability_revision = (
+          SELECT MAX(head.capability_revision)
+            FROM telemetry_performance_device_capabilities head
+           WHERE head.participant_id = p.id AND head.device_id = d.id
+        )
+        AND c.authority_epoch = (
+          SELECT head.authority_epoch
+            FROM telemetry_performance_device_capabilities head
+           WHERE head.participant_id = p.id AND head.device_id = d.id
+           ORDER BY head.capability_revision DESC, head.authority_epoch DESC
+           LIMIT 1
+        )
        LEFT JOIN accountless_telemetry_performance_authorizations a
          ON a.participant_id = p.id AND a.device_credential_id = d.id
         AND a.state = 'active'
+        AND a.capability_revision = (
+          SELECT MAX(head.capability_revision)
+            FROM accountless_telemetry_performance_authorizations head
+           WHERE head.enrollment_device_id = d.accountless_enrollment_device_id
+        )
+        AND a.authority_epoch = (
+          SELECT head.authority_epoch
+            FROM accountless_telemetry_performance_authorizations head
+           WHERE head.enrollment_device_id = d.accountless_enrollment_device_id
+           ORDER BY head.capability_revision DESC, head.authority_epoch DESC
+           LIMIT 1
+        )
        LEFT JOIN accountless_upload_owners owner
          ON owner.participant_id = p.id AND owner.device_credential_id = d.id
         AND owner.state = 'active'
@@ -315,6 +396,16 @@ export async function grantTelemetryPerformanceAccountlessAuthorization(
     PERFORMANCE_PRIVACY_CONTRACT_VERSION)
     .first<{ enrollment_device_id: string; expires_at: string }>();
   if (!owner) invalid();
+  const capabilityHead = await readPerformanceCapabilityHead(db, principal);
+  const authorizationHead = await readAccountlessPerformanceAuthorizationHead(db, principal);
+  const currentGrant = capabilityHead !== null && authorizationHead !== null
+    && capabilityHead.state === "accepted" && authorizationHead.state === "active"
+    && capabilityHead.capability_revision === authorizationHead.capability_revision
+    && capabilityHead.authority_epoch === authorizationHead.authority_epoch
+    && capabilityHead.expires_at === owner.expires_at
+    && authorizationHead.expires_at === owner.expires_at;
+  if (currentGrant) return;
+  const next = nextGrantTuple([capabilityHead, authorizationHead]);
   try {
     await db.batch([
       db.prepare(
@@ -323,31 +414,41 @@ export async function grantTelemetryPerformanceAccountlessAuthorization(
           schema_version, policy_version, authorization_basis,
           performance_schema_version, field_dictionary_version, privacy_contract_version,
           scope, capability_revision, authority_epoch, authorized_at, expires_at, state
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, 'active')
-         ON CONFLICT(enrollment_device_id) DO NOTHING`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
       ).bind(owner.enrollment_device_id, principal.participantId, principal.deviceId,
         ACCOUNTLESS_TELEMETRY_PERFORMANCE_SCHEMA_VERSION,
         ACCOUNTLESS_TELEMETRY_PERFORMANCE_POLICY_VERSION,
         ACCOUNTLESS_TELEMETRY_PERFORMANCE_AUTHORIZATION_BASIS,
         PERFORMANCE_RECORD_SCHEMA_VERSION, PERFORMANCE_FIELD_DICTIONARY_VERSION,
         PERFORMANCE_PRIVACY_CONTRACT_VERSION, TELEMETRY_PERFORMANCE_SCOPE,
-        now, owner.expires_at),
+        next.capabilityRevision, next.authorityEpoch, now, owner.expires_at),
       db.prepare(
         `INSERT INTO telemetry_performance_device_capabilities (
           participant_id, device_id, schema_version, field_dictionary_version,
           privacy_contract_version, scope, capability_revision, authority_epoch,
           issued_at, expires_at, state, consented_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, 'accepted', ?)
-         ON CONFLICT(participant_id, device_id) DO NOTHING`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?)`,
       ).bind(principal.participantId, principal.deviceId,
         PERFORMANCE_RECORD_SCHEMA_VERSION, PERFORMANCE_FIELD_DICTIONARY_VERSION,
         PERFORMANCE_PRIVACY_CONTRACT_VERSION, TELEMETRY_PERFORMANCE_SCOPE,
-        now, owner.expires_at, now),
+        next.capabilityRevision, next.authorityEpoch, now, owner.expires_at, now),
     ]);
   } catch (error) {
     const message = String(error);
     if (message.includes("accountless telemetry performance authorization unavailable")
-        || message.includes("telemetry_performance_capability_unavailable")) {
+        || message.includes("telemetry_performance_capability_unavailable")
+        || message.includes("performance authorization revision conflict")
+        || message.includes("performance capability revision conflict")
+        || message.includes("UNIQUE constraint failed: accountless_telemetry_performance_authorizations")
+        || message.includes("UNIQUE constraint failed: telemetry_performance_device_capabilities")) {
+      const racedCapability = await readPerformanceCapabilityHead(db, principal);
+      const racedAuthorization = await readAccountlessPerformanceAuthorizationHead(db, principal);
+      if (racedCapability?.state === "accepted"
+          && racedAuthorization?.state === "active"
+          && racedCapability.capability_revision === racedAuthorization.capability_revision
+          && racedCapability.authority_epoch === racedAuthorization.authority_epoch
+          && racedCapability.expires_at === owner.expires_at
+          && racedAuthorization.expires_at === owner.expires_at) return;
       invalid("TELEMETRY_CONSENT_INVALID");
     }
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
@@ -384,20 +485,31 @@ export async function grantTelemetryPerformanceSocialAuthorization(
     PERFORMANCE_RECORD_SCHEMA_VERSION, PERFORMANCE_FIELD_DICTIONARY_VERSION,
     PERFORMANCE_PRIVACY_CONTRACT_VERSION, now).first<{ expires_at: string }>();
   if (!row || !instant(row.expires_at) || Date.parse(row.expires_at) <= nowEpoch) invalid("TELEMETRY_CONSENT_INVALID");
+  const capabilityHead = await readPerformanceCapabilityHead(db, principal);
+  if (capabilityHead?.state === "accepted" && capabilityHead.expires_at === row.expires_at) {
+    return readTelemetryPerformanceCapability(db, principal, nowEpoch);
+  }
+  const next = nextGrantTuple([capabilityHead]);
   try {
     await db.prepare(
       `INSERT INTO telemetry_performance_device_capabilities (
         participant_id, device_id, schema_version, field_dictionary_version,
         privacy_contract_version, scope, capability_revision, authority_epoch,
         issued_at, expires_at, state, consented_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, 'accepted', ?)
-       ON CONFLICT(participant_id, device_id) DO NOTHING`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?)`,
     ).bind(principal.participantId, principal.deviceId,
       parsed.schemaVersion, parsed.fieldDictionaryVersion,
-      parsed.privacyContractVersion, parsed.scope, now, row.expires_at, now).run();
+      parsed.privacyContractVersion, parsed.scope, next.capabilityRevision,
+      next.authorityEpoch, now, row.expires_at, now).run();
   } catch (error) {
     const message = String(error);
-    if (message.includes("telemetry_performance_capability_unavailable")) {
+    if (message.includes("telemetry_performance_capability_unavailable")
+        || message.includes("performance capability revision conflict")
+        || message.includes("UNIQUE constraint failed: telemetry_performance_device_capabilities")) {
+      const raced = await readPerformanceCapabilityHead(db, principal);
+      if (raced?.state === "accepted" && raced.expires_at === row.expires_at) {
+        return readTelemetryPerformanceCapability(db, principal, nowEpoch);
+      }
       invalid("TELEMETRY_CONSENT_INVALID");
     }
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");

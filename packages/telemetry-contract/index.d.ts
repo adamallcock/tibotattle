@@ -733,7 +733,8 @@ export const PERFORMANCE_API_SERVICE_TIERS: readonly [
 ];
 export const PERFORMANCE_SPEED_METHODS: readonly ["receipt", "legacy", "tool_free", "unavailable"];
 export const PERFORMANCE_SPEED_MODE_SOURCES: readonly [
-  "rollout_thread_settings", "lineage_inherited", "unobserved", "mixed"
+  "rollout_thread_settings", "turn_context_service_tier", "lineage_inherited",
+  "unobserved", "mixed"
 ];
 export const PERFORMANCE_SPEED_MODES: readonly [
   "fast", "standard", "unknown", "other", "mixed"

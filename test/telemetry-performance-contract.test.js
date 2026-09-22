@@ -138,6 +138,11 @@ test("performance daily cohorts preserve the closed measurement shape", () => {
     apiServiceTier: "priority",
   });
   assert.equal(parseTelemetryPerformanceRecord(claude), claude);
+  const turnContext = performanceRecord({
+    speedMode: "fast",
+    speedModeSource: "turn_context_service_tier",
+  });
+  assert.equal(parseTelemetryPerformanceRecord(turnContext), turnContext);
   const mixed = performanceRecord({
     speedMode: "mixed",
     speedModeSource: "mixed",

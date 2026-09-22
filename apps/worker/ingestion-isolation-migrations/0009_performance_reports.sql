@@ -33,10 +33,13 @@ INSERT INTO telemetry_performance_runtime (
 -- deliberately a different row from accountless_v12_device_authorizations:
 -- the usage successor grant can never authorize performance reports.
 CREATE TABLE accountless_telemetry_performance_authorizations (
-  enrollment_device_id TEXT PRIMARY KEY NOT NULL
+  -- Grants are append-only by authority tuple.  A lease renewal or a fresh
+  -- consent must be able to append a new row while the expired/revoked
+  -- predecessor remains immutable for replay and audit checks.
+  enrollment_device_id TEXT NOT NULL
     REFERENCES accountless_enrollment_ledger(device_id) ON DELETE RESTRICT,
-  participant_id TEXT NOT NULL UNIQUE REFERENCES participants(id) ON DELETE CASCADE,
-  device_credential_id TEXT NOT NULL UNIQUE REFERENCES device_credentials(id) ON DELETE CASCADE,
+  participant_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+  device_credential_id TEXT NOT NULL REFERENCES device_credentials(id) ON DELETE CASCADE,
   schema_version TEXT NOT NULL CHECK (schema_version = 'accountless-performance-owner-v1'),
   policy_version TEXT NOT NULL CHECK (
     policy_version = 'accountless-telemetry-performance-policy-v1'
@@ -63,6 +66,7 @@ CREATE TABLE accountless_telemetry_performance_authorizations (
   revocation_reason TEXT CHECK (revocation_reason IS NULL OR revocation_reason IN (
     'user_opt_out', 'security_reset', 'operator_containment'
   )),
+  PRIMARY KEY (enrollment_device_id, capability_revision, authority_epoch),
   CHECK (expires_at > authorized_at),
   CHECK ((state = 'active' AND revoked_at IS NULL AND revocation_reason IS NULL)
     OR (state = 'revoked' AND revoked_at IS NOT NULL AND revocation_reason IS NOT NULL))
@@ -70,6 +74,56 @@ CREATE TABLE accountless_telemetry_performance_authorizations (
 
 CREATE INDEX accountless_telemetry_performance_authorizations_active
   ON accountless_telemetry_performance_authorizations(state, expires_at);
+CREATE INDEX accountless_telemetry_performance_authorizations_head
+  ON accountless_telemetry_performance_authorizations(
+    enrollment_device_id, capability_revision DESC, authority_epoch DESC
+  );
+
+-- A grant head is monotonic for one enrollment/device authority.  The
+-- authority epoch only advances after a revoked predecessor; ordinary expiry
+-- and lease renewal retain the same authority epoch while capability_revision
+-- fences stale bearer responses.
+CREATE TRIGGER accountless_telemetry_performance_authorization_revision
+BEFORE INSERT ON accountless_telemetry_performance_authorizations
+WHEN NEW.capability_revision IS NOT COALESCE((
+  SELECT prior.capability_revision
+    FROM accountless_telemetry_performance_authorizations prior
+   WHERE prior.enrollment_device_id = NEW.enrollment_device_id
+   ORDER BY prior.capability_revision DESC, prior.authority_epoch DESC
+   LIMIT 1
+), 0) + 1
+  OR NEW.authority_epoch IS NOT COALESCE((
+    SELECT prior.authority_epoch
+      FROM accountless_telemetry_performance_authorizations prior
+     WHERE prior.enrollment_device_id = NEW.enrollment_device_id
+     ORDER BY prior.capability_revision DESC, prior.authority_epoch DESC
+     LIMIT 1
+  ), 0) + CASE
+    WHEN NOT EXISTS (
+      SELECT 1 FROM accountless_telemetry_performance_authorizations prior
+       WHERE prior.enrollment_device_id = NEW.enrollment_device_id
+    ) THEN 1
+    WHEN EXISTS (
+      SELECT 1
+        FROM accountless_telemetry_performance_authorizations prior
+       WHERE prior.enrollment_device_id = NEW.enrollment_device_id
+         AND prior.capability_revision = COALESCE((
+           SELECT latest.capability_revision
+             FROM accountless_telemetry_performance_authorizations latest
+            WHERE latest.enrollment_device_id = NEW.enrollment_device_id
+            ORDER BY latest.capability_revision DESC, latest.authority_epoch DESC
+            LIMIT 1
+         ), 0)
+         AND prior.authority_epoch = COALESCE((
+           SELECT latest.authority_epoch
+             FROM accountless_telemetry_performance_authorizations latest
+            WHERE latest.enrollment_device_id = NEW.enrollment_device_id
+            ORDER BY latest.capability_revision DESC, latest.authority_epoch DESC
+            LIMIT 1
+         ), 0)
+         AND prior.state = 'revoked'
+    ) THEN 1 ELSE 0 END
+BEGIN SELECT RAISE(ABORT, 'accountless telemetry performance authorization revision conflict'); END;
 
 CREATE TRIGGER accountless_telemetry_performance_authorization_admission
 BEFORE INSERT ON accountless_telemetry_performance_authorizations
@@ -142,7 +196,9 @@ CREATE TABLE telemetry_performance_device_capabilities (
   state TEXT NOT NULL CHECK (state IN ('accepted', 'revoked')),
   consented_at TEXT NOT NULL,
   revoked_at TEXT,
-  PRIMARY KEY (participant_id, device_id),
+  -- Keep every authority tuple so expiry/revocation transitions cannot be
+  -- rewritten in place.  Readers select only the monotonic head below.
+  PRIMARY KEY (participant_id, device_id, capability_revision, authority_epoch),
   CHECK (expires_at > issued_at),
   CHECK ((state = 'accepted' AND revoked_at IS NULL)
     OR (state = 'revoked' AND revoked_at IS NOT NULL))
@@ -150,6 +206,58 @@ CREATE TABLE telemetry_performance_device_capabilities (
 
 CREATE INDEX telemetry_performance_capabilities_device
   ON telemetry_performance_device_capabilities(device_id, state, expires_at);
+CREATE INDEX telemetry_performance_capabilities_head
+  ON telemetry_performance_device_capabilities(
+    participant_id, device_id, capability_revision DESC, authority_epoch DESC
+  );
+
+CREATE TRIGGER telemetry_performance_capability_revision
+BEFORE INSERT ON telemetry_performance_device_capabilities
+WHEN NEW.capability_revision IS NOT COALESCE((
+  SELECT prior.capability_revision
+    FROM telemetry_performance_device_capabilities prior
+   WHERE prior.participant_id = NEW.participant_id
+     AND prior.device_id = NEW.device_id
+   ORDER BY prior.capability_revision DESC, prior.authority_epoch DESC
+   LIMIT 1
+), 0) + 1
+  OR NEW.authority_epoch IS NOT COALESCE((
+    SELECT prior.authority_epoch
+      FROM telemetry_performance_device_capabilities prior
+     WHERE prior.participant_id = NEW.participant_id
+       AND prior.device_id = NEW.device_id
+   ORDER BY prior.capability_revision DESC, prior.authority_epoch DESC
+   LIMIT 1
+  ), 0) + CASE
+    WHEN NOT EXISTS (
+      SELECT 1 FROM telemetry_performance_device_capabilities prior
+       WHERE prior.participant_id = NEW.participant_id
+         AND prior.device_id = NEW.device_id
+    ) THEN 1
+    WHEN EXISTS (
+      SELECT 1
+        FROM telemetry_performance_device_capabilities prior
+       WHERE prior.participant_id = NEW.participant_id
+         AND prior.device_id = NEW.device_id
+         AND prior.capability_revision = COALESCE((
+           SELECT latest.capability_revision
+             FROM telemetry_performance_device_capabilities latest
+            WHERE latest.participant_id = NEW.participant_id
+              AND latest.device_id = NEW.device_id
+            ORDER BY latest.capability_revision DESC, latest.authority_epoch DESC
+            LIMIT 1
+         ), 0)
+         AND prior.authority_epoch = COALESCE((
+           SELECT latest.authority_epoch
+             FROM telemetry_performance_device_capabilities latest
+            WHERE latest.participant_id = NEW.participant_id
+              AND latest.device_id = NEW.device_id
+            ORDER BY latest.capability_revision DESC, latest.authority_epoch DESC
+            LIMIT 1
+         ), 0)
+         AND prior.state = 'revoked'
+    ) THEN 1 ELSE 0 END
+BEGIN SELECT RAISE(ABORT, 'telemetry performance capability revision conflict'); END;
 
 CREATE TRIGGER telemetry_performance_capability_admission
 BEFORE INSERT ON telemetry_performance_device_capabilities
@@ -178,6 +286,18 @@ BEGIN
                  ON ledger.device_id = owner.enrollment_device_id
               WHERE a.participant_id = p.id AND a.device_credential_id = d.id
                 AND a.state = 'active' AND a.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                AND a.capability_revision = (
+                  SELECT MAX(head.capability_revision)
+                    FROM accountless_telemetry_performance_authorizations head
+                   WHERE head.enrollment_device_id = a.enrollment_device_id
+                )
+                AND a.authority_epoch = (
+                  SELECT head.authority_epoch
+                    FROM accountless_telemetry_performance_authorizations head
+                   WHERE head.enrollment_device_id = a.enrollment_device_id
+                   ORDER BY head.capability_revision DESC, head.authority_epoch DESC
+                   LIMIT 1
+                )
                 AND a.capability_revision = NEW.capability_revision
                 AND a.authority_epoch = NEW.authority_epoch
                 AND owner.state = 'active' AND ledger.state = 'active'
@@ -286,11 +406,23 @@ BEFORE INSERT ON telemetry_performance_reports
 BEGIN
   SELECT CASE WHEN NEW.state != 'current' OR NOT EXISTS (
     SELECT 1
-      FROM telemetry_performance_runtime r
+       FROM telemetry_performance_runtime r
       JOIN participants p ON p.id = NEW.participant_id
       JOIN device_credentials d ON d.id = NEW.device_id AND d.participant_id = p.id
       JOIN telemetry_performance_device_capabilities c
         ON c.participant_id = p.id AND c.device_id = d.id
+       AND c.capability_revision = (
+         SELECT MAX(head.capability_revision)
+           FROM telemetry_performance_device_capabilities head
+          WHERE head.participant_id = p.id AND head.device_id = d.id
+       )
+       AND c.authority_epoch = (
+         SELECT head.authority_epoch
+           FROM telemetry_performance_device_capabilities head
+          WHERE head.participant_id = p.id AND head.device_id = d.id
+          ORDER BY head.capability_revision DESC, head.authority_epoch DESC
+          LIMIT 1
+       )
      WHERE r.id = 1 AND r.state = 'active'
        AND p.state = 'active' AND d.state = 'active'
        AND c.state = 'accepted' AND c.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -316,6 +448,18 @@ BEGIN
                  ON ledger.device_id = owner.enrollment_device_id
               WHERE a.participant_id = p.id AND a.device_credential_id = d.id
                 AND a.state = 'active' AND a.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                AND a.capability_revision = (
+                  SELECT MAX(head.capability_revision)
+                    FROM accountless_telemetry_performance_authorizations head
+                   WHERE head.enrollment_device_id = a.enrollment_device_id
+                )
+                AND a.authority_epoch = (
+                  SELECT head.authority_epoch
+                    FROM accountless_telemetry_performance_authorizations head
+                   WHERE head.enrollment_device_id = a.enrollment_device_id
+                   ORDER BY head.capability_revision DESC, head.authority_epoch DESC
+                   LIMIT 1
+                )
                 AND a.capability_revision = NEW.capability_revision
                 AND a.authority_epoch = NEW.authority_epoch
                 AND owner.state = 'active' AND ledger.state = 'active'

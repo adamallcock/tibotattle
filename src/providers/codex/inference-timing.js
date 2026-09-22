@@ -16,12 +16,64 @@ const NEEDLES = ['response_item', 'token_count', 'session_meta', 'turn_context',
   'token_usage_record', 'task_started', 'task_complete', 'turn_aborted', 'compacted',
   'thread_settings_applied'].map(x => Buffer.from(x));
 const TIER_NEEDLE = Buffer.from('thread_settings_applied');
+const MODES = new Set(['standard', 'fast', 'unknown', 'other']);
+const MODE_SOURCES = new Set([
+  'rollout_thread_settings', 'turn_context_service_tier', 'unobserved',
+]);
 export const digest = (key, domain, value) => createHmac('sha256', key)
   .update(`tibotattle-timing-experiment/${METHOD}/${domain}\0`).update(value).digest('hex');
 const integer = x => Number.isSafeInteger(x) && x >= 0;
 const stamp = x => typeof x === 'string' ? Date.parse(x) : NaN;
 const id = x => typeof x === 'string' && x.length > 0 && x.length <= 256;
 const TIER_RAW = /^[A-Za-z0-9._:-]{1,64}$/u;
+
+function modeFromRawTier(rawTier, source = 'rollout_thread_settings') {
+  if (rawTier === null) return { mode: 'unknown', modeSource: 'unobserved', invalid: false };
+  if (typeof rawTier !== 'string' || !TIER_RAW.test(rawTier)) {
+    return { mode: 'unknown', modeSource: 'unobserved', invalid: true };
+  }
+  const normalized = rawTier.toLowerCase();
+  return {
+    mode: ['priority', 'fast'].includes(normalized) ? 'fast'
+      : ['default', 'standard'].includes(normalized) ? 'standard'
+        : 'other',
+    modeSource: source,
+    invalid: false,
+  };
+}
+
+function defaultContextMode() {
+  return { modeOverride: false, mode: 'unknown', modeSource: 'unobserved', modeInvalid: false };
+}
+
+function contextModeFromRawTier(rawTier) {
+  const normalized = modeFromRawTier(rawTier, 'turn_context_service_tier');
+  return {
+    modeOverride: true,
+    mode: normalized.mode,
+    modeSource: normalized.modeSource,
+    modeInvalid: normalized.invalid,
+  };
+}
+
+function savedContextMode(entry) {
+  const hasMode = Object.hasOwn(entry, 'modeOverride')
+    || Object.hasOwn(entry, 'mode')
+    || Object.hasOwn(entry, 'modeSource')
+    || Object.hasOwn(entry, 'modeInvalid');
+  if (!hasMode) return defaultContextMode();
+  const modeOverride = entry.modeOverride;
+  const mode = entry.mode;
+  const modeSource = entry.modeSource;
+  const modeInvalid = entry.modeInvalid;
+  if (typeof modeOverride !== 'boolean' || !MODES.has(mode)
+      || !MODE_SOURCES.has(modeSource) || typeof modeInvalid !== 'boolean'
+      || (modeSource === 'unobserved' && mode !== 'unknown')
+      || (modeInvalid && (mode !== 'unknown' || modeSource !== 'unobserved'))) {
+    return null;
+  }
+  return { modeOverride, mode, modeSource, modeInvalid };
+}
 
 function defaultTierState() {
   return { timeline: [], lastAt: null, invalid: false };
@@ -40,11 +92,13 @@ function normalizeSavedContextHistory(value) {
   }
   const entries = {};
   for (const [key, entry] of Object.entries(rawEntries)) {
+    const mode = entry && typeof entry === 'object' && !Array.isArray(entry)
+      ? savedContextMode(entry) : null;
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)
         || !integer(entry.at)
         || (entry.model !== null && !MODELS.has(entry.model))
         || (entry.effort !== null && !EFFORTS.has(entry.effort))
-        || typeof entry.invalid !== 'boolean') {
+        || typeof entry.invalid !== 'boolean' || mode === null) {
       return { entries: {}, invalid: true };
     }
     entries[key] = {
@@ -52,6 +106,7 @@ function normalizeSavedContextHistory(value) {
       model: entry.model,
       effort: entry.effort,
       invalid: entry.invalid,
+      ...mode,
     };
   }
   if (Object.keys(entries).length > MAX_CONTEXT_HISTORY) {
@@ -230,8 +285,27 @@ export function createParser(key, saved, onTurn, { toolFree = false } = {}) {
       turn.mixed = true;
     }
   }
+  function applyContextMode(turn, at, evidence) {
+    if (!evidence.modeOverride) return;
+    if (evidence.modeInvalid || !integer(at) || at < turn.start) {
+      turn.modeInvalid = true;
+      return;
+    }
+    // The per-turn context is authoritative when it is the task boundary.
+    // Once the turn is underway, a different declaration is contradictory
+    // evidence rather than a safe relabel of an already-started turn.
+    if (at !== turn.start) {
+      if (turn.mode !== evidence.mode || turn.modeSource !== evidence.modeSource) {
+        turn.modeMixed = true;
+      }
+      return;
+    }
+    turn.mode = evidence.mode;
+    turn.modeSource = evidence.modeSource;
+  }
   function recordTurnContext(payload, at, turnId) {
     const hasModel = Object.hasOwn(payload, 'model');
+    const hasServiceTier = Object.hasOwn(payload, 'service_tier');
     const malformed = !integer(at) || !hasModel
       || (payload.model !== null && typeof payload.model !== 'string')
       || (Object.hasOwn(payload, 'effort')
@@ -239,10 +313,21 @@ export function createParser(key, saved, onTurn, { toolFree = false } = {}) {
     const model = MODELS.has(payload.model) ? payload.model : null;
     const effort = EFFORTS.has(payload.effort) ? payload.effort : null;
     const previous = turnId ? s.contextHistory[turnId] : null;
+    const modeEvidence = hasServiceTier
+      ? contextModeFromRawTier(payload.service_tier)
+      : previous ? {
+        modeOverride: previous.modeOverride === true,
+        mode: previous.mode ?? 'unknown',
+        modeSource: previous.modeSource ?? 'unobserved',
+        modeInvalid: previous.modeInvalid === true,
+      } : defaultContextMode();
     const globalRegressed = s.modelAt !== null && (!integer(at) || at < s.modelAt);
     const regressed = previous && (!integer(at) || at < previous.at);
     const equalConflict = previous && integer(at) && at === previous.at
-      && (model !== previous.model || effort !== previous.effort);
+      && (model !== previous.model || effort !== previous.effort
+        || hasServiceTier && (previous.modeOverride !== modeEvidence.modeOverride
+          || previous.mode !== modeEvidence.mode || previous.modeSource !== modeEvidence.modeSource
+          || previous.modeInvalid !== modeEvidence.modeInvalid));
     if (malformed || globalRegressed || regressed || equalConflict || previous?.invalid) {
       if (turnId) {
         s.contextHistory[turnId] = {
@@ -250,13 +335,14 @@ export function createParser(key, saved, onTurn, { toolFree = false } = {}) {
           model,
           effort,
           invalid: true,
+          ...modeEvidence,
         };
       }
       markContextEvidenceInvalid(turnId);
       return;
     }
     if (turnId) {
-      s.contextHistory[turnId] = { at, model, effort, invalid: false };
+      s.contextHistory[turnId] = { at, model, effort, invalid: false, ...modeEvidence };
       if (Object.keys(s.contextHistory).length > MAX_CONTEXT_HISTORY) {
         const current = s.contextHistory[turnId];
         s.contextHistory = { [turnId]: current };
@@ -290,6 +376,7 @@ export function createParser(key, saved, onTurn, { toolFree = false } = {}) {
       }
       turn.model = s.model;
       turn.effort = s.effort;
+      applyContextMode(turn, at, modeEvidence);
       return;
     }
     // An unattributed settings change cannot silently leave a pending window
@@ -297,6 +384,7 @@ export function createParser(key, saved, onTurn, { toolFree = false } = {}) {
     for (const active of Object.values(s.turns)) {
       if (active.model !== s.model || active.effort !== s.effort) active.mixed = true;
       if (active.modelObserved && active.stableModel !== s.model) active.modelStable = false;
+      if (hasServiceTier) active.modeInvalid = true;
     }
   }
   function setTierEvent(payload, at) {
@@ -328,11 +416,7 @@ export function createParser(key, saved, onTurn, { toolFree = false } = {}) {
       markModeEvidenceInvalid(s);
       return;
     }
-    const normalized = rawTier === null
-      ? { mode: 'unknown', source: 'unobserved' }
-      : { mode: ['priority', 'fast'].includes(rawTier.toLowerCase()) ? 'fast'
-        : ['default', 'standard'].includes(rawTier.toLowerCase()) ? 'standard'
-          : 'other', source: 'rollout_thread_settings' };
+    const normalized = modeFromRawTier(rawTier);
     if (s.tier.timeline.length >= MAX_TIER_EVENTS) {
       // A completed declaration is sufficient for future task-start lookup;
       // active turns already captured their mode. Keep the newest prior
@@ -347,7 +431,7 @@ export function createParser(key, saved, onTurn, { toolFree = false } = {}) {
         turn.modeMixed = true;
       }
     }
-    s.tier.timeline.push({ at, mode: normalized.mode, source: normalized.source });
+    s.tier.timeline.push({ at, mode: normalized.mode, source: normalized.modeSource });
     s.tier.lastAt = at;
   }
   function legacyCount(p, at) {
@@ -518,10 +602,12 @@ export function createParser(key, saved, onTurn, { toolFree = false } = {}) {
         rejectToolFree();
         for (const t of Object.values(s.turns)) t.legacy.windowBad = true;
       }
-      const mode = modeAt(s.tier, at);
       const context = s.contextHistory[tid];
       const contextAtStart = !s.contextHistoryInvalid && context?.at === at
         && context.invalid === false;
+      const mode = contextAtStart && context.modeOverride
+        ? { mode: context.mode, source: context.modeSource, invalid: context.modeInvalid }
+        : modeAt(s.tier, at);
       const startModel = contextAtStart ? context.model : s.model;
       const startEffort = contextAtStart ? context.effort : s.effort;
       const modelKnownAtStart = contextAtStart && startModel !== null;

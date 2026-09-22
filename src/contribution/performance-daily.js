@@ -166,7 +166,8 @@ function performanceDailyMode(row) {
     return { speedMode: mode, speedModeSource: source };
   }
   if (["fast", "standard", "other"].includes(mode)
-      && ["rollout_thread_settings", "lineage_inherited"].includes(source)) {
+      && ["rollout_thread_settings", "turn_context_service_tier", "lineage_inherited"]
+        .includes(source)) {
     return { speedMode: mode, speedModeSource: source };
   }
   return { speedMode: "unknown", speedModeSource: "unobserved" };
