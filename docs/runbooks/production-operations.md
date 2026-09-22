@@ -479,12 +479,14 @@ forward-only, populated-schema operation for the exact predecessor source
 `ingestion-isolation-migrations/0006`–`0009` files, then the three analytics
 `analytics-migrations/0024`–`0026` files, in that order. The operator binds each
 SQL digest, the candidate clean `HEAD`, the exact database IDs and names, the
-prior schema/data/ledger receipts, the reviewed inventory bytes hash, a 9 GB
+prior schema/data/ledger receipts, the reviewed canonical inventory digest, a 9 GB
 capacity budget, and a rehearsal receipt. It never creates or repairs a
 missing prior ledger. The active Worker predecessor, version, canonical live
 configuration fingerprint, contained collection hold, and reviewed D1
 Time Travel receipt are re-read under the shared production lock before the
-first D1 write and before every later write.
+first D1 write and before every later write. The plan's `inventorySha256` is
+the canonical digest of the embedded inventory object, so execution also
+detects an edited or internally inconsistent plan.
 
 Run the local populated rehearsal from the repository root. It uses
 synthetic content-free rows, enables foreign-key checks, verifies every mapped
@@ -517,8 +519,31 @@ node apps/worker/scripts/typed-forward-migration.mjs --mode capture-backup \
   --output /absolute/private/typed-forward-backup-receipt.json
 ```
 
-A reviewed operator captures the read-only inventory and prior receipts into
-mode-0600 JSON artifacts, then writes a mode-0600 closed plan only from a clean
+A maintained read-only capture brackets the active Worker and the two target
+roles, checks that collection is already contained, and writes three new
+mode-0600 artifacts: the enriched `inventory.json`, the exact ordered
+`targets.json` with populated schema/data/ledger receipts, and the v2 Time
+Travel backup receipt. It performs no remote writes. The growth budget is an
+explicit reviewed number and must leave the 9 GB operating cap below its
+limit:
+
+```sh
+mkdir -m 700 /absolute/private/typed-forward-capture
+node apps/worker/scripts/typed-forward-migration.mjs --mode capture-inventory \
+  --operation /absolute/private/typed-forward-capture \
+  --cli /absolute/wrangler-dist/cli.js \
+  --account-id ACCOUNT_ID --worker-name WORKER_NAME \
+  --wrangler-sha256 WRANGLER_SHA256 --growth-budget-bytes 1000000000 \
+  --inventory-output /absolute/private/typed-forward-capture/inventory.json \
+  --targets-output /absolute/private/typed-forward-capture/targets.json \
+  --backup-output /absolute/private/typed-forward-capture/backup-receipt.json
+```
+
+The capture does two canonical Worker/config reads and rechecks both target
+binding IDs/names, the contained control revision, and the exact prior
+schema/data/ledger observations around the fixed Wrangler reads. Any source,
+version, configuration, role, hold, or backup drift leaves no newly written
+artifact. Prepare then writes a mode-0600 closed plan only from a clean
 checkout whose `HEAD` equals the candidate source pin:
 
 ```sh
@@ -534,7 +559,7 @@ node apps/worker/scripts/typed-forward-migration.mjs --mode prepare \
 
 Inspecting a plan is read-only and does not acquire the shared production
 deployment lock. The remote path is a separate explicitly confirmed command.
-It first rechecks the pinned clean source, exact inventory bytes hash, prior
+It first rechecks the pinned clean source, canonical embedded inventory digest, prior
 receipt, schema prefix and content-free invariants. Each migration file is
 split using the pinned Wrangler splitter. A durable intent is written before
 each bounded mutation request, and the migration ledger insert is its own
@@ -562,9 +587,31 @@ After an uncertain result, stop and rerun the same plan with `--resume`. Resume
 reads first and accepts only the exact before or after state recorded by the
 durable intent; it never blindly retries a provider operation. A completed
 release-intent resumes by observing lock ownership and releases only the
-original owner. An expired plan can only resume reads/reconciliation; writes
-require a separately approved, chained extension of at most 24 hours. The
-concrete transport also rechecks the active Worker through the canonical
+original owner. An expired plan can only resume reads/reconciliation. A write
+extension is admitted only on that existing expired operation, with an
+`approvedAt` at or after the prior deadline, the exact previous-extension
+digest, and a new window of at most 24 hours. Verify the private artifacts and
+their canonical digests before the explicitly protected resume command:
+
+```sh
+test -f /absolute/private/typed-forward-plan.json \
+  && test "$(stat -f '%Lp' /absolute/private/typed-forward-plan.json)" = 600
+test -f /absolute/private/typed-forward-extension.json \
+  && test "$(stat -f '%Lp' /absolute/private/typed-forward-extension.json)" = 600
+PLAN_SHA256="$(node --input-type=module -e 'import { readFileSync } from "node:fs"; import { identityDigest } from "./scripts/lib/release-operation.mjs"; process.stdout.write(identityDigest(JSON.parse(readFileSync(process.argv[1], "utf8"))))' /absolute/private/typed-forward-plan.json)"
+EXTENSION_SHA256="$(node --input-type=module -e 'import { readFileSync } from "node:fs"; import { identityDigest } from "./scripts/lib/release-operation.mjs"; process.stdout.write(identityDigest(JSON.parse(readFileSync(process.argv[1], "utf8"))))' /absolute/private/typed-forward-extension.json)"
+node apps/worker/scripts/typed-forward-migration.mjs --mode execute --resume \
+  --plan /absolute/private/typed-forward-plan.json \
+  --worker-root apps/worker --repository-root /absolute/candidate-checkout \
+  --operation /absolute/private/typed-forward-operation \
+  --cli /absolute/wrangler-dist/cli.js \
+  --confirmation EXECUTE_REVIEWED_TYPED_FORWARD_MIGRATION \
+  --approved-plan-sha256 "$PLAN_SHA256" \
+  --extension /absolute/private/typed-forward-extension.json \
+  --approved-extension-sha256 "$EXTENSION_SHA256"
+```
+
+The concrete transport also rechecks the active Worker through the canonical
 read-only production inventory provider and verifies a Time Travel bookmark at
 the receipt capture time for each exact database. Typed deployment, client
 rollout and staged activation remain separate gates after both ledgers have

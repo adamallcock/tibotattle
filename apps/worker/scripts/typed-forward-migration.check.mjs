@@ -8,11 +8,13 @@ import {
   assertCleanSource,
   createTypedForwardWranglerAdapter,
   captureTypedForwardBackupReceipt,
+  captureTypedForwardInventory,
   prepareTypedForwardPlan,
   parseTypedForwardArguments,
   plannedMigrationOperations,
   rehearseTypedForwardMigration,
   runTypedForwardMigration,
+  validateTypedForwardPlan,
   TYPED_FORWARD_CONFIRMATION,
   TYPED_FORWARD_DATA_INVARIANT_SQL,
   TYPED_FORWARD_MAINTENANCE_HOLD_SCHEMA,
@@ -23,7 +25,6 @@ import {
   previousReceiptDigest,
 } from './typed-forward-migration.mjs';
 import { identityDigest } from '../../../scripts/lib/release-operation.mjs';
-import { storageSha256 } from './d1-storage-plan.mjs';
 
 const now = Date.parse('2026-09-22T12:00:00.000Z');
 const WORKER_ROOT = process.cwd().endsWith('/apps/worker') ? '.' : 'apps/worker';
@@ -92,7 +93,7 @@ async function fixture(t) {
   const inventory = { capturedAt: '2026-09-22T12:00:00.000Z', sourceCommit: TYPED_FORWARD_PREVIOUS_SOURCE,
     versionId: worker.versionId, fingerprint: worker.fingerprint, worker, maintenanceHold: makeHold(), backupReceipt: makeBackup(targets),
     targetsSha256: identityDigest(targets.map(target => ({ role: target.role, binding: target.binding, name: target.name, databaseId: target.databaseId, bytes: target.bytes }))) };
-  const inventorySha256 = storageSha256(`${JSON.stringify(inventory)}\n`);
+  const inventorySha256 = identityDigest(inventory);
   const prepared = await prepareTypedForwardPlan({ workerRoot: WORKER_ROOT, repositoryRoot: repository.root,
     accountId: 'b'.repeat(32), workerName: 'typed-forward-worker', candidateSourceCommit: repository.commit, inventory, targets,
     inventorySha256, rehearsal, wranglerSha256: 'c'.repeat(64), createdAt: '2026-09-22T12:00:00.000Z', expiresAt: '2026-09-22T13:00:00.000Z', now });
@@ -100,17 +101,24 @@ async function fixture(t) {
   const lock = { async createOwner() { return 'd'.repeat(40); }, async status() { return owner; },
     async acquire(next) { assert.equal(owner, null); owner = next; }, async assertOwned(expected) { assert.equal(owner, expected); },
     async release(expected) { assert.equal(owner, expected); owner = null; } };
-  const counts = { writes: 0, safety: 0 };
+  const counts = { writes: 0, safety: 0, foreignKeyChecks: 0 };
   const capturedSql = [];
   const positions = new Map(targets.map(target => [target.role, { applied: 0, statementIndex: 0 }]));
-  const controls = { held: true, worker: true, backup: true };
+  const controls = { held: true, worker: true, backup: true, failForeignKeyAfterLedger: false, foreignKeyFailed: false };
   const adapter = {
     async inventory(target) { return [{ id: target.databaseId, name: target.name, bytes: target.bytes }]; },
     async inspect(target) { const value = observation(prepared.plan, target, positions.get(target.role)); return controls.drift ? { ...value, schemaSha256: '0'.repeat(64) } : value; },
     async assertMaintenanceHold(hold) { counts.safety += 1; if (!controls.held || hold.revision !== 7) throw Object.assign(new Error('hold drift'), { code: 'TYPED_FORWARD_MAINTENANCE_HOLD_DRIFT' }); },
     async activeWorker() { if (!controls.worker) return { ...worker, fingerprint: 'f'.repeat(64) }; return worker; },
     async verifyBackupReceipt() { if (!controls.backup) throw Object.assign(new Error('backup drift'), { code: 'TYPED_FORWARD_BACKUP_RECEIPT_UNVERIFIED' }); },
-    async foreignKeyCheck() { return []; },
+    async foreignKeyCheck() {
+      counts.foreignKeyChecks += 1;
+      if (controls.failForeignKeyAfterLedger && controls.ledgerWritten && !controls.foreignKeyFailed) {
+        controls.foreignKeyFailed = true;
+        throw Object.assign(new Error('foreign-key readback uncertain'), { code: 'TYPED_FORWARD_FOREIGN_KEY_READBACK_UNCERTAIN' });
+      }
+      return [];
+    },
     async migrateStatement(target, statement) {
       counts.writes += 1;
       capturedSql.push(statement.sql);
@@ -119,6 +127,7 @@ async function fixture(t) {
       assert.equal(statement.statementIndex, position.statementIndex);
       if (statement.kind === 'ledger') { position.applied += 1; position.statementIndex = 0; }
       else position.statementIndex += 1;
+      if (statement.kind === 'ledger') controls.ledgerWritten = true;
       if (controls.failAfterWrite && counts.writes === controls.failAfterWrite) throw Object.assign(new Error('provider timeout'), { diagnostics: { classification: 'uncertain', file: 'provider-failure-0.json', sha256: 'e'.repeat(64) } });
     },
   };
@@ -194,6 +203,21 @@ test('uncertain migration resumes when still within plan window without replayin
   assert.equal(f.counts.writes, f.plan.steps.reduce((sum, step) => sum + step.statements.length, 0));
 });
 
+test('post-ledger foreign-key readback is a durable resume checkpoint', async t => {
+  const f = await fixture(t);
+  f.controls.failForeignKeyAfterLedger = true;
+  await assert.rejects(runTypedForwardMigration(f.args), { code: 'TYPED_FORWARD_FOREIGN_KEY_READBACK_UNCERTAIN' });
+  assert.equal(f.counts.writes, f.plan.steps[0].statements.length);
+  const journal = JSON.parse(await readFile(join(f.scratch, 'operation', 'operation.json'), 'utf8'));
+  assert.equal(journal.state.targets.USAGE_MONITOR_DB.status, 'statement_intent');
+  const writesBeforeResume = f.counts.writes;
+  f.controls.failForeignKeyAfterLedger = false;
+  const result = await runTypedForwardMigration({ ...f.args, resume: true, now });
+  assert.equal(result.status, 'completed');
+  assert.equal(f.counts.writes, f.plan.steps.reduce((sum, step) => sum + step.statements.length, 0));
+  assert.ok(f.counts.foreignKeyChecks > writesBeforeResume);
+});
+
 test('schema drift and ledger prefix without a receipt are read-only refusals', async t => {
   const f = await fixture(t); f.controls.drift = true;
   await assert.rejects(runTypedForwardMigration(f.args), { code: 'TYPED_FORWARD_MIGRATION_RESULT_UNCERTAIN' });
@@ -215,12 +239,55 @@ test('expired resume is read-only until a chained <=24h extension is approved', 
   assert.equal(result.status, 'completed');
 });
 
+test('approval extensions require an expired resume and approval at or after the prior deadline', async t => {
+  const initial = await fixture(t);
+  const initialExtension = { schema: 'd1-storage-approval-extension-v1', planSha256: initial.planSha256,
+    previousExtensionSha256: null, approvedAt: '2026-09-22T12:00:00.000Z', expiresAt: '2026-09-22T12:30:00.000Z' };
+  await assert.rejects(runTypedForwardMigration({ ...initial.args, extension: initialExtension,
+    approvedExtensionSha256: identityDigest(initialExtension) }), { code: 'TYPED_FORWARD_APPROVAL_EXTENSION_REQUIRES_EXPIRED_RESUME' });
+  assert.equal(initial.counts.writes, 0);
+
+  const expired = await fixture(t); expired.controls.failAfterWrite = 1;
+  await assert.rejects(runTypedForwardMigration(expired.args), { code: 'TYPED_FORWARD_MIGRATION_RESULT_UNCERTAIN' });
+  delete expired.controls.failAfterWrite;
+  const earlyExtension = { schema: 'd1-storage-approval-extension-v1', planSha256: expired.planSha256,
+    previousExtensionSha256: null, approvedAt: '2026-09-22T12:59:00.000Z', expiresAt: '2026-09-22T13:59:00.000Z' };
+  await assert.rejects(runTypedForwardMigration({ ...expired.args, resume: true, now: Date.parse('2026-09-22T14:00:00.000Z'),
+    extension: earlyExtension, approvedExtensionSha256: identityDigest(earlyExtension) }), { code: 'TYPED_FORWARD_APPROVAL_EXTENSION_REQUIRES_EXPIRED_RESUME' });
+  assert.equal(expired.counts.writes, 1);
+});
+
+test('a second extension resumes from the prior extension deadline', async t => {
+  const f = await fixture(t); f.controls.failAfterWrite = 1;
+  await assert.rejects(runTypedForwardMigration(f.args), { code: 'TYPED_FORWARD_MIGRATION_RESULT_UNCERTAIN' });
+  delete f.controls.failAfterWrite;
+  const first = { schema: 'd1-storage-approval-extension-v1', planSha256: f.planSha256, previousExtensionSha256: null,
+    approvedAt: '2026-09-22T14:01:00.000Z', expiresAt: '2026-09-23T14:01:00.000Z' };
+  await runTypedForwardMigration({ ...f.args, resume: true, now: Date.parse('2026-09-22T14:02:00.000Z'), extension: first,
+    approvedExtensionSha256: identityDigest(first) });
+  const second = { schema: 'd1-storage-approval-extension-v1', planSha256: f.planSha256,
+    previousExtensionSha256: identityDigest(first), approvedAt: '2026-09-23T14:02:00.000Z', expiresAt: '2026-09-24T14:02:00.000Z' };
+  const result = await runTypedForwardMigration({ ...f.args, resume: true, now: Date.parse('2026-09-23T14:03:00.000Z'), extension: second,
+    approvedExtensionSha256: identityDigest(second) });
+  assert.equal(result.status, 'completed');
+  const journal = JSON.parse(await readFile(join(f.scratch, 'operation', 'operation.json'), 'utf8'));
+  assert.equal(journal.state.approvalExtensions.length, 2);
+});
+
+test('plan admission binds the canonical embedded inventory digest', async t => {
+  const f = await fixture(t);
+  const tampered = structuredClone(f.plan);
+  tampered.inventory.worker.fingerprint = 'f'.repeat(64);
+  assert.throws(() => validateTypedForwardPlan(tampered, { now }), { code: 'TYPED_FORWARD_PLAN_INVALID' });
+});
+
 test('expired resume can reconcile an intent after backup expiry but cannot write', async t => {
   const f = await fixture(t);
   const { receiptSha256: _oldReceiptSha256, ...backupWithoutDigest } = f.plan.inventory.backupReceipt;
   const backup = { ...backupWithoutDigest, expiresAt: '2026-09-22T12:30:00.000Z' };
   backup.receiptSha256 = identityDigest({ ...backup });
   f.plan.inventory.backupReceipt = backup;
+  f.plan.inventorySha256 = identityDigest(f.plan.inventory);
   f.args.plan = f.plan;
   f.args.approvedPlanSha256 = identityDigest(f.plan);
   f.controls.failAfterWrite = 1;
@@ -234,6 +301,7 @@ test('expired resume can reconcile an intent after backup expiry but cannot writ
 test('expired resume can reconcile an intent after hold expiry but cannot write', async t => {
   const f = await fixture(t);
   f.plan.inventory.maintenanceHold.expiresAt = '2026-09-22T12:30:00.000Z';
+  f.plan.inventorySha256 = identityDigest(f.plan.inventory);
   f.args.plan = f.plan;
   f.args.approvedPlanSha256 = identityDigest(f.plan);
   f.controls.failAfterWrite = 1;
@@ -351,6 +419,69 @@ test('backup capture refuses reordered targets and ambiguous Time Travel output'
     spawn: () => ({ status: 0, stdout: JSON.stringify([{ bookmark: 'ambiguous' }]), stderr: '' }) }), { code: 'TYPED_FORWARD_BACKUP_RECEIPT_UNVERIFIED' });
 });
 
+test('inventory capture brackets canonical Worker and D1 reads into private enriched artifacts', async t => {
+  const f = await fixture(t);
+  const captures = [];
+  const snapshot = { schema: 'production-live-config-v1', sourceCommit: TYPED_FORWARD_PREVIOUS_SOURCE, versionId: f.plan.inventory.versionId,
+    fingerprint: f.plan.inventory.fingerprint,
+    bindings: f.targets.map(target => ({ name: target.binding, type: 'd1', database_id: target.databaseId, database_name: target.name })) };
+  const provider = { async capture() { captures.push(true); return { capturedAt: '2026-09-22T12:00:00.000Z' }; } };
+  const adapterCalls = [];
+  const adapter = {
+    async captureMaintenanceHold(target, capturedAt, expiresAt) {
+      adapterCalls.push(['hold', target.role]);
+      return makeHold();
+    },
+    async inventory(target) {
+      adapterCalls.push(['inventory', target.role]);
+      return [{ id: target.databaseId, name: target.name, bytes: 1000 }];
+    },
+    async inspect(target) {
+      adapterCalls.push(['inspect', target.role]);
+      const previous = f.targets.find(candidate => candidate.role === target.role).previous;
+      return { schemaSha256: previous.schemaSha256, dataInvariantSha256: previous.dataInvariantSha256,
+        migrations: previous.ledger, ledgerSha256: identityDigest(previous.ledger), bytes: 1000 };
+    },
+    async captureBackupReceipt(targets, capturedAt, expiresAt) {
+      adapterCalls.push(['backup', targets.length]);
+      return f.plan.inventory.backupReceipt;
+    },
+  };
+  const output = {
+    inventory: join(f.scratch, 'captured-inventory.json'), targets: join(f.scratch, 'captured-targets.json'),
+    backup: join(f.scratch, 'captured-backup.json'),
+  };
+  const captured = await captureTypedForwardInventory({ accountId: f.plan.accountId, workerName: f.plan.workerName,
+    operationDirectory: f.scratch, cliPath: 'synthetic-cli', wranglerSha256: f.plan.wranglerSha256, migrationGrowthBudgetBytes: 100000,
+    inventoryOutputPath: output.inventory, targetsOutputPath: output.targets, backupOutputPath: output.backup, now,
+    liveProviderFactory: () => provider, liveConfigSnapshot: () => snapshot, adapterFactory: () => adapter });
+  assert.equal(captured.remoteWrites, false);
+  assert.equal(captures.length, 2);
+  assert.deepEqual(adapterCalls.map(call => call[0]), ['hold', 'inventory', 'inspect', 'inventory', 'inspect', 'backup', 'hold']);
+  assert.deepEqual(captured.targets.map(target => target.role), ['primary', 'analytics']);
+  assert.equal(captured.inventorySha256, identityDigest(captured.inventory));
+  assert.equal((await stat(output.inventory)).mode & 0o777, 0o600);
+  assert.equal((await stat(output.targets)).mode & 0o777, 0o600);
+  assert.equal((await stat(output.backup)).mode & 0o777, 0o600);
+  assert.deepEqual(JSON.parse(await readFile(output.targets, 'utf8')), captured.targets);
+});
+
+test('inventory capture refuses an uncontained hold before writing artifacts', async t => {
+  const f = await fixture(t);
+  const snapshot = { schema: 'production-live-config-v1', sourceCommit: TYPED_FORWARD_PREVIOUS_SOURCE, versionId: f.plan.inventory.versionId,
+    fingerprint: f.plan.inventory.fingerprint, bindings: f.targets.map(target => ({ name: target.binding, type: 'd1', database_id: target.databaseId, database_name: target.name })) };
+  const output = [join(f.scratch, 'inventory.json'), join(f.scratch, 'targets.json'), join(f.scratch, 'backup.json')];
+  const adapter = { async captureMaintenanceHold() { throw Object.assign(new Error('collection active'), { code: 'TYPED_FORWARD_MAINTENANCE_HOLD_UNVERIFIED' }); },
+    async inventory() { assert.fail('uncontained hold should stop before D1 inventory'); }, async inspect() { assert.fail('uncontained hold should stop before D1 inspect'); },
+    async captureBackupReceipt() { assert.fail('uncontained hold should stop before backup capture'); } };
+  await assert.rejects(captureTypedForwardInventory({ accountId: f.plan.accountId, workerName: f.plan.workerName, operationDirectory: f.scratch,
+    cliPath: 'synthetic-cli', wranglerSha256: f.plan.wranglerSha256, migrationGrowthBudgetBytes: 100000,
+    inventoryOutputPath: output[0], targetsOutputPath: output[1], backupOutputPath: output[2], now,
+    liveProviderFactory: () => ({ async capture() { return { capturedAt: '2026-09-22T12:00:00.000Z' }; } }),
+    liveConfigSnapshot: () => snapshot, adapterFactory: () => adapter }), { code: 'TYPED_FORWARD_MAINTENANCE_HOLD_UNVERIFIED' });
+  for (const path of output) await assert.rejects(stat(path));
+});
+
 test('injected backup verification cannot replace exact concrete bookmark comparison', async t => {
   const f = await fixture(t);
   const cliPath = join(WORKER_ROOT, 'node_modules/wrangler/wrangler-dist/cli.js');
@@ -405,5 +536,6 @@ test('concrete active Worker verification uses the canonical live config fingerp
 test('CLI argument admission includes extension input and refuses incomplete execution', () => {
   assert.equal(parseTypedForwardArguments(['--mode', 'execute', '--plan', 'plan.json', '--worker-root', 'worker', '--operation', 'operation', '--repository-root', 'repo', '--cli', 'cli', '--confirmation', TYPED_FORWARD_CONFIRMATION, '--approved-plan-sha256', 'a'.repeat(64), '--extension', 'extension.json', '--approved-extension-sha256', 'b'.repeat(64)]).mode, 'execute');
   assert.equal(parseTypedForwardArguments(['--mode', 'capture-backup', '--targets', 'targets.json', '--operation', 'operation', '--cli', 'cli', '--account-id', 'a'.repeat(32), '--wrangler-sha256', 'b'.repeat(64), '--output', 'backup.json']).mode, 'capture-backup');
+  assert.equal(parseTypedForwardArguments(['--mode', 'capture-inventory', '--operation', 'operation', '--cli', 'cli', '--account-id', 'a'.repeat(32), '--worker-name', 'worker', '--wrangler-sha256', 'b'.repeat(64), '--growth-budget-bytes', '100000', '--inventory-output', 'inventory.json', '--targets-output', 'targets.json', '--backup-output', 'backup.json']).mode, 'capture-inventory');
   assert.throws(() => parseTypedForwardArguments(['--mode', 'execute', '--plan', 'plan.json']), { code: 'TYPED_FORWARD_ARGUMENTS_INVALID' });
 });

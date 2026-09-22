@@ -256,6 +256,11 @@ export function validateTypedForwardPlan(plan, { now = Date.now(), allowExpired 
       || Date.parse(plan.expiresAt) - Date.parse(plan.createdAt) > TYPED_FORWARD_MAX_WINDOW_MS
       || plan.operatingCapBytes !== TYPED_FORWARD_OPERATING_CAP_BYTES || !SHA256.test(plan.wranglerSha256 ?? '')
       || !SHA256.test(plan.rehearsalSha256 ?? '') || !SHA256.test(plan.inventorySha256 ?? '')) fail('PLAN_INVALID');
+  // The plan carries the canonical inventory object so execution can prove the
+  // digest still binds the exact semantic evidence it was approved against.
+  // A raw JSON-file hash would only bind formatting and would not protect the
+  // embedded object if a plan were reconstructed by another operator.
+  if (identityDigest(plan.inventory) !== plan.inventorySha256) fail('PLAN_INVALID');
   validateInventory(plan.inventory, plan);
   if (!Array.isArray(plan.targets) || plan.targets.length !== 2
       || plan.targets[0]?.role !== 'primary' || plan.targets[1]?.role !== 'analytics') fail('TARGET_ORDER_INVALID');
@@ -407,6 +412,7 @@ export async function prepareTypedForwardPlan({ workerRoot, accountId, workerNam
   if (typeof workerRoot !== 'string' || !Array.isArray(targets) || targets.length !== 2 || !object(rehearsal)) fail('PLAN_INPUT_INVALID');
   validateCommit(candidateSourceCommit);
   if (!SHA256.test(inventorySha256 ?? '')) fail('INVENTORY_INVALID');
+  if (!object(inventory) || identityDigest(inventory) !== inventorySha256) fail('INVENTORY_INVALID');
   if (previousSourceCommit !== TYPED_FORWARD_PREVIOUS_SOURCE) fail('PREVIOUS_SOURCE_INVALID');
   validateRehearsalBinding(rehearsal, targets);
   const targetInventoryDigest = identityDigest(targets.map(target => ({ role: target.role, binding: target.binding, name: target.name, databaseId: target.databaseId, bytes: target.bytes })));
@@ -722,7 +728,11 @@ function validateState(state, plan, now = Date.now()) {
         || typeof state.lastFailureDiagnostics.file !== 'string' || state.lastFailureDiagnostics.file.length > 256
         || !SHA256.test(state.lastFailureDiagnostics.sha256 ?? '')))) fail('OPERATION_STATE_INVALID');
   if (!Array.isArray(state.approvalExtensions) || state.approvalExtensions.length > 32) fail('OPERATION_STATE_INVALID');
-  for (const extension of state.approvalExtensions) validateApprovalExtension(extension, identityDigest(plan), null, now, true);
+  let previousExtensionSha256 = null;
+  for (const extension of state.approvalExtensions) {
+    validateApprovalExtension(extension, identityDigest(plan), previousExtensionSha256, now, true);
+    previousExtensionSha256 = identityDigest(extension);
+  }
   if (Object.keys(state.targets).some(binding => !plan.targets.some(target => target.binding === binding))) fail('OPERATION_STATE_INVALID');
   for (const target of plan.targets) {
     const row = state.targets[target.binding];
@@ -754,7 +764,7 @@ function validateApprovalExtension(extension, planSha256, previousExtensionSha25
   return extension;
 }
 
-function resolveTypedForwardApproval({ plan, state, extension, approvedExtensionSha256, now }) {
+function resolveTypedForwardApproval({ plan, state, extension, approvedExtensionSha256, now, resume = false }) {
   const planSha256 = identityDigest(plan);
   const chain = Array.isArray(state.approvalExtensions) ? [...state.approvalExtensions] : [];
   let previous = null;
@@ -763,6 +773,10 @@ function resolveTypedForwardApproval({ plan, state, extension, approvedExtension
     previous = identityDigest(current);
   }
   if (extension !== null && extension !== undefined) {
+    const priorDeadline = chain.length ? Date.parse(chain.at(-1).expiresAt) : Date.parse(plan.expiresAt);
+    if (!resume || now < priorDeadline || Date.parse(extension.approvedAt) < priorDeadline) {
+      fail('APPROVAL_EXTENSION_REQUIRES_EXPIRED_RESUME');
+    }
     if (!approvedExtensionSha256 || identityDigest(extension) !== approvedExtensionSha256) fail('APPROVAL_EXTENSION_NOT_APPROVED');
     validateApprovalExtension(extension, planSha256, previous, now);
     chain.push(extension);
@@ -825,7 +839,7 @@ export async function runTypedForwardMigration({ plan, workerRoot, repositoryRoo
       state = { schema: TYPED_FORWARD_OPERATION_SCHEMA, status: 'lock_intent', owner, targets: {}, approvalExtensions: [] };
       await operation.save(state);
     }
-    const approval = resolveTypedForwardApproval({ plan: prepared, state, extension, approvedExtensionSha256, now: currentNow() });
+    const approval = resolveTypedForwardApproval({ plan: prepared, state, extension, approvedExtensionSha256, now: currentNow(), resume });
     if (extension !== null && extension !== undefined) {
       state.approvalExtensions = approval.chain;
       await operation.save(state);
@@ -864,7 +878,14 @@ export async function runTypedForwardMigration({ plan, workerRoot, repositoryRoo
       if (typeof adapter.verifyBackupReceipt !== 'function') fail('BACKUP_RECEIPT_UNVERIFIED');
       await adapter.verifyBackupReceipt(prepared.inventory.backupReceipt, prepared.targets, boundaryNow, { allowExpired: readOnlyReconciliation });
       validateBackupReceipt(prepared.inventory.backupReceipt, prepared.targets, readOnlyReconciliation ? null : boundaryNow);
-      if (write && !resolveTypedForwardApproval({ plan: prepared, state, extension: null, approvedExtensionSha256: null, now: boundaryNow }).active) fail('APPROVAL_EXPIRED');
+      if (write && !resolveTypedForwardApproval({ plan: prepared, state, extension: null, approvedExtensionSha256: null, now: boundaryNow, resume }).active) fail('APPROVAL_EXPIRED');
+    };
+    const assertForeignKeyReadback = async target => {
+      if (typeof adapter.foreignKeyCheck !== 'function') fail('FOREIGN_KEY_READBACK_UNVERIFIED');
+      const violations = await adapter.foreignKeyCheck(target);
+      if ((Array.isArray(violations) && violations.length > 1024)
+          || (!Array.isArray(violations) && !Number.isSafeInteger(violations))) fail('FOREIGN_KEY_READBACK_INVALID');
+      if ((Array.isArray(violations) && violations.length > 0) || violations > 0) fail('FOREIGN_KEY_READBACK_FAILED');
     };
     await assertSafety();
     for (const target of prepared.targets) {
@@ -890,6 +911,12 @@ export async function runTypedForwardMigration({ plan, workerRoot, repositoryRoo
           state.targets[target.binding] = receipt; await operation.save(state);
         }
         if (receipt.intent !== null) {
+          // A provider response can be lost after the D1 mutation committed,
+          // or the prior run can have failed while reading FK integrity.  The
+          // intent is not cleared until a fresh FK observation succeeds. This
+          // makes the read-first checkpoint durable and prevents a resume from
+          // advancing a post-ledger state on a stale schema-only read.
+          await assertForeignKeyReadback(target);
           const completedStep = statement.kind === 'ledger';
           receipt = completedStep
             ? { status: 'migrated', applied: receipt.applied + 1, statementIndex: 0, intent: null }
@@ -927,11 +954,7 @@ export async function runTypedForwardMigration({ plan, workerRoot, repositoryRoo
           }
           observed = validateInspectionShape(await adapter.inspect(target));
           assertStatementObservation(observed, target, step, statement, true);
-          if (typeof adapter.foreignKeyCheck !== 'function') fail('FOREIGN_KEY_READBACK_UNVERIFIED');
-          const violations = await adapter.foreignKeyCheck(target);
-          if ((Array.isArray(violations) && violations.length > 1024)
-              || (!Array.isArray(violations) && !Number.isSafeInteger(violations))) fail('FOREIGN_KEY_READBACK_INVALID');
-          if ((Array.isArray(violations) && violations.length > 0) || violations > 0) fail('FOREIGN_KEY_READBACK_FAILED');
+          await assertForeignKeyReadback(target);
           receipt = statement.kind === 'ledger'
             ? { status: 'migrated', applied: receipt.applied + 1, statementIndex: 0, intent: null }
             : { status: 'pending', applied: receipt.applied, statementIndex: receipt.statementIndex + 1, intent: null };
@@ -1074,6 +1097,19 @@ export async function createTypedForwardWranglerAdapter({ plan, operationDirecto
         || rows[0].revision !== hold.revision || ![rows[0].enrollment_enabled, rows[0].upload_registration_enabled,
           rows[0].processing_enabled, rows[0].publication_enabled].every(value => value === 0)) fail('MAINTENANCE_HOLD_DRIFT');
   };
+  const captureMaintenanceHold = async (target, capturedAt, expiresAt, now = Date.now()) => {
+    const rows = await readQuery(target, `SELECT schema_version,control_state,enrollment_enabled,upload_registration_enabled,processing_enabled,publication_enabled,revision,updated_at FROM collection_controls WHERE singleton=1`);
+    if (rows.length !== 1 || !exact(rows[0], ['schema_version', 'control_state', 'enrollment_enabled', 'upload_registration_enabled', 'processing_enabled', 'publication_enabled', 'revision', 'updated_at'])
+        || rows[0].schema_version !== 'collection-controls-v0.1' || rows[0].control_state !== 'contained'
+        || rows[0].enrollment_enabled !== 0 || rows[0].upload_registration_enabled !== 0
+        || rows[0].processing_enabled !== 0 || rows[0].publication_enabled !== 0
+        || !Number.isSafeInteger(rows[0].revision) || rows[0].revision < 1 || !date(rows[0].updated_at)
+        || Date.parse(rows[0].updated_at) > Date.parse(capturedAt)) fail('MAINTENANCE_HOLD_UNVERIFIED');
+    const hold = { schema: TYPED_FORWARD_MAINTENANCE_HOLD_SCHEMA, state: 'contained', revision: rows[0].revision,
+      capturedAt, expiresAt, holdSha256: identityDigest({ schema: TYPED_FORWARD_MAINTENANCE_HOLD_SCHEMA, state: 'contained', revision: rows[0].revision }) };
+    validateMaintenanceHold(hold, null, now);
+    return hold;
+  };
   let liveProvider = null;
   const activeWorker = async () => {
     if (activeWorkerReader !== null) {
@@ -1150,6 +1186,7 @@ export async function createTypedForwardWranglerAdapter({ plan, operationDirecto
   return {
     async inventory(target) { return readInventory(target); },
     async assertMaintenanceHold(hold) { return assertMaintenanceHold(hold); },
+    async captureMaintenanceHold(target, capturedAt, expiresAt, now) { return captureMaintenanceHold(target, capturedAt, expiresAt, now); },
     async activeWorker() { return activeWorker(); },
     async verifyBackupReceipt(backup, targets, now, options) { return verifyBackup(backup, targets, now, options); },
     async captureBackupReceipt(targets, capturedAt, expiresAt, now) { return captureBackup(targets, capturedAt, expiresAt, now); },
@@ -1193,6 +1230,102 @@ export async function captureTypedForwardBackupReceipt({ accountId, targets, ope
   return { receipt, outputPath: writtenPath, remoteWrites: false };
 }
 
+/**
+ * Capture the complete private predecessor inventory used by prepare. This is
+ * deliberately a read-only bracket: the canonical live Worker provider is
+ * captured before and after the fixed D1 reads, the collection hold is checked
+ * as contained at both edges, and every role is resolved from the same active
+ * version's exact D1 binding ID/name. The resulting files are immutable,
+ * owner-only artifacts; this function has no mutation-capable transport.
+ */
+export async function captureTypedForwardInventory({ accountId, workerName, operationDirectory, cliPath, wranglerSha256,
+  migrationGrowthBudgetBytes, inventoryOutputPath, targetsOutputPath, backupOutputPath, capturedAt = null, expiresAt = null,
+  now = Date.now(), spawn = spawnSync, liveProviderFactory = createProductionLiveProvider,
+  liveConfigSnapshot = createProductionLiveConfigSnapshot, adapterFactory = null } = {}) {
+  if (!/^[a-f0-9]{32}$/u.test(accountId ?? '') || !/^[A-Za-z0-9_-]{1,63}$/u.test(workerName ?? '')
+      || typeof operationDirectory !== 'string' || !operationDirectory || typeof cliPath !== 'string' || !cliPath
+      || !SHA256.test(wranglerSha256 ?? '') || !Number.isSafeInteger(migrationGrowthBudgetBytes) || migrationGrowthBudgetBytes < 0
+      || ![inventoryOutputPath, targetsOutputPath, backupOutputPath].every(path => typeof path === 'string' && path.length > 0)
+      || new Set([inventoryOutputPath, targetsOutputPath, backupOutputPath].map(path => resolve(path))).size !== 3
+      || typeof liveProviderFactory !== 'function' || typeof liveConfigSnapshot !== 'function'
+      || (adapterFactory !== null && typeof adapterFactory !== 'function')) fail('INVENTORY_CAPTURE_INPUT_INVALID');
+  const provider = liveProviderFactory({ accountId, workerName });
+  if (!provider || typeof provider.capture !== 'function') fail('ACTIVE_WORKER_UNVERIFIED');
+  let beforeRaw;
+  try { beforeRaw = await provider.capture(); } catch { fail('ACTIVE_WORKER_UNVERIFIED'); }
+  let before;
+  try { before = liveConfigSnapshot(beforeRaw); } catch { fail('ACTIVE_WORKER_UNVERIFIED'); }
+  if (before.sourceCommit !== TYPED_FORWARD_PREVIOUS_SOURCE || !COMMIT.test(before.sourceCommit ?? '')
+      || !UUID.test(before.versionId ?? '') || !SHA256.test(before.fingerprint ?? '')) fail('ACTIVE_WORKER_DRIFT');
+  const effectiveCapturedAt = capturedAt ?? beforeRaw.capturedAt;
+  if (!date(effectiveCapturedAt) || Date.parse(effectiveCapturedAt) > now) fail('INVENTORY_CAPTURE_TIME_INVALID');
+  const effectiveExpiresAt = expiresAt ?? new Date(Date.parse(effectiveCapturedAt) + TYPED_FORWARD_MAX_WINDOW_MS).toISOString();
+  if (!date(effectiveExpiresAt) || Date.parse(effectiveExpiresAt) <= now
+      || Date.parse(effectiveExpiresAt) <= Date.parse(effectiveCapturedAt)
+      || Date.parse(effectiveExpiresAt) - Date.parse(effectiveCapturedAt) > TYPED_FORWARD_MAX_WINDOW_MS) fail('INVENTORY_CAPTURE_TIME_INVALID');
+  const worker = { sourceCommit: before.sourceCommit, versionId: before.versionId,
+    configSha256: typedForwardWorkerConfigSha256(before), fingerprint: before.fingerprint };
+  validateWorkerInventory(worker);
+  const bindings = new Map((before.bindings ?? []).filter(binding => binding?.type === 'd1').map(binding => [binding.name, binding]));
+  const targetIdentities = ['primary', 'analytics'].map(role => {
+    const bindingName = TYPED_FORWARD_ROLE_BINDINGS[role], binding = bindings.get(bindingName);
+    const databaseId = binding?.database_id;
+    const name = binding?.database_name;
+    if (!binding || typeof name !== 'string' || !NAME.test(name) || !UUID.test(databaseId ?? '')) fail('TARGET_INVALID');
+    return { role, binding: bindingName, name, databaseId };
+  });
+  const plan = { accountId, workerName, wranglerSha256 };
+  const adapter = adapterFactory
+    ? await adapterFactory({ plan, operationDirectory, cliPath, spawn, liveProvider: provider })
+    : await createTypedForwardWranglerAdapter({ plan, operationDirectory, cliPath, spawn,
+      liveProviderFactory: () => provider, liveConfigSnapshot });
+  if (!adapter || typeof adapter.inventory !== 'function' || typeof adapter.inspect !== 'function'
+      || typeof adapter.captureMaintenanceHold !== 'function' || typeof adapter.captureBackupReceipt !== 'function') fail('INVENTORY_CAPTURE_UNVERIFIED');
+  const hold = await adapter.captureMaintenanceHold(targetIdentities[0], effectiveCapturedAt, effectiveExpiresAt, now);
+  const targets = [];
+  for (const identity of targetIdentities) {
+    const info = await adapter.inventory(identity);
+    if (!Array.isArray(info) || info.length !== 1 || info[0]?.id !== identity.databaseId || info[0]?.name !== identity.name
+        || !Number.isSafeInteger(info[0]?.bytes) || info[0].bytes < 0
+        || info[0].bytes + migrationGrowthBudgetBytes >= TYPED_FORWARD_OPERATING_CAP_BYTES) fail('RESOURCE_DRIFT');
+    const observed = await adapter.inspect(identity);
+    if (!object(observed) || !SHA256.test(observed.schemaSha256 ?? '') || !SHA256.test(observed.dataInvariantSha256 ?? '')
+        || !Array.isArray(observed.migrations) || !SHA256.test(observed.ledgerSha256 ?? '')
+        || identityDigest(observed.migrations) !== observed.ledgerSha256) fail('PRIOR_RECEIPT_INVALID');
+    const previous = { capturedAt: effectiveCapturedAt, schemaSha256: observed.schemaSha256,
+      dataInvariantSha256: observed.dataInvariantSha256, ledger: observed.migrations };
+    previous.receiptSha256 = previousReceiptDigest(previous);
+    const target = { ...identity, bytes: info[0].bytes, migrationGrowthBudgetBytes, previous };
+    validateTarget(target, identity.role, null);
+    targets.push(target);
+  }
+  const backupReceipt = await adapter.captureBackupReceipt(targetIdentities, effectiveCapturedAt, effectiveExpiresAt, now);
+  validateBackupReceipt(backupReceipt, targets);
+  const afterHold = await adapter.captureMaintenanceHold(targetIdentities[0], effectiveCapturedAt, effectiveExpiresAt, now);
+  if (identityDigest(afterHold) !== identityDigest(hold)) fail('MAINTENANCE_HOLD_DRIFT');
+  let afterRaw;
+  try { afterRaw = await provider.capture(); } catch { fail('ACTIVE_WORKER_UNVERIFIED'); }
+  let after;
+  try { after = liveConfigSnapshot(afterRaw); } catch { fail('ACTIVE_WORKER_UNVERIFIED'); }
+  const beforeRoleDigest = identityDigest(targetIdentities.map(target => ({ role: target.role, binding: target.binding, name: target.name, databaseId: target.databaseId })));
+  const afterRoleDigest = identityDigest(['primary', 'analytics'].map(role => {
+    const binding = (after.bindings ?? []).find(candidate => candidate.type === 'd1' && candidate.name === TYPED_FORWARD_ROLE_BINDINGS[role]);
+    return { role, binding: TYPED_FORWARD_ROLE_BINDINGS[role], name: binding?.database_name, databaseId: binding?.database_id };
+  }));
+  if (after.sourceCommit !== before.sourceCommit || after.versionId !== before.versionId || after.fingerprint !== before.fingerprint
+      || typedForwardWorkerConfigSha256(after) !== worker.configSha256 || beforeRoleDigest !== afterRoleDigest) fail('ACTIVE_WORKER_DRIFT');
+  const inventory = { capturedAt: effectiveCapturedAt, sourceCommit: worker.sourceCommit, versionId: worker.versionId,
+    fingerprint: worker.fingerprint, targetsSha256: identityDigest(targets.map(target => ({ role: target.role, binding: target.binding,
+      name: target.name, databaseId: target.databaseId, bytes: target.bytes }))), worker, maintenanceHold: hold, backupReceipt };
+  validateInventory(inventory, { previousSourceCommit: TYPED_FORWARD_PREVIOUS_SOURCE, targets });
+  const written = {
+    inventoryPath: await writePrivateJson(inventoryOutputPath, inventory),
+    targetsPath: await writePrivateJson(targetsOutputPath, targets),
+    backupPath: await writePrivateJson(backupOutputPath, backupReceipt),
+  };
+  return { inventory, targets, backupReceipt, ...written, inventorySha256: identityDigest(inventory), remoteWrites: false };
+}
+
 export function parseTypedForwardArguments(args) {
   const result = { mode: 'inspect', resume: false };
   const values = new Map([['--mode', 'mode'], ['--plan', 'planPath'], ['--worker-root', 'workerRoot'], ['--operation', 'operationDirectory'],
@@ -1200,7 +1333,9 @@ export function parseTypedForwardArguments(args) {
     ['--extension', 'extensionPath'], ['--approved-extension-sha256', 'approvedExtensionSha256'],
     ['--inventory', 'inventoryPath'], ['--targets', 'targetsPath'], ['--rehearsal', 'rehearsalPath'], ['--candidate-source', 'candidateSourceCommit'],
     ['--captured-at', 'capturedAt'], ['--expires-at', 'expiresAt'],
-    ['--account-id', 'accountId'], ['--worker-name', 'workerName'], ['--wrangler-sha256', 'wranglerSha256'], ['--output', 'outputPath']]);
+    ['--account-id', 'accountId'], ['--worker-name', 'workerName'], ['--wrangler-sha256', 'wranglerSha256'],
+    ['--growth-budget-bytes', 'migrationGrowthBudgetBytes'], ['--output', 'outputPath'], ['--inventory-output', 'inventoryOutputPath'],
+    ['--targets-output', 'targetsOutputPath'], ['--backup-output', 'backupOutputPath']]);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === '--resume') { if (result.resume) fail('ARGUMENTS_INVALID'); result.resume = true; continue; }
@@ -1208,13 +1343,16 @@ export function parseTypedForwardArguments(args) {
     if (!key || !value || value.startsWith('--') || Object.hasOwn(result, key) && key !== 'mode') fail('ARGUMENTS_INVALID');
     result[key] = value;
   }
-  if (!['inspect', 'prepare', 'rehearse', 'capture-backup', 'execute'].includes(result.mode)
+  if (!['inspect', 'prepare', 'rehearse', 'capture-backup', 'capture-inventory', 'execute'].includes(result.mode)
       || result.mode === 'rehearse' && !result.workerRoot
       || result.mode === 'inspect' && !result.planPath
       || result.mode === 'prepare' && (!result.workerRoot || !result.repositoryRoot || !result.inventoryPath || !result.targetsPath
         || !result.rehearsalPath || !result.candidateSourceCommit || !result.accountId || !result.workerName || !result.wranglerSha256 || !result.outputPath)
       || result.mode === 'capture-backup' && (!result.targetsPath || !result.operationDirectory || !result.cliPath
         || !result.accountId || !result.wranglerSha256 || !result.outputPath)
+      || result.mode === 'capture-inventory' && (!result.operationDirectory || !result.cliPath || !result.accountId || !result.workerName
+        || !result.wranglerSha256 || !result.migrationGrowthBudgetBytes || !result.inventoryOutputPath
+        || !result.targetsOutputPath || !result.backupOutputPath)
       || result.mode === 'execute' && (!result.planPath || !result.workerRoot || !result.operationDirectory || !result.repositoryRoot
         || !result.cliPath || !result.confirmation || !result.approvedPlanSha256)) fail('ARGUMENTS_INVALID');
   return result;
@@ -1249,12 +1387,12 @@ async function main() {
     const options = parseTypedForwardArguments(process.argv.slice(2));
     if (options.mode === 'rehearse') { process.stdout.write(`${JSON.stringify(await rehearseTypedForwardMigration({ workerRoot: options.workerRoot }))}\n`); return; }
     if (options.mode === 'prepare') {
-      const inventoryFile = await readPrivateJson(options.inventoryPath, 'INVENTORY_INVALID', { withSha256: true });
+      const inventory = await readPrivateJson(options.inventoryPath, 'INVENTORY_INVALID');
       const targets = await readPrivateJson(options.targetsPath, 'TARGET_INVALID');
       const rehearsal = await readPrivateJson(options.rehearsalPath, 'REHEARSAL_REQUIRED');
       const prepared = await prepareTypedForwardPlan({ workerRoot: options.workerRoot, repositoryRoot: options.repositoryRoot,
         accountId: options.accountId, workerName: options.workerName, candidateSourceCommit: options.candidateSourceCommit,
-        inventory: inventoryFile.value, inventorySha256: inventoryFile.sha256, targets, rehearsal, wranglerSha256: options.wranglerSha256 });
+        inventory, inventorySha256: identityDigest(inventory), targets, rehearsal, wranglerSha256: options.wranglerSha256 });
       await writePrivateJson(options.outputPath, prepared.plan);
       process.stdout.write(`${JSON.stringify({ status: 'prepared', planSha256: prepared.planSha256, outputPath: resolve(options.outputPath), remoteWrites: false })}\n`);
       return;
@@ -1266,6 +1404,15 @@ async function main() {
         operationDirectory: options.operationDirectory, cliPath: options.cliPath, wranglerSha256: options.wranglerSha256,
         capturedAt: options.capturedAt, expiresAt: options.expiresAt, outputPath: options.outputPath });
       process.stdout.write(`${JSON.stringify({ status: 'captured', outputPath: resolve(options.outputPath), receiptSha256: captured.receipt.receiptSha256, remoteWrites: false })}\n`);
+      return;
+    }
+    if (options.mode === 'capture-inventory') {
+      const captured = await captureTypedForwardInventory({ accountId: options.accountId, workerName: options.workerName,
+        operationDirectory: options.operationDirectory, cliPath: options.cliPath, wranglerSha256: options.wranglerSha256,
+        migrationGrowthBudgetBytes: Number(options.migrationGrowthBudgetBytes), capturedAt: options.capturedAt, expiresAt: options.expiresAt,
+        inventoryOutputPath: options.inventoryOutputPath, targetsOutputPath: options.targetsOutputPath, backupOutputPath: options.backupOutputPath });
+      process.stdout.write(`${JSON.stringify({ status: 'captured', inventoryPath: captured.inventoryPath, targetsPath: captured.targetsPath,
+        backupPath: captured.backupPath, inventorySha256: captured.inventorySha256, remoteWrites: false })}\n`);
       return;
     }
     const plan = await readPrivateJson(options.planPath);
