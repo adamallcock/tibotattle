@@ -237,6 +237,7 @@ test("qualification TAP failure diagnostics retain only bounded structural index
     "  duration_ms: 0.12",
     "  location: '/private/tmp/PRIVATE/test/model-performance.test.js:123:4'",
     "  failureType: 'testCodeFailure'",
+    "  name: 'AssertionError'",
     "  stack: |-",
     "    Error: PRIVATE-STACK",
     "        at TestContext.<anonymous> (file:///D:/runner/PRIVATE/test/model-performance.test.js:321:9)",
@@ -244,18 +245,35 @@ test("qualification TAP failure diagnostics retain only bounded structural index
     "1..18",
   ].join("\n");
   const diagnostic = parseTapFailureDiagnostic(output);
-  assert.deepEqual(diagnostic, { fileIndex: 1, testOrdinal: 4, sourceLine: 321 });
+  assert.deepEqual(diagnostic, {
+    fileIndex: 1,
+    testOrdinal: 4,
+    sourceLine: 321,
+    failureType: "testCodeFailure",
+    errorName: "AssertionError",
+  });
   const formatted = formatQualificationFailureDiagnostic(diagnostic);
-  assert.equal(formatted, "file_index=1 test_ordinal=4 source_line=321");
+  assert.equal(
+    formatted,
+    "file_index=1 test_ordinal=4 source_line=321 failure_type=testCodeFailure error_name=AssertionError",
+  );
   assert.doesNotMatch(formatted, /PRIVATE|secret|Users|TAP/u);
 
   const fileOnly = parseTapFailureDiagnostic([
     "not ok 14 - PRIVATE-FILE-FAILURE",
     "  ---",
     "  location: 'C:\\\\runner\\\\_work\\\\repo\\\\test\\\\windows-filesystem-security.test.js:8:2'",
+    "  failureType: 'PRIVATE-FAILURE-TYPE'",
+    "  name: 'PRIVATE-ERROR-NAME'",
     "  ...",
   ].join("\n"));
-  assert.deepEqual(fileOnly, { fileIndex: 14, testOrdinal: 14, sourceLine: null });
+  assert.deepEqual(fileOnly, {
+    fileIndex: 14,
+    testOrdinal: 14,
+    sourceLine: null,
+    failureType: null,
+    errorName: null,
+  });
 
   const unknown = parseTapFailureDiagnostic([
     "not ok 1 - PRIVATE-FAILURE",
@@ -263,10 +281,22 @@ test("qualification TAP failure diagnostics retain only bounded structural index
     "  location: 'C:\\Users\\PRIVATE\\unapproved.test.js:1:2'",
     "  ...",
   ].join("\n"));
-  assert.deepEqual(unknown, { fileIndex: null, testOrdinal: 1, sourceLine: null });
+  assert.deepEqual(unknown, {
+    fileIndex: null,
+    testOrdinal: 1,
+    sourceLine: null,
+    failureType: null,
+    errorName: null,
+  });
   assert.deepEqual(
     parseTapFailureDiagnostic("not ok 3 - PRIVATE-WITHOUT-LOCATION\n  ..."),
-    { fileIndex: null, testOrdinal: 3, sourceLine: null },
+    {
+      fileIndex: null,
+      testOrdinal: 3,
+      sourceLine: null,
+      failureType: null,
+      errorName: null,
+    },
   );
   assert.deepEqual(
     parseTapFailureDiagnostic([
@@ -277,15 +307,23 @@ test("qualification TAP failure diagnostics retain only bounded structural index
       "        at TestContext.<anonymous> (file:///D:/runner/test/windows-filesystem-security.test.js:91:4)",
       "  ...",
     ].join("\n")),
-    { fileIndex: 1, testOrdinal: 2, sourceLine: null },
+    {
+      fileIndex: 1,
+      testOrdinal: 2,
+      sourceLine: null,
+      failureType: null,
+      errorName: null,
+    },
   );
   assert.equal(
     formatQualificationFailureDiagnostic({
       fileIndex: 999_999,
       testOrdinal: 1_000_000,
       sourceLine: 1_000_000,
+      failureType: "PRIVATE-FAILURE-TYPE",
+      errorName: "PRIVATE-ERROR-NAME",
       title: canary,
     }),
-    "file_index=unavailable test_ordinal=unavailable source_line=unavailable",
+    "file_index=unavailable test_ordinal=unavailable source_line=unavailable failure_type=unavailable error_name=unavailable",
   );
 });
