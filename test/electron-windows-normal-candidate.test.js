@@ -6,6 +6,12 @@ import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
 import test from "node:test";
 
+import { createLocalCollectorRefreshRunner } from "../src/local-companion-refresh.js";
+import { runCollectorOnce } from "../src/passive-collector.js";
+import { ingestLocalUnifiedIndexOffMain } from "../src/local-unified-index-off-main.js";
+import { refreshReplaySafeAccountingCache } from "../src/replay-safe-accounting-cache.js";
+import { TELEMETRY_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
+
 import { startLocalCompanionServer } from "../apps/local/server.js";
 import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
 import { DesktopSettingsBackendError } from "../apps/electron/desktop-settings-backends.js";
@@ -1323,7 +1329,7 @@ test("normal candidate fixture passes Codex discovery, onboarding, and local ref
     await writeFile(join(rejectedSessions, "synthetic-windows-normal-candidate.jsonl"),
       '{"type":"session_meta","id":"synthetic-windows-normal-candidate"}\n',
       { mode: 0o600, flag: "wx" });
-    prepareLocalInstallationRoots({ resourceRoot: process.cwd(), stateRoot });
+    const installation = prepareLocalInstallationRoots({ resourceRoot: process.cwd(), stateRoot });
     const rejected = await localCodexLogScanner.discoverCodexRolloutInfos({
       codexHome: rejectedCodexHome,
       startAt: "2026-09-01T00:00:00.000Z",
@@ -1343,6 +1349,47 @@ test("normal candidate fixture passes Codex discovery, onboarding, and local ref
     assert.equal(normalized.stateWritable, true);
     assert.equal(normalized.explicitRefresh, true);
 
+    // Keep the real collector, index, accounting and restart path, but never
+    // read the developer's Codex account or Keychain in this synthetic test.
+    let quotaReads = 0;
+    const createFixtureRefreshRunner = () => createLocalCollectorRefreshRunner({
+      codexHome,
+      stateFile: installation.paths.collectorStateFile,
+      accountingSourceMode: "unified",
+      unifiedIndexFile: installation.paths.unifiedIndexFile,
+      unifiedIndexSecretFile: installation.paths.unifiedIndexSecretFile,
+      selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+      runCollector: (options) => runCollectorOnce({
+        ...options,
+        appServerFactory: () => ({
+          async start() {},
+          async readRateLimits() {
+            quotaReads += 1;
+            return {
+              rateLimits: {
+                limitId: "codex",
+                planType: "pro",
+                primary: {
+                  usedPercent: 2,
+                  windowDurationMins: 10080,
+                  resetsAt: Math.floor(Date.now() / 1_000) + 86_400,
+                },
+                secondary: null,
+              },
+              rateLimitsByLimitId: {},
+            };
+          },
+          async readAccount() { return null; },
+          async readAccountUsage() { return { dailyUsageBuckets: [] }; },
+          close() {},
+        }),
+      }),
+      refreshUnifiedIndex: (options) => ingestLocalUnifiedIndexOffMain({
+        ...options,
+        contractVersion: TELEMETRY_SCHEMA_VERSION,
+      }),
+      refreshAccounting: refreshReplaySafeAccountingCache,
+    });
     const serverOptions = {
       port: 0,
       resourceRoot: process.cwd(),
@@ -1358,7 +1405,7 @@ test("normal candidate fixture passes Codex discovery, onboarding, and local ref
         USAGE_MONITOR_STATE_ROOT: stateRoot,
       },
     };
-    app = await startLocalCompanionServer(serverOptions);
+    app = await startLocalCompanionServer({ ...serverOptions, refreshRunner: createFixtureRefreshRunner() });
     const base = `http://127.0.0.1:${app.port}`;
     const response = await fetch(`${base}/api/local/onboarding`);
     assert.equal(response.status, 200);
@@ -1416,7 +1463,7 @@ test("normal candidate fixture passes Codex discovery, onboarding, and local ref
       assert.equal(verifyWindowsNormalCandidateModelPerformance(performance), true);
     }
     await app.close();
-    app = await startLocalCompanionServer(serverOptions);
+    app = await startLocalCompanionServer({ ...serverOptions, refreshRunner: createFixtureRefreshRunner() });
     const restartedBase = `http://127.0.0.1:${app.port}`;
     const restartedOnboarding = await fetch(`${restartedBase}/api/local/onboarding`);
     assert.equal(restartedOnboarding.status, 200);
@@ -1449,6 +1496,7 @@ test("normal candidate fixture passes Codex discovery, onboarding, and local ref
       launch: "restart",
       expectedRefreshId: restartedTerminal.refreshId,
     }), true);
+    assert.equal(quotaReads, 2);
   } finally {
     await app?.close();
     await rm(root, { recursive: true, force: true });
