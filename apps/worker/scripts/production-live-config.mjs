@@ -274,7 +274,9 @@ function normalizeRuntime(runtime) {
     fail("RUNTIME_INVALID");
   }
   const assets = requiredObject(runtime.assets, "RUNTIME_INVALID");
-  if (Object.keys(assets).sort().join(",") !== "not_found_handling,raw_run_worker_first,serve_directly") {
+  const assetKeys = Object.keys(assets).filter((key) => key !== "base_path").sort();
+  if (assetKeys.join(",") !== "not_found_handling,raw_run_worker_first,serve_directly"
+      || (own(assets, "base_path") && assets.base_path !== "/")) {
     fail("RUNTIME_INVALID");
   }
   const limits = requiredObject(runtime.limits, "RUNTIME_INVALID");
