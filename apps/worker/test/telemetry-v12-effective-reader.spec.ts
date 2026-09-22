@@ -42,7 +42,10 @@ interface Bindings extends Env {
 const bindings = env as Bindings;
 const db = () => bindings.USAGE_MONITOR_DB;
 const day = "2026-09-20";
-const nowEpoch = Date.parse("2026-09-21T12:00:00.000Z");
+// The admission trigger compares expiry against SQLite's wall clock. Keep the
+// synthetic caller timestamp current so this test remains valid after the
+// fixed fixture timestamp would have crossed the predecessor TTL.
+const nowEpoch = Date.now();
 
 beforeEach(async () => {
   await reset();
