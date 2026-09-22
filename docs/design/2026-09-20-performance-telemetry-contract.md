@@ -61,8 +61,11 @@ Attribute the UTC day from the stored completion timestamp, not the turn start
 or a later upload time. Compatible receipt and legacy provenance is internal;
 the current local product decision combines those samples in one displayed
 speed distribution rather than presenting logging formats as competing metrics.
-Current Windows capability reports timing unavailable without starting a
-worker; adding a wire schema does not qualify a Windows timing producer.
+The published 0.1.23 Windows client reports timing unavailable without
+starting a worker. The 0.1.24 source enables the protected Windows x64 timing
+reader; its native and packaged qualification is separate from final installer
+and publication evidence. See [platform qualification](../reference/platform-support.md).
+Adding a wire schema alone does not qualify a Windows timing producer.
 
 The local all-time day/week switch uses the earliest precise completion time.
 A day-only payload cannot reproduce that instant: near the 366-day threshold,
