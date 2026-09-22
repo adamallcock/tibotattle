@@ -28,7 +28,8 @@ import {
   buildWindowsNormalCandidateLaunchSpec,
   prepareWindowsDevelopmentProfile,
 } from "../scripts/launch-electron-windows-development.mjs";
-import { ensureWindowsSyntheticSourceOwner } from "../scripts/lib/windows-synthetic-source-owner.mjs";
+import { classifyWindowsSyntheticSourceOwnerFailure,
+  ensureWindowsSyntheticSourceOwner } from "../scripts/lib/windows-synthetic-source-owner.mjs";
 import {
   buildWindowsNormalCandidateCodexFixture,
   buildWindowsNormalCandidateFirewallCreateArguments,
@@ -96,9 +97,14 @@ test("disposable Windows source owner setup preserves ACLs and emits fixed error
   assert.equal(Object.hasOwn(invocation.options.env, "PSModulePath"), false);
   assert.match(invocation.args.at(-1), /GetSecurityDescriptorSddlForm/u);
   assert.match(invocation.args.at(-1), /setowner/u);
-  assert.throws(() => ensureWindowsSyntheticSourceOwner(path, {
-    run: () => ({ status: 40, stdout: "", stderr: "private-ACL-value" }),
-  }), /synthetic_owner_dacl_changed/u);
+  let failure;
+  try {
+    ensureWindowsSyntheticSourceOwner(path, {
+      run: () => ({ status: 40, stdout: "", stderr: "private-ACL-value" }),
+    });
+  } catch (error) { failure = error; }
+  assert.equal(classifyWindowsSyntheticSourceOwnerFailure(failure), "synthetic_owner_dacl_changed");
+  assert.equal(failure.message, "synthetic_owner_dacl_changed");
   assert.throws(() => ensureWindowsSyntheticSourceOwner("relative.jsonl"), /synthetic_owner_invalid_path/u);
 });
 
@@ -1229,6 +1235,17 @@ test("normal candidate adds one content-free Codex source before launch", async 
     writeFixture: async () => {},
   }), {
     code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_SYNTHETIC_FIXTURE_UNAVAILABLE",
+  });
+  await assert.rejects(seedWindowsNormalCandidateCodexFixture({ profile }, {
+    now: () => NORMAL_CANDIDATE_FIXTURE_CLOCK_MS,
+    createDirectory: async () => {},
+    metadata: async () => ({ isDirectory: () => true, isSymbolicLink: () => false }),
+    writeFixture: async () => {},
+    normalizeOwner: (path) => ensureWindowsSyntheticSourceOwner(path, {
+      run: () => ({ status: 40, stdout: "", stderr: "private-ACL-value" }),
+    }),
+  }), {
+    code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_SYNTHETIC_FIXTURE_OWNER_DACL_CHANGED",
   });
 });
 

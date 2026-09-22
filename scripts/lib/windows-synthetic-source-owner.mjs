@@ -8,6 +8,18 @@ const FAILURE = Object.freeze({
   37: 'owner_after_read_failed', 38: 'owner_readback_mismatch',
   39: 'acl_after_snapshot_failed', 40: 'dacl_changed',
 });
+const trustedFailures = new WeakSet();
+
+function fail(category) {
+  const error = new Error(`synthetic_owner_${category}`);
+  error.code = `synthetic_owner_${category}`;
+  trustedFailures.add(error);
+  throw error;
+}
+
+export function classifyWindowsSyntheticSourceOwnerFailure(error) {
+  return error && trustedFailures.has(error) ? error.code : null;
+}
 
 // Hosted Windows tokens can create a disposable source with a group owner.
 // Normalize only that fixture to the current user; preserve its inherited
@@ -16,7 +28,7 @@ export function ensureWindowsSyntheticSourceOwner(path, {
   run = spawnSync, environment = process.env,
 } = {}) {
   if (typeof path !== 'string' || !win32.isAbsolute(path) || path.includes('\0')) {
-    throw new Error('synthetic_owner_invalid_path');
+    fail('invalid_path');
   }
   const childEnvironment = {
     ...Object.fromEntries(Object.entries(environment).filter(([key]) => key.toLowerCase() !== 'psmodulepath')),
@@ -54,12 +66,12 @@ export function ensureWindowsSyntheticSourceOwner(path, {
       timeout: 10_000, maxBuffer: 4_096,
     });
   } catch {
-    throw new Error('synthetic_owner_setup_launch_failed');
+    fail('setup_launch_failed');
   }
   const category = result?.error
     ? result.error.code === 'ETIMEDOUT' ? 'setup_timed_out' : 'setup_launch_failed'
     : FAILURE[result?.status] ?? 'unexpected_setup_exit';
   if (result?.status !== 0 || result?.error || result.stdout?.length || result.stderr?.length) {
-    throw new Error(`synthetic_owner_${category}`);
+    fail(category);
   }
 }

@@ -61,7 +61,8 @@ import {
   parseWindowsProcessSnapshot,
   runWindowsNsisLifecycleProgram,
 } from "./smoke-electron-windows-nsis-lifecycle.mjs";
-import { ensureWindowsSyntheticSourceOwner } from "./lib/windows-synthetic-source-owner.mjs";
+import { classifyWindowsSyntheticSourceOwnerFailure,
+  ensureWindowsSyntheticSourceOwner } from "./lib/windows-synthetic-source-owner.mjs";
 
 const require = createRequire(import.meta.url);
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
@@ -365,6 +366,20 @@ const FAILURE_CODES = new Set([
   "PROFILE_INVALID",
   "PROFILE_NOT_ABSENT",
   "SYNTHETIC_FIXTURE_UNAVAILABLE",
+  "SYNTHETIC_FIXTURE_OWNER_INVALID_PATH",
+  "SYNTHETIC_FIXTURE_OWNER_SETUP_LAUNCH_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_SETUP_TIMED_OUT",
+  "SYNTHETIC_FIXTURE_OWNER_CURRENT_OWNER_READ_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_ACL_BEFORE_READ_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_ACL_BEFORE_SNAPSHOT_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_OWNER_TOOL_INVOCATION_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_OWNER_TOOL_EXIT_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_ACL_AFTER_READ_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_OWNER_AFTER_READ_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_OWNER_READBACK_MISMATCH",
+  "SYNTHETIC_FIXTURE_OWNER_ACL_AFTER_SNAPSHOT_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_DACL_CHANGED",
+  "SYNTHETIC_FIXTURE_OWNER_UNEXPECTED_SETUP_EXIT",
   "PROTECTED_OPT_OUT_UNAVAILABLE",
   "FIREWALL_UNAVAILABLE",
   "FIREWALL_RULE_DIRTY",
@@ -971,6 +986,8 @@ export async function seedWindowsNormalCandidateCodexFixture({ profile } = {}, {
     }
   } catch (error) {
     if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+    const ownerFailure = classifyWindowsSyntheticSourceOwnerFailure(error);
+    if (ownerFailure !== null) fail(`SYNTHETIC_FIXTURE_OWNER_${ownerFailure.slice('synthetic_owner_'.length).toUpperCase()}`);
     fail("SYNTHETIC_FIXTURE_UNAVAILABLE");
   }
   return Object.freeze({ codexHome, fixture, sessions });
