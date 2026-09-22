@@ -4,6 +4,9 @@ import {
   TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
   TELEMETRY_V11_FIELD_DICTIONARY_VERSION,
   TELEMETRY_V11_PRIVACY_CONTRACT_VERSION,
+  TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+  TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
+  TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
   type TelemetryV11Consent,
 } from "@app-usagemonitor/telemetry-contract";
 import { ApiError } from "./errors";
@@ -17,11 +20,13 @@ export interface TelemetryTransportPrincipal {
 
 export type TelemetryTransportSchemaVersion =
   | "telemetry-contribution-v0.1" | "telemetry-contribution-v0.2"
-  | "telemetry-contribution-v1.0" | "telemetry-contribution-v1.1";
+  | "telemetry-contribution-v1.0" | "telemetry-contribution-v1.1"
+  | "telemetry-contribution-v1.2";
 
 const SCHEMAS: readonly string[] = [
   "telemetry-contribution-v0.1", "telemetry-contribution-v0.2",
   "telemetry-contribution-v1.0", "telemetry-contribution-v1.1",
+  "telemetry-contribution-v1.2",
 ];
 
 export function telemetryTransportSchemaVersion(value: unknown): TelemetryTransportSchemaVersion {
@@ -32,7 +37,7 @@ export function telemetryTransportSchemaVersion(value: unknown): TelemetryTransp
 }
 
 export function telemetryTransportSchemaForEnvelope(value: unknown): TelemetryTransportSchemaVersion {
-  if (typeof value !== "string" || !/^telemetry-envelope-v(?:0\.[12]|1\.[01])$/u.test(value)) {
+  if (typeof value !== "string" || !/^telemetry-envelope-v(?:0\.[12]|1\.[0-2])$/u.test(value)) {
     throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
   }
   return telemetryTransportSchemaVersion(value.replace("envelope", "contribution"));
@@ -100,6 +105,86 @@ export async function assertTelemetryTransportWriteAllowed(
   }
   if (schema === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
       && (accountless ? row.accountless_v11 !== 1 : row.consent_v11 !== 1)) {
+    throw new ApiError(403, "TELEMETRY_CONSENT_INVALID");
+  }
+}
+
+/**
+ * v1.2 is a successor transport with an independent staged runtime gate.
+ * Accountless v1.2 authorization is explicit and must match the same ledger
+ * and owner expiry as the device; social v1.2 requires the exact capability
+ * consent.  This policy is shared by registration, chunk writes, and domain
+ * activation so adapters cannot silently admit a staged format.
+ */
+export async function assertTelemetryV12WriteAllowed(
+  db: D1Database,
+  principal: TelemetryTransportPrincipal,
+): Promise<void> {
+  const row = await db.prepare(
+    `SELECT r.state AS runtime_state, formats.format_rank, floors.minimum_rank,
+            p.owner_kind, d.authority_kind,
+            CASE WHEN capability.device_id IS NULL THEN 0 ELSE 1 END AS consent_v12,
+            CASE WHEN accountless_grant.device_credential_id IS NULL THEN 0 ELSE 1 END
+              AS accountless_v12,
+            EXISTS (SELECT 1 FROM telemetry_contributions legacy
+              WHERE legacy.participant_id = p.id AND legacy.status = 'accepted'
+                AND legacy.transport_schema_version = 'telemetry-contribution-v0.2') AS incompatible_history
+       FROM participants p
+       JOIN device_credentials d ON d.participant_id = p.id
+       JOIN telemetry_transport_participant_floors floors ON floors.participant_id = p.id
+       JOIN telemetry_transport_formats formats
+         ON formats.schema_version = 'telemetry-contribution-v1.2'
+       JOIN telemetry_v12_runtime r ON r.id = 1
+       LEFT JOIN telemetry_v12_device_capabilities capability
+         ON capability.participant_id = p.id AND capability.device_id = d.id
+        AND capability.telemetry_schema_version = ?
+        AND capability.field_dictionary_version = ?
+        AND capability.privacy_contract_version = ?
+        AND capability.state = 'accepted'
+       LEFT JOIN accountless_enrollment_ledger ledger
+         ON ledger.device_id = d.accountless_enrollment_device_id
+        AND ledger.state = 'active' AND ledger.expires_at = d.expires_at
+        AND ledger.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+       LEFT JOIN accountless_upload_owners owner
+         ON owner.enrollment_device_id = ledger.device_id
+        AND owner.participant_id = p.id AND owner.device_credential_id = d.id
+        AND owner.state = 'active' AND owner.expires_at = ledger.expires_at
+       LEFT JOIN accountless_v12_device_authorizations accountless_grant
+         ON accountless_grant.enrollment_device_id = ledger.device_id
+        AND accountless_grant.participant_id = p.id
+        AND accountless_grant.device_credential_id = d.id
+        AND accountless_grant.telemetry_schema_version = ?
+        AND accountless_grant.field_dictionary_version = ?
+        AND accountless_grant.privacy_contract_version = ?
+        AND accountless_grant.state = 'active'
+        AND accountless_grant.expires_at = ledger.expires_at
+      WHERE p.id = ? AND d.id = ? AND p.state = 'active' AND d.state = 'active'
+        AND d.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+  ).bind(
+    TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+    TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
+    TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
+    TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+    TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
+    TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
+    principal.participantId,
+    principal.deviceId,
+  ).first<{
+    runtime_state: string; format_rank: number; minimum_rank: number;
+    owner_kind: "social" | "accountless"; authority_kind: "social" | "accountless";
+    consent_v12: number; accountless_v12: number; incompatible_history: number;
+  }>();
+  if (!row) throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  const accountless = row.owner_kind === "accountless";
+  if ((accountless && row.authority_kind !== "accountless")
+      || (!accountless && row.authority_kind !== "social")) {
+    throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  }
+  if (row.runtime_state !== "active" || row.format_rank < row.minimum_rank
+      || row.incompatible_history === 1) {
+    throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+  }
+  if (accountless ? row.accountless_v12 !== 1 : row.consent_v12 !== 1) {
     throw new ApiError(403, "TELEMETRY_CONSENT_INVALID");
   }
 }

@@ -27,6 +27,7 @@ import type {
   AuthorityDeviceRecord,
   AuthorityDeviceUploadMaterial,
   AuthorityDeviceUploadRecord,
+  AuthorityEnrollmentStore,
   AuthoritySessionMaterial,
   AuthoritySessionRecord,
   AuthoritySessionUploadMaterial,
@@ -739,27 +740,85 @@ export function createPostgresTelemetryAuthorityBackend(
           d.expires_at AS device_expires_at, COALESCE(f.minimum_rank, 1) AS minimum_rank,
           COALESCE(f.revision, 0) AS policy_revision, r.state AS format_lifecycle,
           CASE WHEN c.device_id IS NULL THEN 0 ELSE 1 END AS consent_current,
-          CASE WHEN a.device_credential_id IS NULL THEN 0 ELSE 1 END AS accountless_authorization_current
+          CASE WHEN EXISTS (
+            SELECT 1
+              FROM ${tables.accountlessEnrollmentLedger} ledger
+              JOIN ${tables.accountlessUploadOwners} owner
+                ON owner.enrollment_device_id = ledger.device_id
+               AND owner.participant_id = p.id
+               AND owner.device_credential_id = d.id
+               AND owner.state = 'active'
+               AND owner.expires_at = ledger.expires_at
+              JOIN ${tables.accountlessV12DeviceAuthorizations} grant_row
+                ON grant_row.enrollment_device_id = ledger.device_id
+               AND grant_row.participant_id = p.id
+               AND grant_row.device_credential_id = d.id
+               AND grant_row.state = 'active'
+               AND grant_row.expires_at = ledger.expires_at
+             WHERE ledger.device_id = d.accountless_enrollment_device_id
+               AND ledger.state = 'active'
+               AND ledger.expires_at = d.expires_at
+               AND ledger.expires_at > $1
+          ) THEN 1 ELSE 0 END AS accountless_authorization_current
           FROM ${tables.participants} p JOIN ${tables.deviceCredentials} d ON d.participant_id = p.id
           JOIN ${tables.telemetryV12Runtime} r ON r.id = 1
           LEFT JOIN ${tables.telemetryTransportDeviceFloors} f ON f.participant_id = p.id AND f.device_id = d.id
-          LEFT JOIN ${tables.telemetryV12DeviceCapabilities} c ON c.participant_id = p.id AND c.device_id = d.id AND c.state = 'accepted'
+          LEFT JOIN ${tables.telemetryV12DeviceCapabilities} c ON c.participant_id = p.id AND c.device_id = d.id
+            AND c.telemetry_schema_version = '${TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION}'
+            AND c.field_dictionary_version = '${TELEMETRY_V12_FIELD_DICTIONARY_VERSION}'
+            AND c.privacy_contract_version = '${TELEMETRY_V12_PRIVACY_CONTRACT_VERSION}'
+            AND c.state = 'accepted'
           LEFT JOIN ${tables.accountlessV12DeviceAuthorizations} a ON a.participant_id = p.id
-            AND a.device_credential_id = d.id AND a.state = 'active' AND a.expires_at > $1
+            AND a.device_credential_id = d.id
+            AND a.telemetry_schema_version = '${TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION}'
+            AND a.field_dictionary_version = '${TELEMETRY_V12_FIELD_DICTIONARY_VERSION}'
+            AND a.privacy_contract_version = '${TELEMETRY_V12_PRIVACY_CONTRACT_VERSION}'
+            AND a.state = 'active' AND a.expires_at > $1
+            AND a.expires_at = d.expires_at
           WHERE p.id = $2 AND d.id = $3` : `SELECT p.id AS participant_id, d.id AS device_id,
           p.owner_kind, d.authority_kind, p.state AS participant_state, d.state AS device_state,
           d.expires_at AS device_expires_at, f.minimum_rank, f.revision AS policy_revision,
           fmt.format_rank, fmt.lifecycle AS format_lifecycle,
           CASE WHEN c.device_id IS NULL THEN 0 ELSE 1 END AS consent_current,
-          CASE WHEN a.enrollment_device_id IS NULL THEN 0 ELSE 1 END AS accountless_authorization_current,
+          CASE WHEN EXISTS (
+            SELECT 1
+              FROM ${tables.accountlessEnrollmentLedger} ledger
+              JOIN ${tables.accountlessUploadOwners} owner
+                ON owner.enrollment_device_id = ledger.device_id
+               AND owner.participant_id = p.id
+               AND owner.device_credential_id = d.id
+               AND owner.state = 'active'
+               AND owner.expires_at = ledger.expires_at
+              JOIN ${tables.accountlessV11DeviceAuthorizations} grant_row
+                ON grant_row.enrollment_device_id = ledger.device_id
+               AND grant_row.participant_id = p.id
+               AND grant_row.device_credential_id = d.id
+               AND grant_row.state = 'active'
+               AND grant_row.telemetry_schema_version = '${TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION}'
+               AND grant_row.field_dictionary_version = '${TELEMETRY_V11_FIELD_DICTIONARY_VERSION}'
+               AND grant_row.privacy_contract_version = '${TELEMETRY_V11_PRIVACY_CONTRACT_VERSION}'
+               AND grant_row.expires_at = ledger.expires_at
+             WHERE ledger.device_id = d.accountless_enrollment_device_id
+               AND ledger.state = 'active'
+               AND ledger.expires_at = d.expires_at
+               AND ledger.expires_at > $2
+          ) THEN 1 ELSE 0 END AS accountless_authorization_current,
           EXISTS (SELECT 1 FROM ${tables.telemetryContributions} legacy WHERE legacy.participant_id = p.id
             AND legacy.status = 'accepted' AND legacy.transport_schema_version = 'telemetry-contribution-v0.2') AS incompatible_legacy_history
           FROM ${tables.participants} p JOIN ${tables.deviceCredentials} d ON d.participant_id = p.id
           JOIN ${tables.telemetryTransportParticipantFloors} f ON f.participant_id = p.id
           JOIN ${tables.telemetryTransportFormats} fmt ON fmt.schema_version = $1
           LEFT JOIN ${tables.telemetryV11DeviceConsents} c ON c.participant_id = p.id AND c.device_id = d.id
+            AND c.telemetry_schema_version = '${TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION}'
+            AND c.field_dictionary_version = '${TELEMETRY_V11_FIELD_DICTIONARY_VERSION}'
+            AND c.privacy_contract_version = '${TELEMETRY_V11_PRIVACY_CONTRACT_VERSION}'
           LEFT JOIN ${tables.accountlessV11DeviceAuthorizations} a ON a.participant_id = p.id
-            AND a.device_credential_id = d.id AND a.state = 'active' AND a.expires_at > $2
+            AND a.device_credential_id = d.id
+            AND a.telemetry_schema_version = '${TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION}'
+            AND a.field_dictionary_version = '${TELEMETRY_V11_FIELD_DICTIONARY_VERSION}'
+            AND a.privacy_contract_version = '${TELEMETRY_V11_PRIVACY_CONTRACT_VERSION}'
+            AND a.state = 'active' AND a.expires_at > $2
+            AND a.expires_at = d.expires_at
           WHERE p.id = $3 AND d.id = $4`, v12
           ? [input.now, input.principal.participantId, input.principal.deviceId]
           : [input.schemaVersion, input.now, input.principal.participantId, input.principal.deviceId]);
@@ -789,7 +848,100 @@ export function createPostgresTelemetryAuthorityBackend(
       if (!v12 && input.schemaVersion !== "telemetry-contribution-v1.1") {
         throw new ApiError(403, "TELEMETRY_CONSENT_INVALID");
       }
+      const expectedFieldDictionary = v12
+        ? TELEMETRY_V12_FIELD_DICTIONARY_VERSION : TELEMETRY_V11_FIELD_DICTIONARY_VERSION;
+      const expectedPrivacyContract = v12
+        ? TELEMETRY_V12_PRIVACY_CONTRACT_VERSION : TELEMETRY_V11_PRIVACY_CONTRACT_VERSION;
+      if (input.fieldDictionaryVersion !== expectedFieldDictionary
+          || input.privacyContractVersion !== expectedPrivacyContract) {
+        throw new ApiError(403, "TELEMETRY_CONSENT_INVALID");
+      }
       await mutate(pool, async (client) => {
+        if (!v12) {
+          // Consent is a participant policy transition, not merely an insert.
+          // Lock every authority row in the same order used by ingest, then
+          // evaluate current session/legacy state after those locks return.
+          const participant = await client.query(
+            `SELECT owner_kind, state FROM ${tables.participants} WHERE id=$1 FOR UPDATE`,
+            [input.principal.participantId],
+          );
+          const device = await client.query(
+            `SELECT authority_kind, state FROM ${tables.deviceCredentials}
+              WHERE id=$1 AND participant_id=$2 FOR UPDATE`,
+            [input.principal.deviceId, input.principal.participantId],
+          );
+          const session = await client.query(
+            `SELECT scope, state FROM ${tables.webSessions}
+              WHERE id=$1 AND participant_id=$2 FOR UPDATE`,
+            [input.sessionId, input.principal.participantId],
+          );
+          const format = await client.query(
+            `SELECT lifecycle FROM ${tables.telemetryTransportFormats}
+              WHERE schema_version=$1 FOR SHARE`, [input.schemaVersion],
+          );
+          const legacy = await client.query(
+            `SELECT 1 FROM ${tables.telemetryContributions}
+              WHERE participant_id=$1 AND status='accepted'
+                AND transport_schema_version='telemetry-contribution-v0.2' LIMIT 1`,
+            [input.principal.participantId],
+          );
+          if (participant.rowCount !== 1 || device.rowCount !== 1 || session.rowCount !== 1
+              || format.rowCount !== 1 || legacy.rowCount !== 0) {
+            throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+          }
+          const participantRow = rowOne<Record<string, unknown>>(participant);
+          const deviceRow = rowOne<Record<string, unknown>>(device);
+          const sessionRow = rowOne<Record<string, unknown>>(session);
+          const formatRow = rowOne<Record<string, unknown>>(format);
+          if (participantRow.owner_kind !== "social" || participantRow.state !== "active"
+              || deviceRow.authority_kind !== "social" || deviceRow.state !== "active"
+              || sessionRow.scope !== "personal" || sessionRow.state !== "active"
+              || formatRow.lifecycle !== "accepted") {
+            throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+          }
+          const dbNow = stringValue(rowOne<Record<string, unknown>>(
+            await client.query("SELECT clock_timestamp() AS now"),
+          ).now);
+          const validSession = await client.query(
+            `SELECT 1 FROM ${tables.webSessions}
+              WHERE id=$1 AND participant_id=$2 AND scope='personal' AND state='active'
+                AND expires_at > $3::timestamptz`,
+            [input.sessionId, input.principal.participantId, dbNow],
+          );
+          if (validSession.rowCount !== 1) throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+          const consent = await client.query(
+            `INSERT INTO ${tables.telemetryV11DeviceConsents} (
+              participant_id, device_id, telemetry_schema_version,
+              field_dictionary_version, privacy_contract_version, consented_at
+            ) VALUES ($1,$2,$3,$4,$5,$6)
+            ON CONFLICT (participant_id, device_id) DO UPDATE SET
+              telemetry_schema_version=excluded.telemetry_schema_version,
+              field_dictionary_version=excluded.field_dictionary_version,
+              privacy_contract_version=excluded.privacy_contract_version,
+              consented_at=excluded.consented_at
+            RETURNING participant_id`,
+            [input.principal.participantId, input.principal.deviceId, input.schemaVersion,
+              input.fieldDictionaryVersion, input.privacyContractVersion, dbNow],
+          );
+          if (consent.rowCount !== 1) throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+          const floor = await client.query(
+            `INSERT INTO ${tables.telemetryTransportParticipantFloors}
+               (participant_id, minimum_rank, revision, changed_at)
+             VALUES ($1, 11, 1, $2)
+             ON CONFLICT (participant_id) DO UPDATE
+               SET minimum_rank = GREATEST(${tables.telemetryTransportParticipantFloors}.minimum_rank, 11),
+                   revision = ${tables.telemetryTransportParticipantFloors}.revision
+                     + CASE WHEN ${tables.telemetryTransportParticipantFloors}.minimum_rank < 11 THEN 1 ELSE 0 END,
+                   changed_at = CASE WHEN ${tables.telemetryTransportParticipantFloors}.minimum_rank < 11
+                     THEN excluded.changed_at ELSE ${tables.telemetryTransportParticipantFloors}.changed_at END
+             RETURNING minimum_rank`,
+            [input.principal.participantId, dbNow],
+          );
+          if (floor.rowCount !== 1 || numberValue(rowOne<Record<string, unknown>>(floor).minimum_rank) < 11) {
+            throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+          }
+          return undefined;
+        }
         const query = v12 ? `INSERT INTO ${tables.telemetryV12DeviceCapabilities} (
           participant_id, device_id, telemetry_schema_version, field_dictionary_version,
           privacy_contract_version, state, consented_at
@@ -816,6 +968,22 @@ export function createPostgresTelemetryAuthorityBackend(
         const result = await client.query(query, [input.principal.participantId, input.principal.deviceId,
           input.schemaVersion, input.fieldDictionaryVersion, input.privacyContractVersion, input.now, input.sessionId]);
         if (changes(result) !== 1) throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+        const floor = await client.query(
+          `INSERT INTO ${tables.telemetryTransportParticipantFloors}
+             (participant_id, minimum_rank, revision, changed_at)
+           VALUES ($1, 12, 1, $2)
+           ON CONFLICT (participant_id) DO UPDATE
+             SET minimum_rank = GREATEST(${tables.telemetryTransportParticipantFloors}.minimum_rank, 12),
+                 revision = ${tables.telemetryTransportParticipantFloors}.revision
+                   + CASE WHEN ${tables.telemetryTransportParticipantFloors}.minimum_rank < 12 THEN 1 ELSE 0 END,
+                 changed_at = CASE WHEN ${tables.telemetryTransportParticipantFloors}.minimum_rank < 12
+                   THEN excluded.changed_at ELSE ${tables.telemetryTransportParticipantFloors}.changed_at END
+           RETURNING minimum_rank`,
+          [input.principal.participantId, input.now],
+        );
+        if (floor.rowCount !== 1 || numberValue(rowOne<Record<string, unknown>>(floor).minimum_rank) < 12) {
+          throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+        }
         return undefined;
       });
     },
@@ -824,7 +992,29 @@ export function createPostgresTelemetryAuthorityBackend(
         const v12 = input.schemaVersion === TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION;
         const state = await client.query(`SELECT e.namespace, f.minimum_rank, f.revision, p.owner_kind,
           d.authority_kind, CASE WHEN c.device_id IS NULL THEN 0 ELSE 1 END AS consent_current,
-          CASE WHEN a.enrollment_device_id IS NULL THEN 0 ELSE 1 END AS accountless_authorization_current
+          CASE WHEN EXISTS (
+            SELECT 1
+              FROM ${tables.accountlessEnrollmentLedger} ledger
+              JOIN ${tables.accountlessUploadOwners} owner
+                ON owner.enrollment_device_id = ledger.device_id
+               AND owner.participant_id = p.id
+               AND owner.device_credential_id = d.id
+               AND owner.state = 'active'
+               AND owner.expires_at = ledger.expires_at
+              JOIN ${v12 ? tables.accountlessV12DeviceAuthorizations : tables.accountlessV11DeviceAuthorizations} grant_row
+                ON grant_row.enrollment_device_id = ledger.device_id
+               AND grant_row.participant_id = p.id
+               AND grant_row.device_credential_id = d.id
+               AND grant_row.state = 'active'
+               AND grant_row.telemetry_schema_version = '${v12 ? TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION : TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION}'
+               AND grant_row.field_dictionary_version = '${v12 ? TELEMETRY_V12_FIELD_DICTIONARY_VERSION : TELEMETRY_V11_FIELD_DICTIONARY_VERSION}'
+               AND grant_row.privacy_contract_version = '${v12 ? TELEMETRY_V12_PRIVACY_CONTRACT_VERSION : TELEMETRY_V11_PRIVACY_CONTRACT_VERSION}'
+               AND grant_row.expires_at = ledger.expires_at
+             WHERE ledger.device_id = d.accountless_enrollment_device_id
+               AND ledger.state = 'active'
+               AND ledger.expires_at = d.expires_at
+               AND ledger.expires_at > $1
+          ) THEN 1 ELSE 0 END AS accountless_authorization_current
         FROM ${tables.participants} p JOIN ${tables.attributionEnrollments} e ON e.participant_id = p.id
         JOIN ${tables.telemetryTransportParticipantFloors} f ON f.participant_id = p.id
         JOIN ${tables.deviceCredentials} d ON d.participant_id = p.id
@@ -834,12 +1024,12 @@ export function createPostgresTelemetryAuthorityBackend(
           AND c.field_dictionary_version = '${v12 ? TELEMETRY_V12_FIELD_DICTIONARY_VERSION : TELEMETRY_V11_FIELD_DICTIONARY_VERSION}'
           AND c.privacy_contract_version = '${v12 ? TELEMETRY_V12_PRIVACY_CONTRACT_VERSION : TELEMETRY_V11_PRIVACY_CONTRACT_VERSION}'
           ${v12 ? "AND c.state = 'accepted'" : ""}
-        LEFT JOIN ${v12 ? tables.accountlessV12DeviceAuthorizations : tables.accountlessV11DeviceAuthorizations} a ON a.participant_id = p.id
+          LEFT JOIN ${v12 ? tables.accountlessV12DeviceAuthorizations : tables.accountlessV11DeviceAuthorizations} a ON a.participant_id = p.id
           AND a.device_credential_id = d.id
           AND a.telemetry_schema_version = '${v12 ? TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION : TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION}'
           AND a.field_dictionary_version = '${v12 ? TELEMETRY_V12_FIELD_DICTIONARY_VERSION : TELEMETRY_V11_FIELD_DICTIONARY_VERSION}'
           AND a.privacy_contract_version = '${v12 ? TELEMETRY_V12_PRIVACY_CONTRACT_VERSION : TELEMETRY_V11_PRIVACY_CONTRACT_VERSION}'
-          AND a.state = 'active' AND a.expires_at > $1
+          AND a.state = 'active' AND a.expires_at > $1 AND a.expires_at = d.expires_at
         WHERE p.id = $2 AND p.state = 'active' AND d.id = $3 AND d.state = 'active' AND d.expires_at > $1`,
         [input.now, input.principal.participantId, input.principal.deviceId]);
         if (state.rowCount !== 1) throw new ApiError(401, "DEVICE_AUTH_INVALID");
@@ -922,5 +1112,89 @@ export function createPostgresTelemetryAuthorityBackend(
     },
   };
 
-  return { sessions, sessionUploads, devices, accountless, transport, identity };
+  const enrollment: AuthorityEnrollmentStore = {
+    async enroll(input) {
+      const participant = { ...input.participant };
+      const session = { ...input.session };
+      const pairing = input.pairing === null ? null : { ...input.pairing };
+      return mutate(pool, async (client) => {
+        const inserted = await client.query(`INSERT INTO ${tables.participants} (
+          id, access_token_id, access_token_hash, recovery_token_id, recovery_token_hash,
+          state, consent_version, consented_at, created_at, identity_link_key, identity_cooldown_digest
+        ) VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $7, $8, $9)
+        RETURNING id, created_at, state, consent_version`, [
+          participant.id, participant.accessTokenId, copyBytes(participant.accessTokenHash),
+          participant.recoveryTokenId, copyBytes(participant.recoveryTokenHash),
+          participant.consentVersion, participant.createdAt,
+          participant.identityLinkKey, participant.identityCooldownDigest,
+        ]);
+        const row = rowOne<Record<string, unknown>>(inserted);
+        if (row.state !== "active") throw unavailable();
+        const insertedSession = await client.query(`INSERT INTO ${tables.webSessions} (
+          id, participant_id, secret_hash, csrf_hash, scope, state,
+          issued_at, expires_at, last_used_at
+        ) VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $6)`, [
+          session.id, session.participantId, copyBytes(session.secretHash), copyBytes(session.csrfHash),
+          session.scope, session.issuedAt, session.expiresAt,
+        ]);
+        if (changes(insertedSession) !== 1) throw unavailable();
+        if (pairing !== null) {
+          const insertedPairing = await client.query(`INSERT INTO ${tables.devicePairings} (
+            id, participant_id, issued_by_session_id, secret_hash, consent_version,
+            transport_consent_version, state, issued_at, expires_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, 'unused', $7, $8)`, [
+            pairing.id, pairing.participantId, pairing.issuedBySessionId, copyBytes(pairing.secretHash),
+            participant.consentVersion, pairing.transportConsentVersion, pairing.issuedAt, pairing.expiresAt,
+          ]);
+          if (changes(insertedPairing) !== 1) throw unavailable();
+        }
+        return {
+          id: stringValue(row.id),
+          createdAt: stringValue(row.created_at),
+          state: "active" as const,
+          consentVersion: stringValue(row.consent_version),
+        };
+      }, "authority.enrollment.enroll");
+    },
+    async reattach(input) {
+      const session = { ...input.session };
+      const pairing = input.pairing === null ? null : { ...input.pairing };
+      return mutate(pool, async (client) => {
+        const locked = await client.query(`SELECT id FROM ${tables.participants}
+          WHERE id=$1 AND identity_link_key=$2 AND state='active' FOR UPDATE`, [
+          input.participantId, input.identityLinkKey,
+        ]);
+        if (changes(locked) !== 1) return false;
+        const recovery = await client.query(`UPDATE ${tables.participants}
+          SET recovery_token_id=$1, recovery_token_hash=$2
+          WHERE id=$3 AND state='active'`, [
+          input.recoveryTokenId, copyBytes(input.recoveryTokenHash), input.participantId,
+        ]);
+        if (changes(recovery) !== 1) return false;
+        const insertedSession = await client.query(`INSERT INTO ${tables.webSessions} (
+          id, participant_id, secret_hash, csrf_hash, scope, state,
+          issued_at, expires_at, last_used_at
+        ) VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $6)`, [
+          session.id, session.participantId, copyBytes(session.secretHash), copyBytes(session.csrfHash),
+          session.scope, session.issuedAt, session.expiresAt,
+        ]);
+        if (changes(insertedSession) !== 1) throw unavailable();
+        if (pairing !== null) {
+          const insertedPairing = await client.query(`INSERT INTO ${tables.devicePairings} (
+            id, participant_id, issued_by_session_id, secret_hash, consent_version,
+            transport_consent_version, state, issued_at, expires_at
+          ) VALUES ($1, $2, $3, $4,
+                    (SELECT consent_version FROM ${tables.participants} WHERE id=$2),
+                    $5, 'unused', $6, $7)`, [
+            pairing.id, pairing.participantId, pairing.issuedBySessionId, copyBytes(pairing.secretHash),
+            pairing.transportConsentVersion, pairing.issuedAt, pairing.expiresAt,
+          ]);
+          if (changes(insertedPairing) !== 1) throw unavailable();
+        }
+        return true;
+      }, "authority.enrollment.reattach");
+    },
+  };
+
+  return { sessions, sessionUploads, devices, accountless, transport, identity, enrollment };
 }

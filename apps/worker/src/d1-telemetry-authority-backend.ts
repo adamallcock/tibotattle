@@ -578,15 +578,32 @@ export function createD1TelemetryAuthorityBackend(db: D1Database): TelemetryAuth
             d.expires_at AS device_expires_at, COALESCE(f.minimum_rank, 1) AS minimum_rank,
             COALESCE(f.revision, 0) AS policy_revision, r.state AS format_lifecycle,
             CASE WHEN c.device_id IS NULL THEN 0 ELSE 1 END AS consent_current,
-            CASE WHEN a.device_credential_id IS NULL THEN 0 ELSE 1 END AS accountless_authorization_current
+            CASE WHEN EXISTS (
+              SELECT 1 FROM accountless_enrollment_ledger ledger
+              JOIN accountless_upload_owners owner
+                ON owner.enrollment_device_id = ledger.device_id
+               AND owner.participant_id = p.id AND owner.device_credential_id = d.id
+               AND owner.state = 'active' AND owner.expires_at = ledger.expires_at
+              JOIN accountless_v12_device_authorizations grant_row
+                ON grant_row.enrollment_device_id = ledger.device_id
+               AND grant_row.participant_id = p.id AND grant_row.device_credential_id = d.id
+               AND grant_row.state = 'active' AND grant_row.expires_at = ledger.expires_at
+             WHERE ledger.device_id = d.accountless_enrollment_device_id
+               AND ledger.state = 'active' AND ledger.expires_at = d.expires_at
+               AND ledger.expires_at > ?
+            ) THEN 1 ELSE 0 END AS accountless_authorization_current
           FROM participants p JOIN device_credentials d ON d.participant_id = p.id
           JOIN telemetry_v12_runtime r ON r.id = 1
           LEFT JOIN telemetry_transport_device_floors f ON f.participant_id = p.id AND f.device_id = d.id
           LEFT JOIN telemetry_v12_device_capabilities c ON c.participant_id = p.id
-            AND c.device_id = d.id AND c.state = 'accepted'
+            AND c.device_id = d.id
+            AND c.telemetry_schema_version = '${TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION}'
+            AND c.field_dictionary_version = '${TELEMETRY_V12_FIELD_DICTIONARY_VERSION}'
+            AND c.privacy_contract_version = '${TELEMETRY_V12_PRIVACY_CONTRACT_VERSION}'
+            AND c.state = 'accepted'
           LEFT JOIN accountless_v12_device_authorizations a ON a.participant_id = p.id
             AND a.device_credential_id = d.id AND a.state = 'active' AND a.expires_at > ?
-          WHERE p.id = ? AND d.id = ?`).bind(input.now, input.principal.participantId,
+          WHERE p.id = ? AND d.id = ?`).bind(input.now, input.now, input.principal.participantId,
             input.principal.deviceId).first<D1Row>();
           if (!row) return null;
           const ownerKind = row.owner_kind;
@@ -616,7 +633,24 @@ export function createD1TelemetryAuthorityBackend(db: D1Database): TelemetryAuth
           d.expires_at AS device_expires_at, f.minimum_rank, f.revision AS policy_revision,
           fmt.format_rank, fmt.lifecycle AS format_lifecycle,
           CASE WHEN c.device_id IS NULL THEN 0 ELSE 1 END AS consent_current,
-          CASE WHEN a.enrollment_device_id IS NULL THEN 0 ELSE 1 END AS accountless_authorization_current,
+          CASE WHEN EXISTS (
+            SELECT 1 FROM accountless_enrollment_ledger ledger
+            JOIN accountless_upload_owners owner
+              ON owner.enrollment_device_id = ledger.device_id
+             AND owner.participant_id = p.id AND owner.device_credential_id = d.id
+             AND owner.state = 'active' AND owner.expires_at = ledger.expires_at
+            JOIN accountless_v11_device_authorizations grant_row
+              ON grant_row.enrollment_device_id = ledger.device_id
+             AND grant_row.participant_id = p.id AND grant_row.device_credential_id = d.id
+             AND grant_row.state = 'active'
+             AND grant_row.telemetry_schema_version = '${TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION}'
+             AND grant_row.field_dictionary_version = '${TELEMETRY_V11_FIELD_DICTIONARY_VERSION}'
+             AND grant_row.privacy_contract_version = '${TELEMETRY_V11_PRIVACY_CONTRACT_VERSION}'
+             AND grant_row.expires_at = ledger.expires_at
+           WHERE ledger.device_id = d.accountless_enrollment_device_id
+             AND ledger.state = 'active' AND ledger.expires_at = d.expires_at
+             AND ledger.expires_at > ?
+          ) THEN 1 ELSE 0 END AS accountless_authorization_current,
           EXISTS (SELECT 1 FROM telemetry_contributions legacy
             WHERE legacy.participant_id = p.id AND legacy.status = 'accepted'
               AND legacy.transport_schema_version = 'telemetry-contribution-v0.2') AS incompatible_legacy_history
@@ -624,9 +658,12 @@ export function createD1TelemetryAuthorityBackend(db: D1Database): TelemetryAuth
         JOIN telemetry_transport_participant_floors f ON f.participant_id = p.id
         JOIN telemetry_transport_formats fmt ON fmt.schema_version = ?
         LEFT JOIN telemetry_v11_device_consents c ON c.participant_id = p.id AND c.device_id = d.id
+          AND c.telemetry_schema_version = '${TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION}'
+          AND c.field_dictionary_version = '${TELEMETRY_V11_FIELD_DICTIONARY_VERSION}'
+          AND c.privacy_contract_version = '${TELEMETRY_V11_PRIVACY_CONTRACT_VERSION}'
         LEFT JOIN accountless_v11_device_authorizations a ON a.participant_id = p.id
           AND a.device_credential_id = d.id AND a.state = 'active' AND a.expires_at > ?
-        WHERE p.id = ? AND d.id = ?`).bind(input.schemaVersion, input.now,
+        WHERE p.id = ? AND d.id = ?`).bind(input.schemaVersion, input.now, input.now,
           input.principal.participantId, input.principal.deviceId).first<D1Row>();
         if (!row) return null;
         const ownerKind = row.owner_kind;
@@ -655,6 +692,15 @@ export function createD1TelemetryAuthorityBackend(db: D1Database): TelemetryAuth
     },
     async upsertConsent(input): Promise<void> {
       try {
+        const v12 = input.schemaVersion === "telemetry-contribution-v1.2";
+        const expectedFieldDictionary = v12
+          ? TELEMETRY_V12_FIELD_DICTIONARY_VERSION : TELEMETRY_V11_FIELD_DICTIONARY_VERSION;
+        const expectedPrivacyContract = v12
+          ? TELEMETRY_V12_PRIVACY_CONTRACT_VERSION : TELEMETRY_V11_PRIVACY_CONTRACT_VERSION;
+        if (input.fieldDictionaryVersion !== expectedFieldDictionary
+            || input.privacyContractVersion !== expectedPrivacyContract) {
+          throw new ApiError(403, "TELEMETRY_CONSENT_INVALID");
+        }
         if (input.schemaVersion === "telemetry-contribution-v1.2") {
           const result = await db.prepare(`INSERT INTO telemetry_v12_device_capabilities (
             participant_id, device_id, telemetry_schema_version,
@@ -676,6 +722,18 @@ export function createD1TelemetryAuthorityBackend(db: D1Database): TelemetryAuth
               input.fieldDictionaryVersion, input.privacyContractVersion, input.now,
               input.principal.participantId, input.principal.deviceId, input.sessionId, input.now).run();
           if (changes(result) !== 1) throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+          const floor = await db.prepare(
+            `INSERT INTO telemetry_transport_participant_floors
+              (participant_id, minimum_rank, revision, changed_at)
+             VALUES (?, 12, 1, ?)
+             ON CONFLICT(participant_id) DO UPDATE SET
+               minimum_rank = MAX(telemetry_transport_participant_floors.minimum_rank, 12),
+               revision = telemetry_transport_participant_floors.revision
+                 + CASE WHEN telemetry_transport_participant_floors.minimum_rank < 12 THEN 1 ELSE 0 END,
+               changed_at = CASE WHEN telemetry_transport_participant_floors.minimum_rank < 12
+                 THEN excluded.changed_at ELSE telemetry_transport_participant_floors.changed_at END`,
+          ).bind(input.principal.participantId, input.now).run();
+          if (changes(floor) !== 1) throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
           return;
         }
         if (input.schemaVersion !== "telemetry-contribution-v1.1") {
@@ -691,13 +749,32 @@ export function createD1TelemetryAuthorityBackend(db: D1Database): TelemetryAuth
           WHERE p.id = ? AND p.state = 'active' AND p.owner_kind = 'social'
             AND d.id = ? AND d.state = 'active' AND d.authority_kind = 'social'
             AND s.id = ? AND s.scope = 'personal' AND s.state = 'active'
-            AND s.expires_at > ? AND f.lifecycle = 'accepted')
-        ON CONFLICT(participant_id, device_id) DO NOTHING`).bind(
+            AND s.expires_at > ? AND f.lifecycle = 'accepted'
+            AND NOT EXISTS (SELECT 1 FROM telemetry_contributions legacy
+              WHERE legacy.participant_id = p.id AND legacy.status = 'accepted'
+                AND legacy.transport_schema_version = 'telemetry-contribution-v0.2'))
+        ON CONFLICT(participant_id, device_id) DO UPDATE SET
+          telemetry_schema_version = excluded.telemetry_schema_version,
+          field_dictionary_version = excluded.field_dictionary_version,
+          privacy_contract_version = excluded.privacy_contract_version,
+          consented_at = excluded.consented_at`).bind(
           input.principal.participantId, input.principal.deviceId, input.schemaVersion,
           input.fieldDictionaryVersion, input.privacyContractVersion, input.now,
           input.schemaVersion, input.principal.participantId, input.principal.deviceId,
           input.sessionId, input.now).run();
         if (changes(result) !== 1) throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+        const floor = await db.prepare(
+          `INSERT INTO telemetry_transport_participant_floors
+            (participant_id, minimum_rank, revision, changed_at)
+           VALUES (?, 11, 1, ?)
+           ON CONFLICT(participant_id) DO UPDATE SET
+             minimum_rank = MAX(telemetry_transport_participant_floors.minimum_rank, 11),
+             revision = telemetry_transport_participant_floors.revision
+               + CASE WHEN telemetry_transport_participant_floors.minimum_rank < 11 THEN 1 ELSE 0 END,
+             changed_at = CASE WHEN telemetry_transport_participant_floors.minimum_rank < 11
+               THEN excluded.changed_at ELSE telemetry_transport_participant_floors.changed_at END`,
+        ).bind(input.principal.participantId, input.now).run();
+        if (changes(floor) !== 1) throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
       } catch (error) {
         throw mapTransportError(error);
       }
