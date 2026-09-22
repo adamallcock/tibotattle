@@ -12,7 +12,7 @@ import {
 import { compactQuotaPlanEvidence, createLocalUnifiedTelemetryV11Reader } from "../src/local-unified-contribution-attribution.js";
 import { createLocalUnifiedUsageAttributionReader } from "../src/local-unified-accounting-source.js";
 import { createTelemetryV1IndexReader } from "../src/contribution/telemetry-v1-chunks.js";
-import { createTelemetryV11Day } from "../src/contribution/index.js";
+import { createTelemetryV11Day, createTelemetryV12Day } from "../src/contribution/index.js";
 import { ingestLocalUnifiedIndexIncrement } from "../src/local-unified-index-ingest.js";
 
 const DAY = "2026-08-01";
@@ -88,6 +88,12 @@ async function writeFixture(t, { records = [], sources = [1], file = null, repla
       tokensInCacheWrite5m: null, tokensInCacheWrite1h: null, tokensOutText: 1,
       tokensOutReasoning: 0, tokensOutCombined: null, totalInputContext: null, partial: false,
     });
+    if (record.usage !== false && record.boundaryFlags) writer.writeUsageEventBoundary({
+      currentEventKey: eventKey(record.id ?? index + 1), sessionLocal: source.sessionLocal,
+      turnContextBefore: Boolean(record.boundaryFlags & 1),
+      compactionBefore: Boolean(record.boundaryFlags & 2),
+      compactedAtMs: record.boundaryFlags & 2 ? at - 1 : null,
+    });
   }
   for (const sourceId of sources) {
     const source = coords(sourceId);
@@ -144,9 +150,17 @@ test("exact historical plans survive canonical collisions while usage/session id
   const { database, reader } = readFixture(t, file);
   assert.deepEqual(database.prepare("SELECT DISTINCT plan_type FROM quota_observation").all().map((row) => row.plan_type), ["plus"]);
   const base = createTelemetryV1IndexReader(database, codecs).deriveDay(DAY);
-  const day = reader.readDay(DAY);
+  const legacyDay = reader.readDay(DAY);
+  assert.equal(Object.hasOwn(legacyDay, "telemetryV12Evidence"), false);
+  const day = reader.readDayWithV12Evidence(DAY);
   assert.deepEqual(day.recordsByStream.usage, stream(base, "usage"));
   assert.deepEqual(day.recordsByStream.session, stream(base, "session"));
+  assert.equal(day.telemetryV12Evidence.boundaryLookupComplete, true);
+  assert.deepEqual(day.recordsByStream.usage.map((record) =>
+    day.telemetryV12Evidence.continuityForRecord("usage", record)), [
+    { boundaryFlags: 0, tieOrder: 0 },
+    { boundaryFlags: 0, tieOrder: 0 },
+  ]);
   assert.equal(day.recordsByStream.quota.length, 4);
   assert.equal(new Set(day.recordsByStream.quota.map((row) => row.observationId)).size, 4);
   const result = project(day);
@@ -154,8 +168,64 @@ test("exact historical plans survive canonical collisions while usage/session id
     accountBasis: "unavailable", accountTrackId: null, planBasis: "same_source_occurrence", planType, planEraId: null,
   })));
   assert.equal(stream(result, "usage").reduce((sum, row) => sum + row.components.inputUncachedTokens, 0), 70);
+  const successor = createTelemetryV12Day({
+    day: DAY,
+    recordsByStream: day.recordsByStream,
+    attributionForRecord: day.attributionForRecord,
+    accountObservationSecret: secret,
+    binding,
+    parserVersion: LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+    activationTime: `${DAY}T00:00:00.000Z`,
+    continuityForRecord: day.telemetryV12Evidence.continuityForRecord,
+  });
+  const successorUsage = successor.chunks.filter((chunk) => chunk.chunkId.startsWith("usage:"))
+    .flatMap((chunk) => chunk.records);
+  assert.deepEqual(successorUsage.map((record) => [record.boundaryFlags, record.tieOrder]), [
+    [0, 0], [0, 0],
+  ]);
   assert.deepEqual(reader.days(), [DAY]);
   assert.deepEqual(project(reader.readDay(DAY)), result);
+});
+
+test("source cursor ordinal mismatch withholds local order while preserving a proven boundary absence", async (t) => {
+  const { file } = await writeFixture(t, { records: [{ id: 1 }] });
+  const { database, reader } = readFixture(t, file, {}, false);
+  database.prepare("UPDATE source_cursor SET source_ordinal = NULL").run();
+  const day = reader.readDayWithV12Evidence(DAY);
+  const [record] = day.recordsByStream.usage;
+  assert.deepEqual(day.telemetryV12Evidence.continuityForRecord("usage", record), {
+    boundaryFlags: 0,
+    tieOrder: null,
+  });
+});
+
+test("exact index boundary joins reach v1.2 preparation across clock ties and the activation cutoff", async (t) => {
+  const { file } = await writeFixture(t, { records: [
+    { id: 1, at: 0, offset: 40, boundaryFlags: 0 },
+    { id: 2, at: 0, offset: 10, boundaryFlags: 1 },
+    { id: 3, at: 0, offset: 30, boundaryFlags: 2 },
+    { id: 4, at: 0, offset: 20, boundaryFlags: 3 },
+  ] });
+  const { reader } = readFixture(t, file);
+  const legacy = reader.readDay(DAY);
+  const day = reader.readDayWithV12Evidence(DAY);
+  const prepare = (activationTime) => createTelemetryV12Day({
+    day: DAY, recordsByStream: day.recordsByStream,
+    attributionForRecord: day.attributionForRecord,
+    accountObservationSecret: secret, binding,
+    parserVersion: LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+    activationTime, continuityForRecord: day.telemetryV12Evidence.continuityForRecord,
+  });
+  assert.deepEqual(stream(prepare(stamp(-1)), "usage")
+    .map((record) => [record.boundaryFlags, record.tieOrder]), [
+    [0, 3], [1, 0], [2, 2], [3, 1],
+  ]);
+  assert.deepEqual(stream(prepare(stamp(1)), "usage")
+    .map((record) => [record.boundaryFlags, record.tieOrder]), [
+    [null, null], [null, null], [null, null], [null, null],
+  ]);
+  assert.equal(Object.hasOwn(legacy, "telemetryV12Evidence"), false);
+  assert.deepEqual(project(day), project(legacy));
 });
 
 test("held/suppressed quota cannot attribute usage and quota-only plan changes are retained", async (t) => {
@@ -463,6 +533,7 @@ test("acquisition bounds fail closed without dropping records or mutating the in
   const { database, reader } = readFixture(t, file, { limits: { dayRows: 1 } });
   const before = database.prepare("SELECT * FROM usage_event ORDER BY event_key").all();
   assert.throws(() => reader.readDay(DAY), { code: "local_telemetry_v11_day_limit_exceeded" });
+  assert.throws(() => reader.readDayWithV12Evidence(DAY), { code: "local_telemetry_v11_day_limit_exceeded" });
   assert.deepEqual(database.prepare("SELECT * FROM usage_event ORDER BY event_key").all(), before);
   assert.equal(database.prepare("PRAGMA user_version").get().user_version, 11);
   assert.throws(() => reader.readDay("2026-02-30"), { code: "local_telemetry_v11_invalid_day" });

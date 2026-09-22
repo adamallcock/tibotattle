@@ -290,9 +290,10 @@ function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaV
   // worker still validates the complete index. Only reviewed v10 through v15
   // predecessors can receive the v16 rescan window. Their physical schema and
   // immutable source identity remain compatible; v12 nullable counters and
-  // v13 ordinal-bearing compaction headers and v14 paginated setting boundaries
+  // v13 ordinal-bearing compaction headers, v14 paginated setting boundaries,
   // and v15 historical parent-model fallback require reparsing present sources.
-  // v16 adds the explicitly approved missing-cache-write assumption with row provenance.
+  // v16 adds the approved missing-cache-write assumption with row provenance
+  // and retains exact selected input/output totals.
   // Keep the target pinned too: a future parser needs an explicit review and
   // must not silently inherit this longer deadline for every mismatch.
   if (LOCAL_UNIFIED_INDEX_PARSER_VERSION !== "unified-rollout-typed-v16"

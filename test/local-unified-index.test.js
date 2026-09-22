@@ -1100,12 +1100,11 @@ test("a rebuild indexes typed usage events and never stores content", async () =
       assert.equal(rows[0].iu, 100);
       assert.equal(rows[0].ot, 10);
       assert.notEqual(rows[0].quota, null);
-      // Codex reports neither a provider total input context, nor a
-      // cache-write TTL split, nor a combined output figure. NULL must stay
-      // distinguishable from an observed zero.
-      assert.equal(rows[0].tic, null);
+      // Exact raw totals survive; unavailable cache-write TTL splits remain
+      // distinct from observed zero.
+      assert.equal(rows[0].tic, 100);
       assert.equal(rows[0].w5, null);
-      assert.equal(rows[0].oc, null);
+      assert.equal(rows[0].oc, 10);
       assert.equal(rows[1].quota, null);
       assert.equal(rows[1].iu, 200);
 

@@ -263,6 +263,23 @@ export function canonicalComponents(raw) {
   };
 }
 
+// Preserve the exact totals from the selected usage sample. Known components
+// can disprove a total even when other components are unavailable; missing
+// components cannot be reconstructed from the total. These fields are separate
+// from the additive component vector used by replay and cache calculations.
+function canonicalUsageTotals(raw) {
+  const known = (key) => Number.isSafeInteger(raw?.[key]) && raw[key] >= 0;
+  const input = known("input_tokens")
+    && (raw.cached_input_tokens ?? 0) + (raw.cache_write_input_tokens ?? 0)
+      <= raw.input_tokens;
+  const output = known("output_tokens")
+    && (raw.reasoning_output_tokens ?? 0) <= raw.output_tokens;
+  return {
+    totalInputContextTokens: input ? raw.input_tokens : null,
+    outputCombinedTokens: output ? raw.output_tokens : null,
+  };
+}
+
 function safeClassification(value) {
   return typeof value === "string" && /^[a-zA-Z0-9._:-]{1,64}$/u.test(value)
     ? value
@@ -463,6 +480,7 @@ export async function extractRolloutUsage(path, {
   // continuity lens compares positive-input requests, so only the next one is
   // a meaningful boundary.
   function emitUsage(event, rawUsage) {
+    Object.assign(event, canonicalUsageTotals(rawUsage));
     // Product-approved assumption: historical Codex counters can omit cache
     // writes. Apply it only after choosing the charged usage, keeping raw
     // cumulative counters unchanged for replay and delta decisions.

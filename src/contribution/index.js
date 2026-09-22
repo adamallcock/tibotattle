@@ -55,6 +55,13 @@ export {
   telemetryV11FieldInventory,
 } from "./telemetry-v11-chunks.js";
 export {
+  createTelemetryV12Day,
+  telemetryV12FieldInventory,
+} from "./telemetry-v12-chunks.js";
+export {
   readTelemetryV11Capabilities,
   runTelemetryV11Sync,
 } from "./telemetry-v11-sync.js";
+export {
+  projectTelemetryPerformanceDay,
+} from "./performance-daily.js";

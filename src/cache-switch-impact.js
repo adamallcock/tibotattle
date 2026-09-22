@@ -13,6 +13,7 @@ import {
   LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
+  isLocalUnifiedIndexBoundaryParserVersion,
   reasoningEffortName,
 } from "./local-unified-index.js";
 import {
@@ -267,7 +268,8 @@ function sameContinuityConfiguration(row) {
 }
 
 function compactionAwareParser(value) {
-  return COMPACTION_AWARE_PARSERS.has(value);
+  return COMPACTION_AWARE_PARSERS.has(value)
+    || isLocalUnifiedIndexBoundaryParserVersion(value);
 }
 
 function componentsFor(row) {

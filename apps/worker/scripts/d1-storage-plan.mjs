@@ -9,6 +9,40 @@ export const D1_STORAGE_CONFIRMATION = 'EXECUTE_REVIEWED_D1_STORAGE_PLAN';
 export const D1_STORAGE_SCHEMA_DIRECTORIES = Object.freeze({
   control: 'routing-migrations', ingestion: '.release-build/ingestion-role-migrations', analytics: 'analytics-migrations',
 });
+// The correction migration is an ingestion-role capability. Older source
+// snapshots may predate it, so the role proof requires the complete closed
+// object set only when its migration input is pinned. A partial object set is
+// never accepted as a capability claim.
+export const TELEMETRY_USAGE_CORRECTION_TABLES = Object.freeze([
+  'telemetry_usage_correction_cas_guard',
+  'telemetry_usage_correction_facts',
+  'telemetry_usage_correction_history',
+  'telemetry_usage_correction_runtime',
+]);
+export const TELEMETRY_USAGE_CORRECTION_SCHEMA_OBJECTS = Object.freeze([
+  ...TELEMETRY_USAGE_CORRECTION_TABLES,
+  'telemetry_usage_correction_effective_facts',
+  'telemetry_usage_correction_facts_history',
+  'telemetry_usage_correction_history_identity',
+  'telemetry_usage_correction_history_owner_time',
+  'telemetry_usage_correction_history_source',
+  'telemetry_usage_correction_cas_guard_consume',
+  'telemetry_usage_correction_cas_guard_validate',
+  'telemetry_usage_correction_allocation_retirement',
+  'telemetry_usage_correction_admission_retirement',
+  'telemetry_usage_correction_chunk_retirement',
+  'telemetry_usage_correction_fact_erasure',
+  'telemetry_usage_correction_fact_immutable',
+  'telemetry_usage_correction_fact_provenance',
+  'telemetry_usage_correction_history_erasure',
+  'telemetry_usage_correction_history_fact',
+  'telemetry_usage_correction_history_immutable',
+  'telemetry_usage_correction_history_provenance',
+  'telemetry_usage_correction_participant_erasure',
+  'telemetry_usage_correction_record_retirement',
+  'telemetry_usage_correction_runtime_immutable',
+  'telemetry_usage_correction_runtime_retained',
+]);
 const SHA = /^[a-f0-9]{64}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
 const matches = (expression, value) => typeof value === 'string' && expression.test(value);
@@ -153,6 +187,15 @@ export async function loadStorageQualification({ workerRoot, plan, target }) {
       for(const input of pinned){if(!/^\d{4}_[a-z0-9_-]+\.sql$/.test(input.name)
         ||storageSha256(await boundedFile(join(workerRoot,directoryName,input.name),240*1024))!==input.sha256)throw storageError('ROLE_INPUT_CHANGED');}
     }
+    const correctionMigrationPinned=inputs.migrations.some(input=>input.directory==='ingestion-isolation-migrations'
+      &&input.name==='0006_usage_correction_facts.sql');
+    const correctionObjects=objects.filter(object=>object.name.startsWith('telemetry_usage_correction_'));
+    if(correctionObjects.length!==0&&correctionObjects.length!==TELEMETRY_USAGE_CORRECTION_SCHEMA_OBJECTS.length)
+      throw storageError('ROLE_QUALIFICATION_INCOMPLETE');
+    if(correctionMigrationPinned&&correctionObjects.length!==TELEMETRY_USAGE_CORRECTION_SCHEMA_OBJECTS.length)
+      throw storageError('ROLE_QUALIFICATION_INCOMPLETE');
+    if(!correctionMigrationPinned&&correctionObjects.length===TELEMETRY_USAGE_CORRECTION_SCHEMA_OBJECTS.length)
+      throw storageError('ROLE_QUALIFICATION_INCOMPLETE');
   }
 
   const names = [], migrations = [];

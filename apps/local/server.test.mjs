@@ -356,7 +356,7 @@ test("refresh timeout classifier grants the cold window only to missing or prove
   }
 });
 
-test("published v10 v11 v12 v13 v14 v15 upgrades to v16 receive a cold deadline without extending current or uncertain state", async () => {
+test("published v10 through v15 upgrades to v16 receive a cold deadline without extending current or uncertain state", async () => {
   const root = await mkdtemp(join(tmpdir(), "local-timeout-parser-upgrade-"));
   // Deliberately pin the target: another parser release must review its
   // predecessor set, not silently keep passing a generic mismatch test.
