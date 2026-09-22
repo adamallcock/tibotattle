@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { connectCdp, selectMacDashboardTarget, selectMacSettingsTarget, waitFor } from './smoke-electron-macos.mjs';
 import { desktopFirstRunDialogCopy, validateDesktopFirstRunReceipt } from '../apps/electron/desktop-first-run.js';
 import { DESKTOP_SECURE_STORAGE_FAILURE_REASONS, createDesktopSecureStorageDialog } from '../apps/electron/desktop-secure-storage-readiness.js';
+import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC } from '../apps/electron/errors.js';
 import { classifyDesktopSharingInstallation } from '../apps/electron/desktop-sharing-installation.js';
 import { verifySignedStagingLaunchInputs, prepareSignedStagingDisposableProfile, parseSignedStagingConsumerArguments } from './consume-signed-electron-staging.mjs';
 import { macOSLoopbackLaunch, MACOS_LOOPBACK_MODE } from './lib/macos-loopback-qualification.mjs';
@@ -259,6 +260,71 @@ export function assertSignedStagingFreshProjection(sharing, receipt) {
   return true;
 }
 
+// Direct-child diagnostic only: closed observations, never raw stderr or paths.
+// Message flags identify observed fixed literals, not a proven failure cause.
+const STDERR_SCAN_LIMIT = 64 * 1024;
+const STDERR_MARKERS = Object.freeze({ electronEntryFailure: [ELECTRON_ENTRY_FAILURE_DIAGNOSTIC], sandboxApplyMessage: ['sandbox_apply:'],
+  sandboxInitializationMessage: ['sandbox_init() failed', 'InitializeSandbox() failed'],
+  seatbeltMessage: ['SeatbeltExec:'], operationNotPermitted: ['Operation not permitted'],
+  dynamicLibraryMissing: ['Library not loaded:'] });
+const EXIT_SIGNALS = ['SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGILL', 'SIGTRAP', 'SIGABRT', 'SIGBUS',
+  'SIGFPE', 'SIGKILL', 'SIGSEGV', 'SIGPIPE', 'SIGALRM', 'SIGTERM', 'SIGXCPU', 'SIGXFSZ', 'SIGSYS'];
+const EXIT_BOOLEANS = ['exited', 'spawnFailed', 'unknownExitSignal', 'stderrTruncated', 'stderrComplete',
+  ...Object.keys(STDERR_MARKERS)];
+export function sanitizeSignedStagingProcessDiagnostic(value) {
+  const keys = ['exitCode', 'exitSignal', 'stderrBytesScanned', ...EXIT_BOOLEANS];
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype
+    || Reflect.ownKeys(value).some(key => typeof key !== 'string')
+    || Reflect.ownKeys(value).sort().join() !== keys.sort().join()
+    || EXIT_BOOLEANS.some(k => typeof value[k] !== 'boolean')
+    || !(value.exitCode === null || (Number.isInteger(value.exitCode) && value.exitCode >= 0 && value.exitCode <= 255))
+    || !(value.exitSignal === null || EXIT_SIGNALS.includes(value.exitSignal))
+    || !Number.isInteger(value.stderrBytesScanned) || value.stderrBytesScanned < 0 || value.stderrBytesScanned > STDERR_SCAN_LIMIT
+    || (!value.exited && (value.exitCode !== null || value.exitSignal !== null || value.unknownExitSignal))
+    || (value.exitSignal !== null && value.unknownExitSignal)
+    || (value.stderrTruncated && value.stderrBytesScanned !== STDERR_SCAN_LIMIT)
+    || (value.exitCode !== null && (value.exitSignal !== null || value.unknownExitSignal))) return null;
+  return Object.fromEntries(keys.map(k => [k, value[k]]));
+}
+export function observeSignedStagingProcess(child) {
+  const observation = { exitCode: null, exitSignal: null, stderrBytesScanned: 0,
+    ...Object.fromEntries(EXIT_BOOLEANS.map(k => [k, false])) };
+  // Only the suffix needed to recognize fixed ASCII literals split across chunks.
+  const overlapBytes = Math.max(...Object.values(STDERR_MARKERS).flat().map(s => s.length)) - 1;
+  let overlap = Buffer.alloc(0), frozen = null;
+  child.once('exit', (code, signal) => {
+    if (frozen) return;
+    observation.exited = true;
+    observation.exitCode = Number.isInteger(code) && code >= 0 && code <= 255 ? code : null;
+    observation.exitSignal = EXIT_SIGNALS.includes(signal) ? signal : null;
+    observation.unknownExitSignal = signal !== null && signal !== undefined && !EXIT_SIGNALS.includes(signal);
+  });
+  child.once('error', () => { if (!frozen) observation.spawnFailed = true; });
+  child.stderr.on('data', chunk => {
+    // Keep draining after the scan bound/failure snapshot without retaining bytes.
+    if (frozen) return;
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const size = Math.min(bytes.length, STDERR_SCAN_LIMIT - observation.stderrBytesScanned);
+    observation.stderrTruncated ||= size < bytes.length;
+    if (size === 0) { overlap = Buffer.alloc(0); return; }
+    const scanned = Buffer.concat([overlap, bytes.subarray(0, size)]);
+    for (const [key, literals] of Object.entries(STDERR_MARKERS)) {
+      observation[key] ||= literals.some(literal => scanned.includes(literal));
+    }
+    observation.stderrBytesScanned += size;
+    overlap = observation.stderrBytesScanned === STDERR_SCAN_LIMIT ? Buffer.alloc(0)
+      : Buffer.from(scanned.subarray(Math.max(0, scanned.length - overlapBytes)));
+  });
+  child.stderr.once('end', () => { if (!frozen) observation.stderrComplete = true; overlap = Buffer.alloc(0); });
+  child.stderr.once('error', () => { overlap = Buffer.alloc(0); });
+  return () => {
+    // Freeze before cleanup; harness SIGTERM/SIGKILL cannot become launch evidence.
+    frozen ??= sanitizeSignedStagingProcessDiagnostic(observation);
+    overlap = Buffer.alloc(0);
+    return frozen === null ? null : { ...frozen };
+  };
+}
+
 async function launch(verified, environment, { untouched = false, onFailure, launchServices = false,
   networkMode = null, observeBeforeDashboard } = {}) {
   if (networkMode !== null && networkMode !== MACOS_LOOPBACK_MODE) fail('network_policy');
@@ -275,7 +341,8 @@ async function launch(verified, environment, { untouched = false, onFailure, lau
     ? spawn('/usr/bin/open', ['-W', '-n', verified.appPath, '--args', ...argumentsList],
       { cwd: verified.appPath, env: environment, detached: true, stdio: 'ignore' })
     : spawn(direct.executable, direct.args,
-      { cwd: verified.appPath, env: environment, detached: true, stdio: 'ignore' });
+      { cwd: verified.appPath, env: environment, detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
+  const processDiagnostic = launchServices ? null : observeSignedStagingProcess(child);
   let exited = false;
   let spawnFailed = false;
   child.once('exit', () => { exited = true; });
@@ -329,6 +396,7 @@ async function launch(verified, environment, { untouched = false, onFailure, lau
     return state;
   } catch (error) {
     error.signedLaunchStage = launchStage;
+    error.signedProcessDiagnostic = processDiagnostic?.() ?? null;
     if (launchStage === 'native_intro') error.signedNativeIntroDiagnostic = nativeIntroFailureDiagnostic(state, verified);
     if (onFailure) { try { await onFailure({ pid: state.pid, stage: launchStage }); } catch {} }
     const stopped = await stop(state);

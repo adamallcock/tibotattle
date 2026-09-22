@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseSignedStagingExecutionArguments, signedStagingChildEnvironment, signedStagingFixture, signedStagingNativeIntroScript, interpretSignedStagingNativeIntroResult, assertSignedStagingFreshProjection, waitForSignedStagingNativeIntro, signedStagingNativeIntroDiagnosticScript, sanitizeSignedStagingNativeIntroDiagnostic } from '../scripts/run-signed-electron-staging.mjs';
+import { parseSignedStagingExecutionArguments, signedStagingChildEnvironment, signedStagingFixture, signedStagingNativeIntroScript, interpretSignedStagingNativeIntroResult, assertSignedStagingFreshProjection, waitForSignedStagingNativeIntro, signedStagingNativeIntroDiagnosticScript, sanitizeSignedStagingNativeIntroDiagnostic, observeSignedStagingProcess, sanitizeSignedStagingProcessDiagnostic } from '../scripts/run-signed-electron-staging.mjs';
 const identity = ['--app', '/tmp/reviewed/TiboTattle.app', '--source-revision', 'a'.repeat(40), '--asar-sha256', 'b'.repeat(64)];
 test('execution requires an explicit staging mutation mode and exact artifact inputs', () => {
   assert.throws(() => parseSignedStagingExecutionArguments(identity));
@@ -195,4 +195,85 @@ test('native intro failure snapshot is read-only, PID-scoped and content-free', 
     { ...result, status: 'automation_unavailable' }, null]) {
     assert.equal(sanitizeSignedStagingNativeIntroDiagnostic(invalid), null);
   }
+});
+
+
+test('direct-child stderr classifier handles split literals without exporting content', async () => {
+  const { EventEmitter } = await import('node:events');
+  for (const [literal, flag] of [['electron_shell_entry_failed', 'electronEntryFailure'], ['sandbox_apply:', 'sandboxApplyMessage'], ['sandbox_init() failed', 'sandboxInitializationMessage'],
+    ['InitializeSandbox() failed', 'sandboxInitializationMessage'], ['SeatbeltExec:', 'seatbeltMessage'],
+    ['Operation not permitted', 'operationNotPermitted'], ['Library not loaded:', 'dynamicLibraryMissing']]) {
+    for (let split = 1; split < literal.length; split++) {
+      const child = new EventEmitter(); child.stderr = new EventEmitter();
+      const snapshot = observeSignedStagingProcess(child);
+      child.stderr.emit('data', Buffer.from('PRIVATE_SENTINEL' + literal.slice(0, split)));
+      child.stderr.emit('data', Buffer.from(literal.slice(split) + '/private/synthetic'));
+      child.emit('exit', null, 'SIGABRT'); child.stderr.emit('end');
+      const value = snapshot();
+      assert.equal(value[flag], true); assert.equal(value.exitSignal, 'SIGABRT');
+      assert.equal(value.stderrComplete, true); assert.equal(value.stderrTruncated, false);
+      assert.equal(JSON.stringify(value).includes('PRIVATE_SENTINEL'), false);
+      assert.equal(JSON.stringify(value).includes('/private/'), false);
+    }
+  }
+});
+test('stderr scan cap drains excess and distinguishes incomplete from truncated prefixes', async () => {
+  const { EventEmitter } = await import('node:events');
+  const child = new EventEmitter(); child.stderr = new EventEmitter();
+  const snapshot = observeSignedStagingProcess(child);
+  child.stderr.emit('data', Buffer.alloc(65536, 120));
+  child.stderr.emit('data', Buffer.from('sandbox_apply: Operation not permitted PRIVATE_SENTINEL'));
+  const value = snapshot();
+  assert.equal(value.stderrBytesScanned, 65536); assert.equal(value.stderrTruncated, true);
+  assert.equal(value.stderrComplete, false); assert.equal(value.sandboxApplyMessage, false);
+  assert.equal(value.operationNotPermitted, false);
+  for (let i = 0; i < 3; i++) child.stderr.emit('data', Buffer.alloc(65536));
+  child.stderr.emit('end'); assert.deepEqual(snapshot(), value);
+  const other = new EventEmitter(); other.stderr = new EventEmitter();
+  const exact = observeSignedStagingProcess(other);
+  other.stderr.emit('data', Buffer.alloc(65536)); other.stderr.emit('end');
+  assert.equal(exact().stderrTruncated, false); assert.equal(exact().stderrComplete, true);
+});
+test('pre-cleanup failure snapshot cannot acquire a cleanup signal or unknown raw strings', async () => {
+  const { EventEmitter } = await import('node:events');
+  const child = new EventEmitter(); child.stderr = new EventEmitter();
+  const snapshot = observeSignedStagingProcess(child), before = snapshot();
+  child.emit('exit', null, 'SIGTERM'); child.stderr.emit('data', Buffer.from('sandbox_apply:'));
+  assert.deepEqual(snapshot(), before); assert.equal(before.exited, false); assert.equal(before.exitSignal, null);
+  for (const [code, signal] of [[0, null], [42, null], [null, 'SIGKILL'], [null, 'PRIVATE_SENTINEL'], [9999999, null]]) {
+    const direct = new EventEmitter(); direct.stderr = new EventEmitter();
+    const read = observeSignedStagingProcess(direct); direct.emit('exit', code, signal);
+    const result = read(); assert.equal(result.exited, true);
+    assert.equal(result.exitCode, Number.isInteger(code) && code >= 0 && code <= 255 ? code : null);
+    assert.equal(result.unknownExitSignal, signal === 'PRIVATE_SENTINEL');
+    assert.equal(JSON.stringify(result).includes('PRIVATE_SENTINEL'), false);
+  }
+  const failed = new EventEmitter(); failed.stderr = new EventEmitter();
+  const read = observeSignedStagingProcess(failed); failed.emit('error', new Error('PRIVATE_SENTINEL'));
+  assert.equal(read().spawnFailed, true); assert.equal(read().exited, false);
+});
+test('process diagnostic rejects unknown fields, unbounded values and contradictory states', async () => {
+  const { EventEmitter } = await import('node:events');
+  const child = new EventEmitter(); child.stderr = new EventEmitter();
+  const value = observeSignedStagingProcess(child)();
+  assert.deepEqual(sanitizeSignedStagingProcessDiagnostic(value), value);
+  for (const extra of [{ raw: 'PRIVATE_SENTINEL' }, { [Symbol('private')]: true }, { exitCode: 256 }, { exitSignal: 'PRIVATE_SENTINEL' },
+    { stderrBytesScanned: 65537 }, { stderrBytesScanned: -1 }, { stderrComplete: 'yes' },
+    { stderrTruncated: true }, { exited: true, exitSignal: 'SIGABRT', unknownExitSignal: true },
+    { exitCode: 0 }, { exited: true, exitCode: 0, exitSignal: 'SIGABRT' }]) {
+    assert.equal(sanitizeSignedStagingProcessDiagnostic({ ...value, ...extra }), null);
+  }
+});
+
+test('real stderr stream drains beyond scan cap and never stitches a literal across discarded bytes', async () => {
+  const { EventEmitter, once } = await import('node:events');
+  const { PassThrough } = await import('node:stream');
+  const child = new EventEmitter(); child.stderr = new PassThrough();
+  const read = observeSignedStagingProcess(child), ended = once(child.stderr, 'end');
+  child.stderr.write(Buffer.alloc(65536 - 8, 120));
+  child.stderr.write(Buffer.from('sandbox_')); child.stderr.write(Buffer.from('apply:'));
+  child.stderr.end(Buffer.alloc(128 * 1024)); await ended;
+  const result = read();
+  assert.equal(result.stderrBytesScanned, 65536); assert.equal(result.stderrTruncated, true);
+  assert.equal(result.stderrComplete, true); assert.equal(result.sandboxApplyMessage, false);
 });

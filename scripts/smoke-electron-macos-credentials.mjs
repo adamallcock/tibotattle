@@ -11,7 +11,7 @@ import { exerciseEmptyProfileSettings } from './smoke-electron-macos-empty-profi
 import { validateSparkleTransitionHost, signedMacTransitionEnvironment,
   assertExtractedSignedMacBundle, verifySparkleTransitionCandidate } from './smoke-electron-macos-sparkle-transition.mjs';
 import { ELECTRON_020_DMG, verifyPredecessor, refreshProductionUpdateArchiveIndex } from './smoke-electron-macos-production-update.mjs';
-import { launchVerifiedMacSharingApp, stopOwnedMacSharingApp, signedStagingFixture, sanitizeSignedStagingNativeIntroDiagnostic } from './run-signed-electron-staging.mjs';
+import { launchVerifiedMacSharingApp, stopOwnedMacSharingApp, signedStagingFixture, sanitizeSignedStagingNativeIntroDiagnostic, sanitizeSignedStagingProcessDiagnostic } from './run-signed-electron-staging.mjs';
 import { CREDENTIAL_FIXTURE_CASES, CREDENTIAL_FIXTURE_REQUIREMENT } from './prepare-electron-macos-credential-fixture.mjs';
 import { inspectMacOSLoopbackEnforcement, MACOS_LOOPBACK_MODE } from './lib/macos-loopback-qualification.mjs';
 
@@ -259,6 +259,7 @@ export function macCredentialFailureDiagnostics(error) {
   const settingsCodes = ['settings_tab', 'settings_ready', 'settings_click', 'settings_effect'];
   return {
     launchStage: launchStages.includes(error?.signedLaunchStage) ? error.signedLaunchStage : null,
+    process: sanitizeSignedStagingProcessDiagnostic(error?.signedProcessDiagnostic),
     nativeIntro: sanitizeSignedStagingNativeIntroDiagnostic(error?.signedNativeIntroDiagnostic),
     launchCode: launchCodes.includes(error?.stage) ? error.stage : null,
     settingsStage: settingsCodes.includes(error?.emptyProfileStage) ? error.emptyProfileStage : null,
