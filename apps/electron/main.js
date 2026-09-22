@@ -368,6 +368,21 @@ function emitEntryFailureDiagnostic(writeDiagnostic = process.stderr?.write?.bin
   }
 }
 
+function quitAfterEntryFailure({ app, dialog, writeDiagnostic } = {}) {
+  emitEntryFailureDiagnostic(writeDiagnostic);
+  try {
+    // showErrorBox works before app readiness. Keep the copy fixed: a startup
+    // exception may contain private paths, account data, or child output.
+    dialog?.showErrorBox?.(
+      "TiboTattle could not start",
+      `TiboTattle stopped before opening the dashboard.\n\nSupport code: ${ELECTRON_ENTRY_FAILURE_DIAGNOSTIC}\n\nPlease report this code with the app and operating system versions. Preserve your local data.`,
+    );
+  } catch {
+    // A missing or broken native dialog must not prevent fail-closed shutdown.
+  }
+  app?.quit?.();
+}
+
 function isCompanionProcessLifecycleEvent(value) {
   return value !== null
     && typeof value === "object"
@@ -1316,8 +1331,11 @@ export async function launchElectronShell({
   } catch (error) {
     // This includes platform-gate and dependency/configuration failures that
     // occur before the lifecycle owns a shutdown path.
-    if (emitFailureDiagnostic) emitEntryFailureDiagnostic(writeDiagnostic);
-    app.quit?.();
+    if (emitFailureDiagnostic) {
+      quitAfterEntryFailure({ app, dialog: runtime.dialog, writeDiagnostic });
+    } else {
+      app.quit?.();
+    }
     throw error;
   }
 }
@@ -1332,8 +1350,7 @@ if (process.versions.electron) {
     // an ESM main process an unawaited launch can lose the race with `ready`.
     startupPreparation = await prepareElectronShellBootstrap({ electron: runtime });
   } catch {
-    emitEntryFailureDiagnostic();
-    runtime?.app?.quit?.();
+    quitAfterEntryFailure({ app: runtime?.app, dialog: runtime?.dialog });
     process.exitCode = 1;
   }
   if (startupPreparation !== undefined) {

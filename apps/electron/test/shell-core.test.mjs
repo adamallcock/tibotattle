@@ -4053,6 +4053,7 @@ test("desktop lifecycle cancels an in-flight retry before quit and serializes sh
 test("Electron entry quits explicitly when composition fails before lifecycle ownership", async () => {
   const app = new FakeApp();
   const events = [];
+  const alerts = [];
   app.quit = () => {
     events.push("quit");
     app.quitCalls += 1;
@@ -4060,7 +4061,15 @@ test("Electron entry quits explicitly when composition fails before lifecycle ow
   const diagnostics = [];
   await assert.rejects(
     launchElectronShell({
-      electron: { app },
+      electron: {
+        app,
+        dialog: {
+          showErrorBox(title, message) {
+            events.push("alert");
+            alerts.push({ title, message });
+          },
+        },
+      },
       emitFailureDiagnostic: true,
       writeDiagnostic: (value) => {
         events.push("diagnostic");
@@ -4070,15 +4079,28 @@ test("Electron entry quits explicitly when composition fails before lifecycle ow
     electronEntryCompositionFailure,
   );
   assert.deepEqual(diagnostics, [`${ELECTRON_ENTRY_FAILURE_DIAGNOSTIC}\n`]);
-  assert.deepEqual(events, ["diagnostic", "quit"]);
+  assert.deepEqual(alerts, [{
+    title: "TiboTattle could not start",
+    message: `TiboTattle stopped before opening the dashboard.\n\nSupport code: ${ELECTRON_ENTRY_FAILURE_DIAGNOSTIC}\n\nPlease report this code with the app and operating system versions. Preserve your local data.`,
+  }]);
+  assert.deepEqual(events, ["diagnostic", "alert", "quit"]);
   assert.equal(app.quitCalls, 1);
 });
 
-test("Electron entry still quits when its fixed diagnostic cannot be written", async () => {
+test("Electron entry still quits when its fixed diagnostic and native alert fail", async () => {
   const app = new FakeApp();
+  let alertCalls = 0;
   await assert.rejects(
     launchElectronShell({
-      electron: { app },
+      electron: {
+        app,
+        dialog: {
+          showErrorBox() {
+            alertCalls += 1;
+            throw new Error("synthetic native dialog failure");
+          },
+        },
+      },
       emitFailureDiagnostic: true,
       writeDiagnostic() {
         throw new Error("synthetic diagnostic failure");
@@ -4086,6 +4108,7 @@ test("Electron entry still quits when its fixed diagnostic cannot be written", a
     }),
     electronEntryCompositionFailure,
   );
+  assert.equal(alertCalls, 1);
   assert.equal(app.quitCalls, 1);
 });
 
