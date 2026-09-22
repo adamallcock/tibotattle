@@ -7,7 +7,9 @@ import { fileURLToPath } from "node:url";
 import {
   FIXED_STATUS,
   WINDOWS_SECURITY_QUALIFICATION_TEST_FILES,
+  formatQualificationFailureDiagnostic,
   parseTapSummary,
+  parseTapFailureDiagnostic,
   readVerifiedBindingManifest,
   qualificationReceiptMetadata,
   qualificationTestFiles,
@@ -223,5 +225,52 @@ test("qualification TAP receipts reject skips and malformed summaries", () => {
   assert.throws(
     () => parseTapSummary("# tests 1\n# pass 1"),
     (error) => error.code === FIXED_STATUS.resultInvalid,
+  );
+});
+
+test("qualification TAP failure diagnostics retain only bounded structural indexes", () => {
+  const canary = "PRIVATE-TAP-TITLE C:\\Users\\PRIVATE\\secret.txt";
+  const output = [
+    "TAP version 13",
+    `not ok 4 - ${canary}`,
+    "  ---",
+    "  duration_ms: 0.12",
+    "  location: '/private/tmp/PRIVATE/test/model-performance.test.js:123:4'",
+    "  failureType: 'testCodeFailure'",
+    "  ...",
+    "1..18",
+  ].join("\n");
+  const diagnostic = parseTapFailureDiagnostic(output);
+  assert.deepEqual(diagnostic, { fileIndex: 1, testOrdinal: 4 });
+  const formatted = formatQualificationFailureDiagnostic(diagnostic);
+  assert.equal(formatted, "file_index=1 test_ordinal=4");
+  assert.doesNotMatch(formatted, /PRIVATE|secret|Users|TAP/u);
+
+  const fileOnly = parseTapFailureDiagnostic([
+    "not ok 14 - PRIVATE-FILE-FAILURE",
+    "  ---",
+    "  location: 'C:\\runner\\_work\\repo\\test\\windows-filesystem-security.test.js:8:2'",
+    "  ...",
+  ].join("\n"));
+  assert.deepEqual(fileOnly, { fileIndex: 14, testOrdinal: 14 });
+
+  const unknown = parseTapFailureDiagnostic([
+    "not ok 1 - PRIVATE-FAILURE",
+    "  ---",
+    "  location: 'C:\\Users\\PRIVATE\\unapproved.test.js:1:2'",
+    "  ...",
+  ].join("\n"));
+  assert.deepEqual(unknown, { fileIndex: null, testOrdinal: 1 });
+  assert.deepEqual(
+    parseTapFailureDiagnostic("not ok 3 - PRIVATE-WITHOUT-LOCATION\n  ..."),
+    { fileIndex: null, testOrdinal: 3 },
+  );
+  assert.equal(
+    formatQualificationFailureDiagnostic({
+      fileIndex: 999_999,
+      testOrdinal: 1_000_000,
+      title: canary,
+    }),
+    "file_index=unavailable test_ordinal=unavailable",
   );
 });

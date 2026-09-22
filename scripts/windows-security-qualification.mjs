@@ -57,6 +57,10 @@ export const WINDOWS_SECURITY_QUALIFICATION_TEST_FILES = QUALIFICATION_TEST_FILE
 const QUALIFICATION_ENVIRONMENT = "USAGE_MONITOR_WINDOWS_QUALIFICATION";
 const QUALIFICATION_REVISION_ENVIRONMENT = "TIBOTATTLE_QUALIFICATION_REVISION";
 const QUALIFICATION_CACHE_MODE_ENVIRONMENT = "TIBOTATTLE_QUALIFICATION_CACHE_MODE";
+const MAXIMUM_TAP_FAILURE_TEST_ORDINAL = 999_999;
+const QUALIFICATION_FILE_INDEX = new Map(
+  QUALIFICATION_TEST_FILES.map((file, index) => [file, index + 1]),
+);
 
 export const FIXED_STATUS = Object.freeze({
   passed: "WINDOWS_SECURITY_QUALIFICATION_PASSED",
@@ -212,6 +216,88 @@ export function parseTapSummary(output) {
   return result;
 }
 
+const QUALIFICATION_FAILURE_DIAGNOSTIC_FORMAT = /^file_index=(?:unavailable|[1-9]\d{0,2}) test_ordinal=(?:unavailable|[1-9]\d{0,5})$/u;
+const TAP_FAILURE_RESULT = /^not ok ([1-9]\d{0,6})(?:\s+-[^\r\n]*)?$/u;
+const TAP_RESULT = /^(?:ok|not ok) [1-9]\d{0,6}(?:\s+-[^\r\n]*)?$/u;
+const TAP_LOCATION = /^\s+location:\s+(['"])([^'"\r\n]{1,2048})\1$/u;
+
+function boundedTapFailureOrdinal(value) {
+  const ordinal = Number.parseInt(value, 10);
+  return Number.isSafeInteger(ordinal)
+      && ordinal >= 1
+      && ordinal <= MAXIMUM_TAP_FAILURE_TEST_ORDINAL
+    ? ordinal
+    : null;
+}
+
+function fileIndexFromTapLocation(location) {
+  if (typeof location !== "string") return null;
+  const normalized = location.replaceAll("\\", "/");
+  for (const [file, index] of QUALIFICATION_FILE_INDEX) {
+    const marker = `/${file}:`;
+    const markerIndex = normalized.lastIndexOf(marker);
+    if (markerIndex < 0) continue;
+    const lineAndColumn = normalized.slice(markerIndex + marker.length);
+    if (/^\d{1,9}:\d{1,9}$/u.test(lineAndColumn)) return index;
+  }
+  return null;
+}
+
+/**
+ * Extract only bounded structural information from a failed, flat Node TAP
+ * stream. The test ordinal is the first global TAP `not ok` ordinal. The file
+ * index is one-based and refers to the fixed, reviewed qualification file
+ * order above, recovered only from a matching YAML location suffix. Test
+ * titles, arbitrary paths, and assertion output are deliberately ignored.
+ */
+export function parseTapFailureDiagnostic(output) {
+  const empty = Object.freeze({ fileIndex: null, testOrdinal: null });
+  if (typeof output !== "string" || output.length > 5_000_000) return empty;
+
+  let failureOrdinal = null;
+  let failureBlock = false;
+  for (const line of output.split(/\r?\n/u)) {
+    if (!failureBlock) {
+      const failure = TAP_FAILURE_RESULT.exec(line);
+      if (!failure) continue;
+      failureBlock = true;
+      failureOrdinal = boundedTapFailureOrdinal(failure[1]);
+      continue;
+    }
+
+    const location = TAP_LOCATION.exec(line);
+    if (location) {
+      return Object.freeze({
+        fileIndex: fileIndexFromTapLocation(location[2]),
+        testOrdinal: failureOrdinal,
+      });
+    }
+    // Do not scan into the next TAP result or a later test's YAML payload.
+    if (TAP_RESULT.test(line) || /^\s+\.\.\.$/u.test(line)) break;
+  }
+  return failureBlock
+    ? Object.freeze({ fileIndex: null, testOrdinal: failureOrdinal })
+    : empty;
+}
+
+/** Format only the fixed, bounded fields permitted in a qualification receipt. */
+export function formatQualificationFailureDiagnostic(value) {
+  const fileIndex = Number.isSafeInteger(value?.fileIndex)
+      && value.fileIndex >= 1
+      && value.fileIndex <= QUALIFICATION_TEST_FILES.length
+    ? value.fileIndex
+    : null;
+  const testOrdinal = Number.isSafeInteger(value?.testOrdinal)
+      && value.testOrdinal >= 1
+      && value.testOrdinal <= MAXIMUM_TAP_FAILURE_TEST_ORDINAL
+    ? value.testOrdinal
+    : null;
+  const formatted = `file_index=${fileIndex ?? "unavailable"} test_ordinal=${testOrdinal ?? "unavailable"}`;
+  return QUALIFICATION_FAILURE_DIAGNOSTIC_FORMAT.test(formatted)
+    ? formatted
+    : "file_index=unavailable test_ordinal=unavailable";
+}
+
 function runNodeTests(files, {
   environment = process.env,
   cwd = REPOSITORY_ROOT,
@@ -235,8 +321,8 @@ function runNodeTests(files, {
 
     // Do not forward stdout/stderr. A failing native assertion may include a
     // path, SID, account name, or secret-shaped value even when the test was
-    // intended to be content-free. The fixed status below is the only output
-    // this harness emits.
+    // intended to be content-free. The fixed status and bounded structural
+    // diagnostic below are the only output this harness emits.
     let stdout = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
@@ -244,7 +330,11 @@ function runNodeTests(files, {
       if (stdout.length > 5_000_000) child.kill();
     });
     child.stderr.resume();
-    child.once("error", () => rejectRun(fixedError(FIXED_STATUS.failed)));
+    child.once("error", () => {
+      const error = fixedError(FIXED_STATUS.failed);
+      error.diagnostic = formatQualificationFailureDiagnostic(null);
+      rejectRun(error);
+    });
     child.once("close", (code) => {
       if (code === 0) {
         try {
@@ -253,7 +343,11 @@ function runNodeTests(files, {
           rejectRun(error);
         }
       } else {
-        rejectRun(fixedError(FIXED_STATUS.failed));
+        const error = fixedError(FIXED_STATUS.failed);
+        error.diagnostic = formatQualificationFailureDiagnostic(
+          parseTapFailureDiagnostic(stdout),
+        );
+        rejectRun(error);
       }
     });
   });
@@ -311,7 +405,14 @@ export async function main() {
     const status = error?.code && Object.values(FIXED_STATUS).includes(error.code)
       ? error.code
       : FIXED_STATUS.failed;
-    console.error(status);
+    const diagnostic = error?.diagnostic;
+    console.error([
+      status,
+      typeof diagnostic === "string"
+        && QUALIFICATION_FAILURE_DIAGNOSTIC_FORMAT.test(diagnostic)
+        ? diagnostic
+        : null,
+    ].filter(Boolean).join(" "));
     process.exitCode = 1;
   }
 }
