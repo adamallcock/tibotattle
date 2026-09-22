@@ -43,8 +43,10 @@ import {
 } from "../src/local-unified-index-build.js";
 import {
   extractRolloutUsage,
+  extractRolloutWorkContexts,
   parseCompactionPrefix,
   resolveLogicalRolloutHeads,
+  rolloutContentQuarantineReason,
   salvagePartialTokenCount,
 } from "../src/local-unified-index-extract.js";
 import {
@@ -2139,7 +2141,7 @@ for (const history of ["reset", "anchored-null"]) {
             FROM usage_event u JOIN parser_version p ON p.id = u.parser_version_id
             WHERE u.observed_at_ms = ?`).get(Date.parse("2026-07-25T01:00:01.000Z"));
           assert.equal(stamp.parser_version, history === "reset"
-            ? "unified-rollout-typed-v17-parent-model" : LOCAL_UNIFIED_INDEX_PARSER_VERSION);
+            ? "unified-rollout-typed-v18-parent-model" : LOCAL_UNIFIED_INDEX_PARSER_VERSION);
         } finally { provenance.close(); }
 
         if (pipeline !== "incremental") return;
@@ -3390,6 +3392,307 @@ test("a rerun is idempotent: the same source produces the same event keys", asyn
     const second = await inspectLocalUnifiedIndex({ indexFile: join(root, "index.sqlite") });
     assert.equal(second.usageEvents, first.usageEvents);
     assert.deepEqual(second.models, first.models);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+for (const outerType of ["item_completed", "event_msg"]) {
+test(`oversized ${outerType} content markers cannot quarantine or alter accounting carry`, async () => {
+  const unrelated = JSON.stringify({
+    timestamp: "2026-07-25T00:00:02.000Z",
+    type: outerType,
+    payload: {
+      type: "item_completed",
+      nested: {
+        type: "turn_context",
+        model: "gpt-5.6-terra",
+        effort: "low",
+        other: { type: "token_count", total_token_usage: usage(90_000, 9_000) },
+        settings: { type: "thread_settings_applied", service_tier: "priority" },
+      },
+      padding: "x".repeat(600 * 1024),
+    },
+  });
+  const name = "rollout-2026-07-25T00-00-00-markers.jsonl";
+  const { root, sessions } = await corpus({
+    [name]: [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol", "high"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      unrelated,
+      tokenCount("2026-07-25T00:00:03.000Z", usage(150, 15), usage(50, 5)),
+    ],
+  });
+  try {
+    const path = join(sessions, name);
+    const events = [];
+    const extracted = await extractRolloutUsage(path, {
+      size: (await stat(path)).size,
+      onEvent: (event) => events.push(event),
+    });
+    assert.equal(extracted.read.oversizedLines, 1);
+    assert.equal(rolloutContentQuarantineReason(extracted), null);
+    assert.equal(extracted.diagnostics.malformedAccountingRecords, 0);
+    assert.equal(extracted.diagnostics.salvagedRecords, 0);
+    assert.equal(extracted.diagnostics.turnContexts, 1);
+    assert.deepEqual(events.map((event) => ({
+      model: event.model,
+      effort: event.reasoningEffort,
+      input: event.components.inputUncachedTokens,
+      output: event.components.outputTextTokens,
+    })), [
+      { model: "gpt-5.6-sol", effort: "high", input: 100, output: 10 },
+      { model: "gpt-5.6-sol", effort: "high", input: 50, output: 5 },
+    ]);
+    const built = await build(root);
+    assert.equal(built.generation.status, "complete");
+    assert.equal(built.generation.skippedSourceCount, 0);
+    assert.equal(built.usageEvents, 2);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const rows = database.prepare(`
+        SELECT b.turn_context_before FROM usage_event u
+        LEFT JOIN usage_event_boundary b ON u.event_key = b.current_event_key
+        ORDER BY u.source_offset`).all();
+      assert.equal(rows.length, 2);
+      assert.equal(rows[0].turn_context_before, 1);
+      assert.equal(rows[1].turn_context_before, null);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+}
+
+for (const [label, record] of [
+  ["malformed accounting", '{"timestamp":"2026-07-25T00:00:02.000Z","type":"event_msg","payload":{"type":"token_count"'],
+  ["oversized accounting", JSON.stringify({
+    timestamp: "2026-07-25T00:00:02.000Z", type: "turn_context",
+    payload: { padding: "x".repeat(600 * 1024), model: "gpt-5.6-terra" },
+  })],
+  ["unknown oversized outer type", JSON.stringify({
+    timestamp: "2026-07-25T00:00:02.000Z", type: "unknown_future_record",
+    payload: { padding: "x".repeat(600 * 1024) },
+  })],
+  ["oversized event without a visible payload discriminator", JSON.stringify({
+    timestamp: "2026-07-25T00:00:02.000Z", type: "event_msg",
+    payload: { padding: "x".repeat(600 * 1024), type: "token_count" },
+  })],
+  ["duplicate oversized outer discriminator", '{"timestamp":"2026-07-25T00:00:02.000Z","type":"item_completed","type":"turn_context","payload":{"padding":"'
+    + "x".repeat(600 * 1024) + '"}}'],
+]) {
+test(`${label} remains quarantined instead of certifying complete accounting`, async () => {
+  const name = "rollout-2026-07-25T00-00-00-invalid-header.jsonl";
+  const { root, sessions } = await corpus({
+    [name]: [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      record,
+    ],
+  });
+  try {
+    const path = join(sessions, name);
+    const extracted = await extractRolloutUsage(path, {
+      size: (await stat(path)).size,
+      onEvent() {},
+    });
+    assert.equal(rolloutContentQuarantineReason(extracted), "codex_rollout_content_invalid");
+    const built = await build(root);
+    assert.equal(built.generation.status, "partial");
+    assert.equal(built.generation.skippedSourceCount, 1);
+    assert.equal(built.generation.issueCounts.codex_rollout_content_invalid.sourceCount, 1);
+    assert.equal(built.usageEvents, 0);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+}
+
+test("structural classification preserves whitespace, escaped discriminators, and complete payload-first accounting", async () => {
+  const name = "rollout-2026-07-25T00-00-00-structural.jsonl";
+  const escaped = '{ "timestamp" : "2026-07-25T00:00:01.000Z", "ty\\u0070e" : "event_msg", '
+    + '"payload" : { "type" : "item_\\u0063ompleted", "nested" : { "type" : "turn_context", "model" : "gpt-5.6-terra" }, "padding" : "'
+    + "x".repeat(600 * 1024) + '" } }';
+  const payloadFirst = JSON.stringify({
+    payload: { model: "gpt-5.6-sol", effort: "medium" },
+    timestamp: "2026-07-25T00:00:02.000Z",
+    type: "turn_context",
+  });
+  const { root, sessions } = await corpus({
+    [name]: [
+      sessionMeta(THREAD_ONE),
+      escaped,
+      payloadFirst,
+      tokenCount("2026-07-25T00:00:03.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  try {
+    const path = join(sessions, name);
+    const events = [];
+    const result = await extractRolloutUsage(path, {
+      size: (await stat(path)).size,
+      onEvent: (event) => events.push(event),
+    });
+    assert.equal(rolloutContentQuarantineReason(result), null);
+    assert.equal(result.read.oversizedLines, 1);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].model, "gpt-5.6-sol");
+    assert.equal(events[0].reasoningEffort, "medium");
+    assert.equal(events[0].components.inputUncachedTokens, 100);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("malformed unrelated content with accounting markers preserves workspace and quota carry", async () => {
+  const name = "rollout-2026-07-25T00-00-00-work-context.jsonl";
+  const malformedUnrelated = '{"timestamp":"2026-07-25T00:00:02.000Z","type":"event_msg",'
+    + '"payload":{"type":"item_completed","nested":{"type":"turn_context","cwd":"/synthetic/poison"},';
+  const oversizedUnrelated = JSON.stringify({
+    timestamp: "2026-07-25T00:00:02.500Z",
+    type: "event_msg",
+    payload: {
+      type: "item_completed",
+      nested: { type: "token_count", info: { total_token_usage: usage(999, 99) } },
+      context: { type: "turn_context", cwd: "/synthetic/poison" },
+      padding: "x".repeat(600 * 1024),
+    },
+  });
+  const { root, sessions } = await corpus({
+    [name]: [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10), { usedPercent: 12 }),
+      malformedUnrelated,
+      oversizedUnrelated,
+      tokenCount("2026-07-25T00:00:03.000Z", usage(100, 10), usage(0, 0), { usedPercent: 13 }),
+    ],
+  });
+  try {
+    const path = join(sessions, name);
+    const size = (await stat(path)).size;
+    const contexts = [];
+    const quotaOnly = [];
+    await extractRolloutWorkContexts(path, {
+      end: size,
+      onContext: (row) => contexts.push(row),
+      onQuotaOnly: (row) => quotaOnly.push(row),
+    });
+    assert.deepEqual(contexts.map((row) => row.cwd), ["/Users/nobody/project", "/Users/nobody/project"]);
+    assert.deepEqual(quotaOnly, [{ offset: size }]);
+    const events = [];
+    const result = await extractRolloutUsage(path, {
+      size,
+      onEvent: (event) => events.push(event),
+    });
+    assert.equal(rolloutContentQuarantineReason(result), null);
+    assert.equal(result.diagnostics.malformedAccountingRecords, 0);
+    assert.equal(events.length, 2);
+    assert.equal(events[0].components.inputUncachedTokens, 100);
+    assert.equal(events[0].components.outputTextTokens, 10);
+    assert.equal(events[1].components, null, "a repeated snapshot contributes quota only");
+    assert.equal(events[1].quota.length, 1);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("blank and whitespace-only rollout lines do not quarantine accounting or invalidate workspace carry", async () => {
+  const name = "rollout-2026-07-25T00-00-00-blank-lines.jsonl";
+  const { root, sessions } = await corpus({
+    [name]: [
+      "", " \t\r ",
+      sessionMeta(THREAD_ONE),
+      "", "   ",
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      "\t",
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      "",
+    ],
+  });
+  try {
+    const path = join(sessions, name);
+    const size = (await stat(path)).size;
+    const events = [];
+    const extracted = await extractRolloutUsage(path, { size, onEvent: (event) => events.push(event) });
+    assert.equal(rolloutContentQuarantineReason(extracted), null);
+    assert.equal(extracted.diagnostics.malformedAccountingRecords, 0);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].components.inputUncachedTokens, 100);
+    const contexts = [];
+    await extractRolloutWorkContexts(path, { end: size, onContext: (row) => contexts.push(row) });
+    assert.deepEqual(contexts.map((row) => row.cwd), ["/Users/nobody/project", "/Users/nobody/project"]);
+    assert.equal((await build(root)).generation.status, "complete");
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+for (const duplicate of ["outer type", "outer payload", "payload type"]) {
+test(`complete accounting with duplicate ${duplicate} after a container follows the parsed effective discriminator`, async () => {
+  const timestamp = '"timestamp":"2026-07-25T00:00:01.000Z"';
+  const info = JSON.stringify({ total_token_usage: usage(100, 10), last_token_usage: usage(100, 10) });
+  const payload = `{"type":"token_count","info":${info}}`;
+  const record = duplicate === "outer type"
+    ? `{${timestamp},"type":"item_completed","content":{},"type":"event_msg","payload":${payload}}`
+    : duplicate === "outer payload"
+      ? `{${timestamp},"type":"event_msg","payload":{"type":"item_completed","content":{}},"payload":${payload}}`
+      : `{${timestamp},"type":"event_msg","payload":{"type":"item_completed","content":{},"type":"token_count","info":${info}}}`;
+  assert.equal(JSON.parse(record).type, "event_msg");
+  assert.equal(JSON.parse(record).payload.type, "token_count");
+  const name = "rollout-2026-07-25T00-00-00-effective-type.jsonl";
+  const { root, sessions } = await corpus({
+    [name]: [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      record,
+    ],
+  });
+  try {
+    const path = join(sessions, name);
+    const events = [];
+    const extracted = await extractRolloutUsage(path, {
+      size: (await stat(path)).size,
+      onEvent: (event) => events.push(event),
+    });
+    assert.equal(rolloutContentQuarantineReason(extracted), null);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].model, "gpt-5.6-sol");
+    assert.equal(events[0].components.inputUncachedTokens, 100);
+    assert.equal(events[0].components.outputTextTokens, 10);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+}
+
+test("malformed complete context with an unknown prefix clears cwd with and without quota callbacks", async () => {
+  const name = "rollout-2026-07-25T00-00-00-malformed-context.jsonl";
+  const { root, sessions } = await corpus({
+    [name]: [
+      sessionMeta(THREAD_ONE),
+      '{"payload":{"cwd":"/synthetic/changed"},"type":"turn_context"',
+    ],
+  });
+  try {
+    const path = join(sessions, name);
+    const size = (await stat(path)).size;
+    for (const withQuota of [false, true]) {
+      const contexts = [];
+      const quotaOnly = [];
+      await extractRolloutWorkContexts(path, {
+        end: size,
+        onContext: (row) => contexts.push(row),
+        ...(withQuota ? { onQuotaOnly: (row) => quotaOnly.push(row) } : {}),
+      });
+      assert.deepEqual(contexts.map((row) => row.cwd), ["/Users/nobody/project", null]);
+      assert.equal(contexts[1].offset, size);
+      assert.deepEqual(quotaOnly, []);
+    }
   } finally {
     await rm(root, { recursive: true });
   }
@@ -6563,6 +6866,115 @@ test("a v5 development cursor cold-rebuilds into v10 rollout identity", async ()
       assert.equal(cursor.parser_version, LOCAL_UNIFIED_INDEX_PARSER_VERSION);
     } finally {
       database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a parser-version bump heals unchanged content and dependent lineage quarantines exactly once", async () => {
+  const parentName = canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE);
+  const childName = canonicalRolloutName("2026-07-25T01-00-00", THREAD_TWO);
+  const unrelated = JSON.stringify({
+    timestamp: "2026-07-25T00:00:02.000Z",
+    type: "event_msg",
+    payload: {
+      type: "item_completed",
+      nested: { type: "turn_context", model: "gpt-5.6-terra" },
+      padding: "x".repeat(600 * 1024),
+    },
+  });
+  const { root, sessions } = await corpus({
+    [parentName]: [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      unrelated,
+    ],
+    [childName]: [
+      sessionMeta(THREAD_TWO, { parentId: THREAD_ONE }),
+      turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T01:00:01.000Z", usage(50, 5), usage(50, 5)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const ingest = () => ingestLocalUnifiedIndexIncrement({
+    codexHome: root,
+    indexFile,
+    secretFile: join(root, "salt"),
+    contractVersion: CONTRACT,
+  });
+  try {
+    const built = await build(root);
+    assert.equal(built.generation.status, "complete");
+    assert.equal(built.usageEvents, 2);
+    const before = await Promise.all([parentName, childName].map(async (name) => {
+      const path = join(sessions, name);
+      return { content: await readFile(path), metadata: await stat(path) };
+    }));
+
+    // Seed the historical false-positive state without changing either source:
+    // the parent was content-quarantined, so its child had no available lineage.
+    // Keep physical identity/state tokens intact to prove the version change is
+    // what schedules both unchanged files for re-derivation.
+    const old = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    try {
+      const sources = old.prepare(`
+        SELECT source_local FROM usage_event ORDER BY observed_at_ms`).all();
+      old.prepare("UPDATE parser_version SET parser_version = 'unified-rollout-typed-v17'").run();
+      for (const [index, source] of sources.entries()) {
+        old.prepare(`UPDATE source_cursor SET scanned_bytes = 0, quarantine_code = ?
+          WHERE source_local = ?`).run(index === 0
+          ? "codex_rollout_content_invalid" : "codex_rollout_lineage_invalid", source.source_local);
+      }
+      old.exec("DELETE FROM usage_event_boundary; DELETE FROM usage_event; DELETE FROM lineage_snapshot;");
+      assert.deepEqual(old.prepare(`SELECT quarantine_code FROM source_cursor
+        ORDER BY quarantine_code`).all().map((row) => row.quarantine_code), [
+        "codex_rollout_content_invalid", "codex_rollout_lineage_invalid",
+      ]);
+    } finally {
+      old.close();
+    }
+
+    const healed = await ingest();
+    assert.equal(healed.sourcesReparsedForParserVersion, 2);
+    assert.equal(healed.sourcesRescanned, 2);
+    assert.equal(healed.insertedUsageEvents, 2);
+    assert.equal(healed.totalUsageEvents, 2);
+    assert.equal(healed.generation.status, "complete");
+    assert.equal(healed.generation.skippedSourceCount, 0);
+
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    let projection;
+    try {
+      assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM source_cursor
+        WHERE quarantine_code IS NOT NULL`).get().count, 0);
+      const totals = database.prepare(`SELECT SUM(tokens_in_uncached) AS input,
+        SUM(tokens_out_text) AS output FROM usage_event`).get();
+      assert.equal(totals.input, 150);
+      assert.equal(totals.output, 15);
+      projection = logicalProjection(database);
+    } finally {
+      database.close();
+    }
+    const settled = await ingest();
+    assert.equal(settled.sourcesReparsedForParserVersion, 0);
+    assert.equal(settled.sourcesSkipped, 2);
+    assert.equal(settled.insertedUsageEvents, 0);
+    assert.equal(settled.totalUsageEvents, 2);
+    const repeated = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.deepEqual(logicalProjection(repeated), projection);
+    } finally {
+      repeated.close();
+    }
+    for (const [index, name] of [parentName, childName].entries()) {
+      const path = join(sessions, name);
+      assert.deepEqual(await readFile(path), before[index].content);
+      const after = await stat(path);
+      assert.equal(after.size, before[index].metadata.size);
+      assert.equal(after.mtimeMs, before[index].metadata.mtimeMs);
+      assert.equal(after.ino, before[index].metadata.ino);
     }
   } finally {
     await rm(root, { recursive: true });

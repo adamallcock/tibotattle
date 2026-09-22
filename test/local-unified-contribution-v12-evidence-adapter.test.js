@@ -86,7 +86,7 @@ test("local evidence maps reviewed boundary rows to the four masks", () => {
   assert.equal(isTelemetryV12BoundaryParserVersion("unified-rollout-typed-v14"), false);
 });
 
-test("local evidence accepts qualified v15/v16 variants but withholds unknown provenance", () => {
+test("local evidence accepts retained variants but withholds unknown provenance", () => {
   const rows = [
     row("v15", {
       parserVersion: "unified-rollout-typed-v15-parent-model-partial",
@@ -97,7 +97,7 @@ test("local evidence accepts qualified v15/v16 variants but withholds unknown pr
     row("unknown", {
       eventTime: `${DAY}T12:01:00.000Z`,
       sourceOffset: 200,
-      parserVersion: "unified-rollout-typed-v18",
+      parserVersion: "unified-rollout-typed-v19",
       boundary: boundary(1),
     }),
     row("bad-boundary", {
@@ -205,4 +205,29 @@ test("an incomplete boundary join keeps missing relations unknown", () => {
   assert.throws(() => createTelemetryV12LocalEvidenceAdapter({
     rows: [value], boundaryLookupComplete: "yes",
   }));
+});
+
+
+test("v18 boundary evidence keeps reviewed v17/v18 provenance coherent without relabeling rows", () => {
+  for (const version of [17, 18]) {
+    for (const suffix of ["", "-partial", "-parent-model", "-parent-model-partial"]) {
+      for (const assumption of ["", "-cache-write-zero"]) {
+        const parserVersion = `unified-rollout-typed-v${version}${suffix}${assumption}`;
+        const value = row(`v${version}-qualified`, { parserVersion,
+          boundary: boundary(3, { parserVersion }) });
+        assert.deepEqual(evidence(complete([value]), value),
+          { boundaryFlags: 3, tieOrder: 0 }, parserVersion);
+        assert.equal(value.parserVersion, parserVersion);
+      }
+    }
+  }
+  const previous = row("previous", { sourceOffset: 100,
+    parserVersion: "unified-rollout-typed-v17",
+    boundary: boundary(1, { parserVersion: "unified-rollout-typed-v17" }) });
+  const current = row("current", { sourceOffset: 101,
+    parserVersion: "unified-rollout-typed-v18",
+    boundary: boundary(2, { parserVersion: "unified-rollout-typed-v18" }) });
+  const adapter = complete([current, previous]);
+  assert.deepEqual(evidence(adapter, previous), { boundaryFlags: 1, tieOrder: 0 });
+  assert.deepEqual(evidence(adapter, current), { boundaryFlags: 2, tieOrder: 1 });
 });

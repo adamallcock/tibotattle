@@ -314,7 +314,7 @@ function openImmutableLocalUnifiedIndex(indexFile) {
   });
 }
 
-const COLD_REFRESH_V17_PREDECESSOR_PARSERS = Object.freeze([
+const COLD_REFRESH_V18_PREDECESSOR_PARSERS = Object.freeze([
   "unified-rollout-typed-v10",
   "unified-rollout-typed-v11",
   "unified-rollout-typed-v12",
@@ -322,20 +322,22 @@ const COLD_REFRESH_V17_PREDECESSOR_PARSERS = Object.freeze([
   "unified-rollout-typed-v14",
   "unified-rollout-typed-v15",
   "unified-rollout-typed-v16",
+  "unified-rollout-typed-v17",
 ]);
 
 function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaVersion) {
   // This is a deadline decision, not permission to read or publish facts. The
-  // worker still validates the complete index. Only reviewed v10 through v16
-  // predecessors can receive the v17 rescan window. Their physical schema and
+  // worker still validates the complete index. Only reviewed v10 through v17
+  // predecessors can receive the v18 rescan window. Their physical schema and
   // immutable source identity remain compatible; v12 nullable counters and
   // v13 ordinal-bearing compaction headers and v14 paginated setting boundaries
   // and v15 historical parent-model fallback require reparsing present sources.
   // v16 adds the explicitly approved missing-cache-write assumption with row provenance.
   // v17 retains exact selected input/output totals without changing those assumptions.
+  // v18 fixes structural classification and increases the bounded line cap.
   // Keep the target pinned too: a future parser needs an explicit review and
   // must not silently inherit this longer deadline for every mismatch.
-  if (LOCAL_UNIFIED_INDEX_PARSER_VERSION !== "unified-rollout-typed-v17"
+  if (LOCAL_UNIFIED_INDEX_PARSER_VERSION !== "unified-rollout-typed-v18"
       || schemaVersion !== LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
       || !compatibility.metadataPresent
       || compatibility.formatUserVersion !== LOCAL_UNIFIED_INDEX_USER_VERSION
@@ -377,7 +379,7 @@ function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaV
           AND g.tool_provenance_complete = 0)
       )
   `).get(generationId);
-  return COLD_REFRESH_V17_PREDECESSOR_PARSERS.includes(generation?.parser_version)
+  return COLD_REFRESH_V18_PREDECESSOR_PARSERS.includes(generation?.parser_version)
     && generation.parser_contract_version === TELEMETRY_SCHEMA_VERSION
     && generation.contract_version === TELEMETRY_SCHEMA_VERSION
     && Number.isSafeInteger(generation.completed_at_ms)

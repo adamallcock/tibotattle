@@ -7,7 +7,7 @@ import { localCodexLogScanner } from "../src/local-node-runtime.js";
 import { extractRolloutUsage } from "../src/local-unified-index-extract.js";
 import { rebuildLocalUnifiedIndex } from "../src/local-unified-index-build.js";
 import { ingestLocalUnifiedIndexIncrement } from "../src/local-unified-index-ingest.js";
-import { LOCAL_UNIFIED_INDEX_PARSER_VERSION, openLocalUnifiedIndex, outcomeName, reasoningEffortName } from "../src/local-unified-index.js";
+import { LOCAL_UNIFIED_INDEX_PARSER_VERSION, isLocalUnifiedIndexBoundaryParserVersion, openLocalUnifiedIndex, outcomeName, reasoningEffortName } from "../src/local-unified-index.js";
 import { createTelemetryV1IndexReader } from "../src/contribution/telemetry-v1-chunks.js";
 import { createTelemetryV11Day } from "../src/contribution/index.js";
 import { usageProjection } from "../src/local-companion-usage-model.js";
@@ -200,7 +200,7 @@ test("missing cache components remain null; explicit zero remains observed acros
     const refreshed = await ingestLocalUnifiedIndexIncrement({ ...options, indexFile: incremental });
     assert.equal(refreshed.sourcesReparsedForParserVersion, 1);
     assert.deepEqual(rows(incremental), expected);
-    assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v17");
+    assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v18");
   } finally { await rm(value.root, { recursive: true }); }
 });
 
@@ -284,4 +284,22 @@ test("response totals/checkpoint copies are not additive usage and authored conf
       assert.deepEqual(absent, [], "unsupported response-only evidence is unavailable, not a fabricated zero event");
     } finally { await rm(onlyResponse.root, { recursive: true }); }
   } finally { await rm(value.root, { recursive: true }); }
+});
+
+
+test("v18 keeps reviewed historical boundary provenance and refuses unqualified variants", () => {
+  for (const version of [15, 16, 17, 18]) {
+    for (const suffix of ["", "-partial", "-parent-model", "-parent-model-partial"]) {
+      const parser = `unified-rollout-typed-v${version}${suffix}`;
+      assert.equal(isLocalUnifiedIndexBoundaryParserVersion(parser), true, parser);
+      assert.equal(isLocalUnifiedIndexBoundaryParserVersion(`${parser}-cache-write-zero`),
+        version >= 16, `${parser}-cache-write-zero`);
+    }
+  }
+  for (const parser of [null, undefined, "", "unified-rollout-typed-v14",
+    "unified-rollout-typed-v19", "unified-rollout-typed-v018",
+    "unified-rollout-typed-v18-future", "unified-rollout-typed-v18 ",
+    "unified-rollout-typed-v18-partial-parent-model"]) {
+    assert.equal(isLocalUnifiedIndexBoundaryParserVersion(parser), false, String(parser));
+  }
 });

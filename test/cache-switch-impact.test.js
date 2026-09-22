@@ -696,14 +696,14 @@ test("older parser coverage withholds both continuity and switch premiums", () =
   assert.equal(switched.coveredSubtotal, null);
 });
 
-test("retained v15/v16 parser suffixes retain cache continuity coverage after the v17 totals upgrade", () => {
+test("retained v15/v16/v17 parser suffixes retain cache continuity coverage after the v18 classification upgrade", () => {
   const retainedV15 = [
     "unified-rollout-typed-v15",
     "unified-rollout-typed-v15-partial",
     "unified-rollout-typed-v15-parent-model",
     "unified-rollout-typed-v15-parent-model-partial",
   ];
-  const currentV17 = [
+  const currentV18 = [
     LOCAL_UNIFIED_INDEX_PARSER_VERSION,
     LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
     LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
@@ -712,8 +712,9 @@ test("retained v15/v16 parser suffixes retain cache continuity coverage after th
 
   const retainedV16 = retainedV15.map((version) => version.replace("v15", "v16"))
     .flatMap((version) => [version, `${version}-cache-write-zero`]);
-  for (const parserVersion of [...retainedV15, ...retainedV16,
-    ...currentV17.flatMap((version) => [version, `${version}-cache-write-zero`])]) {
+  const retainedV17 = retainedV16.map((version) => version.replace("v16", "v17"));
+  for (const parserVersion of [...retainedV15, ...retainedV16, ...retainedV17,
+    ...currentV18.flatMap((version) => [version, `${version}-cache-write-zero`])]) {
     const continuity = analyzeCacheContinuityRows([continuityRow({
       parser_version: parserVersion,
       previous_parser_version: parserVersion,
@@ -735,8 +736,8 @@ test("retained v15/v16 parser suffixes retain cache continuity coverage after th
   }
 
   for (const parserVersion of [
-    "unified-rollout-typed-v18",
-    "unified-rollout-typed-v18-partial",
+    "unified-rollout-typed-v19",
+    "unified-rollout-typed-v19-partial",
     "unified-rollout-typed-v17-future",
   ]) {
     const continuity = analyzeCacheContinuityRows([continuityRow({

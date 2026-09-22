@@ -31,7 +31,7 @@ one another:
 | Stable filename | `local-unified-index-v1.sqlite` | Machine path continuity across app releases. |
 | Schema-family metadata | `local-unified-index-v2` | Logical family stored in `meta.schema_version`. |
 | SQLite `PRAGMA user_version` | `11` | Physical table/index/migration generation. |
-| Parser version | `unified-rollout-typed-v17` | Meaning and provenance of facts extracted from rollout sources, including ordinal-bearing compaction headers, settings pinned to paginated history boundaries, and exact selected input/output totals. |
+| Parser version | `unified-rollout-typed-v18` | Meaning and provenance of facts extracted from rollout sources, including structural record classification, a 512 KiB default line cap, paginated history boundaries, and exact selected input/output totals. |
 | Source identity version | `codex-immutable-rollout-v1` | Rules for physical rollout identity/generation. |
 
 The application id is a separate SQLite format guard. A file with the wrong
@@ -106,8 +106,8 @@ Tier, effort, cumulative counters and replay admission are unchanged.
 
 Parser v15 introduced the per-event `-parent-model` and
 `-parent-model-partial` suffixes to record the inherited assumption;
-other records use the base and `-partial` stamps. Parsers v16 and v17 retain these
-suffixes with its own version prefix. They do not reclassify legacy inline
+other records use the base and `-partial` stamps. Parsers v16, v17, and v18 retain these
+suffixes with their own version prefixes. They do not reclassify legacy inline
 inheritance. These are local provenance variants, not new physical schemas or
 telemetry fields. Cursor/generation stamps use the base parser version so warm refresh does not
 mistake an assumed-model row for an obsolete parser. Model lookup retains at
@@ -138,9 +138,21 @@ physical schema remains SQLite user version 11. Present sources are reparsed so
 the new totals can be recovered. Rotated sources retain their prior totals and
 parser provenance.
 
+Parser v18 classifies bounded records by their outer `type` and, for
+`event_msg`, the immediate `payload.type`. Nested accounting-like strings in
+unrelated records cannot make those records accounting evidence. The default
+line cap is 512 KiB; oversized accounting records still quarantine their source
+rather than authorizing publication of partial accounting facts.
+Malformed or ambiguous accounting evidence remains unavailable. Present sources
+reparse under the new stamp, including previously quarantined parent sources
+and their dependent children; absent sources keep their existing facts and
+provenance. The physical schema, source identities, replay rules, timing fields,
+and hosted contribution contracts are unchanged. Reprocessing is required before
+new facts acquire v18 provenance; changing a stored parser label is not recovery.
+
 The opt-in local contribution reader `readDayWithV12Evidence(day)` derives
 successor boundary masks and same-session/millisecond ranks from these existing
-index facts; it adds no physical columns. It uses the same exact v15/v16/v17 boundary
+index facts; it adds no physical columns. It uses the same exact v15/v16/v17/v18 boundary
 parser qualification as local cache analysis. A completed event-key boundary
 join can prove absence; an unavailable join cannot. Source generation/cursor
 ambiguity withholds order. This reader supplies evidence to dormant preparation
@@ -176,7 +188,7 @@ effort. No effective-effort carry is inferred across compaction, fork or resume.
 Actual application/eligible-mode and installed-client evidence remains a
 qualification gate, separate from catalogue recognition.
 
-The foreground companion treats verified published v10/v11/v12/v13/v14/v15/v16-to-v17
+The foreground companion treats verified published v10/v11/v12/v13/v14/v15/v16/v17-to-v18
 parser upgrades as cold work even when the physical schema is already 11. The
 target and predecessor set are deliberately closed; current, unknown, malformed
 and future parser evidence cannot obtain a longer deadline. That run receives
