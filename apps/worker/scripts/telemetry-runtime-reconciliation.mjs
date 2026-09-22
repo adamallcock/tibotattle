@@ -25,6 +25,7 @@ export const TELEMETRY_RUNTIME_DEPLOYMENT_ATTESTATION_SCHEMA =
 
 const COMMIT = /^[a-f0-9]{40}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
+const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u;
 const UUID_V4 = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
 const ADMIN_SESSION_SCHEMA = "telemetry-runtime-admin-session-v1";
 const OPERATION_SCHEMA = "telemetry-runtime-activation-operation-v1";
@@ -409,6 +410,132 @@ function activationResultShape(value, activation) {
     && value.revision === activation.expectedRevision + 1;
 }
 
+// These are the only production reads used by the terminal activation
+// recovery path. They are fixed SELECTs selected by the closed target enum;
+// the request key is always passed as a bound D1 parameter.
+const ACTIVATION_RECONCILIATION_QUERIES = Object.freeze({
+  usage_v12: `SELECT r.state AS runtime_state,
+                     r.policy_revision AS runtime_policy_revision,
+                     a.operation_id AS audit_operation_id,
+                     a.action AS audit_action,
+                     a.outcome AS audit_outcome,
+                     a.details_json AS audit_details_json
+                FROM telemetry_v12_runtime r
+                LEFT JOIN admin_action_audit a ON a.operation_id = ?
+               WHERE r.id = 1`,
+  performance: `SELECT r.state AS runtime_state,
+                       r.policy_revision AS runtime_policy_revision,
+                       a.operation_id AS audit_operation_id,
+                       a.action AS audit_action,
+                       a.outcome AS audit_outcome,
+                       a.details_json AS audit_details_json
+                  FROM telemetry_performance_runtime r
+                  LEFT JOIN admin_action_audit a ON a.operation_id = ?
+                 WHERE r.id = 1`,
+});
+
+function activationAuditDetailsMatch(details, activation) {
+  return object(details)
+    && details.schemaVersion === "telemetry-runtime-activation-v1"
+    && details.task === "telemetry_runtime_activation"
+    && details.idempotencyKey === activation.idempotencyKey
+    && details.target === activation.target
+    && details.expectedRevision === activation.expectedRevision
+    && identityDigest(details.reconciliation) === identityDigest(activation.reconciliation);
+}
+
+function exactActivationOutcome(row, activation) {
+  if (!exactKeys(row, [
+    "audit_action", "audit_details_json", "audit_operation_id", "audit_outcome",
+    "runtime_policy_revision", "runtime_state",
+  ])
+      || row.audit_operation_id !== activation.idempotencyKey
+      || row.audit_action !== "run_maintenance"
+      || !["failure", "started", "success"].includes(row.audit_outcome)
+      || !Number.isSafeInteger(row.runtime_policy_revision)
+      || !["active", "staged"].includes(row.runtime_state)
+      || typeof row.audit_details_json !== "string") {
+    return null;
+  }
+  let details;
+  try { details = JSON.parse(row.audit_details_json); } catch { return null; }
+  if (!activationAuditDetailsMatch(details, activation)) return null;
+  const expectedRevision = activation.expectedRevision;
+  const isStaged = row.runtime_state === "staged"
+    && row.runtime_policy_revision === expectedRevision;
+  const isExpectedActive = row.runtime_state === "active"
+    && row.runtime_policy_revision === expectedRevision + 1;
+  if (row.audit_outcome === "success") {
+    if (!isExpectedActive
+        || details.state !== "active"
+        || details.fromRevision !== expectedRevision
+        || details.toRevision !== expectedRevision + 1) return null;
+    return {
+      kind: "success",
+      result: {
+        task: "telemetry_runtime_activation",
+        operationId: activation.idempotencyKey,
+        target: activation.target,
+        state: "active",
+        fromRevision: expectedRevision,
+        toRevision: expectedRevision + 1,
+        revision: expectedRevision + 1,
+      },
+    };
+  }
+  // A durable failure beside the original staged revision is proof that this
+  // operation did not commit. A still-started audit may belong to a request
+  // still in flight, so it remains ambiguous and retains the operator lock.
+  if (row.audit_outcome === "failure" && isStaged) {
+    return { kind: "refused", result: { status: "refused" } };
+  }
+  return null;
+}
+
+async function readExactActivationOutcome({
+  accountId,
+  workerName,
+  activation,
+  inventory,
+  environment,
+  fetchImpl,
+}) {
+  const token = environment?.CLOUDFLARE_API_TOKEN;
+  if (typeof token !== "string" || token.length < 16) return null;
+  if (inventory?.accountId !== accountId || inventory?.workerName !== workerName) return null;
+  const bindings = inventory?.version?.resources?.bindings;
+  if (!Array.isArray(bindings)) return null;
+  const matches = bindings.filter((binding) => binding?.name === "USAGE_MONITOR_DB");
+  const binding = matches[0];
+  const databaseIds = [binding?.id, binding?.database_id].filter((value) => value !== undefined);
+  if (matches.length !== 1 || binding?.type !== "d1"
+      || databaseIds.length === 0 || databaseIds.some((value) => !UUID.test(value))
+      || new Set(databaseIds).size !== 1) return null;
+  const response = await fetchImpl(
+    `https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database/${databaseIds[0]}/query`,
+    {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        sql: ACTIVATION_RECONCILIATION_QUERIES[activation.target],
+        params: [activation.idempotencyKey],
+      }),
+      redirect: "error",
+      signal: AbortSignal.timeout(20_000),
+    },
+  );
+  if (!response.ok) return null;
+  let bytes;
+  try { bytes = new Uint8Array(await response.arrayBuffer()); } catch { return null; }
+  if (bytes.length > MAX_JSON_BYTES) return null;
+  let body;
+  try { body = JSON.parse(new TextDecoder().decode(bytes)); } catch { return null; }
+  if (!object(body) || body.success !== true) return null;
+  const rows = queryRows(body.result, 1);
+  if (rows.length !== 1) return null;
+  return exactActivationOutcome(rows[0], activation);
+}
+
 function assertOperationState(state, activation) {
   if (!object(state)
       || !["lock_intent", "held", "admin_intent", "release_intent", "completed"].includes(state.status)
@@ -439,8 +566,10 @@ function assertOperationState(state, activation) {
  * Run the owner-only activation transaction.  The operator, rather than the
  * Worker request body, is the trust boundary for version/config identity: it
  * acquires the shared production lock, captures the current live Worker just
- * before POST, and captures it again before releasing the lock.  A receipt
- * that no longer describes the live deployment never reaches the admin route.
+ * before a fresh POST, and captures it again before releasing the lock. An
+ * already-journaled admin intent is resolved by exact idempotent replay first;
+ * that recovery path may safely reach the route with a stale receipt because
+ * the Worker returns only its durable matching result.
  */
 export async function runProtectedTelemetryRuntimeActivation({
   accountId,
@@ -450,6 +579,7 @@ export async function runProtectedTelemetryRuntimeActivation({
   request,
   session,
   resume = false,
+  reconcileOnly = false,
   environment = process.env,
   fetchImpl = globalThis.fetch,
   now = () => new Date().toISOString(),
@@ -458,6 +588,7 @@ export async function runProtectedTelemetryRuntimeActivation({
   lockFactory = ({ repositoryRoot: root }) => createProductionDeploymentLock({ repositoryRoot: root }),
   operationFactory = openOperation,
   postAdmin = postTelemetryRuntimeAdminAction,
+  reconcileOutcome = null,
 } = {}) {
   if (!/^[a-f0-9]{32}$/u.test(accountId ?? "")
       || !/^[A-Za-z0-9_-]{1,63}$/u.test(workerName ?? "")
@@ -485,13 +616,17 @@ export async function runProtectedTelemetryRuntimeActivation({
     operation.close();
     return state.result;
   }
-  const live = provider ?? liveProviderFactory({
-    accountId,
-    workerName,
-    environment,
-    fetchImpl,
-    now,
-  });
+  let live = provider;
+  const captureLive = async () => {
+    live ??= liveProviderFactory({
+      accountId,
+      workerName,
+      environment,
+      fetchImpl,
+      now,
+    });
+    return live.capture();
+  };
   const lock = lockFactory({ repositoryRoot });
   let lockHeld = false;
   let adminAttempted = state.status === "admin_intent";
@@ -504,6 +639,53 @@ export async function runProtectedTelemetryRuntimeActivation({
     lockHeld = false;
     state = { ...state, status: "completed", result: { status: "refused" } };
     await operation.save(state);
+  };
+  const releaseSuccessfulMutation = async (result) => {
+    state = { ...state, status: "release_intent", result };
+    await operation.save(state);
+    await lock.release(state.owner);
+    lockHeld = false;
+    state = { ...state, status: "completed" };
+    await operation.save(state);
+  };
+  const releaseReconciledRefusal = async () => {
+    const result = { status: "refused" };
+    // Do not carry beforeIdentity into a refusal journal. The closed resume
+    // shape for a reconciled non-commit is exactly owner/status/result.
+    state = { owner: state.owner, status: "release_intent", result };
+    await operation.save(state);
+    await lock.release(state.owner);
+    lockHeld = false;
+    state = { owner: state.owner, status: "completed", result };
+    await operation.save(state);
+  };
+  const reconcileUncertainAdminIntent = async () => {
+    let inventory;
+    try {
+      inventory = await captureLive();
+      const outcome = reconcileOutcome === null
+          ? await readExactActivationOutcome({
+            accountId,
+            workerName,
+            activation,
+          inventory,
+          environment,
+          fetchImpl,
+        })
+        : await reconcileOutcome({ activation, inventory });
+      if (outcome?.kind === "success" && activationResultShape(outcome.result, activation)) {
+        return { kind: "success", result: outcome.result };
+      }
+      if (outcome?.kind === "refused"
+          && exactKeys(outcome.result, ["status"])
+          && outcome.result.status === "refused") {
+        return { kind: "refused", result: outcome.result };
+      }
+    } catch {
+      // A read failure cannot prove either outcome. Keep the admin intent and
+      // shared lock for a later exact retry or reviewed reconciliation.
+    }
+    return null;
   };
   try {
     if (state.status === "release_intent") {
@@ -553,7 +735,35 @@ export async function runProtectedTelemetryRuntimeActivation({
         await operation.save(state);
       }
     }
-    const beforeInventory = await live.capture();
+    if (reconcileOnly && state.status !== "admin_intent") {
+      fail("ACTIVATION_RECONCILE_REQUIRED");
+    }
+    if (state.status === "admin_intent") {
+      // The Worker has a unique durable audit row for this exact request. An
+      // idempotent replay is therefore the only safe way to resolve a stale
+      // proof or a lost response after the POST boundary. Do it before any
+      // mutable live-deployment check; a completed replay proves the durable
+      // outcome and can release the shared lock.
+      let result;
+      try {
+        result = await postAdmin({ session, request, fetchImpl });
+        if (!activationResultShape(result, activation)) fail("ADMIN_RESPONSE_INVALID");
+      } catch (error) {
+        const reconciled = await reconcileUncertainAdminIntent();
+        if (reconciled !== null) {
+          if (reconciled.kind === "refused") {
+            await releaseReconciledRefusal();
+          } else {
+            await releaseSuccessfulMutation(reconciled.result);
+          }
+          return reconciled.result;
+        }
+        throw error;
+      }
+      await releaseSuccessfulMutation(result);
+      return result;
+    }
+    const beforeInventory = await captureLive();
     const beforeIdentity = deploymentIdentity(beforeInventory);
     assertDeploymentMatchesProof(beforeIdentity, proof);
     // From this point onward the durable owner has crossed the admin mutation
@@ -567,15 +777,10 @@ export async function runProtectedTelemetryRuntimeActivation({
     }
     const result = await postAdmin({ session, request, fetchImpl });
     if (!activationResultShape(result, activation)) fail("ADMIN_RESPONSE_INVALID");
-    const afterInventory = await live.capture();
+    const afterInventory = await captureLive();
     const afterIdentity = deploymentIdentity(afterInventory);
     assertDeploymentStable(beforeIdentity, afterIdentity);
-    state = { ...state, status: "release_intent", result };
-    await operation.save(state);
-    await lock.release(state.owner);
-    lockHeld = false;
-    state = { ...state, status: "completed" };
-    await operation.save(state);
+    await releaseSuccessfulMutation(result);
     return result;
   } catch (error) {
     // A pre-POST receipt/deployment mismatch is deterministic and safe to
@@ -716,7 +921,8 @@ export async function captureTelemetryRuntimeReconciliation({
 async function main() {
   const argv = process.argv.slice(2);
   if (argv[0] === "--mode") {
-    if (argv[1] !== "activate") fail("ARGUMENTS_INVALID");
+    const mode = argv[1];
+    if (mode !== "activate" && mode !== "reconcile") fail("ARGUMENTS_INVALID");
     const args = parseTelemetryRuntimeActivationOperatorArguments(argv.slice(2));
     const request = await readOwnerPrivateJson(args["--request-file"]);
     const session = await readOwnerPrivateJson(args["--admin-session-file"]);
@@ -727,7 +933,8 @@ async function main() {
       operationDirectory: args["--operation-directory"],
       request,
       session,
-      resume: args.resume,
+      resume: mode === "reconcile" ? true : args.resume,
+      reconcileOnly: mode === "reconcile",
     });
     process.stdout.write(`${JSON.stringify({ status: "completed", result })}\n`);
     return;

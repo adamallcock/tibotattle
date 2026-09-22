@@ -62,6 +62,26 @@ function request(
   };
 }
 
+async function insertStartedActivation(input: TelemetryRuntimeActivationRequest): Promise<void> {
+  await db().prepare(
+    `INSERT INTO admin_action_audit (
+      operation_id, action, actor_identity_digest, outcome, details_json, created_at
+    ) VALUES (?, 'run_maintenance', ?, 'started', ?, ?)`,
+  ).bind(
+    input.idempotencyKey,
+    "a".repeat(64),
+    JSON.stringify({
+      schemaVersion: "telemetry-runtime-activation-v1",
+      task: "telemetry_runtime_activation",
+      idempotencyKey: input.idempotencyKey,
+      target: input.target,
+      expectedRevision: input.expectedRevision,
+      reconciliation: input.reconciliation,
+    }),
+    new Date(NOW_EPOCH).toISOString(),
+  ).run();
+}
+
 async function runtimeRow(target: "usage_v12" | "performance") {
   const table = target === "usage_v12" ? "telemetry_v12_runtime" : "telemetry_performance_runtime";
   return db().prepare(`SELECT state, policy_revision FROM ${table} WHERE id = 1`)
@@ -82,6 +102,20 @@ async function installForwardLedger(): Promise<void> {
   await analytics().batch(EXPECTED_ANALYTICS_MIGRATIONS.map((migration) => analytics().prepare(
     "INSERT INTO d1_storage_migrations(name, sha256) VALUES (?, ?)",
   ).bind(migration.name, migration.sha256)));
+}
+
+async function removePerformanceSchema(): Promise<void> {
+  const rows = (await db().prepare(
+    `SELECT type, name FROM sqlite_schema
+      WHERE name LIKE 'telemetry_performance_%'
+         OR name LIKE 'accountless_telemetry_performance_%'`,
+  ).all<{ type: string; name: string }>()).results;
+  for (const type of ["trigger", "index", "view", "table"]) {
+    for (const row of rows.filter((candidate) => candidate.type === type)) {
+      const name = row.name.replaceAll('"', '""');
+      await db().prepare(`DROP ${type.toUpperCase()} IF EXISTS "${name}"`).run();
+    }
+  }
 }
 
 async function installReconciliationProof(): Promise<void> {
@@ -397,14 +431,61 @@ describe("protected telemetry runtime activation", () => {
     expect(await runtimeRow("usage_v12")).toEqual({ state: "staged", policy_revision: 1 });
   });
 
-  it("refuses an incomplete schema before changing the runtime", async () => {
-    await db().prepare("DROP TABLE telemetry_performance_reports").run();
-    await expect(activateTelemetryRuntimeAsOwner(db(), settings, ACTOR_IDENTITY_KEY,
-      request("usage_v12"), NOW_EPOCH)).rejects.toMatchObject({
+  it("fences a started intent when collection controls become disabled", async () => {
+    const started = request("usage_v12", 1, "99999999-9999-4999-8999-999999999999");
+    await insertStartedActivation(started);
+    await db().prepare(
+      `UPDATE collection_controls
+          SET processing_enabled = 0, control_state = 'degraded', revision = revision + 1
+        WHERE singleton = 1`,
+    ).run();
+    await expect(activateTelemetryRuntimeAsOwner(
+      db(), settings, ACTOR_IDENTITY_KEY, started, NOW_EPOCH,
+    )).rejects.toMatchObject({ status: 503, code: "PROCESSING_DISABLED" });
+    expect((await db().prepare(
+      "SELECT outcome FROM admin_action_audit WHERE operation_id = ?",
+    ).bind(started.idempotencyKey).first<{ outcome: string }>())?.outcome).toBe("failure");
+  });
+
+  it("fences a started intent when typed storage configuration drifts", async () => {
+    const started = request("usage_v12", 1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    await insertStartedActivation(started);
+    await expect(activateTelemetryRuntimeAsOwner(
+      db(),
+      { TELEMETRY_STORAGE_MODE: "json", TELEMETRY_STORAGE_NAMESPACE: "" },
+      ACTOR_IDENTITY_KEY,
+      started,
+      NOW_EPOCH,
+    )).rejects.toMatchObject({
       status: 503,
       code: "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE",
     });
-    expect(await runtimeRow("usage_v12")).toEqual({ state: "staged", policy_revision: 1 });
+    expect((await db().prepare(
+      "SELECT outcome FROM admin_action_audit WHERE operation_id = ?",
+    ).bind(started.idempotencyKey).first<{ outcome: string }>())?.outcome).toBe("failure");
+  });
+
+  it("activates usage when the independent performance schema is absent", async () => {
+    await removePerformanceSchema();
+    await installReconciliationProof();
+    const usage = await activateTelemetryRuntimeAsOwner(
+      db(), settings, ACTOR_IDENTITY_KEY, request("usage_v12"), NOW_EPOCH,
+    );
+    expect(usage).toMatchObject({ target: "usage_v12", state: "active", toRevision: 2 });
+    expect(await runtimeRow("usage_v12")).toEqual({ state: "active", policy_revision: 2 });
+  });
+
+  it("refuses performance activation when its schema is absent", async () => {
+    await removePerformanceSchema();
+    await installReconciliationProof();
+    await expect(activateTelemetryRuntimeAsOwner(db(), settings, ACTOR_IDENTITY_KEY,
+      request("performance"), NOW_EPOCH)).rejects.toMatchObject({
+      status: 503,
+      code: "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE",
+    });
+    expect(await db().prepare(
+      "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'telemetry_performance_runtime'",
+    ).first()).toBeNull();
   });
 
   it("refuses a wrong performance method tuple", async () => {
@@ -422,7 +503,7 @@ describe("protected telemetry runtime activation", () => {
   it("refuses a forward migration ledger hash mismatch", async () => {
     await db().prepare(
       "UPDATE d1_storage_migrations SET sha256 = ? WHERE name = ?",
-    ).bind("0".repeat(64), "0009_performance_reports.sql").run();
+    ).bind("0".repeat(64), "0008_telemetry_v12.sql").run();
     await expect(activateTelemetryRuntimeAsOwner(db(), settings, ACTOR_IDENTITY_KEY,
       request("usage_v12"), NOW_EPOCH)).rejects.toMatchObject({
       status: 503,

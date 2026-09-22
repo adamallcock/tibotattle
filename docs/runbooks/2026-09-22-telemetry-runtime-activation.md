@@ -17,9 +17,9 @@ separate rollout decision.
 
 ## Preconditions
 
-The target primary and analytics D1 roles must have their complete forward
-migration prefixes and a durable, read-only post-migration/post-deploy
-reconciliation receipt. The receipt must contain the exact schema and
+The target primary and analytics D1 roles must have the common forward
+migration prefix and a durable, read-only post-migration/post-deploy
+reconciliation receipt. The receipt contains the exact schema and
 `d1_storage_migrations` ledger SHA-256 for both roles, the deployed source
 commit, the owner-captured Worker version/config metadata, and its canonical
 proof digest. The Worker live-checks `DEPLOYMENT_SOURCE_COMMIT` against the
@@ -32,12 +32,14 @@ production lock. The shared provider-schema predicate is used when calculating
 the schema digest, so exact provider-owned metadata is excluded while a shadow
 object remains visible as drift.
 
-The Worker activation gate also checks the four typed-forward ledger rows and
-their source hashes, the final typed v1/v1.1 and successor schema objects, the
-exact runtime tuple, and the performance report bucket and measurement checks.
-The Worker must be configured with typed storage and the same valid source
-namespace for both v1 and v1.1. Upload registration and processing collection
-controls must both be enabled.
+Usage activation requires the common primary forward rows through
+`0008_telemetry_v12.sql` and the final typed v1/v1.1 and successor usage
+objects. The independent `0009_performance_reports.sql` migration, performance
+tables, and histogram bucket checks may be absent or remain staged. Performance
+activation requires the complete primary prefix through `0009`, every pinned
+performance object, and the exact report bucket and measurement checks. Both
+targets require typed storage, the same valid source namespace for v1 and v1.1,
+and enabled upload registration and processing controls.
 
 The runtime row must still be `staged`. Record its current `policy_revision`
 from a read-only post-deploy check and use that value as `expectedRevision`.
@@ -53,8 +55,11 @@ produce an activation success.
    retain its ledger and reconciliation receipt. Migration application is a
    separate operation from activation.
 2. Reconcile the target D1 role read-only. Confirm the typed v1 and v1.1
-   admission state, source namespace, collection controls, staged successor
-   runtime rows, exact revisions, and the expected schema/migration state.
+   admission state, source namespace, collection controls, the staged target
+   runtime row, its exact revision, and the target-specific schema/migration
+   state. For usage, performance tables may be absent; for performance, the
+   full performance migration, tables, indexes, triggers, and bucket contract
+   must be present.
 3. Deploy the Worker build containing the activation path. A deploy does not
    apply D1 migrations and does not activate a runtime.
 4. Repeat the post-deploy read-only checks. Confirm that the runtime target is
@@ -162,10 +167,11 @@ produce an activation success.
    The batch either commits all of those changes or commits none. It writes
    only the closed, content-free activation request envelope and singleton
    runtime row; no participant or event payload is included.
-7. Verify the response and runtime row read-only. Confirm `state = active`,
-   the revision increased by exactly one, and the independent performance row
-   remains staged. Keep the response and audit operation identifier with the
-   release evidence.
+7. Verify the response and runtime row read-only. Confirm `state = active` and
+   the revision increased by exactly one. When the performance stream is
+   installed, its independent row must remain staged during usage activation;
+   it may be absent while performance is still unprepared. Keep the response
+   and audit operation identifier with the release evidence.
 
 Performance activation is optional and follows the same proof and operator
 sequence only after its separate collection decision. Its exact request is:
@@ -209,13 +215,36 @@ the runtime alone.
 The maintained operator command journals its lock and POST boundary in the
 owner-private operation directory. If it exits after `lock_intent`, rerun the
 same command with `--resume`; it adopts that exact owner when the shared lock
-is already held or acquires it when the lock is still absent. If it exits with
-`admin_intent`, `--resume` asserts the existing owner and retries the exact
-same request, which is safe because the Worker idempotency key is unchanged.
+is already held or acquires it when the lock is still absent. A fresh operation
+captures live deployment identity before POST, so a version/config drift
+refuses before the POST; create a new reconciliation proof and operation key
+after the deployment is stable.
+
+If it exits with `admin_intent`, `--resume` asserts the existing owner and
+first retries the exact same request. A completed Worker replay returns the
+durable success before mutable proof checks, journals `release_intent`, and
+releases the lock even when the deployment has since drifted. If the replay is
+refused or its response is lost, use the separate reviewed reconciliation
+mode, which reads the fixed target runtime and exact audit row under the held
+lock:
+
+```sh
+node apps/worker/scripts/telemetry-runtime-reconciliation.mjs \
+  --mode reconcile \
+  --account-id <account-id> \
+  --worker-name <production-worker-name> \
+  --repository-root "$PWD" \
+  --operation-directory <owner-private-directory>/telemetry-runtime-activation \
+  --request-file <owner-private-directory>/telemetry-runtime-activation-request.json \
+  --admin-session-file <owner-private-directory>/telemetry-runtime-admin-session.json
+```
+
+That mode releases only after a durable success with the expected active
+revision or a durable failure with the original staged revision. A still
+started audit, an active revision without matching success, a missing audit,
+or any read uncertainty remains fail-closed and retains the lock for review.
 If it exits with `release_intent`, `--resume` releases or reconciles that exact
-owner and returns the stored result without posting again. A deployment
-version/config drift refuses before the POST; create a new reconciliation proof
-and a new operation key after the deployment is stable.
+owner and returns the stored result without posting again.
 
 If post-deploy verification fails, leave the target staged and resolve the
 migration, schema, configuration, or collection-control issue before retrying

@@ -438,6 +438,195 @@ test("replays an admin intent under the existing lock after a lost response", as
   }
 });
 
+test("reconciles post-POST deployment drift through an exact replay before releasing", async () => {
+  const captured = await runFixture();
+  const request = activationRequest(captured.proof);
+  const operation = operationHarness();
+  const lock = lockHarness();
+  const changedVersion = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  let posts = 0;
+  try {
+    await assert.rejects(runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT,
+      workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory: "/private/tmp/synthetic-operation",
+      request,
+      session: adminSession(),
+      provider: liveProvider(inventory(), inventory(changedVersion)),
+      lockFactory: () => lock,
+      operationFactory: operation.factory,
+      postAdmin: async () => { posts += 1; return resultFor(request); },
+    }), { code: "TELEMETRY_RUNTIME_RECONCILIATION_LIVE_DEPLOYMENT_DRIFT_AFTER_MUTATION" });
+    assert.equal(operation.state.status, "admin_intent");
+    assert.notEqual(lock.owner, null);
+
+    const replay = await runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT,
+      workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory: "/private/tmp/synthetic-operation",
+      request,
+      session: adminSession(),
+      resume: true,
+      provider: { capture: async () => assert.fail("completed replay must not require live capture") },
+      lockFactory: () => lock,
+      operationFactory: operation.factory,
+      postAdmin: async () => { posts += 1; return resultFor(request); },
+    });
+    assert.deepEqual(replay, resultFor(request));
+    assert.equal(posts, 2);
+    assert.equal(lock.owner, null);
+    assert.equal(operation.state.status, "completed");
+  } finally {
+    await captured.cleanup();
+  }
+});
+
+test("reconciles a no-request-reached intent after later deployment drift and releases safely", async () => {
+  const captured = await runFixture();
+  const request = activationRequest(captured.proof);
+  const operation = operationHarness();
+  const lock = lockHarness();
+  const changedVersion = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  let posts = 0;
+  try {
+    await assert.rejects(runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT,
+      workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory: "/private/tmp/synthetic-operation",
+      request,
+      session: adminSession(),
+      provider: liveProvider(inventory()),
+      lockFactory: () => lock,
+      operationFactory: operation.factory,
+      postAdmin: async () => { posts += 1; throw new Error("request never reached admin"); },
+    }), { code: "TELEMETRY_RUNTIME_RECONCILIATION_ACTIVATION_RESULT_UNCERTAIN" });
+    assert.equal(operation.state.status, "admin_intent");
+    assert.notEqual(lock.owner, null);
+
+    const reconciled = await runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT,
+      workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory: "/private/tmp/synthetic-operation",
+      request,
+      session: adminSession(),
+      resume: true,
+      provider: liveProvider(inventory(changedVersion)),
+      lockFactory: () => lock,
+      operationFactory: operation.factory,
+      postAdmin: async () => { posts += 1; throw Object.assign(new Error("stale receipt"), {
+        code: "TELEMETRY_RUNTIME_RECONCILIATION_LIVE_DEPLOYMENT_DRIFT",
+      }); },
+      reconcileOutcome: async ({ inventory: current }) => {
+        assert.equal(current.version.id, changedVersion);
+        return { kind: "refused", result: { status: "refused" } };
+      },
+    });
+    assert.deepEqual(reconciled, { status: "refused" });
+    assert.equal(posts, 2);
+    assert.equal(lock.owner, null);
+    assert.equal(operation.state.status, "completed");
+  } finally {
+    await captured.cleanup();
+  }
+});
+
+test("uses the fixed D1 audit/runtime read before releasing a durable failure", async () => {
+  const captured = await runFixture();
+  const request = activationRequest(captured.proof);
+  const operation = operationHarness();
+  const lock = lockHarness();
+  let posts = 0;
+  let reconciliationReads = 0;
+  try {
+    await assert.rejects(runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT,
+      workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory: "/private/tmp/synthetic-operation",
+      request,
+      session: adminSession(),
+      provider: liveProvider(inventory()),
+      lockFactory: () => lock,
+      operationFactory: operation.factory,
+      postAdmin: async () => { posts += 1; throw new Error("request never reached admin"); },
+    }), { code: "TELEMETRY_RUNTIME_RECONCILIATION_ACTIVATION_RESULT_UNCERTAIN" });
+
+    const activation = request.telemetryRuntimeActivation;
+    const details = {
+      schemaVersion: "telemetry-runtime-activation-v1",
+      task: "telemetry_runtime_activation",
+      idempotencyKey: activation.idempotencyKey,
+      target: activation.target,
+      expectedRevision: activation.expectedRevision,
+      reconciliation: activation.reconciliation,
+      code: "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE",
+    };
+    const resume = await runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT,
+      workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory: "/private/tmp/synthetic-operation",
+      request,
+      session: adminSession(),
+      resume: true,
+      environment: { CLOUDFLARE_API_TOKEN: "synthetic-provider-token" },
+      provider: liveProvider(inventory("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")),
+      lockFactory: () => lock,
+      operationFactory: operation.factory,
+      postAdmin: async () => { posts += 1; throw Object.assign(new Error("stale receipt"), {
+        code: "TELEMETRY_RUNTIME_RECONCILIATION_LIVE_DEPLOYMENT_DRIFT",
+      }); },
+      fetchImpl: async (url, options) => {
+        reconciliationReads += 1;
+        assert.match(url, new RegExp(`/accounts/${ACCOUNT}/d1/database/${PRIMARY}/query$`));
+        assert.equal(options.method, "POST");
+        const body = JSON.parse(options.body);
+        assert.match(body.sql, /telemetry_v12_runtime/u);
+        assert.deepEqual(body.params, [activation.idempotencyKey]);
+        return Response.json({
+          success: true,
+          result: [{
+            success: true,
+            results: [{
+              audit_action: "run_maintenance",
+              audit_details_json: JSON.stringify(details),
+              audit_operation_id: activation.idempotencyKey,
+              audit_outcome: "failure",
+              runtime_policy_revision: 1,
+              runtime_state: "staged",
+            }],
+          }],
+        });
+      },
+    });
+    assert.deepEqual(resume, { status: "refused" });
+    assert.equal(reconciliationReads, 1);
+    assert.equal(posts, 2);
+    assert.equal(lock.owner, null);
+    assert.equal(operation.state.status, "completed");
+    const replay = await runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT,
+      workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory: "/private/tmp/synthetic-operation",
+      request,
+      session: adminSession(),
+      resume: true,
+      provider: { capture: async () => assert.fail("completed refusal must not capture live state") },
+      lockFactory: () => lock,
+      operationFactory: operation.factory,
+      postAdmin: async () => assert.fail("completed refusal must not POST"),
+    });
+    assert.deepEqual(replay, { status: "refused" });
+  } finally {
+    await captured.cleanup();
+  }
+});
+
 test("resumes a pre-acquire journal crash and a lost acquire response", async () => {
   const captured = await runFixture();
   const request = activationRequest(captured.proof);

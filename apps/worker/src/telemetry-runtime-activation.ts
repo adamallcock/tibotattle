@@ -101,6 +101,16 @@ export const EXPECTED_PRIMARY_MIGRATIONS = Object.freeze([
   }),
 ] as const);
 
+// The usage successor is independently activatable. The performance
+// migration is deliberately excluded from its gate so a deployment can carry
+// a staged usage runtime while the optional histogram stream is still absent.
+const EXPECTED_USAGE_PRIMARY_MIGRATIONS = Object.freeze(
+  EXPECTED_PRIMARY_MIGRATIONS.filter((migration) => migration.name !== "0009_performance_reports.sql"),
+);
+const EXPECTED_PERFORMANCE_PRIMARY_MIGRATIONS = Object.freeze(
+  EXPECTED_PRIMARY_MIGRATIONS.filter((migration) => migration.name === "0009_performance_reports.sql"),
+);
+
 export const EXPECTED_ANALYTICS_MIGRATIONS = Object.freeze([
   Object.freeze({
     name: "0024_effective_owner_daily_cursor.sql",
@@ -418,6 +428,17 @@ const EXPECTED_PRIMARY_SCHEMA_OBJECTS: readonly SchemaObjectPin[] = Object.freez
   { type: "trigger", name: "typed_v1_v11_transition_unqualified" },
 ] as const);
 
+const isPerformanceSchemaObject = (object: SchemaObjectPin): boolean =>
+  object.name.startsWith("telemetry_performance_")
+  || object.name.startsWith("accountless_telemetry_performance_");
+
+const EXPECTED_PERFORMANCE_SCHEMA_OBJECTS: readonly SchemaObjectPin[] = Object.freeze(
+  EXPECTED_PRIMARY_SCHEMA_OBJECTS.filter(isPerformanceSchemaObject),
+);
+const EXPECTED_USAGE_SCHEMA_OBJECTS: readonly SchemaObjectPin[] = Object.freeze(
+  EXPECTED_PRIMARY_SCHEMA_OBJECTS.filter((object) => !isPerformanceSchemaObject(object)),
+);
+
 interface RuntimeActivationEnv {
   readonly TELEMETRY_STORAGE_MODE?: unknown;
   readonly TELEMETRY_STORAGE_NAMESPACE?: unknown;
@@ -677,21 +698,28 @@ export function parseTelemetryRuntimeActivationRequest(
 
 async function assertPrimarySchemaIsComplete(
   db: D1Database,
+  target: TelemetryRuntimeActivationTarget,
 ): Promise<TelemetryRuntimeReconciliationRole> {
   try {
+    const expectedObjects = target === "performance"
+      ? [...EXPECTED_USAGE_SCHEMA_OBJECTS, ...EXPECTED_PERFORMANCE_SCHEMA_OBJECTS]
+      : EXPECTED_USAGE_SCHEMA_OBJECTS;
+    const expectedMigrations = target === "performance"
+      ? EXPECTED_PRIMARY_MIGRATIONS
+      : EXPECTED_USAGE_PRIMARY_MIGRATIONS;
     // Keep each query below D1's bound-parameter ceiling even as the pinned
     // schema grows with the v1/v1.1 compatibility surface.
     const actual = new Set<string>();
-    for (let offset = 0; offset < EXPECTED_PRIMARY_SCHEMA_OBJECTS.length; offset += 50) {
-      const objects = EXPECTED_PRIMARY_SCHEMA_OBJECTS.slice(offset, offset + 50);
+    for (let offset = 0; offset < expectedObjects.length; offset += 50) {
+      const objects = expectedObjects.slice(offset, offset + 50);
       const names = objects.map(() => "?").join(",");
       const rows = (await db.prepare(
         `SELECT type, name FROM sqlite_schema WHERE name IN (${names})`,
       ).bind(...objects.map((object) => object.name)).all<SchemaObjectPin>()).results;
       for (const row of rows) actual.add(`${row.type}\0${row.name}`);
     }
-    if (actual.size !== EXPECTED_PRIMARY_SCHEMA_OBJECTS.length
-        || EXPECTED_PRIMARY_SCHEMA_OBJECTS.some((object) => !actual.has(`${object.type}\0${object.name}`))) {
+    if (actual.size !== expectedObjects.length
+        || expectedObjects.some((object) => !actual.has(`${object.type}\0${object.name}`))) {
       unavailableActivation();
     }
 
@@ -699,17 +727,22 @@ async function assertPrimarySchemaIsComplete(
       "SELECT name, sha256 FROM d1_storage_migrations ORDER BY rowid",
     ).all<ReconciliationLedgerRow>()).results;
     const ledger = new Map(ledgerRows.map((row) => [row.name, row.sha256]));
-    if (EXPECTED_PRIMARY_MIGRATIONS.some((migration) => ledger.get(migration.name) !== migration.sha256)) {
+    if (expectedMigrations.some((migration) => ledger.get(migration.name) !== migration.sha256)
+        || (target === "performance"
+          && EXPECTED_PERFORMANCE_PRIMARY_MIGRATIONS.some(
+            (migration) => ledger.get(migration.name) !== migration.sha256))) {
       unavailableActivation();
     }
 
-    const performanceSql = await db.prepare(
-      "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'telemetry_performance_reports'",
-    ).first<{ sql: string }>();
-    if (!performanceSql?.sql
-        || !performanceSql.sql.includes(`bucket_scheme_version TEXT NOT NULL CHECK (bucket_scheme_version = '${PERFORMANCE_BUCKET_SCHEME_VERSION}')`)
-        || !performanceSql.sql.includes("measurement_version TEXT NOT NULL CHECK (measurement_version = 'model-performance-samples-v1')")) {
-      unavailableActivation();
+    if (target === "performance") {
+      const performanceSql = await db.prepare(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'telemetry_performance_reports'",
+      ).first<{ sql: string }>();
+      if (!performanceSql?.sql
+          || !performanceSql.sql.includes(`bucket_scheme_version TEXT NOT NULL CHECK (bucket_scheme_version = '${PERFORMANCE_BUCKET_SCHEME_VERSION}')`)
+          || !performanceSql.sql.includes("measurement_version TEXT NOT NULL CHECK (measurement_version = 'model-performance-samples-v1')")) {
+        unavailableActivation();
+      }
     }
     return await telemetryRuntimeReconciliationDigests(db);
   } catch (error) {
@@ -754,6 +787,7 @@ async function assertReconciliationProof(
   env: RuntimeActivationEnv,
   proof: TelemetryRuntimeReconciliationProof,
   nowEpoch: number,
+  target: TelemetryRuntimeActivationTarget,
 ): Promise<void> {
   const capturedAt = Date.parse(proof.capturedAt);
   if (!Number.isFinite(capturedAt)
@@ -803,7 +837,7 @@ async function assertReconciliationProof(
     unavailableActivation();
   }
   const [primary, analytical] = await Promise.all([
-    assertPrimarySchemaIsComplete(db),
+    assertPrimarySchemaIsComplete(db, target),
     assertAnalyticsSchemaIsComplete(analytics),
   ]);
   if (primary.schemaSha256 !== proof.primary.schemaSha256
@@ -903,6 +937,7 @@ function auditDetailsJson(value: unknown): string {
 function activationMutation(
   db: D1Database,
   input: TelemetryRuntimeActivationRequest,
+  operationId: string,
   controlsRevision: number,
   now: string,
 ): D1PreparedStatement {
@@ -913,6 +948,10 @@ function activationMutation(
              AND controls.upload_registration_enabled = 1
              AND controls.processing_enabled = 1
              AND controls.revision = ?
+        )
+        AND EXISTS (
+          SELECT 1 FROM admin_action_audit audit_row
+           WHERE audit_row.operation_id = ? AND audit_row.outcome = 'started'
         )`;
   if (input.target === "usage_v12") {
     return db.prepare(
@@ -934,6 +973,7 @@ function activationMutation(
       200,
       64_000_000,
       controlsRevision,
+      operationId,
     );
   }
   return db.prepare(
@@ -951,6 +991,7 @@ function activationMutation(
     PERFORMANCE_PRIVACY_CONTRACT_VERSION,
     "performance-daily-histogram-v1",
     controlsRevision,
+    operationId,
   );
 }
 
@@ -963,7 +1004,7 @@ async function activateAndAuditAtomically(
   successDetails: unknown,
 ): Promise<{ state: "active"; policy_revision: number }> {
   const mutation = activationMutation(
-    db, input, controlsRevision, now,
+    db, input, operationId, controlsRevision, now,
   );
   const audit = db.prepare(
     `UPDATE admin_action_audit
@@ -1194,18 +1235,29 @@ export async function activateTelemetryRuntimeAsOwner(
   };
   let operationId: string | null = null;
   let mutationAttempted = false;
+  let fenceFailureEligible = false;
   try {
     const existingAtEntry = await readActivationAudit(db, input.idempotencyKey);
     if (existingAtEntry !== null) {
       const completed = completedActivationResult(existingAtEntry, input);
       if (completed !== null) return completed;
+      // Bind an existing started intent before any mutable proof/control gate.
+      // If a later gate refuses, the failure CAS can fence an in-flight
+      // original before the original runtime mutation reaches its audit batch.
+      operationId = existingAtEntry.operation_id;
     }
+    // Read the target singleton before any mutable storage, control, or proof
+    // gate. A staged expected row lets a deterministic pre-mutation refusal
+    // fence an existing started intent; an active or mismatched row remains
+    // ambiguous and is never converted to failure here.
+    const runtime = await readTargetRuntime(db, input.target);
+    fenceFailureEligible = runtime.state === "staged"
+      && runtime.policy_revision === input.expectedRevision;
     await assertTypedStorage(db, env);
     const controls = await readCollectionControls(db);
     if (!controls.uploadRegistration) throw new ApiError(503, "UPLOAD_REGISTRATION_DISABLED");
     if (!controls.processing) throw new ApiError(503, "PROCESSING_DISABLED");
-    await assertReconciliationProof(db, env, input.reconciliation, nowEpoch);
-    const runtime = await readTargetRuntime(db, input.target);
+    await assertReconciliationProof(db, env, input.reconciliation, nowEpoch, input.target);
     if (runtime.state === "active") {
       const recovered = await recoverActiveActivation(db, input, runtime);
       if (recovered !== null) return recovered;
@@ -1327,7 +1379,7 @@ export async function activateTelemetryRuntimeAsOwner(
     if (deterministicBatch !== null && deterministicBatch.mutationChanges === 1) {
       throw safeError;
     }
-    if (operationId !== null) {
+    if (operationId !== null && fenceFailureEligible) {
       try {
         await finishAdminOperation(db, operationId, "failure", {
           ...auditBase,
