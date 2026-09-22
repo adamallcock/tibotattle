@@ -262,6 +262,8 @@ test('canonical expected schemas are generated from local migration inputs only'
     assert.equal(generated.migrationCounts[role], TYPED_SCHEMA_INPUT_DIRECTORIES[role].reduce((count, directory) => count + (directory === 'migrations' ? 62 : directory === 'typed-ingestion-migrations' ? 4 : directory === 'ingestion-bridge-migrations' ? 2 : directory === 'typed-v11-admission-migrations' ? 6 : directory === 'typed-v1-admission-migrations' ? 3 : directory === 'ingestion-isolation-migrations' ? 9 : directory === 'analytics-migrations' ? 26 : 3), 0));
   }
   assert.equal(generated.expectedSchemas.primary.optionalObjects.length, 17);
+  assert.equal(generated.expectedSchemas.primary.restoredSchemaSha256.length, 3);
+  assert.deepEqual(validateTypedProductionConfiguration({ roles, expectedSchemas: generated.expectedSchemas, config }), { ok: true, code: null });
   assert.deepEqual(generated.expectedSchemas.analytics.optionalObjects, []);
   assert.match(generated.operatorSchemaSourceSha256, /^[a-f0-9]{64}$/u);
 });
@@ -280,4 +282,54 @@ test('restored schema variants require complete exact metadata and reject other 
   assert.equal((await run(restoredRows)).ok, false);
   assert.equal((await run([...restoredRows, { ...metadata, sql: metadata.sql + ' ' }])).ok, false);
   assert.equal((await run([...restoredRows.map(row => ({ ...row, sql: row.sql + ' ' })), metadata])).ok, false);
+});
+
+test('accepts a generated typed-evidence digest and refuses a forged variant', async () => {
+  const metadata = { type: 'table', name: '_authority_restore_run', tbl_name: '_authority_restore_run',
+    sql: 'CREATE TABLE _authority_restore_run(id INTEGER PRIMARY KEY)' };
+  const sourceRows = [...rowsFor('primary'), {
+    type: 'table', name: 'telemetry_usage_correction_facts', tbl_name: 'telemetry_usage_correction_facts',
+    sql: 'CREATE TABLE telemetry_usage_correction_facts(id INTEGER PRIMARY KEY)',
+  }];
+  const typedEvidenceRows = sourceRows.map(row => row.type === 'table'
+    ? { ...row, sql: row.sql.replace(/^(CREATE TABLE )([A-Za-z_][A-Za-z0-9_]*)/u, '$1"$2"') }
+    : row);
+  const typedEvidenceDigest = storageSchemaDigest(typedEvidenceRows);
+  const legacyDigest = storageSchemaDigest(sourceRows);
+  const extensionDigest = storageSchemaDigest(sourceRows.map(row => row.name === 'telemetry_usage_correction_facts'
+    ? { ...row, sql: `${row.sql} ` } : row));
+  const expectation = {
+    ...expectedSchemas,
+    primary: {
+      ...expectedSchemas.primary,
+      schemaSha256: legacyDigest,
+      requiredObjects: sourceRows.map(({ type, name, tbl_name }) => ({ type, name, tbl_name })),
+      optionalObjects: [metadata],
+      restoredSchemaSha256: [legacyDigest, extensionDigest, typedEvidenceDigest],
+    },
+  };
+  const fixture = queryFixture();
+  const runQuery = async (binding, sql) => {
+    if (binding === TYPED_PRODUCTION_ROLE_BINDINGS.primary && sql === TYPED_PRODUCTION_QUERIES.schema) {
+      return response([...typedEvidenceRows, metadata]);
+    }
+    return fixture.runQuery(binding, sql);
+  };
+  const accepted = await runTypedProductionPreflight({ roles, runQuery, expectedSchemas: expectation, config });
+  assert.equal(accepted.ok, true);
+  assert.equal(accepted.roles.find(row => row.role === 'primary')?.schemaSha256, typedEvidenceDigest);
+
+  const forged = await runTypedProductionPreflight({
+    roles,
+    runQuery,
+    expectedSchemas: {
+      ...expectation,
+      primary: { ...expectation.primary, restoredSchemaSha256: [legacyDigest, extensionDigest,
+        `${typedEvidenceDigest.slice(0, -1)}${typedEvidenceDigest.endsWith('0') ? '1' : '0'}`] },
+    },
+    config,
+  });
+  assert.equal(forged.ok, false);
+  assert.equal(forged.code, 'TYPED_PREFLIGHT_SCHEMA_MISMATCH');
+  assert.equal(forged.blockers[0].details.observedSchemaSha256, typedEvidenceDigest);
 });

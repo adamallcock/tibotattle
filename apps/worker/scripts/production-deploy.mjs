@@ -1790,8 +1790,11 @@ async function runUncoordinatedProductionDeployment({
         ...typedProduction,
         workerDirectory: snapshot.workerDirectory,
         sourceCommit,
-        expectedPreviousSourceCommit: typedProduction.expectedPreviousSourceCommit
-          ?? expectedPreviousSourceCommit,
+        // The operation-level predecessor is authoritative. The public
+        // execution API rejects a contradictory nested value below, and this
+        // keeps preparation bound to the same pin even when an adapter passes
+        // an equal nested value.
+        expectedPreviousSourceCommit,
       });
     } catch (error) {
       prepared = typedFailure(
@@ -1896,6 +1899,10 @@ export async function runProductionDeployment(options) {
   if (!options.typedProduction
       && (hasRetainedPublicSourceCommit || hasExpectedLiveManifestSha256)) {
     return typedFailure("PRODUCTION_TYPED_INPUT_INVALID");
+  }
+  if (options.typedProduction?.expectedPreviousSourceCommit !== undefined
+      && options.typedProduction.expectedPreviousSourceCommit !== expectedPreviousSourceCommit) {
+    return typedFailure("PRODUCTION_TYPED_PREDECESSOR_MISMATCH");
   }
   let typedOperationPin = null;
   if (options.typedProduction) {

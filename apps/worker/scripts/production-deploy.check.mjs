@@ -2071,6 +2071,26 @@ test("typed deployment refuses a caller-supplied manifest gate bypass", async ()
   assert.deepEqual(calls, []);
 });
 
+test("typed deployment rejects a contradictory nested predecessor before pinning", async () => {
+  const calls = [];
+  const result = await runProductionDeployment(readyOptions({
+    typedProduction: {
+      expectedPreviousSourceCommit: FIXTURE_SOURCE_COMMIT,
+      inventory: {},
+      provider: { capture: async () => {}, query: async () => {} },
+    },
+    retainedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    expectedLiveManifestSha256: "1".repeat(64),
+    createSourceSnapshot: async () => calls.push("snapshot"),
+    coordinationFactory: () => calls.push("coordination"),
+  }));
+  assert.deepEqual(result, {
+    ok: false,
+    code: "PRODUCTION_TYPED_PREDECESSOR_MISMATCH",
+  });
+  assert.deepEqual(calls, []);
+});
+
 test("typed deployment installs the live config in the immutable snapshot and rechecks it around Wrangler", async (t) => {
   const fixture = await immutableSnapshotFixture();
   t.after(() => rm(fixture.root, { recursive: true, force: true }));

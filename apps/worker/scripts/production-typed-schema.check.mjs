@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
 import { copyFile, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,10 +10,30 @@ import {
   TYPED_SCHEMA_INPUT_DIRECTORIES,
   buildTypedProductionExpectedSchemas,
 } from './production-typed-schema.mjs';
+import { storageSchemaDigest } from './d1-storage-plan.mjs';
 
 const actualWorker = join(dirname(fileURLToPath(import.meta.url)), '..');
 
-async function fixture(t) {
+const syntheticTypedEvidenceRows = rows => rows.map(row => row.type === 'table'
+  ? { ...row, sql: row.sql.replace(/^(CREATE TABLE )([A-Za-z_][A-Za-z0-9_]*)/u, '$1"$2"') }
+  : row);
+
+async function canonicalPrimaryRows(f) {
+  const require = createRequire(join(f.root, 'package.json'));
+  const split = require('wrangler').unstable_splitSqlQuery;
+  const db = new DatabaseSync(':memory:');
+  try {
+    for (const directory of TYPED_SCHEMA_INPUT_DIRECTORIES.primary) {
+      const sql = await readFile(f.files.get(`primary:${directory}`), 'utf8');
+      for (const statement of split(sql)) db.exec(statement);
+    }
+    return db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' AND tbl_name <> 'd1_storage_migrations' ORDER BY type,name").all();
+  } finally {
+    db.close();
+  }
+}
+
+async function fixture(t, { correction = false } = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'typed-schema-')));
   t.after(() => rm(root, { recursive: true, force: true }));
   await writeFile(join(root, 'package.json'), '{}\n');
@@ -24,7 +46,10 @@ async function fixture(t) {
       const name = '0001_synthetic.sql';
       const table = `synthetic_${role}_${directory.replaceAll('-', '_')}`;
       const file = join(path, name);
-      await writeFile(file, `CREATE TABLE ${table}(id INTEGER PRIMARY KEY);\n`);
+      const correctionTable = correction && role === 'primary' && directory === 'migrations'
+        ? 'CREATE TABLE telemetry_usage_correction_facts(id INTEGER PRIMARY KEY);\n'
+        : '';
+      await writeFile(file, `CREATE TABLE ${table}(id INTEGER PRIMARY KEY);\n${correctionTable}`);
       files.set(`${role}:${directory}`, file);
     }
   }
@@ -38,6 +63,10 @@ async function fixture(t) {
     await copyFile(join(actualWorker, relativePath), destination);
   }
   await writeFile(join(root, 'src/authority-restore-role.ts'), 'export const authorityRoleFinalSchema = rows => rows;\n');
+  await writeFile(join(root, 'src/authority-restore.ts'),
+    'export const typedEvidenceRestoreFinalSchema = rows => rows.map(row => row.type === \'table\'\n'
+      + '  ? { ...row, sql: row.sql.replace(/^(CREATE TABLE )([A-Za-z_][A-Za-z0-9_]*)/u, \'$1"$2"\') }\n'
+      + '  : row);\n');
   return { root, files };
 }
 
@@ -63,6 +92,17 @@ test('canonical source changes alter the expected digest and input pin', async t
   const second = await buildTypedProductionExpectedSchemas({ workerDirectory: f.root });
   assert.notEqual(second.expectedSchemas.primary.schemaSha256, first.expectedSchemas.primary.schemaSha256);
   assert.notEqual(second.inputSha256.primary, first.inputSha256.primary);
+});
+
+test('generates the typed-evidence restore digest for a correction-bearing source', async t => {
+  const f = await fixture(t, { correction: true });
+  const generated = await buildTypedProductionExpectedSchemas({ workerDirectory: f.root });
+  const rows = await canonicalPrimaryRows(f);
+  const typedEvidenceDigest = storageSchemaDigest(syntheticTypedEvidenceRows(rows));
+  const variants = generated.expectedSchemas.primary.restoredSchemaSha256;
+  assert.equal(variants.length, 2);
+  assert.equal(variants.includes(typedEvidenceDigest), true);
+  assert.notEqual(typedEvidenceDigest, generated.expectedSchemas.primary.schemaSha256);
 });
 
 test('refuses symlinked and hard-linked canonical migration files', async t => {
