@@ -284,6 +284,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/platform/keychain-capabilities.js",
   "src/platform/local-codex-log-ports.js",
   "src/platform/local-codex-thread-store.js",
+  "src/platform/local-codex-metadata-filesystem.js",
   "src/platform/local-contribution-sync-queue-storage.js",
   "src/platform/local-export-source-ports.js",
   "src/platform/local-metadata-bundle-files.js",

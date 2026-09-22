@@ -69,6 +69,7 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
       "scripts/validate-macos-login-item-release.js",
       "src/local-cache-drop-thread-links.js",
       "src/platform/local-codex-thread-store.js",
+      "src/platform/local-codex-metadata-filesystem.js",
       "test/local-cache-drop-thread-links.test.js",
       "test/local-codex-thread-metadata.test.js",
       "test/local-unified-cache-write-assumption.test.js",

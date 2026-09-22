@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
@@ -76,6 +77,7 @@ import {
   validateWindowsNormalCandidateSmokeMetadata,
   verifyWindowsNormalCandidateSyntheticIngestion,
   verifyWindowsNormalCandidateModelPerformance,
+  verifyWindowsNormalCandidateProjectsAndThreads,
   verifyWindowsNormalCandidateOptOut,
   verifyWindowsNormalCandidateSmokePackage,
   WINDOWS_NORMAL_CANDIDATE_FIREWALL_TIMEOUT_MS,
@@ -143,6 +145,32 @@ test("packaged Windows timing smoke requires a complete ready source scan", () =
   assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "loading" }), "LOADING");
   assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "ready" }), "INCOMPLETE");
   assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "unexpected" }), "INVALID");
+});
+
+test("packaged Windows projects proof requires saved task name inside the actual project", () => {
+  const projects = { schemaVersion: "local-work-usage-v1", status: "available",
+    namesAvailable: true, snapshotId: "synthetic-snapshot", rows: [
+      { id: "project-id", kind: "project", tokens: 120 }],
+    display: { "project-id": { name: "synthetic-windows-project" } } };
+  const threads = { ...projects, rows: [{ id: "thread-id", kind: "thread", tokens: 120 }],
+    display: { "thread-id": { name: "Synthetic Windows saved task",
+      codexUrl: "codex://threads/70000000-0000-4000-8000-000000000001" } } };
+  assert.equal(verifyWindowsNormalCandidateProjectsAndThreads(projects, threads), true);
+  for (const changed of [null, { ...projects, namesAvailable: false },
+    { ...projects, status: "loading" }, { ...projects, rows: [] },
+    { ...projects, rows: undefined }, { ...projects, snapshotId: null },
+    { ...projects, rows: [{ ...projects.rows[0], id: "non-project" }] },
+    { ...projects, rows: [{ ...projects.rows[0], tokens: 240 }] },
+    { ...projects, display: {} }]) {
+    assert.equal(verifyWindowsNormalCandidateProjectsAndThreads(changed, threads), false);
+  }
+  for (const changed of [null, { ...threads, namesAvailable: false },
+    { ...threads, status: "loading" }, { ...threads, snapshotId: "expired" },
+    { ...threads, rows: undefined }, { ...threads, rows: [] }, { ...threads, rows: [{ ...threads.rows[0], tokens: 240 }] },
+    { ...threads, display: { "thread-id": { ...threads.display["thread-id"], name: "Task 00001" } } },
+    { ...threads, display: { "thread-id": { ...threads.display["thread-id"], codexUrl: null } } }]) {
+    assert.equal(verifyWindowsNormalCandidateProjectsAndThreads(projects, changed), false);
+  }
 });
 
 test("startup failure diagnostics retain only fixed categories and booleans", () => {
@@ -1076,6 +1104,7 @@ function passedJourney() {
     localRefreshObserved: true,
     localRefreshTerminal: "succeeded",
     syntheticIngestionVerified: true,
+    projectsAndThreadsVerified: true,
     sharingOptOutRetained: true,
     settingsPersisted: true,
     cleanQuit: true,
@@ -1192,13 +1221,15 @@ test("normal candidate adds one content-free Codex source before launch", async 
     home: String.raw`C:\runner\owned\profile\home`,
   });
   const calls = [];
+  const gitCalls = [];
   let fixtureContent = null;
   const fixture = await seedWindowsNormalCandidateCodexFixture({ profile }, {
     now: () => NORMAL_CANDIDATE_FIXTURE_CLOCK_MS,
+    runGit: async (...args) => { gitCalls.push(args); },
     createDirectory: async (path, options) => {
       calls.push({ kind: "directory", path, options });
     },
-    metadata: async (path) => path.endsWith("sessions")
+    metadata: async (path) => !path.endsWith(".jsonl")
       ? { isDirectory: () => true, isSymbolicLink: () => false }
       : {
         isFile: () => true,
@@ -1211,6 +1242,13 @@ test("normal candidate adds one content-free Codex source before launch", async 
       calls.push({ kind: "file", path, value, options });
     },
   });
+  assert.deepEqual(gitCalls.map(([command, args]) => ({ command, args })), [
+    { command: "git", args: ["init", "--quiet", fixture.project] },
+    { command: "git", args: ["-C", fixture.project, "config", "remote.origin.url",
+      "https://example.invalid/synthetic/synthetic-windows-project.git"] },
+  ]);
+  assert.equal(gitCalls.every(([, , options]) => options.timeout === 5_000
+    && options.maxBuffer === 16_384 && options.env.GIT_TERMINAL_PROMPT === "0"), true);
   assert.equal(fixture.codexHome, win32.join(profile.home, ".codex"));
   assert.notEqual(fixture.codexHome, profile.codex);
   assert.equal(fixture.sessions, String.raw`C:\runner\owned\profile\home\.codex\sessions`);
@@ -1227,11 +1265,24 @@ test("normal candidate adds one content-free Codex source before launch", async 
   assert.equal(records[3].payload.model, "gpt-5.6-sol");
   assert.equal(records[3].payload.service_tier, "default");
   assert.equal(records[6].payload.info.total_token_usage.total_tokens, 120);
+  assert.equal(records[0].payload.cwd, fixture.project);
   assert.deepEqual(calls, [
+    {
+      kind: "directory",
+      path: fixture.project,
+      options: { recursive: true, mode: 0o700 },
+    },
     {
       kind: "directory",
       path: fixture.sessions,
       options: { recursive: true, mode: 0o700 },
+    },
+    {
+      kind: "file",
+      path: fixture.namesFile,
+      value: `${JSON.stringify({ id: "70000000-0000-4000-8000-000000000001",
+        thread_name: "Synthetic Windows saved task", updated_at: "2026-09-08T00:00:00.000Z" })}\n`,
+      options: { mode: 0o600, flag: "wx" },
     },
     {
       kind: "file",
@@ -1242,6 +1293,17 @@ test("normal candidate adds one content-free Codex source before launch", async 
   ]);
   await assert.rejects(seedWindowsNormalCandidateCodexFixture({ profile }, {
     now: () => NORMAL_CANDIDATE_FIXTURE_CLOCK_MS,
+    runGit: async () => { throw new Error("private Git configuration failure"); },
+    createDirectory: async () => {},
+    metadata: async () => ({ isDirectory: () => true, isSymbolicLink: () => false }),
+    writeFixture: async () => { assert.fail("Git preparation must finish before source writes"); },
+  }), {
+    code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_SYNTHETIC_FIXTURE_UNAVAILABLE",
+    message: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_SYNTHETIC_FIXTURE_UNAVAILABLE",
+  });
+  await assert.rejects(seedWindowsNormalCandidateCodexFixture({ profile }, {
+    now: () => NORMAL_CANDIDATE_FIXTURE_CLOCK_MS,
+    runGit: async () => {},
     createDirectory: async () => {},
     metadata: async () => ({ isDirectory: () => false, isSymbolicLink: () => false }),
     writeFixture: async () => {},
@@ -1250,6 +1312,7 @@ test("normal candidate adds one content-free Codex source before launch", async 
   });
   await assert.rejects(seedWindowsNormalCandidateCodexFixture({ profile }, {
     now: () => NORMAL_CANDIDATE_FIXTURE_CLOCK_MS,
+    runGit: async () => {},
     createDirectory: async () => {},
     metadata: async () => ({ isDirectory: () => true, isSymbolicLink: () => false }),
     writeFixture: (path, contents) => createWindowsSyntheticOwnedSource(path, contents, {
@@ -1295,8 +1358,9 @@ test("normal candidate fixture passes Codex discovery, onboarding, and local ref
   await seedWindowsNormalCandidateCodexFixture({
     profile: { home: String.raw`C:\runner\owned\profile\home` },
   }, {
+    runGit: async () => {},
     createDirectory: async () => {},
-    metadata: async (path) => path.endsWith("sessions")
+    metadata: async (path) => !path.endsWith(".jsonl")
       ? { isDirectory: () => true, isSymbolicLink: () => false }
       : {
         isFile: () => true,
@@ -1320,7 +1384,24 @@ test("normal candidate fixture passes Codex discovery, onboarding, and local ref
   try {
     await mkdir(sessions, { recursive: true, mode: 0o700 });
     await mkdir(rejectedSessions, { recursive: true, mode: 0o700 });
-    await writeFile(join(sessions, captured.fileName), captured.content, {
+    const project = join(root, "synthetic-windows-project");
+    await mkdir(project, { mode: 0o700 });
+    const gitOptions = { timeout: 5_000, maxBuffer: 16_384, windowsHide: true,
+      env: Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.toUpperCase().startsWith("GIT_"))) };
+    execFileSync("git", ["init", "--quiet", project], gitOptions);
+    execFileSync("git", ["-C", project, "config", "remote.origin.url",
+      "https://example.invalid/synthetic/synthetic-windows-project.git"], gitOptions);
+    const content = captured.content.trim().split("\n").map(line => {
+      const record = JSON.parse(line);
+      if (record.type === "session_meta") record.payload.cwd = project;
+      return JSON.stringify(record);
+    }).join("\n") + "\n";
+    const writeSource = process.platform === "win32" ? createWindowsSyntheticOwnedSource : writeFile;
+    await writeSource(join(codexHome, "session_index.jsonl"), JSON.stringify({
+      id: "70000000-0000-4000-8000-000000000001", thread_name: "Synthetic Windows saved task",
+      updated_at: new Date().toISOString(),
+    }) + "\n", { mode: 0o600, flag: "wx" });
+    await writeSource(join(sessions, captured.fileName), content, {
       mode: 0o600,
       flag: "wx",
     });
@@ -1462,6 +1543,32 @@ test("normal candidate fixture passes Codex discovery, onboarding, and local ref
       assert.ok(performance.models[0].ttft.some((point) => point.median > 0));
       assert.equal(verifyWindowsNormalCandidateModelPerformance(performance), true);
     }
+    const verifyProjectAndTask = async (origin) => {
+      const query = async (overrides) => {
+        const response = await fetch(`${origin}/api/local/work-usage/query`, {
+          method: "POST", headers: { "content-type": "application/json", "x-usage-monitor-local": "1" },
+          body: JSON.stringify({ schemaVersion: "local-work-usage-v1", period: "7d", sort: "tokens", ...overrides }),
+        });
+        if (response.status === 409) return { status: "expired" };
+        assert.equal(response.status, 200);
+        return response.json();
+      };
+      let verified = false;
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const projects = await query({ grouping: "project" });
+        if (projects.status === "available" && projects.namesAvailable !== false
+            && projects.rows.length === 1) {
+          const threads = await query({ grouping: "thread", project: projects.rows[0].id,
+            snapshotId: projects.snapshotId });
+          verified = verifyWindowsNormalCandidateProjectsAndThreads(projects, threads);
+          if (verified) break;
+        }
+        await new Promise(resolveWait => setTimeout(resolveWait, 25));
+      }
+      assert.equal(verified, true, "real Git group and saved task name must survive the ordinary API");
+    };
+    if (nativeTimingAvailable) await verifyProjectAndTask(base);
     await app.close();
     app = await startLocalCompanionServer({ ...serverOptions, refreshRunner: createFixtureRefreshRunner() });
     const restartedBase = `http://127.0.0.1:${app.port}`;
@@ -1496,6 +1603,7 @@ test("normal candidate fixture passes Codex discovery, onboarding, and local ref
       launch: "restart",
       expectedRefreshId: restartedTerminal.refreshId,
     }), true);
+    if (nativeTimingAvailable) await verifyProjectAndTask(restartedBase);
     assert.equal(quotaReads, 2);
   } finally {
     await app?.close();
@@ -2200,6 +2308,7 @@ test("normal candidate runner orders firewall coverage around both ordinary laun
     localRefreshTerminal: "succeeded",
     syntheticFixtureIngestionVerified: true,
     syntheticFixtureTotalsRetainedAcrossRestart: true,
+    projectsAndThreadsRetainedAcrossRestart: true,
     settingsPersistedAcrossRestart: true,
     durableContributionOptOutRetained: true,
     loopbackJourneyVerified: true,

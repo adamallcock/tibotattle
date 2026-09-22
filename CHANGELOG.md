@@ -42,6 +42,11 @@ See the [candidate release notes](./release-notes/0.1.24.md).
 
 - Enable local Model performance on Windows, following protected-reader and
   packaged-source qualification in [PR #199](https://github.com/adamallcock/tibotattle/pull/199).
+- Repair Windows task names and project grouping reported in
+  [issue #208](https://github.com/adamallcock/tibotattle/issues/208), with separate
+  native metadata and packaged dashboard checks required for the candidate.
+- Align macOS and Windows task metadata and selected-history reads, preserving
+  valid paginated forks and avoiding sidecar creation for closed source databases.
 - Add tool-free turn throughput, retain performance and work reports during
   refresh, and improve automatic refresh recovery.
 - Improve tray pace and run-out forecasts, login status updates, and local

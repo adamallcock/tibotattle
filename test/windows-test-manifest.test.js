@@ -15,6 +15,7 @@ test("Windows qualification includes collector recovery and shared timing storag
     "test/local-collector-state-session.test.js",
     "test/source-file-access.test.js",
     "test/windows-inference-timing.test.js",
+    "test/windows-thread-metadata.test.js",
     "test/windows-protected-sqlite.test.js",
   ]) {
     assert.equal(WINDOWS_PORTABLE_TEST_FILES.includes(file), true, file);

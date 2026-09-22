@@ -52,6 +52,7 @@ const QUALIFICATION_TEST_FILES = Object.freeze([
   "test/windows-qualification-governance.test.js",
   "test/windows-skip-ledger.test.js",
   "test/windows-test-manifest.test.js",
+  "test/work-usage-platform-parity.test.js",
 ]);
 export const WINDOWS_SECURITY_QUALIFICATION_TEST_FILES = QUALIFICATION_TEST_FILES;
 const QUALIFICATION_ENVIRONMENT = "USAGE_MONITOR_WINDOWS_QUALIFICATION";

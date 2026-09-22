@@ -14,7 +14,8 @@
         "scripts/smoke-electron-windows-normal-candidate.mjs",
         "test/model-performance.test.js",
         "test/electron-windows-normal-candidate.test.js",
-        "test/windows-filesystem-security.test.js"
+        "test/windows-filesystem-security.test.js",
+        "test/work-usage-platform-parity.test.js"
       ],
       "decision": "retain_as_internal_windows_qualification_support",
       "provenance": "native/windows-filesystem/README.md",
