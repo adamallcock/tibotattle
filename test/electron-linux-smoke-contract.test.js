@@ -9,6 +9,8 @@ import test from "node:test";
 import { validateDesktopFirstRunReceipt } from "../apps/electron/desktop-first-run.js";
 import {
   assertContainerContract,
+  createLinuxResourceDiagnostics,
+  validateLinuxResourceDiagnostic,
   classifyAutomaticStartupRefreshReceipt,
   createLinuxCompanionProcessDiagnostics,
   createLinuxDashboardFailureDiagnostics,
@@ -1116,4 +1118,118 @@ test("the Linux package navigation gate matches every shipped page in order", as
   const requiredCount = Number(source.match(/snapshot\?\.navCount !== (\d+)/u)?.[1]);
   assert.deepEqual(requiredKeys, pageKeys);
   assert.equal(requiredCount, pageKeys.length);
+});
+
+
+test("Linux resource diagnostics sample fixed mounts and retain only bounded aggregate minima", async () => {
+  let tick;
+  let stopped = false;
+  let free = 8;
+  let counterRead = 0;
+  const paths = new Set();
+  const collector = createLinuxResourceDiagnostics({
+    readFilesystem: async (path) => { paths.add(path); return { bsize: 1024, blocks: 10, bavail: free }; },
+    readCounters: async () => `low 0\noom ${counterRead++}\noom_kill 2\noom_group_kill 0\nPRIVATE_CANARY /private/path\n`,
+    schedule: (callback, interval) => { assert.equal(interval, 200); tick = callback; return 1; },
+    cancel: (handle) => { assert.equal(handle, 1); stopped = true; },
+  });
+  await collector.start();
+  collector.setReloadSubstage("fresh_document");
+  collector.setReloadSubstage("PRIVATE_CANARY");
+  free = 1;
+  await tick();
+  free = 7;
+  await collector.stop();
+  const result = collector.snapshot();
+  assert.equal(stopped, true);
+  assert.deepEqual([...paths].sort(), ["/dev/shm", "/home/node", "/run/user/1000"]);
+  assert.equal(result.reloadSubstage, "fresh_document");
+  for (const mount of Object.values(result.mounts)) {
+    assert.deepEqual(mount, { capacityBytes: 10240, minimumFreeBytes: 1024, sampleCount: 3 });
+  }
+  assert.deepEqual(result.cgroup, {
+    before: { oom: 0, oomKill: 2, oomGroupKill: 0 },
+    after: { oom: 1, oomKill: 2, oomGroupKill: 0 },
+  });
+  assert.equal(JSON.stringify(result).includes("PRIVATE_CANARY"), false);
+  assert.equal(JSON.stringify(result).includes("/"), false);
+  await collector.stop();
+  assert.equal(counterRead, 2);
+});
+
+test("Linux diagnostic I/O and timer failures remain unavailable without leaking or throwing", async () => {
+  const collector = createLinuxResourceDiagnostics({
+    readFilesystem: async () => { throw new Error("PRIVATE_CANARY /private/path"); },
+    readCounters: async () => { throw new Error("PRIVATE_CANARY"); },
+    schedule: () => { throw new Error("PRIVATE_CANARY"); },
+    cancel: () => { throw new Error("PRIVATE_CANARY"); },
+  });
+  await collector.start();
+  await collector.stop();
+  const result = collector.snapshot();
+  assert.deepEqual(result.cgroup, { before: null, after: null });
+  for (const mount of Object.values(result.mounts)) {
+    assert.deepEqual(mount, { capacityBytes: null, minimumFreeBytes: null, sampleCount: 0 });
+  }
+  assert.equal(JSON.stringify(result).includes("PRIVATE_CANARY"), false);
+  for (const invalid of [
+    { ...result, private: "PRIVATE_CANARY" },
+    { ...result, reloadSubstage: "PRIVATE_CANARY" },
+    { ...result, mounts: { ...result.mounts, private: "PRIVATE_CANARY" } },
+    { ...result, cgroup: { before: { oom: 0, oomKill: -1, oomGroupKill: null }, after: null } },
+    { ...result, cgroup: { before: { oom: 0, oomKill: 1, oomGroupKill: null, private: "PRIVATE_CANARY" }, after: null } },
+    { ...result, mounts: { ...result.mounts, home: { capacityBytes: 1, minimumFreeBytes: 2, sampleCount: 1 } } },
+    { ...result, mounts: { ...result.mounts, home: { capacityBytes: 1, minimumFreeBytes: 0, sampleCount: 0 } } },
+  ]) assert.equal(validateLinuxResourceDiagnostic(invalid), null);
+});
+
+test("Linux resource diagnostics coalesce samples and reject malformed counters and sizes", async () => {
+  let tick;
+  const collector = createLinuxResourceDiagnostics({
+    readFilesystem: async () => ({ bsize: 1024, blocks: 1, bavail: 2 }),
+    readCounters: async () => "oom 0\noom 1\noom_kill 2\n",
+    schedule: (callback) => { tick = callback; return 1; },
+    cancel: () => {},
+  });
+  await collector.start();
+  await collector.stop();
+  // A second collector checks that overlapping interval ticks share one sample.
+  assert.equal(collector.snapshot().cgroup.before, null);
+  assert.equal(collector.snapshot().mounts.home.sampleCount, 0);
+  let resolveSample;
+  let calls = 0;
+  const hold = new Promise((resolve) => { resolveSample = resolve; });
+  const serial = createLinuxResourceDiagnostics({
+    readFilesystem: async () => { if (++calls > 3 && calls <= 6) await hold; return { bsize: 1, blocks: 10, bavail: 5 }; },
+    readCounters: async () => "oom 0\noom_kill 0\n",
+    schedule: (callback) => { tick = callback; return 1; }, cancel: () => {},
+  });
+  await serial.start();
+  const first = tick();
+  assert.equal(tick(), first);
+  await Promise.resolve();
+  assert.equal(calls, 6);
+  resolveSample();
+  await first;
+  await serial.stop();
+  assert.equal(serial.snapshot().mounts.home.sampleCount, 3);
+});
+
+
+test("Linux resource diagnostic I/O is bounded and late observations cannot mutate evidence", async () => {
+  const pending = [];
+  const collector = createLinuxResourceDiagnostics({
+    readFilesystem: () => new Promise((resolve) => pending.push(resolve)),
+    readCounters: () => new Promise(() => {}),
+    schedule: () => 1, cancel: () => {},
+  });
+  await collector.start();
+  await collector.stop();
+  const result = collector.snapshot();
+  assert.equal(pending.length, 6);
+  assert.equal(result.mounts.sharedMemory.sampleCount, 0);
+  assert.deepEqual(result.cgroup, { before: null, after: null });
+  for (const resolve of pending) resolve({ bsize: 1024, blocks: 10, bavail: 5 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(collector.snapshot(), result);
 });

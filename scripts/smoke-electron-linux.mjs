@@ -15,6 +15,8 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  readFile,
+  statfs,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -51,6 +53,139 @@ export const LINUX_COMPANION_PROCESS_DIAGNOSTIC_SCHEMA =
   "tibotattle-electron-linux-companion-process-diagnostic-v1";
 export const LINUX_DASHBOARD_FAILURE_DIAGNOSTIC_SCHEMA =
   "tibotattle-electron-linux-dashboard-failure-diagnostic-v1";
+export const LINUX_RESOURCE_DIAGNOSTIC_SCHEMA = "tibotattle-electron-linux-resource-diagnostic-v1";
+const RELOAD_SUBSTAGES = new Set([
+  "not_started", "previous_status", "before_snapshot", "reload_command",
+  "fresh_document", "shell_assertions", "automatic_refresh", "completed",
+]);
+const RESOURCE_MOUNTS = Object.freeze({ sharedMemory: "/dev/shm", runtime: "/run/user/1000", home: "/home/node" });
+const CGROUP_EVENTS = "/sys/fs/cgroup/memory.events";
+const RESOURCE_SAMPLE_MS = 200;
+const RESOURCE_OBSERVATION_MS = 250;
+async function boundedResourceObservation(operation) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Resource diagnostic unavailable")), RESOURCE_OBSERVATION_MS);
+      }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
+const nonnegativeInteger = (value) => Number.isSafeInteger(value) && value >= 0;
+function exactFields(value, keys) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Reflect.ownKeys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+/** Closed stderr-only evidence. It never changes a qualification receipt. */
+export function validateLinuxResourceDiagnostic(value) {
+  if (!exactFields(value, ["schemaVersion", "reloadSubstage", "mounts", "cgroup"])
+      || value.schemaVersion !== LINUX_RESOURCE_DIAGNOSTIC_SCHEMA
+      || !RELOAD_SUBSTAGES.has(value.reloadSubstage)
+      || !exactFields(value.mounts, Object.keys(RESOURCE_MOUNTS))
+      || !exactFields(value.cgroup, ["before", "after"])) return null;
+  const mounts = {};
+  for (const key of Object.keys(RESOURCE_MOUNTS)) {
+    const sample = value.mounts[key];
+    if (!exactFields(sample, ["capacityBytes", "minimumFreeBytes", "sampleCount"])
+        || !nonnegativeInteger(sample.sampleCount)) return null;
+    if (sample.sampleCount === 0) {
+      if (sample.capacityBytes !== null || sample.minimumFreeBytes !== null) return null;
+    } else if (!nonnegativeInteger(sample.capacityBytes) || !nonnegativeInteger(sample.minimumFreeBytes)
+        || sample.minimumFreeBytes > sample.capacityBytes) return null;
+    mounts[key] = { capacityBytes: sample.capacityBytes, minimumFreeBytes: sample.minimumFreeBytes,
+      sampleCount: sample.sampleCount };
+  }
+  const cgroup = {};
+  for (const key of ["before", "after"]) {
+    const sample = value.cgroup[key];
+    if (sample !== null && (!exactFields(sample, ["oom", "oomKill", "oomGroupKill"])
+        || !nonnegativeInteger(sample.oom) || !nonnegativeInteger(sample.oomKill)
+        || sample.oomGroupKill !== null && !nonnegativeInteger(sample.oomGroupKill))) return null;
+    cgroup[key] = sample === null ? null : { oom: sample.oom, oomKill: sample.oomKill,
+      oomGroupKill: sample.oomGroupKill };
+  }
+  return { schemaVersion: LINUX_RESOURCE_DIAGNOSTIC_SCHEMA, reloadSubstage: value.reloadSubstage, mounts, cgroup };
+}
+
+export function createLinuxResourceDiagnostics({
+  readFilesystem = statfs,
+  readCounters = () => readFile(CGROUP_EVENTS, { encoding: "utf8", signal: AbortSignal.timeout(250) }),
+  schedule = setInterval,
+  cancel = clearInterval,
+} = {}) {
+  const mounts = Object.fromEntries(Object.keys(RESOURCE_MOUNTS).map((key) => [key,
+    { capacityBytes: null, minimumFreeBytes: null, sampleCount: 0 }]));
+  let before = null;
+  let after = null;
+  let interval;
+  let inFlight = null;
+  let stopped = false;
+  let substage = "not_started";
+  async function counters() {
+    try {
+      const text = await boundedResourceObservation(readCounters);
+      if (typeof text !== "string" || text.length > 4096) return null;
+      const values = new Map();
+      for (const line of text.trim().split("\n")) {
+        const match = /^(oom|oom_kill|oom_group_kill) ([0-9]+)$/u.exec(line);
+        if (!match) continue;
+        const number = Number(match[2]);
+        if (values.has(match[1]) || !nonnegativeInteger(number)) return null;
+        values.set(match[1], number);
+      }
+      if (!values.has("oom") || !values.has("oom_kill")) return null;
+      return { oom: values.get("oom"), oomKill: values.get("oom_kill"),
+        oomGroupKill: values.get("oom_group_kill") ?? null };
+    } catch { return null; }
+  }
+  async function sample() {
+    await Promise.all(Object.entries(RESOURCE_MOUNTS).map(async ([key, path]) => {
+      try {
+        const value = await boundedResourceObservation(() => readFilesystem(path));
+        const capacity = value.bsize * value.blocks;
+        const free = value.bsize * value.bavail;
+        if (!nonnegativeInteger(capacity) || !nonnegativeInteger(free) || free > capacity) return;
+        const old = mounts[key];
+        // A fixed mount changing size is not comparable; retain only prior observations.
+        if (old.capacityBytes !== null && old.capacityBytes !== capacity) return;
+        mounts[key] = { capacityBytes: capacity,
+          minimumFreeBytes: old.minimumFreeBytes === null ? free : Math.min(old.minimumFreeBytes, free),
+          sampleCount: old.sampleCount + 1 };
+      } catch { /* Unavailable observations stay explicit; no raw error is retained. */ }
+    }));
+  }
+  return Object.freeze({
+    setReloadSubstage(value) { if (RELOAD_SUBSTAGES.has(value)) substage = value; },
+    async start() {
+      before = await counters();
+      await sample();
+      try {
+        interval = schedule(() => {
+          if (stopped || inFlight !== null) return inFlight;
+          inFlight = sample().catch(() => {}).finally(() => { inFlight = null; });
+          return inFlight;
+        }, RESOURCE_SAMPLE_MS);
+        interval?.unref?.();
+      } catch { /* Diagnostics cannot decide qualification. */ }
+    },
+    async stop() {
+      if (stopped) return;
+      stopped = true;
+      try { if (interval !== undefined) cancel(interval); } catch { /* Diagnostic only. */ }
+      await inFlight;
+      await sample();
+      after = await counters();
+    },
+    snapshot() {
+      return validateLinuxResourceDiagnostic({ schemaVersion: LINUX_RESOURCE_DIAGNOSTIC_SCHEMA,
+        reloadSubstage: substage, mounts, cgroup: { before, after } });
+    },
+  });
+}
+
 const COMPANION_PROCESS_PREFIX = "TIBOTATTLE_ELECTRON_COMPANION_PROCESS ";
 const DASHBOARD_FAILURE_PREFIX = "TIBOTATTLE_ELECTRON_DASHBOARD_FAILURE ";
 const RENDER_PROCESS_FAILURE_REASONS = new Set([
@@ -1992,7 +2127,9 @@ export async function runSmoke({
   let failureStage = null;
   let rendererReadinessDiagnostics = null;
   let companionSnapshotObserver = null;
+  const resourceDiagnostics = createLinuxResourceDiagnostics();
   try {
+    try { await resourceDiagnostics.start(); } catch { /* Diagnostic only. */ }
     failureStage = "startup";
     if (!child.pid) fail("Electron did not provide a process id");
     const version = await waitFor(
@@ -2159,16 +2296,20 @@ export async function runSmoke({
     }
 
     failureStage = "reload_refresh";
+    resourceDiagnostics.setReloadSubstage("previous_status");
     const previousStatus = await jsonFetch(new URL("/api/local/refresh", dashboardUrl));
     const previousRefreshId = typeof previousStatus?.refresh?.refreshId === "string"
       ? previousStatus.refresh.refreshId
       : null;
+    resourceDiagnostics.setReloadSubstage("before_snapshot");
     const before = await cdp.evaluate(
       "({ timeOrigin: performance.timeOrigin, url: location.href })",
     );
     const beforeLoaderId = await mainFrameLoaderId(cdp);
     refreshObserver.reset();
+    resourceDiagnostics.setReloadSubstage("reload_command");
     await cdp.request("Page.reload", { ignoreCache: false });
+    resourceDiagnostics.setReloadSubstage("fresh_document");
     const fresh = await waitFor(
       async () => {
         const snapshot = await cdp.evaluate(`(() => ({
@@ -2190,14 +2331,17 @@ export async function runSmoke({
       MAX_STARTUP_MS,
       "dashboard fresh-document render",
     );
+    resourceDiagnostics.setReloadSubstage("shell_assertions");
     selectRequiredRefreshLoader(refreshObserver, fresh.loaderId);
     await assertRendererShell(cdp);
+    resourceDiagnostics.setReloadSubstage("automatic_refresh");
     const reloadStartupRefresh = await assertAutomaticStartupRefresh({
       child,
       dashboardUrl,
       refreshObserver,
       previousRefreshId,
     });
+    resourceDiagnostics.setReloadSubstage("completed");
     const startupRefresh = combineStartupRefreshEvidence(
       initialStartupRefresh,
       reloadStartupRefresh,
@@ -2294,6 +2438,11 @@ export async function runSmoke({
     return result;
   } catch (error) {
     forcedShutdown = true;
+    try {
+      await resourceDiagnostics.stop();
+      const diagnostic = resourceDiagnostics.snapshot();
+      if (diagnostic !== null) process.stderr.write(`${JSON.stringify(diagnostic)}\n`);
+    } catch { /* Diagnostic failure must preserve the original qualification failure. */ }
     if (isRendererReadinessFailureStage(failureStage)
         && onRendererReadinessDiagnostics !== null) {
       try {
@@ -2328,6 +2477,7 @@ export async function runSmoke({
     }
     throw error;
   } finally {
+    try { await resourceDiagnostics.stop(); } catch { /* Diagnostic only. */ }
     await companionSnapshotObserver?.stop?.();
     for (const page of attachedPages.values()) {
       page.rendererReadinessDiagnostics?.dispose?.();
