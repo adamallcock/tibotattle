@@ -154,19 +154,23 @@ by a usage field from another stream.
 The current unified usage path maps observed `fast`/`priority` to Fast and
 `default`/`standard` to standard, while absent evidence remains unknown. It
 retains own-file `rollout_thread_settings` versus `lineage_inherited` provenance
-locally. This path does not backfill history from the mutable thread-database
-setting. For Codex it leaves API service tier unknown rather than equating a
-subscription speed choice with an API tier. The v1/v1.1 projection sends the
-mode/tier labels but omits local `tierSource`, so historical hosted rows alone
-cannot distinguish those evidence bases.
+locally. The performance stream additionally distinguishes an explicit
+per-turn `turn_context.service_tier` declaration as
+`turn_context_service_tier`; it is the authoritative mode evidence at that
+turn's task boundary. This path does not backfill history from the mutable
+thread-database setting. For Codex it leaves API service tier unknown rather
+than equating a subscription speed choice with an API tier. The v1/v1.1
+projection sends the mode/tier labels but omits local `tierSource`, so
+historical hosted rows alone cannot distinguish those evidence bases.
 
 The performance cohort key retains `speedMode`, `speedModeSource` and
 `apiServiceTier` separately from model, effort and measurement method.
-Fast/standard/other requires observed own-file or qualified lineage evidence;
-unknown requires unobserved provenance, and a mixed turn stays mixed. The
-current timing parser qualifies own-file settings only; its existing fork
-exclusion remains in force. Supporting lineage in the wire vocabulary does
-not establish lineage evidence in this parser.
+Fast/standard/other requires observed own-file, explicit per-turn context, or
+qualified lineage evidence; unknown requires unobserved provenance, and a
+mixed turn stays mixed. The current timing parser qualifies own-file thread
+settings and explicit per-turn context declarations at the task boundary; its
+existing fork exclusion remains in force. Supporting lineage in the wire
+vocabulary does not establish lineage evidence in this parser.
 
 Settings apply only at or before the turn. A setting observed later cannot
 backfill an earlier turn, and a change during a turn prevents attributing the

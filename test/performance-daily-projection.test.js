@@ -164,6 +164,14 @@ test("projects eligible receipt and legacy rows while preserving independent met
     "fast", "lineage_inherited",
   ]);
 
+  const turnContext = byMethod(project([row({
+    speed_mode: "fast",
+    speed_mode_source: "turn_context_service_tier",
+  })]), "receipt");
+  assert.deepEqual([turnContext.speedMode, turnContext.speedModeSource], [
+    "fast", "turn_context_service_tier",
+  ]);
+
   const unavailable = byMethod(records, "unavailable");
   assert.equal(unavailable.speedTurns, 0);
   assert.equal(unavailable.ttftTurns, 1);
