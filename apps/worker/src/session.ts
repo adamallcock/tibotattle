@@ -11,6 +11,14 @@ import {
   timingSafeEqual,
 } from "./crypto";
 import { ApiError } from "./errors";
+import type { TelemetryAuthorityBackend } from "./telemetry-authority-backend";
+
+type SessionSource = D1Database | TelemetryAuthorityBackend;
+
+function authorityBackend(source: SessionSource): TelemetryAuthorityBackend | null {
+  return typeof (source as Partial<TelemetryAuthorityBackend>).sessions?.read === "function"
+    ? source as TelemetryAuthorityBackend : null;
+}
 
 export interface SessionMaterial {
   id: string;
@@ -77,8 +85,8 @@ interface UploadAuthorizationRow {
   issuing_session_expires_at: string;
 }
 
-function bytes(value: ArrayBuffer): Uint8Array {
-  return new Uint8Array(value);
+function bytes(value: ArrayBuffer | Uint8Array): Uint8Array {
+  return value instanceof Uint8Array ? new Uint8Array(value) : new Uint8Array(value);
 }
 
 function futureInstant(value: string, nowEpoch = Date.now()): boolean {
@@ -194,7 +202,7 @@ export function clearedSessionCookie(): string {
 }
 
 export async function authenticateSession(
-  db: D1Database,
+  db: SessionSource,
   cookieHeader: string | null,
   {
     allowDeleting = false,
@@ -205,7 +213,20 @@ export async function authenticateSession(
   } = {},
 ): Promise<SessionPrincipal> {
   const parsed = parseSessionToken(sessionCookieValue(cookieHeader));
-  const row = await db.prepare(
+  const backend = authorityBackend(db);
+  const authorityRow = backend ? await backend.sessions.read(parsed.id) : null;
+  const row = backend ? authorityRow && {
+    session_id: authorityRow.id,
+    participant_id: authorityRow.participantId,
+    secret_hash: authorityRow.secretHash,
+    csrf_hash: authorityRow.csrfHash,
+    expires_at: authorityRow.expiresAt,
+    session_state: authorityRow.state,
+    session_scope: authorityRow.scope,
+    participant_created_at: authorityRow.participantCreatedAt,
+    participant_state: authorityRow.participantState,
+    consent_version: authorityRow.consentVersion,
+  } : await (db as D1Database).prepare(
     `SELECT
       s.id AS session_id, s.participant_id, s.secret_hash, s.csrf_hash,
       s.expires_at, s.state AS session_state, s.scope AS session_scope,
@@ -321,10 +342,25 @@ export async function createUploadAuthorizationMaterial(
 }
 
 export async function storeUploadAuthorization(
-  db: D1Database,
+  db: SessionSource,
   authorization: UploadAuthorizationMaterial,
 ): Promise<void> {
-  const result = await db.prepare(
+  const backend = authorityBackend(db);
+  if (backend) {
+    await backend.sessionUploads.insert({
+      id: authorization.id,
+      participantId: authorization.participantId,
+      issuedBySessionId: authorization.issuedBySessionId,
+      secretHash: authorization.secretHash,
+      envelopeDigest: authorization.envelopeDigest,
+      bodyBytes: authorization.bodyBytes,
+      contentType: authorization.contentType,
+      issuedAt: authorization.issuedAt,
+      expiresAt: authorization.expiresAt,
+    });
+    return;
+  }
+  const result = await (db as D1Database).prepare(
     `INSERT INTO upload_authorizations (
       id, participant_id, issued_by_session_id, secret_hash, envelope_digest, body_bytes,
       content_type, state, issued_at, expires_at
@@ -352,7 +388,7 @@ function parseUploadAuthorization(header: string | null): { id: string; secret: 
 }
 
 export async function claimUploadAuthorization(
-  db: D1Database,
+  db: SessionSource,
   authorizationHeader: string | null,
   {
     envelopeDigest,
@@ -367,9 +403,32 @@ export async function claimUploadAuthorization(
   authorizationId: string;
   participantId: string;
   authorizationKind: "session";
+  leaseExpiresAt: string;
 }> {
   const parsed = parseUploadAuthorization(authorizationHeader);
-  const row = await db.prepare(
+  const backend = authorityBackend(db);
+  if (backend) {
+    const row = await backend.sessionUploads.read(parsed.id);
+    const presentedHash = await hashCapability("upload", parsed.id, parsed.secret);
+    if (!row || !timingSafeEqual(presentedHash, row.secretHash)
+        || row.state !== "unused" || row.participantState !== "active"
+        || row.issuingSessionState !== "active"
+        || !futureInstant(row.issuingSessionExpiresAt) || !futureInstant(row.expiresAt)
+        || row.envelopeDigest !== envelopeDigest || row.bodyBytes !== bodyBytes
+        || row.contentType !== contentType) {
+      throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+    }
+    const now = new Date().toISOString();
+    const leaseExpiresAt = new Date(Date.now() + UPLOAD_CONSUME_LEASE_MILLISECONDS).toISOString();
+    const claimedLease = await backend.sessionUploads.claim({
+      authorizationId: parsed.id, participantId: row.participantId, envelopeDigest,
+      bodyBytes, contentType, leaseExpiresAt, now,
+    });
+    if (claimedLease === null) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+    return { authorizationId: parsed.id, participantId: row.participantId,
+      authorizationKind: "session", leaseExpiresAt: claimedLease };
+  }
+  const row = await (db as D1Database).prepare(
     `SELECT u.*, p.state AS participant_state,
             s.state AS issuing_session_state,
             s.expires_at AS issuing_session_expires_at
@@ -398,7 +457,7 @@ export async function claimUploadAuthorization(
   const leaseExpiresAt = new Date(
     Date.now() + UPLOAD_CONSUME_LEASE_MILLISECONDS,
   ).toISOString();
-  const result = await db.prepare(
+  const result = await (db as D1Database).prepare(
     `UPDATE upload_authorizations
         SET state = 'consuming', consume_lease_expires_at = ?
       WHERE id = ? AND state = 'unused' AND expires_at > ?`,
@@ -408,25 +467,43 @@ export async function claimUploadAuthorization(
     authorizationId: parsed.id,
     participantId: row.participant_id,
     authorizationKind: "session" as const,
+    leaseExpiresAt,
   };
 }
 
 export async function recordUploadReceipt(
-  db: D1Database,
+  db: SessionSource,
   authorizationId: string,
   contributionId: string,
+  leaseExpiresAt: string,
 ): Promise<void> {
   const now = new Date().toISOString();
-  const result = await db.prepare(
+  const backend = authorityBackend(db);
+  if (backend) {
+    const current = await backend.sessionUploads.read(authorizationId);
+    if (!current) throw new ApiError(500, "INTERNAL_ERROR");
+    const accepted = await backend.sessionUploads.recordReceipt({
+      authorizationId, participantId: current.participantId, contributionId,
+      leaseExpiresAt, now,
+    });
+    if (!accepted) throw new ApiError(500, "INTERNAL_ERROR");
+    return;
+  }
+  const current = await (db as D1Database).prepare(
+    `SELECT participant_id FROM upload_authorizations WHERE id = ?`,
+  ).bind(authorizationId).first<{participant_id: string}>();
+  if (!current) throw new ApiError(500, "INTERNAL_ERROR");
+  const result = await (db as D1Database).prepare(
     `UPDATE upload_authorizations
         SET state = 'consumed', consumed_at = ?,
             consumed_contribution_id = ?, consume_lease_expires_at = NULL
       WHERE id = ? AND state = 'consuming'
+        AND consume_lease_expires_at = ?
         AND consume_lease_expires_at > ?
         AND expires_at > ?`,
-  ).bind(now, contributionId, authorizationId, now, now).run();
+  ).bind(now, contributionId, authorizationId, leaseExpiresAt, now, now).run();
   if (result.meta.changes === 1) return;
-  const existing = await db.prepare(
+  const existing = await (db as D1Database).prepare(
     `SELECT state, consumed_contribution_id
        FROM upload_authorizations WHERE id = ?`,
   ).bind(authorizationId).first<{
@@ -440,13 +517,21 @@ export async function recordUploadReceipt(
 }
 
 export async function abandonUploadAuthorization(
-  db: D1Database,
+  db: SessionSource,
   authorizationId: string,
+  participantId: string,
+  leaseExpiresAt: string,
 ): Promise<void> {
   const now = new Date().toISOString();
-  await db.prepare(
+  const backend = authorityBackend(db);
+  if (backend) {
+    await backend.sessionUploads.abandon({ authorizationId, participantId, leaseExpiresAt, now });
+    return;
+  }
+  await (db as D1Database).prepare(
     `UPDATE upload_authorizations
         SET state = 'revoked', revoked_at = ?, consume_lease_expires_at = NULL
-      WHERE id = ? AND state = 'consuming'`,
-  ).bind(now, authorizationId).run();
+      WHERE id = ? AND participant_id = ? AND state = 'consuming'
+        AND consume_lease_expires_at = ?`,
+  ).bind(now, authorizationId, participantId, leaseExpiresAt).run();
 }

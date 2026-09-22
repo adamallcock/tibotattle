@@ -83,7 +83,8 @@ async function makeInsert(
     chunkRowId: `chunk:synthetic-correction-${revision}-${crypto.randomUUID()}`,
     participantId: fixture.participantId, deviceId: fixture.deviceId, chunk, envelopeDigest,
     r2Key: `synthetic/v1-correction-${crypto.randomUUID()}`,
-    deviceUploadAuthorizationId: claimed.authorizationId, createdAt: new Date().toISOString(), supersedes,
+    deviceUploadAuthorizationId: claimed.authorizationId, uploadAuthorizationLeaseExpiresAt: claimed.leaseExpiresAt,
+    createdAt: new Date().toISOString(), supersedes,
   };
 }
 

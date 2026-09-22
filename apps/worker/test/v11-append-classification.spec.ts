@@ -93,7 +93,8 @@ async function legacy(fixture: Fixture, stream: TelemetryV11Stream, record: Tele
       privacyContractVersion: "ongoing-privacy-safe-telemetry-v1.0" }, records });
   await insertTelemetryV1Chunk(db(), { chunkRowId: `chunk:${crypto.randomUUID()}`, participantId: fixture.participantId,
     deviceId: fixture.deviceId, chunk, envelopeDigest, r2Key: `synthetic/legacy-${crypto.randomUUID()}`,
-    deviceUploadAuthorizationId: claimed.authorizationId, createdAt: new Date().toISOString(), supersedes: null });
+    deviceUploadAuthorizationId: claimed.authorizationId, uploadAuthorizationLeaseExpiresAt: claimed.leaseExpiresAt,
+    createdAt: new Date().toISOString(), supersedes: null });
 }
 async function enable(fixture: Fixture) {
   await db().prepare("UPDATE telemetry_transport_formats SET lifecycle='accepted' WHERE schema_version='telemetry-contribution-v1.1'").run();

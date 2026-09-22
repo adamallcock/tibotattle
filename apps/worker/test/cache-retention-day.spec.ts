@@ -1033,7 +1033,7 @@ describe('the cache-retention builder over the real v1 source reader',()=>{
      privacyContractVersion:'ongoing-privacy-safe-telemetry-v1.0'},records});
    await insertTypedTelemetryV1Chunk(sourceDb(),{chunkRowId:`chunk:${crypto.randomUUID()}`,
     participantId:device.participantId,deviceId:device.deviceId,chunk,envelopeDigest,
-    r2Key:`synthetic/v1-${crypto.randomUUID()}`,deviceUploadAuthorizationId:claim.authorizationId,
+    r2Key:`synthetic/v1-${crypto.randomUUID()}`,deviceUploadAuthorizationId:claim.authorizationId,uploadAuthorizationLeaseExpiresAt:claim.leaseExpiresAt,
     createdAt:new Date().toISOString(),supersedes:null} as TelemetryV1ChunkInsert,sourceNamespace);
   }
   for(let i=0;i<40;i++)if((await advanceStorageAnalytics(bindings())).state==='idle')break;

@@ -83,7 +83,8 @@ async function seedSources(count = 2,
   await insertTypedTelemetryV1Chunk(db(), {
     chunkRowId, participantId: fixture.participantId, deviceId: fixture.deviceId, chunk,
     envelopeDigest, r2Key: `synthetic/correction-${crypto.randomUUID()}`,
-    deviceUploadAuthorizationId: claimed.authorizationId, createdAt: new Date().toISOString(), supersedes: null,
+    deviceUploadAuthorizationId: claimed.authorizationId, uploadAuthorizationLeaseExpiresAt: claimed.leaseExpiresAt,
+    createdAt: new Date().toISOString(), supersedes: null,
   }, sourceNamespace);
   const rows = (await db().prepare(`
     SELECT v.storage_row_id,v.source_row_id,v.source_namespace,v.format,v.participant_id,v.device_id,
@@ -557,7 +558,8 @@ describe("staged usage correction repository", () => {
     const replacement = {
       chunkRowId: `chunk:${crypto.randomUUID()}`, participantId: fixture.participantId, deviceId: fixture.deviceId,
       chunk: replacementChunk, envelopeDigest, r2Key: `synthetic/correction-replacement-${crypto.randomUUID()}`,
-      deviceUploadAuthorizationId: claimed.authorizationId, createdAt: new Date().toISOString(), supersedes: prior,
+      deviceUploadAuthorizationId: claimed.authorizationId, uploadAuthorizationLeaseExpiresAt: claimed.leaseExpiresAt,
+      createdAt: new Date().toISOString(), supersedes: prior,
     };
     const state = await db().prepare(`
       SELECT namespace_id,next_source_row_id FROM typed_v1_admission_state WHERE id=1 LIMIT 1

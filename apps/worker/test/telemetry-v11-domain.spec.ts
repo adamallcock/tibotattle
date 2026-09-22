@@ -59,6 +59,7 @@ async function legacyUsage(fixture: Awaited<ReturnType<typeof createV11DeviceFix
   const id = `chunk:${crypto.randomUUID()}`;
   await insertTelemetryV1Chunk(db(), {chunkRowId: id, participantId: fixture.participantId, deviceId: fixture.deviceId,
     chunk, envelopeDigest, r2Key: `synthetic/legacy-${crypto.randomUUID()}`, deviceUploadAuthorizationId: claimed.authorizationId,
+    uploadAuthorizationLeaseExpiresAt: claimed.leaseExpiresAt,
     createdAt: new Date().toISOString(), supersedes: null});
   return id;
 }

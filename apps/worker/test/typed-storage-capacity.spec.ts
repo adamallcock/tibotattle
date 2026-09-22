@@ -32,7 +32,8 @@ async function fixture(format:'v1'|'v11'){
  const owner=await createV11DeviceFixture(db(),{grant:format==='v11'}),envelopeDigest=await sha256Hex(crypto.randomUUID());
  const principal=await authenticateDevice(db(),owner.authorization),upload=await createDeviceUploadAuthorization(db(),principal,envelopeDigest,200);
  const auth=await claimDeviceUploadAuthorization(db(),`Upload ${upload.uploadAuthorization}`,{envelopeDigest,bodyBytes:200,contentType:'application/json'});
- const common={chunkRowId:`chunk:${crypto.randomUUID()}`,r2Key:'synthetic/capacity',envelopeDigest,deviceUploadAuthorizationId:auth.authorizationId};
+ const common={chunkRowId:`chunk:${crypto.randomUUID()}`,r2Key:'synthetic/capacity',envelopeDigest,deviceUploadAuthorizationId:auth.authorizationId,
+  uploadAuthorizationLeaseExpiresAt:auth.leaseExpiresAt};
  if(format==='v11'){
   const prepared=await makeV11Day(day(),{usage:[v11UsageRecord(day())]});await registerTelemetryV11DayManifest(db(),owner,prepared.manifest);
   return {owner,auth,run:(target:D1Database)=>persistTypedV11StagedChunk(target,owner,prepared.chunks[0],{...common,sourceNamespace:namespace})};

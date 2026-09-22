@@ -53,7 +53,8 @@ async function seed(stream: 'usage' | 'quota' | 'session' = 'usage', count = 1, 
       privacyContractVersion: 'ongoing-privacy-safe-telemetry-v1.0' }, records });
   return { fixture, insert: { chunkRowId: `chunk:${crypto.randomUUID()}`, participantId: fixture.participantId,
     deviceId: fixture.deviceId, chunk, envelopeDigest, r2Key: `synthetic/proof-${crypto.randomUUID()}`,
-    deviceUploadAuthorizationId: claimed.authorizationId, createdAt: new Date().toISOString(), supersedes: null } as TelemetryV1ChunkInsert };
+    deviceUploadAuthorizationId: claimed.authorizationId, uploadAuthorizationLeaseExpiresAt: claimed.leaseExpiresAt,
+    createdAt: new Date().toISOString(), supersedes: null } as TelemetryV1ChunkInsert };
 }
 
 
@@ -66,7 +67,7 @@ async function write(database:D1Database,f:Fixture,records:TelemetryV1Record[],s
  const claim=await claimDeviceUploadAuthorization(database,`Upload ${authorization.uploadAuthorization}`,{envelopeDigest,bodyBytes:200,contentType:'application/json'});
  const chunk=parseTelemetryV1Chunk({schemaVersion:'telemetry-contribution-v1.0',chunkId:`${stream}:${day()}:${seq}`,chunkRevision:1,
   chunkDigest:await sha256Hex(canonicalTelemetryV11Json(records)),parserVersion:'synthetic-reader',consent:{telemetrySchemaVersion:'telemetry-contribution-v1.0',fieldDictionaryVersion:'telemetry-v1.0-registry-2026-08-07.1',privacyContractVersion:'ongoing-privacy-safe-telemetry-v1.0'},records});
- const insert={chunkRowId:`chunk:${crypto.randomUUID()}`,participantId:f.participantId,deviceId:f.deviceId,chunk,envelopeDigest,r2Key:`synthetic/reader-${crypto.randomUUID()}`,deviceUploadAuthorizationId:claim.authorizationId,createdAt:new Date().toISOString(),supersedes:null};
+ const insert={chunkRowId:`chunk:${crypto.randomUUID()}`,participantId:f.participantId,deviceId:f.deviceId,chunk,envelopeDigest,r2Key:`synthetic/reader-${crypto.randomUUID()}`,deviceUploadAuthorizationId:claim.authorizationId,uploadAuthorizationLeaseExpiresAt:claim.leaseExpiresAt,createdAt:new Date().toISOString(),supersedes:null};
  if(database===source())await insertTypedTelemetryV1Chunk(database,insert,namespace);else await insertTelemetryV1Chunk(database,insert);
 }
 async function both(f:Awaited<ReturnType<typeof pair>>,records:TelemetryV1Record[],stream:'quota'|'usage',seq=0){await write(source(),f.typed,records,stream,seq);await write(raw(),f.original,records,stream,seq);}

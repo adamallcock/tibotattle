@@ -135,7 +135,7 @@ async function fixture(extraUsageCount=0){
     chunkDigest:await sha256Hex(canonicalJson(page)),parserVersion:'synthetic-history',consent:{telemetrySchemaVersion:'telemetry-contribution-v1.0',
      fieldDictionaryVersion:'telemetry-v1.0-registry-2026-08-07.1',privacyContractVersion:'ongoing-privacy-safe-telemetry-v1.0'},records:page});
    await insertTypedTelemetryV1Chunk(source(),{chunkRowId:`chunk:${crypto.randomUUID()}`,participantId:owner.participantId,deviceId:owner.deviceId,
-    chunk,envelopeDigest:digest,r2Key:`synthetic/${key}:${offset/200}`,deviceUploadAuthorizationId:claim.authorizationId,createdAt:new Date().toISOString(),supersedes:null},namespace);
+    chunk,envelopeDigest:digest,r2Key:`synthetic/${key}:${offset/200}`,deviceUploadAuthorizationId:claim.authorizationId,uploadAuthorizationLeaseExpiresAt:claim.leaseExpiresAt,createdAt:new Date().toISOString(),supersedes:null},namespace);
   }
  }
  for(let n=0;n<30;n++)if((await advanceStorageAnalytics(bindings())).state==='idle')break;

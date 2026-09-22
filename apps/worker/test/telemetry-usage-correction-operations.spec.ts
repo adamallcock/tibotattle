@@ -102,6 +102,7 @@ async function seedV1Source(): Promise<TelemetryUsageCorrectionSource> {
     envelopeDigest,
     r2Key: `synthetic/correction-erasure/${crypto.randomUUID()}`,
     deviceUploadAuthorizationId: claimed.authorizationId,
+    uploadAuthorizationLeaseExpiresAt: claimed.leaseExpiresAt,
     createdAt: new Date().toISOString(),
     supersedes: null,
   }, sourceNamespace);

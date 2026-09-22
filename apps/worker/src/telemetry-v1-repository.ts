@@ -1,4 +1,8 @@
-import { createD1TelemetryV1ContributionStore } from "./d1-telemetry-v1-contribution-store";
+import {
+  createD1TelemetryV1ContributionStore,
+  prepareD1TelemetryV1ChunkWrite,
+  type D1TelemetryV1PreparedRecords,
+} from "./d1-telemetry-v1-contribution-store";
 import { canonicalJson } from "./canonical-json";
 import { sha256Hex } from "./crypto";
 import { ApiError } from "./errors";
@@ -157,6 +161,8 @@ export interface TelemetryV1ChunkInsert {
   participantId: string;
   deviceId: string;
   deviceUploadAuthorizationId: string;
+  /** Exact lease returned by the one-use upload claim. */
+  uploadAuthorizationLeaseExpiresAt: string;
   chunkRowId: string;
   r2Key: string;
   envelopeDigest: string;
@@ -174,6 +180,7 @@ export async function insertTelemetryV1Chunk(
     participantId: insert.participantId,
     deviceId: insert.deviceId,
     uploadAuthorizationId: insert.deviceUploadAuthorizationId,
+    uploadAuthorizationLeaseExpiresAt: uploadAuthorizationLeaseExpiresAt(insert),
     chunkId: insert.chunkRowId,
     objectKey: insert.r2Key,
     envelopeDigest: insert.envelopeDigest,
@@ -182,6 +189,35 @@ export async function insertTelemetryV1Chunk(
     createdAt: insert.createdAt,
   });
 }
+
+function uploadAuthorizationLeaseExpiresAt(insert: TelemetryV1ChunkInsert): string {
+  const lease = Reflect.get(insert, "uploadAuthorizationLeaseExpiresAt");
+  if (typeof lease !== "string" || lease.length === 0) {
+    throw new ApiError(500, "INTERNAL_ERROR");
+  }
+  return lease;
+}
+
+/** Compatibility entrypoint backed by the canonical D1 contribution adapter. */
+export function prepareTelemetryV1ChunkWrite(
+  db: D1Database,
+  insert: TelemetryV1ChunkInsert,
+  records?: D1TelemetryV1PreparedRecords,
+): { statements: D1PreparedStatement[]; chunkStatementIndex: number } {
+  return prepareD1TelemetryV1ChunkWrite(db, {
+    participantId: insert.participantId,
+    deviceId: insert.deviceId,
+    uploadAuthorizationId: insert.deviceUploadAuthorizationId,
+    uploadAuthorizationLeaseExpiresAt: uploadAuthorizationLeaseExpiresAt(insert),
+    chunkId: insert.chunkRowId,
+    objectKey: insert.r2Key,
+    envelopeDigest: insert.envelopeDigest,
+    chunk: insert.chunk,
+    supersedes: insert.supersedes === null ? null : { id: insert.supersedes.id },
+    createdAt: insert.createdAt,
+  }, records);
+}
+
 
 /**
  * The consent-once record is written by the claim of a v1.0-consented

@@ -42,7 +42,8 @@ async function upload(fixture: Fixture) {
   const authorization = await createDeviceUploadAuthorization(db(), principal, envelopeDigest, 200);
   const claimed = await claimDeviceUploadAuthorization(db(), `Upload ${authorization.uploadAuthorization}`,
     { envelopeDigest, bodyBytes: 200, contentType: "application/json" });
-  return { envelopeDigest, authorizationId: claimed.authorizationId };
+  return { envelopeDigest, authorizationId: claimed.authorizationId,
+    uploadAuthorizationLeaseExpiresAt: claimed.leaseExpiresAt };
 }
 
 async function prepareChunk(fixture: Fixture, options: {
@@ -64,6 +65,7 @@ async function prepareChunk(fixture: Fixture, options: {
         privacyContractVersion: "ongoing-privacy-safe-telemetry-v1.0",
       }, records }),
     envelopeDigest: grant.envelopeDigest, deviceUploadAuthorizationId: grant.authorizationId,
+    uploadAuthorizationLeaseExpiresAt: grant.uploadAuthorizationLeaseExpiresAt,
     r2Key: `synthetic/graph-preservation/${crypto.randomUUID()}`, createdAt: new Date().toISOString(),
     supersedes: options.supersedes ?? null,
   };

@@ -38,7 +38,8 @@ async function seedV1(count: number) {
       privacyContractVersion: "ongoing-privacy-safe-telemetry-v1.0" }, records });
   await insertTelemetryV1Chunk(source(), { chunkRowId: `chunk:${crypto.randomUUID()}`, participantId: fixture.participantId,
     deviceId: fixture.deviceId, chunk, envelopeDigest, r2Key: `synthetic/copy-${crypto.randomUUID()}`,
-    deviceUploadAuthorizationId: claimed.authorizationId, createdAt: new Date().toISOString(), supersedes: null });
+    deviceUploadAuthorizationId: claimed.authorizationId, uploadAuthorizationLeaseExpiresAt: claimed.leaseExpiresAt,
+    createdAt: new Date().toISOString(), supersedes: null });
   return fixture;
 }
 async function seedV11() {

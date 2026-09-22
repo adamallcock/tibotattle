@@ -81,6 +81,7 @@ async function legacyUsage(fixture: DeviceFixture, day: string, records: Telemet
     chunkRowId: id, participantId: fixture.participantId, deviceId: fixture.deviceId, chunk,
     envelopeDigest, r2Key: `synthetic/daily-spend-${crypto.randomUUID()}`,
     deviceUploadAuthorizationId: claimed.authorizationId,
+    uploadAuthorizationLeaseExpiresAt: claimed.leaseExpiresAt,
     createdAt: options.createdAt ?? new Date().toISOString(), supersedes: null,
   });
   return id;

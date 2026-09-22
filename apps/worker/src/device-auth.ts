@@ -19,6 +19,14 @@ import {
   timingSafeEqual,
 } from "./crypto";
 import { ApiError } from "./errors";
+import type { TelemetryAuthorityBackend } from "./telemetry-authority-backend";
+
+type DeviceSource = D1Database | TelemetryAuthorityBackend;
+
+function authorityBackend(source: DeviceSource): TelemetryAuthorityBackend | null {
+  return typeof (source as Partial<TelemetryAuthorityBackend>).devices?.readUpload === "function"
+    ? source as TelemetryAuthorityBackend : null;
+}
 
 const UUID_V4 =
   "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
@@ -101,6 +109,7 @@ export interface DeviceUploadClaim {
   authorizationId: string;
   participantId: string;
   authorizationKind: "device";
+  leaseExpiresAt: string;
 }
 
 export type DeviceTransportConsentVersion =
@@ -204,8 +213,8 @@ function transportConsentAllowedForParticipant(
     && participantConsentVersion === TELEMETRY_CONSENT_VERSION;
 }
 
-function bytes(value: ArrayBuffer): Uint8Array {
-  return new Uint8Array(value);
+function bytes(value: ArrayBuffer | Uint8Array): Uint8Array {
+  return value instanceof Uint8Array ? new Uint8Array(value) : new Uint8Array(value);
 }
 
 function lifecyclePolicy(
@@ -1478,7 +1487,7 @@ export async function createDeviceUploadAuthorization(
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
   const secretHash = await deviceUploadHash(id, secret);
-  const result = await db.prepare(
+  const result = await (db as D1Database).prepare(
     `INSERT INTO device_upload_authorizations (
       id, participant_id, issued_by_device_id, secret_hash, envelope_digest,
       body_bytes, content_type, state, issued_at, expires_at
@@ -1540,7 +1549,7 @@ export async function createDeviceUploadAuthorization(
 }
 
 export async function claimDeviceUploadAuthorization(
-  db: D1Database,
+  db: DeviceSource,
   authorizationHeader: string | null,
   {
     envelopeDigest,
@@ -1553,7 +1562,28 @@ export async function claimDeviceUploadAuthorization(
   },
 ): Promise<DeviceUploadClaim> {
   const parsed = parseDeviceUploadAuthorization(authorizationHeader);
-  const row = await db.prepare(
+  const backend = authorityBackend(db);
+  if (backend) {
+    const row = await backend.devices.readUpload(parsed.id);
+    const presentedHash = await deviceUploadHash(parsed.id, parsed.secret);
+    if (!row || !timingSafeEqual(presentedHash, row.secretHash)
+        || row.state !== "unused" || row.participantState !== "active"
+        || row.deviceState !== "active" || !futureInstant(row.deviceExpiresAt)
+        || !futureInstant(row.expiresAt) || row.envelopeDigest !== envelopeDigest
+        || row.bodyBytes !== bodyBytes || row.contentType !== contentType) {
+      throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+    }
+    const now = new Date().toISOString();
+    const leaseExpiresAt = new Date(Date.now() + UPLOAD_CONSUME_LEASE_MILLISECONDS).toISOString();
+    const claimedLease = await backend.devices.claimUpload({
+      authorizationId: parsed.id, participantId: row.participantId, deviceId: row.issuedByDeviceId,
+      envelopeDigest, bodyBytes, contentType, leaseExpiresAt, now,
+    });
+    if (claimedLease === null) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+    return { authorizationId: parsed.id, participantId: row.participantId,
+      authorizationKind: "device", leaseExpiresAt: claimedLease };
+  }
+  const row = await (db as D1Database).prepare(
     `SELECT upload.*, participant.state AS participant_state,
             device.state AS device_state, device.expires_at AS device_expires_at
        FROM device_upload_authorizations upload
@@ -1581,7 +1611,7 @@ export async function claimDeviceUploadAuthorization(
   const leaseExpiresAt = new Date(
     Date.now() + UPLOAD_CONSUME_LEASE_MILLISECONDS,
   ).toISOString();
-  const result = await db.prepare(
+  const result = await (db as D1Database).prepare(
     `UPDATE device_upload_authorizations
         SET state = 'consuming', consume_lease_expires_at = ?
       WHERE id = ? AND state = 'unused' AND expires_at > ?
@@ -1622,20 +1652,38 @@ export async function claimDeviceUploadAuthorization(
     authorizationId: parsed.id,
     participantId: row.participant_id,
     authorizationKind: "device",
+    leaseExpiresAt,
   };
 }
 
 export async function recordDeviceUploadReceipt(
-  db: D1Database,
+  db: DeviceSource,
   authorizationId: string,
   contributionId: string,
+  leaseExpiresAt: string,
 ): Promise<void> {
   const now = new Date().toISOString();
-  const result = await db.prepare(
+  const backend = authorityBackend(db);
+  if (backend) {
+    const current = await backend.devices.readUpload(authorizationId);
+    if (!current) throw new ApiError(500, "INTERNAL_ERROR");
+    const accepted = await backend.devices.recordUploadReceipt({
+      authorizationId, participantId: current.participantId, deviceId: current.issuedByDeviceId,
+      contributionId, leaseExpiresAt, now,
+    });
+    if (!accepted) throw new ApiError(500, "INTERNAL_ERROR");
+    return;
+  }
+  const current = await (db as D1Database).prepare(
+    `SELECT participant_id, issued_by_device_id FROM device_upload_authorizations WHERE id = ?`,
+  ).bind(authorizationId).first<{participant_id: string; issued_by_device_id: string}>();
+  if (!current) throw new ApiError(500, "INTERNAL_ERROR");
+  const result = await (db as D1Database).prepare(
     `UPDATE device_upload_authorizations
         SET state = 'consumed', consumed_at = ?,
             consumed_contribution_id = ?, consume_lease_expires_at = NULL
       WHERE id = ? AND state = 'consuming'
+        AND consume_lease_expires_at = ?
         AND consume_lease_expires_at > ?
         AND expires_at > ?
         AND (
@@ -1667,9 +1715,9 @@ export async function recordDeviceUploadReceipt(
                AND grant_row.state = 'active' AND grant_row.expires_at = ledger.expires_at
           )
         )`,
-  ).bind(now, contributionId, authorizationId, now, now, now).run();
+  ).bind(now, contributionId, authorizationId, leaseExpiresAt, now, now, now).run();
   if (result.meta.changes === 1) return;
-  const existing = await db.prepare(
+  const existing = await (db as D1Database).prepare(
     `SELECT state, consumed_contribution_id
        FROM device_upload_authorizations WHERE id = ?`,
   ).bind(authorizationId).first<{
@@ -1683,15 +1731,23 @@ export async function recordDeviceUploadReceipt(
 }
 
 export async function abandonDeviceUploadAuthorization(
-  db: D1Database,
+  db: DeviceSource,
   authorizationId: string,
+  participantId: string,
+  leaseExpiresAt: string,
 ): Promise<void> {
   const now = new Date().toISOString();
-  await db.prepare(
+  const backend = authorityBackend(db);
+  if (backend) {
+    await backend.devices.abandonUpload({ authorizationId, participantId, leaseExpiresAt, now });
+    return;
+  }
+  await (db as D1Database).prepare(
     `UPDATE device_upload_authorizations
         SET state = 'revoked', revoked_at = ?, consume_lease_expires_at = NULL
-      WHERE id = ? AND state = 'consuming'`,
-  ).bind(now, authorizationId).run();
+      WHERE id = ? AND participant_id = ? AND state = 'consuming'
+        AND consume_lease_expires_at = ?`,
+  ).bind(now, authorizationId, participantId, leaseExpiresAt).run();
 }
 
 export async function listParticipantDevices(

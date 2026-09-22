@@ -51,7 +51,8 @@ async function seed(stream: 'usage' | 'quota' | 'session' = 'usage', count = 1, 
       privacyContractVersion: 'ongoing-privacy-safe-telemetry-v1.0' }, records });
   return { fixture, insert: { chunkRowId: `chunk:${crypto.randomUUID()}`, participantId: fixture.participantId,
     deviceId: fixture.deviceId, chunk, envelopeDigest, r2Key: `synthetic/proof-${crypto.randomUUID()}`,
-    deviceUploadAuthorizationId: claimed.authorizationId, createdAt: new Date().toISOString(), supersedes: null } as TelemetryV1ChunkInsert };
+    deviceUploadAuthorizationId: claimed.authorizationId, uploadAuthorizationLeaseExpiresAt: claimed.leaseExpiresAt,
+    createdAt: new Date().toISOString(), supersedes: null } as TelemetryV1ChunkInsert };
 }
 
 async function stamp(){return {
