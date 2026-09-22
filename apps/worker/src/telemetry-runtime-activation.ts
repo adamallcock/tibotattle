@@ -8,7 +8,9 @@ import {
   TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
 } from "@app-usagemonitor/telemetry-contract";
 import { readCollectionControls } from "./collection-controls";
-import { beginAdminOperation, finishAdminOperation } from "./admin-operations";
+import { beginAdminOperationWithId, finishAdminOperation } from "./admin-operations";
+import { sha256Hex } from "./crypto";
+import { D1_PROVIDER_SCHEMA_PREDICATE } from "./d1-provider-schema";
 import { ApiError } from "./errors";
 import {
   parseTelemetryStorageMode,
@@ -29,10 +31,31 @@ export const TELEMETRY_RUNTIME_ACTIVATION_CONFIRMATIONS = Object.freeze({
 
 export type TelemetryRuntimeActivationTarget = keyof typeof TELEMETRY_RUNTIME_ACTIVATION_CONFIRMATIONS;
 
+export const TELEMETRY_RUNTIME_RECONCILIATION_SCHEMA =
+  "typed-forward-post-deploy-reconciliation-v1" as const;
+
+export interface TelemetryRuntimeReconciliationRole {
+  readonly schemaSha256: string;
+  readonly ledgerSha256: string;
+}
+
+export interface TelemetryRuntimeReconciliationProof {
+  readonly schema: typeof TELEMETRY_RUNTIME_RECONCILIATION_SCHEMA;
+  readonly capturedAt: string;
+  readonly sourceCommit: string;
+  readonly versionId: string;
+  readonly configSha256: string;
+  readonly primary: TelemetryRuntimeReconciliationRole;
+  readonly analytics: TelemetryRuntimeReconciliationRole;
+  readonly proofSha256: string;
+}
+
 export interface TelemetryRuntimeActivationRequest {
+  readonly idempotencyKey: string;
   readonly target: TelemetryRuntimeActivationTarget;
   readonly expectedRevision: number;
   readonly confirmation: string;
+  readonly reconciliation: TelemetryRuntimeReconciliationProof;
 }
 
 export interface TelemetryRuntimeActivationResult {
@@ -63,6 +86,21 @@ export const EXPECTED_PRIMARY_MIGRATIONS = Object.freeze([
   Object.freeze({
     name: "0009_performance_reports.sql",
     sha256: "cfd43797151ea3d5a6740da9792be49bf897968094347cd6fbbb9a0cf6510825",
+  }),
+] as const);
+
+export const EXPECTED_ANALYTICS_MIGRATIONS = Object.freeze([
+  Object.freeze({
+    name: "0024_effective_owner_daily_cursor.sql",
+    sha256: "f4eef3495ae3e5f1088ddea695607471dcbc2ea871291274ce50ef1295a05e68",
+  }),
+  Object.freeze({
+    name: "0025_effective_graph_source.sql",
+    sha256: "a99ba82106e53ac2eda3ac9078784e22774ba0fc099265a66dacc5b1765fe84b",
+  }),
+  Object.freeze({
+    name: "0026_cache_retention_effective_layout.sql",
+    sha256: "bac1838613b292b97bfee5022f6b43b6f52c9bc225d6d26f918cdcd7e454a2a1",
   }),
 ] as const);
 
@@ -371,6 +409,9 @@ const EXPECTED_PRIMARY_SCHEMA_OBJECTS: readonly SchemaObjectPin[] = Object.freez
 interface RuntimeActivationEnv {
   readonly TELEMETRY_STORAGE_MODE?: unknown;
   readonly TELEMETRY_STORAGE_NAMESPACE?: unknown;
+  readonly DEPLOYMENT_SOURCE_COMMIT?: unknown;
+  readonly ANALYTICS_DB?: unknown;
+  readonly STORAGE_ANALYTICS_DB?: unknown;
 }
 
 interface UsageRuntimeRow {
@@ -402,11 +443,155 @@ function unavailableActivation(): never {
   throw new ApiError(503, "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE");
 }
 
+function reconciliationRequired(): never {
+  throw new ApiError(503, "TELEMETRY_RUNTIME_ACTIVATION_RECONCILE_REQUIRED");
+}
+
+const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
+const COMMIT_PATTERN = /^[a-f0-9]{40}$/u;
+const UUID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => (
+      `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`
+    )).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+/**
+ * Canonical content for an operator reconciliation proof without its
+ * self-digest.  The migration operator and the Worker intentionally share
+ * this small value-level convention without importing an operator script into
+ * product code.
+ */
+export function canonicalTelemetryRuntimeReconciliationJson(
+  proof: Omit<TelemetryRuntimeReconciliationProof, "proofSha256">,
+): string {
+  return canonicalJson(proof);
+}
+
+interface ReconciliationSchemaRow {
+  readonly type: string;
+  readonly name: string;
+  readonly tbl_name: string;
+  readonly sql: string | null;
+}
+
+interface ReconciliationLedgerRow {
+  readonly name: string;
+  readonly sha256: string;
+}
+
+function compareSchemaText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function canonicalSchemaRows(rows: readonly ReconciliationSchemaRow[]): string {
+  const filtered = rows
+    .filter((row) => !row.name.startsWith("sqlite_")
+      && row.tbl_name !== "d1_storage_migrations")
+    .map((row) => ({
+      type: row.type,
+      name: row.name,
+      tbl_name: row.tbl_name,
+      sql: row.sql,
+    }))
+    .sort((left, right) => compareSchemaText(left.type, right.type)
+      || compareSchemaText(left.name, right.name));
+  return canonicalJson(filtered);
+}
+
+function canonicalLedgerRows(rows: readonly ReconciliationLedgerRow[]): string {
+  return canonicalJson(rows.map((row) => ({ name: row.name, sha256: row.sha256 })));
+}
+
+/** Hash the same ordered schema/ledger value that the forward operator stores. */
+export async function telemetryRuntimeReconciliationDigests(
+  db: D1Database,
+): Promise<TelemetryRuntimeReconciliationRole> {
+  const schema = (await db.prepare(
+    `SELECT s.type, s.name, s.tbl_name, s.sql
+       FROM sqlite_schema s
+      WHERE s.name NOT GLOB 'sqlite_*'
+        AND s.tbl_name <> 'd1_storage_migrations'
+        AND NOT (${D1_PROVIDER_SCHEMA_PREDICATE})
+      ORDER BY s.type, s.name`,
+  ).all<ReconciliationSchemaRow>()).results;
+  const ledger = (await db.prepare(
+    "SELECT name, sha256 FROM d1_storage_migrations ORDER BY rowid LIMIT 129",
+  ).all<ReconciliationLedgerRow>()).results;
+  if (schema.length > 4096 || ledger.length > 512
+      || schema.some((row) => typeof row.type !== "string"
+        || typeof row.name !== "string"
+        || typeof row.tbl_name !== "string"
+        || (typeof row.sql !== "string" && row.sql !== null))
+      || ledger.some((row) => typeof row.name !== "string"
+        || !SHA256_PATTERN.test(row.sha256))) {
+    unavailableActivation();
+  }
+  return {
+    schemaSha256: await sha256Hex(canonicalSchemaRows(schema)),
+    ledgerSha256: await sha256Hex(canonicalLedgerRows(ledger)),
+  };
+}
+
 function exactObject(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   return typeof value === "object"
     && value !== null
     && !Array.isArray(value)
     && Object.keys(value).sort().join("\0") === [...keys].sort().join("\0");
+}
+
+function canonicalIso(value: unknown): value is string {
+  return typeof value === "string"
+    && Number.isFinite(Date.parse(value))
+    && new Date(value).toISOString() === value;
+}
+
+function parseReconciliationRole(value: unknown): TelemetryRuntimeReconciliationRole {
+  if (!exactObject(value, ["ledgerSha256", "schemaSha256"])
+      || typeof value.schemaSha256 !== "string"
+      || typeof value.ledgerSha256 !== "string"
+      || !SHA256_PATTERN.test(value.schemaSha256)
+      || !SHA256_PATTERN.test(value.ledgerSha256)) {
+    invalidActivation();
+  }
+  return Object.freeze({
+    schemaSha256: value.schemaSha256,
+    ledgerSha256: value.ledgerSha256,
+  });
+}
+
+function parseReconciliationProof(value: unknown): TelemetryRuntimeReconciliationProof {
+  if (!exactObject(value, [
+    "analytics", "capturedAt", "configSha256", "primary", "proofSha256",
+    "schema", "sourceCommit", "versionId",
+  ])
+      || value.schema !== TELEMETRY_RUNTIME_RECONCILIATION_SCHEMA
+      || !canonicalIso(value.capturedAt)
+      || typeof value.sourceCommit !== "string"
+      || !COMMIT_PATTERN.test(value.sourceCommit)
+      || typeof value.versionId !== "string"
+      || !UUID_PATTERN.test(value.versionId)
+      || typeof value.configSha256 !== "string"
+      || !SHA256_PATTERN.test(value.configSha256)
+      || typeof value.proofSha256 !== "string"
+      || !SHA256_PATTERN.test(value.proofSha256)) {
+    invalidActivation();
+  }
+  return Object.freeze({
+    schema: TELEMETRY_RUNTIME_RECONCILIATION_SCHEMA,
+    capturedAt: value.capturedAt,
+    sourceCommit: value.sourceCommit,
+    versionId: value.versionId,
+    configSha256: value.configSha256,
+    primary: parseReconciliationRole(value.primary),
+    analytics: parseReconciliationRole(value.analytics),
+    proofSha256: value.proofSha256,
+  });
 }
 
 export function parseTelemetryRuntimeActivationRequest(
@@ -415,13 +600,19 @@ export function parseTelemetryRuntimeActivationRequest(
   if (!exactObject(value, ["action", "telemetryRuntimeActivation"])
       || value.action !== "run_maintenance") invalidActivation();
   const rawTarget = value.telemetryRuntimeActivation;
-  if (!exactObject(rawTarget, ["confirmation", "expectedRevision", "target"])) {
+  if (!exactObject(rawTarget, [
+    "confirmation", "expectedRevision", "idempotencyKey", "reconciliation", "target",
+  ])) {
     invalidActivation();
   }
   const targetValue = rawTarget.target;
   const expectedRevision = rawTarget.expectedRevision;
   const confirmation = rawTarget.confirmation;
+  const idempotencyKey = rawTarget.idempotencyKey;
+  const reconciliation = parseReconciliationProof(rawTarget.reconciliation);
   if ((targetValue !== "usage_v12" && targetValue !== "performance")
+      || typeof idempotencyKey !== "string"
+      || !UUID_PATTERN.test(idempotencyKey)
       || typeof expectedRevision !== "number"
       || !Number.isSafeInteger(expectedRevision)
       || expectedRevision < 1
@@ -431,13 +622,17 @@ export function parseTelemetryRuntimeActivationRequest(
   }
   const target = targetValue as TelemetryRuntimeActivationTarget;
   return Object.freeze({
+    idempotencyKey,
     target,
     expectedRevision: expectedRevision as number,
     confirmation: confirmation as string,
+    reconciliation,
   });
 }
 
-async function assertPrimarySchemaIsComplete(db: D1Database): Promise<void> {
+async function assertPrimarySchemaIsComplete(
+  db: D1Database,
+): Promise<TelemetryRuntimeReconciliationRole> {
   try {
     // Keep each query below D1's bound-parameter ceiling even as the pinned
     // schema grows with the v1/v1.1 compatibility surface.
@@ -456,8 +651,8 @@ async function assertPrimarySchemaIsComplete(db: D1Database): Promise<void> {
     }
 
     const ledgerRows = (await db.prepare(
-      "SELECT name, sha256 FROM d1_storage_migrations",
-    ).all<{ name: string; sha256: string }>()).results;
+      "SELECT name, sha256 FROM d1_storage_migrations ORDER BY rowid",
+    ).all<ReconciliationLedgerRow>()).results;
     const ledger = new Map(ledgerRows.map((row) => [row.name, row.sha256]));
     if (EXPECTED_PRIMARY_MIGRATIONS.some((migration) => ledger.get(migration.name) !== migration.sha256)) {
       unavailableActivation();
@@ -471,8 +666,86 @@ async function assertPrimarySchemaIsComplete(db: D1Database): Promise<void> {
         || !performanceSql.sql.includes("measurement_version TEXT NOT NULL CHECK (measurement_version = 'model-performance-samples-v1')")) {
       unavailableActivation();
     }
+    return await telemetryRuntimeReconciliationDigests(db);
   } catch (error) {
     if (error instanceof ApiError) throw error;
+    unavailableActivation();
+  }
+}
+
+async function assertAnalyticsSchemaIsComplete(
+  db: D1Database,
+): Promise<TelemetryRuntimeReconciliationRole> {
+  try {
+    const names = [
+      "analytics_runtime_sources",
+      "analytics_community_daily_owners",
+      "analytics_community_graph_results",
+      "analytics_cache_retention_day_marks",
+    ];
+    const rows = (await db.prepare(
+      `SELECT type, name FROM sqlite_schema WHERE name IN (${names.map(() => "?").join(",")})`,
+    ).bind(...names).all<{ type: string; name: string }>()).results;
+    if (rows.length !== names.length
+        || names.some((name) => !rows.some((row) => row.type === "table" && row.name === name))) {
+      unavailableActivation();
+    }
+    const ledger = (await db.prepare(
+      "SELECT name, sha256 FROM d1_storage_migrations ORDER BY rowid",
+    ).all<ReconciliationLedgerRow>()).results;
+    const byName = new Map(ledger.map((row) => [row.name, row.sha256]));
+    if (EXPECTED_ANALYTICS_MIGRATIONS.some((migration) => byName.get(migration.name) !== migration.sha256)) {
+      unavailableActivation();
+    }
+    return await telemetryRuntimeReconciliationDigests(db);
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    unavailableActivation();
+  }
+}
+
+async function assertReconciliationProof(
+  db: D1Database,
+  env: RuntimeActivationEnv,
+  proof: TelemetryRuntimeReconciliationProof,
+  nowEpoch: number,
+): Promise<void> {
+  const capturedAt = Date.parse(proof.capturedAt);
+  if (!Number.isFinite(capturedAt)
+      || capturedAt > nowEpoch
+      || nowEpoch - capturedAt > 86_400_000) unavailableActivation();
+  const unsigned = {
+    schema: proof.schema,
+    capturedAt: proof.capturedAt,
+    sourceCommit: proof.sourceCommit,
+    versionId: proof.versionId,
+    configSha256: proof.configSha256,
+    primary: proof.primary,
+    analytics: proof.analytics,
+  } satisfies Omit<TelemetryRuntimeReconciliationProof, "proofSha256">;
+  if (await sha256Hex(canonicalTelemetryRuntimeReconciliationJson(unsigned)) !== proof.proofSha256) {
+    unavailableActivation();
+  }
+
+  const configuredSource = Reflect.get(env, "DEPLOYMENT_SOURCE_COMMIT");
+  if (typeof configuredSource !== "string" || !COMMIT_PATTERN.test(configuredSource)
+      || proof.sourceCommit !== configuredSource) {
+    unavailableActivation();
+  }
+
+  const analytics = (Reflect.get(env, "ANALYTICS_DB")
+    ?? Reflect.get(env, "STORAGE_ANALYTICS_DB")) as D1Database | undefined;
+  if (!analytics || typeof analytics.prepare !== "function" || analytics === db) {
+    unavailableActivation();
+  }
+  const [primary, analytical] = await Promise.all([
+    assertPrimarySchemaIsComplete(db),
+    assertAnalyticsSchemaIsComplete(analytics),
+  ]);
+  if (primary.schemaSha256 !== proof.primary.schemaSha256
+      || primary.ledgerSha256 !== proof.primary.ledgerSha256
+      || analytical.schemaSha256 !== proof.analytics.schemaSha256
+      || analytical.ledgerSha256 !== proof.analytics.ledgerSha256) {
     unavailableActivation();
   }
 }
@@ -555,48 +828,57 @@ function assertPerformanceTuple(row: PerformanceRuntimeRow): void {
       || row.method_version !== "performance-daily-histogram-v1") unavailableActivation();
 }
 
-async function casActivateUsage(
-  db: D1Database,
-  input: TelemetryRuntimeActivationRequest,
-  now: string,
-): Promise<{ state: "active"; policy_revision: number }> {
-  const row = await db.prepare(
-    `UPDATE telemetry_v12_runtime
-        SET state = 'active', policy_revision = policy_revision + 1, changed_at = ?
-      WHERE id = 1 AND state = 'staged' AND policy_revision = ?
-        AND schema_version = ? AND envelope_schema_version = ?
-        AND field_dictionary_version = ? AND privacy_contract_version = ?
-        AND max_day_chunks = ? AND max_chunk_records = ? AND max_day_bytes = ?
-      RETURNING state, policy_revision`,
-  ).bind(
-    now,
-    input.expectedRevision,
-    TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
-    "telemetry-envelope-v1.2",
-    TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
-    TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
-    4_096,
-    200,
-    64_000_000,
-  ).first<{ state: "active"; policy_revision: number }>();
-  if (!row || row.state !== "active" || row.policy_revision !== input.expectedRevision + 1) {
-    throw new ApiError(409, "ADMIN_ACTION_CONFLICT");
+function auditDetailsJson(value: unknown): string {
+  const json = JSON.stringify(value);
+  if (typeof json !== "string" || json.length > 2_000) {
+    throw new ApiError(503, "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE");
   }
-  return row;
+  return json;
 }
 
-async function casActivatePerformance(
+function activationMutation(
   db: D1Database,
   input: TelemetryRuntimeActivationRequest,
+  controlsRevision: number,
   now: string,
-): Promise<{ state: "active"; policy_revision: number }> {
-  const row = await db.prepare(
+): D1PreparedStatement {
+  const controlGuard = `
+        AND EXISTS (
+          SELECT 1 FROM collection_controls controls
+           WHERE controls.singleton = 1
+             AND controls.upload_registration_enabled = 1
+             AND controls.processing_enabled = 1
+             AND controls.revision = ?
+        )`;
+  if (input.target === "usage_v12") {
+    return db.prepare(
+      `UPDATE telemetry_v12_runtime
+          SET state = 'active', policy_revision = policy_revision + 1, changed_at = ?
+        WHERE id = 1 AND state = 'staged' AND policy_revision = ?
+          AND schema_version = ? AND envelope_schema_version = ?
+          AND field_dictionary_version = ? AND privacy_contract_version = ?
+          AND max_day_chunks = ? AND max_chunk_records = ? AND max_day_bytes = ?
+          ${controlGuard}`,
+    ).bind(
+      now,
+      input.expectedRevision,
+      TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+      "telemetry-envelope-v1.2",
+      TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
+      TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
+      4_096,
+      200,
+      64_000_000,
+      controlsRevision,
+    );
+  }
+  return db.prepare(
     `UPDATE telemetry_performance_runtime
         SET state = 'active', policy_revision = policy_revision + 1, updated_at = ?
       WHERE id = 1 AND state = 'staged' AND policy_revision = ?
         AND schema_version = ? AND field_dictionary_version = ?
         AND privacy_contract_version = ? AND method_version = ?
-      RETURNING state, policy_revision`,
+        ${controlGuard}`,
   ).bind(
     now,
     input.expectedRevision,
@@ -604,17 +886,202 @@ async function casActivatePerformance(
     PERFORMANCE_FIELD_DICTIONARY_VERSION,
     PERFORMANCE_PRIVACY_CONTRACT_VERSION,
     "performance-daily-histogram-v1",
-  ).first<{ state: "active"; policy_revision: number }>();
-  if (!row || row.state !== "active" || row.policy_revision !== input.expectedRevision + 1) {
+    controlsRevision,
+  );
+}
+
+async function activateAndAuditAtomically(
+  db: D1Database,
+  input: TelemetryRuntimeActivationRequest,
+  operationId: string,
+  controlsRevision: number,
+  now: string,
+  successDetails: unknown,
+): Promise<{ state: "active"; policy_revision: number }> {
+  const mutation = activationMutation(
+    db, input, controlsRevision, now,
+  );
+  const audit = db.prepare(
+    `UPDATE admin_action_audit
+        SET outcome = 'success', details_json = ?
+      WHERE operation_id = ? AND outcome = 'started' AND changes() = 1`,
+  ).bind(auditDetailsJson(successDetails), operationId);
+  const results = await db.batch([mutation, audit]);
+  const mutationChanges = Number(results[0]?.meta?.changes ?? 0);
+  const auditChanges = Number(results[1]?.meta?.changes ?? 0);
+  if (mutationChanges !== 1 || auditChanges !== 1) {
+    throw new DeterministicActivationBatchError(mutationChanges, auditChanges);
+  }
+  const row = input.target === "usage_v12"
+    ? await readUsageRuntime(db)
+    : await readPerformanceRuntime(db);
+  if (row.state !== "active" || row.policy_revision !== input.expectedRevision + 1) {
+    reconciliationRequired();
+  }
+  return { state: "active", policy_revision: row.policy_revision };
+}
+
+/**
+ * D1 returned a completed batch result, so this outcome is not a lost
+ * response. In particular, a zero-row CAS is a deterministic loser and must
+ * never inspect the now-active runtime and claim another operation's success.
+ */
+class DeterministicActivationBatchError extends Error {
+  constructor(
+    readonly mutationChanges: number,
+    readonly auditChanges: number,
+  ) {
+    super(`telemetry runtime activation batch changed ${mutationChanges}/${auditChanges} rows`);
+    this.name = "DeterministicActivationBatchError";
+  }
+}
+
+type RuntimeStateRow = UsageRuntimeRow | PerformanceRuntimeRow;
+
+async function readTargetRuntime(
+  db: D1Database,
+  target: TelemetryRuntimeActivationTarget,
+): Promise<RuntimeStateRow> {
+  return target === "usage_v12" ? readUsageRuntime(db) : readPerformanceRuntime(db);
+}
+
+function activationResult(
+  operationId: string,
+  input: TelemetryRuntimeActivationRequest,
+  row: { state: "active"; policy_revision: number },
+): TelemetryRuntimeActivationResult {
+  return Object.freeze({
+    task: "telemetry_runtime_activation",
+    operationId,
+    target: input.target,
+    state: row.state,
+    fromRevision: input.expectedRevision,
+    toRevision: row.policy_revision,
+    revision: row.policy_revision,
+  });
+}
+
+interface AuditOutcomeRow {
+  readonly operation_id: string;
+  readonly action: string;
+  readonly outcome: "started" | "success" | "failure";
+  readonly details_json: string;
+}
+
+async function readActivationAudit(
+  db: D1Database,
+  operationId: string,
+): Promise<AuditOutcomeRow | null> {
+  return db.prepare(
+    `SELECT operation_id, action, outcome, details_json
+       FROM admin_action_audit
+      WHERE operation_id = ?`,
+  ).bind(operationId).first<AuditOutcomeRow>();
+}
+
+function activationDetailsMatch(
+  detailsJson: string,
+  input: TelemetryRuntimeActivationRequest,
+): Record<string, unknown> | null {
+  let details: unknown;
+  try {
+    details = JSON.parse(detailsJson);
+  } catch {
+    return null;
+  }
+  if (!details || typeof details !== "object" || Array.isArray(details)) return null;
+  const value = details as Record<string, unknown>;
+  if (value.schemaVersion !== ACTIVATION_SCHEMA_VERSION
+      || value.task !== "telemetry_runtime_activation"
+      || value.idempotencyKey !== input.idempotencyKey
+      || value.target !== input.target
+      || value.expectedRevision !== input.expectedRevision
+      || canonicalJson(value.reconciliation) !== canonicalJson(input.reconciliation)) {
     throw new ApiError(409, "ADMIN_ACTION_CONFLICT");
   }
-  return row;
+  return value;
+}
+
+async function resolveExistingActivation(
+  db: D1Database,
+  input: TelemetryRuntimeActivationRequest,
+  runtime: RuntimeStateRow,
+): Promise<TelemetryRuntimeActivationResult | null> {
+  const existing = await readActivationAudit(db, input.idempotencyKey);
+  if (existing === null) return null;
+  if (existing.action !== "run_maintenance") {
+    throw new ApiError(409, "ADMIN_ACTION_CONFLICT");
+  }
+  const details = activationDetailsMatch(existing.details_json, input);
+  if (details === null) reconciliationRequired();
+  if (existing.outcome === "failure") throw new ApiError(409, "ADMIN_ACTION_CONFLICT");
+  if (runtime.state !== "active" || runtime.policy_revision !== input.expectedRevision + 1) {
+    reconciliationRequired();
+  }
+  const toRevision = details.toRevision;
+  const state = details.state;
+  if (existing.outcome === "success"
+      && state === "active"
+      && toRevision === input.expectedRevision + 1) {
+    return activationResult(existing.operation_id, input, {
+      state: "active",
+      policy_revision: runtime.policy_revision,
+    });
+  }
+  // The runtime update and terminal success audit are one atomic D1 batch.
+  // An active row with a started audit therefore cannot be safely attributed
+  // to this operation; never promote it based on runtime state alone.
+  reconciliationRequired();
+}
+
+async function recoverActiveActivation(
+  db: D1Database,
+  input: TelemetryRuntimeActivationRequest,
+  runtime: RuntimeStateRow,
+): Promise<TelemetryRuntimeActivationResult | null> {
+  if (runtime.state !== "active" || runtime.policy_revision !== input.expectedRevision + 1) {
+    return null;
+  }
+  return resolveExistingActivation(db, input, runtime);
+}
+
+async function reconcilePostMutation(
+  db: D1Database,
+  input: TelemetryRuntimeActivationRequest,
+  operationId: string,
+): Promise<TelemetryRuntimeActivationResult | null> {
+  let runtime: RuntimeStateRow;
+  let audit: AuditOutcomeRow | null;
+  try {
+    [runtime, audit] = await Promise.all([
+      readTargetRuntime(db, input.target),
+      readActivationAudit(db, operationId),
+    ]);
+  } catch {
+    reconciliationRequired();
+  }
+  if (runtime.state === "active" && runtime.policy_revision === input.expectedRevision + 1) {
+    if (audit !== null && audit.action !== "run_maintenance") reconciliationRequired();
+    const result = activationResult(operationId, input, {
+      state: "active",
+      policy_revision: runtime.policy_revision,
+    });
+    if (audit?.outcome === "success") return result;
+    // Atomicity means a committed own activation always has a success audit.
+    // A started audit beside an active row is an ambiguous state and must be
+    // left untouched for exact operator reconciliation.
+    reconciliationRequired();
+  }
+  if (runtime.state === "staged" && runtime.policy_revision === input.expectedRevision) {
+    return null;
+  }
+  reconciliationRequired();
 }
 
 /**
  * Activate one independent hosted telemetry runtime after all local gates have
- * been proved.  This function performs no remote migration and never treats a
- * replay of an already-active row as success.
+ * been proved. This function performs no remote migration. Exact replay of the
+ * same committed operation is safe; a different operation cannot inherit it.
  */
 export async function activateTelemetryRuntimeAsOwner(
   db: D1Database,
@@ -626,66 +1093,152 @@ export async function activateTelemetryRuntimeAsOwner(
   if (!Number.isSafeInteger(nowEpoch) || nowEpoch < 0) {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   }
-  const operationId = await beginAdminOperation(db, actorIdentityKey, "run_maintenance", {
-    schemaVersion: ACTIVATION_SCHEMA_VERSION,
-    task: "telemetry_runtime_activation",
-    target: input.target,
-    expectedRevision: input.expectedRevision,
-  }, nowEpoch);
   const auditBase = {
     schemaVersion: ACTIVATION_SCHEMA_VERSION,
     task: "telemetry_runtime_activation",
+    idempotencyKey: input.idempotencyKey,
     target: input.target,
     expectedRevision: input.expectedRevision,
+    reconciliation: input.reconciliation,
   };
+  let operationId: string | null = null;
+  let mutationAttempted = false;
   try {
     await assertTypedStorage(db, env);
-    await readCollectionControls(db).then((controls) => {
-      if (!controls.uploadRegistration) throw new ApiError(503, "UPLOAD_REGISTRATION_DISABLED");
-      if (!controls.processing) throw new ApiError(503, "PROCESSING_DISABLED");
-    });
-    await assertPrimarySchemaIsComplete(db);
-    const now = new Date(nowEpoch).toISOString();
-    let row: { state: "active"; policy_revision: number };
-    if (input.target === "usage_v12") {
-      const runtime = await readUsageRuntime(db);
-      assertRevisionForActivation(runtime.state, runtime.policy_revision, input.expectedRevision);
-      assertUsageTuple(runtime);
-      row = await casActivateUsage(db, input, now);
-    } else {
-      const runtime = await readPerformanceRuntime(db);
-      assertRevisionForActivation(runtime.state, runtime.policy_revision, input.expectedRevision);
-      assertPerformanceTuple(runtime);
-      row = await casActivatePerformance(db, input, now);
+    const controls = await readCollectionControls(db);
+    if (!controls.uploadRegistration) throw new ApiError(503, "UPLOAD_REGISTRATION_DISABLED");
+    if (!controls.processing) throw new ApiError(503, "PROCESSING_DISABLED");
+    await assertReconciliationProof(db, env, input.reconciliation, nowEpoch);
+    const runtime = await readTargetRuntime(db, input.target);
+    if (runtime.state === "active") {
+      const recovered = await recoverActiveActivation(db, input, runtime);
+      if (recovered !== null) return recovered;
+      throw new ApiError(409, "ADMIN_ACTION_CONFLICT");
     }
-    const result: TelemetryRuntimeActivationResult = Object.freeze({
-      task: "telemetry_runtime_activation",
+    const existing = await readActivationAudit(db, input.idempotencyKey);
+    if (existing !== null) {
+      if (existing.action !== "run_maintenance") {
+        throw new ApiError(409, "ADMIN_ACTION_CONFLICT");
+      }
+      activationDetailsMatch(existing.details_json, input);
+      if (existing.outcome !== "started"
+          || runtime.state !== "staged"
+          || runtime.policy_revision !== input.expectedRevision) {
+        throw new ApiError(409, "ADMIN_ACTION_CONFLICT");
+      }
+      // A crash after the durable intent row and before the D1 batch leaves a
+      // staged runtime with a started audit. Reuse that exact operation id so
+      // the retry completes the original intent instead of inserting a second
+      // audit operation.
+      operationId = existing.operation_id;
+    }
+    assertRevisionForActivation(runtime.state, runtime.policy_revision, input.expectedRevision);
+    if (input.target === "usage_v12") {
+      if (!("envelope_schema_version" in runtime)) unavailableActivation();
+      assertUsageTuple(runtime);
+    } else {
+      if (!("method_version" in runtime)) unavailableActivation();
+      assertPerformanceTuple(runtime);
+    }
+    if (operationId === null) {
+      try {
+        operationId = await beginAdminOperationWithId(
+          db,
+          input.idempotencyKey,
+          actorIdentityKey,
+          "run_maintenance",
+          auditBase,
+          nowEpoch,
+        );
+      } catch (error) {
+        const raced = await readActivationAudit(db, input.idempotencyKey);
+        if (raced !== null) {
+          if (raced.action !== "run_maintenance") {
+            throw new ApiError(409, "ADMIN_ACTION_CONFLICT");
+          }
+          activationDetailsMatch(raced.details_json, input);
+          const racedRuntime = await readTargetRuntime(db, input.target);
+          if (raced.outcome === "started"
+              && racedRuntime.state === "staged"
+              && racedRuntime.policy_revision === input.expectedRevision) {
+            operationId = raced.operation_id;
+          } else if (racedRuntime.state === "active") {
+            const recovered = await resolveExistingActivation(db, input, racedRuntime);
+            if (recovered !== null) return recovered;
+          } else if (raced.outcome === "failure") {
+            throw new ApiError(409, "ADMIN_ACTION_CONFLICT");
+          } else {
+            // A successful intent without the expected active runtime, or a
+            // started intent at another staged revision, is not safe to
+            // inherit from a raced insert. Leave it for explicit recovery.
+            reconciliationRequired();
+          }
+        }
+        if (operationId !== null) {
+          // The competing insert was the only failure; continue with the
+          // already durable intent below.
+        } else {
+          throw error;
+        }
+      }
+    }
+    const now = new Date(nowEpoch).toISOString();
+    mutationAttempted = true;
+    const row = await activateAndAuditAtomically(
+      db,
+      input,
       operationId,
-      target: input.target,
-      state: row.state,
-      fromRevision: input.expectedRevision,
-      toRevision: row.policy_revision,
-      revision: row.policy_revision,
-    });
-    await finishAdminOperation(db, operationId, "success", {
-      ...auditBase,
-      fromRevision: result.fromRevision,
-      toRevision: result.toRevision,
-      state: result.state,
-    });
-    return result;
+      controls.revision,
+      now,
+      {
+        ...auditBase,
+        fromRevision: input.expectedRevision,
+        toRevision: input.expectedRevision + 1,
+        state: "active",
+      },
+    );
+    return activationResult(operationId, input, row);
   } catch (error) {
+    const deterministicBatch = error instanceof DeterministicActivationBatchError
+      ? error
+      : null;
     const safeError = error instanceof ApiError
       ? error
-      : new ApiError(503, "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE");
-    try {
-      await finishAdminOperation(db, operationId, "failure", {
-        ...auditBase,
-        code: safeError.code,
-      });
-    } catch {
-      // Preserve the original failure; an incomplete audit cannot become a
-      // false activation success.
+      : deterministicBatch?.mutationChanges === 0
+        ? new ApiError(409, "ADMIN_ACTION_CONFLICT")
+        : deterministicBatch !== null
+          ? new ApiError(503, "TELEMETRY_RUNTIME_ACTIVATION_RECONCILE_REQUIRED")
+          : new ApiError(503, "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE");
+    // Only an exception from D1 itself leaves the batch outcome unknown. A
+    // returned zero-row result is deterministic and must not reconcile against
+    // a runtime transition committed by a competing operation.
+    if (mutationAttempted && operationId !== null && deterministicBatch === null) {
+      try {
+        const recovered = await reconcilePostMutation(db, input, operationId);
+        if (recovered !== null) return recovered;
+      } catch (reconciliationError) {
+        if (reconciliationError instanceof ApiError
+            && reconciliationError.code === "TELEMETRY_RUNTIME_ACTIVATION_RECONCILE_REQUIRED") {
+          throw reconciliationError;
+        }
+        throw new ApiError(503, "TELEMETRY_RUNTIME_ACTIVATION_RECONCILE_REQUIRED");
+      }
+    }
+    // A returned one-row runtime mutation with a missing terminal audit is a
+    // known, unsafe partial state. Leave it for exact operation-id recovery
+    // instead of recording a false failure.
+    if (deterministicBatch !== null && deterministicBatch.mutationChanges === 1) {
+      throw safeError;
+    }
+    if (operationId !== null) {
+      try {
+        await finishAdminOperation(db, operationId, "failure", {
+          ...auditBase,
+          code: safeError.code,
+        });
+      } catch {
+        if (mutationAttempted) reconciliationRequired();
+      }
     }
     throw safeError;
   }
