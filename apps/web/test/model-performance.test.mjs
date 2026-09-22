@@ -12,6 +12,20 @@ function payload() {
     models: [{ id: 'gpt-5.6-sol', label: 'Sol', turns: 20, speedTurns: 10, ttftTurns: 15, timedResponses: 45, toolFreeTurns: 0, toolFree: [],
       speed: [{ method: 'speed', points: [point(), point(3 * DAY)] }], ttft: [point(), point(3 * DAY), point(4 * DAY)] }] };
 }
+test('GPT-6 Sol and Luna DTOs retain generation labels and refuse unreviewed suffixes', () => {
+  const data = payload();
+  data.models.push(...[['gpt-6-sol', 'GPT-6 Sol'], ['gpt-6-luna', 'GPT-6 Luna'], ['gpt-5.6-luna', 'Luna']]
+    .map(([id, label]) => ({ ...structuredClone(data.models[0]), id, label })));
+  assert.equal(normalizeModelPerformance(data), data);
+  for (const model of ['gpt-6-sol', 'gpt-6-luna']) {
+    const suffix = structuredClone(data);
+    suffix.models.find(row => row.id === model).id += '-unreviewed';
+    assert.equal(normalizeModelPerformance(suffix), null);
+    const mislabeled = structuredClone(data);
+    mislabeled.models.find(row => row.id === model).label = model.endsWith('sol') ? 'Sol' : 'Luna';
+    assert.equal(normalizeModelPerformance(mislabeled), null);
+  }
+});
 function legacyToolFreePayload() {
   const data = payload(); data.schemaVersion = 3; data.method = 4;
   Object.assign(data.models[0], { toolFreeTurns: 2, toolFree: [point(DAY, 2)] });
@@ -369,6 +383,25 @@ test('horizontal hover bins are calendar-aligned including unobserved days and e
   assert.equal(performanceHoverBin(1, domain, 'day'), 9*DAY);
   assert.equal(performanceHoverBin(.5, domain, 'day'), 6*DAY);
   assert.equal((performanceHoverBin(.5, domain, 'week') - 4*DAY) % (7*DAY), 0);
+});
+test('performance cards render separate GPT-6 generations with their shared family icons', async () => {
+  const dom = focusHarness();
+  const data = payload();
+  data.models.push(...[['gpt-6-sol', 'GPT-6 Sol'], ['gpt-6-luna', 'GPT-6 Luna'], ['gpt-5.6-luna', 'Luna']]
+    .map(([id, label]) => ({ ...structuredClone(data.models[0]), id, label })));
+  const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => data },
+    t: (key, values) => translate(key, values, 'en-US') });
+  try {
+    dom.show(); await controller.refresh();
+    for (const name of ['GPT-5.6 Sol', 'GPT-5.6 Luna', 'GPT-6 Sol', 'GPT-6 Luna']) {
+      assert.ok(dom.root.all().some(node => node.textContent === name), name);
+    }
+    for (const family of ['sol', 'luna']) {
+      const buttons = dom.root.all().filter(node => node.tagName === 'button');
+      assert.equal(buttons.filter(button => button.all().some(node => node.className ===
+        `allowance-model-icon performance-model-icon allowance-model-${family}`)).length, 2);
+    }
+  } finally { controller.destroy(); }
 });
 test('plot-area sweep works away from points, clears on exit, and keyboard order follows dates', async () => {
   const dom = focusHarness();

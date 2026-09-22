@@ -169,6 +169,51 @@ describe("server pricing", () => {
     }
   });
 
+  it("prices Sol and Luna through validated client/server contracts at every tier and context boundary", () => {
+    const expected = {
+      "gpt-6-sol": {
+        standard: ["1.399998", "1.4", "2.300004"],
+        batch: ["0.699999", "0.7", "1.150002"],
+        flex: ["0.699999", "0.7", "1.150002"],
+        priority: ["2.799996", "2.8", "4.600008"],
+      },
+      "gpt-6-luna": {
+        standard: ["0.0699999", "0.07", "0.1150002"],
+        batch: ["0.03499995", "0.035", "0.0575001"],
+        flex: ["0.03499995", "0.035", "0.0575001"],
+        priority: ["0.1399998", "0.14", "0.2300004"],
+      },
+    } as const;
+    for (const modelId of ["gpt-6-sol", "gpt-6-luna"] as const) {
+      for (const apiServiceTier of ["standard", "batch", "flex", "priority"] as const) {
+        for (const [index, totalInputContextTokens] of [271_999, 272_000, 272_001].entries()) {
+          const event = validateIngestibleEvent(fixture({
+            modelId, eventTime: "2026-09-22T18:00:00.000Z",
+            billingSurface: "openai_api", apiServiceTier, speedMode: "standard",
+            totalInputContextTokens,
+            components: { ...fixture().components,
+              inputUncachedTokens: totalInputContextTokens - 172_000,
+              inputCacheReadTokens: 100_000, inputCacheWriteTokens: 72_000,
+              outputTextTokens: 40_000, outputReasoningTokens: 60_000,
+            },
+          }));
+          const server = priceTelemetryUsageEvent(event);
+          const local = priceCodexUsageEvent({ model: modelId, timestamp: event.eventTime,
+            totalInputContextTokens, components: event.components,
+          }, { apiServiceTier, priceEpochBasis: "event_time" });
+          expect(server.coverageStatus).toBe("fully_priced");
+          expect(server.exactCostUsd).toBe(expected[modelId][apiServiceTier][index]);
+          expect(server.exactCostUsd).toBe(local.totalUsd);
+          expect(server.selectedPriceCardIds).toEqual(local.selectedPriceCardIds);
+          expect(server.registryVersion).toBe(local.registry?.version);
+          expect(server.registrySha256).toBe(local.registry?.sha256);
+          expect(priceTelemetryUsageEvent({ ...event, eventTime: "2026-09-21T23:59:59.999Z" }).coverageStatus).toBe("unpriced");
+          expect(priceTelemetryUsageEvent({ ...event, totalInputContextTokens: null }).coverageStatus).toBe("unpriced");
+        }
+      }
+    }
+  });
+
   it("uses Astra's API 2x Fast ratio while rejecting missing context and pre-release price epochs", () => {
     const event = validateIngestibleEvent(fixture({
       modelId: "gpt-6-astra", eventTime: "2026-09-03T12:00:00.000Z",
@@ -227,8 +272,8 @@ describe("server pricing", () => {
       }
     }
     expect(checkedAstra).toBe(2);
-    expect(checked - checkedAstra).toBe(26);
-    expect(checked).toBe(28);
+    expect(checked - checkedAstra).toBe(30);
+    expect(checked).toBe(32);
     const provenance: SpeedModeProvenance = "assumed_fast_scenario";
     expect(resolveEffectiveSpeedMode({ unresolvedScenario: "unresolved_as_fast" }).provenance).toBe(provenance);
   });

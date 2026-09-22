@@ -82,6 +82,8 @@
         "o3-mini",
         "o3-pro",
         "o4-mini",
+        "gpt-6-sol",
+        "gpt-6-luna",
         "claude-fable-5",
         "claude-haiku-4-5-20251001",
         "claude-opus-4-8",
@@ -274,7 +276,9 @@
               "o3",
               "o3-mini",
               "o3-pro",
-              "o4-mini"
+              "o4-mini",
+              "gpt-6-sol",
+              "gpt-6-luna"
             ]
           }
         }

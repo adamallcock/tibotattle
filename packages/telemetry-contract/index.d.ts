@@ -99,6 +99,8 @@ export const TELEMETRY_MODEL_IDS: readonly [
   "o3-mini",
   "o3-pro",
   "o4-mini",
+  "gpt-6-sol",
+  "gpt-6-luna",
 ];
 export type TelemetryModelId = typeof TELEMETRY_MODEL_IDS[number];
 
@@ -110,7 +112,7 @@ export interface ReviewedModelIdentity {
   readonly pricingStatus: "published" | "assumed_alias" | "unpriced";
   readonly priceModelId: Exclude<TelemetryModelId, "unknown"> | null;
 }
-export const REVIEWED_MODEL_CATALOG_VERSION: "reviewed-model-catalog-2026-09-03.1";
+export const REVIEWED_MODEL_CATALOG_VERSION: "reviewed-model-catalog-2026-09-22.1";
 export const REVIEWED_MODEL_CATALOG: readonly ReviewedModelIdentity[];
 export const REVIEWED_CODEX_MODEL_IDS: readonly Exclude<TelemetryModelId, "unknown">[];
 export const REVIEWED_CLAUDE_MODEL_IDS: readonly Exclude<TelemetryModelId, "unknown">[];

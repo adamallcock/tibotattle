@@ -37,9 +37,11 @@ remains accountable for release wording, validation, signing, and publication.
 
 0.1.24 source integration includes telemetry v1.2 and the Standard/Fast timing
 correction. Hosted rollout and final artifact qualification remain in progress.
-Publication is held pending final model details and pricing.
+Final GPT-6 Sol and Luna pricing is included in the candidate.
 See the [candidate release notes](./release-notes/0.1.24.md).
 
+- Add GPT-6 Sol and Luna recognition and shared client/server prices for all
+  four processing modes and both context bands, using the existing family icons.
 - Enable local Model performance on Windows, following protected-reader and
   packaged-source qualification in [PR #199](https://github.com/adamallcock/tibotattle/pull/199).
 - Repair Windows task names and project grouping reported in

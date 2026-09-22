@@ -8,6 +8,7 @@ export const MODEL_PERFORMANCE_SPEED_MODES = Object.freeze(['standard', 'fast'])
 export const modelPerformanceSnapshotKey = (period, speedMode) => `${period}:${speedMode}`;
 const DAY = 86_400_000;
 const MODEL_NAMES = Object.freeze({
+  'gpt-6-luna': 'GPT-6 Luna', 'gpt-6-sol': 'GPT-6 Sol',
   'gpt-5.6-luna': 'Luna', 'gpt-5.6-terra': 'Terra', 'gpt-5.6-sol': 'Sol',
   'gpt-6-astra': 'Astra', 'gpt-5.5': 'GPT-5.5', 'gpt-5.4': 'GPT-5.4',
   'gpt-5.4-mini': 'GPT-5.4 mini', 'gpt-5.3-codex-spark': 'Spark',

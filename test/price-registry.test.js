@@ -46,14 +46,14 @@ function price({ provider, model, tier = "standard", pricedAt = "2026-07-26", co
 
 test("registry validates and preserves exact decimal strings and provenance", () => {
   assert.equal(validateOfficialPriceRegistry(), APP_OFFICIAL_PRICE_CARDS);
-  assert.equal(OPENAI_OFFICIAL_PRICE_CARDS.length, 143);
+  assert.equal(OPENAI_OFFICIAL_PRICE_CARDS.length, 159);
   assert.equal(ANTHROPIC_OFFICIAL_PRICE_CARDS.length, 13);
   const batch54 = OPENAI_OFFICIAL_PRICE_CARDS.find((card) => card.model === "gpt-5.4" && card.service_tier === "batch");
   assert.equal(batch54.components.find((item) => item.usage_component === "input_cache_read_tokens").price.amount, "0.13");
   assert.match(batch54.metadata.provenance.evidence_sha256, /^[a-f0-9]{64}$/);
   assert.match(APP_PRICE_REGISTRY_SHA256, /^[a-f0-9]{64}$/);
   assert.equal(APP_PRICE_REGISTRY_MANIFEST.sha256, APP_PRICE_REGISTRY_SHA256);
-  assert.equal(APP_PRICE_REGISTRY_MANIFEST.sources.length, 3);
+  assert.equal(APP_PRICE_REGISTRY_MANIFEST.sources.length, 4);
   assert.equal(batch54.metadata.provenance.vendor_effective_from, null);
   assert.equal(OPENAI_PRICE_EVIDENCE_START_DATE, "2026-07-26");
   assert.equal(batch54.effective.from, undefined);
@@ -76,7 +76,7 @@ test("registry validates and preserves exact decimal strings and provenance", ()
   );
   // This addition must not change even the provenance bytes of legacy cards.
   assert.equal(
-    sha256Json(APP_OFFICIAL_PRICE_CARDS.filter((card) => card.model !== "gpt-6-astra")),
+    sha256Json(APP_OFFICIAL_PRICE_CARDS.filter((card) => !["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"].includes(card.model))),
     "0a5879e981f20f1d244ef193427cf198199bd5e7fd407eca4c0ae48f11d717ac",
   );
 });
@@ -114,6 +114,58 @@ test("Astra has eight exact cards with a strict above-272K boundary and independ
     const result = price({ provider: "openai", ...request, components: { input_uncached_tokens: 1_000 } });
     assert.notEqual(result.warnings.length, 0, JSON.stringify(request));
   }
+});
+
+test("Sol and Luna retain exact launch prices across every tier, component, and context boundary", () => {
+  const expected = {
+    "gpt-6-sol": {
+      standard: { short: ["2", "0.2", "2.5", "10"], long: ["4", "0.4", "5", "15"] },
+      batch: { short: ["1", "0.1", "1.25", "5"], long: ["2", "0.2", "2.5", "7.5"] },
+      flex: { short: ["1", "0.1", "1.25", "5"], long: ["2", "0.2", "2.5", "7.5"] },
+      priority: { short: ["4", "0.4", "5", "20"], long: ["8", "0.8", "10", "30"] },
+    },
+    "gpt-6-luna": {
+      standard: { short: ["0.1", "0.01", "0.125", "0.5"], long: ["0.2", "0.02", "0.25", "0.75"] },
+      batch: { short: ["0.05", "0.005", "0.0625", "0.25"], long: ["0.1", "0.01", "0.125", "0.375"] },
+      flex: { short: ["0.05", "0.005", "0.0625", "0.25"], long: ["0.1", "0.01", "0.125", "0.375"] },
+      priority: { short: ["0.2", "0.02", "0.25", "1"], long: ["0.4", "0.04", "0.5", "1.5"] },
+    },
+  };
+  const names = ["input_uncached_tokens", "input_cache_read_tokens", "input_cache_write_tokens", "output_text_tokens"];
+  for (const [model, tiers] of Object.entries(expected)) {
+    assert.equal(OPENAI_OFFICIAL_PRICE_CARDS.filter((card) => card.model === model).length, 8);
+    for (const [tier, bands] of Object.entries(tiers)) {
+      for (const totalInputTokens of [271_999, 272_000, 272_001]) {
+        const values = totalInputTokens > 272_000 ? bands.long : bands.short;
+        for (const [index, name] of names.entries()) {
+          const result = price({ provider: "openai", model, tier, pricedAt: "2026-09-22",
+            totalInputTokens, components: { [name]: 1_000_000 } });
+          assert.equal(result.total, values[index], `${model}/${tier}/${totalInputTokens}/${name}`);
+          assert.deepEqual(result.warnings, []);
+        }
+      }
+    }
+    const card = OPENAI_OFFICIAL_PRICE_CARDS.find((item) => item.model === model);
+    assert.deepEqual(card.effective, { from: "2026-09-22" });
+    assert.equal(card.metadata.provenance.vendor_effective_from, "2026-09-22");
+    assert.equal(card.source.retrieved_at, "2026-09-22T18:54:35Z");
+    assert.equal(card.aliases, undefined);
+    assert.ok(card.metadata.provenance.evidence_urls.includes(`https://developers.openai.com/api/docs/models/${model}`));
+    for (const request of [
+      { model, pricedAt: "2026-09-21", totalInputTokens: 1_000 },
+      { model: `${model}-preview`, pricedAt: "2026-09-22", totalInputTokens: 1_000 },
+      { model: `${model}-wm`, pricedAt: "2026-09-22", totalInputTokens: 1_000 },
+      { model, tier: "turbo", pricedAt: "2026-09-22", totalInputTokens: 1_000 },
+    ]) {
+      const result = price({ provider: "openai", ...request, components: { input_uncached_tokens: 1_000 } });
+      assert.notEqual(result.warnings.length, 0, JSON.stringify(request));
+    }
+  }
+  assert.equal(sha256Json(NORMALIZED_PRICE_EVIDENCE_ROWS.openaiSolLuna),
+    APP_PRICE_REGISTRY_MANIFEST.sources.find((source) => source.evidenceVersion === "openai-sol-luna-api-pricing-reviewed-2026-09-22").evidenceSha256);
+  // Every prior price card, including Astra source timestamps and identifiers, is unchanged.
+  assert.equal(sha256Json(APP_OFFICIAL_PRICE_CARDS.filter((card) => !["gpt-6-sol", "gpt-6-luna"].includes(card.model))),
+    "303374d522e7ef695beefe1fbf6f3d2b5c84b8b9c6130921a70bc5e8ec1d56e0");
 });
 
 test("exact provider tool units use official call prices without pricing client wrappers", () => {

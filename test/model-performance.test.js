@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { modelPerformanceProjection } from '../src/reporting/index.js';
 import { createModelPerformanceController } from '../apps/local/model-performance-controller.js';
-import { createModelPerformanceSnapshotStore } from '../apps/local/model-performance-snapshots.js';
+import { createModelPerformanceSnapshotStore, isModelPerformanceSnapshot } from '../apps/local/model-performance-snapshots.js';
 import { modelPerformanceSupplementDirectory } from '../apps/local/model-performance-worker.js';
 import { createWindowsFilesystemAdapter, loadWindowsSourceReadBinding } from '../src/platform/windows-filesystem.js';
 import { createWindowsSyntheticOwnedSource } from '../scripts/lib/windows-synthetic-source-owner.mjs';
@@ -16,6 +16,37 @@ const NOW = Date.parse('2026-09-09T12:00:00Z'), DAY = 86400000;
 const row = (patch = {}) => ({ at: NOW, speed_mode: 'standard', model: 'gpt-5.6-sol', sample_method: 'receipt',
   sample_tokens: 100, sample_duration: 1000, sample_responses: 1, sample_total_responses: 2,
   ttft: 5000, ...patch });
+test('GPT-6 Sol and Luna retain separate model generations and observed speed modes', () => {
+  const rows = ['sol', 'luna'].flatMap(name => [
+    row({ model: `gpt-5.6-${name}`, sample_tokens: 100 }),
+    row({ model: `gpt-6-${name}`, sample_tokens: 200 }),
+    row({ model: `gpt-6-${name}`, speed_mode: 'fast', sample_tokens: 300 }),
+    row({ model: `gpt-6-${name}`, speed_mode: 'unknown' }),
+    row({ model: `gpt-6-${name}-unreviewed`, sample_tokens: 99999 }),
+  ]);
+  const standard = modelPerformanceProjection(rows, { now: NOW });
+  const fast = modelPerformanceProjection(rows, { now: NOW, speedMode: 'fast' });
+  assert.equal(isModelPerformanceSnapshot(standard), true);
+  assert.equal(isModelPerformanceSnapshot(fast), true);
+  assert.equal(standard.models.length, 4);
+  assert.equal(fast.models.length, 2);
+  assert.equal(standard.excludedUnknownTurns, 2);
+  assert.equal(fast.excludedUnknownTurns, 2);
+  for (const [name, label] of [['sol', 'Sol'], ['luna', 'Luna']]) {
+    const prior = standard.models.find(model => model.id === `gpt-5.6-${name}`);
+    const current = standard.models.find(model => model.id === `gpt-6-${name}`);
+    assert.equal(prior.label, label);
+    assert.equal(current.label, `GPT-6 ${label}`);
+    assert.equal(prior.turns, 1);
+    assert.equal(current.turns, 1);
+    assert.equal(prior.speed[0].points[0].median, 100);
+    assert.equal(current.speed[0].points[0].median, 200);
+    assert.equal(fast.models.find(model => model.id === current.id).speed[0].points[0].median, 300);
+    const mislabeled = structuredClone(standard);
+    mislabeled.models.find(model => model.id === current.id).label = label;
+    assert.equal(isModelPerformanceSnapshot(mislabeled), false);
+  }
+});
 test('Windows supplemental timing store avoids the primary guard ancestors', () => {
   const timingRoot = join('/state', 'inference-timing-v2');
   const directory = join(timingRoot, 'source-0123456789abcdef');
@@ -210,6 +241,23 @@ test('saved complete measurements are immediately available after restart with a
     const disk = await readFile(fixture.file, 'utf8');
     assert.ok(!disk.includes(fixture.options.codexHome));
     assert.ok(!disk.includes(fixture.options.directory));
+  } finally { await controller.close(); }
+});
+test('GPT-6 Sol and Luna performance snapshots survive restart without merging older generations', async t => {
+  const fixture = await snapshotFixture(t);
+  let controller = fixture.create();
+  const latest = modelPerformanceProjection(['sol', 'luna'].flatMap(name => [
+    row({ model: `gpt-5.6-${name}` }), row({ model: `gpt-6-${name}`, sample_tokens: 200 }),
+  ]), { now: NOW + DAY });
+  try {
+    await controller.read('all');
+    fixture.worker().emit('message', { type: 'snapshots', values: [latest] });
+    await controller.close();
+    controller = fixture.create();
+    const restored = await controller.read('all');
+    assert.equal(restored.status, 'ready');
+    assert.deepEqual(restored.models, latest.models);
+    assert.equal(restored.models.length, 4);
   } finally { await controller.close(); }
 });
 test('combined speed and its fallback subset persist when an additive refresh fails', async t => {

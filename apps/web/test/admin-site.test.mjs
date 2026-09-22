@@ -1682,7 +1682,11 @@ test("rendered model cards, icons and native legend buttons share order and pres
     assert.equal(unavailable.disabled, true);
     assert.equal(unavailable.getAttribute("aria-pressed"), "false");
     assert.equal(unavailable.title, "No qualifying fits in this range");
-    assert.equal(container.querySelectorAll(".admin-allowance-plan-summary").length, 39);
+    assert.equal(container.querySelectorAll(".admin-allowance-plan-summary").length, 41);
+    for (const id of ["gpt-6-sol", "gpt-6-luna"]) {
+      const newModel = container.querySelector(`button[data-allowance-model-focus="${id}"]`);
+      assert.equal(newModel.disabled, true, "new models do not invent qualifying fits");
+    }
     const specific = container.querySelector(".admin-allowance-model-filter select");
     specific.value = "gpt-5.4-mini";
     specific.listeners.get("change")();

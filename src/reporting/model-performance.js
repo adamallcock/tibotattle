@@ -1,6 +1,7 @@
 // Pure, bounded projections of diagnostic timing. No accounting totals.
 const DAY = 86_400_000;
 const LABELS = new Map([
+  ['gpt-6-luna', 'GPT-6 Luna'], ['gpt-6-sol', 'GPT-6 Sol'],
   ['gpt-5.6-luna', 'Luna'], ['gpt-5.6-terra', 'Terra'],
   ['gpt-6-astra', 'Astra'], ['gpt-5.6-sol', 'Sol'],
   ['gpt-5.5', 'GPT-5.5'], ['gpt-5.4', 'GPT-5.4'],

@@ -143,6 +143,38 @@ function rowFor(rows) {
   return result[0];
 }
 
+test('GPT-6 Sol and Luna preserve observed timing and model identity across parser restart', () => {
+  for (const model of ['gpt-6-sol', 'gpt-6-luna']) {
+    const rows = performanceFixture({ model });
+    const before = parse(rows.slice(0, 6));
+    const resumed = parse(rows.slice(6), JSON.parse(JSON.stringify(before.parser.state())));
+    assert.equal(resumed.result.length, 1);
+    const row = resumed.result[0];
+    assert.equal(row.model, model);
+    assert.equal(row.effort, 'high');
+    assert.equal(row.duration, 2000);
+    assert.equal(row.turn_duration, 202000);
+    assert.equal(row.quality, 'complete');
+    assert.equal(row.speed_mode, 'fast');
+    assert.equal(row.api_service_tier, 'unknown');
+  }
+});
+
+test('GPT-6 model suffixes remain unknown and generation switches invalidate attribution', () => {
+  for (const name of ['sol', 'luna']) {
+    const unknown = rowFor(performanceFixture({ model: `gpt-6-${name}-unreviewed` }));
+    assert.equal(unknown.model, null);
+    assert.equal(unknown.turn_duration, null);
+    const rows = performanceFixture({ model: `gpt-5.6-${name}` });
+    rows.splice(6, 0, context(1001, 'synthetic-turn', `gpt-6-${name}`));
+    const mixed = rowFor(rows);
+    assert.equal(mixed.model, null);
+    assert.equal(mixed.duration, null);
+    assert.equal(mixed.turn_duration, null);
+    assert.equal(mixed.quality, 'mixed_model');
+  }
+});
+
 test('full turn duration includes tool waits while TPS duration stays response-only', () => {
   const row = rowFor(performanceFixture());
   assert.equal(row.turn_duration, 202000);
