@@ -215,7 +215,8 @@ packaged worker smoke before merging this candidate. See the
 [implementation and qualification plan](../../docs/plans/2026-09-13-windows-model-performance.md).
 
 The native and packaged timing qualifications use disposable synthetic Codex
-sources. On elevated hosted runners their files can inherit a group owner, so
-fixture setup sets only the synthetic file's owner to the current user and
-verifies its inherited DACL did not change. Real Codex sources are never
+sources. On elevated hosted runners a new file can take the Administrators
+group as its default owner. Fixture setup gives its isolated child process a
+current-user default owner before creating the source, so Windows assigns its
+ordinary inherited/default DACL at creation. Real Codex sources are never
 modified by this setup; the native reader still refuses a foreign owner.

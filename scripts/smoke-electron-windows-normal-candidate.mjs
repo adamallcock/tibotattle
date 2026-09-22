@@ -62,7 +62,7 @@ import {
   runWindowsNsisLifecycleProgram,
 } from "./smoke-electron-windows-nsis-lifecycle.mjs";
 import { classifyWindowsSyntheticSourceOwnerFailure,
-  ensureWindowsSyntheticSourceOwner } from "./lib/windows-synthetic-source-owner.mjs";
+  createWindowsSyntheticOwnedSource } from "./lib/windows-synthetic-source-owner.mjs";
 
 const require = createRequire(import.meta.url);
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
@@ -366,20 +366,23 @@ const FAILURE_CODES = new Set([
   "PROFILE_INVALID",
   "PROFILE_NOT_ABSENT",
   "SYNTHETIC_FIXTURE_UNAVAILABLE",
-  "SYNTHETIC_FIXTURE_OWNER_INVALID_PATH",
-  "SYNTHETIC_FIXTURE_OWNER_SETUP_LAUNCH_FAILED",
-  "SYNTHETIC_FIXTURE_OWNER_SETUP_TIMED_OUT",
-  "SYNTHETIC_FIXTURE_OWNER_CURRENT_OWNER_READ_FAILED",
-  "SYNTHETIC_FIXTURE_OWNER_ACL_BEFORE_READ_FAILED",
-  "SYNTHETIC_FIXTURE_OWNER_ACL_BEFORE_SNAPSHOT_FAILED",
-  "SYNTHETIC_FIXTURE_OWNER_OWNER_TOOL_INVOCATION_FAILED",
-  "SYNTHETIC_FIXTURE_OWNER_OWNER_TOOL_EXIT_FAILED",
-  "SYNTHETIC_FIXTURE_OWNER_ACL_AFTER_READ_FAILED",
-  "SYNTHETIC_FIXTURE_OWNER_OWNER_AFTER_READ_FAILED",
-  "SYNTHETIC_FIXTURE_OWNER_OWNER_READBACK_MISMATCH",
-  "SYNTHETIC_FIXTURE_OWNER_ACL_AFTER_SNAPSHOT_FAILED",
-  "SYNTHETIC_FIXTURE_OWNER_DACL_CHANGED",
-  "SYNTHETIC_FIXTURE_OWNER_UNEXPECTED_SETUP_EXIT",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_INVALID_PATH",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_INVALID_CONTENTS",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_INPUT_TOO_LARGE",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_LAUNCH_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_TIMED_OUT",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_IDENTITY_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_NATIVE_SETUP_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_TOKEN_OWNER_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_FILE_WRITE_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_INPUT_LENGTH_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_CLOSE_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_OWNER_READ_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_OWNER_MISSING",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_OWNER_MISMATCH",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_DACL_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_CONTENT_LENGTH_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_UNEXPECTED_EXIT",
   "PROTECTED_OPT_OUT_UNAVAILABLE",
   "FIREWALL_UNAVAILABLE",
   "FIREWALL_RULE_DIRTY",
@@ -948,14 +951,12 @@ async function protectedOptOutStage(stage, operation) {
 export async function seedWindowsNormalCandidateCodexFixture({ profile } = {}, {
   createDirectory = mkdir,
   metadata = lstat,
-  writeFixture = writeFile,
-  normalizeOwner = process.platform === "win32" ? ensureWindowsSyntheticSourceOwner : () => {},
+  writeFixture = process.platform === "win32" ? createWindowsSyntheticOwnedSource : writeFile,
   now = Date.now,
 } = {}) {
   const home = exactWindowsPath(profile?.home);
   if (home === null || typeof createDirectory !== "function"
       || typeof metadata !== "function" || typeof writeFixture !== "function"
-      || typeof normalizeOwner !== "function"
       || typeof now !== "function") {
     fail("PROFILE_INVALID");
   }
@@ -975,10 +976,8 @@ export async function seedWindowsNormalCandidateCodexFixture({ profile } = {}, {
       mode: 0o600,
       flag: "wx",
     });
-    // The hosted runner can create a source owned by its Administrators group.
-    // Native source reads require the current-user owner, so normalize this
-    // disposable fixture while retaining its inherited source ACL.
-    normalizeOwner(fixture);
+    // Create the disposable source with the current-user owner from the start.
+    // A post-create owner change can rewrite its inherited access descriptor.
     const file = await metadata(fixture);
     if (!file?.isFile?.() || file.isSymbolicLink?.() || file.nlink !== 1
         || file.size !== Buffer.byteLength(source.content)) {

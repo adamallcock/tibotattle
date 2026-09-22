@@ -29,7 +29,7 @@ import {
   prepareWindowsDevelopmentProfile,
 } from "../scripts/launch-electron-windows-development.mjs";
 import { classifyWindowsSyntheticSourceOwnerFailure,
-  ensureWindowsSyntheticSourceOwner } from "../scripts/lib/windows-synthetic-source-owner.mjs";
+  createWindowsSyntheticOwnedSource } from "../scripts/lib/windows-synthetic-source-owner.mjs";
 import {
   buildWindowsNormalCandidateCodexFixture,
   buildWindowsNormalCandidateFirewallCreateArguments,
@@ -82,10 +82,10 @@ const SOURCE_CANDIDATE_PATH = String.raw`C:\candidate\production-source-candidat
 const RECEIPT_PATH = String.raw`C:\workspace\.release-build\electron-windows-normal-candidate\normal-candidate-smoke.json`;
 const FIREWALL_RULE = "tibotattle-normal-candidate-550e8400-e29b-41d4-a716-446655440000";
 
-test("disposable Windows source owner setup preserves ACLs and emits fixed errors", () => {
+test("disposable Windows source is created with current-user owner and fixed errors", () => {
   const path = String.raw`C:\runner\owned\synthetic.jsonl`;
   let invocation;
-  ensureWindowsSyntheticSourceOwner(path, {
+  createWindowsSyntheticOwnedSource(path, "synthetic\n", {
     environment: { PSModulePath: "private-module-path", SystemRoot: String.raw`C:\Windows` },
     run: (command, args, options) => {
       invocation = { command, args, options };
@@ -94,18 +94,22 @@ test("disposable Windows source owner setup preserves ACLs and emits fixed error
   });
   assert.equal(invocation.command, "powershell.exe");
   assert.equal(invocation.options.env.TIBOTATTLE_SYNTHETIC_SOURCE_FILE, path);
+  assert.equal(invocation.options.env.TIBOTATTLE_SYNTHETIC_SOURCE_LENGTH, "10");
   assert.equal(Object.hasOwn(invocation.options.env, "PSModulePath"), false);
-  assert.match(invocation.args.at(-1), /GetSecurityDescriptorSddlForm/u);
-  assert.match(invocation.args.at(-1), /SetNamedSecurityInfo/u);
+  assert.equal(invocation.options.input.toString(), "synthetic\n");
+  assert.match(invocation.args.at(-1), /SetTokenInformation/u);
+  assert.match(invocation.args.at(-1), /CreateNew/u);
+  assert.doesNotMatch(invocation.args.at(-1), /SetNamedSecurityInfo/u);
   let failure;
   try {
-    ensureWindowsSyntheticSourceOwner(path, {
-      run: () => ({ status: 40, stdout: "", stderr: "private-ACL-value" }),
+    createWindowsSyntheticOwnedSource(path, "synthetic\n", {
+      run: () => ({ status: 50, stdout: "", stderr: "private-ACL-value" }),
     });
   } catch (error) { failure = error; }
-  assert.equal(classifyWindowsSyntheticSourceOwnerFailure(failure), "synthetic_owner_dacl_changed");
-  assert.equal(failure.message, "synthetic_owner_dacl_changed");
-  assert.throws(() => ensureWindowsSyntheticSourceOwner("relative.jsonl"), /synthetic_owner_invalid_path/u);
+  assert.equal(classifyWindowsSyntheticSourceOwnerFailure(failure), "synthetic_owner_create_dacl_failed");
+  assert.equal(failure.message, "synthetic_owner_create_dacl_failed");
+  assert.throws(() => createWindowsSyntheticOwnedSource("relative.jsonl", "synthetic\n"),
+    /synthetic_owner_create_invalid_path/u);
 });
 
 test("packaged Windows timing smoke requires a complete ready source scan", () => {
@@ -1197,7 +1201,6 @@ test("normal candidate adds one content-free Codex source before launch", async 
       fixtureContent = value;
       calls.push({ kind: "file", path, value, options });
     },
-    normalizeOwner: (path) => calls.push({ kind: "owner", path }),
   });
   assert.equal(fixture.codexHome, win32.join(profile.home, ".codex"));
   assert.notEqual(fixture.codexHome, profile.codex);
@@ -1226,7 +1229,6 @@ test("normal candidate adds one content-free Codex source before launch", async 
       value: fixtureContent,
       options: { mode: 0o600, flag: "wx" },
     },
-    { kind: "owner", path: fixture.fixture },
   ]);
   await assert.rejects(seedWindowsNormalCandidateCodexFixture({ profile }, {
     now: () => NORMAL_CANDIDATE_FIXTURE_CLOCK_MS,
@@ -1240,12 +1242,11 @@ test("normal candidate adds one content-free Codex source before launch", async 
     now: () => NORMAL_CANDIDATE_FIXTURE_CLOCK_MS,
     createDirectory: async () => {},
     metadata: async () => ({ isDirectory: () => true, isSymbolicLink: () => false }),
-    writeFixture: async () => {},
-    normalizeOwner: (path) => ensureWindowsSyntheticSourceOwner(path, {
-      run: () => ({ status: 40, stdout: "", stderr: "private-ACL-value" }),
+    writeFixture: (path, contents) => createWindowsSyntheticOwnedSource(path, contents, {
+      run: () => ({ status: 50, stdout: "", stderr: "private-ACL-value" }),
     }),
   }), {
-    code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_SYNTHETIC_FIXTURE_OWNER_DACL_CHANGED",
+    code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_SYNTHETIC_FIXTURE_OWNER_CREATE_DACL_FAILED",
   });
 });
 
