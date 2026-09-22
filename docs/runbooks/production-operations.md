@@ -539,9 +539,19 @@ node apps/worker/scripts/typed-forward-migration.mjs --mode capture-inventory \
   --backup-output /absolute/private/typed-forward-capture/backup-receipt.json
 ```
 
+The capture preflights all three destination parents before any Worker or D1
+read. It stages the three files and publishes each with a no-clobber commit;
+`typed-forward-inventory-publication.json` is a private durable journal in the
+operation directory. If a later destination fails, stop with the journal in
+`partial` state and rerun the exact command with the same operation and output
+paths. The operator resumes the staged local publication after checking the
+journal and does not repeat the remote reads. A destination created or changed
+while publication is in progress is refused and remains untouched.
+
 The capture does two canonical Worker/config reads and rechecks both target
 binding IDs/names, the contained control revision, and the exact prior
-schema/data/ledger observations around the fixed Wrangler reads. Any source,
+schema/data/ledger observations for both roles after the backup and hold edge.
+Any source,
 version, configuration, role, hold, or backup drift leaves no newly written
 artifact. Prepare then writes a mode-0600 closed plan only from a clean
 checkout whose `HEAD` equals the candidate source pin:

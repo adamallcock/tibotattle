@@ -2,11 +2,11 @@ import { DatabaseSync } from 'node:sqlite';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { realpathSync } from 'node:fs';
-import { lstat, mkdir, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
+import { constants, realpathSync } from 'node:fs';
+import { lstat, link, mkdir, open, readFile, readdir, realpath, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { identityDigest, openOperation, operationError } from '../../../scripts/lib/release-operation.mjs';
+import { durablePrivateJson, identityDigest, openOperation, operationError } from '../../../scripts/lib/release-operation.mjs';
 import { createProductionDeploymentLock } from './production-deployment-lock.mjs';
 import { storageSchemaDigest, storageSha256 } from './d1-storage-plan.mjs';
 import { createWranglerQueryInvocation } from './wrangler-query-launcher.mjs';
@@ -23,6 +23,7 @@ export const TYPED_FORWARD_CONFIRMATION = 'EXECUTE_REVIEWED_TYPED_FORWARD_MIGRAT
 export const TYPED_FORWARD_PREVIOUS_SOURCE = 'eaf6f521fb9842399da512fd1ad5020c7b706f5b';
 export const TYPED_FORWARD_OPERATING_CAP_BYTES = 9_000_000_000;
 export const TYPED_FORWARD_MAX_WINDOW_MS = 86_400_000;
+const TYPED_FORWARD_PUBLICATION_SCHEMA = 'typed-forward-inventory-publication-v1';
 
 const SHA256 = /^[a-f0-9]{64}$/u;
 const COMMIT = /^[a-f0-9]{40}$/u;
@@ -773,16 +774,31 @@ function resolveTypedForwardApproval({ plan, state, extension, approvedExtension
     previous = identityDigest(current);
   }
   if (extension !== null && extension !== undefined) {
+    const extensionSha256 = identityDigest(extension);
+    if (!approvedExtensionSha256 || extensionSha256 !== approvedExtensionSha256) fail('APPROVAL_EXTENSION_NOT_APPROVED');
+    const tail = chain.at(-1);
+    // A provider interruption can happen after the extension has been durably
+    // appended but before the first subsequent read.  Replaying the exact
+    // command must not append a second copy or require a new expired window.
+    // Validate the tail against its own predecessor before treating it as a
+    // no-op; the normal chain loop intentionally validates each stored entry
+    // against the prior entry, whereas the candidate tail points to that prior
+    // entry rather than to itself.
+    if (tail !== undefined && extensionSha256 === identityDigest(tail)) {
+      const tailPrevious = chain.length > 1 ? identityDigest(chain.at(-2)) : null;
+      validateApprovalExtension(extension, planSha256, tailPrevious, now, true);
+      const deadline = Date.parse(tail.expiresAt);
+      return { chain, active: deadline > now, idempotent: true };
+    }
     const priorDeadline = chain.length ? Date.parse(chain.at(-1).expiresAt) : Date.parse(plan.expiresAt);
     if (!resume || now < priorDeadline || Date.parse(extension.approvedAt) < priorDeadline) {
       fail('APPROVAL_EXTENSION_REQUIRES_EXPIRED_RESUME');
     }
-    if (!approvedExtensionSha256 || identityDigest(extension) !== approvedExtensionSha256) fail('APPROVAL_EXTENSION_NOT_APPROVED');
     validateApprovalExtension(extension, planSha256, previous, now);
     chain.push(extension);
   }
   const deadline = chain.length ? Date.parse(chain.at(-1).expiresAt) : Date.parse(plan.expiresAt);
-  return { chain, active: deadline > now };
+  return { chain, active: deadline > now, idempotent: false };
 }
 function boundedDiagnostics(error) {
   const diagnostics = error?.diagnostics;
@@ -840,7 +856,7 @@ export async function runTypedForwardMigration({ plan, workerRoot, repositoryRoo
       await operation.save(state);
     }
     const approval = resolveTypedForwardApproval({ plan: prepared, state, extension, approvedExtensionSha256, now: currentNow(), resume });
-    if (extension !== null && extension !== undefined) {
+    if (extension !== null && extension !== undefined && !approval.idempotent) {
       state.approvalExtensions = approval.chain;
       await operation.save(state);
     }
@@ -1230,6 +1246,180 @@ export async function captureTypedForwardBackupReceipt({ accountId, targets, ope
   return { receipt, outputPath: writtenPath, remoteWrites: false };
 }
 
+const INVENTORY_PUBLICATION_OUTPUTS = Object.freeze(['inventory', 'targets', 'backup']);
+
+async function privateDirectoryPath(path, code = 'PLAN_OUTPUT_UNSAFE') {
+  if (typeof path !== 'string' || !path || path.length > 4096) fail(code);
+  const resolved = resolve(path), info = await lstat(resolved).catch(() => null);
+  if (!info?.isDirectory() || (info.mode & 0o077) !== 0 || (process.getuid && info.uid !== process.getuid())
+      || await realpath(resolved).catch(() => null) !== resolved) fail(code);
+  return resolved;
+}
+
+async function privateJsonDestination(path, { allowExisting = false, code = 'PLAN_OUTPUT_UNSAFE' } = {}) {
+  if (typeof path !== 'string' || !path || path.length > 4096) fail(code);
+  const resolved = resolve(path), parent = dirname(resolved), parentStat = await lstat(parent).catch(() => null);
+  if (!parentStat?.isDirectory() || (parentStat.mode & 0o077) !== 0 || (process.getuid && parentStat.uid !== process.getuid())
+      || await realpath(parent).catch(() => null) !== parent) fail(code);
+  const existing = await lstat(resolved).catch(() => null);
+  if (existing && !allowExisting) fail('PLAN_OUTPUT_EXISTS');
+  if (existing && (!existing.isFile() || existing.nlink !== 1 || (existing.mode & 0o077) !== 0
+      || (process.getuid && existing.uid !== process.getuid()) || await realpath(resolved).catch(() => null) !== resolved)) fail(code);
+  return resolved;
+}
+
+function privateJsonBytes(value) {
+  const serialized = JSON.stringify(value);
+  if (typeof serialized !== 'string') fail('PLAN_OUTPUT_UNSAFE');
+  const bytes = Buffer.from(`${serialized}\n`);
+  if (bytes.length > 1_048_576) fail('PLAN_OUTPUT_UNSAFE');
+  return bytes;
+}
+
+function publicationJournalPath(operationDirectory) {
+  return join(operationDirectory, 'typed-forward-inventory-publication.json');
+}
+
+function publicationEntryValues({ inventory, targets, backupReceipt }) {
+  return { inventory, targets, backup: backupReceipt };
+}
+
+function publicationPaths({ inventoryOutputPath, targetsOutputPath, backupOutputPath }) {
+  return { inventory: resolve(inventoryOutputPath), targets: resolve(targetsOutputPath), backup: resolve(backupOutputPath) };
+}
+
+function publicationResult({ inventory, targets, backupReceipt, outputPaths, journalPath, resumed = false }) {
+  return { inventory, targets, backupReceipt, inventoryPath: outputPaths.inventory, targetsPath: outputPaths.targets,
+    backupPath: outputPaths.backup, publicationJournalPath: journalPath, inventorySha256: identityDigest(inventory),
+    remoteWrites: false, resumedPublication: resumed };
+}
+
+async function readPublicationOutput(path, entry, code = 'INVENTORY_CAPTURE_PUBLICATION_INVALID') {
+  const info = await lstat(path).catch(() => null);
+  if (!info?.isFile() || info.nlink !== 1 || (info.mode & 0o077) !== 0 || (process.getuid && info.uid !== process.getuid())
+      || await realpath(path).catch(() => null) !== path) fail(code);
+  const bytes = await readFile(path).catch(() => null);
+  if (!bytes || bytes.length !== entry.bytes || storageSha256(bytes) !== entry.sha256) fail(code);
+  try { return JSON.parse(bytes); } catch { fail(code); }
+}
+
+function validatePublicationJournal(journal, operationDirectory, outputPaths) {
+  if (!exact(journal, ['schema', 'status', 'createdAt', 'entries', 'published'])
+      || journal.schema !== TYPED_FORWARD_PUBLICATION_SCHEMA
+      || !['staged', 'publishing', 'partial', 'published'].includes(journal.status) || !date(journal.createdAt)
+      || !Array.isArray(journal.entries) || journal.entries.length !== INVENTORY_PUBLICATION_OUTPUTS.length
+      || !Array.isArray(journal.published)) fail('INVENTORY_CAPTURE_PUBLICATION_INVALID');
+  const names = new Set();
+  const stageDirectories = new Set();
+  const rootPrefix = operationDirectory.endsWith('/') ? operationDirectory : `${operationDirectory}/`;
+  for (const entry of journal.entries) {
+    if (!exact(entry, ['name', 'path', 'stagePath', 'sha256', 'bytes']) || !INVENTORY_PUBLICATION_OUTPUTS.includes(entry.name)
+        || names.has(entry.name) || !SHA256.test(entry.sha256) || !Number.isSafeInteger(entry.bytes) || entry.bytes < 1 || entry.bytes > 1_048_576) {
+      fail('INVENTORY_CAPTURE_PUBLICATION_INVALID');
+    }
+    names.add(entry.name);
+    if (resolve(entry.path) !== outputPaths[entry.name]) fail('INVENTORY_CAPTURE_PUBLICATION_INVALID');
+    const stagePath = resolve(entry.stagePath), stageDirectory = dirname(stagePath);
+    if (!stagePath.startsWith(rootPrefix) || stageDirectory === operationDirectory || !stagePath.endsWith(`/${entry.name}.json`)) {
+      fail('INVENTORY_CAPTURE_PUBLICATION_INVALID');
+    }
+    stageDirectories.add(stageDirectory);
+  }
+  if (names.size !== INVENTORY_PUBLICATION_OUTPUTS.length || stageDirectories.size !== 1
+      || journal.published.some(name => !INVENTORY_PUBLICATION_OUTPUTS.includes(name))) fail('INVENTORY_CAPTURE_PUBLICATION_INVALID');
+  if (new Set(journal.published).size !== journal.published.length) fail('INVENTORY_CAPTURE_PUBLICATION_INVALID');
+  return journal.entries.slice().sort((a, b) => INVENTORY_PUBLICATION_OUTPUTS.indexOf(a.name) - INVENTORY_PUBLICATION_OUTPUTS.indexOf(b.name));
+}
+
+async function writePublicationJournal(path, journal) {
+  try { await durablePrivateJson(path, journal); } catch { fail('INVENTORY_CAPTURE_PUBLICATION_INCOMPLETE'); }
+}
+
+async function createPublicationJournal(path, journal) {
+  const bytes = privateJsonBytes(journal);
+  let handle;
+  try {
+    handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    await handle.write(bytes);
+    await handle.sync();
+  } catch { fail('INVENTORY_CAPTURE_PUBLICATION_CONCURRENT'); }
+  finally { await handle?.close().catch(() => {}); }
+  const directory = await open(dirname(path), constants.O_RDONLY);
+  try { await directory.sync(); } finally { await directory.close(); }
+}
+
+async function publishStagedFile(stagePath, outputPath) {
+  // A hard link is the no-clobber same-filesystem commit point.  Unlike
+  // rename(), it cannot replace a destination created after preflight.
+  await link(stagePath, outputPath);
+  await unlink(stagePath);
+  const directory = await open(dirname(outputPath), constants.O_RDONLY);
+  try { await directory.sync(); } finally { await directory.close(); }
+}
+
+async function resumeInventoryPublication({ operationDirectory, outputPaths, publishFile = publishStagedFile, beforePublish = null }) {
+  const journalPath = publicationJournalPath(operationDirectory);
+  const info = await lstat(journalPath).catch(() => null);
+  if (!info) return null;
+  if (!info.isFile()) fail('INVENTORY_CAPTURE_PUBLICATION_INVALID');
+  const journal = await readPrivateJson(journalPath, 'INVENTORY_CAPTURE_PUBLICATION_INVALID');
+  const entries = validatePublicationJournal(journal, operationDirectory, outputPaths);
+  await privateDirectoryPath(dirname(entries[0].stagePath), 'INVENTORY_CAPTURE_PUBLICATION_INVALID');
+  for (const path of Object.values(outputPaths)) await privateJsonDestination(path, { allowExisting: true,
+    code: 'INVENTORY_CAPTURE_PUBLICATION_INVALID' });
+  if (journal.status === 'published') {
+    const values = {};
+    for (const entry of entries) values[entry.name] = await readPublicationOutput(outputPaths[entry.name], entry);
+    return publicationResult({ inventory: values.inventory, targets: values.targets, backupReceipt: values.backup,
+      outputPaths, journalPath, resumed: true });
+  }
+  const published = [...journal.published];
+  for (const entry of entries) {
+    if (published.includes(entry.name)) {
+      await readPublicationOutput(outputPaths[entry.name], entry);
+      continue;
+    }
+    const outputInfo = await lstat(outputPaths[entry.name]).catch(() => null);
+    if (outputInfo) {
+      await readPublicationOutput(outputPaths[entry.name], entry);
+      published.push(entry.name);
+      await writePublicationJournal(journalPath, { ...journal, status: 'publishing', published });
+      continue;
+    }
+    await readPublicationOutput(entry.stagePath, entry);
+    if (beforePublish !== null) await beforePublish(entry);
+    try { await publishFile(entry.stagePath, outputPaths[entry.name]); }
+    catch {
+      await writePublicationJournal(journalPath, { ...journal, status: 'partial', published });
+      fail('INVENTORY_CAPTURE_PUBLICATION_INCOMPLETE');
+    }
+    published.push(entry.name);
+    await writePublicationJournal(journalPath, { ...journal, status: 'publishing', published });
+  }
+  await writePublicationJournal(journalPath, { ...journal, status: 'published', published });
+  const values = {};
+  for (const entry of entries) values[entry.name] = await readPublicationOutput(outputPaths[entry.name], entry);
+  return publicationResult({ inventory: values.inventory, targets: values.targets, backupReceipt: values.backup,
+    outputPaths, journalPath, resumed: true });
+}
+
+async function publishInventoryArtifacts({ operationDirectory, outputPaths, values, publishFile = publishStagedFile, beforePublish = null }) {
+  for (const name of INVENTORY_PUBLICATION_OUTPUTS) await privateJsonDestination(outputPaths[name]);
+  const bytes = Object.fromEntries(INVENTORY_PUBLICATION_OUTPUTS.map(name => [name, privateJsonBytes(values[name])]));
+  const stageDirectory = join(operationDirectory, `.typed-forward-inventory-publication-${randomUUID()}`);
+  try { await mkdir(stageDirectory, { mode: 0o700 }); } catch { fail('INVENTORY_CAPTURE_PUBLICATION_INVALID'); }
+  await privateDirectoryPath(stageDirectory, 'INVENTORY_CAPTURE_PUBLICATION_INVALID');
+  const entries = INVENTORY_PUBLICATION_OUTPUTS.map(name => ({ name, path: outputPaths[name],
+    stagePath: join(stageDirectory, `${name}.json`), sha256: storageSha256(bytes[name]), bytes: bytes[name].length }));
+  try {
+    for (const entry of entries) await writeFile(entry.stagePath, bytes[entry.name], { mode: 0o600, flag: 'wx' });
+  } catch { fail('INVENTORY_CAPTURE_PUBLICATION_INCOMPLETE'); }
+  const journalPath = publicationJournalPath(operationDirectory);
+  await createPublicationJournal(journalPath, { schema: TYPED_FORWARD_PUBLICATION_SCHEMA, status: 'staged',
+    createdAt: new Date().toISOString(), entries, published: [] });
+  return resumeInventoryPublication({ operationDirectory, outputPaths, publishFile, beforePublish });
+}
+
 /**
  * Capture the complete private predecessor inventory used by prepare. This is
  * deliberately a read-only bracket: the canonical live Worker provider is
@@ -1241,14 +1431,22 @@ export async function captureTypedForwardBackupReceipt({ accountId, targets, ope
 export async function captureTypedForwardInventory({ accountId, workerName, operationDirectory, cliPath, wranglerSha256,
   migrationGrowthBudgetBytes, inventoryOutputPath, targetsOutputPath, backupOutputPath, capturedAt = null, expiresAt = null,
   now = Date.now(), spawn = spawnSync, liveProviderFactory = createProductionLiveProvider,
-  liveConfigSnapshot = createProductionLiveConfigSnapshot, adapterFactory = null } = {}) {
+  liveConfigSnapshot = createProductionLiveConfigSnapshot, adapterFactory = null, publishFile = publishStagedFile,
+  beforePublish = null } = {}) {
   if (!/^[a-f0-9]{32}$/u.test(accountId ?? '') || !/^[A-Za-z0-9_-]{1,63}$/u.test(workerName ?? '')
       || typeof operationDirectory !== 'string' || !operationDirectory || typeof cliPath !== 'string' || !cliPath
       || !SHA256.test(wranglerSha256 ?? '') || !Number.isSafeInteger(migrationGrowthBudgetBytes) || migrationGrowthBudgetBytes < 0
       || ![inventoryOutputPath, targetsOutputPath, backupOutputPath].every(path => typeof path === 'string' && path.length > 0)
       || new Set([inventoryOutputPath, targetsOutputPath, backupOutputPath].map(path => resolve(path))).size !== 3
       || typeof liveProviderFactory !== 'function' || typeof liveConfigSnapshot !== 'function'
-      || (adapterFactory !== null && typeof adapterFactory !== 'function')) fail('INVENTORY_CAPTURE_INPUT_INVALID');
+      || (adapterFactory !== null && typeof adapterFactory !== 'function')
+      || (beforePublish !== null && typeof beforePublish !== 'function')) fail('INVENTORY_CAPTURE_INPUT_INVALID');
+  const outputPaths = publicationPaths({ inventoryOutputPath, targetsOutputPath, backupOutputPath });
+  const operationRoot = await privateDirectoryPath(operationDirectory, 'INVENTORY_CAPTURE_OUTPUT_UNSAFE');
+  if (Object.values(outputPaths).includes(publicationJournalPath(operationRoot))) fail('INVENTORY_CAPTURE_OUTPUT_UNSAFE');
+  const resumed = await resumeInventoryPublication({ operationDirectory: operationRoot, outputPaths });
+  if (resumed) return resumed;
+  for (const path of Object.values(outputPaths)) await privateJsonDestination(path);
   const provider = liveProviderFactory({ accountId, workerName });
   if (!provider || typeof provider.capture !== 'function') fail('ACTIVE_WORKER_UNVERIFIED');
   let beforeRaw;
@@ -1283,7 +1481,8 @@ export async function captureTypedForwardInventory({ accountId, workerName, oper
       || typeof adapter.captureMaintenanceHold !== 'function' || typeof adapter.captureBackupReceipt !== 'function') fail('INVENTORY_CAPTURE_UNVERIFIED');
   const hold = await adapter.captureMaintenanceHold(targetIdentities[0], effectiveCapturedAt, effectiveExpiresAt, now);
   const targets = [];
-  for (const identity of targetIdentities) {
+  const observations = new Map();
+  const observeTarget = async identity => {
     const info = await adapter.inventory(identity);
     if (!Array.isArray(info) || info.length !== 1 || info[0]?.id !== identity.databaseId || info[0]?.name !== identity.name
         || !Number.isSafeInteger(info[0]?.bytes) || info[0].bytes < 0
@@ -1292,10 +1491,16 @@ export async function captureTypedForwardInventory({ accountId, workerName, oper
     if (!object(observed) || !SHA256.test(observed.schemaSha256 ?? '') || !SHA256.test(observed.dataInvariantSha256 ?? '')
         || !Array.isArray(observed.migrations) || !SHA256.test(observed.ledgerSha256 ?? '')
         || identityDigest(observed.migrations) !== observed.ledgerSha256) fail('PRIOR_RECEIPT_INVALID');
-    const previous = { capturedAt: effectiveCapturedAt, schemaSha256: observed.schemaSha256,
-      dataInvariantSha256: observed.dataInvariantSha256, ledger: observed.migrations };
+    return { bytes: info[0].bytes, schemaSha256: observed.schemaSha256, dataInvariantSha256: observed.dataInvariantSha256,
+      migrations: observed.migrations, ledgerSha256: observed.ledgerSha256 };
+  };
+  for (const identity of targetIdentities) {
+    const observation = await observeTarget(identity);
+    observations.set(identity.role, observation);
+    const previous = { capturedAt: effectiveCapturedAt, schemaSha256: observation.schemaSha256,
+      dataInvariantSha256: observation.dataInvariantSha256, ledger: observation.migrations };
     previous.receiptSha256 = previousReceiptDigest(previous);
-    const target = { ...identity, bytes: info[0].bytes, migrationGrowthBudgetBytes, previous };
+    const target = { ...identity, bytes: observation.bytes, migrationGrowthBudgetBytes, previous };
     validateTarget(target, identity.role, null);
     targets.push(target);
   }
@@ -1303,6 +1508,11 @@ export async function captureTypedForwardInventory({ accountId, workerName, oper
   validateBackupReceipt(backupReceipt, targets);
   const afterHold = await adapter.captureMaintenanceHold(targetIdentities[0], effectiveCapturedAt, effectiveExpiresAt, now);
   if (identityDigest(afterHold) !== identityDigest(hold)) fail('MAINTENANCE_HOLD_DRIFT');
+  for (const identity of targetIdentities) {
+    const beforeObservation = observations.get(identity.role);
+    const afterObservation = await observeTarget(identity);
+    if (identityDigest(afterObservation) !== identityDigest(beforeObservation)) fail('INVENTORY_CAPTURE_DRIFT');
+  }
   let afterRaw;
   try { afterRaw = await provider.capture(); } catch { fail('ACTIVE_WORKER_UNVERIFIED'); }
   let after;
@@ -1318,12 +1528,8 @@ export async function captureTypedForwardInventory({ accountId, workerName, oper
     fingerprint: worker.fingerprint, targetsSha256: identityDigest(targets.map(target => ({ role: target.role, binding: target.binding,
       name: target.name, databaseId: target.databaseId, bytes: target.bytes }))), worker, maintenanceHold: hold, backupReceipt };
   validateInventory(inventory, { previousSourceCommit: TYPED_FORWARD_PREVIOUS_SOURCE, targets });
-  const written = {
-    inventoryPath: await writePrivateJson(inventoryOutputPath, inventory),
-    targetsPath: await writePrivateJson(targetsOutputPath, targets),
-    backupPath: await writePrivateJson(backupOutputPath, backupReceipt),
-  };
-  return { inventory, targets, backupReceipt, ...written, inventorySha256: identityDigest(inventory), remoteWrites: false };
+  return await publishInventoryArtifacts({ operationDirectory: operationRoot, outputPaths,
+    values: publicationEntryValues({ inventory, targets, backupReceipt }), publishFile, beforePublish });
 }
 
 export function parseTypedForwardArguments(args) {
@@ -1351,7 +1557,7 @@ export function parseTypedForwardArguments(args) {
       || result.mode === 'capture-backup' && (!result.targetsPath || !result.operationDirectory || !result.cliPath
         || !result.accountId || !result.wranglerSha256 || !result.outputPath)
       || result.mode === 'capture-inventory' && (!result.operationDirectory || !result.cliPath || !result.accountId || !result.workerName
-        || !result.wranglerSha256 || !result.migrationGrowthBudgetBytes || !result.inventoryOutputPath
+        || !result.wranglerSha256 || result.migrationGrowthBudgetBytes === undefined || !result.inventoryOutputPath
         || !result.targetsOutputPath || !result.backupOutputPath)
       || result.mode === 'execute' && (!result.planPath || !result.workerRoot || !result.operationDirectory || !result.repositoryRoot
         || !result.cliPath || !result.confirmation || !result.approvedPlanSha256)) fail('ARGUMENTS_INVALID');

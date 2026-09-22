@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, readFile, realpath, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -274,6 +274,31 @@ test('a second extension resumes from the prior extension deadline', async t => 
   assert.equal(journal.state.approvalExtensions.length, 2);
 });
 
+test('retrying an extension after its durable append is an idempotent no-op', async t => {
+  const f = await fixture(t);
+  f.controls.failAfterWrite = 1;
+  await assert.rejects(runTypedForwardMigration(f.args), { code: 'TYPED_FORWARD_MIGRATION_RESULT_UNCERTAIN' });
+  delete f.controls.failAfterWrite;
+  const extension = { schema: 'd1-storage-approval-extension-v1', planSha256: f.planSha256,
+    previousExtensionSha256: null, approvedAt: '2026-09-22T14:01:00.000Z', expiresAt: '2026-09-23T14:01:00.000Z' };
+  let failAfterSave = true;
+  const args = { ...f.args, adapterFactory: () => {
+    if (failAfterSave) {
+      failAfterSave = false;
+      throw Object.assign(new Error('extension save response lost'), { code: 'TYPED_FORWARD_EXTENSION_SAVE_INTERRUPTED' });
+    }
+    return f.adapter;
+  } };
+  const extensionArgs = { ...args, resume: true, now: Date.parse('2026-09-22T14:02:00.000Z'), extension,
+    approvedExtensionSha256: identityDigest(extension) };
+  await assert.rejects(runTypedForwardMigration(extensionArgs), { code: 'TYPED_FORWARD_EXTENSION_SAVE_INTERRUPTED' });
+  const retried = await runTypedForwardMigration(extensionArgs);
+  assert.equal(retried.status, 'completed');
+  const journal = JSON.parse(await readFile(join(f.scratch, 'operation', 'operation.json'), 'utf8'));
+  assert.equal(journal.state.approvalExtensions.length, 1);
+  assert.equal(f.counts.writes, f.plan.steps.reduce((sum, step) => sum + step.statements.length, 0));
+});
+
 test('plan admission binds the canonical embedded inventory digest', async t => {
   const f = await fixture(t);
   const tampered = structuredClone(f.plan);
@@ -457,13 +482,130 @@ test('inventory capture brackets canonical Worker and D1 reads into private enri
     liveProviderFactory: () => provider, liveConfigSnapshot: () => snapshot, adapterFactory: () => adapter });
   assert.equal(captured.remoteWrites, false);
   assert.equal(captures.length, 2);
-  assert.deepEqual(adapterCalls.map(call => call[0]), ['hold', 'inventory', 'inspect', 'inventory', 'inspect', 'backup', 'hold']);
+  assert.deepEqual(adapterCalls.map(call => call[0]), ['hold', 'inventory', 'inspect', 'inventory', 'inspect', 'backup', 'hold',
+    'inventory', 'inspect', 'inventory', 'inspect']);
   assert.deepEqual(captured.targets.map(target => target.role), ['primary', 'analytics']);
   assert.equal(captured.inventorySha256, identityDigest(captured.inventory));
   assert.equal((await stat(output.inventory)).mode & 0o777, 0o600);
   assert.equal((await stat(output.targets)).mode & 0o777, 0o600);
   assert.equal((await stat(output.backup)).mode & 0o777, 0o600);
   assert.deepEqual(JSON.parse(await readFile(output.targets, 'utf8')), captured.targets);
+});
+
+test('inventory capture rechecks both populated roles after backup and hold before publication', async t => {
+  const f = await fixture(t);
+  const snapshot = { schema: 'production-live-config-v1', sourceCommit: TYPED_FORWARD_PREVIOUS_SOURCE, versionId: f.plan.inventory.versionId,
+    fingerprint: f.plan.inventory.fingerprint,
+    bindings: f.targets.map(target => ({ name: target.binding, type: 'd1', database_id: target.databaseId, database_name: target.name })) };
+  let providerCaptures = 0;
+  const provider = { async capture() { providerCaptures += 1; return { capturedAt: '2026-09-22T12:00:00.000Z' }; } };
+  let drift = false;
+  const observationCalls = new Map();
+  const adapter = {
+    async captureMaintenanceHold() { return makeHold(); },
+    async inventory(target) {
+      return [{ id: target.databaseId, name: target.name, bytes: drift && target.role === 'analytics' ? 1001 : 1000 }];
+    },
+    async inspect(target) {
+      observationCalls.set(target.role, (observationCalls.get(target.role) ?? 0) + 1);
+      const previous = f.targets.find(candidate => candidate.role === target.role).previous;
+      return { schemaSha256: previous.schemaSha256,
+        dataInvariantSha256: drift && target.role === 'analytics' ? 'f'.repeat(64) : previous.dataInvariantSha256,
+        migrations: previous.ledger, ledgerSha256: identityDigest(previous.ledger), bytes: 1000 };
+    },
+    async captureBackupReceipt() { drift = true; return f.plan.inventory.backupReceipt; },
+  };
+  const output = { inventory: join(f.scratch, 'drift-inventory.json'), targets: join(f.scratch, 'drift-targets.json'),
+    backup: join(f.scratch, 'drift-backup.json') };
+  await assert.rejects(captureTypedForwardInventory({ accountId: f.plan.accountId, workerName: f.plan.workerName,
+    operationDirectory: f.scratch, cliPath: 'synthetic-cli', wranglerSha256: f.plan.wranglerSha256, migrationGrowthBudgetBytes: 100000,
+    inventoryOutputPath: output.inventory, targetsOutputPath: output.targets, backupOutputPath: output.backup, now,
+    liveProviderFactory: () => provider, liveConfigSnapshot: () => snapshot, adapterFactory: () => adapter }),
+  { code: 'TYPED_FORWARD_INVENTORY_CAPTURE_DRIFT' });
+  assert.equal(providerCaptures, 1);
+  assert.deepEqual(Object.fromEntries(observationCalls), { primary: 2, analytics: 2 });
+  for (const path of Object.values(output)) await assert.rejects(stat(path));
+});
+
+test('inventory capture journals later-output failure and resumes without another remote read', async t => {
+  const f = await fixture(t);
+  const snapshot = { schema: 'production-live-config-v1', sourceCommit: TYPED_FORWARD_PREVIOUS_SOURCE, versionId: f.plan.inventory.versionId,
+    fingerprint: f.plan.inventory.fingerprint,
+    bindings: f.targets.map(target => ({ name: target.binding, type: 'd1', database_id: target.databaseId, database_name: target.name })) };
+  const provider = { async capture() { return { capturedAt: '2026-09-22T12:00:00.000Z' }; } };
+  const adapter = {
+    async captureMaintenanceHold() { return makeHold(); },
+    async inventory(target) { return [{ id: target.databaseId, name: target.name, bytes: 1000 }]; },
+    async inspect(target) {
+      const previous = f.targets.find(candidate => candidate.role === target.role).previous;
+      return { schemaSha256: previous.schemaSha256, dataInvariantSha256: previous.dataInvariantSha256,
+        migrations: previous.ledger, ledgerSha256: identityDigest(previous.ledger), bytes: 1000 };
+    },
+    async captureBackupReceipt() { return f.plan.inventory.backupReceipt; },
+  };
+  const output = { inventory: join(f.scratch, 'publication-inventory.json'), targets: join(f.scratch, 'publication-targets.json'),
+    backup: join(f.scratch, 'publication-backup.json') };
+  let publishCalls = 0;
+  const failOnSecondDestination = async (stagePath, outputPath) => {
+    publishCalls += 1;
+    if (publishCalls === 2) throw new Error('destination appeared after preflight');
+    await rename(stagePath, outputPath);
+  };
+  let providerFactoryCalls = 0;
+  const captureArgs = { accountId: f.plan.accountId, workerName: f.plan.workerName, operationDirectory: f.scratch,
+    cliPath: 'synthetic-cli', wranglerSha256: f.plan.wranglerSha256, migrationGrowthBudgetBytes: 100000,
+    inventoryOutputPath: output.inventory, targetsOutputPath: output.targets, backupOutputPath: output.backup, now,
+    liveProviderFactory: () => { providerFactoryCalls += 1; return provider; }, liveConfigSnapshot: () => snapshot,
+    adapterFactory: () => adapter, publishFile: failOnSecondDestination };
+  await assert.rejects(captureTypedForwardInventory(captureArgs), { code: 'TYPED_FORWARD_INVENTORY_CAPTURE_PUBLICATION_INCOMPLETE' });
+  const journalPath = join(f.scratch, 'typed-forward-inventory-publication.json');
+  const partial = JSON.parse(await readFile(journalPath, 'utf8'));
+  assert.equal(partial.status, 'partial');
+  assert.deepEqual(partial.published, ['inventory']);
+  await stat(output.inventory);
+  await assert.rejects(stat(output.targets));
+  await assert.rejects(stat(output.backup));
+  const resumed = await captureTypedForwardInventory({ ...captureArgs, publishFile: undefined,
+    liveProviderFactory: () => assert.fail('resume must not capture Worker again'), adapterFactory: () => assert.fail('resume must not read D1 again') });
+  assert.equal(resumed.resumedPublication, true);
+  assert.equal(providerFactoryCalls, 1);
+  const complete = JSON.parse(await readFile(journalPath, 'utf8'));
+  assert.equal(complete.status, 'published');
+  assert.deepEqual(complete.published, ['inventory', 'targets', 'backup']);
+  for (const path of Object.values(output)) assert.equal((await stat(path)).mode & 0o777, 0o600);
+});
+
+test('inventory publication refuses a destination created after preflight without clobbering it', async t => {
+  const f = await fixture(t);
+  const snapshot = { schema: 'production-live-config-v1', sourceCommit: TYPED_FORWARD_PREVIOUS_SOURCE, versionId: f.plan.inventory.versionId,
+    fingerprint: f.plan.inventory.fingerprint,
+    bindings: f.targets.map(target => ({ name: target.binding, type: 'd1', database_id: target.databaseId, database_name: target.name })) };
+  const provider = { async capture() { return { capturedAt: '2026-09-22T12:00:00.000Z' }; } };
+  const adapter = {
+    async captureMaintenanceHold() { return makeHold(); },
+    async inventory(target) { return [{ id: target.databaseId, name: target.name, bytes: 1000 }]; },
+    async inspect(target) {
+      const previous = f.targets.find(candidate => candidate.role === target.role).previous;
+      return { schemaSha256: previous.schemaSha256, dataInvariantSha256: previous.dataInvariantSha256,
+        migrations: previous.ledger, ledgerSha256: identityDigest(previous.ledger), bytes: 1000 };
+    },
+    async captureBackupReceipt() { return f.plan.inventory.backupReceipt; },
+  };
+  const output = { inventory: join(f.scratch, 'race-inventory.json'), targets: join(f.scratch, 'race-targets.json'),
+    backup: join(f.scratch, 'race-backup.json') };
+  const args = { accountId: f.plan.accountId, workerName: f.plan.workerName, operationDirectory: f.scratch,
+    cliPath: 'synthetic-cli', wranglerSha256: f.plan.wranglerSha256, migrationGrowthBudgetBytes: 100000,
+    inventoryOutputPath: output.inventory, targetsOutputPath: output.targets, backupOutputPath: output.backup, now,
+    liveProviderFactory: () => provider, liveConfigSnapshot: () => snapshot, adapterFactory: () => adapter,
+    beforePublish: async entry => { if (entry.name === 'targets') await writeFile(output.targets, 'concurrent\n', { mode: 0o600, flag: 'wx' }); } };
+  await assert.rejects(captureTypedForwardInventory(args), { code: 'TYPED_FORWARD_INVENTORY_CAPTURE_PUBLICATION_INCOMPLETE' });
+  assert.equal(await readFile(output.targets, 'utf8'), 'concurrent\n');
+  const partial = JSON.parse(await readFile(join(f.scratch, 'typed-forward-inventory-publication.json'), 'utf8'));
+  assert.deepEqual(partial.published, ['inventory']);
+  await assert.rejects(captureTypedForwardInventory({ ...args, beforePublish: undefined,
+    liveProviderFactory: () => assert.fail('invalid publication must stop before another remote read'), adapterFactory: () => assert.fail('invalid publication must stop before D1 read') }),
+  { code: 'TYPED_FORWARD_INVENTORY_CAPTURE_PUBLICATION_INVALID' });
+  assert.equal(await readFile(output.targets, 'utf8'), 'concurrent\n');
 });
 
 test('inventory capture refuses an uncontained hold before writing artifacts', async t => {
@@ -537,5 +679,6 @@ test('CLI argument admission includes extension input and refuses incomplete exe
   assert.equal(parseTypedForwardArguments(['--mode', 'execute', '--plan', 'plan.json', '--worker-root', 'worker', '--operation', 'operation', '--repository-root', 'repo', '--cli', 'cli', '--confirmation', TYPED_FORWARD_CONFIRMATION, '--approved-plan-sha256', 'a'.repeat(64), '--extension', 'extension.json', '--approved-extension-sha256', 'b'.repeat(64)]).mode, 'execute');
   assert.equal(parseTypedForwardArguments(['--mode', 'capture-backup', '--targets', 'targets.json', '--operation', 'operation', '--cli', 'cli', '--account-id', 'a'.repeat(32), '--wrangler-sha256', 'b'.repeat(64), '--output', 'backup.json']).mode, 'capture-backup');
   assert.equal(parseTypedForwardArguments(['--mode', 'capture-inventory', '--operation', 'operation', '--cli', 'cli', '--account-id', 'a'.repeat(32), '--worker-name', 'worker', '--wrangler-sha256', 'b'.repeat(64), '--growth-budget-bytes', '100000', '--inventory-output', 'inventory.json', '--targets-output', 'targets.json', '--backup-output', 'backup.json']).mode, 'capture-inventory');
+  assert.equal(parseTypedForwardArguments(['--mode', 'capture-inventory', '--operation', 'operation', '--cli', 'cli', '--account-id', 'a'.repeat(32), '--worker-name', 'worker', '--wrangler-sha256', 'b'.repeat(64), '--growth-budget-bytes', '0', '--inventory-output', 'inventory.json', '--targets-output', 'targets.json', '--backup-output', 'backup.json']).migrationGrowthBudgetBytes, '0');
   assert.throws(() => parseTypedForwardArguments(['--mode', 'execute', '--plan', 'plan.json']), { code: 'TYPED_FORWARD_ARGUMENTS_INVALID' });
 });
