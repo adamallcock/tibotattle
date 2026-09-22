@@ -209,6 +209,35 @@ function isoTimestamp(value, code) {
   return timestamp;
 }
 
+export function projectAdminDatabaseHealth(value) {
+  const code = "ADMIN_DATABASE_HEALTH_INVALID";
+  const source = record(value, code);
+  if (source.schemaVersion !== "admin-database-health-v0.1") invalid(code);
+  const storageMode = enumValue(source.storageMode, new Set(["json", "typed", "unknown"]), code);
+  const roles = ["primary", "deletion_ledger", "analytics"];
+  const rows = array(source.databases, code);
+  if (rows.length !== roles.length) invalid(code);
+  const databases = rows.map((value, index) => {
+    const row = record(value, code);
+    if (row.role !== roles[index]) invalid(code);
+    const status = enumValue(row.status, new Set([
+      "reachable", "unavailable", "timeout", "not_configured", "not_applicable",
+    ]), code);
+    const unused = row.role === "analytics" && storageMode === "json";
+    if ((status === "not_applicable") !== unused) invalid(code);
+    if (status !== "reachable" && (row.responseMs !== null || row.databaseBytes !== null)) invalid(code);
+    if (status === "reachable" && row.responseMs === null) invalid(code);
+    return { role: row.role, status,
+      responseMs: row.responseMs === null ? null : count(row.responseMs, code),
+      databaseBytes: row.databaseBytes === null ? null : count(row.databaseBytes, code) };
+  });
+  const status = storageMode !== "unknown" && databases.every(row =>
+    row.status === "reachable" || row.status === "not_applicable") ? "available" : "degraded";
+  if (source.status !== status) invalid(code);
+  return { schemaVersion: source.schemaVersion, observedAt: isoTimestamp(source.observedAt, code),
+    storageMode, status, databases };
+}
+
 /** Closed, aggregate-only owner progress. It describes recorded work and
  * publication generations, never estimates remaining time or missing counts. */
 export function projectAdminReconstructionProgress(value) {

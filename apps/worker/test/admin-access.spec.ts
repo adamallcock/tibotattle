@@ -186,6 +186,7 @@ describe("admin surface hostname gating", () => {
       "/api/v1/admin/metrics/history",
       "/api/v1/admin/community/allowance-preview",
       "/api/v1/admin/reconstruction-progress",
+      "/api/v1/admin/database-health",
     ]) {
       const adminApi = await handleRequest(
         new Request(`${PUBLIC_ORIGIN}${path}`),
@@ -462,6 +463,29 @@ describe("admin surface hostname gating", () => {
         { planType: "plus", multiplier: 20 },
       ],
     });
+  });
+
+  it("authenticates database probes before reads and preserves partial failures", async () => {
+    const url = `${ADMIN_ORIGIN}/api/v1/admin/database-health`;
+    const token = await signedAccessJwt();
+    const headers = { "cf-access-jwt-assertion": token };
+    const response = await handleRequest(new Request(url, { headers }), adminSurfaceBindings());
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({ schemaVersion: "admin-database-health-v0.1", status: "available" });
+    const partial = await handleRequest(new Request(url, { headers }), adminSurfaceBindings({ USAGE_MONITOR_DB: undefined }));
+    expect(partial.status).toBe(200);
+    await expect(partial.json()).resolves.toMatchObject({ status: "degraded", databases: [
+      { role: "primary", status: "not_configured" }, { role: "deletion_ledger", status: "reachable" },
+      { role: "analytics", status: "not_applicable" },
+    ] });
+    const forbiddenDb = { prepare() { throw new Error("must not probe before owner auth"); } };
+    expect((await handleRequest(new Request(url), adminSurfaceBindings({ USAGE_MONITOR_DB: forbiddenDb }))).status).toBe(403);
+    const nonOwner = await signedAccessJwt({ email: "non-owner@example.test" });
+    expect((await handleRequest(new Request(url, { headers: { "cf-access-jwt-assertion": nonOwner } }),
+      adminSurfaceBindings({ USAGE_MONITOR_DB: forbiddenDb }))).status).toBe(403);
+    expect((await handleRequest(new Request(`${url}?query=private`, { headers }), adminSurfaceBindings())).status).toBe(400);
+    expect((await handleRequest(new Request(url, { method: "POST", headers }), adminSurfaceBindings())).status).toBe(405);
   });
 
   it("serves closed read-only progress only to the Access owner and negotiates exact preparation detail", async () => {
