@@ -106,9 +106,18 @@ successful recovery observation. A `canceled` outcome without an exception does
 not establish a database, memory or application-level cause.
 
 One physical-statement meter covers both D1 bindings and all scheduled phases
-(900 statements, with lease-release headroom). Required maintenance runs
-first. Optional calculation has a 40-second admission deadline and yields durable
-progress when it cannot finish. Migration 0054 replaces the current lane's
+(900 statements, with lease-release headroom). Required maintenance runs first.
+Weekly publication then attempts the current period and at most one queued period,
+reserving statement headroom for graph work. Weekly failures are reported
+independently and leave their queue and source/privacy fences intact. The graph's
+40-second admission window starts only after those earlier phases return; slow
+housekeeping cannot exhaust that window before calculation starts. The statement
+meter is never reset. The deadline stops admission and checkpoint work; it cannot
+cancel a database statement already in progress. `scheduled_graph_admission`
+separates the earlier phase durations from the new graph window; existing phase `elapsedMs` fields still
+measure total invocation time. Verify checkpoint changes and publication times,
+not merely a successful maintenance event. Calculation yields durable progress
+when it cannot finish. Migration 0054 replaces the current lane's
 whole-account polling and four-attempt cap with an indexed, coalescing dirty
 queue. Claiming moves an account to the back before work begins; revision,
 window and lease checks make completion restart-safe. The actual remaining
@@ -194,6 +203,13 @@ admission uses the same statement meter and deadline.
 Content-free preview/analysis phase logs include elapsed time, remaining time
 and actual statement counts. The lifecycle `last_completed_at` stamp precedes
 optional work and must not be mistaken for the whole invocation duration.
+Calculation failures also expose a closed `failureReason`: prepared-source
+revision, saved-control or day-count validation, other unavailable evidence,
+source change, query budget, database or account storage full, database
+constraint/error, type error, or unknown
+error. These labels never include error messages, stack traces or identifiers.
+Use the classified failure and saved checkpoint movement together; a successful
+maintenance result does not prove that its calculations succeeded.
 A cache miss, stale source, deadline or malformed value defers the whole
 cohort. New unpublished activity days may publish token/spend totals without
 an allowance; their rebuild queue stays pending, and existing published
@@ -215,7 +231,54 @@ single-flight browser request lanes with a 15-second request timeout, not a
 15-second polling interval. Automatic polling retains the owner's existing
 cadence and pauses when hidden/offline. Temporary storage/network failure
 preserves the prior validated graph; confirmed invalidation or lost owner
-access clears it. Growth snapshots have no age-only read expiry.
+access clears it. A retained graph after a failed refresh is explicitly marked
+as previous dated evidence, and the attention list reports unavailable history,
+allowance and reconstruction sources. Growth snapshots have no age-only read expiry.
+
+The **Database health** section independently calls owner-only
+`GET /api/v1/admin/database-health` (`admin-database-health-v0.1`, no query
+parameters). It performs one constant `SELECT 1` per API-bound D1 role: primary
+service/telemetry, deletion ledger, and the separate analytics database in typed
+storage mode. JSON mode explicitly marks separate analytics as not applicable.
+Other Workers' databases, including the catchup control journal, are outside this
+probe's coverage. The existing Access owner pin protects the route; the public
+hostname returns 404 and responses are never cached.
+
+Each check reports read availability, elapsed round-trip milliseconds, D1-reported
+size in bytes (displayed as MiB), and the observation timestamp. Missing size
+metadata remains unavailable. Individual failure, missing binding, invalid
+storage configuration or a five-second deadline degrades the result while
+preserving the other roles. The deadline stops waiting; it cannot cancel an
+already admitted D1 query. Temporary endpoint failure retains dated results with
+a stale label; lost owner access clears them. Old Workers lacking this additive
+endpoint display unavailable. No migration or production binding changes are
+needed. The route does not write data, run maintenance, scan tables, or verify
+schema compatibility, backup health, remaining capacity or write availability.
+For failed reads, inspect Cloudflare D1 availability and deployed bindings, then
+refresh. Review Cloudflare D1 storage trends and configured limits separately.
+
+The owner page is an observation surface, not an uptime monitor: automatic reads
+pause when its tab is hidden or offline, and browser alerts depend on those reads.
+The attention list checks retention completion freshness against the service's
+two-hour policy, incomplete maintenance cycles, admission saturation, bounded
+analytics and recently retained 5xx error groups. Sampled diagnostics are not a
+complete error rate. Consult `/ready` for the service's authoritative readiness
+checks rather than treating the page's absence of warnings as proof.
+
+Growth headlines count retained identities/events, with recent UTC-day charts;
+legacy web sign-in, pairing and consent counters do not measure accountless
+Electron enrollment. Accepted-data counters follow the active storage mode: legacy whole
+contributions/v1.0 chunks, or typed v1/v1.1 upload headers. Distribution separates
+native and Electron manifest checks by OS and reported version. Address reach
+can overlap between rows, and a latest-GitHub-tag match does not establish that
+each platform is on its own current feed version. GitHub download counters cover
+macOS DMG assets only, not Windows/Linux adoption or completed installations.
+
+Collection drafts survive refreshes and retain the revision on which editing
+started. A conflicting revision must be discarded and reviewed before saving.
+Actions require a usable overview; a bounded maintenance pass can return
+incomplete or already-running rather than completed. Ordinary maintenance never
+initiates participant erasure.
 
 The admin client requests `?detail=preparation` for the backward-compatible
 version-2 progress view. Query-free version 1 remains unchanged. Retained
@@ -237,6 +300,23 @@ lease state, last cached-result time, and the daily publication/price backlog.
 The display survives an unavailable allowance preview; a failed overview refresh
 labels its last observation stale. Missing diagnostics do not take Operations
 down or become zero work. Refresh never starts a calculation.
+
+Admin overview v0.5 identifies JSON or typed storage explicitly in
+`service.telemetryStorageMode` and adds native/Electron distribution by OS.
+The Worker and bundled admin client must be deployed together; older open tabs
+reject the new schema and need a reload. The prior v0.3/v0.4 schema identifiers
+are not repurposed. In typed-storage mode, the overview keeps operational authority in the
+ingestion source and reads derived publication state only from that source's
+registered analytics target. Current account, upload, chunk and stored-record
+counts come from compact v1/v1.1 upload headers; the interactive route never
+counts `typed_telemetry_records`. Header record counts therefore remain exact
+when the physical typed corpus is much larger than the 10,000-row safety bound
+used for raw operational samples. Daily publication and queue state come from
+the source-keyed analytics tables. The old weekly rebuild queue has no typed
+equivalent and is reported as unavailable, while retained dated model
+publications and graph-preview freshness are shown separately. Do not replace
+that unavailable state with zero or read legacy source-side derived tables as a
+fallback.
 
 Acquisition completion is not a finished allowance estimate. The account census
 is capped at 10,000 tracked checkpoints and explicitly indicates truncation.
@@ -430,6 +510,36 @@ data or authorize a different cross-format join.
 
 ### Guarded deployment wrapper
 
+The routine wrapper below assumes the checked-in JSON database layout. If live
+production uses typed storage, a different primary database, or a separate
+`ANALYTICS_DB`, do not run that wrapper against the legacy configuration.
+Reconcile the live configuration and typed schema first. This is a source/config
+compatibility boundary; a migration confirmation cannot repair a binding mismatch.
+
+The read-only reconciliation command accepts an owner-private Cloudflare
+inventory containing account/Worker identity, active version, settings,
+schedules, ingress, domains, and Durable Object namespace metadata. Pin the
+inventory bytes and the observed deployed source. Supply an existing
+`CLOUDFLARE_API_TOKEN` through the approved credential mechanism; the command
+does not discover credentials, log tokens, or obtain broader permissions.
+
+```bash
+npm run production:reconcile -- \
+  --inventory <private-inventory.json> \
+  --inventory-sha256 <reviewed-inventory-sha256> \
+  --expected-previous-source <reviewed-full-deployed-source-sha> \
+  --output-directory <new-private-output-directory>
+```
+
+It re-reads production before and after its fixed schema/contract SELECTs,
+derives expected schemas from local canonical migrations, and writes a private
+candidate configuration plus a sanitized report. It never deploys or applies
+remote migrations. Dirty source or a schema mismatch remains blocked. Even a
+`compatible` result is inspection evidence: the typed configuration still needs
+integration with the immutable snapshot, coordination, owning-surface and
+post-deployment gates. Do not pass the generated configuration to raw Wrangler
+as a shortcut. Keep database identifiers and plain-variable values private.
+
 Only after explicit authorization and green preflight, use the wrapper from
 `apps/worker`:
 
@@ -543,8 +653,10 @@ This is a destructive, private owner operation, never routine support cleanup:
    (unknown historical count, not zero), with the same response envelope and
    task. Without that proof the response is `404 NOT_FOUND`, not success.
 
-Restore replay owns `state: 'deleting'` with `deletion_session_id: null`.
-An owner request against that state also returns `409 PARTICIPANT_DELETING`;
+Social restore replay owns `state: 'deleting'` with `deletion_session_id: null`.
+Accountless restore replay instead owns the deterministic
+`restore-replay:<participantDeletionDigest>` fence. An owner request against
+either restore state also returns `409 PARTICIPANT_DELETING`;
 let maintenance finish or retry the restore instead of taking it over. Cron
 must not resume non-null owner or legacy deletion fences: those require the
 private owner path, even when an old session fence has no matching audit.
@@ -574,10 +686,240 @@ Classify before mutating:
 | Admin-only failure | Keep public/admin host segregation intact; diagnose Access, owner pin, optional analytics, and route behavior separately |
 
 The checked-in `collection-control.mjs` command is intentionally local-only and
-must not be repurposed for production. Production containment is an owner-run,
-revision-checked D1 operation using the reviewed control schema and a valid
-reason code. Restoration is a separate decision after root cause, reconciliation,
-and read-back; never treat “contain” as permission to “restore.”
+must not be repurposed for production. Collection-control containment uses a
+reviewed, revision-checked D1 operation and a valid reason code. It does not stop
+all lifecycle, request, scheduled, or Durable Object writers. Restoration is a
+separate decision; never treat “contain” as permission to “restore.”
+
+### Journaled maintenance version
+
+`apps/worker/scripts/production-maintenance.mjs` is a distinct maintenance
+operation using the existing release journal and shared production lock. It
+never relaxes `runProductionDeployment` or its normal healthy-predecessor gate.
+The generated version retains the exact 24 public asset bytes, public domains
+and Durable Object class/migration identity, serves content-free 503 responses
+with `Retry-After: 300` for dynamic requests, and has no D1, R2, service, queue,
+or Durable Object binding. The retained class has inert methods and alarms.
+Existing secret names are explicitly inherited without reading their values;
+old plain-text variables are not retained.
+
+Prepare a private 0600 JSON plan and a 0700 directory containing exactly its
+24 listed 0600 assets. `validateMaintenancePlan` defines the closed contract:
+exact tooling commit, pinned Wrangler 4.114.0 CLI digest, account/Worker/source
+D1 identity, canonical origin, deadline within 24 hours, predecessor version
+and source commit, canonical binding and writer-inventory digests, original cron, Durable Object
+namespace/migration tag, secret names, every asset length/hash, and the exact
+pre-maintenance source schema digest. Compute the binding digest with
+`maintenanceBindingDigest`; compute the schema digest with `identityDigest`
+over the exact ordered result of `MAINTENANCE_SCHEMA_QUERY`. Preserve the
+filtered current writer inventory beside the plan. All identifiers and live
+receipts stay private. Do not substitute an earlier release's source or assets.
+
+Use an exact clean tooling checkout. These commands name private prepared
+inputs through shell variables; they are not permission to operate production:
+
+```sh
+node apps/worker/scripts/production-maintenance.mjs \
+  --plan "$MAINTENANCE_PLAN" --assets "$MAINTENANCE_ASSETS" \
+  --operation "$MAINTENANCE_OPERATION" --repository "$MAINTENANCE_TOOLING" \
+  --wrangler-cli "$MAINTENANCE_WRANGLER" --action inspect
+node apps/worker/scripts/production-maintenance.mjs \
+  --plan "$MAINTENANCE_PLAN" --assets "$MAINTENANCE_ASSETS" \
+  --operation "$MAINTENANCE_OPERATION" --repository "$MAINTENANCE_TOOLING" \
+  --wrangler-cli "$MAINTENANCE_WRANGLER" --action dry-run
+```
+
+The dry run creates the immutable operation package but acquires no remote
+owner and uses no credential. Review it and retain its receipt before approval.
+An explicitly approved `--action enter --resume
+--confirm ENTER_PRODUCTION_MAINTENANCE` uses the existing injected
+`CLOUDFLARE_API_TOKEN`, reacquires no existing owner, rechecks the exact
+predecessor and bounded sole-writer inventory, then journals version upload,
+100% activation, and removal of the pinned cron separately. Wrangler and API
+failures stop that operation; command diagnostics contain hashes and closed
+status metadata, never raw credential-bearing output. Provider reads reject
+incomplete inventories. Candidate readback requires no D1 binding, exact
+operation-tag/plan marker, inherited secret names, static bytes and 503s.
+Public-host admin-path checks avoid treating an unauthenticated Access redirect
+as proof of the Worker handler; the generated handler's admin-host refusal is
+covered locally.
+
+The shared owner remains held after verified containment. The receipt explicitly
+reports `drainProven: false`: existing requests, scheduled invocations and alarms
+need a separate drain observation before a source freeze. Do not release the
+owner merely to start another operation. Fresh target schema preparation can
+finish and release its owner before maintenance; the fixed-contract copy Worker
+uses its own D1 journal/CAS and can run while maintenance retains this owner.
+Maintenance-owned cutover into the qualified typed role remains a separate
+required gate: the ordinary deploy path expects healthy 200, a new owner and
+its baseline schema contract. It cannot be used as the exit from this operation.
+
+After confirming the executor and all children stopped, use `--action reconcile
+--executor-stopped --confirm RECONCILE_PRODUCTION_MAINTENANCE` with the same
+inputs and directory. It only reads provider state and updates the existing
+journal. Exact tagged uploads or completed activations can be acknowledged;
+unknown or conflicting results remain pending and cannot be replayed. A
+release intent can reconcile either exact-owner-still-held or absent-after-
+verified-restoration; an unrelated owner is never adopted. If it remains held,
+a separately approved restore call performs the final release after fresh checks.
+
+Restoration requires `--action restore
+--confirm RESTORE_PRODUCTION_FROM_MAINTENANCE`. It remains available after
+entry expiry, but requires exact original source schema with no authority freeze,
+old version/bindings, healthy secure JSON/source and static/cron/domain readback.
+It never rolls back after an unqualified schema/cutover change. Source or target
+migration/cutover approvals do not authorize restoring the old writer after
+new-target acceptance. A pre-activation operation can instead use `--action abort
+--executor-stopped --confirm ABORT_UNACTIVATED_MAINTENANCE` after exact unchanged
+predecessor/schema proof; this only releases its own lock. Preserve all journals,
+including uploaded but inactive versions. Do not retry an uncertain mutation or
+edit its intent by hand.
+
+The provider contracts follow Cloudflare's [versions and deployments](https://developers.cloudflare.com/workers/versions-and-deployments/)
+and [namespace inventory](https://developers.cloudflare.com/api/resources/durable_objects/subresources/namespaces/methods/list/).
+Versions do not roll back associated storage state. Run `npm --prefix apps/worker run maintenance:scripts:check` plus the shared
+release-operation and existing production-deploy checks before qualifying new
+tooling. Local tests
+and dry builds do not prove a production transition or drain.
+
+### Maintenance-owned typed cutover
+
+`apps/worker/scripts/production-maintenance-cutover.mjs` continues the exact
+maintenance journal and owner. Ordinary production deployment remains unchanged.
+The separate closed cutover plan pins that journal UUID/owner/maintenance version,
+its deadline, clean candidate source and dependency digest, all three destination
+D1 UUIDs/names, lossless namespace, independent journal source ID, the analytics
+Worker name and the exact typed-copy/role/ledger proof descriptor. Original source,
+ingestion, analytics and independent deletion ledger must be distinct databases;
+the ledger must be the predecessor's existing binding, never a fresh substitute.
+
+Prepare and finish target schemas before maintenance acquires the shared owner.
+The fixed-copy Worker uses its own CAS journal while containment retains that
+owner. Before cutover, stop its Queue/cron and replace or remove its old-source
+binding; the sole-writer check refuses any remaining Worker capable of writing the
+old source. Pin the post-preparation writer inventory. Its canonical digest uses
+the maintained inventory representation and omits only the named analytics
+Worker's changing version row; that Worker is independently checked for exact
+source/config/database bindings, no HTTP ingress and its intended schedule.
+All other Workers and Queue consumers remain pinned.
+
+The qualification mirror must retain all source-bound ingestion role inputs,
+analytics qualification, and the exact `deletion-ledger-migrations` directory.
+The independent ledger schema and full ordered tombstone/cooldown/job snapshot
+are separately pinned. Pending jobs, a restored tombstoned participant, missing
+cooldown coverage, foreign source registration, unverified copy/bootstrap, or
+schema drift refuse admission. If pending deletion work exists, first complete
+ordinary ledger-proven source-side suppression and existing erasure reconciliation
+while public traffic is contained, then pin the completed ledger snapshot. The
+analytics scheduler does not create missing source-side erasure jobs. This
+operator does not authorize that additional mutation through a readiness flag.
+
+```sh
+node apps/worker/scripts/production-maintenance-cutover.mjs \
+  --plan "$MAINTENANCE_PLAN" --cutover-plan "$CUTOVER_PLAN" \
+  --operation "$MAINTENANCE_OPERATION" --repository "$MAINTENANCE_TOOLING" \
+  --candidate-worker "$CANDIDATE_WORKER" --qualification-root "$QUALIFIED_MIRROR" \
+  --restore-contract "$RESTORE_CONTRACT" --ledger-schema "$LEDGER_SCHEMA" \
+  --wrangler-cli "$MAINTENANCE_WRANGLER" --action dry-run
+```
+
+Dry preparation uses the immutable source snapshot and exact retained 24-asset
+public tree, reruns source-owned workspace/endpoint/release checks, and pins the
+same dependency tree before/after commands. It builds the main app and both
+analytics modes locally with no credentials or external writes. Retained public
+release provenance is checked against the candidate's public source bytes; never
+rewrite the release manifest to make a backend candidate pass.
+
+After reviewing the concrete inputs, the same command with `--action apply
+--confirm CUT_OVER_QUALIFIED_TYPED_PRODUCTION` creates a disabled analytics Worker
+through one journaled deployment (Wrangler cannot upload a first version to an
+absent Worker). It verifies no HTTP/cron, admits the copy/role/ledger proof, and
+uploads the main and enabled analytics versions separately. The immutable
+analytics registration uses the maintained initializer through a closed SQL
+adapter and its own intent. Before the first target write the journal durably
+forbids old-source restoration. Neither response loss nor expiry clears that
+latch. Enabled analytics activation and its cron installation have separate
+intents and exact provider readback.
+
+The command deliberately retains the owner and returns
+`MAINTENANCE_ANALYTICS_NATURAL_PROOF_REQUIRED` until given a private bounded
+Wrangler JSON tail capture from a real scheduled invocation:
+
+```sh
+node "$MAINTENANCE_WRANGLER" tail "$ANALYTICS_WORKER" --format json > "$ANALYTICS_TAIL"
+```
+
+Stop only that capture process after the next ordinary cron. Do not invoke the
+scheduler manually or edit the capture. Restrict the retained file to mode 0600.
+Continue the same approved command with `--analytics-tail "$ANALYTICS_TAIL"`.
+The proof checks actual Worker version, schedule time after enablement, successful
+bounded scheduler result and untruncated exception-free output. Full source,
+copy, ledger and analytics catch-up admission must then pass before main-app
+activation. A capacity/deadline deferral is not proof of completed catch-up.
+
+After exact new app health/security/static/binding checks, a separate intent
+restores the main lifecycle cron on new ingestion. Capture its next ordinary
+scheduled invocation in the same manner and continue with
+`--lifecycle-tail "$LIFECYCLE_TAIL"`. The final proof requires successful complete
+maintenance with analytics explicitly delegated; HTTP200 alone cannot finish the
+operation. Only both real schedule proofs plus fresh new app/analytics readbacks
+permit release of the same original owner.
+
+For an unknown outcome, stop the executor and use the same inputs with
+`--action reconcile --executor-stopped
+--confirm RECONCILE_TYPED_PRODUCTION_CUTOVER`. Reconciliation reads first and
+never submits a provider mutation. An exact before-effect activation observation
+can permit a separately approved forward retry of the same candidate; it never
+clears the old-restore prohibition or repeats pristine copy counts after possible
+new-target acceptance. Duplicate/foreign versions or unknown ownership remain
+pending. Preserve both failed and successful receipts.
+
+Before the first target-write latch, use the closed sibling
+`production-maintenance-source-recovery.mjs` to undo an exact source pause. Its
+private recovery plan pins the original maintenance journal/owner/version,
+restore contract file and canonical digest, original complete source schema,
+original `sqlite_sequence` rows, and optional archived cache file. The latter is
+only the exact `{singleton,generated_at,payload_json}` row previously archived
+from `admin_metrics_history_cache`; its immutable hash must come from the
+reviewed archive/delete operation, not a reconstructed replacement. An absent
+archive means this recovery never writes the cache.
+
+Stop the copy executor and its Queue/cron, and close/remove temporary copy
+resources until the original pinned sole-writer inventory is restored. A
+remotely created cutover analytics resource also requires its separately reviewed
+closure before this predecessor-only recovery can proceed. Keep the maintenance
+owner held and confirm the original drain proof still excludes old in-flight
+writers. The recovery checks actual maintenance version/503/static bytes and
+writer inventory before each bounded call; the caller's stopped-executor flag
+alone cannot replace those provider readbacks.
+
+```sh
+node apps/worker/scripts/production-maintenance-source-recovery.mjs \
+  --plan "$MAINTENANCE_PLAN" --recovery-plan "$SOURCE_RECOVERY_PLAN" \
+  --operation "$MAINTENANCE_OPERATION" --repository "$MAINTENANCE_TOOLING" \
+  --contract "$RESTORE_CONTRACT" --source-schema "$ORIGINAL_SOURCE_SCHEMA" \
+  --sequences "$ORIGINAL_SOURCE_SEQUENCES" --cache-archive "$EXACT_CACHE_ARCHIVE" \
+  --wrangler-cli "$MAINTENANCE_WRANGLER" --action inspect
+```
+
+Omit `--cache-archive` only when the plan pins no archived row. After reviewing
+these exact inputs, use `--action apply --executor-stopped
+--confirm RECOVER_FROZEN_PRODUCTION_SOURCE`. Each call removes at most 16 exact
+source-freeze triggers/metadata statements with individual durable intents;
+repeat the same approved command while it reports progress. It does not delete
+raw rows or baseline schema objects. It removes the final temporary snapshot
+page before restoring an archived cache, so the original full database can reuse
+that page. The original writer remains blocked by the held recovery journal until
+schema, sequences and exact cache bytes are all verified.
+
+An uncertain statement requires `--action reconcile --executor-stopped
+--confirm RECONCILE_FROZEN_SOURCE_RECOVERY`. This only reads and distinguishes
+exact before/after states. It neither resubmits SQL nor clears an unrelated
+intent. Only after `MAINTENANCE_SOURCE_RECOVERED` may the normal separately
+approved maintenance restore action reactivate the pinned predecessor. This
+recovery never activates a Writer or releases the shared owner itself. After any
+target-write latch it refuses unconditionally: recovery is forward-only, and a
+typed cutover is not a database rollback.
 
 ## Recovery and rollback
 
@@ -590,10 +932,14 @@ and read-back; never treat “contain” as permission to “restore.”
   participant or tombstoned resource must not reappear through backup restore,
   delayed processing, or object replay.
 - For tombstoned participants, restore replay atomically claims only active
-  rows or interrupted restores already deleting with a null
-  `deletion_session_id`; it skips non-null owner/legacy fences. Final removal
-  must match the null restore fence or the owner operation UUID respectively,
-  so concurrent maintenance cannot finish an owner's in-flight erasure.
+  rows or interrupted restores with the exact same fence. Social owners retain
+  the NULL restore fence; accountless owners use the deterministic
+  `restore-replay:<participantDeletionDigest>` fence after revoking their
+  enrollment, before changing participant state. Accountless replay resumes only
+  that exact reserved fence and refuses other reserved or owner UUID fences.
+  Final removal must match the exact claimed fence: the social NULL restore
+  fence, the accountless reserved restore fence, or the owner operation UUID.
+  Concurrent maintenance cannot finish an owner's unrelated in-flight erasure.
 - A Worker rollback must still understand the live schemas and current durable
   state. If it cannot, contain the affected path and deploy a forward repair.
   After migrations 0049–0053, preserve their ledger entries, columns, triggers,

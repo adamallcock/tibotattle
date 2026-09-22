@@ -1,7 +1,4 @@
 .model-performance { min-width: 0; }
-.performance-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
-.performance-heading h2 { font-family: var(--sans); margin: 0; font-size: clamp(24px, 3vw, 34px); letter-spacing: -.035em; }
-.performance-subtitle { margin: 8px 0 13px; color: var(--muted); }
 .performance-provider { display: inline-block; margin: 0; color: var(--green); font-size: 12px; font-weight: 650; }
 .performance-periods { flex-shrink: 0; }
 .performance-periods button { min-height: 36px; white-space: nowrap; }
@@ -20,6 +17,7 @@
 .performance-card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 14px; }
 .performance-card h4 { margin: 0; font-size: 20px; letter-spacing: -.02em; }
 .performance-unit { margin: 5px 0 0; color: var(--muted); font-size: 13px; }
+.performance-method-note { max-width: 65ch; margin: 8px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
 .performance-plot svg { display: block; width: 100%; height: auto; overflow: visible; }
 .performance-grid { stroke: var(--line); stroke-width: 1; }
 .performance-axis { fill: var(--muted); font: 13px var(--sans); }
@@ -65,7 +63,6 @@
 .performance-details p { max-width: 80ch; line-height: 1.65; margin: 0 0 16px; }
 .performance-model:focus-visible, .performance-point:focus-visible, .performance-details summary:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
 @media (max-width: 720px) {
-  .performance-heading { flex-direction: column; gap: 14px; }
   .performance-periods { align-self: flex-start; }
   .performance-card { padding: 16px 12px 12px; }
   .performance-card-heading { flex-direction: column; gap: 8px; }
@@ -81,3 +78,129 @@
 
 html[data-theme="dark"] .performance-grid { stroke: rgba(245, 241, 232, .1); }
 html[data-theme="dark"] .performance-axis-line { opacity: .42; }
+
+/* Shared dashboard alignment. This block comes after the feature's legacy
+   rules so the model page follows the dashboard contract when stylesheets are
+   loaded in their existing order. */
+.model-performance .performance-provider {
+  margin: 0;
+  color: var(--green);
+  font-size: .75rem;
+  font-weight: var(--weight-semibold, 700);
+}
+.model-performance .performance-status {
+  min-height: 1.5em;
+  margin: var(--space-3, 12px) 0 var(--space-2, 8px);
+  font-size: .75rem;
+  line-height: 1.45;
+}
+.model-performance .performance-status[data-state="loading"],
+.model-performance .performance-status[data-state="updating"] { color: var(--blue); }
+.model-performance .performance-status[data-state="error"],
+.model-performance .performance-status[data-state="cancelled"] { color: var(--rust); }
+
+.model-performance .performance-models {
+  align-items: stretch;
+  gap: var(--space-1, 4px);
+  margin: var(--space-4, 16px) 0 var(--space-5, 20px);
+  padding: 0;
+  border-bottom: 1px solid var(--line);
+}
+.model-performance .performance-model {
+  min-width: var(--hit-target, 24px);
+  min-height: 40px;
+  margin: 0;
+  padding: .5rem .72rem;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: var(--radius-xs, 6px) var(--radius-xs, 6px) 0 0;
+  font-size: .76rem;
+  font-weight: var(--weight-semibold, 700);
+  transition: background-color .12s ease, border-color .12s ease, color .12s ease;
+}
+.model-performance .performance-model:hover:not(:disabled) { color: var(--ink); background: var(--surface-quiet); }
+.model-performance .performance-model[aria-selected="true"] {
+  color: var(--ink);
+  border-bottom-color: var(--green);
+  background: var(--green-soft);
+}
+.model-performance .performance-model-heading {
+  gap: var(--space-3, 12px);
+  padding: var(--space-4, 16px) 0 var(--space-3, 12px);
+}
+.model-performance .performance-model-heading h3 { font-size: 1.32rem; }
+.model-performance .performance-model-heading > span { font-size: .75rem; }
+
+.model-performance .performance-actions { margin: var(--space-3, 12px) 0; gap: var(--space-2, 8px) var(--space-3, 12px); }
+.model-performance .performance-actions .performance-status { margin: 0; }
+.model-performance .performance-status[data-state="cancelled"] { color: var(--muted); }
+.model-performance .performance-status[data-state="stale"],
+.model-performance .performance-unit[data-state="partial"] { color: var(--amber); }
+/* Secondary timestamps and standalone ranges remain readable without nested cards. */
+.model-performance .performance-evidence {
+  display: flex; flex-wrap: wrap; align-items: baseline;
+  gap: var(--space-2, 8px) var(--space-4, 16px);
+  margin: var(--space-2, 8px) 0; padding: 0; border: 0;
+  border-radius: 0; background: transparent; box-shadow: none;
+  color: var(--muted); font-size: .74rem; line-height: 1.5;
+}
+.model-performance .performance-evidence-row {
+  display: flex; flex-wrap: wrap; align-items: baseline;
+  gap: var(--space-2, 8px); min-width: 0;
+}
+.model-performance .performance-evidence .performance-evidence-label { font-size: .74rem; font-weight: 400; letter-spacing: 0; text-transform: none; }
+.model-performance .performance-evidence-value { margin: 0; font-size: .74rem; font-variant-numeric: tabular-nums; }
+.model-performance .performance-evidence-row[data-state="stale"] { color: var(--amber); }
+.model-performance .performance-evidence-row[data-state="error"] { color: var(--rust); }
+
+.model-performance .performance-card { margin-bottom: var(--space-4, 16px); }
+.model-performance .performance-unit { margin: var(--space-1, 4px) 0 0; font-size: .76rem; line-height: 1.5; }
+.model-performance .performance-legend { justify-content: flex-start; padding: 0; margin-bottom: var(--space-4, 16px); gap: var(--space-2, 8px) var(--space-4, 16px); font-size: .68rem; line-height: 1.4; }
+.model-performance .performance-empty {
+  display: grid;
+  place-items: center;
+  min-height: 220px;
+  margin: 0;
+  padding: var(--space-7, 32px) var(--space-5, 20px);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm, 10px);
+  background: var(--surface-quiet);
+  font-size: .78rem;
+  line-height: 1.5;
+}
+
+.model-performance .performance-details {
+  margin-top: var(--space-5, 20px);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md, 14px);
+  background: var(--surface);
+  overflow: hidden;
+}
+.model-performance .performance-details summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4, 16px);
+  min-height: var(--hit-target, 24px);
+  padding: var(--space-4, 16px) var(--pad-card, 24px);
+  font-weight: var(--weight-semibold, 700);
+  list-style: none;
+}
+.model-performance .performance-details summary::-webkit-details-marker { display: none; }
+.model-performance .performance-details summary::after { color: var(--green); content: "+"; font-size: 1.15rem; font-weight: var(--weight-regular, 400); line-height: 1; }
+.model-performance .performance-details[open] summary { border-bottom: 1px solid var(--line); }
+.model-performance .performance-details[open] summary::after { content: "−"; }
+.model-performance .performance-details p { margin: 0; padding: 0 var(--pad-card, 24px) var(--space-4, 16px); line-height: 1.6; }
+.model-performance .performance-details p:first-of-type { padding-top: var(--space-4, 16px); }
+
+@media (max-width: 720px) {
+  .model-performance .performance-card { padding: var(--space-4, 16px); }
+  .model-performance .performance-evidence-row { flex-basis: 100%; }
+}
+@media (max-width: 480px) {
+  .model-performance .performance-details summary,
+  .model-performance .performance-details p { padding-inline: var(--space-4, 16px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .model-performance .performance-model { transition: none; }
+}

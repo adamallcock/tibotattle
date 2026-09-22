@@ -46,10 +46,10 @@ and updated authoritative documentation.
 - Unexpected Keychain security prompts block release. Routine access must be
   non-interactive; never weaken protection to suppress prompts. Follow
   `apps/macos/AGENTS.md` for silent migration, explicit recovery, and proof.
-- Prompts, responses, raw session commands, credentials, private session paths
-  and filenames, raw account identifiers, and other session content must not
-  enter derived artifacts, fixtures, logs, diagnostics, issues, commits, or
-  pull requests.
+- Prompts, responses, raw commands, credentials, private paths/filenames, raw
+  account IDs and session content must not enter derived artifacts, fixtures,
+  logs, diagnostics, issues, commits, or PRs. Opt-in Crashpad dumps and explicit
+  owner-only raw crash exports are sole local exceptions; never project/upload them (`docs/decisions/2026-09-21-opt-in-crash-doctor.md`).
 - Hosted contribution is optional, content-free and pseudonymous. Follow the
   accountless Electron defaults and transition in
   `docs/decisions/2026-09-04-accountless-sharing-policy.md`; preserve durable

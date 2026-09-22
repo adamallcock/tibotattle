@@ -119,11 +119,11 @@ attestation or digest generation.
 
 | Subject | Native final bytes | Required direct assurances | Current status |
 | --- | --- | --- | --- |
-| macOS direct | Developer ID-signed, notarized, stapled DMG; arm64 and any later architecture as separate subjects | cleanInstallSmokePassed, developerIdSigned, hardenedRuntime, notarizationAccepted, ticketStapled, gatekeeperAssessmentPassed | Existing arm64 local finalizer; protected GitHub attestation/publication caller remains a gate |
+| macOS direct | Developer ID-signed, notarized, stapled DMG; arm64 and any later architecture as separate subjects | cleanInstallSmokePassed, developerIdSigned, hardenedRuntime, notarizationAccepted, ticketStapled, gatekeeperAssessmentPassed | Electron 0.1.22 is published for arm64 and x64; every successor needs distinct artifact and publication evidence |
 | macOS Store | Final App Store-delivered subject retrieved and hash-verified after acceptance, with a `store-delivery-receipt-v1` receipt | storePublisherVerified, storeBuildVerified, storeSignatureVerified; receipt binds provider/listing/source/final filename/bytes/SHA-256 and states `deliveryState: final`, `uploadCandidate: false` | Separate Store subject; never equate its bytes with the DMG or an upload candidate |
-| Windows direct | One selected native x64 installer/package, after signing nested executables and final package | cleanInstallSmokePassed, authenticodeSigned, timestamped | Qualification only; no supported installer is currently claimed |
+| Windows direct | One selected native x64 installer/package, after signing nested executables and final package | cleanInstallSmokePassed, authenticodeSigned, timestamped | Signed Electron 0.1.22 x64 installer is published; successor qualification and signing remain separate gates |
 | Windows Store | Final Microsoft Store-delivered subject retrieved and hash-verified after acceptance, with a `store-delivery-receipt-v1` receipt | storePublisherVerified, storeBuildVerified, storeSignatureVerified; receipt binds provider/listing/source/final filename/bytes/SHA-256 and states `deliveryState: final`, `uploadCandidate: false` | Future separate subject; never describe the upload candidate as delivered |
-| Linux direct | Native x86_64 AppImage or a package from a real signed repository | cleanInstallSmokePassed, artifactIntegrityVerified, plus distribution-specific detached/repository evidence where applicable | Qualification only; no supported artifact is currently claimed |
+| Linux direct | Native x86_64 AppImage or a package from a real signed repository | cleanInstallSmokePassed, artifactIntegrityVerified, plus distribution-specific detached/repository evidence where applicable | Electron 0.1.22 x64 AppImage is published with owner-accepted physical limits; its clean-install assurance remains false |
 | Linux Store/repository | Final Flathub, Snap, APT, or RPM-delivered subject retrieved and hash-verified, with a `store-delivery-receipt-v1` receipt | storePublisherVerified, storeBuildVerified, storeSignatureVerified; receipt binds provider/listing/source/final filename/bytes/SHA-256 and states `deliveryState: final`, `uploadCandidate: false` | Future separate subject; a loose package or upload candidate is not repository evidence |
 
 The current repository's assurance vocabulary and allowed Store providers live in
@@ -249,6 +249,22 @@ skip those attestation steps.
     and gh release verify-asset for the release and every uploaded asset.
 13. Only after those post-publication checks pass, publish Sparkle/R2, Homebrew,
     website, Store, and updater metadata.
+
+Release documentation has two explicit check scopes. Pull-request CI runs
+`node scripts/check-release-notes.mjs --reachable-tags` against complete Git
+history: it requires the package candidate and every stable tag reachable from
+the PR checkout. A tag created on a separate release branch cannot require
+future notes in an older feature branch. Missing reachable history, candidate
+notes, malformed provenance and shallow history still fail.
+
+Main, manual release-trust runs and publication use
+`node scripts/check-release-notes.mjs` without that flag, covering the complete
+stable-tag inventory. Commit the dated changelog and notes before creating the
+annotated release tag, push the reviewed source and tag together, and merge the
+release PR preserving that source before publication. Do not copy future notes
+into unrelated branches, move the tag, or use PR scope to admit a publication.
+When a check fails, record its checkout SHA and scope before changing release
+inputs; a failure in another branch does not identify the signed candidate.
 
 A release that fails any stage remains a draft or is stopped. Do not replace
 assets in an immutable release. Rebuild from a new release tag if final bytes
@@ -630,6 +646,19 @@ credentials. It refuses real-product execution mode. Run it on Linux; a skip
 on another operating system is not Linux evidence. Retain the native packaged
 startup/credential/cold-restart receipts separately from this adapter receipt.
 
+The final Linux production-package workflow also qualifies the application
+extracted from its exact AppImage. `qualify-electron-linux-final-appimage.mjs`
+checks the final package receipt and original source stage before extraction,
+then binds the existing normal packaged startup, refresh, credential-service,
+settings/opt-out and cold-restart smoke to those extracted ASAR/executable bytes.
+The native amd64 test uses the existing disposable Secret Service and Xvfb
+runtime with external networking disabled. Retain `final-image-preparation.json`,
+`normal-packaged-smoke.json` and `final-image-runtime.json` with the final package;
+missing, failed or differently bound smoke evidence refuses final qualification.
+This proves the extracted application's runtime only. AppImage mounting/launcher
+integration, physical desktop behavior and replacement of the older public
+release remain separate observations; the receipt explicitly leaves them open.
+
 ### Stores and updater channels
 
 Store submissions must record their own provider/listing, publisher/build/
@@ -760,6 +789,51 @@ reverse schema migration. The rollback readback checks exact predecessor bytes
 (or a definitive 404); authentication errors and redirects never mean absence.
 
 
+### Separate coordination for immutable qualification artifacts
+
+`createImmutableArtifactPublicationLock` in
+`apps/worker/scripts/production-deployment-lock.mjs` provides the fixed
+`refs/heads/codex/immutable-release-artifact-lock` coordination ref for reviewed
+immutable artifact writers. Its parentless owner commit records the closed
+`immutable-release-artifact-lock-v1` schema, operation `id`, exact `sourceCommit`
+and `planSha256`. It shares the production lock's compare-and-swap acquisition,
+ownership checks and uncertain-response handling, without reading or changing
+the production ref. Neither lock expires, steals ownership or accepts an
+arbitrary destination ref.
+
+The initial scope is native test DMGs and signed test appcasts under an exact
+source/build/artifact-digest namespace. The writer must bind its complete object
+allowlist and hashes to that plan, prove it is disjoint from any concurrent
+production operation, refuse existing different bytes and verify uploaded bytes.
+Uncertain writes retain the exact owner and operation journal for reconciliation.
+The lock coordinates participating writers; it does not supply conditional R2
+creation or fence legacy and external writers. Merely holding it does not prove
+immutable path admission or authorize publication.
+
+A separately reviewed GitHub-only release operation may use the same artifact
+coordination factory for an exact new-version draft, its complete allowlisted
+asset set, and finalization as an immutable release. Its closed plan must also
+explicitly name promotion to GitHub's `latest` release: that is a mutable
+discovery change, not an immutable object upload. Bind the source/tag, notes,
+canonical manifest/checksums and completed release-admission receipt before
+draft creation, then verify every downloaded draft and published asset. Require
+immutable finalization and fresh `latest` identity readback before releasing the
+artifact owner. Pending qualification or owner acceptance still blocks this
+operation; accepted limits must remain explicit in the manifest and review.
+
+This GitHub-only scope does not call the full publication reconciler or require
+a fabricated website receipt. It must retain a separate exact journal, refuse
+conflicting or extra assets, and never overwrite/delete assets or blindly repeat
+an uncertain mutation. An existing Homebrew workflow that polls GitHub `latest`
+may update its cask after this promotion, even without a manual tap dispatch.
+
+Native and Electron stable feeds, direct Homebrew mutation, website deployment,
+Worker changes and migrations retain their existing coordination contracts.
+In particular, native stable appcast replacement still requires the canonical
+Worker-hosted atomic guard; maintenance responses cannot be bypassed with an
+ordinary R2 write. This helper does not qualify an installed app or imply that
+stable updater discovery, hosted APIs or the public website have been updated.
+
 ### Explicit stable writes and rollback
 
 `scripts/publish-electron-stable-feed.mjs` is the separate protected write
@@ -771,6 +845,17 @@ through `createProductionDeploymentLock` in
 lock's exact owner commit, checks ownership before/after I/O, and never acquires,
 steals, expires or releases it. The lock coordinates compliant release tooling;
 R2 itself still supplies no conditional write through this CLI path.
+
+The writer runs the existing release-documentation validator before opening a
+publication journal or contacting R2. The publishing checkout must contain the
+complete release-note and changelog history for its stable tags, including the
+exact version being published. Fetch the existing tags and incorporate any
+missing reviewed documentation into the publishing branch before freezing it;
+do not recreate or move a published tag. Run `node scripts/check-release-notes.mjs`
+there before requesting publication. A passing check on main does not qualify
+an older release worktree, and a green packaging workflow does not run this
+publication check. Explicit rollback retains its existing ownership and journal
+checks without depending on subsequently changed documentation.
 
 Compute the approved digest with the maintained `identityDigest(plan)` helper,
 where `plan` is the result of `prepareElectronStablePublication` for the exact

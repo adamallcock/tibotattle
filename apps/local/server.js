@@ -1,4 +1,5 @@
 import { createWorkUsageService } from "../../src/application/index.js";
+import { createWorkUsageSnapshotStore } from "./work-usage-snapshots.js";
 import { enrichWorkUsageRows } from "../../src/local-work-usage-source.js";
 import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
@@ -605,12 +606,13 @@ export function createCachedLocalUnifiedProjectionReader({
     const nowMs = options.nowMs;
     const key = JSON.stringify([
       options.indexFile, options.declaredSpeedBaselines ?? [],
-      options.includeWorkUsage === true, options.codexHome ?? null, options.secretFile ?? null,
+      options.includeWorkUsage === true, options.exactWindow === true, options.codexHome ?? null, options.secretFile ?? null,
     ]);
     const expectedFingerprint = controls.reuse?.generationFingerprint
       ?? (options.includeWorkUsage ? await readGeneration(options) : null);
     if (closed || controls.signal?.aborted) throw projectionAborted();
     if (cached && key === cached.key && expectedFingerprint === cached.generationFingerprint
+        && (!options.exactWindow || nowMs === cached.projectedAtMs)
         && Number.isFinite(nowMs) && nowMs >= cached.projectedAtMs && nowMs < cached.validUntilMs) {
       return structuredClone(select(cached.projection));
     }
@@ -3147,7 +3149,7 @@ function createPreparedLocalCompanionServer({
     overview,
   }),
   workUsageBuild = async (query, controls) => sharedProjectionReader({
-      mode: "full", nowMs: query.toMs, includeWorkUsage: true,
+      mode: "full", nowMs: query.toMs, includeWorkUsage: true, exactWindow: query.exactWindow === true,
       indexFile: statePaths.unifiedIndexFile, codexHome,
       declaredSpeedBaselines: await codexSpeedBaseline.readWindows(),
     }, { ...controls, selectProjection: projection => selectSharedWorkUsageSnapshot(projection, query) }),
@@ -3334,7 +3336,7 @@ function createPreparedLocalCompanionServer({
   // readiness. Create its controller only when its page is first requested.
   let modelPerformanceController = null;
   let modelPerformanceShutdown = null;
-  const readModelPerformance = modelPerformanceProvider ?? ((period) => {
+  const readModelPerformance = modelPerformanceProvider ?? ((period, options) => {
     if (modelPerformanceShutdown !== null) {
       throw new Error("model_performance_unavailable");
     }
@@ -3342,7 +3344,7 @@ function createPreparedLocalCompanionServer({
       directory: join(stateRoot, "inference-timing-v2"),
       codexHome,
     });
-    return modelPerformanceController.read(period);
+    return modelPerformanceController.read(period, options);
   });
   const closeModelPerformance = () => {
     modelPerformanceShutdown ??= Promise.resolve().then(() => (
@@ -4347,7 +4349,14 @@ function createPreparedLocalCompanionServer({
     return authorization;
   };
 
-  const workUsage = createWorkUsageService({ build: workUsageBuild, enrich: workUsageEnrich });
+  const workUsage = createWorkUsageService({ build: workUsageBuild, enrich: workUsageEnrich,
+    snapshotStore: createWorkUsageSnapshotStore({
+      snapshotFile: join(stateRoot, "work-usage-snapshot.json"),
+      codexHome, indexFile: statePaths.unifiedIndexFile,
+    }),
+  });
+  let workUsageShutdown = null;
+  const closeWorkUsage = () => workUsageShutdown ??= workUsage.close();
   const server = createServer(async (request, response) => {
     try {
       if (!isLoopbackPeer(request)) {
@@ -4716,13 +4725,19 @@ function createPreparedLocalCompanionServer({
           return;
         }
         const entries = [...url.searchParams.entries()];
-        if (entries.length !== 1 || entries[0][0] !== "period"
-            || !["7", "30", "all"].includes(entries[0][1])) {
+        const period = url.searchParams.get("period");
+        const endAt = url.searchParams.get("endAt");
+        const end = endAt === null ? null : Date.parse(endAt);
+        if (entries.length !== (endAt === null ? 1 : 2)
+            || entries.some(([key]) => !["period", "endAt"].includes(key))
+            || !["1", "7", "30", "all"].includes(period)
+            || (endAt !== null && (!Number.isSafeInteger(end) || end < 0
+              || end > Date.now() || new Date(end).toISOString() !== endAt))) {
           sendError(response, 400, "invalid_request");
           return;
         }
         try {
-          send(response, 200, await readModelPerformance(entries[0][1]));
+          send(response, 200, await readModelPerformance(period, endAt === null ? {} : { endAt }));
         } catch {
           sendError(response, 503, "model_performance_unavailable");
         }
@@ -5540,7 +5555,7 @@ function createPreparedLocalCompanionServer({
   });
 
   server.on("close", () => {
-    workUsage.close();
+    void closeWorkUsage().catch(() => onError("work_usage_shutdown_failed"));
     void Promise.resolve(sharedProjectionReader.close?.()).catch(() => onError("local_projection_shutdown_failed"));
   });
 
@@ -5564,6 +5579,7 @@ function createPreparedLocalCompanionServer({
     ),
     shutdownContributionRuntime,
     closeModelPerformance,
+    closeWorkUsage,
   };
 }
 
@@ -5636,6 +5652,7 @@ export async function startLocalCompanionServer({
       await closeHttpServer(app.server);
       await Promise.all([
         app.closeModelPerformance(),
+        app.closeWorkUsage(),
         app.shutdownContributionRuntime(),
       ]);
     },

@@ -183,7 +183,7 @@ describe("owner-only reconstruction progress", () => {
       schemaVersion: "admin-reconstruction-progress-v0.1", status: "unavailable", observedAt: ISO, mode: "resumable" });
     const result = await readAdminOverview(db(), env.DELETION_LEDGER,
       { environment: "synthetic-development", enrollmentMode: "open", accountScopedIngestMode: "disabled", nowEpoch: NOW });
-    expect(result).toMatchObject({ schemaVersion: "admin-overview-v0.3",
+    expect(result).toMatchObject({ schemaVersion: "admin-overview-v0.5",
       dailyPublication: { pendingRebuilds: 0 } });
   });
 });

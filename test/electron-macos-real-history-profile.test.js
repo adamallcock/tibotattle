@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,11 +13,13 @@ import {
   REAL_HISTORY_PROFILE_SCHEMA_VERSION,
   parseRealHistoryProfileArguments,
   prepareRealHistoryProfile,
+  prepareInteractivePacingIdentity,
+  interactiveEnvironment,
   validateRealHistoryProfile,
 } from "../scripts/electron-macos-real-history-profile.mjs";
 
 async function makeSyntheticState(t, { legacyIndex = false, wal = false } = {}) {
-  const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-profile-test-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "tibotattle-electron-profile-test-")));
   t.after(() => rm(root, { recursive: true, force: true }));
   const sourceStateRoot = join(root, "source-state");
   const codexHomePath = join(root, "codex-home");
@@ -89,6 +91,80 @@ function logicalDatabaseDigest(path) {
     database.close();
   }
 }
+
+test("interactive pacing creates a separate stable identity without changing copied or source history", async (t) => {
+  const fixture = await makeSyntheticState(t);
+  await prepareRealHistoryProfile(fixture);
+  const profile = await validateRealHistoryProfile(fixture.profilePath);
+  const exportBefore = await readFile(profile.identityPath);
+  const sourceBefore = logicalDatabaseDigest(fixture.collectorFile);
+  const copyBefore = logicalDatabaseDigest(profile.collectorPath);
+  const path = await prepareInteractivePacingIdentity(fixture.profilePath);
+  const first = await readFile(path);
+  assert.equal(first.length, 32);
+  assert.equal((await lstat(path)).mode & 0o777, 0o600);
+  assert.notDeepEqual(first, Buffer.from(exportBefore.toString().trim(), "base64url"));
+  assert.notDeepEqual(first, fixture.salt);
+  assert.equal(await prepareInteractivePacingIdentity(fixture.profilePath), path);
+  assert.deepEqual(await readFile(path), first);
+  assert.deepEqual(await readFile(profile.identityPath), exportBefore);
+  assert.equal(logicalDatabaseDigest(fixture.collectorFile), sourceBefore);
+  assert.equal(logicalDatabaseDigest(profile.collectorPath), copyBefore);
+  const env = interactiveEnvironment(profile, fixture.codexHomePath, path);
+  assert.equal(env.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE, path);
+  assert.equal(env.USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE, profile.identityPath);
+  assert.equal(env.USAGE_MONITOR_TEST_LANE, "macos-electron-local-qa-v1");
+  assert.equal(env.USAGE_MONITOR_CENTRAL_ORIGIN, undefined);
+  assert.equal(interactiveEnvironment(profile, fixture.codexHomePath)
+    .USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE, undefined);
+  first.fill(0);
+  exportBefore.fill(0);
+});
+
+test("interactive pacing refuses invalid existing identity instead of replacing it", async (t) => {
+  const fixture = await makeSyntheticState(t);
+  await prepareRealHistoryProfile(fixture);
+  const path = join(fixture.profilePath, "identity", "account-observation-development");
+  const malformed = Buffer.from("synthetic-invalid");
+  await writeFile(path, malformed, { mode: 0o600 });
+  await assert.rejects(() => prepareInteractivePacingIdentity(fixture.profilePath), {
+    code: "ELECTRON_REAL_HISTORY_PROFILE_PACING_IDENTITY_INVALID",
+  });
+  assert.deepEqual(await readFile(path), malformed);
+});
+
+test("interactive pacing recovers interrupted publication without rotating the key", async (t) => {
+  const fixture = await makeSyntheticState(t);
+  await prepareRealHistoryProfile(fixture);
+  const directory = join(fixture.profilePath, "identity");
+  const abandoned = join(directory, ".account-observation-development.pending-00000000-0000-0000-0000-000000000001");
+  await writeFile(abandoned, "partial", { mode: 0o600 });
+  const path = await prepareInteractivePacingIdentity(fixture.profilePath);
+  const first = await readFile(path);
+  const published = join(directory, ".account-observation-development.pending-00000000-0000-0000-0000-000000000002");
+  await link(path, published);
+  assert.equal((await lstat(path)).nlink, 2);
+  assert.equal(await prepareInteractivePacingIdentity(fixture.profilePath), path);
+  assert.equal((await lstat(path)).nlink, 1);
+  assert.deepEqual(await readFile(path), first);
+  assert.equal(await readFile(abandoned, "utf8"), "partial");
+  await assert.rejects(() => lstat(published), { code: "ENOENT" });
+  first.fill(0);
+});
+
+test("interactive pacing rejects a linked identity and leaves its target intact", async (t) => {
+  const fixture = await makeSyntheticState(t);
+  await prepareRealHistoryProfile(fixture);
+  const profile = await validateRealHistoryProfile(fixture.profilePath);
+  const before = await readFile(profile.identityPath);
+  await symlink(profile.identityPath,
+    join(fixture.profilePath, "identity", "account-observation-development"));
+  await assert.rejects(() => prepareInteractivePacingIdentity(fixture.profilePath), {
+    code: "ELECTRON_REAL_HISTORY_PROFILE_PACING_IDENTITY_INVALID",
+  });
+  assert.deepEqual(await readFile(profile.identityPath), before);
+  before.fill(0);
+});
 
 test("profile argument parser keeps prepare and launch contracts explicit", () => {
   const prepared = parseRealHistoryProfileArguments([

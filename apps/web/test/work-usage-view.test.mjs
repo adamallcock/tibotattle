@@ -7,7 +7,7 @@ import {
   createWorkUsageAccumulator,
 } from "../../../src/reporting/index.js";
 import { createWorkUsageService } from "../../../src/application/index.js";
-import { formatApiMoney, formatSharePercent } from "../public/ui-format.js";
+import { formatApiMoney, formatSharePercent, formatLocal } from "../public/ui-format.js";
 import { translate } from "../public/localization.js";
 import {
   mountWorkUsageView,
@@ -708,6 +708,9 @@ test("mounted project expansion pins the snapshot/model and renders linked child
     node.classList.contains("work-usage-thread-row"),
   );
   assert.equal(childRows.length, 2);
+  const childPager = findMounted(childGroup, node => node.classList.contains("table-pagination"))[0];
+  assert.equal(childPager.textContent.includes("2 threads"), true);
+  assert.ok(findMounted(childPager, node => node.tagName === "BUTTON").every(node => node.hidden));
   assert.deepEqual(
     childRows.map((row) => row.children.length),
     [6, 6],
@@ -1052,6 +1055,68 @@ test("period switches reuse the available report anchor, polling drops it, and r
 });
 
 
+test("available period reports warm from one live anchor and switch through cached DTOs", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, windowRef } = harness;
+  const anchoredResponse = (snapshotId, totalTokens) => {
+    const response = structuredClone(PROJECT_ROWS_RESPONSE);
+    response.snapshotId = snapshotId;
+    response.generation = { fingerprint: "generation-mounted" };
+    response.totals.tokens = totalTokens;
+    return response;
+  };
+  const initial = anchoredResponse("snapshot-mounted", 100);
+  const warmed = {
+    "24h": anchoredResponse("warm-24h", 200),
+    "30d": anchoredResponse("warm-30d", 300),
+    all: anchoredResponse("warm-all", 400),
+  };
+  const freshAll = anchoredResponse("fresh-all", 500);
+  const requests = [];
+  let freshAllNext = false;
+  const view = mountWorkUsageView({
+    root,
+    windowRef,
+    t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      requests.push(body);
+      if (body.action === "touch") return httpResponse({ status: "available" });
+      if (freshAllNext && body.period === "all") {
+        freshAllNext = false;
+        return httpResponse(freshAll);
+      }
+      if (!body.snapshotId && !body.sourceSnapshotId) return httpResponse(initial);
+      if (body.sourceSnapshotId === initial.snapshotId && warmed[body.period])
+        return httpResponse(warmed[body.period]);
+      throw new Error(`unexpected work-usage request for ${body.period}`);
+    },
+  });
+  t.after(() => view.destroy());
+
+  await settleMountedView();
+  assert.match(root.textContent, /100/u);
+  await harness.runTimer(250);
+  await settleMountedView();
+  const warmRequests = requests.filter((request) => request.sourceSnapshotId === initial.snapshotId);
+  assert.deepEqual(warmRequests.map((request) => request.period), ["24h", "30d", "all"]);
+  assert.ok(warmRequests.every((request) => request.snapshotId === undefined));
+
+  freshAllNext = true;
+  const body = root.children.at(-1);
+  findMounted(root, (node) => node.dataset?.period === "all")[0].click();
+  assert.equal(body.hidden, false, "the cached period remains readable while it revalidates");
+  assert.equal(body.inert, true, "cached controls stay disabled until the fresh report is ready");
+  assert.match(body.textContent, /400/u);
+  await settleMountedView();
+  assert.equal(requests.at(-1).period, "all");
+  assert.equal(requests.at(-1).sourceSnapshotId, initial.snapshotId);
+  assert.equal(requests.at(-1).snapshotId, undefined);
+  assert.match(body.textContent, /500/u);
+  assert.equal(body.inert, false);
+});
+
+
 test("assumptions stay distinct from missing data and the non-project bucket is localized", async () => {
   const response = structuredClone(PROJECT_ROWS_RESPONSE);
   response.rows[0].id = "non-project";
@@ -1072,6 +1137,33 @@ test("assumptions stay distinct from missing data and the non-project bucket is 
   assert.doesNotMatch(root.textContent, /Token counts are missing or incomplete/);
   assert.doesNotMatch(root.textContent, /Repository groups use|Mappings are read-only|API-equivalent estimates use/);
   view.destroy();
+});
+
+test("coverage notices only show below 95 percent without repeated partial labels", async (t) => {
+  const cases = [
+    { name: "both at threshold", incompleteEvents: 5, unpricedEvents: 5, tokenNotices: 0, priceNotices: 0 },
+    { name: "near-complete report", totalEvents: 918_411, incompleteEvents: 209, unpricedEvents: 196, tokenNotices: 0, priceNotices: 0 },
+    { name: "only token counts below threshold", incompleteEvents: 6, unpricedEvents: 5, tokenNotices: 1, priceNotices: 0 },
+    { name: "both below threshold", incompleteEvents: 6, unpricedEvents: 6, tokenNotices: 1, priceNotices: 1 },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const response = structuredClone(PROJECT_ROWS_RESPONSE);
+      response.totals.events = scenario.totalEvents ?? 100;
+      response.totals.incompleteEvents = scenario.incompleteEvents;
+      response.totals.unpricedEvents = scenario.unpricedEvents;
+      response.totals.priceStatus = "partial";
+      const { root, windowRef } = mountedRoot();
+      const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+        fetchRef: async () => httpResponse(response) });
+      try {
+        await settleMountedView();
+        assert.equal(findMounted(root, node => node.dataset?.evidence === "token-coverage").length, scenario.tokenNotices);
+        assert.equal(findMounted(root, node => node.dataset?.evidence === "price-coverage").length, scenario.priceNotices);
+        assert.doesNotMatch(root.textContent, /Partial data/u);
+      } finally { view.destroy(); }
+    });
+  }
 });
 
 test("name search keeps the report snapshot and nested filter, and clearing restores project view", async () => {
@@ -1496,4 +1588,717 @@ test("cancelling revalidation preserves read-only values and fences its late res
   await settleMountedView();
   assert.equal(body.textContent, previous);
   assert.match(root.textContent, /cancelled/i);
+});
+
+test("shared reporting waits for its bound, hides local period controls, and sends the exact window", async () => {
+  const { root, windowRef } = mountedRoot();
+  const calls = [];
+  const window = {
+    period: "24h",
+    startAt: new Date(NOW - 86_400_000).toISOString(),
+    endAt: new Date(NOW).toISOString(),
+  };
+  const response = structuredClone(PROJECT_ROWS_RESPONSE);
+  response.fromMs = NOW - 86_400_000;
+  response.toMs = NOW;
+  const view = mountWorkUsageView({
+    root,
+    windowRef,
+    t: mountedTranslator,
+    sharedReporting: true,
+    reportingWindow: null,
+    fetchRef: async (_url, init) => {
+      calls.push(JSON.parse(init.body));
+      return httpResponse(response);
+    },
+  });
+  await settleMountedView();
+  assert.equal(calls.length, 0);
+  assert.equal(findMounted(root, node => node.dataset?.period).length, 0);
+  assert.match(root.textContent, /unavailable until local evidence loads/u);
+  assert.equal(view.setReportingWindow(window), true);
+  await settleMountedView();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].period, "24h");
+  assert.equal(calls[0].endAt, window.endAt);
+  assert.equal(findMounted(root, node => node.dataset?.evidence === "period").length, 0, "shared header owns the period");
+  assert.ok(root.textContent.includes(mountedTranslator("workUsage.snapshot", { date: formatLocal(NOW) })), "the report timestamp remains available");
+  assert.doesNotMatch(root.textContent, /Mapping observed/u);
+  assert.doesNotMatch(root.textContent, /Current allowance and sharing preferences are not affected/u);
+  view.destroy();
+});
+
+
+test("an available shared-period search with no rows is empty rather than unavailable", async () => {
+  const { root, windowRef } = mountedRoot();
+  const empty = structuredClone(PROJECT_ROWS_RESPONSE);
+  empty.rows = []; empty.rowCount = 0; empty.display = {}; empty.nextCursor = null;
+  const window = { period: "24h", startAt: new Date(NOW - 86_400_000).toISOString(), endAt: new Date(NOW).toISOString() };
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator, sharedReporting: true, reportingWindow: window,
+    fetchRef: async (_url, init) => httpResponse(JSON.parse(init.body).search ? empty : PROJECT_ROWS_RESPONSE) });
+  try {
+    await settleMountedView();
+    const input = findMounted(root, node => node.tagName === "INPUT")[0];
+    const form = findMounted(root, node => node.tagName === "FORM")[0];
+    input.value = "no matching synthetic project";
+    form.dispatchEvent({ type: "submit" });
+    await settleMountedView();
+    const state = findMounted(root, node => node.classList.contains("work-usage-empty"))[0];
+    assert.ok(state);
+    assert.equal(state.children[0].textContent, mountedTranslator("workUsage.searchEmpty"));
+    assert.equal(state.children[0].getAttribute("role"), "status");
+    assert.equal(state.dataset.state, "empty");
+    assert.equal(findMounted(root, node => node.tagName === "TABLE").length, 0);
+    assert.equal(findMounted(root, node => node.classList.contains("work-usage-summary")).length, 0);
+    assert.ok(root.textContent.includes(mountedTranslator("workUsage.snapshot", { date: formatLocal(NOW) })));
+    assert.equal(findMounted(root, node => node.dataset?.evidence === "token-coverage").length, 0);
+    assert.doesNotMatch(root.textContent, /Mapping observed/u);
+    const clearSearch = findMounted(state, node => node.tagName === "BUTTON")[0];
+    assert.equal(clearSearch.textContent, mountedTranslator("workUsage.clearSearch"));
+    clearSearch.dispatchEvent({ type: "click" });
+    assert.equal(input.value, "");
+    await settleMountedView();
+    assert.ok(findMounted(root, node => node.tagName === "TABLE").length);
+    assert.equal(findMounted(root, node => node.classList.contains("work-usage-empty")).length, 0);
+  } finally { view.destroy(); }
+});
+
+test("model filter uses shared identity order and sends the exact selected ID", async () => {
+  const { root, windowRef } = mountedRoot();
+  const requests = [];
+  const models = ["gpt-5.5", "gpt-5.6-luna", "gpt-6-astra", "gpt-5.6-terra", "gpt-5.6-sol-wm", "gpt-5.4-mini", "gpt-5.4", "unreviewed-model"];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      requests.push(JSON.parse(init.body));
+      return httpResponse({ ...PROJECT_ROWS_RESPONSE, models });
+    } });
+  try {
+    await settleMountedView();
+    const picker = findMounted(root, node => node.classList.contains("model-picker"))[0];
+    assert.deepEqual(picker.options.map(option => option.value),
+      ["", "gpt-6-astra", "gpt-5.6-sol-wm", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "unreviewed-model"]);
+    const astra = picker.options[1];
+    assert.equal(astra.textContent, "GPT-6 Astra");
+    assert.equal(astra.children[0].getAttribute("aria-hidden"), "true");
+    assert.equal(astra.title, "gpt-6-astra");
+    picker.value = "gpt-5.6-sol-wm";
+    picker.dispatchEvent({ type: "change" });
+    await settleMountedView();
+    assert.equal(requests.at(-1).model, "gpt-5.6-sol-wm");
+    assert.equal(picker.value, "gpt-5.6-sol-wm");
+    for (const listener of windowRef.listeners.get("tibotattle:locale-change") ?? []) listener();
+    assert.equal(picker.value, "gpt-5.6-sol-wm");
+    assert.equal(picker.options[0].textContent, mountedTranslator("workUsage.allModels"));
+    assert.equal(picker.options[0].children[0].getAttribute("aria-hidden"), "true");
+    assert.equal(picker.options[1].children[0].getAttribute("aria-hidden"), "true");
+  } finally { view.destroy(); }
+});
+
+test("single-page reports show a result count and keep the share explanation at the headers", async () => {
+  const { root, windowRef } = mountedRoot();
+  const labels = [];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    renderInformationLabel: (label, explanation, accessibleLabel) => {
+      labels.push({ label, explanation, accessibleLabel });
+      const node = root.ownerDocument.createElement("button");
+      node.textContent = label;
+      node.setAttribute("aria-label", accessibleLabel);
+      return node;
+    },
+    fetchRef: async () => httpResponse(PROJECT_ROWS_RESPONSE) });
+  try {
+    await settleMountedView();
+    const pagination = findMounted(root, node => node.classList.contains("table-pagination"))[0];
+    assert.equal(pagination.textContent.includes("2 projects"), true);
+    assert.ok(findMounted(pagination, node => node.tagName === "BUTTON").every(node => node.hidden));
+    assert.deepEqual(labels.map(item => item.accessibleLabel), ["Token share", "Value share"]);
+    assert.ok(labels.every(item => item.explanation === mountedTranslator("workUsage.shareNote")));
+    assert.equal(findMounted(root, node => node.tagName === "P" && node.textContent === mountedTranslator("workUsage.shareNote")).length, 0);
+  } finally { view.destroy(); }
+});
+
+test("multi-page reports retain navigation and restore the first page", async () => {
+  const { root, windowRef } = mountedRoot();
+  const calls = [];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body); calls.push(query);
+      return httpResponse({ ...PROJECT_ROWS_RESPONSE, rowCount: 27,
+        offset: query.cursor ? 25 : 0, nextCursor: query.cursor ? null : "page-two" });
+    } });
+  const pager = () => findMounted(root, node => node.classList.contains("table-pagination"))[0];
+  const buttons = () => findMounted(pager(), node => node.tagName === "BUTTON");
+  try {
+    await settleMountedView();
+    assert.ok(buttons().every(node => !node.hidden));
+    assert.equal(buttons()[0].disabled, true);
+    buttons()[1].click(); await settleMountedView();
+    assert.equal(calls.at(-1).cursor, "page-two");
+    assert.ok(pager().textContent.includes("26–27 of 27"));
+    assert.ok(buttons().every(node => !node.hidden));
+    assert.equal(buttons()[1].disabled, true);
+    buttons()[0].click(); await settleMountedView();
+    assert.equal(calls.at(-1).cursor, undefined);
+    assert.ok(pager().textContent.includes("1–25 of 27"));
+  } finally { view.destroy(); }
+});
+
+function warmReport(id, name, generation = "stable-generation") {
+  const value = structuredClone(PROJECT_ROWS_RESPONSE);
+  value.snapshotId = id;
+  value.generation = { fingerprint: generation };
+  for (const display of Object.values(value.display)) display.name = name;
+  return value;
+}
+
+test("period warm-up defers hidden mounts and fences response bodies after cancellation or timeout", async (t) => {
+  for (const stop of ["hidden", "destroyed", "timeout", "filter"]) await t.test(stop, async () => {
+    const harness = mountedLeaseRoot();
+    const { root, documentRef } = harness;
+    documentRef.visibilityState = "hidden";
+    const held = deferred();
+    const calls = [];
+    let warmSignal;
+    const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+      fetchRef: async (_url, init) => {
+        const query = JSON.parse(init.body); calls.push(query);
+        if (query.sourceSnapshotId) {
+          warmSignal = init.signal;
+          return { ok: true, status: 200, json: () => held.promise };
+        }
+        return httpResponse(warmReport("selected", "Selected report"));
+      },
+    });
+    try {
+      assert.equal(calls.length, 0);
+      documentRef.visibilityState = "visible";
+      harness.dispatch(documentRef, "visibilitychange");
+      await settleMountedView();
+      harness.runTimer(250); await settleMountedView();
+      assert.equal(calls.length, 2);
+      if (stop === "hidden") { root.inert = true; harness.changed(); }
+      else if (stop === "destroyed") view.destroy();
+      else if (stop === "timeout") harness.runTimer(10_000);
+      else findMounted(root, n => n.dataset?.grouping === "thread")[0].click();
+      assert.equal(warmSignal.aborted, true);
+      const before = calls.length;
+      held.resolve(warmReport("late", "Late obsolete period"));
+      await settleMountedView();
+      assert.equal(calls.length, before, "an aborted warm-up cannot fan out to more periods");
+      assert.doesNotMatch(root.textContent, /Late obsolete period/);
+      if (stop === "destroyed") assert.equal(harness.timers.size, 0);
+    } finally { view.destroy(); }
+  });
+});
+
+test("background scope invalidation clears warmed periods and recovers through the foreground path", async (t) => {
+  for (const failure of ["denied", "expired", "generation"]) await t.test(failure, async () => {
+    const harness = mountedLeaseRoot();
+    const { root } = harness;
+    const recovery = deferred();
+    const calls = [];
+    let invalidated = false;
+    const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+      fetchRef: async (_url, init) => {
+        const query = JSON.parse(init.body); calls.push(query);
+        if (!query.sourceSnapshotId) return invalidated ? recovery.promise : httpResponse(warmReport("selected", "Selected report"));
+        if (query.period === "24h") return httpResponse(warmReport("warm-day", "Warmed day"));
+        invalidated = true;
+        if (failure === "denied") return { ok: false, status: 403, json: async () => ({}) };
+        if (failure === "expired") return { ok: false, status: 409, json: async () => ({ error: { code: "work_usage_snapshot_expired" } }) };
+        return httpResponse(warmReport("other-generation", "Other generation", "changed-generation"));
+      },
+    });
+    try {
+      await settleMountedView(); harness.runTimer(250); await settleMountedView();
+      assert.equal(calls.length, 4, "selected, two siblings, then one foreground recovery");
+      assert.equal(calls.at(-1).sourceSnapshotId, undefined);
+      assert.equal(calls.at(-1).snapshotId, undefined);
+      assert.equal(root.children.at(-1).inert, true);
+      findMounted(root, n => n.dataset?.period === "24h")[0].click();
+      assert.equal(root.children.at(-1).hidden, true, "invalidated warm data cannot be displayed on a switch");
+      assert.equal(calls.at(-1).sourceSnapshotId, undefined, "an invalidated display DTO cannot revive its old server handle");
+      recovery.resolve(httpResponse(warmReport("recovered", "Recovered report", "new-generation")));
+      await settleMountedView();
+      assert.match(root.textContent, /Recovered report/);
+      assert.equal(root.children.at(-1).inert, false);
+    } finally { view.destroy(); }
+  });
+});
+
+test("pagination never replaces a cached period's first page", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root } = harness;
+  const first = warmReport("selected", "First page projects");
+  first.nextCursor = "synthetic-next-page";
+  first.rowCount = 4;
+  const second = warmReport("selected", "Second page projects");
+  second.offset = 2;
+  second.rowCount = 4;
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body);
+      return httpResponse(query.cursor ? second : query.period === "7d" ? first : warmReport(`warm-${query.period}`, `Other ${query.period}`));
+    },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView(); harness.runTimer(250); await settleMountedView();
+  findMounted(root, n => n.tagName === "BUTTON" && n.textContent === "Next").at(-1).click();
+  await settleMountedView();
+  assert.match(root.textContent, /Second page projects/);
+  findMounted(root, n => n.dataset?.period === "all")[0].click();
+  await settleMountedView();
+  findMounted(root, n => n.dataset?.period === "7d")[0].click();
+  const body = root.children.at(-1);
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true);
+  assert.match(body.textContent, /First page projects/);
+  assert.doesNotMatch(body.textContent, /Second page projects/);
+});
+
+test("unknown generation evidence prevents speculative period requests", async (t) => {
+  const harness = mountedLeaseRoot(); let calls = 0;
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+    fetchRef: async () => { calls++; return httpResponse(PROJECT_ROWS_RESPONSE); },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  assert.equal(calls, 1);
+  assert.equal([...harness.timers.values()].some(timer => timer.delay === 250), false);
+});
+
+test("preload prepares an inactive page and validates its selected lease on first visit", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root } = harness;
+  root.inert = true;
+  const selected = warmReport("selected", "Selected report");
+  const warmed = {
+    "24h": warmReport("warm-24h", "24 hour report"),
+    "30d": warmReport("warm-30d", "30 day report"),
+    all: warmReport("warm-all", "All time report"),
+  };
+  const calls = [];
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body); calls.push(query);
+      if (query.sourceSnapshotId) return httpResponse(warmed[query.period]);
+      return httpResponse(selected);
+    },
+  });
+  t.after(() => view.destroy());
+
+  const preload = view.preload();
+  assert.strictEqual(view.preload(), preload, "concurrent startup calls share one promise");
+  assert.equal(await preload, true);
+  assert.deepEqual(calls.map((query) => query.period), ["7d", "24h", "30d", "all"]);
+  assert.equal(calls[0].snapshotId, undefined);
+  assert.ok(calls.slice(1).every((query) => query.sourceSnapshotId === selected.snapshotId));
+  assert.equal(root.children.at(-1).inert, true);
+  assert.match(root.textContent, /Selected report/u);
+
+  root.inert = false;
+  harness.changed();
+  await settleMountedView();
+  assert.equal(calls.length, 5);
+  assert.equal(calls.at(-1).snapshotId, selected.snapshotId);
+  assert.equal(calls.at(-1).sourceSnapshotId, undefined);
+  assert.equal(root.children.at(-1).inert, false);
+});
+
+test("a cold preload retries after a hidden-start failure when the page becomes active", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root } = harness;
+  root.inert = true;
+  let attempts = 0;
+  const calls = [];
+  const selected = warmReport("selected", "Recovered selected report");
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body); calls.push(query);
+      if (attempts++ === 0) throw new Error("temporary startup failure");
+      if (query.sourceSnapshotId) return httpResponse(warmReport(`warm-${query.period}`, query.period));
+      return httpResponse(selected);
+    },
+  });
+  t.after(() => view.destroy());
+
+  assert.equal(await view.preload(), false);
+  assert.equal(calls.length, 1);
+  root.inert = false;
+  harness.changed();
+  await settleMountedView();
+  assert.ok(calls.length >= 2);
+  assert.equal(calls[1].snapshotId, undefined);
+  assert.match(root.textContent, /Recovered selected report/u);
+  assert.equal(root.children.at(-1).inert, false);
+});
+
+test("preload resumes a preparing report after document hiding cancels its response body", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, documentRef } = harness;
+  root.inert = true;
+  const preparing = {
+    schemaVersion: WORK_USAGE_SCHEMA,
+    status: "preparing",
+    snapshotId: "selected-preparing",
+  };
+  const selected = warmReport("selected", "Selected after retry");
+  const warmed = {
+    "24h": warmReport("warm-24h", "24 hour report"),
+    "30d": warmReport("warm-30d", "30 day report"),
+    all: warmReport("warm-all", "All time report"),
+  };
+  const calls = [];
+  const selectedBody = deferred();
+  let selectedPollSignal = null;
+  let phase = "initial";
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body);
+      calls.push(query);
+      if (query.sourceSnapshotId) return httpResponse(warmed[query.period]);
+      if (query.snapshotId === "selected-preparing") {
+        if (phase === "poll") {
+          phase = "poll-body";
+          selectedPollSignal = init.signal;
+          return { ok: true, status: 200, json: () => selectedBody.promise };
+        }
+        return httpResponse(selected);
+      }
+      if (!query.snapshotId) {
+        if (phase === "initial") {
+          phase = "poll";
+          return httpResponse(preparing);
+        }
+        return httpResponse(selected);
+      }
+      if (query.snapshotId === selected.snapshotId) return httpResponse(selected);
+      throw new Error(`unexpected preload query: ${JSON.stringify(query)}`);
+    },
+  });
+  t.after(() => view.destroy());
+
+  const first = view.preload();
+  await settleMountedView();
+  assert.deepEqual(calls.map((query) => query.period), ["7d"]);
+  assert.equal(calls[0].snapshotId, undefined);
+  assert.ok([...harness.timers.values()].some((timer) => timer.delay === 750));
+
+  harness.runTimer(750);
+  await settleMountedView();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].snapshotId, preparing.snapshotId);
+  assert.ok(selectedPollSignal);
+
+  documentRef.visibilityState = "hidden";
+  harness.dispatch(documentRef, "visibilitychange");
+  assert.equal(selectedPollSignal.aborted, true);
+  selectedBody.resolve(httpResponse(selected));
+  assert.equal(await first, false);
+  await settleMountedView();
+  assert.equal(calls.length, 2, "cancellation stops fan-out to speculative periods");
+
+  phase = "resume";
+  documentRef.visibilityState = "visible";
+  harness.dispatch(documentRef, "visibilitychange");
+  assert.equal(await view.preload(), true);
+  assert.deepEqual(calls.map((query) => query.period), [
+    "7d", "7d", "7d", "24h", "30d", "all",
+  ]);
+  assert.equal(root.children.at(-1).inert, true);
+  assert.match(root.textContent, /Selected after retry/u);
+
+  root.inert = false;
+  harness.changed();
+  await settleMountedView();
+  assert.equal(root.children.at(-1).inert, false);
+  assert.equal(calls.at(-1).snapshotId, selected.snapshotId);
+});
+
+test("cold startup polls back off while retaining a fixed request budget", async (t) => {
+  for (const becomesReady of [true, false]) {
+    await t.test(becomesReady ? "late readiness warms every period" : "never-ready work stops", async (t) => {
+      const harness = mountedLeaseRoot();
+      harness.root.inert = true;
+      const calls = [];
+      const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+        fetchRef: async (_url, init) => {
+          const query = JSON.parse(init.body);
+          calls.push(query);
+          if (becomesReady && calls.length >= 10)
+            return httpResponse(warmReport(`ready-${query.period}`, "Ready report"));
+          return httpResponse({ schemaVersion: WORK_USAGE_SCHEMA, status: "preparing", snapshotId: "cold" });
+        },
+      });
+      t.after(() => view.destroy());
+      const preloading = view.preload();
+      await settleMountedView();
+      const delays = [750, 1500, 3000, 6000, ...Array(16).fill(10_000)];
+      for (const delay of delays.slice(0, becomesReady ? 9 : 20)) {
+        assert.ok([...harness.timers.values()].some(timer => timer.delay === delay));
+        harness.runTimer(delay);
+        await settleMountedView();
+      }
+      assert.equal(await preloading, becomesReady);
+      assert.equal(calls.length, becomesReady ? 13 : 21);
+      assert.equal(harness.timers.size, 0, "inactive startup has no endless poll");
+      if (becomesReady) {
+        assert.deepEqual(calls.slice(-3).map(query => query.period), ["24h", "30d", "all"]);
+        assert.match(harness.root.textContent, /Ready report/);
+      }
+    });
+  }
+});
+
+function retainedResponse({ namesAvailable = false, refreshing = true } = {}) {
+  const result = structuredClone(PROJECT_ROWS_RESPONSE);
+  result.snapshotId = "saved-report";
+  result.retained = true;
+  result.refreshing = refreshing;
+  result.refreshSnapshotId = refreshing ? "pending-report" : null;
+  result.namesAvailable = namesAvailable;
+  if (!namesAvailable) {
+    result.rows.forEach((row, index) => { row.id = `p-${index}`; });
+    result.display = {};
+    result.scopes = [];
+    result.nextCursor = null;
+  }
+  return result;
+}
+
+test("the browser validates saved report refresh and anonymous display boundaries", () => {
+  for (const options of [{}, { namesAvailable: true }, { refreshing: false }]) {
+    const value = retainedResponse(options);
+    assert.equal(validateWorkUsageResponse(value), value);
+  }
+  for (const [label, mutate] of [
+    ["retained boolean", value => { value.retained = "true"; }],
+    ["refreshing boolean", value => { value.refreshing = 1; }],
+    ["names boolean", value => { value.namesAvailable = null; }],
+    ["missing names state", value => { delete value.namesAvailable; }],
+    ["missing refresh state", value => { delete value.refreshing; }],
+    ["missing refresh target", value => { delete value.refreshSnapshotId; }],
+    ["same refresh target", value => { value.refreshSnapshotId = value.snapshotId; }],
+    ["target after failure", value => { value.refreshing = false; }],
+    ["anonymous decorations", value => { value.display = { "p-0": { name: "Unexpected name" } }; }],
+    ["anonymous scope", value => { value.scopes = PROJECT_ROWS_RESPONSE.scopes; }],
+    ["anonymous cursor", value => { value.nextCursor = "old-cursor"; }],
+    ["retained non-report", value => { value.status = "preparing"; }],
+  ]) {
+    const value = retainedResponse(); mutate(value); assertInvalid(value, label);
+  }
+});
+
+test("first load shows anonymous saved figures while polling the replacement snapshot", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, windowRef } = harness;
+  const calls = [];
+  const replacement = { ...PROJECT_ROWS_RESPONSE, snapshotId: "pending-report" };
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      calls.push(JSON.parse(init.body));
+      return httpResponse(calls.length === 1 ? retainedResponse() : replacement);
+    },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  const body = root.children.at(-1);
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true);
+  assert.match(root.textContent, /Saved report as of .+Updating/);
+  assert.match(body.textContent, /Saved project 1/);
+  assert.match(body.textContent, /Saved project 2/);
+  assert.match(body.textContent, /names will return after the report refreshes/);
+  assert.doesNotMatch(body.textContent, /p-0|p-1|Project A|Project B/);
+  assert.equal(findMounted(root, node => node.classList.contains("work-usage-select"))
+    .find(node => node.firstChild.textContent === "Account scope").hidden, true);
+  assert.equal(findMounted(root, node => node.tagName === "FORM")[0].inert, true);
+  findMounted(body, node => node.classList.contains("work-usage-project-toggle"))[0].click();
+  assert.equal(calls.length, 1, "saved identities cannot start a drilldown");
+  await harness.runTimer(750);
+  await settleMountedView();
+  assert.equal(calls[1].snapshotId, "pending-report");
+  assert.equal(calls[1].sourceSnapshotId, undefined);
+  assert.equal(body.inert, false);
+  assert.match(body.textContent, /Project A/);
+  assert.doesNotMatch(root.textContent, /Saved report|names will return/);
+  assert.equal(findMounted(root, node => node.tagName === "FORM")[0].inert, false);
+  assert.equal([...harness.timers.values()].some(timer => timer.delay === 750), false);
+});
+
+test("saved in-memory reports retain names and failures remain visible without polling", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, windowRef } = harness;
+  const calls = [];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      calls.push(JSON.parse(init.body));
+      return httpResponse(retainedResponse({ namesAvailable: true, refreshing: false }));
+    },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  const body = root.children.at(-1);
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true);
+  assert.match(body.textContent, /Project A/);
+  assert.match(root.textContent, /Saved report as of .+Update unavailable/);
+  assert.doesNotMatch(root.textContent, /names will return/);
+  assert.equal(harness.timers.size, 0);
+  assert.equal(root.getAttribute("aria-busy"), null);
+  view.refresh(); await settleMountedView();
+  assert.equal(calls[1].snapshotId, undefined);
+  assert.equal(calls[1].sourceSnapshotId, undefined);
+});
+
+test("a failed replacement poll keeps the exact saved figures and a fresh empty report replaces them", async (t) => {
+  for (const failure of [new Error("temporary failure"), httpResponse({
+    schemaVersion: WORK_USAGE_SCHEMA, status: "unavailable", snapshotId: "pending-report",
+  })]) {
+    await t.test(failure instanceof Error ? "network failure" : "unavailable response", async (t) => {
+      const harness = mountedLeaseRoot();
+      const { root, windowRef } = harness;
+      let calls = 0;
+      const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+        fetchRef: async () => {
+          if (++calls === 1) return httpResponse(retainedResponse());
+          if (calls === 2) { if (failure instanceof Error) throw failure; return failure; }
+          return httpResponse({ ...PROJECT_ROWS_RESPONSE, rows: [], rowCount: 0,
+            snapshotId: "empty-fresh-report", display: {} });
+        },
+      });
+      t.after(() => view.destroy());
+      await settleMountedView();
+      const body = root.children.at(-1);
+      const old = body.textContent;
+      await harness.runTimer(750); await settleMountedView();
+      assert.equal(body.hidden, false);
+      assert.equal(body.textContent, old);
+      assert.match(root.textContent, /Saved report as of .+Update unavailable/);
+      assert.equal(harness.timers.size, 0);
+      view.refresh(); await settleMountedView();
+      assert.equal(body.inert, false);
+      assert.match(body.textContent, /No recorded usage matches this view/);
+      assert.doesNotMatch(root.textContent, /Saved project|Saved report/);
+    });
+  }
+});
+
+test("period changes discard the saved source anchor and late saved responses cannot replace the new report", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, windowRef } = harness;
+  const pending = deferred();
+  const calls = [];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      calls.push(JSON.parse(init.body));
+      if (calls.length === 1) return httpResponse(retainedResponse());
+      if (calls.length === 2) return pending.promise;
+      return httpResponse({ ...PROJECT_ROWS_RESPONSE, snapshotId: "new-period-report" });
+    },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  harness.runTimer(750);
+  await settleMountedView();
+  findMounted(root, node => node.dataset?.period === "all")[0].click();
+  assert.equal(root.children.at(-1).hidden, true);
+  await settleMountedView();
+  assert.equal(calls[2].period, "all");
+  assert.equal(calls[2].snapshotId, undefined);
+  assert.equal(calls[2].sourceSnapshotId, undefined);
+  pending.resolve(httpResponse(retainedResponse()));
+  await settleMountedView();
+  assert.equal(root.children.at(-1).inert, false);
+  assert.match(root.textContent, /Project A/);
+  assert.doesNotMatch(root.textContent, /Saved report/);
+});
+
+test("cold preload retains saved figures while polling the replacement before warming sibling periods", async (t) => {
+  const harness = mountedLeaseRoot();
+  harness.root.inert = true;
+  const calls = [];
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body); calls.push(query);
+      if (calls.length <= 2) return httpResponse(retainedResponse());
+      return httpResponse(warmReport(query.sourceSnapshotId ? `warm-${query.period}` : "pending-report", "Fresh report"));
+    },
+  });
+  t.after(() => view.destroy());
+  const preloading = view.preload();
+  await settleMountedView();
+  assert.match(harness.root.textContent, /Saved project 1/);
+  assert.equal(harness.root.children.at(-1).inert, true);
+  assert.equal(calls.length, 1);
+  harness.runTimer(750); await settleMountedView();
+  assert.equal(calls[1].snapshotId, "pending-report");
+  assert.equal(calls[1].sourceSnapshotId, undefined);
+  assert.equal(calls.length, 2, "retained replies do not anchor speculative period queries");
+  harness.runTimer(1500); await settleMountedView();
+  assert.equal(await preloading, true);
+  assert.equal(calls[2].snapshotId, "pending-report");
+  assert.ok(calls.slice(3).every(query => query.sourceSnapshotId === "pending-report"));
+  assert.match(harness.root.textContent, /Fresh report/);
+  assert.doesNotMatch(harness.root.textContent, /Saved report/);
+  assert.equal(harness.root.children.at(-1).inert, true, "inactive report still needs lease validation");
+});
+
+test("advancing the shared end bound keeps the dated previous report read-only until the exact replacement arrives", async (t) => {
+  const harness = mountedLeaseRoot();
+  const calls = [];
+  const windowAt = end => ({ period: "24h", startAt: new Date(end - 86_400_000).toISOString(), endAt: new Date(end).toISOString() });
+  const pending = deferred();
+  let reply = httpResponse(PROJECT_ROWS_RESPONSE);
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator, reportingWindow: windowAt(NOW),
+    fetchRef: async (_url, init) => { calls.push(JSON.parse(init.body)); return reply; },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  const body = harness.root.children.at(-1);
+  const previous = body.textContent;
+  reply = pending.promise;
+  view.setReportingWindow(windowAt(NOW + 1000));
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true);
+  assert.equal(body.textContent, previous);
+  assert.match(harness.root.textContent, /Saved report as of .+Updating/);
+  assert.equal(calls[1].endAt, windowAt(NOW + 1000).endAt);
+  assert.equal(calls[1].snapshotId, undefined);
+  assert.equal(calls[1].sourceSnapshotId, undefined);
+  assert.equal(calls[1].cursor, undefined);
+  pending.resolve(httpResponse({ ...PROJECT_ROWS_RESPONSE, snapshotId: "exact-new-report", toMs: NOW + 1000,
+    fromMs: NOW + 1000 - 86_400_000 }));
+  await settleMountedView();
+  assert.equal(body.inert, false);
+  assert.doesNotMatch(harness.root.textContent, /Saved report/);
+
+  const cancelled = deferred(); reply = cancelled.promise;
+  view.setReportingWindow(windowAt(NOW + 2000));
+  findMounted(harness.root, node => node.tagName === "BUTTON" && node.textContent === "Cancel")[0].click();
+  const beforeLate = body.textContent;
+  cancelled.resolve(httpResponse({ ...PROJECT_ROWS_RESPONSE, snapshotId: "late-report", rows: [], rowCount: 0,
+    toMs: NOW + 2000, fromMs: NOW + 2000 - 86_400_000 }));
+  await settleMountedView();
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true);
+  assert.equal(body.textContent, beforeLate);
+  assert.match(harness.root.textContent, /cancelled/i);
+});
+
+test("wrong-window replacements fail closed while leaving the prior shared report explicitly saved", async (t) => {
+  const harness = mountedLeaseRoot();
+  const windowAt = end => ({ period: "24h", startAt: new Date(end - 86_400_000).toISOString(), endAt: new Date(end).toISOString() });
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator, reportingWindow: windowAt(NOW),
+    fetchRef: async () => httpResponse(PROJECT_ROWS_RESPONSE),
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  view.setReportingWindow(windowAt(NOW + 1000));
+  await settleMountedView();
+  assert.equal(harness.root.children.at(-1).hidden, false);
+  assert.equal(harness.root.children.at(-1).inert, true);
+  assert.match(harness.root.textContent, /Saved report as of .+Update unavailable/);
+  view.setReportingWindow({ period: "7d", startAt: new Date(NOW - 7 * 86_400_000).toISOString(), endAt: new Date(NOW).toISOString() });
+  assert.equal(harness.root.children.at(-1).hidden, true, "changing the period cannot borrow old figures");
 });

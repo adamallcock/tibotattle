@@ -63,6 +63,7 @@ site.
 | `POST` | `/api/v1/logout` | Website or loopback relay | Session | Revokes/clears the current web session. | Participant account |
 | `GET` | `/api/v1/admin/overview` | Admin application | Admin | Reads bounded operational, distribution, lifecycle, sampled error evidence, and optional failure-isolated reconstruction progress. Refresh never advances calculation. | Operations |
 | `GET` | `/api/v1/admin/metrics/history` | Admin application | Admin | Reads bounded operational history. | Operations |
+| `GET` | `/api/v1/admin/database-health` | Admin application | Admin | Checks each API-bound D1 role with one constant read; partial failures, latency and size metadata only. | Operations |
 | `GET` | `/api/v1/admin/reconstruction-progress` | Admin application | Admin | Reads bounded refresh-generation and historical-completion metadata; never advances calculation. | Operations |
 | `GET` | `/api/v1/admin/community/allowance-preview` | Admin application | Admin | Reads unpublished allowance-fit previews; does not publish. | Operations |
 | `POST` | `/api/v1/admin/action` | Owner/admin application | Admin | Collection controls, maintenance, and distribution actions; explicit participant erasure uses the existing maintenance action with auditable D1/R2 effects. | Operations |
@@ -225,8 +226,8 @@ is never an arbitrary local proxy.
 | `GET` | `/api/local/onboarding` | Dashboard | Loopback read | Projects source readiness without exposing filesystem paths. | Local companion |
 | `GET` | `/api/local/overview` | Dashboard | Loopback read | Reads the current derived overview snapshot. | Local companion |
 | `GET` | `/api/local/cache-drop-thread-links` | Local dashboard only | Same-origin custom-header read | Ephemeral, generation-bound names and Codex thread IDs for recent cache-drop rows; no query parameters, persistence, or export. | Local companion |
-| `POST` | `/api/local/work-usage/query` | Local dashboard only | Same-origin custom-header read; closed 4 KiB JSON | Cancellable, read-only project/worktree/thread reports over a pinned index; bounded process-local snapshots with closed `touch` lease renewal, per-thread model/component breakdowns and transient display metadata; optional `search` (at most 100 characters) finds project/task names before pagination while preserving global share denominators; optional `sourceSnapshotId` anchors related period/scope queries to an available report and its canonical generation; no export or persistence. | Local reporting |
-| `GET` | `/api/local/model-performance` | Model performance page | Loopback read | Requires one `period` value: `7`, `30`, or `all`; returns bounded local timing aggregates and renews an independent background scan lease. No accounting or network effect. | Local timing |
+| `POST` | `/api/local/work-usage/query` | Local dashboard only | Same-origin custom-header read; closed 4 KiB JSON | Cancellable, read-only project/worktree/thread reports over a pinned index; optional canonical ISO `endAt` pins the selected period and rejects older snapshot substitution; bounded process-local snapshots with closed `touch` lease renewal, per-thread model/component breakdowns and transient display metadata; optional `search` (at most 100 characters) finds project/task names before pagination while preserving global share denominators; optional `sourceSnapshotId` anchors related period/scope queries to an available report and its canonical generation; no export. During revalidation an available saved reply has `retained`, `refreshing`, `namesAvailable` and a separate `refreshSnapshotId`; saved figures retain their original bounds and have no paging cursor. Names survive document reload only in process memory; durable snapshots contain anonymous usage figures. | Local reporting |
+| `GET` | `/api/local/model-performance` | Model performance page | Loopback read | Requires one `period` value: `1`, `7`, `30`, or `all`; optional canonical ISO `endAt` pins exact rolling bounds (never a future instant); returns schema-4/method-5 bounded local timing aggregates, including tool-free fallback estimates in Output speed with one sample per turn, restores validated saved measurements before starting work, and renews an independent background scan lease. No accounting or network effect. | Local timing |
 | `GET` | `/api/local/gradient` | Dashboard | Loopback read | Reads the derived cost/quota gradient. | Local analysis |
 | `GET` | `/api/local/weekly` | Dashboard | Loopback read | Reads derived weekly capacity and pace evidence. | Local analysis |
 | `GET` | `/api/local/weekly-pace-outlook` | Native shell | Loopback read | Reads the bounded account-scoped weekly pace presentation projection. | Local analysis |
@@ -316,6 +317,16 @@ and bounded blob downloads. Provider sign-in opens in the system browser.
 | Native to web | `tibotattle:local-evidence-updated` | Payload-free refresh-complete event. |
 | Native to web | `tibotattle:locale-override` | Closed language preference plus locale table metadata. |
 | Native to web | `tibotattle:appearance-override` | Closed appearance preference and resolved theme. |
+
+The sandboxed Electron preload exposes the same fixed `v1` bridge version and
+one fixed IPC channel. Its refresh subset is dashboard-frame-only:
+
+| Direction | Action | Payload boundary |
+| --- | --- | --- |
+| Renderer to main | `getRefreshStatus` | No arguments; returns the content-free timer/watchdog projection without a lease value. |
+| Renderer to main | `refreshStarted` | Exact `{ mode }`, where mode is `quick` or `detailed`; returns one positive integer lease. |
+| Renderer to main | `refreshHeartbeat` | Exact `{ lease }` with one positive safe integer; renews only the matching missing-heartbeat watchdog. |
+| Renderer to main | `refreshSettled` | Exact `{ lease }` with one positive safe integer; matching terminal settlement is idempotent. |
 
 ## Process and provider protocols
 

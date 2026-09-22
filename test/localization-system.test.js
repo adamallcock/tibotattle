@@ -256,7 +256,11 @@ test("shipped static web copy has a complete translated inventory and localizabl
     "TiboTattle",
     "brew install --cask adamallcock/tap/tibotattle",
   ]);
-  const neutralGlyph = /^[+$·＋−—⇢→←\d\s.]+$/u;
+  // `%` joins `$` here: the percent sign is written identically in zh-Hans and
+  // es, so a bare one is a unit symbol rather than untranslated copy. The tank
+  // reading's "33%" splits the number and the sign into separate nodes, which
+  // is what surfaced it.
+  const neutralGlyph = /^[+$%·＋−—⇢→←◎\d\s.]+$/u;
 
   for (const [index, source] of sourceFiles.entries()) {
     assert.match(source, /<body\b[^>]*\bdata-i18n-root\b/u, staticPages[index]);
@@ -463,7 +467,7 @@ test("localizer is root-bounded, preserves raw-data boundaries, and never interp
   assert.match(appSource, /setRawText\(\$\("#identity-account-provider"\)/u);
   assert.match(
     appSource,
-    /node\("span", "metric-name", localizedQuotaWindowLabel\(window\)\)/u,
+    /node\("span", "quota-tank-period",\s*localizedQuotaWindowDuration\(window\.durationMinutes\)\)/u,
   );
   // The SVG <title>/<desc> pair used to be asserted as `setRawText(titleNode,
   // title)` — an assertion that the chart's accessible name was whatever raw

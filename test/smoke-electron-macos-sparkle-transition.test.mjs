@@ -16,7 +16,7 @@ const nativeDigests = {
 };
 const intake = (target = 'darwin-arm64', feedScope = 'isolated_test_feed') => ({
   schemaVersion: 'tibotattle-native-sparkle-test-intake-v1', sourceRevision: source,
-  target, feedScope, version: '0.1.21', buildNumber: '2026091106', bundleVersion: '1028',
+  target, feedScope, version: '0.1.22', buildNumber: '2026091106', bundleVersion: '1029',
   dmgSha256: 'b'.repeat(64), asarSha256: 'c'.repeat(64), feedSha256: 'd'.repeat(64),
   nativeDmgSha256: nativeDigests[target], directory: '/Users/runner/work/_temp/native-sparkle-intake',
 });
@@ -58,6 +58,20 @@ test('both Mac architectures require matching hosted runner identity', () => {
   }
 });
 
+test('same-executable companions belong to one app; independent app roots remain ambiguous', () => {
+  const executable = '/Users/runner/Applications/TiboTattle.app/Contents/MacOS/TiboTattle';
+  const process = (pid, parent, command = executable) => ({ pid, parent, group: pid, command });
+  const main = process(30, 1);
+  const rows = [process(1, 0, '/sbin/launchd'), main, process(31, 30),
+    process(32, 31, '/synthetic/helper'), process(33, 32)];
+  assert.deepEqual(runner.selectMacTransitionApplicationProcess(rows, executable), main);
+  assert.deepEqual(runner.selectMacTransitionApplicationProcess([...rows].reverse(), executable), main);
+  assert.equal(runner.selectMacTransitionApplicationProcess([], executable), null);
+  assert.throws(() => runner.selectMacTransitionApplicationProcess([...rows, process(50, 1)], executable));
+  assert.throws(() => runner.selectMacTransitionApplicationProcess([...rows, main], executable));
+  assert.throws(() => runner.selectMacTransitionApplicationProcess([process(30, 31), process(31, 30)], executable));
+});
+
 test('intake binds the architecture, exact native predecessor and closed feed scope', () => {
   for (const target of Object.keys(nativeDigests)) for (const scope of ['isolated_test_feed', 'production_feed']) {
     const value = intake(target, scope), result = runner.validateSparkleTransitionIntake(value);
@@ -65,10 +79,10 @@ test('intake binds the architecture, exact native predecessor and closed feed sc
     const base = 'https://updates.tibotattle.com';
     assert.equal(result.nativeDmgSha256, nativeDigests[target]);
     assert.equal(result.feedUrl, scope === 'isolated_test_feed'
-      ? `${base}/electron/test/native-sparkle/${source}/1028/${value.dmgSha256}/appcast.xml`
+      ? `${base}/electron/test/native-sparkle/${source}/1029/${value.dmgSha256}/appcast.xml`
       : `${base}/${prefix}appcast.xml`);
     assert.equal(result.dmgFileName, target === 'darwin-x64'
-      ? 'TiboTattle-0.1.21-macOS-x64.dmg' : 'TiboTattle-0.1.21-mac-arm64.dmg');
+      ? 'TiboTattle-0.1.22-macOS-x64.dmg' : 'TiboTattle-0.1.22-mac-arm64.dmg');
     assert.equal(result.appPath, value.directory + '/candidate/TiboTattle.app');
     for (const patch of [{ target: 'linux-x64' }, { feedScope: 'https://attacker.example/appcast.xml' },
       { sourceRevision: 'a'.repeat(39) }, { sourceRevision: '../source' }, { sourceRevision: [source] }, { version: '0.1.20' },
@@ -86,6 +100,28 @@ test('intake binds the architecture, exact native predecessor and closed feed sc
   }
 });
 
+test('successor intake uses reviewed allocations while preserving historical candidate and predecessor identities', () => {
+  for (const target of Object.keys(nativeDigests)) for (const scope of ['isolated_test_feed', 'production_feed']) {
+    for (const [version, bundleVersion] of [['0.1.22', '1029'], ['0.1.23', '1030']]) {
+      const value = { ...intake(target, scope), version, bundleVersion, buildNumber: '2026091301' };
+      const result = runner.validateSparkleTransitionIntake(value);
+      assert.equal(result.nativeDmgSha256, nativeDigests[target]);
+      assert.equal(result.version, version);
+      assert.equal(result.bundleVersion, bundleVersion);
+      assert.equal(result.sourceRevision, source);
+      assert.equal(result.dmgFileName, `TiboTattle-${version}-${target === 'darwin-x64' ? 'macOS-x64' : 'mac-arm64'}.dmg`);
+      if (scope === 'isolated_test_feed') assert.equal(result.feedUrl,
+        `https://updates.tibotattle.com/electron/test/native-sparkle/${source}/${bundleVersion}/${value.dmgSha256}/appcast.xml`);
+    }
+  }
+  for (const change of [{ version: '0.1.23' }, { version: '9999.99.99', bundleVersion: '9999' },
+    { version: '0.1.23', bundleVersion: '1030.0' }, { version: '0.1.18', bundleVersion: '1026' },
+    { version: '0.1.17', bundleVersion: '1024' }, { version: ['0.1.23'], bundleVersion: '1030' },
+    { version: '0.1.23', bundleVersion: 1030 }]) {
+    assert.throws(() => runner.validateSparkleTransitionIntake({ ...intake(), ...change }));
+  }
+});
+
 test('UI automation is PID-scoped, refuses ambiguous buttons, and returns fixed classifications', () => {
   for (const [pid, action] of [[0, 'check'], [1, 'check'], [3.5, 'check'], ['4;evil()', 'check'], [4, 'approve']]) {
     assert.throws(() => runner.sparkleTransitionUiScript(pid, action));
@@ -99,7 +135,7 @@ test('UI automation is PID-scoped, refuses ambiguous buttons, and returns fixed 
       assert.equal(name, 'System Events');
       return { applicationProcesses: { whose(filter) {
         assert.equal(filter.unixId, 321);
-        return () => [{ windows: () => [{ entireContents: () => buttons }] }];
+        return () => [{ windows: () => [{ role: () => 'AXWindow', uiElements: () => buttons }] }];
       } } };
     },
   });
@@ -108,6 +144,22 @@ test('UI automation is PID-scoped, refuses ambiguous buttons, and returns fixed 
   assert.equal(evaluate([]), 'target_absent');
   assert.equal(evaluate([button('Instalar y volver a abrir')], runner.sparkleTransitionUiScript(321, 'relaunch')), 'clicked');
   assert.doesNotMatch(code, /keystroke|keyCode|System Settings|security authorizationdb/u);
+});
+
+test('native updater controls exclude web trees and refuse incomplete native traversals', () => {
+  let clicks = 0, webReads = 0;
+  const button = { name: () => 'Install and Relaunch', role: () => 'AXButton', enabled: () => true,
+    click: () => { clicks++; } };
+  const group = children => ({ role: () => 'AXGroup', uiElements: () => children });
+  const web = { role: () => 'AXWebArea', uiElements: () => { webReads++; throw new Error('Web tree must not be read'); } };
+  const run = children => runInNewContext(runner.sparkleTransitionUiScript(321, 'relaunch') + '\nrun();', {
+    Application: () => ({ applicationProcesses: { whose: () => () => [{ windows: () => [group(children)] }] } }),
+  });
+  assert.equal(run([web, group([button])]), 'clicked'); assert.equal(clicks, 1); assert.equal(webReads, 0);
+  assert.equal(run([web, group([button, button])]), 'ambiguous_target'); assert.equal(clicks, 1);
+  const cycle = group([]); cycle.uiElements = () => [cycle];
+  assert.equal(run([button, cycle]), 'ui_tree_limit'); assert.equal(clicks, 1);
+  assert.equal(run(Array.from({ length: 513 }, () => group([]))), 'ui_tree_limit'); assert.equal(clicks, 1);
 });
 
 test('the runner never installs the candidate directly or changes either signed bundle', async () => {
@@ -133,10 +185,23 @@ test('waiting for a delayed About item does not toggle its menu closed', () => {
   ready = true; assert.equal(run('about'), 'clicked'); assert.equal(presses, 1);
 });
 
+test('closing updater windows can be reread, but an uncertain click is never retried as a read', () => {
+  let clicks = 0, closing = true, rejectClick = false;
+  const button = { name: () => 'Install and Relaunch', role: () => 'AXButton', enabled: () => true,
+    click: () => { clicks++; if (rejectClick) throw new Error('Action outcome unavailable'); } };
+  const context = { Application: () => ({ applicationProcesses: { whose: () => () => [{ windows: () => [
+    { role: () => 'AXWindow', uiElements: () => { if (closing) throw new Error('Window no longer exists'); return [button]; } },
+  ] }] } }) };
+  const run = () => runInNewContext(runner.sparkleTransitionUiScript(321, 'relaunch') + '\nrun();', context);
+  assert.equal(run(), 'snapshot_unavailable'); assert.equal(clicks, 0);
+  closing = false; assert.equal(run(), 'clicked'); assert.equal(clicks, 1);
+  rejectClick = true; assert.equal(run(), 'action_unconfirmed'); assert.equal(clicks, 2);
+});
+
 test('synthetic UI diagnostics return closed counts rather than unknown labels or text', () => {
-  const element = (name, value) => ({ name: () => name, value: () => value, enabled: () => true });
+  const element = (name, value) => ({ role: () => 'AXStaticText', name: () => name, value: () => value, enabled: () => true });
   const context = { Application: () => ({ applicationProcesses: { whose: () => () => [{
-    frontmost: () => true, menuBars: () => [], windows: () => [{ entireContents: () => [
+    frontmost: () => true, menuBars: () => [], windows: () => [{ role: () => 'AXWindow', uiElements: () => [
       element('Private session name', 'Private arbitrary text'), element('Install Update', '')] }],
   }] } }) };
   const text = runInNewContext(runner.sparkleTransitionDiagnosticScript(321) + '\nrun();', context);
@@ -192,7 +257,8 @@ test('workflow download planning matches the runner for both architectures and s
   const workflow = await readFile(new URL('../.github/workflows/electron-macos-sparkle-transition.yml', import.meta.url), 'utf8');
   const inputBlock = workflow.split('    inputs:\n')[1].split('\npermissions:')[0];
   assert.equal([...inputBlock.matchAll(/^      [a-z0-9_]+:$/gmu)].length, 10);
-  assert.match(workflow, /runs-on: macos-26-intel/u);
+  assert.match(workflow, /runs-on: macos-15-intel/u);
+  assert.doesNotMatch(workflow, /runs-on: macos-26-intel/u);
   assert.match(workflow, /runs-on: macos-26\n/u);
   assert.match(workflow, /architecture: x64/u);
   assert.match(workflow, /architecture: arm64/u);
@@ -210,13 +276,33 @@ test('workflow download planning matches the runner for both architectures and s
   const python = pythonBlocks[0];
   execFileSync('python3', ['-c', 'import ast,sys; ast.parse(sys.stdin.read())'], { input: python });
   const planning = python.split('for name,url,digest,limit in files:')[0] + '\nprint(json.dumps(files))\n';
-  for (const target of Object.keys(nativeDigests)) for (const scope of ['isolated_test_feed', 'production_feed']) {
+  for (const identity of [
+    { version: '0.1.23', bundleVersion: '1029', buildNumber: '2026091301' },
+    { version: '9999.99.99', bundleVersion: '9999', buildNumber: '2026091301' },
+    { version: '0.1.23', bundleVersion: '1030', buildNumber: '2026091301', feedUrl: 'https://example.com' },
+    { version: '0.1.23', bundleVersion: 1030, buildNumber: '2026091301' },
+  ]) {
+    const root = await mkdtemp(join(tmpdir(), 'sparkle-refused-plan-'));
+    try {
+      const value = intake();
+      assert.throws(() => execFileSync('python3', ['-c', planning], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env: {
+        ...process.env, SELECTED_SOURCE: source, SELECTED_RUNNER: source, GITHUB_SHA: source,
+        SELECTED_IDENTITY: JSON.stringify(identity), SELECTED_DMG: value.dmgSha256, SELECTED_ASAR: value.asarSha256,
+        SELECTED_FEED: value.feedSha256, SELECTED_MODE: 'plan', SELECTED_CONFIRMATION: '',
+        SELECTED_TARGET: value.target, SELECTED_FEED_SCOPE: value.feedScope, RUNNER_TEMP: root,
+      } }), error => Number.isInteger(error.status) && error.status !== 0);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+  for (const target of Object.keys(nativeDigests)) for (const scope of ['isolated_test_feed', 'production_feed'])
+    for (const [version, bundleVersion] of [['0.1.22', '1029'], ['0.1.23', '1030']]) {
     const root = await mkdtemp(join(tmpdir(), 'sparkle-download-plan-'));
     try {
-      const value = intake(target, scope), normalized = runner.validateSparkleTransitionIntake(value);
+      const value = { ...intake(target, scope), version, bundleVersion };
+      const identity = { version, bundleVersion, buildNumber: value.buildNumber };
+      const normalized = runner.validateSparkleTransitionIntake(value);
       const files = JSON.parse(execFileSync('python3', ['-c', planning], { encoding: 'utf8', env: {
         ...process.env, SELECTED_SOURCE: source, SELECTED_RUNNER: source, GITHUB_SHA: source,
-        SELECTED_BUILD: value.buildNumber, SELECTED_DMG: value.dmgSha256, SELECTED_ASAR: value.asarSha256,
+        SELECTED_IDENTITY: JSON.stringify(identity), SELECTED_DMG: value.dmgSha256, SELECTED_ASAR: value.asarSha256,
         SELECTED_FEED: value.feedSha256, SELECTED_MODE: 'plan', SELECTED_CONFIRMATION: '',
         SELECTED_TARGET: target, SELECTED_FEED_SCOPE: scope, RUNNER_TEMP: root,
       } }));
@@ -226,8 +312,8 @@ test('workflow download planning matches the runner for both architectures and s
       assert.ok(files[1][1].endsWith('/' + normalized.dmgFileName));
       const prefix = target === 'darwin-x64' ? 'intel/' : '';
       const candidatePrefix = scope === 'production_feed'
-        ? `https://updates.tibotattle.com/${prefix}releases/1028/${value.dmgSha256}/`
-        : `https://updates.tibotattle.com/electron/test/native-sparkle/${source}/1028/${value.dmgSha256}/`;
+        ? `https://updates.tibotattle.com/${prefix}releases/${bundleVersion}/${value.dmgSha256}/`
+        : `https://updates.tibotattle.com/electron/test/native-sparkle/${source}/${bundleVersion}/${value.dmgSha256}/`;
       assert.equal(files[1][1], candidatePrefix + normalized.dmgFileName);
       assert.ok(files[0][1].startsWith(`https://updates.tibotattle.com/${prefix}releases/1026/${nativeDigests[target]}/`));
       // Exercise the actual extraction and JSON-writing block with only OS commands
@@ -236,10 +322,11 @@ test('workflow download planning matches the runner for both architectures and s
         'import pathlib,json,shutil',
         'root=pathlib.Path(' + JSON.stringify(root) + ')',
         'e=' + JSON.stringify({ SELECTED_DMG: value.dmgSha256, SELECTED_ASAR: value.asarSha256,
-          SELECTED_FEED: value.feedSha256, SELECTED_BUILD: value.buildNumber }),
+          SELECTED_FEED: value.feedSha256 }),
         'source=' + JSON.stringify(source), 'runner=source',
         'target=' + JSON.stringify(target), 'scope=' + JSON.stringify(scope),
         'native=' + JSON.stringify(nativeDigests[target]),
+        'identity=' + JSON.stringify(identity), 'intake=' + JSON.stringify({ ...value, directory: root }),
         "pathlib.Path('sparkle-transition-receipts').mkdir()",
         'class Commands:',
         '  DEVNULL=None',
@@ -254,9 +341,11 @@ test('workflow download planning matches the runner for both architectures and s
       execFileSync('python3', ['-c', extraction], { cwd: root, encoding: 'utf8' });
       const generated = JSON.parse(await readFile(join(root, 'intake.json'), 'utf8'));
       assert.equal(generated.target, target);
+      for (const key of ['sourceRevision', 'version', 'bundleVersion', 'buildNumber']) assert.equal(generated[key], value[key]);
       assert.equal(runner.validateSparkleTransitionIntake(generated).target, target);
       const receipt = JSON.parse(await readFile(join(root, 'sparkle-transition-receipts', 'intake.json'), 'utf8'));
       assert.equal(receipt.target, target);
+      for (const key of ['sourceRevision', 'version', 'bundleVersion', 'buildNumber']) assert.equal(receipt[key], value[key]);
     } finally { await rm(root, { recursive: true, force: true }); }
   }
 });

@@ -146,6 +146,12 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
     authority: "admin",
   },
   {
+    pathname: "/api/v1/admin/database-health",
+    id: "admin_database_health",
+    methods: ["GET"],
+    authority: "admin",
+  },
+  {
     pathname: "/api/v1/admin/reconstruction-progress",
     id: "admin_reconstruction_progress",
     methods: ["GET"],

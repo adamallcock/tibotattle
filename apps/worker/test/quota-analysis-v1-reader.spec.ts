@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { QUOTA_CALIBRATION_POLICY } from "@app-usagemonitor/quota-analysis";
 import { buildPlanAttributionIndex, planEraForInterval } from "@app-usagemonitor/quota-analysis";
 import {
+  V1_QUOTA_ACQUISITION_VERSION,
   advanceV1QuotaAcquisition,
   advanceV1QuotaAcquisitionPage,
   createV1QuotaAcquisitionCheckpoint,
@@ -81,14 +83,19 @@ async function finish(plan: V1PlanSourceRow[], fit: V1FitSourceRow[], options: {
 describe("resumable v1 quota acquisition", () => {
   it("retains exact dense endpoints across pages and serialized phase boundaries", async () => {
     const rows: V1FitSourceRow[] = [];
-    const expected: string[] = [];
     for (let level = 0; level < 9; level++) {
-      for (let repeat = 0; repeat < 150; repeat++) {
-        const value = row(rows.length + 1, level * 10);
-        rows.push(value);
-        if (repeat === 0 || repeat === 149) expected.push(value.occurrence_id);
-      }
+      for (let repeat = 0; repeat < 150; repeat++) rows.push(row(rows.length + 1, level * 10));
     }
+    // Run collapse keeps each flat run's first and last row until the cluster
+    // holds the boundaries the calibration refuses below. After that the runs
+    // are a second apart, so only the cluster's highest row and its final row
+    // survive the spacing, which is what keeps the displayed span exact.
+    const boundaries = QUOTA_CALIBRATION_POLICY.minimumBoundaries;
+    const expected = [
+      ...Array.from({ length: boundaries - 1 },
+        (_, level) => [level * 150, (level + 1) * 150 - 1]).flat(),
+      (boundaries - 1) * 150, boundaries * 150, rows.length - 1,
+    ].map((index) => rows[index]!.occurrence_id);
     const { result, phases } = await finish(rows, rows);
     expect([...phases].sort()).toEqual(["endpoints", "fitability", "plan"]);
     expect(result.status).toBe("complete");
@@ -130,7 +137,9 @@ describe("resumable v1 quota acquisition", () => {
     if (result.status !== "complete") throw new Error("expected complete");
     expect(result.attributionIndex.conflicts).toHaveLength(1);
     expect(new Set(result.quotaRows.map((value) => value.plan_era_key)).size).toBe(2);
-    expect(result.quotaRows).toHaveLength(32);
+    // Endpoint spacing thins these one-second-apart runs once each cluster
+    // holds its boundaries, keeping both eras' extremes and final rows.
+    expect(result.quotaRows).toHaveLength(30);
     expect(result.quotaRows.some((value) => value.observed_at === at(8000))).toBe(false);
   });
 
@@ -314,7 +323,10 @@ describe("resumable v1 quota acquisition", () => {
       expect(replayBudget.remainingQueries).toBe(9);
       expect(first).toEqual(replay);
       expect(validateV1QuotaPageReplay(first.replay)).toBe(true);
-      expect(first.replay?.from).toEqual({ phase: original.phase, cursor: original.cursor });
+      // The marker reports the cursor of whichever leg ran: the anchor phase
+      // has two, and its hull sweep carries its own.
+      expect(first.replay?.from).toEqual({ phase: original.phase,
+        cursor: original.clusterCursor ?? original.cursor });
       expect(validateV1QuotaPageReplay({ ...first.replay, privateNote: "private-replay-canary" })).toBe(false);
       phases.add(first.replay!.through.phase);
       if (first.result.status === "complete") {
@@ -344,5 +356,38 @@ describe("resumable v1 quota acquisition", () => {
     expect(validateV1CompletedQuotaAcquisition({ planAnchors: [], quotaRows: [], prompt: "private-completed-canary" })).toBe(false);
     expect(validateV1CompletedQuotaAcquisition({ planAnchors: [null], quotaRows: [] })).toBe(false);
     expect(validateV1CompletedQuotaAcquisition({ planAnchors: [], quotaRows: [null] })).toBe(false);
+  });
+
+  it("pins the acquisition contract version", () => {
+    // The version is part of the v1 result and checkpoint identities, so a
+    // change to how v1 evidence is acquired retires exactly the v1 corpus.
+    expect(V1_QUOTA_ACQUISITION_VERSION).toBe("v1-quota-acquisition-2");
+  });
+
+  it("reaches the same evidence one page at a time as in a single pass", async () => {
+    // Every deferral in `finish` is serialized and decoded again, so this is a
+    // cut and resume at every page boundary, including the two legs of the
+    // anchor phase. Pool hulls, fitable keys and the cluster-scoped spacing
+    // state must all survive that round trip to land on the same rows.
+    const rows: V1FitSourceRow[] = [];
+    for (let level = 0; level < 12; level += 1) {
+      for (let repeat = 0; repeat < 40; repeat += 1) {
+        // Seconds of jitter on the restated instant, so the hulls are load
+        // bearing: a raw key would fragment this pool into 40 groups.
+        rows.push(row(rows.length + 1, level * 5, undefined,
+          { resets_at: new Date(Date.parse(RESET) + repeat * 1_000).toISOString() }));
+      }
+    }
+    const paged = await finish(rows, rows);
+    const single = await finish(rows, rows, { queriesPerInvocation: 64 });
+    expect(paged.result.status).toBe("complete");
+    expect(single.result.status).toBe("complete");
+    if (paged.result.status !== "complete" || single.result.status !== "complete") {
+      throw new Error("expected complete");
+    }
+    expect(paged.result.quotaRows).toEqual(single.result.quotaRows);
+    // One settled pool, not one per restated instant.
+    expect(new Set(paged.result.quotaRows.map((value) => value.resets_at)).size).toBe(1);
+    expect(paged.result.quotaRows.length).toBeLessThan(rows.length);
   });
 });

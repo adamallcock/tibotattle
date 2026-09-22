@@ -1,6 +1,6 @@
-import { constants } from 'node:fs';
-import { lstat, open, mkdir, realpath } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { resolve } from 'node:path';
+import { createTimingFilesystem } from './inference-timing-filesystem.js';
+import { configureGuardedSqliteConnection } from './windows-protected-sqlite.js';
 import { randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { forEachRolloutLine } from './rollout-line-reader.js';
@@ -9,26 +9,66 @@ import { forEachRolloutLine } from './rollout-line-reader.js';
 const APPLICATION = 0x54425450;
 const CHUNK = 16 * 1024 * 1024;
 const safe = (ok, code) => { if (!ok) throw new Error(code); };
-function ownerFile(s) {
-  return s.isFile() && s.nlink === 1 && s.uid === process.getuid() && !(s.mode & 0o077);
+
+function databaseIsClosed(database) {
+  if (database === undefined || database === null) return true;
+  try { return database.isOpen === false; } catch { return false; }
 }
-export async function openTimingStore(directory, { createParser, digest, METHOD, MAX_STATE_BYTES }) {
-  const dir = resolve(directory);
-  // Parent must exist and every resolved component must be the requested path.
-  const parent = resolve(dir, '..');
-  safe(await realpath(parent) === parent, 'unsafe_directory');
-  await mkdir(dir, { mode: 0o700 }).catch(e => { if (e.code !== 'EEXIST') throw e; });
-  const d = await lstat(dir);
-  safe(d.isDirectory() && !d.isSymbolicLink() && d.uid === process.getuid() && !(d.mode & 0o077), 'unsafe_directory');
-  const file = join(dir, 'timing-experiment.sqlite');
-  let created = false;
+
+function setAttemptedBytes(error, attemptedBytes) {
   try {
-    const h = await open(file, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-    await h.close(); created = true;
-  } catch (e) { if (e.code !== 'EEXIST') throw e; }
-  safe(ownerFile(await lstat(file)), 'unsafe_database');
-  const db = new DatabaseSync(file);
+    if (error !== null && (typeof error === 'object' || typeof error === 'function')) {
+      Object.defineProperty(error, 'attemptedBytes', {
+        configurable: true, enumerable: false, value: attemptedBytes, writable: true,
+      });
+    }
+  } catch { /* Preserve arbitrary thrown values and frozen errors. */ }
+}
+
+export async function openTimingStore(directory, { createParser, digest, METHOD, MAX_STATE_BYTES, correlationKey,
+  filesystem = createTimingFilesystem(),
+  databaseFactory = (file, options) => new DatabaseSync(file, options) }) {
+  safe(correlationKey === undefined || Buffer.isBuffer(correlationKey) && correlationKey.length === 32, 'invalid_metadata');
+  const lease = await filesystem.prepare(directory);
+  const { file, created } = lease;
+  let db;
+  let dbClosed = false;
+  let leaseReleaseAttempted = false;
+  let leaseReleaseError = null;
+
+  // SQLite must be closed before its native file guards are released. If a
+  // close failure leaves the database open, retain the lease and let a caller
+  // retry close rather than allowing another owner to reach the file.
+  function closeOwnedResources(primaryError = null) {
+    let firstError = primaryError;
+    if (!dbClosed && db !== undefined) {
+      try {
+        db.close();
+        dbClosed = databaseIsClosed(db);
+        if (!dbClosed && firstError === null) firstError = new Error('database_close_incomplete');
+      } catch (error) {
+        if (firstError === null) firstError = error;
+        dbClosed = databaseIsClosed(db);
+      }
+    } else if (db === undefined) {
+      dbClosed = true;
+    }
+    if (dbClosed && !leaseReleaseAttempted) {
+      leaseReleaseAttempted = true;
+      try {
+        lease.release();
+      } catch (error) {
+        leaseReleaseError = error;
+        if (firstError === null) firstError = error;
+      }
+    }
+    if (firstError === null && leaseReleaseError !== null) firstError = leaseReleaseError;
+    return firstError;
+  }
+
   try {
+    db = databaseFactory(file, { timeout: 100 });
+    if (lease.persistentJournal) configureGuardedSqliteConnection(db);
     const version = db.prepare('PRAGMA user_version').get().user_version;
     const application = db.prepare('PRAGMA application_id').get().application_id;
     safe(created || (version === METHOD && application === APPLICATION), 'incompatible_database');
@@ -47,13 +87,20 @@ export async function openTimingStore(directory, { createParser, digest, METHOD,
           sample_total_responses INTEGER NOT NULL, sample_method TEXT) WITHOUT ROWID;
         CREATE INDEX turn_time ON turn(at);
         PRAGMA application_id=${APPLICATION}; PRAGMA user_version=${METHOD};`);
-      db.prepare('INSERT INTO metadata VALUES (?)').run(randomBytes(32));
+      db.prepare('INSERT INTO metadata VALUES (?)').run(correlationKey ?? randomBytes(32));
       db.exec('COMMIT');
     }
     const key = Buffer.from(db.prepare('SELECT key FROM metadata').get().key);
     safe(key.length === 32, 'invalid_metadata');
-    return { db, key, file, createParser, digest, method: METHOD, close: () => db.close() };
-  } catch (e) { db.close(); throw e; }
+    safe(correlationKey === undefined || key.equals(correlationKey), 'correlation_mismatch');
+    return { db, key, file, createParser, digest, filesystem, method: METHOD, close: () => {
+      const error = closeOwnedResources();
+      if (error !== null) throw error;
+    } };
+  } catch (e) {
+    closeOwnedResources(e);
+    throw e;
+  }
 }
 
 const snapshot = s => ({ dev: s.dev, ino: s.ino, birth: s.birthtimeMs,
@@ -72,11 +119,11 @@ async function fingerprint(handle, cursor, key, digest) {
 export async function ingestTimingFile(store, path, { maxBytes = CHUNK, signal, onReadLine } = {}) {
   safe(Number.isSafeInteger(maxBytes) && maxBytes > 0 && maxBytes <= CHUNK, 'invalid_budget');
   const { db, key, createParser, digest } = store;
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const handle = await store.filesystem.openSource(path);
   let attemptedBytes = 0;
+  let primaryError = null;
   try {
     const stat = await handle.stat();
-    safe(stat.isFile() && stat.uid === process.getuid(), 'unsafe_source');
     const before = snapshot(stat);
     const sourceKey = Buffer.from(digest(key, 'source-path', resolve(path)), 'hex');
     const old = db.prepare('SELECT * FROM source WHERE digest=?').get(sourceKey);
@@ -121,7 +168,7 @@ export async function ingestTimingFile(store, path, { maxBytes = CHUNK, signal, 
         } });
       if (receipt.aborted || signal?.aborted) throw new Error('cancelled');
       const after = snapshot(await handle.stat());
-      const named = snapshot(await lstat(path));
+      const named = snapshot(await store.filesystem.namedStat(path, handle));
       safe(sameFile(before, after) && sameFile(before, named)
         && before.size === after.size && before.mtime === after.mtime
         && before.ctime === after.ctime, 'source_changed');
@@ -142,17 +189,53 @@ export async function ingestTimingFile(store, path, { maxBytes = CHUNK, signal, 
       db.exec('COMMIT');
       return { bytes: end - cursor, unchanged: false, cursor: nextOffset,
         remaining: before.size - nextOffset, partial: receipt.partialDeferred };
-    } catch (e) { db.exec('ROLLBACK'); throw e; }
-  } catch (e) { e.attemptedBytes = attemptedBytes; throw e; }
-  finally { await handle.close(); }
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch { /* Preserve the operation failure. */ }
+      throw e;
+    }
+  } catch (e) {
+    primaryError = e;
+    setAttemptedBytes(e, attemptedBytes);
+    throw e;
+  } finally {
+    try {
+      await handle.close();
+    } catch (e) {
+      if (primaryError === null) {
+        setAttemptedBytes(e, attemptedBytes);
+        throw e;
+      }
+      // A cleanup failure must not replace the parser, read, or transaction
+      // error that the caller uses to account for attempted bytes.
+    }
+  }
 }
 
-export function readTimingRows(store) {
-  const rows = store.db.prepare(`SELECT at,model,effort,tokens,reasoning,duration,ttft,
+export function readTimingRows(store, { supplement = null } = {}) {
+  // Correlation handles remain local. Only joined numeric observations leave
+  // this owner; a supplemental scan cannot add turns or replace old metrics.
+  let extras = null;
+  if (supplement) {
+    safe(store.key.equals(supplement.key), 'correlation_mismatch');
+    const candidates = supplement.db.prepare(`SELECT key,at,model,effort,tokens,reasoning,duration,ttft,
+      responses,covered,quality,sample_tokens,sample_duration FROM turn
+      WHERE sample_method='tool_free' LIMIT 100001`).all();
+    safe(candidates.length <= 100000, 'export_limit');
+    extras = new Map(candidates.map(row => [Buffer.from(row.key).toString('hex'), row]));
+  }
+  const rows = store.db.prepare(`SELECT key,at,model,effort,tokens,reasoning,duration,ttft,
     responses,covered,quality,sample_tokens,sample_reasoning,sample_duration,
     sample_responses,sample_total_responses,sample_method FROM turn ORDER BY at LIMIT 100001`).all();
   safe(rows.length <= 100000, 'export_limit');
-  return rows;
+  return rows.map(({ key, ...row }) => {
+    const extra = extras?.get(Buffer.from(key).toString('hex'));
+    if (extra && row.model !== null && ['at', 'model', 'effort', 'tokens', 'reasoning',
+      'duration', 'ttft', 'responses', 'covered', 'quality'].every(field => row[field] === extra[field])) {
+      row.tool_free_tokens = extra.sample_tokens;
+      row.tool_free_duration = extra.sample_duration;
+    }
+    return row;
+  });
 }
 
 export function timingReport(store) {

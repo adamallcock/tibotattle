@@ -54,6 +54,7 @@ const PRODUCTION_PUBLIC_SURFACE_FORBIDDEN_PATHS = Object.freeze([
   ...ADMIN_UI_SOURCES.map(({ route }) => route),
   "/api/v1/admin/community/allowance-preview",
   "/api/v1/admin/reconstruction-progress",
+  "/api/v1/admin/database-health",
 ]);
 const PRODUCTION_PUBLIC_ROOT_FORBIDDEN_MARKERS = Object.freeze([
   'src="./app.js"',
@@ -311,7 +312,7 @@ function checkedOutSourceTreeClean(workerDirectory) {
 
 function verifySourceSnapshot({
   workerDirectory,
-  expectedSourceCommit,
+  expectedSourceCommit = null,
   sourceCommitCheck,
   sourceTreeCleanCheck,
 }) {

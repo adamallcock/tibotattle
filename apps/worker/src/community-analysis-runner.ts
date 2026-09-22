@@ -68,7 +68,8 @@ async function loadCheckpoint(work: CommunityAnalysisWorkStore, db: D1Database, 
   // before allocating, instead of rereading a doomed prefix every invocation.
   if (!available(budget, 3 * Math.ceil(head.manifest.length / COMMUNITY_ANALYSIS_PARTS_PER_READ) + progressReserve)) return { status: "deferred" };
   const components: Record<V1QuotaWorkComponent, unknown[]> = { "plan-anchors": [], "plan-runs": [],
-    "plan-equal-time": [], "fit-stats": [], eligible: [], "endpoint-runs": [], endpoints: [] };
+    "plan-equal-time": [], "reset-clusters": [], "fit-stats": [], eligible: [], "endpoint-runs": [],
+    "endpoint-holds": [], endpoints: [] };
   const interner = createV1QuotaWorkInterner();
   try {
     for (let offset = 0; offset < head.manifest.length;) {

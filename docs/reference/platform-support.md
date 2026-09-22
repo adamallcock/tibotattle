@@ -78,7 +78,11 @@ and notification appearance remain accepted user-testing limits.
 The 0.1.22 **model-performance page is unavailable on Windows** until
 its protected session-state reader is qualified there. That is a feature
 availability boundary, not a statement that the normal Windows application or
-local usage processing is unavailable.
+local usage processing is unavailable. The Windows timing
+adapter and native source-reader implementation are prepared in the
+[Windows model-performance plan](../plans/2026-09-13-windows-model-performance.md);
+native qualification and policy approval remain open. This is not a release
+support change.
 
 ## Linux
 

@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   checkReleaseNotes,
@@ -154,8 +154,8 @@ function assertReleaseLifecycleInventory(result, packageVersionIsTagged) {
   assert.deepEqual(new Set(result.noteVersions), expectedVersions);
 }
 
-test("the current repository covers every stable tag and package version", async () => {
-  const result = await checkReleaseNotes({ rootDirectory: REPOSITORY_ROOT });
+test("the current repository covers its release ancestry and package version", async () => {
+  const result = await checkReleaseNotes({ rootDirectory: REPOSITORY_ROOT, tagScope: "reachable" });
   assert.equal(result.ok, true, formatReleaseNotesReport(result));
   assert.match(result.packageVersion, /^\d+\.\d+\.\d+$/u);
   assert.equal(result.stableTagVersions.includes("0.1.0"), true);
@@ -178,6 +178,81 @@ test("the current repository covers every stable tag and package version", async
     result,
     result.stableTagVersions.includes(result.packageVersion),
   );
+});
+
+test("unrelated future tags do not invalidate PR history, while publication still requires them", async () => {
+  await withReleaseFixture(async (rootDirectory) => {
+    await populateCompleteFixture(rootDirectory);
+    const git = (...args) => execFile("git", args, { cwd: rootDirectory });
+    await git("init", "--quiet");
+    await git("config", "user.name", "Release Test");
+    await git("config", "user.email", "release-test@example.invalid");
+    await git("config", "commit.gpgSign", "false");
+    await git("config", "tag.gpgSign", "false");
+    await git("add", ".");
+    await git("commit", "--quiet", "-m", "reviewed history");
+    await git("tag", "-a", "v1.1.0", "-m", "reviewed release");
+    const base = (await git("rev-parse", "HEAD")).stdout.trim();
+    await git("switch", "--quiet", "-c", "future-release");
+    await writeFile(join(rootDirectory, "future.txt"), "synthetic future release\n");
+    await git("add", "future.txt");
+    await git("commit", "--quiet", "-m", "future release");
+    await git("tag", "-a", "v1.3.0", "-m", "future release");
+    await git("switch", "--quiet", "--detach", base);
+
+    const pr = await checkReleaseNotes({ rootDirectory, tagScope: "reachable" });
+    assert.equal(pr.ok, true, formatReleaseNotesReport(pr));
+    assert.deepEqual(pr.stableTagVersions, ["1.1.0"]);
+    assert.match(formatReleaseNotesReport(pr), /Tag scope: reachable/u);
+    const strict = await checkReleaseNotes({ rootDirectory });
+    assert.equal(strict.ok, false);
+    assert.equal(strict.tagScope, "all");
+    assert.ok(strict.issues.some(({ code, path }) => code === "missing_release_note" && path === "release-notes/1.3.0.md"));
+
+    await rm(join(rootDirectory, "release-notes/1.2.0.md"));
+    const missingCandidate = await checkReleaseNotes({ rootDirectory, tagScope: "reachable" });
+    assert.ok(missingCandidate.issues.some(({ code, path }) => code === "missing_release_note" && path === "release-notes/1.2.0.md"));
+    await git("restore", "release-notes/1.2.0.md");
+    await rm(join(rootDirectory, "release-notes/1.1.0.md"));
+    const missingHistory = await checkReleaseNotes({ rootDirectory, tagScope: "reachable" });
+    assert.ok(missingHistory.issues.some(({ code, path }) => code === "missing_release_note" && path === "release-notes/1.1.0.md"));
+    await git("restore", "release-notes/1.1.0.md");
+
+    await git("switch", "--quiet", "future-release");
+    const nowReachable = await checkReleaseNotes({ rootDirectory, tagScope: "reachable" });
+    assert.equal(nowReachable.ok, false);
+    assert.ok(nowReachable.issues.some(({ code }) => code === "latest_changelog_version"));
+    assert.ok(nowReachable.issues.some(({ code }) => code === "missing_changelog_entry"));
+    assert.ok(nowReachable.issues.some(({ code, path }) => code === "missing_release_note" && path === "release-notes/1.3.0.md"));
+    await git("tag", "v1.4.0");
+    const invalidTag = await checkReleaseNotes({ rootDirectory, tagScope: "reachable" });
+    assert.ok(invalidTag.issues.some(({ code }) => code === "stable_tag_not_annotated"));
+
+    const shallowRoot = join(rootDirectory, "shallow-copy");
+    await git("clone", "--quiet", "--depth=1", pathToFileURL(rootDirectory).href, shallowRoot);
+    const shallow = await checkReleaseNotes({ rootDirectory: shallowRoot, tagScope: "reachable" });
+    assert.equal(shallow.ok, false);
+    assert.ok(shallow.issues.some(({ code, detail }) => code === "tag_discovery_failed" && detail.includes("complete Git history")));
+
+    const blob = (await git("rev-parse", "HEAD:package.json")).stdout.trim();
+    await git("tag", "-a", "v1.5.0", blob, "-m", "invalid release target");
+    for (const tagScope of ["all", "reachable"]) {
+      const malformedTarget = await checkReleaseNotes({ rootDirectory, tagScope });
+      assert.equal(malformedTarget.ok, false);
+      assert.ok(malformedTarget.issues.some(({ code, detail }) => code === "tag_discovery_failed" && detail.includes("must target commits")));
+    }
+  });
+});
+
+test("unknown tag scopes and duplicate CLI scope flags are refused", async () => {
+  await assert.rejects(checkReleaseNotes({ tagScope: "ignore" }), /scope must be all or reachable/u);
+  await assert.rejects(execFile(process.execPath, [join(REPOSITORY_ROOT, "scripts/check-release-notes.mjs"), "--reachable-tags", "--reachable-tags"]), (error) => error.code === 2 && /Unknown argument/u.test(error.stderr));
+});
+
+test("PR documentation scope is separate from full publication inventory", async () => {
+  const workflow = await readFile(join(REPOSITORY_ROOT, ".github/workflows/release-trust-policy.yml"), "utf8");
+  assert.match(workflow, /if: github\.event_name == 'pull_request'\n\s+run: node \.\/scripts\/check-release-notes\.mjs --reachable-tags/u);
+  assert.match(workflow, /if: github\.event_name != 'pull_request'\n\s+run: node \.\/scripts\/check-release-notes\.mjs\n/u);
 });
 
 test("only the exact protected v0.1.10 anomaly is pinned", () => {
@@ -298,7 +373,7 @@ test("release trust CI gates every release-documentation change", async () => {
   }
   assert.match(
     workflow,
-    /- name: Check release documentation\n\s+run: node \.\/scripts\/check-release-notes\.mjs/u,
+    /- name: Check complete release documentation before publication\n\s+if: github\.event_name != 'pull_request'\n\s+run: node \.\/scripts\/check-release-notes\.mjs/u,
   );
 });
 

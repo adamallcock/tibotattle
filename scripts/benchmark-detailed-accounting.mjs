@@ -13,9 +13,8 @@ import { extractEsmImports } from "./lib/esm-imports.mjs";
 // Never discover a corpus, collector state, credentials, or a live app here.
 const SHA256 = /^[a-f0-9]{64}$/u;
 const REVISION = /^[a-f0-9]{40}$/u;
-const MAX_RESULT_BYTES = 64 * 1024 * 1024;
-// The production parent's publication limit is tighter than child transport.
-const MAX_DURABLE_CACHE_BYTES = 16 * 1024 * 1024;
+// Match the production compact-cache publication and child-result ceiling.
+const MAX_ACCOUNTING_CACHE_BYTES = 128 * 1024 * 1024;
 const MAX_STDOUT_BYTES = 64 * 1024;
 const MAX_STDERR_BYTES = 128 * 1024;
 const DAY_MS = 86_400_000;
@@ -193,14 +192,15 @@ export function parseMacOsTimeMetrics(stderr) {
   return result;
 }
 
-export function parseSuccessfulAccountingEnvelope(stdout) {
+export function parseSuccessfulAccountingEnvelope(stdout, { maximumBytes = MAX_ACCOUNTING_CACHE_BYTES } = {}) {
+  if (!integer(maximumBytes, 2, MAX_ACCOUNTING_CACHE_BYTES)) throw fail("envelope_invalid");
   let envelope;
   try { envelope = JSON.parse(stdout.trim()); }
   catch { throw fail("envelope_invalid"); }
   // The production child intentionally exits zero even for a typed refusal.
   if (envelope?.status === "error") throw fail("child_refused");
   if (!exactKeys(envelope, ["status", "resultBytes", "resultSha256"])
-      || envelope.status !== "ok" || !integer(envelope.resultBytes, 2, MAX_RESULT_BYTES)
+      || envelope.status !== "ok" || !integer(envelope.resultBytes, 2, maximumBytes)
       || !SHA256.test(envelope.resultSha256)) throw fail("envelope_invalid");
   return envelope;
 }
@@ -254,10 +254,13 @@ export async function digestDetailedAccountingBenchmarkFile(path, expectedStat =
   } finally { await handle.close(); }
 }
 
-export async function verifyAccountingBenchmarkArtifact(path, envelope, { signal = null } = {}) {
+export async function verifyAccountingBenchmarkArtifact(path, envelope, {
+  signal = null, maximumBytes = MAX_ACCOUNTING_CACHE_BYTES,
+} = {}) {
   checkCancelled(signal);
-  const stat = await privateRegularFile(path, { maximumBytes: MAX_RESULT_BYTES });
-  if (stat.size > MAX_DURABLE_CACHE_BYTES) throw fail("resource_limit_exceeded");
+  if (!integer(maximumBytes, 2, MAX_ACCOUNTING_CACHE_BYTES)) throw fail("artifact_invalid");
+  const stat = await privateRegularFile(path);
+  if (stat.size > maximumBytes) throw fail("resource_limit_exceeded");
   if (stat.size !== envelope.resultBytes) throw fail("artifact_mismatch");
   const sha256 = await digestDetailedAccountingBenchmarkFile(path, stat, { signal });
   if (sha256 !== envelope.resultSha256) throw fail("artifact_mismatch");
@@ -609,7 +612,7 @@ export function validateDetailedAccountingBenchmarkReceipt(receipt) {
       || !integer(receipt.policy.maximumRssBytes, 1) || !integer(receipt.policy.rebuildChildOldSpaceMib, 1)
       || receipt.warmupsPerRevision !== 1 || !integer(receipt.measuredRunsPerRevision, 1, 10)
       || !exactKeys(receipt.artifact, ["sha256", "bytes"]) || !SHA256.test(receipt.artifact.sha256)
-      || !integer(receipt.artifact.bytes, 2, MAX_DURABLE_CACHE_BYTES)
+      || !integer(receipt.artifact.bytes, 2, MAX_ACCOUNTING_CACHE_BYTES)
       || !SHA256.test(receipt.dependenciesSha256)
       || receipt.exactOutputMatch !== true || receipt.indexUnchanged !== true
       || receipt.sourceUnchanged !== true) throw fail("receipt_invalid");

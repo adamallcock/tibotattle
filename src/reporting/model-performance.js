@@ -33,13 +33,14 @@ function add(bins, at, value) {
   if (!bins.has(at)) bins.set(at, []);
   bins.get(at).push(value);
 }
-export function modelPerformanceProjection(rows, { period = 'all', now = Date.now(), historyProgress = null } = {}) {
-  if (!['7', '30', 'all'].includes(period) || !count(now) || !Array.isArray(rows) || rows.length > 100000
-      || !progress(historyProgress))
+export function modelPerformanceProjection(rows, { period = 'all', now = Date.now(), historyProgress = null, rolling = false } = {}) {
+  if (!['1', '7', '30', 'all'].includes(period) || !count(now) || !Array.isArray(rows) || rows.length > 100000
+      || !progress(historyProgress) || typeof rolling !== 'boolean')
     throw new Error('invalid_timing_projection');
   const known = rows.filter(r => LABELS.has(r.model) && count(r.at) && r.at <= now);
   const end = now;
   const start = period === 'all' ? (known.length ? known.reduce((min, r) => Math.min(min, r.at), now) : null)
+    : rolling || period === '1' ? Math.max(0, now - Number(period) * DAY)
     : Math.floor(now / DAY) * DAY - (Number(period) - 1) * DAY;
   const interval = period === 'all' && start !== null && end - start > 366 * DAY ? 'week' : 'day';
   const size = interval === 'week' ? 7 * DAY : DAY;
@@ -49,8 +50,8 @@ export function modelPerformanceProjection(rows, { period = 'all', now = Date.no
   for (const r of known) {
     if (r.at < start) continue;
     if (!groups.has(r.model)) groups.set(r.model, { id: r.model, label: LABELS.get(r.model),
-      turns: 0, speedTurns: 0, ttftTurns: 0, timedResponses: 0,
-      speed: new Map(), latency: new Map() });
+      turns: 0, speedTurns: 0, ttftTurns: 0, timedResponses: 0, toolFreeTurns: 0,
+      speed: new Map(), latency: new Map(), toolFree: new Map() });
     const m = groups.get(r.model), at = Math.floor((r.at - anchor) / size) * size + anchor;
     m.turns++;
     if (['receipt', 'legacy'].includes(r.sample_method) && positive(r.sample_tokens)
@@ -58,14 +59,20 @@ export function modelPerformanceProjection(rows, { period = 'all', now = Date.no
       && count(r.sample_total_responses) && r.sample_responses <= r.sample_total_responses) {
       m.speedTurns++; m.timedResponses += r.sample_responses;
       add(m.speed, at, r.sample_tokens * 1000 / r.sample_duration);
+    } else if (positive(r.tool_free_tokens) && positive(r.tool_free_duration)) {
+      // Prefer response timing; use full-turn throughput only as a fallback.
+      // Each turn contributes once, before computing the combined percentiles.
+      const value = r.tool_free_tokens * 1000 / r.tool_free_duration;
+      m.speedTurns++; m.toolFreeTurns++;
+      add(m.speed, at, value); add(m.toolFree, at, value);
     }
     if (count(r.ttft)) { m.ttftTurns++; add(m.latency, at, r.ttft / 1000); }
   }
-  return { schemaVersion: 2, method: 3, status: 'ready', collecting: false, stale: false,
+  return { schemaVersion: 4, method: 5, status: 'ready', collecting: false, stale: false,
     updatedAt: new Date(now).toISOString(), period, interval, start, end, historyProgress,
     models: [...LABELS.keys()].filter(id => groups.has(id)).map(id => {
-      const { speed, latency, ...m } = groups.get(id);
+      const { speed, latency, toolFree, ...m } = groups.get(id);
       return { ...m, speed: [{ method: 'speed', points: points(speed) }],
-        ttft: points(latency) };
+        ttft: points(latency), toolFree: points(toolFree) };
     }) };
 }

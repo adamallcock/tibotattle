@@ -17,6 +17,10 @@ import {
 } from "./desktop-runtime.js";
 import { createDesktopTrayIconFactory } from "./desktop-tray.js";
 import {
+  createDesktopCrashCapture,
+  createDesktopCrashCaptureBackend,
+} from "./desktop-crash-capture.js";
+import {
   PRODUCTION_ELECTRON_CHANNEL,
   validateProductionDistributionMetadata,
 } from "./desktop-updater.js";
@@ -366,6 +370,21 @@ function emitEntryFailureDiagnostic(writeDiagnostic = process.stderr?.write?.bin
       // Diagnostic delivery must never prevent fail-closed shutdown.
     }
   }
+}
+
+function quitAfterEntryFailure({ app, dialog, writeDiagnostic } = {}) {
+  emitEntryFailureDiagnostic(writeDiagnostic);
+  try {
+    // showErrorBox works before app readiness. Keep the copy fixed: a startup
+    // exception may contain private paths, account data, or child output.
+    dialog?.showErrorBox?.(
+      "TiboTattle could not start",
+      `TiboTattle stopped before opening the dashboard.\n\nSupport code: ${ELECTRON_ENTRY_FAILURE_DIAGNOSTIC}\n\nPlease report this code with the app and operating system versions. Preserve your local data.`,
+    );
+  } catch {
+    // A missing or broken native dialog must not prevent fail-closed shutdown.
+  }
+  app?.quit?.();
 }
 
 function isCompanionProcessLifecycleEvent(value) {
@@ -1067,11 +1086,27 @@ async function prepareElectronShellBootstrap({
     accountlessSignedStagingRehearsal,
     { expectedOwnerUid: accountContext?.expectedTestUID },
   );
+  let crashCapture = null;
+  if (platform === "darwin" && typeof runtime.crashReporter?.start === "function") {
+    try {
+      const backend = createDesktopCrashCaptureBackend({
+        platform,
+        rootPath: join(app.getPath("userData"), "desktop-settings"),
+      });
+      crashCapture = createDesktopCrashCapture({ backend, crashReporter: runtime.crashReporter });
+      await crashCapture.initialize();
+    } catch {
+      // Crash capture is optional. A malformed or unavailable preference must
+      // never prevent the ordinary desktop launch or enable native dumps.
+      crashCapture = null;
+    }
+  }
   return Object.freeze({
     [ELECTRON_SHELL_BOOTSTRAP]: true,
     accountlessHostedRehearsal,
     accountlessSignedStagingRehearsal,
     app,
+    crashCapture,
     productionDistribution,
     runtime,
     signedStagingProfile,
@@ -1143,6 +1178,7 @@ export async function launchElectronShell({
     const {
       accountlessHostedRehearsal,
       accountlessSignedStagingRehearsal,
+      crashCapture,
       productionDistribution,
     } = preparation;
     assertElectronPlatformGate({
@@ -1276,6 +1312,7 @@ export async function launchElectronShell({
       qualificationContext,
       platform,
       architecture,
+      crashCapture,
       productionDistribution: productionEnabled ? productionDistribution : undefined,
       prepareNativeHandover: macCredentialHandover?.prepareNativeHandover,
       accountlessProduction: accountlessProductionEnabled ? {
@@ -1316,8 +1353,11 @@ export async function launchElectronShell({
   } catch (error) {
     // This includes platform-gate and dependency/configuration failures that
     // occur before the lifecycle owns a shutdown path.
-    if (emitFailureDiagnostic) emitEntryFailureDiagnostic(writeDiagnostic);
-    app.quit?.();
+    if (emitFailureDiagnostic) {
+      quitAfterEntryFailure({ app, dialog: runtime.dialog, writeDiagnostic });
+    } else {
+      app.quit?.();
+    }
     throw error;
   }
 }
@@ -1332,8 +1372,7 @@ if (process.versions.electron) {
     // an ESM main process an unawaited launch can lose the race with `ready`.
     startupPreparation = await prepareElectronShellBootstrap({ electron: runtime });
   } catch {
-    emitEntryFailureDiagnostic();
-    runtime?.app?.quit?.();
+    quitAfterEntryFailure({ app: runtime?.app, dialog: runtime?.dialog });
     process.exitCode = 1;
   }
   if (startupPreparation !== undefined) {

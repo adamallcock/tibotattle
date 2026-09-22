@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  assertLocalOwnerOverview,
   assertRetiredDeletionHealth,
   createLocalOwnerEraser,
   localErasureOrigin,
@@ -43,7 +44,10 @@ async function accessFile(t, value = owner) {
   return file;
 }
 
-function service({ intercept, environment = "local-development", deniedOwner = false } = {}) {
+function service({
+  intercept, environment = "local-development", deniedOwner = false,
+  overview = { schemaVersion: "admin-overview-v0.3", service: { environment } },
+} = {}) {
   let erased = false;
   let mutation = null;
   let generation = 0;
@@ -69,7 +73,7 @@ function service({ intercept, environment = "local-development", deniedOwner = f
     }
     if (path === "/api/v1/admin/overview") {
       if (deniedOwner) return error(403, "ADMIN_REQUIRED");
-      return json({ schemaVersion: "admin-overview-v0.3", service: { environment } });
+      return json(overview);
     }
     if (path === "/api/v1/me/export") {
       if (erased) return error(401, "AUTH_INVALID");
@@ -152,6 +156,65 @@ test("owner authorization and local environment are preflighted read-only", asyn
     await assert.rejects(createLocalOwnerEraser({ origin, ownerAccessFile, fetchImpl: backend.fetchImpl }), hasCode(code));
     assert.deepEqual(backend.calls.map(({ method }) => method), ["GET", "GET"]);
   }
+});
+
+test("owner overview accepts legacy v0.3 and validates the typed v0.4 extension", () => {
+  const typed = {
+    schemaVersion: "admin-overview-v0.4",
+    service: { environment: "local-development", telemetryStorageMode: "typed" },
+    snapshots: [],
+    pendingHistoricalRebuilds: null,
+    pendingHistoricalRebuildsBounded: null,
+    historicalPublication: {
+      publishedDays: 1,
+      publishedDaysBounded: false,
+      latestEvidenceDay: "2026-09-14",
+      latestComputedAt: "2026-09-14T12:00:00.000Z",
+      previewState: "current",
+      previewGeneratedAt: "2026-09-14T12:01:00.000Z",
+    },
+  };
+  assert.doesNotThrow(() => assertLocalOwnerOverview({
+    schemaVersion: "admin-overview-v0.3",
+    service: { environment: "local-development" },
+  }));
+  assert.doesNotThrow(() => assertLocalOwnerOverview(typed));
+  assert.doesNotThrow(() => assertLocalOwnerOverview({ ...typed, schemaVersion: "admin-overview-v0.5" }));
+  assert.doesNotThrow(() => assertLocalOwnerOverview({ schemaVersion: "admin-overview-v0.5", service: { telemetryStorageMode: "json" } }));
+  assert.throws(() => assertLocalOwnerOverview({ schemaVersion: "admin-overview-v0.5", service: { telemetryStorageMode: "unknown" } }), hasCode("LOCAL_OWNER_NOT_AUTHORIZED"));
+  for (const invalid of [
+    { ...typed, service: { ...typed.service, telemetryStorageMode: "json" } },
+    { ...typed, pendingHistoricalRebuilds: 0 },
+    { ...typed, snapshots: [{}] },
+    { ...typed, historicalPublication: { ...typed.historicalPublication, previewState: "not_published" } },
+    { ...typed, historicalPublication: { ...typed.historicalPublication, extra: 1 } },
+  ]) {
+    assert.throws(
+      () => assertLocalOwnerOverview(invalid),
+      hasCode("LOCAL_OWNER_NOT_AUTHORIZED"),
+    );
+  }
+});
+
+test("typed v0.4 owner overview passes the local HTTP preflight", async (t) => {
+  const overview = {
+    schemaVersion: "admin-overview-v0.4",
+    service: { environment: "local-development", telemetryStorageMode: "typed" },
+    snapshots: [], pendingHistoricalRebuilds: null,
+    pendingHistoricalRebuildsBounded: null,
+    historicalPublication: {
+      publishedDays: 0, publishedDaysBounded: false,
+      latestEvidenceDay: null, latestComputedAt: null,
+      previewState: "not_published", previewGeneratedAt: null,
+    },
+  };
+  const backend = service({ overview });
+  await assert.doesNotReject(createLocalOwnerEraser({
+    origin,
+    ownerAccessFile: await accessFile(t),
+    fetchImpl: backend.fetchImpl,
+  }));
+  assert.deepEqual(backend.calls.map(({ method }) => method), ["GET", "GET"]);
 });
 
 test("participant requests are refused without changing export/session/devices; only owner erases", async (t) => {

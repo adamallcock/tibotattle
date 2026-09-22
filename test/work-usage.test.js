@@ -79,12 +79,12 @@ function availableResult(events, overrides = {}) {
 
 async function waitForAvailable(service, request) {
   const preparing = await service.query(request);
-  assert.equal(preparing.status, "preparing");
-  const pinnedRequest = { ...request, snapshotId: preparing.snapshotId };
+  assert.ok(preparing.status === "preparing" || preparing.retained === true);
+  const pinnedRequest = { ...request, snapshotId: preparing.refreshSnapshotId ?? preparing.snapshotId };
   for (let attempt = 0; attempt < 5; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 0));
     const result = await service.query(pinnedRequest);
-    if (result.status === "available") return result;
+    if (result.status === "available" && !result.retained) return result;
   }
   assert.fail("work-usage build did not become available");
 }
@@ -724,4 +724,27 @@ test("name search discovers off-page project and worker names before pagination 
   assert.equal(nameReads, 1, "one bounded name read per snapshot, shared across all searches");
   assert.equal(JSON.stringify(source), before, "names are never attached to the accounting snapshot");
   assert.equal(Object.hasOwn(worker, "search"), false, "raw query text is never echoed");
+});
+
+test('explicit reporting end is stable and refuses older or unanchored results', async () => {
+  const now = Date.parse('2026-09-10T12:00:00.000Z');
+  const end = now - 60_000;
+  const request = { schemaVersion: WORK_USAGE_SCHEMA, period: '24h', endAt: new Date(end).toISOString() };
+  for (const shift of [0, -1, null]) {
+    let requested;
+    const service = createWorkUsageService({ clock: () => now, build: async range => {
+      requested = range;
+      return availableResult([], shift === null ? {} : { fromMs: end - 86400000 + shift, toMs: end + shift });
+    } });
+    try {
+      const preparing = await service.query(request);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      const result = await service.query({ ...request, snapshotId: preparing.snapshotId });
+      assert.equal(requested.exactWindow, true);
+      assert.equal(requested.toMs, end);
+      assert.equal(result.status, shift === 0 ? 'available' : 'unavailable');
+      await assert.rejects(service.query({ ...request, endAt: new Date(now + 1).toISOString() }));
+    } finally { service.close(); }
+  }
+  assertQueryError({ ...request, endAt: '2026-09-10' });
 });

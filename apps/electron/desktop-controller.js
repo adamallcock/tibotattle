@@ -1,5 +1,9 @@
 import { DESKTOP_TRAY_DEFAULTS, DESKTOP_TRAY_UPGRADE_DEFAULTS } from "./desktop-tray-preferences.js";
-import { DESKTOP_ACTIONS, DESKTOP_APPEARANCES } from "./desktop-contract.js";
+import {
+  DESKTOP_ACTIONS,
+  DESKTOP_APPEARANCES,
+  DESKTOP_REFRESH_MODES,
+} from "./desktop-contract.js";
 import {
   createDesktopAutomaticRefreshCadence,
   DESKTOP_AUTOMATIC_REFRESH_CADENCE_INTERVAL_MS,
@@ -18,10 +22,16 @@ const DASHBOARD_COMMANDS = Object.freeze({
   refresh: Object.freeze({ command: "refresh" }),
 });
 
-// The renderer keeps one immutable 121-minute operation deadline. This small
-// additional margin releases a lease after a crashed/replaced renderer while
-// still allowing a legitimate cold index pass to settle first.
-export const DESKTOP_REFRESH_LEASE_WATCHDOG_MS = 123 * 60_000;
+// The renderer emits a heartbeat every 30 seconds. Missing-heartbeat recovery
+// is intentionally mode-specific: quick work should recover promptly, while a
+// detailed renderer gets more tolerance for a busy presentation thread.
+export const DESKTOP_QUICK_REFRESH_HEARTBEAT_TIMEOUT_MS = 3 * 60_000;
+export const DESKTOP_DETAILED_REFRESH_HEARTBEAT_TIMEOUT_MS = 10 * 60_000;
+
+// The browser owns a 241-minute polling window. This independent deadline is
+// never renewed by heartbeat, so even a live but broken renderer cannot reserve
+// the desktop cadence indefinitely.
+export const DESKTOP_REFRESH_OPERATION_DEADLINE_MS = 243 * 60_000;
 
 // Native foreground refreshes reserve at most one detailed attempt per hour.
 // Keep this host-side constant separate from the user-configured quick timer:
@@ -434,9 +444,19 @@ export function createDesktopController({
   let disposed = false;
   let refreshTimer = null;
   let refreshInFlight = false;
-  let refreshLeaseWatchdogTimer = null;
+  let refreshHeartbeatWatchdogTimer = null;
+  let refreshDeadlineWatchdogTimer = null;
+  let lastKnownRefreshIntervalSeconds = 300;
   let refreshLeaseCounter = 0;
   let activeRefreshLease = null;
+  let activeRefreshMode = null;
+  let activeRefreshStartedAtMs = null;
+  let lastSettledRefreshLease = null;
+  let lastRefreshStartedAt = null;
+  let lastRefreshHeartbeatAt = null;
+  let lastRefreshSettledAt = null;
+  let lastRefreshRecoveredAt = null;
+  let lastRefreshRecoveryReason = null;
   let automaticRefreshTickInFlight = false;
   let operation = Promise.resolve();
   let activeCodexHome = null;
@@ -515,31 +535,119 @@ export function createDesktopController({
     refreshTimer = null;
   }
 
-  function stopRefreshLeaseWatchdog() {
-    if (refreshLeaseWatchdogTimer === null) return;
-    clearRecurringTimer(refreshLeaseWatchdogTimer);
-    refreshLeaseWatchdogTimer = null;
+  function stopRefreshHeartbeatWatchdog() {
+    if (refreshHeartbeatWatchdogTimer === null) return;
+    clearRecurringTimer(refreshHeartbeatWatchdogTimer);
+    refreshHeartbeatWatchdogTimer = null;
+  }
+
+  function stopRefreshDeadlineWatchdog() {
+    if (refreshDeadlineWatchdogTimer === null) return;
+    clearRecurringTimer(refreshDeadlineWatchdogTimer);
+    refreshDeadlineWatchdogTimer = null;
+  }
+
+  function stopRefreshLeaseWatchdogs() {
+    stopRefreshHeartbeatWatchdog();
+    stopRefreshDeadlineWatchdog();
+  }
+
+  function currentClockMilliseconds() {
+    let value;
+    try {
+      value = clock();
+    } catch {
+      value = 0;
+    }
+    return Number.isFinite(value) && value >= 0 ? Math.trunc(value) : 0;
+  }
+
+  function currentClockInstant() {
+    return new Date(currentClockMilliseconds()).toISOString();
   }
 
   function rearmRefreshTimerFromSettings() {
     return enqueue(async () => {
       if (disposed || refreshInFlight) return false;
-      const settings = await store.getSettings();
-      startRefreshTimer(settings.refreshIntervalSeconds);
+      let seconds = lastKnownRefreshIntervalSeconds;
+      try {
+        const settings = await store.getSettings();
+        seconds = settings.refreshIntervalSeconds;
+      } catch {
+        // Recovery must not lose cadence because the settings backend is
+        // briefly unavailable. The latest successfully armed interval remains
+        // bounded by the closed settings contract.
+      }
+      startRefreshTimer(seconds);
       return true;
     });
   }
 
-  function startRefreshLeaseWatchdog(lease) {
-    stopRefreshLeaseWatchdog();
-    refreshLeaseWatchdogTimer = setRecurringTimer(() => {
-      refreshLeaseWatchdogTimer = null;
-      if (activeRefreshLease !== lease) return;
-      activeRefreshLease = null;
-      refreshInFlight = false;
-      void rearmRefreshTimerFromSettings().catch(() => {});
-    }, DESKTOP_REFRESH_LEASE_WATCHDOG_MS);
-    refreshLeaseWatchdogTimer?.unref?.();
+  function recoverRefreshLease(lease, reason) {
+    if (activeRefreshLease !== lease) return false;
+    activeRefreshLease = null;
+    activeRefreshMode = null;
+    activeRefreshStartedAtMs = null;
+    refreshInFlight = false;
+    stopRefreshLeaseWatchdogs();
+    lastRefreshRecoveredAt = currentClockInstant();
+    lastRefreshRecoveryReason = reason;
+    void rearmRefreshTimerFromSettings().catch(() => {});
+    return true;
+  }
+
+  function startRefreshHeartbeatWatchdog(lease, mode) {
+    stopRefreshHeartbeatWatchdog();
+    const timeout = mode === "detailed"
+      ? DESKTOP_DETAILED_REFRESH_HEARTBEAT_TIMEOUT_MS
+      : DESKTOP_QUICK_REFRESH_HEARTBEAT_TIMEOUT_MS;
+    const timer = setRecurringTimer(() => {
+      if (refreshHeartbeatWatchdogTimer !== timer) return;
+      refreshHeartbeatWatchdogTimer = null;
+      recoverRefreshLease(lease, "heartbeat_timeout");
+    }, timeout);
+    refreshHeartbeatWatchdogTimer = timer;
+    refreshHeartbeatWatchdogTimer?.unref?.();
+  }
+
+  function startRefreshDeadlineWatchdog(lease) {
+    stopRefreshDeadlineWatchdog();
+    const timer = setRecurringTimer(() => {
+      if (refreshDeadlineWatchdogTimer !== timer) return;
+      refreshDeadlineWatchdogTimer = null;
+      recoverRefreshLease(lease, "operation_deadline");
+    }, DESKTOP_REFRESH_OPERATION_DEADLINE_MS);
+    refreshDeadlineWatchdogTimer = timer;
+    refreshDeadlineWatchdogTimer?.unref?.();
+  }
+
+  function refreshStatus() {
+    const now = currentClockMilliseconds();
+    const activeLeaseAgeSeconds = activeRefreshLease !== null
+      && Number.isSafeInteger(activeRefreshStartedAtMs)
+      ? Math.max(0, Math.floor((now - activeRefreshStartedAtMs) / 1_000))
+      : null;
+    return Object.freeze({
+      schemaVersion: "tibotattle-desktop-refresh-status-v1",
+      state: disposed
+        ? "disposed"
+        : activeRefreshLease !== null
+          ? "running"
+          : refreshTimer !== null
+            ? "scheduled"
+            : "idle",
+      mode: activeRefreshMode,
+      cadenceTimerArmed: refreshTimer !== null,
+      heartbeatWatchdogArmed: refreshHeartbeatWatchdogTimer !== null,
+      deadlineWatchdogArmed: refreshDeadlineWatchdogTimer !== null,
+      activeLease: activeRefreshLease !== null,
+      activeLeaseAgeSeconds,
+      lastStartedAt: lastRefreshStartedAt,
+      lastHeartbeatAt: lastRefreshHeartbeatAt,
+      lastSettledAt: lastRefreshSettledAt,
+      lastRecoveredAt: lastRefreshRecoveredAt,
+      lastRecoveryReason: lastRefreshRecoveryReason,
+    });
   }
 
   function armAutomaticRefreshFollowup(seconds) {
@@ -626,7 +734,10 @@ export function createDesktopController({
 
   function startRefreshTimer(seconds) {
     stopRefreshTimer();
-    if (disposed || refreshInFlight) return;
+    if (disposed || refreshInFlight
+        || !Number.isSafeInteger(seconds)
+        || seconds <= 0) return;
+    lastKnownRefreshIntervalSeconds = seconds;
     refreshTimer = setRecurringTimer(() => {
       // The desktop cadence is deliberately one-shot. The renderer reports a
       // terminal requestRefresh finally before another timer is armed, so a
@@ -704,7 +815,7 @@ export function createDesktopController({
 
   async function snapshot() {
     const settings = await store.getSettings();
-    const login = platform.loginItemStatus();
+    const login = await platform.loginItemStatus();
     const codexHomes = activeCodexHomes
       ?? (hasCodexHomesStore
         ? codexHomesPathFreeConfigurationFromSettings(settings)
@@ -731,7 +842,10 @@ export function createDesktopController({
           ? {}
           : { codexHomes: codexHomesSummary(codexHomes) }),
         refreshIntervalSeconds: settings.refreshIntervalSeconds,
-        startAtLogin: login,
+        startAtLogin: Object.freeze({
+          ...login,
+          canOpenSettings: desktopPlatform === "darwin" || desktopPlatform === "win32",
+        }),
         sidebarCollapsed: settings.sidebarCollapsed,
         notifications: notificationSnapshot(settings),
         tray: settings.tray ?? DESKTOP_TRAY_UPGRADE_DEFAULTS,
@@ -1204,11 +1318,11 @@ export function createDesktopController({
         // Persisted preferences may be unapplied defaults after native migration
         // or may differ from changes made in OS Settings. Only the observed OS
         // state can authorize a compensating change if persistence fails.
-        const previousLogin = platform.loginItemStatus();
+        const previousLogin = await platform.loginItemStatus();
         const previousEnabled = previousLogin?.status === "enabled"
           ? true
           : previousLogin?.status === "disabled" ? false : null;
-        const result = platform.setStartAtLogin(enabled);
+        const result = await platform.setStartAtLogin(enabled);
         const accepted = loginItemChangeAccepted(result, enabled);
         if (!accepted) throw controllerError("desktop_start_at_login_unconfirmed");
         try {
@@ -1219,7 +1333,7 @@ export function createDesktopController({
           }
           let rollback;
           try {
-            rollback = platform.setStartAtLogin(previousEnabled);
+            rollback = await platform.setStartAtLogin(previousEnabled);
           } catch {
             rollback = null;
           }
@@ -1369,34 +1483,67 @@ export function createDesktopController({
     async revealLocalData() {
       return revealLocalDataAction();
     },
-    async refreshStarted() {
+    async getRefreshStatus() {
+      return refreshStatus();
+    },
+    async refreshStarted({ mode } = {}) {
       if (disposed) return false;
+      if (!DESKTOP_REFRESH_MODES.includes(mode)) {
+        throw controllerError("desktop_refresh_mode_invalid");
+      }
       if (refreshLeaseCounter >= Number.MAX_SAFE_INTEGER) {
         throw controllerError("desktop_refresh_lease_exhausted");
+      }
+      if (activeRefreshLease !== null) {
+        stopRefreshLeaseWatchdogs();
+        lastRefreshRecoveredAt = currentClockInstant();
+        lastRefreshRecoveryReason = "superseded";
       }
       refreshLeaseCounter += 1;
       const lease = refreshLeaseCounter;
       activeRefreshLease = lease;
+      activeRefreshMode = mode;
+      activeRefreshStartedAtMs = currentClockMilliseconds();
+      lastRefreshStartedAt = new Date(activeRefreshStartedAtMs).toISOString();
+      lastRefreshHeartbeatAt = lastRefreshStartedAt;
       refreshInFlight = true;
       stopRefreshTimer();
-      startRefreshLeaseWatchdog(lease);
+      startRefreshHeartbeatWatchdog(lease, mode);
+      startRefreshDeadlineWatchdog(lease);
       return lease;
+    },
+    async refreshHeartbeat({ lease } = {}) {
+      if (disposed
+          || !Number.isSafeInteger(lease)
+          || lease <= 0
+          || activeRefreshLease !== lease
+          || !DESKTOP_REFRESH_MODES.includes(activeRefreshMode)) {
+        return false;
+      }
+      lastRefreshHeartbeatAt = currentClockInstant();
+      startRefreshHeartbeatWatchdog(lease, activeRefreshMode);
+      return true;
     },
     async refreshSettled({ lease } = {}) {
       if (disposed) return false;
+      if (Number.isSafeInteger(lease)
+          && lease > 0
+          && lastSettledRefreshLease === lease) {
+        return true;
+      }
       if (!Number.isSafeInteger(lease)
           || lease <= 0
           || activeRefreshLease !== lease) {
         return false;
       }
       activeRefreshLease = null;
+      activeRefreshMode = null;
+      activeRefreshStartedAtMs = null;
+      lastSettledRefreshLease = lease;
+      lastRefreshSettledAt = currentClockInstant();
       refreshInFlight = false;
-      stopRefreshLeaseWatchdog();
-      return enqueue(async () => {
-        const settings = await store.getSettings();
-        startRefreshTimer(settings.refreshIntervalSeconds);
-        return true;
-      });
+      stopRefreshLeaseWatchdogs();
+      return rearmRefreshTimerFromSettings();
     },
   });
 
@@ -1418,12 +1565,17 @@ export function createDesktopController({
       return emitDashboardCommand(DASHBOARD_COMMANDS.refresh);
     },
     toggleSidebar,
+    refreshStatus,
     reconcileDashboardSession() {
       if (disposed) return false;
       if (activeRefreshLease !== null) {
         activeRefreshLease = null;
+        activeRefreshMode = null;
+        activeRefreshStartedAtMs = null;
         refreshInFlight = false;
-        stopRefreshLeaseWatchdog();
+        stopRefreshLeaseWatchdogs();
+        lastRefreshRecoveredAt = currentClockInstant();
+        lastRefreshRecoveryReason = "dashboard_replaced";
       }
       void rearmRefreshTimerFromSettings().catch(() => {});
       return true;
@@ -1431,7 +1583,7 @@ export function createDesktopController({
     async dispose() {
       disposed = true;
       stopRefreshTimer();
-      stopRefreshLeaseWatchdog();
+      stopRefreshLeaseWatchdogs();
       await operation.catch(() => {});
     },
   });

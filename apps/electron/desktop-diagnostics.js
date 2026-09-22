@@ -4,7 +4,7 @@ import {
   DESKTOP_REFRESH_INTERVAL_SECONDS,
 } from "./desktop-contract.js";
 
-const DIAGNOSTICS_SCHEMA_VERSION = "tibotattle-electron-diagnostics-v1";
+const DIAGNOSTICS_SCHEMA_VERSION = "tibotattle-electron-diagnostics-v2";
 const PLATFORMS = new Set(["darwin", "win32", "linux"]);
 const ARCHITECTURES = new Set(["arm64", "x64", "ia32", "arm"]);
 const LOGIN_STATUSES = new Set([
@@ -35,6 +35,7 @@ const DIAGNOSTICS_KEYS = Object.freeze([
   "build",
   "lifecycle",
   "settings",
+  "refresh",
   "privacy",
 ]);
 const LIFECYCLE_KEYS = Object.freeze([
@@ -58,6 +59,29 @@ const PRIVACY_KEYS = Object.freeze([
   "includesPrivateData",
   "includesPaths",
   "includesCredentials",
+]);
+const REFRESH_KEYS = Object.freeze([
+  "schemaVersion",
+  "state",
+  "mode",
+  "cadenceTimerArmed",
+  "heartbeatWatchdogArmed",
+  "deadlineWatchdogArmed",
+  "activeLease",
+  "activeLeaseAgeSeconds",
+  "lastStartedAt",
+  "lastHeartbeatAt",
+  "lastSettledAt",
+  "lastRecoveredAt",
+  "lastRecoveryReason",
+]);
+const REFRESH_STATES = new Set(["scheduled", "running", "idle", "disposed"]);
+const REFRESH_MODES = new Set(["quick", "detailed"]);
+const REFRESH_RECOVERY_REASONS = new Set([
+  "heartbeat_timeout",
+  "operation_deadline",
+  "dashboard_replaced",
+  "superseded",
 ]);
 
 function assertExactRecord(value, keys, label) {
@@ -88,6 +112,17 @@ function assertBoolean(value, label) {
   return value;
 }
 
+function validInstant(value) {
+  if (typeof value !== "string" || value.length !== 24) return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+}
+
+function assertNullableInstant(value, label) {
+  if (value !== null && !validInstant(value)) throw new TypeError(`${label} is invalid`);
+  return value;
+}
+
 function strictDiagnosticsRecord(diagnostics) {
   const source = assertExactRecord(diagnostics, DIAGNOSTICS_KEYS, "diagnostics");
   if (source.schemaVersion !== DIAGNOSTICS_SCHEMA_VERSION
@@ -114,6 +149,34 @@ function strictDiagnosticsRecord(diagnostics) {
       || !LOGIN_STATUSES.has(settings.startAtLogin)
       || !NOTIFICATION_DELIVERIES.has(settings.notificationDelivery)) {
     throw new TypeError("diagnostics.settings is invalid");
+  }
+
+  const refresh = assertExactRecord(source.refresh, REFRESH_KEYS, "diagnostics.refresh");
+  if (refresh.schemaVersion !== "tibotattle-desktop-refresh-status-v1"
+      || !REFRESH_STATES.has(refresh.state)
+      || (refresh.mode !== null && !REFRESH_MODES.has(refresh.mode))
+      || (refresh.activeLeaseAgeSeconds !== null
+        && (!Number.isSafeInteger(refresh.activeLeaseAgeSeconds)
+          || refresh.activeLeaseAgeSeconds < 0))
+      || (refresh.lastRecoveryReason !== null
+        && !REFRESH_RECOVERY_REASONS.has(refresh.lastRecoveryReason))) {
+    throw new TypeError("diagnostics.refresh is invalid");
+  }
+  for (const key of [
+    "cadenceTimerArmed",
+    "heartbeatWatchdogArmed",
+    "deadlineWatchdogArmed",
+    "activeLease",
+  ]) {
+    assertBoolean(refresh[key], `diagnostics.refresh.${key}`);
+  }
+  for (const key of [
+    "lastStartedAt",
+    "lastHeartbeatAt",
+    "lastSettledAt",
+    "lastRecoveredAt",
+  ]) {
+    assertNullableInstant(refresh[key], `diagnostics.refresh.${key}`);
   }
 
   const privacy = assertExactRecord(source.privacy, PRIVACY_KEYS, "diagnostics.privacy");
@@ -146,6 +209,21 @@ function strictDiagnosticsRecord(diagnostics) {
       codexFolder: settings.codexFolder,
       startAtLogin: settings.startAtLogin,
       notificationDelivery: settings.notificationDelivery,
+    },
+    refresh: {
+      schemaVersion: refresh.schemaVersion,
+      state: refresh.state,
+      mode: refresh.mode,
+      cadenceTimerArmed: refresh.cadenceTimerArmed,
+      heartbeatWatchdogArmed: refresh.heartbeatWatchdogArmed,
+      deadlineWatchdogArmed: refresh.deadlineWatchdogArmed,
+      activeLease: refresh.activeLease,
+      activeLeaseAgeSeconds: refresh.activeLeaseAgeSeconds,
+      lastStartedAt: refresh.lastStartedAt,
+      lastHeartbeatAt: refresh.lastHeartbeatAt,
+      lastSettledAt: refresh.lastSettledAt,
+      lastRecoveredAt: refresh.lastRecoveredAt,
+      lastRecoveryReason: refresh.lastRecoveryReason,
     },
     privacy: {
       includesPrivateData: false,
@@ -214,6 +292,30 @@ function safeSettingsState(value) {
   });
 }
 
+function safeRefreshState(value) {
+  const source = value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : {};
+  const safeInstant = (candidate) => validInstant(candidate) ? candidate : null;
+  return Object.freeze({
+    schemaVersion: "tibotattle-desktop-refresh-status-v1",
+    state: REFRESH_STATES.has(source.state) ? source.state : "idle",
+    mode: REFRESH_MODES.has(source.mode) ? source.mode : null,
+    cadenceTimerArmed: safeBoolean(source.cadenceTimerArmed),
+    heartbeatWatchdogArmed: safeBoolean(source.heartbeatWatchdogArmed),
+    deadlineWatchdogArmed: safeBoolean(source.deadlineWatchdogArmed),
+    activeLease: safeBoolean(source.activeLease),
+    activeLeaseAgeSeconds: Number.isSafeInteger(source.activeLeaseAgeSeconds)
+      && source.activeLeaseAgeSeconds >= 0 ? source.activeLeaseAgeSeconds : null,
+    lastStartedAt: safeInstant(source.lastStartedAt),
+    lastHeartbeatAt: safeInstant(source.lastHeartbeatAt),
+    lastSettledAt: safeInstant(source.lastSettledAt),
+    lastRecoveredAt: safeInstant(source.lastRecoveredAt),
+    lastRecoveryReason: REFRESH_RECOVERY_REASONS.has(source.lastRecoveryReason)
+      ? source.lastRecoveryReason : null,
+  });
+}
+
 /**
  * Build a deliberately content-free diagnostics record. The inputs are
  * reduced to closed enums and booleans here so a future caller cannot
@@ -227,6 +329,7 @@ export function createDesktopDiagnostics({
   build,
   lifecycle,
   settings,
+  refresh,
 } = {}) {
   return Object.freeze({
     schemaVersion: DIAGNOSTICS_SCHEMA_VERSION,
@@ -236,6 +339,7 @@ export function createDesktopDiagnostics({
     build: safeLabel(build),
     lifecycle: safeLifecycleState(lifecycle),
     settings: safeSettingsState(settings),
+    refresh: safeRefreshState(refresh),
     privacy: Object.freeze({
       includesPrivateData: false,
       includesPaths: false,

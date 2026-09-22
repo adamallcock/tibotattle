@@ -18,6 +18,7 @@ import {
   renderCommunityAllowanceSection,
   renderCommunityDailySeries,
 } from "../public/community-view.js";
+import { SUPPORTED_LOCALES, translate } from "../public/localization.js";
 import {
   HOMEBREW_INSTALL_COMMAND,
   copyInstallerChecksum,
@@ -526,7 +527,10 @@ test("the first visit leads with the product, platform choice, and daily communi
   assert.match(html, /<section class="product-hero"[^>]*id="install"/u);
   assert.match(html, /src="\.\/tibotattle-icon\.png"/u);
   assert.match(html, /src="\.\/apple\.svg"/u);
-  assert.match(html, /<section class="community-window" aria-labelledby="community-allowance-heading">/u);
+  assert.match(
+    html,
+    /<section class="community-window" id="allowance" tabindex="-1" aria-labelledby="community-allowance-heading">/u,
+  );
   assert.match(html, /Community view/u);
   assert.match(html, /id="community-allowance-figure"/u);
   assert.doesNotMatch(
@@ -1201,7 +1205,10 @@ test("the public guidance pages are useful stubs without app-only controls", asy
   assert.match(privacy, /Known off, paused, or\s+disconnected installations stay off/u);
   assert.match(privacy, /Unreadable or uncertain preference state does not\s+enable sharing/u);
   assert.match(privacy, /does not prove a unique person/u);
-  assert.match(privacy, /Accountless contributions are currently excluded from public/u);
+  assert.match(privacy, /Eligible contributions from signed-in or accountless installations can enter the public community sample/u);
+  assert.match(privacy, /Separate installations may submit overlapping history/u);
+  assert.match(privacy, /Previously released sealed weekly snapshots retain their original eligibility rules/u);
+  assert.doesNotMatch(privacy, /Accountless contributions are currently excluded/u);
   assert.doesNotMatch(privacy, /Nothing is contributed unless|one-person account boundary/u);
   assert.doesNotMatch(docs, /Contribution stays off until|one pseudonymous person|delete the complete hosted participation/u);
   for (const page of [docs, privacy]) {
@@ -1299,8 +1306,7 @@ test("the community allowance surface leads the product hero with honest labelin
   assert.match(html, /id="community-allowance-result"/u);
   assert.match(html, /id="community-allowance-state"/u);
   assert.match(html, /id="community-allowance-range-controls"/u);
-  // The allowance figure occupies the hero. The compact daily-activity
-  // disclosure follows it, before the supporting feature strip.
+  // Community evidence remains in the original hero; app features follow.
   const heroIndex = html.indexOf('class="product-hero"');
   const featureIndex = html.indexOf('id="how-it-works"');
   const communityIndex = html.indexOf('id="community"');
@@ -1617,7 +1623,10 @@ test("a published daily series renders friendly cumulative activity, latest-firs
     "Turns counted",
     "All tokens counted",
   ]);
-  assert.deepEqual(values, ["Aug 7, 2026", "—", "240", "3K"]);
+  // "240" and "3.0K" rather than "240" and "3K": the headline stat cards carry
+  // at least two significant figures, so a million-odd turns cannot render as
+  // a bare "1M" that reads like a placeholder and hides a two-to-one range.
+  assert.deepEqual(values, ["Aug 7, 2026", "—", "240", "3.0K"]);
   assert.deepEqual(details, [
     "Most recent community day",
     "API-equivalent spend unavailable; not an actual bill",
@@ -2026,8 +2035,8 @@ function allowanceBlock(overrides = {}) {
     normalization: "pro_x1_prolite_x4_plus_x20",
     windowDurationMinutes: 10_080,
     trailingDays: 30,
-    qualification: "shared_reset_fit_gates_40pp_span_floor",
-    spanFloorPp: 40,
+    qualification: "shared_reset_fit_gates_25pp_span_floor",
+    spanFloorPp: 25,
     fitCount: 5,
     participantCount: 1,
     centralUsd: 1879,
@@ -2223,9 +2232,9 @@ test("the allowance section renders the estimate with its visible caveat", () =>
   // The plausible range is spelled out beside the central number.
   assert.match(container.text, /\$1,500/u);
   assert.match(container.text, /\$2,300/u);
-  // The participant count is visible copy, not a tooltip: with one account
-  // contributing, the page says so plainly.
-  assert.match(container.text, /from 1 contributing account\b/u);
+  // The source count is visible copy, not a tooltip; it does not imply a
+  // unique person or verified provider account.
+  assert.match(container.text, /from 1 contribution source\b/u);
   assert.match(container.text, /5 qualifying reset fits in the trailing 30 days/u);
   assert.match(container.text, /Latest published estimate \(Aug 7, 2026\)/u);
   assert.doesNotMatch(container.text, /Latest published estimate \(Aug 6, 2026\)/u);
@@ -2347,7 +2356,45 @@ test("the allowance section follows the active UI language", () => {
     }),
   });
   assert.equal(stateNode.textContent, "额度估计可用");
-  assert.match(container.text, /来自 1 个贡献账户/u);
+  assert.match(container.text, /来自 1 个贡献来源/u);
+});
+
+test("source-count labels and overlap disclosure render in every public language", () => {
+  for (const [locale, sourceLabel, pluralLabel, identity, overlap] of [
+    ["en-US", "contribution source", "contribution sources", "not a unique person or verified OpenAI account", "overlapping history"],
+    ["zh-Hans", "个贡献来源", "个贡献来源", "不代表唯一用户或经验证的 OpenAI 账户", "重叠历史"],
+    ["es", "fuente de contribución", "fuentes de contribución", "no una persona única ni una cuenta de OpenAI verificada", "historial solapado"],
+  ]) {
+    for (const count of [1, 3]) {
+      const documentRef = fakeDocument();
+      documentRef.documentElement.lang = locale;
+      const container = documentRef.createElement("div");
+      const payload = publishedDailySeries({ days: [allowanceDay("2026-08-07", allowanceBlock({ participantCount: count }))] });
+      const before = structuredClone(payload);
+      assert.equal(renderCommunityAllowanceSection({ documentRef, container, payload }), "published");
+      assert.ok(container.text.includes(`${count} ${count === 1 ? sourceLabel : pluralLabel}`), locale);
+      assert.ok(container.text.includes(identity), locale);
+      assert.ok(container.text.includes(overlap), locale);
+      assert.deepEqual(payload, before, "presentation must not change sample counts or estimates");
+      const daily = documentRef.createElement("div");
+      renderCommunityDailySeries({ documentRef, container: daily, payload });
+      assert.ok(daily.text.includes(identity), locale);
+      assert.ok(daily.text.includes(overlap), locale);
+    }
+  }
+});
+
+test("public sample privacy paragraphs have explicit translations and retain the legacy snapshot boundary", async () => {
+  const privacy = await readFile(PRIVACY_HTML, "utf8");
+  for (const key of ["community.privacy.heading", "community.privacy.sample", "community.privacy.smallSample", "community.privacy.publicationRules"]) {
+    assert.ok(privacy.includes(`data-i18n="${key}"`));
+    for (const locale of ["en-US", "es", "zh-Hans"]) {
+      const copy = translate(key, {}, locale);
+      assert.notEqual(copy, key);
+      assert.ok(copy.length > (key === "community.privacy.heading" ? 2 : 30));
+      if (locale !== "en-US") assert.notEqual(copy, translate(key, {}, "en-US"));
+    }
+  }
 });
 
 test("Intel download rendering stays independent and refuses partial or ARM metadata", () => {
@@ -2513,4 +2560,490 @@ test("the install card refuses a partially injected release", () => {
       false,
     );
   }
+});
+
+// Every interactive panel in the feature tour is fed synthetic input. The
+// labels that say so are the only thing separating a demonstration from an
+// implied measurement, so they are pinned in both the served markup and the
+// catalog entry the markup points at.
+test("the feature tour labels every demonstration as synthetic in markup and catalog", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  for (const [label, key] of [
+    ["Synthetic demonstration", "site.features.insightExample"],
+    ["not measured results", "site.features.insightExample"],
+    ["Illustrative scenario · not a live allowance", "site.features.example"],
+    ["Synthetic example week", "site.features.weekExample"],
+  ]) {
+    assert.ok(html.includes(label), `served markup states "${label}"`);
+    assert.ok(
+      translate(key, {}, "en-US").includes(label),
+      `${key} states "${label}"`,
+    );
+    assert.ok(
+      html.includes(`data-i18n="${key}"`),
+      `${key} is wired for translation`,
+    );
+  }
+  // The pace demonstration ships pre-rendered in its "way over pace" state:
+  // the badge, the verdict copy and the pressed control must agree before any
+  // script runs, and none of them may be untranslated literals.
+  assert.match(html, /data-pace-demo data-pace="way"/u);
+  assert.match(html, /data-demo-verdict data-i18n="site\.features\.wayCopy"/u);
+  assert.match(html, /data-forecast-badge data-i18n="site\.features\.way"/u);
+  assert.match(
+    html,
+    /data-demo-pace="way" aria-pressed="true"/u,
+  );
+  assert.match(
+    html,
+    /id="week-demo"[^>]*data-i18n-aria-label="site\.features\.weekLabel"/u,
+  );
+});
+
+/**
+ * Reports whether `index` in `html` falls inside a `<details>` element that
+ * ships without the `open` attribute. A link that scrolls to content a
+ * closed disclosure is hiding is worse than no link, so every published
+ * anchor is checked against this rather than against a rendered page.
+ */
+function insideClosedDetails(html, index) {
+  const tags = /<details\b([^>]*)>|<\/details>/gu;
+  const open = [];
+  for (let match = tags.exec(html); match !== null; match = tags.exec(html)) {
+    if (match.index >= index) break;
+    if (match[0].startsWith("</")) open.pop();
+    else open.push(/\bopen\b/u.test(match[1]));
+  }
+  // A closing tag before `index` pops its frame, so anything still on the
+  // stack encloses the position.
+  return open.some((isOpen) => isOpen === false);
+}
+
+test("every figure on the page carries a legible TiboTattle credit", async () => {
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  const matrix = await readFile(
+    new URL("../public/cache-reuse-matrix.css", import.meta.url),
+    "utf8",
+  );
+  const html = await readFile(SITE_HTML, "utf8");
+
+  // One treatment, shared by every figure that carries it.
+  const shared = styles.match(
+    /\.community-site \.cache-matrix-view::after,\n\.community-site \.performance-plot::after,\n\.community-site #usage-timeline-chart::after,\n\.community-site \.community-daily-chart::after \{([\s\S]*?)\n\}/u,
+  );
+  assert.ok(shared, "the page's figures share one credit treatment");
+  const credit = shared[1];
+  // The empty alternative text is what keeps generated content out of the
+  // accessible tree; plain `content: "TiboTattle"` would be announced, and it
+  // only repeats the wordmark the header and footer already state.
+  assert.match(credit, /content:\s*"TiboTattle"\s*\/\s*"";/u);
+  // It sits on top of the plot, so it must not take the chart's own hits.
+  assert.match(credit, /pointer-events:\s*none;/u);
+  assert.match(credit, /user-select:\s*none;/u);
+  assert.match(credit, /position:\s*absolute;/u);
+  assert.match(credit, /z-index:\s*2;/u);
+  // Icon and wordmark, not a wash: the shipped mark at a real size, in the
+  // page's display face, with no transparency dialled into it.
+  assert.match(credit, /background:\s*url\("\.\/tibotattle-icon\.png"\)[^;]*13px 13px;/u);
+  assert.match(credit, /font-family:\s*var\(--serif\);/u);
+  assert.match(credit, /font-size:\s*11px;/u);
+  assert.doesNotMatch(credit, /opacity|filter|rgb\([^)]*\/\s*\d?\d%\)/u);
+  assert.ok(
+    html.includes('src="./tibotattle-icon.png"'),
+    "the mark the credit draws is already shipped with the page",
+  );
+
+  // Each figure is positioned against its own empty region. Identical offsets
+  // across four differently shaped charts would mean none of them was placed.
+  const position = (selector, expected = 1) => {
+    const sheet = selector.startsWith(".cache-matrix") ? matrix : styles;
+    // The shared treatment ends with one of these selectors too, so take the
+    // block that actually places the credit rather than the first match.
+    // `#` is not an escapable character in a unicode-mode pattern.
+    const pattern = new RegExp(
+      `${selector.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}::after \\{([\\s\\S]*?)\\n\\}`,
+      "gu",
+    );
+    const bodies = [...sheet.matchAll(pattern)]
+      .map((match) => match[1].replace(/\s+/gu, " ").trim())
+      .filter((body) => /inset-/u.test(body) && !body.includes("content:"));
+    assert.equal(
+      bodies.length,
+      expected,
+      `${selector} states where its credit sits, once per layout it has`,
+    );
+    return bodies[0];
+  };
+  const positions = [
+    // Two: the wide plot and the stacked one, switched by container width.
+    position(".cache-matrix-view", 2),
+    position(".community-site .performance-plot"),
+    position(".community-site #usage-timeline-chart"),
+    position(".community-site .community-daily-chart"),
+  ];
+  for (const rule of positions) {
+    assert.match(rule, /inset-(block|inline)-(start|end):/u);
+  }
+  assert.ok(
+    new Set(positions).size > 1,
+    "the four figures do not all take the same corner",
+  );
+  // The two charts that are not positioned containers of their own have to
+  // become one, or the credit escapes to the nearest ancestor that is.
+  assert.match(styles, /\.community-site \.community-daily-chart \{ position: relative; \}/u);
+  assert.match(
+    styles,
+    /\.community-site #usage-timeline-chart \{ position: relative; container-type: inline-size; \}/u,
+  );
+  // That lane holds a 900:150 ratio, so on a phone it is barely seventy
+  // pixels tall and its series reaches every corner. The credit withdraws on
+  // the lane's own width rather than covering the data it is crediting.
+  assert.match(
+    styles,
+    /@container \(max-width: 399px\) \{[\s\S]*?\.community-site #usage-timeline-chart::after \{ content: none; \}/u,
+  );
+
+  // The cache plot switches layout on its own measured width, so its credit
+  // follows the same measurement rather than a viewport breakpoint that only
+  // happens to line up on one page.
+  const renderer = await readFile(
+    new URL("../public/cache-reuse-matrix.js", import.meta.url),
+    "utf8",
+  );
+  const narrowAt = renderer.match(/const narrow = w < (\d+);/u);
+  assert.ok(narrowAt, "the renderer states the width at which it stacks rows");
+  assert.match(matrix, /\.cache-matrix-view \{[^}]*container-type: inline-size;/u);
+  assert.match(
+    matrix,
+    new RegExp(
+      `@container \\(max-width: ${Number(narrowAt[1]) - 1}px\\) \\{\\s*\\.cache-matrix-view::after \\{[^}]*inset-block-start: 3px;`,
+      "u",
+    ),
+    "the stacked layout moves the credit at the renderer's own threshold",
+  );
+  const viewportBlock = matrix.match(/@media \(max-width: 540px\) \{([\s\S]*?)\n\}/u);
+  assert.ok(viewportBlock, "the instrument keeps its narrow viewport rules");
+  assert.doesNotMatch(
+    viewportBlock[1],
+    /cache-matrix-view::after/u,
+    "the credit does not also answer to a viewport breakpoint",
+  );
+
+  // The hero window states the wordmark in its own title bar, so the chart
+  // inside it does not state it twice.
+  assert.match(
+    styles,
+    /\.community-site \.hero-community-allowance \.community-daily-chart::after \{\s*content: none;/u,
+  );
+  assert.match(html, /class="community-window-brand">\s*<img src="\.\/tibotattle-icon\.png"/u);
+  // Forced palettes repaint it as solid text over the plot, so it withdraws.
+  assert.match(
+    matrix,
+    /@media \(forced-colors: active\) \{[\s\S]*?\.cache-matrix-view::after \{ content: none; \}/u,
+  );
+  assert.match(
+    styles,
+    /@media \(forced-colors: active\) \{[\s\S]*?\.community-site \.community-daily-chart::after \{\s*content: none;/u,
+  );
+});
+
+test("the band opens on its chart, with its figures hosted in the hero", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  // The disclosure stays -- the published-site contract pins its summary --
+  // but it no longer hides the page's community evidence behind a click.
+  assert.match(html, /<details class="community-method" open>/u);
+  assert.match(
+    html,
+    /<summary id="community-method-summary"[^>]*>See community activity<\/summary>/u,
+  );
+  assert.equal(
+    insideClosedDetails(html, html.indexOf('id="community-daily-result"')),
+    false,
+    "the figures the daily renderer writes are not behind a closed disclosure",
+  );
+  // The figures now lead the hero instead, so the band opens on its chart and
+  // must not keep a gap where they used to sit.
+  assert.match(
+    styles,
+    /\.community-site \.community-proof \.community-daily-chart:first-child \{\s*margin-top: 0;/u,
+  );
+  // Open by default, the summary is the band's rule, so the heading below it
+  // does not draw a second one.
+  assert.match(
+    styles,
+    /\.community-site \.community-method\[open\] > summary \{[^}]*border-bottom: 1px solid var\(--line\);/u,
+  );
+  assert.match(
+    styles,
+    /\.community-site \.community-method\[open\] \.activity-heading \{[^}]*border-top: 0;/u,
+  );
+});
+
+test("the page's major sections carry stable, reachable anchors", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  const anchors = [
+    "install",
+    "allowance",
+    "community",
+    "features",
+    "pace",
+    "usage-history",
+    "cache-continuity",
+    "model-speeds",
+    "allowance-value",
+    "how-it-works",
+  ];
+  for (const anchor of anchors) {
+    const index = html.indexOf(`id="${anchor}"`);
+    assert.ok(index >= 0, `#${anchor} is published`);
+    assert.equal(
+      html.indexOf(`id="${anchor}"`, index + 1),
+      -1,
+      `#${anchor} is defined once`,
+    );
+    assert.equal(
+      insideClosedDetails(html, index),
+      false,
+      `#${anchor} is not inside a disclosure that starts closed`,
+    );
+  }
+  // The sticky header is cleared by the root scroll padding, once, for every
+  // target. A per-anchor scroll margin would stack on top of it and drop each
+  // destination about a header's height too low.
+  assert.match(styles, /html \{ scroll-behavior: smooth; scroll-padding-top: 95px; \}/u);
+  assert.doesNotMatch(styles, /\.community-site #[a-z-]+,\s*\n/u);
+  // A pasted link must move the keyboard as well as the viewport.
+  for (const anchor of ["allowance", "pace", "usage-history", "cache-continuity", "model-speeds", "allowance-value"]) {
+    assert.match(
+      html,
+      new RegExp(`id="${anchor}" tabindex="-1"`, "u"),
+      `#${anchor} takes programmatic focus`,
+    );
+  }
+  // The established destinations keep their names: the app and the header
+  // already link to them.
+  assert.match(html, /<a href="#how-it-works">/u);
+  assert.match(html, /<a href="#community">/u);
+});
+
+test("the two closing tour cards are one component pair", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  const styles = await readFile(new URL("../public/feature-tour.css", import.meta.url), "utf8");
+  const section = html.slice(
+    html.indexOf('<div class="tour-bottom">'),
+    html.indexOf('<section class="tour-cta">'),
+  );
+  assert.ok(section.includes("Follow the tokens to the work."));
+  assert.ok(section.includes("Personal by design."));
+  // Identical header structure: both cards lead with the same head row.
+  assert.equal(
+    section.match(/<div class="tour-bottom-head">/gu)?.length,
+    2,
+    "both cards open with the same header row",
+  );
+  // The device mark rides inside that row instead of floating out of flow.
+  assert.match(
+    section,
+    /<div class="tour-bottom-head">\s*<p class="tour-eyebrow" data-i18n="site\.features\.local">On your device<\/p>\s*<span class="tour-local" aria-hidden="true">◎<\/span>\s*<\/div>/u,
+  );
+  assert.doesNotMatch(section, /<div class="tour-local"/u);
+  // Copy is unchanged: this was a layout repair, not a rewrite.
+  assert.match(section, /data-i18n="site\.features\.cost">Tokens → Models → Projects → Threads<\/p>/u);
+  assert.match(section, /data-i18n="site\.features\.projectsCopy">Drill into projects and threads\./u);
+  assert.match(section, /data-i18n="site\.features\.privacyCopy">Your personal analysis runs locally\./u);
+  // A shared row grid is what lines the titles and bodies up across columns.
+  assert.match(styles, /\.tour-bottom \{[^}]*grid-template-rows: auto auto auto;[^}]*gap: 0 28px;/u);
+  assert.match(styles, /\.tour-bottom article \{[^}]*grid-row: span 3;[^}]*grid-template-rows: subgrid;/u);
+  // Stacked, there is nothing to align with, so the shared grid withdraws and
+  // the gap between the two cards comes back.
+  assert.match(
+    styles,
+    /@media \(max-width: 560px\) \{[\s\S]*?\.tour-bottom \{ grid-template-columns: 1fr; grid-template-rows: none; row-gap: 28px; \}[\s\S]*?\.tour-bottom article \{ grid-row: auto; display: block; \}/u,
+  );
+  // The header row, the title and the body keep one rhythm in both cards.
+  assert.match(styles, /\.tour-bottom-head \{[^}]*min-height: 44px;[^}]*margin-bottom: 18px;/u);
+  assert.match(styles, /\.tour-bottom article h3 \{ margin: 0 0 16px; \}/u);
+  // The half-width card gets a title sized to itself, so neither heading has
+  // to wrap while the other sits on one line.
+  assert.match(
+    styles,
+    /\.community-site \.tour-bottom article h3 \{[^}]*font-size: clamp\(22px, 2\.2vw, 30px\);/u,
+  );
+  assert.doesNotMatch(styles, /\.tour-local \{[^}]*float:/u);
+});
+
+test("the community's contribution figures sit in the hero, below the download", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  const source = await readFile(SITE_SOURCE, "utf8");
+  const view = await readFile(new URL("../public/community-view.js", import.meta.url), "utf8");
+
+  // The host is in the hero's copy column, below the whole download cluster:
+  // that ordering is the whole point, so it is asserted, not the mere
+  // presence of the id. Nothing the figures do may push the download down.
+  const heroStart = html.indexOf('class="product-hero"');
+  const ledeIndex = html.indexOf('class="hero-lede"');
+  const hostIndex = html.indexOf('id="community-contribution-summary"');
+  const downloadIndex = html.indexOf('id="download"');
+  const lastPanelIndex = html.indexOf('id="platform-panel-linux"');
+  const heroColumnEnd = html.indexOf('class="community-window"');
+  const bandIndex = html.indexOf('id="community-daily-result"');
+  assert.ok(hostIndex >= 0, "the hero carries the contribution host");
+  assert.ok(heroStart >= 0 && ledeIndex > heroStart);
+  assert.ok(downloadIndex > ledeIndex, "the download still follows the hero lede");
+  assert.ok(lastPanelIndex > downloadIndex, "the platform panels are the download cluster");
+  assert.ok(hostIndex > lastPanelIndex, "the figures come after the whole download cluster");
+  assert.ok(hostIndex < heroColumnEnd, "the figures stay in the hero's copy column");
+  assert.ok(heroColumnEnd < bandIndex, "the activity band still follows the hero");
+  // The published-platform contract slices between the last platform panel
+  // and the community link and asserts what each panel does and does not
+  // contain. Keeping the host after that link is what keeps it out of the
+  // Linux panel's slice; before it, this markup would be read as part of it.
+  const communityLinkIndex = html.indexOf('class="community-inline"');
+  assert.ok(communityLinkIndex > lastPanelIndex);
+  assert.ok(
+    hostIndex > communityLinkIndex,
+    "the figures stay outside the slice the platform contract reads",
+  );
+  assert.equal(
+    insideClosedDetails(html, hostIndex),
+    false,
+    "the hero figures are not behind a disclosure that starts closed",
+  );
+
+  // The page and the renderer have to agree on the host, or the figures
+  // silently stay in the band.
+  assert.match(source, /summaryContainer: \$\("#community-contribution-summary"\)/u);
+  // A hero host outside the rebuilt container must be replaced, never
+  // appended to, or every refresh stacks another copy of the figures.
+  assert.match(view, /summaryContainer\.replaceChildren\(quality\);/u);
+  assert.doesNotMatch(view, /summaryContainer\.append\(/u);
+
+  // Unlabelled in the hero, four totals read as the reader's own usage. The
+  // frame is translated copy, not a literal.
+  assert.match(
+    html,
+    /<h2\s+id="hero-contribution-heading"\s+data-i18n="community\.contribution\.heroHeading"\s*>Contributed by the community so far<\/h2>/u,
+  );
+  assert.match(html, /aria-labelledby="hero-contribution-heading"/u);
+  const headings = SUPPORTED_LOCALES.map(
+    (locale) => translate("community.contribution.heroHeading", {}, locale),
+  );
+  assert.equal(headings.length, 3);
+  for (const heading of headings) {
+    assert.notEqual(heading, "community.contribution.heroHeading");
+    assert.doesNotMatch(heading, /\{/u, "the frame takes no placeholders");
+  }
+  assert.equal(new Set(headings).size, 3, "each locale states it in its own words");
+
+  // Hidden unless the page holds current evidence. The renderer leaves the
+  // host untouched on an unavailable or retained answer, so without this the
+  // hero would keep claiming figures the page can no longer stand behind.
+  assert.match(styles, /\.community-site \.hero-contribution \{ display: none; \}/u);
+  assert.match(
+    styles,
+    /\.community-site:has\(\.community-inline\[data-live="true"\]\) \.hero-contribution \{\s*display: block;/u,
+  );
+
+  // The renderer hands over the same `dl` it writes into the band, so the
+  // hero styles that markup rather than expecting different DOM.
+  const cell = styles.match(
+    /\.community-site \.hero-contribution \.snapshot-quality-grid > div \{([\s\S]*?)\n\}/u,
+  );
+  assert.ok(cell, "the hero styles the renderer's own cells");
+  assert.match(cell[1], /grid-template-rows: subgrid;/u);
+  assert.match(cell[1], /grid-row: span 3;/u);
+  const figure = styles.match(
+    /\.community-site \.hero-contribution \.snapshot-quality-grid dd \{([\s\S]*?)\n\}/u,
+  );
+  assert.ok(figure, "the hero figures carry their own type scale");
+  assert.match(figure[1], /font-family:\s*var\(--serif\);/u);
+  assert.match(figure[1], /font-variant-numeric:\s*tabular-nums;/u);
+  // Each figure keeps its qualifier: a spend total that does not say it is
+  // not a bill, or a count with no stated window, overstates the evidence.
+  const detail = styles.match(
+    /\.community-site \.hero-contribution \.snapshot-quality-grid small \{([\s\S]*?)\n\}/u,
+  );
+  assert.ok(detail, "the hero keeps the qualifier under each figure");
+  assert.match(detail[1], /display: block;/u);
+  assert.doesNotMatch(detail[1], /display: none|visibility: hidden|content-visibility/u);
+});
+
+test("the cache chart's unit noun is the same measurement in every locale", async () => {
+  // The chart counts requests that followed a previous one, not user turns.
+  // Two locales said "turn" while English said "follow-up", which described a
+  // different measurement to a reader who could not check the English.
+  const { EN_US_CATALOG, ZH_HANS_CATALOG, ES_CATALOG } = await import(
+    "../public/i18n.generated.js"
+  );
+  const family = Object.keys(EN_US_CATALOG)
+    .filter((key) => key.startsWith("accounting.cacheContinuity.matrix."));
+  assert.ok(family.length > 20, "the matrix family is present in the mirror");
+
+  const counted = family.filter((key) => /follow-up/u.test(EN_US_CATALOG[key]));
+  assert.ok(counted.length >= 5, "several keys name what the chart counts");
+  for (const key of counted) {
+    assert.doesNotMatch(ZH_HANS_CATALOG[key], /轮次/u, `${key} (zh-Hans) says turn`);
+    assert.match(ZH_HANS_CATALOG[key], /后续请求/u, `${key} (zh-Hans) names the request`);
+    assert.doesNotMatch(ES_CATALOG[key], /turnos?\b/u, `${key} (es) says turn`);
+    // Singular and plural both, so `unitOne` cannot drift from `unit`.
+    assert.match(
+      ES_CATALOG[key],
+      /solicitud(?:es)? posterior(?:es)?/u,
+      `${key} (es) names the request`,
+    );
+  }
+  // No key in the family may reintroduce it anywhere else either.
+  for (const key of family) {
+    assert.doesNotMatch(ZH_HANS_CATALOG[key], /轮次/u, `${key} (zh-Hans)`);
+    assert.doesNotMatch(ES_CATALOG[key], /turnos?\b/u, `${key} (es)`);
+    assert.doesNotMatch(EN_US_CATALOG[key], /\bturns?\b/u, `${key} (en-US)`);
+  }
+});
+
+test("the measured cache section styles its period control and its caveat", async () => {
+  const styles = await readFile(new URL("../public/feature-tour.css", import.meta.url), "utf8");
+  const source = await readFile(
+    new URL("../public/feature-insights.js", import.meta.url),
+    "utf8",
+  );
+  // Both are inserted above the plot once measured evidence arrives, so both
+  // have to be styled for that position rather than left unstyled.
+  assert.match(source, /className='insight-demo-periods'/u);
+  assert.match(source, /className='insight-demo-ties'/u);
+  assert.match(source, /className='insight-demo-period-note'/u);
+
+  // The period control reads as interactive: a pressed state, a hover, a
+  // focus ring, and a target tall enough to hit.
+  const button = styles.match(/\.insight-demo-periods button \{([^}]*)\}/u);
+  assert.ok(button, "the period buttons are styled as controls");
+  assert.match(button[1], /cursor:pointer/u);
+  const minHeight = Number(button[1].match(/min-height:(\d+)px/u)?.[1]);
+  assert.ok(minHeight >= 24, `period buttons meet the 24px target (got ${minHeight})`);
+  assert.match(styles, /\.insight-demo-periods button\[aria-pressed="true"\] \{[^}]*background:#1d4b3e;/u);
+  assert.match(styles, /\.insight-demo-periods button:hover \{/u);
+  assert.match(styles, /\.insight-demo-periods button:focus-visible \{[^}]*outline:/u);
+
+  // The caveat reads as a caveat: quieter than the section label above it,
+  // held to a readable measure, and not dressed as a warning.
+  const label = styles.match(/\.insight-demo-label \{([^}]*)\}/u);
+  const ties = styles.match(/\.insight-demo-ties \{([^}]*)\}/u);
+  assert.ok(label && ties, "the label and the caveat are both styled");
+  const size = (rule) => Number(rule.match(/font-size:(\d+(?:\.\d+)?)px/u)?.[1]);
+  assert.ok(
+    size(ties[1]) < size(label[1]),
+    `the caveat sits below the label's weight (${size(ties[1])} vs ${size(label[1])})`,
+  );
+  assert.match(ties[1], /max-width:\d+ch/u, "the caveat is held to a readable measure");
+  assert.doesNotMatch(ties[1], /background|border|font-weight:\s*(6|7|8)/u);
+  // An empty period is an absence of evidence, so it is not painted in the
+  // caveat's tone: the two say different things.
+  const note = styles.match(/\.insight-demo-period-note \{([^}]*)\}/u);
+  assert.ok(note, "an empty period states itself");
+  assert.notEqual(
+    note[1].match(/color:([^;]+);/u)?.[1],
+    ties[1].match(/color:([^;]+);/u)?.[1],
+  );
 });

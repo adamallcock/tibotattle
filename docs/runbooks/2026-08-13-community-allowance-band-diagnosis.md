@@ -87,18 +87,23 @@ nothing differs, nothing republishes — a correct fit set that never reaches a
 changed day will not surface until a day's expected value moves.
 
 The resumable scheduler budgets both D1 bindings together and runs essential
-maintenance first. Check `BOUNDED_ANALYSIS_PROGRESS`, deferred reasons and
-`queriesUsed` across natural scheduled invocations. Heavy required work may
-defer a large completed checkpoint before loading it. New activity-only days
-retain their queue entry for a later complete allowance rebuild.
+maintenance first. Its 40-second graph window begins after required work and
+bounded weekly publication, without resetting the statement budget. Inspect
+`scheduled_graph_admission` for preceding phase durations and the newly available
+window. Check `BOUNDED_ANALYSIS_PROGRESS`, deferred reasons and `queriesUsed`
+across natural scheduled invocations. Heavy required work can still consume
+enough statements to defer a large checkpoint. Weekly build failures are isolated
+and cannot abort graph admission; losing the outer maintenance lease still stops
+the invocation. New activity-only days retain their queue entry for a later
+complete allowance rebuild.
 
 For a preview that is not advancing despite current account caches, inspect the natural
 invocation's wall time and `admin_allowance_preview_cache` phase timing, not
 only lifecycle `last_completed_at`. That stamp is written before optional
-analytics. Even UTC minutes attempt `before_analysis` publication; incomplete
-inputs retry `after_analysis`. Odd minutes preserve reconstruction's full budget
-and only attempt `after_analysis` publication. Both run before daily
-reconciliation. Refreshed rows and
+analytics. A three-minute rotation gives preview publication, current account
+calculation, and historical reconstruction first use of the graph window in
+turn. Incomplete preview inputs retry `after_analysis`; daily publication and
+remaining historical work use the available budget. Refreshed rows and
 deferrals log `queriesUsed`, `phaseQueries`, `elapsedMs` and
 `deadlineRemainingMs`. An unchanged same-day preview is quiet; it no longer
 rebuilds after an age threshold. Changed inputs or newly completed model dates

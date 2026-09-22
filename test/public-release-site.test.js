@@ -28,8 +28,8 @@ import {
 } from "../scripts/macos-release-core.js";
 import { SPARKLE_VERSION } from "../scripts/macos-updater-core.js";
 import {
-  collectMacOSWebModuleGraph,
-} from "../scripts/build-macos-app.js";
+  collectWebModuleGraph,
+} from "../scripts/lib/runtime-closure.mjs";
 import {
   PUBLIC_RELEASE_MANIFEST_SCHEMA,
   PUBLIC_RELEASE_SOURCE_PROVENANCE_SCHEMA,
@@ -1188,7 +1188,7 @@ test("checked-in public source satisfies the complete release contract", async (
   const result = await buildFixtureSite(
     releaseArgs(value, { source: PUBLIC_SOURCE }),
   );
-  assert.equal(result.fileCount, 24);
+  assert.equal(result.fileCount, 41);
   const manifest = JSON.parse(
     await readFile(join(value.output, "release-site-manifest.json"), "utf8"),
   );
@@ -1198,19 +1198,35 @@ test("checked-in public source satisfies the complete release contract", async (
     manifest.files.map(({ path }) => path),
     [
       "404.html",
+      "allowance-tank-renderer.js",
+      "allowance-tanks.js",
       "apple.svg",
+      "cache-reuse-matrix.css",
+      "cache-reuse-matrix.js",
+      "codex-color.svg",
       "community-data.js",
       "community-refresh.js",
       "community-view.js",
       "community.html",
       "community.js",
+      "dashboard-ui.js",
       "docs.html",
+      "feature-allowance.jpg",
+      "feature-allowance.mp4",
+      "feature-insights.js",
+      "feature-tour.css",
+      "feature-tour.js",
+      "feature-value.jpg",
+      "feature-week.js",
       "github.svg",
       "i18n.generated.js",
       "index.html",
       "install-cta.js",
+      "last-known-good.js",
       "localization.js",
       "model-catalog.generated.js",
+      "model-performance.css",
+      "model-performance.js",
       "model-visuals.js",
       "privacy.html",
       "robots.txt",
@@ -1218,6 +1234,7 @@ test("checked-in public source satisfies the complete release contract", async (
       "social-preview.png",
       "styles.css",
       "tibotattle-icon.png",
+      "trends-horizon.js",
       "ui-format.js",
       "x.svg",
     ],
@@ -1233,8 +1250,9 @@ test("checked-in public source satisfies the complete release contract", async (
   ]) {
     assert.ok(publishedNames.has(publicAsset), `Missing public asset ${publicAsset}`);
   }
-  const communityClosure = await collectMacOSWebModuleGraph({
+  const communityClosure = await collectWebModuleGraph({
     entrypoints: ["apps/web/public/community.js"],
+    surface: "public release",
   });
   for (const relativeFile of communityClosure.relativeFiles) {
     const name = relativeFile.slice("apps/web/public/".length);

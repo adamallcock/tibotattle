@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  addUsdStrings,
   priceUsageEvent,
 } from "../packages/accounting/index.js";
 import { aggregateCostResults } from "../packages/accounting/src/cost-ledger.js";
@@ -49,6 +50,23 @@ const ANTHROPIC_STANDARD = card({
     component("output_text_tokens", "15"),
     component("web_search_units", "10", "search", "1000"),
   ],
+});
+
+test("adds exact decimal costs with the canonical normalization policy", () => {
+  assert.equal(addUsdStrings(), "0");
+  assert.equal(addUsdStrings("+0001.2300e-2", "1.2277", 0), "1.24");
+  assert.equal(
+    addUsdStrings("0.0000000000000000001", "0.9"),
+    "0.9000000000000000001",
+  );
+
+  assert.throws(() => addUsdStrings("-1"), /non-negative decimal/u);
+  assert.throws(() => addUsdStrings("1e1001"), /exponent is too large/u);
+  assert.throws(
+    () => addUsdStrings(`1.${"0".repeat(1_001)}`),
+    /precision is too large/u,
+  );
+  assert.throws(() => addUsdStrings(Number.POSITIVE_INFINITY), /must be finite/u);
 });
 
 test("prices every OpenAI token component and preserves exact decimals plus reasoning fallback metadata", () => {

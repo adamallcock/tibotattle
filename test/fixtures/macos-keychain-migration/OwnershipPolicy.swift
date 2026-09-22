@@ -4,7 +4,7 @@ enum MigrationProbeOwnership {
     static let maximumWrites = 8
 
     enum Failure: Error { case invalid, incomplete }
-    enum Operation: String, Codable { case legacySeed, modernAdoption }
+    enum Operation: String, Codable { case legacySeed, modernAdoption, credentialFixtureSeed, credentialFixtureLock, credentialFixtureUnlock }
     enum Outcome: String, Codable { case committed, unchanged, rolledBack }
 
     struct Identity: Codable, Equatable {

@@ -10,6 +10,7 @@ import {
   DESKTOP_LANGUAGES,
   DESKTOP_NOTIFICATION_THRESHOLDS,
   DESKTOP_REFRESH_INTERVAL_SECONDS,
+  DESKTOP_REFRESH_MODES,
   DESKTOP_SETTINGS_SCHEMA_VERSION,
   DESKTOP_SYSTEM_SETTINGS_TARGETS,
   createDesktopRequest,
@@ -58,11 +59,14 @@ test("desktop contract freezes the exact bridge action and enum vocabulary", () 
     "openDashboardInBrowser",
     "showDiagnostics",
     "revealLocalData",
+    "getRefreshStatus",
     "refreshStarted",
+    "refreshHeartbeat",
     "refreshSettled",
   ]);
   assert.deepEqual(DESKTOP_LANGUAGES, ["system", "en", "zh-Hans", "es"]);
   assert.deepEqual(DESKTOP_REFRESH_INTERVAL_SECONDS, [60, 300, 900, 1800]);
+  assert.deepEqual(DESKTOP_REFRESH_MODES, ["quick", "detailed"]);
   assert.deepEqual(DESKTOP_NOTIFICATION_THRESHOLDS, [
     "off",
     "ninety",
@@ -109,10 +113,20 @@ test("request validation accepts exact envelopes and freezes the result", () => 
     "openDashboardInBrowser",
     "showDiagnostics",
     "revealLocalData",
-    "refreshStarted",
+    "getRefreshStatus",
   ]) {
     assert.deepEqual(validateDesktopRequest({ action, args: {} }), { action, args: {} });
   }
+  for (const mode of DESKTOP_REFRESH_MODES) {
+    assert.deepEqual(
+      validateDesktopRequest({ action: "refreshStarted", args: { mode } }),
+      { action: "refreshStarted", args: { mode } },
+    );
+  }
+  assert.deepEqual(
+    validateDesktopRequest({ action: "refreshHeartbeat", args: { lease: 1 } }),
+    { action: "refreshHeartbeat", args: { lease: 1 } },
+  );
   for (const action of ["setSharingEnabled", "setAutomaticDownload"]) {
     for (const enabled of [true, false]) {
       assert.deepEqual(
@@ -204,6 +218,12 @@ test("request validation rejects unknown actions, extra keys, malformed values, 
     { action: "setRefreshInterval", args: { seconds: 5 } },
     { action: "setStartAtLogin", args: { enabled: "true" } },
     { action: "setNotificationPreferences", args: { enabled: true, threshold: "90" } },
+    { action: "refreshStarted", args: {} },
+    { action: "refreshStarted", args: { mode: "full" } },
+    { action: "refreshStarted", args: { mode: "quick", extra: true } },
+    { action: "refreshHeartbeat", args: {} },
+    { action: "refreshHeartbeat", args: { lease: 0 } },
+    { action: "refreshHeartbeat", args: { lease: 1, extra: true } },
     { action: "refreshSettled", args: {} },
     { action: "refreshSettled", args: { lease: 0 } },
     { action: "refreshSettled", args: { lease: Number.MAX_SAFE_INTEGER + 1 } },

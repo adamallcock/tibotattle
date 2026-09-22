@@ -105,10 +105,6 @@
   border-color: rgba(151, 64, 42, .16);
 }
 
-.settings-bridge-status.is-ready {
-  color: var(--green);
-}
-
 .settings-tabs {
   display: flex;
   flex-wrap: wrap;
@@ -451,6 +447,10 @@
   min-height: 34px;
   overflow-wrap: anywhere;
   white-space: normal;
+}
+
+.settings-login-card .button[hidden] {
+  display: none;
 }
 
 .settings-switch {

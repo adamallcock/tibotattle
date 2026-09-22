@@ -53,8 +53,22 @@ test("exit-zero error envelopes and unbounded/noncanonical protocol values are n
   assert.throws(() => parseSuccessfulAccountingEnvelope('{"status":"error","code":"budget_miss"}'), codeIs("child_refused"));
   const valid = { status: "ok", resultBytes: 2, resultSha256: hash("{}") };
   assert.deepEqual(parseSuccessfulAccountingEnvelope(`${JSON.stringify(valid)}\n`), valid);
+  for (const resultBytes of [64 * 1024 * 1024 + 1, 128 * 1024 * 1024]) {
+    const envelope = { ...valid, resultBytes };
+    assert.deepEqual(parseSuccessfulAccountingEnvelope(JSON.stringify(envelope)), envelope);
+  }
+  const historical = { ...valid, resultBytes: 64 * 1024 * 1024 };
+  assert.deepEqual(parseSuccessfulAccountingEnvelope(JSON.stringify(historical), {
+    maximumBytes: 64 * 1024 * 1024,
+  }), historical);
+  assert.throws(() => parseSuccessfulAccountingEnvelope(JSON.stringify({
+    ...historical, resultBytes: historical.resultBytes + 1,
+  }), { maximumBytes: 64 * 1024 * 1024 }), codeIs("envelope_invalid"));
+  for (const maximumBytes of [0, NaN, Infinity, 128 * 1024 * 1024 + 1]) {
+    assert.throws(() => parseSuccessfulAccountingEnvelope(JSON.stringify(valid), { maximumBytes }), codeIs("envelope_invalid"));
+  }
   for (const value of [{ ...valid, path: "private" }, { ...valid, resultBytes: 0 },
-    { ...valid, resultBytes: 64 * 1024 * 1024 + 1 }, { ...valid, resultSha256: "secret" }, null]) {
+    { ...valid, resultBytes: 128 * 1024 * 1024 + 1 }, { ...valid, resultSha256: "secret" }, null]) {
     assert.throws(() => parseSuccessfulAccountingEnvelope(JSON.stringify(value)), codeIs("envelope_invalid"));
   }
   assert.throws(() => parseSuccessfulAccountingEnvelope(`progress\n${JSON.stringify(valid)}`), codeIs("envelope_invalid"));
@@ -79,6 +93,12 @@ test("artifact verification hashes independently and refuses links, permissions,
     const envelope = { status: "ok", resultBytes: 2, resultSha256: hash("{}") };
     await writeFile(artifact, "{}", { mode: 0o600 });
     assert.deepEqual(await verifyAccountingBenchmarkArtifact(artifact, envelope), { sha256: hash("{}"), bytes: 2 });
+    assert.deepEqual(await verifyAccountingBenchmarkArtifact(artifact, envelope, { maximumBytes: 2 }), {
+      sha256: hash("{}"), bytes: 2,
+    });
+    for (const maximumBytes of [0, NaN, Infinity, 128 * 1024 * 1024 + 1]) {
+      await assert.rejects(verifyAccountingBenchmarkArtifact(artifact, envelope, { maximumBytes }), codeIs("artifact_invalid"));
+    }
     await assert.rejects(verifyAccountingBenchmarkArtifact(artifact, { ...envelope, resultSha256: hash("[]") }), codeIs("artifact_mismatch"));
     await assert.rejects(verifyAccountingBenchmarkArtifact(artifact, { ...envelope, resultBytes: 3 }), codeIs("artifact_mismatch"));
     const symbolic = join(directory, "symbolic");
@@ -90,11 +110,32 @@ test("artifact verification hashes independently and refuses links, permissions,
     await rm(hard);
     await chmod(artifact, 0o644);
     await assert.rejects(verifyAccountingBenchmarkArtifact(artifact, envelope), codeIs("path_invalid"));
+    const bounded = join(directory, "bounded.json");
+    const boundedHandle = await open(bounded, "wx", 0o600);
+    try {
+      // Sparse zero-filled synthetic bytes exercise the streaming verifier at
+      // both the previous durable ceiling and the new exact ceiling.
+      const zeros = Buffer.alloc(1024 * 1024);
+      for (const resultBytes of [16 * 1024 * 1024 + 1, 128 * 1024 * 1024]) {
+        await boundedHandle.truncate(resultBytes);
+        const digest = createHash("sha256");
+        for (let remaining = resultBytes; remaining > 0; remaining -= zeros.length) {
+          digest.update(zeros.subarray(0, Math.min(remaining, zeros.length)));
+        }
+        const resultSha256 = digest.digest("hex");
+        assert.deepEqual(await verifyAccountingBenchmarkArtifact(bounded, {
+          ...envelope, resultBytes, resultSha256,
+        }), { bytes: resultBytes, sha256: resultSha256 });
+        await assert.rejects(verifyAccountingBenchmarkArtifact(bounded, {
+          ...envelope, resultBytes, resultSha256,
+        }, { maximumBytes: 16 * 1024 * 1024 }), codeIs("resource_limit_exceeded"));
+      }
+    } finally { await boundedHandle.close(); }
     const oversized = join(directory, "oversized.json");
     const handle = await open(oversized, "wx", 0o600);
-    try { await handle.truncate(16 * 1024 * 1024 + 1); } finally { await handle.close(); }
+    try { await handle.truncate(128 * 1024 * 1024 + 1); } finally { await handle.close(); }
     await assert.rejects(verifyAccountingBenchmarkArtifact(oversized, {
-      ...envelope, resultBytes: 16 * 1024 * 1024 + 1,
+      ...envelope, resultBytes: 128 * 1024 * 1024 + 1,
     }), codeIs("resource_limit_exceeded"));
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
@@ -341,6 +382,11 @@ function syntheticReceipt() {
 test("receipt schema is closed recursively, complete by revision/run, and content-free", () => {
   const receipt = syntheticReceipt();
   assert.equal(validateDetailedAccountingBenchmarkReceipt(receipt), receipt);
+  for (const bytes of [16 * 1024 * 1024 + 1, 128 * 1024 * 1024]) {
+    const changed = structuredClone(receipt);
+    changed.artifact.bytes = bytes;
+    assert.equal(validateDetailedAccountingBenchmarkReceipt(changed), changed);
+  }
   for (const mutate of [
     (value) => { value.path = "private"; },
     (value) => { value.runtime.environment = "private"; },
@@ -349,7 +395,7 @@ test("receipt schema is closed recursively, complete by revision/run, and conten
     (value) => { value.runs[0].stderr = "private"; },
     (value) => { value.runs[0].peakRssBytes = NaN; },
     (value) => { value.runs[0].peakRssBytes = 1025; },
-    (value) => { value.artifact.bytes = 16 * 1024 * 1024 + 1; },
+    (value) => { value.artifact.bytes = 128 * 1024 * 1024 + 1; },
     (value) => { value.runs[1] = value.runs[0]; },
     (value) => { value.indexUnchanged = false; },
     (value) => { value.exactOutputMatch = false; },

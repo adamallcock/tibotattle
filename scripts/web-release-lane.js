@@ -1,7 +1,15 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
+import { checkI18nBrowserMirror } from "./generate-i18n-browser-mirror.js";
+import {
+  buildPublicModelCatalogMirror,
+  buildTelemetryBrowserMirror,
+  readVerifiedTelemetryBrowserMirror,
+} from "./generate-telemetry-browser-mirror.js";
 import {
   PUBLIC_RELEASE_MANIFEST_SCHEMA,
   PUBLIC_RELEASE_SOURCE_COMMIT_PATTERN,
@@ -14,10 +22,59 @@ export const WEB_RELEASE_OUTPUT_DIRECTORY =
 export const WEB_RELEASE_MANIFEST_PATH =
   `${WEB_RELEASE_OUTPUT_DIRECTORY}/release-site-manifest.json`;
 
+/**
+ * The public site renders its copy through the canonical catalogue, so a copy
+ * change lands there and the browser catalogue is regenerated from it. These
+ * are the only two catalogue paths the lane admits; no other `packages/` file
+ * becomes permissible.
+ */
+export const I18N_CANONICAL_PATH = "packages/i18n/index.js";
+export const I18N_BROWSER_MIRROR_PATH = "apps/web/public/i18n.generated.js";
+
+/** A literal top-level catalogue entry: `  "some.key": "some value",`. */
+const I18N_CATALOG_ENTRY_PATTERN =
+  /^ {2}"[A-Za-z][A-Za-z0-9._-]*": "(?:[^"\\]|\\.)*",$/u;
+
+/**
+ * The public site renders model names through the reviewed identity vocabulary,
+ * so a vocabulary change lands in the canonical module and both browser mirrors
+ * are regenerated from it by `scripts/generate-telemetry-browser-mirror.js`.
+ * `model-catalog.generated.js` is the public site asset. `telemetry-shared.generated.js`
+ * is app-only and is never published - the release-site build and the production
+ * staging guard both refuse it by name - but it embeds the same canonical module,
+ * so a candidate that leaves it behind is stale rather than correct. It is
+ * admitted here only so a proven regeneration can move with its source; no other
+ * `packages/` file becomes permissible.
+ */
+export const MODEL_CATALOG_CANONICAL_PATH =
+  "packages/telemetry-contract/src/model-catalog.js";
+export const MODEL_CATALOG_BROWSER_MIRROR_PATH =
+  "apps/web/public/model-catalog.generated.js";
+export const TELEMETRY_SHARED_MIRROR_PATH =
+  "apps/web/public/telemetry-shared.generated.js";
+const MODEL_CATALOG_MIRROR_PATHS = Object.freeze([
+  MODEL_CATALOG_BROWSER_MIRROR_PATH,
+  TELEMETRY_SHARED_MIRROR_PATH,
+]);
+const TELEMETRY_CANONICAL_SOURCE_PREFIX = "packages/telemetry-contract/src/";
+const MODEL_CATALOG_BASENAME = "model-catalog.js";
+const MODEL_CATALOG_CONTRACT_BASENAME = "model-catalog-contract.js";
+/** The reviewed source directory is a small flat module set; refuse a tree that grew. */
+const MAXIMUM_TELEMETRY_CANONICAL_MODULES = 64;
+
+/**
+ * A literal reviewed identity row, with the optional reviewed pricing columns:
+ * `  ["gpt-5.5", "GPT-5.5"],` or `  ["x", "X", "unpriced", null],`. The label is
+ * literal text with no escape or quote, so presentation cannot carry expressions.
+ */
+const MODEL_CATALOG_ROW_PATTERN =
+  /^ {2}\["[a-z0-9][a-z0-9.-]*", "[^"\\]*"(?:, "[a-z][a-z_]*", (?:"[a-z0-9][a-z0-9.-]*"|null))?\],$/u;
+
 const PUBLIC_RELEASE_SOURCE_BASENAMES = new Set([
   "apple.svg",
   "community-data.js",
   "community-refresh.js",
+  "last-known-good.js",
   "community-view.js",
   "model-visuals.js",
   "community.html",
@@ -39,6 +96,17 @@ const PUBLIC_RELEASE_SOURCE_BASENAMES = new Set([
 const WEB_RELEASE_TOOLING_PATHS = new Set([
   "package.json",
   "scripts/build-public-release-site.js",
+  "scripts/lib/electron-public-site.mjs",
+  "test/electron-public-site.test.js",
+  "packages/i18n/index.js",
+  MODEL_CATALOG_CANONICAL_PATH,
+  "tools/tool-inventory.json",
+  "config/release-evidence.js",
+  "schemas/release-evidence-v1/manifest.schema.json",
+  "scripts/release-evidence-descriptor.js",
+  "scripts/release-evidence-policy.js",
+  "scripts/release-evidence-output.js",
+  "test/release-evidence.test.js",
   "scripts/deploy-web-release.js",
   "scripts/prepare-web-release.js",
   "scripts/preview-public-release-site.js",
@@ -55,6 +123,7 @@ const WEB_RELEASE_TOOLING_PATHS = new Set([
   "apps/web/test/community-site.test.mjs",
   "apps/web/test/community-refresh.test.mjs",
   "apps/web/test/public-allowance-views.test.mjs",
+  "apps/web/test/community-cache-retention.test.mjs",
   "docs/runbooks/2026-08-17-web-only-release.md",
   "docs/runbooks/2026-08-17-public-site-local-preview.md",
   "docs/runbooks/macos-stable-release-runbook.md",
@@ -65,7 +134,7 @@ const WEB_RELEASE_TOOLING_PATHS = new Set([
 ]);
 const WEB_RELEASE_PACKAGE_SCRIPTS = Object.freeze({
   "product:release-site:test":
-    "node --test test/public-release-site.test.js test/public-release-site-preview.test.js test/web-release-lane.test.js",
+    "node --test test/public-release-site.test.js test/public-release-site-preview.test.js test/web-release-lane.test.js test/electron-public-site.test.js",
   "product:release-site:preview": "node ./scripts/preview-public-release-site.js",
   "product:web-release:prepare": "node ./scripts/prepare-web-release.js",
   "product:web-release:deploy": "node ./scripts/deploy-web-release.js",
@@ -173,6 +242,9 @@ function parseNameStatus(raw) {
 export function isAllowedWebReleasePath(path) {
   if (!safeRelativePath(path)) return false;
   if (WEB_RELEASE_TOOLING_PATHS.has(path)) return true;
+  // App-only and never published; admitted only as the paired regeneration of
+  // the reviewed model vocabulary, which the catalogue proof below enforces.
+  if (path === TELEMETRY_SHARED_MIRROR_PATH) return true;
   const prefix = "apps/web/public/";
   if (!path.startsWith(prefix)) return false;
   const basename = path.slice(prefix.length);
@@ -226,6 +298,311 @@ function assertPackageJsonScope({ repositoryRoot, baseCommit, sourceCommit, git 
 }
 
 /**
+ * Only literal catalogue entries may change in the shared canonical i18n file:
+ * runtime code, negotiation, formatting and the exported completeness contract
+ * must stay byte-identical to the reviewed deployed base.
+ */
+export function assertI18nCatalogScope({ repositoryRoot, baseCommit, sourceCommit, git }) {
+  const strip = (value) => value.split("\n")
+    .filter((line) => !I18N_CATALOG_ENTRY_PATTERN.test(line))
+    .join("\n");
+  const before = git(repositoryRoot, ["show", `${baseCommit}:${I18N_CANONICAL_PATH}`]);
+  const after = git(repositoryRoot, ["show", `${sourceCommit}:${I18N_CANONICAL_PATH}`]);
+  if (strip(before) !== strip(after)) {
+    throw new Error("Web-only release changed i18n runtime code, not only catalogue copy.");
+  }
+}
+
+/**
+ * Only literal reviewed identity rows may change in the canonical model
+ * catalogue: the catalogue version, the derived exports, the allowance-track
+ * and pricing projections, and the reasoning-effort runtime must stay
+ * byte-identical to the reviewed deployed base, so contract code cannot ride
+ * along with a site-visible model name.
+ */
+export function assertModelCatalogScope({ repositoryRoot, baseCommit, sourceCommit, git }) {
+  const strip = (value) => value.split("\n")
+    .filter((line) => !MODEL_CATALOG_ROW_PATTERN.test(line))
+    .join("\n");
+  const before = git(repositoryRoot, ["show", `${baseCommit}:${MODEL_CATALOG_CANONICAL_PATH}`]);
+  const after = git(repositoryRoot, ["show", `${sourceCommit}:${MODEL_CATALOG_CANONICAL_PATH}`]);
+  if (strip(before) !== strip(after)) {
+    throw new Error(
+      "Web-only release changed model catalogue contract code, not only reviewed identity rows.",
+    );
+  }
+}
+
+/** A canonical source and every mirror generated from it only ever move together. */
+function assertCanonicalMirrorPairing(changedPaths, canonicalPath, mirrorPaths) {
+  const canonical = changedPaths.has(canonicalPath);
+  for (const mirrorPath of mirrorPaths) {
+    const mirror = changedPaths.has(mirrorPath);
+    if (canonical && !mirror) {
+      throw new Error(
+        `Web-only release changed ${canonicalPath} without its regenerated ${mirrorPath}.`,
+      );
+    }
+    if (mirror && !canonical) {
+      throw new Error(
+        `Web-only release changed ${mirrorPath} without a matching ${canonicalPath} change.`,
+      );
+    }
+  }
+}
+
+function blobAtCommit(repositoryRoot, commit, path, git) {
+  try {
+    return git(repositoryRoot, ["show", `${commit}:${path}`]);
+  } catch {
+    throw new Error(`Web-only release candidate does not carry ${path}.`);
+  }
+}
+
+/**
+ * Prove the candidate's browser catalogue was actually regenerated from its
+ * canonical source, and that every shipped locale is still complete. The mirror
+ * comparison is the generator's own `--check`, not a restatement of it, and the
+ * completeness contract is the i18n package's own exported validator taken from
+ * the candidate itself - whose runtime `assertI18nCatalogScope` has already
+ * proven identical to the reviewed base.
+ */
+export async function verifyWebReleaseI18nProof({
+  repositoryRoot,
+  scope,
+  git = runGit,
+}) {
+  const changedPaths = new Set((scope?.changes ?? []).map((change) => change.path));
+  if (!changedPaths.has(I18N_CANONICAL_PATH) && !changedPaths.has(I18N_BROWSER_MIRROR_PATH)) {
+    return null;
+  }
+  const root = resolve(repositoryRoot);
+  const canonical = blobAtCommit(root, scope.sourceCommit, I18N_CANONICAL_PATH, git);
+  const mirror = blobAtCommit(root, scope.sourceCommit, I18N_BROWSER_MIRROR_PATH, git);
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-web-release-i18n-"));
+  try {
+    const sourceFile = join(directory, "canonical.mjs");
+    const outputFile = join(directory, "mirror.mjs");
+    await writeFile(sourceFile, canonical, { encoding: "utf8", mode: 0o600 });
+    await writeFile(outputFile, mirror, { encoding: "utf8", mode: 0o600 });
+    try {
+      await checkI18nBrowserMirror({ outputFile, sourceFile });
+    } catch {
+      throw new Error(
+        `Web-only release candidate ${I18N_BROWSER_MIRROR_PATH} was not regenerated from ${I18N_CANONICAL_PATH}.`,
+      );
+    }
+    const catalogue = await import(pathToFileURL(sourceFile).href);
+    if (typeof catalogue.assertCatalogCompleteness !== "function") {
+      throw new Error(
+        `Web-only release candidate ${I18N_CANONICAL_PATH} does not export the catalogue completeness contract.`,
+      );
+    }
+    let completeness;
+    try {
+      completeness = catalogue.assertCatalogCompleteness();
+    } catch (error) {
+      throw new Error(
+        `Web-only release candidate i18n locales are incomplete: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    return Object.freeze({
+      canonicalSha256: sha256(canonical),
+      mirrorSha256: sha256(mirror),
+      locales: completeness.locales,
+      keyCount: completeness.keyCount,
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Materialise the candidate's canonical telemetry source tree so the generator
+ * runs against it exactly as it runs against a checkout. The generator owns
+ * which modules it reads, so the whole reviewed source directory is written
+ * rather than a lane-local list of basenames.
+ */
+async function writeTelemetryCanonicalSource({
+  repositoryRoot,
+  commit,
+  sourceDirectory,
+  git,
+}) {
+  const listed = git(repositoryRoot, [
+    "ls-tree", "-r", "-z", "--name-only", commit, "--", TELEMETRY_CANONICAL_SOURCE_PREFIX,
+  ]).split("\0").filter((value) => value !== "");
+  if (listed.length === 0 || listed.length > MAXIMUM_TELEMETRY_CANONICAL_MODULES) {
+    throw new Error("Web-only release candidate telemetry source has an unsupported module count.");
+  }
+  const written = new Map();
+  for (const path of listed) {
+    if (!safeRelativePath(path) || !path.startsWith(TELEMETRY_CANONICAL_SOURCE_PREFIX)) {
+      throw new Error("Web-only release candidate telemetry source contains an unsafe path.");
+    }
+    const basename = path.slice(TELEMETRY_CANONICAL_SOURCE_PREFIX.length);
+    if (basename === "" || basename.includes("/")) {
+      throw new Error("Web-only release candidate telemetry source is not a flat module directory.");
+    }
+    const source = blobAtCommit(repositoryRoot, commit, path, git);
+    await writeFile(join(sourceDirectory, basename), source, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    written.set(basename, source);
+  }
+  if (!written.has(MODEL_CATALOG_BASENAME)) {
+    throw new Error(`Web-only release candidate does not carry ${MODEL_CATALOG_CANONICAL_PATH}.`);
+  }
+  return written;
+}
+
+/**
+ * Run the telemetry-contract package's own exported vocabulary contract against
+ * one materialised canonical source tree. This is the package's validator, not
+ * a lane-local restatement, and it is taken from the tree being judged.
+ */
+async function reviewedModelVocabulary(sourceDirectory, label) {
+  const module = `${TELEMETRY_CANONICAL_SOURCE_PREFIX}${MODEL_CATALOG_CONTRACT_BASENAME}`;
+  let contract;
+  try {
+    contract = await import(
+      pathToFileURL(join(sourceDirectory, MODEL_CATALOG_CONTRACT_BASENAME)).href
+    );
+  } catch {
+    throw new Error(`Web-only release ${label} does not carry ${module}.`);
+  }
+  if (typeof contract.assertReviewedModelCatalogCompleteness !== "function") {
+    throw new Error(
+      `Web-only release ${label} ${module} does not export the model vocabulary completeness contract.`,
+    );
+  }
+  try {
+    return contract.assertReviewedModelCatalogCompleteness();
+  } catch (error) {
+    throw new Error(
+      `Web-only release ${label} model vocabulary is incomplete: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
+async function assertRegeneratedMirror({
+  mirrorPath,
+  outputFile,
+  sourceDirectory,
+  buildMirror,
+}) {
+  try {
+    return await readVerifiedTelemetryBrowserMirror({
+      outputFile,
+      sourceDirectory,
+      buildMirror,
+    });
+  } catch {
+    throw new Error(
+      `Web-only release candidate ${mirrorPath} was not regenerated from ${MODEL_CATALOG_CANONICAL_PATH}.`,
+    );
+  }
+}
+
+/**
+ * Prove the candidate's model-catalogue mirrors were actually regenerated from
+ * its canonical source. Each comparison is the generator's own `--check`
+ * against the candidate's canonical source tree, not a restatement of it, with
+ * `buildPublicModelCatalogMirror` selecting the public model mirror and the
+ * default build covering the app-only shared mirror that embeds the same
+ * module.
+ *
+ * Both the candidate and the deployed base are then validated by the
+ * telemetry-contract package's own exported
+ * `assertReviewedModelCatalogCompleteness`, and their identity projections must
+ * match. A web-only release may move a site-visible label; it may not move the
+ * vocabulary itself, which is reviewed against the accounting price cards, the
+ * export registries and the closed v0.2 `modelId` enum - none of which are in
+ * this lane's scope. That contract module is not an admissible candidate path,
+ * so a candidate cannot weaken the validator it is judged by.
+ */
+export async function verifyWebReleaseModelCatalogProof({
+  repositoryRoot,
+  scope,
+  git = runGit,
+}) {
+  const changedPaths = new Set((scope?.changes ?? []).map((change) => change.path));
+  if (!changedPaths.has(MODEL_CATALOG_CANONICAL_PATH)
+      && !MODEL_CATALOG_MIRROR_PATHS.some((path) => changedPaths.has(path))) {
+    return null;
+  }
+  const root = resolve(repositoryRoot);
+  const browserMirror = blobAtCommit(
+    root, scope.sourceCommit, MODEL_CATALOG_BROWSER_MIRROR_PATH, git,
+  );
+  const sharedMirror = blobAtCommit(
+    root, scope.sourceCommit, TELEMETRY_SHARED_MIRROR_PATH, git,
+  );
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-web-release-model-catalog-"));
+  try {
+    const sourceDirectory = join(directory, "candidate");
+    const baseDirectory = join(directory, "base");
+    await mkdir(sourceDirectory, { recursive: true, mode: 0o700 });
+    await mkdir(baseDirectory, { recursive: true, mode: 0o700 });
+    const canonical = await writeTelemetryCanonicalSource({
+      repositoryRoot: root,
+      commit: scope.sourceCommit,
+      sourceDirectory,
+      git,
+    });
+    await writeTelemetryCanonicalSource({
+      repositoryRoot: root,
+      commit: scope.baseCommit,
+      sourceDirectory: baseDirectory,
+      git,
+    });
+    const browserMirrorFile = join(directory, "model-catalog.generated.js");
+    const sharedMirrorFile = join(directory, "telemetry-shared.generated.js");
+    await writeFile(browserMirrorFile, browserMirror, { encoding: "utf8", mode: 0o600 });
+    await writeFile(sharedMirrorFile, sharedMirror, { encoding: "utf8", mode: 0o600 });
+    const browser = await assertRegeneratedMirror({
+      mirrorPath: MODEL_CATALOG_BROWSER_MIRROR_PATH,
+      outputFile: browserMirrorFile,
+      sourceDirectory,
+      buildMirror: buildPublicModelCatalogMirror,
+    });
+    const shared = await assertRegeneratedMirror({
+      mirrorPath: TELEMETRY_SHARED_MIRROR_PATH,
+      outputFile: sharedMirrorFile,
+      sourceDirectory,
+      buildMirror: buildTelemetryBrowserMirror,
+    });
+    const vocabulary = await reviewedModelVocabulary(sourceDirectory, "candidate");
+    const deployed = await reviewedModelVocabulary(baseDirectory, "deployed base");
+    // The catalog version is already a non-row line that `assertModelCatalogScope`
+    // pins, but the proof is reachable with a caller-supplied scope, so it stands
+    // on its own evidence here.
+    if (deployed.version !== vocabulary.version
+        || JSON.stringify(deployed.identities) !== JSON.stringify(vocabulary.identities)) {
+      throw new Error(
+        "Web-only release candidate changed the reviewed model identity vocabulary, not only its site-visible labels.",
+      );
+    }
+    return Object.freeze({
+      catalogVersion: vocabulary.version,
+      identityCount: vocabulary.identityCount,
+      canonicalSha256: sha256(canonical.get(MODEL_CATALOG_BASENAME)),
+      browserMirrorSha256: browser.sha256,
+      browserMirrorBytes: browser.byteLength,
+      sharedMirrorSha256: shared.sha256,
+      sharedMirrorBytes: shared.byteLength,
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+/**
  * Proves the committed candidate differs from its declared deployed base only
  * in the public-site closure or the release controls that protect that closure.
  */
@@ -265,6 +642,21 @@ export function inspectWebReleaseScope({
     throw new Error(
       `Web-only release candidate changed an unsupported path: ${unsupported.path}`,
     );
+  }
+  // A rename away from any paired path is still a change to it, so the pairing
+  // checks read both sides of every change.
+  const touchedPaths = new Set(changes.flatMap((change) =>
+    change.from === undefined ? [change.path] : [change.path, change.from],
+  ));
+  assertCanonicalMirrorPairing(touchedPaths, I18N_CANONICAL_PATH, [I18N_BROWSER_MIRROR_PATH]);
+  assertCanonicalMirrorPairing(
+    touchedPaths, MODEL_CATALOG_CANONICAL_PATH, MODEL_CATALOG_MIRROR_PATHS,
+  );
+  if (changes.some((change) => change.path === I18N_CANONICAL_PATH)) {
+    assertI18nCatalogScope({ repositoryRoot: root, baseCommit, sourceCommit, git });
+  }
+  if (changes.some((change) => change.path === MODEL_CATALOG_CANONICAL_PATH)) {
+    assertModelCatalogScope({ repositoryRoot: root, baseCommit, sourceCommit, git });
   }
   if (changes.some((change) => change.path === "package.json")) {
     assertPackageJsonScope({
@@ -342,7 +734,8 @@ async function releaseManifestForCandidate({ repositoryRoot }) {
     throw new Error("Generated web-release manifest is not valid JSON.");
   }
   if (manifest?.schemaVersion !== PUBLIC_RELEASE_MANIFEST_SCHEMA
-      || !validSourceProvenance(manifest.source)) {
+      || !validSourceProvenance(manifest.source)
+      || (manifest.electronRelease && manifest.electronRelease.publishedInstallersVerified !== true)) {
     throw new Error(
       "Generated web-release manifest is not bound to the selected public source closure.",
     );
@@ -360,6 +753,7 @@ export async function writeWebReleaseReceipt({
   receiptPath = expectedReceiptPath(repositoryRoot),
   replace = false,
   preparedAt = new Date().toISOString(),
+  git = runGit,
 }) {
   if (scope === null || typeof scope !== "object"
       || !PUBLIC_RELEASE_SOURCE_COMMIT_PATTERN.test(scope.baseCommit ?? "")
@@ -370,6 +764,8 @@ export async function writeWebReleaseReceipt({
   }
   const repository = resolve(repositoryRoot);
   const target = assertReceiptPath(repository, receiptPath);
+  await verifyWebReleaseI18nProof({ repositoryRoot: repository, scope, git });
+  await verifyWebReleaseModelCatalogProof({ repositoryRoot: repository, scope, git });
   let existing = null;
   try {
     existing = await lstat(target);
@@ -461,6 +857,8 @@ export async function verifyWebReleaseReceipt({
       || JSON.stringify(scope.changes) !== JSON.stringify(receipt.sourceDiff.changes)) {
     throw new Error("Web-only release receipt no longer matches the candidate diff.");
   }
+  await verifyWebReleaseI18nProof({ repositoryRoot: repository, scope, git });
+  await verifyWebReleaseModelCatalogProof({ repositoryRoot: repository, scope, git });
   const site = await releaseManifestForCandidate({
     repositoryRoot: repository,
   });

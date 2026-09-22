@@ -404,6 +404,7 @@ async function launchFixture({
   sharingBackend,
   sharingInstallationState,
   ownedCompanionScript,
+  crashCapture,
   childFactory,
   onSpawn = () => {},
   environment = {
@@ -438,6 +439,7 @@ async function launchFixture({
     }),
     platform,
     architecture,
+    crashCapture,
     ...(isolatedRehearsal ? {} : { argv }),
     lifecycleOptions,
     accountlessLaboratory,
@@ -525,6 +527,7 @@ test("compiled hosted rehearsal owns every history, state and private scheduler 
       USAGE_MONITOR_CENTRAL_ORIGIN: "https://unreviewed.example",
       USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE: "/ambient/queue",
       USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "/ambient/export-secret",
+      USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/ambient/account-secret",
       USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
       USAGE_MONITOR_PREPARED_DIRECTORY: "/ambient/prepared",
       USAGE_MONITOR_RESOURCE_ROOT: "/ambient/resources",
@@ -565,6 +568,7 @@ test("compiled hosted rehearsal owns every history, state and private scheduler 
     "USAGE_MONITOR_CENTRAL_ORIGIN",
     "USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE",
     "USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE",
+    "USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE",
     "USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY",
     "USAGE_MONITOR_PREPARED_DIRECTORY",
     "USAGE_MONITOR_TEST_LANE",
@@ -822,7 +826,7 @@ test("macOS production runtime connects updater controls to protected preference
     assert.equal(handoverCompleted, true);
     return null;
   },
-    environment: { HOME: profile },
+    environment: { HOME: profile, USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/ambient/account-secret" },
     runtimeOverrides: { autoUpdater: nativeAutoUpdater, dialog: {
       showMessageBox: async (options) => { firstRunDisclosures.push(options); return { response: 0 }; },
       showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
@@ -838,6 +842,7 @@ test("macOS production runtime connects updater controls to protected preference
       return { status: "already_migrated" };
     },
   });
+  assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE, undefined);
   assert.equal(firstRunDisclosures[0].title, "Welcome to TiboTattle");
   assert.doesNotMatch(firstRunDisclosures[0].detail, /Uploads are not available|development build/u);
   assert.equal(autoUpdater.autoInstallOnAppQuit, false);
@@ -1009,6 +1014,7 @@ test("credential preflight retries only after the user asks and then continues s
   const app = new FakeApp();
   app.isPackaged = true;
   app.getName = () => "TiboTattle";
+  app.getVersion = () => "0.1.19";
   app.getPath = () => profile;
   let attempts = 0;
   const notices = [];
@@ -2059,6 +2065,28 @@ test("runtime persists the fixed Electron appearance and updates live renderers"
   await desktop.lifecycle.dispose();
 });
 
+test("runtime applies the persisted appearance before creating the first window", async () => {
+  for (const appearance of ["system", "light", "dark"]) {
+    const nativeTheme = new EventEmitter();
+    nativeTheme.themeSource = "system";
+    nativeTheme.shouldUseDarkColors = true;
+    const themeSourcesAtWindowCreation = [];
+    class AppearanceWindow extends FakeWindow {
+      constructor(options) {
+        themeSourcesAtWindowCreation.push(nativeTheme.themeSource);
+        super(options);
+      }
+    }
+    const { desktop } = await launchFixture({
+      load: async () => ({ ...DESKTOP_DEFAULT_SETTINGS, appearance }),
+      runtimeOverrides: { BrowserWindow: AppearanceWindow, nativeTheme },
+    });
+
+    assert.equal(themeSourcesAtWindowCreation[0], appearance);
+    await desktop.lifecycle.dispose();
+  }
+});
+
 test("runtime accepts Codex handoff only from the ready dashboard main frame", async () => {
   const opened = [];
   const ipcMain = {
@@ -2364,8 +2392,46 @@ test("runtime wires safe browser, diagnostics, and local-data actions", async ()
   assert.equal(dialogs.length, 1);
   assert.equal(copied.length, 1);
   assert.equal(copied[0], dialogs[0].detail);
-  assert.match(dialogs[0].detail, /tibotattle-electron-diagnostics-v1/u);
+  assert.match(dialogs[0].detail, /tibotattle-electron-diagnostics-v2/u);
+  assert.match(dialogs[0].detail, /"cadenceTimerArmed": true/u);
   assert.doesNotMatch(dialogs[0].detail, /Users|127\.0\.0\.1|codex-first/u);
+  await fixture.desktop.lifecycle.dispose();
+});
+
+test("doctor prepares only the reviewed content-free issue and persists local capture for restart", async () => {
+  const external = [];
+  const choices = [1, 2];
+  let enabled = false;
+  const fixture = await launchFixture({
+    load: async () => null,
+    crashCapture: {
+      get: async () => ({ available: true, enabled, active: false }),
+      setEnabled: async (value) => {
+        enabled = value;
+        return { available: true, enabled, active: false };
+      },
+    },
+    runtimeOverrides: {
+      dialog: { showMessageBox: async () => ({ response: choices.shift() }) },
+      shell: { openExternal: async (url) => external.push(url) },
+    },
+  });
+  assert.deepEqual(await fixture.desktop.controller.handlers.showDiagnostics({}), {
+    status: "capture_changed_next_launch",
+  });
+  assert.equal(enabled, true);
+  assert.deepEqual(await fixture.desktop.controller.handlers.showDiagnostics({}), {
+    status: "support_prepared",
+  });
+  assert.equal(external.length, 1);
+  const issue = new URL(external[0]);
+  assert.equal(issue.origin, "https://github.com");
+  assert.equal(issue.pathname, "/adamallcock/tibotattle/issues/new");
+  const body = issue.searchParams.get("body");
+  assert.match(body, /tibotattle-electron-diagnostics-v2/u);
+  assert.match(body, /crash_capture_next_launch: true/u);
+  assert.match(body, /crash_report_upload: false/u);
+  assert.doesNotMatch(body, /Users|127\.0\.0\.1|codex-first/u);
   await fixture.desktop.lifecycle.dispose();
 });
 
@@ -2408,7 +2474,7 @@ test("runtime invalidates a dashboard refresh lease when its renderer is replace
   ));
   assert.notEqual(dashboard, undefined);
   dashboard.emit("ready-to-show");
-  const lease = await fixture.desktop.controller.handlers.refreshStarted();
+  const lease = await fixture.desktop.controller.handlers.refreshStarted({ mode: "quick" });
   dashboard.webContents.emit("render-process-gone", {}, {
     reason: "crashed",
     exitCode: 17,
@@ -2841,4 +2907,24 @@ test("runtime authorizes a manual notification test only from the live Settings 
     (error) => error?.code === "desktop_ipc_untrusted_context",
   );
   await desktop.lifecycle.dispose();
+});
+
+
+test("development desktop forwards prospective account identity only to the private macOS QA companion", async () => {
+  const accountFile = "/private/fixture/identity/account-observation-development";
+  const fixture = await launchFixture({
+    platform: "darwin", load: async () => null,
+    environment: {
+      USAGE_MONITOR_TEST_LANE: "macos-electron-local-qa-v1",
+      USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+      USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "/private/fixture/identity/export-identity",
+      USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: accountFile,
+    },
+  });
+  try {
+    assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE, accountFile);
+    assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_KEYCHAIN_BROKER_FD, undefined);
+  } finally {
+    await fixture.desktop.lifecycle.requestQuit();
+  }
 });

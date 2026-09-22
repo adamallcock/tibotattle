@@ -291,33 +291,39 @@ test("real public render shows model sample semantics, per-view labels and discl
     const container = new Element("div");
     assert.equal(renderCommunityAllowanceSection({ documentRef, container,
       payload: publicAllowanceFixture(), view }), "published");
-    assert.match(container.text, /single account.*estimated capacity/u);
+    assert.match(container.text, /single source.*estimated capacity/u);
     assert.match(container.text, view === "aggregate" ? /per 7 days, API-price equivalent/u : /API-equivalent USD \/ Pro 20× week/u);
     const svg = container.descendants().find(element => element.tag === "svg" && element.attributes.has("aria-label"));
     assert.ok(svg);
     if (view === "models") {
-      assert.doesNotMatch(container.text, /This plan:/u);
+      assert.doesNotMatch(container.text, /Pro 20x-equivalent:/u);
       assert.match(container.text, /GPT-6 Astra/u);
-      assert.match(container.text, /1 account/u);
+      assert.match(container.text, /1 source/u);
       const cards = container.descendants().filter(element => element.tag === "article");
       assert.match(cards[0].text.trim(), /^GPT-6 Astra/u);
       assert.match(cards[0].className, /allowance-model-astra/u);
       assert.ok(cards.every(card => !card.text.includes("per 7 days")), "one shared unit caption replaces repeated card prose");
       assert.ok(cards.every(card => card.descendants().some(element => element.attributes.get("aria-hidden") === "true")));
       assert.equal(svg.attributes.get("aria-label"), "Community allowance by model");
-      assert.match(svg.attributes.get("aria-description"), /supporting accounts, not reset fits/u);
+      assert.match(svg.attributes.get("aria-description"), /contribution sources, not reset fits/u);
       assert.equal(svg.descendants().filter(element => element.attributes.get("class")?.includes("allowance-band-area")).length, 0);
     } else if (view === "plans") {
-      assert.match(container.text, /Pro 5× ×4, Plus ×20/u);
+      // Nothing is scaled any more: each plan is charted on its own axis at its
+      // own week, so the old "Pro 5× ×4, Plus ×20" note would be a lie.
+      assert.match(container.text, /its own week at API prices, on its own scale/u);
       assert.equal(svg.attributes.get("aria-label"), "Community allowance by plan");
       const normalized = normalizeCommunityDailySeries(publicAllowanceFixture());
       const summaries = buildCommunityAllowanceChartModel(normalized, { view: "plans" }).latestSummaries;
       const cards = container.descendants().filter(element => element.tag === "article");
       assert.equal(cards.length, 3);
       cards.forEach((card, index) => {
+        // The card LEADS with the plan's own week and carries the reference
+        // equivalent underneath, which is the inverse of the old layout.
+        const money = value => new Intl.NumberFormat("en-US",
+          { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(value);
         const planValue = planWeeklyApiEquivalentUsd(summaries[index].centralUsd, summaries[index].seriesKey);
-        const formatted = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(planValue);
-        assert.ok(card.text.includes(`This plan: ${formatted}/week at API prices`));
+        assert.ok(card.text.includes(money(planValue)), "own week leads");
+        assert.ok(card.text.includes(`Pro 20x-equivalent: ${money(summaries[index].centralUsd)}/week`));
       });
     } else {
       assert.doesNotMatch(container.text, /This plan:/u);

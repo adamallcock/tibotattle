@@ -78,8 +78,12 @@ names and project handles are never written into the accounting index, exports,
 diagnostics, contributions or browser storage. Repository grouping describes
 last-observed local workspace mappings, not verified historical ownership.
 The new POST query route requires the local header and existing Origin/Host
-checks. Reports are bounded process-local snapshots; publication/scope/filter
-identity and opaque cursors prevent mixing totals across reads.
+checks. Interactive reports are bounded process-local snapshots;
+publication/scope/filter identity and opaque cursors prevent mixing totals across
+reads. A separate owner-only saved snapshot retains usage figures with anonymous,
+snapshot-local aliases. It excludes names, raw thread IDs, source paths and
+original project/worktree/thread join handles. Restored figures are read-only and
+dated until fresh enrichment completes; they never become a name-search index.
 
 ## Do not include session content in reports
 

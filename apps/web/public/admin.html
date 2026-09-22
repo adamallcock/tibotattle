@@ -27,16 +27,24 @@
           <p class="eyebrow">Owner-only operations</p>
           <h1>Keep the service safe to run.</h1>
           <p class="lede">
-            This page reads bounded operational aggregates through an authenticated
-            Worker API. It never queries D1 directly or exposes participant records.
+            Monitor collection, accepted uploads, maintenance and publication.
+            Each section shows its evidence and limits; use the attention list to investigate issues.
           </p>
         </div>
         <div class="freshness-card" aria-live="polite">
-          <span>Last refresh</span>
+          <span>Service snapshot</span>
           <strong id="last-refresh">Not loaded</strong>
           <small id="service-state">Checking session…</small>
         </div>
       </div>
+
+      <nav class="admin-section-nav" aria-label="Monitoring sections">
+        <a href="#operator-attention-title">Attention</a><a href="#counts-title">Contributors</a>
+        <a href="#growth-title">Activity</a><a href="#storage-safety-title">Storage</a>
+        <a href="#distribution-title">Apps &amp; updates</a><a href="#admin-community-title">Allowance</a>
+        <a href="#controls-title">Controls</a><a href="#ingress-title">Ingress</a>
+        <a href="#database-health-title">Databases</a><a href="#readiness-title">Readiness</a><a href="#errors-title">Failures</a><a href="#audit-title">Audit</a>
+      </nav>
 
       <div id="notice" class="notice notice-warning" role="status" hidden></div>
 
@@ -83,7 +91,7 @@
               Send test
             </button>
           </div>
-          <p class="admin-toolbar-note">Preferences stay in this browser. Alerts are evaluated only when this open tab refreshes; closing it stops them. Browser and OS settings control delivery and sound.</p>
+          <p class="admin-toolbar-note">Preferences stay in this browser. Alerts are evaluated when this visible tab refreshes. Automatic refresh pauses in background tabs or while offline; closing the tab stops alerts. Browser and OS settings control delivery and sound.</p>
         </div>
       </section>
 
@@ -108,9 +116,10 @@
         <div class="section-heading">
           <div>
             <p class="eyebrow">Bounded counts</p>
-            <h2 id="counts-title">Service shape</h2>
+            <h2 id="counts-title">Contributors and accepted uploads</h2>
           </div>
         </div>
+        <p class="admin-copy">Pseudonymous identities are not verified people. A + suffix marks a lower bound from a capped query. Accepted-data counts reflect retained uploads in the service’s active storage mode.</p>
         <div class="admin-card-grid" id="counts" aria-live="polite"></div>
       </section>
 
@@ -122,6 +131,7 @@
           </div>
           <span class="admin-source-badge admin-source-partial" id="growth-status">History loading</span>
         </div>
+        <p class="admin-copy">Headlines are retained totals; charts show recent UTC calendar days, including today’s partial day. Legacy sign-ins, pairings and consent records do not measure the current accountless Electron enrollment flow.</p>
         <div class="admin-card-grid" id="growth-cards" aria-live="polite"></div>
       </section>
 
@@ -162,7 +172,7 @@
           </div>
           <div class="admin-section-actions">
             <span class="admin-source-badge" id="distribution-status">Checking sources…</span>
-            <button class="button button-quiet compact" id="sync-distribution" type="button">
+            <button class="button button-quiet compact" id="sync-distribution" type="button" disabled>
               Sync GitHub releases
             </button>
           </div>
@@ -176,23 +186,24 @@
         </p>
         <div class="admin-card-grid admin-distribution-grid" id="distribution-counts" aria-live="polite"></div>
         <div class="admin-two-column admin-distribution-details">
-          <div class="admin-card admin-table-wrap">
-            <h3>Observed active-version mix</h3>
+          <div class="admin-card admin-table-wrap" tabindex="0" role="region" aria-label="Observed app versions table">
+            <h3>Observed active versions by app and OS</h3>
             <table>
-              <thead><tr><th>Version</th><th>Signal share · 7d</th><th>Source addresses · 7d</th><th>Checks · 7d</th></tr></thead>
+              <thead><tr><th>App</th><th>OS</th><th>Version</th><th>Address reach · 7d</th><th>Source addresses · 7d</th><th>Checks · 7d</th></tr></thead>
               <tbody id="distribution-version-rows"></tbody>
             </table>
+            <p class="admin-copy" id="distribution-version-coverage"></p>
             <p class="admin-empty" id="distribution-version-empty">
               No app-version evidence is available in this window.
             </p>
           </div>
           <div class="admin-card" id="distribution-source-status" aria-live="polite"></div>
         </div>
-        <div class="admin-card admin-table-wrap admin-github-release-table">
+        <div class="admin-card admin-table-wrap admin-github-release-table" tabindex="0" role="region" aria-label="GitHub DMG downloads table">
           <div class="section-heading admin-table-heading">
             <div>
               <h3>GitHub DMG downloads by release</h3>
-              <p class="admin-copy">Current cumulative public GitHub asset counters across every published release. These are downloads, not installs or unique people.</p>
+              <p class="admin-copy">Cumulative macOS DMG asset downloads across published releases. Windows and Linux installers, ZIPs and update metadata are excluded. These are downloads, not installs or unique people.</p>
             </div>
           </div>
           <table>
@@ -208,11 +219,13 @@
       <section class="admin-section admin-community-view community-site" aria-labelledby="admin-community-title">
         <div class="section-heading">
           <div>
-            <p class="eyebrow">Admin-only trial</p>
-            <h2 id="admin-community-title">Allowance merge preview</h2>
+            <p class="eyebrow">Private estimator diagnostics</p>
+            <h2 id="admin-community-title">Community allowance diagnostics</h2>
           </div>
           <span class="admin-source-badge" id="admin-community-status">Loading preview…</span>
         </div>
+        <p class="admin-copy">API-price-equivalent estimates from contributed evidence, not provider billing or an authoritative quota. Missing estimates remain unavailable; reconstruction progress and published graph freshness are separate.</p>
+        <p class="admin-copy" id="admin-community-freshness" role="status">Waiting for allowance evidence…</p>
         <div class="community-window">
           <div class="community-window-content">
             <div class="community-allowance">
@@ -250,12 +263,15 @@
         <section class="admin-card admin-section" aria-labelledby="controls-title">
           <p class="eyebrow">Containment controls</p>
           <h2 id="controls-title">Collection state</h2>
-          <p class="admin-copy">Changes are revisioned and written to the audit log.</p>
+          <p class="admin-copy">Checked means enabled. Disabling a stage contains that part of collection. Changes are revisioned and audited; refresh preserves your unsaved choices.</p>
+          <p class="admin-copy" id="controls-status" role="status">Load a current service snapshot before changing controls.</p>
           <form id="controls-form" class="admin-form">
-            <label><input type="checkbox" name="enrollment"> Enrollment</label>
-            <label><input type="checkbox" name="uploadRegistration"> Upload registration</label>
-            <label><input type="checkbox" name="processing"> Processing</label>
-            <label><input type="checkbox" name="publication"> Publication</label>
+            <fieldset id="controls-fields" disabled>
+            <legend>Collection stages</legend>
+            <label><input type="checkbox" name="enrollment"> Enrollment — allow contributor enrollment</label>
+            <label><input type="checkbox" name="uploadRegistration"> Upload registration — allow upload setup</label>
+            <label><input type="checkbox" name="processing"> Processing — process accepted uploads</label>
+            <label><input type="checkbox" name="publication"> Publication — publish community aggregates</label>
             <label class="admin-field" for="reasonCode">Reason for change
               <select name="reasonCode" id="reasonCode">
                 <option value="maintenance">Maintenance</option>
@@ -266,7 +282,9 @@
                 <option value="drill_restore">Drill restore</option>
               </select>
             </label>
-            <button class="button button-primary" type="submit">Save collection state</button>
+            </fieldset>
+            <div class="admin-control-actions"><button class="button button-primary" id="save-controls" type="submit" disabled>Save collection state</button>
+            <button class="button button-quiet" id="discard-controls" type="button" disabled>Discard changes</button></div>
           </form>
         </section>
 
@@ -274,10 +292,11 @@
           <p class="eyebrow">Bounded maintenance</p>
           <h2 id="maintenance-title">Run the maintenance pass</h2>
           <p class="admin-copy">
-            Processes deletion retention and quarantine reconciliation, then builds
-            the next immutable snapshot only when publication is enabled.
+            Runs one bounded retention and object-reconciliation pass, then processes
+            eligible aggregate rebuilds when publication is enabled. Work may remain
+            after the request succeeds; review the result and queues. This does not initiate participant erasure.
           </p>
-          <button class="button button-secondary" id="run-maintenance" type="button">
+          <button class="button button-secondary" id="run-maintenance" type="button" disabled>
             Run maintenance
           </button>
           <p class="admin-result" id="maintenance-result" role="status"></p>
@@ -289,9 +308,24 @@
         <h2 id="ingress-title">Ingress pressure</h2>
         <p class="admin-copy">
           Shared upload budget state: in-flight leases against the concurrency
-          cap, remaining start tokens, and content-free denial counters.
+          cap, remaining start tokens, and content-free denial counters. Denials are cumulative for the budget state, not a last-24-hour error rate.
         </p>
         <div class="admin-card" id="ingress-status" aria-live="polite"></div>
+      </section>
+
+      <section class="admin-section" aria-labelledby="database-health-title">
+        <p class="eyebrow">Live read checks</p>
+        <h2 id="database-health-title">Database health</h2>
+        <p class="admin-copy">A lightweight read checks each database bound to the API Worker independently when this page refreshes. Response time includes the database round trip; size is reported by D1. Successful reads do not verify writes, backups, schema compatibility or end-to-end service readiness.</p>
+        <p id="database-health-status" class="admin-source-badge" aria-live="polite">Waiting for database checks</p>
+        <p id="database-health-freshness" class="admin-copy">No database check loaded.</p>
+        <div class="admin-card admin-table-wrap" tabindex="0" role="region" aria-label="Database health table">
+          <table>
+            <thead><tr><th>Database role</th><th>Read status</th><th>Response time</th><th>Reported size</th></tr></thead>
+            <tbody id="database-health-rows"></tbody>
+          </table>
+        </div>
+        <p class="admin-copy">If a read fails or exceeds five seconds, check Cloudflare D1 availability and the deployed bindings, then refresh. Size alone does not indicate remaining capacity; review D1 limits and storage trends in Cloudflare.</p>
       </section>
 
       <section class="admin-section" aria-labelledby="readiness-title">
@@ -299,12 +333,12 @@
         <h2 id="readiness-title">Operational readiness</h2>
         <p class="admin-copy">
           Compare the latest accepted upload with the latest daily evidence and
-          publication times to distinguish an idle contributor from a stalled
-          rebuild queue.
+          publication times, then inspect pending work and maintenance freshness.
+          Old evidence dates can reflect backfill or inactivity; timestamps alone do not prove a stalled service. This panel is not a live /ready probe.
         </p>
         <div class="admin-two-column">
           <div class="admin-card" id="lifecycle-status" aria-live="polite"></div>
-          <div class="admin-card admin-table-wrap">
+          <div class="admin-card admin-table-wrap" tabindex="0" role="region" aria-label="Published snapshots table">
             <table>
               <thead><tr><th>Snapshot</th><th>Period</th><th>State</th><th>Released</th></tr></thead>
               <tbody id="snapshot-rows"></tbody>
@@ -321,7 +355,7 @@
             <h2 id="errors-title">Sampled service failures</h2>
             <p class="admin-copy admin-diagnostic-copy" id="diagnostic-retention-summary">
               Retention details load with the service snapshot. Retained service request IDs are UUIDs;
-              TT-… references stay only in the reporting Mac’s local diagnostics log.
+              TT-… references stay only in the reporting device’s local diagnostics log.
             </p>
           </div>
           <form id="diagnostic-form" class="diagnostic-form">
@@ -332,7 +366,7 @@
         </div>
         <div class="admin-card admin-table-wrap">
           <table>
-            <thead><tr><th>Route</th><th>Error</th><th>HTTP</th><th>Count</th><th>Latest</th></tr></thead>
+            <thead><tr><th>Route</th><th>Error</th><th>HTTP</th><th>Retained sample count</th><th>Latest</th></tr></thead>
             <tbody id="error-groups"></tbody>
           </table>
           <p class="admin-empty" id="error-empty">No retained errors in the window.</p>

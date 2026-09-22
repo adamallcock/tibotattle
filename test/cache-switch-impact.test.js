@@ -13,9 +13,12 @@ import {
   analyzeCacheSwitchRows,
   CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_MS,
   CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+  MAX_CACHE_CONTINUITY_RECENT_DETAILS,
   MAX_CACHE_SWITCH_RECENT_DETAILS,
+  readCacheImpacts,
 } from "../src/cache-switch-impact.js";
 import {
+  buildLocalCompanionSnapshot,
   cacheSwitchAllowanceImpact,
 } from "../src/local-companion-data.js";
 import {
@@ -30,6 +33,11 @@ import {
 } from "../src/local-unified-index.js";
 
 const NOW_MS = Date.parse("2026-08-08T12:00:00.000Z");
+
+test("cache impact detail windows retain 250 rows for paginated inspection", () => {
+  assert.equal(MAX_CACHE_SWITCH_RECENT_DETAILS, 250);
+  assert.equal(MAX_CACHE_CONTINUITY_RECENT_DETAILS, 250);
+});
 
 function usdFromNanos(value) {
   const whole = Math.floor(value / 1_000_000_000);
@@ -1077,6 +1085,28 @@ test("raw rollout facts flow through the existing index into the read-only impac
       continuity.comparableReturns,
     );
     assert.ok(continuity.estimatedPremiumUsd > 0);
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      unifiedIndexFile: indexFile,
+      now: () => NOW_MS,
+      allowDevelopmentArtifactFallback: false,
+    });
+    const projected = snapshot.overview.accounting.cacheContinuityImpact;
+    assert.equal(projected.status, "available");
+    assert.equal(projected.byModel.length, 1);
+    assert.equal(projected.byModel[0].model, "gpt-5.6-sol");
+    assert.equal(projected.byModel[0].comparableReturns, projected.comparableReturns);
+    assert.equal(projected.byModel[0].estimatedPremiumUsd, projected.estimatedPremiumUsd);
+    assert.deepEqual(projected.byModel[0].allowanceWeighting, projected.allowanceWeighting);
+    assert.deepEqual(projected.byModel[0].coveredSubtotal, projected.coveredSubtotal);
+    assert.equal(projected.byModel[0].allowanceImpact.status, "unavailable");
+    assert.deepEqual(projected.periods.find((row) => row.periodId === projected.periodId).byModel,
+      projected.byModel);
+    const { normalizeDashboardPayload } = await import("../apps/web/public/data-client.js");
+    const normalized = normalizeDashboardPayload(snapshot.overview).accounting.cacheContinuityImpact;
+    assert.equal(normalized.byModel.length, 1);
+    assert.equal(normalized.byModel[0].model, "gpt-5.6-sol");
+    assert.deepEqual(normalized.byModel[0].byOutcomeBucket, normalized.byOutcomeBucket);
     assert.doesNotMatch(serialized, new RegExp(sessionId, "u"));
     assert.doesNotMatch(serialized, /turn-high|event_key|session_local/u);
     assert.doesNotMatch(
@@ -1096,4 +1126,106 @@ test("a missing unified index reports impact unavailable rather than zero", asyn
   assert.equal(projection.status, "missing");
   assert.equal(projection.cacheSwitchImpact.status, "unavailable");
   assert.deepEqual(projection.cacheSwitchImpact.periods, []);
+});
+
+test("model continuity cohorts use full-period evidence, including warm returns absent from recent drops", () => {
+  const solRows = Array.from({ length: 36 }, (_, index) => continuityRow({
+    observed_at_ms: NOW_MS - (40 - index) * 60_000,
+    previous_observed_at_ms: NOW_MS - (40 - index) * 60_000 - 30_000,
+    tokens_in_cache_read: index < 24 ? 0 : index < 30 ? 750 : 1_000,
+    session_local: "PRIVATE_SESSION_SENTINEL",
+    event_key: "PRIVATE_EVENT_SENTINEL",
+  }));
+  const other = (overrides = {}) => continuityRow({
+    model_id: "gpt-5.4",
+    previous_model_id: "gpt-5.4",
+    tokens_in_cache_read: 1_000,
+    ...overrides,
+  });
+  const result = analyzeCacheContinuityRows([
+    other({ observed_at_ms: NOW_MS - 8 * 86_400_000,
+      previous_observed_at_ms: NOW_MS - 8 * 86_400_000 - 86_400_000 }),
+    ...solRows,
+    other(),
+    other({ parser_version: "uncovered-old-parser" }),
+    other({ compaction_between: 1 }),
+    other({ tokens_in_cache_read: null }),
+    other({ tokens_in_uncached: 0, tokens_in_cache_read: 200 }),
+  ], { nowMs: NOW_MS, pricer: fullyPriced });
+  const week = result.periods.find((period) => period.periodId === "7d");
+  assert.deepEqual(week.byModel.map((cohort) => cohort.model), ["gpt-5.4", "gpt-5.6-sol"]);
+  const [gpt54, sol] = week.byModel;
+  assert.equal(sol.comparableReturns, 36);
+  assert.equal(sol.reusedMoreThanHalfReturns, 12);
+  assert.equal(sol.matchedOrExceededReturns, 6);
+  assert.equal(sol.reusedBetweenHalfAndPreviousReturns, 6);
+  assert.equal(sol.recent.length, 24);
+  assert.equal(sol.cacheReadDrops, 24);
+  assert.equal(sol.byOutcomeBucket.under_one_minute.comparableReturns, 36);
+  assert.equal(gpt54.comparableReturns, 1);
+  assert.equal(gpt54.recent.length, 0);
+  assert.equal(gpt54.sameConfigurationReturns, 5);
+  for (const field of ["uncoveredReturns", "compactionConfoundedReturns",
+    "insufficientEvidenceReturns", "contextContractedReturns"]) assert.equal(gpt54[field], 1);
+  assert.equal(gpt54.coverageStatus, "incomplete");
+  assert.equal(gpt54.estimatedPremiumUsd, null);
+  assert.equal(sol.coverageStatus, "complete");
+  assert.equal(week.estimatedPremiumUsd, null);
+  assert.equal(sol.coveredSubtotal.standardApiPremiumUsdExact,
+    week.coveredSubtotal.standardApiPremiumUsdExact);
+  assert.equal(result.periods.find((period) => period.periodId === "all")
+    .byModel.find((cohort) => cohort.model === "gpt-5.4").comparableReturns, 2);
+  for (const period of result.periods) {
+    for (const field of ["comparableReturns", "sameConfigurationReturns", "cacheReadDrops",
+      "reusedMoreThanHalfReturns", "reusedHalfOrLessReturns", "lostCacheTokens"]) {
+      assert.equal(period.byModel.reduce((sum, cohort) => sum + cohort[field], 0), period[field]);
+    }
+    for (const [key, bucket] of Object.entries(period.byOutcomeBucket)) {
+      assert.equal(period.byModel.reduce((sum, cohort) => sum + cohort.byOutcomeBucket[key].comparableReturns, 0),
+        bucket.comparableReturns);
+    }
+  }
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE_|session_local|event_key/u);
+});
+
+test("model cohorts preserve unpriced totals and never invent unknown configuration rates", () => {
+  const unpriced = analyzeCacheContinuityRows([continuityRow()], {
+    nowMs: NOW_MS,
+    pricer: () => ({ coverageStatus: "unpriced", totalUsd: null }),
+  }).periods.find((period) => period.periodId === "7d").byModel[0];
+  assert.equal(unpriced.comparableReturns, 1);
+  assert.equal(unpriced.unpricedDrops, 1);
+  assert.equal(unpriced.estimatedPremiumUsd, null);
+  assert.equal(unpriced.coveredSubtotal, null);
+  const unknown = analyzeCacheContinuityRows([continuityRow({
+    model_id: "unknown", previous_model_id: "unknown",
+    model_recognition: "unknown", previous_model_recognition: "unknown",
+  })], { nowMs: NOW_MS }).periods[0];
+  assert.equal(unknown.comparableReturns, 0);
+  assert.deepEqual(unknown.byModel, []);
+  const unreviewed = analyzeCacheContinuityRows([continuityRow({
+    model_id: "PRIVATE_UNREVIEWED_MODEL", previous_model_id: "PRIVATE_UNREVIEWED_MODEL",
+    reasoning_effort: reasoningEffortOrdinal("max"),
+  })], { nowMs: NOW_MS, pricer: fullyPriced }).periods[0];
+  assert.equal(unreviewed.comparableReturns, 1);
+  assert.equal(unreviewed.byModel, null);
+});
+
+test("unattributable ordering gaps qualify every model total without manufacturing time-bucket evidence", () => {
+  const result = readCacheImpacts({
+    prepare: () => ({ all: () => [
+      { ...continuityRow(), ordering_coverage_gap: 0 },
+      { observed_at_ms: NOW_MS - 100, ordering_coverage_gap: 1 },
+    ] }),
+  }, { nowMs: NOW_MS, pricer: fullyPriced });
+  const period = result.cacheContinuityImpact.periods.find((row) => row.periodId === "7d");
+  const model = period.byModel[0];
+  assert.equal(model.orderingCoverageGaps, 1);
+  assert.equal(model.coverageStatus, "incomplete");
+  assert.equal(model.estimatedPremiumUsd, null);
+  assert.equal(model.allowanceWeighting.status, "unavailable");
+  assert.equal(model.coveredSubtotal.standardApiPremiumUsdExact,
+    period.coveredSubtotal.standardApiPremiumUsdExact);
+  assert.equal(model.byOutcomeBucket.thirty_minutes_to_one_hour.comparableReturns, 1);
+  assert.equal(model.byOutcomeBucket.thirty_minutes_to_one_hour.coverageStatus, "complete");
 });

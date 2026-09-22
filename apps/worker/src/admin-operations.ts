@@ -4,6 +4,8 @@ import { sha256Hex } from "./crypto";
 import { ApiError } from "./errors";
 import { readQuarantineReconciliationStatus } from "./quarantine-reconciliation";
 import { parseStoredJson } from "./stored-record";
+import type { StorageAnalyticsBindings } from "./analytics-delivery";
+import { readStorageAdminOverview } from "./storage-admin-overview";
 import type { UploadIngressStatus } from "./upload-ingress-admission";
 
 const ADMIN_IDENTITY_DOMAIN = "app-usagemonitor/admin-actor/v1\0";
@@ -36,6 +38,7 @@ export interface AdminOverviewOptions {
    * `null` keeps the overview readable when that binding is unavailable.
    */
   readonly ingress?: UploadIngressStatus | null;
+  readonly storage?: StorageAnalyticsBindings;
   readonly nowEpoch?: number;
 }
 
@@ -442,6 +445,11 @@ export async function readAdminOverview(
   const quarantineCutoffAt = new Date(
     nowEpoch - QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS,
   ).toISOString();
+  const storageOverview = options.storage
+    ? readStorageAdminOverview(options.storage, nowEpoch)
+    : Promise.resolve(null);
+  const skippedLegacyCount: CountRow = { total: 0 };
+  const skippedLegacyAccounts: ContributingAccountsRow = { total: 0 };
   const [
     controls,
     participants,
@@ -462,6 +470,7 @@ export async function readAdminOverview(
     recentDiagnostics,
     diagnosticLookup,
     adminAudit,
+    typed,
   ] = await Promise.all([
     readCollectionControls(db),
     db.prepare(
@@ -497,7 +506,7 @@ export async function readAdminOverview(
             ORDER BY created_at DESC, id DESC LIMIT ?3
          )`,
     ).bind(since, sinceWeek, MAX_ADMIN_AGGREGATE_ROWS).first<CountRow>(),
-    db.prepare(
+    options.storage ? Promise.resolve(skippedLegacyCount) : db.prepare(
       `SELECT COUNT(*) AS total,
               SUM(CASE WHEN superseded_at IS NULL THEN 1 ELSE 0 END) AS current,
               SUM(CASE WHEN created_at >= ?1 THEN 1 ELSE 0 END)
@@ -510,7 +519,7 @@ export async function readAdminOverview(
             ORDER BY created_at DESC, id DESC LIMIT ?3
          )`,
     ).bind(since, sinceWeek, MAX_ADMIN_AGGREGATE_ROWS).first<CountRow>(),
-    db.prepare(
+    options.storage ? Promise.resolve(skippedLegacyAccounts) : db.prepare(
       `SELECT COUNT(*) AS total,
               SUM(CASE WHEN last_accepted_at >= ?1 THEN 1 ELSE 0 END)
                 AS accepted_last_24h,
@@ -544,7 +553,7 @@ export async function readAdminOverview(
       sinceMonth,
       MAX_ADMIN_AGGREGATE_ROWS,
     ).first<ContributingAccountsRow>(),
-    db.prepare(
+    options.storage ? Promise.resolve(skippedLegacyCount) : db.prepare(
       "SELECT COUNT(*) AS total FROM (SELECT 1 FROM telemetry_records LIMIT ?)",
     ).bind(MAX_ADMIN_AGGREGATE_ROWS).first<CountRow>(),
     db.prepare(
@@ -605,26 +614,26 @@ export async function readAdminOverview(
          FROM retention_state WHERE singleton = 1`,
     ).first<RetentionRow>(),
     readQuarantineReconciliationStatus(db),
-    db.prepare(
+    options.storage ? Promise.resolve({ results: [] as SnapshotRow[] }) : db.prepare(
       `SELECT snapshot_id, week_start, week_end, revision,
               source_mutation_epoch, release_state, released_at
          FROM community_weekly_snapshots
         ORDER BY week_end DESC, revision DESC
         LIMIT 12`,
     ).all<SnapshotRow>(),
-    db.prepare(
+    options.storage ? Promise.resolve(skippedLegacyCount) : db.prepare(
       `SELECT COUNT(*) AS total FROM (
          SELECT 1 FROM community_weekly_snapshot_rebuilds LIMIT ?
        )`,
     ).bind(MAX_ADMIN_AGGREGATE_ROWS).first<{ total: number }>(),
-    db.prepare(
+    options.storage ? Promise.resolve(null) : db.prepare(
       `SELECT day, released_at
          FROM community_daily_aggregates
         WHERE release_state = 'published'
         ORDER BY day DESC, revision DESC
         LIMIT 1`,
     ).first<DailyPublicationRow>(),
-    db.prepare(
+    options.storage ? Promise.resolve(skippedLegacyCount) : db.prepare(
       `SELECT COUNT(*) AS total FROM (
          SELECT 1 FROM community_daily_aggregate_rebuilds LIMIT ?
        )`,
@@ -668,6 +677,7 @@ export async function readAdminOverview(
       details_json: string;
       created_at: string;
     }>(),
+    storageOverview,
   ]);
   if (!participants || !syntheticContributions || !telemetryContributions
       || !incrementalChunks
@@ -687,13 +697,15 @@ export async function readAdminOverview(
     boundedCount(contributingAccounts).bounded
     || boundedCount(telemetryContributions).bounded
     || boundedCount(incrementalChunks).bounded;
+  const contributions = typed?.contributions;
   return {
-    schemaVersion: "admin-overview-v0.3",
+    schemaVersion: "admin-overview-v0.5",
     generatedAt: now,
     service: {
       environment: options.environment,
       enrollmentMode: options.enrollmentMode,
       accountScopedIngestMode: options.accountScopedIngestMode,
+      telemetryStorageMode: typed ? "typed" : "json",
     },
     collection: controls,
     counts: {
@@ -707,17 +719,19 @@ export async function readAdminOverview(
       },
       contributions: {
         contributingAccounts: {
-          total: boundedCount(contributingAccounts).total,
-          bounded: contributingAccountsBounded,
-          acceptedLast24Hours: Number(
-            contributingAccounts.accepted_last_24h ?? 0,
-          ),
-          acceptedLast7Days: Number(
-            contributingAccounts.accepted_last_7d ?? 0,
-          ),
-          acceptedLast30Days: Number(
-            contributingAccounts.accepted_last_30d ?? 0,
-          ),
+          total: contributions?.contributingAccounts.total
+            ?? boundedCount(contributingAccounts).total,
+          bounded: contributions?.contributingAccounts.bounded
+            ?? contributingAccountsBounded,
+          acceptedLast24Hours: contributions?.contributingAccounts
+            .acceptedLast24Hours
+            ?? Number(contributingAccounts.accepted_last_24h ?? 0),
+          acceptedLast7Days: contributions?.contributingAccounts
+            .acceptedLast7Days
+            ?? Number(contributingAccounts.accepted_last_7d ?? 0),
+          acceptedLast30Days: contributions?.contributingAccounts
+            .acceptedLast30Days
+            ?? Number(contributingAccounts.accepted_last_30d ?? 0),
         },
         synthetic: {
           total: boundedCount(syntheticContributions).total,
@@ -734,21 +748,31 @@ export async function readAdminOverview(
           acceptedLast7Days: Number(telemetryContributions.accepted_last_7d ?? 0),
         },
         incrementalChunks: {
-          total: boundedCount(incrementalChunks).total,
-          bounded: boundedCount(incrementalChunks).bounded,
-          current: Number(incrementalChunks.current ?? 0),
-          acceptedLast24Hours: Number(incrementalChunks.accepted_last_24h ?? 0),
-          acceptedLast7Days: Number(incrementalChunks.accepted_last_7d ?? 0),
+          total: contributions?.incrementalChunks.total
+            ?? boundedCount(incrementalChunks).total,
+          bounded: contributions?.incrementalChunks.bounded
+            ?? boundedCount(incrementalChunks).bounded,
+          current: contributions?.incrementalChunks.current
+            ?? Number(incrementalChunks.current ?? 0),
+          acceptedLast24Hours: contributions?.incrementalChunks
+            .acceptedLast24Hours
+            ?? Number(incrementalChunks.accepted_last_24h ?? 0),
+          acceptedLast7Days: contributions?.incrementalChunks
+            .acceptedLast7Days
+            ?? Number(incrementalChunks.accepted_last_7d ?? 0),
         },
-        acceptedLast24Hours:
+        acceptedLast24Hours: contributions?.acceptedLast24Hours ?? (
           Number(telemetryContributions.accepted_last_24h ?? 0)
-          + Number(incrementalChunks.accepted_last_24h ?? 0),
-        acceptedLast7Days:
+          + Number(incrementalChunks.accepted_last_24h ?? 0)),
+        acceptedLast7Days: contributions?.acceptedLast7Days ?? (
           Number(telemetryContributions.accepted_last_7d ?? 0)
-          + Number(incrementalChunks.accepted_last_7d ?? 0),
-        latestAcceptedAt,
-        storedTelemetryRecords: boundedCount(telemetryRecords).total,
-        storedTelemetryRecordsBounded: boundedCount(telemetryRecords).bounded,
+          + Number(incrementalChunks.accepted_last_7d ?? 0)),
+        latestAcceptedAt: contributions?.latestAcceptedAt ?? latestAcceptedAt,
+        storedTelemetryRecords: contributions?.storedTelemetryRecords
+          ?? boundedCount(telemetryRecords).total,
+        storedTelemetryRecordsBounded:
+          contributions?.storedTelemetryRecordsBounded
+          ?? boundedCount(telemetryRecords).bounded,
       },
     },
     quarantine: {
@@ -786,7 +810,7 @@ export async function readAdminOverview(
       bounded: boundedCount(deletionTombstones).bounded,
       earliestRetainUntil: deletionTombstones.earliest_retain_until,
     },
-    snapshots: snapshots.results.map((row) => ({
+    snapshots: typed ? [] : snapshots.results.map((row) => ({
       snapshotId: row.snapshot_id,
       weekStart: row.week_start,
       weekEnd: row.week_end,
@@ -795,10 +819,14 @@ export async function readAdminOverview(
       releaseState: row.release_state,
       releasedAt: row.released_at,
     })),
-    pendingHistoricalRebuilds: boundedCount(pendingRebuilds ?? { total: 0 }).total,
-    pendingHistoricalRebuildsBounded:
-      boundedCount(pendingRebuilds ?? { total: 0 }).bounded,
-    dailyPublication: {
+    pendingHistoricalRebuilds: typed
+      ? null
+      : boundedCount(pendingRebuilds ?? { total: 0 }).total,
+    pendingHistoricalRebuildsBounded: typed
+      ? null
+      : boundedCount(pendingRebuilds ?? { total: 0 }).bounded,
+    historicalPublication: typed?.historicalPublication ?? null,
+    dailyPublication: typed?.dailyPublication ?? {
       latestEvidenceDay: latestDailyPublication?.day ?? null,
       latestReleasedAt: latestDailyPublication?.released_at ?? null,
       pendingRebuilds:

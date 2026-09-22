@@ -19,6 +19,7 @@ const KEYS = new Set([
   "snapshotId",
   "sourceSnapshotId",
   "period",
+  "endAt",
   "scope",
   "grouping",
   "project",
@@ -57,6 +58,10 @@ export function validateWorkUsageQuery(value) {
     q.pageSize < 1 ||
     q.pageSize > 100
   )
+    throw workUsageError("work_usage_query_invalid");
+  if (q.endAt !== undefined && (typeof q.endAt !== "string"
+      || !Number.isSafeInteger(Date.parse(q.endAt)) || Date.parse(q.endAt) < 0
+      || new Date(q.endAt).toISOString() !== q.endAt))
     throw workUsageError("work_usage_query_invalid");
   for (const key of [
     "snapshotId",
@@ -129,7 +134,7 @@ async function createSearchIndex(result, enrich) {
   return index;
 }
 
-/** Process-local immutable reports. Jobs never block HTTP or retain source content. */
+/** Immutable reports with an optional content-free last-good snapshot port. */
 export function createWorkUsageService({
   build,
   enrich = async () => ({}),
@@ -137,9 +142,30 @@ export function createWorkUsageService({
   newId = randomUUID,
   idleMs = 300_000,
   maximumSnapshots = 2,
+  snapshotStore = null,
 } = {}) {
   const snapshots = new Map();
   let active = null;
+  let closed = false;
+  const completed = new Map();
+  const writes = new Set();
+  const cacheKey = q => JSON.stringify([q.period, q.scope ?? null]);
+  const authoritative = result => result.status === "available"
+    && result.generation?.status === "complete" && result.metadata?.status === "available";
+  function retain(entry) {
+    const key = cacheKey({ period: entry.period, scope: entry.requestedScope });
+    completed.delete(key);
+    completed.set(key, { id: entry.id, result: entry.result,
+      fromMs: entry.fromMs, toMs: entry.toMs, namesAvailable: true });
+    while (completed.size > maximumSnapshots) completed.delete(completed.keys().next().value);
+    if (!snapshotStore) return;
+    const write = Promise.resolve().then(() => snapshotStore.write({
+      period: entry.period, scope: entry.requestedScope,
+      ...(entry.exactWindow ? { endAt: new Date(entry.toMs).toISOString() } : {}),
+    }, { ...entry.result, fromMs: entry.fromMs, toMs: entry.toMs })).catch(() => {});
+    writes.add(write);
+    void write.finally(() => writes.delete(write));
+  }
   const dispose = (entry) => {
     entry.controller.abort();
     snapshots.delete(entry.id);
@@ -153,18 +179,31 @@ export function createWorkUsageService({
   expiryTimer.unref?.();
   return {
     close() {
+      closed = true;
       clearInterval(expiryTimer);
       for (const entry of snapshots.values()) dispose(entry);
+      completed.clear();
+      return Promise.allSettled([...writes]);
     },
     async query(input) {
       const q = validateWorkUsageQuery(input);
+      if (closed) throw workUsageError("work_usage_unavailable");
+      // Read only a validated local snapshot, never wait for aggregation here.
+      let restored = null;
+      if (!q.snapshotId && !q.sourceSnapshotId && !completed.has(cacheKey(q)) && snapshotStore) {
+        try { restored = await snapshotStore.read(q); } catch { /* Optional cache. */ }
+        if (closed) throw workUsageError("work_usage_unavailable");
+      }
       sweep();
       const source = q.sourceSnapshotId ? snapshots.get(q.sourceSnapshotId) : null;
       if (q.sourceSnapshotId && !source) throw workUsageError("work_usage_snapshot_expired");
       if (source && source.status !== "available") throw workUsageError("work_usage_snapshot_changed");
       // Capture before capacity eviction: related periods share the displayed
       // accounting instant, even when the original build took a long time.
-      const anchorToMs = source?.toMs ?? null;
+      const requestedEnd = q.endAt === undefined ? null : Date.parse(q.endAt);
+      if (requestedEnd !== null && (requestedEnd > clock()
+          || (source && source.toMs !== requestedEnd))) throw workUsageError("work_usage_query_invalid");
+      const anchorToMs = requestedEnd ?? source?.toMs ?? null;
       const expectedGeneration = source?.result?.generation?.fingerprint ?? source?.result?.generation;
       let entry = q.snapshotId ? snapshots.get(q.snapshotId) : null;
       if (q.snapshotId && !entry)
@@ -176,6 +215,7 @@ export function createWorkUsageService({
       if (
         entry && q.action !== "touch" &&
         (entry.period !== q.period ||
+          (requestedEnd !== null && entry.toMs !== requestedEnd) ||
           (q.scope !== undefined && entry.requestedScope !== q.scope))
       )
         throw workUsageError("work_usage_snapshot_changed");
@@ -185,6 +225,7 @@ export function createWorkUsageService({
           active.period === q.period &&
           active.requestedScope === q.scope &&
           active.anchorToMs === anchorToMs &&
+          active.exactWindow === (requestedEnd !== null) &&
           active.expectedGeneration === expectedGeneration
         )
           entry = active;
@@ -197,6 +238,16 @@ export function createWorkUsageService({
           }
           const now = anchorToMs ?? clock();
           const duration = PERIODS[q.period];
+          let retained = completed.get(cacheKey(q)) ?? (restored ? {
+            id: newId(), result: restored, fromMs: restored.fromMs,
+            toMs: restored.toMs, namesAvailable: false,
+          } : null);
+          // An explicit reporting end must match exactly, including after a
+          // restart. A source snapshot additionally pins the generation; an
+          // endAt-only request has no generation identity to compare against.
+          if (anchorToMs !== null && (retained?.toMs !== anchorToMs
+              || (expectedGeneration !== undefined
+                && (retained?.result.generation?.fingerprint ?? retained?.result.generation) !== expectedGeneration))) retained = null;
           entry = {
             id: newId(),
             period: q.period,
@@ -205,9 +256,11 @@ export function createWorkUsageService({
             expectedGeneration,
             fromMs: duration === null ? 0 : Math.max(0, now - duration),
             toMs: now,
-            touched: now,
+            touched: clock(),
+            exactWindow: requestedEnd !== null,
             controller: new AbortController(),
             status: "preparing",
+            retained,
             cursors: new Map(),
           };
           snapshots.set(entry.id, entry);
@@ -218,6 +271,7 @@ export function createWorkUsageService({
               build(
                 {
                   period: selected.period,
+                  exactWindow: selected.exactWindow,
                   fromMs: selected.fromMs,
                   toMs: selected.toMs,
                   scope: selected.requestedScope,
@@ -231,9 +285,10 @@ export function createWorkUsageService({
                   selected.expectedGeneration !== (result.generation?.fingerprint ?? result.generation)) {
                 throw workUsageError("work_usage_snapshot_changed");
               }
-              if (result.status === "available" && result.toMs !== undefined) {
+              if (result.status === "available" && (selected.exactWindow || result.toMs !== undefined)) {
                 const duration = PERIODS[selected.period];
                 if (!Number.isSafeInteger(result.toMs) || result.toMs > selected.toMs
+                    || (selected.exactWindow && result.toMs !== selected.toMs)
                     || !Number.isSafeInteger(result.fromMs)
                     || result.fromMs !== (duration === null ? 0 : Math.max(0, result.toMs - duration))) {
                   throw workUsageError("work_usage_snapshot_changed");
@@ -241,8 +296,13 @@ export function createWorkUsageService({
                 selected.fromMs = result.fromMs;
                 selected.toMs = result.toMs;
               }
+              if (selected.retained && !authoritative(result)) {
+                selected.status = "unavailable";
+                return;
+              }
               selected.result = result;
               selected.status = result.status;
+              if (authoritative(result)) retain(selected);
             })
             .catch((error) => {
               if (!snapshots.has(selected.id)) return;
@@ -259,24 +319,34 @@ export function createWorkUsageService({
         }
       }
       entry.touched = clock();
+      // A retained report is read-only and has its own immutable identity.
+      // The pending build keeps a separate ID; no old cursor can address it.
+      const retained = q.action !== "touch" && entry.status !== "available"
+        && entry.retained && !q.cursor
+        && (entry.retained.namesAvailable || ![q.project, q.worktree, q.thread, q.findThread, q.search].some(Boolean))
+        ? entry.retained : null;
       const base = {
         schemaVersion: WORK_USAGE_SCHEMA,
-        status: entry.status,
-        snapshotId: entry.id,
-        fromMs: entry.fromMs,
-        toMs: entry.toMs,
+        status: retained ? "available" : entry.status,
+        snapshotId: retained?.id ?? entry.id,
+        fromMs: retained?.fromMs ?? entry.fromMs,
+        toMs: retained?.toMs ?? entry.toMs,
+        ...(retained ? { retained: true, refreshing: entry.status === "preparing",
+          refreshSnapshotId: entry.status === "preparing" ? entry.id : null,
+          namesAvailable: retained.namesAvailable } : {}),
         errorCode: entry.errorCode ?? null,
       };
       // A visible report renews its idle lease without repeating aggregation,
       // name enrichment, or cursor allocation. Expired reports stay expired.
-      if (q.action === "touch" || entry.status !== "available") return base;
-      const result = entry.result;
+      if (q.action === "touch" || base.status !== "available") return base;
+      const result = retained?.result ?? entry.result;
       const selected = { ...q, offset: 0 };
       if (q.findThread)
         selected.thread = result.threadLookup[q.findThread] ?? "not-found";
       if (q.search) {
-        entry.searchIndex ??= createSearchIndex(result, enrich);
-        const index = await entry.searchIndex;
+        const key = retained ? "retainedSearchIndex" : "searchIndex";
+        entry[key] ??= createSearchIndex(result, enrich);
+        const index = await entry[key];
         selected.searchMatches = { projects: new Set(), threads: new Set() };
         for (const [id, name] of index.projects) if (name.includes(q.search)) selected.searchMatches.projects.add(id);
         for (const [id, name] of index.threads) if (name.includes(q.search)) selected.searchMatches.threads.add(result.threadFamilies?.[id] ?? id);
@@ -299,7 +369,7 @@ export function createWorkUsageService({
       }
       const report = queryWorkUsageSnapshot(result, selected);
       let nextCursor = null;
-      if (report.nextOffset !== null) {
+      if (!retained && report.nextOffset !== null) {
         const existing = [...entry.cursors].find(
           ([, c]) => c.key === filterKey && c.offset === report.nextOffset,
         );
@@ -313,7 +383,7 @@ export function createWorkUsageService({
           });
         }
       }
-      const display = await enrich({ result, rows: report.rows });
+      const display = retained?.namesAvailable === false ? {} : await enrich({ result, rows: report.rows });
       if (!snapshots.has(entry.id) || entry.controller.signal.aborted)
         throw workUsageError("work_usage_snapshot_expired");
       return {

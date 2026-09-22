@@ -63,3 +63,5 @@ export {
   usageExplanationCatalog,
 } from "./usage-explainer.js";
 export { createModelPerformanceContext } from './model-performance.js';
+
+export { createWorkUsageSnapshotStore } from "./work-usage-snapshots.js";

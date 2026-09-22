@@ -333,6 +333,16 @@ test("bounded metadata parsing fails closed on oversized lines, names, and unsel
   assert.equal(result.get(WORKER).nickname, null);
   assert.equal(result.get(WORKER).parent, null);
   assert.equal((await readCodexLocalThreadMetadata(home, Array(161).fill(ROOT))).size, 0);
+  assert.equal((await readCodexLocalThreadMetadata(
+    home,
+    Array(2_000).fill(ROOT),
+    { forCacheDropLinks: true },
+  )).size, 1);
+  assert.equal((await readCodexLocalThreadMetadata(
+    home,
+    Array(2_001).fill(ROOT),
+    { forCacheDropLinks: true },
+  )).size, 0);
   assert.equal((await readCodexLocalThreadMetadata(home, ["not-a-uuid"])).size, 0);
 });
 

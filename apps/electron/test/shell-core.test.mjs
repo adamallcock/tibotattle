@@ -2690,6 +2690,7 @@ test("desktop lifecycle composes secure window, tray, single instance, retry, an
     candidate.options.webPreferences.preload === "/private/preload.cjs"
   ));
   const firstDashboard = dashboard();
+  assert.equal(firstDashboard.options.minWidth, 960);
   assert.equal(trays.length, 1);
   assert.equal(trays[0].menu.template.some((item) => item.label === "Retry"), false);
   assert.equal(firstDashboard.options.webPreferences.nodeIntegration, false);
@@ -4052,6 +4053,7 @@ test("desktop lifecycle cancels an in-flight retry before quit and serializes sh
 test("Electron entry quits explicitly when composition fails before lifecycle ownership", async () => {
   const app = new FakeApp();
   const events = [];
+  const alerts = [];
   app.quit = () => {
     events.push("quit");
     app.quitCalls += 1;
@@ -4059,7 +4061,15 @@ test("Electron entry quits explicitly when composition fails before lifecycle ow
   const diagnostics = [];
   await assert.rejects(
     launchElectronShell({
-      electron: { app },
+      electron: {
+        app,
+        dialog: {
+          showErrorBox(title, message) {
+            events.push("alert");
+            alerts.push({ title, message });
+          },
+        },
+      },
       emitFailureDiagnostic: true,
       writeDiagnostic: (value) => {
         events.push("diagnostic");
@@ -4069,15 +4079,28 @@ test("Electron entry quits explicitly when composition fails before lifecycle ow
     electronEntryCompositionFailure,
   );
   assert.deepEqual(diagnostics, [`${ELECTRON_ENTRY_FAILURE_DIAGNOSTIC}\n`]);
-  assert.deepEqual(events, ["diagnostic", "quit"]);
+  assert.deepEqual(alerts, [{
+    title: "TiboTattle could not start",
+    message: `TiboTattle stopped before opening the dashboard.\n\nSupport code: ${ELECTRON_ENTRY_FAILURE_DIAGNOSTIC}\n\nPlease report this code with the app and operating system versions. Preserve your local data.`,
+  }]);
+  assert.deepEqual(events, ["diagnostic", "alert", "quit"]);
   assert.equal(app.quitCalls, 1);
 });
 
-test("Electron entry still quits when its fixed diagnostic cannot be written", async () => {
+test("Electron entry still quits when its fixed diagnostic and native alert fail", async () => {
   const app = new FakeApp();
+  let alertCalls = 0;
   await assert.rejects(
     launchElectronShell({
-      electron: { app },
+      electron: {
+        app,
+        dialog: {
+          showErrorBox() {
+            alertCalls += 1;
+            throw new Error("synthetic native dialog failure");
+          },
+        },
+      },
       emitFailureDiagnostic: true,
       writeDiagnostic() {
         throw new Error("synthetic diagnostic failure");
@@ -4085,6 +4108,7 @@ test("Electron entry still quits when its fixed diagnostic cannot be written", a
     }),
     electronEntryCompositionFailure,
   );
+  assert.equal(alertCalls, 1);
   assert.equal(app.quitCalls, 1);
 });
 
@@ -4619,7 +4643,9 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     "openDashboardInBrowser",
     "showDiagnostics",
     "revealLocalData",
+    "getRefreshStatus",
     "refreshStarted",
+    "refreshHeartbeat",
     "refreshSettled",
   ]);
   assert.equal(bridge.version, "v1");
@@ -4715,7 +4741,9 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   await bridge.openDashboardInBrowser();
   await bridge.showDiagnostics();
   await bridge.revealLocalData();
-  await bridge.refreshStarted();
+  await bridge.getRefreshStatus();
+  await bridge.refreshStarted("quick");
+  await bridge.refreshHeartbeat(1);
   await bridge.refreshSettled(1);
   assert.deepEqual(JSON.parse(JSON.stringify(calls.map(({ channel, request }) => ({ channel, request })))), [
     { channel: "tibotattle:desktop:v1", request: { action: "getSettings", args: {} } },
@@ -4793,7 +4821,9 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     { channel: "tibotattle:desktop:v1", request: { action: "openDashboardInBrowser", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "showDiagnostics", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "revealLocalData", args: {} } },
-    { channel: "tibotattle:desktop:v1", request: { action: "refreshStarted", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "getRefreshStatus", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "refreshStarted", args: { mode: "quick" } } },
+    { channel: "tibotattle:desktop:v1", request: { action: "refreshHeartbeat", args: { lease: 1 } } },
     { channel: "tibotattle:desktop:v1", request: { action: "refreshSettled", args: { lease: 1 } } },
   ]);
   await assert.rejects(
@@ -4836,7 +4866,12 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     () => bridge.openCommunity("extra"),
     () => bridge.showDiagnostics("extra"),
     () => bridge.revealLocalData("extra"),
+    () => bridge.getRefreshStatus("extra"),
+    () => bridge.refreshStarted(),
     () => bridge.refreshStarted("extra"),
+    () => bridge.refreshStarted("quick", "extra"),
+    () => bridge.refreshHeartbeat("extra"),
+    () => bridge.refreshHeartbeat(0),
     () => bridge.refreshSettled("extra"),
     () => bridge.refreshSettled(0),
     () => bridge.setSharingEnabled("true"),
@@ -5146,4 +5181,81 @@ test("preload marks both document roots as electron-dashboard across DOM readine
   assert.equal(document.body.classList.contains("electron-dashboard"), true);
   assert.equal(documentElement.classList.contains("native-dashboard"), false);
   assert.equal(document.body.classList.contains("native-dashboard"), false);
+});
+
+test("dashboard minimum width fits smaller display work areas", async () => {
+  const windows = [];
+  const lifecycle = createDesktopLifecycle({
+    app: new FakeApp(),
+    BrowserWindow: class extends FakeWindow {
+      constructor(options) { super(options); windows.push(this); }
+    },
+    Tray: FakeTray,
+    Menu: { buildFromTemplate: template => ({ template }) },
+    icon: "empty-icon", preloadPath: "/private/preload.cjs",
+    screen: { getPrimaryDisplay: () => ({ workAreaSize: { width: 800, height: 600 } }) },
+    supervisor: { async start() { return { origin: "http://127.0.0.1:4999" }; }, async stop() {} },
+  });
+  await lifecycle.start();
+  const dashboard = windows.find(window => window.options.webPreferences.preload === "/private/preload.cjs");
+  assert.equal(dashboard.options.minWidth, 800);
+  assert.equal(dashboard.options.width, 800);
+  await lifecycle.requestQuit();
+});
+
+
+test("companion supervisor confines prospective development account keys to explicit private macOS QA", async () => {
+  const pair = {
+    USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+    USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "/private/fixture/identity/export-identity",
+    USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/private/fixture/identity/account-observation-development",
+  };
+  for (const lane of [undefined, "windows-electron-smoke", "macos-electron-local-qa-v1"]) {
+    const child = new FakeChild();
+    let selected;
+    const supervisor = createCompanionSupervisor({
+      platform: "darwin",
+      environment: { ...pair, USAGE_MONITOR_TEST_LANE: lane },
+      spawnChild(_command, _args, { env }) { selected = env; return child; },
+    });
+    const ready = supervisor.start();
+    child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4545/\n"));
+    await ready;
+    assert.equal(selected.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE,
+      lane === "macos-electron-local-qa-v1" ? pair.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE : undefined);
+    const stopped = supervisor.stop();
+    child.emit("exit", 0, null);
+    await stopped;
+  }
+  for (const patch of [
+    { platform: "linux" },
+    { platform: "win32" },
+    { USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: undefined },
+    { USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: undefined },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "relative" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/private/fixture/identity/export-identity" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/private/other/identity/account-observation-development" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/private/fixture/identity/./account-observation-development" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/private/fixture/identity/../identity/account-observation-development" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/private/fixture/identity//account-observation-development" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "/private/fixture/identity/account-observation-development/" },
+    { USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "/private/fixture/identity/./export-identity" },
+    { USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "/private/fixture/identity/../identity/export-identity" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "C:/private/fixture/identity/account-observation-development" },
+    { USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "C:/private/fixture/identity/export-identity" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "\\\\server\\share\\identity\\account-observation-development" },
+    { USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "\\\\server\\share\\identity\\export-identity" },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: "//server/share/identity/account-observation-development" },
+    { USAGE_MONITOR_ACCOUNTLESS_ORIGIN: "https://example.invalid" },
+    { USAGE_MONITOR_ACCOUNTLESS_MODE: "production-v1" },
+  ]) {
+    let spawned = false;
+    const supervisor = createCompanionSupervisor({
+      platform: patch.platform ?? "darwin",
+      environment: { ...pair, USAGE_MONITOR_TEST_LANE: "macos-electron-local-qa-v1", ...patch },
+      spawnChild() { spawned = true; return new FakeChild(); },
+    });
+    await assert.rejects(supervisor.start(), { code: "electron_shell_companion_spawn_failed" });
+    assert.equal(spawned, false);
+  }
 });

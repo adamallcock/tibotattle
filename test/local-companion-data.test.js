@@ -424,6 +424,183 @@ test("local companion builds a closed real-data projection without identifiers o
   }
 });
 
+test("local companion reconstructs reset kinds and prefers prospective banked evidence", async () => {
+  const root = await fixtureRoot();
+  const accountScope = {
+    status: "available",
+    version: "openai-account-v1",
+    scopeId: "openai-account:v1:synthetic-reset-projection",
+    planType: "pro",
+  };
+  const window = ({ duration, usedPercent, resetsAt }) => ({
+    provider: "openai_codex",
+    planType: "pro",
+    limitId: "codex",
+    slot: duration === 300 ? "primary" : "secondary",
+    usedPercent,
+    windowDurationMins: duration,
+    resetsAt: Date.parse(resetsAt) / 1_000,
+  });
+  const record = (observedAt, weeklyUsed, fiveHourUsed, resetEvents = undefined) => ({
+    schemaVersion: "0.3",
+    kind: "codex_quota_snapshot",
+    provider: "openai_codex",
+    source: "app_server_read",
+    observedAt,
+    receivedAt: observedAt,
+    accountScope,
+    windows: [
+      window({
+        duration: 10_080,
+        usedPercent: weeklyUsed,
+        resetsAt: observedAt < "2026-07-25T00:00:00.000Z"
+          ? "2026-07-25T00:00:00.000Z"
+          : "2026-08-01T00:00:00.000Z",
+      }),
+      window({
+        duration: 300,
+        usedPercent: fiveHourUsed,
+        resetsAt: "2026-07-26T00:00:00.000Z",
+      }),
+    ],
+    ...(resetEvents === undefined ? {} : { resetEvents }),
+  });
+  const banked = {
+    schemaVersion: "quota-reset-event-v0.1",
+    kind: "banked_reset_used",
+    occurredAt: "2026-07-25T02:00:00.000Z",
+    observedAt: "2026-07-25T02:00:00.000Z",
+    intervalStartedAt: "2026-07-25T01:00:00.000Z",
+    precision: "observation_interval",
+    reason: "credit_count_decreased_before_expiry",
+    provider: "openai_codex",
+    planType: "pro",
+    limitId: "codex",
+    windowDurationMins: 10_080,
+  };
+  const oldGrant = {
+    schemaVersion: "quota-reset-event-v0.1",
+    kind: "reset_credit_granted",
+    occurredAt: "2026-06-20T00:00:00.000Z",
+    observedAt: "2026-06-20T01:00:00.000Z",
+    intervalStartedAt: "2026-06-19T23:00:00.000Z",
+    precision: "provider_timestamp",
+    reason: "reset_credit_id_added",
+    provider: "openai_codex",
+    planType: null,
+    limitId: null,
+    windowDurationMins: null,
+  };
+  try {
+    const ledger = [
+      {
+        ...record("2026-06-20T01:00:00.000Z", 20, 20, [oldGrant]),
+        source: "app_server_notification",
+      },
+      record("2026-07-24T23:50:00.000Z", 88, 20),
+      record("2026-07-25T00:10:00.000Z", 2, 25),
+      record("2026-07-25T01:00:00.000Z", 80, 80),
+      record("2026-07-25T02:00:00.000Z", 3, 3, [banked]),
+      record("2026-07-25T02:05:00.000Z", 4, 4),
+    ];
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      `${ledger.map((row) => JSON.stringify(row)).join("\n")}\n`,
+      { mode: 0o600 },
+    );
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      allowDevelopmentArtifactFallback: true,
+      now: () => Date.parse("2026-07-25T03:00:00.000Z"),
+    });
+    assert.deepEqual(
+      snapshot.overview.timeline.resetEvents.map((event) => [
+        event.kind,
+        event.windowDurationMins,
+        event.occurredAt,
+      ]),
+      [
+        ["reset_credit_granted", null, "2026-06-20T00:00:00.000Z"],
+        ["scheduled_reset", 10_080, "2026-07-25T00:00:00.000Z"],
+        ["banked_reset_used", 10_080, "2026-07-25T02:00:00.000Z"],
+        ["unknown_reset", 300, "2026-07-25T02:00:00.000Z"],
+      ],
+    );
+    assert.equal(
+      Date.parse(snapshot.overview.timeline.resetEvents[0].occurredAt)
+        < Date.parse("2026-06-24T03:00:00.000Z"),
+      true,
+      "durable reset events remain available beyond the 31-day chart cache",
+    );
+    const serialized = JSON.stringify(snapshot);
+    assert.equal(serialized.includes("reset-credit-id"), false);
+    assert.equal(serialized.includes("availableCount"), false);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("local reset reconstruction breaks at an unattributed account read", async () => {
+  const root = await fixtureRoot();
+  const accountScope = {
+    status: "available",
+    version: "openai-account-v1",
+    scopeId: "openai-account:v1:synthetic-reset-attribution-gap",
+    planType: "pro",
+  };
+  const record = (hour, usedPercent, scope = accountScope) => {
+    const observedAt = `2026-07-25T0${hour}:00:00.000Z`;
+    return {
+      schemaVersion: "0.3",
+      kind: "codex_quota_snapshot",
+      provider: "openai_codex",
+      source: "app_server_read",
+      observedAt,
+      receivedAt: observedAt,
+      accountScope: scope,
+      windows: [{
+        provider: "openai_codex",
+        planType: "pro",
+        limitId: "codex",
+        slot: "secondary",
+        usedPercent,
+        windowDurationMins: 10_080,
+        resetsAt: Date.parse("2026-08-01T00:00:00.000Z") / 1_000,
+      }],
+    };
+  };
+  try {
+    const ledger = [
+      record(0, 88),
+      record(1, 4, { status: "unavailable" }),
+      record(2, 4),
+      record(3, 5),
+      record(4, 80),
+      record(5, 3),
+      record(6, 4),
+    ];
+    await writeFile(join(root, ".usage-monitor", "collector-events.jsonl"),
+      `${ledger.map((row) => JSON.stringify(row)).join("\n")}\n`,
+      { mode: 0o600 });
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      allowDevelopmentArtifactFallback: true,
+      now: () => Date.parse("2026-07-25T07:00:00.000Z"),
+    });
+    assert.deepEqual(snapshot.overview.timeline.resetEvents.map((event) => ({
+      kind: event.kind,
+      intervalStartedAt: event.intervalStartedAt,
+      occurredAt: event.occurredAt,
+    })), [{
+      kind: "unknown_reset",
+      intervalStartedAt: "2026-07-25T04:00:00.000Z",
+      occurredAt: "2026-07-25T05:00:00.000Z",
+    }], "only the later uninterrupted account track can establish a reset");
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("development side-chat estimates adjust only the calibration timeline", async () => {
   const root = await fixtureRoot();
   const codexHome = join(root, ".codex-test");
@@ -692,6 +869,7 @@ test("raw rollout history reaches the companion through the archive projection w
       .find((period) => period.periodId === "history");
     assert.ok(history);
     assert.equal(history.periodLabel, "Indexed history");
+    assert.deepEqual(history.reportingWindow, { startAt: null, endAt: "2026-08-01T12:00:00.000Z" });
     assert.equal(history.events, 3);
     assert.equal(history.totalTokens, 3_000_000);
     assert.equal(history.apiPriceEquivalentUsd, 7);

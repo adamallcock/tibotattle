@@ -16,10 +16,12 @@ import { parse, printParseErrorCode } from "jsonc-parser";
 import {
   ATTRIBUTION_SCHEMA_OBJECTS,
   attributionSchemaComplete,
-  POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL,
+  CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL,
   SCALE_SCHEMA_COLUMNS,
   SCALE_SCHEMA_OBJECTS,
-  POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL,
+  CURRENT_SCALE_SCHEMA_PROBE_SQL,
+  PUBLIC_SOURCE_SCHEMA_PROBE_SQL,
+  publicSourceSchemaComplete,
   scaleSchemaComplete,
   EXPECTED_STAGING_MIGRATIONS,
 } from "./staging-readiness-lib.mjs";
@@ -86,6 +88,10 @@ export const REQUIRED_DELETION_LEDGER_SCHEMA_OBJECTS = Object.freeze([
   ["table", "identity_reenrollment_cooldowns"],
   ["index", "deletion_tombstones_retention"],
   ["index", "identity_reenrollment_cooldowns_retention"],
+  ["table", "storage_erasure_jobs"],
+  ["index", "storage_erasure_pending"],
+  ["trigger", "storage_erasure_job_scope"],
+  ["trigger", "storage_erasure_tombstone_retained"],
 ]);
 
 export const REQUIRED_COLUMNS = Object.freeze({
@@ -178,6 +184,10 @@ export const REQUIRED_COLUMNS = Object.freeze({
 });
 
 export const REQUIRED_DELETION_LEDGER_COLUMNS = Object.freeze({
+  storage_erasure_jobs: Object.freeze([
+    "participant_digest", "source_id", "owner_digest", "source_namespace",
+    "state", "terminal_json", "completed_at", "attempted_ms",
+  ]),
   deletion_tombstones: Object.freeze([
     "participant_digest",
     "schema_version",
@@ -730,7 +740,7 @@ export async function runReleasePreflight({
         stateDirectory,
         binding: "USAGE_MONITOR_DB",
         spawn,
-        sql: POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL,
+        sql: CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL,
       });
       const scaleRows = runQuery({
         wrangler,
@@ -739,14 +749,18 @@ export async function runReleasePreflight({
         stateDirectory,
         binding: "USAGE_MONITOR_DB",
         spawn,
-        sql: POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL,
+        sql: CURRENT_SCALE_SCHEMA_PROBE_SQL,
       });
+      const publicSourceRows = runQuery({ wrangler, workerDirectory, configPath,
+        stateDirectory, binding: "USAGE_MONITOR_DB", spawn, sql: PUBLIC_SOURCE_SCHEMA_PROBE_SQL });
       receipt.checks.requiredSchemaPresent = objectsPresent
         && columnsPresent.every(Boolean)
         && Array.isArray(attributionRows) && attributionRows.length === 1
         && attributionSchemaComplete(attributionRows[0])
         && Array.isArray(scaleRows) && scaleRows.length === 1
-        && scaleSchemaComplete(scaleRows[0]);
+        && scaleSchemaComplete(scaleRows[0])
+        && Array.isArray(publicSourceRows) && publicSourceRows.length === 1
+        && publicSourceSchemaComplete(publicSourceRows[0]);
       if (!receipt.checks.requiredSchemaPresent) {
         receipt.blockers.push("LOCAL_SCHEMA_INCOMPLETE");
       }

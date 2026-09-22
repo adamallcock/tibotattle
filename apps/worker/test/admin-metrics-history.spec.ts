@@ -11,6 +11,12 @@ import {
   readCachedAdminMetricsHistory,
   warmAdminMetricsHistoryCache,
 } from "../src/admin-metrics-history";
+import {
+  createV11DeviceFixture,
+  makeV11Day,
+  stageV11Day,
+  v11UsageRecord,
+} from "./helpers/telemetry-v11";
 
 interface TestBindings {
   USAGE_MONITOR_DB: D1Database;
@@ -127,6 +133,41 @@ describe("admin metric snapshots", () => {
       quarantinePendingObjects: 10000,
       quarantineWithinGrace: 10000,
       quarantinePendingObjectsBounded: 1,
+    });
+  });
+
+  it("classifies retained v1.1 uploads as referenced in quarantine history", async () => {
+    const db = bindings.USAGE_MONITOR_DB;
+    const nowEpoch = Date.now();
+    const day = new Date(nowEpoch).toISOString().slice(0, 10);
+    const fixture = await createV11DeviceFixture(db, { nowEpoch, grant: true });
+    await stageV11Day(db, fixture, await makeV11Day(day, {
+      usage: [v11UsageRecord(day)],
+    }));
+    const dueAt = new Date(nowEpoch - 24 * 60 * 60 * 1_000).toISOString();
+    await db.batch([
+      db.prepare(
+        `INSERT INTO pending_quarantine_objects (
+           r2_key, contribution_id, object_kind, registered_at
+         ) SELECT r2_key, id, 'telemetry', ? FROM telemetry_v11_chunks`,
+      ).bind(dueAt),
+      db.prepare(
+        `INSERT INTO pending_quarantine_objects (
+           r2_key, contribution_id, object_kind, registered_at
+         ) VALUES ('telemetry/unreferenced', 'unreferenced', 'telemetry', ?)`,
+      ).bind(dueAt),
+    ]);
+
+    expect((await captureAdminMetricSnapshot(db, nowEpoch)).code)
+      .toBe("SNAPSHOT_CAPTURED");
+    const row = await db.prepare(
+      "SELECT metrics_json FROM admin_metric_snapshots",
+    ).first<{ metrics_json: string }>();
+    expect(JSON.parse(row?.metrics_json ?? "{}")).toMatchObject({
+      quarantinePendingObjects: 2,
+      quarantineWithinGrace: 0,
+      quarantineDueReferenced: 1,
+      quarantineDueUnreferenced: 1,
     });
   });
 

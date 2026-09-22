@@ -14,6 +14,12 @@ these commands. Command coverage is checked against `src/cli.js` by
 `test/cli-reference.test.js`; the CLI's own usage output remains the authority
 for exact flags.
 
+The separate `npm run diagnose:desktop-crash -- --hours 72` source command is a
+read-only macOS support tool for an app that will not open. It does not run
+Electron or the `usage-monitor doctor` command. See [support](../../SUPPORT.md)
+for its privacy boundary, `--verbose` option, direct Node `--json` invocation,
+and separate `--export-private` local evidence action.
+
 Commands operate on local files unless a documented `--origin` or explicit
 live-experiment flag is supplied. Paths can contain sensitive derived evidence:
 keep them out of commits, issues, logs, and documentation.

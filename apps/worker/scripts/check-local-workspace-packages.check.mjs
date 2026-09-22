@@ -184,6 +184,7 @@ test("quota analysis uses the generic byte-exact workspace package guard", async
       "src/quota-rolling.js",
       "src/quota-tracks.js",
       "src/quota-windows.js",
+      "src/reset-events.js",
     ]);
     assert.match(receiptValue.sha256, /^[a-f0-9]{64}$/u);
 

@@ -9,6 +9,7 @@ const SESSION_COOKIE = new RegExp(
 );
 const CSRF_TOKEN = /^um_csrf_[A-Za-z0-9_-]{43}$/u;
 const OPERATION_ID = new RegExp(`^${UUID}$`, "u");
+const CALENDAR_DAY = /^\d{4}-\d{2}-\d{2}$/u;
 const MESSAGES = Object.freeze({
   LOCAL_OWNER_ACCESS_REQUIRED:
     "--owner-access-file is required before enrollment. Use a dedicated local lab owner fixture; participant DELETE is retired and is not cleanup.",
@@ -57,6 +58,46 @@ export function assertRetiredDeletionHealth(health) {
   if (health?.capabilities?.participantDeletion !== false
       || health?.capabilities?.deletionSafeRestoreReplay !== true) {
     fail("LOCAL_RETIREMENT_CONTRACT_INVALID");
+  }
+}
+
+function validTimestamp(value) {
+  return typeof value === "string"
+    && Number.isFinite(Date.parse(value))
+    && new Date(value).toISOString() === value;
+}
+
+function validDay(value) {
+  return typeof value === "string" && CALENDAR_DAY.test(value)
+    && new Date(`${value}T00:00:00.000Z`).toISOString().slice(0, 10) === value;
+}
+
+/** The erasure harness needs only proof that owner access reached a recognized
+ * local Admin contract. Keep v0.3 compatibility; v0.4 must carry its typed
+ * storage marker and exact unavailable/publication extension. v0.5 uses an
+ * explicit storage mode for the expanded distribution contract. */
+export function assertLocalOwnerOverview(value) {
+  if (value?.schemaVersion === "admin-overview-v0.3") return;
+  const current = value?.schemaVersion === "admin-overview-v0.5";
+  if (current && value?.service?.telemetryStorageMode === "json") return;
+  const historical = value?.historicalPublication;
+  if ((!current && value?.schemaVersion !== "admin-overview-v0.4")
+      || value?.service?.telemetryStorageMode !== "typed"
+      || value.pendingHistoricalRebuilds !== null
+      || value.pendingHistoricalRebuildsBounded !== null
+      || !Array.isArray(value.snapshots) || value.snapshots.length !== 0
+      || !historical || typeof historical !== "object" || Array.isArray(historical)
+      || Object.keys(historical).sort().join("\0")
+        !== "latestComputedAt\0latestEvidenceDay\0previewGeneratedAt\0previewState\0publishedDays\0publishedDaysBounded"
+      || !Number.isSafeInteger(historical.publishedDays) || historical.publishedDays < 0
+      || typeof historical.publishedDaysBounded !== "boolean"
+      || (historical.latestEvidenceDay !== null && !validDay(historical.latestEvidenceDay))
+      || (historical.latestComputedAt !== null && !validTimestamp(historical.latestComputedAt))
+      || !["current", "stale", "not_published"].includes(historical.previewState)
+      || (historical.previewGeneratedAt !== null && !validTimestamp(historical.previewGeneratedAt))
+      || (historical.previewState === "not_published")
+        !== (historical.previewGeneratedAt === null)) {
+    fail("LOCAL_OWNER_NOT_AUTHORIZED");
   }
 }
 
@@ -163,9 +204,8 @@ export async function createLocalOwnerEraser({
   if (probe.response.status !== 200 || probe.value?.participantId !== owner.participantId
       || probe.value?.csrfToken !== owner.csrfToken) fail("LOCAL_OWNER_NOT_AUTHORIZED");
   const overview = await request("/api/v1/admin/overview", { session: ownerSession });
-  if (overview.response.status !== 200 || overview.value?.schemaVersion !== "admin-overview-v0.3") {
-    fail("LOCAL_OWNER_NOT_AUTHORIZED");
-  }
+  if (overview.response.status !== 200) fail("LOCAL_OWNER_NOT_AUTHORIZED");
+  assertLocalOwnerOverview(overview.value);
   if (!["local-development", "synthetic-development"].includes(overview.value?.service?.environment)) {
     fail("LOCAL_OWNER_ENVIRONMENT_INVALID");
   }

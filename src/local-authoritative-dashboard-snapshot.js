@@ -1,32 +1,9 @@
-import { createHash, randomUUID } from "node:crypto";
-import {
-  constants,
-} from "node:fs";
-import {
-  lstat,
-  mkdir,
-  open,
-  opendir,
-  rename,
-  unlink,
-} from "node:fs/promises";
-import {
-  basename,
-  dirname,
-  isAbsolute,
-  join,
-  parse,
-  resolve,
-} from "node:path";
+import { createValidatedSnapshotStore } from "./platform/index.js";
 
 export const AUTHORITATIVE_DASHBOARD_SNAPSHOT_SCHEMA_VERSION =
   "local-authoritative-dashboard-snapshot-v1";
 export const MAXIMUM_AUTHORITATIVE_DASHBOARD_SNAPSHOT_BYTES =
   16 * 1024 * 1024;
-
-const STALE_SNAPSHOT_TEMP_AGE_MS = 24 * 60 * 60 * 1_000;
-const MAXIMUM_TEMP_DIRECTORY_ENTRIES_INSPECTED = 64;
-const MAXIMUM_STALE_TEMPS_REMOVED_PER_WRITE = 2;
 
 const COMPANION_SCHEMA_VERSION = "local-companion-v0.1";
 // Keep this closed list aligned with buildLocalCompanionSnapshot's public
@@ -51,138 +28,11 @@ const TOOL_CLASS_KEYS = Object.freeze([
   "tool_gateway",
 ]);
 
-function validSnapshotFile(value) {
-  if (typeof value !== "string"
-      || value.length < 1
-      || value.length > 4_096
-      || value.includes("\0")
-      || !isAbsolute(value)) return null;
-  const selected = resolve(value);
-  return selected === parse(selected).root ? null : selected;
-}
-
 function canonicalInstant(value) {
   if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
     return null;
   }
   return new Date(value).toISOString() === value ? value : null;
-}
-
-function digest(payload) {
-  return createHash("sha256").update(payload, "utf8").digest("hex");
-}
-
-function sameFile(left, right) {
-  return left?.dev === right?.dev && left?.ino === right?.ino;
-}
-
-function ownerOnlyFile(metadata) {
-  return metadata?.isFile?.() === true
-    && metadata.isSymbolicLink() === false
-    && (typeof process.getuid !== "function"
-      || (typeof metadata.uid === "number"
-        && metadata.uid === process.getuid()))
-    && (process.platform === "win32" || (metadata.mode & 0o077) === 0);
-}
-
-function ownerOnlyDirectory(metadata) {
-  return metadata?.isDirectory?.() === true
-    && metadata.isSymbolicLink() === false
-    && (typeof process.getuid !== "function"
-      || (typeof metadata.uid === "number"
-        && metadata.uid === process.getuid()))
-    && (process.platform === "win32" || (metadata.mode & 0o077) === 0);
-}
-
-function regexLiteral(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-}
-
-function snapshotTemporaryNamePattern(snapshotFile) {
-  return new RegExp(
-    `^${regexLiteral(basename(snapshotFile))}`
-      + String.raw`\.([1-9]\d{0,9})\.`
-      + String.raw`[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-`
-      + String.raw`[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$`,
-    "u",
-  );
-}
-
-function staleOwnedSnapshotTemporary(metadata, cutoffMs) {
-  return ownerOnlyFile(metadata)
-    && metadata.nlink === 1
-    && Number.isSafeInteger(metadata.size)
-    && metadata.size >= 0
-    && metadata.size <= MAXIMUM_AUTHORITATIVE_DASHBOARD_SNAPSHOT_BYTES
-    && Number.isFinite(metadata.mtimeMs)
-    && Number.isFinite(metadata.ctimeMs)
-    && Math.max(metadata.mtimeMs, metadata.ctimeMs) <= cutoffMs
-    && (process.platform === "win32"
-      || (metadata.mode & 0o777) === 0o600);
-}
-
-async function removeStaleSnapshotTemporary(path, cutoffMs) {
-  let before;
-  try {
-    before = await lstat(path);
-  } catch {
-    return false;
-  }
-  if (!staleOwnedSnapshotTemporary(before, cutoffMs)) return false;
-  let handle;
-  try {
-    handle = await open(
-      path,
-      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
-    );
-    const opened = await handle.stat();
-    if (!sameFile(before, opened)
-        || !staleOwnedSnapshotTemporary(opened, cutoffMs)) return false;
-  } catch {
-    return false;
-  } finally {
-    await handle?.close().catch(() => {});
-  }
-  try {
-    const current = await lstat(path);
-    if (!sameFile(before, current)
-        || !staleOwnedSnapshotTemporary(current, cutoffMs)) return false;
-    await unlink(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function cleanupStaleSnapshotTemporaries({
-  snapshotFile,
-  directory,
-  nowMs,
-}) {
-  const cutoffMs = nowMs - STALE_SNAPSHOT_TEMP_AGE_MS;
-  if (!Number.isFinite(cutoffMs)) return;
-  const pattern = snapshotTemporaryNamePattern(snapshotFile);
-  let directoryHandle;
-  let inspected = 0;
-  let removed = 0;
-  try {
-    directoryHandle = await opendir(directory);
-    for await (const entry of directoryHandle) {
-      if (inspected >= MAXIMUM_TEMP_DIRECTORY_ENTRIES_INSPECTED
-          || removed >= MAXIMUM_STALE_TEMPS_REMOVED_PER_WRITE) break;
-      inspected += 1;
-      if (entry.isFile() !== true || !pattern.test(entry.name)) continue;
-      if (await removeStaleSnapshotTemporary(
-        join(directory, entry.name),
-        cutoffMs,
-      )) removed += 1;
-    }
-  } catch {
-    // Cleanup is deliberately best-effort. An ambiguous entry or directory
-    // read failure must not turn durable snapshot publication into a failure.
-  } finally {
-    await directoryHandle?.close().catch(() => {});
-  }
 }
 
 function exactToolValues(value, expected) {
@@ -295,165 +145,28 @@ export function isAuthoritativeDashboardSnapshot(snapshot) {
     && historyCoverage.phase === "complete";
 }
 
-function encode(snapshot, savedAt) {
-  let snapshotPayload;
-  try {
-    snapshotPayload = JSON.stringify(snapshot);
-  } catch {
-    return null;
-  }
-  if (typeof snapshotPayload !== "string") return null;
-  const envelopeMetadata = JSON.stringify({
-    schemaVersion: AUTHORITATIVE_DASHBOARD_SNAPSHOT_SCHEMA_VERSION,
-    savedAt,
-    digest: digest(snapshotPayload),
-  });
-  // `snapshotPayload` is already the canonical JSON protected by the digest.
-  // Splicing it into the small metadata object preserves JSON.stringify's
-  // exact property order and bytes without synchronously traversing an 8 MB
-  // snapshot a second time.
-  const envelope = `${envelopeMetadata.slice(0, -1)},"snapshot":${snapshotPayload}}`;
-  return Buffer.byteLength(envelope, "utf8")
-      <= MAXIMUM_AUTHORITATIVE_DASHBOARD_SNAPSHOT_BYTES
-    ? envelope
-    : null;
-}
-
-function decode(payload) {
-  let envelope;
-  try {
-    envelope = JSON.parse(payload);
-  } catch {
-    return null;
-  }
-  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)
-      || Object.keys(envelope).sort().join("\0")
-        !== ["schemaVersion", "savedAt", "digest", "snapshot"]
-          .sort().join("\0")
-      || envelope.schemaVersion
-        !== AUTHORITATIVE_DASHBOARD_SNAPSHOT_SCHEMA_VERSION
-      || canonicalInstant(envelope.savedAt) === null
-      || typeof envelope.digest !== "string"
-      || !/^[0-9a-f]{64}$/u.test(envelope.digest)
-      || !isAuthoritativeDashboardSnapshot(envelope.snapshot)) {
-    return null;
-  }
-  const snapshotPayload = JSON.stringify(envelope.snapshot);
-  if (digest(snapshotPayload) !== envelope.digest) return null;
-  return {
-    savedAt: envelope.savedAt,
-    snapshot: envelope.snapshot,
-  };
-}
-
-/**
- * Read a previously persisted projection. Any missing, oversized, open-mode,
- * raced, malformed, or non-authoritative file is treated as absent.
- */
+/** Read a previously persisted authoritative projection, or null. */
 export async function readAuthoritativeDashboardSnapshot({ snapshotFile } = {}) {
-  const selected = validSnapshotFile(snapshotFile);
-  if (selected === null) return null;
-  let metadata;
-  try {
-    metadata = await lstat(selected);
-  } catch {
-    return null;
-  }
-  if (!ownerOnlyFile(metadata)
-      || metadata.size < 2
-      || metadata.size > MAXIMUM_AUTHORITATIVE_DASHBOARD_SNAPSHOT_BYTES) {
-    return null;
-  }
-  let handle;
-  try {
-    handle = await open(selected, constants.O_RDONLY);
-    const opened = await handle.stat();
-    if (!ownerOnlyFile(opened)
-        || !sameFile(metadata, opened)
-        || opened.size > MAXIMUM_AUTHORITATIVE_DASHBOARD_SNAPSHOT_BYTES) {
-      return null;
-    }
-    const payload = await handle.readFile({ encoding: "utf8" });
-    return decode(payload);
-  } catch {
-    return null;
-  } finally {
-    await handle?.close().catch(() => {});
-  }
+  return createValidatedSnapshotStore({
+    snapshotFile,
+    schemaVersion: AUTHORITATIVE_DASHBOARD_SNAPSHOT_SCHEMA_VERSION,
+    validate: isAuthoritativeDashboardSnapshot,
+    maximumBytes: MAXIMUM_AUTHORITATIVE_DASHBOARD_SNAPSHOT_BYTES,
+  }).read();
 }
 
-/**
- * Atomically replace the retained projection beside the app's other
- * owner-only state. Non-authoritative candidates are ignored and never
- * overwrite the last good receipt.
- */
+/** Atomically replace the last good projection with a complete candidate. */
 export async function writeAuthoritativeDashboardSnapshot({
   snapshotFile,
   snapshot,
   now = () => Date.now(),
 } = {}) {
-  const selected = validSnapshotFile(snapshotFile);
-  if (selected === null || typeof now !== "function"
-      || !isAuthoritativeDashboardSnapshot(snapshot)) return false;
-  let nowMs;
-  try {
-    nowMs = now();
-  } catch {
-    return false;
-  }
-  if (!Number.isFinite(nowMs)) return false;
-  let savedAt;
-  try {
-    savedAt = new Date(nowMs).toISOString();
-  } catch {
-    return false;
-  }
-  const payload = encode(snapshotForPersistence(snapshot), savedAt);
-  if (payload === null) return false;
-  const directory = dirname(selected);
-  try {
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    const directoryMetadata = await lstat(directory);
-    if (!ownerOnlyDirectory(directoryMetadata)) return false;
-  } catch {
-    return false;
-  }
-  await cleanupStaleSnapshotTemporaries({
-    snapshotFile: selected,
-    directory,
-    nowMs,
-  });
-  const temporary = `${selected}.${process.pid}.${randomUUID()}.tmp`;
-  let handle;
-  try {
-    handle = await open(
-      temporary,
-      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
-      0o600,
-    );
-    await handle.writeFile(payload, { encoding: "utf8" });
-    await handle.sync();
-    await handle.close();
-    handle = null;
-    await rename(temporary, selected);
-    // Best-effort directory sync makes the rename durable on filesystems that
-    // support opening directories. Failure here does not invalidate the
-    // already atomic replacement.
-    try {
-      const directoryHandle = await open(directory, constants.O_RDONLY);
-      try {
-        await directoryHandle.sync();
-      } finally {
-        await directoryHandle.close();
-      }
-    } catch {
-      // Unsupported on some platforms.
-    }
-    return true;
-  } catch {
-    return false;
-  } finally {
-    await handle?.close().catch(() => {});
-    await unlink(temporary).catch(() => {});
-  }
+  if (!isAuthoritativeDashboardSnapshot(snapshot)) return false;
+  return createValidatedSnapshotStore({
+    snapshotFile,
+    schemaVersion: AUTHORITATIVE_DASHBOARD_SNAPSHOT_SCHEMA_VERSION,
+    validate: isAuthoritativeDashboardSnapshot,
+    maximumBytes: MAXIMUM_AUTHORITATIVE_DASHBOARD_SNAPSHOT_BYTES,
+    now,
+  }).write(snapshotForPersistence(snapshot));
 }

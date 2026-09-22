@@ -4,7 +4,9 @@ import test from "node:test";
 import { DESKTOP_DEFAULT_SETTINGS } from "../desktop-contract.js";
 import {
   createDesktopController,
-  DESKTOP_REFRESH_LEASE_WATCHDOG_MS,
+  DESKTOP_DETAILED_REFRESH_HEARTBEAT_TIMEOUT_MS,
+  DESKTOP_QUICK_REFRESH_HEARTBEAT_TIMEOUT_MS,
+  DESKTOP_REFRESH_OPERATION_DEADLINE_MS,
 } from "../desktop-controller.js";
 import {
   createDesktopAutomaticRefreshCadence,
@@ -217,7 +219,12 @@ test("controller initializes persisted cadence and projects truthful settings st
           primaryRootId: DESKTOP_DEFAULT_SETTINGS.codexHomes.primaryRootId,
         },
         refreshIntervalSeconds: 300,
-        startAtLogin: { status: "disabled", canSet: true, detail: "disabled" },
+        startAtLogin: {
+          status: "disabled",
+          canSet: true,
+          canOpenSettings: process.platform === "darwin" || process.platform === "win32",
+          detail: "disabled",
+        },
         sidebarCollapsed: false,
         tray: DESKTOP_DEFAULT_SETTINGS.tray,
         traySettingsStatus: "current",
@@ -385,9 +392,10 @@ test("controller exposes bounded browser, diagnostics, local-data, and refresh l
   );
   const rearmedTimer = value.timers.at(-1);
   assert.notEqual(rearmedTimer, fallbackTimer);
-  const lease = await value.controller.handlers.refreshStarted({});
+  const lease = await value.controller.handlers.refreshStarted({ mode: "quick" });
   assert.equal(lease, 1);
-  assert.equal(value.timers.at(-1).milliseconds, DESKTOP_REFRESH_LEASE_WATCHDOG_MS);
+  assert.equal(value.timers.at(-2).milliseconds, DESKTOP_QUICK_REFRESH_HEARTBEAT_TIMEOUT_MS);
+  assert.equal(value.timers.at(-1).milliseconds, DESKTOP_REFRESH_OPERATION_DEADLINE_MS);
   assert.ok(value.cleared.includes(rearmedTimer));
   assert.equal(await value.controller.handlers.refreshSettled({}), false);
   assert.equal(await value.controller.handlers.refreshSettled({ lease }), true);
@@ -502,23 +510,28 @@ test("automatic cadence continues while the live dashboard is hidden and refuses
 test("refresh leases ignore stale completion and only the current lease rearms cadence", async () => {
   const value = fixture();
   await value.controller.initialize();
-  const leaseA = await value.controller.handlers.refreshStarted({});
-  const watchdogA = value.timers.at(-1);
-  const leaseB = await value.controller.handlers.refreshStarted({});
-  const watchdogB = value.timers.at(-1);
+  const leaseA = await value.controller.handlers.refreshStarted({ mode: "quick" });
+  const heartbeatA = value.timers.at(-2);
+  const deadlineA = value.timers.at(-1);
+  const leaseB = await value.controller.handlers.refreshStarted({ mode: "quick" });
+  const deadlineB = value.timers.at(-1);
   assert.deepEqual([leaseA, leaseB], [1, 2]);
-  assert.equal(watchdogA.milliseconds, DESKTOP_REFRESH_LEASE_WATCHDOG_MS);
-  assert.ok(value.cleared.includes(watchdogA));
+  assert.equal(heartbeatA.milliseconds, DESKTOP_QUICK_REFRESH_HEARTBEAT_TIMEOUT_MS);
+  assert.equal(deadlineA.milliseconds, DESKTOP_REFRESH_OPERATION_DEADLINE_MS);
+  assert.ok(value.cleared.includes(heartbeatA));
+  assert.ok(value.cleared.includes(deadlineA));
   assert.equal(await value.controller.handlers.refreshSettled({ lease: leaseA }), false);
-  assert.equal(value.timers.at(-1), watchdogB);
+  assert.equal(value.timers.at(-1), deadlineB);
   assert.equal(await value.controller.handlers.refreshSettled({ lease: leaseB }), true);
+  assert.equal(await value.controller.handlers.refreshSettled({ lease: leaseB }), true,
+    "duplicate terminal settlement is idempotent");
   assert.equal(value.timers.at(-1).milliseconds, 300_000);
 });
 
 test("changing the refresh interval during an active lease persists without arming a timer", async () => {
   const value = fixture();
   await value.controller.initialize();
-  const lease = await value.controller.handlers.refreshStarted({});
+  const lease = await value.controller.handlers.refreshStarted({ mode: "quick" });
   const timerCount = value.timers.length;
   await value.controller.handlers.setRefreshInterval({ seconds: 60 });
   assert.equal(value.timers.length, timerCount);
@@ -530,23 +543,103 @@ test("changing the refresh interval during an active lease persists without armi
 test("dashboard replacement releases an abandoned lease and rearms the cadence", async () => {
   const value = fixture();
   await value.controller.initialize();
-  const lease = await value.controller.handlers.refreshStarted({});
-  const watchdog = value.timers.at(-1);
+  const lease = await value.controller.handlers.refreshStarted({ mode: "quick" });
+  const heartbeat = value.timers.at(-2);
+  const deadline = value.timers.at(-1);
   assert.equal(value.controller.reconcileDashboardSession(), true);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.ok(value.cleared.includes(watchdog));
+  assert.ok(value.cleared.includes(heartbeat));
+  assert.ok(value.cleared.includes(deadline));
   assert.equal(await value.controller.handlers.refreshSettled({ lease }), false);
   assert.equal(value.timers.at(-1).milliseconds, 300_000);
+  assert.equal(value.controller.refreshStatus().lastRecoveryReason, "dashboard_replaced");
 });
 
-test("lease watchdog recovers cadence after a renderer disappears", async () => {
+test("missing heartbeat recovers cadence after a renderer disappears", async () => {
   const value = fixture();
   await value.controller.initialize();
-  await value.controller.handlers.refreshStarted({});
-  const watchdog = value.timers.at(-1);
-  watchdog.callback();
+  await value.controller.handlers.refreshStarted({ mode: "quick" });
+  const heartbeat = value.timers.at(-2);
+  heartbeat.callback();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(value.timers.at(-1).milliseconds, 300_000);
+  assert.equal(value.controller.refreshStatus().lastRecoveryReason, "heartbeat_timeout");
+});
+
+test("watchdog recovery uses the last known interval when settings are briefly unavailable", async () => {
+  let settingsUnavailable = false;
+  const baseStore = createDesktopSettingsStore({
+    backend: { load: async () => null, save: async (value) => value },
+  });
+  const store = {
+    ...baseStore,
+    async getSettings() {
+      if (settingsUnavailable) throw new Error("temporarily unavailable");
+      return baseStore.getSettings();
+    },
+  };
+  const value = fixture({ settingsStore: store });
+  await value.controller.initialize();
+  await value.controller.handlers.refreshStarted({ mode: "quick" });
+  settingsUnavailable = true;
+  value.timers.at(-2).callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(value.timers.at(-1).milliseconds, 300_000);
+  assert.equal(value.controller.refreshStatus().state, "scheduled");
+});
+
+test("normal settlement uses the last known interval when settings are briefly unavailable", async () => {
+  let settingsUnavailable = false;
+  const baseStore = createDesktopSettingsStore({
+    backend: { load: async () => null, save: async (value) => value },
+  });
+  const store = {
+    ...baseStore,
+    async getSettings() {
+      if (settingsUnavailable) throw new Error("temporarily unavailable");
+      return baseStore.getSettings();
+    },
+  };
+  const value = fixture({ settingsStore: store });
+  await value.controller.initialize();
+  const lease = await value.controller.handlers.refreshStarted({ mode: "quick" });
+  settingsUnavailable = true;
+  assert.equal(await value.controller.handlers.refreshSettled({ lease }), true);
+  assert.equal(value.timers.at(-1).milliseconds, 300_000);
+  assert.equal(value.controller.refreshStatus().state, "scheduled");
+});
+
+test("heartbeats renew only the mode-specific orphan watchdog", async () => {
+  let nowMs = Date.parse("2026-09-21T12:00:00.000Z");
+  const value = fixture({ clock: () => nowMs });
+  await value.controller.initialize();
+  const lease = await value.controller.handlers.refreshStarted({ mode: "detailed" });
+  const firstHeartbeat = value.timers.at(-2);
+  const deadline = value.timers.at(-1);
+  assert.equal(firstHeartbeat.milliseconds, DESKTOP_DETAILED_REFRESH_HEARTBEAT_TIMEOUT_MS);
+  assert.equal(deadline.milliseconds, DESKTOP_REFRESH_OPERATION_DEADLINE_MS);
+
+  nowMs += 30_000;
+  assert.equal(await value.controller.handlers.refreshHeartbeat({ lease }), true);
+  const renewedHeartbeat = value.timers.at(-1);
+  assert.ok(value.cleared.includes(firstHeartbeat));
+  assert.equal(value.cleared.includes(deadline), false);
+  assert.equal(renewedHeartbeat.milliseconds, DESKTOP_DETAILED_REFRESH_HEARTBEAT_TIMEOUT_MS);
+  assert.equal(value.controller.refreshStatus().activeLeaseAgeSeconds, 30);
+  assert.equal(value.controller.refreshStatus().lastHeartbeatAt, "2026-09-21T12:00:30.000Z");
+  assert.equal(await value.controller.handlers.refreshHeartbeat({ lease: lease + 1 }), false);
+});
+
+test("the non-renewable operation deadline recovers even with a live heartbeat", async () => {
+  const value = fixture();
+  await value.controller.initialize();
+  const lease = await value.controller.handlers.refreshStarted({ mode: "quick" });
+  const deadline = value.timers.at(-1);
+  assert.equal(await value.controller.handlers.refreshHeartbeat({ lease }), true);
+  deadline.callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(value.timers.at(-1).milliseconds, 300_000);
+  assert.equal(value.controller.refreshStatus().lastRecoveryReason, "operation_deadline");
 });
 
 test("controller persists sidebar collapse and sends only the bounded presentation command", async () => {
@@ -799,6 +892,30 @@ test("unconfirmed login-item changes are not persisted", async () => {
     (error) => error?.code === "desktop_start_at_login_unconfirmed",
   );
   assert.equal((await value.store.getSettings()).startAtLogin, false);
+});
+
+test("Linux controller awaits autostart reads and confirms a completed change", async () => {
+  let enabled = false;
+  const value = fixture({
+    actionOverrides: { desktopPlatform: "linux" },
+    platformOverrides: {
+      loginItemStatus: async () => ({
+        status: enabled ? "enabled" : "disabled",
+        canSet: true,
+        detail: enabled ? "enabled" : "disabled",
+      }),
+      setStartAtLogin: async (next) => {
+        enabled = next;
+        return { status: next ? "enabled" : "disabled", canSet: true };
+      },
+    },
+  });
+  const initial = await value.controller.initialize();
+  assert.equal(initial.settings.startAtLogin.status, "disabled");
+  assert.equal(initial.settings.startAtLogin.canOpenSettings, false);
+  const updated = await value.controller.handlers.setStartAtLogin({ enabled: true });
+  assert.equal(updated.settings.startAtLogin.status, "enabled");
+  assert.equal((await value.store.getSettings()).startAtLogin, true);
 });
 
 test("initialization leaves unknown OS startup state untouched despite a stored false default", async () => {

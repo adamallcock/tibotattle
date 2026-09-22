@@ -29,6 +29,8 @@ const SIGNED_MACOS_BUNDLE_VERSION_PLAN = Object.freeze({
   "0.1.21": Object.freeze({ stable: "1028" }),
   // Combined desktop follow-up; preserve native and Electron update ordering.
   "0.1.22": Object.freeze({ stable: "1029" }),
+  // Next desktop candidate; allocation alone is not signed artifact evidence.
+  "0.1.23": Object.freeze({ stable: "1030" }),
 });
 
 module.exports = { SIGNED_MACOS_BUNDLE_VERSION_PLAN };
