@@ -891,6 +891,36 @@ function workCheckpointFromRows(
   return validateCheckpoint({ generation, expectedHead, controlJson, manifestJson, parts, complete }, operation);
 }
 
+function completeCheckpointFromRows(
+  rows: readonly Record<string, unknown>[],
+  generation: string,
+  operation: string,
+): AnalyticalCheckpoint | null {
+  const checkpoint = workCheckpointFromRows(rows, generation, operation);
+  if (!checkpoint?.complete || checkpoint.parts.length === 0) return null;
+  const selected = rows.filter((row) => safeString(row.generation, operation) === generation);
+  const first = selected[0];
+  if (!first || selected.some((row) => row.expected_head !== first.expected_head
+      || row.control_json !== first.control_json || row.manifest_json !== first.manifest_json
+      || (row.complete === true || row.complete === 1) !== (first.complete === true || first.complete === 1))) return null;
+  let manifest: unknown;
+  try { manifest = JSON.parse(checkpoint.manifestJson); } catch { return null; }
+  if (!Array.isArray(manifest) || manifest.length !== checkpoint.parts.length) return null;
+  const parts = new Map(checkpoint.parts.map((part) => [part.index, part]));
+  const seen = new Set<number>();
+  for (const entry of manifest) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null;
+    const value = entry as Record<string, unknown>;
+    const index = value.index;
+    if (typeof index !== "number" || !Number.isSafeInteger(index) || typeof value.sha256 !== "string"
+        || !/^[0-9a-f]{64}$/u.test(value.sha256) || seen.has(index)) return null;
+    const part = parts.get(index);
+    if (!part || part.sha256 !== value.sha256) return null;
+    seen.add(index);
+  }
+  return seen.size === checkpoint.parts.length ? checkpoint : null;
+}
+
 function withWorkCheckpoint(head: AnalyticalWorkHead, checkpoint: AnalyticalCheckpoint | null): AnalyticalWorkHead {
   return Object.freeze({ ...head, checkpoint });
 }
@@ -1151,6 +1181,21 @@ export function createPostgresAnalyticalWorkStore(
               || currentRow.checkpoint_generation === null || currentRow.checkpoint_generation === undefined) {
             throw new PostgresStorageError("conflict", operation, { retryable: true });
           }
+          const checkpointGeneration = safeString(currentRow.checkpoint_generation, operation);
+          const checkpointRows = await execute<Record<string, unknown>>(transaction, operation, statement(`
+            SELECT generation,part_index,sha256,payload_json,expected_head,control_json,manifest_json,complete
+              FROM analytics_analysis_work_parts
+             WHERE source_id=$1 AND owner_digest=$2 AND day=$3 AND metric=$4
+               AND generation=$5
+             ORDER BY part_index LIMIT 1025`, identity.sourceId, identity.ownerDigest, identity.day, identity.metric,
+          checkpointGeneration));
+          let checkpoint: AnalyticalCheckpoint | null;
+          try {
+            checkpoint = completeCheckpointFromRows(checkpointRows.rows, checkpointGeneration, operation);
+          } catch {
+            checkpoint = null;
+          }
+          if (!checkpoint) throw new PostgresStorageError("conflict", operation, { retryable: true });
           const result = await execute<Record<string, unknown>>(transaction, operation, statement(`
             UPDATE analytics_analysis_work_heads
                SET state = 'complete', revision = revision + 1, head_digest = $1,

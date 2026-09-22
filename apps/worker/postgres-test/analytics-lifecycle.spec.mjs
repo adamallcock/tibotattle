@@ -410,6 +410,10 @@ it("reclaims an expired checkpointing lease and rejects stale completion", async
     identity, claimToken: claim.claimToken, expectedRevision: claim.revision, nowMs: 0, checkpoint,
   });
   expect(checkpointed.state).toBe("checkpointing");
+  // A checkpoint row existing is insufficient: completion requires the
+  // selected generation's complete marker and manifest/part digests.
+  await expect(store.complete({ identity, claimToken: claim.claimToken, expectedRevision: checkpointed.revision,
+    nowMs: 0, resultDigest: "1".repeat(64) })).rejects.toMatchObject({ storageCode: "conflict" });
   await pool.query(`UPDATE analytics_analysis_work_heads
     SET lease_expires_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint - 1
     WHERE source_id=$1 AND owner_digest=$2 AND day=$3 AND metric=$4`,
@@ -436,7 +440,7 @@ it("reclaims after a blocked row lock using the database clock", async () => {
     authorityEpoch: 1,
   };
   const store = createPostgresAnalyticalWorkStore(adapterPool, { primarySchema, ledgerSchema });
-  const claim = await store.claim({ identity, nowMs: 0, leaseMs: 40 });
+  const claim = await store.claim({ identity, nowMs: 0, leaseMs: 500 });
   expect(claim).not.toBeNull();
   const blocker = await rawPool.connect();
   let reclaimPromise;
@@ -458,7 +462,7 @@ it("reclaims after a blocked row lock using the database clock", async () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     expect(observedLockWait).toBe(true);
-    await new Promise((resolve) => setTimeout(resolve, 75));
+    await new Promise((resolve) => setTimeout(resolve, 650));
     await blocker.query("COMMIT");
     const resumed = await reclaimPromise;
     expect(resumed).toMatchObject({ revision: claim.revision + 1, identity });
@@ -482,7 +486,7 @@ it("rejects a renew whose lease expires while waiting for the head lock", async 
     authorityEpoch: 1,
   };
   const store = createPostgresAnalyticalWorkStore(adapterPool, { primarySchema, ledgerSchema });
-  const claim = await store.claim({ identity, nowMs: 0, leaseMs: 40 });
+  const claim = await store.claim({ identity, nowMs: 0, leaseMs: 500 });
   expect(claim).not.toBeNull();
   const blocker = await rawPool.connect();
   let renewPromise;
@@ -505,7 +509,7 @@ it("rejects a renew whose lease expires while waiting for the head lock", async 
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     expect(observedLockWait).toBe(true);
-    await new Promise((resolve) => setTimeout(resolve, 75));
+    await new Promise((resolve) => setTimeout(resolve, 650));
     await blocker.query("COMMIT");
     await expect(renewPromise).rejects.toMatchObject({ storageCode: "conflict" });
     expect((await pool.query(`SELECT revision,lease_expires_ms FROM ${primarySchema}.analytics_analysis_work_heads
@@ -532,7 +536,7 @@ it("rejects completion whose lease expires while waiting for the head lock", asy
     authorityEpoch: 1,
   };
   const store = createPostgresAnalyticalWorkStore(adapterPool, { primarySchema, ledgerSchema });
-  const claim = await store.claim({ identity, nowMs: 0, leaseMs: 40 });
+  const claim = await store.claim({ identity, nowMs: 0, leaseMs: 500 });
   expect(claim).not.toBeNull();
   const payloadJson = "[]";
   const sha256 = createHash("sha256").update(payloadJson).digest("hex");
@@ -564,7 +568,7 @@ it("rejects completion whose lease expires while waiting for the head lock", asy
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     expect(observedLockWait).toBe(true);
-    await new Promise((resolve) => setTimeout(resolve, 75));
+    await new Promise((resolve) => setTimeout(resolve, 650));
     await blocker.query("COMMIT");
     await expect(completePromise).rejects.toMatchObject({ storageCode: "conflict" });
     expect((await pool.query(`SELECT state,revision FROM ${primarySchema}.analytics_analysis_work_heads
