@@ -455,6 +455,69 @@ and are not aliases. Do not edit an applied ledger, ignore an unknown name, or
 apply this sequence to an alternative history. Stop and review that exact
 environment before proceeding; the ordered-prefix guard remains unchanged.
 
+### Typed v1.2 existing-role forward migration
+
+The typed v1.2 successor has a separate existing-role operator. It is a
+forward-only, populated-schema operation for the exact predecessor source
+`c93a5a513890be5d4db97de5bcc9a684cbb91f18`. It applies the four primary
+`ingestion-isolation-migrations/0006`–`0009` files, then the three analytics
+`analytics-migrations/0024`–`0026` files, in that order. The operator binds each
+SQL digest, the candidate clean `HEAD`, the exact database IDs and names, the
+prior schema/data/ledger receipts, a 9 GB capacity budget, and a rehearsal
+receipt. It never creates or repairs a missing prior ledger.
+
+Run the local populated rehearsal from the repository root. It uses
+synthetic content-free rows, enables foreign-key checks, verifies every mapped
+column and staged/default value, and proves the carried analytics columns with
+per-column aggregate invariants. This mode never reads credentials or performs
+remote work:
+
+```sh
+node apps/worker/scripts/typed-forward-migration.mjs --mode rehearse \
+  --worker-root apps/worker
+```
+
+A reviewed operator captures the read-only inventory and prior receipts into
+mode-0600 JSON artifacts, then writes a mode-0600 closed plan only from a clean
+checkout whose `HEAD` equals the candidate source pin:
+
+```sh
+node apps/worker/scripts/typed-forward-migration.mjs --mode prepare \
+  --worker-root apps/worker --repository-root /absolute/candidate-checkout \
+  --inventory /absolute/private/inventory.json \
+  --targets /absolute/private/targets.json \
+  --rehearsal /absolute/private/rehearsal.json \
+  --candidate-source CANDIDATE_COMMIT --account-id ACCOUNT_ID \
+  --worker-name WORKER_NAME --wrangler-sha256 WRANGLER_SHA256 \
+  --output /absolute/private/typed-forward-plan.json
+```
+
+Inspecting a plan is read-only and does not acquire the shared production
+deployment lock. The remote path is a separate explicitly confirmed command.
+It first rechecks the pinned clean source, exact inventory, prior receipt,
+schema prefix and content-free invariants. Each migration writes a durable
+intent before one provider file operation that includes the migration SQL and
+its ledger receipt. Afterward it reads the exact schema, ledger prefix and
+invariants before advancing the intent. The shared lock remains held on any
+failure or uncertain response:
+
+```sh
+node apps/worker/scripts/typed-forward-migration.mjs --mode execute \
+  --plan /absolute/private/typed-forward-plan.json \
+  --worker-root apps/worker --repository-root /absolute/candidate-checkout \
+  --operation /absolute/private/typed-forward-operation \
+  --cli /absolute/wrangler-dist/cli.js \
+  --confirmation EXECUTE_REVIEWED_TYPED_FORWARD_MIGRATION \
+  --approved-plan-sha256 PLAN_SHA256
+```
+
+After an uncertain result, stop and rerun the same plan with `--resume`. Resume
+reads first and accepts only the exact before or after state recorded by the
+durable intent; it never blindly retries a provider operation. A completed
+release-intent resumes by observing lock ownership and releases only the
+original owner. Typed deployment, client rollout and staged activation remain
+separate gates after both ledgers have been read back.
+
 ## Owner deployment
 
 ### Attribution successor cutover and rollback
