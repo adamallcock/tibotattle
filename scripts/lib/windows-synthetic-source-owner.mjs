@@ -48,9 +48,28 @@ export function ensureWindowsSyntheticSourceOwner(path, {
         $access = [System.Security.AccessControl.AccessControlSections]::Access
         $before = $acl.GetSecurityDescriptorSddlForm($access)
         $stage = 34
-        $ownerTool = Join-Path $env:SystemRoot 'System32/icacls.exe'
-        & $ownerTool $path '/setowner' ('*' + $owner.Value) '/Q' *> $null
-        if ($LASTEXITCODE -ne 0) { exit 35 }
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class TiboTattleSyntheticSourceOwner {
+  [DllImport("advapi32.dll", EntryPoint = "SetNamedSecurityInfoW",
+    CharSet = CharSet.Unicode, ExactSpelling = true)]
+  public static extern uint SetNamedSecurityInfo(string path, int objectType, uint securityInfo,
+    IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
+}
+'@
+        $bytes = New-Object byte[] ($owner.BinaryLength)
+        $owner.GetBinaryForm($bytes, 0)
+        $pointer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($bytes.Length)
+        try {
+          [System.Runtime.InteropServices.Marshal]::Copy($bytes, 0, $pointer, $bytes.Length)
+          $stage = 35
+          $result = [TiboTattleSyntheticSourceOwner]::SetNamedSecurityInfo(
+            $path, 1, 1, $pointer, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero)
+          if ($result -ne 0) { exit 35 }
+        } finally {
+          [System.Runtime.InteropServices.Marshal]::FreeHGlobal($pointer)
+        }
         $stage = 36
         $after = Get-Acl -LiteralPath $path
         $stage = 37

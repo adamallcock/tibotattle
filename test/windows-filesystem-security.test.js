@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
 import {
   link,
   mkdtemp,
@@ -19,6 +18,10 @@ import {
 } from "../src/platform/windows-filesystem.js";
 import { createWindowsCredentialAuditFileGuardContext } from "../src/platform/windows-credential-audit-file-guard.js";
 import { createWindowsCredentialOperationAuditStore } from "../src/platform/windows-credential-operation-audit.js";
+import {
+  classifyWindowsSyntheticSourceOwnerFailure,
+  ensureWindowsSyntheticSourceOwner,
+} from "../scripts/lib/windows-synthetic-source-owner.mjs";
 
 import { createTimingFilesystem } from '../src/platform/inference-timing-filesystem.js';
 import { openTimingStore, ingestTimingFile, readTimingRows } from '../src/platform/inference-timing-store.js';
@@ -38,83 +41,16 @@ async function withSyntheticRoot(run) {
   }
 }
 
-const SYNTHETIC_OWNER_FAILURES = Object.freeze({
-  31: "current_owner_read_failed",
-  32: "acl_before_read_failed",
-  33: "acl_before_snapshot_failed",
-  34: "owner_tool_invocation_failed",
-  35: "owner_tool_exit_failed",
-  36: "acl_after_read_failed",
-  37: "owner_after_read_failed",
-  38: "owner_readback_mismatch",
-  39: "acl_after_snapshot_failed",
-  40: "dacl_changed",
-});
-
-function assertSyntheticOwnerSetup(result) {
-  const category = result.error
-    ? (result.error.code === "ETIMEDOUT" ? "setup_timed_out" : "setup_launch_failed")
-    : (SYNTHETIC_OWNER_FAILURES[result.status] ?? "unexpected_setup_exit");
-  assert.equal(result.status === 0 && !result.error, true,
-    `synthetic source owner setup failed: ${category}`);
-  assert.equal(result.stdout?.length, 0, "fixture setup emits no ACL or owner details");
-  assert.equal(result.stderr?.length, 0, "fixture setup emits no error details");
-}
-
-function syntheticOwnerChildEnvironment(environment, path) {
-  // Node is an intermediate process between pwsh 7 and Windows PowerShell.
-  // Let the latter construct its own compatible module path at startup.
-  return {
-    ...Object.fromEntries(Object.entries(environment).filter(([key]) => (
-      key.toLowerCase() !== "psmodulepath"
-    ))),
-    TIBOTATTLE_SYNTHETIC_SOURCE_FILE: path,
-  };
-}
-
 async function writeSyntheticOwnedSource(path, contents) {
   await writeFile(path, contents, { flag: "wx" });
   // An elevated Windows token can default new files to a group owner. Give
   // only this disposable fixture the current user's owner SID; preserve its
   // ordinary source DACL instead of turning it into protected derived state.
-  const result = spawnSync("powershell.exe", [
-    "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", `
-      $ErrorActionPreference = 'Stop'
-      $stage = 31
-      try {
-        $path = $env:TIBOTATTLE_SYNTHETIC_SOURCE_FILE
-        $owner = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-        $stage = 32
-        $acl = Get-Acl -LiteralPath $path
-        $stage = 33
-        $access = [System.Security.AccessControl.AccessControlSections]::Access
-        $before = $acl.GetSecurityDescriptorSddlForm($access)
-        $stage = 34
-        $ownerTool = Join-Path $env:SystemRoot 'System32/icacls.exe'
-        & $ownerTool $path '/setowner' ('*' + $owner.Value) '/Q' *> $null
-        if ($LASTEXITCODE -ne 0) { exit 35 }
-        $stage = 36
-        $after = Get-Acl -LiteralPath $path
-        $stage = 37
-        $actualOwner = $after.GetOwner([System.Security.Principal.SecurityIdentifier])
-        if ($actualOwner.Value -ne $owner.Value) { exit 38 }
-        $stage = 39
-        $afterAccess = $after.GetSecurityDescriptorSddlForm($access)
-        if ($afterAccess -cne $before) { exit 40 }
-        exit 0
-      } catch { exit $stage }
-    `,
-  ], {
-    encoding: "utf8",
-    env: syntheticOwnerChildEnvironment(process.env, path),
-    windowsHide: true,
-    timeout: 10_000,
-    maxBuffer: 4_096,
-  });
-  assertSyntheticOwnerSetup(result);
+  ensureWindowsSyntheticSourceOwner(path);
 }
 
 test("synthetic owner child removes inherited module paths without changing its parent", () => {
+  const path = String.raw`C:\runner\owned\synthetic.jsonl`;
   const parent = Object.freeze({
     PSModulePath: "synthetic-pwsh7-modules",
     pSmOdUlEpAtH: "synthetic-other-inherited-modules",
@@ -123,38 +59,57 @@ test("synthetic owner child removes inherited module paths without changing its 
     TIBOTATTLE_SYNTHETIC_SOURCE_FILE: "synthetic-previous-source",
   });
   const before = { ...parent };
-  const child = syntheticOwnerChildEnvironment(parent, "synthetic-new-source");
+  let child;
+  ensureWindowsSyntheticSourceOwner(path, {
+    environment: parent,
+    run: (_command, _args, options) => {
+      child = options.env;
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
   assert.deepEqual(child, {
     PATH: parent.PATH,
     SystemRoot: parent.SystemRoot,
-    TIBOTATTLE_SYNTHETIC_SOURCE_FILE: "synthetic-new-source",
+    TIBOTATTLE_SYNTHETIC_SOURCE_FILE: path,
   });
   assert.deepEqual(parent, before);
 });
 
 test("synthetic owner setup failures report fixed categories without subprocess details", () => {
   const canary = "private-fixture-path-or-owner-canary";
+  const path = String.raw`C:\runner\owned\synthetic.jsonl`;
+  const failureCategories = {
+    31: "current_owner_read_failed", 32: "acl_before_read_failed",
+    33: "acl_before_snapshot_failed", 34: "owner_tool_invocation_failed",
+    35: "owner_tool_exit_failed", 36: "acl_after_read_failed",
+    37: "owner_after_read_failed", 38: "owner_readback_mismatch",
+    39: "acl_after_snapshot_failed", 40: "dacl_changed",
+  };
   for (const [result, category] of [
-    ...Object.entries(SYNTHETIC_OWNER_FAILURES).map(([status, category]) => (
+    ...Object.entries(failureCategories).map(([status, category]) => (
       [{ status: Number(status) }, category]
     )),
     [{ status: 1 }, "unexpected_setup_exit"],
     [{ status: null, error: { code: "ETIMEDOUT", message: canary } }, "setup_timed_out"],
     [{ status: null, error: { code: canary, message: canary } }, "setup_launch_failed"],
   ]) {
-    assert.throws(() => assertSyntheticOwnerSetup({
-      ...result, stdout: canary, stderr: canary,
+    assert.throws(() => ensureWindowsSyntheticSourceOwner(path, {
+      run: () => ({ ...result, stdout: canary, stderr: canary }),
     }), (error) => {
-      assert.equal(error.message.includes(category), true);
+      assert.equal(classifyWindowsSyntheticSourceOwnerFailure(error), `synthetic_owner_${category}`);
       assert.equal(error.message.includes(canary), false);
       return true;
     });
   }
-  assertSyntheticOwnerSetup({ status: 0, stdout: "", stderr: "" });
+  ensureWindowsSyntheticSourceOwner(path, {
+    run: () => ({ status: 0, stdout: "", stderr: "" }),
+  });
   for (const field of ["stdout", "stderr"]) {
-    assert.throws(() => assertSyntheticOwnerSetup({
-      status: 0, stdout: "", stderr: "", [field]: canary,
+    assert.throws(() => ensureWindowsSyntheticSourceOwner(path, {
+      run: () => ({ status: 0, stdout: "", stderr: "", [field]: canary }),
     }), (error) => {
+      assert.equal(classifyWindowsSyntheticSourceOwnerFailure(error),
+        "synthetic_owner_unexpected_setup_exit");
       assert.equal(error.message.includes(canary), false);
       return true;
     });

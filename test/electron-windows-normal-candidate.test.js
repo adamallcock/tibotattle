@@ -96,7 +96,7 @@ test("disposable Windows source owner setup preserves ACLs and emits fixed error
   assert.equal(invocation.options.env.TIBOTATTLE_SYNTHETIC_SOURCE_FILE, path);
   assert.equal(Object.hasOwn(invocation.options.env, "PSModulePath"), false);
   assert.match(invocation.args.at(-1), /GetSecurityDescriptorSddlForm/u);
-  assert.match(invocation.args.at(-1), /setowner/u);
+  assert.match(invocation.args.at(-1), /SetNamedSecurityInfo/u);
   let failure;
   try {
     ensureWindowsSyntheticSourceOwner(path, {
