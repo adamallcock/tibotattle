@@ -449,6 +449,10 @@
   white-space: normal;
 }
 
+.settings-login-card .button[hidden] {
+  display: none;
+}
+
 .settings-switch {
   display: inline-flex;
   align-items: center;

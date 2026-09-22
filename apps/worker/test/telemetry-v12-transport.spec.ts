@@ -55,6 +55,7 @@ import { registerTelemetryV11DayManifest, telemetryV11LegacyProjection } from ".
 import { decodeTelemetryV12Record, type TelemetryV12TypedRecordRow } from "../src/telemetry-v12-typed-codec";
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from "../src/telemetry-v11-domain";
 import { activateTelemetryV12Domain, createTelemetryV12DomainPredecessor } from "../src/telemetry-v12-domain";
+import { readEffectiveUsageOwnerDayPage } from "../src/telemetry-usage-effective-reader";
 import { initializeStorageSource } from "../src/analytics-delivery";
 import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../src/typed-v11-admission";
 import { initializeTypedV1Admission, insertTypedTelemetryV1Chunk } from "../src/typed-v1-admission";
@@ -72,6 +73,140 @@ interface TestBindings extends Env {
 }
 const bindings = () => env as TestBindings;
 const db = () => bindings().USAGE_MONITOR_DB;
+
+const MIXED_CLIENT_NOW_EPOCH = Date.now();
+const MIXED_CLIENT_DAY = new Date(MIXED_CLIENT_NOW_EPOCH).toISOString().slice(0, 10);
+
+function mixedV12UsageRecord(eventId: string, totalInputContextTokens: number | null,
+  outputCombinedTokens: number | null): TelemetryV12UsageEvent {
+  return {
+    schemaVersion: "usage-event-v1.2", eventId,
+    eventTime: `${MIXED_CLIENT_DAY}T12:05:00.000Z`,
+    sessionUuid: "0a49f9db-8b2d-4c3e-9a6f-2f4f1c7d9e0b",
+    provider: "openai_codex", modelId: "gpt-5.6-sol", speedMode: "standard",
+    apiServiceTier: "default", surface: "local_interactive_unclassified",
+    billingSurface: "chatgpt_subscription", reasoningEffort: "high", agentScope: "root",
+    outcome: "completed", totalInputContextTokens,
+    components: {
+      inputUncachedTokens: 100, inputCacheReadTokens: 900, inputCacheWriteTokens: 0,
+      outputTextTokens: 50, outputReasoningTokens: 25, outputCombinedTokens,
+    },
+    accountPlanAttribution: {
+      accountBasis: "unavailable", accountTrackId: null,
+      planBasis: "same_source_occurrence", planType: "pro", planEraId: null,
+    },
+    boundaryFlags: null, tieOrder: null, cacheWriteTtl: null,
+  };
+}
+
+async function makeMixedV1Insert(
+  fixture: Awaited<ReturnType<typeof createV11DeviceFixture>>,
+  records: readonly ReturnType<typeof v11UsageRecord>[],
+  chunkSeq: number,
+  nowEpoch: number,
+) {
+  const projected = records.map((record) => {
+    const legacy = telemetryV11LegacyProjection("usage", record);
+    if (!legacy) throw new Error("mixed v1 projection missing");
+    return JSON.parse(legacy.canonicalRecord) as Record<string, unknown>;
+  });
+  const chunk = parseTelemetryV1Chunk({
+    schemaVersion: "telemetry-contribution-v1.0",
+    chunkId: `usage:${MIXED_CLIENT_DAY}:${chunkSeq}`,
+    chunkRevision: 1,
+    chunkDigest: await sha256Hex(canonicalTelemetryV11Json(projected)),
+    parserVersion: "synthetic-mixed-client-v1",
+    consent: {
+      telemetrySchemaVersion: "telemetry-contribution-v1.0",
+      fieldDictionaryVersion: "telemetry-v1.0-registry-2026-08-07.1",
+      privacyContractVersion: "ongoing-privacy-safe-telemetry-v1.0",
+    },
+    records: projected,
+  });
+  const envelopeDigest = await sha256Hex(`synthetic-mixed-client-v1:${chunkSeq}`);
+  const principal = await authenticateDevice(db(), fixture.authorization);
+  const upload = await createDeviceUploadAuthorization(db(), principal, envelopeDigest, 4096);
+  const claimed = await claimDeviceUploadAuthorization(db(), `Upload ${upload.uploadAuthorization}`, {
+    envelopeDigest, bodyBytes: 4096, contentType: "application/json",
+  });
+  return {
+    chunkRowId: `chunk:${crypto.randomUUID()}`,
+    participantId: fixture.participantId, deviceId: fixture.deviceId, chunk,
+    envelopeDigest, r2Key: `synthetic/mixed-v1-${chunkSeq}-${crypto.randomUUID()}`,
+    deviceUploadAuthorizationId: claimed.authorizationId,
+    createdAt: new Date(nowEpoch).toISOString(), supersedes: null,
+  };
+}
+
+async function persistMixedV11Day(
+  fixture: Awaited<ReturnType<typeof createV11DeviceFixture>>,
+  records: readonly ReturnType<typeof v11UsageRecord>[],
+  sourceNamespace: string,
+  nowEpoch: number,
+) {
+  const prepared = await makeV11Day(MIXED_CLIENT_DAY, { usage: [...records] }, "synthetic-mixed-client-v11");
+  const candidate = await registerTelemetryV11DayManifest(db(), fixture, prepared.manifest, nowEpoch);
+  const chunk = prepared.chunks[0];
+  if (!chunk) throw new Error("mixed v1.1 chunk missing");
+  const envelopeDigest = await sha256Hex("synthetic-mixed-client-v11");
+  const principal = await authenticateDevice(db(), fixture.authorization);
+  const upload = await createDeviceUploadAuthorization(db(), principal, envelopeDigest, 4096);
+  const claimed = await claimDeviceUploadAuthorization(db(), `Upload ${upload.uploadAuthorization}`, {
+    envelopeDigest, bodyBytes: 4096, contentType: "application/json",
+  });
+  await persistTypedV11StagedChunk(db(), fixture, chunk, {
+    sourceNamespace, chunkRowId: `chunk:${crypto.randomUUID()}`,
+    r2Key: `synthetic/mixed-v11-${crypto.randomUUID()}`, envelopeDigest,
+    deviceUploadAuthorizationId: claimed.authorizationId,
+  }, nowEpoch);
+  return { ...candidate, manifest: prepared.manifest };
+}
+
+async function persistMixedV12Day(
+  fixture: Awaited<ReturnType<typeof createV11DeviceFixture>>,
+  records: readonly TelemetryV12UsageEvent[],
+  nowEpoch: number,
+) {
+  const consent = telemetryV12RequiredConsent();
+  const chunk: TelemetryV12Chunk = {
+    schemaVersion: "telemetry-contribution-v1.2", manifestDigest: "0".repeat(64),
+    chunkId: `usage:${MIXED_CLIENT_DAY}:0`, chunkRevision: 1,
+    parserVersion: "synthetic-mixed-client-v12", consent, records: [...records],
+    chunkDigest: await sha256Hex(canonicalTelemetryV12Json(records)),
+  };
+  const manifest: TelemetryV12DayManifest = {
+    schemaVersion: "telemetry-day-manifest-v1.2", day: MIXED_CLIENT_DAY,
+    parserVersion: "synthetic-mixed-client-v12", consent,
+    chunks: [{ chunkId: chunk.chunkId, chunkDigest: chunk.chunkDigest, recordCount: records.length }],
+    excluded: { quota: 0, session: 0, usage: 0 }, manifestDigest: "0".repeat(64),
+  };
+  manifest.manifestDigest = await sha256Hex(telemetryV12DayManifestDigestInput(manifest));
+  chunk.manifestDigest = manifest.manifestDigest;
+  const candidate = await registerTelemetryV12DayManifest(db(), fixture, manifest, nowEpoch);
+  const envelopeDigest = await sha256Hex("synthetic-mixed-client-v12");
+  const principal = await authenticateDevice(db(), fixture.authorization);
+  const upload = await createDeviceUploadAuthorization(db(), principal, envelopeDigest, 4096);
+  const claimed = await claimDeviceUploadAuthorization(db(), `Upload ${upload.uploadAuthorization}`, {
+    envelopeDigest, bodyBytes: 4096, contentType: "application/json",
+  });
+  await persistTelemetryV12StagedChunk(db(), fixture, chunk, {
+    chunkRowId: `chunk:${crypto.randomUUID()}`,
+    r2Key: `synthetic/mixed-v12-${crypto.randomUUID()}`, envelopeDigest,
+    deviceUploadAuthorizationId: claimed.authorizationId,
+  }, nowEpoch);
+  return { ...candidate, manifest };
+}
+
+async function mixedOwner(participantId: string) {
+  const owner = await db().prepare(`
+    SELECT link.owner_digest, revision_row.revision, revision_row.authority_epoch
+      FROM storage_v11_owner_links link
+      JOIN storage_owner_revisions revision_row ON revision_row.owner_digest = link.owner_digest
+     WHERE link.participant_id = ? AND link.state = 'active' AND revision_row.state = 'active'
+  `).bind(participantId).first<{ owner_digest: string; revision: number; authority_epoch: number }>();
+  if (!owner) throw new Error("mixed client owner missing");
+  return owner;
+}
 
 beforeEach(async () => {
   await reset();
@@ -460,6 +595,132 @@ describe("staged v1.2 successor transport", () => {
     expect(await db().prepare("SELECT generation_id FROM telemetry_v12_domain_heads WHERE participant_id = ?")
       .bind(fixture.participantId).first<string>("generation_id")).toBe(v12Activation.generationId);
 
+  });
+
+  it("keeps a late v1 device admitted beside v1.1 and v1.2 and folds overlap once", async () => {
+    const sourceNamespace = "synthetic-mixed-client-effective";
+    await initializeStorageSource(db(), "synthetic-mixed-client-journal");
+    await initializeTypedV1Admission(db(), sourceNamespace);
+    await initializeTypedV11Admission(db(), sourceNamespace);
+    await db().prepare(
+      "UPDATE telemetry_transport_formats SET lifecycle = 'accepted' WHERE schema_version = 'telemetry-contribution-v1.1'",
+    ).run();
+    await db().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    await db().prepare("UPDATE telemetry_v12_runtime SET state='active', changed_at=? WHERE id=1")
+      .bind(new Date(MIXED_CLIENT_NOW_EPOCH).toISOString()).run();
+
+    const v1Device = await createV11DeviceFixture(db(), { nowEpoch: MIXED_CLIENT_NOW_EPOCH });
+    const v11Device = await createV11DeviceFixture(db(), {
+      participantId: v1Device.participantId, nowEpoch: MIXED_CLIENT_NOW_EPOCH,
+    });
+    const v12Device = await createV11DeviceFixture(db(), {
+      participantId: v1Device.participantId, nowEpoch: MIXED_CLIENT_NOW_EPOCH,
+    });
+    const sharedId = `event:v2:${"1".repeat(64)}`;
+    const v11OnlyId = `event:v2:${"2".repeat(64)}`;
+    const v12OnlyId = `event:v2:${"3".repeat(64)}`;
+    const lateOldId = `event:v2:${"4".repeat(64)}`;
+    const components = {
+      inputUncachedTokens: 100, inputCacheReadTokens: 900, inputCacheWriteTokens: 0,
+      outputTextTokens: 50, outputReasoningTokens: 25, outputCombinedTokens: 75,
+    };
+    const oldShared = v11UsageRecord(MIXED_CLIENT_DAY, "a", {
+      eventId: sharedId, totalInputContextTokens: null,
+      components: { ...components, outputCombinedTokens: null },
+    });
+    const knownShared = v11UsageRecord(MIXED_CLIENT_DAY, "b", {
+      eventId: sharedId, totalInputContextTokens: 1000, components: { ...components },
+    });
+    const v11Only = v11UsageRecord(MIXED_CLIENT_DAY, "c", {
+      eventId: v11OnlyId, totalInputContextTokens: 1000, components: { ...components },
+    });
+    const v12Only = mixedV12UsageRecord(v12OnlyId, 1000, 75);
+    const lateOld = v11UsageRecord(MIXED_CLIENT_DAY, "d", {
+      eventId: lateOldId, totalInputContextTokens: 1000, components: { ...components },
+    });
+
+    // The original v1 device sends before either successor is opted in. It
+    // sends one shared occurrence with the legacy totals absent, leaving the
+    // later devices to supply the independently admitted known values.
+    await expect(insertTypedTelemetryV1Chunk(db(), await makeMixedV1Insert(
+      v1Device, [oldShared], 0, MIXED_CLIENT_NOW_EPOCH,
+    ), sourceNamespace)).resolves.toMatchObject({ acceptedRecords: 1, replay: false });
+
+    await expect(grantTelemetryV11Consent(
+      db(), v11Device, telemetryV11RequiredConsent(), MIXED_CLIENT_NOW_EPOCH,
+    )).resolves.toMatchObject({ minimumWriteRank: 11 });
+    await expect(grantTelemetryV12Consent(
+      db(), v12Device, telemetryV12RequiredConsent(), MIXED_CLIENT_NOW_EPOCH,
+    )).resolves.toMatchObject({ schemaVersion: "telemetry-contribution-v1.2" });
+
+    const v11Uploaded = await persistMixedV11Day(
+      v11Device, [knownShared, v11Only], sourceNamespace, MIXED_CLIENT_NOW_EPOCH,
+    );
+    const v11Prior = await createTelemetryV11DomainPredecessor(db(), v11Device, MIXED_CLIENT_NOW_EPOCH);
+    const v11Domain: TelemetryV11DomainManifest = {
+      schemaVersion: "telemetry-domain-manifest-v1.1", fromDay: MIXED_CLIENT_DAY,
+      throughDay: MIXED_CLIENT_DAY,
+      predecessor: {
+        token: v11Prior.token, previousGenerationId: v11Prior.previousGenerationId,
+        legacyFingerprint: v11Prior.legacyFingerprint,
+      },
+      days: [{ day: MIXED_CLIENT_DAY, manifestId: v11Uploaded.manifestId,
+        manifestDigest: v11Uploaded.manifest.manifestDigest }],
+      manifestDigest: "0".repeat(64),
+    };
+    v11Domain.manifestDigest = await sha256Hex(telemetryV11DomainManifestDigestInput(v11Domain));
+    await expect(activateTelemetryV11Domain(db(), v11Device, v11Domain, MIXED_CLIENT_NOW_EPOCH))
+      .resolves.toMatchObject({ replay: false });
+
+    const v12Uploaded = await persistMixedV12Day(v12Device, [
+      mixedV12UsageRecord(sharedId, 1000, 75), v12Only,
+    ], MIXED_CLIENT_NOW_EPOCH);
+    const v12Prior = await createTelemetryV12DomainPredecessor(db(), v12Device, MIXED_CLIENT_NOW_EPOCH);
+    const v12Domain = {
+      schemaVersion: "telemetry-domain-manifest-v1.2" as const,
+      fromDay: MIXED_CLIENT_DAY, throughDay: MIXED_CLIENT_DAY,
+      predecessor: {
+        token: v12Prior.token, previousGenerationId: v12Prior.previousGenerationId,
+        legacyFingerprint: v12Prior.legacyFingerprint,
+      },
+      days: [{ day: MIXED_CLIENT_DAY, manifestId: v12Uploaded.manifestId,
+        manifestDigest: v12Uploaded.manifest.manifestDigest }],
+      manifestDigest: "0".repeat(64),
+    };
+    v12Domain.manifestDigest = await sha256Hex(telemetryV12DomainManifestDigestInput(v12Domain));
+    await expect(activateTelemetryV12Domain(db(), v12Device, v12Domain, MIXED_CLIENT_NOW_EPOCH))
+      .resolves.toMatchObject({ replay: false });
+
+    // The old device remains below the successor floor on its own device row;
+    // this late unique occurrence is accepted after both successor activations.
+    await expect(assertTelemetryTransportWriteAllowed(
+      db(), v1Device, "telemetry-contribution-v1.0",
+    )).resolves.toBeUndefined();
+    await expect(insertTypedTelemetryV1Chunk(db(), await makeMixedV1Insert(
+      v1Device, [lateOld], 1, MIXED_CLIENT_NOW_EPOCH,
+    ), sourceNamespace)).resolves.toMatchObject({ acceptedRecords: 1, replay: false });
+
+    const owner = await mixedOwner(v1Device.participantId);
+    const page = await readEffectiveUsageOwnerDayPage(db(), {
+      sourceNamespace, ownerDigest: owner.owner_digest, ownerRevision: owner.revision,
+      authorityEpoch: owner.authority_epoch, day: MIXED_CLIENT_DAY, limit: 10,
+    });
+    expect(page.next).toBeNull();
+    expect(page.rows).toHaveLength(4);
+    expect(page.rows.map((row) => row.occurrenceId)).toEqual([
+      sharedId, v11OnlyId, v12OnlyId, lateOldId,
+    ]);
+    const shared = page.rows.find((row) => row.occurrenceId === sharedId);
+    expect(shared).toMatchObject({
+      status: "compatible", sourceCount: 3, sourceFormats: ["v1", "v11", "v12"],
+    });
+    expect(JSON.parse(shared?.recordJson ?? "null")).toMatchObject({
+      totalInputContextTokens: 1000, components: { outputCombinedTokens: 75 },
+    });
+    expect(page.rows.filter((row) => row.occurrenceId === sharedId)).toHaveLength(1);
+    expect(page.rows.find((row) => row.occurrenceId === lateOldId)).toMatchObject({
+      status: "compatible", sourceCount: 1, sourceFormats: ["v1"],
+    });
   });
 });
 

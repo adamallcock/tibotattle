@@ -815,7 +815,7 @@ export function createDesktopController({
 
   async function snapshot() {
     const settings = await store.getSettings();
-    const login = platform.loginItemStatus();
+    const login = await platform.loginItemStatus();
     const codexHomes = activeCodexHomes
       ?? (hasCodexHomesStore
         ? codexHomesPathFreeConfigurationFromSettings(settings)
@@ -842,7 +842,10 @@ export function createDesktopController({
           ? {}
           : { codexHomes: codexHomesSummary(codexHomes) }),
         refreshIntervalSeconds: settings.refreshIntervalSeconds,
-        startAtLogin: login,
+        startAtLogin: Object.freeze({
+          ...login,
+          canOpenSettings: desktopPlatform === "darwin" || desktopPlatform === "win32",
+        }),
         sidebarCollapsed: settings.sidebarCollapsed,
         notifications: notificationSnapshot(settings),
         tray: settings.tray ?? DESKTOP_TRAY_UPGRADE_DEFAULTS,
@@ -1315,11 +1318,11 @@ export function createDesktopController({
         // Persisted preferences may be unapplied defaults after native migration
         // or may differ from changes made in OS Settings. Only the observed OS
         // state can authorize a compensating change if persistence fails.
-        const previousLogin = platform.loginItemStatus();
+        const previousLogin = await platform.loginItemStatus();
         const previousEnabled = previousLogin?.status === "enabled"
           ? true
           : previousLogin?.status === "disabled" ? false : null;
-        const result = platform.setStartAtLogin(enabled);
+        const result = await platform.setStartAtLogin(enabled);
         const accepted = loginItemChangeAccepted(result, enabled);
         if (!accepted) throw controllerError("desktop_start_at_login_unconfirmed");
         try {
@@ -1330,7 +1333,7 @@ export function createDesktopController({
           }
           let rollback;
           try {
-            rollback = platform.setStartAtLogin(previousEnabled);
+            rollback = await platform.setStartAtLogin(previousEnabled);
           } catch {
             rollback = null;
           }
