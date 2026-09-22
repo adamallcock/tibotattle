@@ -32,6 +32,7 @@
     "contamination": "node ./src/cli.js contamination",
     "crosscheck": "node ./src/cli.js crosscheck",
     "diagnose:dashboard": "node ./scripts/inspect-dashboard-state.mjs",
+    "diagnose:desktop-crash": "node ./scripts/diagnose-desktop-crash.mjs",
     "docs:api:check": "node --test test/api-surface-reference.test.js",
     "docs:check": "node ./tools/operations/validate-documentation.mjs",
     "docs:links:check": "node ./tools/operations/validate-documentation.mjs --links-only",

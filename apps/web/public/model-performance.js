@@ -491,7 +491,7 @@ export function mountModelPerformance(options = {}) {
       date: new Intl.DateTimeFormat(locale(), { dateStyle: "medium", timeStyle: "short" }).format(new Date(payload.updatedAt)),
     }) : "";
     const collectingStatus = payload?.status === "ready" && updatedLabel
-      ? `${collectingLabel} · ${updatedLabel}` : collectingLabel;
+      ? `${updatedLabel} · ${collectingLabel}` : collectingLabel;
     const statusState = cancelled ? "cancelled" : failed ? "error" : retainedWindowUnavailable ? "unavailable" : loading && !payload ? "loading" : payload?.collecting || payload?.status === "loading" ? "updating" : payload?.status === "unavailable" ? "unavailable" : payload?.updatedAt ? "ready" : sharedReporting && !reportingWindow ? "waiting" : "";
     status.dataset.state = statusState;
     status.textContent = cancelled ? translate("cancelled") : failed ? translate("failed") : retainedWindowUnavailable ? translate("unavailable") : loading && !payload ? translate("loading") : payload?.collecting || payload?.status === "loading" ? collectingStatus : payload?.status === "unavailable" ? translate("unavailable") : updatedLabel ? updatedLabel : sharedReporting && !reportingWindow ? reportTranslate("waiting") : "";

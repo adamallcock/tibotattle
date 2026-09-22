@@ -701,8 +701,8 @@ function setOperationStatus(documentRef, value, { error = false } = {}) {
 
 function setBridgeStatus(documentRef, messageKey, available, localizer) {
   const element = queryRequired(documentRef, "#settings-bridge-status");
-  element.textContent = translateSettingsMessage(localizer, messageKey);
-  element.classList?.toggle?.("is-ready", available);
+  element.hidden = available;
+  element.textContent = available ? "" : translateSettingsMessage(localizer, messageKey);
   element.classList?.toggle?.("is-unavailable", !available);
 }
 

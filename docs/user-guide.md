@@ -326,9 +326,15 @@ the same recorded timestamp and current clock. An open window therefore changes
 to stale, qualifies its allowance values, and removes the current pacing claim
 without waiting for another response. If a completed dashboard operation still
 has an Electron reservation, the freshness card says automatic refresh is
-waiting for safety recovery. **Show diagnostics** reports only timer/watchdog
-state, mode, age, timestamps and a fixed recovery reason; it never includes the
-lease value, paths, accounts, credentials or session content.
+waiting for safety recovery. **Show diagnostics** runs a content-free doctor
+with app state, settings categories, timer/watchdog state, and local crash-capture
+status. It never includes the lease value, paths, accounts, credentials, session
+content, or a native crash dump. You can review and copy the report or prepare
+an editable GitHub support issue. On macOS, local crash capture is a separate
+off-by-default choice that takes effect after restart. See [support](../SUPPORT.md)
+before sharing a native report. If the app will not open, the source checkout's
+independent macOS crash doctor can inspect Apple reports without launching it;
+the support page gives the exact command.
 
 Trends shows three linked views: **Allowance and activity**, the **three-hour
 observed versus calculated comparison**, and **Cumulative drift**. The first

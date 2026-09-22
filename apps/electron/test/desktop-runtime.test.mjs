@@ -404,6 +404,7 @@ async function launchFixture({
   sharingBackend,
   sharingInstallationState,
   ownedCompanionScript,
+  crashCapture,
   childFactory,
   onSpawn = () => {},
   environment = {
@@ -438,6 +439,7 @@ async function launchFixture({
     }),
     platform,
     architecture,
+    crashCapture,
     ...(isolatedRehearsal ? {} : { argv }),
     lifecycleOptions,
     accountlessLaboratory,
@@ -2393,6 +2395,43 @@ test("runtime wires safe browser, diagnostics, and local-data actions", async ()
   assert.match(dialogs[0].detail, /tibotattle-electron-diagnostics-v2/u);
   assert.match(dialogs[0].detail, /"cadenceTimerArmed": true/u);
   assert.doesNotMatch(dialogs[0].detail, /Users|127\.0\.0\.1|codex-first/u);
+  await fixture.desktop.lifecycle.dispose();
+});
+
+test("doctor prepares only the reviewed content-free issue and persists local capture for restart", async () => {
+  const external = [];
+  const choices = [1, 2];
+  let enabled = false;
+  const fixture = await launchFixture({
+    load: async () => null,
+    crashCapture: {
+      get: async () => ({ available: true, enabled, active: false }),
+      setEnabled: async (value) => {
+        enabled = value;
+        return { available: true, enabled, active: false };
+      },
+    },
+    runtimeOverrides: {
+      dialog: { showMessageBox: async () => ({ response: choices.shift() }) },
+      shell: { openExternal: async (url) => external.push(url) },
+    },
+  });
+  assert.deepEqual(await fixture.desktop.controller.handlers.showDiagnostics({}), {
+    status: "capture_changed_next_launch",
+  });
+  assert.equal(enabled, true);
+  assert.deepEqual(await fixture.desktop.controller.handlers.showDiagnostics({}), {
+    status: "support_prepared",
+  });
+  assert.equal(external.length, 1);
+  const issue = new URL(external[0]);
+  assert.equal(issue.origin, "https://github.com");
+  assert.equal(issue.pathname, "/adamallcock/tibotattle/issues/new");
+  const body = issue.searchParams.get("body");
+  assert.match(body, /tibotattle-electron-diagnostics-v2/u);
+  assert.match(body, /crash_capture_next_launch: true/u);
+  assert.match(body, /crash_report_upload: false/u);
+  assert.doesNotMatch(body, /Users|127\.0\.0\.1|codex-first/u);
   await fixture.desktop.lifecycle.dispose();
 });
 

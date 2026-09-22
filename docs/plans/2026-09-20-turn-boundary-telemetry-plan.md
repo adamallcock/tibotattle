@@ -7,39 +7,37 @@ status: in-progress
 
 # Telemetry v1.2 implementation and compatibility plan
 
-Implementation is continuing in `codex/telemetry-v12-integration` from freshly
-fetched `origin/main` at `ecf1b31e` (2026-09-21). The original foundation was
-preserved as local commit `fb778d17` in `codex/telemetry-v12-foundation`; the dirty
-local main checkout remains untouched. Remote main already contains parser v16
-for the approved missing-cache-write assumption, so exact-total capture now
-uses parser v17 and preserves that predecessor's behavior and provenance.
-Remote main advanced to `c9dab823` (PR #185) during implementation; its recovered
-tool-free speed behavior is integrated in source. A later read-only fetch found
-`6f3a35ea` (PRs #187–#190: Electron tray/startup diagnostics, allowance animation
-and admin database health). Git ancestry is not yet advanced to those commits;
-a local checkpoint and merge remain required.
+Implementation is preserved at local checkpoint `8c0dd392` on
+`codex/telemetry-v12-integration`, with the remote snapshot `6d061b57`
+(2026-09-21, through PR #194) integrated. The original foundation remains at
+`fb778d17` in `codex/telemetry-v12-foundation`; the dirty local main checkout is
+untouched. Exact-total capture uses parser v17 and preserves the remote parser
+v16 missing-cache-write assumption and provenance. Integration retains newer
+tool-free speed reporting, Electron tray/startup behavior, allowance animation,
+admin database health and opt-in crash diagnostics. The incoming crash labels
+are now owned by the canonical localization source so regeneration preserves
+their actions and privacy warning.
 
 **Client release remains blocked until the gates below pass.** The integration
 must preserve all supported client versions and current cache calculations.
 Source qualification, installed-client qualification, publication and hosted
 activation remain separate; no deployment or remote migration is authorized.
 
-## Current completion work — 2026-09-21
+## Implementation scope — 2026-09-21
 
-1. Reconcile the foundation onto the current remote base, preserving newer
-   model-performance/tool-free reporting and runtime packaging. Qualify parser
-   v17 against retained v15/v16 evidence and current behavior.
-2. Implement correction-safe v1/v1.1 admission and a bounded occurrence-preserving
-   reader. Wire effective facts into every daily, quota, graph, history and
-   publication pathway; preserve unique older-client observations.
-3. Connect independent v1.2 capability/authorization, prepared upload, typed
-   storage and readers while leaving legacy capability responses frozen.
-4. Persist full-turn duration and event-time mode through a forward migration.
-   Qualify late-evidence revisions, overlap handling and independent performance
-   transport, lifecycle and authorization.
-5. Complete restore/erasure inventory, synthetic mixed-client end-to-end
-   qualification, focused and owning gates, and local candidate qualification.
-   Record any genuinely unavailable native or protected release gate explicitly.
+1. Remote integration preserves newer model-performance/tool-free reporting and
+   runtime packaging. Parser v17 retains v15/v16 replay compatibility.
+2. Correction-safe v1/v1.1 admission and bounded occurrence readers feed daily,
+   quota, graph, history and publication paths, preserving unique older-client
+   observations.
+3. Independent v1.2 capability/authorization, prepared upload, typed storage and
+   consumers coexist with frozen legacy capability responses.
+4. Forward timing migrations persist full-turn duration and event-time mode.
+   Independent daily performance transport, consent and revisions cover initial,
+   appended and late-completion evidence.
+5. Restore/erasure inventory and mixed-client synthetic qualification are
+   implemented. Native, installed-client and protected release qualification
+   remain separate gates as recorded below.
 
 The dated checkpoints below describe their original foundation revision; they
 are not evidence that the rebased integration candidate has passed those gates.
@@ -74,8 +72,10 @@ fresh hosted grant and exact local approval. A read-only review keeps a stable
 field/count sample across grant creation; actual upload projection separately
 pins the server-issued activation instant. Legacy local flows remain covered.
 The social flow passes 14 loopback/transport tests and 292 browser/projection
-checks. The owning browser suite passed 975 tests before the latest PR #185
-port, and the local suite passed 378 before final performance composition. The successor review explicitly names continuity and cache detail, with 21
+checks. The owning local suite passes 381 tests; the merged browser suite passes
+995. Focused merged Electron/crash-diagnostics checks pass 147 tests, with a
+separate generated-localization regression preserving all six incoming rows.
+The successor review explicitly names continuity and cache detail, with 21
 focused browser/localization checks passing. Its production markup and render
 function were inspected in an isolated synthetic browser fixture in English,
 Spanish and Simplified Chinese, including a narrow layout without horizontal
@@ -109,13 +109,34 @@ with pre-cutoff values remaining null. The latest focused client/parser suite
 passes 68 tests. V1.2 quota, session and usage all pass through typed and shared
 effective readers; chunk-local record indexes cannot collide across chunks.
 
-The Worker workspace package, generated binding, TypeScript and operational
-script gates pass (785 assertions across the script suites). Architecture passes
-with 642 production files, 2,635 imports and no approved debt edges; preflight
-passes 20 tests. The synthetic accounting benchmark passes outside the restricted
-sandbox. Dense effective cache-day resumption, bounded historical dependency
-identity and final social-performance qualification remain under completion.
-Checkpoint persistence must respect the [D1 row and string limits](https://developers.cloudflare.com/d1/platform/limits/).
+Dense effective cache-day resumption passes with 3,400 events and a bounded
+checkpoint below the [D1 row and string limits](https://developers.cloudflare.com/d1/platform/limits/).
+Closed-day identities include relevant correction history and carry-day absence;
+new carry evidence invalidates stale progress. Current-day/carry identities also
+exclude stale completion marks from publication. The existing cache method,
+bands and reducer mathematics remain unchanged: only version-neutral evidence
+adaptation and lifecycle handling were added. The focused cache suite passes
+61 tests and erasure passes 9.
+
+Repeated physical upload revisions are grouped by semantic identity in SQL
+before bounded effective reads. Distinct evidence variants remain visible and
+overflow fails closed. Archive tests cover 3,600 physical copies of 200 semantic
+rows without scanning every physical page. Performance reads are capped across
+the complete requested range before detail allocation, and reject concurrent
+detail loss without returning partial histograms; 14 repository tests pass.
+Daily timing reads apply the UTC day predicate before their 100,000-row bound,
+so a large retained back catalog does not prevent an otherwise small daily
+report. Four timing-bound regressions and 62 parser/timing regressions pass.
+
+The merged Worker workspace package, generated binding, TypeScript and
+operational script gates pass. Architecture passes with 644 production files,
+2,643 imports and no approved debt edges; preflight passes 20 tests. Native
+runtime closure and client exporter static checks pass; these are not installed
+artifact proof. The first merged Worker run completed 1,924 tests: 1,922 passed,
+one publication fixture timed out at five seconds, and one namespace inventory
+still expected only the older readers. The inventory now includes the two
+effective-reader namespaces. Both affected files pass focused reruns (34 and
+11 tests); a clean full rerun is in progress without competing test jobs.
 The broad root run recorded 5,826 tests: 5,754 passed, 24 failed and 48 skipped.
 The twelve browser harness failures were subsequently fixed and the full browser
 suite passed; the synthetic accounting benchmark passed outside the restricted
@@ -503,6 +524,11 @@ mapping, then rehash the reconstructed archive. Merely retaining the four
 correction tables is insufficient. Keep unsupported typed-source restores
 fail-closed rather than classifying their durable evidence as disposable
 analytics.
+
+The following table retains the original requirements inventory. Its imperative
+wording is not a current list of missing implementation; the September 21
+integration checkpoint above records source status, and the rollout gates below
+record remaining operational qualification.
 
 | Area | Required work and qualification |
 | --- | --- |

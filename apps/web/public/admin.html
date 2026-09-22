@@ -43,7 +43,7 @@
         <a href="#growth-title">Activity</a><a href="#storage-safety-title">Storage</a>
         <a href="#distribution-title">Apps &amp; updates</a><a href="#admin-community-title">Allowance</a>
         <a href="#controls-title">Controls</a><a href="#ingress-title">Ingress</a>
-        <a href="#readiness-title">Readiness</a><a href="#errors-title">Failures</a><a href="#audit-title">Audit</a>
+        <a href="#database-health-title">Databases</a><a href="#readiness-title">Readiness</a><a href="#errors-title">Failures</a><a href="#audit-title">Audit</a>
       </nav>
 
       <div id="notice" class="notice notice-warning" role="status" hidden></div>
@@ -311,6 +311,21 @@
           cap, remaining start tokens, and content-free denial counters. Denials are cumulative for the budget state, not a last-24-hour error rate.
         </p>
         <div class="admin-card" id="ingress-status" aria-live="polite"></div>
+      </section>
+
+      <section class="admin-section" aria-labelledby="database-health-title">
+        <p class="eyebrow">Live read checks</p>
+        <h2 id="database-health-title">Database health</h2>
+        <p class="admin-copy">A lightweight read checks each database bound to the API Worker independently when this page refreshes. Response time includes the database round trip; size is reported by D1. Successful reads do not verify writes, backups, schema compatibility or end-to-end service readiness.</p>
+        <p id="database-health-status" class="admin-source-badge" aria-live="polite">Waiting for database checks</p>
+        <p id="database-health-freshness" class="admin-copy">No database check loaded.</p>
+        <div class="admin-card admin-table-wrap" tabindex="0" role="region" aria-label="Database health table">
+          <table>
+            <thead><tr><th>Database role</th><th>Read status</th><th>Response time</th><th>Reported size</th></tr></thead>
+            <tbody id="database-health-rows"></tbody>
+          </table>
+        </div>
+        <p class="admin-copy">If a read fails or exceeds five seconds, check Cloudflare D1 availability and the deployed bindings, then refresh. Size alone does not indicate remaining capacity; review D1 limits and storage trends in Cloudflare.</p>
       </section>
 
       <section class="admin-section" aria-labelledby="readiness-title">

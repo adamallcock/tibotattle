@@ -1,3 +1,4 @@
+import { readAdminDatabaseHealth } from "./admin-database-health";
 import { allowanceReconstructionMode } from "./allowance-reconstruction";
 import { createD1InvocationBudget, D1InvocationBudgetExceededError } from "./d1-invocation-budget";
 import { warmCommunityAnalysisCaches } from "./community-analysis-warmer";
@@ -3609,6 +3610,22 @@ async function handleAdminCommunityAllowancePreview(
   });
 }
 
+async function handleAdminDatabaseHealth(
+  request: Request, env: Env, access?: { readonly identityKey: string },
+): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  if (access === undefined) {
+    if (!adminIdentityKeyConfigured(Reflect.get(env, "ADMIN_IDENTITY_LINK_KEY"))) {
+      throw new ApiError(503, "ADMIN_NOT_CONFIGURED");
+    }
+    await adminSession(request, env);
+  }
+  if (new URL(request.url).search !== "") throw new ApiError(400, "BODY_INVALID");
+  return jsonResponse(await readAdminDatabaseHealth(env), 200, {
+    "cache-control": "no-store", vary: "Cookie",
+  });
+}
+
 async function handleAdminReconstructionProgress(
   request: Request, env: Env, access?: { readonly identityKey: string },
 ): Promise<Response> {
@@ -4235,6 +4252,8 @@ async function routeApi(
       return handleAdminMetricsHistory(request, env);
     case "admin_community_allowance_preview":
       return handleAdminCommunityAllowancePreview(request, env);
+    case "admin_database_health":
+      return handleAdminDatabaseHealth(request, env);
     case "admin_reconstruction_progress":
       return handleAdminReconstructionProgress(request, env);
     case "admin_action":
@@ -4380,6 +4399,10 @@ export async function handleRequest(
           assertWorkerRouteMethod(request, route);
           return noStore(await handleAdminAction(request, env, { identityKey }));
         }
+        if (route.kind === "exact" && route.id === "admin_database_health") {
+          assertWorkerRouteMethod(request, route);
+          return noStore(await handleAdminDatabaseHealth(request, env, { identityKey }));
+        }
         if (route.kind === "exact" && route.id === "admin_reconstruction_progress") {
           assertWorkerRouteMethod(request, route);
           return noStore(await handleAdminReconstructionProgress(request, env, { identityKey }));
@@ -4389,6 +4412,7 @@ export async function handleRequest(
           && (route.id === "admin_overview"
             || route.id === "admin_metrics_history"
             || route.id === "admin_community_allowance_preview"
+            || route.id === "admin_database_health"
             || route.id === "admin_reconstruction_progress"
             || route.id === "admin_action"))) {
         throw new ApiError(404, "NOT_FOUND");

@@ -47,10 +47,58 @@ install, or direct DMG replacement.
 Run `npm run diagnose:dashboard` only from a source checkout. Review its output
 before sharing it. Use synthetic examples where possible.
 
+In the Electron app, open **Settings → General → Local tools → Show diagnostics**
+to run the doctor. Review its content-free report, then choose **Copy diagnostics**
+or **Prepare support issue…**. The latter opens an editable GitHub issue form
+with only that report; GitHub receives the form URL when it opens. Describe the
+problem and review the form before submitting. The doctor does not include or
+upload a native crash report.
+
+On macOS, that dialog can also opt in to **local crash capture for the next
+launch**. It is off by default, separate from contribution sharing, and never
+uploads dumps. Restart after changing it. **Open local crash reports** reveals
+the Crashpad folder for manual inspection. A dump may contain process memory,
+so do not attach or share it unreviewed. Disabling capture also takes effect
+after restart; existing local dumps are preserved for your review.
+
 Never paste prompts, model responses, credentials, OAuth material, account
 identifiers, real session paths, repository names, or unredacted local files
 into an issue or pull request. A screenshot can contain private data even when
 the diagnostic text is safe.
+
+If TiboTattle closes during launch, note whether a native alert shows the fixed
+support code `electron_shell_entry_failed`. This means startup stopped before
+the dashboard opened; it does not identify the underlying cause. On macOS, a
+person with this source checkout and Node.js 22.13+ can run the independent,
+read-only doctor **without opening TiboTattle**:
+
+```sh
+npm run diagnose:desktop-crash -- --hours 72
+```
+
+It checks recently modified TiboTattle Apple crash reports, prints only an allowlisted
+exception type, termination namespace/code, and up to five safe crashed-thread
+symbol names, then reports the local crash-capture preference and dump counts.
+It does not start the app, access Codex sessions or Keychain, change settings,
+or send data. For machine-readable output use
+`node scripts/diagnose-desktop-crash.mjs --hours 72 --json`; it returns the same
+bounded fields for local Codex analysis.
+Stable reports are selected by default; add `--channel dev` for **TiboTattle
+Dev**, or `--channel all` for both. Neither format includes raw reports, dump
+bytes, paths, or report filenames.
+The saved preference cannot prove that Crashpad was active when a particular
+crash happened; it takes effect only after an app launch. A displayed report
+timestamp is its file modification time, which may differ from the crash time.
+Review the output before sharing it. The existing `npm run doctor` checks Codex
+tool readiness; it is unrelated to desktop crash diagnosis. This source command
+is available before a new app release, but requires a current source checkout.
+
+If the CLI finds no matching report, or a report uses a newer Apple format it
+cannot read, open **Console** with Spotlight, select **Crash Reports**, and look
+at the launch time. After reviewing for private paths and content, share only
+the exception type, termination reason, and top frames of the crashed thread.
+A full unreviewed report is not needed for initial triage. No report does not
+rule out an early failure.
 
 ## Supported surface
 

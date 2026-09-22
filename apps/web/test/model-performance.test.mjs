@@ -210,7 +210,7 @@ test('background history scan reports honest bounded progress while keeping char
     dateStyle: 'medium', timeStyle: 'short',
   }).format(new Date(data.updatedAt)) }, 'en-US');
   assert.equal(dom.root.all().find(node => node.className === 'performance-status').textContent,
-    `Building earlier history · 629 of 9,026 sessions checked · ${updated}`);
+    `${updated} · Building earlier history · 629 of 9,026 sessions checked`);
   assert.ok(dom.root.all().some(node => node.id === 'performance-model-panel'));
   assert.equal(dom.root.all().filter(node => node.className === 'performance-card chart-card').length, 2);
   assert.ok(dom.root.all().some(node => node.className === 'performance-unit' && node.textContent.includes('2 full-turn estimates')));
@@ -273,7 +273,7 @@ test('retained measurements show their original update date alongside refresh wh
   const updated = translate('performance.updated', { date: new Intl.DateTimeFormat('en-US', {
     dateStyle: 'medium', timeStyle: 'short',
   }).format(new Date(response.updatedAt)) }, 'en-US');
-  assert.equal(status(), `${translate('performance.updating', {}, 'en-US')} · ${updated}`);
+  assert.equal(status(), `${updated} · ${translate('performance.updating', {}, 'en-US')}`);
   assert.ok(dom.root.all().some(node => node.id === 'performance-model-panel'));
   assert.equal(dom.root.all().filter(node => node.className === 'performance-card chart-card').length, 2);
   response = combinedPayload(); await controller.refresh();
@@ -287,6 +287,24 @@ test('retained measurements show their original update date alongside refresh wh
   await controller.refresh();
   assert.equal(status(), translate('performance.unavailable', {}, 'en-US'));
   controller.destroy();
+});
+
+test('cached update time uses the local date while measurements are updating', async () => {
+  const previousZone = process.env.TZ;
+  process.env.TZ = 'America/New_York';
+  try {
+    const dom = focusHarness();
+    const response = { ...combinedPayload(), collecting: true, updatedAt: '2026-09-22T02:12:00.000Z' };
+    const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => response },
+      t: (key, values) => translate(key, values, 'en-US') });
+    dom.show(); await controller.refresh();
+    assert.equal(dom.root.all().find(node => node.className === 'performance-status').textContent,
+      'Updated Sep 21, 2026, 10:12 PM · Updating measurements…');
+    controller.destroy();
+  } finally {
+    if (previousZone === undefined) delete process.env.TZ;
+    else process.env.TZ = previousZone;
+  }
 });
 
 test('loading and background renders retain heading and About keyboard focus without a duplicate table', async () => {
@@ -515,7 +533,7 @@ test('advancing a shared end bound retains dated charts under their original bou
   controller.setReportingWindow(windowAt(end + DAY));
   assert.ok(panel());
   assert.ok(toolFreeVisible());
-  assert.match(status(), /Updating measurements.+Updated/);
+  assert.match(status(), /^Updated .+ · Updating measurements…$/u);
   const priorBounds = dom.root.all().find(node => node.dataset.evidence === 'period');
   assert.ok(priorBounds, 'retained charts identify their old bounds even with a shared header');
   assert.equal(calls.at(-1).options.endAt, windowAt(end + DAY).endAt);

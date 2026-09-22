@@ -235,6 +235,28 @@ access clears it. A retained graph after a failed refresh is explicitly marked
 as previous dated evidence, and the attention list reports unavailable history,
 allowance and reconstruction sources. Growth snapshots have no age-only read expiry.
 
+The **Database health** section independently calls owner-only
+`GET /api/v1/admin/database-health` (`admin-database-health-v0.1`, no query
+parameters). It performs one constant `SELECT 1` per API-bound D1 role: primary
+service/telemetry, deletion ledger, and the separate analytics database in typed
+storage mode. JSON mode explicitly marks separate analytics as not applicable.
+Other Workers' databases, including the catchup control journal, are outside this
+probe's coverage. The existing Access owner pin protects the route; the public
+hostname returns 404 and responses are never cached.
+
+Each check reports read availability, elapsed round-trip milliseconds, D1-reported
+size in bytes (displayed as MiB), and the observation timestamp. Missing size
+metadata remains unavailable. Individual failure, missing binding, invalid
+storage configuration or a five-second deadline degrades the result while
+preserving the other roles. The deadline stops waiting; it cannot cancel an
+already admitted D1 query. Temporary endpoint failure retains dated results with
+a stale label; lost owner access clears them. Old Workers lacking this additive
+endpoint display unavailable. No migration or production binding changes are
+needed. The route does not write data, run maintenance, scan tables, or verify
+schema compatibility, backup health, remaining capacity or write availability.
+For failed reads, inspect Cloudflare D1 availability and deployed bindings, then
+refresh. Review Cloudflare D1 storage trends and configured limits separately.
+
 The owner page is an observation surface, not an uptime monitor: automatic reads
 pause when its tab is hidden or offline, and browser alerts depend on those reads.
 The attention list checks retention completion freshness against the service's

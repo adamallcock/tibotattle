@@ -312,7 +312,8 @@ async function waitFor(predicate) {
   assert.fail("timed out waiting for the admin view to render");
 }
 
-async function withAdminPage(fetchResponse, check, preferences = {}) {
+async function withAdminPage(fetchResponse, check, preferences = {}, databaseResponse = null) {
+  const databaseFixture = await fixture("admin-database-health-valid.json");
   const documentRef = fakeDocument();
   const html = await readFile(new URL("../public/admin.html", import.meta.url), "utf8");
   for (const [, id] of html.matchAll(/\bid="([\w-]+)"/gu)) {
@@ -336,7 +337,9 @@ async function withAdminPage(fetchResponse, check, preferences = {}) {
   const windowListeners = new Map();
   const replacements = {
     document: documentRef,
-    fetch: fetchResponse,
+    fetch: async (path, options) => path === "/api/v1/admin/database-health"
+      ? databaseResponse ? databaseResponse(options) : response(databaseFixture)
+      : fetchResponse(path, options),
     window: { innerHeight: 844, innerWidth: 390, addEventListener(name, listener) { windowListeners.set(name, listener); } },
     localStorage: {
       getItem: (key) => storedPreferences.get(key) ?? null,
@@ -1953,4 +1956,53 @@ test("plan-switch cohorts retain known totals and first snapshots have no compar
       assert.doesNotMatch(allText(card), /0 last 24h/u);
     }
   });
+});
+
+
+test("database checks remain independent, label stale data and recover", async () => {
+  const healthy = await fixture("admin-database-health-valid.json");
+  let reply = () => response(healthy);
+  await withAdminPage(async () => unavailableResponse(), async documentRef => {
+    const status = documentRef.byId.get("database-health-status");
+    await waitFor(() => status.textContent === "All required databases readable");
+    assert.deepEqual(tableTexts(documentRef, "database-health-rows")[0],
+      ["Primary service and telemetry", "Readable", "12 ms", "100 MiB"]);
+    assert.equal(tableTexts(documentRef, "database-health-rows")[2][3], "Unavailable");
+    reply = () => unavailableResponse();
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => status.textContent === "Refresh failed · previous checks");
+    assert.match(documentRef.byId.get("database-health-freshness").textContent, /not current health/u);
+    assert.equal(tableTexts(documentRef, "database-health-rows").length, 3);
+    const degraded = structuredClone(healthy);
+    degraded.status = "degraded";
+    Object.assign(degraded.databases[1], { status: "timeout", responseMs: null, databaseBytes: null });
+    reply = () => response(degraded);
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => status.textContent === "Database checks need attention");
+    assert.equal(tableTexts(documentRef, "database-health-rows")[1][1], "Timed out (5 seconds)");
+    reply = () => response(healthy);
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => status.textContent === "All required databases readable");
+    reply = () => ({ ok: false, status: 403, json: async () => ({ error: { code: "ADMIN_DENIED" } }) });
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => tableTexts(documentRef, "database-health-rows").length === 0);
+  }, {}, () => reply());
+});
+
+test("database failures reach attention and older Workers show unavailable without losing overview", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const degraded = await fixture("admin-database-health-valid.json");
+  degraded.status = "degraded";
+  Object.assign(degraded.databases[0], { status: "unavailable", responseMs: null, databaseBytes: null });
+  let reply = () => response(degraded);
+  await withAdminPage(async path => path === ADMIN_READ_PATHS[0] ? response(overview) : unavailableResponse(), async documentRef => {
+    await waitFor(() => documentRef.byId.get("database-health-status").textContent === "Database checks need attention");
+    assert.match(descendantNodes(documentRef.byId.get("operator-attention")).map(node => node.textContent).join(" "), /Database checks need attention/u);
+    reply = () => ({ ok: false, status: 404, json: async () => ({ error: { code: "NOT_FOUND" } }) });
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => documentRef.byId.get("database-health-status").textContent === "Database checks unavailable");
+    assert.equal(tableTexts(documentRef, "database-health-rows").length, 0);
+    assert.match(documentRef.byId.get("database-health-freshness").textContent, /older deployments/u);
+    assert.ok(documentRef.byId.get("counts").children.length > 0);
+  }, {}, () => reply());
 });

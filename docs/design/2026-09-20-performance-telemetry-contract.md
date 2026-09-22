@@ -22,7 +22,7 @@ typed storage, local scheduler and independent consent now exist in source.
 The real local controller/worker path is qualified with synthetic initial,
 append and late-completion evidence; report revision and source identity advance
 for each mutation. The owning local suite passes 381 tests and the browser suite
-passes 981. Hosted chart publication and installed/deployed qualification remain
+passes 995 after remote integration. Hosted chart publication and installed/deployed qualification remain
 open; the dated foundation checkpoints below describe their original revisions.
 
 ## Measurement requirements

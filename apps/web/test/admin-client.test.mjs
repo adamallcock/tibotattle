@@ -14,6 +14,7 @@ import {
   projectAdminAction,
   projectAdminMetricsHistory,
   projectAdminOverview,
+  projectAdminDatabaseHealth,
   projectAdminReconstructionProgress,
 } from "../public/admin-client.js";
 
@@ -1284,4 +1285,25 @@ test("admin response errors retain only the bounded transport status, never a bo
     assert.equal(adminResponseError(status, { error: { code: "INTERNAL_ERROR" } }).httpStatus, null);
   }
   assert.equal(new AdminResponseError("ADMIN_ALLOWANCE_PREVIEW_INVALID").httpStatus, null);
+});
+
+
+test("database health projects only closed, consistent role evidence", async () => {
+  const input = await fixture("admin-database-health-valid.json");
+  input.databases[0].privateIdentifier = "must-not-escape";
+  const projected = projectAdminDatabaseHealth(input);
+  assert.equal(projected.databases[2].databaseBytes, null);
+  assert.doesNotMatch(JSON.stringify(projected), /must-not-escape/u);
+  for (const alter of [
+    x => { x.databases.pop(); },
+    x => { x.databases[0].role = "unknown"; },
+    x => { x.databases[0].responseMs = -1; },
+    x => { x.databases[0].status = "unavailable"; },
+    x => { x.databases[0].databaseBytes = NaN; },
+    x => { x.status = "degraded"; },
+    x => { x.storageMode = "json"; },
+  ]) {
+    const bad = structuredClone(input); alter(bad);
+    assert.throws(() => projectAdminDatabaseHealth(bad), { message: "ADMIN_DATABASE_HEALTH_INVALID" });
+  }
 });
