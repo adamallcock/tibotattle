@@ -37,6 +37,7 @@ remains accountable for release wording, validation, signing, and publication.
 
 0.1.24 source integration includes telemetry v1.2 and the Standard/Fast timing
 correction. Hosted rollout and final artifact qualification remain in progress.
+Publication is held pending final model details and pricing.
 See the [candidate release notes](./release-notes/0.1.24.md).
 
 - Enable local Model performance on Windows, following protected-reader and
@@ -45,6 +46,10 @@ See the [candidate release notes](./release-notes/0.1.24.md).
   refresh, and improve automatic refresh recovery.
 - Improve tray pace and run-out forecasts, login status updates, and local
   opt-in crash diagnostics.
+- Correct history record classification, accept rollout lines up to 512 KiB,
+  and preserve existing usage through parser recovery and restart.
+- Recover optional uploads from temporary service failures and trigger a
+  coalesced upload after a successful index update, preserving opt-outs and backoff.
 
 These are source changes awaiting final 0.1.24 artifact qualification.
 
