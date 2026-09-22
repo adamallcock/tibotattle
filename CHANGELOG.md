@@ -35,7 +35,17 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-No additional changes recorded.
+0.1.24 release preparation is in progress. The final candidate requires telemetry
+v1.2 and the Standard/Fast timing correction before source freeze.
+
+- Enable local Model performance on Windows, following protected-reader and
+  packaged-source qualification in [PR #199](https://github.com/adamallcock/tibotattle/pull/199).
+- Add tool-free turn throughput, retain performance and work reports during
+  refresh, and improve automatic refresh recovery.
+- Improve tray pace and run-out forecasts, login status updates, and local
+  opt-in crash diagnostics.
+
+These are source changes awaiting final 0.1.24 artifact qualification.
 
 ## [0.1.23](./release-notes/0.1.23.md) - 2026-09-14
 
