@@ -34,7 +34,8 @@ export const PERFORMANCE_SPEED_MODES = Object.freeze([
   "fast", "standard", "unknown", "other", "mixed",
 ]);
 export const PERFORMANCE_SPEED_MODE_SOURCES = Object.freeze([
-  "rollout_thread_settings", "lineage_inherited", "unobserved", "mixed",
+  "rollout_thread_settings", "turn_context_service_tier", "lineage_inherited",
+  "unobserved", "mixed",
 ]);
 export const PERFORMANCE_API_SERVICE_TIERS = Object.freeze([
   "standard", "priority", "flex", "batch", "unknown", "other", "mixed",
@@ -133,7 +134,8 @@ function performanceV1ValidateRecord(value) {
   if ((value.speedMode === "unknown" && value.speedModeSource !== "unobserved")
       || (value.speedMode === "mixed" && value.speedModeSource !== "mixed")
       || (["fast", "standard", "other"].includes(value.speedMode)
-        && !["rollout_thread_settings", "lineage_inherited"].includes(value.speedModeSource))) {
+        && !["rollout_thread_settings", "turn_context_service_tier", "lineage_inherited"]
+          .includes(value.speedModeSource))) {
     performanceV1Invalid("performance_speed_mode_source_mismatch");
   }
   const speed = parsePerformanceHistogram(value.speedHistogram);

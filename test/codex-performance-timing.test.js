@@ -23,8 +23,11 @@ const settings = (offset, serviceTier, turnId = 'synthetic-turn') => event(offse
     thread_settings: { service_tier: serviceTier },
   });
 
-const context = (offset, turnId = 'synthetic-turn', model = 'gpt-6-astra') => record(offset,
-  'turn_context', { turn_id: turnId, model, effort: 'high' });
+const context = (offset, turnId = 'synthetic-turn', model = 'gpt-6-astra', serviceTier) => {
+  const payload = { turn_id: turnId, model, effort: 'high' };
+  if (serviceTier !== undefined) payload.service_tier = serviceTier;
+  return record(offset, 'turn_context', payload);
+};
 
 const item = (offset, turnId, started, completed, type) => event(offset, 'item_completed', {
   turn_id: turnId,
@@ -48,6 +51,7 @@ function performanceFixture({
   start = 0,
   serviceTier = 'priority',
   includeSetting = true,
+  contextServiceTier,
   model = 'gpt-6-astra',
   duration = 202000,
   complete = {},
@@ -56,7 +60,7 @@ function performanceFixture({
   const rows = [record(0, 'session_meta', { id: 'synthetic-session' })];
   if (includeSetting) rows.push(settings(start - 1, serviceTier, turnId));
   rows.push(
-    context(start, turnId, model),
+    context(start, turnId, model, contextServiceTier),
     event(start, 'task_started', { turn_id: turnId }),
     item(start + 1000, turnId, start, start + 1000, 'Reasoning'),
     usage(start + 1000, turnId, `${turnId}-response-one`, 100, 100),
@@ -198,6 +202,42 @@ test('mode is taken at task start and a post-completion toggle affects only late
   assert.equal(parsed[0].speed_mode, 'fast');
   assert.equal(parsed[0].speed_mode_source, 'rollout_thread_settings');
   assert.equal(parsed[1].speed_mode, 'standard');
+});
+
+test('per-turn context service tier overrides the thread setting at the task boundary', () => {
+  const standard = rowFor(performanceFixture({
+    serviceTier: 'standard', contextServiceTier: 'standard',
+  }));
+  assert.equal(standard.speed_mode, 'standard');
+  assert.equal(standard.speed_mode_source, 'turn_context_service_tier');
+
+  for (const serviceTier of ['priority', 'fast']) {
+    const fast = rowFor(performanceFixture({
+      serviceTier: 'standard', contextServiceTier: serviceTier,
+    }));
+    assert.equal(fast.speed_mode, 'fast', serviceTier);
+    assert.equal(fast.speed_mode_source, 'turn_context_service_tier', serviceTier);
+  }
+});
+
+test('contradictory or malformed per-turn service tier evidence fails closed', () => {
+  const contradictory = rowFor(performanceFixture({
+    serviceTier: 'priority', contextServiceTier: 'standard',
+  }));
+  assert.equal(contradictory.speed_mode, 'standard');
+
+  const midTurn = performanceFixture({ serviceTier: 'standard' });
+  midTurn.splice(4, 0, context(1000, 'synthetic-turn', 'gpt-6-astra', 'priority'));
+  const mixed = rowFor(midTurn);
+  assert.equal(mixed.speed_mode, 'mixed');
+  assert.equal(mixed.speed_mode_source, 'mixed');
+
+  const malformed = performanceFixture({ serviceTier: 'standard' });
+  malformed[2].payload.service_tier = { private: 'untrusted' };
+  const unknown = rowFor(malformed);
+  assert.equal(unknown.speed_mode, 'unknown');
+  assert.equal(unknown.speed_mode_source, 'unobserved');
+  assert.equal(unknown.duration, 2000);
 });
 
 test('mid-turn changes are mixed, while bounded unknown values do not retain raw provider text', () => {
@@ -409,6 +449,31 @@ test('mode evidence survives parser restart without backfilling a later setting'
   const lateRow = rowFor(late);
   assert.equal(lateRow.speed_mode, 'unknown');
   assert.equal(lateRow.speed_mode_source, 'unobserved');
+});
+
+test('per-turn mode override survives restart before task start and replay after task start', () => {
+  const rows = performanceFixture({ serviceTier: 'standard', contextServiceTier: 'priority' });
+  const cold = rowFor(rows);
+  const prefix = parse(rows.slice(0, 3));
+  const resumedResult = [];
+  const resumed = createCodexPerformanceTimingParser(KEY, prefix.parser.state(),
+    row => resumedResult.push(row));
+  rows.slice(3).forEach((row, index) => {
+    resumed.line(Buffer.from(JSON.stringify(row)), index + 4, false);
+  });
+  assert.equal(resumedResult.length, 1);
+  assert.equal(resumedResult[0].speed_mode, 'fast');
+  assert.equal(resumedResult[0].speed_mode_source, 'turn_context_service_tier');
+  assert.equal(resumedResult[0].turn_duration, cold.turn_duration);
+
+  const reordered = performanceFixture({ serviceTier: 'standard' });
+  const turnContext = reordered.splice(2, 1)[0];
+  turnContext.payload.service_tier = 'priority';
+  reordered.splice(3, 0, turnContext);
+  const split = parse(reordered.slice(0, 3));
+  const replayed = parse(reordered.slice(3), split.parser.state()).result[0];
+  assert.equal(replayed.speed_mode, 'fast');
+  assert.equal(replayed.speed_mode_source, 'turn_context_service_tier');
 });
 
 test('pre-extension saved turns resume old timing fields but cannot invent full-turn proof', () => {
