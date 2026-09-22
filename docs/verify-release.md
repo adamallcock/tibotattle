@@ -24,20 +24,17 @@ software is vulnerability-free or universally “safe.”
 
 ## Current availability boundary
 
-As checked on 2026-09-07, the public stable release is
-[`v0.1.18`](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.18), for
-macOS 14 or later on Apple silicon and Intel. It has separate `macOS-arm64.dmg`
-and `macOS-x64.dmg` artifacts with independent checksums and update feeds.
-Homebrew selects the matching artifact automatically; for a direct download,
-choose the one matching **Apple menu → About This Mac**. Always verify that
-artifact's own entry in `release-manifest.json`, not the other architecture's
-digest. Recheck [current status](./current-status.md) and the release endpoints
-before relying on this dated snapshot. Endpoint availability is not fresh proof
-of the downloaded artifact's Apple signature or notarization, so perform the
-checks in Section 3.
+Consult [current status](./current-status.md) and
+[platform support](./reference/platform-support.md) for the published release,
+platform matrix and qualification limits. Select the exact operating system,
+architecture and package format listed in that release's manifest. On macOS,
+Homebrew selects the matching artifact; for a direct download, **Apple menu →
+About This Mac** identifies your architecture. Verify the selected artifact's
+own manifest entry and checksum. Endpoint availability does not prove its
+native signature or other platform assurances; perform the checks in Section 3.
 
-Windows and Linux remain unsupported. Source, plans, contract tests, or
-simulated qualification do not make a build an official supported release.
+Source, plans, contract tests and simulated qualification do not establish
+that a candidate is an official supported release.
 For releases published under the v1 policy, treat the release page and its
 release manifest as the source of truth: if a platform, architecture, format,
 channel, native assurance, or digest is not listed there, do not download or
