@@ -5,6 +5,7 @@ import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
+import { runInNewContext } from "node:vm";
 import test from "node:test";
 
 import { createLocalCollectorRefreshRunner } from "../src/local-companion-refresh.js";
@@ -78,6 +79,7 @@ import {
   verifyWindowsNormalCandidateSyntheticIngestion,
   verifyWindowsNormalCandidateModelPerformance,
   verifyWindowsNormalCandidateProjectsAndThreads,
+  inspectWindowsNormalCandidateProjectsAndThreads,
   verifyWindowsNormalCandidateOptOut,
   verifyWindowsNormalCandidateSmokePackage,
   WINDOWS_NORMAL_CANDIDATE_FIREWALL_TIMEOUT_MS,
@@ -170,6 +172,108 @@ test("packaged Windows projects proof requires saved task name inside the actual
     { ...threads, display: { "thread-id": { ...threads.display["thread-id"], name: "Task 00001" } } },
     { ...threads, display: { "thread-id": { ...threads.display["thread-id"], codexUrl: null } } }]) {
     assert.equal(verifyWindowsNormalCandidateProjectsAndThreads(projects, changed), false);
+  }
+});
+
+function projectsRendererFixture() {
+  const element = (className = "", textContent = "") => ({
+    className, textContent, children: [], attributes: {}, dataset: {}, parentNode: null,
+    append(child) { child.parentNode = this; this.children.push(child); },
+    getAttribute(name) { return this.attributes[name] ?? null; },
+    closest() {
+      return this.inert || this.hidden || this.attributes["aria-hidden"] === "true"
+        ? this : this.parentNode?.closest() ?? null;
+    },
+    contains(node) { return this === node || this.children.some(child => child.contains(node)); },
+    querySelectorAll(selector) {
+      return this.children.flatMap(child => [
+        ...(child.className === selector.slice(1) ? [child] : []), ...child.querySelectorAll(selector),
+      ]);
+    },
+    querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; },
+    get classList() { return { contains: value => this.className === value }; },
+  });
+  const section = element();
+  const status = element("work-usage-status"); status.dataset.state = "ready";
+  const body = element();
+  section.append(status); section.append(body);
+  let button, group, clicks = 0, revision = 0;
+  const resetReport = () => {
+    body.children = [];
+    button = element("work-usage-project-toggle", "›synthetic-windows-project");
+    button.attributes["aria-expanded"] = "false";
+    group = element("work-usage-children"); group.id = `children-${++revision}`;
+    // The rendered control points at this report's actual row group.
+    button.click = () => {
+      clicks++;
+      button.attributes["aria-expanded"] = "true";
+      button.attributes["aria-controls"] = group.id;
+    };
+    body.append(button); body.append(group);
+  };
+  resetReport();
+  const document = {
+    querySelector: selector => selector === "#projects" ? section : null,
+    getElementById: id => group.id === id ? group : null,
+  };
+  return {
+    section, body, status, resetReport,
+    get button() { return button; }, get group() { return group; }, get clicks() { return clicks; },
+    renderTask(name = "Synthetic Windows saved task", href = "codex://threads/70000000-0000-4000-8000-000000000001") {
+      const row = element("work-usage-thread-row");
+      const link = element("cache-drop-thread-link", name); link.attributes.href = href;
+      row.append(link); group.append(row); return { row, link };
+    },
+    inspect: () => inspectWindowsNormalCandidateProjectsAndThreads({
+      evaluate: expression => runInNewContext(expression, { document }),
+    }),
+  };
+}
+
+test("rendered projects proof waits for an interactive report and re-expands after lease replacement", async () => {
+  const f = projectsRendererFixture();
+  f.body.inert = true;
+  assert.equal(await f.inspect(), false);
+  assert.equal(f.clicks, 0, "retained rows must not receive synthetic clicks");
+  f.body.inert = false;
+  assert.equal(await f.inspect(), false, "click acceptance is not task rendering proof");
+  assert.equal(f.clicks, 1);
+  // A nested snapshot-expired response refreshes the view and discards expansion.
+  f.resetReport(); f.body.inert = true; f.status.dataset.state = "loading";
+  assert.equal(await f.inspect(), false);
+  assert.equal(f.clicks, 1);
+  f.body.inert = false; f.status.dataset.state = "ready";
+  assert.equal(await f.inspect(), false);
+  assert.equal(f.clicks, 2, "the current replacement report must be expanded again");
+  assert.equal(await f.inspect(), false, "wait for the child response without toggling it closed");
+  assert.equal(f.clicks, 2);
+  f.renderTask();
+  assert.equal(await f.inspect(), true);
+});
+
+test("rendered projects proof requires the exact visible task link in the expanded project's own row group", async () => {
+  for (const alter of [
+    f => { f.section.inert = true; },
+    f => { f.section.hidden = true; },
+    f => { f.section.attributes["aria-hidden"] = "true"; },
+    f => { f.section.attributes["aria-busy"] = "true"; },
+    f => { f.status.dataset.state = "saved"; },
+    f => { f.body.inert = true; },
+    f => { f.body.hidden = true; },
+    f => { f.button.disabled = true; },
+    f => { f.button.textContent = "Tasks without projects"; },
+    f => { f.button.attributes["aria-controls"] = "other-project"; },
+    f => { f.group.hidden = true; },
+    f => { f.group.className = "other-group"; },
+    f => { f.body.children = [f.button]; },
+    f => { f.group.children[0].children[0].textContent = "Task 00001"; },
+    f => { f.group.children[0].children[0].attributes.href = "codex://threads/70000000-0000-4000-8000-000000000002"; },
+    f => { f.group.children[0].children[0].hidden = true; },
+  ]) {
+    const f = projectsRendererFixture();
+    await f.inspect(); f.renderTask();
+    alter(f);
+    assert.equal(await f.inspect(), false);
   }
 });
 

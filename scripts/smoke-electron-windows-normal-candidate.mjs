@@ -2925,6 +2925,34 @@ export function verifyWindowsNormalCandidateProjectsAndThreads(projects, threads
     && threads.display?.[thread.id]?.codexUrl === `codex://threads/${SYNTHETIC_CODEX_SESSION_ID}`;
 }
 
+// A click is not expansion proof: foreground lease validation or a nested
+// snapshot expiry can replace the report and collapse its rows. Re-observe the
+// current interactive report on every bounded poll, then verify the task inside
+// this project's controlled row group. Never act on retained inert rows.
+export async function inspectWindowsNormalCandidateProjectsAndThreads(cdp) {
+  return cdp.evaluate(`(() => {
+    const section = document.querySelector('#projects');
+    const blocked = node => !node || Boolean(node.closest('[inert], [hidden], [aria-hidden="true"]'));
+    if (blocked(section) || section.getAttribute('aria-busy') === 'true'
+        || section.querySelector('.work-usage-status')?.dataset.state !== 'ready') return false;
+    const button = [...section.querySelectorAll('.work-usage-project-toggle')]
+      .find(item => item.textContent.includes(${JSON.stringify(SYNTHETIC_PROJECT_NAME)}));
+    if (blocked(button) || button.disabled) return false;
+    if (button.getAttribute('aria-expanded') !== 'true') {
+      button.click();
+      return false;
+    }
+    const groupId = button.getAttribute('aria-controls');
+    const group = groupId ? document.getElementById(groupId) : null;
+    if (blocked(group) || !section.contains(group)
+        || !group.classList.contains('work-usage-children')) return false;
+    return [...group.querySelectorAll('.work-usage-thread-row')].some(row =>
+      !blocked(row) && [...row.querySelectorAll('.cache-drop-thread-link')].some(link =>
+        !blocked(link) && link.textContent.trim() === ${JSON.stringify(SYNTHETIC_TASK_NAME)}
+        && link.getAttribute('href') === ${JSON.stringify(`codex://threads/${SYNTHETIC_CODEX_SESSION_ID}`)}));
+  })()`);
+}
+
 // Only a fixed state category crosses the CI receipt boundary. The API can
 // contain local measurements, which must never be echoed in a workflow log.
 export function classifyWindowsNormalCandidateModelPerformance(value) {
@@ -3120,23 +3148,8 @@ async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () =>
       return true;
     })()`);
     if (openedProjects !== true) fail("LOCAL_PROJECTS_AND_THREADS_PAGE_UNAVAILABLE");
-    const expandedProject = await waitFor(() => cdp.evaluate(`(() => {
-      const section = document.querySelector('#projects');
-      if (!section || section.inert || section.getAttribute('aria-hidden') === 'true') return false;
-      const button = [...section.querySelectorAll('.work-usage-project-toggle')]
-        .find(item => item.textContent.includes(${JSON.stringify(SYNTHETIC_PROJECT_NAME)}));
-      if (!button) return false;
-      if (button.getAttribute('aria-expanded') !== 'true') button.click();
-      return true;
-    })()`), OPERATION_TIMEOUT_MS);
-    if (expandedProject !== true) fail("LOCAL_PROJECTS_AND_THREADS_PAGE_UNAVAILABLE");
-    const renderedTask = await waitFor(() => cdp.evaluate(`(() => {
-      const section = document.querySelector('#projects');
-      const rows = [...(section?.querySelectorAll('.work-usage-thread-row') ?? [])];
-      return rows.some(row => [...row.querySelectorAll('.cache-drop-thread-link')].some(link =>
-        link.textContent.trim() === ${JSON.stringify(SYNTHETIC_TASK_NAME)}
-        && link.getAttribute('href') === ${JSON.stringify(`codex://threads/${SYNTHETIC_CODEX_SESSION_ID}`)}));
-    })()`), OPERATION_TIMEOUT_MS);
+    const renderedTask = await waitFor(() => inspectWindowsNormalCandidateProjectsAndThreads(cdp),
+      OPERATION_TIMEOUT_MS);
     if (renderedTask !== true) fail("LOCAL_PROJECTS_AND_THREADS_PAGE_UNAVAILABLE");
     if (!observer.valid()) fail("DASHBOARD_INVALID");
     preloadContexts?.dispose?.();
