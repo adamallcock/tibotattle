@@ -40,20 +40,63 @@ function assertPerformancePreference(value, origin) {
   }
 }
 
+function discardPerformanceBody(response) {
+  try { void response?.body?.cancel().catch(() => {}); } catch { /* best effort */ }
+}
+
 async function readBoundedJson(response, maximumBytes = 16_384) {
-  if (!response || typeof response.status !== "number"
-      || typeof response.text !== "function") {
+  if (!(response instanceof Response) || response.redirected
+      || response.headers.get("cache-control") !== "no-store"
+      || !(response.headers.get("content-type") ?? "").toLowerCase().startsWith("application/json")
+      || !response.body) {
+    discardPerformanceBody(response);
     throw performanceError("telemetry_performance_response_invalid");
   }
-  const text = await response.text();
-  if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > maximumBytes) {
+  const declared = response.headers.get("content-length");
+  if (declared !== null && (!/^\d+$/u.test(declared) || Number(declared) > maximumBytes)) {
+    discardPerformanceBody(response);
     throw performanceError("telemetry_performance_response_invalid");
   }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let text = "";
+  let complete = false;
   try {
-    return text.length === 0 ? null : JSON.parse(text);
-  } catch {
+    for (;;) {
+      let part;
+      try { part = await reader.read(); }
+      catch { throw performanceError("telemetry_performance_capability_unavailable"); }
+      if (part.done) break;
+      bytes += part.value.byteLength;
+      if (!(part.value instanceof Uint8Array) || bytes > maximumBytes) throw performanceError("telemetry_performance_response_invalid");
+      text += decoder.decode(part.value, { stream: true });
+    }
+    text += decoder.decode();
+    complete = true;
+    return JSON.parse(text);
+  } catch (error) {
+    if (error?.code?.startsWith("telemetry_performance_")) throw error;
     throw performanceError("telemetry_performance_response_invalid");
+  } finally {
+    if (!complete) void reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
+}
+
+function performanceResponseFailure(response) {
+  if (!(response instanceof Response) || response.redirected) {
+    discardPerformanceBody(response);
+    return performanceError("telemetry_performance_response_invalid");
+  }
+  if (response.ok) return null;
+  discardPerformanceBody(response);
+  const transient = response.status === 408 || response.status === 425 || response.status === 429 || response.status >= 500;
+  const error = performanceError(transient ? "telemetry_performance_capability_unavailable"
+    : "telemetry_performance_authorization_rejected");
+  const retryAfter = response.headers.get("retry-after");
+  if (transient && retryAfter !== null && retryAfter.length <= 128) error.retryAfter = retryAfter;
+  return error;
 }
 
 async function readPerformanceState(path) {
@@ -211,7 +254,9 @@ export function createLocalAccountlessContribution({
     const performanceFetch = async (...args) => {
       const preference = await bridge.readPreference();
       assertPerformancePreference(preference, origin);
-      const response = await fetchImpl(...args);
+      const [url, init = {}] = args;
+      const response = await fetchImpl(url, { ...init, credentials: "omit", redirect: "error", cache: "no-store",
+        signal: init.signal ?? AbortSignal.timeout(15_000) });
       // A preference transition may race the response. Do not let a stale
       // capability or envelope key authorize a subsequent operation.
       assertPerformancePreference(await bridge.readPreference(), origin);
@@ -234,31 +279,39 @@ export function createLocalAccountlessContribution({
       // request for every capability/report lease.
       if (performanceGrantedGeneration !== generation) {
         const grant = await withSecret(async (secret, binding) => {
-          if (!binding || !DEVICE_ID.test(binding.deviceId)) {
-            throw performanceError("telemetry_performance_authorization_rejected");
+          try {
+            if (!binding || !DEVICE_ID.test(binding.deviceId)) {
+              throw performanceError("telemetry_performance_authorization_rejected");
+            }
+            const response = await performanceFetch(new URL(
+              PERFORMANCE_AUTHORIZATION_PATH, origin,
+            ), {
+              method: "POST",
+              cache: "no-store",
+              headers: {
+                Accept: "application/json",
+                "Content-Type": "application/json",
+                Authorization: `Device um_device_${binding.deviceId}.${secret.toString("base64url")}`,
+              },
+              body: JSON.stringify(PERFORMANCE_AUTHORIZATION),
+            });
+            const failure = performanceResponseFailure(response);
+            if (failure) return { failure };
+            return Object.freeze({ status: response.status, payload: await readBoundedJson(response) });
+          } catch (error) {
+            // The secret lease intentionally sanitizes thrown callback errors.
+            // Return only a typed, content-free transport failure through it.
+            return { failure: error?.code?.startsWith("telemetry_performance_") ? error
+              : performanceError("telemetry_performance_capability_unavailable") };
           }
-          const response = await performanceFetch(new URL(
-            PERFORMANCE_AUTHORIZATION_PATH, origin,
-          ), {
-            method: "POST",
-            cache: "no-store",
-            headers: {
-              Accept: "application/json",
-              "Content-Type": "application/json",
-              Authorization: `Device um_device_${binding.deviceId}.${secret.toString("base64url")}`,
-            },
-            body: JSON.stringify(PERFORMANCE_AUTHORIZATION),
-          });
-          return Object.freeze({
-            status: response.status,
-            payload: response.status >= 200 && response.status < 300
-              ? await readBoundedJson(response)
-              : null,
-          });
-        }).catch(() => null);
-        if (generation !== performanceGrantGeneration
-            || !grant || ![200, 201].includes(grant.status)) {
-          throw performanceError("telemetry_performance_authorization_rejected");
+        });
+        if (generation !== performanceGrantGeneration) throw performanceError("telemetry_performance_authorization_rejected");
+        if (grant?.failure) throw grant.failure;
+        if (!grant || ![200, 201].includes(grant.status)) throw performanceError("telemetry_performance_authorization_rejected");
+        if (!grant.payload || typeof grant.payload !== "object" || Array.isArray(grant.payload)
+            || Object.keys(grant.payload).length !== Object.keys(PERFORMANCE_AUTHORIZATION).length
+            || Object.entries(PERFORMANCE_AUTHORIZATION).some(([key, value]) => grant.payload[key] !== value)) {
+          throw performanceError("telemetry_performance_response_invalid");
         }
         performanceGrantedGeneration = generation;
       }
@@ -268,12 +321,18 @@ export function createLocalAccountlessContribution({
       ));
     };
     const readEnvelopeKey = async () => {
-      const response = await performanceFetch(new URL(
-        PERFORMANCE_ENVELOPE_KEY_PATH, origin,
-      ), { method: "GET", headers: { Accept: "application/json" } });
-      if (response.status !== 200) {
+      let response;
+      try {
+        response = await performanceFetch(new URL(PERFORMANCE_ENVELOPE_KEY_PATH, origin), {
+          method: "GET", headers: { Accept: "application/json" },
+        });
+      } catch (error) {
+        if (error?.code?.startsWith("telemetry_performance_")) throw error;
         throw performanceError("telemetry_performance_capability_unavailable");
       }
+      const failure = performanceResponseFailure(response);
+      if (failure) throw failure;
+      if (response.status !== 200) throw performanceError("telemetry_performance_response_invalid");
       return assertPerformanceEnvelopeKey(await readBoundedJson(response));
     };
     const client = createTelemetryPerformanceClient({
@@ -302,7 +361,7 @@ export function createLocalAccountlessContribution({
     });
     performanceScheduler = createTelemetryPerformanceScheduler({
       ...performanceOptions.schedulerOptions,
-      runner: ({ day, nowEpoch }) => client.runDay({ day, nowEpoch }),
+      runner: ({ day, nowEpoch, resetRetryCount }) => client.runDay({ day, nowEpoch, resetRetryCount }),
       backfillDays: performanceOptions.schedulerOptions?.backfillDays ?? 7,
       includeCurrentDay: performanceOptions.schedulerOptions?.includeCurrentDay ?? true,
     });
@@ -314,6 +373,8 @@ export function createLocalAccountlessContribution({
       return status;
     },
     inspect: scheduler.inspect,
+    inspectDiagnostics: scheduler.inspectDiagnostics,
+    notifyIndexPublished: scheduler.notifyIndexPublished,
     runNow: scheduler.runNow,
     performanceInspect: () => performanceScheduler?.inspect() ?? Object.freeze({ state: "off", lastAcceptedAt: null, nextAttemptAt: null }),
     performanceRunNow: () => performanceScheduler?.runNow() ?? Promise.resolve(Object.freeze({ state: "off", lastAcceptedAt: null, nextAttemptAt: null })),

@@ -3006,6 +3006,53 @@ test("contribution diagnostics project only fixed, content-free support state", 
       recordedAt: "2026-08-19T13:01:00.000Z",
     }],
   });
+  const accountless = {
+    ...payload,
+    journeyPhase: "accountless_active",
+    consent: { approved: false, current: false },
+    signedIn: { observed: false, value: false },
+    pairing: { observed: false, paired: false },
+    accountless: {
+      state: "retry_wait",
+      lastAttemptAt: "2026-09-22T12:00:00.000Z",
+      lastSuccessfulSyncAt: "2026-09-22T11:00:00.000Z",
+      lastAcceptedAt: null,
+      nextAttemptAt: "2026-09-22T12:01:00.000Z",
+      lastFailureCode: "transient_failure",
+    },
+  };
+  const accountlessResult = normalizeLocalContributionDiagnostics(accountless);
+  assert.equal(accountlessResult.status, "available");
+  assert.deepEqual(accountlessResult.accountless, accountless.accountless);
+  assert.equal(Object.isFrozen(accountlessResult.accountless), true);
+  for (const [state, journeyPhase] of [
+    ["off", "accountless_off"], ["unavailable", "accountless_unavailable"],
+    ["paused", "accountless_unavailable"], ["recovery_required", "accountless_unavailable"],
+    ["uploading", "accountless_active"], ["pending", "accountless_active"], ["up_to_date", "accountless_active"],
+  ]) {
+    assert.equal(normalizeLocalContributionDiagnostics({ ...accountless, journeyPhase,
+      accountless: { ...accountless.accountless, state } }).status, "available");
+  }
+  for (const invalid of [
+    { ...accountless, accountless: null },
+    { ...accountless, accountless: { ...accountless.accountless, privatePath: "synthetic-private-canary" } },
+    { ...accountless, accountless: { ...accountless.accountless, lastFailureCode: "synthetic-private-canary" } },
+    { ...accountless, accountless: { ...accountless.accountless, state: "invented_state" } },
+    { ...accountless, accountless: { ...accountless.accountless, lastAttemptAt: "2026-09-22" } },
+    { ...accountless, accountless: { ...accountless.accountless, lastAcceptedAt: undefined } },
+    { ...accountless, consent: { approved: true, current: true } },
+    { ...accountless, signedIn: { observed: true, value: true } },
+    { ...accountless, pairing: { observed: true, paired: true } },
+    { ...accountless, journeyPhase: "accountless_off" },
+    { ...payload, journeyPhase: "accountless_active" },
+    { ...accountless, journeyPhase: "approved_idle" },
+    { ...accountless, token: "synthetic-private-canary" },
+  ]) {
+    const result = normalizeLocalContributionDiagnostics(invalid);
+    assert.equal(result.status, "unavailable");
+    assert.equal(JSON.stringify(result).includes("synthetic-private-canary"), false);
+    assert.equal(Object.hasOwn(result, "accountless"), false);
+  }
   for (const unsafe of [
     { ...payload, includesTokens: true },
     { ...payload, token: "must-not-survive" },

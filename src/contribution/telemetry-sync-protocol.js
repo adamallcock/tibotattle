@@ -81,16 +81,25 @@ function retryAfter(response, now) {
   return Number.isSafeInteger(delay) && delay >= 0 ? Math.min(MAX_RETRY_MS, delay) : null;
 }
 
+function discardResponseBody(response) {
+  if (!(response instanceof Response)) return;
+  try { void response.body?.cancel().catch(() => {}); } catch { /* best effort */ }
+}
+
 // Stream with a byte cap. Reading response.text() and measuring afterward
 // would leave an unbounded network allocation before the check.
 async function boundedBody(response, maximumBytes, signal) {
   if (!(response instanceof Response) || response.redirected
       || response.headers.get("cache-control") !== "no-store"
       || !(response.headers.get("content-type") ?? "").toLowerCase().startsWith("application/json")) {
+    discardResponseBody(response);
     stop("response_invalid");
   }
   const declared = response.headers.get("content-length");
-  if (declared !== null && (!/^\d+$/u.test(declared) || Number(declared) > maximumBytes)) stop("response_invalid");
+  if (declared !== null && (!/^\d+$/u.test(declared) || Number(declared) > maximumBytes)) {
+    discardResponseBody(response);
+    stop("response_invalid");
+  }
   if (!response.body) stop("response_invalid");
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -102,8 +111,12 @@ async function boundedBody(response, maximumBytes, signal) {
   try {
     while (true) {
       if (signal.aborted) stop("interrupted", { retryable: true });
-      const next = await reader.read();
+      let next;
+      try { next = await reader.read(); }
+      catch { stop("service_unavailable", { retryable: true }); }
+      if (signal.aborted) stop("interrupted", { retryable: true });
       if (next.done) break;
+      if (!(next.value instanceof Uint8Array)) stop("response_invalid");
       bytes += next.value.byteLength;
       if (bytes > maximumBytes) stop("response_invalid");
       body += decoder.decode(next.value, { stream: true });
@@ -201,7 +214,26 @@ function transport(options, maxDurationMs) {
         if (signal?.aborted) stop("interrupted", { retryable: true });
         stop("service_unavailable", { retryable: true });
       }
-      const value = await boundedBody(response, maximumBytes, requestSignal);
+      if (!(response instanceof Response) || response.redirected) {
+        discardResponseBody(response);
+        stop("response_invalid");
+      }
+      const transient = response.status === 408 || response.status === 429 || response.status >= 500;
+      // Only a bounded, valid JSON 429 can carry the special admission code.
+      // Other transient statuses have no acknowledgement body to interpret.
+      if (transient && response.status !== 429) {
+        discardResponseBody(response);
+        classifyResponse(response, null, clock, authorization === deviceAuthorization);
+      }
+      let value;
+      try { value = await boundedBody(response, maximumBytes, requestSignal); }
+      catch (error) {
+        if (transient && error instanceof SyncFailure
+        && ["response_invalid", "service_unavailable"].includes(error.failureCode)) {
+          classifyResponse(response, null, clock, authorization === deviceAuthorization);
+        }
+        throw error;
+      }
       if (!response.ok) classifyResponse(response, value, clock, authorization === deviceAuthorization);
       return value;
     }, true);

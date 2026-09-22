@@ -41,6 +41,7 @@ an informal archive.
 | Platform support | [Platform support and qualification](./reference/platform-support.md) | Released Electron 0.1.23 across four targets, exact artifact assurances and owner-accepted physical limits |
 | Production | [Production service operations](./runbooks/production-operations.md) | Read-only observation, deploy/migration gates, private owner erasure, containment, rollback, and recovery boundaries |
 | Community diagnostics | [Community allowance-band diagnosis](./runbooks/2026-08-13-community-allowance-band-diagnosis.md) | Current fit-cache and aggregate diagnosis; production writes remain owner-run |
+| Contribution diagnosis | [Contribution completion funnel](./runbooks/2026-09-22-contribution-completion-funnel.md) | Aggregate-only receipt, activation, projection and publication queries; schema-qualified, read-only plans |
 | Retired hosted APIs | [Hosted API retirement data gates](./runbooks/2026-08-27-hosted-api-retirement-data-gates.md) | Owner-run read-only D1 checks required before any future deletion of data retained after source-route retirement |
 | Release verification | [Verify a TiboTattle release](./verify-release.md) | User-facing checksum, native trust, manifest, and evidence verification |
 | Release trust | [Cross-platform release trust](./decisions/2026-08-18-cross-platform-release-trust.md) | Common evidence decision and artifact-specific native trust requirements |

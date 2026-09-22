@@ -161,8 +161,10 @@ On first use:
 1. open the dashboard from the native window;
 2. review whether local Codex metadata and writable installed state are
    available;
-3. let the native launcher perform one quick quota/headline refresh after the
-   dashboard's first paint, or choose **Refresh** in a standalone browser
+3. let the native launcher refresh after the dashboard's first paint; Electron
+   chooses detailed ingestion when the trusted unified-index publication is
+   missing, invalid, in the future or at least one hour old, and quick
+   quota/headline refresh when it is recent; or choose **Refresh** in a standalone browser
    development session;
 4. during manual **Refresh**, keep reading as
    TiboTattle continues bounded slices under that original action, or choose
@@ -321,8 +323,30 @@ substitute for the personal dashboard.
 
 The native/standalone contribution path is off by default. The Electron
 workstream uses the [accepted accountless policy](../../docs/decisions/2026-09-04-accountless-sharing-policy.md)
-and disables this legacy hosted transport while accountless upload ownership
-is completed. The following gates continue to describe the legacy path:
+and keeps this legacy hosted transport disabled.
+
+Accountless usage sync starts independently of dashboard refresh and otherwise
+checks every four hours after a completed pass. A successfully published,
+complete changed index now coalesces an upload within 60 seconds of snapshot
+reload. This preserves earlier retry deadlines, server backoff, single-flight
+execution, opt-out and terminal authorization states. Quick, unchanged, failed
+or cancelled refreshes do not claim a new index publication.
+
+The accountless production profile exposes a read-only scheduler snapshot through
+`GET /api/local/diagnostics/contribution`. Its closed `accountless` object contains
+`state`, `lastAttemptAt`, `lastSuccessfulSyncAt`, `lastAcceptedAt`, `nextAttemptAt`
+and `lastFailureCode`; the browser's **Copy diagnostics** preserves these fields.
+Journey phases distinguish `accountless_active`, `accountless_off` and
+`accountless_unavailable`, without inventing legacy consent, sign-in or pairing.
+A successful bounded pass need not accept new chunks or finish historical
+backfill. Missing timestamps remain unavailable. The six live fields reset with
+the companion process; they do not prove continuity across a restart. Fixed-code
+attempt, success and failure notes persist separately in the existing private
+diagnostic log, at most once per code per hour per process. Up to five existing
+support references are retained in the response; private errors, identities,
+paths and payloads are excluded. Legacy profiles keep their existing exact shape.
+
+The legacy contribution gates are:
 
 
 1. an explicit consent choice;

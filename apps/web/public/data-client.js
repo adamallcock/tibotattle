@@ -1458,6 +1458,9 @@ const CONTRIBUTION_DIAGNOSTIC_PHASES = new Set([
   "approved_paused",
   "approved_syncing",
   "approved_idle",
+  "accountless_active",
+  "accountless_off",
+  "accountless_unavailable",
 ]);
 const CONTRIBUTION_DIAGNOSTIC_QUEUE_STATES = new Set([
   "unavailable",
@@ -1470,6 +1473,28 @@ const CONTRIBUTION_DIAGNOSTIC_PREVIEW_STATES = new Set([
   "not_observed",
   ...CONTRIBUTION_DIAGNOSTIC_QUEUE_STATES,
 ]);
+const ACCOUNTLESS_DIAGNOSTIC_STATES = new Set([
+  "off", "unavailable", "uploading", "recovery_required", "paused", "pending", "up_to_date", "retry_wait",
+]);
+const ACCOUNTLESS_DIAGNOSTIC_FAILURE_CODES = new Set([
+  null, "transient_failure", "terminal_failure", "credential_recovery_required", "preference_unavailable",
+]);
+
+function validAccountlessDiagnostics(value) {
+  return hasExactKeys(value, [
+    "state", "lastAttemptAt", "lastSuccessfulSyncAt", "lastAcceptedAt", "nextAttemptAt", "lastFailureCode",
+  ]) && ACCOUNTLESS_DIAGNOSTIC_STATES.has(value.state)
+    && ACCOUNTLESS_DIAGNOSTIC_FAILURE_CODES.has(value.lastFailureCode)
+    && ["lastAttemptAt", "lastSuccessfulSyncAt", "lastAcceptedAt", "nextAttemptAt"].every((key) =>
+      value[key] === null || (typeof value[key] === "string" && Number.isFinite(Date.parse(value[key]))
+        && new Date(value[key]).toISOString() === value[key]));
+}
+
+function accountlessDiagnosticPhase(state) {
+  if (state === "off") return "accountless_off";
+  return ["unavailable", "paused", "recovery_required"].includes(state)
+    ? "accountless_unavailable" : "accountless_active";
+}
 
 export function normalizeLocalContributionDiagnostics(payload) {
   const unavailable = Object.freeze({
@@ -1483,6 +1508,7 @@ export function normalizeLocalContributionDiagnostics(payload) {
     recentDiagnosticReferences: Object.freeze([]),
   });
   const references = payload?.recentDiagnosticReferences;
+  const hasAccountless = payload !== null && typeof payload === "object" && Object.hasOwn(payload, "accountless");
   if (!hasExactKeys(payload, [
         "schemaVersion",
         "journeyPhase",
@@ -1499,7 +1525,14 @@ export function normalizeLocalContributionDiagnostics(payload) {
         "includesAccountIdentifiers",
         "includesContent",
         "includesPaths",
+        ...(hasAccountless ? ["accountless"] : []),
       ])
+      || (hasAccountless && !validAccountlessDiagnostics(payload.accountless))
+      || (payload?.journeyPhase?.startsWith?.("accountless_") === true) !== hasAccountless
+      || (hasAccountless && (payload.journeyPhase !== accountlessDiagnosticPhase(payload.accountless.state)
+        || payload.consent?.approved !== false || payload.consent?.current !== false
+        || payload.signedIn?.observed !== false || payload.signedIn?.value !== false
+        || payload.pairing?.observed !== false || payload.pairing?.paired !== false))
       || payload.schemaVersion !== LOCAL_CONTRIBUTION_DIAGNOSTICS_SCHEMA_VERSION
       || !CONTRIBUTION_DIAGNOSTIC_PHASES.has(payload?.journeyPhase)
       || !CONTRIBUTION_DIAGNOSTIC_PREVIEW_STATES.has(payload?.previewState)
@@ -1556,6 +1589,14 @@ export function normalizeLocalContributionDiagnostics(payload) {
       paired: payload.pairing.paired,
     }),
     recentDiagnosticReferences: Object.freeze(normalizedReferences),
+    ...(hasAccountless ? { accountless: Object.freeze({
+      state: payload.accountless.state,
+      lastAttemptAt: payload.accountless.lastAttemptAt,
+      lastSuccessfulSyncAt: payload.accountless.lastSuccessfulSyncAt,
+      lastAcceptedAt: payload.accountless.lastAcceptedAt,
+      nextAttemptAt: payload.accountless.nextAttemptAt,
+      lastFailureCode: payload.accountless.lastFailureCode,
+    }) } : {}),
   });
 }
 

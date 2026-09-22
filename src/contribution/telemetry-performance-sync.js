@@ -333,6 +333,15 @@ function retryDelay(retryCount) {
   return Math.min(3_600_000, 5_000 * (2 ** Math.min(retryCount, 10)));
 }
 
+function retryAfterDelay(value, nowEpoch) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 128) return 0;
+  let delay;
+  if (/^\d+$/u.test(value)) delay = Number(value) * 1_000;
+  else if (/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/u.test(value)) delay = Math.max(0, Date.parse(value) - nowEpoch);
+  else return 0;
+  return Number.isSafeInteger(delay) && delay >= 0 ? Math.min(604_800_000, delay) : 0;
+}
+
 function responseStatus(value) {
   if (Number.isSafeInteger(value)) return value;
   if (value && Number.isSafeInteger(value.status)) return value.status;
@@ -351,13 +360,14 @@ export async function runTelemetryPerformanceSync({
   nowEpoch = Date.now(),
   globalPaused = false,
   deviceConnected = true,
+  resetRetryCount = true,
   readCapabilities,
   prepareDay,
   createEnvelope,
   send,
   saveState = async () => {},
 } = {}) {
-  if (!day(selectedDay) || !integer(nowEpoch) || nowEpoch < 0
+  if (!day(selectedDay) || !integer(nowEpoch) || nowEpoch < 0 || typeof resetRetryCount !== "boolean"
       || typeof readCapabilities !== "function"
       || typeof prepareDay !== "function"
       || typeof createEnvelope !== "function"
@@ -380,32 +390,35 @@ export async function runTelemetryPerformanceSync({
     await saveState(state);
     return Object.freeze({ state, status: "paused", reportRevision: null });
   }
-  if (state.paused || (state.nextAttemptAt !== null && Date.parse(state.nextAttemptAt) > nowEpoch)) {
-    return Object.freeze({ state, status: "paused", reportRevision: null });
+  // Recover only the old transient-exhaustion stop. Explicit authorization,
+  // opt-out, disconnect and invalid-data pauses always remain terminal.
+  if (state.paused && state.pausedReason === "retry_exhausted"
+      && ["capability_unavailable", "service_unavailable"].includes(state.lastOutcome?.code)) {
+    state = freeze({ ...state, paused: false, pausedReason: null });
+    await saveState(state);
   }
+  if (state.paused) return Object.freeze({ state, status: "paused", reportRevision: null });
+  if (state.nextAttemptAt !== null && Date.parse(state.nextAttemptAt) > nowEpoch) {
+    return Object.freeze({ state, status: "retry", reportRevision: null });
+  }
+  const transportFailure = async (error, defaultCode, reportRevision = null) => {
+    const code = error?.code === "telemetry_performance_authorization_rejected" ? "authorization_rejected"
+      : ["telemetry_performance_response_invalid", "telemetry_performance_capability_invalid"].includes(error?.code) ? "response_invalid" : defaultCode;
+    const terminal = code === "authorization_rejected" || code === "response_invalid";
+    const retryCount = terminal ? state.retryCount : Math.min(MAX_TELEMETRY_PERFORMANCE_RETRIES, state.retryCount + 1);
+    state = outcomeState(state, nowEpoch, code, terminal ? "paused" : "retry", {
+      retryCount, paused: terminal, pausedReason: terminal ? code : null,
+      nextAttemptAt: terminal ? null : new Date(nowEpoch + Math.max(retryDelay(retryCount), retryAfterDelay(error?.retryAfter, nowEpoch))).toISOString(),
+    });
+    await saveState(state);
+    return Object.freeze({ state, status: terminal ? "paused" : "retry", reportRevision });
+  };
 
   let cap;
   try {
     cap = capability(await readCapabilities(), nowEpoch);
   } catch (error) {
-    const code = error?.code === "telemetry_performance_authorization_rejected"
-      ? "authorization_rejected" : "capability_unavailable";
-    if (code === "authorization_rejected") {
-      state = outcomeState(state, nowEpoch, code, "paused", {
-        paused: true, pausedReason: code, nextAttemptAt: null,
-      });
-      await saveState(state);
-      return Object.freeze({ state, status: "paused", reportRevision: null });
-    }
-    const retryCount = Math.min(MAX_TELEMETRY_PERFORMANCE_RETRIES, state.retryCount + 1);
-    state = outcomeState(state, nowEpoch, code, retryCount >= MAX_TELEMETRY_PERFORMANCE_RETRIES ? "paused" : "retry", {
-      retryCount,
-      paused: retryCount >= MAX_TELEMETRY_PERFORMANCE_RETRIES,
-      pausedReason: retryCount >= MAX_TELEMETRY_PERFORMANCE_RETRIES ? "retry_exhausted" : null,
-      nextAttemptAt: new Date(nowEpoch + retryDelay(retryCount)).toISOString(),
-    });
-    await saveState(state);
-    return Object.freeze({ state, status: state.paused ? "paused" : "retry", reportRevision: null });
+    return transportFailure(error, "capability_unavailable");
   }
 
   let report;
@@ -419,12 +432,19 @@ export async function runTelemetryPerformanceSync({
     await saveState(state);
     return Object.freeze({ state, status: "paused", reportRevision: null });
   }
-  const envelope = await createEnvelope({ report, authorization: cap.authorization });
+  let envelope;
+  try { envelope = await createEnvelope({ report, authorization: cap.authorization }); }
+  catch (error) {
+    const knownTransportFailure = ["telemetry_performance_capability_unavailable", "telemetry_performance_service_unavailable",
+      "telemetry_performance_authorization_rejected", "telemetry_performance_response_invalid"].includes(error?.code);
+    return transportFailure(knownTransportFailure ? error : { code: "telemetry_performance_response_invalid" },
+      "service_unavailable", report.reportRevision);
+  }
   let response;
   try {
     response = await send({ envelope, authorization: cap.authorization, report });
-  } catch {
-    response = { status: 503 };
+  } catch (error) {
+    return transportFailure(error, "service_unavailable", report.reportRevision);
   }
   const status = responseStatus(response);
   if ((status !== null && status >= 200 && status < 300)
@@ -432,7 +452,7 @@ export async function runTelemetryPerformanceSync({
     state = outcomeState(state, nowEpoch, status === 409 ? "idempotent" : "accepted", "succeeded", {
       cursorDay: selectedDay,
       lastReportRevision: report.reportRevision,
-      retryCount: 0,
+      retryCount: resetRetryCount ? 0 : state.retryCount,
       nextAttemptAt: null,
       paused: false,
       pausedReason: null,
@@ -449,16 +469,7 @@ export async function runTelemetryPerformanceSync({
   }
   if (status === 408 || status === 425 || status === 429 || (status !== null && status >= 500)
       || status === null) {
-    const retryCount = Math.min(MAX_TELEMETRY_PERFORMANCE_RETRIES, state.retryCount + 1);
-    const exhausted = retryCount >= MAX_TELEMETRY_PERFORMANCE_RETRIES;
-    state = outcomeState(state, nowEpoch, "service_unavailable", exhausted ? "paused" : "retry", {
-      retryCount,
-      paused: exhausted,
-      pausedReason: exhausted ? "retry_exhausted" : null,
-      nextAttemptAt: new Date(nowEpoch + retryDelay(retryCount)).toISOString(),
-    });
-    await saveState(state);
-    return Object.freeze({ state, status: exhausted ? "paused" : "retry", reportRevision: report.reportRevision });
+    return transportFailure(response, "service_unavailable", report.reportRevision);
   }
   state = outcomeState(state, nowEpoch, "upload_rejected", "paused", {
     paused: true, pausedReason: "upload_rejected", nextAttemptAt: null,

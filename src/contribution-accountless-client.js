@@ -305,6 +305,7 @@ function retryAfterMilliseconds(response, now = Date.now) {
     if (!Number.isSafeInteger(seconds)) return null;
     milliseconds = seconds * 1_000;
   } else {
+    if (!/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/u.test(value)) return null;
     const then = Date.parse(value);
     let current;
     try { current = epochMilliseconds(now()); } catch { return null; }
@@ -326,6 +327,19 @@ async function readJsonResponse(response, signal, {
   enrollment = false,
   now = Date.now,
 } = {}) {
+  if (!(response instanceof Response) || response.redirected) {
+    discardResponseBody(response);
+    fail("response_invalid");
+  }
+  // Intermediaries can return HTML or no application headers during outages.
+  // Their bodies are not acknowledgements and need not be read or retained.
+  if (response.status === 408 || response.status === 429 || response.status >= 500) {
+    discardResponseBody(response);
+    fail("service_unavailable", {
+      retryable: true,
+      retryAfterMilliseconds: retryAfterMilliseconds(response, now),
+    });
+  }
   const validHeaders = response instanceof Response
     && response.headers.get("cache-control") === "no-store"
     && (response.headers.get("content-type") ?? "")
@@ -349,12 +363,6 @@ async function readJsonResponse(response, signal, {
     fail("response_invalid");
   }
   if (!response.ok) {
-    if (response.status === 408 || response.status === 429 || response.status >= 500) {
-      fail("service_unavailable", {
-        retryable: true,
-        retryAfterMilliseconds: retryAfterMilliseconds(response, now),
-      });
-    }
     const backendCode = payload?.error?.code;
     if (enrollment && response.status === 410
         && backendCode === "ACCOUNTLESS_ENROLLMENT_EXPIRED") {

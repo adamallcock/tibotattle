@@ -11,6 +11,7 @@ import {
   prepareTelemetryPerformanceDay,
   runTelemetryPerformanceSync,
 } from "../src/contribution/telemetry-performance-sync.js";
+import { createTelemetryPerformanceClient, createTelemetryPerformanceScheduler } from "../src/application/index.js";
 import {
   createTelemetryPerformanceEnvelope,
   validateTelemetryPerformanceEnvelope,
@@ -96,8 +97,8 @@ test("refuses an old or mismatched speed-method capability before preparation", 
     send: async () => { throw new Error("must not send"); },
   });
   assert.equal(prepared, false);
-  assert.equal(result.state.lastOutcome.code, "capability_unavailable");
-  assert.equal(result.status, "retry");
+  assert.equal(result.state.lastOutcome.code, "response_invalid");
+  assert.equal(result.status, "paused");
 
   const mismatched = capability();
   mismatched.supportedSpeedMethods = ["receipt", "legacy"];
@@ -109,8 +110,8 @@ test("refuses an old or mismatched speed-method capability before preparation", 
     createEnvelope: async () => { throw new Error("must not create an envelope"); },
     send: async () => { throw new Error("must not send"); },
   });
-  assert.equal(mismatch.state.lastOutcome.code, "capability_unavailable");
-  assert.equal(mismatch.state.pausedReason, null);
+  assert.equal(mismatch.state.lastOutcome.code, "response_invalid");
+  assert.equal(mismatch.state.pausedReason, "response_invalid");
 });
 
 test("prepares deterministic path-free report revisions", async () => {
@@ -207,4 +208,125 @@ test("prepares a zero-record day tombstone when the source revision becomes inel
     () => report([], "not-a-day"),
     /sync failed closed/u,
   );
+});
+
+test("performance transient failures saturate backoff without permanently pausing and recover after restart", async () => {
+  for (const phase of ["capability", "envelope", "send"]) {
+    let now = Date.parse("2026-09-21T12:00:00.000Z");
+    let state = initialTelemetryPerformanceSyncState();
+    let offline = true;
+    const common = {
+      day: DAY,
+      readCapabilities: async () => {
+        if (offline && phase === "capability") throw Object.assign(new Error("synthetic outage"), { retryAfter: "120" });
+        return capability(now);
+      },
+      prepareDay: async () => report(),
+      createEnvelope: async ({ report }) => {
+        if (offline && phase === "envelope") throw Object.assign(new Error("synthetic outage"), { code: "telemetry_performance_capability_unavailable" });
+        return { report };
+      },
+      send: async () => ({ status: offline ? 503 : 202, retryAfter: "120" }),
+    };
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const result = await runTelemetryPerformanceSync({ ...common, state, nowEpoch: now });
+      assert.equal(result.status, "retry", phase);
+      assert.equal(result.state.paused, false);
+      assert.ok(result.state.retryCount <= 8);
+      assert.equal(result.state.cursorDay, null);
+      state = JSON.parse(JSON.stringify(result.state));
+      const early = await runTelemetryPerformanceSync({ ...common, state, nowEpoch: now + 1,
+        readCapabilities: async () => assert.fail("early retry cannot reach network") });
+      assert.equal(early.status, "retry");
+      assert.deepEqual(early.state, state);
+      now = Date.parse(state.nextAttemptAt);
+    }
+    offline = false;
+    // Existing installations may carry the old permanent outage pause.
+    state = { ...state, paused: true, pausedReason: "retry_exhausted" };
+    const recovered = await runTelemetryPerformanceSync({ ...common, state, nowEpoch: now });
+    assert.equal(recovered.status, "succeeded");
+    assert.equal(recovered.state.retryCount, 0);
+    assert.equal(recovered.state.cursorDay, DAY);
+  }
+});
+
+test("performance retry-after is bounded and terminal authority or response errors never retry", async () => {
+  const now = Date.parse("2026-09-21T12:00:00.000Z");
+  const common = { day: DAY, nowEpoch: now, readCapabilities: async () => capability(now),
+    prepareDay: async () => report(), createEnvelope: async ({ report }) => ({ report }) };
+  for (const [retryAfter, delay] of [["120", 120_000], ["999999999", 604_800_000],
+    ["Mon, 21 Sep 2026 12:03:00 GMT", 180_000], ["invalid", 10_000]]) {
+    const result = await runTelemetryPerformanceSync({ ...common, send: async () => ({ status: 429, retryAfter }) });
+    assert.equal(Date.parse(result.state.nextAttemptAt) - now, delay);
+  }
+  for (const phase of ["capability", "envelope", "send"]) {
+    for (const code of ["authorization_rejected", "response_invalid"]) {
+      const fail = async () => { throw Object.assign(new Error("synthetic terminal"), { code: `telemetry_performance_${code}` }); };
+      const result = await runTelemetryPerformanceSync({ ...common,
+        ...(phase === "capability" ? { readCapabilities: fail } : phase === "envelope" ? { createEnvelope: fail } : {}),
+        send: phase === "send" ? fail : async () => assert.fail("terminal failure must not upload"),
+      });
+      assert.equal(result.status, "paused");
+      assert.equal(result.state.pausedReason, code);
+      assert.equal(result.state.nextAttemptAt, null);
+    }
+  }
+});
+
+
+test("deterministic envelope failures cannot become an endless network retry", async () => {
+  const result = await runTelemetryPerformanceSync({ day: DAY, nowEpoch: Date.parse("2026-09-21T12:00:00.000Z"),
+    readCapabilities: async () => capability(), prepareDay: async () => report(),
+    createEnvelope: async () => { throw new TypeError("synthetic invalid envelope"); },
+    send: async () => assert.fail("invalid envelope cannot upload"),
+  });
+  assert.equal(result.status, "paused");
+  assert.equal(result.state.pausedReason, "response_invalid");
+  assert.equal(result.state.nextAttemptAt, null);
+});
+
+
+test("successful current-day prefixes preserve older-day retry backoff across scheduler restarts", async () => {
+  let now = Date.parse("2026-09-21T12:00:00.000Z");
+  let state = initialTelemetryPerformanceSyncState();
+  let unavailable = true;
+  let nextDelay = null;
+  const uploadedDays = [];
+  const client = createTelemetryPerformanceClient({
+    origin: "https://telemetry.example.test", readAuthorization: async () => "Device synthetic-token",
+    readState: async () => JSON.parse(JSON.stringify(state)), saveState: async (next) => { state = next; },
+    readPreparedDay: async ({ day }) => report([], day), createEnvelope: async ({ report }) => ({ report }),
+    fetchImpl: async (_, request) => {
+      if (request.method === "GET") return new Response(JSON.stringify(capability(now)), {
+        headers: { "content-type": "application/json", "cache-control": "no-store" },
+      });
+      const selectedDay = JSON.parse(request.body).report.day;
+      uploadedDays.push(selectedDay);
+      return new Response(null, { status: unavailable && selectedDay === "2026-09-20" ? 503 : 202 });
+    },
+  });
+  const runPass = async () => {
+    const scheduler = createTelemetryPerformanceScheduler({ runner: (options) => client.runDay(options),
+      now: () => now, backfillDays: 1, includeCurrentDay: true, retryMilliseconds: 1_000,
+      setTimer: (_, delay) => { nextDelay = delay; return 1; }, clearTimer: () => {},
+    });
+    scheduler.start();
+    const result = await scheduler.runNow();
+    await scheduler.stop();
+    return result;
+  };
+  for (let attempt = 1; attempt <= 10; attempt += 1) {
+    const result = await runPass();
+    assert.equal(result.state, "retry_wait");
+    assert.equal(state.retryCount, Math.min(attempt, 8));
+    assert.equal(nextDelay, 5_000 * (2 ** Math.min(attempt, 8)));
+    assert.deepEqual(uploadedDays.slice(-2), [DAY, "2026-09-20"]);
+    now += nextDelay;
+  }
+  unavailable = false;
+  const recovered = await runPass();
+  assert.equal(recovered.state, "up_to_date");
+  assert.equal(state.retryCount, 0);
+  assert.equal(state.paused, false);
 });

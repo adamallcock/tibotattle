@@ -202,30 +202,78 @@ function retryAfter(response, now = Date.now()) {
     : MAXIMUM_RETRY_AFTER_MILLISECONDS;
 }
 
+function discardResponseBody(response) {
+  if (!(response instanceof Response)) return;
+  try { void response.body?.cancel().catch(() => {}); } catch { /* best effort */ }
+}
+
+async function readBoundedJson(response, maximumBytes, signal) {
+  const declared = response.headers.get("content-length");
+  if (response.headers.get("cache-control") !== "no-store"
+      || !(response.headers.get("content-type") ?? "").toLowerCase().startsWith("application/json")
+      || (declared !== null && (!/^\d+$/u.test(declared) || Number(declared) > maximumBytes))
+      || !response.body) {
+    discardResponseBody(response);
+    interrupt("response_invalid");
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let text = "";
+  let complete = false;
+  const cancel = () => { void reader.cancel().catch(() => {}); };
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    for (;;) {
+      if (signal?.aborted) interrupt("service_unavailable", { retryable: true });
+      let part;
+      try { part = await reader.read(); }
+      catch { interrupt("service_unavailable", { retryable: true }); }
+      if (signal?.aborted) interrupt("service_unavailable", { retryable: true });
+      if (part.done) break;
+      if (!(part.value instanceof Uint8Array)) interrupt("response_invalid");
+      bytes += part.value.byteLength;
+      if (bytes > maximumBytes) interrupt("response_invalid");
+      text += decoder.decode(part.value, { stream: true });
+    }
+    text += decoder.decode();
+    complete = true;
+    return text.length === 0 ? null : JSON.parse(text);
+  } catch (error) {
+    if (error instanceof PassFailure) throw error;
+    interrupt("response_invalid");
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    if (!complete) cancel();
+    reader.releaseLock();
+  }
+}
+
 async function readJson(response, {
   deviceAuthorized = false,
   maximumBytes = MAX_RESPONSE_BYTES,
+  signal,
 } = {}) {
-  if (!(response instanceof Response)) interrupt("response_invalid");
-  if (response.headers.get("cache-control") !== "no-store"
-      || !(response.headers.get("content-type") ?? "")
-        .toLowerCase().startsWith("application/json")) {
+  if (!(response instanceof Response) || response.redirected) {
+    discardResponseBody(response);
     interrupt("response_invalid");
   }
-  let text;
-  try {
-    text = await response.text();
-  } catch {
-    interrupt("service_unavailable", { retryable: true });
-  }
-  if (Buffer.byteLength(text, "utf8") > maximumBytes) {
-    interrupt("response_invalid");
+  const transient = response.status === 408 || response.status === 429 || response.status >= 500;
+  const serviceUnavailable = () => interrupt("service_unavailable", {
+    retryable: true, retryAfterMilliseconds: retryAfter(response),
+  });
+  // Preserve admission pacing for valid JSON 429s without requiring application
+  // headers or a valid error document from a temporarily unavailable gateway.
+  if (transient && response.status !== 429) {
+    discardResponseBody(response);
+    serviceUnavailable();
   }
   let payload;
-  try {
-    payload = text.length === 0 ? null : JSON.parse(text);
-  } catch {
-    interrupt("response_invalid");
+  try { payload = await readBoundedJson(response, maximumBytes, signal); }
+  catch (error) {
+    if (transient && error instanceof PassFailure
+        && ["response_invalid", "service_unavailable"].includes(error.failureCode)) serviceUnavailable();
+    throw error;
   }
   if (response.ok) return payload;
 
@@ -283,7 +331,7 @@ async function requestJson(fetchImpl, url, options, classification = {}) {
   } catch {
     interrupt("service_unavailable", { retryable: true });
   }
-  return readJson(response, classification);
+  return readJson(response, { ...classification, signal: options.signal });
 }
 
 function isUtcDay(value) {
@@ -690,6 +738,7 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
       operation: async (secret, device) => {
         try {
           let envelopeKey = null;
+          let envelopeKeyFailure = null;
           const result = await runSync({
             serverBaseUrl: selectedOrigin,
             deviceAuthorization: `Device um_device_${device.deviceId}.${secret.toString("base64url")}`,
@@ -712,34 +761,27 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
               if (envelopeKey === null) {
                 const requestSignal = signal === undefined ? AbortSignal.timeout(requestTimeoutMilliseconds)
                   : AbortSignal.any([signal, AbortSignal.timeout(requestTimeoutMilliseconds)]);
-                const response = await fetch(new URL("/api/v1/envelope-key", selectedOrigin), {
-                  credentials: "omit", redirect: "error", signal: requestSignal,
-                  headers: { Accept: "application/json" },
-                });
-                if (!(response instanceof Response) || !response.body) interrupt("response_invalid");
-                const reader = response.body.getReader();
-                const parts = [];
-                let bytes = 0;
                 try {
-                  for (;;) {
-                    const part = await reader.read();
-                    if (part.done) break;
-                    bytes += part.value.byteLength;
-                    if (bytes > MAX_RESPONSE_BYTES) interrupt("response_invalid");
-                    parts.push(part.value);
-                  }
-                } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
-                envelopeKey = await readJson(new Response(Buffer.concat(parts), {
-                  status: response.status, headers: response.headers,
-                }));
-                if (envelopeKey?.algorithm !== "RSA-OAEP-256"
-                    || typeof envelopeKey.keyId !== "string" || !envelopeKey.keyId || envelopeKey.keyId.length > 200
-                    || !envelopeKey.publicJwk || typeof envelopeKey.publicJwk !== "object") interrupt("response_invalid");
+                  envelopeKey = await requestJson(fetch, new URL("/api/v1/envelope-key", selectedOrigin), {
+                    signal: requestSignal, headers: { Accept: "application/json" },
+                  });
+                  if (envelopeKey?.algorithm !== "RSA-OAEP-256"
+                      || typeof envelopeKey.keyId !== "string" || !envelopeKey.keyId || envelopeKey.keyId.length > 200
+                      || !envelopeKey.publicJwk || typeof envelopeKey.publicJwk !== "object") interrupt("response_invalid");
+                } catch (error) {
+                  // The injected envelope port is otherwise classified as a local
+                  // index failure; retain this transport's bounded failure type.
+                  if (error instanceof PassFailure) envelopeKeyFailure = error;
+                  throw error;
+                }
               }
               return createEnvelope({ chunk, ...envelopeKey, cryptoImpl });
             },
           });
           if (localIndexChanged) return v11Failure({ code: "local_index_changed" }, {
+            daysTotal: result.daysTotal, networkActivity,
+          });
+          if (envelopeKeyFailure) return v11Failure(envelopeKeyFailure, {
             daysTotal: result.daysTotal, networkActivity,
           });
           return Object.freeze({ ...result, networkActivity: result.networkActivity || networkActivity });

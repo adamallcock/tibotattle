@@ -7,6 +7,7 @@ import { refreshAccountingStatus, refreshQuickResultStatus } from "../public/lib
 import { observationRecency } from "../public/dashboard-ui.js";
 import { createDomHelpers } from "../public/ui-format.js";
 import { createElectronRefreshLease } from "../public/electron-refresh-lifecycle.js";
+import { DESKTOP_AUTOMATIC_REFRESH_CADENCE_INTERVAL_MS } from "../../electron/desktop-automatic-refresh-cadence.js";
 
 const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
 
@@ -49,6 +50,7 @@ function refreshHarness({
   electron = false,
   bridge = undefined,
   detailedSnapshot = false,
+  now = Date.parse("2026-09-22T12:00:00.000Z"),
   refreshStates = [],
 } = {}) {
   const calls = [];
@@ -68,12 +70,21 @@ function refreshHarness({
     state: "stale",
     activity: { lastScanAt: "2026-09-02T00:00:00.000Z" },
     accounting: {
+      generationMatched: detailedSnapshot,
       projection: detailedSnapshot
         ? { status: "available", reason: null, terminal: false }
         : { status: "unavailable", reason: "local_unified_index_deferred", terminal: true },
     },
+    timeline: {
+      history: {
+        status: "complete",
+        source: "unified_local_index",
+        generatedAt: new Date(now).toISOString(),
+      },
+    },
   };
   const context = createContext({
+    Date: class extends Date { static now() { return now; } },
     dashboard: priorDashboard,
     localActionBusy: false,
     localRefreshInProgress: false,
@@ -423,6 +434,85 @@ test("Electron startup stays quick when a trusted detailed projection is present
 
   assert.deepEqual(harness.calls, ["quick", "status", "reload"]);
   assert.deepEqual(harness.routes, ["/api/local/refresh/quick"]);
+});
+
+test("Electron startup only trusts recent unified publication evidence", async (t) => {
+  const now = Date.parse("2026-09-22T12:00:00.000Z");
+  const interval = DESKTOP_AUTOMATIC_REFRESH_CADENCE_INTERVAL_MS;
+  for (const [name, edit, expected] of [
+    ["just under hourly cadence", (data) => {
+      data.timeline.history.generatedAt = new Date(now - interval + 1).toISOString();
+    }, "quick"],
+    ["at hourly cadence", (data) => {
+      data.timeline.history.generatedAt = new Date(now - interval).toISOString();
+    }, "detailed"],
+    ["stale despite fresh quota and accounting", (data) => {
+      data.timeline.history.generatedAt = new Date(now - 3 * interval).toISOString();
+      data.generatedAt = data.accounting.generatedAt = data.activity.lastScanAt = new Date(now).toISOString();
+    }, "detailed"],
+    ["missing publication", (data) => { delete data.timeline.history.generatedAt; }, "detailed"],
+    ["null publication", (data) => { data.timeline.history.generatedAt = null; }, "detailed"],
+    ["malformed publication", (data) => { data.timeline.history.generatedAt = "invalid"; }, "detailed"],
+    ["noncanonical publication", (data) => { data.timeline.history.generatedAt = "2026-09-22"; }, "detailed"],
+    ["future publication", (data) => {
+      data.timeline.history.generatedAt = new Date(now + 1).toISOString();
+    }, "detailed"],
+    ["unavailable projection", (data) => { data.accounting.projection.status = "unavailable"; }, "detailed"],
+    ["mismatched generation", (data) => { data.accounting.generationMatched = false; }, "detailed"],
+    ["collector timeline", (data) => { data.timeline.history.source = "recent_collector_window"; }, "detailed"],
+    ["loading history", (data) => { data.timeline.history.status = "loading"; }, "detailed"],
+    ["available partial history", (data) => { data.timeline.history.status = "partial"; }, "quick"],
+  ]) {
+    await t.test(name, async () => {
+      const harness = refreshHarness({ electron: true, detailedSnapshot: true, now });
+      edit(harness.priorDashboard);
+      runInContext(productionFunction("startElectronStartupRefresh"), harness.context);
+      assert.equal(harness.context.startElectronStartupRefresh(), true);
+      assert.equal(harness.context.startElectronStartupRefresh(), false);
+      await new Promise(setImmediate);
+      assert.equal(harness.calls[0], expected);
+      assert.equal(harness.routes.length, 1);
+    });
+  }
+});
+
+test("short Electron relaunches eventually ingest old history without resetting its freshness", async () => {
+  const publishedMs = Date.parse("2026-09-22T12:00:00.000Z");
+  const interval = DESKTOP_AUTOMATIC_REFRESH_CADENCE_INTERVAL_MS;
+  for (const [age, expected] of [
+    [interval / 2, "quick"],
+    [interval - 1, "quick"],
+    [interval, "detailed"],
+    [interval + 1, "detailed"],
+  ]) {
+    const harness = refreshHarness({ electron: true, detailedSnapshot: true, now: publishedMs + age });
+    harness.priorDashboard.timeline.history.generatedAt = new Date(publishedMs).toISOString();
+    runInContext(productionFunction("startElectronStartupRefresh"), harness.context);
+    harness.context.startElectronStartupRefresh();
+    await new Promise(setImmediate);
+    assert.equal(harness.calls[0], expected);
+    assert.equal(harness.priorDashboard.timeline.history.generatedAt, new Date(publishedMs).toISOString(),
+      "starting or completing a renderer refresh cannot manufacture a publication timestamp");
+  }
+});
+
+test("Electron startup evaluates publication evidence after its barrier clears", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const harness = refreshHarness({ electron: true, detailedSnapshot: true });
+  harness.context.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__ = {
+    version: "v1",
+    waitForStartupRefresh: () => gate,
+  };
+  runInContext(productionFunction("startElectronStartupRefresh"), harness.context);
+  harness.context.startElectronStartupRefresh();
+  await new Promise(setImmediate);
+  assert.deepEqual(harness.calls, []);
+  harness.priorDashboard.timeline.history.generatedAt = null;
+  release();
+  await new Promise(setImmediate);
+  assert.equal(harness.calls[0], "detailed");
+  assert.equal(harness.routes.length, 1);
 });
 
 test("qualified Electron startup waits for the preload smoke barrier", async () => {

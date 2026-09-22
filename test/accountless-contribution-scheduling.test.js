@@ -95,6 +95,189 @@ test("partial uploads keep remaining work explicit until the next bounded pass",
   await scheduler.stop();
 });
 
+test("index publications coalesce without postponing an earlier upload", async () => {
+  const clock = timers();
+  let time = Date.parse("2026-09-22T12:00:00.000Z");
+  let calls = 0;
+  const scheduler = createAccountlessContributionScheduler({ origin, ...clock, now: () => time,
+    readPreference: async () => ready,
+    runner: async () => { calls++; return { status: "complete", chunksUploaded: 0 }; } });
+  assert.equal(scheduler.notifyIndexPublished(), false, "normal startup owns pre-start publications");
+  scheduler.start();
+  await scheduler.runNow();
+  assert.equal(scheduler.notifyIndexPublished(), true);
+  assert.equal(scheduler.inspect().state, "pending", "new local usage awaits upload");
+  const [id, timer] = [...clock.pending.entries()][0];
+  const next = scheduler.inspect().nextAttemptAt;
+  assert.equal(timer.delay, 60_000);
+  time += 30_000;
+  assert.equal(scheduler.notifyIndexPublished(), true);
+  assert.equal(scheduler.inspect().nextAttemptAt, next);
+  assert.equal(clock.pending.get(id), timer);
+  assert.equal(clock.pending.size, 1);
+  assert.equal(calls, 1);
+  await scheduler.stop();
+  assert.equal(scheduler.notifyIndexPublished(), false);
+  assert.equal(clock.pending.size, 0);
+});
+
+test("a partial pass already scheduled sooner keeps its pending deadline on publication", async () => {
+  const clock = timers();
+  let time = Date.parse("2026-09-22T12:00:00.000Z");
+  const scheduler = createAccountlessContributionScheduler({ origin, ...clock, now: () => time,
+    readPreference: async () => ready,
+    runner: async () => ({ status: "partial", chunksUploaded: 1, hasMore: true }) });
+  scheduler.start();
+  await scheduler.runNow();
+  const before = [...clock.pending.entries()];
+  const deadline = scheduler.inspect().nextAttemptAt;
+  time += 45_000;
+  assert.equal(scheduler.notifyIndexPublished(), true);
+  assert.equal(scheduler.inspect().state, "pending");
+  assert.equal(scheduler.inspect().nextAttemptAt, deadline);
+  assert.deepEqual([...clock.pending.entries()], before);
+  await scheduler.stop();
+});
+
+test("a publication during upload queues one bounded follow-up with no overlapping runner", async () => {
+  const clock = timers();
+  let finish;
+  let calls = 0;
+  const scheduler = createAccountlessContributionScheduler({ origin, ...clock,
+    readPreference: async () => ready,
+    runner: () => { calls++; return new Promise((resolve) => { finish = resolve; }); } });
+  scheduler.start();
+  const pass = scheduler.runNow();
+  await tick();
+  assert.equal(scheduler.notifyIndexPublished(), true);
+  assert.equal(scheduler.notifyIndexPublished(), true);
+  const duplicate = scheduler.runNow();
+  assert.equal(calls, 1);
+  finish({ status: "complete", chunksUploaded: 1 });
+  await Promise.all([pass, duplicate]);
+  assert.equal(scheduler.inspect().state, "pending");
+  assert.equal(clock.pending.size, 1);
+  assert.equal([...clock.pending.values()][0].delay, 60_000);
+  const nextPass = scheduler.runNow();
+  await tick();
+  finish({ status: "complete", chunksUploaded: 0 });
+  await nextPass;
+  assert.equal(calls, 2);
+  assert.equal(scheduler.inspect().state, "up_to_date");
+  assert.equal([...clock.pending.values()][0].delay, 4 * 60 * 60_000);
+  await scheduler.stop();
+});
+
+test("index publications cannot override Retry-After, backoff, recovery or opt-out", async (t) => {
+  for (const [name, preference, result, expectedState, expectedDelay] of [
+    ["Retry-After", ready, { status: "failed", failure: { retryable: true, retryAfterMilliseconds: 600_000 } }, "retry_wait", 600_000],
+    ["backoff", ready, { status: "failed", failure: { retryable: true } }, "retry_wait", 60_000],
+    ["terminal", ready, { status: "failed", failure: { retryable: false } }, "paused", null],
+    ["recovery", ready, { status: "failed", failure: { code: "credential_recovery_required", retryable: false } }, "recovery_required", null],
+    ["opt-out", { ...ready, enabled: false }, null, "off", 60_000],
+    ["unavailable", { ...ready, available: false }, null, "unavailable", 60_000],
+  ]) {
+    await t.test(name, async () => {
+      const clock = timers();
+      let scheduler;
+      scheduler = createAccountlessContributionScheduler({ origin, ...clock,
+        readPreference: async () => preference,
+        runner: async () => {
+          scheduler.notifyIndexPublished();
+          return result;
+        } });
+      scheduler.start();
+      await scheduler.runNow();
+      const before = [...clock.pending.entries()];
+      assert.equal(scheduler.inspect().state, expectedState);
+      assert.equal(scheduler.inspectDiagnostics().lastFailureCode, {
+        retry_wait: "transient_failure", paused: "terminal_failure",
+        recovery_required: "credential_recovery_required", off: null,
+        unavailable: "preference_unavailable",
+      }[expectedState]);
+      assert.equal(scheduler.notifyIndexPublished(), false);
+      assert.deepEqual([...clock.pending.entries()], before);
+      assert.deepEqual(before.map(([, timer]) => timer.delay), expectedDelay === null ? [] : [expectedDelay]);
+      if (name === "backoff") {
+        await scheduler.runNow();
+        assert.equal([...clock.pending.values()][0].delay, 120_000);
+        assert.equal(scheduler.notifyIndexPublished(), false);
+        assert.equal([...clock.pending.values()][0].delay, 120_000);
+      }
+      await scheduler.stop();
+    });
+  }
+});
+
+test("opt-out clears a publication queued during an aborted pass", async () => {
+  const clock = timers();
+  let preference = ready;
+  let finish;
+  const scheduler = createAccountlessContributionScheduler({ origin, ...clock,
+    readPreference: async () => preference,
+    runner: () => new Promise((resolve) => { finish = resolve; }) });
+  scheduler.start();
+  const pass = scheduler.runNow();
+  await tick();
+  assert.equal(scheduler.notifyIndexPublished(), true);
+  preference = { ...ready, enabled: false };
+  scheduler.preferenceChanged();
+  finish({ status: "complete", chunksUploaded: 1 });
+  await pass;
+  await scheduler.runNow();
+  assert.equal(scheduler.inspect().state, "off");
+  assert.equal(scheduler.inspect().lastAcceptedAt, null);
+  preference = ready;
+  scheduler.preferenceChanged();
+  const resumed = scheduler.runNow();
+  await tick();
+  finish({ status: "complete", chunksUploaded: 0 });
+  await resumed;
+  assert.equal(scheduler.inspect().state, "up_to_date");
+  assert.equal([...clock.pending.values()][0].delay, 4 * 60 * 60_000);
+  await scheduler.stop();
+});
+
+test("private scheduler diagnostics distinguish attempts, successful passes and accepted chunks", async () => {
+  const clock = timers();
+  let time = Date.parse("2026-09-22T12:00:00.000Z");
+  let pass = 0;
+  const observations = [];
+  const scheduler = createAccountlessContributionScheduler({ origin, ...clock, now: () => time,
+    readPreference: async () => ready,
+    onDiagnostics: (value) => {
+      observations.push(value);
+      if (pass % 2) return Promise.reject(new Error("observer failure"));
+      throw new Error("observer failure");
+    },
+    runner: async () => {
+      pass++;
+      time += 1000;
+      if (pass === 1) throw Object.assign(new Error("untrusted provider detail"), { code: "unknown_provider_code", retryable: true });
+      return { status: "complete", chunksUploaded: pass === 2 ? 1 : 0 };
+    } });
+  assert.deepEqual(Object.keys(scheduler.inspectDiagnostics()).sort(), [
+    "state", "lastAttemptAt", "lastSuccessfulSyncAt", "lastAcceptedAt", "nextAttemptAt", "lastFailureCode",
+  ].sort());
+  scheduler.start();
+  await scheduler.runNow();
+  assert.deepEqual(scheduler.inspectDiagnostics(), {
+    state: "retry_wait", lastAttemptAt: "2026-09-22T12:00:00.000Z", lastSuccessfulSyncAt: null,
+    lastAcceptedAt: null, nextAttemptAt: "2026-09-22T12:01:01.000Z", lastFailureCode: "transient_failure",
+  });
+  await scheduler.runNow();
+  assert.equal(scheduler.inspectDiagnostics().lastFailureCode, null);
+  assert.equal(scheduler.inspectDiagnostics().lastSuccessfulSyncAt, "2026-09-22T12:00:02.000Z");
+  assert.equal(scheduler.inspectDiagnostics().lastAcceptedAt, "2026-09-22T12:00:02.000Z");
+  await scheduler.runNow();
+  assert.equal(scheduler.inspectDiagnostics().lastSuccessfulSyncAt, "2026-09-22T12:00:03.000Z");
+  assert.equal(scheduler.inspectDiagnostics().lastAcceptedAt, "2026-09-22T12:00:02.000Z");
+  assert.equal(Object.isFrozen(scheduler.inspectDiagnostics()), true);
+  assert.deepEqual(Object.keys(scheduler.inspect()).sort(), ["state", "lastAcceptedAt", "nextAttemptAt"].sort());
+  assert.doesNotMatch(JSON.stringify(observations), /untrusted provider detail|unknown_provider_code|observer failure/u);
+  await scheduler.stop();
+});
+
 test("preference change aborts enrollment/upload before waiting for durable persistence", async () => {
   let preference = ready;
   let observed;

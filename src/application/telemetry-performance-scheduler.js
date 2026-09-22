@@ -80,6 +80,7 @@ export function createTelemetryPerformanceDayRunner({
     nowEpoch = now(),
     globalPaused = false,
     deviceConnected = true,
+    resetRetryCount = true,
   } = {}) {
     if (!validDay(day) || !validNow(nowEpoch)) invalid("invalid_telemetry_performance_day");
     const state = await readState();
@@ -105,6 +106,7 @@ export function createTelemetryPerformanceDayRunner({
       nowEpoch,
       globalPaused,
       deviceConnected,
+      resetRetryCount,
       readCapabilities,
       prepareDay,
       createEnvelope,
@@ -190,9 +192,11 @@ export function createTelemetryPerformanceScheduler({
           ]
           : [day];
         let result = null;
-        for (const selectedDay of days) {
+        for (const [index, selectedDay] of days.entries()) {
           if (stopped) break;
-          result = await runner({ day: selectedDay, nowEpoch });
+          // Successful prefixes must not reset the backoff for an older day
+          // that repeatedly fails. Persist the count until the whole pass wins.
+          result = await runner({ day: selectedDay, nowEpoch, resetRetryCount: index === days.length - 1 });
           if (epoch !== generation) return status;
           if (result?.status !== "succeeded") break;
         }
@@ -202,8 +206,10 @@ export function createTelemetryPerformanceScheduler({
           publish("up_to_date", new Date(now() + intervalMilliseconds).toISOString(), true);
           schedule(intervalMilliseconds);
         } else if (result?.status === "retry") {
-          publish("retry_wait", new Date(now() + retryMilliseconds).toISOString());
-          schedule(retryMilliseconds);
+          const retryAt = Date.parse(result.state?.nextAttemptAt ?? "");
+          const delay = Number.isFinite(retryAt) ? Math.min(MAX_TIMER, Math.max(retryMilliseconds, retryAt - now())) : retryMilliseconds;
+          publish("retry_wait", new Date(now() + delay).toISOString());
+          schedule(delay);
         } else {
           publish("paused");
         }

@@ -11672,6 +11672,18 @@ async function collectContributionDiagnostics() {
   const local = await localClient.contributionDiagnostics();
   const browser = browserContributionDiagnosticState();
   const localAvailable = local?.status === "available";
+  if (localAvailable && local.accountless !== undefined) {
+    return Object.freeze({
+      journeyPhase: local.journeyPhase,
+      previewState: local.previewState,
+      queueState: local.queueState,
+      consent: local.consent,
+      signedIn: local.signedIn,
+      pairing: local.pairing,
+      recentDiagnosticReferences: local.recentDiagnosticReferences,
+      accountless: local.accountless,
+    });
+  }
   return Object.freeze({
     journeyPhase: browser.journeyPhase,
     previewState: browser.previewState === "not_observed" && localAvailable
@@ -11703,6 +11715,17 @@ function formatContributionDiagnostics(value) {
     `pairing_observed: ${value.pairing.observed}`,
     `paired: ${value.pairing.paired}`,
   ];
+  if (value.accountless !== undefined) {
+    const accountless = value.accountless;
+    lines.push(
+      `accountless_state: ${accountless.state}`,
+      `accountless_last_attempt_at: ${accountless.lastAttemptAt ?? "unavailable"}`,
+      `accountless_last_successful_sync_at: ${accountless.lastSuccessfulSyncAt ?? "unavailable"}`,
+      `accountless_last_accepted_at: ${accountless.lastAcceptedAt ?? "unavailable"}`,
+      `accountless_next_attempt_at: ${accountless.nextAttemptAt ?? "unavailable"}`,
+      `accountless_last_failure_code: ${accountless.lastFailureCode ?? "none"}`,
+    );
+  }
   value.recentDiagnosticReferences.forEach((item, index) => {
     lines.push(
       `diagnostic_reference_${index + 1}: ${item.reference} @ ${item.recordedAt}`,
@@ -12434,17 +12457,6 @@ function startElectronStartupRefresh() {
     return false;
   }
   electronStartupRefreshTriggered = true;
-  // The companion's launch snapshot intentionally defers the unified history
-  // projection. A cold install therefore needs one detailed pass before the
-  // dashboard can claim retained history or accounting. Once a validated
-  // detailed projection is already present, the normal startup observation is
-  // the cheaper quick pass and the Electron controller owns later cadence.
-  const projection = dashboard?.accounting?.projection;
-  const startupRefreshOptions = projection?.status === "available"
-    && projection.reason === null
-    && projection.terminal === false
-    ? {}
-    : { detailed: true };
   const runStartupRefresh = () => {
     if (localActionBusy) {
       // Only the bootstrap owner is guaranteed to call us again after it
@@ -12456,6 +12468,26 @@ function startElectronStartupRefresh() {
       }
       return;
     }
+    // Quick quota observations and accounting-cache generation do not advance
+    // the unified index. Use its persisted publication time so repeated short
+    // launches cannot keep old usage unindexed indefinitely. Match the host's
+    // hourly detailed cadence; unknown/future evidence cannot prove freshness.
+    // Evaluate after any startup barrier or dashboard lock has cleared.
+    const projection = dashboard?.accounting?.projection;
+    const history = dashboard?.timeline?.history;
+    const generatedAt = history?.generatedAt;
+    const generatedMs = typeof generatedAt === "string" ? Date.parse(generatedAt) : NaN;
+    const ageMs = Date.now() - generatedMs;
+    const freshIndex = projection?.status === "available"
+      && projection.reason === null
+      && projection.terminal === false
+      && dashboard.accounting.generationMatched === true
+      && history?.source === "unified_local_index"
+      && ["complete", "partial"].includes(history.status)
+      && Number.isFinite(generatedMs)
+      && new Date(generatedMs).toISOString() === generatedAt
+      && ageMs >= 0 && ageMs < 60 * 60_000;
+    const startupRefreshOptions = freshIndex ? {} : { detailed: true };
     void requestRefresh(startupRefreshOptions);
   };
   const macSmokeBridge = globalThis.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__;

@@ -146,15 +146,23 @@ test("accountless performance scheduler obtains its own grant, backfills seven d
       scope: "model-performance-daily",
     },
   };
-  const response = (status, value = null) => ({
-    status,
-    async json() { return value; },
-    async text() { return JSON.stringify(value); },
+  const response = (status, value = null) => new Response(JSON.stringify(value), {
+    status, headers: { "content-type": "application/json", "cache-control": "no-store" },
   });
+  let grantFailure = true;
+  let now = Date.parse("2026-09-21T12:00:00.000Z");
   const fetchImpl = async (url, init = {}) => {
     const parsed = new URL(url);
     requests.push({ method: init.method ?? "GET", path: parsed.pathname });
-    if (parsed.pathname === "/api/v1/accountless/telemetry-performance-authorization") return response(201, {});
+    if (parsed.pathname === "/api/v1/accountless/telemetry-performance-authorization") {
+      if (grantFailure === true) return new Response("<html>synthetic outage</html>", { status: 503, headers: { "retry-after": "120" } });
+      if (grantFailure === "invalid") return response(201, {});
+      if (grantFailure === "forbidden") return response(403, {});
+      return response(201, {
+        schemaVersion: "accountless-performance-owner-v1", policyVersion: "accountless-telemetry-performance-policy-v1",
+        authorizationBasis: "accountless-performance-policy-v1",
+      });
+    }
     if (parsed.pathname === "/api/v1/device/telemetry/performance/capabilities") return response(200, capability);
     if (parsed.pathname === "/api/v1/envelope-key") return response(200, {
       algorithm: "RSA-OAEP-256", keyId: "key:performance-fixture", publicJwk: { kty: "RSA" },
@@ -209,11 +217,22 @@ test("accountless performance scheduler obtains its own grant, backfills seven d
       schedulerOptions: {
         setTimer: () => 1,
         clearTimer: () => {},
-        now: () => Date.parse("2026-09-21T12:00:00.000Z"),
+        now: () => now,
+        retryMilliseconds: 30_000,
       },
     },
   });
   selected.start();
+  const unavailable = await selected.performanceRunNow();
+  assert.equal(unavailable.state, "retry_wait");
+  assert.equal(unavailable.nextAttemptAt, "2026-09-21T12:02:00.000Z");
+  assert.equal(preparedDays.length, 0);
+  grantFailure = false;
+  const waiting = await selected.performanceRunNow();
+  assert.equal(waiting.state, "retry_wait");
+  assert.equal(requests.length, 1, "a not-yet-due retry must neither send nor permanently pause");
+  requests.length = 0;
+  now += 120_000;
   const first = await selected.performanceRunNow();
   assert.equal(first.state, "up_to_date");
   assert.deepEqual(preparedDays, [
@@ -236,6 +255,14 @@ test("accountless performance scheduler obtains its own grant, backfills seven d
   assert.equal(resumed.state, "up_to_date");
   assert.equal(requests.filter(item => item.path === "/api/v1/accountless/telemetry-performance-authorization").length, 2);
   assert.equal(requests.filter(item => item.path === "/api/v1/device/telemetry/performance/reports").length, 16);
+  for (const failure of ["invalid", "forbidden"]) {
+    grantFailure = failure;
+    host.invalidate();
+    await new Promise(resolve => setImmediate(resolve));
+    const rejected = await selected.performanceRunNow();
+    assert.equal(rejected.state, "paused", failure);
+    assert.equal(requests.filter(item => item.path === "/api/v1/device/telemetry/performance/reports").length, 16);
+  }
   await selected.stop();
   host.dispose();
 });

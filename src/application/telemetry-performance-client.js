@@ -7,8 +7,75 @@ function invalid(message = "invalid_telemetry_performance_client") {
   throw new TypeError(message);
 }
 
-function responseStatus(response) {
-  return Number.isSafeInteger(response?.status) ? response.status : null;
+function transportError(code, response) {
+  const error = new Error("Telemetry performance transport unavailable");
+  error.code = `telemetry_performance_${code}`;
+  const retryAfter = response?.headers?.get("retry-after");
+  if (typeof retryAfter === "string" && retryAfter.length <= 128) error.retryAfter = retryAfter;
+  return error;
+}
+
+function discardBody(response) {
+  try { void response?.body?.cancel().catch(() => {}); } catch { /* best effort */ }
+}
+
+function checkResponse(response) {
+  if (!(response instanceof Response) || response.redirected) {
+    discardBody(response);
+    throw transportError("response_invalid");
+  }
+  if (response.status === 401 || response.status === 403) {
+    discardBody(response);
+    throw transportError("authorization_rejected");
+  }
+}
+
+async function readCapability(response, signal) {
+  checkResponse(response);
+  if (response.status !== 200) {
+    discardBody(response);
+    const transient = response.status === 408 || response.status === 425 || response.status === 429 || response.status >= 500;
+    throw transportError(transient ? "capability_unavailable" : "response_invalid", response);
+  }
+  const declared = response.headers.get("content-length");
+  if (response.headers.get("cache-control") !== "no-store"
+      || !(response.headers.get("content-type") ?? "").toLowerCase().startsWith("application/json")
+      || (declared !== null && (!/^\d+$/u.test(declared) || Number(declared) > 16_384))
+      || !response.body) {
+    discardBody(response);
+    throw transportError("response_invalid");
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let text = "";
+  let complete = false;
+  const cancel = () => { void reader.cancel().catch(() => {}); };
+  signal.addEventListener("abort", cancel, { once: true });
+  try {
+    for (;;) {
+      if (signal.aborted) throw transportError("capability_unavailable");
+      let part;
+      try { part = await reader.read(); }
+      catch { throw transportError("capability_unavailable"); }
+      if (signal.aborted) throw transportError("capability_unavailable");
+      if (part.done) break;
+      if (!(part.value instanceof Uint8Array)) throw transportError("response_invalid");
+      bytes += part.value.byteLength;
+      if (bytes > 16_384) throw transportError("response_invalid");
+      text += decoder.decode(part.value, { stream: true });
+    }
+    text += decoder.decode();
+    complete = true;
+    return JSON.parse(text);
+  } catch (error) {
+    if (error?.code?.startsWith("telemetry_performance_")) throw error;
+    throw transportError("response_invalid");
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    if (!complete) cancel();
+    reader.releaseLock();
+  }
 }
 
 function originUrl(value) {
@@ -55,30 +122,34 @@ export function createTelemetryPerformanceClient({
     return { authorization };
   };
   const readCapabilities = async () => {
+    const signal = AbortSignal.timeout(15_000);
     const response = await fetchImpl(route(CAPABILITIES_PATH), {
-      method: "GET",
+      method: "GET", credentials: "omit", redirect: "error", cache: "no-store", signal,
       headers: await authHeaders(),
     });
-    if (!response || typeof response.json !== "function") return { status: responseStatus(response) };
-    if (responseStatus(response) !== 200) return { status: responseStatus(response) };
-    return response.json();
+    return readCapability(response, signal);
   };
   const send = async ({ envelope }) => {
     const response = await fetchImpl(route(REPORTS_PATH), {
-      method: "POST",
+      method: "POST", credentials: "omit", redirect: "error", cache: "no-store", signal: AbortSignal.timeout(15_000),
       headers: { ...await authHeaders(), "content-type": "application/json" },
       body: JSON.stringify(envelope),
     });
-    return { status: responseStatus(response) };
+    checkResponse(response);
+    discardBody(response);
+    const retryAfter = response.headers.get("retry-after");
+    return { status: response.status,
+      ...(retryAfter !== null && retryAfter.length <= 128 ? { retryAfter } : {}) };
   };
   return Object.freeze({
-    async runDay({ day, nowEpoch, globalPaused = false, deviceConnected = true } = {}) {
+    async runDay({ day, nowEpoch, globalPaused = false, deviceConnected = true, resetRetryCount = true } = {}) {
       return sync({
         day,
         nowEpoch,
         state: await readState(),
         globalPaused,
         deviceConnected,
+        resetRetryCount,
         readCapabilities,
         prepareDay: ({ day: selectedDay }) => readPreparedDay({ day: selectedDay, nowEpoch }),
         createEnvelope: ({ report }) => createEnvelope({ report, publicJwk, keyId }),

@@ -83,3 +83,31 @@ test("ungranted v1.2 review presents the exact inventory without inventing a cut
   assert.deepEqual(service.calls.map(({ path }) => path), ["/api/v1/device/sync-capabilities-v1.2"]);
   assert.equal(service.envelopes.size, 0);
 });
+
+test("envelope-key transport preserves transient retry floors and terminal response rejection", async (t) => {
+  for (const kind of ["gateway", "redirect", "utf8", "io"]) {
+    const { options } = await fixture(t);
+    const result = await runIncrementalContributionSyncOnce({ ...options,
+      fetchImpl: async (url, request) => {
+        if (new URL(url).pathname !== "/api/v1/envelope-key") return options.fetchImpl(url, request);
+        const response = new Response(new ReadableStream({
+          start(controller) {
+            if (kind === "io") controller.error(new Error("synthetic-key-io"));
+            else {
+              controller.enqueue(kind === "utf8" ? Uint8Array.of(0xff) : new TextEncoder().encode("<html>gateway</html>"));
+              controller.close();
+            }
+          },
+        }), { status: kind === "gateway" || kind === "redirect" ? 503 : 200,
+          headers: { "content-type": "application/json", "cache-control": "no-store", "retry-after": "60" } });
+        if (kind === "redirect") Object.defineProperty(response, "redirected", { value: true });
+        return response;
+      },
+    });
+    assert.equal(result.failure.code, ["gateway", "io"].includes(kind) ? "service_unavailable" : "response_invalid", kind);
+    assert.equal(result.failure.retryable, ["gateway", "io"].includes(kind), kind);
+    if (kind === "gateway") assert.equal(result.failure.retryAfterMilliseconds, 60_000);
+    assert.equal(result.acknowledgedThroughDay, null);
+    assert.equal(result.chunksUploaded, 0);
+  }
+});

@@ -170,8 +170,10 @@ test("production client uses only the independent capability and encrypted repor
     createEnvelope: async ({ report }) => ({ schemaVersion: "telemetry-performance-envelope-v1", report }),
     fetchImpl: async (url, init) => {
       requests.push({ url, init });
-      if (init.method === "GET") return { status: 200, json: async () => ({ accepted: true }) };
-      return { status: 202 };
+      if (init.method === "GET") return new Response(JSON.stringify({ accepted: true }), {
+        headers: { "content-type": "application/json", "cache-control": "no-store" },
+      });
+      return new Response(null, { status: 202 });
     },
     sync: async options => {
       const capability = await options.readCapabilities();
@@ -188,4 +190,72 @@ test("production client uses only the independent capability and encrypted repor
     ["POST", "/api/v1/device/telemetry/performance/reports"],
   ]);
   assert.equal(requests[1].init.headers.authorization, "Device synthetic-performance-token");
+});
+
+
+test("performance client bounds capability bodies and distinguishes gateway failures from invalid receipts", async () => {
+  for (const kind of ["gateway", "io", "utf8", "oversize", "redirect", "401", "403", "404", "422"]) {
+    let cancelled = false;
+    const client = createTelemetryPerformanceClient({
+      origin: "https://telemetry.example.test", readAuthorization: async () => "Device synthetic-token",
+      readPreparedDay: async () => assert.fail("capability must fail first"), createEnvelope: async () => {},
+      fetchImpl: async (_, request) => {
+        assert.equal(request.redirect, "error");
+        assert.equal(request.credentials, "omit");
+        const response = new Response(new ReadableStream({
+          start(controller) {
+            if (kind === "io") controller.error(new Error("synthetic-private-network-error"));
+            else {
+              controller.enqueue(kind === "utf8" ? Uint8Array.of(0xff) : new TextEncoder().encode(
+                kind === "oversize" ? "x".repeat(16_385) : "<html>synthetic gateway</html>"));
+            }
+          },
+          cancel() { cancelled = true; },
+        }), { status: kind === "gateway" ? 503 : ["401", "403", "404", "422"].includes(kind) ? Number(kind) : 200,
+          headers: { "content-type": "application/json", "cache-control": "no-store", "retry-after": "120" } });
+        if (kind === "redirect") Object.defineProperty(response, "redirected", { value: true });
+        return response;
+      },
+      sync: async (options) => options.readCapabilities(),
+    });
+    await assert.rejects(client.runDay(), (error) => {
+      assert.equal(error.code, `telemetry_performance_${["gateway", "io"].includes(kind) ? "capability_unavailable"
+        : ["401", "403"].includes(kind) ? "authorization_rejected" : "response_invalid"}`, kind);
+      if (kind === "gateway") assert.equal(error.retryAfter, "120");
+      return true;
+    });
+    if (kind !== "io") assert.equal(cancelled, true);
+  }
+});
+
+test("performance scheduler respects the persisted next attempt time", async () => {
+  let timer;
+  const now = Date.parse("2026-09-21T12:00:00.000Z");
+  const scheduler = createTelemetryPerformanceScheduler({
+    runner: async () => ({ status: "retry", state: { nextAttemptAt: new Date(now + 600_000).toISOString() } }),
+    now: () => now, setTimer: (callback, delay) => (timer = { callback, delay }), clearTimer: () => {},
+    retryMilliseconds: 30_000,
+  });
+  scheduler.start();
+  await scheduler.runNow();
+  assert.equal(timer.delay, 600_000);
+  assert.equal(scheduler.inspect().nextAttemptAt, new Date(now + 600_000).toISOString());
+  await scheduler.stop();
+});
+
+
+test("performance retry timer clamps distant and past persisted timestamps", async () => {
+  const now = Date.parse("2026-09-21T12:00:00.000Z");
+  for (const [nextAttemptAt, expected] of [["9999-01-01T00:00:00.000Z", 604_800_000],
+    ["2020-01-01T00:00:00.000Z", 30_000], ["invalid", 30_000]]) {
+    let delay;
+    const scheduler = createTelemetryPerformanceScheduler({
+      runner: async () => ({ status: "retry", state: { nextAttemptAt } }), now: () => now,
+      setTimer: (_, value) => { delay = value; return 1; }, clearTimer: () => {}, retryMilliseconds: 30_000,
+    });
+    scheduler.start();
+    await scheduler.runNow();
+    assert.equal(delay, expected);
+    await scheduler.stop();
+  }
 });

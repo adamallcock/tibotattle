@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -242,6 +242,10 @@ test("production-v1 companion retains account-observation ports while closing le
         return { status: "complete", chunksUploaded: 0 };
       },
     });
+    await writeFile(join(stateRoot, "diagnostics-v0.1.log"), `${JSON.stringify({
+      schemaVersion: "local-diagnostic-note-v0.1", reference: "TT-ABCDEF",
+      recordedAt: "2026-09-22T10:00:00.000Z", privateCanary: "synthetic-private-canary",
+    })}\n`, { mode: 0o600 });
     await app.snapshotReady;
     await until(() => observed.length === 1);
     phase = "absent";
@@ -276,7 +280,26 @@ test("production-v1 companion retains account-observation ports while closing le
     });
     const diagnostics = await fetch(`${base}/api/local/diagnostics/contribution`)
       .then((response) => response.json());
-    assert.equal(diagnostics.journeyPhase, "not_configured");
+    assert.equal(diagnostics.journeyPhase, "accountless_active");
+    assert.deepEqual(Object.keys(diagnostics.accountless).sort(), [
+      "state", "lastAttemptAt", "lastSuccessfulSyncAt", "lastAcceptedAt", "nextAttemptAt", "lastFailureCode",
+    ].sort());
+    assert.equal(diagnostics.accountless.state, "up_to_date");
+    assert.equal(diagnostics.accountless.lastAcceptedAt, null);
+    assert.equal(diagnostics.accountless.lastFailureCode, null);
+    assert.ok(Number.isFinite(Date.parse(diagnostics.accountless.lastAttemptAt)));
+    assert.ok(Number.isFinite(Date.parse(diagnostics.accountless.lastSuccessfulSyncAt)));
+    assert.ok(Number.isFinite(Date.parse(diagnostics.accountless.nextAttemptAt)));
+    assert.deepEqual(diagnostics.consent, { approved: false, current: false });
+    assert.deepEqual(diagnostics.signedIn, { observed: false, value: false });
+    assert.deepEqual(diagnostics.pairing, { observed: false, paired: false });
+    assert.ok(diagnostics.recentDiagnosticReferences.length <= 5);
+    assert.ok(diagnostics.recentDiagnosticReferences.some((entry) => entry.reference === "TT-ABCDEF"
+      && entry.recordedAt === "2026-09-22T10:00:00.000Z"));
+    for (const reference of diagnostics.recentDiagnosticReferences) {
+      assert.deepEqual(Object.keys(reference).sort(), ["recordedAt", "reference"]);
+    }
+    assert.equal(JSON.stringify(diagnostics).includes("synthetic-private-canary"), false);
     for (const path of [
       "/api/local/identity/hosted-signin-handoff",
       "/api/local/contribution/prepare",

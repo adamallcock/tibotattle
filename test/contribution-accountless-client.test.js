@@ -1192,3 +1192,71 @@ test("opt-out between successor discovery and authorization prevents both grant 
   assert.equal(result.status, "failed");
   assert.deepEqual(calls, ["/api/v1/device/sync-capabilities-v1.2"]);
 });
+
+test("enrollment retries transient gateway statuses without consuming their bodies", async () => {
+  for (const status of [408, 429, 502, 503]) {
+    let cancelled = false;
+    let reads = 0;
+    await assert.rejects(enrollAccountlessContribution({
+      origin: ORIGIN, readPreference: async () => preference(), now: () => NOW,
+      ensureCapability: async () => capability(),
+      fetchImpl: async () => new Response(new ReadableStream({
+        pull() { reads += 1; return new Promise(() => {}); },
+        cancel() { cancelled = true; },
+      }, { highWaterMark: 0 }), { status, headers: { "content-type": "text/html", "retry-after": "60" } }),
+    }), (error) => {
+      assert.equal(error.code, "contribution_accountless_client_service_unavailable");
+      assert.equal(error.retryable, true);
+      assert.equal(error.retryAfterMilliseconds, 60_000);
+      return true;
+    });
+    assert.equal(cancelled, true);
+    assert.equal(reads, 0);
+  }
+});
+
+test("enrollment keeps redirects and terminal gateway rejections fail closed", async () => {
+  for (const status of [200, 401, 403, 409, 503]) {
+    const response = new Response("<html>synthetic</html>", { status });
+    if ([200, 503].includes(status)) Object.defineProperty(response, "redirected", { value: true });
+    await assert.rejects(enrollAccountlessContribution({
+      origin: ORIGIN, readPreference: async () => preference(), now: () => NOW,
+      ensureCapability: async () => capability(), fetchImpl: async () => response,
+    }), isClientError("response_invalid", { retryable: false }));
+  }
+});
+
+test("enrollment retries body IO errors but rejects completed truncated JSON and invalid UTF8", async () => {
+  for (const kind of ["io", "json", "utf8"]) {
+    const response = new Response(new ReadableStream({
+      start(controller) {
+        if (kind === "io") controller.error(new Error("private-synthetic-body-error"));
+        else {
+          controller.enqueue(kind === "utf8" ? Uint8Array.of(0xff) : new TextEncoder().encode('{"state":'));
+          controller.close();
+        }
+      },
+    }), { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+    await assert.rejects(enrollAccountlessContribution({
+      origin: ORIGIN, readPreference: async () => preference(), now: () => NOW,
+      ensureCapability: async () => capability(), fetchImpl: async () => response,
+    }), isClientError(kind === "io" ? "service_unavailable" : "response_invalid", { retryable: kind === "io" }));
+  }
+});
+
+
+test("gateway Retry-After dates and invalid or excessive delays remain bounded", async () => {
+  for (const [value, expected] of [["Fri, 04 Sep 2026 00:01:00 GMT", 60_000],
+    ["999999999", null], ["invalid", null], ["-1", null]]) {
+    await assert.rejects(enrollAccountlessContribution({
+      origin: ORIGIN, readPreference: async () => preference(), now: () => NOW,
+      ensureCapability: async () => capability(), fetchImpl: async () => new Response(null, {
+        status: 503, headers: { "retry-after": value },
+      }),
+    }), (error) => {
+      assert.equal(error.retryable, true);
+      assert.equal(error.retryAfterMilliseconds, expected);
+      return true;
+    });
+  }
+});

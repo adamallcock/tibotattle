@@ -94,6 +94,7 @@ import {
   selectLocalAccountlessHostedRehearsalProfile,
   selectLocalAccountlessProductionProfile,
 } from "./accountless-contribution.js";
+import { createAccountlessDiagnosticRecorder } from "./accountless-diagnostics.js";
 import { readLocalCollectorCheckpoint } from "../../src/local-collector-state.js";
 import {
   HostedSignInHandoffError,
@@ -2690,13 +2691,51 @@ function contributionDiagnosticQueueState(queue) {
   return "empty";
 }
 
+const ACCOUNTLESS_DIAGNOSTIC_STATES = new Set([
+  "off", "unavailable", "uploading", "recovery_required", "paused", "pending", "up_to_date", "retry_wait",
+]);
+const ACCOUNTLESS_DIAGNOSTIC_FAILURE_CODES = new Set([
+  null, "transient_failure", "terminal_failure", "credential_recovery_required", "preference_unavailable",
+]);
+const ACCOUNTLESS_DIAGNOSTIC_KEYS = [
+  "state", "lastAttemptAt", "lastSuccessfulSyncAt", "lastAcceptedAt", "nextAttemptAt", "lastFailureCode",
+];
+
+function accountlessContributionDiagnosticsProjection(value) {
+  const valid = value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === ACCOUNTLESS_DIAGNOSTIC_KEYS.length
+    && ACCOUNTLESS_DIAGNOSTIC_KEYS.every((key) => Object.hasOwn(value, key))
+    && ACCOUNTLESS_DIAGNOSTIC_STATES.has(value.state)
+    && ACCOUNTLESS_DIAGNOSTIC_FAILURE_CODES.has(value.lastFailureCode)
+    && ["lastAttemptAt", "lastSuccessfulSyncAt", "lastAcceptedAt", "nextAttemptAt"]
+      .every((key) => value[key] === null
+        || (typeof value[key] === "string" && nullableInstant(value[key]) === value[key]));
+  return Object.freeze(valid ? {
+    state: value.state,
+    lastAttemptAt: value.lastAttemptAt,
+    lastSuccessfulSyncAt: value.lastSuccessfulSyncAt,
+    lastAcceptedAt: value.lastAcceptedAt,
+    nextAttemptAt: value.nextAttemptAt,
+    lastFailureCode: value.lastFailureCode,
+  } : {
+    state: "unavailable", lastAttemptAt: null, lastSuccessfulSyncAt: null,
+    lastAcceptedAt: null, nextAttemptAt: null, lastFailureCode: null,
+  });
+}
+
 function contributionDiagnosticJourneyPhase({
   configured,
   queueState,
   incremental,
   pairingObserved,
   paired,
+  accountless,
 }) {
+  if (accountless !== undefined) {
+    if (accountless.state === "off") return "accountless_off";
+    return ["unavailable", "paused", "recovery_required"].includes(accountless.state)
+      ? "accountless_unavailable" : "accountless_active";
+  }
   if (!configured) return "not_configured";
   if (incremental.status !== "available") return "unavailable";
   if (!incremental.consent.approved || !incremental.consent.current) {
@@ -2717,8 +2756,11 @@ function localContributionDiagnosticsProjection({
   pairingObserved,
   paired,
   recentDiagnosticReferences,
+  accountless,
 }) {
   const queueState = contributionDiagnosticQueueState(queue);
+  const accountlessDiagnostics = accountless === undefined
+    ? undefined : accountlessContributionDiagnosticsProjection(accountless);
   return Object.freeze({
     schemaVersion: LOCAL_CONTRIBUTION_DIAGNOSTICS_SCHEMA_VERSION,
     journeyPhase: contributionDiagnosticJourneyPhase({
@@ -2727,6 +2769,7 @@ function localContributionDiagnosticsProjection({
       incremental,
       pairingObserved,
       paired,
+      accountless: accountlessDiagnostics,
     }),
     // Preview discovery is a local mutation (it can enqueue a prepared set),
     // so this read-only support route never runs it. The page merges its
@@ -2743,6 +2786,7 @@ function localContributionDiagnosticsProjection({
       paired,
     }),
     recentDiagnosticReferences: Object.freeze(recentDiagnosticReferences),
+    ...(accountlessDiagnostics === undefined ? {} : { accountless: accountlessDiagnostics }),
     includesTokens: false,
     includesOauthState: false,
     includesVerifiers: false,
@@ -4249,9 +4293,14 @@ function createPreparedLocalCompanionServer({
     ...(accountlessContributionRunner === undefined
       ? {}
       : { runner: accountlessContributionRunner }),
-    ...(accountlessSchedulerOptions === undefined
-      ? {}
-      : { schedulerOptions: accountlessSchedulerOptions }),
+    schedulerOptions: {
+      ...accountlessSchedulerOptions,
+      onDiagnostics: createAccountlessDiagnosticRecorder({
+        recordNote: recordDiagnosticNote,
+        createReference: diagnosticReferenceFactory,
+        clock,
+      }),
+    },
     ...(accountlessPerformanceEnabled
       ? {
         performanceOptions: {
@@ -4463,7 +4512,7 @@ function createPreparedLocalCompanionServer({
     });
     socialPerformanceScheduler = createTelemetryPerformanceScheduler({
       ...(options.schedulerOptions ?? {}),
-      runner: ({ day, nowEpoch }) => socialPerformanceClient.runDay({ day, nowEpoch }),
+      runner: ({ day, nowEpoch, resetRetryCount }) => socialPerformanceClient.runDay({ day, nowEpoch, resetRetryCount }),
       backfillDays: options.schedulerOptions?.backfillDays ?? 7,
       includeCurrentDay: options.schedulerOptions?.includeCurrentDay ?? true,
     });
@@ -4699,6 +4748,7 @@ function createPreparedLocalCompanionServer({
       recordNote: recordDiagnosticNote,
       clock,
     }),
+    onIndexPublished: () => accountlessContribution?.notifyIndexPublished(),
   });
   // One keep-alive-tuned outbound fetch feeds both the proxy and the relay, so
   // the pre-warmed connection is reused by every central request. Only the real
@@ -4718,7 +4768,15 @@ function createPreparedLocalCompanionServer({
     fetchImpl: centralOutbound.fetch,
   });
   const readLocalContributionDiagnostics = async () => {
+    let recentDiagnosticReferences = [];
+    try {
+      recentDiagnosticReferences = await readRecentDiagnosticReferences({ file: diagnosticsLogFile });
+    } catch {
+      recentDiagnosticReferences = [];
+    }
     if (accountlessProductionProfile) {
+      let accountless = null;
+      try { accountless = accountlessContribution?.inspectDiagnostics() ?? null; } catch { /* Unavailable stays explicit. */ }
       return localContributionDiagnosticsProjection({
         queue: syncStatusProjection(null),
         incremental: incrementalSyncStatusProjection(null, {
@@ -4728,7 +4786,8 @@ function createPreparedLocalCompanionServer({
         configured: false,
         pairingObserved: false,
         paired: false,
-        recentDiagnosticReferences: [],
+        recentDiagnosticReferences,
+        accountless,
       });
     }
     let queueValue = null;
@@ -4762,14 +4821,6 @@ function createPreparedLocalCompanionServer({
       }
     } else {
       pairingObserved = true;
-    }
-    let recentDiagnosticReferences = [];
-    try {
-      recentDiagnosticReferences = await readRecentDiagnosticReferences({
-        file: diagnosticsLogFile,
-      });
-    } catch {
-      recentDiagnosticReferences = [];
     }
     return localContributionDiagnosticsProjection({
       queue: syncStatusProjection(queueValue),
