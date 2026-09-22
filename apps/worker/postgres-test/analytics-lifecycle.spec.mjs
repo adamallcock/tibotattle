@@ -1,8 +1,10 @@
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import pg from "pg";
 import { createHash, randomBytes } from "node:crypto";
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { canonicalJson } from "../src/canonical-json.ts";
 import {
   createPostgresLifecycleStore,
   createPostgresAnalyticalWorkStore,
@@ -10,7 +12,7 @@ import {
   createPostgresReleaseNonceStore,
 } from "../src/postgres-storage-provider.ts";
 import {
-  advanceCommunityAnalysisProviderRun,
+  advanceCommunityAnalysisRunWithProvider,
   communityAnalysisProviderIdentity,
 } from "../src/community-analysis-runner.ts";
 import { createProviderV1QuotaReader } from "../src/prepared-v1-evidence.ts";
@@ -68,6 +70,7 @@ async function connectWithSearchPath() {
 }
 
 const payloadDigest = (payload) => createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+const digest = (value) => createHash("sha256").update(value).digest("hex");
 const pageDigest = (rows) => payloadDigest(rows);
 const sourceRow = (occurrenceId, observedAtMs, payloadSha256, payload = { value: occurrenceId }) => ({
   occurrenceId,
@@ -80,6 +83,11 @@ const sourceRow = (occurrenceId, observedAtMs, payloadSha256, payload = { value:
 });
 
 async function seedHead({ state = "ready", generation = "generation-1", progressRevision = 0 } = {}) {
+  await seedCanonical({
+    sourceId: pin.sourceId, ownerDigest: pin.ownerDigest, participantId: pin.sourceId,
+    inputRevision: pin.inputRevision, ownerRevision: pin.ownerRevision,
+    authorityEpoch: pin.authorityEpoch, sourceEpoch: pin.sourceEpoch,
+  });
   await pool.query(`
     INSERT INTO analytics_owner_state(source_id,owner_digest,revision,authority_epoch,state)
     VALUES($1,$2,$3,$4,'active')
@@ -96,6 +104,44 @@ async function seedHead({ state = "ready", generation = "generation-1", progress
     pin.day, pin.inputRevision, pin.ownerRevision, pin.dependencyDigest, pin.method,
     pin.authorityEpoch, pin.sourceEpoch, pin.sequence]);
   return generation;
+}
+
+async function seedCanonical({
+  sourceId, ownerDigest, participantId = sourceId, inputRevision,
+  ownerRevision, authorityEpoch, sourceEpoch = 1, sequence = 1,
+}) {
+  await pool.query(`
+    INSERT INTO participants(id,owner_kind,state,created_at)
+    VALUES($1,'social','active',clock_timestamp())
+    ON CONFLICT(id) DO UPDATE SET state='active'`, [participantId]);
+  await pool.query(`
+    INSERT INTO input_versions(participant_id,revision) VALUES($1,$2)
+    ON CONFLICT(participant_id) DO UPDATE SET revision=EXCLUDED.revision`, [participantId, inputRevision]);
+  await pool.query(`
+    INSERT INTO storage_v11_owner_links(participant_id,owner_digest,state)
+    VALUES($1,$2,'active')
+    ON CONFLICT(participant_id) DO UPDATE SET owner_digest=EXCLUDED.owner_digest,state='active'`,
+  [participantId, ownerDigest]);
+  await pool.query(`
+    INSERT INTO storage_source_state(singleton,source_id,authority_epoch)
+    VALUES(1,$1,$2)
+    ON CONFLICT(singleton) DO UPDATE SET source_id=EXCLUDED.source_id,authority_epoch=EXCLUDED.authority_epoch`,
+  [sourceId, sourceEpoch]);
+  await pool.query(`
+    INSERT INTO storage_ingestion_changes
+      (source_id,sequence,event_digest,owner_digest,owner_revision,authority_epoch,kind,recorded_ms)
+    VALUES($1,$2,$3,$4,$5,$6,'source-updated',0)
+    ON CONFLICT(source_id,sequence) DO UPDATE SET event_digest=EXCLUDED.event_digest,
+      owner_digest=EXCLUDED.owner_digest,owner_revision=EXCLUDED.owner_revision,
+      authority_epoch=EXCLUDED.authority_epoch,kind=EXCLUDED.kind,recorded_ms=EXCLUDED.recorded_ms`,
+  [sourceId, sequence, payloadDigest(JSON.stringify({ sourceId, ownerDigest, sequence })), ownerDigest,
+    ownerRevision, authorityEpoch]);
+  await pool.query(`
+    INSERT INTO analytics_owner_state(source_id,owner_digest,revision,authority_epoch,state)
+    VALUES($1,$2,$3,$4,'active')
+    ON CONFLICT(source_id,owner_digest) DO UPDATE SET revision=EXCLUDED.revision,
+      authority_epoch=EXCLUDED.authority_epoch,state='active'`,
+  [sourceId, ownerDigest, ownerRevision, authorityEpoch]);
 }
 
 async function insertSourceRow(generation, row) {
@@ -151,17 +197,20 @@ beforeAll(async () => {
   };
   await rawPool.query(`CREATE SCHEMA ${primarySchema}`);
   await ledgerPool.query(`CREATE SCHEMA ${ledgerSchema}`);
-  const primaryMigration = await readFile(new URL("../postgres/migrations/primary/0007_analytics_lifecycle.sql", import.meta.url), "utf8");
-  const ledgerMigration = await readFile(new URL("../postgres/migrations/ledger/0002_tombstones_cooldowns.sql", import.meta.url), "utf8");
-  const ledgerRestoreMigration = await readFile(new URL("../postgres/migrations/ledger/0003_erasure_restore_receipts.sql", import.meta.url), "utf8");
-  await rawPool.query(`SET search_path TO ${primarySchema}, pg_catalog;\n${primaryMigration}`);
-  await ledgerPool.query(`SET search_path TO ${ledgerSchema}, pg_catalog;\n${ledgerMigration}\n${ledgerRestoreMigration}`);
+  await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: rawPool });
+  await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: ledgerPool });
   expect((await rawPool.query("SELECT DATE '2026-09-21' AS day")).rows[0].day)
     .toBeInstanceOf(Date);
 });
 
 beforeEach(async () => {
-  await pool.query("TRUNCATE analytics_analysis_work_parts, analytics_analysis_work_heads, analytics_prepared_source_rows, analytics_prepared_source_heads, analytics_owner_state, sparkle_appcast_guard_nonces");
+  await pool.query(`TRUNCATE participants CASCADE`);
+  await pool.query(`TRUNCATE storage_source_state, storage_ingestion_changes,
+    analytics_analysis_work_parts, analytics_analysis_work_heads,
+    analytics_prepared_source_outputs, analytics_prepared_source_controls,
+    analytics_prepared_source_streams,
+    analytics_prepared_source_rows, analytics_prepared_source_heads,
+    analytics_owner_state, sparkle_appcast_guard_nonces`);
   await ledgerPool.query(`TRUNCATE ${ledgerSchema}.deletion_tombstones, ${ledgerSchema}.identity_reenrollment_cooldowns, ${ledgerSchema}.participant_erasure_receipts, ${ledgerSchema}.restore_suppression_receipts`);
 });
 
@@ -203,15 +252,39 @@ it("reads a bounded page only after the authoritative ready head and owner pin a
 });
 
 it("maps the operational prepared-source page to the existing v1 quota reader", async () => {
-  const generation = await seedHead();
+  const generation = await seedHead({ state: "building" });
+  const planPayload = {
+    id: 1, observed_at: "2026-09-21T00:00:01.000Z", observed_day: pin.day, device_id: "device-1",
+    provider: "openai_codex", limit_id: "codex", plan_type: "plus", plan_variant: "standard",
+  };
+  const fitPayload = {
+    ...planPayload, occurrence_id: "quota-occurrence-1", slot: "weekly", used_percent: 12.5,
+    window_duration_minutes: 10080, resets_at: "2026-09-22T00:00:00.000Z",
+  };
   const payload = {
     stream: "quota", id: 1, device_id: "device-1", provider: "openai_codex", limit_id: "codex",
     plan_type: "plus", plan_variant: "standard", occurrence_id: "quota-occurrence-1", slot: "weekly",
     used_percent: 12.5, window_duration_minutes: 10080, resets_at: "2026-09-22T00:00:00.000Z",
   };
-  await insertSourceRow(generation, sourceRow("1", Date.parse("2026-09-21T00:00:01.000Z"), payloadDigest(payload), payload));
+  const store = createPostgresPreparedSourceStore(adapterPool, { primarySchema, ledgerSchema });
+  const control = { plan: null, fit: null, lastTime: null, lastSignature: null, equalTimeChanged: false };
+  const controlJson = canonicalJson(control);
+  const preparedRow = sourceRow("1", Date.parse("2026-09-21T00:00:01.000Z"), digest(canonicalJson(payload)), payload);
+  await store.commitPage({
+    pin, generation, expectedProgressRevision: 0, nextCursor: null, complete: true,
+    rows: [preparedRow], rowDigest: pageDigest([preparedRow]),
+    control: { json: controlJson, sha256: digest(controlJson) },
+    outputs: [
+      { stream: "quota", kind: "plan", key: "2026-09-21T00:00:01.000Z:0000000000000001",
+        index: Date.parse("2026-09-21T00:00:01.000Z"), payload: planPayload,
+        payloadSha256: digest(canonicalJson(planPayload)) },
+      { stream: "quota", kind: "fit", key: "2026-09-22T00:00:00.000Z:2026-09-21T00:00:01.000Z:0000000000000001",
+        index: Date.parse("2026-09-22T00:00:00.000Z"), payload: fitPayload,
+        payloadSha256: digest(canonicalJson(fitPayload)) },
+    ],
+  });
   const reader = createProviderV1QuotaReader({
-    store: createPostgresPreparedSourceStore(adapterPool, { primarySchema, ledgerSchema }),
+    store,
     pin, generation, readerPolicy: "prepared-v1-quota-1",
   });
   await expect(reader.readPlanPage({ observedAt: "2026-09-21T00:00:00.000Z", id: 0 }, 128))
@@ -344,9 +417,18 @@ it("runs the existing quota acquisition codec through provider claims and checkp
     dependencyDigest: identity.inputFingerprint, method: identity.sourceMethodVersion,
     authorityEpoch: 0, sourceEpoch: 1, sequence: 1,
   };
+  await seedCanonical({
+    sourceId: sourcePin.sourceId, ownerDigest: sourcePin.ownerDigest,
+    participantId: identity.participantId, inputRevision: sourcePin.inputRevision,
+    ownerRevision: sourcePin.ownerRevision, authorityEpoch: sourcePin.authorityEpoch,
+    sourceEpoch: sourcePin.sourceEpoch,
+  });
   const generation = "provider-source-generation";
   await pool.query(`INSERT INTO analytics_owner_state(source_id,owner_digest,revision,authority_epoch,state)
-    VALUES($1,$2,$3,$4,'active')`, [sourcePin.sourceId, sourcePin.ownerDigest, sourcePin.ownerRevision, sourcePin.authorityEpoch]);
+    VALUES($1,$2,$3,$4,'active')
+    ON CONFLICT(source_id,owner_digest) DO UPDATE SET revision=EXCLUDED.revision,
+      authority_epoch=EXCLUDED.authority_epoch,state='active'`,
+  [sourcePin.sourceId, sourcePin.ownerDigest, sourcePin.ownerRevision, sourcePin.authorityEpoch]);
   await pool.query(`INSERT INTO analytics_prepared_source_heads
     (generation,state,progress_revision,next_cursor_time,next_cursor_id,rows_written,
      source_id,source_namespace,owner_digest,day,input_revision,owner_revision,
@@ -361,7 +443,12 @@ it("runs the existing quota acquisition codec through provider claims and checkp
   const makeOptions = () => ({
     identity,
     workStore,
-    workIdentity: communityAnalysisProviderIdentity(identity),
+    workIdentity: communityAnalysisProviderIdentity(identity, sourcePin),
+    quotaReader: {
+      pageSize: 128,
+      async readPlanPage() { return []; },
+      async readFitPage() { return []; },
+    },
     preparedSource: {
       store: preparedStore,
       pin: sourcePin, generation, readerPolicy: "prepared-v1-quota-1",
@@ -370,11 +457,11 @@ it("runs the existing quota acquisition codec through provider claims and checkp
     leaseMs: 60_000,
     budget: { remainingQueries: 100, reserveQueries: 0, deadlineMs: Date.now() + 60_000 },
   });
-  const first = await advanceCommunityAnalysisProviderRun(makeOptions());
+  const first = await advanceCommunityAnalysisRunWithProvider(makeOptions());
   expect(first.status).toBe("ready");
   if (first.status !== "ready") return;
   expect(first.evidence.acquisition).toMatchObject({ planAnchors: [], quotaRows: [] });
-  const second = await advanceCommunityAnalysisProviderRun(makeOptions());
+  const second = await advanceCommunityAnalysisRunWithProvider(makeOptions());
   expect(second.status).toBe("ready");
   expect((await pool.query(`SELECT state,checkpoint_generation FROM analytics_analysis_work_heads`)).rows)
     .toMatchObject([{ state: "complete", checkpoint_generation: expect.any(String) }]);
@@ -394,7 +481,13 @@ it("reclaims an expired checkpointing lease and rejects stale completion", async
     dependencyDigest: "f".repeat(64),
     method: "provider-prepared-v1",
     authorityEpoch: 1,
+    sourceEpoch: 1,
+    sequence: 1,
   };
+  await seedCanonical({
+    sourceId: identity.sourceId, ownerDigest: identity.ownerDigest, inputRevision: identity.inputRevision,
+    ownerRevision: identity.ownerRevision, authorityEpoch: identity.authorityEpoch,
+  });
   const store = createPostgresAnalyticalWorkStore(adapterPool, { primarySchema, ledgerSchema });
   // The adapter must ignore this synthetic caller clock for lease decisions;
   // PostgreSQL supplies the mutation-time clock instead.
@@ -438,7 +531,13 @@ it("reclaims after a blocked row lock using the database clock", async () => {
     dependencyDigest: "e".repeat(64),
     method: "provider-prepared-v1",
     authorityEpoch: 1,
+    sourceEpoch: 1,
+    sequence: 1,
   };
+  await seedCanonical({
+    sourceId: identity.sourceId, ownerDigest: identity.ownerDigest, inputRevision: identity.inputRevision,
+    ownerRevision: identity.ownerRevision, authorityEpoch: identity.authorityEpoch,
+  });
   const store = createPostgresAnalyticalWorkStore(adapterPool, { primarySchema, ledgerSchema });
   const claim = await store.claim({ identity, nowMs: 0, leaseMs: 500 });
   expect(claim).not.toBeNull();
@@ -484,7 +583,13 @@ it("rejects a renew whose lease expires while waiting for the head lock", async 
     dependencyDigest: "1".repeat(64),
     method: "provider-prepared-v1",
     authorityEpoch: 1,
+    sourceEpoch: 1,
+    sequence: 1,
   };
+  await seedCanonical({
+    sourceId: identity.sourceId, ownerDigest: identity.ownerDigest, inputRevision: identity.inputRevision,
+    ownerRevision: identity.ownerRevision, authorityEpoch: identity.authorityEpoch,
+  });
   const store = createPostgresAnalyticalWorkStore(adapterPool, { primarySchema, ledgerSchema });
   const claim = await store.claim({ identity, nowMs: 0, leaseMs: 500 });
   expect(claim).not.toBeNull();
@@ -534,7 +639,13 @@ it("rejects completion whose lease expires while waiting for the head lock", asy
     dependencyDigest: "2".repeat(64),
     method: "provider-prepared-v1",
     authorityEpoch: 1,
+    sourceEpoch: 1,
+    sequence: 1,
   };
+  await seedCanonical({
+    sourceId: identity.sourceId, ownerDigest: identity.ownerDigest, inputRevision: identity.inputRevision,
+    ownerRevision: identity.ownerRevision, authorityEpoch: identity.authorityEpoch,
+  });
   const store = createPostgresAnalyticalWorkStore(adapterPool, { primarySchema, ledgerSchema });
   const claim = await store.claim({ identity, nowMs: 0, leaseMs: 500 });
   expect(claim).not.toBeNull();
@@ -578,6 +689,50 @@ it("rejects completion whose lease expires while waiting for the head lock", asy
     await blocker.query("ROLLBACK").catch(() => {});
     await completePromise?.catch(() => {});
     blocker.release();
+  }
+});
+
+it("fences analytical work on both canonical source epoch and ingestion sequence", async () => {
+  const cases = [
+    { sourceId: "source-epoch-fence", ownerDigest: "3".repeat(64), mutation: "epoch" },
+    { sourceId: "source-sequence-fence", ownerDigest: "4".repeat(64), mutation: "sequence" },
+  ];
+  for (const testCase of cases) {
+    const identity = {
+      sourceId: testCase.sourceId,
+      sourceNamespace: "community-analysis-v1",
+      ownerDigest: testCase.ownerDigest,
+      day: "2026-09-21",
+      metric: "fits",
+      inputRevision: 1,
+      ownerRevision: 1,
+      dependencyDigest: testCase.ownerDigest,
+      method: "provider-prepared-v1",
+      authorityEpoch: 1,
+      sourceEpoch: 1,
+      sequence: 1,
+    };
+    await seedCanonical({
+      sourceId: identity.sourceId, ownerDigest: identity.ownerDigest,
+      inputRevision: identity.inputRevision, ownerRevision: identity.ownerRevision,
+      authorityEpoch: identity.authorityEpoch, sourceEpoch: identity.sourceEpoch,
+      sequence: identity.sequence,
+    });
+    const store = createPostgresAnalyticalWorkStore(adapterPool, { primarySchema, ledgerSchema });
+    const claim = await store.claim({ identity, nowMs: 0, leaseMs: 60_000 });
+    expect(claim).not.toBeNull();
+    if (!claim) continue;
+    if (testCase.mutation === "epoch") {
+      await pool.query(`UPDATE storage_source_state SET authority_epoch=2 WHERE singleton=1`);
+    } else {
+      await pool.query(`INSERT INTO storage_ingestion_changes
+        (source_id,sequence,event_digest,owner_digest,owner_revision,authority_epoch,kind,recorded_ms)
+        VALUES($1,2,$2,$3,1,1,'source-updated',1)`,
+      [identity.sourceId, payloadDigest(JSON.stringify({ sourceId: identity.sourceId, sequence: 2 })), identity.ownerDigest]);
+    }
+    await expect(store.renew({ identity, claimToken: claim.claimToken,
+      expectedRevision: claim.revision, nowMs: 0, leaseMs: 60_000 }))
+      .rejects.toMatchObject({ storageCode: "source_stale" });
   }
 });
 

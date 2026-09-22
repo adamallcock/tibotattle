@@ -70,33 +70,114 @@ export interface StorageSourcePageRequest {
   readonly signal?: AbortSignal;
 }
 
+export type StorageSourceStream = "quota" | "usage" | "session";
+
+/** Prepared streams are explicit storage identity, never inferred from a
+ * generation naming convention. */
+export type PreparedSourceStream = "quota" | "usage";
+
+export interface PreparedSourceControl {
+  /** Canonical, bounded JSON for the resumable preparation state. */
+  readonly json: string;
+  readonly sha256: string;
+}
+
+export type PreparedSourceOutputKind = "plan" | "fit" | "usage_price" | "usage_fragment";
+
+export interface PreparedSourceOutput {
+  readonly stream: PreparedSourceStream;
+  readonly kind: PreparedSourceOutputKind;
+  /** Stable source occurrence or fragment identity, not a page-local index. */
+  readonly key: string;
+  readonly index: number;
+  readonly payload: StorageJsonValue;
+  readonly payloadSha256: string;
+}
+
+export interface PreparedSourceOutputRequest {
+  readonly pin: StorageSourcePin;
+  readonly generation: string;
+  readonly stream: PreparedSourceStream;
+  readonly kind: PreparedSourceOutputKind;
+  readonly afterIndex: number;
+  readonly afterKey: string;
+  readonly limit: number;
+}
+
+export interface StorageSourcePinRequest {
+  readonly sourceId: string;
+  readonly sourceNamespace: string;
+  readonly ownerDigest: string;
+  readonly day: string;
+  readonly method: string;
+}
+
+/**
+ * Bounded canonical-source reads.  The source adapter resolves an
+ * owner-scoped pin and repeats that resolution in the page transaction; a
+ * caller cannot turn a participant id or an input fingerprint into authority
+ * by itself.  `deviceId` is the already elected device for the pinned day.
+ */
+export interface StorageSourceStore {
+  readPin(input: StorageSourcePinRequest): Promise<StorageSourcePin | null>;
+  readPage(input: StorageSourcePageRequest & {
+    readonly stream: StorageSourceStream;
+    readonly deviceId: string;
+    readonly beforeObservedAtMs?: number;
+  }): Promise<StorageSourcePage>;
+}
+
 export interface PreparedSourcePageRequest extends StorageSourcePageRequest {
   readonly generation: string;
   readonly readerPolicy: string;
+  readonly stream?: PreparedSourceStream;
+  /** Internal preparation replay may inspect an incomplete generation; normal
+   * readers only receive `available` pages from ready generations. */
+  readonly allowBuilding?: boolean;
 }
 
 export interface PreparedSourceHead {
   readonly generation: string;
+  readonly stream: PreparedSourceStream;
   readonly state: "building" | "ready" | "discarding" | "retired";
   readonly progressRevision: number;
   readonly nextCursor: StoragePageCursor | null;
   readonly rowsWritten: number;
   readonly sourcePin: StorageSourcePin;
+  readonly control?: PreparedSourceControl;
 }
 
 export interface PreparedSourceCommit {
   /** The source/owner pin is part of the write precondition, not caller metadata. */
   readonly pin: StorageSourcePin;
   readonly generation: string;
+  readonly stream?: PreparedSourceStream;
   readonly expectedProgressRevision: number;
   readonly nextCursor: StoragePageCursor | null;
   readonly complete: boolean;
   readonly rows: readonly StorageSourceRecord[];
   readonly rowDigest: string;
+  /** Persisted in the same CAS as rows/cursor/head. Required for provider
+   * preparation; optional keeps the legacy direct port source-compatible. */
+  readonly control?: PreparedSourceControl;
+  /** Derived plans/fits/prices/fragments are independent durable records. */
+  readonly outputs?: readonly PreparedSourceOutput[];
 }
 
 export interface PreparedSourceStore {
+  begin(input: {
+    readonly pin: StorageSourcePin;
+    readonly generation: string;
+    readonly stream?: PreparedSourceStream;
+  }): Promise<PreparedSourceHead>;
   readPage(request: PreparedSourcePageRequest): Promise<StorageSourcePage>;
+  readOutputs(request: PreparedSourceOutputRequest): Promise<readonly PreparedSourceOutput[]>;
+  countOutputs(input: {
+    readonly pin: StorageSourcePin;
+    readonly generation: string;
+    readonly stream: PreparedSourceStream;
+    readonly kind: PreparedSourceOutputKind;
+  }): Promise<number>;
   readHead(input: {
     readonly sourceId: string;
     readonly ownerDigest: string;
@@ -125,6 +206,9 @@ export interface AnalyticalWorkIdentity {
   readonly dependencyDigest: string;
   readonly method: string;
   readonly authorityEpoch: number;
+  /** Canonical source authority pin carried into every resumable work CAS. */
+  readonly sourceEpoch: number;
+  readonly sequence: number;
 }
 
 export interface AnalyticalWorkClaim {
@@ -391,6 +475,7 @@ export interface StorageQuarantineObjectStore {
 export type StorageReleaseGuardNonceStore = ReleaseNonceStore;
 
 export interface StorageProviderPorts {
+  readonly source: StorageSourceStore;
   readonly preparedSource: PreparedSourceStore;
   readonly analyticalWork: AnalyticalWorkStore;
   readonly publication: StoragePublicationStore;

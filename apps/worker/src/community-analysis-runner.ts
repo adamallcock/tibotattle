@@ -24,6 +24,7 @@ import type {
   AnalyticalWorkHead,
   AnalyticalWorkIdentity,
   AnalyticalWorkStore,
+  StorageSourcePin,
 } from "./storage-provider-ports";
 
 const historyWorkStore = createCommunityAnalysisWorkStore("model-history");
@@ -55,26 +56,33 @@ export function communityAnalysisAcquisitionIdentity(identity: CommunityAnalysis
  */
 export function communityAnalysisProviderIdentity(
   identity: CommunityAnalysisWorkIdentity,
+  sourcePin: StorageSourcePin,
   options: {
     readonly storage?: "current" | "model-history";
-    readonly authorityEpoch?: number;
   } = {},
 ): AnalyticalWorkIdentity {
-  const day = identity.observedAtCutoff.slice(0, 10);
-  if (!/^\d{4}-\d{2}-\d{2}$/u.test(day) || !/^[a-f0-9]{64}$/u.test(identity.inputFingerprint)) {
+  const day = sourcePin.day;
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(day)
+      || !/^[a-f0-9]{64}$/u.test(sourcePin.ownerDigest)
+      || !/^[a-f0-9]{64}$/u.test(sourcePin.dependencyDigest)
+      || sourcePin.inputRevision !== identity.inputRevision
+      || sourcePin.dependencyDigest !== identity.inputFingerprint
+      || sourcePin.method !== identity.sourceMethodVersion) {
     throw new TypeError("community analysis provider identity invalid");
   }
   return Object.freeze({
-    sourceId: identity.participantId,
-    sourceNamespace: options.storage === "model-history" ? "community-model-history-v1" : "community-analysis-v1",
-    ownerDigest: identity.inputFingerprint,
+    sourceId: sourcePin.sourceId,
+    sourceNamespace: sourcePin.sourceNamespace,
+    ownerDigest: sourcePin.ownerDigest,
     day,
     metric: options.storage === "model-history" ? "model" : "fits",
-    inputRevision: identity.inputRevision,
-    ownerRevision: identity.inputRevision,
-    dependencyDigest: identity.inputFingerprint,
-    method: identity.sourceMethodVersion,
-    authorityEpoch: options.authorityEpoch ?? 0,
+    inputRevision: sourcePin.inputRevision,
+    ownerRevision: sourcePin.ownerRevision,
+    dependencyDigest: sourcePin.dependencyDigest,
+    method: sourcePin.method,
+    authorityEpoch: sourcePin.authorityEpoch,
+    sourceEpoch: sourcePin.sourceEpoch,
+    sequence: sourcePin.sequence,
   });
 }
 
@@ -173,7 +181,13 @@ export async function advanceCommunityAnalysisProviderRun(
 ): Promise<CommunityAnalysisProviderRunResult> {
   const identity = Object.freeze({ ...options.identity });
   const acquisitionIdentity = communityAnalysisAcquisitionIdentity(identity);
-  const workIdentity = options.workIdentity ?? communityAnalysisProviderIdentity(identity, options);
+  const derivedWorkIdentity = options.preparedSource
+    ? communityAnalysisProviderIdentity(identity, options.preparedSource.pin, { storage: options.storage })
+    : null;
+  const workIdentity = options.workIdentity ?? derivedWorkIdentity;
+  if (!workIdentity || derivedWorkIdentity !== null && canonicalJson(workIdentity) !== canonicalJson(derivedWorkIdentity)) {
+    throw new TypeError("community analysis provider work identity required");
+  }
   const now = options.budget.now ?? Date.now;
   const nowMs = now();
   if (!Number.isSafeInteger(nowMs) || !Number.isSafeInteger(options.leaseMs)
@@ -184,14 +198,15 @@ export async function advanceCommunityAnalysisProviderRun(
     ? options.sourceCurrent
     : options.preparedSource
       ? async () => {
-        const head = await options.preparedSource!.store.readHead({
-          sourceId: options.preparedSource!.pin.sourceId,
-          ownerDigest: options.preparedSource!.pin.ownerDigest,
-          day: options.preparedSource!.pin.day,
+        const page = await options.preparedSource!.store.readPage({
+          pin: options.preparedSource!.pin,
           generation: options.preparedSource!.generation,
+          readerPolicy: options.preparedSource!.readerPolicy,
+          cursor: null,
+          limit: 1,
         });
-        return head?.state === "ready"
-          && canonicalJson(head.sourcePin) === canonicalJson(options.preparedSource!.pin);
+        return page.status === "available"
+          && canonicalJson(page.pin) === canonicalJson(options.preparedSource!.pin);
       }
       : async () => true;
   const sourceIsCurrent = await sourceCurrent();
@@ -272,6 +287,11 @@ export async function advanceCommunityAnalysisProviderRun(
     if (complete) {
       const evidence = providerEvidence(acquisitionIdentity, state);
       const resultDigest = await sha256Hex(canonicalJson(evidence.acquisition));
+      if (!await sourceCurrent()) return { status: "stale" };
+      const committed = await options.workStore.read(workIdentity);
+      if (!committed || committed.revision !== head.revision
+          || committed.claim?.claimToken !== claim.claimToken
+          || !committed.checkpoint?.complete) return { status: "stale" };
       try {
         head = await options.workStore.complete({ identity: workIdentity, claimToken: head.claim!.claimToken,
           expectedRevision: head.revision, nowMs: Math.trunc(currentNow), resultDigest });
@@ -391,11 +411,7 @@ async function disposeObsolete(work: CommunityAnalysisWorkStore, db: D1Database,
   }
 }
 
-/** Local coordinator only: no scheduling, backfill, cache publication or policy
- * activation. Every durable page is source/CAS-fenced by the store. Hard query
- * failure/deadline termination retains the last durable checkpoint; an in-flight
- * uncommitted page is replayed, never interpreted as a partial result. */
-export async function advanceCommunityAnalysisRun(db: D1Database, options: {
+export interface CommunityAnalysisD1RunOptions {
   identity: CommunityAnalysisWorkIdentity; sourcePin: V1SourcePin; budget: CommunityAnalysisWorkBudget;
   storage?: "current" | "model-history";
   /** Required follow-on allowance after rehydrating a completed head. This is
@@ -405,7 +421,21 @@ export async function advanceCommunityAnalysisRun(db: D1Database, options: {
   /** Only selects NEW heads. Persisted raw replay journals retain their reader. */
   preparedReader?: { sourceFingerprint: string; quotaReader: V1QuotaPageReader;
     replayPolicy: "prepared-source-days-1" };
-}): Promise<CommunityAnalysisRunResult> {
+}
+
+/** The provider composition root uses this explicit adapter entrypoint while
+ * the long-standing D1 `advanceCommunityAnalysisRun` signature stays intact. */
+export function advanceCommunityAnalysisRunWithProvider(
+  options: CommunityAnalysisProviderRunOptions,
+): Promise<CommunityAnalysisProviderRunResult> {
+  return advanceCommunityAnalysisProviderRun(options);
+}
+
+/** Local coordinator only: no scheduling, backfill, cache publication or policy
+ * activation. Every durable page is source/CAS-fenced by the store. Hard query
+ * failure/deadline termination retains the last durable checkpoint; an in-flight
+ * uncommitted page is replayed, never interpreted as a partial result. */
+export async function advanceCommunityAnalysisRun(db: D1Database, options: CommunityAnalysisD1RunOptions): Promise<CommunityAnalysisRunResult> {
   const { identity, sourcePin, budget } = options;
   if (options.preparedReader && (options.preparedReader.sourceFingerprint !== sourcePin.fingerprint
     || options.preparedReader.replayPolicy !== "prepared-source-days-1")) throw new TypeError("prepared reader source mismatch");

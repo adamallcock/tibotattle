@@ -1,4 +1,5 @@
 import { APP_PRICE_REGISTRY_MANIFEST } from "@app-usagemonitor/accounting";
+import { MODEL_COMPOSITION_POLICY } from "@app-usagemonitor/quota-analysis";
 import { canonicalJson } from "./canonical-json";
 import { sha256Hex } from "./crypto";
 import { D1InvocationBudgetExceededError } from "./d1-invocation-budget";
@@ -6,8 +7,25 @@ import { SERVER_PRICING_METHOD_VERSION } from "./server-pricing";
 import { loadV1SourcePin, type V1SourceDayDependency, type V1SourcePin } from "./telemetry-v1-source-selection";
 import { prepareQuotaPage, prepareUsagePage, type PreparationQuotaRow, type PreparedQuotaRuns } from "./prepared-v1-day";
 import type { V1FitSourceRow, V1PlanSourceRow, V1QuotaInvocationBudget, V1QuotaPageReader } from "./quota-analysis-v1-reader";
-import type { V1PreparedFinishEvidence, V1PreparedUsageFragment, WindowedUsageRow } from "./quota-analysis-v1";
-import type { PreparedSourceStore, StorageSourcePin, StorageSourceRecord } from "./storage-provider-ports";
+import type {
+  V1PreparedFinishEvidence,
+  V1PreparedUsageFragment,
+  V1PreparedUsageReader,
+  V1PreparedUsageBinsReader,
+  WindowedUsageRow,
+} from "./quota-analysis-v1";
+import type {
+  PreparedSourceStore,
+  PreparedSourceControl,
+  PreparedSourceOutput,
+  PreparedSourceOutputKind,
+  PreparedSourceStream,
+  StorageSourcePage,
+  StorageSourcePin,
+  StorageSourceRecord,
+  StorageSourceStore,
+  StorageJsonValue,
+} from "./storage-provider-ports";
 
 export const V1_PREPARED_READER_POLICY = "prepared-source-days-1";
 export const V1_PREPARATION_METHOD_VERSION = `prepared-source-day-1:${SERVER_PRICING_METHOD_VERSION}:${APP_PRICE_REGISTRY_MANIFEST.sha256}`;
@@ -37,7 +55,8 @@ export type V1PreparedEvidenceUnavailableReason =
   | "invalid_evidence"
   | "source_not_current"
   | "control_invalid"
-  | "day_count_mismatch";
+  | "day_count_mismatch"
+  | "correction_unavailable";
 
 export class V1PreparedEvidenceUnavailableError extends Error {
   readonly code = "V1_PREPARED_EVIDENCE_UNAVAILABLE";
@@ -45,6 +64,7 @@ export class V1PreparedEvidenceUnavailableError extends Error {
   constructor(reason: V1PreparedEvidenceUnavailableReason = "invalid_evidence") {
     super("v1 prepared evidence unavailable");
     this.reason = reason === "source_not_current" || reason === "control_invalid" || reason === "day_count_mismatch"
+      || reason === "correction_unavailable"
       ? reason : "invalid_evidence";
   }
 }
@@ -506,6 +526,344 @@ export interface ProviderPreparedV1QuotaSource {
   readonly pin: StorageSourcePin;
   readonly generation: string;
   readonly readerPolicy: string;
+  readonly stream?: "quota";
+}
+
+export interface ProviderV1PreparationOptions {
+  readonly source: StorageSourceStore;
+  readonly prepared: PreparedSourceStore;
+  readonly pin: StorageSourcePin;
+  readonly deviceId: string;
+  readonly generation: string;
+  readonly readerPolicy?: string;
+  readonly maxPages: number;
+  readonly pageSize?: number;
+  readonly deadlineMs: number;
+  readonly now?: () => number;
+  readonly expectedQuotaRows?: number;
+  /** A separate immutable generation carries the existing usage preparation
+   * output. It is intentionally separate from the quota reader generation so
+   * the v1 acquisition codec cannot advance across usage rows. */
+  readonly usageGeneration?: string;
+  readonly expectedUsageRows?: number;
+}
+
+export interface ProviderV1PreparationResult {
+  readonly status: "complete" | "deferred";
+  readonly pagesRun: number;
+  readonly rowsWritten: number;
+  readonly head: Awaited<ReturnType<PreparedSourceStore["begin"]>>;
+  readonly usageHead?: Awaited<ReturnType<PreparedSourceStore["begin"]>>;
+  readonly usageGeneration: string;
+  readonly preparedEvidence?: V1PreparedFinishEvidence;
+}
+
+function providerPreparationQuotaRows(records: readonly StorageSourceRecord[]): PreparationQuotaRow[] {
+  return records.map((sourceRecord) => {
+    const payload = providerQuotaPayload(sourceRecord.payload, sourceRecord, "provider prepared quota row");
+    const observedAt = new Date(sourceRecord.observedAtMs).toISOString();
+    if (!validTime(observedAt) || sourceRecord.observedDay !== observedAt.slice(0, 10)) {
+      throw new V1PreparedEvidenceUnavailableError("control_invalid");
+    }
+    return {
+      id: payload.id as number,
+      observed_at: observedAt,
+      observed_day: sourceRecord.observedDay,
+      device_id: payload.device_id as string,
+      provider: providerNullableString(payload.provider),
+      limit_id: providerNullableString(payload.limit_id),
+      plan_type: providerNullableString(payload.plan_type),
+      plan_variant: providerNullableString(payload.plan_variant),
+      occurrence_id: typeof payload.occurrence_id === "string" ? payload.occurrence_id : sourceRecord.occurrenceId,
+      slot: providerNullableString(payload.slot),
+      used_percent: payload.used_percent === null || payload.used_percent === undefined
+        ? null : typeof payload.used_percent === "number" && Number.isFinite(payload.used_percent)
+          ? payload.used_percent : (() => { throw new V1PreparedEvidenceUnavailableError("control_invalid"); })(),
+      window_duration_minutes: payload.window_duration_minutes === null || payload.window_duration_minutes === undefined
+        ? null : typeof payload.window_duration_minutes === "number" && Number.isSafeInteger(payload.window_duration_minutes)
+          ? payload.window_duration_minutes
+          : (() => { throw new V1PreparedEvidenceUnavailableError("control_invalid"); })(),
+      resets_at: payload.resets_at === null || payload.resets_at === undefined
+        ? null : validTime(payload.resets_at) ? payload.resets_at
+          : (() => { throw new V1PreparedEvidenceUnavailableError("control_invalid"); })(),
+    };
+  });
+}
+
+function providerPreparationUsageRows(records: readonly StorageSourceRecord[]): WindowedUsageRow[] {
+  return records.map((sourceRecord) => {
+    if (!record(sourceRecord.payload)) throw new V1PreparedEvidenceUnavailableError("control_invalid");
+    const payload = sourceRecord.payload as Record<string, unknown>;
+    const observedAt = new Date(sourceRecord.observedAtMs).toISOString();
+    if (!validTime(observedAt) || sourceRecord.observedDay !== observedAt.slice(0, 10)
+        || typeof payload.id !== "number" || !Number.isSafeInteger(payload.id)
+        || typeof payload.occurrence_id !== "string" || typeof payload.provider !== "string") {
+      throw new V1PreparedEvidenceUnavailableError("control_invalid");
+    }
+    const recordJson = payload.record_json;
+    return {
+      id: payload.id,
+      occurrence_id: payload.occurrence_id,
+      observed_at: observedAt,
+      provider: payload.provider,
+      session_uuid: payload.session_uuid === null || payload.session_uuid === undefined
+        ? null : typeof payload.session_uuid === "string" ? payload.session_uuid
+          : (() => { throw new V1PreparedEvidenceUnavailableError("control_invalid"); })(),
+      record_json: canonicalJson(recordJson === undefined ? payload : recordJson),
+    };
+  });
+}
+
+function equalSourcePin(left: StorageSourcePin, right: StorageSourcePin): boolean {
+  return left.sourceId === right.sourceId
+    && left.sourceNamespace === right.sourceNamespace
+    && left.ownerDigest === right.ownerDigest
+    && left.day === right.day
+    && left.inputRevision === right.inputRevision
+    && left.ownerRevision === right.ownerRevision
+    && left.dependencyDigest === right.dependencyDigest
+    && left.method === right.method
+    && left.authorityEpoch === right.authorityEpoch
+    && left.sourceEpoch === right.sourceEpoch
+    && left.sequence === right.sequence;
+}
+
+function emptyPreparedQuotaRuns(): PreparedQuotaRuns {
+  return { plan: null, fit: null, lastTime: null, lastSignature: null, equalTimeChanged: false };
+}
+
+async function runsFromProviderHead(
+  head: Awaited<ReturnType<PreparedSourceStore["begin"]>>,
+): Promise<PreparedQuotaRuns> {
+  if (!head.control) {
+    if (head.progressRevision !== 0) unavailable("control_invalid");
+    return emptyPreparedQuotaRuns();
+  }
+  if (await sha256Hex(head.control.json) !== head.control.sha256
+      || encoder.encode(head.control.json).byteLength > 16 * 1024) unavailable("control_invalid");
+  let value: unknown;
+  try { value = JSON.parse(head.control.json); } catch { unavailable("control_invalid"); }
+  if (!record(value) || !exactKeys(value, ["plan", "fit", "lastTime", "lastSignature", "equalTimeChanged"])
+      || value.lastTime !== null && !validTime(value.lastTime)
+      || value.lastSignature !== null && typeof value.lastSignature !== "string"
+      || typeof value.equalTimeChanged !== "boolean") unavailable("control_invalid");
+  for (const key of ["plan", "fit"] as const) {
+    const run = value[key];
+    if (run === null) continue;
+    if (!record(run) || !exactKeys(run, ["first", "last"])) unavailable("control_invalid");
+    validateRow(run.first, key === "fit");
+    validateRow(run.last, key === "fit");
+  }
+  return value as unknown as PreparedQuotaRuns;
+}
+
+async function controlFromRuns(runs: PreparedQuotaRuns): Promise<PreparedSourceControl> {
+  const json = canonicalJson(runs);
+  return Object.freeze({ json, sha256: await sha256Hex(json) });
+}
+
+async function outputFromValue(
+  stream: PreparedSourceStream,
+  kind: PreparedSourceOutputKind,
+  key: string,
+  index: number,
+  payload: StorageJsonValue,
+): Promise<PreparedSourceOutput> {
+  const payloadJson = canonicalJson(payload);
+  return Object.freeze({ stream, kind, key, index, payload, payloadSha256: await sha256Hex(payloadJson) });
+}
+
+async function quotaOutputs(
+  plans: readonly V1PlanSourceRow[],
+  fits: readonly V1FitSourceRow[],
+): Promise<PreparedSourceOutput[]> {
+  const outputs: PreparedSourceOutput[] = [];
+  for (const row of plans) outputs.push(await outputFromValue("quota", "plan", `${row.observed_at}:${numericOutputKey(row.id)}`,
+    Date.parse(row.observed_at), row as unknown as StorageJsonValue));
+  for (const row of fits) outputs.push(await outputFromValue("quota", "fit", `${row.resets_at}:${row.observed_at}:${numericOutputKey(row.id)}`,
+    Date.parse(row.resets_at), row as unknown as StorageJsonValue));
+  return outputs;
+}
+
+async function usageOutputs(
+  prices: readonly WindowedUsageRow[],
+  fragments: readonly V1PreparedUsageFragment[],
+): Promise<PreparedSourceOutput[]> {
+  const outputs: PreparedSourceOutput[] = [];
+  for (const row of prices) {
+    if (row.preparedPrice === undefined) unavailable("control_invalid");
+    outputs.push(await outputFromValue("usage", "usage_price", `${row.observed_at}:${numericOutputKey(row.id)}`, Date.parse(row.observed_at),
+      row as unknown as StorageJsonValue));
+  }
+  for (const fragment of fragments) {
+    outputs.push(await outputFromValue("usage", "usage_fragment", `${fragment.observed_at}:${numericOutputKey(fragment.id)}`, fragment.binStartMs,
+      fragment as unknown as StorageJsonValue));
+  }
+  return outputs;
+}
+
+function providerPlanOutput(value: StorageJsonValue, fit: boolean): V1PlanSourceRow | V1FitSourceRow {
+  if (!record(value)) unavailable("control_invalid");
+  const payload = value as Record<string, unknown>;
+  if (typeof payload.id !== "number" || !Number.isSafeInteger(payload.id) || payload.id <= 0
+      || !validTime(payload.observed_at) || payload.observed_day !== payload.observed_at.slice(0, 10)
+      || typeof payload.device_id !== "string") unavailable("control_invalid");
+  const row: V1PlanSourceRow = {
+    id: payload.id, observed_at: payload.observed_at, observed_day: payload.observed_day,
+    device_id: payload.device_id, provider: providerNullableString(payload.provider),
+    limit_id: providerNullableString(payload.limit_id), plan_type: providerNullableString(payload.plan_type),
+    plan_variant: providerNullableString(payload.plan_variant),
+  };
+  if (!fit) return row;
+  if (typeof payload.occurrence_id !== "string" || typeof payload.slot !== "string"
+      || typeof payload.used_percent !== "number" || !Number.isFinite(payload.used_percent)
+      || payload.window_duration_minutes !== 10080 || !validTime(payload.resets_at)
+      || typeof payload.provider !== "string" || typeof payload.limit_id !== "string"
+      || typeof payload.plan_type !== "string" || typeof payload.plan_variant !== "string") unavailable("control_invalid");
+  return { ...row, provider: payload.provider, limit_id: payload.limit_id,
+    plan_type: payload.plan_type, plan_variant: payload.plan_variant,
+    occurrence_id: payload.occurrence_id, slot: payload.slot, used_percent: payload.used_percent,
+    window_duration_minutes: 10080, resets_at: payload.resets_at };
+}
+
+function providerUsagePriceOutput(value: StorageJsonValue): WindowedUsageRow {
+  if (!record(value)) unavailable("control_invalid");
+  const payload = value as Record<string, unknown>;
+  if (typeof payload.id !== "number" || !Number.isSafeInteger(payload.id) || payload.id <= 0
+      || typeof payload.occurrence_id !== "string" || !validTime(payload.observed_at)
+      || typeof payload.provider !== "string" || (payload.session_uuid !== null && typeof payload.session_uuid !== "string")
+      || typeof payload.record_json !== "string") unavailable("control_invalid");
+  const preparedPrice = payload.preparedPrice;
+  if (preparedPrice !== null && !record(preparedPrice)) unavailable("control_invalid");
+  return {
+    id: payload.id, occurrence_id: payload.occurrence_id, observed_at: payload.observed_at,
+    provider: payload.provider, session_uuid: payload.session_uuid as string | null,
+    record_json: payload.record_json, preparedPrice: preparedPrice as WindowedUsageRow["preparedPrice"],
+  };
+}
+
+function providerUsageFragmentOutput(value: StorageJsonValue): V1PreparedUsageFragment {
+  if (!record(value)) unavailable("control_invalid");
+  const payload = value as Record<string, unknown>;
+  if (typeof payload.id !== "number" || !Number.isSafeInteger(payload.id) || payload.id <= 0
+      || !validTime(payload.observed_at) || typeof payload.provider !== "string"
+      || typeof payload.binStartMs !== "number" || !Number.isSafeInteger(payload.binStartMs)
+      || payload.binStartMs !== Date.parse(payload.observed_at)
+      || typeof payload.usageEventCount !== "number" || !safeCount(payload.usageEventCount)
+      || typeof payload.unpricedUsageEventCount !== "number" || !safeCount(payload.unpricedUsageEventCount)
+      || !Array.isArray(payload.cells)) unavailable("control_invalid");
+  const cells = payload.cells.map((cell) => {
+    if (!record(cell) || typeof cell.model !== "string" || !safeCount(cell.costNanousd)
+        || typeof cell.overflowed !== "boolean" || !validTime(cell.firstObservedAt)
+        || typeof cell.firstOccurrenceId !== "string") unavailable("control_invalid");
+    return {
+      model: cell.model, costNanousd: cell.costNanousd, overflowed: cell.overflowed,
+      firstObservedAt: cell.firstObservedAt, firstOccurrenceId: cell.firstOccurrenceId,
+    };
+  });
+  return {
+    id: payload.id, observed_at: payload.observed_at, provider: payload.provider,
+    binStartMs: payload.binStartMs, usageEventCount: payload.usageEventCount,
+    unpricedUsageEventCount: payload.unpricedUsageEventCount, cells,
+  };
+}
+
+/**
+ * Materialize owner-pinned v1 quota and usage generations from the canonical
+ * source port. Each physical page is passed through the existing preparation
+ * algorithms before its immutable raw records are committed. The derived
+ * projection is carried beside the page payload so retries remain idempotent;
+ * the quota reader still consumes only the quota generation and the existing
+ * acquisition/checkpoint codec remains the downstream calculator.
+ */
+export async function ensurePreparedV1WindowFromProvider(
+  options: ProviderV1PreparationOptions,
+): Promise<ProviderV1PreparationResult> {
+  const pageSize = options.pageSize ?? V1_PREPARATION_PAGE_SIZE;
+  const now = options.now ?? Date.now;
+  if (!Number.isSafeInteger(options.maxPages) || options.maxPages < 1 || options.maxPages > MAX_PAGES
+      || !Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > V1_PREPARATION_PAGE_SIZE
+      || !Number.isFinite(options.deadlineMs) || typeof options.deviceId !== "string"
+      || options.deviceId.length === 0 || options.generation.length === 0) {
+    throw new TypeError("provider v1 preparation budget invalid");
+  }
+  const readerPolicy = options.readerPolicy ?? V1_PREPARED_READER_POLICY;
+  const usageGeneration = options.usageGeneration
+    ?? await sha256Hex(canonicalJson(["provider-preparation", options.generation, options.pin.sourceId,
+      options.pin.ownerDigest, options.pin.day, "usage"]));
+  if (usageGeneration.length === 0 || usageGeneration.length > 256 || usageGeneration === options.generation) {
+    throw new TypeError("provider v1 usage generation invalid");
+  }
+  let pagesRun = 0;
+  const deferred = (head: Awaited<ReturnType<PreparedSourceStore["begin"]>>, usageHead?: Awaited<ReturnType<PreparedSourceStore["begin"]>>) =>
+    Object.freeze({ status: "deferred" as const, pagesRun, rowsWritten: head.rowsWritten, head, usageHead, usageGeneration });
+  let head = await options.prepared.begin({ pin: Object.freeze({ ...options.pin }), generation: options.generation, stream: "quota" });
+  while (head.state === "building") {
+    if (pagesRun >= options.maxPages || now() >= options.deadlineMs) return deferred(head);
+    const page: StorageSourcePage = await options.source.readPage({
+      pin: Object.freeze({ ...options.pin }), stream: "quota", deviceId: options.deviceId,
+      cursor: head.nextCursor, limit: pageSize,
+    });
+    if (!equalSourcePin(page.pin, options.pin)) unavailable("source_not_current");
+    if (page.status !== "available") {
+      if (page.status === "stale" || page.status === "withdrawn") unavailable("source_not_current");
+      if (page.status === "correction_unavailable") unavailable("correction_unavailable");
+      return deferred(head);
+    }
+    if (!page.complete && page.rows.length === 0) unavailable("control_invalid");
+    const runs = await runsFromProviderHead(head);
+    const quotaRows = providerPreparationQuotaRows(page.rows);
+    const { plans, fits } = prepareQuotaPage(quotaRows, runs, page.complete);
+    const outputs = await quotaOutputs(plans, fits);
+    const control = await controlFromRuns(runs);
+    const rowDigest = await sha256Hex(canonicalJson(page.rows));
+    head = await options.prepared.commitPage({
+      pin: Object.freeze({ ...options.pin }), generation: options.generation, stream: "quota",
+      expectedProgressRevision: head.progressRevision, nextCursor: page.nextCursor,
+      complete: page.complete, rows: Object.freeze(page.rows), rowDigest, control, outputs,
+    });
+    pagesRun += 1;
+  }
+  if (head.state !== "ready") return deferred(head);
+  if (options.expectedQuotaRows !== undefined && head.rowsWritten !== options.expectedQuotaRows) unavailable("day_count_mismatch");
+
+  // Usage has a separate explicit stream identity, but consumes the same
+  // invocation page budget as quota. The empty control is still persisted so
+  // a resumed usage generation is distinguishable from a legacy raw head.
+  let usageHead = await options.prepared.begin({ pin: Object.freeze({ ...options.pin }), generation: usageGeneration, stream: "usage" });
+  const usageControl = await controlFromRuns(emptyPreparedQuotaRuns());
+  while (usageHead.state === "building") {
+    if (pagesRun >= options.maxPages || now() >= options.deadlineMs) return deferred(head, usageHead);
+    const page = await options.source.readPage({
+      pin: Object.freeze({ ...options.pin }), stream: "usage", deviceId: options.deviceId,
+      cursor: usageHead.nextCursor, limit: pageSize,
+    });
+    if (!equalSourcePin(page.pin, options.pin)) unavailable("source_not_current");
+    if (page.status !== "available") {
+      if (page.status === "stale" || page.status === "withdrawn") unavailable("source_not_current");
+      if (page.status === "correction_unavailable") unavailable("correction_unavailable");
+      return deferred(head, usageHead);
+    }
+    if (!page.complete && page.rows.length === 0) unavailable("control_invalid");
+    const usageRows = providerPreparationUsageRows(page.rows);
+    const { prices, fragments } = prepareUsagePage(usageRows);
+    const outputs = await usageOutputs(prices, fragments);
+    const rowDigest = await sha256Hex(canonicalJson(page.rows));
+    usageHead = await options.prepared.commitPage({
+      pin: Object.freeze({ ...options.pin }), generation: usageGeneration, stream: "usage",
+      expectedProgressRevision: usageHead.progressRevision, nextCursor: page.nextCursor,
+      complete: page.complete, rows: Object.freeze(page.rows), rowDigest,
+      control: usageControl, outputs,
+    });
+    pagesRun += 1;
+  }
+  if (options.expectedUsageRows !== undefined && usageHead.rowsWritten !== options.expectedUsageRows) unavailable("day_count_mismatch");
+  const preparedEvidence = await createProviderV1PreparedEvidence({
+    store: options.prepared, pin: options.pin, quotaGeneration: options.generation,
+    usageGeneration, sourceFingerprint: options.pin.dependencyDigest,
+  });
+  return Object.freeze({ status: "complete", pagesRun, rowsWritten: head.rowsWritten, head,
+    usageHead, usageGeneration, preparedEvidence });
 }
 
 function providerQuotaPayload(value: unknown, recordValue: StorageSourceRecord, operation: string): Record<string, unknown> {
@@ -524,38 +882,99 @@ function providerNullableString(value: unknown): string | null {
   return value === null || value === undefined ? null : typeof value === "string" ? value : (() => { throw new V1PreparedEvidenceUnavailableError("control_invalid"); })();
 }
 
-function providerQuotaRows(records: readonly StorageSourceRecord[], fit: boolean): V1PlanSourceRow[] | V1FitSourceRow[] {
-  return records.map((sourceRecord) => {
-    const payload = providerQuotaPayload(sourceRecord.payload, sourceRecord, "provider prepared quota row");
-    const row: V1PlanSourceRow = {
-      id: payload.id as number,
-      observed_at: new Date(sourceRecord.observedAtMs).toISOString(),
-      observed_day: sourceRecord.observedDay,
-      device_id: payload.device_id as string,
-      provider: providerNullableString(payload.provider),
-      limit_id: providerNullableString(payload.limit_id),
-      plan_type: providerNullableString(payload.plan_type),
-      plan_variant: providerNullableString(payload.plan_variant),
-    };
-    if (!fit) return row;
-    if (typeof payload.occurrence_id !== "string" || payload.occurrence_id.length === 0
-        || typeof payload.slot !== "string" || payload.slot.length === 0
-        || typeof payload.used_percent !== "number" || !Number.isFinite(payload.used_percent)
-        || payload.window_duration_minutes !== 10080 || !validTime(payload.resets_at)) {
-      throw new V1PreparedEvidenceUnavailableError("control_invalid");
-    }
-    return {
-      ...row,
-      occurrence_id: payload.occurrence_id,
-      provider: typeof payload.provider === "string" ? payload.provider : (() => { throw new V1PreparedEvidenceUnavailableError("control_invalid"); })(),
-      limit_id: typeof payload.limit_id === "string" ? payload.limit_id : (() => { throw new V1PreparedEvidenceUnavailableError("control_invalid"); })(),
-      plan_type: typeof payload.plan_type === "string" ? payload.plan_type : (() => { throw new V1PreparedEvidenceUnavailableError("control_invalid"); })(),
-      plan_variant: typeof payload.plan_variant === "string" ? payload.plan_variant : (() => { throw new V1PreparedEvidenceUnavailableError("control_invalid"); })(),
-      slot: payload.slot,
-      used_percent: payload.used_percent,
-      window_duration_minutes: payload.window_duration_minutes,
-      resets_at: payload.resets_at,
-    } satisfies V1FitSourceRow;
+function outputCursor(observedAt: string, id: number): { afterIndex: number; afterKey: string } {
+  if (!validTime(observedAt) || !Number.isSafeInteger(id) || id < 0) {
+    throw new V1PreparedEvidenceUnavailableError("control_invalid");
+  }
+  return { afterIndex: Date.parse(observedAt), afterKey: `${observedAt}:${numericOutputKey(id)}` };
+}
+
+function numericOutputKey(value: number): string {
+  return String(value).padStart(16, "0");
+}
+
+function fitOutputCursor(cursor: { observedAt: string; resetsAt: string; id: number }): { afterIndex: number; afterKey: string } {
+  if (cursor.observedAt !== "" && !validTime(cursor.observedAt)
+      || !validTime(cursor.resetsAt) || !Number.isSafeInteger(cursor.id) || cursor.id < 0) {
+    throw new V1PreparedEvidenceUnavailableError("control_invalid");
+  }
+  return { afterIndex: Date.parse(cursor.resetsAt),
+    afterKey: cursor.observedAt === "" ? `${cursor.resetsAt}:`
+      : `${cursor.resetsAt}:${cursor.observedAt}:${numericOutputKey(cursor.id)}` };
+}
+
+async function preparedOutputPage(
+  source: ProviderPreparedV1QuotaSource,
+  kind: "plan" | "fit",
+  cursor: { observedAt: string; resetsAt?: string; id: number },
+  limit: number,
+): Promise<readonly PreparedSourceOutput[]> {
+  const position = kind === "fit"
+    ? fitOutputCursor({ observedAt: cursor.observedAt, resetsAt: cursor.resetsAt ?? cursor.observedAt, id: cursor.id })
+    : outputCursor(cursor.observedAt, cursor.id);
+  return source.store.readOutputs({
+    pin: source.pin, generation: source.generation, stream: "quota", kind,
+    afterIndex: position.afterIndex, afterKey: position.afterKey, limit,
+  });
+}
+
+/** Provider equivalent of createPreparedV1Evidence. It consumes the durable
+ * plan/fit/price/fragment outputs produced by preparation; it never reprices
+ * or rereads raw source records. */
+export async function createProviderV1PreparedEvidence(input: {
+  readonly store: PreparedSourceStore;
+  readonly pin: StorageSourcePin;
+  readonly quotaGeneration: string;
+  readonly usageGeneration: string;
+  readonly sourceFingerprint: string;
+  readonly readerPolicy?: string;
+}): Promise<V1PreparedFinishEvidence & { quotaReader: V1QuotaPageReader; replayPolicy: typeof V1_PREPARED_READER_POLICY }> {
+  const readerPolicy = input.readerPolicy ?? V1_PREPARED_READER_POLICY;
+  const quotaSource: ProviderPreparedV1QuotaSource = {
+    store: input.store, pin: input.pin, generation: input.quotaGeneration,
+    readerPolicy, stream: "quota",
+  };
+  const quotaHead = await input.store.readHead({ sourceId: input.pin.sourceId, ownerDigest: input.pin.ownerDigest,
+    day: input.pin.day, generation: input.quotaGeneration });
+  const usageHead = await input.store.readHead({ sourceId: input.pin.sourceId, ownerDigest: input.pin.ownerDigest,
+    day: input.pin.day, generation: input.usageGeneration });
+  if (!quotaHead || quotaHead.state !== "ready" || !quotaHead.control
+      || !usageHead || usageHead.state !== "ready" || !usageHead.control) unavailable("control_invalid");
+  const readUsage = async (observedAt: string, id: number, limit: number): Promise<readonly PreparedSourceOutput[]> => {
+    const position = outputCursor(observedAt, id);
+    return input.store.readOutputs({ pin: input.pin, generation: input.usageGeneration, stream: "usage",
+      kind: "usage_price", afterIndex: position.afterIndex, afterKey: position.afterKey, limit });
+  };
+  const readFragments = async (observedAt: string, id: number, limit: number): Promise<readonly PreparedSourceOutput[]> => {
+    const observedAtMs = Date.parse(observedAt);
+    const binStartMs = Math.floor(observedAtMs / MODEL_COMPOSITION_POLICY.grainMs) * MODEL_COMPOSITION_POLICY.grainMs;
+    const binStart = new Date(binStartMs).toISOString();
+    const position = outputCursor(binStart, id);
+    return input.store.readOutputs({ pin: input.pin, generation: input.usageGeneration, stream: "usage",
+      kind: "usage_fragment", afterIndex: position.afterIndex, afterKey: position.afterKey, limit });
+  };
+  const fragmentCount = await input.store.countOutputs({ pin: input.pin, generation: input.usageGeneration,
+    stream: "usage", kind: "usage_fragment" });
+  const usageReader: V1PreparedUsageReader = {
+    async readPage(observedAt, id, limit) {
+      pageBound(limit, 5000, observedAt, id);
+      const outputs = await readUsage(observedAt, id, limit);
+      return outputs.map((output) => providerUsagePriceOutput(output.payload));
+    },
+  };
+  const usageBins: V1PreparedUsageBinsReader = {
+    totalRowCount: usageHead.rowsWritten,
+    fragmentCount,
+    async readPage(observedAt, id, limit) {
+      pageBound(limit, 256, observedAt, id);
+      const outputs = await readFragments(observedAt, id, limit);
+      return outputs.map((output) => providerUsageFragmentOutput(output.payload));
+    },
+  };
+  return Object.freeze({
+    sourceFingerprint: input.sourceFingerprint,
+    replayPolicy: V1_PREPARED_READER_POLICY,
+    quotaReader: createProviderV1QuotaReader(quotaSource), usageReader, usageBins,
   });
 }
 
@@ -563,27 +982,25 @@ function providerQuotaRows(records: readonly StorageSourceRecord[], fit: boolean
 export function createProviderV1QuotaReader(source: ProviderPreparedV1QuotaSource): V1QuotaPageReader {
   const { store, pin } = source;
   if (!source.generation || !source.readerPolicy) throw new TypeError("provider prepared source identity invalid");
-  const read = async (observedAt: string, id: number, limit: number): Promise<readonly StorageSourceRecord[]> => {
-    if (!Number.isSafeInteger(id) || id < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 128
-        || observedAt !== "" && !validTime(observedAt)) throw new TypeError("provider prepared quota page bound invalid");
-    const page = await store.readPage({
-      pin,
-      generation: source.generation,
-      readerPolicy: source.readerPolicy,
-      cursor: { observedAtMs: observedAt === "" ? -1 : Date.parse(observedAt), occurrenceId: String(id) },
-      limit,
-    });
-    if (page.status !== "available") throw new V1PreparedEvidenceUnavailableError(
-      page.status === "stale" ? "source_not_current" : "invalid_evidence");
-    return page.rows;
-  };
   return {
     pageSize: 128,
     async readPlanPage(cursor, limit) {
-      return providerQuotaRows(await read(cursor.observedAt, cursor.id, limit), false) as V1PlanSourceRow[];
+      const head = await store.readHead({ sourceId: pin.sourceId, ownerDigest: pin.ownerDigest, day: pin.day, generation: source.generation });
+      if (!head || head.stream !== "quota" || head.state !== "ready" || !head.control) {
+        throw new V1PreparedEvidenceUnavailableError("invalid_evidence");
+      }
+      await runsFromProviderHead(head);
+      const outputs = await preparedOutputPage(source, "plan", cursor, limit);
+      return outputs.map((output) => providerPlanOutput(output.payload, false)) as V1PlanSourceRow[];
     },
     async readFitPage(cursor, limit) {
-      return providerQuotaRows(await read(cursor.observedAt, cursor.id, limit), true) as V1FitSourceRow[];
+      const head = await store.readHead({ sourceId: pin.sourceId, ownerDigest: pin.ownerDigest, day: pin.day, generation: source.generation });
+      if (!head || head.stream !== "quota" || head.state !== "ready" || !head.control) {
+        throw new V1PreparedEvidenceUnavailableError("invalid_evidence");
+      }
+      await runsFromProviderHead(head);
+      const outputs = await preparedOutputPage(source, "fit", cursor, limit);
+      return outputs.map((output) => providerPlanOutput(output.payload, true)) as V1FitSourceRow[];
     },
   };
 }

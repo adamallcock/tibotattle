@@ -5,9 +5,14 @@ import type {
   AnalyticalWorkIdentity,
   AnalyticalWorkStore,
   PreparedSourceCommit,
+  PreparedSourceControl,
   PreparedSourceHead,
+  PreparedSourceOutput,
+  PreparedSourceOutputKind,
+  PreparedSourceOutputRequest,
   PreparedSourcePageRequest,
   PreparedSourceStore,
+  PreparedSourceStream,
   StorageAdminStore,
   StorageAnalyticsChange,
   StorageAnalyticsDeliveryStore,
@@ -26,6 +31,7 @@ import type {
   StorageSourcePin,
   StorageSourceRecord,
 } from "./storage-provider-ports";
+import { canonicalJson } from "./canonical-json";
 import {
   createPostgresSchemaConfig,
   normalizePostgresError as normalizeSharedPostgresError,
@@ -265,6 +271,19 @@ function validateCheckpoint(checkpoint: AnalyticalCheckpoint, operation: string)
   });
 }
 
+async function checkpointPayloadsMatch(
+  checkpoint: AnalyticalCheckpoint,
+  operation: string,
+): Promise<boolean> {
+  try {
+    const matches = await Promise.all(checkpoint.parts.map(async (part) =>
+      (await sha256Text(part.payloadJson, operation)) === part.sha256));
+    return matches.every(Boolean);
+  } catch {
+    return false;
+  }
+}
+
 function cursorValues(cursor: StoragePageCursor | null): readonly [number, string] {
   return cursor === null ? [-1, ""] : [cursor.observedAtMs, cursor.occurrenceId];
 }
@@ -314,6 +333,111 @@ function assertSourcePin(actual: StorageSourcePin, expected: StorageSourcePin, o
   }
 }
 
+interface CanonicalSourceExpectation {
+  readonly sourceId: string;
+  readonly ownerDigest: string;
+  readonly inputRevision: number;
+  readonly ownerRevision: number;
+  readonly authorityEpoch: number;
+  readonly sourceEpoch: number;
+  readonly sequence: number;
+}
+
+/**
+ * Lock the canonical authority rows before a prepared/work mutation.  The
+ * analytics owner row alone is not enough: the ingest trigger advances
+ * input_versions while participant state and source authority can be revoked
+ * independently.  Every mutation uses the participant-first order shared by
+ * canonical ingest and erasure so an upload or deletion cannot deadlock a
+ * source CAS: discover link -> participant -> input version -> owner link ->
+ * source state -> analytics owner -> work/prepared head.
+ */
+async function lockCanonicalSource(
+  transaction: PostgresTransactionExecutor,
+  operation: string,
+  expected: CanonicalSourceExpectation,
+): Promise<void> {
+  // The first lookup is deliberately nonlocking: it discovers the participant
+  // row without taking the owner/link lock in the opposite order from ingest
+  // and owner erasure. Every value is re-read and validated after the lock.
+  const discoveredLink = await execute<Record<string, unknown>>(transaction, operation, statement(`
+    SELECT participant_id
+      FROM storage_v11_owner_links
+     WHERE owner_digest=$1
+     LIMIT 1`, expected.ownerDigest));
+  const discoveredParticipant = discoveredLink.rows[0]?.participant_id;
+  if (typeof discoveredParticipant !== "string" || discoveredParticipant.length === 0) {
+    throw new PostgresStorageError("source_stale", operation);
+  }
+
+  const participantResult = await execute<Record<string, unknown>>(transaction, operation, statement(`
+    SELECT id, state
+      FROM participants
+     WHERE id=$1
+     LIMIT 1
+     FOR UPDATE`, discoveredParticipant));
+  const participant = participantResult.rows[0];
+  if (!participant || safeString(participant.id, operation) !== discoveredParticipant
+      || safeString(participant.state, operation) !== "active") {
+    throw new PostgresStorageError("source_stale", operation);
+  }
+
+  const inputResult = await execute<Record<string, unknown>>(transaction, operation, statement(`
+    SELECT revision
+      FROM input_versions
+     WHERE participant_id=$1
+     LIMIT 1
+     FOR UPDATE`, discoveredParticipant));
+  const input = inputResult.rows[0];
+  if (!input || safeInteger(input.revision, operation) !== expected.inputRevision) {
+    throw new PostgresStorageError("source_stale", operation);
+  }
+
+  const linkResult = await execute<Record<string, unknown>>(transaction, operation, statement(`
+    SELECT participant_id, owner_digest, state
+      FROM storage_v11_owner_links
+     WHERE owner_digest=$1
+     LIMIT 1
+     FOR UPDATE`, expected.ownerDigest));
+  const link = linkResult.rows[0];
+  if (!link || safeString(link.participant_id, operation) !== discoveredParticipant
+      || safeString(link.owner_digest, operation) !== expected.ownerDigest
+      || safeString(link.state, operation) !== "active") {
+    throw new PostgresStorageError("source_stale", operation);
+  }
+
+  const sourceResult = await execute<Record<string, unknown>>(transaction, operation, statement(`
+    SELECT source_id, authority_epoch,
+           (SELECT COALESCE(MAX(sequence), 0)::bigint
+             FROM storage_ingestion_changes c
+             WHERE c.source_id=storage_source_state.source_id
+               AND c.owner_digest=$1) AS sequence
+      FROM storage_source_state
+     WHERE singleton=1
+     LIMIT 1
+     FOR SHARE`, expected.ownerDigest));
+  const source = sourceResult.rows[0];
+  if (!source || safeString(source.source_id, operation) !== expected.sourceId
+      || safeInteger(source.authority_epoch, operation) < 0
+      || safeInteger(source.authority_epoch, operation) !== expected.sourceEpoch
+      || safeInteger(source.sequence, operation) !== expected.sequence) {
+    throw new PostgresStorageError("source_stale", operation);
+  }
+
+  const ownerResult = await execute<Record<string, unknown>>(transaction, operation, statement(`
+    SELECT state, revision, authority_epoch
+      FROM analytics_owner_state
+     WHERE source_id=$1 AND owner_digest=$2
+     LIMIT 1
+     FOR UPDATE`, expected.sourceId, expected.ownerDigest));
+  const owner = ownerResult.rows[0];
+  if (!owner || safeString(owner.state, operation) !== "active"
+      || safeInteger(owner.revision, operation) !== expected.ownerRevision
+      || safeInteger(owner.authority_epoch, operation) !== expected.authorityEpoch) {
+    throw new PostgresStorageError("source_stale", operation);
+  }
+}
+
 async function assertPreparedRowEqual(
   transaction: PostgresTransactionExecutor,
   operation: string,
@@ -339,6 +463,48 @@ async function assertPreparedRowEqual(
       || safeDay(existingRow.observed_day, operation) !== row.observedDay) {
     throw new PostgresStorageError("conflict", operation, { retryable: false });
   }
+}
+
+async function assertPreparedOutputEqual(
+  transaction: PostgresTransactionExecutor,
+  operation: string,
+  pin: StorageSourcePin,
+  generation: string,
+  output: PreparedSourceOutput,
+  payloadJson: string,
+): Promise<void> {
+  const existing = await execute<Record<string, unknown>>(transaction, operation, statement(`
+    SELECT stream, output_kind, output_index, payload_json, payload_sha256
+      FROM analytics_prepared_source_outputs
+     WHERE source_id=$1 AND owner_digest=$2 AND observed_day=$3
+       AND generation=$4 AND stream=$5 AND output_kind=$6 AND output_key=$7
+     FOR UPDATE`, pin.sourceId, pin.ownerDigest, pin.day, generation, output.stream, output.kind, output.key));
+  const row = existing.rows[0];
+  if (!row || preparedStream(row.stream, operation) !== output.stream
+      || preparedOutputKind(row.output_kind, operation) !== output.kind
+      || safeInteger(row.output_index, operation) !== output.index
+      || safeString(row.payload_json, operation) !== payloadJson
+      || safeSha256(row.payload_sha256, operation) !== output.payloadSha256) {
+    throw new PostgresStorageError("conflict", operation, { retryable: false });
+  }
+}
+
+function preparedOutputFromRow(
+  row: Record<string, unknown>,
+  operation: string,
+): PreparedSourceOutput {
+  const stream = preparedStream(row.stream, operation);
+  const kind = preparedOutputKind(row.output_kind, operation);
+  const payloadJson = boundedJson(safeString(row.payload_json, operation), 256 * 1024, operation);
+  const payloadSha256 = safeSha256(row.payload_sha256, operation);
+  return Object.freeze({
+    stream,
+    kind,
+    key: safeString(row.output_key, operation),
+    index: safeInteger(row.output_index, operation),
+    payload: parseJson(payloadJson, operation),
+    payloadSha256,
+  });
 }
 
 function cursorEqual(left: StoragePageCursor | null, right: StoragePageCursor | null): boolean {
@@ -369,6 +535,76 @@ function mapSourcePage(
     }),
     complete,
   });
+}
+
+function preparedHeadFromRow(row: Record<string, unknown>, operation: string): PreparedSourceHead {
+  const state = safeString(row.state, operation);
+  if (!(["building", "ready", "discarding", "retired"] as const).includes(state as PreparedSourceHead["state"])) {
+    throw new PostgresStorageError("incomplete", operation);
+  }
+  const streamValue = row.stream === null || row.stream === undefined ? "quota" : safeString(row.stream, operation);
+  if (streamValue !== "quota" && streamValue !== "usage") throw new PostgresStorageError("incomplete", operation);
+  const control = row.control_json === null || row.control_json === undefined
+    ? undefined
+    : Object.freeze({
+      json: boundedJson(safeString(row.control_json, operation), 16 * 1024, operation),
+      sha256: safeSha256(row.control_sha256, operation),
+    });
+  if (control && control.json.length === 0) throw new PostgresStorageError("incomplete", operation);
+  return Object.freeze({
+    generation: safeString(row.generation, operation),
+    stream: streamValue as PreparedSourceStream,
+    state: state as PreparedSourceHead["state"],
+    progressRevision: safeInteger(row.progress_revision, operation),
+    nextCursor: row.next_cursor_time === null || row.next_cursor_time === undefined
+      ? null
+      : Object.freeze({
+        observedAtMs: safeInteger(row.next_cursor_time, operation),
+        occurrenceId: safeString(row.next_cursor_id, operation),
+      }),
+    rowsWritten: safeInteger(row.rows_written, operation),
+    sourcePin: sourcePin(row, operation),
+    ...(control ? { control } : {}),
+  });
+}
+
+function preparedStream(value: unknown, operation: string): PreparedSourceStream {
+  if (value !== "quota" && value !== "usage") throw new PostgresStorageError("bounds", operation);
+  return value;
+}
+
+function preparedOutputKind(value: unknown, operation: string): PreparedSourceOutputKind {
+  if (value !== "plan" && value !== "fit" && value !== "usage_price" && value !== "usage_fragment") {
+    throw new PostgresStorageError("bounds", operation);
+  }
+  return value;
+}
+
+function outputKindMatchesStream(stream: PreparedSourceStream, kind: PreparedSourceOutputKind): boolean {
+  return stream === "quota" ? kind === "plan" || kind === "fit"
+    : kind === "usage_price" || kind === "usage_fragment";
+}
+
+function outputPayloadJson(output: PreparedSourceOutput, operation: string): string {
+  if (!output.key || output.key.length > 256 || !Number.isSafeInteger(output.index) || output.index < 0
+      || !outputKindMatchesStream(output.stream, output.kind) || !/^[0-9a-f]{64}$/u.test(output.payloadSha256)) {
+    throw new PostgresStorageError("bounds", operation);
+  }
+  let payloadJson: string;
+  try { payloadJson = canonicalJson(output.payload); } catch { throw new PostgresStorageError("bounds", operation); }
+  return boundedJson(payloadJson, 256 * 1024, operation);
+}
+
+async function validatePreparedControl(
+  control: PreparedSourceControl | undefined,
+  operation: string,
+): Promise<string | undefined> {
+  if (!control) return undefined;
+  const json = boundedJson(control.json, 16 * 1024, operation);
+  if (await sha256Text(json, operation) !== safeSha256(control.sha256, operation)) {
+    throw new PostgresStorageError("incomplete", operation);
+  }
+  return json;
 }
 
 function normalizeLimit(limit: number, maximum: number, operation: string): number {
@@ -443,6 +679,101 @@ export function createPostgresPreparedSourceStore(
 ): PreparedSourceStore {
   const database = storageDatabase(pool, schemaOptions);
   return {
+    async begin(input): Promise<PreparedSourceHead> {
+      const operation = "prepared_source.begin";
+      const pin = Object.freeze({ ...input.pin });
+      const generation = String(input.generation);
+      const stream = preparedStream(input.stream ?? "quota", operation);
+      if (!generation || generation.length > 256) throw new PostgresStorageError("bounds", operation);
+      try {
+        return await inTransaction(database, operation, async (transaction) => {
+          await lockCanonicalSource(transaction, operation, pin);
+          const existing = await execute<Record<string, unknown>>(transaction, operation, statement(`
+            SELECT h.generation, h.state, h.progress_revision, h.next_cursor_time,
+                   h.next_cursor_id, h.rows_written, h.source_id, h.source_namespace,
+                   h.owner_digest, h.day, h.input_revision, h.owner_revision,
+                   h.dependency_digest, h.method, h.authority_epoch, h.source_epoch,
+                   h.sequence, COALESCE(s.stream,'quota') AS stream,
+                   c.control_json, c.control_sha256
+              FROM analytics_prepared_source_heads h
+              LEFT JOIN analytics_prepared_source_streams s
+                ON s.source_id=h.source_id AND s.owner_digest=h.owner_digest
+               AND s.observed_day=h.day AND s.generation=h.generation
+              LEFT JOIN analytics_prepared_source_controls c
+                ON c.source_id=h.source_id AND c.owner_digest=h.owner_digest
+               AND c.observed_day=h.day AND c.generation=h.generation
+               AND c.stream=COALESCE(s.stream,'quota')
+             WHERE h.source_id=$1 AND h.owner_digest=$2 AND h.day=$3
+             ORDER BY h.generation
+             FOR UPDATE OF h`, pin.sourceId, pin.ownerDigest, pin.day));
+          const exact = existing.rows.find((row) => safeString(row.generation, operation) === generation);
+          if (exact) {
+            const head = preparedHeadFromRow(exact, operation);
+            if (head.stream !== stream) throw new PostgresStorageError("conflict", operation, { retryable: true });
+            assertSourcePin(head.sourcePin, pin, operation);
+            if (head.state === "discarding" || head.state === "retired") {
+              throw new PostgresStorageError("conflict", operation, { retryable: true });
+            }
+            return head;
+          }
+          if (existing.rows.some((row) => {
+            const state = safeString(row.state, operation);
+            const existingStream = row.stream === null || row.stream === undefined
+              ? "quota" : preparedStream(row.stream, operation);
+            return (state === "building" || state === "ready" || state === "discarding")
+              && existingStream === stream;
+          })) {
+            throw new PostgresStorageError("conflict", operation, { retryable: true });
+          }
+          // A manually restored/cleaned primary can retain a stream mapping
+          // after its head was removed, and older migrations did not have a
+          // foreign key from the mapping to the head.  Reclaim only mappings
+          // whose generation is no longer active; an active generation was
+          // rejected above and must continue to fence this stream.
+          await execute(transaction, operation, statement(`
+            DELETE FROM analytics_prepared_source_streams s
+             WHERE s.source_id=$1 AND s.owner_digest=$2
+               AND s.observed_day=$3 AND s.stream=$4
+               AND NOT EXISTS (
+                 SELECT 1
+                   FROM analytics_prepared_source_heads h
+                  WHERE h.source_id=s.source_id
+                    AND h.owner_digest=s.owner_digest
+                    AND h.day=s.observed_day
+                    AND h.generation=s.generation
+                    AND h.state IN ('building','ready','discarding')
+               )`, pin.sourceId, pin.ownerDigest, pin.day, stream));
+          const inserted = await execute<Record<string, unknown>>(transaction, operation, statement(`
+            INSERT INTO analytics_prepared_source_heads
+              (source_id, source_namespace, owner_digest, day, generation,
+               input_revision, owner_revision, dependency_digest, method,
+               authority_epoch, source_epoch, sequence, state, progress_revision,
+               next_cursor_time, next_cursor_id, rows_written)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'building',0,NULL,NULL,0)
+            RETURNING generation, state, progress_revision, next_cursor_time,
+                      next_cursor_id, rows_written, source_id, source_namespace,
+                      owner_digest, day, input_revision, owner_revision,
+                      dependency_digest, method, authority_epoch, source_epoch,
+                      sequence`, pin.sourceId, pin.sourceNamespace, pin.ownerDigest,
+          pin.day, generation, pin.inputRevision, pin.ownerRevision, pin.dependencyDigest,
+          pin.method, pin.authorityEpoch, pin.sourceEpoch, pin.sequence));
+          const row = inserted.rows[0];
+          if (!row) throw new PostgresStorageError("conflict", operation, { retryable: true });
+          const streamRow = await execute<Record<string, unknown>>(transaction, operation, statement(`
+            INSERT INTO analytics_prepared_source_streams
+              (source_id,owner_digest,observed_day,generation,stream)
+            VALUES($1,$2,$3,$4,$5)
+            ON CONFLICT (source_id,owner_digest,observed_day,stream) DO NOTHING
+            RETURNING stream`, pin.sourceId, pin.ownerDigest, pin.day, generation, stream));
+          if (streamRow.rows.length !== 1) {
+            throw new PostgresStorageError("conflict", operation, { retryable: true });
+          }
+          return preparedHeadFromRow({ ...row, stream }, operation);
+        });
+      } catch (error) {
+        throw normalizePostgresError(error, operation);
+      }
+    },
     async readPage(input: PreparedSourcePageRequest): Promise<StorageSourcePage> {
       const operation = "prepared_source.read_page";
       const limit = normalizeLimit(input.limit, 256, operation);
@@ -453,6 +784,8 @@ export function createPostgresPreparedSourceStore(
       const pin = Object.freeze({ ...input.pin });
       const generation = String(input.generation);
       const readerPolicy = String(input.readerPolicy);
+      const stream = preparedStream(input.stream ?? "quota", operation);
+      const allowBuilding = input.allowBuilding === true;
       if (generation.length === 0 || readerPolicy.length === 0) {
         throw new PostgresStorageError("bounds", operation);
       }
@@ -472,21 +805,32 @@ export function createPostgresPreparedSourceStore(
           // The head is authoritative.  A row join by itself can silently
           // turn an empty stale/withdrawn source into an available page.
           const headResult = await execute<Record<string, unknown>>(transaction, operation, statement(`
-            SELECT generation, state, progress_revision, next_cursor_time,
-                   next_cursor_id, rows_written, source_id, source_namespace,
-                   owner_digest, day, input_revision, owner_revision,
-                   dependency_digest, method, authority_epoch, source_epoch,
-                   sequence
-              FROM analytics_prepared_source_heads
-             WHERE source_id = $1 AND owner_digest = $2 AND day = $3
-               AND generation = $4
+            SELECT h.generation, h.state, h.progress_revision, h.next_cursor_time,
+                   h.next_cursor_id, h.rows_written, h.source_id, h.source_namespace,
+                   h.owner_digest, h.day, h.input_revision, h.owner_revision,
+                   h.dependency_digest, h.method, h.authority_epoch, h.source_epoch,
+                   h.sequence, COALESCE(s.stream,'quota') AS stream,
+                   c.control_json, c.control_sha256
+              FROM analytics_prepared_source_heads h
+              LEFT JOIN analytics_prepared_source_streams s
+                ON s.source_id=h.source_id AND s.owner_digest=h.owner_digest
+               AND s.observed_day=h.day AND s.generation=h.generation
+              LEFT JOIN analytics_prepared_source_controls c
+                ON c.source_id=h.source_id AND c.owner_digest=h.owner_digest
+               AND c.observed_day=h.day AND c.generation=h.generation
+               AND c.stream=COALESCE(s.stream,'quota')
+             WHERE h.source_id = $1 AND h.owner_digest = $2 AND h.day = $3
+               AND h.generation = $4
              LIMIT 1
-             FOR SHARE`, pin.sourceId, pin.ownerDigest, pin.day, generation));
+             FOR SHARE OF h`, pin.sourceId, pin.ownerDigest, pin.day, generation));
           const head = headResult.rows[0];
           if (!head) {
             return mapSourcePage([], pin, "source_unavailable", limit, operation);
           }
           const authoritativePin = sourcePin(head, operation);
+          if ((head.stream === undefined ? "quota" : preparedStream(head.stream, operation)) !== stream) {
+            return mapSourcePage([], authoritativePin, "stale", limit, operation);
+          }
           try {
             assertSourcePin(authoritativePin, pin, operation);
           } catch (error) {
@@ -512,7 +856,11 @@ export function createPostgresPreparedSourceStore(
           if (headState === "discarding" || headState === "retired") {
             return mapSourcePage([], authoritativePin, "withdrawn", limit, operation);
           }
-          if (headState !== "ready") {
+          if (headState === "building" && allowBuilding) {
+            // The preparation coordinator uses this bounded replay only to
+            // rebuild its cross-page compression state. Public quota readers
+            // leave the default false and never observe a partial generation.
+          } else if (headState !== "ready") {
             return mapSourcePage([], authoritativePin, "correction_unavailable", limit, operation);
           }
 
@@ -547,37 +895,30 @@ export function createPostgresPreparedSourceStore(
     async readHead(input): Promise<PreparedSourceHead | null> {
       const operation = "prepared_source.read_head";
       const result = await execute<Record<string, unknown>>(database, operation, statement(`
-        SELECT generation, state, progress_revision, next_cursor_time,
-               next_cursor_id, rows_written, source_id, source_namespace,
-               owner_digest, day, input_revision, owner_revision,
-               dependency_digest, method, authority_epoch, source_epoch, sequence
-          FROM analytics_prepared_source_heads
-         WHERE source_id = $1 AND owner_digest = $2 AND day = $3 AND generation = $4
+        SELECT h.generation, h.state, h.progress_revision, h.next_cursor_time,
+               h.next_cursor_id, h.rows_written, h.source_id, h.source_namespace,
+               h.owner_digest, h.day, h.input_revision, h.owner_revision,
+               h.dependency_digest, h.method, h.authority_epoch, h.source_epoch, h.sequence,
+               COALESCE(s.stream,'quota') AS stream, c.control_json, c.control_sha256
+          FROM analytics_prepared_source_heads h
+          LEFT JOIN analytics_prepared_source_streams s
+            ON s.source_id=h.source_id AND s.owner_digest=h.owner_digest
+           AND s.observed_day=h.day AND s.generation=h.generation
+          LEFT JOIN analytics_prepared_source_controls c
+            ON c.source_id=h.source_id AND c.owner_digest=h.owner_digest
+           AND c.observed_day=h.day AND c.generation=h.generation
+           AND c.stream=COALESCE(s.stream,'quota')
+         WHERE h.source_id = $1 AND h.owner_digest = $2 AND h.day = $3 AND h.generation = $4
          LIMIT 1`, input.sourceId, input.ownerDigest, input.day, input.generation));
       const row = result.rows[0];
       if (!row) return null;
-      const state = safeString(row.state, operation);
-      if (!["building", "ready", "discarding", "retired"].includes(state)) {
-        throw new PostgresStorageError("incomplete", operation);
-      }
-      return Object.freeze({
-        generation: safeString(row.generation, operation),
-        state: state as PreparedSourceHead["state"],
-        progressRevision: safeInteger(row.progress_revision, operation),
-        nextCursor: row.next_cursor_time === null || row.next_cursor_time === undefined
-          ? null
-          : Object.freeze({
-            observedAtMs: safeInteger(row.next_cursor_time, operation),
-            occurrenceId: safeString(row.next_cursor_id, operation),
-          }),
-        rowsWritten: safeInteger(row.rows_written, operation),
-            sourcePin: sourcePin(row, operation),
-      });
+      return preparedHeadFromRow(row, operation);
     },
 
     async commitPage(input: PreparedSourceCommit): Promise<PreparedSourceHead> {
       const operation = "prepared_source.commit_page";
       const pin = Object.freeze({ ...input.pin });
+      const stream = preparedStream(input.stream ?? "quota", operation);
       const rows = Object.freeze(input.rows.map((row) => Object.freeze({ ...row })));
       // Capture payload JSON synchronously with the other caller-owned
       // preconditions. The stored digest is then checked against this frozen
@@ -585,17 +926,15 @@ export function createPostgresPreparedSourceStore(
       // cannot change between validation and INSERT.
       const payloadJson = Object.freeze(rows.map((row) => {
         let encoded: string;
-        try {
-          encoded = JSON.stringify(row.payload);
-        } catch {
-          throw new PostgresStorageError("bounds", operation);
-        }
+        try { encoded = canonicalJson(row.payload); } catch { throw new PostgresStorageError("bounds", operation); }
         return boundedJson(encoded, 256 * 1024, operation);
       }));
       const generation = String(input.generation);
       const expectedProgressRevision = input.expectedProgressRevision;
       const nextCursor = input.nextCursor === null ? null : Object.freeze({ ...input.nextCursor });
       const complete = input.complete;
+      const controlJsonPromise = validatePreparedControl(input.control, operation);
+      const outputs = Object.freeze((input.outputs ?? []).map((output) => Object.freeze({ ...output })));
       // Keep the page digest in the public contract for caller replay
       // identity, while each occurrence's payload digest remains the
       // idempotency/conflict key checked below.
@@ -619,37 +958,45 @@ export function createPostgresPreparedSourceStore(
           throw new PostgresStorageError("incomplete", operation);
         }
       }
+      const outputJson = Object.freeze(await Promise.all(outputs.map(async (output) => {
+        if (output.stream !== stream) throw new PostgresStorageError("source_stale", operation);
+        const encoded = outputPayloadJson(output, operation);
+        if (await sha256Text(encoded, operation) !== output.payloadSha256) {
+          throw new PostgresStorageError("incomplete", operation);
+        }
+        return encoded;
+      })));
+      const controlJson = await controlJsonPromise;
       try {
         return await inTransaction(database, operation, async (transaction) => {
-          // Both authority and head are locked before any occurrence write.
-          // The same pin and generation are then repeated on the head UPDATE,
-          // so a route/owner move cannot race this durable mutation.
-          const current = await execute<Record<string, unknown>>(transaction, operation, statement(`
-            SELECT state, revision, authority_epoch
-              FROM analytics_owner_state
-             WHERE source_id=$1 AND owner_digest=$2
-             LIMIT 1
-             FOR UPDATE`, pin.sourceId, pin.ownerDigest));
-          const owner = current.rows[0];
-          if (!owner || safeString(owner.state, operation) !== "active"
-              || safeInteger(owner.revision, operation) !== pin.ownerRevision
-              || safeInteger(owner.authority_epoch, operation) !== pin.authorityEpoch) {
-            throw new PostgresStorageError("source_stale", operation);
-          }
+          // Canonical authority and the head are locked before any occurrence
+          // write.  The same pin and generation are then repeated on the head
+          // UPDATE, so an upload, erasure, or owner move cannot race this CAS.
+          await lockCanonicalSource(transaction, operation, pin);
           const head = await execute<Record<string, unknown>>(transaction, operation, statement(`
-            SELECT generation, state, progress_revision, next_cursor_time,
-                   next_cursor_id, rows_written, source_id, source_namespace,
-                   owner_digest, day, input_revision, owner_revision,
-                   dependency_digest, method, authority_epoch, source_epoch,
-                   sequence
-              FROM analytics_prepared_source_heads
-             WHERE source_id=$1 AND owner_digest=$2 AND day=$3 AND generation=$4
+            SELECT h.generation, h.state, h.progress_revision, h.next_cursor_time,
+                   h.next_cursor_id, h.rows_written, h.source_id, h.source_namespace,
+                   h.owner_digest, h.day, h.input_revision, h.owner_revision,
+                   h.dependency_digest, h.method, h.authority_epoch, h.source_epoch,
+                   h.sequence, COALESCE(s.stream,'quota') AS stream,
+                   c.control_json, c.control_sha256
+              FROM analytics_prepared_source_heads h
+              LEFT JOIN analytics_prepared_source_streams s
+                ON s.source_id=h.source_id AND s.owner_digest=h.owner_digest
+               AND s.observed_day=h.day AND s.generation=h.generation
+              LEFT JOIN analytics_prepared_source_controls c
+                ON c.source_id=h.source_id AND c.owner_digest=h.owner_digest
+               AND c.observed_day=h.day AND c.generation=h.generation
+               AND c.stream=COALESCE(s.stream,'quota')
+             WHERE h.source_id=$1 AND h.owner_digest=$2 AND h.day=$3 AND h.generation=$4
              LIMIT 1
-             FOR UPDATE`, pin.sourceId, pin.ownerDigest, pin.day, generation));
+             FOR UPDATE OF h`, pin.sourceId, pin.ownerDigest, pin.day, generation));
           const headRow = head.rows[0];
           if (!headRow) throw new PostgresStorageError("conflict", operation, { retryable: true });
           const authoritativePin = sourcePin(headRow, operation);
           assertSourcePin(authoritativePin, pin, operation);
+          const headStream = preparedStream(headRow.stream ?? "quota", operation);
+          if (headStream !== stream) throw new PostgresStorageError("conflict", operation, { retryable: true });
           if (safeString(headRow.generation, operation) !== generation) {
             throw new PostgresStorageError("conflict", operation, { retryable: true });
           }
@@ -679,13 +1026,31 @@ export function createPostgresPreparedSourceStore(
                 payloadJson[index]!,
               );
             }
+            if (outputs.length > 0) {
+              for (let index = 0; index < outputs.length; index += 1) {
+                await assertPreparedOutputEqual(transaction, operation, pin, generation,
+                  outputs[index]!, outputJson[index]!);
+              }
+            }
+            if (controlJson !== undefined
+                && (safeString(headRow.control_json, operation) !== controlJson
+                  || safeSha256(headRow.control_sha256, operation) !== input.control!.sha256)) {
+              throw new PostgresStorageError("conflict", operation, { retryable: false });
+            }
             return Object.freeze({
               generation: safeString(headRow.generation, operation),
+              stream,
               state: "ready" as const,
               progressRevision: currentProgressRevision,
               nextCursor: storedCursor,
               rowsWritten: safeInteger(headRow.rows_written, operation),
               sourcePin: authoritativePin,
+              ...(headRow.control_json === null || headRow.control_json === undefined ? {} : {
+                control: Object.freeze({
+                  json: safeString(headRow.control_json, operation),
+                  sha256: safeSha256(headRow.control_sha256, operation),
+                }),
+              }),
             });
           }
           if (headState !== "building") {
@@ -693,6 +1058,26 @@ export function createPostgresPreparedSourceStore(
           }
           if (currentProgressRevision !== expectedProgressRevision) {
             throw new PostgresStorageError("conflict", operation, { retryable: true });
+          }
+          // Older/restored heads may predate the explicit stream mapping.  A
+          // commit that carries prepared outputs must establish that mapping
+          // in the same transaction before inserting its FK-backed records.
+          // An existing mapping for another generation remains a hard fence.
+          const streamMapping = await execute<Record<string, unknown>>(transaction, operation, statement(`
+            SELECT generation
+              FROM analytics_prepared_source_streams
+             WHERE source_id=$1 AND owner_digest=$2 AND observed_day=$3 AND stream=$4
+             FOR UPDATE`, pin.sourceId, pin.ownerDigest, pin.day, stream));
+          const mappedGeneration = streamMapping.rows[0]?.generation;
+          if (mappedGeneration !== undefined
+              && safeString(mappedGeneration, operation) !== generation) {
+            throw new PostgresStorageError("conflict", operation, { retryable: true });
+          }
+          if (mappedGeneration === undefined) {
+            await execute(transaction, operation, statement(`
+              INSERT INTO analytics_prepared_source_streams
+                (source_id,owner_digest,observed_day,generation,stream)
+              VALUES($1,$2,$3,$4,$5)`, pin.sourceId, pin.ownerDigest, pin.day, generation, stream));
           }
           let insertedCount = 0;
           for (let index = 0; index < rows.length; index += 1) {
@@ -712,6 +1097,29 @@ export function createPostgresPreparedSourceStore(
               continue;
             }
             await assertPreparedRowEqual(transaction, operation, pin, generation, row, payloadJson[index]!);
+          }
+          for (let index = 0; index < outputs.length; index += 1) {
+            const output = outputs[index]!;
+            const inserted = await execute<Record<string, unknown>>(transaction, operation, statement(`
+              INSERT INTO analytics_prepared_source_outputs
+                (source_id,owner_digest,observed_day,generation,stream,output_kind,
+                 output_key,output_index,payload_json,payload_sha256)
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+              ON CONFLICT (source_id,owner_digest,observed_day,generation,stream,output_kind,output_key)
+              DO NOTHING RETURNING output_key`, pin.sourceId, pin.ownerDigest, pin.day, generation,
+            stream, output.kind, output.key, output.index, outputJson[index]!, output.payloadSha256));
+            if (inserted.rows.length !== 1) {
+              await assertPreparedOutputEqual(transaction, operation, pin, generation, output, outputJson[index]!);
+            }
+          }
+          if (controlJson !== undefined) {
+            await execute(transaction, operation, statement(`
+              INSERT INTO analytics_prepared_source_controls
+                (source_id,owner_digest,observed_day,generation,stream,control_json,control_sha256)
+              VALUES ($1,$2,$3,$4,$5,$6,$7)
+              ON CONFLICT (source_id,owner_digest,observed_day,generation,stream)
+              DO UPDATE SET control_json=EXCLUDED.control_json, control_sha256=EXCLUDED.control_sha256`,
+            pin.sourceId, pin.ownerDigest, pin.day, generation, stream, controlJson, input.control!.sha256));
           }
           const updated = await execute<Record<string, unknown>>(transaction, operation, statement(`
             UPDATE analytics_prepared_source_heads
@@ -740,6 +1148,7 @@ export function createPostgresPreparedSourceStore(
           const state = safeString(row.state, operation);
           return Object.freeze({
             generation: safeString(row.generation, operation),
+            stream,
             state: state as PreparedSourceHead["state"],
             progressRevision: safeInteger(row.progress_revision, operation),
             nextCursor: row.next_cursor_time === null ? null : Object.freeze({
@@ -748,8 +1157,126 @@ export function createPostgresPreparedSourceStore(
             }),
             rowsWritten: safeInteger(row.rows_written, operation),
             sourcePin: sourcePin(row, operation),
+            ...(controlJson !== undefined ? {
+              control: Object.freeze({ json: controlJson, sha256: input.control!.sha256 }),
+            } : headRow.control_json === null || headRow.control_json === undefined ? {} : {
+              control: Object.freeze({
+                json: safeString(headRow.control_json, operation),
+                sha256: safeSha256(headRow.control_sha256, operation),
+              }),
+            }),
           });
         });
+      } catch (error) {
+        throw normalizePostgresError(error, operation);
+      }
+    },
+
+    async readOutputs(input: PreparedSourceOutputRequest): Promise<readonly PreparedSourceOutput[]> {
+      const operation = "prepared_source.read_outputs";
+      const pin = Object.freeze({ ...input.pin });
+      const generation = String(input.generation);
+      const stream = preparedStream(input.stream, operation);
+      const kind = preparedOutputKind(input.kind, operation);
+      const afterIndex = input.afterIndex;
+      const afterKey = String(input.afterKey);
+      const limit = normalizeLimit(input.limit, 256, operation);
+      if (!generation || generation.length > 256 || !outputKindMatchesStream(stream, kind)
+          || !Number.isSafeInteger(afterIndex) || afterIndex < -1 || afterKey.length > 256) {
+        throw new PostgresStorageError("bounds", operation);
+      }
+      try {
+        return await withPostgresRead(database.pool, async (client) => {
+          await client.query(setLocalSearchPath(database.schema));
+          const headResult = await client.query<Record<string, unknown>>(`
+            SELECT h.generation, h.state, h.progress_revision, h.next_cursor_time,
+                   h.next_cursor_id, h.rows_written, h.source_id, h.source_namespace,
+                   h.owner_digest, h.day, h.input_revision, h.owner_revision,
+                   h.dependency_digest, h.method, h.authority_epoch, h.source_epoch,
+                   h.sequence, COALESCE(s.stream,'quota') AS stream,
+                   c.control_json, c.control_sha256
+              FROM analytics_prepared_source_heads h
+              LEFT JOIN analytics_prepared_source_streams s
+                ON s.source_id=h.source_id AND s.owner_digest=h.owner_digest
+               AND s.observed_day=h.day AND s.generation=h.generation
+              LEFT JOIN analytics_prepared_source_controls c
+                ON c.source_id=h.source_id AND c.owner_digest=h.owner_digest
+               AND c.observed_day=h.day AND c.generation=h.generation
+               AND c.stream=COALESCE(s.stream,'quota')
+             WHERE h.source_id=$1 AND h.owner_digest=$2 AND h.day=$3 AND h.generation=$4
+             LIMIT 1`, [pin.sourceId, pin.ownerDigest, pin.day, generation]);
+          const head = headResult.rows[0];
+          if (!head) throw new PostgresStorageError("not_found", operation);
+          if (preparedStream(head.stream ?? "quota", operation) !== stream) {
+            throw new PostgresStorageError("source_stale", operation);
+          }
+          assertSourcePin(sourcePin(head, operation), pin, operation);
+          if (safeString(head.state, operation) !== "ready") {
+            throw new PostgresStorageError("incomplete", operation);
+          }
+          const result = await client.query<Record<string, unknown>>(`
+            SELECT stream, output_kind, output_key, output_index, payload_json, payload_sha256
+              FROM analytics_prepared_source_outputs
+             WHERE source_id=$1 AND owner_digest=$2 AND observed_day=$3
+               AND generation=$4 AND stream=$5 AND output_kind=$6
+               AND (output_index, output_key) > ($7, $8)
+             ORDER BY output_index, output_key
+             LIMIT $9`, [pin.sourceId, pin.ownerDigest, pin.day, generation, stream, kind,
+            afterIndex, afterKey, limit]);
+          const mapped: PreparedSourceOutput[] = [];
+          for (const row of result.rows) {
+            const output = preparedOutputFromRow(row, operation);
+            if (output.stream !== stream || output.kind !== kind
+                || await sha256Text(canonicalJson(output.payload), operation) !== output.payloadSha256) {
+              throw new PostgresStorageError("incomplete", operation);
+            }
+            mapped.push(output);
+          }
+          return Object.freeze(mapped);
+        }, { operation });
+      } catch (error) {
+        throw normalizePostgresError(error, operation);
+      }
+    },
+
+    async countOutputs(input): Promise<number> {
+      const operation = "prepared_source.count_outputs";
+      const pin = Object.freeze({ ...input.pin });
+      const generation = String(input.generation);
+      const stream = preparedStream(input.stream, operation);
+      const kind = preparedOutputKind(input.kind, operation);
+      if (!generation || generation.length > 256 || !outputKindMatchesStream(stream, kind)) {
+        throw new PostgresStorageError("bounds", operation);
+      }
+      try {
+        return await withPostgresRead(database.pool, async (client) => {
+          await client.query(setLocalSearchPath(database.schema));
+          const head = await client.query<Record<string, unknown>>(`
+            SELECT h.generation, h.source_id, h.source_namespace, h.owner_digest, h.day,
+                   h.input_revision, h.owner_revision, h.dependency_digest, h.method,
+                   h.authority_epoch, h.source_epoch, h.sequence, h.state,
+                   COALESCE(s.stream,'quota') AS stream
+              FROM analytics_prepared_source_heads h
+              LEFT JOIN analytics_prepared_source_streams s
+                ON s.source_id=h.source_id AND s.owner_digest=h.owner_digest
+               AND s.observed_day=h.day AND s.generation=h.generation
+             WHERE h.source_id=$1 AND h.owner_digest=$2 AND h.day=$3 AND h.generation=$4
+             LIMIT 1`, [pin.sourceId, pin.ownerDigest, pin.day, generation]);
+          const row = head.rows[0];
+          if (!row) throw new PostgresStorageError("not_found", operation);
+          if (preparedStream(row.stream ?? "quota", operation) !== stream
+              || safeString(row.state, operation) !== "ready") {
+            throw new PostgresStorageError("incomplete", operation);
+          }
+          assertSourcePin(sourcePin(row, operation), pin, operation);
+          const result = await client.query<{ count: string }>(`
+            SELECT count(*)::bigint AS count
+              FROM analytics_prepared_source_outputs
+             WHERE source_id=$1 AND owner_digest=$2 AND observed_day=$3
+               AND generation=$4 AND stream=$5 AND output_kind=$6`,
+          [pin.sourceId, pin.ownerDigest, pin.day, generation, stream, kind]);
+          return safeInteger(result.rows[0]?.count, operation);
+        }, { operation });
       } catch (error) {
         throw normalizePostgresError(error, operation);
       }
@@ -807,6 +1334,15 @@ export function createPostgresPreparedSourceStore(
                AND progress_revision=$6 AND state='discarding'`, complete,
           sourceId, ownerDigest, day, generation, expectedProgressRevision));
           if (updated.rowCount !== 1) throw new PostgresStorageError("conflict", operation, { retryable: true });
+          if (complete) {
+            // Retired generations no longer authorize prepared output reads;
+            // remove their stream/control/output records before releasing the
+            // head lock so a later generation can reuse the explicit stream.
+            await execute(transaction, operation, statement(`
+              DELETE FROM analytics_prepared_source_streams
+               WHERE source_id=$1 AND owner_digest=$2 AND observed_day=$3 AND generation=$4`,
+            sourceId, ownerDigest, day, generation));
+          }
           return { deleted: result.rowCount, complete };
         });
       } catch (error) {
@@ -842,6 +1378,8 @@ function workIdentityFromRow(row: Record<string, unknown>, operation: string): A
     dependencyDigest: safeString(record.dependencyDigest, operation),
     method: safeString(record.method, operation),
     authorityEpoch: safeInteger(record.authorityEpoch, operation),
+    sourceEpoch: safeInteger(record.sourceEpoch, operation),
+    sequence: safeInteger(record.sequence, operation),
   });
 }
 
@@ -891,11 +1429,11 @@ function workCheckpointFromRows(
   return validateCheckpoint({ generation, expectedHead, controlJson, manifestJson, parts, complete }, operation);
 }
 
-function completeCheckpointFromRows(
+async function completeCheckpointFromRows(
   rows: readonly Record<string, unknown>[],
   generation: string,
   operation: string,
-): AnalyticalCheckpoint | null {
+): Promise<AnalyticalCheckpoint | null> {
   const checkpoint = workCheckpointFromRows(rows, generation, operation);
   if (!checkpoint?.complete || checkpoint.parts.length === 0) return null;
   const selected = rows.filter((row) => safeString(row.generation, operation) === generation);
@@ -918,7 +1456,8 @@ function completeCheckpointFromRows(
     if (!part || part.sha256 !== value.sha256) return null;
     seen.add(index);
   }
-  return seen.size === checkpoint.parts.length ? checkpoint : null;
+  return seen.size === checkpoint.parts.length && await checkpointPayloadsMatch(checkpoint, operation)
+    ? checkpoint : null;
 }
 
 function withWorkCheckpoint(head: AnalyticalWorkHead, checkpoint: AnalyticalCheckpoint | null): AnalyticalWorkHead {
@@ -955,21 +1494,24 @@ export function createPostgresAnalyticalWorkStore(
         throw new PostgresStorageError("bounds", operation);
       }
       const token = crypto.randomUUID();
-      const result = await executeMutation<Record<string, unknown>>(database, operation, statement(`
-        INSERT INTO analytics_analysis_work_heads
-          (source_id,owner_digest,day,metric,identity_json,state,revision,claim_token,lease_expires_ms)
-        VALUES ($1,$2,$3,$4,$5,'claimed',1,$6,${POSTGRES_NOW_MS} + $7)
-        ON CONFLICT (source_id,owner_digest,day,metric) DO UPDATE
-          SET identity_json = EXCLUDED.identity_json,
-              state = 'claimed', revision = analytics_analysis_work_heads.revision + 1,
-              claim_token = EXCLUDED.claim_token, lease_expires_ms = ${POSTGRES_NOW_MS} + $7
-        WHERE analytics_analysis_work_heads.identity_json = EXCLUDED.identity_json
-          AND analytics_analysis_work_heads.state IN ('pending','claimed','checkpointing')
-          AND (analytics_analysis_work_heads.state = 'pending'
-            OR analytics_analysis_work_heads.lease_expires_ms <= ${POSTGRES_NOW_MS})
-        RETURNING identity_json,state,revision,claim_token,lease_expires_ms`,
-      identity.sourceId, identity.ownerDigest, identity.day, identity.metric,
-      workIdentityJson(identity, operation), token, leaseMs));
+      const result = await inTransaction(database, operation, async (transaction) => {
+        await lockCanonicalSource(transaction, operation, identity);
+        return execute<Record<string, unknown>>(transaction, operation, statement(`
+          INSERT INTO analytics_analysis_work_heads
+            (source_id,owner_digest,day,metric,identity_json,state,revision,claim_token,lease_expires_ms)
+          VALUES ($1,$2,$3,$4,$5,'claimed',1,$6,${POSTGRES_NOW_MS} + $7)
+          ON CONFLICT (source_id,owner_digest,day,metric) DO UPDATE
+            SET identity_json = EXCLUDED.identity_json,
+                state = 'claimed', revision = analytics_analysis_work_heads.revision + 1,
+                claim_token = EXCLUDED.claim_token, lease_expires_ms = ${POSTGRES_NOW_MS} + $7
+          WHERE analytics_analysis_work_heads.identity_json = EXCLUDED.identity_json
+            AND analytics_analysis_work_heads.state IN ('pending','claimed','checkpointing')
+            AND (analytics_analysis_work_heads.state = 'pending'
+              OR analytics_analysis_work_heads.lease_expires_ms <= ${POSTGRES_NOW_MS})
+          RETURNING identity_json,state,revision,claim_token,lease_expires_ms`,
+        identity.sourceId, identity.ownerDigest, identity.day, identity.metric,
+        workIdentityJson(identity, operation), token, leaseMs));
+      });
       const row = result.rows[0];
       if (!row) return null;
       const head = workHeadFromRow(row, operation);
@@ -991,6 +1533,7 @@ export function createPostgresAnalyticalWorkStore(
       }
       try {
         return await inTransaction(database, operation, async (transaction) => {
+          await lockCanonicalSource(transaction, operation, identity);
           const current = await execute<Record<string, unknown>>(transaction, operation, statement(`
             SELECT identity_json,state,revision,claim_token,lease_expires_ms
               FROM analytics_analysis_work_heads
@@ -1056,7 +1599,9 @@ export function createPostgresAnalyticalWorkStore(
              ORDER BY part_index LIMIT 1025`, [snapshot.sourceId, snapshot.ownerDigest, snapshot.day, snapshot.metric,
             checkpointGeneration]);
           const checkpoint = workCheckpointFromRows(parts.rows, checkpointGeneration, operation);
-          if (!checkpoint) throw new PostgresStorageError("incomplete", operation);
+          if (!checkpoint || !await checkpointPayloadsMatch(checkpoint, operation)) {
+            throw new PostgresStorageError("incomplete", operation);
+          }
           return withWorkCheckpoint(head, checkpoint);
         }, { operation });
       } catch (error) {
@@ -1076,8 +1621,12 @@ export function createPostgresAnalyticalWorkStore(
           || !Number.isSafeInteger(nowMs)) {
         throw new PostgresStorageError("bounds", operation);
       }
+      if (!await checkpointPayloadsMatch(checkpoint, operation)) {
+        throw new PostgresStorageError("incomplete", operation);
+      }
       try {
         return await inTransaction(database, operation, async (transaction) => {
+          await lockCanonicalSource(transaction, operation, identity);
           const current = await execute<Record<string, unknown>>(transaction, operation, statement(`
             SELECT identity_json,state,revision,claim_token,lease_expires_ms,head_digest
               FROM analytics_analysis_work_heads
@@ -1164,6 +1713,7 @@ export function createPostgresAnalyticalWorkStore(
       }
       try {
         return await inTransaction(database, operation, async (transaction) => {
+          await lockCanonicalSource(transaction, operation, identity);
           const current = await execute<Record<string, unknown>>(transaction, operation, statement(`
             SELECT identity_json,state,revision,claim_token,lease_expires_ms,checkpoint_generation
               FROM analytics_analysis_work_heads
@@ -1191,7 +1741,7 @@ export function createPostgresAnalyticalWorkStore(
           checkpointGeneration));
           let checkpoint: AnalyticalCheckpoint | null;
           try {
-            checkpoint = completeCheckpointFromRows(checkpointRows.rows, checkpointGeneration, operation);
+            checkpoint = await completeCheckpointFromRows(checkpointRows.rows, checkpointGeneration, operation);
           } catch {
             checkpoint = null;
           }
