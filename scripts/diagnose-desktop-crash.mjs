@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const SCHEMA_VERSION = "tibotattle-offline-crash-doctor-v2";
+const SCHEMA_VERSION = "tibotattle-offline-crash-doctor-v3";
 const MAX_DIRECTORY_ENTRIES = 5000;
 const MAX_REPORT_BYTES = 4 * 1024 * 1024;
 const MAX_REPORTS = 10;
@@ -35,6 +35,17 @@ const DIAGNOSTIC_CODE = /^(?:[A-Z][A-Z0-9_]{1,63}|[a-z][a-z0-9_]{1,63})$/u;
 const DIAGNOSTIC_REFERENCE = /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u;
 const VERSION = /^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9.-]{1,20})?$/u;
 const OS_VERSION = /^macOS [0-9]+(?:\.[0-9]+){0,2}$/u;
+const STARTUP_SCHEMA = "tibotattle-electron-startup-diagnostic-v1";
+const STARTUP_PHASES = new Set([
+  "bootstrap", "package_metadata", "profile_selection", "crash_capture",
+  "runtime_qualification", "platform_gate", "runtime_paths", "credential_wiring",
+  "app_ready", "native_handover", "installation_state", "first_run",
+  "secure_storage", "runtime_services", "settings", "lifecycle", "updater", "ready",
+]);
+const STARTUP_OUTCOMES = new Set(["in_progress", "failed", "stopped", "ready"]);
+const STARTUP_CODE = /^[a-z][a-z0-9_]{1,95}$/u;
+const STARTUP_PLATFORM = new Set(["darwin", "win32", "linux", "unknown"]);
+const STARTUP_ARCHITECTURE = new Set(["arm64", "x64", "ia32", "arm", "unknown"]);
 
 function safeValue(value, pattern) {
   return typeof value === "string" && pattern.test(value) ? value : null;
@@ -310,6 +321,55 @@ async function inspectCapture(homeDirectory, uid, profile) {
   return { capturePreference, crashpad: counts };
 }
 
+async function inspectStartupDiagnostic(homeDirectory, uid, profile) {
+  const path = join(userDataPath(homeDirectory, profile), "desktop-settings",
+    "startup-diagnostic-v1.json");
+  let raw;
+  try {
+    raw = await readOwnedFile(path, uid, 4096, { ownerOnly: true });
+    if (raw === null) return { profile, status: "unavailable", record: null };
+  } catch (error) {
+    return { profile, status: error?.code === "ENOENT" ? "missing" : "unavailable",
+      record: null };
+  }
+  try {
+    const value = JSON.parse(raw);
+    const keys = ["schemaVersion", "recordedAt", "startedAt", "phase", "outcome",
+      "code", "platform", "architecture", "version"];
+    if (value === null || typeof value !== "object" || Array.isArray(value)
+      || Object.getPrototypeOf(value) !== Object.prototype
+      || Reflect.ownKeys(value).length !== keys.length
+      || keys.some((key) => !Object.hasOwn(value, key))
+      || value.schemaVersion !== STARTUP_SCHEMA
+      || typeof value.recordedAt !== "string" || typeof value.startedAt !== "string"
+      || Number.isNaN(Date.parse(value.recordedAt)) || Number.isNaN(Date.parse(value.startedAt))
+      || new Date(value.recordedAt).toISOString() !== value.recordedAt
+      || new Date(value.startedAt).toISOString() !== value.startedAt
+      || Date.parse(value.startedAt) > Date.parse(value.recordedAt)
+      || !STARTUP_PHASES.has(value.phase) || !STARTUP_OUTCOMES.has(value.outcome)
+      || (value.code !== null && !STARTUP_CODE.test(value.code))
+      || (["in_progress", "ready"].includes(value.outcome) && value.code !== null)
+      || (["failed", "stopped"].includes(value.outcome) && value.code === null)
+      || !STARTUP_PLATFORM.has(value.platform)
+      || !STARTUP_ARCHITECTURE.has(value.architecture)
+      || (value.version !== "unknown" && safeValue(value.version, VERSION) === null)) {
+      return { profile, status: "invalid", record: null };
+    }
+    return { profile, status: "available", record: {
+      recordedAt: value.recordedAt,
+      startedAt: value.startedAt,
+      phase: value.phase,
+      outcome: value.outcome,
+      code: value.code,
+      platform: value.platform,
+      architecture: value.architecture,
+      version: value.version,
+    } };
+  } catch {
+    return { profile, status: "invalid", record: null };
+  }
+}
+
 async function scanAppleReports({ homeDirectory, uid, hours, channel, now, verbose, retainBytes = false }) {
   const reportDirectory = join(homeDirectory, "Library", "Logs", "DiagnosticReports");
   const listing = await listOwnedDirectory(reportDirectory, uid);
@@ -393,6 +453,8 @@ export async function diagnoseDesktopCrash({
     appleReports,
     localCapture: await Promise.all(profilesForChannel(channel)
       .map(async (profile) => ({ profile, ...await inspectCapture(homeDirectory, uid, profile) }))),
+    startupDiagnostics: await Promise.all(profilesForChannel(channel)
+      .map((profile) => inspectStartupDiagnostic(homeDirectory, uid, profile))),
     ...(verbose ? { diagnosticNotes: await Promise.all(profilesForChannel(channel)
       .map((profile) => inspectDiagnosticNotes(homeDirectory, uid, profile, now, hours))) } : {}),
     note: "Read-only local summary. No app launch, network request, or raw report upload. A stored preference does not prove capture was active at crash time. Absence of a report does not rule out a crash.",
@@ -465,7 +527,17 @@ export async function exportPrivateCrashEvidence({
   for (const profile of profilesForChannel(channel)) {
     const userData = userDataPath(homeDirectory, profile);
     const state = join(userData, "companion-state");
-    if (!(await isOwnedDirectory(userData, uid)) || !(await isOwnedDirectory(state, uid))) {
+    if (!(await isOwnedDirectory(userData, uid))) {
+      skippedFiles += 3;
+      continue;
+    }
+    try {
+      const bytes = await readOwnedBytes(join(userData, "desktop-settings",
+        "startup-diagnostic-v1.json"), uid, 4096, { ownerOnly: true });
+      if (bytes === null) skippedFiles += 1;
+      else sources.push({ name: `startup-${profile}.json`, bytes });
+    } catch (error) { if (error?.code !== "ENOENT") skippedFiles += 1; }
+    if (!(await isOwnedDirectory(state, uid))) {
       skippedFiles += 2;
       continue;
     }
@@ -576,6 +648,11 @@ export function renderDesktopCrashDiagnosis(result) {
       const item = capture.crashpad[name];
       lines.push(`Local Crashpad ${name} (${capture.profile}): ${item.status}${item.count === null ? "" : ` (${item.count} dump(s))`}`);
     }
+  }
+  for (const startup of result.startupDiagnostics) {
+    const record = startup.record;
+    lines.push(`Startup diagnostic (${startup.profile}): ${startup.status}${record === null
+      ? "" : `; ${record.recordedAt}; version ${record.version}; ${record.outcome} at ${record.phase}${record.code === null ? "" : `; code ${record.code}`}`}`);
   }
   if (result.mode === "verbose") {
     for (const log of result.diagnosticNotes) {

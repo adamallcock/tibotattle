@@ -444,6 +444,7 @@ function createWindowsStagingFileClosure() {
         "package.json",
         "electron-runtime-manifest.json",
         "apps/electron/**",
+        "scripts/diagnose-desktop-crash.mjs",
         "apps/local/**",
         "apps/web/public/**",
         "config/**",

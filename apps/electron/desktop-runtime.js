@@ -712,6 +712,7 @@ export async function launchDesktopRuntime({
   accountlessSignedStagingRehearsal,
   productionDistribution,
   prepareNativeHandover,
+  onStartupPhase,
   getuid = typeof process.getuid === "function" ? process.getuid.bind(process) : undefined,
   getUserInfo = userInfo,
   loadProductionUpdater = () => import("electron-updater"),
@@ -726,6 +727,13 @@ export async function launchDesktopRuntime({
     throw new TypeError("companion launch paths are invalid");
   }
   assertObject(environment, "environment");
+  const markStartupPhase = (phase) => {
+    try {
+      if (typeof onStartupPhase === "function") onStartupPhase(phase);
+    } catch {
+      // Startup diagnostics are observational and never control startup.
+    }
+  };
   // Test-only loopback composition. Normal main.js does not provide this port.
   // Production is a separate packaged-manifest selection below.
   if (accountlessLaboratory !== undefined) {
@@ -1099,8 +1107,10 @@ export async function launchDesktopRuntime({
   if (platform !== "darwin") acceptDeepLinkArgv(argv ?? process.argv);
   // Electron's native dialog must be shown only after the app is ready. This
   // does not start the companion, register a login item, or enable updates.
+  markStartupPhase("app_ready");
   await app.whenReady?.();
   if (prepareNativeHandover !== undefined) {
+    markStartupPhase("native_handover");
     while (true) {
       let handover;
       try {
@@ -1179,6 +1189,7 @@ export async function launchDesktopRuntime({
   }
   // Establish provenance before the first-run receipt or settings create a new
   // managed marker. Injected test backends never inspect real profile state.
+  markStartupPhase("installation_state");
   const installationState = sharingInstallationState ?? (injectedSettings
     ? "unknown"
     : await classifyDesktopSharingInstallation({
@@ -1262,6 +1273,7 @@ export async function launchDesktopRuntime({
       rootPath: settingsRootPath,
       windowsProtectedStateStore,
     });
+  markStartupPhase("first_run");
   const firstRun = await ensureDesktopFirstRunAcknowledged({
     dialog: runtime.dialog,
     receiptBackend: firstRunBackend,
@@ -1304,6 +1316,7 @@ export async function launchDesktopRuntime({
         enabled: false, policyVersion: null, destinationOrigin: null }),
       updateTransport() {}, dispose() {} };
   }
+  markStartupPhase("secure_storage");
   if (accountlessNativeCredentialUsesMac && initialSharingSnapshot?.enabled === true) {
     while (true) {
       try {
@@ -1332,6 +1345,7 @@ export async function launchDesktopRuntime({
       }
     }
   }
+  markStartupPhase("runtime_services");
   const runtimeOwnedDownloadsRegistry = await createRuntimeOwnedDownloadsRegistry({
     app,
     runtime,
@@ -1688,6 +1702,7 @@ export async function launchDesktopRuntime({
   let initialDesktopSnapshot;
   let firstRunLogin = Object.freeze({ status: "not_requested" });
   let recoverySettingsAction;
+  markStartupPhase("settings");
   try {
     initialDesktopSnapshot = await controller.initialize();
     const firstRunLoginRegistrar = createDesktopFirstRunLoginRegistrar({
@@ -1888,8 +1903,10 @@ export async function launchDesktopRuntime({
         runtime.nativeTheme.removeListener?.("updated", onNativeThemeUpdated);
       };
     }
+    markStartupPhase("lifecycle");
     await lifecycle.start();
     if (productionDistribution !== undefined) {
+      markStartupPhase("updater");
       // Electron's built-in autoUpdater has no supported Linux implementation
       // and lacks electron-updater's explicit download contract on every
       // platform. The selected package consistently uses the pinned updater.
@@ -1909,6 +1926,7 @@ export async function launchDesktopRuntime({
       });
       await updater.start();
     }
+    markStartupPhase("ready");
   } catch (error) {
     deepLinkIntakeCleanup();
     await disposeControllerAndIpc();
