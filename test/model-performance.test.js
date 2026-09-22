@@ -7,12 +7,21 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { modelPerformanceProjection } from '../src/reporting/index.js';
 import { createModelPerformanceController } from '../apps/local/model-performance-controller.js';
+import { modelPerformanceSupplementDirectory } from '../apps/local/model-performance-worker.js';
 import { loadWindowsSourceReadBinding } from '../src/platform/windows-filesystem.js';
 
 const NOW = Date.parse('2026-09-09T12:00:00Z'), DAY = 86400000;
 const row = (patch = {}) => ({ at: NOW, model: 'gpt-5.6-sol', sample_method: 'receipt',
   sample_tokens: 100, sample_duration: 1000, sample_responses: 1, sample_total_responses: 2,
   ttft: 5000, ...patch });
+test('Windows supplemental timing store avoids the primary guard ancestors', () => {
+  const timingRoot = join('/state', 'inference-timing-v2');
+  const directory = join(timingRoot, 'source-0123456789abcdef');
+  assert.equal(modelPerformanceSupplementDirectory({ directory, timingRoot, platform: 'win32' }),
+    join('/state', 'inference-timing-tool-free-v1', 'source-0123456789abcdef'));
+  assert.equal(modelPerformanceSupplementDirectory({ directory, timingRoot, platform: 'darwin' }),
+    join(directory, 'tool-free-v1'));
+});
 test('period coverage is independent and combines compatible speed evidence', () => {
   const rows = [row(), row({ sample_method: 'legacy', sample_tokens: 200 }),
     row({ sample_duration: null }), row({ ttft: null }), row({ at: NOW - 8 * DAY }),

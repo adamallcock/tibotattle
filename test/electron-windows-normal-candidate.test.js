@@ -35,6 +35,7 @@ import {
   createWindowsNormalCandidateQuitProtocol,
   createWindowsNormalCandidateProductFailureDiagnostics,
   createWindowsNormalCandidateStartupStderrObserver,
+  classifyWindowsNormalCandidateModelPerformance,
   classifyWindowsNormalCandidateStartupCdpChild,
   installOutboundFirewallBlock,
   inspectWindowsNormalCandidateCdpEndpoint,
@@ -91,6 +92,11 @@ test("packaged Windows timing smoke requires a complete ready source scan", () =
     { ...ready, models: null }]) {
     assert.equal(verifyWindowsNormalCandidateModelPerformance(value), false);
   }
+  assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "unavailable" }), "UNAVAILABLE");
+  assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "ready", stale: true }), "STALE");
+  assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "loading" }), "LOADING");
+  assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "ready" }), "INCOMPLETE");
+  assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "unexpected" }), "INVALID");
 });
 
 test("startup failure diagnostics retain only fixed categories and booleans", () => {

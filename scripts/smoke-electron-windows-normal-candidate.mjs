@@ -351,6 +351,11 @@ const FAILURE_CODES = new Set([
   "LOCAL_EXPLICIT_REFRESH_COMPLETION_UNAVAILABLE",
   "LOCAL_SYNTHETIC_INGESTION_UNAVAILABLE",
   "LOCAL_MODEL_PERFORMANCE_UNAVAILABLE",
+  "LOCAL_MODEL_PERFORMANCE_LOADING",
+  "LOCAL_MODEL_PERFORMANCE_STALE",
+  "LOCAL_MODEL_PERFORMANCE_INCOMPLETE",
+  "LOCAL_MODEL_PERFORMANCE_INVALID",
+  "LOCAL_MODEL_PERFORMANCE_PAGE_UNAVAILABLE",
   "SETTINGS_UNAVAILABLE",
   "SETTINGS_PERSISTENCE_INVALID",
   "CLEAN_QUIT_INVALID",
@@ -2802,6 +2807,16 @@ export function verifyWindowsNormalCandidateModelPerformance(value) {
     && progress.checked === progress.total;
 }
 
+// Only a fixed state category crosses the CI receipt boundary. The API can
+// contain local measurements, which must never be echoed in a workflow log.
+export function classifyWindowsNormalCandidateModelPerformance(value) {
+  if (value?.status === 'unavailable') return 'UNAVAILABLE';
+  if (value?.stale === true) return 'STALE';
+  if (value?.status === 'loading' || value?.collecting === true) return 'LOADING';
+  if (value?.status === 'ready') return 'INCOMPLETE';
+  return 'INVALID';
+}
+
 async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () => {} }) {
   const dashboard = exactLoopbackRootPage(target.url);
   if (dashboard === null) fail("DASHBOARD_INVALID");
@@ -2934,18 +2949,20 @@ async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () =>
       fail("LOCAL_SYNTHETIC_INGESTION_UNAVAILABLE");
     }
     onPhase("model_performance");
+    let timingState = 'INVALID';
     const timing = await waitFor(async () => {
       const value = await jsonFetch(new URL("/api/local/model-performance?period=all", dashboard), { fetchImpl });
+      timingState = classifyWindowsNormalCandidateModelPerformance(value);
       return verifyWindowsNormalCandidateModelPerformance(value);
     }, OPERATION_TIMEOUT_MS);
-    if (timing !== true) fail("LOCAL_MODEL_PERFORMANCE_UNAVAILABLE");
+    if (timing !== true) fail(`LOCAL_MODEL_PERFORMANCE_${timingState}`);
     const openedPerformance = await cdp.evaluate(`(() => {
       const link = document.querySelector('[data-nav="performance"]');
       if (!link) return false;
       link.click();
       return true;
     })()`);
-    if (openedPerformance !== true) fail("LOCAL_MODEL_PERFORMANCE_UNAVAILABLE");
+    if (openedPerformance !== true) fail("LOCAL_MODEL_PERFORMANCE_PAGE_UNAVAILABLE");
     const renderedPerformance = await waitFor(() => cdp.evaluate(`(() => {
       const section = document.querySelector('#performance');
       const provider = section?.querySelector('.performance-provider');
@@ -2953,7 +2970,7 @@ async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () =>
       return Boolean(section && !section.inert && section.getAttribute('aria-hidden') !== 'true'
         && provider?.textContent?.trim() && status?.dataset?.state === 'ready');
     })()`), OPERATION_TIMEOUT_MS);
-    if (renderedPerformance !== true) fail("LOCAL_MODEL_PERFORMANCE_UNAVAILABLE");
+    if (renderedPerformance !== true) fail("LOCAL_MODEL_PERFORMANCE_PAGE_UNAVAILABLE");
     if (!observer.valid()) fail("DASHBOARD_INVALID");
     preloadContexts?.dispose?.();
     return Object.freeze({
