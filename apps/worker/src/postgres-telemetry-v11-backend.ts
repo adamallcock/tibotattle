@@ -417,7 +417,7 @@ async function lockPendingObject(
   client: PostgresClient,
   tables: PostgresTelemetryV11Tables,
   metadata: TelemetryV11ChunkWriteMetadata,
-): Promise<void> {
+): Promise<{ created: boolean }> {
   const inserted = await client.query(
     `INSERT INTO ${tables.pendingObjects}(contribution_id, object_key)
        VALUES ($1,$2)
@@ -439,6 +439,7 @@ async function lockPendingObject(
   if (row.object_key !== metadata.objectKey || row.reconciliation_state !== "registered") {
     throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
   }
+  return Object.freeze({ created: inserted.rows.length === 1 });
 }
 
 async function assertManifestAdmission(
@@ -451,9 +452,11 @@ async function assertManifestAdmission(
     `SELECT count(*)::text AS count
        FROM ${tables.manifests}
       WHERE participant_id=$1 AND device_id=$2
-        AND created_at >= $3::date
-        AND created_at < ($3::date + INTERVAL '1 day')`,
-    [principal.participantId, principal.deviceId, createdAt.slice(0, 10)],
+        AND created_at >= $3::timestamptz
+        AND created_at < $4::timestamptz`,
+    [principal.participantId, principal.deviceId,
+      `${createdAt.slice(0, 10)}T00:00:00.000Z`,
+      new Date(Date.parse(`${createdAt.slice(0, 10)}T00:00:00.000Z`) + 86_400_000).toISOString()],
   );
   if (result.rows.length !== 1) throw unavailable();
   const count = integer(rowOne(result).count, 0, Number.MAX_SAFE_INTEGER);
@@ -671,7 +674,7 @@ export function createPostgresTelemetryV11Backend(
           // Acquire the same journal row used by reconciliation before any
           // live manifest or authority checks. The lock remains held until
           // the transaction commits or rolls back.
-          await lockPendingObject(client, tables, snapshot.metadata);
+          const pendingFence = await lockPendingObject(client, tables, snapshot.metadata);
           await assertV11Authority(client, tables, principal);
           const manifestResult = await client.query(
             `SELECT id, to_char(chunk_day,'YYYY-MM-DD') AS chunk_day, manifest_digest,
@@ -707,6 +710,14 @@ export function createPostgresTelemetryV11Backend(
           if (existing.rows.length === 1) {
             const row = chunkRow(existing.rows[0]!);
             if (!isExactChunk(row, chunk)) throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
+            if (pendingFence.created) {
+              const removed = await client.query(
+                `DELETE FROM ${tables.pendingObjects}
+                  WHERE contribution_id=$1 AND object_key=$2 AND reconciliation_state='registered'`,
+                [snapshot.metadata.chunkRowId, snapshot.metadata.objectKey],
+              );
+              if (rowCount(removed) !== 1) throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
+            }
             return { contributionId: row.id, manifestId, chunkId: chunk.chunkId, replay: true };
           }
           if (manifest.state !== "staged") {

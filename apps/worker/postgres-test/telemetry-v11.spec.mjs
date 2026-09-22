@@ -298,6 +298,29 @@ it("runs manifest, chunk, journal, ready-vector and replay through PostgreSQL", 
     .toBeTypeOf("string");
 });
 
+it("replays an exact chunk without creating a fresh journal or admission row", async () => {
+  const principal = { participantId, deviceId };
+  const prepared = makeChunk(1);
+  const before = (await pool.query(`SELECT accepted_count FROM "${primarySchema}".telemetry_v1_chunk_admission_windows
+    WHERE participant_id=$1 AND device_id=$2 AND window_day=clock_timestamp()::date`, [participantId, deviceId])).rows[0]?.accepted_count;
+  const envelopeDigest = digest("v11-envelope-fresh-replay");
+  const upload = await claimUpload(9, envelopeDigest);
+  const metadata = {
+    chunkRowId: `chunk:${randomBytes(16).toString("hex")}`,
+    objectKey: "telemetry/v11/fresh-replay",
+    envelopeDigest,
+    deviceUploadAuthorizationId: upload.id,
+    uploadAuthorizationLeaseExpiresAt: upload.lease,
+  };
+  await expect(backend.persistChunk(principal, prepared.chunk, metadata)).resolves.toMatchObject({ replay: true });
+  expect((await pool.query(`SELECT count(*)::int AS n FROM "${primarySchema}".pending_objects WHERE contribution_id=$1`, [metadata.chunkRowId])).rows[0].n).toBe(0);
+  expect((await pool.query(`SELECT accepted_count FROM "${primarySchema}".telemetry_v1_chunk_admission_windows
+    WHERE participant_id=$1 AND device_id=$2 AND window_day=clock_timestamp()::date`, [participantId, deviceId])).rows[0]?.accepted_count)
+    .toBe(before);
+  expect((await pool.query(`SELECT state FROM "${primarySchema}".device_upload_authorizations WHERE id=$1`, [upload.id])).rows[0].state)
+    .toBe("consuming");
+});
+
 it("rejects stale lease and stale consent without leaving a partial chunk or journal", async () => {
   const principal = { participantId, deviceId };
   const prepared = makeChunk(2, "2026-09-20");
