@@ -141,6 +141,7 @@ owner-only permissions. Important entries include:
 | Prepared contribution/review directories and queue | Exact local review, delivery, retry, and audit state. | Retained for replay-safe completion, explicit cleanup, or local erase. |
 | Diagnostics log | Fixed error/status codes and opaque support references. | Bounded, content-free local diagnostics only. |
 | Electron crash capture (macOS opt-in) | Native Crashpad dumps under Electron's user-data directory, separate from the content-free doctor report. Dumps may contain process memory and private data. | Off by default; stored locally only after an explicit preference change and subsequent launch. TiboTattle does not upload or automatically erase dumps. |
+| Offline private crash-evidence export (explicit CLI action) | Bounded copies of matching Apple crash reports and local companion diagnostic log generations; Crashpad dumps only with a second explicit flag. Originals can contain private paths, text, and process memory. | New owner-only directory chosen by the user, outside the source checkout. No automatic upload, issue attachment, or deletion of originals; a private handoff requires a separate owner decision. |
 | WebKit website data | Loopback dashboard session/local storage and short-lived hosted web session state. | Cleared by **Erase local data**; provider pages use the system browser. |
 
 The derived accounting cache inside collector state uses compact JSON with a
