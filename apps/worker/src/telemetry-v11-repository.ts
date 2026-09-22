@@ -140,9 +140,27 @@ export async function existingTelemetryV11StagedChunk(
 
 export async function persistTelemetryV11StagedChunk(
   db: D1Database, principal: TelemetryTransportPrincipal, value: unknown,
-  metadata: { chunkRowId: string; r2Key: string; envelopeDigest: string; deviceUploadAuthorizationId: string },
+  metadata: {
+    chunkRowId: string;
+    r2Key: string;
+    envelopeDigest: string;
+    deviceUploadAuthorizationId: string;
+    /** Exact lease returned by the upload claim, when using the backend port. */
+    uploadAuthorizationLeaseExpiresAt?: string;
+  },
   nowEpoch = Date.now(),
 ): Promise<{ contributionId: string; manifestId: string; chunkId: string; replay: boolean }> {
+  // Capture caller-owned inputs before validation performs asynchronous
+  // hashing. The transaction must use the original authority and lease
+  // identity even if a route handler reuses or mutates its request object.
+  principal = Object.freeze({ participantId: principal.participantId, deviceId: principal.deviceId });
+  metadata = Object.freeze({
+    chunkRowId: metadata.chunkRowId,
+    r2Key: metadata.r2Key,
+    envelopeDigest: metadata.envelopeDigest,
+    deviceUploadAuthorizationId: metadata.deviceUploadAuthorizationId,
+    uploadAuthorizationLeaseExpiresAt: metadata.uploadAuthorizationLeaseExpiresAt,
+  });
   const chunk = await validateTelemetryV11StagedChunk(value);
   const { stream, day, seq } = parseTelemetryV11ChunkId(chunk.chunkId);
   await assertTelemetryTransportWriteAllowed(db, principal, TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION);
@@ -156,15 +174,47 @@ export async function persistTelemetryV11StagedChunk(
     return { contributionId: existing.id, manifestId: manifest.id, chunkId: chunk.chunkId, replay: true };
   }
   const now = new Date(nowEpoch).toISOString();
-  const statements = [db.prepare(
-    `INSERT INTO telemetry_v11_chunks (
+  const exactLease = metadata.uploadAuthorizationLeaseExpiresAt;
+  const insertChunkSql = exactLease === undefined
+    ? `INSERT INTO telemetry_v11_chunks (
       id, manifest_id, participant_id, device_id, stream, chunk_day, chunk_seq, chunk_id,
       chunk_digest, envelope_digest, parser_version, record_count, r2_key,
       device_upload_authorization_id, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).bind(metadata.chunkRowId, manifest.id, principal.participantId, principal.deviceId, stream,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    : `INSERT INTO telemetry_v11_chunks (
+      id, manifest_id, participant_id, device_id, stream, chunk_day, chunk_seq, chunk_id,
+      chunk_digest, envelope_digest, parser_version, record_count, r2_key,
+      device_upload_authorization_id, created_at
+    ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM device_upload_authorizations a
+         WHERE a.id = ? AND a.participant_id = ? AND a.issued_by_device_id = ?
+           AND a.state = 'consuming' AND a.envelope_digest = ?
+           AND a.consume_lease_expires_at = ?
+           AND a.consumed_contribution_id = ?
+           AND a.consume_lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+           AND a.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      )`;
+  const insertChunkValues = [metadata.chunkRowId, manifest.id, principal.participantId, principal.deviceId, stream,
     day, seq, chunk.chunkId, chunk.chunkDigest, metadata.envelopeDigest, chunk.parserVersion,
-    chunk.records.length, metadata.r2Key, metadata.deviceUploadAuthorizationId, now)];
+    chunk.records.length, metadata.r2Key, metadata.deviceUploadAuthorizationId, now];
+  const leaseFence = exactLease === undefined ? null : db.prepare(
+    `UPDATE device_upload_authorizations
+        SET consumed_contribution_id = ?
+      WHERE id = ? AND participant_id = ? AND issued_by_device_id = ?
+        AND state = 'consuming' AND envelope_digest = ?
+        AND consume_lease_expires_at = ?
+        AND consume_lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+  ).bind(metadata.chunkRowId, metadata.deviceUploadAuthorizationId, principal.participantId,
+    principal.deviceId, metadata.envelopeDigest, exactLease);
+  const statements = [
+    ...(leaseFence === null ? [] : [leaseFence]),
+    exactLease === undefined
+      ? db.prepare(insertChunkSql).bind(...insertChunkValues)
+      : db.prepare(insertChunkSql).bind(...insertChunkValues, metadata.deviceUploadAuthorizationId,
+        principal.participantId, principal.deviceId, metadata.envelopeDigest, exactLease, metadata.chunkRowId),
+  ];
   for (const record of chunk.records) {
     const anchor = telemetryV11RecordAnchor(stream, record);
     const legacy = telemetryV11LegacyProjection(stream, record);
@@ -183,11 +233,26 @@ export async function persistTelemetryV11StagedChunk(
         AND NOT EXISTS (SELECT 1 FROM telemetry_v11_chunks c WHERE c.manifest_id = ?
           AND c.record_count != (SELECT count(*) FROM telemetry_v11_records r WHERE r.chunk_id = c.id))`,
   ).bind(now, manifest.id, manifest.id, manifest.id));
-  try { await db.batch(statements); }
+  try {
+    await db.batch(statements);
+  }
   catch (error) {
     const replay = await existingTelemetryV11StagedChunk(db, principal, chunk);
     if (replay?.chunk_digest === chunk.chunkDigest && replay.record_count === chunk.records.length) {
       return { contributionId: replay.id, manifestId: manifest.id, chunkId: chunk.chunkId, replay: true };
+    }
+    if (exactLease !== undefined) {
+      const authorization = await db.prepare(
+        `SELECT 1 FROM device_upload_authorizations
+          WHERE id = ? AND participant_id = ? AND issued_by_device_id = ?
+            AND state = 'consuming' AND envelope_digest = ?
+            AND consume_lease_expires_at = ?
+            AND consumed_contribution_id = ?
+            AND consume_lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+      ).bind(metadata.deviceUploadAuthorizationId, principal.participantId, principal.deviceId,
+        metadata.envelopeDigest, exactLease, metadata.chunkRowId).first<{ 1: number }>();
+      if (!authorization) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
     }
     throw mapStagingError(error);
   }
