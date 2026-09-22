@@ -37,6 +37,7 @@ remains accountable for release wording, validation, signing, and publication.
 
 0.1.24 release preparation is in progress. The final candidate requires telemetry
 v1.2 and the Standard/Fast timing correction before source freeze.
+See the [candidate release notes](./release-notes/0.1.24.md).
 
 - Enable local Model performance on Windows, following protected-reader and
   packaged-source qualification in [PR #199](https://github.com/adamallcock/tibotattle/pull/199).
