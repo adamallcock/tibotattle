@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   diagnoseDesktopCrash,
+  exportPrivateCrashEvidence,
   parseAppleCrashReport,
   renderDesktopCrashDiagnosis,
 } from "../scripts/diagnose-desktop-crash.mjs";
@@ -31,6 +34,116 @@ test("Apple IPS parser retains only closed crash fields and safe frame symbols",
   });
   assert.equal(parseAppleCrashReport(IPS.replaceAll("TiboTattle", "OtherApp"), ".ips"), null);
   assert.equal(parseAppleCrashReport("{invalid", ".ips"), null);
+  const verbose = parseAppleCrashReport(IPS, ".ips", { verbose: true });
+  assert.equal(verbose.reportFormat, "ips");
+  assert.equal(verbose.appVersion, null);
+  assert.equal(verbose.crashedThreadIndex, 0);
+});
+
+test("verbose Apple parsing expands only bounded frames and validated version fields", () => {
+  const report = `${JSON.stringify({ app_name: "TiboTattle" })}\n${JSON.stringify({
+    procName: "TiboTattle",
+    exception: { type: "EXC_CRASH" }, termination: { namespace: "SIGNAL", code: 6 },
+    bundleInfo: { CFBundleShortVersionString: "0.1.23" },
+    osVersion: { train: "macOS 26.7" },
+    faultingThread: 0,
+    threads: [{ frames: Array.from({ length: 25 }, (_, index) => ({ symbol: `Frame${index}` })) }],
+  })}`;
+  assert.equal(parseAppleCrashReport(report, ".ips").topFrames.length, 5);
+  const verbose = parseAppleCrashReport(report, ".ips", { verbose: true });
+  assert.equal(verbose.topFrames.length, 20);
+  assert.equal(verbose.topFrames.at(-1), "Frame19");
+  assert.equal(verbose.appVersion, "0.1.23");
+  assert.equal(verbose.osVersion, "macOS 26.7");
+});
+
+test("explicit private export copies only bounded app evidence into a new owner-only directory", async () => {
+  const homeDirectory = await mkdtemp(join(tmpdir(), "tibotattle-private-doctor-"));
+  try {
+    const reports = join(homeDirectory, "Library", "Logs", "DiagnosticReports");
+    const state = join(homeDirectory, "Library", "Application Support", "TiboTattle", "companion-state");
+    const dumps = join(homeDirectory, "Library", "Application Support", "TiboTattle", "Crashpad", "pending");
+    await Promise.all([mkdir(reports, { recursive: true }), mkdir(state, { recursive: true }),
+      mkdir(dumps, { recursive: true })]);
+    await writeFile(join(reports, "TiboTattle-2026-09-21.ips"), IPS);
+    await writeFile(join(reports, "OtherApp-2026-09-21.ips"), IPS);
+    await symlink(join(reports, "TiboTattle-2026-09-21.ips"), join(reports, "TiboTattle-link.ips"));
+    await writeFile(join(state, "diagnostics-v0.1.log"), "synthetic private log\n", { mode: 0o600 });
+    await writeFile(join(dumps, "synthetic.dmp"), Buffer.from("synthetic private memory"), { mode: 0o600 });
+    for (let index = 1; index <= 4; index += 1) {
+      await writeFile(join(dumps, `synthetic-${index}.dmp`),
+        Buffer.from("synthetic private memory"), { mode: 0o600 });
+    }
+
+    const directory = join(homeDirectory, "private-evidence");
+    const basic = await exportPrivateCrashEvidence({ directory, homeDirectory, platform: "darwin", hours: 1 });
+    assert.deepEqual({ status: basic.status, includedFiles: basic.includedFiles, includedDumps: basic.includedDumps },
+      { status: "created", includedFiles: 2, includedDumps: 0 });
+    assert.equal((await lstat(directory)).mode & 0o777, 0o700);
+    assert.equal((await lstat(join(directory, "apple-report-01.ips"))).mode & 0o777, 0o600);
+    assert.equal(await readFile(join(directory, "apple-report-01.ips"), "utf8"), IPS);
+    assert.equal(await readFile(join(directory, "companion-stable-current.log"), "utf8"),
+      "synthetic private log\n");
+    const manifest = JSON.parse(await readFile(join(directory, "manifest.json"), "utf8"));
+    assert.equal(manifest.includesCrashpadDumps, false);
+    assert.deepEqual(manifest.files.map((file) => file.name),
+      ["apple-report-01.ips", "companion-stable-current.log"]);
+    assert.doesNotMatch(JSON.stringify(manifest), /private memory|\/Users\/private|TiboTattle-link/u);
+    await assert.rejects(exportPrivateCrashEvidence({ directory, homeDirectory, platform: "darwin", hours: 1 }));
+
+    const withDumps = join(homeDirectory, "private-with-dumps");
+    const complete = await exportPrivateCrashEvidence({
+      directory: withDumps, homeDirectory, platform: "darwin", hours: 1, includeDumps: true,
+    });
+    assert.equal(complete.includedDumps, 4);
+    assert.ok(complete.skippedFiles >= 1);
+    assert.deepEqual(await readFile(join(withDumps, "crashpad-stable-pending-01.dmp")),
+      Buffer.from("synthetic private memory"));
+    await assert.rejects(exportPrivateCrashEvidence({
+      directory: join(process.cwd(), "private-evidence"), homeDirectory, platform: "darwin", hours: 1,
+    }), /private destination is invalid/u);
+    const linkedParent = join(homeDirectory, "linked-parent");
+    await symlink(homeDirectory, linkedParent);
+    await assert.rejects(exportPrivateCrashEvidence({
+      directory: join(linkedParent, "private-evidence"), homeDirectory, platform: "darwin", hours: 1,
+    }), /private destination parent is unsafe/u);
+    if (process.platform === "darwin") {
+      const cliDirectory = join(homeDirectory, "cli-private-evidence");
+      const cli = spawnSync(process.execPath, [
+        fileURLToPath(new URL("../scripts/diagnose-desktop-crash.mjs", import.meta.url)),
+        "--hours", "1", "--verbose", "--json", "--export-private", cliDirectory,
+      ], { env: { ...process.env, HOME: homeDirectory }, encoding: "utf8" });
+      assert.equal(cli.status, 0, cli.stderr);
+      const output = JSON.parse(cli.stdout);
+      assert.equal(output.privateEvidence.status, "created");
+      assert.equal(output.privateEvidence.includedDumps, 0);
+      assert.doesNotMatch(cli.stdout, /\/Users\/private|synthetic private memory|cli-private-evidence/u);
+      assert.equal(await readFile(join(cliDirectory, "apple-report-01.ips"), "utf8"), IPS);
+    }
+  } finally {
+    await rm(homeDirectory, { recursive: true, force: true });
+  }
+});
+
+test("private export preserves a matching Apple report when its body is not yet parseable", async () => {
+  const homeDirectory = await mkdtemp(join(tmpdir(), "tibotattle-private-doctor-"));
+  try {
+    const reports = join(homeDirectory, "Library", "Logs", "DiagnosticReports");
+    await mkdir(reports, { recursive: true });
+    const raw = `${JSON.stringify({ app_name: "TiboTattle" })}\n{new-apple-format`;
+    await writeFile(join(reports, "TiboTattle-new-format.ips"), raw);
+    const directory = join(homeDirectory, "private-evidence");
+    const result = await exportPrivateCrashEvidence({
+      directory, homeDirectory, platform: "darwin", hours: 1,
+    });
+    assert.equal(result.unparsedReportsIncluded, 1);
+    assert.equal(result.includedFiles, 1);
+    assert.equal(await readFile(join(directory, "apple-report-01.ips"), "utf8"), raw);
+    const manifest = JSON.parse(await readFile(join(directory, "manifest.json"), "utf8"));
+    assert.equal(manifest.unparsedReportsIncluded, 1);
+  } finally {
+    await rm(homeDirectory, { recursive: true, force: true });
+  }
 });
 
 test("legacy crash parser selects crashed-thread frames without report paths", () => {
@@ -109,8 +222,45 @@ test("offline doctor reports missing Apple evidence honestly", async () => {
     assert.equal(result.localCapture[0].capturePreference, "missing");
     assert.match(renderDesktopCrashDiagnosis(result), /Absence of a report does not rule out a crash/u);
     assert.deepEqual(await diagnoseDesktopCrash({ platform: "linux" }), {
-      schemaVersion: "tibotattle-offline-crash-doctor-v1", status: "unsupported_platform",
+      schemaVersion: "tibotattle-offline-crash-doctor-v2", status: "unsupported_platform",
     });
+  } finally {
+    await rm(homeDirectory, { recursive: true, force: true });
+  }
+});
+
+test("verbose mode reads only validated companion diagnostic notes", async () => {
+  const homeDirectory = await mkdtemp(join(tmpdir(), "tibotattle-offline-doctor-"));
+  try {
+    const state = join(homeDirectory, "Library", "Application Support", "TiboTattle", "companion-state");
+    await mkdir(state, { recursive: true });
+    const recordedAt = new Date().toISOString();
+    const safe = {
+      schemaVersion: "local-diagnostic-note-v0.1", recordedAt,
+      reference: "TT-7QF3K2", surface: "local_refresh",
+      code: "refresh_in_progress", requestId: "",
+      step: "data_store", detail: "snapshot_unavailable",
+      measurements: { baselineRssMib: 300, observedRssMib: 450, ceilingRssMib: 500 },
+    };
+    await writeFile(join(state, "diagnostics-v0.1.log"), [
+      JSON.stringify(safe),
+      JSON.stringify({ ...safe, code: "/Users/private/secret" }),
+      JSON.stringify({ ...safe, privatePath: "/Users/private/secret" }),
+      "",
+    ].join("\n"), { mode: 0o600 });
+    const summary = await diagnoseDesktopCrash({ homeDirectory, platform: "darwin", hours: 1 });
+    assert.equal(Object.hasOwn(summary, "diagnosticNotes"), false);
+    const verbose = await diagnoseDesktopCrash({ homeDirectory, platform: "darwin", hours: 1, verbose: true });
+    assert.equal(verbose.mode, "verbose");
+    assert.equal(verbose.diagnosticNotes[0].status, "available");
+    assert.equal(verbose.diagnosticNotes[0].invalidLines, 2);
+    assert.equal(verbose.diagnosticNotes[0].notes.length, 1);
+    assert.equal(verbose.diagnosticNotes[0].notes[0].baselineRssMib, 300);
+    const output = renderDesktopCrashDiagnosis(verbose);
+    assert.match(output, /TT-7QF3K2 local_refresh refresh_in_progress/u);
+    assert.match(output, /rss_mib=300\/450\/500/u);
+    assert.doesNotMatch(output, /private|secret|\/Users/u);
+    assert.doesNotMatch(JSON.stringify(verbose), /private|secret|\/Users/u);
   } finally {
     await rm(homeDirectory, { recursive: true, force: true });
   }

@@ -334,7 +334,8 @@ an editable GitHub support issue. On macOS, local crash capture is a separate
 off-by-default choice that takes effect after restart. See [support](../SUPPORT.md)
 before sharing a native report. If the app will not open, the source checkout's
 independent macOS crash doctor can inspect Apple reports without launching it;
-the support page gives the exact command.
+the support page gives the exact command, a more detailed `--verbose` mode, and
+an explicitly requested local export for private evidence review.
 
 Trends shows three linked views: **Allowance and activity**, the **three-hour
 observed versus calculated comparison**, and **Cumulative drift**. The first
