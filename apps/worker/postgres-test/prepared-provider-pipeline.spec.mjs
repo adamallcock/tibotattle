@@ -16,6 +16,7 @@ import {
 import {
   createProviderV1QuotaReader,
   createProviderV1PreparedEvidence,
+  ensurePreparedV1WindowFromProviderDays,
   ensurePreparedV1WindowFromProvider,
   V1_PREPARED_READER_POLICY,
 } from "../src/prepared-v1-evidence.ts";
@@ -212,6 +213,92 @@ async function seedCanonicalV1({ includeNumericTieRows = false } = {}) {
   }
 }
 
+async function seedCanonicalSecondDay() {
+  const client = await pool.connect();
+  try {
+    await client.query(`SET search_path TO ${primarySchema}, pg_catalog`);
+    const secondDay = "2026-09-20";
+    const now = "2026-09-20T00:00:00.000Z";
+    const secret = Buffer.alloc(32, 7);
+    await client.query(`
+      INSERT INTO device_upload_authorizations(id,participant_id,issued_by_device_id,secret_hash,
+        envelope_digest,body_bytes,content_type,issued_at,expires_at)
+      VALUES('pipeline-day20-auth',$1,$2,$3,$4,1,'application/json',$5,$6)`,
+    [participantId, deviceId, secret, digest("day20-quota-envelope"), now, "2027-01-01T00:00:00.000Z"]);
+    await client.query(`INSERT INTO pending_objects(contribution_id,object_key)
+      VALUES($1,$2)`, ["pipeline-day20-quota-chunk", "pipeline-day20-quota-object"]);
+    await client.query(`
+      INSERT INTO telemetry_v1_chunks(id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,
+        chunk_digest,envelope_digest,parser_version,record_count,accepted_record_count,r2_key,
+        device_upload_authorization_id,created_at)
+      VALUES($1,$2,$3,'quota',$4,0,1,$5,$6,'pipeline-parser',3,3,$7,$8,$9)`,
+    ["pipeline-day20-quota-chunk", participantId, deviceId, secondDay,
+      digest("pipeline-day20-quota-chunk"), digest("day20-quota-envelope"),
+      "pipeline-day20-quota-object", "pipeline-day20-auth", now]);
+    for (let index = 1; index <= 3; index += 1) {
+      const observedAt = `2026-09-20T00:00:0${index}.000Z`;
+      await client.query(`
+        INSERT INTO telemetry_v1_records(chunk_row_id,participant_id,device_id,stream,occurrence_id,
+          observed_at,observed_day,provider,model_id,plan_type,plan_variant,limit_id,slot,
+          used_percent,window_duration_minutes,resets_at,record_json)
+        VALUES($1,$2,$3,'quota',$4,$5,$6,'openai_codex',NULL,'plus','standard','codex','weekly',$7,10080,$8,$9::jsonb)`,
+      ["pipeline-day20-quota-chunk", participantId, deviceId, `day20-quota-${index}`,
+        observedAt, secondDay, 10 + index, "2026-09-21T00:00:00.000Z",
+        JSON.stringify({ occurrence_id: `day20-quota-${index}` })]);
+    }
+    await client.query(`
+      INSERT INTO device_upload_authorizations(id,participant_id,issued_by_device_id,secret_hash,
+        envelope_digest,body_bytes,content_type,issued_at,expires_at)
+      VALUES('pipeline-day20-usage-auth',$1,$2,$3,$4,1,'application/json',$5,$6)`,
+    [participantId, deviceId, secret, digest("day20-usage-envelope"), now, "2027-01-01T00:00:00.000Z"]);
+    await client.query(`INSERT INTO pending_objects(contribution_id,object_key)
+      VALUES($1,$2)`, ["pipeline-day20-usage-chunk", "pipeline-day20-usage-object"]);
+    await client.query(`
+      INSERT INTO telemetry_v1_chunks(id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,
+        chunk_digest,envelope_digest,parser_version,record_count,accepted_record_count,r2_key,
+        device_upload_authorization_id,created_at)
+      VALUES($1,$2,$3,'usage',$4,1,1,$5,$6,'pipeline-parser',$7,$7,$8,$9,$10)`,
+    ["pipeline-day20-usage-chunk", participantId, deviceId, secondDay, digest("pipeline-day20-usage-chunk"),
+      digest("day20-usage-envelope"), 200, "pipeline-day20-usage-object", "pipeline-day20-usage-auth", now]);
+    await client.query(`
+      INSERT INTO device_upload_authorizations(id,participant_id,issued_by_device_id,secret_hash,
+        envelope_digest,body_bytes,content_type,issued_at,expires_at)
+      VALUES('pipeline-day20-usage-auth-2',$1,$2,$3,$4,1,'application/json',$5,$6)`,
+    [participantId, deviceId, secret, digest("day20-usage-envelope-2"), now, "2027-01-01T00:00:00.000Z"]);
+    await client.query(`INSERT INTO pending_objects(contribution_id,object_key)
+      VALUES($1,$2)`, ["pipeline-day20-usage-chunk-2", "pipeline-day20-usage-object-2"]);
+    await client.query(`
+      INSERT INTO telemetry_v1_chunks(id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,
+        chunk_digest,envelope_digest,parser_version,record_count,accepted_record_count,r2_key,
+        device_upload_authorization_id,created_at)
+      VALUES($1,$2,$3,'usage',$4,2,1,$5,$6,'pipeline-parser',57,57,$7,$8,$9)`,
+    ["pipeline-day20-usage-chunk-2", participantId, deviceId, secondDay, digest("pipeline-day20-usage-chunk-2"),
+      digest("day20-usage-envelope-2"), "pipeline-day20-usage-object-2", "pipeline-day20-usage-auth-2", now]);
+    const baseUsage = {
+      schemaVersion: "usage-event-v1.0", sessionUuid: "pipeline-day20-session", provider: "openai_codex",
+      modelId: "gpt-6-astra", speedMode: "standard", apiServiceTier: "unknown", surface: "local_interactive_unclassified",
+      billingSurface: "chatgpt_subscription", reasoningEffort: "medium", agentScope: "root", outcome: "completed",
+      totalInputContextTokens: null,
+      components: { inputUncachedTokens: 1000, inputCacheReadTokens: 0, inputCacheWriteTokens: 0,
+        outputTextTokens: 1000, outputReasoningTokens: 0, outputCombinedTokens: 1000 },
+    };
+    for (let index = 1; index <= 257; index += 1) {
+      const minute = Math.floor((index - 1) / 60);
+      const second = (index - 1) % 60 + 1;
+      const observedAt = `2026-09-20T00:${String(minute).padStart(2, "0")}:${String(second).padStart(2, "0")}.000Z`;
+      const usage = { ...baseUsage, eventId: `pipeline-day20-usage-${index}`, eventTime: observedAt };
+      await client.query(`
+        INSERT INTO telemetry_v1_records(chunk_row_id,participant_id,device_id,stream,occurrence_id,
+          observed_at,observed_day,provider,model_id,session_uuid,record_json)
+        VALUES($1,$2,$3,'usage',$4,$5,$6,'openai_codex','gpt-6-astra',$7,$8::jsonb)`,
+      [index <= 200 ? "pipeline-day20-usage-chunk" : "pipeline-day20-usage-chunk-2", participantId, deviceId, `day20-usage-${index}`,
+        observedAt, secondDay, "pipeline-day20-session", JSON.stringify(usage)]);
+    }
+  } finally {
+    client.release();
+  }
+}
+
 it("reads canonical v1, prepares immutable pages, and runs the existing quota codec", async () => {
   await seedCanonicalV1({ includeNumericTieRows: true });
   const source = createPostgresStorageSource(pool, { primarySchema, ledgerSchema: "tibotattle_ledger" });
@@ -323,6 +410,96 @@ it("reads canonical v1, prepares immutable pages, and runs the existing quota co
   await pool.query(`UPDATE ${primarySchema}.analytics_owner_state SET revision=revision+1 WHERE source_id=$1 AND owner_digest=$2`, [sourceId, ownerDigest]);
   await expect(source.readPage({ pin: sourcePin, stream: "quota", deviceId, cursor: null, limit: 1 }))
     .resolves.toMatchObject({ status: "stale", rows: [] });
+});
+
+it("prepares an explicit multi-day window and preserves resumed finisher parity", async () => {
+  await seedCanonicalV1();
+  await seedCanonicalSecondDay();
+  const source = createPostgresStorageSource(pool, { primarySchema, ledgerSchema: "tibotattle_ledger" });
+  const firstPin = await source.readPin({ sourceId, sourceNamespace: namespace, ownerDigest, day: "2026-09-20", method });
+  const secondPin = await source.readPin({ sourceId, sourceNamespace: namespace, ownerDigest, day, method });
+  expect(firstPin).not.toBeNull();
+  expect(secondPin).not.toBeNull();
+  if (!firstPin || !secondPin) return;
+  expect(firstPin.inputRevision).toBe(secondPin.inputRevision);
+  const prepared = createPostgresPreparedSourceStore(pool, { primarySchema, ledgerSchema: "tibotattle_ledger" });
+  const windowDays = [
+    { pin: firstPin, deviceId, generation: "pipeline-day20-quota", usageGeneration: "pipeline-day20-usage",
+      expectedQuotaRows: 3, expectedUsageRows: 257 },
+    { pin: secondPin, deviceId, generation: "pipeline-day21-quota", usageGeneration: "pipeline-day21-usage",
+      expectedQuotaRows: 8, expectedUsageRows: 1 },
+  ];
+  let preparation;
+  let invocations = 0;
+  do {
+    preparation = await ensurePreparedV1WindowFromProviderDays({
+      source, prepared, days: windowDays, maxPages: 2, pageSize: 256,
+      deadlineMs: Date.now() + 60_000,
+    });
+    invocations += 1;
+  } while (preparation.status === "deferred" && invocations < 16);
+  expect(preparation.status).toBe("complete");
+  expect(invocations).toBeGreaterThan(1);
+  expect(preparation.days).toHaveLength(2);
+  if (preparation.status !== "complete" || !preparation.preparedEvidence) return;
+  const evidence = preparation.preparedEvidence;
+  const usageRows = await evidence.usageReader.readPage("2026-09-20T00:00:00.000Z", 0, 5000);
+  expect(usageRows).toHaveLength(258);
+  expect(usageRows.some((row) => row.preparedPrice?.costNanousd > 0)).toBe(true);
+  expect(evidence.usageBins.totalRowCount).toBe(258);
+  expect(evidence.usageBins.fragmentCount).toBeGreaterThan(0);
+
+  const preparedSource = {
+    store: prepared, pin: firstPin, generation: "pipeline-day20-quota",
+    readerPolicy: V1_PREPARED_READER_POLICY,
+    sources: preparation.days.map((preparedDay) => ({ pin: preparedDay.pin, generation: preparedDay.generation })),
+  };
+  const quotaReader = createProviderV1QuotaReader(preparedSource);
+  const quotaPlans = await quotaReader.readPlanPage({ observedAt: "2026-09-19T23:59:59.000Z", id: 0 }, 128);
+  const firstRawPage = await prepared.readPage({ pin: firstPin, generation: "pipeline-day20-quota",
+    readerPolicy: V1_PREPARED_READER_POLICY, cursor: null, limit: 128 });
+  const secondRawPage = await prepared.readPage({ pin: secondPin, generation: "pipeline-day21-quota",
+    readerPolicy: V1_PREPARED_READER_POLICY, cursor: null, limit: 128 });
+  expect(firstRawPage.rows).toHaveLength(3);
+  expect(secondRawPage.rows).toHaveLength(8);
+  // The existing compression algorithm retains first/last rows per plan run;
+  // eleven physical rows therefore produce four durable plan anchors here.
+  expect(quotaPlans).toHaveLength(4);
+  expect(quotaPlans.some((row) => row.observed_day === "2026-09-20")).toBe(true);
+  expect(quotaPlans.some((row) => row.observed_day === day)).toBe(true);
+
+  const identity = {
+    participantId, inputRevision: firstPin.inputRevision, inputFingerprint: firstPin.dependencyDigest,
+    sourceKind: "v1", sourceMethodVersion: firstPin.method, fixedNow: "2026-09-21T23:59:59.999Z",
+    observedAtCutoff: "2026-09-21T23:59:59.999Z", resetsAtCutoff: "2026-09-21T00:00:00.000Z",
+    windowMinutes: 10080, maxQuotaRows: 120,
+  };
+  const workStore = createPostgresAnalyticalWorkStore(pool, { primarySchema, ledgerSchema: "tibotattle_ledger" });
+  const workIdentity = communityAnalysisProviderIdentity(identity, firstPin);
+  const sourceCurrent = async () => {
+    for (const [pin, selectedDevice] of [[firstPin, deviceId], [secondPin, deviceId]]) {
+      const page = await source.readPage({ pin, stream: "quota", deviceId: selectedDevice, cursor: null, limit: 1 });
+      if (page.status !== "available" || JSON.stringify(page.pin) !== JSON.stringify(pin)) return false;
+    }
+    return true;
+  };
+  const run = (remainingQueries) => advanceCommunityAnalysisRunWithProvider({
+    identity, workStore, workIdentity, preparedSource,
+    winningDayDevices: new Map([["2026-09-20", deviceId], [day, deviceId]]),
+    leaseMs: 60_000, sourceCurrent,
+    budget: { remainingQueries, reserveQueries: 0, deadlineMs: Date.now() + 60_000 },
+  });
+  const firstAttempt = await run(8);
+  expect(["deferred", "ready"]).toContain(firstAttempt.status);
+  let resumed = firstAttempt;
+  for (let attempt = 0; resumed.status === "deferred" && attempt < 8; attempt += 1) resumed = await run(256);
+  expect(resumed.status).toBe("ready");
+  if (resumed.status !== "ready") return;
+  const resumedEvidence = JSON.stringify(resumed.evidence);
+  await pool.query(`TRUNCATE ${primarySchema}.analytics_analysis_work_parts, ${primarySchema}.analytics_analysis_work_heads`);
+  const uninterrupted = await run(256);
+  expect(uninterrupted.status).toBe("ready");
+  if (uninterrupted.status === "ready") expect(JSON.stringify(uninterrupted.evidence)).toBe(resumedEvidence);
 });
 
 it("fails closed when an active newer domain supersedes the v1 source", async () => {

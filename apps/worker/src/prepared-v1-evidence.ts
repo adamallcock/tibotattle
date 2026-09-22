@@ -20,6 +20,7 @@ import type {
   PreparedSourceOutput,
   PreparedSourceOutputKind,
   PreparedSourceStream,
+  PreparedSourceWindow,
   StorageSourcePage,
   StorageSourcePin,
   StorageSourceRecord,
@@ -527,6 +528,10 @@ export interface ProviderPreparedV1QuotaSource {
   readonly generation: string;
   readonly readerPolicy: string;
   readonly stream?: "quota";
+  /** Optional ordered multi-day generations. When present, `pin` and
+   * `generation` remain the first-day compatibility identity while readers
+   * merge the explicitly sealed window. */
+  readonly sources?: readonly PreparedSourceWindow[];
 }
 
 export interface ProviderV1PreparationOptions {
@@ -555,6 +560,46 @@ export interface ProviderV1PreparationResult {
   readonly head: Awaited<ReturnType<PreparedSourceStore["begin"]>>;
   readonly usageHead?: Awaited<ReturnType<PreparedSourceStore["begin"]>>;
   readonly usageGeneration: string;
+  readonly preparedEvidence?: V1PreparedFinishEvidence;
+}
+
+/** A day-specific canonical pin and its independently sealed quota/usage
+ * generations. The vector is deliberately explicit: a caller cannot encode
+ * stream identity in a generation string or silently skip a day. */
+export interface ProviderV1PreparationWindowDay {
+  readonly pin: StorageSourcePin;
+  readonly deviceId: string;
+  readonly generation: string;
+  readonly usageGeneration?: string;
+  readonly expectedQuotaRows?: number;
+  readonly expectedUsageRows?: number;
+}
+
+export interface ProviderV1PreparationWindowOptions {
+  readonly source: StorageSourceStore;
+  readonly prepared: PreparedSourceStore;
+  readonly days: readonly ProviderV1PreparationWindowDay[];
+  readonly readerPolicy?: string;
+  /** One shared budget across all day and stream pages. */
+  readonly maxPages: number;
+  readonly pageSize?: number;
+  readonly deadlineMs: number;
+  readonly now?: () => number;
+}
+
+export interface ProviderV1PreparationWindowDayResult {
+  readonly pin: StorageSourcePin;
+  readonly deviceId: string;
+  readonly generation: string;
+  readonly usageGeneration: string;
+  readonly quotaHead: Awaited<ReturnType<PreparedSourceStore["begin"]>>;
+  readonly usageHead?: Awaited<ReturnType<PreparedSourceStore["begin"]>>;
+}
+
+export interface ProviderV1PreparationWindowResult {
+  readonly status: "complete" | "deferred";
+  readonly pagesRun: number;
+  readonly days: readonly ProviderV1PreparationWindowDayResult[];
   readonly preparedEvidence?: V1PreparedFinishEvidence;
 }
 
@@ -866,6 +911,86 @@ export async function ensurePreparedV1WindowFromProvider(
     usageHead, usageGeneration, preparedEvidence });
 }
 
+/** Prepare a bounded vector of day generations with one invocation budget.
+ * Each day still uses the existing quota/usage preparation algorithm and CAS;
+ * this coordinator only sequences those real operations and then exposes the
+ * merged finisher reader. A deferred day is returned with its durable heads so
+ * the next invocation resumes from the same generations. */
+export async function ensurePreparedV1WindowFromProviderDays(
+  options: ProviderV1PreparationWindowOptions,
+): Promise<ProviderV1PreparationWindowResult> {
+  const now = options.now ?? Date.now;
+  if (options.days.length < 1 || options.days.length > 128
+      || !Number.isSafeInteger(options.maxPages) || options.maxPages < 1 || options.maxPages > MAX_PAGES
+      || !Number.isSafeInteger(options.pageSize ?? V1_PREPARATION_PAGE_SIZE)
+      || (options.pageSize ?? V1_PREPARATION_PAGE_SIZE) < 1
+      || (options.pageSize ?? V1_PREPARATION_PAGE_SIZE) > V1_PREPARATION_PAGE_SIZE
+      || !Number.isFinite(options.deadlineMs)) throw new TypeError("provider v1 preparation window budget invalid");
+  const first = options.days[0]!;
+  const seenDays = new Set<string>();
+  const seenGenerations = new Set<string>();
+  for (const day of options.days) {
+    if (!/^\d{4}-\d{2}-\d{2}$/u.test(day.pin.day) || seenDays.has(day.pin.day)
+        || seenGenerations.has(day.generation) || !day.generation || day.generation.length > 256
+        || day.pin.sourceId !== first.pin.sourceId
+        || day.pin.sourceNamespace !== first.pin.sourceNamespace
+        || day.pin.ownerDigest !== first.pin.ownerDigest
+        || day.pin.inputRevision !== first.pin.inputRevision
+        || day.pin.ownerRevision !== first.pin.ownerRevision
+        || day.pin.method !== first.pin.method
+        || day.pin.authorityEpoch !== first.pin.authorityEpoch
+        || day.pin.sourceEpoch !== first.pin.sourceEpoch
+        || day.pin.sequence !== first.pin.sequence
+        || typeof day.deviceId !== "string" || day.deviceId.length === 0) {
+      throw new TypeError("provider v1 preparation window identity invalid");
+    }
+    seenDays.add(day.pin.day); seenGenerations.add(day.generation);
+  }
+  for (let index = 1; index < options.days.length; index += 1) {
+    if (options.days[index - 1]!.pin.day >= options.days[index]!.pin.day) {
+      throw new TypeError("provider v1 preparation window days must be ordered");
+    }
+  }
+  let pagesRun = 0;
+  const results: ProviderV1PreparationWindowDayResult[] = [];
+  for (const day of options.days) {
+    if (pagesRun >= options.maxPages || now() >= options.deadlineMs) {
+      return Object.freeze({ status: "deferred", pagesRun, days: Object.freeze(results) });
+    }
+    const result = await ensurePreparedV1WindowFromProvider({
+      source: options.source, prepared: options.prepared, pin: Object.freeze({ ...day.pin }),
+      deviceId: day.deviceId, generation: day.generation, readerPolicy: options.readerPolicy,
+      maxPages: Math.min(MAX_PAGES, options.maxPages - pagesRun), pageSize: options.pageSize,
+      deadlineMs: options.deadlineMs, now,
+      expectedQuotaRows: day.expectedQuotaRows, expectedUsageRows: day.expectedUsageRows,
+      usageGeneration: day.usageGeneration,
+    });
+    pagesRun += result.pagesRun;
+    results.push(Object.freeze({ pin: day.pin, deviceId: day.deviceId, generation: day.generation,
+      usageGeneration: result.usageGeneration, quotaHead: result.head, usageHead: result.usageHead }));
+    if (result.status !== "complete") {
+      return Object.freeze({ status: "deferred", pagesRun, days: Object.freeze(results) });
+    }
+  }
+  const sourceFingerprint = await sha256Hex(canonicalJson(options.days.map((day) => ({
+    sourceId: day.pin.sourceId, sourceNamespace: day.pin.sourceNamespace, ownerDigest: day.pin.ownerDigest,
+    day: day.pin.day, inputRevision: day.pin.inputRevision, ownerRevision: day.pin.ownerRevision,
+    dependencyDigest: day.pin.dependencyDigest, method: day.pin.method,
+    authorityEpoch: day.pin.authorityEpoch, sourceEpoch: day.pin.sourceEpoch, sequence: day.pin.sequence,
+  }))));
+  const preparedEvidence = await createProviderV1PreparedWindowEvidence({
+    store: options.prepared,
+    days: results.map((day) => ({ pin: day.pin, quotaGeneration: day.generation, usageGeneration: day.usageGeneration })),
+    sourceFingerprint,
+    readerPolicy: options.readerPolicy,
+  });
+  return Object.freeze({ status: "complete", pagesRun, days: Object.freeze(results), preparedEvidence });
+}
+
+/** More descriptive alias used by composition roots that expose the window
+ * as a source-preparation operation. */
+export const ensurePreparedV1WindowFromProviderWindow = ensurePreparedV1WindowFromProviderDays;
+
 function providerQuotaPayload(value: unknown, recordValue: StorageSourceRecord, operation: string): Record<string, unknown> {
   if (!record(value) || (value.stream !== undefined && value.stream !== "quota")
       || !safeCount(value.id) || value.id === 0 || String(value.id) !== recordValue.occurrenceId
@@ -903,6 +1028,101 @@ function fitOutputCursor(cursor: { observedAt: string; resetsAt: string; id: num
       : `${cursor.resetsAt}:${cursor.observedAt}:${numericOutputKey(cursor.id)}` };
 }
 
+function preparedWindowSources(source: ProviderPreparedV1QuotaSource): readonly PreparedSourceWindow[] {
+  const sources = source.sources ?? [{ pin: source.pin, generation: source.generation }];
+  if (sources.length < 1 || sources.length > 128) unavailable("control_invalid");
+  const seen = new Set<string>();
+  for (const item of sources) {
+    if (!item.generation || item.generation.length > 256
+        || item.pin.sourceId !== source.pin.sourceId
+        || item.pin.sourceNamespace !== source.pin.sourceNamespace
+        || item.pin.ownerDigest !== source.pin.ownerDigest
+        || !/^\d{4}-\d{2}-\d{2}$/u.test(item.pin.day)
+        || seen.has(`${item.pin.sourceId}\u0000${item.pin.ownerDigest}\u0000${item.pin.day}\u0000${item.generation}`)) {
+      unavailable("control_invalid");
+    }
+    seen.add(`${item.pin.sourceId}\u0000${item.pin.ownerDigest}\u0000${item.pin.day}\u0000${item.generation}`);
+  }
+  const first = sources[0]!;
+  if (first.pin.day !== source.pin.day || first.generation !== source.generation) {
+    unavailable("control_invalid");
+  }
+  return sources;
+}
+
+function preparedOutputBefore(left: PreparedSourceOutput, right: PreparedSourceOutput): number {
+  return left.index - right.index || left.key.localeCompare(right.key);
+}
+
+function preparedOutputAfter(output: PreparedSourceOutput, afterIndex: number, afterKey: string): boolean {
+  return output.index > afterIndex || output.index === afterIndex && output.key > afterKey;
+}
+
+/** Read one bounded merged page. PostgreSQL supplies the single snapshot
+ * window implementation; the fallback remains explicitly capped at twenty
+ * 256-row pages per source so a non-batched adapter cannot become an
+ * unbounded scan. */
+async function preparedOutputWindowPage(
+  source: ProviderPreparedV1QuotaSource,
+  stream: PreparedSourceStream,
+  kind: PreparedSourceOutputKind,
+  afterIndex: number,
+  afterKey: string,
+  limit: number,
+): Promise<readonly PreparedSourceOutput[]> {
+  const sources = preparedWindowSources(source);
+  if (!Number.isSafeInteger(afterIndex) || afterIndex < -1 || afterKey.length > 256
+      || !Number.isSafeInteger(limit) || limit < 1 || limit > 5_000) unavailable("control_invalid");
+  if (source.store.readOutputsWindow) {
+    const outputs = await source.store.readOutputsWindow({ sources, stream, kind,
+      afterIndex, afterKey, limit });
+    if (outputs.length > limit) unavailable("control_invalid");
+    return outputs;
+  }
+  const merged: PreparedSourceOutput[] = [];
+  for (const item of sources) {
+    let cursorIndex = afterIndex;
+    let cursorKey = afterKey;
+    const pageLimit = Math.min(256, limit);
+    for (let page = 0; page < 20 && merged.length < sources.length * limit; page += 1) {
+      const batch = await source.store.readOutputs({ pin: item.pin, generation: item.generation,
+        stream, kind, afterIndex: cursorIndex, afterKey: cursorKey, limit: pageLimit });
+      if (batch.length > pageLimit) unavailable("control_invalid");
+      for (const output of batch) {
+        if (output.stream !== stream || output.kind !== kind
+            || !preparedOutputAfter(output, afterIndex, afterKey)) unavailable("control_invalid");
+        merged.push(output);
+      }
+      if (batch.length < pageLimit) break;
+      const last = batch.at(-1);
+      if (!last || !preparedOutputAfter(last, cursorIndex, cursorKey)) unavailable("control_invalid");
+      cursorIndex = last.index; cursorKey = last.key;
+    }
+  }
+  merged.sort(preparedOutputBefore);
+  return Object.freeze(merged.slice(0, limit));
+}
+
+async function countPreparedWindowOutputs(
+  source: ProviderPreparedV1QuotaSource,
+  stream: PreparedSourceStream,
+  kind: PreparedSourceOutputKind,
+): Promise<number> {
+  const sources = preparedWindowSources(source);
+  if (source.store.countOutputsWindow) {
+    const count = await source.store.countOutputsWindow({ sources, stream, kind });
+    if (!safeCount(count)) unavailable("control_invalid");
+    return count;
+  }
+  let total = 0;
+  for (const item of sources) {
+    const count = await source.store.countOutputs({ pin: item.pin, generation: item.generation, stream, kind });
+    if (!safeCount(count) || total > Number.MAX_SAFE_INTEGER - count) unavailable("control_invalid");
+    total += count;
+  }
+  return total;
+}
+
 async function preparedOutputPage(
   source: ProviderPreparedV1QuotaSource,
   kind: "plan" | "fit",
@@ -912,10 +1132,7 @@ async function preparedOutputPage(
   const position = kind === "fit"
     ? fitOutputCursor({ observedAt: cursor.observedAt, resetsAt: cursor.resetsAt ?? cursor.observedAt, id: cursor.id })
     : outputCursor(cursor.observedAt, cursor.id);
-  return source.store.readOutputs({
-    pin: source.pin, generation: source.generation, stream: "quota", kind,
-    afterIndex: position.afterIndex, afterKey: position.afterKey, limit,
-  });
+  return preparedOutputWindowPage(source, "quota", kind, position.afterIndex, position.afterKey, limit);
 }
 
 /** Provider equivalent of createPreparedV1Evidence. It consumes the durable
@@ -976,6 +1193,109 @@ export async function createProviderV1PreparedEvidence(input: {
     replayPolicy: V1_PREPARED_READER_POLICY,
     quotaReader: createProviderV1QuotaReader(quotaSource), usageReader, usageBins,
   });
+}
+
+export interface ProviderV1PreparedWindowDay {
+  readonly pin: StorageSourcePin;
+  readonly quotaGeneration: string;
+  readonly usageGeneration: string;
+}
+
+/**
+ * Merge independently sealed day generations into the existing v1 finisher
+ * contract.  The physical output reads remain bounded: PostgreSQL uses one
+ * repeatable-read window query and adapters without that operation use the
+ * explicit 256-row fallback above.  The domain algorithms therefore retain
+ * their established 5,000-row usage request without exposing an unbounded
+ * provider page.
+ */
+export async function createProviderV1PreparedWindowEvidence(input: {
+  readonly store: PreparedSourceStore;
+  readonly days: readonly ProviderV1PreparedWindowDay[];
+  readonly sourceFingerprint: string;
+  readonly readerPolicy?: string;
+}): Promise<V1PreparedFinishEvidence & { quotaReader: V1QuotaPageReader; replayPolicy: typeof V1_PREPARED_READER_POLICY }> {
+  if (input.days.length < 1 || input.days.length > 128
+      || !/^[0-9a-f]{64}$/u.test(input.sourceFingerprint)) unavailable("control_invalid");
+  const first = input.days[0]!;
+  const daySources = input.days.map((day) => Object.freeze({ pin: Object.freeze({ ...day.pin }),
+    generation: String(day.quotaGeneration) }));
+  const usageSources = input.days.map((day) => Object.freeze({ pin: Object.freeze({ ...day.pin }),
+    generation: String(day.usageGeneration) }));
+  const quotaSource: ProviderPreparedV1QuotaSource = {
+    store: input.store, pin: first.pin, generation: first.quotaGeneration,
+    readerPolicy: input.readerPolicy ?? V1_PREPARED_READER_POLICY,
+    stream: "quota", sources: daySources,
+  };
+  const usageSource: ProviderPreparedV1QuotaSource = {
+    store: input.store, pin: first.pin, generation: first.usageGeneration,
+    readerPolicy: input.readerPolicy ?? V1_PREPARED_READER_POLICY,
+    sources: usageSources,
+  };
+  for (const day of input.days) {
+    if (day.pin.sourceId !== first.pin.sourceId || day.pin.sourceNamespace !== first.pin.sourceNamespace
+        || day.pin.ownerDigest !== first.pin.ownerDigest || !day.quotaGeneration || !day.usageGeneration) {
+      unavailable("control_invalid");
+    }
+    const quotaHead = await input.store.readHead({ sourceId: day.pin.sourceId, ownerDigest: day.pin.ownerDigest,
+      day: day.pin.day, generation: day.quotaGeneration });
+    const usageHead = await input.store.readHead({ sourceId: day.pin.sourceId, ownerDigest: day.pin.ownerDigest,
+      day: day.pin.day, generation: day.usageGeneration });
+    if (!quotaHead || quotaHead.stream !== "quota" || quotaHead.state !== "ready" || !quotaHead.control
+        || !usageHead || usageHead.stream !== "usage" || usageHead.state !== "ready" || !usageHead.control) {
+      unavailable("control_invalid");
+    }
+    await runsFromProviderHead(quotaHead);
+    await runsFromProviderHead(usageHead);
+  }
+  const readUsage = async (observedAt: string, id: number, limit: number, observedAtBefore?: string): Promise<readonly PreparedSourceOutput[]> => {
+    const position = outputCursor(observedAt, id);
+    const outputs = await preparedOutputWindowPage(usageSource, "usage", "usage_price",
+      position.afterIndex, position.afterKey, limit);
+    if (observedAtBefore !== undefined && !validTime(observedAtBefore)) unavailable("control_invalid");
+    const before = observedAtBefore === undefined ? undefined : Date.parse(observedAtBefore);
+    return before === undefined ? outputs
+      : outputs.filter((output) => {
+        const value = providerUsagePriceOutput(output.payload);
+        return Date.parse(value.observed_at) < before;
+      });
+  };
+  const readFragments = async (observedAt: string, id: number, limit: number): Promise<readonly PreparedSourceOutput[]> => {
+    const observedAtMs = Date.parse(observedAt);
+    const binStartMs = Math.floor(observedAtMs / MODEL_COMPOSITION_POLICY.grainMs) * MODEL_COMPOSITION_POLICY.grainMs;
+    const position = outputCursor(new Date(binStartMs).toISOString(), id);
+    return preparedOutputWindowPage(usageSource, "usage", "usage_fragment",
+      position.afterIndex, position.afterKey, limit);
+  };
+  const fragmentCount = await countPreparedWindowOutputs(usageSource, "usage", "usage_fragment");
+  // Heads are read above for validation; re-read their bounded row counters as
+  // part of the same explicit day vector rather than inventing a global count.
+  let usageRows = 0;
+  for (const day of input.days) {
+    const head = await input.store.readHead({ sourceId: day.pin.sourceId, ownerDigest: day.pin.ownerDigest,
+      day: day.pin.day, generation: day.usageGeneration });
+    if (!head) unavailable("control_invalid");
+    usageRows += head.rowsWritten;
+  }
+  const usageReader: V1PreparedUsageReader = {
+    async readPage(observedAt, id, limit, observedAtBefore) {
+      pageBound(limit, 5000, observedAt, id);
+      const outputs = await readUsage(observedAt, id, limit, observedAtBefore);
+      return outputs.map((output) => providerUsagePriceOutput(output.payload));
+    },
+  };
+  const usageBins: V1PreparedUsageBinsReader = {
+    totalRowCount: usageRows,
+    fragmentCount,
+    async readPage(observedAt, id, limit) {
+      pageBound(limit, 256, observedAt, id);
+      const outputs = await readFragments(observedAt, id, limit);
+      return outputs.map((output) => providerUsageFragmentOutput(output.payload));
+    },
+  };
+  return Object.freeze({ sourceFingerprint: input.sourceFingerprint,
+    replayPolicy: V1_PREPARED_READER_POLICY,
+    quotaReader: createProviderV1QuotaReader(quotaSource), usageReader, usageBins });
 }
 
 /** Create the bounded quota reader used by the provider-backed analysis runner. */

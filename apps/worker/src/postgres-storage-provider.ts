@@ -10,9 +10,11 @@ import type {
   PreparedSourceOutput,
   PreparedSourceOutputKind,
   PreparedSourceOutputRequest,
+  PreparedSourceOutputWindowRequest,
   PreparedSourcePageRequest,
   PreparedSourceStore,
   PreparedSourceStream,
+  PreparedSourceWindow,
   StorageAdminStore,
   StorageAnalyticsChange,
   StorageAnalyticsDeliveryStore,
@@ -40,6 +42,7 @@ import {
   withPostgresMutation,
   withPostgresRead,
   type PostgresPool,
+  type PostgresClient,
   type PostgresQueryResult,
   type PostgresSchemaOptions,
 } from "./postgres-client";
@@ -331,6 +334,212 @@ function assertSourcePin(actual: StorageSourcePin, expected: StorageSourcePin, o
       throw new PostgresStorageError("source_stale", operation);
     }
   }
+}
+
+/**
+ * A prepared output is only useful while its canonical source is still
+ * readable.  Checking the persisted prepared head is insufficient: an
+ * upload can advance input_versions, a participant can enter deletion, or an
+ * owner/source authority row can move while the immutable prepared rows are
+ * still present.  Reads run in the shared repeatable-read transaction and
+ * therefore validate this complete live authority snapshot before returning
+ * any derived output.
+ */
+async function assertCanonicalReadAuthority(
+  client: PostgresClient,
+  pin: StorageSourcePin,
+  operation: string,
+): Promise<void> {
+  const result = await client.query<Record<string, unknown>>(`
+    SELECT participant.state AS participant_state,
+           link.state AS link_state,
+           owner.state AS owner_state,
+           versions.revision AS input_revision,
+           owner.revision AS owner_revision,
+           owner.authority_epoch AS owner_authority_epoch,
+           source.source_id,
+           source.authority_epoch AS source_epoch,
+           (SELECT COALESCE(MAX(changes.sequence), 0)::bigint
+              FROM storage_ingestion_changes changes
+             WHERE changes.source_id=source.source_id
+               AND changes.owner_digest=link.owner_digest) AS sequence
+      FROM storage_v11_owner_links link
+      JOIN participants participant ON participant.id=link.participant_id
+      LEFT JOIN input_versions versions ON versions.participant_id=link.participant_id
+      LEFT JOIN analytics_owner_state owner
+        ON owner.source_id=$2 AND owner.owner_digest=link.owner_digest
+      JOIN storage_source_state source ON source.singleton=1
+     WHERE link.owner_digest=$1 AND source.source_id=$2
+     LIMIT 1`, [pin.ownerDigest, pin.sourceId]);
+  const row = result.rows[0];
+  if (!row
+      || safeString(row.participant_state, operation) !== "active"
+      || safeString(row.link_state, operation) !== "active"
+      || safeString(row.owner_state, operation) !== "active"
+      || safeInteger(row.input_revision, operation) !== pin.inputRevision
+      || safeInteger(row.owner_revision, operation) !== pin.ownerRevision
+      || safeInteger(row.owner_authority_epoch, operation) !== pin.authorityEpoch
+      || safeString(row.source_id, operation) !== pin.sourceId
+      || safeInteger(row.source_epoch, operation) !== pin.sourceEpoch
+      || safeInteger(row.sequence, operation) !== pin.sequence) {
+    throw new PostgresStorageError("source_stale", operation);
+  }
+}
+
+function windowSourceKey(source: PreparedSourceWindow): string {
+  return `${source.pin.sourceId}\u0000${source.pin.ownerDigest}\u0000${source.pin.day}\u0000${source.generation}`;
+}
+
+function validatePreparedOutputWindow(
+  input: PreparedSourceOutputWindowRequest,
+  operation: string,
+): { readonly sources: readonly PreparedSourceWindow[]; readonly stream: PreparedSourceStream;
+  readonly kind: PreparedSourceOutputKind; readonly afterIndex: number; readonly afterKey: string;
+  readonly limit: number } {
+  const sources = Object.freeze(input.sources.map((source) => Object.freeze({
+    pin: Object.freeze({ ...source.pin }), generation: String(source.generation),
+  })));
+  if (sources.length < 1 || sources.length > 128) throw new PostgresStorageError("bounds", operation);
+  const keys = new Set<string>();
+  for (const source of sources) {
+    if (!source.generation || source.generation.length > 256 || keys.has(windowSourceKey(source))) {
+      throw new PostgresStorageError("bounds", operation);
+    }
+    keys.add(windowSourceKey(source));
+  }
+  const stream = preparedStream(input.stream, operation);
+  const kind = preparedOutputKind(input.kind, operation);
+  if (!outputKindMatchesStream(stream, kind)
+      || !Number.isSafeInteger(input.afterIndex) || input.afterIndex < -1
+      || typeof input.afterKey !== "string" || input.afterKey.length > 256) {
+    throw new PostgresStorageError("bounds", operation);
+  }
+  const limit = normalizeLimit(input.limit, 5_000, operation);
+  return Object.freeze({ sources, stream, kind, afterIndex: input.afterIndex,
+    afterKey: input.afterKey, limit });
+}
+
+function windowValues(
+  sources: readonly PreparedSourceWindow[],
+  offset: number,
+): { readonly sql: string; readonly values: readonly unknown[] } {
+  const values: unknown[] = [];
+  const rows = sources.map((source, index) => {
+    const base = offset - 1 + index * 4;
+    values.push(source.pin.sourceId, source.pin.ownerDigest, source.pin.day, source.generation);
+    return `($${base + 1}::text,$${base + 2}::text,$${base + 3}::date,$${base + 4}::text)`;
+  });
+  return { sql: `(VALUES ${rows.join(",")}) AS requested(source_id,owner_digest,observed_day,generation)`, values };
+}
+
+async function assertPreparedWindowHeads(
+  client: PostgresClient,
+  window: ReturnType<typeof validatePreparedOutputWindow>,
+  operation: string,
+): Promise<void> {
+  const values = windowValues(window.sources, 1);
+  const heads = await client.query<Record<string, unknown>>(`
+    SELECT h.generation, h.state, h.source_id, h.source_namespace,
+           h.owner_digest, h.day, h.input_revision, h.owner_revision,
+           h.dependency_digest, h.method, h.authority_epoch,
+           h.source_epoch, h.sequence, COALESCE(s.stream,'quota') AS stream
+      FROM ${values.sql}
+      JOIN analytics_prepared_source_heads h
+        ON h.source_id=requested.source_id AND h.owner_digest=requested.owner_digest
+       AND h.day=requested.observed_day AND h.generation=requested.generation
+      LEFT JOIN analytics_prepared_source_streams s
+        ON s.source_id=h.source_id AND s.owner_digest=h.owner_digest
+       AND s.observed_day=h.day AND s.generation=h.generation
+     ORDER BY h.source_id,h.owner_digest,h.day,h.generation`, [...values.values]);
+  if (heads.rows.length !== window.sources.length) {
+    throw new PostgresStorageError("not_found", operation);
+  }
+  const found = new Set<string>();
+  for (const row of heads.rows) {
+    const source = window.sources.find((candidate) => candidate.pin.sourceId === row.source_id
+      && candidate.pin.ownerDigest === row.owner_digest
+      && candidate.pin.day === safeDay(row.day, operation)
+      && candidate.generation === safeString(row.generation, operation));
+    if (!source) throw new PostgresStorageError("source_stale", operation);
+    const key = windowSourceKey(source);
+    if (found.has(key) || safeString(row.state, operation) !== "ready"
+        || preparedStream(row.stream ?? "quota", operation) !== window.stream) {
+      throw new PostgresStorageError("incomplete", operation);
+    }
+    found.add(key);
+    const actual = sourcePin(row, operation);
+    assertSourcePin(actual, source.pin, operation);
+    await assertCanonicalReadAuthority(client, source.pin, operation);
+  }
+}
+
+async function readPreparedOutputWindow(
+  database: PostgresStorageDatabase,
+  input: PreparedSourceOutputWindowRequest,
+): Promise<readonly PreparedSourceOutput[]> {
+  const operation = "prepared_source.read_outputs_window";
+  const window = validatePreparedOutputWindow(input, operation);
+  return withPostgresRead(database.pool, async (client) => {
+    await client.query(setLocalSearchPath(database.schema));
+    await assertPreparedWindowHeads(client, window, operation);
+    const values = windowValues(window.sources, 1);
+    const limitParameter = values.values.length + 5;
+    const result = await client.query<Record<string, unknown>>(`
+      SELECT output.stream, output.output_kind, output.output_key,
+             output.output_index, output.payload_json, output.payload_sha256
+        FROM analytics_prepared_source_outputs output
+        JOIN ${values.sql}
+          ON requested.source_id=output.source_id
+         AND requested.owner_digest=output.owner_digest
+         AND requested.observed_day=output.observed_day
+         AND requested.generation=output.generation
+       WHERE output.stream=$${values.values.length + 1}::text
+         AND output.output_kind=$${values.values.length + 2}::text
+         AND (output.output_index, output.output_key) > ($${values.values.length + 3}::bigint,$${values.values.length + 4}::text)
+       ORDER BY output.output_index, output.output_key
+       LIMIT $${limitParameter}::integer`,
+      [...values.values, window.stream, window.kind, window.afterIndex, window.afterKey, window.limit]);
+    const mapped: PreparedSourceOutput[] = [];
+    for (const row of result.rows) {
+      const output = preparedOutputFromRow(row, operation);
+      if (output.stream !== window.stream || output.kind !== window.kind
+          || await sha256Text(canonicalJson(output.payload), operation) !== output.payloadSha256) {
+        throw new PostgresStorageError("incomplete", operation);
+      }
+      mapped.push(output);
+    }
+    return Object.freeze(mapped);
+  }, { operation }).catch((error: unknown) => {
+    throw normalizePostgresError(error, operation);
+  });
+}
+
+async function countPreparedOutputWindow(
+  database: PostgresStorageDatabase,
+  input: { readonly sources: readonly PreparedSourceWindow[]; readonly stream: PreparedSourceStream;
+    readonly kind: PreparedSourceOutputKind },
+): Promise<number> {
+  const operation = "prepared_source.count_outputs_window";
+  const window = validatePreparedOutputWindow({ ...input, afterIndex: -1, afterKey: "", limit: 1 }, operation);
+  return withPostgresRead(database.pool, async (client) => {
+    await client.query(setLocalSearchPath(database.schema));
+    await assertPreparedWindowHeads(client, window, operation);
+    const values = windowValues(window.sources, 1);
+    const result = await client.query<{ count: string }>(`
+      SELECT count(*)::bigint AS count
+        FROM analytics_prepared_source_outputs output
+        JOIN ${values.sql}
+          ON requested.source_id=output.source_id
+         AND requested.owner_digest=output.owner_digest
+         AND requested.observed_day=output.observed_day
+         AND requested.generation=output.generation
+       WHERE output.stream=$${values.values.length + 1}
+         AND output.output_kind=$${values.values.length + 2}`,
+    [...values.values, window.stream, window.kind]);
+    return safeInteger(result.rows[0]?.count, operation);
+  }, { operation }).catch((error: unknown) => {
+    throw normalizePostgresError(error, operation);
+  });
 }
 
 interface CanonicalSourceExpectation {
@@ -1214,6 +1423,7 @@ export function createPostgresPreparedSourceStore(
           if (safeString(head.state, operation) !== "ready") {
             throw new PostgresStorageError("incomplete", operation);
           }
+          await assertCanonicalReadAuthority(client, pin, operation);
           const result = await client.query<Record<string, unknown>>(`
             SELECT stream, output_kind, output_key, output_index, payload_json, payload_sha256
               FROM analytics_prepared_source_outputs
@@ -1237,6 +1447,10 @@ export function createPostgresPreparedSourceStore(
       } catch (error) {
         throw normalizePostgresError(error, operation);
       }
+    },
+
+    async readOutputsWindow(input: PreparedSourceOutputWindowRequest): Promise<readonly PreparedSourceOutput[]> {
+      return readPreparedOutputWindow(database, input);
     },
 
     async countOutputs(input): Promise<number> {
@@ -1269,6 +1483,7 @@ export function createPostgresPreparedSourceStore(
             throw new PostgresStorageError("incomplete", operation);
           }
           assertSourcePin(sourcePin(row, operation), pin, operation);
+          await assertCanonicalReadAuthority(client, pin, operation);
           const result = await client.query<{ count: string }>(`
             SELECT count(*)::bigint AS count
               FROM analytics_prepared_source_outputs
@@ -1280,6 +1495,14 @@ export function createPostgresPreparedSourceStore(
       } catch (error) {
         throw normalizePostgresError(error, operation);
       }
+    },
+
+    async countOutputsWindow(input: {
+      readonly sources: readonly PreparedSourceWindow[];
+      readonly stream: PreparedSourceStream;
+      readonly kind: PreparedSourceOutputKind;
+    }): Promise<number> {
+      return countPreparedOutputWindow(database, input);
     },
 
     async retire(input): Promise<{ deleted: number; complete: boolean }> {

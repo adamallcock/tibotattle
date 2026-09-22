@@ -104,6 +104,23 @@ export interface PreparedSourceOutputRequest {
   readonly limit: number;
 }
 
+/** One day/generation in a bounded multi-day prepared window.  The source pin
+ * remains day-specific so each page can prove its own canonical authority;
+ * window readers merge these independently sealed generations by cursor. */
+export interface PreparedSourceWindow {
+  readonly pin: StorageSourcePin;
+  readonly generation: string;
+}
+
+export interface PreparedSourceOutputWindowRequest {
+  readonly sources: readonly PreparedSourceWindow[];
+  readonly stream: PreparedSourceStream;
+  readonly kind: PreparedSourceOutputKind;
+  readonly afterIndex: number;
+  readonly afterKey: string;
+  readonly limit: number;
+}
+
 export interface StorageSourcePinRequest {
   readonly sourceId: string;
   readonly sourceNamespace: string;
@@ -172,9 +189,18 @@ export interface PreparedSourceStore {
   }): Promise<PreparedSourceHead>;
   readPage(request: PreparedSourcePageRequest): Promise<StorageSourcePage>;
   readOutputs(request: PreparedSourceOutputRequest): Promise<readonly PreparedSourceOutput[]>;
+  /** Optional batched read used by bounded multi-day readers.  Implementations
+   * that cannot batch must leave this absent so callers can apply an explicit
+   * bounded fallback, never an unbounded scan. */
+  readOutputsWindow?(request: PreparedSourceOutputWindowRequest): Promise<readonly PreparedSourceOutput[]>;
   countOutputs(input: {
     readonly pin: StorageSourcePin;
     readonly generation: string;
+    readonly stream: PreparedSourceStream;
+    readonly kind: PreparedSourceOutputKind;
+  }): Promise<number>;
+  countOutputsWindow?(input: {
+    readonly sources: readonly PreparedSourceWindow[];
     readonly stream: PreparedSourceStream;
     readonly kind: PreparedSourceOutputKind;
   }): Promise<number>;
