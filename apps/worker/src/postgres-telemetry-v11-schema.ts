@@ -12,6 +12,8 @@ export interface PostgresTelemetryV11Tables {
   readonly uploadAuthorizations: string;
   readonly formats: string;
   readonly participantFloors: string;
+  readonly deviceFloors: string;
+  readonly admissionWindows: string;
   readonly deviceConsents: string;
   readonly accountlessLedger: string;
   readonly accountlessOwners: string;
@@ -34,6 +36,8 @@ export function resolvePostgresTelemetryV11Tables(
     uploadAuthorizations: table("device_upload_authorizations"),
     formats: table("telemetry_transport_formats"),
     participantFloors: table("telemetry_transport_participant_floors"),
+    deviceFloors: table("telemetry_transport_device_floors"),
+    admissionWindows: table("telemetry_v1_chunk_admission_windows"),
     deviceConsents: table("telemetry_v11_device_consents"),
     accountlessLedger: table("accountless_enrollment_ledger"),
     accountlessOwners: table("accountless_upload_owners"),

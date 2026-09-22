@@ -227,6 +227,17 @@ async function databaseClock(client: PostgresClient): Promise<string> {
   return instant(rowOne(await client.query("SELECT clock_timestamp() AS now")).now);
 }
 
+interface V11AuthorityState {
+  readonly dbNow: string;
+  readonly deviceIssuedAt: string;
+}
+
+function admissionLimit(): ApiError {
+  return new ApiError(429, "CHUNK_ADMISSION_LIMIT_REACHED", {
+    responseHeaders: { "retry-after": "60" },
+  });
+}
+
 /**
  * Lock authority in a fixed participant -> device -> policy order.  The clock
  * read occurs only after the locks return; a revoke/expiry that waited behind
@@ -236,7 +247,7 @@ async function assertV11Authority(
   client: PostgresClient,
   tables: PostgresTelemetryV11Tables,
   principal: TelemetryTransportPrincipal,
-): Promise<string> {
+): Promise<V11AuthorityState> {
   const participant = await client.query(
     `SELECT owner_kind, state FROM ${tables.participants} WHERE id=$1 FOR UPDATE`,
     [principal.participantId],
@@ -249,7 +260,7 @@ async function assertV11Authority(
   }
 
   const device = await client.query(
-    `SELECT authority_kind, state, expires_at, accountless_enrollment_device_id
+    `SELECT authority_kind, state, issued_at, expires_at, accountless_enrollment_device_id
        FROM ${tables.devices}
       WHERE id=$1 AND participant_id=$2 FOR UPDATE`,
     [principal.deviceId, principal.participantId],
@@ -264,6 +275,15 @@ async function assertV11Authority(
     [principal.participantId],
   );
   const floorRow = rowOne(floor);
+  const deviceFloor = await client.query(
+    `SELECT minimum_rank FROM ${tables.deviceFloors}
+      WHERE participant_id=$1 AND device_id=$2 FOR SHARE`,
+    [principal.participantId, principal.deviceId],
+  );
+  const participantMinimumRank = integer(floorRow.minimum_rank, 0, 100);
+  const deviceMinimumRank = deviceFloor.rows.length === 0
+    ? participantMinimumRank
+    : integer(rowOne(deviceFloor).minimum_rank, 0, 100);
   const format = await client.query(
     `SELECT format_rank, lifecycle FROM ${tables.formats}
       WHERE schema_version=$1 FOR SHARE`,
@@ -271,13 +291,8 @@ async function assertV11Authority(
   );
   const formatRow = rowOne(format);
   if (formatRow.lifecycle !== "accepted"
-      || integer(formatRow.format_rank, 0, 100) < integer(floorRow.minimum_rank, 0, 100)) {
+      || integer(formatRow.format_rank, 0, 100) < Math.max(participantMinimumRank, deviceMinimumRank)) {
     throw new ApiError(409, "TELEMETRY_TRANSPORT_BLOCKED");
-  }
-
-  const dbNow = await databaseClock(client);
-  if (new Date(instant(deviceRow.expires_at)).getTime() <= new Date(dbNow).getTime()) {
-    throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
 
   if (participantRow.owner_kind === "social") {
@@ -321,7 +336,15 @@ async function assertV11Authority(
     );
     if (accountless.rows.length !== 1) throw new ApiError(403, "TELEMETRY_CONSENT_INVALID");
   }
-  return dbNow;
+
+  // Consent rows are locked above. Read the database clock only after those
+  // waits so an expiry that occurs while a concurrent consent change is
+  // committing cannot be accepted from an earlier caller snapshot.
+  const dbNow = await databaseClock(client);
+  if (new Date(instant(deviceRow.expires_at)).getTime() <= new Date(dbNow).getTime()) {
+    throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  }
+  return Object.freeze({ dbNow, deviceIssuedAt: instant(deviceRow.issued_at) });
 }
 
 async function assertUploadLease(
@@ -329,8 +352,7 @@ async function assertUploadLease(
   tables: PostgresTelemetryV11Tables,
   principal: TelemetryTransportPrincipal,
   metadata: TelemetryV11ChunkWriteMetadata,
-  dbNow: string,
-): Promise<void> {
+): Promise<string> {
   const result = await client.query(
     `SELECT state, participant_id, issued_by_device_id, envelope_digest,
             consume_lease_expires_at, expires_at
@@ -345,6 +367,9 @@ async function assertUploadLease(
   const storedLease = row.consume_lease_expires_at === null
     ? null
     : instant(row.consume_lease_expires_at);
+  // The upload row may have been locked behind a claim, revoke, or cleanup.
+  // Check both expiry values against a clock read after that lock returns.
+  const dbNow = await databaseClock(client);
   if (row.state !== "consuming"
       || row.envelope_digest !== metadata.envelopeDigest
       || storedLease !== lease
@@ -352,11 +377,13 @@ async function assertUploadLease(
       || new Date(instant(row.expires_at)).getTime() <= new Date(dbNow).getTime()) {
     throw new ApiError(401, "UPLOAD_AUTH_INVALID");
   }
+  return dbNow;
 }
 
 async function markUploadConsumed(
   client: PostgresClient,
   tables: PostgresTelemetryV11Tables,
+  principal: TelemetryTransportPrincipal,
   metadata: TelemetryV11ChunkWriteMetadata,
   contributionId: string,
   now: string,
@@ -365,12 +392,125 @@ async function markUploadConsumed(
     `UPDATE ${tables.uploadAuthorizations}
         SET state='consumed', consumed_at=$1, consumed_contribution_id=$2,
             consume_lease_expires_at=NULL
-      WHERE id=$3 AND state='consuming'`,
-    [now, contributionId, metadata.deviceUploadAuthorizationId],
+      WHERE id=$3 AND participant_id=$4 AND issued_by_device_id=$5
+        AND state='consuming' AND envelope_digest=$6
+        AND consume_lease_expires_at=$7::timestamptz
+        AND consume_lease_expires_at > $8::timestamptz
+        AND expires_at > $8::timestamptz
+        AND consumed_contribution_id IS NULL`,
+    [now, contributionId, metadata.deviceUploadAuthorizationId,
+      principal.participantId, principal.deviceId, metadata.envelopeDigest,
+      metadata.uploadAuthorizationLeaseExpiresAt, now],
   );
-  // The row was locked and validated before the insert. Any missing update
-  // means the transaction did not operate on the claimed authority.
+  // This final compare-and-set is intentionally repeated after all journal,
+  // chunk, and record writes. If the lease expired during any lock wait, the
+  // transaction rolls back instead of consuming a stale claim.
   if (rowCount(result) !== 1) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+}
+
+/**
+ * Acquire the shared primary pending-object fence before reading live
+ * manifest/authority state. Cleanup uses this same row lock and retains it
+ * through commit, so a deleting claim cannot race a new chunk publication.
+ */
+async function lockPendingObject(
+  client: PostgresClient,
+  tables: PostgresTelemetryV11Tables,
+  metadata: TelemetryV11ChunkWriteMetadata,
+): Promise<void> {
+  const inserted = await client.query(
+    `INSERT INTO ${tables.pendingObjects}(contribution_id, object_key)
+       VALUES ($1,$2)
+    ON CONFLICT (contribution_id) DO NOTHING
+    RETURNING object_key, reconciliation_state`,
+    [metadata.chunkRowId, metadata.objectKey],
+  );
+  const result = inserted.rows.length === 1
+    ? inserted
+    : await client.query(
+      `SELECT object_key, reconciliation_state
+         FROM ${tables.pendingObjects}
+        WHERE contribution_id=$1
+        FOR UPDATE`,
+      [metadata.chunkRowId],
+    );
+  if (result.rows.length !== 1) throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
+  const row = rowOne(result);
+  if (row.object_key !== metadata.objectKey || row.reconciliation_state !== "registered") {
+    throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
+  }
+}
+
+async function assertManifestAdmission(
+  client: PostgresClient,
+  tables: PostgresTelemetryV11Tables,
+  principal: TelemetryTransportPrincipal,
+  createdAt: string,
+): Promise<void> {
+  const result = await client.query(
+    `SELECT count(*)::text AS count
+       FROM ${tables.manifests}
+      WHERE participant_id=$1 AND device_id=$2
+        AND created_at >= $3::date
+        AND created_at < ($3::date + INTERVAL '1 day')`,
+    [principal.participantId, principal.deviceId, createdAt.slice(0, 10)],
+  );
+  if (result.rows.length !== 1) throw unavailable();
+  const count = integer(rowOne(result).count, 0, Number.MAX_SAFE_INTEGER);
+  if (count >= 8_192) throw admissionLimit();
+}
+
+interface ChunkAdmissionWindow {
+  readonly windowDay: string;
+  readonly maximum: number;
+}
+
+async function assertChunkAdmission(
+  client: PostgresClient,
+  tables: PostgresTelemetryV11Tables,
+  principal: TelemetryTransportPrincipal,
+  createdAt: string,
+  deviceIssuedAt: string,
+): Promise<ChunkAdmissionWindow> {
+  const windowDay = createdAt.slice(0, 10);
+  const result = await client.query(
+    `SELECT accepted_count
+       FROM ${tables.admissionWindows}
+      WHERE participant_id=$1 AND device_id=$2 AND window_day=$3::date
+      FOR UPDATE`,
+    [principal.participantId, principal.deviceId, windowDay],
+  );
+  const accepted = result.rows.length === 0
+    ? 0
+    : integer(rowOne(result).accepted_count, 0, 20_000);
+  const createdEpoch = Date.parse(createdAt);
+  const issuedEpoch = Date.parse(deviceIssuedAt);
+  if (!Number.isFinite(createdEpoch) || !Number.isFinite(issuedEpoch)) throw unavailable();
+  const maximum = issuedEpoch > createdEpoch - 7 * 86_400_000 ? 20_000 : 2_000;
+  if (accepted >= maximum) throw admissionLimit();
+  return Object.freeze({ windowDay, maximum });
+}
+
+async function recordChunkAdmission(
+  client: PostgresClient,
+  tables: PostgresTelemetryV11Tables,
+  principal: TelemetryTransportPrincipal,
+  window: ChunkAdmissionWindow,
+  createdAt: string,
+): Promise<void> {
+  const result = await client.query(
+    `INSERT INTO ${tables.admissionWindows} AS admission(
+       participant_id, device_id, window_day, accepted_count, last_accepted_at
+     ) VALUES ($1,$2,$3::date,1,$4)
+     ON CONFLICT (participant_id, device_id, window_day)
+     DO UPDATE SET accepted_count=admission.accepted_count + 1,
+                   last_accepted_at=EXCLUDED.last_accepted_at
+     RETURNING accepted_count`,
+    [principal.participantId, principal.deviceId, window.windowDay, createdAt],
+  );
+  if (result.rows.length !== 1) throw unavailable();
+  const accepted = integer(rowOne(result).accepted_count, 1, 20_000);
+  if (accepted > window.maximum) throw admissionLimit();
 }
 
 function validateRange(options: TelemetryV11DayCandidateQuery): { fromDay: string; toDay: string; limit: number } {
@@ -475,6 +615,10 @@ export function createPostgresTelemetryV11Backend(
             return candidate(row);
           }
           if (manifest.chunks.length > 4_096) throw new ApiError(400, "TELEMETRY_MANIFEST_INVALID");
+          // D1 bounds candidate-manifest creation independently of chunk
+          // admission so empty/different-digest days cannot grow without
+          // limit. Participant/device locks above serialize this count.
+          await assertManifestAdmission(client, tables, principal, now);
           const id = crypto.randomUUID();
           const inserted = await client.query(
             `INSERT INTO ${tables.manifests} (
@@ -524,6 +668,10 @@ export function createPostgresTelemetryV11Backend(
       const { stream, day, seq } = parseTelemetryV11ChunkId(chunk.chunkId);
       try {
         return await withPostgresMutation(pool, async (client) => {
+          // Acquire the same journal row used by reconciliation before any
+          // live manifest or authority checks. The lock remains held until
+          // the transaction commits or rolls back.
+          await lockPendingObject(client, tables, snapshot.metadata);
           await assertV11Authority(client, tables, principal);
           const manifestResult = await client.query(
             `SELECT id, to_char(chunk_day,'YYYY-MM-DD') AS chunk_day, manifest_digest,
@@ -565,17 +713,11 @@ export function createPostgresTelemetryV11Backend(
             throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
           }
 
-          const dbNow = await assertV11Authority(client, tables, principal);
-          await assertUploadLease(client, tables, principal, snapshot.metadata, dbNow);
-          const pending = await client.query(
-            `INSERT INTO ${tables.pendingObjects}(contribution_id, object_key)
-               VALUES ($1,$2)
-            ON CONFLICT (contribution_id) DO UPDATE SET object_key=EXCLUDED.object_key
-              WHERE ${tables.pendingObjects}.object_key=EXCLUDED.object_key
-            RETURNING contribution_id`,
-            [snapshot.metadata.chunkRowId, snapshot.metadata.objectKey],
+          const authority = await assertV11Authority(client, tables, principal);
+          await assertUploadLease(client, tables, principal, snapshot.metadata);
+          const admission = await assertChunkAdmission(
+            client, tables, principal, snapshot.now, authority.deviceIssuedAt,
           );
-          if (pending.rows.length !== 1) throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
 
           const inserted = await client.query(
             `INSERT INTO ${tables.chunks} (
@@ -604,6 +746,7 @@ export function createPostgresTelemetryV11Backend(
             );
             if (rowCount(recordResult) !== 1) throw unavailable();
           }
+          await recordChunkAdmission(client, tables, principal, admission, snapshot.now);
           await client.query(
             `UPDATE ${tables.manifests} m SET state='ready', ready_at=$1
               WHERE m.id=$2 AND m.state='staged'
@@ -615,8 +758,9 @@ export function createPostgresTelemetryV11Backend(
                 )`,
             [snapshot.now, manifestId],
           );
-          await markUploadConsumed(client, tables, snapshot.metadata,
-            snapshot.metadata.chunkRowId, snapshot.now);
+          const finalNow = await databaseClock(client);
+          await markUploadConsumed(client, tables, principal, snapshot.metadata,
+            snapshot.metadata.chunkRowId, finalNow);
           return {
             contributionId: snapshot.metadata.chunkRowId,
             manifestId,

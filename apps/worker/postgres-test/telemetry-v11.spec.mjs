@@ -152,6 +152,71 @@ async function claimUpload(index, envelopeDigest) {
   return { id, lease };
 }
 
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function waitForLockWait(tableName) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const result = await pool.query(`
+      SELECT 1 FROM pg_stat_activity
+       WHERE pid <> pg_backend_pid()
+         AND state = 'active'
+         AND wait_event_type = 'Lock'
+         AND query LIKE $1
+       LIMIT 1`, [`%${tableName}%`]);
+    if (result.rows.length === 1) return;
+    await sleep(50);
+  }
+  throw new Error(`did not observe PostgreSQL lock wait for ${tableName}`);
+}
+
+async function runLockExpiryCase(index, selectedDay, tableName, lockSql, seedPending) {
+  const principal = { participantId, deviceId };
+  const prepared = makeChunk(index, selectedDay);
+  const manifest = await backend.registerDayManifest(principal, prepared.manifest);
+  const envelopeDigest = digest(`v11-envelope-lock-expiry-${index}`);
+  const upload = await claimUpload(index, envelopeDigest);
+  // Replace the claimed lease in the same form the writer receives from the
+  // authority. The test must fence the replacement lease, not the old claim.
+  const replacementLease = new Date(Date.now() + 1_500).toISOString();
+  await pool.query(`UPDATE "${primarySchema}".device_upload_authorizations
+    SET consume_lease_expires_at=$1 WHERE id=$2`, [replacementLease, upload.id]);
+  const metadata = {
+    chunkRowId: `chunk:${randomBytes(16).toString("hex")}`,
+    objectKey: `telemetry/v11/lock-expiry-${index}`,
+    envelopeDigest,
+    deviceUploadAuthorizationId: upload.id,
+    uploadAuthorizationLeaseExpiresAt: replacementLease,
+  };
+  if (seedPending) {
+    await pool.query(`INSERT INTO "${primarySchema}".pending_objects(contribution_id, object_key)
+      VALUES ($1,$2)`, [metadata.chunkRowId, metadata.objectKey]);
+  }
+
+  const blocker = await pool.connect();
+  let blocked;
+  try {
+    await blocker.query("BEGIN");
+    await blocker.query(typeof lockSql === "function" ? lockSql({ metadata, manifest, upload }) : lockSql);
+    blocked = backend.persistChunk(principal, prepared.chunk, metadata);
+    await waitForLockWait(tableName);
+    const leaseState = await pool.query(`SELECT consume_lease_expires_at > clock_timestamp() AS future
+      FROM "${primarySchema}".device_upload_authorizations WHERE id=$1`, [upload.id]);
+    expect(leaseState.rows[0]?.future).toBe(true);
+    await sleep(1_700);
+    await blocker.query("COMMIT");
+    await expect(blocked).rejects.toMatchObject({ code: "UPLOAD_AUTH_INVALID" });
+  } finally {
+    await blocker.query("ROLLBACK").catch(() => {});
+    blocker.release();
+  }
+  expect((await pool.query(`SELECT count(*)::int AS n FROM "${primarySchema}".telemetry_v11_chunks WHERE id=$1`, [metadata.chunkRowId])).rows[0].n).toBe(0);
+  expect((await pool.query(`SELECT count(*)::int AS n FROM "${primarySchema}".pending_objects WHERE contribution_id=$1`, [metadata.chunkRowId])).rows[0].n)
+    .toBe(seedPending ? 1 : 0);
+  expect((await pool.query(`SELECT state FROM "${primarySchema}".device_upload_authorizations WHERE id=$1`, [upload.id])).rows[0].state)
+    .toBe("consuming");
+  return { manifest, metadata };
+}
+
 beforeAll(async () => {
   const socket = process.env.PG_TEST_SOCKET;
   if (!socket || !isAbsolute(socket) || !socket.startsWith("/private/tmp/tibotattle-pg-")) {
@@ -264,34 +329,97 @@ it("rejects stale lease and stale consent without leaving a partial chunk or jou
     consent.telemetrySchemaVersion, consent.fieldDictionaryVersion, consent.privacyContractVersion]);
 });
 
-it("rechecks the exact lease after a manifest lock wait", async () => {
+it("rechecks the exact replacement lease after a manifest lock wait", async () => {
+  await runLockExpiryCase(
+    4,
+    "2026-09-18",
+    "telemetry_v11_day_manifests",
+    `SELECT id FROM "${primarySchema}".telemetry_v11_day_manifests
+      WHERE chunk_day='2026-09-18'::date FOR UPDATE`,
+    false,
+  );
+});
+
+it("rechecks the exact replacement lease after an upload-row lock wait", async () => {
+  const uploadId = `v11-transport-upload-5`;
+  await runLockExpiryCase(
+    5,
+    "2026-09-17",
+    "device_upload_authorizations",
+    `SELECT id FROM "${primarySchema}".device_upload_authorizations WHERE id='${uploadId}' FOR UPDATE`,
+    false,
+  );
+});
+
+it("rechecks the exact replacement lease after a pending-journal lock wait", async () => {
+  await runLockExpiryCase(
+    6,
+    "2026-09-16",
+    "pending_objects",
+    ({ metadata }) => `SELECT contribution_id FROM "${primarySchema}".pending_objects
+      WHERE contribution_id='${metadata.chunkRowId}' FOR UPDATE`,
+    true,
+  );
+});
+
+it("applies the device floor and bounded manifest admission before publication", async () => {
   const principal = { participantId, deviceId };
-  const prepared = makeChunk(4, "2026-09-18");
-  const manifest = await backend.registerDayManifest(principal, prepared.manifest);
-  const envelopeDigest = digest("v11-envelope-lock-expiry");
-  const upload = await claimUpload(4, envelopeDigest);
-  await pool.query(`UPDATE "${primarySchema}".device_upload_authorizations
-    SET consume_lease_expires_at=clock_timestamp()+interval '150 milliseconds' WHERE id=$1`, [upload.id]);
-  const blocker = await pool.connect();
+  const floorDay = "2026-09-14";
+  const floorChunk = makeChunk(7, floorDay);
+  await pool.query(`INSERT INTO "${primarySchema}".telemetry_transport_device_floors
+    (participant_id, device_id, minimum_rank, revision, changed_at)
+    VALUES ($1,$2,12,1,clock_timestamp())`, [participantId, deviceId]);
+  await expect(backend.registerDayManifest(principal, floorChunk.manifest)).rejects
+    .toMatchObject({ code: "TELEMETRY_TRANSPORT_BLOCKED" });
+  await pool.query(`DELETE FROM "${primarySchema}".telemetry_transport_device_floors
+    WHERE participant_id=$1 AND device_id=$2`, [participantId, deviceId]);
+
+  await pool.query(`INSERT INTO "${primarySchema}".telemetry_v11_day_manifests
+    (id, participant_id, device_id, chunk_day, manifest_digest, parser_version,
+     manifest_json, expected_chunk_count, state, created_at, ready_at)
+    SELECT '00000000-0000-4000-8000-' || lpad(to_hex(g), 12, '0'),
+           $1, $2, $3::date, lpad(to_hex(g), 64, '0'), 'admission-fixture',
+           '{"chunks":[]}', 0, 'ready', $4::timestamptz, $4::timestamptz
+      FROM generate_series(1,8192) AS sequence(g)`,
+  [participantId, deviceId, floorDay, `${floorDay}T10:00:00.000Z`]);
+  await expect(backend.registerDayManifest(
+    principal,
+    floorChunk.manifest,
+    Date.parse(`${floorDay}T12:00:00.000Z`),
+  )).rejects.toMatchObject({ code: "CHUNK_ADMISSION_LIMIT_REACHED" });
+  expect((await pool.query(`SELECT count(*)::int AS n FROM "${primarySchema}".telemetry_v11_day_manifests
+    WHERE parser_version='admission-fixture'`)).rows[0].n).toBe(8192);
+});
+
+it("applies the shared chunk admission window atomically before publication", async () => {
+  const principal = { participantId, deviceId };
+  const prepared = makeChunk(8, "2026-09-13");
+  await backend.registerDayManifest(principal, prepared.manifest);
+  const envelopeDigest = digest("v11-envelope-admission-limit");
+  const upload = await claimUpload(8, envelopeDigest);
+  const createdAt = new Date().toISOString();
+  const createdDay = createdAt.slice(0, 10);
+  await pool.query(`INSERT INTO "${primarySchema}".telemetry_v1_chunk_admission_windows
+    (participant_id, device_id, window_day, accepted_count, last_accepted_at)
+    VALUES ($1,$2,$3::date,20000,$4)
+    ON CONFLICT (participant_id, device_id, window_day)
+    DO UPDATE SET accepted_count=20000,last_accepted_at=EXCLUDED.last_accepted_at`,
+  [participantId, deviceId, createdDay, createdAt]);
   const metadata = {
     chunkRowId: `chunk:${randomBytes(16).toString("hex")}`,
-    objectKey: "telemetry/v11/lock-expiry",
+    objectKey: "telemetry/v11/admission-limit",
     envelopeDigest,
     deviceUploadAuthorizationId: upload.id,
     uploadAuthorizationLeaseExpiresAt: upload.lease,
   };
-  let blocked;
-  try {
-    await blocker.query("BEGIN");
-    await blocker.query(`SELECT id FROM "${primarySchema}".telemetry_v11_day_manifests WHERE id=$1 FOR UPDATE`, [manifest.manifestId]);
-    blocked = backend.persistChunk(principal, prepared.chunk, metadata);
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    await blocker.query("COMMIT");
-    await expect(blocked).rejects.toMatchObject({ code: "UPLOAD_AUTH_INVALID" });
-  } finally {
-    await blocker.query("ROLLBACK").catch(() => {});
-    blocker.release();
-  }
+  await expect(backend.persistChunk(
+    principal,
+    prepared.chunk,
+    metadata,
+    Date.parse(createdAt),
+  )).rejects.toMatchObject({ code: "CHUNK_ADMISSION_LIMIT_REACHED" });
   expect((await pool.query(`SELECT count(*)::int AS n FROM "${primarySchema}".telemetry_v11_chunks WHERE id=$1`, [metadata.chunkRowId])).rows[0].n).toBe(0);
   expect((await pool.query(`SELECT count(*)::int AS n FROM "${primarySchema}".pending_objects WHERE contribution_id=$1`, [metadata.chunkRowId])).rows[0].n).toBe(0);
+  expect((await pool.query(`SELECT state FROM "${primarySchema}".device_upload_authorizations WHERE id=$1`, [upload.id])).rows[0].state)
+    .toBe("consuming");
 });
