@@ -5824,15 +5824,28 @@ body:not(.community-site) > .topbar:has(#reporting-period-toolbar[hidden]) { gri
 .quota-tank[data-flow="over"] { --tank-fluid: #d78112; --tank-glow: #ffe697; --tank-deep: #94510c; }
 .quota-tank[data-flow="critical"] { --tank-fluid: #df3c25; --tank-glow: #ffb65b; --tank-deep: #9e182c; }
 .quota-tank.stale { --tank-fluid: #929b91; --tank-glow: #d4d9cc; --tank-deep: #5a665b; }
-.quota-grid > .quota-tank.has-liquid-tank { padding: 18px 12px; gap: 8px; background: var(--surface-raised); }
+.quota-grid > .quota-tank.has-liquid-tank { --tank-height: 320px; padding: 10px 12px; gap: 4px; justify-content: flex-start; background: var(--surface-raised); }
 .quota-tank.has-liquid-tank .quota-tank-fuel { display: none; }
-.quota-tank.has-liquid-tank .quota-tank-header { align-items: center; text-align: center; min-height: 60px; }
-.quota-tank-canvas { display: block; width: 100%; height: 418px; touch-action: pan-y; }
+/* Keep identity and period above the rocket, clear of the illustration. */
+.quota-tank.has-liquid-tank .quota-tank-header {
+  position: relative; align-items: center; text-align: center; min-height: 42px;
+  gap: 2px; width: 100%; overflow-wrap: anywhere;
+}
+.quota-tank.has-liquid-tank .quota-tank-family {
+  color: var(--muted); font-family: var(--sans); font-size: .7rem;
+  font-weight: var(--weight-regular); letter-spacing: .06em; text-transform: none;
+}
+.quota-tank.has-liquid-tank .quota-tank-period { font-family: var(--serif); font-size: 1.4rem; letter-spacing: normal; text-transform: none; }
+.quota-tank.has-liquid-tank > .allowance-motion-controls { position: absolute; top: 8px; right: 8px; }
+
+.quota-tank-canvas { display: block; width: 100%; height: var(--tank-height); touch-action: pan-y; }
+.quota-tank-canvas[aria-disabled="false"] { cursor: pointer; }
+.quota-tank-canvas:focus-visible { outline: 2px solid var(--green-text); outline-offset: -3px; border-radius: 8px; }
 .quota-tank.has-liquid-tank .quota-tank-bottom { justify-content: center; }
 .quota-tank.has-liquid-tank .quota-tank-bottom > div:first-child {
-  position: absolute; top: 160px; inset-inline: 50% auto; transform: translateX(-50%);
-  text-align: center; background: color-mix(in srgb, var(--surface-raised) 90%, transparent);
-  border-radius: 12px; padding: 6px 12px; pointer-events: none;
+  position: absolute; top: calc(10px + var(--tank-label-space, 0px) + var(--tank-height) * .48); inset-inline: 50% auto; transform: translate(-50%, -50%);
+  text-align: center; background: color-mix(in srgb, var(--surface-raised) 75%, transparent);
+  border-radius: 8px; padding: 3px 5px; pointer-events: none;
 }
 .quota-tank.has-liquid-tank .quota-tank-reset { align-items: center; text-align: center; }
 .quota-tank.has-liquid-tank > .allowance-timestamp { align-self: center; }
@@ -6022,3 +6035,27 @@ html[data-theme="dark"] .quota-tank.stale { --tank-fluid: #8c9a8d; --tank-glow: 
   background: transparent;
   padding-inline: 0;
 }
+
+/* Keep the rocket and collapsed pace forecast together on desktop windows. */
+.quota-tank.has-liquid-tank .quota-tank-value { font-size: 1.65rem; }
+.quota-tank.has-liquid-tank .quota-tank-caption { font-size: .65rem; }
+.quota-tank[data-short-window="true"].has-liquid-tank .quota-tank-bottom > div:first-child { padding: 3px 4px; }
+.quota-tank[data-short-window="true"].has-liquid-tank .quota-tank-value { font-size: 1.4rem; }
+.quota-tank-hint { align-self: center; color: var(--muted); font-size: .65rem; line-height: 1.4; }
+@media (min-width: 900px) {
+  .quota-grid > .quota-tank.has-liquid-tank { --tank-height: clamp(224px, calc(100svh - 570px), 310px); }
+  #overview > .weekly-pace-forecast { padding: 16px 20px; gap: 8px; margin-bottom: 12px; }
+  #overview .weekly-pace-forecast-title { font-size: 1.45rem; max-width: none; }
+  #overview .weekly-pace-forecast-copy { max-width: none; line-height: 1.45; }
+  #overview .weekly-pace-details { margin-top: 2px; padding-top: 8px; }
+}
+
+.quota-tank.has-liquid-tank .quota-tank-period { line-height: 1.2; }
+.quota-tank.has-liquid-tank .quota-tank-family { line-height: 1.2; }
+@media (min-width: 900px) {
+  #overview .weekly-pace-track { margin-top: 4px; }
+  #overview .weekly-pace-track-runout, #overview .weekly-pace-track-reset { padding-bottom: 8px; }
+  #overview .weekly-pace-details { padding-top: 4px; }
+}
+
+.quota-tank.has-liquid-tank .quota-tank-bottom { margin-top: auto; }

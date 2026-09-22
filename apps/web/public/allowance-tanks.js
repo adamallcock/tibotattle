@@ -1,6 +1,7 @@
 import { drawAllowanceTank } from "./allowance-tank-renderer.js";
 
 let userPaused = false;
+let hasAgitated = false;
 const number = (value) =>
   value !== "" && value != null && Number.isFinite(Number(value))
     ? Number(value)
@@ -66,6 +67,44 @@ export function createTankMotion({ request, cancel, draw, active }) {
   };
 }
 
+// Three damped standing waves: impulses change velocity, never surface position.
+// Each cosine mode has zero mean, so a click cannot alter the displayed capacity.
+export function createTankSlosh() {
+  const values = [0, 0, 0];
+  const velocities = [0, 0, 0];
+  const frequencies = [6, 10, 14];
+  const damping = [1.2, 1.8, 2.5];
+  return {
+    values,
+    get agitation() {
+      return Math.min(1, Math.hypot(...velocities, ...values.map((value, i) => value * frequencies[i])) / 180);
+    },
+    kick(position = 0.5) {
+      const x = Number.isFinite(position) ? Math.max(0, Math.min(1, position)) : 0.5;
+      for (let i = 0; i < values.length; i++) {
+        const impulse = [100, 70, 45][i] * Math.cos((i + 1) * Math.PI * x);
+        // Bound total modal energy while keeping displacement continuous on repeated taps.
+        const available = Math.sqrt(Math.max(0, 120 ** 2 - (frequencies[i] * values[i]) ** 2));
+        velocities[i] = Math.max(-available, Math.min(available, velocities[i] + impulse));
+      }
+    },
+    step(dt) {
+      if (!Number.isFinite(dt) || dt <= 0) return;
+      for (let i = 0; i < values.length; i++) {
+        const decay = damping[i];
+        const frequency = Math.sqrt(frequencies[i] ** 2 - decay ** 2);
+        const sine = Math.sin(frequency * dt);
+        const cosine = Math.cos(frequency * dt);
+        const envelope = Math.exp(-decay * dt);
+        const x = values[i];
+        const v = velocities[i];
+        values[i] = envelope * (x * cosine + (v + decay * x) * sine / frequency);
+        velocities[i] = envelope * (v * cosine - (decay * v + frequencies[i] ** 2 * x) * sine / frequency);
+      }
+    },
+  };
+}
+
 export function mountAllowanceTanks(container, forecast, { t }) {
   if (!container) return { dispose() {} };
   const doc = container.ownerDocument,
@@ -117,11 +156,14 @@ export function mountAllowanceTanks(container, forecast, { t }) {
       remaining: entry.remaining,
       pace: entry.pace,
       time: entry.stale ? 0 : time,
-      tilt: entry.tilt,
+      waves: entry.slosh.values,
+      agitation: entry.slosh.agitation,
       colors: entry.colors,
       width: entry.width,
+      height: entry.height,
+      flowEnabled: !entry.stale && number(entry.card.dataset.resetAt) > Date.now(),
       dpr: entry.dpr,
-      widthScale: entry.card.dataset.shortWindow === "true" ? 0.4 : 1,
+      widthScale: entry.card.dataset.shortWindow === "true" ? 0.6 : 1,
     });
   }
   for (const card of container.querySelectorAll(".quota-tank")) {
@@ -130,7 +172,9 @@ export function mountAllowanceTanks(container, forecast, { t }) {
     const canvas = doc.createElement("canvas");
     if (!canvas.getContext("2d")) continue;
     canvas.className = "quota-tank-canvas";
-    canvas.setAttribute("aria-hidden", "true");
+    canvas.setAttribute("role", "button");
+    canvas.setAttribute("tabindex", "0");
+    canvas.setAttribute("aria-label", t("allowance.agitateTank"));
     const pace = allowanceTankPace(card.dataset, forecastState);
     card.dataset.flow =
       pace === null
@@ -142,7 +186,12 @@ export function mountAllowanceTanks(container, forecast, { t }) {
             : "calm";
     card.classList.add("has-liquid-tank");
     card.insertBefore(canvas, card.querySelector(".quota-tank-bottom"));
+    const hint = doc.createElement("span");
+    hint.className = "quota-tank-hint";
+    hint.textContent = t("allowance.sloshHint");
+    card.append(hint);
     const entry = {
+      hint,
       card,
       canvas,
       remaining,
@@ -150,31 +199,38 @@ export function mountAllowanceTanks(container, forecast, { t }) {
       stale: card.dataset.stale === "true",
       visible: false,
       width: 0,
+      height: 556,
       dpr: 1,
-      tilt: 0,
-      velocity: 0,
-      pointerX: null,
+      slosh: createTankSlosh(),
     };
     palette(entry);
-    entry.move = (event) => {
-      if (reduced.matches || userPaused || entry.stale) return;
-      const dx =
-        entry.pointerX === null
-          ? 0
-          : Math.max(-20, Math.min(20, event.clientX - entry.pointerX));
-      entry.pointerX = event.clientX;
-      entry.velocity = Math.max(-100, Math.min(100, entry.velocity + dx * 2));
+    entry.agitate = (event) => {
+      if (reduced.matches || userPaused || entry.stale || entry.remaining <= 0) return;
+      const bounds = canvas.getBoundingClientRect();
+      const scale = bounds.height / 556;
+      const vesselWidth = Math.min(188 * scale, bounds.width - 64 * scale)
+        * (card.dataset.shortWindow === "true" ? 0.6 : 1);
+      const position = event?.clientX === undefined || event.detail === 0
+        ? 0.5
+        : (event.clientX - bounds.left - (bounds.width - vesselWidth) / 2) / vesselWidth;
+      hasAgitated = true;
+      for (const item of entries) item.hint.style.visibility = "hidden";
+      entry.slosh.kick(position);
+      motion.sync();
     };
-    entry.leave = () => {
-      entry.pointerX = null;
+    entry.keydown = (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      if (event.repeat) return;
+      entry.agitate();
     };
-    canvas.addEventListener("pointermove", entry.move);
-    canvas.addEventListener("pointerleave", entry.leave);
+    canvas.addEventListener("click", entry.agitate);
+    canvas.addEventListener("keydown", entry.keydown);
     entries.push(entry);
   }
   if (!entries.length) return { dispose() {} };
   const controlHost = forecast?.querySelector(".weekly-pace-forecast-heading")
-    ?? container.querySelector(".quota-tank-header");
+    ?? container.querySelector(".quota-tank");
   controlHost?.append(controls);
   const motion = createTankMotion({
     request: (callback) => view.requestAnimationFrame(callback),
@@ -192,9 +248,7 @@ export function mountAllowanceTanks(container, forecast, { t }) {
       lastTime = time;
       for (const entry of entries) {
         if (!entry.visible || entry.stale || entry.remaining === 0) continue;
-        entry.velocity =
-          (entry.velocity - entry.tilt * dt * 13) * Math.exp(-dt * 2.7);
-        entry.tilt += entry.velocity * dt;
+        entry.slosh.step(dt);
         paint(entry, time);
       }
     },
@@ -229,6 +283,12 @@ export function mountAllowanceTanks(container, forecast, { t }) {
     controls.hidden = reduced.matches
       || !entries.some(entry => !entry.stale && entry.remaining > 0);
     button.setAttribute("aria-pressed", String(userPaused));
+    for (const entry of entries) {
+      const disabled = reduced.matches || userPaused || entry.stale || entry.remaining <= 0;
+      entry.hint.style.visibility = disabled || hasAgitated ? "hidden" : "visible";
+      entry.canvas.setAttribute("aria-disabled", String(disabled));
+      entry.canvas.setAttribute("tabindex", disabled ? "-1" : "0");
+    }
     if (forecast) {
       const ratio = number(forecastState?.tankRatio);
       const available = entries.some((entry) => entry.pace !== null);
@@ -256,9 +316,13 @@ export function mountAllowanceTanks(container, forecast, { t }) {
       const entry = entries.find((item) => item.canvas === change.target);
       if (!entry) continue;
       entry.width = Math.max(0, Math.round(change.contentRect.width));
+      entry.height = Math.max(1, change.contentRect.height);
+      // The measured header height keeps labels of any length above the artwork.
+      const header = entry.card.querySelector(".quota-tank-header");
+      entry.card.style.setProperty("--tank-label-space", `${Math.ceil(header?.getBoundingClientRect().height ?? 0) + 4}px`);
       entry.dpr = Math.min(view.devicePixelRatio || 1, 2);
       entry.canvas.width = entry.width * entry.dpr;
-      entry.canvas.height = 418 * entry.dpr;
+      entry.canvas.height = entry.height * entry.dpr;
       paint(entry);
     }
   });
@@ -310,10 +374,12 @@ export function mountAllowanceTanks(container, forecast, { t }) {
       controls.remove();
       if (forecast) delete forecast.dataset.motion;
       for (const entry of entries) {
-        entry.canvas.removeEventListener("pointermove", entry.move);
-        entry.canvas.removeEventListener("pointerleave", entry.leave);
+        entry.canvas.removeEventListener("click", entry.agitate);
+        entry.canvas.removeEventListener("keydown", entry.keydown);
         entry.canvas.remove();
+        entry.hint.remove();
         entry.card.classList.remove("has-liquid-tank");
+        entry.card.style.removeProperty("--tank-label-space");
       }
     },
   };

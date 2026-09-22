@@ -4,6 +4,7 @@ import {
   allowanceTankPace,
   createTankMotion,
   mountAllowanceTanks,
+  createTankSlosh,
 } from "../public/allowance-tanks.js";
 import { drawAllowanceTank } from "../public/allowance-tank-renderer.js";
 
@@ -19,7 +20,46 @@ const forecast = {
   tankRemaining: "67",
   hidden: false,
 };
-test("flow requires a fresh, matching forecast and never borrows another pool's pace", () => {
+
+test("slosh impulses preserve surface continuity and settle without further input", () => {
+  const slosh = createTankSlosh();
+  assert.equal(slosh.agitation, 0);
+  slosh.kick(0.15);
+  assert.ok(slosh.agitation > 0, "pressure responds immediately to the impulse");
+  assert.deepEqual(slosh.values, [0, 0, 0], "a click applies velocity instead of teleporting the surface");
+  slosh.step(1 / 30);
+  assert.ok(slosh.values.some(value => Math.abs(value) > 1));
+  const before = [...slosh.values];
+  slosh.kick(0.8);
+  assert.deepEqual(slosh.values, before, "a second click continues the current wave");
+  for (let frame = 0; frame < 240; frame++) slosh.step(1 / 30);
+  assert.ok(slosh.values.every(value => Math.abs(value) < 0.01));
+  assert.ok(slosh.agitation < 0.001, "flame pressure settles with the fuel");
+});
+
+test("slosh follows impact location and stays bounded under repeated taps", () => {
+  const left = createTankSlosh(), right = createTankSlosh(), center = createTankSlosh();
+  left.kick(0); right.kick(1); center.kick(0.5);
+  for (const slosh of [left, right, center]) slosh.step(0.1);
+  assert.ok(Math.abs(left.values[0] + right.values[0]) < 1e-10);
+  assert.ok(Math.abs(center.values[0]) < 1e-10);
+  assert.ok(Math.abs(center.values[1]) > 1, "a central tap makes a symmetric ripple");
+  for (let frame = 0; frame < 1000; frame++) {
+    center.kick((frame % 11) / 10);
+    center.step(1 / 30);
+    assert.ok(center.agitation >= 0 && center.agitation <= 1);
+    center.values.forEach((value, index) => assert.ok(Math.abs(value) <= 120 / [6, 10, 14][index]));
+  }
+});
+
+test("slosh decay is independent of frame partitioning", () => {
+  const coarse = createTankSlosh(), fine = createTankSlosh();
+  coarse.kick(0.3); fine.kick(0.3);
+  coarse.step(1);
+  for (let frame = 0; frame < 60; frame++) fine.step(1 / 60);
+  coarse.values.forEach((value, index) => assert.ok(Math.abs(value - fine.values[index]) < 1e-10));
+});
+test("forecast pace requires fresh matching evidence and never borrows another pool's pace", () => {
   assert.equal(allowanceTankPace(tank, forecast, 1000), 3.8);
   for (const change of [
     { forecastPool: "false" },
@@ -141,7 +181,7 @@ test("renderer keeps observed capacity fixed, handles empty/full and bounded ext
   );
 });
 
-test("short windows use forty percent vessel width without changing height or observed capacity", () => {
+test("short windows use sixty percent vessel width without changing height or observed capacity", () => {
   const rectangles = [];
   const context = new Proxy(
     {},
@@ -177,9 +217,9 @@ test("short windows use forty percent vessel width without changing height or ob
   rectangles.length = 0;
   drawAllowanceTank(
     { getContext: () => context },
-    { ...options, widthScale: 0.4 },
+    { ...options, widthScale: 0.6 },
   );
-  assert.equal(rectangles[0][2], standard[2] * 0.4);
+  assert.equal(rectangles[0][2], standard[2] * 0.6);
   assert.equal(rectangles[0][3], standard[3]);
   assert.equal(options.remaining, 67);
 });
@@ -193,7 +233,7 @@ function mountedTanks(datasets, { reducedMotion = false, forecastData = forecast
   class Element {
     constructor() {
       this.dataset = {}; this.children = []; this.attributes = {}; this.events = {};
-      this.style = { setProperty() {} };
+      this.style = { setProperty() {}, removeProperty() {} };
       this.classList = { add() {}, remove() {} };
     }
     append(child) { child.parent = this; this.children.push(child); }
@@ -280,4 +320,64 @@ test("forecast motion expires while tanks are offscreen and its cleanup cancels 
   assert.equal(pending.timers.size, 1);
   pending.manager.dispose();
   assert.equal(pending.timers.size, 0, "remount/disposal never retains an old forecast timer");
+});
+
+test("tank glow reaches transparency before the canvas edge", () => {
+  let halo = null;
+  let painted = null;
+  const gradient = { addColorStop() {} };
+  const context = new Proxy({}, {
+    get(target, key) {
+      if (key in target) return target[key];
+      if (key === "createRadialGradient") return (...bounds) => {
+        halo = { bounds, addColorStop() {} };
+        return halo;
+      };
+      if (key === "createLinearGradient") return () => gradient;
+      if (key === "fillRect") return (...rect) => {
+        if (target.fillStyle === halo) painted = rect;
+      };
+      return () => {};
+    },
+    set(target, key, value) { target[key] = value; return true; },
+  });
+  const colors = Object.fromEntries(
+    ["bg", "panel", "ink", "muted", "edge", "metal", "bright", "shadow", "fluid", "glow", "deep"]
+      .map((key) => [key, "rgb(100, 150, 120)"]),
+  );
+  drawAllowanceTank({ getContext: () => context }, { remaining: 55, pace: 2, colors, width: 300 });
+  const [,, , centerX, centerY, radius] = halo.bounds;
+  const [x, y, width, height] = painted;
+  assert.ok(x <= centerX - radius && x + width >= centerX + radius);
+  assert.ok(y <= centerY - radius && y + height >= centerY + radius);
+  assert.ok(x >= 0 && x + width <= 300, "the glow is transparent before the canvas edge");
+});
+
+test("unknown forecast shares the gentle idle visual without changing forecast admission", () => {
+  const trace = (pace, flowEnabled = true, agitation = 0) => {
+    const calls = [];
+    const gradient = { addColorStop: (...args) => calls.push(["colorStop", ...args]) };
+    const context = new Proxy({}, {
+      get(_target, key) {
+        return (...args) => {
+          calls.push([key, ...args]);
+          if (key.startsWith("create")) return gradient;
+        };
+      },
+      set(_target, key, value) { calls.push([key, value]); return true; },
+    });
+    const colors = Object.fromEntries(
+      ["bg", "panel", "ink", "muted", "edge", "metal", "bright", "shadow", "fluid", "glow", "deep"]
+        .map(key => [key, "rgb(100, 150, 120)"]),
+    );
+    drawAllowanceTank({ getContext: () => context }, {
+      remaining: 55, pace, flowEnabled, agitation, width: 300, height: 278, time: 3, colors,
+    });
+    return JSON.stringify(calls);
+  };
+  assert.equal(trace(null), trace(0.55));
+  assert.notEqual(trace(0.55, true, 1), trace(0.55), "interaction changes the live plume");
+  assert.equal(trace(null, false, 1), trace(null, false), "interaction cannot ignite disabled flow");
+  assert.notEqual(trace(null, false), trace(null), "stale or expired evidence suppresses the idle plume");
+  assert.equal(allowanceTankPace(tank, null, 1000), null, "idle artwork does not manufacture a pace estimate");
 });

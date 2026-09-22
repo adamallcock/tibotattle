@@ -1688,7 +1688,7 @@ function renderLiveObservationPresentation(data, recency = observationRecency(da
     : "No timestamp";
   $("#data-source").textContent = data.mode === "demo"
     ? "Illustrative fixture — not your usage"
-    : `${formatLocal(data.freshness.latestObservedAt)} · local companion`;
+    : formatLocal(data.freshness.latestObservedAt);
 
   if (priorStatus !== recency.status) {
     setGlobalState(presentation.state, {
