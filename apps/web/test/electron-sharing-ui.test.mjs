@@ -479,6 +479,7 @@ test("Settings coalesces trusted updater status refreshes and renders a later do
   };
   const rootId = "00000000-0000-4000-8000-000000000001";
   let downloaded = false;
+  let failRead = false;
   let refreshCommand = null;
   let reads = 0;
   let activeReads = 0;
@@ -508,6 +509,7 @@ test("Settings coalesces trusted updater status refreshes and renders a later do
     },
     getSettings: async () => {
       reads += 1;
+      if (failRead) throw new Error("synthetic settings read failure");
       activeReads += 1;
       maximumActiveReads = Math.max(maximumActiveReads, activeReads);
       const response = snapshot();
@@ -525,6 +527,8 @@ test("Settings coalesces trusted updater status refreshes and renders a later do
     windowRef: { tibotattleDesktop: bridge, location: { hash: "#about" } },
     bridge,
   });
+  assert.equal(elements.get("#settings-bridge-status").hidden, true);
+  assert.equal(elements.get("#settings-bridge-status").textContent, "");
   const install = elements.get("#settings-install-update");
   assert.equal(install.hidden, true);
   assert.equal(install.disabled, true);
@@ -543,6 +547,15 @@ test("Settings coalesces trusted updater status refreshes and renders a later do
   assert.equal(reads, 3, "the trailing refresh re-reads current main-process status");
   assert.equal(install.hidden, false);
   assert.equal(install.disabled, false);
+  failRead = true;
+  refreshCommand({ command: "refresh" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(elements.get("#settings-bridge-status").hidden, false);
+  assert.match(elements.get("#settings-bridge-status").textContent, /could not be read/u);
+  failRead = false;
+  refreshCommand({ command: "refresh" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(elements.get("#settings-bridge-status").hidden, true);
   mounted.teardown();
 });
 
