@@ -1,9 +1,12 @@
 // Shared decorative model identity for public charts and local usage tables.
+// Prospective GPT-6 Sol/Luna visuals reuse their family icons. This mapping
+// does not register a model, assign prices, or imply release availability.
 const MODEL_PRESENTATION_ORDER = Object.freeze([
-  "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+  "gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra",
+  "gpt-6-luna", "gpt-5.6-luna", "gpt-5.5",
 ]);
 const MODEL_PRESENTATION_THEMES = Object.freeze([
-  "astra", "sol", "terra", "luna", "classic",
+  "astra", "sol", "sol", "terra", "luna", "luna", "classic",
 ]);
 
 // Shared visual identity only. Admin retains its private preview contract and
