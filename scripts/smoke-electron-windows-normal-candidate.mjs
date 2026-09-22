@@ -2989,7 +2989,7 @@ async function waitForSettingsReady(cdp) {
   const ready = await waitFor(async () => {
     const value = await cdp.evaluate(`(() => ({
       title: document.title,
-      bridge: document.querySelector("#settings-bridge-status")?.classList.contains("is-ready") === true,
+      bridge: document.querySelector("#settings-bridge-status")?.hidden === true,
       refresh: document.querySelector("#settings-refresh-interval"),
     }))()`);
     return value?.title === "TiboTattle Settings" && value.bridge === true && value.refresh ? true : null;

@@ -437,6 +437,7 @@ test("Production composition admits only the reviewed Linux handover and qualifi
     "apps/electron/desktop-linux-accountless-credential.js",
     "apps/electron/desktop-linux-secret-service-broker.js",
     "apps/electron/desktop-linux-secret-service.js",
+    "apps/electron/linux-autostart.js",
     "apps/electron/linux-qualification.js",
     "src/platform/linux-account-observation-broker.js",
     "src/platform/linux-account-observation-credential.js",
@@ -468,6 +469,7 @@ test("Production composition admits only the reviewed Linux handover and qualifi
     "apps/electron/desktop-linux-secret-service.js -> src/platform/linux-credential-mutation-lease.js",
     "apps/electron/desktop-linux-secret-service.js -> src/platform/linux-credential-state.js",
     "apps/electron/desktop-linux-secret-service.js -> src/platform/linux-secret-service.js",
+    "apps/electron/desktop-platform-services.js -> apps/electron/linux-autostart.js",
     "apps/electron/main.js -> apps/electron/desktop-linux-secret-service.js",
     "apps/local/server.js -> src/platform/linux-secret-service-broker.js",
     "scripts/build-electron-runtime.mjs -> src/platform/linux-credential-mutex.js",
@@ -485,7 +487,9 @@ test("Production composition admits only the reviewed Linux handover and qualifi
     "src/platform/linux-secret-service.js -> src/platform/linux-credential-mutation-lease.js",
     "src/platform/linux-secret-service.js -> src/platform/linux-secret-service-binding.js",
   ]);
-  const forbiddenSpecifier = /(?:linux-(?:autostart|desktop-capabilities|tray-assets)|platform\/linux-(?:state-composition|xdg-paths))/u;
+  // The settings adapter now owns the one explicit XDG autostart integration.
+  // The remaining desktop/credential foundations must stay out of production.
+  const forbiddenSpecifier = /(?:linux-(?:desktop-capabilities|tray-assets)|platform\/linux-(?:state-composition|xdg-paths))/u;
   const graph = await collectProductionDependencyGraph(productionCompositionRoots);
   const relativeGraph = new Set([...graph.paths].map(repositoryRelativePath));
   assert.ok(

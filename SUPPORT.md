@@ -68,12 +68,65 @@ the diagnostic text is safe.
 
 If TiboTattle closes during launch, note whether a native alert shows the fixed
 support code `electron_shell_entry_failed`. This means startup stopped before
-the dashboard opened; it does not identify the underlying cause. On macOS,
-open **Console** with Spotlight, select **Crash Reports** in the sidebar, and
-look for a TiboTattle report at the launch time. After reviewing it for private
-paths and content, share only the exception type, termination reason, and top
-frames of the crashed thread. If there is no matching report, say so. A full
-unreviewed report is not needed for initial triage.
+the dashboard opened; it does not identify the underlying cause. On macOS, a
+person with this source checkout and Node.js 22.13+ can run the independent,
+read-only doctor **without opening TiboTattle**:
+
+```sh
+npm run diagnose:desktop-crash -- --hours 72
+```
+
+It checks recently modified TiboTattle Apple crash reports, prints only an allowlisted
+exception type, termination namespace/code, and up to five safe crashed-thread
+symbol names, then reports the local crash-capture preference and dump counts.
+Add `--verbose` for up to 20 crashed-thread frames per report, allowlisted app
+and macOS version fields, and up to 40 recent entries from the companion's
+owner-only diagnostics log. Those entries contain fixed codes and opaque
+support references, not raw session content; malformed or unknown fields are
+omitted. The doctor reports when a log is missing or entries could not be read.
+The verbose output still needs review before posting to a public issue.
+If deeper private review is needed, an affected user can explicitly create a
+local owner-only evidence directory at a new, absolute path outside the source
+checkout:
+
+```sh
+node scripts/diagnose-desktop-crash.mjs --hours 72 --verbose --export-private "$HOME/Desktop/TiboTattle-private-evidence"
+```
+
+This copies at most ten matching Apple reports and the current/previous bounded
+companion diagnostics logs into that directory with fixed filenames and a hash
+manifest. Add `--include-dumps` only when native Crashpad dumps are needed; at
+most four recent dumps are copied, subject to a 64 MiB bundle limit. The
+destination must not already exist. The manifest records skipped evidence,
+so a bounded export must not be described as every system log. TiboTattle does
+not have a persistent Electron main-process text log, and this command does not
+collect macOS-wide unified logs, Codex data, or Keychain material.
+If `manifest.json` is absent, the export did not finish; treat that directory
+as incomplete and do not share it.
+
+The private directory may contain paths, report text, and process memory. Keep
+it local until the user and maintainer agree on a private handoff; **do not post
+it in a public GitHub issue**. The command does not transmit or attach it.
+It does not start the app, access Codex sessions or Keychain, change settings,
+or send data. For machine-readable summary output use
+`node scripts/diagnose-desktop-crash.mjs --hours 72 --verbose --json`; it returns
+the same bounded fields for local Codex analysis.
+Stable reports are selected by default; add `--channel dev` for **TiboTattle
+Dev**, or `--channel all` for both. Neither standard nor verbose output includes
+raw reports, dump bytes, paths, or report filenames.
+The saved preference cannot prove that Crashpad was active when a particular
+crash happened; it takes effect only after an app launch. A displayed report
+timestamp is its file modification time, which may differ from the crash time.
+Review the output before sharing it. The existing `npm run doctor` checks Codex
+tool readiness; it is unrelated to desktop crash diagnosis. This source command
+is available before a new app release, but requires a current source checkout.
+
+If the CLI finds no matching report, or a report uses a newer Apple format it
+cannot read, open **Console** with Spotlight, select **Crash Reports**, and look
+at the launch time. After reviewing for private paths and content, share only
+the exception type, termination reason, and top frames of the crashed thread.
+A full unreviewed report is not needed for initial triage. No report does not
+rule out an early failure.
 
 ## Supported surface
 

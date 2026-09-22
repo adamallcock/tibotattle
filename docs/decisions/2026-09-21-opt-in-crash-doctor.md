@@ -28,8 +28,28 @@ unavailable preference fails closed. Other platforms do not offer this capture
 path yet.
 
 This captures crashes only after the reporter starts and does not diagnose
-every failure that prevents app startup. For a macOS launch failure, Apple
-Console → Crash Reports remains the fallback; share only reviewed exception
-type, termination reason, and crashed-thread top frames. Source tests validate
-the preference and projection boundaries. Packaged, installed, signed-release,
-and updater behavior require separate evidence.
+every failure that prevents app startup. The source checkout now has a separate
+read-only macOS command, `npm run diagnose:desktop-crash`, which runs under Node
+without starting Electron. It reads recent Apple crash reports through a bounded
+allowlist, and inspects the local capture preference and dump counts without
+reading dump bytes. It never changes preferences or sends data. Reports it cannot
+parse stay unavailable; the user can inspect them in Console and share only
+reviewed exception type, termination reason, and crashed-thread top frames.
+An explicit `--verbose` mode expands the local result to at most 20 safe symbol
+tokens per crashed thread and at most 40 recent, revalidated companion
+diagnostic notes per profile, including fixed status codes and support references.
+It still excludes raw Apple report text, Crashpad memory dumps, native free-form
+messages, and private paths. No mode automatically sends output.
+The separate `--export-private` mode is an explicit owner action that creates a
+new owner-only local directory outside the source checkout. It copies bounded,
+matching original Apple reports and companion diagnostic log generations under
+fixed names, with a content-free hash manifest. `--include-dumps` is a second
+explicit choice for up to four local Crashpad dumps; total copied bytes are
+capped. The directory is never attached, projected into ordinary diagnostics,
+or transmitted by TiboTattle. Raw contents may contain paths and process memory;
+the owner must review them and choose a private handoff with the maintainer.
+Public issues continue to receive only reviewed summary text.
+This source command does not make the in-app doctor available during a launch
+crash, and it is not an installed-app feature. Source tests validate the
+preference and projection boundaries. Packaged, installed, signed-release, and
+updater behavior require separate evidence.
