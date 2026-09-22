@@ -1,10 +1,12 @@
 # Windows native security adapter
 
-This is a fail-closed readiness component, not a supported Windows product
-lane. The current published application remains macOS-only; source compilation,
-native unit tests, a valid sidecar, or an approved mutex capability cannot by
-itself establish installed Windows, packaging, signing, updater, or release
-support. See the [current status matrix](../../docs/current-status.md).
+This is a fail-closed capability boundary. The published Electron application
+has a Windows x64 release, but this binding's general production/path-walk
+policy remains disabled. Its narrow source-reader is enabled in this unreleased
+source candidate, with native and packaged qualification pending. Source
+compilation, native unit tests, or a valid sidecar do not establish that the
+candidate works in the installed app. See the
+[current status matrix](../../docs/current-status.md).
 
 This directory contains the reviewed Windows-only filesystem and credential
 mutex boundary for private TiboTattle state. The binding is deliberately a
@@ -205,8 +207,16 @@ An optional closed `sourceRead` manifest capability binds the generic methods an
 contract to the native digest. Existing manifests remain compatible for their
 existing consumers. Source-read approval is separate from the still-disabled
 general production/path-walk policies and requires the approved audit guard.
-`WINDOWS_SOURCE_READ_APPROVED` remains false, and the loader refuses this feature.
-A sidecar-only approval edit is rejected. Run the native security suite against a
-rebuilt exact binary and manifest on Windows x64, complete policy review, then
-run the packaged worker before enabling the narrow policy. See the
+`WINDOWS_SOURCE_READ_APPROVED` is true in the unreleased source candidate; the
+loader still rejects a missing or mismatched binding, manifest, contract, or
+audit guard. A sidecar-only approval edit is rejected. Run the native security
+suite against a rebuilt exact binary and manifest on Windows x64, then the
+packaged worker smoke before merging this candidate. See the
 [implementation and qualification plan](../../docs/plans/2026-09-13-windows-model-performance.md).
+
+The native and packaged timing qualifications use disposable synthetic Codex
+sources. On elevated hosted runners a new file can take the Administrators
+group as its default owner. Fixture setup gives its isolated child process a
+current-user default owner before creating the source, so Windows assigns its
+ordinary inherited/default DACL at creation. Real Codex sources are never
+modified by this setup; the native reader still refuses a foreign owner.

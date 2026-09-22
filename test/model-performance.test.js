@@ -7,12 +7,23 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { modelPerformanceProjection } from '../src/reporting/index.js';
 import { createModelPerformanceController } from '../apps/local/model-performance-controller.js';
-import { loadWindowsSourceReadBinding } from '../src/platform/windows-filesystem.js';
+import { createModelPerformanceSnapshotStore } from '../apps/local/model-performance-snapshots.js';
+import { modelPerformanceSupplementDirectory } from '../apps/local/model-performance-worker.js';
+import { createWindowsFilesystemAdapter, loadWindowsSourceReadBinding } from '../src/platform/windows-filesystem.js';
+import { createWindowsSyntheticOwnedSource } from '../scripts/lib/windows-synthetic-source-owner.mjs';
 
 const NOW = Date.parse('2026-09-09T12:00:00Z'), DAY = 86400000;
 const row = (patch = {}) => ({ at: NOW, model: 'gpt-5.6-sol', sample_method: 'receipt',
   sample_tokens: 100, sample_duration: 1000, sample_responses: 1, sample_total_responses: 2,
   ttft: 5000, ...patch });
+test('Windows supplemental timing store avoids the primary guard ancestors', () => {
+  const timingRoot = join('/state', 'inference-timing-v2');
+  const directory = join(timingRoot, 'source-0123456789abcdef');
+  assert.equal(modelPerformanceSupplementDirectory({ directory, timingRoot, platform: 'win32' }),
+    join('/state', 'inference-timing-tool-free-v1', 'source-0123456789abcdef'));
+  assert.equal(modelPerformanceSupplementDirectory({ directory, timingRoot, platform: 'darwin' }),
+    join(directory, 'tool-free-v1'));
+});
 test('period coverage is independent and combines compatible speed evidence', () => {
   const rows = [row(), row({ sample_method: 'legacy', sample_tokens: 200 }),
     row({ sample_duration: null }), row({ ttft: null }), row({ at: NOW - 8 * DAY }),
@@ -161,16 +172,10 @@ class BlockedWorker extends EventEmitter {
     queueMicrotask(() => this.emit('exit', 0));
   }
 }
-async function waitForSavedSnapshot(file, updatedAt) {
-  const deadline = Date.now() + 2000;
-  while (Date.now() < deadline) {
-    try {
-      const receipt = JSON.parse(await readFile(file, 'utf8'));
-      if (receipt.snapshot.values.some(value => value.updatedAt === updatedAt)) return receipt;
-    } catch { /* The first atomic receipt may not exist yet. */ }
-    await new Promise(resolve => setTimeout(resolve, 5));
-  }
-  assert.fail('complete snapshot was not persisted');
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
 }
 async function snapshotFixture(t) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'model-speed-snapshot-')));
@@ -323,8 +328,23 @@ test('complete measurements persist immediately, then hourly, and flush the late
   t.after(() => rm(root, { recursive: true, force: true }));
   const directory = join(root, 'timing'), file = join(directory, 'model-performance-snapshot.json');
   let now = NOW, worker;
+  const writeCompletions = [];
   const options = { directory, codexHome: join(root, 'codex'), platform: 'darwin', snapshotNow: () => now,
-    workerFactory: () => worker = new BlockedWorker() };
+    workerFactory: () => worker = new BlockedWorker(),
+    snapshotStoreFactory: storeOptions => {
+      const store = createModelPerformanceSnapshotStore(storeOptions);
+      return {
+        read: (...args) => store.read(...args),
+        write(values) {
+          const completion = deferred();
+          writeCompletions.push(completion);
+          return store.write(values).then(result => { completion.resolve(result); return result; }, error => {
+            completion.resolve(false);
+            throw error;
+          });
+        },
+      };
+    } };
   let controller = createModelPerformanceController(options);
   const publish = count => worker.emit('message', { type: 'snapshots', values: [
     modelPerformanceProjection(Array.from({ length: count }, () => row()), { now }),
@@ -332,28 +352,35 @@ test('complete measurements persist immediately, then hourly, and flush the late
   try {
     await controller.read('all');
     publish(1);
-    const first = await waitForSavedSnapshot(file, new Date(now).toISOString());
-    assert.equal(first.savedAt, new Date(now).toISOString());
+    assert.equal(writeCompletions.length, 1, 'cadence_first_persistence');
+    assert.equal(await writeCompletions[0].promise, true, 'cadence_first_persistence');
+    const first = JSON.parse(await readFile(file, 'utf8'));
+    assert.equal(first.savedAt, new Date(now).toISOString(), 'cadence_first_persistence');
     now += 5_000;
     publish(2);
-    assert.equal((await controller.read('all')).models[0].turns, 2, 'live results are never throttled');
-    assert.equal(JSON.parse(await readFile(file, 'utf8')).snapshot.values[0].models[0].turns, 1);
+    assert.equal((await controller.read('all')).models[0].turns, 2, 'cadence_live_unthrottled');
+    assert.equal(JSON.parse(await readFile(file, 'utf8')).snapshot.values[0].models[0].turns, 1,
+      'cadence_no_early_write');
     now = NOW + 60 * 60 * 1_000;
     publish(3);
-    await waitForSavedSnapshot(file, new Date(now).toISOString());
+    assert.equal(writeCompletions.length, 2, 'cadence_hourly_persistence');
+    assert.equal(await writeCompletions[1].promise, true, 'cadence_hourly_persistence');
+    const hourly = JSON.parse(await readFile(file, 'utf8'));
+    assert.equal(hourly.snapshot.values[0].models[0].turns, 3, 'cadence_hourly_persistence');
     now += 5_000;
     publish(4);
     await controller.close();
+    assert.equal(writeCompletions.length, 3, 'cadence_close_flush');
     const closed = JSON.parse(await readFile(file, 'utf8'));
-    assert.equal(closed.snapshot.values[0].models[0].turns, 4, 'close flushes the latest completed value');
-    assert.equal(closed.savedAt, new Date(now).toISOString());
+    assert.equal(closed.snapshot.values[0].models[0].turns, 4, 'cadence_close_flush');
+    assert.equal(closed.savedAt, new Date(now).toISOString(), 'cadence_close_flush');
     controller = createModelPerformanceController(options);
-    assert.equal((await controller.read('all')).models[0].turns, 4);
+    assert.equal((await controller.read('all')).models[0].turns, 4, 'cadence_restart');
     now += 5_000;
     publish(5);
-    assert.equal((await controller.read('all')).models[0].turns, 5);
+    assert.equal((await controller.read('all')).models[0].turns, 5, 'cadence_restart');
     assert.equal(JSON.parse(await readFile(file, 'utf8')).snapshot.values[0].models[0].turns, 4,
-      'restart preserves the persisted write interval');
+      'cadence_restart');
   } finally { await controller.close(); }
 });
 test('rebuilding and failed measurements retain complete results and only complete empty results replace them', async t => {
@@ -560,9 +587,19 @@ test('actual worker persists separate Codex sources and preserves the unscoped l
       usage: { output_tokens: 100, reasoning_output_tokens: 50 },
       turn_token_usage: { output_tokens: 100, reasoning_output_tokens: 50 } }),
     rec(1000, 'event_msg', { type: 'task_complete', turn_id: turn, duration_ms: 1000, time_to_first_token_ms: 200 })];
-  await writeFile(join(codexHome, 'sessions', 'synthetic.jsonl'), rows.map(r => JSON.stringify(r)).join('\n') + '\n');
+  const sourcePath = join(codexHome, 'sessions', 'synthetic.jsonl');
+  const sourceContent = rows.map(r => JSON.stringify(r)).join('\n') + '\n';
+  if (process.platform === 'win32') createWindowsSyntheticOwnedSource(sourcePath, sourceContent);
+  else await writeFile(sourcePath, sourceContent);
   const options = { directory: join(root, 'timing'), codexHome };
-  await mkdir(options.directory, { mode: 0o700 });
+  // The native Windows timing store requires an owner-only directory. A
+  // Node-created child of the runner temp root can inherit a broader DACL.
+  if (process.platform === 'win32') {
+    let nativeBindingAvailable = true;
+    try { loadWindowsSourceReadBinding(); } catch { nativeBindingAvailable = false; }
+    if (nativeBindingAvailable) createWindowsFilesystemAdapter().ensureDirectory(options.directory);
+    else await mkdir(options.directory, { mode: 0o700 });
+  } else await mkdir(options.directory, { mode: 0o700 });
   const legacyFile = join(options.directory, 'timing-experiment.sqlite');
   const legacyBytes = Buffer.from('synthetic legacy sidecar with unknown source provenance');
   await writeFile(legacyFile, legacyBytes, { mode: 0o600 });
@@ -581,6 +618,9 @@ test('actual worker persists separate Codex sources and preserves the unscoped l
     if (process.platform === 'win32') {
       let unavailable = false;
       try { loadWindowsSourceReadBinding(); } catch { unavailable = true; }
+      if (process.env.USAGE_MONITOR_WINDOWS_QUALIFICATION === '1') {
+        assert.equal(unavailable, false, 'native Windows qualification requires the exact source-read binding');
+      }
       if (unavailable) {
         const deadline = Date.now() + 10000;
         let result;

@@ -8,12 +8,13 @@ import { createModelPerformanceSnapshotStore, isCompleteModelPerformanceSnapshot
 
 export function createModelPerformanceController({ directory, codexHome,
   idleMs = 60_000, snapshotNow = () => Date.now(), snapshotWriteIntervalMs = 60 * 60 * 1_000,
-  workerFactory = options => new Worker(new URL('./model-performance-worker.js', import.meta.url), options) }) {
+  workerFactory = options => new Worker(new URL('./model-performance-worker.js', import.meta.url), options),
+  snapshotStoreFactory = options => createModelPerformanceSnapshotStore(options) }) {
   if (typeof snapshotNow !== 'function') throw new TypeError('snapshotNow must be a function');
   if (!Number.isSafeInteger(snapshotWriteIntervalMs) || snapshotWriteIntervalMs < 1)
     throw new TypeError('snapshotWriteIntervalMs must be a positive integer');
   const cache = new Map(), complete = new Map(), windows = new Map();
-  const store = createModelPerformanceSnapshotStore({ directory, codexHome, now: snapshotNow });
+  const store = snapshotStoreFactory({ directory, codexHome, now: snapshotNow });
   const sourceScope = modelPerformanceSourceScope(codexHome);
   const timingRoot = sourceScope && typeof directory === 'string' ? directory : undefined;
   // Keep each configured source's durable rows separate. The legacy unscoped

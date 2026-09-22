@@ -4632,7 +4632,11 @@ test("Claude usage shadow failure is contained and abort releases a non-cooperat
 });
 
 
-test("interactive macOS QA uses a separate prospective account key and disposes each refresh loader", async (t) => {
+test("interactive macOS QA uses a separate prospective account key and disposes each refresh loader", {
+  skip: process.platform === "win32"
+    ? "macOS development identity QA is not a Windows test"
+    : false,
+}, async (t) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "refresh-development-account-")));
   t.after(() => rm(root, { recursive: true, force: true }));
   const identity = join(root, "identity");

@@ -1,7 +1,7 @@
 import { parentPort, workerData, isMainThread } from 'node:worker_threads';
 import { createHash } from 'node:crypto';
 import { opendir, lstat, mkdir, realpath } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { openTimingStore, ingestTimingFile, readTimingRows } from '../../src/platform/index.js';
@@ -10,6 +10,19 @@ import {
   prepareTelemetryPerformanceDay,
   projectTelemetryPerformanceDay,
 } from '../../src/application/index.js';
+
+// The Windows native SQLite guard retains the two nearest parent-directory
+// handles with delete sharing disabled. A nested supplemental store would
+// therefore be unable to reopen its guarded parent while the primary store is
+// live. Keep the sidecar under a sibling root on Windows so both stores can be
+// opened concurrently without weakening the native guard.
+export function modelPerformanceSupplementDirectory({ directory, timingRoot, platform = process.platform }) {
+  if (platform !== 'win32' || typeof timingRoot !== 'string' || timingRoot.length === 0
+      || typeof directory !== 'string' || directory.length === 0) {
+    return join(directory, 'tool-free-v1');
+  }
+  return join(dirname(timingRoot), 'inference-timing-tool-free-v1', basename(directory));
+}
 
 const PERFORMANCE_PARSER_VERSION = 'codex-inference-timing-v17';
 const PERFORMANCE_DAY = /^\d{4}-\d{2}-\d{2}$/u;
@@ -159,7 +172,12 @@ async function run() {
     store = await context.open(workerData.directory);
     // Publish only after both independent stores are opened so the first
     // revision token does not spuriously change when the supplement appears.
-    try { supplement = await context.openSupplement(join(workerData.directory, 'tool-free-v1'), store.key); }
+    try {
+      supplement = await context.openSupplement(modelPerformanceSupplementDirectory({
+        directory: workerData.directory,
+        timingRoot: workerData.timingRoot,
+      }), store.key);
+    }
     catch { degraded = true; }
     await drainPerformanceRequests();
     publish(true);

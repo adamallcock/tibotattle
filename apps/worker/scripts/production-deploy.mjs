@@ -906,9 +906,9 @@ export async function createImmutableSourceSnapshot({
   sourceCommit,
 }) {
   const repositoryRoot = sourceRepositoryRoot(workerDirectory);
-  const snapshotParent = await mkdtemp(
+  const snapshotParent = realpathSync(await mkdtemp(
     join(tmpdir(), "usage-monitor-production-source-"),
-  );
+  ));
   const snapshotRoot = join(snapshotParent, "repository");
   let worktreeAdded = false;
   try {
@@ -1407,11 +1407,15 @@ async function runProductionDeploymentFromSnapshot({
   if (typedDeployment && confirmedMigrations !== null) {
     return typedFailure("PRODUCTION_TYPED_MIGRATIONS_UNSUPPORTED");
   }
-  const pendingCheck = migrationGateCheck ?? await determinePendingMigrations({
+  // Typed roles have already passed independent exact-schema qualification.
+  // Their restore lineage does not use the legacy JSON migration ledger.
+  const pendingCheck = migrationGateCheck ?? (typedDeployment
+    ? { ok: true, code: null, pending: [] }
+    : await determinePendingMigrations({
     wrangler,
     workerDirectory,
     spawn,
-  });
+  }));
   if (!pendingCheck?.ok) {
     return pendingCheck?.code
       ? pendingCheck

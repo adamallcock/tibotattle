@@ -2167,11 +2167,13 @@ test("typed deployment installs the live config in the immutable snapshot and re
     },
     retainedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT,
     expectedLiveManifestSha256: "1".repeat(64),
-    migrationGateCheck: { ok: true, code: null, pending: [] },
+    migrationGateCheck: null,
+    determinePendingMigrations: async () => assert.fail("Qualified typed roles must not query the legacy migration ledger"),
     releasePreflight: async () => ({ state: "ready", blockers: [] }),
     checkWorkspacePackages: async () => {},
     checkEndpoints: async () => {},
     stageAssets: async ({ repositoryRoot }) => {
+      assert.equal(realpathSync(repositoryRoot), repositoryRoot);
       const configMetadata = await lstat(
         join(repositoryRoot, "apps", "worker", "wrangler.jsonc"),
       );

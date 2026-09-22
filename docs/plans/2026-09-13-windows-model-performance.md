@@ -2,14 +2,17 @@
 title: Windows model-performance storage and ingestion
 date: 2026-09-13
 type: plan
-status: native-qualification-pending
+status: source-qualified
 ---
 
-The local implementation on `codex/windows-model-performance` now uses shared
-filesystem and SQLite primitives. Windows model performance remains unavailable
-until native qualification; this is not release or installed-artifact evidence.
-The isolated branch starts at `9385bad2` and preserves the main checkout's
-uncommitted work. Accounting and timing schemas are unchanged.
+The shared filesystem and SQLite implementation is present on main. Source
+`f2e12fd0ffd717a2e4e22ac5e2774bb0a232b3df` enables the narrow Windows
+source-read capability and passed its clean/warm native and unsigned packaged
+Electron qualification before
+[PR #199](https://github.com/adamallcock/tibotattle/pull/199) merged on
+2026-09-22. The released 0.1.22 Windows model-performance page remains
+unavailable. Accounting and timing schemas are unchanged by this capability
+switch.
 
 ## Implemented boundaries
 
@@ -39,9 +42,9 @@ uncommitted work. Accounting and timing schemas are unchanged.
   tied to the exact native contract and all four methods. Older manifests remain
   compatible for their existing consumers. The source-read loader requires narrow
   approval and existing audit-guard approval, without enabling unrelated native
-  write/path-walk policy. `WINDOWS_SOURCE_READ_APPROVED` remains false; edited
-  sidecar approval is rejected. Qualification must explicitly change that reviewed
-  policy and regenerate the binary-bound manifest.
+  write/path-walk policy. `WINDOWS_SOURCE_READ_APPROVED` is true in the source
+  candidate; an edited or mismatched sidecar is rejected. Qualification builds
+  the binary-bound manifest from this exact reviewed source.
 - Electron runtime, qualification authority and artifact verification include the
   shared SQLite helper. Worker capability failure occurs before source discovery
   and remains bounded, retryable and explicitly unavailable.
@@ -54,8 +57,8 @@ a hot journal that SQLite deleted on its first schema query. Setting PERSIST
 alone also deleted it during recovery, conflicting with Windows delete denial.
 The corrected shared sequence preserves the journal inode through every startup
 statement and database close in a real SQLite test, rolls back uncommitted data,
-and lets a second connection read and write afterward. This is portable SQLite
-evidence; Windows kernel enforcement still needs the native run. See SQLite's
+and lets a second connection read and write afterward. The later native Windows
+qualification exercised the protected filesystem and timing paths. See SQLite's
 [locking mode documentation](https://www.sqlite.org/pragma.html#pragma_locking_mode)
 and [hot-journal recovery](https://www.sqlite.org/lockingv3.html#dealing_with_hot_journals).
 
@@ -66,9 +69,10 @@ limit is different: oversized individual records remain explicitly partial.
 Existing discovery and projection capacity ceilings remain separate concerns;
 this change does not remove resource limits or reinterpret them as retention.
 
-## Validation and remaining gates
+## Validation and release boundary
 
-On macOS with Node 26.2.0, the focused shared SQLite, audit, loader, manifest,
+The earlier source-preparation run on macOS with Node 26.2.0 passed the focused
+shared SQLite, audit, loader, manifest,
 source/rollout/compressed-reader and timing suite passed 92 tests. Synthetic
 bindings test orchestration and real SQLite behavior, not Windows ACLs.
 The full local companion suite passed 356 tests. Electron staging/package tests
@@ -77,10 +81,19 @@ platform-specific skips. Four API/facade contract tests passed. Architecture,
 documentation and preflight checks passed. These are local source and portable
 packaging checks, not an installed Windows artifact or native build receipt.
 
-Remaining native gates: build the exact Windows x64 binary and sidecar; run
-`test/windows-filesystem-security.test.js`, including held-source replacement,
-junction/hard-link refusal, foreign leases, guarded journaling and hot-journal
-crash recovery; complete native policy review; then run the packaged timing
-worker against synthetic logs and verify TPS/TTFT, restart and graceful refusal.
-Only after that evidence should narrow source-read approval or the visible
-Windows availability claim change. No signing, install, push or release occurred.
+The exact source head passed both clean and warm native Windows x64 security
+qualification in [run 35694491358](https://github.com/adamallcock/tibotattle/actions/runs/35694491358).
+That gate built the binary-bound sidecar and exercised the reviewed native test
+set, including the real model-performance worker and protected filesystem paths.
+The unsigned packaged Electron normal journey passed in
+[run 35694491314](https://github.com/adamallcock/tibotattle/actions/runs/35694491314).
+Its bounded receipt records packaged Electron execution, a rendered dashboard,
+synthetic fixture ingestion and retained totals across restart. Repository
+release-policy, documentation and committed-lock dependency checks also passed
+on the PR head.
+
+These results close the source merge gates. They do not qualify a final signed
+installer, an installed upgrade, updater delivery or public publication. The
+visible claim in the released app changes only after a successor artifact passes
+those release gates and is published; no signing, install or release was part of
+this source qualification.

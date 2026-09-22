@@ -6,6 +6,7 @@ import {
   createServer as createHttpServer,
   request as httpRequest,
 } from "node:http";
+import { lstatSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -308,8 +309,20 @@ test("refresh timeout classifier grants the cold window only to missing or prove
       schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
     });
     await chmod(unreadable, 0o000);
+    const unreadableOptions = process.platform === "win32"
+      ? {
+        inspect(target) {
+          if (target === unreadable) {
+            const error = new Error("synthetic unreadable fixture");
+            error.code = "EACCES";
+            throw error;
+          }
+          return lstatSync(target);
+        },
+      }
+      : {};
     assert.equal(
-      localCompanionRefreshTimeoutForUnifiedIndex(unreadable),
+      localCompanionRefreshTimeoutForUnifiedIndex(unreadable, unreadableOptions),
       incrementalTimeoutMs,
     );
 

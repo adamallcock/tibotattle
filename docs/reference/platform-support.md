@@ -75,14 +75,17 @@ useful within their recorded scope; they do not establish continuity of an
 existing user's credentials in a later installer. Physical update replacement
 and notification appearance remain accepted user-testing limits.
 
-The 0.1.22 **model-performance page is unavailable on Windows** until
-its protected session-state reader is qualified there. That is a feature
-availability boundary, not a statement that the normal Windows application or
-local usage processing is unavailable. The Windows timing
-adapter and native source-reader implementation are prepared in the
-[Windows model-performance plan](../plans/2026-09-13-windows-model-performance.md);
-native qualification and policy approval remain open. This is not a release
-support change.
+The 0.1.22 **model-performance page is unavailable on Windows**. That is a
+released-feature boundary, not a statement that the normal Windows application
+or local usage processing is unavailable. The successor source enables the
+protected timing reader. Exact-head clean and warm native Windows qualification
+and the unsigned packaged Electron normal journey passed for source
+`f2e12fd0ffd717a2e4e22ac5e2774bb0a232b3df` before
+[PR #199](https://github.com/adamallcock/tibotattle/pull/199) merged. The
+[Windows model-performance plan](../plans/2026-09-13-windows-model-performance.md)
+records that source qualification. A signed final installer, installed/update
+lifecycle evidence and publication remain separate gates for the next release;
+the source result does not change the published 0.1.22 artifact.
 
 ## Linux
 
