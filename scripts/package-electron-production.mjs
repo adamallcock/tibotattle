@@ -632,7 +632,10 @@ if (resolve(process.argv[1] ?? "") === SCRIPT_FILE) {
     const options = parseProductionCandidateArguments(process.argv.slice(2));
     process.stdout.write(`${JSON.stringify(await prepareProductionElectronCandidate(options), null, 2)}\n`);
   } catch (error) {
-    process.stderr.write(`${/^ELECTRON_PRODUCTION_[A-Z_]+$/u.test(error?.code ?? "")
+    // The staging layers use fixed error codes. Surface those codes so a
+    // protected CI candidate can be diagnosed without printing paths or
+    // private error messages from the underlying filesystem/dependencies.
+    process.stderr.write(`${/^[A-Z][A-Z0-9_]{0,79}$/u.test(error?.code ?? "")
       ? error.code
       : "ELECTRON_PRODUCTION_FAILED"}\n`);
     process.exitCode = 1;

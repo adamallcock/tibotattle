@@ -81,7 +81,8 @@ availability boundary, not a statement that the normal Windows application or
 local usage processing is unavailable. The Windows timing
 adapter and native source-reader implementation are prepared in the
 [Windows model-performance plan](../plans/2026-09-13-windows-model-performance.md);
-native qualification and policy approval remain open. This is not a release
+the narrow capability is enabled in an unreleased source candidate, while native
+and packaged qualification remain open. This is not a release
 support change.
 
 ## Linux

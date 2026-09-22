@@ -491,10 +491,10 @@ test("verifies Windows x64 binding and sidecar digests without promoting provena
   });
 });
 
-test("accepts the disabled optional source-read sidecar while retaining old sidecars", async () => {
+test("accepts the approved optional source-read sidecar while retaining old sidecars", async () => {
   await withFixture("win32-x64", { sourceReadBinding: true }, async (fixture) => {
     assert.deepEqual(fixture.bindingManifest.sourceRead, {
-      approved: false,
+      approved: true,
       contractVersion: "windows-source-read-v1",
     });
     const result = await verify(fixture, "win32-x64");
@@ -622,9 +622,9 @@ test("requires the exact versioned Windows sidecar schema and policy consistency
       },
     },
     {
-      label: "self-enabled source-read approval",
+      label: "source-read approval disagrees with code policy",
       mutate: (sidecar) => {
-        sidecar.sourceRead = { approved: true, contractVersion: "windows-source-read-v1" };
+        sidecar.sourceRead = { approved: false, contractVersion: "windows-source-read-v1" };
       },
     },
     {

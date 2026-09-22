@@ -84,6 +84,7 @@ const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
   "createOwnerOnlyExportWorkspaceStorageContext",
   "createSourceFileAccess",
   "createTelemetryV11Envelope",
+  "createValidatedSnapshotStore",
   "createWindowsAccountObservationBrokerBackend",
   "createWindowsAccountObservationBrokerBackendFromEnvironment",
   "createWindowsAccountObservationBrokerTransport",

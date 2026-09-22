@@ -108,13 +108,13 @@ test("manifest builder refuses an unreviewed native production claim", () => {
   );
 });
 
-test("manifest source-read extension is additive and cannot approve itself", () => {
+test("manifest source-read extension follows the reviewed source policy only", () => {
   const extension = {
     sourceReadContractVersion: 'windows-source-read-v1',
     openSourceFile() {}, statSourceFile() {}, readSourceFile() {}, closeSourceFile() {},
   };
   const result = createWindowsFilesystemBindingManifest({ bytes: BYTES, binding: binding(extension) });
-  assert.deepEqual(result.sourceRead, { contractVersion: 'windows-source-read-v1', approved: false });
+  assert.deepEqual(result.sourceRead, { contractVersion: 'windows-source-read-v1', approved: true });
   assert.equal(result.approvedPolicy.productionSafe, false);
   assert.equal(result.approvedPolicy.pathWalkRaceSafe, false);
   for (const name of ['openSourceFile', 'statSourceFile', 'readSourceFile', 'closeSourceFile']) {

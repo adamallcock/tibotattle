@@ -22,11 +22,14 @@ import {
 } from "../src/local-installation-diagnostics.js";
 import { localCodexLogScanner } from "../src/local-node-runtime.js";
 import { WindowsProtectedStateStoreError } from "../src/platform/windows-protected-state-store.js";
+import { loadWindowsSourceReadBinding } from "../src/platform/windows-filesystem.js";
 import {
   buildWindowsNormalCandidateEnvironment,
   buildWindowsNormalCandidateLaunchSpec,
   prepareWindowsDevelopmentProfile,
 } from "../scripts/launch-electron-windows-development.mjs";
+import { classifyWindowsSyntheticSourceOwnerFailure,
+  createWindowsSyntheticOwnedSource } from "../scripts/lib/windows-synthetic-source-owner.mjs";
 import {
   buildWindowsNormalCandidateCodexFixture,
   buildWindowsNormalCandidateFirewallCreateArguments,
@@ -35,6 +38,7 @@ import {
   createWindowsNormalCandidateQuitProtocol,
   createWindowsNormalCandidateProductFailureDiagnostics,
   createWindowsNormalCandidateStartupStderrObserver,
+  classifyWindowsNormalCandidateModelPerformance,
   classifyWindowsNormalCandidateStartupCdpChild,
   installOutboundFirewallBlock,
   inspectWindowsNormalCandidateCdpEndpoint,
@@ -65,6 +69,7 @@ import {
   selectWindowsNormalCandidateSettingsTarget,
   validateWindowsNormalCandidateSmokeMetadata,
   verifyWindowsNormalCandidateSyntheticIngestion,
+  verifyWindowsNormalCandidateModelPerformance,
   verifyWindowsNormalCandidateOptOut,
   verifyWindowsNormalCandidateSmokePackage,
   WINDOWS_NORMAL_CANDIDATE_FIREWALL_TIMEOUT_MS,
@@ -76,6 +81,60 @@ const STAGED_APP_PATH = String.raw`C:\candidate\app`;
 const SOURCE_CANDIDATE_PATH = String.raw`C:\candidate\production-source-candidate.json`;
 const RECEIPT_PATH = String.raw`C:\workspace\.release-build\electron-windows-normal-candidate\normal-candidate-smoke.json`;
 const FIREWALL_RULE = "tibotattle-normal-candidate-550e8400-e29b-41d4-a716-446655440000";
+
+test("disposable Windows source is created with current-user owner and fixed errors", () => {
+  const path = String.raw`C:\runner\owned\synthetic.jsonl`;
+  let invocation;
+  createWindowsSyntheticOwnedSource(path, "synthetic\n", {
+    environment: { PSModulePath: "private-module-path", SystemRoot: String.raw`C:\Windows` },
+    run: (command, args, options) => {
+      invocation = { command, args, options };
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.equal(invocation.command, "powershell.exe");
+  assert.equal(invocation.options.env.TIBOTATTLE_SYNTHETIC_SOURCE_FILE, path);
+  assert.equal(invocation.options.env.TIBOTATTLE_SYNTHETIC_SOURCE_LENGTH, "10");
+  assert.equal(Object.hasOwn(invocation.options.env, "PSModulePath"), false);
+  assert.equal(invocation.options.input.toString(), "synthetic\n");
+  assert.match(invocation.args.at(-1), /SetTokenInformation/u);
+  assert.match(invocation.args.at(-1), /CreateNew/u);
+  assert.doesNotMatch(invocation.args.at(-1), /SetNamedSecurityInfo/u);
+  let failure;
+  try {
+    createWindowsSyntheticOwnedSource(path, "synthetic\n", {
+      run: () => ({ status: 50, stdout: "", stderr: "private-ACL-value" }),
+    });
+  } catch (error) { failure = error; }
+  assert.equal(classifyWindowsSyntheticSourceOwnerFailure(failure), "synthetic_owner_create_dacl_failed");
+  assert.equal(failure.message, "synthetic_owner_create_dacl_failed");
+  assert.throws(() => createWindowsSyntheticOwnedSource("relative.jsonl", "synthetic\n"),
+    /synthetic_owner_create_invalid_path/u);
+});
+
+test("packaged Windows timing smoke requires a complete ready source scan", () => {
+  const ready = { schemaVersion: 4, method: 5, status: "ready", collecting: false,
+    stale: false, period: "all", models: [{ id: "gpt-5.6-sol", turns: 1,
+      speed: [{ points: [{ median: 13.3 }] }], ttft: [{ median: 1 }] }],
+    historyProgress: { checked: 1, total: 1 } };
+  assert.equal(verifyWindowsNormalCandidateModelPerformance(ready), true);
+  for (const value of [null, { ...ready, schemaVersion: 2 }, { ...ready, method: 3 },
+    { ...ready, status: "unavailable" },
+    { ...ready, status: "loading" }, { ...ready, stale: true },
+    { ...ready, historyProgress: null },
+    { ...ready, historyProgress: { checked: 0, total: 1 } },
+    { ...ready, historyProgress: { checked: 0, total: 0 } },
+    { ...ready, models: null }, { ...ready, models: [] },
+    { ...ready, models: [{ ...ready.models[0], speed: [] }] },
+    { ...ready, models: [{ ...ready.models[0], ttft: [] }] }]) {
+    assert.equal(verifyWindowsNormalCandidateModelPerformance(value), false);
+  }
+  assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "unavailable" }), "UNAVAILABLE");
+  assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "ready", stale: true }), "STALE");
+  assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "loading" }), "LOADING");
+  assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "ready" }), "INCOMPLETE");
+  assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "unexpected" }), "INVALID");
+});
 
 test("startup failure diagnostics retain only fixed categories and booleans", () => {
   const value = { launch: "restart", requests: "zero", refreshStatus: "idle",
@@ -1152,11 +1211,12 @@ test("normal candidate adds one content-free Codex source before launch", async 
   );
   const records = fixtureContent.trim().split("\n").map((line) => JSON.parse(line));
   assert.deepEqual(records.map((record) => record.type), [
-    "session_meta", "turn_context", "event_msg",
+    "session_meta", "event_msg", "event_msg", "turn_context", "event_msg",
+    "response_item", "event_msg", "event_msg",
   ]);
   assert.equal(records[0].payload.id, "70000000-0000-4000-8000-000000000001");
-  assert.equal(records[1].payload.model, "gpt-5.6-sol");
-  assert.equal(records[2].payload.info.total_token_usage.total_tokens, 120);
+  assert.equal(records[3].payload.model, "gpt-5.6-sol");
+  assert.equal(records[6].payload.info.total_token_usage.total_tokens, 120);
   assert.deepEqual(calls, [
     {
       kind: "directory",
@@ -1177,6 +1237,16 @@ test("normal candidate adds one content-free Codex source before launch", async 
     writeFixture: async () => {},
   }), {
     code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_SYNTHETIC_FIXTURE_UNAVAILABLE",
+  });
+  await assert.rejects(seedWindowsNormalCandidateCodexFixture({ profile }, {
+    now: () => NORMAL_CANDIDATE_FIXTURE_CLOCK_MS,
+    createDirectory: async () => {},
+    metadata: async () => ({ isDirectory: () => true, isSymbolicLink: () => false }),
+    writeFixture: (path, contents) => createWindowsSyntheticOwnedSource(path, contents, {
+      run: () => ({ status: 50, stdout: "", stderr: "private-ACL-value" }),
+    }),
+  }), {
+    code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_SYNTHETIC_FIXTURE_OWNER_CREATE_DACL_FAILED",
   });
 });
 
@@ -1228,6 +1298,7 @@ test("normal candidate fixture passes Codex discovery, onboarding, and local ref
       captured.fileName = win32.basename(path);
       captured.content = value;
     },
+    normalizeOwner: () => {},
   });
   const root = await mkdtemp(join(await realpath(tmpdir()), "tibotattle-windows-normal-fixture-"));
   const codexHome = join(root, "codex");
@@ -1316,6 +1387,30 @@ test("normal candidate fixture passes Codex discovery, onboarding, and local ref
       launch: "first",
       expectedRefreshId: terminal.refreshId,
     }), true);
+    let nativeTimingAvailable = true;
+    if (process.platform === "win32") {
+      try { loadWindowsSourceReadBinding(); } catch { nativeTimingAvailable = false; }
+    }
+    let performance = null;
+    const timingDeadline = Date.now() + 10_000;
+    while (Date.now() < timingDeadline) {
+      performance = await fetch(`${base}/api/local/model-performance?period=all`).then((value) => value.json());
+      if ((!nativeTimingAvailable && performance.status === "unavailable")
+          || (nativeTimingAvailable && performance.status === "ready" && !performance.collecting)) break;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+    }
+    if (!nativeTimingAvailable) {
+      assert.equal(performance?.status, "unavailable", "the pre-binding Windows contract stays fail closed");
+    } else {
+      assert.equal(performance?.status, "ready");
+      assert.equal(performance.stale, false);
+      assert.equal(performance.models.length, 1);
+      assert.equal(performance.models[0].id, "gpt-5.6-sol");
+      assert.equal(performance.models[0].turns, 1);
+      assert.ok(performance.models[0].speed.some((series) => series.points.some((point) => point.median > 0)));
+      assert.ok(performance.models[0].ttft.some((point) => point.median > 0));
+      assert.equal(verifyWindowsNormalCandidateModelPerformance(performance), true);
+    }
     await app.close();
     app = await startLocalCompanionServer(serverOptions);
     const restartedBase = `http://127.0.0.1:${app.port}`;

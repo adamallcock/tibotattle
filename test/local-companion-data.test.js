@@ -2591,29 +2591,34 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
     ).run();
     restoreToolDatabase.close();
 
-    // A copy-on-write publisher replacing the path mid-read must not let the
-    // old opened inode masquerade as the current publication.
-    const movedIndexFile = `${unifiedIndexFile}.reader-race`;
-    let moved = false;
-    const raceBaselines = [];
-    raceBaselines[Symbol.iterator] = function* triggerReplacement() {
-      if (!moved) {
-        moved = true;
-        renameSync(unifiedIndexFile, movedIndexFile);
+    if (process.platform !== "win32") {
+      // A copy-on-write publisher replacing the path mid-read must not let the
+      // old opened inode masquerade as the current publication. Windows holds
+      // the SQLite path open during this read, so its kernel cannot exercise
+      // this POSIX rename race; native Windows replacement qualification covers
+      // that handle-level boundary separately.
+      const movedIndexFile = `${unifiedIndexFile}.reader-race`;
+      let moved = false;
+      const raceBaselines = [];
+      raceBaselines[Symbol.iterator] = function* triggerReplacement() {
+        if (!moved) {
+          renameSync(unifiedIndexFile, movedIndexFile);
+          moved = true;
+        }
+      };
+      let raced;
+      try {
+        raced = await readLocalUnifiedCompanionProjection({
+          indexFile: unifiedIndexFile,
+          declaredSpeedBaselines: raceBaselines,
+          nowMs: Date.parse("2026-07-25T12:00:00.000Z"),
+        });
+      } finally {
+        if (moved) renameSync(movedIndexFile, unifiedIndexFile);
       }
-    };
-    let raced;
-    try {
-      raced = await readLocalUnifiedCompanionProjection({
-        indexFile: unifiedIndexFile,
-        declaredSpeedBaselines: raceBaselines,
-        nowMs: Date.parse("2026-07-25T12:00:00.000Z"),
-      });
-    } finally {
-      if (moved) renameSync(movedIndexFile, unifiedIndexFile);
+      assert.equal(raced.status, "unavailable");
+      assert.equal(raced.errorCode, "local_unified_index_file_changed");
     }
-    assert.equal(raced.status, "unavailable");
-    assert.equal(raced.errorCode, "local_unified_index_file_changed");
 
     // The descriptor commits to the exact fixed-class fact set. Any in-place
     // edit after publication is withheld rather than silently displayed.

@@ -61,6 +61,8 @@ import {
   parseWindowsProcessSnapshot,
   runWindowsNsisLifecycleProgram,
 } from "./smoke-electron-windows-nsis-lifecycle.mjs";
+import { classifyWindowsSyntheticSourceOwnerFailure,
+  createWindowsSyntheticOwnedSource } from "./lib/windows-synthetic-source-owner.mjs";
 
 const require = createRequire(import.meta.url);
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
@@ -82,6 +84,7 @@ const SYNTHETIC_CODEX_SESSION_ID = "70000000-0000-4000-8000-000000000001";
 // window edge when a candidate journey runs long.
 const SYNTHETIC_CODEX_SESSION_AGE_MS = 2 * 24 * 60 * 60 * 1_000;
 const SYNTHETIC_CODEX_TURN_CONTEXT_OFFSET_MS = 1_000;
+const SYNTHETIC_CODEX_TURN_ID = "synthetic-turn";
 const SYNTHETIC_CODEX_TOKEN_COUNT_OFFSET_MS = 60_000;
 
 /** Codex names a canonical rollout after its session start, to whole seconds. */
@@ -113,9 +116,41 @@ export function buildWindowsNormalCandidateCodexFixture(nowMs = Date.now()) {
       payload: { id: SYNTHETIC_CODEX_SESSION_ID },
     },
     {
+      timestamp: at(0),
+      type: "event_msg",
+      payload: { type: "token_count", info: {
+        total_token_usage: { input_tokens: 0, cached_input_tokens: 0,
+          cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0,
+          total_tokens: 0 },
+        last_token_usage: { input_tokens: 0, cached_input_tokens: 0,
+          cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0,
+          total_tokens: 0 },
+      } },
+    },
+    {
+      timestamp: at(SYNTHETIC_CODEX_TURN_CONTEXT_OFFSET_MS),
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: SYNTHETIC_CODEX_TURN_ID },
+    },
+    {
       timestamp: at(SYNTHETIC_CODEX_TURN_CONTEXT_OFFSET_MS),
       type: "turn_context",
-      payload: { model: "gpt-5.6-sol" },
+      payload: { turn_id: SYNTHETIC_CODEX_TURN_ID, model: "gpt-5.6-sol", effort: "high" },
+    },
+    {
+      timestamp: at(3_000),
+      type: "event_msg",
+      payload: { type: "item_completed", thread_id: SYNTHETIC_CODEX_SESSION_ID,
+        turn_id: SYNTHETIC_CODEX_TURN_ID,
+        item: { type: "Reasoning" }, started_at_ms: startedAtMs + 2_000,
+        completed_at_ms: startedAtMs + 3_000 },
+    },
+    {
+      timestamp: at(3_500),
+      type: "response_item",
+      payload: { type: "reasoning", internal_chat_message_metadata_passthrough: {
+        turn_id: SYNTHETIC_CODEX_TURN_ID,
+      } },
     },
     {
       timestamp: at(SYNTHETIC_CODEX_TOKEN_COUNT_OFFSET_MS),
@@ -141,6 +176,13 @@ export function buildWindowsNormalCandidateCodexFixture(nowMs = Date.now()) {
           },
         },
       },
+    },
+    {
+      timestamp: at(SYNTHETIC_CODEX_TOKEN_COUNT_OFFSET_MS + 1_000),
+      type: "event_msg",
+      payload: { type: "task_complete", turn_id: SYNTHETIC_CODEX_TURN_ID,
+        duration_ms: SYNTHETIC_CODEX_TOKEN_COUNT_OFFSET_MS,
+        time_to_first_token_ms: 1_000 },
     },
   ].map((record) => JSON.stringify(record)).join("\n")}\n`;
   return Object.freeze({
@@ -196,6 +238,7 @@ const NORMAL_CANDIDATE_STARTUP_PHASES = new Set([
   "startup_refresh_completion",
   "explicit_refresh_acceptance",
   "explicit_refresh_completion",
+  "model_performance",
   "sharing_opt_out",
   "process_proof",
   "settings_target",
@@ -323,6 +366,23 @@ const FAILURE_CODES = new Set([
   "PROFILE_INVALID",
   "PROFILE_NOT_ABSENT",
   "SYNTHETIC_FIXTURE_UNAVAILABLE",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_INVALID_PATH",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_INVALID_CONTENTS",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_INPUT_TOO_LARGE",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_LAUNCH_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_TIMED_OUT",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_IDENTITY_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_NATIVE_SETUP_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_TOKEN_OWNER_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_FILE_WRITE_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_INPUT_LENGTH_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_CLOSE_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_OWNER_READ_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_OWNER_MISSING",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_OWNER_MISMATCH",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_DACL_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_CONTENT_LENGTH_FAILED",
+  "SYNTHETIC_FIXTURE_OWNER_CREATE_UNEXPECTED_EXIT",
   "PROTECTED_OPT_OUT_UNAVAILABLE",
   "FIREWALL_UNAVAILABLE",
   "FIREWALL_RULE_DIRTY",
@@ -349,6 +409,12 @@ const FAILURE_CODES = new Set([
   "LOCAL_EXPLICIT_REFRESH_ACCEPTANCE_UNAVAILABLE",
   "LOCAL_EXPLICIT_REFRESH_COMPLETION_UNAVAILABLE",
   "LOCAL_SYNTHETIC_INGESTION_UNAVAILABLE",
+  "LOCAL_MODEL_PERFORMANCE_UNAVAILABLE",
+  "LOCAL_MODEL_PERFORMANCE_LOADING",
+  "LOCAL_MODEL_PERFORMANCE_STALE",
+  "LOCAL_MODEL_PERFORMANCE_INCOMPLETE",
+  "LOCAL_MODEL_PERFORMANCE_INVALID",
+  "LOCAL_MODEL_PERFORMANCE_PAGE_UNAVAILABLE",
   "SETTINGS_UNAVAILABLE",
   "SETTINGS_PERSISTENCE_INVALID",
   "CLEAN_QUIT_INVALID",
@@ -885,7 +951,7 @@ async function protectedOptOutStage(stage, operation) {
 export async function seedWindowsNormalCandidateCodexFixture({ profile } = {}, {
   createDirectory = mkdir,
   metadata = lstat,
-  writeFixture = writeFile,
+  writeFixture = process.platform === "win32" ? createWindowsSyntheticOwnedSource : writeFile,
   now = Date.now,
 } = {}) {
   const home = exactWindowsPath(profile?.home);
@@ -910,6 +976,8 @@ export async function seedWindowsNormalCandidateCodexFixture({ profile } = {}, {
       mode: 0o600,
       flag: "wx",
     });
+    // Create the disposable source with the current-user owner from the start.
+    // A post-create owner change can rewrite its inherited access descriptor.
     const file = await metadata(fixture);
     if (!file?.isFile?.() || file.isSymbolicLink?.() || file.nlink !== 1
         || file.size !== Buffer.byteLength(source.content)) {
@@ -917,6 +985,8 @@ export async function seedWindowsNormalCandidateCodexFixture({ profile } = {}, {
     }
   } catch (error) {
     if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+    const ownerFailure = classifyWindowsSyntheticSourceOwnerFailure(error);
+    if (ownerFailure !== null) fail(`SYNTHETIC_FIXTURE_OWNER_${ownerFailure.slice('synthetic_owner_'.length).toUpperCase()}`);
     fail("SYNTHETIC_FIXTURE_UNAVAILABLE");
   }
   return Object.freeze({ codexHome, fixture, sessions });
@@ -2788,6 +2858,35 @@ export function verifyWindowsNormalCandidateSyntheticIngestion({
     && history.totalTokens === expected.totalTokens;
 }
 
+// The fixture has one timed, content-free turn. Require its measured speed and
+// first-token latency, not merely an empty ready page. The smoke records only
+// this boolean, never model or source data.
+export function verifyWindowsNormalCandidateModelPerformance(value) {
+  const progress = value?.historyProgress;
+  const measured = value?.models?.some((model) => model?.id === 'gpt-5.6-sol'
+    && model.turns === 1
+    && Array.isArray(model.speed)
+    && model.speed.some((series) => Array.isArray(series?.points)
+      && series.points.some((point) => Number.isFinite(point?.median) && point.median > 0))
+    && Array.isArray(model.ttft)
+    && model.ttft.some((point) => Number.isFinite(point?.median) && point.median > 0));
+  return value?.schemaVersion === 4 && value.method === 5
+    && value.status === 'ready' && value.collecting === false && value.stale === false
+    && value.period === 'all' && measured === true
+    && Number.isSafeInteger(progress?.total) && progress.total > 0
+    && progress.checked === progress.total;
+}
+
+// Only a fixed state category crosses the CI receipt boundary. The API can
+// contain local measurements, which must never be echoed in a workflow log.
+export function classifyWindowsNormalCandidateModelPerformance(value) {
+  if (value?.status === 'unavailable') return 'UNAVAILABLE';
+  if (value?.stale === true) return 'STALE';
+  if (value?.status === 'loading' || value?.collecting === true) return 'LOADING';
+  if (value?.status === 'ready') return 'INCOMPLETE';
+  return 'INVALID';
+}
+
 async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () => {} }) {
   const dashboard = exactLoopbackRootPage(target.url);
   if (dashboard === null) fail("DASHBOARD_INVALID");
@@ -2919,6 +3018,29 @@ async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () =>
     })) {
       fail("LOCAL_SYNTHETIC_INGESTION_UNAVAILABLE");
     }
+    onPhase("model_performance");
+    let timingState = 'INVALID';
+    const timing = await waitFor(async () => {
+      const value = await jsonFetch(new URL("/api/local/model-performance?period=all", dashboard), { fetchImpl });
+      timingState = classifyWindowsNormalCandidateModelPerformance(value);
+      return verifyWindowsNormalCandidateModelPerformance(value);
+    }, OPERATION_TIMEOUT_MS);
+    if (timing !== true) fail(`LOCAL_MODEL_PERFORMANCE_${timingState}`);
+    const openedPerformance = await cdp.evaluate(`(() => {
+      const link = document.querySelector('[data-nav="performance"]');
+      if (!link) return false;
+      link.click();
+      return true;
+    })()`);
+    if (openedPerformance !== true) fail("LOCAL_MODEL_PERFORMANCE_PAGE_UNAVAILABLE");
+    const renderedPerformance = await waitFor(() => cdp.evaluate(`(() => {
+      const section = document.querySelector('#performance');
+      const provider = section?.querySelector('.performance-provider');
+      const status = section?.querySelector('.performance-status');
+      return Boolean(section && !section.inert && section.getAttribute('aria-hidden') !== 'true'
+        && provider?.textContent?.trim() && status?.dataset?.state === 'ready');
+    })()`), OPERATION_TIMEOUT_MS);
+    if (renderedPerformance !== true) fail("LOCAL_MODEL_PERFORMANCE_PAGE_UNAVAILABLE");
     if (!observer.valid()) fail("DASHBOARD_INVALID");
     preloadContexts?.dispose?.();
     return Object.freeze({

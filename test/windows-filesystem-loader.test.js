@@ -720,7 +720,7 @@ test("production integration guard rejects the unproven native path walk", () =>
 });
 
 
-test("source-read loader refuses unqualified policy even when new native methods exist", () => {
+test("source-read loader refuses a manifest without the capability even when native methods exist", () => {
   const options = {
     platform: "win32", architecture: "x64",
     bindingPath: "C:\\checkout\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node",
@@ -747,15 +747,14 @@ test('source-read manifest verifies every method and rejects edited capability a
     requireBinding: () => native,
   };
   assert.equal(loadWindowsFilesystemBinding(options), native);
-  assert.throws(() => loadWindowsSourceReadBinding(options),
-    { code: 'WINDOWS_FILESYSTEM_SOURCE_READ_UNQUALIFIED' });
+  assert.equal(loadWindowsSourceReadBinding(options), native);
   for (const name of ['openSourceFile', 'statSourceFile', 'readSourceFile', 'closeSourceFile']) {
     assert.throws(() => loadWindowsFilesystemBinding({ ...options,
       requireBinding: () => ({ ...native, [name]: undefined }),
     }), { code: 'WINDOWS_FILESYSTEM_MANIFEST_BINDING_MISMATCH' });
   }
   for (const sourceRead of [
-    { ...sidecar.sourceRead, approved: true },
+    { ...sidecar.sourceRead, approved: false },
     { ...sidecar.sourceRead, extra: true },
     { ...sidecar.sourceRead, contractVersion: 'future-contract' },
   ]) {

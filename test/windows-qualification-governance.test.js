@@ -7,7 +7,10 @@ import { fileURLToPath } from "node:url";
 import {
   FIXED_STATUS,
   WINDOWS_SECURITY_QUALIFICATION_TEST_FILES,
+  formatQualificationFailureDiagnostic,
   parseTapSummary,
+  parseTapFailureDiagnostic,
+  readVerifiedBindingManifest,
   qualificationReceiptMetadata,
   qualificationTestFiles,
 } from "../scripts/windows-security-qualification.mjs";
@@ -16,6 +19,27 @@ const REPOSITORY_ROOT = resolve(
   dirname(fileURLToPath(import.meta.url)),
   "..",
 );
+
+test("Windows qualification requires the exact approved source-read capability", async () => {
+  const manifest = {
+    schemaVersion: "windows-filesystem-binding-manifest-v1",
+    bindingFile: "windows_filesystem.node", platform: "win32", architecture: "x64",
+    bytes: 1, sha256: "0".repeat(64),
+    approvedPolicy: { productionSafe: false, pathWalkRaceSafe: false,
+      credentialMutexSafe: true, credentialAuditFileGuardSafe: true },
+    nativeClaims: { credentialAuditFileGuardSafe: true },
+    credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    credentialMutexContractVersion: "windows-credential-mutex-v1",
+    sourceRead: { contractVersion: "windows-source-read-v1", approved: true },
+  };
+  const read = value => readVerifiedBindingManifest({ readManifest: async () => JSON.stringify(value) });
+  assert.deepEqual(await read(manifest), { bytes: 1, sha256: "0".repeat(64) });
+  for (const sourceRead of [undefined, { ...manifest.sourceRead, approved: false },
+    { ...manifest.sourceRead, contractVersion: "future" },
+    { ...manifest.sourceRead, extra: false }]) {
+    await assert.rejects(read({ ...manifest, sourceRead }), { code: FIXED_STATUS.manifestInvalid });
+  }
+});
 
 test("Windows security workflow is manual, pinned, read-only, and content-free", async () => {
   const workflow = await readFile(
@@ -38,6 +62,7 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /windows-security-qualification\.mjs/u);
   assert.match(workflow, /\$nodeGypScript rebuild --directory native\/windows-filesystem/u);
   assert.match(workflow, /ref: \$\{\{ github\.sha \}\}/u);
+  assert.match(workflow, /fetch-depth: 0/u);
   assert.match(workflow, /persist-credentials: false/u);
   assert.match(workflow, /WINDOWS_QUALIFICATION_REVISION_MISMATCH/u);
   assert.match(workflow, /build-windows-filesystem-manifest\.mjs/u);
@@ -99,6 +124,7 @@ test("qualification selection is the exact reviewed Windows test set", async () 
   });
   assert.deepEqual(selected.files, WINDOWS_SECURITY_QUALIFICATION_TEST_FILES);
   assert.deepEqual(selected.files, [
+    "test/model-performance.test.js",
     "test/windows-credential-manager-probe.test.js",
     "test/windows-credential-audit-file-guard.test.js",
     "test/windows-credential-manager.test.js",
@@ -199,5 +225,116 @@ test("qualification TAP receipts reject skips and malformed summaries", () => {
   assert.throws(
     () => parseTapSummary("# tests 1\n# pass 1"),
     (error) => error.code === FIXED_STATUS.resultInvalid,
+  );
+});
+
+test("qualification TAP failure diagnostics retain only bounded structural indexes", () => {
+  const canary = "PRIVATE-TAP-TITLE C:\\Users\\PRIVATE\\secret.txt";
+  const output = [
+    "TAP version 13",
+    `not ok 4 - ${canary}`,
+    "  ---",
+    "  duration_ms: 0.12",
+    "  location: '/private/tmp/PRIVATE/test/model-performance.test.js:123:4'",
+    "  failureType: 'testCodeFailure'",
+    "  name: 'AssertionError'",
+    "  stack: |-",
+    "    Error: PRIVATE-STACK",
+    "        at TestContext.<anonymous> (file:///D:/runner/PRIVATE/test/model-performance.test.js:321:9)",
+    "  ...",
+    "1..18",
+  ].join("\n");
+  const diagnostic = parseTapFailureDiagnostic(output);
+  assert.deepEqual(diagnostic, {
+    fileIndex: 1,
+    testOrdinal: 4,
+    sourceLine: 321,
+    failureType: "testCodeFailure",
+    errorName: "AssertionError",
+  });
+  const formatted = formatQualificationFailureDiagnostic(diagnostic);
+  assert.equal(
+    formatted,
+    "file_index=1 test_ordinal=4 source_line=321 failure_type=testCodeFailure error_name=AssertionError",
+  );
+  assert.doesNotMatch(formatted, /PRIVATE|secret|Users|TAP/u);
+
+  const fileOnly = parseTapFailureDiagnostic([
+    "not ok 14 - PRIVATE-FILE-FAILURE",
+    "  ---",
+    "  location: 'C:\\\\runner\\\\_work\\\\repo\\\\test\\\\windows-filesystem-security.test.js:8:2'",
+    "  failureType: 'PRIVATE-FAILURE-TYPE'",
+    "  name: 'PRIVATE-ERROR-NAME'",
+    "  ...",
+  ].join("\n"));
+  assert.deepEqual(fileOnly, {
+    fileIndex: 14,
+    testOrdinal: 14,
+    sourceLine: null,
+    failureType: null,
+    errorName: null,
+  });
+
+  const unknown = parseTapFailureDiagnostic([
+    "not ok 1 - PRIVATE-FAILURE",
+    "  ---",
+    "  location: 'C:\\Users\\PRIVATE\\unapproved.test.js:1:2'",
+    "  ...",
+  ].join("\n"));
+  assert.deepEqual(unknown, {
+    fileIndex: null,
+    testOrdinal: 1,
+    sourceLine: null,
+    failureType: null,
+    errorName: null,
+  });
+  const node26 = parseTapFailureDiagnostic([
+    "not ok 15 - PRIVATE-CADENCE",
+    "  ---",
+    "  location: 'D:\\\\runner\\\\test\\\\model-performance.test.js:310:1'",
+    "  stack: |-",
+    "    AssertionError: PRIVATE-DETAIL",
+    "    waitForSavedSnapshot (file:///D:/runner/test/model-performance.test.js:164:3)",
+    "  ...",
+  ].join("\n"));
+  assert.equal(node26.fileIndex, 1);
+  assert.equal(node26.sourceLine, 164);
+  assert.deepEqual(
+    parseTapFailureDiagnostic("not ok 3 - PRIVATE-WITHOUT-LOCATION\n  ..."),
+    {
+      fileIndex: null,
+      testOrdinal: 3,
+      sourceLine: null,
+      failureType: null,
+      errorName: null,
+    },
+  );
+  assert.deepEqual(
+    parseTapFailureDiagnostic([
+      "not ok 2 - PRIVATE-MISMATCHED-FRAME",
+      "  ---",
+      "  location: 'file:///D:/runner/test/model-performance.test.js:10:2'",
+      "  stack: |-",
+      "        at TestContext.<anonymous> (file:///D:/runner/test/windows-filesystem-security.test.js:91:4)",
+      "  ...",
+    ].join("\n")),
+    {
+      fileIndex: 1,
+      testOrdinal: 2,
+      sourceLine: null,
+      failureType: null,
+      errorName: null,
+    },
+  );
+  assert.equal(
+    formatQualificationFailureDiagnostic({
+      fileIndex: 999_999,
+      testOrdinal: 1_000_000,
+      sourceLine: 1_000_000,
+      failureType: "PRIVATE-FAILURE-TYPE",
+      errorName: "PRIVATE-ERROR-NAME",
+      title: canary,
+    }),
+    "file_index=unavailable test_ordinal=unavailable source_line=unavailable failure_type=unavailable error_name=unavailable",
   );
 });

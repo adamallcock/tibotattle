@@ -1,10 +1,23 @@
 import { parentPort, workerData, isMainThread } from 'node:worker_threads';
 import { opendir, lstat, mkdir, realpath } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { openTimingStore, ingestTimingFile, readTimingRows } from '../../src/platform/index.js';
 import { createModelPerformanceContext } from '../../src/application/index.js';
+
+// The Windows native SQLite guard retains the two nearest parent-directory
+// handles with delete sharing disabled. A nested supplemental store would
+// therefore be unable to reopen its guarded parent while the primary store is
+// live. Keep the sidecar under a sibling root on Windows so both stores can be
+// opened concurrently without weakening the native guard.
+export function modelPerformanceSupplementDirectory({ directory, timingRoot, platform = process.platform }) {
+  if (platform !== 'win32' || typeof timingRoot !== 'string' || timingRoot.length === 0
+      || typeof directory !== 'string' || directory.length === 0) {
+    return join(directory, 'tool-free-v1');
+  }
+  return join(dirname(timingRoot), 'inference-timing-tool-free-v1', basename(directory));
+}
 
 // Separate from accounting: no accounting DB, and starts only when a dashboard
 // reader requests it (including background preparation after first paint).
@@ -77,7 +90,12 @@ async function run() {
     publish(true);
     // Additive, independently checkpointed backfill. Failure leaves all original
     // saved measurements usable. The original store/schema is never converted.
-    try { supplement = await context.openSupplement(join(workerData.directory, 'tool-free-v1'), store.key); }
+    try {
+      supplement = await context.openSupplement(modelPerformanceSupplementDirectory({
+        directory: workerData.directory,
+        timingRoot: workerData.timingRoot,
+      }), store.key);
+    }
     catch { degraded = true; }
     while (!stopped) {
       try {

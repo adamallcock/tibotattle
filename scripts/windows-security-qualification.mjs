@@ -15,6 +15,10 @@ import { readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  WINDOWS_SOURCE_READ_APPROVED,
+  WINDOWS_SOURCE_READ_CONTRACT,
+} from "../src/platform/windows-filesystem.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -30,6 +34,7 @@ const FILESYSTEM_SECURITY_TEST_FILE = /^windows-(?:filesystem|security)(?:-[a-z0
 const CREDENTIAL_TEST_FILE = /^windows-(?:credential|production-credential|accountless-installation-credential)(?:-[a-z0-9-]+)?\.test\.(?:js|mjs)$/u;
 const ACCOUNTLESS_CREDENTIAL_TEST_FILE = /^windows-accountless-installation-credential(?:-[a-z0-9-]+)?\.test\.(?:js|mjs)$/u;
 const QUALIFICATION_TEST_FILES = Object.freeze([
+  "test/model-performance.test.js",
   "test/windows-credential-manager-probe.test.js",
   "test/windows-credential-audit-file-guard.test.js",
   "test/windows-credential-manager.test.js",
@@ -52,6 +57,18 @@ export const WINDOWS_SECURITY_QUALIFICATION_TEST_FILES = QUALIFICATION_TEST_FILE
 const QUALIFICATION_ENVIRONMENT = "USAGE_MONITOR_WINDOWS_QUALIFICATION";
 const QUALIFICATION_REVISION_ENVIRONMENT = "TIBOTATTLE_QUALIFICATION_REVISION";
 const QUALIFICATION_CACHE_MODE_ENVIRONMENT = "TIBOTATTLE_QUALIFICATION_CACHE_MODE";
+const MAXIMUM_TAP_FAILURE_TEST_ORDINAL = 999_999;
+const MAXIMUM_TAP_FAILURE_SOURCE_LINE = 999_999;
+const QUALIFICATION_FAILURE_TYPES = new Set([
+  "testCodeFailure",
+  "unhandledRejection",
+  "uncaughtException",
+  "hookFailed",
+]);
+const QUALIFICATION_ERROR_NAMES = new Set(["AssertionError", "Error", "TypeError"]);
+const QUALIFICATION_FILE_INDEX = new Map(
+  QUALIFICATION_TEST_FILES.map((file, index) => [file, index + 1]),
+);
 
 export const FIXED_STATUS = Object.freeze({
   passed: "WINDOWS_SECURITY_QUALIFICATION_PASSED",
@@ -75,7 +92,7 @@ function fixedError(status) {
   return error;
 }
 
-async function readVerifiedBindingManifest({
+export async function readVerifiedBindingManifest({
   manifestPath = BINDING_MANIFEST_PATH,
   readManifest = readFile,
 } = {}) {
@@ -103,7 +120,10 @@ async function readVerifiedBindingManifest({
     && manifest.nativeClaims?.credentialAuditFileGuardSafe === true
     && manifest.credentialAuditFileGuardContractVersion
       === "windows-credential-audit-file-guard-v1"
-    && manifest.credentialMutexContractVersion === "windows-credential-mutex-v1";
+    && manifest.credentialMutexContractVersion === "windows-credential-mutex-v1"
+    && manifest.sourceRead?.contractVersion === WINDOWS_SOURCE_READ_CONTRACT
+    && manifest.sourceRead?.approved === WINDOWS_SOURCE_READ_APPROVED
+    && Object.keys(manifest.sourceRead).sort().join(",") === "approved,contractVersion";
   if (!valid) throw fixedError(FIXED_STATUS.manifestInvalid);
   return Object.freeze({
     bytes: manifest.bytes,
@@ -204,6 +224,172 @@ export function parseTapSummary(output) {
   return result;
 }
 
+const QUALIFICATION_FAILURE_DIAGNOSTIC_FORMAT = /^file_index=(?:unavailable|[1-9]\d{0,2}) test_ordinal=(?:unavailable|[1-9]\d{0,5}) source_line=(?:unavailable|[1-9]\d{0,5}) failure_type=(?:unavailable|testCodeFailure|unhandledRejection|uncaughtException|hookFailed) error_name=(?:unavailable|AssertionError|Error|TypeError)$/u;
+const TAP_FAILURE_RESULT = /^not ok ([1-9]\d{0,6})(?:\s+-[^\r\n]*)?$/u;
+const TAP_RESULT = /^(?:ok|not ok) [1-9]\d{0,6}(?:\s+-[^\r\n]*)?$/u;
+const TAP_LOCATION = /^ {2}location:\s+(['"])([^'"\r\n]{1,2048})\1$/u;
+const TAP_STACK_HEADER = /^ {2}stack:\s*(?:[|>][-+]?\s*)?$/u;
+const TAP_FAILURE_TYPE = /^ {2}failureType:\s+(['"])([^'"\r\n]{1,64})\1[ \t]*$/u;
+const TAP_ERROR_NAME = /^ {2}name:\s+(['"])([^'"\r\n]{1,64})\1[ \t]*$/u;
+
+function boundedTapFailureOrdinal(value) {
+  const ordinal = Number.parseInt(value, 10);
+  return Number.isSafeInteger(ordinal)
+      && ordinal >= 1
+      && ordinal <= MAXIMUM_TAP_FAILURE_TEST_ORDINAL
+    ? ordinal
+    : null;
+}
+
+function fileIndexFromTapLocation(location) {
+  if (typeof location !== "string") return null;
+  const normalized = location.replaceAll("\\", "/").replace(/\/{2,}/gu, "/");
+  for (const [file, index] of QUALIFICATION_FILE_INDEX) {
+    const marker = `/${file}:`;
+    const markerIndex = normalized.lastIndexOf(marker);
+    if (markerIndex < 0) continue;
+    const lineAndColumn = normalized.slice(markerIndex + marker.length);
+    if (/^\d{1,9}:\d{1,9}$/u.test(lineAndColumn)) return index;
+  }
+  return null;
+}
+
+function sourceLocationFromTapStackFrame(line) {
+  // Node 26's TAP stack omits the `at` prefix from frames. Both forms remain
+  // inside the YAML stack and are reduced to a reviewed file index and line.
+  if (typeof line !== "string" || !/^ {4,}(?:at\s+|[A-Za-z][\w.<>]*\s+\()/u.test(line)) return null;
+  const normalized = line.replaceAll("\\", "/").replace(/\/{2,}/gu, "/");
+  for (const [file, index] of QUALIFICATION_FILE_INDEX) {
+    const marker = `/${file}:`;
+    const markerIndex = normalized.lastIndexOf(marker);
+    if (markerIndex < 0) continue;
+    const locationTail = normalized.slice(markerIndex + marker.length);
+    const match = /^(\d{1,9}):(\d{1,9})\)?\s*$/u.exec(locationTail);
+    if (!match) continue;
+    const sourceLine = Number.parseInt(match[1], 10);
+    return Number.isSafeInteger(sourceLine)
+        && sourceLine >= 1
+        && sourceLine <= MAXIMUM_TAP_FAILURE_SOURCE_LINE
+      ? { fileIndex: index, sourceLine }
+      : { fileIndex: index, sourceLine: null };
+  }
+  return null;
+}
+
+/**
+ * Extract only bounded structural information from a failed, flat Node TAP
+ * stream. The test ordinal is the first global TAP `not ok` ordinal. The file
+ * index is one-based and refers to the fixed, reviewed qualification file
+ * order above, recovered only from a matching YAML location suffix. Test
+ * titles, arbitrary paths, and assertion output are deliberately ignored.
+ */
+export function parseTapFailureDiagnostic(output) {
+  const empty = Object.freeze({
+    fileIndex: null,
+    testOrdinal: null,
+    sourceLine: null,
+    failureType: null,
+    errorName: null,
+  });
+  if (typeof output !== "string" || output.length > 5_000_000) return empty;
+
+  let failureOrdinal = null;
+  let fileIndex = null;
+  let sourceLine = null;
+  let failureType = null;
+  let errorName = null;
+  let failureTypeSeen = false;
+  let errorNameSeen = false;
+  let failureBlock = false;
+  let inStack = false;
+  let sourceFrameSeen = false;
+  for (const line of output.split(/\r?\n/u)) {
+    if (!failureBlock) {
+      const failure = TAP_FAILURE_RESULT.exec(line);
+      if (!failure) continue;
+      failureBlock = true;
+      failureOrdinal = boundedTapFailureOrdinal(failure[1]);
+      continue;
+    }
+
+    const location = TAP_LOCATION.exec(line);
+    if (location) {
+      fileIndex ??= fileIndexFromTapLocation(location[2]);
+      continue;
+    }
+    if (TAP_STACK_HEADER.test(line)) {
+      inStack = true;
+      continue;
+    }
+    if (inStack) {
+      if (line === "" || /^ {4,}/u.test(line)) {
+        if (!sourceFrameSeen) {
+          const frame = sourceLocationFromTapStackFrame(line);
+          if (frame) {
+            sourceFrameSeen = true;
+            if (fileIndex === null || fileIndex === frame.fileIndex) {
+              fileIndex ??= frame.fileIndex;
+              sourceLine = frame.sourceLine;
+            }
+          }
+        }
+        continue;
+      }
+      inStack = false;
+    }
+    const failureTypeMatch = TAP_FAILURE_TYPE.exec(line);
+    if (failureTypeMatch && !failureTypeSeen) {
+      failureTypeSeen = true;
+      failureType = QUALIFICATION_FAILURE_TYPES.has(failureTypeMatch[2])
+        ? failureTypeMatch[2]
+        : null;
+      continue;
+    }
+    const errorNameMatch = TAP_ERROR_NAME.exec(line);
+    if (errorNameMatch && !errorNameSeen) {
+      errorNameSeen = true;
+      errorName = QUALIFICATION_ERROR_NAMES.has(errorNameMatch[2])
+        ? errorNameMatch[2]
+        : null;
+      continue;
+    }
+    // Do not scan into the next TAP result or a later test's YAML payload.
+    if (TAP_RESULT.test(line) || /^\s+\.\.\.$/u.test(line)) break;
+  }
+  return failureBlock
+    ? Object.freeze({ fileIndex, testOrdinal: failureOrdinal, sourceLine, failureType, errorName })
+    : empty;
+}
+
+/** Format only the fixed, bounded fields permitted in a qualification receipt. */
+export function formatQualificationFailureDiagnostic(value) {
+  const fileIndex = Number.isSafeInteger(value?.fileIndex)
+      && value.fileIndex >= 1
+      && value.fileIndex <= QUALIFICATION_TEST_FILES.length
+    ? value.fileIndex
+    : null;
+  const testOrdinal = Number.isSafeInteger(value?.testOrdinal)
+      && value.testOrdinal >= 1
+      && value.testOrdinal <= MAXIMUM_TAP_FAILURE_TEST_ORDINAL
+    ? value.testOrdinal
+    : null;
+  const sourceLine = Number.isSafeInteger(value?.sourceLine)
+      && value.sourceLine >= 1
+      && value.sourceLine <= MAXIMUM_TAP_FAILURE_SOURCE_LINE
+    ? value.sourceLine
+    : null;
+  const failureType = QUALIFICATION_FAILURE_TYPES.has(value?.failureType)
+    ? value.failureType
+    : null;
+  const errorName = QUALIFICATION_ERROR_NAMES.has(value?.errorName)
+    ? value.errorName
+    : null;
+  const formatted = `file_index=${fileIndex ?? "unavailable"} test_ordinal=${testOrdinal ?? "unavailable"} source_line=${sourceLine ?? "unavailable"} failure_type=${failureType ?? "unavailable"} error_name=${errorName ?? "unavailable"}`;
+  return QUALIFICATION_FAILURE_DIAGNOSTIC_FORMAT.test(formatted)
+    ? formatted
+    : "file_index=unavailable test_ordinal=unavailable source_line=unavailable failure_type=unavailable error_name=unavailable";
+}
+
 function runNodeTests(files, {
   environment = process.env,
   cwd = REPOSITORY_ROOT,
@@ -227,8 +413,8 @@ function runNodeTests(files, {
 
     // Do not forward stdout/stderr. A failing native assertion may include a
     // path, SID, account name, or secret-shaped value even when the test was
-    // intended to be content-free. The fixed status below is the only output
-    // this harness emits.
+    // intended to be content-free. The fixed status and bounded structural
+    // diagnostic below are the only output this harness emits.
     let stdout = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
@@ -236,7 +422,11 @@ function runNodeTests(files, {
       if (stdout.length > 5_000_000) child.kill();
     });
     child.stderr.resume();
-    child.once("error", () => rejectRun(fixedError(FIXED_STATUS.failed)));
+    child.once("error", () => {
+      const error = fixedError(FIXED_STATUS.failed);
+      error.diagnostic = formatQualificationFailureDiagnostic(null);
+      rejectRun(error);
+    });
     child.once("close", (code) => {
       if (code === 0) {
         try {
@@ -245,7 +435,11 @@ function runNodeTests(files, {
           rejectRun(error);
         }
       } else {
-        rejectRun(fixedError(FIXED_STATUS.failed));
+        const error = fixedError(FIXED_STATUS.failed);
+        error.diagnostic = formatQualificationFailureDiagnostic(
+          parseTapFailureDiagnostic(stdout),
+        );
+        rejectRun(error);
       }
     });
   });
@@ -303,7 +497,14 @@ export async function main() {
     const status = error?.code && Object.values(FIXED_STATUS).includes(error.code)
       ? error.code
       : FIXED_STATUS.failed;
-    console.error(status);
+    const diagnostic = error?.diagnostic;
+    console.error([
+      status,
+      typeof diagnostic === "string"
+        && QUALIFICATION_FAILURE_DIAGNOSTIC_FORMAT.test(diagnostic)
+        ? diagnostic
+        : null,
+    ].filter(Boolean).join(" "));
     process.exitCode = 1;
   }
 }
