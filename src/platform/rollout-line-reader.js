@@ -9,13 +9,10 @@ import { isCompressedRolloutSource, readCompressedRolloutBytes } from "./bounded
 //    `Buffer.prototype.indexOf` drops into a SIMD memchr, and over the local
 //    42 GiB rollout corpus that alone was a 5.93x improvement (228.45s ->
 //    38.52s).
-// 2. Every complete JSON payload this product parses is tiny. Measured across
-//    the largest rollout files (36,395 relevant lines): the longest
-//    `turn_context` was 2 KiB, `token_count` 1 KiB and
-//    `thread_settings_applied` 1 KiB. The 80 MiB `compacted` records are never
-//    parsed; only their bounded top-level type/timestamp prefix may be
-//    inspected. Content-bearing `response_item`, `agent_reasoning`, and
-//    compaction payloads must never be read into memory.
+// 2. Accounting records are usually small, but provider metadata and tool
+//    envelopes can exceed the former 64 KiB limit. Retain at most 512 KiB per
+//    line; callers can inspect structural headers without retaining the tail.
+//    Huge compactions still use only a bounded top-level type/timestamp prefix.
 //
 // So a line longer than the cap never needs full buffering or parsing. Its
 // tail is skipped without concatenation, which is what makes peak memory
@@ -23,9 +20,10 @@ import { isCompressedRolloutSource, readCompressedRolloutBytes } from "./bounded
 // 1 MiB one.
 //
 // "Degrade, don't discard": when a line does exceed the cap, the prefix is
-// still delivered with `partial: true` so a caller can salvage whatever
-// metadata parsed, rather than dropping the record silently.
-export const ROLLOUT_LINE_BYTES = 64 * 1024;
+// still delivered with `partial: true` so a caller can classify it and report
+// incomplete evidence. An oversized accounting record must not become a fully
+// verified accounting source.
+export const ROLLOUT_LINE_BYTES = 512 * 1024;
 
 const NEWLINE = 0x0a;
 
@@ -40,9 +38,9 @@ function positiveSafeInteger(value, label) {
  * Read complete newline-delimited lines from `path` between `start` and `end`.
  *
  * `onLine(line, lineEndOffset, partial)` receives a `Buffer` view, not a
- * string. Deliberately: the relevance test is a byte-level `Buffer#includes`,
- * so the overwhelming majority of lines are rejected without ever being
- * decoded to UTF-8. Callers decode only what they will parse.
+ * string. Callers may inspect structural headers as bytes, or decode complete
+ * bounded records when full JSON member semantics are required. An oversized
+ * suffix is never retained or decoded by this reader.
  *
  * The view handed to `onLine` is only valid for the duration of that call. It
  * may alias the read buffer, which is refilled on the next read.

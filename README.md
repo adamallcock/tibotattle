@@ -8,12 +8,13 @@ confident answer.
 
 Personal analysis runs locally and works without an account. Raw source logs do
 not leave your machine, and prompts, responses, file paths, and raw account
-identifiers do not enter TiboTattle's derived artifacts. The released native app's hosted contribution path remains off by default,
-with local review and an explicit send. The unified Electron workstream adopts
-[accountless automatic sharing](docs/decisions/2026-09-04-accountless-sharing-policy.md):
-fresh installs default on, existing users receive three notices, and a persistent
-opt-out is available without sign-in. The current Electron candidate implements
-the preference and notices; its accountless upload transport is not yet active.
+identifiers do not enter TiboTattle's derived artifacts. Electron implements
+[accountless optional sharing](docs/decisions/2026-09-04-accountless-sharing-policy.md):
+fresh installs default on, existing installations without a recorded choice
+receive three notices, and a persistent opt-out is available without sign-in.
+Uploads honor the recorded preference and negotiated hosted capabilities.
+Local analysis remains available independently of hosted service availability.
+Native Mac version 0.1.18 retains its default-off, review-and-send behavior.
 
 
 > **The name:** TiboTattle is named with affection for the Codex community and
@@ -34,11 +35,12 @@ the preference and notices; its accountless upload transport is not yet active.
   explicit uncertainty band.
 - **Timelines** — hourly/daily/weekly usage against allowance, entirely from
   local evidence.
-- **Fast-mode pricing** — Codex Fast mode is the API's Priority processing
-  tier, so Fast turns are priced at the provider's published Priority (Fast)
-  API rates: 2x Standard for the GPT-5.6 and GPT-5.4 families, 2.5x for
+- **Fast-mode pricing** — API-price-equivalent estimates for Codex Fast turns
+  use the provider's published Priority (Fast) API rates: 2x Standard for
+  GPT-6 Astra, Sol and Luna and the GPT-5.6 and GPT-5.4 families, 2.5x for
   GPT-5.5, and a clearly disclosed assumed 2x for models with no published
-  Priority rate. Codex records the speed mode only when it is applied or
+  Priority rate. These estimates are not subscription charges or quota formulas.
+  Codex records the speed mode only when it is applied or
   changed, so turns before the first change in a session are attributed to
   Standard as a visible assumption unless a timestamped configuration reading
   covers them.
@@ -64,9 +66,10 @@ Alternatively, choose the **macOS Apple silicon** or **macOS Intel** DMG from
 If you are unsure, **Apple menu → About This Mac** shows either an Apple chip or
 an Intel processor. Open the DMG, drag TiboTattle to Applications, and launch it.
 When both refer to the same published version, those channels point to the same
-architecture-specific Developer ID artifact; the app continues to use its signed Sparkle feed for
-updates. A missing website slot is not a release claim—use the GitHub release
-page for the exact version and digest. A v1 release manifest may explicitly
+architecture-specific Developer ID artifact. In Electron, check for updates in
+Settings → About. Native Mac version 0.1.18 uses its retained Sparkle feed to
+transition to Electron. A missing website slot is not a release claim—use the
+GitHub release page for the exact version and digest. A v1 release manifest may explicitly
 leave SBOM or provenance fields `null`; source-to-binary provenance is claimed
 only when a trusted hosted workflow generated/finalized and cryptographically
 verified the exact final bytes for that specific release. This repository is

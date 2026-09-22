@@ -25,15 +25,16 @@ export function exampleCacheImpact() {
   for(const key of Object.keys(models[0]))if(typeof models[0][key]==='number')all[key]=models.reduce((sum,m)=>sum+m[key],0);
   return {...all,status:'available',byModel:models};
 }
-export function exampleModelSpeeds(period='all') {
+export function exampleModelSpeeds(period='all', speedMode='standard') {
   const end=Date.UTC(2026,8,15), days=period==='7'?7:30,start=end-(days-1)*86400000;
   // Fixed illustrative daily observations: uneven samples and independently varying latency.
   // Slice the same history for every period so changing the filter never changes a day's data.
   const activity=[42,67,31,85,56,12,7,49,104,73,38,61,19,9,54,88,126,46,72,14,5,65,97,43,112,58,21,8,76,51];
   const speeds=[62,58,71,47,53,79,66,60,39,51,68,57,74,82,63,48,44,59,70,76,64,55,41,67,50,61,78,69,56,65];
   const latency=[1.4,2.1,1.1,3.8,1.7,.9,1.6,2.3,4.9,2.6,1.3,1.8,1.2,.8,2.7,1.9,3.4,1.5,2.2,1.1,1.8,3.1,2.4,1.2,4.2,1.7,.9,1.4,2.8,1.6];
-  return {schemaVersion:2,method:3,status:'ready',collecting:false,stale:false,updatedAt:new Date(end+86400000-1).toISOString(),period,interval:'day',start,end,historyProgress:null,
-    models:[['gpt-5.5','GPT-5.5'],['gpt-5.4','GPT-5.4']].map(([id,label],index)=>{
+  if (!['standard','fast'].includes(speedMode)) throw new RangeError('Unsupported speed mode');
+  return {schemaVersion:5,method:5,speedMode,excludedUnknownTurns:0,status:'ready',collecting:false,stale:false,updatedAt:new Date(end+86400000-1).toISOString(),period,interval:'day',start,end,historyProgress:null,
+    models:speedMode==='fast'?[]:[['gpt-5.5','GPT-5.5'],['gpt-5.4','GPT-5.4']].map(([id,label],index)=>{
       const history=activity.map((count,i)=>{
         const j=(i+index*9)%30, n=Math.max(3,Math.round(count*(index ? .62 : 1)));
         const at=end-(29-i)*86400000, median=speeds[j]+index*8;
@@ -47,7 +48,7 @@ export function exampleModelSpeeds(period='all') {
         return {speed,ttft};
       }).slice(-days);
       const speedTurns=history.reduce((n,p)=>n+p.speed.n,0), ttftTurns=history.reduce((n,p)=>n+p.ttft.n,0);
-      return {id,label,turns:speedTurns+days*2,speedTurns,ttftTurns,timedResponses:ttftTurns,speed:[{method:'speed',points:history.map(p=>p.speed)}],ttft:history.map(p=>p.ttft)};
+      return {id,label,toolFreeTurns:0,toolFree:[],turns:speedTurns+days*2,speedTurns,ttftTurns,timedResponses:ttftTurns,speed:[{method:'speed',points:history.map(p=>p.speed)}],ttft:history.map(p=>p.ttft)};
     })};
 }
 export function mountExampleInsights(doc,t,loadHostedCurve) {
@@ -123,7 +124,7 @@ export function mountExampleInsights(doc,t,loadHostedCurve) {
   }
   const win=doc.defaultView;
   const localWindow={MutationObserver:win.MutationObserver,setTimeout:win.setTimeout.bind(win),clearTimeout:win.clearTimeout.bind(win),localStorage:{getItem:()=>null,setItem:()=>{}}};
-  const speed=mountModelPerformance({root:doc.querySelector('[data-speeds-demo]'),client:{modelPerformance:async period=>exampleModelSpeeds(period)},t,locale,windowRef:localWindow});
+  const speed=mountModelPerformance({root:doc.querySelector('[data-speeds-demo]'),client:{modelPerformance:async (period,{speedMode})=>exampleModelSpeeds(period,speedMode)},t,locale,windowRef:localWindow});
   win.addEventListener('tibotattle:locale-change',()=>{matrix.render({impact});speed.render();});
 }
 

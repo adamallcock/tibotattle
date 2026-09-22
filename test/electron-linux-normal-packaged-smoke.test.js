@@ -31,6 +31,7 @@ import {
 } from "../scripts/smoke-electron-linux-packaged.mjs";
 import {
   LINUX_COMPANION_PROCESS_DIAGNOSTIC_SCHEMA,
+  createLinuxResourceDiagnostics,
   LINUX_DASHBOARD_FAILURE_DIAGNOSTIC_SCHEMA,
   validateRendererReadinessDiagnostics,
 } from "../scripts/smoke-electron-linux.mjs";
@@ -985,4 +986,63 @@ test("exact ASAR diagnostic classifies fixture creation failure without exposing
     code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SNAPSHOT_FIXTURE_INVALID",
     message: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SNAPSHOT_FIXTURE_INVALID",
   });
+});
+
+
+test("Linux session forwards only closed resource diagnostics on failure without changing receipts", async () => {
+  const diagnostic = createLinuxResourceDiagnostics().snapshot();
+  const identity = { sourceRevision: SOURCE_REVISION, artifactSha256: ARTIFACT_SHA256 };
+  const failureCode = "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_RELOAD_REFRESH_FAILED";
+  for (const variant of ["valid", "forged", "duplicate", "writer_failure"]) {
+    const child = sessionChild();
+    const output = [];
+    const value = variant === "forged" ? { ...diagnostic, private: "PRIVATE_CANARY" } : diagnostic;
+    const receipt = await runLinuxNormalPackagedSmoke({ sourceRevision: SOURCE_REVISION }, {
+      verifyPackage: async () => identity,
+      runSession: () => runLinuxNormalPackagedSmokeSession(identity, {
+        appPath: APP_PATH,
+        writeDiagnostic: (line) => {
+          if (variant === "writer_failure") throw new Error("PRIVATE_CANARY");
+          output.push(line);
+        },
+        spawnSession: () => {
+          queueMicrotask(() => {
+            child.stdout.end();
+            child.stderr.write(`PRIVATE_CANARY /private/path\n${failureCode}\n${JSON.stringify(value)}\n`);
+            if (variant === "duplicate") child.stderr.write(`${JSON.stringify(value)}\n`);
+            child.stderr.end();
+            child.exitCode = 1;
+            child.emit("exit", 1, null);
+          });
+          return child;
+        },
+      }),
+      reserve: async () => ({}), write: async () => {},
+    });
+    assert.equal(receipt.status, "failed");
+    assert.equal(receipt.errorCode, failureCode);
+    assert.equal(Object.hasOwn(receipt, "mounts"), false);
+    assert.equal(output.length, variant === "valid" ? 1 : 0);
+    assert.equal(JSON.stringify({ receipt, output }).includes("PRIVATE_CANARY"), false);
+    if (output.length) assert.deepEqual(JSON.parse(output[0]), diagnostic);
+  }
+});
+
+
+test("Linux resource envelopes cannot qualify an otherwise successful session with stderr", async () => {
+  const child = sessionChild();
+  const output = [];
+  queueMicrotask(() => {
+    child.stdout.end(`${JSON.stringify(validInnerReceipt())}\n`);
+    child.stderr.end(`${JSON.stringify(createLinuxResourceDiagnostics().snapshot())}\n`);
+    child.exitCode = 0;
+    child.emit("exit", 0, null);
+  });
+  await assert.rejects(runLinuxNormalPackagedSmokeSession({
+    sourceRevision: SOURCE_REVISION, artifactSha256: ARTIFACT_SHA256,
+  }, {
+    appPath: APP_PATH, spawnSession: () => child,
+    writeDiagnostic: (line) => output.push(line),
+  }), { code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_PASS_RECEIPT_STDERR_REJECTED" });
+  assert.deepEqual(output, []);
 });

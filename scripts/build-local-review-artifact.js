@@ -109,7 +109,7 @@ const PINNED_RUNTIME_PACKAGES = Object.freeze({
     license: "MIT",
   }),
   "fast-uri": Object.freeze({
-    version: "3.1.5",
+    version: "3.1.6",
     license: "BSD-3-Clause",
   }),
   "json-schema-traverse": Object.freeze({
@@ -150,12 +150,18 @@ export const LOCAL_REVIEW_WORKSPACE_RUNTIME_FILES = Object.freeze({
     "src/errors.js",
     "src/model-catalog-contract.js",
     "src/model-catalog.js",
+    "src/performance-histogram.js",
     "src/primitives.js",
+    "src/telemetry-performance-v1-schemas.js",
+    "src/telemetry-performance-v1.js",
     "src/telemetry-v0.1.js",
     "src/telemetry-v0.2.js",
     "src/telemetry-v1.1-domain.js",
     "src/telemetry-v1.1-schemas.js",
     "src/telemetry-v1.1.js",
+    "src/telemetry-v1.2-domain.js",
+    "src/telemetry-v1.2-schemas.js",
+    "src/telemetry-v1.2.js",
     "src/upload.js",
   ]),
 });

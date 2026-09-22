@@ -19,7 +19,11 @@ test("reviewed identity catalog covers priced OpenAI models and explicit aliases
     && card.model !== "openai-provider-tools").flatMap((card) => [card.model, ...(card.aliases ?? [])]));
   assert.deepEqual(models.filter((entry) => entry.pricingStatus !== "unpriced").map((entry) => entry.id).sort(), [...priced].sort());
   assert.deepEqual(models.filter((entry) => entry.pricingStatus === "unpriced").map((entry) => entry.id), ["gpt-5.3-codex-spark"]);
-  assert.equal(models.length, 39);
+  assert.equal(models.length, 41);
+  for (const id of ["gpt-6-sol", "gpt-6-luna"]) {
+    assert.equal(reviewedModelIdentity(id).priceModelId, id);
+    assert.equal(reviewedModelIdentity(id).pricingStatus, "published");
+  }
   assert.equal(TELEMETRY_MODEL_IDS.length, new Set(TELEMETRY_MODEL_IDS).size);
   for (const entry of models) {
     assert.equal(Object.isFrozen(entry), true);
@@ -31,7 +35,7 @@ test("reviewed identity catalog covers priced OpenAI models and explicit aliases
   assert.notEqual(reviewedModelIdentity("gpt-5.5-codex"), reviewedModelIdentity("gpt-5.5"));
   assert.equal(reviewedModelIdentity("gpt-5.5-codex").pricingStatus, "assumed_alias");
   assert.equal(reviewedModelIdentity("gpt-5.3-codex-spark").priceModelId, null);
-  for (const value of ["gpt-6t", "gpt-6-astra-private", "openai-provider-tools", "gpt-5.6-sol/sensitive", null, {}]) {
+  for (const value of ["gpt-6t", "gpt-6-astra-private", "gpt-6-sol-private", "gpt-6-luna-wm", "openai-provider-tools", "gpt-5.6-sol/sensitive", null, {}]) {
     assert.equal(reviewedModelIdentity(value), null);
     assert.equal(recognizedCodexModelId(value), null);
   }
@@ -47,6 +51,7 @@ test("package, browser and closed upload schemas preserve all reviewed models an
     "claude-fable-5", "claude-haiku-4-5-20251001", "claude-opus-4-8",
     "claude-sonnet-4-6", "claude-sonnet-5",
   ]);
+  assert.deepEqual(TELEMETRY_MODEL_IDS.slice(-2), ["gpt-6-sol", "gpt-6-luna"]);
   const schema = JSON.parse(await readFile(new URL("../packages/telemetry-contract/schemas/v0.2/usage-event.schema.json", import.meta.url), "utf8"));
   assert.deepEqual([...schema.properties.modelId.enum].sort(), [...TELEMETRY_MODEL_IDS].sort());
   const validateId = new Ajv().compile(schema.properties.modelId);

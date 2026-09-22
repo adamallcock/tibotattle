@@ -64,3 +64,12 @@ all earlier allocations remain unchanged. The semantic version is `0.1.22`,
 while the independently selected provenance build number continues to bind
 source candidates and artifact receipts. Allocation is not evidence of a build,
 signature, installed update, or publication.
+
+
+## 0.1.23 and 0.1.24 allocations
+
+The published 0.1.23 Mac artifacts use allocation `1030`. Release preparation
+reserves `0.1.24` → `1031` for both Mac architectures, preserving every earlier
+allocation. The independently selected provenance build remains separate.
+This allocation permits candidate preparation and does not establish signing,
+installed qualification, update delivery, or publication.

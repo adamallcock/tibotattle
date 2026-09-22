@@ -99,7 +99,8 @@ test("assumption is stored with other row provenance and v15 cursors reparse exa
     // Remove writer-only provenance probes before rehearsing a real source reparse.
     db.prepare("DELETE FROM usage_event WHERE source_local IS NULL").run();
     db.prepare("UPDATE usage_event SET tokens_in_uncached = NULL, tokens_in_cache_write = NULL").run();
-    db.prepare("UPDATE parser_version SET parser_version = replace(parser_version, 'v16', 'v15')").run();
+    db.prepare("UPDATE parser_version SET parser_version = replace(parser_version, ?, ?)")
+      .run(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v15");
   } finally { db.close(); }
   const reparsed = await ingest();
   assert.equal(reparsed.sourcesReparsedForParserVersion, 1);

@@ -39,11 +39,11 @@ Those remain separate verification gates in the relevant runbooks.
 
 | Surface | Boundary | Implemented surface |
 |---|---|---:|
-| Local companion API | Browser/native shell → loopback Node companion | 29 paths, 31 method/path operations |
+| Local companion API | Browser/native shell → loopback Node companion | 33 paths, 35 method/path operations |
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
-| Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
-| Hosted Worker API | Internet/native collector → Cloudflare Worker | 40 API paths, 41 method/path operations |
+| Participant relay | Loopback companion → configured hosted origin | 11 paths, 11 method/path operations |
+| Hosted Worker API | Internet/native collector → Cloudflare Worker | 50 API paths, 53 method/path operations |
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 4 message handlers, 4 DOM events, 1 fixed URL scheme |
 | Process protocols | Native shell, Codex plugin, companion, analysis owners ↔ child/worker | 11 explicit runtime protocol families |
@@ -94,7 +94,7 @@ flowchart LR
   Local --> |read-only local files| Evidence
   Local <--> |sanitized account protocol| Codex
   Native <--> |four capabilities; get / set / delete| Keychain
-  Local --> |health-only central relay + 9 participant relays| Worker
+  Local --> |health-only central relay + 11 participant relays| Worker
   Local --> |device bearer + one-use Upload authority| Worker
   Worker <--> Data
   Worker <--> Objects
@@ -186,6 +186,10 @@ Codex accounting snapshot.
 | `POST` | `/api/local/contribution/sync-inspect-exact` | Inspect exact next-upload bytes and authority without sending |
 | `GET` | `/api/local/contribution/incremental-status` | Inspect incremental v1 eligibility, watermark, and state |
 | `POST` | `/api/local/contribution/incremental-review-v11` | Review the capability-gated v1.1 field inventory and derived sample; issue a publication/destination/contract-bound single-use token without uploading |
+| `POST` | `/api/local/contribution/incremental-review-v12` | Review the capability-gated v1.2 field inventory and derived sample; issue a publication/destination/contract-bound single-use token without uploading |
+| `GET` | `/api/local/performance/status` | Read separate performance consent and synchronization status |
+| `POST` | `/api/local/performance/review` | Prepare a content-free histogram review and one-use device/destination/dictionary/method-bound approval token |
+| `POST` | `/api/local/performance/approve` | Verify that review token and independent hosted grant before enabling daily performance delivery |
 | `POST` | `/api/local/contribution/incremental-approve` | Record explicit approval for the incremental contract |
 | `POST` | `/api/local/contribution/incremental-run` | Run one bounded incremental preparation/delivery cycle |
 
@@ -296,6 +300,8 @@ relayed through loopback.
 | `POST` | `/api/v1/logout` | End the hosted browser session |
 | `POST` | `/api/v1/me/device-pairings` | Create a one-use local-device pairing code |
 | `POST` | `/api/v1/me/device-telemetry-consents` | Relay explicit v1.1 consent under the hosted personal session and CSRF; never substitute device authority |
+| `POST` | `/api/v1/me/device-telemetry-v12-consents` | Relay explicit v1.2 consent under the hosted personal session and CSRF; never substitute device authority |
+| `POST` | `/api/v1/me/device-telemetry-performance-consents` | Relay explicit independent daily-performance consent under the hosted personal session and CSRF; never substitute device authority |
 
 ## 3. Hosted Cloudflare Worker HTTP API
 
@@ -373,6 +379,16 @@ Authority vocabulary:
 | `GET` | `/api/v1/device/sync/state` | Device | Read the device's accepted-through and synchronization state |
 | `GET` | `/api/v1/device/sync/manifest` | Device | Read the bounded manifest for `fromDay` and `toDay` ISO-day bounds |
 | `GET` | `/api/v1/device/sync-capabilities` | Device | Read accepted formats, consent/floor state and authenticated enrollment/destination binding |
+| `GET` | `/api/v1/device/sync-capabilities-v1.2` | Device | Read independent successor lifecycle, exact consent and server-issued activation instant; never grant authority |
+| `POST` | `/api/v1/me/device-telemetry-v12-consents` | Session | Grant the exact v1.2 contract for one reviewed device |
+| `GET`, `POST` | `/api/v1/device/telemetry/v1.2/day-manifests` | Device | Read or register bounded immutable successor manifests and staged chunk receipts |
+| `POST` | `/api/v1/me/telemetry-v12/domain-predecessor` | Device | Pin a complete mixed-client predecessor for successor activation |
+| `POST` | `/api/v1/me/telemetry-v12/domain-activate` | Device | Activate a complete proven successor domain under the pinned predecessor |
+| `POST` | `/api/v1/accountless/telemetry-v1.2-authorization` | Device | Record the independent accountless successor policy for the current enrollment and device |
+| `POST` | `/api/v1/accountless/telemetry-performance-authorization` | Device | Record the independent accountless performance policy for the current enrollment and device |
+| `GET` | `/api/v1/device/telemetry/performance/capabilities` | Device | Read the separate daily-performance capability and authorization |
+| `POST` | `/api/v1/me/device-telemetry-performance-consents` | Session | Grant separate performance consent to a reviewed device |
+| `GET`, `POST` | `/api/v1/device/telemetry/performance/reports` | Device | Read bounded report revisions or admit an encrypted daily histogram report; preserve ordinary replay and replacement semantics |
 | `POST` | `/api/v1/me/device-telemetry-consents` | Session | Grant the exact v1.1 contract for a selected device with explicit ongoing-upload approval |
 | `GET`, `POST` | `/api/v1/device/telemetry/v1.1/day-manifests` | Device | Read bounded date-range candidates, or register/resume an immutable staged day manifest and return the exact accepted chunk vector |
 | `POST` | `/api/v1/me/telemetry-v11/domain-predecessor` | Device | Pin the prior analytical domain and legacy source vector for complete replacement |

@@ -204,3 +204,8 @@ html[data-theme="dark"] .performance-axis-line { opacity: .42; }
 @media (prefers-reduced-motion: reduce) {
   .model-performance .performance-model { transition: none; }
 }
+
+.performance-mode-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin-top: 18px; }
+.performance-modes { flex-shrink: 0; }
+.performance-modes button { min-height: 36px; min-width: 80px; }
+.performance-mode-note { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0; }

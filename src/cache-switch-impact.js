@@ -9,10 +9,7 @@ import {
 } from "@app-usagemonitor/accounting";
 import { codexPrimaryAllowanceBasis } from "./codex-primary-allowance-basis.js";
 import {
-  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
-  LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
-  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
-  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
+  isLocalUnifiedIndexBoundaryParserVersion,
   reasoningEffortName,
 } from "./local-unified-index.js";
 import {
@@ -34,12 +31,6 @@ export const CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_MS =
   7 * 24 * 60 * 60_000;
 
 const FUTURE_EVIDENCE_TOLERANCE_MS = 5 * 60_000;
-const COMPACTION_AWARE_PARSERS = new Set([
-  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
-  LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
-  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
-  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
-].flatMap((version) => [version, `${version}-cache-write-zero`]));
 const CHANGE_TYPES = Object.freeze([
   "reasoning_only",
   "model_only",
@@ -267,7 +258,9 @@ function sameContinuityConfiguration(row) {
 }
 
 function compactionAwareParser(value) {
-  return COMPACTION_AWARE_PARSERS.has(value);
+  // v17 adds exact totals only. Retained v15/v16 rows still prove the same
+  // boundaries when their raw source has rotated away and cannot be reparsed.
+  return isLocalUnifiedIndexBoundaryParserVersion(value);
 }
 
 function componentsFor(row) {

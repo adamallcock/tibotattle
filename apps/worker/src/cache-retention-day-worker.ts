@@ -110,7 +110,7 @@ export async function runCacheRetentionDaySchedule(env:CacheRetentionDayWorkerEn
   const target=meter.wrap(env.STORAGE_ANALYTICS_DB);
   const source=meter.wrap(env.STORAGE_INGESTION_DB);
   const lane=await advanceCacheRetentionDayLane({target,sourceId:env.STORAGE_SOURCE_ID,
-   build:createCacheRetentionDaySourceBuild({source,sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE}),
+   build:createCacheRetentionDaySourceBuild({source,target,sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE}),
    deadlineMs:started+CACHE_RETENTION_WORKER_WINDOW_MS,
    remainingQueries:CACHE_RETENTION_WORKER_TARGET_QUERIES,
    sourceQueries:CACHE_RETENTION_WORKER_QUERIES-CACHE_RETENTION_WORKER_TARGET_QUERIES,

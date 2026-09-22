@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import {
   lstat,
+  mkdir,
+  rename,
   link,
   mkdtemp,
   readFile,
@@ -47,6 +49,7 @@ const PLATFORM_CONTEXT_METHODS = Object.freeze([
   "recoverOwnerOnlyPairTransactionsForDestination",
   "recoverOwnerOnlyPairTransactionsUnderLease",
   "withExportDestinationLease",
+  "withOwnerOnlyExportDestinationBatch",
   "writeOwnerOnlyPairNoClobber",
   "writeOwnerOnlyPairNoClobberForDestination",
   "writeOwnerOnlyPairNoClobberUnderLease",
@@ -642,4 +645,195 @@ test("owner-only artifact reads use bounded positioned reads and report close fa
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+
+function batchPair(name) {
+  return { firstBasename: `${name}.bundle`, firstContent: `${name}-bundle`,
+    secondBasename: `${name}.receipt`, secondContent: `${name}-receipt` };
+}
+
+async function batchFixture(t) {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-pair-batch-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const context = platform.createOwnerOnlyExportArtifactStorageContext(ownerStorageConfiguration());
+  const { destination } = await context.openOwnerOnlyExportDestination({ directory });
+  return { context, destination, directory, root: join(directory, ".app-usagemonitor-export-transactions") };
+}
+
+test("multi-pair lease pins one transaction inode, excludes outside writers, and expires its capability", async (t) => {
+  const { context, destination, directory, root } = await batchFixture(t);
+  let retained;
+  await context.withOwnerOnlyExportDestinationBatch(destination, async (batch) => {
+    retained = batch;
+    assert.deepEqual(Reflect.ownKeys(batch), []);
+    assert.equal(Object.isFrozen(batch), true);
+    const identity = await lstat(root);
+    for (const name of ["chunk-0", "chunk-1", "manifest"]) {
+      await context.writeOwnerOnlyPairNoClobberForDestination(batch, batchPair(name));
+      const current = await lstat(root);
+      assert.equal(current.ino, identity.ino);
+      assert.equal(current.dev, identity.dev);
+      assert.deepEqual(await readdir(root), []);
+      assert.equal((await lstat(join(directory, `${name}.bundle`))).nlink, 1);
+      assert.equal((await lstat(join(directory, `${name}.receipt`))).nlink, 1);
+      await assert.rejects(context.writeOwnerOnlyPairNoClobberForDestination(destination, batchPair("outsider")), /busy/u);
+    }
+  });
+  await assert.rejects(lstat(root), { code: "ENOENT" });
+  await assert.rejects(lstat(join(directory, "outsider.bundle")), { code: "ENOENT" });
+  await assert.rejects(context.writeOwnerOnlyPairNoClobberForDestination(retained, batchPair("late")), /capability is invalid/u);
+  await assert.rejects(context.readOwnerOnlyExportArtifactIfPresent(retained, { basename: "manifest.bundle" }), /capability is invalid/u);
+  await assert.rejects(context.recoverOwnerOnlyPairTransactionsForDestination(retained), /capability is invalid/u);
+  await assert.rejects(context.withOwnerOnlyExportDestinationBatch(Object.freeze({}), async () => {}), /capability is invalid/u);
+});
+
+test("batch no-clobber failures retain old bytes and release their empty root and lock", async (t) => {
+  const { context, destination, directory, root } = await batchFixture(t);
+  await writeFile(join(directory, "existing.bundle"), "retained", { mode: 0o600 });
+  await assert.rejects(context.withOwnerOnlyExportDestinationBatch(destination, async (batch) => {
+    await context.writeOwnerOnlyPairNoClobberForDestination(batch, batchPair("first"));
+    await context.writeOwnerOnlyPairNoClobberForDestination(batch, batchPair("existing"));
+  }));
+  assert.equal(await readFile(join(directory, "existing.bundle"), "utf8"), "retained");
+  await assert.rejects(lstat(join(directory, "existing.receipt")), { code: "ENOENT" });
+  await assert.rejects(lstat(root), { code: "ENOENT" });
+  await context.writeOwnerOnlyPairNoClobberForDestination(destination, batchPair("after"));
+});
+
+test("batch interruption preserves recoverable journals and recovery retains the same root generation", async (t) => {
+  const { context, destination, directory, root } = await batchFixture(t);
+  await assert.rejects(context.withOwnerOnlyExportDestinationBatch(destination, async (batch) => {
+    await context.writeOwnerOnlyPairNoClobberForDestination(batch, batchPair("completed"));
+    await context.writeOwnerOnlyPairNoClobberForDestination(batch, batchPair("interrupted"), {
+      failpoint: (stage) => { if (stage === "after_receipt") throw new Error("synthetic interruption"); },
+    });
+  }), /synthetic interruption/u);
+  const identity = await lstat(root);
+  assert.equal((await readdir(root)).length, 1);
+  await context.withOwnerOnlyExportDestinationBatch(destination, async (batch) => {
+    assert.deepEqual(await context.recoverOwnerOnlyPairTransactionsForDestination(batch), { recovered: 1, transactionsFound: 1 });
+    assert.equal((await lstat(root)).ino, identity.ino);
+    assert.deepEqual(await readdir(root), []);
+    await context.writeOwnerOnlyPairNoClobberForDestination(batch, batchPair("manifest"));
+    assert.equal((await lstat(root)).ino, identity.ino);
+  });
+  assert.equal(await readFile(join(directory, "interrupted.bundle"), "utf8"), "interrupted-bundle");
+  assert.equal((await lstat(join(directory, "interrupted.receipt"))).nlink, 1);
+  await assert.rejects(lstat(root), { code: "ENOENT" });
+});
+
+test("batch root replacement stays rejected without removing or writing into the replacement", async (t) => {
+  const { context, destination, directory, root } = await batchFixture(t);
+  const retired = join(directory, "retired-root");
+  await assert.rejects(context.withOwnerOnlyExportDestinationBatch(destination, async (batch) => {
+    await context.writeOwnerOnlyPairNoClobberForDestination(batch, batchPair("first"));
+    await rename(root, retired);
+    await mkdir(root, { mode: 0o700 });
+    await writeFile(join(root, "keep"), "replacement", { mode: 0o600 });
+    await context.writeOwnerOnlyPairNoClobberForDestination(batch, batchPair("second"));
+  }), /transaction root changed/u);
+  assert.equal(await readFile(join(root, "keep"), "utf8"), "replacement");
+  assert.deepEqual(await readdir(retired), []);
+  await assert.rejects(lstat(join(directory, "second.bundle")), { code: "ENOENT" });
+});
+
+test("batch drains unawaited writes before releasing ownership and refuses overlapping writes", async (t) => {
+  const { context, destination, root } = await batchFixture(t);
+  let release;
+  let entered;
+  const held = new Promise((resolve) => { release = resolve; });
+  const started = new Promise((resolve) => { entered = resolve; });
+  let writing;
+  let settled = false;
+  const lease = context.withOwnerOnlyExportDestinationBatch(destination, async (batch) => {
+    writing = context.writeOwnerOnlyPairNoClobberForDestination(batch, batchPair("pending"), {
+      failpoint: async (stage) => { if (stage === "after_transaction_prepare") { entered(); await held; } },
+    });
+    writing.catch(() => {});
+    await started;
+    await assert.rejects(context.writeOwnerOnlyPairNoClobberForDestination(batch, batchPair("overlap")), /operation is unavailable/u);
+  });
+  lease.finally(() => { settled = true; }).catch(() => {});
+  await started;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  await assert.rejects(context.writeOwnerOnlyPairNoClobberForDestination(destination, batchPair("outsider")), /busy/u);
+  release();
+  await assert.rejects(lease, /unfinished operation/u);
+  await writing;
+  await assert.rejects(lstat(root), { code: "ENOENT" });
+  await context.writeOwnerOnlyPairNoClobberForDestination(destination, batchPair("after"));
+});
+
+test("batch boundaries refuse proxy callbacks and option accessors without invoking them", async (t) => {
+  const { context, destination, root } = await batchFixture(t);
+  let invoked = 0;
+  await assert.rejects(context.withOwnerOnlyExportDestinationBatch(destination, new Proxy(() => {}, {
+    apply() { invoked += 1; throw new Error("foreign-secret"); },
+  })), /callback is required/u);
+  await assert.rejects(context.withOwnerOnlyExportDestinationBatch(destination, async () => {}, {
+    get failpoint() { invoked += 1; throw new Error("foreign-secret"); },
+  }), /options are invalid/u);
+  assert.equal(invoked, 0);
+  await assert.rejects(lstat(root), { code: "ENOENT" });
+  const applicationContext = application.createLocalExportArtifactStorageContext({
+    createStorage: platform.createOwnerOnlyExportArtifactStorageContext,
+    activityMarkerFile: platform.defaultActivityMarkerFile,
+  });
+  const opened = await applicationContext.openOwnerOnlyExportDestination({ directory: dirname(root) });
+  const sentinel = Object.freeze({ expected: "callback failure" });
+  await assert.rejects(applicationContext.withOwnerOnlyExportDestinationBatch(opened.destination, async () => {
+    throw sentinel;
+  }), (error) => error === sentinel);
+  await assert.rejects(lstat(root), { code: "ENOENT" });
+});
+
+
+test("successful batch callbacks cannot silently retain unknown transactions", async (t) => {
+  const { context, destination, root } = await batchFixture(t);
+  await assert.rejects(context.withOwnerOnlyExportDestinationBatch(destination, async () => {
+    await writeFile(join(root, "unknown"), "must remain", { mode: 0o600 });
+  }), /retained incomplete transactions/u);
+  assert.equal(await readFile(join(root, "unknown"), "utf8"), "must remain");
+});
+
+test("batch callbacks preserve falsey failures while removing only empty roots", async (t) => {
+  const { context, destination, root } = await batchFixture(t);
+  for (const value of [null, undefined, false, 0]) {
+    let observed = Symbol("not rejected");
+    try { await context.withOwnerOnlyExportDestinationBatch(destination, async () => { throw value; }); }
+    catch (error) { observed = error; }
+    assert.equal(observed, value);
+    await assert.rejects(lstat(root), { code: "ENOENT" });
+  }
+});
+
+
+test("batch enumeration omits only pinned internal entries and retains the physical bound", async (t) => {
+  const { context, destination, directory } = await batchFixture(t);
+  await writeFile(join(directory, ".app-usagemonitor-unrelated"), "retained", { mode: 0o600 });
+  await context.withOwnerOnlyExportDestinationBatch(destination, async (batch) => {
+    assert.deepEqual(await context.enumerateOwnerOnlyExportDestinationEntries(batch), [".app-usagemonitor-unrelated"]);
+    assert.deepEqual(await context.enumerateOwnerOnlyExportDestinationEntries(destination), [
+      ".app-usagemonitor-export-transactions", ".app-usagemonitor-export.lock", ".app-usagemonitor-unrelated",
+    ]);
+  });
+  const limited = platform.createOwnerOnlyExportArtifactStorageContext(ownerStorageConfiguration({ maximumDirectoryEntries: 2 }));
+  const opened = await limited.openOwnerOnlyExportDestination({ directory });
+  await assert.rejects(limited.withOwnerOnlyExportDestinationBatch(opened.destination, async (batch) => {
+    await limited.enumerateOwnerOnlyExportDestinationEntries(batch);
+  }), (error) => error.code === "export_resource_directory_entries");
+});
+
+test("batch enumeration refuses a substituted lock instead of hiding it", async (t) => {
+  const { context, destination, directory } = await batchFixture(t);
+  const lock = join(directory, ".app-usagemonitor-export.lock");
+  const replacementTarget = `pid=${process.pid};token=00000000-0000-0000-0000-000000000000`;
+  await assert.rejects(context.withOwnerOnlyExportDestinationBatch(destination, async (batch) => {
+    await rename(lock, join(directory, "retained-lock"));
+    await symlink(replacementTarget, lock);
+    await assert.rejects(context.enumerateOwnerOnlyExportDestinationEntries(batch), /batch lock changed/u);
+  }));
+  assert.equal(await readlink(lock), replacementTarget);
 });

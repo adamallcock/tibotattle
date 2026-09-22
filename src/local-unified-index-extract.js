@@ -35,16 +35,6 @@ import { forEachRolloutLine, ROLLOUT_LINE_BYTES } from "./rollout-line-reader.js
 // The separate optional metadata-only traversal below reads only bounded cwd
 // for the owner-approved transient local Projects & threads view.
 
-// Byte-level needles. Matching on the raw Buffer avoids decoding the ~99% of
-// lines that are irrelevant. The response-item marker is exact and is decoded
-// only far enough for typed tool classification; arbitrary response content
-// never becomes an index value.
-const NEEDLE_TURN_CONTEXT = Buffer.from('"turn_context"');
-const NEEDLE_TOKEN_COUNT = Buffer.from('"token_count"');
-const NEEDLE_THREAD_SETTINGS = Buffer.from('"thread_settings_applied"');
-const NEEDLE_SESSION_META = Buffer.from('"type":"session_meta"');
-const NEEDLE_RESPONSE_ITEM = Buffer.from('"type":"response_item"');
-const NEEDLE_RELEVANT_PREFIX = Buffer.from('"t');
 const COMPACTION_TIMESTAMP_PREFIX = Buffer.from('{"timestamp":"');
 const COMPACTION_TYPE_SUFFIX = Buffer.from(',"type":"compacted"');
 const COMPACTION_TYPE_PREFIX = Buffer.from('{"type":"compacted","timestamp":"');
@@ -136,31 +126,97 @@ const TOKEN_KEYS = [
   "total_tokens",
 ];
 
-function relevant(line) {
-  if (line.includes(NEEDLE_RESPONSE_ITEM)) return true;
-  let from = 0;
-  for (;;) {
-    const at = line.indexOf(NEEDLE_RELEVANT_PREFIX, from);
-    if (at < 0) return false;
-    let needle = null;
-    if (line[at + 2] === 0x6f) needle = NEEDLE_TOKEN_COUNT;
-    else if (line[at + 2] === 0x75) needle = NEEDLE_TURN_CONTEXT;
-    else if (line[at + 2] === 0x68) needle = NEEDLE_THREAD_SETTINGS;
-    else if (line[at + 2] === 0x79) needle = NEEDLE_SESSION_META;
-    if (needle !== null
-        && at + needle.length <= line.length
-        && line.compare(needle, 0, needle.length, at, at + needle.length) === 0) {
-      return true;
-    }
-    from = at + NEEDLE_RELEVANT_PREFIX.length;
+// Classify only the outer discriminator and event_msg's immediate payload
+// discriminator. Never search nested content for accounting marker strings.
+// Complete bounded records use their parsed shape, including fields after
+// content and JSON duplicate-member semantics. Oversized/malformed records
+// use a prefix reader that accepts scalar header fields in either order, stops
+// at content containers, and spends at most 4 KiB on headers. An incomplete
+// unknown header cannot establish that accounting is absent and is quarantined.
+const RECORD_HEADER_BYTES = 4 * 1024;
+const ACCOUNTING_KINDS = new Set([
+  "session_meta", "turn_context", "token_count", "thread_settings_applied",
+]);
+const IGNORED_RECORD_KINDS = new Set([
+  "compacted", "token_usage_record", "configuration_update", "item_completed",
+]);
+
+function classifiedRecordKind(type, eventType = null) {
+  if (type === "event_msg") {
+    if (eventType === null) return null;
+    return eventType === "token_count" || eventType === "thread_settings_applied"
+      ? eventType : "other";
   }
+  if (type === "session_meta" || type === "turn_context" || type === "response_item") {
+    return type;
+  }
+  return IGNORED_RECORD_KINDS.has(type) ? "other" : null;
 }
 
-function accountingMarker(text) {
-  return text.includes('"turn_context"')
-    || text.includes('"token_count"')
-    || text.includes('"thread_settings_applied"')
-    || text.includes('"type":"session_meta"');
+function recordPrefixKind(line) {
+  const limit = Math.min(line.length, RECORD_HEADER_BYTES);
+  let at = 0;
+  function whitespace() {
+    while (at < limit && (line[at] === 0x20 || line[at] === 0x09
+      || line[at] === 0x0d || line[at] === 0x0a)) at += 1;
+  }
+  function string(decode) {
+    if (line[at] !== 0x22) return null;
+    const start = at++;
+    while (at < limit) {
+      const byte = line[at++];
+      if (byte < 0x20) return null;
+      if (byte === 0x5c) { at += 1; continue; }
+      if (byte !== 0x22) continue;
+      if (!decode) return true;
+      if (at - start > 128) return null;
+      try { return JSON.parse(line.toString("utf8", start, at)); }
+      catch { return null; }
+    }
+    return null;
+  }
+  function objectType(eventPayload = false) {
+    whitespace();
+    if (line[at++] !== 0x7b) return null;
+    let type = null;
+    for (;;) {
+      whitespace();
+      if (line[at] === 0x7d) return eventPayload ? type : classifiedRecordKind(type);
+      const key = string(true);
+      if (key === null) return null;
+      whitespace();
+      if (line[at++] !== 0x3a) return null;
+      whitespace();
+      if (key === "type") {
+        // Duplicate discriminators in a header cannot establish an identity.
+        if (type !== null) return null;
+        type = string(true);
+        if (type === null) return null;
+      } else if (!eventPayload && key === "payload") {
+        if (type === "event_msg") return classifiedRecordKind(type, objectType(true));
+        return classifiedRecordKind(type);
+      } else if (line[at] === 0x7b || line[at] === 0x5b) {
+        // A container is content, not another place to seek a discriminator.
+        return eventPayload ? type : classifiedRecordKind(type);
+      } else if (eventPayload && type !== null) {
+        // The immediate payload discriminator precedes its content. Do not
+        // decode an item_completed output or scan it for nested type fields.
+        return type;
+      } else if (line[at] === 0x22) {
+        if (string(false) === null) return null;
+      } else {
+        const start = at;
+        while (at < limit && line[at] !== 0x2c && line[at] !== 0x7d) at += 1;
+        if (at === limit || at - start > 32) return null;
+        const scalar = line.toString("ascii", start, at).trim();
+        if (!/^(?:null|true|false|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)$/u.test(scalar)) return null;
+      }
+      whitespace();
+      if (line[at] === 0x7d) return eventPayload ? type : classifiedRecordKind(type);
+      if (line[at++] !== 0x2c) return null;
+    }
+  }
+  return objectType();
 }
 
 export function rolloutContentQuarantineReason(outcome) {
@@ -260,6 +316,23 @@ export function canonicalComponents(raw) {
     inputCacheWriteTokens: allInputKnown && inputConsistent ? raw.cache_write_input_tokens : null,
     outputTextTokens: outputKnown ? raw.output_tokens - raw.reasoning_output_tokens : null,
     outputReasoningTokens: outputKnown ? raw.reasoning_output_tokens : null,
+  };
+}
+
+// Preserve the exact totals from the selected usage sample. Known components
+// can disprove a total even when other components are unavailable; missing
+// components cannot be reconstructed from the total. These fields are separate
+// from the additive component vector used by replay and cache calculations.
+function canonicalUsageTotals(raw) {
+  const known = (key) => Number.isSafeInteger(raw?.[key]) && raw[key] >= 0;
+  const input = known("input_tokens")
+    && (raw.cached_input_tokens ?? 0) + (raw.cache_write_input_tokens ?? 0)
+      <= raw.input_tokens;
+  const output = known("output_tokens")
+    && (raw.reasoning_output_tokens ?? 0) <= raw.output_tokens;
+  return {
+    totalInputContextTokens: input ? raw.input_tokens : null,
+    outputCombinedTokens: output ? raw.output_tokens : null,
   };
 }
 
@@ -473,6 +546,7 @@ export async function extractRolloutUsage(path, {
       event.components = canonicalComponents({ ...rawUsage, cache_write_input_tokens: 0 });
       event.cacheWriteAssumedZero = true;
     }
+    Object.assign(event, canonicalUsageTotals(rawUsage));
     if (event.model === null && parentModelAt !== null) {
       event.model = parentModelAt(event.observedAtMs);
       event.modelInherited = event.model !== null;
@@ -584,28 +658,39 @@ export async function extractRolloutUsage(path, {
         };
         return;
       }
-      if (!relevant(line)) return;
-      diagnostics.relevantLines += 1;
-      const text = line.toString("utf8");
+      // Empty JSONL separators do not contain accounting evidence.
+      if (line.length === 0) return;
+      let kind;
       let record = null;
+      let text;
       if (partial) {
+        kind = recordPrefixKind(line);
+        if (kind === "other") return;
+        text = line.toString("utf8");
+        diagnostics.relevantLines += 1;
         diagnostics.partialLines += 1;
-        if (accountingMarker(text)) {
+        if (kind === null || ACCOUNTING_KINDS.has(kind)) {
           diagnostics.malformedAccountingRecords += 1;
         }
       } else {
+        text = line.toString("utf8");
+        if (text.trim().length === 0) return;
         try {
           record = JSON.parse(text);
         } catch {
+          kind = recordPrefixKind(line);
+          if (kind === "other") return;
+          diagnostics.relevantLines += 1;
           diagnostics.malformedLines += 1;
-          if (accountingMarker(text)) {
+          if (kind === null || ACCOUNTING_KINDS.has(kind)) {
             diagnostics.malformedAccountingRecords += 1;
           }
-          if (text.includes(NEEDLE_RESPONSE_ITEM)) {
-            diagnostics.toolRecordsSkipped += 1;
-          }
+          if (kind === "response_item") diagnostics.toolRecordsSkipped += 1;
           return;
         }
+        kind = classifiedRecordKind(record?.type, record?.payload?.type ?? null);
+        if (kind === null || kind === "other") return;
+        diagnostics.relevantLines += 1;
       }
       if (record === null) {
         // Degrade, don't discard.
@@ -613,7 +698,7 @@ export async function extractRolloutUsage(path, {
           salvageScalar(text, "timestamp", SALVAGE_TOKEN) ?? "",
         );
         if (!Number.isFinite(observedAtMs)) return;
-        if (text.includes('"turn_context"')) {
+        if (kind === "turn_context") {
           turnContextPending = true;
           const model = salvageScalar(text, "model", SALVAGE_TOKEN);
           if (model !== null) currentModel = model;
@@ -624,14 +709,14 @@ export async function extractRolloutUsage(path, {
           diagnostics.salvagedRecords += 1;
           return;
         }
-        if (text.includes(NEEDLE_RESPONSE_ITEM)) {
+        if (kind === "response_item") {
           // A response item that exceeds the bounded line cap cannot be
           // classified without decoding its payload. Withhold it and let the
           // generation attestation mark tool evidence incomplete.
           diagnostics.toolRecordsSkipped += 1;
           return;
         }
-        if (!text.includes('"token_count"')) return;
+        if (kind !== "token_count") return;
         const salvaged = salvagePartialTokenCount(text);
         if (salvaged === null) return;
         diagnostics.salvagedRecords += 1;
@@ -1014,7 +1099,6 @@ export function createLineageSnapshots(members) {
 /** Metadata-only traversal using the index's bounded line reader. Never derives usage. */
 export async function extractRolloutWorkContexts(path, { end, onContext, onQuotaOnly = null, signal = null } = {}) {
   if (typeof onContext !== "function") throw new TypeError("onContext is required");
-  const sessionMetaKind = Buffer.from('"session_meta"');
   let previousReportedTotal = null;
   const completeConsistentTotal = (value) => value !== null
     && TOKEN_KEYS.every((key) => Number.isSafeInteger(value[key]) && value[key] >= 0)
@@ -1022,36 +1106,41 @@ export async function extractRolloutWorkContexts(path, { end, onContext, onQuota
     && value.cached_input_tokens + value.cache_write_input_tokens <= value.input_tokens
     && value.reasoning_output_tokens <= value.output_tokens;
   return forEachRolloutLine(path, { end, signal, onLine(line, offset, partial) {
-    if (onQuotaOnly && line.includes(NEEDLE_TOKEN_COUNT)) {
-      if (partial) { previousReportedTotal = null; return; }
-      let record;
-      try { record = JSON.parse(line.toString("utf8")); } catch { previousReportedTotal = null; return; }
+    let kind;
+    let record;
+    if (partial) {
+      kind = recordPrefixKind(line);
+      if (kind === "other" || kind === "response_item") return;
+      if (kind === "token_count" || kind === null) previousReportedTotal = null;
+      if (kind !== "token_count") return onContext({ offset, cwd: null });
+      return;
+    }
+    const text = line.toString("utf8");
+    if (text.trim().length === 0) return;
+    try { record = JSON.parse(text); } catch {
+      kind = recordPrefixKind(line);
+      if (kind === "other" || kind === "response_item") return;
+      if (kind === "token_count" || kind === null) previousReportedTotal = null;
+      if (kind !== "token_count") return onContext({ offset, cwd: null });
+      return;
+    }
+    kind = classifiedRecordKind(record?.type, record?.payload?.type ?? null);
+    if (kind === "other" || kind === "response_item" || kind === null) return;
+    if (onQuotaOnly && kind === "token_count") {
       // Classify only a verified status update. Ambiguous, malformed or
       // incomplete usage objects remain unknown even when quota is present.
       // This observes record kind; it never calculates or replays token deltas.
-      if (record?.type === "event_msg" && record.payload?.type === "token_count") {
-        const total = normalizeUsage(record.payload.info?.total_token_usage);
-        // A repeated complete cumulative snapshot is another status reading,
-        // not a new usage change. Compare exact observed counters using the
-        // owner's normalization; do not calculate or admit any token delta.
-        const unchanged = completeConsistentTotal(total) && completeConsistentTotal(previousReportedTotal)
-          && TOKEN_KEYS.every((key) => total[key] === previousReportedTotal[key]);
-        if (record.payload.info != null) previousReportedTotal = total;
-        const at = Date.parse(record.timestamp);
-        if ((record.payload.info == null || unchanged) && Number.isFinite(at)
-            && quotaSnapshot(record.payload.rate_limits, at)?.windows.length > 0) {
-          return onQuotaOnly({ offset });
-        }
+      const total = normalizeUsage(record.payload.info?.total_token_usage);
+      const unchanged = completeConsistentTotal(total) && completeConsistentTotal(previousReportedTotal)
+        && TOKEN_KEYS.every((key) => total[key] === previousReportedTotal[key]);
+      if (record.payload.info != null) previousReportedTotal = total;
+      const at = Date.parse(record.timestamp);
+      if ((record.payload.info == null || unchanged) && Number.isFinite(at)
+          && quotaSnapshot(record.payload.rate_limits, at)?.windows.length > 0) {
+        return onQuotaOnly({ offset });
       }
     }
-    if (!line.includes(NEEDLE_TURN_CONTEXT)
-        && !line.includes(sessionMetaKind)
-        && !line.includes(NEEDLE_THREAD_SETTINGS)) return;
-    // A malformed context invalidates the carry; it cannot silently retain an
-    // earlier workspace across a context change we could not interpret.
-    if (partial) return onContext({ offset, cwd: null });
-    let record;
-    try { record = JSON.parse(line.toString("utf8")); } catch { return onContext({ offset, cwd: null }); }
+    if (!["turn_context", "session_meta", "thread_settings_applied"].includes(kind)) return;
     let settings;
     if (record?.type === "session_meta" || record?.type === "turn_context") {
       settings = record.payload;

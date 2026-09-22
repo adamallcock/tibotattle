@@ -113,6 +113,30 @@ const CANONICAL_MODULES = Object.freeze([
       "./errors.js", "./primitives.js", "./telemetry-v1.1.js",
     ]),
   }),
+  Object.freeze({
+    basename: "telemetry-v1.2.js",
+    expectedImports: Object.freeze([
+      "./constants.js", "./errors.js", "./primitives.js",
+    ]),
+  }),
+  Object.freeze({
+    basename: "telemetry-v1.2-domain.js",
+    expectedImports: Object.freeze([
+      "./errors.js", "./primitives.js", "./telemetry-v1.2.js",
+    ]),
+  }),
+  Object.freeze({
+    basename: "performance-histogram.js",
+    expectedImports: Object.freeze([
+      "./primitives.js", "./errors.js",
+    ]),
+  }),
+  Object.freeze({
+    basename: "telemetry-performance-v1.js",
+    expectedImports: Object.freeze([
+      "./errors.js", "./model-catalog.js", "./performance-histogram.js", "./primitives.js",
+    ]),
+  }),
 ]);
 
 function stripCanonicalImports(source, {

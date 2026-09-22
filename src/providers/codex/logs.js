@@ -140,4 +140,14 @@ export {
   validateTierDeclaration,
 } from "./tier-normalization.js";
 
-export { createParser, createToolFreeParser, digest, METHOD, TOOL_FREE_METHOD, MAX_STATE_BYTES } from './inference-timing.js';
+// The performance parser is deliberately exposed under a projection-specific
+// name so callers cannot mistake it for the accounting/log-normalization path.
+export {
+  createParser,
+  createToolFreeParser,
+  createParser as createCodexPerformanceTimingParser,
+  digest,
+  METHOD,
+  TOOL_FREE_METHOD,
+  MAX_STATE_BYTES,
+} from "./inference-timing.js";

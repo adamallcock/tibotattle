@@ -7,6 +7,7 @@ import {createV1QuotaAcquisitionCheckpoint} from '../src/quota-analysis-v1-reade
 import {createV11QuotaAcquisitionCheckpoint,type V11QuotaAcquisitionIdentity} from '../src/quota-analysis-v11-reader';
 import type {StorageV1HistoryCheckpoint} from '../src/storage-v1-history';
 import type {StorageV11HistoryCheckpoint} from '../src/storage-v11-history';
+import {validEffectiveDays,validEffectiveQuotaCursor,type StorageEffectiveHistoryCheckpoint} from '../src/storage-effective-history';
 import {MODEL_HISTORY_METHOD_VERSION} from '../src/quota-analysis-v1';
 import type {V11UsageReductionCheckpoint} from '../src/quota-analysis-v11';
 import {retireStorageGraphPage} from '../src/storage-graph-retirement';
@@ -109,6 +110,44 @@ describe('private paged historical checkpoint store',()=>{
   expect(await retireStorageGraphPage(target(),key.sourceId,Date.parse('2027-09-06T12:00:00Z')))
    .toEqual({state:'retiring',deleted:2});
  },30000);
+ it('roundtrips effective acquisition, finish, and usage with a nonempty resume cursor',async()=>{
+  const identity:V11QuotaAcquisitionIdentity={participantId:'synthetic-effective-participant',inputFingerprint:'e'.repeat(64),
+   sourceMethodVersion:'synthetic-effective-reader-1',observedAtCutoff:'2026-05-28T00:00:00.000Z',
+   resetsAtCutoff:'2026-06-04T00:00:00.000Z',windowMinutes:10080,maxQuotaRows:60000};
+  const effectiveKey={...key,method:`${STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD}:effective`};
+  const effectiveCursor={phase:'clusters' as const,day:'2026-05-29',
+   after:{observedAtMs:Date.parse('2026-05-29T12:34:56.000Z'),occurrenceId:'effective-occurrence-1'},ordinal:17,complete:false};
+  expect(validEffectiveQuotaCursor(effectiveCursor)).toBe(true);
+  const effectiveDays={quota:['2026-05-29'],usage:['2026-05-30']};
+  expect(validEffectiveDays(effectiveDays,'2026-05-28',key.day)).toBe(true);
+  const acquisition:StorageEffectiveHistoryCheckpoint={version:1,source:'effective',day:key.day,
+   layout:`effective:${key.sourceNamespace}`,identity,effectiveCursor,effectiveDays,phase:'acquisition',
+   acquisition:createV11QuotaAcquisitionCheckpoint(identity)};
+  const acquisitionHead=await drain(acquisition,null,effectiveKey);
+  expect(await read(effectiveKey)).toEqual({status:'ready',headDigest:acquisitionHead,
+   partCount:await parts(acquisitionHead),checkpoint:acquisition});
+  const finish:StorageEffectiveHistoryCheckpoint={...acquisition,phase:'finish',
+   acquisition:{identity,planAnchors:[],quotaRows:[]}};
+  const finishHead=await drain(finish,acquisitionHead,effectiveKey);
+  expect(await read(effectiveKey)).toEqual({status:'ready',headDigest:finishHead,
+   partCount:await parts(finishHead),checkpoint:finish});
+  const usage:StorageEffectiveHistoryCheckpoint={...finish,phase:'usage',usage:{version:1,identity,days:[],dayIndex:0,
+   cursorTime:identity.observedAtCutoff,cursorOccurrence:'',rowsRead:0,complete:true,scalarReduced:true,
+   commonRefusal:'supported_quota_track_unavailable',scalarRefusal:null,modelRefusal:null,previous:[],hazards:[],
+   scalarBuckets:[],modelCosts:[],poisoned:[],usageEventCount:0,unpricedUsageEventCount:0,attributionUnresolved:false}};
+  const usageHead=await drain(usage,finishHead,effectiveKey);
+  expect(await read(effectiveKey)).toEqual({status:'ready',headDigest:usageHead,
+   partCount:await parts(usageHead),checkpoint:usage});
+  const malformed={...acquisition,effectiveCursor:{...effectiveCursor,after:{...effectiveCursor.after,occurrenceId:123}}};
+  await expect(save({target:target(),key:effectiveKey,checkpoint:malformed as unknown as StorageHistoryCheckpoint,
+   expectedHead:usageHead})).rejects.toThrow('CHECKPOINT_UNAVAILABLE');
+  const malformedDays={...acquisition,effectiveDays:{quota:['2026-05-27'],usage:[]}};
+  await expect(save({target:target(),key:effectiveKey,checkpoint:malformedDays as unknown as StorageHistoryCheckpoint,
+   expectedHead:usageHead})).rejects.toThrow('CHECKPOINT_UNAVAILABLE');
+  const withSnapshot={...acquisition,snapshot:null};
+  await expect(save({target:target(),key:effectiveKey,checkpoint:withSnapshot as unknown as StorageHistoryCheckpoint,
+   expectedHead:usageHead})).rejects.toThrow('CHECKPOINT_UNAVAILABLE');
+ });
  it('retires a checkpoint whose method is no longer a live reader key',async()=>{
   const identity:V11QuotaAcquisitionIdentity={participantId:'synthetic-v11-participant',inputFingerprint:'e'.repeat(64),
    sourceMethodVersion:'synthetic-v11-reader-1',observedAtCutoff:'2026-05-28T00:00:00.000Z',

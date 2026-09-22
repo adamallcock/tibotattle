@@ -135,7 +135,14 @@ export const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION =
 // assumption of zero when input/cache-read counters are valid and consistent.
 // A per-event suffix retains the assumption; raw delta/replay counters do not
 // change. The base cursor stamp forces historical sources to be reparsed.
-export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v16";
+// v17 (2026-09-21): retain exact selected input/output totals in the existing
+// total columns. Reject contradictory totals without inventing missing splits.
+// Replay identity, additive components, and boundary semantics are unchanged.
+// v18 (2026-09-22): classify bounded records by structural envelope type,
+// not nested accounting markers, and raise the default line cap to 512 KiB.
+// Reparse present sources, including quarantined lineage; retained absent
+// sources keep their original facts and parser provenance.
+export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v18";
 export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
   "codex-immutable-rollout-v1";
 
@@ -146,14 +153,32 @@ export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
 // degraded row is recorded. Kept in lockstep with the main constant: salvaged
 // rows run the same delta derivation.
 export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v16-partial";
+  "unified-rollout-typed-v18-partial";
 
 // Per-row provenance variants retain the inherited-model assumption without
-// changing the physical schema. Ingest cursors keep the base v16 stamp.
+// changing the physical schema. Ingest cursors keep the base v18 stamp.
 export const LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION =
-  "unified-rollout-typed-v16-parent-model";
+  "unified-rollout-typed-v18-parent-model";
 export const LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v16-parent-model-partial";
+  "unified-rollout-typed-v18-parent-model-partial";
+
+// Cache continuity and dormant successor preparation both accept these exact
+// row-level provenance variants. Keep the reviewed v15/v16/v17 families readable after a
+// v18 reparse; future parser labels remain unsupported until their semantics
+// are reviewed explicitly.
+const QUALIFIED_LOCAL_PARSER_VERSIONS = new Set([
+  ...["unified-rollout-typed-v15", "unified-rollout-typed-v16", "unified-rollout-typed-v17"].flatMap((version) =>
+    [version, `${version}-partial`, `${version}-parent-model`, `${version}-parent-model-partial`]),
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
+].flatMap((version) => version.startsWith("unified-rollout-typed-v15")
+  ? [version] : [version, `${version}-cache-write-zero`]));
+
+export function isLocalUnifiedIndexBoundaryParserVersion(value) {
+  return QUALIFIED_LOCAL_PARSER_VERSIONS.has(value);
+}
 
 export const LOCAL_UNIFIED_INDEX_APPLICATION_ID = 0x554d5549;
 const INDEX_APPLICATION_ID = LOCAL_UNIFIED_INDEX_APPLICATION_ID;

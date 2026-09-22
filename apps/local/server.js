@@ -1,4 +1,15 @@
-import { createWorkUsageService } from "../../src/application/index.js";
+import {
+  createTelemetryPerformanceClient,
+  createTelemetryPerformanceScheduler,
+  createWorkUsageService,
+  initialTelemetryPerformanceSyncState,
+  parseTelemetryPerformanceSyncState,
+  TELEMETRY_PERFORMANCE_AUTHORIZATION_VERSION,
+  TELEMETRY_PERFORMANCE_CAPABILITIES_VERSION,
+  TELEMETRY_PERFORMANCE_METHOD_VERSION,
+  TELEMETRY_PERFORMANCE_SCOPE,
+  TELEMETRY_PERFORMANCE_SUPPORTED_SPEED_METHODS,
+} from "../../src/application/index.js";
 import { createWorkUsageSnapshotStore } from "./work-usage-snapshots.js";
 import { enrichWorkUsageRows } from "../../src/local-work-usage-source.js";
 import { createServer } from "node:http";
@@ -51,7 +62,12 @@ import {
 import {
   buildLocalCacheDropThreadLinks,
 } from "../../src/local-cache-drop-thread-links.js";
-import { TELEMETRY_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
+import {
+  PERFORMANCE_FIELD_DICTIONARY_VERSION,
+  PERFORMANCE_PRIVACY_CONTRACT_VERSION,
+  PERFORMANCE_RECORD_SCHEMA_VERSION,
+  TELEMETRY_SCHEMA_VERSION,
+} from "@app-usagemonitor/telemetry-contract";
 import {
   acquireAutomaticContributionRetirementLock,
   retireAutomaticContributionState,
@@ -59,21 +75,26 @@ import {
 import {
   TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
   TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
+  TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
   createIncrementalContributionSyncController,
   incrementalContributionRequiredConsent,
   telemetryV11FieldInventory,
+  telemetryV12FieldInventory,
   sanitizeTelemetryAttributionBinding,
 } from "../../src/incremental-contribution.js";
 import {
   runIncrementalContributionSyncOnce,
   readIncrementalContributionV11Capabilities,
   readIncrementalContributionV11Review,
+  readIncrementalContributionV12Capabilities,
+  readIncrementalContributionV12Review,
 } from "../../src/contribution-incremental-sync.js";
 import {
   createLocalAccountlessContribution,
   selectLocalAccountlessHostedRehearsalProfile,
   selectLocalAccountlessProductionProfile,
 } from "./accountless-contribution.js";
+import { createAccountlessDiagnosticRecorder } from "./accountless-diagnostics.js";
 import { readLocalCollectorCheckpoint } from "../../src/local-collector-state.js";
 import {
   HostedSignInHandoffError,
@@ -104,7 +125,10 @@ import {
   migrateLegacyContributionDeviceCapability,
   readContributionDeviceCapability,
   removeContributionDeviceCapability,
+  withContributionDeviceSecret,
 } from "../../src/contribution-device-capability.js";
+import { createTelemetryPerformanceEnvelope } from "../../src/platform/index.js";
+import { readJsonIfExists, writeJsonOwnerOnlyAtomic } from "../../src/storage.js";
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
   createExportIdentityKeychainBackend,
@@ -236,6 +260,21 @@ const PARTICIPANT_RELAY_TIMEOUT_MS = 15_000;
 // the dependency-free half that removes the measured cold handshake.
 const CENTRAL_PREWARM_TIMEOUT_MS = 10_000;
 export const LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS = 5 * 60_000;
+const LOCAL_PERFORMANCE_REVIEW_SCHEMA_VERSION =
+  "local-telemetry-performance-review-v1";
+const LOCAL_PERFORMANCE_CONSENT_STATE_SCHEMA_VERSION =
+  "local-telemetry-performance-consent-v1";
+const LOCAL_PERFORMANCE_CAPABILITIES_PATH =
+  "/api/v1/device/telemetry/performance/capabilities";
+const LOCAL_PERFORMANCE_ENVELOPE_KEY_PATH = "/api/v1/envelope-key";
+const LOCAL_PERFORMANCE_CONSENT_FILE =
+  "social-performance-consent-v1.json";
+const LOCAL_PERFORMANCE_SYNC_STATE_FILE =
+  "social-performance-sync-state-v1.json";
+const LOCAL_PERFORMANCE_REVIEW_LIFETIME_MS = 10 * 60_000;
+const MAX_ACTIVE_PERFORMANCE_REVIEWS = 8;
+const PERFORMANCE_DEVICE_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 function ownerOnlyRegularUnifiedIndex(metadata) {
   return metadata.isFile()
@@ -276,26 +315,30 @@ function openImmutableLocalUnifiedIndex(indexFile) {
   });
 }
 
-const COLD_REFRESH_V16_PREDECESSOR_PARSERS = Object.freeze([
+const COLD_REFRESH_V18_PREDECESSOR_PARSERS = Object.freeze([
   "unified-rollout-typed-v10",
   "unified-rollout-typed-v11",
   "unified-rollout-typed-v12",
   "unified-rollout-typed-v13",
   "unified-rollout-typed-v14",
   "unified-rollout-typed-v15",
+  "unified-rollout-typed-v16",
+  "unified-rollout-typed-v17",
 ]);
 
 function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaVersion) {
   // This is a deadline decision, not permission to read or publish facts. The
-  // worker still validates the complete index. Only reviewed v10 through v15
-  // predecessors can receive the v16 rescan window. Their physical schema and
+  // worker still validates the complete index. Only reviewed v10 through v17
+  // predecessors can receive the v18 rescan window. Their physical schema and
   // immutable source identity remain compatible; v12 nullable counters and
   // v13 ordinal-bearing compaction headers and v14 paginated setting boundaries
   // and v15 historical parent-model fallback require reparsing present sources.
   // v16 adds the explicitly approved missing-cache-write assumption with row provenance.
+  // v17 retains exact selected input/output totals without changing those assumptions.
+  // v18 fixes structural classification and increases the bounded line cap.
   // Keep the target pinned too: a future parser needs an explicit review and
   // must not silently inherit this longer deadline for every mismatch.
-  if (LOCAL_UNIFIED_INDEX_PARSER_VERSION !== "unified-rollout-typed-v16"
+  if (LOCAL_UNIFIED_INDEX_PARSER_VERSION !== "unified-rollout-typed-v18"
       || schemaVersion !== LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
       || !compatibility.metadataPresent
       || compatibility.formatUserVersion !== LOCAL_UNIFIED_INDEX_USER_VERSION
@@ -337,7 +380,7 @@ function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaV
           AND g.tool_provenance_complete = 0)
       )
   `).get(generationId);
-  return COLD_REFRESH_V16_PREDECESSOR_PARSERS.includes(generation?.parser_version)
+  return COLD_REFRESH_V18_PREDECESSOR_PARSERS.includes(generation?.parser_version)
     && generation.parser_contract_version === TELEMETRY_SCHEMA_VERSION
     && generation.contract_version === TELEMETRY_SCHEMA_VERSION
     && Number.isSafeInteger(generation.completed_at_ms)
@@ -954,8 +997,12 @@ const API_ROUTES = new Set([
   "/api/local/contribution/sync-inspect-exact",
   "/api/local/contribution/incremental-status",
   "/api/local/contribution/incremental-review-v11",
+  "/api/local/contribution/incremental-review-v12",
   "/api/local/contribution/incremental-approve",
   "/api/local/contribution/incremental-run",
+  "/api/local/performance/status",
+  "/api/local/performance/review",
+  "/api/local/performance/approve",
 ]);
 
 // The production-v1 accountless companion keeps local collection and its
@@ -977,6 +1024,9 @@ const SNAPSHOT_INDEPENDENT_API_ROUTES = new Set([
   "/api/local/diagnostics/note",
   "/api/local/identity/hosted-signin-handoff",
   "/api/local/model-performance",
+  "/api/local/performance/status",
+  "/api/local/performance/review",
+  "/api/local/performance/approve",
 ]);
 
 
@@ -1022,6 +1072,121 @@ function sendError(response, statusCode, code) {
   send(response, statusCode, {
     schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
     error: { code },
+  });
+}
+
+function performanceExact(value, keys) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === keys.length
+    && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function performanceInstant(value) {
+  return typeof value === "string"
+    && value.length === 24
+    && Number.isFinite(Date.parse(value))
+    && new Date(value).toISOString() === value;
+}
+
+function performanceDay(value) {
+  return typeof value === "string"
+    && /^\d{4}-\d{2}-\d{2}$/u.test(value)
+    && performanceInstant(`${value}T00:00:00.000Z`);
+}
+
+function performanceOrigin(value) {
+  if (typeof value !== "string") return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.origin === value && ["http:", "https:"].includes(parsed.protocol);
+  } catch {
+    return false;
+  }
+}
+
+function performanceSpeedMethods(value) {
+  return Array.isArray(value)
+    && value.length === TELEMETRY_PERFORMANCE_SUPPORTED_SPEED_METHODS.length
+    && value.every((method, index) => method === TELEMETRY_PERFORMANCE_SUPPORTED_SPEED_METHODS[index]);
+}
+
+function performanceConsent(value) {
+  return performanceExact(value, [
+    "fieldDictionaryVersion", "privacyContractVersion", "schemaVersion", "scope",
+  ])
+    && value.schemaVersion === PERFORMANCE_RECORD_SCHEMA_VERSION
+    && value.fieldDictionaryVersion === PERFORMANCE_FIELD_DICTIONARY_VERSION
+    && value.privacyContractVersion === PERFORMANCE_PRIVACY_CONTRACT_VERSION
+    && value.scope === TELEMETRY_PERFORMANCE_SCOPE;
+}
+
+function performanceBinding(value, destinationOrigin) {
+  return performanceExact(value, [
+    "destinationOrigin", "fieldDictionaryVersion", "methodVersion",
+    "privacyContractVersion", "scope", "stream", "supportedSpeedMethods",
+  ])
+    && value.destinationOrigin === destinationOrigin
+    && performanceOrigin(value.destinationOrigin)
+    && value.fieldDictionaryVersion === PERFORMANCE_FIELD_DICTIONARY_VERSION
+    && value.methodVersion === TELEMETRY_PERFORMANCE_METHOD_VERSION
+    && value.privacyContractVersion === PERFORMANCE_PRIVACY_CONTRACT_VERSION
+    && value.scope === TELEMETRY_PERFORMANCE_SCOPE
+    && value.stream === TELEMETRY_PERFORMANCE_SCOPE
+    && performanceSpeedMethods(value.supportedSpeedMethods);
+}
+
+function performanceConsentState(value, destinationOrigin) {
+  if (!performanceExact(value, [
+    "approvedAt", "binding", "deviceId", "schemaVersion",
+  ])
+      || value.schemaVersion !== LOCAL_PERFORMANCE_CONSENT_STATE_SCHEMA_VERSION
+      || !performanceInstant(value.approvedAt)
+      || !PERFORMANCE_DEVICE_ID.test(value.deviceId)
+      || !performanceBinding(value.binding, destinationOrigin)) return null;
+  return Object.freeze({
+    schemaVersion: value.schemaVersion,
+    approvedAt: value.approvedAt,
+    binding: Object.freeze({
+      ...value.binding,
+      supportedSpeedMethods: Object.freeze([...value.binding.supportedSpeedMethods]),
+    }),
+    deviceId: value.deviceId,
+  });
+}
+
+function performanceReviewProjection({ reviewToken, grantDeviceId, destinationOrigin, day }) {
+  const consent = Object.freeze({
+    schemaVersion: PERFORMANCE_RECORD_SCHEMA_VERSION,
+    fieldDictionaryVersion: PERFORMANCE_FIELD_DICTIONARY_VERSION,
+    privacyContractVersion: PERFORMANCE_PRIVACY_CONTRACT_VERSION,
+    scope: TELEMETRY_PERFORMANCE_SCOPE,
+  });
+  const binding = Object.freeze({
+    destinationOrigin,
+    fieldDictionaryVersion: PERFORMANCE_FIELD_DICTIONARY_VERSION,
+    methodVersion: TELEMETRY_PERFORMANCE_METHOD_VERSION,
+    privacyContractVersion: PERFORMANCE_PRIVACY_CONTRACT_VERSION,
+    scope: TELEMETRY_PERFORMANCE_SCOPE,
+    stream: TELEMETRY_PERFORMANCE_SCOPE,
+    supportedSpeedMethods: Object.freeze([...TELEMETRY_PERFORMANCE_SUPPORTED_SPEED_METHODS]),
+  });
+  return Object.freeze({
+    schemaVersion: LOCAL_PERFORMANCE_REVIEW_SCHEMA_VERSION,
+    status: "ready",
+    reviewToken,
+    consent,
+    binding,
+    grantDeviceId,
+    sample: Object.freeze({
+      status: "available",
+      day,
+      recordCount: null,
+      content: false,
+    }),
+    includesContent: false,
+    includesPaths: false,
+    includesIdentifiers: false,
+    includesCredentials: false,
   });
 }
 
@@ -2445,8 +2610,8 @@ function incrementalSyncStatusProjection(value, {
     status: valid
       ? "available"
       : configured ? "unavailable" : "not_configured",
-    contractVersion: valid && value.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
-      ? TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION : TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+    contractVersion: valid && [TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION].includes(value.contractVersion)
+      ? value.contractVersion : TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
     keychainPrompt: promptSurface,
     consent: { approved: false, current: false, consentedAt: null },
     paused: false,
@@ -2526,13 +2691,51 @@ function contributionDiagnosticQueueState(queue) {
   return "empty";
 }
 
+const ACCOUNTLESS_DIAGNOSTIC_STATES = new Set([
+  "off", "unavailable", "uploading", "recovery_required", "paused", "pending", "up_to_date", "retry_wait",
+]);
+const ACCOUNTLESS_DIAGNOSTIC_FAILURE_CODES = new Set([
+  null, "transient_failure", "terminal_failure", "credential_recovery_required", "preference_unavailable",
+]);
+const ACCOUNTLESS_DIAGNOSTIC_KEYS = [
+  "state", "lastAttemptAt", "lastSuccessfulSyncAt", "lastAcceptedAt", "nextAttemptAt", "lastFailureCode",
+];
+
+function accountlessContributionDiagnosticsProjection(value) {
+  const valid = value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === ACCOUNTLESS_DIAGNOSTIC_KEYS.length
+    && ACCOUNTLESS_DIAGNOSTIC_KEYS.every((key) => Object.hasOwn(value, key))
+    && ACCOUNTLESS_DIAGNOSTIC_STATES.has(value.state)
+    && ACCOUNTLESS_DIAGNOSTIC_FAILURE_CODES.has(value.lastFailureCode)
+    && ["lastAttemptAt", "lastSuccessfulSyncAt", "lastAcceptedAt", "nextAttemptAt"]
+      .every((key) => value[key] === null
+        || (typeof value[key] === "string" && nullableInstant(value[key]) === value[key]));
+  return Object.freeze(valid ? {
+    state: value.state,
+    lastAttemptAt: value.lastAttemptAt,
+    lastSuccessfulSyncAt: value.lastSuccessfulSyncAt,
+    lastAcceptedAt: value.lastAcceptedAt,
+    nextAttemptAt: value.nextAttemptAt,
+    lastFailureCode: value.lastFailureCode,
+  } : {
+    state: "unavailable", lastAttemptAt: null, lastSuccessfulSyncAt: null,
+    lastAcceptedAt: null, nextAttemptAt: null, lastFailureCode: null,
+  });
+}
+
 function contributionDiagnosticJourneyPhase({
   configured,
   queueState,
   incremental,
   pairingObserved,
   paired,
+  accountless,
 }) {
+  if (accountless !== undefined) {
+    if (accountless.state === "off") return "accountless_off";
+    return ["unavailable", "paused", "recovery_required"].includes(accountless.state)
+      ? "accountless_unavailable" : "accountless_active";
+  }
   if (!configured) return "not_configured";
   if (incremental.status !== "available") return "unavailable";
   if (!incremental.consent.approved || !incremental.consent.current) {
@@ -2553,8 +2756,11 @@ function localContributionDiagnosticsProjection({
   pairingObserved,
   paired,
   recentDiagnosticReferences,
+  accountless,
 }) {
   const queueState = contributionDiagnosticQueueState(queue);
+  const accountlessDiagnostics = accountless === undefined
+    ? undefined : accountlessContributionDiagnosticsProjection(accountless);
   return Object.freeze({
     schemaVersion: LOCAL_CONTRIBUTION_DIAGNOSTICS_SCHEMA_VERSION,
     journeyPhase: contributionDiagnosticJourneyPhase({
@@ -2563,6 +2769,7 @@ function localContributionDiagnosticsProjection({
       incremental,
       pairingObserved,
       paired,
+      accountless: accountlessDiagnostics,
     }),
     // Preview discovery is a local mutation (it can enqueue a prepared set),
     // so this read-only support route never runs it. The page merges its
@@ -2579,6 +2786,7 @@ function localContributionDiagnosticsProjection({
       paired,
     }),
     recentDiagnosticReferences: Object.freeze(recentDiagnosticReferences),
+    ...(accountlessDiagnostics === undefined ? {} : { accountless: accountlessDiagnostics }),
     includesTokens: false,
     includesOauthState: false,
     includesVerifiers: false,
@@ -3311,6 +3519,13 @@ function createPreparedLocalCompanionServer({
   incrementalAttributionReviewProvider = null,
   accountlessContributionRunner = undefined,
   accountlessSchedulerOptions = undefined,
+  // The accountless profile's usage-sharing preference is the only local
+  // signal that may start the independent performance scheduler. It still
+  // obtains a distinct Worker policy grant; social installs remain disabled
+  // until a separate performance consent composition is supplied.
+  accountlessPerformanceEnabled = accountlessProductionProfile,
+  accountlessPerformanceOptions = undefined,
+  socialPerformanceOptions = undefined,
   loadExistingAccountObservationSecret = async () => {
     if (environment.USAGE_MONITOR_ACCOUNTLESS_MODE === "rehearsal-v1") {
       return null;
@@ -3420,12 +3635,38 @@ function createPreparedLocalCompanionServer({
       "contributionPreparationCreateKeychainBackend must be a function",
     );
   }
+  const invalidSocialPerformanceOptions = socialPerformanceOptions !== undefined
+    && (!socialPerformanceOptions
+      || typeof socialPerformanceOptions !== "object"
+      || Array.isArray(socialPerformanceOptions)
+      || (socialPerformanceOptions.readPreparedDay !== undefined
+        && typeof socialPerformanceOptions.readPreparedDay !== "function")
+      || (socialPerformanceOptions.createEnvelope !== undefined
+        && typeof socialPerformanceOptions.createEnvelope !== "function")
+      || (socialPerformanceOptions.fetchImpl !== undefined
+        && typeof socialPerformanceOptions.fetchImpl !== "function")
+      || (socialPerformanceOptions.readDeviceCapability !== undefined
+        && typeof socialPerformanceOptions.readDeviceCapability !== "function")
+      || (socialPerformanceOptions.readAuthorization !== undefined
+        && typeof socialPerformanceOptions.readAuthorization !== "function")
+      || (socialPerformanceOptions.readHostedCapability !== undefined
+        && typeof socialPerformanceOptions.readHostedCapability !== "function")
+      || (socialPerformanceOptions.schedulerOptions !== undefined
+        && (!socialPerformanceOptions.schedulerOptions
+          || typeof socialPerformanceOptions.schedulerOptions !== "object"
+          || Array.isArray(socialPerformanceOptions.schedulerOptions))));
   if ((accountlessContributionRunner !== undefined
         && typeof accountlessContributionRunner !== "function")
       || (accountlessSchedulerOptions !== undefined
         && (!accountlessSchedulerOptions
           || typeof accountlessSchedulerOptions !== "object"
-          || Array.isArray(accountlessSchedulerOptions)))) {
+          || Array.isArray(accountlessSchedulerOptions)))
+      || typeof accountlessPerformanceEnabled !== "boolean"
+      || (accountlessPerformanceOptions !== undefined
+        && (!accountlessPerformanceOptions
+          || typeof accountlessPerformanceOptions !== "object"
+          || Array.isArray(accountlessPerformanceOptions)))
+      || invalidSocialPerformanceOptions) {
     throw new TypeError("accountless contribution controls are invalid");
   }
   const developmentIdentity = accountlessProductionProfile
@@ -3946,7 +4187,7 @@ function createPreparedLocalCompanionServer({
       if (approvedAttributionBinding === null || clock() - approvedAttributionBindingAt > 5 * 60_000
           || contributionDeviceDisconnectInProgress || contributionReconnectInProgress > 0) return null;
       const status = await incrementalContribution?.inspect();
-      return status?.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+      return [TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION].includes(status?.contractVersion)
         && status?.consent?.approved === true && status?.consent?.current === true
         && status.settingsAvailable === true && status.pausedReason !== "device_repair_required"
         ? approvedAttributionBinding : null;
@@ -3962,14 +4203,30 @@ function createPreparedLocalCompanionServer({
       stateFile: statePaths.contributionDeviceStateFile, fetchImpl: centralFetch, now: clock,
       readAccountMarkers: readContributionAccountMarkers, loadExistingAccountObservationSecret }));
   const attributionCapabilities = () => withContributionCredentialRead(readAttributionCapabilities);
-  const attributionReview = () => withContributionCredentialRead(readAttributionReview);
+  const readSuccessorCapabilities = async () => {
+    try { return await readIncrementalContributionV12Capabilities({
+    origin: contributionServiceOrigin, backend: await createContributionDeviceBackend(),
+    stateFile: statePaths.contributionDeviceStateFile, fetchImpl: centralFetch, now: clock });
+    } catch { return null; }
+  };
+  const readSuccessorReview = async () => readIncrementalContributionV12Review({
+    indexFile: statePaths.unifiedIndexFile, origin: contributionServiceOrigin,
+    backend: await createContributionDeviceBackend(), stateFile: statePaths.contributionDeviceStateFile,
+    fetchImpl: centralFetch, now: clock, readAccountMarkers: readContributionAccountMarkers,
+    loadExistingAccountObservationSecret });
+  const attributionReview = (successor = false) => withContributionCredentialRead(successor ? readSuccessorReview : readAttributionReview);
+  const successorAccepted = capability => capability?.destinationOrigin === contributionServiceOrigin
+    && capability?.successor?.schemaVersion === TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION
+    && capability.successor.lifecycle === "accepted";
+  const reviewIsSuccessor = review => review?.capabilities?.successor?.schemaVersion === TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION;
+  const reviewConsentCurrent = review => (reviewIsSuccessor(review) ? review.capabilities.successor : review.capabilities)?.consentCurrent === true;
   let attributionSupportCache = null;
   let attributionSupportPending = null;
   const attributionAccepted = (capability) => capability?.destinationOrigin === contributionServiceOrigin
     && capability?.requiredConsent?.telemetrySchemaVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
     && capability?.formats?.some((format) => format.schemaVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
       && format.lifecycle === "accepted") === true;
-  const attributionReviewReady = (review) => review?.status === "ready" && attributionAccepted(review.capabilities)
+  const attributionReviewReady = (review) => review?.status === "ready" && (reviewIsSuccessor(review) ? successorAccepted(review.capabilities) : attributionAccepted(review.capabilities))
     && sanitizeTelemetryAttributionBinding(review.binding) !== null
     && review.binding.destinationOrigin === contributionServiceOrigin
     && review.binding.enrollmentNamespace === review.capabilities.enrollmentNamespace
@@ -3978,7 +4235,7 @@ function createPreparedLocalCompanionServer({
     && SHA256.test(review.sample?.manifestDigest ?? "")
     && INCREMENTAL_SYNC_DAY.test(review.sample?.day ?? "")
     && ["usage", "quota", "session"].every((stream) => isNonNegativeInteger(review.sample?.recordCounts?.[stream]))
-    && JSON.stringify(review.inventory) === JSON.stringify(telemetryV11FieldInventory());
+    && JSON.stringify(review.inventory) === JSON.stringify((reviewIsSuccessor(review) ? telemetryV12FieldInventory : telemetryV11FieldInventory)());
   const attributionUpgradeAvailable = async (status) => {
     // Do not discover a new upload format before any user-approved sharing,
     // or let polling repeatedly prompt the credential store/network.
@@ -3990,7 +4247,10 @@ function createPreparedLocalCompanionServer({
     }
     attributionSupportPending ??= (async () => {
       let available = false;
-      try { available = attributionAccepted(await attributionCapabilities()); } catch { /* Staged/unavailable stays hidden. */ }
+      try {
+        if (successorAccepted(await withContributionCredentialRead(readSuccessorCapabilities))) available = TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION;
+        else if (attributionAccepted(await attributionCapabilities())) available = TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION;
+      } catch { /* Staged/unavailable stays hidden. */ }
       attributionSupportCache = { at: clock(), available };
       return available;
     })().finally(() => { attributionSupportPending = null; });
@@ -4033,10 +4293,243 @@ function createPreparedLocalCompanionServer({
     ...(accountlessContributionRunner === undefined
       ? {}
       : { runner: accountlessContributionRunner }),
-    ...(accountlessSchedulerOptions === undefined
-      ? {}
-      : { schedulerOptions: accountlessSchedulerOptions }),
+    schedulerOptions: {
+      ...accountlessSchedulerOptions,
+      onDiagnostics: createAccountlessDiagnosticRecorder({
+        recordNote: recordDiagnosticNote,
+        createReference: diagnosticReferenceFactory,
+        clock,
+      }),
+    },
+    ...(accountlessPerformanceEnabled
+      ? {
+        performanceOptions: {
+          ...(accountlessPerformanceOptions ?? {}),
+          fetchImpl: accountlessPerformanceOptions?.fetchImpl ?? centralFetch,
+          readPreparedDay: accountlessPerformanceOptions?.readPreparedDay
+            ?? (async ({ day, nowEpoch }) => {
+              modelPerformanceController ??= createModelPerformanceController({
+                directory: join(stateRoot, "inference-timing-v2"),
+                codexHome,
+              });
+              return modelPerformanceController.preparePerformanceDay({
+                day, provider: "openai_codex", nowEpoch,
+              });
+            }),
+        },
+      }
+      : {}),
   });
+  const socialPerformanceConsentFile = join(
+    stateRoot, "private", LOCAL_PERFORMANCE_CONSENT_FILE,
+  );
+  const socialPerformanceStateFile = join(
+    stateRoot, "private", LOCAL_PERFORMANCE_SYNC_STATE_FILE,
+  );
+  const readSocialPerformanceDeviceCapability = async () => {
+    const injected = socialPerformanceOptions?.readDeviceCapability;
+    if (injected !== undefined) return injected();
+    return readContributionDeviceCapability({
+      backend: contributionDeviceBackendFactory(),
+      stateFile: statePaths.contributionDeviceStateFile,
+      expectedOrigin: contributionServiceOrigin,
+    });
+  };
+  const reviewedPerformanceAuthorizations = new Map();
+  let socialPerformanceClient = null;
+  let socialPerformanceScheduler = null;
+  let socialPerformanceReviewInProgress = false;
+  const purgeReviewedPerformanceAuthorizations = (now) => {
+    for (const [token, authorization] of reviewedPerformanceAuthorizations) {
+      if (authorization.expiresAt <= now) reviewedPerformanceAuthorizations.delete(token);
+    }
+  };
+  const consumeReviewedPerformanceAuthorization = (token) => {
+    if (typeof token !== "string") return null;
+    const authorization = reviewedPerformanceAuthorizations.get(token) ?? null;
+    if (authorization === null || authorization.expiresAt <= clock()) return null;
+    reviewedPerformanceAuthorizations.delete(token);
+    return authorization;
+  };
+
+  const readSocialPerformanceConsent = async () => {
+    if (accountlessProductionProfile || contributionServiceOrigin === null) return null;
+    try {
+      return performanceConsentState(
+        await readJsonIfExists(socialPerformanceConsentFile, null),
+        contributionServiceOrigin,
+      );
+    } catch {
+      return null;
+    }
+  };
+  const saveSocialPerformanceConsent = async (value) => {
+    const parsed = performanceConsentState(value, contributionServiceOrigin);
+    if (parsed === null) throw new Error("performance_consent_invalid");
+    await writeJsonOwnerOnlyAtomic(socialPerformanceConsentFile, parsed);
+    return parsed;
+  };
+  const readPerformanceResponse = async (response, maximumBytes = 16_384) => {
+    if (!response || typeof response.status !== "number"
+        || typeof response.text !== "function") throw new Error("performance_response_invalid");
+    const text = await response.text();
+    if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > maximumBytes) {
+      throw new Error("performance_response_invalid");
+    }
+    try { return text.length === 0 ? null : JSON.parse(text); }
+    catch { throw new Error("performance_response_invalid"); }
+  };
+  const readSocialPerformanceHostedCapability = async ({ deviceId } = {}) => {
+    if (!PERFORMANCE_DEVICE_ID.test(deviceId ?? "")
+        || accountlessProductionProfile
+        || !performanceOrigin(contributionServiceOrigin)) return null;
+    const validate = (value) => {
+      if (!performanceExact(value, [
+        "authorization", "authorizationCurrent", "consentCurrent", "lifecycle",
+        "requiredConsent", "schemaVersion", "supportedSpeedMethods",
+      ])
+          || value.schemaVersion !== TELEMETRY_PERFORMANCE_CAPABILITIES_VERSION
+          || value.lifecycle !== "accepted"
+          || value.consentCurrent !== true
+          || value.authorizationCurrent !== true
+          || !performanceSpeedMethods(value.supportedSpeedMethods)
+          || !performanceConsent(value.requiredConsent)
+          || !performanceExact(value.authorization, [
+            "authorityEpoch", "capabilityRevision", "expiresAt", "issuedAt",
+            "schemaVersion", "scope",
+          ])
+          || value.authorization.schemaVersion !== TELEMETRY_PERFORMANCE_AUTHORIZATION_VERSION
+          || !Number.isSafeInteger(value.authorization.capabilityRevision)
+          || value.authorization.capabilityRevision < 1
+          || !Number.isSafeInteger(value.authorization.authorityEpoch)
+          || value.authorization.authorityEpoch < 1
+          || !performanceInstant(value.authorization.issuedAt)
+          || !performanceInstant(value.authorization.expiresAt)
+          || Date.parse(value.authorization.expiresAt) <= clock()
+          || value.authorization.scope !== TELEMETRY_PERFORMANCE_SCOPE) {
+        return null;
+      }
+      return value;
+    };
+    const options = socialPerformanceOptions ?? {};
+    if (options.readHostedCapability !== undefined) {
+      try {
+        return validate(await options.readHostedCapability({
+          deviceId,
+          origin: contributionServiceOrigin,
+        }));
+      } catch {
+        return null;
+      }
+    }
+    try {
+      return await withContributionDeviceSecret({
+        backend: await createContributionDeviceBackend(),
+        stateFile: statePaths.contributionDeviceStateFile,
+        expectedOrigin: contributionServiceOrigin,
+        operation: async (secret, binding) => {
+          if (binding.deviceId !== deviceId) return null;
+          const response = await (options.fetchImpl ?? centralFetch)(
+            new URL(LOCAL_PERFORMANCE_CAPABILITIES_PATH, contributionServiceOrigin),
+            {
+              method: "GET",
+              cache: "no-store",
+              headers: {
+                Accept: "application/json",
+                Authorization:
+                  `Device um_device_${binding.deviceId}.${secret.toString("base64url")}`,
+              },
+            },
+          );
+          return validate(await readPerformanceResponse(response));
+        },
+      });
+    } catch {
+      return null;
+    }
+  };
+  const readPerformanceEnvelopeKey = async (fetchImpl, origin) => {
+    const response = await fetchImpl(new URL(LOCAL_PERFORMANCE_ENVELOPE_KEY_PATH, origin), {
+      method: "GET", headers: { Accept: "application/json" },
+    });
+    const value = await readPerformanceResponse(response);
+    if (response.status !== 200 || !value || typeof value !== "object"
+        || Array.isArray(value) || value.algorithm !== "RSA-OAEP-256"
+        || typeof value.keyId !== "string" || !/^key:[A-Za-z0-9._-]{1,64}$/u.test(value.keyId)
+        || !value.publicJwk || typeof value.publicJwk !== "object"
+        || Array.isArray(value.publicJwk)) throw new Error("performance_key_unavailable");
+    return Object.freeze({ keyId: value.keyId, publicJwk: value.publicJwk });
+  };
+  const createSocialPerformanceRuntime = () => {
+    if (socialPerformanceClient !== null) return socialPerformanceClient;
+    if (accountlessProductionProfile || contributionServiceOrigin === null) return null;
+    const options = socialPerformanceOptions ?? {};
+    const fetchImpl = options.fetchImpl ?? centralFetch;
+    const readAuthorization = socialPerformanceOptions?.readAuthorization
+      ?? (async () => withContributionDeviceSecret({
+        backend: await createContributionDeviceBackend(),
+        stateFile: statePaths.contributionDeviceStateFile,
+        expectedOrigin: contributionServiceOrigin,
+        operation: async (secret, binding) => {
+          if (!PERFORMANCE_DEVICE_ID.test(binding.deviceId)) {
+            throw new Error("performance_device_unavailable");
+          }
+          return `Device um_device_${binding.deviceId}.${secret.toString("base64url")}`;
+        },
+      }));
+    socialPerformanceClient = createTelemetryPerformanceClient({
+      origin: contributionServiceOrigin,
+      fetchImpl,
+      readAuthorization,
+      readPreparedDay: options.readPreparedDay
+        ?? (async ({ day, nowEpoch }) => {
+          modelPerformanceController ??= createModelPerformanceController({
+            directory: join(stateRoot, "inference-timing-v2"), codexHome,
+          });
+          return modelPerformanceController.preparePerformanceDay({
+            day, provider: "openai_codex", nowEpoch,
+          });
+        }),
+      readState: async () => {
+        try {
+          return parseTelemetryPerformanceSyncState(
+            await readJsonIfExists(socialPerformanceStateFile, null),
+          );
+        } catch {
+          return initialTelemetryPerformanceSyncState();
+        }
+      },
+      saveState: (value) => writeJsonOwnerOnlyAtomic(
+        socialPerformanceStateFile,
+        parseTelemetryPerformanceSyncState(value),
+      ),
+      createEnvelope: async ({ report }) => {
+        const key = await readPerformanceEnvelopeKey(fetchImpl, contributionServiceOrigin);
+        return (options.createEnvelope ?? createTelemetryPerformanceEnvelope)({
+          report, publicJwk: key.publicJwk, keyId: key.keyId,
+        });
+      },
+    });
+    socialPerformanceScheduler = createTelemetryPerformanceScheduler({
+      ...(options.schedulerOptions ?? {}),
+      runner: ({ day, nowEpoch, resetRetryCount }) => socialPerformanceClient.runDay({ day, nowEpoch, resetRetryCount }),
+      backfillDays: options.schedulerOptions?.backfillDays ?? 7,
+      includeCurrentDay: options.schedulerOptions?.includeCurrentDay ?? true,
+    });
+    return socialPerformanceClient;
+  };
+  const startSocialPerformanceIfApproved = async () => {
+    const consent = await readSocialPerformanceConsent();
+    if (consent === null) return false;
+    createSocialPerformanceRuntime();
+    socialPerformanceScheduler?.start();
+    return true;
+  };
+  const stopSocialPerformance = async () => {
+    await socialPerformanceScheduler?.stop();
+    socialPerformanceScheduler = null;
+    socialPerformanceClient = null;
+  };
   let supersededContributionRetirementPending = null;
   let supersededContributionRetirementRequested = false;
   const maybeRetireSupersededPreparedSets = () => {
@@ -4107,6 +4600,11 @@ function createPreparedLocalCompanionServer({
         } catch {
           onError("accountless_contribution_stop_failed");
         }
+        try {
+          await stopSocialPerformance();
+        } catch {
+          onError("social_performance_stop_failed");
+        }
         // Retirement includes its consent probe and may still write private
         // state. Keep the instance lock until that accepted work has settled.
         await supersededContributionRetirementPending?.catch(() => {});
@@ -4174,6 +4672,11 @@ function createPreparedLocalCompanionServer({
                 await accountlessContribution?.start();
               } catch {
                 onError("accountless_contribution_start_failed");
+              }
+              try {
+                await startSocialPerformanceIfApproved();
+              } catch {
+                onError("social_performance_start_failed");
               }
             });
             await contributionRuntimeStart;
@@ -4245,6 +4748,7 @@ function createPreparedLocalCompanionServer({
       recordNote: recordDiagnosticNote,
       clock,
     }),
+    onIndexPublished: () => accountlessContribution?.notifyIndexPublished(),
   });
   // One keep-alive-tuned outbound fetch feeds both the proxy and the relay, so
   // the pre-warmed connection is reused by every central request. Only the real
@@ -4264,7 +4768,15 @@ function createPreparedLocalCompanionServer({
     fetchImpl: centralOutbound.fetch,
   });
   const readLocalContributionDiagnostics = async () => {
+    let recentDiagnosticReferences = [];
+    try {
+      recentDiagnosticReferences = await readRecentDiagnosticReferences({ file: diagnosticsLogFile });
+    } catch {
+      recentDiagnosticReferences = [];
+    }
     if (accountlessProductionProfile) {
+      let accountless = null;
+      try { accountless = accountlessContribution?.inspectDiagnostics() ?? null; } catch { /* Unavailable stays explicit. */ }
       return localContributionDiagnosticsProjection({
         queue: syncStatusProjection(null),
         incremental: incrementalSyncStatusProjection(null, {
@@ -4274,7 +4786,8 @@ function createPreparedLocalCompanionServer({
         configured: false,
         pairingObserved: false,
         paired: false,
-        recentDiagnosticReferences: [],
+        recentDiagnosticReferences,
+        accountless,
       });
     }
     let queueValue = null;
@@ -4308,14 +4821,6 @@ function createPreparedLocalCompanionServer({
       }
     } else {
       pairingObserved = true;
-    }
-    let recentDiagnosticReferences = [];
-    try {
-      recentDiagnosticReferences = await readRecentDiagnosticReferences({
-        file: diagnosticsLogFile,
-      });
-    } catch {
-      recentDiagnosticReferences = [];
     }
     return localContributionDiagnosticsProjection({
       queue: syncStatusProjection(queueValue),
@@ -4727,9 +5232,13 @@ function createPreparedLocalCompanionServer({
         const entries = [...url.searchParams.entries()];
         const period = url.searchParams.get("period");
         const endAt = url.searchParams.get("endAt");
+        const speedMode = url.searchParams.get("speedMode") ?? "standard";
         const end = endAt === null ? null : Date.parse(endAt);
-        if (entries.length !== (endAt === null ? 1 : 2)
-            || entries.some(([key]) => !["period", "endAt"].includes(key))
+        if (url.searchParams.getAll("period").length !== 1
+            || url.searchParams.getAll("endAt").length > 1
+            || url.searchParams.getAll("speedMode").length > 1
+            || entries.some(([key]) => !["period", "endAt", "speedMode"].includes(key))
+            || !["standard", "fast"].includes(speedMode)
             || !["1", "7", "30", "all"].includes(period)
             || (endAt !== null && (!Number.isSafeInteger(end) || end < 0
               || end > Date.now() || new Date(end).toISOString() !== endAt))) {
@@ -4737,7 +5246,7 @@ function createPreparedLocalCompanionServer({
           return;
         }
         try {
-          send(response, 200, await readModelPerformance(period, endAt === null ? {} : { endAt }));
+          send(response, 200, await readModelPerformance(period, { speedMode, ...(endAt === null ? {} : { endAt }) }));
         } catch {
           sendError(response, 503, "model_performance_unavailable");
         }
@@ -4879,14 +5388,176 @@ function createPreparedLocalCompanionServer({
           configured: true,
           keychainPrompt: keychainPromptSurface(),
         });
-        if (await attributionUpgradeAvailable(status)) {
-          projected.attributionUpgrade = { available: true,
-            contractVersion: TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION };
+        const upgradeVersion = await attributionUpgradeAvailable(status);
+        if (upgradeVersion) {
+          projected.attributionUpgrade = { available: true, contractVersion: upgradeVersion };
         }
         send(response, 200, projected);
         return;
       }
-      if (path === "/api/local/contribution/incremental-review-v11") {
+      if (path === "/api/local/performance/status") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        const consent = await readSocialPerformanceConsent();
+        const scheduler = socialPerformanceScheduler?.inspect?.() ?? {
+          state: "off", lastAcceptedAt: null, nextAttemptAt: null,
+        };
+        send(response, 200, {
+          schemaVersion: "local-telemetry-performance-status-v1",
+          configured: !accountlessProductionProfile && contributionServiceOrigin !== null,
+          destinationOrigin: performanceOrigin(contributionServiceOrigin)
+            ? contributionServiceOrigin : null,
+          supportedSpeedMethods: [...TELEMETRY_PERFORMANCE_SUPPORTED_SPEED_METHODS],
+          consent: consent === null
+            ? { approved: false, current: false, approvedAt: null }
+            : { approved: true, current: true, approvedAt: consent.approvedAt },
+          scheduler: {
+            state: ["off", "up_to_date", "retry_wait", "paused"].includes(scheduler.state)
+              ? scheduler.state : "off",
+            lastAcceptedAt: performanceInstant(scheduler.lastAcceptedAt)
+              ? scheduler.lastAcceptedAt : null,
+            nextAttemptAt: performanceInstant(scheduler.nextAttemptAt)
+              ? scheduler.nextAttemptAt : null,
+          },
+        });
+        return;
+      }
+      if (path === "/api/local/performance/review") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!await authorizeLocalMutation(request, response, "performance_review_not_authorized")) return;
+        if (accountlessProductionProfile || !performanceOrigin(contributionServiceOrigin)) {
+          sendError(response, 409, "performance_not_configured");
+          return;
+        }
+        if (socialPerformanceReviewInProgress) {
+          sendError(response, 409, "performance_review_in_progress");
+          return;
+        }
+        socialPerformanceReviewInProgress = true;
+        try {
+          const capability = await readSocialPerformanceDeviceCapability();
+          if (!capability || !PERFORMANCE_DEVICE_ID.test(capability.deviceId)) {
+            sendError(response, 409, "performance_device_unavailable");
+            return;
+          }
+          const reviewToken = randomBytes(32).toString("base64url");
+          const now = clock();
+          const sampleDay = new Date(now - 86_400_000).toISOString().slice(0, 10);
+          const review = performanceReviewProjection({
+            reviewToken, grantDeviceId: capability.deviceId,
+            destinationOrigin: contributionServiceOrigin, day: sampleDay,
+          });
+          purgeReviewedPerformanceAuthorizations(now);
+          while (reviewedPerformanceAuthorizations.size >= MAX_ACTIVE_PERFORMANCE_REVIEWS) {
+            reviewedPerformanceAuthorizations.delete(
+              reviewedPerformanceAuthorizations.keys().next().value,
+            );
+          }
+          reviewedPerformanceAuthorizations.set(reviewToken, {
+            reviewToken,
+            consent: review.consent,
+            binding: review.binding,
+            grantDeviceId: review.grantDeviceId,
+            expiresAt: now + LOCAL_PERFORMANCE_REVIEW_LIFETIME_MS,
+          });
+          send(response, 200, review);
+        } catch {
+          sendError(response, 409, "performance_review_unavailable");
+        } finally {
+          socialPerformanceReviewInProgress = false;
+        }
+        return;
+      }
+      if (path === "/api/local/performance/approve") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!sameOrigin(request)
+            || request.headers["x-usage-monitor-local"] !== "1") {
+          sendError(response, 403, "performance_approval_not_authorized");
+          return;
+        }
+        let approvalRequest;
+        try {
+          approvalRequest = await readBoundedJsonObject(request);
+        } catch (error) {
+          sendError(response, boundedRequestStatus(error), error.code ?? "invalid_request");
+          return;
+        }
+        if (!performanceExact(approvalRequest, ["binding", "consent", "grantDeviceId", "reviewToken"])
+            || !/^[A-Za-z0-9_-]{43}$/u.test(approvalRequest.reviewToken)
+            || !PERFORMANCE_DEVICE_ID.test(approvalRequest.grantDeviceId)
+            || !performanceConsent(approvalRequest.consent)
+            || !performanceBinding(approvalRequest.binding, contributionServiceOrigin)) {
+          sendError(response, 400, "invalid_request");
+          return;
+        }
+        const authorization = consumeReviewedPerformanceAuthorization(
+          approvalRequest.reviewToken,
+        );
+        if (authorization === null
+            || authorization.grantDeviceId !== approvalRequest.grantDeviceId
+            || JSON.stringify(authorization.consent) !== JSON.stringify(approvalRequest.consent)
+            || JSON.stringify(authorization.binding) !== JSON.stringify(approvalRequest.binding)) {
+          sendError(response, 409, "performance_review_expired_or_changed");
+          return;
+        }
+        if (accountlessProductionProfile || !performanceOrigin(contributionServiceOrigin)) {
+          sendError(response, 409, "performance_not_configured");
+          return;
+        }
+        try {
+          const capability = await readSocialPerformanceDeviceCapability();
+          if (!capability || capability.deviceId !== authorization.grantDeviceId) {
+            sendError(response, 409, "performance_device_unavailable");
+            return;
+          }
+          // Local review proves only that this device credential is present.
+          // Approval also requires the current, independent hosted
+          // performance grant; usage or successor consent cannot stand in for
+          // this capability. Keep the hosted proof immediately before the
+          // durable local approval so a revoked grant cannot arm the scheduler.
+          if (await readSocialPerformanceHostedCapability({
+            deviceId: authorization.grantDeviceId,
+          }) === null) {
+            sendError(response, 409, "performance_authorization_unavailable");
+            return;
+          }
+          const state = await readSocialPerformanceConsent();
+          if (state !== null && state.deviceId !== authorization.grantDeviceId) {
+            sendError(response, 409, "performance_review_expired_or_changed");
+            return;
+          }
+          await saveSocialPerformanceConsent({
+            schemaVersion: LOCAL_PERFORMANCE_CONSENT_STATE_SCHEMA_VERSION,
+            approvedAt: new Date(clock()).toISOString(),
+            binding: authorization.binding,
+            deviceId: authorization.grantDeviceId,
+          });
+          createSocialPerformanceRuntime();
+          socialPerformanceScheduler?.start();
+          send(response, 200, {
+            schemaVersion: LOCAL_PERFORMANCE_CONSENT_STATE_SCHEMA_VERSION,
+            status: "approved",
+            binding: authorization.binding,
+            scheduler: socialPerformanceScheduler?.inspect?.() ?? {
+              state: "off", lastAcceptedAt: null, nextAttemptAt: null,
+            },
+          });
+        } catch {
+          sendError(response, 409, "performance_authorization_unavailable");
+        }
+        return;
+      }
+      if (path === "/api/local/contribution/incremental-review-v11" || path === "/api/local/contribution/incremental-review-v12") {
+        const successor = path.endsWith("-v12");
+        const contractVersion = successor ? TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION : TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION;
         if (request.method !== "POST") { sendError(response, 405, "method_not_allowed"); return; }
         if (!await authorizeLocalMutation(request, response, "exact_review_not_authorized")) return;
         if (incrementalContribution === null) {
@@ -4895,12 +5566,12 @@ function createPreparedLocalCompanionServer({
         const conflict = await contributionControlConflict();
         if (conflict !== null) { sendError(response, 409, conflict); return; }
         let review;
-        try { review = await attributionReview(); } catch { review = null; }
+        try { review = await attributionReview(successor); } catch { review = null; }
         if (!attributionReviewReady(review)) {
           sendError(response, 409, "attribution_review_unavailable"); return;
         }
         const consent = incrementalContributionRequiredConsent({
-          destinationOrigin: contributionServiceOrigin, telemetrySchemaVersion: TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
+          destinationOrigin: contributionServiceOrigin, telemetrySchemaVersion: contractVersion,
         });
         const reviewToken = randomBytes(32).toString("base64url");
         const now = clock();
@@ -4909,7 +5580,7 @@ function createPreparedLocalCompanionServer({
           reviewedContributionAuthorizations.delete(reviewedContributionAuthorizations.keys().next().value);
         }
         reviewedContributionAuthorizations.set(reviewToken, {
-          reviewToken, contractVersion: TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, consent,
+          reviewToken, contractVersion, consent,
           inventoryDigest: review.inventory.inventoryDigest,
           publicationFingerprint: review.publicationFingerprint,
           sampleDigest: review.sample.manifestDigest, sampleDay: review.sample.day,
@@ -4917,12 +5588,12 @@ function createPreparedLocalCompanionServer({
           expiresAt: now + REVIEW_AUTHORIZATION_LIFETIME_MS,
         });
         send(response, 200, {
-          schemaVersion: "local-incremental-contribution-review-v1.1", status: "ready",
+          schemaVersion: successor ? "local-incremental-contribution-review-v1.2" : "local-incremental-contribution-review-v1.1", status: "ready",
           reviewToken, consent, inventory: review.inventory, sample: review.sample,
           // A random hosted contribution-device target, not a provider account
           // identifier or a credential. The session grant needs this target.
           grantDeviceId: review.grantDeviceId,
-          hostedConsentCurrent: review.capabilities.consentCurrent === true,
+          hostedConsentCurrent: reviewConsentCurrent(review),
           includesContent: false, includesPaths: false, includesAccountIdentifiers: false, includesCredentials: false,
         });
         return;
@@ -4958,7 +5629,8 @@ function createPreparedLocalCompanionServer({
           sendError(response, 409, "review_expired_or_changed");
           return;
         }
-        const v11 = authorization.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION;
+        const successor = authorization.contractVersion === TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION;
+        const v11 = successor || authorization.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION;
         if (v11 !== Object.hasOwn(approvalRequest, "consent")) {
           sendError(response, 409, "review_expired_or_changed"); return;
         }
@@ -4968,7 +5640,7 @@ function createPreparedLocalCompanionServer({
             sendError(response, 409, "review_expired_or_changed"); return;
           }
           let current;
-          try { current = await attributionReview(); } catch { current = null; }
+          try { current = await attributionReview(successor); } catch { current = null; }
           if (!attributionReviewReady(current)
               || current.publicationFingerprint !== authorization.publicationFingerprint
               || current.sample.day !== authorization.sampleDay
@@ -4980,7 +5652,7 @@ function createPreparedLocalCompanionServer({
           }
           // Only the personal hosted session may create this grant. Neither
           // the local route nor the device uploader can mint it implicitly.
-          if (current.capabilities.consentCurrent !== true) {
+          if (!reviewConsentCurrent(current)) {
             sendError(response, 409, "hosted_consent_required"); return;
           }
         }
@@ -5021,7 +5693,7 @@ function createPreparedLocalCompanionServer({
         send(response, 200, {
           schemaVersion: "local-incremental-contribution-consent-v1.0",
           status: "approved",
-          contractVersion: v11 ? TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION : TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+          contractVersion: v11 ? authorization.contractVersion : TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
           consentedAt: nullableInstant(approved.consent.consentedAt),
           includesIdentifiers: false,
           includesCredentials: false,
@@ -5546,12 +6218,16 @@ function createPreparedLocalCompanionServer({
   server.keepAliveTimeout = 90_000;
   server.headersTimeout = 95_000;
   server.once("close", () => {
-    void closeModelPerformance().catch(() => {
-      onError("model_performance_shutdown_failed");
-    });
-    void shutdownContributionRuntime().catch(() => {
-      onError("automatic_contribution_retirement_lock_release_failed");
-    });
+    // Stop the independent performance scheduler before its timing worker.
+    // This closes the read/send race on accountless opt-out and prevents a
+    // worker from being torn down while the final report cursor is settling.
+    void shutdownContributionRuntime()
+      .catch(() => {
+        onError("automatic_contribution_retirement_lock_release_failed");
+      })
+      .finally(() => closeModelPerformance().catch(() => {
+        onError("model_performance_shutdown_failed");
+      }));
   });
 
   server.on("close", () => {

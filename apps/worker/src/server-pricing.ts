@@ -148,6 +148,30 @@ function tierForEvent(row: TelemetryUsageEvent): {
   };
 }
 
+function isSafeNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function componentsForServerPricing(row: TelemetryUsageEvent): TelemetryUsageEvent["components"] {
+  if (row.provider !== "openai_codex") return row.components;
+  const {
+    outputTextTokens,
+    outputReasoningTokens,
+    outputCombinedTokens,
+  } = row.components;
+  if (isSafeNonNegativeInteger(outputTextTokens)
+      && isSafeNonNegativeInteger(outputReasoningTokens)
+      && isSafeNonNegativeInteger(outputCombinedTokens)
+      && outputTextTokens + outputReasoningTokens === outputCombinedTokens) {
+    // The OpenAI accounting mapper prices the explicit text and reasoning
+    // components. A matching aggregate is redundant there and would
+    // otherwise be reported as an unknown billable component. Keep the
+    // stored evidence intact and project only this adapter input.
+    return { ...row.components, outputCombinedTokens: null };
+  }
+  return row.components;
+}
+
 // Exact decimal multiply for the speed ratio: both operands are decimal
 // strings, so the product is computed on scaled integers and re-rendered
 // without ever touching floating point.
@@ -223,7 +247,7 @@ export function priceTelemetryUsageEvent(row: TelemetryUsageEvent): ServerPricin
     apiTier: tier.apiServiceTier,
     pricedAt: row.eventTime,
     totalInputContextTokens: row.totalInputContextTokens,
-    components: row.components,
+    components: componentsForServerPricing(row),
   }, {
     priceCards: APP_OFFICIAL_PRICE_CARDS,
     pricingContext: {

@@ -71,6 +71,34 @@ test("Astra prices separate cache writes and combined output once with event-tim
   assert.equal(priceCodexUsageEvent(event, { priceEpochBasis: "current_price_sensitivity" }).totalUsd, "7");
 });
 
+test("Sol and Luna event pricing counts cache writes and reasoning once and preserves unknown history", () => {
+  for (const [model, short, fast, long] of [
+    ["gpt-6-sol", "1.4", "2.8", "2.3"],
+    ["gpt-6-luna", "0.07", "0.14", "0.115"],
+  ]) {
+    const event = {
+      timestamp: "2026-09-22T12:00:00.000Z", model,
+      totalInputContextTokens: 272_000, raw: { input_tokens: 999_999 },
+      components: { input_uncached_tokens: 100_000, input_cache_read_tokens: 100_000,
+        input_cache_write_tokens: 72_000, output_text_tokens: 40_000, output_reasoning_tokens: 60_000 },
+      componentAvailability: { input_uncached_tokens: true, input_cache_read_tokens: true,
+        input_cache_write_tokens: true, output_text_tokens: true, output_reasoning_tokens: true },
+    };
+    assert.equal(priceCodexUsageEvent(event).totalUsd, short);
+    assert.equal(priceCodexUsageEvent(event, { apiServiceTier: "priority" }).totalUsd, fast);
+    assert.equal(priceCodexUsageEvent({ ...event, totalInputContextTokens: 272_001 }).totalUsd, long);
+    assert.equal(priceCodexUsageEvent(event, { priceEpochBasis: "current_price_sensitivity" }).totalUsd, short);
+    const beforeLaunch = priceCodexUsageEvent({ ...event, timestamp: "2026-09-21T23:59:59.999Z" });
+    assert.notEqual(beforeLaunch.coverageStatus, "fully_priced");
+    assert.equal(beforeLaunch.totalUsd, "0");
+    const missing = priceCodexUsageEvent({ ...event, componentAvailability: {
+      ...event.componentAvailability, input_cache_write_tokens: false,
+    } });
+    assert.equal(missing.coverageStatus, "partially_priced");
+    assert.equal(missing.coverageCounts.unavailableComponents, 1);
+  }
+});
+
 test("Codex component availability reaches the ledger and never becomes observed zero", () => {
   const result = priceCodexUsageEvent({
     timestamp: "2026-07-26T15:00:00.000Z",

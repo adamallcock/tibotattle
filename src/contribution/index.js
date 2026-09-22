@@ -55,6 +55,34 @@ export {
   telemetryV11FieldInventory,
 } from "./telemetry-v11-chunks.js";
 export {
+  createTelemetryV12Day,
+  telemetryV12FieldInventory,
+} from "./telemetry-v12-chunks.js";
+export {
   readTelemetryV11Capabilities,
   runTelemetryV11Sync,
 } from "./telemetry-v11-sync.js";
+export {
+  projectTelemetryPerformanceDay,
+} from "./performance-daily.js";
+export {
+  MAX_TELEMETRY_PERFORMANCE_REPORT_BYTES,
+  MAX_TELEMETRY_PERFORMANCE_REPORT_RECORDS,
+  MAX_TELEMETRY_PERFORMANCE_RETRIES,
+  TELEMETRY_PERFORMANCE_AUTHORIZATION_VERSION,
+  TELEMETRY_PERFORMANCE_CAPABILITIES_VERSION,
+  TELEMETRY_PERFORMANCE_METHOD_VERSION,
+  TELEMETRY_PERFORMANCE_PRIVACY_CONTRACT_VERSION,
+  TELEMETRY_PERFORMANCE_REPORT_SCHEMA_VERSION,
+  TELEMETRY_PERFORMANCE_SCOPE,
+  TELEMETRY_PERFORMANCE_SUPPORTED_SPEED_METHODS,
+  TELEMETRY_PERFORMANCE_SYNC_STATE_VERSION,
+  initialTelemetryPerformanceSyncState,
+  parseTelemetryPerformanceSyncState,
+  prepareTelemetryPerformanceDay,
+  runTelemetryPerformanceSync,
+} from "./telemetry-performance-sync.js";
+
+export { readTelemetryV12Capabilities, runTelemetryV12Sync } from "./telemetry-v12-sync.js";
+export { ACCOUNTLESS_V12_UPLOAD_SCHEMA_VERSION, ACCOUNTLESS_V12_UPLOAD_POLICY_VERSION,
+  ACCOUNTLESS_V12_UPLOAD_AUTHORIZATION_BASIS } from "./accountless-transport-contract.js";

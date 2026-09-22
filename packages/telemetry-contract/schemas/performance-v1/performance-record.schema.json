@@ -1,0 +1,461 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://tibotattle.com/schemas/telemetry-performance-v1/performance-record.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "day",
+    "provider",
+    "modelId",
+    "reasoningEffort",
+    "speedMethod",
+    "speedMode",
+    "speedModeSource",
+    "apiServiceTier",
+    "measurementVersion",
+    "bucketSchemeVersion",
+    "turns",
+    "speedTurns",
+    "ttftTurns",
+    "completionTurns",
+    "timedResponses",
+    "speedTokens",
+    "speedDurationMs",
+    "speedHistogram",
+    "ttftHistogram",
+    "completionHistogram"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "model-performance-daily-v1"
+    },
+    "day": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "format": "date"
+    },
+    "provider": {
+      "enum": [
+        "openai_codex",
+        "anthropic_claude_code"
+      ]
+    },
+    "modelId": {
+      "enum": [
+        "codex-auto-review",
+        "gpt-4-turbo-2024-04-09",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4.1-nano",
+        "gpt-4o",
+        "gpt-4o-2024-05-13",
+        "gpt-4o-mini",
+        "gpt-5",
+        "gpt-5-codex",
+        "gpt-5-mini",
+        "gpt-5-nano",
+        "gpt-5-pro",
+        "gpt-5.1",
+        "gpt-5.1-codex",
+        "gpt-5.1-codex-mini",
+        "gpt-5.2",
+        "gpt-5.2-codex",
+        "gpt-5.2-pro",
+        "gpt-5.3-codex",
+        "gpt-5.3-codex-spark",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+        "gpt-5.4-pro",
+        "gpt-5.5",
+        "gpt-5.5-codex",
+        "gpt-5.5-pro",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-sol-wm",
+        "gpt-5.6-terra",
+        "gpt-6-astra",
+        "o1",
+        "o1-pro",
+        "o3",
+        "o3-mini",
+        "o3-pro",
+        "o4-mini",
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "claude-fable-5",
+        "claude-haiku-4-5-20251001",
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+        "claude-sonnet-5"
+      ]
+    },
+    "reasoningEffort": {
+      "enum": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra",
+        "unknown"
+      ]
+    },
+    "speedMethod": {
+      "enum": [
+        "receipt",
+        "legacy",
+        "tool_free",
+        "unavailable"
+      ]
+    },
+    "speedMode": {
+      "enum": [
+        "fast",
+        "standard",
+        "unknown",
+        "other",
+        "mixed"
+      ]
+    },
+    "speedModeSource": {
+      "enum": [
+        "rollout_thread_settings",
+        "turn_context_service_tier",
+        "lineage_inherited",
+        "unobserved",
+        "mixed"
+      ]
+    },
+    "apiServiceTier": {
+      "enum": [
+        "standard",
+        "priority",
+        "flex",
+        "batch",
+        "unknown",
+        "other",
+        "mixed"
+      ]
+    },
+    "measurementVersion": {
+      "const": "model-performance-samples-v1"
+    },
+    "bucketSchemeVersion": {
+      "const": "performance-histogram-v1"
+    },
+    "turns": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "speedTurns": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "ttftTurns": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "completionTurns": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "timedResponses": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "speedTokens": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "speedDurationMs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "speedHistogram": {
+      "allOf": [
+        {
+          "$ref": "performance-histogram.schema.json"
+        },
+        {
+          "properties": {
+            "metric": {
+              "const": "speed"
+            }
+          }
+        }
+      ]
+    },
+    "ttftHistogram": {
+      "allOf": [
+        {
+          "$ref": "performance-histogram.schema.json"
+        },
+        {
+          "properties": {
+            "metric": {
+              "const": "ttft"
+            }
+          }
+        }
+      ]
+    },
+    "completionHistogram": {
+      "allOf": [
+        {
+          "$ref": "performance-histogram.schema.json"
+        },
+        {
+          "properties": {
+            "metric": {
+              "const": "turnDuration"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "provider": {
+            "const": "openai_codex"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "modelId": {
+            "enum": [
+              "codex-auto-review",
+              "gpt-4-turbo-2024-04-09",
+              "gpt-4.1",
+              "gpt-4.1-mini",
+              "gpt-4.1-nano",
+              "gpt-4o",
+              "gpt-4o-2024-05-13",
+              "gpt-4o-mini",
+              "gpt-5",
+              "gpt-5-codex",
+              "gpt-5-mini",
+              "gpt-5-nano",
+              "gpt-5-pro",
+              "gpt-5.1",
+              "gpt-5.1-codex",
+              "gpt-5.1-codex-mini",
+              "gpt-5.2",
+              "gpt-5.2-codex",
+              "gpt-5.2-pro",
+              "gpt-5.3-codex",
+              "gpt-5.3-codex-spark",
+              "gpt-5.4",
+              "gpt-5.4-mini",
+              "gpt-5.4-nano",
+              "gpt-5.4-pro",
+              "gpt-5.5",
+              "gpt-5.5-codex",
+              "gpt-5.5-pro",
+              "gpt-5.6-luna",
+              "gpt-5.6-sol",
+              "gpt-5.6-sol-wm",
+              "gpt-5.6-terra",
+              "gpt-6-astra",
+              "o1",
+              "o1-pro",
+              "o3",
+              "o3-mini",
+              "o3-pro",
+              "o4-mini",
+              "gpt-6-sol",
+              "gpt-6-luna"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "provider": {
+            "const": "anthropic_claude_code"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "modelId": {
+            "enum": [
+              "claude-fable-5",
+              "claude-haiku-4-5-20251001",
+              "claude-opus-4-8",
+              "claude-sonnet-4-6",
+              "claude-sonnet-5"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "speedMethod": {
+            "const": "unavailable"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "speedTurns": {
+            "const": 0
+          },
+          "timedResponses": {
+            "const": 0
+          },
+          "speedTokens": {
+            "const": 0
+          },
+          "speedDurationMs": {
+            "const": 0
+          },
+          "speedHistogram": {
+            "properties": {
+              "sampleCount": {
+                "const": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "speedMode": {
+            "const": "unknown"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "speedModeSource": {
+            "const": "unobserved"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "speedMode": {
+            "const": "mixed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "speedModeSource": {
+            "const": "mixed"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "speedMode": {
+            "enum": [
+              "fast",
+              "standard",
+              "other"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "speedModeSource": {
+            "enum": [
+              "rollout_thread_settings",
+              "lineage_inherited"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "completionTurns": {
+            "const": 0
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "completionHistogram": {
+            "properties": {
+              "sampleCount": {
+                "const": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "completionTurns": {
+            "minimum": 1
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "completionHistogram": {
+            "properties": {
+              "sampleCount": {
+                "minimum": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "speedMethod": {
+            "enum": [
+              "receipt",
+              "legacy",
+              "tool_free"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "turns": {
+            "minimum": 1
+          },
+          "speedTurns": {
+            "minimum": 1
+          }
+        }
+      }
+    }
+  ],
+  "$comment": "Provider and model IDs come from the reviewed catalog and its exact provider pairing. Runtime additionally requires speedTurns, ttftTurns, and completionTurns to be no greater than positive turns; receipt/legacy/tool_free cohorts to have speedTurns equal turns; unavailable speed cohorts to have zero speed sums and an empty speed histogram; timedResponses to be at least speedTurns; speed, TTFT, and completion histogram counts to match their eligible counts; completion observations to be positive integer milliseconds; and the ratio of summed speedTokens to speedDurationMs to lie within conservative speed extrema. Speed mode evidence and API service tier are independent dimensions."
+}

@@ -19,6 +19,11 @@ export {
   supportsCompressedRollouts,
 } from "./bounded-rollout-bytes.js";
 export { createTelemetryV11Envelope } from "./telemetry-v11-envelope.js";
+export { createTelemetryV12Envelope } from "./telemetry-v12-envelope.js";
+export {
+  createTelemetryPerformanceEnvelope,
+  validateTelemetryPerformanceEnvelope,
+} from "./telemetry-performance-envelope.js";
 export {
   CODEX_CONFIG_RETAINED_KEYS,
   CODEX_CONFIG_SERVICE_TIER_STATUSES,

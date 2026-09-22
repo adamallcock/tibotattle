@@ -88,6 +88,7 @@ export function createLocalExportArtifactStorageContext(configuration = {}) {
     "recoverOwnerOnlyPairTransactions",
     "recoverOwnerOnlyPairTransactionsUnderLease",
     "withExportDestinationLease",
+    "withOwnerOnlyExportDestinationBatch",
     "writeOwnerOnlyPairNoClobberForDestination",
     "writeOwnerOnlyPairNoClobber",
     "writeOwnerOnlyPairNoClobberUnderLease",
@@ -103,7 +104,7 @@ export function createLocalExportArtifactStorageContext(configuration = {}) {
   const facade = {
     defaultActivityMarkerFile: activityMarkerFile,
     ...Object.fromEntries(required
-      .filter((name) => name !== "withExportDestinationLease")
+      .filter((name) => !["withExportDestinationLease", "withOwnerOnlyExportDestinationBatch"].includes(name))
       .map((name) => [name, (...argumentsList) =>
         invokeApplicationPort(
           ports[name],
@@ -112,13 +113,13 @@ export function createLocalExportArtifactStorageContext(configuration = {}) {
           "Local export storage operation failed",
           { preserveResourceLimitError: name === "enumerateOwnerOnlyExportDestinationEntries" },
         )])),
-    withExportDestinationLease: async (directory, callback, options) => {
+    ...Object.fromEntries(["withExportDestinationLease", "withOwnerOnlyExportDestinationBatch"].map((name) => [name, async (directory, callback, options) => {
       const leaseCallback = guardedFunction(
         callback,
         "Export destination lease callback is required",
       );
       return invokeApplicationPort(
-        ports.withExportDestinationLease,
+        ports[name],
         storage,
         [directory, async (...argumentsList) => {
           try {
@@ -129,7 +130,7 @@ export function createLocalExportArtifactStorageContext(configuration = {}) {
         }, options],
         "Local export storage operation failed",
       );
-    },
+    }])),
   };
   return Object.freeze(facade);
 }

@@ -10,7 +10,7 @@ The shared filesystem and SQLite implementation is present on main. Source
 source-read capability and passed its clean/warm native and unsigned packaged
 Electron qualification before
 [PR #199](https://github.com/adamallcock/tibotattle/pull/199) merged on
-2026-09-22. The released 0.1.22 Windows model-performance page remains
+2026-09-22. The released 0.1.23 Windows model-performance page remains
 unavailable. Accounting and timing schemas are unchanged by this capability
 switch.
 

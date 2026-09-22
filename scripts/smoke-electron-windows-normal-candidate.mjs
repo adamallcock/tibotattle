@@ -11,7 +11,7 @@
  * its loopback dashboard remains the rendered journey under test.
  */
 
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
@@ -19,6 +19,7 @@ import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import { dirname, join, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import {
   createWindowsFilesystemAdapter,
@@ -76,6 +77,9 @@ const FIRST_RUN_ACKNOWLEDGEMENT = validateDesktopFirstRunReceipt({
   schemaVersion: DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
   acknowledged: true,
 });
+const runSyntheticGit = promisify(execFile);
+const SYNTHETIC_PROJECT_NAME = "synthetic-windows-project";
+const SYNTHETIC_TASK_NAME = "Synthetic Windows saved task";
 const SYNTHETIC_CODEX_SESSION_ID = "70000000-0000-4000-8000-000000000001";
 // The ingestion proof reads the rolling seven-day accounting period, so a
 // source pinned to a fixed calendar date silently leaves the window this smoke
@@ -101,7 +105,7 @@ function syntheticCodexRolloutName(startedAtMs) {
  * so the single event always falls inside the seven-day accounting period the
  * ingestion proof reads back.
  */
-export function buildWindowsNormalCandidateCodexFixture(nowMs = Date.now()) {
+export function buildWindowsNormalCandidateCodexFixture(nowMs = Date.now(), { cwd } = {}) {
   if (!Number.isSafeInteger(nowMs) || nowMs <= SYNTHETIC_CODEX_SESSION_AGE_MS) {
     fail("SYNTHETIC_FIXTURE_UNAVAILABLE");
   }
@@ -113,7 +117,7 @@ export function buildWindowsNormalCandidateCodexFixture(nowMs = Date.now()) {
     {
       timestamp: at(0),
       type: "session_meta",
-      payload: { id: SYNTHETIC_CODEX_SESSION_ID },
+      payload: { id: SYNTHETIC_CODEX_SESSION_ID, ...(cwd ? { cwd } : {}) },
     },
     {
       timestamp: at(0),
@@ -135,7 +139,7 @@ export function buildWindowsNormalCandidateCodexFixture(nowMs = Date.now()) {
     {
       timestamp: at(SYNTHETIC_CODEX_TURN_CONTEXT_OFFSET_MS),
       type: "turn_context",
-      payload: { turn_id: SYNTHETIC_CODEX_TURN_ID, model: "gpt-5.6-sol", effort: "high" },
+      payload: { turn_id: SYNTHETIC_CODEX_TURN_ID, model: "gpt-5.6-sol", effort: "high", service_tier: "default" },
     },
     {
       timestamp: at(3_000),
@@ -239,6 +243,7 @@ const NORMAL_CANDIDATE_STARTUP_PHASES = new Set([
   "explicit_refresh_acceptance",
   "explicit_refresh_completion",
   "model_performance",
+  "projects_and_threads",
   "sharing_opt_out",
   "process_proof",
   "settings_target",
@@ -415,6 +420,8 @@ const FAILURE_CODES = new Set([
   "LOCAL_MODEL_PERFORMANCE_INCOMPLETE",
   "LOCAL_MODEL_PERFORMANCE_INVALID",
   "LOCAL_MODEL_PERFORMANCE_PAGE_UNAVAILABLE",
+  "LOCAL_PROJECTS_AND_THREADS_UNAVAILABLE",
+  "LOCAL_PROJECTS_AND_THREADS_PAGE_UNAVAILABLE",
   "SETTINGS_UNAVAILABLE",
   "SETTINGS_PERSISTENCE_INVALID",
   "CLEAN_QUIT_INVALID",
@@ -953,25 +960,46 @@ export async function seedWindowsNormalCandidateCodexFixture({ profile } = {}, {
   metadata = lstat,
   writeFixture = process.platform === "win32" ? createWindowsSyntheticOwnedSource : writeFile,
   now = Date.now,
+  runGit = runSyntheticGit,
 } = {}) {
   const home = exactWindowsPath(profile?.home);
   if (home === null || typeof createDirectory !== "function"
       || typeof metadata !== "function" || typeof writeFixture !== "function"
-      || typeof now !== "function") {
+      || typeof now !== "function" || typeof runGit !== "function") {
     fail("PROFILE_INVALID");
   }
-  const source = buildWindowsNormalCandidateCodexFixture(now());
+  const project = win32.join(home, SYNTHETIC_PROJECT_NAME);
+  const source = buildWindowsNormalCandidateCodexFixture(now(), { cwd: project });
   // The normal app's default-root settings select HOME/.codex before spawning
   // its companion. Seed that actual root, not the development override.
   const codexHome = win32.join(home, ".codex");
   const sessions = win32.join(codexHome, "sessions");
   const fixture = win32.join(sessions, source.fileName);
+  const namesFile = win32.join(codexHome, "session_index.jsonl");
+  const namesContent = `${JSON.stringify({ id: source.sessionId,
+    thread_name: SYNTHETIC_TASK_NAME, updated_at: new Date(source.startedAtMs).toISOString() })}\n`;
   try {
+    await createDirectory(project, { recursive: true, mode: 0o700 });
+    const projectDirectory = await metadata(project);
+    if (!projectDirectory?.isDirectory?.() || projectDirectory.isSymbolicLink?.()) {
+      fail("SYNTHETIC_FIXTURE_UNAVAILABLE");
+    }
+    const gitEnvironment = Object.fromEntries(Object.entries(process.env)
+      .filter(([name]) => !name.toUpperCase().startsWith("GIT_")));
+    const gitOptions = { timeout: 5_000, maxBuffer: 16_384, windowsHide: true,
+      env: { ...gitEnvironment, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" } };
+    await runGit("git", ["init", "--quiet", project], gitOptions);
+    await runGit("git", ["-C", project, "config", "remote.origin.url",
+      `https://example.invalid/synthetic/${SYNTHETIC_PROJECT_NAME}.git`], gitOptions);
     await createDirectory(sessions, { recursive: true, mode: 0o700 });
     const directory = await metadata(sessions);
     if (!directory?.isDirectory?.() || directory.isSymbolicLink?.()) {
       fail("SYNTHETIC_FIXTURE_UNAVAILABLE");
     }
+    await writeFixture(namesFile, namesContent, { mode: 0o600, flag: "wx" });
+    const names = await metadata(namesFile);
+    if (!names?.isFile?.() || names.isSymbolicLink?.() || names.nlink !== 1
+        || names.size !== Buffer.byteLength(namesContent)) fail("SYNTHETIC_FIXTURE_UNAVAILABLE");
     await writeFixture(fixture, source.content, {
       mode: 0o600,
       flag: "wx",
@@ -989,7 +1017,7 @@ export async function seedWindowsNormalCandidateCodexFixture({ profile } = {}, {
     if (ownerFailure !== null) fail(`SYNTHETIC_FIXTURE_OWNER_${ownerFailure.slice('synthetic_owner_'.length).toUpperCase()}`);
     fail("SYNTHETIC_FIXTURE_UNAVAILABLE");
   }
-  return Object.freeze({ codexHome, fixture, sessions });
+  return Object.freeze({ codexHome, fixture, sessions, project, namesFile });
 }
 
 /** Seed only the fixed acknowledgement and durable contribution opt-out. */
@@ -2870,11 +2898,59 @@ export function verifyWindowsNormalCandidateModelPerformance(value) {
       && series.points.some((point) => Number.isFinite(point?.median) && point.median > 0))
     && Array.isArray(model.ttft)
     && model.ttft.some((point) => Number.isFinite(point?.median) && point.median > 0));
-  return value?.schemaVersion === 4 && value.method === 5
+  return value?.schemaVersion === 5 && value.method === 5
+    && value.speedMode === 'standard' && value.excludedUnknownTurns === 0
     && value.status === 'ready' && value.collecting === false && value.stale === false
     && value.period === 'all' && measured === true
     && Number.isSafeInteger(progress?.total) && progress.total > 0
     && progress.checked === progress.total;
+}
+
+/** Exact synthetic API proof; return only a boolean across the receipt boundary. */
+export function verifyWindowsNormalCandidateProjectsAndThreads(projects, threads) {
+  const project = projects?.rows?.[0];
+  const thread = threads?.rows?.[0];
+  return projects?.schemaVersion === "local-work-usage-v1"
+    && projects.status === "available" && projects.namesAvailable !== false
+    && Array.isArray(projects.rows) && projects.rows.length === 1 && project?.kind === "project"
+    && typeof projects.snapshotId === "string" && projects.snapshotId.length > 0
+    && typeof project.id === "string" && !["non-project", "unassigned"].includes(project.id)
+    && project.tokens === 120 && projects.display?.[project.id]?.name === SYNTHETIC_PROJECT_NAME
+    && threads?.schemaVersion === "local-work-usage-v1"
+    && threads.status === "available" && threads.namesAvailable !== false
+    && threads.snapshotId === projects.snapshotId
+    && Array.isArray(threads.rows) && threads.rows.length === 1
+    && thread?.kind === "thread" && thread.tokens === 120
+    && threads.display?.[thread.id]?.name === SYNTHETIC_TASK_NAME
+    && threads.display?.[thread.id]?.codexUrl === `codex://threads/${SYNTHETIC_CODEX_SESSION_ID}`;
+}
+
+// A click is not expansion proof: foreground lease validation or a nested
+// snapshot expiry can replace the report and collapse its rows. Re-observe the
+// current interactive report on every bounded poll, then verify the task inside
+// this project's controlled row group. Never act on retained inert rows.
+export async function inspectWindowsNormalCandidateProjectsAndThreads(cdp) {
+  return cdp.evaluate(`(() => {
+    const section = document.querySelector('#projects');
+    const blocked = node => !node || Boolean(node.closest('[inert], [hidden], [aria-hidden="true"]'));
+    if (blocked(section) || section.getAttribute('aria-busy') === 'true'
+        || section.querySelector('.work-usage-status')?.dataset.state !== 'ready') return false;
+    const button = [...section.querySelectorAll('.work-usage-project-toggle')]
+      .find(item => item.textContent.includes(${JSON.stringify(SYNTHETIC_PROJECT_NAME)}));
+    if (blocked(button) || button.disabled) return false;
+    if (button.getAttribute('aria-expanded') !== 'true') {
+      button.click();
+      return false;
+    }
+    const groupId = button.getAttribute('aria-controls');
+    const group = groupId ? document.getElementById(groupId) : null;
+    if (blocked(group) || !section.contains(group)
+        || !group.classList.contains('work-usage-children')) return false;
+    return [...group.querySelectorAll('.work-usage-thread-row')].some(row =>
+      !blocked(row) && [...row.querySelectorAll('.cache-drop-thread-link')].some(link =>
+        !blocked(link) && link.textContent.trim() === ${JSON.stringify(SYNTHETIC_TASK_NAME)}
+        && link.getAttribute('href') === ${JSON.stringify(`codex://threads/${SYNTHETIC_CODEX_SESSION_ID}`)}));
+  })()`);
 }
 
 // Only a fixed state category crosses the CI receipt boundary. The API can
@@ -3041,6 +3117,40 @@ async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () =>
         && provider?.textContent?.trim() && status?.dataset?.state === 'ready');
     })()`), OPERATION_TIMEOUT_MS);
     if (renderedPerformance !== true) fail("LOCAL_MODEL_PERFORMANCE_PAGE_UNAVAILABLE");
+    onPhase("projects_and_threads");
+    const queryWorkUsage = (body) => jsonFetch(new URL("/api/local/work-usage/query", dashboard), {
+      fetchImpl: async (url, options) => {
+        const response = await fetchImpl(url, { ...options, method: "POST",
+          headers: { "content-type": "application/json", "x-usage-monitor-local": "1" },
+          body: JSON.stringify({ schemaVersion: "local-work-usage-v1", period: "7d", sort: "tokens", ...body }),
+        });
+        // The bounded browser preloader may evict a report between these two
+        // ordinary requests. Retry a fresh report; never follow a stale ID.
+        return response.status === 409 && response.redirected !== true
+          ? { ok: true, redirected: false, json: async () => ({ status: "expired" }) }
+          : response;
+      },
+    });
+    const grouped = await waitFor(async () => {
+      const projects = await queryWorkUsage({ grouping: "project" });
+      const project = projects?.rows?.[0];
+      if (projects?.status !== "available" || projects.namesAvailable === false
+          || !project?.id || !projects.snapshotId) return false;
+      const threads = await queryWorkUsage({ grouping: "thread", project: project.id,
+        snapshotId: projects.snapshotId });
+      return verifyWindowsNormalCandidateProjectsAndThreads(projects, threads);
+    }, OPERATION_TIMEOUT_MS);
+    if (grouped !== true) fail("LOCAL_PROJECTS_AND_THREADS_UNAVAILABLE");
+    const openedProjects = await cdp.evaluate(`(() => {
+      const link = document.querySelector('[data-nav="projects"]');
+      if (!link) return false;
+      link.click();
+      return true;
+    })()`);
+    if (openedProjects !== true) fail("LOCAL_PROJECTS_AND_THREADS_PAGE_UNAVAILABLE");
+    const renderedTask = await waitFor(() => inspectWindowsNormalCandidateProjectsAndThreads(cdp),
+      OPERATION_TIMEOUT_MS);
+    if (renderedTask !== true) fail("LOCAL_PROJECTS_AND_THREADS_PAGE_UNAVAILABLE");
     if (!observer.valid()) fail("DASHBOARD_INVALID");
     preloadContexts?.dispose?.();
     return Object.freeze({
@@ -3048,6 +3158,7 @@ async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () =>
       observer,
       refreshTerminalStatus: explicitTerminal.terminalStatus,
       syntheticIngestionVerified: true,
+      projectsAndThreadsVerified: true,
     });
   } catch (error) {
     observer.dispose();
@@ -3355,6 +3466,7 @@ export async function launchAndRenderCandidate({
       localRefreshObserved: true,
       localRefreshTerminal: dashboard.refreshTerminalStatus,
       syntheticIngestionVerified: dashboard.syntheticIngestionVerified === true,
+      projectsAndThreadsVerified: dashboard.projectsAndThreadsVerified === true,
       sharingOptOutRetained,
       settingsPersisted: true,
       cleanQuit: true,
@@ -3481,6 +3593,7 @@ function candidateReceipt({
     syntheticFixtureIngestionVerified: journey?.syntheticIngestionVerified === true,
     syntheticFixtureTotalsRetainedAcrossRestart:
       journey?.syntheticTotalsRetainedAcrossRestart === true,
+    projectsAndThreadsRetainedAcrossRestart: journey?.projectsAndThreadsVerified === true,
     settingsPersistedAcrossRestart: journey?.settingsPersisted === true,
     durableContributionOptOutRetained: journey?.optOutRetained === true,
     loopbackJourneyVerified: journey?.loopbackJourneyVerified === true,
@@ -3606,8 +3719,10 @@ export async function runWindowsNormalCandidateSmoke(options, {
         || first?.settingsPersisted !== true || first?.cleanQuit !== true
         || !["succeeded", "degraded"].includes(first?.localRefreshTerminal)
         || first?.syntheticIngestionVerified !== true
+        || first?.projectsAndThreadsVerified !== true
         || first?.sharingOptOutRetained !== true || second?.dashboardRendered !== true
         || second?.syntheticIngestionVerified !== true
+        || second?.projectsAndThreadsVerified !== true
         || second?.sharingOptOutRetained !== true || second?.settingsPersisted !== true
         || second?.cleanQuit !== true || candidateState.quiescent !== true) {
       fail("DASHBOARD_INVALID");
@@ -3622,6 +3737,8 @@ export async function runWindowsNormalCandidateSmoke(options, {
         && second.syntheticIngestionVerified === true,
       syntheticTotalsRetainedAcrossRestart: first.syntheticIngestionVerified === true
         && second.syntheticIngestionVerified === true,
+      projectsAndThreadsVerified: first.projectsAndThreadsVerified === true
+        && second.projectsAndThreadsVerified === true,
       settingsPersisted: first.settingsPersisted === true && second.settingsPersisted === true,
       optOutRetained: optOutRetained === true
         && first.sharingOptOutRetained === true && second.sharingOptOutRetained === true,

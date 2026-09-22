@@ -3,7 +3,7 @@
 // The published identities match the accounting package's reviewed text-model
 // cards; synthetic provider-tool cards are deliberately excluded. Explicit
 // aliases retain their own identity even when a caller shares a price card.
-export const REVIEWED_MODEL_CATALOG_VERSION = "reviewed-model-catalog-2026-09-03.1";
+export const REVIEWED_MODEL_CATALOG_VERSION = "reviewed-model-catalog-2026-09-22.1";
 
 const reviewedOpenAiModelRows = [
   ["codex-auto-review", "Codex Auto-review", "assumed_alias", "gpt-5.4"],
@@ -45,6 +45,9 @@ const reviewedOpenAiModelRows = [
   ["o3-mini", "o3 Mini"],
   ["o3-pro", "o3 Pro"],
   ["o4-mini", "o4 Mini"],
+  // Append identities to preserve every existing telemetry enum position.
+  ["gpt-6-sol", "GPT-6 Sol"],
+  ["gpt-6-luna", "GPT-6 Luna"],
 ];
 
 const reviewedClaudeModelRows = [

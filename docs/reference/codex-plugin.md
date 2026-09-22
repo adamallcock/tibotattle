@@ -13,11 +13,11 @@ MCP server. The plugin never parses Codex sessions or owns a second ledger; it
 calls the installed Electron application's versioned, read-only agent interface,
 which delegates analysis to the existing local usage explainer.
 
-This source contract is newer than the public 0.1.22 app. The plugin requires
-installed agent protocol v1, whose first compatible public release must be
-0.1.23 or later. Until that release is published and independently qualified,
-`tibotattle_status` reports 0.1.22 as incompatible and
-`tibotattle_install_plan` refuses to offer it as a solution.
+The public 0.1.23 release includes the agent protocol v1 source contract.
+The plugin checks the installed application's protocol handshake before using
+it; a version number alone does not establish compatibility. Version 0.1.22
+remains incompatible, and `tibotattle_install_plan` refuses to offer it as a
+solution. A successor must pass its own packaged and installed protocol checks.
 
 ## Agent data flow
 

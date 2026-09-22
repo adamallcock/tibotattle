@@ -62,9 +62,31 @@ test("every shipped Priority card and reviewed alias equals the event-weighted S
       checked += 1;
     }
   }
-  assert.equal(checked, 28);
-  assert.equal(FAST_MODE_MODEL_FAMILY_KEYS.length, 17);
+  assert.equal(checked, 32);
+  assert.equal(FAST_MODE_MODEL_FAMILY_KEYS.length, 19);
   assert.equal(Math.max(...Object.values(FAST_MODE_QUOTA_MULTIPLIERS)), 2.5);
+});
+
+test("Sol and Luna Priority ratios require launch-time evidence and the matching context card", () => {
+  for (const model of ["gpt-6-sol", "gpt-6-luna"]) {
+    assert.ok(FAST_MODE_MODEL_FAMILY_KEYS.includes(model));
+    assert.equal(FAST_MODE_QUOTA_MULTIPLIERS[model], 2);
+    for (const totalInputContextTokens of [272_000, 272_001]) {
+      const evidence = { eventTime: "2026-09-22T00:00:00.000Z", totalInputContextTokens };
+      const band = totalInputContextTokens === 272_000 ? "short" : "long";
+      const standard = APP_OFFICIAL_PRICE_CARDS.find((card) => card.model === model
+        && card.service_tier === "standard" && card.metadata.total_input_context_band === band);
+      assert.equal(fastModeQuotaMultiplier(model, { ...evidence, standardPriceCardIds: [standard.id] }), 2);
+      const wrongBand = APP_OFFICIAL_PRICE_CARDS.find((card) => card.model === model
+        && card.service_tier === "standard" && card.metadata.total_input_context_band !== band);
+      assert.equal(fastModeQuotaMultiplier(model, { ...evidence, standardPriceCardIds: [wrongBand.id] }), null);
+      assert.equal(fastModeQuotaMultiplier(model, {
+        ...evidence, eventTime: "2026-09-21T23:59:59.999Z",
+      }), null);
+      assert.equal(fastModeQuotaMultiplier(`${model}-wm`, evidence), null);
+      assert.equal(fastModeQuotaMultiplier(`${model}-preview`, evidence), null);
+    }
+  }
 });
 
 test("Priority eligibility rejects guessed names, wrong cards, missing evidence, and uncovered epochs/contexts", () => {

@@ -8,17 +8,32 @@ const point = (at = 2 * DAY, n = 5) => ({ at, n,
   p10: n < 5 ? null : 30, p25: n < 5 ? null : 40, median: 50,
   p75: n < 5 ? null : 60, p90: n < 5 ? null : 70 });
 function payload() {
-  return { schemaVersion: 2, method: 3, status: 'ready', collecting: false, stale: false, updatedAt: '2026-09-09T12:00:00.000Z', period: 'all', interval: 'day', start: DAY, end: 9 * DAY, historyProgress: null,
-    models: [{ id: 'gpt-5.6-sol', label: 'Sol', turns: 20, speedTurns: 10, ttftTurns: 15, timedResponses: 45,
+  return { schemaVersion: 5, method: 5, speedMode: 'standard', excludedUnknownTurns: 0, status: 'ready', collecting: false, stale: false, updatedAt: '2026-09-09T12:00:00.000Z', period: 'all', interval: 'day', start: DAY, end: 9 * DAY, historyProgress: null,
+    models: [{ id: 'gpt-5.6-sol', label: 'Sol', turns: 20, speedTurns: 10, ttftTurns: 15, timedResponses: 45, toolFreeTurns: 0, toolFree: [],
       speed: [{ method: 'speed', points: [point(), point(3 * DAY)] }], ttft: [point(), point(3 * DAY), point(4 * DAY)] }] };
 }
-function toolFreePayload() {
+test('GPT-6 Sol and Luna DTOs retain generation labels and refuse unreviewed suffixes', () => {
+  const data = payload();
+  data.models.push(...[['gpt-6-sol', 'GPT-6 Sol'], ['gpt-6-luna', 'GPT-6 Luna'], ['gpt-5.6-luna', 'Luna']]
+    .map(([id, label]) => ({ ...structuredClone(data.models[0]), id, label })));
+  assert.equal(normalizeModelPerformance(data), data);
+  for (const model of ['gpt-6-sol', 'gpt-6-luna']) {
+    const suffix = structuredClone(data);
+    suffix.models.find(row => row.id === model).id += '-unreviewed';
+    assert.equal(normalizeModelPerformance(suffix), null);
+    const mislabeled = structuredClone(data);
+    mislabeled.models.find(row => row.id === model).label = model.endsWith('sol') ? 'Sol' : 'Luna';
+    assert.equal(normalizeModelPerformance(mislabeled), null);
+  }
+});
+function legacyToolFreePayload() {
   const data = payload(); data.schemaVersion = 3; data.method = 4;
   Object.assign(data.models[0], { toolFreeTurns: 2, toolFree: [point(DAY, 2)] });
   return data;
 }
 function combinedPayload() {
-  const data = toolFreePayload(); data.schemaVersion = 4; data.method = 5;
+  const data = payload();
+  Object.assign(data.models[0], { toolFreeTurns: 2, toolFree: [point(DAY, 2)] });
   data.models[0].speedTurns = 12;
   data.models[0].speed[0].points.unshift(point(DAY, 2));
   return data;
@@ -27,7 +42,7 @@ test('combined DTO accepts fallback subsets and refuses impossible or cross-vers
   const data = combinedPayload();
   assert.equal(normalizeModelPerformance(data), data);
   for (const mutate of [
-    x => { x.method = 4; }, x => { x.schemaVersion = 3; },
+    x => { x.method = 4; }, x => { x.schemaVersion = 3; }, x => { x.schemaVersion = 4; },
     x => { x.models[0].toolFreeTurns = 13; },
     x => { x.models[0].toolFree[0].at = 5 * DAY; },
     x => { x.models[0].toolFree[0].n = 3; },
@@ -37,8 +52,8 @@ test('combined DTO accepts fallback subsets and refuses impossible or cross-vers
     assert.equal(normalizeModelPerformance(pinned), pinned);
   }
 });
-test('tool-free DTO uses a closed versioned contract and an independent bounded population', () => {
-  const data = toolFreePayload();
+test('mode-scoped tool-free DTO uses a closed contract and a subset of combined speed evidence', () => {
+  const data = combinedPayload();
   assert.equal(normalizeModelPerformance(data), data);
   for (const mutate of [
     x => { x.schemaVersion = 2; }, x => { x.method = 3; },
@@ -48,10 +63,14 @@ test('tool-free DTO uses a closed versioned contract and an independent bounded 
     x => { x.models[0].toolFree[0].p90 = 1; },
     x => { x.models[0].toolFree[0].privatePath = '/synthetic/private'; },
     x => { x.models[0].toolFree.push(point(DAY, 1)); },
-  ]) { const invalid = toolFreePayload(); mutate(invalid); assert.equal(normalizeModelPerformance(invalid), null); }
-  const legacy = payload(); legacy.models[0].toolFreeTurns = 0;
-  assert.equal(normalizeModelPerformance(legacy), null, 'old schema cannot carry undeclared evidence');
-  Object.assign(data.models[0], { speedTurns: 0, speed: [], ttftTurns: 0, ttft: [] });
+  ]) { const invalid = combinedPayload(); mutate(invalid); assert.equal(normalizeModelPerformance(invalid), null); }
+  for (const [schemaVersion, method] of [[2, 3], [3, 4], [4, 5]]) {
+    const legacy = legacyToolFreePayload(); Object.assign(legacy, { schemaVersion, method });
+    delete legacy.speedMode; delete legacy.excludedUnknownTurns;
+    if (schemaVersion === 2) { delete legacy.models[0].toolFree; delete legacy.models[0].toolFreeTurns; }
+    assert.equal(normalizeModelPerformance(legacy), null, 'mixed-mode legacy contracts must never appear as Standard');
+  }
+  Object.assign(data.models[0], { speedTurns: 2, speed: [{ method: 'speed', points: [point(DAY, 2)] }], ttftTurns: 0, ttft: [] });
   assert.equal(normalizeModelPerformance(data), data, 'historical throughput needs no reconstructed response timing');
   assert.deepEqual(performanceDomain(data, data.models[0]), { start: DAY, end: data.end });
 });
@@ -68,6 +87,9 @@ test('malformed, private, unknown, duplicate and excessive evidence fails closed
   for (const mutate of [
     x => { x.privatePath = '/synthetic/private'; },
     x => { x.schemaVersion = 7; }, x => { x.method = 1; },
+    x => { x.speedMode = 'unknown'; }, x => { x.speedMode = 'mixed'; },
+    x => { delete x.speedMode; }, x => { x.excludedUnknownTurns = -1; },
+    x => { x.excludedUnknownTurns = 1.5; }, x => { delete x.excludedUnknownTurns; },
     x => { x.historyProgress = { checked: 2, total: 1 }; },
     x => { x.historyProgress = { checked: -1, total: 1 }; },
     x => { x.historyProgress = { checked: 0, total: 1, privatePath: '/synthetic/private' }; },
@@ -102,7 +124,7 @@ test('client requests only an enum period, is abortable, and reports endpoint fa
   const calls = [], signal = new AbortController().signal;
   const client = new LocalCompanionClient({ fetchImpl: async (...args) => { calls.push(args); return {ok: true, status: 200, json: async () => payload()}; } });
   await client.modelPerformance('all', { signal });
-  assert.equal(calls[0][0], '/api/local/model-performance?period=all');
+  assert.equal(calls[0][0], '/api/local/model-performance?period=all&speedMode=standard');
   assert.equal(calls[0][1].signal, signal);
   assert.equal(calls[0][1].headers['X-Usage-Monitor-Local'], '1');
   assert.equal(calls[0][1].cache, 'no-store');
@@ -112,7 +134,7 @@ test('client requests only an enum period, is abortable, and reports endpoint fa
 });
 test('every supported locale preserves coverage and measurement meaning', () => {
   for (const locale of SUPPORTED_LOCALES) {
-    for (const key of ['title', 'speedEmpty', 'ttftEmpty', 'methodology', 'variance', 'speedSummary', 'latencySummary', 'combinedSpeedSummary', 'combinedSpeedMethodology', 'combinedSpeedEmpty', 'combinedMethodology', 'outerBand', 'innerBand', 'medianP50', 'percentileValues', 'percentilesUnavailable', 'buildingHistory', 'unavailable', 'stale']) {
+    for (const key of ['title', 'speedEmpty', 'ttftEmpty', 'methodology', 'variance', 'speedSummary', 'latencySummary', 'combinedSpeedSummary', 'combinedSpeedMethodology', 'combinedSpeedEmpty', 'combinedMethodology', 'outerBand', 'innerBand', 'medianP50', 'percentileValues', 'percentilesUnavailable', 'buildingHistory', 'unavailable', 'stale', 'mode', 'standard', 'fast', 'standardNote', 'fastNote', 'unknownMode', 'modeEmpty']) {
       const value = translate(`performance.${key}`, {}, locale);
       assert.notEqual(value, `performance.${key}`);
     }
@@ -245,16 +267,14 @@ test('recovered estimates stay in one output-speed chart with explicit populatio
   assert.equal(dom.root.all().some(node => node.className === 'performance-method-note'), false);
   controller.destroy();
 });
-test('legacy independent distributions remain response-only without mixing aggregate percentiles', async () => {
-  const dom = focusHarness(), data = toolFreePayload();
+test('legacy independent distributions reject mixed-mode evidence without rendering charts', async () => {
+  const dom = focusHarness(), data = legacyToolFreePayload();
   const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => data },
     t: (key, values) => translate(key, values, 'en-US') });
   dom.show(); await controller.refresh();
-  assert.deepEqual(performanceDomain(data, data.models[0]), { start: 2 * DAY, end: data.end });
-  assert.equal(dom.root.all().filter(node => node.tagName === 'h4').length, 2);
-  assert.equal(dom.root.all().some(node => node.className === 'performance-method-note'), false);
-  assert.equal(dom.root.all().filter(node => node.className === 'performance-unit')[0].textContent,
-    'tokens/s · Higher is faster · 10 of 20 turns measured');
+  assert.equal(dom.root.all().filter(node => node.tagName === 'h4').length, 0);
+  assert.equal(dom.root.all().some(node => node.id === 'performance-model-panel'), false);
+  assert.ok(dom.find('retry'));
   controller.destroy();
 });
 
@@ -364,6 +384,25 @@ test('horizontal hover bins are calendar-aligned including unobserved days and e
   assert.equal(performanceHoverBin(.5, domain, 'day'), 6*DAY);
   assert.equal((performanceHoverBin(.5, domain, 'week') - 4*DAY) % (7*DAY), 0);
 });
+test('performance cards render separate GPT-6 generations with their shared family icons', async () => {
+  const dom = focusHarness();
+  const data = payload();
+  data.models.push(...[['gpt-6-sol', 'GPT-6 Sol'], ['gpt-6-luna', 'GPT-6 Luna'], ['gpt-5.6-luna', 'Luna']]
+    .map(([id, label]) => ({ ...structuredClone(data.models[0]), id, label })));
+  const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => data },
+    t: (key, values) => translate(key, values, 'en-US') });
+  try {
+    dom.show(); await controller.refresh();
+    for (const name of ['GPT-5.6 Sol', 'GPT-5.6 Luna', 'GPT-6 Sol', 'GPT-6 Luna']) {
+      assert.ok(dom.root.all().some(node => node.textContent === name), name);
+    }
+    for (const family of ['sol', 'luna']) {
+      const buttons = dom.root.all().filter(node => node.tagName === 'button');
+      assert.equal(buttons.filter(button => button.all().some(node => node.className ===
+        `allowance-model-icon performance-model-icon allowance-model-${family}`)).length, 2);
+    }
+  } finally { controller.destroy(); }
+});
 test('plot-area sweep works away from points, clears on exit, and keyboard order follows dates', async () => {
   const dom = focusHarness();
   const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => payload() },
@@ -380,7 +419,7 @@ test('plot-area sweep works away from points, clears on exit, and keyboard order
   assert.ok(dom.root.all().some(node => node.textContent === 'GPT-5.6 Sol'));
   assert.ok(dom.root.all().some(node => node.className === 'allowance-model-icon performance-model-icon allowance-model-sol'));
   assert.deepEqual(dom.root.all().filter(node => node.className === 'performance-unit').map(node => node.textContent), [
-    'tokens/s · Higher is faster · 10 of 20 turns measured',
+    'tokens/s · 10 of 20 turns measured · 10 response-timed · 0 full-turn estimates',
     'seconds · Lower is faster · 15 of 20 turns measured · 45 timed responses',
   ]);
   assert.equal(dom.root.all().some(node => node.className === 'performance-coverage'), false);
@@ -592,7 +631,7 @@ test('failed refresh retains chart coverage and timestamp beside the retry actio
   assert.ok(actions.children.some(node => node.dataset.performanceFocus === 'retry'));
   assert.equal(dom.root.all().filter(node => node.dataset.evidence === 'freshness').length, 1);
   assert.deepEqual(dom.root.all().filter(node => node.className === 'performance-unit').map(node => node.textContent), [
-    'tokens/s · Higher is faster · 10 of 20 turns measured',
+    'tokens/s · 10 of 20 turns measured · 10 response-timed · 0 full-turn estimates',
     'seconds · Lower is faster · 15 of 20 turns measured · 45 timed responses',
   ]);
   fail = false; await dom.find('retry').listeners.click();
@@ -900,4 +939,159 @@ test('hidden and destroyed views cancel selected and prefetch requests', async (
   assert.ok(prefetchCall, 'visible ready data starts the bounded prefetch');
   secondController.destroy();
   assert.equal(prefetchCall.options.signal.aborted, true, 'destroy cancels a running prefetch');
+});
+
+const modePayload = (period, speedMode, overrides = {}) => periodPayload(period, { speedMode, ...overrides });
+const hasPanel = dom => dom.root.all().some(node => node.id === 'performance-model-panel');
+
+test('Standard is the initial mode and Fast empty results show unknown exclusions without borrowing cached Standard', async () => {
+  const dom = focusHarness(), fast = Promise.withResolvers();
+  const { calls, client } = performanceClient((period, { speedMode }) => speedMode === 'fast'
+    ? period === 'all' ? fast.promise : modePayload(period, speedMode, { models: [] })
+    : modePayload(period, speedMode));
+  const controller = mountModelPerformance({ ...dom, client, t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh(); await settle();
+  assert.ok(calls.every(call => call.options.speedMode === 'standard'), 'prewarming also stays in Standard');
+  assert.equal(dom.find('mode-standard').attributes['aria-pressed'], 'true');
+  assert.equal(dom.find('mode-fast').attributes['aria-pressed'], 'false');
+  dom.find('mode-fast').focus(); dom.find('mode-fast').listeners.click();
+  assert.equal(hasPanel(dom), false, 'an uncached Fast view clears all Standard charts immediately');
+  assert.equal(dom.documentRef.activeElement, dom.find('mode-fast'), 'toggle focus survives render');
+  assert.equal(calls.at(-1).options.speedMode, 'fast');
+  fast.resolve(modePayload('all', 'fast', { models: [], excludedUnknownTurns: 17 }));
+  await settle(); await settle();
+  assert.equal(hasPanel(dom), false);
+  assert.ok(dom.root.all().some(node => node.textContent?.includes('No Fast mode measurements')));
+  assert.ok(dom.root.all().some(node => node.textContent?.includes('Excluded turns (unknown or mixed speed mode): 17.')));
+  assert.equal(dom.find('mode-fast').attributes['aria-pressed'], 'true');
+  controller.destroy();
+});
+
+test('one Fast observation shows its own coverage, hollow points and no percentile bands', async () => {
+  const dom = focusHarness();
+  const { client } = performanceClient((period, { speedMode }) => {
+    const data = modePayload(period, speedMode);
+    if (speedMode === 'fast') Object.assign(data.models[0], { turns: 1, speedTurns: 1, ttftTurns: 1, timedResponses: 1,
+      speed: [{ method: 'speed', points: [point(2 * DAY, 1)] }], ttft: [point(2 * DAY, 1)] });
+    return data;
+  });
+  const controller = mountModelPerformance({ ...dom, client, t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh(); dom.find('mode-fast').listeners.click(); await settle();
+  const nodes = dom.root.all();
+  assert.equal(nodes.filter(node => node.className === 'performance-point').length, 2);
+  assert.equal(nodes.filter(node => node.attributes.fill === 'var(--surface-raised)').length, 2);
+  assert.equal(nodes.some(node => node.className?.startsWith('performance-percentile-band ')), false);
+  assert.equal(nodes.some(node => node.className === 'performance-median-line'), false);
+  assert.ok(nodes.some(node => node.textContent === 'tokens/s · 1 of 1 turns measured · 1 response-timed · 0 full-turn estimates'));
+  controller.destroy();
+});
+
+test('mode and period caches stay independent while revisits retain only their own measurements', async () => {
+  const dom = focusHarness(); let loading = false;
+  const { calls, client } = performanceClient((period, { speedMode }) => modePayload(period, speedMode,
+    loading ? { status: 'loading', models: [] } : speedMode === 'fast' ? { models: [] } : {}));
+  const controller = mountModelPerformance({ ...dom, client, t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh(); await settle();
+  dom.find('mode-fast').listeners.click(); await settle(); await settle();
+  assert.deepEqual(calls.filter(call => call.options.speedMode === 'fast').map(call => call.period), ['all', '7', '30']);
+  loading = true;
+  dom.find('mode-standard').listeners.click();
+  assert.ok(hasPanel(dom), 'Standard synchronously recovers its own cached all-time result');
+  await settle();
+  dom.find('period-7').listeners.click();
+  assert.ok(hasPanel(dom), 'Standard recovers only its own warmed seven-day result');
+  await settle();
+  dom.find('mode-fast').listeners.click();
+  assert.equal(hasPanel(dom), false, 'Fast seven-day empty result is not replaced by Standard seven-day charts');
+  await settle();
+  assert.equal(calls.at(-1).period, '7');
+  assert.equal(calls.at(-1).options.speedMode, 'fast');
+  assert.equal(dom.find('period-7').attributes['aria-pressed'], 'true');
+  controller.destroy();
+});
+
+test('late responses and failures from the previous mode cannot change the selected mode or its cache', async () => {
+  for (const outcome of ['response', 'failure']) {
+    const dom = focusHarness(), late = Promise.withResolvers();
+    let standardAttempts = 0;
+    const { calls, client } = performanceClient((period, { speedMode }) => {
+      if (speedMode === 'standard' && period === 'all') {
+        if (++standardAttempts === 1) return late.promise;
+        return modePayload(period, speedMode, { status: 'loading', models: [] });
+      }
+      return modePayload(period, speedMode, { models: [] });
+    });
+    const controller = mountModelPerformance({ ...dom, client, t: (key, values) => translate(key, values, 'en-US') });
+    dom.show(); const first = controller.refresh();
+    dom.find('mode-fast').listeners.click(); await settle();
+    assert.equal(calls[0].options.signal.aborted, true);
+    if (outcome === 'response') late.resolve(modePayload('all', 'standard'));
+    else late.reject(new Error('late Standard failure'));
+    await first; await settle();
+    assert.equal(dom.find('mode-fast').attributes['aria-pressed'], 'true');
+    assert.equal(hasPanel(dom), false);
+    assert.equal(dom.find('retry'), undefined, 'an obsolete failure never becomes a Fast error');
+    dom.find('mode-standard').listeners.click(); await settle();
+    assert.equal(hasPanel(dom), false, 'late Standard responses never warm the Standard cache');
+    controller.destroy();
+  }
+});
+
+test('a mode switch fences an in-flight page preload and starts an independent Fast request', async () => {
+  const dom = focusHarness(), late = Promise.withResolvers();
+  const { calls, client } = performanceClient((period, { speedMode }) => speedMode === 'standard'
+    ? late.promise : modePayload(period, speedMode, { models: [] }));
+  const controller = mountModelPerformance({ ...dom, client, t: (key, values) => translate(key, values, 'en-US') });
+  const preload = controller.preload(); await settle();
+  dom.show(); dom.find('mode-fast').listeners.click(); await settle();
+  assert.equal(calls[0].options.signal.aborted, true);
+  late.resolve(modePayload('all', 'standard')); await preload; await settle();
+  assert.equal(calls.filter(call => call.options.speedMode === 'standard').length, 1, 'cancelled preload does not fan out Standard periods');
+  assert.equal(hasPanel(dom), false);
+  assert.equal(dom.find('mode-fast').attributes['aria-pressed'], 'true');
+  await controller.preload(); await settle();
+  assert.equal(calls.filter(call => call.options.speedMode === 'fast' && call.period === 'all').length, 1, 'new-mode preload reuses only Fast cache');
+  controller.destroy();
+});
+
+test('shared reporting keeps its exact bound and selected speed mode through mode and period changes', async () => {
+  const dom = focusHarness(), end = 9 * DAY;
+  const windowAt = period => ({ period, startAt: new Date(end - (period === '24h' ? 1 : 7) * DAY).toISOString(), endAt: new Date(end).toISOString() });
+  const { calls, client } = performanceClient((period, { speedMode }) => modePayload(period, speedMode, {
+    start: end - Number(period) * DAY, end, models: [],
+  }));
+  const controller = mountModelPerformance({ ...dom, client, reportingWindow: windowAt('24h'),
+    t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh();
+  dom.find('mode-fast').listeners.click(); await settle();
+  assert.equal(calls.at(-1).period, '1');
+  assert.equal(calls.at(-1).options.speedMode, 'fast');
+  assert.equal(calls.at(-1).options.endAt, windowAt('24h').endAt);
+  controller.setReportingWindow(windowAt('7d')); await settle();
+  assert.equal(calls.at(-1).period, '7');
+  assert.equal(calls.at(-1).options.speedMode, 'fast');
+  assert.equal(calls.at(-1).options.endAt, windowAt('7d').endAt);
+  assert.equal(dom.root.all().some(node => node.dataset.performanceFocus?.startsWith('period-')), false);
+  assert.equal(dom.find('mode-fast').attributes['aria-pressed'], 'true');
+  controller.destroy();
+});
+
+test('client rejects unsupported modes, preserves endAt, and page rejects a wrong-mode response', async () => {
+  const calls = [], endAt = '2026-09-22T12:00:00.000Z';
+  const client = new LocalCompanionClient({ fetchImpl: async (...args) => {
+    calls.push(args); return { ok: true, status: 200, json: async () => payload() };
+  } });
+  await client.modelPerformance('7', { speedMode: 'fast', endAt });
+  const url = new URL(calls[0][0], 'http://localhost');
+  assert.equal(url.searchParams.get('period'), '7');
+  assert.equal(url.searchParams.get('speedMode'), 'fast');
+  assert.equal(url.searchParams.get('endAt'), endAt);
+  for (const speedMode of ['unknown', 'mixed', 'all', 'fast&path=x', null]) assert.throws(() => client.modelPerformance('7', { speedMode }), RangeError);
+  const dom = focusHarness();
+  const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => modePayload('all', 'fast') },
+    t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh();
+  assert.equal(hasPanel(dom), false);
+  assert.ok(dom.find('retry'));
+  controller.destroy();
 });

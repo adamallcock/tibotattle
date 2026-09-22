@@ -1085,10 +1085,11 @@ test("Codex SQLite selected heads are owner-controlled hints and stale or missin
     );
     database.close();
     await chmod(databaseFile, 0o600);
-    const selectedHeads = await readCodexSelectedRolloutNames(fixture.codexHome);
+    const selectedHeads = await readCodexSelectedRolloutNames(fixture.codexHome,
+      isWindows ? { loadWindowsBinding() { throw new Error("synthetic binding unavailable"); } } : {});
     if (isWindows) {
-      // The portable reader has no proof of the Windows owner ACL, so it must
-      // fail closed and let normal discovery select the sole leaf below.
+      // Native platform parity tests cover an authenticated Windows source.
+      // Without the binding, discovery still safely falls back to the sole leaf.
       assert.equal(selectedHeads, null);
     } else {
       assert.deepEqual(selectedHeads, new Map([
@@ -1132,6 +1133,7 @@ test("Codex SQLite selected heads are owner-controlled hints and stale or missin
       codexHome: fixture.codexHome,
       startAt: START_AT,
       endAt: END_AT,
+      ...(isWindows ? { selectedRolloutNames: selectedHeads } : {}),
     });
     assert.equal(
       infos.find((info) => info.rolloutId === ROLLOUT_A2)?.selectedHead,
@@ -1155,6 +1157,7 @@ test("Codex SQLite selected heads are owner-controlled hints and stale or missin
       codexHome: fixture.codexHome,
       startAt: START_AT,
       endAt: END_AT,
+      ...(isWindows ? { selectedRolloutNames: selectedHeads } : {}),
     });
     assert.equal(
       infos.find((info) => info.rolloutId === THREAD_A)?.selectedHead,

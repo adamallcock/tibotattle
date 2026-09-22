@@ -9,6 +9,10 @@ import {
   ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
   ACCOUNTLESS_UPLOAD_OWNER_SCOPE,
   ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+  ACCOUNTLESS_V12_UPLOAD_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_V12_UPLOAD_POLICY_VERSION,
+  ACCOUNTLESS_V12_UPLOAD_SCHEMA_VERSION,
+  readTelemetryV12Capabilities,
 } from "./contribution/index.js";
 import { runIncrementalContributionSyncOnce } from "./contribution-incremental-sync.js";
 
@@ -52,6 +56,13 @@ const ACCOUNTLESS_RUN_AUTHORIZATION = Object.freeze({
   policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
   authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
   telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+});
+
+const ACCOUNTLESS_V12_RUN_AUTHORIZATION = Object.freeze({
+  schemaVersion: ACCOUNTLESS_V12_UPLOAD_SCHEMA_VERSION,
+  policyVersion: ACCOUNTLESS_V12_UPLOAD_POLICY_VERSION,
+  authorizationBasis: ACCOUNTLESS_V12_UPLOAD_AUTHORIZATION_BASIS,
+  telemetrySchemaVersion: "telemetry-contribution-v1.2",
 });
 
 const ERROR_CODES = new Set([
@@ -294,6 +305,7 @@ function retryAfterMilliseconds(response, now = Date.now) {
     if (!Number.isSafeInteger(seconds)) return null;
     milliseconds = seconds * 1_000;
   } else {
+    if (!/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/u.test(value)) return null;
     const then = Date.parse(value);
     let current;
     try { current = epochMilliseconds(now()); } catch { return null; }
@@ -315,6 +327,19 @@ async function readJsonResponse(response, signal, {
   enrollment = false,
   now = Date.now,
 } = {}) {
+  if (!(response instanceof Response) || response.redirected) {
+    discardResponseBody(response);
+    fail("response_invalid");
+  }
+  // Intermediaries can return HTML or no application headers during outages.
+  // Their bodies are not acknowledgements and need not be read or retained.
+  if (response.status === 408 || response.status === 429 || response.status >= 500) {
+    discardResponseBody(response);
+    fail("service_unavailable", {
+      retryable: true,
+      retryAfterMilliseconds: retryAfterMilliseconds(response, now),
+    });
+  }
   const validHeaders = response instanceof Response
     && response.headers.get("cache-control") === "no-store"
     && (response.headers.get("content-type") ?? "")
@@ -338,12 +363,6 @@ async function readJsonResponse(response, signal, {
     fail("response_invalid");
   }
   if (!response.ok) {
-    if (response.status === 408 || response.status === 429 || response.status >= 500) {
-      fail("service_unavailable", {
-        retryable: true,
-        retryAfterMilliseconds: retryAfterMilliseconds(response, now),
-      });
-    }
     const backendCode = payload?.error?.code;
     if (enrollment && response.status === 410
         && backendCode === "ACCOUNTLESS_ENROLLMENT_EXPIRED") {
@@ -796,6 +815,39 @@ export function renewAccountlessContributionOwnership(options = {}) {
   return requestAccountlessAuthority(options, true);
 }
 
+/** This client implements the separate successor policy. A current protected
+ * sharing preference still fences every request; an older hosted grant cannot
+ * authorize v1.2. Discovery or grant failure leaves the independently valid
+ * legacy stream available. The v1.2 runner rechecks authority before any data. */
+async function negotiateAccountlessV12({ origin, backend, stateFile,
+  withDeviceSecret, fetchImpl, signal, requestTimeoutMilliseconds, now,
+  setTimeoutImpl, clearTimeoutImpl }) {
+  return withDeviceSecret({ backend, ...(stateFile === undefined ? {} : { stateFile }),
+    expectedOrigin: origin,
+    operation: async (secret, device) => {
+      try {
+        const deviceAuthorization = `Device um_device_${device.deviceId}.${secret.toString("base64url")}`;
+        const capability = await readTelemetryV12Capabilities({ serverBaseUrl: origin,
+          deviceAuthorization, fetchImpl, signal, clock: now,
+          requestTimeoutMs: requestTimeoutMilliseconds });
+        if (capability.authorityKind !== "accountless" || capability.successor.lifecycle !== "accepted") return false;
+        if (capability.successor.authorizationCurrent) return true;
+        const receipt = await requestJsonWithDeadline({ fetchImpl,
+          url: `${origin}/api/v1/accountless/telemetry-v1.2-authorization`,
+          options: { method: "POST", cache: "no-store",
+            headers: { "Content-Type": "application/json", Authorization: deviceAuthorization },
+            body: JSON.stringify(ACCOUNTLESS_V12_RUN_AUTHORIZATION) },
+          signal, requestTimeoutMilliseconds, setTimeoutImpl, clearTimeoutImpl,
+          responseOptions: { rejectionCode: "ownership_rejected", ownership: true, now },
+        });
+        return receipt !== null && typeof receipt === "object" && !Array.isArray(receipt)
+          && Object.keys(receipt).length === 4
+          && Object.entries(ACCOUNTLESS_V12_RUN_AUTHORIZATION).every(([key, value]) => receipt[key] === value);
+      } catch { return false; }
+    },
+  });
+}
+
 function configuredAccountlessSync(options) {
   if (!options || typeof options !== "object" || Array.isArray(options)
       || ["consent", "authorization", "approve", "approval"].some((key) => Object.hasOwn(options, key))) {
@@ -805,6 +857,7 @@ function configuredAccountlessSync(options) {
     laboratory = false,
     rehearsal = false,
     production = false,
+    negotiateSuccessors = false,
     origin,
     readPreference,
     backend,
@@ -830,7 +883,7 @@ function configuredAccountlessSync(options) {
     progressStore = undefined,
     progressFile = null,
   } = options;
-  if (typeof readPreference !== "function" || !backend || typeof backend !== "object"
+  if (typeof negotiateSuccessors !== "boolean" || typeof readPreference !== "function" || !backend || typeof backend !== "object"
       || Array.isArray(backend) || typeof indexFile !== "string" || !indexFile
       || (stateFile !== undefined && (typeof stateFile !== "string" || !stateFile))
       || [fetchImpl, ensureCapability, withDeviceSecret, enroll, claimOwnership, renewOwnership,
@@ -855,6 +908,7 @@ function configuredAccountlessSync(options) {
     laboratory,
     rehearsal,
     production,
+    negotiateSuccessors,
     origin: selectedOrigin,
     readPreference,
     backend,
@@ -932,6 +986,7 @@ export async function runAccountlessContributionSyncOnce(options = {}) {
     laboratory,
     rehearsal,
     production,
+    negotiateSuccessors,
     origin,
     readPreference,
     backend,
@@ -1025,6 +1080,12 @@ export async function runAccountlessContributionSyncOnce(options = {}) {
     assertSignalActive(signal);
     await readEligiblePreference(readPreference, origin);
     assertSignalActive(signal);
+    const successor = negotiateSuccessors && await negotiateAccountlessV12({
+      origin, backend, stateFile, withDeviceSecret, fetchImpl: guardedFetch,
+      signal, requestTimeoutMilliseconds, now, setTimeoutImpl, clearTimeoutImpl,
+    });
+    assertSignalActive(signal);
+    await readEligiblePreference(readPreference, origin);
     const result = await runIncrementalSync({
       laboratory,
       rehearsal,
@@ -1033,7 +1094,7 @@ export async function runAccountlessContributionSyncOnce(options = {}) {
       backend,
       ...(stateFile === undefined ? {} : { stateFile }),
       indexFile,
-      authorization: ACCOUNTLESS_RUN_AUTHORIZATION,
+      authorization: successor ? ACCOUNTLESS_V12_RUN_AUTHORIZATION : ACCOUNTLESS_RUN_AUTHORIZATION,
       fetchImpl: guardedFetch,
       withDeviceSecret,
       maximumChunks,
@@ -1043,8 +1104,8 @@ export async function runAccountlessContributionSyncOnce(options = {}) {
       readAccountMarkers,
       loadExistingAccountObservationSecret,
       onAttributionBinding,
-      progressStore,
-      progressFile,
+      ...(successor ? { progressFile: progressFile === null ? null : `${progressFile}.v12` }
+        : { progressStore, progressFile }),
       signal,
     });
     assertSignalActive(signal);

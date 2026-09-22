@@ -7,13 +7,16 @@ status: maintained
 
 # TiboTattle user guide
 
-TiboTattle is a local-first macOS companion for understanding AI-tool usage,
+TiboTattle is a local-first desktop application for understanding AI-tool usage,
 cost, quota windows, and trends. Local analysis works without an account and
-keeps session content on this Mac. Optional community contribution is a separate,
+keeps session content on your device. Optional community contribution is a separate,
 content-free, consented feature.
 
-Current support is macOS 14 or later on Apple silicon and Intel. Windows and Linux are not
-supported; see [platform support](./reference/platform-support.md).
+See [platform support](./reference/platform-support.md) for the current macOS,
+Windows x64 and Linux x86_64 distribution matrix and its qualification limits.
+Choose the artifact for your platform from the published release manifest.
+The Mac installation steps below apply to macOS 14 or later on Apple silicon
+and Intel.
 
 ## Install and first launch
 
@@ -177,6 +180,14 @@ Open **Model performance** from the dashboard sidebar, then choose a model
 and use the shared **Reporting period** above the page. The web and native navigation
 include this page in development source; an installed release must contain
 these changes before the page is available there.
+
+The page starts in **Standard** mode. Use the **Standard / Fast** toggle to show
+only the selected mode; counts, medians, bands and both charts use that same
+population. The choice lasts while the page is mounted, including period/model
+changes and refreshes. Fast mode can have few or no observations. Hollow points
+have fewer than five measured turns, and those bins have no percentile bands.
+Unknown or mixed modes are excluded from both views, with their excluded turn
+count shown. Older saved measurements without mode evidence stay unclassified.
 
 After the initial dashboard loads, the app prepares this page and its standard
 periods in the background before you visit. Once ready, opening the page or
@@ -507,9 +518,10 @@ Application Support or Keychain locations blindly.
 
 ## Updates and help
 
-Stable builds check the signed Sparkle feed at
-`https://updates.tibotattle.com/appcast.xml`. A temporary network failure should
-leave the installed app usable; it does not prove an update exists or failed to
+In Electron, check for updates in **Settings → About**. Native Mac version
+0.1.18 uses its retained signed Sparkle feed to transition to Electron.
+A temporary network failure should leave the installed app usable; it does not
+prove an update exists or failed to
 publish. Verify the current release independently if an update looks stale.
 
 For bugs, diagnostics, privacy questions, and security reporting, start at

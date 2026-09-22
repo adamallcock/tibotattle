@@ -1294,8 +1294,8 @@
                 <p class="annotation" id="attribution-review-sample"></p>
                 <dl id="attribution-review-inventory"></dl>
                 <p class="annotation" id="attribution-review-bases"></p>
-                <p class="annotation" data-i18n="attributionConsent.privacy">Account tracks can link eligible activity within this destination and enrollment. No raw account identifiers, prompts, responses or paths are sent. Missing historical identity stays unknown; observed plans are preserved.</p>
-                <label class="annotation"><input id="attribution-consent-confirm" type="checkbox"> <span data-i18n="attributionConsent.confirm">I approve ongoing upload of these fields, including pseudonymous account and plan linkage.</span></label>
+                <p class="annotation" id="attribution-review-privacy" data-i18n="attributionConsent.privacy">Account tracks can link eligible activity within this destination and enrollment. No raw account identifiers, prompts, responses or paths are sent. Missing historical identity stays unknown; observed plans are preserved.</p>
+                <label class="annotation"><input id="attribution-consent-confirm" type="checkbox"> <span id="attribution-consent-confirm-label" data-i18n="attributionConsent.confirm">I approve ongoing upload of these fields, including pseudonymous account and plan linkage.</span></label>
                 <div class="contribution-cta-buttons">
                   <button class="button button-primary" id="attribution-consent-approve" type="button" disabled data-i18n="attributionConsent.approve">Approve account and plan contribution</button>
                   <button class="button button-quiet" id="attribution-review-cancel" type="button" data-i18n="attributionConsent.cancel">Not now</button>
@@ -1303,6 +1303,33 @@
               </div>
               <p class="annotation" id="attribution-consent-status" role="status" hidden></p>
             </section>
+          </section>
+          <section class="panel performance-consent" id="performance-consent" aria-labelledby="performance-consent-title" hidden>
+            <div class="panel-heading">
+              <div>
+                <p class="panel-kicker" data-i18n="performanceConsent.kicker">Optional measurement</p>
+                <h3 id="performance-consent-title" data-i18n="performanceConsent.title">Model performance sharing</h3>
+              </div>
+              <span class="evidence-chip neutral" id="performance-consent-state" data-i18n="performanceConsent.notApproved">Not approved</span>
+            </div>
+            <p class="annotation" id="performance-consent-description" data-i18n="performanceConsent.description">
+              Share daily output speed, first-token latency and full-turn duration as aggregate histograms. Usage sharing remains separate.
+            </p>
+            <button class="button button-quiet" id="performance-review-open" type="button" data-i18n="performanceConsent.review">Review performance measurement</button>
+            <div id="performance-review" hidden>
+              <h4 id="performance-review-title" tabindex="-1" data-i18n="performanceConsent.reviewTitle">Review model performance measurement</h4>
+              <p class="annotation" id="performance-review-destination"></p>
+              <p class="annotation" id="performance-review-contract"></p>
+              <p class="annotation" id="performance-review-sample"></p>
+              <p class="annotation" id="performance-review-privacy" data-i18n="performanceConsent.privacy">Only bounded aggregate histograms are shared. Prompts, responses, paths, session identifiers and account identifiers stay local.</p>
+              <label class="annotation"><input id="performance-consent-confirm" type="checkbox"> <span id="performance-consent-confirm-label" data-i18n="performanceConsent.confirm">I approve ongoing upload of these independent performance measurements.</span></label>
+              <div class="contribution-cta-buttons">
+                <button class="button button-primary" id="performance-consent-approve" type="button" disabled data-i18n="performanceConsent.approve">Approve performance measurement</button>
+                <button class="button button-quiet" id="performance-review-cancel" type="button" data-i18n="performanceConsent.cancel">Not now</button>
+              </div>
+            </div>
+            <p class="participant-action-status" id="performance-consent-status" role="status" hidden></p>
+            <p class="annotation" id="performance-sync-status" role="status" hidden></p>
           </section>
           <section class="contribution-device-controls" id="contribution-device-controls" aria-label="Disconnect this Mac" data-i18n-aria-label="contribution.disconnect.action" hidden>
             <p class="annotation" id="disconnect-device-description" data-i18n="contribution.disconnect.description">

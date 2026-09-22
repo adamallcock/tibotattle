@@ -35,7 +35,32 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-No additional changes recorded.
+## [0.1.24](./release-notes/0.1.24.md) - 2026-09-22
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.24) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.24) ·
+[changes since v0.1.23](https://github.com/adamallcock/tibotattle/compare/v0.1.23...v0.1.24)
+
+- Add GPT-6 Sol and Luna recognition and shared client/server prices for all
+  four processing modes and both context bands, using the existing family icons.
+- Enable local Model performance on Windows x64, following protected-reader and
+  packaged-source qualification in [PR #199](https://github.com/adamallcock/tibotattle/pull/199).
+- Repair Windows task names and project grouping reported in
+  [issue #208](https://github.com/adamallcock/tibotattle/issues/208).
+- Align macOS and Windows task metadata and selected-history reads, preserving
+  valid paginated forks and avoiding sidecar creation for closed source databases.
+- Add tool-free turn throughput, retain performance and work reports during
+  refresh, and improve automatic refresh recovery.
+- Keep Standard and Fast performance measurements separate, default to Standard,
+  and identify historical measurements with unknown mode as excluded.
+- Add telemetry v1.2 turn-boundary and continuity evidence for optional sharing
+  while retaining older-client compatibility and existing cache calculations.
+- Improve tray pace and run-out forecasts, login status updates, and local
+  opt-in crash diagnostics.
+- Correct history record classification, accept rollout lines up to 512 KiB,
+  and preserve existing usage through parser recovery and restart.
+- Recover optional uploads from temporary service failures and trigger a
+  coalesced upload after a successful index update, preserving opt-outs and backoff.
 
 ## [0.1.23](./release-notes/0.1.23.md) - 2026-09-14
 

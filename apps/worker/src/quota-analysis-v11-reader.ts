@@ -98,7 +98,10 @@ export const V11_QUOTA_ACQUISITION_PAGE_SIZE = TYPED_V11_QUOTA_PAGE_SIZE;
 
 
 export interface V11QuotaPageReader {
-  readonly pageSize: typeof V11_QUOTA_ACQUISITION_PAGE_SIZE;
+  readonly pageSize: number;
+  /** Effective pages preserve occurrence groups and may end a UTC day before
+   * the whole window. Only this explicitly tagged adapter may use that seam. */
+  readonly effective?: { readonly complete: () => boolean };
   readPage(cursor: V11QuotaPageCursor, limit: number): Promise<V11QuotaPageRow[]>;
 }
 
@@ -610,7 +613,10 @@ export async function advanceV11QuotaAcquisition(
   state: V11QuotaAcquisitionCheckpoint = createV11QuotaAcquisitionCheckpoint(identity),
   options: { maxPages?: number; stopAtPhaseBoundary?: boolean } = {},
 ): Promise<V11QuotaAcquisitionStep> {
-  if (reader.pageSize !== V11_QUOTA_ACQUISITION_PAGE_SIZE) throw new Error("v11 quota reader page policy invalid");
+  if (reader.pageSize !== V11_QUOTA_ACQUISITION_PAGE_SIZE
+      && !(reader.pageSize === 200 && typeof reader.effective?.complete === "function")) {
+    throw new Error("v11 quota reader page policy invalid");
+  }
   validateCheckpoint(state, identity);
   if (!Number.isSafeInteger(budget.remainingQueries) || budget.remainingQueries < 0
       || !Number.isFinite(budget.deadlineMs)) throw new Error("v11 quota acquisition budget invalid");
@@ -715,7 +721,7 @@ export async function advanceV11QuotaAcquisition(
         endpointView, emitEndpoint)) return refusal("downsampled_quota_limit_exceeded");
     }
     state.cursor = previous;
-    if (rows.length === reader.pageSize) continue;
+    if (reader.effective ? !reader.effective.complete() : rows.length === reader.pageSize) continue;
     if (state.phase === "plan") {
       if (!plan.finish()) return refusal("plan_attribution_limit_exceeded");
       index = buildPlanAttributionIndex(state.plan.observations);

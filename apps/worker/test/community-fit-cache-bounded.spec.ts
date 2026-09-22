@@ -1,9 +1,8 @@
 import { env } from "cloudflare:workers";
 import { reset, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { APP_PRICE_REGISTRY_MANIFEST } from "@app-usagemonitor/accounting";
-import { CACHED_COMMUNITY_ALLOWANCE_PAYLOADS_SQL,COMMUNITY_ATTRIBUTION_METHOD_VERSION, readCachedCommunityAllowanceCorpus } from "../src/community-allowance";
-import { SERVER_PRICING_METHOD_VERSION } from "../src/server-pricing";
+import { CACHED_COMMUNITY_ALLOWANCE_PAYLOADS_SQL,COMMUNITY_ATTRIBUTION_METHOD_VERSION, V1_FIT_CACHE_KEY,
+  V1_FIT_CACHE_KEY_SUFFIX, readCachedCommunityAllowanceCorpus } from "../src/community-allowance";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
 
 import { installPublicSourceOwnersForCacheFixture } from "./helpers/public-source-owners";
@@ -11,7 +10,7 @@ import { installPublicSourceOwnersForCacheFixture } from "./helpers/public-sourc
 interface Bindings extends Env { TEST_MIGRATIONS: D1Migration[] }
 const db = () => env.USAGE_MONITOR_DB;
 const NOW = Date.parse("2026-09-01T00:00:00.000Z"), FROM = "2026-05-24", FP="a".repeat(64);
-const suffix = `${APP_PRICE_REGISTRY_MANIFEST.sha256}:v1-fit-7:${SERVER_PRICING_METHOD_VERSION}:${COMMUNITY_ATTRIBUTION_METHOD_VERSION}`;
+const suffix = V1_FIT_CACHE_KEY;
 const budget = (remainingQueries=30) => ({remainingQueries, deadlineMs:1, now:()=>0});
 async function fixture() {
   await db().batch([
@@ -55,7 +54,8 @@ describe("bounded cache-only scalar fit corpus",()=>{
   });
   it("returns no partial cohort when a later cache is missing, stale or corrupt",async()=>{
     await participant("a"); await participant("b");
-    for (const [column,value] of [["cache_key","old"],["fits_json","[false]"],["input_fingerprint","not-a-fingerprint"],
+    const shortenedFitKey = `v1:1:${FROM}:${V1_FIT_CACHE_KEY_SUFFIX}`;
+    for (const [column,value] of [["cache_key","old"],["cache_key",shortenedFitKey],["fits_json","[false]"],["input_fingerprint","not-a-fingerprint"],
       ["source_method_version","obsolete"]]) {
       const old=await db().prepare(`SELECT ${column} AS value FROM community_allowance_fit_cache WHERE participant_id='b'`).first<{value:string}>();
       await db().prepare(`UPDATE community_allowance_fit_cache SET ${column}=? WHERE participant_id='b'`).bind(value).run();

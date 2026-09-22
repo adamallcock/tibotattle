@@ -1798,6 +1798,7 @@ export class LocalCompanionRefreshController {
   #inFlight = null;
   #onDegradedOutcome;
   #onTerminalFailure;
+  #onIndexPublished;
   #runner;
   #setTimeoutImpl;
   #state;
@@ -1829,6 +1830,9 @@ export class LocalCompanionRefreshController {
     // can file a content-free note keeping the trail the terminal recorder no
     // longer sees. At most once per run; its own failures are swallowed.
     onDegradedOutcome = null,
+    // Signals a validated, changed index only after the local snapshot reload.
+    // Observers cannot change refresh success or authorize contribution.
+    onIndexPublished = null,
   }) {
     if (typeof runner !== "function") throw new TypeError("runner must be a function");
     if (!dataStore || typeof dataStore.reload !== "function") {
@@ -1875,6 +1879,9 @@ export class LocalCompanionRefreshController {
     if (onDegradedOutcome !== null && typeof onDegradedOutcome !== "function") {
       throw new TypeError("onDegradedOutcome must be a function or null");
     }
+    if (onIndexPublished !== null && typeof onIndexPublished !== "function") {
+      throw new TypeError("onIndexPublished must be a function or null");
+    }
     this.#runner = runner;
     this.#dataStore = dataStore;
     this.#timeoutMs = timeoutMs;
@@ -1888,6 +1895,7 @@ export class LocalCompanionRefreshController {
     this.#createRefreshId = createRefreshId;
     this.#onTerminalFailure = onTerminalFailure;
     this.#onDegradedOutcome = onDegradedOutcome;
+    this.#onIndexPublished = onIndexPublished;
     this.#state = {
       status: "idle",
       refreshId: null,
@@ -2165,6 +2173,11 @@ export class LocalCompanionRefreshController {
               : {}),
           });
         }
+        // A cancellation/deadline can arrive while reload yields. Do not turn
+        // that terminal outcome into success or wake an uploader afterward.
+        if (this.#cancelRequested || timedOut || controller.signal.aborted) {
+          throw new Error("Refresh interrupted during snapshot reload");
+        }
         const finalProgress = publicIndexingResult(result?.indexing);
         const degradation = unifiedIndexDegradation(result);
         this.#state = {
@@ -2186,6 +2199,17 @@ export class LocalCompanionRefreshController {
         // retained cache. File the degraded-event note (kept from the incident)
         // now that the terminal-failure path no longer sees it.
         this.#notifyDegradedOutcome(result);
+        const publication = publicUnifiedIndexResult(result?.unifiedIndex);
+        if (mode === "detailed" && this.#state.status === "succeeded"
+            && !this.#cancelRequested && !timedOut && !controller.signal.aborted
+            && publication.status === "ingested" && result?.unifiedIndex?.unchanged === false
+            && publication.generation.status === "complete"
+            && unifiedGenerationAuthoritative(publication)
+            && this.#onIndexPublished !== null) {
+          try {
+            Promise.resolve(this.#onIndexPublished()).catch(() => {});
+          } catch { /* Publication observers cannot change the refresh result. */ }
+        }
       })
       .catch(async (error) => {
         if (this.#cancelRequested) {

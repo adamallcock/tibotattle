@@ -18,6 +18,46 @@ function productionFunction(name) {
   return match[0];
 }
 
+test("copy diagnostics carries the accountless snapshot without inventing legacy authority", async () => {
+  const accountless = {
+    state: "retry_wait", lastAttemptAt: "2026-09-22T12:00:00.000Z",
+    lastSuccessfulSyncAt: null, lastAcceptedAt: null,
+    nextAttemptAt: "2026-09-22T12:01:00.000Z", lastFailureCode: "transient_failure",
+  };
+  const local = { status: "available", journeyPhase: "accountless_active",
+    previewState: "not_observed", queueState: "unavailable",
+    consent: { approved: false, current: false }, signedIn: { observed: false, value: false },
+    pairing: { observed: false, paired: false }, accountless,
+    recentDiagnosticReferences: [{ reference: "TT-ABCDEF", recordedAt: "2026-09-22T12:00:00.000Z" }],
+  };
+  const browser = { journeyPhase: "approved_idle", previewState: "ready",
+    consent: { approved: true, current: true }, signedIn: { observed: true, value: true },
+    pairing: { observed: true, paired: true },
+  };
+  const context = createContext({ localClient: { async contributionDiagnostics() { return local; } },
+    browserContributionDiagnosticState() { return browser; } });
+  runInContext(["collectContributionDiagnostics", "formatContributionDiagnostics"].map(productionFunction).join("\n"), context);
+  const result = await context.collectContributionDiagnostics();
+  assert.equal(result.journeyPhase, "accountless_active");
+  assert.equal(result.consent.approved, false);
+  assert.equal(result.signedIn.observed, false);
+  assert.equal(result.pairing.paired, false);
+  assert.deepEqual(result.accountless, accountless);
+  const copied = context.formatContributionDiagnostics(result);
+  assert.match(copied, /accountless_state: retry_wait/u);
+  assert.match(copied, /accountless_last_attempt_at: 2026-09-22T12:00:00.000Z/u);
+  assert.match(copied, /accountless_last_successful_sync_at: unavailable/u);
+  assert.match(copied, /accountless_last_accepted_at: unavailable/u);
+  assert.match(copied, /accountless_next_attempt_at: 2026-09-22T12:01:00.000Z/u);
+  assert.match(copied, /accountless_last_failure_code: transient_failure/u);
+  assert.match(copied, /diagnostic_reference_1: TT-ABCDEF/u);
+  delete local.accountless;
+  const legacy = await context.collectContributionDiagnostics();
+  assert.equal(legacy.journeyPhase, "approved_idle");
+  assert.equal(Object.hasOwn(legacy, "accountless"), false);
+  assert.doesNotMatch(context.formatContributionDiagnostics(legacy), /accountless_/u);
+});
+
 function deferred() {
   let resolve;
   const promise = new Promise((done) => { resolve = done; });
@@ -110,9 +150,14 @@ function createDisconnectHarness({
     } },
     INCREMENTAL_SYNC_CONTRACT: "telemetry-contribution-v1.0",
     TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION: "telemetry-contribution-v1.1",
+    TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION: "telemetry-contribution-v1.2",
     hasCommunitySession: () => context.communitySession !== null,
     hostedSignInRequired: () => context.communitySession === null,
     keychainPromptSurface: () => "none",
+    // Disconnect/repair tests intentionally omit the performance consent DOM;
+    // its production renderer is an independent surface refreshed alongside
+    // this action state.
+    renderTelemetryPerformanceContribution() {},
     renderCommunityJourney() {},
     approveIncrementalContribution() { state.repairs += 1; },
     forgetLocalizedNode() {},

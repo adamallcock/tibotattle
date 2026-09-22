@@ -169,6 +169,51 @@ describe("server pricing", () => {
     }
   });
 
+  it("prices Sol and Luna through validated client/server contracts at every tier and context boundary", () => {
+    const expected = {
+      "gpt-6-sol": {
+        standard: ["1.399998", "1.4", "2.300004"],
+        batch: ["0.699999", "0.7", "1.150002"],
+        flex: ["0.699999", "0.7", "1.150002"],
+        priority: ["2.799996", "2.8", "4.600008"],
+      },
+      "gpt-6-luna": {
+        standard: ["0.0699999", "0.07", "0.1150002"],
+        batch: ["0.03499995", "0.035", "0.0575001"],
+        flex: ["0.03499995", "0.035", "0.0575001"],
+        priority: ["0.1399998", "0.14", "0.2300004"],
+      },
+    } as const;
+    for (const modelId of ["gpt-6-sol", "gpt-6-luna"] as const) {
+      for (const apiServiceTier of ["standard", "batch", "flex", "priority"] as const) {
+        for (const [index, totalInputContextTokens] of [271_999, 272_000, 272_001].entries()) {
+          const event = validateIngestibleEvent(fixture({
+            modelId, eventTime: "2026-09-22T18:00:00.000Z",
+            billingSurface: "openai_api", apiServiceTier, speedMode: "standard",
+            totalInputContextTokens,
+            components: { ...fixture().components,
+              inputUncachedTokens: totalInputContextTokens - 172_000,
+              inputCacheReadTokens: 100_000, inputCacheWriteTokens: 72_000,
+              outputTextTokens: 40_000, outputReasoningTokens: 60_000,
+            },
+          }));
+          const server = priceTelemetryUsageEvent(event);
+          const local = priceCodexUsageEvent({ model: modelId, timestamp: event.eventTime,
+            totalInputContextTokens, components: event.components,
+          }, { apiServiceTier, priceEpochBasis: "event_time" });
+          expect(server.coverageStatus).toBe("fully_priced");
+          expect(server.exactCostUsd).toBe(expected[modelId][apiServiceTier][index]);
+          expect(server.exactCostUsd).toBe(local.totalUsd);
+          expect(server.selectedPriceCardIds).toEqual(local.selectedPriceCardIds);
+          expect(server.registryVersion).toBe(local.registry?.version);
+          expect(server.registrySha256).toBe(local.registry?.sha256);
+          expect(priceTelemetryUsageEvent({ ...event, eventTime: "2026-09-21T23:59:59.999Z" }).coverageStatus).toBe("unpriced");
+          expect(priceTelemetryUsageEvent({ ...event, totalInputContextTokens: null }).coverageStatus).toBe("unpriced");
+        }
+      }
+    }
+  });
+
   it("uses Astra's API 2x Fast ratio while rejecting missing context and pre-release price epochs", () => {
     const event = validateIngestibleEvent(fixture({
       modelId: "gpt-6-astra", eventTime: "2026-09-03T12:00:00.000Z",
@@ -227,8 +272,8 @@ describe("server pricing", () => {
       }
     }
     expect(checkedAstra).toBe(2);
-    expect(checked - checkedAstra).toBe(26);
-    expect(checked).toBe(28);
+    expect(checked - checkedAstra).toBe(30);
+    expect(checked).toBe(32);
     const provenance: SpeedModeProvenance = "assumed_fast_scenario";
     expect(resolveEffectiveSpeedMode({ unresolvedScenario: "unresolved_as_fast" }).provenance).toBe(provenance);
   });
@@ -271,6 +316,88 @@ describe("server pricing", () => {
         selectedPriceCardIds: priced.selectedPriceCardIds,
       }, item.id).toEqual(item.expected);
     }
+  });
+
+  it("projects only redundant OpenAI combined output at the Worker pricing boundary", () => {
+    const consistent = fixture({
+      components: {
+        ...fixture().components,
+        outputCombinedTokens: 75,
+      },
+    });
+    const consistentBefore = structuredClone(consistent);
+    const withoutAggregate = fixture();
+    expect(priceTelemetryUsageEvent(consistent)).toEqual(priceTelemetryUsageEvent(withoutAggregate));
+    expect(consistent).toEqual(consistentBefore);
+
+    const zeroCombined = fixture({
+      components: {
+        ...fixture().components,
+        outputTextTokens: 0,
+        outputReasoningTokens: 0,
+        outputCombinedTokens: 0,
+      },
+    });
+    const zeroWithoutAggregate = fixture({
+      components: {
+        ...fixture().components,
+        outputTextTokens: 0,
+        outputReasoningTokens: 0,
+        outputCombinedTokens: null,
+      },
+    });
+    expect(priceTelemetryUsageEvent(zeroCombined)).toEqual(priceTelemetryUsageEvent(zeroWithoutAggregate));
+
+    const mismatch = priceTelemetryUsageEvent(fixture({
+      components: {
+        ...fixture().components,
+        outputCombinedTokens: 76,
+      },
+    }));
+    expect(mismatch.coverageStatus).toBe("partially_priced");
+    expect(mismatch.unpricedReasonCodes).toContain("unknown_component");
+
+    const missingSplit = priceTelemetryUsageEvent(fixture({
+      components: {
+        ...fixture().components,
+        outputReasoningTokens: null,
+        outputCombinedTokens: 50,
+      },
+    }));
+    expect(missingSplit.coverageStatus).toBe("partially_priced");
+    expect(missingSplit.unpricedReasonCodes).toContain("unknown_component");
+    expect(missingSplit.unknownBillableUnits).toBe(50);
+
+    const anthropic = validateIngestibleEvent(fixture({
+      provider: "anthropic_claude_code",
+      modelId: "claude-sonnet-4-6",
+      billingSurface: "claude_subscription",
+      speedMode: "standard",
+      apiServiceTier: "unknown",
+      reasoningEffort: "unknown",
+      components: {
+        inputUncachedTokens: 100,
+        inputCacheReadTokens: 900,
+        inputCacheWriteTokens: 0,
+        inputCacheWrite5mTokens: 0,
+        inputCacheWrite1hTokens: 0,
+        outputTextTokens: null,
+        outputReasoningTokens: null,
+        outputCombinedTokens: 75,
+      },
+    }));
+    const anthropicBefore = structuredClone(anthropic);
+    const anthropicWithCombined = priceTelemetryUsageEvent(anthropic);
+    const anthropicWithoutCombined = priceTelemetryUsageEvent({
+      ...anthropic,
+      components: { ...anthropic.components, outputCombinedTokens: null },
+    });
+    expect(anthropicWithCombined).toMatchObject({
+      exactCostUsd: "0.001695",
+      coverageStatus: "fully_priced",
+    });
+    expect(anthropicWithCombined.exactCostUsd).not.toBe(anthropicWithoutCombined.exactCostUsd);
+    expect(anthropic).toEqual(anthropicBefore);
   });
 
   it("rejects unsupported providers instead of pricing them as Anthropic", () => {

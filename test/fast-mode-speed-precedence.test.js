@@ -235,6 +235,8 @@ test("the ratio map holds every registered published Priority model", () => {
     "gpt-5.5": 2.5,
     "gpt-5.4": 2,
     "gpt-6-astra": 2,
+    "gpt-6-sol": 2,
+    "gpt-6-luna": 2,
   });
   // Every ratio is strictly greater than 1x: Fast never costs less quota
   // than Standard, and is never accidentally recorded as 1x (which would

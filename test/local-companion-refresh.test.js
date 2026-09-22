@@ -4745,3 +4745,73 @@ test("quick polling omits reset details only after a successful startup read; de
   assert.equal(typeof classifiersSeen[0].observe, "function");
   assert.equal(typeof classifiersSeen[0].reset, "function");
 });
+
+const PUBLISHED_INDEX_FOR_UPLOAD = Object.freeze({
+  status: "ingested", unchanged: false,
+  generation: {
+    id: 1, fingerprint: `generation-v2-${"a".repeat(64)}`, status: "complete",
+    discoveryComplete: true, diagnosticsComplete: true,
+    usageProvenanceComplete: true, sourceOrderComplete: true,
+    quotaProvenanceComplete: true, toolProvenanceComplete: true,
+  },
+});
+
+test("index publication observer follows validated detailed reload, excluding non-publications", async (t) => {
+  for (const [name, mode, unifiedIndex, expected] of [
+    ["changed detailed", "detailed", PUBLISHED_INDEX_FOR_UPLOAD, 1],
+    ["quick", "quick", PUBLISHED_INDEX_FOR_UPLOAD, 0],
+    ["unchanged", "detailed", { ...PUBLISHED_INDEX_FOR_UPLOAD, unchanged: true }, 0],
+    ["unknown change status", "detailed", { ...PUBLISHED_INDEX_FOR_UPLOAD, unchanged: undefined }, 0],
+    ["failed", "detailed", { status: "failed" }, 0],
+    ["missing descriptor", "detailed", { status: "ingested" }, 0],
+    ["partial", "detailed", { ...PUBLISHED_INDEX_FOR_UPLOAD, generation: {
+      ...PUBLISHED_INDEX_FOR_UPLOAD.generation, status: "partial",
+    } }, 0],
+    ["unproven completeness", "detailed", { ...PUBLISHED_INDEX_FOR_UPLOAD, generation: {
+      ...PUBLISHED_INDEX_FOR_UPLOAD.generation, discoveryComplete: false,
+    } }, 0],
+  ]) {
+    await t.test(name, async () => {
+      let reloaded = false;
+      const observed = [];
+      const controller = new LocalCompanionRefreshController({
+        runner: async () => ({ unifiedIndex }),
+        dataStore: { async reload() { reloaded = true; } },
+        onIndexPublished: (...args) => {
+          assert.equal(reloaded, true);
+          observed.push(args);
+        },
+      });
+      assert.equal(controller.start({ mode }), true);
+      await flushControllerSettlement(controller);
+      assert.equal(observed.length, expected);
+      if (expected) assert.deepEqual(observed, [[]], "no generation identifiers leave observer");
+    });
+  }
+});
+
+test("index publication observer is fenced on failed or cancelled reload and cannot break success", async (t) => {
+  for (const outcome of ["failed_reload", "cancelled_reload", "throwing_observer", "rejecting_observer"]) {
+    await t.test(outcome, async () => {
+      let calls = 0;
+      let controller;
+      controller = new LocalCompanionRefreshController({
+        runner: async () => ({ unifiedIndex: PUBLISHED_INDEX_FOR_UPLOAD }),
+        dataStore: { async reload() {
+          if (outcome === "failed_reload") throw new Error("synthetic reload failure");
+          if (outcome === "cancelled_reload") controller.cancel();
+        } },
+        onIndexPublished: () => {
+          calls += 1;
+          if (outcome === "throwing_observer") throw new Error("synthetic observer failure");
+          return Promise.reject(new Error("synthetic observer rejection"));
+        },
+      });
+      controller.start();
+      await flushControllerSettlement(controller);
+      assert.equal(calls, outcome.endsWith("observer") ? 1 : 0);
+      if (outcome === "cancelled_reload") assert.equal(controller.getStatus().status, "cancelled");
+      if (outcome.endsWith("observer")) assert.equal(controller.getStatus().status, "succeeded");
+    });
+  }
+});

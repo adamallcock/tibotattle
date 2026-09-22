@@ -74,7 +74,7 @@ async function restoredSchemaTransform(root) {
     const require = createRequire(join(root, 'package.json'));
     const result = await require('esbuild').build({
       absWorkingDir: root,
-      stdin: { contents: "export { authorityRoleFinalSchema } from './src/authority-restore-role.ts';",
+      stdin: { contents: "export { authorityRoleFinalSchema } from './src/authority-restore-role.ts'; export { typedEvidenceRestoreFinalSchema } from './src/authority-restore.ts';",
         resolveDir: root, sourcefile: 'typed-schema-transform.ts' },
       bundle: true, packages: 'external', platform: 'node', format: 'cjs',
       write: false, treeShaking: true, metafile: true, logLevel: 'silent',
@@ -88,8 +88,15 @@ async function restoredSchemaTransform(root) {
     module.filename = join(root, '__typed-schema-transform.cjs');
     module.paths = Module._nodeModulePaths(root);
     module._compile(code, module.filename);
-    if (typeof module.exports.authorityRoleFinalSchema !== 'function') fail('RESTORE_SOURCE_INVALID');
-    return { transform: module.exports.authorityRoleFinalSchema,
+    if (typeof module.exports.authorityRoleFinalSchema !== 'function'
+        || typeof module.exports.typedEvidenceRestoreFinalSchema !== 'function') {
+      fail('RESTORE_SOURCE_INVALID');
+    }
+    return {
+      transforms: {
+        legacy: module.exports.authorityRoleFinalSchema,
+        typedEvidence: module.exports.typedEvidenceRestoreFinalSchema,
+      },
       sourceSha256: identityDigest({ bundle: storageSha256(code),
         sources: sources.map(({ relativePath, sha256 }) => ({ relativePath, sha256 })) }) };
   } catch { fail('RESTORE_SOURCE_INVALID'); }
@@ -320,7 +327,7 @@ export async function buildTypedProductionExpectedSchemas({ workerDirectory } = 
         optionalObjects: role === 'primary' ? operatorSchema.objects : [],
       };
       if (role === 'primary') {
-        const transformed = restored.transform(rows);
+        const transformed = restored.transforms.legacy(rows);
         validateSchemaRows(transformed);
         const variants = [storageSchemaDigest(transformed)];
         // Also support the maintained forward extension of a restored role:
@@ -339,6 +346,16 @@ export async function buildTypedProductionExpectedSchemas({ workerDirectory } = 
             variants.push(storageSchemaDigest(transformed.map(row => row.type === 'table' && row.name === addition.name
               ? { ...row, sql: addition.sql } : row)));
           } finally { extensionDb.close(); }
+        }
+        // A correction-bearing source may use the typed-evidence restore
+        // contract. That contract preserves every application table and
+        // applies SQLite's exact final-schema quoting to all table DDL,
+        // including the v1.2 and performance tables that the legacy authority
+        // transform deliberately leaves outside its retained set.
+        if (rows.some(row => row.name.startsWith('telemetry_usage_correction_'))) {
+          const typedEvidence = restored.transforms.typedEvidence(rows);
+          validateSchemaRows(typedEvidence);
+          variants.push(storageSchemaDigest(typedEvidence));
         }
         expectedSchemas.primary.restoredSchemaSha256 = [...new Set(variants)];
       }

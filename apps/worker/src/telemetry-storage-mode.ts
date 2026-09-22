@@ -43,6 +43,38 @@ export async function resolveTelemetryStorageMode(db: D1Database, settings: Stor
   return mode;
 }
 
+/** Successor usage is owned by the isolated typed ingestion deployment.
+ * JSON deployments keep their existing local analytics; advertising or
+ * admitting v1.2 there would create evidence those readers cannot consume. */
+export async function requireTelemetryV12StorageMode(db:D1Database,settings:StorageModeSettings):Promise<void> {
+  if(parseTelemetryStorageMode(settings).kind!=='typed')throw unavailable();
+  await resolveTelemetryStorageMode(db,settings,'v1');
+  await resolveTelemetryStorageMode(db,settings,'v11');
+}
+
+/**
+ * Performance is a separately authorized dialect, but its durable report
+ * tables are deployed only in the typed ingestion environment.  This gate
+ * checks that deployment selection and the performance migration exist; it
+ * deliberately does not read telemetry_v12_runtime or any usage consent row.
+ * The performance policy remains responsible for requiring the runtime to be
+ * active and for checking its exact schema tuple before capability or writes.
+ */
+export async function requireTelemetryPerformanceStorageMode(
+  db: D1Database,
+  settings: StorageModeSettings,
+): Promise<void> {
+  if (parseTelemetryStorageMode(settings).kind !== "typed") throw unavailable();
+  try {
+    const ready = await db.prepare(
+      "SELECT 1 AS ready FROM telemetry_performance_runtime WHERE id = 1",
+    ).first<{ ready: number }>();
+    if (!ready || ready.ready !== 1) throw unavailable();
+  } catch {
+    throw unavailable();
+  }
+}
+
 /** A replay receipt proves complete retained records, not merely a header. */
 export async function readTelemetryV11StorageReplay(db: D1Database, mode: TelemetryStorageMode,
   principal: TelemetryTransportPrincipal, chunk: TelemetryV11Chunk): Promise<TelemetryV11StagedChunkRow | null> {

@@ -1,11 +1,11 @@
 // The backend owns the complete existing claim/step/commit frame.
 // Only the front owns durable Queue publication and acknowledgment.
 import { createStorageMigrationWorker } from './d1-storage-migration-worker.mjs';
-import { STORAGE_RESTORE_STAGES } from './d1-storage-restore-runner.mjs';
+import { STORAGE_RESTORE_STAGES, storageRestoreStages } from './d1-storage-restore-runner.mjs';
 const SCHEMA='d1-storage-private-execution-v1',LIMIT=2048;
 const fail=()=>{throw Error('D1_STORAGE_PRIVATE_EXECUTION_UNCERTAIN');};
 const exact=(value,keys)=>value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).sort().join()===keys.sort().join();
-function wake(value,digest){return exact(value,['schema','contractDigest','stage','steps'])&&value.schema==='d1-storage-restore-wakeup-v1'&&value.contractDigest===digest&&STORAGE_RESTORE_STAGES.includes(value.stage)&&Number.isSafeInteger(value.steps)&&value.steps>=0;}
+function wake(value,digest,stages=STORAGE_RESTORE_STAGES){return exact(value,['schema','contractDigest','stage','steps'])&&value.schema==='d1-storage-restore-wakeup-v1'&&value.contractDigest===digest&&stages.includes(value.stage)&&Number.isSafeInteger(value.steps)&&value.steps>=0;}
 async function boundedJson(stream){
  if(!stream)fail();const reader=stream.getReader(),pieces=[];let total=0;
  try{while(true){const {done,value}=await reader.read();if(done)break;total+=value.byteLength;if(total>LIMIT){await reader.cancel();fail();}pieces.push(value);}}
@@ -36,7 +36,9 @@ export function createStorageMigrationBackend(options){
   }catch{return Response.json({error:'D1_STORAGE_PRIVATE_EXECUTION_UNCERTAIN'},{status:503,headers:{'cache-control':'no-store'}});}
  }};
 }
-export function createStorageMigrationFront({contractDigest,executionDigest,expiresAt,clock=()=>Date.now()}){
+export function createStorageMigrationFront({contractDigest,executionDigest,expiresAt,contractVersion='authority-restore-v1',clock=()=>Date.now()}){
+ if(!['authority-restore-v1','typed-evidence-restore-v1'].includes(contractVersion))fail();
+ const stages=storageRestoreStages({version:contractVersion});
  if(!/^[a-f0-9]{64}$/.test(executionDigest??'')||!/^[a-f0-9]{64}$/.test(contractDigest)||!Number.isSafeInteger(expiresAt))fail();
  const enabled=env=>{if(env.STORAGE_RESTORE_MODE===undefined||env.STORAGE_RESTORE_MODE==='disabled')return false;
   if(env.STORAGE_RESTORE_MODE!=='enabled'||clock()>=expiresAt||typeof env.STORAGE_RESTORE_EXECUTOR?.fetch!=='function'||typeof env.STORAGE_RESTORE_QUEUE?.send!=='function')fail();return true;};
@@ -46,14 +48,14 @@ export function createStorageMigrationFront({contractDigest,executionDigest,expi
   if(response.status!==200||!response.headers.get('content-type')?.startsWith('application/json'))fail();
   const result=await boundedJson(response.body);
   if(!exact(result,['schema','contractDigest','executionDigest','request','next'])||result.schema!==SCHEMA||result.contractDigest!==contractDigest||result.executionDigest!==executionDigest||JSON.stringify(result.request)!==JSON.stringify(request)
-    ||result.next!==null&&!wake(result.next,contractDigest))fail();
-  if(operation==='step'&&result.next!==null&&(result.next.steps!==message.steps+1||![message.stage,STORAGE_RESTORE_STAGES[STORAGE_RESTORE_STAGES.indexOf(message.stage)+1]].includes(result.next.stage)))fail();
+    ||result.next!==null&&!wake(result.next,contractDigest,stages))fail();
+  if(operation==='step'&&result.next!==null&&(result.next.steps!==message.steps+1||![message.stage,stages[stages.indexOf(message.stage)+1]].includes(result.next.stage)))fail();
   if(result.next!==null){if(clock()>=expiresAt)fail();await env.STORAGE_RESTORE_QUEUE.send(result.next);}
  }
  return {fetch:notFound,async scheduled(_controller,env){if(enabled(env))await invoke(env,'wakeup',null);},async queue(batch,env){
   if(!enabled(env))return;
   if(!Array.isArray(batch?.messages)||batch.messages.length!==1)fail();const message=batch.messages[0];
-  if(typeof message.ack!=='function'||!wake(message.body,contractDigest))fail();
+  if(typeof message.ack!=='function'||!wake(message.body,contractDigest,stages))fail();
   await invoke(env,'step',structuredClone(message.body));message.ack();
  }};
 }

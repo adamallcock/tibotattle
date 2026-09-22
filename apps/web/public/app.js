@@ -26,6 +26,7 @@ import {
   demoDashboard,
   isValidQuotaWindowDuration,
   normalizeIncrementalContributionSyncStatus,
+  normalizeTelemetryPerformanceStatus,
   selectAllowancePlanPopulation,
   selectPrimaryCodexQuotaWindow
 } from "./data-client.js";
@@ -66,6 +67,7 @@ import {
   TELEMETRY_PLAN_DISPLAY_NAMES,
   TELEMETRY_PLAN_TYPES,
   TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
+  TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
 } from "./telemetry-shared.generated.js";
 import {
   compact,
@@ -365,6 +367,10 @@ let incrementalSyncStatus = null;
 let attributionContributionReview = null;
 let attributionContributionBusy = false;
 let attributionContributionNotice = null;
+let telemetryPerformanceStatus = null;
+let telemetryPerformanceReview = null;
+let telemetryPerformanceBusy = false;
+let telemetryPerformanceNotice = null;
 // The optional lastOutcome.detail.code the 0.1.2 companion records beside the
 // bare outcome code, so "Last error: device credential unavailable" can be
 // stated instead of an anonymous "run_failed". The bounded normalizer keeps
@@ -11666,6 +11672,18 @@ async function collectContributionDiagnostics() {
   const local = await localClient.contributionDiagnostics();
   const browser = browserContributionDiagnosticState();
   const localAvailable = local?.status === "available";
+  if (localAvailable && local.accountless !== undefined) {
+    return Object.freeze({
+      journeyPhase: local.journeyPhase,
+      previewState: local.previewState,
+      queueState: local.queueState,
+      consent: local.consent,
+      signedIn: local.signedIn,
+      pairing: local.pairing,
+      recentDiagnosticReferences: local.recentDiagnosticReferences,
+      accountless: local.accountless,
+    });
+  }
   return Object.freeze({
     journeyPhase: browser.journeyPhase,
     previewState: browser.previewState === "not_observed" && localAvailable
@@ -11697,6 +11715,17 @@ function formatContributionDiagnostics(value) {
     `pairing_observed: ${value.pairing.observed}`,
     `paired: ${value.pairing.paired}`,
   ];
+  if (value.accountless !== undefined) {
+    const accountless = value.accountless;
+    lines.push(
+      `accountless_state: ${accountless.state}`,
+      `accountless_last_attempt_at: ${accountless.lastAttemptAt ?? "unavailable"}`,
+      `accountless_last_successful_sync_at: ${accountless.lastSuccessfulSyncAt ?? "unavailable"}`,
+      `accountless_last_accepted_at: ${accountless.lastAcceptedAt ?? "unavailable"}`,
+      `accountless_next_attempt_at: ${accountless.nextAttemptAt ?? "unavailable"}`,
+      `accountless_last_failure_code: ${accountless.lastFailureCode ?? "none"}`,
+    );
+  }
   value.recentDiagnosticReferences.forEach((item, index) => {
     lines.push(
       `diagnostic_reference_${index + 1}: ${item.reference} @ ${item.recordedAt}`,
@@ -11772,6 +11801,14 @@ async function loadLocalDashboardSecondaryState({ isCurrent, primaryAvailable })
     () => localClient.contributionSyncStatus(),
     (value) => renderContributionSyncStatus(primaryAvailable ? value : null),
   );
+  const performance = read(
+    () => localClient.telemetryPerformanceStatus(),
+    (value) => {
+      if (value === null) return;
+      telemetryPerformanceStatus = value;
+      renderTelemetryPerformanceContribution();
+    },
+  );
   const preview = read(() => localClient.contributionSyncPreview());
   const consentAndPreview = (async () => {
     // These settled answers prevent duplicate recovery reads. Consent must
@@ -11786,7 +11823,7 @@ async function loadLocalDashboardSecondaryState({ isCurrent, primaryAvailable })
     if (!isCurrent()) return;
     renderContributionSyncPreview(primaryAvailable ? value : null);
   })();
-  await Promise.all([refresh, status, consentAndPreview]);
+  await Promise.all([refresh, status, performance, consentAndPreview]);
 }
 
 /** Mark the first real local-dashboard render for the native shell. */
@@ -12420,17 +12457,6 @@ function startElectronStartupRefresh() {
     return false;
   }
   electronStartupRefreshTriggered = true;
-  // The companion's launch snapshot intentionally defers the unified history
-  // projection. A cold install therefore needs one detailed pass before the
-  // dashboard can claim retained history or accounting. Once a validated
-  // detailed projection is already present, the normal startup observation is
-  // the cheaper quick pass and the Electron controller owns later cadence.
-  const projection = dashboard?.accounting?.projection;
-  const startupRefreshOptions = projection?.status === "available"
-    && projection.reason === null
-    && projection.terminal === false
-    ? {}
-    : { detailed: true };
   const runStartupRefresh = () => {
     if (localActionBusy) {
       // Only the bootstrap owner is guaranteed to call us again after it
@@ -12442,6 +12468,26 @@ function startElectronStartupRefresh() {
       }
       return;
     }
+    // Quick quota observations and accounting-cache generation do not advance
+    // the unified index. Use its persisted publication time so repeated short
+    // launches cannot keep old usage unindexed indefinitely. Match the host's
+    // hourly detailed cadence; unknown/future evidence cannot prove freshness.
+    // Evaluate after any startup barrier or dashboard lock has cleared.
+    const projection = dashboard?.accounting?.projection;
+    const history = dashboard?.timeline?.history;
+    const generatedAt = history?.generatedAt;
+    const generatedMs = typeof generatedAt === "string" ? Date.parse(generatedAt) : NaN;
+    const ageMs = Date.now() - generatedMs;
+    const freshIndex = projection?.status === "available"
+      && projection.reason === null
+      && projection.terminal === false
+      && dashboard.accounting.generationMatched === true
+      && history?.source === "unified_local_index"
+      && ["complete", "partial"].includes(history.status)
+      && Number.isFinite(generatedMs)
+      && new Date(generatedMs).toISOString() === generatedAt
+      && ageMs >= 0 && ageMs < 60 * 60_000;
+    const startupRefreshOptions = freshIndex ? {} : { detailed: true };
     void requestRefresh(startupRefreshOptions);
   };
   const macSmokeBridge = globalThis.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__;
@@ -13785,7 +13831,7 @@ function renderCommunityJourney() {
 const INCREMENTAL_SYNC_CONTRACT = "telemetry-contribution-v1.0";
 
 function attributionContributionSelected() {
-  return incrementalSyncStatus?.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION;
+  return [TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION].includes(incrementalSyncStatus?.contractVersion);
 }
 
 function renderAttributionContribution() {
@@ -13801,12 +13847,24 @@ function renderAttributionContribution() {
   const repair = incrementalUploadAuthorityLost() || contributionDeviceDisconnectPaused();
   const repairRequired = approved && incrementalSyncStatus?.pausedReason === "device_repair_required";
   const button = $("#attribution-review-open");
-  button.hidden = approved && !repair;
+  button.hidden = approved && !repair && (!incrementalSyncStatus?.attributionUpgradeAvailable
+    || incrementalSyncStatus.attributionUpgradeVersion === incrementalSyncStatus.contractVersion);
   button.disabled = busy || contributionDisconnectOutcome === "cleanup_pending";
   setLocalizedText(button, repairRequired ? "consent.repairConnection" : "attributionConsent.review");
-  setLocalizedText($("#attribution-consent-description"), repairRequired
-    ? "consent.repairRequired" : approved ? "attributionConsent.approved" : "attributionConsent.description");
   const review = attributionContributionReview;
+  const successor = (review?.consent.telemetrySchemaVersion
+    ?? incrementalSyncStatus?.attributionUpgradeVersion
+    ?? incrementalSyncStatus?.contractVersion) === TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION;
+  const copy = successor ? "continuityConsent" : "attributionConsent";
+  setLocalizedText($("#attribution-consent-title"), `${copy}.title`);
+  setLocalizedText($("#attribution-review-title"), `${copy}.reviewTitle`);
+  setLocalizedText($("#attribution-consent-confirm-label"), `${copy}.confirm`);
+  setLocalizedText($("#attribution-consent-approve"), `${copy}.approve`);
+  setLocalizedText($("#attribution-review-privacy"), `${copy}.privacy`);
+  const selectedApproved = approved && (!successor
+    || incrementalSyncStatus?.contractVersion === TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION);
+  setLocalizedText($("#attribution-consent-description"), repairRequired
+    ? "consent.repairRequired" : `${copy}.${selectedApproved ? "approved" : "description"}`);
   const details = $("#attribution-review");
   details.hidden = review === null;
   if (review !== null) {
@@ -13898,7 +13956,8 @@ async function openAttributionContributionReview() {
         return;
       }
     }
-    attributionContributionReview = await localClient.reviewAttributionContribution();
+    attributionContributionReview = await localClient.reviewAttributionContribution(
+      incrementalSyncStatus?.attributionUpgradeVersion ?? incrementalSyncStatus?.contractVersion);
     attributionContributionNotice = null;
     $("#attribution-review").hidden = false;
     $("#attribution-review-title").focus();
@@ -13924,11 +13983,12 @@ async function approveAttributionContribution() {
     // the upload device credential. The local approval verifies the grant.
     await communityClient.grantAttributionContribution(review);
     const result = await localClient.approveAttributionContribution(review);
-    if (result?.status !== "approved" || result.contractVersion !== TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION) {
+    if (result?.status !== "approved" || result.contractVersion !== review.consent.telemetrySchemaVersion) {
       throw new Error("Attribution approval did not finish.");
     }
     attributionContributionReview = null;
-    attributionContributionNotice = "attributionConsent.approved";
+    attributionContributionNotice = review.consent.telemetrySchemaVersion === TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION
+      ? "continuityConsent.approved" : "attributionConsent.approved";
     await loadIncrementalSyncStatus();
     scheduleIncrementalSyncStatusPoll({ reset: true });
   } catch {
@@ -13938,6 +13998,118 @@ async function approveAttributionContribution() {
     attributionContributionNotice = "attributionConsent.approvalIncomplete";
   } finally {
     attributionContributionBusy = false;
+    renderContributionActionState();
+  }
+}
+
+function telemetryPerformanceAvailable() {
+  return telemetryPerformanceStatus?.configured === true
+    && JSON.stringify(telemetryPerformanceStatus.supportedSpeedMethods)
+      === JSON.stringify(["receipt", "tool_free"]);
+}
+
+function renderTelemetryPerformanceContribution() {
+  const surface = $("#performance-consent");
+  if (!surface) return;
+  const available = telemetryPerformanceAvailable();
+  surface.hidden = !available;
+  if (!available) return;
+  const approved = telemetryPerformanceStatus?.consent?.approved === true
+    && telemetryPerformanceStatus.consent.current === true;
+  const busy = telemetryPerformanceBusy || contributionDisconnectBusy
+    || contributionDisconnectDialogOpen();
+  const reviewButton = $("#performance-review-open");
+  reviewButton.hidden = approved;
+  reviewButton.disabled = busy;
+  const state = $("#performance-consent-state");
+  setLocalizedText(state, approved ? "performanceConsent.approved" : "performanceConsent.notApproved");
+  setLocalizedText($("#performance-consent-description"), approved
+    ? "performanceConsent.approvedDescription" : "performanceConsent.description");
+  const review = telemetryPerformanceReview;
+  $("#performance-review").hidden = review === null;
+  if (review !== null) {
+    setLocalizedText($("#performance-review-destination"), "performanceConsent.destination", {
+      destination: review.binding.destinationOrigin,
+    });
+    setRawText($("#performance-review-contract"), [
+      review.binding.methodVersion,
+      review.binding.fieldDictionaryVersion,
+      review.binding.privacyContractVersion,
+      review.binding.supportedSpeedMethods.join(", "),
+    ].join(" · "));
+    setLocalizedText($("#performance-review-sample"), "performanceConsent.sample", {
+      day: review.sample.day,
+    });
+  }
+  $("#performance-consent-confirm").disabled = busy;
+  $("#performance-consent-approve").disabled = busy || review === null
+    || !$("#performance-consent-confirm").checked || hostedSignInRequired();
+  $("#performance-review-cancel").disabled = busy;
+  const status = $("#performance-consent-status");
+  const key = telemetryPerformanceNotice
+    ?? (review !== null && hostedSignInRequired() ? "consent.signInFirst" : null);
+  status.hidden = key === null;
+  if (key !== null) setLocalizedText(status, key);
+  const syncLine = $("#performance-sync-status");
+  if (approved && telemetryPerformanceStatus?.scheduler?.state !== "off") {
+    setLocalizedText(syncLine, "performanceConsent.syncing", {
+      state: telemetryPerformanceStatus.scheduler.state,
+    });
+    syncLine.hidden = false;
+  } else {
+    syncLine.hidden = true;
+    forgetLocalizedNode(syncLine);
+    syncLine.textContent = "";
+  }
+}
+
+async function loadTelemetryPerformanceStatus() {
+  telemetryPerformanceStatus = await localClient.telemetryPerformanceStatus();
+  renderTelemetryPerformanceContribution();
+}
+
+async function openTelemetryPerformanceReview() {
+  if (telemetryPerformanceBusy || contributionDisconnectBusy
+      || contributionDisconnectDialogOpen() || !telemetryPerformanceAvailable()) return;
+  telemetryPerformanceBusy = true;
+  telemetryPerformanceReview = null;
+  telemetryPerformanceNotice = "performanceConsent.reviewing";
+  $("#performance-consent-confirm").checked = false;
+  renderTelemetryPerformanceContribution();
+  try {
+    telemetryPerformanceReview = await localClient.reviewTelemetryPerformance();
+    telemetryPerformanceNotice = null;
+    $("#performance-review").hidden = false;
+    $("#performance-review-title").focus();
+  } catch {
+    telemetryPerformanceNotice = "performanceConsent.reviewUnavailable";
+  } finally {
+    telemetryPerformanceBusy = false;
+    renderTelemetryPerformanceContribution();
+  }
+}
+
+async function approveTelemetryPerformance() {
+  const review = telemetryPerformanceReview;
+  if (review === null || telemetryPerformanceBusy || contributionDisconnectBusy
+      || contributionDisconnectDialogOpen() || !$("#performance-consent-confirm").checked
+      || hostedSignInRequired()) return;
+  telemetryPerformanceBusy = true;
+  telemetryPerformanceNotice = "performanceConsent.approving";
+  renderTelemetryPerformanceContribution();
+  try {
+    await ensureAttributionHostedSession();
+    await communityClient.grantTelemetryPerformanceContribution(review);
+    const result = await localClient.approveTelemetryPerformance(review);
+    if (result?.status !== "approved") throw new Error("Performance approval did not finish.");
+    telemetryPerformanceReview = null;
+    telemetryPerformanceNotice = "performanceConsent.approvedDescription";
+    await loadTelemetryPerformanceStatus();
+  } catch {
+    telemetryPerformanceReview = null;
+    telemetryPerformanceNotice = "performanceConsent.approvalIncomplete";
+  } finally {
+    telemetryPerformanceBusy = false;
     renderContributionActionState();
   }
 }
@@ -14118,6 +14290,7 @@ function renderIncrementalConsent() {
   renderIncrementalSyncStatusLine();
   renderIncrementalSyncRetry();
   renderAttributionContribution();
+  renderTelemetryPerformanceContribution();
 }
 
 /**
@@ -15485,6 +15658,21 @@ $("#attribution-review-cancel")?.addEventListener("click", () => {
   $("#attribution-consent-confirm").checked = false;
   renderAttributionContribution();
   $("#attribution-review-open").focus();
+});
+$("#performance-review-open")?.addEventListener("click", () => {
+  void openTelemetryPerformanceReview();
+});
+$("#performance-consent-confirm")?.addEventListener("change", renderTelemetryPerformanceContribution);
+$("#performance-consent-approve")?.addEventListener("click", () => {
+  void approveTelemetryPerformance();
+});
+$("#performance-review-cancel")?.addEventListener("click", () => {
+  if (telemetryPerformanceBusy) return;
+  telemetryPerformanceReview = null;
+  telemetryPerformanceNotice = null;
+  $("#performance-consent-confirm").checked = false;
+  renderTelemetryPerformanceContribution();
+  $("#performance-review-open").focus();
 });
 $("#incremental-sync-retry").addEventListener("click", () => {
   void runIncrementalSyncNow();

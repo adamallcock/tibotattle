@@ -102,14 +102,15 @@ for runtime and resource limits.
 
 ## Model performance timing in development source
 
-Opening **Model performance** (`#performance`) enables an independent worker
+Opening **Model performance** (`#performance`) or running a separately authorized
+daily-performance delivery enables an independent worker
 for the selected Codex home's plain `.jsonl` session and archived-session files.
 This diagnostic population spans accounts on this device. It reads timestamps,
-allowlisted model metadata, token counters, and response/turn boundaries to
+allowlisted model and speed-mode metadata, token counters, and response/turn boundaries to
 reconstruct timing; raw content and raw IDs are never persisted or returned.
 Compressed-only histories and missing timing remain unavailable.
 
-Reads renew a 60-second page lease. Discovery is capped at 50,000 entries;
+Page reads and daily-report requests renew a 60-second lease. Discovery is capped at 50,000 entries;
 scan passes target at most 32 MiB or 750 ms, checking between chunks of at most
 two 2-MiB reads per source (original timing and supplemental throughput). It
 pauses 250 ms during history collection and five seconds after catching up.
@@ -120,8 +121,10 @@ unknown activity, tools, steering, ambiguous tokens, or incomplete evidence
 excludes a turn. Full-turn duration includes initial waiting; TTFT is never
 subtracted. Output speed uses response timing when available, otherwise an eligible
 supplemental full-turn estimate. Each turn is counted once; the display discloses
-the fallback count and its inclusion of initial waiting. It does not feed accounting, contribution,
-or network requests. Failures preserve available saved evidence with its
+the fallback count and its inclusion of initial waiting. It does not feed accounting.
+Only the separately authorized performance scheduler can project and send its
+content-free daily histograms; opening the page does not grant sharing consent.
+Failures preserve available saved evidence with its
 stale/unavailable state. Windows remains unavailable until its protected-state
 adapter is qualified. These are source behavior, not installed-release proof.
 
@@ -133,9 +136,9 @@ owner-only permissions. Important entries include:
 | State | Purpose | Retention behavior |
 | --- | --- | --- |
 | `local-unified-index-v1.sqlite` plus device salt | Canonical replay-safe Codex usage/quota/tool projection and source provenance. | Accumulates locally; the 30-day UI horizon is not retention. |
-| `inference-timing-v2/model-performance-snapshot.json` | At most four rolling-period and eight exact-window completed timing projections, fixed model IDs and numeric bins; 4 MiB owner-only, schema/digest-checked v4 envelope bound to the configured Codex source. | Uses the same atomic snapshot transport as Overview. Earlier independent-distribution receipts are preserved and refused until valid per-turn reconstruction produces a v4 replacement. Restored measurements keep their observation date while background scanning runs or fails; incomplete scans cannot replace them. First result saves immediately, then hourly, with latest completed results flushed on clean shutdown. |
-| `inference-timing-v2/source-<Codex-home digest>/timing-experiment.sqlite` (development source) | Separate owner-only timing sidecar: one row per completed turn, counts/durations/coverage, local HMAC keys, source cursors and bounded pending state. No raw content or IDs. | Maximum 256 MiB per selected source; method/SQLite user version 2. The legacy unscoped sidecar is preserved without reading or migrating its unknown source provenance; first use rebuilds measurements from retained source logs. Incompatible stores, including version 1, are preserved and refused. Display periods do not delete evidence or migrate the accounting index. |
-| `inference-timing-v2/source-<Codex-home digest>/tool-free-v1/timing-experiment.sqlite` (development source) | Independent supplement for reconciled single-response turns without tools, plus its own source cursors and bounded scalar pending state. Shares the original private timing correlation key for local joins only. | Maximum 256 MiB; SQLite user version 3. Original version-2 data is preserved. An incompatible or unavailable supplement does not hide original measurements. |
+| `inference-timing-v2/model-performance-snapshot.json` | At most eight rolling period/mode and eight exact-window completed timing projections, fixed model IDs and numeric bins; 4 MiB owner-only, schema/digest-checked v5 envelope bound to the configured Codex source. | Uses the same atomic snapshot transport as Overview. Earlier mixed-mode receipts are preserved and refused until mode-separated reconstruction produces a v5 replacement. Unknown and mixed-mode turns are excluded from both selectable modes. Restored measurements keep their observation date while background scanning runs or fails; incomplete scans cannot replace them. First result saves immediately, then hourly, with latest completed results flushed on clean shutdown. |
+| `inference-timing-v2/source-<Codex-home digest>/timing-experiment.sqlite` (development source) | Separate owner-only timing sidecar: one row per completed turn, counts/durations/coverage, local HMAC keys, source cursors and bounded pending state. No raw content or IDs. | Maximum 256 MiB per selected source; parser method 2 and SQLite user version 4. The forward migration retains existing TPS/TTFT, adds nullable completion/mode fields and source revision counters, and fences older writers. The legacy unscoped sidecar is preserved without reading or migrating its unknown source provenance; first use rebuilds measurements from retained source logs. Incompatible stores, including version 1, are preserved and refused. Display periods do not delete evidence or migrate the accounting index. |
+| `inference-timing-v2/source-<Codex-home digest>/tool-free-v1/timing-experiment.sqlite` (development source) | Independent supplement for reconciled single-response turns without tools, plus its own source cursors and bounded scalar pending state. Shares the original private timing correlation key for local joins only. | Maximum 256 MiB; parser method 3 and SQLite user version 5. Its forward migration preserves previous supplement measurements and fences older writers; the original primary store remains separate. An incompatible or unavailable supplement does not hide original measurements. |
 | `local-collector-state-v1.sqlite` | App-server quota observations, checkpoints, dedupe, locks, and replay-safe collector state. | Accumulates until explicit local erase or a reviewed migration/retention workflow. |
 | `private/` settings/handoff state | Automatic/incremental contribution settings, bounded OAuth restart handle, fast-mode preference, and speed baselines. | Settings persist; the OAuth handle expires and is bounded. |
 | Prepared contribution/review directories and queue | Exact local review, delivery, retry, and audit state. | Retained for replay-safe completion, explicit cleanup, or local erase. |
@@ -288,6 +291,36 @@ Accepted v0.2 history keeps its existing analytical source. Until a compatible
 replacement adapter exists, this history blocks the stronger-format upgrade
 before consent or admission-floor changes; disjoint dates do not make it safe
 to hide the old source. No local or hosted history is deleted by this refusal.
+
+### Continuity successor and daily performance (source implementation)
+
+V1.2 adds nullable turn-start/preceding-compaction bits, ordering among events
+with the same session and timestamp, and reported five-minute/one-hour cache
+write subdivisions. Unknown evidence stays null. The subdivisions reconcile to
+the existing cache-write total and never add usage. Continuity before the
+server-issued activation instant remains unreported. Current cache calculations
+remain unchanged. Social sharing requires an exact new field review, hosted
+grant and local approval; accountless sharing negotiates a distinct policy grant
+while respecting the existing durable opt-out. Legacy clients retain their own
+closed contracts. Installing the source does not activate the hosted runtime.
+
+The separately authorized performance stream contains daily distributions and
+counts by provider, model, reasoning effort, measurement method, event-time
+speed mode/evidence source and API tier. It covers eligible TPS, first-token
+time and complete-turn duration, including tool waits where qualified. Missing
+measurements remain unavailable. It sends fixed histogram counts and bounded
+integer summaries, not turn identifiers, prompts, responses or timestamps for
+individual turns. Compatible reports are pooled as reported samples: ordinary
+retry/revision deduplication does not remove copied history across devices.
+
+Usage and performance have separate capabilities, consent/policy tuples,
+progress, retry and storage state. Usage authorization never grants performance
+permission. Performance delivery and application composition are still qualified
+independently in the [implementation plan](../plans/2026-09-20-turn-boundary-telemetry-plan.md).
+The source includes owner erasure for both streams and a typed restore role that
+preserves grants, report revisions and correction history. Populated synthetic
+restore/erasure checks do not establish a production migration or deletion-ledger
+reconciliation. Opt-out stops future uploads and retains accepted history.
 
 ## Network destinations
 

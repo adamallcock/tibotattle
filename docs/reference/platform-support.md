@@ -1,29 +1,30 @@
 ---
 title: Platform support and qualification
-date: 2026-09-13
+date: 2026-09-22
 type: reference
 status: maintained
 ---
 
 # Platform support and qualification
 
-The released Electron application is **0.1.22** across four distribution
+The released Electron application is **0.1.23** across four distribution
 targets: macOS Apple silicon, macOS Intel, Windows x64 and Linux x64. See
 [current status](../current-status.md) for exact source, release and hosted
-boundaries, and the [public release manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.22/release-manifest.json)
+boundaries, and the [public release manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.23/release-manifest.json)
 for the final artifact assurances.
 
 ## Status matrix
 
 | Platform | Current distribution | Proven final-artifact boundary | Acceptance limits |
 |---|---|---|---|
-| macOS 14+ arm64 | Supported; 0.1.22 DMG | Developer ID signing, notarization/stapling, Gatekeeper and clean-install smoke for the exact artifact | Retained native/Electron upgrade receipts apply to 0.1.21, not 0.1.22 |
-| macOS 14+ x86_64 | Supported; separate 0.1.22 Intel DMG | Separate native trust and clean-install smoke for the exact artifact | Remaining physical/manual Intel observations explicitly accepted by the owner, not recorded as passed |
-| Windows x64 | Released; 0.1.22 signed installer | Authenticode signing, timestamp and clean-install smoke for the exact artifact | Remaining physical desktop/update/notification acceptance explicitly accepted by the owner; credential persistence and hosted enrollment were not requalified by that journey |
-| Linux x86_64 | Released; 0.1.22 AppImage | Exact artifact integrity; updater metadata bound to the AppImage | Owner accepted remaining physical desktop/lifecycle qualification; manifest clean-install assurance remains false and native trust scheme is none |
+| macOS 14+ arm64 | Supported; 0.1.23 DMG | Developer ID signing, notarization/stapling, Gatekeeper and clean-install smoke for the exact artifact | Retained native/Electron upgrade receipts apply to 0.1.21, not 0.1.23 |
+| macOS 14+ x86_64 | Supported; separate 0.1.23 Intel DMG | Separate native trust and clean-install smoke for the exact artifact | Remaining physical/manual Intel observations explicitly accepted by the owner, not recorded as passed |
+| Windows x64 | Released; 0.1.23 signed installer | Authenticode signing, timestamp and clean-install smoke for the exact artifact | Remaining physical desktop/update/notification acceptance explicitly accepted by the owner; credential persistence and hosted enrollment were not requalified by that journey |
+| Linux x86_64 | Released; 0.1.23 AppImage | Exact artifact integrity; updater metadata bound to the AppImage | Owner accepted remaining physical desktop/lifecycle qualification; manifest clean-install assurance remains false and native trust scheme is none |
 
-These owner decisions apply to the named Electron release workstream. They do
-not fabricate physical test results or declare other platforms supported.
+These owner decisions apply only to the named published release. They do not
+carry forward to 0.1.24, fabricate physical test results, or declare other
+platforms supported.
 Windows ARM, Linux ARM64 and unlisted operating-system/package variants are not
 covered. The four targets share an application source; they retain distinct
 installer, trust, credential and desktop-integration evidence.
@@ -51,9 +52,9 @@ binding, credential protection or update integrity.
 ## macOS
 
 Both published Mac installers require macOS 14 or later and use bundle version
-`1029`. Their signed clean-install evidence is linked from
+`1030`. Their signed clean-install evidence is linked from
 [current status](../current-status.md#published-electron-release). Retained
-production-upgrade receipts qualify 0.1.21 and are not reused for 0.1.22.
+production-upgrade receipts qualify 0.1.21 and are not reused for 0.1.23.
 The incoming native Sparkle transition and the outgoing Electron updater are
 separate paths. Installing the current app transfers compatible retained local
 state; users should not need to preserve an old app bundle manually.
@@ -68,14 +69,14 @@ for subsequent versions.
 
 ## Windows
 
-The public 0.1.22 installer is signed and timestamped. Its clean-install
+The public 0.1.23 installer is signed and timestamped. Its clean-install
 normal journey confirms installation, normal local processing, uninstall and
 owned cleanup. Earlier synthetic credential and portability tests remain
 useful within their recorded scope; they do not establish continuity of an
 existing user's credentials in a later installer. Physical update replacement
 and notification appearance remain accepted user-testing limits.
 
-The 0.1.22 **model-performance page is unavailable on Windows**. That is a
+The 0.1.23 **model-performance page is unavailable on Windows**. That is a
 released-feature boundary, not a statement that the normal Windows application
 or local usage processing is unavailable. The successor source enables the
 protected timing reader. Exact-head clean and warm native Windows qualification
@@ -85,7 +86,7 @@ and the unsigned packaged Electron normal journey passed for source
 [Windows model-performance plan](../plans/2026-09-13-windows-model-performance.md)
 records that source qualification. A signed final installer, installed/update
 lifecycle evidence and publication remain separate gates for the next release;
-the source result does not change the published 0.1.22 artifact.
+the source result does not change the published 0.1.23 artifact.
 
 ## Linux
 
@@ -102,4 +103,4 @@ this release on unavailable hardware tests.
 Update this declaration from exact release evidence and explicit acceptance.
 Do not infer current support from an open pull request, development build,
 screenshot or old receipt. Every future release requires its own frozen source,
-artifacts and qualification; current 0.1.22 publication does not satisfy them.
+artifacts and qualification; current 0.1.23 publication does not satisfy them.

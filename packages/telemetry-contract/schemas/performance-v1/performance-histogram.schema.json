@@ -1,0 +1,242 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://tibotattle.com/schemas/telemetry-performance-v1/performance-histogram.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "metric",
+    "sampleCount",
+    "buckets",
+    "min",
+    "max"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "performance-histogram-v1"
+    },
+    "metric": {
+      "enum": [
+        "speed",
+        "ttft",
+        "turnDuration"
+      ]
+    },
+    "sampleCount": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "buckets": {
+      "type": "object",
+      "additionalProperties": false,
+      "propertyNames": {
+        "pattern": "^(?:0|[1-9]\\d?)$"
+      },
+      "patternProperties": {
+        "^(?:0|[1-9]\\d?)$": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "min": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      ]
+    },
+    "max": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "metric": {
+            "const": "speed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "buckets": {
+            "propertyNames": {
+              "pattern": "^(?:0|[1-9]|[1-5]\\d|60)$"
+            }
+          },
+          "min": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              }
+            ]
+          },
+          "max": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "metric": {
+            "const": "ttft"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "buckets": {
+            "propertyNames": {
+              "pattern": "^(?:0|[1-9]|[1-4]\\d|5[0-7])$"
+            }
+          },
+          "min": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              }
+            ]
+          },
+          "max": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "metric": {
+            "const": "turnDuration"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "buckets": {
+            "propertyNames": {
+              "pattern": "^(?:[1-9]|[1-4]\\d|5[0-7])$"
+            }
+          },
+          "min": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            ]
+          },
+          "max": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "sampleCount": {
+            "const": 0
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "buckets": {
+            "maxProperties": 0
+          },
+          "min": {
+            "const": null
+          },
+          "max": {
+            "const": null
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "sampleCount": {
+            "minimum": 1
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "buckets": {
+            "minProperties": 1
+          },
+          "min": {
+            "type": "integer"
+          },
+          "max": {
+            "type": "integer"
+          }
+        }
+      }
+    }
+  ],
+  "$comment": "Speed bins are half-open [0,2), [2,4), through [118,120), with overflow >=120 tokens/second; TTFT has [0,1ms), [1,500ms), logarithmic upper-exclusive bins through the final edge, and overflow at or above that edge; turnDuration uses the same positive millisecond bins and never occupies bucket 0. Runtime additionally requires sparse bucket counts to sum to sampleCount, non-empty extrema to be ordered and occupied-bin compatible, singleton TTFT extrema to be equal, singleton speed extrema to differ by at most one centi-TPS, and metric-specific units to match the selected bucket scheme."
+}

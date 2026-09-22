@@ -185,7 +185,7 @@ async function loadedCheckpoint(key:StorageHistoryKey):Promise<StorageV11History
  let cursor:StorageHistoryLoadCursor|undefined;
  for(;;){const loaded=await loadStorageHistoryCheckpoint({target:b.STORAGE_ANALYTICS_DB,key,cursor});
   if(loaded.status==='deferred'){cursor=loaded.cursor;continue;}
-  if(loaded.status!=='ready'||!('source'in loaded.checkpoint))throw new Error('synthetic v1.1 checkpoint unavailable');
+  if(loaded.status!=='ready'||!('source'in loaded.checkpoint)||loaded.checkpoint.source!=='v1.1')throw new Error('synthetic v1.1 checkpoint unavailable');
   return loaded.checkpoint;
  }
 }

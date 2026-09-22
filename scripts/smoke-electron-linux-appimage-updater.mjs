@@ -334,6 +334,7 @@ function makeAppAdapter({ root, version, configPath, profile, cache, marker }) {
   let quitCalled = false;
   const app = {
     version,
+    getVersion() { return version; },
     name: "TiboTattle",
     isPackaged: true,
     appUpdateConfigPath: configPath,

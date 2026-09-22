@@ -76,6 +76,16 @@ site.
 | `GET` | `/api/v1/device/sync/state` | Native app | Device | Reads the device's v1 incremental cursor/admission state. | Contribution sync |
 | `GET` | `/api/v1/device/sync/manifest` | Native app | Device | Reads a bounded date-range manifest of accepted incremental chunks. | Contribution sync |
 | `GET` | `/api/v1/device/sync-capabilities` | Native app | Device | Reads accepted formats, exact v1.1 grant, write floor/revision and authenticated enrollment/destination binding; never creates consent. | Contribution sync |
+| `GET` | `/api/v1/device/sync-capabilities-v1.2` | Contribution client | Device | Read independent successor lifecycle, exact consent and server-issued activation instant; never grant authority. | Contribution telemetry |
+| `POST` | `/api/v1/me/device-telemetry-v12-consents` | Contribution client | Session | Grant the exact v1.2 contract for one reviewed device. | Contribution telemetry |
+| `GET`, `POST` | `/api/v1/device/telemetry/v1.2/day-manifests` | Contribution client | Device | Read or register bounded immutable successor manifests and staged chunk receipts. | Contribution telemetry |
+| `POST` | `/api/v1/me/telemetry-v12/domain-predecessor` | Contribution client | Device | Pin a complete mixed-client predecessor for successor activation. | Contribution telemetry |
+| `POST` | `/api/v1/me/telemetry-v12/domain-activate` | Contribution client | Device | Activate a complete proven successor domain under the pinned predecessor. | Contribution telemetry |
+| `POST` | `/api/v1/accountless/telemetry-v1.2-authorization` | Contribution client | Device | Record the independent accountless successor policy for the current enrollment and device. | Contribution telemetry |
+| `POST` | `/api/v1/accountless/telemetry-performance-authorization` | Contribution client | Device | Record the independent accountless performance policy for the current enrollment and device. | Contribution telemetry |
+| `GET` | `/api/v1/device/telemetry/performance/capabilities` | Contribution client | Device | Read the separate daily-performance capability and authorization. | Contribution telemetry |
+| `POST` | `/api/v1/me/device-telemetry-performance-consents` | Contribution client | Session | Grant separate performance consent to a reviewed device. | Contribution telemetry |
+| `GET`, `POST` | `/api/v1/device/telemetry/performance/reports` | Contribution client | Device | Read bounded report revisions or admit an encrypted daily histogram report; preserve ordinary replay and replacement semantics. | Contribution telemetry |
 | `POST` | `/api/v1/me/device-telemetry-consents` | Participant browser | Session | Records explicit current v1.1 consent for the selected device and raises the persisted participant write floor. | Contribution consent |
 | `GET`, `POST` | `/api/v1/device/telemetry/v1.1/day-manifests` | Native app | Device | Reads a bounded date-range candidate inventory, or registers/replays one immutable day manifest and reports exact staged chunks; no analytical activation. | Contribution sync |
 | `POST` | `/api/v1/me/telemetry-v11/domain-predecessor` | Native app | Device | Issues a bounded source-pinned bootstrap/successor token, with null predecessor for first cutover. | Contribution sync |
@@ -227,7 +237,7 @@ is never an arbitrary local proxy.
 | `GET` | `/api/local/overview` | Dashboard | Loopback read | Reads the current derived overview snapshot. | Local companion |
 | `GET` | `/api/local/cache-drop-thread-links` | Local dashboard only | Same-origin custom-header read | Ephemeral, generation-bound names and Codex thread IDs for recent cache-drop rows; no query parameters, persistence, or export. | Local companion |
 | `POST` | `/api/local/work-usage/query` | Local dashboard only | Same-origin custom-header read; closed 4 KiB JSON | Cancellable, read-only project/worktree/thread reports over a pinned index; optional canonical ISO `endAt` pins the selected period and rejects older snapshot substitution; bounded process-local snapshots with closed `touch` lease renewal, per-thread model/component breakdowns and transient display metadata; optional `search` (at most 100 characters) finds project/task names before pagination while preserving global share denominators; optional `sourceSnapshotId` anchors related period/scope queries to an available report and its canonical generation; no export. During revalidation an available saved reply has `retained`, `refreshing`, `namesAvailable` and a separate `refreshSnapshotId`; saved figures retain their original bounds and have no paging cursor. Names survive document reload only in process memory; durable snapshots contain anonymous usage figures. | Local reporting |
-| `GET` | `/api/local/model-performance` | Model performance page | Loopback read | Requires one `period` value: `1`, `7`, `30`, or `all`; optional canonical ISO `endAt` pins exact rolling bounds (never a future instant); returns schema-4/method-5 bounded local timing aggregates, including tool-free fallback estimates in Output speed with one sample per turn, restores validated saved measurements before starting work, and renews an independent background scan lease. No accounting or network effect. | Local timing |
+| `GET` | `/api/local/model-performance` | Model performance page | Loopback read | Requires one `period` value: `1`, `7`, `30`, or `all`; optional canonical ISO `endAt` pins exact rolling bounds (never a future instant); optional `speedMode=standard|fast` (default `standard`) filters before aggregation; returns schema-5/method-5 bounded local timing aggregates, with the selected `speedMode` and period-scoped `excludedUnknownTurns`, including tool-free fallback estimates in Output speed with one sample per turn, restores validated saved measurements before starting work, and renews an independent background scan lease. No accounting or network effect. | Local timing |
 | `GET` | `/api/local/gradient` | Dashboard | Loopback read | Reads the derived cost/quota gradient. | Local analysis |
 | `GET` | `/api/local/weekly` | Dashboard | Loopback read | Reads derived weekly capacity and pace evidence. | Local analysis |
 | `GET` | `/api/local/weekly-pace-outlook` | Native shell | Loopback read | Reads the bounded account-scoped weekly pace presentation projection. | Local analysis |
@@ -245,6 +255,10 @@ is never an arbitrary local proxy.
 | `POST` | `/api/local/contribution/sync-inspect-exact` | Dashboard | Loopback mutation | Verifies the exact next payload and issues a short-lived, single-use local review token. | Contribution sync |
 | `GET` | `/api/local/contribution/incremental-status` | Dashboard | Loopback read | Reads v1 incremental consent/cursor/retry state. | Contribution sync |
 | `POST` | `/api/local/contribution/incremental-review-v11` | Dashboard | Loopback mutation | Capability-gated v1.1 field/sample review with a one-use token bound to the published index, consent triple and destination. Does not upload or grant hosted consent. | Contribution consent |
+| `POST` | `/api/local/contribution/incremental-review-v12` | Dashboard | Loopback mutation | Capability-gated v1.2 field/sample review with a one-use token bound to the published index, consent triple and destination. Does not upload or grant hosted consent. | Contribution consent |
+| `GET` | `/api/local/performance/status` | Dashboard | Loopback read | Independent daily-performance consent and synchronization status. | Performance consent |
+| `POST` | `/api/local/performance/review` | Dashboard | Loopback mutation | Review the independent histogram stream and bind a one-use token to the device, destination, dictionary and measurement methods. | Performance consent |
+| `POST` | `/api/local/performance/approve` | Dashboard | Loopback mutation | Verify the explicit review token and fresh hosted grant before enabling daily-performance delivery. | Performance consent |
 | `POST` | `/api/local/contribution/incremental-approve` | Dashboard | Loopback mutation | Records current consent after exact local review and schedules the first due pass. | Contribution sync |
 | `POST` | `/api/local/contribution/incremental-run` | Dashboard | Loopback mutation | Resets bounded retry backoff and asks the consent-gated controller to run now. | Contribution sync |
 
@@ -302,6 +316,8 @@ from request data, and keeps provider callbacks off loopback.
 | `POST` | `/api/v1/logout` |
 | `POST` | `/api/v1/me/device-pairings` |
 | `POST` | `/api/v1/me/device-telemetry-consents` |
+| `POST` | `/api/v1/me/device-telemetry-v12-consents` |
+| `POST` | `/api/v1/me/device-telemetry-performance-consents` |
 
 ## Native bridge
 
@@ -336,7 +352,7 @@ one fixed IPC channel. Its refresh subset is dashboard-frame-only:
 | Installed Electron agent protocol v1 | TiboTattle plugin | Runs the packaged companion through Electron's retained Node mode with four closed commands and one bounded JSON result. No arbitrary path, SQL, command, refresh, setting or upload input. |
 | Codex app-server | Local collector | Spawns the local `codex app-server` binary and uses bounded JSON-RPC for account, rate-limit, and usage evidence. No provider credential is copied into documentation or telemetry. |
 | Claude status line | Explicit standalone callback hook to local broker | Bounded JSON input through the managed callback/socket boundary; content-free status projection only. It is not an installed-app API. |
-| Model performance worker | Page-leased local controller | Independent, bounded Codex timing scan and aggregate snapshots; no accounting or contribution input. Stops after 60 seconds without a page reader. |
+| Model performance worker | Local controller leased by page reads or separately authorized daily-report requests | Independent, bounded Codex timing scan, local snapshots and content-free performance histograms; no accounting input. Completes its requested history pass, then stops after the 60-second idle lease. |
 | R7 benchmark worker | Protected release-evidence generator | Bounded JSON request on stdin and one stable JSON result on stdout. It is not a routine documentation gate and may read private local corpus evidence. |
 | Local companion ready line | Native launcher | One `USAGE_MONITOR_READY` line containing the loopback URL after bind; stdout is not a general API. |
 

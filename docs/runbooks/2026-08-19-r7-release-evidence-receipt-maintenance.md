@@ -113,6 +113,14 @@ without changing product verification, resource limits, or retrying until a
 sample passes. A sampler change invalidates prior workload-source provenance
 and requires the complete protected regeneration, not partial receipt reuse.
 
+Export-set materialization holds one destination lease across its chunk and
+manifest pairs. The producer pins the shared transaction directory until the
+operation ends, removes completed per-pair directories, and then removes the
+empty shared directory. Interrupted journals remain available to recovery.
+This prevents normal chunk publication from deleting and recreating a directory
+while the sampler is traversing it; the sampler still rejects changed directory
+identities. Standalone pair publication and recovery retain their own cleanup.
+
 Symlink refusals distinguish an unapproved basename, a different owner, fewer
 than one link, and more than two links using fixed outcome labels. These labels
 never include paths, targets or owner identifiers. They do not broaden the

@@ -7,15 +7,46 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { modelPerformanceProjection } from '../src/reporting/index.js';
 import { createModelPerformanceController } from '../apps/local/model-performance-controller.js';
-import { createModelPerformanceSnapshotStore } from '../apps/local/model-performance-snapshots.js';
+import { createModelPerformanceSnapshotStore, isModelPerformanceSnapshot } from '../apps/local/model-performance-snapshots.js';
 import { modelPerformanceSupplementDirectory } from '../apps/local/model-performance-worker.js';
 import { createWindowsFilesystemAdapter, loadWindowsSourceReadBinding } from '../src/platform/windows-filesystem.js';
 import { createWindowsSyntheticOwnedSource } from '../scripts/lib/windows-synthetic-source-owner.mjs';
 
 const NOW = Date.parse('2026-09-09T12:00:00Z'), DAY = 86400000;
-const row = (patch = {}) => ({ at: NOW, model: 'gpt-5.6-sol', sample_method: 'receipt',
+const row = (patch = {}) => ({ at: NOW, speed_mode: 'standard', model: 'gpt-5.6-sol', sample_method: 'receipt',
   sample_tokens: 100, sample_duration: 1000, sample_responses: 1, sample_total_responses: 2,
   ttft: 5000, ...patch });
+test('GPT-6 Sol and Luna retain separate model generations and observed speed modes', () => {
+  const rows = ['sol', 'luna'].flatMap(name => [
+    row({ model: `gpt-5.6-${name}`, sample_tokens: 100 }),
+    row({ model: `gpt-6-${name}`, sample_tokens: 200 }),
+    row({ model: `gpt-6-${name}`, speed_mode: 'fast', sample_tokens: 300 }),
+    row({ model: `gpt-6-${name}`, speed_mode: 'unknown' }),
+    row({ model: `gpt-6-${name}-unreviewed`, sample_tokens: 99999 }),
+  ]);
+  const standard = modelPerformanceProjection(rows, { now: NOW });
+  const fast = modelPerformanceProjection(rows, { now: NOW, speedMode: 'fast' });
+  assert.equal(isModelPerformanceSnapshot(standard), true);
+  assert.equal(isModelPerformanceSnapshot(fast), true);
+  assert.equal(standard.models.length, 4);
+  assert.equal(fast.models.length, 2);
+  assert.equal(standard.excludedUnknownTurns, 2);
+  assert.equal(fast.excludedUnknownTurns, 2);
+  for (const [name, label] of [['sol', 'Sol'], ['luna', 'Luna']]) {
+    const prior = standard.models.find(model => model.id === `gpt-5.6-${name}`);
+    const current = standard.models.find(model => model.id === `gpt-6-${name}`);
+    assert.equal(prior.label, label);
+    assert.equal(current.label, `GPT-6 ${label}`);
+    assert.equal(prior.turns, 1);
+    assert.equal(current.turns, 1);
+    assert.equal(prior.speed[0].points[0].median, 100);
+    assert.equal(current.speed[0].points[0].median, 200);
+    assert.equal(fast.models.find(model => model.id === current.id).speed[0].points[0].median, 300);
+    const mislabeled = structuredClone(standard);
+    mislabeled.models.find(model => model.id === current.id).label = label;
+    assert.equal(isModelPerformanceSnapshot(mislabeled), false);
+  }
+});
 test('Windows supplemental timing store avoids the primary guard ancestors', () => {
   const timingRoot = join('/state', 'inference-timing-v2');
   const directory = join(timingRoot, 'source-0123456789abcdef');
@@ -117,7 +148,7 @@ test('all history uses bounded weekly bins and excludes missing or invalid sampl
 test('history scan progress is explicit and fails closed', () => {
   const historyProgress = { checked: 629, total: 9026 };
   const result = modelPerformanceProjection([], { now: NOW, historyProgress });
-  assert.equal(result.schemaVersion, 4);
+  assert.equal(result.schemaVersion, 5);
   assert.equal(result.method, 5);
   assert.equal(result.historyProgress, historyProgress);
   for (const invalid of [
@@ -143,6 +174,27 @@ test('controller is lazy, coalesces reads, retains good snapshots on failure, an
   await c.close(); assert.equal((await c.read('all')).status, 'unavailable');
   await assert.rejects(c.read('90'));
 });
+test('source revision invalidation drops a cached completion until replay publishes replacement', async () => {
+  class FakeWorker extends EventEmitter {
+    unref() {}
+    postMessage(message) { if (message.type === 'stop') queueMicrotask(() => this.emit('exit', 0)); }
+  }
+  let worker;
+  const c = createModelPerformanceController({ directory: 'unused', codexHome: 'unused',
+    workerFactory: () => worker = new FakeWorker() });
+  try {
+    await c.read('all');
+    const complete = modelPerformanceProjection([row()], { now: NOW });
+    worker.emit('message', { type: 'snapshots', revision: '0', values: [complete] });
+    assert.equal((await c.read('all')).models[0].turns, 1);
+    worker.emit('message', { type: 'invalidate', revision: '1' });
+    const rebuilding = await c.read('all');
+    assert.equal(rebuilding.status, 'loading');
+    assert.deepEqual(rebuilding.models, []);
+    worker.emit('message', { type: 'snapshots', revision: '1', values: [complete] });
+    assert.equal((await c.read('all')).models[0].turns, 1);
+  } finally { await c.close(); }
+});
 class BlockedWorker extends EventEmitter {
   unref() {}
   postMessage(message) {
@@ -163,9 +215,9 @@ async function snapshotFixture(t) {
   let worker;
   const create = patch => createModelPerformanceController({ ...options,
     workerFactory: () => worker = new BlockedWorker(), ...patch });
-  const complete = ['1', '7', '30', 'all'].map(period => modelPerformanceProjection([row()], {
-    now: NOW, period, historyProgress: { checked: 1, total: 1 },
-  }));
+  const complete = ['1', '7', '30', 'all'].flatMap(period => ['standard', 'fast'].map(speedMode => modelPerformanceProjection([row({ speed_mode: speedMode })], {
+    now: NOW, period, speedMode, historyProgress: { checked: 1, total: 1 },
+  })));
   const initial = create();
   assert.equal((await initial.read('all')).status, 'loading');
   worker.emit('message', { type: 'snapshots', values: complete });
@@ -191,6 +243,23 @@ test('saved complete measurements are immediately available after restart with a
     assert.ok(!disk.includes(fixture.options.directory));
   } finally { await controller.close(); }
 });
+test('GPT-6 Sol and Luna performance snapshots survive restart without merging older generations', async t => {
+  const fixture = await snapshotFixture(t);
+  let controller = fixture.create();
+  const latest = modelPerformanceProjection(['sol', 'luna'].flatMap(name => [
+    row({ model: `gpt-5.6-${name}` }), row({ model: `gpt-6-${name}`, sample_tokens: 200 }),
+  ]), { now: NOW + DAY });
+  try {
+    await controller.read('all');
+    fixture.worker().emit('message', { type: 'snapshots', values: [latest] });
+    await controller.close();
+    controller = fixture.create();
+    const restored = await controller.read('all');
+    assert.equal(restored.status, 'ready');
+    assert.deepEqual(restored.models, latest.models);
+    assert.equal(restored.models.length, 4);
+  } finally { await controller.close(); }
+});
 test('combined speed and its fallback subset persist when an additive refresh fails', async t => {
   const fixture = await snapshotFixture(t);
   let controller = fixture.create();
@@ -206,7 +275,7 @@ test('combined speed and its fallback subset persist when an additive refresh fa
     await controller.close();
     controller = fixture.create();
     let result = await controller.read('all');
-    assert.equal(result.schemaVersion, 4);
+    assert.equal(result.schemaVersion, 5);
     assert.equal(result.method, 5);
     assert.equal(result.models[0].speedTurns, 2);
     assert.equal(result.models[0].speed[0].points[0].n, 2);
@@ -226,7 +295,7 @@ test('saved pinned windows restore only their exact period and end independently
   const fixture = await snapshotFixture(t);
   const endAt = new Date(NOW).toISOString(), collectedAt = new Date(NOW + 60_000).toISOString();
   const pinned = { ...modelPerformanceProjection([row(), row()], { period: '1', now: NOW, rolling: true }),
-    updatedAt: collectedAt, requestKey: `1:${NOW}` };
+    updatedAt: collectedAt, requestKey: `1:standard:${NOW}` };
   let controller = fixture.create();
   try {
     assert.equal((await controller.read('1', { endAt })).status, 'loading');
@@ -246,13 +315,13 @@ test('saved pinned windows restore only their exact period and end independently
     assert.equal(other.status, 'loading');
     assert.equal(other.end, NOW - 1);
     assert.deepEqual(other.models, []);
-    fixture.worker().emit('message', { type: 'snapshots', values: [{ ...pinned, requestKey: `1:${NOW - 1}` }] });
+    fixture.worker().emit('message', { type: 'snapshots', values: [{ ...pinned, requestKey: `1:standard:${NOW - 1}` }] });
     const rejected = await controller.read('1', { endAt });
     assert.equal(rejected.stale, true);
     assert.equal(rejected.models[0].turns, 2, 'mismatched worker window cannot replace the saved value');
   } finally { await controller.close(); }
 });
-test('pinned retained cache is bounded to eight exact windows plus four live periods', async t => {
+test('pinned retained cache is bounded to eight exact windows plus eight live period/mode pairs', async t => {
   const fixture = await snapshotFixture(t);
   let controller = fixture.create();
   try {
@@ -261,15 +330,15 @@ test('pinned retained cache is bounded to eight exact windows plus four live per
       await controller.read('1', { endAt: new Date(end).toISOString() });
       fixture.worker().emit('message', { type: 'snapshots', values: [{
         ...modelPerformanceProjection([row({ at: end })], { period: '1', now: end, rolling: true }),
-        updatedAt: new Date(NOW).toISOString(), requestKey: `1:${end}`,
+        updatedAt: new Date(NOW).toISOString(), requestKey: `1:standard:${end}`,
       }] });
     }
     await controller.close();
     const receipt = JSON.parse(await readFile(fixture.file, 'utf8'));
-    assert.equal(receipt.schemaVersion, 'local-model-performance-snapshot-v4');
-    assert.equal(receipt.snapshot.values.length, 12);
+    assert.equal(receipt.schemaVersion, 'local-model-performance-snapshot-v5');
+    assert.equal(receipt.snapshot.values.length, 16);
     assert.equal(receipt.snapshot.values.filter(value => Object.hasOwn(value, 'requestKey')).length, 8);
-    assert.equal(receipt.snapshot.values.some(value => value.requestKey === `1:${NOW}`), false);
+    assert.equal(receipt.snapshot.values.some(value => value.requestKey === `1:standard:${NOW}`), false);
     controller = fixture.create();
     assert.equal((await controller.read('1', { endAt: new Date(NOW - 8 * DAY).toISOString() })).models[0].turns, 1);
     assert.equal((await controller.read('1', { endAt: new Date(NOW).toISOString() })).status, 'loading');
@@ -281,12 +350,12 @@ test('pinned cache receipts reject mismatched keys and rolling bounds even with 
   let controller = fixture.create();
   await controller.read('1', { endAt });
   fixture.worker().emit('message', { type: 'snapshots', values: [{
-    ...modelPerformanceProjection([row()], { period: '1', now: NOW, rolling: true }), requestKey: `1:${NOW}`,
+    ...modelPerformanceProjection([row()], { period: '1', now: NOW, rolling: true }), requestKey: `1:standard:${NOW}`,
   }] });
   await controller.close();
   const saved = await readFile(fixture.file, 'utf8');
   for (const change of [
-    value => { value.requestKey = `1:${NOW - 1}`; },
+    value => { value.requestKey = `1:standard:${NOW - 1}`; },
     value => { value.start++; },
   ]) {
     const receipt = JSON.parse(saved);
@@ -426,7 +495,7 @@ test('old independent-distribution receipts are preserved until combined samples
     fixture.worker().emit('message', { type: 'snapshots', values: fixture.complete });
   } finally { await controller.close(); }
   const rebuilt = JSON.parse(await readFile(fixture.file, 'utf8'));
-  assert.equal(rebuilt.schemaVersion, 'local-model-performance-snapshot-v4');
+  assert.equal(rebuilt.schemaVersion, 'local-model-performance-snapshot-v5');
   assert.deepEqual(rebuilt.snapshot.values, fixture.complete);
 });
 test('source changes, corrupted receipts and incompatible schemas fail closed without waiting for the worker', async t => {
@@ -438,6 +507,7 @@ test('source changes, corrupted receipts and incompatible schemas fail closed wi
     value => JSON.stringify({ ...JSON.parse(value), schemaVersion: 'future' }),
     value => JSON.stringify({ ...JSON.parse(value), schemaVersion: 'local-model-performance-snapshot-v2' }),
     value => JSON.stringify({ ...JSON.parse(value), schemaVersion: 'local-model-performance-snapshot-v3' }),
+    value => JSON.stringify({ ...JSON.parse(value), schemaVersion: 'local-model-performance-snapshot-v4' }),
     value => JSON.stringify({ ...JSON.parse(value), digest: '0'.repeat(64) }),
     value => {
       const envelope = JSON.parse(value);
@@ -451,6 +521,9 @@ test('source changes, corrupted receipts and incompatible schemas fail closed wi
         for (const model of value.models) { delete model.toolFreeTurns; delete model.toolFree; }
       },
       value => { value.schemaVersion = 3; value.method = 4; },
+      value => { value.schemaVersion = 4; delete value.speedMode; delete value.excludedUnknownTurns; },
+      value => { value.speedMode = 'mixed'; },
+      value => { value.excludedUnknownTurns = -1; },
       value => { value.models[0].toolFreeTurns = value.models[0].turns + 1; },
       value => { value.models[0].speedTurns = 0; },
       value => { value.models[0].ttftTurns = 0; },
@@ -535,7 +608,7 @@ test('missing timing capability returns unavailable with bounded worker retry', 
       const result = await controller.read(period);
       assert.deepEqual(Object.keys(result).sort(), [
         'schemaVersion', 'method', 'status', 'collecting', 'stale', 'updatedAt',
-        'period', 'interval', 'start', 'end', 'historyProgress', 'models',
+        'period', 'speedMode', 'excludedUnknownTurns', 'interval', 'start', 'end', 'historyProgress', 'models',
       ].sort());
       assert.equal(result.status, 'unavailable');
       assert.equal(result.collecting, false);
@@ -558,6 +631,7 @@ test('actual worker persists separate Codex sources and preserves the unscoped l
   const at = Date.now() - 5000, thread = 'synthetic-session', turn = 'synthetic-turn';
   const rec = (n, type, payload) => ({ timestamp: new Date(at + n).toISOString(), type, payload });
   const rows = [rec(0, 'session_meta', { id: thread }),
+    rec(0, 'event_msg', { type: 'thread_settings_applied', thread_settings: { service_tier: 'default' } }),
     rec(0, 'event_msg', { type: 'task_started', turn_id: turn }),
     rec(0, 'turn_context', { turn_id: turn, model: 'gpt-5.6-sol', effort: 'high' }),
     rec(1000, 'event_msg', { type: 'item_completed', thread_id: thread, turn_id: turn,
@@ -570,6 +644,17 @@ test('actual worker persists separate Codex sources and preserves the unscoped l
   const sourceContent = rows.map(r => JSON.stringify(r)).join('\n') + '\n';
   if (process.platform === 'win32') createWindowsSyntheticOwnedSource(sourcePath, sourceContent);
   else await writeFile(sourcePath, sourceContent);
+  for (const [name, serviceTier, tokens] of [['fast', 'priority', 900], ['unknown', null, 5000]]) {
+    const others = JSON.parse(JSON.stringify(rows).replaceAll('synthetic-turn', `synthetic-${name}-turn`)
+      .replaceAll('synthetic-session', `synthetic-${name}-session`).replaceAll('synthetic-response', `synthetic-${name}-response`));
+    others.find(r => r.payload.type === 'thread_settings_applied').payload.thread_settings.service_tier = serviceTier;
+    const usage = others.find(r => r.type === 'token_usage_record').payload;
+    usage.usage.output_tokens = tokens; usage.turn_token_usage.output_tokens = tokens;
+    const file = join(codexHome, 'sessions', `${name}.jsonl`);
+    const content = others.map(r => JSON.stringify(r)).join('\n') + '\n';
+    if (process.platform === 'win32') createWindowsSyntheticOwnedSource(file, content);
+    else await writeFile(file, content);
+  }
   const options = { directory: join(root, 'timing'), codexHome };
   // The native Windows timing store requires an owner-only directory. A
   // Node-created child of the runner temp root can inherit a broader DACL.
@@ -615,8 +700,18 @@ test('actual worker persists separate Codex sources and preserves the unscoped l
       }
     }
     let result = await readReady(controller);
-    assert.equal(result.schemaVersion, 4);
-    assert.deepEqual(result.historyProgress, { checked: 1, total: 1 });
+    assert.equal(result.schemaVersion, 5);
+    assert.deepEqual(result.historyProgress, { checked: 3, total: 3 });
+    assert.equal(result.excludedUnknownTurns, 1);
+    for (const period of ['1', '7', '30', 'all']) for (const speedMode of ['standard', 'fast']) {
+      const snapshot = await controller.read(period, { speedMode });
+      assert.equal(snapshot.status, 'ready');
+      assert.equal(snapshot.speedMode, speedMode);
+      assert.equal(snapshot.excludedUnknownTurns, 1);
+      assert.equal(snapshot.models[0].turns, 1);
+      assert.equal(snapshot.models[0].speed[0].points[0].median, speedMode === 'standard' ? 100 : 900);
+      assert.equal(snapshot.models[0].speed[0].points[0].p90, null);
+    }
     assert.equal(result.models[0].speed[0].points[0].median, 100);
     assert.equal(result.models[0].ttft[0].median, .2);
     assert.equal(result.models[0].turns, 1);
@@ -672,4 +767,123 @@ test('controller caches each exact reporting window independently and rejects ma
     await assert.rejects(controller.read('1', { endAt: '2026-09-10' }), /invalid_timing_window/);
     await assert.rejects(controller.read('1', { endAt: new Date(Date.now() + DAY).toISOString() }), /invalid_timing_window/);
   } finally { await controller.close(); }
+});
+
+test('standard and sparse fast evidence have independent counts and distributions', () => {
+  const rows = [100, 200, 300, 400, 500].map(sample_tokens => row({ sample_tokens }));
+  rows.push(row({ speed_mode: 'fast', sample_tokens: 900, ttft: 50 }),
+    row({ speed_mode: 'fast', sample_tokens: 1100, ttft: 150 }),
+    row({ speed_mode: 'unknown', sample_tokens: 99999 }),
+    row({ speed_mode: undefined }), row({ speed_mode: 'mixed' }),
+    row({ speed_mode: 'unknown', model: 'unknown-model' }));
+  const standard = modelPerformanceProjection(rows, { now: NOW });
+  const fast = modelPerformanceProjection(rows, { now: NOW, speedMode: 'fast' });
+  assert.equal(standard.speedMode, 'standard');
+  assert.equal(fast.speedMode, 'fast');
+  for (const value of [standard, fast]) assert.equal(value.excludedUnknownTurns, 3);
+  assert.deepEqual([standard.models[0].turns, standard.models[0].speedTurns,
+    standard.models[0].ttftTurns, standard.models[0].timedResponses], [5, 5, 5, 5]);
+  assert.equal(standard.models[0].speed[0].points[0].median, 300);
+  assert.equal(standard.models[0].speed[0].points[0].p90, 460);
+  assert.deepEqual([fast.models[0].turns, fast.models[0].speedTurns,
+    fast.models[0].ttftTurns, fast.models[0].timedResponses], [2, 2, 2, 2]);
+  assert.equal(fast.models[0].ttft[0].median, .1);
+  assert.deepEqual(fast.models[0].speed[0].points[0], {
+    at: Math.floor(NOW / DAY) * DAY, n: 2, median: 1000,
+    p10: null, p25: null, p75: null, p90: null,
+  });
+  assert.throws(() => modelPerformanceProjection(rows, { now: NOW, speedMode: 'unknown' }));
+});
+test('mode-specific history bounds exclude other modes and unknowns without hiding unknown coverage', () => {
+  const rows = [row({ at: NOW - 500 * DAY }),
+    row({ speed_mode: 'fast', at: NOW - DAY }),
+    row({ speed_mode: 'unknown', at: NOW - 600 * DAY }),
+    row({ speed_mode: 'unknown', at: NOW }),
+    row({ speed_mode: 'unknown', at: NOW + 1 })];
+  const standard = modelPerformanceProjection(rows, { now: NOW });
+  const fast = modelPerformanceProjection(rows, { now: NOW, speedMode: 'fast' });
+  assert.equal(standard.interval, 'week'); assert.equal(standard.start, NOW - 500 * DAY);
+  assert.equal(fast.interval, 'day'); assert.equal(fast.start, NOW - DAY);
+  assert.equal(fast.excludedUnknownTurns, 2);
+  const recent = modelPerformanceProjection(rows, { now: NOW, period: '7' });
+  assert.deepEqual(recent.models, []); assert.equal(recent.excludedUnknownTurns, 1);
+  const unknownOnly = modelPerformanceProjection(rows.filter(r => r.speed_mode === 'unknown'), { now: NOW });
+  assert.equal(unknownOnly.start, null); assert.deepEqual(unknownOnly.models, []);
+  assert.equal(unknownOnly.excludedUnknownTurns, 2);
+});
+
+test('mode isolation survives persisted live and pinned snapshots, failure, and restart', async t => {
+  const fixture = await snapshotFixture(t);
+  const endAt = new Date(NOW).toISOString();
+  let controller = fixture.create();
+  try {
+    const values = ['standard', 'fast'].flatMap((speedMode, index) => {
+      const snapshot = modelPerformanceProjection(Array.from({ length: index + 2 }, () => row({ speed_mode: speedMode })),
+        { period: '1', now: NOW, speedMode, rolling: true });
+      return [snapshot, { ...snapshot, requestKey: `1:${speedMode}:${NOW}` }];
+    });
+    for (const speedMode of ['standard', 'fast']) {
+      await controller.read('1', { speedMode, endAt });
+    }
+    fixture.worker().emit('message', { type: 'snapshots', values });
+    for (let pass = 0; pass < 2; pass++) {
+      for (const [index, speedMode] of ['standard', 'fast'].entries()) for (const pinned of [false, true]) {
+        const result = await controller.read('1', { speedMode, ...(pinned ? { endAt } : {}) });
+        assert.equal(result.models[0].turns, index + 2);
+        assert.equal(result.speedMode, speedMode);
+      }
+      await controller.close();
+      controller = fixture.create();
+    }
+    await controller.read('1');
+    fixture.worker().emit('error', new Error('synthetic failure'));
+    for (const speedMode of ['standard', 'fast']) {
+      const result = await controller.read('1', { speedMode, endAt });
+      assert.equal(result.stale, true);
+      assert.equal(result.speedMode, speedMode);
+      assert.equal(result.models[0].turns, speedMode === 'standard' ? 2 : 3);
+    }
+    await assert.rejects(controller.read('1', { speedMode: 'mixed' }), /invalid_timing_speed_mode/u);
+  } finally { await controller.close(); }
+});
+test('tool-free fallback and unknown coverage respect mode and exact rolling boundaries', () => {
+  const start = NOW - DAY;
+  const rows = [row({ speed_mode: 'fast', sample_duration: null, tool_free_tokens: 1000, tool_free_duration: 1000 }),
+    row({ at: start, speed_mode: 'mixed' }), row({ at: start - 1, speed_mode: 'unknown' }),
+    row({ speed_mode: 'other' }), row({ at: NOW + 1, speed_mode: 'unknown' }), row()];
+  const fast = modelPerformanceProjection(rows, { now: NOW, period: '1', rolling: true, speedMode: 'fast' });
+  const standard = modelPerformanceProjection(rows, { now: NOW, period: '1', rolling: true });
+  assert.equal(fast.excludedUnknownTurns, 2); assert.equal(standard.excludedUnknownTurns, 2);
+  assert.equal(fast.models[0].toolFreeTurns, 1); assert.equal(fast.models[0].speed[0].points[0].median, 1000);
+  assert.equal(standard.models[0].toolFreeTurns, 0); assert.equal(standard.models[0].speed[0].points[0].median, 100);
+});
+
+test('unseparated prior snapshots remain untouched until mode-qualified measurements rebuild', async t => {
+  const fixture = await snapshotFixture(t);
+  const envelope = JSON.parse(await readFile(fixture.file, 'utf8'));
+  envelope.schemaVersion = 'local-model-performance-snapshot-v4';
+  envelope.snapshot.values = envelope.snapshot.values.filter(value => value.speedMode === 'standard').map(value => {
+    const { speedMode, excludedUnknownTurns, ...old } = value;
+    return { ...old, schemaVersion: 4 };
+  });
+  envelope.digest = createHash('sha256').update(JSON.stringify(envelope.snapshot)).digest('hex');
+  const saved = JSON.stringify(envelope);
+  await writeFile(fixture.file, saved);
+  let controller = fixture.create();
+  try {
+    for (const speedMode of ['standard', 'fast']) {
+      const result = await controller.read('all', { speedMode });
+      assert.equal(result.status, 'loading');
+      assert.deepEqual(result.models, []);
+    }
+  } finally { await controller.close(); }
+  assert.equal(await readFile(fixture.file, 'utf8'), saved);
+  controller = fixture.create();
+  try {
+    await controller.read('all');
+    fixture.worker().emit('message', { type: 'snapshots', values: fixture.complete });
+  } finally { await controller.close(); }
+  const rebuilt = JSON.parse(await readFile(fixture.file, 'utf8'));
+  assert.equal(rebuilt.schemaVersion, 'local-model-performance-snapshot-v5');
+  assert.deepEqual(rebuilt.snapshot.values, fixture.complete);
 });

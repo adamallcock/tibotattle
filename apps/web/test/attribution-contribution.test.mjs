@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createContext, runInContext } from "node:vm";
 import test from "node:test";
-import { telemetryV11FieldInventory } from "../../../src/contribution/index.js";
+import { telemetryV11FieldInventory, telemetryV12FieldInventory } from "../../../src/contribution/index.js";
 import { normalizeAttributionContributionReview, normalizeIncrementalContributionSyncStatus, CommunityClient } from "../public/data-client.js";
 import { WEB_MESSAGES, translate } from "../public/localization.js";
 
@@ -42,6 +42,7 @@ function harness({ accepted = true, selected = false, signedIn = true, localFail
   const context = createContext({
     $: element, document: { createElement: () => node() },
     TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION: inventory.consent.telemetrySchemaVersion,
+    TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION: "telemetry-contribution-v1.2",
     incrementalSyncStatus: repairRequired ? repairStatus(selected) : { ...(selected ? { contractVersion: inventory.consent.telemetrySchemaVersion,
       consent: { approved: true, current: true } } : {}),
       ...(accepted ? { attributionUpgradeAvailable: true } : {}) },
@@ -54,6 +55,10 @@ function harness({ accepted = true, selected = false, signedIn = true, localFail
     contributionDisconnectBlocksRepair: () => false, hostedSignInRequired: () => !signedIn,
     incrementalSyncCapabilityAdvertised: () => true, keychainPromptSurface: () => "none",
     hasCommunitySession: () => signedIn,
+    // This harness exercises attribution/repair only.  The production action
+    // renderer now also refreshes the independent performance surface; keep
+    // that unrelated surface inert here rather than requiring its DOM fixture.
+    renderTelemetryPerformanceContribution() {},
     forgetLocalizedNode() {},
     formatNumber: String, setRawText: (target, value) => { target.textContent = value; },
     setLocalizedText: (target, key, values = {}) => { target.textContent = translate(key, values, state.locale); },
@@ -277,4 +282,33 @@ test("all attribution approval copy has explicit English, Chinese and Spanish me
     assert.equal(WEB_MESSAGES[key]?.length, 3, key);
     assert.ok(WEB_MESSAGES[key].every((message) => message.length > 0), key);
   }
+});
+
+test("successor review is exact and an approved v1.1 client can review the v1.2 upgrade", async () => {
+  const inventory = telemetryV12FieldInventory();
+  const source = { ...payload(), schemaVersion: "local-incremental-contribution-review-v1.2", inventory,
+    consent: { ...inventory.consent, destinationOrigin: "https://telemetry.example" } };
+  const review = normalizeAttributionContributionReview(source);
+  assert.equal(review.consent.telemetrySchemaVersion, "telemetry-contribution-v1.2");
+  assert.ok(review.inventory.fields.usage.includes("boundaryFlags"));
+  assert.equal(normalizeAttributionContributionReview({ ...source, consent: payload().consent }), null);
+  const { context, element } = harness({ selected: true });
+  context.incrementalSyncStatus.attributionUpgradeVersion = "telemetry-contribution-v1.2";
+  context.renderAttributionContribution();
+  assert.equal(element("#attribution-review-open").hidden, false);
+});
+
+
+test("v1.2 review names continuity fields and preserves missing evidence and cache semantics", () => {
+  const { context, element } = harness({ selected: true });
+  context.incrementalSyncStatus.attributionUpgradeVersion = "telemetry-contribution-v1.2";
+  context.renderAttributionContribution();
+  assert.match(element("#attribution-consent-title").textContent, /Turn boundaries/u);
+  assert.match(element("#attribution-consent-description").textContent, /new review and approval/u);
+  assert.match(element("#attribution-consent-confirm-label").textContent, /turn and cache details/u);
+  assert.match(element("#attribution-review-privacy").textContent, /before activation remain unknown/u);
+  assert.match(element("#attribution-review-privacy").textContent, /do not add tokens or change current cache calculations/u);
+  context.incrementalSyncStatus.attributionUpgradeVersion = undefined;
+  context.renderAttributionContribution();
+  assert.equal(element("#attribution-consent-title").textContent, "Separate account and plan evidence");
 });

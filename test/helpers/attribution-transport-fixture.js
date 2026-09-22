@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   parseTelemetryV11DayManifest, parseTelemetryV11DomainManifest, telemetryV11RequiredConsent,
+  parseTelemetryV12DayManifest, parseTelemetryV12DomainManifest, telemetryV12RequiredConsent,
 } from "@app-usagemonitor/telemetry-contract";
 import { ensureContributionDeviceCapability } from "../../src/contribution-device-capability.js";
 import {
@@ -29,7 +30,8 @@ export async function createAttributionFixtureDevice(stateFile, origin = ATTRIBU
 
 /** In-memory protocol fixture. Crypto and hosted-route suites test their own
  * implementations; this fixture asserts exact local integration requests. */
-export function createAttributionFixtureService({ accepted = true, granted = true,
+export function createAttributionFixtureService({ accepted = true, granted = true, successor = false,
+  activationTime = "2026-08-01T12:00:00.500Z",
   fromDay = ATTRIBUTION_FIXTURE_DAY, throughDay = ATTRIBUTION_FIXTURE_DAY } = {}) {
   const manifests = new Map();
   const envelopes = new Map();
@@ -37,7 +39,15 @@ export function createAttributionFixtureService({ accepted = true, granted = tru
   const calls = [];
   let sequence = 10;
   let active = null;
-  const capability = {
+  const version = successor ? "v1.2" : "v1.1";
+  const lane = successor ? "v12" : "v11";
+  const capability = successor ? {
+    schemaVersion: "device-sync-capabilities-v1.2", ...ATTRIBUTION_FIXTURE_BINDING,
+    identityVersion: "account-track-v2", authorityKind: "social",
+    successor: { schemaVersion: "telemetry-contribution-v1.2", envelopeSchemaVersion: "telemetry-envelope-v1.2",
+      lifecycle: accepted ? "accepted" : "staged", consentCurrent: granted, authorizationCurrent: granted,
+      requiredConsent: telemetryV12RequiredConsent(), activationTime: granted ? activationTime : null },
+  } : {
     schemaVersion: "device-sync-capabilities-v1.1", ...ATTRIBUTION_FIXTURE_BINDING,
     identityVersion: "account-track-v2", minimumWriteRank: granted ? 11 : 10, policyRevision: 1,
     requiredConsent: telemetryV11RequiredConsent(), consentCurrent: granted,
@@ -53,12 +63,16 @@ export function createAttributionFixtureService({ accepted = true, granted = tru
     const body = options.body === undefined || options.body === null ? null : JSON.parse(options.body);
     const headers = new Headers(options.headers);
     calls.push({ path, body });
-    if (path === "/api/v1/me/device-telemetry-consents") {
+    if (path === (successor ? "/api/v1/me/device-telemetry-v12-consents" : "/api/v1/me/device-telemetry-consents")) {
       assert.equal(headers.get("authorization"), null);
       assert.equal(headers.get("cookie"), "__Host-usage_monitor_session=synthetic_session");
       assert.equal(headers.get("x-usage-monitor-csrf"), "synthetic_csrf_0001");
-      assert.deepEqual(body, { deviceId: ATTRIBUTION_FIXTURE_DEVICE_ID, consent: telemetryV11RequiredConsent(), ongoingUpload: true });
+      assert.deepEqual(body, { deviceId: ATTRIBUTION_FIXTURE_DEVICE_ID, consent: (successor ? telemetryV12RequiredConsent : telemetryV11RequiredConsent)(), ongoingUpload: true });
       if (!accepted) return json({ error: { code: "TELEMETRY_TRANSPORT_BLOCKED" } }, 403);
+      if (successor) {
+        Object.assign(capability.successor, { consentCurrent: true, authorizationCurrent: true, activationTime });
+        return json({ consent: telemetryV12RequiredConsent() }, 201);
+      }
       capability.consentCurrent = true;
       capability.minimumWriteRank = 11;
       capability.policyRevision += 1;
@@ -66,15 +80,15 @@ export function createAttributionFixtureService({ accepted = true, granted = tru
     }
     if (path === "/api/v1/envelope-key") return json({ algorithm: "RSA-OAEP-256", keyId: "key:synthetic", publicJwk: { kty: "RSA" } });
     if (path !== "/api/v1/contributions") assert.match(headers.get("authorization") ?? "", /^Device um_device_[0-9a-f-]+\.[A-Za-z0-9_-]{43}$/u);
-    if (path === "/api/v1/device/sync-capabilities") return json(capability);
-    if (path === "/api/v1/me/telemetry-v11/domain-predecessor") return json({
-      schemaVersion: "telemetry-domain-predecessor-v1.1", token: uuid(sequence++),
+    if (path === (successor ? "/api/v1/device/sync-capabilities-v1.2" : "/api/v1/device/sync-capabilities")) return json(capability);
+    if (path === `/api/v1/me/telemetry-${lane}/domain-predecessor`) return json({
+      schemaVersion: `telemetry-domain-predecessor-${version}`, token: uuid(sequence++),
       previousGenerationId: active?.generationId ?? null, legacyFingerprint: "e".repeat(64),
       fromDay, throughDay,
       expiresAt: new Date(ATTRIBUTION_FIXTURE_START + 86_400_000).toISOString(),
     }, 201);
-    if (path === "/api/v1/device/telemetry/v1.1/day-manifests") {
-      parseTelemetryV11DayManifest(body);
+    if (path === `/api/v1/device/telemetry/${version}/day-manifests`) {
+      (successor ? parseTelemetryV12DayManifest : parseTelemetryV11DayManifest)(body);
       const key = `${body.day}:${body.manifestDigest}`;
       if (!manifests.has(key)) manifests.set(key, { manifest: body, id: uuid(sequence++), chunks: new Map() });
       const candidate = manifests.get(key);
@@ -84,7 +98,7 @@ export function createAttributionFixtureService({ accepted = true, granted = tru
           chunkDigest: chunk.chunkDigest, recordCount: chunk.records.length })) }, 201);
     }
     if (path === "/api/v1/device/upload-authorizations") {
-      assert.equal(body.telemetrySchemaVersion, "telemetry-contribution-v1.1");
+      assert.equal(body.telemetrySchemaVersion, `telemetry-contribution-${version}`);
       const uploadAuthorization = `um_device_upload_${uuid(sequence++)}.${"b".repeat(43)}`;
       authorizations.set(`Upload ${uploadAuthorization}`, body);
       return json({ uploadAuthorization, expiresAt: new Date(ATTRIBUTION_FIXTURE_START + 3_600_000).toISOString() }, 201);
@@ -96,18 +110,18 @@ export function createAttributionFixtureService({ accepted = true, granted = tru
       const chunk = envelopes.get(body.ciphertext);
       const candidate = manifests.get(`${chunk.chunkId.split(":")[1]}:${chunk.manifestDigest}`);
       candidate.chunks.set(chunk.chunkId, chunk);
-      return json({ schemaVersion: "telemetry-chunk-receipt-v1.1", contributionId: `chunk:${uuid(sequence++)}`,
+      return json({ schemaVersion: `telemetry-chunk-receipt-${version}`, contributionId: `chunk:${uuid(sequence++)}`,
         manifestId: candidate.id, chunkId: chunk.chunkId, chunkRevision: 1, status: "staged", replayed: false,
         recordCounts: { declared: chunk.records.length, accepted: chunk.records.length } }, 202);
     }
-    if (path === "/api/v1/me/telemetry-v11/domain-activate") {
-      parseTelemetryV11DomainManifest(body);
+    if (path === `/api/v1/me/telemetry-${lane}/domain-activate`) {
+      (successor ? parseTelemetryV12DomainManifest : parseTelemetryV11DomainManifest)(body);
       for (const entry of body.days) {
         const candidate = manifests.get(`${entry.day}:${entry.manifestDigest}`);
         assert.equal(candidate?.id, entry.manifestId);
         assert.equal(candidate.chunks.size, candidate.manifest.chunks.length);
       }
-      active = { schemaVersion: "telemetry-domain-activation-v1.1", generationId: uuid(sequence++),
+      active = { schemaVersion: `telemetry-domain-activation-${version}`, generationId: uuid(sequence++),
         manifestDigest: body.manifestDigest, fromDay: body.fromDay, throughDay: body.throughDay, replay: false };
       return json(active, 201);
     }
@@ -118,7 +132,7 @@ export function createAttributionFixtureService({ accepted = true, granted = tru
     async createEnvelope({ chunk }) {
       const ciphertext = Buffer.from(String(sequence++).padStart(32, "0")).toString("base64url");
       envelopes.set(ciphertext, chunk);
-      return { schemaVersion: "telemetry-envelope-v1.1", synthetic: false, keyId: "key:synthetic",
+      return { schemaVersion: `telemetry-envelope-${version}`, synthetic: false, keyId: "key:synthetic",
         wrappedKey: "a".repeat(342), iv: "a".repeat(16), ciphertext };
     },
   };

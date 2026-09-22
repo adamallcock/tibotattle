@@ -6,7 +6,13 @@ import {
   CACHE_RETENTION_METHOD,
   CACHE_RETENTION_RECORDED_REFUSALS,
   CacheRetentionRefusedError,
+  applyCacheRetentionReducerCarryPage,
+  applyCacheRetentionReducerPage,
+  createCacheRetentionReducerState,
+  finishCacheRetentionReducer,
   reduceCacheRetentionDay,
+  validCacheRetentionReducerState,
+  type CacheRetentionReducerState,
   validCacheRetentionDayAggregate,
   validCacheRetentionDayLabel,
   validCacheRetentionToken,
@@ -33,6 +39,14 @@ import { loadTypedV1AnalysisScope, readTypedV1UsageAnalysisPage,
 import { readTypedV11UsageAnalysisPage, TYPED_V11_ANALYSIS_PAGE_SIZE } from "./typed-v11-analysis-reader";
 import { assertTypedV11GenerationSnapshotLive, loadTypedV11GenerationSnapshot,
   type V11GenerationSnapshot } from "./typed-v11-quota-reader";
+import {
+  EffectiveUsageReaderError,
+  MAX_EFFECTIVE_USAGE_PAGE,
+  readEffectiveTelemetryOwnerDayPage,
+  type EffectiveUsageReaderCursor,
+} from "./telemetry-usage-effective-reader";
+import { effectiveHistoryDependency } from "./storage-effective-history";
+import type { StorageCommunityOwner } from "./storage-community-authority";
 
 /**
  * The `cache_retention_by_pause` lane: one prepared aggregate per
@@ -82,7 +96,7 @@ export const CACHE_RETENTION_MAX_SHARDS = 256;
  * differs is only where the day's events and the day's identity are read from,
  * and `source_layout` is in the mark identity so the two never collide.
  */
-export const CACHE_RETENTION_SOURCE_LAYOUTS = ["typed-v11", "typed-v1"] as const;
+export const CACHE_RETENTION_SOURCE_LAYOUTS = ["typed-v11", "typed-v1", "effective"] as const;
 export type CacheRetentionSourceLayout = (typeof CACHE_RETENTION_SOURCE_LAYOUTS)[number];
 
 /**
@@ -98,6 +112,68 @@ export type CacheRetentionSourceLayout = (typeof CACHE_RETENTION_SOURCE_LAYOUTS)
  */
 export const CACHE_RETENTION_V1_DEVICE_ID = "v1-elected-at-read";
 export const CACHE_RETENTION_V1_MANIFEST_ID = "v1-chunk-vector";
+/** Effective owner/day pages are already reconciled across every admitted
+ * family. These constants keep their prepared mark a single candidate per
+ * owner/day and prevent a physical device or generation from becoming another
+ * pooled contributor. */
+export const CACHE_RETENTION_EFFECTIVE_DEVICE_ID = "effective-owner";
+export const CACHE_RETENTION_EFFECTIVE_MANIFEST_ID = "effective-owner-day";
+
+const EFFECTIVE_DAILY_CURSOR_METHOD = "effective-daily-cursor-v2";
+/**
+ * Extract the closed-window dependency identity materialized by the effective
+ * daily projector. This is deliberately a fail-closed expression: a legacy,
+ * malformed, or hand-written effective row must never become an empty digest
+ * and accidentally authorize a cache aggregate.
+ */
+function effectiveDependencyDigestSql(alias: string): string {
+  if (!/^[A-Za-z][A-Za-z0-9_]{0,31}$/u.test(alias)) throw fail();
+  const path = `${alias}.fingerprint`;
+  return `(CASE WHEN json_valid(${path})=1
+      AND json_extract(${path},'$.method')='${EFFECTIVE_DAILY_CURSOR_METHOD}'
+      AND json_type(${path},'$.dependencyDigest')='text'
+      AND length(json_extract(${path},'$.dependencyDigest'))=64
+      AND json_extract(${path},'$.dependencyDigest') NOT GLOB '*[^0-9a-f]*'
+    THEN json_extract(${path},'$.dependencyDigest') ELSE NULL END)`;
+}
+
+/**
+ * The identity a promoted effective mark must still match before it can be
+ * read or suppress a legacy row. The daily cursor digest covers the selected
+ * day; the carry rows cover each of the seven lookback days. Both are needed:
+ * a late lookback projection can leave the selected-day digest unchanged while
+ * changing the aggregate's input. `ready` is false for retirement/selection,
+ * where a current recorded refusal is still a durable identity; readers and
+ * legacy suppression pass true so refusals never appear as values.
+ */
+function effectiveMarkCurrentSql(markAlias: string, ready = false): string {
+  if (!/^[A-Za-z][A-Za-z0-9_]{0,31}$/u.test(markAlias)) throw fail();
+  const dayAlias = `${markAlias}_day`;
+  const carryAlias = `${markAlias}_carry`;
+  const carryDayAlias = `${markAlias}_carry_day`;
+  return `(${markAlias}.source_layout='effective'
+    AND ${markAlias}.source_namespace=(SELECT runtime.source_namespace FROM analytics_runtime_sources runtime
+      WHERE runtime.source_id=${markAlias}.source_id)
+    AND EXISTS(SELECT 1 FROM analytics_community_daily_owners ${dayAlias}
+      WHERE ${dayAlias}.source_id=${markAlias}.source_id
+        AND ${dayAlias}.owner_digest=${markAlias}.owner_digest
+        AND ${dayAlias}.day=${markAlias}.day
+        AND ${dayAlias}.source_format='effective' AND ${dayAlias}.complete=1
+        AND ${effectiveDependencyDigestSql(dayAlias)}=${markAlias}.manifest_digest)
+    AND (SELECT COUNT(*) FROM analytics_cache_retention_day_carry ${carryAlias}
+      WHERE ${carryAlias}.mark_key=${markAlias}.mark_key)=${markAlias}.carry_days
+    AND NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_carry ${carryAlias}
+      WHERE ${carryAlias}.mark_key=${markAlias}.mark_key
+        AND ${carryAlias}.manifest_digest!=COALESCE(
+          (SELECT ${effectiveDependencyDigestSql(carryDayAlias)}
+             FROM analytics_community_daily_owners ${carryDayAlias}
+            WHERE ${carryDayAlias}.source_id=${markAlias}.source_id
+              AND ${carryDayAlias}.owner_digest=${markAlias}.owner_digest
+              AND ${carryDayAlias}.day=${carryAlias}.day
+              AND ${carryDayAlias}.source_format='effective'
+              AND ${carryDayAlias}.complete=1),''))
+    ${ready ? `AND ${markAlias}.refusal IS NULL` : ''})`;
+}
 
 /**
  * The v1 day identity, as one SQL expression.
@@ -165,6 +241,8 @@ function checkKey(key: CacheRetentionDayKey): void {
     // candidates and the pooled merge would count it twice.
     || (key.sourceLayout === "typed-v1" && (key.deviceId !== CACHE_RETENTION_V1_DEVICE_ID
       || key.manifestId !== CACHE_RETENTION_V1_MANIFEST_ID))
+    || (key.sourceLayout === "effective" && (key.deviceId !== CACHE_RETENTION_EFFECTIVE_DEVICE_ID
+      || key.manifestId !== CACHE_RETENTION_EFFECTIVE_MANIFEST_ID))
     || !validCacheRetentionDayLabel(key.day)) throw fail();
 }
 
@@ -219,6 +297,21 @@ export async function cacheRetentionCarryDigest(
     days: carry.map((entry) => [entry.day, entry.manifestDigest]) }));
 }
 
+/** Values predating the effective lane have a historical uniqueness key that
+ * omits source layout. Keep the public v2 carry digest byte-for-byte stable for
+ * both frozen layouts, while salting only effective storage identities so an
+ * owner/day can retain the legacy mark during an effective replacement without
+ * colliding at the values table. The reducer and all band arithmetic remain
+ * unchanged; this is solely a storage identity fence. */
+async function cacheRetentionStorageCarryDigest(key: CacheRetentionDayKey,
+  carry: readonly CacheRetentionCarryDay[]): Promise<string> {
+  const digest = await cacheRetentionCarryDigest(carry);
+  return key.sourceLayout === "effective"
+    ? sha256Hex(canonicalJson({ method: "cache-retention-effective-carry-v1",
+      sourceLayout: key.sourceLayout, carryDigest: digest }))
+    : digest;
+}
+
 /** The content-addressed day identity. It covers the day manifest identity, the
  * method version and the carry digest and nothing else: those are exactly the
  * inputs whose change must invalidate a prepared day. */
@@ -256,21 +349,39 @@ export async function readCacheRetentionCarryDays(target: D1Database,
   // Still one statement per layout. The v1 arm derives the same per-day
   // identity the selection derives, from the same rows, so a lookback day's
   // recorded dependency and its selected identity can never disagree.
-  const rows = (key.sourceLayout === "typed-v11"
-    ? await target.prepare(`SELECT day,MAX(manifest_digest) AS manifest_digest
-      FROM analytics_v11_reusable_values
-      WHERE source_id=?1 AND owner_digest=?2 AND device_id=?3 AND day>=?4 AND day<?5
-        AND source_layout='typed-v11' AND source_namespace=?6
-      GROUP BY day`)
+  let rows: Array<{ day: string; manifest_digest: string | null }>;
+  if (key.sourceLayout === "typed-v11") {
+    rows = (await target.prepare(`SELECT day,MAX(manifest_digest) AS manifest_digest
+        FROM analytics_v11_reusable_values
+        WHERE source_id=?1 AND owner_digest=?2 AND device_id=?3 AND day>=?4 AND day<?5
+          AND source_layout='typed-v11' AND source_namespace=?6
+        GROUP BY day`)
       .bind(key.sourceId, key.ownerDigest, key.deviceId, days[0]!, key.day, key.sourceNamespace)
-      .all<{ day: string; manifest_digest: string }>()
-    : await target.prepare(`SELECT observed_day AS day,${V1_DAY_REVISION} AS manifest_digest
-      FROM analytics_v1_chunk_values
-      WHERE source_id=?1 AND owner_digest=?2 AND observed_day>=?3 AND observed_day<?4
-      GROUP BY observed_day`)
+      .all<{ day: string; manifest_digest: string }>()).results;
+  } else if (key.sourceLayout === "typed-v1") {
+    rows = (await target.prepare(`SELECT observed_day AS day,${V1_DAY_REVISION} AS manifest_digest
+        FROM analytics_v1_chunk_values
+        WHERE source_id=?1 AND owner_digest=?2 AND observed_day>=?3 AND observed_day<?4
+        GROUP BY observed_day`)
       .bind(key.sourceId, key.ownerDigest, days[0]!, key.day)
       .all<{ day: string; manifest_digest: string }>()).results;
-  const delivered = new Map(rows.map((row) => [row.day, row.manifest_digest]));
+  } else {
+    rows = (await target.prepare(`SELECT day,${effectiveDependencyDigestSql("e")} AS manifest_digest
+        FROM analytics_community_daily_owners e
+        WHERE e.source_id=?1 AND e.owner_digest=?2 AND e.source_format='effective'
+          AND e.complete=1 AND e.day>=?3 AND e.day<?4
+        GROUP BY e.day`)
+      .bind(key.sourceId, key.ownerDigest, days[0]!, key.day)
+      .all<{ day: string; manifest_digest: string | null }>()).results;
+    // An effective row exists, but its closed-window cursor is missing or
+    // malformed. Treat that as unavailable rather than allowing a retry to
+    // use an empty digest and publish a cache value against unproved inputs.
+    if (rows.some((row) => row.manifest_digest === null)) throw fail();
+  }
+  const delivered = new Map<string, string>();
+  for (const row of rows) {
+    if (row.manifest_digest !== null) delivered.set(row.day, row.manifest_digest);
+  }
   const carry = days.map((day) => ({ day, manifestDigest: delivered.get(day) ?? "" }));
   checkCarry(key, carry);
   return carry;
@@ -341,14 +452,14 @@ async function framed(key: CacheRetentionDayKey, carryDigest: string,
  */
 export async function writeCacheRetentionDay(input: { target: D1Database; key: CacheRetentionDayKey;
   carry: readonly CacheRetentionCarryDay[]; aggregate: CacheRetentionDayAggregate;
-  maxWrites?: number; cursor?: CacheRetentionDayWriteCursor;
+  maxWrites?: number; cursor?: CacheRetentionDayWriteCursor; progressKey?: string;
 }): Promise<CacheRetentionDayWrite> {
   const { target, aggregate } = input, key = { ...input.key };
   checkKey(key);
   checkCarry(key, input.carry);
   const max = input.maxWrites ?? CACHE_RETENTION_MAX_WRITES;
   bounded(max, CACHE_RETENTION_MIN_WRITES, CACHE_RETENTION_MAX_WRITES);
-  const carryDigest = await cacheRetentionCarryDigest(input.carry);
+  const carryDigest = await cacheRetentionStorageCarryDigest(key, input.carry);
   const f = await framed(key, carryDigest, aggregate);
   if (f.groups.length > CACHE_RETENTION_GROUP_LIMIT) throw fail();
   const present = new Set<string>();
@@ -424,6 +535,15 @@ export async function writeCacheRetentionDay(input: { target: D1Database; key: C
   }
   const complete = page.length === missing.length;
   if (complete) {
+    if (input.progressKey !== undefined) {
+      if (!HASH.test(input.progressKey) || input.progressKey !== f.markKey) throw fail();
+      // Delete before inserting the immutable mark. The whole batch is one
+      // transaction, so a crash cannot leave a promoted mark with a mutable
+      // reducer checkpoint, and a retry is idempotent either way.
+      statements.push(target.prepare(`DELETE FROM analytics_cache_retention_day_progress
+        WHERE progress_key=? AND NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_marks WHERE mark_key=?)`)
+        .bind(input.progressKey, input.progressKey));
+    }
     statements.push(markStatement(target, key, f, carryDigest, aggregate, null));
   }
   if (statements.length) await target.batch(statements);
@@ -468,7 +588,7 @@ export async function writeCacheRetentionDayRefusal(input: { target: D1Database;
   checkKey(key);
   checkCarry(key, input.carry);
   if (!CACHE_RETENTION_RECORDED_REFUSALS.has(reason)) throw fail();
-  const carryDigest = await cacheRetentionCarryDigest(input.carry);
+  const carryDigest = await cacheRetentionStorageCarryDigest(key, input.carry);
   const markKey = await cacheRetentionDayMarkKey(key, carryDigest);
   const empty: Framed = { markKey, groups: [],
     valuesDigest: await sha256Hex(canonicalJson({ methodVersion: CACHE_RETENTION_METHOD.version,
@@ -479,6 +599,14 @@ export async function writeCacheRetentionDayRefusal(input: { target: D1Database;
       ON CONFLICT(mark_key,day) DO UPDATE SET manifest_digest=excluded.manifest_digest
        WHERE analytics_cache_retention_day_carry.manifest_digest IS NOT excluded.manifest_digest`)
     .bind(markKey, entry.day, key.sourceId, key.ownerDigest, key.deviceId, entry.manifestDigest));
+  if (key.sourceLayout === "effective") {
+    // A capacity refusal closes the effective identity.  Remove any cursor
+    // left by the failed attempt in the same target transaction so it cannot
+    // survive behind an immutable refusal mark.
+    statements.unshift(target.prepare(`DELETE FROM analytics_cache_retention_day_progress
+      WHERE progress_key=? AND NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_marks WHERE mark_key=?)`)
+      .bind(markKey, markKey));
+  }
   statements.push(markStatement(target, key, empty, carryDigest, null, reason));
   await target.batch(statements);
   return { markKey };
@@ -498,7 +626,7 @@ export async function readCacheRetentionDay(input: { target: D1Database; key: Ca
   const { target } = input, key = { ...input.key };
   checkKey(key);
   checkCarry(key, input.carry);
-  const carryDigest = await cacheRetentionCarryDigest(input.carry);
+  const carryDigest = await cacheRetentionStorageCarryDigest(key, input.carry);
   const markKey = await cacheRetentionDayMarkKey(key, carryDigest);
   const mark = await target.prepare(`SELECT value_count,events_read,unreadable_events,values_digest,refusal
     FROM analytics_cache_retention_day_marks WHERE mark_key=?`).bind(markKey)
@@ -576,7 +704,13 @@ export async function retireCacheRetentionDayPage(target: D1Database, sourceId: 
           WHERE c.source_id=m.source_id AND c.owner_digest=m.owner_digest
             AND c.observed_day=m.day
           GROUP BY c.owner_digest,c.observed_day
-          HAVING ${v1DayRevision("c")}=m.manifest_digest)))
+          HAVING ${v1DayRevision("c")}=m.manifest_digest))
+        OR (m.source_layout='effective' AND NOT ${effectiveMarkCurrentSql("m")})
+        OR (m.source_layout IN ('typed-v11','typed-v1') AND EXISTS(
+          SELECT 1 FROM analytics_cache_retention_day_marks e
+          WHERE ${effectiveMarkCurrentSql("e", true)}
+            AND e.method_version=m.method_version AND e.source_id=m.source_id
+            AND e.owner_digest=m.owner_digest AND e.day=m.day)))
       ORDER BY m.owner_digest,m.day,m.mark_key LIMIT ?3) RETURNING mark_key`)
     .bind(sourceId, version, limit).all()).results.length;
   const values = (await target.prepare(`DELETE FROM analytics_cache_retention_day_values
@@ -597,6 +731,23 @@ export async function retireCacheRetentionDayPage(target: D1Database, sourceId: 
         WHERE m.mark_key=c.mark_key)
       ORDER BY c.mark_key,c.day LIMIT ?2) RETURNING day`)
     .bind(sourceId, limit).all()).results.length;
+  // Effective reducer checkpoints are replaceable staging. Retire an orphan
+  // when its owner is erased or its pinned owner-day revision no longer
+  // exists; a promoted mark deliberately blocks this cleanup and is cleaned
+  // transactionally by writeCacheRetentionDay instead.
+  try {
+    await target.prepare(`DELETE FROM analytics_cache_retention_day_progress
+      WHERE progress_key IN (SELECT p.progress_key FROM analytics_cache_retention_day_progress p
+        WHERE p.source_id=?1 AND NOT EXISTS(
+          SELECT 1 FROM analytics_cache_retention_day_marks m WHERE m.mark_key=p.progress_key)
+        AND (EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
+          WHERE f.source_id=p.source_id AND f.owner_digest=p.owner_digest)
+          OR NOT EXISTS(SELECT 1 FROM analytics_community_daily_owners e
+            WHERE e.source_id=p.source_id AND e.owner_digest=p.owner_digest AND e.day=p.day
+              AND e.source_format='effective' AND e.complete=1
+              AND ${effectiveDependencyDigestSql("e")} = p.manifest_digest))
+        ORDER BY p.owner_digest,p.day LIMIT ?2)`).bind(sourceId, limit).run();
+  } catch { /* Older analytics databases have no staged effective table. */ }
   return { state: marks + carry + values + bands > 0 ? "retiring" : "idle",
     marks, carry, values, bands };
 }
@@ -858,11 +1009,265 @@ export function createCacheRetentionV1DayReader(options: {
   };
 }
 
+/**
+ * The version-neutral production reader. The effective occurrence reader has
+ * already joined and reconciled every admitted v1/v1.1/v1.2 source before a
+ * row crosses this boundary, so this lane applies the exact same mapper and
+ * reduction as the frozen readers above. A page is charged conservatively for
+ * the bounded source work behind that public page; this keeps the retention
+ * scheduler from opening an effective day it cannot finish within its source
+ * allowance. The reservation is 192: at most 16 compatibility decode pages
+ * cost 16*(one schema read + three 90-id reads) = 64, at most 16 grouped
+ * correction pages cost 16*(runtime + before/after CAS + page) = 64, and the
+ * remaining family candidates, v1.2 availability/source expansion and final
+ * fences fit within the remaining 64. This is a scheduler reservation, not a
+ * claim about D1 subrequest accounting; the wrapped invocation meter remains
+ * the final ceiling.
+ */
+export const CACHE_RETENTION_EFFECTIVE_PAGE_QUERIES = 192;
+export const CACHE_RETENTION_EFFECTIVE_SETUP_QUERIES = 3;
+/** One closed-window dependency read currently uses six bounded D1 queries:
+ * schema capability, v1, v1.1, optional v1.2, correction frontier and the
+ * outside-occurrence link page. Reserve the full shape before invoking the
+ * helper so the lane's source allowance cannot be overspent invisibly. */
+export const CACHE_RETENTION_EFFECTIVE_DEPENDENCY_QUERIES = 6;
+
+function spendMany(budget: CacheRetentionBuildBudget, now: () => number, count: number): void {
+  bounded(count, 1, 192);
+  for (let index = 0; index < count; index += 1) spend(budget, now);
+}
+
+export function createCacheRetentionEffectiveDayReader(options: {
+  source: D1Database; sourceNamespace: string; ownerDigest: string;
+  ownerRevision: number; authorityEpoch: number; maxPages?: number;
+}): CacheRetentionDayReader {
+  const maxPages = options.maxPages ?? CACHE_RETENTION_DAY_PAGES;
+  bounded(maxPages, 1, CACHE_RETENTION_DAY_PAGES);
+  bounded(options.ownerRevision, 1, 0x7fffffff);
+  bounded(options.authorityEpoch, 1, 0x7fffffff);
+  if (!HASH.test(options.ownerDigest) || typeof options.sourceNamespace !== "string"
+    || options.sourceNamespace.length < 1
+    || options.sourceNamespace.length > 256) throw fail();
+  return async ({ day, sessions, budget, now }) => {
+    if (!validCacheRetentionDayLabel(day)) throw fail();
+    const items: CacheRetentionItem[] = [];
+    const seen = new Set<string>();
+    let rowsRead = 0;
+    let after: EffectiveUsageReaderCursor | undefined;
+    for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
+      spendMany(budget, now, CACHE_RETENTION_EFFECTIVE_PAGE_QUERIES);
+      const page = await readEffectiveTelemetryOwnerDayPage(options.source, {
+        sourceNamespace: options.sourceNamespace, ownerDigest: options.ownerDigest,
+        ownerRevision: options.ownerRevision, authorityEpoch: options.authorityEpoch,
+        day, stream: "usage", limit: MAX_EFFECTIVE_USAGE_PAGE,
+        ...(after === undefined ? {} : { after }),
+      });
+      for (const row of page.rows) {
+        rowsRead += 1;
+        if (seen.has(row.occurrenceId)) continue;
+        seen.add(row.occurrenceId);
+        if (seen.size > maxPages * MAX_EFFECTIVE_USAGE_PAGE) {
+          throw new CacheRetentionRefusedError("day_page_limit_exceeded");
+        }
+        if (row.status !== "compatible" || row.recordJson === null || row.eventTime === null) {
+          throw new CacheRetentionRefusedError("usage_row_refused");
+        }
+        const observedAtMs = Date.parse(row.eventTime);
+        if (!Number.isSafeInteger(observedAtMs)
+          || new Date(observedAtMs).toISOString().slice(0, 10) !== day) {
+          throw new CacheRetentionRefusedError("usage_row_refused");
+        }
+        const record = parseStoredRecordJson(row.recordJson) as Record<string, unknown> | null;
+        const sessionUuid = record?.sessionUuid;
+        const provider = record?.provider;
+        if (!record || typeof sessionUuid !== "string" || sessionUuid.length === 0
+          || typeof provider !== "string" || provider.length === 0) {
+          throw new CacheRetentionRefusedError("usage_row_refused");
+        }
+        const sessionDigest = await cacheRetentionSessionDigest({
+          ownerDigest: options.ownerDigest, provider, sessionUuid,
+        });
+        if (sessions !== null && !sessions.has(sessionDigest)) continue;
+        const item = cacheRetentionEventFromRecord({ sessionDigest, observedAtMs,
+          orderKey: row.occurrenceId, recordJson: row.recordJson });
+        if (item !== null) items.push(item);
+      }
+      if (page.next === null) return { items, rowsRead };
+      if (page.rows.length === 0 || page.next.observedAtMs < (after?.observedAtMs ?? -Infinity)
+        || (page.next.observedAtMs === (after?.observedAtMs ?? -Infinity)
+          && page.next.occurrenceId <= (after?.occurrenceId ?? ""))) {
+        throw new CacheRetentionRefusedError("usage_row_refused");
+      }
+      after = page.next;
+    }
+    throw new CacheRetentionRefusedError("day_page_limit_exceeded");
+  };
+}
+
 /** One candidate day. */
 export interface CacheRetentionDayCandidate extends CacheRetentionDayKey {}
 export type CacheRetentionDayBuild = (candidate: CacheRetentionDayCandidate,
   carry: readonly CacheRetentionCarryDay[],
   budget: CacheRetentionBuildBudget) => Promise<CacheRetentionDayAggregate>;
+
+type CacheRetentionEffectiveProgressPhase = "discover" | "lookback" | "own" | "write";
+interface CacheRetentionEffectiveProgressCursor {
+  readonly observedAtMs: number;
+  readonly occurrenceId: string;
+}
+interface CacheRetentionEffectiveProgressEnvelope {
+  readonly schemaVersion: "cache-retention-effective-progress-v1";
+  readonly phase: CacheRetentionEffectiveProgressPhase;
+  readonly lookbackIndex: number;
+  readonly cursor: CacheRetentionEffectiveProgressCursor | null;
+  readonly eventsRead: number;
+  readonly sessions: readonly string[];
+  readonly reducer: CacheRetentionReducerState;
+  readonly aggregate: CacheRetentionDayAggregate | null;
+}
+interface CacheRetentionEffectiveProgressRow {
+  readonly progress_key: string;
+  readonly source_id: string;
+  readonly source_layout: string;
+  readonly source_namespace: string;
+  readonly owner_digest: string;
+  readonly device_id: string;
+  readonly manifest_id: string;
+  readonly manifest_digest: string;
+  readonly day: string;
+  readonly method_version: string;
+  readonly carry_digest: string;
+  readonly progress_revision: number;
+  readonly state_json: string;
+  readonly state_digest: string;
+}
+
+const CACHE_RETENTION_EFFECTIVE_PROGRESS_VERSION = "cache-retention-effective-progress-v1" as const;
+// D1 caps a single TEXT/BLOB value at 2,000,000 bytes.  Keep a margin for
+// SQLite's value framing and reject before binding; a larger JavaScript string
+// would otherwise fail after the source page had already been consumed.
+const CACHE_RETENTION_EFFECTIVE_PROGRESS_MAX_BYTES = 1_900_000;
+const CACHE_RETENTION_EFFECTIVE_PROGRESS_MAX_SESSIONS = 100_000;
+const progressByteLength = (value: string): number => new TextEncoder().encode(value).byteLength;
+
+function progressCursorValid(value: unknown): value is CacheRetentionEffectiveProgressCursor {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const cursor = value as Record<string, unknown>;
+  return Object.keys(cursor).sort().join(",") === "observedAtMs,occurrenceId"
+    && Number.isSafeInteger(cursor.observedAtMs)
+    && typeof cursor.occurrenceId === "string"
+    && /^[A-Za-z0-9._:-]{8,128}$/u.test(cursor.occurrenceId);
+}
+
+function progressEnvelopeValid(value: unknown): value is CacheRetentionEffectiveProgressEnvelope {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const envelope = value as Record<string, unknown>;
+  if (Object.keys(envelope).sort().join(",") !== "aggregate,cursor,eventsRead,lookbackIndex,phase,reducer,schemaVersion,sessions"
+    || envelope.schemaVersion !== CACHE_RETENTION_EFFECTIVE_PROGRESS_VERSION
+    || !["discover", "lookback", "own", "write"].includes(envelope.phase as string)
+    || !Number.isSafeInteger(envelope.lookbackIndex) || (envelope.lookbackIndex as number) < 0
+    || (envelope.lookbackIndex as number) > CACHE_RETENTION_MAX_LOOKBACK_DAYS
+    || (envelope.cursor !== null && !progressCursorValid(envelope.cursor))
+    || !Number.isSafeInteger(envelope.eventsRead) || (envelope.eventsRead as number) < 0
+    || !Array.isArray(envelope.sessions) || envelope.sessions.length > CACHE_RETENTION_EFFECTIVE_PROGRESS_MAX_SESSIONS
+    || !envelope.sessions.every((item) => typeof item === "string" && HASH.test(item))
+    || envelope.sessions.some((item, index, all) => index > 0 && item <= all[index - 1]!)
+    || !validCacheRetentionReducerState(envelope.reducer)
+    || (envelope.aggregate !== null && !validCacheRetentionDayAggregate(envelope.aggregate))) return false;
+  if (envelope.phase === "write" && envelope.aggregate === null) return false;
+  if (envelope.phase !== "write" && envelope.aggregate !== null) return false;
+  if (envelope.phase === "discover" && envelope.lookbackIndex !== 0) return false;
+  return true;
+}
+
+function progressEnvelopeSnapshot(day: string, phase: CacheRetentionEffectiveProgressPhase,
+  lookbackIndex: number, cursor: CacheRetentionEffectiveProgressCursor | null,
+  eventsRead: number, sessions: readonly string[], reducer: CacheRetentionReducerState,
+  aggregate: CacheRetentionDayAggregate | null = null): CacheRetentionEffectiveProgressEnvelope {
+  const value: CacheRetentionEffectiveProgressEnvelope = {
+    schemaVersion: CACHE_RETENTION_EFFECTIVE_PROGRESS_VERSION,
+    phase, lookbackIndex, cursor, eventsRead, sessions: [...new Set(sessions)].sort(), reducer, aggregate,
+  };
+  if (value.reducer.day !== day || !progressEnvelopeValid(value)) throw fail();
+  return value;
+}
+
+async function readCacheRetentionEffectiveProgress(target: D1Database,
+  key: CacheRetentionDayCandidate, progressKey: string, carryDigest: string): Promise<{
+    row: CacheRetentionEffectiveProgressRow; value: CacheRetentionEffectiveProgressEnvelope;
+  } | null> {
+  let row: CacheRetentionEffectiveProgressRow | null;
+  try {
+    row = await target.prepare(`SELECT progress_key,source_id,source_layout,source_namespace,owner_digest,
+      device_id,manifest_id,manifest_digest,day,method_version,carry_digest,progress_revision,state_json,state_digest
+      FROM analytics_cache_retention_day_progress WHERE progress_key=?`).bind(progressKey)
+      .first<CacheRetentionEffectiveProgressRow>();
+  } catch { throw new CacheRetentionDeferredError("query_budget"); }
+  if (!row) return null;
+  if (row.source_id !== key.sourceId || row.source_layout !== key.sourceLayout
+    || row.source_namespace !== key.sourceNamespace || row.owner_digest !== key.ownerDigest
+    || row.device_id !== key.deviceId || row.manifest_id !== key.manifestId
+    || row.manifest_digest !== key.manifestDigest || row.day !== key.day
+    || row.method_version !== CACHE_RETENTION_METHOD.version || row.carry_digest !== carryDigest) throw fail();
+  let value: unknown;
+  try { value = JSON.parse(row.state_json); } catch { throw fail(); }
+  if (!progressEnvelopeValid(value) || value.reducer.day !== key.day
+    || !HASH.test(row.state_digest)
+    || await sha256Hex(canonicalJson(value)) !== row.state_digest) throw fail();
+  return { row, value };
+}
+
+async function writeCacheRetentionEffectiveProgress(target: D1Database,
+  key: CacheRetentionDayCandidate, progressKey: string,
+  carryDigest: string,
+  previous: CacheRetentionEffectiveProgressRow | null,
+  value: CacheRetentionEffectiveProgressEnvelope): Promise<CacheRetentionEffectiveProgressRow> {
+  const stateJson = canonicalJson(value);
+  if (progressByteLength(stateJson) > CACHE_RETENTION_EFFECTIVE_PROGRESS_MAX_BYTES) {
+    // This is a closed capacity outcome, not transient query pressure.  A
+    // retry would serialize the same state again and starve the owner forever;
+    // record the bounded refusal through the ordinary day lane instead.
+    throw new CacheRetentionRefusedError("checkpoint_size_exceeded");
+  }
+  const stateDigest = await sha256Hex(stateJson);
+  const revision = previous?.progress_revision === undefined ? 1 : previous.progress_revision + 1;
+  try {
+    if (!previous) {
+      await target.prepare(`INSERT INTO analytics_cache_retention_day_progress
+        (progress_key,source_id,source_layout,source_namespace,owner_digest,device_id,manifest_id,
+         manifest_digest,day,method_version,carry_digest,progress_revision,state_json,state_digest)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(progressKey,key.sourceId,key.sourceLayout,key.sourceNamespace,
+          key.ownerDigest,key.deviceId,key.manifestId,key.manifestDigest,key.day,CACHE_RETENTION_METHOD.version,
+          carryDigest,revision,stateJson,stateDigest).run();
+    } else {
+      const updated = await target.prepare(`UPDATE analytics_cache_retention_day_progress SET
+        progress_revision=?,state_json=?,state_digest=? WHERE progress_key=? AND progress_revision=?
+        AND NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_marks WHERE mark_key=?)`)
+        .bind(revision,stateJson,stateDigest,progressKey,previous.progress_revision,progressKey).run();
+      if (updated.meta?.changes !== undefined && updated.meta.changes !== 1) throw new CacheRetentionDeferredError("query_budget");
+    }
+  } catch (error) {
+    if (error instanceof CacheRetentionDeferredError) throw error;
+    // An active erasure fence is a terminal privacy decision, not missing
+    // capacity.  Preserve the trigger's closed error so the caller cannot
+    // retry the same checkpoint forever after the owner has been erased.
+    if (String(error).includes("storage_owner_erased")) throw error;
+    throw new CacheRetentionDeferredError("query_budget");
+  }
+  const saved = await target.prepare(`SELECT progress_key,source_id,source_layout,source_namespace,owner_digest,
+    device_id,manifest_id,manifest_digest,day,method_version,carry_digest,progress_revision,state_json,state_digest
+    FROM analytics_cache_retention_day_progress WHERE progress_key=?`).bind(progressKey)
+    .first<CacheRetentionEffectiveProgressRow>();
+  if (!saved || saved.progress_revision !== revision || saved.state_digest !== stateDigest
+    || saved.state_json !== stateJson) throw new CacheRetentionDeferredError("query_budget");
+  return saved;
+}
+
+async function deleteCacheRetentionEffectiveProgress(target: D1Database, progressKey: string): Promise<void> {
+  try { await target.prepare(`DELETE FROM analytics_cache_retention_day_progress WHERE progress_key=?
+    AND NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_marks WHERE mark_key=?)`)
+    .bind(progressKey,progressKey).run(); } catch { /* stale/missing staged state is recoverable */ }
+}
 
 /**
  * The production day builder.
@@ -931,34 +1336,189 @@ export function createCacheRetentionV1DayBuild(options: {
     options.now ?? Date.now);
 }
 
+/** Effective rows are folded through the same cache-retention-v2 reduction;
+ * only the source reader and its owner revision fence differ. */
+export function createCacheRetentionEffectiveDayBuild(options: {
+  source: D1Database; target?: D1Database; sourceNamespace: string; ownerDigest: string;
+  ownerRevision: number; authorityEpoch: number; now?: () => number;
+  read?: CacheRetentionDayReader;
+  /** Narrow test seam for proving durable page resumption without source data. */
+  readPage?: typeof readEffectiveTelemetryOwnerDayPage;
+}): CacheRetentionDayBuild {
+  if (options.read) {
+    return cacheRetentionBuildFromReader(options.read, options.sourceNamespace, options.now ?? Date.now);
+  }
+  if (!options.target) {
+    return async () => { throw new CacheRetentionDeferredError("query_budget"); };
+  }
+  const target = options.target;
+  const now = options.now ?? Date.now;
+  if (typeof options.sourceNamespace !== "string" || options.sourceNamespace.length < 1
+    || options.sourceNamespace.length > 256) throw fail();
+  return async (candidate, carry, budget) => {
+    checkKey(candidate);
+    checkCarry(candidate, carry);
+    if (candidate.sourceLayout !== "effective" || candidate.sourceNamespace !== options.sourceNamespace
+      || candidate.ownerDigest !== options.ownerDigest) throw fail();
+    if (!Number.isFinite(budget.deadlineMs) || !Number.isSafeInteger(budget.remainingQueries)) throw fail();
+    const carryDigest = await cacheRetentionStorageCarryDigest(candidate, carry);
+    const progressKey = await cacheRetentionDayMarkKey(candidate, carryDigest);
+    let saved = await readCacheRetentionEffectiveProgress(target, candidate, progressKey, carryDigest);
+    let envelope = saved?.value ?? progressEnvelopeSnapshot(candidate.day, "discover", 0, null, 0, [],
+      createCacheRetentionReducerState(candidate.day));
+    const sessions = new Set(envelope.sessions);
+    const lookbackDays = cacheRetentionLookbackDays(candidate.day);
+    const pageItems = async (day: string, sessionSet: ReadonlySet<string> | null,
+      cursor: CacheRetentionEffectiveProgressCursor | null): Promise<{
+      items: CacheRetentionItem[]; rowsRead: number; next: CacheRetentionEffectiveProgressCursor | null;
+    }> => {
+      spendMany(budget, now, CACHE_RETENTION_EFFECTIVE_PAGE_QUERIES);
+      let page: Awaited<ReturnType<typeof readEffectiveTelemetryOwnerDayPage>>;
+      try {
+        page = await (options.readPage ?? readEffectiveTelemetryOwnerDayPage)(options.source, {
+          sourceNamespace: options.sourceNamespace, ownerDigest: options.ownerDigest,
+          ownerRevision: options.ownerRevision, authorityEpoch: options.authorityEpoch,
+          day, stream: "usage", limit: MAX_EFFECTIVE_USAGE_PAGE,
+          ...(cursor === null ? {} : { after: cursor }),
+        });
+      } catch (error) {
+        if (error instanceof EffectiveUsageReaderError
+          && error.code === "EFFECTIVE_USAGE_LIMIT") throw new CacheRetentionDeferredError("query_budget");
+        if (error instanceof EffectiveUsageReaderError
+          && ["EFFECTIVE_USAGE_CAS_MISMATCH", "EFFECTIVE_USAGE_UNAVAILABLE"].includes(error.code)) {
+          throw new CacheRetentionRefusedError("owner_source_unavailable");
+        }
+        if (error instanceof EffectiveUsageReaderError
+          && ["EFFECTIVE_USAGE_INVALID", "EFFECTIVE_USAGE_SOURCE_CONFLICT"].includes(error.code)) {
+          throw new CacheRetentionRefusedError("usage_row_refused");
+        }
+        throw error;
+      }
+      const items: CacheRetentionItem[] = [];
+      for (const row of page.rows) {
+        if (row.status !== "compatible" || row.recordJson === null || row.eventTime === null) {
+          throw new CacheRetentionRefusedError("usage_row_refused");
+        }
+        const observedAtMs = Date.parse(row.eventTime);
+        if (!Number.isSafeInteger(observedAtMs)
+          || new Date(observedAtMs).toISOString().slice(0, 10) !== day) {
+          throw new CacheRetentionRefusedError("usage_row_refused");
+        }
+        const record = parseStoredRecordJson(row.recordJson) as Record<string, unknown> | null;
+        const sessionUuid = record?.sessionUuid;
+        const provider = record?.provider;
+        if (!record || typeof sessionUuid !== "string" || sessionUuid.length === 0
+          || typeof provider !== "string" || provider.length === 0) {
+          throw new CacheRetentionRefusedError("usage_row_refused");
+        }
+        const sessionDigest = await cacheRetentionSessionDigest({
+          ownerDigest: options.ownerDigest, provider, sessionUuid,
+        });
+        if (sessionSet !== null && !sessionSet.has(sessionDigest)) continue;
+        const item = cacheRetentionEventFromRecord({ sessionDigest, observedAtMs,
+          orderKey: row.occurrenceId, recordJson: row.recordJson });
+        if (item !== null) items.push(item);
+      }
+      if (page.next !== null && (page.rows.length === 0
+        || (cursor !== null && (page.next.observedAtMs < cursor.observedAtMs
+          || (page.next.observedAtMs === cursor.observedAtMs
+            && page.next.occurrenceId <= cursor.occurrenceId))))) {
+        throw new CacheRetentionRefusedError("usage_row_refused");
+      }
+      return { items, rowsRead: page.rows.length, next: page.next };
+    };
+    const save = async (next: CacheRetentionEffectiveProgressEnvelope): Promise<void> => {
+      saved = { row: await writeCacheRetentionEffectiveProgress(target, candidate, progressKey,
+        carryDigest, saved?.row ?? null, next), value: next };
+      envelope = next;
+    };
+    for (;;) {
+      if (envelope.phase === "write") {
+        if (!envelope.aggregate) throw fail();
+        return envelope.aggregate;
+      }
+      if (envelope.phase === "discover") {
+        const page = await pageItems(candidate.day, null, envelope.cursor);
+        for (const item of page.items) {
+          if (!("unreadable" in item)) sessions.add(item.sessionDigest);
+        }
+        const next = page.next;
+        const state = progressEnvelopeSnapshot(candidate.day, next === null ? (sessions.size === 0 ? "own" : "lookback") : "discover",
+          next === null ? 0 : 0, next, envelope.eventsRead + page.rowsRead, [...sessions], envelope.reducer);
+        await save(state);
+        if (next !== null) continue;
+        envelope = state;
+        continue;
+      }
+      if (envelope.phase === "lookback") {
+        if (sessions.size === 0) {
+          const next = progressEnvelopeSnapshot(candidate.day, "own", 0, null,
+            envelope.eventsRead, [...sessions], envelope.reducer);
+          await save(next); envelope = next; continue;
+        }
+        if (envelope.lookbackIndex >= lookbackDays.length) {
+          const next = progressEnvelopeSnapshot(candidate.day, "own", 0, null,
+            envelope.eventsRead, [...sessions], envelope.reducer);
+          await save(next); envelope = next; continue;
+        }
+        const page = await pageItems(lookbackDays[envelope.lookbackIndex]!, sessions, envelope.cursor);
+        const reducer = applyCacheRetentionReducerCarryPage(envelope.reducer, page.items);
+        const next = page.next === null
+          ? progressEnvelopeSnapshot(candidate.day, "lookback", envelope.lookbackIndex + 1, null,
+            envelope.eventsRead, [...sessions], reducer)
+          : progressEnvelopeSnapshot(candidate.day, "lookback", envelope.lookbackIndex, page.next,
+            envelope.eventsRead, [...sessions], reducer);
+        await save(next); envelope = next; continue;
+      }
+      // Own-day pages are now reduced incrementally. `eventsRead` came from
+      // discovery, so it counts source rows exactly once even though the own
+      // pass reads the same immutable cursor a second time.
+      const page = await pageItems(candidate.day, null, envelope.cursor);
+      const reducer = applyCacheRetentionReducerPage(envelope.reducer, page.items);
+      const next = page.next === null
+        ? progressEnvelopeSnapshot(candidate.day, "write", 0, null, envelope.eventsRead,
+          [...sessions], reducer, finishCacheRetentionReducer(reducer, envelope.eventsRead))
+        : progressEnvelopeSnapshot(candidate.day, "own", 0, page.next, envelope.eventsRead,
+          [...sessions], reducer);
+      await save(next); envelope = next;
+    }
+  };
+}
+
 /**
  * The production build for a WHOLE source, resolving each candidate owner's
  * source itself.
  *
  * Analytics never holds a participant identifier, so the owner digest is
  * bridged back through `storage_v11_owner_links` in the source database — the
- * same mapping owner erasure uses. Resolution is memoized per pass and per
- * layout. An owner whose link, pin, snapshot or analysis scope is absent is
+ * same mapping owner erasure uses. Legacy resolution is memoized per pass and
+ * layout. Effective resolution is revalidated for every candidate because its
+ * closed-window source identity includes the day and carry vector, and a late
+ * source row must not reuse a factory that was proved against an older empty
+ * carry. An owner whose link, pin, snapshot or analysis scope is absent is
  * skipped rather than guessed at.
  *
- * The two layouts are exclusive and the source decides which: a live v1.1
- * generation pin IS the v1.1 layout, and its absence is what makes an owner a
- * v1 one. `typed_v1_v11_transition_unqualified` refuses a v1.1 domain for a
- * participant holding typed v1 evidence, so no owner can answer to both and
- * the pooled merge cannot read one owner-day twice.
+ * The effective layout is selected when the version-neutral daily owner page
+ * is complete. It is one owner/day lane even when the source contains several
+ * physical families; legacy candidates are suppressed while that effective
+ * identity is current.
  */
 export function createCacheRetentionDaySourceBuild(options: {
-  source: D1Database; sourceNamespace: string; now?: () => number;
+  source: D1Database; target?: D1Database; sourceNamespace: string; now?: () => number;
 }): CacheRetentionDayBuild {
   const resolved = new Map<string, CacheRetentionDayBuild | null>();
   const now = options.now ?? Date.now;
   return async (candidate, carry, budget) => {
     checkKey(candidate);
     if (candidate.sourceNamespace !== options.sourceNamespace) throw fail();
-    // Memoized per layout as well as per owner: a build reads one layout, and
-    // a candidate must never be served by the other layout's reader.
-    const memo = `${candidate.sourceLayout} ${candidate.ownerDigest}`;
-    let build = resolved.get(memo);
+    // The effective key contains every target-side identity that the source
+    // validation proves. The effective branch below still resolves afresh on
+    // every call, because a source-only late arrival can invalidate a target
+    // carry that is still recorded as empty between two invocations.
+    const carryIdentity = candidate.sourceLayout === "effective"
+      ? await cacheRetentionStorageCarryDigest(candidate, carry) : "";
+    const memo = `${candidate.sourceLayout}\0${candidate.ownerDigest}\0${candidate.day}\0${candidate.manifestDigest}\0${carryIdentity}`;
+    let build = candidate.sourceLayout === "effective" ? undefined : resolved.get(memo);
     if (build === undefined) {
       build = null;
       spend(budget, now);
@@ -966,9 +1526,78 @@ export function createCacheRetentionDaySourceBuild(options: {
         .prepare("SELECT participant_id FROM storage_v11_owner_links WHERE owner_digest=?")
         .bind(candidate.ownerDigest).first<string>("participant_id");
       if (link) {
-        spend(budget, now);
-        const pin = await loadV11SourcePin(options.source, link);
-        if (candidate.sourceLayout === "typed-v11") {
+        if (candidate.sourceLayout === "effective") {
+          // The owner page already proved that this is an effective lane. Do
+          // not key it to the correction runtime: a v1.2-only owner is valid
+          // while correction remains staged, and the effective reader fences
+          // that successor directly.
+          if (!options.target) throw new CacheRetentionDeferredError("query_budget");
+          spend(budget, now);
+          const owner = await options.source.prepare(`SELECT link.participant_id,
+              owner.revision,owner.authority_epoch
+            FROM storage_v11_owner_links link
+            JOIN storage_owner_revisions owner ON owner.owner_digest=link.owner_digest
+            JOIN participants participant ON participant.id=link.participant_id
+              AND participant.state='active'
+            WHERE link.owner_digest=? AND link.state='active' AND owner.state='active'
+            LIMIT 2`).bind(candidate.ownerDigest)
+            .first<{ participant_id: string; revision: number; authority_epoch: number }>();
+          if (owner && Number.isSafeInteger(owner.revision) && owner.revision >= 1
+            && Number.isSafeInteger(owner.authority_epoch) && owner.authority_epoch >= 1) {
+            // The candidate digest is the effective daily projection's
+            // closed-window dependency, not the live owner revision. An
+            // unrelated day can advance the latter without changing this
+            // cache day; the effective reader still fences the source read
+            // with the current revision and authority epoch.
+            spendMany(budget, now, CACHE_RETENTION_EFFECTIVE_DEPENDENCY_QUERIES);
+            try {
+              const effectiveOwner: StorageCommunityOwner = {
+                participantId: owner.participant_id, ownerDigest: candidate.ownerDigest,
+                inputRevision: 1, ownerRevision: owner.revision,
+                authorityEpoch: owner.authority_epoch,
+                hasV1: false, hasV11: false, hasV12: true, hasLegacy: false,
+                hasEffective: true,
+              };
+              const dependency = await effectiveHistoryDependency(options.source,
+                effectiveOwner, options.sourceNamespace, candidate.day, candidate.day,
+                { includeSessions: true });
+              const digest = await sha256Hex(canonicalJson(dependency));
+              let dependenciesMatch = digest === candidate.manifestDigest;
+              // The day key also commits to every non-empty lookback source
+              // identity. Recheck those closed days against the same helper
+              // before resuming a staged reducer; otherwise a late carry-day
+              // upload could be folded under an old target digest.
+              for (const carryDay of carry) {
+                if (!dependenciesMatch) continue;
+                spendMany(budget, now, CACHE_RETENTION_EFFECTIVE_DEPENDENCY_QUERIES);
+                const carryDependency = await effectiveHistoryDependency(options.source,
+                  effectiveOwner, options.sourceNamespace, carryDay.day, carryDay.day,
+                  { includeSessions: true });
+                const carryHasSource = carryDependency.v1.length > 0 || carryDependency.v11.length > 0
+                  || carryDependency.v12.length > 0 || carryDependency.corrections.length > 0
+                  || carryDependency.occurrenceLinks.length > 0;
+                if (carryDay.manifestDigest === "" ? carryHasSource
+                  : await sha256Hex(canonicalJson(carryDependency)) !== carryDay.manifestDigest) {
+                  dependenciesMatch = false;
+                }
+              }
+              if (dependenciesMatch) {
+                build = createCacheRetentionEffectiveDayBuild({ source: options.source, target: options.target,
+                  sourceNamespace: options.sourceNamespace, ownerDigest: candidate.ownerDigest,
+                  ownerRevision: owner.revision, authorityEpoch: owner.authority_epoch, now });
+              }
+            } catch (error) {
+              if (error instanceof CacheRetentionDeferredError) throw error;
+              // A missing/partial effective source or a changed closed-window
+              // dependency is a transient source refusal. Leave the candidate
+              // unbuilt so the next pass can reselect it after projection has
+              // delivered a matching fingerprint.
+            }
+          }
+        } else {
+          spend(budget, now);
+          const pin = await loadV11SourcePin(options.source, link);
+          if (candidate.sourceLayout === "typed-v11") {
           if (pin && pin.source === "v1.1") {
             spend(budget, now);
             spend(budget, now);
@@ -978,23 +1607,24 @@ export function createCacheRetentionDaySourceBuild(options: {
               sourceNamespace: options.sourceNamespace, snapshot,
               ownerDigest: candidate.ownerDigest, now });
           }
-        } else if (pin === null) {
-          spend(budget, now);
-          const scope = await loadTypedV1AnalysisScope(options.source, link);
-          if (scope && scope.sourceNamespace === options.sourceNamespace) {
-            // The pin is scoped to the participant, so it fences every day the
-            // pass reads for this owner and one unrelated upload retries the
-            // owner rather than half-building a day from two vectors.
+          } else if (pin === null) {
             spend(budget, now);
-            spend(budget, now);
-            const sourcePin = await loadV1SourcePin(options.source, { participantId: link });
-            build = createCacheRetentionV1DayBuild({ source: options.source,
-              sourceNamespace: options.sourceNamespace, scope, pin: sourcePin,
-              ownerDigest: candidate.ownerDigest, now });
+            const scope = await loadTypedV1AnalysisScope(options.source, link);
+            if (scope && scope.sourceNamespace === options.sourceNamespace) {
+              // The pin is scoped to the participant, so it fences every day the
+              // pass reads for this owner and one unrelated upload retries the
+              // owner rather than half-building a day from two vectors.
+              spend(budget, now);
+              spend(budget, now);
+              const sourcePin = await loadV1SourcePin(options.source, { participantId: link });
+              build = createCacheRetentionV1DayBuild({ source: options.source,
+                sourceNamespace: options.sourceNamespace, scope, pin: sourcePin,
+                ownerDigest: candidate.ownerDigest, now });
+            }
           }
         }
       }
-      resolved.set(memo, build);
+      if (candidate.sourceLayout !== "effective") resolved.set(memo, build);
     }
     if (build === null) throw new CacheRetentionRefusedError("owner_source_unavailable");
     return build(candidate, carry, budget);
@@ -1026,10 +1656,10 @@ const shardSql = (column: string): string =>
     +(instr('0123456789abcdef',substr(${column},2,1))-1))%?5=?6)`;
 
 /**
- * The candidate selection: oldest day first across BOTH delivered layouts.
+ * The candidate selection: oldest day first across all delivered layouts.
  *
  * Each arm is limited on its own before the union, so the compound never
- * materializes more than `2 * maxDays` rows; taking the oldest N of each arm
+ * materializes more than `3 * maxDays` rows; taking the oldest N of each arm
  * and then the oldest N of the union is the oldest N overall.
  *
  * The v1 arm derives its day identity rather than reading one, for the reason
@@ -1038,12 +1668,10 @@ const shardSql = (column: string): string =>
  * comes from the runtime source row the marks table already keys on by foreign
  * key, so no second copy of that name enters the lane.
  *
- * The arm also excludes any owner that has v1.1 rows. `typed_v1_v11_transition_
- * unqualified` already refuses a v1.1 domain for a participant holding typed v1
- * evidence, so the two can never both be delivered — but the pooled community
- * merge sums every mark, and an owner-day appearing under both layouts would be
- * counted twice. That is the one failure this selection can rule out itself
- * rather than inherit, so it does.
+ * An effective owner/day row supersedes either legacy layout. The suppression
+ * is repeated in both legacy arms and the read path also filters stale overlap,
+ * so a daily projection completing between two lane passes cannot make one
+ * owner-day count twice.
  */
 const SELECTION_SQL = `SELECT * FROM (
     SELECT DISTINCT v.source_id AS source_id,v.source_layout AS source_layout,
@@ -1056,6 +1684,9 @@ const SELECTION_SQL = `SELECT * FROM (
     WHERE v.source_id=?1 AND v.source_layout='typed-v11' AND (?2 IS NULL OR v.day>=?2)
       AND NOT EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
         WHERE f.source_id=v.source_id AND f.owner_digest=v.owner_digest)
+      AND NOT EXISTS(SELECT 1 FROM analytics_community_daily_owners e
+        WHERE e.source_id=v.source_id AND e.owner_digest=v.owner_digest AND e.day=v.day
+          AND e.source_format='effective' AND e.complete=1)
       AND NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_marks m
         WHERE m.source_id=v.source_id AND m.owner_digest=v.owner_digest AND m.day=v.day
           AND m.method_version=?3 AND m.source_layout=v.source_layout
@@ -1086,6 +1717,9 @@ const SELECTION_SQL = `SELECT * FROM (
           AND o.owner_digest=c.owner_digest AND o.state='active')
         AND NOT EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
           WHERE f.source_id=c.source_id AND f.owner_digest=c.owner_digest)
+        AND NOT EXISTS(SELECT 1 FROM analytics_community_daily_owners e
+          WHERE e.source_id=c.source_id AND e.owner_digest=c.owner_digest
+            AND e.day=c.observed_day AND e.source_format='effective' AND e.complete=1)
         AND NOT EXISTS(SELECT 1 FROM analytics_v11_reusable_values x
           WHERE x.source_id=c.source_id AND x.owner_digest=c.owner_digest)
       GROUP BY c.source_id,c.owner_digest,c.observed_day) d
@@ -1100,6 +1734,29 @@ const SELECTION_SQL = `SELECT * FROM (
                 AND w.observed_day=y.day
               GROUP BY w.owner_digest,w.observed_day),'')))
     ORDER BY d.day,d.owner_digest LIMIT ?4)
+  UNION ALL
+  SELECT * FROM (
+    SELECT e.source_id AS source_id,'effective' AS source_layout,
+      (SELECT r.source_namespace FROM analytics_runtime_sources r
+        WHERE r.source_id=e.source_id) AS source_namespace,
+      e.owner_digest AS owner_digest,'${CACHE_RETENTION_EFFECTIVE_DEVICE_ID}' AS device_id,
+      '${CACHE_RETENTION_EFFECTIVE_MANIFEST_ID}' AS manifest_id,
+      ${effectiveDependencyDigestSql("e")} AS manifest_digest,e.day AS day
+    FROM analytics_community_daily_owners e
+    JOIN analytics_owner_state o ON o.source_id=e.source_id AND o.owner_digest=e.owner_digest
+      AND o.state='active'
+    WHERE e.source_id=?1 AND e.source_format='effective' AND e.complete=1
+      AND ${effectiveDependencyDigestSql("e")} IS NOT NULL
+      AND (?2 IS NULL OR e.day>=?2)
+      AND NOT EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
+        WHERE f.source_id=e.source_id AND f.owner_digest=e.owner_digest)
+      AND NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_marks m
+        WHERE m.source_id=e.source_id AND m.owner_digest=e.owner_digest AND m.day=e.day
+          AND m.method_version=?3 AND m.device_id='${CACHE_RETENTION_EFFECTIVE_DEVICE_ID}'
+          AND m.manifest_id='${CACHE_RETENTION_EFFECTIVE_MANIFEST_ID}'
+          AND ${effectiveMarkCurrentSql("m")})
+      AND ${shardSql("e.owner_digest")}
+    ORDER BY e.day,e.owner_digest LIMIT ?4)
   ORDER BY day,owner_digest,device_id LIMIT ?4`;
 
 /**
@@ -1199,7 +1856,10 @@ export async function advanceCacheRetentionDayLane(options: {
       if (!(error instanceof CacheRetentionDeferredError)) throw error;
       return idle(built + staged ? "progress" : "deferred", error.reason, candidates.length, spent());
     }
-    const result = await writeCacheRetentionDay({ target, key: candidate, carry, aggregate, maxWrites });
+    const progressKey = candidate.sourceLayout === "effective"
+      ? await cacheRetentionDayMarkKey(candidate, await cacheRetentionStorageCarryDigest(candidate, carry))
+      : undefined;
+    const result = await writeCacheRetentionDay({ target, key: candidate, carry, aggregate, maxWrites, progressKey });
     if (result.status === "stored") built += 1; else staged += 1;
   }
   // A pass that only refused still advanced: it recorded refusals the next
@@ -1240,9 +1900,16 @@ export async function readCacheRetentionCommunityBands(input: {
       SUM(b.matched_or_exceeded) matched_or_exceeded, SUM(b.unordered_ties) unordered_ties,
       SUM(b.excluded_insufficient_evidence) excluded_insufficient_evidence,
       SUM(b.excluded_context_contracted) excluded_context_contracted, SUM(b.sessions) sessions
-    FROM analytics_cache_retention_day_bands b${model
-      ? " JOIN analytics_cache_retention_day_values v ON v.value_key=b.value_key" : ""}
+    FROM analytics_cache_retention_day_bands b
+    JOIN analytics_cache_retention_day_values v ON v.value_key=b.value_key
+    JOIN analytics_cache_retention_day_marks m ON m.mark_key=v.mark_key
     WHERE b.source_id=? AND b.method_version=?${input.fromDay === undefined ? "" : " AND b.day>=?"}
+      AND ((${effectiveMarkCurrentSql("m", true)}) OR
+        (m.source_layout!='effective' AND NOT EXISTS(
+          SELECT 1 FROM analytics_cache_retention_day_marks e
+          WHERE ${effectiveMarkCurrentSql("e", true)}
+            AND e.method_version=m.method_version AND e.source_id=m.source_id
+            AND e.owner_digest=m.owner_digest AND e.day=m.day)))
     GROUP BY b.owner_digest,b.band${model ? ",v.model" : ""} ORDER BY b.owner_digest,b.band`)
     .bind(...[input.sourceId, method, ...(input.fromDay === undefined ? [] : [input.fromDay])])
     .all<{ owner_digest: string; band: string; adjacencies: number; reused_more_than_half: number;

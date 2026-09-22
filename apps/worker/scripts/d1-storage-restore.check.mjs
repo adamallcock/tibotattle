@@ -28,6 +28,22 @@ test('incomplete pages retain stage and counters cannot leak record fields',asyn
  await assert.rejects(runStorageRestoreStep({api,source,target,contract,contractDigest:'0'.repeat(64),stage:'copy-authority'}));
  await assert.rejects(runStorageRestorePage({state:initial(),save:async()=>{},api,source,target,contract,contractDigest,maxSteps:33}));
 });
+test('typed evidence restore preserves its role and never runs legacy conversion or bootstrap',async()=>{
+ const contract={version:'typed-evidence-restore-v1'},contractDigest=identityDigest(contract),calls=[];
+ const methods=['freezeAuthorityRestoreSource','beginAuthorityRestore','copyAuthorityPage','sealAuthorityRestore',
+  'completeAuthorityVerification','promoteAuthorityRestore','finalizeAuthorityRestore'];
+ const api={...apiBase,...Object.fromEntries(methods.map(name=>[name,async()=>{calls.push(name);return {state:'complete'};}]))};
+ const state={...initial(),contractDigest};
+ const result=await runStorageRestorePage({state,save:async()=>{},api,source,target,contract,contractDigest,maxSteps:32});
+ assert.equal(result.stage,null);assert.equal(result.steps,9);
+ assert.deepEqual(calls,['freezeAuthorityRestoreSource','beginAuthorityRestore','copyAuthorityPage','sealAuthorityRestore',
+  'copyAuthorityPage','completeAuthorityVerification','promoteAuthorityRestore','finalizeAuthorityRestore','finalizeAuthorityRestore']);
+ for(const stage of ['copy-v1','copy-v11','adopt-v1','verify-v11','initialize-bootstrap','bootstrap']){
+  await assert.rejects(runStorageRestoreStep({api,source,target,contract,contractDigest,stage}),/RESTORE_STEP_INVALID/);
+  await assert.rejects(runStorageRestorePage({state:{...state,stage},save:async()=>{},api,source,target,contract,contractDigest}),/RESTORE_STEP_INVALID/);
+ }
+ assert.equal(calls.length,9);
+});
 test('local transport preserves native batch rollback, exact BLOB and null',async()=>{
  const mf=new Miniflare({host:'127.0.0.1',cf:false,modules:true,script:SYNTHETIC_D1_WORKER,compatibilityDate:'2026-07-26',d1Databases:['SOURCE','TARGET','REFERENCE']});
  try{
@@ -73,19 +89,29 @@ test('temporary worker claims one page under concurrent schedules and advances o
  }finally{await closeSyntheticD1Bindings(mf);await mf.dispose();}
 });
 test('ingestion qualification binds tested restore base and complete ordered role inputs',async t=>{
- const {mkdtemp,mkdir,writeFile,rm,realpath}=await import('node:fs/promises'),{tmpdir}=await import('node:os'),{join}=await import('node:path');
- const {loadStorageQualification,storageSha256,storageSchemaDigest}=await import('./d1-storage-plan.mjs');
+ const {mkdtemp,mkdir,writeFile,readFile,rm,realpath}=await import('node:fs/promises'),{tmpdir}=await import('node:os'),{join,dirname}=await import('node:path'),{fileURLToPath}=await import('node:url');
+ const {loadStorageQualification,storageSha256,storageSchemaDigest,TELEMETRY_USAGE_CORRECTION_SCHEMA_OBJECTS}=await import('./d1-storage-plan.mjs');
  const {INGESTION_ROLE_INPUT_DIRECTORIES}=await import('./d1-storage-role.mjs');
+ const workerRoot=dirname(dirname(fileURLToPath(import.meta.url)));
+ const correctionSql=await readFile(join(workerRoot,'ingestion-isolation-migrations','0006_usage_correction_facts.sql'),'utf8');
+ const correctionNames=[...correctionSql.matchAll(/\bCREATE\s+(?:UNIQUE\s+)?(?:TABLE|VIEW|INDEX|TRIGGER)\s+(?:"([A-Za-z_][A-Za-z0-9_]*)"|([A-Za-z_][A-Za-z0-9_]*))/gi)]
+  .map(match=>match[1]??match[2]).filter(name=>name.startsWith('telemetry_usage_correction_')).sort();
+ assert.deepEqual(correctionNames,[...TELEMETRY_USAGE_CORRECTION_SCHEMA_OBJECTS].sort());
  const root=await realpath(await mkdtemp(join(tmpdir(),'storage-role-parser-')));t.after(()=>rm(root,{recursive:true,force:true}));
  const directory=join(root,'.release-build/ingestion-role-migrations');await mkdir(directory,{recursive:true});
  const sourceCommit='a'.repeat(40),migrations=[];
- for(const name of INGESTION_ROLE_INPUT_DIRECTORIES){await mkdir(join(root,name));const sql='CREATE TABLE synthetic(id INTEGER PRIMARY KEY);';await writeFile(join(root,name,'0001_synthetic.sql'),sql);
-  migrations.push({directory:name,name:'0001_synthetic.sql',sha256:storageSha256(sql),bytes:Buffer.byteLength(sql)});}
+ for(const name of INGESTION_ROLE_INPUT_DIRECTORIES){await mkdir(join(root,name));const migrationName=name==='ingestion-isolation-migrations'?'0006_usage_correction_facts.sql':'0001_synthetic.sql';const sql='CREATE TABLE synthetic(id INTEGER PRIMARY KEY);';await writeFile(join(root,name,migrationName),sql);
+  migrations.push({directory:name,name:migrationName,sha256:storageSha256(sql),bytes:Buffer.byteLength(sql)});}
  const objects=['participants','device_credentials','upload_authorizations','accountless_enrollment_ledger','telemetry_contributions','telemetry_records',
   'telemetry_contribution_occurrences','typed_telemetry_records','typed_v1_admission_state','typed_v11_record_proofs','typed_v11_manifest_memberships','telemetry_v11_domain_heads',
   'storage_v11_owner_links','storage_legacy_event_sources','ingestion_analytics_separation','storage_v11_append_transitions']
   .map(name=>({type:'table',name,tbl_name:name,sql:`CREATE TABLE ${name}(id INTEGER PRIMARY KEY)`}));
  objects.push({type:'view',name:'typed_v11_record_admissions',tbl_name:'typed_v11_record_admissions',sql:'CREATE VIEW typed_v11_record_admissions AS SELECT * FROM typed_v11_record_proofs'});
+ objects.push(...TELEMETRY_USAGE_CORRECTION_SCHEMA_OBJECTS.filter(name=>!objects.some(object=>object.name===name)).map(name=>{
+  const table=name.includes('_facts')?'telemetry_usage_correction_facts':name.includes('_history')?'telemetry_usage_correction_history':'telemetry_usage_correction_runtime';
+  const type=name==='telemetry_usage_correction_effective_facts'?'view':name.endsWith('_index')||name.includes('_identity')||name.includes('_owner_time')||name.includes('_source')?'index':name.includes('_cas_guard_')||name.includes('_erasure')||name.includes('_immutable')||name.includes('_provenance')||name.endsWith('_fact')||name.endsWith('_retirement')?'trigger':'table';
+  return {type,name,tbl_name:type==='view'?name:table,sql:type==='table'?`CREATE TABLE ${name}(id INTEGER PRIMARY KEY)`:type==='view'?`CREATE VIEW ${name} AS SELECT 1`:type==='index'?`CREATE INDEX ${name} ON ${table}(id)`:`CREATE TRIGGER ${name} AFTER INSERT ON ${table} BEGIN SELECT 1; END`};
+ }));
  const inputs={schema:'d1-ingestion-role-inputs-v1',sourceCommit,frozen:true,migrations,inputSha256:identityDigest(migrations)};
  const finalRole=JSON.stringify(objects),roleInputs=JSON.stringify(inputs),base='CREATE TABLE synthetic(id INTEGER PRIMARY KEY);';
  await writeFile(join(directory,'final-role-schema.json'),finalRole);await writeFile(join(directory,'role-inputs.json'),roleInputs);await writeFile(join(directory,'0001_restore_base.sql'),base);
@@ -98,11 +124,16 @@ test('ingestion qualification binds tested restore base and complete ordered rol
  const manifest={schema:'d1-storage-schema-qualification-v1',status:'qualified',role:'ingestion',directory:'.release-build/ingestion-role-migrations',sourceCommit,
   qualificationScope:'restore-base-schema-only',runtimeReady:false,finalRoleSchemaSha256:proof.finalRoleSchemaSha256,roleInputsSha256:proof.roleInputsSha256,
   migrations:[{name:'0001_restore_base.sql',sha256:storageSha256(base),beforeSchemaSha256:storageSchemaDigest([]),afterSchemaSha256:'d'.repeat(64)}]};
- const save=async()=>{const evidence=JSON.stringify(proof);await writeFile(join(directory,'qualification-evidence.json'),evidence);manifest.evidenceSha256=storageSha256(evidence);
+ const save=async(roleObjects=objects)=>{const finalRole=JSON.stringify(roleObjects);await writeFile(join(directory,'final-role-schema.json'),finalRole);proof.finalRoleSchemaSha256=storageSha256(finalRole);proof.finalSchemaSha256=storageSchemaDigest(roleObjects);manifest.finalRoleSchemaSha256=proof.finalRoleSchemaSha256;const evidence=JSON.stringify(proof);await writeFile(join(directory,'qualification-evidence.json'),evidence);manifest.evidenceSha256=storageSha256(evidence);
   const bytes=JSON.stringify(manifest);await writeFile(join(directory,'qualification.json'),bytes);return {workerRoot:root,plan:{sourceCommit},target:{role:'ingestion',qualificationSha256:storageSha256(bytes)}};};
  assert.equal((await loadStorageQualification(await save())).migrations.length,1);
+ const partial=objects.filter(object=>object.name!=='telemetry_usage_correction_history');
+ await assert.rejects(loadStorageQualification(await save(partial)),/ROLE_QUALIFICATION_INCOMPLETE/);
+ const viewOnly=objects.filter(object=>!TELEMETRY_USAGE_CORRECTION_SCHEMA_OBJECTS.includes(object.name)
+   ||object.name==='telemetry_usage_correction_effective_facts');
+ await assert.rejects(loadStorageQualification(await save(viewOnly)),/ROLE_QUALIFICATION_INCOMPLETE/);
  proof.baseSqlSha256='f'.repeat(64);await assert.rejects(loadStorageQualification(await save()),/ROLE_QUALIFICATION_INVALID/);proof.baseSqlSha256=storageSha256(base);
  proof.frozenSource=false;await assert.rejects(loadStorageQualification(await save()),/ROLE_QUALIFICATION_INVALID/);proof.frozenSource=true;
  manifest.runtimeReady=true;await assert.rejects(loadStorageQualification(await save()),/ROLE_QUALIFICATION_INVALID/);manifest.runtimeReady=false;
- await writeFile(join(root,'ingestion-isolation-migrations','0001_synthetic.sql'),'changed');await assert.rejects(loadStorageQualification(await save()),/ROLE_INPUT_CHANGED/);
+ await writeFile(join(root,'ingestion-isolation-migrations','0006_usage_correction_facts.sql'),'changed');await assert.rejects(loadStorageQualification(await save()),/ROLE_INPUT_CHANGED/);
 });

@@ -31,14 +31,14 @@ import {claimStorageGraphWorkSelection,completeStorageGraphWorkSelection,discard
 const fail=()=>new Error('STORAGE_GRAPH_WORK_UNAVAILABLE');
 const CURRENT_FIT_CACHE_PAGE=64;
 const SCOPE_RETRY_HEADROOM_MS=4_000;
-type CachedGraphResult={owner_digest:string;source_kind:'v0.2'|'v1'|'v1.1'|'mixed'};
+type CachedGraphResult={owner_digest:string;source_kind:'v0.2'|'v1'|'v1.1'|'mixed'|'effective'};
 export interface StorageGraphWorkProgress {
  state:'complete'|'reused'|'deferred'|'idle';metric?:'fits'|'model';day?:string;reason?:string;
  failure?:StorageGraphFailureFields;
 }
 
 function ownerSource(owner:StorageCommunityOwner):CachedGraphResult['source_kind'] {
- return owner.hasV11?'v1.1':owner.hasV1?owner.hasLegacy?'mixed':'v1':'v0.2';
+ return owner.hasEffective?'effective':owner.hasV11?'v1.1':owner.hasV1?owner.hasLegacy?'mixed':'v1':'v0.2';
 }
 
 /** A current fit is publishable as a completed snapshot across later appends,
@@ -57,7 +57,7 @@ async function nextMissingCurrentFitPosition(target:D1Database,sourceId:string,o
   if(rows.length>page.length)throw fail();
   const expected=new Set(page);
   for(const row of rows) {
-   if(!expected.has(row.owner_digest)||!['v0.2','v1','v1.1','mixed'].includes(row.source_kind))throw fail();
+   if(!expected.has(row.owner_digest)||!['v0.2','v1','v1.1','mixed','effective'].includes(row.source_kind))throw fail();
    cached.set(row.owner_digest,row.source_kind);
   }
  }
@@ -86,7 +86,7 @@ async function nextMissingHistoricalModelPosition(target:D1Database,sourceId:str
   if(rows.length>page.length)throw fail();
   const expected=new Set(page);
   for(const row of rows) {
-   if(!expected.has(row.owner_digest)||!['v0.2','v1','v1.1','mixed'].includes(row.source_kind))throw fail();
+   if(!expected.has(row.owner_digest)||!['v0.2','v1','v1.1','mixed','effective'].includes(row.source_kind))throw fail();
    cached.set(row.owner_digest,row.source_kind);
   }
  }
@@ -131,7 +131,7 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   if(page>=COMMUNITY_MODEL_CACHE_MAX_PAGES)return {state:'deferred',reason:'cohort_capacity'};
   const rows=await readStorageCommunityOwnerPage(options.source,{afterParticipantId:after});
   for(const owner of rows) {
-   if(!owner.hasV1&&!owner.hasV11&&!owner.hasLegacy)continue;
+  if(!owner.hasV1&&!owner.hasV11&&!owner.hasV12&&!owner.hasLegacy)continue;
    bytes+=new TextEncoder().encode(JSON.stringify(owner)).byteLength;
    if(bytes>COMMUNITY_MODEL_CACHE_MAX_BYTES)return {state:'deferred',reason:'cohort_capacity'};
    owners.push(owner);
@@ -193,7 +193,7 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   }
  };
  let scope:StorageGraphScope,selection:StorageGraphWorkSelection|null=null,claimToken:string|null=null;
- if(owner.hasV11){
+ if(owner.hasV11&&!owner.hasEffective){
   const key:StorageGraphSelectionKey={sourceId:options.sourceId,ownerDigest:owner.ownerDigest,day,metric};
   const existing=await withStorageGraphFailureStage('graph_scope',()=>readStorageGraphWorkSelection(options.target,key));
   if(existing&&existing.state!=='complete'){
