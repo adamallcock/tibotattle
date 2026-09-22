@@ -25,9 +25,12 @@ commit, the owner-captured Worker version/config metadata, and its canonical
 proof digest. The Worker live-checks `DEPLOYMENT_SOURCE_COMMIT` against the
 receipt and re-reads both D1 roles before activation. The version and config
 metadata are bound into the owner-authenticated receipt; this deployment does
-not expose runtime bindings for them. The shared provider-schema predicate is
-used when calculating the schema digest, so exact provider-owned metadata is
-excluded while a shadow object remains visible as drift.
+not expose runtime bindings for them. The receipt fields are evidence pins;
+the maintained operator transaction independently captures and compares the
+live version/config immediately around the admin POST under the shared
+production lock. The shared provider-schema predicate is used when calculating
+the schema digest, so exact provider-owned metadata is excluded while a shadow
+object remains visible as drift.
 
 The Worker activation gate also checks the four typed-forward ledger rows and
 their source hashes, the final typed v1/v1.1 and successor schema objects, the
@@ -38,7 +41,7 @@ controls must both be enabled.
 
 The runtime row must still be `staged`. Record its current `policy_revision`
 from a read-only post-deploy check and use that value as `expectedRevision`.
-Do not guess a revision or start a new operation against an already-active
+Do not guess a revision or start a new operation/key against an already-active
 row. An exact retry of the same idempotency key and complete request is the
 lost-response recovery path. A stale revision, tuple mismatch, missing schema
 object, disabled control, or JSON storage mode is a refusal and does not
@@ -75,10 +78,29 @@ produce an activation success.
    fingerprint are captured from the same Worker inventory. The generator
    refuses an existing output path, so preserve the original receipt for
    recovery evidence and choose a new path for a recapture.
-6. From the owner-pinned Access/admin session, with the existing CSRF
-   protection, submit exactly one `run_maintenance` request for the usage
-   target. Generate a fresh bounded UUIDv4 idempotency key for the attempt and
-   include the exact reconciliation receipt from the post-deploy check:
+6. Create two owner-private, mode `0600` JSON files: the request file contains
+   the exact body below (with the receipt copied byte-for-byte), and the admin
+   session file contains the owner session used by the maintained operator
+   entrypoint. The session file shape is:
+
+   ```json
+   {
+    "schema": "telemetry-runtime-admin-session-v1",
+    "origin": "https://admin.tibotattle.com",
+    "cookie": "CF_Authorization=<owner Access cookie>",
+    "csrfToken": null,
+    "accessJwt": "<same owner Access JWT as CF_Authorization>"
+  }
+  ```
+
+   Keep the Access cookie and JWT only in that private file. The maintained
+   entrypoint posts exactly `POST /api/v1/admin/action` with the exact origin
+   and `x-usage-monitor-admin: 1`; it sends the optional CSRF header only when
+   a session token is supplied. It accepts either the verified Access JWT
+   header or the `CF_Authorization` cookie and never prints session values. It
+   refuses any origin other than the reviewed admin origin. Generate a fresh
+   bounded UUIDv4 idempotency key for the attempt and include the exact
+   reconciliation receipt from the post-deploy check:
 
    ```json
    {
@@ -94,6 +116,14 @@ produce an activation success.
         "sourceCommit": "<40 lowercase hex characters>",
         "versionId": "<owner-captured deployed Worker version UUID>",
         "configSha256": "<owner-captured live config SHA-256>",
+        "deploymentAttestation": {
+          "schema": "typed-forward-live-deployment-attestation-v1",
+          "capturedAt": "<canonical ISO timestamp>",
+          "sourceCommit": "<same deployed source commit>",
+          "versionId": "<same owner-captured deployed Worker version UUID>",
+          "configSha256": "<same owner-captured live config SHA-256>",
+          "attestationSha256": "<SHA-256 of the canonical unsigned attestation>"
+        },
         "primary": {
           "schemaSha256": "<64 lowercase hex characters>",
           "ledgerSha256": "<64 lowercase hex characters>"
@@ -109,19 +139,36 @@ produce an activation success.
    ```
 
    Replace `1` with the reconciled revision and obtain the proof fields from
-   the operator receipt; do not hand-edit its digests. The endpoint performs
-   one D1 batch containing the runtime compare-and-swap, the collection-control
-   revision guard, and the terminal success audit update. The batch either
-   commits all of those changes or commits none. It writes only the
-   digest-only admin audit envelope and singleton runtime row; no participant
-   or event payload is included.
+   the operator receipt; do not hand-edit its digests. Run the maintained
+   operator transaction from the repository root:
+
+   ```sh
+   node apps/worker/scripts/telemetry-runtime-reconciliation.mjs \
+     --mode activate \
+     --account-id <account-id> \
+     --worker-name <production-worker-name> \
+     --repository-root "$PWD" \
+     --operation-directory <owner-private-directory>/telemetry-runtime-activation \
+     --request-file <owner-private-directory>/telemetry-runtime-activation-request.json \
+     --admin-session-file <owner-private-directory>/telemetry-runtime-admin-session.json
+   ```
+
+   The entrypoint acquires the shared production lock, captures the live
+   Worker version/config immediately before the POST, compares those facts to
+   the nested deployment attestation, and captures them again before releasing
+   the lock. A stale version/config receipt is refused before the POST. The
+   endpoint performs one D1 batch containing the runtime compare-and-swap, the
+   collection-control revision guard, and the terminal success audit update.
+   The batch either commits all of those changes or commits none. It writes
+   only the closed, content-free activation request envelope and singleton
+   runtime row; no participant or event payload is included.
 7. Verify the response and runtime row read-only. Confirm `state = active`,
    the revision increased by exactly one, and the independent performance row
    remains staged. Keep the response and audit operation identifier with the
    release evidence.
 
-Performance activation is optional and follows the same proof and sequence only after
-its separate collection decision. Its exact request is:
+Performance activation is optional and follows the same proof and operator
+sequence only after its separate collection decision. Its exact request is:
 
 ```json
 {
@@ -158,6 +205,17 @@ staged. A `started` audit alongside an active runtime is ambiguous and returns
 the reconcile-required error; inspect the exact operation id, runtime row, and
 audit row before taking any further action. Never promote that audit by reading
 the runtime alone.
+
+The maintained operator command journals its lock and POST boundary in the
+owner-private operation directory. If it exits after `lock_intent`, rerun the
+same command with `--resume`; it adopts that exact owner when the shared lock
+is already held or acquires it when the lock is still absent. If it exits with
+`admin_intent`, `--resume` asserts the existing owner and retries the exact
+same request, which is safe because the Worker idempotency key is unchanged.
+If it exits with `release_intent`, `--resume` releases or reconciles that exact
+owner and returns the stored result without posting again. A deployment
+version/config drift refuses before the POST; create a new reconciliation proof
+and a new operation key after the deployment is stable.
 
 If post-deploy verification fails, leave the target staged and resolve the
 migration, schema, configuration, or collection-control issue before retrying

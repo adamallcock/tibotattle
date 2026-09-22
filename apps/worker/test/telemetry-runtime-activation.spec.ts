@@ -2,11 +2,13 @@ import { applyD1Migrations, env, reset, type D1Migration } from "cloudflare:test
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   activateTelemetryRuntimeAsOwner,
+  canonicalTelemetryRuntimeDeploymentAttestationJson,
   canonicalTelemetryRuntimeReconciliationJson,
   EXPECTED_ANALYTICS_MIGRATIONS,
   EXPECTED_PRIMARY_MIGRATIONS,
   parseTelemetryRuntimeActivationRequest,
   TELEMETRY_RUNTIME_ACTIVATION_CONFIRMATIONS,
+  TELEMETRY_RUNTIME_DEPLOYMENT_ATTESTATION_SCHEMA,
   TELEMETRY_RUNTIME_RECONCILIATION_SCHEMA,
   telemetryRuntimeReconciliationDigests,
   type TelemetryRuntimeActivationRequest,
@@ -83,12 +85,26 @@ async function installForwardLedger(): Promise<void> {
 }
 
 async function installReconciliationProof(): Promise<void> {
+  const deploymentAttestationUnsigned = {
+    schema: TELEMETRY_RUNTIME_DEPLOYMENT_ATTESTATION_SCHEMA,
+    capturedAt: "2026-09-22T14:58:00.000Z",
+    sourceCommit: SOURCE_COMMIT,
+    versionId: VERSION_ID,
+    configSha256: CONFIG_SHA256,
+  } as const;
+  const deploymentAttestation = {
+    ...deploymentAttestationUnsigned,
+    attestationSha256: await sha256Hex(
+      canonicalTelemetryRuntimeDeploymentAttestationJson(deploymentAttestationUnsigned),
+    ),
+  };
   const proofWithoutDigest = {
     schema: TELEMETRY_RUNTIME_RECONCILIATION_SCHEMA,
     capturedAt: "2026-09-22T14:59:00.000Z",
     sourceCommit: SOURCE_COMMIT,
     versionId: VERSION_ID,
     configSha256: CONFIG_SHA256,
+    deploymentAttestation,
     primary: await telemetryRuntimeReconciliationDigests(db()),
     analytics: await telemetryRuntimeReconciliationDigests(analytics()),
   } satisfies Omit<TelemetryRuntimeActivationRequest["reconciliation"], "proofSha256">;
@@ -175,6 +191,25 @@ describe("protected telemetry runtime activation", () => {
       code: "ADMIN_ACTION_CONFLICT",
     });
     expect(await runtimeRow("usage_v12")).toEqual({ state: "active", policy_revision: 2 });
+  });
+
+  it("replays a completed operation before freshness and control gates", async () => {
+    const completed = request("usage_v12");
+    await activateTelemetryRuntimeAsOwner(db(), settings, ACTOR_IDENTITY_KEY, completed, NOW_EPOCH);
+    await db().prepare(
+      `UPDATE collection_controls
+          SET upload_registration_enabled = 0, control_state = 'degraded', revision = revision + 1
+        WHERE singleton = 1`,
+    ).run();
+    const replay = await activateTelemetryRuntimeAsOwner(
+      db(), settings, ACTOR_IDENTITY_KEY, completed, NOW_EPOCH + 86_400_001,
+    );
+    expect(replay).toMatchObject({
+      operationId: completed.idempotencyKey,
+      target: "usage_v12",
+      state: "active",
+      toRevision: 2,
+    });
   });
 
   it("recovers a committed batch response loss and rejects conflicting key reuse", async () => {

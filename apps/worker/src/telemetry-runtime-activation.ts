@@ -33,6 +33,17 @@ export type TelemetryRuntimeActivationTarget = keyof typeof TELEMETRY_RUNTIME_AC
 
 export const TELEMETRY_RUNTIME_RECONCILIATION_SCHEMA =
   "typed-forward-post-deploy-reconciliation-v1" as const;
+export const TELEMETRY_RUNTIME_DEPLOYMENT_ATTESTATION_SCHEMA =
+  "typed-forward-live-deployment-attestation-v1" as const;
+
+export interface TelemetryRuntimeDeploymentAttestation {
+  readonly schema: typeof TELEMETRY_RUNTIME_DEPLOYMENT_ATTESTATION_SCHEMA;
+  readonly capturedAt: string;
+  readonly sourceCommit: string;
+  readonly versionId: string;
+  readonly configSha256: string;
+  readonly attestationSha256: string;
+}
 
 export interface TelemetryRuntimeReconciliationRole {
   readonly schemaSha256: string;
@@ -45,6 +56,7 @@ export interface TelemetryRuntimeReconciliationProof {
   readonly sourceCommit: string;
   readonly versionId: string;
   readonly configSha256: string;
+  readonly deploymentAttestation: TelemetryRuntimeDeploymentAttestation;
   readonly primary: TelemetryRuntimeReconciliationRole;
   readonly analytics: TelemetryRuntimeReconciliationRole;
   readonly proofSha256: string;
@@ -473,6 +485,12 @@ export function canonicalTelemetryRuntimeReconciliationJson(
   return canonicalJson(proof);
 }
 
+export function canonicalTelemetryRuntimeDeploymentAttestationJson(
+  attestation: Omit<TelemetryRuntimeDeploymentAttestation, "attestationSha256">,
+): string {
+  return canonicalJson(attestation);
+}
+
 interface ReconciliationSchemaRow {
   readonly type: string;
   readonly name: string;
@@ -567,8 +585,8 @@ function parseReconciliationRole(value: unknown): TelemetryRuntimeReconciliation
 
 function parseReconciliationProof(value: unknown): TelemetryRuntimeReconciliationProof {
   if (!exactObject(value, [
-    "analytics", "capturedAt", "configSha256", "primary", "proofSha256",
-    "schema", "sourceCommit", "versionId",
+    "analytics", "capturedAt", "configSha256", "deploymentAttestation", "primary",
+    "proofSha256", "schema", "sourceCommit", "versionId",
   ])
       || value.schema !== TELEMETRY_RUNTIME_RECONCILIATION_SCHEMA
       || !canonicalIso(value.capturedAt)
@@ -588,9 +606,36 @@ function parseReconciliationProof(value: unknown): TelemetryRuntimeReconciliatio
     sourceCommit: value.sourceCommit,
     versionId: value.versionId,
     configSha256: value.configSha256,
+    deploymentAttestation: parseDeploymentAttestation(value.deploymentAttestation),
     primary: parseReconciliationRole(value.primary),
     analytics: parseReconciliationRole(value.analytics),
     proofSha256: value.proofSha256,
+  });
+}
+
+function parseDeploymentAttestation(value: unknown): TelemetryRuntimeDeploymentAttestation {
+  if (!exactObject(value, [
+    "attestationSha256", "capturedAt", "configSha256", "schema", "sourceCommit", "versionId",
+  ])
+      || value.schema !== TELEMETRY_RUNTIME_DEPLOYMENT_ATTESTATION_SCHEMA
+      || !canonicalIso(value.capturedAt)
+      || typeof value.sourceCommit !== "string"
+      || !COMMIT_PATTERN.test(value.sourceCommit)
+      || typeof value.versionId !== "string"
+      || !UUID_PATTERN.test(value.versionId)
+      || typeof value.configSha256 !== "string"
+      || !SHA256_PATTERN.test(value.configSha256)
+      || typeof value.attestationSha256 !== "string"
+      || !SHA256_PATTERN.test(value.attestationSha256)) {
+    invalidActivation();
+  }
+  return Object.freeze({
+    schema: TELEMETRY_RUNTIME_DEPLOYMENT_ATTESTATION_SCHEMA,
+    capturedAt: value.capturedAt,
+    sourceCommit: value.sourceCommit,
+    versionId: value.versionId,
+    configSha256: value.configSha256,
+    attestationSha256: value.attestationSha256,
   });
 }
 
@@ -720,6 +765,7 @@ async function assertReconciliationProof(
     sourceCommit: proof.sourceCommit,
     versionId: proof.versionId,
     configSha256: proof.configSha256,
+    deploymentAttestation: proof.deploymentAttestation,
     primary: proof.primary,
     analytics: proof.analytics,
   } satisfies Omit<TelemetryRuntimeReconciliationProof, "proofSha256">;
@@ -727,9 +773,27 @@ async function assertReconciliationProof(
     unavailableActivation();
   }
 
+  const attestation = proof.deploymentAttestation;
+  const attestationUnsigned = {
+    schema: attestation.schema,
+    capturedAt: attestation.capturedAt,
+    sourceCommit: attestation.sourceCommit,
+    versionId: attestation.versionId,
+    configSha256: attestation.configSha256,
+  } satisfies Omit<TelemetryRuntimeDeploymentAttestation, "attestationSha256">;
+  if (await sha256Hex(canonicalTelemetryRuntimeDeploymentAttestationJson(attestationUnsigned))
+      !== attestation.attestationSha256
+      || proof.sourceCommit !== attestation.sourceCommit
+      || proof.versionId !== attestation.versionId
+      || proof.configSha256 !== attestation.configSha256
+      || Date.parse(attestation.capturedAt) > capturedAt) {
+    unavailableActivation();
+  }
+
   const configuredSource = Reflect.get(env, "DEPLOYMENT_SOURCE_COMMIT");
   if (typeof configuredSource !== "string" || !COMMIT_PATTERN.test(configuredSource)
-      || proof.sourceCommit !== configuredSource) {
+      || proof.sourceCommit !== configuredSource
+      || attestation.sourceCommit !== configuredSource) {
     unavailableActivation();
   }
 
@@ -1002,6 +1066,33 @@ function activationDetailsMatch(
   return value;
 }
 
+function completedActivationResult(
+  existing: AuditOutcomeRow,
+  input: TelemetryRuntimeActivationRequest,
+): TelemetryRuntimeActivationResult | null {
+  if (existing.action !== "run_maintenance") {
+    throw new ApiError(409, "ADMIN_ACTION_CONFLICT");
+  }
+  const details = activationDetailsMatch(existing.details_json, input);
+  if (details === null) reconciliationRequired();
+  if (existing.outcome === "failure") {
+    throw new ApiError(409, "ADMIN_ACTION_CONFLICT");
+  }
+  if (existing.outcome !== "success") return null;
+  if (details.state !== "active"
+      || details.fromRevision !== input.expectedRevision
+      || details.toRevision !== input.expectedRevision + 1) {
+    reconciliationRequired();
+  }
+  // A completed operation is the durable replay authority. Do not make an
+  // exact retry depend on mutable controls, current schema, proof freshness,
+  // or the runtime row being readable after its committed audit result exists.
+  return activationResult(existing.operation_id, input, {
+    state: "active",
+    policy_revision: details.toRevision as number,
+  });
+}
+
 async function resolveExistingActivation(
   db: D1Database,
   input: TelemetryRuntimeActivationRequest,
@@ -1104,6 +1195,11 @@ export async function activateTelemetryRuntimeAsOwner(
   let operationId: string | null = null;
   let mutationAttempted = false;
   try {
+    const existingAtEntry = await readActivationAudit(db, input.idempotencyKey);
+    if (existingAtEntry !== null) {
+      const completed = completedActivationResult(existingAtEntry, input);
+      if (completed !== null) return completed;
+    }
     await assertTypedStorage(db, env);
     const controls = await readCollectionControls(db);
     if (!controls.uploadRegistration) throw new ApiError(503, "UPLOAD_REGISTRATION_DISABLED");
@@ -1115,12 +1211,13 @@ export async function activateTelemetryRuntimeAsOwner(
       if (recovered !== null) return recovered;
       throw new ApiError(409, "ADMIN_ACTION_CONFLICT");
     }
-    const existing = await readActivationAudit(db, input.idempotencyKey);
+    const existing = existingAtEntry;
     if (existing !== null) {
       if (existing.action !== "run_maintenance") {
         throw new ApiError(409, "ADMIN_ACTION_CONFLICT");
       }
-      activationDetailsMatch(existing.details_json, input);
+      const details = activationDetailsMatch(existing.details_json, input);
+      if (details === null) reconciliationRequired();
       if (existing.outcome !== "started"
           || runtime.state !== "staged"
           || runtime.policy_revision !== input.expectedRevision) {
