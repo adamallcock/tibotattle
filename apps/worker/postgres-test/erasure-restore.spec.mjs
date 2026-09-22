@@ -25,7 +25,9 @@ const pairingId = "pairing-00000000-0000-4000-8000-000000000001";
 const sessionId = "session-00000000-0000-4000-8000-000000000001";
 const now = Date.parse("2026-09-21T12:00:00.000Z");
 const hash = "a".repeat(64);
+const survivorOwner = "b".repeat(64);
 const zeros = "0".repeat(64);
+const sourceId = "canonical-source";
 const manifestV11 = "00000000-0000-4000-8000-000000000011";
 const manifestV12 = "00000000-0000-4000-8000-000000000012";
 let admin;
@@ -103,22 +105,49 @@ async function seedParticipant() {
   [manifestV12, participantId, deviceId, "7".repeat(64), "8".repeat(64), issued]);
   await primary.query(`INSERT INTO ${primarySchema}.pending_objects(contribution_id,object_key)
     VALUES('chunk-v1','objects/v1'),('chunk-v11','objects/v11'),('chunk-v12','objects/v12')`);
+  await primary.query(`INSERT INTO ${primarySchema}.storage_source_state(singleton,source_id,authority_epoch)
+    VALUES(1,$1,1)`, [sourceId]);
+  await primary.query(`INSERT INTO ${primarySchema}.storage_v11_owner_links
+    (participant_id,owner_digest,state,generation_id,head_revision,object_digest,manifest_digest)
+    VALUES($1,$2,'active','owner-generation-1',1,$3,$4)`,
+  [participantId, hash, hash, hash]);
   await primary.query(`INSERT INTO ${primarySchema}.analytics_owner_state
     (source_id,owner_digest,revision,authority_epoch,state)
-    VALUES($1,$2,1,1,'active')`, [participantId, hash]);
+    VALUES($1,$2,1,1,'active'),($1,$3,1,1,'active')`, [sourceId, hash, survivorOwner]);
   await primary.query(`INSERT INTO ${primarySchema}.analytics_prepared_source_heads
     (source_id,source_namespace,owner_digest,day,generation,input_revision,owner_revision,
      dependency_digest,method,authority_epoch,source_epoch,sequence,state,progress_revision,
      rows_written) VALUES($1,'telemetry-v1',$2,'2026-09-21','g-1',1,1,$3,'test',1,1,1,'ready',0,0)`,
-  [participantId, hash, zeros]);
+  [sourceId, hash, zeros]);
+  await primary.query(`INSERT INTO ${primarySchema}.analytics_publication_captures
+    (source_id,day,metric,generation,cohort_digest,expected_members,payload_json,
+     policy_revision,collection_revision)
+    VALUES($1,'2026-09-21','daily','pub-shared',$2,2,'{}',1,1),
+      ($1,'2026-09-20','daily','pub-survivor',$2,1,'{}',1,1)`, [sourceId, hash]);
+  await primary.query(`INSERT INTO ${primarySchema}.analytics_publications
+    (source_id,day,metric,generation,cohort_digest,authority_json,payload_json,payload_sha256,
+     computed_at_ms,policy_revision,collection_revision)
+    VALUES($1,'2026-09-21','daily','pub-shared',$2,'{}','{}',$3,$4,1,1),
+      ($1,'2026-09-20','daily','pub-survivor',$2,'{}','{}',$3,$4,1,1)`,
+  [sourceId, hash, "d".repeat(64), now]);
+  await primary.query(`INSERT INTO ${primarySchema}.analytics_publication_owner_members
+    (source_id,day,metric,generation,owner_digest)
+    VALUES($1,'2026-09-21','daily','pub-shared',$2),
+      ($1,'2026-09-21','daily','pub-shared',$3),
+      ($1,'2026-09-20','daily','pub-survivor',$3)`,
+  [sourceId, hash, survivorOwner]);
 }
 
 async function restorePrimaryParticipant() {
   await primary.query(`INSERT INTO ${primarySchema}.participants(id,owner_kind,state,created_at)
     VALUES($1,'social','active',$2)`, [participantId, new Date(now)]);
+  await primary.query(`INSERT INTO ${primarySchema}.storage_v11_owner_links
+    (participant_id,owner_digest,state,generation_id,head_revision,object_digest,manifest_digest)
+    VALUES($1,$2,'active','owner-generation-restored',2,$3,$4)`,
+  [participantId, hash, hash, hash]);
   await primary.query(`INSERT INTO ${primarySchema}.analytics_owner_state
     (source_id,owner_digest,revision,authority_epoch,state)
-    VALUES($1,$2,1,1,'active')`, [participantId, hash]);
+    VALUES($1,$2,2,1,'active')`, [sourceId, hash]);
 }
 
 beforeAll(async () => {
@@ -179,6 +208,29 @@ it("retries owner erasure, then suppresses a restored primary from the independe
     registeredAt: referencedRegisteredAt,
     leaseId: "referenced-lease",
   })).toBe("referenced");
+  const raceRegisteredAt = new Date(now).toISOString();
+  await lifecycle.registerQuarantine({
+    objectKind: "telemetry_v1",
+    contributionId: "chunk-race",
+    objectKey: "objects/race",
+    registeredAt: raceRegisteredAt,
+  });
+  expect(await lifecycle.claimQuarantine({
+    objectKey: "objects/race",
+    registeredAt: raceRegisteredAt,
+    leaseId: "race-lease",
+  })).toBe("claimed");
+  await primary.query(`INSERT INTO ${primarySchema}.device_upload_authorizations
+    (id,participant_id,issued_by_device_id,secret_hash,envelope_digest,body_bytes,content_type,
+     state,issued_at,expires_at) VALUES('auth-race',$1,$2,$3,$4,1,'application/json','unused',$5,$6)`,
+  [participantId, deviceId, Buffer.alloc(32, 1), "9".repeat(64), new Date(now), new Date(now + 86_400_000)]);
+  await expect(primary.query(`INSERT INTO ${primarySchema}.telemetry_v1_chunks
+    (id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,chunk_digest,envelope_digest,
+     parser_version,record_count,accepted_record_count,r2_key,device_upload_authorization_id,created_at)
+    VALUES('chunk-race',$1,$2,'quota','2026-09-21',99,1,$3,$4,'test',1,1,'objects/race','auth-race',$5)`,
+  [participantId, deviceId, "e".repeat(64), "9".repeat(64), new Date(now)]))
+    .rejects.toMatchObject({ code: "P1005" });
+  await lifecycle.clearQuarantine({ objectKey: "objects/race", leaseId: "race-lease" });
   const stores = createPostgresParticipantErasureStores(primary, ledger, {
     schemaOptions: { primarySchema, ledgerSchema },
   });
@@ -226,7 +278,15 @@ it("retries owner erasure, then suppresses a restored primary from the independe
   expect(retry).toMatchObject({ deleted: true, contributionsDeleted: 3 });
   expect(deleted.map((row) => row.source)).toEqual(["telemetry_v1", "telemetry_v11", "telemetry_v12"]);
   expect((await primary.query(`SELECT COUNT(*)::int AS count FROM ${primarySchema}.analytics_owner_state`)).rows[0].count)
-    .toBe(0);
+    .toBe(1);
+  expect((await primary.query(`SELECT owner_digest FROM ${primarySchema}.analytics_owner_state`)).rows[0].owner_digest)
+    .toBe(survivorOwner);
+  expect((await primary.query(`SELECT COUNT(*)::int AS count FROM ${primarySchema}.analytics_publications`)).rows[0].count)
+    .toBe(2);
+  expect((await primary.query(`SELECT COUNT(*)::int AS count FROM ${primarySchema}.analytics_publication_invalidations`)).rows[0].count)
+    .toBe(1);
+  expect((await primary.query(`SELECT COUNT(*)::int AS count FROM ${primarySchema}.analytics_publication_owner_members`)).rows[0].count)
+    .toBe(2);
   expect((await ledger.query(`SELECT state FROM ${ledgerSchema}.storage_erasure_jobs`)).rows[0].state)
     .toBe("complete");
 
@@ -242,6 +302,12 @@ it("retries owner erasure, then suppresses a restored primary from the independe
     .toMatchObject({ state: "deleting" });
   expect((await ledger.query(`SELECT COUNT(*)::int AS count FROM ${ledgerSchema}.restore_suppression_receipts`)).rows[0].count)
     .toBe(1);
+  expect((await primary.query(`SELECT state FROM ${primarySchema}.analytics_owner_state
+    WHERE source_id=$1 AND owner_digest=$2`, [sourceId, hash])).rows[0].state).toBe("erased");
+  await expect(requirePostgresStorageParticipantErasureComplete(storageErasure, participantId))
+    .rejects.toMatchObject({ status: 503, code: "BACKEND_STORAGE_UNAVAILABLE" });
+  expect((await ledger.query(`SELECT state FROM ${ledgerSchema}.storage_erasure_jobs`)).rows[0].state)
+    .toBe("pending");
 
   const unavailableGate = createPostgresRestoreSuppressionGate(primary, {
     connect: async () => { throw new Error("ledger offline"); },

@@ -260,6 +260,7 @@ async function deleteParticipantRows(
 
   const sourceTables = [
     "telemetry_v1_chunks", "telemetry_v11_chunks", "telemetry_v12_chunks",
+    "storage_v11_event_sources",
     "telemetry_v1_day_manifests", "telemetry_v11_day_manifests", "telemetry_v12_day_manifests",
     "telemetry_v1_domain_heads", "telemetry_v11_domain_heads", "telemetry_v12_domain_heads",
     "telemetry_v1_domains", "telemetry_v11_domains", "telemetry_v12_domains",
@@ -286,38 +287,88 @@ async function deleteAnalyticsRows(
   client: PostgresClient,
   schema: string,
   sourceId: string,
+  ownerDigest: string,
 ): Promise<void> {
   const owners = await client.query<{ owner_digest: string }>(
-    `SELECT owner_digest FROM ${q(schema, "analytics_owner_state")} WHERE source_id=$1 FOR UPDATE`,
-    [sourceId],
+    `SELECT owner_digest FROM ${q(schema, "analytics_owner_state")}
+      WHERE source_id=$1 AND owner_digest=$2 FOR UPDATE`,
+    [sourceId, ownerDigest],
   );
   const ownerRows = resultRows(owners);
   for (const row of ownerRows) {
-    const ownerDigest = text(row.owner_digest);
-  for (const table of [
+    const persistedOwnerDigest = text(row.owner_digest);
+    for (const table of [
       "analytics_prepared_source_rows", "analytics_prepared_source_heads",
       "analytics_analysis_work_parts", "analytics_analysis_work_heads",
     ]) {
       await client.query(
         `DELETE FROM ${q(schema, table)} WHERE source_id=$1 AND owner_digest=$2`,
-        [sourceId, ownerDigest],
+        [sourceId, persistedOwnerDigest],
       );
     }
   }
-  // The initial publication fragment has no owner_digest column. Refuse to
-  // erase while such rows exist rather than broadening a source-scoped delete
-  // across owners. A forward publication-owner migration makes this branch
-  // owner-scoped and removable by the next adapter revision.
-  const publications = await client.query(
-    `SELECT 1 FROM ${q(schema, "analytics_publications")} WHERE source_id=$1
-     UNION ALL SELECT 1 FROM ${q(schema, "analytics_publication_captures")} WHERE source_id=$1 LIMIT 1`,
-    [sourceId],
-  );
-  if (resultRows(publications).length !== 0) throw unavailable();
-  await client.query(`DELETE FROM ${q(schema, "analytics_owner_state")} WHERE source_id=$1`, [sourceId]);
-  await client.query(`DELETE FROM ${q(schema, "storage_ingestion_changes")} WHERE source_id=$1`, [sourceId]);
-  await client.query(`DELETE FROM ${q(schema, "analytics_applied_events")} WHERE source_id=$1`, [sourceId]);
-  await client.query(`DELETE FROM ${q(schema, "analytics_source_cursors")} WHERE source_id=$1`, [sourceId]);
+  // Publication membership is explicit. A publication with no membership
+  // proof blocks erasure instead of being deleted broadly.
+  const unscopedPublication = await client.query(`SELECT 1
+    FROM ${q(schema, "analytics_publications")} p
+    WHERE p.source_id=$1 AND NOT EXISTS (
+      SELECT 1 FROM ${q(schema, "analytics_publication_owner_members")} m
+       WHERE m.source_id=p.source_id AND m.day=p.day AND m.metric=p.metric
+         AND m.generation=p.generation
+    ) LIMIT 1`, [sourceId]);
+  const unscopedCapture = await client.query(`SELECT 1
+    FROM ${q(schema, "analytics_publication_captures")} p
+    WHERE p.source_id=$1 AND NOT EXISTS (
+      SELECT 1 FROM ${q(schema, "analytics_publication_owner_members")} m
+       WHERE m.source_id=p.source_id AND m.day=p.day AND m.metric=p.metric
+         AND m.generation=p.generation
+    ) LIMIT 1`, [sourceId]);
+  if (resultRows(unscopedPublication).length !== 0 || resultRows(unscopedCapture).length !== 0) {
+    throw unavailable();
+  }
+  // Shared aggregate rows remain stored but are invalidated for the erased
+  // owner. Physical deletion is guarded by the absence of every other owner
+  // member for that same aggregate key.
+  await client.query(`INSERT INTO ${q(schema, "analytics_publication_invalidations")}
+    (source_id,day,metric,generation,owner_digest,reason,invalidated_at)
+    SELECT source_id,day,metric,generation,$2,'owner-erased',clock_timestamp()
+      FROM ${q(schema, "analytics_publication_owner_members")}
+     WHERE source_id=$1 AND owner_digest=$2
+    ON CONFLICT (source_id,day,metric,generation,owner_digest) DO NOTHING`, [sourceId, ownerDigest]);
+  await client.query(`WITH doomed AS (
+      SELECT m.source_id,m.day,m.metric,m.generation
+        FROM ${q(schema, "analytics_publication_owner_members")} m
+       WHERE m.source_id=$1 AND m.owner_digest=$2
+         AND NOT EXISTS (
+           SELECT 1 FROM ${q(schema, "analytics_publication_owner_members")} other
+            WHERE other.source_id=m.source_id AND other.day=m.day
+              AND other.metric=m.metric AND other.generation=m.generation
+              AND other.owner_digest<>m.owner_digest
+         )
+    ) DELETE FROM ${q(schema, "analytics_publications")} p USING doomed d
+       WHERE p.source_id=d.source_id AND p.day=d.day AND p.metric=d.metric
+         AND p.generation=d.generation`, [sourceId, ownerDigest]);
+  await client.query(`WITH doomed AS (
+      SELECT m.source_id,m.day,m.metric,m.generation
+        FROM ${q(schema, "analytics_publication_owner_members")} m
+       WHERE m.source_id=$1 AND m.owner_digest=$2
+         AND NOT EXISTS (
+           SELECT 1 FROM ${q(schema, "analytics_publication_owner_members")} other
+            WHERE other.source_id=m.source_id AND other.day=m.day
+              AND other.metric=m.metric AND other.generation=m.generation
+              AND other.owner_digest<>m.owner_digest
+         )
+    ) DELETE FROM ${q(schema, "analytics_publication_captures")} p USING doomed d
+       WHERE p.source_id=d.source_id AND p.day=d.day AND p.metric=d.metric
+         AND p.generation=d.generation`, [sourceId, ownerDigest]);
+  await client.query(`DELETE FROM ${q(schema, "analytics_publication_owner_members")}
+    WHERE source_id=$1 AND owner_digest=$2`, [sourceId, ownerDigest]);
+  await client.query(`DELETE FROM ${q(schema, "analytics_owner_state")}
+    WHERE source_id=$1 AND owner_digest=$2`, [sourceId, ownerDigest]);
+  await client.query(`DELETE FROM ${q(schema, "storage_ingestion_changes")}
+    WHERE source_id=$1 AND owner_digest=$2`, [sourceId, ownerDigest]);
+  await client.query(`DELETE FROM ${q(schema, "analytics_applied_events")}
+    WHERE source_id=$1 AND owner_digest=$2`, [sourceId, ownerDigest]);
 }
 
 function canonicalPrimaryStore(
@@ -450,7 +501,19 @@ function canonicalPrimaryStore(
           WHERE id=$1 AND state='deleting' AND deletion_session_id=$2 FOR UPDATE`,
         [participantId, deletionFence]);
         if (resultRows(owner).length !== 1) throw conflict("PARTICIPANT_DELETING");
-        await deleteAnalyticsRows(client, schema, participantId);
+        const ownership = await client.query<{ source_id: string; owner_digest: string }>(
+          `SELECT source.source_id,link.owner_digest
+             FROM ${q(schema, "storage_source_state")} source
+             JOIN ${q(schema, "storage_v11_owner_links")} link ON link.participant_id=$1
+            WHERE source.singleton=1`, [participantId]);
+        const ownershipRows = resultRows(ownership);
+        if (ownershipRows.length !== 1) throw unavailable();
+        await deleteAnalyticsRows(
+          client,
+          schema,
+          text(ownershipRows[0]?.source_id),
+          text(ownershipRows[0]?.owner_digest),
+        );
         await deleteParticipantRows(client, schema, participantId);
         for (const table of ["upload_authorizations", "device_upload_authorizations",
           "device_pairings", "device_credentials", "web_sessions"]) {
@@ -586,15 +649,30 @@ export function createPostgresRestoreSuppressionGate(
         if (rows.length !== 1) throw unavailable();
         const state = rows[0]?.state;
         const existingFence = optionalText(rows[0]?.deletion_session_id);
-        if (state === "deleting" && existingFence === fence) return "already_suppressed";
-        if (state !== "active" || (existingFence !== null && existingFence !== fence)) throw unavailable();
-        await client.query(`UPDATE ${q(primarySchema, "participants")}
-          SET state='deleting',deletion_session_id=$1 WHERE id=$2 AND state='active'`, [fence, participantId]);
+        if (state !== "active" && !(state === "deleting" && existingFence === fence)) {
+          throw unavailable();
+        }
+        const alreadySuppressed = state === "deleting" && existingFence === fence;
+        const ownership = await client.query<{ source_id: string; owner_digest: string }>(
+          `SELECT source.source_id,link.owner_digest
+             FROM ${q(primarySchema, "storage_source_state")} source
+             JOIN ${q(primarySchema, "storage_v11_owner_links")} link ON link.participant_id=$1
+            WHERE source.singleton=1`, [participantId]);
+        const ownershipRows = resultRows(ownership);
+        if (ownershipRows.length !== 1) throw unavailable();
+        const sourceId = text(ownershipRows[0]?.source_id);
+        const ownerDigest = text(ownershipRows[0]?.owner_digest);
+        if (!alreadySuppressed) {
+          await client.query(`UPDATE ${q(primarySchema, "participants")}
+            SET state='deleting',deletion_session_id=$1 WHERE id=$2 AND state='active'`, [fence, participantId]);
+        }
         const now = new Date(nowEpoch).toISOString();
-        for (const table of ["upload_authorizations", "device_upload_authorizations", "web_sessions",
-          "device_pairings", "device_credentials"]) {
-          await client.query(`UPDATE ${q(primarySchema, table)} SET state='revoked',revoked_at=$1
-            WHERE participant_id=$2 AND state IN ('active','unused','consuming')`, [now, participantId]);
+        if (!alreadySuppressed) {
+          for (const table of ["upload_authorizations", "device_upload_authorizations", "web_sessions",
+            "device_pairings", "device_credentials"]) {
+            await client.query(`UPDATE ${q(primarySchema, table)} SET state='revoked',revoked_at=$1
+              WHERE participant_id=$2 AND state IN ('active','unused','consuming')`, [now, participantId]);
+          }
         }
         for (const table of ["telemetry_v1_chunk_admission_windows", "telemetry_v1_device_consents",
           "telemetry_v11_device_consents", "telemetry_v12_device_capabilities"]) {
@@ -602,7 +680,37 @@ export function createPostgresRestoreSuppressionGate(
             await client.query(`DELETE FROM ${q(primarySchema, table)} WHERE participant_id=$1`, [participantId]);
           }
         }
-        return "suppressed";
+        const unscopedPublication = await client.query(`SELECT 1
+          FROM ${q(primarySchema, "analytics_publications")} p
+          WHERE p.source_id=$1 AND NOT EXISTS (
+            SELECT 1 FROM ${q(primarySchema, "analytics_publication_owner_members")} m
+             WHERE m.source_id=p.source_id AND m.day=p.day AND m.metric=p.metric
+               AND m.generation=p.generation
+          ) LIMIT 1`, [sourceId]);
+        const unscopedCapture = await client.query(`SELECT 1
+          FROM ${q(primarySchema, "analytics_publication_captures")} p
+          WHERE p.source_id=$1 AND NOT EXISTS (
+            SELECT 1 FROM ${q(primarySchema, "analytics_publication_owner_members")} m
+             WHERE m.source_id=p.source_id AND m.day=p.day AND m.metric=p.metric
+               AND m.generation=p.generation
+          ) LIMIT 1`, [sourceId]);
+        if (resultRows(unscopedPublication).length !== 0 || resultRows(unscopedCapture).length !== 0) {
+          throw unavailable();
+        }
+        await client.query(`UPDATE ${q(primarySchema, "analytics_owner_state")}
+          SET state='erased' WHERE source_id=$1 AND owner_digest=$2`, [sourceId, ownerDigest]);
+        await client.query(`UPDATE ${q(primarySchema, "storage_v11_owner_links")}
+          SET state='erased' WHERE participant_id=$1 AND owner_digest=$2`, [participantId, ownerDigest]);
+        await client.query(`UPDATE ${q(primarySchema, "analytics_analysis_work_heads")}
+          SET state='discarding',claim_token=NULL,lease_expires_ms=NULL
+          WHERE source_id=$1 AND owner_digest=$2 AND state NOT IN ('retired','discarding')`, [sourceId, ownerDigest]);
+        await client.query(`INSERT INTO ${q(primarySchema, "analytics_publication_invalidations")}
+          (source_id,day,metric,generation,owner_digest,reason,invalidated_at)
+          SELECT source_id,day,metric,generation,$2,'owner-erased',clock_timestamp()
+            FROM ${q(primarySchema, "analytics_publication_owner_members")}
+           WHERE source_id=$1 AND owner_digest=$2
+          ON CONFLICT (source_id,day,metric,generation,owner_digest) DO NOTHING`, [sourceId, ownerDigest]);
+        return alreadySuppressed ? "already_suppressed" : "suppressed";
       }, optionsFor("restore_gate.primary.suppress", options));
     } catch (error) {
       if (error instanceof ApiError) throw error;

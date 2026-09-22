@@ -102,22 +102,27 @@ export async function preparePostgresStorageParticipantErasure(
   if (typeof participantId !== "string" || participantId.length === 0) throw unavailable();
   const digest = await participantDeletionDigest(participantId);
   const namespace = bindings.sourceNamespace ?? DEFAULT_NAMESPACE;
-  const owners = await mutate(bindings, async (client, schema) => {
-    const result = await client.query<{ owner_digest: string }>(
-      `SELECT owner_digest FROM ${q(schema, "analytics_owner_state")}
-        WHERE source_id=$1 AND state IN ('active','withdrawn','erased')`, [participantId]);
-    return rows(result).map((row) => stringValue(row.owner_digest));
-  }, "erasure.prepare.read_owners");
-  if (owners.length === 0) return;
+  const ownership = await mutate(bindings, async (client, schema) => {
+    const sourceResult = await client.query<{ source_id: string }>(
+      `SELECT source_id FROM ${q(schema, "storage_source_state")}
+        WHERE singleton=1`, []);
+    const sourceRows = rows(sourceResult);
+    if (sourceRows.length !== 1) throw unavailable();
+    const sourceId = stringValue(sourceRows[0]?.source_id);
+    const ownerResult = await client.query<{ owner_digest: string }>(
+      `SELECT owner_digest FROM ${q(schema, "storage_v11_owner_links")}
+        WHERE participant_id=$1 AND state IN ('active','withdrawn','erased')`, [participantId]);
+    const ownerRows = rows(ownerResult);
+    if (ownerRows.length !== 1) throw unavailable();
+    return { sourceId, ownerDigest: stringValue(ownerRows[0]?.owner_digest) };
+  }, "erasure.prepare.read_ownership");
   await ledgerMutate(bindings, async (client, schema) => {
-    for (const ownerDigest of owners) {
-      await client.query(`INSERT INTO ${q(schema, "storage_erasure_jobs")}
-        (participant_digest,source_id,owner_digest,source_namespace,state,terminal_json,attempted_ms,completed_at)
-        VALUES($1,$2,$3,$4,'pending',NULL,0,NULL)
-        ON CONFLICT(participant_digest,source_id,owner_digest) DO UPDATE SET
-          source_namespace=EXCLUDED.source_namespace,state='pending',terminal_json=NULL,completed_at=NULL`,
-      [digest, participantId, ownerDigest, namespace]);
-    }
+    await client.query(`INSERT INTO ${q(schema, "storage_erasure_jobs")}
+      (participant_digest,source_id,owner_digest,source_namespace,state,terminal_json,attempted_ms,completed_at)
+      VALUES($1,$2,$3,$4,'pending',NULL,0,NULL)
+      ON CONFLICT(participant_digest,source_id,owner_digest) DO UPDATE SET
+        source_namespace=EXCLUDED.source_namespace,state='pending',terminal_json=NULL,completed_at=NULL`,
+    [digest, ownership.sourceId, ownership.ownerDigest, namespace]);
   }, "erasure.prepare.write_jobs");
 }
 
@@ -140,6 +145,9 @@ async function ownerPayloadRemains(
   job: { source_id: string; owner_digest: string },
 ): Promise<boolean> {
   return mutate(bindings, async (client, schema) => {
+    const ownerState = await client.query(`SELECT 1 FROM ${q(schema, "analytics_owner_state")}
+      WHERE source_id=$1 AND owner_digest=$2 LIMIT 1`, [job.source_id, job.owner_digest]);
+    if (rows(ownerState).length !== 0) return true;
     for (const table of [
       "analytics_prepared_source_rows", "analytics_prepared_source_heads",
       "analytics_analysis_work_parts", "analytics_analysis_work_heads",
@@ -148,13 +156,28 @@ async function ownerPayloadRemains(
         WHERE source_id=$1 AND owner_digest=$2 LIMIT 1`, [job.source_id, job.owner_digest]);
       if (rows(result).length !== 0) return true;
     }
-    // Publications are deliberately owner-scoped in the next schema revision;
-    // while 0007 lacks that key, any source publication blocks completion.
-    for (const table of ["analytics_publication_captures", "analytics_publications"]) {
-      const result = await client.query(`SELECT 1 FROM ${q(schema, table)}
-        WHERE source_id=$1 LIMIT 1`, [job.source_id]);
-      if (rows(result).length !== 0) return true;
-    }
+    const ownedPublication = await client.query(`SELECT 1
+      FROM ${q(schema, "analytics_publication_owner_members")} m
+      WHERE m.source_id=$1 AND m.owner_digest=$2 LIMIT 1`, [job.source_id, job.owner_digest]);
+    if (rows(ownedPublication).length !== 0) return true;
+    // A publication without owner membership cannot be safely attributed or
+    // invalidated. Keep erasure pending rather than treating it as absent.
+    const unscopedPublication = await client.query(`SELECT 1
+      FROM ${q(schema, "analytics_publications")} p
+      WHERE p.source_id=$1 AND NOT EXISTS (
+        SELECT 1 FROM ${q(schema, "analytics_publication_owner_members")} m
+         WHERE m.source_id=p.source_id AND m.day=p.day AND m.metric=p.metric
+           AND m.generation=p.generation
+      ) LIMIT 1`, [job.source_id]);
+    if (rows(unscopedPublication).length !== 0) return true;
+    const unscopedCapture = await client.query(`SELECT 1
+      FROM ${q(schema, "analytics_publication_captures")} p
+      WHERE p.source_id=$1 AND NOT EXISTS (
+        SELECT 1 FROM ${q(schema, "analytics_publication_owner_members")} m
+         WHERE m.source_id=p.source_id AND m.day=p.day AND m.metric=p.metric
+           AND m.generation=p.generation
+      ) LIMIT 1`, [job.source_id]);
+    if (rows(unscopedCapture).length !== 0) return true;
     return false;
   }, "erasure.read_payload_absence");
 }
@@ -212,5 +235,20 @@ export async function requirePostgresStorageParticipantErasureComplete(
       return rows(result).length !== 0;
     }, "erasure.read_participant_pending");
     if (remaining) throw unavailable();
+  }
+  for (const job of jobs) {
+    if (job.state !== "complete") continue;
+    if (await ownerPayloadRemains(bindings, {
+      source_id: stringValue(job.source_id),
+      owner_digest: stringValue(job.owner_digest),
+    })) {
+      await ledgerMutate(bindings, async (client, schema) => {
+        await client.query(`UPDATE ${q(schema, "storage_erasure_jobs")}
+          SET state='pending',completed_at=NULL
+          WHERE participant_digest=$1 AND source_id=$2 AND owner_digest=$3 AND state='complete'`,
+        [digest, job.source_id, job.owner_digest]);
+      }, "erasure.reopen_restored_job");
+      throw unavailable();
+    }
   }
 }

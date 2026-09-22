@@ -11,3 +11,36 @@ ALTER TABLE pending_objects
 
 CREATE INDEX pending_objects_reconciliation
   ON pending_objects(reconciliation_state, registered_at, contribution_id);
+
+-- The v1/v1.1/v1.2 writers register pending_objects before inserting their
+-- chunk row. Retention claims the same row before deleting the object. Reject
+-- a writer that races a committed deleting claim; otherwise its
+-- ON CONFLICT(contribution_id) DO NOTHING would silently publish a chunk after
+-- cleanup had established the deletion fence.
+CREATE OR REPLACE FUNCTION reject_reconciliation_deleting_chunk()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  blocked boolean;
+BEGIN
+  EXECUTE format(
+    'SELECT EXISTS (SELECT 1 FROM %I.pending_objects WHERE contribution_id=$1 AND reconciliation_state=''deleting'')',
+    TG_TABLE_SCHEMA
+  ) INTO blocked USING NEW.id;
+  IF blocked THEN
+    RAISE EXCEPTION USING ERRCODE = 'P1005';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER telemetry_v1_chunks_reconciliation_guard
+  BEFORE INSERT ON telemetry_v1_chunks
+  FOR EACH ROW EXECUTE FUNCTION reject_reconciliation_deleting_chunk();
+CREATE TRIGGER telemetry_v11_chunks_reconciliation_guard
+  BEFORE INSERT ON telemetry_v11_chunks
+  FOR EACH ROW EXECUTE FUNCTION reject_reconciliation_deleting_chunk();
+CREATE TRIGGER telemetry_v12_chunks_reconciliation_guard
+  BEFORE INSERT ON telemetry_v12_chunks
+  FOR EACH ROW EXECUTE FUNCTION reject_reconciliation_deleting_chunk();

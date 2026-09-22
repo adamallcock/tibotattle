@@ -1242,32 +1242,54 @@ export function createPostgresPublicationStore(
         throw new PostgresStorageError("bounds", operation);
       }
       const payloadJson = boundedJson(capture.payloadJson, 1024 * 1024, operation);
-      const result = await executeMutation<Record<string, unknown>>(database, operation, statement(`
-        INSERT INTO analytics_publications
-          (source_id,day,metric,generation,cohort_digest,authority_json,payload_json,payload_sha256,
-           computed_at_ms,policy_revision,collection_revision)
-        SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11
-         WHERE EXISTS (
-           SELECT 1 FROM analytics_publication_captures c
-            WHERE c.source_id=$1 AND c.day=$2 AND c.metric=$3 AND c.generation=$4
-              AND c.cohort_digest=$5 AND c.payload_json=$7
-              AND c.policy_revision=$10 AND c.collection_revision=$11
-         )
-        ON CONFLICT (source_id,day,metric) DO UPDATE
-          SET generation=EXCLUDED.generation,cohort_digest=EXCLUDED.cohort_digest,
-              authority_json=EXCLUDED.authority_json,payload_json=EXCLUDED.payload_json,
-              payload_sha256=EXCLUDED.payload_sha256,computed_at_ms=EXCLUDED.computed_at_ms,
-              policy_revision=EXCLUDED.policy_revision,collection_revision=EXCLUDED.collection_revision
-        WHERE analytics_publications.policy_revision=$10
-          AND analytics_publications.collection_revision=$11
-        RETURNING source_id`, capture.authority.sourceId, capture.day,
-      capture.metric, capture.generation, capture.cohortDigest,
-      JSON.stringify(capture.authority), payloadJson, payloadSha256,
-      computedAtMs, capture.authority.policyRevision, capture.authority.collectionRevision));
+      const result = await inTransaction(database, operation, async (transaction) => {
+        const published = await execute<Record<string, unknown>>(transaction, operation, statement(`
+          INSERT INTO analytics_publications
+            (source_id,day,metric,generation,cohort_digest,authority_json,payload_json,payload_sha256,
+             computed_at_ms,policy_revision,collection_revision)
+          SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11
+           WHERE EXISTS (
+             SELECT 1 FROM analytics_publication_captures c
+              WHERE c.source_id=$1 AND c.day=$2 AND c.metric=$3 AND c.generation=$4
+                AND c.cohort_digest=$5 AND c.payload_json=$7
+                AND c.policy_revision=$10 AND c.collection_revision=$11
+           )
+           AND EXISTS (
+             SELECT 1 FROM analytics_owner_state o
+              WHERE o.source_id=$1 AND o.state <> 'erased'
+           )
+          ON CONFLICT (source_id,day,metric) DO UPDATE
+            SET generation=EXCLUDED.generation,cohort_digest=EXCLUDED.cohort_digest,
+                authority_json=EXCLUDED.authority_json,payload_json=EXCLUDED.payload_json,
+                payload_sha256=EXCLUDED.payload_sha256,computed_at_ms=EXCLUDED.computed_at_ms,
+                policy_revision=EXCLUDED.policy_revision,collection_revision=EXCLUDED.collection_revision
+          WHERE analytics_publications.policy_revision=$10
+            AND analytics_publications.collection_revision=$11
+          RETURNING source_id`, capture.authority.sourceId, capture.day,
+        capture.metric, capture.generation, capture.cohortDigest,
+        JSON.stringify(capture.authority), payloadJson, payloadSha256,
+        computedAtMs, capture.authority.policyRevision, capture.authority.collectionRevision));
+        if (published.rowCount === 1) {
+          const members = await execute(transaction, operation, statement(`
+            INSERT INTO analytics_publication_owner_members
+              (source_id,day,metric,generation,owner_digest)
+            SELECT $1,$2,$3,$4,owner_digest
+              FROM analytics_owner_state
+             WHERE source_id=$1 AND state <> 'erased'
+            ON CONFLICT (source_id,day,metric,generation,owner_digest) DO NOTHING`,
+          capture.authority.sourceId, capture.day, capture.metric, capture.generation));
+          if (members.rowCount < 1) throw new PostgresStorageError("incomplete", operation);
+        }
+        return published;
+      });
       if (result.rows.length === 1) return "published";
       const existing = await execute(database, operation, statement(`
         SELECT 1 FROM analytics_publications WHERE source_id=$1 AND day=$2 AND metric=$3
-          AND payload_sha256=$4 AND policy_revision=$5 AND collection_revision=$6 LIMIT 1`,
+          AND payload_sha256=$4 AND policy_revision=$5 AND collection_revision=$6
+          AND NOT EXISTS (SELECT 1 FROM analytics_publication_invalidations i
+            WHERE i.source_id=analytics_publications.source_id AND i.day=analytics_publications.day
+              AND i.metric=analytics_publications.metric AND i.generation=analytics_publications.generation)
+          LIMIT 1`,
       capture.authority.sourceId, capture.day,
       capture.metric, payloadSha256, capture.authority.policyRevision, capture.authority.collectionRevision));
       if (existing.rows.length === 1) return "unchanged";
@@ -1279,10 +1301,23 @@ export function createPostgresPublicationStore(
       const day = String(input.day);
       const authority = validatePublicationAuthority(input.authority, operation);
       const result = await execute<Record<string, unknown>>(database, operation, statement(`
-        SELECT generation,day,metric,cohort_digest,expected_members,payload_json
-          FROM analytics_publications
-         WHERE source_id=$1 AND day=$2 AND metric=$3
-           AND policy_revision=$4 AND collection_revision=$5
+        SELECT p.generation,p.day,p.metric,p.cohort_digest,c.expected_members,p.payload_json
+          FROM analytics_publications p
+          JOIN analytics_publication_captures c
+            ON c.source_id=p.source_id AND c.day=p.day AND c.metric=p.metric
+           AND c.generation=p.generation
+         WHERE p.source_id=$1 AND p.day=$2 AND p.metric=$3
+           AND p.policy_revision=$4 AND p.collection_revision=$5
+           AND EXISTS (
+             SELECT 1 FROM analytics_publication_owner_members m
+              WHERE m.source_id=p.source_id AND m.day=p.day AND m.metric=p.metric
+                AND m.generation=p.generation
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM analytics_publication_invalidations i
+              WHERE i.source_id=p.source_id AND i.day=p.day AND i.metric=p.metric
+                AND i.generation=p.generation
+           )
          LIMIT 1`, sourceId, day, input.metric,
       authority.policyRevision, authority.collectionRevision));
       const row = result.rows[0];
@@ -1291,16 +1326,41 @@ export function createPostgresPublicationStore(
     async retire(input): Promise<{ deleted: number; complete: boolean }> {
       const operation = "publication.retire";
       const limit = normalizeLimit(input.limit, 256, operation);
-      const result = await executeMutation<Record<string, unknown>>(database, operation, statement(`
-        WITH doomed AS (
-          SELECT source_id,day,metric FROM analytics_publications
-           WHERE source_id=$1 AND day < $2 ORDER BY day,metric LIMIT $3
-        ) DELETE FROM analytics_publications p USING doomed d
-         WHERE p.source_id=d.source_id AND p.day=d.day AND p.metric=d.metric
-         RETURNING p.day`, input.sourceId, input.beforeDay, limit));
+      const deleted = await inTransaction(database, operation, async (transaction) => {
+        await execute(transaction, operation, statement(`
+          WITH doomed AS (
+            SELECT source_id,day,metric,generation FROM analytics_publications
+             WHERE source_id=$1 AND day < $2 ORDER BY day,metric LIMIT $3
+          ) DELETE FROM analytics_publication_owner_members m USING doomed d
+           WHERE m.source_id=d.source_id AND m.day=d.day AND m.metric=d.metric
+             AND m.generation=d.generation`, input.sourceId, input.beforeDay, limit));
+        await execute(transaction, operation, statement(`
+          WITH doomed AS (
+            SELECT source_id,day,metric,generation FROM analytics_publications
+             WHERE source_id=$1 AND day < $2 ORDER BY day,metric LIMIT $3
+          ) DELETE FROM analytics_publication_invalidations i USING doomed d
+           WHERE i.source_id=d.source_id AND i.day=d.day AND i.metric=d.metric
+             AND i.generation=d.generation`, input.sourceId, input.beforeDay, limit));
+        await execute(transaction, operation, statement(`
+          WITH doomed AS (
+            SELECT source_id,day,metric,generation FROM analytics_publications
+             WHERE source_id=$1 AND day < $2 ORDER BY day,metric LIMIT $3
+          ) DELETE FROM analytics_publication_captures c USING doomed d
+           WHERE c.source_id=d.source_id AND c.day=d.day AND c.metric=d.metric
+             AND c.generation=d.generation`, input.sourceId, input.beforeDay, limit));
+        const result = await execute<Record<string, unknown>>(transaction, operation, statement(`
+          WITH doomed AS (
+            SELECT source_id,day,metric,generation FROM analytics_publications
+             WHERE source_id=$1 AND day < $2 ORDER BY day,metric LIMIT $3
+          ) DELETE FROM analytics_publications p USING doomed d
+           WHERE p.source_id=d.source_id AND p.day=d.day AND p.metric=d.metric
+             AND p.generation=d.generation
+           RETURNING p.day`, input.sourceId, input.beforeDay, limit));
+        return result.rowCount;
+      });
       const left = await execute(database, operation, statement(`
         SELECT 1 FROM analytics_publications WHERE source_id=$1 AND day < $2 LIMIT 1`, input.sourceId, input.beforeDay));
-      return { deleted: result.rowCount, complete: left.rows.length === 0 };
+      return { deleted, complete: left.rows.length === 0 };
     },
   };
 }
@@ -1518,7 +1578,9 @@ export function createPostgresLifecycleStore(
     async clearQuarantine(input): Promise<void> {
       const result = await executeMutation(primaryDatabase, "lifecycle.clear_quarantine", statement(`
         DELETE FROM pending_objects
-         WHERE object_key=$1 AND ($2::text IS NULL OR reconciliation_lease_id=$2)`, input.objectKey, input.leaseId ?? null));
+         WHERE object_key=$1
+           AND (($2::text IS NOT NULL AND reconciliation_lease_id=$2)
+             OR ($2::text IS NULL AND reconciliation_state='registered' AND reconciliation_lease_id IS NULL))`, input.objectKey, input.leaseId ?? null));
       if (result.rowCount !== 1) throw new PostgresStorageError("conflict", "lifecycle.clear_quarantine", { retryable: true });
     },
     async beginMaintenance(input): Promise<boolean> {
