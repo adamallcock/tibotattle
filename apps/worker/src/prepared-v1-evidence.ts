@@ -7,6 +7,7 @@ import { loadV1SourcePin, type V1SourceDayDependency, type V1SourcePin } from ".
 import { prepareQuotaPage, prepareUsagePage, type PreparationQuotaRow, type PreparedQuotaRuns } from "./prepared-v1-day";
 import type { V1FitSourceRow, V1PlanSourceRow, V1QuotaInvocationBudget, V1QuotaPageReader } from "./quota-analysis-v1-reader";
 import type { V1PreparedFinishEvidence, V1PreparedUsageFragment, WindowedUsageRow } from "./quota-analysis-v1";
+import type { PreparedSourceStore, StorageSourcePin, StorageSourceRecord } from "./storage-provider-ports";
 
 export const V1_PREPARED_READER_POLICY = "prepared-source-days-1";
 export const V1_PREPARATION_METHOD_VERSION = `prepared-source-day-1:${SERVER_PRICING_METHOD_VERSION}:${APP_PRICE_REGISTRY_MANIFEST.sha256}`;
@@ -488,6 +489,101 @@ export async function createPreparedV1EvidenceReader(db: D1Database, pin: V1Sour
           return fragment;
         }));
       },
+    },
+  };
+}
+
+/**
+ * Adapt the provider-neutral prepared-source page contract to the existing v1
+ * quota acquisition reader.  The source generation is a quota-only prepared
+ * stream: accepting an untyped mixed stream here would advance the v1 cursor
+ * past usage rows and silently lose evidence.  The writer therefore stamps
+ * `stream: "quota"` (or omits the legacy marker) and a positive numeric `id`
+ * in each bounded payload.
+ */
+export interface ProviderPreparedV1QuotaSource {
+  readonly store: PreparedSourceStore;
+  readonly pin: StorageSourcePin;
+  readonly generation: string;
+  readonly readerPolicy: string;
+}
+
+function providerQuotaPayload(value: unknown, recordValue: StorageSourceRecord, operation: string): Record<string, unknown> {
+  if (!record(value) || (value.stream !== undefined && value.stream !== "quota")
+      || !safeCount(value.id) || value.id === 0 || String(value.id) !== recordValue.occurrenceId
+      || typeof value.device_id !== "string" || value.device_id.length === 0
+      || value.device_id.length > 256) throw new V1PreparedEvidenceUnavailableError("control_invalid");
+  const observedAt = new Date(recordValue.observedAtMs).toISOString();
+  if (!validTime(observedAt) || recordValue.observedDay !== observedAt.slice(0, 10)) {
+    throw new V1PreparedEvidenceUnavailableError("control_invalid");
+  }
+  return value;
+}
+
+function providerNullableString(value: unknown): string | null {
+  return value === null || value === undefined ? null : typeof value === "string" ? value : (() => { throw new V1PreparedEvidenceUnavailableError("control_invalid"); })();
+}
+
+function providerQuotaRows(records: readonly StorageSourceRecord[], fit: boolean): V1PlanSourceRow[] | V1FitSourceRow[] {
+  return records.map((sourceRecord) => {
+    const payload = providerQuotaPayload(sourceRecord.payload, sourceRecord, "provider prepared quota row");
+    const row: V1PlanSourceRow = {
+      id: payload.id as number,
+      observed_at: new Date(sourceRecord.observedAtMs).toISOString(),
+      observed_day: sourceRecord.observedDay,
+      device_id: payload.device_id as string,
+      provider: providerNullableString(payload.provider),
+      limit_id: providerNullableString(payload.limit_id),
+      plan_type: providerNullableString(payload.plan_type),
+      plan_variant: providerNullableString(payload.plan_variant),
+    };
+    if (!fit) return row;
+    if (typeof payload.occurrence_id !== "string" || payload.occurrence_id.length === 0
+        || typeof payload.slot !== "string" || payload.slot.length === 0
+        || typeof payload.used_percent !== "number" || !Number.isFinite(payload.used_percent)
+        || payload.window_duration_minutes !== 10080 || !validTime(payload.resets_at)) {
+      throw new V1PreparedEvidenceUnavailableError("control_invalid");
+    }
+    return {
+      ...row,
+      occurrence_id: payload.occurrence_id,
+      provider: typeof payload.provider === "string" ? payload.provider : (() => { throw new V1PreparedEvidenceUnavailableError("control_invalid"); })(),
+      limit_id: typeof payload.limit_id === "string" ? payload.limit_id : (() => { throw new V1PreparedEvidenceUnavailableError("control_invalid"); })(),
+      plan_type: typeof payload.plan_type === "string" ? payload.plan_type : (() => { throw new V1PreparedEvidenceUnavailableError("control_invalid"); })(),
+      plan_variant: typeof payload.plan_variant === "string" ? payload.plan_variant : (() => { throw new V1PreparedEvidenceUnavailableError("control_invalid"); })(),
+      slot: payload.slot,
+      used_percent: payload.used_percent,
+      window_duration_minutes: payload.window_duration_minutes,
+      resets_at: payload.resets_at,
+    } satisfies V1FitSourceRow;
+  });
+}
+
+/** Create the bounded quota reader used by the provider-backed analysis runner. */
+export function createProviderV1QuotaReader(source: ProviderPreparedV1QuotaSource): V1QuotaPageReader {
+  const { store, pin } = source;
+  if (!source.generation || !source.readerPolicy) throw new TypeError("provider prepared source identity invalid");
+  const read = async (observedAt: string, id: number, limit: number): Promise<readonly StorageSourceRecord[]> => {
+    if (!Number.isSafeInteger(id) || id < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 128
+        || observedAt !== "" && !validTime(observedAt)) throw new TypeError("provider prepared quota page bound invalid");
+    const page = await store.readPage({
+      pin,
+      generation: source.generation,
+      readerPolicy: source.readerPolicy,
+      cursor: { observedAtMs: observedAt === "" ? -1 : Date.parse(observedAt), occurrenceId: String(id) },
+      limit,
+    });
+    if (page.status !== "available") throw new V1PreparedEvidenceUnavailableError(
+      page.status === "stale" ? "source_not_current" : "invalid_evidence");
+    return page.rows;
+  };
+  return {
+    pageSize: 128,
+    async readPlanPage(cursor, limit) {
+      return providerQuotaRows(await read(cursor.observedAt, cursor.id, limit), false) as V1PlanSourceRow[];
+    },
+    async readFitPage(cursor, limit) {
+      return providerQuotaRows(await read(cursor.observedAt, cursor.id, limit), true) as V1FitSourceRow[];
     },
   };
 }

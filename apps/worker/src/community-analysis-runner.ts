@@ -1,4 +1,5 @@
 import { canonicalJson } from "./canonical-json";
+import { sha256Hex } from "./crypto";
 import {
   communityAnalysisWorkStore, createCommunityAnalysisWorkStore,
   COMMUNITY_ANALYSIS_PARTS_PER_READ,
@@ -10,13 +11,20 @@ import {
   createV1QuotaWorkInterner, decodeV1QuotaWorkCheckpoint, encodeV1QuotaWorkCheckpoint,
   validateV1CompletedQuotaAcquisition, type V1QuotaAcquisitionIdentity,
   type V1QuotaAcquisitionCheckpoint, type V1QuotaPageReader, type V1QuotaPageReplay,
-  type V1QuotaWorkComponent, type V1QuotaInvocationBudget,
+  type V1QuotaWorkComponent, type V1QuotaInvocationBudget, V1_QUOTA_WORK_COMPONENTS,
 } from "./quota-analysis-v1-reader";
 import { createV1QuotaPageReader, V1QuotaFitProjectionUnavailableError } from "./quota-fit-projection";
+import { createProviderV1QuotaReader, type ProviderPreparedV1QuotaSource } from "./prepared-v1-evidence";
 import { loadV1SourcePin, type V1SourcePin } from "./telemetry-v1-source-selection";
 import type { V1AcquiredQuotaEvidence } from "./quota-analysis-v1";
 import { MODEL_HISTORY_METHOD_VERSION } from "./quota-analysis-v1";
 import { modelHistoryWindow } from "./model-history-window";
+import type {
+  AnalyticalCheckpoint,
+  AnalyticalWorkHead,
+  AnalyticalWorkIdentity,
+  AnalyticalWorkStore,
+} from "./storage-provider-ports";
 
 const historyWorkStore = createCommunityAnalysisWorkStore("model-history");
 
@@ -36,6 +44,241 @@ export function communityAnalysisAcquisitionIdentity(identity: CommunityAnalysis
     resetsAtCutoff: identity.resetsAtCutoff, windowMinutes: identity.windowMinutes, maxQuotaRows: identity.maxQuotaRows };
   createV1QuotaAcquisitionCheckpoint(result);
   return result;
+}
+
+/**
+ * The provider-backed work identity is deliberately derived from the existing
+ * calculation identity.  This keeps the domain's source fingerprint and
+ * revision in the durable key, while allowing the PostgreSQL adapter to use
+ * its operation-level claim/checkpoint contract.  The composition root may
+ * supply a more specific namespace/epoch when it has an authority route.
+ */
+export function communityAnalysisProviderIdentity(
+  identity: CommunityAnalysisWorkIdentity,
+  options: {
+    readonly storage?: "current" | "model-history";
+    readonly authorityEpoch?: number;
+  } = {},
+): AnalyticalWorkIdentity {
+  const day = identity.observedAtCutoff.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(day) || !/^[a-f0-9]{64}$/u.test(identity.inputFingerprint)) {
+    throw new TypeError("community analysis provider identity invalid");
+  }
+  return Object.freeze({
+    sourceId: identity.participantId,
+    sourceNamespace: options.storage === "model-history" ? "community-model-history-v1" : "community-analysis-v1",
+    ownerDigest: identity.inputFingerprint,
+    day,
+    metric: options.storage === "model-history" ? "model" : "fits",
+    inputRevision: identity.inputRevision,
+    ownerRevision: identity.inputRevision,
+    dependencyDigest: identity.inputFingerprint,
+    method: identity.sourceMethodVersion,
+    authorityEpoch: options.authorityEpoch ?? 0,
+  });
+}
+
+export interface CommunityAnalysisProviderRunOptions {
+  readonly identity: CommunityAnalysisWorkIdentity;
+  readonly workStore: AnalyticalWorkStore;
+  readonly workIdentity?: AnalyticalWorkIdentity;
+  readonly quotaReader?: V1QuotaPageReader;
+  readonly preparedSource?: ProviderPreparedV1QuotaSource;
+  readonly winningDayDevices: ReadonlyMap<string, string>;
+  readonly budget: CommunityAnalysisWorkBudget;
+  readonly leaseMs: number;
+  /** A source/authority read performed by the selected composition root. */
+  readonly sourceCurrent?: () => Promise<boolean>;
+  readonly storage?: "current" | "model-history";
+  readonly authorityEpoch?: number;
+}
+
+export type CommunityAnalysisProviderRunResult =
+  | { status: "ready"; evidence: V1AcquiredQuotaEvidence; head: AnalyticalWorkHead }
+  | { status: "deferred" | "stale" | "corrupt" }
+  | { status: "not_testable"; reason: "plan_attribution_limit_exceeded" | "downsampled_quota_limit_exceeded" };
+
+function providerCheckpointComponents(checkpoint: AnalyticalCheckpoint, operation: string): {
+  control: unknown;
+  components: Record<string, unknown>;
+} {
+  let control: unknown, manifest: unknown;
+  try {
+    control = JSON.parse(checkpoint.controlJson);
+    manifest = JSON.parse(checkpoint.manifestJson);
+  } catch {
+    throw new Error(operation);
+  }
+  if (!Array.isArray(manifest) || manifest.length !== checkpoint.parts.length) throw new Error(operation);
+  const components: Record<string, unknown> = {};
+  for (const entry of manifest) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw new Error(operation);
+    const value = entry as Record<string, unknown>;
+    if (typeof value.component !== "string" || !V1_QUOTA_WORK_COMPONENTS.includes(value.component as V1QuotaWorkComponent)
+        || !Number.isSafeInteger(value.index)) throw new Error(operation);
+    const part = checkpoint.parts.find((candidate) => candidate.index === value.index);
+    if (!part || typeof components[value.component] !== "undefined") throw new Error(operation);
+    if (typeof value.sha256 !== "string" || value.sha256 !== part.sha256) throw new Error(operation);
+    try { components[value.component] = JSON.parse(part.payloadJson); } catch { throw new Error(operation); }
+  }
+  if (Object.keys(components).length !== V1_QUOTA_WORK_COMPONENTS.length) throw new Error(operation);
+  return { control, components };
+}
+
+async function providerCheckpoint(
+  state: V1QuotaAcquisitionCheckpoint,
+  expectedHead: string | null,
+  generation: string,
+  complete: boolean,
+): Promise<AnalyticalCheckpoint> {
+  const encoded = encodeV1QuotaWorkCheckpoint(state);
+  const parts: Array<AnalyticalCheckpoint["parts"][number]> = [];
+  const manifest: Array<{ component: string; index: number; sha256: string; bytes: number }> = [];
+  for (let index = 0; index < V1_QUOTA_WORK_COMPONENTS.length; index += 1) {
+    const component = V1_QUOTA_WORK_COMPONENTS[index]!;
+    const payloadJson = canonicalJson(encoded.components[component]);
+    const sha256 = await sha256Hex(payloadJson);
+    const bytes = new TextEncoder().encode(payloadJson).byteLength;
+    parts.push(Object.freeze({ index, sha256, payloadJson }));
+    manifest.push({ component, index, sha256, bytes });
+  }
+  return Object.freeze({
+    generation,
+    expectedHead,
+    controlJson: canonicalJson(encoded.control),
+    manifestJson: canonicalJson(manifest),
+    parts: Object.freeze(parts),
+    complete,
+  });
+}
+
+function providerEvidence(
+  identity: V1QuotaAcquisitionIdentity,
+  state: V1QuotaAcquisitionCheckpoint,
+): V1AcquiredQuotaEvidence {
+  const acquisition = { planAnchors: state.plan.anchors, quotaRows: state.endpoints.map(({ row }) => row) };
+  if (!validateV1CompletedQuotaAcquisition(acquisition)) throw new Error("community analysis provider checkpoint incomplete");
+  return { identity, acquisition };
+}
+
+/**
+ * Provider-backed acquisition path used by the existing analysis runner once
+ * the composition root selects PostgreSQL.  It reuses the same bounded quota
+ * page reader and checkpoint codec as the D1 path; only the durable claim and
+ * checkpoint operations are provider-specific.  No SQL or seeded fixture is
+ * exposed to the calculation layer.
+ */
+export async function advanceCommunityAnalysisProviderRun(
+  options: CommunityAnalysisProviderRunOptions,
+): Promise<CommunityAnalysisProviderRunResult> {
+  const identity = Object.freeze({ ...options.identity });
+  const acquisitionIdentity = communityAnalysisAcquisitionIdentity(identity);
+  const workIdentity = options.workIdentity ?? communityAnalysisProviderIdentity(identity, options);
+  const now = options.budget.now ?? Date.now;
+  const nowMs = now();
+  if (!Number.isSafeInteger(nowMs) || !Number.isSafeInteger(options.leaseMs)
+      || options.leaseMs < 1 || options.leaseMs > 86_400_000) throw new TypeError("community analysis provider lease invalid");
+  const quotaReader = options.quotaReader ?? (options.preparedSource ? createProviderV1QuotaReader(options.preparedSource) : null);
+  if (!quotaReader) throw new TypeError("community analysis provider quota reader required");
+  const sourceCurrent = options.sourceCurrent
+    ? options.sourceCurrent
+    : options.preparedSource
+      ? async () => {
+        const head = await options.preparedSource!.store.readHead({
+          sourceId: options.preparedSource!.pin.sourceId,
+          ownerDigest: options.preparedSource!.pin.ownerDigest,
+          day: options.preparedSource!.pin.day,
+          generation: options.preparedSource!.generation,
+        });
+        return head?.state === "ready"
+          && canonicalJson(head.sourcePin) === canonicalJson(options.preparedSource!.pin);
+      }
+      : async () => true;
+  const sourceIsCurrent = await sourceCurrent();
+  if (!sourceIsCurrent) return { status: "stale" };
+
+  const readOrClaim = async (): Promise<AnalyticalWorkHead | null> => {
+    let head = await options.workStore.read(workIdentity);
+    const needsClaim = !head || head.state === "pending"
+      || head.claim === null || head.claim.leaseExpiresAtMs <= nowMs;
+    if (needsClaim) {
+      const claim = await options.workStore.claim({ identity: workIdentity, nowMs, leaseMs: options.leaseMs });
+      if (!claim) return head;
+      head = await options.workStore.read(workIdentity);
+      if (!head) return null;
+    }
+    return head;
+  };
+
+  let head: AnalyticalWorkHead | null;
+  try { head = await readOrClaim(); } catch { return { status: "deferred" }; }
+  if (!head || head.state === "discarding" || head.state === "retired") return { status: "stale" };
+  if (head.state === "complete") {
+    if (!head.checkpoint?.complete) return { status: "corrupt" };
+    try {
+      const encoded = providerCheckpointComponents(head.checkpoint, "community analysis provider checkpoint invalid");
+      const state = decodeV1QuotaWorkCheckpoint(acquisitionIdentity, encoded.control, encoded.components);
+      return { status: "ready", evidence: providerEvidence(acquisitionIdentity, state), head };
+    } catch { return { status: "corrupt" }; }
+  }
+  if (!head.claim) return { status: "stale" };
+
+  let state = createV1QuotaAcquisitionCheckpoint(acquisitionIdentity);
+  if (head.checkpoint) {
+    try {
+      const encoded = providerCheckpointComponents(head.checkpoint, "community analysis provider checkpoint invalid");
+      state = decodeV1QuotaWorkCheckpoint(acquisitionIdentity, encoded.control, encoded.components);
+    } catch { return { status: "corrupt" }; }
+  }
+
+  for (;;) {
+    if (!await sourceCurrent()) return { status: "stale" };
+    const currentNow = now();
+    if (!Number.isFinite(currentNow) || currentNow >= options.budget.deadlineMs
+        || options.budget.remainingQueries - (options.budget.reserveQueries ?? 0) < 2) return { status: "deferred" };
+    const claim = head.claim;
+    if (!claim) return { status: "stale" };
+    if (claim.leaseExpiresAtMs <= currentNow + Math.min(1_000, Math.floor(options.leaseMs / 4))) {
+      try {
+        const renewed = await options.workStore.renew({ identity: workIdentity, claimToken: claim.claimToken,
+          expectedRevision: head.revision, nowMs: Math.trunc(currentNow), leaseMs: options.leaseMs });
+        head = Object.freeze({ ...head, revision: renewed.revision, claim: renewed });
+      } catch { return { status: "deferred" }; }
+    }
+    const pageBudget: V1QuotaInvocationBudget = {
+      remainingQueries: 1,
+      deadlineMs: options.budget.deadlineMs,
+      now: options.budget.now,
+    };
+    let stepped: Awaited<ReturnType<typeof advanceV1QuotaAcquisitionPage>>;
+    try {
+      stepped = await advanceV1QuotaAcquisitionPage(quotaReader, acquisitionIdentity,
+        options.winningDayDevices, pageBudget, state);
+    } catch { return { status: "corrupt" }; }
+    if (pageBudget.remainingQueries !== 0 || !stepped.checkpoint) return { status: "deferred" };
+    options.budget.remainingQueries -= 1;
+    if (stepped.result.status === "not_testable") return stepped.result;
+    state = stepped.checkpoint;
+    const complete = stepped.result.status === "complete";
+    const generation = `v1-${head.revision + 1}`;
+    let checkpoint: AnalyticalCheckpoint;
+    try { checkpoint = await providerCheckpoint(state, head.headDigest, generation, complete); }
+    catch { return { status: "corrupt" }; }
+    try {
+      head = await options.workStore.saveCheckpoint({ identity: workIdentity, claimToken: claim.claimToken,
+        expectedRevision: head.revision, nowMs: Math.trunc(currentNow), checkpoint });
+    } catch { return { status: "deferred" }; }
+    options.budget.remainingQueries -= 1;
+    if (complete) {
+      const evidence = providerEvidence(acquisitionIdentity, state);
+      const resultDigest = await sha256Hex(canonicalJson(evidence.acquisition));
+      try {
+        head = await options.workStore.complete({ identity: workIdentity, claimToken: head.claim!.claimToken,
+          expectedRevision: head.revision, nowMs: Math.trunc(currentNow), resultDigest });
+      } catch { return { status: "deferred" }; }
+      return { status: "ready", evidence, head };
+    }
+  }
 }
 
 function available(budget: CommunityAnalysisWorkBudget, count: number): boolean {

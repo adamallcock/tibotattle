@@ -6,32 +6,36 @@ import {
   POSTGRES_V1_QUOTA_PROJECTION_BACKFILL_INSERT_SQL,
 } from "../src/postgres-quota-fit-projection";
 import type {
-  PostgresTelemetryV1Client,
-  PostgresTelemetryV1Pool,
-  PostgresTelemetryV1QueryResult,
-} from "../src/postgres-telemetry-v1-contribution-store";
+  PostgresClient,
+  PostgresPool,
+  PostgresQueryResult,
+} from "../src/postgres-client";
 
-function result(rows: Record<string, unknown>[]): PostgresTelemetryV1QueryResult {
+function result(rows: Record<string, unknown>[]): PostgresQueryResult {
   return { rows, rowCount: rows.length };
 }
 
-function state(through: string, last: string, complete: number): PostgresTelemetryV1QueryResult {
+function state(through: string, last: string, complete: number): PostgresQueryResult {
   return result([{ through_record_id: through, last_record_id: last, is_complete: complete }]);
 }
 
 function mockPool(
-  query: (text: string, values?: unknown[]) => Promise<PostgresTelemetryV1QueryResult>,
+  query: (text: string, values?: unknown[]) => Promise<PostgresQueryResult>,
 ) {
   const calls: Array<{ text: string; values?: unknown[] }> = [];
   const releases: boolean[] = [];
-  const client: PostgresTelemetryV1Client = {
-    async query(text, values) {
+  const client: PostgresClient = {
+    async query<Row extends object = Record<string, unknown>>(
+      text: string,
+      values?: unknown[],
+    ): Promise<PostgresQueryResult<Row>> {
       calls.push({ text, values });
-      return query(text, values);
+      const response = await query(text, values);
+      return response as unknown as PostgresQueryResult<Row>;
     },
     release(discard = false) { releases.push(discard); },
   };
-  const pool: PostgresTelemetryV1Pool = { connect: vi.fn(async () => client) };
+  const pool: PostgresPool = { connect: vi.fn(async () => client) };
   return { pool, calls, releases };
 }
 

@@ -4,23 +4,26 @@ import {
   createExperimentalPostgresParticipantErasureStores,
 } from "../src/postgres-participant-erasure-store";
 import type {
-  PostgresTelemetryV1Client,
-  PostgresTelemetryV1Pool,
-  PostgresTelemetryV1QueryResult,
-} from "../src/postgres-telemetry-v1-contribution-store";
+  PostgresClient,
+  PostgresPool,
+  PostgresQueryResult,
+} from "../src/postgres-client";
 
 const PARTICIPANT_ID = "participant-1";
 const DELETION_FENCE = "deletion-fence";
 
 function fixture(failAt: string | null = null): {
-  readonly pool: PostgresTelemetryV1Pool;
+  readonly pool: PostgresPool;
   readonly queries: string[];
   readonly releases: boolean[];
 } {
   const queries: string[] = [];
   const releases: boolean[] = [];
-  const client: PostgresTelemetryV1Client = {
-    async query(sql): Promise<PostgresTelemetryV1QueryResult> {
+  const client: PostgresClient = {
+    async query<Row extends object = Record<string, unknown>>(
+      sql: string,
+      _values?: unknown[],
+    ): Promise<PostgresQueryResult<Row>> {
       queries.push(sql);
       if (failAt !== null && sql.includes(failAt)) {
         throw new Error("synthetic-private-driver-details");
@@ -33,11 +36,11 @@ function fixture(failAt: string | null = null): {
             deletion_session_id: DELETION_FENCE,
             owner_kind: "social",
             enrollment_device_id: null,
-          }],
+          }] as unknown as Row[],
           rowCount: 1,
         };
       }
-      return { rows: [], rowCount: 0 };
+      return { rows: [] as Row[], rowCount: 0 };
     },
     release(discard = false) {
       releases.push(discard);
