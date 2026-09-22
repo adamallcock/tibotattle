@@ -146,6 +146,35 @@ test("private export preserves a matching Apple report when its body is not yet 
   }
 });
 
+test("private export includes the startup journal when the companion never started", async () => {
+  const homeDirectory = await mkdtemp(join(tmpdir(), "tibotattle-private-doctor-"));
+  try {
+    const settings = join(homeDirectory, "Library", "Application Support", "TiboTattle",
+      "desktop-settings");
+    await mkdir(settings, { recursive: true, mode: 0o700 });
+    const startup = `${JSON.stringify({
+      schemaVersion: "tibotattle-electron-startup-diagnostic-v1",
+      recordedAt: "2026-09-22T14:00:01.000Z",
+      startedAt: "2026-09-22T14:00:00.000Z",
+      phase: "settings",
+      outcome: "failed",
+      code: "electron_shell_desktop_codex_roots_invalid",
+      platform: "darwin",
+      architecture: "arm64",
+      version: "0.1.24",
+    })}\n`;
+    await writeFile(join(settings, "startup-diagnostic-v1.json"), startup, { mode: 0o600 });
+    const directory = join(homeDirectory, "private-evidence");
+    const result = await exportPrivateCrashEvidence({
+      directory, homeDirectory, platform: "darwin", hours: 1,
+    });
+    assert.equal(result.includedFiles, 1);
+    assert.equal(await readFile(join(directory, "startup-stable.json"), "utf8"), startup);
+  } finally {
+    await rm(homeDirectory, { recursive: true, force: true });
+  }
+});
+
 test("legacy crash parser selects crashed-thread frames without report paths", () => {
   const raw = `Process: TiboTattle [123]\nException Type: EXC_CRASH (SIGABRT)\nTermination Reason: Namespace SIGNAL, Code 6 Abort trap: 6\nTriggered by Thread: 1\nThread 0:\n0 libSystem 0x123456 Other + 1\nThread 1 Crashed:\n0 TiboTattle 0x123456 TiboStart + 12\n1 libSystem 0x123457 /Users/private/secret + 4\n\nBinary Images:\n/Users/private/account\n`;
   assert.deepEqual(parseAppleCrashReport(raw, ".crash"), {
@@ -169,6 +198,17 @@ test("offline doctor reads synthetic user reports and preference, never launches
     await writeFile(join(reports, "OtherApp-2026-09-21.ips"), IPS);
     await writeFile(join(settings, "crash-capture-v1.json"),
       '{"schemaVersion":"tibotattle-electron-crash-capture-v1","enabled":true}\n');
+    await writeFile(join(settings, "startup-diagnostic-v1.json"), `${JSON.stringify({
+      schemaVersion: "tibotattle-electron-startup-diagnostic-v1",
+      recordedAt: "2026-09-22T14:00:01.000Z",
+      startedAt: "2026-09-22T14:00:00.000Z",
+      phase: "native_handover",
+      outcome: "failed",
+      code: "secure_storage_locked",
+      platform: "darwin",
+      architecture: "arm64",
+      version: "0.1.24",
+    })}\n`, { mode: 0o600 });
     await symlink(join(reports, "TiboTattle-2026-09-21.ips"), join(reports, "TiboTattle-link.ips"));
     const result = await diagnoseDesktopCrash({
       homeDirectory, platform: "darwin", now: Date.now(), hours: 1,
@@ -179,9 +219,12 @@ test("offline doctor reads synthetic user reports and preference, never launches
     assert.match(result.appleReports.matches[0].reportModifiedAt, /^\d{4}-\d{2}-\d{2}T/u);
     assert.equal(result.channel, "stable");
     assert.equal(result.localCapture[0].capturePreference, "enabled_preference");
+    assert.equal(result.startupDiagnostics[0].status, "available");
+    assert.equal(result.startupDiagnostics[0].record.phase, "native_handover");
     const output = renderDesktopCrashDiagnosis(result);
     assert.match(output, /EXC_BAD_ACCESS/u);
     assert.match(output, /ElectronMain, unavailable, abort/u);
+    assert.match(output, /failed at native_handover; code secure_storage_locked/u);
     assert.doesNotMatch(output, /private|secret|account|\.ips|TiboTattle-link/u);
     assert.doesNotMatch(JSON.stringify(result), /private|secret|account|\.ips|TiboTattle-link/u);
   } finally {
@@ -222,8 +265,35 @@ test("offline doctor reports missing Apple evidence honestly", async () => {
     assert.equal(result.localCapture[0].capturePreference, "missing");
     assert.match(renderDesktopCrashDiagnosis(result), /Absence of a report does not rule out a crash/u);
     assert.deepEqual(await diagnoseDesktopCrash({ platform: "linux" }), {
-      schemaVersion: "tibotattle-offline-crash-doctor-v2", status: "unsupported_platform",
+      schemaVersion: "tibotattle-offline-crash-doctor-v3", status: "unsupported_platform",
     });
+  } finally {
+    await rm(homeDirectory, { recursive: true, force: true });
+  }
+});
+
+test("offline doctor accepts a content-free unknown startup version", async () => {
+  const homeDirectory = await mkdtemp(join(tmpdir(), "tibotattle-doctor-"));
+  try {
+    const settings = join(homeDirectory, "Library", "Application Support", "TiboTattle",
+      "desktop-settings");
+    await mkdir(settings, { recursive: true, mode: 0o700 });
+    await writeFile(join(settings, "startup-diagnostic-v1.json"), `${JSON.stringify({
+      schemaVersion: "tibotattle-electron-startup-diagnostic-v1",
+      recordedAt: "2026-09-22T14:00:01.000Z",
+      startedAt: "2026-09-22T14:00:00.000Z",
+      phase: "runtime_paths",
+      outcome: "failed",
+      code: "startup_unclassified",
+      platform: "darwin",
+      architecture: "arm64",
+      version: "unknown",
+    })}\n`, { mode: 0o600 });
+    const result = await diagnoseDesktopCrash({
+      homeDirectory, platform: "darwin", now: Date.now(), hours: 1,
+    });
+    assert.equal(result.startupDiagnostics[0].status, "available");
+    assert.equal(result.startupDiagnostics[0].record.version, "unknown");
   } finally {
     await rm(homeDirectory, { recursive: true, force: true });
   }

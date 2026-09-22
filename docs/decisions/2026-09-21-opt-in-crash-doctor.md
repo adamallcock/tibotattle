@@ -40,6 +40,12 @@ tokens per crashed thread and at most 40 recent, revalidated companion
 diagnostic notes per profile, including fixed status codes and support references.
 It still excludes raw Apple report text, Crashpad memory dumps, native free-form
 messages, and private paths. No mode automatically sends output.
+The Electron main process also overwrites one owner-only, content-free startup
+result per launch. It contains only version/platform labels, timestamps, the
+last fixed startup phase, outcome, and an allowlisted code. A handled startup
+failure after profile selection is durably recorded before the deliberate quit,
+so the independent doctor can distinguish credential, settings, lifecycle, and
+updater failure families without retaining an exception message or path.
 The separate `--export-private` mode is an explicit owner action that creates a
 new owner-only local directory outside the source checkout. It copies bounded,
 matching original Apple reports and companion diagnostic log generations under
@@ -49,7 +55,9 @@ capped. The directory is never attached, projected into ordinary diagnostics,
 or transmitted by TiboTattle. Raw contents may contain paths and process memory;
 the owner must review them and choose a private handoff with the maintainer.
 Public issues continue to receive only reviewed summary text.
-This source command does not make the in-app doctor available during a launch
-crash, and it is not an installed-app feature. Source tests validate the
-preference and projection boundaries. Packaged, installed, signed-release, and
-updater behavior require separate evidence.
+The doctor script is included in the reviewed Electron runtime closure and can
+be run through the installed executable with `ELECTRON_RUN_AS_NODE=1`, which
+bypasses the app entrypoint. Source tests validate the preference, startup
+journal, and projection boundaries. Packaged-source validation establishes the
+file is present; installed, signed-release, and updater behavior require their
+separate evidence.

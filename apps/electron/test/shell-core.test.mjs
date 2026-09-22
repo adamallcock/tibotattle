@@ -4059,6 +4059,7 @@ test("Electron entry quits explicitly when composition fails before lifecycle ow
     app.quitCalls += 1;
   };
   const diagnostics = [];
+  let recordedFailure = null;
   await assert.rejects(
     launchElectronShell({
       electron: {
@@ -4075,15 +4076,41 @@ test("Electron entry quits explicitly when composition fails before lifecycle ow
         events.push("diagnostic");
         diagnostics.push(value);
       },
+      startupDiagnostics: {
+        mark() {},
+        async fail(error) {
+          events.push("startup-failure");
+          recordedFailure = error;
+        },
+      },
     }),
     electronEntryCompositionFailure,
   );
+  assert.equal(electronEntryCompositionFailure(recordedFailure), true);
   assert.deepEqual(diagnostics, [`${ELECTRON_ENTRY_FAILURE_DIAGNOSTIC}\n`]);
   assert.deepEqual(alerts, [{
     title: "TiboTattle could not start",
     message: `TiboTattle stopped before opening the dashboard.\n\nSupport code: ${ELECTRON_ENTRY_FAILURE_DIAGNOSTIC}\n\nPlease report this code with the app and operating system versions. Preserve your local data.`,
   }]);
-  assert.deepEqual(events, ["diagnostic", "alert", "quit"]);
+  assert.deepEqual(events, ["startup-failure", "diagnostic", "alert", "quit"]);
+  assert.equal(app.quitCalls, 1);
+});
+
+test("Electron entry ignores an unavailable startup journal", async () => {
+  const app = new FakeApp();
+  await assert.rejects(
+    launchElectronShell({
+      electron: { app, dialog: { showErrorBox() {} } },
+      emitFailureDiagnostic: true,
+      writeDiagnostic() {},
+      startupDiagnostics: {
+        mark() { throw new Error("synthetic journal failure"); },
+        async start() { throw new Error("synthetic journal failure"); },
+        async fail() { throw new Error("synthetic journal failure"); },
+      },
+    }),
+    electronEntryCompositionFailure,
+  );
   assert.equal(app.quitCalls, 1);
 });
 

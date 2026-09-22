@@ -54,6 +54,7 @@ const SHELL_FILES = [
   "apps/electron/desktop-contract.js",
   "apps/electron/desktop-contribution-credential.js",
   "apps/electron/desktop-crash-capture.js",
+  "apps/electron/desktop-startup-diagnostics.js",
   "apps/electron/desktop-codex-roots.js",
   "apps/electron/desktop-deep-links.js",
   "apps/electron/desktop-diagnostics.js",
@@ -138,6 +139,7 @@ const SHELL_FILES = [
   "src/platform/windows-credential-operation-audit.js",
   "src/platform/windows-credential-audit-file-guard.js",
   "src/platform/windows-protected-sqlite.js",
+  "scripts/diagnose-desktop-crash.mjs",
 ];
 const KEYTAR = Object.freeze({
   "darwin-arm64": "node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
