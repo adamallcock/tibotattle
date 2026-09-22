@@ -39,8 +39,6 @@ CREATE TABLE community_model_composition_days (
 
 -- Operational v1 transactional projection effects. Computation workers
 -- consume these states separately, just as on D1; this is not publication.
-CREATE TABLE legacy_sources(participant_id text PRIMARY KEY REFERENCES participants);
-CREATE TABLE v11_domain_heads(participant_id text PRIMARY KEY REFERENCES participants);
 CREATE TABLE mutation_control (
   singleton_id integer PRIMARY KEY CHECK(singleton_id=1), mutation_epoch bigint NOT NULL DEFAULT 0,
   graph_append_epoch bigint NOT NULL DEFAULT -1, graph_invalidation_epoch bigint NOT NULL DEFAULT 0,
@@ -81,8 +79,15 @@ BEGIN
   -- Acquire the shared publication epoch before mutating source rows. This
   -- preserves D1's global serialization; throughput remains a qualification gate.
   SELECT mutation_epoch INTO STRICT epoch FROM mutation_control WHERE singleton_id=1 FOR UPDATE;
-  IF EXISTS(SELECT 1 FROM legacy_sources WHERE participant_id=input->>'participantId')
-     OR EXISTS(SELECT 1 FROM v11_domain_heads WHERE participant_id=input->>'participantId') THEN RETURN; END IF;
+  IF EXISTS(SELECT 1 FROM telemetry_v11_domain_heads
+      WHERE participant_id=input->>'participantId')
+     OR EXISTS(
+       SELECT 1
+         FROM telemetry_v11_records legacy
+         JOIN telemetry_v11_chunks legacy_chunk ON legacy_chunk.id=legacy.chunk_id
+        WHERE legacy_chunk.participant_id=input->>'participantId'
+          AND legacy.legacy_occurrence_id IS NOT NULL
+     ) THEN RETURN; END IF;
   INSERT INTO graph_scope VALUES(1,jsonb_set(input #- '{chunk,records}','{recordCount}',to_jsonb(jsonb_array_length(input->'chunk'->'records'))),epoch,
     CASE WHEN input->'supersedes'->>'id' IS NULL THEN 'insert' ELSE 'supersede' END);
 END;
@@ -142,8 +147,15 @@ BEGIN
       AND m->>'envelopeDigest'=NEW.envelope_digest,false);
     IF NOT preserves AND NOT correction THEN
       preserves := NEW.revision=1 AND EXISTS(SELECT 1 FROM participants WHERE id=owner_id AND state='active')
-        AND NOT EXISTS(SELECT 1 FROM legacy_sources WHERE participant_id=owner_id)
-        AND NOT EXISTS(SELECT 1 FROM v11_domain_heads WHERE participant_id=owner_id)
+        AND NOT EXISTS(SELECT 1 FROM telemetry_v11_domain_heads
+          WHERE participant_id=owner_id)
+        AND NOT EXISTS(
+          SELECT 1
+            FROM telemetry_v11_records legacy
+            JOIN telemetry_v11_chunks legacy_chunk ON legacy_chunk.id=legacy.chunk_id
+           WHERE legacy_chunk.participant_id=owner_id
+             AND legacy.legacy_occurrence_id IS NOT NULL
+        )
         AND NOT EXISTS(SELECT 1 FROM telemetry_v1_chunks WHERE participant_id=owner_id AND device_id=NEW.device_id AND stream=NEW.stream
           AND chunk_day=NEW.chunk_day AND chunk_seq=NEW.chunk_seq AND id<>NEW.id)
         AND NOT EXISTS(SELECT 1 FROM telemetry_v1_chunks WHERE participant_id=owner_id AND device_id<>NEW.device_id
@@ -515,3 +527,36 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+
+-- v1 admission is defined in migration 0004, before the transport authority
+-- tables are installed by 0005/0006.  Keep the v1 writer itself unchanged,
+-- but apply the same participant floor at its canonical chunk boundary.  A
+-- missing floor retains the authority default (rank 1); an explicit floor
+-- above the accepted v1 format fails closed with the neutral transport code.
+CREATE OR REPLACE FUNCTION reject_v1_transport_floor()
+RETURNS trigger
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE
+  minimum_rank_value integer;
+  format_rank_value integer;
+  lifecycle_value text;
+BEGIN
+  SELECT COALESCE(minimum_rank,1) INTO minimum_rank_value
+    FROM telemetry_transport_participant_floors
+   WHERE participant_id=NEW.participant_id
+   FOR SHARE;
+  SELECT format_rank,lifecycle INTO format_rank_value,lifecycle_value
+    FROM telemetry_transport_formats
+   WHERE schema_version='telemetry-contribution-v1.0';
+  IF lifecycle_value IS DISTINCT FROM 'accepted'
+      OR format_rank_value IS NULL
+      OR format_rank_value < COALESCE(minimum_rank_value,1) THEN
+    RAISE EXCEPTION USING ERRCODE = 'P1007';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER telemetry_v1_transport_floor_guard
+  BEFORE INSERT ON telemetry_v1_chunks
+  FOR EACH ROW EXECUTE FUNCTION reject_v1_transport_floor();

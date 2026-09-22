@@ -5,7 +5,7 @@ import { isAbsolute } from 'node:path';
 import pg from 'pg';
 import { applyPostgresMigrations } from '../scripts/postgres-migrations.mjs';
 import { eraseParticipantWithStore } from '../src/participant-erasure-store.ts';
-import { createExperimentalPostgresParticipantErasureStores } from '../src/postgres-participant-erasure-store.ts';
+import { createPostgresParticipantErasureStores } from '../src/postgres-participant-erasure-canonical.ts';
 import { registerParticipantErasureTests } from './erasure-fixtures.mjs';
 import { registerSyncTests } from './sync-fixtures.mjs';
 import { registerQuotaFitTests } from './quota-fit-fixtures.mjs';
@@ -101,6 +101,7 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   await pool.query(`TRUNCATE ${schema}.participants, ${schema}.pending_objects CASCADE`);
+  await pool.query(`TRUNCATE ${schema}.analytics_owner_state`);
   await resetProjectionState(pool,schema);
   const issuedAt = new Date().toISOString();
   const deviceIssuedAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
@@ -130,6 +131,18 @@ beforeEach(async () => {
     (participant_id,device_id,telemetry_schema_version,field_dictionary_version,
       privacy_contract_version,consented_at)
     VALUES($1,$2,$3,$4,$5,$6)`, [pid, did, ...Object.values(consent), issuedAt]);
+  await pool.query(`INSERT INTO ${schema}.storage_source_state(singleton,source_id,authority_epoch)
+    VALUES(1,'canonical-v1-test-source',1)
+    ON CONFLICT(singleton) DO NOTHING`);
+  const ownerDigest = digest(`owner:${pid}`);
+  await pool.query(`INSERT INTO ${schema}.storage_v11_owner_links
+    (participant_id,owner_digest,state,generation_id,head_revision,object_digest,manifest_digest)
+    VALUES($1,$2,'active','owner-generation-1',1,$2,$2)`, [pid, ownerDigest]);
+  await pool.query(`DELETE FROM ${schema}.analytics_owner_state WHERE owner_digest=$1`, [ownerDigest]);
+  await pool.query(`INSERT INTO ${schema}.analytics_owner_state
+    (source_id,owner_digest,revision,authority_epoch,state)
+    SELECT source_id,$1,1,authority_epoch,'active'
+      FROM ${schema}.storage_source_state WHERE singleton=1`, [ownerDigest]);
 });
 
 async function input({sequence=0, revision=1, supersedes=null, occurrence=randomUUID(), count=1, stream='session',chunkDay=day}={}) {
@@ -428,14 +441,53 @@ registerProjectionTests({pool:()=>pool,store:()=>store,input,grant,rows,snapshot
 registerSyncTests({syncStore:()=>backend.sync,contributionStore:()=>store,input,grant,pid,did});
 registerQuotaFitTests({pool:()=>pool,rows,schema,pid,did});
 
-registerParticipantErasureTests({primaryPool:()=>pool,ledgerPool:()=>ledgerPool,schema});
+registerParticipantErasureTests({primaryPool:()=>pool,ledgerPool:()=>ledgerPool,schema,ledgerSchema});
+
+async function restoreParticipantForReplay() {
+  const issuedAt = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  await pool.query(`INSERT INTO ${schema}.participants
+    (id,state,owner_kind,consent_version,consented_at,created_at)
+    VALUES($1,'active','social',$2,$3,$3)`, [pid, consent.privacyContractVersion, issuedAt]);
+  await pool.query(`INSERT INTO ${schema}.web_sessions
+    (id,participant_id,secret_hash,csrf_hash,scope,state,issued_at,expires_at,last_used_at)
+    VALUES($1,$2,$3,$4,'personal','active',$5,$6,$5)`,
+  [`session-${pid}`,pid,Buffer.alloc(32,1),Buffer.alloc(32,2),issuedAt,expiresAt]);
+  await pool.query(`INSERT INTO ${schema}.device_pairings
+    (id,participant_id,issued_by_session_id,secret_hash,consent_version,
+     transport_consent_version,state,issued_at,expires_at,claimed_device_id)
+    VALUES($1,$2,$3,$4,$5,$6,'consumed',$7,$8,$9)`,
+  [`pairing-${did}`,pid,`session-${pid}`,Buffer.alloc(32,3),consent.privacyContractVersion,
+    consent.telemetrySchemaVersion,issuedAt,expiresAt,did]);
+  await pool.query(`INSERT INTO ${schema}.device_credentials
+    (id,participant_id,authority_kind,paired_via_pairing_id,secret_hash,state,
+     issued_at,expires_at,last_used_at,social_verified_at)
+    VALUES($1,$2,'social',$3,$4,'active',$5,$6,$5,$5)`,
+  [did,pid,`pairing-${did}`,Buffer.alloc(32,4),issuedAt,expiresAt]);
+  await pool.query(`INSERT INTO ${schema}.telemetry_transport_participant_floors
+    (participant_id,minimum_rank,revision,changed_at) VALUES($1,1,0,$2)`,[pid,issuedAt]);
+  await pool.query(`INSERT INTO ${schema}.telemetry_v1_device_consents
+    (participant_id,device_id,telemetry_schema_version,field_dictionary_version,
+     privacy_contract_version,consented_at)
+    VALUES($1,$2,$3,$4,$5,$6)`,[pid,did,...Object.values(consent),issuedAt]);
+  const ownerDigest=digest(`owner:${pid}`);
+  await pool.query(`INSERT INTO ${schema}.storage_v11_owner_links
+    (participant_id,owner_digest,state,generation_id,head_revision,object_digest,manifest_digest)
+    VALUES($1,$2,'active','owner-generation-restored',1,$2,$2)`,[pid,ownerDigest]);
+  await pool.query(`INSERT INTO ${schema}.analytics_owner_state
+    (source_id,owner_digest,revision,authority_epoch,state)
+    SELECT source_id,$1,1,authority_epoch,'active'
+      FROM ${schema}.storage_source_state WHERE singleton=1`,[ownerDigest]);
+}
 
 it('erases actual accepted v1 data and preserves the independent ledger across a primary restore',async()=>{
   const value=await grant(await input());await store.insert(value);
-  const retainedTables=['participants','devices','consents','authorizations','chunks','records','pending_objects'];
+  const retainedTables=['participants','device_credentials','telemetry_v1_device_consents',
+    'device_upload_authorizations','telemetry_v1_chunks','telemetry_v1_records','pending_objects',
+    'storage_v11_owner_links','analytics_owner_state'];
   const retained={};
   for(const table of retainedTables) retained[table]=await rows(table);
-  const adapters=createExperimentalPostgresParticipantErasureStores(pool,ledgerPool,{primarySchema:schema});
+  const adapters=createPostgresParticipantErasureStores(pool,ledgerPool,{schemaOptions:{primarySchema:schema,ledgerSchema}});
   const deleted=[];
   const dependencies={...adapters,objects:{async deleteBatch(refs){deleted.push(...refs.map(ref=>ref.key));}},
     hooks:{async revokeAccountlessEnrollment(){},async assertIdentityConfiguration(){},async recordIdentityCooldown(){}}};
@@ -447,9 +499,8 @@ it('erases actual accepted v1 data and preserves the independent ledger across a
   expect(await eraseParticipantWithStore(dependencies,pid,randomUUID(),now)).toEqual({deleted:true,alreadyDeleted:true,contributionsDeleted:null});
   // Rehearse restoration of primary source rows only. The external ledger
   // deliberately remains intact and is consulted before repeating erasure.
-  for(const table of retainedTables) {
-    await pool.query(`INSERT INTO ${schema}.${table} SELECT * FROM jsonb_populate_recordset(NULL::${schema}.${table},$1::jsonb)`,[JSON.stringify(retained[table])]);
-  }
+  await restoreParticipantForReplay();
+  await store.insert(await grant(value));
   expect(await adapters.ledger.hasTombstone(pid,now)).toBe(true);
   expect(await reader.byEnvelope(pid,value.envelopeDigest)).not.toBeNull();
   expect(await eraseParticipantWithStore(dependencies,pid,randomUUID(),now+1000)).toMatchObject({deleted:true,contributionsDeleted:1});
@@ -459,7 +510,7 @@ it('erases actual accepted v1 data and preserves the independent ledger across a
 
 it('rolls back failed erasure finalization and retries from the durable ledger and source rows',async()=>{
   const value=await grant(await input());await store.insert(value);
-  const adapters=createExperimentalPostgresParticipantErasureStores(pool,ledgerPool);
+  const adapters=createPostgresParticipantErasureStores(pool,ledgerPool,{schemaOptions:{primarySchema:schema,ledgerSchema}});
   const dependencies={...adapters,objects:{async deleteBatch(){}},
     hooks:{async revokeAccountlessEnrollment(){},async assertIdentityConfiguration(){},async recordIdentityCooldown(){}}};
   await pool.query(`CREATE FUNCTION ${schema}.synthetic_erasure_failure() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -469,8 +520,8 @@ it('rolls back failed erasure finalization and retries from the durable ledger a
   try {
     await expect(eraseParticipantWithStore(dependencies,pid,randomUUID())).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
     expect((await rows('participants'))[0].state).toBe('deleting');
-    expect(await rows('records')).toHaveLength(1);
-    expect(await rows('chunks')).toHaveLength(1);
+    expect(await rows('telemetry_v1_records')).toHaveLength(1);
+    expect(await rows('telemetry_v1_chunks')).toHaveLength(1);
     expect(await rows('pending_objects')).toHaveLength(1);
     expect(await adapters.ledger.hasTombstone(pid,Date.now())).toBe(true);
   } finally {
@@ -478,7 +529,7 @@ it('rolls back failed erasure finalization and retries from the durable ledger a
   }
   expect(await eraseParticipantWithStore(dependencies,pid,randomUUID())).toMatchObject({deleted:true,contributionsDeleted:1});
   expect(await rows('participants')).toEqual([]);
-  expect(await rows('records')).toEqual([]);
+  expect(await rows('telemetry_v1_records')).toEqual([]);
 });
 
 it('bounds PostgreSQL erasure reads while a primary table is locked',async()=>{
@@ -486,8 +537,8 @@ it('bounds PostgreSQL erasure reads while a primary table is locked',async()=>{
   try {
     await blocker.query('BEGIN');
     await blocker.query(`LOCK TABLE ${schema}.participants IN ACCESS EXCLUSIVE MODE`);
-    const adapters=createExperimentalPostgresParticipantErasureStores(pool,ledgerPool,
-      {statementTimeoutMilliseconds:100,lockTimeoutMilliseconds:50});
+    const adapters=createPostgresParticipantErasureStores(pool,ledgerPool,
+      {schemaOptions:{primarySchema:schema,ledgerSchema},statementTimeoutMilliseconds:100,lockTimeoutMilliseconds:50});
     await expect(adapters.primary.readParticipant(pid)).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
   } finally {await blocker.query('ROLLBACK');blocker.release();}
 });

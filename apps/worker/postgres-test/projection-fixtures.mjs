@@ -1,5 +1,6 @@
 import {expect,it} from 'vitest';
-export const projectionTables=['legacy_sources','v11_domain_heads','mutation_control','graph_scope','publication_state',
+import {randomUUID} from 'node:crypto';
+export const projectionTables=['mutation_control','graph_scope','publication_state',
   'preview_cache','daily_rebuilds','current_queue_state','current_queue','refresh_lanes','prepared_source_days','preparation_counters'];
 export async function resetProjectionState(pool,schema) {
   // These singleton rows belong to the operational migration.  Reset their
@@ -17,9 +18,61 @@ export async function resetProjectionState(pool,schema) {
     UPDATE ${schema}.publication_state SET publication_state='ready',changed_at=clock_timestamp()
       WHERE singleton=1;
     UPDATE ${schema}.current_queue_state SET window_generation=1 WHERE singleton_id=1;
-    UPDATE ${schema}.preparation_counters SET is_exact=true,tracked_days=0,
+  UPDATE ${schema}.preparation_counters SET is_exact=true,tracked_days=0,
       complete_days=0,building_days=0,retiring_days=0,checkpoint_steps=0,
       quota_observations=0,usage_events=0 WHERE singleton_id=1`);
+}
+async function seedCanonicalV11Head(pool,schema,participantId,deviceId) {
+  const now='2026-09-01T12:00:00.000Z';
+  const manifestId=randomUUID(),domainId=randomUUID();
+  const digest='a'.repeat(64),tokenHash='b'.repeat(64);
+  await pool.query(`INSERT INTO ${schema}.telemetry_v11_day_manifests
+    (id,participant_id,device_id,chunk_day,manifest_digest,parser_version,manifest_json,
+     expected_chunk_count,state,created_at)
+    VALUES($1,$2,$3,'2026-09-01',$4,'projection-fixture','{}',0,'staged',$5)`,
+  [manifestId,participantId,deviceId,digest,now]);
+  await pool.query(`INSERT INTO ${schema}.telemetry_v11_domain_predecessors
+    (token_hash,participant_id,device_id,previous_generation_id,legacy_fingerprint,
+     input_revision,from_day,through_day,winners_json,created_at,expires_at)
+    VALUES($1,$2,$3,NULL,$4,0,'2026-09-01','2026-09-01','{}',$5,$6)`,
+  [tokenHash,participantId,deviceId,digest,now,'2026-09-02T12:00:00.000Z']);
+  await pool.query(`INSERT INTO ${schema}.telemetry_v11_domains
+    (id,participant_id,device_id,predecessor_token_hash,previous_generation_id,
+     manifest_digest,legacy_fingerprint,input_revision,from_day,through_day,days_json,created_at)
+    VALUES($1,$2,$3,$4,NULL,$5,$6,0,'2026-09-01','2026-09-01','{}',$7)`,
+  [domainId,participantId,deviceId,tokenHash,digest,digest,now]);
+  await pool.query(`INSERT INTO ${schema}.telemetry_v11_domain_heads
+    (participant_id,generation_id,revision,updated_at) VALUES($1,$2,1,$3)`,
+  [participantId,domainId,now]);
+}
+async function seedCanonicalV11LegacyRecord(pool,schema,participantId,deviceId) {
+  const now='2026-09-01T12:00:00.000Z';
+  const id=randomUUID(),manifestId=randomUUID(),authorizationId=`projection-auth-${randomUUID()}`;
+  const digest='c'.repeat(64),objectKey=`projection/${id}`;
+  await pool.query(`INSERT INTO ${schema}.device_upload_authorizations
+    (id,participant_id,issued_by_device_id,secret_hash,envelope_digest,body_bytes,
+     content_type,state,issued_at,expires_at)
+    VALUES($1,$2,$3,$4,$5,1,'application/json','consumed',$6,$7)`,
+  [authorizationId,participantId,deviceId,Buffer.alloc(32,7),digest,new Date(now),new Date('2026-09-02T12:00:00.000Z')]);
+  await pool.query(`INSERT INTO ${schema}.pending_objects
+    (contribution_id,object_key,object_kind,registered_at,reconciliation_state)
+    VALUES($1,$2,'telemetry_v11',$3,'registered')`,[id,objectKey,now]);
+  await pool.query(`INSERT INTO ${schema}.telemetry_v11_day_manifests
+    (id,participant_id,device_id,chunk_day,manifest_digest,parser_version,manifest_json,
+     expected_chunk_count,state,created_at,ready_at)
+    VALUES($1,$2,$3,'2026-09-01',$4,'projection-fixture','{}',1,'ready',$5,$5)`,
+  [manifestId,participantId,deviceId,digest,now]);
+  await pool.query(`INSERT INTO ${schema}.telemetry_v11_chunks
+    (id,manifest_id,participant_id,device_id,stream,chunk_day,chunk_seq,chunk_id,
+     chunk_digest,envelope_digest,parser_version,record_count,r2_key,
+     device_upload_authorization_id,created_at)
+    VALUES($1,$2,$3,$4,'session','2026-09-01',0,$1,$5,$6,'projection-fixture',1,$7,$8,$9)`,
+  [id,manifestId,participantId,deviceId,digest,'d'.repeat(64),objectKey,authorizationId,now]);
+  await pool.query(`INSERT INTO ${schema}.telemetry_v11_records
+    (chunk_id,manifest_id,stream,occurrence_id,observed_at,record_json,
+     legacy_occurrence_id,legacy_record_json)
+    VALUES($1,$2,'session','projection-occurrence',$3,'{}','legacy-occurrence','{}')`,
+  [id,manifestId,now]);
 }
 export function registerProjectionTests({pool:getPool,store:getStore,input,grant,rows,snapshot,schema,pid,did}) {
   const pool=()=>getPool(),store=()=>getStore(),day='2026-09-01';
@@ -37,8 +90,10 @@ export function registerProjectionTests({pool:getPool,store:getStore,input,grant
     expect((await rows('publication_state'))[0].publication_state).toBe('updating');
     expect(await rows('preview_cache')).toHaveLength(1);expect(await rows('graph_scope')).toHaveLength(0);
   });
-  it.each(['legacy_sources','v11_domain_heads'])('hard invalidates when %s prevents graph preservation',async table=>{
-    await preview();await pool().query(`INSERT INTO ${schema}.${table} VALUES($1)`,[pid]);
+  it.each(['telemetry_v11_records','telemetry_v11_domain_heads'])('hard invalidates when canonical %s prevents graph preservation',async table=>{
+    await preview();
+    if(table==='telemetry_v11_records') await seedCanonicalV11LegacyRecord(pool(),schema,pid,did);
+    else await seedCanonicalV11Head(pool(),schema,pid,did);
     const value=await grant(await input());await store().insert(value);
     expect((await rows('mutation_control'))[0]).toMatchObject({mutation_epoch:'1',graph_invalidation_epoch:'1',graph_last_change_reason:'authority-or-unrecognized-change'});
     expect(await rows('preview_cache')).toHaveLength(0);
