@@ -737,6 +737,7 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
         },
         currentVersion: "0.1.12",
         currentVersionSourceAddresses: { last24Hours: 18, last7Days: 19 },
+        observedTotals: null,
         observedVersions: [{
           client: "native",
           operatingSystem: "macos",
@@ -1305,5 +1306,37 @@ test("database health projects only closed, consistent role evidence", async () 
   ]) {
     const bad = structuredClone(input); alter(bad);
     assert.throws(() => projectAdminDatabaseHealth(bad), { message: "ADMIN_DATABASE_HEALTH_INVALID" });
+  }
+});
+
+
+test("version totals validate OS coverage, counts and unavailable states without inferring legacy totals", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  assert.equal(projectAdminOverview(payload).distribution.cloudflare.observedTotals, null);
+  const totals = {
+    platforms: [
+      { operatingSystem: "macos", requestsLast7Days: 85, sourceAddressesLast7Days: 25 },
+      { operatingSystem: "windows", requestsLast7Days: 8, sourceAddressesLast7Days: 4 },
+      { operatingSystem: "linux", requestsLast7Days: 3, sourceAddressesLast7Days: 2 },
+    ],
+    overall: { requestsLast7Days: 96, sourceAddressesLast7Days: 29 },
+  };
+  payload.distribution.cloudflare.observedTotals = totals;
+  totals.overall.privateField = "omit me";
+  const projected = projectAdminOverview(payload).distribution.cloudflare.observedTotals;
+  assert.equal(projected.overall.privateField, undefined);
+  assert.ok(Object.isFrozen(projected.platforms));
+  for (const mutate of [
+    p => p.platforms[0].operatingSystem = "darwin",
+    p => p.platforms[1].operatingSystem = "macos",
+    p => p.platforms.pop(),
+    p => p.platforms[0].sourceAddressesLast7Days = 30,
+    p => p.platforms[0].requestsLast7Days = -1,
+    p => p.overall.requestsLast7Days = 97,
+    p => p.overall.sourceAddressesLast7Days = 28,
+  ]) {
+    const invalid = structuredClone(payload);
+    mutate(invalid.distribution.cloudflare.observedTotals);
+    assert.throws(() => projectAdminOverview(invalid), /ADMIN_OVERVIEW_INVALID/u);
   }
 });
