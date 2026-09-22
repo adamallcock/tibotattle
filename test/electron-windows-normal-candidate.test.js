@@ -113,12 +113,15 @@ test("disposable Windows source is created with current-user owner and fixed err
 });
 
 test("packaged Windows timing smoke requires a complete ready source scan", () => {
-  const ready = { schemaVersion: 4, method: 5, status: "ready", collecting: false,
+  const ready = { schemaVersion: 5, method: 5, speedMode: "standard", excludedUnknownTurns: 0,
+    status: "ready", collecting: false,
     stale: false, period: "all", models: [{ id: "gpt-5.6-sol", turns: 1,
       speed: [{ points: [{ median: 13.3 }] }], ttft: [{ median: 1 }] }],
     historyProgress: { checked: 1, total: 1 } };
   assert.equal(verifyWindowsNormalCandidateModelPerformance(ready), true);
-  for (const value of [null, { ...ready, schemaVersion: 2 }, { ...ready, method: 3 },
+  for (const value of [null, { ...ready, schemaVersion: 2 }, { ...ready, schemaVersion: 4 }, { ...ready, method: 3 },
+    { ...ready, speedMode: "fast" }, { ...ready, speedMode: undefined },
+    { ...ready, excludedUnknownTurns: 1 }, { ...ready, excludedUnknownTurns: undefined },
     { ...ready, status: "unavailable" },
     { ...ready, status: "loading" }, { ...ready, stale: true },
     { ...ready, historyProgress: null },
@@ -1216,6 +1219,7 @@ test("normal candidate adds one content-free Codex source before launch", async 
   ]);
   assert.equal(records[0].payload.id, "70000000-0000-4000-8000-000000000001");
   assert.equal(records[3].payload.model, "gpt-5.6-sol");
+  assert.equal(records[3].payload.service_tier, "default");
   assert.equal(records[6].payload.info.total_token_usage.total_tokens, 120);
   assert.deepEqual(calls, [
     {

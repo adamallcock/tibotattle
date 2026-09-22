@@ -135,7 +135,7 @@ export function buildWindowsNormalCandidateCodexFixture(nowMs = Date.now()) {
     {
       timestamp: at(SYNTHETIC_CODEX_TURN_CONTEXT_OFFSET_MS),
       type: "turn_context",
-      payload: { turn_id: SYNTHETIC_CODEX_TURN_ID, model: "gpt-5.6-sol", effort: "high" },
+      payload: { turn_id: SYNTHETIC_CODEX_TURN_ID, model: "gpt-5.6-sol", effort: "high", service_tier: "default" },
     },
     {
       timestamp: at(3_000),
@@ -2870,7 +2870,8 @@ export function verifyWindowsNormalCandidateModelPerformance(value) {
       && series.points.some((point) => Number.isFinite(point?.median) && point.median > 0))
     && Array.isArray(model.ttft)
     && model.ttft.some((point) => Number.isFinite(point?.median) && point.median > 0));
-  return value?.schemaVersion === 4 && value.method === 5
+  return value?.schemaVersion === 5 && value.method === 5
+    && value.speedMode === 'standard' && value.excludedUnknownTurns === 0
     && value.status === 'ready' && value.collecting === false && value.stale === false
     && value.period === 'all' && measured === true
     && Number.isSafeInteger(progress?.total) && progress.total > 0
