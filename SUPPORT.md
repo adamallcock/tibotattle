@@ -76,7 +76,7 @@ read-only doctor **without opening TiboTattle**:
 npm run diagnose:desktop-crash -- --hours 72
 ```
 
-It checks recent TiboTattle Apple crash reports, prints only an allowlisted
+It checks recently modified TiboTattle Apple crash reports, prints only an allowlisted
 exception type, termination namespace/code, and up to five safe crashed-thread
 symbol names, then reports the local crash-capture preference and dump counts.
 It does not start the app, access Codex sessions or Keychain, change settings,
@@ -87,7 +87,8 @@ Stable reports are selected by default; add `--channel dev` for **TiboTattle
 Dev**, or `--channel all` for both. Neither format includes raw reports, dump
 bytes, paths, or report filenames.
 The saved preference cannot prove that Crashpad was active when a particular
-crash happened; it takes effect only after an app launch.
+crash happened; it takes effect only after an app launch. A displayed report
+timestamp is its file modification time, which may differ from the crash time.
 Review the output before sharing it. The existing `npm run doctor` checks Codex
 tool readiness; it is unrelated to desktop crash diagnosis. This source command
 is available before a new app release, but requires a current source checkout.

@@ -52,6 +52,7 @@ test("offline doctor reads synthetic user reports and preference, never launches
     await mkdir(reports, { recursive: true });
     await mkdir(settings, { recursive: true });
     await writeFile(join(reports, "TiboTattle-2026-09-21.ips"), IPS);
+    await writeFile(join(reports, "TiboTattle-large.ips"), Buffer.alloc(4 * 1024 * 1024 + 1));
     await writeFile(join(reports, "OtherApp-2026-09-21.ips"), IPS);
     await writeFile(join(settings, "crash-capture-v1.json"),
       '{"schemaVersion":"tibotattle-electron-crash-capture-v1","enabled":true}\n');
@@ -60,6 +61,9 @@ test("offline doctor reads synthetic user reports and preference, never launches
       homeDirectory, platform: "darwin", now: Date.now(), hours: 1,
     });
     assert.equal(result.appleReports.matches.length, 1);
+    assert.equal(result.appleReports.candidateFiles, 1);
+    assert.equal(result.appleReports.skippedLargeReports, 1);
+    assert.match(result.appleReports.matches[0].reportModifiedAt, /^\d{4}-\d{2}-\d{2}T/u);
     assert.equal(result.channel, "stable");
     assert.equal(result.localCapture[0].capturePreference, "enabled_preference");
     const output = renderDesktopCrashDiagnosis(result);

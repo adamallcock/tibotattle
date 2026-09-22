@@ -174,6 +174,7 @@ export async function diagnoseDesktopCrash({
   const reportDirectory = join(homeDirectory, "Library", "Logs", "DiagnosticReports");
   const listing = await listOwnedDirectory(reportDirectory, uid);
   const candidates = [];
+  let skippedLargeReports = 0;
   if (listing.status === "available") {
     for (const name of listing.names) {
       if (!REPORT_NAME.test(name) || !/\.(?:ips|crash)$/iu.test(name)
@@ -182,9 +183,10 @@ export async function diagnoseDesktopCrash({
       const path = join(reportDirectory, name);
       try {
         const stat = await lstat(path);
-        if (isOwnedRegularFile(stat, uid) && stat.size <= MAX_REPORT_BYTES
+        if (isOwnedRegularFile(stat, uid)
           && stat.mtimeMs <= now + 60_000 && stat.mtimeMs >= now - hours * 3_600_000) {
-          candidates.push({ path, mtimeMs: stat.mtimeMs,
+          if (stat.size > MAX_REPORT_BYTES) skippedLargeReports += 1;
+          else candidates.push({ path, mtimeMs: stat.mtimeMs,
             extension: name.toLowerCase().endsWith(".ips") ? ".ips" : ".crash" });
         }
       } catch { /* A report may be rotated while we inspect it. */ }
@@ -201,7 +203,7 @@ export async function diagnoseDesktopCrash({
       if (parsed === null) { unreadableCount += 1; continue; }
       if ((channel === "stable" && parsed.processKind === "development_app")
         || (channel === "dev" && parsed.processKind !== "development_app")) continue;
-      reports.push({ observedAt: new Date(candidate.mtimeMs).toISOString(), ...parsed });
+      reports.push({ reportModifiedAt: new Date(candidate.mtimeMs).toISOString(), ...parsed });
     } catch { unreadableCount += 1; }
   }
   return {
@@ -209,7 +211,9 @@ export async function diagnoseDesktopCrash({
     status: "ok",
     lookbackHours: hours,
     channel,
-    appleReports: { status: listing.status, matches: reports, unreadableCount },
+    appleReports: { status: listing.status, matches: reports, unreadableCount,
+      candidateFiles: candidates.length, skippedLargeReports,
+      mayHaveMore: candidates.length > MAX_CANDIDATES || reports.length === MAX_REPORTS },
     localCapture: await Promise.all((channel === "all" ? ["stable", "dev"] : [channel])
       .map(async (profile) => ({ profile, ...await inspectCapture(homeDirectory, uid, profile) }))),
     note: "Read-only local summary. No app launch, network request, or raw report upload. A stored preference does not prove capture was active at crash time. Absence of a report does not rule out a crash.",
@@ -220,15 +224,17 @@ export function renderDesktopCrashDiagnosis(result) {
   if (result.status === "unsupported_platform") return "This crash doctor currently supports macOS only.\n";
   const lines = [
     "TiboTattle offline crash doctor",
-    `Apple crash reports: ${result.appleReports.status}; channel: ${result.channel}; matching recent reports: ${result.appleReports.matches.length}`,
+    `Apple crash reports: ${result.appleReports.status}; channel: ${result.channel}; summaries shown: ${result.appleReports.matches.length}${result.appleReports.mayHaveMore ? " (more may exist)" : ""}`,
   ];
   result.appleReports.matches.forEach((report, index) => {
-    lines.push(`Report ${index + 1} (${report.observedAt}; ${report.processKind})`);
+    lines.push(`Report ${index + 1} (file modified ${report.reportModifiedAt}; ${report.processKind})`);
     lines.push(`  Exception type: ${report.exceptionType ?? "unavailable"}`);
     lines.push(`  Termination: ${report.terminationNamespace ?? "unavailable"} / ${report.terminationCode ?? "unavailable"}`);
     lines.push(`  Crashed thread top frames: ${report.topFrames.length ? report.topFrames.join(", ") : "unavailable"}`);
   });
-  lines.push(`Unreadable matching reports: ${result.appleReports.unreadableCount}`);
+  lines.push(`Candidate report files: ${result.appleReports.candidateFiles}`);
+  lines.push(`Reports not summarized: ${result.appleReports.unreadableCount}`);
+  lines.push(`Oversized reports skipped: ${result.appleReports.skippedLargeReports}`);
   for (const capture of result.localCapture) {
     lines.push(`Local crash capture preference (${capture.profile}): ${capture.capturePreference}`);
     for (const name of ["pending", "completed"]) {
