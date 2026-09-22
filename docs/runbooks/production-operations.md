@@ -510,11 +510,11 @@ data or authorize a different cross-format join.
 
 ### Guarded deployment wrapper
 
-The routine wrapper below assumes the checked-in JSON database layout. If live
-production uses typed storage, a different primary database, or a separate
-`ANALYTICS_DB`, do not run that wrapper against the legacy configuration.
-Reconcile the live configuration and typed schema first. This is a source/config
-compatibility boundary; a migration confirmation cannot repair a binding mismatch.
+Without inventory flags, the routine wrapper below uses the checked-in JSON
+database layout. For typed storage, a different primary database, or a separate
+`ANALYTICS_DB`, use the pinned typed path below. It reconstructs the live
+configuration inside a disposable source snapshot and qualifies each database
+role. A migration confirmation cannot repair a binding mismatch.
 
 The read-only reconciliation command accepts an owner-private Cloudflare
 inventory containing account/Worker identity, active version, settings,
@@ -535,10 +535,36 @@ It re-reads production before and after its fixed schema/contract SELECTs,
 derives expected schemas from local canonical migrations, and writes a private
 candidate configuration plus a sanitized report. It never deploys or applies
 remote migrations. Dirty source or a schema mismatch remains blocked. Even a
-`compatible` result is inspection evidence: the typed configuration still needs
-integration with the immutable snapshot, coordination, owning-surface and
-post-deployment gates. Do not pass the generated configuration to raw Wrangler
-as a shortcut. Keep database identifiers and plain-variable values private.
+`compatible` result is inspection evidence; deploy through the wrapper's
+immutable snapshot, coordination, owning-surface and post-deployment gates.
+Do not pass the generated configuration to raw Wrangler as a shortcut. Keep
+database identifiers and plain-variable values private.
+
+For an admin-only typed deployment, retain the exact current public release
+tree in `.release-build/public-release-site`. Pin its live manifest bytes and
+the full Git commit whose public source files produced it. The wrapper checks
+the retained source directly from Git, verifies the complete local asset tree,
+and rechecks the live manifest before and after deployment:
+
+```bash
+npm run production:deploy -- --confirm DEPLOY_PRODUCTION \
+  --expected-previous-source <reviewed-full-deployed-source-sha> \
+  --inventory <private-inventory.json> \
+  --inventory-sha256 <reviewed-inventory-sha256> \
+  --retained-public-source <reviewed-full-public-source-sha> \
+  --expected-live-manifest-sha256 <reviewed-live-manifest-sha256>
+```
+
+The typed path preserves the live bindings, settings and ingress, and rechecks
+all three database contracts at the deployment boundary. It refuses migration
+confirmations and never applies database migrations. Schema differences require
+independent diagnosis and, if needed, an explicitly authorized forward repair.
+Schema qualification derives restored-role SQL from `authorityRoleFinalSchema`.
+It also supports the forward migration 0061 extension of an already restored
+role. These exact source-derived variants require the complete, unchanged
+restore metadata group; arbitrary SQL normalization is not accepted.
+`production-trigger-repair-rehearsal.mjs` locally exercises migration-order guard
+preservation; it is not a remote repair command.
 
 Only after explicit authorization and green preflight, use the wrapper from
 `apps/worker`:
@@ -583,6 +609,10 @@ npm run production:deploy -- --confirm RECONCILE_PRODUCTION_DEPLOYMENT \
 Reconciliation does not deploy. It verifies the intended source and public
 surface, then releases only the exact recorded owner. If verification is
 unavailable or the old executor might still run, retain the lock and investigate.
+This generic reconciliation command refuses operations carrying typed deployment
+pins. Preserve their journal and lock for a separately reviewed recovery that
+revalidates the pinned configuration, schemas and public manifest; legacy
+health checks alone cannot qualify them.
 A proven pre-mutation failure with no retained lock can be retried using a new
 `--operation <fresh-private-directory>`, preserving the old evidence. Cleanup
 warnings do not erase a verified deployment outcome. These are cooperative

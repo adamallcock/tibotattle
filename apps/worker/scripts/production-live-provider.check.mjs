@@ -92,3 +92,13 @@ test('schema reader admits only fixed SELECTs and exact known database identitie
   await assert.rejects(provider.query(changed, 'USAGE_MONITOR_DB', TYPED_PRODUCTION_QUERIES.probe), { code: 'PRODUCTION_LIVE_QUERY_REFUSED' });
   assert.equal(requests, 1);
 });
+
+test('the deployment read budget permits final verification but refuses excess network calls', async () => {
+  const { provider, calls } = fixture();
+  for (let index = 0; index < 8; index += 1) await provider.capture();
+  assert.equal(calls.length, 72);
+  await assert.rejects(provider.capture(), { code: 'PRODUCTION_LIVE_READ_BUDGET' });
+  assert.equal(calls.length, 80);
+  await assert.rejects(provider.capture(), { code: 'PRODUCTION_LIVE_READ_BUDGET' });
+  assert.equal(calls.length, 80);
+});

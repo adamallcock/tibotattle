@@ -44,6 +44,18 @@ The inspection operator records those checks without modifying the service.
 No bulk PR merging, branch deletion, database migration, maintenance cutover, or
 configuration-mode change is part of this reconciliation.
 
+## Completion work
+
+- Integrate the typed inspection into the coordinated deployment wrapper with
+  private inventory hash pinning and repeated configuration/schema checks.
+- Permit an admin-only release to retain a separately pinned public-site Git
+  source and exact live manifest, without changing current public source files.
+- Rehearse any required trigger restoration locally against both migration
+  orders, preserving existing rows and unrelated guards. A prepared repair is
+  not permission to apply it to a remote database.
+- Validate the exact admin/runtime composition, then verify live configuration,
+  public assets, health and the authenticated admin page after deployment.
+
 ## Reconciliation findings
 
 The [open PR review](../reviews/2026-09-21-open-pr-reconciliation.md) accounts
@@ -67,8 +79,11 @@ to obtain a passing inspection.
 ## Validation boundary
 
 The focused reconciliation suite, documentation checks, preflight and architecture
-checks pass. The complete Worker gate passes package guards, generated assets,
-types and script checks, then encounters failures in existing runtime tests.
-The accountless ownership test's `ready` versus `deferred` assertion reproduces
-on clean base `8e8df1b5d6aeb5283da2b7979b15c966df61fbe3` and on this change.
-The broad run was stopped after failures; it is not a green complete Worker gate.
+checks pass. The completed tooling has 40 reconciliation/repair checks, 43
+deployment checks, two asset-staging checks and 30 public-release checks passing.
+Admin qualification covers 106 web tests and 76 Worker tests.
+The complete Worker runtime run reports 1,777 passing tests and 31 failures in
+seven files. Those seven files reproduce the same 31 failing test names on clean
+base `7125ee9bcc896c445f055370c222e979aa8df790`, with 108 tests passing there.
+The owning gate is not fully green; baseline reproduction establishes the
+failures predate the deployment-tooling changes, not that the failures are fixed.
