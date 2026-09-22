@@ -648,7 +648,11 @@ jobs:
           # paths are mounted and both profile roots remain private/noexec.
           # The production candidate stays inside this runner; only its bounded
           # test receipt joins the already-authorized development artifacts.
+          # Renderer reload nearly exhausted Docker's default 64 MiB /dev/shm in the
+          # retained resource diagnostic. Keep isolated shared memory with room
+          # for overlapping Chromium renderer lifetimes; diagnostics stay on.
           docker run --rm --init --platform=linux/amd64 --cap-add=SYS_ADMIN --network none \
+            --shm-size=512m \
             --tmpfs /home/node:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700 \
             --tmpfs /run/user/1000:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700 \
             --env HOME=/home/node --env TMPDIR=/run/user/1000 \
@@ -674,7 +678,9 @@ jobs:
           host_receipt=".release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution/real-appimage-updater-smoke.json"
           # Only the fixed feed host resolves to our local HTTPS fixture. Its
           # CA is generated in this disposable profile; no host trust changes.
+          # Use the same isolated Chromium shared-memory limit as normal startup.
           timeout 420s docker run --rm --init --platform=linux/amd64 --cap-add=SYS_ADMIN --network none \
+            --shm-size=512m \
             --add-host updates.tibotattle.com:127.0.0.1 \
             --sysctl net.ipv4.ip_unprivileged_port_start=0 \
             --tmpfs /home/node:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700 \
