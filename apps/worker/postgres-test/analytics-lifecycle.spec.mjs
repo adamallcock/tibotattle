@@ -468,6 +468,115 @@ it("reclaims after a blocked row lock using the database clock", async () => {
   }
 });
 
+it("rejects a renew whose lease expires while waiting for the head lock", async () => {
+  const identity = {
+    sourceId: "blocked-renew-expiry",
+    sourceNamespace: "community-analysis-v1",
+    ownerDigest: "1".repeat(64),
+    day: "2026-09-21",
+    metric: "fits",
+    inputRevision: 1,
+    ownerRevision: 1,
+    dependencyDigest: "1".repeat(64),
+    method: "provider-prepared-v1",
+    authorityEpoch: 1,
+  };
+  const store = createPostgresAnalyticalWorkStore(adapterPool, { primarySchema, ledgerSchema });
+  const claim = await store.claim({ identity, nowMs: 0, leaseMs: 40 });
+  expect(claim).not.toBeNull();
+  const blocker = await rawPool.connect();
+  let renewPromise;
+  try {
+    await blocker.query("BEGIN");
+    await blocker.query(`SELECT source_id FROM ${primarySchema}.analytics_analysis_work_heads
+      WHERE source_id=$1 AND owner_digest=$2 AND day=$3 AND metric=$4 FOR UPDATE`,
+    [identity.sourceId, identity.ownerDigest, identity.day, identity.metric]);
+    renewPromise = store.renew({ identity, claimToken: claim.claimToken, expectedRevision: claim.revision,
+      nowMs: 0, leaseMs: 5_000 });
+    let observedLockWait = false;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const waitRows = (await admin.query(`SELECT 1 FROM pg_stat_activity
+        WHERE datname=$1 AND pid <> pg_backend_pid() AND wait_event_type='Lock'
+          AND query LIKE '%analytics_analysis_work_heads%'`, [primaryDatabaseName])).rows;
+      if (waitRows.length !== 0) {
+        observedLockWait = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(observedLockWait).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    await blocker.query("COMMIT");
+    await expect(renewPromise).rejects.toMatchObject({ storageCode: "conflict" });
+    expect((await pool.query(`SELECT revision,lease_expires_ms FROM ${primarySchema}.analytics_analysis_work_heads
+      WHERE source_id=$1 AND owner_digest=$2`, [identity.sourceId, identity.ownerDigest])).rows[0])
+      .toMatchObject({ revision: "1" });
+  } finally {
+    await blocker.query("ROLLBACK").catch(() => {});
+    await renewPromise?.catch(() => {});
+    blocker.release();
+  }
+});
+
+it("rejects completion whose lease expires while waiting for the head lock", async () => {
+  const identity = {
+    sourceId: "blocked-complete-expiry",
+    sourceNamespace: "community-analysis-v1",
+    ownerDigest: "2".repeat(64),
+    day: "2026-09-21",
+    metric: "fits",
+    inputRevision: 1,
+    ownerRevision: 1,
+    dependencyDigest: "2".repeat(64),
+    method: "provider-prepared-v1",
+    authorityEpoch: 1,
+  };
+  const store = createPostgresAnalyticalWorkStore(adapterPool, { primarySchema, ledgerSchema });
+  const claim = await store.claim({ identity, nowMs: 0, leaseMs: 40 });
+  expect(claim).not.toBeNull();
+  const payloadJson = "[]";
+  const sha256 = createHash("sha256").update(payloadJson).digest("hex");
+  const checkpointed = await store.saveCheckpoint({
+    identity, claimToken: claim.claimToken, expectedRevision: claim.revision, nowMs: 0,
+    checkpoint: {
+      generation: "blocked-complete-checkpoint", expectedHead: null, controlJson: "{}", manifestJson: "[]",
+      parts: [{ index: 0, sha256, payloadJson }], complete: false,
+    },
+  });
+  const blocker = await rawPool.connect();
+  let completePromise;
+  try {
+    await blocker.query("BEGIN");
+    await blocker.query(`SELECT source_id FROM ${primarySchema}.analytics_analysis_work_heads
+      WHERE source_id=$1 AND owner_digest=$2 AND day=$3 AND metric=$4 FOR UPDATE`,
+    [identity.sourceId, identity.ownerDigest, identity.day, identity.metric]);
+    completePromise = store.complete({ identity, claimToken: claim.claimToken,
+      expectedRevision: checkpointed.revision, nowMs: 0, resultDigest: "3".repeat(64) });
+    let observedLockWait = false;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const waitRows = (await admin.query(`SELECT 1 FROM pg_stat_activity
+        WHERE datname=$1 AND pid <> pg_backend_pid() AND wait_event_type='Lock'
+          AND query LIKE '%analytics_analysis_work_heads%'`, [primaryDatabaseName])).rows;
+      if (waitRows.length !== 0) {
+        observedLockWait = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(observedLockWait).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    await blocker.query("COMMIT");
+    await expect(completePromise).rejects.toMatchObject({ storageCode: "conflict" });
+    expect((await pool.query(`SELECT state,revision FROM ${primarySchema}.analytics_analysis_work_heads
+      WHERE source_id=$1 AND owner_digest=$2`, [identity.sourceId, identity.ownerDigest])).rows[0])
+      .toMatchObject({ state: "checkpointing", revision: "2" });
+  } finally {
+    await blocker.query("ROLLBACK").catch(() => {});
+    await completePromise?.catch(() => {});
+    blocker.release();
+  }
+});
+
 it("consumes release nonces once, replaces an expired nonce, and serializes races", async () => {
   const store = createPostgresReleaseNonceStore(adapterPool, { primarySchema, ledgerSchema });
   await expect(store.consume("nonce-a", { nowSeconds: 100, expiresAtSeconds: 200 })).resolves.toBe("consumed");

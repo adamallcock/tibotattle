@@ -932,7 +932,7 @@ export function createPostgresAnalyticalWorkStore(
         ON CONFLICT (source_id,owner_digest,day,metric) DO UPDATE
           SET identity_json = EXCLUDED.identity_json,
               state = 'claimed', revision = analytics_analysis_work_heads.revision + 1,
-              claim_token = EXCLUDED.claim_token, lease_expires_ms = EXCLUDED.lease_expires_ms
+              claim_token = EXCLUDED.claim_token, lease_expires_ms = ${POSTGRES_NOW_MS} + $7
         WHERE analytics_analysis_work_heads.identity_json = EXCLUDED.identity_json
           AND analytics_analysis_work_heads.state IN ('pending','claimed','checkpointing')
           AND (analytics_analysis_work_heads.state = 'pending'
@@ -959,24 +959,46 @@ export function createPostgresAnalyticalWorkStore(
           || claimToken.length === 0 || claimToken.length > 256) {
         throw new PostgresStorageError("bounds", operation);
       }
-      const result = await executeMutation<Record<string, unknown>>(database, operation, statement(`
-        UPDATE analytics_analysis_work_heads
-           SET lease_expires_ms = ${POSTGRES_NOW_MS} + $1, revision = revision + 1
-         WHERE source_id = $2 AND owner_digest = $3 AND day = $4 AND metric = $5
-           AND state IN ('claimed','checkpointing') AND claim_token = $6 AND revision = $7
-           AND identity_json = $8
-           AND lease_expires_ms > ${POSTGRES_NOW_MS}
-         RETURNING identity_json,revision,claim_token,lease_expires_ms`, leaseMs,
-      identity.sourceId, identity.ownerDigest, identity.day, identity.metric,
-      claimToken, expectedRevision, workIdentityJson(identity, operation)));
-      const row = result.rows[0];
-      if (!row) throw new PostgresStorageError("conflict", operation, { retryable: true });
-      return Object.freeze({
-        claimToken: safeString(row.claim_token, operation),
-        leaseExpiresAtMs: safeInteger(row.lease_expires_ms, operation),
-        revision: safeInteger(row.revision, operation),
-        identity: workIdentityFromRow(row, operation),
-      });
+      try {
+        return await inTransaction(database, operation, async (transaction) => {
+          const current = await execute<Record<string, unknown>>(transaction, operation, statement(`
+            SELECT identity_json,state,revision,claim_token,lease_expires_ms
+              FROM analytics_analysis_work_heads
+             WHERE source_id=$1 AND owner_digest=$2 AND day=$3 AND metric=$4
+             FOR UPDATE`, identity.sourceId, identity.ownerDigest, identity.day, identity.metric));
+          const databaseClock = await execute<Record<string, unknown>>(transaction, operation, statement(
+            `SELECT ${POSTGRES_NOW_MS} AS now_ms`));
+          const dbNowMs = safeInteger(databaseClock.rows[0]?.now_ms, operation);
+          const currentRow = current.rows[0];
+          if (!currentRow || safeString(currentRow.identity_json, operation) !== workIdentityJson(identity, operation)
+              || !["claimed", "checkpointing"].includes(safeString(currentRow.state, operation))
+              || safeInteger(currentRow.revision, operation) !== expectedRevision
+              || safeString(currentRow.claim_token, operation) !== claimToken
+              || safeInteger(currentRow.lease_expires_ms, operation) <= dbNowMs) {
+            throw new PostgresStorageError("conflict", operation, { retryable: true });
+          }
+          const result = await execute<Record<string, unknown>>(transaction, operation, statement(`
+            UPDATE analytics_analysis_work_heads
+               SET lease_expires_ms = ${POSTGRES_NOW_MS} + $1, revision = revision + 1
+             WHERE source_id = $2 AND owner_digest = $3 AND day = $4 AND metric = $5
+               AND state IN ('claimed','checkpointing') AND claim_token = $6 AND revision = $7
+               AND identity_json = $8
+               AND lease_expires_ms > ${POSTGRES_NOW_MS}
+             RETURNING identity_json,revision,claim_token,lease_expires_ms`, leaseMs,
+          identity.sourceId, identity.ownerDigest, identity.day, identity.metric,
+          claimToken, expectedRevision, workIdentityJson(identity, operation)));
+          const row = result.rows[0];
+          if (!row) throw new PostgresStorageError("conflict", operation, { retryable: true });
+          return Object.freeze({
+            claimToken: safeString(row.claim_token, operation),
+            leaseExpiresAtMs: safeInteger(row.lease_expires_ms, operation),
+            revision: safeInteger(row.revision, operation),
+            identity: workIdentityFromRow(row, operation),
+          });
+        });
+      } catch (error) {
+        throw normalizePostgresError(error, operation);
+      }
     },
 
     async read(identity): Promise<AnalyticalWorkHead | null> {
@@ -1110,19 +1132,42 @@ export function createPostgresAnalyticalWorkStore(
           || !Number.isSafeInteger(nowMs)) {
         throw new PostgresStorageError("bounds", operation);
       }
-      const result = await executeMutation<Record<string, unknown>>(database, operation, statement(`
-        UPDATE analytics_analysis_work_heads
-           SET state = 'complete', revision = revision + 1, head_digest = $1,
-               claim_token = NULL, lease_expires_ms = NULL
-         WHERE source_id = $2 AND owner_digest = $3 AND day = $4 AND metric = $5
-           AND state IN ('claimed','checkpointing') AND claim_token = $6 AND revision = $7
-           AND identity_json = $8 AND lease_expires_ms > ${POSTGRES_NOW_MS} AND checkpoint_generation IS NOT NULL
-           RETURNING identity_json,state,revision,head_digest,claim_token,lease_expires_ms`, resultDigest,
-      identity.sourceId, identity.ownerDigest, identity.day, identity.metric,
-      claimToken, expectedRevision, identityJson));
-      const row = result.rows[0];
-      if (!row) throw new PostgresStorageError("conflict", operation, { retryable: true });
-      return workHeadFromRow(row, operation);
+      try {
+        return await inTransaction(database, operation, async (transaction) => {
+          const current = await execute<Record<string, unknown>>(transaction, operation, statement(`
+            SELECT identity_json,state,revision,claim_token,lease_expires_ms,checkpoint_generation
+              FROM analytics_analysis_work_heads
+             WHERE source_id=$1 AND owner_digest=$2 AND day=$3 AND metric=$4
+             FOR UPDATE`, identity.sourceId, identity.ownerDigest, identity.day, identity.metric));
+          const databaseClock = await execute<Record<string, unknown>>(transaction, operation, statement(
+            `SELECT ${POSTGRES_NOW_MS} AS now_ms`));
+          const dbNowMs = safeInteger(databaseClock.rows[0]?.now_ms, operation);
+          const currentRow = current.rows[0];
+          if (!currentRow || safeString(currentRow.identity_json, operation) !== identityJson
+              || !["claimed", "checkpointing"].includes(safeString(currentRow.state, operation))
+              || safeInteger(currentRow.revision, operation) !== expectedRevision
+              || safeString(currentRow.claim_token, operation) !== claimToken
+              || safeInteger(currentRow.lease_expires_ms, operation) <= dbNowMs
+              || currentRow.checkpoint_generation === null || currentRow.checkpoint_generation === undefined) {
+            throw new PostgresStorageError("conflict", operation, { retryable: true });
+          }
+          const result = await execute<Record<string, unknown>>(transaction, operation, statement(`
+            UPDATE analytics_analysis_work_heads
+               SET state = 'complete', revision = revision + 1, head_digest = $1,
+                   claim_token = NULL, lease_expires_ms = NULL
+             WHERE source_id = $2 AND owner_digest = $3 AND day = $4 AND metric = $5
+               AND state IN ('claimed','checkpointing') AND claim_token = $6 AND revision = $7
+               AND identity_json = $8 AND lease_expires_ms > ${POSTGRES_NOW_MS} AND checkpoint_generation IS NOT NULL
+               RETURNING identity_json,state,revision,head_digest,claim_token,lease_expires_ms`, resultDigest,
+          identity.sourceId, identity.ownerDigest, identity.day, identity.metric,
+          claimToken, expectedRevision, identityJson));
+          const row = result.rows[0];
+          if (!row) throw new PostgresStorageError("conflict", operation, { retryable: true });
+          return workHeadFromRow(row, operation);
+        });
+      } catch (error) {
+        throw normalizePostgresError(error, operation);
+      }
     },
 
     async discard(input): Promise<AnalyticalWorkHead> {
