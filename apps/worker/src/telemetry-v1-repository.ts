@@ -7,6 +7,10 @@ import { canonicalJson } from "./canonical-json";
 import { sha256Hex } from "./crypto";
 import { ApiError } from "./errors";
 import {
+  snapshotTelemetryCorrectionWriteOperation,
+  type TelemetryCorrectionWriteOperation,
+} from "./telemetry-correction-ports";
+import {
   TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
   TELEMETRY_V1_FIELD_DICTIONARY_VERSION,
   TELEMETRY_V1_PRIVACY_CONTRACT_VERSION,
@@ -215,6 +219,31 @@ export function prepareTelemetryV1ChunkWrite(
     chunk: insert.chunk,
     supersedes: insert.supersedes === null ? null : { id: insert.supersedes.id },
     createdAt: insert.createdAt,
+  }, records);
+}
+
+/**
+ * Compile the provider-neutral correction operation into the canonical D1 v1
+ * transaction.  The operation remains free of D1 types; this adapter is the
+ * only layer that exposes prepared statements to the existing batch callers.
+ */
+export function prepareTelemetryV1CorrectionWrite(
+  db: D1Database,
+  operation: TelemetryCorrectionWriteOperation,
+  records?: D1TelemetryV1PreparedRecords,
+): { statements: D1PreparedStatement[]; chunkStatementIndex: number } {
+  const snapshot = snapshotTelemetryCorrectionWriteOperation(operation);
+  return prepareD1TelemetryV1ChunkWrite(db, {
+    participantId: snapshot.participantId,
+    deviceId: snapshot.deviceId,
+    uploadAuthorizationId: snapshot.claim.uploadAuthorizationId,
+    uploadAuthorizationLeaseExpiresAt: snapshot.claim.leaseExpiresAt,
+    chunkId: snapshot.replacement.chunkId,
+    objectKey: snapshot.replacement.objectKey,
+    envelopeDigest: snapshot.replacement.envelopeDigest,
+    chunk: snapshot.replacement.chunk,
+    supersedes: { id: snapshot.predecessor.chunkId },
+    createdAt: snapshot.replacement.createdAt,
   }, records);
 }
 
