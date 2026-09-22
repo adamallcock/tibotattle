@@ -168,6 +168,73 @@ test('known Wrangler ledger DDL is exact and attached objects remain drift', asy
   assert.deepEqual(attached.blockers[0].details.additional, ['trigger:unexpected_d1_trigger']);
 });
 
+test('source-defined restore metadata is optional only when its exact DDL is present', async () => {
+  const optional = {
+    type: 'table',
+    name: '_authority_restore_run',
+    tbl_name: '_authority_restore_run',
+    sql: 'CREATE TABLE _authority_restore_run(id INTEGER PRIMARY KEY CHECK(id=1)) STRICT',
+  };
+  const optionalSecond = {
+    type: 'table',
+    name: '_authority_restore_tables',
+    tbl_name: '_authority_restore_tables',
+    sql: 'CREATE TABLE _authority_restore_tables(name TEXT PRIMARY KEY) STRICT',
+  };
+  const expectedWithOptional = {
+    ...expectedSchemas,
+    primary: { ...expectedSchemas.primary, optionalObjects: [optional, optionalSecond] },
+  };
+  const fresh = await runTypedProductionPreflight({ roles, expectedSchemas: expectedWithOptional, config,
+    runQuery: queryFixture().runQuery });
+  assert.equal(fresh.ok, true);
+  const withRestore = queryFixture();
+  const retained = await runTypedProductionPreflight({ roles, expectedSchemas: expectedWithOptional, config,
+    runQuery: async (binding, sql) => {
+      if (binding === TYPED_PRODUCTION_ROLE_BINDINGS.primary && sql === TYPED_PRODUCTION_QUERIES.schema) {
+        return response([...rowsFor('primary'), optional, optionalSecond]);
+      }
+      return withRestore.runQuery(binding, sql);
+    } });
+  assert.equal(retained.ok, true);
+  assert.equal(retained.roles.find(row => row.role === 'primary')?.optionalObjectCount, 2);
+
+  const partial = await runTypedProductionPreflight({ roles, expectedSchemas: expectedWithOptional, config,
+    runQuery: async (binding, sql) => {
+      if (binding === TYPED_PRODUCTION_ROLE_BINDINGS.primary && sql === TYPED_PRODUCTION_QUERIES.schema) {
+        return response([...rowsFor('primary'), optional]);
+      }
+      return withRestore.runQuery(binding, sql);
+    } });
+  assert.equal(partial.ok, false);
+  assert.equal(partial.code, 'TYPED_PREFLIGHT_SCHEMA_OPTIONAL_GROUP_INCOMPLETE');
+  assert.deepEqual(partial.blockers[0].details.missingOptional, ['table:_authority_restore_tables']);
+
+  const altered = await runTypedProductionPreflight({ roles, expectedSchemas: expectedWithOptional, config,
+    runQuery: async (binding, sql) => {
+      if (binding === TYPED_PRODUCTION_ROLE_BINDINGS.primary && sql === TYPED_PRODUCTION_QUERIES.schema) {
+        return response([...rowsFor('primary'), { ...optional, sql: `${optional.sql} ` }, optionalSecond]);
+      }
+      return withRestore.runQuery(binding, sql);
+    } });
+  assert.equal(altered.ok, false);
+  assert.equal(altered.code, 'TYPED_PREFLIGHT_SCHEMA_MISMATCH');
+  assert.deepEqual(altered.blockers[0].details.additional, ['table:_authority_restore_run']);
+
+  const attached = await runTypedProductionPreflight({ roles, expectedSchemas: expectedWithOptional, config,
+    runQuery: async (binding, sql) => {
+      if (binding === TYPED_PRODUCTION_ROLE_BINDINGS.primary && sql === TYPED_PRODUCTION_QUERIES.schema) {
+        return response([...rowsFor('primary'), optional, {
+          type: 'trigger', name: '_authority_restore_unreviewed', tbl_name: '_authority_restore_run',
+          sql: 'CREATE TRIGGER _authority_restore_unreviewed AFTER INSERT ON _authority_restore_run BEGIN SELECT 1; END',
+        }]);
+      }
+      return withRestore.runQuery(binding, sql);
+    } });
+  assert.equal(attached.ok, false);
+  assert.deepEqual(attached.blockers[0].details.additional, ['trigger:_authority_restore_unreviewed']);
+});
+
 test('runtime namespace and analytics registration mismatches are refused', async () => {
   const fixture = queryFixture({ namespace: 'wrong-namespace' });
   const result = await runTypedProductionPreflight({ roles, runQuery: fixture.runQuery, expectedSchemas, config });
@@ -194,4 +261,23 @@ test('canonical expected schemas are generated from local migration inputs only'
     assert.ok(generated.expectedSchemas[role].requiredObjects.length > 0);
     assert.equal(generated.migrationCounts[role], TYPED_SCHEMA_INPUT_DIRECTORIES[role].reduce((count, directory) => count + (directory === 'migrations' ? 62 : directory === 'typed-ingestion-migrations' ? 4 : directory === 'ingestion-bridge-migrations' ? 2 : directory === 'typed-v11-admission-migrations' ? 6 : directory === 'typed-v1-admission-migrations' ? 3 : directory === 'ingestion-isolation-migrations' ? 9 : directory === 'analytics-migrations' ? 26 : 3), 0));
   }
+  assert.equal(generated.expectedSchemas.primary.optionalObjects.length, 17);
+  assert.deepEqual(generated.expectedSchemas.analytics.optionalObjects, []);
+  assert.match(generated.operatorSchemaSourceSha256, /^[a-f0-9]{64}$/u);
+});
+
+test('restored schema variants require complete exact metadata and reject other SQL drift', async () => {
+  const metadata = { type: 'table', name: '_authority_restore_run', tbl_name: '_authority_restore_run',
+    sql: 'CREATE TABLE _authority_restore_run(id INTEGER PRIMARY KEY)' };
+  const restoredRows = rowsFor('primary').map(row => row.name === 'primary_schema'
+    ? { ...row, sql: 'CREATE TABLE "primary_schema"(id INTEGER PRIMARY KEY)' } : row);
+  const expectation = { ...expectedSchemas, primary: { ...expectedSchemas.primary,
+    optionalObjects: [metadata], restoredSchemaSha256: [storageSchemaDigest(restoredRows)] } };
+  const run = rows => runTypedProductionPreflight({ roles, expectedSchemas: expectation, config,
+    runQuery: (binding, sql) => binding === TYPED_PRODUCTION_ROLE_BINDINGS.primary && sql === TYPED_PRODUCTION_QUERIES.schema
+      ? response(rows) : queryFixture().runQuery(binding, sql) });
+  assert.equal((await run([...restoredRows, metadata])).ok, true);
+  assert.equal((await run(restoredRows)).ok, false);
+  assert.equal((await run([...restoredRows, { ...metadata, sql: metadata.sql + ' ' }])).ok, false);
+  assert.equal((await run([...restoredRows.map(row => ({ ...row, sql: row.sql + ' ' })), metadata])).ok, false);
 });

@@ -8,8 +8,9 @@ import { COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION } from './telemetry-v1-source-se
 const fail=()=>new Error('AUTHORITY_RESTORE_BOOTSTRAP_UNQUALIFIED');
 const q=(name:string)=>{if(!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name))throw fail();return `"${name}"`;};
 interface State {contract_digest:string;phase:'walking'|'complete';participant_cursor:string;chunk_cursor:string}
-const stateSQL=`CREATE TABLE _authority_restore_bootstrap(id INTEGER PRIMARY KEY CHECK(id=1),contract_digest TEXT NOT NULL,
+export const AUTHORITY_RESTORE_BOOTSTRAP_STATE_SCHEMA=`CREATE TABLE _authority_restore_bootstrap(id INTEGER PRIMARY KEY CHECK(id=1),contract_digest TEXT NOT NULL,
  phase TEXT NOT NULL CHECK(phase IN ('walking','complete')),participant_cursor TEXT NOT NULL,chunk_cursor TEXT NOT NULL) STRICT`;
+export const AUTHORITY_RESTORE_BOOTSTRAP_ASSERT_SCHEMA='CREATE TABLE _authority_restore_bootstrap_assert(id INTEGER CHECK(id=0)) STRICT';
 const guardSQL=(table:string,action:string)=>`CREATE TRIGGER ${q(`_authority_bootstrap_${table}_${action}`)} BEFORE ${action} ON ${q(table)} BEGIN SELECT RAISE(ABORT,'authority_restore_bootstrap_frozen'); END`;
 async function guards(db:D1Database){
  const tables=(await db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT GLOB '_authority_*' ORDER BY name LIMIT 1025").all<{name:string}>()).results;
@@ -44,8 +45,8 @@ export async function initializeAuthorityRestoreBootstrap(db:D1Database,contract
   if(!prior||prior.contract_digest!==contractDigest)throw fail();
   await exactGuards(db,prior.phase==='walking'?expected:[]);return;
  }
- await db.batch([db.prepare(stateSQL),
-  db.prepare("CREATE TABLE _authority_restore_bootstrap_assert(id INTEGER CHECK(id=0)) STRICT"),
+ await db.batch([db.prepare(AUTHORITY_RESTORE_BOOTSTRAP_STATE_SCHEMA),
+  db.prepare(AUTHORITY_RESTORE_BOOTSTRAP_ASSERT_SCHEMA),
   db.prepare("INSERT INTO _authority_restore_bootstrap VALUES(1,?,'walking','','')").bind(contractDigest),
   ...expected.map(x=>db.prepare(x.sql)),
   db.prepare(`INSERT INTO community_public_source_bootstrap(singleton,policy_version,participant_cursor,source_day_cursor,completed)

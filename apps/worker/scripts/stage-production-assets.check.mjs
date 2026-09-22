@@ -6,6 +6,7 @@ import {
   mkdir,
   readFile,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -52,7 +53,7 @@ async function fixture() {
     "i18n.generated.js": "export const messages = {};\n",
     "index.html": '<!doctype html><script type="module" src="./community.js"></script>\n',
     "install-cta.js": "export const installCta = true;\n",
-    "last-known-good.js": "export const lastKnownGood = true;\n",
+    "last-known-good.js": "export const retainedPublicCache = true;\n",
     "localization.js": "export const localization = true;\n",
     "model-catalog.generated.js": "export const REVIEWED_MODEL_CATALOG = [];\n",
     "privacy.html": "<!doctype html><title>public privacy</title>\n",
@@ -118,6 +119,7 @@ async function fixture() {
     publicSource,
     destination: join(root, ".release-build", "worker-assets"),
     generatedFiles,
+    sourceCommit: git(root, ["rev-parse", "HEAD"]).trim(),
   };
 }
 
@@ -285,6 +287,66 @@ test("stages only verified generated public assets and maps the community entry 
       destinationDirectory: value.destination,
     }),
     /does not match the source snapshot/u,
+  );
+
+  const manifestSha256 = createHash("sha256")
+    .update(await readFile(join(value.source, "release-site-manifest.json")))
+    .digest("hex");
+  const retained = await stageProductionAssets({
+    repositoryRoot: value.root,
+    sourceDirectory: value.source,
+    destinationDirectory: value.destination,
+    retainedPublicSourceCommit: value.sourceCommit,
+    expectedLiveManifestSha256: manifestSha256,
+  });
+  assert.equal(retained.sourceCommit, git(value.root, ["rev-parse", "HEAD"]).trim());
+  assert.equal(retained.publicSourceCommit, value.sourceCommit);
+  assert.equal(retained.manifestSha256, manifestSha256);
+
+  await assert.rejects(
+    stageProductionAssets({
+      repositoryRoot: value.root,
+      sourceDirectory: value.source,
+      destinationDirectory: value.destination,
+      retainedPublicSourceCommit: value.sourceCommit,
+      expectedLiveManifestSha256: "0".repeat(64),
+    }),
+    /does not match the expected live manifest/u,
+  );
+  await assert.rejects(
+    stageProductionAssets({
+      repositoryRoot: value.root,
+      sourceDirectory: value.source,
+      destinationDirectory: value.destination,
+      retainedPublicSourceCommit: value.sourceCommit.slice(0, 7),
+      expectedLiveManifestSha256: manifestSha256,
+    }),
+    /40-character lowercase Git commit/u,
+  );
+  await assert.rejects(
+    stageProductionAssets({
+      repositoryRoot: value.root,
+      sourceDirectory: value.source,
+      destinationDirectory: value.destination,
+      retainedPublicSourceCommit: value.sourceCommit,
+    }),
+    /must be supplied together/u,
+  );
+
+  await rm(join(value.publicSource, "community.js"));
+  await symlink("community.html", join(value.publicSource, "community.js"));
+  git(value.root, ["add", "-A", "apps/web/public/community.js"]);
+  git(value.root, ["commit", "--quiet", "-m", "symlink source candidate"]);
+  const symlinkCommit = git(value.root, ["rev-parse", "HEAD"]).trim();
+  await assert.rejects(
+    stageProductionAssets({
+      repositoryRoot: value.root,
+      sourceDirectory: value.source,
+      destinationDirectory: value.destination,
+      retainedPublicSourceCommit: symlinkCommit,
+      expectedLiveManifestSha256: manifestSha256,
+    }),
+    /not a regular file/u,
   );
 });
 

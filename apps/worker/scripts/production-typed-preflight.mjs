@@ -79,7 +79,9 @@ function validateExpectedSchemas(expectedSchemas) {
   if (!exactKeys(expectedSchemas, ROLE_NAMES)) return 'EXPECTED_SCHEMAS_INVALID';
   for (const role of ROLE_NAMES) {
     const expected = expectedSchemas[role];
-    if (!exactKeys(expected, ['schemaSha256', 'requiredObjects'])
+    const expectedKeys = Object.keys(expected ?? {}).sort();
+    if (!object(expected) || !expectedKeys.every(key => ['schemaSha256', 'requiredObjects', 'optionalObjects', 'restoredSchemaSha256'].includes(key))
+        || !expectedKeys.includes('schemaSha256') || !expectedKeys.includes('requiredObjects')
         || !SHA256.test(expected.schemaSha256)
         || !Array.isArray(expected.requiredObjects)
         || expected.requiredObjects.length < 1
@@ -90,6 +92,24 @@ function validateExpectedSchemas(expectedSchemas) {
           || !['table', 'index', 'trigger', 'view'].includes(objectDescriptor.type)
           || !IDENTIFIER.test(objectDescriptor.name)
           || !IDENTIFIER.test(objectDescriptor.tbl_name)) return 'EXPECTED_SCHEMAS_INVALID';
+      const key = `${objectDescriptor.type}\u0000${objectDescriptor.name}\u0000${objectDescriptor.tbl_name}`;
+      if (seen.has(key)) return 'EXPECTED_SCHEMAS_INVALID';
+      seen.add(key);
+    }
+    const optionalObjects = expected.optionalObjects ?? [];
+    if (!Array.isArray(optionalObjects) || optionalObjects.length > 4096) return 'EXPECTED_SCHEMAS_INVALID';
+    if (expected.restoredSchemaSha256 !== undefined
+        && (role !== 'primary' || !optionalObjects.length || !Array.isArray(expected.restoredSchemaSha256)
+          || expected.restoredSchemaSha256.length < 1 || expected.restoredSchemaSha256.length > 2
+          || !expected.restoredSchemaSha256.every(value => typeof value === 'string' && SHA256.test(value)))) return 'EXPECTED_SCHEMAS_INVALID';
+    for (const objectDescriptor of optionalObjects) {
+      if (!exactKeys(objectDescriptor, ['type', 'name', 'tbl_name', 'sql'])
+          || !['table', 'index', 'trigger', 'view'].includes(objectDescriptor.type)
+          || !IDENTIFIER.test(objectDescriptor.name)
+          || !IDENTIFIER.test(objectDescriptor.tbl_name)
+          || typeof objectDescriptor.sql !== 'string' || objectDescriptor.sql.length < 1 || objectDescriptor.sql.length > 262144) {
+        return 'EXPECTED_SCHEMAS_INVALID';
+      }
       const key = `${objectDescriptor.type}\u0000${objectDescriptor.name}\u0000${objectDescriptor.tbl_name}`;
       if (seen.has(key)) return 'EXPECTED_SCHEMAS_INVALID';
       seen.add(key);
@@ -151,6 +171,13 @@ function expectedObjectSet(expected) {
   return new Set(expected.requiredObjects.map(row => `${row.type}\u0000${row.name}\u0000${row.tbl_name}`));
 }
 
+function optionalObjectMap(expected) {
+  return new Map((expected.optionalObjects ?? []).map(row => [
+    `${row.type}\u0000${row.name}\u0000${row.tbl_name}`,
+    row,
+  ]));
+}
+
 // Keep this in lockstep with storageSchemaDigest: only the exact provider DDL
 // is ignored, and any attached user-visible object makes the provider table
 // part of the observed schema again so an unexpected trigger cannot hide.
@@ -161,6 +188,11 @@ const KNOWN_PROVIDER_OBJECTS = Object.freeze([
 
 function schemaKey(row) {
   return `${row.type}:${row.name}`;
+}
+
+function schemaKeyValue(key) {
+  const [type, name] = key.split('\u0000');
+  return `${type}:${name}`;
 }
 
 function normalizedSchemaRows(rows) {
@@ -175,20 +207,40 @@ function schemaObservation(rows, expected) {
   const normalized = normalizedSchemaRows(rows);
   const observed = new Set(normalized.map(row => `${row.type}\u0000${row.name}\u0000${row.tbl_name}`));
   const expectedObjects = expectedObjectSet(expected);
+  const optionalObjects = optionalObjectMap(expected);
   const missingRows = expected.requiredObjects.filter(row => !observed.has(`${row.type}\u0000${row.name}\u0000${row.tbl_name}`));
-  const additionalRows = normalized.filter(row => !expectedObjects.has(`${row.type}\u0000${row.name}\u0000${row.tbl_name}`));
+  const optionalPresent = normalized.some(row => optionalObjects.has(`${row.type}\u0000${row.name}\u0000${row.tbl_name}`));
+  const missingOptional = optionalPresent
+    ? [...optionalObjects.keys()].filter(key => !observed.has(key)).sort()
+    : [];
+  const recognizedOptional = [];
+  const additionalRows = normalized.filter(row => {
+    const key = `${row.type}\u0000${row.name}\u0000${row.tbl_name}`;
+    if (expectedObjects.has(key)) return false;
+    const optional = optionalObjects.get(key);
+    if (optional && optional.sql === row.sql) {
+      recognizedOptional.push(row);
+      return false;
+    }
+    return true;
+  });
+  const recognizedOptionalKeys = new Set(recognizedOptional.map(row => `${row.type}\u0000${row.name}\u0000${row.tbl_name}`));
+  const digestRows = normalized.filter(row => !recognizedOptionalKeys.has(`${row.type}\u0000${row.name}\u0000${row.tbl_name}`));
   let schemaSha256;
   try {
-    schemaSha256 = storageSchemaDigest(rows);
+    schemaSha256 = storageSchemaDigest(digestRows);
   } catch {
     return { ok: false, code: 'SCHEMA_INVALID' };
   }
-  if (missingRows.length || additionalRows.length || schemaSha256 !== expected.schemaSha256) {
+  const digestMatches = schemaSha256 === expected.schemaSha256
+    || (optionalPresent && !missingOptional.length && recognizedOptional.length === optionalObjects.size
+      && (expected.restoredSchemaSha256 ?? []).includes(schemaSha256));
+  if (missingRows.length || missingOptional.length || additionalRows.length || !digestMatches) {
     const missing = missingRows.map(schemaKey).sort();
     const additional = additionalRows.map(schemaKey).sort();
     return {
       ok: false,
-      code: missing.length ? 'SCHEMA_OBJECT_MISSING' : 'SCHEMA_MISMATCH',
+      code: missing.length ? 'SCHEMA_OBJECT_MISSING' : missingOptional.length ? 'SCHEMA_OPTIONAL_GROUP_INCOMPLETE' : 'SCHEMA_MISMATCH',
       details: {
         expectedSchemaSha256: expected.schemaSha256,
         observedSchemaSha256: schemaSha256,
@@ -196,10 +248,12 @@ function schemaObservation(rows, expected) {
         missingCount: missing.length,
         additional: additional.slice(0, 16),
         additionalCount: additional.length,
+        missingOptional: missingOptional.slice(0, 16).map(schemaKeyValue),
+        missingOptionalCount: missingOptional.length,
       },
     };
   }
-  return { ok: true, schemaSha256, objectCount: normalized.length };
+  return { ok: true, schemaSha256, objectCount: normalized.length, optionalObjectCount: recognizedOptional.length };
 }
 
 function oneRow(rows, keys) {
@@ -222,6 +276,7 @@ function roleSummary(role, binding, expected, schema) {
     status: 'qualified',
     schemaSha256: schema.schemaSha256,
     objectCount: schema.objectCount,
+    optionalObjectCount: schema.optionalObjectCount,
     probes: ROLE_SQL[role].length,
     expectedSchemaSha256: expected.schemaSha256,
   };
