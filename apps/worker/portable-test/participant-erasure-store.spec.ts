@@ -101,6 +101,7 @@ function makeFixture(options: FixtureOptions = {}): Fixture {
     telemetry: rows.filter((row) => row.source === "telemetry").length,
     telemetryV1: rows.filter((row) => row.source === "telemetry_v1").length,
     telemetryV11: rows.filter((row) => row.source === "telemetry_v11").length,
+    telemetryV12: rows.filter((row) => row.source === "telemetry_v12").length,
   };
 
   const objectStore: ParticipantErasureObjectStore = {
@@ -249,6 +250,7 @@ describe("provider-neutral participant erasure workflow", () => {
         telemetry: 1,
         telemetryV1: 0,
         telemetryV11: 0,
+        telemetryV12: 0,
       },
     });
 

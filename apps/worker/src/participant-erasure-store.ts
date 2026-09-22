@@ -23,6 +23,7 @@ export interface ParticipantErasureCounts {
   readonly telemetry: number;
   readonly telemetryV1: number;
   readonly telemetryV11: number;
+  readonly telemetryV12: number;
 }
 
 export interface ParticipantErasurePrimaryStore {
@@ -89,6 +90,7 @@ const SOURCES: readonly ParticipantErasureObjectSource[] = [
   "telemetry",
   "telemetry_v1",
   "telemetry_v11",
+  "telemetry_v12",
 ];
 const DEFAULT_MAX_OBJECT_PAGES = 1_000;
 
@@ -105,7 +107,8 @@ function validCounts(value: ParticipantErasureCounts): void {
     }
   }
   if (!Number.isSafeInteger(
-    value.synthetic + value.telemetry + value.telemetryV1 + value.telemetryV11,
+    value.synthetic + value.telemetry + value.telemetryV1 + value.telemetryV11
+      + value.telemetryV12,
   )) {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   }
@@ -117,6 +120,7 @@ function sourceCount(counts: ParticipantErasureCounts, source: ParticipantErasur
     case "telemetry": return counts.telemetry;
     case "telemetry_v1": return counts.telemetryV1;
     case "telemetry_v11": return counts.telemetryV11;
+    case "telemetry_v12": return counts.telemetryV12;
   }
 }
 
@@ -210,6 +214,7 @@ export async function eraseParticipantWithStore(
   validCounts(initialCounts);
   let pages = 0;
   for (const source of SOURCES) {
+    if (sourceCount(initialCounts, source) === 0) continue;
     let cursor: { readonly createdAt: string; readonly id: string } | null = null;
     let processed = 0;
     const seenIds = new Set<string>();
@@ -290,7 +295,8 @@ export async function eraseParticipantWithStore(
   if (finalCounts.synthetic !== initialCounts.synthetic
       || finalCounts.telemetry !== initialCounts.telemetry
       || finalCounts.telemetryV1 !== initialCounts.telemetryV1
-      || finalCounts.telemetryV11 !== initialCounts.telemetryV11) {
+      || finalCounts.telemetryV11 !== initialCounts.telemetryV11
+      || finalCounts.telemetryV12 !== initialCounts.telemetryV12) {
     throw new ApiError(409, "UPLOAD_IN_PROGRESS");
   }
   await dependencies.primary.finish(participantId, deletionFence);
@@ -298,7 +304,8 @@ export async function eraseParticipantWithStore(
   const contributionsDeleted = initialCounts.synthetic
     + initialCounts.telemetry
     + initialCounts.telemetryV1
-    + initialCounts.telemetryV11;
+    + initialCounts.telemetryV11
+    + initialCounts.telemetryV12;
   return {
     deleted: true,
     alreadyDeleted: false,

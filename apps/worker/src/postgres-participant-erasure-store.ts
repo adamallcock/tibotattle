@@ -57,6 +57,7 @@ const SOURCE_TABLES: Record<ParticipantErasureObjectSource, {
   // object column `object_key`; keep that mapping explicit at the boundary.
   telemetry_v1: { table: "chunks", keyColumn: "object_key", versionColumn: "object_version" },
   telemetry_v11: { table: "telemetry_v11_chunks", keyColumn: "r2_key", versionColumn: "object_version" },
+  telemetry_v12: { table: "telemetry_v12_chunks", keyColumn: "r2_key", versionColumn: "object_version" },
 };
 
 function storageUnavailable(): ApiError {
@@ -476,6 +477,9 @@ function createPrimaryStore(
         telemetry: await count("telemetry"),
         telemetryV1: await count("telemetry_v1"),
         telemetryV11: await count("telemetry_v11"),
+        // v1.2 remains staged in the legacy qualification schema. The
+        // canonical adapter handles its operational chunk journal.
+        telemetryV12: 0,
       };
     },
 

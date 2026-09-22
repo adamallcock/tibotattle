@@ -7,7 +7,8 @@ export type ParticipantErasureObjectSource =
   | "synthetic"
   | "telemetry"
   | "telemetry_v1"
-  | "telemetry_v11";
+  | "telemetry_v11"
+  | "telemetry_v12";
 
 /**
  * A database row plus the provider version observed for its object. D1/R2

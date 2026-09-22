@@ -39,6 +39,7 @@ const SOURCE_TABLES: Record<ParticipantErasureObjectSource, string> = {
   telemetry: "telemetry_contributions",
   telemetry_v1: "telemetry_v1_chunks",
   telemetry_v11: "telemetry_v11_chunks",
+  telemetry_v12: "telemetry_v12_chunks",
 };
 
 function unavailable(): ApiError {
@@ -223,6 +224,13 @@ export function createD1ParticipantErasureStore(
         telemetry: await telemetryContributionCount(database as D1Database, participantId),
         telemetryV1: await telemetryV1ChunkCount(database as D1Database, participantId),
         telemetryV11: await telemetryV11ChunkCount(database as D1Database, participantId),
+        telemetryV12: await database.prepare(
+          "SELECT COUNT(*) AS count FROM sqlite_schema WHERE type='table' AND name='telemetry_v12_chunks'",
+        ).first<{ count: number }>().then(async (present) => present?.count === 1
+          ? Number((await database.prepare(
+            "SELECT COUNT(*) AS count FROM telemetry_v12_chunks WHERE participant_id = ?",
+          ).bind(participantId).first<{ count: number }>())?.count ?? 0)
+          : 0),
       };
     },
 
