@@ -12,6 +12,11 @@ import {
   createPostgresPreparedSourceStore,
   createPostgresPublicationStore,
 } from "./postgres-storage-provider";
+import { createPostgresStorageSource } from "./postgres-storage-source";
+import {
+  createPostgresWorkerApplication,
+  type PostgresWorkerApplication,
+} from "./postgres-worker-application";
 import {
   createPostgresTelemetryAuthorityBackend,
 } from "./postgres-telemetry-authority-backend";
@@ -49,6 +54,7 @@ export interface WorkerBackend {
   readonly identity: IdentityHandoffBackend;
   readonly telemetryV1: TelemetryV1Backend;
   readonly storage: StorageProviderPorts;
+  readonly application: PostgresWorkerApplication;
   readonly releaseNonce: StorageReleaseGuardNonceStore;
 }
 
@@ -71,6 +77,7 @@ export function createPostgresWorkerBackend(
   const primary = options.primaryPool;
 
   const storage: StorageProviderPorts = Object.freeze({
+    source: createPostgresStorageSource(primary, schemaOptions),
     preparedSource: createPostgresPreparedSourceStore(primary, schemaOptions),
     analyticalWork: createPostgresAnalyticalWorkStore(primary, schemaOptions),
     publication: createPostgresPublicationStore(primary, schemaOptions),
@@ -83,6 +90,7 @@ export function createPostgresWorkerBackend(
     analyticsDelivery: createPostgresAnalyticsDeliveryStore(primary, schemaOptions),
     ownerRouter: createPostgresOwnerRouter(primary, schemaOptions),
   });
+  const authority = createPostgresTelemetryAuthorityBackend(primary, schemaOptions);
 
   return Object.freeze({
     provider: "postgres" as const,
@@ -90,10 +98,16 @@ export function createPostgresWorkerBackend(
       primary: schema.primarySchema,
       ledger: schema.ledgerSchema,
     }),
-    authority: createPostgresTelemetryAuthorityBackend(primary, schemaOptions),
+    authority,
     identity: createPostgresIdentityHandoffBackend(primary, schemaOptions),
     telemetryV1: createExperimentalPostgresTelemetryV1Backend(primary, schemaOptions),
     storage,
+    application: createPostgresWorkerApplication(
+      primary,
+      options.ledgerPool,
+      authority,
+      schemaOptions,
+    ),
     releaseNonce: createPostgresReleaseGuardNonceStore(primary, schemaOptions),
   });
 }
@@ -131,6 +145,8 @@ export function readWorkerBackend(env: unknown): WorkerBackend | null {
       || !hasObjectProperty(candidate, "identity")
       || !hasObjectProperty(candidate, "telemetryV1")
       || !hasObjectProperty(candidate, "storage")
+      || !hasObjectProperty(candidate.storage as Record<string, unknown>, "source")
+      || !hasObjectProperty(candidate, "application")
       || !hasObjectProperty(candidate, "releaseNonce")) {
     // An absent host extension is the explicit D1 fallback. A supplied but
     // malformed bundle must fail closed instead of silently routing half the

@@ -21,11 +21,15 @@ import {
 import { ApiError } from "./errors";
 import type { TelemetryAuthorityBackend } from "./telemetry-authority-backend";
 
-type DeviceSource = D1Database | TelemetryAuthorityBackend;
+export type DeviceSource = D1Database | TelemetryAuthorityBackend;
 
 function authorityBackend(source: DeviceSource): TelemetryAuthorityBackend | null {
   return typeof (source as Partial<TelemetryAuthorityBackend>).devices?.readUpload === "function"
     ? source as TelemetryAuthorityBackend : null;
+}
+
+function isAuthorityBackend(source: DeviceSource): source is TelemetryAuthorityBackend {
+  return authorityBackend(source) !== null;
 }
 
 const UUID_V4 =
@@ -585,7 +589,7 @@ async function revokeSupersededDeviceCredential(
 }
 
 export async function createDevicePairing(
-  db: D1Database,
+  db: DeviceSource,
   participantId: string,
   sessionId: string,
   participantConsentVersion: string,
@@ -601,6 +605,17 @@ export async function createDevicePairing(
     nowEpoch,
     requestedTransportConsentVersion,
   );
+  if (isAuthorityBackend(db)) {
+    const authority = db;
+    await authority.devices.insertPairing({
+      ...material,
+      consentVersion: participantConsentVersion,
+    });
+    return {
+      pairingCode: material.pairingCode,
+      expiresAt: material.expiresAt,
+    };
+  }
   const mint = (): Promise<D1Result<unknown>> => devicePairingInsert(
     db,
     material,
@@ -841,7 +856,7 @@ async function claimPairingWithContinuity(
 }
 
 export async function claimDevicePairing(
-  db: D1Database,
+  db: DeviceSource,
   authorizationHeader: string | null,
   deviceId: string,
   deviceSecretHashHex: string,
@@ -860,6 +875,62 @@ export async function claimDevicePairing(
   }
   const parsed = parsePairingAuthorization(authorizationHeader);
   const deviceSecretHash = bytesFromHex(deviceSecretHashHex);
+  if (isAuthorityBackend(db)) {
+    const authority = db;
+    if (previousDeviceAuthorization !== null) {
+      throw new ApiError(409, "DEVICE_CONTINUITY_REQUIRED");
+    }
+    const pairing = await authority.devices.readPairing(parsed.id);
+    const presentedHash = await pairingHash(parsed.id, parsed.secret);
+    const nowEpoch = Date.now();
+    if (!pairing
+        || !timingSafeEqual(presentedHash, pairing.secretHash)
+        || pairing.participantState !== "active"
+        || !transportConsentAllowedForParticipant(
+          pairing.consentVersion,
+          pairing.transportConsentVersion,
+        )
+        || !futureInstant(pairing.expiresAt, nowEpoch)) {
+      throw new ApiError(401, "PAIRING_AUTH_INVALID");
+    }
+    if (pairing.state === "consumed" && pairing.claimedDeviceId === deviceId) {
+      const replay = await authority.devices.readDevice(deviceId);
+      if (replay !== null
+          && replay.pairingId === pairing.id
+          && replay.state === "active"
+          && timingSafeEqual(replay.secretHash, deviceSecretHash)
+          && futureInstant(replay.expiresAt, nowEpoch)) {
+        return {
+          deviceId,
+          state: "active",
+          scope: "upload_registration",
+          expiresAt: replay.expiresAt,
+        };
+      }
+      throw new ApiError(401, "PAIRING_AUTH_INVALID");
+    }
+    if (pairing.state !== "unused") throw new ApiError(401, "PAIRING_AUTH_INVALID");
+    const issuedAt = new Date(nowEpoch).toISOString();
+    const expiresAt = new Date(nowEpoch + DEVICE_CREDENTIAL_TTL_MILLISECONDS).toISOString();
+    const claimed = await authority.devices.claimPairing({
+      pairingId: pairing.id,
+      participantId: pairing.participantId,
+      device: {
+        id: deviceId,
+        participantId: pairing.participantId,
+        pairingId: pairing.id,
+        secretHash: deviceSecretHash,
+        issuedAt,
+        expiresAt,
+        lastUsedAt: issuedAt,
+        socialVerifiedAt: issuedAt,
+        credentialGeneration: 1,
+      },
+      now: issuedAt,
+    });
+    if (!claimed) throw new ApiError(401, "PAIRING_AUTH_INVALID");
+    return { deviceId, state: "active", scope: "upload_registration", expiresAt };
+  }
   const row = await db.prepare(
     `SELECT pairing.id, pairing.participant_id, pairing.secret_hash,
             pairing.state, pairing.expires_at, pairing.claimed_device_id,
@@ -1532,7 +1603,7 @@ export async function rotateDeviceCredential(
 }
 
 export async function createDeviceUploadAuthorization(
-  db: D1Database,
+  db: DeviceSource,
   device: DevicePrincipal,
   envelopeDigest: string,
   bodyBytes: number,
@@ -1551,6 +1622,24 @@ export async function createDeviceUploadAuthorization(
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
   const secretHash = await deviceUploadHash(id, secret);
+  if (isAuthorityBackend(db)) {
+    const authority = db;
+    await authority.devices.insertUpload({
+      id,
+      participantId: device.participantId,
+      issuedByDeviceId: device.deviceId,
+      secretHash,
+      envelopeDigest,
+      bodyBytes,
+      contentType: "application/json",
+      issuedAt,
+      expiresAt,
+    });
+    return {
+      uploadAuthorization: `um_device_upload_${id}.${secret}`,
+      expiresAt,
+    };
+  }
   const result = await (db as D1Database).prepare(
     `INSERT INTO device_upload_authorizations (
       id, participant_id, issued_by_device_id, secret_hash, envelope_digest,
@@ -1810,8 +1899,8 @@ export async function abandonDeviceUploadAuthorization(
     `UPDATE device_upload_authorizations
         SET state = 'revoked', revoked_at = ?, consume_lease_expires_at = NULL
       WHERE id = ? AND participant_id = ? AND state = 'consuming'
-        AND consume_lease_expires_at = ?`,
-  ).bind(now, authorizationId, participantId, leaseExpiresAt).run();
+        AND (consume_lease_expires_at = ? OR consume_lease_expires_at <= ?)`,
+  ).bind(now, authorizationId, participantId, leaseExpiresAt, now).run();
 }
 
 export async function listParticipantDevices(

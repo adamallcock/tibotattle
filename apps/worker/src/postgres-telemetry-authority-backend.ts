@@ -1,6 +1,10 @@
 import { ApiError } from "./errors";
 import { timingSafeEqual } from "./crypto";
 import {
+  INCREMENTAL_TELEMETRY_FIELD_DICTIONARY_VERSION,
+  ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION,
+} from "./constants";
+import {
   createPostgresSchemaConfig,
   quotePostgresIdentifier,
   withPostgresMutation,
@@ -27,6 +31,7 @@ import type {
   AuthorityDeviceRecord,
   AuthorityDeviceUploadMaterial,
   AuthorityDeviceUploadRecord,
+  AuthorityEnrollmentBootstrap,
   AuthorityEnrollmentStore,
   AuthoritySessionMaterial,
   AuthoritySessionRecord,
@@ -265,7 +270,69 @@ export function createPostgresTelemetryAuthorityBackend(
     telemetryV12Runtime: table("telemetry_v12_runtime"),
     telemetryContributions: table("telemetry_contributions"),
     attributionEnrollments: table("attribution_enrollments"),
+    storageSourceState: table("storage_source_state"),
+    storageOwnerLinks: table("storage_v11_owner_links"),
+    analyticsOwnerState: table("analytics_owner_state"),
+    participantFloors: table("telemetry_transport_participant_floors"),
+    inputVersions: table("input_versions"),
   });
+
+  const bootstrapParticipant = async (
+    client: PostgresTelemetryAuthorityClient,
+    participantId: string,
+    bootstrap: AuthorityEnrollmentBootstrap,
+  ): Promise<void> => {
+    if (!/^[0-9a-f]{64}$/u.test(bootstrap.ownerDigest)
+        || !/^[0-9a-f]{64}$/u.test(bootstrap.attributionNamespace)
+        || bootstrap.sourceId.length < 1 || bootstrap.sourceId.length > 200) {
+      throw unavailable();
+    }
+    const source = await client.query(`INSERT INTO ${tables.storageSourceState}
+      (singleton,source_id,authority_epoch) VALUES(1,$1,1)
+      ON CONFLICT(singleton) DO NOTHING RETURNING source_id,authority_epoch`, [bootstrap.sourceId]);
+    const sourceRow = source.rows[0] ?? (await client.query(
+      `SELECT source_id,authority_epoch FROM ${tables.storageSourceState} WHERE singleton=1`,
+    )).rows[0];
+    if (!sourceRow || sourceRow.source_id !== bootstrap.sourceId) throw unavailable();
+
+    const attribution = await client.query(`INSERT INTO ${tables.attributionEnrollments}
+      (participant_id,namespace,created_at) VALUES($1,$2,$3)
+      ON CONFLICT(participant_id) DO NOTHING RETURNING namespace`,
+    [participantId, bootstrap.attributionNamespace, bootstrap.now]);
+    const attributionRow = attribution.rows[0] ?? (await client.query(
+      `SELECT namespace FROM ${tables.attributionEnrollments} WHERE participant_id=$1`, [participantId],
+    )).rows[0];
+    if (!attributionRow || attributionRow.namespace !== bootstrap.attributionNamespace) {
+      throw unavailable();
+    }
+
+    const ownerLink = await client.query(`INSERT INTO ${tables.storageOwnerLinks}
+      (participant_id,owner_digest,state,generation_id,head_revision,object_digest,manifest_digest)
+      VALUES($1,$2,'active','owner-bootstrap-1',0,$2,$2)
+      ON CONFLICT(participant_id) DO NOTHING RETURNING owner_digest,state`,
+    [participantId, bootstrap.ownerDigest]);
+    const ownerRow = ownerLink.rows[0] ?? (await client.query(
+      `SELECT owner_digest,state FROM ${tables.storageOwnerLinks} WHERE participant_id=$1`, [participantId],
+    )).rows[0];
+    if (!ownerRow || ownerRow.owner_digest !== bootstrap.ownerDigest || ownerRow.state !== "active") {
+      throw unavailable();
+    }
+    const analyticsOwner = await client.query(`INSERT INTO ${tables.analyticsOwnerState}
+      (source_id,owner_digest,revision,authority_epoch,state)
+      VALUES($1,$2,0,$3,'active')
+      ON CONFLICT(source_id,owner_digest) DO NOTHING`,
+    [bootstrap.sourceId, bootstrap.ownerDigest, sourceRow.authority_epoch]);
+    if (changes(analyticsOwner) !== 1) {
+      const current = await client.query(`SELECT state FROM ${tables.analyticsOwnerState}
+        WHERE source_id=$1 AND owner_digest=$2`, [bootstrap.sourceId, bootstrap.ownerDigest]);
+      if (current.rows[0]?.state !== "active") throw unavailable();
+    }
+    await client.query(`INSERT INTO ${tables.participantFloors}
+      (participant_id,minimum_rank,revision,changed_at) VALUES($1,1,0,$2)
+      ON CONFLICT(participant_id) DO NOTHING`, [participantId, bootstrap.now]);
+    await client.query(`INSERT INTO ${tables.inputVersions}(participant_id,revision)
+      VALUES($1,0) ON CONFLICT(participant_id) DO NOTHING`, [participantId]);
+  };
 
   // Lock authority rows before evaluating lifecycle predicates.  PostgreSQL
   // can wait for an UPDATE target while joined rows remain visible from the
@@ -546,7 +613,31 @@ export function createPostgresTelemetryAuthorityBackend(
           snapshot.device.issuedAt, snapshot.device.expiresAt, snapshot.device.lastUsedAt,
           snapshot.device.socialVerifiedAt, snapshot.device.credentialGeneration,
         ]);
-        return changes(result) === 1;
+        if (changes(result) !== 1) return false;
+        const pairing = await client.query(`SELECT transport_consent_version
+          FROM ${tables.devicePairings} WHERE id=$1 AND participant_id=$2 FOR SHARE`,
+        [snapshot.device.pairingId, snapshot.participantId]);
+        const pairingRow = rowOne<Record<string, unknown>>(pairing);
+        const floor = await client.query(`INSERT INTO ${tables.telemetryTransportDeviceFloors}
+          (participant_id,device_id,minimum_rank,revision,changed_at)
+          VALUES($1,$2,1,0,$3)
+          ON CONFLICT(participant_id,device_id) DO NOTHING`,
+        [snapshot.participantId, snapshot.device.id, snapshot.device.issuedAt]);
+        const floorCount = changes(floor);
+        if (floorCount !== 1 && floorCount !== 0) throw unavailable();
+        if (pairingRow.transport_consent_version === ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION) {
+          const consent = await client.query(`INSERT INTO ${table("telemetry_v1_device_consents")}
+            (participant_id,device_id,telemetry_schema_version,field_dictionary_version,
+             privacy_contract_version,consented_at)
+            VALUES($1,$2,'telemetry-contribution-v1.0',$3,$4,$5)
+            ON CONFLICT(participant_id,device_id) DO NOTHING`,
+          [snapshot.participantId, snapshot.device.id,
+            INCREMENTAL_TELEMETRY_FIELD_DICTIONARY_VERSION,
+            ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION, snapshot.device.issuedAt]);
+          const consentCount = changes(consent);
+          if (consentCount !== 1 && consentCount !== 0) throw unavailable();
+        }
+        return true;
       });
     },
     async readDevice(deviceId): Promise<AuthorityDeviceRecord | null> {
@@ -1150,6 +1241,9 @@ export function createPostgresTelemetryAuthorityBackend(
           ]);
           if (changes(insertedPairing) !== 1) throw unavailable();
         }
+        if (input.bootstrap !== undefined) {
+          await bootstrapParticipant(client, participant.id, input.bootstrap);
+        }
         return {
           id: stringValue(row.id),
           createdAt: stringValue(row.created_at),
@@ -1192,6 +1286,9 @@ export function createPostgresTelemetryAuthorityBackend(
             pairing.transportConsentVersion, pairing.issuedAt, pairing.expiresAt,
           ]);
           if (changes(insertedPairing) !== 1) throw unavailable();
+        }
+        if (input.bootstrap !== undefined) {
+          await bootstrapParticipant(client, input.participantId, input.bootstrap);
         }
         return true;
       }, "authority.enrollment.reattach");

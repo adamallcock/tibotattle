@@ -194,6 +194,7 @@ export interface TelemetryAuthorityBackend {
   readonly accountless: AccountlessAuthorityStore;
   readonly transport: TransportAuthorityStore;
   readonly identity: IdentityAuthorityStore;
+  readonly enrollment?: AuthorityEnrollmentStore;
 }
 
 /** Hosted identity mapping stores only the pairwise HMAC and lifecycle state. */
@@ -225,6 +226,45 @@ export interface IdentityAuthorityStore {
     recoveryTokenId: string;
     recoveryTokenHash: Uint8Array;
     now: string;
+  }): Promise<boolean>;
+}
+
+/**
+ * Canonical PostgreSQL owner rows created with the authority identity.  The
+ * values are opaque, provider-neutral digests; a PG adapter uses this optional
+ * payload to keep application bootstrap in the same transaction as enrollment
+ * or reattachment.
+ */
+export interface AuthorityEnrollmentBootstrap {
+  sourceId: string;
+  ownerDigest: string;
+  attributionNamespace: string;
+  now: string;
+}
+
+/**
+ * Composite authority writes used by host adapters whose database can keep
+ * enrollment, session, and optional pairing in one transaction. The legacy
+ * per-table methods remain available for existing callers; a provider that
+ * exposes this port must use it for the enrollment route so a credential is
+ * never rotated without its session/pairing companion.
+ */
+export interface AuthorityEnrollmentStore {
+  enroll(input: {
+    participant: IdentityParticipantMaterial;
+    session: AuthoritySessionMaterial;
+    pairing: AuthorityDevicePairingMaterial | null;
+    bootstrap?: AuthorityEnrollmentBootstrap;
+  }): Promise<IdentityParticipantRecord>;
+  reattach(input: {
+    participantId: string;
+    identityLinkKey: string;
+    recoveryTokenId: string;
+    recoveryTokenHash: Uint8Array;
+    now: string;
+    session: AuthoritySessionMaterial;
+    pairing: AuthorityDevicePairingMaterial | null;
+    bootstrap?: AuthorityEnrollmentBootstrap;
   }): Promise<boolean>;
 }
 

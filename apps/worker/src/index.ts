@@ -1,11 +1,13 @@
 import { createD1TelemetryV1Backend } from "./d1-telemetry-v1-backend";
 import type { TelemetryV1Backend } from "./telemetry-v1-backend";
 import { readWorkerBackend } from "./backend-composition";
+import type { PostgresWorkerApplication } from "./postgres-worker-application";
 import type { TelemetryV1ContributionStore } from "./telemetry-v1-contribution-store";
 import type {
   StoredTelemetryV1Chunk,
   TelemetryV1ContributionReader,
 } from "./telemetry-v1-contribution-reader";
+import type { TelemetryV1ChunkRow } from "./telemetry-v1-repository";
 import {
   buildTelemetryV1ReplayReceipt,
   resolveTelemetryV1Replay,
@@ -206,7 +208,8 @@ import {
 } from "./telemetry-v11-repository";
 import { createTelemetryV11DomainPredecessor, activateTelemetryV11Domain } from "./telemetry-v11-domain";
 import { parseTelemetryStorageMode, resolveTelemetryStorageMode, readTelemetryV11StorageReplay,
-  persistTelemetryV11StorageChunk } from "./telemetry-storage-mode";
+  readTelemetryV1StorageReceipt, persistTelemetryV1StorageChunk,
+  persistTelemetryV11StorageChunk, type TelemetryStorageMode } from "./telemetry-storage-mode";
 import {
   claimPendingAppleSignInHandoff,
   completeAppleSignInHandoff,
@@ -305,6 +308,14 @@ function configuredDeploymentSourceCommit(env: Env): string | null {
 
 /** Worker composition root for the contribution quarantine port. */
 function quarantineObjectStore(env: Env): QuarantineObjectStore {
+  const injected = Reflect.get(env, "POSTGRES_OBJECT_STORE");
+  if (injected !== null && typeof injected === "object"
+      && typeof Reflect.get(injected, "put") === "function"
+      && typeof Reflect.get(injected, "head") === "function"
+      && typeof Reflect.get(injected, "delete") === "function"
+      && typeof Reflect.get(injected, "deleteMany") === "function") {
+    return injected as QuarantineObjectStore;
+  }
   return createR2QuarantineObjectStore(env.QUARANTINE);
 }
 
@@ -313,6 +324,10 @@ function telemetryV1Backend(env: Env): TelemetryV1Backend {
   const backend = readWorkerBackend(env);
   if (backend !== null) return backend.telemetryV1;
   return createD1TelemetryV1Backend(env.USAGE_MONITOR_DB);
+}
+
+function postgresWorkerApplication(env: Env): PostgresWorkerApplication | null {
+  return readWorkerBackend(env)?.application ?? null;
 }
 
 /**
@@ -764,12 +779,14 @@ function hasExactEnvelopeKeyOccurrences(raw: string): boolean {
 async function handleEnroll(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
   assertSameOrigin(request);
+  const postgres = postgresWorkerApplication(env);
   const mode = configuredEnrollmentMode(env);
   assertAdmissionBindings(env);
   // "disabled" pauses NEW participation only. An identity that already links
   // to a participant reattaches below without creating anything, so the
   // refusal moves to the fresh-enrollment fall-through instead of the door.
-  await assertCollectionControl(env.USAGE_MONITOR_DB, "enrollment");
+  if (postgres) await postgres.assertCollectionControl("enrollment");
+  else await assertCollectionControl(env.USAGE_MONITOR_DB, "enrollment");
   await assertAttemptAllowed(
     env.ENROLLMENT_RATE_LIMIT,
     env.CLIENT_ATTEMPT_RATE_LIMIT,
@@ -836,11 +853,18 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
     throw new ApiError(401, "IDENTITY_REQUIRED");
   }
   if (identityRequired(env)) {
-    await assertPinnedIdentityLinkSecretConfiguration(
-      env.USAGE_MONITOR_DB,
-      Reflect.get(env, "IDENTITY_LINK_SECRET"),
-      Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
-    );
+    if (postgres) {
+      await postgres.assertIdentityConfiguration(
+        Reflect.get(env, "IDENTITY_LINK_SECRET"),
+        Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
+      );
+    } else {
+      await assertPinnedIdentityLinkSecretConfiguration(
+        env.USAGE_MONITOR_DB,
+        Reflect.get(env, "IDENTITY_LINK_SECRET"),
+        Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
+      );
+    }
   }
   const verifiedIdentity = identityProvided
     ? await consumeHostedIdentityProof(
@@ -852,19 +876,19 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
     ? await assertIdentityReenrollmentAllowed(
       env,
       verifiedIdentity.linkKeyHex,
+      postgres,
     )
     : null;
   if (deviceBootstrapRequested) {
-    await assertCollectionControl(
-      env.USAGE_MONITOR_DB,
-      "uploadRegistration",
-    );
+    if (postgres) await postgres.assertCollectionControl("uploadRegistration");
+    else await assertCollectionControl(env.USAGE_MONITOR_DB, "uploadRegistration");
   }
   const consentVersion = Reflect.get(body.value, "consentVersion") as string;
   const syntheticOnly = Reflect.get(body.value, "syntheticOnly");
+  const enrollmentSource = readWorkerBackend(env)?.authority ?? env.USAGE_MONITOR_DB;
   const reattached = verifiedIdentity
     ? await reattachParticipantByLinkKey(
-      env.USAGE_MONITOR_DB,
+      enrollmentSource,
       verifiedIdentity.linkKeyHex,
       consentVersion,
       { deviceBootstrap: deviceBootstrapRequested },
@@ -878,7 +902,18 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
     : null;
   const enrollment = reattached ?? await (async () => {
     try {
-      return await enroll(
+      if (postgres) {
+        if (inviteGrant !== null || (mode === "open" && syntheticOnly === false)) {
+          throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+        }
+        return postgres.enroll({
+          consentVersion,
+          deviceBootstrap: deviceBootstrapRequested,
+          identityLinkKey: verifiedIdentity?.linkKeyHex ?? null,
+          identityCooldownDigest,
+        });
+      }
+      return enroll(
         env.USAGE_MONITOR_DB,
         consentVersion,
         inviteGrant,
@@ -895,10 +930,9 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
       // deleting → removed race. Map its expected rejection without exposing
       // a database error; any unrecognised write failure remains fail-closed.
       if (identityCooldownDigest !== null
-          && await hasIdentityReenrollmentCooldownDigest(
-            env.USAGE_MONITOR_DB,
-            identityCooldownDigest,
-          )) {
+          && (postgres
+            ? await postgres.hasIdentityCooldownDigest(identityCooldownDigest, false)
+            : await hasIdentityReenrollmentCooldownDigest(env.USAGE_MONITOR_DB, identityCooldownDigest))) {
         throw new ApiError(409, "IDENTITY_REENROLLMENT_COOLDOWN");
       }
       throw error;
@@ -908,7 +942,7 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
     schemaVersion: "participant-bootstrap-v0.1",
     state: enrollment.pairing ? "pairing_ready" : "enrolled",
     participantId: enrollment.participantId,
-    csrfToken: enrollment.csrfToken,
+    csrfToken: enrollment.session.csrfToken,
     recoveryCode: enrollment.recoveryCode,
     consentVersion,
     invitation: enrollment.invitation,
@@ -1105,9 +1139,10 @@ async function consumeHostedIdentityProof(
 async function assertIdentityReenrollmentAllowed(
   env: Env,
   identityLinkKey: string,
+  postgres: PostgresWorkerApplication | null = postgresWorkerApplication(env),
 ): Promise<string | null> {
   const state = await participantIdentityLinkState(
-    env.USAGE_MONITOR_DB,
+    readWorkerBackend(env)?.authority ?? env.USAGE_MONITOR_DB,
     identityLinkKey,
   );
   // Do not fall through to a fresh enrollment when the deletion still owns
@@ -1133,14 +1168,12 @@ async function assertIdentityReenrollmentAllowed(
   );
   if (state?.state === "active") return cooldownDigest;
   const [primaryCoolingDown, ledgerCoolingDown] = await Promise.all([
-    hasIdentityReenrollmentCooldownDigest(
-      env.USAGE_MONITOR_DB,
-      cooldownDigest,
-    ),
-    hasIdentityReenrollmentCooldownDigest(
-      env.DELETION_LEDGER,
-      cooldownDigest,
-    ),
+    postgres
+      ? postgres.hasIdentityCooldownDigest(cooldownDigest, false)
+      : hasIdentityReenrollmentCooldownDigest(env.USAGE_MONITOR_DB, cooldownDigest),
+    postgres
+      ? postgres.hasIdentityCooldownDigest(cooldownDigest, true)
+      : hasIdentityReenrollmentCooldownDigest(env.DELETION_LEDGER, cooldownDigest),
   ]);
   if (primaryCoolingDown || ledgerCoolingDown) {
     throw new ApiError(409, "IDENTITY_REENROLLMENT_COOLDOWN");
@@ -1792,6 +1825,10 @@ async function personalSession(
 ): Promise<SessionPrincipal> {
   if (request.headers.has("authorization")) throw new ApiError(401, "AUTH_INVALID");
   const backend = readWorkerBackend(env);
+  // A personal read is served only after the composed primary/ledger sweep has
+  // reconciled restored owner rows. Enrollment itself is the bootstrap path;
+  // every session-backed read or mutation crosses this barrier afterwards.
+  if (backend !== null) await backend.application.assertGlobalReadiness();
   const session = await authenticateSession(
     backend?.authority ?? env.USAGE_MONITOR_DB,
     request.headers.get("cookie"),
@@ -1810,10 +1847,11 @@ async function hasDeletionTombstoneForParticipant(
 ): Promise<boolean> {
   const backend = readWorkerBackend(env);
   if (backend !== null) {
-    return backend.storage.lifecycle.hasDeletionTombstone({
-      participantDigest: await participantDeletionDigest(participantId),
-      now: new Date().toISOString(),
-    });
+    // The composed application checks both the independent tombstone and any
+    // pending restartable erasure job. A missing or unavailable ledger throws
+    // closed; treating it as "no tombstone" would admit restored data.
+    await backend.application.assertOwnerAdmission(participantId);
+    return false;
   }
   return hasDeletionTombstone(env.DELETION_LEDGER, participantId);
 }
@@ -1880,10 +1918,9 @@ async function handleSecurityReset(request: Request, env: Env): Promise<Response
 
 async function handleDevicePairing(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
-  await assertCollectionControl(
-    env.USAGE_MONITOR_DB,
-    "uploadRegistration",
-  );
+  const postgres = postgresWorkerApplication(env);
+  if (postgres) await postgres.assertCollectionControl("uploadRegistration");
+  else await assertCollectionControl(env.USAGE_MONITOR_DB, "uploadRegistration");
   const session = await personalSession(request, env);
   assertCsrf(request, session);
   const accountScoped = session.consentVersion
@@ -1916,7 +1953,7 @@ async function handleDevicePairing(request: Request, env: Env): Promise<Response
   }
   return jsonResponse(
     await createDevicePairing(
-      env.USAGE_MONITOR_DB,
+      readWorkerBackend(env)?.authority ?? env.USAGE_MONITOR_DB,
       session.participantId,
       session.sessionId,
       session.consentVersion,
@@ -1931,10 +1968,10 @@ async function handleDevicePairing(request: Request, env: Env): Promise<Response
 
 async function handleDevicePairingClaim(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
-  await assertCollectionControl(
-    env.USAGE_MONITOR_DB,
-    "uploadRegistration",
-  );
+  const postgres = postgresWorkerApplication(env);
+  if (postgres) await postgres.assertGlobalReadiness();
+  if (postgres) await postgres.assertCollectionControl("uploadRegistration");
+  else await assertCollectionControl(env.USAGE_MONITOR_DB, "uploadRegistration");
   if (request.headers.has("cookie")) throw new ApiError(401, "PAIRING_AUTH_INVALID");
   const body = await readBoundedJson(request);
   if (typeof body.value !== "object"
@@ -1945,15 +1982,26 @@ async function handleDevicePairingClaim(request: Request, env: Env): Promise<Res
       || typeof Reflect.get(body.value, "deviceSecretHash") !== "string") {
     throw new ApiError(400, "BODY_INVALID");
   }
-  return jsonResponse(await claimDevicePairing(
-    env.USAGE_MONITOR_DB,
-    request.headers.get("authorization"),
-    Reflect.get(body.value, "deviceId") as string,
-    Reflect.get(body.value, "deviceSecretHash") as string,
-    undefined,
-    undefined,
-    request.headers.get("x-previous-device-authorization"),
-  ), 201);
+  const claimInput = {
+    authorizationHeader: request.headers.get("authorization"),
+    deviceId: Reflect.get(body.value, "deviceId") as string,
+    deviceSecretHashHex: Reflect.get(body.value, "deviceSecretHash") as string,
+    previousDeviceAuthorization: request.headers.get("x-previous-device-authorization"),
+  };
+  return jsonResponse(
+    postgres
+      ? await postgres.claimPairing(claimInput)
+      : await claimDevicePairing(
+        env.USAGE_MONITOR_DB,
+        claimInput.authorizationHeader,
+        claimInput.deviceId,
+        claimInput.deviceSecretHashHex,
+        undefined,
+        undefined,
+        claimInput.previousDeviceAuthorization,
+      ),
+    201,
+  );
 }
 
 async function handleDeviceUploadAuthorization(
@@ -1961,19 +2009,21 @@ async function handleDeviceUploadAuthorization(
   env: Env,
 ): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
+  const postgres = postgresWorkerApplication(env);
   assertAdmissionBindings(env);
   assertUploadAuthorizationBindings(env);
   assertUploadIngressConfiguration(env);
-  await assertCollectionControl(
-    env.USAGE_MONITOR_DB,
-    "uploadRegistration",
-  );
+  if (postgres) await postgres.assertGlobalReadiness();
+  if (postgres) await postgres.assertCollectionControl("uploadRegistration");
+  else await assertCollectionControl(env.USAGE_MONITOR_DB, "uploadRegistration");
   if (request.headers.has("cookie")) throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  const backend = readWorkerBackend(env);
   const device = await authenticateDevice(
-    env.USAGE_MONITOR_DB,
+    backend?.authority ?? env.USAGE_MONITOR_DB,
     request.headers.get("authorization"),
   );
-  if (await hasDeletionTombstone(env.DELETION_LEDGER, device.participantId)) {
+  if (postgres) await postgres.assertOwnerAdmission(device.participantId);
+  else if (await hasDeletionTombstone(env.DELETION_LEDGER, device.participantId)) {
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
   await assertUploadAuthorizationAllowed(
@@ -1997,13 +2047,30 @@ async function handleDeviceUploadAuthorization(
       || Reflect.get(body.value, "contentType") !== "application/json") {
     throw new ApiError(400, "BODY_INVALID");
   }
-  await assertTelemetryTransportWriteAllowed(
-    env.USAGE_MONITOR_DB,
-    device,
-    telemetryTransportSchemaVersion(Reflect.get(body.value, "telemetrySchemaVersion") ?? "telemetry-contribution-v1.0"),
+  const transportSchema = telemetryTransportSchemaVersion(
+    Reflect.get(body.value, "telemetrySchemaVersion") ?? "telemetry-contribution-v1.0",
   );
+  if (postgres && backend) {
+    if (transportSchema === "telemetry-contribution-v1.0") {
+      await postgres.assertTelemetryV1Consent(device.participantId, device.deviceId);
+    } else {
+      const transport = await backend.authority.transport.readAuthorization({
+        principal: { participantId: device.participantId, deviceId: device.deviceId },
+        schemaVersion: transportSchema,
+        now: new Date().toISOString(),
+      });
+      if (!transport
+          || !transport.consentCurrent
+          || transport.formatLifecycle !== "accepted"
+          || transport.formatRank < transport.minimumWriteRank) {
+        throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+      }
+    }
+  } else {
+    await assertTelemetryTransportWriteAllowed(env.USAGE_MONITOR_DB, device, transportSchema);
+  }
   return jsonResponse(await createDeviceUploadAuthorization(
-    env.USAGE_MONITOR_DB,
+    backend?.authority ?? env.USAGE_MONITOR_DB,
     device,
     Reflect.get(body.value, "envelopeDigest") as string,
     Reflect.get(body.value, "contentLengthBytes") as number,
@@ -2458,6 +2525,65 @@ async function telemetryV1ChunkReceipt(
   );
 }
 
+/**
+ * A typed-storage header is not, by itself, a replay proof.  The typed
+ * adapter owns the membership, source-journal and record-integrity checks;
+ * the HTTP route still uses the neutral reader for the public receipt.  Keep
+ * the provider row lookup here so an incomplete typed membership cannot fall
+ * through to the JSON header path.
+ */
+async function verifyTelemetryV1StorageRow(
+  db: D1Database,
+  mode: TelemetryStorageMode,
+  row: StoredTelemetryV1Chunk,
+  deviceId: string,
+): Promise<StoredTelemetryV1Chunk> {
+  if (mode.kind === "json") return row;
+  const raw = await db.prepare(
+    `SELECT id, participant_id, device_id, stream, chunk_day, chunk_seq,
+            revision, chunk_digest, envelope_digest, parser_version,
+            record_count, accepted_record_count, r2_key,
+            device_upload_authorization_id, superseded_at,
+            quarantine_deleted_at, created_at
+       FROM telemetry_v1_chunks WHERE id = ?`,
+  ).bind(row.id).first<TelemetryV1ChunkRow>();
+  if (!raw) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  const verified = await readTelemetryV1StorageReceipt(db, mode, raw, deviceId);
+  return {
+    id: verified.id,
+    participantId: verified.participant_id,
+    deviceId: verified.device_id,
+    stream: verified.stream,
+    chunkDay: verified.chunk_day,
+    chunkSeq: verified.chunk_seq,
+    revision: verified.revision,
+    chunkDigest: verified.chunk_digest,
+    recordCount: verified.record_count,
+    acceptedRecords: verified.accepted_record_count,
+    supersededAt: verified.superseded_at,
+  };
+}
+
+async function readTelemetryV1StorageRow(
+  db: D1Database,
+  mode: TelemetryStorageMode,
+  id: string,
+): Promise<TelemetryV1ChunkRow> {
+  if (mode.kind === "json") {
+    throw new ApiError(500, "INTERNAL_ERROR");
+  }
+  const row = await db.prepare(
+    `SELECT id, participant_id, device_id, stream, chunk_day, chunk_seq,
+            revision, chunk_digest, envelope_digest, parser_version,
+            record_count, accepted_record_count, r2_key,
+            device_upload_authorization_id, superseded_at,
+            quarantine_deleted_at, created_at
+       FROM telemetry_v1_chunks WHERE id = ?`,
+  ).bind(id).first<TelemetryV1ChunkRow>();
+  if (!row) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  return row;
+}
+
 async function handleTelemetryV11Contribution(
   body: { raw: string; value: unknown },
   participant: {
@@ -2467,6 +2593,7 @@ async function handleTelemetryV11Contribution(
   },
   deviceId: string,
   authorizationId: string,
+  uploadAuthorizationLeaseExpiresAt: string,
   env: Env,
   quarantine: QuarantineObjectStore,
 ): Promise<Response> {
@@ -2512,7 +2639,9 @@ async function handleTelemetryV11Contribution(
   });
   try {
     const result = await persistTelemetryV11StorageChunk(env.USAGE_MONITOR_DB, storageMode, principal, chunk, {
-      chunkRowId, r2Key, envelopeDigest, deviceUploadAuthorizationId: authorizationId,
+      chunkRowId, r2Key, envelopeDigest,
+      deviceUploadAuthorizationId: authorizationId,
+      uploadAuthorizationLeaseExpiresAt,
     });
     if (result.replay && result.contributionId !== chunkRowId) {
       // A content replay won after our first lookup. Only our unreferenced
@@ -2555,6 +2684,7 @@ async function handleTelemetryV1Contribution(
   quarantine: QuarantineObjectStore,
   contributions: TelemetryV1ContributionStore,
   reader: TelemetryV1ContributionReader,
+  postgres: PostgresWorkerApplication | null = null,
 ): Promise<Response> {
   if (uploadAuthorization.authorizationKind !== "device") {
     throw new ApiError(401, "UPLOAD_AUTH_INVALID");
@@ -2562,19 +2692,38 @@ async function handleTelemetryV1Contribution(
   if (participant.consentVersion !== TELEMETRY_CONSENT_VERSION) {
     throw new ApiError(400, "TELEMETRY_REQUIRED");
   }
+  // PostgreSQL has its own explicit transport adapter.  D1's optional typed
+  // layout must be resolved before any JSON write is attempted; an absent or
+  // mismatched typed admission state is a closed 503, never a JSON fallback.
+  const storageMode = postgres === null
+    ? await resolveTelemetryStorageMode(env.USAGE_MONITOR_DB, env, "v1")
+    : null;
   const envelope = validateTelemetryV1Envelope(body.value);
   const envelopeDigestValue = await telemetryEnvelopeDigest(envelope);
-  const deviceId = await telemetryV1DeviceForUploadAuthorization(
-    env.USAGE_MONITOR_DB,
-    uploadAuthorization.authorizationId,
-  );
+  const authorityUpload = postgres === null
+    ? null
+    : await postgres.deviceForUploadAuthorization(uploadAuthorization.authorizationId);
+  const deviceId = postgres === null
+    ? await telemetryV1DeviceForUploadAuthorization(
+      env.USAGE_MONITOR_DB,
+      uploadAuthorization.authorizationId,
+    )
+    : authorityUpload?.deviceId ?? null;
   if (deviceId === null) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
   const envelopeReplay = await reader.byEnvelope(
     participant.id,
     envelopeDigestValue,
   );
   if (envelopeReplay) {
-    return telemetryV1ChunkReceipt(reader, envelopeReplay, deviceId);
+    const verified = storageMode === null
+      ? envelopeReplay
+      : await verifyTelemetryV1StorageRow(
+        env.USAGE_MONITOR_DB,
+        storageMode,
+        envelopeReplay,
+        deviceId,
+      );
+    return telemetryV1ChunkReceipt(reader, verified, deviceId);
   }
 
   const plaintext = await decryptSyntheticEnvelope(
@@ -2587,12 +2736,16 @@ async function handleTelemetryV1Contribution(
   // equal the currently required identifiers AND the grant this device's
   // pairing claim recorded. An upload can never create or repair the grant.
   assertTelemetryV1ConsentCurrent(chunk.consent);
-  if (!await telemetryV1DeviceConsentCurrent(
-    env.USAGE_MONITOR_DB,
-    participant.id,
-    deviceId,
-  )) {
-    throw new ApiError(403, "TELEMETRY_CONSENT_INVALID");
+  if (postgres === null) {
+    if (!await telemetryV1DeviceConsentCurrent(
+      env.USAGE_MONITOR_DB,
+      participant.id,
+      deviceId,
+    )) {
+      throw new ApiError(403, "TELEMETRY_CONSENT_INVALID");
+    }
+  } else {
+    await postgres.assertTelemetryV1Consent(participant.id, deviceId);
   }
   // The digest identity is the canonical minified JSON array of the chunk's
   // records — the same serialization the client computes — so replay and
@@ -2616,7 +2769,15 @@ async function handleTelemetryV1Contribution(
   // (device, stream, day, seq) chunk with an equal digest is a replay. An
   // equal digest anywhere else is a coincidence and proceeds as an insert.
   if (current && current.chunkDigest === chunk.chunkDigest) {
-    return telemetryV1ChunkReceipt(reader, current, deviceId);
+    const verified = storageMode === null
+      ? current
+      : await verifyTelemetryV1StorageRow(
+        env.USAGE_MONITOR_DB,
+        storageMode,
+        current,
+        deviceId,
+      );
+    return telemetryV1ChunkReceipt(reader, verified, deviceId);
   }
   // Same-digest replay answered above, so a declared revision must extend
   // the current one by exactly one; anything else means the client's cursor
@@ -2626,11 +2787,9 @@ async function handleTelemetryV1Contribution(
     : chunk.chunkRevision !== 1) {
     throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
   }
-  const admission = await telemetryV1ChunkAdmission(
-    env.USAGE_MONITOR_DB,
-    participant.id,
-    deviceId,
-  );
+  const admission = postgres === null
+    ? await telemetryV1ChunkAdmission(env.USAGE_MONITOR_DB, participant.id, deviceId)
+    : await telemetryV1Backend(env).sync.admission(participant.id, deviceId);
   if (admission.state === "exhausted") {
     throw telemetryV1ChunkAdmissionError(admission);
   }
@@ -2638,17 +2797,38 @@ async function handleTelemetryV1Contribution(
   const chunkRowId = `chunk:${crypto.randomUUID()}`;
   const r2Key = `telemetry/v1-${crypto.randomUUID()}`;
   const createdAt = new Date().toISOString();
-  await putTrackedQuarantineObject(
-    env.USAGE_MONITOR_DB,
-    quarantine,
-    {
+  const authorizationEnvelopeDigest = await sha256Hex(body.raw);
+  const typedSupersedes = storageMode?.kind === "typed" && current !== null
+    ? await readTelemetryV1StorageRow(env.USAGE_MONITOR_DB, storageMode, current.id)
+    : null;
+  if (postgres === null) {
+    await putTrackedQuarantineObject(
+      env.USAGE_MONITOR_DB,
+      quarantine,
+      {
+        contributionId: chunkRowId,
+        objectKind: "telemetry",
+        r2Key,
+        registeredAt: createdAt,
+      },
+      JSON.stringify(envelope),
+      {
+        contentType: "application/json",
+        customMetadata: {
+          contributionId: chunkRowId,
+          schemaVersion: TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION,
+          plaintextSchemaVersion: chunk.schemaVersion,
+          synthetic: "false",
+        },
+      },
+    );
+  } else {
+    await postgres.registerQuarantine({
       contributionId: chunkRowId,
-      objectKind: "telemetry",
-      r2Key,
+      objectKey: r2Key,
       registeredAt: createdAt,
-    },
-    JSON.stringify(envelope),
-    {
+    });
+    await quarantine.put(r2Key, JSON.stringify(envelope), {
       contentType: "application/json",
       customMetadata: {
         contributionId: chunkRowId,
@@ -2656,27 +2836,80 @@ async function handleTelemetryV1Contribution(
         plaintextSchemaVersion: chunk.schemaVersion,
         synthetic: "false",
       },
-    },
-  );
-  try {
-    const result = await contributions.insert({
-      participantId: participant.id,
-      deviceId,
-      uploadAuthorizationId: uploadAuthorization.authorizationId,
-      uploadAuthorizationLeaseExpiresAt: uploadAuthorization.leaseExpiresAt,
-      chunkId: chunkRowId,
-      objectKey: r2Key,
-      envelopeDigest: envelopeDigestValue,
-      chunk,
-      supersedes: current === null ? null : { id: current.id },
-      createdAt,
     });
+  }
+  try {
+    const result = storageMode?.kind === "typed"
+      ? await persistTelemetryV1StorageChunk(env.USAGE_MONITOR_DB, storageMode, {
+        participantId: participant.id,
+        deviceId,
+        deviceUploadAuthorizationId: uploadAuthorization.authorizationId,
+        uploadAuthorizationLeaseExpiresAt: uploadAuthorization.leaseExpiresAt,
+        authorizationEnvelopeDigest,
+        chunkRowId,
+        r2Key,
+        envelopeDigest: envelopeDigestValue,
+        chunk,
+        supersedes: typedSupersedes,
+        createdAt,
+      })
+      : await contributions.insert({
+        participantId: participant.id,
+        deviceId,
+        uploadAuthorizationId: uploadAuthorization.authorizationId,
+        uploadAuthorizationLeaseExpiresAt: uploadAuthorization.leaseExpiresAt,
+        authorizationEnvelopeDigest,
+        chunkId: chunkRowId,
+        objectKey: r2Key,
+        envelopeDigest: envelopeDigestValue,
+        chunk,
+        supersedes: current === null ? null : { id: current.id },
+        createdAt,
+      });
+    if (storageMode?.kind === "typed"
+        && "replay" in result
+        && result.replay) {
+      const replay = await resolveTelemetryV1Replay(
+        reader,
+        envelopeDigestValue,
+        {
+          participantId: participant.id,
+          deviceId,
+          stream: chunk.stream,
+          chunkDay: chunk.chunkDay,
+          chunkSeq: chunk.chunkSeq,
+        },
+        chunk.chunkDigest,
+      );
+      if (replay === null) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+      const verified = await verifyTelemetryV1StorageRow(
+        env.USAGE_MONITOR_DB,
+        storageMode,
+        replay,
+        deviceId,
+      );
+      // A typed adapter replay can mean either that this request's batch
+      // committed and its response was lost, or that another request won the
+      // same content race.  Only the latter has an orphaned object to remove;
+      // deleting the object when the retained row is ours would turn a valid
+      // lost-response recovery into a ciphertextless receipt.
+      if (replay.id !== chunkRowId) {
+        await quarantine.delete(r2Key);
+        await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, {
+          contributionId: chunkRowId,
+          r2Key,
+        });
+      }
+      return telemetryV1ChunkReceipt(reader, verified, deviceId);
+    }
     const [acknowledgedThroughDay, settledAdmission] = await Promise.all([
       reader.acknowledgedThroughDay(
         participant.id,
         deviceId,
       ),
-      telemetryV1ChunkAdmission(env.USAGE_MONITOR_DB, participant.id, deviceId),
+      postgres === null
+        ? telemetryV1ChunkAdmission(env.USAGE_MONITOR_DB, participant.id, deviceId)
+        : telemetryV1Backend(env).sync.admission(participant.id, deviceId),
     ]);
     return jsonResponse({
       schemaVersion: "telemetry-chunk-receipt-v1.0",
@@ -2710,14 +2943,26 @@ async function handleTelemetryV1Contribution(
       chunk.chunkDigest,
     );
     if (replay !== null) {
-      return telemetryV1ChunkReceipt(reader, replay, deviceId);
+      const verified = storageMode === null
+        ? replay
+        : await verifyTelemetryV1StorageRow(
+          env.USAGE_MONITOR_DB,
+          storageMode,
+          replay,
+          deviceId,
+        );
+      return telemetryV1ChunkReceipt(reader, verified, deviceId);
     }
     try {
       await quarantine.delete(r2Key);
-      await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, {
-        contributionId: chunkRowId,
-        r2Key,
-      });
+      if (postgres === null) {
+        await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, {
+          contributionId: chunkRowId,
+          r2Key,
+        });
+      } else {
+        await postgres.clearQuarantine({ contributionId: chunkRowId, objectKey: r2Key });
+      }
     } catch {
       // The reconciliation registration remains durable by design.
     }
@@ -2726,11 +2971,9 @@ async function handleTelemetryV1Contribution(
     // the admission recheck that distinguishes a raced budget exhaustion
     // from a genuine internal error.
     if (error instanceof ApiError) throw error;
-    const retryAdmission = await telemetryV1ChunkAdmission(
-      env.USAGE_MONITOR_DB,
-      participant.id,
-      deviceId,
-    );
+    const retryAdmission = postgres === null
+      ? await telemetryV1ChunkAdmission(env.USAGE_MONITOR_DB, participant.id, deviceId)
+      : await telemetryV1Backend(env).sync.admission(participant.id, deviceId);
     if (retryAdmission.state === "exhausted") {
       throw telemetryV1ChunkAdmissionError(retryAdmission);
     }
@@ -2764,6 +3007,7 @@ async function deviceSyncPrincipal(
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
   const backend = readWorkerBackend(env);
+  if (backend !== null) await backend.application.assertGlobalReadiness();
   const device = await authenticateDevice(
     backend?.authority ?? env.USAGE_MONITOR_DB,
     request.headers.get("authorization"),
@@ -2902,6 +3146,8 @@ async function handleDeviceSyncManifest(
 
 async function handleContribution(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
+  const postgres = postgresWorkerApplication(env);
+  if (postgres !== null) return handlePostgresContribution(request, env, postgres);
   assertUploadIngressConfiguration(env);
   assertUploadIngressRateLimitBindings(env);
   const quarantine = quarantineObjectStore(env);
@@ -2980,7 +3226,15 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
           v1Backend.reader,
         )
         : declaredEnvelopeVersion === TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION
-          ? await handleTelemetryV11Contribution(body, participant, sourceDeviceId, claimed.authorizationId, env, quarantine)
+          ? await handleTelemetryV11Contribution(
+            body,
+            participant,
+            sourceDeviceId,
+            claimed.authorizationId,
+            claimed.leaseExpiresAt,
+            env,
+            quarantine,
+          )
           : await handleSyntheticContribution(body, participant, claimed, env, quarantine);
     await heartbeat.assertActive();
     const receipt = await response.clone().json<{ contributionId?: unknown }>();
@@ -3024,6 +3278,117 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
           event: "upload_ingress_lease_release_failed",
         }));
       }
+    }
+  }
+}
+
+/**
+ * The v1 path is the first complete no-D1 upload journey.  It deliberately
+ * reuses the normal ingress lease, envelope validator, authority claim and
+ * provider-neutral contribution store; only D1-specific participant,
+ * quarantine, consent, and admission reads are replaced by composed PG
+ * ports. The v0/v1.1 branches remain explicitly outside this checkpoint.
+ */
+async function handlePostgresContribution(
+  request: Request,
+  env: Env,
+  postgres: PostgresWorkerApplication,
+): Promise<Response> {
+  assertUploadIngressConfiguration(env);
+  assertUploadIngressRateLimitBindings(env);
+  const backend = readWorkerBackend(env);
+  if (backend === null) throw new ApiError(503, "POSTGRES_BACKEND_INVALID");
+  await postgres.assertGlobalReadiness();
+  const quarantine = quarantineObjectStore(env);
+  const bodyReadPolicy = uploadIngressBodyReadPolicy(env);
+  const authorizationHeader = contributionRequestPreflight(request);
+  await assertUploadIngressRequestAllowed(
+    env.UPLOAD_INGRESS_REQUEST_RATE_LIMIT,
+    env.UPLOAD_INGRESS_CLIENT_RATE_LIMIT,
+    request,
+    env,
+  );
+  const ingressLease = await acquireUploadIngressLease(env);
+  const heartbeat = startUploadIngressLeaseHeartbeat(env, ingressLease);
+  let completed = false;
+  let claimed: {
+    authorizationId: string;
+    participantId: string;
+    authorizationKind: "device";
+    leaseExpiresAt: string;
+  } | null = null;
+  try {
+    const body = await readBoundedJson(request, bodyReadPolicy);
+    await heartbeat.assertActive();
+    const contentType = request.headers.get("content-type")?.trim() ?? "";
+    const bodyBytes = body.bytes.byteLength;
+    const scopeDigest = await sha256Hex(body.bytes);
+    await postgres.assertCollectionControl("processing");
+    claimed = await claimDeviceUploadAuthorization(
+      backend.authority,
+      authorizationHeader,
+      { envelopeDigest: scopeDigest, bodyBytes, contentType },
+    );
+    await heartbeat.assertActive();
+    if (!hasExactEnvelopeKeyOccurrences(body.raw)
+        || typeof body.value !== "object"
+        || body.value === null
+        || Array.isArray(body.value)) {
+      throw new ApiError(400, "ENVELOPE_INVALID");
+    }
+    if (Reflect.get(body.value, "schemaVersion") !== TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION) {
+      throw new ApiError(400, "ENVELOPE_INVALID");
+    }
+    const upload = await backend.authority.devices.readUpload(claimed.authorizationId);
+    if (!upload || upload.participantId !== claimed.participantId) {
+      throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+    }
+    const device = await backend.authority.devices.readDevice(upload.issuedByDeviceId);
+    if (!device || device.participantId !== upload.participantId) {
+      throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+    }
+    await postgres.assertOwnerAdmission(upload.participantId);
+    const response = await handleTelemetryV1Contribution(
+      body,
+      {
+        id: upload.participantId,
+        consentVersion: device.participantConsentVersion,
+      },
+      claimed,
+      env,
+      quarantine,
+      backend.telemetryV1.contributions,
+      backend.telemetryV1.reader,
+      postgres,
+    );
+    await heartbeat.assertActive();
+    const receipt = await response.clone().json() as { contributionId?: unknown };
+    if (typeof receipt.contributionId !== "string") throw new ApiError(500, "INTERNAL_ERROR");
+    if (!await backend.authority.devices.recordUploadReceipt({
+      authorizationId: claimed.authorizationId,
+      participantId: claimed.participantId,
+      deviceId: upload.issuedByDeviceId,
+      contributionId: receipt.contributionId,
+      leaseExpiresAt: claimed.leaseExpiresAt,
+      now: new Date().toISOString(),
+    })) {
+      throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+    }
+    completed = true;
+    return response;
+  } finally {
+    try {
+      if (!completed && claimed !== null) {
+        await backend.authority.devices.abandonUpload({
+          authorizationId: claimed.authorizationId,
+          participantId: claimed.participantId,
+          leaseExpiresAt: claimed.leaseExpiresAt,
+          now: new Date().toISOString(),
+        });
+      }
+    } finally {
+      await heartbeat.stop();
+      await releaseUploadIngressLease(env, ingressLease);
     }
   }
 }

@@ -25,6 +25,13 @@ test("loads contiguous primary and independent ledger migration manifests", asyn
       [5, "0005_telemetry_v11_transport_and_domain.sql"],
       [6, "0006_telemetry_v12_usage_quota_session.sql"],
       [7, "0007_analytics_lifecycle.sql"],
+      [8, "0008_pending_object_reconciliation.sql"],
+      [9, "0009_owner_scoped_analytics.sql"],
+      [10, "0010_v1_analytical_side_effects.sql"],
+      [11, "0011_retained_telemetry.sql"],
+      [12, "0012_provider_preparation.sql"],
+      [13, "0013_postgres_runtime_guards.sql"],
+      [14, "0014_effective_source_revision.sql"],
     ],
   );
   assert.deepEqual(
@@ -33,6 +40,7 @@ test("loads contiguous primary and independent ledger migration manifests", asyn
       [1, "0001_schema_metadata.sql"],
       [2, "0002_tombstones_cooldowns.sql"],
       [3, "0003_erasure_restore_receipts.sql"],
+      [4, "0004_storage_erasure_jobs.sql"],
     ],
   );
   for (const role of ["primary", "ledger"]) {

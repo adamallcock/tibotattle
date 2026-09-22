@@ -73,15 +73,30 @@ beforeAll(async () => {
   expect(primaryMigrations.applied).toBe(primaryMigrations.migrations.length);
   expect(primaryMigrations.migrations.map(migration => migration.version))
     .toEqual(primaryMigrations.migrations.map((_, index) => index + 1));
-  expect(primaryMigrations.migrations.slice(-3).map(migration => migration.name))
-    .toEqual([
+  expect(primaryMigrations.migrations.map(migration => migration.name)).toEqual(
+    expect.arrayContaining([
       '0008_pending_object_reconciliation.sql',
       '0009_owner_scoped_analytics.sql',
       '0010_v1_analytical_side_effects.sql',
-    ]);
+      '0011_retained_telemetry.sql',
+      '0012_provider_preparation.sql',
+      '0013_postgres_runtime_guards.sql',
+      '0014_effective_source_revision.sql',
+    ]),
+  );
+  expect(primaryMigrations.migrations.find((migration) => migration.name === '0008_pending_object_reconciliation.sql').version)
+    .toBeLessThan(primaryMigrations.migrations.find((migration) => migration.name === '0009_owner_scoped_analytics.sql').version);
+  expect(primaryMigrations.migrations.find((migration) => migration.name === '0009_owner_scoped_analytics.sql').version)
+    .toBeLessThan(primaryMigrations.migrations.find((migration) => migration.name === '0010_v1_analytical_side_effects.sql').version);
   expect(ledgerMigrations.applied).toBe(ledgerMigrations.migrations.length);
   expect(ledgerMigrations.migrations.map(migration => migration.version))
     .toEqual(ledgerMigrations.migrations.map((_, index) => index + 1));
+  expect(ledgerMigrations.migrations.map(migration => migration.name)).toEqual([
+    '0001_schema_metadata.sql',
+    '0002_tombstones_cooldowns.sql',
+    '0003_erasure_restore_receipts.sql',
+    '0004_storage_erasure_jobs.sql',
+  ]);
   backend = createExperimentalPostgresTelemetryV1Backend(pool, {
     primarySchema: schema,
     ledgerSchema,
@@ -286,6 +301,18 @@ it.each([
 ])('refuses %s without any partial state',async(_label,sql,code)=> {
   const value=await grant(await input()); await pool.query(sql); const before=await snapshot();
   await expect(store.insert(value)).rejects.toMatchObject({code}); expect(await snapshot()).toEqual(before);
+});
+it('rejects a raised device transport floor before any v1 side effect', async () => {
+  const value = await grant(await input());
+  await pool.query(`INSERT INTO ${schema}.telemetry_transport_device_floors
+    (participant_id,device_id,minimum_rank,revision,changed_at)
+    VALUES($1,$2,11,1,clock_timestamp())
+    ON CONFLICT(participant_id,device_id) DO UPDATE
+      SET minimum_rank=11,revision=${schema}.telemetry_transport_device_floors.revision+1,
+          changed_at=clock_timestamp()`, [pid, did]);
+  const before = await snapshot();
+  await expect(store.insert(value)).rejects.toMatchObject({code:'TELEMETRY_TRANSPORT_BLOCKED'});
+  expect(await snapshot()).toEqual(before);
 });
 it.each([1999,19999])('does not overshoot the admission budget under concurrent clients at %s',async prior=> {
   if(prior===19999) await pool.query(`UPDATE ${schema}.device_credentials SET issued_at=clock_timestamp()`);

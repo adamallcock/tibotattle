@@ -30,6 +30,22 @@ import {
   type SessionMaterial,
 } from "./session";
 import type { SyntheticContribution, SyntheticEnvelope } from "./validation";
+import type {
+  AuthorityEnrollmentBootstrap,
+  TelemetryAuthorityBackend,
+} from "./telemetry-authority-backend";
+
+export type EnrollmentSource = D1Database | TelemetryAuthorityBackend;
+
+function enrollmentAuthority(source: EnrollmentSource): TelemetryAuthorityBackend | null {
+  return typeof (source as Partial<TelemetryAuthorityBackend>).identity?.insertParticipant === "function"
+    ? source as TelemetryAuthorityBackend
+    : null;
+}
+
+function isEnrollmentAuthority(source: EnrollmentSource): source is TelemetryAuthorityBackend {
+  return enrollmentAuthority(source) !== null;
+}
 
 export interface Participant {
   id: string;
@@ -140,6 +156,11 @@ export interface EnrollmentOptions {
    * member.
    */
   openCommunityEligibility?: boolean;
+  /**
+   * Optional host-owned bootstrap rows. PostgreSQL adapters apply these rows
+   * in the same authority transaction as the identity/session/pairing write.
+   */
+  authorityBootstrap?: AuthorityEnrollmentBootstrap;
 }
 
 function capability(prefix: "um_recovery"): {
@@ -186,7 +207,7 @@ function returnedTargetId(result: D1Result<unknown> | undefined, expectedId: str
 }
 
 export async function enroll(
-  db: D1Database,
+  db: EnrollmentSource,
   consentVersion: string,
   inviteGrant: ParsedInviteGrant | null = null,
   options: EnrollmentOptions = {},
@@ -210,6 +231,48 @@ export async function enroll(
     hashCapability("access", legacyAccessId, legacyAccessSecret),
     hashCapability("recovery", recovery.id, recovery.secret),
   ]);
+  if (isEnrollmentAuthority(db)) {
+    const authority = db;
+    if (inviteGrant !== null || options.openCommunityEligibility || !authority.enrollment) {
+      throw new ApiError(400, "INVITE_GRANT_INVALID");
+    }
+    const participant = await authority.enrollment.enroll({
+      participant: {
+        id: participantId,
+        accessTokenId: legacyAccessId,
+        accessTokenHash: legacyAccessHash,
+        recoveryTokenId: recovery.id,
+        recoveryTokenHash: recoveryHash,
+        consentVersion,
+        createdAt: now,
+        identityLinkKey: options.identityLinkKey ?? null,
+        identityCooldownDigest: options.identityCooldownDigest ?? null,
+      },
+      session: {
+        id: session.id,
+        participantId,
+        secretHash: session.secretHash,
+        csrfHash: session.csrfHash,
+        scope: session.scope,
+        issuedAt: session.issuedAt,
+        expiresAt: session.expiresAt,
+      },
+      pairing: pairing ? { ...pairing, consentVersion } : null,
+      bootstrap: options.authorityBootstrap,
+    });
+    return {
+      participantId: participant.id,
+      recoveryCode: recovery.encoded,
+      csrfToken: session.csrfToken,
+      session,
+      pairing,
+      invitation: {
+        state: "not_required",
+        redeemedAt: null,
+        expiresAt: null,
+      },
+    };
+  }
   const participantInsert = db.prepare(
     `INSERT INTO participants (
       id, access_token_id, access_token_hash, recovery_token_id,
@@ -352,11 +415,53 @@ export async function enroll(
  * in progress so a deleting identity cannot silently resurrect.
  */
 export async function reattachParticipantByLinkKey(
-  db: D1Database,
+  db: EnrollmentSource,
   identityLinkKey: string,
   consentVersion: string,
   options: EnrollmentOptions = {},
 ): Promise<Enrollment | null> {
+  if (isEnrollmentAuthority(db)) {
+    const authority = db;
+    if (!authority.enrollment) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+    const row = await authority.identity.readByLinkKey(identityLinkKey);
+    if (!row) return null;
+    if (row.state !== "active") throw new ApiError(409, "PARTICIPANT_DELETING");
+    const nowEpoch = options.nowEpoch ?? Date.now();
+    const now = new Date(nowEpoch).toISOString();
+    const recovery = capability("um_recovery");
+    const recoveryHash = await hashCapability("recovery", recovery.id, recovery.secret);
+    const session = await createSessionMaterial(row.id, nowEpoch);
+    const pairing = options.deviceBootstrap
+      ? await createDevicePairingMaterial(row.id, session.id, consentVersion, nowEpoch)
+      : null;
+    const reattached = await authority.enrollment.reattach({
+      participantId: row.id,
+      identityLinkKey,
+      recoveryTokenId: recovery.id,
+      recoveryTokenHash: recoveryHash,
+      now,
+      session: {
+        id: session.id,
+        participantId: row.id,
+        secretHash: session.secretHash,
+        csrfHash: session.csrfHash,
+        scope: session.scope,
+        issuedAt: session.issuedAt,
+        expiresAt: session.expiresAt,
+      },
+      pairing: pairing ? { ...pairing, consentVersion } : null,
+      bootstrap: options.authorityBootstrap,
+    });
+    if (!reattached) throw new ApiError(409, "PARTICIPANT_DELETING");
+    return {
+      participantId: row.id,
+      recoveryCode: recovery.encoded,
+      csrfToken: session.csrfToken,
+      session,
+      pairing,
+      invitation: { state: "not_required", redeemedAt: null, expiresAt: null },
+    };
+  }
   const row = await db.prepare(
     `SELECT id, state FROM participants WHERE identity_link_key = ?`,
   ).bind(identityLinkKey).first<{ id: string; state: string }>();
@@ -400,9 +505,10 @@ export async function reattachParticipantByLinkKey(
  * or raw identity material is returned.
  */
 export async function participantIdentityLinkState(
-  db: D1Database,
+  db: EnrollmentSource,
   identityLinkKey: string,
 ): Promise<{ id: string; state: "active" | "deleting" } | null> {
+  if (isEnrollmentAuthority(db)) return db.identity.readByLinkKey(identityLinkKey);
   const row = await db.prepare(
     `SELECT id, state
        FROM participants
