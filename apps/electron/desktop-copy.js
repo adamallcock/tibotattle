@@ -212,15 +212,35 @@ const DESKTOP_OVERLAY_MESSAGES = Object.freeze({
     "zh-Hans": "完成",
     "es": "Listo",
   }),
+  "electron.diagnostics.enableCapture": Object.freeze({
+    "en-US": "Enable local crash capture next launch",
+    "zh-Hans": "下次启动时启用本地崩溃捕获",
+    "es": "Activar captura local al reiniciar",
+  }),
+  "electron.diagnostics.disableCapture": Object.freeze({
+    "en-US": "Disable local crash capture next launch",
+    "zh-Hans": "下次启动时停用本地崩溃捕获",
+    "es": "Desactivar captura local al reiniciar",
+  }),
+  "electron.diagnostics.openCrashFolder": Object.freeze({
+    "en-US": "Open local crash reports",
+    "zh-Hans": "打开本地崩溃报告",
+    "es": "Abrir informes de fallos locales",
+  }),
+  "electron.diagnostics.prepareSupportIssue": Object.freeze({
+    "en-US": "Prepare public GitHub issue…",
+    "zh-Hans": "准备公开的 GitHub 问题…",
+    "es": "Preparar incidencia pública en GitHub…",
+  }),
   "electron.diagnostics.message": Object.freeze({
-    "en-US": "Content-free diagnostics",
-    "zh-Hans": "不含内容的诊断信息",
-    "es": "Diagnósticos sin contenido",
+    "en-US": "Review this content-free report. Preparing a public issue sends it to GitHub in the URL; review the form before submitting. Local crash dumps may contain private data and are not uploaded by TiboTattle. Capture changes take effect after restart.",
+    "zh-Hans": "请查看这份不含内容的报告。准备公开问题会通过网址将报告发送给 GitHub；提交前请检查表单。本地崩溃转储可能包含私密数据，TiboTattle 不会上传它们。捕获设置会在重启后生效。",
+    "es": "Revisa este informe sin contenido. Preparar una incidencia pública lo envía a GitHub en la URL; revisa el formulario antes de publicarlo. Los volcados locales pueden contener datos privados y TiboTattle no los sube. Los cambios de captura se aplican tras reiniciar.",
   }),
   "electron.diagnostics.title": Object.freeze({
-    "en-US": "TiboTattle diagnostics",
-    "zh-Hans": "TiboTattle 诊断信息",
-    "es": "Diagnósticos de TiboTattle",
+    "en-US": "TiboTattle doctor",
+    "zh-Hans": "TiboTattle 诊断工具",
+    "es": "Diagnóstico de TiboTattle",
   }),
   "electron.firstRun.checkbox.startAtLogin": Object.freeze({
     "en-US": "Start TiboTattle at login (you can change this later in Settings)",
