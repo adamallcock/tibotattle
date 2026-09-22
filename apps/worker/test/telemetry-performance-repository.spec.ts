@@ -17,9 +17,14 @@ import {
   ACCOUNTLESS_TELEMETRY_PERFORMANCE_AUTHORIZATION_BASIS,
   ACCOUNTLESS_TELEMETRY_PERFORMANCE_POLICY_VERSION,
   ACCOUNTLESS_TELEMETRY_PERFORMANCE_SCHEMA_VERSION,
+  assertTelemetryPerformanceWriteAllowed,
   grantTelemetryPerformanceAccountlessAuthorization,
   grantTelemetryPerformanceSocialAuthorization,
 } from "../src/telemetry-performance-policy";
+import {
+  ACCOUNTLESS_RENEWAL_SCHEMA_VERSION,
+  renewAccountlessUploadOwner,
+} from "../src/accountless-renewal";
 import { requireTelemetryPerformanceStorageMode } from "../src/telemetry-storage-mode";
 import { createV11DeviceFixture } from "./helpers/telemetry-v11";
 
@@ -128,6 +133,13 @@ function rejectPerformanceDetailReads(database: D1Database): D1Database {
   }) as D1Database;
 }
 
+const ACCOUNTLESS_RENEWAL_REQUEST = {
+  schemaVersion: ACCOUNTLESS_RENEWAL_SCHEMA_VERSION,
+  policyVersion: "accountless-opt-out-v1" as const,
+  authorizationBasis: "accountless-policy-v1" as const,
+  telemetrySchemaVersion: "telemetry-contribution-v1.1" as const,
+} as const;
+
 function mutateBeforePerformanceDetailBatch(
   database: D1Database,
   mutation: () => Promise<void>,
@@ -208,7 +220,7 @@ async function createAccountlessPerformanceFixture() {
     "SELECT participant_id FROM accountless_upload_owners WHERE enrollment_device_id = ?",
   ).bind(deviceId).first<{ participant_id: string }>();
   if (!owner) throw new Error("missing synthetic accountless performance owner");
-  return { participantId: owner.participant_id, deviceId };
+  return { participantId: owner.participant_id, deviceId, authorization };
 }
 
 describe("independent performance report repository", () => {
@@ -455,6 +467,120 @@ describe("independent performance report repository", () => {
     await expect(admitTelemetryPerformanceReport(
       db(), fixture, await report(), capability.authorization, "c".repeat(64), NOW,
     )).resolves.toMatchObject({ status: "accepted" });
+  });
+
+  it("rotates an expired social capability only after the device authority is renewed", async () => {
+    const fixture = await createV11DeviceFixture(db());
+    const baseNow = fixture.nowEpoch;
+    await db().prepare("UPDATE telemetry_performance_runtime SET state='active' WHERE id=1").run();
+    const initialDevice = await db().prepare(
+      "SELECT expires_at FROM device_credentials WHERE id=?",
+    ).bind(fixture.deviceId).first<{ expires_at: string }>();
+    if (!initialDevice) throw new Error("missing social performance device");
+    const initial = await grantTelemetryPerformanceSocialAuthorization(db(), fixture, {
+      schemaVersion: "model-performance-daily-v1",
+      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-21.1",
+      privacyContractVersion: "privacy-safe-model-performance-v1",
+      scope: "model-performance-daily",
+    }, baseNow);
+    const renewedExpiry = new Date(Date.parse(initialDevice.expires_at) + 60_000).toISOString();
+    await db().prepare("UPDATE device_credentials SET expires_at=? WHERE id=?")
+      .bind(renewedExpiry, fixture.deviceId).run();
+    const renewalNow = Date.parse(initialDevice.expires_at) + 1_000;
+    const renewed = await grantTelemetryPerformanceSocialAuthorization(db(), fixture, {
+      schemaVersion: "model-performance-daily-v1",
+      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-21.1",
+      privacyContractVersion: "privacy-safe-model-performance-v1",
+      scope: "model-performance-daily",
+    }, renewalNow);
+    expect(renewed.authorization).toMatchObject({
+      capabilityRevision: 2,
+      authorityEpoch: 1,
+      expiresAt: renewedExpiry,
+    });
+    await expect(assertTelemetryPerformanceWriteAllowed(
+      db(), fixture, initial.authorization, renewalNow,
+    )).rejects.toMatchObject({ code: "TELEMETRY_TRANSPORT_BLOCKED" });
+    await expect(db().prepare(
+      "UPDATE telemetry_performance_device_capabilities SET expires_at=? WHERE participant_id=? AND device_id=? AND capability_revision=1",
+    ).bind(renewedExpiry, fixture.participantId, fixture.deviceId).run())
+      .rejects.toThrow(/telemetry_performance_capability_immutable/u);
+    const history = await db().prepare(
+      "SELECT capability_revision, authority_epoch, expires_at FROM telemetry_performance_device_capabilities WHERE participant_id=? AND device_id=? ORDER BY capability_revision",
+    ).bind(fixture.participantId, fixture.deviceId).all();
+    expect(history.results).toEqual([
+      { capability_revision: 1, authority_epoch: 1, expires_at: initialDevice.expires_at },
+      { capability_revision: 2, authority_epoch: 1, expires_at: renewedExpiry },
+    ]);
+  });
+
+  it("increments the authority epoch after revocation and rejects the old authorization", async () => {
+    const fixture = await createV11DeviceFixture(db());
+    const baseNow = fixture.nowEpoch;
+    await db().prepare("UPDATE telemetry_performance_runtime SET state='active' WHERE id=1").run();
+    const initial = await grantTelemetryPerformanceSocialAuthorization(db(), fixture, {
+      schemaVersion: "model-performance-daily-v1",
+      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-21.1",
+      privacyContractVersion: "privacy-safe-model-performance-v1",
+      scope: "model-performance-daily",
+    }, baseNow);
+    const revokedAt = new Date(baseNow + 1_000).toISOString();
+    await db().prepare(`UPDATE telemetry_performance_device_capabilities
+      SET state='revoked', revoked_at=?
+       WHERE participant_id=? AND device_id=? AND capability_revision=1`)
+      .bind(revokedAt, fixture.participantId, fixture.deviceId).run();
+    const renewed = await grantTelemetryPerformanceSocialAuthorization(db(), fixture, {
+      schemaVersion: "model-performance-daily-v1",
+      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-21.1",
+      privacyContractVersion: "privacy-safe-model-performance-v1",
+      scope: "model-performance-daily",
+    }, baseNow + 2_000);
+    expect(renewed.authorization).toMatchObject({ capabilityRevision: 2, authorityEpoch: 2 });
+    await expect(assertTelemetryPerformanceWriteAllowed(
+      db(), fixture, initial.authorization, baseNow + 2_000,
+    )).rejects.toMatchObject({ code: "TELEMETRY_TRANSPORT_BLOCKED" });
+    await expect(db().prepare(
+      "UPDATE telemetry_performance_device_capabilities SET expires_at=? WHERE participant_id=? AND device_id=? AND capability_revision=1",
+    ).bind(new Date(baseNow + 3_000).toISOString(), fixture.participantId, fixture.deviceId).run())
+      .rejects.toThrow(/telemetry_performance_capability_immutable/u);
+  });
+
+  it("rotates the accountless performance grant after the owner lease renewal", async () => {
+    const fixture = await createAccountlessPerformanceFixture();
+    await db().prepare("UPDATE telemetry_performance_runtime SET state='active' WHERE id=1").run();
+    await grantTelemetryPerformanceAccountlessAuthorization(db(), fixture, {
+      schemaVersion: ACCOUNTLESS_TELEMETRY_PERFORMANCE_SCHEMA_VERSION,
+      policyVersion: ACCOUNTLESS_TELEMETRY_PERFORMANCE_POLICY_VERSION,
+      authorizationBasis: ACCOUNTLESS_TELEMETRY_PERFORMANCE_AUTHORIZATION_BASIS,
+    }, NOW);
+    const initial = await db().prepare(`SELECT expires_at FROM
+      accountless_telemetry_performance_authorizations
+      WHERE participant_id=? AND device_credential_id=? ORDER BY capability_revision LIMIT 1`)
+      .bind(fixture.participantId, fixture.deviceId).first<{ expires_at: string }>();
+    if (!initial) throw new Error("missing accountless performance authorization");
+    const renewalNow = Date.parse(initial.expires_at) + 1_000;
+    await expect(renewAccountlessUploadOwner(
+      db(), fixture.authorization, ACCOUNTLESS_RENEWAL_REQUEST, renewalNow,
+    )).resolves.toMatchObject({ state: "renewed" });
+    await grantTelemetryPerformanceAccountlessAuthorization(db(), fixture, {
+      schemaVersion: ACCOUNTLESS_TELEMETRY_PERFORMANCE_SCHEMA_VERSION,
+      policyVersion: ACCOUNTLESS_TELEMETRY_PERFORMANCE_POLICY_VERSION,
+      authorizationBasis: ACCOUNTLESS_TELEMETRY_PERFORMANCE_AUTHORIZATION_BASIS,
+    }, renewalNow);
+    const rows = await db().prepare(`SELECT capability_revision, authority_epoch,
+      state, expires_at FROM accountless_telemetry_performance_authorizations
+      WHERE participant_id=? AND device_credential_id=? ORDER BY capability_revision`)
+      .bind(fixture.participantId, fixture.deviceId).all();
+    expect(rows.results).toHaveLength(2);
+    expect(rows.results[0]).toMatchObject({ capability_revision: 1, authority_epoch: 1, state: "active", expires_at: initial.expires_at });
+    expect(rows.results[1]).toMatchObject({ capability_revision: 2, authority_epoch: 1, state: "active" });
+    expect(rows.results[1]).not.toMatchObject({ expires_at: initial.expires_at });
+    const capabilities = await db().prepare(`SELECT capability_revision, authority_epoch,
+      expires_at FROM telemetry_performance_device_capabilities
+      WHERE participant_id=? AND device_id=? ORDER BY capability_revision`)
+      .bind(fixture.participantId, fixture.deviceId).all();
+    expect(capabilities.results).toHaveLength(2);
+    expect(capabilities.results[1]).toMatchObject({ capability_revision: 2, authority_epoch: 1 });
   });
 
   it("keeps a normal 31-day small-report range readable", async () => {
