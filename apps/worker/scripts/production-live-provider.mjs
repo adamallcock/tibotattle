@@ -30,7 +30,9 @@ export function createProductionLiveProvider({
   let requests = 0;
   const evidence = [];
   const get = async (path, { firstPageOnly = false, query = null } = {}) => {
-    if (++requests > 64) fail('READ_BUDGET');
+    // A coordinated typed deployment uses 66 reads including the final
+    // configuration capture after schema qualification. Keep a fixed ceiling.
+    if (++requests > 80) fail('READ_BUDGET');
     let response;
     let bytes;
     try {
