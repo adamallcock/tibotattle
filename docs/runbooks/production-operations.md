@@ -510,6 +510,36 @@ data or authorize a different cross-format join.
 
 ### Guarded deployment wrapper
 
+The routine wrapper below assumes the checked-in JSON database layout. If live
+production uses typed storage, a different primary database, or a separate
+`ANALYTICS_DB`, do not run that wrapper against the legacy configuration.
+Reconcile the live configuration and typed schema first. This is a source/config
+compatibility boundary; a migration confirmation cannot repair a binding mismatch.
+
+The read-only reconciliation command accepts an owner-private Cloudflare
+inventory containing account/Worker identity, active version, settings,
+schedules, ingress, domains, and Durable Object namespace metadata. Pin the
+inventory bytes and the observed deployed source. Supply an existing
+`CLOUDFLARE_API_TOKEN` through the approved credential mechanism; the command
+does not discover credentials, log tokens, or obtain broader permissions.
+
+```bash
+npm run production:reconcile -- \
+  --inventory <private-inventory.json> \
+  --inventory-sha256 <reviewed-inventory-sha256> \
+  --expected-previous-source <reviewed-full-deployed-source-sha> \
+  --output-directory <new-private-output-directory>
+```
+
+It re-reads production before and after its fixed schema/contract SELECTs,
+derives expected schemas from local canonical migrations, and writes a private
+candidate configuration plus a sanitized report. It never deploys or applies
+remote migrations. Dirty source or a schema mismatch remains blocked. Even a
+`compatible` result is inspection evidence: the typed configuration still needs
+integration with the immutable snapshot, coordination, owning-surface and
+post-deployment gates. Do not pass the generated configuration to raw Wrangler
+as a shortcut. Keep database identifiers and plain-variable values private.
+
 Only after explicit authorization and green preflight, use the wrapper from
 `apps/worker`:
 
