@@ -8,7 +8,7 @@ status: in-progress
 # Telemetry v1.2 implementation and compatibility plan
 
 Implementation is on `codex/telemetry-v12-integration`. The current local
-candidate incorporates `origin/main` through `d7849e8f` (PR #198) and retains
+candidate incorporates `origin/main` through `e70cff4d` (PR #200) and retains
 the earlier `6d061b57` snapshot (through PR #194), staging asset repair, and
 the mixed-client regression. The original foundation remains at
 `fb778d17` in `codex/telemetry-v12-foundation`; the dirty local main checkout is
@@ -72,8 +72,18 @@ and process-owner tests pass outside the sandbox, confirming the earlier RSS/
 process failures were environment restrictions. Neither guard nor protected
 receipt has been weakened or regenerated.
 
-Public health on 2026-09-21 reported production source `0fb6a5e6` and an
-operational collection state. That observation does not reveal the live D1
+The subsequent guarded-deployment integration at clean commit `832130aa`
+passes 42 production reconciliation/schema checks, 44 deployment checks, and
+the complete Worker gate: 1,925 tests across 152 files, asset staging, and
+production/staging Wrangler dry runs. The production preflight now derives the
+valid correction-bearing typed-evidence restore schema from its maintained
+source transform, while still refusing forged schema digests. The deployment
+API rejects contradictory predecessor pins before any snapshot or Wrangler
+call. This integration does not activate v1.2 or apply a remote migration.
+
+Public health on 2026-09-22 still reported production source `0fb6a5e6`,
+operational collection controls, and accepted contribution v0.1. That
+observation does not reveal the live D1
 schema. The read-only production reconciliation requires a reviewed private
 resource inventory and credential, which are not present in this workspace.
 Installed-client qualification, live schema compatibility, protected R7/native
