@@ -142,6 +142,7 @@ test("qualification selection is the exact reviewed Windows test set", async () 
     "test/windows-qualification-governance.test.js",
     "test/windows-skip-ledger.test.js",
     "test/windows-test-manifest.test.js",
+    "test/windows-work-usage-native.test.js",
   ]);
   assert.deepEqual(selected.accountlessCredentialFiles, [
     "test/windows-accountless-installation-credential-native.test.js",
@@ -337,4 +338,9 @@ test("qualification TAP failure diagnostics retain only bounded structural index
     }),
     "file_index=unavailable test_ordinal=unavailable source_line=unavailable failure_type=unavailable error_name=unavailable",
   );
+});
+
+test("native qualification includes Windows work metadata regression coverage", async () => {
+  const selected = await qualificationTestFiles({ platform: "win32", architecture: "x64" });
+  assert.ok(selected.files.includes("test/windows-work-usage-native.test.js"));
 });

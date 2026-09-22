@@ -147,6 +147,7 @@ test('signature proof requires OS trust, publisher and timestamp without raw cer
 
 const proofKeys = ['packageArtifactVerified', 'packagedElectronExecutionVerified',
   'syntheticFixtureIngestionVerified', 'syntheticFixtureTotalsRetainedAcrossRestart',
+  'projectsAndThreadsRetainedAcrossRestart',
   'settingsPersistedAcrossRestart', 'durableContributionOptOutRetained', 'loopbackJourneyVerified',
   'outboundFirewallRuleRemoved', 'ownedProfileRemoved'];
 const valid = () => ({ status: 'passed', sourceRevision: revision, target: 'win32-x64',
@@ -156,7 +157,9 @@ const valid = () => ({ status: 'passed', sourceRevision: revision, target: 'win3
 test('installed proof refuses incomplete native journey and unbound source receipts', () => {
   assert.equal(validateSignedInstalledNormalReceipt(valid(), revision).status, 'passed');
   for (const key of proofKeys) {
-    assert.throws(() => validateSignedInstalledNormalReceipt({ ...valid(), [key]: false }, revision), /NORMAL_JOURNEY_UNPROVEN/u);
+    for (const missing of [false, undefined]) {
+      assert.throws(() => validateSignedInstalledNormalReceipt({ ...valid(), [key]: missing }, revision), /NORMAL_JOURNEY_UNPROVEN/u);
+    }
   }
   for (const patch of [{ sourceRevision: 'd'.repeat(40) }, { status: 'failed' },
     { target: 'linux-x64' }, { executableSha256: null }]) {

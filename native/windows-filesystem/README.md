@@ -220,3 +220,15 @@ group as its default owner. Fixture setup gives its isolated child process a
 current-user default owner before creating the source, so Windows assigns its
 ordinary inherited/default DACL at creation. Real Codex sources are never
 modified by this setup; the native reader still refuses a foreign owner.
+
+Projects & threads also uses these source leases for local display metadata.
+The main SQLite database and existing sidecars remain leased through connection
+close. With no sidecars, an immutable read avoids creating coordination files
+and rejects main-file or sidecar-presence changes. Live WAL reads require both
+existing WAL and SHM files; SQLite may update existing SHM coordination bytes,
+but the reader does not write database/WAL content or change journal mode or
+source permissions. A transient create/remove of an absent sidecar by a hostile
+same-owner process is outside the lease guarantee. Unsafe metadata retains the
+anonymous fallback. Native metadata tests and the packaged project/task journey
+are required in addition to model-performance qualification; see the
+[issue #208 plan](../../docs/plans/2026-09-22-windows-project-task-names.md).

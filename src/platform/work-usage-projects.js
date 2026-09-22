@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { basename, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { realpath, stat } from "node:fs/promises";
 const run = promisify(execFile);
 
@@ -25,6 +25,9 @@ export function createWorkUsageProjectResolver({
   digest,
   maximum = 10_000,
   repositoryOrigins = new Map(),
+  filesystem = { realpath, stat },
+  paths = { basename, dirname, isAbsolute, resolve },
+  runCommand = run,
 } = {}) {
   const cache = new Map();
   const originCache = new Map();
@@ -36,14 +39,14 @@ export function createWorkUsageProjectResolver({
     maxBuffer: 16_384,
     env: { ...environment, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
   };
-  const safeName = (path) => basename(path).replace(/[\u0000-\u001f\u007f]/gu, "").slice(0, 120) || null;
+  const safeName = (path) => paths.basename(path).replace(/[\u0000-\u001f\u007f]/gu, "").slice(0, 120) || null;
   const originIdentity = (origin) => ({
     project: digest("repository-origin", origin),
     projectName: safeName(decodeURIComponent(new URL(origin).pathname)),
   });
   return async function resolveProject(cwd) {
-    if (typeof cwd !== "string" || !isAbsolute(cwd) || /[\u0000-\u001f\u007f]/u.test(cwd)) return null;
-    const location = resolve(cwd);
+    if (typeof cwd !== "string" || !paths.isAbsolute(cwd) || /[\u0000-\u001f\u007f]/u.test(cwd)) return null;
+    const location = paths.resolve(cwd);
     if (cache.has(location)) return cache.get(location);
     if (cache.size >= maximum)
       throw Object.assign(new Error("work_usage_capacity_exceeded"), {
@@ -57,39 +60,47 @@ export function createWorkUsageProjectResolver({
         worktreeName: safeName(location),
         method: "non_project",
       };
+      const retainedProject = () => {
+        const origin = normalizeWorkUsageRepositoryOrigin(repositoryOrigins.get(location));
+        return origin ? { ...nonProject, ...originIdentity(origin), method: "retained_git_origin" } : nonProject;
+      };
       let actual;
       try {
-        actual = await realpath(location);
-        if (!(await stat(actual)).isDirectory()) return null;
+        actual = await filesystem.realpath(location);
+        if (!(await filesystem.stat(actual)).isDirectory()) return null;
       } catch (error) {
-        const retained = error.code === "ENOENT"
-          ? normalizeWorkUsageRepositoryOrigin(repositoryOrigins.get(location)) : null;
-        return retained ? { ...nonProject, ...originIdentity(retained), method: "retained_git_origin" } : nonProject;
+        return error.code === "ENOENT" ? retainedProject() : nonProject;
       }
       try {
-        const { stdout } = await run("git", [
+        const { stdout } = await runCommand("git", [
           "-C", actual, "rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel",
         ], gitOptions);
-        const lines = stdout.trim().split("\n");
-        if (lines.length !== 2 || !lines.every(isAbsolute)) return nonProject;
-        const common = await realpath(lines[0]);
-        const root = await realpath(lines[1]);
-        const info = await stat(common);
+        const lines = stdout.trim().split(/\r?\n/u);
+        if (lines.length !== 2 || !lines.every(paths.isAbsolute)) return nonProject;
+        const common = await filesystem.realpath(lines[0]);
+        const root = await filesystem.realpath(lines[1]);
+        const info = await filesystem.stat(common);
         if (!originCache.has(common)) {
-          originCache.set(common, run("git", ["-C", root, "config", "--get", "remote.origin.url"], gitOptions)
+          originCache.set(common, runCommand("git", ["-C", root, "config", "--get", "remote.origin.url"], gitOptions)
             .then(({ stdout: origin }) => normalizeWorkUsageRepositoryOrigin(origin.trim()), () => null));
         }
         const origin = await originCache.get(common);
         return {
           ...(origin ? originIdentity(origin) : {
             project: digest("repository", `${common}\0${info.dev}:${info.ino}:${info.birthtimeMs}`),
-            projectName: safeName(common.endsWith("/.git") ? common.slice(0, -5) : common),
+            projectName: safeName(paths.basename(common) === ".git" ? paths.dirname(common) : common),
           }),
           worktree: digest("workspace", root),
           worktreeName: safeName(root),
           method: "git_observation",
         };
-      } catch { return nonProject; }
+      } catch (error) {
+        // The desktop may run without Git on PATH. A saved Codex origin still
+        // describes the last observed repository, but a current Git rejection
+        // must not be overridden by that historical observation.
+        return error.code === "ENOENT" && error.syscall?.startsWith("spawn")
+          ? retainedProject() : nonProject;
+      }
     })();
     cache.set(location, pending);
     return pending;

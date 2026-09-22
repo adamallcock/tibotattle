@@ -175,7 +175,8 @@ export function validateSignedInstalledNormalReceipt(receipt, sourceRevision) {
       || receipt.target !== 'win32-x64' || !SHA256.test(receipt.artifactSha256 ?? '')
       || !SHA256.test(receipt.executableSha256 ?? '') || [
         'packageArtifactVerified', 'packagedElectronExecutionVerified', 'syntheticFixtureIngestionVerified',
-        'syntheticFixtureTotalsRetainedAcrossRestart', 'settingsPersistedAcrossRestart',
+        'syntheticFixtureTotalsRetainedAcrossRestart', 'projectsAndThreadsRetainedAcrossRestart',
+        'settingsPersistedAcrossRestart',
         'durableContributionOptOutRetained', 'loopbackJourneyVerified', 'outboundFirewallRuleRemoved',
         'ownedProfileRemoved',
       ].some((key) => receipt[key] !== true)) fail('NORMAL_JOURNEY_UNPROVEN');

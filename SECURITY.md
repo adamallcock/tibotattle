@@ -77,6 +77,13 @@ Directory basenames and thread display labels are transient metadata; paths,
 names and project handles are never written into the accounting index, exports,
 diagnostics, contributions or browser storage. Repository grouping describes
 last-observed local workspace mappings, not verified historical ownership.
+On Windows, transient metadata uses the approved native source reader's
+current-owner, single-link and reparse-point checks instead of Unix mode bits.
+Existing SQLite files are held through connection close; metadata never changes
+source permissions or journal mode. Missing or unsafe native access preserves
+anonymous fallback labels. A saved, unambiguous Codex repository origin may
+supply project grouping when Git is absent from the app's executable search
+path; a current Git rejection is not overridden by that historical observation.
 The new POST query route requires the local header and existing Origin/Host
 checks. Interactive reports are bounded process-local snapshots;
 publication/scope/filter identity and opaque cursors prevent mixing totals across

@@ -1,9 +1,9 @@
-import { constants } from "node:fs";
-import { lstat, open, realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { normalizeWorkUsageRepositoryOrigin } from "./work-usage-projects.js";
 import { readBoundedUtf8LineEntries } from "./bounded-jsonl-reader.js";
+import { createLocalCodexMetadataFilesystem, ownerControlledRegularFile } from "./local-codex-metadata-filesystem.js";
 
 const CODEX_THREAD_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -14,15 +14,6 @@ const CODEX_SELECTED_ROLLOUT_NAME = new RegExp(
     + "\\.jsonl(?:\\.zst)?$",
   "iu",
 );
-
-function ownerControlledRegularFile(stats) {
-  const currentUid = typeof process.getuid === "function" ? process.getuid() : null;
-  return stats.isFile()
-    && !stats.isSymbolicLink()
-    && stats.nlink === 1
-    && (currentUid === null || stats.uid === currentUid)
-    && (stats.mode & 0o022) === 0;
-}
 
 /**
  * Read Codex's selected rollout heads from an owner-controlled, non-writable-
@@ -101,23 +92,6 @@ function displayName(value, maximumLength = MAX_THREAD_DISPLAY_NAME_LENGTH) {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-function sameOwnerControlledFile(before, after) {
-  return ownerControlledRegularFile(after)
-    && before.dev === after.dev && before.ino === after.ino;
-}
-
-async function ownerControlledCodexHome(codexHome) {
-  if (typeof codexHome !== "string" || codexHome.length < 1) return false;
-  try {
-    const stats = await lstat(codexHome);
-    const uid = typeof process.getuid === "function" ? process.getuid() : null;
-    return stats.isDirectory() && !stats.isSymbolicLink()
-      && (uid === null || stats.uid === uid) && (stats.mode & 0o022) === 0;
-  } catch {
-    return false;
-  }
-}
-
 function parseThreadSource(value) {
   if (typeof value !== "string" || value.length > MAX_THREAD_SOURCE_LENGTH) return null;
   try {
@@ -171,17 +145,16 @@ function isCodexSessionPath(codexHome, rolloutPath) {
  * this relationship. It is never retained or exposed: this returns one UUID
  * only after both the selected thread and its source classification agree.
  */
-async function readAutoReviewParent(codexHome, rolloutPath, id) {
+async function readAutoReviewParent(codexHome, rolloutPath, id, filesystem) {
   if (typeof rolloutPath !== "string" || rolloutPath.length === 0
       || !isAbsolute(rolloutPath)) return null;
   let handle;
   try {
     const [home, path] = await Promise.all([realpath(codexHome), realpath(rolloutPath)]);
     if (!isCodexSessionPath(home, path)) return null;
-    const before = await lstat(path);
-    if (!ownerControlledRegularFile(before)) return null;
-    handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-    if (!sameOwnerControlledFile(before, await handle.stat())) return null;
+    const opened = await filesystem.openFile(path);
+    handle = opened.handle;
+    const before = opened.before;
     const bytes = Buffer.alloc(MAX_SESSION_METADATA_LINE_BYTES + 1);
     const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
     const newline = bytes.subarray(0, bytesRead).indexOf(0x0a);
@@ -194,9 +167,9 @@ async function readAutoReviewParent(codexHome, rolloutPath, id) {
       return null;
     }
     const after = await handle.stat();
-    return sameOwnerControlledFile(before, after)
+    return filesystem.same(before, after)
         && before.size === after.size && before.mtimeMs === after.mtimeMs
-        && sameOwnerControlledFile(before, await lstat(path))
+        && filesystem.same(before, await filesystem.namedStat(path, handle))
       ? parentId
       : null;
   } catch {
@@ -219,28 +192,61 @@ function boundedTextColumn(columns, name, maximumLength) {
     : `NULL AS ${name}`;
 }
 
-async function safeSqliteSidecars(databaseFile) {
-  for (const suffix of ["-wal", "-shm", "-journal"]) {
-    try {
-      if (!ownerControlledRegularFile(await lstat(`${databaseFile}${suffix}`))) {
-        return false;
-      }
-    } catch (error) {
-      if (error?.code !== "ENOENT") return false;
-    }
+
+function openMetadataDatabase(path, options) { return new DatabaseSync(path, options); }
+
+// A rare failed SQLite close must not let GC finalize its native source leases
+// while the connection is still live. Keep the pair until the next bounded
+// metadata attempt retries close; a repeated refusal prevents further DB opens.
+const pendingMetadataDatabaseCloses = new Set();
+const activeMetadataDatabaseSlots = new Set();
+const MAX_METADATA_DATABASE_CONNECTIONS = 64;
+
+function reserveMetadataDatabaseSlot() {
+  if (activeMetadataDatabaseSlots.size >= MAX_METADATA_DATABASE_CONNECTIONS) {
+    throw new Error("local_metadata_unavailable");
   }
-  return true;
+  const slot = {};
+  activeMetadataDatabaseSlots.add(slot);
+  return slot;
 }
 
-async function readSelectedThreadMetadata(codexHome, ids, { ancestryOnly = false, allowTitleFallback = false } = {}) {
+async function closeMetadataDatabase(database, guard, slot) {
+  try {
+    if (database?.isOpen) database.close();
+    if (database?.isOpen) throw new Error("local_metadata_unavailable");
+  } catch {
+    if (database?.isOpen) pendingMetadataDatabaseCloses.add({ database, guard, slot });
+    else {
+      try { await guard?.release(); } catch { /* Keep close errors content-free. */ }
+      activeMetadataDatabaseSlots.delete(slot);
+    }
+    throw new Error("local_metadata_unavailable");
+  }
+  try { await guard?.release(); }
+  catch { throw new Error("local_metadata_unavailable"); }
+  finally { activeMetadataDatabaseSlots.delete(slot); }
+}
+
+async function retryMetadataDatabaseCloses() {
+  for (const pending of pendingMetadataDatabaseCloses) {
+    pendingMetadataDatabaseCloses.delete(pending);
+    await closeMetadataDatabase(pending.database, pending.guard, pending.slot);
+  }
+}
+
+async function readSelectedThreadMetadata(codexHome, ids, { ancestryOnly = false, allowTitleFallback = false, filesystem, databaseFactory } = {}) {
   const databaseFile = join(codexHome, "state_5.sqlite");
   let database;
+  let guard;
+  let slot;
   try {
-    const before = await lstat(databaseFile);
-    if (!ownerControlledRegularFile(before)
-        || !await safeSqliteSidecars(databaseFile)) return new Map();
-    database = new DatabaseSync(databaseFile, { readOnly: true, timeout: 500 });
-    if (!sameOwnerControlledFile(before, await lstat(databaseFile))) return new Map();
+    await retryMetadataDatabaseCloses();
+    slot = reserveMetadataDatabaseSlot();
+    guard = await filesystem.guardDatabase(databaseFile);
+    if (!await guard.validate()) return new Map();
+    database = databaseFactory(guard.databasePath, { readOnly: true, timeout: 500 });
+    if (!await guard.validate()) return new Map();
     database.exec("BEGIN");
     if (database.prepare(
       "SELECT type FROM sqlite_master WHERE name = 'threads'",
@@ -282,7 +288,7 @@ async function readSelectedThreadMetadata(codexHome, ids, { ancestryOnly = false
       const verifiedAutoReview = threadStoreAutoReview && sourceAutoReview;
       const worker = autoReview ? null : workerMetadata(source, id);
       const parentId = verifiedAutoReview && !ancestryOnly
-        ? await readAutoReviewParent(codexHome, row.rollout_path, id)
+        ? await readAutoReviewParent(codexHome, row.rollout_path, id, filesystem)
         : worker?.parentId ?? null;
       if (parentId !== null) parentIds.add(parentId);
       result.set(id, {
@@ -309,27 +315,23 @@ async function readSelectedThreadMetadata(codexHome, ids, { ancestryOnly = false
         result.set(id, { name: selectedName(row), nickname: null, parentId, origin: null });
       }
     }
-    return sameOwnerControlledFile(before, await lstat(databaseFile))
-        && await safeSqliteSidecars(databaseFile)
-      ? result
-      : new Map();
+    return await guard.validate() ? result : new Map();
   } catch {
     // Local display metadata is optional. Never expose paths or SQLite errors.
     return new Map();
   } finally {
-    if (database?.isOpen) database.close();
+    await closeMetadataDatabase(database, guard, slot);
   }
 }
 
-async function readSelectedSessionIndexNames(codexHome, selectedIds) {
+async function readSelectedSessionIndexNames(codexHome, selectedIds, filesystem) {
   const file = join(codexHome, "session_index.jsonl");
   let handle;
   try {
-    const before = await lstat(file);
-    if (!ownerControlledRegularFile(before)
-        || before.size > MAX_SESSION_INDEX_BYTES) return new Map();
-    handle = await open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-    if (!sameOwnerControlledFile(before, await handle.stat())) return new Map();
+    const opened = await filesystem.openFile(file);
+    handle = opened.handle;
+    const before = opened.before;
+    if (before.size > MAX_SESSION_INDEX_BYTES) return new Map();
     const last = Buffer.alloc(1);
     if (before.size > 0) await handle.read(last, 0, 1, before.size - 1);
     const names = new Map();
@@ -368,9 +370,9 @@ async function readSelectedSessionIndexNames(codexHome, selectedIds) {
       }
     }
     const after = await handle.stat();
-    if (!sameOwnerControlledFile(before, after)
+    if (!filesystem.same(before, after)
         || before.size !== after.size || before.mtimeMs !== after.mtimeMs
-        || !sameOwnerControlledFile(before, await lstat(file))) return new Map();
+        || !filesystem.same(before, await filesystem.namedStat(file, handle))) return new Map();
     return new Map([...names].map(([id, value]) => [id, value.name]));
   } catch {
     return new Map();
@@ -392,7 +394,11 @@ export async function readCodexLocalThreadMetadata(codexHome, threadIds, {
   allowTitleFallback = false,
   forNameSearch = false,
   forCacheDropLinks = false,
+  platform = process.platform,
+  loadWindowsBinding,
+  databaseFactory = openMetadataDatabase,
 } = {}) {
+  const filesystem = createLocalCodexMetadataFilesystem({ platform, loadWindowsBinding });
   const maximumLookups = forNameSearch === true
     ? 25_000
     : forCacheDropLinks === true
@@ -400,16 +406,16 @@ export async function readCodexLocalThreadMetadata(codexHome, threadIds, {
       : MAX_LOCAL_THREAD_LOOKUPS;
   if (!Array.isArray(threadIds) || threadIds.length === 0
       || threadIds.length > maximumLookups
-      || !await ownerControlledCodexHome(codexHome)) return new Map();
+      || !await filesystem.validHome(codexHome)) return new Map();
   const ids = [...new Set(threadIds.map(threadId))];
   if (ids.includes(null)) return new Map();
-  const selected = await readSelectedThreadMetadata(codexHome, ids, { allowTitleFallback: allowTitleFallback === true });
+  const selected = await readSelectedThreadMetadata(codexHome, ids, { allowTitleFallback: allowTitleFallback === true, filesystem, databaseFactory });
   const nameIds = new Set(ids);
   for (const id of ids) {
     const parentId = selected.get(id)?.parentId;
     if (parentId) nameIds.add(parentId);
   }
-  const names = await readSelectedSessionIndexNames(codexHome, nameIds);
+  const names = await readSelectedSessionIndexNames(codexHome, nameIds, filesystem);
   return new Map(ids.map((id) => {
     const metadata = selected.get(id);
     const parentId = metadata?.parentId ?? null;
@@ -435,11 +441,14 @@ export async function readCodexLocalThreadMetadata(codexHome, threadIds, {
 }
 
 /** Read only explicit collaboration edges; no names or prompt-bearing titles. */
-export async function readCodexLocalThreadAncestry(codexHome, threadIds) {
-  if (!Array.isArray(threadIds) || threadIds.length > 25_000 || !await ownerControlledCodexHome(codexHome)) return new Map();
+export async function readCodexLocalThreadAncestry(codexHome, threadIds, {
+  platform = process.platform, loadWindowsBinding, databaseFactory = openMetadataDatabase,
+} = {}) {
+  const filesystem = createLocalCodexMetadataFilesystem({ platform, loadWindowsBinding });
+  if (!Array.isArray(threadIds) || threadIds.length > 25_000 || !await filesystem.validHome(codexHome)) return new Map();
   const ids = [...new Set(threadIds.map(threadId))];
   if (ids.includes(null)) return new Map();
-  const selected = await readSelectedThreadMetadata(codexHome, ids, { ancestryOnly: true });
+  const selected = await readSelectedThreadMetadata(codexHome, ids, { ancestryOnly: true, filesystem, databaseFactory });
   const roots = new Map();
   for (const id of ids) {
     let current = id;
@@ -457,16 +466,23 @@ export async function readCodexLocalThreadAncestry(codexHome, threadIds) {
 }
 
 
-/** Local-only repository hints for vanished working folders. Never reads titles. */
-export async function readCodexLocalRepositoryOrigins(codexHome) {
-  if (!await ownerControlledCodexHome(codexHome)) return new Map();
+/** Local-only repository hints for vanished folders or unavailable Git. Never reads titles. */
+export async function readCodexLocalRepositoryOrigins(codexHome, {
+  platform = process.platform, loadWindowsBinding, databaseFactory = openMetadataDatabase,
+} = {}) {
+  const filesystem = createLocalCodexMetadataFilesystem({ platform, loadWindowsBinding });
+  if (!await filesystem.validHome(codexHome)) return new Map();
   const databaseFile = join(codexHome, "state_5.sqlite");
   let database;
+  let guard;
+  let slot;
   try {
-    const before = await lstat(databaseFile);
-    if (!ownerControlledRegularFile(before) || !await safeSqliteSidecars(databaseFile)) return new Map();
-    database = new DatabaseSync(databaseFile, { readOnly: true, timeout: 500 });
-    if (!sameOwnerControlledFile(before, await lstat(databaseFile))) return new Map();
+    await retryMetadataDatabaseCloses();
+    slot = reserveMetadataDatabaseSlot();
+    guard = await filesystem.guardDatabase(databaseFile);
+    if (!await guard.validate()) return new Map();
+    database = databaseFactory(guard.databasePath, { readOnly: true, timeout: 500 });
+    if (!await guard.validate()) return new Map();
     database.exec("BEGIN");
     if (database.prepare("SELECT type FROM sqlite_master WHERE name = 'threads'").get()?.type !== "table") return new Map();
     const columns = new Set(database.prepare("PRAGMA table_info(threads)").all().map(row => row.name));
@@ -485,8 +501,7 @@ export async function readCodexLocalRepositoryOrigins(codexHome) {
       if (!result.has(cwd)) result.set(cwd, origin);
       else if (result.get(cwd) !== origin) result.set(cwd, null);
     }
-    return sameOwnerControlledFile(before, await lstat(databaseFile)) && await safeSqliteSidecars(databaseFile)
-      ? result : new Map();
+    return await guard.validate() ? result : new Map();
   } catch { return new Map(); }
-  finally { if (database?.isOpen) database.close(); }
+  finally { await closeMetadataDatabase(database, guard, slot); }
 }
