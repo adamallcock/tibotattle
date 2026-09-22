@@ -545,6 +545,44 @@ export interface V1AcquiredQuotaEvidence {
   acquisition: V1CompletedQuotaAcquisition;
 }
 
+/**
+ * Authority supplied to the shared acquired-evidence finisher.  The legacy
+ * D1 path fills this from V1SourcePin; provider compositions fill it from the
+ * canonical source window and keep the complete window fingerprint separate
+ * from the first-day fingerprint used by the acquisition work identity.
+ *
+ * This is deliberately an operation-level contract.  A copied pin or a
+ * prepared payload is not authority until isCurrent() rechecks the canonical
+ * producer state at both sides of the calculation.
+ */
+interface V1AnalysisSourceAuthority {
+  readonly identityFingerprint: string;
+  readonly preparedFingerprint: string;
+  readonly resultFingerprint: string;
+  readonly sourceMethodVersion?: string;
+  readonly winnersJson: string;
+  readonly winnerCount: number;
+  readonly isCurrent: () => Promise<boolean>;
+}
+
+function d1AnalysisSourceAuthority(db: D1Database, sourcePin: V1SourcePin): V1AnalysisSourceAuthority {
+  return {
+    identityFingerprint: sourcePin.fingerprint,
+    preparedFingerprint: sourcePin.fingerprint,
+    resultFingerprint: sourcePin.fingerprint,
+    winnersJson: sourcePin.winnersJson,
+    winnerCount: sourcePin.winners.length,
+    isCurrent: async () => {
+      await assertV1SourcePinCurrent(db, sourcePin);
+      return true;
+    },
+  };
+}
+
+async function assertAnalysisSourceCurrent(authority: V1AnalysisSourceAuthority): Promise<void> {
+  if (!await authority.isCurrent()) throw new Error("v1 analysis source stale");
+}
+
 /** The whole non-resumable usage/fit phase must fit the SAME invocation budget.
  * This is a conservative reservation, not a report of queries actually used.
  * With a supplied pin: 1 successor check + 2 initial source checks + at most
@@ -612,10 +650,20 @@ async function validateAcquiredQuotaEvidence(
   sourcePin: V1SourcePin, observedAtCutoff: string, resetsAtCutoff: string, maxQuotaRows: number,
   history?: ModelHistoryWindow,
 ): Promise<{ attributionIndex: PlanAttributionIndex; results: DownsampledQuotaRow[] }> {
+  return validateAcquiredQuotaEvidenceForAuthority(participantId, evidence,
+    d1AnalysisSourceAuthority(db, sourcePin), observedAtCutoff, resetsAtCutoff, maxQuotaRows, history);
+}
+
+async function validateAcquiredQuotaEvidenceForAuthority(
+  participantId: string, evidence: V1AcquiredQuotaEvidence, authority: V1AnalysisSourceAuthority,
+  observedAtCutoff: string, resetsAtCutoff: string, maxQuotaRows: number,
+  history?: ModelHistoryWindow,
+): Promise<{ attributionIndex: PlanAttributionIndex; results: DownsampledQuotaRow[] }> {
   const identity = evidence.identity;
   if (!identity || identity.participantId !== participantId
-      || identity.inputFingerprint !== sourcePin.fingerprint
-      || identity.sourceMethodVersion !== (history ? MODEL_HISTORY_METHOD_VERSION : V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION)
+      || identity.inputFingerprint !== authority.identityFingerprint
+      || identity.sourceMethodVersion !== (authority.sourceMethodVersion
+        ?? (history ? MODEL_HISTORY_METHOD_VERSION : V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION))
       || identity.observedAtCutoff !== observedAtCutoff || identity.resetsAtCutoff !== resetsAtCutoff
       || identity.windowMinutes !== SEVEN_DAY_WINDOW_MINUTES || identity.maxQuotaRows !== maxQuotaRows
       || !validateV1CompletedQuotaAcquisition(evidence.acquisition)
@@ -631,7 +679,7 @@ async function validateAcquiredQuotaEvidence(
   }
   // Check before doing expensive fitting, not only after it. A stored payload
   // with a valid shape is never proof that its source is still current.
-  await assertV1SourcePinCurrent(db, sourcePin);
+  await assertAnalysisSourceCurrent(authority);
   return { attributionIndex: buildPlanAttributionIndex(evidence.acquisition.planAnchors),
     results: evidence.acquisition.quotaRows };
 }
@@ -691,6 +739,74 @@ export async function finishAccountScopedAnalysesV1(
   if (!options.sourcePin) throw new Error("v1 acquired finish requires source pin");
   if (!reserveV1QuotaFinish(budget, options)) return { status: "deferred" };
   return { status: "complete", ...await finishAcquiredAnalyses(db, participantId, evidence, options, true, true) };
+}
+
+/**
+ * Provider source authority for the shared v1 finisher.  `sourceFingerprint`
+ * identifies the complete prepared window.  `identityFingerprint` may point
+ * at the first-day acquisition identity for backwards-compatible work heads;
+ * it defaults to the complete-window fingerprint when omitted.
+ */
+export interface V1ProviderAnalysisSource {
+  readonly sourceFingerprint: string;
+  readonly identityFingerprint?: string;
+  readonly sourceMethodVersion: string;
+  readonly winnersJson: string;
+  readonly winnerCount: number;
+  readonly isCurrent: () => Promise<boolean>;
+}
+
+export interface V1ProviderAnalysisOptions extends Omit<V1AnalysisOptions, "sourcePin"> {
+  readonly source: V1ProviderAnalysisSource;
+}
+
+export type V1ProviderAnalysisResult =
+  | { status: "deferred" | "stale" }
+  | { status: "complete"; quotaAnalysis: object; modelComposition: V1ModelCompositionResult };
+
+function providerAnalysisSourceAuthority(source: V1ProviderAnalysisSource): V1AnalysisSourceAuthority {
+  if (!/^[0-9a-f]{64}$/u.test(source.sourceFingerprint)
+      || source.identityFingerprint !== undefined && !/^[0-9a-f]{64}$/u.test(source.identityFingerprint)
+      || typeof source.sourceMethodVersion !== "string" || source.sourceMethodVersion.length === 0
+      || typeof source.winnersJson !== "string" || source.winnersJson.length > 512 * 1024
+      || !Number.isSafeInteger(source.winnerCount) || source.winnerCount < 0) {
+    throw new TypeError("v1 provider analysis source invalid");
+  }
+  return {
+    identityFingerprint: source.identityFingerprint ?? source.sourceFingerprint,
+    preparedFingerprint: source.sourceFingerprint,
+    resultFingerprint: source.sourceFingerprint,
+    sourceMethodVersion: source.sourceMethodVersion,
+    winnersJson: source.winnersJson,
+    winnerCount: source.winnerCount,
+    isCurrent: source.isCurrent,
+  };
+}
+
+/**
+ * Finish an acquired provider-backed window through the same quota and model
+ * composition kernels used by finishAccountScopedAnalysesV1.  The provider
+ * supplies only prepared, source-pinned pages and a current-authority check;
+ * no D1-shaped database or translated SQL path is accepted here.
+ */
+export async function finishProviderPreparedAnalysesV1(
+  participantId: string, evidence: V1AcquiredQuotaEvidence, budget: V1QuotaInvocationBudget,
+  options: V1ProviderAnalysisOptions,
+): Promise<V1ProviderAnalysisResult> {
+  requireAcquiredQuotaEvidence(evidence);
+  if (!options.preparedEvidence) throw new TypeError("v1 provider finish requires prepared evidence");
+  const nowMs = options.nowMs ?? Date.now();
+  if (!Number.isSafeInteger(nowMs)) throw new TypeError("v1 provider finish clock invalid");
+  const observedAtCutoff = new Date(nowMs - V1_ANALYSIS_WINDOW_MS).toISOString().slice(0, 10) + "T00:00:00.000Z";
+  const resetsAtCutoff = new Date(Date.parse(observedAtCutoff) + SEVEN_DAY_WINDOW_MS).toISOString();
+  const authority = providerAnalysisSourceAuthority(options.source);
+  if (!await authority.isCurrent()) return { status: "stale" };
+  if (!reserveV1QuotaFinish(budget, options)) return { status: "deferred" };
+  const collected = await collectAcquiredAnalyses(null, participantId, evidence, options, true, true,
+    authority, observedAtCutoff, resetsAtCutoff);
+  const finished = finishCollectedAnalyses(collected, authority);
+  if (!await authority.isCurrent()) return { status: "stale" };
+  return { status: "complete", ...finished };
 }
 
 function notTestable(reason: string): object {
@@ -1430,7 +1546,7 @@ function createUsageSessionState() {
  * cap (never truncate-and-fit).
  */
 async function readAndBucketUsage(
-  db: D1Database,
+  db: D1Database | null,
   participantId: string,
   datasetId: string,
   observedAtCutoff: string,
@@ -1449,7 +1565,9 @@ async function readAndBucketUsage(
   // matchedUsage lower bound is inclusive, so a grid-exact event that equals a
   // reset's firstObserved is in-window while interior events of the same bucket
   // are not — the singleton-split preserves that distinction).
-  const selectedLayout=preparedUsage?null:await loadTypedV1AnalysisScope(db,participantId);
+  const selectedLayout = preparedUsage ? null : db
+    ? await loadTypedV1AnalysisScope(db, participantId)
+    : (() => { throw new Error("v1 usage source required"); })();
   const buckets = new Map<string, Map<number, BucketAccumulator>>();
   const singletons = new Map<string, Map<number, BucketAccumulator>>();
   const bucketScopes = new Map<string, { provider: string; planEraKey: string | null }>();
@@ -1518,7 +1636,7 @@ async function readAndBucketUsage(
   for (;;) {
     const rows = preparedUsage
       ? await preparedUsage.readPage(cursorObs, cursorId, USAGE_PAGE_SIZE, observedAtBefore)
-      : await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE, observedAtBefore,selectedLayout);
+      : await readV1UsagePage(db!, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE, observedAtBefore, selectedLayout!);
     if (rows.length === 0) break;
     total += rows.length;
     if (total > maxWindowedUsageRows) {
@@ -2533,20 +2651,20 @@ async function finishAcquiredScalar(rows: DownsampledQuotaRow[], attributionInde
  * newly built plan index, scalar grids and snapshots are owned temporaries;
  * do not keep them alive through the second fit or the final source await.
  * Returned rows remain the original borrowed, validated evidence. */
-async function collectAcquiredAnalyses(db: D1Database, participantId: string, evidence: V1AcquiredQuotaEvidence,
-  options: V1AnalysisOptions & { sourcePin: V1SourcePin }, scalarRequested: boolean, compositionRequested: boolean,
-  sourcePin: V1SourcePin, observedAtCutoff: string, resetsAtCutoff: string,
+async function collectAcquiredAnalyses(db: D1Database | null, participantId: string, evidence: V1AcquiredQuotaEvidence,
+  options: V1AnalysisOptions, scalarRequested: boolean, compositionRequested: boolean,
+  authority: V1AnalysisSourceAuthority, observedAtCutoff: string, resetsAtCutoff: string,
   history?: ModelHistoryWindow,
 ) {
-  if (options.preparedEvidence && options.preparedEvidence.sourceFingerprint !== sourcePin.fingerprint) {
+  if (options.preparedEvidence && options.preparedEvidence.sourceFingerprint !== authority.preparedFingerprint) {
     throw new Error("v1 prepared evidence source mismatch");
   }
-  const prepared = await validateAcquiredQuotaEvidence(db, participantId, evidence, sourcePin,
+  const prepared = await validateAcquiredQuotaEvidenceForAuthority(participantId, evidence, authority,
     observedAtCutoff, resetsAtCutoff, options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS, history);
   const { attributionIndex: index, results: rows } = prepared;
   let scalarReason: string | null = !scalarRequested ? "supported_quota_track_unavailable" : null;
   let compositionReason: string | null = !compositionRequested ? "supported_quota_track_unavailable" : null;
-  if (sourcePin.winners.length === 0) scalarReason = compositionReason = "supported_quota_track_unavailable";
+  if (authority.winnerCount === 0) scalarReason = compositionReason = "supported_quota_track_unavailable";
   else if (index.status === "limit_exceeded") scalarReason = compositionReason = "plan_attribution_limit_exceeded";
   if (compositionReason === null) {
     const plans = new Set(index.eras.map(era => era.planType).filter(plan => plan !== "unknown"));
@@ -2605,7 +2723,7 @@ async function collectAcquiredAnalyses(db: D1Database, participantId: string, ev
   } else if (scalarReason === null || composition) {
     usage = await readAndBucketUsage(db, participantId, datasetId,
       observedAtCutoff, accountTracks, gridByProvider, maxUsage,
-      sourcePin.winnersJson, index, composition, scalarReason === null, history?.observedAtBefore,
+      authority.winnersJson, index, composition, scalarReason === null, history?.observedAtBefore,
       options.preparedEvidence?.usageReader);
   }
   gridByProvider.clear();
@@ -2615,7 +2733,7 @@ async function collectAcquiredAnalyses(db: D1Database, participantId: string, ev
   const scalar = scalarReason !== null ? notTestable(scalarReason)
     : await finishAcquiredScalar(rows, index, datasetId, accountTracks, usage as AttributedUsageEventPartial[]);
   const quotaAnalysis = scalarReason === null ? { ...scalar,
-    attributionMethod: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION, inputFingerprint: sourcePin.fingerprint } : scalar;
+    attributionMethod: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION, inputFingerprint: authority.resultFingerprint } : scalar;
   return { quotaAnalysis, composition, compositionReason, compositionPlans, latestQuotaMs, rows };
 }
 
@@ -2627,9 +2745,28 @@ async function finishAcquiredAnalyses(db: D1Database, participantId: string, evi
   const observedAtCutoff = new Date(nowMs - V1_ANALYSIS_WINDOW_MS).toISOString().slice(0, 10) + "T00:00:00.000Z";
   const resetsAtCutoff = new Date(Date.parse(observedAtCutoff) + SEVEN_DAY_WINDOW_MS).toISOString();
   const sourcePin = await analysisSourcePin(db, participantId, observedAtCutoff, options.sourcePin, history);
+  const authority = d1AnalysisSourceAuthority(db, sourcePin);
   const { quotaAnalysis, composition, compositionReason, compositionPlans, latestQuotaMs, rows } =
     await collectAcquiredAnalyses(db, participantId, evidence, options, scalarRequested, compositionRequested,
-      sourcePin, observedAtCutoff, resetsAtCutoff, history);
+      authority, observedAtCutoff, resetsAtCutoff, history);
+  const finished = finishCollectedAnalyses({ quotaAnalysis, composition, compositionReason, compositionPlans, latestQuotaMs, rows }, authority, history);
+  await assertAnalysisSourceCurrent(authority);
+  return finished;
+}
+
+function finishCollectedAnalyses(
+  collected: {
+    quotaAnalysis: object;
+    composition: ReturnType<typeof createCompositionUsageAccumulator> | undefined;
+    compositionReason: string | null;
+    compositionPlans: Set<string>;
+    latestQuotaMs: number;
+    rows: DownsampledQuotaRow[];
+  },
+  authority: V1AnalysisSourceAuthority,
+  history?: ModelHistoryWindow,
+): { quotaAnalysis: object; modelComposition: V1ModelCompositionResult } {
+  const { quotaAnalysis, composition, compositionReason, compositionPlans, latestQuotaMs, rows } = collected;
   let modelComposition: V1ModelCompositionResult = { status: "not_testable", reason: compositionReason ?? "supported_quota_track_unavailable" };
   if (composition) {
     const folded = composition.finish();
@@ -2645,10 +2782,9 @@ async function finishAcquiredAnalyses(db: D1Database, participantId: string, evi
         usageEventCount: folded.usageEventCount, unpricedUsageEventCount: folded.unpricedUsageEventCount,
         poisonedBinCount: folded.poisonedBinCount, latestQuotaObservedAt: new Date(latestQuotaMs).toISOString(),
         attributionStatus: "legacy_conditional", attributionMethod: history ? MODEL_HISTORY_METHOD_VERSION : V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
-        inputFingerprint: sourcePin.fingerprint };
+        inputFingerprint: authority.resultFingerprint };
     }
   }
-  await assertV1SourcePinCurrent(db, sourcePin);
   return { quotaAnalysis, modelComposition };
 }
 

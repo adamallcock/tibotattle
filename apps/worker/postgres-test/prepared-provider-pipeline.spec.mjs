@@ -20,6 +20,7 @@ import {
   ensurePreparedV1WindowFromProvider,
   V1_PREPARED_READER_POLICY,
 } from "../src/prepared-v1-evidence.ts";
+import { finishProviderPreparedAnalysesV1 } from "../src/quota-analysis-v1.ts";
 
 const { Pool } = pg;
 const primarySchema = "tibotattle";
@@ -103,7 +104,7 @@ afterAll(async () => {
   await admin?.end();
 });
 
-async function seedCanonicalV1({ includeNumericTieRows = false } = {}) {
+async function seedCanonicalV1({ includeNumericTieRows = false, includeUsage = true } = {}) {
   const client = await pool.connect();
   try {
     await client.query(`SET search_path TO ${primarySchema}, pg_catalog`);
@@ -164,26 +165,27 @@ async function seedCanonicalV1({ includeNumericTieRows = false } = {}) {
         INSERT INTO telemetry_v1_records(chunk_row_id,participant_id,device_id,stream,occurrence_id,
           observed_at,observed_day,provider,model_id,plan_type,plan_variant,limit_id,slot,
           used_percent,window_duration_minutes,resets_at,record_json)
-        VALUES($1,$2,$3,'quota',$4,$5,$6,'openai_codex',NULL,$7,$8,$9,'weekly',$10,10080,$11,$12::jsonb)`,
+        VALUES($1,$2,$3,'quota',$4,$5,$6,'openai_codex',NULL,$7,$8,$9,'seven_day',$10,10080,$11,$12::jsonb)`,
       [chunkId, participantId, deviceId, occurrence, observedAt, day, planType, planVariant,
         limitId, usedPercent, "2026-09-22T00:00:00.000Z", JSON.stringify({ occurrence_id: occurrence })]);
     }
-    await client.query(`
+    if (includeUsage) {
+      await client.query(`
       INSERT INTO device_upload_authorizations(id,participant_id,issued_by_device_id,secret_hash,
         envelope_digest,body_bytes,content_type,issued_at,expires_at)
       VALUES('pipeline-usage-auth',$1,$2,$3,$4,1,'application/json',$5,$6)`,
-    [participantId, deviceId, secret, digest("usage-envelope"), now, "2027-01-01T00:00:00.000Z"]);
-    const usageChunkId = "pipeline-usage-chunk";
-    await client.query(`
+      [participantId, deviceId, secret, digest("usage-envelope"), now, "2027-01-01T00:00:00.000Z"]);
+      const usageChunkId = "pipeline-usage-chunk";
+      await client.query(`
       INSERT INTO pending_objects(contribution_id,object_key)
       VALUES($1,$2)`, [usageChunkId, "pipeline-usage-object"]);
-    await client.query(`
+      await client.query(`
       INSERT INTO telemetry_v1_chunks(id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,
         chunk_digest,envelope_digest,parser_version,record_count,accepted_record_count,r2_key,
         device_upload_authorization_id,created_at)
       VALUES($1,$2,$3,'usage',$4,1,1,$5,$6,'pipeline-parser',1,1,'pipeline-usage-object','pipeline-usage-auth',$7)`,
-    [usageChunkId, participantId, deviceId, day, digest("pipeline-usage-chunk"), digest("usage-envelope"), now]);
-    const usageRecord = {
+      [usageChunkId, participantId, deviceId, day, digest("pipeline-usage-chunk"), digest("usage-envelope"), now]);
+      const usageRecord = {
       schemaVersion: "usage-event-v1.0", eventId: "pipeline-usage-1", eventTime: "2026-09-21T00:00:09.000Z",
       sessionUuid: "pipeline-session-usage", provider: "openai_codex", modelId: "gpt-6-astra",
       speedMode: "standard", apiServiceTier: "unknown", surface: "local_interactive_unclassified",
@@ -191,13 +193,14 @@ async function seedCanonicalV1({ includeNumericTieRows = false } = {}) {
       totalInputContextTokens: null,
       components: { inputUncachedTokens: 1000, inputCacheReadTokens: 0, inputCacheWriteTokens: 0,
         outputTextTokens: 1000, outputReasoningTokens: 0, outputCombinedTokens: 1000 },
-    };
-    await client.query(`
+      };
+      await client.query(`
       INSERT INTO telemetry_v1_records(chunk_row_id,participant_id,device_id,stream,occurrence_id,
         observed_at,observed_day,provider,model_id,session_uuid,record_json)
         VALUES($1,$2,$3,'usage','pipeline-usage-1',$4,$5,'openai_codex','gpt-6-astra',
         'pipeline-session-usage',$6::jsonb)`,
-    [usageChunkId, participantId, deviceId, "2026-09-21T00:00:09.000Z", day, JSON.stringify(usageRecord)]);
+      [usageChunkId, participantId, deviceId, "2026-09-21T00:00:09.000Z", day, JSON.stringify(usageRecord)]);
+    }
     const revision = (await client.query(`SELECT revision FROM input_versions WHERE participant_id=$1`, [participantId])).rows[0].revision;
     await client.query(`
       INSERT INTO storage_source_state(singleton,source_id,authority_epoch) VALUES(1,$1,1)`, [sourceId]);
@@ -231,19 +234,19 @@ async function seedCanonicalSecondDay() {
       INSERT INTO telemetry_v1_chunks(id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,
         chunk_digest,envelope_digest,parser_version,record_count,accepted_record_count,r2_key,
         device_upload_authorization_id,created_at)
-      VALUES($1,$2,$3,'quota',$4,0,1,$5,$6,'pipeline-parser',3,3,$7,$8,$9)`,
+      VALUES($1,$2,$3,'quota',$4,0,1,$5,$6,'pipeline-parser',8,8,$7,$8,$9)`,
     ["pipeline-day20-quota-chunk", participantId, deviceId, secondDay,
       digest("pipeline-day20-quota-chunk"), digest("day20-quota-envelope"),
       "pipeline-day20-quota-object", "pipeline-day20-auth", now]);
-    for (let index = 1; index <= 3; index += 1) {
+    for (let index = 1; index <= 8; index += 1) {
       const observedAt = `2026-09-20T00:00:0${index}.000Z`;
       await client.query(`
         INSERT INTO telemetry_v1_records(chunk_row_id,participant_id,device_id,stream,occurrence_id,
           observed_at,observed_day,provider,model_id,plan_type,plan_variant,limit_id,slot,
           used_percent,window_duration_minutes,resets_at,record_json)
-        VALUES($1,$2,$3,'quota',$4,$5,$6,'openai_codex',NULL,'plus','standard','codex','weekly',$7,10080,$8,$9::jsonb)`,
+        VALUES($1,$2,$3,'quota',$4,$5,$6,'openai_codex',NULL,'plus','standard','codex','seven_day',$7,10080,$8,$9::jsonb)`,
       ["pipeline-day20-quota-chunk", participantId, deviceId, `day20-quota-${index}`,
-        observedAt, secondDay, 10 + index, "2026-09-21T00:00:00.000Z",
+        observedAt, secondDay, index * 10, "2026-09-21T00:00:00.000Z",
         JSON.stringify({ occurrence_id: `day20-quota-${index}` })]);
     }
     await client.query(`
@@ -271,7 +274,7 @@ async function seedCanonicalSecondDay() {
       INSERT INTO telemetry_v1_chunks(id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,
         chunk_digest,envelope_digest,parser_version,record_count,accepted_record_count,r2_key,
         device_upload_authorization_id,created_at)
-      VALUES($1,$2,$3,'usage',$4,2,1,$5,$6,'pipeline-parser',57,57,$7,$8,$9)`,
+      VALUES($1,$2,$3,'usage',$4,2,1,$5,$6,'pipeline-parser',60,60,$7,$8,$9)`,
     ["pipeline-day20-usage-chunk-2", participantId, deviceId, secondDay, digest("pipeline-day20-usage-chunk-2"),
       digest("day20-usage-envelope-2"), "pipeline-day20-usage-object-2", "pipeline-day20-usage-auth-2", now]);
     const baseUsage = {
@@ -293,6 +296,16 @@ async function seedCanonicalSecondDay() {
         VALUES($1,$2,$3,'usage',$4,$5,$6,'openai_codex','gpt-6-astra',$7,$8::jsonb)`,
       [index <= 200 ? "pipeline-day20-usage-chunk" : "pipeline-day20-usage-chunk-2", participantId, deviceId, `day20-usage-${index}`,
         observedAt, secondDay, "pipeline-day20-session", JSON.stringify(usage)]);
+    }
+    for (const [index, modelId] of [[258, "gpt-6-astra"], [259, "gpt-5.5"], [260, "gpt-6-astra"]]) {
+      const observedAt = "2026-09-20T00:05:00.000Z";
+      const usage = { ...baseUsage, eventId: `pipeline-day20-usage-${index}`, eventTime: observedAt, modelId };
+      await client.query(`
+        INSERT INTO telemetry_v1_records(chunk_row_id,participant_id,device_id,stream,occurrence_id,
+          observed_at,observed_day,provider,model_id,session_uuid,record_json)
+        VALUES($1,$2,$3,'usage',$4,$5,$6,'openai_codex',$7,$8,$9::jsonb)`,
+      ["pipeline-day20-usage-chunk-2", participantId, deviceId, `day20-usage-${index}`,
+        observedAt, secondDay, modelId, "pipeline-day20-session", JSON.stringify(usage)]);
     }
   } finally {
     client.release();
@@ -413,7 +426,7 @@ it("reads canonical v1, prepares immutable pages, and runs the existing quota co
 });
 
 it("prepares an explicit multi-day window and preserves resumed finisher parity", async () => {
-  await seedCanonicalV1();
+  await seedCanonicalV1({ includeUsage: false });
   await seedCanonicalSecondDay();
   const source = createPostgresStorageSource(pool, { primarySchema, ledgerSchema: "tibotattle_ledger" });
   const firstPin = await source.readPin({ sourceId, sourceNamespace: namespace, ownerDigest, day: "2026-09-20", method });
@@ -425,9 +438,9 @@ it("prepares an explicit multi-day window and preserves resumed finisher parity"
   const prepared = createPostgresPreparedSourceStore(pool, { primarySchema, ledgerSchema: "tibotattle_ledger" });
   const windowDays = [
     { pin: firstPin, deviceId, generation: "pipeline-day20-quota", usageGeneration: "pipeline-day20-usage",
-      expectedQuotaRows: 3, expectedUsageRows: 257 },
+      expectedQuotaRows: 8, expectedUsageRows: 260 },
     { pin: secondPin, deviceId, generation: "pipeline-day21-quota", usageGeneration: "pipeline-day21-usage",
-      expectedQuotaRows: 8, expectedUsageRows: 1 },
+      expectedQuotaRows: 8, expectedUsageRows: 0 },
   ];
   let preparation;
   let invocations = 0;
@@ -444,10 +457,17 @@ it("prepares an explicit multi-day window and preserves resumed finisher parity"
   if (preparation.status !== "complete" || !preparation.preparedEvidence) return;
   const evidence = preparation.preparedEvidence;
   const usageRows = await evidence.usageReader.readPage("2026-09-20T00:00:00.000Z", 0, 5000);
-  expect(usageRows).toHaveLength(258);
+  expect(usageRows).toHaveLength(260);
   expect(usageRows.some((row) => row.preparedPrice?.costNanousd > 0)).toBe(true);
-  expect(evidence.usageBins.totalRowCount).toBe(258);
+  const equalTimeUsage = usageRows.filter((row) => row.observed_at === "2026-09-20T00:05:00.000Z");
+  expect(equalTimeUsage.map((row) => row.id)).toEqual([...equalTimeUsage].sort((left, right) => left.id - right.id).map((row) => row.id));
+  expect(equalTimeUsage.map((row) => row.preparedPrice?.modelId)).toEqual(["gpt-6-astra", "gpt-5.5", "gpt-6-astra"]);
+  expect(evidence.usageBins.totalRowCount).toBe(260);
   expect(evidence.usageBins.fragmentCount).toBeGreaterThan(0);
+  const emptyFinalUsageHead = await prepared.begin({ pin: secondPin, generation: "pipeline-day21-usage", stream: "usage" });
+  expect(emptyFinalUsageHead).toMatchObject({ state: "ready", rowsWritten: 0 });
+  await expect(prepared.readOutputs({ pin: secondPin, generation: "pipeline-day21-usage", stream: "usage",
+    kind: "usage_fragment", afterIndex: -1, afterKey: "", limit: 128 })).resolves.toHaveLength(0);
 
   const preparedSource = {
     store: prepared, pin: firstPin, generation: "pipeline-day20-quota",
@@ -460,10 +480,10 @@ it("prepares an explicit multi-day window and preserves resumed finisher parity"
     readerPolicy: V1_PREPARED_READER_POLICY, cursor: null, limit: 128 });
   const secondRawPage = await prepared.readPage({ pin: secondPin, generation: "pipeline-day21-quota",
     readerPolicy: V1_PREPARED_READER_POLICY, cursor: null, limit: 128 });
-  expect(firstRawPage.rows).toHaveLength(3);
+  expect(firstRawPage.rows).toHaveLength(8);
   expect(secondRawPage.rows).toHaveLength(8);
   // The existing compression algorithm retains first/last rows per plan run;
-  // eleven physical rows therefore produce four durable plan anchors here.
+  // these sixteen physical rows therefore produce four durable plan anchors here.
   expect(quotaPlans).toHaveLength(4);
   expect(quotaPlans.some((row) => row.observed_day === "2026-09-20")).toBe(true);
   expect(quotaPlans.some((row) => row.observed_day === day)).toBe(true);
@@ -471,7 +491,7 @@ it("prepares an explicit multi-day window and preserves resumed finisher parity"
   const identity = {
     participantId, inputRevision: firstPin.inputRevision, inputFingerprint: firstPin.dependencyDigest,
     sourceKind: "v1", sourceMethodVersion: firstPin.method, fixedNow: "2026-09-21T23:59:59.999Z",
-    observedAtCutoff: "2026-09-21T23:59:59.999Z", resetsAtCutoff: "2026-09-21T00:00:00.000Z",
+    observedAtCutoff: "2026-06-13T00:00:00.000Z", resetsAtCutoff: "2026-06-20T00:00:00.000Z",
     windowMinutes: 10080, maxQuotaRows: 120,
   };
   const workStore = createPostgresAnalyticalWorkStore(pool, { primarySchema, ledgerSchema: "tibotattle_ledger" });
@@ -500,6 +520,30 @@ it("prepares an explicit multi-day window and preserves resumed finisher parity"
   const uninterrupted = await run(256);
   expect(uninterrupted.status).toBe("ready");
   if (uninterrupted.status === "ready") expect(JSON.stringify(uninterrupted.evidence)).toBe(resumedEvidence);
+
+  const finished = await finishProviderPreparedAnalysesV1(participantId, resumed.evidence,
+    { remainingQueries: 256, reserveQueries: 0, deadlineMs: Date.now() + 60_000 }, {
+      nowMs: Date.parse(identity.fixedNow), preparedEvidence: evidence,
+      maxDownsampledQuotaRows: 120, maxWindowedUsageRows: 1_000,
+      source: {
+        sourceFingerprint: evidence.sourceFingerprint,
+        identityFingerprint: firstPin.dependencyDigest,
+        sourceMethodVersion: identity.sourceMethodVersion,
+        winnersJson: JSON.stringify(preparation.days.map((preparedDay) => [preparedDay.pin.day, preparedDay.deviceId])),
+        winnerCount: preparation.days.length,
+        isCurrent: sourceCurrent,
+      },
+    });
+  expect(finished.status).toBe("complete");
+  if (finished.status === "complete") {
+    expect(finished.quotaAnalysis).toMatchObject({ attributionMethod: expect.any(String), inputFingerprint: evidence.sourceFingerprint });
+    expect(finished.modelComposition).toMatchObject({ status: "ready", usageEventCount: expect.any(Number) });
+    if (finished.modelComposition.status === "ready") {
+      expect(finished.modelComposition.usageEventCount).toBeGreaterThan(0);
+      expect(finished.modelComposition.fit).toBeTruthy();
+      expect(JSON.stringify(finished.modelComposition.fit)).toContain("gpt-6-astra");
+    }
+  }
 });
 
 it("fails closed when an active newer domain supersedes the v1 source", async () => {
