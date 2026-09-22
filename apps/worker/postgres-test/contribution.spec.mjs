@@ -1,8 +1,9 @@
 import { beforeAll, afterAll, beforeEach, expect, it, vi } from 'vitest';
-import { readFile, lstat, realpath } from 'node:fs/promises';
+import { lstat, realpath } from 'node:fs/promises';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import pg from 'pg';
+import { applyPostgresMigrations } from '../scripts/postgres-migrations.mjs';
 import { eraseParticipantWithStore } from '../src/participant-erasure-store.ts';
 import { createExperimentalPostgresParticipantErasureStores } from '../src/postgres-participant-erasure-store.ts';
 import { registerParticipantErasureTests } from './erasure-fixtures.mjs';
@@ -17,11 +18,15 @@ import { buildTelemetryV1ReplayReceipt, resolveTelemetryV1Replay } from '../src/
 import { parseTelemetryV1Chunk } from '../src/telemetry-v1.ts';
 import { canonicalJson } from '../src/canonical-json.ts';
 
+// This is an explicitly isolated operational schema. It receives the same
+// numbered primary/ledger migrations as production; the disposable database
+// keeps the qualification lane independent from other PostgreSQL tests.
 const schema = 'tibotattle_v1_test';
+const ledgerSchema = 'tibotattle_ledger_test';
 const database = `tibotattle_pg_test_${randomBytes(12).toString('hex')}`;
 const ledgerDatabase = `tibotattle_pg_test_${randomBytes(12).toString('hex')}`;
 const tables = ['accountless_upload_owners','admin_action_audit','web_sessions','device_upload_authorizations',
-  'device_pairings','device_credentials','contributions','telemetry_contributions','telemetry_v11_chunks','telemetry_v1_quota_fit_rows','telemetry_v1_quota_fit_backfill',...projectionTables,'community_model_history_dependencies','community_model_composition_days','records','chunks','authorizations','consents','devices','admission_windows',
+  'device_pairings','device_credentials','telemetry_v11_chunks','telemetry_v1_quota_fit_rows','telemetry_v1_quota_fit_backfill',...projectionTables,'community_model_history_dependencies','community_model_composition_days','telemetry_v1_records','telemetry_v1_chunks','device_upload_authorizations','telemetry_v1_device_consents','telemetry_v1_chunk_admission_windows',
   'input_versions','pending_objects','participants'];
 const pid = 'synthetic-participant', did = 'synthetic-device';
 const day = '2026-09-01';
@@ -60,17 +65,18 @@ beforeAll(async () => {
   ledgerCreated = true;
   ledgerPool = new pg.Pool({...options, database: ledgerDatabase});
   pool = new pg.Pool({...options, database});
-  backend = createExperimentalPostgresTelemetryV1Backend(pool);
+  await pool.query(`CREATE SCHEMA "${schema}"`);
+  await ledgerPool.query(`CREATE SCHEMA "${ledgerSchema}"`);
+  const primaryMigrations = await applyPostgresMigrations({ role: 'primary', schema, pool });
+  const ledgerMigrations = await applyPostgresMigrations({ role: 'ledger', schema: ledgerSchema, pool: ledgerPool });
+  expect(primaryMigrations.applied).toBeGreaterThanOrEqual(4);
+  expect(ledgerMigrations.applied).toBeGreaterThanOrEqual(3);
+  backend = createExperimentalPostgresTelemetryV1Backend(pool, {
+    primarySchema: schema,
+    ledgerSchema,
+  });
   store = backend.contributions;
   reader = backend.reader;
-  // Qualification cannot silently succeed before its schema is installed.
-  await expect(store.insert(await input())).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
-  await expect(reader.byEnvelope(pid,'synthetic-missing')).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
-  await pool.query(await readFile(new URL('./schema.sql', import.meta.url),'utf8'));
-  await pool.query(await readFile(new URL('./projections.sql', import.meta.url),'utf8'));
-  await pool.query(await readFile(new URL('./quota-fit.sql', import.meta.url),'utf8'));
-  await pool.query(await readFile(new URL('./erasure.sql', import.meta.url),'utf8'));
-  await ledgerPool.query(await readFile(new URL('./erasure-ledger.sql', import.meta.url),'utf8'));
 });
 afterAll(async () => {
   try {
@@ -83,11 +89,32 @@ afterAll(async () => {
   }
 });
 beforeEach(async () => {
-  await pool.query(`TRUNCATE ${tables.map(name=>`${schema}.${name}`).join(', ')} CASCADE`);
+  await pool.query(`TRUNCATE ${schema}.participants, ${schema}.pending_objects CASCADE`);
   await resetProjectionState(pool,schema);
-  await pool.query(`INSERT INTO ${schema}.participants(id,state,owner_kind) VALUES($1,'active','social')`,[pid]);
-  await pool.query(`INSERT INTO ${schema}.devices VALUES($1,$2,'active',clock_timestamp()-interval '30 days',clock_timestamp()+interval '1 day')`,[did,pid]);
-  await pool.query(`INSERT INTO ${schema}.consents VALUES($1,$2,$3,$4,$5)`,[pid,did,...Object.values(consent)]);
+  const issuedAt = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  await pool.query(`INSERT INTO ${schema}.participants
+    (id,state,owner_kind,consent_version,consented_at,created_at)
+    VALUES($1,'active','social',$2,$3,$3)`, [pid, consent.privacyContractVersion, issuedAt]);
+  await pool.query(`INSERT INTO ${schema}.web_sessions
+    (id,participant_id,secret_hash,csrf_hash,scope,state,issued_at,expires_at,last_used_at)
+    VALUES($1,$2,$3,$4,'personal','active',$5,$6,$5)`,
+  [`session-${pid}`, pid, Buffer.alloc(32, 1), Buffer.alloc(32, 2), issuedAt, expiresAt]);
+  await pool.query(`INSERT INTO ${schema}.device_pairings
+    (id,participant_id,issued_by_session_id,secret_hash,consent_version,
+      transport_consent_version,state,issued_at,expires_at,claimed_device_id)
+    VALUES($1,$2,$3,$4,$5,$6,'consumed',$7,$8,$9)`,
+  [`pairing-${did}`, pid, `session-${pid}`, Buffer.alloc(32, 3), consent.privacyContractVersion,
+    consent.telemetrySchemaVersion, issuedAt, expiresAt, did]);
+  await pool.query(`INSERT INTO ${schema}.device_credentials
+    (id,participant_id,authority_kind,paired_via_pairing_id,secret_hash,state,
+      issued_at,expires_at,last_used_at,social_verified_at)
+    VALUES($1,$2,'social',$3,$4,'active',$5,$6,$5,$5)`,
+  [did, pid, `pairing-${did}`, Buffer.alloc(32, 4), issuedAt, expiresAt]);
+  await pool.query(`INSERT INTO ${schema}.telemetry_v1_device_consents
+    (participant_id,device_id,telemetry_schema_version,field_dictionary_version,
+      privacy_contract_version,consented_at)
+    VALUES($1,$2,$3,$4,$5,$6)`, [pid, did, ...Object.values(consent), issuedAt]);
 });
 
 async function input({sequence=0, revision=1, supersedes=null, occurrence=randomUUID(), count=1, stream='session',chunkDay=day}={}) {
@@ -111,13 +138,37 @@ async function input({sequence=0, revision=1, supersedes=null, occurrence=random
     objectKey:`synthetic/${id}`,envelopeDigest:digest(id),chunk,supersedes,createdAt:new Date().toISOString()};
 }
 async function grant(value) {
-  await pool.query(`INSERT INTO ${schema}.authorizations(id,participant_id,device_id,envelope_digest,state,lease_expires_at,expires_at)
-    VALUES($1,$2,$3,$4,'consuming',clock_timestamp()+interval '5 minutes',clock_timestamp()+interval '10 minutes')`,
-    [value.uploadAuthorizationId,value.participantId,value.deviceId,value.envelopeDigest]);
+  const leaseExpiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  await pool.query(`INSERT INTO ${schema}.device_upload_authorizations
+    (id,participant_id,issued_by_device_id,secret_hash,envelope_digest,body_bytes,
+      content_type,state,issued_at,expires_at,consume_lease_expires_at)
+    VALUES($1,$2,$3,$4,$5,1024,'application/json','consuming',$6,$7,$8)`,
+  [value.uploadAuthorizationId, value.participantId, value.deviceId, Buffer.alloc(32, 5),
+    value.envelopeDigest, value.createdAt, expiresAt, leaseExpiresAt]);
   await pool.query(`INSERT INTO ${schema}.pending_objects VALUES($1,$2)`,[value.chunkId,value.objectKey]);
-  return value;
+  return {...value, uploadAuthorizationLeaseExpiresAt: leaseExpiresAt};
 }
-async function rows(table) {return (await pool.query(`SELECT * FROM ${schema}.${table}`)).rows;}
+async function rows(table) {
+  const canonical = {
+    chunks: `SELECT *, r2_key AS object_key, device_upload_authorization_id AS authorization_id
+      FROM ${schema}.telemetry_v1_chunks`,
+    records: `SELECT id,chunk_row_id AS chunk_id,participant_id,device_id,stream,occurrence_id,
+      observed_at,payload_json AS payload,observed_day,provider,model_id,session_uuid,plan_type,
+      plan_variant,limit_id,slot,used_percent,window_duration_minutes,resets_at
+      FROM ${schema}.telemetry_v1_records`,
+    devices: `SELECT id,participant_id,state,issued_at,expires_at FROM ${schema}.device_credentials`,
+    consents: `SELECT participant_id,device_id,telemetry_schema_version AS schema_version,
+      field_dictionary_version AS dictionary_version,privacy_contract_version AS privacy_version,
+      consented_at FROM ${schema}.telemetry_v1_device_consents`,
+    authorizations: `SELECT id,participant_id,issued_by_device_id AS device_id,envelope_digest,state,
+      consume_lease_expires_at AS lease_expires_at,expires_at,consumed_contribution_id,consumed_at
+      FROM ${schema}.device_upload_authorizations`,
+    admission_windows: `SELECT participant_id,device_id,window_day,accepted_count,last_accepted_at
+      FROM ${schema}.telemetry_v1_chunk_admission_windows`,
+  }[table];
+  return (await pool.query(canonical ?? `SELECT * FROM ${schema}.${table}`)).rows;
+}
 async function snapshot() {
   const result={};
   for (const table of tables) result[table]=(await rows(table)).sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b)));
@@ -196,22 +247,24 @@ it('refuses an unrelated predecessor before deleting records',async()=> {
 it.each([
   ['participant deletion',`UPDATE ${schema}.participants SET state='deleting'`,'PARTICIPANT_DELETING'],
   ['accountless owner',`UPDATE ${schema}.participants SET owner_kind='accountless'`,'TELEMETRY_TRANSPORT_BLOCKED'],
-  ['transport floor',`UPDATE ${schema}.participants SET transport_floor=20`,'TELEMETRY_TRANSPORT_BLOCKED'],
-  ['revoked device',`UPDATE ${schema}.devices SET state='revoked'`,'UPLOAD_AUTH_INVALID'],
-  ['expired device',`UPDATE ${schema}.devices SET expires_at=clock_timestamp()-interval '1 second'`,'UPLOAD_AUTH_INVALID'],
-  ['revoked upload',`UPDATE ${schema}.authorizations SET state='revoked'`,'UPLOAD_AUTH_INVALID'],
-  ['expired lease',`UPDATE ${schema}.authorizations SET lease_expires_at=clock_timestamp()-interval '1 second'`,'UPLOAD_AUTH_INVALID'],
-  ['expired upload',`UPDATE ${schema}.authorizations SET expires_at=clock_timestamp()-interval '1 second'`,'UPLOAD_AUTH_INVALID'],
-  ['wrong digest',`UPDATE ${schema}.authorizations SET envelope_digest='${'f'.repeat(64)}'`,'UPLOAD_AUTH_INVALID'],
-  ['consent drift',`UPDATE ${schema}.consents SET dictionary_version='stale'`,'TELEMETRY_CONSENT_INVALID'],
+  ['transport floor',`UPDATE ${schema}.telemetry_transport_participant_floors SET minimum_rank=11`,'TELEMETRY_TRANSPORT_BLOCKED'],
+  ['revoked device',`UPDATE ${schema}.device_credentials SET state='revoked'`,'UPLOAD_AUTH_INVALID'],
+  ['expired device',`UPDATE ${schema}.device_credentials SET expires_at=clock_timestamp()-interval '1 second'`,'UPLOAD_AUTH_INVALID'],
+  ['revoked upload',`UPDATE ${schema}.device_upload_authorizations SET state='revoked'`,'UPLOAD_AUTH_INVALID'],
+  ['expired lease',`UPDATE ${schema}.device_upload_authorizations SET consume_lease_expires_at=clock_timestamp()-interval '1 second'`,'UPLOAD_AUTH_INVALID'],
+  ['expired upload',`UPDATE ${schema}.device_upload_authorizations SET expires_at=clock_timestamp()-interval '1 second'`,'UPLOAD_AUTH_INVALID'],
+  ['wrong digest',`UPDATE ${schema}.device_upload_authorizations SET envelope_digest='${'f'.repeat(64)}'`,'UPLOAD_AUTH_INVALID'],
+  ['consent drift',`UPDATE ${schema}.telemetry_v1_device_consents SET field_dictionary_version='stale'`,'TELEMETRY_CONSENT_INVALID'],
 ])('refuses %s without any partial state',async(_label,sql,code)=> {
   const value=await grant(await input()); await pool.query(sql); const before=await snapshot();
   await expect(store.insert(value)).rejects.toMatchObject({code}); expect(await snapshot()).toEqual(before);
 });
 it.each([1999,19999])('does not overshoot the admission budget under concurrent clients at %s',async prior=> {
-  if(prior===19999) await pool.query(`UPDATE ${schema}.devices SET issued_at=clock_timestamp()`);
+  if(prior===19999) await pool.query(`UPDATE ${schema}.device_credentials SET issued_at=clock_timestamp()`);
   const a=await grant(await input()),b=await grant(await input({sequence:1}));
-  await pool.query(`INSERT INTO ${schema}.admission_windows VALUES($1,$2,$3,$4)`,[pid,did,a.createdAt.slice(0,10),prior]);
+  await pool.query(`INSERT INTO ${schema}.telemetry_v1_chunk_admission_windows
+    (participant_id,device_id,window_day,accepted_count,last_accepted_at)
+    VALUES($1,$2,$3,$4,clock_timestamp())`,[pid,did,a.createdAt.slice(0,10),prior]);
   const outcomes=await race(a,b);
   expect(outcomes.filter(r=>r.status==='fulfilled')).toHaveLength(1);
   expect(outcomes.find(r=>r.status==='rejected').reason.code).toBe('CHUNK_ADMISSION_LIMIT_REACHED');
@@ -339,7 +392,7 @@ it('does not convert a failed PostgreSQL replay lookup into absence',async()=> {
 
 it('builds replay counts from stored acceptance and acknowledges the requesting device',async()=> {
   const value=await grant(await input({count:2}));await store.insert(value);
-  await pool.query(`UPDATE ${schema}.chunks SET accepted_record_count=1 WHERE id=$1`,[value.chunkId]);
+  await pool.query(`UPDATE ${schema}.telemetry_v1_chunks SET accepted_record_count=1 WHERE id=$1`,[value.chunkId]);
   const retained=await reader.byEnvelope(pid,value.envelopeDigest);
   expect(await buildTelemetryV1ReplayReceipt(reader,retained,'synthetic-other-device')).toMatchObject({
     status:'accepted',recordCounts:{declared:2,accepted:1},acknowledgedThroughDay:null,
