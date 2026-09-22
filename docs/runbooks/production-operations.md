@@ -495,9 +495,14 @@ per-column aggregate invariants. This mode never reads credentials or performs
 remote work:
 
 ```sh
+mkdir -m 700 /absolute/private/typed-forward-rehearsal
 node apps/worker/scripts/typed-forward-migration.mjs --mode rehearse \
-  --worker-root apps/worker
+  --worker-root apps/worker \
+  --output /absolute/private/typed-forward-rehearsal/rehearsal.json
 ```
+
+The explicit output is a mode-0600 private artifact written atomically; use
+its path in prepare rather than relying on terminal output.
 
 Capture the reviewed D1 Time Travel receipt separately before preparing the
 plan. The targets file must be a mode-0600 JSON array in this exact order,
@@ -542,7 +547,8 @@ node apps/worker/scripts/typed-forward-migration.mjs --mode capture-inventory \
 The capture preflights all three destination parents before any Worker or D1
 read. It stages the three files and publishes each with a no-clobber commit;
 `typed-forward-inventory-publication.json` is a private durable journal in the
-operation directory. If a later destination fails, stop with the journal in
+operation directory bound to the account, Worker, CLI path and digest, growth
+budget, exact output paths, and explicit capture-time inputs. If a later destination fails, stop with the journal in
 `partial` state and rerun the exact command with the same operation and output
 paths. The operator resumes the staged local publication after checking the
 journal and does not repeat the remote reads. A destination created or changed
@@ -561,7 +567,7 @@ node apps/worker/scripts/typed-forward-migration.mjs --mode prepare \
   --worker-root apps/worker --repository-root /absolute/candidate-checkout \
   --inventory /absolute/private/inventory.json \
   --targets /absolute/private/targets.json \
-  --rehearsal /absolute/private/rehearsal.json \
+  --rehearsal /absolute/private/typed-forward-rehearsal/rehearsal.json \
   --candidate-source CANDIDATE_COMMIT --account-id ACCOUNT_ID \
   --worker-name WORKER_NAME --wrangler-sha256 WRANGLER_SHA256 \
   --output /absolute/private/typed-forward-plan.json
@@ -602,6 +608,13 @@ extension is admitted only on that existing expired operation, with an
 `approvedAt` at or after the prior deadline, the exact previous-extension
 digest, and a new window of at most 24 hours. Verify the private artifacts and
 their canonical digests before the explicitly protected resume command:
+
+An active chained extension renews the write approval for the original
+contained hold and captured Time Travel bookmarks. It does not replace those
+recovery anchors: each write re-reads the exact control revision and resolves
+the original bookmark at its original capture timestamp. Their capture
+timestamps may be older than the new boundary only while that extension is
+active; any control or bookmark drift still refuses the write.
 
 ```sh
 test -f /absolute/private/typed-forward-plan.json \

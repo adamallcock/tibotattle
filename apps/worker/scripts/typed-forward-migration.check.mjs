@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, readFile, realpath, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -23,6 +23,7 @@ import {
   TYPED_FORWARD_PREVIOUS_SOURCE,
   TYPED_FORWARD_ROLE_BINDINGS,
   previousReceiptDigest,
+  writePrivateJsonNoClobber,
 } from './typed-forward-migration.mjs';
 import { identityDigest } from '../../../scripts/lib/release-operation.mjs';
 
@@ -237,6 +238,58 @@ test('expired resume is read-only until a chained <=24h extension is approved', 
   const result = await runTypedForwardMigration({ ...f.args, resume: true, now: Date.parse('2026-09-22T14:02:00.000Z'), extension,
     approvedExtensionSha256: identityDigest(extension) });
   assert.equal(result.status, 'completed');
+});
+
+test('an active extension permits writes against capture-produced expired safety receipts', async t => {
+  const f = await fixture(t);
+  const capturedAt = '2026-09-21T12:00:00.000Z';
+  const safetyExpiresAt = '2026-09-22T12:00:00.000Z';
+  const initialNow = Date.parse('2026-09-21T12:01:00.000Z');
+  const snapshot = { schema: 'production-live-config-v1', sourceCommit: TYPED_FORWARD_PREVIOUS_SOURCE, versionId: f.plan.inventory.versionId,
+    fingerprint: f.plan.inventory.fingerprint,
+    bindings: f.targets.map(target => ({ name: target.binding, type: 'd1', database_id: target.databaseId, database_name: target.name })) };
+  const holdCore = { schema: TYPED_FORWARD_MAINTENANCE_HOLD_SCHEMA, state: 'contained', revision: 7, capturedAt, expiresAt: safetyExpiresAt };
+  const hold = { ...holdCore, holdSha256: identityDigest({ schema: holdCore.schema, state: holdCore.state, revision: holdCore.revision }) };
+  const captureAdapter = {
+    async captureMaintenanceHold() { return hold; },
+    async inventory(target) { return [{ id: target.databaseId, name: target.name, bytes: 1000 }]; },
+    async inspect(target) {
+      const previous = f.targets.find(candidate => candidate.role === target.role).previous;
+      return { schemaSha256: previous.schemaSha256, dataInvariantSha256: previous.dataInvariantSha256,
+        migrations: previous.ledger, ledgerSha256: identityDigest(previous.ledger), bytes: 1000 };
+    },
+    async captureBackupReceipt(targets) {
+      const receipt = { schema: 'typed-forward-backup-receipt-v2', provider: 'cloudflare-d1-time-travel', capturedAt,
+        expiresAt: safetyExpiresAt, targetsSha256: identityDigest(targets.map(target => ({ role: target.role, databaseId: target.databaseId }))),
+        targetBookmarks: targets.map(target => ({ role: target.role, databaseId: target.databaseId, bookmark: `captured-${target.role}-bookmark` })) };
+      return { ...receipt, receiptSha256: identityDigest(receipt) };
+    },
+  };
+  const captureDirectory = join(f.scratch, 'capture-produced');
+  await mkdir(captureDirectory, { mode: 0o700 });
+  const captured = await captureTypedForwardInventory({ accountId: f.plan.accountId, workerName: f.plan.workerName,
+    operationDirectory: captureDirectory, cliPath: 'synthetic-cli', wranglerSha256: f.plan.wranglerSha256,
+    migrationGrowthBudgetBytes: 100000, capturedAt, expiresAt: safetyExpiresAt, now: initialNow,
+    inventoryOutputPath: join(captureDirectory, 'inventory.json'), targetsOutputPath: join(captureDirectory, 'targets.json'),
+    backupOutputPath: join(captureDirectory, 'backup.json'), liveProviderFactory: () => ({ async capture() { return { capturedAt }; } }),
+    liveConfigSnapshot: () => snapshot, adapterFactory: () => captureAdapter });
+  assert.equal(captured.inventory.maintenanceHold.expiresAt, safetyExpiresAt);
+  assert.equal(captured.backupReceipt.expiresAt, safetyExpiresAt);
+  const prepared = await prepareTypedForwardPlan({ workerRoot: WORKER_ROOT, repositoryRoot: f.repository.root,
+    accountId: f.plan.accountId, workerName: f.plan.workerName, candidateSourceCommit: f.repository.commit,
+    inventory: captured.inventory, inventorySha256: captured.inventorySha256, targets: captured.targets, rehearsal: f.rehearsal,
+    wranglerSha256: f.plan.wranglerSha256, createdAt: capturedAt, expiresAt: '2026-09-21T13:00:00.000Z', now: initialNow });
+  f.adapter.activeWorker = async () => prepared.plan.inventory.worker;
+  const operationArgs = { ...f.args, plan: prepared.plan, approvedPlanSha256: prepared.planSha256,
+    operationDirectory: join(f.scratch, 'capture-produced-operation'), now: initialNow };
+  f.controls.failAfterWrite = 1;
+  await assert.rejects(runTypedForwardMigration(operationArgs), { code: 'TYPED_FORWARD_MIGRATION_RESULT_UNCERTAIN' });
+  delete f.controls.failAfterWrite;
+  const extension = { schema: 'd1-storage-approval-extension-v1', planSha256: prepared.planSha256,
+    previousExtensionSha256: null, approvedAt: '2026-09-22T12:01:00.000Z', expiresAt: '2026-09-23T12:01:00.000Z' };
+  const resumed = await runTypedForwardMigration({ ...operationArgs, resume: true, now: Date.parse('2026-09-22T12:02:00.000Z'),
+    extension, approvedExtensionSha256: identityDigest(extension) });
+  assert.equal(resumed.status, 'completed');
 });
 
 test('approval extensions require an expired resume and approval at or after the prior deadline', async t => {
@@ -573,6 +626,51 @@ test('inventory capture journals later-output failure and resumes without anothe
   assert.equal(complete.status, 'published');
   assert.deepEqual(complete.published, ['inventory', 'targets', 'backup']);
   for (const path of Object.values(output)) assert.equal((await stat(path)).mode & 0o777, 0o600);
+  const mismatches = [
+    { accountId: 'c'.repeat(32) },
+    { workerName: 'different-worker' },
+    { cliPath: 'different-cli' },
+    { wranglerSha256: 'd'.repeat(64) },
+    { migrationGrowthBudgetBytes: 100001 },
+    { inventoryOutputPath: join(f.scratch, 'different-inventory.json') },
+  ];
+  for (const mismatch of mismatches) {
+    await assert.rejects(captureTypedForwardInventory({ ...captureArgs, ...mismatch, publishFile: undefined,
+      liveProviderFactory: () => assert.fail('context mismatch must stop before another Worker read'),
+      adapterFactory: () => assert.fail('context mismatch must stop before another D1 read') }),
+    { code: 'TYPED_FORWARD_INVENTORY_CAPTURE_CONTEXT_MISMATCH' });
+  }
+  assert.equal(providerFactoryCalls, 1);
+});
+
+test('inventory capture samples a fresh clock after a delayed provider timestamp', async t => {
+  const f = await fixture(t);
+  const snapshot = { schema: 'production-live-config-v1', sourceCommit: TYPED_FORWARD_PREVIOUS_SOURCE, versionId: f.plan.inventory.versionId,
+    fingerprint: f.plan.inventory.fingerprint,
+    bindings: f.targets.map(target => ({ name: target.binding, type: 'd1', database_id: target.databaseId, database_name: target.name })) };
+  const providerNow = '2026-09-22T12:01:00.000Z';
+  const freshNow = Date.parse('2026-09-22T12:02:00.000Z');
+  const observedTimes = [];
+  const adapter = {
+    async captureMaintenanceHold(target, capturedAt, expiresAt, capturedNow) { observedTimes.push(capturedNow); return makeHold(); },
+    async inventory(target) { return [{ id: target.databaseId, name: target.name, bytes: 1000 }]; },
+    async inspect(target) {
+      const previous = f.targets.find(candidate => candidate.role === target.role).previous;
+      return { schemaSha256: previous.schemaSha256, dataInvariantSha256: previous.dataInvariantSha256,
+        migrations: previous.ledger, ledgerSha256: identityDigest(previous.ledger), bytes: 1000 };
+    },
+    async captureBackupReceipt(targets, capturedAt, expiresAt, capturedNow) { observedTimes.push(capturedNow); return f.plan.inventory.backupReceipt; },
+  };
+  const output = { inventory: join(f.scratch, 'delayed-inventory.json'), targets: join(f.scratch, 'delayed-targets.json'),
+    backup: join(f.scratch, 'delayed-backup.json') };
+  const captured = await captureTypedForwardInventory({ accountId: f.plan.accountId, workerName: f.plan.workerName,
+    operationDirectory: f.scratch, cliPath: 'synthetic-cli', wranglerSha256: f.plan.wranglerSha256, migrationGrowthBudgetBytes: 100000,
+    inventoryOutputPath: output.inventory, targetsOutputPath: output.targets, backupOutputPath: output.backup,
+    now, clock: () => freshNow, liveProviderFactory: () => ({ async capture() { return { capturedAt: providerNow }; } }),
+    liveConfigSnapshot: () => snapshot, adapterFactory: () => adapter });
+  assert.equal(captured.remoteWrites, false);
+  assert.deepEqual(observedTimes, [freshNow, freshNow, freshNow]);
+  assert.equal(captured.inventory.capturedAt, providerNow);
 });
 
 test('inventory publication refuses a destination created after preflight without clobbering it', async t => {
@@ -676,9 +774,35 @@ test('concrete active Worker verification uses the canonical live config fingerp
 });
 
 test('CLI argument admission includes extension input and refuses incomplete execution', () => {
+  assert.equal(parseTypedForwardArguments(['--mode', 'rehearse', '--worker-root', 'worker', '--output', 'rehearsal.json']).outputPath, 'rehearsal.json');
   assert.equal(parseTypedForwardArguments(['--mode', 'execute', '--plan', 'plan.json', '--worker-root', 'worker', '--operation', 'operation', '--repository-root', 'repo', '--cli', 'cli', '--confirmation', TYPED_FORWARD_CONFIRMATION, '--approved-plan-sha256', 'a'.repeat(64), '--extension', 'extension.json', '--approved-extension-sha256', 'b'.repeat(64)]).mode, 'execute');
   assert.equal(parseTypedForwardArguments(['--mode', 'capture-backup', '--targets', 'targets.json', '--operation', 'operation', '--cli', 'cli', '--account-id', 'a'.repeat(32), '--wrangler-sha256', 'b'.repeat(64), '--output', 'backup.json']).mode, 'capture-backup');
   assert.equal(parseTypedForwardArguments(['--mode', 'capture-inventory', '--operation', 'operation', '--cli', 'cli', '--account-id', 'a'.repeat(32), '--worker-name', 'worker', '--wrangler-sha256', 'b'.repeat(64), '--growth-budget-bytes', '100000', '--inventory-output', 'inventory.json', '--targets-output', 'targets.json', '--backup-output', 'backup.json']).mode, 'capture-inventory');
   assert.equal(parseTypedForwardArguments(['--mode', 'capture-inventory', '--operation', 'operation', '--cli', 'cli', '--account-id', 'a'.repeat(32), '--worker-name', 'worker', '--wrangler-sha256', 'b'.repeat(64), '--growth-budget-bytes', '0', '--inventory-output', 'inventory.json', '--targets-output', 'targets.json', '--backup-output', 'backup.json']).migrationGrowthBudgetBytes, '0');
   assert.throws(() => parseTypedForwardArguments(['--mode', 'execute', '--plan', 'plan.json']), { code: 'TYPED_FORWARD_ARGUMENTS_INVALID' });
+});
+
+test('rehearse CLI emits an atomic private rehearsal artifact when output is requested', async t => {
+  const f = await fixture(t);
+  const outputPath = join(f.scratch, 'rehearsal.json');
+  const scriptPath = process.cwd().endsWith('/apps/worker') ? 'scripts/typed-forward-migration.mjs' : 'apps/worker/scripts/typed-forward-migration.mjs';
+  const stdout = execFileSync(process.execPath, [scriptPath, '--mode', 'rehearse', '--worker-root', WORKER_ROOT, '--output', outputPath],
+    { cwd: process.cwd(), encoding: 'utf8' });
+  const metadata = JSON.parse(stdout);
+  assert.equal(metadata.status, 'rehearsed');
+  assert.equal(metadata.remoteWrites, false);
+  assert.equal((await stat(outputPath)).mode & 0o777, 0o600);
+  const rehearsal = JSON.parse(await readFile(outputPath, 'utf8'));
+  assert.equal(rehearsal.schema, 'typed-forward-migration-rehearsal-v2');
+  assert.equal(metadata.rehearsalSha256, identityDigest(rehearsal));
+});
+
+test('rehearsal private output refuses a concurrent destination without clobbering it', async t => {
+  const scratch = await realpath(await mkdtemp(join(tmpdir(), 'typed-forward-rehearsal-output-')));
+  t.after(() => rm(scratch, { recursive: true, force: true }));
+  const outputPath = join(scratch, 'rehearsal.json');
+  await assert.rejects(writePrivateJsonNoClobber(outputPath, { schema: 'synthetic-rehearsal' }, {
+    beforeCommit: async path => writeFile(path, 'concurrent\n', { mode: 0o600, flag: 'wx' }),
+  }), { code: 'TYPED_FORWARD_PLAN_OUTPUT_EXISTS' });
+  assert.equal(await readFile(outputPath, 'utf8'), 'concurrent\n');
 });
