@@ -117,6 +117,22 @@ describe("provider-neutral telemetry correction operation", () => {
     }))).toThrow("Telemetry correction operation is invalid");
   });
 
+  it("rejects cyclic, oversized, or accessor-backed replacements before parsing", () => {
+    const cyclic = operation();
+    (cyclic.replacement.chunk as unknown as Record<string, unknown>).self = cyclic.replacement.chunk;
+    expect(() => snapshotTelemetryCorrectionWriteOperation(cyclic)).toThrow("Telemetry correction operation is invalid");
+
+    const oversized = operation();
+    (oversized.replacement.chunk as unknown as Record<string, unknown>).padding = "x".repeat(1_250_001);
+    expect(() => snapshotTelemetryCorrectionWriteOperation(oversized)).toThrow("Telemetry correction operation is invalid");
+
+    const accessor = operation();
+    Object.defineProperty(accessor.replacement.chunk, "chunkDigest", {
+      configurable: true, enumerable: true, get: () => "a".repeat(64),
+    });
+    expect(() => snapshotTelemetryCorrectionWriteOperation(accessor)).toThrow("Telemetry correction operation is invalid");
+  });
+
   it("prepares an occurrence correction from a bounded, digest-matched source fence", async () => {
     const base = operation();
     const source = {
@@ -142,6 +158,33 @@ describe("provider-neutral telemetry correction operation", () => {
       expect.objectContaining({ field: "outputCombinedTokens", status: "known", value: 25 }),
     ]));
     expect(prepared.sourceFence.snapshotDigest).toBe(snapshotDigest);
+
+    const mismatchedReplacement = {
+      ...base.replacement,
+      chunk: { ...base.replacement.chunk, records: [{
+        ...base.replacement.chunk.records[0]!, totalInputContextTokens: 999,
+      }] },
+    };
+    await expect(prepareTelemetryCorrectionWriteOperation({
+      participantId: base.participantId, deviceId: base.deviceId, stream: base.stream,
+      predecessor: base.predecessor, claim: base.claim,
+      replacement: mismatchedReplacement,
+      sourceFence: { snapshotDigest, entries }, sources: [source],
+    })).rejects.toThrow("Telemetry correction operation is invalid");
+
+    await expect(prepareTelemetryCorrectionWriteOperation({
+      participantId: base.participantId, deviceId: base.deviceId, stream: base.stream,
+      predecessor: base.predecessor, claim: base.claim, replacement: base.replacement,
+      sourceFence: { snapshotDigest, entries: [entries[0]!, entries[0]!] }, sources: [source],
+    })).rejects.toThrow("Telemetry correction operation is invalid");
+
+    const fakeEntries = [{ ...entries[0]!, recordDigest: "e".repeat(64) }];
+    const fakeDigest = await sha256Hex(telemetryCorrectionSourceFenceDigestInput(fakeEntries));
+    await expect(prepareTelemetryCorrectionWriteOperation({
+      participantId: base.participantId, deviceId: base.deviceId, stream: base.stream,
+      predecessor: base.predecessor, claim: base.claim, replacement: base.replacement,
+      sourceFence: { snapshotDigest: fakeDigest, entries: fakeEntries }, sources: [source],
+    })).rejects.toThrow("Telemetry correction operation is invalid");
   });
 
   it("keeps an all-null source occurrence unknown", async () => {

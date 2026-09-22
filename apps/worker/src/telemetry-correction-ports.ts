@@ -1,5 +1,6 @@
 import {
   parseTelemetryV1Chunk,
+  MAX_TELEMETRY_V1_CHUNK_CANONICAL_BYTES,
   telemetryV1RecordAnchor,
   type TelemetryV1Chunk,
   type TelemetryV1Record,
@@ -11,8 +12,8 @@ import { sha256Hex } from "./crypto";
 import {
   MAX_USAGE_CORRECTION_PAGE_BYTES,
   MAX_USAGE_CORRECTION_SOURCES,
-  prepareUsageCorrectionAssertion,
-  reconcileUsageCorrectionSources,
+  prepareUsageCorrectionSources,
+  reconcilePreparedUsageCorrectionSources,
   type UsageCorrectionSource,
 } from "./telemetry-usage-reconciliation";
 
@@ -208,10 +209,80 @@ function safeInteger(value: unknown, minimum = 0, maximum = Number.MAX_SAFE_INTE
   return value as number;
 }
 
-function cloneRecord(value: unknown): unknown {
-  if (value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map(cloneRecord);
-  return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, cloneRecord(child)]));
+const utf8 = new TextEncoder();
+const MAX_REPLACEMENT_DEPTH = 16;
+const MAX_REPLACEMENT_NODES = 16_384;
+
+interface ReplacementSnapshotBudget {
+  bytes: number;
+  nodes: number;
+  active: WeakSet<object>;
+}
+
+function replacementBudgetBytes(budget: ReplacementSnapshotBudget, value: string | number | boolean | null): void {
+  const bytes = typeof value === "string" ? utf8.encode(value).byteLength
+    : value === null ? 4 : typeof value === "boolean" ? 5 : 24;
+  budget.bytes += bytes;
+  if (budget.bytes > MAX_TELEMETRY_V1_CHUNK_CANONICAL_BYTES) fail();
+}
+
+/** Clone only a bounded JSON-shaped tree; accessors, cycles, and hidden array
+ * properties are rejected before the parsed replacement can reach an await. */
+function boundedReplacementSnapshot(value: unknown, budget: ReplacementSnapshotBudget, depth = 0): unknown {
+  if (depth > MAX_REPLACEMENT_DEPTH) fail();
+  budget.nodes += 1;
+  if (budget.nodes > MAX_REPLACEMENT_NODES) fail();
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    replacementBudgetBytes(budget, value);
+    return value;
+  }
+  if (typeof value !== "object") fail();
+  if (budget.active.has(value)) fail();
+  budget.active.add(value);
+  try {
+    if (Array.isArray(value)) {
+      if (value.length > 200) fail();
+      const keys = Object.keys(value);
+      if (keys.length !== value.length || keys.some((key, index) => key !== String(index))) fail();
+      return keys.map((key) => {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (!descriptor || !Object.hasOwn(descriptor, "value")) fail();
+        return boundedReplacementSnapshot(descriptor.value, budget, depth + 1);
+      });
+    }
+    const keys = Object.keys(value);
+    if (keys.length > 64) fail();
+    const output: Record<string, unknown> = Object.create(null);
+    for (const key of keys) {
+      if (key.length > 512) fail();
+      replacementBudgetBytes(budget, key);
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !Object.hasOwn(descriptor, "value")) fail();
+      output[key] = boundedReplacementSnapshot(descriptor.value, budget, depth + 1);
+    }
+    return output;
+  } finally {
+    budget.active.delete(value);
+  }
+}
+
+function snapshotReplacementChunk(value: unknown): TelemetryV1Chunk {
+  try {
+    const clone = boundedReplacementSnapshot(value, { bytes: 0, nodes: 0, active: new WeakSet() });
+    if (utf8.encode(canonicalJson(clone)).byteLength > MAX_TELEMETRY_V1_CHUNK_CANONICAL_BYTES) fail();
+    if (!record(clone)) fail();
+    return parseTelemetryV1Chunk({
+      schemaVersion: clone.schemaVersion,
+      chunkId: clone.chunkId,
+      chunkRevision: clone.chunkRevision,
+      chunkDigest: clone.chunkDigest,
+      parserVersion: clone.parserVersion,
+      consent: clone.consent,
+      records: clone.records,
+    });
+  } catch {
+    fail();
+  }
 }
 
 function freezeSnapshot<T>(value: T): T {
@@ -316,8 +387,9 @@ function snapshotInvalidation(value: unknown, operation: {
  * I/O.  This is the single operation-level contract shared by D1 and
  * PostgreSQL; no provider-specific statement or row object can cross it.
  */
-export function snapshotTelemetryCorrectionWriteOperation(
+function snapshotTelemetryCorrectionWriteOperationInternal(
   value: TelemetryCorrectionWriteOperation,
+  preparedChunk?: TelemetryV1Chunk,
 ): TelemetryCorrectionWriteOperation {
   if (!record(value) || value.schemaVersion !== TELEMETRY_CORRECTION_WRITE_SCHEMA_VERSION) fail();
   exactKeys(value, ["schemaVersion", "participantId", "deviceId", "stream", "chunkDay", "chunkSeq",
@@ -342,21 +414,7 @@ export function snapshotTelemetryCorrectionWriteOperation(
   const replacementObjectKey = objectKey(value.replacement.objectKey);
   const envelopeDigest = digest(value.replacement.envelopeDigest);
   const createdAt = instant(value.replacement.createdAt);
-  let chunk: TelemetryV1Chunk;
-  try {
-    const rawChunk = value.replacement.chunk;
-    chunk = parseTelemetryV1Chunk(cloneRecord({
-      schemaVersion: rawChunk.schemaVersion,
-      chunkId: rawChunk.chunkId,
-      chunkRevision: rawChunk.chunkRevision,
-      chunkDigest: rawChunk.chunkDigest,
-      parserVersion: rawChunk.parserVersion,
-      consent: rawChunk.consent,
-      records: rawChunk.records,
-    }));
-  } catch {
-    fail();
-  }
+  const chunk = preparedChunk ?? snapshotReplacementChunk(value.replacement.chunk);
   if (chunk.stream !== stream || chunk.chunkDay !== chunkDay || chunk.chunkSeq !== chunkSeq
       || chunk.chunkRevision !== predecessorRevision + 1 || chunk.chunkId !== value.replacement.chunk.chunkId
       || chunk.records.length < 1) fail();
@@ -386,11 +444,17 @@ export function snapshotTelemetryCorrectionWriteOperation(
     sourceFence,
     replacement: Object.freeze({
       chunkId: replacementChunkId, objectKey: replacementObjectKey, envelopeDigest,
-      chunk: freezeSnapshot(cloneRecord(chunk)) as TelemetryV1Chunk, createdAt,
+      chunk: freezeSnapshot(chunk) as TelemetryV1Chunk, createdAt,
     }),
     outcomes,
     invalidation,
   });
+}
+
+export function snapshotTelemetryCorrectionWriteOperation(
+  value: TelemetryCorrectionWriteOperation,
+): TelemetryCorrectionWriteOperation {
+  return snapshotTelemetryCorrectionWriteOperationInternal(value);
 }
 
 function assertUsageReplacementMatchesOutcomes(
@@ -398,7 +462,25 @@ function assertUsageReplacementMatchesOutcomes(
   outcomes: readonly TelemetryCorrectionFieldOutcome[],
 ): void {
   const byOccurrence = new Map<string, TelemetryCorrectionFieldOutcome>();
-  for (const outcome of outcomes) byOccurrence.set(`${outcome.occurrenceId}\u0000${outcome.field}`, outcome);
+  const expectedKeys = new Set<string>();
+  for (const item of chunk.records) {
+    const occurrenceId = telemetryV1RecordAnchor("usage", item).occurrenceId;
+    const usage = item as TelemetryV1UsageEvent;
+    const expected: readonly [TelemetryCorrectionField, number | null][] = [
+      ["totalInputContextTokens", usage.totalInputContextTokens],
+      ["outputCombinedTokens", usage.components.outputCombinedTokens],
+    ];
+    for (const [field] of expected) {
+      expectedKeys.add(`${occurrenceId}\u0000${field}`);
+    }
+    expectedKeys.add(`${occurrenceId}\u0000record`);
+  }
+  if (outcomes.length !== expectedKeys.size) fail();
+  for (const outcome of outcomes) {
+    const key = `${outcome.occurrenceId}\u0000${outcome.field}`;
+    if (!expectedKeys.has(key) || byOccurrence.has(key)) fail();
+    byOccurrence.set(key, outcome);
+  }
   for (const item of chunk.records) {
     const occurrenceId = telemetryV1RecordAnchor("usage", item).occurrenceId;
     const usage = item as TelemetryV1UsageEvent;
@@ -449,23 +531,30 @@ export async function prepareTelemetryCorrectionWriteOperation(
     return Object.freeze({ ownerScope: source.ownerScope,
       format: source.format as UsageCorrectionSource["format"], recordJson: source.recordJson });
   }));
+  const replacementChunk = snapshotReplacementChunk(input.replacement.chunk);
   const predecessor = Object.freeze({ ...input.predecessor });
   const claim = Object.freeze({ ...input.claim });
   const replacement = Object.freeze({
     ...input.replacement,
-    chunk: freezeSnapshot(cloneRecord(input.replacement.chunk)) as TelemetryV1Chunk,
+    chunk: replacementChunk,
   });
-  const reconciled = await reconcileUsageCorrectionSources({ ownerScope: participantId, sources });
-  const assertions: Awaited<ReturnType<typeof prepareUsageCorrectionAssertion>>[] = [];
-  for (const source of sources) assertions.push(await prepareUsageCorrectionAssertion(source));
+  const preparedSources = await prepareUsageCorrectionSources(participantId, sources);
+  const reconciled = reconcilePreparedUsageCorrectionSources({ ownerScope: participantId, prepared: preparedSources });
+  const assertions = preparedSources.map((prepared) => prepared.assertion);
   if (sourceFence.entries.length !== assertions.length) fail();
-  for (let index = 0; index < assertions.length; index += 1) {
-    const fence = sourceFence.entries[index]!;
-    const assertion = assertions[index]!;
-    if (fence.format !== sourceFormat(sources[index]!.format)
-        || fence.occurrenceId !== assertion.occurrenceId
-        || fence.recordDigest !== assertion.recordDigest) fail();
+  const fenceCounts = new Map<string, number>();
+  for (const fence of sourceFence.entries) {
+    const key = `${fence.format}\u0000${fence.occurrenceId}\u0000${fence.recordDigest}`;
+    fenceCounts.set(key, (fenceCounts.get(key) ?? 0) + 1);
   }
+  for (let index = 0; index < assertions.length; index += 1) {
+    const assertion = assertions[index]!;
+    const key = `${sourceFormat(sources[index]!.format)}\u0000${assertion.occurrenceId}\u0000${assertion.recordDigest}`;
+    const remaining = fenceCounts.get(key) ?? 0;
+    if (remaining < 1) fail();
+    fenceCounts.set(key, remaining - 1);
+  }
+  if ([...fenceCounts.values()].some((remaining) => remaining !== 0)) fail();
   const expectedFenceDigest = await sha256Hex(telemetryCorrectionSourceFenceDigestInput(sourceFence.entries));
   if (expectedFenceDigest !== sourceFence.snapshotDigest) fail();
   const formatsByOccurrence = new Map<string, Set<TelemetryCorrectionSourceFormat>>();
@@ -506,9 +595,8 @@ export async function prepareTelemetryCorrectionWriteOperation(
     });
   }
   assertUsageReplacementMatchesOutcomes(replacement.chunk, outcomes);
-  const replacementChunk = replacement.chunk;
   const occurrenceIds = reconciled.map((row) => row.occurrenceId);
-  return snapshotTelemetryCorrectionWriteOperation({
+  return snapshotTelemetryCorrectionWriteOperationInternal({
     schemaVersion: TELEMETRY_CORRECTION_WRITE_SCHEMA_VERSION,
     participantId,
     deviceId,
@@ -526,5 +614,5 @@ export async function prepareTelemetryCorrectionWriteOperation(
       predecessorChunkId: predecessor.chunkId, replacementChunkId: replacement.chunkId,
       reason: "accepted-correction",
     },
-  });
+  }, replacementChunk);
 }

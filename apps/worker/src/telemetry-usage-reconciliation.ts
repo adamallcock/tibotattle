@@ -130,7 +130,7 @@ async function prepare(input: UsageCorrectionInput) {
   return { assertion, legacy: row };
 }
 
-interface PreparedUsageCorrection {
+export interface PreparedUsageCorrection {
   readonly assertion: UsageCorrectionAssertion;
   readonly legacy: TelemetryV1UsageEvent;
 }
@@ -159,6 +159,22 @@ function snapshotUsageCorrectionPage(
  */
 export async function prepareUsageCorrectionAssertion(input: UsageCorrectionInput): Promise<UsageCorrectionAssertion> {
   return (await prepare(input)).assertion;
+}
+
+/**
+ * Snapshot and prepare one bounded source page exactly once. Correction
+ * adapters use this before provider I/O; the returned rows contain the
+ * canonical assertion and parsed legacy template needed by reconciliation.
+ */
+export async function prepareUsageCorrectionSources(
+  ownerScope: string,
+  sources: readonly UsageCorrectionSource[],
+): Promise<readonly PreparedUsageCorrection[]> {
+  assertOwnerScope(ownerScope);
+  const snapshots = snapshotUsageCorrectionPage(ownerScope, sources);
+  const prepared: PreparedUsageCorrection[] = [];
+  for (const source of snapshots) prepared.push(await prepare(source));
+  return Object.freeze(prepared);
 }
 
 export interface ReconciledUsageTotal {
@@ -211,21 +227,22 @@ function reconcileTotal(assertions: readonly UsageCorrectionAssertion[], kind: "
   return Object.freeze({ status: value === null ? "unknown" : "reported", value });
 }
 
-/** Bounded qualification primitive. This does not establish complete owner-day coverage,
- * activate a generation, admit an upload, or select a newest source family.
- */
-export async function reconcileUsageCorrectionSources(input: {
+/** Reconcile a page that has already passed the bounded preparation pass. */
+export function reconcilePreparedUsageCorrectionSources(input: {
   ownerScope: string;
-  sources: readonly UsageCorrectionSource[];
-}): Promise<readonly ReconciledUsageOccurrence[]> {
+  prepared: readonly PreparedUsageCorrection[];
+}): readonly ReconciledUsageOccurrence[] {
   if (typeof input !== "object" || input === null || Array.isArray(input)) fail();
   assertOwnerScope(input.ownerScope);
-  const snapshots = snapshotUsageCorrectionPage(input.ownerScope, input.sources);
+  if (!Array.isArray(input.prepared) || input.prepared.length > MAX_USAGE_CORRECTION_SOURCES) {
+    fail("USAGE_CORRECTION_LIMIT");
+  }
   const ownerScope = input.ownerScope;
   const groups = new Map<string, PreparedUsageCorrection[]>();
-  // Sequential hashing keeps asynchronous work bounded as well as the input.
-  for (const source of snapshots) {
-    const prepared = await prepare(source);
+  for (const prepared of input.prepared) {
+    if (prepared === null || typeof prepared !== "object"
+        || prepared.assertion === null || typeof prepared.assertion !== "object"
+        || prepared.legacy === null || typeof prepared.legacy !== "object") fail();
     const rows = groups.get(prepared.assertion.occurrenceId) ?? [];
     rows.push(prepared);
     groups.set(prepared.assertion.occurrenceId, rows);
@@ -246,9 +263,24 @@ export async function reconcileUsageCorrectionSources(input: {
         totalInputContextTokens, outputCombinedTokens,
         effectiveLegacyRecord: status !== "compatible" ? null : canonicalTelemetryV11Json({ ...row,
           totalInputContextTokens: totalInputContextTokens.value,
-          components: { ...row.components, outputCombinedTokens: outputCombinedTokens.value } }),
+          components: { ...row.components, outputCombinedTokens: outputCombinedTokens.value },
+        }),
       });
     }));
+}
+
+/** Bounded qualification primitive. This does not establish complete owner-day coverage,
+ * activate a generation, admit an upload, or select a newest source family.
+ */
+export async function reconcileUsageCorrectionSources(input: {
+  ownerScope: string;
+  sources: readonly UsageCorrectionSource[];
+}): Promise<readonly ReconciledUsageOccurrence[]> {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) fail();
+  return reconcilePreparedUsageCorrectionSources({
+    ownerScope: input.ownerScope,
+    prepared: await prepareUsageCorrectionSources(input.ownerScope, input.sources),
+  });
 }
 
 interface StreamingTotalState {

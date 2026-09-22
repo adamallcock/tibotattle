@@ -714,14 +714,25 @@ export function createD1TelemetryAuthorityBackend(db: D1Database): TelemetryAuth
           JOIN device_credentials d ON d.participant_id = p.id
           LEFT JOIN ${v12 ? "telemetry_v12_device_capabilities" : "telemetry_v11_device_consents"} c
             ON c.participant_id = p.id AND c.device_id = d.id
-          LEFT JOIN accountless_v11_device_authorizations a ON a.participant_id = p.id
-            AND a.device_credential_id = d.id AND a.state = 'active' AND a.expires_at > ?
+            AND c.telemetry_schema_version = '${v12 ? TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION : TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION}'
+            AND c.field_dictionary_version = '${v12 ? TELEMETRY_V12_FIELD_DICTIONARY_VERSION : TELEMETRY_V11_FIELD_DICTIONARY_VERSION}'
+            AND c.privacy_contract_version = '${v12 ? TELEMETRY_V12_PRIVACY_CONTRACT_VERSION : TELEMETRY_V11_PRIVACY_CONTRACT_VERSION}'
+            ${v12 ? "AND c.state = 'accepted'" : ""}
+          LEFT JOIN ${v12 ? "accountless_v12_device_authorizations" : "accountless_v11_device_authorizations"} a
+            ON a.participant_id = p.id
+            AND a.device_credential_id = d.id
+            AND a.telemetry_schema_version = '${v12 ? TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION : TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION}'
+            AND a.field_dictionary_version = '${v12 ? TELEMETRY_V12_FIELD_DICTIONARY_VERSION : TELEMETRY_V11_FIELD_DICTIONARY_VERSION}'
+            AND a.privacy_contract_version = '${v12 ? TELEMETRY_V12_PRIVACY_CONTRACT_VERSION : TELEMETRY_V11_PRIVACY_CONTRACT_VERSION}'
+            AND a.state = 'active' AND a.expires_at > ?
           WHERE p.id = ? AND p.state = 'active' AND d.id = ? AND d.state = 'active'
             AND d.expires_at > ?`).bind(input.now, input.principal.participantId,
           input.principal.deviceId, input.now).first<D1Row>();
         if (!row) throw new ApiError(401, "DEVICE_AUTH_INVALID");
         const formats = await db.prepare(`SELECT schema_version, format_rank, lifecycle
-          FROM telemetry_transport_formats ORDER BY format_rank LIMIT 5`).all<D1Row>();
+          FROM telemetry_transport_formats
+         WHERE format_rank IN (1, 2, 10, 11${v12 ? ", 12" : ""})
+         ORDER BY format_rank`).all<D1Row>();
         if (formats.results.length < (v12 ? 5 : 4)) throw unavailable();
         const ownerKind = row.owner_kind;
         const authorityKind = row.authority_kind;

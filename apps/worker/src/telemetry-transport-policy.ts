@@ -2,6 +2,8 @@ import {
   isTelemetryV11ConsentCurrent,
   telemetryV11RequiredConsent,
   TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
+  TELEMETRY_V11_FIELD_DICTIONARY_VERSION,
+  TELEMETRY_V11_PRIVACY_CONTRACT_VERSION,
   type TelemetryV11Consent,
 } from "@app-usagemonitor/telemetry-contract";
 import { ApiError } from "./errors";
@@ -210,7 +212,11 @@ export async function telemetryTransportCapabilities(
        FROM participants p JOIN attribution_enrollments e ON e.participant_id = p.id
        JOIN telemetry_transport_participant_floors f ON f.participant_id = p.id
        JOIN device_credentials d ON d.participant_id = p.id
-       LEFT JOIN telemetry_v11_device_consents c ON c.participant_id = p.id AND c.device_id = d.id
+       LEFT JOIN telemetry_v11_device_consents c
+         ON c.participant_id = p.id AND c.device_id = d.id
+        AND c.telemetry_schema_version = ?
+        AND c.field_dictionary_version = ?
+        AND c.privacy_contract_version = ?
        LEFT JOIN accountless_enrollment_ledger ledger
          ON ledger.device_id = d.accountless_enrollment_device_id
         AND ledger.state = 'active' AND ledger.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -224,11 +230,15 @@ export async function telemetryTransportCapabilities(
         AND owner.enrollment_device_id = ledger.device_id
         AND accountless_grant.participant_id = p.id
         AND accountless_grant.device_credential_id = d.id
+        AND accountless_grant.telemetry_schema_version = 'telemetry-contribution-v1.1'
+        AND accountless_grant.field_dictionary_version = 'telemetry-v1.1-registry-2026-08-31.1'
+        AND accountless_grant.privacy_contract_version = 'ongoing-privacy-safe-telemetry-v1.1'
         AND accountless_grant.state = 'active'
         AND accountless_grant.expires_at = ledger.expires_at
       WHERE p.id = ? AND p.state = 'active' AND d.id = ? AND d.state = 'active'
         AND d.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
-  ).bind(principal.participantId, principal.deviceId).first<{
+  ).bind(TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, TELEMETRY_V11_FIELD_DICTIONARY_VERSION,
+    TELEMETRY_V11_PRIVACY_CONTRACT_VERSION, principal.participantId, principal.deviceId).first<{
     namespace: string; minimum_rank: number; revision: number; consent_v11: number;
     owner_kind: "social" | "accountless";
     authority_kind: "social" | "accountless";
@@ -242,7 +252,8 @@ export async function telemetryTransportCapabilities(
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
   const formats = await db.prepare(
-    "SELECT schema_version, format_rank, lifecycle FROM telemetry_transport_formats ORDER BY format_rank LIMIT 5",
+    "SELECT schema_version, format_rank, lifecycle FROM telemetry_transport_formats "
+      + "WHERE format_rank IN (1, 2, 10, 11) ORDER BY format_rank",
   ).all<{ schema_version: string; format_rank: number; lifecycle: "accepted" | "staged" | "blocked" }>();
   if (formats.results.length !== 4) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   const base = {

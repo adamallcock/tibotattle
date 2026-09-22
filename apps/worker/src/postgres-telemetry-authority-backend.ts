@@ -830,14 +830,24 @@ export function createPostgresTelemetryAuthorityBackend(
         JOIN ${tables.deviceCredentials} d ON d.participant_id = p.id
         LEFT JOIN ${v12 ? tables.telemetryV12DeviceCapabilities : tables.telemetryV11DeviceConsents} c
           ON c.participant_id = p.id AND c.device_id = d.id
+          AND c.telemetry_schema_version = '${v12 ? TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION : TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION}'
+          AND c.field_dictionary_version = '${v12 ? TELEMETRY_V12_FIELD_DICTIONARY_VERSION : TELEMETRY_V11_FIELD_DICTIONARY_VERSION}'
+          AND c.privacy_contract_version = '${v12 ? TELEMETRY_V12_PRIVACY_CONTRACT_VERSION : TELEMETRY_V11_PRIVACY_CONTRACT_VERSION}'
+          ${v12 ? "AND c.state = 'accepted'" : ""}
         LEFT JOIN ${v12 ? tables.accountlessV12DeviceAuthorizations : tables.accountlessV11DeviceAuthorizations} a ON a.participant_id = p.id
-          AND a.device_credential_id = d.id AND a.state = 'active' AND a.expires_at > $1
+          AND a.device_credential_id = d.id
+          AND a.telemetry_schema_version = '${v12 ? TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION : TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION}'
+          AND a.field_dictionary_version = '${v12 ? TELEMETRY_V12_FIELD_DICTIONARY_VERSION : TELEMETRY_V11_FIELD_DICTIONARY_VERSION}'
+          AND a.privacy_contract_version = '${v12 ? TELEMETRY_V12_PRIVACY_CONTRACT_VERSION : TELEMETRY_V11_PRIVACY_CONTRACT_VERSION}'
+          AND a.state = 'active' AND a.expires_at > $1
         WHERE p.id = $2 AND p.state = 'active' AND d.id = $3 AND d.state = 'active' AND d.expires_at > $1`,
         [input.now, input.principal.participantId, input.principal.deviceId]);
         if (state.rowCount !== 1) throw new ApiError(401, "DEVICE_AUTH_INVALID");
         const row = rowOne<Record<string, unknown>>(state);
         const formats = await client.query(`SELECT schema_version, format_rank, lifecycle
-          FROM ${tables.telemetryTransportFormats} ORDER BY format_rank LIMIT 5`);
+          FROM ${tables.telemetryTransportFormats}
+         WHERE format_rank IN (1, 2, 10, 11${v12 ? ", 12" : ""})
+         ORDER BY format_rank`);
         if (formats.rowCount === null || formats.rowCount < (v12 ? 5 : 4)) throw unavailable();
         const ownerKind = row.owner_kind; const authorityKind = row.authority_kind;
         if ((ownerKind !== "social" && ownerKind !== "accountless")

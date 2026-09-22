@@ -6,6 +6,7 @@ import { isAbsolute } from "node:path";
 import { join } from "node:path";
 import { createPostgresTelemetryAuthorityBackend } from "../src/postgres-telemetry-authority-backend.ts";
 import { createPostgresIdentityHandoffBackend } from "../src/postgres-identity-handoff-backend.ts";
+import { readTelemetryV11Capabilities } from "../../src/contribution/telemetry-v11-sync.js";
 
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 const hash = (value) => Buffer.alloc(32, value);
@@ -138,6 +139,15 @@ async function insertPairingAndDevice() {
       credentialGeneration: 1,
     },
   })).toBe(true);
+}
+
+async function insertTransportCapabilityRows() {
+  await pool.query(`INSERT INTO "${primarySchema}".attribution_enrollments
+    (participant_id, namespace, created_at) VALUES ($1, $2, $3)`,
+  [participantId, "e".repeat(64), now]);
+  await pool.query(`INSERT INTO "${primarySchema}".telemetry_transport_participant_floors
+    (participant_id, minimum_rank, revision, changed_at) VALUES ($1, 1, 0, $2)`,
+  [participantId, now]);
 }
 
 async function insertDeviceGrant(id = "device-grant") {
@@ -360,6 +370,55 @@ it("does not double-consume when the receipt commit acknowledgement is lost", as
   expect(await authority.sessionUploads.recordReceipt({
     authorizationId: id, participantId, contributionId: "ack-loss", leaseExpiresAt: later, now,
   })).toBe(true);
+});
+
+it("keeps the legacy capability parser compatible while v1.2 moves from staged to accepted", async () => {
+  await clearAuthority();
+  await insertSession();
+  await insertPairingAndDevice();
+  await insertTransportCapabilityRows();
+  const deviceAuthorization = "Device um_device_550e8400-e29b-41d4-a716-446655440000." + "A".repeat(43);
+  const readLegacyCapabilities = async () => {
+    const value = await authority.transport.capabilities({
+      principal: { participantId, deviceId },
+      destinationOrigin: "https://example.test",
+      now,
+      schemaVersion: "telemetry-contribution-v1.1",
+    });
+    return readTelemetryV11Capabilities({
+      serverBaseUrl: "https://example.test",
+      deviceAuthorization,
+      clock: () => baseEpoch,
+      fetchImpl: async (url) => {
+        expect(url.pathname).toBe("/api/v1/device/sync-capabilities");
+        return new Response(JSON.stringify(value), {
+          status: 200,
+          headers: { "cache-control": "no-store", "content-type": "application/json" },
+        });
+      },
+    });
+  };
+
+  const staged = await readLegacyCapabilities();
+  expect(staged.schemaVersion).toBe("device-sync-capabilities-v1.1");
+  expect(staged.formats).toHaveLength(4);
+  expect(staged.formats.map((format) => format.rank)).toEqual([1, 2, 10, 11]);
+  expect(staged.formats.find((format) => format.rank === 11)?.lifecycle).toBe("staged");
+
+  await pool.query(`UPDATE "${primarySchema}".telemetry_transport_formats
+    SET lifecycle = 'accepted' WHERE format_rank = 12`);
+  const accepted = await readLegacyCapabilities();
+  expect(accepted.formats).toHaveLength(4);
+  expect(accepted.formats.find((format) => format.rank === 11)?.lifecycle).toBe("staged");
+
+  const successor = await authority.transport.capabilities({
+    principal: { participantId, deviceId },
+    destinationOrigin: "https://example.test",
+    now,
+    schemaVersion: "telemetry-contribution-v1.2",
+  });
+  expect(successor.formats).toHaveLength(5);
+  expect(successor.formats.find((format) => format.rank === 12)?.lifecycle).toBe("accepted");
 });
 
 it("keeps Apple identity handoffs fenced and bounded", async () => {
