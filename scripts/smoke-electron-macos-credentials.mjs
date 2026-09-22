@@ -249,10 +249,27 @@ export async function exerciseCredentialRefresh(dashboard, clock) {
   return true;
 }
 
+// Retain fixed failure families only; exception messages, URLs and paths stay private.
+export function macCredentialFailureDiagnostics(error) {
+  const launchStages = ['process_group', 'native_intro', 'owned_debugger', 'dashboard_target',
+    'dashboard_ready', 'settings_target', 'settings_ready'];
+  const launchCodes = ['startup', 'process_inventory', 'preexisting_app', 'local_response',
+    'native_intro_identity', 'native_intro_closed', 'native_intro_unexpected',
+    'native_intro_automation_unavailable'];
+  const settingsCodes = ['settings_tab', 'settings_ready', 'settings_click', 'settings_effect'];
+  return {
+    launchStage: launchStages.includes(error?.signedLaunchStage) ? error.signedLaunchStage : null,
+    launchCode: launchCodes.includes(error?.stage) ? error.stage : null,
+    settingsStage: settingsCodes.includes(error?.emptyProfileStage) ? error.emptyProfileStage : null,
+    launchOwnedProcessesStopped: typeof error?.ownedMacProcessesStopped === 'boolean'
+      ? error.ownedMacProcessesStopped : null,
+  };
+}
+
 export async function runMacCredentialQualification({ intake, execute = false }) {
   const proof = { schemaVersion: SCHEMA, status: 'planned', credentialContinuityQualified: false,
     enforcedLoopbackOnly: false, fixtureCleaned: false, ownedProcessesStopped: false,
-    applicationBytesUnchanged: false, cases: [], fixtureScopes: [], failureStage: null, failurePhase: null, fixtureFailure: null,
+    applicationBytesUnchanged: false, cases: [], fixtureScopes: [], failureStage: null, failurePhase: null, failureDiagnostics: null, fixtureFailure: null,
     nativeLegacyMigrationQualified: false, hostedUploadQualified: false, timeoutQualified: false,
     lockedStoreQualified: false, deniedStoreQualified: false, legacyOnlyQualified: false,
     nativeCleanQuitQualified: false, partialMigrationQualified: false,
@@ -296,8 +313,8 @@ export async function runMacCredentialQualification({ intake, execute = false })
     proof.fixtureScopes.push({ scenario: 'modern', ...((await fixture.request('select')).scope) });
     await fixture.request('scope');
     stage = 'predecessor_launch'; active = await launchVerifiedMacSharingApp(verified, environment, { ...launchOptions, untouched: true });
-    await exerciseEmptyProfileSettings(active.settings);
-    await active.settings.evaluate('globalThis.tibotattleDesktop.setSharingEnabled(false)');
+    stage = 'predecessor_settings'; await exerciseEmptyProfileSettings(active.settings);
+    stage = 'predecessor_opt_out'; await active.settings.evaluate('globalThis.tibotattleDesktop.setSharingEnabled(false)');
     await until(async () => (await active.readSharing())?.enabled === false, 'predecessor_opt_out');
     await stopOwnedMacSharingApp(active); active = null;
     if (JSON.stringify(validateCredentialSnapshot(await fixture.request('snapshot'), 'modern')) !== JSON.stringify(before)) fail('predecessor_credential_changed');
@@ -348,6 +365,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
     proof.credentialContinuityQualified = true; proof.status = 'passed';
   } catch (error) {
     proof.status = 'failed'; proof.failureStage = error.credentialStage ?? stage; proof.failurePhase = stage;
+    proof.failureDiagnostics = macCredentialFailureDiagnostics(error);
     if (error.fixtureFailure) proof.fixtureFailure = error.fixtureFailure;
   }
   finally {

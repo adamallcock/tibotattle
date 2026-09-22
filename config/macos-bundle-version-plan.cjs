@@ -31,8 +31,10 @@ const SIGNED_MACOS_BUNDLE_VERSION_PLAN = Object.freeze({
   "0.1.22": Object.freeze({ stable: "1029" }),
   // Next desktop candidate; allocation alone is not signed artifact evidence.
   "0.1.23": Object.freeze({ stable: "1030" }),
-  // 0.1.24 release allocation; final artifact qualification remains separate.
-  "0.1.24": Object.freeze({ stable: "1031" }),
+  // Supersede unpublished candidate 1031 after its native-upgrade qualification
+  // found startup diagnostics occupying the migration target. Qualification
+  // and publication of this replacement allocation remain separate gates.
+  "0.1.24": Object.freeze({ stable: "1032" }),
 });
 
 module.exports = { SIGNED_MACOS_BUNDLE_VERSION_PLAN };

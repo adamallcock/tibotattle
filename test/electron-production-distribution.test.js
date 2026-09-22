@@ -143,25 +143,25 @@ test("023 allocation advances released 022 on both Mac architectures independent
   }
 });
 
-test("024 allocation advances released 023 on both Mac architectures independently of provenance", () => {
-  assert.equal(resolveSignedMacOSBundleVersion("0.1.24", "stable"), "1031");
-  assert.equal(compareAppleMacOSBundleVersions("1030", "1031"), -1);
-  assert.equal(isAppleMacOSBundleVersion("1031"), true);
+test("024 allocation advances unpublished candidate 1031 on both Mac architectures independently of provenance", () => {
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.24", "stable"), "1032");
+  assert.equal(compareAppleMacOSBundleVersions("1031", "1032"), -1);
+  assert.equal(isAppleMacOSBundleVersion("1032"), true);
   for (const target of ["darwin-arm64", "darwin-x64"]) {
     for (const buildNumber of ["2026092201", "2026092202"]) {
       const input = { target, version: "0.1.24", buildNumber };
-      assert.equal(POLICY.productionElectronBuildVersionForTarget(input), "1031");
+      assert.equal(POLICY.productionElectronBuildVersionForTarget(input), "1032");
       assert.deepEqual(POLICY.assertProductionElectronMacOSBundleMetadata({
-        ...input, bundleVersion: "1031", bundleShortVersion: "0.1.24",
-      }), { bundleVersion: "1031", bundleShortVersion: "0.1.24" });
-      for (const bundleVersion of [undefined, "1030", "1031.0", buildNumber]) {
+        ...input, bundleVersion: "1032", bundleShortVersion: "0.1.24",
+      }), { bundleVersion: "1032", bundleShortVersion: "0.1.24" });
+      for (const bundleVersion of [undefined, "1030", "1031", "1032.0", buildNumber]) {
         assert.throws(() => POLICY.assertProductionElectronMacOSBundleMetadata({
           ...input, bundleVersion, bundleShortVersion: "0.1.24",
         }), /reviewed production allocation/u);
       }
-      for (const bundleShortVersion of [undefined, "0.1.23", "1031"]) {
+      for (const bundleShortVersion of [undefined, "0.1.23", "1032"]) {
         assert.throws(() => POLICY.assertProductionElectronMacOSBundleMetadata({
-          ...input, bundleVersion: "1031", bundleShortVersion,
+          ...input, bundleVersion: "1032", bundleShortVersion,
         }), /reviewed production allocation/u);
       }
     }

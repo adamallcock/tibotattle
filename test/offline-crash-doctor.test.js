@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -146,34 +146,40 @@ test("private export preserves a matching Apple report when its body is not yet 
   }
 });
 
-test("private export includes the startup journal when the companion never started", async () => {
-  const homeDirectory = await mkdtemp(join(tmpdir(), "tibotattle-private-doctor-"));
-  try {
-    const settings = join(homeDirectory, "Library", "Application Support", "TiboTattle",
-      "desktop-settings");
-    await mkdir(settings, { recursive: true, mode: 0o700 });
-    const startup = `${JSON.stringify({
-      schemaVersion: "tibotattle-electron-startup-diagnostic-v1",
-      recordedAt: "2026-09-22T14:00:01.000Z",
-      startedAt: "2026-09-22T14:00:00.000Z",
-      phase: "settings",
-      outcome: "failed",
-      code: "electron_shell_desktop_codex_roots_invalid",
-      platform: "darwin",
-      architecture: "arm64",
-      version: "0.1.24",
-    })}\n`;
-    await writeFile(join(settings, "startup-diagnostic-v1.json"), startup, { mode: 0o600 });
-    const directory = join(homeDirectory, "private-evidence");
-    const result = await exportPrivateCrashEvidence({
-      directory, homeDirectory, platform: "darwin", hours: 1,
-    });
-    assert.equal(result.includedFiles, 1);
-    assert.equal(await readFile(join(directory, "startup-stable.json"), "utf8"), startup);
-  } finally {
-    await rm(homeDirectory, { recursive: true, force: true });
-  }
-});
+for (const diagnosticDirectory of ["startup-diagnostics", "desktop-settings"]) {
+  test(`private export includes the ${diagnosticDirectory} startup journal when the companion never started`, async () => {
+    const homeDirectory = await mkdtemp(join(tmpdir(), "tibotattle-private-doctor-"));
+    try {
+      const settings = join(homeDirectory, "Library", "Application Support", "TiboTattle",
+        diagnosticDirectory);
+      await mkdir(settings, { recursive: true, mode: 0o700 });
+      const startup = `${JSON.stringify({
+        schemaVersion: "tibotattle-electron-startup-diagnostic-v1",
+        recordedAt: "2026-09-22T14:00:01.000Z",
+        startedAt: "2026-09-22T14:00:00.000Z",
+        phase: "settings",
+        outcome: "failed",
+        code: "electron_shell_desktop_codex_roots_invalid",
+        platform: "darwin",
+        architecture: "arm64",
+        version: "0.1.24",
+      })}\n`;
+      await writeFile(join(settings, "startup-diagnostic-v1.json"), startup, { mode: 0o600 });
+      const directory = join(homeDirectory, "private-evidence");
+      const result = await exportPrivateCrashEvidence({
+        directory, homeDirectory, platform: "darwin", hours: 1,
+      });
+      assert.equal(result.includedFiles, 1);
+      assert.equal(await readFile(join(directory, "startup-stable.json"), "utf8"), startup);
+      const diagnosis = await diagnoseDesktopCrash({ homeDirectory, platform: "darwin" });
+      assert.equal(diagnosis.startupDiagnostics[0].status, "available");
+      assert.equal(diagnosis.startupDiagnostics[0].record.phase, "settings");
+    } finally {
+      await rm(homeDirectory, { recursive: true, force: true });
+    }
+  });
+
+}
 
 test("legacy crash parser selects crashed-thread frames without report paths", () => {
   const raw = `Process: TiboTattle [123]\nException Type: EXC_CRASH (SIGABRT)\nTermination Reason: Namespace SIGNAL, Code 6 Abort trap: 6\nTriggered by Thread: 1\nThread 0:\n0 libSystem 0x123456 Other + 1\nThread 1 Crashed:\n0 TiboTattle 0x123456 TiboStart + 12\n1 libSystem 0x123457 /Users/private/secret + 4\n\nBinary Images:\n/Users/private/account\n`;
@@ -335,3 +341,38 @@ test("verbose mode reads only validated companion diagnostic notes", async () =>
     await rm(homeDirectory, { recursive: true, force: true });
   }
 });
+
+
+for (const current of ["valid", "invalid", "unsafe", "symlink", "hardlink", "oversize"]) {
+  test(`startup doctor prefers the current record and does not hide ${current} evidence behind legacy state`, async (t) => {
+    const homeDirectory = await mkdtemp(join(tmpdir(), "tibotattle-startup-precedence-"));
+    t.after(() => rm(homeDirectory, { recursive: true, force: true }));
+    const userData = join(homeDirectory, "Library", "Application Support", "TiboTattle");
+    const record = phase => JSON.stringify({
+      schemaVersion: "tibotattle-electron-startup-diagnostic-v1",
+      recordedAt: "2026-09-22T14:00:01.000Z", startedAt: "2026-09-22T14:00:00.000Z",
+      phase, outcome: "stopped", code: "native_handover_blocked", platform: "darwin",
+      architecture: "arm64", version: "0.1.24",
+    });
+    const legacy = join(userData, "desktop-settings", "startup-diagnostic-v1.json");
+    const selected = join(userData, "startup-diagnostics", "startup-diagnostic-v1.json");
+    await mkdir(join(userData, "desktop-settings"), { recursive: true, mode: 0o700 });
+    await mkdir(join(userData, "startup-diagnostics"), { mode: 0o700 });
+    await writeFile(legacy, record("settings"), { mode: 0o600 });
+    if (current === "symlink") await symlink(legacy, selected);
+    else if (current === "hardlink") await link(legacy, selected);
+    else await writeFile(selected, current === "invalid" ? "{}"
+      : current === "oversize" ? "x".repeat(4097) : record("native_handover"),
+      { mode: current === "unsafe" ? 0o644 : 0o600 });
+    const result = await diagnoseDesktopCrash({ homeDirectory, platform: "darwin" });
+    assert.equal(result.startupDiagnostics[0].status,
+      current === "valid" ? "available" : current === "invalid" ? "invalid" : "unavailable");
+    assert.equal(result.startupDiagnostics[0].record?.phase ?? null,
+      current === "valid" ? "native_handover" : null);
+    const directory = join(homeDirectory, "export");
+    const exported = await exportPrivateCrashEvidence({ directory, homeDirectory, platform: "darwin" });
+    if (["unsafe", "symlink", "hardlink", "oversize"].includes(current)) assert.equal(exported.includedFiles, 0);
+    else assert.equal(await readFile(join(directory, "startup-stable.json"), "utf8"),
+      current === "invalid" ? "{}" : record("native_handover"));
+  });
+}

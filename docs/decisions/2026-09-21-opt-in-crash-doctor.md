@@ -41,7 +41,13 @@ diagnostic notes per profile, including fixed status codes and support reference
 It still excludes raw Apple report text, Crashpad memory dumps, native free-form
 messages, and private paths. No mode automatically sends output.
 The Electron main process also overwrites one owner-only, content-free startup
-result per launch. It contains only version/platform labels, timestamps, the
+result per launch in `startup-diagnostics/startup-diagnostic-v1.json` under the
+selected Electron user-data root, separate from migration-owned settings and
+companion state. Early recording therefore does not occupy a native handover
+target. The independent doctor and explicit private export read this location
+first, falling back to the older `desktop-settings` location only when the new
+record is absent; unsafe or invalid current evidence is not hidden by an older
+record. It contains only version/platform labels, timestamps, the
 last fixed startup phase, outcome, and an allowlisted code. A handled startup
 failure after profile selection is durably recorded before the deliberate quit,
 so the independent doctor can distinguish credential, settings, lifecycle, and
