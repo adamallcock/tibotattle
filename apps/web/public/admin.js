@@ -8,6 +8,7 @@ import {
   projectAdminAction,
   projectAdminMetricsHistory,
   projectAdminOverview,
+  projectAdminDatabaseHealth,
   projectAdminReconstructionProgress,
 } from "./admin-client.js";
 import { formatNumber, formatReportingTime } from "./ui-format.js";
@@ -17,9 +18,10 @@ import { allowanceModelPresentation, modelThemeIcon } from "./community-view.js"
 const state = {
   csrfToken: "",
   overview: null,
+  databaseHealth: null,
   loading: false,
   overviewUnavailable: true,
-  sourceHealth: { history: "loading", allowance: "loading", progress: "loading" },
+  sourceHealth: { history: "loading", allowance: "loading", progress: "loading", database: "loading" },
   controlsDirty: false,
   controlsRevision: null,
   actionPending: false,
@@ -1283,6 +1285,26 @@ function renderSourceHealth() {
     : "No usable allowance preview loaded.";
 }
 
+function renderDatabaseHealth() {
+  if (!isAdminPage) return;
+  const snapshot = state.databaseHealth;
+  const health = state.sourceHealth.database;
+  const badge = $("#database-health-status");
+  badge.className = `admin-source-badge ${health === "available" && snapshot?.status === "available" ? "admin-source-available" : "admin-source-partial"}`;
+  badge.textContent = health === "stale" ? "Refresh failed · previous checks"
+    : snapshot ? snapshot.status === "available" ? "All required databases readable" : "Database checks need attention"
+    : health === "loading" ? "Waiting for database checks" : "Database checks unavailable";
+  $("#database-health-freshness").textContent = snapshot
+    ? `Checked ${formatTime(snapshot.observedAt)} · Storage mode: ${snapshot.storageMode}.${health === "stale" ? " These are previous results, not current health." : ""}`
+    : "No usable database check loaded. Refresh to retry; older deployments may not provide this endpoint.";
+  const labels = { primary: "Primary service and telemetry", deletion_ledger: "Deletion ledger", analytics: "Separate analytics" };
+  const statuses = { reachable: "Readable", unavailable: "Read failed", timeout: "Timed out (5 seconds)", not_configured: "Binding unavailable", not_applicable: "Not used in JSON mode" };
+  $("#database-health-rows").replaceChildren(...(snapshot?.databases ?? []).map(row => tableRow([
+    labels[row.role], statuses[row.status], row.responseMs === null ? "Unavailable" : `${formatNumber(row.responseMs)} ms`,
+    row.databaseBytes === null ? "Unavailable" : `${formatNumber(row.databaseBytes / (1024 * 1024), { maximumFractionDigits: 2 })} MiB`,
+  ])));
+}
+
 function refreshAttention() {
   if (!state.overview || state.overviewUnavailable) return;
   notifyAttention(renderAttention(state.overview));
@@ -1295,19 +1317,26 @@ function collectAttentionItems(overview) {
       ["history", "Growth history", "#growth-title"],
       ["allowance", "Allowance preview", "#admin-community-title"],
       ["progress", "Graph reconstruction progress", "#admin-reconstruction-title"],
+      ["database", "Database checks", "#database-health-title"],
     ]) {
       const health = state.sourceHealth[name];
-      const snapshot = name === "history" ? state.metricsHistory : name === "allowance" ? state.allowancePreview : state.reconstructionProgress;
-      const evidenceAge = Date.parse(overview.generatedAt) - Date.parse(snapshot?.generatedAt);
+      const snapshot = name === "history" ? state.metricsHistory : name === "allowance" ? state.allowancePreview : name === "database" ? state.databaseHealth : state.reconstructionProgress;
+      const observedAt = name === "database" ? snapshot?.observedAt : snapshot?.generatedAt;
+      const evidenceAge = Date.parse(overview.generatedAt) - Date.parse(observedAt);
       if (health === "available" && evidenceAge > 24 * 60 * 60 * 1_000) {
         addAttentionItem(items, `source-age-${name}`, "evidence", "warning", `${label}: older than 24 hours`,
-          `Observed ${formatTime(snapshot.generatedAt)}. The read succeeded, but the evidence is more than a day behind the service snapshot. Check scheduled refresh progress; retained evidence remains visible.`, target, "Review freshness");
+          `Observed ${formatTime(observedAt)}. The read succeeded, but the evidence is more than a day behind the service snapshot. Check scheduled refresh progress; retained evidence remains visible.`, target, "Review freshness");
       }
       if (health !== "available") addAttentionItem(items, `source-${name}`, "evidence", "warning",
         `${label}: ${health === "loading" ? "waiting for evidence" : health === "stale" ? "refresh failed" : "unavailable"}`,
         health === "stale" ? "Previous dated evidence remains visible. Refresh to check for recovery."
           : "This source has not supplied usable current evidence. Check the section and refresh.", target, "Review source");
     }
+  }
+  if (state.sourceHealth.database === "available" && state.databaseHealth?.status === "degraded") {
+    addAttentionItem(items, "database-health", "evidence", "warning", "Database checks need attention",
+      "At least one required database could not be read, or the storage configuration is invalid. Review each role and check Cloudflare D1 before retrying.",
+      "#database-health-title", "Review databases");
   }
   const collection = overview.collection;
   const lifecycle = overview.lifecycle;
@@ -3603,9 +3632,11 @@ function refuseAdminAccess(error) {
   // successful response from before the refusal cannot restore private data.
   for (const lane of Object.values(adminReadLanes)) lane.invalidate();
   state.overview = null;
+  state.databaseHealth = null;
   state.controlsDirty = false;
   state.controlsRevision = null;
-  state.sourceHealth = { history: "unavailable", allowance: "unavailable", progress: "unavailable" };
+  state.sourceHealth = { history: "unavailable", allowance: "unavailable", progress: "unavailable", database: "unavailable" };
+  renderDatabaseHealth();
   state.overviewReadSucceeded = false;
   state.metricsHistory = null;
   state.allowancePreview = null;
@@ -3631,6 +3662,21 @@ function refuseAdminAccess(error) {
 }
 
 const adminReadLanes = {
+  database: createAdminReadLane({
+    read: async ({ signal }) => projectAdminDatabaseHealth(await request("/api/v1/admin/database-health", { signal })),
+    publish: snapshot => {
+      state.databaseHealth = snapshot;
+      updateSourceHealth("database", "available");
+      renderDatabaseHealth();
+    },
+    failed: error => {
+      if (refuseAdminAccess(error)) return;
+      const retained = isTransientAdminReadError(error) && state.databaseHealth !== null;
+      if (!retained) state.databaseHealth = null;
+      updateSourceHealth("database", retained ? "stale" : "unavailable");
+      renderDatabaseHealth();
+    },
+  }),
   overview: createAdminReadLane({
     read: async ({ signal }) => projectAdminOverview(await request("/api/v1/admin/overview", { signal })),
     publish: overview => {
@@ -3725,7 +3771,10 @@ async function load() {
   const overviewRead = adminReadLanes.overview.run();
   void loadAdminCommunityAllowance();
   void loadGrowthHistory();
-  if (isAdminPage) void adminReadLanes.progress.run();
+  if (isAdminPage) {
+    void adminReadLanes.progress.run();
+    void adminReadLanes.database.run();
+  }
   try {
     // No app session on the admin host: authentication is Cloudflare Access and
     // the owner-email pin, and CSRF is the always-sent x-usage-monitor-admin
