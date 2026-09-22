@@ -83,9 +83,9 @@ function totalTurns(snapshot) {
 async function waitForReady(controller, expectedTurns) {
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
-    const snapshot = await controller.read("all");
-    if (snapshot.status === "ready" && !snapshot.collecting && !snapshot.stale
-        && totalTurns(snapshot) === expectedTurns) return snapshot;
+    const snapshots = await Promise.all(["standard", "fast"].map(speedMode => controller.read("all", { speedMode })));
+    if (snapshots.every(snapshot => snapshot.status === "ready" && !snapshot.collecting && !snapshot.stale)
+        && snapshots.reduce((sum, snapshot) => sum + totalTurns(snapshot), 0) === expectedTurns) return snapshots;
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   assert.fail(`performance worker did not publish ${expectedTurns} turns`);
