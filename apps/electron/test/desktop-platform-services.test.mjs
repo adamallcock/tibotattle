@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import {
   createDesktopPlatformServices,
   validateDesktopCodexHome,
 } from "../desktop-platform-services.js";
+import { LINUX_AUTOSTART_DESKTOP_FILE } from "../linux-autostart.js";
 
 function directory({ uid = 501, symbolic = false } = {}) {
   return {
@@ -141,7 +142,7 @@ test("platform services use only native-picker paths and fixed open targets", as
   });
   assert.equal(services.setLocale("es"), true);
   assert.equal(services.defaultCodexHomeDisplay, "Ubicación predeterminada (~/.codex)");
-  assert.equal(services.loginItemStatus().detail, "TiboTattle no se iniciará automáticamente.");
+  assert.equal((await services.loginItemStatus()).detail, "TiboTattle no se iniciará automáticamente.");
   assert.match(services.about().update.detail, /no están disponibles/u);
   await services.chooseCodexHome();
   assert.equal(dialogOptions.at(-1).title, "Elegir carpeta de Codex");
@@ -251,7 +252,7 @@ test("About refuses to hash an oversized runtime manifest", async () => {
   }
 });
 
-test("login-item state is reread and requires exact confirmation", () => {
+test("login-item state is reread and requires exact confirmation", async () => {
   let current = { status: "not-registered", openAtLogin: false };
   const services = createDesktopPlatformServices({
     app: {
@@ -270,12 +271,12 @@ test("login-item state is reread and requires exact confirmation", () => {
     shell: { openExternal: async () => {} },
     Notification: { isSupported: () => false },
   });
-  assert.equal(services.loginItemStatus().status, "disabled");
-  assert.equal(services.setStartAtLogin(true).status, "needs-approval");
-  assert.equal(services.setStartAtLogin(false).status, "disabled");
+  assert.equal((await services.loginItemStatus()).status, "disabled");
+  assert.equal((await services.setStartAtLogin(true)).status, "needs-approval");
+  assert.equal((await services.setStartAtLogin(false)).status, "disabled");
 });
 
-test("macOS missing or contradictory login evidence never becomes a disabled preference", () => {
+test("macOS missing or contradictory login evidence never becomes a disabled preference", async () => {
   let current;
   const calls = [];
   const services = createDesktopPlatformServices({
@@ -301,14 +302,14 @@ test("macOS missing or contradictory login evidence never becomes a disabled pre
     [{ status: "requires-approval", openAtLogin: false }, "needs-approval"],
   ]) {
     current = evidence;
-    const observed = services.loginItemStatus();
+    const observed = await services.loginItemStatus();
     assert.equal(observed.status, expected);
     assert.equal(observed.canSet, true, "an explicit user action remains available");
     assert.doesNotMatch(observed.detail, /will not start/u);
   }
   assert.deepEqual(calls, [], "status reads must leave OS registration untouched");
   current = { status: "not-found", openAtLogin: false };
-  assert.equal(services.setStartAtLogin(false).status, "error",
+  assert.equal((await services.setStartAtLogin(false)).status, "error",
     "an unconfirmed explicit change must not manufacture disabled evidence");
   assert.deepEqual(calls, [{ openAtLogin: false }]);
 });
@@ -322,14 +323,68 @@ test("Linux reports unavailable OS-specific settings without pretending support"
     shell: { openExternal: async () => {} },
     Notification: { isSupported: () => false },
   });
-  assert.deepEqual(services.loginItemStatus(), {
+  assert.deepEqual(await services.loginItemStatus(), {
     status: "unavailable",
     canSet: false,
-    detail: "Login item status is unavailable. Open your operating system Login Items settings to review it.",
+    detail: "Start at login status is unavailable on this system.",
   });
   assert.equal(services.notificationStatus().permission, "unavailable");
   await assert.rejects(
     services.openSystemSettings("startup"),
     (error) => error?.code === "desktop_system_settings_unavailable",
   );
+});
+
+test("packaged Linux settings observe and change the exact XDG autostart entry", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "tibotattle-login-settings-")));
+  const configRoot = join(root, "config");
+  const executablePath = join(root, "TiboTattle.AppImage");
+  await mkdir(configRoot, { mode: 0o700 });
+  await writeFile(executablePath, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  await chmod(executablePath, 0o700);
+  const services = createDesktopPlatformServices({
+    app: { isPackaged: true, getVersion: () => "0.1.22" },
+    platform: "linux",
+    homeDirectory: root,
+    environment: { XDG_CONFIG_HOME: configRoot, APPIMAGE: executablePath },
+    dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
+    shell: { openExternal: async () => {} },
+    Notification: { isSupported: () => false },
+  });
+  const entry = join(configRoot, "autostart", LINUX_AUTOSTART_DESKTOP_FILE);
+  try {
+    assert.equal((await services.loginItemStatus()).status, "disabled");
+    assert.equal(await readFile(entry, "utf8").catch(() => null), null,
+      "status reads must not register autostart");
+    assert.equal((await services.setStartAtLogin(true)).status, "enabled");
+    assert.match(await readFile(entry, "utf8"), /TiboTattle\.AppImage/u);
+    assert.equal((await services.loginItemStatus()).status, "enabled");
+    assert.equal((await services.setStartAtLogin(false)).status, "disabled");
+    assert.equal(await readFile(entry, "utf8").catch(() => null), null);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Linux unsafe startup evidence cannot trigger a replacement or expose a path", async () => {
+  let writes = 0;
+  const services = createDesktopPlatformServices({
+    app: { isPackaged: true, getVersion: () => "0.1.22" },
+    platform: "linux",
+    homeDirectory: "/home/test",
+    linuxAutostartOwner: {
+      status: async () => ({ status: "unsafe", canSet: false, path: "/home/test/private" }),
+      enable: async () => { writes += 1; },
+      disable: async () => { writes += 1; },
+    },
+    dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
+    shell: { openExternal: async () => {} },
+    Notification: { isSupported: () => false },
+  });
+  const observed = await services.loginItemStatus();
+  assert.equal(observed.status, "unavailable");
+  assert.equal(observed.canSet, false);
+  assert.equal(JSON.stringify(observed).includes("/home/test/private"), false);
+  assert.equal((await services.setStartAtLogin(true)).status, "unavailable");
+  assert.equal(writes, 0);
 });

@@ -1436,9 +1436,14 @@ async function assertDashboardData(cdp) {
           source,
           state,
           setupVisible: setup?.hidden === false,
-          dataFlow: source.toLowerCase().includes("local companion")
+          // Live observation now shows its source timestamp instead of a
+          // fixed "Local companion" label. The synthetic fixture must render
+          // a real observation, not its loading or illustrative fallback.
+          dataFlow: source.length > 0
+            && source !== "Illustrative fixture — not your usage"
             && latest.length > 0
-            && latest !== "Checking…",
+            && latest !== "Checking…"
+            && latest !== "No timestamp",
         };
       })()`);
       return candidate?.dataFlow === true ? candidate : null;
@@ -2335,19 +2340,27 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, chil
     await settingsCdp.request("Page.enable");
     const state = await waitFor(async () => {
       const snapshot = await settingsCdp.evaluate(`(() => {
+      const visible = ${visible.toString()};
       const status = document.querySelector("#settings-bridge-status");
       const tabs = [...document.querySelectorAll("[data-settings-tab]")];
       const panels = [...document.querySelectorAll("[data-settings-panel]")];
       const general = document.querySelector('[data-settings-panel="general"]');
+      const loginSwitch = document.querySelector("#settings-start-at-login");
+      const loginOpen = document.querySelector("#settings-open-login-items");
+      const loginRetry = document.querySelector("#settings-refresh-login-status");
       return {
         title: document.title,
-        connected: status?.classList.contains("is-ready") === true,
+        connected: status?.hidden === true && status.textContent.trim() === "",
         tabCount: tabs.length,
         panelCount: panels.length,
         tabNames: tabs.map((tab) => tab.dataset.settingsTab),
         generalVisible: general?.hidden === false,
-        generalLanguageVisible: ${visible.toString()}(document.querySelector("#settings-language")),
+        generalLanguageVisible: visible(document.querySelector("#settings-language")),
         generalLanguageEnabled: document.querySelector("#settings-language")?.disabled === false,
+        loginSwitchPresent: loginSwitch?.getAttribute("role") === "switch",
+        loginOpenVisible: visible(loginOpen),
+        loginRetryHidden: loginRetry?.hidden === true
+          && getComputedStyle(loginRetry).display === "none",
       };
     })()`);
       return snapshot?.title === "TiboTattle Settings"
@@ -2358,6 +2371,9 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, chil
         && snapshot?.generalVisible === true
         && snapshot?.generalLanguageVisible === true
         && snapshot?.generalLanguageEnabled === true
+        && snapshot?.loginSwitchPresent === true
+        && snapshot?.loginOpenVisible === true
+        && snapshot?.loginRetryHidden === true
         ? snapshot
         : null;
     }, MAX_STARTUP_MS, "Electron Settings render");
@@ -2368,7 +2384,10 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, chil
         || JSON.stringify(state?.tabNames) !== JSON.stringify(["general", "data", "notifications", "about", "tray"])
         || state?.generalVisible !== true
         || state?.generalLanguageVisible !== true
-        || state?.generalLanguageEnabled !== true) {
+        || state?.generalLanguageEnabled !== true
+        || state?.loginSwitchPresent !== true
+        || state?.loginOpenVisible !== true
+        || state?.loginRetryHidden !== true) {
       fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
     }
     const initialSettingsLoader = await mainFrameLoaderId(settingsCdp);
@@ -2395,7 +2414,7 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, chil
         .filter((panel) => panel.hidden === false);
       return document.readyState === "complete"
         && location.hash === "#data"
-        && document.querySelector("#settings-bridge-status")?.classList.contains("is-ready") === true
+        && document.querySelector("#settings-bridge-status")?.hidden === true
         && activeTabs.length === 1
         && activeTabs[0].dataset.settingsTab === "data"
         && activePanels.length === 1
@@ -2679,7 +2698,7 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, chil
     // focus refresh must expose the newly saved Community preference itself.
     await waitFor(async () => settingsCdp.evaluate(`(() => {
       const tab = document.querySelector('[data-settings-tab="data"]');
-      const ready = document.querySelector("#settings-bridge-status")?.classList.contains("is-ready");
+      const ready = document.querySelector("#settings-bridge-status")?.hidden === true;
       if (!ready || !tab) return false;
       tab.click();
       return true;

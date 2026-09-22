@@ -219,7 +219,12 @@ test("controller initializes persisted cadence and projects truthful settings st
           primaryRootId: DESKTOP_DEFAULT_SETTINGS.codexHomes.primaryRootId,
         },
         refreshIntervalSeconds: 300,
-        startAtLogin: { status: "disabled", canSet: true, detail: "disabled" },
+        startAtLogin: {
+          status: "disabled",
+          canSet: true,
+          canOpenSettings: process.platform === "darwin" || process.platform === "win32",
+          detail: "disabled",
+        },
         sidebarCollapsed: false,
         tray: DESKTOP_DEFAULT_SETTINGS.tray,
         traySettingsStatus: "current",
@@ -887,6 +892,30 @@ test("unconfirmed login-item changes are not persisted", async () => {
     (error) => error?.code === "desktop_start_at_login_unconfirmed",
   );
   assert.equal((await value.store.getSettings()).startAtLogin, false);
+});
+
+test("Linux controller awaits autostart reads and confirms a completed change", async () => {
+  let enabled = false;
+  const value = fixture({
+    actionOverrides: { desktopPlatform: "linux" },
+    platformOverrides: {
+      loginItemStatus: async () => ({
+        status: enabled ? "enabled" : "disabled",
+        canSet: true,
+        detail: enabled ? "enabled" : "disabled",
+      }),
+      setStartAtLogin: async (next) => {
+        enabled = next;
+        return { status: next ? "enabled" : "disabled", canSet: true };
+      },
+    },
+  });
+  const initial = await value.controller.initialize();
+  assert.equal(initial.settings.startAtLogin.status, "disabled");
+  assert.equal(initial.settings.startAtLogin.canOpenSettings, false);
+  const updated = await value.controller.handlers.setStartAtLogin({ enabled: true });
+  assert.equal(updated.settings.startAtLogin.status, "enabled");
+  assert.equal((await value.store.getSettings()).startAtLogin, true);
 });
 
 test("initialization leaves unknown OS startup state untouched despite a stored false default", async () => {
