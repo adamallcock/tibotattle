@@ -1,6 +1,6 @@
 ---
 title: User guide
-date: 2026-09-07
+date: 2026-09-23
 type: guide
 status: maintained
 ---
@@ -156,7 +156,7 @@ uses a shortened thread ID. If attribution cannot be proven, it stays unlinked.
 Names are looked up locally and are not included in reports, share cards,
 diagnostics, or community contributions.
 
-## Shared reporting period in development source
+## Shared reporting period
 
 The app header's **Reporting period** control offers **24hr**, **7d**,
 **30d**, and **All**. Your selection persists across pages and restarts.
@@ -174,12 +174,12 @@ grouping, chart zoom, and minimum-span controls remain beside the data they affe
 Updating local usage can advance the displayed reporting dates when a new
 accounting snapshot becomes available.
 
-## Model performance in development source
+## Model performance
 
 Open **Model performance** from the dashboard sidebar, then choose a model
-and use the shared **Reporting period** above the page. The web and native navigation
-include this page in development source; an installed release must contain
-these changes before the page is available there.
+and use the shared **Reporting period** above the page. The 0.1.24 desktop
+release includes this page, including on Windows x64. Local timing analysis is
+separate from activation of optional hosted performance telemetry.
 
 The page starts in **Standard** mode. Use the **Standard / Fast** toggle to show
 only the selected mode; counts, medians, bands and both charts use that same
@@ -223,8 +223,7 @@ from saved checkpoints. Timing failures do not block usage accounting.
 
 ## Customize the menu bar and popup
 
-Tray customization is implemented in the development source; the published
-0.1.18 app does not gain these controls until an update containing them ships.
+The 0.1.24 desktop release includes tray customization.
 Open **Customize menu bar…** from the native popup's More menu or General
 Settings. Electron's Settings includes the corresponding **Menu bar** or
 **Tray** controls and the popup opens the same page.
@@ -317,7 +316,9 @@ its report to be validated. Changing filters or refreshing the report discards
 incompatible warmed results. Preloading does not collect logs or repeat the
 underlying accounting calculation.
 
-This feature is qualified in a local development build and has not been released.
+Projects & threads is included in the 0.1.24 desktop release. See
+[platform support](./reference/platform-support.md) for installed qualification
+and its remaining limits.
 
 ## Refresh, progress, and recovery
 
