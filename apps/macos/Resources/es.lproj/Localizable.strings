@@ -172,6 +172,9 @@
 "settings.automaticUpdatesUnavailable" = "Las actualizaciones automáticas no están disponibles en esta versión.";
 "settings.automaticUpdatesTooltip" = "Descarga automáticamente actualizaciones firmadas de TiboTattle.";
 "settings.checkForUpdates" = "Buscar actualizaciones";
+"settings.checkingForUpdates" = "Buscando actualizaciones…";
+"settings.updateAvailable" = "Actualización disponible…";
+"settings.quitToInstallUpdate" = "Salir para instalar la actualización";
 "settings.chooseCodexFolder" = "Elegir carpeta de Codex…";
 "settings.codexFolder" = "Carpeta de Codex";
 "settings.codexFolderSummary" = "Esta opción solo controla el origen sessions y archived_sessions. La actualización también usa las fuentes locales de cuenta, límite, configuración y linaje de ejecuciones de Codex explicadas en la configuración inicial.";

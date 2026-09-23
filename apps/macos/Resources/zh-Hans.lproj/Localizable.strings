@@ -172,6 +172,9 @@
 "settings.automaticUpdatesUnavailable" = "此版本不提供自动更新。";
 "settings.automaticUpdatesTooltip" = "自动下载已签名的 TiboTattle 更新。";
 "settings.checkForUpdates" = "检查更新";
+"settings.checkingForUpdates" = "正在检查更新…";
+"settings.updateAvailable" = "有可用更新…";
+"settings.quitToInstallUpdate" = "退出并安装更新";
 "settings.chooseCodexFolder" = "选择 Codex 文件夹…";
 "settings.codexFolder" = "Codex 文件夹";
 "settings.codexFolderSummary" = "此设置只控制 sessions 和 archived_sessions 来源。刷新还会使用首次设置中披露的本地 Codex 帐户、额度、配置和运行谱系来源。";

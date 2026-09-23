@@ -401,6 +401,9 @@ enum TiboTattleLocalization {
         case settingsAutomaticUpdatesUnavailable = "settings.automaticUpdatesUnavailable"
         case settingsAutomaticUpdatesTooltip = "settings.automaticUpdatesTooltip"
         case settingsCheckForUpdates = "settings.checkForUpdates"
+        case settingsCheckingForUpdates = "settings.checkingForUpdates"
+        case settingsUpdateAvailable = "settings.updateAvailable"
+        case settingsQuitToInstallUpdate = "settings.quitToInstallUpdate"
         case settingsChooseCodexFolder = "settings.chooseCodexFolder"
         case settingsCodexFolder = "settings.codexFolder"
         case settingsCodexFolderCustomSelectedPath = "settings.codexFolderCustomSelectedPath"
@@ -1106,6 +1109,12 @@ enum TiboTattleLocalization {
                 "Download signed TiboTattle updates automatically."
             case .settingsCheckForUpdates:
                 "Check for Updates"
+            case .settingsCheckingForUpdates:
+                "Checking for Updates…"
+            case .settingsUpdateAvailable:
+                "Update Available…"
+            case .settingsQuitToInstallUpdate:
+                "Quit to Install Update"
             case .settingsChooseCodexFolder:
                 "Choose Codex Folder…"
             case .settingsCodexFolder:

@@ -395,6 +395,7 @@ private enum AppUpdaterState: Equatable {
     case ready
     case checking
     case updateAvailable
+    case installOnQuit
     case verifiedNoUpdate
     case failed
 }
@@ -975,12 +976,31 @@ private final class AppUpdater: NSObject {
 
     var canCheckForUpdates: Bool {
         isAvailable && !feedPreflightInFlight && state != .checking
+            && (state == .installOnQuit || !hasStarted
+                || controller?.updater.canCheckForUpdates == true)
     }
 
     var menuItemTitle: String {
-        state == .failed
-            ? TiboTattleLocalization.string(.launcherRetry)
-            : TiboTattleLocalization.string(.settingsCheckForUpdates) + "…"
+        switch state {
+        case .checking:
+            return TiboTattleLocalization.string(.settingsCheckingForUpdates)
+        case .updateAvailable:
+            return TiboTattleLocalization.string(.settingsUpdateAvailable)
+        case .installOnQuit:
+            return TiboTattleLocalization.string(.settingsQuitToInstallUpdate)
+        case .failed:
+            return TiboTattleLocalization.string(.launcherRetry)
+        default:
+            return TiboTattleLocalization.string(.settingsCheckForUpdates) + "…"
+        }
+    }
+
+    var updateAvailable: Bool {
+        state == .updateAvailable || state == .installOnQuit
+    }
+
+    var installOnQuit: Bool {
+        state == .installOnQuit
     }
 
     var settingsSummary: String {
@@ -1013,7 +1033,7 @@ private final class AppUpdater: NSObject {
         case .checking:
             return TiboTattleLocalization.string(.settingsCheckForUpdates)
                 + "…"
-        case .updateAvailable:
+        case .updateAvailable, .installOnQuit:
             // The native Sparkle sheet presents the version and install
             // choices. Keep this native summary truthful without inventing a
             // second version display in the settings window.
@@ -1049,7 +1069,7 @@ private final class AppUpdater: NSObject {
     }
 
     func checkForUpdates(_ sender: Any?) {
-        guard isAvailable, !feedPreflightInFlight else { return }
+        guard canCheckForUpdates, !installOnQuit else { return }
         preflightFeed(userInitiated: true) { [weak self] in
             guard let self, let controller = self.controller else { return }
             self.startUpdaterIfNeeded()
@@ -1179,6 +1199,10 @@ private final class AppUpdater: NSObject {
         false
     }
 
+    var updateAvailable: Bool { false }
+
+    var installOnQuit: Bool { false }
+
     var menuItemTitle: String {
         TiboTattleLocalization.string(.settingsCheckForUpdates) + "…"
     }
@@ -1226,6 +1250,52 @@ private final class AppUpdater: NSObject {
     // failed check retryable from About or the menu bar.
     func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
         setState(.updateAvailable)
+    }
+
+    func updater(
+        _ updater: SPUUpdater,
+        userDidMake choice: SPUUserUpdateChoice,
+        forUpdate updateItem: SUAppcastItem,
+        state: SPUUserUpdateState
+    ) {
+        if choice == .skip {
+            setState(.ready)
+        }
+    }
+
+    func updater(
+        _ updater: SPUUpdater,
+        willInstallUpdateOnQuit item: SUAppcastItem,
+        immediateInstallationBlock immediateInstallHandler: @escaping () -> Void
+    ) -> Bool {
+        setState(.installOnQuit)
+        // Sparkle retains installation ownership and installs on normal quit.
+        return false
+    }
+
+    func updater(
+        _ updater: SPUUpdater,
+        didFinishUpdateCycleFor updateCheck: SPUUpdateCheck,
+        error: Error?
+    ) {
+        // A dismissed or cancelled check can finish without one of the
+        // result callbacks. Never leave the menu stuck at "Checking…".
+        if state == .checking {
+            if let error = error as NSError? {
+                setState(Self.stateForUpdaterAbort(
+                    errorDomain: error.domain,
+                    errorCode: error.code
+                ))
+            } else {
+                setState(.ready)
+            }
+        }
+        // Sparkle releases its active session after this callback. Read its
+        // menu eligibility on the next main-queue turn, including when the
+        // available-update state itself did not change.
+        DispatchQueue.main.async { [weak self] in
+            self?.onStateChange?()
+        }
     }
 
     func updaterDidNotFindUpdate(_ updater: SPUUpdater, error: Error) {
@@ -6744,7 +6814,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 // where an update check has to be reachable. A build with no
                 // updater passes nothing and the row is left out.
                 checkForUpdates: updater.isAvailable
-                    ? { [weak self] in self?.updater.checkForUpdates(nil) }
+                    ? { [weak self] in self?.performUpdateMenuAction() }
                     : nil,
                 refreshFinished: { [weak self] refreshID in
                     self?.evaluateQuotaNotificationsAfterRefresh(
@@ -7136,8 +7206,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsCheckForUpdatesButton?.isEnabled = updater.canCheckForUpdates
         menuBarStatus?.updateUpdaterPresentation(
             title: updater.menuItemTitle,
-            isEnabled: updater.canCheckForUpdates
+            isEnabled: updater.canCheckForUpdates,
+            updateAvailable: updater.updateAvailable
         )
+    }
+
+    private func performUpdateMenuAction() {
+        guard updater.canCheckForUpdates else { return }
+        if updater.installOnQuit {
+            quitApplication()
+        } else {
+            updater.checkForUpdates(nil)
+        }
     }
 
     private func nativeToolbarEvidenceTitle(fallback: String) -> String {
@@ -8437,7 +8517,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     @objc private func checkForUpdates(_ sender: Any?) {
-        updater.checkForUpdates(sender)
+        performUpdateMenuAction()
     }
 
     @objc private func toggleAutomaticUpdates(_ sender: NSSwitch) {
@@ -11607,10 +11687,35 @@ private enum MenuBarContractSmokeTest {
                 openTiboTattle: {},
                 showSettings: {},
                 showAbout: {},
-                quit: {}
+                quit: {},
+                checkForUpdates: {}
             )
         )
         let starting = controller.nativePresentationContract()
+        controller.updateUpdaterPresentation(
+            title: "Checking for Updates…",
+            isEnabled: false,
+            updateAvailable: false
+        )
+        let checkingUpdate = controller.nativePresentationContract()
+        controller.updateUpdaterPresentation(
+            title: "Update Available…",
+            isEnabled: true,
+            updateAvailable: true
+        )
+        let availableUpdate = controller.nativePresentationContract()
+        controller.updateUpdaterPresentation(
+            title: "Quit to Install Update",
+            isEnabled: true,
+            updateAvailable: true
+        )
+        let installOnQuit = controller.nativePresentationContract()
+        controller.updateUpdaterPresentation(
+            title: "Check for Updates…",
+            isEnabled: true,
+            updateAvailable: false
+        )
+        let clearedUpdate = controller.nativePresentationContract()
         controller.companionUnavailable(
             summary: "The local companion is unavailable for this smoke test."
         )
@@ -11830,6 +11935,17 @@ private enum MenuBarContractSmokeTest {
         }
         guard starting.informationRowsAreNative,
               starting.informationRowsHaveTitles,
+              !starting.updateIndicatorShown,
+              checkingUpdate.updateActionTitle == "Checking for Updates…",
+              !checkingUpdate.updateActionEnabled,
+              !checkingUpdate.updateIndicatorShown,
+              availableUpdate.updateActionTitle == "Update Available…",
+              availableUpdate.updateActionEnabled,
+              availableUpdate.updateIndicatorShown,
+              installOnQuit.updateActionTitle == "Quit to Install Update",
+              installOnQuit.updateIndicatorShown,
+              clearedUpdate.updateActionEnabled,
+              !clearedUpdate.updateIndicatorShown,
               unavailable.informationRowsAreNative,
               unavailable.unavailableRowHasTitle,
               starting.analyzeShortcut == "r",

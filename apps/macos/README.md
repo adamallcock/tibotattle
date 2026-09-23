@@ -125,7 +125,11 @@ refresh once and clears the stale readiness-timeout diagnostic.
 9. Choose **About TiboTattle** → **Check for Updates** to check a signed
    production appcast. Automatic update downloads are controlled by one native
    switch in **Settings…** → **About**. Developer and ad-hoc builds contain
-   no updater framework and perform no update networking.
+   no updater framework and perform no update networking. During a check, the
+   menu says **Checking for Updates…** and disables that action. An update
+   reported by Sparkle adds a small arrow beside the menu-bar title. Once Sparkle
+   schedules a downloaded update for installation on quit, the action becomes
+   **Quit to Install Update** and uses the app's normal quit path.
 10. **Settings…** → **Notifications** contains **Local allowance
    notifications**. It is off by default; enabling it is the only action that
    may request macOS notification permission. The first opt-in visibly selects
