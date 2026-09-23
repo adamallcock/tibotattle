@@ -1859,6 +1859,22 @@ function renderDistribution(distribution) {
       ]);
     }),
   );
+  const installerKeys = ["macArm64", "macX64", "windowsX64", "linuxX64"];
+  const installerTotals = installerKeys.map(key => {
+    const published = releases.some(release => release.installerDownloads[key] !== null);
+    return published
+      ? releases.reduce((sum, release) => sum + (release.installerDownloads[key] ?? 0), 0)
+      : null;
+  });
+  $("#github-release-total-rows").replaceChildren(...(releases.length ? [tableRow([
+    `Grand total · all ${releases.length} releases`,
+    "All versions",
+    ...installerTotals.map(value => value === null ? "—" : count(value)),
+    installerTotals.some(value => value !== null)
+      ? count(installerTotals.reduce((sum, value) => sum + (value ?? 0), 0))
+      : "—",
+    "All time",
+  ])] : []));
   $("#github-release-empty").hidden = releases.length !== 0;
 
   $("#distribution-source-status").replaceChildren(
