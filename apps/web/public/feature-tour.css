@@ -1,6 +1,6 @@
 /* Public marketing surface only; the personal dashboard has its own layout. */
 .feature-media { min-width: 0; margin: 0; overflow: hidden; border: 1px solid #466358; border-radius: 22px; background: #14271f; box-shadow: 0 24px 60px #12362b18; }
-.feature-media video, .feature-media img { display: block; width: 100%; height: auto; object-fit: contain; }
+.feature-media img { display: block; width: 100%; height: auto; object-fit: contain; }
 .feature-media figcaption { display: flex; justify-content: space-between; align-items: center; gap: 12px; min-height: 48px; padding: 12px 18px; color: #c5dcd0; font-size: 12px; letter-spacing: .02em; }
 .feature-media button { color: #e4f9ee; background: #284a3c; border: 1px solid #5c7a6d; border-radius: 20px; padding: 7px 12px; cursor: pointer; font: inherit; }
 .feature-media button:hover { background: #385f4e; }
@@ -60,13 +60,15 @@
 .pace-options button[aria-pressed="true"] { background:var(--fuel); border-color:var(--fuel); color:#162c24; }
 .pace-options button:focus-visible,.pace-demo-footer button:focus-visible { outline:3px solid #fff0b4; outline-offset:3px; }
 .pace-verdict { min-height:90px; border-top:1px solid #527365; color:var(--fuel); font-size:15px; line-height:1.7; }
-.pace-apparatus { position:relative; width:320px; max-width:100%; height:418px; justify-self:center; }
-.pace-apparatus canvas { display:block; width:100%; height:418px; }
-.tank-reading {position:absolute; top:78px; left:50%; transform:translateX(-50%); text-align:center; border-radius:14px; padding:10px 20px; background:#173329de; color:#f0f6eb; }
-.tank-reading strong {display:block; font:normal 65px/1 Georgia,serif; letter-spacing:-4px;}.tank-reading strong span {font-size:38px;letter-spacing:-1px;}.tank-reading>span {font-size:12px;}
+.pace-apparatus { position:relative; width:230px; max-width:100%; justify-self:center; }
+/* Use the app's complete tank geometry and controls; only the tour palette and
+   available space belong to this surface. The shared mount measures both axes. */
+.pace-showcase { --paper:#102b24; --surface-raised:#193228; --ink:#f0f6eb; --muted:#a3bfb0; --green-text:#a3ffce; }
+.pace-apparatus.quota-grid > .quota-tank { --tank-height:320px; background:transparent; }
+.pace-apparatus .quota-tank { --tank-edge:#567568; --tank-metal:#334e42; --tank-bright:#bcebd1; --tank-shadow:#000b07; --tank-fluid:#28c89d; --tank-glow:#a3ffce; --tank-deep:#12664e; }
+.pace-apparatus .quota-tank[data-flow="over"] { --tank-fluid:#ffb73f; --tank-glow:#ffe6a8; --tank-deep:#b06816; }
+.pace-apparatus .quota-tank[data-flow="critical"] { --tank-fluid:#ff654b; --tank-glow:#ffd28c; --tank-deep:#ad2538; }
 .pace-demo-footer {grid-column:1/-1;display:flex;justify-content:space-between;align-items:center;gap:16px;font-size:11px;color:#a3bfb0;border-top:1px solid #52736566;padding-top:18px;margin-top:24px;}
-.tour-recording {margin:-42px 0 80px; border-bottom:1px solid #a5b7a7; padding:18px 0;color:#326a58;}
-.tour-recording summary {cursor:pointer;font-weight:650;}.tour-recording .feature-media {max-width:860px;margin:24px auto;}
 .tour-history {padding:38px; background:#e5eae1;border-radius:24px;}
 .tour-cache {padding-block:30px;}
 .tour-cta {text-align:center;max-width:850px;margin:80px auto;padding:30px 24px;}.tour-cta h2 {font:normal clamp(32px,4vw,54px)/1.1 Georgia,serif;}.tour-cta a {display:inline-block;background:#163f32;color:#f1f6ec;border-radius:30px;padding:16px 26px;text-decoration:none;font-weight:650;}
@@ -262,10 +264,6 @@
 .community-site .pace-showcase { min-height: 0; padding: 26px; }
 .community-site .pace-demo-copy h4 { font-size: 32px; }
 .community-site .pace-verdict { min-height: 0; }
-.community-site .pace-apparatus { width: 230px; height: 300px; }
-.community-site .pace-apparatus canvas { height: 300px; }
-.community-site .tank-reading { top: 55px; padding: 8px 14px; }
-.community-site .tank-reading strong { font-size: 48px; }
 .community-site .pace-showcase .demo-forecast { padding: 20px; margin-top: 8px; }
 .community-site .pace-demo-footer { margin-top: 12px; padding-top: 12px; }
 .community-site .insight-demo-label, .community-site .week-demo-label { padding: 10px 18px; }
@@ -300,7 +298,7 @@
 /* No-script degradation. Every demonstration below is drawn by the tour
    modules into an empty host; with scripts unavailable those hosts stay
    empty and would otherwise render as blank framed panels. Hide only the
-   empty frame -- each row's heading, prose and the recorded app preview
+   empty frame -- each row's heading, prose and the app preview
    remain visible, so the page still reads as intended. Browsers without
    :has() keep the previous behavior rather than hiding rendered content. */
 [data-cache-demo]:empty, [data-speeds-demo]:empty {display:none;}
