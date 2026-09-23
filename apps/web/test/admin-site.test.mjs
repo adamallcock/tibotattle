@@ -602,8 +602,8 @@ test("the graph rebuild window renders every day, refusal and lease without inve
     assert.match(text, /Checkpoint phases: usage 12 stages, 240 parts · endpoints 10 stages, 210 parts · plan 8 stages, 148 parts/u);
     assert.match(text, /Throughput 23 results in the last hour · 208 in 6 h/u);
     assert.match(text, /1,042 results remaining/u);
-    assert.match(text, /Estimate only: about 30.1 h remaining at the 6-hour rate/u);
-    assert.match(text, /216 results from a previous build awaiting retirement/u);
+    assert.match(text, /At the last 6-hour rate, about 30.1 h for the remaining result slots. This is not a completion forecast; staged work may finish unevenly/u);
+    assert.match(text, /216 retained intermediate results from an earlier calculation, not a published graph/u);
     assert.doesNotMatch(text, /Account progress not recorded|Preparation counters unavailable|Update trigger|not counted/u);
     assert.doesNotMatch(reconstructionMarkup(documentRef), /[0-9a-f]{64}/iu, "no digest-like value reaches the markup");
     // A stale pass keeps the rendered window and marks the failure explicitly.
@@ -630,7 +630,7 @@ test("capped rebuild counters read as not counted rather than as zero", async ()
     assert.match(text, /checkpoints not counted/u);
     assert.match(text, /Throughput results in the last hour not counted · 6-hour total not counted/u);
     assert.match(text, /1,042 results remaining/u);
-    assert.match(text, /Estimate only: no estimate yet/u);
+    assert.match(text, /No recent-rate comparison yet/u);
     assert.match(text, /retirement backlog not counted/u);
     assert.doesNotMatch(text, /0 stages|0 results in the last hour|0 in 6 h|Checkpoint phases|0 results from a previous build/u);
   });
@@ -649,7 +649,7 @@ test("a graph rebuild with no projection and no gap states that plainly instead 
   await withAdminPage(async path => path === ADMIN_READ_PATHS[3] ? progressReply() : unavailableResponse(), async documentRef => {
     assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Waiting for a pass");
     const text = reconstructionText(documentRef);
-    assert.match(text, /Estimate only: no estimate yet/u);
+    assert.match(text, /No recent-rate comparison yet/u);
     assert.match(text, /In progress Nothing claimed/u);
     assert.match(text, /no lease recorded/u);
     assert.match(text, /No refusals recorded/u);
