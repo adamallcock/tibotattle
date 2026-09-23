@@ -295,9 +295,9 @@ vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ## Status
 
-TiboTattle is a published macOS product with an operational optional hosted
-service. The current published version and user-facing history are listed in
-the [changelog](CHANGELOG.md) and on the
+TiboTattle publishes desktop installers for macOS, Windows x64 and Linux x64,
+with an operational optional hosted service. The current published version and
+user-facing history are listed in the [changelog](CHANGELOG.md) and on the
 [GitHub Releases page](https://github.com/adamallcock/tibotattle/releases).
 TiboTattle is not a provider-authoritative billing dashboard: quota estimates
 carry explicit uncertainty, and unknown models or tiers remain explicit rather

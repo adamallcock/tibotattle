@@ -2013,6 +2013,7 @@ test("typed deployment refuses an unqualified inventory before Wrangler", async 
 
 test("legacy deployment refuses typed public asset pins before snapshot", async () => {
   for (const pins of [
+    { candidatePublicManifestSha256: "2".repeat(64) },
     { retainedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT },
     { expectedLiveManifestSha256: "1".repeat(64) },
     {
@@ -2091,7 +2092,9 @@ test("typed deployment rejects a contradictory nested predecessor before pinning
   assert.deepEqual(calls, []);
 });
 
-test("typed deployment installs the live config in the immutable snapshot and rechecks it around Wrangler", async (t) => {
+for (const mode of ["retained", "candidate", "bad-preimage", "bad-postimage", "mutated-options"]) test(`typed deployment preserves immutable config and manifest transition: ${mode}`, async (t) => {
+  const candidate = mode === "retained" ? null : "2".repeat(64);
+  const manifestChecks = [];
   const fixture = await immutableSnapshotFixture();
   t.after(() => rm(fixture.root, { recursive: true, force: true }));
   const baseline = {
@@ -2140,7 +2143,10 @@ test("typed deployment installs the live config in the immutable snapshot and re
       directory,
       ["status", "--porcelain=v1", "--untracked-files=all"],
     ).trim() === "",
-    createSourceSnapshot: (arguments_) => createImmutableSourceSnapshot(arguments_),
+    createSourceSnapshot: (arguments_) => {
+      if (mode === "mutated-options") configured.candidatePublicManifestSha256 = "3".repeat(64);
+      return createImmutableSourceSnapshot(arguments_);
+    },
     dependencyDigestCheck: undefined,
     typedProduction: {
       inventory: { snapshot: baseline },
@@ -2167,19 +2173,27 @@ test("typed deployment installs the live config in the immutable snapshot and re
     },
     retainedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT,
     expectedLiveManifestSha256: "1".repeat(64),
+    candidatePublicManifestSha256: candidate,
     migrationGateCheck: null,
     determinePendingMigrations: async () => assert.fail("Qualified typed roles must not query the legacy migration ledger"),
     releasePreflight: async () => ({ state: "ready", blockers: [] }),
     checkWorkspacePackages: async () => {},
     checkEndpoints: async () => {},
-    stageAssets: async ({ repositoryRoot }) => {
+    stageAssets: async ({ repositoryRoot, expectedSourceCommit, retainedPublicSourceCommit, expectedLiveManifestSha256 }) => {
+      assert.equal(expectedSourceCommit, fixture.sourceCommit);
+      assert.equal(retainedPublicSourceCommit, candidate === null ? FIXTURE_PREVIOUS_COMMIT : fixture.sourceCommit);
+      assert.equal(expectedLiveManifestSha256, candidate ?? "1".repeat(64));
       assert.equal(realpathSync(repositoryRoot), repositoryRoot);
       const configMetadata = await lstat(
         join(repositoryRoot, "apps", "worker", "wrangler.jsonc"),
       );
       assert.equal(configMetadata.mode & 0o777, 0o600);
     },
-    publicReleaseManifestRecheck: async () => ({ ok: true, code: null }),
+    publicReleaseManifestRecheck: async ({ expectedSha256 }) => {
+      manifestChecks.push(expectedSha256);
+      assert.equal(expectedSha256, deployed ? candidate ?? "1".repeat(64) : "1".repeat(64));
+      return { ok: !(mode === "bad-preimage" && !deployed) && !(mode === "bad-postimage" && deployed), code: null };
+    },
     publicSurfaceRecheck: async () => ({ ok: true, code: null }),
     healthRecheck,
     spawn: () => {
@@ -2188,10 +2202,20 @@ test("typed deployment installs the live config in the immutable snapshot and re
     },
   });
   const result = await runProductionDeployment(configured);
+  if (["bad-preimage", "bad-postimage"].includes(mode)) {
+    assert.equal(result.ok, false);
+    assert.equal(deployed, mode === "bad-postimage");
+    assert.equal(result.outcome, mode === "bad-postimage" ? "deployed_unverified" : "not_started");
+    assert.equal(result.coordination, mode === "bad-postimage" ? "held" : "not_acquired");
+    assert.equal(result.code, "PRODUCTION_TYPED_PUBLIC_RELEASE_MANIFEST_INVALID");
+    return;
+  }
+  assert.deepEqual(manifestChecks, ["1".repeat(64), candidate ?? "1".repeat(64)]);
   assert.equal(result.ok, true);
   assert.equal(result.code, "PRODUCTION_DEPLOYED");
   assert.equal(captures, 4);
   const record = await readOperation(configured.operationDirectory);
+  assert.equal(record.state.typed.candidatePublicManifestSha256 ?? null, candidate);
   assert.equal(record.state.typed.schema, "production-typed-operation-v1");
   assert.equal(record.state.typed.liveConfigurationFingerprint, baseline.fingerprint);
   assert.equal(record.state.typed.retainedPublicSourceCommit, FIXTURE_PREVIOUS_COMMIT);
@@ -2225,4 +2249,14 @@ test("public release manifest recheck is bounded and exact", async () => {
     expectedSha256: "0".repeat(64),
     fetchImpl: async () => response,
   }), { ok: false, code: "PRODUCTION_PUBLIC_RELEASE_MANIFEST_MISMATCH" });
+});
+
+test("typed candidate manifest rejects malformed values before provider or snapshot work", async () => {
+ for (const candidatePublicManifestSha256 of ["", "no", 42, {}, "A".repeat(64)]) {
+  const result=await runProductionDeployment(readyOptions({candidatePublicManifestSha256,
+   retainedPublicSourceCommit:FIXTURE_PREVIOUS_COMMIT,expectedLiveManifestSha256:"1".repeat(64),
+   typedProduction:{inventory:{},provider:{capture:()=>assert.fail("provider must not run")}},
+   createSourceSnapshot:()=>assert.fail("snapshot must not run")}));
+  assert.deepEqual(result,{ok:false,code:"PRODUCTION_TYPED_INPUT_INVALID"});
+ }
 });

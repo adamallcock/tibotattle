@@ -174,12 +174,14 @@ export async function createTypedProductionOperationPin({
   expectedPreviousSourceCommit,
   retainedPublicSourceCommit,
   expectedLiveManifestSha256,
+  candidatePublicManifestSha256 = null,
   buildSchemas = buildTypedProductionExpectedSchemas,
   configTools = defaultTypedConfigTools,
 } = {}) {
   if (!PRODUCTION_SOURCE_COMMIT_PATTERN.test(expectedPreviousSourceCommit ?? "")
       || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(retainedPublicSourceCommit ?? "")
       || !PRODUCTION_SHA256_PATTERN.test(expectedLiveManifestSha256 ?? "")
+      || (candidatePublicManifestSha256 !== null && !PRODUCTION_SHA256_PATTERN.test(candidatePublicManifestSha256))
       || typeof buildSchemas !== "function"
       || typeof configTools?.createSnapshot !== "function") {
     return typedFailure("PRODUCTION_TYPED_INPUT_INVALID");
@@ -215,6 +217,7 @@ export async function createTypedProductionOperationPin({
       predecessorSourceCommit: expectedPreviousSourceCommit,
       retainedPublicSourceCommit,
       expectedLiveManifestSha256,
+      ...(candidatePublicManifestSha256 === null ? {} : { candidatePublicManifestSha256 }),
       expectedSchemaIdentity: schemaIdentity,
     },
   };
@@ -1362,6 +1365,7 @@ async function runProductionDeploymentFromSnapshot({
   typedConfigPath = null,
   retainedPublicSourceCommit = null,
   expectedLiveManifestSha256 = null,
+  candidatePublicManifestSha256 = null,
   beforeMutation = async () => { throw operationError("PRODUCTION_COORDINATION_REQUIRED"); },
   finalMutationRecheck = null,
   mutationIntent = async () => { throw operationError("PRODUCTION_COORDINATION_REQUIRED"); },
@@ -1492,10 +1496,10 @@ async function runProductionDeploymentFromSnapshot({
       expectedSourceCommit: sourceCommit,
       ...(retainedPublicSourceCommit === null
         ? {}
-        : { retainedPublicSourceCommit }),
+        : { retainedPublicSourceCommit: candidatePublicManifestSha256 === null ? retainedPublicSourceCommit : sourceCommit }),
       ...(expectedLiveManifestSha256 === null
         ? {}
-        : { expectedLiveManifestSha256 }),
+        : { expectedLiveManifestSha256: candidatePublicManifestSha256 ?? expectedLiveManifestSha256 }),
       git: typedDeployment
         ? gitWithGeneratedConfigException({
           snapshotGit,
@@ -1638,7 +1642,7 @@ async function runProductionDeploymentFromSnapshot({
     try {
       manifest = await publicReleaseManifestRecheck({
         fetchImpl,
-        expectedSha256: expectedLiveManifestSha256,
+        expectedSha256: candidatePublicManifestSha256 ?? expectedLiveManifestSha256,
         timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
       });
     } catch {
@@ -1734,6 +1738,7 @@ async function runUncoordinatedProductionDeployment({
   typedOperationPin = null,
   retainedPublicSourceCommit = null,
   expectedLiveManifestSha256 = null,
+  candidatePublicManifestSha256 = null,
   beforeMutation,
   finalMutationRecheck,
   mutationIntent,
@@ -1817,6 +1822,7 @@ async function runUncoordinatedProductionDeployment({
       return prepared;
     }
     if (!typedOperationPin
+        || (typedOperationPin.candidatePublicManifestSha256 ?? null) !== candidatePublicManifestSha256
         || prepared.baseline?.fingerprint !== typedOperationPin.liveConfigurationFingerprint
         || JSON.stringify(prepared.expectedSchemaIdentity)
           !== JSON.stringify(typedOperationPin.expectedSchemaIdentity)) {
@@ -1867,6 +1873,7 @@ async function runUncoordinatedProductionDeployment({
         : null,
       retainedPublicSourceCommit,
       expectedLiveManifestSha256,
+      candidatePublicManifestSha256,
       beforeMutation,
       finalMutationRecheck,
       mutationIntent,
@@ -1901,7 +1908,7 @@ export async function runProductionDeployment(options) {
   const hasExpectedLiveManifestSha256 = options.expectedLiveManifestSha256 !== undefined
     && options.expectedLiveManifestSha256 !== null;
   if (!options.typedProduction
-      && (hasRetainedPublicSourceCommit || hasExpectedLiveManifestSha256)) {
+      && (hasRetainedPublicSourceCommit || hasExpectedLiveManifestSha256 || options.candidatePublicManifestSha256 != null)) {
     return typedFailure("PRODUCTION_TYPED_INPUT_INVALID");
   }
   if (options.typedProduction?.expectedPreviousSourceCommit !== undefined
@@ -1921,6 +1928,7 @@ export async function runProductionDeployment(options) {
         expectedPreviousSourceCommit,
         retainedPublicSourceCommit: options.retainedPublicSourceCommit,
         expectedLiveManifestSha256: options.expectedLiveManifestSha256,
+        candidatePublicManifestSha256: options.candidatePublicManifestSha256 ?? null,
       });
     } catch (error) {
       pinResult = typedFailure(

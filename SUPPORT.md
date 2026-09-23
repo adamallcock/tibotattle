@@ -145,13 +145,14 @@ rule out an early failure.
 
 ## Supported surface
 
-The published product supports macOS 14 or later on Apple silicon and Intel.
-Both use the same [Homebrew command](README.md#install-macos-apple-silicon-or-intel),
-or their matching direct DMG. See [platform qualification](docs/reference/platform-support.md)
-for the release-specific Intel testing boundary.
-Windows and Linux work in this repository is preparation or experimental
-evidence, not a supported install. Local analysis works without the hosted
-service; a hosted outage should remain visibly unavailable rather than make the
+The published 0.1.24 release supports macOS 14 or later on Apple silicon and Intel.
+It also provides a Windows x64 installer and a Linux x86_64 AppImage. Macs use the same
+[Homebrew command](README.md#install-macos-apple-silicon-or-intel), or their
+matching direct DMG. See [platform qualification](docs/reference/platform-support.md)
+for exact artifact assurances and the owner-accepted unperformed macOS
+existing-credential and Linux physical/FUSE/existing-install coverage.
+Local analysis works without the hosted service; a hosted outage should remain
+visibly unavailable rather than make the
 local dashboard unusable.
 
 Only the latest published stable release and current source receive routine
