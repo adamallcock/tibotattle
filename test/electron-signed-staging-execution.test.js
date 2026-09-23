@@ -307,3 +307,104 @@ test('long Chromium policy marker is recognized only when wholly within the scan
     assert.equal(value.stderrComplete, true);
   }
 });
+
+test('GPU codes and same-line spawn errno survive every chunk split without exporting paths', async () => {
+  const { EventEmitter } = await import('node:events');
+  const cases = [
+    ['GPU process launch failed: error_code=1003\n', 'gpuLaunchFailureCodes', 1003],
+    ['GPU process exited unexpectedly: exit_code=-2147483648\r\n', 'gpuExitCodes', -2147483648],
+    ['posix_spawnp(/private/PRIVATE_SENTINEL/helper): -1 Operation not permitted\n', 'posixSpawnErrnos', 1],
+  ];
+  for (const [message, key, expected] of cases) {
+    for (let split = 1; split < message.length; split++) {
+      const child = new EventEmitter(); child.stderr = new EventEmitter();
+      const read = observeSignedStagingProcess(child);
+      child.stderr.emit('data', Buffer.from(message.slice(0, split)));
+      child.stderr.emit('data', Buffer.from(message.slice(split))); child.stderr.emit('end');
+      const result = read();
+      assert.deepEqual(result[key], [expected]);
+      for (const flag of ['Overflow', 'OutOfRange', 'Malformed', 'Partial']) assert.equal(result[key + flag], false);
+      assert.equal(JSON.stringify(result).includes('PRIVATE_SENTINEL'), false);
+      assert.equal(JSON.stringify(result).includes('/private/'), false);
+      result[key].push(42); assert.deepEqual(read()[key], [expected]);
+    }
+  }
+});
+
+test('numeric stderr classification caps unique codes and distinguishes invalid, partial and unobserved', async () => {
+  const { EventEmitter } = await import('node:events');
+  const classify = message => {
+    const child = new EventEmitter(); child.stderr = new EventEmitter();
+    const read = observeSignedStagingProcess(child);
+    for (const byte of Buffer.from(message)) child.stderr.emit('data', Buffer.from([byte]));
+    child.stderr.emit('end'); return read();
+  };
+  const specs = [
+    ['GPU process launch failed: error_code=', 'gpuLaunchFailureCodes', 0, 65535],
+    ['GPU process exited unexpectedly: exit_code=', 'gpuExitCodes', -2147483648, 2147483647],
+    ['posix_spawnp(/PRIVATE_SENTINEL): -', 'posixSpawnErrnos', 1, 255],
+  ];
+  for (const [prefix, key, min, max] of specs) {
+    const valid = classify(prefix + min + '\n' + prefix + max + '\n');
+    assert.deepEqual(valid[key], [min, max]);
+    for (const invalid of [min - 1, max + 1, '999999999999999999999999999999999999999']) {
+      const result = classify(prefix + invalid + '\n');
+      assert.deepEqual(result[key], []);
+      // An unsupported sign is malformed rather than a parsed range violation.
+      assert.equal(result[key + (String(invalid).startsWith('-') && min >= 0 ? 'Malformed' : 'OutOfRange')], true);
+    }
+    for (const malformed of ['1PRIVATE_SENTINEL\n', '+1\n', '--1\n', '1.0\n', '\n']) {
+      const result = classify(prefix + malformed);
+      assert.deepEqual(result[key], []); assert.equal(result[key + 'Malformed'], true);
+    }
+    for (const partial of ['', '1', '-']) {
+      if (partial === '-' && min >= 0) continue;
+      const result = classify(prefix + partial);
+      assert.deepEqual(result[key], []); assert.equal(result[key + 'Partial'], true);
+    }
+    const many = classify(Array.from({ length: 10 }, (_, i) => prefix + (i + 1) + '\n').join('') + prefix + '1\n');
+    assert.deepEqual(many[key], [1, 2, 3, 4, 5, 6, 7, 8]); assert.equal(many[key + 'Overflow'], true);
+    const repeat = classify((prefix + '1\n').repeat(12));
+    assert.deepEqual(repeat[key], [1]); assert.equal(repeat[key + 'Overflow'], false);
+    assert.equal(classify('PRIVATE_SENTINEL')[key + 'Partial'], false);
+  }
+  const disconnected = classify('posix_spawnp(/PRIVATE_SENTINEL\n): -1 Operation not permitted\n');
+  assert.deepEqual(disconnected.posixSpawnErrnos, []); assert.equal(disconnected.posixSpawnErrnosMalformed, true);
+});
+
+test('numeric scan never consumes discarded delimiters or freezes cleanup output into evidence', async () => {
+  const { EventEmitter } = await import('node:events');
+  for (const marker of ['GPU process launch failed: error_code=', 'GPU process launch failed: error_code=1003']) {
+    for (const atScanLimit of [false, true]) {
+      const child = new EventEmitter(); child.stderr = new EventEmitter();
+      const read = observeSignedStagingProcess(child);
+      if (atScanLimit) child.stderr.emit('data', Buffer.alloc(65536 - marker.length, 120));
+      child.stderr.emit('data', Buffer.from(marker));
+      if (atScanLimit) { child.stderr.emit('data', Buffer.from('\n')); child.stderr.emit('end'); }
+      const value = read();
+      assert.equal(value.stderrTruncated, atScanLimit); assert.equal(value.stderrComplete, atScanLimit);
+      assert.deepEqual(value.gpuLaunchFailureCodes, []); assert.equal(value.gpuLaunchFailureCodesPartial, true);
+      child.stderr.emit('data', Buffer.from('1003\n')); child.emit('exit', null, 'SIGTERM');
+      assert.deepEqual(read(), value);
+    }
+  }
+});
+
+test('numeric diagnostic schema rejects forged arrays and detaches accepted arrays', async () => {
+  const { EventEmitter } = await import('node:events');
+  const child = new EventEmitter(); child.stderr = new EventEmitter();
+  const value = observeSignedStagingProcess(child)();
+  for (const key of ['gpuLaunchFailureCodes', 'gpuExitCodes', 'posixSpawnErrnos']) {
+    const hole = Array(1); hole.extra = 1;
+    const symbol = []; symbol[Symbol('PRIVATE_SENTINEL')] = 1;
+    for (const invalid of [[1, 1], [1.5], [Infinity], ['PRIVATE_SENTINEL'], Array(1), hole, symbol, Array.from({ length: 9 }, (_, i) => i + 1)]) {
+      assert.equal(sanitizeSignedStagingProcessDiagnostic({ ...value, [key]: invalid }), null);
+    }
+    assert.equal(sanitizeSignedStagingProcessDiagnostic({ ...value, [key + 'Overflow']: true }), null);
+    for (const flag of ['Overflow', 'OutOfRange', 'Malformed', 'Partial']) {
+      assert.equal(sanitizeSignedStagingProcessDiagnostic({ ...value, [key + flag]: 'true' }), null);
+    }
+    const input = { ...value, [key]: [1] }, clean = sanitizeSignedStagingProcessDiagnostic(input);
+    clean[key].push(2); assert.deepEqual(input[key], [1]);
+  }
+});

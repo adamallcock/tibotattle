@@ -273,16 +273,95 @@ const STDERR_MARKERS = Object.freeze({ electronEntryFailure: [ELECTRON_ENTRY_FAI
   machBootstrapCheck: ['bootstrap_check_in '],
   gpuProcessUnusable: ["GPU process isn't usable. Goodbye."],
   chromiumFatal: [':FATAL:'], chromiumCheckFailure: ['Check failed:'] });
+const STDERR_NUMBERS = [
+  { key: 'gpuLaunchFailureCodes', prefix: 'GPU process launch failed: error_code=', min: 0, max: 65535 },
+  { key: 'gpuExitCodes', prefix: 'GPU process exited unexpectedly: exit_code=', min: -2147483648, max: 2147483647 },
+  { key: 'posixSpawnErrnos', prefix: 'posix_spawnp(', min: 1, max: 255, path: true },
+];
+const NUMBER_FLAGS = ['Overflow', 'OutOfRange', 'Malformed', 'Partial'];
+// Only fixed-prefix match positions survive between bytes, never path contents.
+function literalMatcher(literal) {
+  const fallback = [0];
+  for (let i = 1, j = 0; i < literal.length; i++) {
+    while (j > 0 && literal[i] !== literal[j]) j = fallback[j - 1];
+    if (literal[i] === literal[j]) j++;
+    fallback[i] = j;
+  }
+  let matched = 0;
+  return {
+    reset: () => { matched = 0; },
+    push(byte) {
+      while (matched > 0 && byte !== literal.charCodeAt(matched)) matched = fallback[matched - 1];
+      if (byte === literal.charCodeAt(matched)) matched++;
+      if (matched !== literal.length) return false;
+      matched = 0;
+      return true;
+    },
+  };
+}
+function observeNumericStderr(observation) {
+  const parsers = STDERR_NUMBERS.map(spec => {
+    const prefix = literalMatcher(spec.prefix), suffix = literalMatcher('): -');
+    let phase = 'prefix', digits = 0, magnitude = 0, negative = false, tooLarge = false;
+    const flag = name => { observation[spec.key + name] = true; };
+    const reset = () => { phase = 'prefix'; prefix.reset(); suffix.reset(); };
+    const startNumber = () => { phase = 'number'; digits = 0; magnitude = 0; negative = false; tooLarge = false; };
+    return {
+      finish: () => { if (phase === 'number' || phase === 'path') flag('Partial'); reset(); },
+      push(byte) {
+        const newline = byte === 10 || byte === 13;
+        if (phase === 'prefix') {
+          if (prefix.push(byte)) { if (spec.path) phase = 'path'; else startNumber(); }
+        } else if (phase === 'path') {
+          // Discard every path byte. A suffix on a different line cannot match.
+          if (newline) { flag('Malformed'); reset(); }
+          else if (suffix.push(byte)) startNumber();
+        } else if (phase === 'skip') {
+          if (newline) reset();
+        } else if (byte >= 48 && byte <= 57) {
+          digits = Math.min(digits + 1, 11);
+          if (digits > 10) tooLarge = true;
+          if (!tooLarge) {
+            magnitude = magnitude * 10 + byte - 48;
+            tooLarge = magnitude > Math.max(Math.abs(spec.min), Math.abs(spec.max));
+          }
+        } else if (byte === 45 && spec.min < 0 && digits === 0 && !negative) {
+          negative = true;
+        } else if (newline || byte === 9 || byte === 32) {
+          const value = negative ? -magnitude : magnitude;
+          if (digits === 0) flag('Malformed');
+          else if (tooLarge || value < spec.min || value > spec.max) flag('OutOfRange');
+          else if (!observation[spec.key].includes(value)) {
+            if (observation[spec.key].length === 8) flag('Overflow');
+            else observation[spec.key].push(value === 0 ? 0 : value);
+          }
+          reset();
+        } else {
+          // A number must end at whitespace, not in a longer arbitrary token.
+          flag('Malformed'); phase = 'skip';
+        }
+      },
+    };
+  });
+  return { push: bytes => { for (const byte of bytes) for (const parser of parsers) parser.push(byte); },
+    finish: () => { for (const parser of parsers) parser.finish(); } };
+}
 const EXIT_SIGNALS = ['SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGILL', 'SIGTRAP', 'SIGABRT', 'SIGBUS',
   'SIGFPE', 'SIGKILL', 'SIGSEGV', 'SIGPIPE', 'SIGALRM', 'SIGTERM', 'SIGXCPU', 'SIGXFSZ', 'SIGSYS'];
 const EXIT_BOOLEANS = ['exited', 'spawnFailed', 'unknownExitSignal', 'stderrTruncated', 'stderrComplete',
-  ...Object.keys(STDERR_MARKERS)];
+  ...Object.keys(STDERR_MARKERS), ...STDERR_NUMBERS.flatMap(({ key }) => NUMBER_FLAGS.map(flag => key + flag))];
 export function sanitizeSignedStagingProcessDiagnostic(value) {
-  const keys = ['exitCode', 'exitSignal', 'stderrBytesScanned', ...EXIT_BOOLEANS];
+  const keys = ['exitCode', 'exitSignal', 'stderrBytesScanned', ...EXIT_BOOLEANS, ...STDERR_NUMBERS.map(({ key }) => key)];
   if (!value || Object.getPrototypeOf(value) !== Object.prototype
     || Reflect.ownKeys(value).some(key => typeof key !== 'string')
     || Reflect.ownKeys(value).sort().join() !== keys.sort().join()
     || EXIT_BOOLEANS.some(k => typeof value[k] !== 'boolean')
+    || STDERR_NUMBERS.some(({ key, min, max }) => !Array.isArray(value[key]) || value[key].length > 8
+      || Reflect.ownKeys(value[key]).some(k => typeof k !== 'string')
+      || Reflect.ownKeys(value[key]).sort().join() !== ['length', ...Array.from({ length: value[key].length }, (_, i) => String(i))].sort().join()
+      || value[key].some(n => !Number.isInteger(n) || n < min || n > max)
+      || new Set(value[key]).size !== value[key].length
+      || (value[key + 'Overflow'] && value[key].length !== 8))
     || !(value.exitCode === null || (Number.isInteger(value.exitCode) && value.exitCode >= 0 && value.exitCode <= 255))
     || !(value.exitSignal === null || EXIT_SIGNALS.includes(value.exitSignal))
     || !Number.isInteger(value.stderrBytesScanned) || value.stderrBytesScanned < 0 || value.stderrBytesScanned > STDERR_SCAN_LIMIT
@@ -290,11 +369,13 @@ export function sanitizeSignedStagingProcessDiagnostic(value) {
     || (value.exitSignal !== null && value.unknownExitSignal)
     || (value.stderrTruncated && value.stderrBytesScanned !== STDERR_SCAN_LIMIT)
     || (value.exitCode !== null && (value.exitSignal !== null || value.unknownExitSignal))) return null;
-  return Object.fromEntries(keys.map(k => [k, value[k]]));
+  return Object.fromEntries(keys.map(k => [k, Array.isArray(value[k]) ? [...value[k]] : value[k]]));
 }
 export function observeSignedStagingProcess(child) {
   const observation = { exitCode: null, exitSignal: null, stderrBytesScanned: 0,
-    ...Object.fromEntries(EXIT_BOOLEANS.map(k => [k, false])) };
+    ...Object.fromEntries(EXIT_BOOLEANS.map(k => [k, false])),
+    ...Object.fromEntries(STDERR_NUMBERS.map(({ key }) => [key, []])) };
+  const numbers = observeNumericStderr(observation);
   // Only the suffix needed to recognize fixed ASCII literals split across chunks.
   const overlapBytes = Math.max(...Object.values(STDERR_MARKERS).flat().map(s => s.length)) - 1;
   let overlap = Buffer.alloc(0), frozen = null;
@@ -313,6 +394,7 @@ export function observeSignedStagingProcess(child) {
     const size = Math.min(bytes.length, STDERR_SCAN_LIMIT - observation.stderrBytesScanned);
     observation.stderrTruncated ||= size < bytes.length;
     if (size === 0) { overlap = Buffer.alloc(0); return; }
+    numbers.push(bytes.subarray(0, size));
     const scanned = Buffer.concat([overlap, bytes.subarray(0, size)]);
     for (const [key, literals] of Object.entries(STDERR_MARKERS)) {
       observation[key] ||= literals.some(literal => scanned.includes(literal));
@@ -325,9 +407,9 @@ export function observeSignedStagingProcess(child) {
   child.stderr.once('error', () => { overlap = Buffer.alloc(0); });
   return () => {
     // Freeze before cleanup; harness SIGTERM/SIGKILL cannot become launch evidence.
-    frozen ??= sanitizeSignedStagingProcessDiagnostic(observation);
+    if (!frozen) { numbers.finish(); frozen = sanitizeSignedStagingProcessDiagnostic(observation); }
     overlap = Buffer.alloc(0);
-    return frozen === null ? null : { ...frozen };
+    return frozen === null ? null : sanitizeSignedStagingProcessDiagnostic(frozen);
   };
 }
 
