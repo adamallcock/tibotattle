@@ -49,6 +49,10 @@ const CANONICAL_MODULES = Object.freeze([
   Object.freeze({
     basename: "admin-model-history.js",
     expectedImports: Object.freeze(["./model-catalog.js"]),
+    privateExports: Object.freeze([
+      "PREVIOUS_ADMIN_MODEL_HISTORY_CATALOG_VERSION",
+      "OLDER_ADMIN_MODEL_HISTORY_CATALOG_VERSION",
+    ]),
   }),
   Object.freeze({
     basename: "constants.js",

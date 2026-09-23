@@ -242,8 +242,8 @@ export function assertReviewedModelCatalogCompleteness({
 // and API-price-equivalent dollars. No participant or source identifiers enter.
 export const ADMIN_MODEL_HISTORY_CATALOG_VERSION = REVIEWED_MODEL_CATALOG_VERSION;
 export const LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION = "admin-model-roster-v0.2";
-export const PREVIOUS_ADMIN_MODEL_HISTORY_CATALOG_VERSION = "reviewed-model-catalog-2026-09-22.1";
-export const OLDER_ADMIN_MODEL_HISTORY_CATALOG_VERSION = "reviewed-model-catalog-2026-09-03.1";
+const PREVIOUS_ADMIN_MODEL_HISTORY_CATALOG_VERSION = "reviewed-model-catalog-2026-09-22.1";
+const OLDER_ADMIN_MODEL_HISTORY_CATALOG_VERSION = "reviewed-model-catalog-2026-09-03.1";
 export const ADMIN_MODEL_CONFIG = Object.freeze(REVIEWED_MODEL_CATALOG
   .filter((model) => model.provider === "openai_codex")
   .map((model) => Object.freeze({

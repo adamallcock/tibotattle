@@ -44,7 +44,7 @@
     {
       "schemaName": "usage-event.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json",
-      "schemaSha256": "f59dbc51f8f9031f902aa1d079d628d172e612027c024a822c6a573643c50fc7",
+      "schemaSha256": "43693e9cbce396e451d918e129c54de91e0059250e937c5a533b898b7b21aed0",
       "propertyCount": 40
     }
   ],
