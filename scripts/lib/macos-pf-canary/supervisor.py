@@ -93,9 +93,9 @@ def reference_token(text):
 
 
 def require_no_references(text):
-    # Native macOS pfctl DIOCGETSTARTERS zero-reference output. A table,
-    # mixed output or an unknown format is never evidence of zero owners.
-    require(text.strip() == 'No pf_enabled references', 'preexisting_references')
+    # Native DIOCGETSTARTERS empty success: puts(), then return 0. The
+    # different 'No pf_enabled references' literal is an errx(1) error path.
+    require(text.strip() == 'No pf starter references held', 'preexisting_references')
 
 
 def labels(text, expected):

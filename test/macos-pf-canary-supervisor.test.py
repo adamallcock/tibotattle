@@ -42,7 +42,7 @@ class SupervisorTest(unittest.TestCase):
         if args == ('-s', 'states'):
             return ''
         if args == ('-s', 'References'):
-            return 'No pf_enabled references\n'
+            return 'No pf starter references held\n'
         if args == ('-a', self.anchor, '-f', '-'):
             self.loaded = bool(data)
             return ''
@@ -241,14 +241,27 @@ class SupervisorTest(unittest.TestCase):
             self.assertEqual(events, [('journal', 88888), ('release', 88888), ('stop', 88888), ('journal', None)])
 
     def test_native_zero_reference_message_is_exact_and_tables_or_mixed_output_refuse(self):
-        module.require_no_references('No pf_enabled references\n')
-        for value in ('', 'References:', 'TOKENS:', 'No pf starter references held',
-                      'No pf_enabled references\nTOKENS:',
+        module.require_no_references('No pf starter references held\n')
+        for value in ('', 'References:', 'TOKENS:', 'No pf_enabled references',
+                      'No pf starter references held\nTOKENS:',
                       'PID Process Name TOKEN TIMESTAMP\n1 service 123 0 days 00:00:01',
-                      'No pf_enabled references\n1 service 123 0 days 00:00:01',
+                      'No pf starter references held\n1 service 123 0 days 00:00:01',
                       'No PF_enabled references', 'PRIVATE_SENTINEL'):
             with self.subTest(value=value), self.assertRaises(module.Refused):
                 module.require_no_references(value)
+
+    def test_reference_admission_never_uses_error_exit_or_stderr_as_empty_success(self):
+        for code, out, err in [
+                (1, b'', b'pfctl: No pf_enabled references\n'),
+                (1, b'No pf starter references held\n', b'failed'),
+                (0, b'', b'No pf starter references held\n'),
+                (0, b'TOKENS:\n1 service 123 0 days 00:00:01', b'No pf starter references held\n')]:
+            with self.subTest(code=code, out=out), patch.object(module.subprocess, 'run',
+                    return_value=subprocess.CompletedProcess([], code, out, err)), self.assertRaises(module.Refused):
+                module.require_no_references(module.pf('-s', 'References'))
+        with patch.object(module.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                [], 0, b'No pf starter references held\n', b'')):
+            module.require_no_references(module.pf('-s', 'References'))
 
     def test_strict_label_and_enable_token_parsers(self):
         self.assertEqual(module.labels('owned 1 2 3 4 5 6 7\n', ['owned']), {'owned': 2})
