@@ -1776,6 +1776,7 @@ export function mountWorkUsageView(options = {}) {
     const retainPrevious = next && reportingWindow && next.period === reportingWindow.period
       && Date.parse(next.endAt) > Date.parse(reportingWindow.endAt) && displayedForQuery();
     const previousKey = queryKey();
+    const sameEnd = next && reportingWindow?.endAt === next.endAt;
     sharedReporting = true;
     reportingWindow = next;
     query = { ...query, period: next?.period ?? null };
@@ -1786,12 +1787,13 @@ export function mountWorkUsageView(options = {}) {
       if (next === null) setStatus("waiting");
       return next !== null;
     }
+    const prepared = sameEnd ? cachedPeriod(next.period, queryFamilyKey(), periodCacheAnchor) : null;
     stopLease();
     stopPeriodPreload();
     preloadInFlight = null;
     liveAnchor = null;
     needsLeaseValidation = false;
-    clearPeriodCache();
+    if (!sameEnd) clearPeriodCache();
     // A reporting-window change is a new exact evidence scope. Fence every
     // old request before replacing the query so a late response cannot revive
     // a snapshot or period cache from the previous window.
@@ -1805,29 +1807,29 @@ export function mountWorkUsageView(options = {}) {
     clearNested();
     delete query.snapshotId;
     delete query.sourceSnapshotId;
+    if (prepared) query.snapshotId = prepared.snapshotId;
     resetPage();
     ancestors = [];
     selectedTitle = null;
-    if (!retainPrevious) {
-      response = null;
-      responseQueryKey = null;
-    }
-    retainedWindowQueryKey = retainPrevious ? queryKey() : null;
+    response = prepared ?? (retainPrevious ? response : null);
+    responseQueryKey = prepared ? queryKey() : retainPrevious ? responseQueryKey : null;
+    retainedWindowQueryKey = prepared || retainPrevious ? queryKey() : null;
     started = false;
     cancel.hidden = true;
     root.removeAttribute("aria-busy");
-    if (!retainPrevious) body.replaceChildren();
-    body.hidden = !retainPrevious;
+    if (!prepared && !retainPrevious) body.replaceChildren();
+    body.hidden = !prepared && !retainPrevious;
     body.inert = true;
     body.dataset.state = next === null ? "waiting" : "loading";
     if (next === null) {
       setStatus("waiting");
       return false;
     }
-    if (retainPrevious) {
+    if (prepared || retainPrevious) {
       setStatus("savedUpdating", { date: formatLocal(new Date(response.toMs).toISOString()) });
       scope.wrapper.hidden = true;
       for (const control of [views, sort.wrapper, model.wrapper, scope.wrapper, form]) control.inert = true;
+      if (prepared) render();
     }
     if (visible()) load();
     return true;

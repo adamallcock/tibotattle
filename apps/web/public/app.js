@@ -1482,8 +1482,10 @@ const reportingPeriod = createReportingPeriod({
     resetTimelineViewport();
     resetUsageTimelineViewport();
     timelineSeriesMemo = null;
-    if (dashboard) renderDashboard(dashboard);
-    else renderReportingPeriod();
+    if (dashboard) {
+      renderDashboard(dashboard);
+      dashboardReportPreloader.schedule();
+    } else renderReportingPeriod();
   },
 });
 
