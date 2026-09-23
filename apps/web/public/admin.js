@@ -3541,15 +3541,15 @@ function renderGraphRebuild(progress, panel, badge, details) {
       ? "6-hour total not counted"
       : `${formatNumber(throughput.resultsLast6Hours)} in 6 h`}`);
   throughputGroup.append(paragraph(`${formatNumber(throughput.remainingResults)} results remaining`));
-  throughputGroup.append(paragraph(`Estimate only: ${throughput.estimatedHoursRemaining === null
-    ? "no estimate yet"
-    : `about ${formatNumber(throughput.estimatedHoursRemaining, { maximumFractionDigits: 1 })} h remaining at the 6-hour rate`}.`));
+  throughputGroup.append(paragraph(throughput.estimatedHoursRemaining === null
+    ? "No recent-rate comparison yet."
+    : `At the last 6-hour rate, about ${formatNumber(throughput.estimatedHoursRemaining, { maximumFractionDigits: 1 })} h for the remaining result slots. This is not a completion forecast; staged work may finish unevenly.`));
   const freshness = paragraph(`${state.reconstructionProgressFailed ? "Progress refresh unavailable. " : ""}Observed ${formatTime(progress.generatedAt)}${work.updatedAt === null ? "" : ` · work updated ${formatTime(work.updatedAt)}`}. Window ${window.from} to ${window.to}.`, "admin-reconstruction-freshness");
   details.replaceChildren(subtitle, strip, readout, legend, grid,
     ...(retirement.staleResults === null
       ? [paragraph("retirement backlog not counted", "admin-graph-retirement")]
       : retirement.staleResults > 0
-        ? [paragraph(`${formatNumber(retirement.staleResults)} results from a previous build awaiting retirement`,
+        ? [paragraph(`${formatNumber(retirement.staleResults)} retained intermediate results from an earlier calculation, not a published graph`,
           "admin-graph-retirement")]
         : []),
     freshness);
