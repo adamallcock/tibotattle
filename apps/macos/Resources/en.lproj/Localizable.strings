@@ -41,6 +41,9 @@
 "settings.automaticUpdatesUnavailable" = "Automatic updates are unavailable in this build.";
 "settings.automaticUpdatesTooltip" = "Download signed TiboTattle updates automatically.";
 "settings.checkForUpdates" = "Check for Updates";
+"settings.checkingForUpdates" = "Checking for Updates…";
+"settings.updateAvailable" = "Update Available…";
+"settings.quitToInstallUpdate" = "Quit to Install Update";
 "settings.chooseCodexFolder" = "Choose Codex Folder…";
 "settings.codexFolder" = "Codex folder";
 "settings.codexFolderSummary" = "This setting controls the sessions and archived_sessions source only. Refresh also uses the local Codex account, quota, configuration, and rollout-lineage sources disclosed at first run.";

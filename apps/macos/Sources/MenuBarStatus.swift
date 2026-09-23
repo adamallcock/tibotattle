@@ -378,6 +378,9 @@ struct NativeMenuPresentationContract: Equatable {
     let quitShortcut: String
     let usesNativeStatusItemMenu: Bool
     let statusItemButtonRoutesClicks: Bool
+    let updateActionTitle: String?
+    let updateActionEnabled: Bool
+    let updateIndicatorShown: Bool
     let popoverIsTransient: Bool
     let popoverIsShown: Bool
     let popoverContentWidth: CGFloat
@@ -1438,6 +1441,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
     private let quitItem = NSMenuItem()
     private var updaterMenuTitle: String?
     private var updaterMenuEnabled = true
+    private var upgradeAvailable = false
     private var snapshot = MenuBarStatusSnapshot()
     private var dashboardURL: URL?
     private var companionGeneration: UInt64 = 0
@@ -1711,12 +1715,20 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
     /// The updater state is owned by the launcher, but the menu keeps the
     /// always-visible retry/check affordance honest without starting any
     /// updater work itself.
-    func updateUpdaterPresentation(title: String, isEnabled: Bool) {
+    func updateUpdaterPresentation(
+        title: String,
+        isEnabled: Bool,
+        updateAvailable: Bool
+    ) {
         guard !stopped, actions.checkForUpdates != nil else { return }
         updaterMenuTitle = title
         updaterMenuEnabled = isEnabled
         checkForUpdatesItem.title = title
         checkForUpdatesItem.isEnabled = isEnabled
+        if upgradeAvailable != updateAvailable {
+            upgradeAvailable = updateAvailable
+            render()
+        }
     }
 
     /// Used only by the packaged AppKit smoke mode. The test instantiates the
@@ -1725,6 +1737,14 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
     func nativePresentationContract() -> NativeMenuPresentationContract {
         let informationItems = [allowanceItem, evidenceItem]
         let popup = popoverController.nativePresentationContract()
+        let title = statusItem.button?.attributedTitle
+        let updateIndicatorShown = title.map {
+            $0.length > 0 && $0.attribute(
+                .attachment,
+                at: $0.length - 1,
+                effectiveRange: nil
+            ) != nil
+        } ?? false
         return NativeMenuPresentationContract(
             informationRowsAreNative: informationItems.allSatisfy {
                 $0.view == nil && !$0.isEnabled
@@ -1743,6 +1763,10 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
             statusItemButtonRoutesClicks:
                 statusItem.button?.target === self
                     && statusItem.button?.action == #selector(statusItemActivated),
+            updateActionTitle: actions.checkForUpdates == nil
+                ? nil : checkForUpdatesItem.title,
+            updateActionEnabled: checkForUpdatesItem.isEnabled,
+            updateIndicatorShown: updateIndicatorShown,
             popoverIsTransient: popover.behavior == .transient,
             popoverIsShown: popover.isShown,
             popoverContentWidth: popup.contentWidth,
@@ -2264,14 +2288,31 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
                 attributed.addAttributes([.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .bold), .underlineStyle: NSUnderlineStyle.single.rawValue], range: NSRange(range, in: title))
             }
         }
+        if upgradeAvailable,
+           let image = NSImage(
+                systemSymbolName: "arrow.up.circle.fill",
+                accessibilityDescription: nil
+           ) {
+            image.isTemplate = true
+            image.size = NSSize(width: 11, height: 11)
+            let attachment = NSTextAttachment()
+            attachment.image = image
+            attachment.bounds = NSRect(x: 0, y: -1, width: 11, height: 11)
+            if !title.isEmpty {
+                attributed.append(NSAttributedString(string: " "))
+            }
+            attributed.append(NSAttributedString(attachment: attachment))
+        }
         button.attributedTitle = attributed
         button.toolTip =
             "\(snapshot.allowanceSummary)\n\(snapshot.evidenceSummary)\n\(title) · \(trayText(preferences.iconMode))"
             + (lowWindows.isEmpty ? "" : "\n" + trayText("low"))
+            + (upgradeAvailable ? "\n" + TiboTattleLocalization.string(.settingsUpdateAvailable) : "")
         button.setAccessibilityLabel(
             snapshot.accessibilityLabel(productName: productName) + ", " + title
                 + ", " + trayText(preferences.iconMode)
                 + (lowWindows.isEmpty ? "" : ", " + trayText("low"))
+                + (upgradeAvailable ? ", " + TiboTattleLocalization.string(.settingsUpdateAvailable) : "")
         )
     }
 

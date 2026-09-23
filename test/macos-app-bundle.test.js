@@ -1250,6 +1250,11 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     /settingsAutomaticUpdatesOn|settingsAutomaticUpdatesOff/u,
   );
   assert.match(source, /didFindValidUpdate[\s\S]*\.updateAvailable/u);
+  assert.match(source, /willInstallUpdateOnQuit[\s\S]*setState\(\.installOnQuit\)[\s\S]*return false/u);
+  assert.match(source, /userDidMake choice: SPUUserUpdateChoice[\s\S]*choice == \.skip[\s\S]*setState\(\.ready\)/u);
+  assert.match(source, /controller\?\.updater\.canCheckForUpdates == true/u);
+  assert.match(source, /didFinishUpdateCycleFor[\s\S]*state == \.checking[\s\S]*DispatchQueue\.main\.async/u);
+  assert.match(source, /if updater\.installOnQuit \{\s*quitApplication\(\)/u);
   assert.match(
     source,
     /func updaterDidNotFindUpdate\(_ updater: SPUUpdater, error: Error\) \{[\s\S]*?setState\(\.verifiedNoUpdate\)\s*\}/u,
