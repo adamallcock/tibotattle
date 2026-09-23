@@ -7,7 +7,7 @@ import { finalizeCommunityDailySpend, COMMUNITY_DAILY_SPEND_PRICING_METHOD,
 import { createV11DailyProjectionValues, foldV11DailyProjectionValues,
   mergeV11DailyProjectionValues, validateV11DailyProjectionValues,
   V11_DAILY_VALUES_SCHEMA, type V11DailyProjectionValues } from './v11-daily-projection-values';
-import { readV11ProjectedOwnerDays } from './v11-daily-projection';
+import { readV11ProjectedOwnerDays, repriceV11ProjectedOwnerDayPage } from './v11-daily-projection';
 import { readV1ProjectedChunkPage } from './v1-daily-projection';
 import { readPublishedStorageCommunityGraph } from './storage-community-graph-publication';
 import { readCacheRetentionCommunitySeries } from './cache-retention-day';
@@ -205,8 +205,15 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
       .bind(sourceId,ownerDigest,owner.ownerRevision).first();
     if (!ready) return 'deferred';
     const read=await readV11ProjectedOwnerDays({source,target,sourceId,ownerDigest,fromDay:observedDay,throughDay:observedDay});
-    if (read.state !== 'available' || read.values.length > 1) return 'deferred';
-    values=read.values[0]??createV11DailyProjectionValues(observedDay);
+    if (read.state === 'pricing-stale') {
+      const repriced=await repriceV11ProjectedOwnerDayPage({source,target,sourceId,sourceNamespace,
+        ownerDigest,day:observedDay,values,cursor:reuse?old!.fingerprint:null});
+      if(!repriced)return 'deferred';
+      values=repriced.values;fingerprint=repriced.cursor;complete=repriced.complete;
+    } else {
+      if (read.state !== 'available' || read.values.length > 1) return 'deferred';
+      values=read.values[0]??createV11DailyProjectionValues(observedDay);
+    }
   } else {
     const page=(afterIndex:number,requested?:string|null)=>readV1ProjectedChunkPage({source,target,sourceId,sourceNamespace,
       ownerDigest,day:observedDay,afterIndex,limit:50,...(requested?{fingerprint:requested}:{})});

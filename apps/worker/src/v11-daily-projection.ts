@@ -3,7 +3,7 @@ import { analyticsAuthorityIsCurrent, applyAnalyticsChange, readIngestionChanges
   type StorageChange } from "./analytics-delivery";
 import { canonicalJson } from "./canonical-json";
 import { sha256Hex } from "./crypto";
-import { createV11DailyProjectionValues, foldV11DailyProjectionValues, mergeV11DailyProjectionValues } from "./v11-daily-projection-values";
+import { createV11DailyProjectionValues, foldV11DailyProjectionValues, mergeV11DailyProjectionValues, validateV11DailyProjectionValues } from "./v11-daily-projection-values";
 import { lookupV11StorageSource, type V11StorageDiscard, type V11StorageGeneration } from "./v11-storage-journal";
 import { readTypedV11ManifestPage } from "./typed-v11-record-reader";
 import { encodeTypedTelemetryId } from "./typed-telemetry-codec";
@@ -567,7 +567,7 @@ export async function retireV11DailyProjectionPage(target: D1Database, sourceId:
  */
 export async function readV11ProjectedOwnerDays(options: {
   source: D1Database; target: D1Database; sourceId: string; ownerDigest: string; fromDay: string; throughDay: string;
-}): Promise<{ state: "available" | "authority-unavailable"; values: Values[] }> {
+}): Promise<{ state: "available" | "authority-unavailable" | "pricing-stale"; values: Values[] }> {
   const { source, target, sourceId, ownerDigest, fromDay, throughDay } = options;
   const days = (Date.parse(throughDay) - Date.parse(fromDay)) / DAY_MS + 1;
   for (const day of [fromDay, throughDay]) {
@@ -600,6 +600,80 @@ export async function readV11ProjectedOwnerDays(options: {
       || !await analyticsAuthorityIsCurrent(source, target, sourceId, epoch)) {
     return { state: "authority-unavailable", values: [] };
   }
-  return { state: "available", values: rows.flatMap(row => row.values_json === null ? []
-    : [foldV11DailyProjectionValues(JSON.parse(row.values_json) as Values, [])]) };
+  const values: Values[] = []; let stale = false;
+  for (const row of rows) {
+    if (row.values_json === null) continue;
+    const value = JSON.parse(row.values_json) as Values;
+    const current = createV11DailyProjectionValues(fromDay);
+    if (value.registrySha256 !== current.registrySha256 && /^[a-f0-9]{64}$/.test(value.registrySha256)) {
+      // Validate the old closed arithmetic shape, then discard its pricing.
+      // This temporary validation copy is never returned or persisted.
+      validateV11DailyProjectionValues({...value,registrySha256:current.registrySha256});
+      stale = true;
+    } else values.push(foldV11DailyProjectionValues(value, []));
+  }
+  return stale ? {state:"pricing-stale",values:[]} : {state:"available",values};
+}
+
+/** Reprice one source-proven page of an already admitted generation. This
+ * does not replay delivery, replace immutable projection values, or move the
+ * admitted head. The daily owner cache persists the returned arithmetic and
+ * cursor together using its existing compare-and-swap. */
+export async function repriceV11ProjectedOwnerDayPage(options: {
+  source:D1Database;target:D1Database;sourceId:string;sourceNamespace:string;
+  ownerDigest:string;day:string;values:Values;cursor:string|null;
+}):Promise<{values:Values;cursor:string;complete:boolean}|null> {
+  const {source,target,sourceId,ownerDigest,day}=options;
+  const empty=createV11DailyProjectionValues(day);
+  if(!/^[a-f0-9]{64}$/.test(ownerDigest))throw new Error("STORAGE_DIGEST_INVALID");
+  const pin=async()=>{
+    const work=await target.prepare(`SELECT w.*,h.sequence AS selected_sequence,c.authority_epoch AS current_epoch
+      FROM analytics_v11_owner_heads h
+      JOIN analytics_v11_projection_work w ON w.source_id=h.source_id AND w.event_digest=h.event_digest
+      JOIN analytics_owner_state o ON o.source_id=h.source_id AND o.owner_digest=h.owner_digest AND o.state='active'
+      JOIN analytics_applied_events e ON e.source_id=h.source_id AND e.sequence=h.sequence AND e.revision=o.revision
+      JOIN analytics_source_cursors c ON c.source_id=h.source_id
+      WHERE h.source_id=? AND h.owner_digest=? AND w.phase='ready'`)
+      .bind(sourceId,ownerDigest).first<Work&{selected_sequence:number;current_epoch:number}>();
+    if(!work||day<work.from_day||day>work.through_day
+      ||!await analyticsAuthorityIsCurrent(source,target,sourceId,work.current_epoch))return null;
+    const change=(await readIngestionChanges(source,sourceId,work.selected_sequence-1,1))[0];
+    if(!change||change.eventDigest!==work.event_digest||change.ownerDigest!==ownerDigest)return null;
+    const generation=await lookupV11StorageSource(source,change);
+    if(generation.disposition!=='generation')return null;
+    const layout:V11ProjectionSourceLayout=work.source_layout==='typed-v11'
+      ?{kind:'typed-v11',sourceNamespace:options.sourceNamespace}:{kind:'json-v11'};
+    validateWork(work,generation,layout);
+    const selected={...work,next_day:day};
+    const metadata=await sourceDay(source,generation,selected);
+    const identity=await sha256Hex(canonicalJson({generation,layout,metadata,day,
+      registry:empty.registrySha256,method:empty.pricingMethodVersion}));
+    return {work:selected,generation,layout,metadata,identity};
+  };
+  const initial=await pin();if(!initial)return null;
+  let values=empty,afterStream='',afterOccurrence='',records=0;
+  if(options.cursor!==null){
+    const cursor=JSON.parse(options.cursor) as Record<string,unknown>;
+    if(!cursor||Object.keys(cursor).sort().join(',')!=='afterOccurrence,afterStream,identity,method,records'
+      ||cursor.method!=='v11-daily-reprice-v1'||typeof cursor.identity!=='string'||!/^[a-f0-9]{64}$/.test(cursor.identity)
+      ||typeof cursor.afterStream!=='string'||!['quota','session','usage'].includes(cursor.afterStream)
+      ||typeof cursor.afterOccurrence!=='string'||cursor.afterOccurrence.length<1||cursor.afterOccurrence.length>256
+      ||!Number.isSafeInteger(cursor.records)||(cursor.records as number)<1)throw new Error('V11_REPRICE_CURSOR_INVALID');
+    if(cursor.identity===initial.identity){
+      validateV11DailyProjectionValues(options.values);
+      if(options.values.day!==day||Object.values(options.values.counts).reduce((a,b)=>a+b,0)!==cursor.records)
+        throw new Error('V11_REPRICE_CURSOR_INVALID');
+      values=options.values;afterStream=cursor.afterStream;afterOccurrence=cursor.afterOccurrence;records=cursor.records as number;
+    }
+  }
+  const rows=await sourcePage(source,initial.generation,{...initial.work,after_stream:afterStream,after_occurrence:afterOccurrence},initial.layout,initial.metadata);
+  values=foldV11DailyProjectionValues(values,rows.map(row=>JSON.parse(row.record_json)));
+  records+=rows.length;
+  if(records>initial.metadata.expected_records||(rows.length<PAGE_SIZE&&records!==initial.metadata.expected_records))
+    throw new Error('V11_PROJECTION_SOURCE_INCOMPLETE');
+  const final=await pin();if(!final||canonicalJson(initial)!==canonicalJson(final))return null;
+  const last=rows.at(-1);
+  return {values,complete:records===initial.metadata.expected_records,
+    cursor:canonicalJson({method:'v11-daily-reprice-v1',identity:initial.identity,
+      afterStream:last?.stream??afterStream,afterOccurrence:last?.occurrence_id??afterOccurrence,records})};
 }

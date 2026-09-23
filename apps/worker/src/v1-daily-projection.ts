@@ -163,6 +163,23 @@ const scopeSql=`SELECT p.id participant_id,v.revision,s.authority_epoch,s.source
  WHERE l.owner_digest=? AND l.state='active' AND s.singleton=1 AND a.id=1 AND a.runtime_contract_version=1
  AND NOT EXISTS(SELECT 1 FROM telemetry_v11_domain_heads h WHERE h.participant_id=p.id)`;
 
+/** Pricing changes do not append an ingestion event. Re-read one immutable
+ * chunk without replaying its delivery or replacing its retained summary. */
+async function repriceChunk(source:D1Database,sourceNamespace:string,participantId:string,
+ header:Header,observedDay:string):Promise<V11DailyProjectionValues>{
+ const receipt=await validateTypedTelemetryV1Receipt(source,{sourceNamespace,participantId,
+  deviceId:header.device_id,chunkRowId:header.id});
+ if(!receipt||receipt.superseded_at!==null||canonicalJson(receipt)!==canonicalJson(header))throw fail();
+ const ids=(await source.prepare('SELECT typed_record_id FROM typed_v1_record_admissions WHERE chunk_id=? ORDER BY typed_record_id LIMIT 201')
+  .bind(header.id).all<{typed_record_id:number}>()).results.map(row=>row.typed_record_id);
+ if(ids.length!==header.record_count||ids.length<1||ids.length>200)throw fail();
+ const rows=await readTypedTelemetryRowsByStorageIds(source,{sourceNamespace,participantId,storageRowIds:ids});
+ if(rows.length!==ids.length||rows.some(row=>row.format!=='v1'||row.device_id!==header.device_id||row.chunk_row_id!==header.id))throw fail();
+ const records=rows.map(row=>JSON.parse(row.record_json));
+ if(await sha256Hex(canonicalJson(records))!==header.chunk_digest)throw fail();
+ return foldV1DailyProjectionValues(createV11DailyProjectionValues(observedDay),records);
+}
+
 /** Internal bounded page. Callers merge disjoint pages only with one unchanged
  * fingerprint, then keep the ordinary public suppression/completion gates.
  * An active v1.1 head blocks this lane even while its projection is catching up. */
@@ -203,19 +220,42 @@ export async function readV1ProjectedChunkPage(options:{source:D1Database;target
   WHERE source_id=? AND owner_digest=? AND slot_digest IN (${refs.map(()=>'?').join(',')})`)
   .bind(sourceId,ownerDigest,...refs.map(r=>r.slotDigest)).all<{slot_digest:string;chunk_digest:string;namespace_digest:string;
    device_digest:string;content_digest:string;chunk_revision:number;values_json:string}>()).results:[];
- const values:V11DailyProjectionValues[]=[];
+ const values:V11DailyProjectionValues[]=[];let repriced=false;
  for(let i=0;i<page.length;i++){
   const h=page[i]!,ref=refs[i]!,row=summaries.find(r=>r.slot_digest===ref.slotDigest);if(!row)return null;
   if(row.chunk_digest!==ref.chunkDigest||row.namespace_digest!==ref.namespaceDigest||row.device_digest!==ref.deviceDigest
    ||row.content_digest!==h.chunk_digest||row.chunk_revision!==h.revision)throw fail();
-  const value:unknown=JSON.parse(row.values_json);validateV11DailyProjectionValues(value);
+  let value:unknown=JSON.parse(row.values_json);
+  const currentRegistry=createV11DailyProjectionValues(observedDay).registrySha256;
+  const retainedRegistry=value&&typeof value==='object'&&!Array.isArray(value)?Reflect.get(value,'registrySha256'):undefined;
+  if(typeof retainedRegistry==='string'&&digest(retainedRegistry)&&retainedRegistry!==currentRegistry){
+   // Only the registry pin may be stale. Validate the entire closed arithmetic
+   // shape before discarding it; malformed summaries are never repaired silently.
+   validateV11DailyProjectionValues({...value as Record<string,unknown>,registrySha256:currentRegistry});
+   const retained=value as V11DailyProjectionValues;
+   if(retained.day!==observedDay||retained.counts.usage+retained.counts.quota+retained.counts.session!==h.record_count)throw fail();
+   value=await repriceChunk(source,sourceNamespace,scope.participant_id,h,observedDay);repriced=true;
+  }
+  validateV11DailyProjectionValues(value);
   if(value.day!==observedDay||value.counts.usage+value.counts.quota+value.counts.session!==h.record_count)throw fail();
   values.push(value);
+  // A 50-chunk cache page may contain 10,000 source records. Yield after one
+  // stale chunk so the caller can persist a bounded prefix before its deadline.
+  if(repriced)break;
  }
  // Final authoritative source read is the serving linearization point. The
  // previously observed target epoch and immutable header vector must still fit.
- const final=await source.prepare(scopeSql).bind(ownerDigest).first<Scope>();
- if(!final||canonicalJson(final)!==canonicalJson(scope))return null;
- return {fingerprint,values,nextIndex:after+page.length<selected.length?after+page.length:null,
+ if(repriced){
+  const final=await source.batch<Scope|Header>([source.prepare(scopeSql).bind(ownerDigest),
+   source.prepare(`SELECT c.* FROM telemetry_v1_chunks c JOIN storage_v11_owner_links l ON l.participant_id=c.participant_id
+   WHERE l.owner_digest=? AND c.chunk_day=? AND c.superseded_at IS NULL AND c.accepted_record_count>0
+   ORDER BY c.id LIMIT ?`).bind(ownerDigest,observedDay,MAX_V1_SOURCE_CHUNKS+1)]);
+  if(final[0]!.results.length!==1||canonicalJson(final[0]!.results[0])!==canonicalJson(scope)
+   ||canonicalJson(final[1]!.results)!==canonicalJson(headers))return null;
+ }else{
+  const final=await source.prepare(scopeSql).bind(ownerDigest).first<Scope>();
+  if(!final||canonicalJson(final)!==canonicalJson(scope))return null;
+ }
+ return {fingerprint,values,nextIndex:after+values.length<selected.length?after+values.length:null,
   totalChunks:selected.length,authorityEpoch:scope.authority_epoch};
 }

@@ -59,6 +59,12 @@ The maintained field, storage, retention, and deletion inventory is in the
 
 ## Calculation and scale boundary
 
+When pricing changes, daily publication rebuilds stale v1/v1.1 summaries from
+the same admitted source records. Repricing checkpoints one source chunk or
+one generation page at a time; it preserves source selection, immutable
+projection records, and delivery cursors. Incomplete or invalid evidence is
+never relabeled with the new registry or published as a complete day.
+
 Migrations 0054–0056 add a fair dirty-account queue, restartable captured-cohort
 publication, and constant-size preparation counters. Unchanged current work is
 a metadata check, not an account scan. New inputs coalesce per account, and a
