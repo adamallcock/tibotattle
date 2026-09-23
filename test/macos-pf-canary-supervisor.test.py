@@ -39,8 +39,10 @@ class SupervisorTest(unittest.TestCase):
         self.calls.append(args)
         if args == ('-s', 'info'):
             return 'Status: ' + ('Enabled' if self.enabled else 'Disabled') + ' for 0 days\n'
-        if args in [('-s', 'states'), ('-s', 'References')]:
+        if args == ('-s', 'states'):
             return ''
+        if args == ('-s', 'References'):
+            return 'No pf_enabled references\n'
         if args == ('-a', self.anchor, '-f', '-'):
             self.loaded = bool(data)
             return ''
@@ -237,6 +239,16 @@ class SupervisorTest(unittest.TestCase):
              patch.object(module, 'root_file', return_value=output):
             module.fork_probe(self.root, self.config, journal, 'tcp4')
             self.assertEqual(events, [('journal', 88888), ('release', 88888), ('stop', 88888), ('journal', None)])
+
+    def test_native_zero_reference_message_is_exact_and_tables_or_mixed_output_refuse(self):
+        module.require_no_references('No pf_enabled references\n')
+        for value in ('', 'References:', 'TOKENS:', 'No pf starter references held',
+                      'No pf_enabled references\nTOKENS:',
+                      'PID Process Name TOKEN TIMESTAMP\n1 service 123 0 days 00:00:01',
+                      'No pf_enabled references\n1 service 123 0 days 00:00:01',
+                      'No PF_enabled references', 'PRIVATE_SENTINEL'):
+            with self.subTest(value=value), self.assertRaises(module.Refused):
+                module.require_no_references(value)
 
     def test_strict_label_and_enable_token_parsers(self):
         self.assertEqual(module.labels('owned 1 2 3 4 5 6 7\n', ['owned']), {'owned': 2})

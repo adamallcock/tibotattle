@@ -92,6 +92,12 @@ def reference_token(text):
     return matches[0]
 
 
+def require_no_references(text):
+    # Native macOS pfctl DIOCGETSTARTERS zero-reference output. A table,
+    # mixed output or an unknown format is never evidence of zero owners.
+    require(text.strip() == 'No pf_enabled references', 'preexisting_references')
+
+
 def labels(text, expected):
     result = {}
     for line in text.splitlines():
@@ -328,8 +334,7 @@ def supervise(root):
         require(not enabled(pf('-s', 'info')) and not pf('-s', 'states').strip(), 'preexisting_pf')
         # No reference tokens may predate this operation, including tokens left
         # behind by a separately disabled PF instance. Unknown headers refuse.
-        refs = pf('-s', 'References').strip()
-        require(not refs or refs in ('References:', 'TOKENS:'), 'preexisting_references')
+        require_no_references(pf('-s', 'References'))
         require(anchor.split('/')[-1] not in anchor_names('com.apple'), 'preexisting_anchor')
         journal['topology'] = topology(anchor)
         if config['scenario'] == 'network':
