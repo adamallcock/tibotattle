@@ -4,7 +4,8 @@ import { telemetryV11DomainManifestDigestInput, type TelemetryV11DomainManifest 
 import { initializeStorageSource, readIngestionChanges } from "../src/analytics-delivery";
 import { sha256Hex } from "../src/crypto";
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from "../src/telemetry-v11-domain";
-import { advanceV11DailyProjection, readV11ProjectedOwnerDays, retireV11DailyProjectionPage } from "../src/v11-daily-projection";
+import { advanceV11DailyProjection, readV11ProjectedOwnerDays, repriceV11ProjectedOwnerDayPage, retireV11DailyProjectionPage } from "../src/v11-daily-projection";
+import { createV11DailyProjectionValues } from "../src/v11-daily-projection-values";
 import { createV11DeviceFixture, makeV11Day, stageV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 
 const b = env as Env & { STORAGE_ANALYTICS_DB: D1Database; TEST_MIGRATIONS: D1Migration[];
@@ -49,6 +50,39 @@ beforeEach(async () => {
 });
 
 describe("real activated source to isolated daily projection", () => {
+  it("reprices an admitted json-v11 generation in two bounded pages without changing delivery state", async () => {
+    const { event } = await active(203); await drain();
+    const expected = (await read(event.ownerDigest)).values[0]!;
+    const snapshot = async () => ({
+      target: (await target().batch([
+        target().prepare("SELECT * FROM analytics_source_cursors"),
+        target().prepare("SELECT * FROM analytics_v11_owner_heads"),
+        target().prepare("SELECT * FROM analytics_applied_events ORDER BY sequence"),
+        target().prepare("SELECT * FROM analytics_v11_projection_work ORDER BY event_digest"),
+        target().prepare("SELECT * FROM analytics_v11_day_values ORDER BY day"),
+      ])).map(result => result.results),
+      sourceHeads: (await source().prepare("SELECT * FROM telemetry_v11_domain_heads").all()).results,
+      sourceEvents: await readIngestionChanges(source(), sourceId, 0),
+    });
+    const before = await snapshot();
+    expect(before.target[3]![0]).toMatchObject({ source_layout: "json-v11", phase: "ready" });
+    const options = { source: source(), target: target(), sourceId, sourceNamespace: "synthetic-json-source",
+      ownerDigest: event.ownerDigest, day: today() };
+    const first = await repriceV11ProjectedOwnerDayPage({ ...options,
+      values: createV11DailyProjectionValues(today()), cursor: null });
+    expect(first).not.toBeNull();
+    expect(first!.complete).toBe(false);
+    expect(first!.values.counts).toEqual({ usage: 200, quota: 0, session: 0 });
+    expect(JSON.parse(first!.cursor).records).toBe(200);
+    const second = await repriceV11ProjectedOwnerDayPage({ ...options, values: first!.values, cursor: first!.cursor });
+    expect(second).not.toBeNull();
+    expect(second!.complete).toBe(true);
+    expect(second!.values.counts).toEqual({ usage: 203, quota: 0, session: 0 });
+    expect(second!.values).toEqual(expected);
+    expect(JSON.parse(second!.cursor).records).toBe(203);
+    expect(await snapshot()).toEqual(before);
+  });
+
   it("accepts the real domain while analytics is unavailable, then builds bounded pages before acknowledgement", async () => {
     const { event } = await active(203);
     expect(event.kind).toBe("owner-active");

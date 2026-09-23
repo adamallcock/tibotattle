@@ -67,6 +67,15 @@ const target=()=>bindings.STORAGE_ANALYTICS_DB;
 const step=(db=target())=>advanceV1DailyProjection({source:source(),target:db,sourceId,sourceNamespace:namespace});
 const owner=async()=> (await changes())[0]!.ownerDigest;
 const read=async(options:{limit?:number;afterIndex?:number;fingerprint?:string}={})=>readV1ProjectedChunkPage({source:source(),target:target(),sourceId,sourceNamespace:namespace,ownerDigest:await owner(),day:day(),...options});
+// Seed retained bytes from a previous pricer without disabling the immutable
+// same-revision update trigger. This helper touches synthetic test state only.
+async function seedRetainedValue(slot:string,value:unknown){
+ const row=await target().prepare('SELECT * FROM analytics_v1_chunk_values WHERE slot_digest=?').bind(slot).first<Record<string,unknown>>();
+ if(!row)throw new Error('synthetic projection missing');
+ row.values_json=JSON.stringify(value);const columns=Object.keys(row);
+ await target().batch([target().prepare('DELETE FROM analytics_v1_chunk_values WHERE slot_digest=?').bind(slot),
+  target().prepare(`INSERT INTO analytics_v1_chunk_values(${columns.join(',')}) VALUES(${columns.map(()=>'?').join(',')})`).bind(...columns.map(key=>row[key]))]);
+}
 function targetBatch(batch:D1Database['batch']):D1Database{return new Proxy(target(),{get(db,key){if(key==='batch')return batch;
  const v=Reflect.get(db,key);return typeof v==='function'?v.bind(db):v;}});}
 function observe(database:D1Database){let calls=0,batches=0;const originals=new WeakMap<D1PreparedStatement,D1PreparedStatement>();
@@ -134,6 +143,57 @@ describe('separate typed v1 analytical projection',()=>{
   expect(new Set(values.cells.map(c=>c.modelId))).toEqual(new Set(Array.from({length:200},(_,i)=>`synthetic-model-${i}`)));
   expect(values.tokens.nonOverlappingTotal.knownSum).toBe('215000');
   expect(await step()).toMatchObject({state:'idle'});
+ });
+ it('reprices stale immutable summaries in bounded pages without replaying ingestion or changing caches',async()=>{
+  const a=await seed('usage',200),b=await seed('quota',1,a.fixture),c=await seed('session',1,a.fixture);
+  for(const item of [a,b,c]){await insertTypedTelemetryV1Chunk(source(),item.insert,namespace);await step();}
+  const expected=(await read())!;
+  const rows=(await target().prepare('SELECT slot_digest,values_json FROM analytics_v1_chunk_values').all<{slot_digest:string;values_json:string}>()).results;
+  for(const row of rows){const value=JSON.parse(row.values_json);value.registrySha256='303374d522e7ef695beefe1fbf6f3d2b5c84b8b9c6130921a70bc5e8ec1d56e0';
+   value.pricing.knownNanousd='0';for(const cell of value.cells)cell.pricing.knownNanousd='0';
+   await seedRetainedValue(row.slot_digest,value);}
+  const snapshot=async()=>JSON.stringify(await target().batch([
+   target().prepare('SELECT * FROM analytics_v1_chunk_values ORDER BY slot_digest'),
+   target().prepare('SELECT * FROM analytics_source_cursors'),target().prepare('SELECT * FROM analytics_applied_events ORDER BY sequence'),
+   target().prepare('SELECT * FROM analytics_v1_projection_receipts ORDER BY event_digest')]).then(items=>items.map(item=>item.results)));
+  const before=await snapshot(),sourceBefore=await changes(),values=[];
+  let afterIndex=0;
+  for(let index=0;index<3;index++){
+   const page=(await read({afterIndex,...(afterIndex?{fingerprint:expected.fingerprint}:{})}))!;
+   expect(page.values).toHaveLength(1);expect(page.totalChunks).toBe(3);expect(page.fingerprint).toBe(expected.fingerprint);
+   values.push(...page.values);expect(page.nextIndex).toBe(index<2?index+1:null);afterIndex=page.nextIndex??0;
+  }
+  expect(values).toEqual(expected.values);expect((await read())!.values).toEqual(values.slice(0,1));
+  expect(await snapshot()).toBe(before);expect(await changes()).toEqual(sourceBefore);expect(await step()).toMatchObject({state:'idle'});
+ });
+ it('rejects malformed stale pricing summaries instead of silently rebuilding them',async()=>{
+  const a=await seed();await insertTypedTelemetryV1Chunk(source(),a.insert,namespace);await step();
+  const original=JSON.parse((await target().prepare('SELECT values_json FROM analytics_v1_chunk_values').first<string>('values_json'))!);
+  const slot=(await target().prepare('SELECT slot_digest FROM analytics_v1_chunk_values').first<string>('slot_digest'))!;
+  for(const corrupt of [
+   {...original,registrySha256:'not-a-registry'},
+   {...original,registrySha256:'0'.repeat(64),extra:true},
+   {...original,registrySha256:'0'.repeat(64),counts:{...original.counts,usage:2}},
+   {...original,registrySha256:'0'.repeat(64),pricingMethodVersion:'unrecognized-pricing'},
+   {...original,registrySha256:'0'.repeat(64),day:'2026-01-01'},
+  ]){
+   await seedRetainedValue(slot,corrupt);
+   await expect(read()).rejects.toThrow();
+  }
+ });
+ it('refuses a repriced page when its selected header changes during source reads',async()=>{
+  const a=await seed();await insertTypedTelemetryV1Chunk(source(),a.insert,namespace);await step();
+  const retained=(await target().prepare('SELECT slot_digest,values_json FROM analytics_v1_chunk_values').first<{slot_digest:string;values_json:string}>())!;
+  await seedRetainedValue(retained.slot_digest,{...JSON.parse(retained.values_json),registrySha256:'0'.repeat(64)});
+  let batches=0,mutated=false;
+  const proxy=withBatch(async statements=>{
+   batches++;
+   if(batches===2){mutated=true;await source().prepare('UPDATE telemetry_v1_chunks SET parser_version=? WHERE id=?')
+    .bind('synthetic-changed-during-reprice',a.insert.chunkRowId).run();}
+   return source().batch(statements);
+  });
+  expect(await readV1ProjectedChunkPage({source:proxy,target:target(),sourceId,sourceNamespace:namespace,ownerDigest:await owner(),day:day()})).toBeNull();
+  expect(mutated).toBe(true);expect(await target().prepare('SELECT sequence FROM analytics_source_cursors').first('sequence')).toBe(1);
  });
  it('replaces a corrected slot atomically, with failed projection leaving its cursor and prior value intact',async()=>{
   const a=await seed();await insertTypedTelemetryV1Chunk(source(),a.insert,namespace);await step();

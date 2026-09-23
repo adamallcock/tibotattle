@@ -126,6 +126,35 @@ const api=(configured=publicEnv())=>handleRequest(new Request(`https://typed.exa
 function targetBatch(batch:D1Database['batch']):D1Database{return new Proxy(target(),{get(db,key){if(key==='batch')return batch;
   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;}});}
 
+// Model immutable summaries written by an older registry without disabling
+// any database trigger or altering the authoritative admitted source.
+function priorRegistryTarget(corrupt=false):D1Database {
+  return new Proxy(target(),{get(db,key){
+    if(key==='prepare')return(sql:string)=>{
+      const statement=db.prepare(sql);
+      if(!sql.includes('selected_days AS MATERIALIZED'))return statement;
+      return new Proxy(statement,{get(s,k){
+        if(k==='bind')return(...args:unknown[])=>{
+          const bound=s.bind(...args);return new Proxy(bound,{get(b,member){
+            if(member==='all')return async()=>{const result=await b.all<{authority_epoch:number;values_json:string|null}>();
+              return {...result,results:result.results.map(row=>{
+                if(row.values_json===null)return row;
+                const value=JSON.parse(row.values_json);value.registrySha256='1'.repeat(64);
+                value.pricing.knownNanousd='0';value.omitted.pricing.knownNanousd='0';
+                for(const cell of value.cells)cell.pricing.knownNanousd='0';
+                if(corrupt)value.counts.usage++;
+                return {...row,values_json:JSON.stringify(value)};
+              })};};
+            const value=Reflect.get(b,member);return typeof value==='function'?value.bind(b):value;
+          }});
+        };
+        const value=Reflect.get(s,k);return typeof value==='function'?value.bind(s):value;
+      }});
+    };
+    const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+  }});
+}
+
 async function seedV1(stream: 'usage' | 'quota' | 'session' = 'usage', count = 1,
   fixture = undefined as Awaited<ReturnType<typeof createV11DeviceFixture>> | undefined, revision=1, seq=0,
   observedDay=today()) {
@@ -153,6 +182,45 @@ async function seedV1(stream: 'usage' | 'quota' | 'session' = 'usage', count = 1
 }
 
 describe('independent public daily publication',()=>{
+  it('reprices an old-registry v11 day in bounded pages without replaying admission',async()=>{
+    const owner=await fixture(250);await ready();
+    const priorCursor=await target().prepare('SELECT * FROM analytics_source_cursors').all();
+    const priorHead=await target().prepare('SELECT * FROM analytics_v11_owner_heads').all();
+    const expected=await read(owner.event.ownerDigest);
+    const old=priorRegistryTarget();
+    expect(await readV11ProjectedOwnerDays({...options(),target:old,ownerDigest:owner.event.ownerDigest,
+      fromDay:today(),throughDay:today()})).toEqual({state:'pricing-stale',values:[]});
+    expect((await advanceStorageCommunityDaily({...options(),target:old})).state).toBe('progress');
+    const checkpoint=JSON.parse((await target().prepare('SELECT values_json FROM analytics_community_daily_owners').first<string>('values_json'))!);
+    expect(checkpoint.counts.usage).toBe(200);
+    expect((await publicRead()).rows).toEqual([]);
+    expect((await advanceStorageCommunityDaily({...options(),target:old})).state).toBe('published');
+    const rebuilt=JSON.parse((await target().prepare('SELECT values_json FROM analytics_community_daily_owners').first<string>('values_json'))!);
+    expect(rebuilt).toEqual(expected.values[0]);
+    expect(BigInt(rebuilt.pricing.knownNanousd)).toBeGreaterThan(0n);
+    expect((await advanceStorageCommunityDaily({...options(),target:old})).state).toBe('unchanged');
+    expect((await target().prepare('SELECT * FROM analytics_source_cursors').all()).results).toEqual(priorCursor.results);
+    expect((await target().prepare('SELECT * FROM analytics_v11_owner_heads').all()).results).toEqual(priorHead.results);
+    expect(JSON.parse((await publicRead()).rows[0]!.payload_json).totals.usageEvents).toBe(250);
+  });
+  it('does not treat malformed old-registry arithmetic as a repricing request',async()=>{
+    await fixture();await ready();
+    await expect(advanceStorageCommunityDaily({...options(),target:priorRegistryTarget(true)}))
+      .rejects.toThrow('V11_DAILY_PROJECTION_VALUES_INVALID');
+    expect((await publicRead()).rows).toEqual([]);
+  });
+  it('restarts a v11 repricing cursor after its retained identity no longer matches',async()=>{
+    await fixture(250);await ready();const old=priorRegistryTarget();
+    await advanceStorageCommunityDaily({...options(),target:old});
+    const raw=(await target().prepare('SELECT fingerprint FROM analytics_community_daily_owners').first<string>('fingerprint'))!;
+    const cursor=JSON.parse(raw);cursor.identity='0'.repeat(64);
+    await target().prepare('UPDATE analytics_community_daily_owners SET fingerprint=?').bind(JSON.stringify(cursor)).run();
+    expect((await advanceStorageCommunityDaily({...options(),target:old})).state).toBe('progress');
+    const count=JSON.parse((await target().prepare('SELECT values_json FROM analytics_community_daily_owners').first<string>('values_json'))!).counts.usage;
+    expect(count).toBe(200);
+    expect((await advanceStorageCommunityDaily({...options(),target:old})).state).toBe('published');
+    expect(JSON.parse((await publicRead()).rows[0]!.payload_json).totals.usageEvents).toBe(250);
+  });
   it('runs the real accountless projection and public route, keeping graph unavailable and IDs private',async()=>{
     const value=await fixture(203);await drainCommunityPublicSourceBootstrap(source());
     expect(await publish()).toMatchObject({state:'deferred',reason:'projection_pending'});
