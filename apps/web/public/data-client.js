@@ -6304,7 +6304,15 @@ export function selectAllowancePlanPopulation(data, requestedPlanType = null) {
   const selectedPlanType = populations.some((row) => row.planType === requestedPlanType)
     ? requestedPlanType : currentPlanType;
   let views = allowancePlanViews.get(root);
-  if (views?.has(selectedPlanType)) return views.get(selectedPlanType);
+  if (views?.has(selectedPlanType)) {
+    const view = views.get(selectedPlanType);
+    // The header selection is attached to the root after normalization and
+    // changes without replacing it. Keep this cached plan view in sync so
+    // Trends and other plan-scoped renderers see the selected date range.
+    view.reportingWindow = root.reportingWindow;
+    view.reportingAccountingPeriod = root.reportingAccountingPeriod;
+    return view;
+  }
   const population = populations.find((row) => row.planType === selectedPlanType)
     ?? normalizeWeeklyPopulation({ planType: selectedPlanType });
   const isCurrentPlan = selectedPlanType === currentPlanType;
