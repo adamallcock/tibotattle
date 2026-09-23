@@ -72,7 +72,7 @@
     }
   },
   "registry": {
-    "sha256": "390338c41cf48845e745cf5544e3f60fd6a45ea3ad97f3f4dd507df29dfd53e0",
+    "sha256": "6ba530b92c4dcb1795df7fc5b00acbcee6c79df19f9136f53622e33a20bc0af6",
     "version": "telemetry-v0.1-registry-2026-09-22.1"
   },
   "schemas": {

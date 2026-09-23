@@ -626,10 +626,12 @@ const MODEL_NAME_FRAGMENTS = Object.freeze({
   auto: "Auto",
   claude: "Claude",
   codex: "Codex",
+  fable: "Fable",
   gpt: "GPT",
   haiku: "Haiku",
   luna: "Luna",
   mini: "Mini",
+  mythos: "Mythos",
   nano: "Nano",
   opus: "Opus",
   preview: "Preview",
@@ -642,6 +644,12 @@ const MODEL_NAME_FRAGMENTS = Object.freeze({
   wm: "WM",
 });
 const MODEL_VERSION_FRAGMENT = /^\d+(?:\.\d+)*$/;
+const REVIEWED_MODEL_DISPLAY_NAMES = Object.freeze({
+  "claude-fable-5-1": "Claude Fable 5.1",
+  "claude-mythos-5-1": "Claude Mythos 5.1",
+  "claude-opus-5-5": "Claude Opus 5.5",
+  "gpt-6.1-astra": "GPT-6.1 Astra (forecast)",
+});
 
 /**
  * `gpt-5.6-sol` is a wire identifier, not a name a person reads. This turns it
@@ -654,6 +662,8 @@ export function formatModelName(value) {
   if (typeof value !== "string") return "";
   const identifier = value.trim();
   if (identifier === "") return "";
+  const reviewedLabel = REVIEWED_MODEL_DISPLAY_NAMES[identifier.toLowerCase()];
+  if (reviewedLabel) return reviewedLabel;
   const fragments = identifier.toLowerCase().split("-");
   const parts = [];
   for (const [index, fragment] of fragments.entries()) {

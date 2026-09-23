@@ -1,5 +1,5 @@
 // Reviewed provider price evidence shared by local and edge accounting adapters.
-export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-09-22T18:54:35Z";
+export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-09-23T14:52:10Z";
 // First official-page review. This is the review boundary, not a lower bound
 // on the reviewed model rates: recognized OpenAI/Codex events before this date
 // remain priceable unless a card has an explicit vendor-effective boundary.
@@ -80,6 +80,18 @@ const SOURCE_DEFINITIONS = Object.freeze({
       "https://developers.openai.com/api/docs/models/gpt-6-sol",
       "https://developers.openai.com/api/docs/models/gpt-6-luna",
       "https://openai.com/index/introducing-gpt-6-sol-and-luna/",
+    ]),
+  }),
+  anthropicLatest: Object.freeze({
+    provider: "anthropic",
+    name: "anthropic-latest-model-pricing",
+    url: OFFICIAL_PRICE_SOURCE_URLS.anthropic,
+    observedAt: "2026-09-23T14:52:10Z",
+    evidenceVersion: "anthropic-latest-model-pricing-reviewed-2026-09-23",
+    evidenceUrls: Object.freeze([
+      OFFICIAL_PRICE_SOURCE_URLS.anthropic,
+      "https://platform.claude.com/docs/en/models/overview",
+      "https://platform.claude.com/docs/en/release-notes/overview",
     ]),
   }),
 });
@@ -331,6 +343,15 @@ const ANTHROPIC_ROWS = Object.freeze([
   ["claude-sonnet-5", "batch", "1.5", "1.875", "3", "0.15", "7.5", "standard-2026-09-01"],
 ]);
 
+// Latest reviewed Claude IDs and official API rates. Mythos 5.1 is invite-only;
+// cataloging its identity and price does not imply general entitlement.
+const ANTHROPIC_LATEST_ROWS = Object.freeze([
+  ["claude-fable-5-1", "standard", "10", "12.5", "20", "0.25", "50", "from-2026-09-01"],
+  ["claude-mythos-5-1", "standard", "10", "12.5", "20", "0.25", "50", "from-2026-09-01"],
+  ["claude-opus-5", "standard", "5", "6.25", "10", "0.5", "25", "from-2026-07-24"],
+  ["claude-opus-5-5", "standard", "4", "5", "8", "0.2", "20", "from-2026-09-22"],
+]);
+
 const OPENAI_TOOL_ROWS = Object.freeze([
   ["web_search_units", "10", "search", "1000"],
   ["file_search_units", "2.5", "call", "1000"],
@@ -345,6 +366,7 @@ export const NORMALIZED_PRICE_EVIDENCE_ROWS = deepFreeze({
   anthropic: [ANTHROPIC_ROWS, ANTHROPIC_TOOL_ROWS],
   openaiAstra: [OPENAI_ASTRA_ROWS],
   openaiSolLuna: [OPENAI_SOL_LUNA_ROWS],
+  anthropicLatest: [ANTHROPIC_LATEST_ROWS],
 });
 
 // These hashes are generated from the normalized reviewed rows during an
@@ -355,6 +377,7 @@ const EVIDENCE_HASHES = Object.freeze({
   openai: "ec99367fb7d91dc68f1501e325384eda7a5cf885c763deebd28e1eff594dad57",
   anthropic: "7653380aa58230fef8a39a17f141fe04bd763ca39390a69671825e6f6109d76e",
   openaiAstra: "546af74276392ac5cd4f3faab783fff6d2b62235c7a5288012e8a24fd309301b",
+  anthropicLatest: "3762998c98a2d9c058b9e698f3d3b8b77b652d0c838ada78cc2ba550de4740c7",
 });
 
 function component(usageComponent, amount, conditions) {
@@ -551,6 +574,15 @@ function anthropicEffective(period) {
       suffix: "from-2026-09-01",
     };
   }
+  const releaseDate = /^from-(\d{4}-\d{2}-\d{2})$/u.exec(period ?? "")?.[1];
+  if (releaseDate && Number.isFinite(Date.parse(`${releaseDate}T00:00:00.000Z`))) {
+    return {
+      effective: { from: releaseDate },
+      vendorEffectiveFrom: releaseDate,
+      vendorEffectiveTo: null,
+      suffix: `from-${releaseDate}`,
+    };
+  }
   return {
     // No vendor-effective date was published for this row, so the effective
     // range is open in both directions. The review date is provenance and must
@@ -562,11 +594,14 @@ function anthropicEffective(period) {
   };
 }
 
-function anthropicCard([model, tier, input, cacheWrite5m, cacheWrite1h, cacheRead, output, period = null]) {
+function anthropicCard(
+  [model, tier, input, cacheWrite5m, cacheWrite1h, cacheRead, output, period = null],
+  sourceKey = "anthropic",
+) {
   const validity = anthropicEffective(period);
   return {
     schema_version: "0.1",
-    id: cardId("anthropic", model, tier, validity.suffix),
+    id: cardId(sourceKey, model, tier, validity.suffix),
     provider: "anthropic",
     model,
     service_tier: tier,
@@ -580,12 +615,12 @@ function anthropicCard([model, tier, input, cacheWrite5m, cacheWrite1h, cacheRea
       component("output_text_tokens", output),
       providerUnitComponent("web_search_units", "10", "search", "1000"),
     ],
-    source: source("anthropic"),
+    source: source(sourceKey),
     metadata: {
       pricing_basis: "official_api_price_not_subscription_allowance",
       api_service_tier: tier,
       subscription_speed_tier: null,
-      provenance: provenance("anthropic", validity),
+      provenance: provenance(sourceKey, validity),
       ...(tier === "fast" ? {
         coverage_note: "Anthropic first-party API fast mode; unrelated to subscription or Codex Fast modes.",
       } : {}),
@@ -620,7 +655,10 @@ function providerToolCard(provider, model, rows) {
 }
 
 export const OPENAI_OFFICIAL_PRICE_CARDS = deepFreeze([...OPENAI_ROWS, ...OPENAI_ASTRA_ROWS, ...OPENAI_SOL_LUNA_ROWS].map(openAiCard));
-export const ANTHROPIC_OFFICIAL_PRICE_CARDS = deepFreeze(ANTHROPIC_ROWS.map(anthropicCard));
+export const ANTHROPIC_OFFICIAL_PRICE_CARDS = deepFreeze([
+  ...ANTHROPIC_ROWS.map((row) => anthropicCard(row)),
+  ...ANTHROPIC_LATEST_ROWS.map((row) => anthropicCard(row, "anthropicLatest")),
+]);
 export const PROVIDER_TOOL_PRICE_CARDS = deepFreeze([
   providerToolCard("openai", "openai-provider-tools", OPENAI_TOOL_ROWS),
   providerToolCard("anthropic", "anthropic-provider-tools", ANTHROPIC_TOOL_ROWS),
@@ -632,7 +670,7 @@ export const APP_OFFICIAL_PRICE_CARDS = deepFreeze([
 ]);
 
 export const APP_PRICE_REGISTRY_SHA256 =
-  "4f8e5b81e14a35d463fb25fb9d27089f7cf1aa3c3a2c74be2599544a90051d8b";
+  "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9";
 
 export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
   version: APP_PRICE_REGISTRY_VERSION,
