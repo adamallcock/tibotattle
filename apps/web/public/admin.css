@@ -267,6 +267,7 @@
 
 #distribution-total-rows { border-top: 2px solid var(--line); font-weight: 700; }
 #distribution-total-rows tr:last-child { background: var(--paper, #f5f1e8); }
+#github-release-total-rows { border-top: 2px solid var(--line); font-weight: 700; background: var(--paper, #f5f1e8); }
 .admin-evidence-card summary, .admin-diagnostic-details summary { cursor: pointer; color: var(--green); font-weight: 700; }
 .admin-evidence-card details[open] summary, .admin-diagnostic-details[open] summary { margin-bottom: 16px; }
 .admin-evidence-card { align-self: start; }

@@ -171,6 +171,7 @@ function fakeDocument() {
     "distribution-version-empty",
     "distribution-source-status",
     "github-release-rows",
+    "github-release-total-rows",
     "github-release-empty",
     "service-state",
     "ingress-status",
@@ -1145,6 +1146,9 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     assert.deepEqual(tableTexts(documentRef, "github-release-rows"), [
       ["v0.1.12", "Stable", "88", "0", "7", "6", "101", formatReportingTime("2026-08-15T18:00:00.000Z")],
       ["v0.1.11", "Stable", "22", "—", "—", "—", "22", formatReportingTime("2026-08-01T18:00:00.000Z")],
+    ]);
+    assert.deepEqual(tableTexts(documentRef, "github-release-total-rows"), [
+      ["Grand total · all 2 releases", "All versions", "110", "0", "7", "6", "123", "All time"],
     ]);
 
     assert.deepEqual(
