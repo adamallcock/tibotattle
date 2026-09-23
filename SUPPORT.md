@@ -145,8 +145,8 @@ rule out an early failure.
 
 ## Supported surface
 
-The published 0.1.24 release provides macOS 14+ installers for Apple silicon and
-Intel, a Windows x64 installer and a Linux x86_64 AppImage. Macs use the same
+The published 0.1.24 release supports macOS 14 or later on Apple silicon and Intel.
+It also provides a Windows x64 installer and a Linux x86_64 AppImage. Macs use the same
 [Homebrew command](README.md#install-macos-apple-silicon-or-intel), or their
 matching direct DMG. See [platform qualification](docs/reference/platform-support.md)
 for exact artifact assurances and the owner-accepted unperformed macOS
