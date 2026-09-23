@@ -188,13 +188,15 @@
         <p class="admin-copy" id="distribution-estimate-note"></p>
         <div class="admin-card-grid admin-distribution-grid" id="distribution-counts" aria-live="polite"></div>
         <div class="admin-two-column admin-distribution-details">
-          <div class="admin-card admin-table-wrap" tabindex="0" role="region" aria-label="Observed app versions table">
+          <div class="admin-card admin-table-wrap admin-version-table">
             <h3>Observed active versions by app and OS</h3>
-            <table>
-              <thead><tr><th>App</th><th>OS</th><th>Version</th><th>Address reach · 7d</th><th>Source addresses · 7d</th><th>Checks · 7d</th></tr></thead>
-              <tbody id="distribution-version-rows"></tbody>
-              <tfoot id="distribution-total-rows"></tfoot>
-            </table>
+            <div class="admin-table-scroll" tabindex="0" role="region" aria-label="Observed app versions table">
+              <table>
+                <thead><tr><th>App</th><th>OS / architecture</th><th>Version</th><th>Address reach · 7d</th><th>Source addresses · 7d</th><th>Checks · 7d</th></tr></thead>
+                <tbody id="distribution-version-rows"></tbody>
+                <tfoot id="distribution-total-rows"></tfoot>
+              </table>
+            </div>
             <p class="admin-copy" id="distribution-version-coverage"></p>
             <p class="admin-empty" id="distribution-version-empty">
               No app-version evidence is available in this window.
@@ -209,17 +211,19 @@
             </details>
           </div>
         </div>
-        <div class="admin-card admin-table-wrap admin-github-release-table" tabindex="0" role="region" aria-label="GitHub DMG downloads table">
+        <div class="admin-card admin-table-wrap admin-github-release-table">
           <div class="section-heading admin-table-heading">
             <div>
-              <h3>GitHub DMG downloads by release</h3>
-              <p class="admin-copy">Cumulative macOS DMG asset downloads across published releases. Windows and Linux installers, ZIPs and update metadata are excluded. These are downloads, not installs or unique people.</p>
+              <h3>GitHub installer downloads by release</h3>
+              <p class="admin-copy">Cumulative downloads of the four named installer assets in each published release. A dash means that installer was not published. ZIPs, update metadata and unclassified assets are excluded. Downloads are not installs or unique people.</p>
             </div>
           </div>
-          <table>
-            <thead><tr><th>Release</th><th>Channel</th><th>DMG downloads · all time</th><th>Share</th><th>Published</th></tr></thead>
-            <tbody id="github-release-rows"></tbody>
-          </table>
+          <div class="admin-table-scroll" tabindex="0" role="region" aria-label="GitHub installer downloads table">
+            <table>
+              <thead><tr><th>Release</th><th>Channel</th><th>macOS Apple silicon</th><th>macOS Intel</th><th>Windows</th><th>Linux</th><th>Installer total</th><th>Published</th></tr></thead>
+              <tbody id="github-release-rows"></tbody>
+            </table>
+          </div>
           <p class="admin-empty" id="github-release-empty">
             No complete GitHub release snapshot is available yet.
           </p>

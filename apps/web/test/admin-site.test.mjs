@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 
 import { formatReportingTime } from "../public/ui-format.js";
+import { ADMIN_MODEL_CONFIG } from "../public/telemetry-shared.generated.js";
 import { createAdminAllowancePreviewPayload } from "./fixtures/admin-allowance.js";
 
 const fixture = async (name) => JSON.parse(await readFile(
@@ -1122,9 +1123,9 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     ]]);
 
     assert.deepEqual(tableTexts(documentRef, "distribution-version-rows"), [
-      ["Native", "macOS", "0.1.12", "66%", "19", "64"],
-      ["Electron", "macOS", "0.1.23", "24%", "7", "12"],
-      ["Native", "macOS", "0.1.11", "17%", "5", "9"],
+      ["Native", "macOS · Apple silicon", "0.1.12", "66%", "19", "64"],
+      ["Electron", "macOS · Intel", "0.1.23", "24%", "7", "12"],
+      ["Native", "macOS · Apple silicon", "0.1.11", "17%", "5", "9"],
       ["Electron", "Windows", "0.1.23", "14%", "4", "8"],
       ["Electron", "Linux", "Unknown", "7%", "2", "3"],
     ]);
@@ -1137,13 +1138,13 @@ test("admin tables preserve row order, text rendering, and empty states", async 
         ["Electron update checks", "11", "Last 24h above · 9 addresses · 23 checks/7d"],
         ["Sparkle artifact fetches", "3", "Last 24h above · 3 addresses · 3 fetches/7d"],
         ["Latest GitHub tag match", "18", "v0.1.12 · last 24h above · 19 addresses/7d"],
-        ["GitHub DMG downloads", "110", "2 releases · 2 DMG assets · all time"],
+        ["GitHub DMG downloads", "110", "2 releases · 3 DMG assets · all time"],
         ["GitHub DMG downloads since prior snapshot", "6", `${formatReportingTime("2026-08-16T12:00:00.000Z")} → ${formatReportingTime("2026-08-17T12:00:00.000Z")}`],
       ],
     );
     assert.deepEqual(tableTexts(documentRef, "github-release-rows"), [
-      ["v0.1.12", "Stable", "88", "80%", formatReportingTime("2026-08-15T18:00:00.000Z")],
-      ["v0.1.11", "Stable", "22", "20%", formatReportingTime("2026-08-01T18:00:00.000Z")],
+      ["v0.1.12", "Stable", "88", "0", "7", "6", "101", formatReportingTime("2026-08-15T18:00:00.000Z")],
+      ["v0.1.11", "Stable", "22", "—", "—", "—", "22", formatReportingTime("2026-08-01T18:00:00.000Z")],
     ]);
 
     assert.deepEqual(
@@ -1682,7 +1683,7 @@ test("rendered model cards, icons and native legend buttons share order and pres
     assert.equal(unavailable.disabled, true);
     assert.equal(unavailable.getAttribute("aria-pressed"), "false");
     assert.equal(unavailable.title, "No qualifying fits in this range");
-    assert.equal(container.querySelectorAll(".admin-allowance-plan-summary").length, 41);
+    assert.equal(container.querySelectorAll(".admin-allowance-plan-summary").length, ADMIN_MODEL_CONFIG.length);
     for (const id of ["gpt-6-sol", "gpt-6-luna"]) {
       const newModel = container.querySelector(`button[data-allowance-model-focus="${id}"]`);
       assert.equal(newModel.disabled, true, "new models do not invent qualifying fits");
@@ -2015,6 +2016,10 @@ test("database failures reach attention and older Workers show unavailable witho
 test("platform and overall totals use the API union and clear on access refusal", async () => {
   const overview = await fixture("admin-overview-valid.json");
   overview.distribution.cloudflare.observedTotals = {
+    macosArchitectures: [
+      { architecture: "arm64", requestsLast7Days: 60, sourceAddressesLast7Days: 20 },
+      { architecture: "x64", requestsLast7Days: 25, sourceAddressesLast7Days: 10 },
+    ],
     platforms: [
       { operatingSystem: "macos", requestsLast7Days: 85, sourceAddressesLast7Days: 25 },
       { operatingSystem: "windows", requestsLast7Days: 8, sourceAddressesLast7Days: 4 },
@@ -2026,7 +2031,9 @@ test("platform and overall totals use the API union and clear on access refusal"
     ? { ok: false, status: 403, json: async () => ({ error: { code: "ADMIN_DENIED" } }) }
     : healthyAdminRead(path, overview), async documentRef => {
     assert.deepEqual(tableTexts(documentRef, "distribution-total-rows"), [
-      ["Platform total", "macOS", "All versions", "86%", "25", "85"],
+      ["Architecture total", "macOS · Apple silicon", "All versions", "69%", "20", "60"],
+      ["Architecture total", "macOS · Intel", "All versions", "34%", "10", "25"],
+      ["macOS subtotal", "macOS", "All versions", "86%", "25", "85"],
       ["Platform total", "Windows", "All versions", "14%", "4", "8"],
       ["Platform total", "Linux", "All versions", "7%", "2", "3"],
       ["Overall total", "All OS", "All versions", "100%", "29", "96"],

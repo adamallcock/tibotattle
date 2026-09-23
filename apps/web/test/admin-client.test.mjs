@@ -741,30 +741,35 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
         observedVersions: [{
           client: "native",
           operatingSystem: "macos",
+          architecture: "arm64",
           version: "0.1.12",
           requestsLast7Days: 64,
           sourceAddressesLast7Days: 19,
         }, {
           client: "electron",
           operatingSystem: "macos",
+          architecture: "x64",
           version: "0.1.23",
           requestsLast7Days: 12,
           sourceAddressesLast7Days: 7,
         }, {
           client: "native",
           operatingSystem: "macos",
+          architecture: "arm64",
           version: "0.1.11",
           requestsLast7Days: 9,
           sourceAddressesLast7Days: 5,
         }, {
           client: "electron",
           operatingSystem: "windows",
+          architecture: "x64",
           version: "0.1.23",
           requestsLast7Days: 8,
           sourceAddressesLast7Days: 4,
         }, {
           client: "electron",
           operatingSystem: "linux",
+          architecture: "x64",
           version: null,
           requestsLast7Days: 3,
           sourceAddressesLast7Days: 2,
@@ -785,8 +790,8 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
         summary: {
           dmgDownloads: 110,
           allAssetDownloads: 135,
-          dmgAssetCount: 2,
-          assetCount: 4,
+          dmgAssetCount: 3,
+          assetCount: 6,
           releaseCount: 2,
         },
         releases: [{
@@ -796,8 +801,9 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
           prerelease: false,
           dmgDownloads: 88,
           allAssetDownloads: 101,
-          dmgAssetCount: 1,
-          assetCount: 2,
+          dmgAssetCount: 2,
+          assetCount: 4,
+          installerDownloads: { macArm64: 88, macX64: 0, windowsX64: 7, linuxX64: 6 },
         }, {
           id: 11,
           tag: "v0.1.11",
@@ -807,6 +813,7 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
           allAssetDownloads: 34,
           dmgAssetCount: 1,
           assetCount: 2,
+          installerDownloads: { macArm64: 22, macX64: null, windowsX64: null, linuxX64: null },
         }],
         releasesBounded: false,
         history: {
@@ -1210,6 +1217,34 @@ test("distribution version rows require a known app and operating system", async
     () => projectAdminOverview(unknownOperatingSystem),
     /ADMIN_OVERVIEW_INVALID/u,
   );
+
+  const unknownArchitecture = await fixture("admin-overview-valid.json");
+  unknownArchitecture.distribution.cloudflare.observedVersions[0]
+    .architecture = "unknown";
+  assert.throws(
+    () => projectAdminOverview(unknownArchitecture),
+    /ADMIN_OVERVIEW_INVALID/u,
+  );
+
+  const unsupportedArchitecture = await fixture("admin-overview-valid.json");
+  unsupportedArchitecture.distribution.cloudflare.observedVersions[3]
+    .architecture = "arm64";
+  assert.throws(
+    () => projectAdminOverview(unsupportedArchitecture),
+    /ADMIN_OVERVIEW_INVALID/u,
+  );
+});
+
+test("installer breakdown refuses unclassified fields and impossible totals", async () => {
+  const extraField = await fixture("admin-overview-valid.json");
+  extraField.distribution.github.releases[0].installerDownloads
+    .rawAssetName = "private-path";
+  assert.throws(() => projectAdminOverview(extraField), /ADMIN_OVERVIEW_INVALID/u);
+
+  const overcount = await fixture("admin-overview-valid.json");
+  overcount.distribution.github.releases[0].installerDownloads
+    .macX64 = 1;
+  assert.throws(() => projectAdminOverview(overcount), /ADMIN_OVERVIEW_INVALID/u);
 });
 
 test("distribution projection rejects stale values behind unavailable sources", async () => {
@@ -1326,6 +1361,13 @@ test("version totals validate OS coverage, counts and unavailable states without
   const projected = projectAdminOverview(payload).distribution.cloudflare.observedTotals;
   assert.equal(projected.overall.privateField, undefined);
   assert.ok(Object.isFrozen(projected.platforms));
+  assert.equal(projected.macosArchitectures, null);
+  totals.macosArchitectures = [
+    { architecture: "arm64", requestsLast7Days: 60, sourceAddressesLast7Days: 20 },
+    { architecture: "x64", requestsLast7Days: 25, sourceAddressesLast7Days: 10 },
+  ];
+  assert.equal(projectAdminOverview(payload).distribution.cloudflare.observedTotals
+    .macosArchitectures[1].architecture, "x64");
   for (const mutate of [
     p => p.platforms[0].operatingSystem = "darwin",
     p => p.platforms[1].operatingSystem = "macos",
@@ -1334,6 +1376,9 @@ test("version totals validate OS coverage, counts and unavailable states without
     p => p.platforms[0].requestsLast7Days = -1,
     p => p.overall.requestsLast7Days = 97,
     p => p.overall.sourceAddressesLast7Days = 28,
+    p => p.macosArchitectures[1].architecture = "arm64",
+    p => p.macosArchitectures[0].requestsLast7Days = 61,
+    p => p.macosArchitectures[0].sourceAddressesLast7Days = 26,
   ]) {
     const invalid = structuredClone(payload);
     mutate(invalid.distribution.cloudflare.observedTotals);

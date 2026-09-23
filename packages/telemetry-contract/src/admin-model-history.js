@@ -8,6 +8,8 @@ import {
 // and API-price-equivalent dollars. No participant or source identifiers enter.
 export const ADMIN_MODEL_HISTORY_CATALOG_VERSION = REVIEWED_MODEL_CATALOG_VERSION;
 export const LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION = "admin-model-roster-v0.2";
+export const PREVIOUS_ADMIN_MODEL_HISTORY_CATALOG_VERSION = "reviewed-model-catalog-2026-09-22.1";
+export const OLDER_ADMIN_MODEL_HISTORY_CATALOG_VERSION = "reviewed-model-catalog-2026-09-03.1";
 export const ADMIN_MODEL_CONFIG = Object.freeze(REVIEWED_MODEL_CATALOG
   .filter((model) => model.provider === "openai_codex")
   .map((model) => Object.freeze({
@@ -23,6 +25,28 @@ const adminHistoryLegacyIds = Object.freeze([
 const adminHistoryCurrentIds = Object.freeze(ADMIN_MODEL_CONFIG
   .filter((model) => model.allowanceTrack === "primary")
   .map((model) => model.modelId));
+// Frozen roster for reviewed-model-catalog-2026-09-22.1.
+const adminHistoryPreviousIds = Object.freeze([
+  "codex-auto-review", "gpt-4-turbo-2024-04-09", "gpt-4.1", "gpt-4.1-mini",
+  "gpt-4.1-nano", "gpt-4o", "gpt-4o-2024-05-13", "gpt-4o-mini", "gpt-5",
+  "gpt-5-codex", "gpt-5-mini", "gpt-5-nano", "gpt-5-pro", "gpt-5.1",
+  "gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5.2", "gpt-5.2-codex",
+  "gpt-5.2-pro", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
+  "gpt-5.4-pro", "gpt-5.5", "gpt-5.5-codex", "gpt-5.5-pro", "gpt-5.6-luna",
+  "gpt-5.6-sol", "gpt-5.6-sol-wm", "gpt-5.6-terra", "gpt-6-astra", "o1",
+  "o1-pro", "o3", "o3-mini", "o3-pro", "o4-mini", "gpt-6-sol", "gpt-6-luna",
+]);
+// Frozen roster for reviewed-model-catalog-2026-09-03.1.
+const adminHistoryOlderIds = Object.freeze([
+  "codex-auto-review", "gpt-4-turbo-2024-04-09", "gpt-4.1", "gpt-4.1-mini",
+  "gpt-4.1-nano", "gpt-4o", "gpt-4o-2024-05-13", "gpt-4o-mini", "gpt-5",
+  "gpt-5-codex", "gpt-5-mini", "gpt-5-nano", "gpt-5-pro", "gpt-5.1",
+  "gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5.2", "gpt-5.2-codex",
+  "gpt-5.2-pro", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
+  "gpt-5.4-pro", "gpt-5.5", "gpt-5.5-codex", "gpt-5.5-pro", "gpt-5.6-luna",
+  "gpt-5.6-sol", "gpt-5.6-sol-wm", "gpt-5.6-terra", "gpt-6-astra", "o1",
+  "o1-pro", "o3", "o3-mini", "o3-pro", "o4-mini",
+]);
 const adminHistoryCountKeys = Object.freeze([
   "fittedParticipantCount", "unstableParticipantCount", "staleParticipantCount",
   "refusedParticipantCount", "v1ParticipantCount", "unsupportedSourceParticipantCount",
@@ -86,8 +110,12 @@ export function projectAdminModelHistoryDay(value) {
   }
   const ids = catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION
     ? adminHistoryCurrentIds
-    : catalogVersion === LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION
-      ? adminHistoryLegacyIds : null;
+    : catalogVersion === PREVIOUS_ADMIN_MODEL_HISTORY_CATALOG_VERSION
+      ? adminHistoryPreviousIds
+      : catalogVersion === OLDER_ADMIN_MODEL_HISTORY_CATALOG_VERSION
+        ? adminHistoryOlderIds
+        : catalogVersion === LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION
+          ? adminHistoryLegacyIds : null;
   if (!ids || !Array.isArray(values) || values.length > ids.length) return null;
   const allowed = new Set(ids);
   const seen = new Set();
@@ -113,7 +141,11 @@ export function expandAdminModelHistoryDay(value) {
   const day = projectAdminModelHistoryDay(value);
   if (day === null) return null;
   const covered = new Set(day.catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION
-    ? adminHistoryCurrentIds : adminHistoryLegacyIds);
+    ? adminHistoryCurrentIds
+    : day.catalogVersion === PREVIOUS_ADMIN_MODEL_HISTORY_CATALOG_VERSION
+      ? adminHistoryPreviousIds
+      : day.catalogVersion === OLDER_ADMIN_MODEL_HISTORY_CATALOG_VERSION
+        ? adminHistoryOlderIds : adminHistoryLegacyIds);
   const identified = new Map(day.values.map(([id, capacityUsd, participantCount]) => [
     id, Object.freeze({ capacityUsd, participantCount }),
   ]));

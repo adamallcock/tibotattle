@@ -220,35 +220,56 @@ describe("owner distribution analytics", () => {
       observedVersions: [{
         client: "native",
         operatingSystem: "macos",
+        architecture: "arm64",
         version: "0.1.12",
         requestsLast7Days: 18,
         sourceAddressesLast7Days: 3,
       }, {
         client: "electron",
         operatingSystem: "macos",
+        architecture: "arm64",
         version: "0.1.23",
-        requestsLast7Days: 5,
-        sourceAddressesLast7Days: 2,
+        requestsLast7Days: 4,
+        sourceAddressesLast7Days: 1,
       }, {
         client: "electron",
         operatingSystem: "windows",
+        architecture: "x64",
         version: "0.1.22",
         requestsLast7Days: 2,
         sourceAddressesLast7Days: 1,
       }, {
         client: "electron",
         operatingSystem: "linux",
+        architecture: "x64",
         version: null,
+        requestsLast7Days: 1,
+        sourceAddressesLast7Days: 1,
+      }, {
+        client: "electron",
+        operatingSystem: "macos",
+        architecture: "x64",
+        version: "0.1.23",
         requestsLast7Days: 1,
         sourceAddressesLast7Days: 1,
       }, {
         client: "native",
         operatingSystem: "macos",
+        architecture: "arm64",
         version: "0.1.11",
         requestsLast7Days: 1,
         sourceAddressesLast7Days: 1,
       }],
       observedTotals: {
+        macosArchitectures: [{
+          architecture: "arm64",
+          requestsLast7Days: 23,
+          sourceAddressesLast7Days: 5,
+        }, {
+          architecture: "x64",
+          requestsLast7Days: 1,
+          sourceAddressesLast7Days: 1,
+        }],
         platforms: [{
           operatingSystem: "macos",
           requestsLast7Days: 24,
@@ -408,6 +429,15 @@ describe("owner distribution analytics", () => {
       status: "available",
       observedVersionsBounded: true,
       observedTotals: {
+        macosArchitectures: [{
+          architecture: "arm64",
+          requestsLast7Days: 26,
+          sourceAddressesLast7Days: 21,
+        }, {
+          architecture: "x64",
+          requestsLast7Days: 3,
+          sourceAddressesLast7Days: 1,
+        }],
         platforms: [{
           operatingSystem: "macos",
           requestsLast7Days: 29,
@@ -427,7 +457,7 @@ describe("owner distribution analytics", () => {
         },
       },
     });
-    expect(overview.cloudflare.observedVersions).toHaveLength(12);
+    expect(overview.cloudflare.observedVersions).toHaveLength(24);
   });
 
   it("does no external work when distribution evidence is disabled", async () => {

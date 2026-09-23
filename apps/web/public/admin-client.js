@@ -65,6 +65,7 @@ const DISTRIBUTION_SOURCE_STATUSES = new Set([
 ]);
 const DISTRIBUTION_CLIENTS = new Set(["native", "electron"]);
 const DISTRIBUTION_OPERATING_SYSTEMS = new Set(["macos", "windows", "linux"]);
+const DISTRIBUTION_ARCHITECTURES = new Set(["arm64", "x64"]);
 const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{2,79}$/u;
 const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
@@ -1073,17 +1074,21 @@ function projectDistribution(value) {
     "ADMIN_OVERVIEW_INVALID",
   ).map((value) => {
     const version = record(value, "ADMIN_OVERVIEW_INVALID");
+    const client = enumValue(version.client, DISTRIBUTION_CLIENTS, "ADMIN_OVERVIEW_INVALID");
+    const operatingSystem = enumValue(
+      version.operatingSystem, DISTRIBUTION_OPERATING_SYSTEMS, "ADMIN_OVERVIEW_INVALID",
+    );
+    const architecture = enumValue(
+      version.architecture, DISTRIBUTION_ARCHITECTURES, "ADMIN_OVERVIEW_INVALID",
+    );
+    if ((client === "native" && operatingSystem !== "macos")
+        || (operatingSystem !== "macos" && architecture !== "x64")) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
     return Object.freeze({
-      client: enumValue(
-        version.client,
-        DISTRIBUTION_CLIENTS,
-        "ADMIN_OVERVIEW_INVALID",
-      ),
-      operatingSystem: enumValue(
-        version.operatingSystem,
-        DISTRIBUTION_OPERATING_SYSTEMS,
-        "ADMIN_OVERVIEW_INVALID",
-      ),
+      client,
+      operatingSystem,
+      architecture,
       version: nullableString(version.version, "ADMIN_OVERVIEW_INVALID"),
       requestsLast7Days: count(
         version.requestsLast7Days,
@@ -1119,7 +1124,34 @@ function projectDistribution(value) {
         || platforms.reduce((sum, row) => sum + row.requestsLast7Days, 0) !== overall.requestsLast7Days) {
       invalid("ADMIN_OVERVIEW_INVALID");
     }
-    observedTotals = Object.freeze({ platforms: Object.freeze(platforms), overall });
+    // Older cached overviews only contain OS totals. Keep the macOS subtotal
+    // available without inventing an architecture breakdown for those reads.
+    const macosArchitectures = totals.macosArchitectures === undefined
+      ? null
+      : boundedArray(totals.macosArchitectures, 2, "ADMIN_OVERVIEW_INVALID").map(value => {
+        const row = record(value, "ADMIN_OVERVIEW_INVALID");
+        return Object.freeze({
+          architecture: enumValue(row.architecture, DISTRIBUTION_ARCHITECTURES, "ADMIN_OVERVIEW_INVALID"),
+          ...projectCounts(row),
+        });
+      });
+    if (macosArchitectures !== null) {
+      const macos = platforms.find(row => row.operatingSystem === "macos");
+      if (macosArchitectures.length !== 2
+          || new Set(macosArchitectures.map(row => row.architecture)).size !== 2
+          || macosArchitectures.some(row => row.sourceAddressesLast7Days > macos.sourceAddressesLast7Days)
+          || macosArchitectures.reduce((sum, row) => sum + row.requestsLast7Days, 0)
+            !== macos.requestsLast7Days
+          || macosArchitectures.reduce((sum, row) => sum + row.sourceAddressesLast7Days, 0)
+            < macos.sourceAddressesLast7Days) {
+        invalid("ADMIN_OVERVIEW_INVALID");
+      }
+    }
+    observedTotals = Object.freeze({
+      platforms: Object.freeze(platforms),
+      macosArchitectures: macosArchitectures === null ? null : Object.freeze(macosArchitectures),
+      overall,
+    });
   }
   const bySegment = boundedArray(
     cloudflare.bySegment ?? [],
@@ -1228,6 +1260,16 @@ function projectDistribution(value) {
   );
   const projectGithubRelease = (value) => {
     const candidate = record(value, "ADMIN_OVERVIEW_INVALID");
+    const installerSource = record(candidate.installerDownloads, "ADMIN_OVERVIEW_INVALID");
+    const installerKeys = ["macArm64", "macX64", "windowsX64", "linuxX64"];
+    if (Object.keys(installerSource).length !== installerKeys.length
+        || installerKeys.some(key => !Object.hasOwn(installerSource, key))) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
+    const installerDownloads = Object.freeze(Object.fromEntries(
+      installerKeys.map(key => [key, installerSource[key] === null
+        ? null : count(installerSource[key], "ADMIN_OVERVIEW_INVALID")]),
+    ));
     const release = Object.freeze({
       id: positiveInteger(candidate.id, "ADMIN_OVERVIEW_INVALID"),
       tag: string(candidate.tag, "ADMIN_OVERVIEW_INVALID"),
@@ -1240,9 +1282,14 @@ function projectDistribution(value) {
       ),
       dmgAssetCount: count(candidate.dmgAssetCount, "ADMIN_OVERVIEW_INVALID"),
       assetCount: count(candidate.assetCount, "ADMIN_OVERVIEW_INVALID"),
+      installerDownloads,
     });
     if (release.dmgDownloads > release.allAssetDownloads
-        || release.dmgAssetCount > release.assetCount) {
+        || release.dmgAssetCount > release.assetCount
+        || (installerDownloads.macArm64 ?? 0) + (installerDownloads.macX64 ?? 0)
+          > release.dmgDownloads
+        || Object.values(installerDownloads).reduce((sum, value) => sum + (value ?? 0), 0)
+          > release.allAssetDownloads) {
       invalid("ADMIN_OVERVIEW_INVALID");
     }
     return release;

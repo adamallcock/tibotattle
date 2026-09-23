@@ -13,7 +13,7 @@
     "transportReady": false
   },
   "fieldContract": {
-    "sha256": "68785acb0e9a1838878f75365006be6c62f97121ef71aa556692c1992b117d50",
+    "sha256": "45dada68d20ef6fef62272aa9c37efceed009a410755f9f5ed8bb6090787d69e",
     "version": "telemetry-field-dictionary-v0.1"
   },
   "implementation": {
@@ -72,7 +72,7 @@
     }
   },
   "registry": {
-    "sha256": "390338c41cf48845e745cf5544e3f60fd6a45ea3ad97f3f4dd507df29dfd53e0",
+    "sha256": "6ba530b92c4dcb1795df7fc5b00acbcee6c79df19f9136f53622e33a20bc0af6",
     "version": "telemetry-v0.1-registry-2026-09-22.1"
   },
   "schemas": {
@@ -105,10 +105,10 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json",
         "name": "usage-event.schema.json",
-        "sha256": "f59dbc51f8f9031f902aa1d079d628d172e612027c024a822c6a573643c50fc7"
+        "sha256": "43693e9cbce396e451d918e129c54de91e0059250e937c5a533b898b7b21aed0"
       }
     ],
-    "setSha256": "23ce68cb63fde8be883899b3c94dcbfd731a35d2c949153065f30fc67258b07d"
+    "setSha256": "ac09e00a083a0140cb03456564cb0812e04042d0cd730742cdda95f06220b76c"
   },
   "tupleVersion": "usage-export-compatibility-v0.1"
 }
