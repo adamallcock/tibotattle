@@ -15,8 +15,9 @@ const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 const GRAPHQL_ROW_LIMIT = 10_000;
 const MAX_RESPONSE_BYTES = 2 * 1_024 * 1_024;
 const FETCH_TIMEOUT_MILLISECONDS = 8_000;
-const MAX_RENDERED_VERSIONS = 12;
+const MAX_RENDERED_VERSIONS = 24;
 const OBSERVED_OPERATING_SYSTEMS = ["macos", "windows", "linux"] as const;
+const OBSERVED_MACOS_ARCHITECTURES = ["arm64", "x64"] as const;
 
 const ANALYTICS_QUERY = `
   query TiboTattleDistribution($zoneTag: string, $start: Time, $end: Time) {
@@ -168,6 +169,7 @@ export interface DistributionRequestCounts {
 export interface DistributionVersionActivity {
   readonly client: "native" | "electron";
   readonly operatingSystem: "macos" | "windows" | "linux";
+  readonly architecture: "arm64" | "x64";
   readonly version: string | null;
   readonly requestsLast7Days: number;
   readonly sourceAddressesLast7Days: number;
@@ -179,8 +181,15 @@ export interface DistributionObservedPlatformTotals {
   readonly sourceAddressesLast7Days: number;
 }
 
+export interface DistributionObservedArchitectureTotals {
+  readonly architecture: DistributionVersionActivity["architecture"];
+  readonly requestsLast7Days: number;
+  readonly sourceAddressesLast7Days: number;
+}
+
 export interface DistributionObservedTotals {
   readonly platforms: readonly DistributionObservedPlatformTotals[];
+  readonly macosArchitectures: readonly DistributionObservedArchitectureTotals[];
   readonly overall: {
     readonly requestsLast7Days: number;
     readonly sourceAddressesLast7Days: number;
@@ -265,6 +274,7 @@ interface ObservedTotalsAccumulator {
 interface AnalyticsCheckGroup {
   readonly client: DistributionVersionActivity["client"];
   readonly operatingSystem: DistributionVersionActivity["operatingSystem"];
+  readonly architecture: DistributionVersionActivity["architecture"];
   readonly rows: readonly AnalyticsRow[];
 }
 
@@ -431,21 +441,37 @@ function parseAnalyticsResponse(
     {
       client: "native",
       operatingSystem: "macos",
-      rows: [...nativeArm64, ...nativeX64],
+      architecture: "arm64",
+      rows: nativeArm64,
+    },
+    {
+      client: "native",
+      operatingSystem: "macos",
+      architecture: "x64",
+      rows: nativeX64,
     },
     {
       client: "electron",
       operatingSystem: "macos",
-      rows: [...electronMacArm64, ...electronMacX64],
+      architecture: "arm64",
+      rows: electronMacArm64,
+    },
+    {
+      client: "electron",
+      operatingSystem: "macos",
+      architecture: "x64",
+      rows: electronMacX64,
     },
     {
       client: "electron",
       operatingSystem: "windows",
+      architecture: "x64",
       rows: electronWindowsX64,
     },
     {
       client: "electron",
       operatingSystem: "linux",
+      architecture: "x64",
       rows: electronLinuxX64,
     },
   ];
@@ -610,6 +636,18 @@ function aggregateAnalytics(
       },
     ]),
   );
+  const observedTotalsByMacosArchitecture = new Map<
+    DistributionVersionActivity["architecture"],
+    ObservedTotalsAccumulator
+  >(
+    OBSERVED_MACOS_ARCHITECTURES.map((architecture) => [
+      architecture,
+      {
+        requestsLast7Days: 0,
+        sourceAddressesLast7Days: new Set<string>(),
+      },
+    ]),
+  );
   const observedTotalsOverall: ObservedTotalsAccumulator = {
     requestsLast7Days: 0,
     sourceAddressesLast7Days: new Set<string>(),
@@ -660,6 +698,19 @@ function aggregateAnalytics(
           row.count,
         );
         observedPlatformTotals.sourceAddressesLast7Days.add(row.clientIP);
+        if (group.operatingSystem === "macos") {
+          const architectureTotals = observedTotalsByMacosArchitecture.get(
+            group.architecture,
+          );
+          if (architectureTotals === undefined) {
+            throw new Error("unknown macOS architecture");
+          }
+          architectureTotals.requestsLast7Days = safeAdd(
+            architectureTotals.requestsLast7Days,
+            row.count,
+          );
+          architectureTotals.sourceAddressesLast7Days.add(row.clientIP);
+        }
         observedTotalsOverall.requestsLast7Days = safeAdd(
           observedTotalsOverall.requestsLast7Days,
           row.count,
@@ -684,7 +735,7 @@ function aggregateAnalytics(
         }
 
         const version = appVersion(row.userAgent);
-        const versionKey = `${group.client}\u0000${group.operatingSystem}\u0000${version ?? ""}`;
+        const versionKey = `${group.client}\u0000${group.operatingSystem}\u0000${group.architecture}\u0000${version ?? ""}`;
         const accumulator = versions.get(versionKey) ?? {
           requestsLast7Days: 0,
           sourceAddressesLast24Hours: new Set<string>(),
@@ -731,14 +782,16 @@ function aggregateAnalytics(
 
   const observedVersions = [...versions.entries()]
     .map(([key, value]) => {
-      const [client, operatingSystem, version] = key.split("\u0000") as [
+      const [client, operatingSystem, architecture, version] = key.split("\u0000") as [
         DistributionVersionActivity["client"],
         DistributionVersionActivity["operatingSystem"],
+        DistributionVersionActivity["architecture"],
         string,
       ];
       return {
         client,
         operatingSystem,
+        architecture,
         version: version.length === 0 ? null : version,
         requestsLast7Days: value.requestsLast7Days,
         sourceAddressesLast7Days: value.sourceAddressesLast7Days.size,
@@ -749,6 +802,7 @@ function aggregateAnalytics(
       || right.requestsLast7Days - left.requestsLast7Days
       || left.client.localeCompare(right.client)
       || left.operatingSystem.localeCompare(right.operatingSystem)
+      || left.architecture.localeCompare(right.architecture)
       || (left.version ?? "").localeCompare(right.version ?? ""))
     .slice(0, MAX_RENDERED_VERSIONS);
   const observedTotals: DistributionObservedTotals = {
@@ -759,6 +813,17 @@ function aggregateAnalytics(
       }
       return {
         operatingSystem,
+        requestsLast7Days: totals.requestsLast7Days,
+        sourceAddressesLast7Days: totals.sourceAddressesLast7Days.size,
+      };
+    }),
+    macosArchitectures: OBSERVED_MACOS_ARCHITECTURES.map((architecture) => {
+      const totals = observedTotalsByMacosArchitecture.get(architecture);
+      if (totals === undefined) {
+        throw new Error("unknown macOS architecture");
+      }
+      return {
+        architecture,
         requestsLast7Days: totals.requestsLast7Days,
         sourceAddressesLast7Days: totals.sourceAddressesLast7Days.size,
       };

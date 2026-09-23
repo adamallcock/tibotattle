@@ -92,6 +92,8 @@
 .admin-plan-name { font-weight: 640; letter-spacing: .01em; }
 .admin-plan-stat { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
 .admin-table-wrap { overflow-x: auto; }
+.admin-version-table, .admin-github-release-table { min-width: 0; overflow-x: visible; }
+.admin-table-scroll { max-width: 100%; overflow-x: auto; }
 .admin-table-wrap table { width: 100%; border-collapse: collapse; font-size: .74rem; }
 .admin-table-wrap th { color: var(--muted); font-size: .65rem; letter-spacing: .04em; text-align: left; text-transform: uppercase; }
 .admin-table-wrap th, .admin-table-wrap td { padding: 11px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }

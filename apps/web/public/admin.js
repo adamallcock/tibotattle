@@ -1799,7 +1799,7 @@ function renderDistribution(distribution) {
     ...versions.map((version) => tableRow([
       version.client === "native" ? "Native" : "Electron",
       version.operatingSystem === "macos"
-        ? "macOS"
+        ? version.architecture === "arm64" ? "macOS · Apple silicon" : "macOS · Intel"
         : version.operatingSystem === "windows" ? "Windows" : "Linux",
       version.version ?? "Unknown",
       percentage(version.sourceAddressesLast7Days, activeAddresses),
@@ -1811,8 +1811,17 @@ function renderDistribution(distribution) {
     const totals = cloudflare.observedTotals;
     const platformName = os => ({ macos: "macOS", windows: "Windows", linux: "Linux" })[os];
     $("#distribution-total-rows").replaceChildren(...(totals ? [
+      ...(totals.macosArchitectures ?? []).map(row => tableRow([
+        "Architecture total",
+        row.architecture === "arm64" ? "macOS · Apple silicon" : "macOS · Intel",
+        "All versions",
+        percentage(row.sourceAddressesLast7Days, activeAddresses),
+        distributionCount(row.sourceAddressesLast7Days, cloudflare),
+        distributionCount(row.requestsLast7Days, cloudflare),
+      ])),
       ...totals.platforms.map(row => tableRow([
-        "Platform total", platformName(row.operatingSystem), "All versions",
+        row.operatingSystem === "macos" ? "macOS subtotal" : "Platform total",
+        platformName(row.operatingSystem), "All versions",
         percentage(row.sourceAddressesLast7Days, activeAddresses),
         distributionCount(row.sourceAddressesLast7Days, cloudflare),
         distributionCount(row.requestsLast7Days, cloudflare),
@@ -1828,17 +1837,27 @@ function renderDistribution(distribution) {
     ? "No recognized app-version traffic was observed in this window."
     : "App-version evidence is unavailable; this does not mean there are no active apps.";
   if (isAdminPage) $("#distribution-version-coverage").textContent =
-    `${cloudflare.observedVersionsBounded ? "Version list capped; additional rows are omitted. " : ""}Address reach uses all observed active addresses as its denominator. One address can occur in several app, OS or version rows, so percentages need not sum to 100%. Each total counts an address once across all included apps and versions; platform totals can overlap. ${cloudflare.observedTotals ? "" : "Totals are unavailable from this snapshot. "}Unknown means no usable TiboTattle app version was present in the updater request; it cannot be recovered from the OS or update feed.`;
+    `${cloudflare.observedVersionsBounded ? "Version list capped; additional rows are omitted. " : ""}macOS architecture comes from the update-feed path. The macOS subtotal counts each address once across Apple silicon and Intel; architecture rows can overlap. Address reach uses all observed active addresses as its denominator. One address can occur in several app, OS, architecture or version rows, so percentages need not sum to 100%. Each total counts an address once across all included apps and versions; platform totals can overlap. ${cloudflare.observedTotals ? "" : "Totals are unavailable from this snapshot. "}Unknown means no usable TiboTattle app version was present in the updater request; it cannot be recovered from the OS or update feed.`;
 
   const releases = github.releases;
   $("#github-release-rows").replaceChildren(
-    ...releases.map((githubRelease) => tableRow([
-      githubRelease.tag,
-      githubRelease.prerelease ? "Prerelease" : "Stable",
-      count(githubRelease.dmgDownloads),
-      percentage(githubRelease.dmgDownloads, summary?.dmgDownloads ?? 0),
-      formatTime(githubRelease.publishedAt),
-    ])),
+    ...releases.map((githubRelease) => {
+      const installers = githubRelease.installerDownloads;
+      const values = [
+        installers.macArm64, installers.macX64,
+        installers.windowsX64, installers.linuxX64,
+      ];
+      const total = values.some(value => value !== null)
+        ? count(values.reduce((sum, value) => sum + (value ?? 0), 0))
+        : "—";
+      return tableRow([
+        githubRelease.tag,
+        githubRelease.prerelease ? "Prerelease" : "Stable",
+        ...values.map(value => value === null ? "—" : count(value)),
+        total,
+        formatTime(githubRelease.publishedAt),
+      ]);
+    }),
   );
   $("#github-release-empty").hidden = releases.length !== 0;
 
