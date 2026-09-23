@@ -424,6 +424,186 @@ def supervise(root):
     return receipt
 
 
+
+# Inspection is a separate read-only path. Dynamic anchor names are never emitted
+# and only direct, strictly parsed children may select another read-only query.
+INSPECT_LIMIT = 65536
+INSPECT_ANCHORS = 16
+INSPECT_FIXED = {
+    'status': [PF, '-s', 'info'], 'states': [PF, '-s', 'states'],
+    'references': [PF, '-s', 'References'],
+    'interfaces': [PF, '-v', '-s', 'Interfaces'],
+    'route4': ['/sbin/route', '-n', 'get', '-inet', '192.0.2.1'],
+    'route6': ['/sbin/route', '-n', 'get', '-inet6', '2001:db8::1'],
+}
+
+
+def inspect_argv(kind, parent):
+    if kind in INSPECT_FIXED:
+        require(parent == '', 'arguments')
+        return list(INSPECT_FIXED[kind])
+    require(kind in ('anchors', 'rules', 'nat') and isinstance(parent, str)
+            and len(parent) <= 512 and (not parent or all(
+                re.fullmatch('[a-zA-Z0-9_.-]{1,128}', part) and part not in ('.', '..')
+                for part in parent.split('/'))) and parent.count('/') <= 2, 'arguments')
+    return [PF, *(['-a', parent] if parent else []), '-s', 'Anchors' if kind == 'anchors' else kind]
+
+
+def inspect_read(kind, parent, deadline):
+    argv = inspect_argv(kind, parent)  # No arbitrary command/flags entrypoint.
+    if time.monotonic() >= deadline:
+        return 'budget', b'', b''
+    buffers = [bytearray(), bytearray()]
+    result = 'success'
+    try:
+        with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LC_ALL': 'C'}) as child:
+            try:
+                pipes = {child.stdout.fileno(): 0, child.stderr.fileno(): 1}
+                stop = min(deadline, time.monotonic() + 5)
+                while pipes:
+                    remaining = stop - time.monotonic()
+                    if remaining <= 0:
+                        result = 'timeout'; break
+                    ready, _, _ = select.select(list(pipes), [], [], remaining)
+                    for fd in ready:
+                        part = os.read(fd, 4096)
+                        if not part:
+                            del pipes[fd]; continue
+                        target = buffers[pipes[fd]]
+                        available = INSPECT_LIMIT - len(target)
+                        target.extend(part[:available])
+                        if len(part) > available:
+                            result = 'oversize'; break
+                    if result != 'success':
+                        break
+                if result != 'success':
+                    child.kill()
+                try:
+                    code = child.wait(timeout=max(0.01, stop - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    child.kill(); child.wait(timeout=1); result = 'timeout'; code = None
+                if result == 'success' and code != 0:
+                    result = 'nonzero'
+            except BaseException:
+                # A capture error must not make Popen's context wait indefinitely.
+                child.kill(); child.wait(timeout=1)
+                raise
+    except (OSError, subprocess.SubprocessError):
+        result = 'unavailable'
+    return result, bytes(buffers[0]), bytes(buffers[1])
+
+
+def inspect_anchor_list(text, parent):
+    names = [line.strip() for line in text.splitlines() if line.strip()]
+    if not names:
+        return 'empty', []
+    if len(names) > 64 or len(set(names)) != len(names):
+        return 'unknown', None
+    paths, formats = [], set()
+    for name in names:
+        if parent and name.startswith(parent + '/'):
+            component = name[len(parent) + 1:]; formats.add('qualified')
+        else:
+            component = name; formats.add('components')
+        if not re.fullmatch('[a-zA-Z0-9_.-]{1,128}', component) or component in ('.', '..'):
+            return 'unknown', None
+        paths.append(parent + '/' + component if parent else component)
+    if len(set(paths)) != len(paths):
+        return 'unknown', None
+    return next(iter(formats)) if len(formats) == 1 else 'mixed', paths
+
+
+def inspect_classify(kind, parent, text):
+    stripped = text.strip()
+    if kind == 'anchors':
+        category, paths = inspect_anchor_list(text, parent)
+        return category, paths
+    if kind == 'status':
+        matches = re.findall(r'^Status: (Enabled|Disabled)\b', text, re.M)
+        return (matches[0].lower() if len(matches) == 1 else 'unknown'), None
+    if kind == 'references':
+        category = ('empty-success' if stripped == 'No pf starter references held' else
+                    'error-literal' if stripped == 'No pf_enabled references' else
+                    'token-table' if stripped.startswith('TOKENS:') else 'unknown')
+        return category, None
+    if kind == 'interfaces':
+        return ('empty' if not stripped else 'skip-present' if re.search(r'\bskip\b', text, re.I)
+                else 'no-skip-marker'), None
+    if kind in ('route4', 'route6'):
+        return ('route-present' if re.search(r'^\s*interface:\s+\S+', text, re.M) else 'unknown'), None
+    if not stripped:
+        return 'empty', None
+    if kind == 'rules' and not parent and stripped == 'anchor "com.apple/*" all':
+        return 'apple-wildcard', None
+    if kind == 'nat' and not parent and set(stripped.splitlines()) <= {
+            'nat-anchor "com.apple/*" all', 'rdr-anchor "com.apple/*" all'}:
+        return 'apple-translation', None
+    return 'nonempty', None
+
+
+def inspection(operation, revision, source_hash, read=inspect_read):
+    require(UUID.fullmatch(operation) and re.fullmatch('[a-f0-9]{40}', revision)
+            and re.fullmatch('[a-f0-9]{64}', source_hash), 'intake')
+    checks = []; complete = True; deadline = time.monotonic() + 90
+
+    def observe(kind, parent=''):
+        outcome, out, err = read(kind, parent, deadline)
+        category, paths = 'unobserved', None
+        if outcome == 'success':
+            try:
+                category, paths = inspect_classify(kind, parent, out.decode('ascii'))
+            except UnicodeDecodeError:
+                category = 'unknown'
+        checks.append({'kind': kind, 'scope': 'root' if not parent else 'apple' if parent == 'com.apple' else 'other',
+                       'pathSha256': hashlib.sha256(parent.encode()).hexdigest(),
+                       'depth': len(parent.split('/')) if parent else 0, 'outcome': outcome,
+                       'stdoutBytes': len(out), 'stdoutSha256': hashlib.sha256(out).hexdigest(),
+                       'stderrBytes': len(err), 'stderrSha256': hashlib.sha256(err).hexdigest(),
+                       'classification': category, 'lineCount': min(65536, len(out.splitlines())),
+                       'itemCount': len(paths) if paths is not None else None})
+        return paths
+
+    for kind in INSPECT_FIXED:
+        observe(kind)
+    queue = ['', 'com.apple']; seen = set(queue)
+    for parent in queue:
+        children = observe('anchors', parent)
+        observe('rules', parent); observe('nat', parent)
+        if children is None:
+            complete = False
+        else:
+            for child in children:
+                if child in seen:
+                    continue
+                if len(queue) >= INSPECT_ANCHORS or child.count('/') > 2:
+                    complete = False; continue
+                seen.add(child); queue.append(child)
+    # A second read distinguishes concurrent host changes from this no-write path.
+    observe('status'); observe('states'); observe('references')
+    return {'schemaVersion': 'macos-pf-inspection-v1', 'operationId': operation, 'runnerRevision': revision,
+            'supervisorSha256': source_hash, 'readOnly': True, 'anchorTreeComplete': complete,
+            'networkQualified': False, 'credentialContinuityQualified': False, 'checks': checks}
+
+
+def inspect_host(operation, revision):
+    require(os.getuid() == 0 and os.environ.get('SUDO_UID') == '501'
+            and os.environ.get('SUDO_USER') == 'runner' and sys.platform == 'darwin'
+            and platform.machine() == 'arm64' and pwd.getpwuid(501).pw_dir == '/Users/runner', 'disposable_host')
+    source = pathlib.Path(__file__).absolute()
+    require(source.resolve() == source and str(source).startswith('/Users/runner/work/'), 'source_location')
+    require(source.is_file() and source.stat().st_size <= 65536 and source.stat().st_uid == 501
+            and source.stat().st_nlink == 1 and source.stat().st_mode & 0o022 == 0, 'source_file')
+    for parent in source.parents:
+        require(not parent.is_symlink() and parent.stat().st_mode & 0o002 == 0, 'source_ancestor')
+    receipt = inspection(operation, revision, hashlib.sha256(source.read_bytes()).hexdigest())
+    # Native binary identity helps interpret output without retaining raw output.
+    binary = pathlib.Path(PF)
+    require(binary.is_file() and not binary.is_symlink() and binary.stat().st_size <= 8388608, 'source_file')
+    receipt['pfctlSha256'] = hashlib.sha256(binary.read_bytes()).hexdigest()
+    sys.stdout.write(json.dumps(receipt, separators=(',', ':')) + '\n')
+
+
 def install(operation, scenario, revision):
     require(os.getuid() == 0 and os.environ.get('SUDO_UID') == '501'
             and os.environ.get('SUDO_USER') == 'runner' and sys.platform == 'darwin'
@@ -482,6 +662,8 @@ if __name__ == '__main__':
     try:
         if len(sys.argv) == 3 and sys.argv[1] == '--probe':
             probe(sys.argv[2])
+        elif len(sys.argv) == 4 and sys.argv[1] == '--inspect':
+            inspect_host(*sys.argv[2:])
         elif len(sys.argv) == 5 and sys.argv[1] == '--install':
             install(*sys.argv[2:])
         elif len(sys.argv) == 3 and sys.argv[1] == '--collect':

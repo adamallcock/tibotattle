@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { parsePfCanaryArguments, runPfCanary, validatePfCanaryHost, validatePfCanaryReceipt,
-  PF_CANARY_CONFIRMATION } from '../scripts/qualify-macos-pf-canary.mjs';
+  PF_CANARY_CONFIRMATION, validatePfInspection } from '../scripts/qualify-macos-pf-canary.mjs';
 import { macOSPfQualificationPlan } from '../scripts/lib/macos-pf-qualification.mjs';
 
 const operationId = '4a5361b7-dc54-49cc-92c5-a3e7d42b9a6f';
@@ -82,4 +82,49 @@ test('manual workflow prefetches before start and retains source pins, read-only
   const coordinator = await readFile(new URL('../scripts/qualify-macos-pf-canary.mjs', import.meta.url), 'utf8');
   assert.ok(coordinator.includes("['rev-parse', 'HEAD']") && coordinator.includes("'--error-unmatch'"));
   assert.ok(!coordinator.includes('smoke-electron') && !coordinator.includes('/sbin/pfctl'));
+});
+
+
+test('read-only inspection arguments and user-host refusal cannot reach sudo or live PF', async () => {
+  assert.deepEqual(parsePfCanaryArguments(['--inspect', operationId, 'network']), { mode: 'inspect', operationId, scenario: 'network' });
+  let calls = 0;
+  await assert.rejects(runPfCanary({ mode: 'inspect', operationId, scenario: 'network' }, {
+    environment: { GITHUB_SHA: input.runnerRevision }, command() { calls++; throw new Error('must not run'); },
+  }));
+  assert.equal(calls, 0);
+});
+
+test('inspection closed receipt binds source, query set, bounded content-free observations and immutable copies', () => {
+  const python = `import importlib.util,json,sys
+s=importlib.util.spec_from_file_location('canary',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
+r=m.inspection(sys.argv[2],'a'*40,'b'*64,lambda *args:('success',b'',b''));r['pfctlSha256']='c'*64;print(json.dumps(r))`;
+  const value = JSON.parse(execFileSync('/usr/bin/python3', ['-B', '-c', python,
+    new URL('../scripts/lib/macos-pf-canary/supervisor.py', import.meta.url).pathname, operationId], { encoding: 'utf8', timeout: 5000 }));
+  const checked = validatePfInspection(value, input);
+  assert.ok(Object.isFrozen(checked) && Object.isFrozen(checked.checks) && Object.isFrozen(checked.checks[0]));
+  assert.notEqual(checked.checks, value.checks); assert.equal(checked.readOnly, true);
+  for (const patch of [{ runnerRevision: 'd'.repeat(40) }, { supervisorSha256: 'd'.repeat(64) },
+    { networkQualified: true }, { credentialContinuityQualified: true }, { readOnly: false },
+    { raw: 'PRIVATE_SENTINEL' }, { checks: [] }, { pfctlSha256: 'private' }]) {
+    assert.throws(() => validatePfInspection({ ...value, ...patch }, input));
+  }
+  for (const patch of [{ kind: 'enable' }, { raw: 'PRIVATE_SENTINEL' }, { stdoutBytes: 65537 },
+    { classification: 'PRIVATE_SENTINEL' }, { classification: 'disabled', outcome: 'nonzero' },
+    { scope: 'other' }, { pathSha256: 'd'.repeat(64) }, { itemCount: 1 }, { depth: 4 }]) {
+    const altered = structuredClone(value); Object.assign(altered.checks[0], patch);
+    assert.throws(() => validatePfInspection(altered, input));
+  }
+  const mismatched = structuredClone(value); mismatched.checks[7].pathSha256 = 'd'.repeat(64);
+  assert.throws(() => validatePfInspection(mismatched, input));
+  for (const key of Object.keys(value)) {
+    const altered = structuredClone(value); delete altered[key]; assert.throws(() => validatePfInspection(altered, input));
+  }
+});
+
+test('inspection workflow is a distinct read-only job with no launch, confirmation bypass into execution or raw artifact', async () => {
+  const workflow = await readFile(new URL('../.github/workflows/electron-macos-credentials.yml', import.meta.url), 'utf8');
+  const inspection = workflow.slice(workflow.indexOf('  inspection:'));
+  assert.ok(inspection.includes("if: inputs.mode == 'pf-canary-inspect'"));
+  assert.ok(inspection.includes('--inspect') && inspection.includes('pf-inspection-receipts/inspection.json'));
+  for (const forbidden of ['--start', '--collect', '--install', 'secrets.', 'always()', 'PF_CANARY_CONFIRMATION']) assert.ok(!inspection.includes(forbidden));
 });

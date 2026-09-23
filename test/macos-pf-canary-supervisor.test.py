@@ -274,5 +274,108 @@ class SupervisorTest(unittest.TestCase):
                 module.reference_token(value)
 
 
+class InspectionTest(unittest.TestCase):
+    def test_inspection_is_fixed_read_only_queries_with_strict_child_paths(self):
+        for kind in module.INSPECT_FIXED:
+            argv = module.inspect_argv(kind, '')
+            self.assertNotIn('-f', argv); self.assertNotIn('-E', argv)
+            self.assertIn(argv[0], ('/sbin/pfctl', '/sbin/route'))
+        for kind in ('anchors', 'rules', 'nat'):
+            self.assertEqual(module.inspect_argv(kind, 'com.apple/synthetic')[1:3], ['-a', 'com.apple/synthetic'])
+        for kind, parent in [('enable', ''), ('rules', '../other'), ('rules', '*'), ('rules', '/absolute'),
+                             ('rules', 'a/b/c/d'), ('route4', 'private'), ('rules', 'a/../b')]:
+            with self.assertRaises(module.Refused): module.inspect_argv(kind, parent)
+
+    def test_anchor_format_observation_normalizes_only_direct_children_without_execution_policy_change(self):
+        for text, category, paths in [('', 'empty', []), ('  com.apple/synthetic\n', 'qualified', ['com.apple/synthetic']),
+                ('synthetic', 'components', ['com.apple/synthetic']),
+                ('first\ncom.apple/second', 'mixed', ['com.apple/first', 'com.apple/second'])]:
+            self.assertEqual(module.inspect_anchor_list(text, 'com.apple'), (category, paths))
+        for text in ('other/child', 'com.apple/a/b', 'com.apple/../other', 'first\nfirst',
+                     'first\ncom.apple/first', 'x' * 129, '\n'.join('a' + str(i) for i in range(65))):
+            self.assertEqual(module.inspect_anchor_list(text, 'com.apple'), ('unknown', None))
+        with patch.object(module, 'pf', return_value='com.apple/synthetic'):
+            with self.assertRaises(module.Refused): module.anchor_names('com.apple')
+
+    def test_all_prerequisites_continue_after_failure_and_receipt_contains_no_raw_values(self):
+        calls = []
+        def read(kind, parent, deadline):
+            calls.append((kind, parent)); module.inspect_argv(kind, parent)
+            if kind == 'route6': return 'nonzero', b'', b'PRIVATE_SENTINEL'
+            if kind == 'anchors':
+                text = 'com.apple' if not parent else 'com.apple/PRIVATE_SENTINEL' if parent == 'com.apple' else ''
+            else:
+                text = {'status': 'Status: Disabled for 0 days', 'references': 'No pf starter references held',
+                        'states': '', 'interfaces': 'synthetic (skip)', 'route4': 'interface: PRIVATE_SENTINEL',
+                        'rules': 'anchor "com.apple/*" all' if not parent else '', 'nat': ''}[kind]
+            return 'success', text.encode(), b''
+        result = module.inspection(OP, 'a' * 40, 'b' * 64, read)
+        self.assertTrue(result['anchorTreeComplete']); self.assertTrue(result['readOnly'])
+        self.assertFalse(result['networkQualified']); self.assertFalse(result['credentialContinuityQualified'])
+        self.assertNotIn('PRIVATE_SENTINEL', json.dumps(result))
+        self.assertEqual(result['checks'][5]['outcome'], 'nonzero')
+        self.assertEqual(result['checks'][5]['classification'], 'unobserved')
+        self.assertEqual(result['checks'][3]['classification'], 'skip-present')
+        self.assertEqual([c['kind'] for c in result['checks'][-3:]], ['status', 'states', 'references'])
+        self.assertIn(('rules', 'com.apple/PRIVATE_SENTINEL'), calls)
+
+    def test_unknown_and_large_anchor_trees_stay_explicit_and_bounded(self):
+        for unknown in (False, True):
+            calls = []
+            def read(kind, parent, deadline):
+                calls.append((kind, parent))
+                if kind != 'anchors': return 'success', b'', b''
+                if unknown: return 'success', b'not/within/requested/parent', b''
+                return 'success', '\n'.join((parent + '/' if parent else '') + 'a' + str(i) for i in range(64)).encode(), b''
+            result = module.inspection(OP, 'a' * 40, 'b' * 64, read)
+            self.assertFalse(result['anchorTreeComplete']); self.assertLessEqual(len(calls), 57)
+            self.assertLessEqual(len(json.dumps(result)), 65536)
+
+    def test_read_capture_caps_both_streams_and_kills_only_its_owned_command(self):
+        class Pipe:
+            def __init__(self, fd): self.fd = fd
+            def fileno(self): return self.fd
+        class Child:
+            stdout = Pipe(10); stderr = Pipe(11)
+            def __init__(self): self.killed = False
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def kill(self): self.killed = True
+            def wait(self, timeout): return -9 if self.killed else 0
+        for noisy_fd in (10, 11):
+            child = Child()
+            with patch.object(module.subprocess, 'Popen', return_value=child), \
+                    patch.object(module.select, 'select', side_effect=lambda fds, *args: ([noisy_fd], [], [])), \
+                    patch.object(module.os, 'read', return_value=b'x' * 4096):
+                result, out, err = module.inspect_read('states', '', module.time.monotonic() + 10)
+            self.assertEqual(result, 'oversize'); self.assertTrue(child.killed)
+            self.assertLessEqual(len(out), 65536); self.assertLessEqual(len(err), 65536)
+        child = Child()
+        with patch.object(module.subprocess, 'Popen', return_value=child), \
+                patch.object(module.time, 'monotonic', side_effect=[1, 1, 7, 7]):
+            self.assertEqual(module.inspect_read('states', '', 10)[0], 'timeout')
+        self.assertTrue(child.killed)
+        child = Child()
+        with patch.object(module.subprocess, 'Popen', return_value=child), \
+                patch.object(module.select, 'select', side_effect=lambda fds, *args: (fds, [], [])), \
+                patch.object(module.os, 'read', return_value=b''), patch.object(child, 'wait', return_value=1):
+            self.assertEqual(module.inspect_read('states', '', module.time.monotonic() + 10)[0], 'nonzero')
+        self.assertFalse(child.killed)
+        child = Child()
+        with patch.object(module.subprocess, 'Popen', return_value=child), \
+                patch.object(module.select, 'select', side_effect=OSError):
+            self.assertEqual(module.inspect_read('states', '', module.time.monotonic() + 10)[0], 'unavailable')
+        self.assertTrue(child.killed)
+        with patch.object(module.subprocess, 'Popen') as popen:
+            self.assertEqual(module.inspect_read('states', '', 0), ('budget', b'', b''))
+            popen.assert_not_called()
+
+    def test_inspection_does_not_reach_install_cleanup_probe_or_pf_mutations(self):
+        with patch.object(module, 'install', side_effect=AssertionError), patch.object(module, 'collect', side_effect=AssertionError), \
+                patch.object(module, 'probe', side_effect=AssertionError), patch.object(module, 'pf', side_effect=AssertionError), \
+                patch.object(module, 'durable', side_effect=AssertionError):
+            module.inspection(OP, 'a' * 40, 'b' * 64, lambda *args: ('success', b'', b''))
+
+
 if __name__ == '__main__':
     unittest.main()
