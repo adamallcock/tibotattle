@@ -86,6 +86,15 @@ def enabled(text):
     return matches[0] == 'Enabled'
 
 
+
+def require_route_interface(out, err):
+    # macOS route can exit zero while printing "not in table" to stderr.
+    # Only one complete native interface field, with no stderr, proves a lookup.
+    fields = re.findall(r'^[ \t]*interface:[^\r\n]*$', out, re.M)
+    require(not err.strip() and len(fields) == 1 and re.fullmatch(
+        r'[ \t]*interface:[ \t]+[A-Za-z][A-Za-z0-9_.-]{0,31}[ \t]*', fields[0]), 'command')
+
+
 def reference_token(text):
     matches = re.findall(r'^Token\s*:\s*([1-9][0-9]{0,19})\s*$', text, re.M)
     require(len(matches) == 1 and int(matches[0]) <= 2**64 - 1, 'enable_token')
@@ -339,11 +348,11 @@ def supervise(root):
         journal['topology'] = topology(anchor)
         if config['scenario'] == 'network':
             try:
-                command(['/sbin/route', '-n', 'get', '-inet', '192.0.2.1'])
+                require_route_interface(*command(['/sbin/route', '-n', 'get', '-inet', '192.0.2.1']))
             except Refused:
                 raise Refused('ipv4_route_unavailable')
             try:
-                command(['/sbin/route', '-n', 'get', '-inet6', '2001:db8::1'])
+                require_route_interface(*command(['/sbin/route', '-n', 'get', '-inet6', '2001:db8::1']))
             except Refused:
                 raise Refused('ipv6_route_unavailable')
         durable(journal_path, journal)

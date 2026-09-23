@@ -62,7 +62,7 @@ class SupervisorTest(unittest.TestCase):
         self.calls.append(tuple(argv))
         if argv in (['/sbin/route', '-n', 'get', '-inet6', '2001:db8::1'],
                     ['/sbin/route', '-n', 'get', '-inet', '192.0.2.1']):
-            return 'synthetic route', ''
+            return '   route to: 192.0.2.1\n  interface: en0\n      flags: <UP,GATEWAY,HOST,DONE,STATIC>\n', ''
         if argv == [module.PF, '-E']:
             self.enabled = True
             if self.enable_uncertain:
@@ -196,6 +196,33 @@ class SupervisorTest(unittest.TestCase):
             with self.assertRaises(module.Refused):
                 module.stop_group(88888, 'old birth')
             kill.assert_called_once_with(88888, module.signal.SIGTERM)
+
+    def test_route_interface_requires_native_field_and_never_promotes_exit_zero_errors(self):
+        module.require_route_interface('   route to: 192.0.2.1\n  interface: en0\n', '')
+        module.require_route_interface('  interface: utun12\n', '')
+        for out, err in [('', ''), ('', 'route: writing to routing socket: not in table\n'),
+                         ('  interface: en0\n', 'route: writing to routing socket: not in table\n'),
+                         ('  interface: en0\n  interface: en1\n', ''), ('interface:', ''),
+                         ('interface: en0 PRIVATE_SENTINEL', ''), ('interface: /private', ''),
+                         ('route to: 2001:db8::1', ''), ('interface: en0\ninterface: ?', '')]:
+            with self.subTest(out=out, err=err), self.assertRaises(module.Refused):
+                module.require_route_interface(out, err)
+
+    def test_zero_exit_missing_route_refuses_both_families_before_firewall_mutation(self):
+        original = self.command
+        for family in ('-inet', '-inet6'):
+            # Fresh journal for each family; no external process or PF command.
+            def command(argv, data=None):
+                if argv[:4] == ['/sbin/route', '-n', 'get', family]:
+                    return '', 'route: writing to routing socket: not in table\n'
+                return original(argv, data)
+            self.command = command
+            receipt = self.run_supervisor()
+            self.assertEqual(receipt['failure'], 'ipv4_route_unavailable' if family == '-inet' else 'ipv6_route_unavailable')
+            self.assertFalse(any('-f' in call or '-E' in call or '-X' in call for call in self.calls))
+            self.assertFalse(self.loaded or self.enabled)
+            (self.root / 'journal.json').unlink()
+            (self.root / 'receipt.json').unlink()
 
     def test_missing_ipv6_route_refuses_before_firewall_mutation(self):
         original = self.command
