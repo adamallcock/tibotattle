@@ -2,6 +2,7 @@ import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import { formatModelName } from "./ui-format.js";
 import {
   REPORTING_PERIODS,
+  REPORTING_DURATION_MS,
   normalizeReportingWindow,
   reportingRequestPeriod,
   reportingPeriodLabel,
@@ -17,11 +18,13 @@ const STANDALONE_PERIODS = ["7", "30", "all"];
 const PRELOAD_PERIODS = STANDALONE_PERIODS;
 const MAX_READY_PERIODS = 8;
 // Keep the in-memory period cache useful across quick switches while ensuring
-// each entry is eventually revalidated. The cache is deliberately bounded by
-// PERIODS; it never persists measurements in browser storage.
+// each entry is eventually revalidated. The cache holds at most the four
+// shared periods in two speed modes; it never persists measurements in browser storage.
 const PERIOD_CACHE_TTL_MS = 60_000;
-const PRELOAD_MAX_ATTEMPTS = 3;
-const PRELOAD_RETRY_DELAY_MS = 5_000;
+// A first history pass can take minutes. Continue bounded background retries
+// while the document is visible instead of giving up after ten seconds.
+const PRELOAD_MAX_ATTEMPTS = 24;
+const preloadRetryDelay = attempt => Math.min(30_000, 5_000 * 2 ** attempt);
 const SPEED_METHOD = "speed";
 const SPEED_MODES = ["standard", "fast"];
 const MODEL_NAMES = Object.freeze({
@@ -610,17 +613,29 @@ export function mountModelPerformance(options = {}) {
     root.append(panel);
     restoreFocus();
   }
-  const cacheKeyFor = value => `${speedMode}::${sharedReporting ? `${reportingKey()}::${value}` : value}`;
+  const cacheKeyFor = (value, mode = speedMode, window = reportingWindow) => `${mode}::${sharedReporting
+    ? `${window?.period ?? "waiting"}:${window?.startAt ?? ""}:${window?.endAt ?? ""}::${value}` : value}`;
   const cachedPayload = value => readyPeriods.get(cacheKeyFor(value))?.payload ?? null;
   const cacheFresh = entry => entry && Date.now() - entry.cachedAt < PERIOD_CACHE_TTL_MS;
-  const preloadValues = () => {
-    const selected = selectedRequestPeriod();
-    return sharedReporting ? (selected ? [selected] : []) : PRELOAD_PERIODS;
+  const preloadTargets = () => {
+    if (!sharedReporting) return PRELOAD_PERIODS.map(value => ({ value, mode: speedMode, window: null }));
+    if (!reportingWindow) return [];
+    const endMs = Date.parse(reportingWindow.endAt);
+    return REPORTING_PERIODS.flatMap(periodId => {
+      const window = normalizeReportingWindow({
+        period: periodId,
+        startAt: periodId === "all" ? null
+          : new Date(Math.max(0, endMs - REPORTING_DURATION_MS[periodId])).toISOString(),
+        endAt: reportingWindow.endAt,
+      });
+      const value = reportingRequestPeriod(periodId);
+      return SPEED_MODES.map(mode => ({ value, mode, window }));
+    });
   };
   const allPeriodsFresh = () => {
-    const values = preloadValues();
-    return values.length > 0
-      && values.every(value => cacheFresh(readyPeriods.get(cacheKeyFor(value))));
+    const targets = preloadTargets();
+    return targets.length > 0
+      && targets.every(({ value, mode, window }) => cacheFresh(readyPeriods.get(cacheKeyFor(value, mode, window))));
   };
   const documentVisible = () => !documentRef.hidden && !destroyed;
   const canPreload = (runLifecycle, runScope) => documentVisible()
@@ -680,17 +695,19 @@ export function mountModelPerformance(options = {}) {
     payload = next;
     return changed;
   };
-  function requestPeriod(value, { force = false, speculative = false } = {}) {
-    if (!PERIODS.includes(value) || sharedReporting && value !== selectedRequestPeriod()) {
+  function requestPeriod(value, { force = false, speculative = false,
+    mode = speedMode, window = reportingWindow } = {}) {
+    if (!PERIODS.includes(value) || !SPEED_MODES.includes(mode)
+        || sharedReporting && (!window || value !== reportingRequestPeriod(window.period))) {
       return Promise.reject(new RangeError("Unsupported performance period"));
     }
-    const cacheKey = cacheKeyFor(value);
+    const cacheKey = cacheKeyFor(value, mode, window);
     const existing = pendingPeriods.get(cacheKey);
     if (existing) return existing.promise;
     const entry = readyPeriods.get(cacheKey);
     if (!force && cacheFresh(entry)) return Promise.resolve(entry.payload);
-    const expectedMode = speedMode;
-    const expectedWindow = sharedReporting ? reportingWindow : null;
+    const expectedMode = mode;
+    const expectedWindow = sharedReporting ? window : null;
     const expectedEndAt = expectedWindow?.endAt ?? null;
     const expectedStartAt = expectedWindow?.startAt ?? null;
     const controller = new AbortController();
@@ -747,50 +764,49 @@ export function mountModelPerformance(options = {}) {
       preloadWaiters.set(timeout, finish);
     });
   }
-  async function preloadPeriod(value, runLifecycle, runScope) {
+  async function preloadPeriod({ value, mode, window }, runLifecycle, runScope) {
     for (let attempt = 0; attempt < PRELOAD_MAX_ATTEMPTS; attempt++) {
       if (!canPreload(runLifecycle, runScope)) return null;
       let result = null;
-      try { result = await requestPeriod(value, { speculative: true }); }
+      try { result = await requestPeriod(value, { speculative: true, mode, window }); }
       catch { if (!canPreload(runLifecycle, runScope)) return null; }
       if (result?.status === "unavailable") {
-        if (value === selectedRequestPeriod() && presentResult(value, result)) render();
+        if (mode === speedMode && value === selectedRequestPeriod() && presentResult(value, result)) render();
         return result;
       }
       if (!canPreload(runLifecycle, runScope)) return null;
       if (result) {
-        if (presentResult(value, result)) render();
+        if (mode === speedMode && presentResult(value, result)) render();
         if (result.status === "ready") return result;
       }
       if (attempt + 1 < PRELOAD_MAX_ATTEMPTS
-          && !await waitForPreload(PRELOAD_RETRY_DELAY_MS, runLifecycle, runScope)) return null;
+          && !await waitForPreload(preloadRetryDelay(attempt), runLifecycle, runScope)) return null;
     }
     return null;
   }
-  async function runPreload(runLifecycle, runScope, selectedPeriod) {
-    const values = preloadValues();
-    if (!values.length) return;
-    const selectedResult = await preloadPeriod(selectedPeriod, runLifecycle, runScope);
-    if (selectedResult?.status === "unavailable" || !canPreload(runLifecycle, runScope)) return;
-    for (const value of values) {
-      if (value === selectedPeriod) continue;
-      const result = await preloadPeriod(value, runLifecycle, runScope);
-      if (result?.status === "unavailable" || !canPreload(runLifecycle, runScope)) return;
+  async function runPreload(runLifecycle, runScope) {
+    if (!sharedReporting) {
+      const targets = preloadTargets().sort((left, right) =>
+        Number(right.value === selectedRequestPeriod()) - Number(left.value === selectedRequestPeriod()));
+      for (const target of targets) {
+        const result = await preloadPeriod(target, runLifecycle, runScope);
+        if (result?.status === "unavailable" || !canPreload(runLifecycle, runScope)) return;
+      }
+      return;
     }
+    // Every exact period/mode window shares the same timing worker. Register
+    // them together so one background history pass can fill all eight views.
+    await Promise.all(preloadTargets().map(target => preloadPeriod(target, runLifecycle, runScope)));
   }
   function preload() {
     if (destroyed || documentRef.hidden) return Promise.resolve();
     if (preloadPromise) return preloadPromise;
-    const values = preloadValues();
-    if (!values.length) return Promise.resolve(false);
+    if (!preloadTargets().length) return Promise.resolve(false);
     if (preloadComplete && allPeriodsFresh()) return Promise.resolve();
     preloadComplete = false;
     const runLifecycle = lifecycle, runScope = scopeGeneration;
-    const selectedPeriod = values.includes(selectedRequestPeriod())
-      ? selectedRequestPeriod()
-      : values[0];
     const operation = (async () => {
-      try { await runPreload(runLifecycle, runScope, selectedPeriod); }
+      try { await runPreload(runLifecycle, runScope); }
       catch { /* Speculative warming is best effort; foreground refresh remains authoritative. */ }
     })();
     preloadPromise = operation;

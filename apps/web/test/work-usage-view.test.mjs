@@ -1905,6 +1905,43 @@ test("preload prepares an inactive page and validates its selected lease on firs
   assert.equal(root.children.at(-1).inert, false);
 });
 
+test("a shared period switch displays its prepared report for the same end bound", async (t) => {
+  const harness = mountedLeaseRoot();
+  harness.root.inert = true;
+  const windowAt = period => ({ period, endAt: new Date(NOW).toISOString(),
+    startAt: period === "all" ? null : new Date(NOW - {
+      "24h": 1, "7d": 7, "30d": 30,
+    }[period] * 86_400_000).toISOString() });
+  const requests = [];
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+    reportingWindow: windowAt("7d"),
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body);
+      requests.push(query);
+      const report = warmReport(query.sourceSnapshotId ? `warm-${query.period}` : "selected",
+        `${query.period} prepared report`);
+      report.toMs = NOW;
+      report.fromMs = query.period === "all" ? 0 : NOW - {
+        "24h": 1, "7d": 7, "30d": 30,
+      }[query.period] * 86_400_000;
+      return httpResponse(report);
+    },
+  });
+  t.after(() => view.destroy());
+  assert.equal(await view.preload(), true);
+  const before = requests.length;
+  view.setReportingWindow(windowAt("30d"));
+  const body = harness.root.children.at(-1);
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true, "prepared figures cannot use an unvalidated lease");
+  assert.match(body.textContent, /30d prepared report/u);
+  assert.equal(requests.length, before, "the prepared report renders without a foreground request");
+  harness.root.inert = false;
+  harness.changed();
+  assert.equal(requests.at(-1).snapshotId, "warm-30d",
+    "entry revalidates the prepared snapshot without rebuilding its accounting projection");
+});
+
 test("a cold preload retries after a hidden-start failure when the page becomes active", async (t) => {
   const harness = mountedLeaseRoot();
   const { root } = harness;

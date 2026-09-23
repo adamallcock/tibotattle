@@ -189,11 +189,13 @@ have fewer than five measured turns, and those bins have no percentile bands.
 Unknown or mixed modes are excluded from both views, with their excluded turn
 count shown. Older saved measurements without mode evidence stay unclassified.
 
-After the initial dashboard loads, the app prepares this page and its standard
-periods in the background before you visit. Once ready, opening the page or
-changing period displays its cached chart immediately while checking for
-updates. These results stay in memory only; restarting the app starts a fresh
-page cache. Speculative report requests pause while the app document is hidden.
+After the initial dashboard loads, the app prepares all four shared reporting
+periods in both Standard and Fast in the background. Once ready, opening the
+page or switching either control displays its cached result immediately while
+checking for updates. A first history scan may still show progress until its
+measurements are ready. Browser results stay in memory only; restarting the app
+starts a fresh page cache. Speculative requests pause while the app document is
+hidden.
 
 **Output speed** includes response-timed measurements plus eligible tool-free
 turn estimates from older logs. Each turn contributes once: covered response
@@ -300,9 +302,11 @@ input counters support it; **Includes assumed counts** distinguishes them from
 observed values. Other missing counts remain labelled partial.
 
 **Refresh report** updates this view from the existing local index. Use the app's
-main **Refresh** to collect new usage first. Each report displays its as-of time and the shared reporting bounds. Opening
-another section preserves the selection; changing the reporting period or its
-accounting snapshot rebuilds a report for those exact dates.
+main **Refresh** to collect new usage first. Each report displays its as-of time
+and the shared reporting bounds. Opening another section preserves the selection.
+A period switch with the same accounting end bound displays its prepared figures
+while validating the report lease. An expired lease or a new accounting bound
+requires a new report for those exact dates.
 While Projects & threads is visible, a lightweight keep-alive preserves its
 cached report without recalculating usage. Reports may be released after five
 minutes away from the page; returning automatically rebuilds an expired report.

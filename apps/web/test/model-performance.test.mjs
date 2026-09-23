@@ -173,6 +173,7 @@ test('bounded periods preserve the complete requested domain and empty all-time 
 function focusHarness() {
   let inactive = true, visibilityObserver = null, documentVisibilityObserver = null, nextTimer = 0;
   const timers = new Map();
+  const timerDelays = new Map();
   const documentRef = { activeElement: null, hidden: false,
     addEventListener: (type, listener) => { if (type === 'visibilitychange') documentVisibilityObserver = listener; },
     removeEventListener: (type, listener) => { if (type === 'visibilitychange' && documentVisibilityObserver === listener) documentVisibilityObserver = null; } };
@@ -202,14 +203,15 @@ function focusHarness() {
   documentRef.createElementNS = (namespace, tag) => new Node(tag);
   const root = new Node('section');
   const windowRef = { localStorage: { getItem: () => null, setItem() {} },
-    setTimeout: callback => { const id = ++nextTimer; timers.set(id, callback); return id; },
-    clearTimeout: id => { timers.delete(id); },
+    setTimeout: (callback, delay) => { const id = ++nextTimer; timers.set(id, callback); timerDelays.set(id, delay); return id; },
+    clearTimeout: id => { timers.delete(id); timerDelays.delete(id); },
     MutationObserver: class { constructor(callback) { visibilityObserver = callback; } observe() {} disconnect() {} },
   };
   return { root, documentRef, windowRef, show: () => { inactive = false; },
     navigate: (shown) => { inactive = !shown; visibilityObserver?.(); },
     find: key => root.all().find(node => node.dataset.performanceFocus === key),
-    timerIds: () => [...timers.keys()], runTimer: id => timers.get(id)?.(),
+    timerIds: () => [...timers.keys()], timerDelay: id => timerDelays.get(id),
+    runTimer: id => timers.get(id)?.(),
     setDocumentHidden: hidden => { documentRef.hidden = hidden; documentVisibilityObserver?.(); } };
 }
 const settle = () => new Promise(resolve => setImmediate(resolve));
@@ -672,6 +674,26 @@ test('page preload retries a cold loading response with a bounded retry', async 
   controller.destroy();
 });
 
+test('background timing preload continues past the first ten seconds of a cold history pass', async () => {
+  const dom = focusHarness();
+  let attempts = 0;
+  const { calls, client } = performanceClient(period => period === 'all' && attempts++ < 4
+    ? periodPayload('all', { status: 'loading', models: [] }) : periodPayload(period));
+  const controller = mountModelPerformance({ ...dom, client,
+    t: (key, values) => translate(key, values, 'en-US') });
+  try {
+    const operation = controller.preload();
+    for (const delay of [5_000, 10_000, 20_000, 30_000]) {
+      await settle();
+      const timer = dom.timerIds().find(id => dom.timerDelay(id) === delay);
+      assert.ok(timer, `cold history schedules a ${delay}ms retry`);
+      dom.runTimer(timer);
+    }
+    await operation;
+    assert.equal(calls.filter(call => call.period === 'all').length, 5);
+  } finally { controller.destroy(); }
+});
+
 test('active navigation joins an in-flight page preload without duplicating the request', async () => {
   const dom = focusHarness(), all = Promise.withResolvers();
   const { calls, client } = performanceClient(period => period === 'all' ? all.promise : periodPayload(period));
@@ -1074,6 +1096,43 @@ test('shared reporting keeps its exact bound and selected speed mode through mod
   assert.equal(dom.root.all().some(node => node.dataset.performanceFocus?.startsWith('period-')), false);
   assert.equal(dom.find('mode-fast').attributes['aria-pressed'], 'true');
   controller.destroy();
+});
+
+test('shared preload prepares every period and both speed modes at one exact end bound', async () => {
+  const dom = focusHarness(), end = 60 * DAY;
+  const endAt = new Date(end).toISOString();
+  const pending = Promise.withResolvers();
+  let revalidating = false;
+  const { calls, client } = performanceClient((period, { speedMode }) => revalidating
+    ? pending.promise
+    : modePayload(period, speedMode, {
+      start: period === 'all' ? null : end - Number(period) * DAY,
+      end, models: [],
+    }));
+  const windowAt = period => ({ period, endAt, startAt: period === 'all' ? null
+    : new Date(end - (period === '24h' ? 1 : period === '7d' ? 7 : 30) * DAY).toISOString() });
+  const controller = mountModelPerformance({ ...dom, client, reportingWindow: windowAt('7d'),
+    t: (key, values) => translate(key, values, 'en-US') });
+  try {
+    await controller.preload();
+    assert.equal(calls.length, 8);
+    assert.deepEqual(new Set(calls.map(call => `${call.period}:${call.options.speedMode}`)), new Set([
+      '1:standard', '1:fast', '7:standard', '7:fast',
+      '30:standard', '30:fast', 'all:standard', 'all:fast',
+    ]));
+    assert.ok(calls.every(call => call.options.endAt === endAt));
+    revalidating = true;
+    dom.navigate(true);
+    dom.find('mode-fast').listeners.click();
+    assert.ok(dom.root.all().some(node => node.className === 'performance-empty'),
+      'Fast displays its prepared result while revalidation is pending');
+    controller.setReportingWindow(windowAt('30d'));
+    assert.ok(dom.root.all().some(node => node.className === 'performance-empty'),
+      'a different period displays its prepared Fast result immediately');
+  } finally {
+    controller.destroy();
+    pending.resolve(null);
+  }
 });
 
 test('client rejects unsupported modes, preserves endAt, and page rejects a wrong-mode response', async () => {
