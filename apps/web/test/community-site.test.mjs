@@ -2571,7 +2571,7 @@ test("the feature tour labels every demonstration as synthetic in markup and cat
   for (const [label, key] of [
     ["Synthetic demonstration", "site.features.insightExample"],
     ["not measured results", "site.features.insightExample"],
-    ["Illustrative scenario · not a live allowance", "site.features.example"],
+    ["The app’s interactive tank · illustrative allowance, not live account data.", "site.features.example"],
     ["Synthetic example week", "site.features.weekExample"],
   ]) {
     assert.ok(html.includes(label), `served markup states "${label}"`);

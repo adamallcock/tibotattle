@@ -147,6 +147,10 @@ test("web-only scope accepts only committed public source and release controls",
   assert.equal(isAllowedWebReleasePath("apps/web/test/community-refresh.test.mjs"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/test/public-allowance-views.test.mjs"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/test/community-cache-retention.test.mjs"), true);
+  assert.equal(isAllowedWebReleasePath("apps/web/public/feature-tour.js"), true);
+  assert.equal(isAllowedWebReleasePath("apps/web/public/feature-tour.css"), true);
+  assert.equal(isAllowedWebReleasePath("apps/web/test/feature-tour.test.mjs"), true);
+  assert.equal(isAllowedWebReleasePath("apps/web/public/feature-tour-private.js"), false);
   // Still an exact allowlist, not a prefix: a sibling nobody named stays out.
   assert.equal(isAllowedWebReleasePath("apps/web/test/unlisted.test.mjs"), false);
   assert.equal(isAllowedWebReleasePath("apps/web/public/unreviewed.js"), false);

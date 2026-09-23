@@ -547,25 +547,22 @@
       <p data-i18n="site.features.quotaCopy">Living fuel tanks show your remaining allowance. The forecast turns your recent pace into a run-out estimate, with the time until reset right beside it.</p>
       </div>
 <div class="pace-showcase" data-pace-demo data-pace="way">
-<div class="pace-demo-copy"><p class="tour-eyebrow" data-i18n="site.features.demo">Interactive demonstration</p><p  data-i18n="site.features.demoCopy">Try a pace below. The level shows what is left; the flow shows how quickly you are using it.</p><div class="pace-options" role="group" aria-label="Interactive demonstration" data-i18n-aria-label="site.features.demo"><button type="button" data-demo-pace="under" aria-pressed="false" data-i18n="site.features.under">Under pace</button><button type="button" data-demo-pace="over" aria-pressed="false" data-i18n="site.features.over">Over pace</button><button type="button" data-demo-pace="way" aria-pressed="true" data-i18n="site.features.way">Way over pace</button></div>
+<div class="pace-demo-copy"><p class="tour-eyebrow" data-i18n="site.features.demo">Interactive demonstration</p><p  data-i18n="site.features.demoCopy">Try a pace, then tap the rocket to slosh the fuel. The level shows what is left; the plume shows how quickly you are using it.</p><div class="pace-options" role="group" aria-label="Interactive demonstration" data-i18n-aria-label="site.features.demo"><button type="button" data-demo-pace="under" aria-pressed="false" data-i18n="site.features.under">Under pace</button><button type="button" data-demo-pace="over" aria-pressed="false" data-i18n="site.features.over">Over pace</button><button type="button" data-demo-pace="way" aria-pressed="true" data-i18n="site.features.way">Way over pace</button></div>
 <div class="pace-verdict" aria-live="polite"><p data-demo-verdict data-i18n="site.features.wayCopy">A much earlier stop. Heavy flow makes the gap to reset impossible to miss.</p></div></div>
-<div class="pace-apparatus" aria-hidden="true"><canvas width="320" height="418"></canvas><div class="tank-reading"><strong>33<span>%</span></strong><span data-i18n="site.features.remaining">remaining</span></div></div>
+<div class="pace-apparatus quota-grid">
+<article class="metric-card quota-tank" data-remaining="33" data-forecast-pool="true" data-stale="false">
+<div class="quota-tank-header"><span class="quota-tank-family"><img class="quota-codex-icon" src="./codex-color.svg" alt=""><span>Codex</span></span><span class="quota-tank-period" data-i18n="site.features.weekly">Weekly allowance</span></div>
+<div class="quota-tank-bottom"><div><strong class="quota-tank-value">33%</strong><span class="quota-tank-caption" data-i18n="allowance.remaining">remaining</span></div></div>
+</article>
+</div>
 <aside class="weekly-pace-forecast demo-forecast is-over-pace is-critical" data-demo-forecast data-motion="running" aria-live="polite">
 <div class="weekly-pace-forecast-heading"><p class="panel-kicker"><img src="./codex-color.svg" width="18" height="18" alt=""><span data-i18n="site.features.forecast">Codex · weekly forecast</span></p><span class="evidence-chip weekly-pace-forecast-state-chip" data-forecast-badge data-i18n="site.features.way">Way over pace</span></div>
 <h4 class="weekly-pace-forecast-title" data-forecast-title></h4><p class="weekly-pace-forecast-copy" data-forecast-copy></p>
 <div class="weekly-pace-track" data-forecast-track><div class="weekly-pace-track-labels"><div class="weekly-pace-track-runout" data-forecast-runout><span data-i18n="site.features.runout">Estimated run-out</span><time class="allowance-timestamp" data-runout-time tabindex="0"></time></div><div class="weekly-pace-track-reset"><span data-i18n="site.features.reset">Allowance resets</span><time class="allowance-timestamp" data-reset-time tabindex="0"></time></div></div><div class="weekly-pace-track-bar"><div class="weekly-pace-track-covered" data-forecast-covered></div><div class="weekly-pace-track-mark" data-forecast-mark></div></div><div class="weekly-pace-track-scale"><span data-i18n="site.features.now">Now</span><span class="weekly-pace-track-gap" data-forecast-gap></span></div></div>
 <details class="weekly-pace-details"><summary data-i18n="site.features.basis">Forecast basis and assumptions</summary><p data-i18n="site.features.assumptions">Illustrative scenario with 33% remaining and a reset in 5d 20h. Assumes the selected pace continues. Hover the times for example timestamps.</p></details></aside>
-<div class="pace-demo-footer"><span  data-i18n="site.features.example">Illustrative scenario · not a live allowance. In the app the tanks are live and interactive.</span><button type="button" data-demo-motion aria-pressed="false" data-i18n="site.features.pause">Pause preview</button></div></div>
+<div class="pace-demo-footer"><span  data-i18n="site.features.example">The app’s interactive tank · illustrative allowance, not live account data.</span></div></div>
 
-<details class="tour-recording"><summary  data-i18n="site.features.actual">See real example</summary>      <figure class="feature-media feature-video" data-feature-preview>
-       <video muted loop playsinline preload="none" poster="./feature-allowance.jpg" width="960" height="768" aria-label="App preview · example usage" data-i18n-aria-label="site.features.preview">
-      <source src="./feature-allowance.mp4" type="video/mp4">
-      </video>
-       <figcaption>
-      <span data-i18n="site.features.preview">App preview · example usage</span>
-      <button type="button" data-preview-toggle hidden data-i18n="site.features.play">Play preview</button>
-      </figcaption>
-      </figure></details>
+
       </article>
       <article class="tour-row tour-history" id="usage-history" tabindex="-1">
       <div class="tour-copy">
