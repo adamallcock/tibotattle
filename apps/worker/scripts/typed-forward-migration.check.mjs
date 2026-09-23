@@ -455,7 +455,7 @@ test('concrete backup verification performs a bounded read-only Time Travel chec
       const role = args.includes('USAGE_MONITOR_DB') ? 'primary' : 'analytics';
       return { status: 0, stdout: JSON.stringify({ bookmark: `synthetic-${role}-bookmark` }), stderr: '' };
     } });
-  await adapter.verifyBackupReceipt(f.plan.inventory.backupReceipt, f.targets);
+  await adapter.verifyBackupReceipt(f.plan.inventory.backupReceipt, f.targets, now);
   assert.equal(calls.length, f.targets.length);
   assert.equal(supplementalChecks, 1);
   assert.ok(calls.every(args => args.includes('time-travel') && args.includes('info') && args.some(arg => arg.startsWith('--timestamp='))));
@@ -730,7 +730,7 @@ test('injected backup verification cannot replace exact concrete bookmark compar
   const adapter = await createTypedForwardWranglerAdapter({ plan: { ...f.plan, wranglerSha256: cliSha256 }, operationDirectory: f.scratch, cliPath,
     backupVerifier: async () => { supplementalChecks += 1; },
     spawn() { return { status: 0, stdout: JSON.stringify({ bookmark: 'wrong-bookmark' }), stderr: '' }; } });
-  await assert.rejects(adapter.verifyBackupReceipt(f.plan.inventory.backupReceipt, f.targets), { code: 'TYPED_FORWARD_BACKUP_RECEIPT_UNVERIFIED' });
+  await assert.rejects(adapter.verifyBackupReceipt(f.plan.inventory.backupReceipt, f.targets, now), { code: 'TYPED_FORWARD_BACKUP_RECEIPT_UNVERIFIED' });
   assert.equal(supplementalChecks, 0);
 });
 
