@@ -12,7 +12,7 @@ import { mountExampleWeek } from "./feature-week.js";
 // Every rendering routine below is imported, not copied: the install card and
 // the community view are the same modules the in-app dashboard entry uses.
 
-import { wireFeaturePreviews, wirePaceDemo } from "./feature-tour.js";
+import { wirePaceDemo } from "./feature-tour.js";
 import {
   COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY,
   PublicCommunityClient,
@@ -691,7 +691,6 @@ export function selectCommunityAllowancePayload(previous, payload) {
 }
 
 if (typeof document !== "undefined") {
-  wireFeaturePreviews(document, window, t);
   wirePaceDemo(document, t);
   // The tour's cache section shows the illustration first and swaps in the
   // measured curve if the hosted lane has published one. The read is the same
