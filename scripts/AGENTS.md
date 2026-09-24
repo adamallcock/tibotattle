@@ -52,6 +52,10 @@ Scope: all files under `scripts/`. Apply the repository root guidance first.
 
 ## Validation
 
+- macOS packaging and smoke commands that launch an Electron or app GUI need
+  WindowServer access from the start. Run those native checks in a permitted
+  execution context, or stop before launch and report the environment gap;
+  do not use an expected AppKit abort as a capability probe.
 - Add unit tests for argument parsing, refusal paths, path safety, interruption,
   recovery, deterministic output, and dry-run/mutation separation.
 - Run `node --check` and the narrow owning tests while iterating. Run

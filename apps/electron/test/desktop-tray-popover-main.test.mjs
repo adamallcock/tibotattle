@@ -308,6 +308,67 @@ test("popover controller lazily positions, updates, routes, and destroys a trust
   assert.equal(popover.setModel(nextModel), false);
 });
 
+test("native close releases listeners without reading a destroyed window and allows reopening", async () => {
+  for (const closeBeforeLoad of [false, true]) {
+    const windows = [];
+    const loads = [];
+    class NativeLifecycleWindow extends FakeWindow {
+      constructor(options) {
+        super(options);
+        const contents = this.webContents;
+        this.retainedContents = contents;
+        Object.defineProperty(this, "webContents", {
+          get: () => {
+            if (this.destroyed) throw new TypeError("Object has been destroyed");
+            return contents;
+          },
+        });
+        windows.push(this);
+      }
+      loadURL(url) {
+        this.loaded.push(url);
+        this.webContents.currentURL = url;
+        return new Promise(resolve => loads.push(resolve));
+      }
+    }
+    const popover = createDesktopTrayPopover({
+      BrowserWindow: NativeLifecycleWindow,
+      preloadPath: await preloadFixture(),
+      pageURL: POPOVER_PAGE_URL,
+      origin: POPOVER_ORIGIN,
+      platform: "darwin",
+      model: createDesktopTrayPopoverModel({ trayStatus: status("unavailable") }),
+      onAction: () => {},
+    });
+    assert.equal(popover.show(), true);
+    if (!closeBeforeLoad) {
+      loads[0]();
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    const closed = windows[0];
+    assert.doesNotThrow(() => closed.destroy(), "native quit/update closes the window before controller teardown");
+    assert.equal(popover.visible, false);
+    for (const event of ["blur", "show", "hide", "closed"]) {
+      assert.equal(closed.listenerCount(event), 0);
+    }
+    for (const event of ["before-input-event", "will-navigate", "will-redirect", "will-frame-navigate", "will-attach-webview", "ipc-message"]) {
+      assert.equal(closed.retainedContents.listenerCount(event), 0);
+    }
+    assert.equal(popover.show(), true);
+    loads[0](); // A stale completion must not present the replacement prematurely.
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(windows[1].showCalls, 0);
+    loads[1]();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(popover.visible, true);
+    assert.equal(windows[1].showCalls, 1);
+    assert.doesNotThrow(() => popover.destroy());
+    assert.doesNotThrow(() => popover.destroy(), "shutdown cleanup is idempotent");
+    assert.equal(windows[1].destroyed, true);
+    assert.equal(windows[1].retainedContents.listenerCount("ipc-message"), 0);
+  }
+});
+
 test("a failed initial load is discarded so reopening retries the route", async () => {
   for (const failure of ["reject", "throw"]) {
     const preloadPath = await preloadFixture();

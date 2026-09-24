@@ -35,6 +35,11 @@ Scope: all files under `apps/electron/`. Apply the repository root guidance firs
 
 ## Validation and local handoff
 
+- On macOS, run real Electron GUI tests and packaged app smokes from an
+  execution context that permits WindowServer registration. The managed command
+  sandbox can abort in AppKit before app code starts and leave a macOS crash
+  alert. Do not launch the GUI there as a capability probe; if permitted
+  execution is unavailable, report native validation as unavailable.
 - Run focused `apps/electron/test/*.test.mjs` tests while iterating, followed by
   affected web/companion and packaging contracts when their boundary changes.
 - A user-visible fix needs a fresh packaged app and rendered inspection, not
