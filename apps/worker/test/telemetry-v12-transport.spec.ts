@@ -57,10 +57,16 @@ import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from 
 import { activateTelemetryV12Domain, createTelemetryV12DomainPredecessor } from "../src/telemetry-v12-domain";
 import { readEffectiveUsageOwnerDayPage } from "../src/telemetry-usage-effective-reader";
 import { initializeStorageSource } from "../src/analytics-delivery";
+import {
+  putTrackedQuarantineObject,
+  reconcilePendingQuarantineObjects,
+} from "../src/quarantine-reconciliation";
+import { deleteDueQuarantineObjects } from "../src/retention";
 import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../src/typed-v11-admission";
 import { initializeTypedV1Admission, insertTypedTelemetryV1Chunk } from "../src/typed-v1-admission";
 import { parseTelemetryV1Chunk } from "../src/telemetry-v1";
 import { createV11DeviceFixture, makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
+import { QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS } from "../src/constants";
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -189,12 +195,124 @@ async function persistMixedV12Day(
   const claimed = await claimDeviceUploadAuthorization(db(), `Upload ${upload.uploadAuthorization}`, {
     envelopeDigest, bodyBytes: 4096, contentType: "application/json",
   });
+  const chunkRowId = `chunk:${crypto.randomUUID()}`;
+  const r2Key = `telemetry/mixed-v12-${crypto.randomUUID()}`;
+  await putTrackedQuarantineObject(db(), bindings().QUARANTINE, {
+    contributionId: chunkRowId,
+    objectKind: "telemetry",
+    r2Key,
+    registeredAt: new Date(nowEpoch).toISOString(),
+  }, "synthetic v1.2 bytes");
   await persistTelemetryV12StagedChunk(db(), fixture, chunk, {
-    chunkRowId: `chunk:${crypto.randomUUID()}`,
-    r2Key: `synthetic/mixed-v12-${crypto.randomUUID()}`, envelopeDigest,
+    chunkRowId,
+    r2Key, envelopeDigest,
     deviceUploadAuthorizationId: claimed.authorizationId,
   }, nowEpoch);
   return { ...candidate, manifest };
+}
+
+async function activeV12Device() {
+  const nowEpoch = Date.now();
+  const fixture = await createV11DeviceFixture(db(), { nowEpoch });
+  await db().prepare("UPDATE telemetry_v12_runtime SET state = 'active', changed_at = ? WHERE id = 1")
+    .bind(new Date(nowEpoch).toISOString()).run();
+  await grantTelemetryV12Consent(db(), fixture, telemetryV12RequiredConsent(), nowEpoch);
+  return fixture;
+}
+
+async function prepareDeferredV12Chunk(
+  fixture: Awaited<ReturnType<typeof createV11DeviceFixture>>,
+  r2Key: string,
+  nowEpoch = Date.now(),
+) {
+  const record: TelemetryV12UsageEvent = mixedV12UsageRecord(
+    `event:v2:${await sha256Hex(crypto.randomUUID())}`,
+    1000,
+    75,
+  );
+  const chunk: TelemetryV12Chunk = {
+    schemaVersion: "telemetry-contribution-v1.2",
+    manifestDigest: "0".repeat(64),
+    chunkId: `usage:${MIXED_CLIENT_DAY}:0`,
+    chunkRevision: 1,
+    parserVersion: "synthetic-quarantine-v12",
+    consent: telemetryV12RequiredConsent(),
+    records: [record],
+    chunkDigest: await sha256Hex(canonicalTelemetryV12Json([record])),
+  };
+  const manifest: TelemetryV12DayManifest = {
+    schemaVersion: "telemetry-day-manifest-v1.2",
+    day: MIXED_CLIENT_DAY,
+    parserVersion: chunk.parserVersion,
+    consent: telemetryV12RequiredConsent(),
+    chunks: [{ chunkId: chunk.chunkId, chunkDigest: chunk.chunkDigest, recordCount: 1 }],
+    excluded: { quota: 0, session: 0, usage: 0 },
+    manifestDigest: "0".repeat(64),
+  };
+  manifest.manifestDigest = await sha256Hex(telemetryV12DayManifestDigestInput(manifest));
+  chunk.manifestDigest = manifest.manifestDigest;
+  await registerTelemetryV12DayManifest(db(), fixture, manifest, nowEpoch);
+
+  const principal = await authenticateDevice(db(), fixture.authorization);
+  const envelopeDigest = await sha256Hex(`synthetic-quarantine-v12:${crypto.randomUUID()}`);
+  const upload = await createDeviceUploadAuthorization(db(), principal, envelopeDigest, 4096);
+  const claimed = await claimDeviceUploadAuthorization(db(), `Upload ${upload.uploadAuthorization}`, {
+    envelopeDigest, bodyBytes: 4096, contentType: "application/json",
+  });
+  const chunkRowId = `chunk:${crypto.randomUUID()}`;
+  return {
+    chunkRowId,
+    persist: () => persistTelemetryV12StagedChunk(db(), fixture, chunk, {
+      chunkRowId,
+      r2Key,
+      envelopeDigest,
+      deviceUploadAuthorizationId: claimed.authorizationId,
+    }, nowEpoch),
+  };
+}
+
+function insertV12ReferenceBeforeOrphanClaim(
+  base: D1Database,
+  insertReference: () => Promise<unknown>,
+): { db: D1Database; inserted: () => boolean } {
+  let inserted = false;
+  const wrapStatement = (
+    statement: D1PreparedStatement,
+    interceptClaim = false,
+  ): D1PreparedStatement => new Proxy(statement, {
+    get(target, property) {
+      if (property === "bind") {
+        return (...values: Parameters<D1PreparedStatement["bind"]>) => (
+          wrapStatement(target.bind(...values), interceptClaim)
+        );
+      }
+      if (property === "run" && interceptClaim) {
+        return async () => {
+          if (!inserted) {
+            inserted = true;
+            await insertReference();
+          }
+          return target.run();
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const proxiedDb = new Proxy(base, {
+    get(target, property) {
+      if (property === "prepare") {
+        return (query: string) => wrapStatement(
+          target.prepare(query),
+          query.includes("UPDATE pending_quarantine_objects")
+            && query.includes("NOT EXISTS"),
+        );
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return { db: proxiedDb, inserted: () => inserted };
 }
 
 async function mixedOwner(participantId: string) {
@@ -460,8 +578,16 @@ describe("staged v1.2 successor transport", () => {
     const upload = await createDeviceUploadAuthorization(db(), principal, envelopeDigest, 22);
     const claimed = await claimDeviceUploadAuthorization(db(), `Upload ${upload.uploadAuthorization}`,
       { envelopeDigest, bodyBytes: 22, contentType: "application/json" });
+    const chunkRowId = `chunk:${crypto.randomUUID()}`;
+    const r2Key = `telemetry/v12-typed-${crypto.randomUUID()}`;
+    await putTrackedQuarantineObject(db(), bindings().QUARANTINE, {
+      contributionId: chunkRowId,
+      objectKind: "telemetry",
+      r2Key,
+      registeredAt: new Date().toISOString(),
+    }, "synthetic-v12-envelope");
     await expect(persistTelemetryV12StagedChunk(db(), fixture, chunk, {
-      chunkRowId: `chunk:${crypto.randomUUID()}`, r2Key: `synthetic/${crypto.randomUUID()}`,
+      chunkRowId, r2Key,
       envelopeDigest, deviceUploadAuthorizationId: claimed.authorizationId,
     })).resolves.toMatchObject({ replay: false, chunkId: chunk.chunkId });
     const columns = await db().prepare("PRAGMA table_info(telemetry_v12_records)").all<{ name: string }>();
@@ -507,7 +633,7 @@ describe("staged v1.2 successor transport", () => {
     expect(await telemetryV12ChunkCount(db(), fixture.participantId)).toBe(1);
     const r2Page = await telemetryV12ChunkR2KeyPage(db(), fixture.participantId, null, 1);
     expect(r2Page.rows).toHaveLength(1);
-    expect(r2Page.rows[0]?.r2Key).toMatch(/^synthetic\//u);
+    expect(r2Page.rows[0]?.r2Key).toMatch(/^telemetry\//u);
 
     // The successor closes beside an existing typed v1.1 head. Initialize
     // both typed legacy allocators through the normal source gate; this is
@@ -724,6 +850,131 @@ describe("staged v1.2 successor transport", () => {
   });
 });
 
+describe("v1.2 quarantine lifecycle coverage", () => {
+  it("preserves a pending object after its v1.2 chunk reference is committed", async () => {
+    const fixture = await activeV12Device();
+    const uploaded = await persistMixedV12Day(
+      fixture,
+      [mixedV12UsageRecord(`event:v2:${"a".repeat(64)}`, 1000, 75)],
+      Date.now(),
+    );
+    const chunk = await db().prepare(
+      "SELECT id, r2_key FROM telemetry_v12_chunks WHERE manifest_id = ?",
+    ).bind(uploaded.manifestId).first<{ id: string; r2_key: string }>();
+    expect(chunk).not.toBeNull();
+    const registeredAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const bucket = bindings().QUARANTINE;
+    await db().prepare(
+      "UPDATE pending_quarantine_objects SET registered_at = ? WHERE r2_key = ?",
+    ).bind(registeredAt, chunk!.r2_key).run();
+
+    const result = await reconcilePendingQuarantineObjects(
+      db(),
+      bucket,
+      Date.parse(registeredAt) + QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS + 1,
+    );
+    expect(result).toMatchObject({
+      registrationsExamined: 1,
+      orphanObjectsDeleted: 0,
+      referencedObjectsPreserved: 1,
+      reconciliationComplete: true,
+    });
+    expect((await db().prepare(
+      "SELECT count(*) AS total FROM pending_quarantine_objects WHERE r2_key = ?",
+    ).bind(chunk!.r2_key).first<{ total: number }>())?.total).toBe(0);
+    expect(await bucket.head(chunk!.r2_key)).not.toBeNull();
+  });
+
+  it("rechecks v1.2 membership atomically when a reference races the orphan claim", async () => {
+    const fixture = await activeV12Device();
+    const r2Key = `telemetry/v12-orphan-race-${crypto.randomUUID()}`;
+    const deferredChunk = await prepareDeferredV12Chunk(fixture, r2Key);
+    const registeredAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const registration = {
+      contributionId: deferredChunk.chunkRowId,
+      objectKind: "telemetry" as const,
+      r2Key,
+      registeredAt,
+    };
+    const bucket = bindings().QUARANTINE;
+    await putTrackedQuarantineObject(db(), bucket, registration, "synthetic v1.2 bytes");
+    expect((await db().prepare(
+      "SELECT count(*) AS total FROM telemetry_v12_chunks WHERE r2_key = ?",
+    ).bind(r2Key).first<{ total: number }>())?.total).toBe(0);
+    const racingDb = insertV12ReferenceBeforeOrphanClaim(db(), deferredChunk.persist);
+
+    const result = await reconcilePendingQuarantineObjects(
+      racingDb.db,
+      bucket,
+      Date.parse(registeredAt) + QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS + 1,
+    );
+    expect(racingDb.inserted()).toBe(true);
+    expect(result).toMatchObject({
+      registrationsExamined: 1,
+      orphanObjectsDeleted: 0,
+      referencedObjectsPreserved: 1,
+      reconciliationComplete: true,
+    });
+    expect((await db().prepare(
+      "SELECT count(*) AS total FROM telemetry_v12_chunks WHERE r2_key = ?",
+    ).bind(r2Key).first<{ total: number }>())?.total).toBe(1);
+    expect((await db().prepare(
+      "SELECT count(*) AS total FROM pending_quarantine_objects WHERE r2_key = ?",
+    ).bind(r2Key).first<{ total: number }>())?.total).toBe(0);
+    expect(await bucket.head(r2Key)).not.toBeNull();
+  });
+
+  it("still deletes a stale unreferenced v1.2-shaped object", async () => {
+    const r2Key = `telemetry/v12-orphan-${crypto.randomUUID()}`;
+    const registeredAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const registration = {
+      contributionId: `chunk:${crypto.randomUUID()}`,
+      objectKind: "telemetry" as const,
+      r2Key,
+      registeredAt,
+    };
+    const bucket = bindings().QUARANTINE;
+    await putTrackedQuarantineObject(db(), bucket, registration, "synthetic orphan bytes");
+
+    const result = await reconcilePendingQuarantineObjects(
+      db(),
+      bucket,
+      Date.parse(registeredAt) + QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS + 1,
+    );
+    expect(result).toMatchObject({
+      registrationsExamined: 1,
+      orphanObjectsDeleted: 1,
+      referencedObjectsPreserved: 0,
+      reconciliationComplete: true,
+    });
+    expect(await bucket.head(r2Key)).toBeNull();
+  });
+
+  it("leaves v1.2 bytes out of the age sweep under the current retention policy", async () => {
+    const fixture = await activeV12Device();
+    const r2Key = `telemetry/v12-retained-${crypto.randomUUID()}`;
+    const deferredChunk = await prepareDeferredV12Chunk(fixture, r2Key);
+    const bucket = bindings().QUARANTINE;
+    await putTrackedQuarantineObject(db(), bucket, {
+      contributionId: deferredChunk.chunkRowId,
+      objectKind: "telemetry",
+      r2Key,
+      registeredAt: new Date().toISOString(),
+    }, "synthetic v1.2 bytes");
+    await deferredChunk.persist();
+
+    const result = await deleteDueQuarantineObjects(
+      db(),
+      bucket,
+      new Date(Date.now() + 60_000).toISOString(),
+    );
+    expect(result).toEqual({ deleted: 0, complete: true });
+    expect(await bucket.head(r2Key)).not.toBeNull();
+    expect((await db().prepare(
+      "SELECT count(*) AS total FROM telemetry_v12_chunks WHERE r2_key = ?",
+    ).bind(r2Key).first<{ total: number }>())?.total).toBe(1);
+  });
+});
 
 it('offers the successor only on the typed deployment whose independent analytics can read it',async()=>{
  await applyD1Migrations(bindings().DELETION_LEDGER,bindings().TEST_DELETION_LEDGER_MIGRATIONS);

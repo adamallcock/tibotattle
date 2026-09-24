@@ -10,7 +10,12 @@ import {
   isPostgresWorkerRequestPathSupported,
   runScheduledMaintenance,
 } from "../src/index.ts";
-import { assertAdmissionBindings, assertAttemptAllowed } from "../src/admission.ts";
+import {
+  assertAdmissionBindings,
+  assertAttemptAllowed,
+  assertUploadAuthorizationAllowed,
+  assertUploadAuthorizationBindings,
+} from "../src/admission.ts";
 import { MAX_REQUEST_BYTES } from "../src/constants.ts";
 import { readBoundedRequestBody } from "../src/bounded-body.ts";
 import { createGcsQuarantineObjectStore } from "../src/gcs-quarantine-object-store.ts";
@@ -18,8 +23,24 @@ import { createGcsErasureBucketHistoryProof } from "../src/gcs-erasure-object-st
 import { createFilesystemAssets } from "./assets.mjs";
 import { createPostgresUploadIngressBudget } from "../src/postgres-ingress-budget.ts";
 import { createPostgresRateLimiter } from "../src/postgres-rate-limiter.ts";
-import { authenticatePostgresDevice } from "../src/postgres-typed-v12-transport.ts";
-import { registerPostgresTypedV12DayManifest } from "../src/postgres-typed-v12-admission.ts";
+import {
+  abandonPostgresDeviceUploadAuthorization,
+  authenticatePostgresDevice,
+  claimPostgresDeviceUploadAuthorization,
+} from "../src/postgres-typed-v12-transport.ts";
+import {
+  persistPostgresTypedV12StagedChunk,
+  registerPostgresTypedV12DayManifest,
+} from "../src/postgres-typed-v12-admission.ts";
+import { createPostgresDeviceUploadAuthorization } from "../src/postgres-upload-authorization.ts";
+import {
+  decryptSyntheticEnvelope,
+  sha256Hex,
+} from "../src/crypto.ts";
+import { validateTelemetryV12StagedChunk } from "../src/telemetry-v12-repository.ts";
+import { validateTelemetryV12Envelope } from "@app-usagemonitor/telemetry-contract";
+import { assertPostgresTelemetryTransportWriteAllowed } from "../src/postgres-telemetry-format-authority.ts";
+import { TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
 import { hasPostgresDeletionTombstone } from "../src/postgres-ledger-authority.ts";
 import { setTimingSafeEqualImplementation } from "../src/crypto.ts";
 import { createIamPool, createGoogleAccessTokenProvider, closeCloudSqlResources, normalizeIamUser } from "./cloud-sql.mjs";
@@ -335,6 +356,17 @@ async function createRuntime({ databaseOnly = false } = {}) {
       if (new TextEncoder().encode(rateLimitSecret).byteLength < 32) {
         configurationError("POSTGRES_RATE_LIMIT_SECRET_INVALID");
       }
+      const envelopePublicJwk = required("ENVELOPE_PUBLIC_JWK");
+      const envelopePrivateJwk = required("ENVELOPE_PRIVATE_JWK");
+      const bucket = required("GCS_BUCKET_NAME");
+      const accessToken = await createGoogleAccessTokenProvider();
+      const objectStore = createGcsQuarantineObjectStore(
+        bucket,
+        accessToken,
+        undefined,
+        undefined,
+        gcsHistoryProof(),
+      );
       const admissionEnv = {
         ENVIRONMENT: optional("ENVIRONMENT", "synthetic-development"),
         IDENTITY_LINK_SECRET: optional("IDENTITY_LINK_SECRET"),
@@ -372,9 +404,29 @@ async function createRuntime({ databaseOnly = false } = {}) {
           admissionEnv: Object.freeze(admissionEnv),
           assertAdmissionBindings,
           assertAttemptAllowed,
+          assertUploadAuthorizationBindings,
+          assertUploadAuthorizationAllowed,
+          assertPostgresV12UploadAllowed: (pool, device, nowEpoch, { schema }) =>
+            assertPostgresTelemetryTransportWriteAllowed(
+              pool,
+              device,
+              TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+              { nowEpoch, schema },
+            ),
+          createPostgresDeviceUploadAuthorization,
           authenticatePostgresDevice,
           hasPostgresDeletionTombstone,
           registerPostgresTypedV12DayManifest,
+          claimPostgresDeviceUploadAuthorization,
+          abandonPostgresDeviceUploadAuthorization,
+          persistPostgresTypedV12StagedChunk,
+          decryptSyntheticEnvelope,
+          validateTelemetryV12Envelope,
+          validateTelemetryV12StagedChunk,
+          sha256Hex,
+          objectStore,
+          envelopePublicJwk,
+          envelopePrivateJwk,
           readBoundedRequestBody,
           maxRequestBytes: MAX_REQUEST_BYTES,
         }),

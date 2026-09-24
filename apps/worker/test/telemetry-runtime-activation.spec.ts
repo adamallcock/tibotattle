@@ -503,13 +503,27 @@ describe("protected telemetry runtime activation", () => {
   it("refuses a forward migration ledger hash mismatch", async () => {
     await db().prepare(
       "UPDATE d1_storage_migrations SET sha256 = ? WHERE name = ?",
-    ).bind("0".repeat(64), "0008_telemetry_v12.sql").run();
+    ).bind("0".repeat(64), "0010_v12_quarantine_admission.sql").run();
     await expect(activateTelemetryRuntimeAsOwner(db(), settings, ACTOR_IDENTITY_KEY,
       request("usage_v12"), NOW_EPOCH)).rejects.toMatchObject({
       status: 503,
       code: "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE",
     });
     expect(await runtimeRow("usage_v12")).toEqual({ state: "staged", policy_revision: 1 });
+  });
+
+  it("requires the v1.2 quarantine admission trigger before usage activation", async () => {
+    await db().prepare(
+      "DROP TRIGGER telemetry_v12_chunk_quarantine_admission",
+    ).run();
+    await expect(activateTelemetryRuntimeAsOwner(
+      db(), settings, ACTOR_IDENTITY_KEY, request("usage_v12"), NOW_EPOCH,
+    )).rejects.toMatchObject({
+      status: 503,
+      code: "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE",
+    });
+    expect(await runtimeRow("usage_v12")).toEqual({ state: "staged", policy_revision: 1 });
+    expect(await runtimeRow("performance")).toEqual({ state: "staged", policy_revision: 1 });
   });
 
   it("keeps audit details content-free", async () => {

@@ -90,11 +90,22 @@ interface UploadAuthorizationRow {
   accountless_enrollment_device_id: string | null;
 }
 
+interface UploadAbandonmentRow {
+  state: "unused" | "consuming" | "consumed" | "revoked";
+  consumed_contribution_id: string | null;
+}
+
+interface UploadReferenceRow {
+  referenced: boolean;
+}
+
 interface PostgresTypedV12TransportRuntime {
   readonly schema?: PostgresSchemaConfig;
 }
 
 const SHA256_HEX = /^[0-9a-f]{64}$/u;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const PARTICIPANT_ID = /^[A-Za-z0-9._:-]{1,256}$/u;
 const CONSENT_VERSIONS = new Set([
   TELEMETRY_CONSENT_VERSION,
   ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
@@ -453,6 +464,101 @@ export async function claimPostgresDeviceUploadAuthorization(
       });
     }, {
       operation: "device_upload.claim",
+      preserveSafeError: safeError,
+    });
+  } catch (error) {
+    backendError(error);
+  }
+}
+
+export interface PostgresDeviceUploadAbandonmentResult {
+  /** False means consumption or a durable source reference won the race. */
+  readonly abandoned: boolean;
+}
+
+/**
+ * Terminally revoke a claimed device upload after its caller has confirmed
+ * that the external write failed. Callers must pass the receipt returned by
+ * `claimPostgresDeviceUploadAuthorization` and the same authenticated device
+ * principal; raw upload bearer values are neither accepted nor stored here.
+ *
+ * The grant row lock serializes abandonment with chunk persistence. A source
+ * reference check plus a guarded state transition protects already committed
+ * contributions and makes duplicate abandonment harmless.
+ */
+export async function abandonPostgresDeviceUploadAuthorization(
+  pool: PostgresPool,
+  claim: DeviceUploadClaim,
+  principal: DevicePrincipal,
+  options: PostgresDeviceUploadClaimOptions = {},
+): Promise<PostgresDeviceUploadAbandonmentResult> {
+  if (claim.authorizationKind !== "device"
+      || !UUID_V4.test(claim.authorizationId)
+      || !PARTICIPANT_ID.test(claim.participantId)
+      || claim.participantId !== principal.participantId
+      || !UUID_V4.test(principal.deviceId)) {
+    throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+  }
+  const now = epochIso(options.nowEpoch ?? Date.now());
+  const schema = schemaName(options);
+  const authorizationId = claim.authorizationId;
+  const participantId = principal.participantId;
+  const deviceId = principal.deviceId;
+  const referencePredicate = `
+    EXISTS (
+      SELECT 1 FROM ${table(schema, "telemetry_contributions")}
+       WHERE device_upload_authorization_id = $1
+    ) OR EXISTS (
+      SELECT 1 FROM ${table(schema, "telemetry_v1_chunks")}
+       WHERE device_upload_authorization_id = $1
+    ) OR EXISTS (
+      SELECT 1 FROM ${table(schema, "telemetry_v11_chunks")}
+       WHERE device_upload_authorization_id = $1
+    ) OR EXISTS (
+      SELECT 1 FROM ${table(schema, "telemetry_v12_chunks")}
+       WHERE device_upload_authorization_id = $1
+    )`;
+
+  try {
+    return await withPostgresMutation(pool, async (client) => {
+      const result = await client.query<UploadAbandonmentRow>(
+        `SELECT state, consumed_contribution_id
+           FROM ${table(schema, "device_upload_authorizations")}
+          WHERE id = $1 AND participant_id = $2 AND issued_by_device_id = $3
+          FOR UPDATE`,
+        [authorizationId, participantId, deviceId],
+      );
+      const grant = result.rows[0];
+      if (!grant) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+      if (grant.state === "consumed" || grant.consumed_contribution_id !== null) {
+        return Object.freeze({ abandoned: false });
+      }
+
+      const references = await client.query<UploadReferenceRow>(
+        `SELECT ${referencePredicate} AS referenced`,
+        [authorizationId],
+      );
+      const referenced = references.rows[0]?.referenced;
+      if (typeof referenced !== "boolean") {
+        throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+      }
+      if (referenced) return Object.freeze({ abandoned: false });
+      if (grant.state === "revoked") return Object.freeze({ abandoned: true });
+      if (grant.state !== "consuming") return Object.freeze({ abandoned: false });
+
+      const updated = await client.query<{ id: string }>(
+        `UPDATE ${table(schema, "device_upload_authorizations")}
+            SET state = 'revoked', revoked_at = COALESCE(revoked_at, $4),
+                consume_lease_expires_at = NULL
+          WHERE id = $1 AND participant_id = $2 AND issued_by_device_id = $3
+            AND state = 'consuming' AND consumed_contribution_id IS NULL
+            AND NOT (${referencePredicate})
+          RETURNING id`,
+        [authorizationId, participantId, deviceId, now],
+      );
+      return Object.freeze({ abandoned: updated.rowCount === 1 });
+    }, {
+      operation: "device_upload.abandon",
       preserveSafeError: safeError,
     });
   } catch (error) {

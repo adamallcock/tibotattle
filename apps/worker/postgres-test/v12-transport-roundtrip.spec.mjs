@@ -277,9 +277,10 @@ test("PostgreSQL v1.2 authenticates a device and atomically claims a bounded one
     });
     const transport = await vite.ssrLoadModule("/src/postgres-typed-v12-transport.ts");
     const admission = await vite.ssrLoadModule("/src/postgres-typed-v12-admission.ts");
+    const formatAuthority = await vite.ssrLoadModule("/src/postgres-telemetry-format-authority.ts");
     const crypto = await vite.ssrLoadModule("/src/crypto.ts");
     const constants = await vite.ssrLoadModule("/src/constants.ts");
-    const modules = { ...transport, ...admission, ...crypto, ...constants };
+    const modules = { ...transport, ...admission, ...formatAuthority, ...crypto, ...constants };
 
     const nowEpoch = Date.now();
     const device = await seedDevice({ pool, schema, nowEpoch, modules });
@@ -302,6 +303,29 @@ test("PostgreSQL v1.2 authenticates a device and atomically claims a bounded one
     await assert.rejects(
       modules.authenticatePostgresDevice(pool, `Device um_device_${device.principal.deviceId}.${randomBytes(32).toString("base64url")}`, { ...options, nowEpoch }),
       { code: "DEVICE_AUTH_INVALID" },
+    );
+    await modules.assertPostgresTelemetryTransportWriteAllowed(
+      pool, device.principal, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION, { ...options, nowEpoch },
+    );
+    await pool.query(
+      `UPDATE ${q(schema, "participants")} SET consent_version=$2 WHERE id=$1`,
+      [device.principal.participantId, modules.ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION],
+    );
+    const stillAcceptedV12Capability = await pool.query(
+      `SELECT state FROM ${q(schema, "telemetry_v12_device_capabilities")}
+        WHERE participant_id=$1 AND device_id=$2`,
+      [device.principal.participantId, device.principal.deviceId],
+    );
+    assert.equal(stillAcceptedV12Capability.rows[0]?.state, "accepted");
+    await assert.rejects(
+      modules.assertPostgresTelemetryTransportWriteAllowed(
+        pool, device.principal, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION, { ...options, nowEpoch },
+      ),
+      { code: "TELEMETRY_REQUIRED" },
+    );
+    await pool.query(
+      `UPDATE ${q(schema, "participants")} SET consent_version=$2 WHERE id=$1`,
+      [device.principal.participantId, modules.TELEMETRY_CONSENT_VERSION],
     );
 
     const consent = telemetryV12RequiredConsent();
@@ -333,6 +357,37 @@ test("PostgreSQL v1.2 authenticates a device and atomically claims a bounded one
       pool, device.principal, manifest, nowEpoch, options,
     );
     assert.equal(candidate.state, "staged");
+
+    const consentMismatchGrant = await seedUploadGrant({ pool, schema, device, nowEpoch, modules });
+    const consentMismatchClaim = await modules.claimPostgresDeviceUploadAuthorization(
+      pool, consentMismatchGrant.authorization, {
+        envelopeDigest: consentMismatchGrant.envelopeDigest,
+        bodyBytes: consentMismatchGrant.bodyBytes,
+        contentType: "application/json",
+      }, { ...options, nowEpoch },
+    );
+    await pool.query(
+      `UPDATE ${q(schema, "participants")} SET consent_version=$2 WHERE id=$1`,
+      [device.principal.participantId, modules.ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION],
+    );
+    await assert.rejects(
+      modules.persistPostgresTypedV12StagedChunk(pool, device.principal, chunk, {
+        chunkRowId: `chunk:${randomUUID()}`,
+        r2Key: `synthetic/pg-v12-consent-mismatch-${randomBytes(8).toString("hex")}`,
+        envelopeDigest: consentMismatchGrant.envelopeDigest,
+        deviceUploadAuthorizationId: consentMismatchClaim.authorizationId,
+      }, nowEpoch, options),
+      { code: "TELEMETRY_REQUIRED" },
+    );
+    const unconsumedMismatchGrant = await pool.query(
+      `SELECT state FROM ${q(schema, "device_upload_authorizations")} WHERE id=$1`,
+      [consentMismatchGrant.authorizationId],
+    );
+    assert.equal(unconsumedMismatchGrant.rows[0]?.state, "consuming");
+    await pool.query(
+      `UPDATE ${q(schema, "participants")} SET consent_version=$2 WHERE id=$1`,
+      [device.principal.participantId, modules.TELEMETRY_CONSENT_VERSION],
+    );
 
     const expiredGrant = await seedUploadGrant({
       pool, schema, device, nowEpoch, modules,
@@ -446,6 +501,136 @@ test("PostgreSQL v1.2 authenticates a device and atomically claims a bounded one
       modules.claimPostgresDeviceUploadAuthorization(pool, grant.authorization, request, { ...options, nowEpoch }),
       { code: "UPLOAD_AUTH_INVALID" },
     );
+    assert.deepEqual(
+      await modules.abandonPostgresDeviceUploadAuthorization(pool, claim, authenticated, { ...options, nowEpoch }),
+      { abandoned: false },
+    );
+
+    const abandonedGrant = await seedUploadGrant({ pool, schema, device, nowEpoch, modules });
+    const abandonedRequest = {
+      envelopeDigest: abandonedGrant.envelopeDigest,
+      bodyBytes: abandonedGrant.bodyBytes,
+      contentType: "application/json",
+    };
+    const abandonedClaim = await modules.claimPostgresDeviceUploadAuthorization(
+      pool, abandonedGrant.authorization, abandonedRequest, { ...options, nowEpoch },
+    );
+    assert.deepEqual(
+      await modules.abandonPostgresDeviceUploadAuthorization(
+        pool, abandonedClaim, authenticated, { ...options, nowEpoch },
+      ),
+      { abandoned: true },
+    );
+    assert.deepEqual(
+      await modules.abandonPostgresDeviceUploadAuthorization(
+        pool, abandonedClaim, authenticated, { ...options, nowEpoch },
+      ),
+      { abandoned: true },
+    );
+    const abandonedState = await pool.query(
+      `SELECT state, consume_lease_expires_at
+         FROM ${q(schema, "device_upload_authorizations")} WHERE id=$1`,
+      [abandonedGrant.authorizationId],
+    );
+    assert.deepEqual(abandonedState.rows[0], {
+      state: "revoked",
+      consume_lease_expires_at: null,
+    });
+    await assert.rejects(
+      modules.claimPostgresDeviceUploadAuthorization(
+        pool, abandonedGrant.authorization, abandonedRequest, { ...options, nowEpoch },
+      ),
+      { code: "UPLOAD_AUTH_INVALID" },
+    );
+
+    const raceDay = "2026-09-25";
+    const raceRecords = [usageRecord(`event:v2:${"b".repeat(64)}`, `${raceDay}T12:15:00.000Z`)];
+    const raceChunkId = `usage:${raceDay}:0`;
+    const raceParserVersion = "synthetic-pg-v12-abandon-race";
+    const raceChunkDigest = await modules.sha256Hex(canonicalTelemetryV12Json(raceRecords));
+    const raceManifest = {
+      schemaVersion: "telemetry-day-manifest-v1.2",
+      day: raceDay,
+      parserVersion: raceParserVersion,
+      consent,
+      chunks: [{ chunkId: raceChunkId, chunkDigest: raceChunkDigest, recordCount: 1 }],
+      excluded: { quota: 0, session: 0, usage: 0 },
+      manifestDigest: "0".repeat(64),
+    };
+    raceManifest.manifestDigest = await modules.sha256Hex(
+      telemetryV12DayManifestDigestInput(raceManifest),
+    );
+    const raceChunk = {
+      schemaVersion: "telemetry-contribution-v1.2",
+      manifestDigest: raceManifest.manifestDigest,
+      chunkId: raceChunkId,
+      chunkRevision: 1,
+      chunkDigest: raceChunkDigest,
+      parserVersion: raceParserVersion,
+      consent,
+      records: raceRecords,
+    };
+    const raceCandidate = await modules.registerPostgresTypedV12DayManifest(
+      pool, device.principal, raceManifest, nowEpoch, options,
+    );
+    assert.equal(raceCandidate.state, "staged");
+    const raceGrant = await seedUploadGrant({ pool, schema, device, nowEpoch, modules });
+    const raceClaim = await modules.claimPostgresDeviceUploadAuthorization(
+      pool, raceGrant.authorization, {
+        envelopeDigest: raceGrant.envelopeDigest,
+        bodyBytes: raceGrant.bodyBytes,
+        contentType: "application/json",
+      }, { ...options, nowEpoch },
+    );
+    const raceChunkRowId = `chunk:${randomUUID()}`;
+    const raceR2Key = `synthetic/pg-v12-abandon-race-${randomBytes(8).toString("hex")}`;
+    await pool.query(
+      `INSERT INTO ${q(schema, "pending_objects")} (contribution_id, object_key, object_kind)
+       VALUES ($1,$2,'telemetry_v12')`,
+      [raceChunkRowId, raceR2Key],
+    );
+    let releaseRace;
+    const raceStart = new Promise((resolve) => { releaseRace = resolve; });
+    const abandonment = raceStart.then(() => modules.abandonPostgresDeviceUploadAuthorization(
+      pool, raceClaim, authenticated, { ...options, nowEpoch },
+    ));
+    const persistence = raceStart.then(() => modules.persistPostgresTypedV12StagedChunk(
+      pool, device.principal, raceChunk, {
+        chunkRowId: raceChunkRowId,
+        r2Key: raceR2Key,
+        envelopeDigest: raceGrant.envelopeDigest,
+        deviceUploadAuthorizationId: raceClaim.authorizationId,
+      }, nowEpoch, options,
+    ));
+    releaseRace();
+    const raceOutcomes = await Promise.allSettled([abandonment, persistence]);
+    assert.equal(raceOutcomes[0].status, "fulfilled");
+    const raceAbandonment = raceOutcomes[0].value;
+    const racePersistence = raceOutcomes[1];
+    const racedGrantState = await pool.query(
+      `SELECT upload.state, upload.consumed_contribution_id,
+              EXISTS (SELECT 1 FROM ${q(schema, "telemetry_v12_chunks")} chunk
+                       WHERE chunk.device_upload_authorization_id = upload.id) AS referenced
+         FROM ${q(schema, "device_upload_authorizations")} upload WHERE upload.id=$1`,
+      [raceGrant.authorizationId],
+    );
+    if (raceAbandonment.abandoned) {
+      assert.equal(racePersistence.status, "rejected");
+      assert.equal(raceOutcomes[1].reason.code, "TELEMETRY_MANIFEST_CONFLICT");
+      assert.deepEqual(racedGrantState.rows[0], {
+        state: "revoked",
+        consumed_contribution_id: null,
+        referenced: false,
+      });
+    } else {
+      assert.equal(racePersistence.status, "fulfilled");
+      assert.equal(racePersistence.value.replay, false);
+      assert.deepEqual(racedGrantState.rows[0], {
+        state: "consumed",
+        consumed_contribution_id: raceChunkRowId,
+        referenced: true,
+      });
+    }
 
     const revokedGrant = await seedUploadGrant({ pool, schema, device, nowEpoch, modules });
     await pool.query(
@@ -492,6 +677,20 @@ test("PostgreSQL v1.2 authenticates a device and atomically claims a bounded one
       }, { ...options, nowEpoch },
     );
     assert.equal(accountlessClaim.authorizationId, accountlessGrant.authorizationId);
+    await pool.query(
+      `UPDATE ${q(schema, "participants")} SET consent_version=$2 WHERE id=$1`,
+      [accountless.principal.participantId, modules.TELEMETRY_CONSENT_VERSION],
+    );
+    await assert.rejects(
+      modules.assertPostgresTelemetryTransportWriteAllowed(
+        pool, accountless.principal, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION, { ...options, nowEpoch },
+      ),
+      { code: "TELEMETRY_REQUIRED" },
+    );
+    await pool.query(
+      `UPDATE ${q(schema, "participants")} SET consent_version=NULL WHERE id=$1`,
+      [accountless.principal.participantId],
+    );
 
     const revokedSharedDevice = await seedAccountlessDevice({ pool, schema, nowEpoch, modules });
     const revokedSharedGrant = await seedUploadGrant({

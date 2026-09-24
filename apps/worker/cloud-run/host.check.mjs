@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, webcrypto } from "node:crypto";
 import { lstat, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -9,11 +9,13 @@ import test from "node:test";
 import { build } from "esbuild";
 import pg from "pg";
 import {
+  canonicalTelemetryV12Json,
   TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
   TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
   TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
   telemetryV12DayManifestDigestInput,
   telemetryV12RequiredConsent,
+  validateTelemetryV12Envelope,
 } from "@app-usagemonitor/telemetry-contract";
 import { createServer } from "vite";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
@@ -55,6 +57,73 @@ function deviceSecretHash(deviceId, secret) {
     .update(`app-usagemonitor/device/v1\0${deviceId}\0`)
     .update(Buffer.from(secret, "base64url"))
     .digest();
+}
+
+function sha256Hex(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function hostV12UsageRecord(eventId, eventTime) {
+  return {
+    schemaVersion: "usage-event-v1.2",
+    eventId,
+    eventTime,
+    sessionUuid: "0a49f9db-8b2d-4c3e-9a6f-2f4f1c7d9e0b",
+    provider: "openai_codex",
+    modelId: "gpt-5.6-sol",
+    speedMode: "standard",
+    apiServiceTier: "default",
+    surface: "local_interactive_unclassified",
+    billingSurface: "chatgpt_subscription",
+    reasoningEffort: "high",
+    agentScope: "root",
+    outcome: "completed",
+    totalInputContextTokens: 1000,
+    components: {
+      inputUncachedTokens: 100,
+      inputCacheReadTokens: 900,
+      inputCacheWriteTokens: 0,
+      outputTextTokens: 50,
+      outputReasoningTokens: 25,
+      outputCombinedTokens: 75,
+    },
+    accountPlanAttribution: {
+      accountBasis: "unavailable",
+      accountTrackId: null,
+      planBasis: "same_source_occurrence",
+      planType: "pro",
+      planEraId: null,
+    },
+    boundaryFlags: null,
+    tieOrder: null,
+    cacheWriteTtl: null,
+  };
+}
+
+async function encryptHostV12(value, publicJwk, keyId) {
+  const rsaJwk = { ...publicJwk };
+  delete rsaJwk.kid;
+  const rsa = await webcrypto.subtle.importKey(
+    "jwk", rsaJwk, { name: "RSA-OAEP", hash: "SHA-256" }, false, ["encrypt"],
+  );
+  const aes = await webcrypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
+  const rawKey = await webcrypto.subtle.exportKey("raw", aes);
+  const iv = webcrypto.getRandomValues(new Uint8Array(12));
+  const wrappedKey = await webcrypto.subtle.encrypt({ name: "RSA-OAEP" }, rsa, rawKey);
+  const ciphertext = await webcrypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    aes,
+    new TextEncoder().encode(canonicalTelemetryV12Json(value)),
+  );
+  new Uint8Array(rawKey).fill(0);
+  return {
+    schemaVersion: "telemetry-envelope-v1.2",
+    synthetic: false,
+    keyId,
+    wrappedKey: Buffer.from(wrappedKey).toString("base64url"),
+    iv: Buffer.from(iv).toString("base64url"),
+    ciphertext: Buffer.from(ciphertext).toString("base64url"),
+  };
 }
 
 function assertApiError(response, status, code) {
@@ -491,7 +560,8 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       server: { middlewareMode: true },
       appType: "custom",
     });
-    const [transport, v12Admission, ledgerAuthority, admission, rateLimit, bodyReader, constants]
+    const [transport, v12Admission, ledgerAuthority, admission, rateLimit, bodyReader, constants,
+      cryptoModule, telemetryV12Repository]
       = await Promise.all([
         vite.ssrLoadModule("/src/postgres-typed-v12-transport.ts"),
         vite.ssrLoadModule("/src/postgres-typed-v12-admission.ts"),
@@ -500,7 +570,60 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
         vite.ssrLoadModule("/src/postgres-rate-limiter.ts"),
         vite.ssrLoadModule("/src/bounded-body.ts"),
         vite.ssrLoadModule("/src/constants.ts"),
+        vite.ssrLoadModule("/src/crypto.ts"),
+        vite.ssrLoadModule("/src/telemetry-v12-repository.ts"),
       ]);
+    const [uploadAuthorization, formatAuthority] = await Promise.all([
+      vite.ssrLoadModule("/src/postgres-upload-authorization.ts"),
+      vite.ssrLoadModule("/src/postgres-telemetry-format-authority.ts"),
+    ]);
+    const keyPair = await webcrypto.subtle.generateKey({
+      name: "RSA-OAEP", modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256",
+    }, true, ["encrypt", "decrypt"]);
+    const envelopePublicJwk = {
+      ...await webcrypto.subtle.exportKey("jwk", keyPair.publicKey),
+      kid: "key:gcp-host-v12",
+    };
+    const envelopePrivateJwk = {
+      ...await webcrypto.subtle.exportKey("jwk", keyPair.privateKey),
+      kid: "key:gcp-host-v12",
+    };
+    const storedObjects = new Map();
+    let objectPutCount = 0;
+    let objectDeleteCount = 0;
+    let failNextObjectPutAfterStore = false;
+    let twoPutBarrier = null;
+    let lastPut = null;
+    const objectPuts = [];
+    const objectStore = {
+      async put(key, value, options) {
+        objectPutCount += 1;
+        assert.equal(options?.contentType, "application/json");
+        const bytes = Uint8Array.from(value);
+        lastPut = { key, bytes, metadata: options?.customMetadata };
+        objectPuts.push(lastPut);
+        storedObjects.set(key, lastPut);
+        const barrier = twoPutBarrier;
+        if (barrier) {
+          barrier.waiting += 1;
+          if (barrier.waiting === 2) {
+            twoPutBarrier = null;
+            barrier.release();
+          }
+          await barrier.promise;
+        }
+        if (failNextObjectPutAfterStore) {
+          failNextObjectPutAfterStore = false;
+          throw new Error("synthetic provider acknowledgement loss");
+        }
+      },
+      async delete(key) {
+        objectDeleteCount += 1;
+        storedObjects.delete(key);
+        if (lastPut?.key === key) lastPut = null;
+      },
+    };
 
     const now = Date.now();
     const nowIso = new Date(now).toISOString();
@@ -577,6 +700,8 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       ["RECOVERY_RATE_LIMIT", "RECOVERY", 20],
       ["CLIENT_ATTEMPT_RATE_LIMIT", "CLIENT_ATTEMPT", 1_000],
       ["PUBLIC_READ_RATE_LIMIT", "PUBLIC_READ", 1_000],
+      ["UPLOAD_AUTHORIZATION_RATE_LIMIT", "UPLOAD_AUTHORIZATION", 1_000],
+      ["UPLOAD_PRINCIPAL_RATE_LIMIT", "UPLOAD_PRINCIPAL", 1_000],
     ]) {
       admissionEnv[binding] = rateLimit.createPostgresRateLimiter(primaryPool, {
         primarySchema,
@@ -594,7 +719,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
       privateOrigin: "http://127.0.0.1:43817",
     });
-    const manifestDispatch = createPostgresTestV12DayManifestDispatch({
+    const manifestDispatchOptions = {
       primaryPool,
       ledgerPool,
       schemaOptions,
@@ -604,12 +729,31 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       admissionEnv: Object.freeze(admissionEnv),
       assertAdmissionBindings: admission.assertAdmissionBindings,
       assertAttemptAllowed: admission.assertAttemptAllowed,
+      assertUploadAuthorizationBindings: admission.assertUploadAuthorizationBindings,
+      assertUploadAuthorizationAllowed: admission.assertUploadAuthorizationAllowed,
       authenticatePostgresDevice: transport.authenticatePostgresDevice,
       hasPostgresDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
+      assertPostgresV12UploadAllowed: (pool, principal, nowEpoch, options) =>
+        formatAuthority.assertPostgresTelemetryTransportWriteAllowed(
+          pool, principal, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+          { ...options, nowEpoch },
+        ),
+      createPostgresDeviceUploadAuthorization: uploadAuthorization.createPostgresDeviceUploadAuthorization,
       registerPostgresTypedV12DayManifest: v12Admission.registerPostgresTypedV12DayManifest,
+      claimPostgresDeviceUploadAuthorization: transport.claimPostgresDeviceUploadAuthorization,
+      abandonPostgresDeviceUploadAuthorization: transport.abandonPostgresDeviceUploadAuthorization,
+      persistPostgresTypedV12StagedChunk: v12Admission.persistPostgresTypedV12StagedChunk,
+      decryptSyntheticEnvelope: cryptoModule.decryptSyntheticEnvelope,
+      validateTelemetryV12Envelope,
+      validateTelemetryV12StagedChunk: telemetryV12Repository.validateTelemetryV12StagedChunk,
+      sha256Hex: cryptoModule.sha256Hex,
+      objectStore,
+      envelopePublicJwk: JSON.stringify(envelopePublicJwk),
+      envelopePrivateJwk: JSON.stringify(envelopePrivateJwk),
       readBoundedRequestBody: bodyReader.readBoundedRequestBody,
       maxRequestBytes: constants.MAX_REQUEST_BYTES,
-    });
+    };
+    const manifestDispatch = createPostgresTestV12DayManifestDispatch(manifestDispatchOptions);
     let d1Touched = 0;
     let workerCalls = 0;
     const runtime = {
@@ -625,6 +769,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     };
     const dispatch = (request) => dispatchCloudRunHostRequest(request, runtime, workerHandler);
     const manifestUrl = "http://127.0.0.1:43817/api/v1/device/telemetry/v1.2/day-manifests";
+    const uploadAuthorizationUrl = "http://127.0.0.1:43817/api/v1/device/upload-authorizations";
     const request = ({ body = "{}", headers = {}, method = "POST", url = manifestUrl } = {}) => new Request(url, {
       method,
       headers: { authorization: auth, "content-type": "application/json", ...headers },
@@ -641,7 +786,10 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       assert.equal((await response.json()).error, "POSTGRES_TEST_ROUTE_UNSUPPORTED");
     }
     const health = await dispatch(request({ url: "http://127.0.0.1:43817/api/health", method: "GET" }));
-    assert.equal(health.status, 200);
+    if (health.status !== 200) {
+      const status = await health.clone().json();
+      throw new Error(`POSTGRES_TEST_HEALTH_NOT_READY:${status?.checks?.primaryMigrationReceipt?.status ?? "unknown"}:${status?.checks?.ledgerMigrationReceipt?.status ?? "unknown"}`);
+    }
     assert.equal((await health.json()).workerApplicationReady, false);
 
     await assertApiError(await dispatch(request({ headers: { cookie: "session=not-used" } })), 401, "DEVICE_AUTH_INVALID");
@@ -650,6 +798,9 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     } })), 401, "DEVICE_AUTH_INVALID");
     await assertApiError(await dispatch(request({ headers: { "content-type": "text/plain" } })), 415, "CONTENT_TYPE_INVALID");
     await assertApiError(await dispatch(request({ body: " ".repeat(constants.MAX_REQUEST_BYTES + 1) })), 413, "BODY_TOO_LARGE");
+    const chunkUploadUrl = "http://127.0.0.1:43817/api/v1/contributions";
+    await assertApiError(await dispatch(request({ url: chunkUploadUrl, body: " ".repeat(constants.MAX_REQUEST_BYTES + 1) })), 413, "BODY_TOO_LARGE");
+    await assertApiError(await dispatch(request({ url: chunkUploadUrl, headers: { cookie: "session=not-used" } })), 401, "DEVICE_AUTH_INVALID");
     await assertApiError(await dispatch(request({ body: "{}" })), 400, "TELEMETRY_MANIFEST_INVALID");
 
     await primaryPool.query(
@@ -696,6 +847,357 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     const replayed = await replay.json();
     assert.equal(replayed.manifestId, accepted.manifestId);
     assert.deepEqual(replayed.stagedChunks, []);
+
+    const uploadRequestBody = {
+      envelopeDigest: "b".repeat(64),
+      contentLengthBytes: 257,
+      contentType: "application/json",
+      telemetrySchemaVersion: TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+    };
+    const uploadRequest = ({ body = JSON.stringify(uploadRequestBody), headers = {}, method = "POST", url = uploadAuthorizationUrl } = {}) => request({
+      body,
+      headers,
+      method,
+      url,
+    });
+
+    await primaryPool.query(
+      `UPDATE ${primaryTable("collection_controls")}
+          SET revision=5, control_state='degraded', upload_registration_enabled=false, updated_at=$1
+        WHERE singleton=1`,
+      [new Date().toISOString()],
+    );
+    await assertApiError(
+      await dispatch(uploadRequest()), 503, "UPLOAD_REGISTRATION_DISABLED",
+    );
+    await primaryPool.query(
+      `UPDATE ${primaryTable("collection_controls")}
+          SET revision=6, control_state='operational', upload_registration_enabled=true, updated_at=$1
+        WHERE singleton=1`,
+      [new Date().toISOString()],
+    );
+
+    await assertApiError(await dispatch(uploadRequest({ body: JSON.stringify({
+      ...uploadRequestBody,
+      telemetrySchemaVersion: "telemetry-contribution-v1.1",
+    }) })), 400, "BODY_INVALID");
+
+    const v12Revocation = await primaryPool.query(
+      `UPDATE ${primaryTable("telemetry_v12_device_capabilities")}
+          SET state='revoked' WHERE participant_id=$1 AND device_id=$2`,
+      [participantId, deviceId],
+    );
+    assert.equal(v12Revocation.rowCount, 1);
+    await assertApiError(
+      await dispatch(uploadRequest()), 403, "TELEMETRY_TRANSPORT_BLOCKED",
+    );
+    const v12Reacceptance = await primaryPool.query(
+      `UPDATE ${primaryTable("telemetry_v12_device_capabilities")}
+          SET state='accepted' WHERE participant_id=$1 AND device_id=$2`,
+      [participantId, deviceId],
+    );
+    assert.equal(v12Reacceptance.rowCount, 1);
+
+    const issued = await dispatch(uploadRequest());
+    if (issued.status !== 201) {
+      const failure = await issued.clone().json();
+      throw new Error(`UPLOAD_AUTHORIZATION_ISSUE_FAILED:${failure?.error?.code ?? "UNKNOWN"}`);
+    }
+    const issuedValue = await issued.json();
+    assert.equal(typeof issuedValue.expiresAt, "string");
+    if (typeof issuedValue.uploadAuthorization !== "string") {
+      throw new Error("UPLOAD_AUTHORIZATION_RESPONSE_INVALID");
+    }
+    const uploadClaim = {
+      envelopeDigest: uploadRequestBody.envelopeDigest,
+      bodyBytes: uploadRequestBody.contentLengthBytes,
+      contentType: uploadRequestBody.contentType,
+    };
+    const claimed = await transport.claimPostgresDeviceUploadAuthorization(
+      primaryPool,
+      `Upload ${issuedValue.uploadAuthorization}`,
+      uploadClaim,
+      { schema: schemaOptions },
+    );
+    assert.equal(claimed.authorizationKind, "device");
+    let replayCode;
+    try {
+      await transport.claimPostgresDeviceUploadAuthorization(
+        primaryPool,
+        `Upload ${issuedValue.uploadAuthorization}`,
+        uploadClaim,
+        { schema: schemaOptions },
+      );
+    } catch (error) {
+      replayCode = error?.code;
+    }
+    assert.equal(replayCode, "UPLOAD_AUTH_INVALID");
+
+    const revoked = await dispatch(uploadRequest({ body: JSON.stringify({
+      ...uploadRequestBody,
+      envelopeDigest: "c".repeat(64),
+    }) }));
+    assert.equal(revoked.status, 201);
+    const revokedValue = await revoked.json();
+    const revokedId = revokedValue.uploadAuthorization
+      .slice("um_device_upload_".length).split(".", 1)[0];
+    if (!/^[0-9a-f-]{36}$/u.test(revokedId)) {
+      throw new Error("UPLOAD_AUTHORIZATION_RESPONSE_INVALID");
+    }
+    const revokedResult = await primaryPool.query(
+      `UPDATE ${primaryTable("device_upload_authorizations")}
+          SET state='revoked', revoked_at=$2 WHERE id=$1 AND state='unused'`,
+      [revokedId, new Date().toISOString()],
+    );
+    assert.equal(revokedResult.rowCount, 1);
+    let revokedClaimCode;
+    try {
+      await transport.claimPostgresDeviceUploadAuthorization(
+        primaryPool,
+        `Upload ${revokedValue.uploadAuthorization}`,
+        { ...uploadClaim, envelopeDigest: "c".repeat(64) },
+        { schema: schemaOptions },
+      );
+    } catch (error) {
+      revokedClaimCode = error?.code;
+    }
+    assert.equal(revokedClaimCode, "UPLOAD_AUTH_INVALID");
+
+    const uploadDay = new Date().toISOString().slice(0, 10);
+    const uploadParserVersion = "synthetic-cloud-run-v12-host-check";
+    const uploadConsent = telemetryV12RequiredConsent();
+    const makeChunk = async (seq, fill, minute) => {
+      const record = hostV12UsageRecord(
+        `event:v2:${fill.repeat(64)}`,
+        `${uploadDay}T12:${String(minute).padStart(2, "0")}:00.000Z`,
+      );
+      const records = [record];
+      return {
+        schemaVersion: TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+        manifestDigest: "0".repeat(64),
+        chunkId: `usage:${uploadDay}:${seq}`,
+        chunkRevision: 1,
+        chunkDigest: sha256Hex(Buffer.from(canonicalTelemetryV12Json(records))),
+        parserVersion: uploadParserVersion,
+        consent: uploadConsent,
+        records,
+      };
+    };
+    const uploadChunks = [
+      await makeChunk(0, "d", 10),
+      await makeChunk(1, "e", 11),
+      await makeChunk(2, "f", 12),
+      await makeChunk(3, "1", 13),
+    ];
+    const uploadManifest = {
+      schemaVersion: "telemetry-day-manifest-v1.2",
+      day: uploadDay,
+      parserVersion: uploadParserVersion,
+      consent: uploadConsent,
+      chunks: uploadChunks.map((chunk) => ({
+        chunkId: chunk.chunkId,
+        chunkDigest: chunk.chunkDigest,
+        recordCount: chunk.records.length,
+      })),
+      excluded: { quota: 0, session: 0, usage: 0 },
+      manifestDigest: "0".repeat(64),
+    };
+    uploadManifest.manifestDigest = sha256Hex(Buffer.from(
+      telemetryV12DayManifestDigestInput(uploadManifest),
+    ));
+    for (const chunk of uploadChunks) chunk.manifestDigest = uploadManifest.manifestDigest;
+    const manifestResponse = await dispatch(request({ body: JSON.stringify(uploadManifest) }));
+    assert.equal(manifestResponse.status, 201);
+    const uploadManifestReceipt = await manifestResponse.json();
+    assert.equal(uploadManifestReceipt.expectedChunks, uploadChunks.length);
+
+    const uploadChunk = async (chunk) => {
+      const envelope = await encryptHostV12(chunk, envelopePublicJwk, envelopePublicJwk.kid);
+      const raw = JSON.stringify(envelope);
+      const bytes = Buffer.from(raw);
+      const envelopeDigest = sha256Hex(bytes);
+      const authorizationResponse = await dispatch(uploadRequest({ body: JSON.stringify({
+        envelopeDigest,
+        contentLengthBytes: bytes.byteLength,
+        contentType: "application/json",
+        telemetrySchemaVersion: TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+      }) }));
+      if (authorizationResponse.status !== 201) {
+        const failure = await authorizationResponse.clone().json();
+        throw new Error(`CHUNK_AUTHORIZATION_ISSUE_FAILED:${failure?.error?.code ?? "UNKNOWN"}`);
+      }
+      const authorization = await authorizationResponse.json();
+      const authorizationId = authorization.uploadAuthorization
+        .slice("um_device_upload_".length).split(".", 1)[0];
+      const response = await dispatch(new Request(chunkUploadUrl, {
+        method: "POST",
+        headers: {
+          authorization: `Upload ${authorization.uploadAuthorization}`,
+          "content-type": "application/json; charset=utf-8",
+        },
+        body: raw,
+      }));
+      return { authorizationId, bytes, response };
+    };
+
+    const initialPutCount = objectPutCount;
+    const firstUpload = await uploadChunk(uploadChunks[0]);
+    assert.equal(firstUpload.response.status, 202);
+    const firstReceipt = await firstUpload.response.json();
+    assert.equal(firstReceipt.schemaVersion, "telemetry-chunk-receipt-v1.2");
+    assert.equal(firstReceipt.chunkId, uploadChunks[0].chunkId);
+    assert.equal(firstReceipt.replayed, false);
+    assert.equal(objectPutCount, initialPutCount + 1);
+    assert.equal(Buffer.from(storedObjects.get(lastPut.key)?.bytes ?? []).equals(firstUpload.bytes), true);
+    const firstChunkRows = await primaryPool.query(
+      `SELECT id, manifest_id, r2_key, device_upload_authorization_id
+         FROM ${primaryTable("telemetry_v12_chunks")} WHERE id=$1`,
+      [firstReceipt.contributionId],
+    );
+    assert.equal(firstChunkRows.rowCount, 1);
+    assert.equal(firstChunkRows.rows[0].manifest_id, uploadManifestReceipt.manifestId);
+    const firstJournal = await primaryPool.query(
+      `SELECT object_kind, reconciliation_state FROM ${primaryTable("pending_objects")}
+        WHERE contribution_id=$1 AND object_key=$2`,
+      [firstReceipt.contributionId, firstChunkRows.rows[0].r2_key],
+    );
+    assert.deepEqual(firstJournal.rows[0], {
+      object_kind: "telemetry_v12", reconciliation_state: "registered",
+    });
+    const firstGrant = await primaryPool.query(
+      `SELECT state FROM ${primaryTable("device_upload_authorizations")} WHERE id=$1`,
+      [firstUpload.authorizationId],
+    );
+    assert.equal(firstGrant.rows[0]?.state, "consumed");
+
+    const putsBeforeReplay = objectPutCount;
+    const replayUpload = await uploadChunk(uploadChunks[0]);
+    assert.equal(replayUpload.response.status, 202);
+    const replayReceipt = await replayUpload.response.json();
+    assert.equal(replayReceipt.replayed, true);
+    assert.equal(replayReceipt.contributionId, firstReceipt.contributionId);
+    assert.equal(objectPutCount, putsBeforeReplay);
+    const replayGrant = await primaryPool.query(
+      `SELECT state FROM ${primaryTable("device_upload_authorizations")} WHERE id=$1`,
+      [replayUpload.authorizationId],
+    );
+    assert.equal(replayGrant.rows[0]?.state, "revoked");
+
+    const conflictChunk = await makeChunk(0, "9", 13);
+    conflictChunk.manifestDigest = uploadManifest.manifestDigest;
+    const putsBeforeConflict = objectPutCount;
+    const conflictingUpload = await uploadChunk(conflictChunk);
+    await assertApiError(conflictingUpload.response, 409, "TELEMETRY_MANIFEST_CONFLICT");
+    assert.equal(objectPutCount, putsBeforeConflict);
+    const conflictGrant = await primaryPool.query(
+      `SELECT state FROM ${primaryTable("device_upload_authorizations")} WHERE id=$1`,
+      [conflictingUpload.authorizationId],
+    );
+    assert.equal(conflictGrant.rows[0]?.state, "revoked");
+
+    const putsBeforeConcurrentReplay = objectPutCount;
+    const deletesBeforeConcurrentReplay = objectDeleteCount;
+    let releaseConcurrentPuts;
+    let concurrentPutTimeout;
+    const concurrentPutPromise = new Promise((resolvePromise) => {
+      concurrentPutTimeout = setTimeout(resolvePromise, 5_000);
+      releaseConcurrentPuts = () => {
+        clearTimeout(concurrentPutTimeout);
+        resolvePromise();
+      };
+    });
+    twoPutBarrier = { waiting: 0, promise: concurrentPutPromise, release: releaseConcurrentPuts };
+    const concurrentReplays = await Promise.all([
+      uploadChunk(uploadChunks[3]),
+      uploadChunk(uploadChunks[3]),
+    ]);
+    twoPutBarrier = null;
+    releaseConcurrentPuts();
+    assert.equal(objectPutCount, putsBeforeConcurrentReplay + 2);
+    assert.equal(objectDeleteCount, deletesBeforeConcurrentReplay + 1);
+    for (const upload of concurrentReplays) assert.equal(upload.response.status, 202);
+    const concurrentReceipts = await Promise.all(
+      concurrentReplays.map((upload) => upload.response.json()),
+    );
+    assert.deepEqual(concurrentReceipts.map((receipt) => receipt.replayed).sort(), [false, true]);
+    assert.equal(concurrentReceipts[0].contributionId, concurrentReceipts[1].contributionId);
+    const concurrentRows = await primaryPool.query(
+      `SELECT id FROM ${primaryTable("telemetry_v12_chunks")}
+        WHERE manifest_id=$1 AND chunk_id=$2`,
+      [uploadManifestReceipt.manifestId, uploadChunks[3].chunkId],
+    );
+    assert.equal(concurrentRows.rowCount, 1);
+    const duplicatePut = objectPuts.slice(-2).find((put) =>
+      put.metadata.contributionId !== concurrentReceipts[0].contributionId);
+    assert.ok(duplicatePut);
+    assert.equal(storedObjects.has(duplicatePut.key), false);
+    const duplicateJournal = await primaryPool.query(
+      `SELECT contribution_id FROM ${primaryTable("pending_objects")} WHERE contribution_id=$1`,
+      [duplicatePut.metadata.contributionId],
+    );
+    assert.equal(duplicateJournal.rowCount, 0);
+    const concurrentGrantStates = await primaryPool.query(
+      `SELECT state FROM ${primaryTable("device_upload_authorizations")}
+        WHERE id = ANY($1::text[]) ORDER BY state`,
+      [concurrentReplays.map((upload) => upload.authorizationId)],
+    );
+    assert.deepEqual(concurrentGrantStates.rows.map((row) => row.state), ["consumed", "revoked"]);
+
+    failNextObjectPutAfterStore = true;
+    const uncertainPut = await uploadChunk(uploadChunks[1]);
+    await assertApiError(uncertainPut.response, 503, "BACKEND_STORAGE_UNAVAILABLE");
+    assert.ok(lastPut);
+    const uncertainPutMetadata = lastPut.metadata;
+    const uncertainPutEntry = storedObjects.get(lastPut.key);
+    assert.ok(uncertainPutEntry, "a provider that accepted bytes before losing its response may leave the object present");
+    assert.equal(Buffer.from(uncertainPutEntry.bytes).equals(uncertainPut.bytes), true);
+    assert.match(uncertainPutMetadata?.contributionId ?? "", /^chunk:[0-9a-f-]{36}$/u);
+    const uncertainPutJournal = await primaryPool.query(
+      `SELECT object_key, object_kind, reconciliation_state FROM ${primaryTable("pending_objects")}
+        WHERE contribution_id=$1`,
+      [uncertainPutMetadata.contributionId],
+    );
+    assert.deepEqual(uncertainPutJournal.rows[0], {
+      object_key: lastPut.key,
+      object_kind: "telemetry_v12",
+      reconciliation_state: "registered",
+    });
+    const uncertainPutGrant = await primaryPool.query(
+      `SELECT state FROM ${primaryTable("device_upload_authorizations")} WHERE id=$1`,
+      [uncertainPut.authorizationId],
+    );
+    assert.equal(uncertainPutGrant.rows[0]?.state, "revoked");
+
+    const regularPersist = manifestDispatchOptions.persistPostgresTypedV12StagedChunk;
+    runtime.postgresTestDispatch = createPostgresTestV12DayManifestDispatch({
+      ...manifestDispatchOptions,
+      persistPostgresTypedV12StagedChunk: async (...args) => {
+        await regularPersist(...args);
+        throw Object.assign(new Error("synthetic lost PostgreSQL commit acknowledgement"), {
+          code: "BACKEND_STORAGE_UNAVAILABLE", status: 503,
+        });
+      },
+    });
+    let uncertainCommit;
+    try {
+      uncertainCommit = await uploadChunk(uploadChunks[2]);
+    } finally {
+      runtime.postgresTestDispatch = manifestDispatch;
+    }
+    assert.equal(uncertainCommit.response.status, 202);
+    const uncertainCommitReceipt = await uncertainCommit.response.json();
+    assert.equal(uncertainCommitReceipt.replayed, false);
+    const uncertainCommitGrant = await primaryPool.query(
+      `SELECT state FROM ${primaryTable("device_upload_authorizations")} WHERE id=$1`,
+      [uncertainCommit.authorizationId],
+    );
+    assert.equal(uncertainCommitGrant.rows[0]?.state, "consumed");
+    const uncertainCommitSource = await primaryPool.query(
+      `SELECT id FROM ${primaryTable("telemetry_v12_chunks")} WHERE id=$1`,
+      [uncertainCommitReceipt.contributionId],
+    );
+    assert.equal(uncertainCommitSource.rowCount, 1);
+    assert.equal(objectDeleteCount, 1);
 
     await ledgerAuthority.recordPostgresDeletionTombstone(
       ledgerPool, participantId, Date.now(), { schema: schemaOptions },

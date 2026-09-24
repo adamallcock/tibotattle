@@ -1702,14 +1702,15 @@ export async function createSyntheticCanonicalD1({ extraV1Chunks = 0, v1RecordPa
     chunk_digest, envelope_digest, parser_version, record_count, r2_key,
     device_upload_authorization_id, created_at
   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'synthetic-cutover-v12', 1, ?, ?, ?)`);
+  const registerV12Object = database.prepare(`INSERT INTO pending_quarantine_objects
+    (r2_key, contribution_id, object_kind, registered_at)
+    VALUES (?, ?, 'telemetry', ?)`);
   for (const row of v12Rows) {
     insertV12Authorization.run(row.authorizationId, participant, device, Buffer.alloc(32, 9),
       row.envelopeDigest, now, expires, lease);
+    registerV12Object.run(row.r2Key, row.id, now);
     insertV12Chunk.run(row.id, v12Manifest, participant, device, row.stream, day, row.chunkSeq,
       row.id, row.chunkDigest, row.envelopeDigest, row.r2Key, row.authorizationId, now);
-    database.prepare(`INSERT INTO pending_quarantine_objects(r2_key, contribution_id, object_kind, registered_at)
-      VALUES (?, ?, 'telemetry', ?)`)
-      .run(row.r2Key, row.id, now);
   }
 
   const dictionary = [

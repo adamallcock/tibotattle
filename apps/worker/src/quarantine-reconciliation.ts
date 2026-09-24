@@ -307,10 +307,31 @@ async function dueRegistrations(
   return result.results;
 }
 
+async function telemetryV12MembershipAvailable(
+  db: D1Database,
+): Promise<boolean> {
+  const row = await db.prepare(
+    `SELECT CASE WHEN EXISTS (
+       SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'telemetry_v12_chunks'
+     ) THEN 1 ELSE 0 END AS available`,
+  ).first<{ available: number }>();
+  if (row?.available !== 0 && row?.available !== 1) {
+    throw new ApiError(503, "LIFECYCLE_STATE_CONFLICT");
+  }
+  return row.available === 1;
+}
+
 async function quarantineObjectReferenced(
   db: D1Database,
   r2Key: string,
+  telemetryV12Available: boolean,
 ): Promise<boolean> {
+  const telemetryV12Reference = telemetryV12Available
+    ? "OR EXISTS (SELECT 1 FROM telemetry_v12_chunks WHERE r2_key = ?)"
+    : "";
+  const bindings = [r2Key, r2Key, r2Key, r2Key];
+  if (telemetryV12Available) bindings.push(r2Key);
   const row = await db.prepare(
     `SELECT CASE
       WHEN EXISTS (SELECT 1 FROM contributions WHERE r2_key = ?)
@@ -323,9 +344,10 @@ async function quarantineObjectReferenced(
         OR EXISTS (
           SELECT 1 FROM telemetry_v11_chunks WHERE r2_key = ?
         )
+        ${telemetryV12Reference}
       THEN 1 ELSE 0
     END AS referenced`,
-  ).bind(r2Key, r2Key, r2Key, r2Key).first<{ referenced: number }>();
+  ).bind(...bindings).first<{ referenced: number }>();
   if (row?.referenced !== 0 && row?.referenced !== 1) {
     throw new ApiError(503, "LIFECYCLE_STATE_CONFLICT");
   }
@@ -345,7 +367,22 @@ async function claimOrphanRegistration(
   db: D1Database,
   row: PendingQuarantineRow,
   leaseId: string,
+  telemetryV12Available: boolean,
 ): Promise<"claimed" | "gone" | "referenced"> {
+  const telemetryV12ClaimGuard = telemetryV12Available
+    ? "AND NOT EXISTS (SELECT 1 FROM telemetry_v12_chunks WHERE r2_key = ?)"
+    : "";
+  const bindings = [
+    leaseId,
+    row.r2_key,
+    row.registered_at,
+    row.r2_key,
+    row.r2_key,
+    row.r2_key,
+    row.r2_key,
+  ];
+  if (telemetryV12Available) bindings.push(row.r2_key);
+  bindings.push(leaseId);
   const claimed = await db.prepare(
     `UPDATE pending_quarantine_objects
         SET reconciliation_state = 'deleting',
@@ -365,6 +402,7 @@ async function claimOrphanRegistration(
         AND NOT EXISTS (
           SELECT 1 FROM telemetry_v11_chunks WHERE r2_key = ?
         )
+        ${telemetryV12ClaimGuard}
         AND EXISTS (
           SELECT 1
             FROM quarantine_reconciliation_state
@@ -372,18 +410,11 @@ async function claimOrphanRegistration(
              AND state = 'running'
              AND lease_id = ?
         )`,
-  ).bind(
-    leaseId,
-    row.r2_key,
-    row.registered_at,
-    row.r2_key,
-    row.r2_key,
-    row.r2_key,
-    row.r2_key,
-    leaseId,
-  ).run();
+  ).bind(...bindings).run();
   if (claimed.meta.changes === 1) return "claimed";
-  if (await quarantineObjectReferenced(db, row.r2_key)) return "referenced";
+  if (await quarantineObjectReferenced(db, row.r2_key, telemetryV12Available)) {
+    return "referenced";
+  }
   const pending = await db.prepare(
     "SELECT 1 AS pending FROM pending_quarantine_objects WHERE r2_key = ?",
   ).bind(row.r2_key).first<{ pending: number }>();
@@ -414,15 +445,21 @@ async function reconcileRegistration(
   quarantine: R2Bucket,
   row: PendingQuarantineRow,
   leaseId: string,
+  telemetryV12Available: boolean,
 ): Promise<{
   orphanDeleted: number;
   referencedPreserved: number;
 }> {
-  if (await quarantineObjectReferenced(db, row.r2_key)) {
+  if (await quarantineObjectReferenced(db, row.r2_key, telemetryV12Available)) {
     await clearReconciledRegistration(db, row.r2_key);
     return { orphanDeleted: 0, referencedPreserved: 1 };
   }
-  const claim = await claimOrphanRegistration(db, row, leaseId);
+  const claim = await claimOrphanRegistration(
+    db,
+    row,
+    leaseId,
+    telemetryV12Available,
+  );
   if (claim === "referenced") {
     await clearReconciledRegistration(db, row.r2_key);
     return { orphanDeleted: 0, referencedPreserved: 1 };
@@ -490,6 +527,9 @@ export async function reconcilePendingQuarantineObjects(
       maximumRegistrations,
     );
     const batch = due.slice(0, maximumRegistrations);
+    const telemetryV12Available = batch.length > 0
+      ? await telemetryV12MembershipAvailable(db)
+      : false;
     let orphanObjectsDeleted = 0;
     let referencedObjectsPreserved = 0;
     for (const row of batch) {
@@ -498,6 +538,7 @@ export async function reconcilePendingQuarantineObjects(
         quarantine,
         row,
         lease.leaseId,
+        telemetryV12Available,
       );
       orphanObjectsDeleted += result.orphanDeleted;
       referencedObjectsPreserved += result.referencedPreserved;

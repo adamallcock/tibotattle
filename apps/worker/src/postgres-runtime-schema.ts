@@ -60,6 +60,8 @@ export const POSTGRES_RUNTIME_MIGRATIONS: Readonly<{
     ["0026_v12_domain_days_and_input_revision.sql", "7e15b4d82b196e1ad8b6ef98c253e91f6204921d2f54207ab3346a8cf0a025e5"],
     ["0027_typed_v12_published_delete_guard.sql", "95de20d5e64bb5087ee4de5900b41f6ffa88446216440e10b3d08d79abce3997"],
     ["0028_typed_v12_ready_integrity_guard.sql", "bb0406a7c2f3963ad5dd73b981da3ae5305bb5fa3b19154c413a5d176b2ae3f9"],
+    ["0029_legacy_source_membership.sql", "c8d9bb75659705492d3d14f23570ad3207677e75b17b27f032ccfd6c24b15c87"],
+    ["0030_legacy_typed_telemetry.sql", "b6ea645e97aa0aef8d9a790ae97a8c11662e3ca459a5dcb7299c98cba80d9d8a"],
   ] as readonly MigrationEntry[]).map((entry, index) => receipt(entry, index + 1))),
   ledger: Object.freeze(([
     ["0001_schema_metadata.sql", "783e0d414ee8c755c8886daa95a1fe998527b44445b08eaa36a595dddabf8f8c"],

@@ -32,10 +32,12 @@ beforeEach(async () => {
   await applyD1Migrations(db(), bindings.TEST_INGESTION_BRIDGE_MIGRATIONS);
   await applyD1Migrations(db(), bindings.TEST_TYPED_V11_ADMISSION_MIGRATIONS);
   await applyD1Migrations(db(), bindings.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
-  // v1.2 transport migration is being qualified separately; this reader is
-  // intentionally exercised against the frozen v1/v1.1 tables plus 0006.
+  // v1.2 transport and its 0010 quarantine-admission fence are qualified
+  // separately; 0010 targets the table created by 0008, so omit both together.
+  // This reader is exercised against the frozen v1/v1.1 tables plus 0006.
   await applyD1Migrations(db(), bindings.TEST_INGESTION_ISOLATION_MIGRATIONS
-    .filter((migration) => !migration.name.startsWith("0008_")));
+    .filter((migration) => !migration.name.startsWith("0008_")
+      && !migration.name.startsWith("0010_")));
   await initializeStorageSource(db(), "synthetic-effective-usage-journal");
   await initializeTypedV1Admission(db(), sourceNamespace);
 });

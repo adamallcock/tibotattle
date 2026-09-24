@@ -99,6 +99,10 @@ export const EXPECTED_PRIMARY_MIGRATIONS = Object.freeze([
     name: "0009_performance_reports.sql",
     sha256: "cfd43797151ea3d5a6740da9792be49bf897968094347cd6fbbb9a0cf6510825",
   }),
+  Object.freeze({
+    name: "0010_v12_quarantine_admission.sql",
+    sha256: "01f7b2f75dcbe9de8d42fb194702504db39f7ea8dbc475e28d09604230152344",
+  }),
 ] as const);
 
 // The usage successor is independently activatable. The performance
@@ -285,6 +289,7 @@ const EXPECTED_PRIMARY_SCHEMA_OBJECTS: readonly SchemaObjectPin[] = Object.freez
   { type: "trigger", name: "telemetry_v12_chunk_admission" },
   { type: "trigger", name: "telemetry_v12_chunk_authorization_consumed" },
   { type: "trigger", name: "telemetry_v12_chunk_immutable" },
+  { type: "trigger", name: "telemetry_v12_chunk_quarantine_admission" },
   { type: "trigger", name: "telemetry_v12_domain_admission" },
   { type: "trigger", name: "telemetry_v12_domain_day_admission" },
   { type: "trigger", name: "telemetry_v12_domain_head_immutable" },

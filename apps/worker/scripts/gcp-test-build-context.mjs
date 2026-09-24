@@ -32,9 +32,9 @@ const SECRET_PATH_PARTS = new Set([
   "credentials.json",
   "service-account.json",
 ]);
-const EXPECTED_PRIMARY_MIGRATION_COUNT = 28;
+const EXPECTED_PRIMARY_MIGRATION_COUNT = 30;
 const EXPECTED_LEDGER_MIGRATION_COUNT = 5;
-const EXPECTED_PRIMARY_MIGRATION_TAIL = "0028_typed_v12_ready_integrity_guard.sql";
+const EXPECTED_PRIMARY_MIGRATION_TAIL = "0030_legacy_typed_telemetry.sql";
 
 const ALLOWLIST = Object.freeze([
   Object.freeze({ source: "gcp-test/package.json", destination: "apps/worker/gcp-test/package.json" }),

@@ -18,6 +18,7 @@ import {
 } from "@app-usagemonitor/telemetry-contract";
 import { ApiError } from "./errors";
 import { sha256, sha256Hex } from "./crypto";
+import { TELEMETRY_CONSENT_VERSION } from "./constants";
 import {
   createPostgresSchemaConfig,
   PostgresStorageError,
@@ -244,13 +245,15 @@ async function assertWriteAllowed(
   }
   const authority = await client.query<{
     owner_kind: "social" | "accountless";
+    participant_consent_version: string | null;
     participant_state: string;
     authority_kind: "social" | "accountless";
     device_state: string;
     device_expires_at: string | Date;
     enrollment_device_id: string | null;
   }>(
-    `SELECT p.owner_kind, p.state AS participant_state, d.authority_kind, d.state AS device_state,
+    `SELECT p.owner_kind, p.consent_version AS participant_consent_version,
+            p.state AS participant_state, d.authority_kind, d.state AS device_state,
             d.expires_at AS device_expires_at, d.accountless_enrollment_device_id AS enrollment_device_id
        FROM ${table(schema, "participants")} p
        JOIN ${table(schema, "device_credentials")} d ON d.participant_id = p.id
@@ -265,6 +268,9 @@ async function assertWriteAllowed(
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
   if (identity.owner_kind === "social") {
+    if (identity.participant_consent_version !== TELEMETRY_CONSENT_VERSION) {
+      throw new ApiError(400, "TELEMETRY_REQUIRED");
+    }
     const consent = await client.query<{
       state: string;
       telemetry_schema_version: string;
@@ -285,6 +291,9 @@ async function assertWriteAllowed(
       throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
     }
     return;
+  }
+  if (identity.participant_consent_version !== null) {
+    throw new ApiError(400, "TELEMETRY_REQUIRED");
   }
   const accountless = await client.query<{ enrollment_device_id: string }>(
     `SELECT authz.enrollment_device_id

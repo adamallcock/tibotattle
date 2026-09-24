@@ -33,13 +33,19 @@ the schema digest, so exact provider-owned metadata is excluded while a shadow
 object remains visible as drift.
 
 Usage activation requires the common primary forward rows through
-`0008_telemetry_v12.sql` and the final typed v1/v1.1 and successor usage
-objects. The independent `0009_performance_reports.sql` migration, performance
-tables, and histogram bucket checks may be absent or remain staged. Performance
-activation requires the complete primary prefix through `0009`, every pinned
+`0008_telemetry_v12.sql`, the exact `0010_v12_quarantine_admission.sql` ledger
+row and trigger, and the final typed v1/v1.1 and successor usage objects. The
+`0009_performance_reports.sql` ledger row precedes `0010` in the ordered D1
+migration stream, so applying `0010` also requires applying `0009`. Usage
+activation does not inspect the independent performance tables or histogram
+bucket contract, and the performance runtime may remain staged. Performance
+activation requires the complete primary prefix through `0010`, every pinned
 performance object, and the exact report bucket and measurement checks. Both
 targets require typed storage, the same valid source namespace for v1 and v1.1,
-and enabled upload registration and processing controls.
+and enabled upload registration and processing controls. The historical
+existing-role operator described in the production runbook is source-pinned
+through `0009`; it does not apply the new `0010` migration. Rehearse and review
+that forward step separately before attempting activation.
 
 The runtime row must still be `staged`. Record its current `policy_revision`
 from a read-only post-deploy check and use that value as `expectedRevision`.

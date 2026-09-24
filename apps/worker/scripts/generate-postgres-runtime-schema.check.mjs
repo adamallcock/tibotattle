@@ -46,4 +46,16 @@ test("Worker migration receipt source is generated exactly from canonical SQL", 
     ),
     true,
   );
+  assert.equal(
+    renderPostgresRuntimeSchema(manifest).includes(
+      '"0029_legacy_source_membership.sql"',
+    ),
+    true,
+  );
+  assert.equal(
+    renderPostgresRuntimeSchema(manifest).includes(
+      '"0030_legacy_typed_telemetry.sql"',
+    ),
+    true,
+  );
 });

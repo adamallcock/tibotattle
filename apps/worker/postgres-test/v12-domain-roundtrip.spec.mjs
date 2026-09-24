@@ -48,7 +48,8 @@ it("current v1.2 domain activates and replays on real local PostgreSQL", async (
     const secretHash = Buffer.alloc(32, 7);
     const participantId = "synthetic-domain-owner";
     const deviceId = "synthetic-domain-device";
-    await pool.query(`INSERT INTO ${s}.participants(id, created_at) VALUES ($1,$2)`, [participantId, now]);
+    await pool.query(`INSERT INTO ${s}.participants(id, consent_version, created_at)
+      VALUES ($1,$2,$3)`, [participantId, "privacy-safe-telemetry-v0.1", now]);
     await pool.query(`INSERT INTO ${s}.web_sessions(
       id, participant_id, secret_hash, csrf_hash, issued_at, expires_at, last_used_at
     ) VALUES ($1,$2,$3,$4,$5,$6,$5)`, [

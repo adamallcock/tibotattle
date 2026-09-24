@@ -488,6 +488,15 @@ first D1 write and before every later write. The plan's `inventorySha256` is
 the canonical digest of the embedded inventory object, so execution also
 detects an edited or internally inconsistent plan.
 
+This operator intentionally stops at `0009`. The later
+`ingestion-isolation-migrations/0010_v12_quarantine_admission.sql` adds a
+v1.2 chunk-admission fence against objects already claimed for orphan deletion.
+It needs its own reviewed, rehearsed forward application and post-migration
+receipt. Do not extend the historical operator's pinned source sequence or
+assume that a Worker deploy applies `0010`. The protected usage activation
+gate requires that exact migration and trigger; its ordered D1 prefix also
+requires `0009` to have been applied first.
+
 Run the local populated rehearsal from the repository root. It uses
 synthetic content-free rows, enables foreign-key checks, verifies every mapped
 column and staged/default value, and proves the carried analytics columns with
