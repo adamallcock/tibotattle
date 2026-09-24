@@ -316,6 +316,17 @@ smoke until that proof exists. The host also remains loopback-only. Automatic
 approval review rejected the proposed `cloud-run-iam` mode that would bind
 `0.0.0.0` and accept its HTTPS origin without sufficient IAM-enforcement
 proof. No network boundary was broadened.
+To clear the provenance blocker, package the already validated source context
+as one archive, hash its exact bytes, and upload it to a create-only GCS object
+with a pinned generation. Submit a fixed Cloud Build request using that
+generation, a pinned builder and service account, requested SHA-256 source
+hash, and verified provenance. The [Cloud Build API](https://docs.cloud.google.com/build/docs/api/reference/rest/v1/projects.builds)
+exposes the resolved storage source and source-file hash; compare both against
+the local archive, then use the build result's immutable image digest for
+Cloud Run read-back. Recompute the canonical source-content digest from the
+same archive before submission. The [provenance guide](https://docs.cloud.google.com/build/docs/securing-builds/generate-validate-build-provenance)
+describes verified provenance for Artifact Registry images. No such build or
+archive upload has run for this integration revision.
 
 The separate typed legacy transfer rehearsal now pages the 14 D1-shaped base
 tables from a cloned synthetic in-memory fixture into PostgreSQL 17, including
