@@ -123,13 +123,61 @@ export async function hashCapability(
   return sha256(`app-usagemonitor/${capability}/v1\0${tokenId}\0${secret}`);
 }
 
-export function timingSafeEqual(left: Uint8Array, right: Uint8Array): boolean {
-  if (left.byteLength !== right.byteLength) {
-    const dummy = new Uint8Array(left.byteLength);
-    crypto.subtle.timingSafeEqual(left, dummy);
-    return false;
+type TimingSafeEqualImplementation = (
+  left: Uint8Array,
+  right: Uint8Array,
+) => boolean;
+
+function portableTimingSafeEqual(left: Uint8Array, right: Uint8Array): boolean {
+  const length = Math.max(left.byteLength, right.byteLength);
+  let difference = left.byteLength ^ right.byteLength;
+  for (let index = 0; index < length; index += 1) {
+    difference |= (left[index] ?? 0) ^ (right[index] ?? 0);
   }
-  return crypto.subtle.timingSafeEqual(left, right);
+  return difference === 0;
+}
+
+function defaultTimingSafeEqual(left: Uint8Array, right: Uint8Array): boolean {
+  // Cloudflare Workers exposes a native constant-time primitive. Preserve it
+  // as the default there; Node hosts can inject node:crypto's implementation
+  // during composition. Only fall back to the portable loop where neither is
+  // available.
+  if (left.byteLength !== right.byteLength) return false;
+  const subtle = crypto.subtle as SubtleCrypto & {
+    timingSafeEqual?: (first: BufferSource, second: BufferSource) => boolean;
+  };
+  if (typeof subtle.timingSafeEqual === "function") {
+    return subtle.timingSafeEqual.call(subtle, left, right);
+  }
+  return portableTimingSafeEqual(left, right);
+}
+
+// Cloudflare Workers provides subtle.timingSafeEqual, while Node's Web Crypto
+// API does not. Keep the portable implementation only as the final fallback;
+// a Node host can install node:crypto's implementation at composition time.
+let timingSafeEqualImplementation: TimingSafeEqualImplementation = defaultTimingSafeEqual;
+
+/** Install the host's constant-time comparison and return a scoped restore. */
+export function setTimingSafeEqualImplementation(
+  implementation: TimingSafeEqualImplementation,
+): () => void {
+  if (typeof implementation !== "function") {
+    throw new TypeError("TIMING_SAFE_EQUAL_IMPLEMENTATION_INVALID");
+  }
+  const previous = timingSafeEqualImplementation;
+  timingSafeEqualImplementation = implementation;
+  return () => {
+    if (timingSafeEqualImplementation === implementation) {
+      timingSafeEqualImplementation = previous;
+    }
+  };
+}
+
+export function timingSafeEqual(left: Uint8Array, right: Uint8Array): boolean {
+  const sameLength = left.byteLength === right.byteLength;
+  const comparisonRight = sameLength ? right : new Uint8Array(left.byteLength);
+  const equal = timingSafeEqualImplementation(left, comparisonRight);
+  return sameLength && equal;
 }
 
 export async function decryptSyntheticEnvelope(

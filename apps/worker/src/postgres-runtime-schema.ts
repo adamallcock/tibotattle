@@ -1,0 +1,71 @@
+/**
+ * Build-time PostgreSQL migration receipt expected by the Worker runtime.
+ *
+ * The migration runner owns applying SQL fragments. The application still
+ * needs a source-owned admission fence so a host cannot point an older
+ * reader at a missing, newer, or checksum-drifted schema and begin a write.
+ * Keep this small manifest in product code instead of importing the Node-only
+ * migration script or reading the filesystem from a Worker.
+ */
+
+export interface PostgresRuntimeMigrationReceipt {
+  readonly version: number;
+  readonly name: string;
+  readonly sha256: string;
+}
+
+export const POSTGRES_RUNTIME_SCHEMA_VERSION =
+  "tibotattle-postgres-migration-manifest-v1" as const;
+
+type MigrationEntry = readonly [name: string, sha256: string];
+
+function receipt(
+  entry: readonly [string, string],
+  version: number,
+): PostgresRuntimeMigrationReceipt {
+  const [name, sha256] = entry;
+  return Object.freeze({ version, name, sha256 });
+}
+
+export const POSTGRES_RUNTIME_MIGRATIONS: Readonly<{
+  readonly primary: readonly PostgresRuntimeMigrationReceipt[];
+  readonly ledger: readonly PostgresRuntimeMigrationReceipt[];
+}> = Object.freeze({
+  primary: Object.freeze(([
+    ["0001_schema_metadata.sql", "2bcf95c2954d3194696d24574d916391bf09525bf6951d7f6a825f5beb70efb2"],
+    ["0002_authority_identity.sql", "06f12e6993d814b748577432c4c5a5ebeb25f5ea1f4843911815a73607e17160"],
+    ["0003_device_and_enrollment_authority.sql", "62319ef5c7902800564368ce0ddf551907411412718d84bf798f634227d4493b"],
+    ["0004_telemetry_v1_ingest.sql", "45c611d5c3e9cdcf07fe37887f15e74bdf2568c880b286e0667450e77f1a45c3"],
+    ["0005_telemetry_v11_transport_and_domain.sql", "bb939ab3d6355c4021c4a3a8eb689fd377e73a074d738408e42e0de03dc76c76"],
+    ["0006_telemetry_v12_usage_quota_session.sql", "48485a8929f177a9cda22333ed93e2a7a073ede8fd3ae0cbfbfd9f124e209d50"],
+    ["0007_analytics_lifecycle.sql", "b5bcf7f33cb9c046def75dae34a6789a411b417859433440d6ae71623d23af10"],
+    ["0008_pending_object_reconciliation.sql", "c43fc6b4ef4b1592a60798a50eddf683973a10df6844aa42a7c88b351ea3ce7e"],
+    ["0009_owner_scoped_analytics.sql", "c5a936af6132bb903f14e1bfb739f8a74e26e98ce96f1a4fb40ce9ad83577253"],
+    ["0010_v1_analytical_side_effects.sql", "60a5a159610bb4e627382a0ac4ae4292e78e75bd269b67fbc91f70d0f88c62e5"],
+    ["0011_retained_telemetry.sql", "3ae149ee1c907cd548458c0c23627a0509c19d45bdd1fc7b0e97dd9cfbdc8aa7"],
+    ["0012_provider_preparation.sql", "3c1a5fcf9ede24f3380bd90257695c01cd89e0d5571c0e7811e2f33eb9a8c0e2"],
+    ["0013_postgres_runtime_guards.sql", "c2bb4e8ac5d4b802d5457f1aaf1d9cc2afc33836d2bbd4dfbc851f016bb9c20f"],
+    ["0014_effective_source_revision.sql", "ad124ecdc7b008e18c11a7faf45886c666b7ca42b40322089d597641a515ed3c"],
+    ["0015_enrollment_grants.sql", "7b362f377b3b9e2dbb671d18db61e09d05cf2bcc70c1b3739577850faee05754"],
+    ["0016_publication_authority.sql", "a97c64175d4af12a2b06782007491c7acb9da2364003cc09110e7b5356b31b9d"],
+    ["0017_readiness_sweep_fence.sql", "96ad7866bb6083a2f0e0415c6a86a7a4efe492310a1fced1606c5c012493986c"],
+    ["0018_admin_analytics_caches.sql", "f4d7df1e75c0d3bd880bba7d3653ca53b5c19d8af2e5fb0a5ada35abb915f6c5"],
+    ["0019_signin_start_admission.sql", "a5fe389848a1ec7bf11c9f4408c43ca5e547c03e1299adaa86697d1eca24db72"],
+    ["0020_analytics_results_and_delivery.sql", "7725f2a57d290e3aa25387b84c0f1cf50509bfb560a2f92fb7c209d4f8cede74"],
+    ["0021_upload_ingress_budget.sql", "a8bc582e17eb518e670fa50e40bab1526b800a86d3a0acb1e9e0138094ae912b"],
+    ["0022_github_distribution_history.sql", "412b3555bd2b1aff5b667c92499cadca8d0abbdd0111fbac50a3f0eba65841e6"],
+    ["0023_analytics_fit_results.sql", "3cd6cfbdff5ed8a9c8da56f6f3b03343049655952b7169a989f8fb09cbcbd43a"],
+    ["0024_scheduler_source_cutoff.sql", "7a0819d714ea5ba8a7191e9a0eb923a8625cbe1bbbae2a9161248dd2e003fe22"],
+    ["0025_typed_v12_normalized.sql", "7b789441ac5b1489ec42a90daec9cf1120c10bc192beaed31f9162ee0add1d40"],
+    ["0026_v12_domain_days_and_input_revision.sql", "7e15b4d82b196e1ad8b6ef98c253e91f6204921d2f54207ab3346a8cf0a025e5"],
+    ["0027_typed_v12_published_delete_guard.sql", "95de20d5e64bb5087ee4de5900b41f6ffa88446216440e10b3d08d79abce3997"],
+    ["0028_typed_v12_ready_integrity_guard.sql", "bb0406a7c2f3963ad5dd73b981da3ae5305bb5fa3b19154c413a5d176b2ae3f9"],
+  ] as readonly MigrationEntry[]).map((entry, index) => receipt(entry, index + 1))),
+  ledger: Object.freeze(([
+    ["0001_schema_metadata.sql", "783e0d414ee8c755c8886daa95a1fe998527b44445b08eaa36a595dddabf8f8c"],
+    ["0002_tombstones_cooldowns.sql", "6628c0bcc1f44ee040c137e2e7d0f2163e1dfc147c40a97942ec429c44163d2e"],
+    ["0003_erasure_restore_receipts.sql", "26fe1c48f75816c02415eec5f77fb242894974615f51938d5b75292bb2d71b27"],
+    ["0004_storage_erasure_jobs.sql", "e64d248b31db42dcdcc2aa36e7c623b7f9752143d8108de2d8852702fcbae3d9"],
+    ["0005_readiness_generation.sql", "79b6535a97c8b0ddf39b77e83cbc28842ff864f093ee3c308e52da7e39ec7064"],
+  ] as readonly MigrationEntry[]).map((entry, index) => receipt(entry, index + 1))),
+});

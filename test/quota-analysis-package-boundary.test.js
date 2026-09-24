@@ -73,7 +73,11 @@ const WINDOW_EXPORTS = Object.freeze([
 ]);
 const SOURCE_HASHES = Object.freeze({
   "quota-calibration.js":
-    "7d19a7a0184c65378c3214b439c2cac647747457823d91d2999991847a552bbc",
+    // Re-pinned 2026-09-24 for the reviewed fit optimization: finite capacity
+    // candidates are sorted once and reused for the exact median/P10/P90
+    // interpolation. The independent legacy-quantile oracle regression covers
+    // even/odd candidate counts and non-finite slopes.
+    "9ffae10d672ba9de421ad2ae448286c9e58f07b3603802c45e9fbef811100d82",
   "quota-rolling.js":
     "2afca11d40c61c463524cc8f4d267c128dbe427c72fb6c2e3ed68b056ca70977",
   "quota-tracks.js":
@@ -88,7 +92,11 @@ const SOURCE_HASHES = Object.freeze({
     // Both the split and its guard compare WITHIN a slot: `slot` is absent from
     // the group key, so a cross-slot comparison split healthy groups on the
     // primary/secondary crossover.
-    "922350e53fd58920fd9f9a9354db1a67b131cb302490b898cb4a5ca8379f9645",
+    // Re-pinned 2026-09-24 for the ordered cumulative-cost cursor. It preserves
+    // the legacy reduction order and falls back when extended ISO timestamps
+    // make lexical boundaries non-chronological; the independent reduction
+    // oracle covers large sums, timestamp ties, and that fallback.
+    "af5f16e82b577a3c4f0aac330fa1f889def648f35ff6798268f3a0751df74099",
   "quota-windows.js":
     // Re-pinned for the reviewed local-only quota display-name contract:
     // bounded provider copy cannot affect identity, calibration, or export,
@@ -161,7 +169,7 @@ test("quota analysis exposes one exact runtime-neutral package root", async () =
   );
 });
 
-test("package implementation bytes equal the pre-extraction quota kernels", async () => {
+test("package implementation bytes match reviewed quota-kernel hashes", async () => {
   for (const [name, expected] of Object.entries(SOURCE_HASHES)) {
     const bytes = await readFile(
       new URL(`../packages/quota-analysis/src/${name}`, import.meta.url),

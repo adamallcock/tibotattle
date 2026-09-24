@@ -1,4 +1,6 @@
 import { readAdminDatabaseHealth } from "./admin-database-health";
+import { isPostgresWorkerRequestPathSupported } from "./backend-composition";
+export { isPostgresWorkerRequestPathSupported } from "./backend-composition";
 import { allowanceReconstructionMode } from "./allowance-reconstruction";
 import { createD1InvocationBudget, D1InvocationBudgetExceededError } from "./d1-invocation-budget";
 import { warmCommunityAnalysisCaches } from "./community-analysis-warmer";
@@ -291,7 +293,6 @@ import {
 
 // Wrangler discovers Durable Object classes through the Worker module's named
 // exports. The class itself owns only opaque short-lived admission leases.
-export { UploadIngressBudget } from "./ingress-budget";
 
 const DEPLOYMENT_SOURCE_COMMIT_PATTERN = /^[a-f0-9]{7,64}$/u;
 const EXACT_DEPLOYMENT_SOURCE_COMMIT_PATTERN = /^[a-f0-9]{40}$/u;
@@ -4343,6 +4344,13 @@ export async function handleRequest(
   const requestId = crypto.randomUUID();
   const url = new URL(request.url);
   const route = matchWorkerRoute(url.pathname);
+  if (Object.prototype.hasOwnProperty.call(env, "POSTGRES_WORKER_BACKEND")
+      && !isPostgresWorkerRequestPathSupported()) {
+    return noStore(errorResponse(
+      new ApiError(503, "POSTGRES_REQUEST_PATH_UNSUPPORTED"),
+      requestId,
+    ));
+  }
   const configuredAdminHostname = adminHostname(env);
   const adminSurface = isAdminSurfacePath(url.pathname)
     || configuredAdminHostname === url.hostname;

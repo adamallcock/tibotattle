@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { UploadIngressBudgetPolicy } from "../src/ingress-budget";
+import type { UploadIngressBudgetPolicy } from "../src/ingress-budget-policy";
 
 async function freshBudget(name: string) {
   const budget = env.UPLOAD_INGRESS_BUDGET.getByName(name);

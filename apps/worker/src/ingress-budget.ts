@@ -1,32 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
+import type {
+  UploadIngressBudgetDecision,
+  UploadIngressBudgetPolicy,
+  UploadIngressBudgetStatus,
+} from "./ingress-budget-policy";
 
-export interface UploadIngressBudgetPolicy {
-  maximumConcurrent: number;
-  maximumStartsPerMinute: number;
-  burst: number;
-  leaseMilliseconds: number;
-}
-
-export interface UploadIngressBudgetDecision {
-  allowed: boolean;
-  leaseId: string | null;
-  retryAfterSeconds: number;
-}
-
-/**
- * A read-only pressure snapshot for the owner operations surface. It contains
- * capacity numbers and content-free denial counters only — never a lease ID,
- * IP, participant, or request detail.
- */
-export interface UploadIngressBudgetStatus {
-  activeLeases: number;
-  maximumConcurrent: number;
-  availableStartTokens: number;
-  burst: number;
-  concurrencyDenials: number;
-  startRateDenials: number;
-  lastDeniedAtEpoch: number | null;
-}
+export type {
+  UploadIngressBudgetDecision,
+  UploadIngressBudgetPolicy,
+  UploadIngressBudgetStatus,
+} from "./ingress-budget-policy";
 
 interface StoredIngressBudget {
   schemaVersion: "upload-ingress-budget-v0.1";

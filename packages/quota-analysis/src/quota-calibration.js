@@ -71,8 +71,7 @@ function round(value, places = 6) {
   return Math.round((value + Number.EPSILON) * scale) / scale;
 }
 
-function quantile(values, probability) {
-  const ordered = values.filter(Number.isFinite).sort((left, right) => left - right);
+function quantileOrdered(ordered, probability) {
   if (ordered.length === 0) return null;
   const position = (ordered.length - 1) * probability;
   const lower = Math.floor(position);
@@ -80,6 +79,11 @@ function quantile(values, probability) {
   if (lower === upper) return ordered[lower];
   const weight = position - lower;
   return ordered[lower] * (1 - weight) + ordered[upper] * weight;
+}
+
+function quantile(values, probability) {
+  const ordered = values.filter(Number.isFinite).sort((left, right) => left - right);
+  return quantileOrdered(ordered, probability);
 }
 
 function median(values) {
@@ -135,10 +139,13 @@ function capacityCandidates(points) {
 
 function fitPoints(points) {
   const candidates = capacityCandidates(points);
-  const capacityNanousd = median(candidates);
+  const orderedCandidates = candidates
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+  const capacityNanousd = quantileOrdered(orderedCandidates, 0.5);
   if (!(capacityNanousd > 0)) return null;
-  const lower = quantile(candidates, 0.1);
-  const upper = quantile(candidates, 0.9);
+  const lower = quantileOrdered(orderedCandidates, 0.1);
+  const upper = quantileOrdered(orderedCandidates, 0.9);
   return {
     capacityNanousd,
     sensitivityRangeNanousd: {

@@ -2,7 +2,7 @@ import {
   cloudflareTest,
   readD1Migrations,
 } from "@cloudflare/vitest-pool-workers";
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 const migrations = await readD1Migrations("./migrations");
 const deletionLedgerMigrations = await readD1Migrations(
@@ -41,5 +41,8 @@ export default defineConfig({
   ],
   test: {
     fileParallelism: false,
+    // PostgreSQL/Cloud Run qualification tests use Node filesystem and socket
+    // APIs; they run under their separate Node or local-PostgreSQL gates.
+    exclude: [...configDefaults.exclude, "postgres-test/**"],
   },
 });

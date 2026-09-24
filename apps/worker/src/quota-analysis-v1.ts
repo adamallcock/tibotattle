@@ -184,6 +184,8 @@ const SLOT_VALUES = new Set<string>([
   "unknown",
 ]);
 const SAFE_TOKEN = /^[a-z0-9][a-z0-9_.:-]{0,127}$/u;
+const EFFECTIVE_DATASET_ID = /^dataset:v[0-9]+:[a-f0-9]{64}$/u;
+const EFFECTIVE_ACCOUNT_TRACK_ID = /^account-track:v2:[a-f0-9]{64}$/u;
 
 // v1 carries no provider policy epoch; the whole v1 corpus is one epoch. It is
 // stamped identically onto synthesized quota snapshots and usage events, so
@@ -293,7 +295,7 @@ type UsageEventPartial = Omit<
 interface AttributedUsageEventPartial extends UsageEventPartial {
   contextKey: string;
   planEraKey: string | null;
-  attribution: "legacy_conditional" | "unresolved";
+  attribution: "legacy_conditional" | "effective_source" | "unresolved";
 }
 
 interface AttributedQuotaSnapshot extends QuotaSnapshotInput {
@@ -1949,6 +1951,7 @@ function runV1SeedLoop(
   datasets: { datasetId: string; complete: boolean }[],
   quotaSnapshots: AttributedQuotaSnapshot[],
   usageEvents: AttributedUsageEventPartial[],
+  attributionStatus: "legacy_conditional" | "effective_source" = "legacy_conditional",
 ): object {
   const seeds = new Map<string, TrackSeed>();
   for (const snapshot of quotaSnapshots) {
@@ -2044,7 +2047,7 @@ function runV1SeedLoop(
     tracks.push({
       continuity: seed, calibration,
       attribution: {
-        status: "legacy_conditional", accountScope: "unknown", planEraKey: seed.planEraKey,
+        status: attributionStatus, accountScope: "unknown", planEraKey: seed.planEraKey,
         refusedResets: refusedResets.map((reset) => ({
           resetKey: reset.resetKey, reason: "usage_plan_interval_unresolved",
           firstObservedAt: reset.firstObservedAt, lastObservedAt: reset.lastObservedAt,
@@ -2365,9 +2368,11 @@ export interface V1ModelComposition {
   readonly poisonedBinCount: number;
   /** Newest retained quota reading; the cohort layer's recency evidence. */
   readonly latestQuotaObservedAt: string;
-  readonly attributionStatus: "legacy_conditional";
+  readonly attributionStatus: "legacy_conditional" | "effective_source";
   readonly attributionMethod: string;
   readonly inputFingerprint: string;
+  readonly legacyQuotaRowsExcluded?: number;
+  readonly legacyUsageRowsExcluded?: number;
 }
 
 export interface V1ModelCompositionRefusal {
@@ -2378,6 +2383,87 @@ export interface V1ModelCompositionRefusal {
 export type V1ModelCompositionResult =
   | V1ModelComposition
   | V1ModelCompositionRefusal;
+
+/** Source-pinned quota evidence supplied by the effective retained/v1/v1.1/v1.2
+ * bridge. These rows intentionally carry only the fields consumed by the
+ * existing composition kernel; the bridge retains format/provenance on the
+ * source records and binds this vector to its source fingerprint. */
+export interface V1ProviderCompositionQuotaRow {
+  readonly occurrenceId: string;
+  readonly observedAt: string;
+  readonly provider: string;
+  readonly planType: string;
+  readonly planVariant: string;
+  readonly limitId: string;
+  readonly slot: string;
+  readonly usedPercent: number;
+  readonly windowDurationMinutes: number;
+  readonly resetsAt: string;
+}
+
+export interface V1ProviderCompositionUsageRow {
+  readonly occurrenceId: string;
+  readonly observedAt: string;
+  readonly provider: string;
+  /** Canonical successor/retained usage payload. */
+  readonly recordJson: string;
+}
+
+export interface V1ProviderCompositionRows {
+  readonly quotaRows: readonly V1ProviderCompositionQuotaRow[];
+  readonly usageRows: readonly V1ProviderCompositionUsageRow[];
+  readonly sourceFingerprint: string;
+  readonly attributionMethod?: string;
+  readonly maxQuotaRows?: number;
+  readonly maxUsageRows?: number;
+}
+
+/**
+ * Complete scalar evidence from the effective retained/v1/v1.1/v1.2 source.
+ * The source bridge must provide the opaque dataset and account-track IDs it
+ * already owns; this adapter never derives continuity from a participant ID,
+ * record payload, or row position.  A single effective track per provider is
+ * required because the compact usage row intentionally does not carry a
+ * second plan-attribution stream.  Ambiguous provider/plan evidence remains a
+ * refusal instead of being assigned to an arbitrary reset fit.
+ */
+export interface V1ProviderEffectiveQuotaRows {
+  /** Explicit source groups prevent legacy/unavailable rows from inheriting a
+   * modern account track. Every supplied row must belong to exactly one group. */
+  readonly sourceGroups: readonly V1ProviderEffectiveQuotaSourceGroup[];
+  readonly sourceFingerprint: string;
+  readonly attributionMethod?: string;
+  readonly maxQuotaRows?: number;
+  readonly maxUsageRows?: number;
+}
+
+export interface V1ProviderEffectiveQuotaSourceGroup {
+  readonly kind: "modern" | "legacy";
+  readonly datasetId: string;
+  readonly accountTrackId: string | null;
+  readonly policyEpoch: string;
+  readonly completeWindow: boolean;
+  readonly quotaRows: readonly V1ProviderCompositionQuotaRow[];
+  readonly usageRows: readonly V1ProviderCompositionUsageRow[];
+}
+
+/** Model fitting consumes the same source-group fence as scalar quota fitting.
+ * Keeping this alias explicit prevents callers from flattening account-track
+ * metadata before the model kernel sees it. */
+export type V1ProviderEffectiveModelRows = V1ProviderEffectiveQuotaRows;
+
+/** Result shape exposed to the effective-source analytics bridge. */
+export interface V1ProviderEffectiveQuotaAnalysisResult {
+  readonly status: "ready" | "not_testable";
+  readonly reason?: string;
+  readonly tracks: readonly unknown[];
+  readonly attributionMethod: string;
+  readonly inputFingerprint: string;
+  readonly schemaVersion: string;
+  readonly fragmentSelection?: string;
+  readonly legacyQuotaRowsExcluded?: number;
+  readonly legacyUsageRowsExcluded?: number;
+}
 
 function validCompositionQuotaRow(row: DownsampledQuotaRow): boolean {
   const observed = Date.parse(row.observed_at), reset = Date.parse(row.resets_at);
@@ -2650,6 +2736,590 @@ async function finishAcquiredAnalyses(db: D1Database, participantId: string, evi
   }
   await assertV1SourcePinCurrent(db, sourcePin);
   return { quotaAnalysis, modelComposition };
+}
+
+/**
+ * Finish effective retained/v1/v1.1/v1.2 composition rows with the same
+ * bounded accumulator and calibration kernel as the prepared v1 path. This is
+ * an adapter boundary, not a second model implementation: source readers
+ * prove the complete window and current pin before calling it, while this
+ * function owns the existing single-plan, priced-usage, overflow, and fit
+ * gates. A refusal remains explicit and is never converted into a zero fit.
+ */
+function finishProviderCompositionKernel(
+  input: V1ProviderCompositionRows,
+  excluded: { readonly legacyQuotaRowsExcluded: number; readonly legacyUsageRowsExcluded: number },
+): V1ModelCompositionResult {
+  if (!/^[0-9a-f]{64}$/u.test(input.sourceFingerprint)
+      || !Array.isArray(input.quotaRows) || !Array.isArray(input.usageRows)) {
+    throw new TypeError("effective composition source identity invalid");
+  }
+  const maxQuotaRows = input.maxQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS;
+  const maxUsageRows = input.maxUsageRows ?? MAX_WINDOWED_USAGE_ROWS;
+  if (!Number.isSafeInteger(maxQuotaRows) || maxQuotaRows < 1
+      || !Number.isSafeInteger(maxUsageRows) || maxUsageRows < 1) {
+    throw new TypeError("effective composition bounds invalid");
+  }
+  if (input.quotaRows.length > maxQuotaRows) {
+    return { status: "not_testable", reason: "downsampled_quota_limit_exceeded" };
+  }
+  if (input.usageRows.length > maxUsageRows) {
+    return { status: "not_testable", reason: "windowed_usage_limit_exceeded" };
+  }
+  const rows: DownsampledQuotaRow[] = [];
+  const providers = new Set<string>();
+  const plans = new Set<string>();
+  for (const row of input.quotaRows) {
+    if (!row || typeof row !== "object"
+        || typeof row.occurrenceId !== "string"
+        || typeof row.observedAt !== "string"
+        || typeof row.provider !== "string"
+        || typeof row.planType !== "string"
+        || typeof row.planVariant !== "string"
+        || typeof row.limitId !== "string"
+        || typeof row.slot !== "string"
+        || typeof row.usedPercent !== "number"
+        || typeof row.windowDurationMinutes !== "number"
+        || typeof row.resetsAt !== "string") continue;
+    const candidate: DownsampledQuotaRow = {
+      occurrence_id: row.occurrenceId,
+      observed_at: row.observedAt,
+      provider: row.provider,
+      plan_type: row.planType,
+      plan_variant: row.planVariant,
+      limit_id: row.limitId,
+      slot: row.slot,
+      used_percent: row.usedPercent,
+      window_duration_minutes: row.windowDurationMinutes,
+      resets_at: row.resetsAt,
+      plan_era_key: "effective-source",
+    };
+    if (!validCompositionQuotaRow(candidate)) continue;
+    rows.push(candidate);
+    providers.add(row.provider);
+    plans.add(row.planType);
+  }
+  if (rows.length === 0) return { status: "not_testable", reason: "supported_quota_track_unavailable" };
+  if (plans.size > 1) return { status: "not_testable", reason: "multi_plan_window_unsupported" };
+  const providerSet = new Set(rows.map((row) => row.provider));
+  const accumulator = createCompositionUsageAccumulator(
+    providerSet,
+    compositionQuotaBins(rows.map((row) => Date.parse(row.observed_at))),
+  );
+  const usageRows = [...input.usageRows].sort((left, right) =>
+    left.observedAt < right.observedAt ? -1 : left.observedAt > right.observedAt ? 1
+      : left.occurrenceId < right.occurrenceId ? -1 : left.occurrenceId > right.occurrenceId ? 1 : 0);
+  for (let index = 0; index < usageRows.length; index += 1) {
+    const row = usageRows[index]!;
+    if (!row || typeof row !== "object" || typeof row.provider !== "string"
+        || !providerSet.has(row.provider) || typeof row.observedAt !== "string"
+        || typeof row.occurrenceId !== "string" || typeof row.recordJson !== "string") continue;
+    const observedAtMs = Date.parse(row.observedAt);
+    if (!Number.isFinite(observedAtMs)) continue;
+    const usage: WindowedUsageRow = {
+      id: index + 1,
+      occurrence_id: row.occurrenceId,
+      observed_at: row.observedAt,
+      provider: row.provider,
+      session_uuid: null,
+      record_json: row.recordJson,
+    };
+    accumulator.add(usage, observedAtMs, priceChunkUsageRecord(row.recordJson, row.observedAt));
+  }
+  const folded = accumulator.finish();
+  if (folded.status === "not_testable") return folded;
+  const quotaRows = rows.map((row) => ({
+    observedAtMs: Date.parse(row.observed_at),
+    planType: row.plan_type,
+    resetsAtMs: Date.parse(row.resets_at),
+    usedPercent: row.used_percent,
+  }));
+  const corpus = buildCompositionObservationsFromOrderedUsage({
+    usageRows: folded.usageRows,
+    quotaRows,
+  });
+  const fit = calibrateCompositionCapacities(corpus.observations);
+  const latestQuotaMs = Math.max(...rows.map((row) => Date.parse(row.observed_at)));
+  return {
+    status: "ready",
+    planType: [...plans][0]!,
+    fit,
+    voidedBinCount: corpus.voidedBinCount,
+    poolCount: corpus.poolCount,
+    quotaRowCount: rows.length,
+    usageEventCount: folded.usageEventCount,
+    unpricedUsageEventCount: folded.unpricedUsageEventCount,
+    poisonedBinCount: folded.poisonedBinCount,
+    latestQuotaObservedAt: new Date(latestQuotaMs).toISOString(),
+    attributionStatus: "effective_source",
+    attributionMethod: input.attributionMethod ?? "telemetry-effective-source-v1:model",
+    inputFingerprint: input.sourceFingerprint,
+    legacyQuotaRowsExcluded: excluded.legacyQuotaRowsExcluded,
+    legacyUsageRowsExcluded: excluded.legacyUsageRowsExcluded,
+  };
+}
+
+/**
+ * Finish effective retained/v1/v1.1/v1.2 model rows only after the source
+ * bridge has preserved its account-track groups. The existing model kernel is
+ * single-track: multiple modern identities are refused rather than flattened,
+ * while a same-track v1.1/v1.2 corpus may be combined. Legacy rows are
+ * validated, counted, and excluded from the modern fit.
+ */
+export function finishProviderEffectiveModelComposition(
+  input: V1ProviderEffectiveModelRows,
+): V1ModelCompositionResult {
+  const sourceFingerprint = input?.sourceFingerprint;
+  const sourceGroups = input?.sourceGroups;
+  if (!/^[0-9a-f]{64}$/u.test(sourceFingerprint)
+      || !Array.isArray(sourceGroups)) {
+    throw new TypeError("effective model source groups invalid");
+  }
+  const maxQuotaRows = input.maxQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS;
+  const maxUsageRows = input.maxUsageRows ?? MAX_WINDOWED_USAGE_ROWS;
+  if (!Number.isSafeInteger(maxQuotaRows) || maxQuotaRows < 1
+      || maxQuotaRows > MAX_DOWNSAMPLED_QUOTA_ROWS
+      || !Number.isSafeInteger(maxUsageRows) || maxUsageRows < 1
+      || maxUsageRows > MAX_WINDOWED_USAGE_ROWS) {
+    throw new TypeError("effective model bounds invalid");
+  }
+  const method = input.attributionMethod ?? "telemetry-effective-source-v1:model";
+  if (typeof method !== "string" || !SAFE_TOKEN.test(method)) {
+    throw new TypeError("effective model attribution method invalid");
+  }
+  const refusal = (reason: string): V1ModelCompositionRefusal => ({ status: "not_testable", reason });
+  if (sourceGroups.length === 0) return refusal("effective_source_groups_required");
+  if (sourceGroups.length > MAX_CONTINUITY_TRACKS) return refusal("continuity_track_limit_exceeded");
+
+  type Group = V1ProviderEffectiveQuotaSourceGroup;
+  const isRecord = (value: unknown): value is Record<string, unknown> =>
+    typeof value === "object" && value !== null && !Array.isArray(value);
+  const groupKey = (group: Group): string => JSON.stringify([
+    group.kind, group.datasetId, group.accountTrackId, group.policyEpoch,
+  ]);
+  const groups: Group[] = [];
+  const groupKeys = new Set<string>();
+  let totalQuotaRows = 0;
+  let totalUsageRows = 0;
+  for (const value of sourceGroups) {
+    if (!isRecord(value)
+        || (value.kind !== "modern" && value.kind !== "legacy")
+        || typeof value.datasetId !== "string"
+        || (value.accountTrackId !== null && typeof value.accountTrackId !== "string")
+        || typeof value.policyEpoch !== "string"
+        || typeof value.completeWindow !== "boolean"
+        || !Array.isArray(value.quotaRows) || !Array.isArray(value.usageRows)) {
+      return refusal("effective_source_group_invalid");
+    }
+    const group = value as unknown as Group;
+    if (!EFFECTIVE_DATASET_ID.test(group.datasetId)
+        || !SAFE_TOKEN.test(group.policyEpoch)
+        || (group.kind === "modern"
+          ? !EFFECTIVE_ACCOUNT_TRACK_ID.test(group.accountTrackId ?? "")
+          : group.accountTrackId !== null)) {
+      return refusal(group.kind === "legacy"
+        ? "legacy_account_attribution_invalid"
+        : "effective_account_attribution_unavailable");
+    }
+    if (!group.completeWindow) return refusal("incomplete_dataset");
+    const key = groupKey(group);
+    if (groupKeys.has(key)) return refusal("effective_source_group_duplicate");
+    groupKeys.add(key);
+    groups.push(group);
+    totalQuotaRows += group.quotaRows.length;
+    totalUsageRows += group.usageRows.length;
+  }
+  if (totalQuotaRows > maxQuotaRows) return refusal("downsampled_quota_limit_exceeded");
+  if (totalUsageRows > maxUsageRows) return refusal("windowed_usage_limit_exceeded");
+
+  const quotaOccurrenceIds = new Set<string>();
+  const usageOccurrenceIds = new Set<string>();
+  const modernTracks = new Set<string>();
+  const modernQuotaRows: V1ProviderCompositionQuotaRow[] = [];
+  const modernUsageRows: V1ProviderCompositionUsageRow[] = [];
+  let legacyQuotaRowsExcluded = 0;
+  let legacyUsageRowsExcluded = 0;
+  const quotaRowShape = (value: unknown): value is V1ProviderCompositionQuotaRow => {
+    if (!isRecord(value)
+        || typeof value.occurrenceId !== "string" || !SAFE_TOKEN.test(value.occurrenceId)
+        || typeof value.observedAt !== "string" || !validEffectiveInstant(value.observedAt)
+        || typeof value.provider !== "string" || !SAFE_TOKEN.test(value.provider)
+        || typeof value.planType !== "string" || !SAFE_TOKEN.test(value.planType)
+        || typeof value.planVariant !== "string" || !SAFE_TOKEN.test(value.planVariant)
+        || typeof value.limitId !== "string" || !SAFE_TOKEN.test(value.limitId)
+        || typeof value.slot !== "string"
+        || typeof value.usedPercent !== "number" || !Number.isFinite(value.usedPercent)
+        || typeof value.windowDurationMinutes !== "number"
+        || !Number.isSafeInteger(value.windowDurationMinutes)
+        || !isSupportedQuotaWindowDuration(value.windowDurationMinutes)
+        || typeof value.resetsAt !== "string" || !validEffectiveInstant(value.resetsAt)) {
+      return false;
+    }
+    const candidate: DownsampledQuotaRow = {
+      occurrence_id: value.occurrenceId,
+      observed_at: value.observedAt,
+      provider: value.provider,
+      plan_type: value.planType,
+      plan_variant: value.planVariant,
+      limit_id: value.limitId,
+      slot: value.slot,
+      used_percent: value.usedPercent,
+      window_duration_minutes: value.windowDurationMinutes,
+      resets_at: value.resetsAt,
+      plan_era_key: "effective-source",
+    };
+    return validCompositionQuotaRow(candidate);
+  };
+  const usageRowShape = (value: unknown): value is V1ProviderCompositionUsageRow =>
+    isRecord(value)
+    && typeof value.occurrenceId === "string" && SAFE_TOKEN.test(value.occurrenceId)
+    && typeof value.observedAt === "string" && validEffectiveInstant(value.observedAt)
+    && typeof value.provider === "string" && SAFE_TOKEN.test(value.provider)
+    && typeof value.recordJson === "string" && value.recordJson.length > 0;
+
+  for (const group of groups) {
+    if (group.kind === "legacy") {
+      legacyQuotaRowsExcluded += group.quotaRows.length;
+      legacyUsageRowsExcluded += group.usageRows.length;
+      for (const row of group.quotaRows) {
+        if (!quotaRowShape(row)) return refusal("legacy_quota_rows_invalid");
+        if (quotaOccurrenceIds.has(row.occurrenceId)) return refusal("effective_quota_rows_duplicate");
+        quotaOccurrenceIds.add(row.occurrenceId);
+      }
+      for (const row of group.usageRows) {
+        if (!usageRowShape(row)) return refusal("legacy_usage_rows_invalid");
+        if (usageOccurrenceIds.has(row.occurrenceId)) return refusal("effective_usage_rows_duplicate");
+        usageOccurrenceIds.add(row.occurrenceId);
+      }
+      continue;
+    }
+    modernTracks.add(group.accountTrackId!);
+    for (const row of group.quotaRows) {
+      if (!quotaRowShape(row)) return refusal("effective_quota_rows_invalid");
+      if (quotaOccurrenceIds.has(row.occurrenceId)) return refusal("effective_quota_rows_duplicate");
+      quotaOccurrenceIds.add(row.occurrenceId);
+      modernQuotaRows.push(row);
+    }
+    for (const row of group.usageRows) {
+      if (!usageRowShape(row)) return refusal("effective_usage_rows_invalid");
+      if (usageOccurrenceIds.has(row.occurrenceId)) return refusal("effective_usage_rows_duplicate");
+      usageOccurrenceIds.add(row.occurrenceId);
+      modernUsageRows.push(row);
+    }
+  }
+  if (modernTracks.size === 0) return refusal("effective_source_modern_group_unavailable");
+  if (modernTracks.size > 1) return refusal("effective_model_account_attribution_conflict");
+
+  const providerPlans = new Map<string, { planType: string; planVariant: string; limitId: string }>();
+  const plans = new Set<string>();
+  for (const row of modernQuotaRows) {
+    const prior = providerPlans.get(row.provider);
+    const current = { planType: row.planType, planVariant: row.planVariant, limitId: row.limitId };
+    if (prior && (prior.planType !== current.planType
+        || prior.planVariant !== current.planVariant || prior.limitId !== current.limitId)) {
+      return refusal("effective_model_provider_plan_conflict");
+    }
+    providerPlans.set(row.provider, prior ?? current);
+    plans.add(row.planType);
+  }
+  if (modernQuotaRows.length === 0) return refusal("supported_quota_track_unavailable");
+  if (plans.size > 1) return refusal("multi_plan_window_unsupported");
+  const providers = new Set(modernQuotaRows.map((row) => row.provider));
+  for (const row of modernUsageRows) {
+    if (!providers.has(row.provider)) return refusal("effective_usage_attribution_unavailable");
+    if (priceChunkUsageRecord(row.recordJson, row.observedAt) === null) {
+      return refusal("effective_usage_pricing_unavailable");
+    }
+  }
+  return finishProviderCompositionKernel({
+    quotaRows: modernQuotaRows,
+    usageRows: modernUsageRows,
+    sourceFingerprint,
+    attributionMethod: method,
+    maxQuotaRows,
+    maxUsageRows,
+  }, { legacyQuotaRowsExcluded, legacyUsageRowsExcluded });
+}
+
+/**
+ * Finish effective-source quota observations through the existing scalar
+ * reset/calibration kernel.  The provider supplies a complete-window
+ * fingerprint and the opaque continuity IDs; no D1-shaped reader, SQL
+ * translation, or participant-derived attribution is accepted here.
+ *
+ * The effective reader currently exposes usage payloads without a separate
+ * plan stream.  Therefore this bounded adapter accepts one unambiguous plan
+ * and limit identity per provider, while retaining each supported window as a
+ * separate reset track. Usage rows inherit only that source-proven provider
+ * track, never a guessed account or plan identity.
+ */
+export function finishProviderEffectiveQuotaAnalysis(
+  input: V1ProviderEffectiveQuotaRows,
+): V1ProviderEffectiveQuotaAnalysisResult {
+  const sourceFingerprint = input?.sourceFingerprint;
+  const sourceGroups = input?.sourceGroups;
+  if (!/^[0-9a-f]{64}$/u.test(sourceFingerprint)
+      || !Array.isArray(sourceGroups)) {
+    throw new TypeError("effective quota source groups invalid");
+  }
+  const maxQuotaRows = input.maxQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS;
+  const maxUsageRows = input.maxUsageRows ?? MAX_WINDOWED_USAGE_ROWS;
+  if (!Number.isSafeInteger(maxQuotaRows) || maxQuotaRows < 1
+      || maxQuotaRows > MAX_DOWNSAMPLED_QUOTA_ROWS
+      || !Number.isSafeInteger(maxUsageRows) || maxUsageRows < 1
+      || maxUsageRows > MAX_WINDOWED_USAGE_ROWS) {
+    throw new TypeError("effective quota bounds invalid");
+  }
+  const method = input.attributionMethod ?? "telemetry-effective-source-v1:quota";
+  if (typeof method !== "string" || !SAFE_TOKEN.test(method)) {
+    throw new TypeError("effective quota attribution method invalid");
+  }
+  let legacyQuotaRowsExcluded = 0;
+  let legacyUsageRowsExcluded = 0;
+  const refusal = (reason: string): V1ProviderEffectiveQuotaAnalysisResult => ({
+    ...notTestable(reason),
+    attributionMethod: method,
+    inputFingerprint: sourceFingerprint,
+    legacyQuotaRowsExcluded,
+    legacyUsageRowsExcluded,
+  } as V1ProviderEffectiveQuotaAnalysisResult);
+  if (sourceGroups.length === 0) return refusal("effective_source_groups_required");
+  if (sourceGroups.length > MAX_CONTINUITY_TRACKS) return refusal("continuity_track_limit_exceeded");
+
+  type Group = V1ProviderEffectiveQuotaSourceGroup;
+  const isRecord = (value: unknown): value is Record<string, unknown> =>
+    typeof value === "object" && value !== null && !Array.isArray(value);
+  const groupKey = (group: Group): string => JSON.stringify([
+    group.kind, group.datasetId, group.accountTrackId, group.policyEpoch,
+  ]);
+  const groups: Group[] = [];
+  const groupKeys = new Set<string>();
+  for (const value of sourceGroups) {
+    if (!isRecord(value)
+        || (value.kind !== "modern" && value.kind !== "legacy")
+        || typeof value.datasetId !== "string"
+        || (value.accountTrackId !== null && typeof value.accountTrackId !== "string")
+        || typeof value.policyEpoch !== "string"
+        || typeof value.completeWindow !== "boolean"
+        || !Array.isArray(value.quotaRows) || !Array.isArray(value.usageRows)) {
+      return refusal("effective_source_group_invalid");
+    }
+    const group = value as unknown as Group;
+    if (!EFFECTIVE_DATASET_ID.test(group.datasetId)
+        || !SAFE_TOKEN.test(group.policyEpoch)
+        || (group.kind === "modern"
+          ? !EFFECTIVE_ACCOUNT_TRACK_ID.test(group.accountTrackId ?? "")
+          : group.accountTrackId !== null)) {
+      return refusal(group.kind === "legacy"
+        ? "legacy_account_attribution_invalid"
+        : "effective_account_attribution_unavailable");
+    }
+    const key = groupKey(group);
+    if (groupKeys.has(key)) return refusal("effective_source_group_duplicate");
+    groupKeys.add(key);
+    groups.push(group);
+  }
+  groups.sort((left, right) => groupKey(left).localeCompare(groupKey(right)));
+
+  const quotaOccurrenceIds = new Set<string>();
+  const usageOccurrenceIds = new Set<string>();
+  const quotaSnapshots: AttributedQuotaSnapshot[] = [];
+  const usageEvents: AttributedUsageEventPartial[] = [];
+  const datasets = new Map<string, boolean>();
+  let modernGroupCount = 0;
+  let totalQuotaRows = 0;
+  let totalUsageRows = 0;
+
+  const quotaRowShape = (value: unknown, requireSupportedWindow: boolean): value is V1ProviderCompositionQuotaRow => {
+    if (!isRecord(value)
+        || typeof value.occurrenceId !== "string" || !SAFE_TOKEN.test(value.occurrenceId)
+        || typeof value.observedAt !== "string" || typeof value.provider !== "string"
+        || !SAFE_TOKEN.test(value.provider)
+        || typeof value.planType !== "string" || typeof value.planVariant !== "string"
+        || typeof value.limitId !== "string" || typeof value.slot !== "string"
+        || typeof value.usedPercent !== "number" || typeof value.windowDurationMinutes !== "number"
+        || typeof value.resetsAt !== "string") return false;
+    const raw: RawQuotaRow = {
+      occurrence_id: value.occurrenceId,
+      observed_at: value.observedAt,
+      provider: value.provider,
+      plan_type: value.planType,
+      plan_variant: value.planVariant,
+      limit_id: value.limitId,
+      slot: value.slot,
+      used_percent: value.usedPercent,
+      window_duration_minutes: value.windowDurationMinutes,
+      resets_at: value.resetsAt,
+    };
+    return validQuotaSnapshotRow(raw)
+      && (!requireSupportedWindow || isSupportedQuotaWindowDuration(value.windowDurationMinutes))
+      && validEffectiveInstant(value.observedAt)
+      && validEffectiveInstant(value.resetsAt);
+  };
+  const usageRowShape = (value: unknown): value is V1ProviderCompositionUsageRow =>
+    isRecord(value)
+    && typeof value.occurrenceId === "string" && SAFE_TOKEN.test(value.occurrenceId)
+    && typeof value.observedAt === "string" && validEffectiveInstant(value.observedAt)
+    && typeof value.provider === "string" && SAFE_TOKEN.test(value.provider)
+    && typeof value.recordJson === "string";
+
+  for (const group of groups) {
+    totalQuotaRows += group.quotaRows.length;
+    totalUsageRows += group.usageRows.length;
+  }
+  if (totalQuotaRows > maxQuotaRows) return refusal("downsampled_quota_limit_exceeded");
+  if (totalUsageRows > maxUsageRows) return refusal("windowed_usage_limit_exceeded");
+
+  for (const group of groups) {
+    if (!group.completeWindow) return refusal("incomplete_dataset");
+    if (group.kind === "legacy") {
+      legacyQuotaRowsExcluded += group.quotaRows.length;
+      legacyUsageRowsExcluded += group.usageRows.length;
+      for (const row of group.quotaRows) {
+        if (!quotaRowShape(row, false)) return refusal("legacy_quota_rows_invalid");
+        if (quotaOccurrenceIds.has(row.occurrenceId)) return refusal("effective_quota_rows_duplicate");
+        quotaOccurrenceIds.add(row.occurrenceId);
+      }
+      for (const row of group.usageRows) {
+        if (!usageRowShape(row)) return refusal("legacy_usage_rows_invalid");
+        if (usageOccurrenceIds.has(row.occurrenceId)) return refusal("effective_usage_rows_duplicate");
+        usageOccurrenceIds.add(row.occurrenceId);
+      }
+      continue;
+    }
+
+    modernGroupCount += 1;
+    const tracks = new Map<string, {
+      planType: string;
+      planVariant: string;
+      limitId: string;
+      windowDurationMinutes: number;
+    }>();
+    const providerPlans = new Map<string, {
+      planType: string;
+      planVariant: string;
+      limitId: string;
+    }>();
+    const providers = new Set<string>();
+    const plans = new Set<string>();
+    const quotaRows: V1ProviderCompositionQuotaRow[] = [];
+    for (const row of group.quotaRows) {
+      if (!quotaRowShape(row, true)) return refusal("effective_quota_rows_invalid");
+      if (quotaOccurrenceIds.has(row.occurrenceId)) return refusal("effective_quota_rows_duplicate");
+      quotaOccurrenceIds.add(row.occurrenceId);
+      const track = {
+        planType: row.planType,
+        planVariant: row.planVariant,
+        limitId: row.limitId,
+        windowDurationMinutes: row.windowDurationMinutes,
+      };
+      const providerPrior = providerPlans.get(row.provider);
+      if (providerPrior && (providerPrior.planType !== track.planType
+          || providerPrior.planVariant !== track.planVariant
+          || providerPrior.limitId !== track.limitId)) {
+        return refusal("effective_usage_attribution_unavailable");
+      }
+      const trackKey = `${row.provider}\u0000${row.windowDurationMinutes}`;
+      const prior = tracks.get(trackKey);
+      if (prior && (prior.planType !== track.planType
+          || prior.planVariant !== track.planVariant
+          || prior.limitId !== track.limitId
+          || prior.windowDurationMinutes !== track.windowDurationMinutes)) {
+        return refusal("effective_usage_attribution_unavailable");
+      }
+      tracks.set(trackKey, prior ?? track);
+      providerPlans.set(row.provider, providerPrior ?? {
+        planType: track.planType, planVariant: track.planVariant, limitId: track.limitId,
+      });
+      providers.add(row.provider);
+      plans.add(row.planType);
+      quotaRows.push(row);
+    }
+    if (quotaRows.length === 0) return refusal("supported_quota_track_unavailable");
+    if (plans.size > 1) return refusal("multi_plan_window_unsupported");
+    if (datasets.has(group.datasetId) && datasets.get(group.datasetId) !== group.completeWindow) {
+      return refusal("effective_dataset_completeness_conflict");
+    }
+    datasets.set(group.datasetId, group.completeWindow);
+    quotaRows.sort((left, right) => left.observedAt.localeCompare(right.observedAt)
+      || left.occurrenceId.localeCompare(right.occurrenceId));
+    for (const row of quotaRows) {
+      quotaSnapshots.push({
+        snapshotId: effectiveOpaqueId("quota-effective", quotaSnapshots.length),
+        datasetId: group.datasetId,
+        accountTrackId: group.accountTrackId!,
+        provider: row.provider,
+        planType: row.planType,
+        planVariant: row.planVariant,
+        limitId: row.limitId,
+        slot: row.slot as QuotaSlot,
+        windowDurationMinutes: row.windowDurationMinutes as QuotaWindowDurationMinutes,
+        resetsAt: row.resetsAt,
+        observedAt: row.observedAt,
+        receivedAt: row.observedAt,
+        usedPercent: row.usedPercent,
+        displayPrecision: 0,
+        policyEpoch: group.policyEpoch,
+        planEraKey: "effective-source",
+      });
+    }
+
+    const usageRows: V1ProviderCompositionUsageRow[] = [];
+    for (const row of group.usageRows) {
+      if (!usageRowShape(row)) return refusal("effective_usage_rows_invalid");
+      if (usageOccurrenceIds.has(row.occurrenceId)) return refusal("effective_usage_rows_duplicate");
+      // Record the occurrence before pricing. A null-priced first duplicate is
+      // still a duplicate and must not disappear through DROP semantics.
+      usageOccurrenceIds.add(row.occurrenceId);
+      if (!providers.has(row.provider)) return refusal("effective_usage_attribution_unavailable");
+      usageRows.push(row);
+    }
+    usageRows.sort((left, right) => left.observedAt.localeCompare(right.observedAt)
+      || left.occurrenceId.localeCompare(right.occurrenceId));
+    for (const row of usageRows) {
+      const track = providerPlans.get(row.provider)!;
+      const priced = priceChunkUsageRecord(row.recordJson, row.observedAt);
+      if (priced === null) return refusal("effective_usage_pricing_unavailable");
+      usageEvents.push({
+        eventId: effectiveOpaqueId("usage-effective", usageEvents.length),
+        datasetId: group.datasetId,
+        accountTrackId: group.accountTrackId!,
+        provider: row.provider,
+        observedAt: row.observedAt,
+        costNanousd: priced.costNanousd,
+        pricingStatus: priced.pricingStatus,
+        policyEpoch: group.policyEpoch,
+        contextKey: planAttributionContextKey(row.provider, track.limitId),
+        planEraKey: "effective-source",
+        attribution: "effective_source",
+      });
+    }
+  }
+  if (modernGroupCount === 0) return refusal("effective_source_modern_group_unavailable");
+
+  const analysis = runV1SeedLoop(
+    [...datasets].map(([datasetId, complete]) => ({ datasetId, complete })),
+    quotaSnapshots,
+    usageEvents,
+    "effective_source",
+  );
+  return ({
+    ...analysis,
+    attributionMethod: method,
+    inputFingerprint: sourceFingerprint,
+    legacyQuotaRowsExcluded,
+    legacyUsageRowsExcluded,
+  } as V1ProviderEffectiveQuotaAnalysisResult);
+}
+
+
+function effectiveOpaqueId(prefix: string, index: number): string {
+  return `${prefix}:v1:${index.toString(16).padStart(64, "0")}`;
+}
+
+function validEffectiveInstant(value: string): boolean {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
 }
 
 /**

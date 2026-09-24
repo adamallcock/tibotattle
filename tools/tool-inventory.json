@@ -5,6 +5,38 @@
   "records": [
     {
       "classification": "build_release_operation",
+      "owner": "gcp_test",
+      "canonicalPath": "scripts/gcp-cloud-run-journey.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private synthetic GCP test journey; exact target and phase are supplied explicitly.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/gcp-cloud-run-journey.check.mjs",
+        "test/gcp-cloud-run-journey.test.js",
+        "apps/worker/postgres-test/gcp-cloud-run-journey-fixture.spec.mjs"
+      ],
+      "decision": "retain_as_bounded_private_gcp_test_harness",
+      "provenance": "docs/plans/2026-09-24-gcp-source-integration.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "gcp_test",
+      "canonicalPath": "scripts/gcp-cloud-run-journey.check.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Focused test command for the private GCP journey runner; not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/gcp-cloud-run-journey.test.js"
+      ],
+      "decision": "retain_as_bounded_private_gcp_test_harness_check",
+      "provenance": "docs/plans/2026-09-24-gcp-source-integration.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
       "owner": "electron_packaging",
       "canonicalPath": "scripts/lib/windows-synthetic-source-owner.mjs",
       "stableAlias": null,
@@ -32,7 +64,8 @@
       "callers": [
         "package.json#scripts.diagnose:desktop-crash",
         "test/offline-crash-doctor.test.js",
-        "docs/reference/cli-reference.md"
+        "docs/reference/cli-reference.md",
+        "scripts/smoke-electron-macos-sparkle-transition.mjs"
       ],
       "decision": "retain_as_explicit_read_only_support_entrypoint",
       "provenance": "docs/decisions/2026-09-21-opt-in-crash-doctor.md",

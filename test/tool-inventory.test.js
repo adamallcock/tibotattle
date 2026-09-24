@@ -303,7 +303,7 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 170 records / 171 executable paths: release-documentation, Codex contract,
+  // 172 records / 173 executable paths: release-documentation, Codex contract,
   // documentation governance, repository-layout, macOS bundle-version, and
   // local index-recovery gates are reviewed repository operations invoked by
   // CI, release runbooks, or supported internal product tooling.
@@ -327,8 +327,10 @@ test("the checked-in inventory classifies every retained tool entry point and np
   // journey to final package bytes without rebuilding or publishing them.
   // The last four are the macOS credential qualification set: the fixture
   // preparer, the credentials smoke, and the loopback/intake helpers.
-  assert.equal(result.records, 170);
-  assert.equal(result.candidates.length, 171);
+  // The private GCP test journey and its focused refusal check are explicit
+  // operations, not product commands.
+  assert.equal(result.records, 172);
+  assert.equal(result.candidates.length, 173);
   assert.ok(result.aliases >= 25);
 });
 
