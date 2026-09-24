@@ -18,6 +18,7 @@ export const TELEMETRY_PLAN_TYPES: readonly [
   "plus",
   "pro",
   "prolite",
+  "promax",
   "team",
   "self_serve_business_prolite",
   "self_serve_business_usage_based",

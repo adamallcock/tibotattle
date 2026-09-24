@@ -14,7 +14,7 @@
     {
       "schemaName": "activity-marker.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/activity-marker.schema.json",
-      "schemaSha256": "3e6db5204d174d0cc01cade736ea3243535c31514d54f0a521e6920f9f6ba20c",
+      "schemaSha256": "78cbc3d08ecfbd5481f663fc619c83135ef964bc463ac73ec83a2baddc35a2f5",
       "propertyCount": 9
     },
     {
@@ -38,7 +38,7 @@
     {
       "schemaName": "quota-snapshot.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/quota-snapshot.schema.json",
-      "schemaSha256": "2d426427ae33087cb52f1f7aa12497200ee758d24f7974e20329a90c2199246b",
+      "schemaSha256": "21edb13e2db787fa0499c8e6fcd5a83427d206d60eae8f6e11a300c8e4ca2ba1",
       "propertyCount": 18
     },
     {

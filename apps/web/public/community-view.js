@@ -510,8 +510,9 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
   const breakdownDays = new Map(series.breakdowns.days.map(day => [day.day, day]));
   const definitions = [
     { key: "aggregate", view: "aggregate", label: null, className: "" },
-    ...[ ["pro", "Pro 20×"], ["prolite", "Pro 5×"], ["plus", "Plus"] ].map(([key, label], index) => ({
-      key, label, view: "plans", className: `allowance-series-${index}`,
+    ...(series.breakdowns.planIds ?? Object.keys(series.breakdowns.days.at(-1)?.byPlanType ?? {})).map((key, index) => ({
+      label: { pro: "Pro 20×", prolite: "Pro 5×", promax: "Pro 50×", plus: "Plus" }[key],
+      key, view: "plans", className: `allowance-series-${index}`,
     })),
     ...series.breakdowns.modelConfig.map(({ modelId, label }, index) => ({
       key: modelId, label, view: "models", ...allowanceModelPresentation(modelId, index),
@@ -1627,7 +1628,8 @@ export function renderCommunityAllowanceSection({
       appendCommunityAllowanceChart({ documentRef, container, model, t, inspection });
     }
     container.append(node("p", "snapshot-disclosure", t(view === "models"
-      ? "community.allowance.modelMethod" : "community.allowance.planMethod")));
+      ? "community.allowance.modelMethod"
+      : series.breakdowns?.isCurrent ? "community.allowance.planMethod" : "community.allowance.planMethodLegacy")));
     return "published";
   }
   const headline = node("div", "allowance-headline");
@@ -1670,7 +1672,8 @@ export function renderCommunityAllowanceSection({
   container.append(node(
     "p",
     "snapshot-disclosure",
-    t("community.allowance.methodNote"),
+    t((series.breakdowns?.isCurrent ?? series.allowanceIsCurrent)
+      ? "community.allowance.methodNote" : "community.allowance.methodNoteLegacy"),
   ));
   return "published";
 }

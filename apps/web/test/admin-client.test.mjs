@@ -353,11 +353,12 @@ function allowancePreviewPayload() {
     byPlanType: {
       pro: emptyAllowanceSummary(),
       prolite: emptyAllowanceSummary(),
+      promax: emptyAllowanceSummary(),
       plus: emptyAllowanceSummary(),
     },
   }));
   days.at(-1).combined = {
-    fitCount: 6,
+    fitCount: 7,
     participantCount: 4,
     centralUsd: 2_100,
     band80Usd: { lowerUsd: 1_800, upperUsd: 2_400 },
@@ -375,6 +376,12 @@ function allowancePreviewPayload() {
       centralUsd: 2_200,
       band80Usd: null,
     },
+    promax: {
+      fitCount: 1,
+      participantCount: 1,
+      centralUsd: 2_300,
+      band80Usd: null,
+    },
     plus: {
       fitCount: 3,
       participantCount: 2,
@@ -383,11 +390,11 @@ function allowancePreviewPayload() {
     },
   };
   return {
-    schemaVersion: "admin-community-allowance-preview-v0.3",
+    schemaVersion: "admin-community-allowance-preview-v0.4",
     generatedAt: "2026-08-23T10:30:00.000Z",
     from: "2026-06-15",
     to: "2026-08-23",
-    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview",
+    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax50_preview",
     referencePlanType: "pro",
     trailingDays: 30,
     qualification: "shared_reset_fit_gates_25pp_span_floor",
@@ -395,6 +402,7 @@ function allowancePreviewPayload() {
     plans: [
       { planType: "pro", label: "Pro 20x", multiplier: 1 },
       { planType: "prolite", label: "Pro 5x", multiplier: 4 },
+      { planType: "promax", label: "Pro 50x", multiplier: 0.4 },
       { planType: "plus", label: "Plus", multiplier: 20 },
     ],
     days,
@@ -492,10 +500,11 @@ test("admin allowance preview projects the fixed merge trial contract", () => {
   assert.deepEqual(preview.plans.map((plan) => [plan.planType, plan.multiplier]), [
     ["pro", 1],
     ["prolite", 4],
+    ["promax", 0.4],
     ["plus", 20],
   ]);
   assert.deepEqual(preview.days.at(-1).combined, {
-    fitCount: 6,
+    fitCount: 7,
     participantCount: 4,
     centralUsd: 2_100,
     band80Usd: { lowerUsd: 1_800, upperUsd: 2_400 },

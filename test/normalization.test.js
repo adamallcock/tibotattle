@@ -164,6 +164,21 @@ test("reset-credit detail completeness is explicit and count-only reads stay bou
   })), null);
 });
 
+test("provisional Pro 50x account and rate-limit evidence stay aligned", () => {
+  const result = sanitizeCodexAccountSnapshot({
+    account: { account: { email: "promax.fixture@example.test", planType: "promax" } },
+    rateLimits: { rateLimits: {
+      limitId: "codex", planType: "promax",
+      primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1_788_048_360 },
+      secondary: { usedPercent: 50, windowDurationMins: 10_080, resetsAt: 1_788_048_360 },
+    } },
+  }, "2026-07-23T00:00:00.000Z", { accountHmacKey: "test-account-hmac-key" });
+  assert.equal(result.accountScope.planType, "promax");
+  assert.equal(result.canonical.planType, "promax");
+  assert.equal(result.canonical.primary.windowDurationMins, 300);
+  assert.equal(result.canonical.secondary.windowDurationMins, 10_080);
+});
+
 test("Codex app-server child environment never inherits the account HMAC key", () => {
   const environment = codexAppServerChildEnv({
     PATH: "/safe/bin",

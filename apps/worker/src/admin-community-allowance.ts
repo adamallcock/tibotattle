@@ -6,6 +6,7 @@ import {
 import {
   COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG,
   COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+  COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,
   COMMUNITY_ALLOWANCE_QUALIFICATION,
   COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS,
   COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP,
@@ -33,9 +34,9 @@ export const PREVIEW_CACHE_JSON_LIMIT_BYTES = 256 * 1_024;
 const PREVIEW_CACHE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 60 * 1_000;
 
 export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
-  "admin-community-allowance-preview-v0.3";
+  "admin-community-allowance-preview-v0.4";
 export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_BASIS =
-  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview";
+  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax50_preview";
 
 /**
  * The v1 analyzer exposes a trailing 100-day fit corpus. Each historical point
@@ -554,7 +555,7 @@ function prepareCommunityModelCompositionDay(
        attribution_method_version = excluded.attribution_method_version,
        source_mutation_epoch = excluded.source_mutation_epoch`,
   );
-  const values = [payload.day, payloadJson, COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourceMutationEpoch];
+  const values = [payload.day, payloadJson, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, sourceMutationEpoch];
   return captured ? statement.bind(...values,captured.generation,captured.sourceEpoch,captured.hardEpoch,COMMUNITY_ATTRIBUTION_METHOD_VERSION)
     : statement.bind(...values);
 }
@@ -580,7 +581,7 @@ async function readCommunityModelCompositionDays(
     latestAllowedDay,
     MODEL_COMPOSITION_DAY_JSON_LIMIT_BYTES,
     ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS,
-    COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+    COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,
   ).all<{ day: string; payload_json: string }>();
   const days: AdminCommunityModelCompositionDay[] = [];
   for (const row of rows.results) {
@@ -844,7 +845,7 @@ export async function readCachedAdminCommunityAllowancePreview(
   let row: { generated_at: string; payload_json: string } | null;
   try {
     row = await db.prepare(COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL)
-      .bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ATTRIBUTION_METHOD_VERSION)
+      .bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION)
       .first<{ generated_at: string; payload_json: string }>();
   } catch {
     throw new ApiError(503, "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE");
@@ -896,7 +897,7 @@ export async function warmAdminCommunityAllowancePreviewCache(
   try {
     if (recovery && !reserveRecoveryStatements(recovery, 6)) return { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };
     const existing = await db.prepare(COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL)
-      .bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ATTRIBUTION_METHOD_VERSION)
+      .bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION)
       .first<{ generated_at: string; payload_json: string; source_mutation_epoch: number; mutation_epoch: number;
         publication_generation?: string | null }>();
     let previousPreview: AdminCommunityAllowancePreview | null = null;
@@ -932,7 +933,7 @@ export async function warmAdminCommunityAllowancePreviewCache(
         const completed = await db.prepare(`SELECT day FROM community_model_composition_days
           WHERE day >= ?1 AND day < ?2 AND attribution_method_version = ?3
           ORDER BY day DESC LIMIT ?4`)
-          .bind(from, to, COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+          .bind(from, to, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,
             ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS).all<{ day: string }>();
         if (!Array.isArray(completed.results) || completed.results.length > ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS
             || completed.results.some(row => !validDay(row.day) || row.day < from || row.day >= to)) {
@@ -990,7 +991,7 @@ export async function warmAdminCommunityAllowancePreviewCache(
          source_mutation_epoch = excluded.source_mutation_epoch,
          publication_generation = excluded.publication_generation`,
     );
-    const values = [preview.generatedAt,payloadJson,COMMUNITY_ATTRIBUTION_METHOD_VERSION,sourceEpoch,
+    const values = [preview.generatedAt,payloadJson,COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,sourceEpoch,
       prepared?.captured.generation ?? null];
     const statement = prepared ? unbound.bind(...values,prepared.captured.generation,prepared.captured.sourceEpoch,
       prepared.captured.hardEpoch,COMMUNITY_ATTRIBUTION_METHOD_VERSION) : unbound.bind(...values);

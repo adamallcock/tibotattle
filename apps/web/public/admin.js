@@ -1156,7 +1156,7 @@ function growthPlanCohortCard(snapshots) {
     const item = document.createElement("li");
     const name = document.createElement("span");
     name.className = "admin-plan-name";
-    name.textContent = row.plan;
+    name.textContent = ADMIN_ALLOWANCE_PLAN_STYLES[row.plan]?.label ?? row.plan;
     const stat = document.createElement("span");
     stat.className = "admin-plan-stat";
     const people = `${count(row.people)} on plan`;
@@ -2482,7 +2482,8 @@ const ADMIN_ALLOWANCE_CHART_HEIGHT = 300;
 const ADMIN_ALLOWANCE_PLAN_STYLES = Object.freeze({
   pro: Object.freeze({ label: "Pro 20×", className: "allowance-series-0" }),
   prolite: Object.freeze({ label: "Pro 5×", className: "allowance-series-1" }),
-  plus: Object.freeze({ label: "Plus", className: "allowance-series-2" }),
+  promax: Object.freeze({ label: "Pro 50×", className: "allowance-series-2" }),
+  plus: Object.freeze({ label: "Plus", className: "allowance-series-3" }),
 });
 
 function adminAllowanceTickStep(span, target = 4) {
@@ -2996,7 +2997,7 @@ function appendAdminAllowanceChart(container, preview) {
   if (model.mode === "plans") {
     const method = document.createElement("p");
     method.className = "admin-allowance-meta";
-    method.textContent = "Chart scaled to Pro 20×: Pro 20× ×1, Pro 5× ×4, Plus ×20."
+    method.textContent = "Chart scaled to Pro 20×: Pro 20× ×1, Pro 5× ×4, Pro 50× ×0.4, Plus ×20."
       + " Smaller card values show each plan’s own week at API prices."
       + " Shading: middle 80% of qualifying reset fits. Missing days stay gaps.";
     container.append(method);

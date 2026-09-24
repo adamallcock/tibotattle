@@ -62,6 +62,13 @@
       "firstReviewedOn": "2026-08-25"
     },
     {
+      "rawValue": "promax",
+      "displayName": "Pro Max",
+      "lifecycle": "provisional",
+      "firstReviewedOn": "2026-09-24",
+      "note": "User-provided future plan assumption. The raw value and display name have not been verified against an upstream Codex source or released binary."
+    },
+    {
       "rawValue": "team",
       "displayName": "Team",
       "lifecycle": "active",

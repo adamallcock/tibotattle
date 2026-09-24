@@ -140,6 +140,12 @@ test("rate-limit sanitation retains provider duration and fails closed on plan e
   });
 
   assert.equal(sanitized.planType, "unknown");
+  assert.equal(accountFacade.sanitizeRateLimit({
+    limitId: "codex",
+    planType: "promax",
+    primary: { usedPercent: 12, windowDurationMins: 300, resetsAt: 1_788_048_360 },
+    secondary: { usedPercent: 21, windowDurationMins: 10_080, resetsAt: 1_788_048_360 },
+  }).planType, "promax");
   assert.equal(sanitized.limitName, "Codex allowance");
   assert.equal(sanitized.primary.windowDurationMins, 43_200);
   assert.equal(sanitized.secondary.windowDurationMins, 10_080);

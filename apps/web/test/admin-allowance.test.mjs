@@ -357,8 +357,9 @@ test("allowance preview exposes the complete honest 70-day range", async () => {
 test("actual-plan weekly dollars invert the canonical basis before rounding and preserve zero", () => {
   assert.equal(planWeeklyApiEquivalentUsd(2_050.75, "pro"), 2_050.75);
   assert.equal(planWeeklyApiEquivalentUsd(1_917.9, "prolite"), 479.475);
+  assert.equal(planWeeklyApiEquivalentUsd(1_000, "promax"), 2_500);
   assert.equal(planWeeklyApiEquivalentUsd(1_900, "plus"), 95);
-  for (const plan of ["pro", "prolite", "plus"]) {
+  for (const plan of ["pro", "prolite", "promax", "plus"]) {
     assert.equal(planWeeklyApiEquivalentUsd(0, plan), 0);
   }
   for (const value of [null, undefined, "1917.9", NaN, Infinity, -Infinity, -1]) {

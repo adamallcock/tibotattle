@@ -14,9 +14,9 @@ const ADMIN_RECONSTRUCTION_PUBLICATION_STATES = new Set([
 ]);
 const ADMIN_ACTION_SCHEMA_VERSION = "admin-action-v0.1";
 const ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
-  "admin-community-allowance-preview-v0.3";
+  "admin-community-allowance-preview-v0.4";
 const ADMIN_ALLOWANCE_PREVIEW_BASIS =
-  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview";
+  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax50_preview";
 const ADMIN_ALLOWANCE_PREVIEW_DAYS = 70;
 const ADMIN_METRICS_HISTORY_SCHEMA_VERSION = "admin-metrics-history-v0.2";
 const ADMIN_METRICS_HISTORY_MAX_DAYS = 30;
@@ -25,6 +25,7 @@ const ADMIN_METRICS_HISTORY_MAX_GAUGES = 128;
 const ADMIN_ALLOWANCE_PREVIEW_PLANS = Object.freeze([
   Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
   Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 4 }),
+  Object.freeze({ planType: "promax", label: "Pro 50x", multiplier: 0.4 }),
   Object.freeze({ planType: "plus", label: "Plus", multiplier: 20 }),
 ]);
 const ADMIN_ALLOWANCE_PREVIEW_MODELS = ADMIN_MODEL_CONFIG;

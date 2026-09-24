@@ -165,6 +165,13 @@ The v1.1 wire format does not carry a complete quantity-interval proof. Hosted
 allowance remains explicitly conditional even when a record has an account
 pseudonym. This is not a provider-authoritative account billing contract.
 
+The source-verified `promax` identifier is accepted by local v0.1 export and
+staged v1.1 schemas in the dedicated Pro 50x branch. The frozen v0.2
+contribution schema retains its original vocabulary: its local projection
+writes `unknown` for this value, while v1.1 can retain the exact identifier.
+The installed Codex binary has not exposed `promax`, and the 50x allowance and
+window semantics remain unverified. The release contract check stays blocked.
+
 ## Staged continuity successor v1.2
 
 The v1.2 contract adds three required nullable usage fields:
