@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { open } from "node:fs/promises";
+import { createInterface } from "node:readline";
 
 export const ACCOUNTLESS_RETENTION_D1_ARTIFACT_SCHEMA = "tibotattle-accountless-retention-source-artifact-v1";
 export const ACCOUNTLESS_RETENTION_D1_SOURCE_KIND = "cloudflare-d1-accountless-retention-snapshot-v1";
@@ -31,6 +34,9 @@ const SAFE_GENERATION = /^[A-Za-z0-9._:-]{36}$/u;
 const CANONICAL_UTC_MILLIS = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/u;
 const BLOB_FIELDS = new Set(["ledger_device_secret_hash", "device_secret_hash"]);
 const INTEGER_FIELDS = new Set(["marker_head_revision", "head_revision"]);
+const MAX_ARTIFACT_PAGE_BYTES = 16 * 1_024 * 1_024;
+const MAX_MAPPING_ENTRY_BYTES = 8 * 1_024;
+const MAX_ARTIFACT_METADATA_VALUE_BYTES = 1 * 1_024 * 1_024;
 
 export const ACCOUNTLESS_RETENTION_D1_ROW_FIELDS = Object.freeze([
   "participant_id",
@@ -315,6 +321,535 @@ function canonicalMigrationNames(value) {
     artifactFailure("ACCOUNTLESS_RETENTION_SOURCE_MIGRATION_MISMATCH");
   }
   return ACCOUNTLESS_RETENTION_D1_SOURCE_MIGRATIONS;
+}
+
+function streamFailure(code = "ACCOUNTLESS_RETENTION_ARTIFACT_INVALID") {
+  artifactFailure(code);
+}
+
+function decodeJsonBytes(bytes) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    streamFailure();
+  }
+}
+
+function parseJsonText(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    streamFailure();
+  }
+}
+
+/** Detect duplicate object keys before JSON.parse applies last-key-wins semantics. */
+function assertNoDuplicateJsonObjectKeys(text) {
+  const stack = [];
+  for (let index = 0; index < text.length;) {
+    const character = text[index];
+    if (character === '"') {
+      const start = index;
+      index += 1;
+      let escaped = false;
+      while (index < text.length) {
+        const current = text[index];
+        if (escaped) escaped = false;
+        else if (current === "\\") escaped = true;
+        else if (current === '"') break;
+        index += 1;
+      }
+      if (index >= text.length) streamFailure();
+      const container = stack.at(-1);
+      if (container?.kind === "object" && container.expectKey) {
+        const key = parseJsonText(text.slice(start, index + 1));
+        if (container.keys.has(key)) streamFailure();
+        container.keys.add(key);
+        container.expectKey = false;
+      }
+      index += 1;
+      continue;
+    }
+    if (character === "{") {
+      stack.push({ kind: "object", keys: new Set(), expectKey: true });
+    } else if (character === "[") {
+      stack.push({ kind: "array" });
+    } else if (character === ",") {
+      const container = stack.at(-1);
+      if (container?.kind === "object") container.expectKey = true;
+    } else if (character === "}" || character === "]") {
+      stack.pop();
+    }
+    index += 1;
+  }
+}
+
+class JsonFileReader {
+  constructor(path) {
+    this.stream = createReadStream(path, { highWaterMark: 64 * 1_024 });
+    this.iterator = this.stream[Symbol.asyncIterator]();
+    this.chunk = Buffer.alloc(0);
+    this.offset = 0;
+    this.ended = false;
+  }
+
+  async nextChunk() {
+    while (!this.ended) {
+      const next = await this.iterator.next();
+      if (next.done) {
+        this.ended = true;
+        this.chunk = Buffer.alloc(0);
+        this.offset = 0;
+        return false;
+      }
+      this.chunk = Buffer.isBuffer(next.value) ? next.value : Buffer.from(next.value);
+      this.offset = 0;
+      if (this.chunk.length > 0) return true;
+    }
+    return false;
+  }
+
+  async ensureByte() {
+    while (this.offset >= this.chunk.length && !this.ended) {
+      if (!await this.nextChunk()) return false;
+    }
+    return this.offset < this.chunk.length;
+  }
+
+  async peekByte() {
+    return await this.ensureByte() ? this.chunk[this.offset] : null;
+  }
+
+  async readByte() {
+    if (!await this.ensureByte()) return null;
+    return this.chunk[this.offset++];
+  }
+
+  async skipWhitespace() {
+    for (;;) {
+      const byte = await this.peekByte();
+      if (byte !== 0x20 && byte !== 0x09 && byte !== 0x0a && byte !== 0x0d) return;
+      this.offset += 1;
+    }
+  }
+
+  async expectByte(expected) {
+    await this.skipWhitespace();
+    if (await this.readByte() !== expected) streamFailure();
+  }
+
+  async readRawValue(maximumBytes) {
+    await this.skipWhitespace();
+    if (!await this.ensureByte()) streamFailure();
+    const first = this.chunk[this.offset];
+    const parts = [];
+    let total = 0;
+    let start = this.offset;
+    const appendChunkPart = () => {
+      if (this.offset <= start) return;
+      const part = this.chunk.subarray(start, this.offset);
+      total += part.byteLength;
+      if (total > maximumBytes) streamFailure("ACCOUNTLESS_RETENTION_ARTIFACT_VALUE_TOO_LARGE");
+      parts.push(part);
+    };
+    const result = () => decodeJsonBytes(Buffer.concat(parts, total));
+
+    if (first === 0x22) {
+      this.offset += 1;
+      let escaped = false;
+      for (;;) {
+        if (this.offset >= this.chunk.length) {
+          appendChunkPart();
+          if (!await this.nextChunk()) streamFailure();
+          start = 0;
+        }
+        const byte = this.chunk[this.offset++];
+        if (escaped) escaped = false;
+        else if (byte === 0x5c) escaped = true;
+        else if (byte === 0x22) {
+          appendChunkPart();
+          return result();
+        }
+        if (total + this.offset - start > maximumBytes) {
+          streamFailure("ACCOUNTLESS_RETENTION_ARTIFACT_VALUE_TOO_LARGE");
+        }
+      }
+    }
+
+    if (first === 0x7b || first === 0x5b) {
+      const stack = [first === 0x7b ? 0x7d : 0x5d];
+      let inString = false;
+      let escaped = false;
+      this.offset += 1;
+      for (;;) {
+        if (this.offset >= this.chunk.length) {
+          appendChunkPart();
+          if (!await this.nextChunk()) streamFailure();
+          start = 0;
+        }
+        const byte = this.chunk[this.offset++];
+        if (inString) {
+          if (escaped) escaped = false;
+          else if (byte === 0x5c) escaped = true;
+          else if (byte === 0x22) inString = false;
+        } else if (byte === 0x22) inString = true;
+        else if (byte === 0x7b) stack.push(0x7d);
+        else if (byte === 0x5b) stack.push(0x5d);
+        else if (byte === 0x7d || byte === 0x5d) {
+          if (stack.pop() !== byte) streamFailure();
+          if (stack.length === 0) {
+            appendChunkPart();
+            return result();
+          }
+        }
+        if (total + this.offset - start > maximumBytes) {
+          streamFailure("ACCOUNTLESS_RETENTION_ARTIFACT_VALUE_TOO_LARGE");
+        }
+      }
+    }
+
+    for (;;) {
+      if (this.offset >= this.chunk.length && !this.ended) {
+        appendChunkPart();
+        if (!await this.nextChunk()) {
+          if (total === 0) streamFailure();
+          return result();
+        }
+        start = 0;
+      }
+      if (!await this.ensureByte()) {
+        appendChunkPart();
+        if (total === 0) streamFailure();
+        return result();
+      }
+      const byte = this.chunk[this.offset];
+      if (byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d
+          || byte === 0x2c || byte === 0x5d || byte === 0x7d) {
+        appendChunkPart();
+        if (total === 0) streamFailure();
+        return result();
+      }
+      this.offset += 1;
+      if (total + this.offset - start > maximumBytes) {
+        streamFailure("ACCOUNTLESS_RETENTION_ARTIFACT_VALUE_TOO_LARGE");
+      }
+    }
+  }
+
+  async readArray(onItem, maximumItemBytes) {
+    await this.expectByte(0x5b);
+    await this.skipWhitespace();
+    if (await this.peekByte() === 0x5d) {
+      this.offset += 1;
+      return 0;
+    }
+    let count = 0;
+    for (;;) {
+      const raw = await this.readRawValue(maximumItemBytes);
+      if (raw[0] === "{") assertNoDuplicateJsonObjectKeys(raw);
+      await onItem(parseJsonText(raw), raw);
+      count += 1;
+      await this.skipWhitespace();
+      const delimiter = await this.readByte();
+      if (delimiter === 0x5d) return count;
+      if (delimiter !== 0x2c) streamFailure();
+      await this.skipWhitespace();
+    }
+  }
+
+  async expectEnd() {
+    await this.skipWhitespace();
+    if (await this.peekByte() !== null) streamFailure();
+  }
+
+  async close() {
+    this.stream.destroy();
+    await this.iterator.return?.().catch(() => undefined);
+  }
+}
+
+async function* streamJsonArrayItems(path, maximumItemBytes) {
+  const reader = new JsonFileReader(path);
+  try {
+    await reader.expectByte(0x5b);
+    await reader.skipWhitespace();
+    if (await reader.peekByte() === 0x5d) {
+      reader.offset += 1;
+      await reader.expectEnd();
+      return;
+    }
+    for (;;) {
+      const raw = await reader.readRawValue(maximumItemBytes);
+      if (raw[0] === "{") assertNoDuplicateJsonObjectKeys(raw);
+      yield parseJsonText(raw);
+      await reader.skipWhitespace();
+      const delimiter = await reader.readByte();
+      if (delimiter === 0x5d) break;
+      if (delimiter !== 0x2c) streamFailure();
+      await reader.skipWhitespace();
+    }
+    await reader.expectEnd();
+  } finally {
+    await reader.close();
+  }
+}
+
+async function streamJsonObjectArrayMember(path, arrayKey, pageSpoolPath) {
+  const reader = new JsonFileReader(path);
+  const metadata = Object.create(null);
+  const keys = new Set();
+  let foundArray = false;
+  let pageWriter;
+  try {
+    pageWriter = await open(pageSpoolPath, "wx", 0o600);
+    await reader.expectByte(0x7b);
+    await reader.skipWhitespace();
+    if (await reader.peekByte() === 0x7d) reader.offset += 1;
+    else {
+      for (;;) {
+        const keyText = await reader.readRawValue(1_024);
+        if (keyText[0] !== '"') streamFailure();
+        const key = parseJsonText(keyText);
+        if (typeof key !== "string" || keys.has(key)) streamFailure();
+        keys.add(key);
+        await reader.expectByte(0x3a);
+        if (key === arrayKey) {
+          if (foundArray) streamFailure();
+          foundArray = true;
+          await reader.readArray(async (_page, rawPage) => {
+            if (rawPage[0] !== "{") streamFailure("ACCOUNTLESS_RETENTION_SOURCE_PAGE_INVALID");
+            assertNoDuplicateJsonObjectKeys(rawPage);
+            const page = parseJsonText(rawPage);
+            const line = Buffer.from(`${canonical(page)}\n`);
+            let offset = 0;
+            while (offset < line.length) {
+              const written = await pageWriter.write(line, offset, line.length - offset);
+              if (written.bytesWritten <= 0) streamFailure();
+              offset += written.bytesWritten;
+            }
+          }, MAX_ARTIFACT_PAGE_BYTES);
+        } else {
+          metadata[key] = parseJsonText(await reader.readRawValue(MAX_ARTIFACT_METADATA_VALUE_BYTES));
+        }
+        await reader.skipWhitespace();
+        const delimiter = await reader.readByte();
+        if (delimiter === 0x7d) break;
+        if (delimiter !== 0x2c) streamFailure();
+        await reader.skipWhitespace();
+      }
+    }
+    await reader.expectEnd();
+    if (!foundArray) streamFailure("ACCOUNTLESS_RETENTION_SOURCE_PAGE_INVALID");
+    await pageWriter.sync();
+  } finally {
+    await pageWriter?.close();
+    await reader.close();
+  }
+  return { metadata, keys };
+}
+
+async function streamCanonicalArtifactDigest(metadata, pageSpoolPath) {
+  const hash = createHash("sha256");
+  hash.update("{");
+  const keys = [...new Set([...Object.keys(metadata), "pages"])].sort();
+  let first = true;
+  for (const key of keys) {
+    if (!first) hash.update(",");
+    first = false;
+    hash.update(`${JSON.stringify(key)}:`);
+    if (key !== "pages") {
+      hash.update(canonical(metadata[key]));
+      continue;
+    }
+    hash.update("[");
+    let firstPage = true;
+    const input = createReadStream(pageSpoolPath, { encoding: "utf8", highWaterMark: 64 * 1_024 });
+    const lines = createInterface({ input, crlfDelay: Infinity });
+    try {
+      for await (const line of lines) {
+        if (!firstPage) hash.update(",");
+        firstPage = false;
+        hash.update(line);
+      }
+    } finally {
+      lines.close();
+      input.destroy();
+    }
+    hash.update("]");
+  }
+  hash.update("}");
+  return hash.digest("hex");
+}
+
+/**
+ * Verify the sealed D1 artifact and separate mapping JSON files incrementally.
+ * Pages are limited to the existing 500-row contract and then one page at a
+ * time; no total-row-count cap or whole-artifact array is created.
+ */
+export async function verifyAccountlessRetentionD1ArtifactFiles({
+  artifactPath,
+  participantMappingsPath,
+  pageSpoolPath,
+  expectedArtifactSha256,
+  expectedMappingSha256,
+  onMappedRow,
+} = {}) {
+  requireHash(expectedArtifactSha256, "ACCOUNTLESS_RETENTION_ARTIFACT_CHECKSUM_REQUIRED");
+  requireHash(expectedMappingSha256, "ACCOUNTLESS_RETENTION_MAPPING_CHECKSUM_REQUIRED");
+  if (typeof artifactPath !== "string" || typeof participantMappingsPath !== "string"
+      || typeof pageSpoolPath !== "string" || typeof onMappedRow !== "function") {
+    streamFailure();
+  }
+  const { metadata, keys } = await streamJsonObjectArrayMember(
+    artifactPath,
+    "pages",
+    pageSpoolPath,
+  );
+  const artifactKeys = [...keys, "pages"];
+  exactKeys(Object.fromEntries(artifactKeys.map(key => [key, null])), [
+    "schemaVersion", "runId", "state", "sourceRevision", "authorityRevision", "latestMigrationName",
+    "snapshotAt", "rowCount", "pageCount", "migrationReceipts", "manifestSha256", "pages",
+  ]);
+  const artifact = { ...metadata, pages: null };
+  if (artifact.schemaVersion !== ACCOUNTLESS_RETENTION_D1_ARTIFACT_SCHEMA
+      || typeof artifact.runId !== "string" || !SAFE_RUN_ID.test(artifact.runId)
+      || artifact.state !== "extracted"
+      || !Number.isSafeInteger(artifact.sourceRevision) || artifact.sourceRevision < 0
+      || artifact.authorityRevision !== artifact.sourceRevision
+      || artifact.latestMigrationName !== "0063_accountless_history_transfer_source.sql"
+      || !Number.isSafeInteger(artifact.rowCount) || artifact.rowCount < 0
+      || !Number.isSafeInteger(artifact.pageCount) || artifact.pageCount < 0) {
+    streamFailure("ACCOUNTLESS_RETENTION_SOURCE_FENCE_INVALID");
+  }
+  requireTimestamp(artifact.snapshotAt);
+  requireHash(artifact.manifestSha256);
+  const artifactSha256 = await streamCanonicalArtifactDigest(metadata, pageSpoolPath);
+  if (artifactSha256 !== expectedArtifactSha256) {
+    streamFailure("ACCOUNTLESS_RETENTION_ARTIFACT_CHECKSUM_MISMATCH");
+  }
+  const migrationReceipts = canonicalMigrationNames(artifact.migrationReceipts);
+
+  const mappingSha = createHash("sha256");
+  mappingSha.update("[");
+  let mappedCount = 0;
+  async function* mappings() {
+    let first = true;
+    for await (const rawMapping of streamJsonArrayItems(participantMappingsPath, MAX_MAPPING_ENTRY_BYTES)) {
+      const mapping = normalizeMapping(rawMapping);
+      if (!first) mappingSha.update(",");
+      first = false;
+      mappingSha.update(canonical(mapping));
+      mappedCount += 1;
+      yield mapping;
+    }
+    mappingSha.update("]");
+    if (mappingSha.digest("hex") !== expectedMappingSha256) {
+      streamFailure("ACCOUNTLESS_RETENTION_MAPPING_CHECKSUM_MISMATCH");
+    }
+  }
+
+  const mappingSource = mappings();
+  const nextMapping = mappingSource[Symbol.asyncIterator]();
+  let pageCount = 0;
+  let seenRows = 0;
+  let cursor = "";
+  let manifest = manifestSeed(artifact.runId, artifact.sourceRevision);
+  const pageInput = createReadStream(pageSpoolPath, { encoding: "utf8", highWaterMark: 64 * 1_024 });
+  const pageLines = createInterface({ input: pageInput, crlfDelay: Infinity });
+  let pagesVerified = false;
+  try {
+    for await (const line of pageLines) {
+      if (line.length === 0) streamFailure("ACCOUNTLESS_RETENTION_SOURCE_PAGE_INVALID");
+      const page = parseJsonText(line);
+      exactKeys(page, ["pageNumber", "afterParticipantId", "throughParticipantId", "rowCount", "pageSha256",
+        "manifestSha256", "rowDigests", "rows"]);
+      pageCount += 1;
+      if (page.pageNumber !== pageCount || page.afterParticipantId !== cursor
+          || !Number.isSafeInteger(page.rowCount) || page.rowCount < 1 || page.rowCount > 500
+          || !Array.isArray(page.rows) || page.rows.length !== page.rowCount
+          || !Array.isArray(page.rowDigests) || page.rowDigests.length !== page.rowCount) {
+        streamFailure("ACCOUNTLESS_RETENTION_SOURCE_PAGE_INVALID");
+      }
+      requireHash(page.pageSha256);
+      requireHash(page.manifestSha256);
+      const normalizedRows = page.rows.map(normalizeD1Row);
+      const rowDigests = page.rowDigests.map((entry, rowIndex) => {
+        exactKeys(entry, ["participantId", "sha256"]);
+        const participantId = requireIdentifier(entry.participantId);
+        const digest = requireHash(entry.sha256);
+        const row = normalizedRows[rowIndex];
+        if (!row || participantId !== row.participant_id || digest !== accountlessRetentionD1RowSha256(row)) {
+          streamFailure("ACCOUNTLESS_RETENTION_SOURCE_ROW_CHECKSUM_MISMATCH");
+        }
+        if (rowIndex > 0 && participantId <= normalizedRows[rowIndex - 1].participant_id) {
+          streamFailure("ACCOUNTLESS_RETENTION_SOURCE_ORDER_INVALID");
+        }
+        return Object.freeze({ participantId, sha256: digest });
+      });
+      if (page.throughParticipantId !== rowDigests.at(-1)?.participantId
+          || rowDigests[0]?.participantId <= cursor
+          || page.pageSha256 !== pageDigest(rowDigests)) {
+        streamFailure("ACCOUNTLESS_RETENTION_SOURCE_PAGE_CHECKSUM_MISMATCH");
+      }
+      manifest = manifestStep(manifest, page);
+      if (manifest !== page.manifestSha256) {
+        streamFailure("ACCOUNTLESS_RETENTION_SOURCE_MANIFEST_MISMATCH");
+      }
+
+      for (const row of normalizedRows) {
+        const next = await nextMapping.next();
+        if (next.done) streamFailure("ACCOUNTLESS_RETENTION_SOURCE_MAPPING_INCOMPLETE");
+        const mapping = next.value;
+        if (mapping.sourceParticipantId !== row.participant_id) {
+          streamFailure("ACCOUNTLESS_RETENTION_SOURCE_MAPPING_INVALID");
+        }
+        await onMappedRow(mappedRow(row, mapping.target));
+      }
+      cursor = page.throughParticipantId;
+      seenRows += page.rowCount;
+    }
+    pagesVerified = true;
+  } finally {
+    pageLines.close();
+    pageInput.destroy();
+    if (!pagesVerified) await mappingSource.return?.();
+  }
+  try {
+    const extraMapping = await nextMapping.next();
+    if (!extraMapping.done || mappedCount !== artifact.rowCount) {
+      streamFailure("ACCOUNTLESS_RETENTION_SOURCE_MAPPING_INCOMPLETE");
+    }
+  } finally {
+    await mappingSource.return?.();
+  }
+  if (seenRows !== artifact.rowCount || pageCount !== artifact.pageCount
+      || manifest !== artifact.manifestSha256
+      || artifact.rowCount === 0 && artifact.pageCount !== 0
+      || artifact.rowCount > 0 && artifact.pageCount === 0) {
+    streamFailure("ACCOUNTLESS_RETENTION_SOURCE_COUNT_MISMATCH");
+  }
+  const fenceDigest = sha256([
+    "tibotattle-accountless-retention-d1-fence-v1",
+    artifact.runId,
+    String(artifact.sourceRevision),
+    artifact.manifestSha256,
+    artifactSha256,
+    expectedMappingSha256,
+  ].join("\n"));
+  return Object.freeze({
+    kind: ACCOUNTLESS_RETENTION_D1_SOURCE_KIND,
+    immutable: true,
+    snapshotId: `d1-accountless-retention:${artifactSha256}`,
+    fenceId: `d1-retention-fence:${fenceDigest}`,
+    artifactSha256,
+    manifestSha256: artifact.manifestSha256,
+    rowCount: artifact.rowCount,
+    sourceRevision: artifact.sourceRevision,
+    sourceRunId: artifact.runId,
+    mappingSha256: expectedMappingSha256,
+    migrationReceipts,
+    sourceFenceReconciled: false,
+  });
 }
 
 /** Validate the sealed D1 JSON artifact and a separate complete mapping file. */

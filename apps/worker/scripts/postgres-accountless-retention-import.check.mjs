@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import {
   createD1AccountlessRetentionSource,
+  createD1AccountlessRetentionFileSource,
   createSyntheticAccountlessRetentionSource,
   invalidatePostgresAccountlessRetentionTransfer,
   POSTGRES_ACCOUNTLESS_RETENTION_IMPORT_DEFAULT_PAGE_SIZE,
@@ -221,6 +223,115 @@ test("sealed D1 artifact bridge verifies the source fence, row/page chain, and e
     expectedArtifactSha256: accountlessRetentionD1ArtifactSha256(changed) }), {
     code: "ACCOUNTLESS_RETENTION_SOURCE_FENCE_INVALID",
   });
+});
+
+async function writeD1BundleFiles(bundle) {
+  const directory = await mkdtemp(join(tmpdir(), "tibotattle-retention-check-"));
+  const artifactPath = join(directory, "artifact.json");
+  const participantMappingsPath = join(directory, "participant-mappings.json");
+  await writeFile(artifactPath, JSON.stringify(bundle.artifact));
+  await writeFile(participantMappingsPath, JSON.stringify(bundle.mappings));
+  return { directory, artifactPath, participantMappingsPath };
+}
+
+test("file-backed D1 source preserves the exact fence and streams bounded keyset pages", async () => {
+  const bundle = d1ArtifactBundle([two, one]);
+  const files = await writeD1BundleFiles(bundle);
+  let source;
+  try {
+    await assert.rejects(createD1AccountlessRetentionFileSource({
+      artifactPath: files.artifactPath,
+      participantMappingsPath: files.participantMappingsPath,
+      expectedArtifactSha256: "0".repeat(64),
+      expectedMappingSha256: bundle.expectedMappingSha256,
+    }), { code: "ACCOUNTLESS_RETENTION_ARTIFACT_CHECKSUM_MISMATCH" });
+    source = await createD1AccountlessRetentionFileSource({
+      artifactPath: files.artifactPath,
+      participantMappingsPath: files.participantMappingsPath,
+      expectedArtifactSha256: bundle.expectedArtifactSha256,
+      expectedMappingSha256: bundle.expectedMappingSha256,
+    });
+    const objectSource = createD1AccountlessRetentionSource(bundle);
+    assert.deepEqual(source.snapshot, objectSource.snapshot);
+    assert.equal((await source.verifySnapshot()).fenceId, objectSource.snapshot.fenceId);
+    const first = await source.listPage({ after: null, limit: 1 });
+    assert.deepEqual(first, await objectSource.listPage({ after: null, limit: 1 }));
+    const second = await source.listPage({ after: "source-owner-a", limit: 1 });
+    assert.deepEqual(second, await objectSource.listPage({ after: "source-owner-a", limit: 1 }));
+    assert.deepEqual(await source.listPage({ after: "source-owner-b", limit: 1 }), { rows: [] });
+
+    await writeFile(files.artifactPath, "changed after the private verified copy was staged");
+    assert.equal((await source.verifySnapshot()).artifactSha256, bundle.expectedArtifactSha256);
+    assert.equal((await source.listPage({ after: null, limit: 2 })).rows.length, 2);
+  } finally {
+    await source?.close();
+    await rm(files.directory, { recursive: true, force: true });
+  }
+});
+
+test("file-backed D1 source has no total-row cap and rejects duplicate target identities", async () => {
+  const rows = Array.from({ length: 601 }, (_, index) => {
+    const suffix = String(index).padStart(8, "0");
+    return validRow(`source-owner-${suffix}`, `target-owner-${suffix}`,
+      `${suffix}-1111-4111-8111-111111111111`, `${suffix}-2222-4222-8222-222222222222`);
+  });
+  const bundle = d1ArtifactBundle(rows);
+  const files = await writeD1BundleFiles(bundle);
+  let source;
+  try {
+    source = await createD1AccountlessRetentionFileSource({
+      artifactPath: files.artifactPath,
+      participantMappingsPath: files.participantMappingsPath,
+      expectedArtifactSha256: bundle.expectedArtifactSha256,
+      expectedMappingSha256: bundle.expectedMappingSha256,
+    });
+    assert.equal(source.snapshot.rowCount, 601);
+    const first = await source.listPage({ after: null, limit: 500 });
+    const second = await source.listPage({ after: first.rows.at(-1).source.marker.participantId, limit: 500 });
+    assert.equal(first.rows.length, 500);
+    assert.equal(second.rows.length, 101);
+    assert.equal(second.rows.at(-1).source.marker.participantId, "source-owner-00000600");
+    assert.deepEqual(await source.listPage({ after: "source-owner-00000600", limit: 500 }), { rows: [] });
+  } finally {
+    await source?.close();
+    await rm(files.directory, { recursive: true, force: true });
+  }
+
+  const duplicateMappings = structuredClone(bundle.mappings);
+  duplicateMappings[1].target.participantId = duplicateMappings[0].target.participantId;
+  const invalid = { ...bundle, mappings: duplicateMappings,
+    expectedMappingSha256: accountlessRetentionD1MappingSha256(duplicateMappings) };
+  const invalidFiles = await writeD1BundleFiles(invalid);
+  try {
+    await assert.rejects(createD1AccountlessRetentionFileSource({
+      artifactPath: invalidFiles.artifactPath,
+      participantMappingsPath: invalidFiles.participantMappingsPath,
+      expectedArtifactSha256: invalid.expectedArtifactSha256,
+      expectedMappingSha256: invalid.expectedMappingSha256,
+    }), { code: "ACCOUNTLESS_RETENTION_SOURCE_MAPPING_INVALID" });
+  } finally {
+    await rm(invalidFiles.directory, { recursive: true, force: true });
+  }
+});
+
+test("file-backed D1 source verifies and pages an empty sealed snapshot", async () => {
+  const bundle = d1ArtifactBundle([]);
+  const files = await writeD1BundleFiles(bundle);
+  let source;
+  try {
+    source = await createD1AccountlessRetentionFileSource({
+      artifactPath: files.artifactPath,
+      participantMappingsPath: files.participantMappingsPath,
+      expectedArtifactSha256: bundle.expectedArtifactSha256,
+      expectedMappingSha256: bundle.expectedMappingSha256,
+    });
+    assert.equal(source.snapshot.rowCount, 0);
+    await source.verifySnapshot();
+    assert.deepEqual(await source.listPage({ after: null, limit: 200 }), { rows: [] });
+  } finally {
+    await source?.close();
+    await rm(files.directory, { recursive: true, force: true });
+  }
 });
 
 test("synthetic retention fixture pins exact D1 opt-out migration receipts", async () => {

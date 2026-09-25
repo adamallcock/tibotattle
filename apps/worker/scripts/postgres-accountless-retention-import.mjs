@@ -1,8 +1,15 @@
 import { createHash } from "node:crypto";
+import { constants as fsConstants, createReadStream, createWriteStream, fstat } from "node:fs";
+import { lstat, mkdtemp, open, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createInterface } from "node:readline";
+import { pipeline } from "node:stream/promises";
 import { buildPostgresMigrationManifest, renderPostgresSearchPath } from "../cloud-run/postgres-migrations.mjs";
 import {
   ACCOUNTLESS_RETENTION_D1_SOURCE_KIND,
   ACCOUNTLESS_RETENTION_D1_SOURCE_MIGRATIONS,
+  verifyAccountlessRetentionD1ArtifactFiles,
   verifyAccountlessRetentionD1ArtifactBundle,
 } from "./postgres-accountless-retention-artifact.mjs";
 
@@ -419,6 +426,342 @@ export function createD1AccountlessRetentionSource({
       }
     },
   });
+}
+
+async function fileFingerprint(path) {
+  const info = await lstat(path, { bigint: true });
+  if (!info.isFile()) fail("ACCOUNTLESS_RETENTION_SOURCE_CHANGED");
+  return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs, info.mode].join(":");
+}
+
+async function writeHandle(handle, value) {
+  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
+  let offset = 0;
+  while (offset < bytes.length) {
+    const result = await handle.write(bytes, offset, bytes.length - offset, null);
+    if (result.bytesWritten <= 0) fail("ACCOUNTLESS_RETENTION_TEMP_FILE_WRITE_FAILED");
+    offset += result.bytesWritten;
+  }
+}
+
+async function stageRegularFile(sourcePath, destinationPath) {
+  if (typeof sourcePath !== "string" || sourcePath.length === 0) {
+    fail("ACCOUNTLESS_RETENTION_INPUT_FILE_INVALID");
+  }
+  let before;
+  let input;
+  let destination;
+  try {
+    before = await lstat(sourcePath);
+    if (!before.isFile() || before.isSymbolicLink()) fail("ACCOUNTLESS_RETENTION_INPUT_FILE_INVALID");
+    const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+    input = createReadStream(sourcePath, { flags: fsConstants.O_RDONLY | noFollow });
+    const opened = await new Promise((resolve, reject) => {
+      input.once("open", descriptor => fstat(descriptor, (error, info) => error ? reject(error) : resolve(info)));
+      input.once("error", reject);
+    });
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
+      fail("ACCOUNTLESS_RETENTION_INPUT_FILE_INVALID");
+    }
+    await pipeline(
+      input,
+      createWriteStream(destinationPath, { flags: "wx", mode: 0o600 }),
+    );
+    destination = await open(destinationPath, "r+");
+    await destination.sync();
+    await destination.chmod(0o400);
+  } catch (error) {
+    if (error instanceof PostgresAccountlessRetentionImportError) throw error;
+    fail("ACCOUNTLESS_RETENTION_INPUT_FILE_INVALID");
+  } finally {
+    await destination?.close().catch(() => {});
+    input?.destroy();
+  }
+}
+
+function compareText(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+async function mergeKeyRuns(paths, outputPath) {
+  const readers = paths.map(path => {
+    const input = createReadStream(path, { encoding: "utf8", highWaterMark: 32 * 1_024 });
+    return { input, lines: createInterface({ input, crlfDelay: Infinity }), iterator: null };
+  });
+  for (const reader of readers) reader.iterator = reader.lines[Symbol.asyncIterator]();
+  let output;
+  try {
+    output = await open(outputPath, "wx", 0o600);
+    const heads = await Promise.all(readers.map(reader => reader.iterator.next()));
+    let prior = null;
+    for (;;) {
+      let selected = -1;
+      for (let index = 0; index < heads.length; index += 1) {
+        if (heads[index].done) continue;
+        if (selected < 0 || compareText(heads[index].value, heads[selected].value) < 0) selected = index;
+      }
+      if (selected < 0) break;
+      const key = heads[selected].value;
+      if (typeof key !== "string" || key.length === 0) fail("ACCOUNTLESS_RETENTION_TEMP_FILE_INVALID");
+      if (key === prior) fail("ACCOUNTLESS_RETENTION_SOURCE_MAPPING_INVALID");
+      await writeHandle(output, `${key}\n`);
+      prior = key;
+      heads[selected] = await readers[selected].iterator.next();
+    }
+    await output.sync();
+  } finally {
+    await output?.close().catch(() => {});
+    for (const reader of readers) {
+      reader.lines.close();
+      reader.input.destroy();
+      await reader.iterator.return?.().catch(() => {});
+    }
+  }
+}
+
+function createTargetKeySorter(directory) {
+  const MAX_BUFFER_BYTES = 4 * 1_024 * 1_024;
+  const MERGE_FAN_IN = 16;
+  let bufferedKeys = [];
+  let bufferedBytes = 0;
+  let runNumber = 0;
+  const runLevels = [];
+
+  async function addRun(path, level = 0) {
+    runLevels[level] ??= [];
+    runLevels[level].push(path);
+    if (runLevels[level].length < MERGE_FAN_IN) return;
+    const group = runLevels[level];
+    runLevels[level] = [];
+    const outputPath = join(directory, `target-key-merge-${runNumber++}.ndjson`);
+    await mergeKeyRuns(group, outputPath);
+    for (const runPath of group) await rm(runPath, { force: true });
+    await addRun(outputPath, level + 1);
+  }
+
+  async function flush() {
+    if (bufferedKeys.length === 0) return;
+    bufferedKeys.sort(compareText);
+    const runPath = join(directory, `target-key-run-${runNumber++}.ndjson`);
+    let handle;
+    try {
+      handle = await open(runPath, "wx", 0o600);
+      let prior = null;
+      for (const key of bufferedKeys) {
+        if (key === prior) fail("ACCOUNTLESS_RETENTION_SOURCE_MAPPING_INVALID");
+        await writeHandle(handle, `${key}\n`);
+        prior = key;
+      }
+      await handle.sync();
+      bufferedKeys = [];
+      bufferedBytes = 0;
+      await addRun(runPath);
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  }
+
+  async function addTarget(target) {
+    for (const [prefix, value] of [
+      ["participant:", target.participantId],
+      ["enrollment-device:", target.enrollmentDeviceId],
+      ["device-credential:", target.deviceCredentialId],
+    ]) {
+      const key = `${prefix}${value}`;
+      bufferedKeys.push(key);
+      bufferedBytes += Buffer.byteLength(key) + 1;
+      if (bufferedBytes >= MAX_BUFFER_BYTES) await flush();
+    }
+  }
+
+  async function finish() {
+    await flush();
+    let runs = runLevels.flat();
+    while (runs.length > 1) {
+      const nextRuns = [];
+      for (let start = 0; start < runs.length; start += MERGE_FAN_IN) {
+        const group = runs.slice(start, start + MERGE_FAN_IN);
+        if (group.length === 1) {
+          nextRuns.push(group[0]);
+          continue;
+        }
+        const outputPath = join(directory, `target-key-merge-${runNumber++}.ndjson`);
+        await mergeKeyRuns(group, outputPath);
+        for (const path of group) await rm(path, { force: true });
+        nextRuns.push(outputPath);
+      }
+      runs = nextRuns;
+    }
+    for (const path of runs) await rm(path, { force: true });
+    runs = [];
+  }
+
+  return Object.freeze({ addTarget, finish });
+}
+
+async function* readMappedRowsFile(path) {
+  const input = createReadStream(path, { encoding: "utf8", highWaterMark: 64 * 1_024 });
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      if (line.length === 0) fail("ACCOUNTLESS_RETENTION_SOURCE_CHANGED");
+      let value;
+      try {
+        value = JSON.parse(line);
+      } catch {
+        fail("ACCOUNTLESS_RETENTION_SOURCE_CHANGED");
+      }
+      yield normalizeSourceRow(value);
+    }
+  } finally {
+    lines.close();
+    input.destroy();
+  }
+}
+
+/**
+ * Build a trusted D1 source from sealed JSON files without materializing the
+ * artifact, mappings, or complete mapped-row set in memory. Inputs are copied
+ * to a private temporary directory, verified there, and removed by close().
+ */
+export async function createD1AccountlessRetentionFileSource({
+  artifactPath,
+  participantMappingsPath,
+  expectedArtifactSha256,
+  expectedMappingSha256,
+} = {}) {
+  if (typeof expectedArtifactSha256 !== "string" || !SHA256.test(expectedArtifactSha256)) {
+    fail("ACCOUNTLESS_RETENTION_ARTIFACT_CHECKSUM_REQUIRED");
+  }
+  if (typeof expectedMappingSha256 !== "string" || !SHA256.test(expectedMappingSha256)) {
+    fail("ACCOUNTLESS_RETENTION_MAPPING_CHECKSUM_REQUIRED");
+  }
+  let directory;
+  try {
+    directory = await mkdtemp(join(tmpdir(), "tibotattle-retention-source-"));
+    const stagedArtifactPath = join(directory, "artifact.json");
+    const stagedMappingsPath = join(directory, "participant-mappings.json");
+    const pageSpoolPath = join(directory, "artifact-pages.ndjson");
+    const mappedRowsPath = join(directory, "mapped-rows.ndjson");
+    await stageRegularFile(artifactPath, stagedArtifactPath);
+    await stageRegularFile(participantMappingsPath, stagedMappingsPath);
+
+    const rowHandle = await open(mappedRowsPath, "wx", 0o600);
+    const keySorter = createTargetKeySorter(directory);
+    let previousSourceId = null;
+    let rowCount = 0;
+    let snapshot;
+    try {
+      snapshot = await verifyAccountlessRetentionD1ArtifactFiles({
+        artifactPath: stagedArtifactPath,
+        participantMappingsPath: stagedMappingsPath,
+        pageSpoolPath,
+        expectedArtifactSha256,
+        expectedMappingSha256,
+        async onMappedRow(value) {
+          const row = normalizeSourceRow(value);
+          const sourceId = row.source.marker.participantId;
+          if (previousSourceId !== null && sourceId <= previousSourceId) {
+            fail("ACCOUNTLESS_RETENTION_SOURCE_ORDER_INVALID");
+          }
+          previousSourceId = sourceId;
+          await keySorter.addTarget(row.target);
+          await writeHandle(rowHandle, `${JSON.stringify(row)}\n`);
+          rowCount += 1;
+        },
+      });
+      if (rowCount !== snapshot.rowCount) fail("ACCOUNTLESS_RETENTION_SOURCE_COUNT_MISMATCH");
+      await rowHandle.sync();
+      await rowHandle.chmod(0o400);
+      await keySorter.finish();
+    } finally {
+      await rowHandle.close().catch(() => {});
+    }
+    await rm(pageSpoolPath, { force: true });
+
+    const fingerprints = new Map();
+    for (const path of [stagedArtifactPath, stagedMappingsPath, mappedRowsPath]) {
+      fingerprints.set(path, await fileFingerprint(path));
+    }
+    let closed = false;
+    let rowIterator;
+    let iteratorAfter;
+    let pendingRow = null;
+    let ended = false;
+
+    async function resetIterator(after) {
+      await rowIterator?.return?.();
+      rowIterator = readMappedRowsFile(mappedRowsPath)[Symbol.asyncIterator]();
+      iteratorAfter = after;
+      pendingRow = null;
+      ended = false;
+      if (after === null) return;
+      for (;;) {
+        const next = await rowIterator.next();
+        if (next.done) {
+          ended = true;
+          return;
+        }
+        if (next.value.source.marker.participantId > after) {
+          pendingRow = next.value;
+          return;
+        }
+      }
+    }
+
+    const source = Object.freeze({
+      snapshot,
+      async verifySnapshot() {
+        if (closed) fail("ACCOUNTLESS_RETENTION_SOURCE_CLOSED");
+        try {
+          for (const [path, expected] of fingerprints) {
+            if (await fileFingerprint(path) !== expected) fail("ACCOUNTLESS_RETENTION_SOURCE_CHANGED");
+          }
+        } catch (error) {
+          if (error instanceof PostgresAccountlessRetentionImportError) throw error;
+          fail("ACCOUNTLESS_RETENTION_SOURCE_CHANGED");
+        }
+        return snapshot;
+      },
+      async listPage({ after = null, limit } = {}) {
+        if (closed) fail("ACCOUNTLESS_RETENTION_SOURCE_CLOSED");
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > POSTGRES_ACCOUNTLESS_RETENTION_IMPORT_MAX_PAGE_SIZE
+            || after !== null && (typeof after !== "string" || !SAFE_ID.test(after))) {
+          fail("ACCOUNTLESS_RETENTION_PAGE_REQUEST_INVALID");
+        }
+        if (iteratorAfter !== after) await resetIterator(after);
+        const rows = [];
+        if (pendingRow !== null) {
+          rows.push(pendingRow);
+          pendingRow = null;
+        }
+        while (rows.length < limit && !ended) {
+          const next = await rowIterator.next();
+          if (next.done) {
+            ended = true;
+            break;
+          }
+          rows.push(next.value);
+        }
+        if (rows.length > 0) iteratorAfter = rows.at(-1).source.marker.participantId;
+        return Object.freeze({ rows: Object.freeze(rows) });
+      },
+      async close() {
+        if (closed) return;
+        closed = true;
+        await rowIterator?.return?.();
+        await rm(directory, { recursive: true, force: true });
+      },
+    });
+    TRUSTED_SOURCES.add(source);
+    return source;
+  } catch (error) {
+    if (directory) await rm(directory, { recursive: true, force: true }).catch(() => {});
+    if (error instanceof PostgresAccountlessRetentionImportError) throw error;
+    if (error && typeof error === "object" && typeof error.code === "string"
+        && error.code.startsWith("ACCOUNTLESS_RETENTION_")) fail(error.code);
+    fail("ACCOUNTLESS_RETENTION_TEMP_STORAGE_FAILED");
+  }
 }
 
 function quoteSchema(schema) {
@@ -912,6 +1255,27 @@ export async function runPostgresAccountlessRetentionImport({
         [`${targetSchema}:accountless-retention:${transferId}`]).catch(() => {});
       client.release();
     }
+  }
+}
+
+/** Run the operational import from sealed artifact and mapping files. */
+export async function runPostgresAccountlessRetentionImportFromFiles({
+  artifactPath,
+  participantMappingsPath,
+  expectedArtifactSha256,
+  expectedMappingSha256,
+  ...importOptions
+} = {}) {
+  const source = await createD1AccountlessRetentionFileSource({
+    artifactPath,
+    participantMappingsPath,
+    expectedArtifactSha256,
+    expectedMappingSha256,
+  });
+  try {
+    return await runPostgresAccountlessRetentionImport({ ...importOptions, source });
+  } finally {
+    await source.close();
   }
 }
 
