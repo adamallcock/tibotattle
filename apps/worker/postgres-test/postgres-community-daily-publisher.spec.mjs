@@ -14,6 +14,7 @@ import {
 import { readPostgresPublishedCommunityDaily } from "../src/postgres-community-daily.ts";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
+const PG_TEST_HOST = process.env.PG_TEST_HOST;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
 const SOURCE_ID = "synthetic-community-source";
 const SOURCE_NAMESPACE = "synthetic-community-namespace";
@@ -33,6 +34,16 @@ async function localSocket() {
   assert.equal(metadata.mode & 0o077, 0);
   assert.equal(metadata.uid, process.getuid());
   return { host: resolved, port: PG_TEST_PORT };
+}
+
+async function localPostgresConnection() {
+  if (PG_TEST_HOST !== undefined) {
+    assert.ok(["127.0.0.1", "::1"].includes(PG_TEST_HOST),
+      "qualification allows only an explicit loopback TCP host");
+    assert.ok(Number.isSafeInteger(PG_TEST_PORT) && PG_TEST_PORT > 0 && PG_TEST_PORT <= 65535);
+    return { host: PG_TEST_HOST, port: PG_TEST_PORT };
+  }
+  return localSocket();
 }
 
 function usageRecord() {
@@ -63,13 +74,13 @@ function usageRecord() {
   };
 }
 
-describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL explicit-day community daily producer", () => {
+describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day community daily producer", () => {
   let pool;
   let schema;
   let sqlSchema;
 
   beforeAll(async () => {
-    const socket = await localSocket();
+    const socket = await localPostgresConnection();
     pool = new pg.Pool({
       ...socket,
       user: process.env.PG_TEST_USER || "postgres",
@@ -81,7 +92,12 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL explicit-day community daily produc
       connectionTimeoutMillis: 5_000,
     });
     const locality = await pool.query("SELECT inet_server_addr() AS address, version() AS version");
-    assert.equal(locality.rows[0]?.address, null, "qualification requires a local Unix socket");
+    if (PG_TEST_HOST !== undefined) {
+      assert.notEqual(locality.rows[0]?.address, null,
+        "TCP qualification must reach the explicit loopback host");
+    } else {
+      assert.equal(locality.rows[0]?.address, null, "qualification requires a local Unix socket");
+    }
     assert.match(locality.rows[0]?.version ?? "", /^PostgreSQL 17\./u);
   }, 120_000);
 
@@ -119,17 +135,13 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL explicit-day community daily produc
     if (pool) await pool.end();
   });
 
-  async function addOneUsageEvent() {
+  async function addUsageEvents(eventCount) {
+    if (eventCount === 0) return;
     const now = "2026-09-24T12:00:00.000Z";
     const expires = "2027-09-24T12:00:00.000Z";
     const secretHash = Buffer.alloc(32, 7);
     const pairingId = "synthetic-social-pairing";
     const sessionId = "synthetic-social-session";
-    const authorizationId = "synthetic-social-upload-authorization";
-    const chunkId = "synthetic-social-usage-chunk";
-    const objectKey = `synthetic/${chunkId}`;
-    const record = usageRecord();
-    const envelopeDigest = "b".repeat(64);
 
     await pool.query(`INSERT INTO ${sqlSchema}.participants(id,owner_kind,state,created_at)
       VALUES ($1,'social','active',$2::timestamptz)`, [OWNER_ID, now]);
@@ -147,28 +159,213 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL explicit-day community daily produc
       id,participant_id,paired_via_pairing_id,secret_hash,issued_at,expires_at,last_used_at)
       VALUES ($1,$2,$3,$4,$5::timestamptz,$6::timestamptz,$5::timestamptz)`,
     [DEVICE_ID, OWNER_ID, pairingId, secretHash, now, expires]);
-    await pool.query(`INSERT INTO ${sqlSchema}.device_upload_authorizations(
-      id,participant_id,issued_by_device_id,secret_hash,envelope_digest,body_bytes,
-      content_type,state,issued_at,expires_at,consumed_at)
-      VALUES ($1,$2,$3,$4,$5,64,'application/json','consumed',$6::timestamptz,
-        $7::timestamptz,$6::timestamptz)`,
-    [authorizationId, OWNER_ID, DEVICE_ID, secretHash, envelopeDigest, now, expires]);
-    await pool.query(`INSERT INTO ${sqlSchema}.pending_objects(contribution_id,object_key,object_kind)
-      VALUES ($1,$2,'telemetry_v1')`, [chunkId, objectKey]);
-    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v1_chunks(
-      id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,chunk_digest,
-      envelope_digest,parser_version,record_count,accepted_record_count,r2_key,
-      device_upload_authorization_id,created_at)
-      VALUES ($1,$2,$3,'usage',$4::date,0,1,$5,$6,'synthetic-publisher-v1',
-        1,1,$7,$8,$9::timestamptz)`,
-    [chunkId, OWNER_ID, DEVICE_ID, DAY, "c".repeat(64), envelopeDigest, objectKey, authorizationId, now]);
-    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v1_records(
-      chunk_row_id,participant_id,device_id,stream,occurrence_id,observed_at,observed_day,
-      provider,model_id,input_uncached_tokens,input_cache_read_tokens,input_cache_write_tokens,
-      output_text_tokens,output_reasoning_tokens,output_combined_tokens,record_json)
-      VALUES ($1,$2,$3,'usage',$4,$5::timestamptz,$6::date,$7,$8,100,900,0,50,25,NULL,$9::jsonb)`,
-    [chunkId, OWNER_ID, DEVICE_ID, record.eventId, record.eventTime, DAY,
-      record.provider, record.modelId, JSON.stringify(record)]);
+    const chunkCount = Math.ceil(eventCount / 200);
+    for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+      const start = chunkIndex * 200 + 1;
+      const count = Math.min(200, eventCount - chunkIndex * 200);
+      const chunkId = `synthetic-social-usage-chunk-${chunkIndex}`;
+      const authorizationId = `synthetic-social-upload-authorization-${chunkIndex}`;
+      const envelopeDigest = (chunkIndex + 0x100000).toString(16).padStart(64, "0");
+      const chunkDigest = (chunkIndex + 0x200000).toString(16).padStart(64, "0");
+      const objectKey = `synthetic/${chunkId}`;
+      await pool.query(`INSERT INTO ${sqlSchema}.device_upload_authorizations(
+        id,participant_id,issued_by_device_id,secret_hash,envelope_digest,body_bytes,
+        content_type,state,issued_at,expires_at,consumed_at)
+        VALUES ($1,$2,$3,$4,$5,64,'application/json','consumed',$6::timestamptz,
+          $7::timestamptz,$6::timestamptz)`,
+      [authorizationId, OWNER_ID, DEVICE_ID, secretHash, envelopeDigest, now, expires]);
+      await pool.query(`INSERT INTO ${sqlSchema}.pending_objects(contribution_id,object_key,object_kind)
+        VALUES ($1,$2,'telemetry_v1')`, [chunkId, objectKey]);
+      await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v1_chunks(
+        id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,chunk_digest,
+        envelope_digest,parser_version,record_count,accepted_record_count,r2_key,
+        device_upload_authorization_id,created_at)
+        VALUES ($1,$2,$3,'usage',$4::date,$5,1,$6,$7,'synthetic-publisher-v1',
+          $8,$8,$9,$10,$11::timestamptz)`,
+      [chunkId, OWNER_ID, DEVICE_ID, DAY, chunkIndex, chunkDigest, envelopeDigest,
+        count, objectKey, authorizationId, now]);
+      await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v1_records(
+        chunk_row_id,participant_id,device_id,stream,occurrence_id,observed_at,observed_day,
+        provider,model_id,input_uncached_tokens,input_cache_read_tokens,input_cache_write_tokens,
+        output_text_tokens,output_reasoning_tokens,output_combined_tokens,record_json)
+        SELECT $1,$2,$3,'usage','event:v2:' || lpad(g::text,64,'a'),
+          '2026-09-24T12:05:00.000Z'::timestamptz,$4::date,
+          'openai_codex','gpt-5.6-sol',100,900,0,50,25,NULL,
+          jsonb_build_object(
+            'schemaVersion','usage-event-v1.0',
+            'eventId','event:v2:' || lpad(g::text,64,'a'),
+            'eventTime','2026-09-24T12:05:00.000Z',
+            'sessionUuid','0a49f9db-8b2d-4c3e-9a6f-2f4f1c7d9e0b',
+            'provider','openai_codex','modelId','gpt-5.6-sol','speedMode','fast',
+            'apiServiceTier','priority','surface','local_interactive_unclassified',
+            'billingSurface','chatgpt_subscription','reasoningEffort','xhigh',
+            'agentScope','root','outcome','completed','totalInputContextTokens',NULL,
+            'components',jsonb_build_object('inputUncachedTokens',100,
+              'inputCacheReadTokens',900,'inputCacheWriteTokens',0,
+              'outputTextTokens',50,'outputReasoningTokens',25,'outputCombinedTokens',NULL))
+        FROM generate_series($5::int,$6::int) g`,
+      [chunkId, OWNER_ID, DEVICE_ID, DAY, start, start + count - 1]);
+    }
+    await pool.query(`ANALYZE ${sqlSchema}.telemetry_v1_chunks`);
+    await pool.query(`ANALYZE ${sqlSchema}.telemetry_v1_records`);
+  }
+
+  async function addOneUsageEvent() { await addUsageEvents(1); }
+
+  async function addActiveV11UsageOwner(eventCount) {
+    const now = "2026-09-24T12:00:00.000Z";
+    const expires = "2027-09-24T12:00:00.000Z";
+    const secretHash = Buffer.alloc(32, 8);
+    const owner = "synthetic-v11-social-owner";
+    const device = "synthetic-v11-social-device";
+    const session = "synthetic-v11-social-session";
+    const pairing = "synthetic-v11-social-pairing";
+    const manifest = "10000000-0000-4000-8000-000000000011";
+    const generation = "10000000-0000-4000-8000-000000000012";
+    const predecessor = "1".repeat(64);
+    const manifestDigest = "2".repeat(64);
+    const fingerprint = "3".repeat(64);
+    await pool.query(`INSERT INTO ${sqlSchema}.participants(id,owner_kind,state,created_at)
+      VALUES ($1,'social','active',$2::timestamptz)`, [owner, now]);
+    await pool.query(`INSERT INTO ${sqlSchema}.web_sessions(
+      id,participant_id,secret_hash,csrf_hash,issued_at,expires_at,last_used_at)
+      VALUES ($1,$2,$3,$3,$4::timestamptz,$5::timestamptz,$4::timestamptz)`,
+    [session, owner, secretHash, now, expires]);
+    await pool.query(`INSERT INTO ${sqlSchema}.device_pairings(
+      id,participant_id,issued_by_session_id,secret_hash,consent_version,
+      transport_consent_version,state,issued_at,expires_at,consumed_at,claimed_device_id)
+      VALUES ($1,$2,$3,$4,'synthetic-consent','synthetic-transport','consumed',
+        $5::timestamptz,$6::timestamptz,$5::timestamptz,$7)`,
+    [pairing, owner, session, secretHash, now, expires, device]);
+    await pool.query(`INSERT INTO ${sqlSchema}.device_credentials(
+      id,participant_id,paired_via_pairing_id,secret_hash,issued_at,expires_at,last_used_at)
+      VALUES ($1,$2,$3,$4,$5::timestamptz,$6::timestamptz,$5::timestamptz)`,
+    [device, owner, pairing, secretHash, now, expires]);
+    const chunkCount = Math.ceil(eventCount / 200);
+    const manifestJson = JSON.stringify({ schemaVersion: "telemetry-day-manifest-v1.1", day: DAY });
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_day_manifests(
+      id,participant_id,device_id,chunk_day,manifest_digest,parser_version,manifest_json,
+      expected_chunk_count,state,created_at,ready_at)
+      VALUES ($1,$2,$3,$4::date,$5,'synthetic-v11',$6,$7,'ready',$8::timestamptz,$8::timestamptz)`,
+    [manifest, owner, device, DAY, manifestDigest, manifestJson, chunkCount, now]);
+
+    for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+      const start = chunkIndex * 200 + 1;
+      const count = Math.min(200, eventCount - chunkIndex * 200);
+      const chunkId = `synthetic-v11-usage-chunk-${chunkIndex}`;
+      const authorizationId = `synthetic-v11-upload-authorization-${chunkIndex}`;
+      const envelopeDigest = (chunkIndex + 0x300000).toString(16).padStart(64, "0");
+      const chunkDigest = (chunkIndex + 0x400000).toString(16).padStart(64, "0");
+      const objectKey = `synthetic-v11/${chunkId}`;
+      await pool.query(`INSERT INTO ${sqlSchema}.device_upload_authorizations(
+        id,participant_id,issued_by_device_id,secret_hash,envelope_digest,body_bytes,
+        content_type,state,issued_at,expires_at,consumed_at)
+        VALUES ($1,$2,$3,$4,$5,64,'application/json','consumed',
+          $6::timestamptz,$7::timestamptz,$6::timestamptz)`,
+      [authorizationId, owner, device, secretHash, envelopeDigest, now, expires]);
+      await pool.query(`INSERT INTO ${sqlSchema}.pending_objects(contribution_id,object_key,object_kind)
+        VALUES ($1,$2,'telemetry_v11')`, [chunkId, objectKey]);
+      await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_chunks(
+        id,manifest_id,participant_id,device_id,stream,chunk_day,chunk_seq,chunk_id,chunk_digest,
+        envelope_digest,parser_version,record_count,r2_key,device_upload_authorization_id,created_at)
+        VALUES ($1,$2,$3,$4,'usage',$5::date,$6,$7,$8,$9,'synthetic-v11',$10,$11,$12,$13::timestamptz)`,
+      [chunkId, manifest, owner, device, DAY, chunkIndex, `usage:${DAY}:${chunkIndex}`,
+        chunkDigest, envelopeDigest, count, objectKey, authorizationId, now]);
+      await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_records(
+        chunk_id,manifest_id,stream,occurrence_id,observed_at,record_json)
+        SELECT $1,$2,'usage','event:v2:' || lpad(g::text,64,'b'),$3::timestamptz,
+          jsonb_build_object(
+            'schemaVersion','usage-event-v1.1',
+            'eventId','event:v2:' || lpad(g::text,64,'b'),
+            'eventTime','2026-09-24T12:05:00.000Z',
+            'sessionUuid','0a49f9db-8b2d-4c3e-9a6f-2f4f1c7d9e0b',
+            'provider','openai_codex','modelId','gpt-5.6-sol','speedMode','standard',
+            'apiServiceTier','default','surface','local_interactive_unclassified',
+            'billingSurface','chatgpt_subscription','reasoningEffort','high',
+            'agentScope','root','outcome','completed','totalInputContextTokens',1000,
+            'components',jsonb_build_object('inputUncachedTokens',100,
+              'inputCacheReadTokens',900,'inputCacheWriteTokens',0,
+              'outputTextTokens',50,'outputReasoningTokens',25,'outputCombinedTokens',NULL),
+            'accountPlanAttribution',jsonb_build_object('accountBasis','unavailable',
+              'accountTrackId',NULL,'planBasis','same_source_occurrence','planType','pro','planEraId',NULL))::text
+        FROM generate_series($4::int,$5::int) g`,
+      [chunkId, manifest, "2026-09-24T12:05:00.000Z", start, start + count - 1]);
+    }
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domain_predecessors(
+      token_hash,participant_id,device_id,legacy_fingerprint,input_revision,from_day,through_day,
+      winners_json,created_at,expires_at)
+      VALUES ($1,$2,$3,$4,0,$5::date,$5::date,'[]',$6::timestamptz,$7::timestamptz)`,
+    [predecessor, owner, device, fingerprint, DAY, now, expires]);
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domains(
+      id,participant_id,device_id,predecessor_token_hash,manifest_digest,legacy_fingerprint,
+      input_revision,from_day,through_day,days_json,created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,0,$7::date,$7::date,$8,$9::timestamptz)`,
+    [generation, owner, device, predecessor, manifestDigest, fingerprint, DAY,
+      JSON.stringify([{ day: DAY, manifestId: manifest, manifestDigest }]), now]);
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domain_days(generation_id,observed_day,manifest_id)
+      VALUES ($1,$2::date,$3)`, [generation, DAY, manifest]);
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domain_heads(participant_id,generation_id,revision,updated_at)
+      VALUES ($1,$2,1,$3::timestamptz)`, [owner, generation, now]);
+    await pool.query(`ANALYZE ${sqlSchema}.telemetry_v11_chunks`);
+    await pool.query(`ANALYZE ${sqlSchema}.telemetry_v11_records`);
+  }
+
+  function observedPool(fetchMutation) {
+    const stats = { checkouts: 0, releases: 0, active: 0, maxActive: 0,
+      fetches: 0, rollbacks: 0, cursorCountAfterRollback: null };
+    return {
+      stats,
+      pool: {
+        async connect() {
+          stats.checkouts += 1;
+          const client = await pool.connect();
+          stats.active += 1;
+          stats.maxActive = Math.max(stats.maxActive, stats.active);
+          return {
+            async query(text, values) {
+              const sql = String(text).trim();
+              const result = await client.query(text, values);
+              if (/^FETCH\b/iu.test(sql)) {
+                stats.fetches += 1;
+                return fetchMutation ? fetchMutation(result, stats.fetches) : result;
+              }
+              if (/^ROLLBACK\b/iu.test(sql)) {
+                stats.rollbacks += 1;
+                const cursorCheck = await client.query(
+                  "SELECT count(*)::int AS count FROM pg_cursors WHERE name=$1",
+                  ["community_daily_spend_cursor"],
+                );
+                stats.cursorCountAfterRollback = cursorCheck.rows[0]?.count;
+              }
+              return result;
+            },
+            release(discard) {
+              stats.releases += 1;
+              stats.active -= 1;
+              return client.release(discard);
+            },
+          };
+        },
+      },
+    };
+  }
+
+  async function sourceSnapshot() {
+    const result = await pool.query(`SELECT
+      (SELECT count(*)::int FROM ${sqlSchema}.telemetry_v1_chunks) AS v1_chunks,
+      (SELECT count(*)::int FROM ${sqlSchema}.telemetry_v1_records) AS v1_records,
+      (SELECT count(*)::int FROM ${sqlSchema}.telemetry_v11_chunks) AS v11_chunks,
+      (SELECT count(*)::int FROM ${sqlSchema}.telemetry_v11_records) AS v11_records,
+      (SELECT count(*)::int FROM ${sqlSchema}.pending_objects) AS pending_objects,
+      (SELECT md5(COALESCE(string_agg(id || ':' || chunk_digest || ':' || accepted_record_count::text,
+        E'\\n' ORDER BY id), '')) FROM ${sqlSchema}.telemetry_v1_chunks) AS v1_chunk_digest,
+      (SELECT md5(COALESCE(string_agg(chunk_row_id || ':' || occurrence_id || ':' || record_json::text,
+        E'\\n' ORDER BY chunk_row_id, occurrence_id), '')) FROM ${sqlSchema}.telemetry_v1_records) AS v1_record_digest,
+      (SELECT md5(COALESCE(string_agg(id || ':' || chunk_digest || ':' || record_count::text,
+        E'\\n' ORDER BY id), '')) FROM ${sqlSchema}.telemetry_v11_chunks) AS v11_chunk_digest,
+      (SELECT md5(COALESCE(string_agg(chunk_id || ':' || occurrence_id || ':' || record_json,
+        E'\\n' ORDER BY chunk_id, occurrence_id), '')) FROM ${sqlSchema}.telemetry_v11_records) AS v11_record_digest`);
+    return result.rows[0];
   }
 
   async function addAccountlessRetainedV11Day({ mismatchedLedgerHash = false } = {}) {
@@ -309,8 +506,8 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL explicit-day community daily produc
     };
   }
 
-  async function publish(options = {}) {
-    return publishPostgresCommunityDailyDay(pool, {
+  async function publish(options = {}, publicationPool = pool) {
+    return publishPostgresCommunityDailyDay(publicationPool, {
       sourceId: SOURCE_ID,
       sourceNamespace: SOURCE_NAMESPACE,
       day: DAY,
@@ -605,6 +802,88 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL explicit-day community daily produc
       .rows[0].count).toBe("0");
     expect((await pool.query(`SELECT count(*) AS count FROM ${sqlSchema}.community_daily_allowance_publication_state`))
       .rows[0].count).toBe("0");
+  });
+
+  it.each([
+    { events: 0, pages: 0, sha256: "a24f88d998fa610f0609e827e82375d970fc98a0ba9fe4907b588ae3fda83f8b" },
+    { events: 1, pages: 2, sha256: "d85c2439373a479cf694a27f6149d03ad86e07eeb835af95c3c70322ea168778" },
+    { events: 999, pages: 2, sha256: "fa0dbaa1678a2fa4c8bf218ccb223dd23bbc98d912dd9be10328aad8892cd7ac" },
+    { events: 1_000, pages: 2, sha256: "a6a7f139f86b024ac44330f1fe6473b33d74bd21d2c784a3d65da6717906e871" },
+    { events: 1_001, pages: 3, sha256: "ac32732a4b8892558097e7f4f829bdab1bdccd1ef00bb0257e8fbc7c0136de53" },
+  ])("streams $events v1 records with exact pre-cursor publication output", async ({ events, pages, sha256 }) => {
+    await addUsageEvents(events);
+    const before = await sourceSnapshot();
+    const expectedEligibility = {
+      v1SelectedRecordsPresent: events > 0,
+      v11SelectedRecordsPresent: false,
+    };
+    expect(await readPostgresCommunityDailyDaySourceEligibility(pool, {
+      day: DAY, schema: { primarySchema: schema },
+    })).toEqual(expectedEligibility);
+
+    const observed = observedPool();
+    expect(await publish({}, observed.pool)).toEqual({ state: "published", day: DAY, revision: 1 });
+    const aggregate = await pool.query(`SELECT payload_json,payload_sha256 FROM ${sqlSchema}.community_daily_aggregates
+      WHERE source_id=$1 AND day=$2::date AND revision=1`, [SOURCE_ID, DAY]);
+    expect(aggregate.rows).toHaveLength(1);
+    expect(aggregate.rows[0].payload_sha256).toBe(sha256);
+    const payload = JSON.parse(aggregate.rows[0].payload_json);
+    expect(payload.totals.usageEvents).toBe(events);
+    expect(aggregate.rows[0].payload_json).not.toContain(OWNER_ID);
+    expect(aggregate.rows[0].payload_json).not.toContain(DEVICE_ID);
+    expect(await sourceSnapshot()).toEqual(before);
+    expect(await readPostgresCommunityDailyDaySourceEligibility(pool, {
+      day: DAY, schema: { primarySchema: schema },
+    })).toEqual(expectedEligibility);
+    expect(observed.stats).toMatchObject({ checkouts: 1, releases: 1, active: 0, maxActive: 1, fetches: pages });
+  });
+
+  it("preserves exact mixed v1.0/v1.1 publication output", async () => {
+    await addUsageEvents(500);
+    await addActiveV11UsageOwner(500);
+    const before = await sourceSnapshot();
+    const observed = observedPool();
+    expect(await publish({}, observed.pool)).toEqual({ state: "published", day: DAY, revision: 1 });
+    const aggregate = await pool.query(`SELECT payload_json,payload_sha256 FROM ${sqlSchema}.community_daily_aggregates
+      WHERE source_id=$1 AND day=$2::date AND revision=1`, [SOURCE_ID, DAY]);
+    expect(aggregate.rows).toHaveLength(1);
+    expect(aggregate.rows[0].payload_sha256)
+      .toBe("bd9e41356a03443b7e4addcefc32448c96a44bdbb8e865ae5b82d69c2f3fcdf2");
+    const payload = JSON.parse(aggregate.rows[0].payload_json);
+    expect(payload.totals).toMatchObject({ usageEvents: 1_000,
+      contributingParticipants: 2, contributingDevices: 2 });
+    expect(aggregate.rows[0].payload_json).not.toContain("synthetic-v11-social-owner");
+    expect(aggregate.rows[0].payload_json).not.toContain("synthetic-v11-social-device");
+    expect(await sourceSnapshot()).toEqual(before);
+    expect(await readPostgresCommunityDailyDaySourceEligibility(pool, {
+      day: DAY, schema: { primarySchema: schema },
+    })).toEqual({ v1SelectedRecordsPresent: true, v11SelectedRecordsPresent: true });
+    expect(observed.stats).toMatchObject({ checkouts: 1, releases: 1, active: 0, maxActive: 1, fetches: 2 });
+  });
+
+  it.each([
+    {
+      name: "missing fetched row",
+      mutate: (result, call) => call === 1 ? { ...result, rows: [], rowCount: 0 } : result,
+      operation: "community_daily.spend_rows",
+    },
+    {
+      name: "extra fetched row",
+      mutate: (result, call) => call === 1
+        ? { ...result, rows: [...result.rows, ...result.rows], rowCount: result.rows.length * 2 }
+        : result,
+      operation: "community_daily.spend_event_count",
+    },
+  ])("rolls back and releases the cursor when the fetch stream has an $name", async ({ mutate, operation }) => {
+    await addOneUsageEvent();
+    const before = await sourceSnapshot();
+    const observed = observedPool(mutate);
+    await expect(publish({}, observed.pool)).rejects.toMatchObject({ code: "unavailable", operation });
+    expect(observed.stats).toMatchObject({ checkouts: 1, releases: 1, active: 0,
+      maxActive: 1, fetches: 1, rollbacks: 1, cursorCountAfterRollback: 0 });
+    expect((await pool.query(`SELECT count(*)::int AS count FROM ${sqlSchema}.community_daily_aggregates
+      WHERE source_id=$1 AND day=$2::date`, [SOURCE_ID, DAY])).rows[0].count).toBe(0);
+    expect(await sourceSnapshot()).toEqual(before);
   });
 
   it("withdraws prior revisions, waits for the terminal cursor, then publishes a fresh owner-free revision", async () => {

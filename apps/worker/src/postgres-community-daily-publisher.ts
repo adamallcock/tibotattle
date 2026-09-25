@@ -470,36 +470,44 @@ async function priceDailySpend(
     });
   }
 
-  let after: readonly [string, string, string, number, string] | null = null;
+  const cursor = "community_daily_spend_cursor";
+  // `day` is validated by dayValue and contains only ISO date digits. DECLARE
+  // takes one SQL statement, so bind the validated date as a literal rather
+  // than trying to bind through PostgreSQL's cursor declaration syntax.
+  const cursorCtes = ctes.replaceAll("$1::date", `DATE '${day}'`);
+  await client.query(
+    `DECLARE ${cursor} NO SCROLL CURSOR WITHOUT HOLD FOR
+     ${cursorCtes}
+     SELECT record.participant_id, record.device_id, record.chunk_id,
+            record.source_format, record.occurrence_id,
+            to_char(record.observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS observed_at,
+            record.record_json
+       FROM active_records record
+      WHERE record.stream = 'usage'
+      ORDER BY record.participant_id COLLATE "C", record.device_id COLLATE "C",
+               record.chunk_id COLLATE "C", record.source_format,
+               record.occurrence_id COLLATE "C"`,
+  );
   let seen = 0;
   let knownNanousd = 0n;
   let fullyPricedUsageEvents = 0;
   let partiallyPricedUsageEvents = 0;
   let unpricedUsageEvents = 0;
-  while (seen < usageEvents) {
+  while (true) {
+    // Fetch at most one row beyond the aggregate count. This also verifies
+    // exhaustion when usageEvents is an exact multiple of the page size.
+    const fetchCount = Math.min(SPEND_FETCH_BATCH_SIZE, usageEvents - seen + 1);
     const page: PostgresQueryResult<SpendRecordQueryRow> = await client.query<SpendRecordQueryRow>(
-      `${ctes}
-       SELECT record.participant_id, record.device_id, record.chunk_id,
-              record.source_format, record.occurrence_id,
-              to_char(record.observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS observed_at,
-              record.record_json
-         FROM active_records record
-        WHERE record.stream = 'usage'
-          AND ($2::text IS NULL OR
-            (record.participant_id COLLATE "C", record.device_id COLLATE "C",
-             record.chunk_id COLLATE "C", record.source_format,
-             record.occurrence_id COLLATE "C")
-              > ($2 COLLATE "C", $3 COLLATE "C", $4 COLLATE "C", $5::integer,
-                 $6 COLLATE "C"))
-        ORDER BY record.participant_id COLLATE "C", record.device_id COLLATE "C",
-                 record.chunk_id COLLATE "C", record.source_format,
-                 record.occurrence_id COLLATE "C"
-        LIMIT $7`,
-      [day, after?.[0] ?? null, after?.[1] ?? "", after?.[2] ?? "", after?.[3] ?? 0,
-        after?.[4] ?? "", SPEND_FETCH_BATCH_SIZE],
+      `FETCH FORWARD ${fetchCount} FROM ${cursor}`,
     );
-    if (!Array.isArray(page.rows) || page.rows.length === 0
-        || page.rows.length > SPEND_FETCH_BATCH_SIZE) unavailable("community_daily.spend_rows");
+    if (!Array.isArray(page.rows) || page.rows.length > fetchCount) {
+      unavailable("community_daily.spend_rows");
+    }
+    if (page.rows.length === 0) {
+      if (seen !== usageEvents) unavailable("community_daily.spend_rows");
+      break;
+    }
+    if (seen + page.rows.length > usageEvents) unavailable("community_daily.spend_event_count");
     for (const row of page.rows) {
       const priced = priceChunkUsageRecord(row.record_json, row.observed_at);
       if (priced === null || priced.pricingStatus === "unpriced") {
@@ -510,12 +518,14 @@ async function priceDailySpend(
         if (priced.pricingStatus === "fully_priced") fullyPricedUsageEvents += 1;
         else partiallyPricedUsageEvents += 1;
       }
+      integer(row.source_format, 10);
       seen += 1;
-      after = [row.participant_id, row.device_id, row.chunk_id,
-        integer(row.source_format, 10), row.occurrence_id];
     }
   }
   if (seen !== usageEvents) unavailable("community_daily.spend_event_count");
+  // If fetching/pricing failed, the transaction rollback releases the
+  // transaction-scoped cursor. Closing only on success avoids masking errors.
+  await client.query(`CLOSE ${cursor}`);
   return finalizeCommunityDailySpend({
     usageEvents,
     knownNanousd,
