@@ -23,6 +23,71 @@ const OTHER_PARTICIPANT_ID = "synthetic-community-participant-2";
 const DAY = "2026-09-23";
 const FINGERPRINT = "a".repeat(64);
 const NOW = Date.now();
+const STRESS_MEMBERS = process.env.PG_GRAPH_STRESS_MEMBERS === undefined
+  ? 1_025 : Number(process.env.PG_GRAPH_STRESS_MEMBERS);
+if (!Number.isSafeInteger(STRESS_MEMBERS) || STRESS_MEMBERS < 1_025
+    || STRESS_MEMBERS > 100_000) {
+  throw new Error("PG_GRAPH_STRESS_MEMBERS must be an integer from 1025 to 100000");
+}
+
+function measuredPool(base) {
+  const timings = new Map();
+  let explainedResultPage = false;
+  const classify = (sql) => {
+    if (sql.includes("candidates AS MATERIALIZED")) return "result_pages";
+    if (sql.includes("WITH locked AS MATERIALIZED")) return "authority_locks";
+    if (sql.includes("WITH stored AS MATERIALIZED")) return "member_receipt";
+    if (sql.includes("percentile_cont(0.5)")) return "database_median";
+    if (sql.includes("pg_temp.pg_community_graph_members")) return "member_temp_table";
+    if (sql.includes("pg_temp.pg_community_graph_capacities")) return "capacity_temp_table";
+    if (sql.includes("analytics_publication_owner_members")) return "publication_members";
+    if (sql.includes("analytics_publications")) return "publication_read_write";
+    return "other_sql";
+  };
+  return {
+    pool: {
+      async connect() {
+        const client = await base.connect();
+        return {
+          async query(sql, values) {
+            if (!explainedResultPage && process.env.PG_GRAPH_STRESS_EXPLAIN === "1"
+                && classify(sql) === "result_pages") {
+              explainedResultPage = true;
+              const explained = await client.query(`EXPLAIN (FORMAT JSON) ${sql}`, values);
+              const plan = explained.rows[0]?.["QUERY PLAN"]?.[0]?.Plan;
+              const nodes = [];
+              const collect = (node) => {
+                if (!node) return;
+                nodes.push({ type: node["Node Type"], relation: node["Relation Name"],
+                  index: node["Index Name"], planRows: node["Plan Rows"] });
+                for (const child of node.Plans ?? []) collect(child);
+              };
+              collect(plan);
+              console.log(JSON.stringify({ kind: "synthetic-postgres-result-page-plan-v1", nodes }));
+            }
+            const started = performance.now();
+            try { return await client.query(sql, values); }
+            finally {
+              const kind = classify(sql);
+              const previous = timings.get(kind) ?? { count: 0, milliseconds: 0 };
+              timings.set(kind, {
+                count: previous.count + 1,
+                milliseconds: previous.milliseconds + performance.now() - started,
+              });
+            }
+          },
+          release(discard) { return client.release(discard); },
+        };
+      },
+    },
+    summary() {
+      return Object.fromEntries([...timings].sort(([left], [right]) => left.localeCompare(right))
+        .map(([kind, timing]) => [kind, {
+          count: timing.count, milliseconds: Math.round(timing.milliseconds),
+        }]));
+    },
+  };
+}
 
 async function localSocket() {
   assert.match(PG_TEST_SOCKET ?? "", /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u);
@@ -503,7 +568,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
 
   it("streams cohorts above 1,024 members and rolls back interrupted attempts before retry", async () => {
     await seedOwner();
-    const largeCount = 1_025;
+    const largeCount = STRESS_MEMBERS;
     await pool.query(`INSERT INTO ${sqlSchema}.participants(id, owner_kind, state, created_at)
       SELECT 'synthetic-stream-'||index, 'social', 'active', clock_timestamp()
         FROM generate_series(1,$1::integer) AS generated(index)`, [largeCount]);
@@ -551,15 +616,22 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
       (SELECT count(*) FROM ${sqlSchema}.analytics_publication_owner_members) AS members`))
       .toMatchObject({ rows: [{ publications: "0", captures: "0", members: "0" }] });
 
-    const published = await publishPostgresCommunityModelDayStream(pool, {
+    const rssBefore = process.memoryUsage().rss;
+    const publicationSql = measuredPool(pool);
+    const publishStarted = performance.now();
+    const published = await publishPostgresCommunityModelDayStream(publicationSql.pool, {
       sourcePin, members: stream(), day: DAY, nowMs: NOW, schema: schemaOptions,
     });
+    const publishMilliseconds = performance.now() - publishStarted;
+    const rssAfterPublish = process.memoryUsage().rss;
     expect(published).toMatchObject({ state: "published", memberCount: largeCount });
     expect(await pool.query(`SELECT expected_members, payload_json
       FROM ${sqlSchema}.analytics_publication_captures`)).toMatchObject({
-      rows: [{ expected_members: "1025", payload_json: expect.stringContaining('"postgres-community-model-capture-v2"') }],
+      rows: [{ expected_members: String(largeCount), payload_json: expect.stringContaining('"postgres-community-model-capture-v2"') }],
     });
-    expect(await readPostgresCommunityModelDay(pool, {
+    const readSql = measuredPool(pool);
+    const readStarted = performance.now();
+    expect(await readPostgresCommunityModelDay(readSql.pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: DAY, schema: schemaOptions,
     })).toMatchObject({
       day: DAY,
@@ -568,6 +640,19 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
       unsupportedSourceParticipantCount: 0,
       values: [["gpt-6-astra", 1000, largeCount]],
     });
+    const readMilliseconds = performance.now() - readStarted;
+    const rssAfterRead = process.memoryUsage().rss;
+    if (process.env.PG_GRAPH_STRESS_MEMBERS !== undefined) {
+      console.log(JSON.stringify({
+        kind: "synthetic-postgres-graph-stress-v1",
+        members: largeCount,
+        publishMilliseconds: Math.round(publishMilliseconds),
+        readMilliseconds: Math.round(readMilliseconds),
+        rssSnapshotsBytes: [rssBefore, rssAfterPublish, rssAfterRead],
+        publicationSql: publicationSql.summary(),
+        readSql: readSql.summary(),
+      }));
+    }
     expect(await publishPostgresCommunityModelDayStream(pool, {
       sourcePin, members: stream(), day: DAY, nowMs: NOW + 1, schema: schemaOptions,
     })).toMatchObject({ state: "unchanged", memberCount: largeCount, generation: published.generation });

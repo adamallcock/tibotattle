@@ -41,7 +41,7 @@ import { MODEL_HISTORY_METHOD_VERSION } from "./quota-analysis-v1";
 import { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from "./quota-analysis-v11";
 
 const MAX_RESULT_BYTES = 1024 * 1024;
-const MAX_MEMBER_INSERT_BATCH = 200;
+const MAX_MEMBER_INSERT_BATCH = 1_000;
 const MAX_RESULT_CANDIDATE_ROWS = 512;
 const MAX_RESULT_BATCH_BYTES = 1024 * 1024;
 const MAX_PUBLICATION_BYTES = 16 * 1024;
@@ -531,7 +531,15 @@ async function publishPostgresCommunityModelDayStreamWithClientMembers(
       let resultCursor = "";
       while (true) {
         const results = await client.query<StreamResultRow>(
-          `WITH candidates AS MATERIALIZED (
+          `WITH member_page AS MATERIALIZED (
+             SELECT member.owner_digest, member.participant_id, member.input_revision,
+                    member.owner_revision, member.authority_epoch, member.source_kind,
+                    member.input_fingerprint, member.model_method
+               FROM pg_temp.pg_community_graph_members member
+              WHERE member.owner_digest COLLATE "C" > $4::text COLLATE "C"
+              ORDER BY member.owner_digest COLLATE "C"
+              LIMIT $5
+           ), candidates AS MATERIALIZED (
              SELECT member.owner_digest, member.participant_id, member.input_revision,
                     member.owner_revision, member.authority_epoch, member.source_kind,
                     member.input_fingerprint,
@@ -543,7 +551,7 @@ async function publishPostgresCommunityModelDayStreamWithClientMembers(
                     result.method, result.status, result.reason, result.payload_json,
                     result.payload_sha256, result.computed_at_ms,
                     COALESCE(octet_length(result.payload_json),0) AS result_payload_bytes
-               FROM pg_temp.pg_community_graph_members member
+               FROM member_page member
                LEFT JOIN LATERAL (
                  SELECT result.owner_digest, result.input_revision, result.owner_revision,
                         result.authority_epoch, result.public_authority_epoch, result.source_epoch,
@@ -555,9 +563,7 @@ async function publishPostgresCommunityModelDayStreamWithClientMembers(
                     AND result.metric='model' AND result.owner_digest=member.owner_digest
                   FOR SHARE OF result
                ) result ON true
-              WHERE member.owner_digest COLLATE "C" > $4::text COLLATE "C"
               ORDER BY member.owner_digest COLLATE "C"
-              LIMIT $5
            ), sized AS MATERIALIZED (
              SELECT candidates.*,
                     sum(result_payload_bytes) OVER (ORDER BY owner_digest COLLATE "C") AS cumulative_payload_bytes,
