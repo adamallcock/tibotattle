@@ -9,6 +9,7 @@ const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
 const POSTGRES_MAJOR_REQUIRED = 17;
 const V12_CHUNK_UPLOAD_PATH = "/api/v1/contributions";
 const COMMUNITY_DAILY_PATH = "/api/v1/community/daily";
+const PARTICIPANT_DEVICES_PATH = "/api/v1/me/devices";
 const COMMUNITY_DAILY_MAX_RANGE_DAYS = 366;
 export const CLOUD_RUN_IAM_TEST_TARGET = Object.freeze({
   project: "tibotattle",
@@ -393,6 +394,93 @@ export function createPostgresTestCommunityDailyDispatch({
       });
     } catch (error) {
       return routeError(error, requestId);
+    }
+  };
+}
+
+/** Private Cloud Run test route for the Worker-compatible personal device read. */
+export function createPostgresTestParticipantDevicesDispatch({
+  primaryPool,
+  ledgerPool,
+  schemaOptions,
+  authenticatePostgresPersonalSession,
+  listPostgresParticipantDevices,
+  hasPostgresDeletionTombstone,
+  healthDispatch,
+  privateOrigin,
+}) {
+  if (primaryPool === null || typeof primaryPool !== "object"
+      || typeof primaryPool.connect !== "function"
+      || ledgerPool === null || typeof ledgerPool !== "object"
+      || typeof ledgerPool.connect !== "function"
+      || primaryPool === ledgerPool
+      || typeof authenticatePostgresPersonalSession !== "function"
+      || typeof listPostgresParticipantDevices !== "function"
+      || typeof hasPostgresDeletionTombstone !== "function"
+      || typeof healthDispatch !== "function") {
+    configurationError("POSTGRES_TEST_PARTICIPANT_DEVICES_DISPATCH_CONFIGURATION_INVALID");
+  }
+  const schemas = validatedSchemas(schemaOptions);
+  if (!isAllowedPostgresTestOrigin(privateOrigin)) {
+    configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
+  }
+
+  return async function dispatchPostgresTestParticipantDevices(request) {
+    let url;
+    try { url = new URL(request.url); } catch {
+      return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
+    }
+    if (url.origin !== privateOrigin || url.pathname !== PARTICIPANT_DEVICES_PATH) {
+      return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
+    }
+    if (request.method !== "GET") {
+      return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
+        code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET" },
+      }), crypto.randomUUID());
+    }
+
+    const requestId = crypto.randomUUID();
+    try {
+      // Cloud Run carries its IAM assertion in x-serverless-authorization;
+      // the Node boundary removes that header. Authorization remains reserved
+      // for Worker capabilities and personalSession rejects it for this GET.
+      if (request.headers.has("authorization")) {
+        throw Object.assign(new Error("AUTH_INVALID"), { code: "AUTH_INVALID", status: 401 });
+      }
+      const health = await healthDispatch(new Request(`${privateOrigin}/api/health`));
+      if (health?.status !== 200) throw storageUnavailable();
+
+      const principal = await authenticatePostgresPersonalSession(
+        primaryPool,
+        request.headers.get("cookie"),
+        { schema: { primarySchema: schemas.primary } },
+      );
+      if (principal === null || typeof principal !== "object"
+          || typeof principal.participantId !== "string" || principal.participantId.length === 0) {
+        throw storageUnavailable();
+      }
+      if (await hasPostgresDeletionTombstone(
+        ledgerPool,
+        principal.participantId,
+        Date.now(),
+        { schema: { ledgerSchema: schemas.ledger } },
+      )) {
+        throw Object.assign(new Error("AUTH_INVALID"), { code: "AUTH_INVALID", status: 401 });
+      }
+      const devices = await listPostgresParticipantDevices(
+        primaryPool,
+        principal.participantId,
+        { schema: { primarySchema: schemas.primary } },
+      );
+      if (!Array.isArray(devices) || devices.length > 100) throw storageUnavailable();
+      return json(200, { devices }, { vary: "Cookie" });
+    } catch (error) {
+      if (Number.isSafeInteger(error?.status)
+          && typeof error?.code === "string" && /^[A-Z0-9_]+$/u.test(error.code)) {
+        return routeError(error, requestId);
+      }
+      // Never expose PostgreSQL driver errors or database object details.
+      return routeError(storageUnavailable(), requestId);
     }
   };
 }

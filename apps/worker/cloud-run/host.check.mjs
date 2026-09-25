@@ -23,6 +23,7 @@ import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import {
   CLOUD_RUN_IAM_TEST_TARGET,
   createPostgresTestCommunityDailyDispatch,
+  createPostgresTestParticipantDevicesDispatch,
   createPostgresTestV12DayManifestDispatch,
   createPostgresTestHealthDispatch,
   dispatchCloudRunHostRequest,
@@ -515,6 +516,115 @@ test("private community daily dispatch withholds unavailable PostgreSQL data and
   assert.equal(reads, 1);
 });
 
+test("private participant-device dispatch preserves cookie auth, owner scope, and private readiness", async () => {
+  let healthChecks = 0;
+  let authCalls = 0;
+  let tombstoneChecks = 0;
+  let deviceReads = 0;
+  let workerCalls = 0;
+  const primaryPool = { async connect() { throw new Error("the PostgreSQL facades own reads"); } };
+  const ledgerPool = { async connect() { throw new Error("the tombstone facade owns reads"); } };
+  const healthDispatch = async () => {
+    healthChecks += 1;
+    return new Response(JSON.stringify({ status: "ready" }), { status: 200 });
+  };
+  const dispatch = createPostgresTestParticipantDevicesDispatch({
+    primaryPool,
+    ledgerPool,
+    schemaOptions: { primarySchema: "devices_test", ledgerSchema: "devices_ledger_test" },
+    authenticatePostgresPersonalSession: async (pool, cookie, options) => {
+      authCalls += 1;
+      assert.equal(pool, primaryPool);
+      assert.equal(cookie, "__Host-usage_monitor_session=synthetic-session");
+      assert.deepEqual(options, { schema: { primarySchema: "devices_test" } });
+      return { participantId: "synthetic-owner-a" };
+    },
+    hasPostgresDeletionTombstone: async (pool, participantId, _now, options) => {
+      tombstoneChecks += 1;
+      assert.equal(pool, ledgerPool);
+      assert.equal(participantId, "synthetic-owner-a");
+      assert.deepEqual(options, { schema: { ledgerSchema: "devices_ledger_test" } });
+      return false;
+    },
+    listPostgresParticipantDevices: async (pool, participantId, options) => {
+      deviceReads += 1;
+      assert.equal(pool, primaryPool);
+      assert.equal(participantId, "synthetic-owner-a");
+      assert.deepEqual(options, { schema: { primarySchema: "devices_test" } });
+      return [{
+        deviceId: "synthetic-owner-a-device",
+        state: "active",
+        createdAt: "2026-09-25T12:00:00.000Z",
+        expiresAt: "2026-10-25T12:00:00.000Z",
+        lastUsedAt: "2026-09-25T12:30:00.000Z",
+        revokedAt: null,
+      }];
+    },
+    healthDispatch,
+    privateOrigin: "http://127.0.0.1:8080",
+  });
+  const runtime = {
+    postgresTestDispatch: dispatch,
+    get env() { throw new Error("D1 must remain unreachable"); },
+  };
+  const workerHandler = async () => { workerCalls += 1; throw new Error("Worker must not be called"); };
+  const path = "http://127.0.0.1:8080/api/v1/me/devices";
+
+  const wrongOrigin = await dispatchCloudRunHostRequest(
+    new Request("http://other-host:8080/api/v1/me/devices"), runtime, workerHandler,
+  );
+  assert.equal(wrongOrigin.status, 503);
+  assert.equal(authCalls, 0);
+
+  const wrongMethod = await dispatchCloudRunHostRequest(
+    new Request(path, { method: "POST" }), runtime, workerHandler,
+  );
+  assert.equal(wrongMethod.status, 405);
+  assert.equal(wrongMethod.headers.get("allow"), "GET");
+
+  const authorization = await dispatchCloudRunHostRequest(new Request(path, {
+    headers: {
+      cookie: "__Host-usage_monitor_session=synthetic-session",
+      authorization: "Bearer device-capability",
+    },
+  }), runtime, workerHandler);
+  assert.equal((await assertApiError(authorization, 401, "AUTH_INVALID")).error.code, "AUTH_INVALID");
+  assert.equal(authCalls, 0, "Authorization is rejected before session or database reads");
+
+  const response = await dispatchCloudRunHostRequest(new Request(
+    `${path}?participantId=synthetic-owner-b`,
+    { headers: { cookie: "__Host-usage_monitor_session=synthetic-session" } },
+  ), runtime, workerHandler);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("vary"), "Cookie");
+  const body = await response.json();
+  assert.equal(body.devices.length, 1);
+  assert.equal(body.devices[0].deviceId, "synthetic-owner-a-device");
+  assert.equal(JSON.stringify(body).includes("synthetic-owner-b"), false,
+    "query parameters cannot choose or reveal another participant's devices");
+  assert.equal(healthChecks, 1);
+  assert.equal(authCalls, 1);
+  assert.equal(tombstoneChecks, 1);
+  assert.equal(deviceReads, 1);
+  assert.equal(workerCalls, 0);
+
+  const staleReadiness = createPostgresTestParticipantDevicesDispatch({
+    primaryPool,
+    ledgerPool,
+    schemaOptions: { primarySchema: "devices_test", ledgerSchema: "devices_ledger_test" },
+    authenticatePostgresPersonalSession: async () => { throw new Error("must not authenticate when stale"); },
+    listPostgresParticipantDevices: async () => { throw new Error("must not read when stale"); },
+    hasPostgresDeletionTombstone: async () => { throw new Error("must not check ledger when stale"); },
+    healthDispatch: async () => new Response(null, { status: 503 }),
+    privateOrigin: "http://127.0.0.1:8080",
+  });
+  const notReady = await staleReadiness(new Request(path, {
+    headers: { cookie: "__Host-usage_monitor_session=synthetic-session" },
+  }));
+  assert.equal(notReady.status, 503);
+  assert.equal((await notReady.json()).error.code, "BACKEND_STORAGE_UNAVAILABLE");
+});
+
 test("private-host envelope-key is public-only and bypasses PostgreSQL and Worker fallback", async () => {
   let postgresConnections = 0;
   let projectionCalls = 0;
@@ -943,6 +1053,130 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
   }
 });
 
+test("PostgreSQL personal-device adapter validates Worker session bindings and maps the bounded projection", async () => {
+  const vite = await createServer({
+    root: WORKER_ROOT,
+    configFile: false,
+    server: { middlewareMode: true },
+    appType: "custom",
+  });
+  try {
+    const [session, personalDevices] = await Promise.all([
+      vite.ssrLoadModule("/src/session.ts"),
+      vite.ssrLoadModule("/src/postgres-personal-devices.ts"),
+    ]);
+    const now = Date.now();
+    const participantId = "synthetic-personal-device-owner";
+    const makeMaterial = (scope = "personal", expiresAt = new Date(now + 60 * 60_000).toISOString()) =>
+      session.createSessionMaterialFromSecret(
+        participantId,
+        randomUUID(),
+        randomBytes(32).toString("base64url"),
+        new Date(now - 5_000).toISOString(),
+        expiresAt,
+        scope,
+      );
+    const [valid, expired, deletionOnly, revoked, deletingParticipant] = await Promise.all([
+      makeMaterial(),
+      makeMaterial("personal", new Date(now - 60_000).toISOString()),
+      makeMaterial("deletion_only"),
+      makeMaterial(),
+      makeMaterial(),
+    ]);
+    const rowFor = (material, overrides = {}) => ({
+      participant_id: participantId,
+      secret_hash: material.secretHash,
+      csrf_hash: material.csrfHash,
+      session_scope: material.scope,
+      session_state: "active",
+      expires_at: material.expiresAt,
+      participant_state: "active",
+      consent_version: null,
+      ...overrides,
+    });
+    const sessions = new Map([
+      [valid.id, rowFor(valid)],
+      [expired.id, rowFor(expired)],
+      [deletionOnly.id, rowFor(deletionOnly)],
+      [revoked.id, rowFor(revoked, { session_state: "revoked" })],
+      [deletingParticipant.id, rowFor(deletingParticipant, { participant_state: "deleting" })],
+    ]);
+    const devices = [{
+      id: "synthetic-revoked-device",
+      state: "revoked",
+      created_at: "2026-09-25T12:00:00.000Z",
+      expires_at: "2026-09-24T12:00:00.000Z",
+      last_used_at: "2026-09-25T12:30:00.000Z",
+      revoked_at: "2026-09-25T12:45:00.000Z",
+    }];
+    const pool = {
+      async connect() {
+        return {
+          async query(sql, values = []) {
+            if (sql.startsWith("SELECT session.participant_id")) {
+              const row = sessions.get(values[0]);
+              return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
+            }
+            if (sql.includes('FROM "devices_test"."device_credentials"')) {
+              const rows = values[0] === participantId ? devices : [];
+              return { rows, rowCount: rows.length };
+            }
+            return { rows: [], rowCount: 0 };
+          },
+          release() {},
+        };
+      },
+    };
+    const schema = { primarySchema: "devices_test", ledgerSchema: "devices_ledger_test" };
+    assert.deepEqual(
+      await personalDevices.authenticatePostgresPersonalSession(
+        pool,
+        session.sessionCookie(valid),
+        { schema, nowEpoch: now },
+      ),
+      { participantId },
+      "a valid cookie remains readable without a consent-version requirement",
+    );
+    assert.deepEqual(
+      await personalDevices.listPostgresParticipantDevices(pool, participantId, { schema }),
+      [{
+        deviceId: "synthetic-revoked-device",
+        state: "revoked",
+        createdAt: "2026-09-25T12:00:00.000Z",
+        expiresAt: "2026-09-24T12:00:00.000Z",
+        lastUsedAt: "2026-09-25T12:30:00.000Z",
+        revokedAt: "2026-09-25T12:45:00.000Z",
+      }],
+      "revoked and expired devices remain visible in the personal history",
+    );
+    for (const [material, code] of [
+      [expired, "AUTH_INVALID"],
+      [deletionOnly, "AUTH_INVALID"],
+      [revoked, "AUTH_INVALID"],
+    ]) {
+      await assert.rejects(
+        personalDevices.authenticatePostgresPersonalSession(pool, session.sessionCookie(material), {
+          schema,
+          nowEpoch: now,
+        }),
+        { code, status: 401 },
+      );
+    }
+    await assert.rejects(
+      personalDevices.authenticatePostgresPersonalSession(
+        pool, session.sessionCookie(deletingParticipant), { schema, nowEpoch: now },
+      ),
+      { code: "PARTICIPANT_DELETING", status: 409 },
+    );
+    await assert.rejects(
+      personalDevices.authenticatePostgresPersonalSession(pool, null, { schema }),
+      { code: "AUTH_REQUIRED", status: 401 },
+    );
+  } finally {
+    await vite.close();
+  }
+});
+
 test("private health dispatch validates current primary and independent ledger PostgreSQL 17 receipts", {
   skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
   timeout: 90_000,
@@ -1043,6 +1277,247 @@ test("private health dispatch validates current primary and independent ledger P
       try { await primaryPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); } catch {}
     }
     if (temporary) await rm(temporary, { recursive: true, force: true });
+    await Promise.all([primaryPool.end(), ledgerPool.end()]);
+  }
+});
+
+test("private PostgreSQL 17 participant devices GET preserves session semantics and owner isolation", {
+  skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
+  timeout: 90_000,
+}, async () => {
+  const endpoint = await localPostgresEndpoint();
+  const suffix = randomBytes(6).toString("hex");
+  const primarySchema = `host_devices_${suffix}`;
+  const ledgerSchema = `host_devices_${suffix}_ledger`;
+  const primaryPool = new pg.Pool({
+    host: endpoint.host,
+    port: endpoint.port,
+    user: PG_TEST_USER,
+    ...(PG_TEST_PASSWORD === undefined ? { password: "synthetic-local-only" } : { password: PG_TEST_PASSWORD }),
+    database: PG_TEST_DATABASE,
+    ssl: false,
+    max: 3,
+    connectionTimeoutMillis: 3_000,
+  });
+  const ledgerPool = new pg.Pool({
+    host: endpoint.host,
+    port: endpoint.port,
+    user: PG_TEST_USER,
+    ...(PG_TEST_PASSWORD === undefined ? { password: "synthetic-local-only" } : { password: PG_TEST_PASSWORD }),
+    database: PG_TEST_DATABASE,
+    ssl: false,
+    max: 2,
+    connectionTimeoutMillis: 3_000,
+  });
+  const createdSchemas = [];
+  let vite;
+  try {
+    const server = await primaryPool.query(
+      "SELECT current_setting('server_version_num')::integer AS version",
+    );
+    assert.equal(Math.floor(server.rows[0].version / 10_000), 17,
+      "the personal-device HTTP integration check requires PostgreSQL 17");
+    await primaryPool.query(`CREATE SCHEMA "${primarySchema}"`);
+    createdSchemas.push(primarySchema);
+    await primaryPool.query(`CREATE SCHEMA "${ledgerSchema}"`);
+    createdSchemas.push(ledgerSchema);
+    await Promise.all([
+      applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: primaryPool }),
+      applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: ledgerPool }),
+    ]);
+
+    vite = await createServer({
+      root: WORKER_ROOT,
+      configFile: false,
+      server: { middlewareMode: true },
+      appType: "custom",
+    });
+    const [session, personalDevices, ledgerAuthority, deletionDigest, runtimeSchema]
+      = await Promise.all([
+        vite.ssrLoadModule("/src/session.ts"),
+        vite.ssrLoadModule("/src/postgres-personal-devices.ts"),
+        vite.ssrLoadModule("/src/postgres-ledger-authority.ts"),
+        vite.ssrLoadModule("/src/participant-deletion-digest.ts"),
+        vite.ssrLoadModule("/src/postgres-runtime-schema.ts"),
+      ]);
+    const primaryTable = (name) => quotedTable(primarySchema, name);
+    const ledgerTable = (name) => quotedTable(ledgerSchema, name);
+    const schemas = { primarySchema, ledgerSchema };
+    const now = Date.now();
+    const participantA = `synthetic-devices-a-${suffix}`;
+    const participantB = `synthetic-devices-b-${suffix}`;
+    await primaryPool.query(
+      `INSERT INTO ${primaryTable("participants")} (id, owner_kind, state, consent_version, created_at)
+       VALUES ($1, 'social', 'active', NULL, $2), ($3, 'social', 'active', $4, $2)`,
+      [participantA, new Date(now - 60_000).toISOString(), participantB, "telemetry-v3"],
+    );
+
+    async function insertSession(participantId, {
+      issuedAt = new Date(now - 5_000).toISOString(),
+      expiresAt = new Date(now + 60 * 60_000).toISOString(),
+      state = "active",
+      scope = "personal",
+    } = {}) {
+      const id = randomUUID();
+      const secret = randomBytes(32).toString("base64url");
+      const material = await session.createSessionMaterialFromSecret(
+        participantId, id, secret, issuedAt, expiresAt, scope,
+      );
+      await primaryPool.query(
+        `INSERT INTO ${primaryTable("web_sessions")} (
+           id, participant_id, secret_hash, csrf_hash, scope, state,
+           issued_at, expires_at, last_used_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$7)`,
+        [material.id, participantId, material.secretHash, material.csrfHash,
+          material.scope, state, material.issuedAt, material.expiresAt],
+      );
+      return material;
+    }
+
+    async function insertDevice(participantId, sessionId, {
+      issuedAt,
+      state = "active",
+      expiresAt = new Date(now + 30 * 24 * 60 * 60_000).toISOString(),
+    }) {
+      const deviceId = randomUUID();
+      const pairingId = randomUUID();
+      const issued = new Date(issuedAt).toISOString();
+      const revokedAt = state === "revoked" ? new Date(now - 1_000).toISOString() : null;
+      await primaryPool.query(
+        `INSERT INTO ${primaryTable("device_pairings")} (
+           id, participant_id, issued_by_session_id, secret_hash, consent_version,
+           transport_consent_version, state, issued_at, expires_at, consumed_at, claimed_device_id
+         ) VALUES ($1,$2,$3,$4,'stored-device-consent-v1','stored-transport-consent-v1',
+                   'consumed',$5,$6,$5,$7)`,
+        [pairingId, participantId, sessionId, randomBytes(32), issued,
+          expiresAt, deviceId],
+      );
+      await primaryPool.query(
+        `INSERT INTO ${primaryTable("device_credentials")} (
+           id, participant_id, authority_kind, paired_via_pairing_id, secret_hash,
+           state, issued_at, expires_at, last_used_at, revoked_at
+         ) VALUES ($1,$2,'social',$3,$4,$5,$6,$7,$8,$9)`,
+        [deviceId, participantId, pairingId, randomBytes(32), state, issued,
+          expiresAt, issued, revokedAt],
+      );
+      return {
+        deviceId,
+        state,
+        createdAt: issued,
+        expiresAt,
+        lastUsedAt: issued,
+        revokedAt,
+      };
+    }
+
+    const sessionA = await insertSession(participantA);
+    const sessionB = await insertSession(participantB);
+    const oldSessionA = await insertSession(participantA, {
+      issuedAt: new Date(now - 120_000).toISOString(),
+      expiresAt: new Date(now - 60_000).toISOString(),
+    });
+    const revokedSessionA = await insertSession(participantA, { state: "revoked" });
+    const deletionOnlySessionA = await insertSession(participantA, { scope: "deletion_only" });
+    const deviceAOld = await insertDevice(participantA, sessionA.id, {
+      issuedAt: new Date(now - 120_000).toISOString(),
+    });
+    const deviceARevokedExpired = await insertDevice(participantA, sessionA.id, {
+      issuedAt: new Date(now - 60_000).toISOString(),
+      state: "revoked",
+      expiresAt: new Date(now - 30_000).toISOString(),
+    });
+    const deviceB = await insertDevice(participantB, sessionB.id, {
+      issuedAt: new Date(now - 10_000).toISOString(),
+    });
+
+    const digest = await deletionDigest.participantDeletionDigest(participantB);
+    await ledgerPool.query(
+      `INSERT INTO ${ledgerTable("deletion_tombstones")} (
+         participant_digest, schema_version, deleted_at, retain_until
+       ) VALUES ($1,'participant-deletion-tombstone-v0.1',$2,$3)`,
+      [digest, new Date(now - 1_000).toISOString(), new Date(now + 60 * 60_000).toISOString()],
+    );
+
+    const healthDispatch = createPostgresTestHealthDispatch({
+      primaryPool,
+      ledgerPool,
+      schemaOptions: schemas,
+      expectedMigrations: runtimeSchema.POSTGRES_RUNTIME_MIGRATIONS,
+      privateOrigin: "http://127.0.0.1:43818",
+    });
+    const routeDispatch = createPostgresTestParticipantDevicesDispatch({
+      primaryPool,
+      ledgerPool,
+      schemaOptions: schemas,
+      authenticatePostgresPersonalSession: personalDevices.authenticatePostgresPersonalSession,
+      listPostgresParticipantDevices: personalDevices.listPostgresParticipantDevices,
+      hasPostgresDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
+      healthDispatch,
+      privateOrigin: "http://127.0.0.1:43818",
+    });
+    const runtime = {
+      postgresTestDispatch: routeDispatch,
+      get env() { throw new Error("D1 must not be reachable from the PostgreSQL HTTP route"); },
+    };
+    const workerHandler = async () => { throw new Error("Worker fallback must not be called"); };
+    const request = (material) => new Request(
+      `http://127.0.0.1:43818/api/v1/me/devices?participantId=${encodeURIComponent(participantB)}`,
+      { headers: { cookie: session.sessionCookie(material) } },
+    );
+
+    const responseA = await dispatchCloudRunHostRequest(request(sessionA), runtime, workerHandler);
+    assert.equal(responseA.status, 200);
+    assert.equal(responseA.headers.get("vary"), "Cookie");
+    const bodyA = await responseA.json();
+    assert.deepEqual(bodyA, {
+      devices: [
+        {
+          deviceId: deviceARevokedExpired.deviceId,
+          state: "revoked",
+          createdAt: deviceARevokedExpired.createdAt,
+          expiresAt: deviceARevokedExpired.expiresAt,
+          lastUsedAt: deviceARevokedExpired.lastUsedAt,
+          revokedAt: deviceARevokedExpired.revokedAt,
+        },
+        {
+          deviceId: deviceAOld.deviceId,
+          state: "active",
+          createdAt: deviceAOld.createdAt,
+          expiresAt: deviceAOld.expiresAt,
+          lastUsedAt: deviceAOld.lastUsedAt,
+          revokedAt: null,
+        },
+      ],
+    }, "the route returns all of the authenticated owner's devices in Worker order");
+    assert.equal(JSON.stringify(bodyA).includes(deviceB.deviceId), false,
+      "a query parameter cannot select or disclose another participant's device");
+    assert.equal(JSON.stringify(bodyA).includes(participantB), false);
+
+    for (const [material, code] of [
+      [oldSessionA, "AUTH_INVALID"],
+      [revokedSessionA, "AUTH_INVALID"],
+      [deletionOnlySessionA, "AUTH_INVALID"],
+    ]) {
+      await assertApiError(
+        await dispatchCloudRunHostRequest(request(material), runtime, workerHandler),
+        401,
+        code,
+      );
+    }
+    await assertApiError(
+      await dispatchCloudRunHostRequest(request(sessionB), runtime, workerHandler),
+      401,
+      "AUTH_INVALID",
+    );
+    const missingCookie = await dispatchCloudRunHostRequest(new Request(
+      "http://127.0.0.1:43818/api/v1/me/devices",
+    ), runtime, workerHandler);
+    await assertApiError(missingCookie, 401, "AUTH_REQUIRED");
+  } finally {
+    if (vite) await vite.close();
+    for (const schema of createdSchemas.reverse()) {
+      try { await primaryPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); } catch {}
+    }
     await Promise.all([primaryPool.end(), ledgerPool.end()]);
   }
 });

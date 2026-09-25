@@ -7,6 +7,10 @@ import { fileURLToPath } from "node:url";
 import { createPostgresWorkerBackend } from "../src/backend-composition.ts";
 import { readPostgresPublishedCommunityDaily } from "../src/postgres-community-daily.ts";
 import {
+  authenticatePostgresPersonalSession,
+  listPostgresParticipantDevices,
+} from "../src/postgres-personal-devices.ts";
+import {
   handleRequest,
   isPostgresWorkerRequestPathSupported,
 } from "../src/index.ts";
@@ -88,6 +92,7 @@ import { installNodeTimingSafeEqual } from "./node-crypto-adapter.mjs";
 import {
   CLOUD_RUN_IAM_TEST_TARGET,
   createPostgresTestCommunityDailyDispatch,
+  createPostgresTestParticipantDevicesDispatch,
   createPostgresTestV12DayManifestDispatch,
   createPostgresTestHealthDispatch,
   dispatchCloudRunHostRequest,
@@ -495,6 +500,16 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         healthDispatch,
         privateOrigin: hostOrigin,
       });
+      const participantDevicesDispatch = createPostgresTestParticipantDevicesDispatch({
+        primaryPool,
+        ledgerPool,
+        schemaOptions,
+        authenticatePostgresPersonalSession,
+        listPostgresParticipantDevices,
+        hasPostgresDeletionTombstone,
+        healthDispatch,
+        privateOrigin: hostOrigin,
+      });
       return {
         pools,
         connector,
@@ -510,9 +525,9 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         postgresTestDispatch: ((v12Dispatch) => async (request) => {
           let pathname;
           try { pathname = new URL(request.url).pathname; } catch { /* V12 dispatch returns a safe 503. */ }
-          return pathname === "/api/v1/community/daily"
-            ? communityDailyDispatch(request)
-            : v12Dispatch(request);
+          if (pathname === "/api/v1/community/daily") return communityDailyDispatch(request);
+          if (pathname === "/api/v1/me/devices") return participantDevicesDispatch(request);
+          return v12Dispatch(request);
         })(createPostgresTestV12DayManifestDispatch({
           primaryPool,
           ledgerPool,
