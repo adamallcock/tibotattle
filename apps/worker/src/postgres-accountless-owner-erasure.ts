@@ -7,6 +7,7 @@ import {
   withPostgresRead,
   type PostgresClient,
   type PostgresPool,
+  type PostgresSchemaConfig,
   type PostgresSchemaOptions,
 } from "./postgres-client";
 import { hasPostgresDeletionTombstone, recordPostgresDeletionTombstone } from "./postgres-ledger-authority";
@@ -15,6 +16,7 @@ import {
   type ParticipantErasureObjectRef,
   type ParticipantErasureObjectStore,
 } from "./erasure-object-store";
+import { retirePostgresAnalyticsOwner } from "./postgres-analytics-owner-retirement";
 
 const ACCOUNTLESS_PARTICIPANT = /^participant:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const DIGEST = /^[0-9a-f]{64}$/u;
@@ -36,6 +38,7 @@ export type PostgresAccountlessOwnerErasureCode =
   | "ACCOUNTLESS_OWNER_ERASURE_REFERENCE_MISMATCH"
   | "ACCOUNTLESS_OWNER_ERASURE_PENDING_UNATTRIBUTED"
   | "ACCOUNTLESS_OWNER_ERASURE_OBJECT_STORE_FAILED"
+  | "ACCOUNTLESS_OWNER_ERASURE_ANALYTICS_RETIREMENT_FAILED"
   | "ACCOUNTLESS_OWNER_ERASURE_LEDGER_FAILED"
   | "ACCOUNTLESS_OWNER_ERASURE_READBACK_FAILED";
 
@@ -94,7 +97,8 @@ interface ReceiptRow {
 
 interface ReceiptDetails {
   readonly schemaVersion: typeof RECEIPT_SCHEMA;
-  readonly phase: "fenced" | "pending_unattributed" | "object_delete_retry" | "objects_deleted" | "completed";
+  readonly phase:
+    | "fenced" | "pending_unattributed" | "object_delete_retry" | "objects_deleted" | "primary_deleted" | "completed";
   readonly ownerDigest: string;
   readonly objectCount: number;
 }
@@ -196,7 +200,8 @@ function parseDetails(row: ReceiptRow): ReceiptDetails | null {
   if (Reflect.get(value, "schemaVersion") !== RECEIPT_SCHEMA
       || typeof ownerDigest !== "string" || !DIGEST.test(ownerDigest)
       || !Number.isSafeInteger(objectCount) || objectCount < 0
-      || !["fenced", "pending_unattributed", "object_delete_retry", "objects_deleted", "completed"].includes(phase)) {
+      || !["fenced", "pending_unattributed", "object_delete_retry", "objects_deleted", "primary_deleted", "completed"]
+        .includes(phase)) {
     return null;
   }
   return Object.freeze({
@@ -821,6 +826,20 @@ async function verifyPrimaryCompletion(
   }
 }
 
+/** Retirement is idempotent; a refusal leaves the eraser resumable. */
+async function retireOwnerAnalytics(
+  primaryPool: PostgresPool,
+  schemas: PostgresSchemaConfig,
+  ownerDigest: string,
+): Promise<boolean> {
+  try {
+    const result = await retirePostgresAnalyticsOwner({ primaryPool, ownerDigest, schema: schemas });
+    return result.status === "complete";
+  } catch {
+    return false;
+  }
+}
+
 async function incomplete(
   ledgerPool: PostgresPool,
   ledgerSchema: string,
@@ -841,6 +860,8 @@ async function incomplete(
  * This is not a participant route. It retains no accountless identity rows,
  * removes exact live/archive object keys before source rows, and relies on the
  * independent deletion ledger plus the primary owner receipt for replay proof.
+ * After the primary deletion commits it retires the owner's derived analytics;
+ * a refused retirement leaves a primary_deleted receipt that a retry resumes.
  */
 export async function erasePostgresAccountlessOwner(
   options: PostgresAccountlessOwnerErasureOptions,
@@ -870,7 +891,7 @@ export async function erasePostgresAccountlessOwner(
   );
   if (snapshot.absent) {
     if (priorReceipt === null || priorDetails === null
-        || !["objects_deleted", "completed"].includes(priorDetails.phase)
+        || !["objects_deleted", "primary_deleted", "completed"].includes(priorDetails.phase)
         || !await hasPostgresDeletionTombstone(
           options.ledgerPool, options.participantId, Date.now(), { schema: schemas },
         )
@@ -881,6 +902,12 @@ export async function erasePostgresAccountlessOwner(
       fail("ACCOUNTLESS_OWNER_ERASURE_PARTICIPANT_NOT_FOUND");
     }
     if (priorReceipt.outcome !== "completed") {
+      // The primary deletion committed; only analytics retirement may remain.
+      if (!await retireOwnerAnalytics(options.primaryPool, schemas, priorDetails.ownerDigest)) {
+        return incomplete(options.ledgerPool, schemas.ledgerSchema, operationId, participantDigest,
+          priorDetails.ownerDigest, "primary_deleted", priorDetails.objectCount,
+          "ACCOUNTLESS_OWNER_ERASURE_ANALYTICS_RETIREMENT_FAILED");
+      }
       await writeReceipt(options.ledgerPool, schemas.ledgerSchema, operationId, participantDigest,
         "completed", details(priorDetails.ownerDigest, "completed", priorDetails.objectCount));
     }
@@ -941,6 +968,12 @@ export async function erasePostgresAccountlessOwner(
   )) {
     return incomplete(options.ledgerPool, schemas.ledgerSchema, operationId, participantDigest,
       ownerDigest, "objects_deleted", objectsDeleted, "ACCOUNTLESS_OWNER_ERASURE_READBACK_FAILED");
+  }
+  await writeReceipt(options.ledgerPool, schemas.ledgerSchema, operationId, participantDigest,
+    "started", details(ownerDigest, "primary_deleted", objectsDeleted));
+  if (!await retireOwnerAnalytics(options.primaryPool, schemas, ownerDigest)) {
+    return incomplete(options.ledgerPool, schemas.ledgerSchema, operationId, participantDigest,
+      ownerDigest, "primary_deleted", objectsDeleted, "ACCOUNTLESS_OWNER_ERASURE_ANALYTICS_RETIREMENT_FAILED");
   }
   await writeReceipt(options.ledgerPool, schemas.ledgerSchema, operationId, participantDigest,
     "completed", details(ownerDigest, "completed", objectsDeleted));

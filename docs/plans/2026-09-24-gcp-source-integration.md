@@ -94,12 +94,27 @@ candidate also adds PostgreSQL analytics owner retirement and completes the
 internal social owner eraser, which revokes authority, records the ledger
 tombstone and pinned-secret identity cooldowns, deletes exact stored objects,
 removes the participant, and then retires the owner's derived analytics, all
-resumably. These are local PostgreSQL 17 source results. Neither is routed,
-deployed, or live-qualified: no Worker route or admin action invokes them, the
-accountless eraser does not yet retire analytics, participants holding a
-redeemed community grant are refused pending a grant-retention decision, and
+resumably. The internal accountless owner eraser now takes the same final
+step: after its primary deletion commits it records a `primary_deleted` ledger
+phase and retires the owner's derived analytics, and a retry after a refusal
+or interruption resumes retirement from an `objects_deleted` or
+`primary_deleted` receipt before recording completion. These are local
+PostgreSQL 17 source results. None is routed, deployed, or live-qualified: no
+Worker route, admin action, or Job invokes them; participants holding a
+redeemed community grant are refused pending a grant-retention decision; and
 retirement's owner-digest discovery and residual scans still need
-qualification against a real transferred snapshot on the test primary.
+qualification against a real transferred snapshot on the test primary. In
+both erasers, a retirement refused while re-erasing a restored primary is not
+yet resumable: the terminal ledger receipt cannot record the refusal, so a
+later retry reports `already_complete` while the restored owner's derived
+analytics remain.
+
+The test project's live cleanup Job, `tibotattle-v12-synthetic-cleanup`, is
+built from `apps/worker/cloud-run/synthetic-v12-cleanup.mjs`, which calls the
+separate synthetic v1.2 eraser rather than the accountless eraser; that eraser
+does not retire analytics. Its recorded executions qualify only their pinned
+earlier images, so requalify the Job against the exact candidate image before
+any redeploy.
 
 The deployed OAuth gateway is isolated to a small explicit route allowlist. It
 pins the IAM-private backend URL and

@@ -16,6 +16,7 @@ const PG_TEST_DATABASE = process.env.PG_TEST_DATABASE ?? "postgres";
 const PG_TEST_PASSWORD = process.env.PG_TEST_PASSWORD;
 const PG_TEST_MIGRATIONS_ROOT = process.env.PG_TEST_MIGRATIONS_ROOT;
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const SOURCE_ID = "canonical-v1-primary";
 
 async function localEndpoint() {
   assert.ok(!PG_TEST_HOST || ["localhost", "127.0.0.1", "::1"].includes(PG_TEST_HOST),
@@ -361,6 +362,25 @@ async function seedAccountlessOwner(pool, schema, supplied = {}) {
     [deviceId, now],
   );
 
+  // Derived analytics follow every source row, so the source journal holds no
+  // unapplied event, as for a caught-up projection.
+  await pool.query(
+    `INSERT INTO ${q(schema, "storage_source_state")} (singleton,source_id,authority_epoch)
+     VALUES (1,$1,2) ON CONFLICT (singleton) DO NOTHING`, [SOURCE_ID],
+  );
+  await pool.query(
+    `INSERT INTO ${q(schema, "analytics_owner_state")} (source_id,owner_digest,revision,authority_epoch,state)
+     VALUES ($1,$2,1,2,'active')`, [SOURCE_ID, ownerDigest],
+  );
+  await pool.query(
+    `INSERT INTO ${q(schema, "analytics_owner_results")} (
+       source_id,source_namespace,observed_day,metric,owner_digest,input_revision,owner_revision,
+       authority_epoch,public_authority_epoch,source_epoch,sequence,method,status,payload_json,
+       payload_sha256,computed_at_ms
+     ) VALUES ($1,'telemetry-v1.2','2026-09-20','daily',$2,1,1,2,2,1,0,'synthetic','ready','{}',$3,0)`,
+    [SOURCE_ID, ownerDigest, randomDigest()],
+  );
+
   return {
     participantId,
     deviceId,
@@ -384,6 +404,27 @@ function failParticipantDeleteOnce(pool, schema) {
               && text.includes(`DELETE FROM ${q(schema, "participants")}`)) {
             failed = true;
             return Promise.reject(new Error("synthetic transaction interruption"));
+          }
+          return client.query(text, values);
+        },
+        release(discard) { return client.release(discard); },
+      };
+    },
+  };
+}
+
+/** Interrupt after the primary deletion commits, before its phase is recorded. */
+function failPrimaryDeletedReceiptOnce(pool) {
+  let failed = false;
+  return {
+    async connect() {
+      const client = await pool.connect();
+      return {
+        query(text, values) {
+          if (!failed && typeof text === "string" && text.includes("participant_erasure_receipts")
+              && typeof values?.[3] === "string" && values[3].includes('"phase":"primary_deleted"')) {
+            failed = true;
+            return Promise.reject(new Error("synthetic ledger interruption"));
           }
           return client.query(text, values);
         },
@@ -496,6 +537,14 @@ async function count(pool, schema, name, column, value) {
   return result.rows[0].count;
 }
 
+async function analyticsStates(pool, schema, ownerDigest) {
+  const result = await pool.query(
+    `SELECT state FROM ${q(schema, "analytics_owner_state")} WHERE owner_digest=$1 ORDER BY source_id`,
+    [ownerDigest],
+  );
+  return result.rows.map((row) => row.state);
+}
+
 test("PG17 accountless erasure removes opt-out history markers across v1/v1.1/v1.2, resumes after interruption, and suppresses restored state", {
   skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
   timeout: 180_000,
@@ -595,6 +644,9 @@ test("PG17 accountless erasure removes opt-out history markers across v1/v1.1/v1
     assert.equal(JSON.parse(interruptedReceipt.rows[0]?.details_json).phase, "objects_deleted");
     assert.equal(interruptedReceipt.rows[0]?.details_json.includes(fixture.participantId), false);
     assert.equal(interruptedReceipt.rows[0]?.details_json.includes("synthetic/erasure"), false);
+    assert.equal(await count(primaryPool, primarySchema, "analytics_owner_results", "owner_digest", fixture.ownerDigest), 1,
+      "derived analytics are retired only after the primary erasure commits");
+    assert.deepEqual(await analyticsStates(primaryPool, primarySchema, fixture.ownerDigest), ["active"]);
 
     const completed = await erasePostgresAccountlessOwner(options);
     assert.deepEqual(completed, { status: "complete", objectsDeleted: 6 });
@@ -621,11 +673,18 @@ test("PG17 accountless erasure removes opt-out history markers across v1/v1.1/v1
       [fixture.ownerDigest],
     );
     assert.equal(proof.rowCount, 1);
+    assert.equal(await count(primaryPool, primarySchema, "analytics_owner_results", "owner_digest", fixture.ownerDigest), 0,
+      "derived analytics for the erased owner are retired");
+    assert.deepEqual(await analyticsStates(primaryPool, primarySchema, fixture.ownerDigest), ["erased"],
+      "the erased owner-state sentinel is retained");
     const durable = await ledgerPool.query(
       `SELECT outcome,details_json FROM ${q(ledgerSchema, "participant_erasure_receipts")}`,
     );
     assert.equal(durable.rows[0]?.outcome, "completed");
-    assert.equal(JSON.parse(durable.rows[0]?.details_json).objectCount, 6);
+    const durableDetails = JSON.parse(durable.rows[0]?.details_json);
+    assert.deepEqual(Object.keys(durableDetails).sort(), ["objectCount", "ownerDigest", "phase", "schemaVersion"]);
+    assert.equal(durableDetails.phase, "completed");
+    assert.equal(durableDetails.objectCount, 6);
     const repeated = await erasePostgresAccountlessOwner(options);
     assert.deepEqual(repeated, { status: "already_complete", objectsDeleted: 6 });
     assert.equal(calls.length, 3, "already-complete retry performs no provider operations");
@@ -644,6 +703,9 @@ test("PG17 accountless erasure removes opt-out history markers across v1/v1.1/v1
     assert.equal(await count(restoredPool, restoredSchema, "participants", "id", fixture.participantId), 0);
     assert.equal(await count(restoredPool, restoredSchema, "accountless_public_history_retention", "participant_id", fixture.participantId), 0,
       "a restored marker is removed again under the prior durable owner-erasure receipt");
+    assert.equal(await count(restoredPool, restoredSchema, "analytics_owner_results", "owner_digest", fixture.ownerDigest), 0,
+      "restored derived analytics are retired again");
+    assert.deepEqual(await analyticsStates(restoredPool, restoredSchema, fixture.ownerDigest), ["erased"]);
     assert.equal(calls.length, 4);
     const stillCompleted = await ledgerPool.query(
       `SELECT outcome FROM ${q(ledgerSchema, "participant_erasure_receipts")}`,
@@ -656,6 +718,120 @@ test("PG17 accountless erasure removes opt-out history markers across v1/v1.1/v1
       try { await primaryPool.query(`DROP SCHEMA IF EXISTS ${q(schema, "unused").split(".")[0]} CASCADE`); } catch {}
     }
     await Promise.all([primaryPool.end(), restoredPool.end(), ledgerPool.end()]);
+  }
+});
+
+test("PG17 accountless erasure keeps the owner erased and resumes refused or interrupted analytics retirement", {
+  skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  const endpoint = await localEndpoint();
+  const suffix = randomBytes(5).toString("hex");
+  const refusedSchema = `typed_legacy_target_retire_${suffix}`;
+  const interruptedSchema = `typed_legacy_target_resume_${suffix}`;
+  const ledgerSchema = `${refusedSchema}_ledger`;
+  const poolOptions = {
+    host: endpoint.host,
+    port: endpoint.port,
+    user: PG_TEST_USER,
+    ...(PG_TEST_PASSWORD === undefined ? { password: "synthetic-local-only" } : { password: PG_TEST_PASSWORD }),
+    database: PG_TEST_DATABASE,
+    ssl: false,
+    max: 6,
+    connectionTimeoutMillis: 5_000,
+  };
+  const primaryPool = new pg.Pool(poolOptions);
+  const ledgerPool = new pg.Pool(poolOptions);
+  const schemas = [];
+  let vite;
+  try {
+    const version = await primaryPool.query("SELECT current_setting('server_version_num')::integer AS version");
+    assert.equal(Math.floor(version.rows[0].version / 10_000), 17);
+    // Each opt-out fixture needs its own primary schema for its header import;
+    // both owners share the independent ledger.
+    for (const schema of [refusedSchema, interruptedSchema]) {
+      await createSchema(primaryPool, schema);
+      schemas.push(schema);
+    }
+    await createSchema(primaryPool, ledgerSchema, "ledger");
+    schemas.push(ledgerSchema);
+    vite = await createServer({ root: WORKER_ROOT, configFile: false, server: { middlewareMode: true }, appType: "custom" });
+    const { erasePostgresAccountlessOwner, PostgresAccountlessOwnerErasureError } = await loadEraser(vite);
+    const refused = await seedAccountlessOwner(primaryPool, refusedSchema);
+    const interrupted = await seedAccountlessOwner(primaryPool, interruptedSchema);
+    const calls = [];
+    const objectStore = { async deleteBatch(refs) { calls.push(refs.map((ref) => ref.key)); } };
+    const optionsFor = (fixture, primarySchema, overrides = {}) => ({
+      primaryPool,
+      ledgerPool,
+      objectStore,
+      participantId: fixture.participantId,
+      schema: { primarySchema, ledgerSchema },
+      ...overrides,
+    });
+    const receiptFor = async (fixture) => {
+      const rows = (await ledgerPool.query(
+        `SELECT outcome,details_json FROM ${q(ledgerSchema, "participant_erasure_receipts")}`,
+      )).rows.filter((row) => JSON.parse(row.details_json).ownerDigest === fixture.ownerDigest);
+      assert.equal(rows.length, 1);
+      const { phase, objectCount } = JSON.parse(rows[0].details_json);
+      return { outcome: rows[0].outcome, phase, objectCount };
+    };
+    const retirementFailed = {
+      status: "incomplete", code: "ACCOUNTLESS_OWNER_ERASURE_ANALYTICS_RETIREMENT_FAILED",
+    };
+
+    // An unreviewed owner-bearing relation makes analytics retirement refuse.
+    const unreviewed = `future_owner_family_${randomBytes(3).toString("hex")}`;
+    await primaryPool.query(`CREATE TABLE ${q(refusedSchema, unreviewed)} (owner_digest text NOT NULL)`);
+    assert.deepEqual(await erasePostgresAccountlessOwner(optionsFor(refused, refusedSchema)), retirementFailed);
+    assert.equal(calls.length, 1);
+    assert.equal(await count(primaryPool, refusedSchema, "participants", "id", refused.participantId), 0,
+      "the primary erasure commits before derived analytics retirement");
+    assert.equal(await count(primaryPool, refusedSchema, "accountless_public_history_retention", "participant_id",
+      refused.participantId), 0);
+    assert.equal(await count(primaryPool, refusedSchema, "storage_owner_erasure_receipts", "owner_digest",
+      refused.ownerDigest), 1);
+    assert.equal(await count(primaryPool, refusedSchema, "analytics_owner_results", "owner_digest", refused.ownerDigest), 1);
+    assert.deepEqual(await analyticsStates(primaryPool, refusedSchema, refused.ownerDigest), ["active"],
+      "a refused retirement makes no partial analytics change");
+    assert.deepEqual(await receiptFor(refused), { outcome: "failed", phase: "primary_deleted", objectCount: 6 });
+    assert.deepEqual(await erasePostgresAccountlessOwner(optionsFor(refused, refusedSchema)), retirementFailed,
+      "a retry for the absent participant refuses again while the family is unreviewed");
+    assert.deepEqual(await receiptFor(refused), { outcome: "failed", phase: "primary_deleted", objectCount: 6 });
+
+    // A ledger interruption after the primary commit leaves the earlier
+    // objects_deleted phase, from which the absent-participant retry resumes.
+    await assert.rejects(
+      erasePostgresAccountlessOwner(optionsFor(interrupted, interruptedSchema, {
+        ledgerPool: failPrimaryDeletedReceiptOnce(ledgerPool),
+      })),
+      (error) => error instanceof PostgresAccountlessOwnerErasureError
+        && error.code === "ACCOUNTLESS_OWNER_ERASURE_LEDGER_FAILED",
+    );
+    assert.equal(calls.length, 2);
+    assert.equal(await count(primaryPool, interruptedSchema, "participants", "id", interrupted.participantId), 0);
+    assert.equal(await count(primaryPool, interruptedSchema, "analytics_owner_results", "owner_digest",
+      interrupted.ownerDigest), 1);
+    assert.deepEqual(await receiptFor(interrupted), { outcome: "started", phase: "objects_deleted", objectCount: 6 });
+
+    await primaryPool.query(`DROP TABLE ${q(refusedSchema, unreviewed)}`);
+    for (const [fixture, schema] of [[refused, refusedSchema], [interrupted, interruptedSchema]]) {
+      assert.deepEqual(await erasePostgresAccountlessOwner(optionsFor(fixture, schema)),
+        { status: "already_complete", objectsDeleted: 6 });
+      assert.equal(await count(primaryPool, schema, "analytics_owner_results", "owner_digest", fixture.ownerDigest), 0);
+      assert.deepEqual(await analyticsStates(primaryPool, schema, fixture.ownerDigest), ["erased"]);
+      assert.deepEqual(await receiptFor(fixture), { outcome: "completed", phase: "completed", objectCount: 6 });
+      assert.deepEqual(await erasePostgresAccountlessOwner(optionsFor(fixture, schema)),
+        { status: "already_complete", objectsDeleted: 6 });
+    }
+    assert.equal(calls.length, 2, "resuming analytics retirement repeats no provider deletion");
+  } finally {
+    if (vite) await vite.close();
+    for (const schema of schemas.reverse()) {
+      try { await primaryPool.query(`DROP SCHEMA IF EXISTS ${q(schema, "unused").split(".")[0]} CASCADE`); } catch {}
+    }
+    await Promise.all([primaryPool.end(), ledgerPool.end()]);
   }
 });
 
