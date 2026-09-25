@@ -5,13 +5,22 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import {
+  createD1AccountlessRetentionSource,
   createSyntheticAccountlessRetentionSource,
+  invalidatePostgresAccountlessRetentionTransfer,
   POSTGRES_ACCOUNTLESS_RETENTION_IMPORT_DEFAULT_PAGE_SIZE,
   POSTGRES_ACCOUNTLESS_RETENTION_IMPORT_MAX_PAGE_SIZE,
   POSTGRES_ACCOUNTLESS_RETENTION_SOURCE_MIGRATIONS,
   PostgresAccountlessRetentionImportError,
   runPostgresAccountlessRetentionImport,
 } from "./postgres-accountless-retention-import.mjs";
+import {
+  ACCOUNTLESS_RETENTION_D1_ARTIFACT_SCHEMA,
+  ACCOUNTLESS_RETENTION_D1_SOURCE_MIGRATIONS,
+  accountlessRetentionD1ArtifactSha256,
+  accountlessRetentionD1MappingSha256,
+  accountlessRetentionD1RowSha256,
+} from "./postgres-accountless-retention-artifact.mjs";
 
 const WORKER_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -55,6 +64,164 @@ const one = validRow("source-owner-a", "target-owner-a", "11111111-1111-4111-811
   "22222222-2222-4222-8222-222222222222");
 const two = validRow("source-owner-b", "target-owner-b", "33333333-3333-4333-8333-333333333333",
   "44444444-4444-4444-8444-444444444444");
+
+function flatD1Row(row) {
+  const { marker, participant, owner, ledger, device, grant, head, domain } = row.source;
+  return {
+    participant_id: marker.participantId,
+    marker_enrollment_device_id: marker.enrollmentDeviceId,
+    marker_device_credential_id: marker.deviceCredentialId,
+    marker_generation_id: marker.generationId,
+    marker_head_revision: marker.headRevision,
+    marker_retained_at: marker.retainedAt,
+    participant_owner_kind: participant.ownerKind,
+    participant_state: participant.state,
+    owner_participant_id: owner.participantId,
+    owner_enrollment_device_id: owner.enrollmentDeviceId,
+    owner_device_credential_id: owner.deviceCredentialId,
+    owner_policy_version: owner.policyVersion,
+    owner_authorization_basis: owner.authorizationBasis,
+    owner_expires_at: owner.expiresAt,
+    owner_state: owner.state,
+    owner_revoked_at: owner.revokedAt,
+    owner_revocation_reason: owner.revocationReason,
+    ledger_device_id: ledger.deviceId,
+    ledger_device_secret_hash: ledger.deviceSecretHash,
+    ledger_schema_version: ledger.schemaVersion,
+    ledger_policy_version: ledger.policyVersion,
+    ledger_authorization_basis: ledger.authorizationBasis,
+    ledger_expires_at: ledger.expiresAt,
+    ledger_state: ledger.state,
+    ledger_revoked_at: ledger.revokedAt,
+    ledger_revocation_reason: ledger.revocationReason,
+    device_id: device.id,
+    device_participant_id: device.participantId,
+    device_authority_kind: device.authorityKind,
+    device_enrollment_device_id: device.accountlessEnrollmentDeviceId,
+    device_secret_hash: device.secretHash,
+    device_paired_via_pairing_id: device.pairedViaPairingId,
+    device_social_verified_at: device.socialVerifiedAt,
+    device_expires_at: device.expiresAt,
+    device_state: device.state,
+    device_revoked_at: device.revokedAt,
+    grant_enrollment_device_id: grant.enrollmentDeviceId,
+    grant_participant_id: grant.participantId,
+    grant_device_credential_id: grant.deviceCredentialId,
+    grant_telemetry_schema_version: grant.telemetrySchemaVersion,
+    grant_field_dictionary_version: grant.fieldDictionaryVersion,
+    grant_privacy_contract_version: grant.privacyContractVersion,
+    grant_expires_at: grant.expiresAt,
+    grant_state: grant.state,
+    grant_revoked_at: grant.revokedAt,
+    grant_revocation_reason: grant.revocationReason,
+    head_participant_id: head.participantId,
+    head_generation_id: head.generationId,
+    head_revision: head.revision,
+    domain_id: domain.id,
+    domain_participant_id: domain.participantId,
+    domain_device_id: domain.deviceId,
+  };
+}
+
+function d1ArtifactBundle(rows) {
+  const ordered = rows.map(row => ({ row: flatD1Row(row), target: row.target }))
+    .sort((left, right) => left.row.participant_id.localeCompare(right.row.participant_id));
+  const runId = "sealed-local-retention-fixture";
+  const sourceRevision = 8;
+  let cursor = "";
+  let manifestSha256 = digest(Buffer.from(`tibotattle-accountless-retention-manifest-v1\n${runId}\n${sourceRevision}`));
+  const pages = [];
+  const mappings = [];
+  for (let index = 0; index < ordered.length; index += 1) {
+    const { row, target } = ordered[index];
+    const participantId = row.participant_id;
+    const rowDigests = [{ participantId, sha256: accountlessRetentionD1RowSha256(row) }];
+    const pageSha256 = digest(Buffer.from([
+      "tibotattle-accountless-retention-page-v1",
+      `${participantId}\0${rowDigests[0].sha256}`,
+    ].join("\n")));
+    const page = {
+      pageNumber: index + 1,
+      afterParticipantId: cursor,
+      throughParticipantId: participantId,
+      rowCount: 1,
+      pageSha256,
+      manifestSha256: "",
+      rowDigests,
+      rows: [row],
+    };
+    manifestSha256 = digest(Buffer.from([
+      "tibotattle-accountless-retention-manifest-page-v1",
+      manifestSha256,
+      String(page.pageNumber),
+      page.afterParticipantId,
+      page.throughParticipantId,
+      String(page.rowCount),
+      page.pageSha256,
+    ].join("\n")));
+    page.manifestSha256 = manifestSha256;
+    pages.push(page);
+    mappings.push({ sourceParticipantId: participantId, target });
+    cursor = participantId;
+  }
+  const artifact = {
+    schemaVersion: ACCOUNTLESS_RETENTION_D1_ARTIFACT_SCHEMA,
+    runId,
+    state: "extracted",
+    sourceRevision,
+    authorityRevision: sourceRevision,
+    latestMigrationName: "0063_accountless_history_transfer_source.sql",
+    snapshotAt: "2026-09-25T12:00:00.123Z",
+    rowCount: ordered.length,
+    pageCount: pages.length,
+    migrationReceipts: ACCOUNTLESS_RETENTION_D1_SOURCE_MIGRATIONS.map(row => row.name),
+    manifestSha256,
+    pages,
+  };
+  return {
+    artifact,
+    mappings,
+    participantMappings: mappings,
+    expectedArtifactSha256: accountlessRetentionD1ArtifactSha256(artifact),
+    expectedMappingSha256: accountlessRetentionD1MappingSha256(mappings),
+  };
+}
+
+test("sealed D1 artifact bridge verifies the source fence, row/page chain, and explicit mapping", async () => {
+  const bundle = d1ArtifactBundle([two, one]);
+  const source = createD1AccountlessRetentionSource(bundle);
+  assert.equal(source.snapshot.kind, "cloudflare-d1-accountless-retention-snapshot-v1");
+  assert.equal(source.snapshot.sourceRevision, 8);
+  assert.equal(source.snapshot.sourceFenceReconciled, false);
+  assert.equal(source.snapshot.rowCount, 2);
+  assert.equal(source.snapshot.migrationReceipts.length, 3);
+  await source.verifySnapshot();
+  const firstPage = await source.listPage({ after: null, limit: 1 });
+  assert.equal(firstPage.rows[0].source.marker.participantId, "source-owner-a");
+  assert.equal(firstPage.rows[0].target.participantId, "target-owner-a");
+  assert.equal((await source.listPage({ after: "source-owner-a", limit: 1 })).rows[0].target.participantId,
+    "target-owner-b");
+
+  const remapped = structuredClone(bundle.mappings);
+  remapped[0].target.participantId = "target-owner-remapped";
+  const remappedSource = createD1AccountlessRetentionSource({ ...bundle, participantMappings: remapped,
+    expectedMappingSha256: accountlessRetentionD1MappingSha256(remapped) });
+  assert.notEqual(remappedSource.snapshot.fenceId, source.snapshot.fenceId,
+    "the transfer fence binds the explicit target mapping digest");
+  assert.throws(() => createD1AccountlessRetentionSource({ ...bundle, expectedArtifactSha256: "0".repeat(64) }), {
+    code: "ACCOUNTLESS_RETENTION_ARTIFACT_CHECKSUM_MISMATCH",
+  });
+  assert.throws(() => createD1AccountlessRetentionSource({ ...bundle, participantMappings: bundle.mappings.slice(1),
+    expectedMappingSha256: accountlessRetentionD1MappingSha256(bundle.mappings.slice(1)) }), {
+    code: "ACCOUNTLESS_RETENTION_SOURCE_MAPPING_INCOMPLETE",
+  });
+  const changed = structuredClone(bundle.artifact);
+  changed.authorityRevision += 1;
+  assert.throws(() => createD1AccountlessRetentionSource({ ...bundle, artifact: changed,
+    expectedArtifactSha256: accountlessRetentionD1ArtifactSha256(changed) }), {
+    code: "ACCOUNTLESS_RETENTION_SOURCE_FENCE_INVALID",
+  });
+});
 
 test("synthetic retention fixture pins exact D1 opt-out migration receipts", async () => {
   assert.equal(POSTGRES_ACCOUNTLESS_RETENTION_SOURCE_MIGRATIONS.length, 2);
@@ -101,7 +268,7 @@ test("retention importer refuses forged sources and broad/unbounded targets befo
   await assert.rejects(runPostgresAccountlessRetentionImport({ source: forged, destinationPool: pool,
     targetSchema: "accountless_retention_import_target_12345678", transferId: "synthetic-run" }),
   error => error instanceof PostgresAccountlessRetentionImportError
-    && error.code === "ACCOUNTLESS_RETENTION_SYNTHETIC_SOURCE_REQUIRED");
+    && error.code === "ACCOUNTLESS_RETENTION_TRUSTED_SOURCE_REQUIRED");
 
   const trusted = createSyntheticAccountlessRetentionSource({ rows: [one] });
   await assert.rejects(runPostgresAccountlessRetentionImport({ source: trusted, destinationPool: pool,
@@ -111,6 +278,10 @@ test("retention importer refuses forged sources and broad/unbounded targets befo
   await assert.rejects(runPostgresAccountlessRetentionImport({ source: trusted, destinationPool: pool,
     targetSchema: "accountless_retention_import_target_12345678", transferId: "synthetic-run", pageSize: 501 }), {
     code: "ACCOUNTLESS_RETENTION_PAGE_SIZE_INVALID",
+  });
+  await assert.rejects(invalidatePostgresAccountlessRetentionTransfer({ destinationPool: pool,
+    targetSchema: "accountless_retention_import_target_12345678", transferId: "synthetic-run" }), {
+    code: "ACCOUNTLESS_RETENTION_SOURCE_REVALIDATION_REQUIRED",
   });
   assert.equal(databaseCalls, 0);
 });

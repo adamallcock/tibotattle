@@ -5,11 +5,20 @@ import { test } from "node:test";
 import pg from "pg";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import {
+  createD1AccountlessRetentionSource,
   createSyntheticAccountlessRetentionSource,
+  invalidatePostgresAccountlessRetentionTransfer,
   POSTGRES_ACCOUNTLESS_RETENTION_SOURCE_MIGRATIONS,
   runPostgresAccountlessRetentionImport,
   PostgresAccountlessRetentionImportError,
 } from "../scripts/postgres-accountless-retention-import.mjs";
+import {
+  ACCOUNTLESS_RETENTION_D1_ARTIFACT_SCHEMA,
+  ACCOUNTLESS_RETENTION_D1_SOURCE_MIGRATIONS,
+  accountlessRetentionD1ArtifactSha256,
+  accountlessRetentionD1MappingSha256,
+  accountlessRetentionD1RowSha256,
+} from "../scripts/postgres-accountless-retention-artifact.mjs";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
@@ -100,6 +109,111 @@ function sourceRow(index, { variant = "a", targetSuffix = "a" } = {}) {
 
 function sourceRows({ count = 2, variant = "a", targetSuffix = "a" } = {}) {
   return Array.from({ length: count }, (_, index) => sourceRow(index + 1, { variant, targetSuffix }));
+}
+
+function flatD1Row(record) {
+  const { marker, participant, owner, ledger, device, grant, head, domain } = record.source;
+  return {
+    participant_id: marker.participantId,
+    marker_enrollment_device_id: marker.enrollmentDeviceId,
+    marker_device_credential_id: marker.deviceCredentialId,
+    marker_generation_id: marker.generationId,
+    marker_head_revision: marker.headRevision,
+    marker_retained_at: marker.retainedAt,
+    participant_owner_kind: participant.ownerKind,
+    participant_state: participant.state,
+    owner_participant_id: owner.participantId,
+    owner_enrollment_device_id: owner.enrollmentDeviceId,
+    owner_device_credential_id: owner.deviceCredentialId,
+    owner_policy_version: owner.policyVersion,
+    owner_authorization_basis: owner.authorizationBasis,
+    owner_expires_at: owner.expiresAt,
+    owner_state: owner.state,
+    owner_revoked_at: owner.revokedAt,
+    owner_revocation_reason: owner.revocationReason,
+    ledger_device_id: ledger.deviceId,
+    ledger_device_secret_hash: ledger.deviceSecretHash,
+    ledger_schema_version: ledger.schemaVersion,
+    ledger_policy_version: ledger.policyVersion,
+    ledger_authorization_basis: ledger.authorizationBasis,
+    ledger_expires_at: ledger.expiresAt,
+    ledger_state: ledger.state,
+    ledger_revoked_at: ledger.revokedAt,
+    ledger_revocation_reason: ledger.revocationReason,
+    device_id: device.id,
+    device_participant_id: device.participantId,
+    device_authority_kind: device.authorityKind,
+    device_enrollment_device_id: device.accountlessEnrollmentDeviceId,
+    device_secret_hash: device.secretHash,
+    device_paired_via_pairing_id: device.pairedViaPairingId,
+    device_social_verified_at: device.socialVerifiedAt,
+    device_expires_at: device.expiresAt,
+    device_state: device.state,
+    device_revoked_at: device.revokedAt,
+    grant_enrollment_device_id: grant.enrollmentDeviceId,
+    grant_participant_id: grant.participantId,
+    grant_device_credential_id: grant.deviceCredentialId,
+    grant_telemetry_schema_version: grant.telemetrySchemaVersion,
+    grant_field_dictionary_version: grant.fieldDictionaryVersion,
+    grant_privacy_contract_version: grant.privacyContractVersion,
+    grant_expires_at: grant.expiresAt,
+    grant_state: grant.state,
+    grant_revoked_at: grant.revokedAt,
+    grant_revocation_reason: grant.revocationReason,
+    head_participant_id: head.participantId,
+    head_generation_id: head.generationId,
+    head_revision: head.revision,
+    domain_id: domain.id,
+    domain_participant_id: domain.participantId,
+    domain_device_id: domain.deviceId,
+  };
+}
+
+function d1ArtifactBundle(records) {
+  const ordered = records.map(record => ({ row: flatD1Row(record), target: record.target }))
+    .sort((left, right) => left.row.participant_id.localeCompare(right.row.participant_id));
+  const runId = "sealed-local-retention-fixture";
+  const sourceRevision = 8;
+  let cursor = "";
+  let manifestSha256 = createHash("sha256")
+    .update(`tibotattle-accountless-retention-manifest-v1\n${runId}\n${sourceRevision}`).digest("hex");
+  const pages = [];
+  const mappings = [];
+  for (let index = 0; index < ordered.length; index += 1) {
+    const { row, target } = ordered[index];
+    const participantId = row.participant_id;
+    const rowDigests = [{ participantId, sha256: accountlessRetentionD1RowSha256(row) }];
+    const pageSha256 = createHash("sha256").update([
+      "tibotattle-accountless-retention-page-v1", `${participantId}\0${rowDigests[0].sha256}`,
+    ].join("\n")).digest("hex");
+    const page = { pageNumber: index + 1, afterParticipantId: cursor, throughParticipantId: participantId,
+      rowCount: 1, pageSha256, manifestSha256: "", rowDigests, rows: [row] };
+    manifestSha256 = createHash("sha256").update([
+      "tibotattle-accountless-retention-manifest-page-v1", manifestSha256, String(page.pageNumber),
+      page.afterParticipantId, page.throughParticipantId, String(page.rowCount), page.pageSha256,
+    ].join("\n")).digest("hex");
+    page.manifestSha256 = manifestSha256;
+    pages.push(page);
+    mappings.push({ sourceParticipantId: participantId, target });
+    cursor = participantId;
+  }
+  const artifact = {
+    schemaVersion: ACCOUNTLESS_RETENTION_D1_ARTIFACT_SCHEMA,
+    runId,
+    state: "extracted",
+    sourceRevision,
+    authorityRevision: sourceRevision,
+    latestMigrationName: "0063_accountless_history_transfer_source.sql",
+    snapshotAt: RETAINED_AT,
+    rowCount: ordered.length,
+    pageCount: pages.length,
+    migrationReceipts: ACCOUNTLESS_RETENTION_D1_SOURCE_MIGRATIONS.map(row => row.name),
+    manifestSha256,
+    pages,
+  };
+  return { artifact, participantMappings: mappings,
+    expectedArtifactSha256: accountlessRetentionD1ArtifactSha256(artifact),
+    expectedMappingSha256: accountlessRetentionD1MappingSha256(mappings) };
 }
 
 async function localSocket() {
@@ -219,6 +333,124 @@ test("synthetic source rejects non-opt-out, non-v1.1, and lossy timestamp eviden
   assert.equal(POSTGRES_ACCOUNTLESS_RETENTION_SOURCE_MIGRATIONS.length, 2);
 });
 
+test("PG17 imports the verified D1 artifact through explicit mappings under migration 43", {
+  skip: !PG_TEST_SOCKET,
+}, async () => {
+  const socket = await localSocket();
+  const suffix = randomBytes(6).toString("hex");
+  const schema = `accountless_retention_import_target_${suffix}`;
+  const quoted = `"${schema}"`;
+  const transferId = `d1-retention-${suffix}`;
+  const records = sourceRows({ count: 2 });
+  const bundle = d1ArtifactBundle(records);
+  const source = createD1AccountlessRetentionSource(bundle);
+  const pool = new pg.Pool({ ...socket, user: PG_TEST_USER, password: PG_TEST_PASSWORD,
+    database: PG_TEST_DATABASE, application_name: "pg-accountless-retention-d1-test", ssl: false,
+    max: 3, connectionTimeoutMillis: 5_000 });
+  let schemaCreated = false;
+  try {
+    const locality = await pool.query("SELECT inet_server_addr() AS address, version() AS version");
+    assert.equal(locality.rows[0]?.address, null);
+    assert.ok(String(locality.rows[0]?.version ?? "").startsWith("PostgreSQL 17."));
+    await pool.query(`CREATE SCHEMA ${quoted}`); schemaCreated = true;
+    const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
+    assert.equal(applied.applied, 43);
+    await pool.query(`UPDATE ${quoted}.collection_controls SET revision=revision+1,
+      control_state='degraded', enrollment_enabled=false, upload_registration_enabled=false,
+      processing_enabled=false, publication_enabled=false, reason_code='synthetic-d1-import-test',
+      updated_at=clock_timestamp() WHERE singleton=1`);
+    for (const row of records) await seedTargetAuthority(pool, schema, row);
+
+    const result = await runPostgresAccountlessRetentionImport({ source, destinationPool: pool,
+      targetSchema: schema, transferId, pageSize: 1 });
+    assert.deepEqual({ status: result.status, rows: result.rows, pages: result.pages,
+      pagesWritten: result.pagesWritten, syntheticOnly: result.syntheticOnly,
+      sourceFenceReconciled: result.sourceFenceReconciled, cutoverAuthorized: result.cutoverAuthorized,
+      controlsRemainDegraded: result.controlsRemainDegraded,
+      enrollmentRemainsDisabled: result.enrollmentRemainsDisabled,
+      publicationRemainsDisabled: result.publicationRemainsDisabled }, {
+      status: "d1_accountless_retention_import_complete", rows: 2, pages: 2, pagesWritten: 2,
+      syntheticOnly: false, sourceFenceReconciled: false, cutoverAuthorized: false,
+      controlsRemainDegraded: true, enrollmentRemainsDisabled: true, publicationRemainsDisabled: true,
+    });
+    const permit = await pool.query(`SELECT source_kind,target_migration_version,
+      source_artifact_sha256,source_manifest_sha256,source_migration_receipts,status,source_fence_state,
+      source_run_id,source_revision,source_mapping_sha256
+      FROM ${quoted}.accountless_public_history_import_runs WHERE transfer_id=$1`, [transferId]);
+    assert.equal(permit.rowCount, 1);
+    assert.equal(permit.rows[0]?.source_kind, "cloudflare-d1-accountless-retention-snapshot-v1");
+    assert.equal(permit.rows[0]?.target_migration_version, 43);
+    assert.equal(permit.rows[0]?.source_artifact_sha256, bundle.expectedArtifactSha256);
+    assert.equal(permit.rows[0]?.status, "complete");
+    assert.equal(permit.rows[0]?.source_fence_state, "pending");
+    assert.equal(permit.rows[0]?.source_run_id, bundle.artifact.runId);
+    assert.equal(Number(permit.rows[0]?.source_revision), bundle.artifact.sourceRevision);
+    assert.equal(permit.rows[0]?.source_mapping_sha256, bundle.expectedMappingSha256);
+    assert.deepEqual(permit.rows[0]?.source_migration_receipts, ACCOUNTLESS_RETENTION_D1_SOURCE_MIGRATIONS);
+
+    const replay = await runPostgresAccountlessRetentionImport({ source, destinationPool: pool,
+      targetSchema: schema, transferId, pageSize: 1 });
+    assert.equal(replay.replayed, true);
+    assert.equal(replay.pagesWritten, 0);
+
+    await assert.rejects(invalidatePostgresAccountlessRetentionTransfer({
+      sourceVerifier: async snapshot => ({ state: "extracted", sourceRevision: snapshot.sourceRevision }),
+      destinationPool: pool, targetSchema: schema, transferId,
+    }), error => error instanceof PostgresAccountlessRetentionImportError
+      && error.code === "ACCOUNTLESS_RETENTION_SOURCE_STILL_ELIGIBLE");
+    await assert.rejects(invalidatePostgresAccountlessRetentionTransfer({
+      sourceVerifier: async () => { throw new Error("synthetic_revalidation_read_failure"); },
+      destinationPool: pool, targetSchema: schema, transferId,
+    }), error => error instanceof PostgresAccountlessRetentionImportError
+      && error.code === "ACCOUNTLESS_RETENTION_SOURCE_REVALIDATION_FAILED");
+    const invalidated = await invalidatePostgresAccountlessRetentionTransfer({
+      sourceVerifier: async () => { throw Object.assign(new Error("private detail"), {
+        code: "SOURCE_MARKER_INELIGIBLE",
+      }); },
+      destinationPool: pool, targetSchema: schema, transferId,
+    });
+    assert.equal(invalidated.status, "source_fence_invalidated");
+    assert.equal(invalidated.invalidationCode, "SOURCE_MARKER_INELIGIBLE");
+    assert.equal(invalidated.markersDeleted, false);
+    assert.equal(invalidated.replayAllowed, false);
+    assert.match(invalidated.proofSha256, /^[0-9a-f]{64}$/u);
+    const fenceState = await pool.query(`SELECT source_fence_state,
+        (SELECT count(*)::int FROM ${quoted}.accountless_public_history_import_fence_receipts
+          WHERE transfer_id=$1) AS receipts,
+        (SELECT invalidation_code FROM ${quoted}.accountless_public_history_import_fence_receipts
+          WHERE transfer_id=$1) AS invalidation_code,
+        (SELECT count(*)::int FROM ${quoted}.accountless_public_history_retention) AS markers
+      FROM ${quoted}.accountless_public_history_import_runs WHERE transfer_id=$1`, [transferId]);
+    assert.deepEqual(fenceState.rows[0], {
+      source_fence_state: "invalidated", receipts: 1,
+      invalidation_code: "SOURCE_MARKER_INELIGIBLE", markers: 2,
+    });
+    const idempotentInvalidation = await invalidatePostgresAccountlessRetentionTransfer({
+      sourceVerifier: async () => { throw new Error("already-invalidated transfer must not recheck"); },
+      destinationPool: pool, targetSchema: schema, transferId,
+    });
+    assert.equal(idempotentInvalidation.proofSha256, invalidated.proofSha256);
+    await assert.rejects(pool.query(`UPDATE ${quoted}.collection_controls SET revision=revision+1,
+      control_state='operational',publication_enabled=true,updated_at=clock_timestamp() WHERE singleton=1`));
+    await assert.rejects(runPostgresAccountlessRetentionImport({ source, destinationPool: pool,
+      targetSchema: schema, transferId, pageSize: 1 }), error => error instanceof PostgresAccountlessRetentionImportError
+      && error.code === "ACCOUNTLESS_RETENTION_SOURCE_FENCE_INVALIDATED");
+
+    assert.equal((await pool.query(`SELECT count(*)::int AS count FROM ${quoted}.accountless_public_history_retention`))
+      .rows[0]?.count, 2);
+
+    bundle.artifact.pages[0].rows[0].participant_state = "inactive";
+    await assert.rejects(runPostgresAccountlessRetentionImport({ source, destinationPool: pool,
+      targetSchema: schema, transferId, pageSize: 1 }), error => error instanceof PostgresAccountlessRetentionImportError
+      && error.code === "ACCOUNTLESS_RETENTION_SOURCE_CHANGED");
+    assert.equal((await pool.query(`SELECT count(*)::int AS count FROM ${quoted}.accountless_public_history_retention`))
+      .rows[0]?.count, 2, "a locally changed source file is refused and cannot alter the imported marker set");
+  } finally {
+    if (schemaCreated) await pool.query(`DROP SCHEMA IF EXISTS ${quoted} CASCADE`);
+    await pool.end();
+  }
+});
+
 test("PG17 synthetic permit imports exact v1.1 retained markers in bounded replay-safe pages", {
   skip: !PG_TEST_SOCKET,
 }, async () => {
@@ -247,7 +479,7 @@ test("PG17 synthetic permit imports exact v1.1 retained markers in bounded repla
     await pool.query(`CREATE SCHEMA ${quoted}`);
     schemaCreated = true;
     const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
-    assert.equal(applied.applied, 42);
+    assert.equal(applied.applied, 43);
     await pool.query(`UPDATE ${quoted}.collection_controls SET revision=revision+1,
       control_state='degraded', enrollment_enabled=false, upload_registration_enabled=false,
       processing_enabled=false, publication_enabled=false, reason_code='synthetic-import-test',

@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
 import { buildPostgresMigrationManifest, renderPostgresSearchPath } from "../cloud-run/postgres-migrations.mjs";
+import {
+  ACCOUNTLESS_RETENTION_D1_SOURCE_KIND,
+  ACCOUNTLESS_RETENTION_D1_SOURCE_MIGRATIONS,
+  verifyAccountlessRetentionD1ArtifactBundle,
+} from "./postgres-accountless-retention-artifact.mjs";
 
 export const POSTGRES_ACCOUNTLESS_RETENTION_IMPORT_SCHEMA = "accountless-public-history-retention-import-v1";
 export const POSTGRES_ACCOUNTLESS_RETENTION_IMPORT_DEFAULT_PAGE_SIZE = 200;
@@ -7,13 +12,21 @@ export const POSTGRES_ACCOUNTLESS_RETENTION_IMPORT_MAX_PAGE_SIZE = 500;
 export const POSTGRES_ACCOUNTLESS_RETENTION_TARGET_SCHEMA_PREFIX = "accountless_retention_import_target_";
 
 const SOURCE_KIND = "synthetic-retention-fixture-v1";
-const MIGRATION_VERSION = 42;
+const LEGACY_MIGRATION_VERSION = 42;
+const MIGRATION_VERSION = 43;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const SAFE_ID = /^[A-Za-z0-9._:-]{1,256}$/u;
 const SAFE_TRANSFER_ID = /^[A-Za-z0-9._-]{1,128}$/u;
 const SAFE_SCHEMA = /^[a-z_][a-z0-9_]{0,62}$/u;
 const TARGET_SCHEMA = /^accountless_retention_import_target_[a-f0-9]{8,}$/u;
 const TRUSTED_SOURCES = new WeakSet();
+const SOURCE_INVALIDATION_CODES = new Set([
+  "SOURCE_MIGRATION_RECEIPT_MISMATCH",
+  "SOURCE_MARKER_INELIGIBLE",
+  "SOURCE_AUTHORITY_REVISION_CHANGED",
+  "SOURCE_SNAPSHOT_ABORTED",
+  "SOURCE_SNAPSHOT_INVALIDATED",
+]);
 
 export const POSTGRES_ACCOUNTLESS_RETENTION_SOURCE_MIGRATIONS = Object.freeze([
   Object.freeze({
@@ -296,6 +309,35 @@ function snapshotDescriptor(rows) {
   });
 }
 
+function createPagedSource({ snapshot, rows, verify }) {
+  const frozenRows = deepFreeze([...rows]);
+  const source = Object.freeze({
+    snapshot,
+    async verifySnapshot() {
+      await verify();
+      return snapshot;
+    },
+    async listPage({ after = null, limit } = {}) {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > POSTGRES_ACCOUNTLESS_RETENTION_IMPORT_MAX_PAGE_SIZE
+          || after !== null && (typeof after !== "string" || !SAFE_ID.test(after))) {
+        fail("ACCOUNTLESS_RETENTION_PAGE_REQUEST_INVALID");
+      }
+      let low = 0;
+      let high = frozenRows.length;
+      if (after !== null) {
+        while (low < high) {
+          const middle = (low + high) >>> 1;
+          if (frozenRows[middle].source.marker.participantId <= after) low = middle + 1;
+          else high = middle;
+        }
+      }
+      return Object.freeze({ rows: Object.freeze(frozenRows.slice(low, low + limit)) });
+    },
+  });
+  TRUSTED_SOURCES.add(source);
+  return source;
+}
+
 /**
  * Synthetic-only source seam for local PG17 exercises. It is deliberately not
  * a D1 adapter or a source snapshot/fence implementation.
@@ -322,35 +364,61 @@ export function createSyntheticAccountlessRetentionSource({ rows } = {}) {
     targetDevices.add(row.target.enrollmentDeviceId);
     targetCredentials.add(row.target.deviceCredentialId);
   }
-  const frozenRows = Object.freeze(normalized);
+  const frozenRows = deepFreeze(normalized);
   const snapshot = snapshotDescriptor(frozenRows);
-  const source = Object.freeze({
+  return createPagedSource({
     snapshot,
-    async verifySnapshot() {
+    rows: frozenRows,
+    async verify() {
       if (sourceManifestDigest(frozenRows) !== snapshot.manifestSha256) {
         fail("ACCOUNTLESS_RETENTION_SOURCE_CHANGED");
       }
-      return snapshot;
-    },
-    async listPage({ after = null, limit } = {}) {
-      if (!Number.isSafeInteger(limit) || limit < 1 || limit > POSTGRES_ACCOUNTLESS_RETENTION_IMPORT_MAX_PAGE_SIZE
-          || after !== null && (typeof after !== "string" || !SAFE_ID.test(after))) {
-        fail("ACCOUNTLESS_RETENTION_PAGE_REQUEST_INVALID");
-      }
-      let low = 0;
-      let high = frozenRows.length;
-      if (after !== null) {
-        while (low < high) {
-          const middle = (low + high) >>> 1;
-          if (frozenRows[middle].source.marker.participantId <= after) low = middle + 1;
-          else high = middle;
-        }
-      }
-      return Object.freeze({ rows: Object.freeze(frozenRows.slice(low, low + limit)) });
     },
   });
-  TRUSTED_SOURCES.add(source);
-  return source;
+}
+
+/**
+ * Turn a sealed D1 0063 artifact and an explicit target mapping into the
+ * PostgreSQL importer's trusted source interface. Both artifact digests must be
+ * supplied independently by the operator; their values are never logged.
+ */
+export function createD1AccountlessRetentionSource({
+  artifact,
+  participantMappings,
+  expectedArtifactSha256,
+  expectedMappingSha256,
+} = {}) {
+  let verified;
+  try {
+    verified = verifyAccountlessRetentionD1ArtifactBundle({
+      artifact,
+      participantMappings,
+      expectedArtifactSha256,
+      expectedMappingSha256,
+    });
+  } catch (error) {
+    if (error && typeof error === "object" && typeof error.code === "string") fail(error.code);
+    fail("ACCOUNTLESS_RETENTION_ARTIFACT_INVALID");
+  }
+  const rows = deepFreeze(verified.rows.map(normalizeSourceRow));
+  if (rows.length !== verified.snapshot.rowCount) fail("ACCOUNTLESS_RETENTION_SOURCE_COUNT_MISMATCH");
+  for (let index = 1; index < rows.length; index += 1) {
+    if (rows[index - 1].source.marker.participantId >= rows[index].source.marker.participantId) {
+      fail("ACCOUNTLESS_RETENTION_SOURCE_ORDER_INVALID");
+    }
+  }
+  return createPagedSource({
+    snapshot: verified.snapshot,
+    rows,
+    verify() {
+      try {
+        verified.verifyDigests();
+      } catch (error) {
+        if (error && typeof error === "object" && typeof error.code === "string") fail(error.code);
+        fail("ACCOUNTLESS_RETENTION_SOURCE_CHANGED");
+      }
+    },
+  });
 }
 
 function quoteSchema(schema) {
@@ -364,6 +432,7 @@ const IMPORT_TABLES = new Set([
   "accountless_public_history_import_runs",
   "accountless_public_history_import_claims",
   "accountless_public_history_import_pages",
+  "accountless_public_history_import_fence_receipts",
   "accountless_public_history_retention",
   "collection_controls",
 ]);
@@ -391,16 +460,34 @@ function pageDigest(rows) {
 }
 
 function assertTrustedSource(source) {
+  const snapshot = source?.snapshot;
+  const isSynthetic = snapshot?.kind === "synthetic-accountless-retention-fixture-v1";
+  const isD1Artifact = snapshot?.kind === ACCOUNTLESS_RETENTION_D1_SOURCE_KIND;
+  const validSynthetic = !isSynthetic || (
+    snapshot.snapshotId === `synthetic-retention:${snapshot.artifactSha256}`
+    && snapshot.fenceId === `synthetic-fence:${snapshot.artifactSha256}`
+  );
+  const validD1Artifact = !isD1Artifact || (
+    typeof snapshot.snapshotId === "string"
+    && snapshot.snapshotId === `d1-accountless-retention:${snapshot.artifactSha256}`
+    && typeof snapshot.fenceId === "string"
+    && snapshot.fenceId.startsWith("d1-retention-fence:")
+    && Number.isSafeInteger(snapshot.sourceRevision) && snapshot.sourceRevision >= 0
+    && SHA256.test(snapshot.mappingSha256 ?? "")
+    && snapshot.sourceFenceReconciled === false
+  );
+  const expectedReceipts = isD1Artifact
+    ? canonical(ACCOUNTLESS_RETENTION_D1_SOURCE_MIGRATIONS)
+    : canonical(POSTGRES_ACCOUNTLESS_RETENTION_SOURCE_MIGRATIONS);
   if (!source || !TRUSTED_SOURCES.has(source) || typeof source.listPage !== "function"
-      || typeof source.verifySnapshot !== "function" || source.snapshot?.kind !== "synthetic-accountless-retention-fixture-v1"
-      || source.snapshot?.immutable !== true || !SHA256.test(source.snapshot?.artifactSha256 ?? "")
-      || !SHA256.test(source.snapshot?.manifestSha256 ?? "")
-      || source.snapshot.snapshotId !== `synthetic-retention:${source.snapshot.artifactSha256}`
-      || source.snapshot.fenceId !== `synthetic-fence:${source.snapshot.artifactSha256}`
-      || !Number.isSafeInteger(source.snapshot.rowCount) || source.snapshot.rowCount < 0) {
-    fail("ACCOUNTLESS_RETENTION_SYNTHETIC_SOURCE_REQUIRED");
+      || typeof source.verifySnapshot !== "function" || (!isSynthetic && !isD1Artifact)
+      || snapshot.immutable !== true || !SHA256.test(snapshot.artifactSha256 ?? "")
+      || !SHA256.test(snapshot.manifestSha256 ?? "") || !validSynthetic || !validD1Artifact
+      || canonical(snapshot.migrationReceipts) !== expectedReceipts
+      || !Number.isSafeInteger(snapshot.rowCount) || snapshot.rowCount < 0) {
+    fail("ACCOUNTLESS_RETENTION_TRUSTED_SOURCE_REQUIRED");
   }
-  return source.snapshot;
+  return snapshot;
 }
 
 function validatePage(rows, after, pageSize, expectedRemaining) {
@@ -418,30 +505,49 @@ function validatePage(rows, after, pageSize, expectedRemaining) {
   return rows;
 }
 
-async function expectedTargetReceipt(pool, schema) {
+async function expectedTargetReceipts(pool, schema, { requireVersion43 = false } = {}) {
   let manifest;
   try {
     manifest = await buildPostgresMigrationManifest();
   } catch {
     fail("ACCOUNTLESS_RETENTION_TARGET_MIGRATION_MANIFEST_INVALID");
   }
-  const entry = manifest.roles.primary[MIGRATION_VERSION - 1];
-  if (!entry || entry.version !== MIGRATION_VERSION
-      || entry.name !== "0042_accountless_history_retention_import.sql") {
-    fail("ACCOUNTLESS_RETENTION_TARGET_MIGRATION_REQUIRED");
+  const entries = new Map([
+    [LEGACY_MIGRATION_VERSION, manifest.roles.primary[LEGACY_MIGRATION_VERSION - 1]],
+    [MIGRATION_VERSION, manifest.roles.primary[MIGRATION_VERSION - 1]],
+  ]);
+  const expectedNames = new Map([
+    [LEGACY_MIGRATION_VERSION, "0042_accountless_history_retention_import.sql"],
+    [MIGRATION_VERSION, "0043_accountless_history_d1_import.sql"],
+  ]);
+  for (const [version, entry] of entries) {
+    if (entry && (entry.version !== version || entry.name !== expectedNames.get(version))) {
+      fail("ACCOUNTLESS_RETENTION_TARGET_MIGRATION_REQUIRED");
+    }
   }
+  if (!entries.get(MIGRATION_VERSION)) fail("ACCOUNTLESS_RETENTION_TARGET_MIGRATION_REQUIRED");
   let result;
   try {
-    result = await pool.query(`SELECT version,name,checksum_sha256 FROM ${table(schema, "_tibotattle_migration_history")}
-      WHERE version=$1`, [MIGRATION_VERSION]);
+    result = await pool.query(`SELECT version,name,checksum_sha256
+      FROM ${table(schema, "_tibotattle_migration_history")} WHERE version = ANY($1::int[])`,
+    [[...entries.keys()]]);
   } catch {
     fail("ACCOUNTLESS_RETENTION_TARGET_MIGRATION_REQUIRED");
   }
-  const receipt = result.rows?.[0];
-  if (result.rowCount !== 1 || receipt?.name !== entry.name || receipt?.checksum_sha256 !== entry.sha256) {
+  const receipts = new Map(result.rows.map(row => [Number(row.version), row]));
+  if (receipts.size !== result.rowCount || result.rows.some(row => {
+    const expected = entries.get(Number(row.version));
+    return !expected || row.name !== expected.name || row.checksum_sha256 !== expected.sha256;
+  })) {
     fail("ACCOUNTLESS_RETENTION_TARGET_MIGRATION_REQUIRED");
   }
-  return entry;
+  const latest = receipts.has(MIGRATION_VERSION) ? MIGRATION_VERSION : LEGACY_MIGRATION_VERSION;
+  if (requireVersion43 && latest !== MIGRATION_VERSION) {
+    fail("ACCOUNTLESS_RETENTION_D1_TARGET_MIGRATION_REQUIRED");
+  }
+  const preferred = entries.get(latest);
+  if (!preferred || !receipts.has(latest)) fail("ACCOUNTLESS_RETENTION_TARGET_MIGRATION_REQUIRED");
+  return Object.freeze({ entries, preferred, receipts });
 }
 
 async function validateTarget(pool, schema) {
@@ -500,7 +606,7 @@ async function transaction(client, schema, callback, failureCode) {
   }
 }
 
-async function ensureRun({ client, schema, transferId, snapshot, pageSize, migration }) {
+async function ensureRun({ client, schema, transferId, snapshot, pageSize, migration, migrations }) {
   return transaction(client, schema, async () => {
     const runs = table(schema, "accountless_public_history_import_runs");
     const existing = await client.query(`SELECT * FROM ${runs} WHERE transfer_id=$1 FOR UPDATE`, [transferId]);
@@ -510,30 +616,49 @@ async function ensureRun({ client, schema, transferId, snapshot, pageSize, migra
       try { receipts = typeof run.source_migration_receipts === "string"
         ? JSON.parse(run.source_migration_receipts) : run.source_migration_receipts; }
       catch { fail("ACCOUNTLESS_RETENTION_TRANSFER_ID_CONFLICT"); }
+      const version = Number(run.target_migration_version);
+      const priorMigration = migrations.entries.get(version);
+      const expectedSourceKind = snapshot.kind === ACCOUNTLESS_RETENTION_D1_SOURCE_KIND
+        ? ACCOUNTLESS_RETENTION_D1_SOURCE_KIND : SOURCE_KIND;
       if (run.schema_version !== POSTGRES_ACCOUNTLESS_RETENTION_IMPORT_SCHEMA
-          || run.source_kind !== SOURCE_KIND || run.target_schema !== schema
+          || run.source_kind !== expectedSourceKind || run.target_schema !== schema
           || run.source_snapshot_id !== snapshot.snapshotId || run.source_fence_id !== snapshot.fenceId
           || run.source_artifact_sha256 !== snapshot.artifactSha256
           || run.source_manifest_sha256 !== snapshot.manifestSha256
+          || run.source_run_id !== (snapshot.kind === ACCOUNTLESS_RETENTION_D1_SOURCE_KIND ? snapshot.sourceRunId : null)
+          || (run.source_revision === null ? null : Number(run.source_revision))
+            !== (snapshot.kind === ACCOUNTLESS_RETENTION_D1_SOURCE_KIND ? snapshot.sourceRevision : null)
+          || run.source_mapping_sha256 !== (snapshot.kind === ACCOUNTLESS_RETENTION_D1_SOURCE_KIND
+            ? snapshot.mappingSha256 : null)
           || Number(run.source_row_count) !== snapshot.rowCount
           || canonical(receipts) !== canonical(snapshot.migrationReceipts)
-          || Number(run.target_migration_version) !== MIGRATION_VERSION
-          || run.target_migration_sha256 !== migration.sha256
+          || !priorMigration || !migrations.receipts.has(version)
+          || version === LEGACY_MIGRATION_VERSION && expectedSourceKind !== SOURCE_KIND
+          || run.target_migration_sha256 !== priorMigration.sha256
           || Number(run.page_size) !== pageSize) {
         fail("ACCOUNTLESS_RETENTION_TRANSFER_ID_CONFLICT");
       }
       if (run.status === "aborted") fail("ACCOUNTLESS_RETENTION_TRANSFER_ABORTED");
+      if (run.source_fence_state === "invalidated") fail("ACCOUNTLESS_RETENTION_SOURCE_FENCE_INVALIDATED");
       return run.status;
     }
     if (existing.rowCount !== 0) fail("ACCOUNTLESS_RETENTION_TRANSFER_ID_CONFLICT");
+    const sourceKind = snapshot.kind === ACCOUNTLESS_RETENTION_D1_SOURCE_KIND
+      ? ACCOUNTLESS_RETENTION_D1_SOURCE_KIND : SOURCE_KIND;
+    const sourceFenceState = sourceKind === ACCOUNTLESS_RETENTION_D1_SOURCE_KIND ? "pending" : "not_required";
     await client.query(`INSERT INTO ${runs} (
       transfer_id,schema_version,source_kind,target_schema,source_snapshot_id,source_fence_id,
       source_artifact_sha256,source_manifest_sha256,source_row_count,source_migration_receipts,
+      source_run_id,source_revision,source_mapping_sha256,source_fence_state,
       target_migration_version,target_migration_sha256,page_size,status
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,'importing')`, [
-      transferId, POSTGRES_ACCOUNTLESS_RETENTION_IMPORT_SCHEMA, SOURCE_KIND, schema,
-      snapshot.snapshotId, snapshot.fenceId, snapshot.artifactSha256, snapshot.manifestSha256,
-      snapshot.rowCount, JSON.stringify(snapshot.migrationReceipts), MIGRATION_VERSION, migration.sha256, pageSize,
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14,$15,$16,$17,'importing')`, [
+      transferId, POSTGRES_ACCOUNTLESS_RETENTION_IMPORT_SCHEMA, sourceKind,
+      schema, snapshot.snapshotId, snapshot.fenceId, snapshot.artifactSha256, snapshot.manifestSha256,
+      snapshot.rowCount, JSON.stringify(snapshot.migrationReceipts),
+      sourceKind === ACCOUNTLESS_RETENTION_D1_SOURCE_KIND ? snapshot.sourceRunId : null,
+      sourceKind === ACCOUNTLESS_RETENTION_D1_SOURCE_KIND ? snapshot.sourceRevision : null,
+      sourceKind === ACCOUNTLESS_RETENTION_D1_SOURCE_KIND ? snapshot.mappingSha256 : null,
+      sourceFenceState, migration.version, migration.sha256, pageSize,
     ]);
     return "importing";
   }, "ACCOUNTLESS_RETENTION_PERMIT_WRITE_FAILED");
@@ -657,7 +782,7 @@ async function completeRun({ client, schema, transferId, targetManifestSha256 })
 }
 
 async function readRun(client, schema, transferId) {
-  const result = await client.query(`SELECT status,target_manifest_sha256
+    const result = await client.query(`SELECT status,target_manifest_sha256,source_fence_state
     FROM ${table(schema, "accountless_public_history_import_runs")} WHERE transfer_id=$1`, [transferId]);
   if (result.rowCount !== 1) fail("ACCOUNTLESS_RETENTION_PERMIT_UNAVAILABLE");
   return result.rows[0];
@@ -678,14 +803,17 @@ async function abortEmptyRun(client, schema, transferId) {
   }
 }
 
-function receiptResult({ rows, pages, pagesWritten, replayed }) {
+function receiptResult({ rows, pages, pagesWritten, replayed, sourceKind }) {
+  const syntheticOnly = sourceKind === SOURCE_KIND;
   return Object.freeze({
-    status: "synthetic_accountless_retention_import_complete",
+    status: syntheticOnly
+      ? "synthetic_accountless_retention_import_complete"
+      : "d1_accountless_retention_import_complete",
     rows,
     pages,
     pagesWritten,
     replayed,
-    syntheticOnly: true,
+    syntheticOnly,
     cutoverAuthorized: false,
     sourceFenceReconciled: false,
     controlsRemainDegraded: true,
@@ -696,9 +824,10 @@ function receiptResult({ rows, pages, pagesWritten, replayed }) {
 }
 
 /**
- * Import content-free markers from the local synthetic fixture seam only.
- * Real D1 export/fence verification and cutover reconciliation are separate,
- * intentionally unimplemented authorities.
+ * Import content-free markers from a local synthetic fixture or an independently
+ * checksummed D1 0063 artifact plus explicit participant mapping. The artifact
+ * proves its sealed source revision at extraction time; fresh live source-fence
+ * reconciliation remains a separate cutover gate.
  */
 export async function runPostgresAccountlessRetentionImport({
   source,
@@ -708,6 +837,8 @@ export async function runPostgresAccountlessRetentionImport({
   pageSize = POSTGRES_ACCOUNTLESS_RETENTION_IMPORT_DEFAULT_PAGE_SIZE,
 } = {}) {
   const snapshot = assertTrustedSource(source);
+  const sourceKind = snapshot.kind === ACCOUNTLESS_RETENTION_D1_SOURCE_KIND
+    ? ACCOUNTLESS_RETENTION_D1_SOURCE_KIND : SOURCE_KIND;
   quoteSchema(targetSchema);
   if (!SAFE_TRANSFER_ID.test(transferId ?? "")) fail("ACCOUNTLESS_RETENTION_TRANSFER_ID_INVALID");
   if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > POSTGRES_ACCOUNTLESS_RETENTION_IMPORT_MAX_PAGE_SIZE) {
@@ -721,9 +852,12 @@ export async function runPostgresAccountlessRetentionImport({
   try {
     await source.verifySnapshot();
     await validateTarget(destinationPool, targetSchema);
-    const migration = await expectedTargetReceipt(destinationPool, targetSchema);
+    const migrations = await expectedTargetReceipts(destinationPool, targetSchema, {
+      requireVersion43: sourceKind === ACCOUNTLESS_RETENTION_D1_SOURCE_KIND,
+    });
+    const migration = migrations.preferred;
     client = await acquireLock(destinationPool, targetSchema, transferId);
-    const status = await ensureRun({ client, schema: targetSchema, transferId, snapshot, pageSize, migration });
+    const status = await ensureRun({ client, schema: targetSchema, transferId, snapshot, pageSize, migration, migrations });
     runCreated = true;
     if (status === "complete") {
       const actual = await verifyAllTargetRows({ source, client, schema: targetSchema, pageSize });
@@ -735,7 +869,7 @@ export async function runPostgresAccountlessRetentionImport({
       if (!Number.isSafeInteger(pages) || pages !== Math.ceil(snapshot.rowCount / pageSize)) {
         fail("ACCOUNTLESS_RETENTION_CHECKPOINT_INVALID");
       }
-      return receiptResult({ rows: snapshot.rowCount, pages, pagesWritten: 0, replayed: true });
+      return receiptResult({ rows: snapshot.rowCount, pages, pagesWritten: 0, replayed: true, sourceKind });
     }
 
     const previous = await lastPage(client, targetSchema, transferId);
@@ -767,11 +901,136 @@ export async function runPostgresAccountlessRetentionImport({
     await source.verifySnapshot();
     await completeRun({ client, schema: targetSchema, transferId, targetManifestSha256 });
     return receiptResult({ rows: snapshot.rowCount, pages: pageNumber,
-      pagesWritten: pageNumber - startPages, replayed: false });
+      pagesWritten: pageNumber - startPages, replayed: false, sourceKind });
   } catch (error) {
     if (runCreated && client) await abortEmptyRun(client, targetSchema, transferId);
     if (error instanceof PostgresAccountlessRetentionImportError) throw error;
     fail("ACCOUNTLESS_RETENTION_IMPORT_FAILED");
+  } finally {
+    if (client) {
+      await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))",
+        [`${targetSchema}:accountless-retention:${transferId}`]).catch(() => {});
+      client.release();
+    }
+  }
+}
+
+/**
+ * Mark a completed D1-artifact transfer ineligible after a fresh source-side
+ * recheck fails closed. The callback must query the live D1 0063 source and
+ * return its checked state/revision; an offline artifact is never sufficient.
+ * This appends a terminal receipt and deliberately leaves imported markers in
+ * place. A transient/read failure is not converted into invalidation.
+ */
+export async function invalidatePostgresAccountlessRetentionTransfer({
+  sourceVerifier,
+  destinationPool,
+  targetSchema,
+  transferId,
+} = {}) {
+  quoteSchema(targetSchema);
+  if (!SAFE_TRANSFER_ID.test(transferId ?? "")) fail("ACCOUNTLESS_RETENTION_TRANSFER_ID_INVALID");
+  if (typeof sourceVerifier !== "function") fail("ACCOUNTLESS_RETENTION_SOURCE_REVALIDATION_REQUIRED");
+  if (!destinationPool || typeof destinationPool.connect !== "function"
+      || typeof destinationPool.query !== "function") fail("ACCOUNTLESS_RETENTION_TARGET_UNAVAILABLE");
+
+  let client;
+  try {
+    await validateTarget(destinationPool, targetSchema);
+    await expectedTargetReceipts(destinationPool, targetSchema, { requireVersion43: true });
+    client = await acquireLock(destinationPool, targetSchema, transferId);
+    const runs = table(targetSchema, "accountless_public_history_import_runs");
+    const existing = await client.query(`SELECT source_kind,status,source_fence_state,source_run_id,
+        source_revision,source_artifact_sha256,source_manifest_sha256,source_mapping_sha256
+      FROM ${runs} WHERE transfer_id=$1`, [transferId]);
+    if (existing.rowCount !== 1) fail("ACCOUNTLESS_RETENTION_PERMIT_UNAVAILABLE");
+    const run = existing.rows[0];
+    if (run.source_kind !== ACCOUNTLESS_RETENTION_D1_SOURCE_KIND || run.status !== "complete") {
+      fail("ACCOUNTLESS_RETENTION_SOURCE_REVALIDATION_NOT_APPLICABLE");
+    }
+    if (run.source_fence_state === "invalidated") {
+      const prior = await client.query(`SELECT invalidation_code,proof_sha256 FROM ${table(targetSchema,
+        "accountless_public_history_import_fence_receipts")} WHERE transfer_id=$1`, [transferId]);
+      if (prior.rowCount !== 1) fail("ACCOUNTLESS_RETENTION_SOURCE_FENCE_RECEIPT_INVALID");
+      return Object.freeze({ status: "source_fence_invalidated", invalidationCode: prior.rows[0].invalidation_code,
+        proofSha256: prior.rows[0].proof_sha256, markersDeleted: false, replayAllowed: false });
+    }
+    if (run.source_fence_state !== "pending") fail("ACCOUNTLESS_RETENTION_SOURCE_FENCE_STATE_INVALID");
+
+    let invalidationCode = null;
+    try {
+      const checked = await sourceVerifier(Object.freeze({
+        runId: run.source_run_id,
+        sourceRevision: Number(run.source_revision),
+        artifactSha256: run.source_artifact_sha256,
+        manifestSha256: run.source_manifest_sha256,
+        mappingSha256: run.source_mapping_sha256,
+      }));
+      if (!checked || !["sealed", "extracted"].includes(checked.state)
+          || !Number.isSafeInteger(checked.sourceRevision) || checked.sourceRevision < 0) {
+        fail("ACCOUNTLESS_RETENTION_SOURCE_REVALIDATION_INVALID");
+      }
+      if (checked.state !== "extracted") invalidationCode = "SOURCE_SNAPSHOT_INVALIDATED";
+      else if (checked.sourceRevision !== Number(run.source_revision)) {
+        invalidationCode = "SOURCE_AUTHORITY_REVISION_CHANGED";
+      }
+    } catch (error) {
+      if (error instanceof PostgresAccountlessRetentionImportError) throw error;
+      const code = error && typeof error === "object" ? error.code : null;
+      if (!SOURCE_INVALIDATION_CODES.has(code)) fail("ACCOUNTLESS_RETENTION_SOURCE_REVALIDATION_FAILED");
+      invalidationCode = code;
+    }
+    if (invalidationCode === null) fail("ACCOUNTLESS_RETENTION_SOURCE_STILL_ELIGIBLE");
+
+    const checkedAt = new Date().toISOString();
+    const proof = {
+      schemaVersion: "tibotattle-accountless-retention-source-invalidation-v1",
+      transferId,
+      sourceRunId: run.source_run_id,
+      sourceRevision: Number(run.source_revision),
+      artifactSha256: run.source_artifact_sha256,
+      manifestSha256: run.source_manifest_sha256,
+      mappingSha256: run.source_mapping_sha256,
+      invalidationCode,
+      checkedAt,
+    };
+    const proofSha256 = sha256(canonical(proof));
+    await transaction(client, targetSchema, async () => {
+      const locked = await client.query(`SELECT status,source_kind,source_fence_state,source_run_id,
+          source_revision,source_artifact_sha256,source_manifest_sha256,source_mapping_sha256
+        FROM ${runs} WHERE transfer_id=$1 FOR UPDATE`, [transferId]);
+      const current = locked.rows?.[0];
+      if (locked.rowCount !== 1 || current.status !== "complete"
+          || current.source_kind !== ACCOUNTLESS_RETENTION_D1_SOURCE_KIND
+          || current.source_fence_state !== "pending"
+          || current.source_run_id !== run.source_run_id
+          || Number(current.source_revision) !== Number(run.source_revision)
+          || current.source_artifact_sha256 !== run.source_artifact_sha256
+          || current.source_manifest_sha256 !== run.source_manifest_sha256
+          || current.source_mapping_sha256 !== run.source_mapping_sha256) {
+        fail("ACCOUNTLESS_RETENTION_SOURCE_FENCE_STATE_INVALID");
+      }
+      await client.query("SELECT set_config('tibotattle.accountless_history_fence_invalidate',$1,true)",
+        [`${transferId}\ninvalidated\n${proofSha256}`]);
+      const receipts = table(targetSchema, "accountless_public_history_import_fence_receipts");
+      const inserted = await client.query(`INSERT INTO ${receipts} (
+        transfer_id,sequence,result_state,source_run_id,source_revision,
+        source_artifact_sha256,source_mapping_sha256,invalidation_code,proof_sha256,checked_at
+      ) VALUES ($1,1,'invalidated',$2,$3,$4,$5,$6,$7,$8::timestamptz) RETURNING proof_sha256`, [
+        transferId, run.source_run_id, Number(run.source_revision), run.source_artifact_sha256,
+        run.source_mapping_sha256, invalidationCode, proofSha256, checkedAt,
+      ]);
+      if (inserted.rowCount !== 1 || inserted.rows[0]?.proof_sha256 !== proofSha256) {
+        fail("ACCOUNTLESS_RETENTION_SOURCE_FENCE_RECEIPT_INVALID");
+      }
+      const updated = await client.query(`UPDATE ${runs}
+        SET source_fence_state='invalidated',updated_at=clock_timestamp()
+        WHERE transfer_id=$1 AND status='complete' AND source_fence_state='pending' RETURNING transfer_id`,
+      [transferId]);
+      if (updated.rowCount !== 1) fail("ACCOUNTLESS_RETENTION_SOURCE_FENCE_STATE_INVALID");
+    }, "ACCOUNTLESS_RETENTION_SOURCE_FENCE_INVALIDATION_FAILED");
+    return Object.freeze({ status: "source_fence_invalidated", invalidationCode, proofSha256,
+      markersDeleted: false, replayAllowed: false });
   } finally {
     if (client) {
       await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))",
