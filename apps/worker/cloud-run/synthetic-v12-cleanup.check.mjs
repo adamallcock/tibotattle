@@ -335,6 +335,8 @@ async function seedOwner(pool, schema, { withChunk = false } = {}) {
   const pairingId = randomUUID();
   const deviceId = randomUUID();
   const ownerDigest = randomBytes(32).toString("hex");
+  const priorSecretHash = randomBytes(32);
+  const replacementSecretHash = randomBytes(32);
   const now = new Date();
   const later = new Date(now.getTime() + 86_400_000);
   await pool.query(
@@ -366,9 +368,17 @@ async function seedOwner(pool, schema, { withChunk = false } = {}) {
   await pool.query(
     `INSERT INTO ${qualified(schema, "device_credentials")} (
        id, participant_id, authority_kind, paired_via_pairing_id, secret_hash,
-       state, issued_at, expires_at, last_used_at, social_verified_at
-     ) VALUES ($1, $2, 'social', $3, $4, 'active', $5, $6, $5, $5)`,
-    [deviceId, participantId, pairingId, randomBytes(32), now, later],
+       state, issued_at, expires_at, last_used_at, social_verified_at, credential_generation
+     ) VALUES ($1, $2, 'social', $3, $4, 'active', $5, $6, $5, $5, 2)`,
+    [deviceId, participantId, pairingId, replacementSecretHash, now, later],
+  );
+  await pool.query(
+    `INSERT INTO ${qualified(schema, "device_credential_rotations")} (
+       id, device_id, participant_id, prior_secret_hash, replacement_secret_hash,
+       attempt_id, generation, rotated_at, retire_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, 2, $7, $8)`,
+    [randomUUID(), deviceId, participantId, priorSecretHash, replacementSecretHash,
+      randomUUID(), now, later],
   );
   await pool.query(
     `INSERT INTO ${qualified(schema, "telemetry_v12_device_capabilities")} (
@@ -423,7 +433,7 @@ async function seedOwner(pool, schema, { withChunk = false } = {}) {
         digest, objectKey, grantId, now],
     );
   }
-  return { participantId, ownerDigest, objectKey };
+  return { participantId, deviceId, ownerDigest, objectKey };
 }
 
 async function seedActivatedDomain(pool, schema, participantId) {
@@ -526,6 +536,12 @@ test("PG17 owner-erasure fixture fences one exact owner, retries an object failu
     const { eraseSyntheticPostgresV12Owner } = await importOwnerErasure(temporary);
 
     const fixture = await seedOwner(primaryPool, primarySchema, { withChunk: true });
+    const rotationBefore = await primaryPool.query(
+      `SELECT count(*)::int AS count FROM ${qualified(primarySchema, "device_credential_rotations")}
+        WHERE participant_id=$1`,
+      [fixture.participantId],
+    );
+    assert.equal(rotationBefore.rows[0]?.count, 1);
     await primaryPool.query(
       `INSERT INTO ${qualified(primarySchema, "input_source_digests")}
         (participant_id,digest) VALUES($1,$2)`,
@@ -571,6 +587,13 @@ test("PG17 owner-erasure fixture fences one exact owner, retries an object failu
       [fixture.participantId],
     );
     assert.equal(state.rows[0]?.state, "deleting");
+    const rotationAfterFailedDelete = await primaryPool.query(
+      `SELECT count(*)::int AS count FROM ${qualified(primarySchema, "device_credential_rotations")}
+        WHERE participant_id=$1`,
+      [fixture.participantId],
+    );
+    assert.equal(rotationAfterFailedDelete.rows[0]?.count, 1,
+      "a failed object-delete attempt leaves the exact owner and its rotation receipt retryable");
     const stillReferenced = await primaryPool.query(
       `SELECT r2_key FROM ${qualified(primarySchema, "telemetry_v12_chunks")} WHERE participant_id=$1`,
       [fixture.participantId],
@@ -595,6 +618,13 @@ test("PG17 owner-erasure fixture fences one exact owner, retries an object failu
       [fixture.participantId],
     );
     assert.equal(state.rows.length, 0);
+    const rotationAfterComplete = await primaryPool.query(
+      `SELECT count(*)::int AS count FROM ${qualified(primarySchema, "device_credential_rotations")}
+        WHERE participant_id=$1`,
+      [fixture.participantId],
+    );
+    assert.equal(rotationAfterComplete.rows[0]?.count, 0,
+      "completed exact-owner erasure cascades its credential rotation receipt");
     const enrollment = await primaryPool.query(
       `SELECT participant_id FROM ${qualified(primarySchema, "attribution_enrollments")}
         WHERE participant_id=$1`,
@@ -633,6 +663,38 @@ test("PG17 owner-erasure fixture fences one exact owner, retries an object failu
     const repeated = await eraseSyntheticPostgresV12Owner(options);
     assert.deepEqual(repeated, { status: "already_complete", objectsDeleted: 1 });
     assert.equal(deletes.length, 2);
+
+    const unexpectedFixture = await seedOwner(primaryPool, primarySchema);
+    const nextPriorSecretHash = randomBytes(32);
+    const nextReplacementSecretHash = randomBytes(32);
+    const rotationNow = new Date();
+    const rotationRetireAt = new Date(rotationNow.getTime() + 86_400_000);
+    await primaryPool.query(
+      `UPDATE ${qualified(primarySchema, "device_credentials")}
+          SET credential_generation=3, secret_hash=$2
+        WHERE id=$1`,
+      [unexpectedFixture.deviceId, nextReplacementSecretHash],
+    );
+    await primaryPool.query(
+      `INSERT INTO ${qualified(primarySchema, "device_credential_rotations")} (
+         id, device_id, participant_id, prior_secret_hash, replacement_secret_hash,
+         attempt_id, generation, rotated_at, retire_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, 3, $7, $8)`,
+      [randomUUID(), unexpectedFixture.deviceId, unexpectedFixture.participantId,
+        nextPriorSecretHash, nextReplacementSecretHash, randomUUID(), rotationNow, rotationRetireAt],
+    );
+    await assert.rejects(
+      eraseSyntheticPostgresV12Owner({ ...options, participantId: unexpectedFixture.participantId }),
+      (error) => error?.code === "SYNTHETIC_OWNER_ERASURE_FAMILY_UNSUPPORTED",
+      "cleanup must refuse a synthetic owner with more than its exact expected rotation receipt",
+    );
+    const unexpectedState = await primaryPool.query(
+      `SELECT state FROM ${qualified(primarySchema, "participants")} WHERE id=$1`,
+      [unexpectedFixture.participantId],
+    );
+    assert.equal(unexpectedState.rows[0]?.state, "active",
+      "family refusal occurs before the owner is fenced or mutated");
+    assert.equal(deletes.length, 2, "family refusal must not reach object deletion");
   } finally {
     for (const schema of createdSchemas.reverse()) {
       try { await primaryPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); } catch {}

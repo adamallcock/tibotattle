@@ -38,6 +38,7 @@ const TABLES = Object.freeze([
   "web_sessions",
   "device_pairings",
   "device_credentials",
+  "device_credential_rotations",
   "device_upload_authorizations",
   "telemetry_v12_device_capabilities",
   "storage_v11_owner_links",
@@ -166,6 +167,7 @@ function fakePrimaryPool({
                   ? String(familyCountOverrides[table_name])
                   : table_name === "device_upload_authorizations" ? "2"
                   : ["web_sessions", "device_pairings", "device_credentials",
+                    "device_credential_rotations",
                     "telemetry_v12_device_capabilities", "storage_v11_owner_links",
                     "telemetry_v12_day_manifests", "telemetry_v12_chunks",
                     "telemetry_v12_domain_predecessors", "telemetry_v12_domains",
@@ -292,14 +294,37 @@ test("family refusal reports only a catalog table and bounded aggregate count", 
   fixture.pending.object_key = fixture.chunk.r2_key;
   await assert.rejects(readSyntheticV12PrimarySnapshot(fakePrimaryPool({
     fixtures: [fixture],
-    familyCountOverrides: { device_credentials: 2, input_source_digests: 2 },
+    familyCountOverrides: {
+      device_credentials: 2,
+      device_credential_rotations: 2,
+      input_source_digests: 2,
+    },
   }), "tibotattle", fakeManifest().roles.primary), (error) => {
     assert.equal(error?.code, "POSTGRES_SYNTHETIC_DISCOVERY_FAMILY_INVALID");
     assert.deepEqual(error?.safeFamilies, [
       { table: "device_credentials", actual: 2, expectedMinimum: 1, expectedMaximum: 1 },
+      { table: "device_credential_rotations", actual: 2, expectedMinimum: 1, expectedMaximum: 1 },
       { table: "input_source_digests", actual: 2, expectedMinimum: 0, expectedMaximum: 1 },
     ]);
     assert.doesNotMatch(JSON.stringify(error.safeFamilies), /synthetic-v12-smoke-|telemetry\/v12-/u);
+    return true;
+  });
+});
+
+test("discovery refuses a synthetic owner missing the exact credential rotation receipt", async () => {
+  const fixture = participantFixture();
+  fixture.pending.object_key = fixture.chunk.r2_key;
+  await assert.rejects(readSyntheticV12PrimarySnapshot(fakePrimaryPool({
+    fixtures: [fixture],
+    familyCountOverrides: { device_credential_rotations: 0 },
+  }), "tibotattle", fakeManifest().roles.primary), (error) => {
+    assert.equal(error?.code, "POSTGRES_SYNTHETIC_DISCOVERY_FAMILY_INVALID");
+    assert.deepEqual(error?.safeFamilies, [{
+      table: "device_credential_rotations",
+      actual: 0,
+      expectedMinimum: 1,
+      expectedMaximum: 1,
+    }]);
     return true;
   });
 });

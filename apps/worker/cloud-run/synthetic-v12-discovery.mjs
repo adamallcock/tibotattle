@@ -51,6 +51,9 @@ const ALLOWED_PARTICIPANT_TABLES = Object.freeze({
   web_sessions: [1, 1],
   device_pairings: [1, 1],
   device_credentials: [1, 1],
+  // The verified credential-renewal journey leaves one exact replay receipt
+  // for this device generation; keep other counts outside the cleanup target.
+  device_credential_rotations: [1, 1],
   device_upload_authorizations: [0, 4],
   telemetry_v12_device_capabilities: [1, 1],
   storage_v11_owner_links: [1, 1],
@@ -287,6 +290,7 @@ async function readParticipantFamily(client, schema, participantId) {
   }
   const required = [
     "web_sessions", "device_pairings", "device_credentials",
+    "device_credential_rotations",
     "device_upload_authorizations", "telemetry_v12_device_capabilities",
     "storage_v11_owner_links", "telemetry_v12_day_manifests", "telemetry_v12_chunks",
   ];
