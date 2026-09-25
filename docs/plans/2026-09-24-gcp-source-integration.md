@@ -21,6 +21,15 @@ source archive, not to a production Worker build.
 
 ### Latest test-project checkpoint: 2026-09-25
 
+The subsequent [private daily and readpaged graph receipt](../receipts/2026-09-25-gcp-a2-daily-and-readpaged-graph.md)
+records ready private revision `tibotattle-test-app-00031-lg7`, current
+37/37 primary and 6/6 ledger migration health, and a guarded daily preflight
+blocked by `SOURCE_FENCE_UNAVAILABLE`; no daily revision was published. A
+fresh 100,000-member graph schema migrated to 38/38, but its exact-image
+hosted run still timed out during a 4,096-row readback cursor fetch. The
+publisher write timeout was resolved; hosted readback and a matched
+Cloudflare speed comparison remain open gates.
+
 The later [A2 rotation and graph diagnostics receipt](../receipts/2026-09-25-gcp-a2-v12-rotation-and-graph-diagnostics.md)
 records primary migration 37/37, a source-pinned private v1.2 journey through
 device credential rotation, exact-owner discovery/cleanup/retry, and an empty
