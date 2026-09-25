@@ -272,6 +272,7 @@ const ACCOUNTLESS_ENROLLMENT_PATH = "/api/v1/accountless/enrollment";
 const ACCOUNTLESS_OWNERSHIP_PATH = "/api/v1/accountless/ownership";
 const ACCOUNTLESS_V12_AUTHORIZATION_PATH = "/api/v1/accountless/telemetry-v1.2-authorization";
 const ACCOUNTLESS_RENEWAL_PATH = "/api/v1/accountless/renewal";
+const DEVICE_CREDENTIAL_RENEWAL_PATH = "/api/v1/device/credential/renew";
 const MAX_V12_DAY_CHUNKS = 4_096;
 const MAX_V12_EFFECTIVE_PAGE_LIMIT = 200;
 const MAX_V12_EFFECTIVE_TIME_MS = 8_640_000_000_000_000;
@@ -1028,6 +1029,7 @@ export function createPostgresTestV12DayManifestDispatch({
   privateOrigin,
   healthDispatch,
   accountlessAuthority,
+  deviceCredentialRenewalAuthority,
   admissionEnv,
   assertAdmissionBindings,
   assertAttemptAllowed,
@@ -1117,6 +1119,14 @@ export function createPostgresTestV12DayManifestDispatch({
         || accountlessAuthority.maxRenewalBytes !== 512)) {
     configurationError("POSTGRES_TEST_ACCOUNTLESS_AUTHORITY_CONFIGURATION_INVALID");
   }
+  if (deviceCredentialRenewalAuthority !== undefined
+      && (deviceCredentialRenewalAuthority === null
+        || typeof deviceCredentialRenewalAuthority !== "object"
+        || typeof deviceCredentialRenewalAuthority.renew !== "function"
+        || typeof deviceCredentialRenewalAuthority.parseRequest !== "function"
+        || deviceCredentialRenewalAuthority.maxRequestBytes !== 2 * 1024 * 1024)) {
+    configurationError("POSTGRES_TEST_DEVICE_CREDENTIAL_RENEWAL_CONFIGURATION_INVALID");
+  }
 
   return async function dispatchPostgresTestV12DayManifest(request) {
     let url;
@@ -1147,11 +1157,13 @@ export function createPostgresTestV12DayManifestDispatch({
     const accountlessOwnershipPath = url.pathname === ACCOUNTLESS_OWNERSHIP_PATH;
     const accountlessV12AuthorizationPath = url.pathname === ACCOUNTLESS_V12_AUTHORIZATION_PATH;
     const accountlessRenewalPath = url.pathname === ACCOUNTLESS_RENEWAL_PATH;
+    const deviceCredentialRenewalPath = url.pathname === DEVICE_CREDENTIAL_RENEWAL_PATH;
     const accountlessEnrollmentRoute = accountlessEnrollmentPath && request.method === "POST";
     const accountlessOwnershipRoute = accountlessOwnershipPath && request.method === "POST";
     const accountlessV12AuthorizationRoute = accountlessV12AuthorizationPath
       && request.method === "POST";
     const accountlessRenewalRoute = accountlessRenewalPath && request.method === "POST";
+    const deviceCredentialRenewalRoute = deviceCredentialRenewalPath && request.method === "POST";
     const syncStateRoute = syncStatePath && request.method === "GET";
     const syncCapabilitiesV12Route = syncCapabilitiesV12Path && request.method === "GET";
     const v12DomainPredecessorRoute = v12DomainPredecessorPath && request.method === "POST";
@@ -1190,6 +1202,11 @@ export function createPostgresTestV12DayManifestDispatch({
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "POST" },
       }), crypto.randomUUID());
     }
+    if (deviceCredentialRenewalPath && request.method !== "POST") {
+      return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
+        code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "POST" },
+      }), crypto.randomUUID());
+    }
     if ((accountlessEnrollmentPath || accountlessOwnershipPath || accountlessV12AuthorizationPath
       || accountlessRenewalPath)
         && request.headers.has("cookie")) {
@@ -1197,13 +1214,18 @@ export function createPostgresTestV12DayManifestDispatch({
         ? "AUTH_INVALID" : "DEVICE_AUTH_INVALID";
       return routeError(Object.assign(new Error(code), { code, status: 401 }), crypto.randomUUID());
     }
+    if (deviceCredentialRenewalPath && request.headers.has("cookie")) {
+      return routeError(Object.assign(new Error("DEVICE_AUTH_INVALID"), {
+        code: "DEVICE_AUTH_INVALID", status: 401,
+      }), crypto.randomUUID());
+    }
     if ((!envelopeKeyRoute && !manifestRoute && !manifestReadRoute
         && !uploadAuthorizationRoute && !v12ChunkUploadRoute
         && !syncStateRoute && !syncCapabilitiesV12Route
         && !v12DomainPredecessorRoute && !v12DomainActivateRoute
         && !v12EffectivePageRoute && !accountlessEnrollmentRoute
         && !accountlessOwnershipRoute && !accountlessV12AuthorizationRoute
-        && !accountlessRenewalRoute)
+        && !accountlessRenewalRoute && !deviceCredentialRenewalRoute)
         || (url.search && !envelopeKeyRoute && !manifestReadRoute
           && !syncStatePath && !syncCapabilitiesV12Path && !v12EffectivePageRoute)) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
@@ -1211,6 +1233,9 @@ export function createPostgresTestV12DayManifestDispatch({
     if ((accountlessEnrollmentRoute || accountlessOwnershipRoute || accountlessV12AuthorizationRoute
       || accountlessRenewalRoute)
         && !accountlessAuthority) {
+      return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
+    }
+    if (deviceCredentialRenewalRoute && !deviceCredentialRenewalAuthority) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
 
@@ -1300,6 +1325,34 @@ export function createPostgresTestV12DayManifestDispatch({
         return json(200, await accountlessAuthority.renew(
           primaryPool, request.headers.get("authorization"), body, { schema },
         ));
+      }
+      if (deviceCredentialRenewalRoute) {
+        await assertAttemptAllowed(
+          admissionEnv.RECOVERY_RATE_LIMIT,
+          admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
+          request,
+          admissionEnv,
+          "device_credential_renew",
+        );
+        await assertPostgresUploadRegistrationEnabled(primaryPool, schemas.primary);
+        const body = await readAccountlessJson(
+          request,
+          deviceCredentialRenewalAuthority.maxRequestBytes,
+          readBoundedRequestBody,
+          deviceCredentialRenewalAuthority.parseRequest,
+        );
+        const rotated = await deviceCredentialRenewalAuthority.renew(
+          primaryPool, request.headers.get("authorization"), body, { schema },
+        );
+        return json(200, {
+          schemaVersion: "device-credential-renewal-v1.0",
+          deviceId: rotated.deviceId,
+          state: rotated.state,
+          scope: rotated.scope,
+          expiresAt: rotated.expiresAt,
+          credentialGeneration: rotated.credentialGeneration,
+          commit: rotated.commit,
+        });
       }
       if (accountlessOwnershipRoute || accountlessV12AuthorizationRoute) {
         const mode = admissionEnv.ACCOUNTLESS_OWNERSHIP_MODE;

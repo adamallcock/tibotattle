@@ -45,6 +45,11 @@ import {
 } from "../src/postgres-accountless-enrollment.ts";
 import { renewPostgresAccountlessUploadOwner } from "../src/postgres-accountless-renewal.ts";
 import {
+  POSTGRES_DEVICE_CREDENTIAL_RENEWAL_MAX_REQUEST_BYTES,
+  parsePostgresDeviceCredentialRenewalJson,
+  renewPostgresDeviceCredential,
+} from "../src/postgres-device-credential-renewal.ts";
+import {
   readPostgresDeviceSyncState,
   readPostgresDeviceSyncV12Capabilities,
 } from "../src/postgres-device-sync.ts";
@@ -509,6 +514,11 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
             maxEnrollmentBytes: ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
             maxOwnershipBytes: ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES,
             maxRenewalBytes: ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
+          }),
+          deviceCredentialRenewalAuthority: Object.freeze({
+            renew: renewPostgresDeviceCredential,
+            parseRequest: parsePostgresDeviceCredentialRenewalJson,
+            maxRequestBytes: POSTGRES_DEVICE_CREDENTIAL_RENEWAL_MAX_REQUEST_BYTES,
           }),
           expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
           privateOrigin: hostOrigin,

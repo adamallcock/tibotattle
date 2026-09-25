@@ -465,6 +465,15 @@ test("private-host envelope-key is public-only and bypasses PostgreSQL and Worke
   assert.equal(wrongMethod.headers.get("allow"), "GET");
   const wrongOrigin = await dispatch(new Request("http://127.0.0.2:8080/api/v1/envelope-key"));
   assert.equal(wrongOrigin.status, 503);
+  const unconfiguredRenewal = await dispatch(new Request(
+    "http://127.0.0.1:8080/api/v1/device/credential/renew",
+    { method: "POST", headers: { "content-type": "application/json" }, body: "{}" },
+  ));
+  assert.equal(unconfiguredRenewal.status, 503,
+    "credential renewal stays closed unless its PostgreSQL authority adapter is wired");
+  assert.deepEqual(await unconfiguredRenewal.json(), {
+    status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED",
+  });
   assert.equal(postgresConnections, 0);
   assert.equal(projectionCalls, 1);
   assert.equal(workerCalls, 0);
@@ -980,7 +989,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     const [transport, v12Admission, ledgerAuthority, admission, rateLimit, bodyReader, constants,
       cryptoModule, telemetryV12Repository, deviceSync, typedCodec, typedV12EffectiveReader,
       accountlessAdapter, accountlessRenewalAdapter, accountlessEnrollment, accountlessOwnership,
-      accountlessRenewal, transportPolicy]
+      accountlessRenewal, transportPolicy, postgresCredentialRenewalAdapter]
       = await Promise.all([
         vite.ssrLoadModule("/src/postgres-typed-v12-transport.ts"),
         vite.ssrLoadModule("/src/postgres-typed-v12-admission.ts"),
@@ -1000,6 +1009,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
         vite.ssrLoadModule("/src/accountless-ownership.ts"),
         vite.ssrLoadModule("/src/accountless-renewal.ts"),
         vite.ssrLoadModule("/src/telemetry-transport-policy.ts"),
+        vite.ssrLoadModule("/src/postgres-device-credential-renewal.ts"),
       ]);
     const v12ManifestCandidates = await vite.ssrLoadModule("/src/postgres-v12-manifest-candidates.ts");
     const [uploadAuthorization, formatAuthority] = await Promise.all([
@@ -1215,6 +1225,12 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
         maxEnrollmentBytes: accountlessEnrollment.ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
         maxOwnershipBytes: accountlessOwnership.ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES,
         maxRenewalBytes: accountlessRenewal.ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
+      }),
+      deviceCredentialRenewalAuthority: Object.freeze({
+        renew: postgresCredentialRenewalAdapter.renewPostgresDeviceCredential,
+        parseRequest: postgresCredentialRenewalAdapter.parsePostgresDeviceCredentialRenewalJson,
+        maxRequestBytes:
+          postgresCredentialRenewalAdapter.POSTGRES_DEVICE_CREDENTIAL_RENEWAL_MAX_REQUEST_BYTES,
       }),
       admissionEnv: Object.freeze(admissionEnv),
       assertAdmissionBindings: admission.assertAdmissionBindings,
@@ -2075,6 +2091,87 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       method: "GET",
       url: `${manifestUrl}?fromDay=2020-01-01&toDay=2020-01-31`,
     })), 401, "DEVICE_AUTH_INVALID");
+    const credentialRenewalUrl =
+      "http://127.0.0.1:43817/api/v1/device/credential/renew";
+    const credentialRenewalDeviceId = randomUUID();
+    const credentialRenewalParticipantId = `synthetic-host-renewal-${randomUUID()}`;
+    const credentialRenewalPairingId = randomUUID();
+    const credentialRenewalSessionId = randomUUID();
+    const credentialRenewalSecret = randomBytes(32).toString("base64url");
+    const credentialRenewalAuth =
+      `Device um_device_${credentialRenewalDeviceId}.${credentialRenewalSecret}`;
+    const credentialRenewalIssuedAt = new Date().toISOString();
+    const credentialRenewalExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60_000).toISOString();
+    await primaryPool.query(
+      `INSERT INTO ${primaryTable("participants")} (
+         id, owner_kind, state, consent_version, created_at
+       ) VALUES ($1, 'social', 'active', $2, $3::timestamptz)`,
+      [credentialRenewalParticipantId, constants.TELEMETRY_CONSENT_VERSION,
+        credentialRenewalIssuedAt],
+    );
+    await primaryPool.query(
+      `INSERT INTO ${primaryTable("web_sessions")} (
+         id, participant_id, secret_hash, csrf_hash, issued_at, expires_at, last_used_at
+       ) VALUES ($1, $2, $3, $4, $5::timestamptz, $6::timestamptz, $5::timestamptz)`,
+      [credentialRenewalSessionId, credentialRenewalParticipantId, randomBytes(32), randomBytes(32),
+        credentialRenewalIssuedAt, new Date(Date.now() + 30 * 24 * 60 * 60_000).toISOString()],
+    );
+    await primaryPool.query(
+      `INSERT INTO ${primaryTable("device_pairings")} (
+         id, participant_id, issued_by_session_id, secret_hash, consent_version,
+         transport_consent_version, state, issued_at, expires_at, consumed_at, claimed_device_id
+       ) VALUES ($1, $2, $3, $4, $5, $5, 'consumed', $6::timestamptz,
+         $7::timestamptz, $6::timestamptz, $8)`,
+      [credentialRenewalPairingId, credentialRenewalParticipantId, credentialRenewalSessionId,
+        randomBytes(32), constants.TELEMETRY_CONSENT_VERSION, credentialRenewalIssuedAt,
+        credentialRenewalExpiresAt, credentialRenewalDeviceId],
+    );
+    await primaryPool.query(
+      `INSERT INTO ${primaryTable("device_credentials")} (
+         id, participant_id, authority_kind, paired_via_pairing_id, secret_hash,
+         state, issued_at, expires_at, last_used_at, social_verified_at
+       ) VALUES ($1, $2, 'social', $3, $4, 'active', $5::timestamptz,
+         $6::timestamptz, $5::timestamptz, $5::timestamptz)`,
+      [credentialRenewalDeviceId, credentialRenewalParticipantId, credentialRenewalPairingId,
+        deviceSecretHash(credentialRenewalDeviceId, credentialRenewalSecret),
+        credentialRenewalIssuedAt, credentialRenewalExpiresAt],
+    );
+    const replacementSecret = randomBytes(32).toString("base64url");
+    const renewalAttemptId = randomUUID();
+    const credentialRenewalBody = JSON.stringify({
+      nextDeviceSecretHash:
+        deviceSecretHash(credentialRenewalDeviceId, replacementSecret).toString("hex"),
+      rotationAttemptId: renewalAttemptId,
+    });
+    const credentialRenewalRequest = (body = credentialRenewalBody, headers = {}, method = "POST") =>
+      new Request(credentialRenewalUrl, {
+        method,
+        headers: { "content-type": "application/json", authorization: credentialRenewalAuth, ...headers },
+        ...(method === "GET" || method === "HEAD" ? {} : { body }),
+      });
+    const credentialRenewalWrongMethod = await dispatch(credentialRenewalRequest("", {}, "GET"));
+    await assertApiError(credentialRenewalWrongMethod, 405, "METHOD_NOT_ALLOWED");
+    assert.equal(credentialRenewalWrongMethod.headers.get("allow"), "POST");
+    await assertApiError(await dispatch(credentialRenewalRequest("{}")), 400, "BODY_INVALID");
+    await assertApiError(await dispatch(credentialRenewalRequest(
+      credentialRenewalBody, { cookie: "session=not-allowed" },
+    )), 401, "DEVICE_AUTH_INVALID");
+    const credentialRenewalStartedAt = Date.now();
+    const credentialRenewalResponse = await dispatch(credentialRenewalRequest());
+    assert.equal(credentialRenewalResponse.status, 200);
+    const credentialRenewalReceipt = await credentialRenewalResponse.json();
+    assert.equal(credentialRenewalReceipt.schemaVersion, "device-credential-renewal-v1.0");
+    assert.equal(credentialRenewalReceipt.deviceId, credentialRenewalDeviceId);
+    assert.equal(credentialRenewalReceipt.state, "active");
+    assert.equal(credentialRenewalReceipt.scope, "upload_registration");
+    assert.equal(credentialRenewalReceipt.credentialGeneration, 2);
+    assert.equal(credentialRenewalReceipt.commit, true);
+    assert.ok(Math.abs(Date.parse(credentialRenewalReceipt.expiresAt)
+      - (credentialRenewalStartedAt + constants.DEVICE_CREDENTIAL_TTL_MILLISECONDS)) < 10_000);
+    const credentialRenewalReplay = await dispatch(credentialRenewalRequest());
+    assert.equal(credentialRenewalReplay.status, 200);
+    assert.deepEqual(await credentialRenewalReplay.json(), credentialRenewalReceipt,
+      "the same rotation attempt replays its committed result");
     // Exercise accountless enrollment and separate v1.2 authority through
     // private HTTP dispatch. All durable writes go through PostgreSQL.
     const accountlessEnrollmentUrl = "http://127.0.0.1:43817/api/v1/accountless/enrollment";
@@ -2418,14 +2515,69 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     "ledger, device, owner, and v1.1 authorization renew atomically");
     assert.equal(Date.parse(renewedReceipt.expiresAt),
       Date.parse(renewedRow.renewed_at) + 30 * 24 * 60 * 60_000);
-    assert.equal(Date.parse(renewedRow.v12_expires_at), Date.parse(dueExpiresAt),
-      "Cloudflare parity leaves the separate v1.2 authorization expiry unchanged");
-    assert.notEqual(Date.parse(renewedRow.v12_expires_at), Date.parse(renewedReceipt.expiresAt));
-    await assertApiError(await dispatch(request({
+    assert.equal(Date.parse(renewedRow.v12_expires_at), Date.parse(renewedReceipt.expiresAt),
+      "renewal extends the exact active matching v1.2 authorization with its owner lease");
+    assert.equal(new Set([
+      renewedRow.ledger_expires_at, renewedRow.device_expires_at,
+      renewedRow.owner_expires_at, renewedRow.v11_expires_at, renewedRow.v12_expires_at,
+    ].map((value) => Date.parse(value))).size, 1,
+    "the exact active v1.2 grant advances in the same lease transaction");
+    const renewedUploadAuthorization = await dispatch(request({
       url: uploadAuthorizationUrl,
       headers: { authorization: accountlessAuth },
       body: JSON.stringify({
         envelopeDigest: "b".repeat(64), contentLengthBytes: 1,
+        contentType: "application/json", telemetrySchemaVersion: TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+      }),
+    }));
+    assert.equal(renewedUploadAuthorization.status, 201,
+      "the exact active v1.2 authority remains usable after renewal");
+
+    const noV12DeviceId = randomUUID();
+    const noV12Secret = randomBytes(32).toString("base64url");
+    const noV12Auth = `Device um_device_${noV12DeviceId}.${noV12Secret}`;
+    const noV12EnrollmentBody = {
+      ...accountlessEnrollmentBody,
+      deviceId: noV12DeviceId,
+      deviceSecretHash: deviceSecretHash(noV12DeviceId, noV12Secret).toString("hex"),
+    };
+    assert.equal((await dispatch(enrollmentHttp(JSON.stringify(noV12EnrollmentBody)))).status, 201);
+    assert.equal((await dispatch(ownershipHttp(JSON.stringify(ownershipBody), {
+      authorization: noV12Auth,
+    }))).status, 201);
+    const noV12DueAt = Date.now();
+    const noV12IssuedAt = new Date(noV12DueAt - 29 * 24 * 60 * 60_000).toISOString();
+    const noV12ExpiresAt = new Date(noV12DueAt + 24 * 60 * 60_000).toISOString();
+    await primaryPool.query(
+      "UPDATE " + primaryTable("accountless_enrollment_ledger")
+        + " SET issued_at=$2::timestamptz, expires_at=$3::timestamptz, "
+        + "renewed_at=NULL, renewal_generation=0 WHERE device_id=$1",
+      [noV12DeviceId, noV12IssuedAt, noV12ExpiresAt],
+    );
+    for (const table of [
+      "device_credentials", "accountless_upload_owners",
+      "accountless_v11_device_authorizations",
+    ]) {
+      const key = table === "device_credentials" ? "id" : "enrollment_device_id";
+      await primaryPool.query(
+        "UPDATE " + primaryTable(table) + " SET expires_at=$2::timestamptz WHERE " + key + "=$1",
+        [noV12DeviceId, noV12ExpiresAt],
+      );
+    }
+    const noV12Renewal = await dispatch(renewalHttp(renewalJson, { authorization: noV12Auth }));
+    assert.equal(noV12Renewal.status, 200);
+    assert.equal((await noV12Renewal.json()).state, "renewed");
+    assert.equal((await primaryPool.query(
+      "SELECT count(*)::integer AS count FROM " + primaryTable("accountless_v12_device_authorizations")
+        + " WHERE enrollment_device_id=$1 AND state='active'",
+      [noV12DeviceId],
+    )).rows[0].count, 0,
+    "renewal never creates or reactivates a missing v1.2 grant");
+    await assertApiError(await dispatch(request({
+      url: uploadAuthorizationUrl,
+      headers: { authorization: noV12Auth },
+      body: JSON.stringify({
+        envelopeDigest: "c".repeat(64), contentLengthBytes: 1,
         contentType: "application/json", telemetrySchemaVersion: TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
       }),
     })), 401, "DEVICE_AUTH_INVALID");
