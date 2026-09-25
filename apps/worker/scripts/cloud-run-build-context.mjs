@@ -63,6 +63,7 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/Dockerfile", destination: "apps/worker/cloud-run/Dockerfile" }),
   Object.freeze({ source: "cloud-run/cloudbuild.yaml", destination: "apps/worker/cloud-run/cloudbuild.yaml" }),
   Object.freeze({ source: "cloud-run/server.mjs", destination: "apps/worker/cloud-run/server.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-maintenance-gate.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-gate.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-test-dispatch.mjs", destination: "apps/worker/cloud-run/postgres-test-dispatch.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-migrations.mjs", destination: "apps/worker/cloud-run/postgres-migrations.mjs" }),
   Object.freeze({ source: "cloud-run/cloud-sql.mjs", destination: "apps/worker/cloud-run/cloud-sql.mjs" }),

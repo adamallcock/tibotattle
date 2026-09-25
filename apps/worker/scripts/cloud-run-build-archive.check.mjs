@@ -16,6 +16,7 @@ import {
 function digestFromTar(bytes) {
   const hash = createHash("sha256");
   let cloudBuildConfigBytes = null;
+  let maintenanceGateBytes = null;
   let offset = 0;
   let count = 0;
   while (offset + 512 <= bytes.length) {
@@ -33,6 +34,9 @@ function digestFromTar(bytes) {
     if (path === "apps/worker/cloud-run/cloudbuild.yaml") {
       cloudBuildConfigBytes = Buffer.from(content);
     }
+    if (path === "apps/worker/cloud-run/postgres-maintenance-gate.mjs") {
+      maintenanceGateBytes = Buffer.from(content);
+    }
     if (path !== "apps/worker/cloud-run/source-content-digest.txt") {
       hash.update(path);
       hash.update(Buffer.from([0]));
@@ -42,7 +46,7 @@ function digestFromTar(bytes) {
     offset = start + size + padding;
     count += 1;
   }
-  return { digest: hash.digest("hex"), count, cloudBuildConfigBytes };
+  return { digest: hash.digest("hex"), count, cloudBuildConfigBytes, maintenanceGateBytes };
 }
 
 test("archive helper proves digest from tar members and returns shell-safe argument vectors", async () => {
@@ -60,6 +64,12 @@ test("archive helper proves digest from tar members and returns shell-safe argum
     assert.equal(receipt.sourceArchiveSha256,
       createHash("sha256").update(archiveBytes).digest("hex"));
     assert.equal(Buffer.isBuffer(members.cloudBuildConfigBytes), true);
+    const workerRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSource = readFileSync(join(workerRoot, "cloud-run/server.mjs"), "utf8");
+    assert.match(serverSource,
+      /from\s+["']\.\/postgres-maintenance-gate\.mjs["']/u);
+    assert.deepEqual(members.maintenanceGateBytes,
+      readFileSync(join(workerRoot, "cloud-run/postgres-maintenance-gate.mjs")));
     assert.equal(receipt.buildConfigSha256,
       createHash("sha256").update(members.cloudBuildConfigBytes).digest("hex"));
     assert.equal(receipt.buildConfigPath, outputPath + ".cloudbuild.yaml");
