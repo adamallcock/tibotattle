@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
+import {
+  buildGcpTestBucketCreateRequest,
+  GCP_TEST_BUCKET_HISTORY_RECEIPT_SCHEMA,
+  GCP_TEST_BUCKET_HISTORY_TARGET,
+} from "./gcp-test-bucket-history.mjs";
 import {
   GCP_PRIVATE_TEST_BUILD,
   GCP_PRIVATE_TEST_TARGET,
@@ -14,6 +19,8 @@ import {
   runGcpPrivateTestDeployment,
   runSyntheticRouteBoundarySmoke,
   runUnauthenticatedInvokerProbe,
+  parseArgs,
+  readGcpPrivateTestBucketHistoryProof,
   validateConfig,
 } from "./gcp-private-test-deploy.mjs";
 
@@ -34,6 +41,53 @@ const backingTargetEnvironment = {
   POSTGRES_IAM_USER: GCP_PRIVATE_TEST_TARGET.postgresIamUser,
   GCS_BUCKET_NAME: GCP_PRIVATE_TEST_TARGET.gcsBucketName,
 };
+const bucketCreationResponse = {
+  bucket: GCP_PRIVATE_TEST_TARGET.gcsBucketName,
+  projectNumber: GCP_TEST_BUCKET_HISTORY_TARGET.projectNumber,
+  bucketGeneration: "1",
+  bucketMetageneration: "1",
+  location: GCP_TEST_BUCKET_HISTORY_TARGET.location,
+  timeCreated: "2026-09-25T00:00:00.000Z",
+  softDeleteRetentionDurationSeconds: "0",
+  iamConfiguration: {
+    uniformBucketLevelAccess: true,
+    publicAccessPrevention: "enforced",
+  },
+  versioningEnabled: false,
+};
+const bucketHistoryProof = {
+  bucket: bucketCreationResponse.bucket,
+  bucketGeneration: bucketCreationResponse.bucketGeneration,
+  bucketMetageneration: bucketCreationResponse.bucketMetageneration,
+  softDeleteRetentionDurationSeconds: bucketCreationResponse.softDeleteRetentionDurationSeconds,
+};
+const bucketHistoryReceipt = {
+  schemaVersion: GCP_TEST_BUCKET_HISTORY_RECEIPT_SCHEMA,
+  source: "storage.buckets.insert",
+  project: GCP_TEST_BUCKET_HISTORY_TARGET.project,
+  projectNumber: GCP_TEST_BUCKET_HISTORY_TARGET.projectNumber,
+  creationRequestSha256: createHash("sha256")
+    .update(JSON.stringify(buildGcpTestBucketCreateRequest(GCP_PRIVATE_TEST_TARGET.gcsBucketName)))
+    .digest("hex"),
+  creationResponse: bucketCreationResponse,
+  creationResponseSha256: createHash("sha256")
+    .update(JSON.stringify(bucketCreationResponse)).digest("hex"),
+  proof: bucketHistoryProof,
+};
+const bucketHistoryProofJson = JSON.stringify(bucketHistoryProof);
+const previousBucketHistoryProofJson = JSON.stringify({
+  bucket: "tibotattle-gcs-test-app-20260922",
+  bucketGeneration: "1",
+  bucketMetageneration: "1",
+  softDeleteRetentionDurationSeconds: "0",
+});
+const bucketHistoryTestDirectory = await mkdtemp(join(tmpdir(), "private-test-bucket-proof-"));
+const bucketHistoryReceiptPath = join(bucketHistoryTestDirectory, "receipt.json");
+await writeFile(bucketHistoryReceiptPath, `${JSON.stringify(bucketHistoryReceipt, null, 2)}\n`, {
+  flag: "wx",
+  mode: 0o600,
+});
+after(async () => rm(bucketHistoryTestDirectory, { recursive: true, force: true }));
 
 function serviceFixture({
   serviceImage = image,
@@ -58,6 +112,7 @@ function serviceFixture({
     HOST: "0.0.0.0",
     HOST_ORIGIN: GCP_PRIVATE_TEST_TARGET.hostOrigin,
     POSTGRES_TEST_HTTP_MODE: postgresTestMode,
+    GCS_ERASURE_BUCKET_HISTORY_PROOF: bucketHistoryProofJson,
     ...backingTargetEnvironment,
     ...environmentOverrides,
   };
@@ -116,6 +171,7 @@ function config(overrides = {}) {
     service: "tibotattle-test-app",
     image,
     sourceDigest,
+    bucketHistoryReceiptPath,
     buildId: "12345678-abcd-efab-1234-1234567890ab",
     ...overrides,
   };
@@ -195,6 +251,13 @@ function buildFixture(overrides = {}, configValue = qualifiedConfig()) {
 }
 
 test("target is fixed to the named us-east1 test service and exact Artifact Registry digest", () => {
+  assert.equal(GCP_PRIVATE_TEST_TARGET.primarySchema, "tibotattle_v12_a2_20260925");
+  assert.equal(GCP_PRIVATE_TEST_TARGET.ledgerSchema, "tibotattle_ledger_v12_a2_20260925");
+  assert.equal(GCP_PRIVATE_TEST_TARGET.gcsBucketName, "tibotattle-gcs-test-cleanup-20260925-a2");
+  assert.equal(GCP_PRIVATE_TEST_TARGET.primaryInstanceConnectionName,
+    "tibotattle:us-east1:tibotattle-test-primary-20260922");
+  assert.equal(GCP_PRIVATE_TEST_TARGET.ledgerInstanceConnectionName,
+    "tibotattle:us-east1:tibotattle-test-ledger-20260922");
   assert.throws(
     () => validateConfig(config({ project: "production-project" })),
     (error) => error.code === "GCP_PRIVATE_TEST_TARGET_FIXED",
@@ -211,6 +274,67 @@ test("target is fixed to the named us-east1 test service and exact Artifact Regi
     () => validateConfig(config({ image: "other.invalid/repo@sha256:" + imageDigest })),
     (error) => error.code === "GCP_PRIVATE_TEST_IMAGE_DIGEST_REQUIRED",
   );
+  assert.throws(
+    () => validateConfig(config({ command: "deploy", bucketHistoryReceiptPath: "relative.json" })),
+    (error) => error.code === "GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_REQUIRED",
+  );
+  assert.throws(
+    () => validateConfig(config({ command: "verify", bucketHistoryReceiptPath: "" })),
+    (error) => error.code === "GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_REQUIRED",
+  );
+  assert.equal(parseArgs([
+    "deploy",
+    "--image=" + image,
+    "--source-digest=" + sourceDigest,
+    "--bucket-history-receipt=" + bucketHistoryReceiptPath,
+  ]).bucketHistoryReceiptPath, bucketHistoryReceiptPath);
+  assert.throws(() => parseArgs([
+    "deploy",
+    "--image=" + image,
+    "--source-digest=" + sourceDigest,
+  ]), (error) => error.code === "GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_REQUIRED");
+});
+
+test("bucket birth receipt must be the owner-only, canonical proof for the exact A2 bucket", async () => {
+  assert.equal(await readGcpPrivateTestBucketHistoryProof(bucketHistoryReceiptPath), bucketHistoryProofJson);
+  const stat = await lstat(bucketHistoryReceiptPath);
+  assert.equal(stat.mode & 0o777, 0o600);
+
+  const scratch = await mkdtemp(join(tmpdir(), "private-test-bucket-proof-reject-"));
+  const insecurePath = join(scratch, "insecure.json");
+  const symlinkPath = join(scratch, "receipt-link.json");
+  const wrongBucketPath = join(scratch, "wrong-bucket.json");
+  try {
+    await writeFile(insecurePath, `${JSON.stringify(bucketHistoryReceipt, null, 2)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    await chmod(insecurePath, 0o644);
+    await symlink(bucketHistoryReceiptPath, symlinkPath);
+    const wrongBucket = structuredClone(bucketHistoryReceipt);
+    wrongBucket.creationResponse.bucket = "tibotattle-gcs-test-app-20260922";
+    wrongBucket.creationResponseSha256 = createHash("sha256")
+      .update(JSON.stringify(wrongBucket.creationResponse)).digest("hex");
+    wrongBucket.proof.bucket = wrongBucket.creationResponse.bucket;
+    await writeFile(wrongBucketPath, `${JSON.stringify(wrongBucket, null, 2)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    await assert.rejects(
+      readGcpPrivateTestBucketHistoryProof(insecurePath),
+      (error) => error?.code === "GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_UNSAFE",
+    );
+    await assert.rejects(
+      readGcpPrivateTestBucketHistoryProof(symlinkPath),
+      (error) => error?.code === "GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_UNSAFE",
+    );
+    await assert.rejects(
+      readGcpPrivateTestBucketHistoryProof(wrongBucketPath),
+      (error) => error?.code === "GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_INVALID",
+    );
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
 });
 
 test("Cloud Build provenance binds the exact archive generation, hash, builder, service account, and image", () => {
@@ -628,6 +752,71 @@ test("Cloud Run readback pins every database, IAM-user, bucket, and runtime iden
     expectedImage: image,
     expectedSourceDigest: sourceDigest,
   }).blockers.includes("GCP_TEST_RUNTIME_SERVICE_ACCOUNT_UNQUALIFIED"), true);
+
+  const knownPreviousProfile = serviceFixture({
+    environmentOverrides: {
+      PRIMARY_SCHEMA: "tibotattle",
+      LEDGER_SCHEMA: "tibotattle_ledger",
+      GCS_BUCKET_NAME: "tibotattle-gcs-test-app-20260922",
+      GCS_ERASURE_BUCKET_HISTORY_PROOF: previousBucketHistoryProofJson,
+    },
+  });
+  assert.equal(assessCloudRunReadback({
+    service: knownPreviousProfile,
+    policy: policyFixture(),
+    expectedImage: image,
+    expectedSourceDigest: sourceDigest,
+    expectedBucketHistoryProof: bucketHistoryProofJson,
+    requireBackingTargets: false,
+    allowKnownPreviousBackingTargets: true,
+  }).blockers.includes("GCP_TEST_BACKING_TARGET_READBACK_UNQUALIFIED"), false);
+  const unknownPreviousProfile = serviceFixture({
+    environmentOverrides: {
+      PRIMARY_SCHEMA: "unrecognized_schema",
+      LEDGER_SCHEMA: "tibotattle_ledger",
+      GCS_BUCKET_NAME: "tibotattle-gcs-test-app-20260922",
+      GCS_ERASURE_BUCKET_HISTORY_PROOF: previousBucketHistoryProofJson,
+    },
+  });
+  assert.equal(assessCloudRunReadback({
+    service: unknownPreviousProfile,
+    policy: policyFixture(),
+    expectedImage: image,
+    expectedSourceDigest: sourceDigest,
+    expectedBucketHistoryProof: bucketHistoryProofJson,
+    requireBackingTargets: false,
+    allowKnownPreviousBackingTargets: true,
+  }).blockers.includes("GCP_TEST_BACKING_TARGET_READBACK_UNQUALIFIED"), true);
+
+  assert.equal(assessCloudRunReadback({
+    service: serviceFixture(),
+    policy: policyFixture(),
+    expectedImage: image,
+    expectedSourceDigest: sourceDigest,
+    expectedBucketHistoryProof: bucketHistoryProofJson,
+  }).ok, true);
+  const wrongProof = serviceFixture({
+    environmentOverrides: { GCS_ERASURE_BUCKET_HISTORY_PROOF: previousBucketHistoryProofJson },
+  });
+  assert.equal(assessCloudRunReadback({
+    service: wrongProof,
+    policy: policyFixture(),
+    expectedImage: image,
+    expectedSourceDigest: sourceDigest,
+    expectedBucketHistoryProof: bucketHistoryProofJson,
+  }).blockers.includes("GCP_TEST_BUCKET_HISTORY_PROOF_READBACK_UNQUALIFIED"), true);
+  const duplicateProof = serviceFixture({
+    additionalEnvironment: [
+      { name: "GCS_ERASURE_BUCKET_HISTORY_PROOF", value: bucketHistoryProofJson },
+    ],
+  });
+  assert.equal(assessCloudRunReadback({
+    service: duplicateProof,
+    policy: policyFixture(),
+    expectedImage: image,
+    expectedSourceDigest: sourceDigest,
+    expectedBucketHistoryProof: bucketHistoryProofJson,
+  }).blockers.includes("GCP_TEST_BUCKET_HISTORY_PROOF_READBACK_UNQUALIFIED"), true);
 });
 
 test("Cloud Run host mode needs the explicit cloud-run-iam predicate", () => {
@@ -941,6 +1130,12 @@ test("deploy applies only qualified image and scoped env updates, then rechecks 
     serviceImage: oldImage,
     source: "d".repeat(64),
     postgresTestMode: "health-and-v12-day-manifest",
+    environmentOverrides: {
+      PRIMARY_SCHEMA: "tibotattle",
+      LEDGER_SCHEMA: "tibotattle_ledger",
+      GCS_BUCKET_NAME: "tibotattle-gcs-test-app-20260922",
+      GCS_ERASURE_BUCKET_HISTORY_PROOF: previousBucketHistoryProofJson,
+    },
   });
   initialService.spec.template.spec.containers[0].env.find((entry) => entry.name === "HOST_ORIGIN").value =
     "https://alternate.example.invalid";
@@ -994,7 +1189,7 @@ test("deploy applies only qualified image and scoped env updates, then rechecks 
         throw new Error("Unexpected command in provenance deploy.");
       },
     });
-    assert.equal(result.status, "deployed");
+    assert.equal(result.status, "deployed", JSON.stringify(result));
     assert.deepEqual(result.blockers, []);
     assert.equal(result.postDeployAssessment, true);
     assert.equal(result.routeSmoke, "not_run_application_device_token_required");
@@ -1002,18 +1197,34 @@ test("deploy applies only qualified image and scoped env updates, then rechecks 
     assert.equal(deployArgs.includes("--no-allow-unauthenticated"), true);
     assert.equal(deployArgs.includes("--allow-unauthenticated"), false);
     assert.equal(deployArgs.some((argument) => argument.startsWith("--set-env-vars")), false);
-    assert.equal(deployArgs.some((argument) => argument.startsWith(
-      "--update-env-vars=HOST=0.0.0.0,HOST_ORIGIN="
-      + GCP_PRIVATE_TEST_TARGET.hostOrigin
-      + ",POSTGRES_TEST_HTTP_MODE=cloud-run-iam,PRIMARY_INSTANCE_CONNECTION_NAME="
-      + GCP_PRIVATE_TEST_TARGET.primaryInstanceConnectionName
-      + ",PRIMARY_DATABASE=tibotattle,PRIMARY_SCHEMA=tibotattle,LEDGER_INSTANCE_CONNECTION_NAME="
-      + GCP_PRIVATE_TEST_TARGET.ledgerInstanceConnectionName
-      + ",LEDGER_DATABASE=tibotattle_ledger,LEDGER_SCHEMA=tibotattle_ledger,GCS_BUCKET_NAME="
-      + GCP_PRIVATE_TEST_TARGET.gcsBucketName
-      + ",POSTGRES_IAM_USER=" + GCP_PRIVATE_TEST_TARGET.postgresIamUser
-      + ",SOURCE_CONTENT_DIGEST=" + sourceDigest,
-    )), true);
+    const updateArgument = deployArgs.find((argument) =>
+      argument.startsWith("--update-env-vars="));
+    assert.ok(updateArgument);
+    assert.equal(updateArgument.startsWith("--update-env-vars=^|^"), true);
+    const updates = updateArgument.slice("--update-env-vars=^|^".length)
+      .split("|")
+      .map((entry) => {
+        const separator = entry.indexOf("=");
+        assert.ok(separator > 0);
+        return [entry.slice(0, separator), entry.slice(separator + 1)];
+      });
+    assert.deepEqual(updates, [
+      ["HOST", "0.0.0.0"],
+      ["HOST_ORIGIN", GCP_PRIVATE_TEST_TARGET.hostOrigin],
+      ["POSTGRES_TEST_HTTP_MODE", "cloud-run-iam"],
+      ["PRIMARY_INSTANCE_CONNECTION_NAME", GCP_PRIVATE_TEST_TARGET.primaryInstanceConnectionName],
+      ["PRIMARY_DATABASE", GCP_PRIVATE_TEST_TARGET.primaryDatabase],
+      ["PRIMARY_SCHEMA", "tibotattle_v12_a2_20260925"],
+      ["LEDGER_INSTANCE_CONNECTION_NAME", GCP_PRIVATE_TEST_TARGET.ledgerInstanceConnectionName],
+      ["LEDGER_DATABASE", GCP_PRIVATE_TEST_TARGET.ledgerDatabase],
+      ["LEDGER_SCHEMA", "tibotattle_ledger_v12_a2_20260925"],
+      ["GCS_BUCKET_NAME", "tibotattle-gcs-test-cleanup-20260925-a2"],
+      ["GCS_ERASURE_BUCKET_HISTORY_PROOF", bucketHistoryProofJson],
+      ["POSTGRES_IAM_USER", GCP_PRIVATE_TEST_TARGET.postgresIamUser],
+      ["SOURCE_CONTENT_DIGEST", sourceDigest],
+    ]);
+    assert.equal(updates.some(([name]) => name === "ADMIN_IDENTITY_LINK_KEY"), false);
+    assert.equal(deployArgs.includes("--image=" + image), true);
     assert.equal(deployArgs.includes("--service-account=" + GCP_PRIVATE_TEST_TARGET.runtimeServiceAccount), true);
     assert.deepEqual(trafficArgs, [
       "run", "services", "update-traffic", GCP_PRIVATE_TEST_TARGET.service,
@@ -1033,6 +1244,72 @@ test("deploy applies only qualified image and scoped env updates, then rechecks 
     assert.equal(postDeployReadbackIndex > trafficCallIndex, true);
     assert.equal(calls.filter(({ args }) => args[0] === "run"
       && args[1] === "services" && args[2] === "get-iam-policy").length, 2);
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("deploy reports only a sanitized gcloud failure when the history proof was supplied", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "cloud-run-proof-deploy-failure-"));
+  const archivePath = join(scratch, "source.tar.gz");
+  const bytes = Buffer.from("synthetic archive for proof deployment failure");
+  const sha = createHash("sha256").update(bytes).digest("hex");
+  const qualified = qualifiedConfig({
+    sourceArchivePath: archivePath,
+    sourceArchiveSha256: sha,
+    sourceObject: GCP_PRIVATE_TEST_BUILD.sourceObjectPrefix + sourceDigest + "-" + sha + ".tar.gz",
+  });
+  const build = buildFixture({}, qualified);
+  const previousService = serviceFixture({
+    serviceImage: GCP_PRIVATE_TEST_TARGET.imageRepository + "@sha256:" + "d".repeat(64),
+    source: "d".repeat(64),
+    environmentOverrides: {
+      PRIMARY_SCHEMA: "tibotattle",
+      LEDGER_SCHEMA: "tibotattle_ledger",
+      GCS_BUCKET_NAME: "tibotattle-gcs-test-app-20260922",
+      GCS_ERASURE_BUCKET_HISTORY_PROOF: previousBucketHistoryProofJson,
+    },
+  });
+  try {
+    await writeFile(archivePath, bytes, { flag: "wx", mode: 0o600 });
+    await assert.rejects(runGcpPrivateTestDeployment({
+      config: qualified,
+      archiveBuilder: async () => ({
+        sourceContentDigest: sourceDigest,
+        sourceArchiveSha256: sha,
+        cloudBuildConfigSha256: GCP_PRIVATE_TEST_BUILD.cloudBuildConfigSha256,
+      }),
+      isPrivateHost: () => true,
+      fetchImpl: async () => new Response(null, { status: 403 }),
+      spawn: (command, args) => {
+        if (command === process.execPath && args.at(-1) === "--check") {
+          return { status: 0, stdout: JSON.stringify({
+            status: "ok", mode: "check", sourceContentDigest: sourceDigest,
+          }), stderr: "" };
+        }
+        if (args[0] === "builds" && args[1] === "describe") {
+          return { status: 0, stdout: JSON.stringify(build), stderr: "" };
+        }
+        if (args[0] === "run" && args[1] === "services" && args[2] === "describe") {
+          return { status: 0, stdout: JSON.stringify(previousService), stderr: "" };
+        }
+        if (args[0] === "run" && args[1] === "services" && args[2] === "get-iam-policy") {
+          return { status: 0, stdout: JSON.stringify(policyFixture()), stderr: "" };
+        }
+        if (args[0] === "run" && args[1] === "deploy") {
+          return {
+            status: 1,
+            stdout: "",
+            stderr: "synthetic rejection included " + bucketHistoryProofJson,
+          };
+        }
+        throw new Error("Unexpected command in sanitized deployment failure check.");
+      },
+    }), (error) => {
+      assert.equal(error?.code, "GCP_PRIVATE_TEST_GCLOUD_OPERATION_FAILED");
+      assert.equal(error.message.includes(bucketHistoryProofJson), false);
+      return true;
+    });
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }

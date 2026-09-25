@@ -13,6 +13,7 @@ import {
   TEST_MIGRATIONS_JOB,
   TEST_MIGRATIONS_PROJECT,
   TEST_MIGRATIONS_ROOT,
+  TEST_MIGRATIONS_RUNTIME_IAM_USER,
   TEST_MIGRATIONS_SERVICE_ACCOUNT,
   TEST_MIGRATIONS_TARGETS,
 } from "./test-migrations.mjs";
@@ -45,11 +46,23 @@ function expectCode(fn, code) {
 function makeHarness(manifest, {
   wrongPrimaryOwner = false,
   corruptPrimaryReceipt = false,
+  corruptPrimaryPrivileges = false,
 } = {}) {
   const state = Object.fromEntries(Object.keys(TEST_MIGRATIONS_TARGETS).map((role) => [role, {
     schemaExists: wrongPrimaryOwner && role === "primary",
     owner: wrongPrimaryOwner && role === "primary" ? "different-owner" : null,
     receipts: [],
+    runtimePrivileges: {
+      schemaUsage: false,
+      schemaCreate: false,
+      applicationTablesDml: false,
+      sequencesAccess: false,
+      historySelect: false,
+      historyWrite: false,
+      defaultTablesDml: false,
+      defaultSequencesAccess: false,
+      telemetryFunctionExecute: false,
+    },
   }]));
   const events = [];
   const pools = {};
@@ -90,6 +103,92 @@ function makeHarness(manifest, {
                   || sql === "COMMIT" || sql === "ROLLBACK"
                   || sql.startsWith("SET LOCAL")) {
                 return { rows: [], rowCount: 0 };
+              }
+              const privileges = state[role].runtimePrivileges;
+              if (sql.startsWith("REVOKE ALL ON SCHEMA ")) {
+                privileges.schemaUsage = false;
+                privileges.schemaCreate = false;
+                return { rows: [], rowCount: 0 };
+              }
+              if (sql.startsWith("GRANT USAGE ON SCHEMA ")) {
+                privileges.schemaUsage = true;
+                return { rows: [], rowCount: 0 };
+              }
+              if (sql.startsWith("REVOKE ALL PRIVILEGES ON ALL TABLES ")) {
+                privileges.applicationTablesDml = false;
+                privileges.historySelect = false;
+                privileges.historyWrite = false;
+                return { rows: [], rowCount: 0 };
+              }
+              if (sql.startsWith("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES ")) {
+                privileges.applicationTablesDml = true;
+                privileges.historySelect = true;
+                privileges.historyWrite = true;
+                return { rows: [], rowCount: 0 };
+              }
+              if (sql.startsWith("REVOKE ALL PRIVILEGES ON ALL SEQUENCES ")) {
+                privileges.sequencesAccess = false;
+                return { rows: [], rowCount: 0 };
+              }
+              if (sql.startsWith("GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES ")) {
+                privileges.sequencesAccess = true;
+                return { rows: [], rowCount: 0 };
+              }
+              if (sql.startsWith("REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER")) {
+                privileges.historyWrite = false;
+                return { rows: [], rowCount: 0 };
+              }
+              if (sql.startsWith("ALTER DEFAULT PRIVILEGES IN SCHEMA ")
+                  && sql.includes("REVOKE ALL ON TABLES")) {
+                privileges.defaultTablesDml = false;
+                return { rows: [], rowCount: 0 };
+              }
+              if (sql.startsWith("ALTER DEFAULT PRIVILEGES IN SCHEMA ")
+                  && sql.includes("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES")) {
+                privileges.defaultTablesDml = true;
+                return { rows: [], rowCount: 0 };
+              }
+              if (sql.startsWith("ALTER DEFAULT PRIVILEGES IN SCHEMA ")
+                  && sql.includes("REVOKE ALL ON SEQUENCES")) {
+                privileges.defaultSequencesAccess = false;
+                return { rows: [], rowCount: 0 };
+              }
+              if (sql.startsWith("ALTER DEFAULT PRIVILEGES IN SCHEMA ")
+                  && sql.includes("GRANT USAGE, SELECT, UPDATE ON SEQUENCES")) {
+                privileges.defaultSequencesAccess = true;
+                return { rows: [], rowCount: 0 };
+              }
+              if (sql.startsWith("REVOKE ALL ON FUNCTION ")) {
+                privileges.telemetryFunctionExecute = false;
+                return { rows: [], rowCount: 0 };
+              }
+              if (sql.startsWith("GRANT EXECUTE ON FUNCTION ")) {
+                privileges.telemetryFunctionExecute = true;
+                return { rows: [], rowCount: 0 };
+              }
+              if (sql.includes("has_schema_privilege($1, $2, 'USAGE')")) {
+                const actual = { ...privileges };
+                if (corruptPrimaryPrivileges && role === "primary") actual.schemaUsage = false;
+                return {
+                  rows: [{
+                    schema_usage: actual.schemaUsage,
+                    schema_create: actual.schemaCreate,
+                    application_tables_dml: actual.applicationTablesDml,
+                    sequences_access: actual.sequencesAccess,
+                    history_select: actual.historySelect,
+                    history_insert: actual.historyWrite,
+                    history_update: actual.historyWrite,
+                    history_delete: actual.historyWrite,
+                    default_tables_dml: actual.defaultTablesDml,
+                    default_sequences_access: actual.defaultSequencesAccess,
+                    no_global_table_defaults: true,
+                    no_global_sequence_defaults: true,
+                    telemetry_function_execute: role === "primary"
+                      ? actual.telemetryFunctionExecute
+                      : true,
+                  }],
+                  rowCount: 1,
+                };
               }
               if (sql.includes("FROM pg_namespace")) {
                 return state[role].schemaExists
@@ -164,6 +263,11 @@ test("configuration is pinned to the one-task tibotattle migration Job and exact
   assert.equal(config.project, TEST_MIGRATIONS_PROJECT);
   assert.equal(manifest.roles.primary.length, 36);
   assert.equal(manifest.roles.ledger.length, 6);
+  assert.equal(TEST_MIGRATIONS_TARGETS.primary.schema, "tibotattle_v12_a2_20260925");
+  assert.equal(TEST_MIGRATIONS_TARGETS.ledger.schema, "tibotattle_ledger_v12_a2_20260925");
+  assert.notEqual(TEST_MIGRATIONS_TARGETS.primary.schema, "tibotattle");
+  assert.notEqual(TEST_MIGRATIONS_TARGETS.ledger.schema, "tibotattle_ledger");
+  assert.equal(TEST_MIGRATIONS_RUNTIME_IAM_USER, "tibotattle-test-runtime@tibotattle.iam");
 });
 
 test("configuration rejects wrong job, task shape, project, IAM identity, instance, database, and schema", () => {
@@ -245,7 +349,46 @@ test("primary and ledger migrations are checksum-read back and repeated runs are
   assert.equal(harness.applyCalls, 4);
   assert.equal(harness.cleanupCalls, 2);
   assert.equal(harness.events.filter(({ sql }) => sql?.startsWith("CREATE SCHEMA")).length, 2);
-  assert.equal(harness.events.filter(({ sql }) => sql?.includes("_tibotattle_migration_history")).length, 4);
+  assert.equal(harness.events.filter(({ sql }) => sql?.startsWith("SELECT version, name, checksum_sha256")
+    && sql.includes("_tibotattle_migration_history")).length, 4);
+  const privilegeSql = harness.events
+    .filter(({ sql }) => sql?.startsWith("GRANT ") || sql?.startsWith("REVOKE ")
+      || sql?.startsWith("ALTER DEFAULT PRIVILEGES "))
+    .map(({ sql }) => sql);
+  for (const role of ["primary", "ledger"]) {
+    const schema = `"${TEST_MIGRATIONS_TARGETS[role].schema}"`;
+    assert.equal(privilegeSql.some((sql) => sql.includes(`SCHEMA ${schema}`)), true);
+    assert.equal(privilegeSql.some((sql) => sql.includes(`IN SCHEMA ${schema}`)), true);
+    assert.equal(privilegeSql.some((sql) => sql.includes("GRANT USAGE ON SCHEMA " + schema
+      + ` TO "${TEST_MIGRATIONS_RUNTIME_IAM_USER}"`)), true);
+    assert.equal(privilegeSql.some((sql) => sql.includes(
+      `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ${schema}`,
+    )), true);
+    assert.equal(privilegeSql.some((sql) => sql.includes(
+      `GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA ${schema}`,
+    )), true);
+    assert.equal(privilegeSql.some((sql) => sql.includes(
+      `REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER\n         ON ${schema}."_tibotattle_migration_history"`,
+    )), true);
+  }
+  assert.equal(privilegeSql.some((sql) => sql.startsWith("GRANT EXECUTE ON FUNCTION ")),
+    true, "primary runtime must execute the intentionally non-public v1 admission function");
+  assert.equal(privilegeSql.filter((sql) => sql.startsWith("GRANT EXECUTE ON FUNCTION ")).length, 2);
+  assert.equal(harness.events.filter(({ sql }) => sql?.includes("has_schema_privilege($1, $2, 'USAGE')")).length, 4);
+  assert.equal(privilegeSql.some((sql) => sql.includes('"tibotattle"')),
+    false, "only the exact A2 schemas may receive grants");
+});
+
+test("runtime privilege readback fails closed when any required schema permission is missing", async () => {
+  const harness = makeHarness(manifest, { corruptPrimaryPrivileges: true });
+  await assert.rejects(
+    runTestMigrations({ env: validEnv(), dependencies: harness.dependencies }),
+    (error) => error?.code === "POSTGRES_TEST_MIGRATIONS_PRIMARY_RUNTIME_PRIVILEGES_INVALID",
+  );
+  assert.equal(harness.applyCalls, 1);
+  assert.equal(harness.cleanupCalls, 1);
+  assert.equal(harness.events.some(({ sql }) => sql?.includes('"tibotattle"')),
+    false, "a privilege readback failure must not touch retired schemas");
 });
 
 test("a pre-existing schema with unexpected owner refuses before applying migrations", async () => {

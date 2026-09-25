@@ -18,18 +18,19 @@ export const TEST_MIGRATIONS_PROJECT = "tibotattle";
 export const TEST_MIGRATIONS_SERVICE_ACCOUNT =
   "tibotattle-test-migrator@tibotattle.iam.gserviceaccount.com";
 export const TEST_MIGRATIONS_IAM_USER = "tibotattle-test-migrator@tibotattle.iam";
+export const TEST_MIGRATIONS_RUNTIME_IAM_USER = "tibotattle-test-runtime@tibotattle.iam";
 export const TEST_MIGRATIONS_ROOT = "/app/apps/worker/postgres/migrations";
 export const TEST_MIGRATIONS_TARGETS = Object.freeze({
   primary: Object.freeze({
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
-    schema: "tibotattle",
+    schema: "tibotattle_v12_a2_20260925",
     expectedMigrations: 36,
   }),
   ledger: Object.freeze({
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-ledger-20260922",
     database: "tibotattle_ledger",
-    schema: "tibotattle_ledger",
+    schema: "tibotattle_ledger_v12_a2_20260925",
     expectedMigrations: 6,
   }),
 });
@@ -137,6 +138,13 @@ function quoteSchema(schema) {
   return `"${schema}"`;
 }
 
+function quoteRole(role) {
+  if (typeof role !== "string" || role !== TEST_MIGRATIONS_RUNTIME_IAM_USER) {
+    fail("POSTGRES_TEST_MIGRATIONS_RUNTIME_ROLE_INVALID");
+  }
+  return `"${role.replaceAll('"', '""')}"`;
+}
+
 function rowsFrom(result, code) {
   if (result === null || typeof result !== "object"
       || !Array.isArray(result.rows)
@@ -197,6 +205,181 @@ async function ensureSchema(pool, role, target) {
         await client.release(discard || transactionOpen);
       } catch {
         fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_SCHEMA_RELEASE_FAILED`);
+      }
+    }
+  }
+}
+
+async function grantAndVerifyRuntimePrivileges(pool, role, target) {
+  const schema = quoteSchema(target.schema);
+  const runtimeRole = quoteRole(TEST_MIGRATIONS_RUNTIME_IAM_USER);
+  const historyTable = `"${HISTORY_TABLE}"`;
+  const tableRelation = `${target.schema}.${HISTORY_TABLE}`;
+  const functionRelation = `${target.schema}.insert_telemetry_v1_contribution(jsonb)`;
+  let client;
+  let transactionOpen = false;
+  let discard = false;
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    transactionOpen = true;
+    await client.query("SET LOCAL statement_timeout='30000ms'");
+    await client.query("SET LOCAL lock_timeout='5000ms'");
+
+    // The A2 schemas are isolated to this test environment. Reset only direct
+    // grants on these exact schemas, then grant the runtime role only the
+    // privileges exercised by the application. Migration history remains
+    // read-only to runtime.
+    await client.query(`REVOKE ALL ON SCHEMA ${schema} FROM ${runtimeRole}`);
+    await client.query(`GRANT USAGE ON SCHEMA ${schema} TO ${runtimeRole}`);
+    await client.query(`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA ${schema} FROM ${runtimeRole}`);
+    await client.query(
+      `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ${schema} TO ${runtimeRole}`,
+    );
+    await client.query(`REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${schema} FROM ${runtimeRole}`);
+    await client.query(
+      `GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA ${schema} TO ${runtimeRole}`,
+    );
+    await client.query(
+      `REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
+         ON ${schema}.${historyTable} FROM ${runtimeRole}`,
+    );
+    await client.query(
+      `ALTER DEFAULT PRIVILEGES IN SCHEMA ${schema}
+         REVOKE ALL ON TABLES FROM ${runtimeRole}`,
+    );
+    await client.query(
+      `ALTER DEFAULT PRIVILEGES IN SCHEMA ${schema}
+         GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ${runtimeRole}`,
+    );
+    await client.query(
+      `ALTER DEFAULT PRIVILEGES IN SCHEMA ${schema}
+         REVOKE ALL ON SEQUENCES FROM ${runtimeRole}`,
+    );
+    await client.query(
+      `ALTER DEFAULT PRIVILEGES IN SCHEMA ${schema}
+         GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${runtimeRole}`,
+    );
+    if (role === "primary") {
+      await client.query(
+        `REVOKE ALL ON FUNCTION ${schema}."insert_telemetry_v1_contribution"(jsonb) FROM ${runtimeRole}`,
+      );
+      await client.query(
+        `GRANT EXECUTE ON FUNCTION ${schema}."insert_telemetry_v1_contribution"(jsonb) TO ${runtimeRole}`,
+      );
+    }
+
+    const rows = rowsFrom(await client.query(
+      `SELECT
+         has_schema_privilege($1, $2, 'USAGE') AS schema_usage,
+         has_schema_privilege($1, $2, 'CREATE') AS schema_create,
+         (SELECT count(*) > 0 AND COALESCE(bool_and(
+             has_table_privilege($1, rel.oid, 'SELECT')
+             AND has_table_privilege($1, rel.oid, 'INSERT')
+             AND has_table_privilege($1, rel.oid, 'UPDATE')
+             AND has_table_privilege($1, rel.oid, 'DELETE')
+           ), false)
+            FROM pg_class rel
+            JOIN pg_namespace ns ON ns.oid = rel.relnamespace
+           WHERE ns.nspname = $2 AND rel.relkind IN ('r', 'p', 'v', 'm', 'f')
+             AND rel.relname <> $6) AS application_tables_dml,
+         (SELECT COALESCE(bool_and(
+             has_sequence_privilege($1, rel.oid, 'USAGE')
+             AND has_sequence_privilege($1, rel.oid, 'SELECT')
+             AND has_sequence_privilege($1, rel.oid, 'UPDATE')
+           ), true)
+            FROM pg_class rel
+            JOIN pg_namespace ns ON ns.oid = rel.relnamespace
+           WHERE ns.nspname = $2 AND rel.relkind = 'S') AS sequences_access,
+         has_table_privilege($1, $3, 'SELECT') AS history_select,
+         has_table_privilege($1, $3, 'INSERT') AS history_insert,
+         has_table_privilege($1, $3, 'UPDATE') AS history_update,
+         has_table_privilege($1, $3, 'DELETE') AS history_delete,
+         (SELECT count(*) = 4
+                 AND array_agg(acl.privilege_type ORDER BY acl.privilege_type)
+                   = ARRAY['DELETE', 'INSERT', 'SELECT', 'UPDATE']::text[]
+                 AND bool_and(NOT acl.is_grantable)
+            FROM pg_default_acl defaults
+            CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl
+           WHERE defaults.defaclobjtype = 'r'
+             AND defaults.defaclnamespace = to_regnamespace($2)
+             AND pg_get_userbyid(defaults.defaclrole) = current_user
+             AND pg_get_userbyid(acl.grantee) = $1) AS default_tables_dml,
+         (SELECT count(*) = 3
+                 AND array_agg(acl.privilege_type ORDER BY acl.privilege_type)
+                   = ARRAY['SELECT', 'UPDATE', 'USAGE']::text[]
+                 AND bool_and(NOT acl.is_grantable)
+            FROM pg_default_acl defaults
+            CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl
+           WHERE defaults.defaclobjtype = 'S'
+             AND defaults.defaclnamespace = to_regnamespace($2)
+             AND pg_get_userbyid(defaults.defaclrole) = current_user
+             AND pg_get_userbyid(acl.grantee) = $1) AS default_sequences_access,
+         (SELECT count(*) = 0
+            FROM pg_default_acl defaults
+            CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl
+           WHERE defaults.defaclobjtype = 'r'
+             AND defaults.defaclnamespace = 0
+             AND pg_get_userbyid(defaults.defaclrole) = current_user
+             AND pg_get_userbyid(acl.grantee) = $1) AS no_global_table_defaults,
+         (SELECT count(*) = 0
+            FROM pg_default_acl defaults
+            CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl
+           WHERE defaults.defaclobjtype = 'S'
+             AND defaults.defaclnamespace = 0
+             AND pg_get_userbyid(defaults.defaclrole) = current_user
+             AND pg_get_userbyid(acl.grantee) = $1) AS no_global_sequence_defaults,
+         CASE WHEN $4
+           THEN has_function_privilege($1, $5, 'EXECUTE')
+           ELSE true
+         END AS telemetry_function_execute`,
+      [
+        TEST_MIGRATIONS_RUNTIME_IAM_USER,
+        target.schema,
+        tableRelation,
+        role === "primary",
+        functionRelation,
+        HISTORY_TABLE,
+      ],
+    ), `POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RUNTIME_PRIVILEGES_READ_FAILED`);
+    const actual = rows[0];
+    if (rows.length !== 1
+        || actual?.schema_usage !== true
+        || actual?.schema_create !== false
+        || actual?.application_tables_dml !== true
+        || actual?.sequences_access !== true
+        || actual?.history_select !== true
+        || actual?.history_insert !== false
+        || actual?.history_update !== false
+        || actual?.history_delete !== false
+        || actual?.default_tables_dml !== true
+        || actual?.default_sequences_access !== true
+        || actual?.no_global_table_defaults !== true
+        || actual?.no_global_sequence_defaults !== true
+        || actual?.telemetry_function_execute !== true) {
+      fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RUNTIME_PRIVILEGES_INVALID`);
+    }
+    await client.query("COMMIT");
+    transactionOpen = false;
+  } catch (error) {
+    discard = true;
+    if (transactionOpen) {
+      try {
+        await client.query("ROLLBACK");
+        transactionOpen = false;
+      } catch {
+        fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RUNTIME_PRIVILEGES_ROLLBACK_FAILED`);
+      }
+    }
+    if (typeof error?.code === "string"
+        && /^POSTGRES_TEST_MIGRATIONS_[A-Z0-9_]+$/u.test(error.code)) throw error;
+    fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RUNTIME_GRANT_FAILED`);
+  } finally {
+    if (client !== undefined) {
+      try {
+        await client.release(discard || transactionOpen);
+      } catch {
+        fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RUNTIME_PRIVILEGES_RELEASE_FAILED`);
       }
     }
   }
@@ -421,6 +604,7 @@ async function runConfiguredTestMigrations({ env, dependencies }) {
       }
       validateApplyResult(applied, role, target, expected);
       await readBackReceipts(pools[role], role, target, expected);
+      await grantAndVerifyRuntimePrivileges(pools[role], role, target);
     }
     result = Object.freeze({
       status: "ok",

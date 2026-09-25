@@ -13,9 +13,14 @@ import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createCloudRunBuildArchive } from "./cloud-run-build-archive.mjs";
+import {
+  buildGcpTestBucketCreateRequest,
+  GCP_TEST_BUCKET_HISTORY_RECEIPT_SCHEMA,
+  GCP_TEST_BUCKET_HISTORY_TARGET,
+} from "./gcp-test-bucket-history.mjs";
 
 export const GCP_PRIVATE_TEST_TARGET = Object.freeze({
   project: "tibotattle",
@@ -26,12 +31,12 @@ export const GCP_PRIVATE_TEST_TARGET = Object.freeze({
   runtimeServiceAccount: "tibotattle-test-runtime@tibotattle.iam.gserviceaccount.com",
   primaryInstanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
   primaryDatabase: "tibotattle",
-  primarySchema: "tibotattle",
+  primarySchema: "tibotattle_v12_a2_20260925",
   ledgerInstanceConnectionName: "tibotattle:us-east1:tibotattle-test-ledger-20260922",
   ledgerDatabase: "tibotattle_ledger",
-  ledgerSchema: "tibotattle_ledger",
+  ledgerSchema: "tibotattle_ledger_v12_a2_20260925",
   postgresIamUser: "tibotattle-test-runtime@tibotattle.iam",
-  gcsBucketName: "tibotattle-gcs-test-app-20260922",
+  gcsBucketName: "tibotattle-gcs-test-cleanup-20260925-a2",
   buildBucket: "tibotattle-gcs-test-build-20260922",
   imageRepository:
     "us-east1-docker.pkg.dev/tibotattle/tibotattle-test/tibotattle-host",
@@ -54,6 +59,7 @@ const BUILD_CONTEXT_CHECK = resolve(WORKER_ROOT, "scripts/cloud-run-build-contex
 const DIGEST = /^[a-f0-9]{64}$/u;
 const BUILD_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u;
 const MAX_SOURCE_ARCHIVE_BYTES = 64 * 1024 * 1024;
+const MAX_BUCKET_HISTORY_RECEIPT_BYTES = 64 * 1024;
 const GENERATION = /^[1-9]\d{0,19}$/u;
 const CLOUD_BUILD_HASH_TYPES = new Set([
   "SHA256", "MD5", "SHA512", "GO_MODULE_H1", "DIRSUM_SHA256",
@@ -67,7 +73,7 @@ function fail(code) {
   throw Object.assign(new Error(code), { code });
 }
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const command = argv[0] ?? "preflight";
   if (!["preflight", "verify", "deploy"].includes(command)) {
     fail("GCP_PRIVATE_TEST_COMMAND_INVALID");
@@ -75,7 +81,7 @@ function parseArgs(argv) {
   const allowed = new Set(["--project", "--region", "--service", "--image",
     "--source-digest", "--build-id", "--source-archive",
     "--source-archive-sha256", "--source-bucket", "--source-object",
-    "--source-generation"]);
+    "--source-generation", "--bucket-history-receipt"]);
   const values = new Map();
   for (const argument of argv.slice(1)) {
     const separator = argument.indexOf("=");
@@ -102,6 +108,7 @@ function parseArgs(argv) {
     sourceBucket: values.get("--source-bucket") ?? "",
     sourceObject: values.get("--source-object") ?? "",
     sourceGeneration: values.get("--source-generation") ?? "",
+    bucketHistoryReceiptPath: values.get("--bucket-history-receipt") ?? "",
   };
   validateConfig(config);
   return Object.freeze(config);
@@ -114,10 +121,20 @@ export function validateConfig(config) {
   const sourceBucket = config?.sourceBucket ?? "";
   const sourceObject = config?.sourceObject ?? "";
   const sourceGeneration = config?.sourceGeneration ?? "";
+  const bucketHistoryReceiptPath = config?.bucketHistoryReceiptPath ?? "";
   if (config?.project !== GCP_PRIVATE_TEST_TARGET.project
       || config?.region !== GCP_PRIVATE_TEST_TARGET.region
       || config?.service !== GCP_PRIVATE_TEST_TARGET.service) {
     fail("GCP_PRIVATE_TEST_TARGET_FIXED");
+  }
+  if (config.command !== "preflight"
+      && (typeof bucketHistoryReceiptPath !== "string"
+        || !isAbsolute(bucketHistoryReceiptPath))) {
+    fail("GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_REQUIRED");
+  }
+  if (bucketHistoryReceiptPath !== ""
+      && (typeof bucketHistoryReceiptPath !== "string" || !isAbsolute(bucketHistoryReceiptPath))) {
+    fail("GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_PATH_INVALID");
   }
   if (typeof config.image !== "string" || !IMAGE_REFERENCE.test(config.image)) {
     fail("GCP_PRIVATE_TEST_IMAGE_DIGEST_REQUIRED");
@@ -280,6 +297,12 @@ const GCP_PRIVATE_TEST_BACKING_ENVIRONMENT = Object.freeze({
   LEDGER_SCHEMA: GCP_PRIVATE_TEST_TARGET.ledgerSchema,
   GCS_BUCKET_NAME: GCP_PRIVATE_TEST_TARGET.gcsBucketName,
 });
+const GCP_PRIVATE_TEST_PREVIOUS_BACKING_ENVIRONMENT = Object.freeze({
+  ...GCP_PRIVATE_TEST_BACKING_ENVIRONMENT,
+  PRIMARY_SCHEMA: "tibotattle",
+  LEDGER_SCHEMA: "tibotattle_ledger",
+  GCS_BUCKET_NAME: "tibotattle-gcs-test-app-20260922",
+});
 
 const ALTERNATE_DATABASE_CREDENTIAL_ENVIRONMENT_NAME = /^(?:(?:DATABASE|DB|PRIMARY|LEDGER|POSTGRES|PG)(?:_.*)?_(?:URL|URI|PASSWORD|PASS|PASSFILE|CREDENTIALS?|CONNECTION_STRING|USER)|DATABASE_URL|DB_URL|PGPASSWORD|PGUSER|PGPASSFILE|PGSERVICE|PGSERVICEFILE|GOOGLE_APPLICATION_CREDENTIALS|CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE)$/u;
 
@@ -287,6 +310,51 @@ function backingTargetsReadbackReady(service) {
   return Object.entries(GCP_PRIVATE_TEST_BACKING_ENVIRONMENT).every(([name, value]) =>
     exactServiceEnvironmentValue(service, name, value),
   );
+}
+
+function backingTargetsMatch(service, expected) {
+  return Object.entries(expected).every(([name, value]) =>
+    exactServiceEnvironmentValue(service, name, value),
+  );
+}
+
+function previousBucketHistoryProofReadbackReady(service) {
+  const entries = serviceEnvironmentEntries(service)
+    .filter((entry) => entry?.name === "GCS_ERASURE_BUCKET_HISTORY_PROOF");
+  if (entries.length !== 1 || typeof entries[0]?.value !== "string") return false;
+  let parsed;
+  try { parsed = JSON.parse(entries[0].value); } catch { return false; }
+  const proof = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      && parsed.proof !== undefined ? parsed.proof : parsed;
+  if (!exactKeys(proof, [
+    "bucket", "bucketGeneration", "bucketMetageneration", "softDeleteRetentionDurationSeconds",
+  ])
+      || proof.bucket !== GCP_PRIVATE_TEST_PREVIOUS_BACKING_ENVIRONMENT.GCS_BUCKET_NAME
+      || !validBucketGeneration(proof.bucketGeneration)
+      || !validBucketGeneration(proof.bucketMetageneration)
+      || proof.softDeleteRetentionDurationSeconds !== "0") {
+    return false;
+  }
+  if (parsed.proof !== undefined) {
+    return parsed.schemaVersion === GCP_TEST_BUCKET_HISTORY_RECEIPT_SCHEMA
+      && parsed.source === "storage.buckets.insert"
+      && parsed.project === GCP_PRIVATE_TEST_TARGET.project
+      && parsed.projectNumber === GCP_TEST_BUCKET_HISTORY_TARGET.projectNumber;
+  }
+  return true;
+}
+
+function knownDeploymentSourceBackingReadbackReady(service, expectedBucketHistoryProof) {
+  if (backingTargetsMatch(service, GCP_PRIVATE_TEST_BACKING_ENVIRONMENT)) {
+    return expectedBucketHistoryProof !== undefined
+      && exactServiceEnvironmentValue(
+        service,
+        "GCS_ERASURE_BUCKET_HISTORY_PROOF",
+        expectedBucketHistoryProof,
+      );
+  }
+  return backingTargetsMatch(service, GCP_PRIVATE_TEST_PREVIOUS_BACKING_ENVIRONMENT)
+    && previousBucketHistoryProofReadbackReady(service);
 }
 
 function credentialScopeReadbackReady(service) {
@@ -657,10 +725,13 @@ export function assessCloudRunReadback({
   policy,
   expectedImage,
   expectedSourceDigest,
+  expectedBucketHistoryProof,
   requireExactImage = true,
   requireSourceDigest = true,
   requireLatestReadyTraffic = requireExactImage,
   requireCloudRunHostMode = false,
+  requireBackingTargets = true,
+  allowKnownPreviousBackingTargets = false,
 } = {}) {
   const blockers = [];
   if (!service || !policy) return Object.freeze({
@@ -684,8 +755,22 @@ export function assessCloudRunReadback({
       && serviceEnvironment(service).get("SOURCE_CONTENT_DIGEST") !== expectedSourceDigest) {
     blockers.push("GCP_TEST_SOURCE_DIGEST_READBACK_MISMATCH");
   }
-  if (!backingTargetsReadbackReady(service)) {
+  if (requireBackingTargets && !backingTargetsReadbackReady(service)) {
     blockers.push("GCP_TEST_BACKING_TARGET_READBACK_UNQUALIFIED");
+  }
+  if (allowKnownPreviousBackingTargets
+      && !knownDeploymentSourceBackingReadbackReady(service, expectedBucketHistoryProof)) {
+    blockers.push("GCP_TEST_BACKING_TARGET_READBACK_UNQUALIFIED");
+  }
+  if (expectedBucketHistoryProof !== undefined
+      && !(allowKnownPreviousBackingTargets
+        && backingTargetsMatch(service, GCP_PRIVATE_TEST_PREVIOUS_BACKING_ENVIRONMENT))
+      && !exactServiceEnvironmentValue(
+        service,
+        "GCS_ERASURE_BUCKET_HISTORY_PROOF",
+        expectedBucketHistoryProof,
+      )) {
+    blockers.push("GCP_TEST_BUCKET_HISTORY_PROOF_READBACK_UNQUALIFIED");
   }
   if (!credentialScopeReadbackReady(service)) {
     blockers.push("GCP_TEST_CREDENTIAL_SCOPE_READBACK_UNQUALIFIED");
@@ -732,6 +817,152 @@ function parseJson(text, code) {
   } catch {
     fail(code);
   }
+}
+
+function exactKeys(value, expectedKeys) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value).sort();
+  const expected = [...expectedKeys].sort();
+  return keys.length === expected.length
+    && keys.every((key, index) => key === expected[index]);
+}
+
+function validBucketGeneration(value) {
+  if (typeof value !== "string" || !GENERATION.test(value)) return false;
+  try { return BigInt(value) <= 9_223_372_036_854_775_807n; } catch { return false; }
+}
+
+function validateBucketHistoryReceipt(receipt) {
+  const target = GCP_PRIVATE_TEST_TARGET;
+  const responseFields = [
+    "bucket", "projectNumber", "bucketGeneration", "bucketMetageneration", "location",
+    "timeCreated", "softDeleteRetentionDurationSeconds", "iamConfiguration", "versioningEnabled",
+  ];
+  const proofFields = [
+    "bucket", "bucketGeneration", "bucketMetageneration", "softDeleteRetentionDurationSeconds",
+  ];
+  if (!exactKeys(receipt, [
+    "schemaVersion", "source", "project", "projectNumber", "creationRequestSha256",
+    "creationResponse", "creationResponseSha256", "proof",
+  ])
+      || receipt.schemaVersion !== GCP_TEST_BUCKET_HISTORY_RECEIPT_SCHEMA
+      || receipt.source !== "storage.buckets.insert"
+      || receipt.project !== target.project
+      || receipt.projectNumber !== GCP_TEST_BUCKET_HISTORY_TARGET.projectNumber
+      || !DIGEST.test(receipt.creationRequestSha256 ?? "")
+      || !DIGEST.test(receipt.creationResponseSha256 ?? "")
+      || receipt.creationRequestSha256 !== createHash("sha256")
+        .update(JSON.stringify(buildGcpTestBucketCreateRequest(target.gcsBucketName))).digest("hex")
+      || !exactKeys(receipt.creationResponse, responseFields)
+      || !exactKeys(receipt.proof, proofFields)) {
+    fail("GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_INVALID");
+  }
+
+  const response = receipt.creationResponse;
+  const proof = receipt.proof;
+  if (response.bucket !== target.gcsBucketName
+      || response.projectNumber !== target.projectNumber
+      || !validBucketGeneration(response.bucketGeneration)
+      || response.bucketMetageneration !== "1"
+      || response.location !== GCP_TEST_BUCKET_HISTORY_TARGET.location
+      || response.softDeleteRetentionDurationSeconds !== "0"
+      || response.iamConfiguration === null || typeof response.iamConfiguration !== "object"
+      || Array.isArray(response.iamConfiguration)
+      || !exactRecord(response.iamConfiguration, {
+        uniformBucketLevelAccess: true,
+        publicAccessPrevention: "enforced",
+      })
+      || response.versioningEnabled !== false
+      || typeof response.timeCreated !== "string"
+      || !Number.isFinite(Date.parse(response.timeCreated))
+      || receipt.creationResponseSha256 !== createHash("sha256")
+        .update(JSON.stringify(response)).digest("hex")
+      || proof.bucket !== response.bucket
+      || proof.bucketGeneration !== response.bucketGeneration
+      || proof.bucketMetageneration !== response.bucketMetageneration
+      || proof.softDeleteRetentionDurationSeconds !== response.softDeleteRetentionDurationSeconds) {
+    fail("GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_INVALID");
+  }
+  return JSON.stringify(proof);
+}
+
+async function readExactFileBytes(handle, size) {
+  const bytes = Buffer.alloc(size + 1);
+  let offset = 0;
+  while (offset < bytes.length) {
+    const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+    if (bytesRead === 0) break;
+    offset += bytesRead;
+  }
+  if (offset !== size) fail("GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_UNSAFE");
+  return bytes.subarray(0, size);
+}
+
+/** Read and validate the owner-only bucket birth receipt without exposing its contents. */
+export async function readGcpPrivateTestBucketHistoryProof(receiptPath) {
+  if (typeof receiptPath !== "string" || !isAbsolute(receiptPath)) {
+    fail("GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_REQUIRED");
+  }
+  const path = resolve(receiptPath);
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  let handle;
+  try {
+    const pathStat = await lstat(path);
+    if (uid === null || !pathStat.isFile() || pathStat.isSymbolicLink()
+        || pathStat.nlink !== 1 || pathStat.uid !== uid
+        || (pathStat.mode & 0o777) !== 0o600
+        || pathStat.size < 1 || pathStat.size > MAX_BUCKET_HISTORY_RECEIPT_BYTES) {
+      fail("GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_UNSAFE");
+    }
+    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const openedStat = await handle.stat();
+    if (!openedStat.isFile() || openedStat.nlink !== 1 || openedStat.uid !== uid
+        || (openedStat.mode & 0o777) !== 0o600
+        || openedStat.dev !== pathStat.dev || openedStat.ino !== pathStat.ino
+        || openedStat.size !== pathStat.size
+        || openedStat.size < 1 || openedStat.size > MAX_BUCKET_HISTORY_RECEIPT_BYTES) {
+      fail("GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_UNSAFE");
+    }
+    const bytes = await readExactFileBytes(handle, openedStat.size);
+    const afterReadStat = await handle.stat();
+    const finalPathStat = await lstat(path);
+    if (afterReadStat.dev !== openedStat.dev || afterReadStat.ino !== openedStat.ino
+        || afterReadStat.size !== openedStat.size || afterReadStat.mtimeMs !== openedStat.mtimeMs
+        || finalPathStat.dev !== openedStat.dev || finalPathStat.ino !== openedStat.ino
+        || finalPathStat.uid !== uid || finalPathStat.nlink !== 1
+        || (finalPathStat.mode & 0o777) !== 0o600) {
+      fail("GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_UNSAFE");
+    }
+    let text;
+    try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch {
+      fail("GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_INVALID");
+    }
+    const receipt = parseJson(text, "GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_INVALID");
+    if (`${JSON.stringify(receipt, null, 2)}\n` !== text) {
+      fail("GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_INVALID");
+    }
+    return validateBucketHistoryReceipt(receipt);
+  } catch (error) {
+    if (typeof error?.code === "string"
+        && /^GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_(?:REQUIRED|UNSAFE|INVALID)$/u.test(error.code)) {
+      throw error;
+    }
+    fail("GCP_PRIVATE_TEST_BUCKET_HISTORY_RECEIPT_UNAVAILABLE");
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+function encodeUpdateEnvVars(entries) {
+  const delimiter = "|";
+  if (!Array.isArray(entries) || entries.length === 0
+      || entries.some(({ name, value }) => !/^[A-Z][A-Z0-9_]*$/u.test(name)
+        || typeof value !== "string" || value.length === 0 || value.includes(delimiter))) {
+    fail("GCP_PRIVATE_TEST_ENV_UPDATE_INVALID");
+  }
+  // gcloud's dictionary parser uses commas by default; the bucket proof is
+  // JSON, so use its documented alternate-list delimiter for one atomic flag.
+  return "--update-env-vars=^|^" + entries.map(({ name, value }) => `${name}=${value}`).join(delimiter);
 }
 
 function spawnGcloud(args, spawn = spawnSync) {
@@ -968,8 +1199,15 @@ export async function runGcpPrivateTestDeployment({
   fetchImpl = fetch,
   isPrivateHost,
   archiveBuilder = createCloudRunBuildArchive,
+  readBucketHistoryProof = readGcpPrivateTestBucketHistoryProof,
 } = {}) {
   validateConfig(config);
+  let bucketHistoryProof;
+  if (config.command !== "preflight"
+      || (typeof config.bucketHistoryReceiptPath === "string"
+        && config.bucketHistoryReceiptPath.length > 0)) {
+    bucketHistoryProof = await readBucketHistoryProof(config.bucketHistoryReceiptPath);
+  }
   checkedBuildContext(config.sourceDigest, spawn);
   const hostModeReady = cloudRunHostModeReady(isPrivateHost);
   const provenance = await assessRequestedSourceProvenance(config, archiveBuilder, spawn);
@@ -997,6 +1235,12 @@ export async function runGcpPrivateTestDeployment({
     requireSourceDigest: !deploying,
     requireLatestReadyTraffic: true,
     requireCloudRunHostMode: config.command === "verify",
+    // The fixed service may still be serving its previous known database and
+    // bucket revision. Deployment replaces image and all A2 backing settings
+    // together; retain service identity, IAM, privacy, and credential checks.
+    requireBackingTargets: !deploying,
+    ...(bucketHistoryProof === undefined ? {} : { expectedBucketHistoryProof: bucketHistoryProof }),
+    allowKnownPreviousBackingTargets: deploying,
   });
   const origin = validateServiceUrl(serviceUrl(initial.service));
   const unauthenticatedProbe = await runUnauthenticatedInvokerProbe({
@@ -1055,13 +1299,14 @@ export async function runGcpPrivateTestDeployment({
   }
 
   const updateEnv = [
-    "HOST=0.0.0.0",
-    "HOST_ORIGIN=" + GCP_PRIVATE_TEST_TARGET.hostOrigin,
-    "POSTGRES_TEST_HTTP_MODE=cloud-run-iam",
-    ...Object.entries(GCP_PRIVATE_TEST_BACKING_ENVIRONMENT).map(([name, value]) => name + "=" + value),
-    "POSTGRES_IAM_USER=" + GCP_PRIVATE_TEST_TARGET.postgresIamUser,
-    "SOURCE_CONTENT_DIGEST=" + config.sourceDigest,
-  ].join(",");
+    { name: "HOST", value: "0.0.0.0" },
+    { name: "HOST_ORIGIN", value: GCP_PRIVATE_TEST_TARGET.hostOrigin },
+    { name: "POSTGRES_TEST_HTTP_MODE", value: "cloud-run-iam" },
+    ...Object.entries(GCP_PRIVATE_TEST_BACKING_ENVIRONMENT).map(([name, value]) => ({ name, value })),
+    { name: "GCS_ERASURE_BUCKET_HISTORY_PROOF", value: bucketHistoryProof },
+    { name: "POSTGRES_IAM_USER", value: GCP_PRIVATE_TEST_TARGET.postgresIamUser },
+    { name: "SOURCE_CONTENT_DIGEST", value: config.sourceDigest },
+  ];
   spawnGcloud([
     "run", "deploy", config.service,
     "--project=" + config.project,
@@ -1069,7 +1314,7 @@ export async function runGcpPrivateTestDeployment({
     "--image=" + config.image,
     "--port=8080",
     "--service-account=" + GCP_PRIVATE_TEST_TARGET.runtimeServiceAccount,
-    "--update-env-vars=" + updateEnv,
+    encodeUpdateEnvVars(updateEnv),
     "--no-allow-unauthenticated",
     "--quiet",
   ], spawn);
@@ -1095,6 +1340,7 @@ export async function runGcpPrivateTestDeployment({
     requireSourceDigest: true,
     requireLatestReadyTraffic: true,
     requireCloudRunHostMode: true,
+    expectedBucketHistoryProof: bucketHistoryProof,
   });
   const deployedUrl = validateServiceUrl(serviceUrl(deployed.service));
   const deployedUnauthenticatedProbe = await runUnauthenticatedInvokerProbe({
