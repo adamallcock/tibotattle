@@ -40,6 +40,17 @@ The route, transfer, and analytics rows are material blockers. A private test
 service that accepts one synthetic upload is useful evidence but cannot serve
 the complete application yet.
 
+At this checkpoint, the Worker route registry defines 50 exact `/api/` paths.
+A source-level comparison with the Cloud Run host and gateway finds 21 paths
+without a corresponding literal host path, including Apple sign-in, v1.1 and
+performance telemetry, export/security reset, release readiness, and the admin
+surface. This is an inventory aid, not a runtime parity test: the test gateway
+also intentionally withholds the public community-daily read even though the
+private host has a handler. Before a traffic switch, classify each route as
+ported, deliberately retained on a separate service, or retired under an
+explicit contract, then exercise every client-visible path against the chosen
+ingress.
+
 The [migration-41 A2 v1.2 journey](../receipts/2026-09-25-gcp-a2-v12-migration41-journey.md)
 records clean-candidate qualification, a successful pre-migration backup,
 41/41 primary and 6/6 ledger migrations, an exact-image IAM-private service,
