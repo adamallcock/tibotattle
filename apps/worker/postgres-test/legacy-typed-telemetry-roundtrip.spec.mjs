@@ -43,7 +43,7 @@ test("PostgreSQL typed v1/v1.1 base preserves source keys and blocks erasure unt
     await pool.query(`CREATE SCHEMA "${schema}"`);
     created = true;
     const migration = await applyPostgresMigrations({ role: "primary", schema, pool });
-    assert.equal(migration.applied, 30);
+    assert.equal(migration.applied, 35);
 
     const s = `"${schema}"`;
     const participantId = `synthetic-typed-owner-${randomBytes(4).toString("hex")}`;
@@ -378,21 +378,22 @@ test("PostgreSQL typed v1/v1.1 base preserves source keys and blocks erasure unt
     assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${s}.typed_telemetry_records`)).rows[0]?.n, 7);
     assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${s}.typed_telemetry_usage`)).rows[0]?.n, 3);
 
-    // A data-shape migration must not be mistaken for an admission/proof
-    // migration or a transfer receipt.
-    const unportedAuthorityTables = await pool.query(`SELECT
+    // The admission/proof schema can exist without an importer receipt for
+    // these base rows. They must remain unqualified as effective evidence.
+    const authorityTables = await pool.query(`SELECT
       to_regclass($1) AS v1_admissions,
       to_regclass($2) AS v11_proofs,
-      to_regclass($3) AS v1_publication_receipts`, [
+      to_regclass($3) AS admission_receipts`, [
       `${schema}.typed_v1_record_admissions`,
-      `${schema}.typed_v11_record_admissions`,
-      `${schema}.typed_telemetry_transfer_receipts`,
+      `${schema}.typed_v11_record_proofs`,
+      `${schema}.typed_telemetry_admission_transfer_receipts`,
     ]);
-    assert.deepEqual(unportedAuthorityTables.rows[0], {
-      v1_admissions: null,
-      v11_proofs: null,
-      v1_publication_receipts: null,
+    assert.deepEqual(authorityTables.rows[0], {
+      v1_admissions: `${schema}.typed_v1_record_admissions`,
+      v11_proofs: `${schema}.typed_v11_record_proofs`,
+      admission_receipts: `${schema}.typed_telemetry_admission_transfer_receipts`,
     });
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${s}.typed_telemetry_admission_transfer_receipts`)).rows[0]?.n, 0);
   } finally {
     if (created) await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
     await pool.end();

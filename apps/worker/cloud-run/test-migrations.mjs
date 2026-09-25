@@ -24,13 +24,13 @@ export const TEST_MIGRATIONS_TARGETS = Object.freeze({
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle",
-    expectedMigrations: 30,
+    expectedMigrations: 35,
   }),
   ledger: Object.freeze({
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-ledger-20260922",
     database: "tibotattle_ledger",
     schema: "tibotattle_ledger",
-    expectedMigrations: 5,
+    expectedMigrations: 6,
   }),
 });
 

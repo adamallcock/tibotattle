@@ -13,7 +13,9 @@
     "synthetic:v12:smoke": "node ./dist/synthetic-v12-smoke.mjs",
     "database:migrate:test": "node ./dist/test-migrations.mjs",
     "database:activate:test:v12": "node ./dist/test-activation.mjs",
-    "check": "node --check ./server.mjs && node --check ./cloud-sql.mjs && node --check ./node-crypto-adapter.mjs && node --check ./owner-bootstrap.mjs && node --check ./request-boundary.mjs && node --check ./postgres-migrations.mjs && node --check ./synthetic-v12-smoke.mjs && node --check ./test-migrations.mjs && node --check ./test-activation.mjs && node --check ./build.mjs && node ./build.mjs --check && node ../scripts/cloud-run-build-context.mjs --check && node ./synthetic-v12-smoke.check.mjs && node ./test-migrations.check.mjs && node ./test-activation.check.mjs && node ./host.check.mjs"
+    "synthetic:v12:cleanup": "node ./dist/synthetic-v12-cleanup.mjs",
+    "synthetic:v12:discovery": "node ./dist/synthetic-v12-discovery.mjs",
+    "check": "node --check ./server.mjs && node --check ./cloud-sql.mjs && node --check ./node-crypto-adapter.mjs && node --check ./owner-bootstrap.mjs && node --check ./request-boundary.mjs && node --check ./postgres-migrations.mjs && node --check ./synthetic-v12-smoke.mjs && node --check ./synthetic-v12-cleanup.mjs && node --check ./synthetic-v12-discovery.mjs && node --check ./test-migrations.mjs && node --check ./test-activation.mjs && node --check ./build.mjs && node ./build.mjs --check && node ../scripts/cloud-run-build-context.mjs --check && node ./synthetic-v12-smoke.check.mjs && node ./synthetic-v12-cleanup.check.mjs && node ./synthetic-v12-discovery.check.mjs && node ./test-migrations.check.mjs && node ./test-activation.check.mjs && node ./host.check.mjs"
   },
   "dependencies": {
     "@app-usagemonitor/accounting": "file:../../../packages/accounting",

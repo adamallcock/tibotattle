@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
-import { lstat, realpath, stat } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { chmod, lstat, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import pg from "pg";
 import {
@@ -9,6 +12,7 @@ import {
   POSTGRES_TYPED_LEGACY_TRANSFER_TABLES,
   PostgresTypedLegacyTransferError,
   createD1TypedLegacyPageSource,
+  createSealedSqliteTypedLegacyRehearsalSource,
   createSyntheticD1TypedLegacyFixtureSource,
   runPostgresTypedLegacyTransfer,
 } from "./postgres-typed-legacy-transfer.mjs";
@@ -180,6 +184,58 @@ function syntheticRows() {
   return { rows, linkedParticipant, linklessParticipant, ownerDigest };
 }
 
+async function sealedSqliteFixture() {
+  const directory = await mkdtemp(join(tmpdir(), "tibotattle-sealed-legacy-"));
+  const path = join(await realpath(directory), "source.sqlite");
+  const fixture = syntheticRows();
+  // D1's v1.1 admission singleton supplies one namespace for both owners.
+  fixture.rows.typed_telemetry_owner_memberships[2].source_namespace =
+    "synthetic-v11-shared-source";
+  const db = new DatabaseSync(path);
+  try {
+    for (const table of POSTGRES_TYPED_LEGACY_TRANSFER_TABLES) {
+      if (table === "typed_telemetry_owner_memberships") continue;
+      const rows = fixture.rows[table];
+      assert.ok(rows.length > 0, table);
+      const columns = Object.keys(rows[0]);
+      db.exec(`CREATE TABLE ${quoted(table)} (${columns.map(name => {
+        const sample = rows.find(row => row[name] !== null)?.[name];
+        const type = Buffer.isBuffer(sample) ? "BLOB"
+          : typeof sample === "number" ? "INTEGER" : "TEXT";
+        return `${quoted(name)} ${type}`;
+      }).join(",")})`);
+      const insert = db.prepare(`INSERT INTO ${quoted(table)} (${columns.map(quoted).join(",")})
+        VALUES (${columns.map(() => "?").join(",")})`);
+      for (const row of rows) insert.run(...columns.map(column => row[column]));
+    }
+    db.exec(`CREATE TABLE typed_v1_owner_memberships(typed_owner_id INTEGER, participant_id TEXT);
+      CREATE TABLE typed_v11_owner_memberships(typed_owner_id INTEGER, participant_id TEXT);
+      CREATE TABLE typed_v1_admission_state(id INTEGER, namespace_id INTEGER, source_namespace TEXT);
+      CREATE TABLE typed_v11_admission_state(id INTEGER, namespace_id INTEGER, source_namespace TEXT);
+      CREATE TABLE participants(id TEXT, state TEXT);
+      CREATE TABLE storage_v11_owner_links(participant_id TEXT, owner_digest TEXT, state TEXT);`);
+    db.prepare("INSERT INTO typed_v1_admission_state VALUES (1,100,?)")
+      .run("synthetic-v1-source");
+    db.prepare("INSERT INTO typed_v11_admission_state VALUES (1,100,?)")
+      .run("synthetic-v11-shared-source");
+    const participant = db.prepare("INSERT INTO participants VALUES (?,'active')");
+    participant.run(fixture.linkedParticipant);
+    participant.run(fixture.linklessParticipant);
+    db.prepare("INSERT INTO storage_v11_owner_links VALUES (?,?,'active')")
+      .run(fixture.linkedParticipant, fixture.ownerDigest);
+    for (const row of fixture.rows.typed_telemetry_owner_memberships) {
+      db.prepare(`INSERT INTO ${row.source_format === 10
+        ? "typed_v1_owner_memberships" : "typed_v11_owner_memberships"} VALUES (?,?)`)
+        .run(row.owner_id, row.participant_id);
+    }
+  } finally {
+    db.close();
+  }
+  await chmod(path, 0o400);
+  const sha256 = createHash("sha256").update(await readFile(path)).digest("hex");
+  return { directory, path, sha256, fixture };
+}
+
 test("D1 page adapter builds source owner membership with separate, non-copied authority", async () => {
   const prepared = [];
   const database = {
@@ -214,6 +270,44 @@ test("D1 page adapter builds source owner membership with separate, non-copied a
   assert.match(prepared[0], /typed_v1_owner_memberships/u);
   assert.match(prepared[0], /typed_v11_owner_memberships/u);
   assert.match(prepared[1], /ORDER BY "id" LIMIT \?/u);
+});
+
+test("sealed SQLite rehearsal source checks exact bytes, ownership and source authority", {
+  skip: process.platform === "win32",
+}, async () => {
+  const { directory, path, sha256 } = await sealedSqliteFixture();
+  let source;
+  try {
+    await assert.rejects(
+      createSealedSqliteTypedLegacyRehearsalSource({ path, expectedSha256: "0".repeat(64) }),
+      error => error instanceof PostgresTypedLegacyTransferError
+        && error.code === "TYPED_LEGACY_SEALED_SQLITE_SHA256_MISMATCH",
+    );
+    source = await createSealedSqliteTypedLegacyRehearsalSource({ path, expectedSha256: sha256 });
+    assert.equal(source.snapshot.kind, "sealed-sqlite-rehearsal");
+    assert.equal(source.snapshot.artifactSha256, sha256);
+    assert.deepEqual(await source.verifySnapshot(), {
+      snapshotId: `sha256:${sha256}`, artifactSha256: sha256,
+    });
+    const dictionary = await source.listPage({ table: "typed_telemetry_dictionary", limit: 2 });
+    assert.equal(dictionary.rows.length, 2);
+    assert.equal(dictionary.rows[0].value, "openai_codex");
+    const membership = await source.listPage({ table: "typed_telemetry_owner_memberships", limit: 3 });
+    assert.deepEqual(membership.rows.map(row => row.source_format), [10n, 11n, 11n]);
+    assert.equal(membership.rows[0].authority.ownerLink.ownerDigest, "a".repeat(64));
+    assert.equal(membership.rows[2].authority.ownerLink, null);
+    await chmod(path, 0o600);
+    await assert.rejects(source.verifySnapshot(), error => error instanceof PostgresTypedLegacyTransferError
+      && error.code === "TYPED_LEGACY_SEALED_SQLITE_UNSAFE");
+    await chmod(path, 0o400);
+    source.close();
+    await assert.rejects(source.listPage({ table: "typed_telemetry_dictionary", limit: 2 }),
+      error => error instanceof PostgresTypedLegacyTransferError
+        && error.code === "TYPED_LEGACY_SEALED_SQLITE_CLOSED");
+  } finally {
+    source?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("synthetic transfer source owns an immutable copy of fixture rows", async () => {
@@ -330,7 +424,7 @@ test("PG17 typed legacy import streams bounded D1 pages, rolls back a failed pag
     await pool.query(`CREATE SCHEMA ${quoted(controlSchema)}`);
     controlCreated = true;
     const migrated = await applyPostgresMigrations({ role: "primary", schema: targetSchema, pool });
-    assert.equal(migrated.applied, 30);
+    assert.equal(migrated.applied, 35);
 
     const fixture = syntheticRows();
     const source = syntheticD1Source({ mutableRows: fixture.rows, d1BlobArrays: true });
@@ -446,5 +540,72 @@ test("PG17 typed legacy import streams bounded D1 pages, rolls back a failed pag
     if (controlCreated) await pool.query(`DROP SCHEMA ${quoted(controlSchema)} CASCADE`);
     if (targetCreated) await pool.query(`DROP SCHEMA ${quoted(targetSchema)} CASCADE`);
     await pool.end();
+  }
+});
+
+test("PG17 imports a hash-sealed SQLite export rehearsal and refuses a changed artifact", {
+  skip: !PG_TEST_SOCKET,
+}, async () => {
+  const endpoint = await localSocket();
+  const pool = new pg.Pool({
+    ...endpoint,
+    user: PG_TEST_USER,
+    password: process.env.PG_TEST_PASSWORD ?? "synthetic-local-only",
+    database: PG_TEST_DATABASE,
+    ssl: false,
+    max: 4,
+    connectionTimeoutMillis: 5_000,
+  });
+  const suffix = randomBytes(5).toString("hex");
+  const targetSchema = `${POSTGRES_TYPED_LEGACY_TARGET_SCHEMA_PREFIX}${suffix}`;
+  const controlSchema = `${POSTGRES_TYPED_LEGACY_CONTROL_SCHEMA_PREFIX}${suffix}`;
+  const sealed = await sealedSqliteFixture();
+  let source;
+  let targetCreated = false;
+  let controlCreated = false;
+  try {
+    await pool.query(`CREATE SCHEMA ${quoted(targetSchema)}`);
+    targetCreated = true;
+    await pool.query(`CREATE SCHEMA ${quoted(controlSchema)}`);
+    controlCreated = true;
+    const migrated = await applyPostgresMigrations({ role: "primary", schema: targetSchema, pool });
+    assert.ok(migrated.applied >= 30);
+    source = await createSealedSqliteTypedLegacyRehearsalSource({
+      path: sealed.path, expectedSha256: sealed.sha256,
+    });
+    const now = new Date().toISOString();
+    await pool.query(`INSERT INTO ${quoted(targetSchema)}.participants(id,created_at) VALUES
+      ($1,$3),($2,$3)`, [sealed.fixture.linkedParticipant, sealed.fixture.linklessParticipant, now]);
+    await pool.query(`INSERT INTO ${quoted(targetSchema)}.storage_v11_owner_links(participant_id,owner_digest,state)
+      VALUES ($1,$2,'active')`, [sealed.fixture.linkedParticipant, sealed.fixture.ownerDigest]);
+    const transfer = {
+      source, destinationPool: pool, targetSchema, controlSchema,
+      transferId: "sealed-sqlite-legacy-rehearsal", pageSize: 2,
+    };
+    const receipt = await runPostgresTypedLegacyTransfer(transfer);
+    assert.equal(receipt.status, "staged_rehearsal_complete");
+    assert.equal(receipt.source.kind, "sealed-sqlite-rehearsal");
+    assert.equal(receipt.source.artifactSha256, sealed.sha256);
+    assert.equal(receipt.source.manifestSha256, receipt.destination.manifestSha256);
+    assert.equal(receipt.authority.preservedLinklessMemberships, 1);
+    assert.equal(receipt.capabilities.productionCutoverAuthorized, false);
+    await chmod(sealed.path, 0o600);
+    const mutable = new DatabaseSync(sealed.path);
+    try {
+      mutable.prepare("UPDATE typed_telemetry_dictionary SET value=? WHERE id=1")
+        .run("changed-after-transfer");
+    } finally {
+      mutable.close();
+      await chmod(sealed.path, 0o400);
+    }
+    await assert.rejects(runPostgresTypedLegacyTransfer(transfer),
+      error => error instanceof PostgresTypedLegacyTransferError
+        && error.code === "TYPED_LEGACY_SNAPSHOT_CHANGED");
+  } finally {
+    source?.close();
+    if (controlCreated) await pool.query(`DROP SCHEMA ${quoted(controlSchema)} CASCADE`);
+    if (targetCreated) await pool.query(`DROP SCHEMA ${quoted(targetSchema)} CASCADE`);
+    await pool.end();
+    await rm(sealed.directory, { recursive: true, force: true });
   }
 });

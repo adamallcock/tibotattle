@@ -261,7 +261,12 @@ export function createPostgresTestHealthDispatch({
 }
 
 const V12_DAY_MANIFEST_PATH = "/api/v1/device/telemetry/v1.2/day-manifests";
+const ENVELOPE_KEY_PATH = "/api/v1/envelope-key";
 const DEVICE_UPLOAD_AUTHORIZATION_PATH = "/api/v1/device/upload-authorizations";
+const DEVICE_SYNC_STATE_PATH = "/api/v1/device/sync/state";
+const DEVICE_SYNC_CAPABILITIES_V12_PATH = "/api/v1/device/sync-capabilities-v1.2";
+const V12_DOMAIN_PREDECESSOR_PATH = "/api/v1/me/telemetry-v12/domain-predecessor";
+const V12_DOMAIN_ACTIVATE_PATH = "/api/v1/me/telemetry-v12/domain-activate";
 const MAX_V12_DAY_CHUNKS = 4_096;
 
 function routeError(error, requestId) {
@@ -908,8 +913,9 @@ async function readV12StagedChunkVector(pool, schema, principal, manifestId) {
 }
 
 /**
- * Private test dispatch. It admits the read-only health proof, v1.2 manifest
- * registration, v1.2-bound upload grants, and bounded v1.2 chunk writes.
+ * Private test dispatch. It admits the health proof and a bounded v1.2 sync
+ * path: capabilities, day candidates, domain predecessor/activation, manifest
+ * registration, upload grants, and chunk writes.
  */
 export function createPostgresTestV12DayManifestDispatch({
   primaryPool,
@@ -925,6 +931,12 @@ export function createPostgresTestV12DayManifestDispatch({
   assertUploadAuthorizationAllowed,
   authenticatePostgresDevice,
   hasPostgresDeletionTombstone,
+  readPostgresDeviceSyncState,
+  readPostgresDeviceSyncV12Capabilities,
+  readPostgresV12DayCandidates,
+  publicEnvelopeKey,
+  sourceNamespace,
+  createPostgresTypedV12Domain,
   assertPostgresV12UploadAllowed,
   createPostgresDeviceUploadAuthorization,
   registerPostgresTypedV12DayManifest,
@@ -969,6 +981,9 @@ export function createPostgresTestV12DayManifestDispatch({
       || typeof envelopePublicJwk !== "string" || envelopePublicJwk.length < 1
       || typeof envelopePrivateJwk !== "string" || envelopePrivateJwk.length < 1
       || typeof readBoundedRequestBody !== "function"
+      || typeof readPostgresV12DayCandidates !== "function"
+      || typeof publicEnvelopeKey !== "function"
+      || typeof createPostgresTypedV12Domain !== "function"
       || !Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1) {
     configurationError("POSTGRES_TEST_V12_DISPATCH_CONFIGURATION_INVALID");
   }
@@ -992,17 +1007,59 @@ export function createPostgresTestV12DayManifestDispatch({
     if (request.method === "GET" && url.pathname === "/api/health") {
       return healthDispatch(request);
     }
-    const manifestRoute = request.method === "POST" && url.pathname === V12_DAY_MANIFEST_PATH;
+    const envelopeKeyPath = url.pathname === ENVELOPE_KEY_PATH;
+    const envelopeKeyRoute = envelopeKeyPath && request.method === "GET";
+    const manifestPath = url.pathname === V12_DAY_MANIFEST_PATH;
+    const manifestRoute = manifestPath && request.method === "POST";
+    const manifestReadRoute = manifestPath && request.method === "GET";
     const uploadAuthorizationRoute = request.method === "POST"
       && url.pathname === DEVICE_UPLOAD_AUTHORIZATION_PATH;
     const v12ChunkUploadRoute = request.method === "POST"
       && url.pathname === V12_CHUNK_UPLOAD_PATH;
-    if ((!manifestRoute && !uploadAuthorizationRoute && !v12ChunkUploadRoute) || url.search) {
+    const syncStatePath = url.pathname === DEVICE_SYNC_STATE_PATH;
+    const syncCapabilitiesV12Path = url.pathname === DEVICE_SYNC_CAPABILITIES_V12_PATH;
+    const v12DomainPredecessorPath = url.pathname === V12_DOMAIN_PREDECESSOR_PATH;
+    const v12DomainActivatePath = url.pathname === V12_DOMAIN_ACTIVATE_PATH;
+    const syncStateRoute = syncStatePath && request.method === "GET";
+    const syncCapabilitiesV12Route = syncCapabilitiesV12Path && request.method === "GET";
+    const v12DomainPredecessorRoute = v12DomainPredecessorPath && request.method === "POST";
+    const v12DomainActivateRoute = v12DomainActivatePath && request.method === "POST";
+    if (envelopeKeyPath && request.method !== "GET") {
+      return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
+        code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET" },
+      }), crypto.randomUUID());
+    }
+    if (manifestPath && !manifestRoute && !manifestReadRoute) {
+      return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
+        code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET, POST" },
+      }), crypto.randomUUID());
+    }
+    if ((syncStatePath || syncCapabilitiesV12Path) && request.method !== "GET") {
+      return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
+        code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET" },
+      }), crypto.randomUUID());
+    }
+    if ((v12DomainPredecessorPath || v12DomainActivatePath)
+        && request.method !== "POST") {
+      return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
+        code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "POST" },
+      }), crypto.randomUUID());
+    }
+    if ((!envelopeKeyRoute && !manifestRoute && !manifestReadRoute
+        && !uploadAuthorizationRoute && !v12ChunkUploadRoute
+        && !syncStateRoute && !syncCapabilitiesV12Route
+        && !v12DomainPredecessorRoute && !v12DomainActivateRoute)
+        || (url.search && !envelopeKeyRoute && !manifestReadRoute
+          && !syncStatePath && !syncCapabilitiesV12Path)) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
 
     const requestId = crypto.randomUUID();
     try {
+      // Like the Worker route, envelope-key is public configuration projection
+      // and must remain available without opening either database pool.
+      if (envelopeKeyRoute) return json(200, publicEnvelopeKey(envelopePublicJwk));
+
       const [primaryReceipt, ledgerReceipt] = await Promise.all([
         readSchemaReceipt(primaryPool, schemas.primary, expected.primary),
         readSchemaReceipt(ledgerPool, schemas.ledger, expected.ledger),
@@ -1012,6 +1069,15 @@ export function createPostgresTestV12DayManifestDispatch({
       }
 
       assertAdmissionBindings(admissionEnv);
+      if (syncStateRoute || syncCapabilitiesV12Route || manifestReadRoute) {
+        await assertAttemptAllowed(
+          admissionEnv.RECOVERY_RATE_LIMIT,
+          admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
+          request,
+          admissionEnv,
+          "device_sync",
+        );
+      }
       if (request.headers.has("cookie")) {
         throw Object.assign(new Error("DEVICE_AUTH_INVALID"), {
           code: "DEVICE_AUTH_INVALID", status: 401,
@@ -1054,6 +1120,48 @@ export function createPostgresTestV12DayManifestDispatch({
         throw Object.assign(new Error("DEVICE_AUTH_INVALID"), {
           code: "DEVICE_AUTH_INVALID", status: 401,
         });
+      }
+
+      if (syncStateRoute) {
+        if (device.authorityKind !== "social") {
+          throw Object.assign(new Error("TELEMETRY_TRANSPORT_BLOCKED"), {
+            code: "TELEMETRY_TRANSPORT_BLOCKED", status: 403,
+          });
+        }
+        if (typeof readPostgresDeviceSyncState !== "function") throw storageUnavailable();
+        return json(200, await readPostgresDeviceSyncState(
+          primaryPool,
+          device.participantId,
+          device.deviceId,
+          { schema, nowEpoch: Date.now() },
+        ));
+      }
+      if (syncCapabilitiesV12Route) {
+        if (typeof readPostgresDeviceSyncV12Capabilities !== "function") throw storageUnavailable();
+        return json(200, await readPostgresDeviceSyncV12Capabilities(
+          primaryPool,
+          device.participantId,
+          device.deviceId,
+          url.origin,
+          { schema, sourceNamespace, nowEpoch: Date.now() },
+        ));
+      }
+      if (manifestReadRoute) {
+        const query = url.searchParams;
+        if ([...query.keys()].some((key) => !["fromDay", "toDay"].includes(key))
+            || query.getAll("fromDay").length !== 1 || query.getAll("toDay").length !== 1) {
+          throw Object.assign(new Error("BODY_INVALID"), { code: "BODY_INVALID", status: 400 });
+        }
+        return json(200, await readPostgresV12DayCandidates(
+          primaryPool,
+          device,
+          {
+            fromDay: query.get("fromDay"),
+            toDay: query.get("toDay"),
+            schema,
+            sourceNamespace,
+          },
+        ));
       }
 
       if (uploadAuthorizationRoute) {
@@ -1125,6 +1233,21 @@ export function createPostgresTestV12DayManifestDispatch({
           { envelopeDigest: value.envelopeDigest, bodyBytes: value.contentLengthBytes },
           { schema },
         ));
+      }
+
+      if (v12DomainPredecessorRoute) {
+        if (value === null || typeof value !== "object" || Array.isArray(value)
+            || Object.keys(value).length !== 0) {
+          throw Object.assign(new Error("BODY_INVALID"), {
+            code: "BODY_INVALID", status: 400,
+          });
+        }
+        const domain = createPostgresTypedV12Domain(primaryPool, { schema });
+        return json(201, await domain.createPredecessor(device, Date.now()));
+      }
+      if (v12DomainActivateRoute) {
+        const domain = createPostgresTypedV12Domain(primaryPool, { schema });
+        return json(201, await domain.activate(device, value, Date.now()));
       }
 
       const candidate = await registerPostgresTypedV12DayManifest(

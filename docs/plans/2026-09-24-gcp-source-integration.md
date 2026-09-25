@@ -19,6 +19,66 @@ The branch later merged remote `main` at `db470190`; the exact private test
 image and receipt described below apply only to the allowlisted Cloud Run
 source archive, not to a production Worker build.
 
+### 2026-09-25 integration checkpoint
+
+The current local integration has 35 primary and six independent erasure-ledger
+PostgreSQL migrations. Primary migration 0035 closes the direct ready-v1.2
+mutation/deletion gap and permits a terminal owner-erasure cascade only when
+that participant's owner link transitions to erased and its matching receipt
+is inserted in the same transaction. PostgreSQL 17 regressions cover both a
+linkless owner and a previously erased link trying to borrow another owner's
+fresh receipt in a mixed deletion; both fail closed. A ready
+v1.2 owner without that link still fails closed during deletion;
+ledger migration 0006 adds D1-shaped authority guards and sealed, restartable
+transfer evidence. Both passed disposable PostgreSQL 17 regressions. A
+proposed named-target ledger migration 0007 remains outside the executable
+migration chain: automatic approval review rejected the proposed wrapper for
+reading a private sealed ledger export and sending its rows to the named GCP
+test database. No private ledger rows were transferred, and no dedicated
+transfer identity was provisioned. The
+generated runtime schema, migration runner, and reviewed build contexts now
+agree on these exact migration tails. This revision has **not** been built or
+applied to the private GCP test service yet.
+
+Local sealed-source transfer coverage now includes typed v1/v1.1 base rows,
+event-source memberships, admission/proof families, usage-correction history,
+analytics owner-state/source cursors, and the independent erasure ledger.
+The typed-only effective reader has a PostgreSQL 17 fixture with no obsolete
+raw-record rows. Analytics transfer is deliberately partial: event history,
+results, work, and publications are not representable and remain blocked.
+No live D1 export, R2 object copy, source freeze, or end-to-end production
+reconciliation has occurred. The test-only transfer importers do not by
+themselves establish a production activation path.
+
+The Worker registry has 51 exact routes. The currently deployed private GCP
+host serves health and three v1.2 upload routes. The local source adds bounded
+device sync-state, v1.2 sync-capability, envelope-key and day-manifest reads,
+but that revision has not been deployed. The full public, desktop, admin,
+scheduled, and owner-erasure application path is still absent.
+The previous exact-image hosted v1.2 synthetic journey remains valid only for
+its older 30-primary/five-ledger image. Fresh on-demand backups completed for
+the named GCP test primary (`1790311919040`) and ledger (`1790312021531`)
+before the pending forward migration. The live Cloudflare Worker still serves.
+
+The Cloudflare scheduled path is a cutover gate, not a background detail. Its
+one-minute maintenance lease runs required identity, retention, restore and
+object reconciliation phases before optional analytics. The analytics path
+delivers ordered source journal entries, then calculates and publishes public
+days and graph work with durable claims, checkpoints and authority rechecks.
+The current PostgreSQL graph module stores and reads supplied precomputed
+model-day cohorts; it does not schedule, select, calculate or serve the public
+graph. A successful GCP synthetic upload therefore cannot qualify a public
+graph or a complete application cutover.
+
+The local private host now routes
+`POST /api/v1/me/telemetry-v12/domain-predecessor` and
+`POST /api/v1/me/telemetry-v12/domain-activate` through the PostgreSQL domain
+adapter. The disposable PostgreSQL 17 HTTP test covers predecessor creation,
+ready-day activation, replay, active-head read-back and tombstone refusal.
+These routes are not yet deployed to the private GCP test service, and the
+hosted smoke still stops at admission and storage read-back. Legacy v1/v1.1
+writers and authority transfer remain separate follow-on work.
+
 The accepted local PostgreSQL graph optimization improved the 10,000-record
 synthetic median from 12,280.94 ms to 4,326.49 ms (2.84 times faster within
 that local lane). Equal hosted Cloudflare and GCP work has not been timed.
@@ -59,12 +119,11 @@ transaction. Migration 0027 blocks direct deletion of published normalized
 records while the owner is active. This keeps the small zonal test topology and
 does not imply that the new v1.2 path is routed or ready. Migration 0028 checks
 declared chunk and record completeness when a manifest enters `ready`, permits
-the older raw-only representation, and refuses mixed raw/typed storage. It
-does not protect later ready-header changes, ready-to-staged transitions, or
-deletion of a ready but unpublished manifest, chunk, record or child. A broader
-persistent guard was rejected by automatic approval review because of possible
-cleanup-workflow impact without validating tests; the remaining mutation
-paths are a separate cutover review gate.
+the older raw-only representation, and refuses mixed raw/typed storage. The
+later 0035 upgrade audits existing ready days with that validator, then guards
+ready headers, chunks, records and children against direct changes or deletion.
+Its PostgreSQL 17 tests cover exact replay and terminal owner-erasure cascade;
+it is not yet applied to the GCP test database.
 Migration 0029 adds D1-shaped v1 and v1.1 effective-source membership tables
 with identity, lineage and retention guards. A PG17 regression proves
 forward application and owner-erasure behavior. A follow-up review closed the
@@ -75,8 +134,9 @@ over a preexisting PostgreSQL owner link already marked `erased`, because the
 older schema did not prove that state was terminal; such a target needs a
 separately reviewed reconciliation. Direct owner-link deletion is refused
 while its participant exists. A real participant cascade test removes both
-v1 and v1.1 memberships while retaining the digest-only receipt. These tables
-still have no migrated rows, effective reader or hosted route.
+v1 and v1.1 memberships while retaining the digest-only receipt. A local
+typed-only reader now exists, but no live source rows have been migrated or
+hosted legacy route qualified.
 Migration 0030 adds a PostgreSQL base shape for the bound D1 typed legacy
 v1/v1.1 family: source-keyed namespaces, owners, devices, manifests, chunks,
 records, dictionary-backed identifiers and attributions, and usage/quota/
@@ -93,26 +153,29 @@ rows. It includes a linkless v1.1 record and verifies that one linked v1
 receipt cannot release a shared owner while its v1.1 membership lacks proof.
 Participant deletion with retained typed rows is deliberately blocked and
 rolls back without losing those rows. Owner-link deletion while the participant
-exists is also blocked, preserving the optional authority mapping. It has no
-admission/proof transfer, effective reader, or explicit typed-owner erasure
-adapter; linkless owner erasure has no qualified authority policy. Automatic
-approval review rejected an implicit broad
-participant-delete purge because it could irreversibly remove retained typed
-source rows before the owner-erasure workflow was settled.
+exists is also blocked, preserving the optional authority mapping. Subsequent
+migrations and adapters add admission/proof transfer, a typed-only effective
+reader and an explicit owner-erasure path. Linkless owner authority still
+requires exact transferred evidence; a typed record alone never grants
+permission to purge it. Automatic approval review had rejected an implicit
+broad participant-delete purge because it could irreversibly remove retained
+typed source rows before the owner-erasure workflow was settled.
 The remaining typed v1/v1.1 authority family is material: live D1 reports
 5,122,773 v1 record-admission rows, 4,329,999 v1.1 record proofs,
 27,577/22,823 format-specific chunk allocations, and 1,035 v1.1 manifest
 memberships. Preservation proofs and authority requests also need mapping.
-None has a PostgreSQL transfer or reconciliation receipt. A future importer
-must preserve the exact source participant-to-owner mapping, leave missing
-owner links unknown, and use a separately reviewed policy for linkless owner
-erasure.
+The 0033 migration and sealed local importer now represent and rehearse these
+families with bounded checkpoints and exact source/destination receipts. They
+have not consumed a live, consistently frozen D1 export. The importer must
+preserve the exact source participant-to-owner mapping and leave missing owner
+links unknown; local fixture parity is not live reconciliation.
 
 The generated PostgreSQL runtime receipt, migration runner, local Cloud Run
-host and database build-context checks now agree on 30 primary migrations and
-five ledger migrations. The focused 0029 and 0030 tests each applied the full
+host and database build-context checks now agree on 35 primary migrations and
+six ledger migrations. The focused 0029 through 0035 tests applied the full
 stream against disposable PostgreSQL 17. The private loopback host suite
-passes 12/12 and the synthetic cutover rehearsal passes 13/13. The 25-to-26
+passes 15/15 with PostgreSQL 17 and the synthetic cutover rehearsal passes
+13/13. The 25-to-26
 forward test preserves legacy rows and admits the new day
 representation. A local v1.2 round trip admits 2,049 normalized usage records
 in bounded scans, pages effective usage without duplicates, reads quota and
@@ -154,15 +217,16 @@ day enumeration. A PG17 test scans 2,049 records with repeated timestamps and
 a cursor split, verifies successor-generation selection and refuses oversize
 occurrence/day requests. These are v1.2 source primitives: the v1/v1.1 union,
 mixed-format precedence, owner-revision checkpointing and full analytics
-orchestration remain unported. The narrower migration 0028 guard leaves ready
-manifest headers mutable by direct SQL, as noted above.
+orchestration remain unported. The 0035 retention guard closes the direct
+ready-header mutation path locally.
 Migration 0029 introduces `typed_v1_event_sources` and
 `storage_v11_event_sources` membership tables needed to prove which legacy
 records are effective. The focused PostgreSQL 17 tests cover its receipt,
-lock-order and participant-cascade safeguards; the source rows and reader are
-still absent. Legacy candidate/occurrence/day readers remain unavailable
-until the D1 membership rows are transferred and reconciled; merely scanning
-raw v1/v1.1 records could resurrect superseded evidence.
+lock-order and participant-cascade safeguards. A typed-only local effective
+reader now requires 0031/0033 lineage proof and rejects old raw-record-only
+fixtures. Live source rows are still untransferred; merely scanning all typed
+records without the exact D1 membership rows could resurrect superseded
+evidence.
 The bounded synthetic transfer rehearsal passes 13/13 tests. It imports 14
 normalized v1.2 tables: dictionary, manifests, chunks, attributions, records,
 three child tables, runtime, device capability and four domain tables. Source
@@ -221,6 +285,19 @@ OAuth session alone did not launch it. [Cloudflare's Wrangler authorization
 guide](https://developers.cloudflare.com/workers/authorization/) says its
 login OAuth flow does not support granular authorization; a separately scoped
 account-owned API token is the supported way to grant narrow permissions.
+An independent [Cloudflare R2 List Objects API](https://developers.cloudflare.com/api/resources/r2/subresources/buckets/subresources/objects/methods/list/)
+provides paged key, size, ETag, HTTP and custom metadata, but no object
+version. A new read-only REST inventory command accepts an injected scoped API
+token, bounds each page and the whole sweep, and emits only counts, byte totals,
+metadata exception counts and a metadata digest. Four synthetic tests pass.
+This can discover all prefixes without a Worker binding; it cannot supply the
+version-pinned object-copy receipt or a consistent snapshot of a moving bucket.
+The Wrangler OAuth session was refreshed with the previously approved D1
+scope and verified against read-only D1 metadata. It does not have R2 bucket
+access; a read-only R2 bucket-list attempt returned Cloudflare authorization
+error `10000`. No scoped R2 token is currently available to run this inventory
+live. A separate bucket-scoped read token is needed before listing or copying
+quarantine objects.
 The harness therefore still needs a qualified credential path and a live read
 smoke before a transfer run. The
 existing transfer accepts one
@@ -456,19 +533,37 @@ The separate typed legacy transfer rehearsal now pages the 14 D1-shaped base
 tables from a cloned synthetic in-memory fixture into PostgreSQL 17, including
 v1 and v1.1 owner memberships and D1 BLOB byte-array conversion. It uses a
 dedicated rehearsal control schema, transactional checkpoints, rollback/resume
-and source/destination count and digest read-back. Six focused tests pass,
+and source/destination count and digest read-back. Eight focused tests pass,
 including linkless v1.1 membership, repeated participant identity,
 changed-source refusal and bounded page behavior. The transfer runner accepts
-only the private synthetic-fixture source; a generic D1 adapter cannot label
-itself as an immutable source. The runner also requires a dedicated rehearsal
+the private synthetic-fixture source or an owner-owned, read-only, hash-sealed
+SQLite rehearsal artifact. A generic D1 adapter or caller-built export
+descriptor cannot label itself as immutable. The SQLite reader checks exact
+bytes and file identity before and after transfer and reads bounded keyset
+pages. A PostgreSQL 17 rehearsal transfers the synthetic 14-table source
+through that file, compares source/destination digests, and refuses a changed
+artifact on retry. This proves the offline file path, not that any file is a
+complete or consistent production D1 export. The runner also requires a dedicated rehearsal
 target schema and refuses ordinary application schemas before any destination
 query; this protects against accidental targeting, not deliberate use of that
 prefix in a production database. Dictionary parity is explicitly scoped to
 source keys, so a preexisting destination dictionary row does not masquerade
-as whole-table equality. Live mutable D1 and an unverified export are refused:
+as whole-table equality. Live mutable D1 and an unverified remote export are refused:
 the source still needs a verifiable frozen export, and the other legacy
 admission/proof/effective-reader families remain untransferred. The rehearsal
-is not production cutover authorization.
+is not production cutover authorization. Automatic approval review rejected
+the proposed read-only export of the unbound 10 GB legacy production D1 into
+a private local artifact because that database contains sensitive telemetry
+and Cloudflare warns that large exports can pause queries. No export was
+created; exact approval for that source and operation remains pending. This
+does not block local synthetic transfer work.
+Cloudflare documents that a large [D1 export can make the database unavailable
+for queries](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/export/)
+while it runs, and [Time Travel cannot yet clone a database into a new
+copy](https://developers.cloudflare.com/d1/reference/time-travel/). The final
+source export therefore needs an explicit maintenance/freeze window and a
+write-delta policy. Do not run a large export against the serving ingestion D1
+as an ordinary read-only inventory command.
 
 The shared quota hot-path change touches the R7 workload source set. Its
 retained release receipt was already stale at this branch's base revision;
@@ -555,6 +650,18 @@ cross-backend transfer. A synthetic valid chain is still refused with
 `CUTOVER_ACCOUNTLESS_AUTHORITY_SCHEMA_PARITY_UNQUALIFIED` rather than copied.
 The importer reports `fullCutoverReady=false` and cannot import production.
 
+### Typed legacy source-shape correction
+
+The source D1 typed-admission migrations block insertion into
+`telemetry_v1_records` and `telemetry_v11_records` after typed admission is
+active. The original PostgreSQL reader fixture populated those obsolete raw
+tables and therefore could not qualify a real typed owner. The corrected
+PostgreSQL reader now joins typed allocation, admission/proof,
+owner-membership and event-source lineage. A PostgreSQL 17 fixture with no raw
+record rows passes. This is still local structural proof: no sealed live D1
+export has been transferred and reconciled with the PostgreSQL target, so the
+production path remains closed.
+
 ## Observed GCP test boundary
 
 A read-only Google Cloud Console inspection on 2026-09-24 found one healthy
@@ -586,6 +693,15 @@ The earlier destination-transfer smoke cleaned up its objects. The hosted v1.2
 journeys have since retained tagged synthetic fixtures and their referenced
 objects in the test bucket. It has not been populated with the 7.92 GB
 production quarantine set.
+A read-only bucket metadata sweep on 2026-09-24 counted two test object
+generations totaling 4,674 bytes, with no noncurrent generation listed. A
+separate IAM-private synthetic discovery Job now passes 11 focused local
+checks and is included in the Cloud Run image build. It enumerates only exact
+synthetic UUIDv4 owner tags and aggregate PostgreSQL references under read-only
+transactions; it has not been deployed or run. Its database counts cannot by
+themselves prove that specific GCS keys and generations match. Exact-owner
+cleanup still requires the independent bucket-history proof and a hosted
+read-back before deleting either retained fixture.
 
 The local `gcloud` CLI has an active account and can read the test service
 when commands specify `--project tibotattle`; its default project is unrelated.
@@ -620,12 +736,18 @@ partial host into a complete Worker replacement.
    source/destination reconciliation and rollback. Copy the classified R2
    object set to GCS, compare bytes and metadata, and remap read-back GCS
    generations. Do not treat a copied object set as database-reference proof.
-5. Size separate zonal production databases and storage from measured data;
+5. Port the required one-minute maintenance phases and ordered analytics
+   delivery to PostgreSQL/GCS, then the public graph's selection, calculation,
+   claim/checkpoint, publication and serving path. Test crash/retry, authority
+   change, owner erasure and stale-source refusal. Confirm that any optional
+   catch-up queue or prepared-data builder is disabled or ported before its
+   Cloudflare owner is stopped.
+6. Size separate zonal production databases and storage from measured data;
    qualify public/admin ingress, Access assertions, direct-origin refusal,
    client callbacks, rate limits and production costs. The small IAM-private
    test deployment does not qualify public ingress or a hosted 10,000-record
    graph throughput target.
-6. Only after an exact rollback point, writer freeze, final delta and complete
+7. Only after an exact rollback point, writer freeze, final delta and complete
    read-back should production routing or client configuration change. Account
    for writes accepted on GCP before any reversal.
 

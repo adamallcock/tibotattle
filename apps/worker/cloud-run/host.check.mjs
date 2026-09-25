@@ -13,6 +13,7 @@ import {
   TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
   TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
   TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
+  telemetryV12DomainManifestDigestInput,
   telemetryV12DayManifestDigestInput,
   telemetryV12RequiredConsent,
   validateTelemetryV12Envelope,
@@ -379,6 +380,85 @@ test("partial HTTP dispatch serves only current read-only health and never calls
   assert.equal(connections, 2);
   assert.equal(workerHandlerCalls, 0);
   assert.equal(d1Touched, 0);
+});
+
+test("private-host envelope-key is public-only and bypasses PostgreSQL and Worker fallback", async () => {
+  let postgresConnections = 0;
+  let projectionCalls = 0;
+  let workerCalls = 0;
+  const pool = { async connect() { postgresConnections += 1; throw new Error("must not connect"); } };
+  const projectedKey = {
+    algorithm: "RSA-OAEP-256",
+    keyId: "key:private-host-check",
+    publicJwk: {
+      alg: "RSA-OAEP-256", e: "AQAB", key_ops: ["encrypt"],
+      kid: "key:private-host-check", kty: "RSA", n: "synthetic-public-modulus", use: "enc",
+    },
+  };
+  const dispatch = createPostgresTestV12DayManifestDispatch({
+    primaryPool: pool,
+    ledgerPool: { async connect() { postgresConnections += 1; throw new Error("must not connect"); } },
+    expectedMigrations: ONE_MIGRATION,
+    privateOrigin: "http://127.0.0.1:8080",
+    healthDispatch: async () => new Response(null, { status: 503 }),
+    admissionEnv: {},
+    assertAdmissionBindings() {},
+    assertAttemptAllowed: async () => {},
+    assertUploadAuthorizationBindings() {},
+    assertUploadAuthorizationAllowed: async () => {},
+    authenticatePostgresDevice: async () => { throw new Error("must not authenticate"); },
+    hasPostgresDeletionTombstone: async () => { throw new Error("must not read ledger"); },
+    readPostgresDeviceSyncState: async () => ({}),
+    readPostgresDeviceSyncV12Capabilities: async () => ({}),
+    readPostgresV12DayCandidates: async () => ({}),
+    createPostgresTypedV12Domain: () => ({
+      async createPredecessor() { throw new Error("must not create predecessor"); },
+      async activate() { throw new Error("must not activate domain"); },
+    }),
+    publicEnvelopeKey(raw) {
+      projectionCalls += 1;
+      assert.equal(raw, '{"synthetic":"public-key-config"}');
+      return projectedKey;
+    },
+    sourceNamespace: "synthetic-host-source",
+    assertPostgresV12UploadAllowed: async () => {},
+    createPostgresDeviceUploadAuthorization: async () => ({}),
+    registerPostgresTypedV12DayManifest: async () => ({}),
+    claimPostgresDeviceUploadAuthorization: async () => ({}),
+    abandonPostgresDeviceUploadAuthorization: async () => {},
+    persistPostgresTypedV12StagedChunk: async () => ({}),
+    decryptSyntheticEnvelope: async () => ({}),
+    validateTelemetryV12Envelope() {},
+    validateTelemetryV12StagedChunk: async () => ({}),
+    sha256Hex: async () => "0".repeat(64),
+    objectStore: { async put() {}, async delete() {} },
+    envelopePublicJwk: '{"synthetic":"public-key-config"}',
+    envelopePrivateJwk: "synthetic-private-key-config",
+    readBoundedRequestBody: async () => new Uint8Array(),
+    maxRequestBytes: 1_024,
+  });
+  const runtime = { postgresTestDispatch: dispatch };
+  const workerHandler = async () => {
+    workerCalls += 1;
+    throw new Error("private host must not fall back to the Worker");
+  };
+
+  const response = await dispatchCloudRunHostRequest(
+    new Request("http://127.0.0.1:8080/api/v1/envelope-key"), runtime, workerHandler,
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), projectedKey);
+  assert.equal(Object.hasOwn(projectedKey.publicJwk, "d"), false);
+  const wrongMethod = await dispatch(new Request("http://127.0.0.1:8080/api/v1/envelope-key", {
+    method: "POST",
+  }));
+  await assertApiError(wrongMethod, 405, "METHOD_NOT_ALLOWED");
+  assert.equal(wrongMethod.headers.get("allow"), "GET");
+  const wrongOrigin = await dispatch(new Request("http://127.0.0.2:8080/api/v1/envelope-key"));
+  assert.equal(wrongOrigin.status, 503);
+  assert.equal(postgresConnections, 0);
+  assert.equal(projectionCalls, 1);
+  assert.equal(workerCalls, 0);
 });
 
 test("partial HTTP health fails closed when either database or receipt is unavailable or stale", async () => {
@@ -782,7 +862,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       appType: "custom",
     });
     const [transport, v12Admission, ledgerAuthority, admission, rateLimit, bodyReader, constants,
-      cryptoModule, telemetryV12Repository]
+      cryptoModule, telemetryV12Repository, deviceSync, typedCodec]
       = await Promise.all([
         vite.ssrLoadModule("/src/postgres-typed-v12-transport.ts"),
         vite.ssrLoadModule("/src/postgres-typed-v12-admission.ts"),
@@ -793,11 +873,15 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
         vite.ssrLoadModule("/src/constants.ts"),
         vite.ssrLoadModule("/src/crypto.ts"),
         vite.ssrLoadModule("/src/telemetry-v12-repository.ts"),
+        vite.ssrLoadModule("/src/postgres-device-sync.ts"),
+        vite.ssrLoadModule("/src/typed-telemetry-codec.ts"),
       ]);
+    const v12ManifestCandidates = await vite.ssrLoadModule("/src/postgres-v12-manifest-candidates.ts");
     const [uploadAuthorization, formatAuthority] = await Promise.all([
       vite.ssrLoadModule("/src/postgres-upload-authorization.ts"),
       vite.ssrLoadModule("/src/postgres-telemetry-format-authority.ts"),
     ]);
+    const typedV12Domain = await vite.ssrLoadModule("/src/postgres-typed-v12-domain.ts");
     const keyPair = await webcrypto.subtle.generateKey({
       name: "RSA-OAEP", modulusLength: 2048,
       publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256",
@@ -856,6 +940,8 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     const deviceSecret = randomBytes(32).toString("base64url");
     const primaryTable = (name) => quotedTable(primarySchema, name);
     const schemaOptions = { primarySchema, ledgerSchema };
+    const sourceNamespace = `synthetic-host-source-${suffix}`;
+    const encodedSourceNamespace = Buffer.from(typedCodec.encodeTypedTelemetryId(sourceNamespace));
     const auth = `Device um_device_${deviceId}.${deviceSecret}`;
 
     await primaryPool.query(
@@ -863,6 +949,11 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
          id, owner_kind, state, consent_version, created_at
        ) VALUES ($1, 'social', 'active', $2, $3)`,
       [participantId, constants.TELEMETRY_CONSENT_VERSION, nowIso],
+    );
+    await primaryPool.query(
+      `INSERT INTO ${primaryTable("attribution_enrollments")} (participant_id, namespace, created_at)
+       VALUES ($1, $2, $3)`,
+      [participantId, sha256Hex(`synthetic-enrollment:${suffix}`), nowIso],
     );
     await primaryPool.query(
       `INSERT INTO ${primaryTable("web_sessions")} (
@@ -894,6 +985,23 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
         TELEMETRY_V12_FIELD_DICTIONARY_VERSION, TELEMETRY_V12_PRIVACY_CONTRACT_VERSION, nowIso],
     );
     await primaryPool.query(
+      `INSERT INTO ${primaryTable("typed_telemetry_namespaces")} (id, original_id)
+       VALUES (1, $1)`,
+      [encodedSourceNamespace],
+    );
+    await primaryPool.query(
+      `INSERT INTO ${primaryTable("typed_v1_admission_state")} (
+         id, source_namespace, namespace_id, runtime_contract_version, next_source_row_id
+       ) VALUES (1, $1, 1, 1, 1)`,
+      [sourceNamespace],
+    );
+    await primaryPool.query(
+      `INSERT INTO ${primaryTable("typed_v11_admission_state")} (
+         id, source_namespace, namespace_id, runtime_contract_version, next_source_row_id
+       ) VALUES (1, $1, 1, 1, 1)`,
+      [sourceNamespace],
+    );
+    await primaryPool.query(
       `INSERT INTO ${primaryTable("storage_v11_owner_links")} (participant_id, owner_digest, state)
        VALUES ($1,$2,'active')`,
       [participantId, randomBytes(32).toString("hex")],
@@ -918,7 +1026,9 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     const admissionEnv = { ENVIRONMENT: "test" };
     for (const [binding, name, limit] of [
       ["ENROLLMENT_RATE_LIMIT", "ENROLLMENT", 20],
-      ["RECOVERY_RATE_LIMIT", "RECOVERY", 20],
+      // This end-to-end fixture exercises more than 20 authenticated sync
+      // requests; cover the fixed-window boundary separately below.
+      ["RECOVERY_RATE_LIMIT", "RECOVERY", 100],
       ["CLIENT_ATTEMPT_RATE_LIMIT", "CLIENT_ATTEMPT", 1_000],
       ["PUBLIC_READ_RATE_LIMIT", "PUBLIC_READ", 1_000],
       ["UPLOAD_AUTHORIZATION_RATE_LIMIT", "UPLOAD_AUTHORIZATION", 1_000],
@@ -933,6 +1043,19 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
         keyHashSecret: randomBytes(32),
       });
     }
+    const recoveryBoundary = rateLimit.createPostgresRateLimiter(primaryPool, {
+      primarySchema,
+      ledgerSchema,
+      name: "HOST_RECOVERY_BOUNDARY",
+      limit: 20,
+      periodSeconds: 60,
+      keyHashSecret: randomBytes(32),
+    });
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      assert.deepEqual(await recoveryBoundary.limit({ key: "synthetic-host-boundary" }), { success: true });
+    }
+    assert.deepEqual(await recoveryBoundary.limit({ key: "synthetic-host-boundary" }), { success: false });
+    assert.deepEqual(await recoveryBoundary.limit({ key: "synthetic-other-device" }), { success: true });
     const healthDispatch = createPostgresTestHealthDispatch({
       primaryPool,
       ledgerPool,
@@ -940,6 +1063,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
       privateOrigin: "http://127.0.0.1:43817",
     });
+    let deviceSyncRateLimitCalls = 0;
     const manifestDispatchOptions = {
       primaryPool,
       ledgerPool,
@@ -949,11 +1073,20 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       healthDispatch,
       admissionEnv: Object.freeze(admissionEnv),
       assertAdmissionBindings: admission.assertAdmissionBindings,
-      assertAttemptAllowed: admission.assertAttemptAllowed,
+      assertAttemptAllowed: (...args) => {
+        if (args[4] === "device_sync") deviceSyncRateLimitCalls += 1;
+        return admission.assertAttemptAllowed(...args);
+      },
       assertUploadAuthorizationBindings: admission.assertUploadAuthorizationBindings,
       assertUploadAuthorizationAllowed: admission.assertUploadAuthorizationAllowed,
       authenticatePostgresDevice: transport.authenticatePostgresDevice,
       hasPostgresDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
+      readPostgresDeviceSyncState: deviceSync.readPostgresDeviceSyncState,
+      readPostgresDeviceSyncV12Capabilities: deviceSync.readPostgresDeviceSyncV12Capabilities,
+      readPostgresV12DayCandidates: v12ManifestCandidates.readPostgresV12DayCandidates,
+      publicEnvelopeKey: cryptoModule.publicEnvelopeKey,
+      sourceNamespace,
+      createPostgresTypedV12Domain: typedV12Domain.createPostgresTypedV12Domain,
       assertPostgresV12UploadAllowed: (pool, principal, nowEpoch, options) =>
         formatAuthority.assertPostgresTelemetryTransportWriteAllowed(
           pool, principal, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
@@ -1000,7 +1133,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     for (const unsupported of [
       request({ url: "http://127.0.0.2:43817/api/health", method: "GET" }),
       request({ url: "http://127.0.0.1:43817/api/v1/contribute" }),
-      request({ method: "GET" }),
+      request({ url: "http://127.0.0.1:43817/api/v1/unsupported-read", method: "GET" }),
     ]) {
       const response = await dispatch(unsupported);
       assert.equal(response.status, 503);
@@ -1013,6 +1146,186 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     }
     assert.equal((await health.json()).workerApplicationReady, false);
 
+    const syncStateUrl = "http://127.0.0.1:43817/api/v1/device/sync/state";
+    const syncCapabilitiesV12Url = "http://127.0.0.1:43817/api/v1/device/sync-capabilities-v1.2";
+    const envelopeKeyUrl = "http://127.0.0.1:43817/api/v1/envelope-key";
+    const domainPredecessorUrl = "http://127.0.0.1:43817/api/v1/me/telemetry-v12/domain-predecessor";
+    const domainActivateUrl = "http://127.0.0.1:43817/api/v1/me/telemetry-v12/domain-activate";
+    const emptySyncStateResponse = await dispatch(request({ url: syncStateUrl, method: "GET" }));
+    assert.equal(emptySyncStateResponse.status, 200);
+    const emptySyncState = await emptySyncStateResponse.json();
+    const { retryAt, ...admissionWithoutRetryAt } = emptySyncState.admission;
+    assert.deepEqual({ ...emptySyncState, admission: admissionWithoutRetryAt }, {
+      schemaVersion: "device-sync-state-v1.0",
+      contractVersion: "telemetry-contribution-v1.0",
+      acknowledgedThroughDay: null,
+      historyDigest: null,
+      dayCount: 0,
+      chunkCount: 0,
+      admission: {
+        schemaVersion: "telemetry-chunk-admission-v1.0",
+        state: "available",
+        windowDay: nowIso.slice(0, 10),
+        budget: "launch_week",
+        acceptedChunks: 0,
+        remainingChunks: 20_000,
+        maximumChunks: 20_000,
+      },
+    });
+    assert.match(retryAt, /^\d{4}-\d{2}-\d{2}T00:00:00\.000Z$/u);
+    const capabilitiesResponse = await dispatch(request({ url: syncCapabilitiesV12Url, method: "GET" }));
+    assert.equal(capabilitiesResponse.status, 200);
+    const capabilities = await capabilitiesResponse.json();
+    assert.deepEqual(capabilities, {
+      schemaVersion: "device-sync-capabilities-v1.2",
+      destinationOrigin: "http://127.0.0.1:43817",
+      enrollmentNamespace: sha256Hex(`synthetic-enrollment:${suffix}`),
+      identityVersion: "account-track-v2",
+      authorityKind: "social",
+      successor: {
+        schemaVersion: TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+        envelopeSchemaVersion: "telemetry-envelope-v1.2",
+        lifecycle: "accepted",
+        requiredConsent: telemetryV12RequiredConsent(),
+        consentCurrent: true,
+        authorizationCurrent: true,
+        activationTime: nowIso,
+      },
+    });
+    const envelopeKeyResponse = await dispatch(new Request(envelopeKeyUrl));
+    assert.equal(envelopeKeyResponse.status, 200);
+    const envelopeKey = await envelopeKeyResponse.json();
+    assert.deepEqual(envelopeKey, {
+      algorithm: "RSA-OAEP-256",
+      keyId: "key:gcp-host-v12",
+      publicJwk: {
+        alg: "RSA-OAEP-256",
+        e: envelopePublicJwk.e,
+        key_ops: ["encrypt"],
+        kid: "key:gcp-host-v12",
+        kty: "RSA",
+        n: envelopePublicJwk.n,
+        use: "enc",
+      },
+    });
+    assert.equal(Object.hasOwn(envelopeKey.publicJwk, "d"), false);
+
+    const candidateFixtures = Array.from({ length: 205 }, (_, index) => ({
+      id: randomUUID(),
+      day: index % 3 === 0 ? "2020-01-02" : "2020-01-01",
+      digest: sha256Hex(`synthetic-v12-candidate:${suffix}:${index}`),
+      createdAt: new Date(Date.UTC(2020, 0, 1, 0, 0, Math.floor(index / 3))).toISOString(),
+      expectedChunks: index % 5,
+    }));
+    const candidateValues = [];
+    const candidateSqlRows = candidateFixtures.map((fixture, index) => {
+      const offset = index * 10;
+      candidateValues.push(
+        fixture.id, participantId, deviceId, fixture.day, fixture.digest,
+        "synthetic-manifest-candidate", "{}", fixture.expectedChunks, "staged", fixture.createdAt,
+      );
+      return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}::date,
+        $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10})`;
+    });
+    await primaryPool.query(
+      `INSERT INTO ${primaryTable("telemetry_v12_day_manifests")} (
+         id, participant_id, device_id, chunk_day, manifest_digest, parser_version,
+         manifest_json, expected_chunk_count, state, created_at
+       ) VALUES ${candidateSqlRows.join(",")}`,
+      candidateValues,
+    );
+    const candidatesRequestCount = deviceSyncRateLimitCalls;
+    const candidatesResponse = await dispatch(request({
+      method: "GET",
+      url: `${manifestUrl}?fromDay=2020-01-01&toDay=2020-01-31`,
+    }));
+    assert.equal(candidatesResponse.status, 200);
+    assert.equal(deviceSyncRateLimitCalls, candidatesRequestCount + 1,
+      "manifest reads must consume the authenticated device-sync limiter");
+    const sortedCandidates = [...candidateFixtures].sort((left, right) =>
+      left.day.localeCompare(right.day)
+      || left.createdAt.localeCompare(right.createdAt)
+      || left.id.localeCompare(right.id));
+    assert.deepEqual(await candidatesResponse.json(), {
+      candidates: sortedCandidates.slice(0, 200).map((fixture) => ({
+        manifestId: fixture.id,
+        day: fixture.day,
+        manifestDigest: fixture.digest,
+        state: "staged",
+        expectedChunks: fixture.expectedChunks,
+      })),
+      bounded: true,
+    });
+    await assertApiError(await dispatch(request({
+      method: "GET",
+      url: `${manifestUrl}?fromDay=2020-01-01&toDay=2020-01-02&extra=1`,
+    })), 400, "BODY_INVALID");
+    await assertApiError(await dispatch(request({
+      method: "GET",
+      url: `${manifestUrl}?fromDay=2020-01-01&fromDay=2020-01-02&toDay=2020-01-03`,
+    })), 400, "BODY_INVALID");
+    await assertApiError(await dispatch(request({
+      method: "GET",
+      url: `${manifestUrl}?fromDay=2020-01-01&toDay=2020-02-01`,
+    })), 400, "SYNC_RANGE_TOO_LARGE");
+    const wrongMethodResponse = await dispatch(request({ url: syncStateUrl }));
+    await assertApiError(wrongMethodResponse, 405, "METHOD_NOT_ALLOWED");
+    assert.equal(wrongMethodResponse.headers.get("allow"), "GET");
+    const wrongPredecessorMethod = await dispatch(request({
+      url: domainPredecessorUrl, method: "GET",
+    }));
+    await assertApiError(wrongPredecessorMethod, 405, "METHOD_NOT_ALLOWED");
+    assert.equal(wrongPredecessorMethod.headers.get("allow"), "POST");
+    await assertApiError(await dispatch(request({
+      url: syncStateUrl, method: "GET", headers: { cookie: "session=not-used" },
+    })), 401, "DEVICE_AUTH_INVALID");
+    await assertApiError(await dispatch(request({
+      url: manifestUrl, method: "GET", headers: { cookie: "session=not-used" },
+    })), 401, "DEVICE_AUTH_INVALID");
+    await assertApiError(await dispatch(request({
+      url: domainPredecessorUrl, headers: { cookie: "session=not-used" }, body: "{}",
+    })), 401, "DEVICE_AUTH_INVALID");
+    await assertApiError(await dispatch(request({
+      url: domainPredecessorUrl, body: JSON.stringify({ extra: true }),
+    })), 400, "BODY_INVALID");
+    await assertApiError(await dispatch(request({
+      url: domainActivateUrl, body: "{}",
+    })), 400, "TELEMETRY_MANIFEST_INVALID");
+
+    await primaryPool.query(
+      `UPDATE ${primaryTable("telemetry_v12_runtime")} SET state='staged' WHERE id=1`,
+    );
+    await primaryPool.query(
+      `UPDATE ${primaryTable("telemetry_v12_typed_runtime")} SET state='staged' WHERE id=1`,
+    );
+    const stagedCapabilitiesResponse = await dispatch(request({
+      url: syncCapabilitiesV12Url, method: "GET",
+    }));
+    assert.equal(stagedCapabilitiesResponse.status, 200);
+    const stagedCapabilities = await stagedCapabilitiesResponse.json();
+    assert.equal(stagedCapabilities.successor.lifecycle, "staged");
+    assert.equal(stagedCapabilities.successor.authorizationCurrent, false);
+    assert.equal(stagedCapabilities.successor.activationTime, nowIso);
+    await primaryPool.query(
+      `UPDATE ${primaryTable("telemetry_v12_runtime")} SET state='active' WHERE id=1`,
+    );
+    await primaryPool.query(
+      `UPDATE ${primaryTable("telemetry_v12_typed_runtime")} SET state='active' WHERE id=1`,
+    );
+
+    await primaryPool.query(
+      `DELETE FROM ${primaryTable("typed_v11_admission_state")} WHERE id=1`,
+    );
+    await assertApiError(await dispatch(request({
+      url: syncCapabilitiesV12Url, method: "GET",
+    })), 503, "BACKEND_STORAGE_UNAVAILABLE");
+    await primaryPool.query(
+      `INSERT INTO ${primaryTable("typed_v11_admission_state")} (
+         id, source_namespace, namespace_id, runtime_contract_version, next_source_row_id
+       ) VALUES (1, $1, 1, 1, 1)`,
+      [sourceNamespace],
+    );
+
     await assertApiError(await dispatch(request({ headers: { cookie: "session=not-used" } })), 401, "DEVICE_AUTH_INVALID");
     await assertApiError(await dispatch(request({ headers: {
       authorization: `Device um_device_${deviceId}.${randomBytes(32).toString("base64url")}`,
@@ -1023,6 +1336,9 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     await assertApiError(await dispatch(request({ url: chunkUploadUrl, body: " ".repeat(constants.MAX_REQUEST_BYTES + 1) })), 413, "BODY_TOO_LARGE");
     await assertApiError(await dispatch(request({ url: chunkUploadUrl, headers: { cookie: "session=not-used" } })), 401, "DEVICE_AUTH_INVALID");
     await assertApiError(await dispatch(request({ body: "{}" })), 400, "TELEMETRY_MANIFEST_INVALID");
+    await assertApiError(await dispatch(request({
+      url: domainPredecessorUrl, body: "{}",
+    })), 409, "TELEMETRY_MANIFEST_INCOMPLETE");
 
     await primaryPool.query(
       `UPDATE ${primaryTable("collection_controls")}
@@ -1031,6 +1347,9 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       [new Date().toISOString()],
     );
     await assertApiError(await dispatch(request()), 503, "PROCESSING_DISABLED");
+    await assertApiError(await dispatch(request({
+      url: domainPredecessorUrl, body: "{}",
+    })), 503, "PROCESSING_DISABLED");
     await primaryPool.query(
       `UPDATE ${primaryTable("collection_controls")}
           SET revision=4, control_state='operational', processing_enabled=true, updated_at=$1
@@ -1334,9 +1653,9 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     ]);
     twoPutBarrier = null;
     releaseConcurrentPuts();
+    for (const upload of concurrentReplays) assert.equal(upload.response.status, 202);
     assert.equal(objectPutCount, putsBeforeConcurrentReplay + 2);
     assert.equal(objectDeleteCount, deletesBeforeConcurrentReplay + 1);
-    for (const upload of concurrentReplays) assert.equal(upload.response.status, 202);
     const concurrentReceipts = await Promise.all(
       concurrentReplays.map((upload) => upload.response.json()),
     );
@@ -1420,10 +1739,115 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     assert.equal(uncertainCommitSource.rowCount, 1);
     assert.equal(objectDeleteCount, 1);
 
+    const recoveredChunk = await uploadChunk(uploadChunks[1]);
+    assert.equal(recoveredChunk.response.status, 202);
+    const recoveredReceipt = await recoveredChunk.response.json();
+    assert.equal(recoveredReceipt.replayed, false);
+    const readyManifest = await primaryPool.query(
+      `SELECT state, expected_chunk_count,
+              (SELECT count(*)::integer FROM ${primaryTable("telemetry_v12_chunks")} chunk
+                WHERE chunk.manifest_id = manifest.id) AS staged_chunk_count
+         FROM ${primaryTable("telemetry_v12_day_manifests")} manifest
+        WHERE manifest.id=$1`,
+      [uploadManifestReceipt.manifestId],
+    );
+    assert.deepEqual(readyManifest.rows[0], {
+      state: "ready", expected_chunk_count: uploadChunks.length,
+      staged_chunk_count: uploadChunks.length,
+    });
+
+    const syncRateBeforeDomain = deviceSyncRateLimitCalls;
+    const predecessorResponse = await dispatch(request({
+      url: domainPredecessorUrl, body: "{}",
+    }));
+    assert.equal(predecessorResponse.status, 201);
+    const predecessor = await predecessorResponse.json();
+    assert.equal(predecessor.schemaVersion, "telemetry-domain-predecessor-v1.2");
+    assert.match(predecessor.token, /^[0-9a-f-]{36}$/u);
+    assert.equal(predecessor.previousGenerationId, null);
+    assert.match(predecessor.legacyFingerprint, /^[0-9a-f]{64}$/u);
+    assert.equal(predecessor.fromDay, uploadDay);
+    assert.equal(predecessor.throughDay, uploadDay);
+    assert.ok(Date.parse(predecessor.expiresAt) > Date.now());
+
+    const domainManifest = {
+      schemaVersion: "telemetry-domain-manifest-v1.2",
+      fromDay: predecessor.fromDay,
+      throughDay: predecessor.throughDay,
+      predecessor: {
+        token: predecessor.token,
+        previousGenerationId: predecessor.previousGenerationId,
+        legacyFingerprint: predecessor.legacyFingerprint,
+      },
+      days: [{
+        day: uploadDay,
+        manifestId: uploadManifestReceipt.manifestId,
+        manifestDigest: uploadManifest.manifestDigest,
+      }],
+      manifestDigest: "0".repeat(64),
+    };
+    domainManifest.manifestDigest = sha256Hex(Buffer.from(
+      telemetryV12DomainManifestDigestInput(domainManifest),
+    ));
+    const activationResponse = await dispatch(request({
+      url: domainActivateUrl, body: JSON.stringify(domainManifest),
+    }));
+    assert.equal(activationResponse.status, 201);
+    const activation = await activationResponse.json();
+    assert.deepEqual(activation, {
+      schemaVersion: "telemetry-domain-activation-v1.2",
+      generationId: activation.generationId,
+      manifestDigest: domainManifest.manifestDigest,
+      fromDay: uploadDay,
+      throughDay: uploadDay,
+      replay: false,
+    });
+    assert.match(activation.generationId, /^[0-9a-f-]{36}$/u);
+
+    const activationReplayResponse = await dispatch(request({
+      url: domainActivateUrl, body: JSON.stringify(domainManifest),
+    }));
+    assert.equal(activationReplayResponse.status, 201);
+    assert.deepEqual(await activationReplayResponse.json(), { ...activation, replay: true });
+    assert.equal(deviceSyncRateLimitCalls, syncRateBeforeDomain + 3,
+      "domain predecessor and activation requests must consume the authenticated device-sync limiter");
+
+    const activeHead = await primaryPool.query(
+      `SELECT head.generation_id, head.revision::text AS revision, domain.manifest_digest
+         FROM ${primaryTable("telemetry_v12_domain_heads")} head
+         JOIN ${primaryTable("telemetry_v12_domains")} domain
+           ON domain.id = head.generation_id
+        WHERE head.participant_id=$1`,
+      [participantId],
+    );
+    assert.deepEqual(activeHead.rows, [{
+      generation_id: activation.generationId,
+      revision: "1",
+      manifest_digest: domainManifest.manifestDigest,
+    }]);
+    const consumedPredecessor = await primaryPool.query(
+      `SELECT token_hash, consumed_at FROM ${primaryTable("telemetry_v12_domain_predecessors")}
+        WHERE participant_id=$1 AND device_id=$2`,
+      [participantId, deviceId],
+    );
+    assert.equal(consumedPredecessor.rowCount, 1);
+    assert.equal(consumedPredecessor.rows[0].token_hash, sha256Hex(predecessor.token));
+    assert.ok(consumedPredecessor.rows[0].consumed_at);
+
     await ledgerAuthority.recordPostgresDeletionTombstone(
       ledgerPool, participantId, Date.now(), { schema: schemaOptions },
     );
     await assertApiError(await dispatch(request({ body: JSON.stringify(manifest) })), 401, "DEVICE_AUTH_INVALID");
+    await assertApiError(await dispatch(request({
+      url: domainPredecessorUrl, body: "{}",
+    })), 401, "DEVICE_AUTH_INVALID");
+    await assertApiError(await dispatch(request({
+      url: domainActivateUrl, body: JSON.stringify(domainManifest),
+    })), 401, "DEVICE_AUTH_INVALID");
+    await assertApiError(await dispatch(request({
+      method: "GET",
+      url: `${manifestUrl}?fromDay=2020-01-01&toDay=2020-01-31`,
+    })), 401, "DEVICE_AUTH_INVALID");
     assert.equal(d1Touched, 0);
     assert.equal(workerCalls, 0);
   } finally {

@@ -33,9 +33,9 @@ const SECRET_PATH_PARTS = new Set([
   "credentials.json",
   "service-account.json",
 ]);
-const EXPECTED_PRIMARY_MIGRATION_COUNT = 30;
-const EXPECTED_LEDGER_MIGRATION_COUNT = 5;
-const EXPECTED_PRIMARY_MIGRATION_TAIL = "0030_legacy_typed_telemetry.sql";
+const EXPECTED_PRIMARY_MIGRATION_COUNT = 35;
+const EXPECTED_LEDGER_MIGRATION_COUNT = 6;
+const EXPECTED_PRIMARY_MIGRATION_TAIL = "0035_v12_ready_manifest_retention.sql";
 const SKIPPED_DIRECTORY_NAMES = new Set([
   ".git",
   ".wrangler",
@@ -68,6 +68,10 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/test-migrations.check.mjs", destination: "apps/worker/cloud-run/test-migrations.check.mjs" }),
   Object.freeze({ source: "cloud-run/test-activation.mjs", destination: "apps/worker/cloud-run/test-activation.mjs" }),
   Object.freeze({ source: "cloud-run/test-activation.check.mjs", destination: "apps/worker/cloud-run/test-activation.check.mjs" }),
+  Object.freeze({ source: "cloud-run/synthetic-v12-cleanup.mjs", destination: "apps/worker/cloud-run/synthetic-v12-cleanup.mjs" }),
+  Object.freeze({ source: "cloud-run/synthetic-v12-cleanup.check.mjs", destination: "apps/worker/cloud-run/synthetic-v12-cleanup.check.mjs" }),
+  Object.freeze({ source: "cloud-run/synthetic-v12-discovery.mjs", destination: "apps/worker/cloud-run/synthetic-v12-discovery.mjs" }),
+  Object.freeze({ source: "cloud-run/synthetic-v12-discovery.check.mjs", destination: "apps/worker/cloud-run/synthetic-v12-discovery.check.mjs" }),
   Object.freeze({ source: "cloud-run/node-crypto-adapter.mjs", destination: "apps/worker/cloud-run/node-crypto-adapter.mjs" }),
   Object.freeze({ source: "cloud-run/owner-bootstrap.mjs", destination: "apps/worker/cloud-run/owner-bootstrap.mjs" }),
   Object.freeze({ source: "cloud-run/request-boundary.mjs", destination: "apps/worker/cloud-run/request-boundary.mjs" }),

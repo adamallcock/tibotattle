@@ -58,4 +58,35 @@ test("Worker migration receipt source is generated exactly from canonical SQL", 
     ),
     true,
   );
+  assert.equal(
+    renderPostgresRuntimeSchema(manifest).includes(
+      '"0031_typed_legacy_source_family_receipts.sql"',
+    ),
+    true,
+  );
+  assert.equal(
+    renderPostgresRuntimeSchema(manifest).includes(
+      '"0032_analytics_publication_fences.sql"',
+    ),
+    true,
+  );
+  assert.equal(
+    renderPostgresRuntimeSchema(manifest).includes(
+      '"0033_legacy_admission_proofs.sql"',
+    ),
+    true,
+  );
+  assert.equal(
+    renderPostgresRuntimeSchema(manifest).includes(
+      '"0034_usage_correction_history.sql"',
+      '"0035_v12_ready_manifest_retention.sql"',
+    ),
+    true,
+  );
+  assert.equal(
+    renderPostgresRuntimeSchema(manifest).includes(
+      '"0006_erasure_ledger_transfer_receipts.sql"',
+    ),
+    true,
+  );
 });

@@ -65,7 +65,7 @@ test("PostgreSQL ledger tombstones preserve retention and pending erasure author
     await pool.query(`CREATE SCHEMA "${schema}"`);
     schemaCreated = true;
     const migrations = await applyPostgresMigrations({ role: "ledger", schema, pool });
-    assert.equal(migrations.applied, 5);
+    assert.equal(migrations.applied, 6);
 
     vite = await createServer({
       root: new URL("..", import.meta.url).pathname,
@@ -130,11 +130,18 @@ test("PostgreSQL ledger tombstones preserve retention and pending erasure author
     );
     assert.equal(await adapter.hasPostgresDeletionTombstone(pool, participantId, expiredAt, options), true,
       "a pending erasure job retains deletion authority after tombstone expiry");
+    const terminalJson = JSON.stringify({
+      sourceId: "synthetic-source-v1", sequence: 1,
+      eventDigest: "a".repeat(64), ownerDigest, revision: 1,
+      kind: "owner-erased", objectDigest: "b".repeat(64),
+      contentDigest: "c".repeat(64), authorityEpoch: 1,
+      publicAuthorityEpoch: 1, recordedMs: expiredAt,
+    });
     await pool.query(
       `UPDATE "${schema}"."storage_erasure_jobs"
-          SET state='complete',completed_at=$2::timestamptz
+          SET state='complete',completed_at=$2::timestamptz,terminal_json=$4
         WHERE participant_digest=$1 AND owner_digest=$3`,
-      [digest, new Date(expiredAt).toISOString(), ownerDigest],
+      [digest, new Date(expiredAt).toISOString(), ownerDigest, terminalJson],
     );
     assert.equal(await adapter.hasPostgresDeletionTombstone(pool, participantId, expiredAt, options), false,
       "a completed erasure job no longer extends expired tombstone authority");

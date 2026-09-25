@@ -113,8 +113,22 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403 } = {}) 
             workerApplicationReady: false,
             checks: {
               postgresMajor: 17,
-              primaryMigrationReceipt: { status: "current", version: 30 },
-              ledgerMigrationReceipt: { status: "current", version: 5 },
+              primaryMigrationReceipt: { status: "current", version: 35 },
+              ledgerMigrationReceipt: { status: "current", version: 6 },
+            },
+          });
+        }
+        if (url.pathname === "/api/v1/device/sync/state") {
+          return response(200, {
+            schemaVersion: "device-sync-state-v1.0",
+            contractVersion: "telemetry-contribution-v1.0",
+            acknowledgedThroughDay: null,
+            historyDigest: null,
+            dayCount: 0,
+            chunkCount: 0,
+            admission: {
+              schemaVersion: "telemetry-chunk-admission-v1.0",
+              state: "available",
             },
           });
         }
@@ -300,11 +314,12 @@ test("fixture seed writes only uniquely tagged authority rows in one transaction
   assert.equal(fixture.participantId, `${SYNTHETIC_V12_SMOKE_PARTICIPANT_PREFIX}${IDS[0]}`);
   assert.equal(fixture.deviceId, IDS[3]);
   assert.match(fixture.ownerDigest, /^[a-f0-9]{64}$/u);
+  assert.match(fixture.enrollmentNamespace, /^[a-f0-9]{64}$/u);
   assert.deepEqual(statements.map(({ sql }) => sql === "RELEASE" ? sql : sql.match(/(?:INSERT INTO|BEGIN|COMMIT)/u)?.[0]), [
-    "BEGIN", "INSERT INTO", "INSERT INTO", "INSERT INTO", "INSERT INTO", "INSERT INTO", "INSERT INTO", "COMMIT", "RELEASE",
+    "BEGIN", "INSERT INTO", "INSERT INTO", "INSERT INTO", "INSERT INTO", "INSERT INTO", "INSERT INTO", "INSERT INTO", "COMMIT", "RELEASE",
   ]);
   assert.equal(statements.some(({ sql }) => /UPDATE .*collection_controls|DELETE FROM/u.test(sql)), false);
-  assert.equal(statements.filter(({ sql }) => /INSERT INTO/u.test(sql)).length, 6);
+  assert.equal(statements.filter(({ sql }) => /INSERT INTO/u.test(sql)).length, 7);
   assert.ok(statements.every(({ sql }) => !/POSTGRES_RATE_LIMIT_SECRET/u.test(sql)));
 });
 
@@ -468,20 +483,22 @@ test("smoke journey keeps IAM and participant credentials separate and replays e
   assert.deepEqual({
     manifest: receipt.manifest,
     chunk: receipt.chunk,
+    syncState: receipt.syncState,
     postgresReadback: receipt.postgresReadback,
     gcsReadback: receipt.gcsReadback,
   }, {
     manifest: "staged_and_exactly_replayed",
     chunk: "staged_and_exactly_replayed",
+    syncState: "empty_history_admission_available",
     postgresReadback: true,
     gcsReadback: true,
   });
-  assert.equal(fake.getTokenCount, 7);
+  assert.equal(fake.getTokenCount, 8);
   const anonymous = fake.calls[0];
   assert.equal(anonymous.options.headers.authorization, undefined);
   assert.equal(anonymous.options.headers["x-serverless-authorization"], undefined);
   const authenticated = fake.calls.slice(1);
-  assert.equal(authenticated.length, 7);
+  assert.equal(authenticated.length, 8);
   for (const call of authenticated) {
     assert.equal(call.url.origin, CLOUD_RUN_IAM_TEST_TARGET.origin);
     assert.equal(call.options.redirect, "manual");
@@ -494,7 +511,7 @@ test("smoke journey keeps IAM and participant credentials separate and replays e
     call.options.headers.authorization?.startsWith("Device "));
   const grantAuthCalls = authenticated.filter((call) =>
     call.options.headers.authorization?.startsWith("Upload "));
-  assert.equal(deviceAuthCalls.length, 4);
+  assert.equal(deviceAuthCalls.length, 5);
   assert.equal(grantAuthCalls.length, 2);
   assert.equal(grantAuthCalls[0].options.headers.authorization, `Upload ${GRANT_TOKEN_1}`);
   assert.equal(grantAuthCalls[1].options.headers.authorization, `Upload ${GRANT_TOKEN_2}`);

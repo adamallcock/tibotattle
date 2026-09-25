@@ -49,6 +49,7 @@ const MAX_ENVELOPE_BYTES = 2_100_000;
 const MANIFEST_PATH = "/api/v1/device/telemetry/v1.2/day-manifests";
 const GRANT_PATH = "/api/v1/device/upload-authorizations";
 const CHUNK_PATH = "/api/v1/contributions";
+const SYNC_STATE_PATH = "/api/v1/device/sync/state";
 const encoder = new TextEncoder();
 
 function fail(code, extras = {}) {
@@ -227,6 +228,7 @@ export async function seedSyntheticV12Fixture({
   const pairingId = randomUUIDImpl();
   const deviceId = randomUUIDImpl();
   const ownerDigest = randomBytesImpl(32).toString("hex");
+  const enrollmentNamespace = randomBytesImpl(32).toString("hex");
   const deviceSecret = randomBytesImpl(32).toString("base64url");
   const nowIso = now.toISOString();
   const expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60_000).toISOString();
@@ -241,6 +243,12 @@ export async function seedSyntheticV12Fixture({
          id, owner_kind, state, consent_version, consented_at, created_at
        ) VALUES ($1, 'social', 'active', $2, $3, $3)`,
       [participantId, TELEMETRY_CONSENT_VERSION, nowIso],
+    );
+    await client.query(
+      `INSERT INTO ${primary("attribution_enrollments")} (
+         participant_id, namespace, created_at
+       ) VALUES ($1, $2, $3)`,
+      [participantId, enrollmentNamespace, nowIso],
     );
     await client.query(
       `INSERT INTO ${primary("web_sessions")} (
@@ -284,6 +292,7 @@ export async function seedSyntheticV12Fixture({
       deviceId,
       deviceSecret,
       ownerDigest,
+      enrollmentNamespace,
       deviceAuthorization: `Device um_device_${deviceId}.${deviceSecret}`,
     });
   } catch {
@@ -459,7 +468,7 @@ async function requestJson({ fetchImpl, getIdToken, origin, method, path, author
   if (authorization !== undefined) headers.authorization = authorization;
   if (body !== undefined) headers["content-type"] = "application/json; charset=utf-8";
   const url = new URL(path, origin);
-  if (url.origin !== origin || ![MANIFEST_PATH, GRANT_PATH, CHUNK_PATH, "/api/health"].includes(path)) {
+  if (url.origin !== origin || ![MANIFEST_PATH, GRANT_PATH, CHUNK_PATH, SYNC_STATE_PATH, "/api/health"].includes(path)) {
     fail("SMOKE_ROUTE_INVALID");
   }
   let response;
@@ -680,8 +689,8 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
         || health.scope !== "postgres_schema_and_migrations_only"
         || health.status !== "ready" || health.workerApplicationReady !== false
         || health.checks?.postgresMajor !== 17
-        || primaryReceipt?.status !== "current" || primaryReceipt.version !== 30
-        || ledgerReceipt?.status !== "current" || ledgerReceipt.version !== 5) {
+        || primaryReceipt?.status !== "current" || primaryReceipt.version !== 35
+        || ledgerReceipt?.status !== "current" || ledgerReceipt.version !== 6) {
       fail("SMOKE_HEALTH_CONTRACT_INVALID");
     }
 
@@ -693,6 +702,24 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
         || typeof fixture.deviceAuthorization !== "string"
         || !fixture.deviceAuthorization.startsWith("Device um_device_")) {
       fail("SMOKE_FIXTURE_INVALID", { orphaned: true });
+    }
+
+    const { response: syncResponse, value: syncState } = await requestJson({
+      fetchImpl: deps.fetchImpl,
+      getIdToken: deps.getIdToken,
+      origin: config.origin,
+      method: "GET",
+      path: SYNC_STATE_PATH,
+      authorization: fixture.deviceAuthorization,
+    });
+    expectStatus(syncResponse, syncState, 200, "SMOKE_SYNC_STATE_FAILED");
+    if (syncState.schemaVersion !== "device-sync-state-v1.0"
+        || syncState.acknowledgedThroughDay !== null
+        || syncState.historyDigest !== null
+        || syncState.dayCount !== 0 || syncState.chunkCount !== 0
+        || syncState.admission?.schemaVersion !== "telemetry-chunk-admission-v1.0"
+        || syncState.admission?.state !== "available") {
+      fail("SMOKE_SYNC_STATE_CONTRACT_INVALID");
     }
 
     const { manifest, chunk } = makeManifestAndChunk({
@@ -802,6 +829,7 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       origin: config.origin,
       manifest: "staged_and_exactly_replayed",
       chunk: "staged_and_exactly_replayed",
+      syncState: "empty_history_admission_available",
       postgresReadback: true,
       gcsReadback: true,
       retainedFixturePrefix: SYNTHETIC_V12_SMOKE_PARTICIPANT_PREFIX,

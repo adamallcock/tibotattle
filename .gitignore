@@ -67,6 +67,9 @@ native/windows-filesystem/build/
 # Native Linux qualification output.
 native/linux-credential-mutex/build/
 
+# Local Cloud Run bundle produced by the private GCP test-host build.
+apps/worker/cloud-run/dist/
+
 # Package manager store
 .pnpm-store/
 

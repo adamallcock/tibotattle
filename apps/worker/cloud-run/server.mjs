@@ -24,6 +24,11 @@ import { createFilesystemAssets } from "./assets.mjs";
 import { createPostgresUploadIngressBudget } from "../src/postgres-ingress-budget.ts";
 import { createPostgresRateLimiter } from "../src/postgres-rate-limiter.ts";
 import {
+  readPostgresDeviceSyncState,
+  readPostgresDeviceSyncV12Capabilities,
+} from "../src/postgres-device-sync.ts";
+import { readPostgresV12DayCandidates } from "../src/postgres-v12-manifest-candidates.ts";
+import {
   abandonPostgresDeviceUploadAuthorization,
   authenticatePostgresDevice,
   claimPostgresDeviceUploadAuthorization,
@@ -33,8 +38,10 @@ import {
   registerPostgresTypedV12DayManifest,
 } from "../src/postgres-typed-v12-admission.ts";
 import { createPostgresDeviceUploadAuthorization } from "../src/postgres-upload-authorization.ts";
+import { createPostgresTypedV12Domain } from "../src/postgres-typed-v12-domain.ts";
 import {
   decryptSyntheticEnvelope,
+  publicEnvelopeKey,
   sha256Hex,
 } from "../src/crypto.ts";
 import { validateTelemetryV12StagedChunk } from "../src/telemetry-v12-repository.ts";
@@ -483,6 +490,12 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           createPostgresDeviceUploadAuthorization,
           authenticatePostgresDevice,
           hasPostgresDeletionTombstone,
+          readPostgresDeviceSyncState,
+          readPostgresDeviceSyncV12Capabilities,
+          readPostgresV12DayCandidates,
+          publicEnvelopeKey,
+          sourceNamespace: backend.sourceIdentity.sourceNamespace,
+          createPostgresTypedV12Domain,
           registerPostgresTypedV12DayManifest,
           claimPostgresDeviceUploadAuthorization,
           abandonPostgresDeviceUploadAuthorization,

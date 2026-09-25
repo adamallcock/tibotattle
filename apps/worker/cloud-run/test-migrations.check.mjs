@@ -162,8 +162,8 @@ test("configuration is pinned to the one-task tibotattle migration Job and exact
   const config = parseTestMigrationsConfig(validEnv(), TEST_MIGRATIONS_SERVICE_ACCOUNT);
   assert.equal(config.job, TEST_MIGRATIONS_JOB);
   assert.equal(config.project, TEST_MIGRATIONS_PROJECT);
-  assert.equal(manifest.roles.primary.length, 30);
-  assert.equal(manifest.roles.ledger.length, 5);
+  assert.equal(manifest.roles.primary.length, 35);
+  assert.equal(manifest.roles.ledger.length, 6);
 });
 
 test("configuration rejects wrong job, task shape, project, IAM identity, instance, database, and schema", () => {
@@ -236,12 +236,12 @@ test("primary and ledger migrations are checksum-read back and repeated runs are
   const first = await runTestMigrations({ env: validEnv(), dependencies: harness.dependencies });
   const second = await runTestMigrations({ env: validEnv(), dependencies: harness.dependencies });
   assert.deepEqual(first, second);
-  assert.equal(first.migrations.primary.applied, 30);
-  assert.equal(first.migrations.ledger.applied, 5);
+  assert.equal(first.migrations.primary.applied, 35);
+  assert.equal(first.migrations.ledger.applied, 6);
   assert.match(first.migrations.primary.manifestSha256, /^[0-9a-f]{64}$/u);
   assert.match(first.migrations.ledger.latest.sha256, /^[0-9a-f]{64}$/u);
-  assert.equal(harness.state.primary.receipts.length, 30);
-  assert.equal(harness.state.ledger.receipts.length, 5);
+  assert.equal(harness.state.primary.receipts.length, 35);
+  assert.equal(harness.state.ledger.receipts.length, 6);
   assert.equal(harness.applyCalls, 4);
   assert.equal(harness.cleanupCalls, 2);
   assert.equal(harness.events.filter(({ sql }) => sql?.startsWith("CREATE SCHEMA")).length, 2);

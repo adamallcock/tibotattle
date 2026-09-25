@@ -62,6 +62,11 @@ export const POSTGRES_RUNTIME_MIGRATIONS: Readonly<{
     ["0028_typed_v12_ready_integrity_guard.sql", "bb0406a7c2f3963ad5dd73b981da3ae5305bb5fa3b19154c413a5d176b2ae3f9"],
     ["0029_legacy_source_membership.sql", "c8d9bb75659705492d3d14f23570ad3207677e75b17b27f032ccfd6c24b15c87"],
     ["0030_legacy_typed_telemetry.sql", "b6ea645e97aa0aef8d9a790ae97a8c11662e3ca459a5dcb7299c98cba80d9d8a"],
+    ["0031_typed_legacy_source_family_receipts.sql", "64c115c7593c358fa41c27aae2e0ff60ad82d20f0a205828a115c539a6e123cb"],
+    ["0032_analytics_publication_fences.sql", "153fa64c761cac3176d84d129c452246db05623609e2e3c843ed833a4df808d9"],
+    ["0033_legacy_admission_proofs.sql", "894901da1e9976a66ef5780d375fe4ed324650bc5f11fb79594a68617fcac236"],
+    ["0034_usage_correction_history.sql", "34a837e9646cf0d966d416c01ce39f604a000edc82c3120b2a57229d777bae9d"],
+    ["0035_v12_ready_manifest_retention.sql", "a3fb5f597f7e202b7803a5345f52f4a1a2285fc56cc2c5d119c0b2a2571a0872"],
   ] as readonly MigrationEntry[]).map((entry, index) => receipt(entry, index + 1))),
   ledger: Object.freeze(([
     ["0001_schema_metadata.sql", "783e0d414ee8c755c8886daa95a1fe998527b44445b08eaa36a595dddabf8f8c"],
@@ -69,5 +74,6 @@ export const POSTGRES_RUNTIME_MIGRATIONS: Readonly<{
     ["0003_erasure_restore_receipts.sql", "26fe1c48f75816c02415eec5f77fb242894974615f51938d5b75292bb2d71b27"],
     ["0004_storage_erasure_jobs.sql", "e64d248b31db42dcdcc2aa36e7c623b7f9752143d8108de2d8852702fcbae3d9"],
     ["0005_readiness_generation.sql", "79b6535a97c8b0ddf39b77e83cbc28842ff864f093ee3c308e52da7e39ec7064"],
+    ["0006_erasure_ledger_transfer_receipts.sql", "1e964efc4a6cdf849e4eb14355956ac3c4e16255d2d3e4ea714a9d098e3f7298"],
   ] as readonly MigrationEntry[]).map((entry, index) => receipt(entry, index + 1))),
 });

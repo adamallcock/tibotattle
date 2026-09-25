@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import { lstat, open, realpath } from "node:fs/promises";
+import { isAbsolute } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 export const POSTGRES_TYPED_LEGACY_TRANSFER_SCHEMA = "typed-legacy-transfer-rehearsal-v1";
 export const POSTGRES_TYPED_LEGACY_CONTROL_SCHEMA_PREFIX = "typed_legacy_transfer_rehearsal_";
@@ -20,10 +24,10 @@ const encoder = new TextEncoder();
  * membership rows also carry an `authority` projection used only for a
  * fail-closed source/destination identity check; it is never copied.
  *
- * Only synthetic fixtures are accepted by this implementation. A live D1
- * binding is not a consistent snapshot across independent paged SELECTs. An
- * immutable export is also rejected until a concrete artifact reader and
- * end-to-end snapshot verifier are implemented.
+ * A live D1 binding is not a consistent snapshot across independent paged
+ * SELECTs. The accepted local sources are synthetic fixtures and sealed,
+ * hash-checked SQLite rehearsal artifacts. Sealing proves local byte stability,
+ * not the provenance of a remote D1 export or a cross-database write freeze.
  */
 const TABLES = Object.freeze([
   // The dictionary is shared with v1.2, so parity covers every imported source
@@ -58,7 +62,9 @@ const TABLES = Object.freeze([
   table("typed_telemetry_session_tools", ["record_id", "stream", "tool_class_id", "count"], ["record_id", "tool_class_id"], ["i64", "i16", "i64", "i64"]),
 ]);
 const TABLE_BY_NAME = new Map(TABLES.map(value => [value.name, value]));
-const SYNTHETIC_TYPED_LEGACY_FIXTURE_SOURCES = new WeakSet();
+const TRUSTED_TYPED_LEGACY_REHEARSAL_SOURCES = new WeakSet();
+const MAX_SEALED_SQLITE_BYTES = 100 * 1024 * 1024 * 1024;
+const HASH_BUFFER_BYTES = 1024 * 1024;
 
 export class PostgresTypedLegacyTransferError extends Error {
   constructor(code) {
@@ -109,7 +115,7 @@ function quoteRelation(schema, name) {
 }
 
 function validSnapshotDescriptor(source) {
-  if (!source || !SYNTHETIC_TYPED_LEGACY_FIXTURE_SOURCES.has(source)) {
+  if (!source || !TRUSTED_TYPED_LEGACY_REHEARSAL_SOURCES.has(source)) {
     fail("TYPED_LEGACY_SNAPSHOT_REQUIRED");
   }
   const snapshot = source?.snapshot;
@@ -122,9 +128,18 @@ function validSnapshotDescriptor(source) {
         || snapshot.immutable !== true) fail("TYPED_LEGACY_SNAPSHOT_REQUIRED");
     return Object.freeze({ kind: snapshot.kind, snapshotId: snapshot.snapshotId, artifactSha256: null });
   }
-  // Neither a live binding nor an export descriptor alone qualifies all
-  // independent keyset reads as one snapshot; no artifact reader/verifier is
-  // wired into this rehearsal yet.
+  if (snapshot.kind === "sealed-sqlite-rehearsal"
+      && snapshot.immutable === true
+      && SHA256.test(snapshot.artifactSha256 ?? "")
+      && snapshot.snapshotId === `sha256:${snapshot.artifactSha256}`) {
+    return Object.freeze({
+      kind: snapshot.kind,
+      snapshotId: snapshot.snapshotId,
+      artifactSha256: snapshot.artifactSha256,
+    });
+  }
+  // A live binding and a caller-supplied export descriptor cannot self-label
+  // into a trusted rehearsal source.
   fail("TYPED_LEGACY_SNAPSHOT_REQUIRED");
 }
 
@@ -859,6 +874,176 @@ export async function runPostgresTypedLegacyTransfer({
   }
 }
 
+const SEALED_SOURCE_TABLES = Object.freeze([
+  ...TABLES.filter(spec => spec.name !== "typed_telemetry_owner_memberships")
+    .map(spec => spec.name),
+  "typed_v1_owner_memberships",
+  "typed_v11_owner_memberships",
+  "typed_v1_admission_state",
+  "typed_v11_admission_state",
+  "participants",
+  "storage_v11_owner_links",
+]);
+
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino
+    && left.size === right.size && left.mode === right.mode
+    && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+}
+
+async function assertNoSqliteSidecars(path) {
+  for (const suffix of ["-wal", "-shm", "-journal"]) {
+    try {
+      await lstat(path + suffix);
+      fail("TYPED_LEGACY_SEALED_SQLITE_SIDECAR_PRESENT");
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      if (error instanceof PostgresTypedLegacyTransferError) throw error;
+      fail("TYPED_LEGACY_SEALED_SQLITE_UNAVAILABLE");
+    }
+  }
+}
+
+async function sealedSqliteFingerprint(path) {
+  let handle;
+  try {
+    if (typeof path !== "string" || !isAbsolute(path)
+        || await realpath(path) !== path) {
+      fail("TYPED_LEGACY_SEALED_SQLITE_PATH_INVALID");
+    }
+    await assertNoSqliteSidecars(path);
+    const before = await lstat(path);
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
+        || typeof process.getuid !== "function" || before.uid !== process.getuid()
+        || (before.mode & 0o222) !== 0
+        || before.size <= 0 || before.size > MAX_SEALED_SQLITE_BYTES) {
+      fail("TYPED_LEGACY_SEALED_SQLITE_UNSAFE");
+    }
+    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const opened = await handle.stat();
+    if (!sameFileIdentity(before, opened)) fail("TYPED_LEGACY_SEALED_SQLITE_CHANGED");
+    const hash = sha256();
+    const buffer = Buffer.allocUnsafe(HASH_BUFFER_BYTES);
+    let offset = 0;
+    while (offset < opened.size) {
+      const { bytesRead } = await handle.read(buffer, 0,
+        Math.min(buffer.byteLength, opened.size - offset), offset);
+      if (bytesRead <= 0) fail("TYPED_LEGACY_SEALED_SQLITE_CHANGED");
+      hash.update(buffer.subarray(0, bytesRead));
+      offset += bytesRead;
+    }
+    const after = await handle.stat();
+    if (!sameFileIdentity(opened, after)) fail("TYPED_LEGACY_SEALED_SQLITE_CHANGED");
+    await assertNoSqliteSidecars(path);
+    return Object.freeze({ sha256: hash.digest("hex"), stat: opened });
+  } catch (error) {
+    if (error instanceof PostgresTypedLegacyTransferError) throw error;
+    fail("TYPED_LEGACY_SEALED_SQLITE_UNAVAILABLE");
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+/**
+ * Open a local SQLite database reconstructed from an independently retained
+ * D1 SQL export. The file must be owner-owned, read-only and self-contained.
+ * Its exact bytes are checked before and after transfer; caller-supplied
+ * provenance is never treated as proof of a production source snapshot.
+ */
+export async function createSealedSqliteTypedLegacyRehearsalSource({
+  path,
+  expectedSha256,
+} = {}) {
+  if (!SHA256.test(expectedSha256 ?? "")) fail("TYPED_LEGACY_SEALED_SQLITE_SHA256_REQUIRED");
+  const initial = await sealedSqliteFingerprint(path);
+  if (initial.sha256 !== expectedSha256) fail("TYPED_LEGACY_SEALED_SQLITE_SHA256_MISMATCH");
+  let database;
+  try {
+    database = new DatabaseSync(path, { readOnly: true, allowExtension: false });
+    database.exec("PRAGMA query_only=ON");
+    if (database.prepare("PRAGMA journal_mode").get()?.journal_mode === "wal") {
+      fail("TYPED_LEGACY_SEALED_SQLITE_SIDECAR_PRESENT");
+    }
+    if (database.prepare("PRAGMA quick_check(1)").get()?.quick_check !== "ok") {
+      fail("TYPED_LEGACY_SEALED_SQLITE_INTEGRITY_FAILED");
+    }
+    const available = new Set(database.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table'",
+    ).all().map(row => row.name));
+    if (SEALED_SOURCE_TABLES.some(name => !available.has(name))) {
+      fail("TYPED_LEGACY_SEALED_SQLITE_LAYOUT_INVALID");
+    }
+  } catch (error) {
+    database?.close();
+    if (error instanceof PostgresTypedLegacyTransferError) throw error;
+    fail("TYPED_LEGACY_SEALED_SQLITE_INVALID");
+  }
+  const statements = new Map();
+  const d1Shape = {
+    prepare(sql) {
+      let statement = statements.get(sql);
+      try {
+        if (!statement) {
+          if (statements.size >= 2 * TABLES.length + 1) {
+            fail("TYPED_LEGACY_SEALED_SQLITE_QUERY_LIMIT");
+          }
+          statement = database.prepare(sql);
+          statement.setReadBigInts(true);
+          statements.set(sql, statement);
+        }
+      } catch {
+        fail("TYPED_LEGACY_SEALED_SQLITE_READ_FAILED");
+      }
+      return {
+        bind(...parameters) {
+          return {
+            async all() {
+              try {
+                return { success: true, results: statement.all(...parameters) };
+              } catch {
+                fail("TYPED_LEGACY_SEALED_SQLITE_READ_FAILED");
+              }
+            },
+          };
+        },
+      };
+    },
+  };
+  const paged = createD1TypedLegacyPageSource({ database: d1Shape });
+  const snapshot = Object.freeze({
+    kind: "sealed-sqlite-rehearsal",
+    snapshotId: `sha256:${expectedSha256}`,
+    artifactSha256: expectedSha256,
+    immutable: true,
+  });
+  let closed = false;
+  const source = Object.freeze({
+    snapshot,
+    async verifySnapshot() {
+      if (closed) fail("TYPED_LEGACY_SEALED_SQLITE_CLOSED");
+      const actual = await sealedSqliteFingerprint(path);
+      if (actual.sha256 !== expectedSha256
+          || !sameFileIdentity(initial.stat, actual.stat)) {
+        fail("TYPED_LEGACY_SNAPSHOT_CHANGED");
+      }
+      return { snapshotId: snapshot.snapshotId, artifactSha256: expectedSha256 };
+    },
+    async listPage(options) {
+      if (closed) fail("TYPED_LEGACY_SEALED_SQLITE_CLOSED");
+      return paged.listPage(options);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      statements.clear();
+      database.close();
+    },
+  });
+  TRUSTED_TYPED_LEGACY_REHEARSAL_SOURCES.add(source);
+  validSnapshotDescriptor(source);
+  return source;
+}
+
 /**
  * Create a transfer source from an immutable in-memory fixture. The private
  * WeakSet brand is the transfer runner's trust boundary: generic D1 bindings
@@ -908,7 +1093,7 @@ export function createSyntheticD1TypedLegacyFixtureSource({ rows, snapshotId } =
       return Object.freeze({ rows: Object.freeze(page) });
     },
   };
-  SYNTHETIC_TYPED_LEGACY_FIXTURE_SOURCES.add(source);
+  TRUSTED_TYPED_LEGACY_REHEARSAL_SOURCES.add(source);
   validSnapshotDescriptor(source);
   return Object.freeze(source);
 }
