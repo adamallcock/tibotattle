@@ -21,16 +21,21 @@ source archive, not to a production Worker build.
 
 ### Latest test-project checkpoint: 2026-09-25
 
-The [migration 36 and hosted v1.2 receipt](../receipts/2026-09-25-gcp-test-graph36.md)
-is the latest named-test-project evidence. The private Cloud Run service now
-runs a source-pinned image with 36/36 primary and 6/6 ledger migrations.
-Synthetic v1.2 admission, domain activation, effective-record read-back and
-exact GCS byte read-back passed against real Cloud SQL and GCS. Read-only
-discovery found four tagged synthetic owners and four referenced objects with
-no unattributable pending reference. This does not qualify public/admin
-ingress, scheduled work, owner erasure, production data transfer or a hosted
-graph speedup. The test maintenance Scheduler remains paused; production
-Cloudflare remains the serving system.
+The [A2 isolated v1.2 test-journey receipt](../receipts/2026-09-25-gcp-a2-v12-test-journey.md)
+is the latest named-test-project evidence. A new primary schema, independent
+ledger schema, and bucket with a recorded birth state were migrated and
+deployed through a source-pinned private Cloud Run image. The real Cloud SQL
+and GCS path passed synthetic v1.2 admission, replay, domain activation,
+effective-record and exact-object read-back, then exact-owner discovery and
+one-owner erasure. The owner-erasure result was checked against primary and
+ledger state; a separate post-cleanup discovery found the owner absent, and
+the bucket has no live or versioned objects. The older
+[migration 36 and hosted v1.2 receipt](../receipts/2026-09-25-gcp-test-graph36.md)
+remains a separate earlier test snapshot for different schemas and bucket.
+This A2 proof does not qualify public/admin ingress, scheduled work, general
+owner erasure, production data transfer or a hosted graph speedup. The test
+maintenance Scheduler remains paused; production Cloudflare remains the
+serving system.
 
 The streamed PostgreSQL graph publisher, PostgreSQL accountless v1.2
 enrollment/grant adapter, migration 36 and exact-owner discovery family
