@@ -7,6 +7,9 @@ import {
   POSTGRES_MIGRATION_ROOT,
 } from "./postgres-migrations.mjs";
 import {
+  GRAPH_BENCHMARK_MIGRATION_PROFILE,
+  GRAPH_BENCHMARK_MIGRATIONS_JOB,
+  GRAPH_BENCHMARK_MIGRATION_TARGETS,
   parseTestMigrationsConfig,
   runTestMigrations,
   TEST_MIGRATIONS_IAM_USER,
@@ -39,6 +42,19 @@ function validEnv(overrides = {}) {
   };
 }
 
+function validBenchmarkEnv(overrides = {}) {
+  const env = validEnv();
+  for (const key of [
+    "PRIMARY_SCHEMA", "LEDGER_DATABASE", "LEDGER_SCHEMA", "LEDGER_INSTANCE_CONNECTION_NAME",
+  ]) delete env[key];
+  Object.assign(env, {
+    CLOUD_RUN_JOB: GRAPH_BENCHMARK_MIGRATIONS_JOB,
+    PRIMARY_DATABASE: GRAPH_BENCHMARK_MIGRATION_TARGETS[0].database,
+    PRIMARY_INSTANCE_CONNECTION_NAME: GRAPH_BENCHMARK_MIGRATION_TARGETS[0].instanceConnectionName,
+  }, overrides);
+  return env;
+}
+
 function expectCode(fn, code) {
   assert.throws(fn, (error) => error?.code === code);
 }
@@ -47,11 +63,23 @@ function makeHarness(manifest, {
   wrongPrimaryOwner = false,
   corruptPrimaryReceipt = false,
   corruptPrimaryPrivileges = false,
+  graphBenchmark = false,
 } = {}) {
+  const schemaNames = {
+    primary: [TEST_MIGRATIONS_TARGETS.primary.schema,
+      ...(graphBenchmark ? GRAPH_BENCHMARK_MIGRATION_TARGETS.map(({ schema }) => schema) : [])],
+    ledger: [TEST_MIGRATIONS_TARGETS.ledger.schema],
+  };
+  const allSchemas = Object.values(schemaNames).flat();
+  const schemaReceipts = new Map(allSchemas.map((schema) => [schema, []]));
+  const schemaOwners = new Map(allSchemas.map((schema) => [schema, null]));
+  if (wrongPrimaryOwner) {
+    schemaOwners.set(TEST_MIGRATIONS_TARGETS.primary.schema, "different-owner");
+  }
   const state = Object.fromEntries(Object.keys(TEST_MIGRATIONS_TARGETS).map((role) => [role, {
-    schemaExists: wrongPrimaryOwner && role === "primary",
-    owner: wrongPrimaryOwner && role === "primary" ? "different-owner" : null,
-    receipts: [],
+    schemaExists: false,
+    owner: null,
+    receipts: schemaReceipts.get(TEST_MIGRATIONS_TARGETS[role].schema),
     runtimePrivileges: {
       schemaUsage: false,
       schemaCreate: false,
@@ -67,6 +95,7 @@ function makeHarness(manifest, {
   const events = [];
   const pools = {};
   let connectorCount = 0;
+  let poolCount = 0;
   let metadataCount = 0;
   let manifestCount = 0;
   let applyCalls = 0;
@@ -86,6 +115,7 @@ function makeHarness(manifest, {
       return manifest;
     },
     async createPool(options) {
+      poolCount += 1;
       const role = Object.entries(TEST_MIGRATIONS_TARGETS).find(([, target]) =>
         target.instanceConnectionName === options.instanceConnectionName)?.[0];
       assert.ok(role);
@@ -98,7 +128,7 @@ function makeHarness(manifest, {
           events.push({ role, type: "connect" });
           return {
             async query(sql, params) {
-              events.push({ role, type: "query", sql });
+              events.push({ role, type: "query", sql, params });
               if (sql === "BEGIN" || sql === "BEGIN READ ONLY"
                   || sql === "COMMIT" || sql === "ROLLBACK"
                   || sql.startsWith("SET LOCAL")) {
@@ -191,17 +221,21 @@ function makeHarness(manifest, {
                 };
               }
               if (sql.includes("FROM pg_namespace")) {
-                return state[role].schemaExists
-                  ? { rows: [{ owner: state[role].owner }], rowCount: 1 }
+                const owner = schemaOwners.get(params?.[0]);
+                return owner !== null && owner !== undefined
+                  ? { rows: [{ owner }], rowCount: 1 }
                   : { rows: [], rowCount: 0 };
               }
               if (sql.startsWith("CREATE SCHEMA ")) {
-                state[role].schemaExists = true;
-                state[role].owner = TEST_MIGRATIONS_IAM_USER;
+                const schema = sql.match(/^CREATE SCHEMA "([a-z0-9_]+)"$/u)?.[1];
+                if (!schemaNames[role].includes(schema)) throw new Error("unexpected fake schema");
+                schemaOwners.set(schema, TEST_MIGRATIONS_IAM_USER);
                 return { rows: [], rowCount: 0 };
               }
               if (sql.includes(`."_tibotattle_migration_history"`)) {
-                const rows = state[role].receipts.map(({ version, name, sha256 }) => ({
+                const schema = sql.match(/FROM "([a-z0-9_]+)"\."_tibotattle_migration_history"/u)?.[1];
+                if (!schemaNames[role].includes(schema)) throw new Error("unexpected fake history schema");
+                const rows = schemaReceipts.get(schema).map(({ version, name, sha256 }) => ({
                   version,
                   name,
                   checksum_sha256: sha256,
@@ -222,18 +256,19 @@ function makeHarness(manifest, {
     async applyMigrations({ role, schema, pool, rootDirectory }) {
       applyCalls += 1;
       assert.equal(pool, pools[role]);
-      assert.equal(schema, TEST_MIGRATIONS_TARGETS[role].schema);
+      assert.equal(schemaNames[role].includes(schema), true);
       assert.equal(rootDirectory, TEST_MIGRATIONS_ROOT);
       const expected = manifest.roles[role].map(({ version, name, sha256 }) => ({
         version,
         name,
         sha256,
       }));
-      for (const receipt of expected.slice(state[role].receipts.length)) {
-        state[role].receipts.push(receipt);
+      const receipts = schemaReceipts.get(schema);
+      for (const receipt of expected.slice(receipts.length)) {
+        receipts.push(receipt);
       }
       if (corruptPrimaryReceipt && role === "primary") {
-        state[role].receipts[0] = { ...state[role].receipts[0], sha256: "f".repeat(64) };
+        receipts[0] = { ...receipts[0], sha256: "f".repeat(64) };
       }
       return { role, schema, applied: expected.length, migrations: expected };
     },
@@ -248,10 +283,13 @@ function makeHarness(manifest, {
     state,
     events,
     get connectorCount() { return connectorCount; },
+    get poolCount() { return poolCount; },
     get metadataCount() { return metadataCount; },
     get manifestCount() { return manifestCount; },
     get applyCalls() { return applyCalls; },
     get cleanupCalls() { return cleanupCalls; },
+    schemaReceipts,
+    schemaOwners,
   };
 }
 
@@ -268,6 +306,41 @@ test("configuration is pinned to the one-task tibotattle migration Job and exact
   assert.notEqual(TEST_MIGRATIONS_TARGETS.primary.schema, "tibotattle");
   assert.notEqual(TEST_MIGRATIONS_TARGETS.ledger.schema, "tibotattle_ledger");
   assert.equal(TEST_MIGRATIONS_RUNTIME_IAM_USER, "tibotattle-test-runtime@tibotattle.iam");
+  expectCode(() => parseTestMigrationsConfig(
+    validEnv({ PRIMARY_SCHEMA: GRAPH_BENCHMARK_MIGRATION_TARGETS[0].schema }),
+    TEST_MIGRATIONS_SERVICE_ACCOUNT,
+  ), "POSTGRES_TEST_MIGRATIONS_PRIMARY_TARGET_INVALID");
+});
+
+test("benchmark migrator profile pins both primary-only schemas and rejects all overrides", () => {
+  const config = parseTestMigrationsConfig(
+    validBenchmarkEnv(), TEST_MIGRATIONS_SERVICE_ACCOUNT, GRAPH_BENCHMARK_MIGRATION_PROFILE,
+  );
+  assert.equal(config.job, GRAPH_BENCHMARK_MIGRATIONS_JOB);
+  assert.equal(config.profile, GRAPH_BENCHMARK_MIGRATION_PROFILE);
+  assert.deepEqual(config.plans.map(({ role, target }) => [role, target.schema]), [
+    ["primary", "tibotattle_graph_benchmark_10k_20260925"],
+    ["primary", "tibotattle_graph_benchmark_100k_20260925"],
+  ]);
+  for (const overrides of [
+    { CLOUD_RUN_JOB: TEST_MIGRATIONS_JOB },
+    { PRIMARY_SCHEMA: "public" },
+    { PRIMARY_SCHEMA: TEST_MIGRATIONS_TARGETS.primary.schema },
+    { PRIMARY_DATABASE: "production" },
+    { PRIMARY_INSTANCE_CONNECTION_NAME: "other-project:us-east1:db" },
+    { LEDGER_SCHEMA: TEST_MIGRATIONS_TARGETS.ledger.schema },
+    { LEDGER_DATABASE: TEST_MIGRATIONS_TARGETS.ledger.database },
+    { LEDGER_INSTANCE_CONNECTION_NAME: TEST_MIGRATIONS_TARGETS.ledger.instanceConnectionName },
+  ]) {
+    expectCode(() => parseTestMigrationsConfig(
+      validBenchmarkEnv(overrides), TEST_MIGRATIONS_SERVICE_ACCOUNT, GRAPH_BENCHMARK_MIGRATION_PROFILE,
+    ), overrides.CLOUD_RUN_JOB !== undefined
+      ? "CLOUD_RUN_TEST_MIGRATIONS_JOB_CONTEXT_INVALID"
+      : "POSTGRES_TEST_MIGRATIONS_BENCHMARK_TARGET_INVALID");
+  }
+  expectCode(() => parseTestMigrationsConfig(
+    validBenchmarkEnv(), TEST_MIGRATIONS_SERVICE_ACCOUNT, "other-profile",
+  ), "CLOUD_RUN_TEST_MIGRATIONS_PROFILE_INVALID");
 });
 
 test("configuration rejects wrong job, task shape, project, IAM identity, instance, database, and schema", () => {
@@ -333,6 +406,16 @@ test("invalid context and wrong attached service account stop before connector o
   assert.equal(wrongIdentity.connectorCount, 0);
   assert.equal(wrongIdentity.manifestCount, 0);
   assert.equal(wrongIdentity.events.length, 0);
+
+  const invalidBenchmark = makeHarness(manifest, { graphBenchmark: true });
+  await assert.rejects(runTestMigrations({
+    env: validBenchmarkEnv({ PRIMARY_SCHEMA: "public" }),
+    profile: GRAPH_BENCHMARK_MIGRATION_PROFILE,
+    dependencies: invalidBenchmark.dependencies,
+  }), (error) => error?.code === "POSTGRES_TEST_MIGRATIONS_BENCHMARK_TARGET_INVALID");
+  assert.equal(invalidBenchmark.metadataCount, 0);
+  assert.equal(invalidBenchmark.connectorCount, 0);
+  assert.equal(invalidBenchmark.events.length, 0);
 });
 
 test("primary and ledger migrations are checksum-read back and repeated runs are idempotent", async () => {
@@ -377,6 +460,47 @@ test("primary and ledger migrations are checksum-read back and repeated runs are
   assert.equal(harness.events.filter(({ sql }) => sql?.includes("has_schema_privilege($1, $2, 'USAGE')")).length, 4);
   assert.equal(privilegeSql.some((sql) => sql.includes('"tibotattle"')),
     false, "only the exact A2 schemas may receive grants");
+});
+
+test("benchmark profile applies 37 receipts and verifies runtime grants on both exact primary schemas", async () => {
+  const harness = makeHarness(manifest, { graphBenchmark: true });
+  const result = await runTestMigrations({
+    env: validBenchmarkEnv(),
+    profile: GRAPH_BENCHMARK_MIGRATION_PROFILE,
+    dependencies: harness.dependencies,
+  });
+  assert.equal(result.job, GRAPH_BENCHMARK_MIGRATIONS_JOB);
+  assert.equal(result.profile, GRAPH_BENCHMARK_MIGRATION_PROFILE);
+  assert.equal(result.migrations.primarySchemas.length, 2);
+  assert.deepEqual(result.migrations.primarySchemas.map(({ schema, applied }) => [schema, applied]),
+    GRAPH_BENCHMARK_MIGRATION_TARGETS.map(({ schema }) => [schema, 37]));
+  assert.equal(harness.poolCount, 1, "both schemas use only the pinned primary database pool");
+  assert.equal(harness.applyCalls, 2);
+  assert.equal(harness.cleanupCalls, 1);
+  assert.equal(harness.connectorCount, 1);
+  assert.equal(harness.events.some(({ role }) => role === "ledger"), false);
+
+  for (const { schema } of GRAPH_BENCHMARK_MIGRATION_TARGETS) {
+    assert.equal(harness.schemaReceipts.get(schema).length, 37);
+    assert.equal(harness.schemaOwners.get(schema), TEST_MIGRATIONS_IAM_USER);
+    const quoted = `"${schema}"`;
+    assert.equal(harness.events.some(({ sql }) => sql === `CREATE SCHEMA ${quoted}`), true);
+    assert.equal(harness.events.some(({ sql }) => sql === `SELECT version, name, checksum_sha256
+         FROM ${quoted}."_tibotattle_migration_history"
+        ORDER BY version`), true, "every schema must read back its complete receipt chain");
+    assert.equal(harness.events.some(({ sql }) => sql?.includes(
+      `GRANT USAGE ON SCHEMA ${quoted} TO "${TEST_MIGRATIONS_RUNTIME_IAM_USER}"`,
+    )), true);
+    assert.equal(harness.events.some(({ sql }) => sql?.includes(
+      `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ${quoted}`,
+    )), true);
+    assert.equal(harness.events.some(({ sql }) => sql?.includes(
+      `REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER\n         ON ${quoted}."_tibotattle_migration_history"`,
+    )), true, "runtime can read but cannot change migration receipts");
+    assert.equal(harness.events.some(({ sql, params }) =>
+      sql?.includes("has_schema_privilege($1, $2, 'USAGE')") && params?.[1] === schema,
+    ), true, "runtime grant readback is scoped to the exact schema");
+  }
 });
 
 test("runtime privilege readback fails closed when any required schema permission is missing", async () => {

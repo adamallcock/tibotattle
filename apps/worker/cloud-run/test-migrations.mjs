@@ -14,6 +14,7 @@ import {
 } from "./cloud-sql.mjs";
 
 export const TEST_MIGRATIONS_JOB = "tibotattle-test-database-migrate";
+export const GRAPH_BENCHMARK_MIGRATIONS_JOB = "tibotattle-public-graph-benchmark-migrate";
 export const TEST_MIGRATIONS_PROJECT = "tibotattle";
 export const TEST_MIGRATIONS_SERVICE_ACCOUNT =
   "tibotattle-test-migrator@tibotattle.iam.gserviceaccount.com";
@@ -34,6 +35,26 @@ export const TEST_MIGRATIONS_TARGETS = Object.freeze({
     expectedMigrations: 6,
   }),
 });
+export const GRAPH_BENCHMARK_MIGRATION_TARGETS = Object.freeze([
+  Object.freeze({
+    name: "10k",
+    instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
+    database: "tibotattle",
+    schema: "tibotattle_graph_benchmark_10k_20260925",
+    expectedMigrations: 37,
+  }),
+  Object.freeze({
+    name: "100k",
+    instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
+    database: "tibotattle",
+    schema: "tibotattle_graph_benchmark_100k_20260925",
+    expectedMigrations: 37,
+  }),
+]);
+
+const A2_PROFILE = "a2";
+export const GRAPH_BENCHMARK_MIGRATION_PROFILE = "community-graph-benchmark";
+const GRAPH_BENCHMARK_PROFILE = GRAPH_BENCHMARK_MIGRATION_PROFILE;
 
 const EXECUTION_PATTERN = /^[a-z][a-z0-9-]{0,62}$/u;
 const MIGRATION_NAME_PATTERN = /^\d{4}_[a-z][a-z0-9_-]*\.sql$/u;
@@ -473,10 +494,28 @@ export async function readAttachedServiceAccountEmail({
   return email;
 }
 
-/** Validate the immutable target and one-task Cloud Run Job execution contract. */
-function validateJobEnvironment(env) {
+function migrationPlans(profile) {
+  if (profile === A2_PROFILE) {
+    return Object.freeze(Object.entries(TEST_MIGRATIONS_TARGETS).map(([role, target]) =>
+      Object.freeze({ name: role, role, poolKey: role, target }),
+    ));
+  }
+  if (profile === GRAPH_BENCHMARK_PROFILE) {
+    return Object.freeze(GRAPH_BENCHMARK_MIGRATION_TARGETS.map((target) =>
+      Object.freeze({ name: target.name, role: "primary", poolKey: "primary", target }),
+    ));
+  }
+  fail("CLOUD_RUN_TEST_MIGRATIONS_PROFILE_INVALID");
+}
+
+/** Validate the exact profile target and one-task Cloud Run Job execution contract. */
+function validateJobEnvironment(env, profile = A2_PROFILE) {
+  const plans = migrationPlans(profile);
+  const expectedJob = profile === A2_PROFILE
+    ? TEST_MIGRATIONS_JOB
+    : GRAPH_BENCHMARK_MIGRATIONS_JOB;
   if (env === null || typeof env !== "object"
-      || env.CLOUD_RUN_JOB !== TEST_MIGRATIONS_JOB
+      || env.CLOUD_RUN_JOB !== expectedJob
       || !EXECUTION_PATTERN.test(env.CLOUD_RUN_EXECUTION ?? "")
       || env.CLOUD_RUN_TASK_INDEX !== "0"
       || env.CLOUD_RUN_TASK_COUNT !== "1"
@@ -488,26 +527,40 @@ function validateJobEnvironment(env) {
   if (env.POSTGRES_MIGRATOR_IAM_USER !== TEST_MIGRATIONS_IAM_USER) {
     fail("POSTGRES_TEST_MIGRATIONS_IAM_USER_INVALID");
   }
-  for (const [role, target] of Object.entries(TEST_MIGRATIONS_TARGETS)) {
-    const prefix = role.toUpperCase();
-    if (env[`${prefix}_DATABASE`] !== target.database
-        || env[`${prefix}_SCHEMA`] !== target.schema
-        || env[`${prefix}_INSTANCE_CONNECTION_NAME`] !== target.instanceConnectionName) {
-      fail(`POSTGRES_TEST_MIGRATIONS_${prefix}_TARGET_INVALID`);
+  if (profile === A2_PROFILE) {
+    for (const [role, target] of Object.entries(TEST_MIGRATIONS_TARGETS)) {
+      const prefix = role.toUpperCase();
+      if (env[`${prefix}_DATABASE`] !== target.database
+          || env[`${prefix}_SCHEMA`] !== target.schema
+          || env[`${prefix}_INSTANCE_CONNECTION_NAME`] !== target.instanceConnectionName) {
+        fail(`POSTGRES_TEST_MIGRATIONS_${prefix}_TARGET_INVALID`);
+      }
+    }
+  } else {
+    const target = GRAPH_BENCHMARK_MIGRATION_TARGETS[0];
+    if (env.PRIMARY_DATABASE !== target.database
+        || env.PRIMARY_INSTANCE_CONNECTION_NAME !== target.instanceConnectionName
+        || env.PRIMARY_SCHEMA !== undefined
+        || env.LEDGER_DATABASE !== undefined
+        || env.LEDGER_SCHEMA !== undefined
+        || env.LEDGER_INSTANCE_CONNECTION_NAME !== undefined) {
+      fail("POSTGRES_TEST_MIGRATIONS_BENCHMARK_TARGET_INVALID");
     }
   }
   return Object.freeze({
-    job: TEST_MIGRATIONS_JOB,
+    job: expectedJob,
+    profile,
     execution: env.CLOUD_RUN_EXECUTION,
     project: TEST_MIGRATIONS_PROJECT,
     serviceAccount: TEST_MIGRATIONS_SERVICE_ACCOUNT,
     migratorIamUser: TEST_MIGRATIONS_IAM_USER,
-    targets: TEST_MIGRATIONS_TARGETS,
+    ...(profile === A2_PROFILE ? { targets: TEST_MIGRATIONS_TARGETS } : {}),
+    plans,
   });
 }
 
-export function parseTestMigrationsConfig(env, attachedServiceAccountEmail) {
-  const config = validateJobEnvironment(env);
+export function parseTestMigrationsConfig(env, attachedServiceAccountEmail, profile = A2_PROFILE) {
+  const config = validateJobEnvironment(env, profile);
   if (attachedServiceAccountEmail !== TEST_MIGRATIONS_SERVICE_ACCOUNT) {
     fail("CLOUD_RUN_TEST_MIGRATIONS_SERVICE_ACCOUNT_INVALID");
   }
@@ -533,18 +586,19 @@ function migrationSummary(role, manifest) {
 export async function runTestMigrations({
   env = process.env,
   dependencies = {},
+  profile = A2_PROFILE,
 } = {}) {
   // Reject wrong jobs and targets before metadata credentials or SQL clients are touched.
-  validateJobEnvironment(env);
-  return runConfiguredTestMigrations({ env, dependencies });
+  validateJobEnvironment(env, profile);
+  return runConfiguredTestMigrations({ env, dependencies, profile });
 }
 
-async function runConfiguredTestMigrations({ env, dependencies }) {
+async function runConfiguredTestMigrations({ env, dependencies, profile }) {
   // Validate the non-identity portion separately to avoid accepting an
   // environment-provided service-account value as proof of the attached identity.
   const attachedServiceAccountEmail = await (dependencies.readServiceAccountEmail
     ?? readAttachedServiceAccountEmail)({ fetchImpl: dependencies.fetchImpl });
-  const config = parseTestMigrationsConfig(env, attachedServiceAccountEmail);
+  const config = parseTestMigrationsConfig(env, attachedServiceAccountEmail, profile);
   const migrationRoot = TEST_MIGRATIONS_ROOT;
   let manifest;
   try {
@@ -571,9 +625,10 @@ async function runConfiguredTestMigrations({ env, dependencies }) {
     } catch {
       fail("CLOUD_SQL_TEST_MIGRATIONS_CONNECTOR_CREATE_FAILED");
     }
-    for (const [role, target] of Object.entries(TEST_MIGRATIONS_TARGETS)) {
+    const poolPlans = new Map(config.plans.map(({ poolKey, role, target }) => [poolKey, { role, target }]));
+    for (const [poolKey, { role, target }] of poolPlans) {
       try {
-        pools[role] = await createPool({
+        pools[poolKey] = await createPool({
           connector,
           instanceConnectionName: target.instanceConnectionName,
           database: target.database,
@@ -585,17 +640,18 @@ async function runConfiguredTestMigrations({ env, dependencies }) {
         fail(`CLOUD_SQL_TEST_MIGRATIONS_${role.toUpperCase()}_CONNECT_FAILED`);
       }
     }
-    for (const [role, target] of Object.entries(TEST_MIGRATIONS_TARGETS)) {
-      await ensureSchema(pools[role], role, target);
+    for (const { poolKey, role, target } of config.plans) {
+      await ensureSchema(pools[poolKey], role, target);
     }
-    for (const [role, target] of Object.entries(TEST_MIGRATIONS_TARGETS)) {
+    const targetSummaries = {};
+    for (const { name, poolKey, role, target } of config.plans) {
       const expected = expectedReceipts(manifest, role);
       let applied;
       try {
         applied = await applyMigrations({
           role,
           schema: target.schema,
-          pool: pools[role],
+          pool: pools[poolKey],
           rootDirectory: migrationRoot,
         });
       } catch (error) {
@@ -603,19 +659,28 @@ async function runConfiguredTestMigrations({ env, dependencies }) {
         fail(code);
       }
       validateApplyResult(applied, role, target, expected);
-      await readBackReceipts(pools[role], role, target, expected);
-      await grantAndVerifyRuntimePrivileges(pools[role], role, target);
+      await readBackReceipts(pools[poolKey], role, target, expected);
+      await grantAndVerifyRuntimePrivileges(pools[poolKey], role, target);
+      targetSummaries[name] = profile === A2_PROFILE
+        ? migrationSummary(role, manifest)
+        : Object.freeze({ schema: target.schema, ...migrationSummary(role, manifest) });
     }
+    const migrations = profile === A2_PROFILE
+      ? Object.freeze({
+        primary: targetSummaries.primary,
+        ledger: targetSummaries.ledger,
+      })
+      : Object.freeze({
+        primarySchemas: Object.freeze(config.plans.map(({ name }) => targetSummaries[name])),
+      });
     result = Object.freeze({
       status: "ok",
       mode: "migrate",
       job: config.job,
+      ...(profile === A2_PROFILE ? {} : { profile }),
       execution: config.execution,
       project: config.project,
-      migrations: Object.freeze({
-        primary: migrationSummary("primary", manifest),
-        ledger: migrationSummary("ledger", manifest),
-      }),
+      migrations,
     });
   } catch (error) {
     operationError = error;
@@ -639,12 +704,18 @@ function invokedDirectly() {
 }
 
 if (invokedDirectly()) {
-  if (process.argv.length !== 2) {
+  const profileArgument = process.argv.slice(2);
+  const profile = profileArgument.length === 0
+    ? A2_PROFILE
+    : profileArgument.length === 1 && profileArgument[0] === `--profile=${GRAPH_BENCHMARK_PROFILE}`
+      ? GRAPH_BENCHMARK_PROFILE
+      : null;
+  if (profile === null) {
     console.error(JSON.stringify({ status: "error", code: "CLOUD_RUN_TEST_MIGRATIONS_ARGUMENTS_INVALID" }));
     process.exitCode = 1;
   } else {
     try {
-      const result = await runTestMigrations();
+      const result = await runTestMigrations({ profile });
       console.log(JSON.stringify(result));
     } catch (error) {
       const code = safeErrorCode(error, "POSTGRES_TEST_MIGRATIONS_FAILED");
