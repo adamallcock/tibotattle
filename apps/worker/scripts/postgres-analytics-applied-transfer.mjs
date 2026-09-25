@@ -646,3 +646,16 @@ export async function transferPostgresAnalyticsAppliedReceipts({
     client?.release();
   }
 }
+
+// Shared sealed-source primitives for the separate main-table transfer. Keep
+// this an explicit export surface so the importer reuses the same closed D1
+// tuple validation, source keyset ordering, and content-free manifest.
+export {
+  EVENT_COLUMNS as POSTGRES_ANALYTICS_APPLIED_EVENT_COLUMNS,
+  canonicalRow as canonicalAnalyticsAppliedEventRow,
+  compareCursor as compareAnalyticsAppliedEventCursor,
+  cursorFor as analyticsAppliedEventCursorFor,
+  normalizeRow as normalizeAnalyticsAppliedEventRow,
+  readSourcePage as readSealedAnalyticsAppliedEventPage,
+  sourceManifest as scanSealedAnalyticsAppliedEventSource,
+};

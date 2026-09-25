@@ -95,6 +95,20 @@ owner erasure, production data transfer or a hosted graph speedup. The test
 maintenance Scheduler remains paused; production Cloudflare remains the
 serving system.
 
+The sealed analytics applied-event v1 rehearsal can now write exact event
+tuples to PostgreSQL's main `analytics_applied_events` table after the matching
+sealed ingestion journal is imported. It binds the applied artifact's snapshot,
+source ID, namespace digest, and source-cursor metadata to a resumable run;
+before writing, it verifies the completed journal transfer receipt and compares
+every shared D1 tuple field and checkpoint page hash. PostgreSQL 17 coverage
+proves rollback/resume, changed-artifact refusal, incomplete or mismatched
+journal refusal, and preservation of version-0 receipts. The PostgreSQL cursor,
+owner state, and publications remain empty, so this is source-history staging,
+not analytics activation or cutover. The journal artifact has no namespace
+field: the namespace is pinned to the applied artifact but cannot be compared
+across both sealed files under the current contract. No production D1 export or
+remote write is part of this rehearsal.
+
 The streamed PostgreSQL graph publisher, PostgreSQL accountless v1.2
 enrollment/grant adapter, migration 36 and exact-owner discovery family
 checks are integrated in this worktree. The accountless adapter is still

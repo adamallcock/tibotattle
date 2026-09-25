@@ -13,6 +13,7 @@ export default defineConfig({
       "postgres-test/postgres-analytics-event-tuple.spec.mjs",
       "postgres-test/postgres-ingestion-journal-transfer.spec.mjs",
       "postgres-test/postgres-analytics-applied-transfer.spec.mjs",
+      "postgres-test/postgres-analytics-applied-main-transfer.spec.mjs",
     ],
     fileParallelism: false,
   },

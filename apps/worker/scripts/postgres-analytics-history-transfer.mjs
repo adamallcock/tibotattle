@@ -352,6 +352,27 @@ export async function createSealedSqliteAnalyticsHistorySource({ path, expectedS
   let closed = false;
   const source = Object.freeze({
     snapshot,
+    async sourceIdentityManifest() {
+      if (closed) fail("ANALYTICS_HISTORY_SQLITE_CLOSED");
+      const registrations = database.prepare(`SELECT source_id,source_namespace,contract_version
+        FROM analytics_runtime_sources ORDER BY source_id COLLATE BINARY`).all();
+      const cursorStatement = database.prepare(`SELECT source_id,sequence,authority_epoch
+        FROM analytics_source_cursors ORDER BY source_id COLLATE BINARY`);
+      cursorStatement.setReadBigInts(true);
+      const cursors = cursorStatement.all();
+      return Object.freeze({
+        runtimeSources: Object.freeze(registrations.map(row => Object.freeze({
+          sourceId: row.source_id,
+          namespaceSha256: sha256().update(row.source_namespace).digest("hex"),
+          contractVersion: Number(row.contract_version),
+        }))),
+        sourceCursors: Object.freeze(cursors.map(row => Object.freeze({
+          sourceId: row.source_id,
+          sequence: normalizeInteger(row.sequence),
+          authorityEpoch: normalizeInteger(row.authority_epoch),
+        }))),
+      });
+    },
     async verifySnapshot() {
       if (closed) fail("ANALYTICS_HISTORY_SQLITE_CLOSED");
       const actual = await fingerprintSqlite(path);
@@ -428,6 +449,38 @@ export async function createSealedSqliteAnalyticsHistorySource({ path, expectedS
   });
   TRUSTED_SOURCES.add(source);
   return source;
+}
+
+/** Return a content-free identity binding for a trusted sealed analytics artifact. */
+export async function inspectSealedSqliteAnalyticsSourceIdentity(source) {
+  const snapshot = assertSource(source);
+  if (typeof source.sourceIdentityManifest !== "function") fail("ANALYTICS_HISTORY_SEALED_SOURCE_REQUIRED");
+  let identity;
+  try {
+    identity = await source.sourceIdentityManifest();
+  } catch {
+    fail("ANALYTICS_HISTORY_SOURCE_IDENTITY_INVALID");
+  }
+  if (!Array.isArray(identity?.runtimeSources) || !Array.isArray(identity?.sourceCursors)
+      || identity.runtimeSources.length !== 1 || identity.sourceCursors.length !== 1) {
+    fail("ANALYTICS_HISTORY_SOURCE_IDENTITY_NOT_SINGLETON");
+  }
+  const [runtime] = identity.runtimeSources;
+  const [cursor] = identity.sourceCursors;
+  if (!runtime || runtime.sourceId !== cursor?.sourceId || !SOURCE_ID.test(runtime.sourceId ?? "")
+      || runtime.contractVersion !== 1 || !SHA256.test(runtime.namespaceSha256 ?? "")
+      || normalizeInteger(cursor.sequence) !== cursor.sequence
+      || normalizeInteger(cursor.authorityEpoch) !== cursor.authorityEpoch
+      || BigInt(cursor.sequence) < 0n || BigInt(cursor.authorityEpoch) < 0n) {
+    fail("ANALYTICS_HISTORY_SOURCE_IDENTITY_INVALID");
+  }
+  const verified = await source.verifySnapshot();
+  if (verified?.snapshotId !== snapshot.snapshotId || verified?.artifactSha256 !== snapshot.artifactSha256) {
+    fail("ANALYTICS_HISTORY_SOURCE_CHANGED");
+  }
+  return Object.freeze({ snapshotId: snapshot.snapshotId, snapshotSha256: snapshot.artifactSha256,
+    sourceId: runtime.sourceId, namespaceSha256: runtime.namespaceSha256,
+    contractVersion: runtime.contractVersion, sourceSequence: cursor.sequence, sourceAuthorityEpoch: cursor.authorityEpoch });
 }
 
 function assertSource(source) {
