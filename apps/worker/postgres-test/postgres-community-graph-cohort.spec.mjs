@@ -12,6 +12,7 @@ import {
 import {
   publishPostgresCommunityModelDay,
   publishPostgresCommunityModelDayFromCohort,
+  readPostgresCommunityModelDay,
 } from "../src/postgres-community-graph.ts";
 import { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from "../src/quota-analysis-v11.ts";
 
@@ -412,6 +413,33 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
     }
     expect(concurrentPublications.map((result) => result.state).sort()).toEqual(["published", "unchanged"]);
     expect(concurrentPublications.map((result) => result.memberCount)).toEqual([3, 3]);
+
+    const readQueries = [];
+    const measuredReadPool = {
+      async connect() {
+        const client = await pool.connect();
+        return {
+          query(sql, values) {
+            readQueries.push(sql);
+            return client.query(sql, values);
+          },
+          release(discard) { return client.release(discard); },
+        };
+      },
+    };
+    expect(await readPostgresCommunityModelDay(measuredReadPool, {
+      sourceId: SOURCE_ID,
+      sourceNamespace: SOURCE_NAMESPACE,
+      day: DAY,
+      schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+    })).toMatchObject({ day: DAY, fittedParticipantCount: 3, values: [["gpt-6-astra", 1000, 3]] });
+    expect(readQueries.filter((sql) => sql.startsWith("DECLARE postgres_community_graph_member_readback")))
+      .toHaveLength(1);
+    expect(readQueries.filter((sql) => sql.startsWith("FETCH FORWARD 4096 FROM postgres_community_graph_member_readback")))
+      .toHaveLength(1);
+    expect(readQueries.filter((sql) => sql === "CLOSE postgres_community_graph_member_readback"))
+      .toHaveLength(1);
+    expect(readQueries.some((sql) => sql.includes('owner_digest COLLATE "C" >'))).toBe(false);
 
     const restart = await listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,

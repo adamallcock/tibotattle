@@ -9,6 +9,7 @@ import {
   createPostgresSchemaConfig,
   quotePostgresIdentifier,
   withPostgresRead,
+  type PostgresClient,
   type PostgresPool,
   type PostgresSchemaOptions,
 } from "./postgres-client";
@@ -26,6 +27,8 @@ export type {
 } from "./postgres-community-graph-contract";
 
 const MAX_PUBLICATION_BYTES = 16 * 1024;
+const MEMBER_READBACK_FETCH_SIZE = 4_096;
+const MEMBER_READBACK_CURSOR = "postgres_community_graph_member_readback";
 const fail = () => new Error("POSTGRES_COMMUNITY_GRAPH_UNAVAILABLE");
 
 type MemberProof = readonly [
@@ -37,6 +40,61 @@ type MemberProof = readonly [
   inputFingerprint: string | null,
   resultSha256: string | null,
 ];
+
+interface PublicationMemberReadbackRow {
+  readonly owner_digest: string;
+  readonly input_revision: string | number;
+  readonly owner_revision: string | number;
+  readonly authority_epoch: string | number;
+  readonly source_kind: string | null;
+  readonly input_fingerprint: string | null;
+  readonly result_sha256: string | null;
+}
+
+interface PublicationMemberReadbackScope {
+  readonly sourceId: string;
+  readonly day: string;
+  readonly generation: string;
+}
+
+/** Read publication member receipts in bounded batches without reopening the
+ * ordered index scan for every keyset page. The transaction pins the same
+ * snapshot used by the owner-authority preflight query. */
+async function readPublicationMembers(
+  client: PostgresClient,
+  schema: string,
+  scope: PublicationMemberReadbackScope,
+  visit: (row: PublicationMemberReadbackRow, index: number) => Promise<boolean>,
+): Promise<{ readonly complete: boolean; readonly count: number }> {
+  await client.query(
+    `DECLARE ${MEMBER_READBACK_CURSOR} NO SCROLL CURSOR FOR
+       SELECT member.owner_digest, member.input_revision, member.owner_revision,
+              member.authority_epoch, member.source_kind, member.input_fingerprint,
+              member.result_sha256
+         FROM ${schema}.analytics_publication_owner_members member
+        WHERE member.source_id = $1 AND member.day = $2::date
+          AND member.metric = 'model' AND member.generation = $3
+        ORDER BY member.owner_digest COLLATE "C"`,
+    [scope.sourceId, scope.day, scope.generation],
+  );
+  let count = 0;
+  try {
+    while (true) {
+      const page = await client.query<PublicationMemberReadbackRow>(
+        `FETCH FORWARD ${MEMBER_READBACK_FETCH_SIZE} FROM ${MEMBER_READBACK_CURSOR}`,
+      );
+      if (!Array.isArray(page.rows) || page.rows.length > MEMBER_READBACK_FETCH_SIZE) throw fail();
+      for (const row of page.rows) {
+        const index = count;
+        count += 1;
+        if (!await visit(row, index)) return { complete: false, count };
+      }
+      if (page.rows.length < MEMBER_READBACK_FETCH_SIZE) return { complete: true, count };
+    }
+  } finally {
+    await client.query(`CLOSE ${MEMBER_READBACK_CURSOR}`);
+  }
+}
 
 function integer(value: unknown, minimum = 0): number {
   const parsed = typeof value === "string" && /^\d+$/u.test(value) ? Number(value) : value;
@@ -204,26 +262,19 @@ export async function readPostgresCommunityModelDay(
       if (computedGeneration !== row.generation || row.cohort_digest !== computedGeneration
           || integer(row.capture_policy_revision, 1) !== integer(row.policy_revision, 1)
           || integer(row.capture_collection_revision, 1) !== integer(row.collection_revision, 1)) return null;
-      const memberRows = await client.query<{
-        owner_digest: string; input_revision: string | number;
-        owner_revision: string | number; authority_epoch: string | number;
-        source_kind: string | null; input_fingerprint: string | null; result_sha256: string | null;
-      }>(
-        `SELECT owner_digest, input_revision, owner_revision, authority_epoch,
-                source_kind, input_fingerprint, result_sha256
-           FROM ${schema}.analytics_publication_owner_members
-          WHERE source_id = $1 AND day = $2::date AND metric = 'model' AND generation = $3
-          ORDER BY owner_digest`,
-        [identity.sourceId, capturedDay, row.generation],
-      );
-      if (memberRows.rows.length !== memberProof.length || memberRows.rows.some((member, index) => {
+      const memberReadback = await readPublicationMembers(client, schema, {
+        sourceId: identity.sourceId, day: capturedDay, generation: row.generation,
+      }, async (member, index) => {
         const proof = memberProof[index];
-        return !proof || member.owner_digest !== proof[0]
-          || integer(member.input_revision) !== proof[2]
-          || integer(member.owner_revision) !== proof[3]
-          || integer(member.authority_epoch) !== proof[4]
-          || member.source_kind !== null || member.input_fingerprint !== null || member.result_sha256 !== null;
-      })) return null;
+        if (!proof) return false;
+        return member.owner_digest === proof[0]
+          && integer(member.input_revision) === proof[2]
+          && integer(member.owner_revision) === proof[3]
+          && integer(member.authority_epoch) === proof[4]
+          && member.source_kind === null && member.input_fingerprint === null
+          && member.result_sha256 === null;
+      });
+      if (!memberReadback.complete || memberReadback.count !== memberProof.length) return null;
     } else if (captureRecord.schema === "postgres-community-model-capture-v2") {
       const memberProof = captureRecord.memberProof;
       if (!memberProof || typeof memberProof !== "object" || Array.isArray(memberProof)) return null;
@@ -233,58 +284,44 @@ export async function readPostgresCommunityModelDay(
           || typeof proofRecord.root !== "string" || !/^[a-f0-9]{64}$/u.test(proofRecord.root)
           || typeof proofRecord.count !== "number" || !Number.isSafeInteger(proofRecord.count)
           || proofRecord.count !== integer(row.expected_members)) return null;
+      const expectedMemberCount = proofRecord.count;
       const computedGeneration = await sha256Hex(canonicalJson([
         "postgres-community-model-day-v2", capturedDay, row.authority_json,
-        STREAMED_MEMBER_PROOF_ALGORITHM, proofRecord.count, proofRecord.root,
+        STREAMED_MEMBER_PROOF_ALGORITHM, expectedMemberCount, proofRecord.root,
       ]));
       if (computedGeneration !== row.generation || row.cohort_digest !== computedGeneration
           || integer(row.capture_policy_revision, 1) !== integer(row.policy_revision, 1)
           || integer(row.capture_collection_revision, 1) !== integer(row.collection_revision, 1)) return null;
       const proof = new StreamingMemberProofAccumulator();
-      let after = "";
       let observedCount = 0;
       let previousDigest = "";
-      while (true) {
-        const page = await client.query<{
-          owner_digest: string; input_revision: string | number;
-          owner_revision: string | number; authority_epoch: string | number;
-          source_kind: string | null; input_fingerprint: string | null; result_sha256: string | null;
-        }>(
-          `SELECT owner_digest, input_revision, owner_revision, authority_epoch,
-                  source_kind, input_fingerprint, result_sha256
-             FROM ${schema}.analytics_publication_owner_members
-            WHERE source_id=$1 AND day=$2::date AND metric='model' AND generation=$3
-              AND owner_digest COLLATE "C" > $4::text COLLATE "C"
-            ORDER BY owner_digest COLLATE "C" LIMIT 200`,
-          [identity.sourceId, capturedDay, row.generation, after],
-        );
-        if (page.rows.length === 0) break;
-        for (const member of page.rows) {
-          const ownerDigest = member.owner_digest;
-          const sourceKind = member.source_kind;
-          const inputRevision = integer(member.input_revision);
-          const ownerRevision = integer(member.owner_revision);
-          const authorityEpoch = integer(member.authority_epoch);
-          if (!/^[a-f0-9]{64}$/u.test(ownerDigest) || ownerDigest <= previousDigest
-              || typeof sourceKind !== "string"
-              || !["effective", "v1.1", "v1", "mixed", "v0.2"].includes(sourceKind)
-              || member.input_fingerprint !== null
-                && (typeof member.input_fingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(member.input_fingerprint))
-              || member.result_sha256 !== null
-                && (typeof member.result_sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(member.result_sha256))) return null;
-          const supported = sourceKind === "effective" || sourceKind === "v1.1" || sourceKind === "v1";
-          if (supported ? member.input_fingerprint === null || member.result_sha256 === null
-              : member.input_fingerprint !== null || member.result_sha256 !== null) return null;
-          await proof.add([ownerDigest, sourceKind as PostgresCommunityGraphSourceKind,
-            inputRevision, ownerRevision, authorityEpoch,
-            member.input_fingerprint, member.result_sha256]);
-          observedCount += 1;
-          previousDigest = ownerDigest;
-        }
-        after = page.rows.at(-1)!.owner_digest;
-        if (page.rows.length < 200) break;
-      }
-      if (observedCount !== proofRecord.count || proof.count !== observedCount
+      const memberReadback = await readPublicationMembers(client, schema, {
+        sourceId: identity.sourceId, day: capturedDay, generation: row.generation,
+      }, async (member) => {
+        const ownerDigest = member.owner_digest;
+        const sourceKind = member.source_kind;
+        const inputRevision = integer(member.input_revision);
+        const ownerRevision = integer(member.owner_revision);
+        const authorityEpoch = integer(member.authority_epoch);
+        if (!/^[a-f0-9]{64}$/u.test(ownerDigest) || ownerDigest <= previousDigest
+            || typeof sourceKind !== "string"
+            || !["effective", "v1.1", "v1", "mixed", "v0.2"].includes(sourceKind)
+            || member.input_fingerprint !== null
+              && (typeof member.input_fingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(member.input_fingerprint))
+            || member.result_sha256 !== null
+              && (typeof member.result_sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(member.result_sha256))) return false;
+        const supported = sourceKind === "effective" || sourceKind === "v1.1" || sourceKind === "v1";
+        if (supported ? member.input_fingerprint === null || member.result_sha256 === null
+            : member.input_fingerprint !== null || member.result_sha256 !== null) return false;
+        await proof.add([ownerDigest, sourceKind as PostgresCommunityGraphSourceKind,
+          inputRevision, ownerRevision, authorityEpoch,
+          member.input_fingerprint, member.result_sha256]);
+        observedCount += 1;
+        previousDigest = ownerDigest;
+        return observedCount <= expectedMemberCount;
+      });
+      if (!memberReadback.complete || memberReadback.count !== expectedMemberCount
+          || observedCount !== expectedMemberCount || proof.count !== observedCount
           || await proof.root() !== proofRecord.root) return null;
     } else return null;
     const projected = projectDay(payload);
