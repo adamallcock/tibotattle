@@ -85,6 +85,20 @@ v1.2 upload/readback, exact-owner cleanup and idempotent replay passed, and
 the isolated bucket again had no object generations. This remains a scoped
 test journey, not browser sign-in or production route parity.
 
+Source integration after that journey merges the migration-41 integration
+line (`1470f041`) and the live-tested A2 retry (`8c8eead6`) into this
+candidate; the A2 activation sources are byte-identical to `8c8eead6`. The
+candidate also adds PostgreSQL analytics owner retirement and completes the
+internal social owner eraser, which revokes authority, records the ledger
+tombstone and pinned-secret identity cooldowns, deletes exact stored objects,
+removes the participant, and then retires the owner's derived analytics, all
+resumably. These are local PostgreSQL 17 source results. Neither is routed,
+deployed, or live-qualified: no Worker route or admin action invokes them, the
+accountless eraser does not yet retire analytics, participants holding a
+redeemed community grant are refused pending a grant-retention decision, and
+retirement's owner-digest discovery and residual scans still need
+qualification against a real transferred snapshot on the test primary.
+
 The deployed OAuth gateway is isolated to a small explicit route allowlist. It
 pins the IAM-private backend URL and
 ID-token audience, preserves the application `Authorization` header separately
@@ -165,9 +179,13 @@ The [A2 synthetic daily publication review](./2026-09-25-a2-synthetic-daily-publ
 defines the exact private fixture and temporary collection-control transition.
 Automatic approval review initially blocked its write-capable runner. The
 owner subsequently approved the exact test-only effect recorded in that
-review. Execution still requires an exact-image qualification, live
-preconditions, and a fresh backup; approval is not an activation or
-publication receipt.
+review. Execution required an exact-image qualification, live
+preconditions, and a fresh backup; approval alone is not an activation or
+publication receipt. The [A2 private daily read retry](../receipts/2026-09-25-gcp-a2-private-daily-read-retry.md)
+then records a prewrite backup, immutable synthetic aggregate revision 2, an
+authenticated IAM-private read of that exact day and revision, and controls
+restored to revision 6 with publication and enrollment off. It is one
+synthetic read, not public daily parity or a production test.
 
 The private Cloud Run dispatch recognizes at most 16 of the 51 exact Worker
 registry paths, plus one private test-only effective-page path. The other 35
