@@ -11,6 +11,7 @@ export default defineConfig({
       "postgres-test/postgres-community-daily-publisher.spec.mjs",
       "postgres-test/postgres-community-daily-host.spec.mjs",
       "postgres-test/postgres-analytics-event-tuple.spec.mjs",
+      "postgres-test/postgres-ingestion-journal-transfer.spec.mjs",
     ],
     fileParallelism: false,
   },
