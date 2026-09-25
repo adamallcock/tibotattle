@@ -9,7 +9,7 @@ import {
   POSTGRES_COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_SERVICE_ACCOUNT,
   POSTGRES_COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_TARGET,
   parsePostgresCommunityGraphReadbackDiagnosticConfig,
-  postgresCommunityGraphMemberReadbackSelect,
+  postgresCommunityGraphMemberReadbackPageSelect,
   readAttachedCommunityGraphReadbackDiagnosticServiceAccount,
   runPostgresCommunityGraphReadbackDiagnostic,
 } from "./dist/postgres-community-graph-readback-diagnostic.mjs";
@@ -18,7 +18,7 @@ const EXECUTION = "tibotattle-public-graph-readback-diagnostic-00001-abc";
 const SOURCE_ID = "synthetic-community-source";
 const DAY = "2026-09-23";
 const GENERATION = "a".repeat(64);
-const MIGRATION_TAIL = "0038_analytics_event_tuple_versions.sql";
+const MIGRATION_TAIL = "0039_analytics_applied_projection_v1.sql";
 
 function validEnv(overrides = {}) {
   return {
@@ -38,10 +38,10 @@ function validEnv(overrides = {}) {
 }
 
 function fakeMigrations() {
-  return Array.from({ length: 38 }, (_, index) => ({
+  return Array.from({ length: 39 }, (_, index) => ({
     version: index + 1,
-    name: `${String(index + 1).padStart(4, "0")}_${index === 37
-      ? "analytics_event_tuple_versions" : `test_${index + 1}`}.sql`,
+    name: `${String(index + 1).padStart(4, "0")}_${index === 38
+      ? "analytics_applied_projection_v1" : `test_${index + 1}`}.sql`,
     sha256: (index + 1).toString(16).padStart(64, "0"),
   }));
 }
@@ -153,8 +153,8 @@ test("readback diagnostic accepts only the exact single-task isolated target", (
     validEnv(), POSTGRES_COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_SERVICE_ACCOUNT,
   ), {
     job: POSTGRES_COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_JOB,
-    profile: "100k-readpaged",
-    schema: "tibotattle_graph_benchmark_100k_readpaged_20260925",
+    profile: "100k-readindexed",
+    schema: "tibotattle_graph_benchmark_100k_readindexed_20260925",
     project: "tibotattle",
     serviceAccount: POSTGRES_COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_SERVICE_ACCOUNT,
     iamUser: POSTGRES_COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_IAM_USER,
@@ -205,7 +205,7 @@ test("diagnostic explains the production read query in a bounded read-only plan 
   const receipt = await runPostgresCommunityGraphReadbackDiagnostic({
     env: validEnv(), dependencies: harness.dependencies,
   });
-  const productionSelect = postgresCommunityGraphMemberReadbackSelect(
+  const productionSelect = postgresCommunityGraphMemberReadbackPageSelect(
     POSTGRES_COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_SCHEMA,
   );
   const explainStatementIndex = harness.statements.findIndex((sql) => sql.startsWith("EXPLAIN "));
@@ -215,16 +215,16 @@ test("diagnostic explains the production read query in a bounded read-only plan 
   assert.doesNotMatch(explainSql, /\bANALYZE\b/u);
   assert.ok(harness.statements.includes("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"));
   assert.ok(harness.statements.includes("SET LOCAL statement_timeout='15000ms'"));
-  assert.deepEqual(harness.parameters[explainStatementIndex], [SOURCE_ID, DAY, GENERATION]);
+  assert.deepEqual(harness.parameters[explainStatementIndex], [SOURCE_ID, DAY, GENERATION, "", 4_096]);
   assert.equal(harness.checkouts, 3);
   assert.equal(harness.releases, 3);
   assert.equal(harness.closed, true);
   assert.deepEqual(receipt, {
     schemaVersion: "postgres-community-graph-readback-explain-v1",
     status: "ok",
-    profile: "100k-readpaged",
+    profile: "100k-readindexed",
     memberCount: 100_000,
-    migrationReceipt: { count: 38, tail: MIGRATION_TAIL },
+    migrationReceipt: { count: 39, tail: MIGRATION_TAIL },
     explainElapsedMilliseconds: receipt.explainElapsedMilliseconds,
     statementSha256: createHash("sha256").update(explainSql).digest("hex"),
     planSummary: {

@@ -104,10 +104,10 @@ function validEnv(profileName = "10k", overrides = {}) {
 }
 
 function fakeMigrations() {
-  return Array.from({ length: 38 }, (_, index) => ({
+  return Array.from({ length: 39 }, (_, index) => ({
     version: index + 1,
-    name: `${String(index + 1).padStart(4, "0")}_${index === 37
-      ? "analytics_event_tuple_versions" : `test_${index + 1}`}.sql`,
+    name: `${String(index + 1).padStart(4, "0")}_${index === 38
+      ? "analytics_applied_projection_v1" : `test_${index + 1}`}.sql`,
     sha256: (index + 1).toString(16).padStart(64, "0"),
   }));
 }
@@ -230,6 +230,25 @@ test("isolated 100k diagnostic profiles keep exact matched digests with distinct
   assert.notEqual(readpaged100k.schema, matched100k.schema);
   assert.notEqual(readpaged100k.schema, paged100k.schema);
   assert.equal(readpaged100k.schema, "tibotattle_graph_benchmark_100k_readpaged_20260925");
+  const readindexed100k = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-readindexed"];
+  assert.deepEqual(computePostgresCommunityGraphBenchmarkDigests("100k-readindexed"), {
+    workloadDigest: matched100k.workloadDigest,
+    sourceDigest: matched100k.sourceDigest,
+  });
+  assert.deepEqual({
+    members: readindexed100k.members,
+    workloadDigest: readindexed100k.workloadDigest,
+    sourceDigest: readindexed100k.sourceDigest,
+    outputDigest: readindexed100k.outputDigest,
+  }, {
+    members: matched100k.members,
+    workloadDigest: matched100k.workloadDigest,
+    sourceDigest: matched100k.sourceDigest,
+    outputDigest: matched100k.outputDigest,
+  });
+  assert.notEqual(readindexed100k.schema, matched100k.schema);
+  assert.notEqual(readindexed100k.schema, readpaged100k.schema);
+  assert.equal(readindexed100k.schema, "tibotattle_graph_benchmark_100k_readindexed_20260925");
   assert.equal(POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["10k"].members, 10_000);
   assert.equal(POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k"].members, 100_000);
 });
@@ -269,6 +288,16 @@ test("configuration pins one single-attempt primary test Job, schema and runtime
   assert.equal(readpagedConfig.schema, "tibotattle_graph_benchmark_100k_readpaged_20260925");
   assert.throws(() => parsePostgresCommunityGraphBenchmarkConfig(
     validEnv("100k-readpaged", { PRIMARY_SCHEMA: "tibotattle_graph_benchmark_100k_20260925" }),
+    POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SERVICE_ACCOUNT,
+  ), (error) => error?.code === "POSTGRES_COMMUNITY_GRAPH_BENCHMARK_TARGET_INVALID");
+  const readindexedConfig = parsePostgresCommunityGraphBenchmarkConfig(
+    validEnv("100k-readindexed"), POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SERVICE_ACCOUNT,
+  );
+  assert.equal(readindexedConfig.profile, "100k-readindexed");
+  assert.equal(readindexedConfig.members, 100_000);
+  assert.equal(readindexedConfig.schema, "tibotattle_graph_benchmark_100k_readindexed_20260925");
+  assert.throws(() => parsePostgresCommunityGraphBenchmarkConfig(
+    validEnv("100k-readindexed", { PRIMARY_SCHEMA: "tibotattle_graph_benchmark_100k_20260925" }),
     POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SERVICE_ACCOUNT,
   ), (error) => error?.code === "POSTGRES_COMMUNITY_GRAPH_BENCHMARK_TARGET_INVALID");
   for (const overrides of [
@@ -356,8 +385,8 @@ test("migration receipt is compared row-for-row and fails closed on drift", asyn
   const receipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
     pool, POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["10k"].schema, migrations,
   );
-  assert.equal(receipt.count, 38);
-  assert.equal(receipt.tail, "0038_analytics_event_tuple_versions.sql");
+  assert.equal(receipt.count, 39);
+  assert.equal(receipt.tail, "0039_analytics_applied_projection_v1.sql");
   assert.match(receipt.sha256, /^[a-f0-9]{64}$/u);
   assert.equal(pool.releases, 1);
   assert.ok(pool.statements.some((sql) => sql.includes('ORDER BY version')));
@@ -367,8 +396,8 @@ test("migration receipt is compared row-for-row and fails closed on drift", asyn
   const insightsReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
     insightsPool, insightsSchema, migrations,
   );
-  assert.equal(insightsReceipt.count, 38);
-  assert.equal(insightsReceipt.tail, "0038_analytics_event_tuple_versions.sql");
+  assert.equal(insightsReceipt.count, 39);
+  assert.equal(insightsReceipt.tail, "0039_analytics_applied_projection_v1.sql");
   assert.match(insightsReceipt.sha256, /^[a-f0-9]{64}$/u);
 
   const pagedSchema = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-paged"].schema;
@@ -376,16 +405,24 @@ test("migration receipt is compared row-for-row and fails closed on drift", asyn
   const pagedReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
     pagedPool, pagedSchema, migrations,
   );
-  assert.equal(pagedReceipt.count, 38);
-  assert.equal(pagedReceipt.tail, "0038_analytics_event_tuple_versions.sql");
+  assert.equal(pagedReceipt.count, 39);
+  assert.equal(pagedReceipt.tail, "0039_analytics_applied_projection_v1.sql");
   const readpagedSchema = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-readpaged"].schema;
   const readpagedPool = migrationPool(rows, readpagedSchema);
   const readpagedReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
     readpagedPool, readpagedSchema, migrations,
   );
-  assert.equal(readpagedReceipt.count, 38);
-  assert.equal(readpagedReceipt.tail, "0038_analytics_event_tuple_versions.sql");
+  assert.equal(readpagedReceipt.count, 39);
+  assert.equal(readpagedReceipt.tail, "0039_analytics_applied_projection_v1.sql");
   assert.match(readpagedReceipt.sha256, /^[a-f0-9]{64}$/u);
+  const readindexedSchema = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-readindexed"].schema;
+  const readindexedPool = migrationPool(rows, readindexedSchema);
+  const readindexedReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
+    readindexedPool, readindexedSchema, migrations,
+  );
+  assert.equal(readindexedReceipt.count, 39);
+  assert.equal(readindexedReceipt.tail, "0039_analytics_applied_projection_v1.sql");
+  assert.match(readindexedReceipt.sha256, /^[a-f0-9]{64}$/u);
   assert.match(pagedReceipt.sha256, /^[a-f0-9]{64}$/u);
 
   const drifted = migrationPool(rows.map((row, index) => index === 4
@@ -403,7 +440,7 @@ test("bundled migration loader pins the image migration directory", async () => 
   const migrations = await readPostgresCommunityGraphBenchmarkMigrations({
     async readMigrations(actual) { options = actual; return fakeMigrations(); },
   });
-  assert.equal(migrations.length, 38);
+  assert.equal(migrations.length, 39);
   assert.deepEqual(options, {
     role: "primary",
     rootDirectory: POSTGRES_COMMUNITY_GRAPH_BENCHMARK_MIGRATION_ROOT,
@@ -419,7 +456,10 @@ test("query receipt metrics count pages and connections without retaining SQL or
     async connect() {
       return {
         async query(sql) {
-          if (sql.startsWith("FETCH FORWARD")) return { rows: [{ synthetic: "x" }], rowCount: 1 };
+          if (sql.includes(".analytics_publication_owner_members member")
+              && sql.includes("member.owner_digest > $4::text")) {
+            return { rows: [{ synthetic: "x" }], rowCount: 1 };
+          }
           return { rows: [], rowCount: 0 };
         },
         release() { releaseCount += 1; },
@@ -429,7 +469,10 @@ test("query receipt metrics count pages and connections without retaining SQL or
   const metrics = createPostgresCommunityGraphBenchmarkMetrics(rawPool);
   metrics.setPhase("readback");
   const client = await metrics.pool.connect();
-  await client.query("FETCH FORWARD 4096 FROM synthetic_cursor");
+  await client.query(`WITH page AS MATERIALIZED (
+    SELECT member.owner_digest FROM synthetic.analytics_publication_owner_members member
+    WHERE member.owner_digest > $4::text ORDER BY member.owner_digest LIMIT $5::integer
+  ) SELECT page.owner_digest FROM page`);
   metrics.setPhase("publish");
   await client.query(`WITH page AS MATERIALIZED (SELECT 'synthetic'::text AS owner_digest),
     inserted AS (INSERT INTO synthetic.analytics_publication_owner_members(owner_digest)

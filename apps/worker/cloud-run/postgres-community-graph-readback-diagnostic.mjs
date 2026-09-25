@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Connector } from "@google-cloud/cloud-sql-connector";
 import { quotePostgresIdentifier, withPostgresRead } from "../src/postgres-client.ts";
-import { postgresCommunityGraphMemberReadbackSelect } from "../src/postgres-community-graph-readback-query.ts";
+import { postgresCommunityGraphMemberReadbackPageSelect } from "../src/postgres-community-graph-readback-query.ts";
 import {
   closeCloudSqlResources,
   createIamPool as createCloudSqlIamPool,
@@ -13,13 +13,13 @@ import {
 } from "./cloud-sql.mjs";
 import { readPostgresMigrations } from "./postgres-migrations.mjs";
 
-export { postgresCommunityGraphMemberReadbackSelect };
+export { postgresCommunityGraphMemberReadbackPageSelect };
 
 export const POSTGRES_COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_JOB =
   "tibotattle-public-graph-readback-diagnostic";
-export const POSTGRES_COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_PROFILE = "100k-readpaged";
+export const POSTGRES_COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_PROFILE = "100k-readindexed";
 export const POSTGRES_COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_SCHEMA =
-  "tibotattle_graph_benchmark_100k_readpaged_20260925";
+  "tibotattle_graph_benchmark_100k_readindexed_20260925";
 export const POSTGRES_COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_SERVICE_ACCOUNT =
   "tibotattle-test-runtime@tibotattle.iam.gserviceaccount.com";
 export const POSTGRES_COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_IAM_USER =
@@ -36,8 +36,8 @@ const METADATA_EMAIL_URL =
   "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email";
 const SOURCE_ID = "synthetic-community-source";
 const DAY = "2026-09-23";
-const MIGRATION_COUNT = 38;
-const MIGRATION_TAIL = "0038_analytics_event_tuple_versions.sql";
+const MIGRATION_COUNT = 39;
+const MIGRATION_TAIL = "0039_analytics_applied_projection_v1.sql";
 const MIGRATION_ROOT = "/app/apps/worker/postgres/migrations";
 const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
 const EXPLAIN_TIMEOUT_MS = 15_000;
@@ -197,7 +197,7 @@ function validateTarget(row, config) {
 }
 
 function explainSql(schema) {
-  const statement = postgresCommunityGraphMemberReadbackSelect(schema);
+  const statement = postgresCommunityGraphMemberReadbackPageSelect(schema);
   return `EXPLAIN (FORMAT JSON, COSTS TRUE, VERBOSE FALSE, SETTINGS TRUE) ${statement}`;
 }
 
@@ -309,7 +309,7 @@ export async function runPostgresCommunityGraphReadbackDiagnostic({ env = proces
     const sql = explainSql(config.schema);
     const explainStarted = performance.now();
     const explainRows = await withPostgresRead(pool, async (client) => {
-      const result = await client.query(sql, [SOURCE_ID, DAY, generation]);
+      const result = await client.query(sql, [SOURCE_ID, DAY, generation, "", 4_096]);
       if (!Array.isArray(result?.rows) || result.rows.length !== 1) {
         fail("POSTGRES_COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_PLAN_INVALID", "explain");
       }

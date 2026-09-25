@@ -47,8 +47,13 @@ function measuredPool(base) {
   let checkedOutConnections = 0;
   let maxConcurrentCheckedOutConnections = 0;
   let explainedResultPage = false;
+  let explainedMemberReadbackPage = false;
+  let lastMemberReadbackDigest = "";
+  let memberReadbackPageBoundaryCount = 0;
+  let memberReadbackCanonicalOrder = true;
   const classify = (sql) => {
-    if (/^FETCH FORWARD\b/u.test(sql)) return "member_readback_pages";
+    if (sql.includes(".analytics_publication_owner_members member")
+        && sql.includes("member.owner_digest > $4::text")) return "member_readback_pages";
     if (sql.includes("CREATE INDEX pg_community_graph_members_owner_digest_c")) return "member_page_index";
     if (/^\s*ANALYZE pg_temp\.pg_community_graph_members\b/u.test(sql)) return "member_table_analyze";
     if (sql.includes("candidates AS MATERIALIZED")) return "result_pages";
@@ -107,6 +112,33 @@ function measuredPool(base) {
                 nodes,
               }));
             }
+            if (!explainedMemberReadbackPage && process.env.PG_GRAPH_STRESS_READBACK_EXPLAIN === "1"
+                && classify(sql) === "member_readback_pages") {
+              explainedMemberReadbackPage = true;
+              const explained = await client.query(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sql}`, values);
+              const explainedPlan = explained.rows[0]?.["QUERY PLAN"]?.[0];
+              const bufferCounters = ["Shared Hit Blocks", "Shared Read Blocks", "Shared Dirtied Blocks",
+                "Shared Written Blocks", "Local Hit Blocks", "Local Read Blocks", "Local Dirtied Blocks",
+                "Local Written Blocks", "Temp Read Blocks", "Temp Written Blocks"];
+              const nodes = [];
+              const collect = (node) => {
+                if (!node) return;
+                nodes.push({ type: node["Node Type"], relation: node["Relation Name"],
+                  index: node["Index Name"], planRows: node["Plan Rows"], actualRows: node["Actual Rows"],
+                  loops: node["Actual Loops"], actualTotalTimeMs: node["Actual Total Time"],
+                  rowsRemovedByFilter: node["Rows Removed by Filter"],
+                  buffers: Object.fromEntries(bufferCounters
+                    .filter((key) => Number.isSafeInteger(node[key])).map((key) => [key, node[key]])) });
+                for (const child of node.Plans ?? []) collect(child);
+              };
+              collect(explainedPlan?.Plan);
+              console.log(JSON.stringify({
+                kind: "synthetic-postgres-member-readback-page-explain-v1",
+                planningTimeMs: explainedPlan?.["Planning Time"] ?? null,
+                executionTimeMs: explainedPlan?.["Execution Time"] ?? null,
+                nodes,
+              }));
+            }
             const started = performance.now();
             let result;
             try {
@@ -123,6 +155,17 @@ function measuredPool(base) {
               // `result` is assigned before the finally block on successful queries.
               // These sizes are decoded row JSON, not PostgreSQL wire-protocol bytes.
               const rows = result?.rows ?? [];
+              if (kind === "member_readback_pages" && rows.length > 0) {
+                memberReadbackPageBoundaryCount += lastMemberReadbackDigest === "" ? 0 : 1;
+                for (const row of rows) {
+                  const ownerDigest = row.owner_digest;
+                  if (typeof ownerDigest !== "string" || !/^[a-f0-9]{64}$/u.test(ownerDigest)
+                      || ownerDigest <= lastMemberReadbackDigest) {
+                    memberReadbackCanonicalOrder = false;
+                  }
+                  if (typeof ownerDigest === "string") lastMemberReadbackDigest = ownerDigest;
+                }
+              }
               const decodedRowsJsonBytes = Buffer.byteLength(JSON.stringify(rows));
               const resultPayloadJsonBytes = rows.reduce((total, row) => total
                 + (typeof row.payload_json === "string" ? Buffer.byteLength(row.payload_json) : 0), 0);
@@ -166,6 +209,8 @@ function measuredPool(base) {
         connectionAcquisitions,
         maxConcurrentCheckedOutConnections,
         checkedOutConnectionsAtEnd: checkedOutConnections,
+        memberReadbackPageBoundaryCount,
+        memberReadbackCanonicalOrder,
         pageIndexMode: STRESS_MEMBERS >= C_COLLATION_INDEX_MEMBER_THRESHOLD
           ? "collate-c-index" : "primary-key-default-collation",
         pageIndexThresholdMembers: C_COLLATION_INDEX_MEMBER_THRESHOLD,
@@ -631,6 +676,47 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     expect(await read()).toMatchObject({ day: DAY, fittedParticipantCount: 1 });
   }, 120_000);
 
+  it("withholds the projection when native-collation rows diverge from bytewise hex order", async () => {
+    await seedOwner();
+    await seedOtherOwner();
+    await writeResult(FINGERPRINT, 0, 1, 0, OTHER_OWNER_DIGEST);
+    const schemaOptions = { primarySchema: schema, ledgerSchema: "tibotattle_ledger" };
+    const published = await publishPostgresCommunityModelDay(pool, {
+      sourcePin,
+      members: [
+        member("effective", FINGERPRINT, 0, 1, OTHER_OWNER_DIGEST, OTHER_PARTICIPANT_ID),
+        member("effective", FINGERPRINT, 0, 1, OWNER_DIGEST, PARTICIPANT_ID),
+      ],
+      day: DAY,
+      nowMs: NOW,
+      schema: schemaOptions,
+    });
+    expect(published).toMatchObject({ state: "published", memberCount: 2 });
+
+    let pageNumber = 0;
+    const mismatchedCollationPool = {
+      async connect() {
+        const client = await pool.connect();
+        return {
+          async query(sql, values) {
+            const result = await client.query(sql, values);
+            if (typeof sql !== "string"
+                || !sql.includes(".analytics_publication_owner_members member")
+                || !sql.includes("member.owner_digest > $4::text")) return result;
+            pageNumber += 1;
+            // Model a locale sort that returns valid hashes in reverse bytewise order.
+            return { ...result, rows: [...result.rows].reverse() };
+          },
+          release: client.release.bind(client),
+        };
+      },
+    };
+    expect(await readPostgresCommunityModelDay(mismatchedCollationPool, {
+      sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: DAY, schema: schemaOptions,
+    })).toBeNull();
+    expect(pageNumber).toBe(1);
+  }, 120_000);
+
   it("rolls back a failed member-page read and releases its PostgreSQL client", async () => {
     await seedOwner();
     const schemaOptions = { primarySchema: schema, ledgerSchema: "tibotattle_ledger" };
@@ -646,7 +732,9 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
         const client = await pool.connect();
         return {
           async query(sql, values) {
-            if (!fetchFailed && typeof sql === "string" && /^FETCH FORWARD\b/u.test(sql)) {
+            if (!fetchFailed && typeof sql === "string"
+                && sql.includes(".analytics_publication_owner_members member")
+                && sql.includes("member.owner_digest > $4::text")) {
               fetchFailed = true;
               throw new Error("synthetic read-page failure");
             }
@@ -985,6 +1073,9 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     expect(readSqlSummary.queries.member_readback_pages?.pages.rows.max ?? 0).toBeLessThanOrEqual(4_096);
     expect(readSqlSummary.queries.member_readback_pages?.count ?? 0)
       .toBe(Math.ceil(largeCount / 4_096));
+    expect(readSqlSummary.memberReadbackCanonicalOrder).toBe(true);
+    expect(readSqlSummary.memberReadbackPageBoundaryCount)
+      .toBe(Math.max(0, Math.ceil(largeCount / 4_096) - 1));
     expect(readSqlSummary.checkedOutConnectionsAtEnd).toBe(0);
     const outputDigest = createHash("sha256").update(canonicalJson(readback)).digest("hex");
     if (largeCount === 100_000 && STRESS_NOW_MS === 1_790_294_400_000) {

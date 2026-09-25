@@ -4,7 +4,10 @@ import { projectAdminModelHistoryDay } from "@app-usagemonitor/telemetry-contrac
 import { canonicalJson } from "./canonical-json";
 import { sha256Hex } from "./crypto";
 import { modelHistoryWindow } from "./model-history-window";
-import { postgresCommunityGraphMemberReadbackSelect } from "./postgres-community-graph-readback-query";
+import {
+  isCanonicalCommunityGraphDigestPageAfter,
+  postgresCommunityGraphMemberReadbackPageSelect,
+} from "./postgres-community-graph-readback-query";
 import {
   createPostgresSourceIdentityConfig,
   createPostgresSchemaConfig,
@@ -29,7 +32,6 @@ export type {
 
 const MAX_PUBLICATION_BYTES = 16 * 1024;
 const MEMBER_READBACK_FETCH_SIZE = 4_096;
-const MEMBER_READBACK_CURSOR = "postgres_community_graph_member_readback";
 const fail = () => new Error("POSTGRES_COMMUNITY_GRAPH_UNAVAILABLE");
 
 type MemberProof = readonly [
@@ -61,38 +63,41 @@ interface PublicationMemberReadbackScope {
   readonly generation: string;
 }
 
-/** Read member receipts and current authority rows in bounded batches without
- * reopening the ordered index scan for every keyset page. The repeatable-read
- * transaction keeps the page checks on the same snapshot as publication gates. */
+/** Read member receipts and current authority rows in indexed keyset batches.
+ * The repeatable-read transaction keeps every page on the same snapshot as
+ * publication gates. Each page boundary is checked in canonical bytewise
+ * lowercase-hex order before its cursor can advance. */
 async function readPublicationMembers(
   client: PostgresClient,
   schema: string,
   scope: PublicationMemberReadbackScope,
   visit: (row: PublicationMemberReadbackRow, index: number) => Promise<boolean>,
 ): Promise<{ readonly complete: boolean; readonly count: number }> {
-  await client.query(
-    `DECLARE ${MEMBER_READBACK_CURSOR} NO SCROLL CURSOR FOR ${postgresCommunityGraphMemberReadbackSelect(
-      schema,
-    )}`,
-    [scope.sourceId, scope.day, scope.generation],
-  );
   let count = 0;
-  try {
-    while (true) {
-      const page = await client.query<PublicationMemberReadbackRow>(
-        `FETCH FORWARD ${MEMBER_READBACK_FETCH_SIZE} FROM ${MEMBER_READBACK_CURSOR}`,
-      );
-      if (!Array.isArray(page.rows) || page.rows.length > MEMBER_READBACK_FETCH_SIZE) throw fail();
-      for (const row of page.rows) {
-        const index = count;
-        count += 1;
-        if (row.owner_state !== "active" || row.link_state !== "active" || row.participant_state !== "active"
-            || !await visit(row, index)) return { complete: false, count };
-      }
-      if (page.rows.length < MEMBER_READBACK_FETCH_SIZE) return { complete: true, count };
+  let afterOwnerDigest = "";
+  let previousDigest = "";
+  while (true) {
+    const page = await client.query<PublicationMemberReadbackRow>(
+      postgresCommunityGraphMemberReadbackPageSelect(schema),
+      [scope.sourceId, scope.day, scope.generation, afterOwnerDigest, MEMBER_READBACK_FETCH_SIZE],
+    );
+    if (!Array.isArray(page.rows) || page.rows.length > MEMBER_READBACK_FETCH_SIZE) throw fail();
+    if (!isCanonicalCommunityGraphDigestPageAfter(
+      page.rows.map(({ owner_digest }) => owner_digest), previousDigest,
+    )) {
+      return { complete: false, count };
     }
-  } finally {
-    await client.query(`CLOSE ${MEMBER_READBACK_CURSOR}`);
+    for (const row of page.rows) {
+      const index = count;
+      previousDigest = row.owner_digest;
+      count += 1;
+      if (row.owner_state !== "active" || row.link_state !== "active" || row.participant_state !== "active"
+          || !await visit(row, index)) return { complete: false, count };
+    }
+    if (page.rows.length < MEMBER_READBACK_FETCH_SIZE) return { complete: true, count };
+    // This exact last key is the next page's lower bound. The first digest on
+    // the next page is checked against it before any row can affect the proof.
+    afterOwnerDigest = previousDigest;
   }
 }
 

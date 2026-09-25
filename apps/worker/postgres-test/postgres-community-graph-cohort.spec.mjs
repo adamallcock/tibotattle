@@ -9,6 +9,7 @@ import { createPostgresTypedV12Domain } from "../src/postgres-typed-v12-domain.t
 import {
   listPostgresCommunityGraphCohortPage,
 } from "../src/postgres-community-graph-cohort.ts";
+import { isCanonicalCommunityGraphDigestPageAfter } from "../src/postgres-community-graph-readback-query.ts";
 import {
   publishPostgresCommunityModelDay,
   publishPostgresCommunityModelDayFromCohort,
@@ -22,6 +23,16 @@ const SOURCE_ID = "synthetic-community-source";
 const SOURCE_NAMESPACE = "synthetic-community-namespace";
 const DAY = "2026-09-23";
 const MODEL_FINGERPRINT = "f".repeat(64);
+
+it("rejects locale-sorted member pages that diverge from canonical lowercase-hex order", () => {
+  const e = "e".repeat(64);
+  const f = "f".repeat(64);
+  expect(isCanonicalCommunityGraphDigestPageAfter([e, f], "")).toBe(true);
+  expect(isCanonicalCommunityGraphDigestPageAfter([e], f)).toBe(false);
+  expect(isCanonicalCommunityGraphDigestPageAfter([f, e], "")).toBe(false);
+  expect(isCanonicalCommunityGraphDigestPageAfter([e, e], "")).toBe(false);
+  expect(isCanonicalCommunityGraphDigestPageAfter(["F".repeat(64)], "")).toBe(false);
+});
 
 async function localSocket() {
   assert.match(PG_TEST_SOCKET ?? "", /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u);
@@ -433,13 +444,15 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
       day: DAY,
       schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
     })).toMatchObject({ day: DAY, fittedParticipantCount: 3, values: [["gpt-6-astra", 1000, 3]] });
-    expect(readQueries.filter((sql) => sql.startsWith("DECLARE postgres_community_graph_member_readback")))
-      .toHaveLength(1);
-    expect(readQueries.filter((sql) => sql.startsWith("FETCH FORWARD 4096 FROM postgres_community_graph_member_readback")))
-      .toHaveLength(1);
-    expect(readQueries.filter((sql) => sql === "CLOSE postgres_community_graph_member_readback"))
-      .toHaveLength(1);
-    expect(readQueries.some((sql) => sql.includes('owner_digest COLLATE "C" >'))).toBe(false);
+    const memberReadbackPages = readQueries.filter((sql) =>
+      sql.includes("FROM ") && sql.includes(".analytics_publication_owner_members member")
+        && sql.includes("member.owner_digest > $4::text"));
+    expect(memberReadbackPages).toHaveLength(1);
+    expect(memberReadbackPages[0]).toContain("WITH page AS MATERIALIZED");
+    expect(memberReadbackPages[0]).toContain("ORDER BY member.owner_digest");
+    expect(memberReadbackPages[0]).toContain("LIMIT $5::integer");
+    expect(memberReadbackPages[0]).toContain("LEFT JOIN LATERAL");
+    expect(memberReadbackPages[0]).not.toContain('COLLATE "C"');
 
     const restart = await listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,

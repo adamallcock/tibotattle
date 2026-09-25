@@ -66,10 +66,17 @@ export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES = Object.freeze({
     sourceDigest: "c90d7927e4444ccb53db17822d5c11fa42adfd933854fbc50123a70cc9dde934",
     outputDigest: "4025b72539599beb754fb0b3a476203d05b2c0ff07fb824f9287656b40f7b10f",
   }),
+  "100k-readindexed": Object.freeze({
+    members: 100_000,
+    schema: "tibotattle_graph_benchmark_100k_readindexed_20260925",
+    workloadDigest: "7b3199c3da470fd8c55806f275f4f3094cb5be4fff7158aa1d07bcfc7a27f5fc",
+    sourceDigest: "c90d7927e4444ccb53db17822d5c11fa42adfd933854fbc50123a70cc9dde934",
+    outputDigest: "4025b72539599beb754fb0b3a476203d05b2c0ff07fb824f9287656b40f7b10f",
+  }),
 });
 
-const MIGRATION_COUNT = 38;
-const MIGRATION_TAIL = "0038_analytics_event_tuple_versions.sql";
+const MIGRATION_COUNT = 39;
+const MIGRATION_TAIL = "0039_analytics_applied_projection_v1.sql";
 export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_MIGRATION_ROOT =
   "/app/apps/worker/postgres/migrations";
 const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
@@ -674,6 +681,9 @@ function statementKind(statement) {
   if (/^INSERT INTO .*ANALYTICS_PUBLICATION_OWNER_MEMBERS/u.test(sql)
       || (/^WITH\b/u.test(sql) && /\bINSERT INTO\b/u.test(sql)
         && /ANALYTICS_PUBLICATION_OWNER_MEMBERS/u.test(sql))) return "publication_member_write";
+  if (/^WITH PAGE AS MATERIALIZED\b/u.test(sql)
+      && /\.ANALYTICS_PUBLICATION_OWNER_MEMBERS MEMBER\b/u.test(sql)
+      && /MEMBER\.OWNER_DIGEST > \$4::TEXT\b/u.test(sql)) return "member_readback_page";
   if (/ANALYTICS_PUBLICATION_OWNER_MEMBERS/u.test(sql)) return "publication_member_read";
   if (/ANALYTICS_PUBLICATION_CAPTURES/u.test(sql)) return "publication_capture";
   if (/ANALYTICS_PUBLICATIONS/u.test(sql)) return "publication_row";
@@ -821,7 +831,7 @@ export function createPostgresCommunityGraphBenchmarkMetrics(pool) {
         pages: Object.freeze({
           stagedMemberPages: countedCalls("member_stage_page"),
           ownerResultPages: countedCalls("owner_result_page"),
-          publicationMemberReadPages: countedCalls("cursor_page_fetch"),
+          publicationMemberReadPages: countedCalls("member_readback_page"),
           publicationMemberWriteQueries: countedCalls("publication_member_write"),
         }),
         queries: Object.freeze(queries),
