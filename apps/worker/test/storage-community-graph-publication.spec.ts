@@ -4,6 +4,11 @@ import { publishStorageCommunityModelDay, publishStorageCommunityGraphPreview, r
 import { advanceStorageCommunityDaily } from '../src/storage-community-daily';
 import { handleRequest } from '../src/index';
 import { captureStorageCommunityAuthority } from '../src/storage-community-authority';
+import { canonicalTelemetryV12Json, telemetryV12DayManifestDigestInput, telemetryV12DomainManifestDigestInput,
+  telemetryV12RequiredConsent, type TelemetryV12Chunk, type TelemetryV12DayManifest, type TelemetryV12Record } from "@app-usagemonitor/telemetry-contract";
+import { grantTelemetryV12Consent } from "../src/telemetry-transport-policy";
+import { persistTelemetryV12StagedChunk, registerTelemetryV12DayManifest } from "../src/telemetry-v12-repository";
+import { activateTelemetryV12Domain, createTelemetryV12DomainPredecessor } from "../src/telemetry-v12-domain";
 import { env, reset, applyD1Migrations, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { telemetryV11DomainManifestDigestInput, type TelemetryV11DomainManifest,
@@ -235,6 +240,45 @@ async function selectedEnvelope(metric:'fits'|'model',date=metric==='fits'?today
   checkpointKeyDigest:await storageHistoryKeyDigest(key),targetAuthorityEpoch:authorityEpoch as number,snapshot};
  return {owner,scope,envelope};
 }
+/** The same evidence uploaded through the v1.2 successor only: no v1 chunk,
+ * no v1.1 head and no legacy contribution exists for this owner. */
+async function v12Fixture(id=participantId){
+ const f=await createV11DeviceFixture(typed(),{participantId:id,grant:true});
+ await typed().prepare("UPDATE telemetry_v12_runtime SET state='active',changed_at=? WHERE id=1").bind(new Date().toISOString()).run();
+ await grantTelemetryV12Consent(typed(),f,telemetryV12RequiredConsent());
+ const {quota,usage}=evidence();
+ const records:TelemetryV12Record[]=[
+  ...quota.map(row=>({...row,schemaVersion:'quota-observation-v1.2'}) as TelemetryV12Record),
+  ...usage.map(row=>({...row,schemaVersion:'usage-event-v1.2',boundaryFlags:null,tieOrder:null,cacheWriteTtl:null}) as TelemetryV12Record)];
+ const consent=telemetryV12RequiredConsent(),parserVersion='synthetic-v12-graph',chunks:TelemetryV12Chunk[]=[];
+ for(const stream of ['quota','usage'] as const){
+  const selected=records.filter(row=>row.schemaVersion.startsWith(stream+'-'));
+  chunks.push({schemaVersion:'telemetry-contribution-v1.2',manifestDigest:'0'.repeat(64),chunkId:`${stream}:${day()}:0`,
+   chunkRevision:1,parserVersion,consent,records:selected,chunkDigest:await sha256Hex(canonicalTelemetryV12Json(selected))});
+ }
+ const manifest:TelemetryV12DayManifest={schemaVersion:'telemetry-day-manifest-v1.2',day:day(),parserVersion,consent,
+  chunks:chunks.map(chunk=>({chunkId:chunk.chunkId,chunkDigest:chunk.chunkDigest,recordCount:chunk.records.length})),
+  excluded:{quota:0,session:0,usage:0},manifestDigest:'0'.repeat(64)};
+ manifest.manifestDigest=await sha256Hex(telemetryV12DayManifestDigestInput(manifest));
+ const registered=await registerTelemetryV12DayManifest(typed(),f,manifest);
+ for(const chunk of chunks){
+  chunk.manifestDigest=manifest.manifestDigest;
+  const digest=await sha256Hex(`synthetic:${crypto.randomUUID()}`),device=await authenticateDevice(typed(),f.authorization);
+  const grant=await createDeviceUploadAuthorization(typed(),device,digest,4096);
+  const claim=await claimDeviceUploadAuthorization(typed(),`Upload ${grant.uploadAuthorization}`,
+   {envelopeDigest:digest,bodyBytes:4096,contentType:'application/json'});
+  await persistTelemetryV12StagedChunk(typed(),f,chunk,{chunkRowId:`chunk:${crypto.randomUUID()}`,
+   r2Key:`synthetic/${crypto.randomUUID()}`,envelopeDigest:digest,deviceUploadAuthorizationId:claim.authorizationId});
+ }
+ const prior=await createTelemetryV12DomainPredecessor(typed(),f);
+ const domain={schemaVersion:'telemetry-domain-manifest-v1.2' as const,fromDay:day(),throughDay:day(),
+  predecessor:{token:prior.token,previousGenerationId:prior.previousGenerationId,legacyFingerprint:prior.legacyFingerprint},
+  days:[{day:day(),manifestId:registered.manifestId,manifestDigest:manifest.manifestDigest}],manifestDigest:'0'.repeat(64)};
+ domain.manifestDigest=await sha256Hex(telemetryV12DomainManifestDigestInput(domain));
+ await activateTelemetryV12Domain(typed(),f,domain);
+ for(let n=0;n<32;n++){if((await advanceStorageAnalytics(bindings())).state==='idle')break;}
+ await advanceStorageCommunityDaily({...bindings(),day:day()});return f;
+}
 async function api(){
  const configured={...b,USAGE_MONITOR_DB:typed(),ENVIRONMENT:'synthetic-development',ACCOUNT_SCOPED_INGEST_MODE:'disabled'} as Env;
  Reflect.set(configured,'TELEMETRY_STORAGE_MODE','typed');Reflect.set(configured,'TELEMETRY_STORAGE_NAMESPACE',namespace);
@@ -298,6 +342,21 @@ describe('isolated allowance graph publication',()=>{
    (await readStorageCommunityOwnerPage(typed()))[0]!.ownerDigest!])expect(text).not.toContain(value);
   expect(await typed().prepare('SELECT count(*) n FROM community_allowance_fit_cache').first('n')).toBe(0);
   expect(await typed().prepare('SELECT count(*) n FROM community_model_composition_days').first('n')).toBe(0);
+ });
+ it('fits allowance for an owner who has only ever uploaded v1.2',async()=>{
+  const f=await v12Fixture();
+  const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+  expect(owner).toMatchObject({hasV1:false,hasV11:false,hasV12:true,hasEffective:true});
+  expect(owner.ownerDigest).toMatch(/^[0-9a-f]{64}$/u);
+  expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'deferred',reason:'cache_pending'});
+  // The ordinary scheduled graph-work lane selects and computes this owner's fit.
+  expect(await advanceStorageCommunityGraphWork(bindings())).toMatchObject({state:'complete',metric:'fits',day:today()});
+  expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'published',memberCount:1});
+  const response=await api();expect(response.status).toBe(200);const text=await response.text(),body=JSON.parse(text);
+  expect(body.allowanceState).toBe('ready');
+  const point=body.allowanceBreakdowns.days.find((x:{day:string})=>x.day===day());
+  expect(point.combined.centralUsd).toBeGreaterThan(0);expect(point.combined.participantCount).toBe(1);
+  for(const value of [f.participantId,f.deviceId,owner.ownerDigest!])expect(text).not.toContain(value);
  });
  it('publishes a separate exact historical model day and refreshes the preview when it arrives',async()=>{
   await modelFixture();await compute('fits');await publishStorageCommunityGraphPreview(bindings());

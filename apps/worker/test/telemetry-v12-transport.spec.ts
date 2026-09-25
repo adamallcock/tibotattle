@@ -30,6 +30,7 @@ import {
   parseAccountlessOwnershipRequest,
 } from "../src/accountless-ownership";
 import { handleRequest } from "../src/index";
+import { ACCOUNTLESS_RENEWAL_SCHEMA_VERSION, renewAccountlessUploadOwner } from "../src/accountless-renewal";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { authenticateDevice, claimDeviceUploadAuthorization, createDeviceUploadAuthorization } from "../src/device-auth";
 import {
@@ -441,6 +442,56 @@ describe("staged v1.2 successor transport", () => {
       "SELECT count(*) AS total FROM telemetry_v12_device_capabilities WHERE participant_id = ?",
     ).bind(owner!.participant_id).first<{ total: number }>("total")).resolves.toBe(0);
     secret.fill(0);
+  });
+
+  it("keeps an accountless v1.2 grant usable across an ordinary lease renewal", async () => {
+    const deviceId = crypto.randomUUID();
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    const prefix = new TextEncoder().encode(`app-usagemonitor/device/v1\0${deviceId}\0`);
+    const input = new Uint8Array(prefix.length + secret.length);
+    input.set(prefix);
+    input.set(secret, prefix.length);
+    const secretHash = await sha256Hex(input);
+    input.fill(0);
+    const authorization = `Device um_device_${deviceId}.${encodeBase64Url(secret)}`;
+    secret.fill(0);
+    // Enrolled 25 days ago: inside the 7-day renewal window of a 30-day lease.
+    const enrolledEpoch = Date.now() - 25 * 24 * 60 * 60 * 1000;
+    await enrollAccountlessDevice(db(), parseAccountlessEnrollmentRequest({
+      schemaVersion: ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION, deviceId, deviceSecretHash: secretHash,
+      policyVersion: ACCOUNTLESS_ENROLLMENT_POLICY_VERSION, authorizationBasis: ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,
+    }), enrolledEpoch);
+    await createAccountlessUploadOwner(db(), authorization, parseAccountlessOwnershipRequest({
+      schemaVersion: ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION, policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+      authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+      telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+    }), enrolledEpoch);
+    const participantId = (await db().prepare(
+      "SELECT participant_id FROM accountless_upload_owners WHERE enrollment_device_id = ?",
+    ).bind(deviceId).first<string>("participant_id"))!;
+    const principal = { participantId, deviceId };
+    await db().prepare("UPDATE telemetry_v12_runtime SET state = 'active' WHERE id = 1").run();
+    await grantTelemetryV12AccountlessAuthorization(db(), principal, parseTelemetryV12AccountlessAuthorizationRequest({
+      schemaVersion: ACCOUNTLESS_V12_UPLOAD_SCHEMA_VERSION, policyVersion: ACCOUNTLESS_V12_UPLOAD_POLICY_VERSION,
+      authorizationBasis: ACCOUNTLESS_V12_UPLOAD_AUTHORIZATION_BASIS, telemetrySchemaVersion: "telemetry-contribution-v1.2",
+    }), enrolledEpoch);
+    await expect(assertTelemetryTransportWriteAllowed(db(), principal, "telemetry-contribution-v1.2")).resolves.toBeUndefined();
+
+    const renewed = await renewAccountlessUploadOwner(db(), authorization, {
+      schemaVersion: ACCOUNTLESS_RENEWAL_SCHEMA_VERSION, policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+      authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+      telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+    });
+    const expiries = await db().prepare(`SELECT ledger.expires_at AS ledger, grant_row.expires_at AS successor
+      FROM accountless_enrollment_ledger ledger
+      JOIN accountless_v12_device_authorizations grant_row ON grant_row.enrollment_device_id = ledger.device_id
+      WHERE ledger.device_id = ?`).bind(deviceId).first<{ ledger: string; successor: string }>();
+    expect(expiries?.ledger).toBe(renewed.expiresAt);
+    expect(expiries?.successor).toBe(expiries?.ledger);
+    await expect(assertTelemetryTransportWriteAllowed(db(), principal, "telemetry-contribution-v1.2")).resolves.toBeUndefined();
+    await expect(telemetryTransportV12Capabilities(db(), principal, "https://example.test")).resolves.toMatchObject({
+      successor: { lifecycle: "accepted", authorizationCurrent: true },
+    });
   });
 
   it("stages a v1.2 day manifest only after the independent device grant", async () => {
