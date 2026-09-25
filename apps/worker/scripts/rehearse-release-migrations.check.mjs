@@ -123,11 +123,14 @@ test("reopened forward connection reapplies page ceiling before a growing pendin
     await cp(join(workerRoot, "migrations"), join(dir, "migrations"), { recursive: true });
     await cp(join(workerRoot, "deletion-ledger-migrations"), join(dir, "deletion-ledger-migrations"), { recursive: true });
     const names = (await readdir(join(dir, "migrations"))).sort(), last = join(dir, "migrations", names.at(-1));
-    await writeFile(last, `${await readFile(last, "utf8")}\nCREATE TABLE rehearsal_page_ceiling (ceiling INTEGER CHECK (ceiling <= 512), payload BLOB);\nINSERT INTO rehearsal_page_ceiling SELECT max_page_count, zeroblob(400000) FROM pragma_max_page_count;\n`);
+    // Migration 0063 adds source-fence schema pages, so preserve the original
+    // 400 KB growth while giving this synthetic fixture a tightly bounded
+    // 2.25 MiB ceiling (576 SQLite pages at the default 4 KiB page size).
+    await writeFile(last, `${await readFile(last, "utf8")}\nCREATE TABLE rehearsal_page_ceiling (ceiling INTEGER CHECK (ceiling <= 576), payload BLOB);\nINSERT INTO rehearsal_page_ceiling SELECT max_page_count, zeroblob(400000) FROM pragma_max_page_count;\n`);
     const result = await runMigrationRehearsal({ workerRoot: dir, prefix: await prefix(55, 2, dir), accounts: 2, events: 4,
-      maxDatabaseBytes: 2 * 1024 * 1024 });
+      maxDatabaseBytes: 2.25 * 1024 * 1024 });
     assert.equal(result.ok, true);
-    assert.ok(result.receipts.USAGE_MONITOR_DB.databaseBytes <= 2 * 1024 * 1024);
+    assert.ok(result.receipts.USAGE_MONITOR_DB.databaseBytes <= 2.25 * 1024 * 1024);
   } finally { await rm(dir, { recursive: true }); }
 });
 
@@ -340,7 +343,7 @@ test("fixed scale admission rejects unknown profiles, override dimensions and wr
   assert.equal(historical.migrations.USAGE_MONITOR_DB.pending.length, 3);
   assert.equal(historical.migrations.USAGE_MONITOR_DB.pending.at(-1).name, LOCAL_SCALE_PROFILE.throughMigration);
   const current = await inspectMigrationPrefix({ prefix: p });
-  assert.equal(current.migrations.USAGE_MONITOR_DB.pending.at(-1).name, "0062_v1_acquisition_vocabulary.sql");
+  assert.equal(current.migrations.USAGE_MONITOR_DB.pending.at(-1).name, "0063_accountless_history_transfer_source.sql");
   assert.deepEqual(historical.migrations.DELETION_LEDGER.pending, []);
   assert.deepEqual(current.migrations.DELETION_LEDGER.pending.map(row => row.name), ["0003_storage_erasure_jobs.sql"]);
   await assert.rejects(inspectMigrationPrefix({ prefix: p, throughMigration: "0058_accountless_upload_ownership.sql" }), /REHEARSAL_TARGET_INVALID/);

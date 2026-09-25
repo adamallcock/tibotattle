@@ -2,7 +2,7 @@
 title: Transfer opted-out accountless public-history retention markers
 date: 2026-09-25
 type: plan
-status: proposed
+status: in-progress
 ---
 
 # Transfer opted-out accountless public-history retention markers
@@ -14,6 +14,12 @@ cutover proof. No source data, PostgreSQL schema, Cloud Run service, or GCP
 resource has been changed for this plan. The marker carries no telemetry, but
 its opaque participant, device, generation, and credential-hash evidence is
 private authority data; keep snapshots, row manifests, and diagnostics private.
+
+The source-side implementation is now present locally in Worker migration 0063
+and `apps/worker/src/accountless-retention-transfer-source.ts`. Synthetic D1
+coverage exercises one real opt-out marker through capture, keyset extraction,
+and invalidation on owner erasure. The PostgreSQL permit/import path, source to
+target identity mapping, final reconciliation, and any cutover remain unbuilt.
 
 The current D1 contract is prospective. Migration 0061 pins the exact accepted
 v1.1 head during ordinary `user_opt_out`; ingestion isolation migration 0005
@@ -79,6 +85,46 @@ and canonical ordered manifest digest. If the export path cannot prove a
 single state or the fence/revision changes while pages are read, discard the
 artifact and restart; do not call a before/after hash alone a snapshot.
 
+### Verified D1 mechanism and current source implementation
+
+The canonical D1 chain now includes `0062_v1_acquisition_vocabulary.sql`, so
+the source-transfer objects are installed by forward-only migration
+`0063_accountless_history_transfer_source.sql`. The capture path uses a single
+Worker `D1Database.batch()` transaction to read the authority revision, count
+all markers and ineligible proofs, record the exact source migration receipts,
+and materialize eligible marker-plus-proof rows. Cloudflare documents D1 batch
+statements as sequential, non-concurrent, and atomic: if a statement fails, the
+batch is rolled back. That supports one consistent materialization on the
+source database. [D1 Worker API](https://developers.cloudflare.com/d1/worker-api/d1-database/)
+
+The snapshot module reads only that immutable materialization, in binary
+participant-key order and pages of at most 500 rows. It persists per-row hashes,
+page hashes, and an ordered manifest chain. Source triggers advance a
+revision and invalidate the run when any marker is added or removed, or when a
+participant, owner, enrollment ledger, device, v1.1 grant, head, or domain row
+that can change an eligible marker is mutated. Invalidated or aborted runs
+automatically purge copied proof fields, identifiers, page cursors, digests,
+and migration receipts while retaining a count-only disposition. The code has
+no HTTP route; rows and hashes are returned only to its privileged caller and
+must not enter logs or ordinary job output.
+
+D1 Sessions provide sequential consistency, not a frozen read transaction, so
+they are not a substitute for the materialized snapshot. The database `dump()`
+API remains legacy-alpha-only. Remote SQL export supports a bookmark-pinned
+full-database export, but it is a broader data artifact than this marker-only
+transfer needs. [D1 consistency and export guidance](https://developers.cloudflare.com/d1/best-practices/import-export-data/),
+[D1 export API](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/export/)
+
+This mechanism proves that the captured D1 rows belonged to one source state
+and that relevant source mutations invalidate the receipt. It cannot keep a
+D1 transaction or write fence open across PostgreSQL import and reconciliation.
+An importer must recheck the live source revision at its checkpoints and must
+still perform the final exact reconciliation under a fenced cursor or complete
+source change journal. A source mutation after an earlier target page was
+committed requires target-side terminal withdrawal/reconciliation; it cannot
+be made atomic by D1 alone. A still-valid extracted artifact remains private
+until the importer and final cutover workflow provide a verified release point.
+
 After extraction, page only from that immutable artifact, in key order and
 bounded batches (default 200, hard maximum 500 rows, matching the existing
 typed-transfer bounds). Hash each canonical page and the complete ordered
@@ -125,8 +171,9 @@ loads resume without duplicate authority or skipped pages.
 Schema and code order:
 
 1. Qualify current primary migration 0041 and its canonical manifest locally.
-2. Add a source-side, forward-only snapshot/fence mechanism after D1 migration
-   0061, with focused D1 tests.
+2. Add a source-side, forward-only snapshot/fence mechanism after the current
+   D1 migration 0062, with focused D1 tests. Migration 0063 now implements this
+   source half; the importer and final fence/reconciliation are still required.
 3. Add PostgreSQL migration 0042 after 0041 for the import permit, claims, and
    guarded trigger extension; regenerate the canonical runtime schema and
    update migration gates through their generators.

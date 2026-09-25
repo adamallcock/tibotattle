@@ -23,6 +23,12 @@ import { initializeStorageSource } from "../src/analytics-delivery";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
 import { eraseParticipantAsOwner } from "../src/participant-erasure";
+import {
+  assertAccountlessRetentionSourceSnapshotCurrent,
+  captureAccountlessRetentionSourceSnapshot,
+  completeAccountlessRetentionSourceExtraction,
+  readAccountlessRetentionSourcePage,
+} from "../src/accountless-retention-transfer-source";
 import { accountScopedModelCompositionV11, accountScopedQuotaAnalysisV11 } from "../src/quota-analysis-v11";
 import { collectCommunityAllowanceFits, publishCommunityAnalysisCaches } from "../src/community-allowance";
 import { advanceCommunityPublication, readCapturedCommunityPublication,
@@ -794,6 +800,94 @@ describe("accountless owner-to-v1.1 transport", () => {
           generation_id: accountlessSourcePin.generationId,
           head_revision: 1,
         });
+      const retentionMarker = await db().prepare(`SELECT *
+        FROM accountless_public_history_retention WHERE participant_id = ?`)
+        .bind(participantId).first<Record<string, string | number>>();
+      const retentionSnapshot = await captureAccountlessRetentionSourceSnapshot(db(), {
+        runId: `synthetic-retention:${crypto.randomUUID()}`,
+        snapshotAt: new Date().toISOString(),
+      });
+      expect(retentionSnapshot).toMatchObject({ state: "sealed", rowCount: 1 });
+      expect(retentionSnapshot.migrationReceipts).toEqual([
+        "0061_accountless_history_retention.sql",
+        "0062_v1_acquisition_vocabulary.sql",
+        "0063_accountless_history_transfer_source.sql",
+      ]);
+      const retentionPage = await readAccountlessRetentionSourcePage(db(), {
+        runId: retentionSnapshot.runId,
+        limit: 1,
+      });
+      expect(retentionPage).not.toBeNull();
+      expect(retentionPage).toMatchObject({
+        afterParticipantId: "",
+        throughParticipantId: participantId,
+        hasMore: false,
+        rows: [{
+          participant_id: participantId,
+          marker_enrollment_device_id: deviceId,
+          marker_device_credential_id: deviceId,
+          marker_generation_id: accountlessSourcePin.generationId,
+          marker_head_revision: 1,
+          marker_retained_at: retentionMarker!.retained_at,
+          participant_owner_kind: "accountless",
+          participant_state: "active",
+          owner_participant_id: participantId,
+          owner_enrollment_device_id: deviceId,
+          owner_device_credential_id: deviceId,
+          owner_policy_version: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+          owner_authorization_basis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+          owner_expires_at: expect.any(String),
+          owner_revocation_reason: "user_opt_out",
+          owner_revoked_at: retentionMarker!.retained_at,
+          ledger_device_id: deviceId,
+          ledger_schema_version: ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION,
+          ledger_policy_version: ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
+          ledger_authorization_basis: ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,
+          ledger_expires_at: expect.any(String),
+          ledger_revoked_at: retentionMarker!.retained_at,
+          ledger_revocation_reason: "user_opt_out",
+          device_participant_id: participantId,
+          device_enrollment_device_id: deviceId,
+          device_expires_at: expect.any(String),
+          device_revoked_at: retentionMarker!.retained_at,
+          grant_enrollment_device_id: deviceId,
+          grant_participant_id: participantId,
+          grant_device_credential_id: deviceId,
+          grant_revocation_reason: "user_opt_out",
+          grant_revoked_at: retentionMarker!.retained_at,
+          grant_expires_at: expect.any(String),
+          grant_field_dictionary_version: "telemetry-v1.1-registry-2026-08-31.1",
+          grant_privacy_contract_version: "ongoing-privacy-safe-telemetry-v1.1",
+          device_authority_kind: "accountless",
+          grant_telemetry_schema_version: "telemetry-contribution-v1.1",
+          head_generation_id: accountlessSourcePin.generationId,
+          head_revision: 1,
+          domain_participant_id: participantId,
+          domain_device_id: deviceId,
+        }],
+      });
+      const retainedProof = retentionPage!.rows[0]!;
+      expect(retainedProof.owner_expires_at).toBe(retainedProof.ledger_expires_at);
+      expect(retainedProof.owner_expires_at).toBe(retainedProof.device_expires_at);
+      expect(retainedProof.owner_expires_at).toBe(retainedProof.grant_expires_at);
+      expect(retainedProof.ledger_device_secret_hash).toEqual(retainedProof.device_secret_hash);
+      expect(retentionPage!.rowDigests).toHaveLength(1);
+      expect(retentionPage!.rowDigests[0]!.sha256).toMatch(/^[0-9a-f]{64}$/u);
+      const retentionExtraction = await completeAccountlessRetentionSourceExtraction(
+        db(), retentionSnapshot.runId,
+      );
+      expect(retentionExtraction).toMatchObject({
+        state: "extracted", rowCount: 1, pageCount: 1,
+      });
+      await expect(readAccountlessRetentionSourcePage(db(), {
+        runId: retentionSnapshot.runId,
+        afterParticipantId: "",
+        limit: 501,
+      })).rejects.toMatchObject({ code: "SOURCE_PAGE_LIMIT_INVALID" });
+      await expect(db().prepare(`UPDATE accountless_history_transfer_rows
+        SET marker_head_revision = 2 WHERE run_id = ? AND participant_id = ?`)
+        .bind(retentionSnapshot.runId, participantId).run())
+        .rejects.toThrow("accountless_history_transfer_rows_immutable");
       expect(await db().prepare(`SELECT state FROM storage_v11_owner_links
         WHERE participant_id = ?`).bind(participantId).first()).toEqual({ state: "active" });
       expect(await db().prepare(`SELECT participant_id, owner_kind, device_id
@@ -854,6 +948,21 @@ describe("accountless owner-to-v1.1 transport", () => {
         participantId!,
       );
       expect(erased).toMatchObject({ deleted: true, alreadyDeleted: false });
+      await expect(assertAccountlessRetentionSourceSnapshotCurrent(
+        db(), retentionSnapshot.runId,
+      )).rejects.toMatchObject({ code: "SOURCE_AUTHORITY_MUTATED" });
+      await expect(completeAccountlessRetentionSourceExtraction(
+        db(), retentionSnapshot.runId,
+      )).rejects.toMatchObject({ code: "SOURCE_AUTHORITY_MUTATED" });
+      expect(await db().prepare(`SELECT
+          (SELECT COUNT(*) FROM accountless_history_transfer_rows WHERE run_id = ?) AS rows,
+          (SELECT COUNT(*) FROM accountless_history_transfer_row_digests WHERE run_id = ?) AS digests,
+          (SELECT COUNT(*) FROM accountless_history_transfer_pages WHERE run_id = ?) AS pages,
+          (SELECT COUNT(*) FROM accountless_history_transfer_migration_receipts WHERE run_id = ?) AS receipts`)
+        .bind(retentionSnapshot.runId, retentionSnapshot.runId,
+          retentionSnapshot.runId, retentionSnapshot.runId).first()).toEqual({
+        rows: 0, digests: 0, pages: 0, receipts: 0,
+      });
       expect(await readCapturedCommunityPublication(db(), publicationTime, {
         budget: { remainingQueries: 64, deadlineMs: Date.now() + 30_000 },
       })).toBeNull();

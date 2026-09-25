@@ -124,6 +124,7 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0060_public_contribution_sources.sql",
     "0061_accountless_history_retention.sql",
     "0062_v1_acquisition_vocabulary.sql",
+    "0063_accountless_history_transfer_source.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",
