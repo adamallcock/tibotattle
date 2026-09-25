@@ -9,12 +9,15 @@ status: in-progress
 
 ## Boundary
 
-This clean worktree starts at remote `main`
+This integration worktree started at remote `main`
 `d7186a61b006b2d873139cc0821371276763ec3f`. The earlier PostgreSQL/GCS
 worktree starts at divergent commit `c4e16ab030ead9cbec0e00da42d83582d1f0fc86`
 and contains uncommitted implementation and synthetic test evidence. Port its
 reviewed behavior against this worktree's newer contracts; do not merge its
 whole tree or present its private test image as a production build.
+The branch later merged remote `main` at `db470190`; the exact private test
+image and receipt described below apply only to the allowlisted Cloud Run
+source archive, not to a production Worker build.
 
 The accepted local PostgreSQL graph optimization improved the 10,000-record
 synthetic median from 12,280.94 ms to 4,326.49 ms (2.84 times faster within
@@ -41,8 +44,10 @@ private test source, not this integration checkout or a live cutover.
 Agents own disjoint files. The parent reviews their combined work and runs one
 integrated gate after focused checks, so concurrent edits do not cause
 repeated broad-suite runs. No production data, DNS or route changes are part
-of this source integration. Synthetic GCS smoke objects in the private test
-bucket were removed and the bucket returned to zero aggregate bytes.
+of this source integration. Synthetic GCS transfer-rehearsal objects in the
+private test bucket were removed. Later hosted v1.2 smokes retained tagged
+synthetic database and object fixtures for exact owner-erasure validation;
+the bucket is no longer empty.
 
 The normalized v1.2 PostgreSQL extension uses the existing primary database,
 schema and forward migration history. Migrations 0025 through 0030 follow the
@@ -284,10 +289,16 @@ stores the encrypted bytes, and commits the typed chunk. It reads back exact
 replays without another object write and keeps registered objects available
 for reconciliation when a GCS acknowledgement is lost. Every other route
 fails closed before Worker or D1 access. The local host suite passes
-12/12, including real PG17 health, manifest replay, grant issuance/revocation,
+14/14, including real PG17 health, manifest replay, grant issuance/revocation,
 one-use claim refusal and negative auth, body, control and host checks. Both
-partial modes require `127.0.0.1`; neither can listen on Cloud
-Run's `0.0.0.0` interface or qualifies a hosted GCP service. Rechecking both
+local partial modes require `127.0.0.1`. A separately selected
+`cloud-run-iam` mode admits the same limited v1.2 routes only on the named
+`tibotattle-test-app` service, its pinned reported HTTPS origin, port 8080,
+and Cloud Run's `0.0.0.0` listener. Startup requires the `K_SERVICE` identity
+and rejects alternate authorities, public/admin origins, and unsupported
+routes; Cloud Run IAM enforcement is checked outside the process. This is
+source qualification for the named private GCP test service running this
+exact mode. Rechecking both
 migration receipts on each partial-route POST is a local correctness gate, not a
 production throughput design. An independent route review found that the
 PostgreSQL v1.2 authority check initially omitted D1's base-consent gate.
@@ -300,33 +311,146 @@ This is a local v1.2 admission slice, not the complete application. Device
 enrollment/refresh, v1/v1.1 contributions, effective mixed-format reads,
 analytics publication, and owner erasure still have D1-owned routes or missing
 PostgreSQL adapters. Scheduled maintenance and public graph publication also
-use separate D1 ingestion/analytics roles. The existing Cloud Run service is
-IAM-private but runs an older image. The test deployment gate pins the
+use separate D1 ingestion/analytics roles. The Cloud Run service is
+IAM-private. The test deployment gate pins the
 `tibotattle` `us-east1` service and image repository, checks the local source
 context and read-only Cloud Run/IAM state, and rejects public invoker bindings,
 a disabled Invoker IAM check, or traffic not wholly on the latest ready and
-created revision. Its dedicated tests pass 10/10. A read-only live check found
+created revision. Its dedicated tests pass. A read-only live check found
 the service Ready with no public invoker and unauthenticated GET denied with
-HTTP 403; it did not deploy an image. An independent audit showed that a Cloud
+HTTP 403. An independent audit showed that a Cloud
 Build tag and service environment digest do not prove the built bytes came
 from the reviewed local context. The gate now reports
-`SOURCE_PROVENANCE_UNQUALIFIED` and refuses deploy before any `gcloud` write;
-read-only preflight/verify cannot claim exact-image success or run the hosted
-smoke until that proof exists. The host also remains loopback-only. Automatic
-approval review rejected the proposed `cloud-run-iam` mode that would bind
-`0.0.0.0` and accept its HTTPS origin without sufficient IAM-enforcement
-proof. No network boundary was broadened.
-To clear the provenance blocker, package the already validated source context
-as one archive, hash its exact bytes, and upload it to a create-only GCS object
-with a pinned generation. Submit a fixed Cloud Build request using that
-generation, a pinned builder and service account, requested SHA-256 source
-hash, and verified provenance. The [Cloud Build API](https://docs.cloud.google.com/build/docs/api/reference/rest/v1/projects.builds)
+`SOURCE_PROVENANCE_UNQUALIFIED` and refuses deploy without an exact archive,
+Cloud Build source-generation/hash receipt and image digest. The final archive,
+verified Build, image and hosted smoke supplied that proof for the test source
+only. The earlier loopback-only gate was superseded by the user's
+explicit approval for the exact IAM-only named test host mode.
+The verified image now runs on the named private service with the pinned
+`HOST_ORIGIN` and `POSTGRES_TEST_HTTP_MODE=cloud-run-iam`. Exact-image, origin,
+IAM-policy, source provenance, latest-revision traffic, and anonymous-denial
+read-back pass. The successful hosted synthetic journey below additionally
+qualifies the scoped authenticated v1.2 route and storage read-back.
+The reviewed source context was packaged as one deterministic archive and
+uploaded create-only to the named test build bucket at generation
+`1790296412253434`. Its SHA-256 is
+`085aca9e08b86dd02803ab39ae0c64a84c42f12e120e55b8bd9588b9a31d9288`;
+the canonical source-content digest is
+`0545fb1206f3f3dd0f8a615b936f8e77ad0c5c3ad87c1c808934c3e63e25458e`.
+The archive contains the 296 allowlisted source files and its marker, with no
+private environment or key files. `gcloud builds submit` copied those bytes to
+its default staging bucket, which the pinned builder service account cannot
+read; that attempt failed before creating a Build. A regional Build API request
+must refer to the original named object and generation. The fixed build
+request specifies a pinned builder and service account, SHA-256 source hash,
+and verified provenance. The [Cloud Build API](https://docs.cloud.google.com/build/docs/api/reference/rest/v1/projects.builds)
 exposes the resolved storage source and source-file hash; compare both against
 the local archive, then use the build result's immutable image digest for
 Cloud Run read-back. Recompute the canonical source-content digest from the
 same archive before submission. The [provenance guide](https://docs.cloud.google.com/build/docs/securing-builds/generate-validate-build-provenance)
-describes verified provenance for Artifact Registry images. No such build or
-archive upload has run for this integration revision.
+describes verified provenance for Artifact Registry images. The first
+verified-provenance build failed after its Docker step because Container
+Analysis API was disabled. That API was enabled on the test project; the
+repeated exact-source Build `87472dc5-ad6c-4091-939d-6211788f6d78`
+succeeded with image digest
+`sha256:4d7109e470f2f54693c7d27c92fa4d1a5af47d967ea6e576c846ebb8d3ba8626`.
+The source-generation, SHA-256, pinned builder, service account and digest
+passed the independent gate. The test migration job on that image completed as
+`tibotattle-test-database-migrate-thr4d`; its Cloud Logging receipt read back
+all 30 primary and five ledger migration checksums. The service retained an
+explicit traffic pin to its prior revision after deployment. Routing only the
+named test service to `LATEST` produced 100% traffic on
+`tibotattle-test-app-00020-kr8`; the read-only deployment gate then returned
+`verified` with no blockers, including anonymous health HTTP 403.
+
+The first hosted synthetic v1.2 Job,
+`tibotattle-v12-smoke-xf8qj`, stopped before fixture seeding with
+`SMOKE_RUNTIME_CONTROLS_NOT_READY`. The separate test-only activation job,
+rather than the synthetic smoke, established and changed the actual live
+runtime/control state as described below. The
+second source archive has content digest
+`645397855a7d5f052c230db269414f5ccea948f8052ffdd67d0facba93ef9170`,
+archive SHA-256
+`d6561f0f879677e24fb8f1c0d9524f055372165598f2f66ac857a845aab070a4`,
+and named build-bucket generation `1790298530391406`. Verified Build
+`32b314b9-9633-4e78-8ea6-78a325286a7c` produced image
+`sha256:c189c55029806f62b89b7bb0f2c88122b6db56c4be123154fca924c672fb5bd6`.
+The exact-image, source-generation, verified provenance, private IAM and
+anonymous-denial gate passed after deploying that image to the named test
+service; 100% of its traffic is on the latest revision. The named test
+migrator on the same image completed as
+`tibotattle-test-database-migrate-qzrms`, reading back all 30 primary and five
+ledger migration checksums. The first activation execution,
+`tibotattle-v12-test-activate-f4w2s`, refused with
+`POSTGRES_TEST_ACTIVATION_STATE_UNEXPECTED` before any update committed.
+Later bounded diagnostics and the exact compare-and-set transition below
+resolved that test-only state mismatch.
+
+A third verified test Build, `780651f1-2982-4095-b381-1f88d6366700`, used
+source generation `1790299458480293` and produced diagnostic image
+`sha256:85a4c9091605aaa1db1a7b9eb69c642c69ff9ad76b64875946f97dc699f5d13b`.
+The diagnostic activation execution `tibotattle-v12-test-activate-296bc`
+again refused without an update. Its allowlisted field-name receipt shows that
+the live test rows are closer to a previously activated legacy runtime and
+operational collection controls than to migration defaults: the typed runtime
+is not active, and collection-control state, revision, enrollment, and
+publication differ from the narrow target. A fourth verified Build,
+`df5434c6-50f6-490a-ae89-de49cfaa62cc`, used source generation
+`1790299903184451` and produced image
+`sha256:1f0e6844fb14d0048b91fd6ab3f6420154e22aa09a763342c25c320ecdb7fe5f`.
+Its activation execution `tibotattle-v12-test-activate-gqzqp` again refused
+without an update and returned only bounded nonsecret singleton values:
+legacy runtime active/revision 1, typed runtime staged, collection controls
+operational/revision 14 with enrollment, upload registration, processing, and
+publication all enabled. The next transition must accept exactly that test
+prestate, activate typed v1.2, and advance controls to revision 15 with only
+upload registration and processing enabled. In-memory comparison confirmed
+that the test service private envelope JWK and the smoke job public JWK are a
+matching pair; both use their pinned Secret Manager version 1. The runtime
+service account has object access on the named test app bucket.
+
+The exact test-only recovery source was built with verified Build
+`fef857a5-4af4-4d6e-816b-5c45e8ec3bef` from source generation
+`1790301010600342` as image
+`sha256:01bdb65fb477cc5dd003f480f59999033c02bf19d8088a6021398128b7ee7712`.
+The private service's final-image and IAM gate passed. Activation execution
+`tibotattle-v12-test-activate-mczrg` succeeded with a transactional read-back:
+legacy and typed v1.2 runtimes active; controls degraded/revision 15, with
+upload registration and processing enabled and enrollment and publication
+disabled. The first post-activation synthetic journey,
+`tibotattle-v12-smoke-qpw6m`, reached the service: anonymous health was
+denied, authenticated health returned 200, manifest/grant calls returned 201,
+and both chunk calls returned 202. It then failed its own PostgreSQL read-back
+assertion with `SMOKE_POSTGRES_READBACK_MISMATCH`, leaving a tagged synthetic
+fixture. Local PostgreSQL 17 confirmed the cause of the first assertion:
+`pg` decodes a `date` column to a JavaScript `Date`, while the smoke compared
+the first ten characters of `String(date)` with an ISO calendar day. The
+read-back now selects `chunk_day::text` and reports a fixed mismatch stage.
+That failed run retained a tagged synthetic fixture and referenced GCS object;
+the successful run below retained a separate tagged fixture. Neither can be
+removed through the current private test host because owner erasure is not yet
+routed. A participant cascade alone would leave the independent erasure ledger
+and object journal without an end-to-end proof. Keep the fixtures until an
+exact-owner cleanup path is implemented and reviewed.
+
+The final allowlisted archive contains 298 source files plus its marker.
+Its canonical source digest is
+`5393a857ec32bc8d3e1573ab1b1b391535b363d4204c2d40a154b926aacfb93f`;
+the archive SHA-256 is
+`2a8c768d959b10bdd4869a44b30186977c3537cee6a37cfe665370a5baafb41c`.
+The create-only build-bucket object is
+`source/cloud-run-host-5393a857ec32bc8d3e1573ab1b1b391535b363d4204c2d40a154b926aacfb93f-2a8c768d959b10bdd4869a44b30186977c3537cee6a37cfe665370a5baafb41c.tar.gz`
+at generation `1790301596100551`. Verified Build
+`f817c07c-ed47-4a52-8b27-429f1d49e5ec` produced and deployed image
+`us-east1-docker.pkg.dev/tibotattle/tibotattle-test/tibotattle-host@sha256:b7f4a2339965e5773e1dd786f356c345f8b1be2710f9c9e676188159c66103d2`.
+The exact-image and IAM deployment gate passed with 100% traffic on its latest
+revision and anonymous health denied. The named smoke Job uses that same image.
+Its execution `tibotattle-v12-smoke-wv52n` completed on
+2026-09-25 at 02:03:19 UTC. The sanitized Cloud Logging receipt reports
+`status=ok`, anonymous denial, authenticated health, staged and exactly replayed
+manifest and encrypted chunk, `postgresReadback=true`, and `gcsReadback=true`.
+This is a real, hosted, scoped v1.2 admission/storage journey, not an effective
+read/analytics/erasure test or a complete application replacement.
 
 The separate typed legacy transfer rehearsal now pages the 14 D1-shaped base
 tables from a cloned synthetic in-memory fixture into PostgreSQL 17, including
@@ -436,10 +560,14 @@ The importer reports `fullCutoverReady=false` and cannot import production.
 A read-only Google Cloud Console inspection on 2026-09-24 found one healthy
 Cloud Run service, `tibotattle-test-app`, in `us-east1`. Its ingress is `All`
 and it requires Google IAM authentication; no anonymous or all-authenticated
-invoker binding appeared. It has no direct service-level IAM grants; project
-Owner and Editor roles remain inherited invocation paths. The deployed image
-digest is `sha256:5706640597336e002b49919b920017d08f9b39b4de2644e1cee4de012557a188`,
-not a receipt for this worktree. The service uses 1 vCPU and 1 GiB RAM.
+invoker binding appeared. A service-level `roles/run.invoker` grant was added
+for only `tibotattle-test-runtime@tibotattle.iam.gserviceaccount.com` so a
+single-task synthetic Cloud Run Job can call the named service with an IAM ID
+token; the policy was read back, and anonymous health remained HTTP 403.
+Project Owner and Editor roles remain inherited invocation paths. The deployed
+private test image is the verified
+`sha256:b7f4a2339965e5773e1dd786f356c345f8b1be2710f9c9e676188159c66103d2`
+digest described above. The service uses 1 vCPU and 1 GiB RAM.
 
 The test primary and independent ledger are PostgreSQL 17.11 Cloud SQL
 Enterprise instances in the single `us-east1-c` zone. Both have 10 GiB SSD;
@@ -454,26 +582,34 @@ ingestion D1 source plus indexes, analytics, and any retained legacy-primary
 lineage, the existing 10 GiB test disk is not a qualified full-corpus target.
 Measure PostgreSQL expansion during a bounded rehearsal before increasing it;
 no Cloud SQL storage setting changed in this pass.
-The test app GCS bucket reports zero aggregate object bytes after the synthetic
-destination smoke cleanup. It has not been populated with the 7.92 GB
+The earlier destination-transfer smoke cleaned up its objects. The hosted v1.2
+journeys have since retained tagged synthetic fixtures and their referenced
+objects in the test bucket. It has not been populated with the 7.92 GB
 production quarantine set.
 
 The local `gcloud` CLI has an active account and can read the test service
 when commands specify `--project tibotattle`; its default project is unrelated.
-The CLI returned ready revision `tibotattle-test-app-restore20260924` in
-`us-east1`. No cloud setting was changed in this source-integration pass.
-The existing IAM-private test service still requires an exact-image deployment
-and hosted readback for this source. The partial PostgreSQL host remains
-loopback-only and cannot be deployed to Cloud Run.
+The CLI initially returned ready revision `tibotattle-test-app-restore20260924`
+in `us-east1`; the final image is routed entirely to its latest ready revision.
+The integration also uploaded the reviewed source archive to the
+named test build bucket. The failed `gcloud builds submit` attempt left a
+same-byte 1.2 MB source object in the default Cloud Build staging bucket; no
+Build record was created. The IAM-private test service now has exact-image
+deployment, infrastructure and scoped v1.2 authenticated application/storage
+readback. The `cloud-run-iam` mode permits only the named
+IAM-private test service and the limited v1.2 route set; it does not turn the
+partial host into a complete Worker replacement.
 
 ## Release and activation gates
 
 1. Reconcile current-main v1.2, effective-reader, analytics and erasure
    contracts with the PostgreSQL implementation. Preserve closed schemas,
    replay safety, owner authority and fail-closed forward migrations.
-2. Build and test a clean integrated revision. Run Worker, PostgreSQL,
-   portable-contract, architecture, documentation and release-stage checks,
-   plus the full private GCP journey on the exact new image.
+2. Build and test a clean integrated revision. Worker, PostgreSQL,
+   portable-contract, architecture and documentation checks passed for the
+   private v1.2 slice, and its exact-image hosted journey passed. The complete
+   application, installed-client and release-stage checks remain separate
+   gates after the missing routes and transfer are implemented.
 3. Pin the deployed Cloudflare artifact/configuration, finish a content-free
    table and object inventory, then obtain a consistent source snapshot and
    digest evidence for every active D1 source. Determine the unbound legacy

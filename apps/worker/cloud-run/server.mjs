@@ -51,6 +51,7 @@ import {
 } from "./owner-bootstrap.mjs";
 import { installNodeTimingSafeEqual } from "./node-crypto-adapter.mjs";
 import {
+  CLOUD_RUN_IAM_TEST_TARGET,
   createPostgresTestV12DayManifestDispatch,
   createPostgresTestHealthDispatch,
   dispatchCloudRunHostRequest,
@@ -150,12 +151,38 @@ function configuredRequestOrigins(hostOrigin, publicOrigin) {
 function postgresTestHttpMode() {
   const mode = optional("POSTGRES_TEST_HTTP_MODE");
   if (mode === undefined) return null;
-  if (!new Set(["health-only", "health-and-v12-day-manifest"]).has(mode)) {
+  if (!new Set(["health-only", "health-and-v12-day-manifest", "cloud-run-iam"]).has(mode)) {
     configurationError("POSTGRES_TEST_HTTP_MODE_INVALID");
   }
   return mode;
 }
-function privatePostgresTestHostConfiguration() {
+function privatePostgresTestHostConfiguration(mode) {
+  if (mode === "cloud-run-iam") {
+    const listenHost = optional("HOST");
+    const configuredPort = optional("PORT");
+    const hostOrigin = optional("HOST_ORIGIN");
+    const service = optional("K_SERVICE");
+    if (!isPrivatePostgresTestHost({
+      mode,
+      project: CLOUD_RUN_IAM_TEST_TARGET.project,
+      region: CLOUD_RUN_IAM_TEST_TARGET.region,
+      service,
+      listenHost,
+      hostOrigin,
+      port: configuredPort === String(CLOUD_RUN_IAM_TEST_TARGET.port)
+        ? CLOUD_RUN_IAM_TEST_TARGET.port : null,
+    }) || optional("PUBLIC_ORIGIN") !== undefined
+        || optional("ADMIN_HOST_ORIGIN") !== undefined) {
+      configurationError("POSTGRES_TEST_CLOUD_RUN_IAM_CONFIGURATION_INVALID");
+    }
+    return Object.freeze({
+      listenHost,
+      port: CLOUD_RUN_IAM_TEST_TARGET.port,
+      hostOrigin,
+      mode,
+      requestOriginAllowlist: createRequestOriginAllowlist({ publicHostOrigin: hostOrigin }),
+    });
+  }
   const listenHost = optional("HOST", "127.0.0.1");
   const port = integer("PORT", 8080, 1, 65_535);
   const hostOrigin = configuredHostOrigin();
@@ -168,6 +195,7 @@ function privatePostgresTestHostConfiguration() {
     listenHost,
     port,
     hostOrigin,
+    mode,
     requestOriginAllowlist: createRequestOriginAllowlist({ publicHostOrigin: hostOrigin }),
   });
 }
@@ -200,6 +228,29 @@ function databaseConfig() {
     max: 2,
   };
   return { primary, ledger };
+}
+
+export function validateCloudRunIamTestResources({ database, iamUser, bucket, historyProof }) {
+  const target = CLOUD_RUN_IAM_TEST_TARGET;
+  const matchesDatabaseTarget = (actual, expected) => actual?.database === expected.database
+    && actual?.schema === expected.schema
+    && actual?.instanceConnectionName === expected.instanceConnectionName;
+  if (!matchesDatabaseTarget(database?.primary, target.postgres.primary)) {
+    configurationError("POSTGRES_TEST_CLOUD_RUN_IAM_PRIMARY_TARGET_INVALID");
+  }
+  if (!matchesDatabaseTarget(database?.ledger, target.postgres.ledger)) {
+    configurationError("POSTGRES_TEST_CLOUD_RUN_IAM_LEDGER_TARGET_INVALID");
+  }
+  if (iamUser !== target.postgres.iamUser) {
+    configurationError("POSTGRES_TEST_CLOUD_RUN_IAM_USER_INVALID");
+  }
+  if (bucket !== target.gcsBucket) {
+    configurationError("POSTGRES_TEST_CLOUD_RUN_IAM_BUCKET_INVALID");
+  }
+  if (historyProof?.bucket !== target.gcsBucket) {
+    configurationError("POSTGRES_TEST_CLOUD_RUN_IAM_BUCKET_HISTORY_PROOF_INVALID");
+  }
+  return Object.freeze({ bucket: target.gcsBucket, historyProof });
 }
 
 function rateLimitBinding(pool, schemaOptions, keyHashSecret, [binding, name, defaultLimit, defaultPeriod]) {
@@ -283,14 +334,14 @@ function configurationEnv({
   return Object.freeze(env);
 }
 
-async function createRuntime({ databaseOnly = false } = {}) {
+export async function createRuntime({ databaseOnly = false, dependencies = {} } = {}) {
   const postgresTestMode = databaseOnly ? null : postgresTestHttpMode();
   const postgresTestHttpEnabled = postgresTestMode !== null;
   if (!databaseOnly && !postgresTestHttpEnabled && !isPostgresWorkerRequestPathSupported()) {
     configurationError("POSTGRES_WORKER_REQUEST_PATH_UNSUPPORTED");
   }
   const privateHost = postgresTestHttpEnabled
-    ? privatePostgresTestHostConfiguration() : null;
+    ? privatePostgresTestHostConfiguration(postgresTestMode) : null;
   const hostOrigin = databaseOnly ? null : privateHost?.hostOrigin ?? configuredHostOrigin();
   const publicOrigin = databaseOnly || postgresTestHttpEnabled
     ? undefined : configuredPublicOrigin();
@@ -300,12 +351,23 @@ async function createRuntime({ databaseOnly = false } = {}) {
   const digest = databaseOnly || postgresTestHttpEnabled ? undefined : sourceDigest();
   const database = databaseConfig();
   const iamUser = normalizeIamUser(required("POSTGRES_IAM_USER"), "POSTGRES_IAM_USER");
-  const connector = new Connector();
+  const cloudRunIamResources = postgresTestMode === "cloud-run-iam"
+    ? validateCloudRunIamTestResources({
+      database,
+      iamUser,
+      bucket: required("GCS_BUCKET_NAME"),
+      historyProof: gcsHistoryProof(),
+    })
+    : null;
+  const connector = typeof dependencies.createConnector === "function"
+    ? dependencies.createConnector()
+    : new Connector();
+  const createPool = dependencies.createIamPool ?? createIamPool;
   const pools = [];
   try {
-    const primaryPool = await createIamPool({ connector, ...database.primary, user: iamUser });
+    const primaryPool = await createPool({ connector, ...database.primary, user: iamUser });
     pools.push(primaryPool);
-    const ledgerPool = await createIamPool({ connector, ...database.ledger, user: iamUser });
+    const ledgerPool = await createPool({ connector, ...database.ledger, user: iamUser });
     pools.push(ledgerPool);
     const schemaOptions = {
       primarySchema: database.primary.schema,
@@ -342,6 +404,7 @@ async function createRuntime({ databaseOnly = false } = {}) {
         requestOriginAllowlist,
         listenHost: privateHost.listenHost,
         listenPort: privateHost.port,
+        postgresTestHostMode: privateHost.mode,
         postgresTestHealthDispatch: createPostgresTestHealthDispatch({
           primaryPool,
           ledgerPool,
@@ -351,21 +414,24 @@ async function createRuntime({ databaseOnly = false } = {}) {
         }),
       };
     }
-    if (postgresTestMode === "health-and-v12-day-manifest") {
+    if (postgresTestMode === "health-and-v12-day-manifest"
+        || postgresTestMode === "cloud-run-iam") {
       const rateLimitSecret = required("POSTGRES_RATE_LIMIT_SECRET");
       if (new TextEncoder().encode(rateLimitSecret).byteLength < 32) {
         configurationError("POSTGRES_RATE_LIMIT_SECRET_INVALID");
       }
       const envelopePublicJwk = required("ENVELOPE_PUBLIC_JWK");
       const envelopePrivateJwk = required("ENVELOPE_PRIVATE_JWK");
-      const bucket = required("GCS_BUCKET_NAME");
-      const accessToken = await createGoogleAccessTokenProvider();
-      const objectStore = createGcsQuarantineObjectStore(
+      const bucket = cloudRunIamResources?.bucket ?? required("GCS_BUCKET_NAME");
+      const accessToken = await (dependencies.createGoogleAccessTokenProvider
+        ?? createGoogleAccessTokenProvider)();
+      const objectStore = (dependencies.createGcsQuarantineObjectStore
+        ?? createGcsQuarantineObjectStore)(
         bucket,
         accessToken,
         undefined,
         undefined,
-        gcsHistoryProof(),
+        cloudRunIamResources?.historyProof ?? gcsHistoryProof(),
       );
       const admissionEnv = {
         ENVIRONMENT: optional("ENVIRONMENT", "synthetic-development"),
@@ -394,6 +460,7 @@ async function createRuntime({ databaseOnly = false } = {}) {
         requestOriginAllowlist,
         listenHost: privateHost.listenHost,
         listenPort: privateHost.port,
+        postgresTestHostMode: privateHost.mode,
         postgresTestDispatch: createPostgresTestV12DayManifestDispatch({
           primaryPool,
           ledgerPool,
@@ -436,8 +503,10 @@ async function createRuntime({ databaseOnly = false } = {}) {
     const rateLimitSecret = required("POSTGRES_RATE_LIMIT_SECRET");
     if (new TextEncoder().encode(rateLimitSecret).byteLength < 32) configurationError("POSTGRES_RATE_LIMIT_SECRET_INVALID");
     const bucket = required("GCS_BUCKET_NAME");
-    const accessToken = await createGoogleAccessTokenProvider();
-    const objectStore = createGcsQuarantineObjectStore(
+    const accessToken = await (dependencies.createGoogleAccessTokenProvider
+      ?? createGoogleAccessTokenProvider)();
+    const objectStore = (dependencies.createGcsQuarantineObjectStore
+      ?? createGcsQuarantineObjectStore)(
       bucket,
       accessToken,
       undefined,
@@ -522,7 +591,14 @@ async function serve(runtime) {
   const port = runtime.listenPort ?? integer("PORT", 8080, 1, 65_535);
   const host = runtime.listenHost ?? optional("HOST", "127.0.0.1");
   if (host !== "127.0.0.1" && host !== "0.0.0.0") configurationError("HOST_INVALID");
-  if ((runtime.postgresTestHealthDispatch || runtime.postgresTestDispatch) && host !== "127.0.0.1") {
+  const postgresTestDispatch = runtime.postgresTestHealthDispatch || runtime.postgresTestDispatch;
+  const cloudRunIamMode = runtime.postgresTestHostMode === "cloud-run-iam";
+  if (cloudRunIamMode
+      && (host !== CLOUD_RUN_IAM_TEST_TARGET.listenHost
+        || port !== CLOUD_RUN_IAM_TEST_TARGET.port)) {
+    configurationError("POSTGRES_TEST_CLOUD_RUN_IAM_CONFIGURATION_INVALID");
+  }
+  if (postgresTestDispatch && host !== "127.0.0.1" && !cloudRunIamMode) {
     configurationError("POSTGRES_TEST_PRIVATE_HOST_REQUIRED");
   }
   try {

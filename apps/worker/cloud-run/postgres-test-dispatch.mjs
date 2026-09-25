@@ -8,6 +8,28 @@ const DIGEST = /^[0-9a-f]{64}$/u;
 const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
 const POSTGRES_MAJOR_REQUIRED = 17;
 const V12_CHUNK_UPLOAD_PATH = "/api/v1/contributions";
+export const CLOUD_RUN_IAM_TEST_TARGET = Object.freeze({
+  project: "tibotattle",
+  region: "us-east1",
+  service: "tibotattle-test-app",
+  origin: "https://tibotattle-test-app-5t5mehqi7a-ue.a.run.app",
+  listenHost: "0.0.0.0",
+  port: 8080,
+  postgres: Object.freeze({
+    primary: Object.freeze({
+      instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
+      database: "tibotattle",
+      schema: "tibotattle",
+    }),
+    ledger: Object.freeze({
+      instanceConnectionName: "tibotattle:us-east1:tibotattle-test-ledger-20260922",
+      database: "tibotattle_ledger",
+      schema: "tibotattle_ledger",
+    }),
+    iamUser: "tibotattle-test-runtime@tibotattle.iam",
+  }),
+  gcsBucket: "tibotattle-gcs-test-app-20260922",
+});
 
 function configurationError(code) {
   throw Object.assign(new Error(code), { code });
@@ -53,11 +75,28 @@ function schemaTable(schema) {
 }
 
 /**
- * The partial GCP health host must remain loopback-only. Cloud Run's normal
- * 0.0.0.0 binding and public origins are deliberately not accepted here.
+ * Loopback remains the default for local partial tests. The sole 0.0.0.0
+ * exception is the named Cloud Run test service, whose IAM ingress policy is
+ * qualified outside this process by the GCP readback and unauthenticated probe.
  */
-export function isPrivatePostgresTestHost({ listenHost, hostOrigin, port }) {
-  if (listenHost !== "127.0.0.1"
+export function isPrivatePostgresTestHost({
+  mode,
+  project,
+  region,
+  service,
+  listenHost,
+  hostOrigin,
+  port,
+}) {
+  if (mode === "cloud-run-iam") {
+    return project === CLOUD_RUN_IAM_TEST_TARGET.project
+      && region === CLOUD_RUN_IAM_TEST_TARGET.region
+      && service === CLOUD_RUN_IAM_TEST_TARGET.service
+      && listenHost === CLOUD_RUN_IAM_TEST_TARGET.listenHost
+      && hostOrigin === CLOUD_RUN_IAM_TEST_TARGET.origin
+      && port === CLOUD_RUN_IAM_TEST_TARGET.port;
+  }
+  if (mode !== undefined || listenHost !== "127.0.0.1"
       || !Number.isSafeInteger(port) || port < 1 || port > 65_535
       || typeof hostOrigin !== "string") return false;
   try {
@@ -66,6 +105,18 @@ export function isPrivatePostgresTestHost({ listenHost, hostOrigin, port }) {
       && origin.protocol === "http:"
       && origin.hostname === "127.0.0.1"
       && Number(origin.port || "80") === port;
+  } catch {
+    return false;
+  }
+}
+
+function isAllowedPostgresTestOrigin(value) {
+  if (typeof value !== "string") return false;
+  try {
+    const origin = new URL(value);
+    if (origin.origin !== value) return false;
+    return (origin.protocol === "http:" && origin.hostname === "127.0.0.1")
+      || (origin.protocol === "https:" && value === CLOUD_RUN_IAM_TEST_TARGET.origin);
   } catch {
     return false;
   }
@@ -170,12 +221,7 @@ export function createPostgresTestHealthDispatch({
     primary: validateExpectedMigrations(expectedMigrations?.primary, "primary"),
     ledger: validateExpectedMigrations(expectedMigrations?.ledger, "ledger"),
   });
-  let privateUrl;
-  try { privateUrl = new URL(privateOrigin); } catch {
-    configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
-  }
-  if (privateUrl.origin !== privateOrigin || privateUrl.protocol !== "http:"
-      || privateUrl.hostname !== "127.0.0.1") {
+  if (!isAllowedPostgresTestOrigin(privateOrigin)) {
     configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
   }
 
@@ -931,12 +977,7 @@ export function createPostgresTestV12DayManifestDispatch({
     primary: validateExpectedMigrations(expectedMigrations?.primary, "primary"),
     ledger: validateExpectedMigrations(expectedMigrations?.ledger, "ledger"),
   });
-  let privateUrl;
-  try { privateUrl = new URL(privateOrigin); } catch {
-    configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
-  }
-  if (privateUrl.origin !== privateOrigin || privateUrl.protocol !== "http:"
-      || privateUrl.hostname !== "127.0.0.1") {
+  if (!isAllowedPostgresTestOrigin(privateOrigin)) {
     configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
   }
 

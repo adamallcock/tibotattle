@@ -5,25 +5,59 @@
  *
  * The target is intentionally fixed to tibotattle/us-east1 and one named test
  * service. Local context checks and read-only Cloud Run assessments remain
- * available, but deploy and exact-image verification stay blocked until the
- * Cloud Build source can be tied to the checked local context.
+ * available. Verify and deploy require a generated local source archive and a
+ * matching regional Cloud Build provenance receipt before using an image.
  */
 
+import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import { lstat, open } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createCloudRunBuildArchive } from "./cloud-run-build-archive.mjs";
 
 export const GCP_PRIVATE_TEST_TARGET = Object.freeze({
   project: "tibotattle",
+  projectNumber: "806510610397",
   region: "us-east1",
   service: "tibotattle-test-app",
+  hostOrigin: "https://tibotattle-test-app-5t5mehqi7a-ue.a.run.app",
+  runtimeServiceAccount: "tibotattle-test-runtime@tibotattle.iam.gserviceaccount.com",
+  primaryInstanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
+  primaryDatabase: "tibotattle",
+  primarySchema: "tibotattle",
+  ledgerInstanceConnectionName: "tibotattle:us-east1:tibotattle-test-ledger-20260922",
+  ledgerDatabase: "tibotattle_ledger",
+  ledgerSchema: "tibotattle_ledger",
+  postgresIamUser: "tibotattle-test-runtime@tibotattle.iam",
+  gcsBucketName: "tibotattle-gcs-test-app-20260922",
+  buildBucket: "tibotattle-gcs-test-build-20260922",
   imageRepository:
     "us-east1-docker.pkg.dev/tibotattle/tibotattle-test/tibotattle-host",
+});
+
+export const GCP_PRIVATE_TEST_BUILD = Object.freeze({
+  serviceAccount:
+    "projects/tibotattle/serviceAccounts/tibotattle-test-builder@tibotattle.iam.gserviceaccount.com",
+  imageTag: GCP_PRIVATE_TEST_TARGET.imageRepository + ":content-digest-required",
+  dockerBuilderImage:
+    "gcr.io/cloud-builders/docker@sha256:bbb3d633c5c2813b2ce5245852979e1d637768f4acfc504d8ece288f91e9b60f",
+  // Pin only after review; archive creation and provenance qualification check
+  // this digest against the exact cloudbuild.yaml tar member.
+  cloudBuildConfigSha256: "a6dd372a20429ab6b3e9b11b738514d201c6b5b0ca8e395e6c69bb0b166dbc12",
+  sourceObjectPrefix: "source/cloud-run-host-",
 });
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const BUILD_CONTEXT_CHECK = resolve(WORKER_ROOT, "scripts/cloud-run-build-context.mjs");
 const DIGEST = /^[a-f0-9]{64}$/u;
+const BUILD_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u;
+const MAX_SOURCE_ARCHIVE_BYTES = 64 * 1024 * 1024;
+const GENERATION = /^[1-9]\d{0,19}$/u;
+const CLOUD_BUILD_HASH_TYPES = new Set([
+  "SHA256", "MD5", "SHA512", "GO_MODULE_H1", "DIRSUM_SHA256",
+]);
 const IMAGE_REFERENCE =
   /^us-east1-docker\.pkg\.dev\/tibotattle\/tibotattle-test\/tibotattle-host@sha256:([a-f0-9]{64})$/u;
 const HEALTH_PATH = "/api/health";
@@ -39,7 +73,9 @@ function parseArgs(argv) {
     fail("GCP_PRIVATE_TEST_COMMAND_INVALID");
   }
   const allowed = new Set(["--project", "--region", "--service", "--image",
-    "--source-digest", "--build-id"]);
+    "--source-digest", "--build-id", "--source-archive",
+    "--source-archive-sha256", "--source-bucket", "--source-object",
+    "--source-generation"]);
   const values = new Map();
   for (const argument of argv.slice(1)) {
     const separator = argument.indexOf("=");
@@ -61,12 +97,23 @@ function parseArgs(argv) {
     image: values.get("--image") ?? "",
     sourceDigest: values.get("--source-digest") ?? "",
     buildId: values.get("--build-id") ?? "",
+    sourceArchivePath: values.get("--source-archive") ?? "",
+    sourceArchiveSha256: values.get("--source-archive-sha256") ?? "",
+    sourceBucket: values.get("--source-bucket") ?? "",
+    sourceObject: values.get("--source-object") ?? "",
+    sourceGeneration: values.get("--source-generation") ?? "",
   };
   validateConfig(config);
   return Object.freeze(config);
 }
 
 export function validateConfig(config) {
+  const buildId = config?.buildId ?? "";
+  const sourceArchivePath = config?.sourceArchivePath ?? "";
+  const sourceArchiveSha256 = config?.sourceArchiveSha256 ?? "";
+  const sourceBucket = config?.sourceBucket ?? "";
+  const sourceObject = config?.sourceObject ?? "";
+  const sourceGeneration = config?.sourceGeneration ?? "";
   if (config?.project !== GCP_PRIVATE_TEST_TARGET.project
       || config?.region !== GCP_PRIVATE_TEST_TARGET.region
       || config?.service !== GCP_PRIVATE_TEST_TARGET.service) {
@@ -77,6 +124,29 @@ export function validateConfig(config) {
   }
   if (typeof config.sourceDigest !== "string" || !DIGEST.test(config.sourceDigest)) {
     fail("GCP_PRIVATE_TEST_SOURCE_DIGEST_REQUIRED");
+  }
+  if (buildId !== "" && !BUILD_ID.test(buildId)) {
+    fail("GCP_PRIVATE_TEST_BUILD_ID_INVALID");
+  }
+  if (sourceArchivePath !== "" && typeof sourceArchivePath !== "string") {
+    fail("GCP_PRIVATE_TEST_SOURCE_ARCHIVE_PATH_INVALID");
+  }
+  if (sourceArchiveSha256 !== "" && !DIGEST.test(sourceArchiveSha256)) {
+    fail("GCP_PRIVATE_TEST_SOURCE_ARCHIVE_SHA256_INVALID");
+  }
+  if (sourceBucket !== "" && sourceBucket !== GCP_PRIVATE_TEST_TARGET.buildBucket) {
+    fail("GCP_PRIVATE_TEST_SOURCE_BUCKET_UNEXPECTED");
+  }
+  if (sourceGeneration !== "" && !GENERATION.test(sourceGeneration)) {
+    fail("GCP_PRIVATE_TEST_SOURCE_GENERATION_INVALID");
+  }
+  if (sourceObject !== "" && sourceArchiveSha256 !== ""
+      && config.sourceDigest !== "") {
+    const expectedObject = GCP_PRIVATE_TEST_BUILD.sourceObjectPrefix
+      + config.sourceDigest + "-" + sourceArchiveSha256 + ".tar.gz";
+    if (sourceObject !== expectedObject) {
+      fail("GCP_PRIVATE_TEST_SOURCE_OBJECT_UNEXPECTED");
+    }
   }
   return Object.freeze({
     digest: IMAGE_REFERENCE.exec(config.image)[1],
@@ -96,9 +166,27 @@ function serviceIngress(service) {
     ?? null;
 }
 
+function serviceUrl(service) {
+  return service?.uri ?? service?.status?.url ?? service?.url ?? null;
+}
+
+function serviceAccountName(service) {
+  return service?.spec?.template?.spec?.serviceAccountName
+    ?? service?.template?.serviceAccount
+    ?? null;
+}
+
 function readyCondition(service) {
+  const terminalCondition = service?.status?.terminalCondition ?? service?.terminalCondition;
   const conditions = service?.status?.conditions ?? service?.conditions ?? [];
-  return conditions.find((condition) => condition.type === "Ready")?.status === "True";
+  const condition = terminalCondition ?? conditions.find((value) => value?.type === "Ready");
+  if (!condition) return false;
+  const signals = [];
+  if (condition.status !== undefined) signals.push(condition.status === "True");
+  if (condition.state !== undefined) {
+    signals.push(condition.state === "CONDITION_SUCCEEDED");
+  }
+  return signals.length > 0 && signals.every(Boolean);
 }
 
 function invokerIamCheckEnabled(service) {
@@ -165,12 +253,394 @@ function routesAllTrafficToLatestReadyRevision(service) {
 }
 
 function serviceEnvironment(service) {
-  const values = service?.spec?.template?.spec?.containers?.[0]?.env
-    ?? service?.template?.containers?.[0]?.env
-    ?? [];
+  const values = serviceEnvironmentEntries(service);
   return new Map(values
     .filter((value) => typeof value?.name === "string" && typeof value?.value === "string")
     .map((value) => [value.name, value.value]));
+}
+
+function serviceEnvironmentEntries(service) {
+  const values = service?.spec?.template?.spec?.containers?.[0]?.env
+    ?? service?.template?.containers?.[0]?.env
+    ?? [];
+  return Array.isArray(values) ? values : [];
+}
+
+function exactServiceEnvironmentValue(service, name, expected) {
+  const matches = serviceEnvironmentEntries(service).filter((entry) => entry?.name === name);
+  return matches.length === 1 && exactRecord(matches[0], { name, value: expected });
+}
+
+const GCP_PRIVATE_TEST_BACKING_ENVIRONMENT = Object.freeze({
+  PRIMARY_INSTANCE_CONNECTION_NAME: GCP_PRIVATE_TEST_TARGET.primaryInstanceConnectionName,
+  PRIMARY_DATABASE: GCP_PRIVATE_TEST_TARGET.primaryDatabase,
+  PRIMARY_SCHEMA: GCP_PRIVATE_TEST_TARGET.primarySchema,
+  LEDGER_INSTANCE_CONNECTION_NAME: GCP_PRIVATE_TEST_TARGET.ledgerInstanceConnectionName,
+  LEDGER_DATABASE: GCP_PRIVATE_TEST_TARGET.ledgerDatabase,
+  LEDGER_SCHEMA: GCP_PRIVATE_TEST_TARGET.ledgerSchema,
+  GCS_BUCKET_NAME: GCP_PRIVATE_TEST_TARGET.gcsBucketName,
+});
+
+const ALTERNATE_DATABASE_CREDENTIAL_ENVIRONMENT_NAME = /^(?:(?:DATABASE|DB|PRIMARY|LEDGER|POSTGRES|PG)(?:_.*)?_(?:URL|URI|PASSWORD|PASS|PASSFILE|CREDENTIALS?|CONNECTION_STRING|USER)|DATABASE_URL|DB_URL|PGPASSWORD|PGUSER|PGPASSFILE|PGSERVICE|PGSERVICEFILE|GOOGLE_APPLICATION_CREDENTIALS|CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE)$/u;
+
+function backingTargetsReadbackReady(service) {
+  return Object.entries(GCP_PRIVATE_TEST_BACKING_ENVIRONMENT).every(([name, value]) =>
+    exactServiceEnvironmentValue(service, name, value),
+  );
+}
+
+function credentialScopeReadbackReady(service) {
+  const environment = serviceEnvironmentEntries(service);
+  return exactServiceEnvironmentValue(
+    service,
+    "POSTGRES_IAM_USER",
+    GCP_PRIVATE_TEST_TARGET.postgresIamUser,
+  ) && !environment.some((entry) => typeof entry?.name === "string"
+    && entry.name !== "POSTGRES_IAM_USER"
+    && ALTERNATE_DATABASE_CREDENTIAL_ENVIRONMENT_NAME.test(entry.name));
+}
+
+function sourceProvenanceInputsReady(config) {
+  return typeof config?.buildId === "string" && BUILD_ID.test(config.buildId)
+    && typeof config?.sourceArchivePath === "string" && config.sourceArchivePath.length > 0
+    && typeof config?.sourceArchiveSha256 === "string" && DIGEST.test(config.sourceArchiveSha256)
+    && config?.sourceBucket === GCP_PRIVATE_TEST_TARGET.buildBucket
+    && typeof config?.sourceGeneration === "string" && GENERATION.test(config.sourceGeneration)
+    && typeof config?.sourceObject === "string"
+    && config.sourceObject === GCP_PRIVATE_TEST_BUILD.sourceObjectPrefix
+      + config.sourceDigest + "-" + config.sourceArchiveSha256 + ".tar.gz";
+}
+
+function buildStepImageDigest(value) {
+  if (typeof value !== "string") return null;
+  const match = /(?:@)?sha256:([a-f0-9]{64})$/u.exec(value);
+  return match?.[1] ?? null;
+}
+
+function wellFormedCloudBuildHash(hash) {
+  if (hash === null || typeof hash !== "object"
+      || !CLOUD_BUILD_HASH_TYPES.has(hash.type)
+      || typeof hash.value !== "string"
+      || !exactRecord(hash, { type: hash.type, value: hash.value })) {
+    return false;
+  }
+  let bytes;
+  // Cloud Build's REST schema represents bytes as base64; gcloud readbacks
+  // have also shown URL-safe base64, with and without canonical padding.
+  if (/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(hash.value)) {
+    bytes = Buffer.from(hash.value, "base64");
+    if (bytes.toString("base64") !== hash.value) return false;
+  } else if (/^[A-Za-z0-9_-]+$/u.test(hash.value) && hash.value.length % 4 !== 1) {
+    bytes = Buffer.from(hash.value, "base64url");
+    if (bytes.toString("base64url") !== hash.value) return false;
+  } else if (/^(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-]{2}==|[A-Za-z0-9_-]{3}=)$/u.test(hash.value)) {
+    bytes = Buffer.from(hash.value, "base64url");
+    const unpadded = bytes.toString("base64url");
+    const padding = "=".repeat((4 - (unpadded.length % 4)) % 4);
+    if (unpadded + padding !== hash.value) return false;
+  } else {
+    return false;
+  }
+  if (bytes.length === 0) return false;
+  if ((hash.type === "MD5" && bytes.length !== 16)
+      || ((hash.type === "SHA256" || hash.type === "DIRSUM_SHA256") && bytes.length !== 32)
+      || (hash.type === "SHA512" && bytes.length !== 64)) {
+    return false;
+  }
+  if (hash.type === "GO_MODULE_H1") {
+    const text = bytes.toString("ascii");
+    if (!/^(?:[a-f0-9]{2})+$/u.test(text)) return false;
+  }
+  return true;
+}
+
+const CLOUD_BUILD_TOP_LEVEL_FIELDS = new Set([
+  "name", "id", "projectId", "status", "statusDetail", "source", "steps",
+  "results", "createTime", "startTime", "finishTime", "timeout", "images",
+  "queueTtl", "artifacts", "logsBucket", "sourceProvenance", "buildTriggerId",
+  "options", "logUrl", "substitutions", "tags", "secrets", "timing", "approval",
+  "serviceAccount", "availableSecrets", "warnings", "gitConfig", "failureInfo",
+  "dependencies",
+]);
+const CLOUD_BUILD_UNCONFIGURED_FIELDS = Object.freeze([
+  "logsBucket", "buildTriggerId", "tags", "secrets", "availableSecrets",
+  "approval", "gitConfig", "dependencies",
+]);
+
+function hasOnlyKeys(value, allowedKeys) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).every((key) => allowedKeys.has(key));
+}
+
+function exactRecord(value, expected) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  const expectedKeys = Object.keys(expected);
+  return keys.length === expectedKeys.length
+    && expectedKeys.every((key) => value[key] === expected[key]);
+}
+
+function buildConfigurationMatchesReviewedConfig(build) {
+  if (!hasOnlyKeys(build, CLOUD_BUILD_TOP_LEVEL_FIELDS)
+      || CLOUD_BUILD_UNCONFIGURED_FIELDS.some((key) => Object.hasOwn(build, key))) {
+    return false;
+  }
+
+  // These response fields are fixed by the generated submission contract:
+  // gcloud receives --timeout=1200s, queueTtl uses the documented 3600s
+  // default, and artifacts.images echoes the one reviewed image output.
+  if (build.timeout !== undefined && build.timeout !== "1200s") return false;
+  if (build.queueTtl !== undefined && build.queueTtl !== "3600s") return false;
+  if (build.artifacts !== undefined
+      && (!hasOnlyKeys(build.artifacts, new Set(["images"]))
+        || !Array.isArray(build.artifacts.images)
+        || build.artifacts.images.length !== 1
+        || build.artifacts.images[0] !== GCP_PRIVATE_TEST_BUILD.imageTag)) {
+    return false;
+  }
+
+  const step = Array.isArray(build.steps) && build.steps.length === 1
+    ? build.steps[0]
+    : null;
+  const allowedStepKeys = new Set([
+    "name", "args", "timing", "pullTiming", "status", "exitCode",
+  ]);
+  const resolvedArgs = [
+    "build",
+    "--file=apps/worker/cloud-run/Dockerfile",
+    "--tag=" + GCP_PRIVATE_TEST_BUILD.imageTag,
+    ".",
+  ];
+  if (!hasOnlyKeys(step, allowedStepKeys)
+      || step.name !== GCP_PRIVATE_TEST_BUILD.dockerBuilderImage
+      || JSON.stringify(step.args) !== JSON.stringify(resolvedArgs)
+      || step.status !== "SUCCESS"
+      || (step.exitCode !== undefined && step.exitCode !== 0)) {
+    return false;
+  }
+
+  const options = build.options;
+  const allowedOptionKeys = new Set([
+    "logging", "sourceProvenanceHash", "requestedVerifyOption", "pool",
+  ]);
+  if (!hasOnlyKeys(options, allowedOptionKeys)
+      || options.logging !== "CLOUD_LOGGING_ONLY"
+      || !Array.isArray(options.sourceProvenanceHash)
+      || options.sourceProvenanceHash.length !== 1
+      || options.sourceProvenanceHash[0] !== "SHA256"
+      || options.requestedVerifyOption !== "VERIFIED"
+      || (options.pool !== undefined && !exactRecord(options.pool, {}))) {
+    return false;
+  }
+
+  return exactRecord(build.substitutions, { _IMAGE: GCP_PRIVATE_TEST_BUILD.imageTag });
+}
+
+export function assessCloudBuildProvenance({ build, config } = {}) {
+  const blockers = [];
+  if (!sourceProvenanceInputsReady(config)) {
+    return Object.freeze({
+      ok: false,
+      blockers: Object.freeze(["GCP_BUILD_PROVENANCE_ARGUMENTS_REQUIRED"]),
+    });
+  }
+  if (!build || typeof build !== "object") {
+    return Object.freeze({
+      ok: false,
+      blockers: Object.freeze(["GCP_BUILD_READBACK_MISSING"]),
+    });
+  }
+  const expectedNames = new Set([
+    GCP_PRIVATE_TEST_TARGET.project,
+    GCP_PRIVATE_TEST_TARGET.projectNumber,
+  ].map((project) =>
+    `projects/${project}/locations/${GCP_PRIVATE_TEST_TARGET.region}/builds/${config.buildId}`,
+  ));
+  if (build.id !== config.buildId || build.projectId !== config.project
+      || !expectedNames.has(build.name)) {
+    blockers.push("GCP_BUILD_IDENTITY_MISMATCH");
+  }
+  if (!buildConfigurationMatchesReviewedConfig(build)) {
+    blockers.push("GCP_BUILD_CONFIGURATION_UNEXPECTED");
+  }
+  if (build.status !== "SUCCESS") blockers.push("GCP_BUILD_NOT_SUCCESSFUL");
+  if (build.serviceAccount !== GCP_PRIVATE_TEST_BUILD.serviceAccount) {
+    blockers.push("GCP_BUILD_SERVICE_ACCOUNT_UNEXPECTED");
+  }
+
+  const options = build.options;
+  if (!Array.isArray(options?.sourceProvenanceHash)
+      || options.sourceProvenanceHash.length !== 1
+      || options.sourceProvenanceHash[0] !== "SHA256"
+      || options.requestedVerifyOption !== "VERIFIED") {
+    blockers.push("GCP_BUILD_PROVENANCE_OPTIONS_UNQUALIFIED");
+  }
+
+  const steps = build.steps;
+  if (!Array.isArray(steps) || steps.length !== 1
+      || steps[0]?.name !== GCP_PRIVATE_TEST_BUILD.dockerBuilderImage
+      || steps[0]?.status !== "SUCCESS"
+      || (steps[0]?.exitCode !== undefined && steps[0].exitCode !== 0)) {
+    blockers.push("GCP_BUILD_STEP_UNEXPECTED");
+  }
+  const stepImages = build.results?.buildStepImages;
+  if (!Array.isArray(stepImages) || stepImages.length !== 1
+      || buildStepImageDigest(stepImages[0])
+        !== GCP_PRIVATE_TEST_BUILD.dockerBuilderImage.slice("gcr.io/cloud-builders/docker@sha256:".length)) {
+    blockers.push("GCP_BUILD_STEP_IMAGE_DIGEST_UNEXPECTED");
+  }
+
+  const expectedSourceName = {
+    bucket: config.sourceBucket,
+    object: config.sourceObject,
+    generation: config.sourceGeneration,
+  };
+  const source = build.source?.storageSource;
+  if (!exactRecord(source, expectedSourceName)
+      || source?.bucket !== expectedSourceName.bucket
+      || source?.object !== expectedSourceName.object
+      || String(source?.generation) !== config.sourceGeneration
+      || !exactRecord(build.source, { storageSource: source })) {
+    blockers.push("GCP_BUILD_SOURCE_OBJECT_MISMATCH");
+  }
+  const resolvedSource = build.sourceProvenance?.resolvedStorageSource;
+  if (!exactRecord(resolvedSource, {
+    bucket: expectedSourceName.bucket,
+    object: expectedSourceName.object,
+    generation: config.sourceGeneration,
+  }) || resolvedSource?.bucket !== expectedSourceName.bucket
+      || resolvedSource?.object !== expectedSourceName.object
+      || typeof resolvedSource?.generation !== "string"
+      || resolvedSource.generation !== config.sourceGeneration
+      || !exactRecord(build.sourceProvenance, {
+        resolvedStorageSource: resolvedSource,
+        fileHashes: build.sourceProvenance?.fileHashes,
+      })) {
+    blockers.push("GCP_BUILD_SOURCE_GENERATION_MISMATCH");
+  }
+  const expectedSourceUri = `gs://${config.sourceBucket}/${config.sourceObject}#${config.sourceGeneration}`;
+  const fileHashes = build.sourceProvenance?.fileHashes;
+  const hashKeys = fileHashes !== null && typeof fileHashes === "object"
+      && !Array.isArray(fileHashes) ? Object.keys(fileHashes) : [];
+  const hashes = fileHashes?.[expectedSourceUri]?.fileHash;
+  const archiveHashBytes = Buffer.from(config.sourceArchiveSha256, "hex");
+  const paddedBase64UrlArchiveHash = archiveHashBytes.toString("base64")
+    .replaceAll("+", "-").replaceAll("/", "_");
+  const expectedArchiveHashValues = new Set([
+    archiveHashBytes.toString("base64"),
+    archiveHashBytes.toString("base64url"),
+    paddedBase64UrlArchiveHash,
+  ]);
+  const hashEntry = fileHashes?.[expectedSourceUri];
+  const results = build.results;
+  const allowedResultKeys = new Set(["images", "buildStepImages", "buildStepOutputs"]);
+  const allowedImageResultKeys = new Set([
+    "name", "digest", "pushTiming", "artifactRegistryPackage", "ociMediaType",
+  ]);
+  if (hashKeys.length !== 1 || hashKeys[0] !== expectedSourceUri
+      || !exactRecord(hashEntry, { fileHash: hashes })
+      || !Array.isArray(hashes) || hashes.length === 0
+      || hashes.some((hash) => !wellFormedCloudBuildHash(hash))
+      || new Set(hashes.map((hash) => hash.type)).size !== hashes.length
+      || hashes.filter((hash) => hash.type === "SHA256").length !== 1
+      || !expectedArchiveHashValues.has(hashes.find((hash) => hash.type === "SHA256")?.value)
+      || !exactRecord(build.sourceProvenance, {
+        resolvedStorageSource: resolvedSource,
+        fileHashes,
+      })
+      || !hasOnlyKeys(results, allowedResultKeys)
+      || !Array.isArray(results?.images) || results.images.length !== 1
+      || !hasOnlyKeys(results.images[0], allowedImageResultKeys)
+      || (results.buildStepOutputs !== undefined
+        && (!Array.isArray(results.buildStepOutputs)
+          || results.buildStepOutputs.length !== 1
+          || results.buildStepOutputs[0] !== ""))) {
+    blockers.push("GCP_BUILD_SOURCE_ARCHIVE_SHA256_MISMATCH");
+  }
+
+  const expectedImageDigest = IMAGE_REFERENCE.exec(config.image)?.[1];
+  const images = build.results?.images;
+  if (build.images?.length !== 1 || build.images[0] !== GCP_PRIVATE_TEST_BUILD.imageTag
+      || !Array.isArray(images) || images.length !== 1
+      || images[0]?.name !== GCP_PRIVATE_TEST_BUILD.imageTag
+      || images[0]?.digest !== `sha256:${expectedImageDigest}`) {
+    blockers.push("GCP_BUILD_IMAGE_DIGEST_MISMATCH");
+  }
+  return Object.freeze({
+    ok: blockers.length === 0,
+    blockers: Object.freeze([...new Set(blockers)]),
+    sourceGeneration: resolvedSource?.generation ?? null,
+    image: images?.[0]?.name && images?.[0]?.digest
+      ? `${images[0].name.replace(/:[^/:]+$/u, "")}@${images[0].digest}`
+      : null,
+  });
+}
+
+export async function assessLocalCloudBuildSourceArchive(config, {
+  archiveBuilder = createCloudRunBuildArchive,
+} = {}) {
+  const blockers = [];
+  if (!sourceProvenanceInputsReady(config)) {
+    return Object.freeze({
+      ok: false,
+      blockers: Object.freeze(["GCP_BUILD_PROVENANCE_ARGUMENTS_REQUIRED"]),
+    });
+  }
+  let canonical;
+  try {
+    canonical = await archiveBuilder();
+  } catch {
+    return Object.freeze({
+      ok: false,
+      blockers: Object.freeze(["GCP_PRIVATE_TEST_SOURCE_ARCHIVE_BUILD_FAILED"]),
+    });
+  }
+  if (canonical?.sourceContentDigest !== config.sourceDigest) {
+    blockers.push("GCP_PRIVATE_TEST_SOURCE_CONTEXT_DIGEST_MISMATCH");
+  }
+  if (canonical?.cloudBuildConfigSha256 !== GCP_PRIVATE_TEST_BUILD.cloudBuildConfigSha256) {
+    blockers.push("GCP_PRIVATE_TEST_BUILD_CONFIG_SHA256_MISMATCH");
+  }
+  let bytes;
+  let handle;
+  try {
+    const path = resolve(config.sourceArchivePath);
+    const stat = await lstat(path);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1
+        || stat.size <= 0 || stat.size > MAX_SOURCE_ARCHIVE_BYTES) {
+      blockers.push("GCP_PRIVATE_TEST_SOURCE_ARCHIVE_UNSAFE");
+    } else {
+      handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      const openedStat = await handle.stat();
+      if (!openedStat.isFile() || openedStat.nlink !== 1
+          || openedStat.dev !== stat.dev || openedStat.ino !== stat.ino
+          || openedStat.size !== stat.size || openedStat.size > MAX_SOURCE_ARCHIVE_BYTES) {
+        blockers.push("GCP_PRIVATE_TEST_SOURCE_ARCHIVE_UNSAFE");
+      } else {
+        bytes = await handle.readFile();
+      }
+    }
+  } catch {
+    blockers.push("GCP_PRIVATE_TEST_SOURCE_ARCHIVE_UNAVAILABLE");
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+  let observedSha256 = null;
+  if (bytes !== undefined) {
+    observedSha256 = createHash("sha256").update(bytes).digest("hex");
+    if (observedSha256 !== config.sourceArchiveSha256) {
+      blockers.push("GCP_PRIVATE_TEST_SOURCE_ARCHIVE_SHA256_MISMATCH");
+    }
+    if (observedSha256 !== canonical?.sourceArchiveSha256) {
+      blockers.push("GCP_PRIVATE_TEST_SOURCE_ARCHIVE_CONTEXT_MISMATCH");
+    }
+  }
+  return Object.freeze({
+    ok: blockers.length === 0,
+    blockers: Object.freeze([...new Set(blockers)]),
+    sourceContentDigest: canonical?.sourceContentDigest ?? null,
+    sourceArchiveSha256: observedSha256,
+  });
 }
 
 function hasPublicInvokerBinding(policy) {
@@ -190,6 +660,7 @@ export function assessCloudRunReadback({
   requireExactImage = true,
   requireSourceDigest = true,
   requireLatestReadyTraffic = requireExactImage,
+  requireCloudRunHostMode = false,
 } = {}) {
   const blockers = [];
   if (!service || !policy) return Object.freeze({
@@ -197,7 +668,10 @@ export function assessCloudRunReadback({
     blockers: Object.freeze(["GCP_TEST_SERVICE_READBACK_MISSING"]),
   });
   if (!readyCondition(service)) blockers.push("GCP_TEST_SERVICE_NOT_READY");
-  if (serviceIngress(service) !== "all") blockers.push("GCP_TEST_INGRESS_UNEXPECTED");
+  if (serviceIngress(service) !== "all"
+      && serviceIngress(service) !== "INGRESS_TRAFFIC_ALL") {
+    blockers.push("GCP_TEST_INGRESS_UNEXPECTED");
+  }
   if (!invokerIamCheckEnabled(service)) blockers.push("GCP_TEST_INVOKER_IAM_CHECK_DISABLED");
   if (hasPublicInvokerBinding(policy)) blockers.push("GCP_TEST_PUBLIC_INVOKER_PRESENT");
   if (requireLatestReadyTraffic && !routesAllTrafficToLatestReadyRevision(service)) {
@@ -210,6 +684,25 @@ export function assessCloudRunReadback({
       && serviceEnvironment(service).get("SOURCE_CONTENT_DIGEST") !== expectedSourceDigest) {
     blockers.push("GCP_TEST_SOURCE_DIGEST_READBACK_MISMATCH");
   }
+  if (!backingTargetsReadbackReady(service)) {
+    blockers.push("GCP_TEST_BACKING_TARGET_READBACK_UNQUALIFIED");
+  }
+  if (!credentialScopeReadbackReady(service)) {
+    blockers.push("GCP_TEST_CREDENTIAL_SCOPE_READBACK_UNQUALIFIED");
+  }
+  if (serviceAccountName(service) !== GCP_PRIVATE_TEST_TARGET.runtimeServiceAccount) {
+    blockers.push("GCP_TEST_RUNTIME_SERVICE_ACCOUNT_UNQUALIFIED");
+  }
+  if (requireCloudRunHostMode) {
+    const environment = serviceEnvironment(service);
+    const resolvedServiceUrl = serviceUrl(service);
+    if (resolvedServiceUrl !== GCP_PRIVATE_TEST_TARGET.hostOrigin
+        || environment.get("HOST") !== "0.0.0.0"
+        || environment.get("HOST_ORIGIN") !== GCP_PRIVATE_TEST_TARGET.hostOrigin
+        || environment.get("POSTGRES_TEST_HTTP_MODE") !== "cloud-run-iam") {
+      blockers.push("GCP_TEST_HOST_MODE_READBACK_UNQUALIFIED");
+    }
+  }
   return Object.freeze({
     ok: blockers.length === 0,
     blockers: Object.freeze(blockers),
@@ -221,8 +714,11 @@ export function cloudRunHostModeReady(isPrivateHost) {
   try {
     return isPrivateHost({
       mode: "cloud-run-iam",
+      service: GCP_PRIVATE_TEST_TARGET.service,
+      project: GCP_PRIVATE_TEST_TARGET.project,
+      region: GCP_PRIVATE_TEST_TARGET.region,
       listenHost: "0.0.0.0",
-      hostOrigin: "https://service.invalid",
+      hostOrigin: GCP_PRIVATE_TEST_TARGET.hostOrigin,
       port: 8080,
     }) === true;
   } catch {
@@ -354,6 +850,10 @@ export async function runSyntheticRouteBoundarySmoke({
     fail("GCP_PRIVATE_TEST_HEALTH_SMOKE_FAILED");
   }
 
+  // This IAM-token Authorization header is used only for this invalid-envelope
+  // boundary: it is rejected before application device authorization. A valid
+  // route smoke must send the Cloud Run ID token in X-Serverless-Authorization
+  // and a separate application device token in Authorization.
   const route = await authenticatedRequest(
     new URL(V12_CHUNK_PATH, origin),
     token,
@@ -371,6 +871,7 @@ export async function runSyntheticRouteBoundarySmoke({
   return Object.freeze({
     health: "ready",
     routeBoundary: "synthetic_invalid_envelope_rejected",
+    validRouteSmoke: "not_tested_requires_cloud_run_and_device_tokens",
     writesAttempted: false,
   });
 }
@@ -417,36 +918,87 @@ async function readCloudRunState(config, spawn = spawnSync) {
   return Object.freeze({ service: serviceJson, policy: policyJson });
 }
 
+function readCloudBuild(config, spawn = spawnSync) {
+  return parseJson(spawnGcloud([
+    "builds", "describe", config.buildId,
+    "--project=" + config.project,
+    "--region=" + config.region,
+    "--format=json",
+  ], spawn), "GCP_PRIVATE_TEST_BUILD_READBACK_INVALID");
+}
+
+async function assessRequestedSourceProvenance(config, archiveBuilder, spawn) {
+  if (!sourceProvenanceInputsReady(config)) {
+    return Object.freeze({
+      ok: false,
+      blockers: Object.freeze(["GCP_BUILD_PROVENANCE_ARGUMENTS_REQUIRED"]),
+      local: null,
+      build: null,
+    });
+  }
+  const local = await assessLocalCloudBuildSourceArchive(config, { archiveBuilder });
+  if (!local.ok) {
+    return Object.freeze({
+      ok: false,
+      blockers: local.blockers,
+      local,
+      build: null,
+    });
+  }
+  let build;
+  try {
+    build = assessCloudBuildProvenance({ build: readCloudBuild(config, spawn), config });
+  } catch {
+    build = Object.freeze({
+      ok: false,
+      blockers: Object.freeze(["GCP_BUILD_READBACK_UNAVAILABLE"]),
+    });
+  }
+  return Object.freeze({
+    ok: local.ok && build.ok,
+    blockers: Object.freeze(build.ok ? [] : build.blockers),
+    local,
+    build,
+  });
+}
+
 export async function runGcpPrivateTestDeployment({
   config,
   spawn = spawnSync,
   fetchImpl = fetch,
   isPrivateHost,
+  archiveBuilder = createCloudRunBuildArchive,
 } = {}) {
   validateConfig(config);
   checkedBuildContext(config.sourceDigest, spawn);
   const hostModeReady = cloudRunHostModeReady(isPrivateHost);
-  if (config.command === "deploy") {
+  const provenance = await assessRequestedSourceProvenance(config, archiveBuilder, spawn);
+  const provenanceBlockers = provenance.ok
+    ? []
+    : ["SOURCE_PROVENANCE_UNQUALIFIED", ...provenance.blockers];
+  if (config.command === "deploy" && !provenance.ok) {
     return Object.freeze({
       status: "blocked",
       blockers: Object.freeze([
-        "SOURCE_PROVENANCE_UNQUALIFIED",
+        ...provenanceBlockers,
         ...(!hostModeReady ? ["POSTGRES_TEST_HOST_CLOUD_RUN_MODE_UNAVAILABLE"] : []),
       ]),
     });
   }
 
   const initial = await readCloudRunState(config, spawn);
+  const deploying = config.command === "deploy";
   const assessment = assessCloudRunReadback({
     service: initial.service,
     policy: initial.policy,
     expectedImage: config.image,
     expectedSourceDigest: config.sourceDigest,
-    requireExactImage: config.command === "verify",
-    requireSourceDigest: config.command === "verify",
-    requireLatestReadyTraffic: config.command === "verify",
+    requireExactImage: !deploying,
+    requireSourceDigest: !deploying,
+    requireLatestReadyTraffic: true,
+    requireCloudRunHostMode: config.command === "verify",
   });
-  const origin = validateServiceUrl(initial.service?.status?.url ?? initial.service?.url);
+  const origin = validateServiceUrl(serviceUrl(initial.service));
   const unauthenticatedProbe = await runUnauthenticatedInvokerProbe({
     serviceUrl: origin,
     fetchImpl,
@@ -454,13 +1006,14 @@ export async function runGcpPrivateTestDeployment({
 
   if (config.command === "preflight") {
     const blockers = [
-      "SOURCE_PROVENANCE_UNQUALIFIED",
+      ...provenanceBlockers,
       ...assessment.blockers,
       ...(!hostModeReady ? ["POSTGRES_TEST_HOST_CLOUD_RUN_MODE_UNAVAILABLE"] : []),
+      ...(origin !== GCP_PRIVATE_TEST_TARGET.hostOrigin ? ["GCP_TEST_SERVICE_URL_UNEXPECTED"] : []),
       ...(!unauthenticatedProbe.ok ? ["GCP_TEST_UNAUTHENTICATED_PROBE_FAILED"] : []),
     ];
     return Object.freeze({
-      status: "blocked",
+      status: blockers.length === 0 ? "ready" : "blocked",
       blockers: Object.freeze([...new Set(blockers)]),
       readOnlyAssessment: true,
       unauthenticatedProbe: unauthenticatedProbe.result,
@@ -468,19 +1021,103 @@ export async function runGcpPrivateTestDeployment({
   }
 
   if (config.command === "verify") {
-    const blockers = ["SOURCE_PROVENANCE_UNQUALIFIED", ...assessment.blockers];
+    const blockers = [...provenanceBlockers, ...assessment.blockers];
     if (!hostModeReady) blockers.push("POSTGRES_TEST_HOST_CLOUD_RUN_MODE_UNAVAILABLE");
+    if (origin !== GCP_PRIVATE_TEST_TARGET.hostOrigin) blockers.push("GCP_TEST_SERVICE_URL_UNEXPECTED");
     if (!unauthenticatedProbe.ok) blockers.push("GCP_TEST_UNAUTHENTICATED_PROBE_FAILED");
     return Object.freeze({
-      status: "blocked",
+      status: blockers.length === 0 ? "verified" : "blocked",
       blockers: Object.freeze([...new Set(blockers)]),
       readOnlyAssessment: true,
       unauthenticatedProbe: unauthenticatedProbe.result,
+      sourceProvenance: provenance.ok ? Object.freeze({
+        buildId: config.buildId,
+        sourceGeneration: provenance.build.sourceGeneration,
+        sourceArchiveSha256: provenance.local.sourceArchiveSha256,
+        image: provenance.build.image,
+      }) : null,
     });
   }
+
+  const preDeployBlockers = [
+    ...assessment.blockers,
+    ...(!hostModeReady ? ["POSTGRES_TEST_HOST_CLOUD_RUN_MODE_UNAVAILABLE"] : []),
+    ...(origin !== GCP_PRIVATE_TEST_TARGET.hostOrigin ? ["GCP_TEST_SERVICE_URL_UNEXPECTED"] : []),
+    ...(!unauthenticatedProbe.ok ? ["GCP_TEST_UNAUTHENTICATED_PROBE_FAILED"] : []),
+  ];
+  if (preDeployBlockers.length > 0) {
+    return Object.freeze({
+      status: "blocked",
+      blockers: Object.freeze([...new Set(preDeployBlockers)]),
+      preDeployReadOnlyAssessment: true,
+      unauthenticatedProbe: unauthenticatedProbe.result,
+    });
+  }
+
+  const updateEnv = [
+    "HOST=0.0.0.0",
+    "HOST_ORIGIN=" + GCP_PRIVATE_TEST_TARGET.hostOrigin,
+    "POSTGRES_TEST_HTTP_MODE=cloud-run-iam",
+    ...Object.entries(GCP_PRIVATE_TEST_BACKING_ENVIRONMENT).map(([name, value]) => name + "=" + value),
+    "POSTGRES_IAM_USER=" + GCP_PRIVATE_TEST_TARGET.postgresIamUser,
+    "SOURCE_CONTENT_DIGEST=" + config.sourceDigest,
+  ].join(",");
+  spawnGcloud([
+    "run", "deploy", config.service,
+    "--project=" + config.project,
+    "--region=" + config.region,
+    "--image=" + config.image,
+    "--port=8080",
+    "--service-account=" + GCP_PRIVATE_TEST_TARGET.runtimeServiceAccount,
+    "--update-env-vars=" + updateEnv,
+    "--no-allow-unauthenticated",
+    "--quiet",
+  ], spawn);
+
+  // Cloud Run can retain a service-level traffic pin to an older revision.
+  // Move only this fixed test service to its latest revision before the
+  // post-deploy readback; do not let a ready-but-retired revision pass as live.
+  spawnGcloud([
+    "run", "services", "update-traffic", config.service,
+    "--to-latest",
+    "--project=" + config.project,
+    "--region=" + config.region,
+    "--quiet",
+  ], spawn);
+
+  const deployed = await readCloudRunState(config, spawn);
+  const deployedAssessment = assessCloudRunReadback({
+    service: deployed.service,
+    policy: deployed.policy,
+    expectedImage: config.image,
+    expectedSourceDigest: config.sourceDigest,
+    requireExactImage: true,
+    requireSourceDigest: true,
+    requireLatestReadyTraffic: true,
+    requireCloudRunHostMode: true,
+  });
+  const deployedUrl = validateServiceUrl(serviceUrl(deployed.service));
+  const deployedUnauthenticatedProbe = await runUnauthenticatedInvokerProbe({
+    serviceUrl: deployedUrl,
+    fetchImpl,
+  });
+  const deployedBlockers = [
+    ...deployedAssessment.blockers,
+    ...(deployedUrl !== GCP_PRIVATE_TEST_TARGET.hostOrigin ? ["GCP_TEST_SERVICE_URL_UNEXPECTED"] : []),
+    ...(!deployedUnauthenticatedProbe.ok ? ["GCP_TEST_UNAUTHENTICATED_PROBE_FAILED"] : []),
+  ];
   return Object.freeze({
-    status: "blocked",
-    blockers: Object.freeze(["GCP_PRIVATE_TEST_COMMAND_INVALID"]),
+    status: deployedBlockers.length === 0 ? "deployed" : "blocked",
+    blockers: Object.freeze([...new Set(deployedBlockers)]),
+    sourceProvenance: Object.freeze({
+      buildId: config.buildId,
+      sourceGeneration: provenance.build.sourceGeneration,
+      sourceArchiveSha256: provenance.local.sourceArchiveSha256,
+      image: provenance.build.image,
+    }),
+    postDeployAssessment: true,
+    unauthenticatedProbe: deployedUnauthenticatedProbe.result,
+    routeSmoke: "not_run_application_device_token_required",
   });
 }
 

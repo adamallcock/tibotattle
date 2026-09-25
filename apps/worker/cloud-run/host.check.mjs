@@ -20,6 +20,7 @@ import {
 import { createServer } from "vite";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import {
+  CLOUD_RUN_IAM_TEST_TARGET,
   createPostgresTestV12DayManifestDispatch,
   createPostgresTestHealthDispatch,
   dispatchCloudRunHostRequest,
@@ -236,6 +237,87 @@ test("partial PostgreSQL health dispatch is pinned to an explicit private loopba
   ]) assert.equal(isPrivatePostgresTestHost(value), false);
 });
 
+test("cloud-run-iam host predicate accepts only the named service tuple and pinned origin", () => {
+  const valid = {
+    mode: "cloud-run-iam",
+    project: CLOUD_RUN_IAM_TEST_TARGET.project,
+    region: CLOUD_RUN_IAM_TEST_TARGET.region,
+    service: CLOUD_RUN_IAM_TEST_TARGET.service,
+    listenHost: CLOUD_RUN_IAM_TEST_TARGET.listenHost,
+    hostOrigin: CLOUD_RUN_IAM_TEST_TARGET.origin,
+    port: CLOUD_RUN_IAM_TEST_TARGET.port,
+  };
+  assert.equal(isPrivatePostgresTestHost(valid), true);
+  for (const override of [
+    { mode: "health-only" },
+    { project: "other-project" },
+    { region: "us-west1" },
+    { service: "other-service" },
+    { listenHost: "127.0.0.1" },
+    { listenHost: "::1" },
+    { port: 8081 },
+    { hostOrigin: "https://tibotattle-test-app-806510610397.us-east1.run.app" },
+    { hostOrigin: "https://other-service-5t5mehqi7a-ue.a.run.app" },
+    { hostOrigin: "https://service.invalid" },
+  ]) {
+    assert.equal(isPrivatePostgresTestHost({ ...valid, ...override }), false);
+  }
+  assert.equal(isPrivatePostgresTestHost({
+    ...valid,
+    mode: undefined,
+  }), false);
+});
+
+test("Cloud Run test origin allowlist rejects alternate authorities and forwarded-header spoofing", async () => {
+  const allowlist = createRequestOriginAllowlist({
+    publicHostOrigin: CLOUD_RUN_IAM_TEST_TARGET.origin,
+  });
+  assert.equal(
+    requestOriginForHost("tibotattle-test-app-5t5mehqi7a-ue.a.run.app", allowlist).origin,
+    CLOUD_RUN_IAM_TEST_TARGET.origin,
+  );
+  for (const host of [
+    "other-service-5t5mehqi7a-ue.a.run.app",
+    "tibotattle-test-app-806510610397.us-east1.run.app",
+    "tibotattle-test-app-5t5mehqi7a-ue.a.run.app:443",
+    "tibotattle-test-app-5t5mehqi7a-ue.a.run.app.evil.example",
+  ]) assert.throws(() => requestOriginForHost(host, allowlist), /REQUEST_HOST_INVALID/);
+
+  const sanitized = sanitizeHeaders({
+    "x-forwarded-host": "tibotattle-test-app-5t5mehqi7a-ue.a.run.app",
+    "x-forwarded-proto": "https",
+    "x-serverless-authorization": "Bearer caller-controlled",
+  });
+  assert.equal(sanitized.has("x-forwarded-host"), false);
+  assert.equal(sanitized.has("x-forwarded-proto"), false);
+  assert.equal(sanitized.has("x-serverless-authorization"), false);
+
+  let connections = 0;
+  const pools = receiptPool({ onConnect: () => { connections += 1; } });
+  const dispatch = createPostgresTestHealthDispatch({
+    primaryPool: pools("primary"),
+    ledgerPool: pools("ledger"),
+    expectedMigrations: ONE_MIGRATION,
+    privateOrigin: CLOUD_RUN_IAM_TEST_TARGET.origin,
+  });
+  for (const request of [
+    new Request("https://other-service-5t5mehqi7a-ue.a.run.app/api/health"),
+    new Request("https://tibotattle-test-app-806510610397.us-east1.run.app/api/health"),
+    new Request(`${CLOUD_RUN_IAM_TEST_TARGET.origin}/api/not-implemented`),
+    new Request(`${CLOUD_RUN_IAM_TEST_TARGET.origin}/api/health`, { method: "POST" }),
+  ]) {
+    assert.equal((await dispatch(request)).status, 503);
+  }
+  assert.equal(connections, 0, "wrong origins and unimplemented direct requests cannot touch PostgreSQL");
+
+  assert.throws(() => createPostgresTestHealthDispatch({
+    primaryPool: pools("primary"),
+    ledgerPool: pools("ledger"),
+    expectedMigrations: ONE_MIGRATION,
+    privateOrigin: "https://other-service-5t5mehqi7a-ue.a.run.app",
+  }), /POSTGRES_TEST_PRIVATE_ORIGIN_INVALID/);
+});
+
 test("partial HTTP dispatch serves only current read-only health and never calls the Worker or D1", async () => {
   let connections = 0;
   let d1Touched = 0;
@@ -331,7 +413,7 @@ test("partial HTTP health fails closed when either database or receipt is unavai
   assert.equal((await missingResponse.json()).checks.primaryMigrationReceipt.status, "schema_missing");
 });
 
-test("default host startup remains blocked and health-test mode rejects a public bind", async () => {
+test("host startup keeps loopback modes and rejects missing or mismatched Cloud Run identity/config", async () => {
   const temporary = await mkdtemp(join(ROOT, ".tmp-postgres-health-host-"));
   try {
     const result = await build({
@@ -348,9 +430,10 @@ test("default host startup remains blocked and health-test mode rejects a public
     assert.ok(output instanceof Uint8Array);
     const bundlePath = join(temporary, "server.mjs");
     await writeFile(bundlePath, output);
+    const serverModule = await import(`${pathToFileURL(bundlePath).href}?test=${randomUUID()}`);
     const baseEnv = { ...process.env };
     for (const name of ["POSTGRES_TEST_HTTP_MODE", "HOST", "HOST_ORIGIN", "PUBLIC_ORIGIN",
-      "ADMIN_HOST_ORIGIN", "PORT", "PRIMARY_DATABASE", "LEDGER_DATABASE",
+      "ADMIN_HOST_ORIGIN", "PORT", "K_SERVICE", "PRIMARY_DATABASE", "LEDGER_DATABASE",
       "PRIMARY_INSTANCE_CONNECTION_NAME", "LEDGER_INSTANCE_CONNECTION_NAME", "POSTGRES_IAM_USER"]) {
       delete baseEnv[name];
     }
@@ -384,6 +467,144 @@ test("default host startup remains blocked and health-test mode rejects a public
         status: "error",
         code: "POSTGRES_TEST_PRIVATE_HOST_CONFIGURATION_INVALID",
       });
+    }
+
+    const cloudRunEnv = {
+      ...baseEnv,
+      POSTGRES_TEST_HTTP_MODE: "cloud-run-iam",
+      HOST: CLOUD_RUN_IAM_TEST_TARGET.listenHost,
+      PORT: String(CLOUD_RUN_IAM_TEST_TARGET.port),
+      HOST_ORIGIN: CLOUD_RUN_IAM_TEST_TARGET.origin,
+      K_SERVICE: CLOUD_RUN_IAM_TEST_TARGET.service,
+    };
+    for (const override of [
+      { K_SERVICE: undefined },
+      { HOST: "127.0.0.1" },
+      { HOST: "0.0.0.0", PORT: "8081" },
+      { K_SERVICE: "other-service" },
+      { HOST_ORIGIN: "https://service.invalid" },
+      { HOST_ORIGIN: "https://other-service-5t5mehqi7a-ue.a.run.app" },
+      { HOST_ORIGIN: "https://tibotattle-test-app-806510610397.us-east1.run.app" },
+      { PUBLIC_ORIGIN: "https://tibotattle.example" },
+      { ADMIN_HOST_ORIGIN: "https://admin.tibotattle.example" },
+    ]) {
+      const environment = { ...cloudRunEnv, ...override };
+      if (Object.hasOwn(override, "K_SERVICE") && override.K_SERVICE === undefined) {
+        delete environment.K_SERVICE;
+      }
+      const invalid = spawnSync(process.execPath, [bundlePath], {
+        cwd: ROOT,
+        env: environment,
+        encoding: "utf8",
+        timeout: 30_000,
+      });
+      assert.equal(invalid.status, 1);
+      assert.deepEqual(JSON.parse(invalid.stderr.trim()), {
+        status: "error",
+        code: "POSTGRES_TEST_CLOUD_RUN_IAM_CONFIGURATION_INVALID",
+      });
+    }
+
+    const configured = spawnSync(process.execPath, [bundlePath], {
+      cwd: ROOT,
+      env: cloudRunEnv,
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    assert.equal(configured.status, 1);
+    assert.deepEqual(JSON.parse(configured.stderr.trim()), {
+      status: "error",
+      code: "PRIMARY_DATABASE_MISSING",
+    }, "a fully qualified IAM host passes host checks before database startup");
+
+    const proof = (bucket) => JSON.stringify({
+      bucket,
+      bucketGeneration: "1",
+      bucketMetageneration: "1",
+      softDeleteRetentionDurationSeconds: "0",
+    });
+    const resourceEnv = {
+      POSTGRES_TEST_HTTP_MODE: "cloud-run-iam",
+      HOST: CLOUD_RUN_IAM_TEST_TARGET.listenHost,
+      PORT: String(CLOUD_RUN_IAM_TEST_TARGET.port),
+      HOST_ORIGIN: CLOUD_RUN_IAM_TEST_TARGET.origin,
+      K_SERVICE: CLOUD_RUN_IAM_TEST_TARGET.service,
+      PRIMARY_DATABASE: CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.database,
+      PRIMARY_SCHEMA: CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.schema,
+      PRIMARY_INSTANCE_CONNECTION_NAME:
+        CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.instanceConnectionName,
+      LEDGER_DATABASE: CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.database,
+      LEDGER_SCHEMA: CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.schema,
+      LEDGER_INSTANCE_CONNECTION_NAME:
+        CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.instanceConnectionName,
+      POSTGRES_IAM_USER: CLOUD_RUN_IAM_TEST_TARGET.postgres.iamUser,
+      GCS_BUCKET_NAME: CLOUD_RUN_IAM_TEST_TARGET.gcsBucket,
+      GCS_ERASURE_BUCKET_HISTORY_PROOF: proof(CLOUD_RUN_IAM_TEST_TARGET.gcsBucket),
+    };
+    const targetOverrides = [
+      [{ PRIMARY_INSTANCE_CONNECTION_NAME: "other-project:us-east1:other-primary" },
+        "POSTGRES_TEST_CLOUD_RUN_IAM_PRIMARY_TARGET_INVALID"],
+      [{ PRIMARY_DATABASE: "other_primary" },
+        "POSTGRES_TEST_CLOUD_RUN_IAM_PRIMARY_TARGET_INVALID"],
+      [{ PRIMARY_SCHEMA: "other_primary" },
+        "POSTGRES_TEST_CLOUD_RUN_IAM_PRIMARY_TARGET_INVALID"],
+      [{ LEDGER_INSTANCE_CONNECTION_NAME: "other-project:us-east1:other-ledger" },
+        "POSTGRES_TEST_CLOUD_RUN_IAM_LEDGER_TARGET_INVALID"],
+      [{ LEDGER_DATABASE: "other_ledger" },
+        "POSTGRES_TEST_CLOUD_RUN_IAM_LEDGER_TARGET_INVALID"],
+      [{ LEDGER_SCHEMA: "other_ledger" },
+        "POSTGRES_TEST_CLOUD_RUN_IAM_LEDGER_TARGET_INVALID"],
+      [{ POSTGRES_IAM_USER: "other-runtime@tibotattle.iam" },
+        "POSTGRES_TEST_CLOUD_RUN_IAM_USER_INVALID"],
+      [{ GCS_BUCKET_NAME: "another-test-bucket" },
+        "POSTGRES_TEST_CLOUD_RUN_IAM_BUCKET_INVALID"],
+      [{ GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("another-test-bucket") },
+        "POSTGRES_TEST_CLOUD_RUN_IAM_BUCKET_HISTORY_PROOF_INVALID"],
+    ];
+    const environmentNames = new Set([
+      ...Object.keys(resourceEnv),
+      "POSTGRES_TEST_HTTP_MODE", "HOST", "PORT", "HOST_ORIGIN", "K_SERVICE",
+      "PUBLIC_ORIGIN", "ADMIN_HOST_ORIGIN", "PRIMARY_DATABASE", "PRIMARY_SCHEMA",
+      "PRIMARY_INSTANCE_CONNECTION_NAME", "LEDGER_DATABASE", "LEDGER_SCHEMA",
+      "LEDGER_INSTANCE_CONNECTION_NAME", "POSTGRES_IAM_USER", "GCS_BUCKET_NAME",
+      "GCS_ERASURE_BUCKET_HISTORY_PROOF",
+    ]);
+    const originalEnvironment = new Map([...environmentNames].map((name) => [name, process.env[name]]));
+    try {
+      for (const [overrides, expectedCode] of targetOverrides) {
+        for (const name of environmentNames) delete process.env[name];
+        Object.assign(process.env, resourceEnv, overrides);
+        const constructionCalls = [];
+        await assert.rejects(
+          serverModule.createRuntime({
+            dependencies: {
+              createConnector() {
+                constructionCalls.push("connector");
+                return {};
+              },
+              createIamPool() {
+                constructionCalls.push("postgres-pool");
+                throw new Error("test pool must not be reached");
+              },
+              createGoogleAccessTokenProvider() {
+                constructionCalls.push("gcs-access-token");
+                return async () => "synthetic-token";
+              },
+              createGcsQuarantineObjectStore() {
+                constructionCalls.push("gcs-object-store");
+                throw new Error("test object store must not be reached");
+              },
+            },
+          }),
+          (error) => error?.code === expectedCode,
+        );
+        assert.deepEqual(constructionCalls, [], `${expectedCode} must fail before DB/GCS construction`);
+      }
+    } finally {
+      for (const [name, value] of originalEnvironment) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
     }
   } finally {
     await rm(temporary, { recursive: true, force: true });

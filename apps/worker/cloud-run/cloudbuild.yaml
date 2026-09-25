@@ -1,5 +1,5 @@
 steps:
-  - name: gcr.io/cloud-builders/docker
+  - name: gcr.io/cloud-builders/docker@sha256:bbb3d633c5c2813b2ce5245852979e1d637768f4acfc504d8ece288f91e9b60f
     args:
       - build
       - --file=apps/worker/cloud-run/Dockerfile
@@ -9,6 +9,8 @@ images:
   - ${_IMAGE}
 options:
   logging: CLOUD_LOGGING_ONLY
+  sourceProvenanceHash: [SHA256]
+  requestedVerifyOption: VERIFIED
 serviceAccount: projects/tibotattle/serviceAccounts/tibotattle-test-builder@tibotattle.iam.gserviceaccount.com
 substitutions:
   _IMAGE: us-east1-docker.pkg.dev/tibotattle/tibotattle-test/tibotattle-host:content-digest-required
