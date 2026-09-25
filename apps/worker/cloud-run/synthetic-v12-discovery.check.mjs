@@ -277,13 +277,14 @@ test("family refusal reports only a catalog table and bounded aggregate count", 
   fixture.pending.object_key = fixture.chunk.r2_key;
   await assert.rejects(readSyntheticV12PrimarySnapshot(fakePrimaryPool({
     fixtures: [fixture],
-    familyCountOverrides: { device_credentials: 2 },
+    familyCountOverrides: { device_credentials: 2, input_source_digests: 2 },
   }), "tibotattle", fakeManifest().roles.primary), (error) => {
     assert.equal(error?.code, "POSTGRES_SYNTHETIC_DISCOVERY_FAMILY_INVALID");
-    assert.deepEqual(error?.safeFamily, {
-      table: "device_credentials", actual: 2, expectedMinimum: 1, expectedMaximum: 1,
-    });
-    assert.doesNotMatch(JSON.stringify(error.safeFamily), /synthetic-v12-smoke-|telemetry\/v12-/u);
+    assert.deepEqual(error?.safeFamilies, [
+      { table: "device_credentials", actual: 2, expectedMinimum: 1, expectedMaximum: 1 },
+      { table: "input_source_digests", actual: 2, expectedMinimum: 0, expectedMaximum: 1 },
+    ]);
+    assert.doesNotMatch(JSON.stringify(error.safeFamilies), /synthetic-v12-smoke-|telemetry\/v12-/u);
     return true;
   });
 });

@@ -68,13 +68,18 @@ function fail(code) {
   throw Object.assign(new Error(code), { code });
 }
 
-function failFamilyCount(table, actual, bounds) {
+function failFamilyCounts(violations) {
   const code = "POSTGRES_SYNTHETIC_DISCOVERY_FAMILY_INVALID";
-  if (!SCHEMA_PATTERN.test(table) || !Number.isSafeInteger(actual) || actual < 0
-      || !Array.isArray(bounds) || bounds.length !== 2) fail(code);
+  if (!Array.isArray(violations) || violations.length < 1 || violations.length > 32
+      || violations.some(({ table, actual, expectedMinimum, expectedMaximum }) =>
+        typeof table !== "string" || !SCHEMA_PATTERN.test(table)
+        || !Number.isSafeInteger(actual) || actual < 0
+        || !Number.isSafeInteger(expectedMinimum) || !Number.isSafeInteger(expectedMaximum))) {
+    fail(code);
+  }
   throw Object.assign(new Error(code), {
     code,
-    safeFamily: Object.freeze({ table, actual, expectedMinimum: bounds[0], expectedMaximum: bounds[1] }),
+    safeFamilies: Object.freeze(violations.map((entry) => Object.freeze(entry))),
   });
 }
 
@@ -289,15 +294,18 @@ async function readParticipantFamily(client, schema, participantId) {
   ).join(" UNION ALL ");
   const rows = parseRows(await client.query(countsSql, [participantId]), "POSTGRES_SYNTHETIC_DISCOVERY_FAMILY_INVALID");
   if (rows.length !== names.length) fail("POSTGRES_SYNTHETIC_DISCOVERY_FAMILY_INVALID");
+  const violations = [];
   for (const row of rows) {
     const count = parseCount(row.row_count);
     const bounds = Object.hasOwn(ALLOWED_PARTICIPANT_TABLES, row.table_name)
       ? ALLOWED_PARTICIPANT_TABLES[row.table_name]
       : [0, 0];
     if (count < bounds[0] || count > bounds[1]) {
-      failFamilyCount(row.table_name, count, bounds);
+      violations.push({ table: row.table_name, actual: count,
+        expectedMinimum: bounds[0], expectedMaximum: bounds[1] });
     }
   }
+  if (violations.length > 0) failFamilyCounts(violations);
 }
 
 async function readOwnerReferences(client, schema, participant) {
@@ -584,7 +592,7 @@ async function main() {
       status: "error",
       code: safeCode(error),
       ...(error?.code === "POSTGRES_SYNTHETIC_DISCOVERY_FAMILY_INVALID"
-        && error?.safeFamily ? { safeFamily: error.safeFamily } : {}),
+        && error?.safeFamilies ? { safeFamilies: error.safeFamilies } : {}),
     }));
     process.exitCode = 1;
   }
