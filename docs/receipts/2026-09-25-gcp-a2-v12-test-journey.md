@@ -113,6 +113,9 @@ maintenance all remained explicitly incomplete. The bucket remained empty
 and the recurring test Scheduler remained `PAUSED` after this probe. This
 proves the supported phases run against the isolated test resources and the
 Job does not silently report full readiness.
+After the run, the Job's explicit maintenance gate was reset to `disabled`
+and read back; it cannot repeat the writer phase without another explicit
+configuration change.
 
 ## Validation and cutover boundary
 

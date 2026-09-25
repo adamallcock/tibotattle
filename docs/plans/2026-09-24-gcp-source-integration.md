@@ -29,7 +29,11 @@ and GCS path passed synthetic v1.2 admission, replay, domain activation,
 effective-record and exact-object read-back, then exact-owner discovery and
 one-owner erasure. The owner-erasure result was checked against primary and
 ledger state; a separate post-cleanup discovery found the owner absent, and
-the bucket has no live or versioned objects. The older
+the bucket has no live or versioned objects. A retry returned
+`already_complete`. A one-off maintenance probe completed its supported
+identity-expiry and object-reconciliation scans but deliberately reported
+unsupported lifecycle and analytics phases as incomplete; its run gate was
+disabled again after the probe. The older
 [migration 36 and hosted v1.2 receipt](../receipts/2026-09-25-gcp-test-graph36.md)
 remains a separate earlier test snapshot for different schemas and bucket.
 This A2 proof does not qualify public/admin ingress, scheduled work, general
