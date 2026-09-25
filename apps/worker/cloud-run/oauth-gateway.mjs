@@ -8,37 +8,44 @@ const ROUTES = new Map([
   ["/api/health", Object.freeze({
     id: "health", method: "GET", body: "none", maxBodyBytes: 0,
     responseTypes: ["application/json"], maxResponseBytes: 16 * 1_024,
-    sessionCookie: false, forwardAuthorization: false,
+    sessionCookie: false, forwardAuthorization: false, forwardCsrf: false,
   })],
   ["/api/v1/identity/google/start", Object.freeze({
     id: "google_start", method: "POST", body: "json", maxBodyBytes: 4_096,
     responseTypes: ["application/json"], maxResponseBytes: 16 * 1_024,
-    sessionCookie: false,
+    sessionCookie: false, forwardCsrf: false,
   })],
   ["/api/v1/identity/google/callback", Object.freeze({
     id: "google_callback", method: "GET", body: "none", maxBodyBytes: 0,
     responseTypes: ["text/html", "application/json"], maxResponseBytes: 32 * 1_024,
-    sessionCookie: false,
+    sessionCookie: false, forwardCsrf: false,
   })],
   ["/api/v1/identity/google/result", Object.freeze({
     id: "google_result", method: "POST", body: "json", maxBodyBytes: 8_192,
     responseTypes: ["application/json"], maxResponseBytes: 8 * 1_024,
-    sessionCookie: false,
+    sessionCookie: false, forwardCsrf: false,
   })],
   ["/api/v1/enroll", Object.freeze({
     id: "enroll", method: "POST", body: "json", maxBodyBytes: 16_384,
     responseTypes: ["application/json"], maxResponseBytes: 32 * 1_024,
-    sessionCookie: false,
+    sessionCookie: false, forwardCsrf: false,
   })],
   ["/api/v1/session", Object.freeze({
     id: "session", method: "GET", body: "none", maxBodyBytes: 0,
     responseTypes: ["application/json"], maxResponseBytes: 8 * 1_024,
-    sessionCookie: true, forwardAuthorization: false,
+    sessionCookie: true, forwardAuthorization: false, forwardCsrf: false,
   })],
   ["/api/v1/logout", Object.freeze({
     id: "logout", method: "POST", body: "none", maxBodyBytes: 0,
     responseTypes: ["application/json"], maxResponseBytes: 8 * 1_024,
-    sessionCookie: true, forwardAuthorization: false,
+    sessionCookie: true, forwardAuthorization: false, forwardCsrf: true,
+    originContract: "backend",
+  })],
+  ["/api/v1/me/device-pairings", Object.freeze({
+    id: "device_pairing", method: "POST", body: "json", maxBodyBytes: 4_096,
+    responseTypes: ["application/json"], maxResponseBytes: 8 * 1_024,
+    sessionCookie: true, forwardAuthorization: false, forwardCsrf: true,
+    originContract: "backend",
   })],
 ]);
 const MAX_URL_LENGTH = 8_192;
@@ -178,11 +185,11 @@ function upstreamHeaders(request, publicOrigin, backendOrigin, route, url) {
   if (route.body === "json") result.set("content-type", "application/json");
   if (route.method === "POST") {
     // The gateway has already verified the browser-facing Origin. The private
-    // host's logout dispatcher validates Origin against its private Request
-    // URL, so only this exact route receives the backend origin on the trusted
-    // service-to-service hop. OAuth and enrollment retain the public origin
-    // required by their callback configuration.
-    result.set("origin", route.id === "logout" ? backendOrigin : publicOrigin);
+    // Private session dispatchers validate Origin against their private
+    // Request URL. These exact routes receive the backend origin on the
+    // trusted service-to-service hop only after the browser Origin was checked.
+    // OAuth and enrollment retain the public origin for their host rebasing.
+    result.set("origin", route.originContract === "backend" ? backendOrigin : publicOrigin);
   }
   if (route.id === "google_callback" && url.search !== "") {
     // Keep OAuth code/state out of the private backend request URL, which is
@@ -210,7 +217,7 @@ function upstreamHeaders(request, publicOrigin, backendOrigin, route, url) {
     result.set("cookie", cookie);
   }
   const csrf = request.headers["x-usage-monitor-csrf"];
-  if (csrf !== undefined) {
+  if (route.forwardCsrf && csrf !== undefined) {
     if (typeof csrf !== "string" || csrf.length > MAX_REQUEST_CSRF_LENGTH || /[\r\n]/u.test(csrf)) {
       const error = new Error("CSRF_INVALID");
       error.status = 400;

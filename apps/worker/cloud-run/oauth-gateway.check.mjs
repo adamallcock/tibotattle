@@ -137,7 +137,7 @@ test("Google start forwards only the allowlisted request and separates serverles
   assert.equal(backendCall.options.headers.get("authorization"), "Bearer application-session-token");
   assert.equal(backendCall.options.headers.get("x-serverless-authorization"), `Bearer ${TOKEN}`);
   assert.equal(backendCall.options.headers.has("cookie"), false);
-  assert.equal(backendCall.options.headers.get("x-usage-monitor-csrf"), "csrf-test-token");
+  assert.equal(backendCall.options.headers.has("x-usage-monitor-csrf"), false);
   for (const header of [
     "x-forwarded-host", "x-forwarded-proto", "forwarded", "cf-connecting-ip",
     "cf-access-jwt-assertion",
@@ -153,7 +153,7 @@ test("Google start forwards only the allowlisted request and separates serverles
   });
 });
 
-test("the companion health and session journey forwards only host-supported exact routes", async () => {
+test("the companion health, enrollment, session, and pairing journey uses exact supported routes", async () => {
   const routes = [
     { path: "/api/health", method: "GET", body: null, contentType: "application/json" },
     { path: "/api/v1/identity/google/start", method: "POST", body: "{}", contentType: "application/json" },
@@ -162,6 +162,11 @@ test("the companion health and session journey forwards only host-supported exac
     { path: "/api/v1/enroll", method: "POST", body: "{}", contentType: "application/json" },
     { path: "/api/v1/session", method: "GET", body: null, contentType: "application/json" },
     { path: "/api/v1/logout", method: "POST", body: null, contentType: "application/json" },
+    {
+      path: "/api/v1/me/device-pairings", method: "POST",
+      body: JSON.stringify({ consentVersion: "ongoing-privacy-safe-telemetry-v1.0", ongoingUpload: true }),
+      contentType: "application/json", status: 201,
+    },
   ];
   const { fetchImpl: metadata } = metadataFetch();
   const backendCalls = [];
@@ -172,7 +177,10 @@ test("the companion health and session journey forwards only host-supported exac
       backendCalls.push({ url: new URL(input), options });
       return new Response(
         options.headers.get("accept") === "text/html" ? "<html>complete</html>" : "{}",
-        { status: 200, headers: { "content-type": `${options.headers.get("accept")}; charset=utf-8` } },
+        {
+          status: new URL(input).pathname === "/api/v1/me/device-pairings" ? 201 : 200,
+          headers: { "content-type": `${options.headers.get("accept")}; charset=utf-8` },
+        },
       );
     },
     logger: () => {},
@@ -183,9 +191,14 @@ test("the companion health and session journey forwards only host-supported exac
       method: route.method,
       url: route.path,
       body: route.body,
-      headers: { cookie: "__Host-usage_monitor_session=opaque" },
+      headers: {
+        cookie: "__Host-usage_monitor_session=opaque",
+        authorization: "Bearer caller-forgery",
+        "x-usage-monitor-csrf": "csrf-test-token",
+      },
     });
-    assert.equal(result.status, 200, `${route.path}: ${result.body.toString("utf8").slice(0, 200)}`);
+    assert.equal(result.status, route.status ?? 200,
+      `${route.path}: ${result.body.toString("utf8").slice(0, 200)}`);
   }
   assert.equal(backendCalls.length, routes.length);
   for (let index = 0; index < routes.length; index += 1) {
@@ -195,18 +208,30 @@ test("the companion health and session journey forwards only host-supported exac
     assert.equal(url.pathname, new URL(route.path, PUBLIC_ORIGIN).pathname);
     assert.equal(url.search, "");
     assert.equal(options.headers.get("accept"), route.contentType);
+    const sessionRoute = route.path === "/api/v1/session"
+      || route.path === "/api/v1/logout" || route.path === "/api/v1/me/device-pairings";
     assert.equal(options.headers.get("cookie"),
-      route.path === "/api/v1/session" || route.path === "/api/v1/logout"
+      sessionRoute
         ? "__Host-usage_monitor_session=opaque" : null);
+    assert.equal(options.headers.has("authorization"), !sessionRoute && route.path !== "/api/health");
     assert.equal(options.headers.get("x-serverless-authorization"), `Bearer ${TOKEN}`);
-    if (route.method === "POST" && route.path.endsWith("/logout")) {
+    if (route.method === "POST" && (route.path.endsWith("/logout")
+        || route.path === "/api/v1/me/device-pairings")) {
       assert.equal(options.headers.get("origin"), BACKEND_ORIGIN);
-      assert.equal(options.headers.has("content-type"), false);
-      assert.equal(options.body, undefined);
+      assert.equal(options.headers.get("x-usage-monitor-csrf"), "csrf-test-token");
+      if (route.path.endsWith("/logout")) {
+        assert.equal(options.headers.has("content-type"), false);
+        assert.equal(options.body, undefined);
+      } else {
+        assert.equal(options.headers.get("content-type"), "application/json");
+        assert.equal(options.body.toString("utf8"), route.body);
+        assert.ok(Buffer.byteLength(options.body) <= 4_096);
+      }
     } else if (route.method === "POST") {
       assert.equal(options.headers.get("origin"), PUBLIC_ORIGIN);
       assert.equal(options.headers.get("content-type"), "application/json");
       assert.ok(Buffer.byteLength(options.body) <= 16_384);
+      assert.equal(options.headers.has("x-usage-monitor-csrf"), false);
     } else {
       assert.equal(options.headers.has("origin"), false);
       assert.equal(options.headers.has("content-type"), false);
@@ -274,6 +299,7 @@ test("wrong methods, extra paths, and query parameters on POST routes never reac
     ["/api/health", "GET"],
     ["/api/v1/session", "GET"],
     ["/api/v1/logout", "POST"],
+    ["/api/v1/me/device-pairings", "POST"],
   ]) {
     const wrong = await invoke(handler, {
       method: method === "GET" ? "POST" : "GET",
@@ -285,7 +311,6 @@ test("wrong methods, extra paths, and query parameters on POST routes never reac
   }
   assert.equal(callbackMethod.headers.allow, "GET");
   for (const url of [
-    "/api/v1/me/device-pairings",
     "/api/v1/me/device-telemetry-consents",
     "/api/v1/admin/action",
     "/api/v1/enroll?unexpected=1",
@@ -357,6 +382,12 @@ test("request and response bodies, unsupported content, and upstream redirects s
     body: "{}",
   });
   assert.equal(tooLargeDeclared.status, 413);
+  const tooLargePairing = await invoke(handler, {
+    url: "/api/v1/me/device-pairings",
+    headers: { "content-length": "4097" },
+    body: "{}",
+  });
+  assert.equal(tooLargePairing.status, 413);
   const wrongContentType = await invoke(handler, {
     headers: { "content-type": "text/plain" }, body: "{}",
   });
@@ -376,7 +407,8 @@ test("route-specific response bounds and media types fail closed", async () => {
     configuration: configuration(),
     fetchImpl: async (input, options) => {
       if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
-      if (new URL(input).pathname === "/api/v1/session") {
+      if (new URL(input).pathname === "/api/v1/session"
+          || new URL(input).pathname === "/api/v1/me/device-pairings") {
         return new Response("x".repeat(8 * 1_024 + 1), {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -391,6 +423,17 @@ test("route-specific response bounds and media types fail closed", async () => {
   });
   assert.equal(oversizedSession.status, 502);
   assert.equal(oversizedSession.json().error.code, "UPSTREAM_UNAVAILABLE");
+  const oversizedPairing = await invoke(handler, {
+    method: "POST",
+    url: "/api/v1/me/device-pairings",
+    body: JSON.stringify({ consentVersion: "ongoing-privacy-safe-telemetry-v1.0", ongoingUpload: true }),
+    headers: {
+      cookie: "__Host-usage_monitor_session=opaque",
+      "x-usage-monitor-csrf": "csrf-test-token",
+    },
+  });
+  assert.equal(oversizedPairing.status, 502);
+  assert.equal(oversizedPairing.json().error.code, "UPSTREAM_UNAVAILABLE");
   const wrongMediaType = await invoke(handler, { url: "/api/v1/enroll", body: "{}" });
   assert.equal(wrongMediaType.status, 502);
   assert.equal(wrongMediaType.json().error.code, "UPSTREAM_UNAVAILABLE");
@@ -422,6 +465,12 @@ test("bodyless logout rejects an unexpected body and GET routes reject foreign O
     headers: { origin: "https://attacker.example" },
   });
   assert.equal(foreignSessionOrigin.status, 403);
+  const foreignPairingOrigin = await invoke(handler, {
+    url: "/api/v1/me/device-pairings",
+    body: JSON.stringify({ consentVersion: "ongoing-privacy-safe-telemetry-v1.0", ongoingUpload: true }),
+    headers: { origin: "https://attacker.example" },
+  });
+  assert.equal(foreignPairingOrigin.status, 403);
   assert.equal(backendCount, 0);
 });
 
