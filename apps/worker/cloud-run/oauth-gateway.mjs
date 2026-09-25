@@ -14,6 +14,7 @@ const STATIC_ASSET_CONTENT_TYPES = new Set([
   "image/jpeg",
   "image/png",
   "image/svg+xml",
+  "video/mp4",
 ]);
 const STATIC_ASSET_SECURITY_HEADERS = Object.freeze({
   "content-security-policy": "default-src 'self'; connect-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",

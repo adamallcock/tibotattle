@@ -495,6 +495,7 @@ test("the gateway serves only bounded reviewed GET/HEAD assets and keeps API/adm
   t.after(() => rm(root, { recursive: true, force: true }));
   await writeFile(join(root, "index.html"), "<html>synthetic public UI</html>", "utf8");
   await writeFile(join(root, "app.js"), "export const value = 1;", "utf8");
+  await writeFile(join(root, "feature-allowance.mp4"), "synthetic MP4 bytes", "utf8");
   await writeFile(join(root, "admin.html"), "private admin shell", "utf8");
   await writeFile(join(root, "app.js.map"), "private source map", "utf8");
   await writeFile(join(root, "contract.json"), "{}", "utf8");
@@ -527,6 +528,12 @@ test("the gateway serves only bounded reviewed GET/HEAD assets and keeps API/adm
   assert.equal(head.headers["content-type"], "text/javascript; charset=utf-8");
   assert.equal(head.headers["content-length"], String(Buffer.byteLength("export const value = 1;")));
   assert.equal(head.body.byteLength, 0);
+  const video = await invoke(handler, {
+    method: "GET", url: "/feature-allowance.mp4", body: null,
+  });
+  assert.equal(video.status, 200);
+  assert.equal(video.headers["content-type"], "video/mp4");
+  assert.equal(video.body.toString("utf8"), "synthetic MP4 bytes");
 
   for (const path of [
     "/admin.html",
