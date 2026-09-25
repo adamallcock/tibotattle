@@ -178,6 +178,19 @@ async function prepareOwner(participantId: string): Promise<{
   return { ownerDigest, ownerRevision, authorityEpoch };
 }
 
+/** An accepted v1.2 head journals an owner change (isolation 0011), so a
+ * reader's CAS pin must be the owner's current revision, not the seeded one. */
+async function currentPin(ownerDigest: string): Promise<{
+  ownerDigest: string;
+  ownerRevision: number;
+  authorityEpoch: number;
+}> {
+  const row = await db().prepare(
+    "SELECT revision, authority_epoch FROM storage_owner_revisions WHERE owner_digest=?",
+  ).bind(ownerDigest).first<{ revision: number; authority_epoch: number }>();
+  return { ownerDigest, ownerRevision: row!.revision, authorityEpoch: row!.authority_epoch };
+}
+
 describe("typed v1.2 effective reader", () => {
   it("reads disjoint and overlapping observations from both retained device generations", async () => {
     await db().prepare("UPDATE telemetry_v12_runtime SET state='active',changed_at=? WHERE id=1")
@@ -263,7 +276,7 @@ describe("typed v1.2 effective reader", () => {
         participantId: fixture.participantId, stream, occurrenceIds: [occurrenceId]});
       expect(byOccurrence.records).toEqual(page.records);
       const effective = await readEffectiveTelemetryOwnerDayPage(db(), {
-        sourceNamespace: "synthetic-v12-reader-source", ...owner, day, stream, limit: 10,
+        sourceNamespace: "synthetic-v12-reader-source", ...await currentPin(owner.ownerDigest), day, stream, limit: 10,
       });
       expect(effective.rows).toHaveLength(1);
       expect(effective.rows[0]).toMatchObject({status: "compatible", sourceCount: 1,
@@ -318,9 +331,7 @@ describe("typed v1.2 effective reader", () => {
 
     const options = {
       sourceNamespace: "synthetic-v12-reader-source",
-      ownerDigest: owner.ownerDigest,
-      ownerRevision: owner.ownerRevision,
-      authorityEpoch: owner.authorityEpoch,
+      ...await currentPin(owner.ownerDigest),
       day,
       limit: 2,
     } as const;
@@ -374,7 +385,7 @@ describe("typed v1.2 effective reader", () => {
     expect(expanded.records.some((row) => row.sourceRecordJson.includes('"boundaryFlags":1'))).toBe(true);
 
     const effective = await readEffectiveUsageOwnerDayPage(db(), {
-      sourceNamespace: "synthetic-v12-reader-source", ...owner, day, limit: 200,
+      sourceNamespace: "synthetic-v12-reader-source", ...await currentPin(owner.ownerDigest), day, limit: 200,
     });
     expect(effective.rows).toHaveLength(200);
     expect(effective.rows.find((row) => row.occurrenceId === eventIds[7])).toMatchObject({
