@@ -119,6 +119,13 @@ function table(schema: string, name: string): string {
   return `${schema}.${quotePostgresIdentifier(name)}`;
 }
 
+function randomAttributionNamespace(): string {
+  const randomBytes = crypto.getRandomValues(new Uint8Array(32));
+  let namespace = "";
+  for (const byte of randomBytes) namespace += byte.toString(16).padStart(2, "0");
+  return namespace;
+}
+
 function validNow(nowEpoch: number): void {
   if (!Number.isSafeInteger(nowEpoch) || nowEpoch < 0
       || !Number.isFinite(new Date(nowEpoch).getTime())) {
@@ -590,6 +597,20 @@ export async function createPostgresAccountlessUploadOwner(
          RETURNING id`,
         [participantId, now],
       );
+      const attribution = await client.query(
+        `INSERT INTO ${table(schema, "attribution_enrollments")} (
+           participant_id, namespace, created_at
+         ) VALUES ($1, $2, CURRENT_TIMESTAMP)
+         RETURNING participant_id`,
+        [participantId, randomAttributionNamespace()],
+      );
+      const participantFloor = await client.query(
+        `INSERT INTO ${table(schema, "telemetry_transport_participant_floors")} (
+           participant_id, minimum_rank, revision, changed_at
+         ) VALUES ($1, 11, 0, CURRENT_TIMESTAMP)
+         RETURNING participant_id`,
+        [participantId],
+      );
       const device = await client.query(
         `INSERT INTO ${table(schema, "device_credentials")} (
            id, participant_id, authority_kind, paired_via_pairing_id,
@@ -621,7 +642,8 @@ export async function createPostgresAccountlessUploadOwner(
         [ledger.device_id, participantId, TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
           consent.fieldDictionaryVersion, consent.privacyContractVersion, now, ledger.expires_at],
       );
-      if (participant.rowCount !== 1 || device.rowCount !== 1
+      if (participant.rowCount !== 1 || attribution.rowCount !== 1
+          || participantFloor.rowCount !== 1 || device.rowCount !== 1
           || owner.rowCount !== 1 || v11.rowCount !== 1) {
         throw unavailable();
       }

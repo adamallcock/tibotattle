@@ -3429,27 +3429,36 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     assert.equal(accountlessOwner.rows[0].telemetry_schema_version, "telemetry-contribution-v1.1");
     assert.equal(accountlessOwner.rows[0].v11_state, "active");
     const accountlessParticipantId = accountlessOwner.rows[0].participant_id;
-    await primaryPool.query(
-      `INSERT INTO ${primaryTable("telemetry_transport_participant_floors")} (
-         participant_id, minimum_rank, revision, changed_at
-       ) VALUES ($1, 11, 0, $2)`,
-      [accountlessParticipantId, nowIso],
-    );
-    // PostgreSQL participant creation does not yet mirror D1's automatic
-    // attribution-enrollment trigger; seed the exact synthetic row required
-    // by the read contract so this assertion isolates capability semantics.
-    await primaryPool.query(
-      `INSERT INTO ${primaryTable("attribution_enrollments")} (
-         participant_id, namespace, created_at
-       ) VALUES ($1, $2, $3)`,
-      [accountlessParticipantId,
-        sha256Hex(`synthetic-accountless-enrollment:${suffix}`), nowIso],
-    );
     const accountlessNamespace = await primaryPool.query(
       `SELECT namespace FROM ${primaryTable("attribution_enrollments")} WHERE participant_id=$1`,
       [accountlessParticipantId],
     );
     assert.equal(accountlessNamespace.rowCount, 1);
+    assert.match(accountlessNamespace.rows[0].namespace, /^[0-9a-f]{64}$/u);
+    const accountlessFloor = await primaryPool.query(
+      `SELECT minimum_rank, revision
+         FROM ${primaryTable("telemetry_transport_participant_floors")}
+        WHERE participant_id=$1`,
+      [accountlessParticipantId],
+    );
+    assert.deepEqual(accountlessFloor.rows, [{ minimum_rank: 11, revision: 0 }],
+      "PostgreSQL accountless participants receive D1's v1.1 transport-floor default");
+    const replayedOwner = await dispatch(ownershipHttp(JSON.stringify(ownershipBody)));
+    assert.equal(replayedOwner.status, 200);
+    assert.equal((await replayedOwner.json()).state, "existing");
+    const replayState = await primaryPool.query(
+      `SELECT enrollment.namespace, floor.minimum_rank, floor.revision
+         FROM ${primaryTable("attribution_enrollments")} enrollment
+         JOIN ${primaryTable("telemetry_transport_participant_floors")} floor
+           ON floor.participant_id = enrollment.participant_id
+        WHERE enrollment.participant_id=$1`,
+      [accountlessParticipantId],
+    );
+    assert.deepEqual(replayState.rows, [{
+      namespace: accountlessNamespace.rows[0].namespace,
+      minimum_rank: 11,
+      revision: 0,
+    }], "owner replay preserves its single namespace and participant floor");
     await assert.rejects(
       transport.authenticatePostgresDevice(primaryPool, accountlessAuth, { schema: schemaOptions }),
       (error) => error?.code === "DEVICE_AUTH_INVALID",
