@@ -8,6 +8,7 @@ import { test } from "node:test";
 import pg from "pg";
 import {
   POSTGRES_TYPED_LEGACY_CONTROL_SCHEMA_PREFIX,
+  POSTGRES_TYPED_LEGACY_STAGING_FAMILY_EVIDENCE_TABLE,
   POSTGRES_TYPED_LEGACY_TARGET_SCHEMA_PREFIX,
   POSTGRES_TYPED_LEGACY_TRANSFER_TABLES,
   PostgresTypedLegacyTransferError,
@@ -15,6 +16,7 @@ import {
   createSealedSqliteTypedLegacyRehearsalSource,
   createSyntheticD1TypedLegacyFixtureSource,
   runPostgresTypedLegacyTransfer,
+  typedLegacyStagingFamilyEvidenceSha256,
 } from "./postgres-typed-legacy-transfer.mjs";
 import { applyPostgresMigrations } from "./postgres-migrations.mjs";
 
@@ -184,7 +186,7 @@ function syntheticRows() {
   return { rows, linkedParticipant, linklessParticipant, ownerDigest };
 }
 
-async function sealedSqliteFixture() {
+async function sealedSqliteFixture({ duplicateV11AdmissionState = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "tibotattle-sealed-legacy-"));
   const path = join(await realpath(directory), "source.sqlite");
   const fixture = syntheticRows();
@@ -218,6 +220,12 @@ async function sealedSqliteFixture() {
       .run("synthetic-v1-source");
     db.prepare("INSERT INTO typed_v11_admission_state VALUES (1,100,?)")
       .run("synthetic-v11-shared-source");
+    if (duplicateV11AdmissionState) {
+      // The sealed source contract requires the D1 singleton key to be unique.
+      // A duplicate id=1 must not silently multiply joined membership rows.
+      db.prepare("INSERT INTO typed_v11_admission_state VALUES (1,100,?)")
+        .run("synthetic-v11-ambiguous-source");
+    }
     const participant = db.prepare("INSERT INTO participants VALUES (?,'active')");
     participant.run(fixture.linkedParticipant);
     participant.run(fixture.linklessParticipant);
@@ -589,6 +597,49 @@ test("PG17 imports a hash-sealed SQLite export rehearsal and refuses a changed a
     assert.equal(receipt.source.manifestSha256, receipt.destination.manifestSha256);
     assert.equal(receipt.authority.preservedLinklessMemberships, 1);
     assert.equal(receipt.capabilities.productionCutoverAuthorized, false);
+    const evidenceTable = `${quoted(controlSchema)}.${quoted(POSTGRES_TYPED_LEGACY_STAGING_FAMILY_EVIDENCE_TABLE)}`;
+    const evidenceRows = await pool.query(`SELECT transfer_id,target_schema,source_snapshot_id,
+        source_artifact_sha256,source_manifest_sha256,target_manifest_sha256,source_format::int AS source_format,
+        source_namespace,source_row_count::text,membership_row_count::text,membership_table_sha256,
+        records_table_sha256,family_evidence_sha256
+      FROM ${evidenceTable} WHERE transfer_id=$1 ORDER BY source_format,source_namespace`, [transfer.transferId]);
+    assert.equal(receipt.stagingFamilyEvidence.rowCount, 2);
+    assert.equal(evidenceRows.rows.length, 2);
+    assert.deepEqual(evidenceRows.rows.map(row => [row.source_format,row.source_namespace,
+      row.source_row_count,row.membership_row_count]), [
+      [10, "synthetic-v1-source", "6", "1"],
+      [11, "synthetic-v11-shared-source", "2", "2"],
+    ]);
+    for (const row of evidenceRows.rows) {
+      assert.equal(row.transfer_id, transfer.transferId);
+      assert.equal(row.target_schema, targetSchema);
+      assert.equal(row.source_snapshot_id, receipt.source.snapshotId);
+      assert.equal(row.source_artifact_sha256, sealed.sha256);
+      assert.equal(row.source_manifest_sha256, receipt.source.manifestSha256);
+      assert.equal(row.target_manifest_sha256, receipt.destination.manifestSha256);
+      assert.equal(row.membership_table_sha256, receipt.source.tables.typed_telemetry_owner_memberships.sha256);
+      assert.equal(row.records_table_sha256, receipt.source.tables.typed_telemetry_records.sha256);
+      assert.equal(row.family_evidence_sha256, typedLegacyStagingFamilyEvidenceSha256({
+        sourceSnapshotId: row.source_snapshot_id,
+        sourceArtifactSha256: row.source_artifact_sha256,
+        sourceManifestSha256: row.source_manifest_sha256,
+        targetManifestSha256: row.target_manifest_sha256,
+        sourceFormat: row.source_format,
+        sourceNamespace: row.source_namespace,
+        sourceRowCount: row.source_row_count,
+        membershipRowCount: row.membership_row_count,
+        membershipTableSha256: row.membership_table_sha256,
+        recordsTableSha256: row.records_table_sha256,
+      }));
+    }
+    assert.equal(receipt.stagingFamilyEvidence.sha256,
+      createHash("sha256").update(JSON.stringify(evidenceRows.rows.map(row => row.family_evidence_sha256))).digest("hex"));
+    await assert.rejects(pool.query(`UPDATE ${evidenceTable} SET source_row_count=source_row_count
+      WHERE transfer_id=$1`, [transfer.transferId]), /typed_legacy_staging_family_evidence_immutable/u);
+    const repeated = await runPostgresTypedLegacyTransfer(transfer);
+    assert.deepEqual(repeated.stagingFamilyEvidence, receipt.stagingFamilyEvidence);
+    assert.equal((await pool.query(`SELECT count(*)::int AS count FROM ${evidenceTable} WHERE transfer_id=$1`,
+      [transfer.transferId])).rows[0]?.count, 2);
     await chmod(sealed.path, 0o600);
     const mutable = new DatabaseSync(sealed.path);
     try {
@@ -601,6 +652,61 @@ test("PG17 imports a hash-sealed SQLite export rehearsal and refuses a changed a
     await assert.rejects(runPostgresTypedLegacyTransfer(transfer),
       error => error instanceof PostgresTypedLegacyTransferError
         && error.code === "TYPED_LEGACY_SNAPSHOT_CHANGED");
+  } finally {
+    source?.close();
+    if (controlCreated) await pool.query(`DROP SCHEMA ${quoted(controlSchema)} CASCADE`);
+    if (targetCreated) await pool.query(`DROP SCHEMA ${quoted(targetSchema)} CASCADE`);
+    await pool.end();
+    await rm(sealed.directory, { recursive: true, force: true });
+  }
+});
+
+test("PG17 typed legacy transfer rejects an ambiguous admission singleton before staging", {
+  skip: !PG_TEST_SOCKET,
+}, async () => {
+  const endpoint = await localSocket();
+  const pool = new pg.Pool({
+    ...endpoint,
+    user: PG_TEST_USER,
+    password: process.env.PG_TEST_PASSWORD ?? "synthetic-local-only",
+    database: PG_TEST_DATABASE,
+    ssl: false,
+    max: 4,
+    connectionTimeoutMillis: 5_000,
+  });
+  const suffix = randomBytes(5).toString("hex");
+  const targetSchema = `${POSTGRES_TYPED_LEGACY_TARGET_SCHEMA_PREFIX}${suffix}`;
+  const controlSchema = `${POSTGRES_TYPED_LEGACY_CONTROL_SCHEMA_PREFIX}${suffix}`;
+  const sealed = await sealedSqliteFixture({ duplicateV11AdmissionState: true });
+  let source;
+  let targetCreated = false;
+  let controlCreated = false;
+  try {
+    await pool.query(`CREATE SCHEMA ${quoted(targetSchema)}`);
+    targetCreated = true;
+    await pool.query(`CREATE SCHEMA ${quoted(controlSchema)}`);
+    controlCreated = true;
+    const migrated = await applyPostgresMigrations({ role: "primary", schema: targetSchema, pool });
+    assert.ok(migrated.applied >= 30);
+    source = await createSealedSqliteTypedLegacyRehearsalSource({
+      path: sealed.path, expectedSha256: sealed.sha256,
+    });
+    const now = new Date().toISOString();
+    await pool.query(`INSERT INTO ${quoted(targetSchema)}.participants(id,created_at) VALUES
+      ($1,$3),($2,$3)`, [sealed.fixture.linkedParticipant, sealed.fixture.linklessParticipant, now]);
+    await pool.query(`INSERT INTO ${quoted(targetSchema)}.storage_v11_owner_links(participant_id,owner_digest,state)
+      VALUES ($1,$2,'active')`, [sealed.fixture.linkedParticipant, sealed.fixture.ownerDigest]);
+    const transfer = {
+      source, destinationPool: pool, targetSchema, controlSchema,
+      transferId: "sealed-sqlite-ambiguous-admission-refusal", pageSize: 2,
+    };
+    await assert.rejects(runPostgresTypedLegacyTransfer(transfer), error =>
+      error instanceof PostgresTypedLegacyTransferError
+        && error.code === "TYPED_LEGACY_SOURCE_ORDER_INVALID");
+    const controlState = await pool.query("SELECT to_regclass($1) AS name", [
+      `${controlSchema}._typed_legacy_transfer_rehearsal_runs_v1`,
+    ]);
+    assert.equal(controlState.rows[0]?.name, null);
   } finally {
     source?.close();
     if (controlCreated) await pool.query(`DROP SCHEMA ${quoted(controlSchema)} CASCADE`);

@@ -503,7 +503,21 @@ test("PG17 stages exact sealed headers with a replay-safe control receipt before
         }
         return pool.query(sql, values);
       },
-      connect() { return pool.connect(); },
+      async connect() {
+        const client = await pool.connect();
+        return {
+          async query(...args) {
+            const [sql, values] = args;
+            if (interruptReceipt && typeof sql === "string"
+                && sql.startsWith("INSERT INTO ") && sql.includes("_legacy_admission_header_receipts_v1")) {
+              interruptReceipt = false;
+              throw new Error("synthetic_header_stage_interruption");
+            }
+            return client.query(...args);
+          },
+          release(...args) { return client.release(...args); },
+        };
+      },
     };
     const transfer = {
       source, destinationPool: interruptedPool, targetSchema, controlSchema,
@@ -518,8 +532,10 @@ test("PG17 stages exact sealed headers with a replay-safe control receipt before
     assert.equal((await pool.query("SELECT count(*)::int AS n FROM " + v11ChunkStage)).rows[0]?.n, 1);
     assert.equal((await pool.query("SELECT count(*)::int AS n FROM " + target + ".typed_v1_admission_state")).rows[0]?.n, 0,
       "the interruption is before any admission-table write");
-    assert.equal((await pool.query("SELECT count(*)::int AS n FROM " + quote(controlSchema) +
-      "._legacy_admission_header_receipts_v1")).rows[0]?.n, 0);
+    assert.equal((await pool.query("SELECT to_regclass($1) AS name", [
+      `${controlSchema}._legacy_admission_header_receipts_v1`,
+    ])).rows[0]?.name, null,
+    "the interrupted receipt transaction rolls back its table and receipt atomically");
 
     const completed = await runPostgresLegacyAdmissionTransfer({ ...transfer, destinationPool: pool });
     assert.equal(completed.status, "staged_admission_lineage_transfer_complete");

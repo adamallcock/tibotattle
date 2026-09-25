@@ -9,13 +9,17 @@ export const POSTGRES_TYPED_LEGACY_CONTROL_SCHEMA_PREFIX = "typed_legacy_transfe
 export const POSTGRES_TYPED_LEGACY_TARGET_SCHEMA_PREFIX = "typed_legacy_transfer_rehearsal_target_";
 export const POSTGRES_TYPED_LEGACY_DEFAULT_PAGE_SIZE = 200;
 export const POSTGRES_TYPED_LEGACY_MAX_PAGE_SIZE = 500;
+export const POSTGRES_TYPED_LEGACY_STAGING_FAMILY_EVIDENCE_SCHEMA = "typed-legacy-staging-family-evidence-v1";
+export const POSTGRES_TYPED_LEGACY_STAGING_FAMILY_EVIDENCE_TABLE = "_typed_legacy_transfer_rehearsal_family_evidence_v1";
+export const POSTGRES_TYPED_LEGACY_TRANSFER_RUN_TABLE = "_typed_legacy_transfer_rehearsal_runs_v1";
+export const POSTGRES_TYPED_LEGACY_TRANSFER_CHECKPOINT_TABLE = "_typed_legacy_transfer_rehearsal_checkpoints_v1";
 
 const IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
 const TRANSFER_ID = /^[A-Za-z0-9._-]{1,128}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const MIGRATION_VERSION = 30;
-const CONTROL_RUN_TABLE = "_typed_legacy_transfer_rehearsal_runs_v1";
-const CONTROL_CHECKPOINT_TABLE = "_typed_legacy_transfer_rehearsal_checkpoints_v1";
+const CONTROL_RUN_TABLE = POSTGRES_TYPED_LEGACY_TRANSFER_RUN_TABLE;
+const CONTROL_CHECKPOINT_TABLE = POSTGRES_TYPED_LEGACY_TRANSFER_CHECKPOINT_TABLE;
 const encoder = new TextEncoder();
 
 /**
@@ -264,6 +268,51 @@ function sha256() {
   return createHash("sha256");
 }
 
+/**
+ * Content-free digest for the explicit staging-only bridge consumed by the
+ * legacy admission importer. The complete sealed base manifest binds every
+ * imported row; the format/namespace counts identify the exact family slice.
+ * This is not an effective-reader source-family receipt.
+ */
+export function typedLegacyStagingFamilyEvidenceSha256({
+  sourceSnapshotId,
+  sourceArtifactSha256,
+  sourceManifestSha256,
+  targetManifestSha256,
+  sourceFormat,
+  sourceNamespace,
+  sourceRowCount,
+  membershipRowCount,
+  membershipTableSha256,
+  recordsTableSha256,
+} = {}) {
+  if (typeof sourceSnapshotId !== "string" || sourceSnapshotId.length < 8
+      || !SHA256.test(sourceArtifactSha256 ?? "")
+      || !SHA256.test(sourceManifestSha256 ?? "")
+      || !SHA256.test(targetManifestSha256 ?? "")
+      || (sourceFormat !== 10 && sourceFormat !== 11)
+      || typeof sourceNamespace !== "string" || sourceNamespace.length < 1 || sourceNamespace.length > 256
+      || !/^(0|[1-9][0-9]*)$/u.test(sourceRowCount ?? "")
+      || !/^(0|[1-9][0-9]*)$/u.test(membershipRowCount ?? "")
+      || !SHA256.test(membershipTableSha256 ?? "")
+      || !SHA256.test(recordsTableSha256 ?? "")) {
+    fail("TYPED_LEGACY_STAGING_EVIDENCE_INVALID");
+  }
+  return sha256().update(JSON.stringify([
+    POSTGRES_TYPED_LEGACY_STAGING_FAMILY_EVIDENCE_SCHEMA,
+    sourceSnapshotId,
+    sourceArtifactSha256,
+    sourceManifestSha256,
+    targetManifestSha256,
+    sourceFormat,
+    sourceNamespace,
+    sourceRowCount,
+    membershipRowCount,
+    membershipTableSha256,
+    recordsTableSha256,
+  ])).digest("hex");
+}
+
 function manifestDigest(manifest) {
   const rows = TABLES.map(spec => ({
     table: spec.name,
@@ -395,6 +444,174 @@ async function ensureCheckpointTables(pool, schema) {
   } finally {
     client.release();
   }
+}
+
+async function ensureFamilyEvidenceTable(pool, controlSchema) {
+  const control = quoteIdentifier(controlSchema);
+  const relation = `${control}."${POSTGRES_TYPED_LEGACY_STAGING_FAMILY_EVIDENCE_TABLE}"`;
+  const triggerName = "_typed_legacy_transfer_rehearsal_family_evidence_guard";
+  const functionName = `${control}."${triggerName}_fn"`;
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS ${relation} (
+      transfer_id text NOT NULL REFERENCES ${control}."${CONTROL_RUN_TABLE}"(transfer_id),
+      target_schema text NOT NULL,
+      source_snapshot_id text NOT NULL,
+      source_artifact_sha256 text NOT NULL CHECK(source_artifact_sha256 ~ '^[0-9a-f]{64}$'),
+      source_manifest_sha256 text NOT NULL CHECK(source_manifest_sha256 ~ '^[0-9a-f]{64}$'),
+      target_manifest_sha256 text NOT NULL CHECK(target_manifest_sha256 ~ '^[0-9a-f]{64}$'),
+      source_format smallint NOT NULL CHECK(source_format IN (10,11)),
+      source_namespace text NOT NULL CHECK(length(source_namespace) BETWEEN 1 AND 256),
+      source_row_count bigint NOT NULL CHECK(source_row_count >= 0),
+      membership_row_count bigint NOT NULL CHECK(membership_row_count >= 1),
+      membership_table_sha256 text NOT NULL CHECK(membership_table_sha256 ~ '^[0-9a-f]{64}$'),
+      records_table_sha256 text NOT NULL CHECK(records_table_sha256 ~ '^[0-9a-f]{64}$'),
+      family_evidence_sha256 text NOT NULL CHECK(family_evidence_sha256 ~ '^[0-9a-f]{64}$'),
+      PRIMARY KEY(transfer_id,source_format,source_namespace)
+    )`);
+    await pool.query(`CREATE OR REPLACE FUNCTION ${functionName}() RETURNS trigger
+      LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+      BEGIN RAISE EXCEPTION 'typed_legacy_staging_family_evidence_immutable' USING ERRCODE='P1005'; END; $$`);
+    await pool.query(`DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid='${controlSchema}.${POSTGRES_TYPED_LEGACY_STAGING_FAMILY_EVIDENCE_TABLE}'::regclass
+        AND tgname='${triggerName}') THEN
+        CREATE TRIGGER ${triggerName} BEFORE UPDATE OR DELETE ON ${relation}
+          FOR EACH ROW EXECUTE FUNCTION ${functionName}();
+      END IF;
+    END $$`);
+  } catch {
+    fail("TYPED_LEGACY_STAGING_EVIDENCE_TABLE_INVALID");
+  }
+}
+
+async function collectStagingFamilyEvidence({ source, destinationClient, targetSchema, controlSchema,
+  transferId, snapshot, sourceManifest, targetManifest, pageSize } = {}) {
+  if (snapshot?.kind !== "sealed-sqlite-rehearsal" || !SHA256.test(snapshot.artifactSha256 ?? "")) {
+    fail("TYPED_LEGACY_STAGING_SEALED_SOURCE_REQUIRED");
+  }
+  const membershipSpec = TABLE_BY_NAME.get("typed_telemetry_owner_memberships");
+  // The D1 contract has one admission singleton per source format, so every
+  // typed membership for a format must carry that format's one source
+  // namespace. Retain at most those two keys; never materialize the owner
+  // membership set or records in application memory.
+  const namespaces = new Map();
+  let after = null;
+  for (;;) {
+    const rows = await readSourcePage(source, membershipSpec, after, pageSize);
+    for (const row of rows) {
+      if ((row.source_format !== 10 && row.source_format !== 11)
+          || typeof row.source_namespace !== "string" || row.source_namespace.length < 1) {
+        fail("TYPED_LEGACY_STAGING_FAMILY_MEMBERSHIP_INVALID");
+      }
+      const previous = namespaces.get(row.source_format);
+      if (previous !== undefined && previous !== row.source_namespace) {
+        fail("TYPED_LEGACY_STAGING_FAMILY_MEMBERSHIP_INVALID");
+      }
+      namespaces.set(row.source_format, row.source_namespace);
+    }
+    if (rows.length < pageSize) break;
+    after = keyValues(membershipSpec, rows.at(-1));
+  }
+  if (namespaces.size !== 2 || !namespaces.has(10) || !namespaces.has(11)) {
+    fail("TYPED_LEGACY_STAGING_FAMILY_MEMBERSHIP_INVALID");
+  }
+  await assertSnapshot(source, snapshot);
+
+  const membershipTableSha256 = sourceManifest.tables.typed_telemetry_owner_memberships?.sha256;
+  const recordsTableSha256 = sourceManifest.tables.typed_telemetry_records?.sha256;
+  const familyRows = [];
+  let membershipTotal = 0n;
+  let recordTotal = 0n;
+  for (const sourceFormat of [10, 11]) {
+    const sourceNamespace = namespaces.get(sourceFormat);
+    const actual = await destinationClient.query(`SELECT
+      count(DISTINCT (membership.namespace_id,membership.source_format,membership.owner_id))::text AS membership_row_count,
+      count(record.id)::text AS source_row_count
+    FROM ${quoteIdentifier(targetSchema)}."typed_telemetry_owner_memberships" membership
+    LEFT JOIN ${quoteIdentifier(targetSchema)}."typed_telemetry_records" record
+      ON record.namespace_id=membership.namespace_id AND record.format=membership.source_format
+       AND record.owner_id=membership.owner_id
+    WHERE membership.source_format=$1 AND membership.source_namespace=$2`, [sourceFormat, sourceNamespace]);
+    const row = actual.rows[0];
+    const membershipRowCount = BigInt(row?.membership_row_count ?? "0");
+    const sourceRowCount = BigInt(row?.source_row_count ?? "0");
+    if (membershipRowCount < 1n) {
+      fail("TYPED_LEGACY_STAGING_FAMILY_PARITY_FAILED");
+    }
+    const evidence = {
+      transferId,
+      targetSchema,
+      sourceSnapshotId: snapshot.snapshotId,
+      sourceArtifactSha256: snapshot.artifactSha256,
+      sourceManifestSha256: sourceManifest.sha256,
+      targetManifestSha256: targetManifest.sha256,
+      sourceFormat,
+      sourceNamespace,
+      sourceRowCount: sourceRowCount.toString(),
+      membershipRowCount: membershipRowCount.toString(),
+      membershipTableSha256,
+      recordsTableSha256,
+    };
+    evidence.familyEvidenceSha256 = typedLegacyStagingFamilyEvidenceSha256(evidence);
+    familyRows.push(Object.freeze(evidence));
+    membershipTotal += membershipRowCount;
+    recordTotal += sourceRowCount;
+  }
+  if (membershipTotal !== BigInt(sourceManifest.tables.typed_telemetry_owner_memberships.rows)
+      || recordTotal !== BigInt(sourceManifest.tables.typed_telemetry_records.rows)) {
+    fail("TYPED_LEGACY_STAGING_FAMILY_PARITY_FAILED");
+  }
+  const unexpected = await destinationClient.query(`SELECT count(*)::text AS count
+    FROM ${quoteIdentifier(targetSchema)}."typed_telemetry_owner_memberships"
+    WHERE NOT ((source_format=10 AND source_namespace=$1) OR (source_format=11 AND source_namespace=$2))`,
+  [namespaces.get(10), namespaces.get(11)]);
+  if (unexpected.rows[0]?.count !== "0") fail("TYPED_LEGACY_STAGING_FAMILY_PARITY_FAILED");
+
+  const relation = `${quoteIdentifier(controlSchema)}."${POSTGRES_TYPED_LEGACY_STAGING_FAMILY_EVIDENCE_TABLE}"`;
+  for (const evidence of familyRows) {
+    const inserted = await destinationClient.query(`INSERT INTO ${relation}(
+        transfer_id,target_schema,source_snapshot_id,source_artifact_sha256,source_manifest_sha256,
+        target_manifest_sha256,source_format,source_namespace,source_row_count,membership_row_count,
+        membership_table_sha256,records_table_sha256,family_evidence_sha256
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      ON CONFLICT(transfer_id,source_format,source_namespace) DO NOTHING`, [
+      evidence.transferId, evidence.targetSchema, evidence.sourceSnapshotId, evidence.sourceArtifactSha256,
+      evidence.sourceManifestSha256, evidence.targetManifestSha256, evidence.sourceFormat, evidence.sourceNamespace,
+      evidence.sourceRowCount, evidence.membershipRowCount, evidence.membershipTableSha256,
+      evidence.recordsTableSha256, evidence.familyEvidenceSha256,
+    ]);
+    if (inserted.rowCount === 0) {
+      const current = await destinationClient.query(`SELECT target_schema,source_snapshot_id,source_artifact_sha256,
+          source_manifest_sha256,target_manifest_sha256,source_row_count::text AS source_row_count,
+          membership_row_count::text AS membership_row_count,membership_table_sha256,records_table_sha256,
+          family_evidence_sha256 FROM ${relation}
+        WHERE transfer_id=$1 AND source_format=$2 AND source_namespace=$3`,
+      [evidence.transferId, evidence.sourceFormat, evidence.sourceNamespace]);
+      const row = current.rows[0];
+      if (!row || row.target_schema !== evidence.targetSchema
+          || row.source_snapshot_id !== evidence.sourceSnapshotId
+          || row.source_artifact_sha256 !== evidence.sourceArtifactSha256
+          || row.source_manifest_sha256 !== evidence.sourceManifestSha256
+          || row.target_manifest_sha256 !== evidence.targetManifestSha256
+          || row.source_row_count !== evidence.sourceRowCount
+          || row.membership_row_count !== evidence.membershipRowCount
+          || row.membership_table_sha256 !== evidence.membershipTableSha256
+          || row.records_table_sha256 !== evidence.recordsTableSha256
+          || row.family_evidence_sha256 !== evidence.familyEvidenceSha256) {
+        fail("TYPED_LEGACY_STAGING_FAMILY_EVIDENCE_MISMATCH");
+      }
+    }
+  }
+  const persisted = await destinationClient.query(`SELECT source_format::integer AS source_format,
+      source_namespace,family_evidence_sha256 FROM ${relation}
+    WHERE transfer_id=$1 ORDER BY source_format,source_namespace`, [transferId]);
+  if (persisted.rows.length !== familyRows.length
+      || persisted.rows.some((row, index) => Number(row.source_format) !== familyRows[index].sourceFormat
+        || row.source_namespace !== familyRows[index].sourceNamespace
+        || row.family_evidence_sha256 !== familyRows[index].familyEvidenceSha256)) {
+    fail("TYPED_LEGACY_STAGING_FAMILY_EVIDENCE_MISMATCH");
+  }
+  return Object.freeze({ rowCount: familyRows.length,
+    sha256: sha256().update(JSON.stringify(familyRows.map(row => row.familyEvidenceSha256))).digest("hex") });
 }
 
 async function preflightMembershipAuthority({ source, destinationPool, targetSchema, pageSize }) {
@@ -803,33 +1020,58 @@ export async function runPostgresTypedLegacyTransfer({
     if (finalSourceManifest.sha256 !== sourceManifest.sha256) fail("TYPED_LEGACY_SOURCE_CHANGED");
     await assertSnapshot(source, snapshot);
     await updateDictionarySequence(destinationPool, targetSchema);
+    if (snapshot.kind === "sealed-sqlite-rehearsal") {
+      await ensureFamilyEvidenceTable(destinationPool, controlSchema);
+    }
 
-    const targetTables = Object.create(null);
-    for (const spec of TABLES) {
-      targetTables[spec.name] = spec.comparisonScope === "source-keys"
-        ? await scanDictionaryTarget({ source, destinationPool, targetSchema, spec, pageSize: size })
-        : await scanPostgresTable(destinationPool, targetSchema, spec, size);
-    }
-    const targetManifestBase = Object.freeze({
-      schema: POSTGRES_TYPED_LEGACY_TRANSFER_SCHEMA,
-      tables: Object.freeze(targetTables),
-    });
-    const targetManifest = Object.freeze({ ...targetManifestBase, sha256: manifestDigest(targetManifestBase) });
-    for (const spec of TABLES) {
-      const expected = sourceManifest.tables[spec.name];
-      const actual = targetManifest.tables[spec.name];
-      if (expected.rows !== actual.rows || expected.sha256 !== actual.sha256) {
-        fail("TYPED_LEGACY_SOURCE_DESTINATION_PARITY_FAILED");
+    // Keep the final manifest and staging evidence over one stable target
+    // snapshot. SHARE locks reject concurrent staging inserts/deletes while
+    // the bounded keyset scans and family aggregates run; migration triggers
+    // already make source-row updates immutable.
+    const auditClient = await destinationPool.connect();
+    let targetManifest;
+    let stagingFamilyEvidence;
+    try {
+      await auditClient.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+      const relations = TABLES.map(spec => `${quoteIdentifier(targetSchema)}."${spec.name}"`).join(", ");
+      await auditClient.query(`LOCK TABLE ${relations} IN SHARE MODE`);
+      const targetTables = Object.create(null);
+      for (const spec of TABLES) {
+        targetTables[spec.name] = spec.comparisonScope === "source-keys"
+          ? await scanDictionaryTarget({ source, destinationPool: auditClient, targetSchema, spec, pageSize: size })
+          : await scanPostgresTable(auditClient, targetSchema, spec, size);
       }
+      const targetManifestBase = Object.freeze({
+        schema: POSTGRES_TYPED_LEGACY_TRANSFER_SCHEMA,
+        tables: Object.freeze(targetTables),
+      });
+      targetManifest = Object.freeze({ ...targetManifestBase, sha256: manifestDigest(targetManifestBase) });
+      for (const spec of TABLES) {
+        const expected = sourceManifest.tables[spec.name];
+        const actual = targetManifest.tables[spec.name];
+        if (expected.rows !== actual.rows || expected.sha256 !== actual.sha256) {
+          fail("TYPED_LEGACY_SOURCE_DESTINATION_PARITY_FAILED");
+        }
+      }
+      await assertSnapshot(source, snapshot);
+      await auditClient.query(
+        `UPDATE ${quoteRelation(controlSchema, CONTROL_RUN_TABLE)}
+            SET status='complete', target_manifest_sha256=$2,
+                updated_at=clock_timestamp(), completed_at=COALESCE(completed_at,clock_timestamp())
+          WHERE transfer_id=$1 AND source_manifest_sha256=$3`,
+        [transferId, targetManifest.sha256, sourceManifest.sha256],
+      );
+      stagingFamilyEvidence = snapshot.kind === "sealed-sqlite-rehearsal"
+        ? await collectStagingFamilyEvidence({ source, destinationClient: auditClient, targetSchema,
+          controlSchema, transferId, snapshot, sourceManifest, targetManifest, pageSize: size })
+        : Object.freeze({ rowCount: 0, sha256: null });
+      await auditClient.query("COMMIT");
+    } catch (error) {
+      await auditClient.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      auditClient.release();
     }
-    await assertSnapshot(source, snapshot);
-    await destinationPool.query(
-      `UPDATE ${quoteRelation(controlSchema, CONTROL_RUN_TABLE)}
-          SET status='complete', target_manifest_sha256=$2,
-              updated_at=clock_timestamp(), completed_at=COALESCE(completed_at,clock_timestamp())
-        WHERE transfer_id=$1 AND source_manifest_sha256=$3`,
-      [transferId, targetManifest.sha256, sourceManifest.sha256],
-    );
     return Object.freeze({
     schema: POSTGRES_TYPED_LEGACY_TRANSFER_SCHEMA,
     status: "staged_rehearsal_complete",
@@ -868,6 +1110,7 @@ export async function runPostgresTypedLegacyTransfer({
       erasureAuthorized: false,
       productionCutoverAuthorized: false,
       }),
+      stagingFamilyEvidence,
     });
   } finally {
     await releaseTransferLock(runLock, transferId);
@@ -1173,3 +1416,9 @@ export function createD1TypedLegacyPageSource({ database } = {}) {
 }
 
 export const POSTGRES_TYPED_LEGACY_TRANSFER_TABLES = Object.freeze(TABLES.map(spec => spec.name));
+export const POSTGRES_TYPED_LEGACY_TRANSFER_LAYOUT = Object.freeze(TABLES.map(spec => Object.freeze({
+  name: spec.name,
+  columns: spec.columns,
+  primaryKey: spec.primaryKey,
+  types: spec.types,
+})));
