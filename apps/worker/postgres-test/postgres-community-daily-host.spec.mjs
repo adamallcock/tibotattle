@@ -153,7 +153,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL private community daily HTTP route"
   }
 
   it("read-only publisher preflight blocks disabled controls and an undelivered journal tail", async () => {
-    const config = { schema, sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE };
+    const config = { schema, sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: DAY };
     const ready = await readPostgresCommunityDailyTestPreflight(pool, config);
     expect(ready).toMatchObject({ status: "ready", blockers: [] });
 
