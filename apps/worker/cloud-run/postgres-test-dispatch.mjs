@@ -11,6 +11,8 @@ const V12_CHUNK_UPLOAD_PATH = "/api/v1/contributions";
 const COMMUNITY_DAILY_PATH = "/api/v1/community/daily";
 const PARTICIPANT_DEVICES_PATH = "/api/v1/me/devices";
 const PARTICIPANT_DEVICE_REVOKE_PATH = "/api/v1/me/devices/revoke";
+const PERSONAL_SESSION_PATH = "/api/v1/session";
+const PERSONAL_LOGOUT_PATH = "/api/v1/logout";
 const COMMUNITY_DAILY_MAX_RANGE_DAYS = 366;
 export const CLOUD_RUN_IAM_TEST_TARGET = Object.freeze({
   project: "tibotattle",
@@ -547,6 +549,132 @@ export function createPostgresTestParticipantDevicesDispatch({
       if (typeof revoked !== "boolean") throw storageUnavailable();
       if (!revoked) throw personalDevicesRequestError(404, "DEVICE_NOT_FOUND");
       return json(200, { revoked: true, deviceId }, { vary: "Cookie" });
+    } catch (error) {
+      if (Number.isSafeInteger(error?.status)
+          && typeof error?.code === "string" && /^[A-Z0-9_]+$/u.test(error.code)) {
+        return routeError(error, requestId);
+      }
+      // Never expose PostgreSQL driver errors or database object details.
+      return routeError(storageUnavailable(), requestId);
+    }
+  };
+}
+
+/** Private Cloud Run test routes for Worker-compatible social session read and logout. */
+export function createPostgresTestPersonalSessionDispatch({
+  primaryPool,
+  ledgerPool,
+  schemaOptions,
+  authenticatePostgresPersonalSession,
+  assertPostgresPersonalSessionCsrf,
+  revokePostgresPersonalSession,
+  hasPostgresDeletionTombstone,
+  healthDispatch,
+  clearSessionCookie,
+  privateOrigin,
+}) {
+  if (primaryPool === null || typeof primaryPool !== "object"
+      || typeof primaryPool.connect !== "function"
+      || ledgerPool === null || typeof ledgerPool !== "object"
+      || typeof ledgerPool.connect !== "function"
+      || primaryPool === ledgerPool
+      || typeof authenticatePostgresPersonalSession !== "function"
+      || typeof assertPostgresPersonalSessionCsrf !== "function"
+      || typeof revokePostgresPersonalSession !== "function"
+      || typeof hasPostgresDeletionTombstone !== "function"
+      || typeof healthDispatch !== "function"
+      || typeof clearSessionCookie !== "string"
+      || clearSessionCookie.length === 0) {
+    configurationError("POSTGRES_TEST_PERSONAL_SESSION_DISPATCH_CONFIGURATION_INVALID");
+  }
+  const schemas = validatedSchemas(schemaOptions);
+  if (!isAllowedPostgresTestOrigin(privateOrigin)) {
+    configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
+  }
+
+  return async function dispatchPostgresTestPersonalSession(request) {
+    let url;
+    try { url = new URL(request.url); } catch {
+      return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
+    }
+    const isSessionRead = url.pathname === PERSONAL_SESSION_PATH;
+    const isLogout = url.pathname === PERSONAL_LOGOUT_PATH;
+    if (url.origin !== privateOrigin || (!isSessionRead && !isLogout)) {
+      return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
+    }
+    const requestId = crypto.randomUUID();
+    const requiredMethod = isSessionRead ? "GET" : "POST";
+    if (request.method !== requiredMethod) {
+      return routeError(personalDevicesRequestError(405, "METHOD_NOT_ALLOWED", {
+        allow: requiredMethod,
+      }), requestId);
+    }
+
+    try {
+      const health = await healthDispatch(new Request(`${privateOrigin}/api/health`));
+      if (health?.status !== 200) throw storageUnavailable();
+
+      const authenticate = async () => {
+        if (request.headers.has("authorization")) {
+          throw personalDevicesRequestError(401, "AUTH_INVALID");
+        }
+        const principal = await authenticatePostgresPersonalSession(
+          primaryPool,
+          request.headers.get("cookie"),
+          { schema: { primarySchema: schemas.primary } },
+        );
+        if (principal === null || typeof principal !== "object"
+            || typeof principal.participantId !== "string" || principal.participantId.length === 0
+            || typeof principal.sessionId !== "string" || principal.sessionId.length === 0
+            || typeof principal.participantCreatedAt !== "string"
+            || typeof principal.expiresAt !== "string"
+            || (principal.consentVersion !== null && typeof principal.consentVersion !== "string")
+            || typeof principal.csrfToken !== "string" || principal.csrfToken.length === 0) {
+          throw storageUnavailable();
+        }
+        if (await hasPostgresDeletionTombstone(
+          ledgerPool,
+          principal.participantId,
+          Date.now(),
+          { schema: { ledgerSchema: schemas.ledger } },
+        )) {
+          throw personalDevicesRequestError(401, "AUTH_INVALID");
+        }
+        return principal;
+      };
+
+      if (isSessionRead) {
+        const principal = await authenticate();
+        return json(200, {
+          participantId: principal.participantId,
+          createdAt: principal.participantCreatedAt,
+          expiresAt: principal.expiresAt,
+          csrfToken: principal.csrfToken,
+          consentVersion: principal.consentVersion,
+        }, { vary: "Cookie" });
+      }
+
+      let principal;
+      try {
+        principal = await authenticate();
+      } catch (error) {
+        if (error?.status !== 401) throw error;
+        return json(200, { loggedOut: true }, {
+          "set-cookie": clearSessionCookie,
+          vary: "Cookie",
+        });
+      }
+      assertPostgresPersonalSessionCsrf(request, principal.csrfToken);
+      await revokePostgresPersonalSession(
+        primaryPool,
+        principal.participantId,
+        principal.sessionId,
+        { schema: { primarySchema: schemas.primary } },
+      );
+      return json(200, { loggedOut: true }, {
+        "set-cookie": clearSessionCookie,
+        vary: "Cookie",
+      });
     } catch (error) {
       if (Number.isSafeInteger(error?.status)
           && typeof error?.code === "string" && /^[A-Z0-9_]+$/u.test(error.code)) {

@@ -16,12 +16,14 @@ const UTC_MILLISECOND_INSTANT = 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"';
 const MAX_PARTICIPANT_DEVICES = 100;
 
 interface PersonalSessionRow {
+  readonly session_id: string;
   readonly participant_id: string;
   readonly secret_hash: Uint8Array;
   readonly csrf_hash: Uint8Array;
   readonly session_scope: "personal" | "deletion_only";
   readonly session_state: "active" | "revoked";
   readonly expires_at: string;
+  readonly participant_created_at: string;
   readonly participant_state: "active" | "deleting";
   // Worker personal-session authentication returns this field, but device
   // listing does not require fresh consent. Keep it selected for parity while
@@ -75,7 +77,14 @@ export async function authenticatePostgresPersonalSession(
   pool: PostgresPool,
   cookieHeader: string | null,
   options: { readonly schema?: PostgresSchemaOptions; readonly nowEpoch?: number } = {},
-): Promise<{ readonly participantId: string; readonly csrfToken: string }> {
+): Promise<{
+  readonly participantId: string;
+  readonly participantCreatedAt: string;
+  readonly consentVersion: string | null;
+  readonly sessionId: string;
+  readonly expiresAt: string;
+  readonly csrfToken: string;
+}> {
   const parsed = parseSessionCookie(cookieHeader);
   const schemas = createPostgresSchemaConfig(options.schema);
   const primary = quotePostgresIdentifier(schemas.primarySchema);
@@ -83,12 +92,14 @@ export async function authenticatePostgresPersonalSession(
   if (!Number.isFinite(nowEpoch)) throw new ApiError(401, "AUTH_INVALID");
 
   const result = await withPostgresRead(pool, async (client) => client.query<PersonalSessionRow>(
-    `SELECT session.participant_id,
+    `SELECT session.id AS session_id,
+            session.participant_id,
             session.secret_hash,
             session.csrf_hash,
             session.scope AS session_scope,
             session.state AS session_state,
             to_char(session.expires_at AT TIME ZONE 'UTC', '${UTC_MILLISECOND_INSTANT}') AS expires_at,
+            to_char(participant.created_at AT TIME ZONE 'UTC', '${UTC_MILLISECOND_INSTANT}') AS participant_created_at,
             participant.state AS participant_state,
             participant.consent_version
        FROM ${primary}."web_sessions" session
@@ -121,7 +132,19 @@ export async function authenticatePostgresPersonalSession(
   if (typeof row.participant_id !== "string" || row.participant_id.length === 0) {
     throw new ApiError(401, "AUTH_INVALID");
   }
-  return Object.freeze({ participantId: row.participant_id, csrfToken });
+  if (typeof row.session_id !== "string"
+      || typeof row.participant_created_at !== "string"
+      || (row.consent_version !== null && typeof row.consent_version !== "string")) {
+    throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  }
+  return Object.freeze({
+    participantId: row.participant_id,
+    participantCreatedAt: row.participant_created_at,
+    consentVersion: row.consent_version,
+    sessionId: row.session_id,
+    expiresAt: row.expires_at,
+    csrfToken,
+  });
 }
 
 /** Apply the Worker session-bound same-origin and CSRF checks to a private-host mutation. */

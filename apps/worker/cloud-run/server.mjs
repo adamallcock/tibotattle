@@ -13,6 +13,11 @@ import {
   revokePostgresParticipantDevice,
 } from "../src/postgres-personal-devices.ts";
 import {
+  authenticatePostgresPersonalSessionForRead,
+  revokePostgresPersonalSession,
+} from "../src/postgres-personal-session.ts";
+import { clearedSessionCookie } from "../src/session.ts";
+import {
   handleRequest,
   isPostgresWorkerRequestPathSupported,
 } from "../src/index.ts";
@@ -100,6 +105,7 @@ import {
   CLOUD_RUN_IAM_TEST_TARGET,
   createPostgresTestCommunityDailyDispatch,
   createPostgresTestParticipantDevicesDispatch,
+  createPostgresTestPersonalSessionDispatch,
   createPostgresTestV12DayManifestDispatch,
   createPostgresTestHealthDispatch,
   dispatchCloudRunHostRequest,
@@ -521,6 +527,18 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         healthDispatch,
         privateOrigin: hostOrigin,
       });
+      const personalSessionDispatch = createPostgresTestPersonalSessionDispatch({
+        primaryPool,
+        ledgerPool,
+        schemaOptions,
+        authenticatePostgresPersonalSession: authenticatePostgresPersonalSessionForRead,
+        assertPostgresPersonalSessionCsrf,
+        revokePostgresPersonalSession,
+        hasPostgresDeletionTombstone,
+        healthDispatch,
+        clearSessionCookie: clearedSessionCookie(),
+        privateOrigin: hostOrigin,
+      });
       return {
         pools,
         connector,
@@ -540,6 +558,9 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           if (pathname === "/api/v1/me/devices"
               || pathname === "/api/v1/me/devices/revoke") {
             return participantDevicesDispatch(request);
+          }
+          if (pathname === "/api/v1/session" || pathname === "/api/v1/logout") {
+            return personalSessionDispatch(request);
           }
           return v12Dispatch(request);
         })(createPostgresTestV12DayManifestDispatch({
