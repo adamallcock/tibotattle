@@ -36,6 +36,7 @@ import { createFilesystemAssets } from "./assets.mjs";
 import { assertPostgresScheduledMaintenanceEnabled } from "./postgres-maintenance-gate.mjs";
 import { createPostgresUploadIngressBudget } from "../src/postgres-ingress-budget.ts";
 import { createPostgresRateLimiter } from "../src/postgres-rate-limiter.ts";
+import { createPostgresGoogleHandoffDispatch } from "../src/postgres-google-handoff.ts";
 import {
   ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
   parseAccountlessEnrollmentJson,
@@ -489,7 +490,12 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
       );
       const admissionEnv = {
         ENVIRONMENT: optional("ENVIRONMENT", "synthetic-development"),
+        ENROLLMENT_MODE: optional("ENROLLMENT_MODE", "disabled"),
         IDENTITY_LINK_SECRET: optional("IDENTITY_LINK_SECRET"),
+        IDENTITY_LINK_SECRET_VERSION: optional("IDENTITY_LINK_SECRET_VERSION"),
+        GOOGLE_OIDC_CLIENT_ID: optional("GOOGLE_OIDC_CLIENT_ID"),
+        GOOGLE_OIDC_CLIENT_SECRET: optional("GOOGLE_OIDC_CLIENT_SECRET"),
+        SIGN_IN_START_MAX_PER_MINUTE: optional("SIGN_IN_START_MAX_PER_MINUTE", "120"),
         ACCOUNTLESS_ENROLLMENT_MODE: optional("ACCOUNTLESS_ENROLLMENT_MODE", "disabled"),
         ACCOUNTLESS_OWNERSHIP_MODE: optional("ACCOUNTLESS_OWNERSHIP_MODE", "disabled"),
       };
@@ -539,6 +545,17 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         clearSessionCookie: clearedSessionCookie(),
         privateOrigin: hostOrigin,
       });
+      const googleHandoffDispatch = postgresTestMode === "cloud-run-iam"
+        ? createPostgresGoogleHandoffDispatch({
+          primaryPool,
+          schemaOptions,
+          privateOrigin: hostOrigin,
+          env: admissionEnv,
+          assertAdmissionBindings,
+          assertAttemptAllowed,
+          healthDispatch,
+        })
+        : null;
       return {
         pools,
         connector,
@@ -561,6 +578,11 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           }
           if (pathname === "/api/v1/session" || pathname === "/api/v1/logout") {
             return personalSessionDispatch(request);
+          }
+          if (googleHandoffDispatch && (pathname === "/api/v1/identity/google/start"
+              || pathname === "/api/v1/identity/google/callback"
+              || pathname === "/api/v1/identity/google/result")) {
+            return googleHandoffDispatch(request);
           }
           return v12Dispatch(request);
         })(createPostgresTestV12DayManifestDispatch({

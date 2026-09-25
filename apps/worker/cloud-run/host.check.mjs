@@ -883,7 +883,9 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
     for (const name of ["POSTGRES_TEST_HTTP_MODE", "HOST", "HOST_ORIGIN", "PUBLIC_ORIGIN",
       "ADMIN_HOST_ORIGIN", "PORT", "K_SERVICE", "PRIMARY_DATABASE", "LEDGER_DATABASE",
       "PRIMARY_INSTANCE_CONNECTION_NAME", "LEDGER_INSTANCE_CONNECTION_NAME", "POSTGRES_IAM_USER",
-      "POSTGRES_SCHEDULED_MAINTENANCE_ENABLED"]) {
+      "POSTGRES_SCHEDULED_MAINTENANCE_ENABLED", "ENROLLMENT_MODE", "IDENTITY_LINK_SECRET",
+      "IDENTITY_LINK_SECRET_VERSION", "GOOGLE_OIDC_CLIENT_ID", "GOOGLE_OIDC_CLIENT_SECRET",
+      "SIGN_IN_START_MAX_PER_MINUTE"]) {
       delete baseEnv[name];
     }
     const blocked = spawnSync(process.execPath, [bundlePath], {
@@ -1046,7 +1048,9 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
       "PUBLIC_ORIGIN", "ADMIN_HOST_ORIGIN", "PRIMARY_DATABASE", "PRIMARY_SCHEMA",
       "PRIMARY_INSTANCE_CONNECTION_NAME", "LEDGER_DATABASE", "LEDGER_SCHEMA",
       "LEDGER_INSTANCE_CONNECTION_NAME", "POSTGRES_IAM_USER", "GCS_BUCKET_NAME",
-      "GCS_ERASURE_BUCKET_HISTORY_PROOF",
+      "GCS_ERASURE_BUCKET_HISTORY_PROOF", "ENROLLMENT_MODE", "IDENTITY_LINK_SECRET",
+      "IDENTITY_LINK_SECRET_VERSION", "GOOGLE_OIDC_CLIENT_ID", "GOOGLE_OIDC_CLIENT_SECRET",
+      "SIGN_IN_START_MAX_PER_MINUTE",
     ]);
     const originalEnvironment = new Map([...environmentNames].map((name) => [name, process.env[name]]));
     try {
