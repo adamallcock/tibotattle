@@ -21,6 +21,31 @@ source archive, not to a production Worker build.
 
 ### Latest test-project checkpoint: 2026-09-25
 
+#### Cutover gate board
+
+This is an implementation and test-project checkpoint, not a production
+activation decision. The following gates must be satisfied against the exact
+candidate revision and source snapshot before moving live traffic:
+
+| Gate | Evidence now | Still required |
+| --- | --- | --- |
+| Private GCP data plane | Zonal Cloud SQL primary and independent erasure ledger, GCS, IAM-private Cloud Run, and a cleaned-up synthetic v1.2 journey at primary 39/39 and ledger 6/6 | Requalify each forward migration and serving image; preserve exact-owner erasure and restore behavior |
+| Application routes and identity | Partial private host and tested v1.2 upload/domain path; social device disconnect and some device/accountless source adapters are local-only | Complete or explicitly retire every live Worker route, OAuth/session/admin ingress, accountless opt-out, and the production composition root |
+| Historical source transfer | Sealed local rehearsals cover several typed source, journal, correction, and ledger families | Export and reconcile the real D1/R2 snapshot under a source fence, import exact history and objects, and prove no admitted writes are lost or duplicated |
+| Public analytics and maintenance | Read-only daily preflight is fail-closed; 100,000-member graph publishes in the isolated benchmark | Complete daily source/claim/cursor/publication lifecycle, full scheduled maintenance and public reads, then rehearse replay, rollback, and recovery |
+| Performance and cost | One 100,000-member hosted graph run completed in about 284 seconds; batching preserved output but did not materially improve time | Run a matched Cloudflare workload and sustained GCP load, measure database saturation and cost, and decide the acceptable throughput target |
+| Traffic switch | Production Cloudflare remains serving; private GCP test Scheduler is paused | Source-pinned deployment and full journey, controlled shadow/reconciliation window, explicit production authorization, cutover and rollback proof |
+
+The route, transfer, and analytics rows are material blockers. A private test
+service that accepts one synthetic upload is useful evidence but cannot serve
+the complete application yet.
+
+The [source-pinned private route candidate journey](../receipts/2026-09-25-gcp-private-route-candidate-journey.md)
+now records exact-image revision `tibotattle-test-app-00035-ws7`, a passing full
+Worker gate, a fresh synthetic v1.2 journey, and exact-owner cleanup. It
+includes some recently committed private route work, but remains a partial
+private host; later disconnect and transfer commits are not in that image.
+
 The [migration-39 A2 v1.2 journey](../receipts/2026-09-25-gcp-a2-v12-migration39-journey.md)
 now proves a fresh synthetic upload, exact replay, domain activation,
 PostgreSQL/GCS readback, and exact-owner cleanup against the current private
