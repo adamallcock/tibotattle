@@ -5,6 +5,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import pg from "pg";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import { createPostgresTestCommunityDailyDispatch } from "../cloud-run/postgres-test-dispatch.mjs";
+import { readPostgresCommunityDailyTestPreflight } from "../cloud-run/postgres-community-daily-publish-test.mjs";
 import { readPostgresPublishedCommunityDaily } from "../src/postgres-community-daily.ts";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
@@ -31,7 +32,8 @@ function digest(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function payload(revision) {
+function payload(revision, usageEvents = 1) {
+  const activity = usageEvents > 0;
   return {
     schemaVersion: "community-daily-aggregate-v1.0",
     aggregateId: `community-daily:${DAY}:r${revision}`,
@@ -57,15 +59,17 @@ function payload(revision) {
       band80Usd: null,
     },
     totals: {
-      contributingParticipants: 1, contributingDevices: 1, usageEvents: 1,
-      quotaObservations: 0, sessionDimensions: 0, inputUncachedTokens: 1,
+      contributingParticipants: activity ? 1 : 0,
+      contributingDevices: activity ? 1 : 0,
+      usageEvents,
+      quotaObservations: 0, sessionDimensions: 0, inputUncachedTokens: activity ? 1 : 0,
       inputCacheReadTokens: 0, inputCacheWriteTokens: 0, outputTextTokens: 0,
       outputReasoningTokens: 0, outputCombinedTokens: 0,
     },
     cellsTruncated: false,
-    cells: [{ provider: "openai", modelId: "gpt-6-sol", usageEvents: 1,
+    cells: activity ? [{ provider: "openai", modelId: "gpt-6-sol", usageEvents,
       inputUncachedTokens: 1, inputCacheReadTokens: 0, inputCacheWriteTokens: 0,
-      outputTextTokens: 0, outputReasoningTokens: 0, outputCombinedTokens: 0 }],
+      outputTextTokens: 0, outputReasoningTokens: 0, outputCombinedTokens: 0 }] : [],
     capacityByPlanType: { privateDiagnostic: "must-not-cross" },
   };
 }
@@ -124,8 +128,8 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL private community daily HTTP route"
 
   afterAll(async () => { if (pool) await pool.end(); });
 
-  async function insertRevision(revision, releaseState = "published") {
-    const json = JSON.stringify(payload(revision));
+  async function insertRevision(revision, releaseState = "published", usageEvents = 1) {
+    const json = JSON.stringify(payload(revision, usageEvents));
     await pool.query(`INSERT INTO ${quotedSchema}.community_daily_aggregates(
       source_id,source_namespace,day,revision,payload_json,payload_sha256,
       source_authority_epoch,source_cursor_sequence,policy_revision,collection_revision,
@@ -148,8 +152,33 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL private community daily HTTP route"
     });
   }
 
-  it("serves the PostgreSQL read facade projection and omits unavailable allowance diagnostics", async () => {
-    await insertRevision(1);
+  it("read-only publisher preflight blocks disabled controls and an undelivered journal tail", async () => {
+    const config = { schema, sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE };
+    const ready = await readPostgresCommunityDailyTestPreflight(pool, config);
+    expect(ready).toMatchObject({ status: "ready", blockers: [] });
+
+    await pool.query(`UPDATE ${quotedSchema}.collection_controls SET control_state='contained',
+      publication_enabled=false WHERE singleton=1`);
+    const blockedControls = await readPostgresCommunityDailyTestPreflight(pool, config);
+    expect(blockedControls).toMatchObject({
+      status: "blocked",
+      blockers: ["PUBLICATION_CONTROLS_DISABLED"],
+    });
+    await pool.query(`INSERT INTO ${quotedSchema}.storage_ingestion_changes(
+      source_id,sequence,event_digest,owner_digest,owner_revision,authority_epoch,kind,recorded_ms)
+      VALUES ($1,1,repeat('a',64),repeat('b',64),0,0,'source-updated',0)`, [SOURCE_ID]);
+    const blockedCursor = await readPostgresCommunityDailyTestPreflight(pool, config);
+    expect(blockedCursor).toMatchObject({
+      status: "blocked",
+      blockers: ["PUBLICATION_CONTROLS_DISABLED", "ANALYTICS_CURSOR_BEHIND_JOURNAL"],
+    });
+    const persisted = await pool.query(`SELECT control_state,publication_enabled
+      FROM ${quotedSchema}.collection_controls WHERE singleton=1`);
+    expect(persisted.rows[0]).toEqual({ control_state: "contained", publication_enabled: false });
+  });
+
+  it("serves an honest empty activity day and omits unavailable allowance diagnostics", async () => {
+    await insertRevision(1, "published", 0);
     const response = await dispatch()(new Request(
       `http://127.0.0.1:8080/api/v1/community/daily?from=${DAY}&to=${DAY}`,
     ));
@@ -160,7 +189,10 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL private community daily HTTP route"
       from: DAY,
       to: DAY,
       allowanceState: "updating",
-      days: [{ day: DAY, revision: 1, payload: { totals: { usageEvents: 1 } } }],
+      days: [{ day: DAY, revision: 1, payload: {
+        totals: { usageEvents: 0, contributingParticipants: 0, contributingDevices: 0 },
+        cells: [],
+      } }],
     });
     expect(result.days[0].payload).not.toHaveProperty("allowance");
     expect(result.days[0].payload).not.toHaveProperty("capacityByPlanType");

@@ -3,15 +3,22 @@ import test from "node:test";
 import {
   POSTGRES_COMMUNITY_DAILY_TEST_IAM_USER,
   POSTGRES_COMMUNITY_DAILY_TEST_JOB,
+  POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE,
   POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT,
   POSTGRES_COMMUNITY_DAILY_TEST_TARGET,
   parsePostgresCommunityDailyTestConfig,
+  readPostgresCommunityDailyTestPreflight,
   readAttachedPostgresCommunityDailyTestServiceAccount,
   runPostgresCommunityDailyTest,
 } from "./dist/postgres-community-daily-publish-test.mjs";
 
 const EXECUTION = "tibotattle-community-daily-publish-test-00001-abc";
 const DAY = "2026-09-24";
+const READY_PREFLIGHT = {
+  status: "ready",
+  blockers: [],
+  projectionScope: POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE,
+};
 
 function validEnv(overrides = {}) {
   return {
@@ -91,6 +98,60 @@ test("metadata identity requires Google's marker and the exact runtime service a
   }), /CLOUD_RUN_COMMUNITY_DAILY_TEST_METADATA_UNAVAILABLE/);
 });
 
+test("publisher preflight uses a read-only snapshot and reports disabled controls and cursor lag", async () => {
+  const calls = [];
+  let serverVersionNum = 170006;
+  const client = {
+    async query(sql, params) {
+      calls.push({ sql, params });
+      if (sql.startsWith("SELECT current_setting")) {
+        return { rows: [{
+          server_version_num: serverVersionNum,
+          source_id: "synthetic-community-source",
+          source_authority_epoch: "0",
+          cursor_sequence: "4",
+          cursor_authority_epoch: "0",
+          v1_source_namespace: "synthetic-community-namespace",
+          v1_runtime_contract_version: 1,
+          v11_source_namespace: "synthetic-community-namespace",
+          v11_runtime_contract_version: 1,
+          policy_revision: 1,
+          collection_revision: 2,
+          control_state: "disabled",
+          publication_enabled: false,
+          latest_sequence: "7",
+          terminal_sequence: "6",
+        }] };
+      }
+      return { rows: [] };
+    },
+    release() { calls.push({ sql: "release" }); },
+  };
+  const config = parsePostgresCommunityDailyTestConfig(
+    validEnv(), POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT,
+  );
+  const result = await readPostgresCommunityDailyTestPreflight({ connect: async () => client }, config);
+  assert.deepEqual(result, {
+    status: "blocked",
+    blockers: [
+      "PUBLICATION_CONTROLS_DISABLED",
+      "ANALYTICS_CURSOR_BEHIND_JOURNAL",
+      "TERMINAL_EVENT_BEHIND_CURSOR",
+    ],
+    projectionScope: POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE,
+  });
+  assert.match(calls[0].sql, /^BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY$/u);
+  assert.match(calls[1].sql, /^SELECT current_setting/u);
+  assert.deepEqual(calls[1].params, ["synthetic-community-source"]);
+  assert.equal(calls[1].sql.includes("v1.2"), false);
+  assert.equal(calls.at(-2).sql, "COMMIT");
+  assert.equal(calls.at(-1).sql, "release");
+  assert.equal(JSON.stringify(result).includes("synthetic-community"), false);
+  serverVersionNum = 160005;
+  const oldMajor = await readPostgresCommunityDailyTestPreflight({ connect: async () => client }, config);
+  assert.equal(oldMajor.blockers[0], "POSTGRES_MAJOR_VERSION_UNSUPPORTED");
+});
+
 test("publisher calls one day, reads back that exact revision, and returns no source identity", async () => {
   const calls = [];
   const pool = { async end() {} };
@@ -99,6 +160,7 @@ test("publisher calls one day, reads back that exact revision, and returns no so
     env: validEnv(),
     dependencies: {
       attachedServiceAccountEmail: POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT,
+      preflight: async () => READY_PREFLIGHT,
       createConnector: () => connector,
       createIamPool: async (options) => {
         calls.push(["connect", options]);
@@ -134,6 +196,10 @@ test("publisher calls one day, reads back that exact revision, and returns no so
     publicationState: "published",
     revision: 3,
     readback: "exact_revision_verified",
+    projectionScope: POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE,
+    activityState: "empty",
+    usageEvents: 0,
+    allowanceState: "updating",
   });
   assert.equal(JSON.stringify(receipt).includes("synthetic-community"), false);
   assert.equal(calls[0][1].max, 1);
@@ -159,6 +225,7 @@ test("publisher fails closed and closes the pool when exact-day readback does no
     env: validEnv(),
     dependencies: {
       attachedServiceAccountEmail: POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT,
+      preflight: async () => READY_PREFLIGHT,
       createConnector: () => ({}),
       createIamPool: async () => ({}),
       publish: async () => ({ state: "unchanged", day: DAY, revision: 3 }),
@@ -167,6 +234,43 @@ test("publisher fails closed and closes the pool when exact-day readback does no
     },
   }), /POSTGRES_COMMUNITY_DAILY_TEST_READBACK_INVALID/);
   assert.equal(closeCalls, 1);
+});
+
+test("blocked preflight makes no publication or readback call and can return a safe checklist", async () => {
+  const calls = [];
+  const blocked = {
+    status: "blocked",
+    blockers: ["PUBLICATION_CONTROLS_DISABLED", "ANALYTICS_CURSOR_BEHIND_JOURNAL"],
+    projectionScope: POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE,
+  };
+  const dependencies = {
+    attachedServiceAccountEmail: POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT,
+    createConnector: () => ({}),
+    createIamPool: async () => ({ end: async () => {} }),
+    preflight: async () => blocked,
+    publish: async () => { calls.push("publish"); throw new Error("must not publish"); },
+    readPublished: async () => { calls.push("read"); throw new Error("must not read"); },
+    closeResources: async () => {},
+  };
+  const env = validEnv();
+  await assert.rejects(runPostgresCommunityDailyTest({ env, dependencies }),
+    (error) => error.code === "POSTGRES_COMMUNITY_DAILY_TEST_PREFLIGHT_BLOCKED"
+      && error.preflightBlockers === blocked.blockers);
+  const receipt = await runPostgresCommunityDailyTest({
+    env, dependencies, preflightOnly: true,
+  });
+  assert.deepEqual(receipt, {
+    schemaVersion: "postgres-community-daily-test-preflight-v1",
+    status: "blocked",
+    job: POSTGRES_COMMUNITY_DAILY_TEST_JOB,
+    project: "tibotattle",
+    execution: EXECUTION,
+    day: DAY,
+    readOnly: true,
+    projectionScope: POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE,
+    blockers: blocked.blockers,
+  });
+  assert.deepEqual(calls, []);
 });
 
 test("invalid Job targets fail before metadata or database access", async () => {
