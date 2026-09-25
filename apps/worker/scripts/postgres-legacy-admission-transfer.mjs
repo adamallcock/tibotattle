@@ -736,6 +736,28 @@ async function persistHeaderStageReceipt({ pool, controlSchema, transferId, targ
   }
 }
 
+async function persistSealedHeaderStageReceipt({ source, pool, controlSchema, transferId, targetSchema,
+  snapshot, sourceManifest, state, proof, pageSize } = {}) {
+  const client = await pool.connect();
+  let transactionStarted = false;
+  try {
+    await client.query("BEGIN");
+    transactionStarted = true;
+    const relations = HEADER_TABLES.map((spec) => `${qschema(controlSchema)}."${spec.targetTable}"`).join(",");
+    await client.query(`LOCK TABLE ${relations} IN SHARE MODE`);
+    await verifyAllRows({ source, pool: client, schema: targetSchema, controlSchema, pageSize, specs: HEADER_TABLES });
+    await persistHeaderStageReceipt({ pool: client, controlSchema, transferId, targetSchema,
+      snapshot, sourceManifest, state, proof });
+    await client.query("COMMIT");
+    transactionStarted = false;
+  } catch (error) {
+    if (transactionStarted) await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function ensureControlTables(pool, controlSchema) {
   const ns = qschema(controlSchema);
   await pool.query(`CREATE TABLE IF NOT EXISTS ${ns}."${RUN_TABLE}" (
@@ -754,9 +776,23 @@ async function ensureControlTables(pool, controlSchema) {
     PRIMARY KEY(transfer_id,table_name)
   )`);
   const immutableFunction = `${ns}."_legacy_header_stage_immutable_fn"`;
+  const sealedInsertFunction = `${ns}."_legacy_header_stage_sealed_insert_fn"`;
   await pool.query(`CREATE OR REPLACE FUNCTION ${immutableFunction}() RETURNS trigger
     LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
     BEGIN RAISE EXCEPTION 'legacy_header_stage_immutable' USING ERRCODE='P1005'; END; $$`);
+  await pool.query(`CREATE OR REPLACE FUNCTION ${sealedInsertFunction}() RETURNS trigger
+    LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+    DECLARE
+      receipt_relation regclass;
+      sealed boolean := false;
+    BEGIN
+      receipt_relation := to_regclass(format('%I.%I', TG_TABLE_SCHEMA, '_legacy_admission_header_receipts_v1'));
+      IF receipt_relation IS NOT NULL THEN
+        EXECUTE format('SELECT EXISTS (SELECT 1 FROM %s)', receipt_relation) INTO sealed;
+      END IF;
+      IF sealed THEN RAISE EXCEPTION 'legacy_header_stage_sealed' USING ERRCODE='P1005'; END IF;
+      RETURN NEW;
+    END; $$`);
   for (const spec of HEADER_TABLES) {
     const columns = spec.columns.map((column, index) => {
       const type = spec.types[index];
@@ -774,7 +810,155 @@ async function ensureControlTables(pool, controlSchema) {
           FOR EACH ROW EXECUTE FUNCTION ${immutableFunction}();
       END IF;
     END $$`);
+    const insertTrigger = `${spec.targetTable}_sealed_insert`;
+    await pool.query(`DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid='${controlSchema}.${spec.targetTable}'::regclass AND tgname='${insertTrigger}') THEN
+        CREATE TRIGGER ${insertTrigger} BEFORE INSERT ON ${relation}
+          FOR EACH ROW EXECUTE FUNCTION ${sealedInsertFunction}();
+      END IF;
+    END $$`);
   }
+}
+
+function headerMirrorManifest(tableProofs) {
+  const tables = Object.create(null);
+  for (const spec of HEADER_TABLES) {
+    const item = tableProofs[spec.name];
+    if (!item || !Number.isSafeInteger(item.rows) || item.rows < 0 || !SHA256.test(item.sha256 ?? "")) {
+      fail("LEGACY_ADMISSION_HEADER_MANIFEST_INVALID");
+    }
+    tables[spec.name] = Object.freeze({ rows: item.rows, sha256: item.sha256 });
+  }
+  return Object.freeze({
+    tables: Object.freeze(tables),
+    rowCounts: Object.freeze(Object.fromEntries(Object.entries(tables).map(([name, item]) => [name, item.rows]))),
+    sha256: createHash("sha256").update(JSON.stringify(tables)).digest("hex"),
+  });
+}
+
+async function scanHeaderMirror(pool, controlSchema, pageSize) {
+  const namespace = qschema(controlSchema);
+  const tableProofs = Object.create(null);
+  for (const spec of HEADER_TABLES) {
+    const columns = spec.columns.map((column) => `"${column}"`).join(",");
+    const relation = `${namespace}."${spec.targetTable}"`;
+    const digest = createHash("sha256");
+    let after = null;
+    let rowsSeen = 0;
+    for (;;) {
+      const page = await pool.query(`SELECT ${columns} FROM ${relation}
+        WHERE ($1::text IS NULL OR "id" > $1) ORDER BY "id" LIMIT $2`, [after, pageSize]);
+      if (!Array.isArray(page.rows) || page.rows.length > pageSize) fail("LEGACY_ADMISSION_HEADER_MIRROR_INVALID");
+      const rows = page.rows.map((raw) => normalizeRow(spec, raw));
+      for (let index = 0; index < rows.length; index += 1) {
+        if (after !== null && rows[index].id <= after) fail("LEGACY_ADMISSION_SOURCE_ORDER_INVALID");
+        if (index > 0 && rows[index - 1].id >= rows[index].id) fail("LEGACY_ADMISSION_SOURCE_ORDER_INVALID");
+        digest.update(rowJson(spec, rows[index]));
+        digest.update("\n");
+      }
+      rowsSeen += rows.length;
+      if (rows.length < pageSize) break;
+      after = rows.at(-1).id;
+    }
+    tableProofs[spec.name] = Object.freeze({ rows: rowsSeen, sha256: digest.digest("hex") });
+  }
+  return headerMirrorManifest(tableProofs);
+}
+
+/**
+ * Open a completed immutable header mirror for another local rehearsal step.
+ * The reader is bounded and exposes only the three reviewed header tables
+ * plus content-free receipt metadata.
+ */
+export async function openPostgresLegacyAdmissionHeaderMirror({ pool, targetSchema: rawTargetSchema,
+  controlSchema: rawControlSchema, transferId, pageSize } = {}) {
+  const targetSchema = schemaName(rawTargetSchema);
+  const controlSchema = schemaName(rawControlSchema);
+  if (!controlSchema.startsWith(CONTROL_PREFIX) || controlSchema.length < CONTROL_PREFIX.length + 8
+      || controlSchema === targetSchema) fail("LEGACY_ADMISSION_CONTROL_SCHEMA_INVALID");
+  if (typeof transferId !== "string" || !TRANSFER_ID.test(transferId)) fail("LEGACY_ADMISSION_TRANSFER_ID_INVALID");
+  if (!pool || typeof pool.query !== "function") fail("LEGACY_ADMISSION_DESTINATION_INVALID");
+  const size = validatePageSize(pageSize);
+  const ns = qschema(controlSchema);
+  const result = await pool.query(`SELECT run.status, receipt.target_schema, receipt.source_snapshot_id,
+      receipt.source_snapshot_kind, receipt.source_snapshot_sha256, receipt.source_manifest_sha256,
+      receipt.v1_source_namespace, receipt.v11_source_namespace, receipt.header_manifest_sha256,
+      receipt.header_table_row_counts, receipt.completed_at
+    FROM ${ns}."${RUN_TABLE}" run
+    JOIN ${ns}."_legacy_admission_header_receipts_v1" receipt USING (transfer_id)
+    WHERE run.transfer_id=$1`, [transferId]);
+  if (result.rowCount !== 1 || result.rows[0]?.status !== "complete"
+      || result.rows[0]?.target_schema !== targetSchema
+      || !SHA256.test(result.rows[0]?.source_snapshot_sha256 ?? "")
+      || !SHA256.test(result.rows[0]?.source_manifest_sha256 ?? "")
+      || !SHA256.test(result.rows[0]?.header_manifest_sha256 ?? "")) {
+    fail("LEGACY_ADMISSION_HEADER_MIRROR_RECEIPT_REQUIRED");
+  }
+  const receiptRow = result.rows[0];
+  let counts = receiptRow.header_table_row_counts;
+  if (typeof counts === "string") {
+    try { counts = JSON.parse(counts); } catch { fail("LEGACY_ADMISSION_HEADER_MIRROR_RECEIPT_INVALID"); }
+  }
+  const checkpoint = await pool.query(`SELECT table_name,row_count,complete FROM ${ns}."${CHECKPOINT_TABLE}"
+    WHERE transfer_id=$1 AND table_name=ANY($2::text[]) ORDER BY table_name`,
+  [transferId, HEADER_TABLES.map((spec) => spec.name)]);
+  if (checkpoint.rowCount !== HEADER_TABLES.length
+      || HEADER_TABLES.some((spec) => !checkpoint.rows.some((row) => row.table_name === spec.name
+        && row.complete === true && BigInt(row.row_count) === BigInt(counts?.[spec.name] ?? -1)))) {
+    fail("LEGACY_ADMISSION_HEADER_MIRROR_CHECKPOINT_INVALID");
+  }
+  const rowCounts = Object.fromEntries(HEADER_TABLES.map((spec) => [spec.name, Number(counts?.[spec.name]) ]));
+  if (Object.values(rowCounts).some((value) => !Number.isSafeInteger(value) || value < 0)
+      || !sameCounts(counts, rowCounts)) fail("LEGACY_ADMISSION_HEADER_MIRROR_RECEIPT_INVALID");
+  const completedAt = receiptRow.completed_at instanceof Date
+    ? receiptRow.completed_at.toISOString() : String(receiptRow.completed_at ?? "");
+  if (!Number.isFinite(Date.parse(completedAt))) fail("LEGACY_ADMISSION_HEADER_MIRROR_RECEIPT_INVALID");
+  const receipt = Object.freeze({
+    transferId,
+    targetSchema,
+    controlSchema,
+    sourceSnapshotId: receiptRow.source_snapshot_id,
+    sourceSnapshotKind: receiptRow.source_snapshot_kind,
+    sourceSnapshotSha256: receiptRow.source_snapshot_sha256,
+    sourceManifestSha256: receiptRow.source_manifest_sha256,
+    v1SourceNamespace: receiptRow.v1_source_namespace,
+    v11SourceNamespace: receiptRow.v11_source_namespace,
+    headerManifestSha256: receiptRow.header_manifest_sha256,
+    headerTableRowCounts: Object.freeze(rowCounts),
+    completedAt,
+  });
+  if (typeof receipt.sourceSnapshotId !== "string" || receipt.sourceSnapshotId.length < 8
+      || !["sealed-sqlite-rehearsal", "synthetic-d1-fixture"].includes(receipt.sourceSnapshotKind)
+      || typeof receipt.v1SourceNamespace !== "string" || receipt.v1SourceNamespace.length === 0
+      || typeof receipt.v11SourceNamespace !== "string" || receipt.v11SourceNamespace.length === 0) {
+    fail("LEGACY_ADMISSION_HEADER_MIRROR_RECEIPT_INVALID");
+  }
+
+  return Object.freeze({
+    receipt,
+    async listPage({ table: tableName, after = null, limit = size } = {}) {
+      const spec = HEADER_TABLES.find((item) => item.name === tableName);
+      if (!spec || !Number.isInteger(limit) || limit < 1 || limit > POSTGRES_LEGACY_ADMISSION_MAX_PAGE_SIZE) {
+        fail("LEGACY_ADMISSION_HEADER_MIRROR_PAGE_INVALID");
+      }
+      let key = after;
+      if (Array.isArray(key)) key = key[0];
+      if (key !== null && typeof key !== "string") fail("LEGACY_ADMISSION_HEADER_MIRROR_PAGE_INVALID");
+      const columns = spec.columns.map((column) => `"${column}"`).join(",");
+      const page = await pool.query(`SELECT ${columns} FROM ${ns}."${spec.targetTable}"
+        WHERE ($1::text IS NULL OR "id" > $1) ORDER BY "id" LIMIT $2`, [key, limit]);
+      if (!Array.isArray(page.rows) || page.rows.length > limit) fail("LEGACY_ADMISSION_HEADER_MIRROR_PAGE_INVALID");
+      return Object.freeze({ rows: Object.freeze(page.rows.map((raw) => normalizeRow(spec, raw))) });
+    },
+    async verify() {
+      const proof = await scanHeaderMirror(pool, controlSchema, size);
+      if (proof.sha256 !== receipt.headerManifestSha256
+          || !sameCounts(proof.rowCounts, receipt.headerTableRowCounts)) {
+        fail("LEGACY_ADMISSION_HEADER_MIRROR_PARITY_FAILED");
+      }
+      return proof;
+    },
+  });
 }
 
 function insertStatement(schema, spec, rows) {
@@ -997,9 +1181,8 @@ export async function runPostgresLegacyAdmissionTransfer({ source, destinationPo
       const copied = await copyTable({ source, pool: destinationPool, targetSchema, controlSchema, transferId, spec, pageSize: size });
       pages += copied.pages;
     }
-    await verifyAllRows({ source, pool: destinationPool, schema: targetSchema, controlSchema, pageSize: size, specs: HEADER_TABLES });
-    await persistHeaderStageReceipt({ pool: destinationPool, controlSchema, transferId, targetSchema,
-      snapshot, sourceManifest, state, proof: sourceHeaderManifest });
+    await persistSealedHeaderStageReceipt({ source, pool: destinationPool, controlSchema, transferId,
+      targetSchema, snapshot, sourceManifest, state, proof: sourceHeaderManifest, pageSize: size });
     for (const spec of TABLES) {
       const copied = await copyTable({ source, pool: destinationPool, targetSchema, controlSchema, transferId, spec, pageSize: size });
       pages += copied.pages;

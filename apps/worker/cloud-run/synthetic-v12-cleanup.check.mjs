@@ -436,6 +436,42 @@ async function seedOwner(pool, schema, { withChunk = false } = {}) {
   return { participantId, deviceId, ownerDigest, objectKey };
 }
 
+async function seedHistoricalHeader(pool, schema, fixture) {
+  const sourceImportId = randomBytes(32).toString("hex");
+  const tableCounts = {
+    telemetry_v11_chunks: 0,
+    telemetry_v11_day_manifests: 0,
+    telemetry_v1_chunks: 1,
+  };
+  const tableDigests = Object.fromEntries(Object.keys(tableCounts).map((name) => [name, "a".repeat(64)]));
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`SET LOCAL search_path TO ${qualified(schema, "participants").split(".")[0]}, pg_catalog`);
+    await client.query(`INSERT INTO ${qualified(schema, "historical_transport_header_imports")} (
+      source_import_id,target_schema,source_snapshot_id,source_snapshot_kind,source_snapshot_sha256,
+      source_manifest_sha256,v1_source_namespace,v11_source_namespace,header_manifest_sha256,
+      header_table_row_counts,header_table_sha256,mirror_control_schema,mirror_transfer_id,mirror_receipt_sha256
+    ) VALUES ($1,$2,'synthetic-owner-archive-snapshot','synthetic-d1-fixture',$3,$4,
+      'synthetic-v1-namespace','synthetic-v11-namespace',$5,$6::jsonb,$7::jsonb,
+      'typed_legacy_admission_transfer_aaaaaaaa','synthetic-owner-archive-transfer',$8)`,
+    [sourceImportId, schema, "b".repeat(64), "c".repeat(64), "d".repeat(64),
+      JSON.stringify(tableCounts), JSON.stringify(tableDigests), "e".repeat(64)]);
+    await client.query("SELECT set_config('tibotattle.legacy_header_promotion',$1,true)", [sourceImportId]);
+    await client.query(`INSERT INTO ${qualified(schema, "historical_telemetry_v1_chunk_headers")} (
+      source_import_id,id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,
+      chunk_digest,envelope_digest,parser_version,record_count,accepted_record_count,r2_key,
+      device_upload_authorization_id,created_at
+    ) VALUES ($1,'synthetic-archived-v1-header',$2,$3,'usage','2026-09-24',0,1,$4,$4,
+      'synthetic-owner-archive-v1',1,1,'synthetic-owner-archive/object','synthetic-owner-archive-upload',
+      '2026-09-24T10:00:00.000Z')`, [sourceImportId, fixture.participantId, fixture.deviceId, "f".repeat(64)]);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally { client.release(); }
+}
+
 async function seedActivatedDomain(pool, schema, participantId) {
   const device = await pool.query(
     `SELECT id FROM ${qualified(schema, "device_credentials")} WHERE participant_id=$1`,
@@ -505,7 +541,7 @@ test("PG17 owner-erasure fixture fences one exact owner, retries an object failu
 }, async () => {
   const endpoint = await localPostgresEndpoint();
   const suffix = randomBytes(5).toString("hex");
-  const primarySchema = `owner_cleanup_${suffix}`;
+  const primarySchema = `typed_legacy_target_${suffix}`;
   const ledgerSchema = `${primarySchema}_ledger`;
   const poolOptions = {
     host: endpoint.host,
@@ -695,6 +731,22 @@ test("PG17 owner-erasure fixture fences one exact owner, retries an object failu
     assert.equal(unexpectedState.rows[0]?.state, "active",
       "family refusal occurs before the owner is fenced or mutated");
     assert.equal(deletes.length, 2, "family refusal must not reach object deletion");
+
+    const archivedFixture = await seedOwner(primaryPool, primarySchema);
+    await seedHistoricalHeader(primaryPool, primarySchema, archivedFixture);
+    await assert.rejects(
+      eraseSyntheticPostgresV12Owner({ ...options, participantId: archivedFixture.participantId }),
+      (error) => error?.code === "SYNTHETIC_OWNER_ERASURE_FAMILY_UNSUPPORTED",
+      "the v1.2-only eraser refuses owners with historical v1 archive references",
+    );
+    const archivedOwnerState = await primaryPool.query(
+      `SELECT state FROM ${qualified(primarySchema, "participants")} WHERE id=$1`,
+      [archivedFixture.participantId],
+    );
+    assert.equal(archivedOwnerState.rows[0]?.state, "active",
+      "archived owner refusal happens before fencing or archive cascade");
+    assert.equal(deletes.length, 2,
+      "historical object keys are not silently omitted from object erasure");
   } finally {
     for (const schema of createdSchemas.reverse()) {
       try { await primaryPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); } catch {}
