@@ -269,6 +269,12 @@ test("cloud-run-iam host predicate accepts only the named service tuple and pinn
   }), false);
 });
 
+test("Cloud Run IAM test target is pinned to the isolated A2 schema and bucket profile", () => {
+  assert.equal(CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.schema, "tibotattle_v12_a2_20260925");
+  assert.equal(CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.schema, "tibotattle_ledger_v12_a2_20260925");
+  assert.equal(CLOUD_RUN_IAM_TEST_TARGET.gcsBucket, "tibotattle-gcs-test-cleanup-20260925-a2");
+});
+
 test("Cloud Run test origin allowlist rejects alternate authorities and forwarded-header spoofing", async () => {
   const allowlist = createRequestOriginAllowlist({
     publicHostOrigin: CLOUD_RUN_IAM_TEST_TARGET.origin,
@@ -656,15 +662,21 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
         "POSTGRES_TEST_CLOUD_RUN_IAM_PRIMARY_TARGET_INVALID"],
       [{ PRIMARY_SCHEMA: "other_primary" },
         "POSTGRES_TEST_CLOUD_RUN_IAM_PRIMARY_TARGET_INVALID"],
+      [{ PRIMARY_SCHEMA: "tibotattle" },
+        "POSTGRES_TEST_CLOUD_RUN_IAM_PRIMARY_TARGET_INVALID"],
       [{ LEDGER_INSTANCE_CONNECTION_NAME: "other-project:us-east1:other-ledger" },
         "POSTGRES_TEST_CLOUD_RUN_IAM_LEDGER_TARGET_INVALID"],
       [{ LEDGER_DATABASE: "other_ledger" },
         "POSTGRES_TEST_CLOUD_RUN_IAM_LEDGER_TARGET_INVALID"],
       [{ LEDGER_SCHEMA: "other_ledger" },
         "POSTGRES_TEST_CLOUD_RUN_IAM_LEDGER_TARGET_INVALID"],
+      [{ LEDGER_SCHEMA: "tibotattle_ledger" },
+        "POSTGRES_TEST_CLOUD_RUN_IAM_LEDGER_TARGET_INVALID"],
       [{ POSTGRES_IAM_USER: "other-runtime@tibotattle.iam" },
         "POSTGRES_TEST_CLOUD_RUN_IAM_USER_INVALID"],
       [{ GCS_BUCKET_NAME: "another-test-bucket" },
+        "POSTGRES_TEST_CLOUD_RUN_IAM_BUCKET_INVALID"],
+      [{ GCS_BUCKET_NAME: "tibotattle-gcs-test-app-20260922" },
         "POSTGRES_TEST_CLOUD_RUN_IAM_BUCKET_INVALID"],
       [{ GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("another-test-bucket") },
         "POSTGRES_TEST_CLOUD_RUN_IAM_BUCKET_HISTORY_PROOF_INVALID"],

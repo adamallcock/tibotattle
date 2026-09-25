@@ -19,16 +19,16 @@ export const CLOUD_RUN_IAM_TEST_TARGET = Object.freeze({
     primary: Object.freeze({
       instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
       database: "tibotattle",
-      schema: "tibotattle",
+      schema: "tibotattle_v12_a2_20260925",
     }),
     ledger: Object.freeze({
       instanceConnectionName: "tibotattle:us-east1:tibotattle-test-ledger-20260922",
       database: "tibotattle_ledger",
-      schema: "tibotattle_ledger",
+      schema: "tibotattle_ledger_v12_a2_20260925",
     }),
     iamUser: "tibotattle-test-runtime@tibotattle.iam",
   }),
-  gcsBucket: "tibotattle-gcs-test-app-20260922",
+  gcsBucket: "tibotattle-gcs-test-cleanup-20260925-a2",
 });
 
 function configurationError(code) {
