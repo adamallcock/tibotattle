@@ -2705,8 +2705,8 @@ const SHARE_CARD_WINDOW_KEYS = Object.freeze({
 // absent, so it — like any unmapped or empty reading — draws no chip.
 const SHARE_CARD_PLAN_LABELS = Object.freeze({
   ...TELEMETRY_PLAN_DISPLAY_NAMES,
-  pro: `${TELEMETRY_PLAN_DISPLAY_NAMES.pro} (20×)`,
-  prolite: `${TELEMETRY_PLAN_DISPLAY_NAMES.prolite} (5×)`,
+  pro: "Pro (20×)",
+  prolite: "Pro Lite (5×)",
   promax: "Pro 50×",
   self_serve_business_prolite: "Business · Pro Lite (5×)",
   self_serve_business_usage_based: "Business · usage-based",

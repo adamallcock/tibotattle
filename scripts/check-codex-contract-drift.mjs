@@ -699,7 +699,7 @@ export function compareUpstreamPlanRegistry(ledger, observedPairs) {
     if (expected.lifecycle === "provisional" && observedByRaw.has(expected.rawValue)) {
       warnings.push(issue(
         "provisional_plan_observed",
-        `Provisional plan ${expected.rawValue} appeared upstream; review its exact contract before activation`,
+        `Provisional plan ${expected.rawValue} is present upstream; resolve remaining release gates before activation`,
       ));
     }
   }
@@ -1004,12 +1004,12 @@ export async function checkCodexContractDrift({
   if (requireBinary && provisionalPlans.length > 0) {
     issues.push(issue(
       "provisional_plan_unverified_for_release",
-      `Release check requires upstream review of provisional plan(s): ${provisionalPlans.map((plan) => plan.rawValue).join(", ")}`,
+      `Release check requires resolution of provisional plan(s): ${provisionalPlans.map((plan) => plan.rawValue).join(", ")}`,
     ));
   } else if (provisionalPlans.length > 0) {
     warnings.push(issue(
       "provisional_plan_assumption",
-      `Product accepts unverified provisional plan(s): ${provisionalPlans.map((plan) => plan.rawValue).join(", ")}`,
+      `Product accepts provisional plan(s) pending release review: ${provisionalPlans.map((plan) => plan.rawValue).join(", ")}`,
     ));
   }
 

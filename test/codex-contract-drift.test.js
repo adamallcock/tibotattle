@@ -84,8 +84,8 @@ test("provisional Pro 50x is explicit and blocks release qualification", async (
   const ledger = validateCodexContractLedger(await fixtureLedger());
   const candidate = ledger.plans.find((plan) => plan.rawValue === "promax");
   assert.equal(candidate.lifecycle, "provisional");
-  assert.equal(candidate.displayName, "Pro Max");
-  assert.match(candidate.note, /not been verified/u);
+  assert.equal(candidate.displayName, "Pro (Max)");
+  assert.match(candidate.note, /source revision/u);
   const result = await checkCodexContractDrift({
     binaries: [{ binaryPath: "/not/reported", channel: "fixture" }],
     inspectBinary: async ({ channel }) => ({
@@ -103,7 +103,7 @@ test("provisional Pro 50x is explicit and blocks release qualification", async (
 
 test("source fixture yields the current exhaustive raw/display plan pairs", async () => {
   const pairs = parseKnownPlanSource(await fixtureText(SOURCE_FIXTURE));
-  const verifiedPlans = (await fixtureLedger()).plans.filter((plan) => plan.lifecycle !== "provisional");
+  const verifiedPlans = (await fixtureLedger()).plans;
   assert.deepEqual(
     pairs.map(({ rawValue }) => rawValue),
     verifiedPlans.map((plan) => plan.rawValue),
@@ -150,7 +150,10 @@ test("deprecated historical values may disappear without weakening telemetry acc
   assert.deepEqual(compareUpstreamPlanRegistry(ledger, pairs), {
     issues: [],
     ok: true,
-    warnings: [],
+    warnings: [{
+      code: "provisional_plan_observed",
+      message: "Provisional plan promax is present upstream; resolve remaining release gates before activation",
+    }],
   });
   assert.equal(TELEMETRY_PLAN_TYPES.includes("go"), true);
 });

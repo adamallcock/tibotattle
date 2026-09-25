@@ -14,28 +14,29 @@ available or that any installed client, hosted service, or release supports it. 
 checkout `9385bad260698814cc2a4a6c685575a3fd63811a` on 2026-09-24.
 
 [Official OpenAI documentation](https://learn.chatgpt.com/docs/pricing)
-currently describes Pro 5x and Pro 20x, with no Pro 50x limit table. The
-locally bundled `codex-cli 0.155.0-alpha.16.4` passed
-`npm run codex:contract:release:check` with the existing 17 `PlanType` values;
-`promax` is not in that reviewed contract. The user-supplied future name and
-identifier are therefore inputs to plan for, not yet provider-verified facts.
-Confirm the released `PlanType` value, `KnownPlan::display_name()`, observed
+currently describes Pro 5x and Pro 20x, with no Pro 50x limit table. On
+2026-09-24 (Eastern), [OpenAI's Codex source at
+`b725da3b6d5237e8eb0cf8bb0bc47b8efa575fc2`](https://github.com/openai/codex/blob/b725da3b6d5237e8eb0cf8bb0bc47b8efa575fc2/codex-rs/protocol/src/auth.rs)
+added raw `promax` with the exact `KnownPlan::display_name()` value
+**“Pro (Max)”**. It also changed `pro` to “Pro (More)” and `prolite` to
+“Pro.” The ledger and source fixture now pin those exact pairs. The locally
+bundled `codex-cli 0.155.0-alpha.16.4` still exposes the earlier 17-value
+`PlanType` schema, including `unknown` and excluding `promax`; the branch's
+release contract check fails. Confirm a released binary contract, observed
 quota windows, and the meaning of “50x” before release qualification. The
-dedicated branch `codex/pro-50x-integration` implements the user-provided
-assumption locally, with a release contract check that fails while it is
-provisional.
+dedicated branch `codex/pro-50x-integration` keeps the 50x factor provisional.
 
 The accepted [plan-name decision](../design/2026-08-26-codex-plan-display-names.md)
 requires an exact upstream raw identifier and an exhaustive official-name
-registry. If upstream calls `promax` “Pro Max,” keep that name in the contract
-registry and use “Pro 50×” as a separate reviewed product label. Never derive a
+registry. The official “Pro (Max)” name belongs in that registry; “Pro 50×”
+is the separate provisional product label. Never derive a
 plan from the window duration or from a nominal multiplier.
 
 # Current plan-dependent surface inventory
 
 | Boundary | Current behavior and source | Pro 50x work |
 | --- | --- | --- |
-| Provider vocabulary and drift | `config/codex-contract-ledger.json`, `scripts/check-codex-contract-drift.mjs`, and the two `test/fixtures/codex-*plan*` fixtures pin the raw/display pairs and installed binary contract. | Pin the new upstream source revision and released binary schema; append the verified raw/display pair and update exhaustive drift tests. Do not silently title-case `promax`. |
+| Provider vocabulary and drift | `config/codex-contract-ledger.json`, `scripts/check-codex-contract-drift.mjs`, and the two `test/fixtures/codex-*plan*` fixtures pin the raw/display pairs and installed binary contract. | The new source revision and exact raw/display pair are pinned. Verify a released binary schema before lifting the provisional release block; do not title-case `promax`. |
 | Detection and capture | `src/providers/codex/plan-normalization.js` maps unrecognized provider plans to `unknown`; `app-server.js` reads `account/read` and rate limits, while `log-normalization.js` reads rollout `plan_type`. `account-scope.js`, `src/passive-collector.js`, and `src/capture.js` carry the resulting evidence. | Admit the verified value through the canonical vocabulary. Test account/rate-limit agreement, missing fields, malformed labels, and a plan switch; preserve unknown/conflicted evidence. Pre-support observations normalized to `unknown` cannot simply be relabelled after the fact. |
 | Local persistence, accounting, and allowance | `src/local-unified-index.js` persists plan-labelled observations; `src/local-companion-usage-model.js`, `src/replay-safe-accounting-cache.js`, `src/reporting/weekly-calibration.js`, and `packages/quota-analysis/` partition reset fits, history, composition, and pace by plan era. `src/local-companion-data.js` projects the selected population. The reporting contract currently caps a history at 16 plan populations. | Keep Pro 50x a separate era, never pool its numerator with Pro or Pro Lite, and review the 16-population bound. Existing observed-window and API-price-equivalent algorithms should remain plan-neutral; test a Pro → Pro 50x → Pro transition and both five-hour/seven-day observations if the provider emits them. Do not invent a seven-day fit when it does not. |
 | Export and contribution contract | `packages/telemetry-contract/src/constants.js` owns the closed plan list and display registry. Package validators, TypeScript declarations, v0.2/v1.1 schemas, `src/export/safe-records.js`, `src/application/export-sources/codex-collector-export.js`, and `src/contribution/telemetry-v1*-chunks.js` use it. The Worker validates via its installed package in `apps/worker/src/telemetry-validation.ts`, `telemetry-v1.ts`, and `quota-analysis-v1-reader.ts`. | Extend the canonical allowlist and declarations, regenerate only owned schema/browser/upload mirrors, and review consent and old-client/new-Worker compatibility. Preserve historical bytes, unknown values, privacy limits, and distinct account/plan attribution. Deploying a producer before a compatible receiver would reject the new value. |
@@ -92,11 +93,11 @@ aggregate rather than create a parallel “Pro 50x allowance” estimator.
 
 # Implementation and verification sequence
 
-1. **Verify contract and semantics.** Capture exact `openai/codex` source
-   revision, `KnownPlan` name, released binary `PlanType` schema, official
-   multiplier baseline, and observed quota windows. Record source digests in
-   the ledger; use synthetic, content-free fixtures. If any element is absent,
-   stop at safe `unknown` handling for that element.
+1. **Verify contract and semantics.** The exact `openai/codex` source revision,
+   `KnownPlan` name, and source digest are recorded. Capture the released binary
+   `PlanType` schema, official multiplier baseline, and observed quota windows;
+   use synthetic, content-free fixtures. If any element is absent, keep that
+   claim provisional rather than infer it from the source name.
 2. **Make local and receiver vocabularies compatible.** Update canonical
    telemetry types, display names, source/fixture parity, export and contribution
    schemas, and generated mirrors. Check legacy v0.1/v0.2 and v1.1
@@ -134,8 +135,9 @@ aggregate rather than create a parallel “Pro 50x allowance” estimator.
 
 # Decisions required before release or publication
 
-- Is `promax` the released raw `planType`, and what exact official display name
-  does Codex assign it? The user-facing “Pro 50×” label can remain separate.
+- When will a released Codex binary expose the source-verified `promax`
+  `PlanType`? Its official source display name is “Pro (Max),” while the
+  user-facing “Pro 50×” label remains separate.
 - Is 50x relative to the same Plus baseline as the documented Pro 5x/20x
   options, and does the tier expose a comparable seven-day Codex allowance?
 - Should the new tier join the combined public estimate and visible By plan
@@ -150,9 +152,10 @@ schemas, a legacy v0.2 `unknown` projection, Pro 50× browser labels, the
 four-plan Worker fit roster and owner preview, a versioned v1.2 public
 breakdown, and a projection-specific cache version. Existing fit and raw
 composition caches retain their method identities. Source tests use synthetic
-data and the current Codex source/binary fixture remains the verified 17-plan
-contract. The release contract check deliberately refuses the provisional
-value until upstream evidence is reviewed and the ledger is advanced.
+data. The Codex source fixture now reflects 17 named plans including `promax`;
+the installed-binary fixture retains its older 17 values including `unknown`.
+The release contract check deliberately refuses the provisional value until
+the binary and allowance evidence is reviewed.
 
 The nominal factor `0.4` and Pro 50× label are assumptions in this branch.
 No installed application, hosted database, public site, deployment, migration,

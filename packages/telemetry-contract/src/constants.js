@@ -18,7 +18,8 @@ export const MAX_TELEMETRY_BROWSER_BYTES = 1_310_720;
 // openai/codex codex-rs/protocol/src/auth.rs (KnownPlan). "unknown" is our
 // sentinel for a plan Codex has not (yet) named. The usage multiplier is the
 // plan itself (e.g. pro = 20x, prolite = 5x) and is NOT a separate field.
-// promax is a provisional product value pending an upstream Codex contract.
+// promax is source-verified but remains provisional until binary and allowance
+// semantics are reviewed for release.
 export const TELEMETRY_PLAN_TYPES = Object.freeze([
   "free",
   "go",
@@ -47,9 +48,9 @@ export const TELEMETRY_PLAN_DISPLAY_NAMES = Object.freeze({
   free: "Free",
   go: "Go",
   plus: "Plus",
-  pro: "Pro",
-  prolite: "Pro Lite",
-  promax: "Pro Max",
+  pro: "Pro (More)",
+  prolite: "Pro",
+  promax: "Pro (Max)",
   team: "Team",
   self_serve_business_prolite: "Self Serve Business ProLite",
   self_serve_business_usage_based: "Self Serve Business Usage Based",
