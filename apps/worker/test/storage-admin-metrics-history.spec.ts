@@ -8,6 +8,7 @@ import {
   warmStorageAdminMetricsHistoryCache,
 } from "../src/admin-metrics-history";
 import { initializeStorageAnalyticsRuntime } from "../src/storage-analytics-runtime";
+import { readStorageAdminOverview } from "../src/storage-admin-overview";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
 import { initializeTypedV11Admission } from "../src/typed-v11-admission";
 
@@ -169,6 +170,25 @@ describe("typed-storage admin metrics history", () => {
     });
   });
 
+  it("rebuilds a fresh v0.2 cache because it omits v1.2 uploads", async () => {
+    expect(await captureStorageAdminMetricSnapshot(storage(), now))
+      .toEqual({ code: "SNAPSHOT_CAPTURED" });
+    expect(await warmStorageAdminMetricsHistoryCache(storage(), now))
+      .toEqual({ code: "HISTORY_CACHE_REFRESHED" });
+    const row = await target().prepare(
+      "SELECT payload_json FROM analytics_admin_metrics_history_cache WHERE source_id=?",
+    ).bind(sourceId).first<string>("payload_json");
+    const old = JSON.parse(row ?? "null") as { schemaVersion: string };
+    old.schemaVersion = "admin-metrics-history-v0.2";
+    await target().prepare(
+      "UPDATE analytics_admin_metrics_history_cache SET payload_json=? WHERE source_id=?",
+    ).bind(JSON.stringify(old), sourceId).run();
+    await expect(readCachedStorageAdminMetricsHistory(storage(), now + 1_000))
+      .rejects.toMatchObject({ code: "ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE" });
+    expect(await warmStorageAdminMetricsHistoryCache(storage(), now + 1_000))
+      .toEqual({ code: "HISTORY_CACHE_REFRESHED" });
+  });
+
   it("keeps bounded source SQL and preserves an older cache on refresh failure", async () => {
     const statements: string[] = [];
     const observedSource = new Proxy(source(), {
@@ -234,5 +254,16 @@ describe("typed-storage admin metrics history", () => {
     expect(await target().prepare(
       "SELECT COUNT(*) AS n FROM analytics_admin_metric_snapshots",
     ).first<number>("n")).toBe(0);
+  });
+
+  it("refuses incomplete v1.2 schema rather than showing a partial zero", async () => {
+    await source().prepare("CREATE TABLE telemetry_v12_runtime (id INTEGER PRIMARY KEY)").run();
+    await expect(readStorageAdminOverview(storage(), now)).rejects.toMatchObject({
+      status: 503, code: "BACKEND_STORAGE_UNAVAILABLE",
+    });
+    expect(await captureStorageAdminMetricSnapshot(storage(), now))
+      .toEqual({ code: "SNAPSHOT_UNAVAILABLE" });
+    expect(await warmStorageAdminMetricsHistoryCache(storage(), now))
+      .toEqual({ code: "HISTORY_CACHE_UNAVAILABLE" });
   });
 });

@@ -2547,7 +2547,7 @@ describe("synthetic usage monitor service", () => {
       }>;
       gauges: { snapshots: { metrics: Record<string, unknown> }[] };
     }>();
-    expect(body.schemaVersion).toBe("admin-metrics-history-v0.2");
+    expect(body.schemaVersion).toBe("admin-metrics-history-v0.3");
     const today = body.generatedAt.slice(0, 10);
     // The enrolled participant is a real event in today's bucket.
     const participants = body.events.participants;
@@ -2621,7 +2621,7 @@ describe("synthetic usage monitor service", () => {
     );
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      schemaVersion: "admin-metrics-history-v0.2",
+      schemaVersion: "admin-metrics-history-v0.3",
       events: { participants: { total: 1 } },
       gauges: { snapshots: [{ metrics: { participantsTotal: 1 } }] },
     });

@@ -27,8 +27,13 @@ import { QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS } from "./constants";
 import { ApiError } from "./errors";
 import { readPublishedStorageCommunityAdminPreview } from "./storage-community-graph-publication";
 import type { StorageAnalyticsBindings } from "./analytics-delivery";
+import {
+  TELEMETRY_V12_ADMIN_SCHEMA_SQL,
+  telemetryV12AdminSchemaPresent,
+  type TelemetryV12AdminSchemaRow,
+} from "./telemetry-v12-table";
 
-export const ADMIN_METRICS_HISTORY_SCHEMA_VERSION = "admin-metrics-history-v0.2";
+export const ADMIN_METRICS_HISTORY_SCHEMA_VERSION = "admin-metrics-history-v0.3";
 
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 const RECENT_EVENT_CALENDAR_DAYS = 30;
@@ -258,6 +263,7 @@ async function v1UploadEventSeries(
   nowEpoch: number,
   maximumRows?: number,
   includeV11 = false,
+  includeV12 = false,
 ): Promise<{
   uploadedChunks: AdminEventSeries;
   uploadedRecords: AdminEventSeries;
@@ -274,6 +280,9 @@ async function v1UploadEventSeries(
     UNION ALL
     SELECT created_at,record_count,participant_id
       FROM telemetry_v11_chunks WHERE created_at IS NOT NULL
+    ${includeV12 ? `UNION ALL
+    SELECT created_at,record_count,participant_id
+      FROM telemetry_v12_chunks WHERE created_at IS NOT NULL` : ""}
   ) ` : maximumRows === undefined ? "" : `WITH source_rows AS (
     SELECT created_at,record_count,participant_id FROM telemetry_v1_chunks
      WHERE created_at IS NOT NULL
@@ -431,6 +440,7 @@ async function buildAdminMetricsHistory(
   nowEpoch: number,
   maximumRows?: number,
   includeV11 = false,
+  includeV12 = false,
 ): Promise<AdminMetricsHistory> {
   const [
     participants,
@@ -458,6 +468,7 @@ async function buildAdminMetricsHistory(
       nowEpoch,
       includeV11 ? undefined : maximumRows,
       includeV11,
+      includeV12,
     ),
     acceptedTelemetryUploadEventSeries(source, nowEpoch, maximumRows),
     downloadSeries(source, nowEpoch),
@@ -487,11 +498,12 @@ async function buildAdminMetricsHistory(
 }
 
 /** Scheduled typed-storage builder. Operational tables retain their explicit
- * row bound. Compact v1/v1.1 upload headers are aggregated exactly so a large
+ * row bound. Compact v1/v1.1/v1.2 upload headers are aggregated exactly so a large
  * recovered corpus does not make the cache permanently unavailable. */
 async function readStorageAdminMetricsHistory(
   bindings: StorageAnalyticsBindings,
   nowEpoch: number,
+  includeV12: boolean,
 ): Promise<AdminMetricsHistory> {
   return buildAdminMetricsHistory(
     bindings.source,
@@ -499,6 +511,7 @@ async function readStorageAdminMetricsHistory(
     nowEpoch,
     STORAGE_ADMIN_SOURCE_ROW_LIMIT,
     true,
+    includeV12,
   );
 }
 
@@ -807,10 +820,13 @@ export interface AdminMetricsHistoryCacheResult {
 
 async function storageAdminSourceMatches(
   bindings: StorageAnalyticsBindings,
-): Promise<boolean> {
-  if (bindings.source === bindings.target) return false;
-  const ready = await bindings.source.prepare(
-    `SELECT 1 AS ready FROM storage_source_state source
+): Promise<{ matches: boolean; includeV12: boolean }> {
+  if (bindings.source === bindings.target) {
+    return { matches: false, includeV12: false };
+  }
+  const row = await bindings.source.prepare(
+    `SELECT 1 AS ready, ${TELEMETRY_V12_ADMIN_SCHEMA_SQL}
+       FROM storage_source_state source
        JOIN typed_v1_admission_state v1 ON v1.id=1
          AND v1.runtime_contract_version=1
        JOIN typed_v11_admission_state v11 ON v11.id=1
@@ -818,8 +834,10 @@ async function storageAdminSourceMatches(
       WHERE source.singleton=1 AND source.source_id=?1
         AND v1.source_namespace=?2 AND v11.source_namespace=?2
       LIMIT 1`,
-  ).bind(bindings.sourceId, bindings.sourceNamespace).first<number>("ready");
-  return ready === 1;
+  ).bind(bindings.sourceId, bindings.sourceNamespace)
+    .first<{ ready: number } & TelemetryV12AdminSchemaRow>();
+  if (row?.ready !== 1) return { matches: false, includeV12: false };
+  return { matches: true, includeV12: telemetryV12AdminSchemaPresent(row) };
 }
 
 /**
@@ -887,7 +905,8 @@ export async function warmStorageAdminMetricsHistoryCache(
   nowEpoch: number,
 ): Promise<AdminMetricsHistoryCacheResult> {
   try {
-    if (!await storageAdminSourceMatches(bindings)) {
+    const source = await storageAdminSourceMatches(bindings);
+    if (!source.matches) {
       return { code: "HISTORY_CACHE_UNAVAILABLE" };
     }
     const existing = await bindings.target.prepare(
@@ -922,7 +941,9 @@ export async function warmStorageAdminMetricsHistoryCache(
       return { code: "HISTORY_CACHE_CURRENT" };
     }
 
-    const history = await readStorageAdminMetricsHistory(bindings, nowEpoch);
+    const history = await readStorageAdminMetricsHistory(
+      bindings, nowEpoch, source.includeV12,
+    );
     // Gauge history starts at the first successful typed capture. An empty
     // target must remain unavailable rather than look like proven zero history.
     if (history.gauges.snapshots.length === 0) {
@@ -1080,6 +1101,7 @@ async function readCurrentStateGauges(
   nowEpoch: number,
   maximumRows?: number,
   includeV11 = false,
+  includeV12 = false,
 ): Promise<Record<string, number>> {
   const cutoffAt = iso(
     nowEpoch - QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS,
@@ -1101,6 +1123,9 @@ async function readCurrentStateGauges(
        UNION ALL
        SELECT participant_id,record_count
          FROM telemetry_v11_chunks
+       ${includeV12 ? `UNION ALL
+       SELECT participant_id,record_count
+         FROM telemetry_v12_chunks` : ""}
      )` : `bounded_chunks AS (
        SELECT id,participant_id,record_count,superseded_at,r2_key,created_at
          FROM telemetry_v1_chunks ORDER BY created_at DESC,id DESC
@@ -1122,10 +1147,20 @@ async function readCurrentStateGauges(
      ),
      chunk_metrics AS (
        ${includeV11 ? `SELECT COUNT(*) AS chunks,
-              (SELECT COUNT(*) FROM telemetry_analytical_chunks)
+              ((SELECT COUNT(*) FROM telemetry_analytical_chunks)
+               ${includeV12 ? `+ (SELECT COUNT(*) FROM telemetry_v12_domain_heads head
+                 JOIN telemetry_v12_domain_days day ON day.generation_id=head.generation_id
+                 JOIN telemetry_v12_chunks chunk ON chunk.participant_id=head.participant_id
+                  AND chunk.manifest_id=day.manifest_id)` : ""})
                 AS current_chunks,
-              COALESCE((SELECT SUM(accepted_record_count)
-                FROM telemetry_analytical_chunks),0) AS current_records
+              (COALESCE((SELECT SUM(accepted_record_count)
+                FROM telemetry_analytical_chunks),0)
+               ${includeV12 ? `+ COALESCE((SELECT SUM(chunk.record_count)
+                 FROM telemetry_v12_domain_heads head
+                 JOIN telemetry_v12_domain_days day ON day.generation_id=head.generation_id
+                 JOIN telemetry_v12_chunks chunk ON chunk.participant_id=head.participant_id
+                  AND chunk.manifest_id=day.manifest_id),0)` : ""})
+                AS current_records
          FROM typed_chunk_headers` : `SELECT COUNT(*) AS chunks,
               COALESCE(SUM(CASE WHEN superseded_at IS NULL
                 THEN 1 ELSE 0 END), 0)
@@ -1179,6 +1214,10 @@ async function readCurrentStateGauges(
                   SELECT 1 FROM telemetry_v11_chunks
                    WHERE r2_key = pending.r2_key
                 )
+                ${includeV12 ? `OR EXISTS (
+                  SELECT 1 FROM telemetry_v12_chunks
+                   WHERE r2_key = pending.r2_key
+                )` : ""}
               ) THEN 1 ELSE 0 END), 0) AS due_referenced,
               COALESCE(SUM(CASE WHEN registered_at <= ?1
                 AND NOT EXISTS (
@@ -1196,6 +1235,10 @@ async function readCurrentStateGauges(
                   SELECT 1 FROM telemetry_v11_chunks
                    WHERE r2_key = pending.r2_key
                 )
+                ${includeV12 ? `AND NOT EXISTS (
+                  SELECT 1 FROM telemetry_v12_chunks
+                   WHERE r2_key = pending.r2_key
+                )` : ""}
                 THEN 1 ELSE 0 END), 0) AS due_unreferenced
          FROM pending
      ),
@@ -1310,7 +1353,8 @@ export async function captureStorageAdminMetricSnapshot(
   nowEpoch: number,
 ): Promise<AdminMetricSnapshotResult> {
   try {
-    if (!await storageAdminSourceMatches(bindings)) {
+    const source = await storageAdminSourceMatches(bindings);
+    if (!source.matches) {
       return { code: "SNAPSHOT_UNAVAILABLE" };
     }
     const registered = await bindings.target.prepare(
@@ -1334,6 +1378,7 @@ export async function captureStorageAdminMetricSnapshot(
         nowEpoch,
         STORAGE_ADMIN_SOURCE_ROW_LIMIT,
         true,
+        source.includeV12,
       ),
       readStoragePublishedBandGauges(bindings, nowEpoch),
     ]);
