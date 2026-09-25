@@ -75,6 +75,15 @@ period, keeping the same identities and accepted upload history. Ordinary
 enrollment replay does not renew. Lost responses converge on the existing
 renewed lease, without consuming another installation slot.
 
+An already-present, active v1.2 upload authorization follows that same renewal
+only when it matches the exact owner, device, v1.1 authorization, and old lease;
+the expiry extension commits atomically with the renewed lease. Renewal does not
+create an absent v1.2 grant or reactivate a revoked or mismatched grant. For D1,
+apply forward migration `0011_accountless_v12_renewal.sql` before deploying or
+activating the renewal code that extends v1.2 grants. The code remains
+fail-closed on older schemas, and the migration narrowly permits only this
+active-grant expiry extension.
+
 Revocation, erasure, containment, conflicting identities and policy mismatches
 remain terminal. Renewal never clears a local opt-out, recreates an erased
 owner, invents consent, or grants public-aggregate eligibility. This implements

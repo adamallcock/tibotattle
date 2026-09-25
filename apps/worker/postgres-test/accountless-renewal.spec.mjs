@@ -261,8 +261,8 @@ test("PostgreSQL accountless renewal preserves Cloudflare authority, boundary, a
       boundarySnapshot.v11_expires_at,
     ].map((value) => new Date(value).getTime())).size, 1,
     "ledger/device/owner/v1.1 expires move together");
-    assert.equal(new Date(boundarySnapshot.v12_expires_at).getTime(), boundaryExpiry,
-      "the v1.2 grant keeps its old expiry, matching current Cloudflare behavior");
+    assert.equal(new Date(boundarySnapshot.v12_expires_at).getTime(), Date.parse(boundaryResult.expiresAt),
+      "an exact active v1.2 grant follows the same renewed lease");
     const boundaryReplay = await renew(boundary, boundaryNow);
     assert.equal(boundaryReplay.state, "existing");
     assert.equal(boundaryReplay.renewalGeneration, 1);
@@ -270,9 +270,7 @@ test("PostgreSQL accountless renewal preserves Cloudflare authority, boundary, a
       `SELECT expires_at FROM ${q(schema, "accountless_v12_device_authorizations")}
         WHERE enrollment_device_id=$1`, [boundary.deviceId],
     );
-    assert.equal(new Date(v12Row.rows[0].expires_at).getTime(), boundaryExpiry);
-    assert.notEqual(new Date(v12Row.rows[0].expires_at).getTime(),
-      Date.parse(boundaryResult.expiresAt));
+    assert.equal(new Date(v12Row.rows[0].expires_at).getTime(), Date.parse(boundaryResult.expiresAt));
 
     // Expired-but-active ledgers are renewable through explicit bearer authority.
     const expired = await seedAccountlessGraph({ pool, schema, issuedAtEpoch: base + 40 * DAY });
@@ -281,9 +279,72 @@ test("PostgreSQL accountless renewal preserves Cloudflare authority, boundary, a
     assert.equal(expiredResult.state, "renewed");
     assert.equal(expiredResult.renewalGeneration, 1);
     assert.equal(Date.parse(expiredResult.expiresAt), expiredAt + LEASE);
+    assert.equal((await pool.query(
+      `SELECT 1 FROM ${q(schema, "accountless_v12_device_authorizations")}
+        WHERE enrollment_device_id=$1`, [expired.deviceId],
+    )).rowCount, 0, "renewal never creates an absent v1.2 grant");
+
+    // Prove the renewed exact grant is still accepted by PostgreSQL's live
+    // v1.2 authority view, not merely that its stored expiry looks plausible.
+    const activeNow = Date.now();
+    const activeV12 = await seedAccountlessGraph({
+      pool, schema, issuedAtEpoch: activeNow - 23 * DAY, withV12: true,
+    });
+    await pool.query(`UPDATE ${q(schema, "telemetry_v12_runtime")} SET state='active' WHERE id=1`);
+    await pool.query(`UPDATE ${q(schema, "telemetry_v12_typed_runtime")} SET state='active' WHERE id=1`);
+    const activeResult = await renew(activeV12, activeNow);
+    assert.equal(activeResult.state, "renewed");
+    assert.equal((await pool.query(
+      `SELECT participant_id, device_id FROM ${q(schema, "telemetry_v12_typed_active_authorizations")}
+        WHERE participant_id=$1 AND device_id=$2`,
+      [activeV12.participantId, activeV12.deviceId],
+    )).rowCount, 1, "the renewed grant continues to authorize v1.2 writes");
+
+    // Optional grants which are revoked or point at another participant stay
+    // untouched while the independent accountless/v1.1 lease renews.
+    const revokedV12 = await seedAccountlessGraph({
+      pool, schema, issuedAtEpoch: base + 50 * DAY, withV12: true,
+    });
+    const revokedAt = new Date(base + 51 * DAY).toISOString();
+    await pool.query(
+      `UPDATE ${q(schema, "accountless_v12_device_authorizations")}
+          SET state='revoked', revoked_at=$2::timestamptz,
+              revocation_reason='security_reset' WHERE enrollment_device_id=$1`,
+      [revokedV12.deviceId, revokedAt],
+    );
+    const revokedResult = await renew(revokedV12, Date.parse(revokedV12.expiresAt));
+    assert.equal(revokedResult.state, "renewed");
+    const revokedGrant = await pool.query(
+      `SELECT state, expires_at FROM ${q(schema, "accountless_v12_device_authorizations")}
+        WHERE enrollment_device_id=$1`, [revokedV12.deviceId],
+    );
+    assert.equal(revokedGrant.rows[0].state, "revoked");
+    assert.equal(new Date(revokedGrant.rows[0].expires_at).getTime(), Date.parse(revokedV12.expiresAt));
+
+    const mismatchedV12 = await seedAccountlessGraph({
+      pool, schema, issuedAtEpoch: base + 55 * DAY, withV12: true,
+    });
+    const otherOwner = await seedAccountlessGraph({
+      pool, schema, issuedAtEpoch: base + 56 * DAY,
+    });
+    await pool.query(
+      `UPDATE ${q(schema, "accountless_v12_device_authorizations")}
+          SET participant_id=$2 WHERE enrollment_device_id=$1`,
+      [mismatchedV12.deviceId, otherOwner.participantId],
+    );
+    const mismatchedResult = await renew(mismatchedV12, Date.parse(mismatchedV12.expiresAt));
+    assert.equal(mismatchedResult.state, "renewed");
+    const mismatchedGrant = await pool.query(
+      `SELECT participant_id, state, expires_at
+         FROM ${q(schema, "accountless_v12_device_authorizations")}
+        WHERE enrollment_device_id=$1`, [mismatchedV12.deviceId],
+    );
+    assert.equal(mismatchedGrant.rows[0].participant_id, otherOwner.participantId);
+    assert.equal(mismatchedGrant.rows[0].state, "active");
+    assert.equal(new Date(mismatchedGrant.rows[0].expires_at).getTime(), Date.parse(mismatchedV12.expiresAt));
 
     // Multiple requests serialize on the ledger and converge on one generation.
-    const concurrent = await seedAccountlessGraph({ pool, schema, issuedAtEpoch: base + 60 * DAY });
+    const concurrent = await seedAccountlessGraph({ pool, schema, issuedAtEpoch: base + 60 * DAY, withV12: true });
     const concurrentNow = Date.parse(concurrent.expiresAt) - 5 * DAY;
     const concurrentResults = await Promise.all(Array.from({ length: 4 }, () =>
       renew(concurrent, concurrentNow)));
@@ -292,13 +353,14 @@ test("PostgreSQL accountless renewal preserves Cloudflare authority, boundary, a
     assert.ok(concurrentResults.every((result) => result.renewalGeneration === 1));
 
     // A mid-transaction provider failure rolls the ledger and all graph rows back.
-    const rollback = await seedAccountlessGraph({ pool, schema, issuedAtEpoch: base + 80 * DAY });
+    const rollback = await seedAccountlessGraph({ pool, schema, issuedAtEpoch: base + 80 * DAY, withV12: true });
     const rollbackNow = Date.parse(rollback.expiresAt) - 2 * DAY;
     const rollbackBefore = await readGraphSnapshot(pool, schema, rollback.deviceId);
     let injected = false;
     const failingPool = interceptPool(pool, async (text, values, query) => {
       if (!injected && /^\s*UPDATE\b/u.test(text)
-          && text.includes('"accountless_v11_device_authorizations"')) {
+          && text.includes('"accountless_v12_device_authorizations"')) {
+        await query();
         injected = true;
         throw new Error("private provider diagnostic");
       }
@@ -309,7 +371,7 @@ test("PostgreSQL accountless renewal preserves Cloudflare authority, boundary, a
         && !error.message.includes("private provider diagnostic"));
     assert.equal(injected, true);
     assert.deepEqual(await readGraphSnapshot(pool, schema, rollback.deviceId), rollbackBefore,
-      "failure after the ledger/device/owner updates rolls all four rows back");
+      "failure after the v1.2 update rolls the full renewal transaction back");
 
     // A lost commit acknowledgement is resolved from durable generation state.
     const ambiguous = await seedAccountlessGraph({ pool, schema, issuedAtEpoch: base + 90 * DAY });

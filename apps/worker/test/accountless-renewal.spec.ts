@@ -26,12 +26,25 @@ import { makeV11Day, stageV11Day, v11UsageRecord } from "./helpers/telemetry-v11
 import { createTelemetryV11DomainPredecessor, activateTelemetryV11Domain } from "../src/telemetry-v11-domain";
 import { telemetryV11DomainManifestDigestInput } from "@app-usagemonitor/telemetry-contract";
 import { eraseParticipantAsOwner } from "../src/participant-erasure";
+import {
+  ACCOUNTLESS_V12_UPLOAD_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_V12_UPLOAD_POLICY_VERSION,
+  ACCOUNTLESS_V12_UPLOAD_SCHEMA_VERSION,
+  assertTelemetryV12WriteAllowed,
+} from "../src/telemetry-transport-policy";
+import {
+  TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+  TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
+  TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
+} from "@app-usagemonitor/telemetry-contract";
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
   TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[];
   TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[];
   TEST_INGESTION_BRIDGE_MIGRATIONS: D1Migration[];
+  TEST_TYPED_V11_ADMISSION_MIGRATIONS: D1Migration[];
+  TEST_TYPED_V1_ADMISSION_MIGRATIONS: D1Migration[];
   TEST_INGESTION_ISOLATION_MIGRATIONS: D1Migration[];
 }
 
@@ -131,6 +144,97 @@ async function enrollAndOwn(deviceId: string, secret: Uint8Array): Promise<{
   return { authorization, participantId: owner.participant_id };
 }
 
+async function applyV12AuthorityMigrations(): Promise<void> {
+  await applyD1Migrations(db(), bindings().TEST_TYPED_INGESTION_MIGRATIONS);
+  await applyD1Migrations(db(), bindings().TEST_INGESTION_BRIDGE_MIGRATIONS);
+  await applyD1Migrations(db(), bindings().TEST_TYPED_V11_ADMISSION_MIGRATIONS);
+  await applyD1Migrations(db(), bindings().TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+  await applyD1Migrations(db(), bindings().TEST_INGESTION_ISOLATION_MIGRATIONS);
+}
+
+async function applyV12AuthorityMigrationsBeforeRenewal(): Promise<void> {
+  await applyD1Migrations(db(), bindings().TEST_TYPED_INGESTION_MIGRATIONS);
+  await applyD1Migrations(db(), bindings().TEST_INGESTION_BRIDGE_MIGRATIONS);
+  await applyD1Migrations(db(), bindings().TEST_TYPED_V11_ADMISSION_MIGRATIONS);
+  await applyD1Migrations(db(), bindings().TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+  const migrations = bindings().TEST_INGESTION_ISOLATION_MIGRATIONS;
+  const lastPreRenewalIndex = migrations.findIndex(
+    (migration) => migration.name === "0010_v12_quarantine_admission.sql",
+  );
+  if (lastPreRenewalIndex < 0) {
+    throw new Error("missing v1.2 pre-renewal migration boundary");
+  }
+  await applyD1Migrations(db(), migrations.slice(0, lastPreRenewalIndex + 1));
+}
+
+async function insertV12Grant(
+  deviceId: string,
+  participantId: string,
+  issuedAt: string,
+  expiresAt: string,
+  state: "active" | "revoked" = "active",
+): Promise<void> {
+  await db().prepare(`
+    INSERT INTO accountless_v12_device_authorizations (
+      enrollment_device_id, participant_id, device_credential_id,
+      schema_version, policy_version, authorization_basis, telemetry_schema_version,
+      field_dictionary_version, privacy_contract_version, authorized_at,
+      expires_at, state, revoked_at, revocation_reason
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    deviceId,
+    participantId,
+    deviceId,
+    ACCOUNTLESS_V12_UPLOAD_SCHEMA_VERSION,
+    ACCOUNTLESS_V12_UPLOAD_POLICY_VERSION,
+    ACCOUNTLESS_V12_UPLOAD_AUTHORIZATION_BASIS,
+    TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+    TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
+    TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
+    issuedAt,
+    expiresAt,
+    state,
+    state === "revoked" ? issuedAt : null,
+    state === "revoked" ? "security_reset" : null,
+  ).run();
+}
+
+async function insertMismatchedV12Grant(
+  deviceId: string,
+  mismatchedParticipantId: string,
+  issuedAt: string,
+  expiresAt: string,
+): Promise<void> {
+  // Construct impossible-but-defensive restored state: all referenced rows
+  // exist, but the v1.2 row names another participant. The normal admission
+  // trigger prevents creating this state; renewal must still avoid broadening
+  // authority if it is encountered after restore/corruption.
+  await db().prepare("DROP TRIGGER accountless_v12_authorization_admission").run();
+  try {
+    await insertV12Grant(deviceId, mismatchedParticipantId, issuedAt, expiresAt);
+  } finally {
+    await db().prepare(`
+      CREATE TRIGGER accountless_v12_authorization_admission
+      BEFORE INSERT ON accountless_v12_device_authorizations
+      WHEN NOT EXISTS (
+        SELECT 1 FROM accountless_upload_owners owner
+          JOIN accountless_enrollment_ledger ledger
+            ON ledger.device_id = owner.enrollment_device_id
+          JOIN device_credentials device ON device.id = owner.device_credential_id
+         WHERE owner.enrollment_device_id = NEW.enrollment_device_id
+           AND owner.participant_id = NEW.participant_id
+           AND owner.device_credential_id = NEW.device_credential_id
+           AND owner.state = 'active' AND owner.expires_at = NEW.expires_at
+           AND ledger.state = 'active' AND ledger.expires_at = NEW.expires_at
+           AND device.authority_kind = 'accountless' AND device.state = 'active'
+           AND device.accountless_enrollment_device_id = NEW.enrollment_device_id
+           AND device.expires_at = NEW.expires_at
+      )
+      BEGIN SELECT RAISE(ABORT, 'accountless v12 authorization unavailable'); END
+    `).run();
+  }
+}
+
 beforeEach(async () => {
   await reset();
   await applyD1Migrations(db(), bindings().TEST_MIGRATIONS);
@@ -145,6 +249,71 @@ beforeEach(async () => {
 });
 
 describe("accountless owner lease renewal", () => {
+  it("fails closed and rolls back the whole lease graph before migration 0011", async () => {
+    const wallClock = Date.now();
+    const issuedAtEpoch = wallClock - 23 * DAY;
+    const issuedAt = new Date(issuedAtEpoch).toISOString();
+    const oldExpiry = new Date(issuedAtEpoch + 30 * DAY).toISOString();
+    const nextExpiry = new Date(wallClock + 30 * DAY).toISOString();
+    const deviceId = crypto.randomUUID();
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    const clock = vi.spyOn(Date, "now").mockReturnValue(issuedAtEpoch);
+    try {
+      await applyV12AuthorityMigrationsBeforeRenewal();
+      const { authorization, participantId } = await enrollAndOwn(deviceId, secret);
+      await insertV12Grant(deviceId, participantId, issuedAt, oldExpiry);
+
+      const snapshot = async () => db().prepare(`
+        SELECT ledger.expires_at AS ledger_expires_at,
+               ledger.renewal_generation, ledger.renewed_at,
+               device.expires_at AS device_expires_at,
+               owner.expires_at AS owner_expires_at,
+               v11.expires_at AS v11_expires_at,
+               v12.state AS v12_state, v12.expires_at AS v12_expires_at
+          FROM accountless_enrollment_ledger ledger
+          JOIN device_credentials device ON device.id = ledger.device_id
+          JOIN accountless_upload_owners owner
+            ON owner.enrollment_device_id = ledger.device_id
+          JOIN accountless_v11_device_authorizations v11
+            ON v11.enrollment_device_id = ledger.device_id
+          JOIN accountless_v12_device_authorizations v12
+            ON v12.enrollment_device_id = ledger.device_id
+         WHERE ledger.device_id = ?
+      `).bind(deviceId).first();
+      const before = await snapshot();
+      expect(before).toEqual({
+        ledger_expires_at: oldExpiry,
+        renewal_generation: 0,
+        renewed_at: null,
+        device_expires_at: oldExpiry,
+        owner_expires_at: oldExpiry,
+        v11_expires_at: oldExpiry,
+        v12_state: "active",
+        v12_expires_at: oldExpiry,
+      });
+
+      await expect(db().prepare(`
+        UPDATE accountless_v12_device_authorizations SET expires_at = ?
+         WHERE enrollment_device_id = ?
+      `).bind(nextExpiry, deviceId).run()).rejects.toThrow(
+        "accountless v12 authorization immutable",
+      );
+
+      clock.mockReturnValue(wallClock);
+      const response = await api("/api/v1/accountless/renewal", {
+        method: "POST",
+        headers: { authorization, "content-type": "application/json" },
+        body: JSON.stringify(RENEWAL_BODY),
+      });
+      expect(response.status).toBe(503);
+      expect(await errorCode(response)).toBe("BACKEND_STORAGE_UNAVAILABLE");
+      expect(await snapshot()).toEqual(before);
+    } finally {
+      clock.mockRestore();
+      secret.fill(0);
+    }
+  });
+
   it("uses a local HTTP renewal journey to advance only the same active graph", async () => {
     const wallClock = Date.now();
     const issuedAt = wallClock - 23 * DAY;
@@ -457,6 +626,76 @@ describe("accountless owner lease renewal", () => {
     }
   });
 
+  it("does not create, reactivate, or extend absent, revoked, or mismatched v1.2 grants", async () => {
+    const wallClock = Date.now();
+    const issuedAtEpoch = wallClock - 23 * DAY;
+    const issuedAt = new Date(issuedAtEpoch).toISOString();
+    const oldExpiry = new Date(issuedAtEpoch + 30 * DAY).toISOString();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(issuedAtEpoch);
+    const absentId = crypto.randomUUID();
+    const absentSecret = crypto.getRandomValues(new Uint8Array(32));
+    const revokedId = crypto.randomUUID();
+    const revokedSecret = crypto.getRandomValues(new Uint8Array(32));
+    const mismatchedId = crypto.randomUUID();
+    const mismatchedSecret = crypto.getRandomValues(new Uint8Array(32));
+    const otherId = crypto.randomUUID();
+    const otherSecret = crypto.getRandomValues(new Uint8Array(32));
+    try {
+      await applyV12AuthorityMigrations();
+      const absent = await enrollAndOwn(absentId, absentSecret);
+      const revoked = await enrollAndOwn(revokedId, revokedSecret);
+      const mismatched = await enrollAndOwn(mismatchedId, mismatchedSecret);
+      const other = await enrollAndOwn(otherId, otherSecret);
+      await insertV12Grant(revokedId, revoked.participantId, issuedAt, oldExpiry, "revoked");
+      await insertMismatchedV12Grant(mismatchedId, other.participantId, issuedAt, oldExpiry);
+
+      clock.mockReturnValue(wallClock);
+      for (const owner of [absent, revoked, mismatched]) {
+        const response = await api("/api/v1/accountless/renewal", {
+          method: "POST",
+          headers: { authorization: owner.authorization, "content-type": "application/json" },
+          body: JSON.stringify(RENEWAL_BODY),
+        });
+        expect(response.status, await response.clone().text()).toBe(200);
+        expect(await response.json()).toMatchObject({ state: "renewed", renewalGeneration: 1 });
+      }
+
+      expect(await db().prepare(`SELECT count(*) AS count
+        FROM accountless_v12_device_authorizations WHERE enrollment_device_id = ?`)
+        .bind(absentId).first("count")).toBe(0);
+      expect(await db().prepare(`SELECT participant_id, state, expires_at
+        FROM accountless_v12_device_authorizations WHERE enrollment_device_id = ?`)
+        .bind(revokedId).first()).toEqual({
+        participant_id: revoked.participantId,
+        state: "revoked",
+        expires_at: oldExpiry,
+      });
+      expect(await db().prepare(`SELECT participant_id, state, expires_at
+        FROM accountless_v12_device_authorizations WHERE enrollment_device_id = ?`)
+        .bind(mismatchedId).first()).toEqual({
+        participant_id: other.participantId,
+        state: "active",
+        expires_at: oldExpiry,
+      });
+
+      await db().prepare("UPDATE telemetry_v12_runtime SET state = 'active' WHERE id = 1").run();
+      for (const [owner, deviceId] of [
+        [absent, absentId], [revoked, revokedId], [mismatched, mismatchedId],
+      ] as const) {
+        await expect(assertTelemetryV12WriteAllowed(db(), {
+          participantId: owner.participantId,
+          deviceId,
+        })).rejects.toMatchObject({ code: "TELEMETRY_TRANSPORT_BLOCKED" });
+      }
+    } finally {
+      clock.mockRestore();
+      absentSecret.fill(0);
+      revokedSecret.fill(0);
+      mismatchedSecret.fill(0);
+      otherSecret.fill(0);
+    }
+  });
+
   it("fails closed for a ledger-only enrollment and permanently revoked or erased graphs", async () => {
     const deviceId = crypto.randomUUID();
     const secret = crypto.getRandomValues(new Uint8Array(32));
@@ -527,7 +766,11 @@ describe("accountless owner lease renewal", () => {
     const deviceId = crypto.randomUUID();
     const secret = crypto.getRandomValues(new Uint8Array(32));
     try {
-      const { authorization } = await enrollAndOwn(deviceId, secret);
+      await applyV12AuthorityMigrations();
+      const { authorization, participantId } = await enrollAndOwn(deviceId, secret);
+      const originalExpiry = new Date(issuedAt + 30 * DAY).toISOString();
+      await insertV12Grant(deviceId, participantId,
+        new Date(issuedAt).toISOString(), originalExpiry);
       clock.mockReturnValue(wallClock);
       const concurrent = await Promise.all(Array.from({ length: 4 }, () =>
         renewAccountlessUploadOwner(db(), authorization, RENEWAL_BODY, wallClock),
@@ -549,13 +792,23 @@ describe("accountless owner lease renewal", () => {
         owner_expires_at: new Date(wallClock + 30 * DAY).toISOString(),
         authorization_expires_at: new Date(wallClock + 30 * DAY).toISOString(),
       });
+      const v12Expiry = new Date(wallClock + 30 * DAY).toISOString();
+      expect(await db().prepare(`SELECT state, expires_at
+        FROM accountless_v12_device_authorizations WHERE enrollment_device_id = ?`)
+        .bind(deviceId).first()).toEqual({ state: "active", expires_at: v12Expiry });
+      await db().prepare("UPDATE telemetry_v12_runtime SET state = 'active' WHERE id = 1").run();
+      await expect(assertTelemetryV12WriteAllowed(db(), { participantId, deviceId }))
+        .resolves.toBeUndefined();
 
       const rollbackId = crypto.randomUUID();
       const rollbackSecret = crypto.getRandomValues(new Uint8Array(32));
-      // Create this independent graph with only seven days remaining too, so
-      // the injected D1 failure reaches the four-statement renewal batch.
+      // Create this independent graph with a matching v1.2 grant too, so the
+      // appended failure proves the complete D1 batch rolls its renewal back.
       clock.mockReturnValue(issuedAt);
       const rollback = await enrollAndOwn(rollbackId, rollbackSecret);
+      const rollbackExpiry = new Date(issuedAt + 30 * DAY).toISOString();
+      await insertV12Grant(rollbackId, rollback.participantId,
+        new Date(issuedAt).toISOString(), rollbackExpiry);
       clock.mockReturnValue(wallClock);
       const snapshot = await db().prepare(`SELECT expires_at, renewal_generation, renewed_at
         FROM accountless_enrollment_ledger WHERE device_id = ?`).bind(rollbackId).first();
@@ -599,6 +852,9 @@ describe("accountless owner lease renewal", () => {
         owner_expires_at: snapshot?.expires_at,
         authorization_expires_at: snapshot?.expires_at,
       });
+      expect(await db().prepare(`SELECT state, expires_at
+        FROM accountless_v12_device_authorizations WHERE enrollment_device_id = ?`)
+        .bind(rollbackId).first()).toEqual({ state: "active", expires_at: rollbackExpiry });
       rollbackSecret.fill(0);
     } finally {
       clock.mockRestore();

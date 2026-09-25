@@ -13,6 +13,16 @@ import {
   type AccountlessRenewalResponse,
 } from "./accountless-renewal";
 import { ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION } from "./accountless-ownership";
+import {
+  ACCOUNTLESS_V12_UPLOAD_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_V12_UPLOAD_POLICY_VERSION,
+  ACCOUNTLESS_V12_UPLOAD_SCHEMA_VERSION,
+} from "./telemetry-transport-policy";
+import {
+  TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+  TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
+  TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
+} from "@app-usagemonitor/telemetry-contract";
 import { deviceHash, parseDeviceAuthorization } from "./device-auth";
 import { timingSafeEqual } from "./crypto";
 import { ApiError } from "./errors";
@@ -378,8 +388,9 @@ async function authenticatedRenewableGraph(
 /**
  * Renew only the exact active v1.1 accountless owner graph. Lock bearer rows
  * before the ledger, matching the upload path; row locks serialize renewals
- * for one device. All four fenced updates and their readback commit or roll
- * back together. As on Cloudflare, v1.2 grants are deliberately not extended.
+ * for one device. Any exact, active v1.2 grant is extended in the same
+ * transaction; absent, revoked, or mismatched grants are never created or
+ * reactivated. Every fenced update and readback commits or rolls back together.
  */
 export async function renewPostgresAccountlessUploadOwner(
   pool: PostgresPool,
@@ -434,6 +445,54 @@ export async function renewPostgresAccountlessUploadOwner(
           ledger.expires_at, ledger.renewal_generation, ledger.renewed_at],
       );
       if (ledgerUpdate.rowCount !== 1) throw unavailable();
+
+      // v1.2 is optional authority layered on top of the v1.1 owner lease.
+      // Extend only an existing exact grant whose previous expiry matched the
+      // complete old graph; a missing/revoked/mismatched row is an intentional
+      // no-op and never gains authority as a side effect of renewal.
+      const v12AuthorizationUpdate = await client.query(
+        `UPDATE ${table(schema, "accountless_v12_device_authorizations")}
+            SET expires_at = $1::timestamptz
+          WHERE enrollment_device_id = $2 AND participant_id = $3
+            AND device_credential_id = $4
+            AND schema_version = $5 AND policy_version = $6 AND authorization_basis = $7
+            AND telemetry_schema_version = $8 AND field_dictionary_version = $9
+            AND privacy_contract_version = $10
+            AND state = 'active' AND expires_at = $11::timestamptz
+            AND EXISTS (
+              SELECT 1 FROM ${table(schema, "accountless_enrollment_ledger")} ledger
+                JOIN ${table(schema, "accountless_upload_owners")} owner
+                  ON owner.enrollment_device_id = ledger.device_id
+                JOIN ${table(schema, "device_credentials")} device
+                  ON device.id = owner.device_credential_id
+                JOIN ${table(schema, "accountless_v11_device_authorizations")} grant_row
+                  ON grant_row.enrollment_device_id = ledger.device_id
+                 AND grant_row.participant_id = owner.participant_id
+                 AND grant_row.device_credential_id = device.id
+               WHERE ledger.device_id = $2 AND ledger.state = 'active'
+                 AND ledger.expires_at = $1::timestamptz
+                 AND ledger.renewal_generation = $12 AND ledger.renewed_at = $13::timestamptz
+                 AND owner.participant_id = $3 AND owner.device_credential_id = $4
+                 AND owner.state = 'active' AND owner.expires_at = $11::timestamptz
+                 AND device.participant_id = owner.participant_id
+                 AND device.authority_kind = 'accountless'
+                 AND device.accountless_enrollment_device_id = ledger.device_id
+                 AND device.secret_hash = ledger.device_secret_hash
+                 AND device.state = 'active' AND device.social_verified_at IS NULL
+                 AND device.expires_at = $11::timestamptz
+                 AND grant_row.state = 'active'
+                 AND grant_row.telemetry_schema_version = $14
+                 AND grant_row.expires_at = $11::timestamptz
+            )
+          RETURNING enrollment_device_id`,
+        [expiresAt, ledger.device_id, graph.participant_id, ledger.device_id,
+          ACCOUNTLESS_V12_UPLOAD_SCHEMA_VERSION, ACCOUNTLESS_V12_UPLOAD_POLICY_VERSION,
+          ACCOUNTLESS_V12_UPLOAD_AUTHORIZATION_BASIS, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+          TELEMETRY_V12_FIELD_DICTIONARY_VERSION, TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
+          ledger.expires_at, nextGeneration, renewedAt,
+          ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION],
+      );
+      if ((v12AuthorizationUpdate.rowCount ?? 0) > 1) throw unavailable();
 
       const deviceUpdate = await client.query(
         `UPDATE ${table(schema, "device_credentials")}
