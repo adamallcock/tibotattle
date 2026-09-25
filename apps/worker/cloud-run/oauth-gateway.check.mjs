@@ -51,9 +51,12 @@ function request({
   const input = Readable.from(body === null ? [] : [Buffer.from(body)]);
   input.method = method;
   input.url = url;
+  const bodyHeaders = method === "POST" && body !== null
+    ? { "content-type": "application/json", "content-length": String(Buffer.byteLength(body)) }
+    : {};
   input.headers = {
     host,
-    ...(method === "POST" ? { "content-type": "application/json", "content-length": String(Buffer.byteLength(body)) } : {}),
+    ...bodyHeaders,
     origin: PUBLIC_ORIGIN,
     ...headers,
   };
@@ -114,7 +117,7 @@ test("Google start forwards only the allowlisted request and separates serverles
   const result = await invoke(handler, {
     headers: {
       authorization: "Bearer application-session-token",
-      cookie: "__Host-usage-monitor-session=opaque",
+      cookie: "__Host-usage_monitor_session=opaque",
       "x-usage-monitor-csrf": "csrf-test-token",
       "x-serverless-authorization": "Bearer caller-forgery",
       "x-forwarded-host": "spoofed.invalid",
@@ -133,7 +136,7 @@ test("Google start forwards only the allowlisted request and separates serverles
   assert.equal(backendCall.options.headers.get("origin"), PUBLIC_ORIGIN);
   assert.equal(backendCall.options.headers.get("authorization"), "Bearer application-session-token");
   assert.equal(backendCall.options.headers.get("x-serverless-authorization"), `Bearer ${TOKEN}`);
-  assert.equal(backendCall.options.headers.get("cookie"), "__Host-usage-monitor-session=opaque");
+  assert.equal(backendCall.options.headers.has("cookie"), false);
   assert.equal(backendCall.options.headers.get("x-usage-monitor-csrf"), "csrf-test-token");
   for (const header of [
     "x-forwarded-host", "x-forwarded-proto", "forwarded", "cf-connecting-ip",
@@ -148,6 +151,70 @@ test("Google start forwards only the allowlisted request and separates serverles
     event: "oauth_gateway_request", route: "google_start", method: "POST", status: 200,
     durationMs: JSON.parse(logs[0]).durationMs,
   });
+});
+
+test("the companion health and session journey forwards only host-supported exact routes", async () => {
+  const routes = [
+    { path: "/api/health", method: "GET", body: null, contentType: "application/json" },
+    { path: "/api/v1/identity/google/start", method: "POST", body: "{}", contentType: "application/json" },
+    { path: "/api/v1/identity/google/callback?state=opaque&code=opaque", method: "GET", body: null, contentType: "text/html" },
+    { path: "/api/v1/identity/google/result", method: "POST", body: "{}", contentType: "application/json" },
+    { path: "/api/v1/enroll", method: "POST", body: "{}", contentType: "application/json" },
+    { path: "/api/v1/session", method: "GET", body: null, contentType: "application/json" },
+    { path: "/api/v1/logout", method: "POST", body: null, contentType: "application/json" },
+  ];
+  const { fetchImpl: metadata } = metadataFetch();
+  const backendCalls = [];
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      backendCalls.push({ url: new URL(input), options });
+      return new Response(
+        options.headers.get("accept") === "text/html" ? "<html>complete</html>" : "{}",
+        { status: 200, headers: { "content-type": `${options.headers.get("accept")}; charset=utf-8` } },
+      );
+    },
+    logger: () => {},
+  });
+
+  for (const route of routes) {
+    const result = await invoke(handler, {
+      method: route.method,
+      url: route.path,
+      body: route.body,
+      headers: { cookie: "__Host-usage_monitor_session=opaque" },
+    });
+    assert.equal(result.status, 200, `${route.path}: ${result.body.toString("utf8").slice(0, 200)}`);
+  }
+  assert.equal(backendCalls.length, routes.length);
+  for (let index = 0; index < routes.length; index += 1) {
+    const route = routes[index];
+    const { url, options } = backendCalls[index];
+    assert.equal(url.origin, BACKEND_ORIGIN);
+    assert.equal(url.pathname, new URL(route.path, PUBLIC_ORIGIN).pathname);
+    assert.equal(url.search, "");
+    assert.equal(options.headers.get("accept"), route.contentType);
+    assert.equal(options.headers.get("cookie"),
+      route.path === "/api/v1/session" || route.path === "/api/v1/logout"
+        ? "__Host-usage_monitor_session=opaque" : null);
+    assert.equal(options.headers.get("x-serverless-authorization"), `Bearer ${TOKEN}`);
+    if (route.method === "POST" && route.path.endsWith("/logout")) {
+      assert.equal(options.headers.get("origin"), BACKEND_ORIGIN);
+      assert.equal(options.headers.has("content-type"), false);
+      assert.equal(options.body, undefined);
+    } else if (route.method === "POST") {
+      assert.equal(options.headers.get("origin"), PUBLIC_ORIGIN);
+      assert.equal(options.headers.get("content-type"), "application/json");
+      assert.ok(Buffer.byteLength(options.body) <= 16_384);
+    } else {
+      assert.equal(options.headers.has("origin"), false);
+      assert.equal(options.headers.has("content-type"), false);
+      assert.equal(options.body, undefined);
+    }
+  }
+  assert.equal(backendCalls[2].options.headers.get("x-tibotattle-google-callback-query"), "?state=opaque&code=opaque");
+  assert.equal(backendCalls[2].url.search, "", "callback query stays out of the private URL");
 });
 
 test("Google callback stays on the configured public callback origin and query material stays out of logs", async () => {
@@ -193,7 +260,7 @@ test("wrong methods, extra paths, and query parameters on POST routes never reac
     fetchImpl: async (input, options) => {
       if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
       fetchCount += 1;
-      return new Response("{}", { status: 200 });
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
     },
     logger: () => {},
   });
@@ -203,8 +270,23 @@ test("wrong methods, extra paths, and query parameters on POST routes never reac
   assert.equal(wrongMethod.headers.allow, "POST");
   const callbackMethod = await invoke(handler, { method: "POST", url: "/api/v1/identity/google/callback", body: "{}" });
   assert.equal(callbackMethod.status, 405);
+  for (const [path, method] of [
+    ["/api/health", "GET"],
+    ["/api/v1/session", "GET"],
+    ["/api/v1/logout", "POST"],
+  ]) {
+    const wrong = await invoke(handler, {
+      method: method === "GET" ? "POST" : "GET",
+      url: path,
+      body: method === "GET" ? "{}" : null,
+    });
+    assert.equal(wrong.status, 405, path);
+    assert.equal(wrong.headers.allow, method, path);
+  }
   assert.equal(callbackMethod.headers.allow, "GET");
   for (const url of [
+    "/api/v1/me/device-pairings",
+    "/api/v1/me/device-telemetry-consents",
     "/api/v1/admin/action",
     "/api/v1/enroll?unexpected=1",
     "/api/v1/enroll?",
@@ -228,7 +310,7 @@ test("spoofed origins and authorities are rejected while forwarded security head
       backendCount += 1;
       assert.equal(options.headers.has("x-forwarded-host"), false);
       assert.equal(options.headers.has("x-serverless-authorization"), true);
-      return new Response("{}", { status: 200 });
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
     },
     logger: () => {},
   });
@@ -260,9 +342,12 @@ test("request and response bodies, unsupported content, and upstream redirects s
         return new Response("", { status: 302, headers: { location: "https://attacker.example" } });
       }
       if (new URL(input).pathname.endsWith("/enroll")) {
-        return new Response("x".repeat(64 * 1_024 + 1), { status: 201 });
+        return new Response("x".repeat(64 * 1_024 + 1), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        });
       }
-      return new Response("{}", { status: 200 });
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
     },
     logger: () => {},
   });
@@ -285,6 +370,84 @@ test("request and response bodies, unsupported content, and upstream redirects s
   assert.equal(backendCount, 2);
 });
 
+test("route-specific response bounds and media types fail closed", async () => {
+  const { fetchImpl: metadata } = metadataFetch();
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      if (new URL(input).pathname === "/api/v1/session") {
+        return new Response("x".repeat(8 * 1_024 + 1), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "text/plain" } });
+    },
+    logger: () => {},
+  });
+  const oversizedSession = await invoke(handler, {
+    method: "GET", url: "/api/v1/session", body: null,
+  });
+  assert.equal(oversizedSession.status, 502);
+  assert.equal(oversizedSession.json().error.code, "UPSTREAM_UNAVAILABLE");
+  const wrongMediaType = await invoke(handler, { url: "/api/v1/enroll", body: "{}" });
+  assert.equal(wrongMediaType.status, 502);
+  assert.equal(wrongMediaType.json().error.code, "UPSTREAM_UNAVAILABLE");
+});
+
+test("bodyless logout rejects an unexpected body and GET routes reject foreign Origins", async () => {
+  let backendCount = 0;
+  const { fetchImpl: metadata } = metadataFetch();
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      backendCount += 1;
+      return new Response("{}", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+    logger: () => {},
+  });
+  const logoutBody = await invoke(handler, {
+    method: "POST", url: "/api/v1/logout", body: "{}",
+  });
+  assert.equal(logoutBody.status, 413);
+  const foreignSessionOrigin = await invoke(handler, {
+    method: "GET",
+    url: "/api/v1/session",
+    body: null,
+    headers: { origin: "https://attacker.example" },
+  });
+  assert.equal(foreignSessionOrigin.status, 403);
+  assert.equal(backendCount, 0);
+});
+
+test("session routes forward only the exact host-only session cookie", async () => {
+  let backendCount = 0;
+  const { fetchImpl: metadata } = metadataFetch();
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      backendCount += 1;
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    },
+    logger: () => {},
+  });
+  const malformed = await invoke(handler, {
+    method: "GET",
+    url: "/api/v1/session",
+    body: null,
+    headers: { cookie: "__Host-usage-monitor-session=opaque" },
+  });
+  assert.equal(malformed.status, 400);
+  assert.equal(malformed.json().error.code, "COOKIE_INVALID");
+  assert.equal(backendCount, 0);
+});
+
 test("backend response cookies retain host-only session attributes", async () => {
   const { fetchImpl: metadata } = metadataFetch();
   const handler = createOauthGatewayHandler({
@@ -295,7 +458,7 @@ test("backend response cookies retain host-only session attributes", async () =>
         status: 201,
         headers: {
           "content-type": "application/json",
-          "set-cookie": "__Host-usage-monitor-session=secret; Path=/; Secure; HttpOnly; SameSite=Strict",
+          "set-cookie": "__Host-usage_monitor_session=secret; Path=/; Secure; HttpOnly; SameSite=Strict",
         },
       });
     },
@@ -304,7 +467,7 @@ test("backend response cookies retain host-only session attributes", async () =>
   const result = await invoke(handler, { url: "/api/v1/enroll", body: "{}" });
   assert.equal(result.status, 201);
   assert.deepEqual(result.headers["set-cookie"], [
-    "__Host-usage-monitor-session=secret; Path=/; Secure; HttpOnly; SameSite=Strict",
+    "__Host-usage_monitor_session=secret; Path=/; Secure; HttpOnly; SameSite=Strict",
   ]);
   assert.equal(result.headers["cache-control"], "no-store");
 });

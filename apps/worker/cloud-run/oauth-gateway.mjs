@@ -5,19 +5,49 @@ import http from "node:http";
 const BACKEND_ORIGIN = "https://tibotattle-test-app-5t5mehqi7a-ue.a.run.app";
 const METADATA_IDENTITY_URL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity";
 const ROUTES = new Map([
-  ["/api/v1/identity/google/start", Object.freeze({ id: "google_start", method: "POST", maxBodyBytes: 4_096 })],
-  ["/api/v1/identity/google/callback", Object.freeze({ id: "google_callback", method: "GET", maxBodyBytes: 0 })],
-  ["/api/v1/identity/google/result", Object.freeze({ id: "google_result", method: "POST", maxBodyBytes: 8_192 })],
-  ["/api/v1/enroll", Object.freeze({ id: "enroll", method: "POST", maxBodyBytes: 16_384 })],
+  ["/api/health", Object.freeze({
+    id: "health", method: "GET", body: "none", maxBodyBytes: 0,
+    responseTypes: ["application/json"], maxResponseBytes: 16 * 1_024,
+    sessionCookie: false, forwardAuthorization: false,
+  })],
+  ["/api/v1/identity/google/start", Object.freeze({
+    id: "google_start", method: "POST", body: "json", maxBodyBytes: 4_096,
+    responseTypes: ["application/json"], maxResponseBytes: 16 * 1_024,
+    sessionCookie: false,
+  })],
+  ["/api/v1/identity/google/callback", Object.freeze({
+    id: "google_callback", method: "GET", body: "none", maxBodyBytes: 0,
+    responseTypes: ["text/html", "application/json"], maxResponseBytes: 32 * 1_024,
+    sessionCookie: false,
+  })],
+  ["/api/v1/identity/google/result", Object.freeze({
+    id: "google_result", method: "POST", body: "json", maxBodyBytes: 8_192,
+    responseTypes: ["application/json"], maxResponseBytes: 8 * 1_024,
+    sessionCookie: false,
+  })],
+  ["/api/v1/enroll", Object.freeze({
+    id: "enroll", method: "POST", body: "json", maxBodyBytes: 16_384,
+    responseTypes: ["application/json"], maxResponseBytes: 32 * 1_024,
+    sessionCookie: false,
+  })],
+  ["/api/v1/session", Object.freeze({
+    id: "session", method: "GET", body: "none", maxBodyBytes: 0,
+    responseTypes: ["application/json"], maxResponseBytes: 8 * 1_024,
+    sessionCookie: true, forwardAuthorization: false,
+  })],
+  ["/api/v1/logout", Object.freeze({
+    id: "logout", method: "POST", body: "none", maxBodyBytes: 0,
+    responseTypes: ["application/json"], maxResponseBytes: 8 * 1_024,
+    sessionCookie: true, forwardAuthorization: false,
+  })],
 ]);
 const MAX_URL_LENGTH = 8_192;
-const MAX_RESPONSE_BYTES = 64 * 1_024;
 const BACKEND_TIMEOUT_MS = 30_000;
 const METADATA_TIMEOUT_MS = 3_000;
 const MAX_AUTHORIZATION_LENGTH = 8_192;
-const MAX_COOKIE_LENGTH = 16_384;
 const MAX_REQUEST_CSRF_LENGTH = 96;
 const CALLBACK_QUERY_HEADER = "x-tibotattle-google-callback-query";
+const SESSION_COOKIE_MEMBER = /^__Host-usage_monitor_session=[A-Za-z0-9_.-]{0,384}$/u;
 const JWT_PATTERN = /^[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}$/u;
 const RESPONSE_HEADERS = Object.freeze([
   "allow",
@@ -106,7 +136,7 @@ function declaredBodyLength(headers, maximum) {
 }
 
 async function readIncomingBody(request, route) {
-  if (route.method === "GET") {
+  if (route.body === "none") {
     const length = declaredBodyLength(request.headers, 0);
     if ((length !== null && length !== 0) || request.headers["transfer-encoding"] !== undefined) {
       const error = new Error("BODY_INVALID");
@@ -115,7 +145,7 @@ async function readIncomingBody(request, route) {
     }
     return Buffer.alloc(0);
   }
-  if (!jsonContentType(request.headers["content-type"])) {
+  if (route.body !== "json" || !jsonContentType(request.headers["content-type"])) {
     const error = new Error("CONTENT_TYPE_INVALID");
     error.status = 415;
     throw error;
@@ -141,13 +171,18 @@ async function readIncomingBody(request, route) {
   return Buffer.concat(chunks, total);
 }
 
-function upstreamHeaders(request, publicOrigin, route, url) {
+function upstreamHeaders(request, publicOrigin, backendOrigin, route, url) {
   const result = new Headers({
     accept: route.id === "google_callback" ? "text/html" : "application/json",
   });
+  if (route.body === "json") result.set("content-type", "application/json");
   if (route.method === "POST") {
-    result.set("content-type", "application/json");
-    result.set("origin", publicOrigin);
+    // The gateway has already verified the browser-facing Origin. The private
+    // host's logout dispatcher validates Origin against its private Request
+    // URL, so only this exact route receives the backend origin on the trusted
+    // service-to-service hop. OAuth and enrollment retain the public origin
+    // required by their callback configuration.
+    result.set("origin", route.id === "logout" ? backendOrigin : publicOrigin);
   }
   if (route.id === "google_callback" && url.search !== "") {
     // Keep OAuth code/state out of the private backend request URL, which is
@@ -156,7 +191,7 @@ function upstreamHeaders(request, publicOrigin, route, url) {
   }
 
   const authorization = request.headers.authorization;
-  if (authorization !== undefined) {
+  if (route.forwardAuthorization !== false && authorization !== undefined) {
     if (typeof authorization !== "string" || authorization.length > MAX_AUTHORIZATION_LENGTH
         || /[\r\n]/u.test(authorization)) {
       const error = new Error("AUTHORIZATION_INVALID");
@@ -166,8 +201,8 @@ function upstreamHeaders(request, publicOrigin, route, url) {
     result.set("authorization", authorization);
   }
   const cookie = request.headers.cookie;
-  if (cookie !== undefined) {
-    if (typeof cookie !== "string" || cookie.length > MAX_COOKIE_LENGTH || /[\r\n]/u.test(cookie)) {
+  if (route.sessionCookie && cookie !== undefined) {
+    if (typeof cookie !== "string" || !SESSION_COOKIE_MEMBER.test(cookie)) {
       const error = new Error("COOKIE_INVALID");
       error.status = 400;
       throw error;
@@ -324,8 +359,7 @@ export function createOauthGatewayHandler({
     }
     const origin = request.headers.origin;
     if ((route.method === "POST" && origin !== configuration.publicOrigin)
-        || (route.id === "google_callback" && origin !== undefined
-          && origin !== configuration.publicOrigin)) {
+        || (origin !== undefined && origin !== configuration.publicOrigin)) {
       finish(route.id, safeError(403, "CSRF_INVALID"));
       return;
     }
@@ -334,7 +368,13 @@ export function createOauthGatewayHandler({
     let headers;
     try {
       body = await readIncomingBody(request, route);
-      headers = upstreamHeaders(request, configuration.publicOrigin, route, url);
+      headers = upstreamHeaders(
+        request,
+        configuration.publicOrigin,
+        configuration.backendOrigin,
+        route,
+        url,
+      );
     } catch (error) {
       finish(route.id, safeError(
         Number.isSafeInteger(error?.status) ? error.status : 400,
@@ -353,7 +393,7 @@ export function createOauthGatewayHandler({
       const upstream = await fetchImpl(backendUrl, {
         method: route.method,
         headers,
-        ...(route.method === "POST" ? { body } : {}),
+        ...(route.body === "json" ? { body } : {}),
         cache: "no-store",
         redirect: "manual",
         signal: AbortSignal.any([clientAbort.signal, AbortSignal.timeout(BACKEND_TIMEOUT_MS)]),
@@ -362,7 +402,12 @@ export function createOauthGatewayHandler({
         await upstream.body?.cancel().catch(() => undefined);
         throw new Error("UPSTREAM_REDIRECT_REFUSED");
       }
-      const responseBody = await readBoundedResponse(upstream, MAX_RESPONSE_BYTES);
+      const contentType = upstream.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+      if (!route.responseTypes.includes(contentType)) {
+        await upstream.body?.cancel().catch(() => undefined);
+        throw new Error("UPSTREAM_RESPONSE_TYPE_INVALID");
+      }
+      const responseBody = await readBoundedResponse(upstream, route.maxResponseBytes);
       result = {
         status: upstream.status,
         headers: responseHeaders(upstream),
