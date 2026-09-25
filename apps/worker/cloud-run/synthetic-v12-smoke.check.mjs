@@ -191,7 +191,7 @@ function mockReadback(input, envelopeBytes, getFailureStage = () => "", onGcsRea
 }
 
 function fakeDependencies({ failManifest = false, anonymousStatus = 403, effectiveMismatch = false,
-  oversizedHealth = false } = {}) {
+  oversizedHealth = false, healthPrimaryVersion = 39, healthLedgerVersion = 6 } = {}) {
   const calls = [];
   let seedCount = 0;
   let getTokenCount = 0;
@@ -244,8 +244,8 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
             workerApplicationReady: false,
             checks: {
               postgresMajor: 17,
-              primaryMigrationReceipt: { status: "current", version: 38 },
-              ledgerMigrationReceipt: { status: "current", version: 6 },
+              primaryMigrationReceipt: { status: "current", version: healthPrimaryVersion },
+              ledgerMigrationReceipt: { status: "current", version: healthLedgerVersion },
             },
           });
         }
@@ -768,6 +768,22 @@ test("oversized hosted JSON response is rejected before synthetic authority is s
     { code: "SMOKE_RESPONSE_TOO_LARGE" },
   );
   assert.equal(fake.seedCount, 0);
+});
+
+test("health rejects pre-v1.2 migrations before seeding and accepts a newer current migration", async () => {
+  for (const version of [38, "39"]) {
+    const fake = fakeDependencies({ healthPrimaryVersion: version });
+    await assert.rejects(
+      runSyntheticV12Smoke({ config: parseSyntheticV12SmokeConfig(env()), dependencies: fake.dependencies }),
+      { code: "SMOKE_HEALTH_CONTRACT_INVALID" },
+    );
+    assert.equal(fake.seedCount, 0);
+  }
+  const newer = fakeDependencies({ healthPrimaryVersion: 40 });
+  const receipt = await runSyntheticV12Smoke({
+    config: parseSyntheticV12SmokeConfig(env()), dependencies: newer.dependencies,
+  });
+  assert.equal(receipt.status, "ok");
 });
 
 test("effective readback mismatch fails closed after domain activation", async () => {
