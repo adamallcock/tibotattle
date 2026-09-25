@@ -765,12 +765,12 @@ export const COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY = [
   ...COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS,
 ].join("|");
 
-function cachedAllowanceBlock(allowance) {
+function cachedAllowanceBlock(allowance, isCurrent) {
   if (allowance === null) return null;
   return {
-    basis: COMMUNITY_ALLOWANCE_BASIS,
+    basis: isCurrent ? COMMUNITY_ALLOWANCE_BASIS : LEGACY_COMMUNITY_ALLOWANCE_BASIS,
     referencePlanType: COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE,
-    normalization: COMMUNITY_ALLOWANCE_NORMALIZATION,
+    normalization: isCurrent ? COMMUNITY_ALLOWANCE_NORMALIZATION : LEGACY_COMMUNITY_ALLOWANCE_NORMALIZATION,
     fitCount: allowance.fitCount,
     participantCount: allowance.participantCount,
     centralUsd: allowance.centralUsd,
@@ -782,12 +782,14 @@ function cachedAllowanceBlock(allowance) {
 
 function cachedBreakdowns(breakdowns) {
   return {
-    schemaVersion: breakdowns.hasCombined
-      ? COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION
-      : COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS[0],
-    basis: COMMUNITY_ALLOWANCE_BASIS,
+    schemaVersion: breakdowns.isCurrent
+      ? COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS[2]
+      : breakdowns.hasCombined
+        ? COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION
+        : COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS[0],
+    basis: breakdowns.isCurrent ? COMMUNITY_ALLOWANCE_BASIS : LEGACY_COMMUNITY_ALLOWANCE_BASIS,
     referencePlanType: COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE,
-    normalization: COMMUNITY_ALLOWANCE_NORMALIZATION,
+    normalization: breakdowns.isCurrent ? COMMUNITY_ALLOWANCE_NORMALIZATION : LEGACY_COMMUNITY_ALLOWANCE_NORMALIZATION,
     modelBasis: COMMUNITY_ALLOWANCE_MODEL_BASIS,
     modelGate: COMMUNITY_ALLOWANCE_MODEL_GATE,
     generatedAt: breakdowns.generatedAt,
@@ -802,7 +804,7 @@ function cachedBreakdowns(breakdowns) {
   };
 }
 
-function cachedDay(day) {
+function cachedDay(day, allowanceIsCurrent) {
   return {
     day: day.day,
     revision: day.revision,
@@ -815,7 +817,7 @@ function cachedDay(day) {
       day: day.day,
       revision: day.revision,
       totals: day.totals,
-      allowance: cachedAllowanceBlock(day.allowance),
+      allowance: cachedAllowanceBlock(day.allowance, allowanceIsCurrent),
       ...(day.apiEquivalentSpend === null
         ? {}
         : { apiEquivalentSpend: day.apiEquivalentSpend }),
@@ -862,7 +864,7 @@ export function projectCommunityDailyPayloadForCache(payload, { nowMs = Date.now
     ...(series.breakdowns === null
       ? {}
       : { allowanceBreakdowns: cachedBreakdowns(series.breakdowns) }),
-    days: series.days.map(cachedDay),
+    days: series.days.map(day => cachedDay(day, series.allowanceIsCurrent)),
   };
 }
 

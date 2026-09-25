@@ -661,7 +661,7 @@ export function projectAdminAllowancePreview(value) {
     referencePlanType: "pro",
     trailingDays: 30,
     qualification: preview.qualification,
-    spanFloorPp: 40,
+    spanFloorPp: preview.spanFloorPp,
     plans: Object.freeze(plans),
     days: Object.freeze(days),
     coverage: projectAllowancePreviewCoverage(preview.coverage),

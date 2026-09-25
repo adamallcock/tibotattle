@@ -476,6 +476,7 @@ function metricsHistoryPayload() {
 
 test("admin allowance preview projects the fixed merge trial contract", () => {
   const preview = projectAdminAllowancePreview(allowancePreviewPayload());
+  assert.equal(preview.spanFloorPp, 25);
   assert.equal(preview.days.length, 70);
   assert.equal(preview.models.days.length, 1);
   assert.deepEqual(preview.models.days[0].byModel["gpt-5.6-sol"], {

@@ -293,7 +293,7 @@ test("aggregate method copy follows the daily basis when breakdowns are absent",
   delete current.allowanceBreakdowns;
   assert.equal(renderCommunityAllowanceSection({ documentRef, container,
     payload: current, view: "aggregate" }), "published");
-  assert.match(container.text, /Pro 50x ×0\.4/u);
+  assert.match(container.text, /Pro 50× ×0\.4/u);
 
   const legacy = publicAllowanceFixture();
   delete legacy.allowanceBreakdowns;
@@ -304,7 +304,7 @@ test("aggregate method copy follows the daily basis when breakdowns are absent",
   assert.equal(renderCommunityAllowanceSection({ documentRef, container,
     payload: legacy, view: "aggregate" }), "published");
   assert.match(container.text, /Pro 5x ×4, Plus ×20/u);
-  assert.doesNotMatch(container.text, /Pro 50x ×0\.4/u);
+  assert.doesNotMatch(container.text, /Pro 50× ×0\.4/u);
 });
 test("real public render shows model sample semantics, per-view labels and disclosure", () => {
   const documentRef = { documentElement: { lang: "en-US" }, createElement: tag => new Element(tag),
@@ -314,7 +314,7 @@ test("real public render shows model sample semantics, per-view labels and discl
     assert.equal(renderCommunityAllowanceSection({ documentRef, container,
       payload: publicAllowanceFixture(), view }), "published");
     assert.match(container.text, /single source.*estimated capacity/u);
-    assert.match(container.text, view === "aggregate" ? /per 7 days, API-price equivalent/u : /API-equivalent USD \/ Pro 20× week/u);
+    assert.match(container.text, view === "aggregate" ? /per 7 days, API-price equivalent/u : /API-equivalent USD \/ week/u);
     const svg = container.descendants().find(element => element.tag === "svg" && element.attributes.has("aria-label"));
     assert.ok(svg);
     if (view === "models") {

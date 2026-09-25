@@ -172,7 +172,7 @@ function valueAxis(maximum, plotTop, plotBottom, minimum = 0) {
   const step = chartTickStep(top);
   const axisTop = Math.ceil(top / step) * step;
   // A zero baseline wastes most of the panel when a band sits well above it:
-  // three plans on their own axes only read if each one fills its own panel.
+  // plans on their own axes only read if each one fills its own panel.
   // The floor still snaps to a whole tick, so the gridlines stay round and the
   // axis never implies a precision the step does not have. Zero is kept when
   // the data actually reaches down toward it.
@@ -1606,7 +1606,7 @@ export function renderCommunityAllowanceSection({
     }
     container.append(cards);
     if (view === "plans") {
-      // Small multiples. Three plans whose own weeks span roughly twentyfold
+      // Small multiples. Plans whose own weeks span a wide range
       // cannot share a linear axis — the smallest is pinned to the baseline and
       // its band becomes a sliver. One panel per plan gives each its own value
       // axis and full vertical resolution, and it removes the need to explain a

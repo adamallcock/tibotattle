@@ -123,11 +123,12 @@ These historical estimates are conditional on the locally observed plan, not
 proof of which provider account generated every token. Known plan switches and
 ambiguous boundary quantities are excluded narrowly; coherent older history is
 still useful. **Usage and costs** continues to retain all-plan accounting totals.
-Community chart lines and headline values retain their common Pro 20x-equivalent
-scale. In By plan, the smaller card value shows that plan's own weekly allowance
-at API prices: divide the headline by 1 for Pro 20x, 4 for Pro 5x, 0.4 for
-provisional Pro 50x, or 20 for Plus. The Pro 50x factor assumes the same Plus
-baseline as the existing tiers and awaits provider confirmation.
+The Aggregate and By model community views use a Pro 20x-equivalent weekly
+basis. By plan charts each plan's own weekly API-price value on its own scale;
+the card shows that value first and the Pro 20x equivalent underneath. The
+plan value is the reference estimate divided by 1 for Pro 20x, 4 for Pro 5x,
+0.4 for provisional Pro 50x, or 20 for Plus. The Pro 50x factor assumes the
+same Plus baseline as the existing tiers and awaits provider confirmation.
 This is an estimated API value, not the subscription price, and does not authorize
 mixing personal Plus and Pro allowance histories.
 

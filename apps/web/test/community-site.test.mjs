@@ -1328,7 +1328,7 @@ test("the community allowance surface leads the product hero with honest labelin
     /data-range-days="30" class="active" aria-pressed="true"/u,
   );
   assert.match(html, /Pro 20x-equivalent allowance/u);
-  assert.match(html, /API-price value of a Pro 20x-equivalent week: overall, by plan or by model/u);
+  assert.match(html, /Estimated weekly API-price value: Pro 20× equivalent overall and by model; each plan's own week in By plan/u);
   for (const view of ["aggregate", "plans", "models"]) {
     assert.equal(html.match(new RegExp(`data-allowance-view="${view}"`, "gu"))?.length, 2);
   }
