@@ -21,6 +21,15 @@ source archive, not to a production Worker build.
 
 ### Latest test-project checkpoint: 2026-09-25
 
+The later [A2 rotation and graph diagnostics receipt](../receipts/2026-09-25-gcp-a2-v12-rotation-and-graph-diagnostics.md)
+records primary migration 37/37, a source-pinned private v1.2 journey through
+device credential rotation, exact-owner discovery/cleanup/retry, and an empty
+isolated bucket after cleanup. It also records a completed 10,000-member GCP
+graph benchmark and two separate 100,000-member hosted runs that each hit a
+120-second timeout on the same publication insert. A bounded transactional
+insert rewrite and fresh-schema hosted proof are in progress. No matched
+hosted Cloudflare comparator or 10-times speedup has been established.
+
 The [A2 isolated v1.2 test-journey receipt](../receipts/2026-09-25-gcp-a2-v12-test-journey.md)
 is the latest named-test-project evidence. A new primary schema, independent
 ledger schema, and bucket with a recorded birth state were migrated and
@@ -783,8 +792,10 @@ partial host into a complete Worker replacement.
 6. Size separate zonal production databases and storage from measured data;
    qualify public/admin ingress, Access assertions, direct-origin refusal,
    client callbacks, rate limits and production costs. The small IAM-private
-   test deployment does not qualify public ingress or a hosted 10,000-record
-   graph throughput target.
+   test deployment does not qualify public ingress or the 100,000-member graph
+   throughput target. Diagnose the timed-out publication insert, prove a
+   bounded version on a pristine hosted schema, and measure against a matched
+   hosted Cloudflare workload before claiming a speed ratio.
 7. Only after an exact rollback point, writer freeze, final delta and complete
    read-back should production routing or client configuration change. Account
    for writes accepted on GCP before any reversal.
