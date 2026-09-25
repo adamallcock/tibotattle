@@ -4,6 +4,7 @@ import { projectAdminModelHistoryDay } from "@app-usagemonitor/telemetry-contrac
 import { canonicalJson } from "./canonical-json";
 import { sha256Hex } from "./crypto";
 import { modelHistoryWindow } from "./model-history-window";
+import { postgresCommunityGraphMemberReadbackSelect } from "./postgres-community-graph-readback-query";
 import {
   createPostgresSourceIdentityConfig,
   createPostgresSchemaConfig,
@@ -70,19 +71,9 @@ async function readPublicationMembers(
   visit: (row: PublicationMemberReadbackRow, index: number) => Promise<boolean>,
 ): Promise<{ readonly complete: boolean; readonly count: number }> {
   await client.query(
-    `DECLARE ${MEMBER_READBACK_CURSOR} NO SCROLL CURSOR FOR
-       SELECT member.owner_digest, member.input_revision, member.owner_revision,
-              member.authority_epoch, member.source_kind, member.input_fingerprint,
-              member.result_sha256, owner.state AS owner_state, link.state AS link_state,
-              participant.state AS participant_state
-         FROM ${schema}.analytics_publication_owner_members member
-         LEFT JOIN ${schema}.analytics_owner_state owner
-           ON owner.source_id = member.source_id AND owner.owner_digest = member.owner_digest
-         LEFT JOIN ${schema}.storage_v11_owner_links link ON link.owner_digest = member.owner_digest
-         LEFT JOIN ${schema}.participants participant ON participant.id = link.participant_id
-        WHERE member.source_id = $1 AND member.day = $2::date
-          AND member.metric = 'model' AND member.generation = $3
-        ORDER BY member.owner_digest COLLATE "C"`,
+    `DECLARE ${MEMBER_READBACK_CURSOR} NO SCROLL CURSOR FOR ${postgresCommunityGraphMemberReadbackSelect(
+      schema,
+    )}`,
     [scope.sourceId, scope.day, scope.generation],
   );
   let count = 0;
@@ -119,10 +110,6 @@ function day(value: unknown): string {
   return value;
 }
 
-function schemaName(options: PostgresSchemaOptions | undefined): string {
-  return quotePostgresIdentifier(createPostgresSchemaConfig(options).primarySchema);
-}
-
 async function hashMatches(value: string, expected: string): Promise<boolean> {
   return await sha256Hex(value) === expected;
 }
@@ -150,7 +137,8 @@ export async function readPostgresCommunityModelDay(
 ): Promise<AdminCommunityModelCompositionDay | null> {
   const identity = createPostgresSourceIdentityConfig(options);
   const capturedDay = day(options.day);
-  const schema = schemaName(options.schema);
+  const primarySchema = createPostgresSchemaConfig(options.schema).primarySchema;
+  const schema = quotePostgresIdentifier(primarySchema);
   return withPostgresRead(pool, async (client) => {
     const result = await client.query<{
       payload_json: string;
@@ -257,7 +245,7 @@ export async function readPostgresCommunityModelDay(
       if (computedGeneration !== row.generation || row.cohort_digest !== computedGeneration
           || integer(row.capture_policy_revision, 1) !== integer(row.policy_revision, 1)
           || integer(row.capture_collection_revision, 1) !== integer(row.collection_revision, 1)) return null;
-      const memberReadback = await readPublicationMembers(client, schema, {
+      const memberReadback = await readPublicationMembers(client, primarySchema, {
         sourceId: identity.sourceId, day: capturedDay, generation: row.generation,
       }, async (member, index) => {
         const proof = memberProof[index];
@@ -290,7 +278,7 @@ export async function readPostgresCommunityModelDay(
       const proof = new StreamingMemberProofAccumulator();
       let observedCount = 0;
       let previousDigest = "";
-      const memberReadback = await readPublicationMembers(client, schema, {
+      const memberReadback = await readPublicationMembers(client, primarySchema, {
         sourceId: identity.sourceId, day: capturedDay, generation: row.generation,
       }, async (member) => {
         const ownerDigest = member.owner_digest;

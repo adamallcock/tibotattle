@@ -86,6 +86,8 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/ledger-preflight-reconcile.check.mjs", destination: "apps/worker/cloud-run/ledger-preflight-reconcile.check.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-graph-benchmark.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-benchmark.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-graph-benchmark.check.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-benchmark.check.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-community-graph-readback-diagnostic.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-readback-diagnostic.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-community-graph-readback-diagnostic.check.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-readback-diagnostic.check.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-daily-publish-test.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-publish-test.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-daily-publish-test.check.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-publish-test.check.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-daily-live-smoke.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-live-smoke.mjs" }),
