@@ -4,8 +4,9 @@
  * Build the audited Cloud Run host context. The host is a Node composition
  * root around the existing Worker handlers; it must never be built from the
  * dirty repository root. Only the host, Worker source, canonical migrations,
- * migration runner, the read-only ledger diagnostic, and the three reviewed
- * workspace packages enter this context.
+ * migration runner, the read-only ledger diagnostic, the guarded test-only
+ * ledger reconciler, and the three reviewed workspace packages enter this
+ * context.
  */
 
 import { createHash } from "node:crypto";
@@ -39,6 +40,8 @@ const EXPECTED_PRIMARY_MIGRATION_TAIL = "0035_v12_ready_manifest_retention.sql";
 const REQUIRED_LEDGER_DIAGNOSTIC_PATHS = new Set([
   "apps/worker/cloud-run/ledger-reconciliation-diagnostic.mjs",
   "apps/worker/cloud-run/ledger-reconciliation-diagnostic.check.mjs",
+  "apps/worker/cloud-run/ledger-preflight-reconcile.mjs",
+  "apps/worker/cloud-run/ledger-preflight-reconcile.check.mjs",
 ]);
 const SKIPPED_DIRECTORY_NAMES = new Set([
   ".git",
@@ -78,6 +81,8 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/synthetic-v12-discovery.check.mjs", destination: "apps/worker/cloud-run/synthetic-v12-discovery.check.mjs" }),
   Object.freeze({ source: "cloud-run/ledger-reconciliation-diagnostic.mjs", destination: "apps/worker/cloud-run/ledger-reconciliation-diagnostic.mjs" }),
   Object.freeze({ source: "cloud-run/ledger-reconciliation-diagnostic.check.mjs", destination: "apps/worker/cloud-run/ledger-reconciliation-diagnostic.check.mjs" }),
+  Object.freeze({ source: "cloud-run/ledger-preflight-reconcile.mjs", destination: "apps/worker/cloud-run/ledger-preflight-reconcile.mjs" }),
+  Object.freeze({ source: "cloud-run/ledger-preflight-reconcile.check.mjs", destination: "apps/worker/cloud-run/ledger-preflight-reconcile.check.mjs" }),
   Object.freeze({ source: "cloud-run/node-crypto-adapter.mjs", destination: "apps/worker/cloud-run/node-crypto-adapter.mjs" }),
   Object.freeze({ source: "cloud-run/owner-bootstrap.mjs", destination: "apps/worker/cloud-run/owner-bootstrap.mjs" }),
   Object.freeze({ source: "cloud-run/request-boundary.mjs", destination: "apps/worker/cloud-run/request-boundary.mjs" }),

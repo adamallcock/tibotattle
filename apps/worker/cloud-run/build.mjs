@@ -13,6 +13,7 @@ const ACTIVATION_ENTRY = resolve(ROOT, "test-activation.mjs");
 const CLEANUP_ENTRY = resolve(ROOT, "synthetic-v12-cleanup.mjs");
 const DISCOVERY_ENTRY = resolve(ROOT, "synthetic-v12-discovery.mjs");
 const LEDGER_DIAGNOSTIC_ENTRY = resolve(ROOT, "ledger-reconciliation-diagnostic.mjs");
+const LEDGER_RECONCILE_ENTRY = resolve(ROOT, "ledger-preflight-reconcile.mjs");
 const OUTDIR = resolve(ROOT, "dist");
 const options = {
   entryPoints: {
@@ -23,6 +24,7 @@ const options = {
     "synthetic-v12-cleanup": CLEANUP_ENTRY,
     "synthetic-v12-discovery": DISCOVERY_ENTRY,
     "ledger-reconciliation-diagnostic": LEDGER_DIAGNOSTIC_ENTRY,
+    "ledger-preflight-reconcile": LEDGER_RECONCILE_ENTRY,
   },
   bundle: true,
   platform: "node",
@@ -40,7 +42,7 @@ if (process.argv.includes("--check")) {
   console.log(JSON.stringify({
     status: "ok",
     mode: "check",
-    entries: ["server.mjs", "synthetic-v12-smoke.mjs", "test-migrations.mjs", "test-activation.mjs", "synthetic-v12-cleanup.mjs", "synthetic-v12-discovery.mjs", "ledger-reconciliation-diagnostic.mjs"],
+    entries: ["server.mjs", "synthetic-v12-smoke.mjs", "test-migrations.mjs", "test-activation.mjs", "synthetic-v12-cleanup.mjs", "synthetic-v12-discovery.mjs", "ledger-reconciliation-diagnostic.mjs", "ledger-preflight-reconcile.mjs"],
   }));
 } else {
   await mkdir(OUTDIR, { recursive: true });
@@ -48,6 +50,6 @@ if (process.argv.includes("--check")) {
   console.log(JSON.stringify({
     status: "ok",
     mode: "build",
-    outputs: ["dist/server.mjs", "dist/synthetic-v12-smoke.mjs", "dist/test-migrations.mjs", "dist/test-activation.mjs", "dist/synthetic-v12-cleanup.mjs", "dist/synthetic-v12-discovery.mjs", "dist/ledger-reconciliation-diagnostic.mjs"],
+    outputs: ["dist/server.mjs", "dist/synthetic-v12-smoke.mjs", "dist/test-migrations.mjs", "dist/test-activation.mjs", "dist/synthetic-v12-cleanup.mjs", "dist/synthetic-v12-discovery.mjs", "dist/ledger-reconciliation-diagnostic.mjs", "dist/ledger-preflight-reconcile.mjs"],
   }));
 }
