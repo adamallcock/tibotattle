@@ -126,14 +126,15 @@ interface FencedSnapshot {
 }
 
 // This is the complete current owner-scoped table set on migrations through
-// 0041. It is a fail-closed schema fence: adding a participant-owned table
+// 0042. It is a fail-closed schema fence: adding a participant-owned table
 // requires reviewing whether it contains an external object or an accountless
 // authority edge before this eraser can proceed.
 const ACCOUNTLESS_PARTICIPANT_TABLES = new Set(`
-  accountless_public_history_retention accountless_upload_owners accountless_v11_device_authorizations
+  accountless_public_history_retention accountless_public_history_import_claims
+  accountless_upload_owners accountless_v11_device_authorizations
   accountless_v12_device_authorizations attribution_enrollments community_analytical_input_versions
   community_model_history_dependencies current_queue device_credential_rotations device_credentials
-  device_pairing_events device_pairings device_upload_authorizations historical_telemetry_v11_chunk_headers
+  device_pairing_events device_pairings device_upload_authorizations enrollment_grants historical_telemetry_v11_chunk_headers
   historical_telemetry_v11_manifest_headers historical_telemetry_v1_chunk_headers identity_reenrollment_cooldowns
   input_source_digests input_versions participant_community_eligibility prepared_source_days recovery_retry_receipts
   storage_v11_event_sources storage_v11_owner_links telemetry_additive_correction_facts
@@ -264,13 +265,26 @@ async function writeReceipt(
 
 async function assertKnownOwnerTables(client: PostgresClient, primarySchema: string): Promise<void> {
   const rows = parseRows<{ readonly table_name: string }>(await client.query(
-    `SELECT DISTINCT columns.table_name
-       FROM information_schema.columns columns
-       JOIN information_schema.tables tables
-         ON tables.table_schema=columns.table_schema AND tables.table_name=columns.table_name
-        AND tables.table_type='BASE TABLE'
-      WHERE columns.table_schema=$1 AND columns.column_name='participant_id'
-      ORDER BY columns.table_name`,
+    `SELECT DISTINCT candidate.relname::text AS table_name
+       FROM pg_class candidate
+       JOIN pg_namespace candidate_schema ON candidate_schema.oid=candidate.relnamespace
+       JOIN pg_class participants
+         ON participants.relnamespace=candidate_schema.oid AND participants.relname='participants'
+        AND participants.relkind='r'
+      WHERE candidate_schema.nspname=$1 AND candidate.relkind='r'
+        AND (
+          EXISTS (
+            SELECT 1 FROM information_schema.columns columns
+             WHERE columns.table_schema=$1 AND columns.table_name=candidate.relname
+               AND columns.column_name='participant_id'
+          )
+          OR EXISTS (
+            SELECT 1 FROM pg_constraint ownership
+             WHERE ownership.conrelid=candidate.oid
+               AND ownership.confrelid=participants.oid AND ownership.contype='f'
+          )
+        )
+      ORDER BY table_name`,
     [primarySchema],
   ));
   if (rows.some((row) => typeof row.table_name !== "string"
@@ -425,6 +439,14 @@ async function fenceAndRead(
         [participantId],
       ));
       if (parseCount(socialSessions[0]?.count) !== 0 || parseCount(pairings[0]?.count) !== 0) {
+        fail("ACCOUNTLESS_OWNER_ERASURE_FAMILY_UNSUPPORTED");
+      }
+      const communityGrants = parseRows<{ readonly count: string | number }>(await client.query(
+        `SELECT count(*)::text AS count FROM ${table(primarySchema, "enrollment_grants")}
+          WHERE redeemed_participant_id=$1`,
+        [participantId],
+      ));
+      if (parseCount(communityGrants[0]?.count) !== 0) {
         fail("ACCOUNTLESS_OWNER_ERASURE_FAMILY_UNSUPPORTED");
       }
       const consuming = parseRows<{ readonly count: string | number }>(await client.query(

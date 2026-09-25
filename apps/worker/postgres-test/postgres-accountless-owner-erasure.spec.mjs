@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { lstat, realpath, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { createServer } from "vite";
-import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { applyPostgresMigrations, readPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 
 const PG_TEST_HOST = process.env.PG_TEST_HOST;
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
@@ -14,6 +14,7 @@ const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
 const PG_TEST_USER = process.env.PG_TEST_USER ?? "postgres";
 const PG_TEST_DATABASE = process.env.PG_TEST_DATABASE ?? "postgres";
 const PG_TEST_PASSWORD = process.env.PG_TEST_PASSWORD;
+const PG_TEST_MIGRATIONS_ROOT = process.env.PG_TEST_MIGRATIONS_ROOT;
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 async function localEndpoint() {
@@ -333,6 +334,7 @@ async function seedAccountlessOwner(pool, schema, supplied = {}) {
   return {
     participantId,
     deviceId,
+    generationId: v11GenerationId,
     ownerDigest,
     sourceImportId,
     objectKeys: [v1.objectKey, v11.objectKey, v12.objectKey,
@@ -366,7 +368,94 @@ async function loadEraser(vite) {
 
 async function createSchema(pool, schema, role = "primary") {
   await pool.query(`CREATE SCHEMA ${q(schema, "unused").split(".")[0]}`);
-  await applyPostgresMigrations({ role, schema, pool });
+  const migrationOptions = PG_TEST_MIGRATIONS_ROOT === undefined
+    ? {} : { rootDirectory: PG_TEST_MIGRATIONS_ROOT };
+  const expected = await readPostgresMigrations({ role, ...migrationOptions });
+  const applied = await applyPostgresMigrations({ role, schema, pool, ...migrationOptions });
+  assert.equal(applied.applied, expected.length, "the disposable schema reaches the selected migration head");
+  return applied.applied;
+}
+
+async function seedCompletedImportClaim(pool, schema, fixture) {
+  await pool.query(
+    `UPDATE ${q(schema, "collection_controls")}
+        SET revision=revision+1,control_state='degraded',enrollment_enabled=false,
+            upload_registration_enabled=false,processing_enabled=false,publication_enabled=false,
+            reason_code='synthetic-import-test',updated_at=clock_timestamp()
+      WHERE singleton=1`,
+  );
+  const migrationReceipt = await pool.query(
+    `SELECT checksum_sha256 FROM ${q(schema, "_tibotattle_migration_history")} WHERE version=42`,
+  );
+  assert.equal(migrationReceipt.rowCount, 1, "a PG42 claim needs the exact applied migration receipt");
+  const transferId = `synthetic-erasure-${randomUUID()}`;
+  const sourceParticipantId = `synthetic-source-${randomUUID()}`;
+  await pool.query(
+    `INSERT INTO ${q(schema, "accountless_public_history_import_runs")} (
+       transfer_id,schema_version,source_kind,target_schema,source_snapshot_id,source_fence_id,
+       source_artifact_sha256,source_manifest_sha256,source_row_count,source_migration_receipts,
+       target_migration_version,target_migration_sha256,page_size,status
+     ) VALUES ($1,'accountless-public-history-retention-import-v1','synthetic-retention-fixture-v1',
+       $2,'synthetic-source-snapshot','synthetic-source-fence',$3,$4,1,'[]'::jsonb,42,$5,10,'importing')`,
+    [transferId, schema, randomDigest(), randomDigest(), migrationReceipt.rows[0].checksum_sha256],
+  );
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`SET LOCAL search_path TO ${q(schema, "unused").split(".")[0]}, pg_catalog`);
+    await client.query("SELECT set_config('tibotattle.accountless_history_import',$1,true)", [transferId]);
+    await client.query(
+      `INSERT INTO ${q(schema, "accountless_public_history_import_claims")} (
+         transfer_id,source_participant_id,source_enrollment_device_id,source_device_credential_id,
+         source_generation_id,target_participant_id,target_enrollment_device_id,
+         target_device_credential_id,target_generation_id,head_revision,retained_at,
+         source_row_sha256,source_expires_at,source_device_secret_hash
+       ) VALUES ($1,$2,'synthetic-source-enrollment','synthetic-source-device',$3,$4,$5,$5,$6,
+         1,'2026-09-24T12:00:00.000Z',$7,'2026-10-24T12:00:00.000Z',$8)`,
+      [transferId, sourceParticipantId, randomUUID(), fixture.participantId, fixture.deviceId,
+        fixture.generationId, randomDigest(), randomBytes(32)],
+    );
+    await client.query("SELECT set_config('tibotattle.accountless_history_import_consuming',$1,true)",
+      [`${transferId}\n${sourceParticipantId}`]);
+    await client.query(
+      `UPDATE ${q(schema, "accountless_public_history_import_claims")}
+          SET consumed_at=clock_timestamp()
+        WHERE transfer_id=$1 AND source_participant_id=$2`,
+      [transferId, sourceParticipantId],
+    );
+    await client.query("SELECT set_config('tibotattle.accountless_history_import_consuming','',true)");
+    await client.query(
+      `INSERT INTO ${q(schema, "accountless_public_history_import_pages")} (
+         transfer_id,page_number,first_source_participant_id,last_source_participant_id,
+         row_count,cumulative_row_count,page_sha256
+       ) VALUES ($1,1,$2,$2,1,1,$3)`,
+      [transferId, sourceParticipantId, randomDigest()],
+    );
+    await client.query(
+      `UPDATE ${q(schema, "accountless_public_history_import_runs")}
+          SET status='complete',target_manifest_sha256=$2,completed_at=clock_timestamp(),updated_at=clock_timestamp()
+        WHERE transfer_id=$1`,
+      [transferId, randomDigest()],
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+  await assert.rejects(
+    pool.query(
+      `DELETE FROM ${q(schema, "accountless_public_history_import_claims")}
+        WHERE transfer_id=$1 AND source_participant_id=$2`,
+      [transferId, sourceParticipantId],
+    ),
+    (error) => error?.code === "P1005",
+    "a direct claim delete remains immutable while its target participant exists",
+  );
+  assert.equal(await count(pool, schema, "accountless_public_history_import_claims",
+    "target_participant_id", fixture.participantId), 1);
+  return transferId;
 }
 
 async function count(pool, schema, name, column, value) {
@@ -404,15 +493,17 @@ test("PG17 accountless erasure removes opt-out history markers across v1/v1.1/v1
     const version = await primaryPool.query("SELECT current_setting('server_version_num')::integer AS version");
     assert.equal(Math.floor(version.rows[0].version / 10_000), 17,
       "accountless erasure is qualified against PostgreSQL 17");
-    await createSchema(primaryPool, primarySchema);
+    const primaryMigrationVersion = await createSchema(primaryPool, primarySchema);
     schemas.push(primarySchema);
     await createSchema(primaryPool, ledgerSchema, "ledger");
     schemas.push(ledgerSchema);
-    await createSchema(restoredPool, restoredSchema);
+    assert.equal(await createSchema(restoredPool, restoredSchema), primaryMigrationVersion);
     schemas.push(restoredSchema);
     vite = await createServer({ root: WORKER_ROOT, configFile: false, server: { middlewareMode: true }, appType: "custom" });
     const { erasePostgresAccountlessOwner } = await loadEraser(vite);
     const fixture = await seedAccountlessOwner(primaryPool, primarySchema);
+    const importClaimTransferId = primaryMigrationVersion >= 42
+      ? await seedCompletedImportClaim(primaryPool, primarySchema, fixture) : null;
     const calls = [];
     let failObjectDelete = true;
     const objectStore = {
@@ -480,6 +571,11 @@ test("PG17 accountless erasure removes opt-out history markers across v1/v1.1/v1
     assert.equal(await count(primaryPool, primarySchema, "accountless_upload_owners", "participant_id", fixture.participantId), 0);
     assert.equal(await count(primaryPool, primarySchema, "accountless_enrollment_ledger", "device_id", fixture.deviceId), 0,
       "accountless installation identity is removed after all restrict references cascade");
+    if (importClaimTransferId !== null) {
+      assert.equal(await count(primaryPool, primarySchema, "accountless_public_history_import_claims",
+        "target_participant_id", fixture.participantId), 0,
+      "the imported source-authority claim cascades with owner erasure");
+    }
     assert.equal(await count(primaryPool, primarySchema, "pending_objects", "object_key", fixture.objectKeys[0]), 0);
     const proof = await primaryPool.query(
       `SELECT owner_digest FROM ${q(primarySchema, "storage_owner_erasure_receipts")} WHERE owner_digest=$1`,
