@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { lstat, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
@@ -9,6 +9,7 @@ import {
   createD1AccountlessRetentionSource,
   createD1AccountlessRetentionFileSource,
   createSyntheticAccountlessRetentionSource,
+  cleanupStaleAccountlessRetentionTempDirs,
   invalidatePostgresAccountlessRetentionTransfer,
   POSTGRES_ACCOUNTLESS_RETENTION_IMPORT_DEFAULT_PAGE_SIZE,
   POSTGRES_ACCOUNTLESS_RETENTION_IMPORT_MAX_PAGE_SIZE,
@@ -234,23 +235,40 @@ async function writeD1BundleFiles(bundle) {
   return { directory, artifactPath, participantMappingsPath };
 }
 
+function fileSourceOptions(files, bundle, overrides = {}) {
+  return {
+    artifactPath: files.artifactPath,
+    participantMappingsPath: files.participantMappingsPath,
+    expectedArtifactSha256: bundle.expectedArtifactSha256,
+    expectedMappingSha256: bundle.expectedMappingSha256,
+    temporaryRoot: files.directory,
+    ...overrides,
+  };
+}
+
+async function createOwnedTempFixture(root, { pid = process.pid, withMappedRows = false } = {}) {
+  const directoryPath = await mkdtemp(join(root, "tibotattle-retention-source-"));
+  const owner = {
+    schemaVersion: "tibotattle-accountless-retention-temp-owner-v1",
+    directoryName: basename(directoryPath),
+    pid,
+    runId: randomUUID(),
+    createdAt: Date.now(),
+  };
+  await writeFile(join(directoryPath, "owner.json"), JSON.stringify(owner), { mode: 0o600 });
+  if (withMappedRows) await writeFile(join(directoryPath, "mapped-rows.ndjson"), "{}\n", { mode: 0o600 });
+  return directoryPath;
+}
+
 test("file-backed D1 source preserves the exact fence and streams bounded keyset pages", async () => {
   const bundle = d1ArtifactBundle([two, one]);
   const files = await writeD1BundleFiles(bundle);
   let source;
   try {
     await assert.rejects(createD1AccountlessRetentionFileSource({
-      artifactPath: files.artifactPath,
-      participantMappingsPath: files.participantMappingsPath,
-      expectedArtifactSha256: "0".repeat(64),
-      expectedMappingSha256: bundle.expectedMappingSha256,
+      ...fileSourceOptions(files, bundle, { expectedArtifactSha256: "0".repeat(64) }),
     }), { code: "ACCOUNTLESS_RETENTION_ARTIFACT_CHECKSUM_MISMATCH" });
-    source = await createD1AccountlessRetentionFileSource({
-      artifactPath: files.artifactPath,
-      participantMappingsPath: files.participantMappingsPath,
-      expectedArtifactSha256: bundle.expectedArtifactSha256,
-      expectedMappingSha256: bundle.expectedMappingSha256,
-    });
+    source = await createD1AccountlessRetentionFileSource(fileSourceOptions(files, bundle));
     const objectSource = createD1AccountlessRetentionSource(bundle);
     assert.deepEqual(source.snapshot, objectSource.snapshot);
     assert.equal((await source.verifySnapshot()).fenceId, objectSource.snapshot.fenceId);
@@ -280,10 +298,7 @@ test("file-backed D1 source has no total-row cap and rejects duplicate target id
   let source;
   try {
     source = await createD1AccountlessRetentionFileSource({
-      artifactPath: files.artifactPath,
-      participantMappingsPath: files.participantMappingsPath,
-      expectedArtifactSha256: bundle.expectedArtifactSha256,
-      expectedMappingSha256: bundle.expectedMappingSha256,
+      ...fileSourceOptions(files, bundle),
     });
     assert.equal(source.snapshot.rowCount, 601);
     const first = await source.listPage({ after: null, limit: 500 });
@@ -298,16 +313,13 @@ test("file-backed D1 source has no total-row cap and rejects duplicate target id
   }
 
   const duplicateMappings = structuredClone(bundle.mappings);
-  duplicateMappings[1].target.participantId = duplicateMappings[0].target.participantId;
+  duplicateMappings.at(-1).target.participantId = duplicateMappings[0].target.participantId;
   const invalid = { ...bundle, mappings: duplicateMappings,
     expectedMappingSha256: accountlessRetentionD1MappingSha256(duplicateMappings) };
   const invalidFiles = await writeD1BundleFiles(invalid);
   try {
     await assert.rejects(createD1AccountlessRetentionFileSource({
-      artifactPath: invalidFiles.artifactPath,
-      participantMappingsPath: invalidFiles.participantMappingsPath,
-      expectedArtifactSha256: invalid.expectedArtifactSha256,
-      expectedMappingSha256: invalid.expectedMappingSha256,
+      ...fileSourceOptions(invalidFiles, invalid, { maxTargetKeyBufferBytes: 1_024 }),
     }), { code: "ACCOUNTLESS_RETENTION_SOURCE_MAPPING_INVALID" });
   } finally {
     await rm(invalidFiles.directory, { recursive: true, force: true });
@@ -320,10 +332,7 @@ test("file-backed D1 source verifies and pages an empty sealed snapshot", async 
   let source;
   try {
     source = await createD1AccountlessRetentionFileSource({
-      artifactPath: files.artifactPath,
-      participantMappingsPath: files.participantMappingsPath,
-      expectedArtifactSha256: bundle.expectedArtifactSha256,
-      expectedMappingSha256: bundle.expectedMappingSha256,
+      ...fileSourceOptions(files, bundle),
     });
     assert.equal(source.snapshot.rowCount, 0);
     await source.verifySnapshot();
@@ -331,6 +340,92 @@ test("file-backed D1 source verifies and pages an empty sealed snapshot", async 
   } finally {
     await source?.close();
     await rm(files.directory, { recursive: true, force: true });
+  }
+});
+
+test("file-backed D1 source rejects excessive aggregate metadata before accumulating it", async () => {
+  const base = d1ArtifactBundle([one]);
+  const excessiveKeys = structuredClone(base.artifact);
+  excessiveKeys.operatorNote = "unexpected";
+  const keyBundle = { ...base, artifact: excessiveKeys,
+    expectedArtifactSha256: accountlessRetentionD1ArtifactSha256(excessiveKeys) };
+  const keyFiles = await writeD1BundleFiles(keyBundle);
+  try {
+    await assert.rejects(createD1AccountlessRetentionFileSource(fileSourceOptions(keyFiles, keyBundle)), {
+      code: "ACCOUNTLESS_RETENTION_ARTIFACT_METADATA_TOO_LARGE",
+    });
+  } finally {
+    await rm(keyFiles.directory, { recursive: true, force: true });
+  }
+
+  const excessiveBytes = structuredClone(base.artifact);
+  excessiveBytes.latestMigrationName = "m".repeat(750_000);
+  excessiveBytes.snapshotAt = "s".repeat(750_000);
+  excessiveBytes.migrationReceipts = ["a".repeat(300_000), "b".repeat(300_000), "c".repeat(300_000)];
+  const byteBundle = { ...base, artifact: excessiveBytes,
+    expectedArtifactSha256: accountlessRetentionD1ArtifactSha256(excessiveBytes) };
+  const byteFiles = await writeD1BundleFiles(byteBundle);
+  try {
+    await assert.rejects(createD1AccountlessRetentionFileSource(fileSourceOptions(byteFiles, byteBundle)), {
+      code: "ACCOUNTLESS_RETENTION_ARTIFACT_METADATA_TOO_LARGE",
+    });
+  } finally {
+    await rm(byteFiles.directory, { recursive: true, force: true });
+  }
+});
+
+test("file-backed D1 source abort removes private staged files", async () => {
+  const bundle = d1ArtifactBundle([one]);
+  const files = await writeD1BundleFiles(bundle);
+  const controller = new AbortController();
+  let source;
+  try {
+    source = await createD1AccountlessRetentionFileSource(fileSourceOptions(files, bundle, {
+      signal: controller.signal,
+    }));
+    const sourceTempDirs = () => readdir(files.directory)
+      .then(entries => entries.filter(entry => entry.startsWith("tibotattle-retention-source-")));
+    assert.equal((await sourceTempDirs()).length, 1);
+    controller.abort();
+    await assert.rejects(source.listPage({ after: null, limit: 10 }), {
+      code: "ACCOUNTLESS_RETENTION_IMPORT_ABORTED",
+    });
+    await source.close();
+    assert.deepEqual(await sourceTempDirs(), []);
+  } finally {
+    await source?.close();
+    await rm(files.directory, { recursive: true, force: true });
+  }
+});
+
+test("temp recovery removes only dead, journaled private runs and fails closed on ambiguity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-retention-recovery-check-"));
+  try {
+    let deadPid;
+    for (const candidate of [2_147_483_647, 2_000_000_000, 1_000_000_000]) {
+      try { process.kill(candidate, 0); } catch (error) {
+        if (error?.code === "ESRCH") { deadPid = candidate; break; }
+        if (error?.code !== "EPERM") throw error;
+      }
+    }
+    assert.ok(deadPid, "test host must expose an ESRCH PID for the stale-run fixture");
+    const stale = await createOwnedTempFixture(root, { pid: deadPid, withMappedRows: true });
+    const active = await createOwnedTempFixture(root, { pid: process.pid });
+    assert.deepEqual(await cleanupStaleAccountlessRetentionTempDirs({ directory: root }), {
+      removed: 1, active: 1, unjournaledRecent: 0,
+    });
+    await assert.rejects(lstat(stale), { code: "ENOENT" });
+    assert.equal((await lstat(active)).isDirectory(), true);
+
+    const ambiguous = await mkdtemp(join(root, "tibotattle-retention-source-"));
+    const old = new Date(Date.now() - 120_000);
+    await utimes(ambiguous, old, old);
+    await assert.rejects(cleanupStaleAccountlessRetentionTempDirs({ directory: root }), {
+      code: "ACCOUNTLESS_RETENTION_TEMP_RECOVERY_AMBIGUOUS",
+    });
+    assert.equal((await lstat(ambiguous)).isDirectory(), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -382,6 +477,11 @@ test("retention importer refuses forged sources and broad/unbounded targets befo
     && error.code === "ACCOUNTLESS_RETENTION_TRUSTED_SOURCE_REQUIRED");
 
   const trusted = createSyntheticAccountlessRetentionSource({ rows: [one] });
+  const cancelled = new AbortController();
+  cancelled.abort();
+  await assert.rejects(runPostgresAccountlessRetentionImport({ source: trusted, destinationPool: pool,
+    targetSchema: "accountless_retention_import_target_12345678", transferId: "synthetic-run",
+    signal: cancelled.signal }), { code: "ACCOUNTLESS_RETENTION_IMPORT_ABORTED" });
   await assert.rejects(runPostgresAccountlessRetentionImport({ source: trusted, destinationPool: pool,
     targetSchema: "public", transferId: "synthetic-run" }), {
     code: "ACCOUNTLESS_RETENTION_TARGET_SCHEMA_INVALID",

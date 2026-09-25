@@ -37,6 +37,8 @@ const INTEGER_FIELDS = new Set(["marker_head_revision", "head_revision"]);
 const MAX_ARTIFACT_PAGE_BYTES = 16 * 1_024 * 1_024;
 const MAX_MAPPING_ENTRY_BYTES = 8 * 1_024;
 const MAX_ARTIFACT_METADATA_VALUE_BYTES = 1 * 1_024 * 1_024;
+const MAX_ARTIFACT_METADATA_BYTES = 2 * 1_024 * 1_024;
+const MAX_ARTIFACT_TOP_LEVEL_KEYS = 12;
 
 export const ACCOUNTLESS_RETENTION_D1_ROW_FIELDS = Object.freeze([
   "participant_id",
@@ -327,6 +329,10 @@ function streamFailure(code = "ACCOUNTLESS_RETENTION_ARTIFACT_INVALID") {
   artifactFailure(code);
 }
 
+function throwIfFileStreamAborted(signal) {
+  if (signal?.aborted) streamFailure("ACCOUNTLESS_RETENTION_IMPORT_ABORTED");
+}
+
 function decodeJsonBytes(bytes) {
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -385,16 +391,19 @@ function assertNoDuplicateJsonObjectKeys(text) {
 }
 
 class JsonFileReader {
-  constructor(path) {
+  constructor(path, signal) {
     this.stream = createReadStream(path, { highWaterMark: 64 * 1_024 });
     this.iterator = this.stream[Symbol.asyncIterator]();
+    this.signal = signal;
     this.chunk = Buffer.alloc(0);
     this.offset = 0;
     this.ended = false;
   }
 
   async nextChunk() {
+    throwIfFileStreamAborted(this.signal);
     while (!this.ended) {
+      throwIfFileStreamAborted(this.signal);
       const next = await this.iterator.next();
       if (next.done) {
         this.ended = true;
@@ -427,6 +436,7 @@ class JsonFileReader {
 
   async skipWhitespace() {
     for (;;) {
+      if ((this.offset & 0xfff) === 0) throwIfFileStreamAborted(this.signal);
       const byte = await this.peekByte();
       if (byte !== 0x20 && byte !== 0x09 && byte !== 0x0a && byte !== 0x0d) return;
       this.offset += 1;
@@ -458,6 +468,7 @@ class JsonFileReader {
       this.offset += 1;
       let escaped = false;
       for (;;) {
+        if ((this.offset & 0xfff) === 0) throwIfFileStreamAborted(this.signal);
         if (this.offset >= this.chunk.length) {
           appendChunkPart();
           if (!await this.nextChunk()) streamFailure();
@@ -482,6 +493,7 @@ class JsonFileReader {
       let escaped = false;
       this.offset += 1;
       for (;;) {
+        if ((this.offset & 0xfff) === 0) throwIfFileStreamAborted(this.signal);
         if (this.offset >= this.chunk.length) {
           appendChunkPart();
           if (!await this.nextChunk()) streamFailure();
@@ -509,6 +521,7 @@ class JsonFileReader {
     }
 
     for (;;) {
+      if ((this.offset & 0xfff) === 0) throwIfFileStreamAborted(this.signal);
       if (this.offset >= this.chunk.length && !this.ended) {
         appendChunkPart();
         if (!await this.nextChunk()) {
@@ -545,6 +558,7 @@ class JsonFileReader {
     }
     let count = 0;
     for (;;) {
+      throwIfFileStreamAborted(this.signal);
       const raw = await this.readRawValue(maximumItemBytes);
       if (raw[0] === "{") assertNoDuplicateJsonObjectKeys(raw);
       await onItem(parseJsonText(raw), raw);
@@ -568,8 +582,8 @@ class JsonFileReader {
   }
 }
 
-async function* streamJsonArrayItems(path, maximumItemBytes) {
-  const reader = new JsonFileReader(path);
+async function* streamJsonArrayItems(path, maximumItemBytes, signal) {
+  const reader = new JsonFileReader(path, signal);
   try {
     await reader.expectByte(0x5b);
     await reader.skipWhitespace();
@@ -594,12 +608,13 @@ async function* streamJsonArrayItems(path, maximumItemBytes) {
   }
 }
 
-async function streamJsonObjectArrayMember(path, arrayKey, pageSpoolPath) {
-  const reader = new JsonFileReader(path);
+async function streamJsonObjectArrayMember(path, arrayKey, pageSpoolPath, signal) {
+  const reader = new JsonFileReader(path, signal);
   const metadata = Object.create(null);
   const keys = new Set();
   let foundArray = false;
   let pageWriter;
+  let metadataBytes = 0;
   try {
     pageWriter = await open(pageSpoolPath, "wx", 0o600);
     await reader.expectByte(0x7b);
@@ -607,10 +622,14 @@ async function streamJsonObjectArrayMember(path, arrayKey, pageSpoolPath) {
     if (await reader.peekByte() === 0x7d) reader.offset += 1;
     else {
       for (;;) {
+        throwIfFileStreamAborted(signal);
         const keyText = await reader.readRawValue(1_024);
         if (keyText[0] !== '"') streamFailure();
         const key = parseJsonText(keyText);
         if (typeof key !== "string" || keys.has(key)) streamFailure();
+        if (keys.size >= MAX_ARTIFACT_TOP_LEVEL_KEYS) {
+          streamFailure("ACCOUNTLESS_RETENTION_ARTIFACT_METADATA_TOO_LARGE");
+        }
         keys.add(key);
         await reader.expectByte(0x3a);
         if (key === arrayKey) {
@@ -629,7 +648,12 @@ async function streamJsonObjectArrayMember(path, arrayKey, pageSpoolPath) {
             }
           }, MAX_ARTIFACT_PAGE_BYTES);
         } else {
-          metadata[key] = parseJsonText(await reader.readRawValue(MAX_ARTIFACT_METADATA_VALUE_BYTES));
+          const rawValue = await reader.readRawValue(MAX_ARTIFACT_METADATA_VALUE_BYTES);
+          metadataBytes += Buffer.byteLength(keyText) + Buffer.byteLength(rawValue);
+          if (metadataBytes > MAX_ARTIFACT_METADATA_BYTES) {
+            streamFailure("ACCOUNTLESS_RETENTION_ARTIFACT_METADATA_TOO_LARGE");
+          }
+          metadata[key] = parseJsonText(rawValue);
         }
         await reader.skipWhitespace();
         const delimiter = await reader.readByte();
@@ -648,12 +672,13 @@ async function streamJsonObjectArrayMember(path, arrayKey, pageSpoolPath) {
   return { metadata, keys };
 }
 
-async function streamCanonicalArtifactDigest(metadata, pageSpoolPath) {
+async function streamCanonicalArtifactDigest(metadata, pageSpoolPath, signal) {
   const hash = createHash("sha256");
   hash.update("{");
   const keys = [...new Set([...Object.keys(metadata), "pages"])].sort();
   let first = true;
   for (const key of keys) {
+    throwIfFileStreamAborted(signal);
     if (!first) hash.update(",");
     first = false;
     hash.update(`${JSON.stringify(key)}:`);
@@ -667,6 +692,7 @@ async function streamCanonicalArtifactDigest(metadata, pageSpoolPath) {
     const lines = createInterface({ input, crlfDelay: Infinity });
     try {
       for await (const line of lines) {
+        throwIfFileStreamAborted(signal);
         if (!firstPage) hash.update(",");
         firstPage = false;
         hash.update(line);
@@ -693,7 +719,9 @@ export async function verifyAccountlessRetentionD1ArtifactFiles({
   expectedArtifactSha256,
   expectedMappingSha256,
   onMappedRow,
+  signal,
 } = {}) {
+  throwIfFileStreamAborted(signal);
   requireHash(expectedArtifactSha256, "ACCOUNTLESS_RETENTION_ARTIFACT_CHECKSUM_REQUIRED");
   requireHash(expectedMappingSha256, "ACCOUNTLESS_RETENTION_MAPPING_CHECKSUM_REQUIRED");
   if (typeof artifactPath !== "string" || typeof participantMappingsPath !== "string"
@@ -704,6 +732,7 @@ export async function verifyAccountlessRetentionD1ArtifactFiles({
     artifactPath,
     "pages",
     pageSpoolPath,
+    signal,
   );
   const artifactKeys = [...keys, "pages"];
   exactKeys(Object.fromEntries(artifactKeys.map(key => [key, null])), [
@@ -723,7 +752,7 @@ export async function verifyAccountlessRetentionD1ArtifactFiles({
   }
   requireTimestamp(artifact.snapshotAt);
   requireHash(artifact.manifestSha256);
-  const artifactSha256 = await streamCanonicalArtifactDigest(metadata, pageSpoolPath);
+  const artifactSha256 = await streamCanonicalArtifactDigest(metadata, pageSpoolPath, signal);
   if (artifactSha256 !== expectedArtifactSha256) {
     streamFailure("ACCOUNTLESS_RETENTION_ARTIFACT_CHECKSUM_MISMATCH");
   }
@@ -734,7 +763,8 @@ export async function verifyAccountlessRetentionD1ArtifactFiles({
   let mappedCount = 0;
   async function* mappings() {
     let first = true;
-    for await (const rawMapping of streamJsonArrayItems(participantMappingsPath, MAX_MAPPING_ENTRY_BYTES)) {
+    for await (const rawMapping of streamJsonArrayItems(participantMappingsPath, MAX_MAPPING_ENTRY_BYTES, signal)) {
+      throwIfFileStreamAborted(signal);
       const mapping = normalizeMapping(rawMapping);
       if (!first) mappingSha.update(",");
       first = false;
@@ -759,6 +789,7 @@ export async function verifyAccountlessRetentionD1ArtifactFiles({
   let pagesVerified = false;
   try {
     for await (const line of pageLines) {
+      throwIfFileStreamAborted(signal);
       if (line.length === 0) streamFailure("ACCOUNTLESS_RETENTION_SOURCE_PAGE_INVALID");
       const page = parseJsonText(line);
       exactKeys(page, ["pageNumber", "afterParticipantId", "throughParticipantId", "rowCount", "pageSha256",
