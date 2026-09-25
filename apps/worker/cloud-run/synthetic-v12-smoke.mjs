@@ -57,6 +57,7 @@ const CHUNK_PATH = "/api/v1/contributions";
 const SYNC_STATE_PATH = "/api/v1/device/sync/state";
 const DOMAIN_PREDECESSOR_PATH = "/api/v1/me/telemetry-v12/domain-predecessor";
 const DOMAIN_ACTIVATE_PATH = "/api/v1/me/telemetry-v12/domain-activate";
+const DEVICE_CREDENTIAL_RENEWAL_PATH = "/api/v1/device/credential/renew";
 const encoder = new TextEncoder();
 
 function fail(code, extras = {}) {
@@ -521,7 +522,7 @@ async function requestJson({ fetchImpl, getIdToken, origin, method, path, author
   }
   const url = new URL(path, origin);
   const allowedPaths = [MANIFEST_PATH, GRANT_PATH, CHUNK_PATH, SYNC_STATE_PATH,
-    DOMAIN_PREDECESSOR_PATH, DOMAIN_ACTIVATE_PATH, "/api/health"];
+    DOMAIN_PREDECESSOR_PATH, DOMAIN_ACTIVATE_PATH, DEVICE_CREDENTIAL_RENEWAL_PATH, "/api/health"];
   if (url.origin !== origin || !allowedPaths.includes(path)
       || (["/api/health", SYNC_STATE_PATH].includes(path) ? method !== "GET" : method !== "POST")) {
     fail("SMOKE_ROUTE_INVALID");
@@ -718,7 +719,7 @@ export async function readSyntheticGcsObject({
 export async function runSyntheticV12Smoke({ config, dependencies }) {
   const deps = dependencies;
   for (const name of ["validateEnvelopeKey", "assertRuntimeReady", "seedFixture", "getIdToken", "fetchImpl",
-    "encryptEnvelope", "readback", "randomUUID"]) {
+    "encryptEnvelope", "readback", "randomUUID", "randomBytes"]) {
     if (typeof deps?.[name] !== "function") fail("SMOKE_DEPENDENCIES_INVALID");
   }
   if (config?.origin !== SMOKE_ORIGIN || config?.bucket !== SYNTHETIC_V12_SMOKE_BUCKET
@@ -936,6 +937,81 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       fail("SMOKE_DOMAIN_REPLAY_MISMATCH");
     }
 
+    const replacementBytes = Buffer.from(deps.randomBytes(32));
+    if (replacementBytes.byteLength !== 32) fail("SMOKE_DEVICE_CREDENTIAL_RENEWAL_SECRET_INVALID");
+    const replacementSecret = replacementBytes.toString("base64url");
+    replacementBytes.fill(0);
+    const rotationAttemptId = deps.randomUUID();
+    if (typeof rotationAttemptId !== "string"
+        || !/^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/iu.test(rotationAttemptId)) {
+      fail("SMOKE_DEVICE_CREDENTIAL_RENEWAL_ATTEMPT_INVALID");
+    }
+    const renewalBody = JSON.stringify({
+      nextDeviceSecretHash: deviceSecretHash(fixture.deviceId, replacementSecret).toString("hex"),
+      rotationAttemptId,
+    });
+    const rotateDeviceCredential = () => requestJson({
+      fetchImpl: deps.fetchImpl,
+      getIdToken: deps.getIdToken,
+      origin: config.origin,
+      method: "POST",
+      path: DEVICE_CREDENTIAL_RENEWAL_PATH,
+      authorization: fixture.deviceAuthorization,
+      body: renewalBody,
+    });
+    const firstRenewal = await rotateDeviceCredential();
+    expectStatus(firstRenewal.response, firstRenewal.value, 200, "SMOKE_DEVICE_CREDENTIAL_RENEWAL_FAILED");
+    const renewalReceipt = firstRenewal.value;
+    if (renewalReceipt.schemaVersion !== "device-credential-renewal-v1.0"
+        || renewalReceipt.deviceId !== fixture.deviceId
+        || renewalReceipt.state !== "active"
+        || renewalReceipt.scope !== "upload_registration"
+        || renewalReceipt.credentialGeneration !== 2
+        || renewalReceipt.commit !== true
+        || typeof renewalReceipt.expiresAt !== "string"
+        || !Number.isFinite(Date.parse(renewalReceipt.expiresAt))
+        || Date.parse(renewalReceipt.expiresAt) <= Date.now()) {
+      fail("SMOKE_DEVICE_CREDENTIAL_RENEWAL_RECEIPT_INVALID");
+    }
+    const renewalReplay = await rotateDeviceCredential();
+    expectStatus(renewalReplay.response, renewalReplay.value, 200, "SMOKE_DEVICE_CREDENTIAL_RENEWAL_REPLAY_FAILED");
+    for (const field of ["schemaVersion", "deviceId", "state", "scope", "expiresAt",
+      "credentialGeneration", "commit"]) {
+      if (renewalReplay.value[field] !== renewalReceipt[field]) {
+        fail("SMOKE_DEVICE_CREDENTIAL_RENEWAL_REPLAY_MISMATCH");
+      }
+    }
+
+    const replacementAuthorization = `Device um_device_${fixture.deviceId}.${replacementSecret}`;
+    const { response: replacementSyncResponse, value: replacementSyncState } = await requestJson({
+      fetchImpl: deps.fetchImpl,
+      getIdToken: deps.getIdToken,
+      origin: config.origin,
+      method: "GET",
+      path: SYNC_STATE_PATH,
+      authorization: replacementAuthorization,
+    });
+    expectStatus(replacementSyncResponse, replacementSyncState, 200,
+      "SMOKE_DEVICE_CREDENTIAL_RENEWAL_NEW_SECRET_REJECTED");
+    if (replacementSyncState.schemaVersion !== "device-sync-state-v1.0"
+        || replacementSyncState.admission?.state !== "available") {
+      fail("SMOKE_DEVICE_CREDENTIAL_RENEWAL_NEW_SECRET_AUTHORITY_INVALID");
+    }
+
+    const { response: priorSecretResponse, value: priorSecretResult } = await requestJson({
+      fetchImpl: deps.fetchImpl,
+      getIdToken: deps.getIdToken,
+      origin: config.origin,
+      method: "GET",
+      path: SYNC_STATE_PATH,
+      authorization: fixture.deviceAuthorization,
+    });
+    expectStatus(priorSecretResponse, priorSecretResult, 401,
+      "SMOKE_DEVICE_CREDENTIAL_RENEWAL_OLD_SECRET_ACCEPTED");
+    if (routeCode(priorSecretResult) !== "DEVICE_AUTH_INVALID") {
+      fail("SMOKE_DEVICE_CREDENTIAL_RENEWAL_OLD_SECRET_REJECTION_INVALID");
+    }
+
     const storage = await deps.readback({
       config,
       fixture,
@@ -962,6 +1038,7 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       chunk: "staged_and_exactly_replayed",
       domain: "activated_and_exactly_replayed",
       syncState: "empty_history_admission_available",
+      deviceCredentialRenewal: "rotated_replayed_new_secret_authorized_old_secret_rejected",
       postgresReadback: true,
       effectiveRecordReadback: true,
       gcsReadback: true,
@@ -1237,6 +1314,7 @@ async function createNativeDependencies(config) {
           ...input,
         }),
         randomUUID,
+        randomBytes,
       },
       close: () => closeCloudSqlResources({ pools, connector }),
     };

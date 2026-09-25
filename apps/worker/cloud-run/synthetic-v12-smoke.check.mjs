@@ -81,6 +81,13 @@ function response(status, value, url = "") {
   return result;
 }
 
+function deviceSecretHash(deviceId, secret) {
+  return createHash("sha256")
+    .update(`app-usagemonitor/device/v1\0${deviceId}\0`)
+    .update(Buffer.from(secret, "base64url"))
+    .digest("hex");
+}
+
 function fakeEnvelope() {
   return {
     schemaVersion: "telemetry-envelope-v1.2",
@@ -189,6 +196,17 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
   let seedCount = 0;
   let getTokenCount = 0;
   let encryptedEnvelopeBytes;
+  const replacementSecret = Buffer.alloc(32, 0xa5).toString("base64url");
+  const replacementAuthorization = `Device um_device_${DEVICE_ID}.${replacementSecret}`;
+  const renewalReceipt = {
+    schemaVersion: "device-credential-renewal-v1.0",
+    deviceId: DEVICE_ID,
+    state: "active",
+    scope: "upload_registration",
+    expiresAt: "2030-01-01T00:00:00.000Z",
+    credentialGeneration: 2,
+    commit: true,
+  };
   const fixture = {
     participantId: PARTICIPANT_ID,
     sessionId: IDS[1],
@@ -232,6 +250,18 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
           });
         }
         if (url.pathname === "/api/v1/device/sync/state") {
+          const renewalCalls = calls.filter((call) =>
+            call.url.pathname === "/api/v1/device/credential/renew");
+          const suppliedAuthorization = options.headers.authorization;
+          if (renewalCalls.length >= 2 && suppliedAuthorization === fixture.deviceAuthorization) {
+            return response(401, { error: { code: "DEVICE_AUTH_INVALID" } });
+          }
+          if (renewalCalls.length >= 2 && suppliedAuthorization !== replacementAuthorization) {
+            return response(401, { error: { code: "DEVICE_AUTH_INVALID" } });
+          }
+          if (renewalCalls.length < 2 && suppliedAuthorization !== fixture.deviceAuthorization) {
+            return response(401, { error: { code: "DEVICE_AUTH_INVALID" } });
+          }
           return response(200, {
             schemaVersion: "device-sync-state-v1.0",
             contractVersion: "telemetry-contribution-v1.0",
@@ -244,6 +274,16 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
               state: "available",
             },
           });
+        }
+        if (url.pathname === "/api/v1/device/credential/renew") {
+          assert.equal(options.method, "POST");
+          assert.equal(options.headers.authorization, fixture.deviceAuthorization);
+          const body = JSON.parse(options.body);
+          assert.deepEqual(body, {
+            nextDeviceSecretHash: deviceSecretHash(DEVICE_ID, replacementSecret),
+            rotationAttemptId: IDS[6],
+          });
+          return response(200, renewalReceipt);
         }
         if (url.pathname === "/api/v1/me/telemetry-v12/domain-predecessor") {
           assert.equal(options.method, "POST");
@@ -335,7 +375,10 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
         });
       },
       randomUUID() { return IDS[6]; },
+      randomBytes(length) { return Buffer.alloc(length, 0xa5); },
     },
+    replacementSecret,
+    replacementAuthorization,
   };
 }
 
@@ -617,6 +660,7 @@ test("smoke journey keeps IAM and participant credentials separate and replays e
     chunk: receipt.chunk,
     domain: receipt.domain,
     syncState: receipt.syncState,
+    deviceCredentialRenewal: receipt.deviceCredentialRenewal,
     postgresReadback: receipt.postgresReadback,
     effectiveRecordReadback: receipt.effectiveRecordReadback,
     gcsReadback: receipt.gcsReadback,
@@ -627,17 +671,18 @@ test("smoke journey keeps IAM and participant credentials separate and replays e
     chunk: "staged_and_exactly_replayed",
     domain: "activated_and_exactly_replayed",
     syncState: "empty_history_admission_available",
+    deviceCredentialRenewal: "rotated_replayed_new_secret_authorized_old_secret_rejected",
     postgresReadback: true,
     effectiveRecordReadback: true,
     gcsReadback: true,
     publication: "withheld_by_verified_degraded_controls",
   });
-  assert.equal(fake.getTokenCount, 11);
+  assert.equal(fake.getTokenCount, 15);
   const anonymous = fake.calls[0];
   assert.equal(anonymous.options.headers.authorization, undefined);
   assert.equal(anonymous.options.headers["x-serverless-authorization"], undefined);
   const authenticated = fake.calls.slice(1);
-  assert.equal(authenticated.length, 11);
+  assert.equal(authenticated.length, 15);
   for (const call of authenticated) {
     assert.equal(call.url.origin, CLOUD_RUN_IAM_TEST_TARGET.origin);
     assert.equal(call.options.redirect, "manual");
@@ -650,10 +695,29 @@ test("smoke journey keeps IAM and participant credentials separate and replays e
     call.options.headers.authorization?.startsWith("Device "));
   const grantAuthCalls = authenticated.filter((call) =>
     call.options.headers.authorization?.startsWith("Upload "));
-  assert.equal(deviceAuthCalls.length, 8);
+  assert.equal(deviceAuthCalls.length, 12);
   assert.equal(grantAuthCalls.length, 2);
   assert.equal(grantAuthCalls[0].options.headers.authorization, `Upload ${GRANT_TOKEN_1}`);
   assert.equal(grantAuthCalls[1].options.headers.authorization, `Upload ${GRANT_TOKEN_2}`);
+  const credentialRenewals = authenticated.filter((call) =>
+    call.url.pathname === "/api/v1/device/credential/renew");
+  assert.equal(credentialRenewals.length, 2);
+  assert.ok(credentialRenewals.every((call) => call.options.method === "POST"
+    && call.options.headers.authorization === fake.fixture.deviceAuthorization));
+  assert.equal(credentialRenewals[0].options.body, credentialRenewals[1].options.body,
+    "the exact rotation body and old authorization are replayed");
+  const rotationBody = JSON.parse(credentialRenewals[0].options.body);
+  assert.deepEqual(rotationBody, {
+    nextDeviceSecretHash: deviceSecretHash(DEVICE_ID, fake.replacementSecret),
+    rotationAttemptId: IDS[6],
+  });
+  const syncCalls = authenticated.filter((call) =>
+    call.url.pathname === "/api/v1/device/sync/state");
+  assert.equal(syncCalls.length, 3);
+  assert.equal(syncCalls[1].options.headers.authorization, fake.replacementAuthorization,
+    "the replacement secret authorizes a protected request after rotation");
+  assert.equal(syncCalls[2].options.headers.authorization, fake.fixture.deviceAuthorization,
+    "the prior secret is explicitly tested after replacement authority succeeds");
   const manifests = authenticated.filter((call) => call.url.pathname.endsWith("day-manifests"));
   assert.equal(manifests.length, 2);
   assert.equal(manifests[0].options.body, manifests[1].options.body);
@@ -687,6 +751,8 @@ test("smoke journey keeps IAM and participant credentials separate and replays e
     .update(telemetryV12DomainManifestDigestInput(domainManifest)).digest("hex"));
   assert.equal(JSON.stringify(receipt).includes(SERVERLESS_TOKEN), false);
   assert.equal(JSON.stringify(receipt).includes(DEVICE_SECRET), false);
+  assert.equal(JSON.stringify(receipt).includes(fake.replacementSecret), false);
+  assert.equal(JSON.stringify(receipt).includes(fake.replacementAuthorization), false);
   assert.equal(JSON.stringify(receipt).includes(GRANT_TOKEN_1), false);
   assert.equal(JSON.stringify(receipt).includes(PREDECESSOR_TOKEN), false);
   assert.equal(JSON.stringify(receipt).includes(DOMAIN_FINGERPRINT), false);
