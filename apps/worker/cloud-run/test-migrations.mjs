@@ -50,6 +50,13 @@ export const GRAPH_BENCHMARK_MIGRATION_TARGETS = Object.freeze([
     schema: "tibotattle_graph_benchmark_100k_20260925",
     expectedMigrations: 37,
   }),
+  Object.freeze({
+    name: "100k-insights",
+    instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
+    database: "tibotattle",
+    schema: "tibotattle_graph_benchmark_100k_insights_20260925",
+    expectedMigrations: 37,
+  }),
 ]);
 
 const A2_PROFILE = "a2";

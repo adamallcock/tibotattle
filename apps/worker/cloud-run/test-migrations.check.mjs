@@ -312,7 +312,7 @@ test("configuration is pinned to the one-task tibotattle migration Job and exact
   ), "POSTGRES_TEST_MIGRATIONS_PRIMARY_TARGET_INVALID");
 });
 
-test("benchmark migrator profile pins both primary-only schemas and rejects all overrides", () => {
+test("benchmark migrator profile pins all isolated primary-only schemas and rejects overrides", () => {
   const config = parseTestMigrationsConfig(
     validBenchmarkEnv(), TEST_MIGRATIONS_SERVICE_ACCOUNT, GRAPH_BENCHMARK_MIGRATION_PROFILE,
   );
@@ -321,6 +321,7 @@ test("benchmark migrator profile pins both primary-only schemas and rejects all 
   assert.deepEqual(config.plans.map(({ role, target }) => [role, target.schema]), [
     ["primary", "tibotattle_graph_benchmark_10k_20260925"],
     ["primary", "tibotattle_graph_benchmark_100k_20260925"],
+    ["primary", "tibotattle_graph_benchmark_100k_insights_20260925"],
   ]);
   for (const overrides of [
     { CLOUD_RUN_JOB: TEST_MIGRATIONS_JOB },
@@ -462,7 +463,7 @@ test("primary and ledger migrations are checksum-read back and repeated runs are
     false, "only the exact A2 schemas may receive grants");
 });
 
-test("benchmark profile applies 37 receipts and verifies runtime grants on both exact primary schemas", async () => {
+test("benchmark profile applies 37 receipts and verifies runtime grants on every exact primary schema", async () => {
   const harness = makeHarness(manifest, { graphBenchmark: true });
   const result = await runTestMigrations({
     env: validBenchmarkEnv(),
@@ -471,11 +472,11 @@ test("benchmark profile applies 37 receipts and verifies runtime grants on both 
   });
   assert.equal(result.job, GRAPH_BENCHMARK_MIGRATIONS_JOB);
   assert.equal(result.profile, GRAPH_BENCHMARK_MIGRATION_PROFILE);
-  assert.equal(result.migrations.primarySchemas.length, 2);
+  assert.equal(result.migrations.primarySchemas.length, 3);
   assert.deepEqual(result.migrations.primarySchemas.map(({ schema, applied }) => [schema, applied]),
     GRAPH_BENCHMARK_MIGRATION_TARGETS.map(({ schema }) => [schema, 37]));
   assert.equal(harness.poolCount, 1, "both schemas use only the pinned primary database pool");
-  assert.equal(harness.applyCalls, 2);
+  assert.equal(harness.applyCalls, 3);
   assert.equal(harness.cleanupCalls, 1);
   assert.equal(harness.connectorCount, 1);
   assert.equal(harness.events.some(({ role }) => role === "ledger"), false);
