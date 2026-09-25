@@ -21,6 +21,13 @@ const JOB_COUNT = 15;
 const EXECUTION = "tibotattle-test-ledger-preflight-reconcile-00001-abc";
 const SOURCE_ID = "synthetic:test-source";
 const SOURCE_NAMESPACE = "synthetic-test-namespace";
+const SOURCE_PIN_SHA256 = createHash("sha256")
+  .update(JSON.stringify({ sourceId: SOURCE_ID, namespace: SOURCE_NAMESPACE })).digest("hex");
+const TEST_SCHEMAS = Object.freeze({
+  primarySchema: "synthetic_reconcile_primary",
+  ledgerSchema: "synthetic_reconcile_ledger",
+  expectedSourcePinSha256: SOURCE_PIN_SHA256,
+});
 
 function validEnv(overrides = {}) {
   return {
@@ -92,7 +99,7 @@ function result(rows) {
 }
 
 function makePools(state, { badReceipt = false, sourceMismatch = false, invalidMetadata = false,
-  missingV1Admission = false } = {}) {
+  unexpectedV1Admission = false, multipleNamespaces = false, missingPrimarySource = false } = {}) {
   const events = [];
   let primaryReleaseCount = 0;
   let ledgerReleaseCount = 0;
@@ -103,12 +110,10 @@ function makePools(state, { badReceipt = false, sourceMismatch = false, invalidM
           events.push({ role: "primary", sql });
           if (sql.includes("AS source_pin_rows")) {
             return result([{
-              source_pin_rows: "1",
-              v1_admission_rows: missingV1Admission ? "0" : "1",
-              v11_admission_rows: "1",
-              source_id: SOURCE_ID,
-              v1_namespace: SOURCE_NAMESPACE,
-              v11_namespace: SOURCE_NAMESPACE,
+              source_pin_rows: missingPrimarySource ? "0" : "1",
+              v1_admission_rows: unexpectedV1Admission ? "1" : "0",
+              v11_admission_rows: "0",
+              source_id: missingPrimarySource ? null : SOURCE_ID,
               server_version_num: 170006,
             }]);
           }
@@ -136,6 +141,9 @@ function makePools(state, { badReceipt = false, sourceMismatch = false, invalidM
               checksum_sha256: badReceipt && version === 3 ? "f".repeat(64) : sha256,
             }));
             return result(rows);
+          }
+          if (sql.includes("AS namespace_count")) {
+            return result([{ namespace_count: multipleNamespaces ? "2" : "1", namespace: SOURCE_NAMESPACE }]);
           }
           if (sql.includes("AS mismatches")) return result([{ mismatches: sourceMismatch ? "1" : "0" }]);
           if (sql.includes("AS completed_at_utc")) return result(state.jobs.map((row) => ({ ...row })));
@@ -191,6 +199,7 @@ function reconcile(state, overrides = {}) {
     promise: reconcileUnprovenCompleteLedgerJobs({
       primaryPool: pools.primaryPool,
       ledgerPool: pools.ledgerPool,
+      ...TEST_SCHEMAS,
       expectedLedgerMigrations: expectedMigrations(),
       mode: "apply",
     }),
@@ -278,6 +287,7 @@ test("read-only inspect applies the same guards and returns digests without issu
   const receipt = await reconcileUnprovenCompleteLedgerJobs({
     primaryPool: pools.primaryPool,
     ledgerPool: pools.ledgerPool,
+    ...TEST_SCHEMAS,
     expectedLedgerMigrations: expectedMigrations(),
     mode: "inspect",
   });
@@ -309,7 +319,9 @@ test("wrong checksum, source pin, missing synthetic provenance, row drift, and m
   const cases = [
     ["migration checksum drift", () => reconcile(makeState(), { badReceipt: true }),
       "POSTGRES_TEST_LEDGER_RECONCILE_MIGRATION_RECEIPTS_INVALID"],
-    ["source/admission pin mismatch", () => reconcile(makeState(), { sourceMismatch: true }),
+    ["source pin mismatch", () => reconcile(makeState(), { sourceMismatch: true }),
+      "POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID"],
+    ["multiple ledger namespaces", () => reconcile(makeState(), { multipleNamespaces: true }),
       "POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID"],
     ["synthetic owner receipt missing", () => {
       const state = makeState();
@@ -340,21 +352,47 @@ test("wrong checksum, source pin, missing synthetic provenance, row drift, and m
   }
 });
 
-test("inspection error reports safe singleton and admission counts without values", async () => {
+test("inspection refuses unexpected legacy admission state and reports safe counts", async () => {
   const state = makeState();
-  const pools = makePools(state, { missingV1Admission: true });
+  const pools = makePools(state, { unexpectedV1Admission: true });
   await assert.rejects(reconcileUnprovenCompleteLedgerJobs({
     primaryPool: pools.primaryPool,
     ledgerPool: pools.ledgerPool,
+    ...TEST_SCHEMAS,
     expectedLedgerMigrations: expectedMigrations(),
     mode: "inspect",
   }), (error) => {
     assert.equal(error?.code, "POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID");
-    assert.deepEqual({ ...error?.safeCounts }, { sourcePinRows: 1, v1AdmissionRows: 0, v11AdmissionRows: 1 });
+    assert.deepEqual({ ...error?.safeCounts }, { sourcePinRows: 1, v1AdmissionRows: 1, v11AdmissionRows: 0 });
     assert.doesNotMatch(JSON.stringify(error), /synthetic:test-source|synthetic-test-namespace/u);
     return true;
   });
   assert.equal(state.updated, 0);
+});
+
+test("inspection refuses a changed maintenance source fingerprint or missing primary source", async () => {
+  const state = makeState();
+  const pools = makePools(state);
+  await assert.rejects(reconcileUnprovenCompleteLedgerJobs({
+    primaryPool: pools.primaryPool,
+    ledgerPool: pools.ledgerPool,
+    ...TEST_SCHEMAS,
+    expectedSourcePinSha256: "f".repeat(64),
+    expectedLedgerMigrations: expectedMigrations(),
+    mode: "inspect",
+  }), (error) => error?.code === "POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID"
+    && error.safeCounts?.ledgerNamespaceCount === 1);
+  assert.equal(state.updated, 0);
+
+  const missing = makePools(makeState(), { missingPrimarySource: true });
+  await assert.rejects(reconcileUnprovenCompleteLedgerJobs({
+    primaryPool: missing.primaryPool,
+    ledgerPool: missing.ledgerPool,
+    ...TEST_SCHEMAS,
+    expectedLedgerMigrations: expectedMigrations(),
+    mode: "inspect",
+  }), (error) => error?.code === "POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID"
+    && error.safeCounts?.sourcePinRows === 0);
 });
 
 test("runner rejects invalid job context before metadata or database access", async () => {

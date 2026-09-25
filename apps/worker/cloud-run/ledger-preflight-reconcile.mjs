@@ -18,6 +18,11 @@ export const LEDGER_PREFLIGHT_RECONCILE_SERVICE_ACCOUNT =
 export const LEDGER_PREFLIGHT_RECONCILE_IAM_USER =
   "tibotattle-test-migrator@tibotattle.iam";
 export const LEDGER_PREFLIGHT_RECONCILE_MIGRATION_ROOT = "/app/apps/worker/postgres/migrations";
+// Pinned from the named synthetic-development maintenance Job's configured
+// POSTGRES_SOURCE_ID and POSTGRES_SOURCE_NAMESPACE, without recording either
+// raw identifier in this image or its receipt.
+export const LEDGER_PREFLIGHT_RECONCILE_SOURCE_PIN_SHA256 =
+  "04788696fd8ad7482ace2f9d3950f75bb56e7bc7e5389c47466db231dfe2be8a";
 export const LEDGER_PREFLIGHT_RECONCILE_TARGETS = Object.freeze({
   primary: Object.freeze({
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
@@ -97,6 +102,7 @@ const SAFE_DIAGNOSTIC_COUNT_KEYS = new Set([
   "v11AdmissionRows",
   "jobsTotal",
   "jobsSourceMismatched",
+  "ledgerNamespaceCount",
   "syntheticReceiptMatches",
   "completeUnproven",
   "pendingUnverified",
@@ -375,20 +381,19 @@ function readSourcePinResult(rows) {
   const sourcePinRows = parseCount(row?.source_pin_rows, "POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID");
   const v1AdmissionRows = parseCount(row?.v1_admission_rows, "POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID");
   const v11AdmissionRows = parseCount(row?.v11_admission_rows, "POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID");
+  // This named test primary has v1.2-only authority. A newly populated legacy
+  // admission state changes the provenance question and must stop this repair.
   if (Math.floor(Number(row?.server_version_num) / 10_000) !== 17
-      || sourcePinRows !== 1 || v1AdmissionRows !== 1 || v11AdmissionRows !== 1
+      || sourcePinRows !== 1 || v1AdmissionRows !== 0 || v11AdmissionRows !== 0
       || typeof row?.source_id !== "string"
-      || !/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/u.test(row.source_id)
-      || typeof row.v1_namespace !== "string" || row.v1_namespace.length < 1 || row.v1_namespace.length > 256
-      || typeof row.v11_namespace !== "string" || row.v11_namespace.length < 1 || row.v11_namespace.length > 256
-      || row.v1_namespace !== row.v11_namespace) {
+      || !/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/u.test(row.source_id)) {
     fail("POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID", {
       sourcePinRows,
       v1AdmissionRows,
       v11AdmissionRows,
     });
   }
-  return Object.freeze({ sourceId: row.source_id, namespace: row.v1_namespace });
+  return Object.freeze({ sourceId: row.source_id });
 }
 
 async function readPinnedTestSource(primaryPool, schema) {
@@ -404,15 +409,9 @@ async function readPinnedTestSource(primaryPool, schema) {
     const rows = rowsFrom(await client.query(`
       SELECT
         (SELECT count(*)::text FROM ${qualifiedSchema}.storage_source_state WHERE singleton = 1) AS source_pin_rows,
-        (SELECT count(*)::text FROM ${qualifiedSchema}.typed_v1_admission_state
-          WHERE id = 1 AND runtime_contract_version = 1) AS v1_admission_rows,
-        (SELECT count(*)::text FROM ${qualifiedSchema}.typed_v11_admission_state
-          WHERE id = 1 AND runtime_contract_version = 1) AS v11_admission_rows,
+        (SELECT count(*)::text FROM ${qualifiedSchema}.typed_v1_admission_state) AS v1_admission_rows,
+        (SELECT count(*)::text FROM ${qualifiedSchema}.typed_v11_admission_state) AS v11_admission_rows,
         (SELECT source_id FROM ${qualifiedSchema}.storage_source_state WHERE singleton = 1) AS source_id,
-        (SELECT source_namespace FROM ${qualifiedSchema}.typed_v1_admission_state
-          WHERE id = 1 AND runtime_contract_version = 1) AS v1_namespace,
-        (SELECT source_namespace FROM ${qualifiedSchema}.typed_v11_admission_state
-          WHERE id = 1 AND runtime_contract_version = 1) AS v11_namespace,
         current_setting('server_version_num')::integer AS server_version_num
     `), "POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID");
     const pin = readSourcePinResult(rows);
@@ -470,6 +469,7 @@ export async function reconcileUnprovenCompleteLedgerJobs({
   primarySchema = LEDGER_PREFLIGHT_RECONCILE_TARGETS.primary.schema,
   ledgerSchema = LEDGER_PREFLIGHT_RECONCILE_TARGETS.ledger.schema,
   expectedLedgerMigrations,
+  expectedSourcePinSha256 = LEDGER_PREFLIGHT_RECONCILE_SOURCE_PIN_SHA256,
   mode = "inspect",
 } = {}) {
   if (primaryPool === null || typeof primaryPool !== "object" || typeof primaryPool.connect !== "function"
@@ -481,6 +481,12 @@ export async function reconcileUnprovenCompleteLedgerJobs({
   const ledger = quoteSchema(ledgerSchema);
   if (mode !== "inspect" && mode !== "apply") {
     fail("POSTGRES_TEST_LEDGER_RECONCILE_MODE_INVALID");
+  }
+  if (!SHA256_PATTERN.test(expectedSourcePinSha256)
+      || (primarySchema === LEDGER_PREFLIGHT_RECONCILE_TARGETS.primary.schema
+        && ledgerSchema === LEDGER_PREFLIGHT_RECONCILE_TARGETS.ledger.schema
+        && expectedSourcePinSha256 !== LEDGER_PREFLIGHT_RECONCILE_SOURCE_PIN_SHA256)) {
+    fail("POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID");
   }
   const expectedReceipts = expectedReceiptRows(expectedLedgerMigrations);
   const sourcePin = await readPinnedTestSource(primaryPool, primarySchema);
@@ -524,11 +530,31 @@ export async function reconcileUnprovenCompleteLedgerJobs({
     ), "POSTGRES_TEST_LEDGER_RECONCILE_MIGRATION_RECEIPTS_INVALID");
     validateMigrationReceipts(migrationRows, expectedReceipts);
 
+    const namespaceRows = rowsFrom(await client.query(
+      `SELECT count(DISTINCT source_namespace)::text AS namespace_count,
+              min(source_namespace) AS namespace
+         FROM ${ledger}.storage_erasure_jobs`,
+    ), "POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID");
+    const ledgerNamespaceCount = namespaceRows.length === 1
+      ? parseCount(namespaceRows[0]?.namespace_count)
+      : 0;
+    const namespace = namespaceRows[0]?.namespace;
+    if (ledgerNamespaceCount !== 1 || typeof namespace !== "string"
+        || namespace.length < 1 || namespace.length > 256) {
+      fail("POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID", { ledgerNamespaceCount });
+    }
+    const sourcePinSha256 = createHash("sha256")
+      .update(JSON.stringify({ sourceId: sourcePin.sourceId, namespace }))
+      .digest("hex");
+    if (sourcePinSha256 !== expectedSourcePinSha256) {
+      fail("POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID", { ledgerNamespaceCount });
+    }
+
     const sourceMismatchRows = rowsFrom(await client.query(
       `SELECT count(*)::text AS mismatches
          FROM ${ledger}.storage_erasure_jobs job
         WHERE job.source_id <> $1 OR job.source_namespace <> $2`,
-      [sourcePin.sourceId, sourcePin.namespace],
+      [sourcePin.sourceId, namespace],
     ), "POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID");
     const sourceMismatches = sourceMismatchRows.length === 1
       ? parseCount(sourceMismatchRows[0]?.mismatches)
@@ -631,9 +657,6 @@ export async function reconcileUnprovenCompleteLedgerJobs({
         || (expectedAfterPrestate ? !afterIsExpectedPrestate : !afterIsExpectedPoststate)) {
       fail("POSTGRES_TEST_LEDGER_RECONCILE_READBACK_INVALID");
     }
-    const sourcePinSha256 = createHash("sha256")
-      .update(JSON.stringify({ sourceId: sourcePin.sourceId, namespace: sourcePin.namespace }))
-      .digest("hex");
     const receipt = buildReceipt({
       actionMode: mode,
       resultMode,

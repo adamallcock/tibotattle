@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -70,8 +70,6 @@ test("PG17 inspect is read-only and exact candidate reopens 15 jobs for ledger m
       id integer PRIMARY KEY, runtime_contract_version integer NOT NULL, source_namespace text NOT NULL
     )`);
     await pool.query(`INSERT INTO "${primarySchema}".storage_source_state VALUES (1, 'synthetic:reconcile-test')`);
-    await pool.query(`INSERT INTO "${primarySchema}".typed_v1_admission_state VALUES (1, 1, 'synthetic-reconcile-namespace')`);
-    await pool.query(`INSERT INTO "${primarySchema}".typed_v11_admission_state VALUES (1, 1, 'synthetic-reconcile-namespace')`);
 
     directory = await mkdtemp(join(tmpdir(), "tibotattle-ledger-reconcile-pg17-"));
     const migrations = await readPostgresMigrations({ role: "ledger" });
@@ -110,16 +108,27 @@ test("PG17 inspect is read-only and exact candidate reopens 15 jobs for ledger m
       database: PG_TEST_DATABASE, ssl: false, max: 1, connectionTimeoutMillis: 5_000 });
     try {
       const expectedLedgerMigrations = manifest.roles.ledger;
-      const options = { primaryPool, ledgerPool, primarySchema, ledgerSchema, expectedLedgerMigrations };
+      const expectedSourcePinSha256 = createHash("sha256").update(JSON.stringify({
+        sourceId: "synthetic:reconcile-test", namespace: "synthetic-reconcile-namespace",
+      })).digest("hex");
+      const options = { primaryPool, ledgerPool, primarySchema, ledgerSchema,
+        expectedLedgerMigrations, expectedSourcePinSha256 };
       const beforeGeneration = await pool.query(`SELECT generation::text FROM "${ledgerSchema}".storage_erasure_ledger_generation`);
       assert.equal(beforeGeneration.rows[0]?.generation, "30");
+      await assert.rejects(reconcileUnprovenCompleteLedgerJobs({
+        ...options, expectedSourcePinSha256: "f".repeat(64), mode: "inspect",
+      }), (error) => error?.code === "POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID");
+      await pool.query(`DELETE FROM "${primarySchema}".storage_source_state`);
+      await assert.rejects(reconcileUnprovenCompleteLedgerJobs({ ...options, mode: "inspect" }),
+        (error) => error?.code === "POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID");
+      await pool.query(`INSERT INTO "${primarySchema}".storage_source_state VALUES (1, 'synthetic:reconcile-test')`);
       const inspection = await reconcileUnprovenCompleteLedgerJobs({ ...options, mode: "inspect" });
       assert.equal(inspection.status, "inspection_only");
       assert.equal(inspection.mode, "prestate_qualified");
       assert.equal(inspection.jobsThatWouldReopen, 15);
       assert.equal(inspection.sourceIdNamespaceMatches, 15);
       assert.equal(inspection.syntheticOwnersProven, 15);
-      assert.match(inspection.sourcePinSha256, /^[0-9a-f]{64}$/u);
+      assert.equal(inspection.sourcePinSha256, expectedSourcePinSha256);
       const unchanged = await pool.query(`SELECT count(*) FILTER (WHERE state='complete' AND terminal_json IS NULL)::int AS complete,
         count(*)::int AS total FROM "${ledgerSchema}".storage_erasure_jobs`);
       assert.deepEqual(unchanged.rows[0], { complete: 15, total: 15 });
