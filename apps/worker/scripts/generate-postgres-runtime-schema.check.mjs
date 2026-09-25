@@ -102,6 +102,12 @@ test("Worker migration receipt source is generated exactly from canonical SQL", 
   );
   assert.equal(
     renderPostgresRuntimeSchema(manifest).includes(
+      '"0044_accountless_import_claim_erasure.sql"',
+    ),
+    true,
+  );
+  assert.equal(
+    renderPostgresRuntimeSchema(manifest).includes(
       '"0031_typed_legacy_source_family_receipts.sql"',
     ),
     true,

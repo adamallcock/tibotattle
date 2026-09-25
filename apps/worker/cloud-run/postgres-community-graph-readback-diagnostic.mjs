@@ -36,8 +36,8 @@ const METADATA_EMAIL_URL =
   "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email";
 const SOURCE_ID = "synthetic-community-source";
 const DAY = "2026-09-23";
-const MIGRATION_COUNT = 43;
-const MIGRATION_TAIL = "0043_accountless_history_d1_import.sql";
+const MIGRATION_COUNT = 44;
+const MIGRATION_TAIL = "0044_accountless_import_claim_erasure.sql";
 const MIGRATION_ROOT = "/app/apps/worker/postgres/migrations";
 const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
 const EXPLAIN_TIMEOUT_MS = 15_000;

@@ -82,8 +82,8 @@ export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES = Object.freeze({
   }),
 });
 
-const MIGRATION_COUNT = 43;
-const MIGRATION_TAIL = "0043_accountless_history_d1_import.sql";
+const MIGRATION_COUNT = 44;
+const MIGRATION_TAIL = "0044_accountless_import_claim_erasure.sql";
 export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_MIGRATION_ROOT =
   "/app/apps/worker/postgres/migrations";
 const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
