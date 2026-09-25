@@ -25,15 +25,37 @@ const FINGERPRINT = "a".repeat(64);
 const NOW = Date.now();
 const STRESS_MEMBERS = process.env.PG_GRAPH_STRESS_MEMBERS === undefined
   ? 1_025 : Number(process.env.PG_GRAPH_STRESS_MEMBERS);
+const STRESS_NOW_MS = process.env.PG_GRAPH_STRESS_NOW_MS === undefined
+  ? NOW : Number(process.env.PG_GRAPH_STRESS_NOW_MS);
+const STRESS_TIMEOUT_MS = process.env.PG_GRAPH_STRESS_TIMEOUT_MS === undefined
+  ? 120_000 : Number(process.env.PG_GRAPH_STRESS_TIMEOUT_MS);
+const STRESS_C_COLLATION_INDEX = process.env.PG_GRAPH_STRESS_C_COLLATION_INDEX;
 if (!Number.isSafeInteger(STRESS_MEMBERS) || STRESS_MEMBERS < 1_025
     || STRESS_MEMBERS > 100_000) {
   throw new Error("PG_GRAPH_STRESS_MEMBERS must be an integer from 1025 to 100000");
 }
+if (!Number.isSafeInteger(STRESS_TIMEOUT_MS) || STRESS_TIMEOUT_MS < 120_000
+    || STRESS_TIMEOUT_MS > 1_800_000) {
+  throw new Error("PG_GRAPH_STRESS_TIMEOUT_MS must be an integer from 120000 to 1800000");
+}
+if (!Number.isSafeInteger(STRESS_NOW_MS) || STRESS_NOW_MS < 0) {
+  throw new Error("PG_GRAPH_STRESS_NOW_MS must be a nonnegative safe integer");
+}
+if (!(STRESS_C_COLLATION_INDEX === undefined || STRESS_C_COLLATION_INDEX === "0"
+    || STRESS_C_COLLATION_INDEX === "1")) {
+  throw new Error("PG_GRAPH_STRESS_C_COLLATION_INDEX must be unset, 0, or 1");
+}
 
 function measuredPool(base) {
   const timings = new Map();
+  let connectionAcquisitions = 0;
+  let checkedOutConnections = 0;
+  let maxConcurrentCheckedOutConnections = 0;
   let explainedResultPage = false;
+  let pageIndexInstalled = false;
+  let pageIndexSetupMilliseconds = 0;
   const classify = (sql) => {
+    if (/^FETCH FORWARD\b/u.test(sql)) return "member_readback_pages";
     if (sql.includes("candidates AS MATERIALIZED")) return "result_pages";
     if (sql.includes("WITH locked AS MATERIALIZED")) return "authority_locks";
     if (sql.includes("WITH stored AS MATERIALIZED")) return "member_receipt";
@@ -48,43 +70,127 @@ function measuredPool(base) {
     pool: {
       async connect() {
         const client = await base.connect();
+        connectionAcquisitions += 1;
+        checkedOutConnections += 1;
+        maxConcurrentCheckedOutConnections = Math.max(
+          maxConcurrentCheckedOutConnections, checkedOutConnections,
+        );
         return {
           async query(sql, values) {
+            if (!pageIndexInstalled && STRESS_C_COLLATION_INDEX === "1"
+                && classify(sql) === "result_pages") {
+              pageIndexInstalled = true;
+              const indexStarted = performance.now();
+              await client.query(`CREATE INDEX pg_community_graph_members_owner_digest_c
+                ON pg_temp.pg_community_graph_members (owner_digest COLLATE "C")`);
+              await client.query("ANALYZE pg_temp.pg_community_graph_members");
+              pageIndexSetupMilliseconds = performance.now() - indexStarted;
+            }
             if (!explainedResultPage && process.env.PG_GRAPH_STRESS_EXPLAIN === "1"
                 && classify(sql) === "result_pages") {
               explainedResultPage = true;
-              const explained = await client.query(`EXPLAIN (FORMAT JSON) ${sql}`, values);
-              const plan = explained.rows[0]?.["QUERY PLAN"]?.[0]?.Plan;
+              const explained = await client.query(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sql}`, values);
+              const explainedPlan = explained.rows[0]?.["QUERY PLAN"]?.[0];
+              const plan = explainedPlan?.Plan;
+              const bufferCounters = ["Shared Hit Blocks", "Shared Read Blocks", "Shared Dirtied Blocks",
+                "Shared Written Blocks", "Local Hit Blocks", "Local Read Blocks", "Local Dirtied Blocks",
+                "Local Written Blocks", "Temp Read Blocks", "Temp Written Blocks"];
               const nodes = [];
               const collect = (node) => {
                 if (!node) return;
+                const buffers = Object.fromEntries(bufferCounters
+                  .filter((key) => Number.isSafeInteger(node[key]))
+                  .map((key) => [key, node[key]]));
                 nodes.push({ type: node["Node Type"], relation: node["Relation Name"],
-                  index: node["Index Name"], planRows: node["Plan Rows"] });
+                  index: node["Index Name"], planRows: node["Plan Rows"],
+                  actualRows: node["Actual Rows"], loops: node["Actual Loops"],
+                  actualTotalTimeMs: node["Actual Total Time"],
+                  rowsRemovedByFilter: node["Rows Removed by Filter"],
+                  buffers });
                 for (const child of node.Plans ?? []) collect(child);
               };
               collect(plan);
-              console.log(JSON.stringify({ kind: "synthetic-postgres-result-page-plan-v1", nodes }));
+              console.log(JSON.stringify({
+                kind: "synthetic-postgres-result-page-explain-v2",
+                querySha256: createHash("sha256").update(sql).digest("hex"),
+                planningTimeMs: explainedPlan?.["Planning Time"] ?? null,
+                executionTimeMs: explainedPlan?.["Execution Time"] ?? null,
+                nodes,
+              }));
             }
             const started = performance.now();
-            try { return await client.query(sql, values); }
+            let result;
+            try {
+              result = await client.query(sql, values);
+              return result;
+            }
             finally {
               const kind = classify(sql);
-              const previous = timings.get(kind) ?? { count: 0, milliseconds: 0 };
+              const previous = timings.get(kind) ?? {
+                count: 0, milliseconds: 0, returnedRows: 0,
+                decodedRowsJsonBytes: 0, resultPayloadJsonBytes: 0,
+                pageRowCounts: [], pageDecodedRowsJsonBytes: [], pagePayloadJsonBytes: [],
+              };
+              // `result` is assigned before the finally block on successful queries.
+              // These sizes are decoded row JSON, not PostgreSQL wire-protocol bytes.
+              const rows = result?.rows ?? [];
+              const decodedRowsJsonBytes = Buffer.byteLength(JSON.stringify(rows));
+              const resultPayloadJsonBytes = rows.reduce((total, row) => total
+                + (typeof row.payload_json === "string" ? Buffer.byteLength(row.payload_json) : 0), 0);
               timings.set(kind, {
                 count: previous.count + 1,
                 milliseconds: previous.milliseconds + performance.now() - started,
+                returnedRows: previous.returnedRows + rows.length,
+                decodedRowsJsonBytes: previous.decodedRowsJsonBytes + decodedRowsJsonBytes,
+                resultPayloadJsonBytes: previous.resultPayloadJsonBytes + resultPayloadJsonBytes,
+                pageRowCounts: kind === "result_pages" || kind === "member_readback_pages"
+                  ? [...previous.pageRowCounts, rows.length] : previous.pageRowCounts,
+                pageDecodedRowsJsonBytes: kind === "result_pages" || kind === "member_readback_pages"
+                  ? [...previous.pageDecodedRowsJsonBytes, decodedRowsJsonBytes] : previous.pageDecodedRowsJsonBytes,
+                pagePayloadJsonBytes: kind === "result_pages" || kind === "member_readback_pages"
+                  ? [...previous.pagePayloadJsonBytes, resultPayloadJsonBytes] : previous.pagePayloadJsonBytes,
               });
             }
           },
-          release(discard) { return client.release(discard); },
+          release(discard) {
+            checkedOutConnections -= 1;
+            return client.release(discard);
+          },
         };
       },
     },
     summary() {
-      return Object.fromEntries([...timings].sort(([left], [right]) => left.localeCompare(right))
-        .map(([kind, timing]) => [kind, {
-          count: timing.count, milliseconds: Math.round(timing.milliseconds),
-        }]));
+      const summarizePages = (timing) => {
+        const summarizePageValues = (values) => ({
+          min: values.length ? Math.min(...values) : 0,
+          max: values.length ? Math.max(...values) : 0,
+          total: values.reduce((sum, value) => sum + value, 0),
+        });
+        return {
+          pageCount: timing.pageRowCounts.length,
+          rows: summarizePageValues(timing.pageRowCounts),
+          decodedRowsJsonBytes: summarizePageValues(timing.pageDecodedRowsJsonBytes),
+          resultPayloadJsonBytes: summarizePageValues(timing.pagePayloadJsonBytes),
+        };
+      };
+      return {
+        connectionAcquisitions,
+        maxConcurrentCheckedOutConnections,
+        checkedOutConnectionsAtEnd: checkedOutConnections,
+        pageIndexMode: STRESS_C_COLLATION_INDEX === "1" ? "collate-c-index-experiment" : "primary-key-default-collation",
+        pageIndexSetupMilliseconds: Math.round(pageIndexSetupMilliseconds),
+        queries: Object.fromEntries([...timings].sort(([left], [right]) => left.localeCompare(right))
+          .map(([kind, timing]) => [kind, {
+            count: timing.count,
+            milliseconds: Math.round(timing.milliseconds),
+            returnedRows: timing.returnedRows,
+            decodedRowsJsonBytes: timing.decodedRowsJsonBytes,
+            resultPayloadJsonBytes: timing.resultPayloadJsonBytes,
+            ...(kind === "result_pages" || kind === "member_readback_pages" ? {
+              pages: summarizePages(timing),
+            } : {}),
+          }])),
+      };
     },
   };
 }
@@ -230,6 +336,77 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
       ...(sourceKind === "effective" || sourceKind === "v1.1" || sourceKind === "v1"
         ? { inputFingerprint: fingerprint } : {}),
     };
+  }
+
+  function syntheticGraphStressDigests(memberCount, computedAtMs) {
+    const payload = JSON.stringify(readyComposition(FINGERPRINT));
+    const payloadSha256 = createHash("sha256").update(payload).digest("hex");
+    const workload = {
+      schemaVersion: "synthetic-public-graph-cohort-workload-v1",
+      day: DAY,
+      sourceId: SOURCE_ID,
+      sourceNamespace: SOURCE_NAMESPACE,
+      memberCount,
+      computedAtMs,
+      sourcePin,
+      syntheticGeneration: {
+        ownerDigest: "lowercase-hex(index), left padded to 64 characters",
+        participantId: "synthetic-stream-index",
+        sourceKind: "effective",
+        inputRevision: 0,
+        ownerRevision: 1,
+        authorityEpoch: 0,
+        inputFingerprint: FINGERPRINT,
+        payloadSha256,
+      },
+    };
+    const source = createHash("sha256");
+    const updateSource = (record) => {
+      const serialized = canonicalJson(record);
+      source.update(`${Buffer.byteLength(serialized)}:${serialized}\n`);
+    };
+    updateSource(workload);
+    for (let index = 1; index <= memberCount; index += 1) {
+      const ownerDigest = index.toString(16).padStart(64, "0");
+      updateSource({
+        schemaVersion: "synthetic-community-graph-owner-v1",
+        participant: { id: `synthetic-stream-${index}`, ownerKind: "social", state: "active" },
+        owner: { sourceId: SOURCE_ID, ownerDigest, revision: 1, authorityEpoch: 0, state: "active" },
+        link: { participantId: `synthetic-stream-${index}`, ownerDigest, state: "active" },
+        inputVersion: { participantId: `synthetic-stream-${index}`, revision: 0 },
+        graphMember: {
+          participantId: `synthetic-stream-${index}`,
+          ownerDigest,
+          inputRevision: 0,
+          ownerRevision: 1,
+          authorityEpoch: 0,
+          sourceKind: "effective",
+          inputFingerprint: FINGERPRINT,
+        },
+        ownerResult: {
+          sourceId: SOURCE_ID,
+          sourceNamespace: SOURCE_NAMESPACE,
+          observedDay: DAY,
+          metric: "model",
+          ownerDigest,
+          inputRevision: 0,
+          ownerRevision: 1,
+          authorityEpoch: 0,
+          publicAuthorityEpoch: 0,
+          sourceEpoch: 0,
+          sequence: 0,
+          method: V11_PLAN_ATTRIBUTION_ADAPTER_VERSION,
+          status: "ready",
+          reason: null,
+          payloadSha256,
+          computedAtMs,
+        },
+      });
+    }
+    return Object.freeze({
+      workloadDigest: createHash("sha256").update(canonicalJson(workload)).digest("hex"),
+      sourceDigest: source.digest("hex"),
+    });
   }
 
   const sourcePin = {
@@ -593,8 +770,9 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
              $4, 'ready', NULL, $5, $6, $7
         FROM generate_series(1,$8::integer) AS generated(index)`, [
       SOURCE_ID, SOURCE_NAMESPACE, DAY, V11_PLAN_ATTRIBUTION_ADAPTER_VERSION,
-      largePayload, largePayloadHash, NOW, largeCount,
+      largePayload, largePayloadHash, STRESS_NOW_MS, largeCount,
     ]);
+    const workloadDigests = syntheticGraphStressDigests(largeCount, STRESS_NOW_MS);
 
     const stream = async function* (stopAfter = largeCount) {
       for (let index = 1; index <= stopAfter; index += 1) {
@@ -608,7 +786,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     }
     const schemaOptions = { primarySchema: schema, ledgerSchema: "tibotattle_ledger" };
     await expect(publishPostgresCommunityModelDayStream(pool, {
-      sourcePin, members: interrupted(), day: DAY, nowMs: NOW, schema: schemaOptions,
+      sourcePin, members: interrupted(), day: DAY, nowMs: STRESS_NOW_MS, schema: schemaOptions,
     })).rejects.toMatchObject({ code: "unavailable", operation: "postgres.community_graph.publish_model_day" });
     expect(await pool.query(`SELECT
       (SELECT count(*) FROM ${sqlSchema}.analytics_publications) AS publications,
@@ -616,24 +794,37 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
       (SELECT count(*) FROM ${sqlSchema}.analytics_publication_owner_members) AS members`))
       .toMatchObject({ rows: [{ publications: "0", captures: "0", members: "0" }] });
 
-    const rssBefore = process.memoryUsage().rss;
+    const memorySnapshot = () => {
+      const { rss, heapUsed, external } = process.memoryUsage();
+      return { rssBytes: rss, heapUsedBytes: heapUsed, externalBytes: external };
+    };
+    const cpuMilliseconds = (usage) => ({
+      userMs: Math.round(usage.user / 1000),
+      systemMs: Math.round(usage.system / 1000),
+      totalMs: Math.round((usage.user + usage.system) / 1000),
+    });
+    const rssBefore = memorySnapshot();
+    const publishCpuStarted = process.cpuUsage();
     const publicationSql = measuredPool(pool);
     const publishStarted = performance.now();
     const published = await publishPostgresCommunityModelDayStream(publicationSql.pool, {
-      sourcePin, members: stream(), day: DAY, nowMs: NOW, schema: schemaOptions,
+      sourcePin, members: stream(), day: DAY, nowMs: STRESS_NOW_MS, schema: schemaOptions,
     });
     const publishMilliseconds = performance.now() - publishStarted;
-    const rssAfterPublish = process.memoryUsage().rss;
+    const publishCpu = cpuMilliseconds(process.cpuUsage(publishCpuStarted));
+    const rssAfterPublish = memorySnapshot();
     expect(published).toMatchObject({ state: "published", memberCount: largeCount });
     expect(await pool.query(`SELECT expected_members, payload_json
       FROM ${sqlSchema}.analytics_publication_captures`)).toMatchObject({
       rows: [{ expected_members: String(largeCount), payload_json: expect.stringContaining('"postgres-community-model-capture-v2"') }],
     });
     const readSql = measuredPool(pool);
+    const readCpuStarted = process.cpuUsage();
     const readStarted = performance.now();
-    expect(await readPostgresCommunityModelDay(readSql.pool, {
+    const readback = await readPostgresCommunityModelDay(readSql.pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: DAY, schema: schemaOptions,
-    })).toMatchObject({
+    });
+    expect(readback).toMatchObject({
       day: DAY,
       fittedParticipantCount: largeCount,
       v1ParticipantCount: largeCount,
@@ -641,20 +832,31 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
       values: [["gpt-6-astra", 1000, largeCount]],
     });
     const readMilliseconds = performance.now() - readStarted;
-    const rssAfterRead = process.memoryUsage().rss;
+    const readCpu = cpuMilliseconds(process.cpuUsage(readCpuStarted));
+    const rssAfterRead = memorySnapshot();
+    const outputDigest = createHash("sha256").update(canonicalJson(readback)).digest("hex");
     if (process.env.PG_GRAPH_STRESS_MEMBERS !== undefined) {
       console.log(JSON.stringify({
-        kind: "synthetic-postgres-graph-stress-v1",
+        kind: "synthetic-postgres-graph-stress-v2",
+        profile: "community-graph-100k-capable-v1",
         members: largeCount,
+        computedAtMs: STRESS_NOW_MS,
+        workloadDigest: workloadDigests.workloadDigest,
+        sourceDigest: workloadDigests.sourceDigest,
+        outputDigest,
         publishMilliseconds: Math.round(publishMilliseconds),
+        publishCpu,
         readMilliseconds: Math.round(readMilliseconds),
-        rssSnapshotsBytes: [rssBefore, rssAfterPublish, rssAfterRead],
+        readCpu,
+        memorySnapshots: [rssBefore, rssAfterPublish, rssAfterRead],
+        processMaxRssPlatformUnits: process.resourceUsage().maxRSS,
+        poolMax: 4,
         publicationSql: publicationSql.summary(),
         readSql: readSql.summary(),
       }));
     }
     expect(await publishPostgresCommunityModelDayStream(pool, {
-      sourcePin, members: stream(), day: DAY, nowMs: NOW + 1, schema: schemaOptions,
+      sourcePin, members: stream(), day: DAY, nowMs: STRESS_NOW_MS + 1, schema: schemaOptions,
     })).toMatchObject({ state: "unchanged", memberCount: largeCount, generation: published.generation });
     await pool.query(`UPDATE ${sqlSchema}.analytics_publication_owner_members
       SET authority_epoch=1 WHERE source_id=$1 AND day=$2::date AND metric='model' AND generation=$3
@@ -665,5 +867,5 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     expect(await readPostgresCommunityModelDay(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: DAY, schema: schemaOptions,
     })).toBeNull();
-  }, 120_000);
+  }, STRESS_TIMEOUT_MS);
 });
