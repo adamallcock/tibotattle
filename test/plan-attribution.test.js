@@ -112,6 +112,18 @@ test("Pro to Plus to Pro produces distinct eras even if reset labels are reused"
   assert.equal(classifyUsageAttribution(index, usage(700)).disposition, "legacy_conditional");
 });
 
+test("Pro to provisional Pro 50x to Pro keeps three separate plan eras", () => {
+  const index = buildPlanAttributionIndex([
+    observation(100, "pro"), observation(200, "pro"),
+    observation(300, "promax"), observation(400, "promax"),
+    observation(500, "pro"), observation(600, "pro"),
+  ]);
+  assert.deepEqual(index.eras.map((era) => era.planType), ["pro", "promax", "pro"]);
+  assert.notEqual(index.eras[0].eraKey, index.eras[2].eraKey);
+  assert.equal(planEraForInterval(index, usage(350)).era.planType, "promax");
+  assert.equal(planEraForInterval(index, usage(350, { intervalStartMs: 150 })).status, "conflicted");
+});
+
 test("declared same-plan continuity changes and returns create distinct eras without account proof", () => {
   const rows = [
     observation(100, "pro", { continuityId: "era-a" }), observation(200, "pro", { continuityId: "era-a" }),

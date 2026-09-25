@@ -7,8 +7,8 @@ export function publicAllowanceFixture(nowMs = Date.now()) {
   const summary = (usd, accounts = 2) => ({ centralUsd: usd,
     participantCount: usd === null ? 0 : accounts, fitCount: usd === null ? 0 : 4,
     band80Usd: usd === null ? null : { lowerUsd: usd * .8, upperUsd: usd * 1.2 } });
-  const basis = "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d";
-  const normalization = "pro_x1_prolite_x4_plus_x20";
+  const basis = "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax50";
+  const normalization = "pro_x1_prolite_x4_promax_x0_4_plus_x20";
   const dates = Array.from({ length: 35 }, (_, i) => dayAt(i - 35));
   return {
     schemaVersion: "community-daily-read-v1.0", allowanceState: "ready",
@@ -23,12 +23,14 @@ export function publicAllowanceFixture(nowMs = Date.now()) {
         allowance: { basis, referencePlanType: "pro", normalization, ...summary(1500 + i * 12) },
       } })),
     allowanceBreakdowns: {
-      schemaVersion: "community-allowance-breakdowns-v1.0", basis, referencePlanType: "pro",
+      schemaVersion: "community-allowance-breakdowns-v1.2", basis, referencePlanType: "pro",
       normalization, modelBasis: "seven_day_codex_pro20x_equivalent_per_model_composition",
       modelGate: "shared_composition_kernel_identification", generatedAt,
-      days: dates.map((day, i) => ({ day,
+      days: dates.map((day, i) => ({ day, combined: summary(1500 + i * 12),
         byPlanType: { pro: summary(2000 + Math.sin(i / 3) * 200),
-          prolite: summary(i === 20 ? null : 1000 + i * 8), plus: summary(3000 - i * 10, 1) },
+          prolite: summary(i === 20 ? null : 1000 + i * 8),
+          promax: summary(i === 12 ? null : 850 + i * 7),
+          plus: summary(3000 - i * 10, 1) },
         models: i < 25 ? [] : [
           ["gpt-5.5", 1200 + i * 6, 1], ["gpt-5.6-sol", 2200 + Math.cos(i) * 100, 3],
           ...(i > 30 ? [["gpt-6-astra", 1600 + i * 8, 1]] : []),

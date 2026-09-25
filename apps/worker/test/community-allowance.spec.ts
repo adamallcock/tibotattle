@@ -493,10 +493,10 @@ describe("summarizeCommunityAllowanceDay", () => {
     expect(summary.fitCount).toBe(2);
     expect(summary.centralUsd).toBe(20);
     expect(summary.basis).toBe(
-      "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+      "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax50",
     );
     expect(summary.referencePlanType).toBe("pro");
-    expect(summary.normalization).toBe("pro_x1_prolite_x4_plus_x20");
+    expect(summary.normalization).toBe("pro_x1_prolite_x4_promax_x0_4_plus_x20");
     expect(summary).not.toHaveProperty("planType");
     expect(summary).not.toHaveProperty("planVariant");
     expect(summary.trailingDays).toBe(30);
@@ -552,6 +552,14 @@ describe("summarizeCommunityAllowanceDay", () => {
     expect(summary.participantCount).toBe(2);
     expect(summary.centralUsd).toBe(100);
     expect(summary.band80Usd).toEqual({ lowerUsd: 100, upperUsd: 100 });
+  });
+
+  it("converts a Pro 50x fit to the Pro 20x reference without changing its observed capacity", () => {
+    const promax = fit({ participantId: "p50", planType: "promax", capacityNanousd: 250e9 });
+    const summary = summarizeCommunityAllowanceDay([promax], "2026-07-25");
+    expect(summary).toMatchObject({ fitCount: 1, participantCount: 1, centralUsd: 100 });
+    expect(summarizeCommunityCapacityByPlanType([promax], "2026-07-25").promax)
+      .toMatchObject({ medianCapacityNanousd: 250e9, participantCount: 1, fitCount: 1 });
   });
 });
 
@@ -657,9 +665,9 @@ describe("community allowance in the daily aggregate", () => {
       .toBe("community-daily-aggregate-v1.0");
     expect(contributionPayload.allowance).toMatchObject({
       basis:
-        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax50",
       referencePlanType: "pro",
-      normalization: "pro_x1_prolite_x4_plus_x20",
+      normalization: "pro_x1_prolite_x4_promax_x0_4_plus_x20",
       qualification: "shared_reset_fit_gates_25pp_span_floor",
       spanFloorPp: 25,
       fitCount: 1,

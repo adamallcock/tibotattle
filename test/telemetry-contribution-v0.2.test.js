@@ -162,6 +162,17 @@ test("known account tracks survive account switches while unattributed usage sta
   assert.equal(part.usageEvents[0].accountingDiagnostic.status, "untrusted_diagnostic");
 });
 
+test("the frozen v0.2 projection keeps provisional Pro 50x as unknown", async () => {
+  const source = bundle({
+    quotaSnapshots: [{ ...quota(2), planType: "promax" }],
+    activityMarkers: [{ ...marker(3), planType: "promax" }],
+  });
+  const [part] = buildTelemetryContributionsV02(source, PARTICIPANT_A);
+  assert.equal(part.quotaSnapshots[0].planType, "unknown");
+  assert.equal(part.activityMarkers[0].planType, "unknown");
+  assert.equal((await compiledContributionValidator())(part), true);
+});
+
 test("central re-enrollment changes dataset and account tracks without leaking either scope", () => {
   const source = bundle();
   const [first] = buildTelemetryContributionsV02(source, PARTICIPANT_A);

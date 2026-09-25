@@ -21,6 +21,7 @@ import {
   COMMUNITY_ALLOWANCE_BASIS,
   COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS,
   COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+  COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,
 } from "../src/community-allowance";
 import type { PublicAllowanceBreakdowns } from "../src/public-allowance-breakdowns";
 import {
@@ -172,7 +173,7 @@ async function seedReadyAllowanceState(nowMs: number): Promise<void> {
     (singleton, publication_state, expected_basis, safe_from_day, safe_to_day,
      changed_at, attribution_method_version) VALUES (1,'ready',?,?,?,?,?)`)
     .bind(COMMUNITY_ALLOWANCE_BASIS, utcDay(nowMs, 1 - COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS),
-      utcDay(nowMs), new Date(nowMs).toISOString(), COMMUNITY_ATTRIBUTION_METHOD_VERSION).run();
+      utcDay(nowMs), new Date(nowMs).toISOString(), COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION).run();
 }
 
 async function seedBreakdownCache(nowMs: number, options: {
@@ -184,7 +185,7 @@ async function seedBreakdownCache(nowMs: number, options: {
     (singleton, generated_at, payload_json, attribution_method_version, source_mutation_epoch)
     VALUES (1,?,?,?,?)`).bind(options.generatedAt ?? new Date(nowMs).toISOString(),
       options.payload ?? JSON.stringify(breakdownPreview(nowMs)),
-      options.method ?? COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+      options.method ?? COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,
       options.epoch === undefined ? source!.mutation_epoch : options.epoch).run();
 }
 
@@ -513,10 +514,10 @@ describe("GET /api/v1/community/daily", () => {
 
     const mergedAllowance = {
       basis:
-        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax50",
       limitId: "codex",
       referencePlanType: "pro",
-      normalization: "pro_x1_prolite_x4_plus_x20",
+      normalization: "pro_x1_prolite_x4_promax_x0_4_plus_x20",
       windowDurationMinutes: 10_080,
       trailingDays: 30,
       qualification: "shared_reset_fit_gates_25pp_span_floor",
@@ -550,7 +551,7 @@ describe("GET /api/v1/community/daily", () => {
     expect(updatingState).toMatchObject({
       publication_state: "updating",
       expected_basis:
-        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax50",
       safe_to_day: today,
     });
 
@@ -592,7 +593,7 @@ describe("GET /api/v1/community/daily", () => {
     expect(readyBody.allowanceState).toBe("ready");
     expect(readyBody.days[0]?.payload.allowance).toMatchObject({
       basis:
-        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax50",
       fitCount: 0,
       participantCount: 0,
       centralUsd: null,

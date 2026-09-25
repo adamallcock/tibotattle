@@ -41,6 +41,7 @@
         "plus",
         "pro",
         "prolite",
+        "promax",
         "team",
         "self_serve_business_prolite",
         "self_serve_business_usage_based",
@@ -202,6 +203,26 @@
             "properties": {
               "planType": {
                 "const": "prolite"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "promax"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "promax"
               }
             }
           }

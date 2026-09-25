@@ -4,9 +4,9 @@
     "repository": "openai/codex",
     "branch": "main",
     "path": "codex-rs/protocol/src/auth.rs",
-    "reviewedRevision": "b68acc4d4b56fdfa1d5b6a2c36102c66876e0c46",
-    "reviewedOn": "2026-08-26",
-    "sourceSha256": "c7293c4b592e7429b6aeb969b15ba0cfe056729f33b09583912fec250b00c756"
+    "reviewedRevision": "b725da3b6d5237e8eb0cf8bb0bc47b8efa575fc2",
+    "reviewedOn": "2026-09-24",
+    "sourceSha256": "0ab901e92eaaa9ac87d1aa5ba94c1bdc72696e922062f318e2c8e308462a3856"
   },
   "binaryChannels": [
     {
@@ -51,15 +51,22 @@
     },
     {
       "rawValue": "pro",
-      "displayName": "Pro",
+      "displayName": "Pro (More)",
       "lifecycle": "active",
       "firstReviewedOn": "2026-08-25"
     },
     {
       "rawValue": "prolite",
-      "displayName": "Pro Lite",
+      "displayName": "Pro",
       "lifecycle": "active",
       "firstReviewedOn": "2026-08-25"
+    },
+    {
+      "rawValue": "promax",
+      "displayName": "Pro (Max)",
+      "lifecycle": "provisional",
+      "firstReviewedOn": "2026-09-24",
+      "note": "The raw value and display name match openai/codex KnownPlan at the reviewed source revision. No reviewed installed binary exposes the value yet; the 50x allowance and window semantics remain unverified."
     },
     {
       "rawValue": "team",

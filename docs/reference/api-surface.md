@@ -104,16 +104,20 @@ are not part of the API registry.
 ### Public allowance breakdowns
 
 `GET /api/v1/community/daily` may add `allowanceBreakdowns` with schema
-`community-allowance-breakdowns-v1.1`. Its only fields are schema version,
+`community-allowance-breakdowns-v1.2`. Its only fields are schema version,
 aggregate basis, reference plan, normalization, model basis/gate, generation
 timestamp and up to 70 date rows. Each row contains the day, the combined
-summary, the three reviewed
+summary, the four configured
 personal-plan summaries and reviewed model tuples `[modelId, usd, accountCount]`.
 Combined and plan summaries contain only median dollars, account/fit counts and an optional
 middle-80%-of-fits band. Model estimates have no band or reset-fit count.
 
-All comparisons use the same Pro 20x-equivalent weekly basis: Pro ×1,
-Pro 5x ×4, Plus ×20. Unknown plans and separate-track Spark estimates are
+The underlying combined and model estimates use a Pro 20x-equivalent weekly
+basis: Pro ×1, Pro 5x ×4, provisional Pro 50x ×0.4, Plus ×20. The public By
+plan chart displays each plan's own week on its own scale by dividing the
+reference estimate by that plan's factor; each card also shows the reference
+estimate. The Pro 50x factor assumes a common Plus baseline and is pending
+provider confirmation. Unknown plans and separate-track Spark estimates are
 excluded. Model values require the existing composition identification gate;
 historical values are never carried backward from today's fit.
 

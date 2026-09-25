@@ -172,7 +172,7 @@ function valueAxis(maximum, plotTop, plotBottom, minimum = 0) {
   const step = chartTickStep(top);
   const axisTop = Math.ceil(top / step) * step;
   // A zero baseline wastes most of the panel when a band sits well above it:
-  // three plans on their own axes only read if each one fills its own panel.
+  // plans on their own axes only read if each one fills its own panel.
   // The floor still snaps to a whole tick, so the gridlines stay round and the
   // axis never implies a precision the step does not have. Zero is kept when
   // the data actually reaches down toward it.
@@ -510,8 +510,9 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
   const breakdownDays = new Map(series.breakdowns.days.map(day => [day.day, day]));
   const definitions = [
     { key: "aggregate", view: "aggregate", label: null, className: "" },
-    ...[ ["pro", "Pro 20×"], ["prolite", "Pro 5×"], ["plus", "Plus"] ].map(([key, label], index) => ({
-      key, label, view: "plans", className: `allowance-series-${index}`,
+    ...(series.breakdowns.planIds ?? Object.keys(series.breakdowns.days.at(-1)?.byPlanType ?? {})).map((key, index) => ({
+      label: { pro: "Pro 20×", prolite: "Pro 5×", promax: "Pro 50×", plus: "Plus" }[key],
+      key, view: "plans", className: `allowance-series-${index}`,
     })),
     ...series.breakdowns.modelConfig.map(({ modelId, label }, index) => ({
       key: modelId, label, view: "models", ...allowanceModelPresentation(modelId, index),
@@ -1605,7 +1606,7 @@ export function renderCommunityAllowanceSection({
     }
     container.append(cards);
     if (view === "plans") {
-      // Small multiples. Three plans whose own weeks span roughly twentyfold
+      // Small multiples. Plans whose own weeks span a wide range
       // cannot share a linear axis — the smallest is pinned to the baseline and
       // its band becomes a sliver. One panel per plan gives each its own value
       // axis and full vertical resolution, and it removes the need to explain a
@@ -1627,7 +1628,8 @@ export function renderCommunityAllowanceSection({
       appendCommunityAllowanceChart({ documentRef, container, model, t, inspection });
     }
     container.append(node("p", "snapshot-disclosure", t(view === "models"
-      ? "community.allowance.modelMethod" : "community.allowance.planMethod")));
+      ? "community.allowance.modelMethod"
+      : series.breakdowns?.isCurrent ? "community.allowance.planMethod" : "community.allowance.planMethodLegacy")));
     return "published";
   }
   const headline = node("div", "allowance-headline");
@@ -1670,7 +1672,8 @@ export function renderCommunityAllowanceSection({
   container.append(node(
     "p",
     "snapshot-disclosure",
-    t("community.allowance.methodNote"),
+    t((series.breakdowns?.isCurrent ?? series.allowanceIsCurrent)
+      ? "community.allowance.methodNote" : "community.allowance.methodNoteLegacy"),
   ));
   return "published";
 }

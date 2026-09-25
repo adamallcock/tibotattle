@@ -13,7 +13,7 @@
     "transportReady": false
   },
   "fieldContract": {
-    "sha256": "45dada68d20ef6fef62272aa9c37efceed009a410755f9f5ed8bb6090787d69e",
+    "sha256": "72f5bc882a6d8525edd02f23d4e81dd0ec0de4bf2adde2c7afbad65cb3baacb0",
     "version": "telemetry-field-dictionary-v0.1"
   },
   "implementation": {
@@ -80,7 +80,7 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/activity-marker.schema.json",
         "name": "activity-marker.schema.json",
-        "sha256": "3e6db5204d174d0cc01cade736ea3243535c31514d54f0a521e6920f9f6ba20c"
+        "sha256": "78cbc3d08ecfbd5481f663fc619c83135ef964bc463ac73ec83a2baddc35a2f5"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/bundle.schema.json",
@@ -100,7 +100,7 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/quota-snapshot.schema.json",
         "name": "quota-snapshot.schema.json",
-        "sha256": "2d426427ae33087cb52f1f7aa12497200ee758d24f7974e20329a90c2199246b"
+        "sha256": "21edb13e2db787fa0499c8e6fcd5a83427d206d60eae8f6e11a300c8e4ca2ba1"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json",
@@ -108,7 +108,7 @@
         "sha256": "43693e9cbce396e451d918e129c54de91e0059250e937c5a533b898b7b21aed0"
       }
     ],
-    "setSha256": "ac09e00a083a0140cb03456564cb0812e04042d0cd730742cdda95f06220b76c"
+    "setSha256": "9a4a58170bc643329d7faac61bc032d7cefc69798efcc831aae4b920c6b8edb9"
   },
   "tupleVersion": "usage-export-compatibility-v0.1"
 }

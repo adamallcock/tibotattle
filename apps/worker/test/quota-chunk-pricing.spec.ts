@@ -4,7 +4,7 @@ import { parseTelemetryV1Chunk, type TelemetryV1UsageEvent } from "../src/teleme
 import { COMMUNITY_DAILY_SPEND_BASIS, COMMUNITY_DAILY_SPEND_PRICING_METHOD,
   COMMUNITY_DAILY_SPEND_REGISTRY_SHA256, isCurrentCommunityDailySpend } from "../src/community-daily-spend";
 import { COMMUNITY_ALLOWANCE_BASIS, COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS,
-  COMMUNITY_ATTRIBUTION_METHOD_VERSION } from "../src/community-allowance";
+  COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, COMMUNITY_ATTRIBUTION_METHOD_VERSION } from "../src/community-allowance";
 import { isCurrentCommunityAllowancePublication } from "../src/community-daily-aggregates";
 
 const AT = "2026-09-05T00:00:00.000Z";
@@ -38,7 +38,7 @@ function price(value: TelemetryV1UsageEvent) {
 describe("admitted chunk usage pricing evidence boundaries", () => {
   it("fences public allowance readiness against prior v0.4 pricing without rewriting the singleton", () => {
     const state = { publication_state: "ready" as const, expected_basis: COMMUNITY_ALLOWANCE_BASIS,
-      attribution_method_version: COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+      attribution_method_version: COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,
       safe_from_day: new Date(Date.parse(AT) - (COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS - 1) * 86_400_000)
         .toISOString().slice(0, 10), safe_to_day: AT.slice(0, 10), changed_at: AT };
     expect(COMMUNITY_ATTRIBUTION_METHOD_VERSION).toContain(COMMUNITY_DAILY_SPEND_PRICING_METHOD);
@@ -46,8 +46,8 @@ describe("admitted chunk usage pricing evidence boundaries", () => {
     // The actual prior tuple omitted the price method entirely. Also reject a
     // tuple explicitly bound to v0.4, rather than treating any version as current.
     for (const oldMethod of [
-      COMMUNITY_ATTRIBUTION_METHOD_VERSION.split(":").filter(value => value !== COMMUNITY_DAILY_SPEND_PRICING_METHOD).join(":"),
-      COMMUNITY_ATTRIBUTION_METHOD_VERSION.replace(COMMUNITY_DAILY_SPEND_PRICING_METHOD, "server-api-price-equivalent-v0.4"),
+      COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION.split(":").filter(value => value !== COMMUNITY_DAILY_SPEND_PRICING_METHOD).join(":"),
+      COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION.replace(COMMUNITY_DAILY_SPEND_PRICING_METHOD, "server-api-price-equivalent-v0.4"),
     ]) {
       const old = { ...state, attribution_method_version: oldMethod };
       expect(isCurrentCommunityAllowancePublication(old, Date.parse(AT))).toBe(false);

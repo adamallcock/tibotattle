@@ -1328,7 +1328,7 @@ test("the community allowance surface leads the product hero with honest labelin
     /data-range-days="30" class="active" aria-pressed="true"/u,
   );
   assert.match(html, /Pro 20x-equivalent allowance/u);
-  assert.match(html, /API-price value of a Pro 20x-equivalent week: overall, by plan or by model/u);
+  assert.match(html, /Estimated weekly API-price value: Pro 20× equivalent overall and by model; each plan's own week in By plan/u);
   for (const view of ["aggregate", "plans", "models"]) {
     assert.equal(html.match(new RegExp(`data-allowance-view="${view}"`, "gu"))?.length, 2);
   }
@@ -2123,6 +2123,22 @@ test("the daily normalizer treats the allowance block as additive and per-day", 
     centralUsd: 1879,
     band80Usd: null,
   });
+
+  const current = allowanceBlock({
+    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax50",
+    normalization: "pro_x1_prolite_x4_promax_x0_4_plus_x20",
+  });
+  const currentOnly = normalizeCommunityDailySeries(publishedDailySeries({
+    days: [allowanceDay("2026-08-06", current)],
+  }));
+  assert.equal(currentOnly.allowanceIsCurrent, true);
+  const mixed = normalizeCommunityDailySeries(publishedDailySeries({
+    days: [allowanceDay("2026-08-06", allowanceBlock()), allowanceDay("2026-08-07", current)],
+  }));
+  assert.equal(mixed.state, "published");
+  assert.equal(mixed.allowanceIsCurrent, false);
+  assert.deepEqual(mixed.days.map(day => day.allowance), [null, null],
+    "a cutover response cannot connect unlike allowance bases");
 });
 
 test("the allowance chart model maps estimates honestly and slices ranges", () => {
@@ -2238,8 +2254,9 @@ test("the allowance section renders the estimate with its visible caveat", () =>
   assert.match(container.text, /5 qualifying reset fits in the trailing 30 days/u);
   assert.match(container.text, /Latest published estimate \(Aug 7, 2026\)/u);
   assert.doesNotMatch(container.text, /Latest published estimate \(Aug 6, 2026\)/u);
-  // The methodology note names the merged multipliers and real 40pp gate.
+  // Legacy daily evidence keeps its own methodology note and real 40pp gate.
   assert.match(container.text, /Pro ×1, Pro 5x ×4, Plus ×20/u);
+  assert.doesNotMatch(container.text, /Pro 50x ×0\.4/u);
   assert.match(container.text, /40-point observed-span floor/u);
   // Chart present with band, line, and fit dots; sparse two-point series
   // carries the still-filling note.

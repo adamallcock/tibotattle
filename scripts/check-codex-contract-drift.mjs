@@ -48,7 +48,7 @@ const EXPECTED_SOURCE = Object.freeze({
   path: "codex-rs/protocol/src/auth.rs",
   repository: "openai/codex",
 });
-const ALLOWED_PLAN_LIFECYCLES = new Set(["active", "deprecated"]);
+const ALLOWED_PLAN_LIFECYCLES = new Set(["active", "deprecated", "provisional"]);
 const ALLOWED_SEAT_MAPPING_STATUSES = new Set([
   "rejected",
   "unverified_candidate",
@@ -238,6 +238,11 @@ export function validateCodexContractLedger(value) {
         `ledger.plans[${index}].deprecatedOn`,
         { pattern: ISO_DATE_RE },
       );
+    }
+    if (plan.lifecycle === "provisional") {
+      requireBoundedString(plan.note, `ledger.plans[${index}].note`, {
+        maxLength: 500,
+      });
     }
   }
 
@@ -691,6 +696,12 @@ export function compareUpstreamPlanRegistry(ledger, observedPairs) {
         `Active plan ${expected.rawValue} is no longer present upstream; review before marking it deprecated`,
       ));
     }
+    if (expected.lifecycle === "provisional" && observedByRaw.has(expected.rawValue)) {
+      warnings.push(issue(
+        "provisional_plan_observed",
+        `Provisional plan ${expected.rawValue} is present upstream; resolve remaining release gates before activation`,
+      ));
+    }
   }
   return { issues, ok: issues.length === 0, warnings };
 }
@@ -989,6 +1000,18 @@ export async function checkCodexContractDrift({
 
   const productCheck = compareProductPlanRegistry(ledger);
   issues.push(...productCheck.issues);
+  const provisionalPlans = ledger.plans.filter((plan) => plan.lifecycle === "provisional");
+  if (requireBinary && provisionalPlans.length > 0) {
+    issues.push(issue(
+      "provisional_plan_unverified_for_release",
+      `Release check requires resolution of provisional plan(s): ${provisionalPlans.map((plan) => plan.rawValue).join(", ")}`,
+    ));
+  } else if (provisionalPlans.length > 0) {
+    warnings.push(issue(
+      "provisional_plan_assumption",
+      `Product accepts provisional plan(s) pending release review: ${provisionalPlans.map((plan) => plan.rawValue).join(", ")}`,
+    ));
+  }
 
   if (sourceFile !== null) {
     if (sourceRevision !== null && !GIT_REVISION_RE.test(sourceRevision)) {

@@ -15,20 +15,21 @@ export function createAdminAllowancePreviewPayload() {
   });
   const days = Array.from({ length: 70 }, (_, index) => ({
     day: new Date(startMs + index * 86_400_000).toISOString().slice(0, 10),
-    combined: summary(2_100 + index, 6, 3),
+    combined: summary(2_100 + index, 8, 4),
     byPlanType: {
       pro: summary(2_050 + index),
       // Divide before rounding: $1,917.90 / 4 = $479.475, displayed as $479.
       prolite: summary(1_917.9),
+      promax: summary(2_500),
       plus: summary(1_900),
     },
   }));
   return {
-    schemaVersion: "admin-community-allowance-preview-v0.3",
+    schemaVersion: "admin-community-allowance-preview-v0.4",
     generatedAt: "2026-09-06T10:30:00.000Z",
     from: days[0].day,
     to: days.at(-1).day,
-    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview",
+    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax50_preview",
     referencePlanType: "pro",
     trailingDays: 30,
     qualification: "shared_reset_fit_gates_25pp_span_floor",
@@ -36,6 +37,7 @@ export function createAdminAllowancePreviewPayload() {
     plans: [
       { planType: "pro", label: "Pro 20x", multiplier: 1 },
       { planType: "prolite", label: "Pro 5x", multiplier: 4 },
+      { planType: "promax", label: "Pro 50x", multiplier: 0.4 },
       { planType: "plus", label: "Plus", multiplier: 20 },
     ],
     days,

@@ -143,6 +143,9 @@ function transformQuota(record, localScope, participantId) {
   return {
     schemaVersion: "quota-snapshot-v0.2",
     ...safe,
+    // v0.2 is a closed, older wire contract. Preserve its bytes and represent
+    // the provisional tier as unknown; v1.1 carries the exact plan value.
+    planType: record.planType === "promax" ? "unknown" : record.planType,
     accountTrackId: deriveTelemetryAccountTrackId(
       localScope,
       participantId,
@@ -157,6 +160,7 @@ function transformActivity(record, localScope, participantId) {
   return {
     schemaVersion: "activity-marker-v0.2",
     ...safe,
+    planType: record.planType === "promax" ? "unknown" : record.planType,
     provider,
     accountTrackId: deriveTelemetryAccountTrackId(
       localScope,

@@ -170,7 +170,10 @@ test("the closed public wire survives normalization into all three chart views",
 test("v1.1 keeps all graph views on one publication while daily revisions update independently", () => {
   const payload = publicAllowanceFixture(NOW);
   payload.allowanceBreakdowns.schemaVersion = "community-allowance-breakdowns-v1.1";
+  payload.allowanceBreakdowns.basis = "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d";
+  payload.allowanceBreakdowns.normalization = "pro_x1_prolite_x4_plus_x20";
   for (const [index, day] of payload.allowanceBreakdowns.days.entries()) {
+    delete day.byPlanType.promax;
     const { centralUsd, participantCount, fitCount, band80Usd } = payload.days[index].payload.allowance;
     day.combined = { centralUsd, participantCount, fitCount, band80Usd };
     delete payload.days[index].payload.allowance;
@@ -284,6 +287,25 @@ function chartParts(container) {
     svg: all.find(element => element.tag === "svg" && element.attributes.has("aria-label")),
     tooltip: all.find(element => element.className === "allowance-tooltip") };
 }
+test("aggregate method copy follows the daily basis when breakdowns are absent", () => {
+  const documentRef = interactiveDocument(), container = documentRef.createElement("div");
+  const current = publicAllowanceFixture();
+  delete current.allowanceBreakdowns;
+  assert.equal(renderCommunityAllowanceSection({ documentRef, container,
+    payload: current, view: "aggregate" }), "published");
+  assert.match(container.text, /Pro 50× ×0\.4/u);
+
+  const legacy = publicAllowanceFixture();
+  delete legacy.allowanceBreakdowns;
+  for (const day of legacy.days) {
+    day.payload.allowance.basis = "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d";
+    day.payload.allowance.normalization = "pro_x1_prolite_x4_plus_x20";
+  }
+  assert.equal(renderCommunityAllowanceSection({ documentRef, container,
+    payload: legacy, view: "aggregate" }), "published");
+  assert.match(container.text, /Pro 5x ×4, Plus ×20/u);
+  assert.doesNotMatch(container.text, /Pro 50× ×0\.4/u);
+});
 test("real public render shows model sample semantics, per-view labels and disclosure", () => {
   const documentRef = { documentElement: { lang: "en-US" }, createElement: tag => new Element(tag),
     createElementNS: (_, tag) => new Element(tag) };
@@ -292,7 +314,7 @@ test("real public render shows model sample semantics, per-view labels and discl
     assert.equal(renderCommunityAllowanceSection({ documentRef, container,
       payload: publicAllowanceFixture(), view }), "published");
     assert.match(container.text, /single source.*estimated capacity/u);
-    assert.match(container.text, view === "aggregate" ? /per 7 days, API-price equivalent/u : /API-equivalent USD \/ Pro 20× week/u);
+    assert.match(container.text, view === "aggregate" ? /per 7 days, API-price equivalent/u : /API-equivalent USD \/ week/u);
     const svg = container.descendants().find(element => element.tag === "svg" && element.attributes.has("aria-label"));
     assert.ok(svg);
     if (view === "models") {
@@ -311,11 +333,12 @@ test("real public render shows model sample semantics, per-view labels and discl
       // Nothing is scaled any more: each plan is charted on its own axis at its
       // own week, so the old "Pro 5× ×4, Plus ×20" note would be a lie.
       assert.match(container.text, /its own week at API prices, on its own scale/u);
+      assert.match(container.text, /Pro 50×.*provisional ×0\.4 conversion/u);
       assert.equal(svg.attributes.get("aria-label"), "Community allowance by plan");
       const normalized = normalizeCommunityDailySeries(publicAllowanceFixture());
       const summaries = buildCommunityAllowanceChartModel(normalized, { view: "plans" }).latestSummaries;
       const cards = container.descendants().filter(element => element.tag === "article");
-      assert.equal(cards.length, 3);
+      assert.equal(cards.length, 4);
       cards.forEach((card, index) => {
         // The card LEADS with the plan's own week and carries the reference
         // equivalent underneath, which is the inverse of the old layout.
