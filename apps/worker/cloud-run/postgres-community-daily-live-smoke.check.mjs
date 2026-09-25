@@ -1,14 +1,55 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
 import {
   POSTGRES_COMMUNITY_DAILY_TEST_JOB,
   POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE,
-} from "./dist/postgres-community-daily-publish-test.mjs";
+} from "./postgres-community-daily-contract.mjs";
 import { runPostgresCommunityDailyLiveSmoke } from "./dist/postgres-community-daily-live-smoke.mjs";
 
 const DAY = "2026-09-24";
 const TOKEN = "synthetic-id-token-placeholder";
+
+test("each daily bundle runs only its own CLI guard", () => {
+  const cases = [
+    {
+      entry: "postgres-community-daily-publish-test",
+      args: ["--invalid"],
+      expected: {
+        schemaVersion: "postgres-community-daily-test-v1",
+        status: "failed",
+        code: "CLOUD_RUN_COMMUNITY_DAILY_TEST_ARGUMENT_INVALID",
+        phase: "configuration",
+      },
+    },
+    {
+      entry: "postgres-community-daily-live-smoke",
+      args: [],
+      expected: {
+        schemaVersion: "postgres-community-daily-live-smoke-v1",
+        status: "failed",
+        code: "POSTGRES_COMMUNITY_DAILY_LIVE_SMOKE_ARGUMENT_INVALID",
+      },
+    },
+  ];
+  for (const { entry, args, expected } of cases) {
+    const bundle = fileURLToPath(new URL(`./dist/${entry}.mjs`, import.meta.url));
+    const result = spawnSync(process.execPath, [bundle, ...args], {
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    assert.equal(result.error, undefined, `${entry} should start successfully`);
+    assert.equal(result.status, 1, `${entry} should reject the invalid CLI invocation`);
+    assert.equal(result.stdout, "", `${entry} should not emit a success receipt`);
+    assert.deepEqual(
+      result.stderr.trim().split(/\r?\n/u).map((line) => JSON.parse(line)),
+      [expected],
+      `${entry} should emit only its own failure receipt`,
+    );
+  }
+});
 
 function jobReceipt(usageEvents = 0) {
   return {

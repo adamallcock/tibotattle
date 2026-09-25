@@ -8,7 +8,7 @@ import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
 import {
   POSTGRES_COMMUNITY_DAILY_TEST_JOB,
   POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE,
-} from "./postgres-community-daily-publish-test.mjs";
+} from "./postgres-community-daily-contract.mjs";
 
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
 const MAX_RECEIPT_BYTES = 8_192;

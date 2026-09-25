@@ -4,10 +4,10 @@
  * Build the audited Cloud Run host context. The host is a Node composition
  * root around the existing Worker handlers; it must never be built from the
  * dirty repository root. Only the host, Worker source, canonical migrations,
- * migration runner, the private daily publication test Job, live verifier, and
- * test-only activation and independent restore commands,
- * the read-only ledger diagnostic, the guarded test-only ledger reconciler, and the three
- * reviewed workspace packages enter this context.
+ * migration runner, the private daily publication Job and verifier, their
+ * shared receipt contract, test-only activation and independent restore
+ * commands, the read-only ledger diagnostic, the guarded test-only ledger
+ * reconciler, and the reviewed workspace packages enter this context.
  */
 
 import { createHash } from "node:crypto";
@@ -49,6 +49,9 @@ const REQUIRED_DAILY_ACTIVATION_PATHS = new Set([
   "apps/worker/cloud-run/postgres-community-daily-activation.check.mjs",
   "apps/worker/cloud-run/postgres-community-daily-prepare-test.mjs",
   "apps/worker/cloud-run/postgres-community-daily-restore-test.mjs",
+]);
+const REQUIRED_DAILY_CONTRACT_PATHS = new Set([
+  "apps/worker/cloud-run/postgres-community-daily-contract.mjs",
 ]);
 const SKIPPED_DIRECTORY_NAMES = new Set([
   ".git",
@@ -97,6 +100,7 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/postgres-community-graph-readback-diagnostic.check.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-readback-diagnostic.check.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-daily-publish-test.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-publish-test.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-daily-publish-test.check.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-publish-test.check.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-community-daily-contract.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-contract.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-daily-live-smoke.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-live-smoke.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-daily-live-smoke.check.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-live-smoke.check.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-daily-activation.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-activation.mjs" }),
@@ -229,6 +233,9 @@ async function validateSource(assets) {
   }
   if ([...REQUIRED_DAILY_ACTIVATION_PATHS].some((path) => !includedPaths.has(path))) {
     fail("CLOUD_RUN_CONTEXT_DAILY_ACTIVATION_PATH_SET_UNEXPECTED");
+  }
+  if ([...REQUIRED_DAILY_CONTRACT_PATHS].some((path) => !includedPaths.has(path))) {
+    fail("CLOUD_RUN_CONTEXT_DAILY_CONTRACT_PATH_SET_UNEXPECTED");
   }
   const primary = await readPostgresMigrations({
     role: "primary",

@@ -13,17 +13,18 @@ import {
   createIamPool as createCloudSqlIamPool,
   normalizeIamUser,
 } from "./cloud-sql.mjs";
+import {
+  POSTGRES_COMMUNITY_DAILY_TEST_JOB,
+  POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE,
+} from "./postgres-community-daily-contract.mjs";
 import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
 
-export const POSTGRES_COMMUNITY_DAILY_TEST_JOB = "tibotattle-community-daily-publish-test";
+export { POSTGRES_COMMUNITY_DAILY_TEST_JOB, POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE };
 export const POSTGRES_COMMUNITY_DAILY_TEST_PROJECT = CLOUD_RUN_IAM_TEST_TARGET.project;
 export const POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT =
   "tibotattle-test-runtime@tibotattle.iam.gserviceaccount.com";
 export const POSTGRES_COMMUNITY_DAILY_TEST_IAM_USER = CLOUD_RUN_IAM_TEST_TARGET.postgres.iamUser;
 export const POSTGRES_COMMUNITY_DAILY_TEST_TARGET = CLOUD_RUN_IAM_TEST_TARGET.postgres.primary;
-export const POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE =
-  "v1_v1_1_only_v1_2_excluded";
-
 const EXECUTION_PATTERN = /^[a-z][a-z0-9-]{0,62}$/u;
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
 const SOURCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,199}$/u;
