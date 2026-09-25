@@ -84,6 +84,8 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/ledger-reconciliation-diagnostic.check.mjs", destination: "apps/worker/cloud-run/ledger-reconciliation-diagnostic.check.mjs" }),
   Object.freeze({ source: "cloud-run/ledger-preflight-reconcile.mjs", destination: "apps/worker/cloud-run/ledger-preflight-reconcile.mjs" }),
   Object.freeze({ source: "cloud-run/ledger-preflight-reconcile.check.mjs", destination: "apps/worker/cloud-run/ledger-preflight-reconcile.check.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-community-graph-benchmark.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-benchmark.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-community-graph-benchmark.check.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-benchmark.check.mjs" }),
   Object.freeze({ source: "cloud-run/node-crypto-adapter.mjs", destination: "apps/worker/cloud-run/node-crypto-adapter.mjs" }),
   Object.freeze({ source: "cloud-run/owner-bootstrap.mjs", destination: "apps/worker/cloud-run/owner-bootstrap.mjs" }),
   Object.freeze({ source: "cloud-run/request-boundary.mjs", destination: "apps/worker/cloud-run/request-boundary.mjs" }),

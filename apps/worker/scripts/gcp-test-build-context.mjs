@@ -44,6 +44,8 @@ const ALLOWLIST = Object.freeze([
   Object.freeze({ source: "scripts/gcp-test-database.mjs", destination: "apps/worker/scripts/gcp-test-database.mjs" }),
   Object.freeze({ source: "scripts/postgres-migrations.mjs", destination: "apps/worker/scripts/postgres-migrations.mjs" }),
   Object.freeze({ source: "postgres/migrations", destination: "apps/worker/postgres/migrations" }),
+  Object.freeze({ source: "cloud-run/postgres-community-graph-benchmark.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-benchmark.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-community-graph-benchmark.check.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-benchmark.check.mjs" }),
 ]);
 
 function fail(code) {
