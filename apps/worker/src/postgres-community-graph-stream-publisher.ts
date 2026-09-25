@@ -42,6 +42,7 @@ import { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from "./quota-analysis-v11";
 
 const MAX_RESULT_BYTES = 1024 * 1024;
 const MAX_MEMBER_INSERT_BATCH = 1_000;
+const MIN_MEMBERS_FOR_C_COLLATION_INDEX = 10_000;
 const MAX_RESULT_CANDIDATE_ROWS = 512;
 const MAX_RESULT_BATCH_BYTES = 1024 * 1024;
 const MAX_PUBLICATION_BYTES = 16 * 1024;
@@ -458,6 +459,17 @@ async function publishPostgresCommunityModelDayStreamWithClientMembers(
           return { state: "deferred" as const, reason: "source_changed" as const, memberCount };
         }
         throw error;
+      }
+
+      // The primary-key index follows the database's default text collation,
+      // while graph locks and result pages traverse owner digests in bytewise
+      // C order. The measured 100k end-to-end win included index setup; 10k
+      // was effectively flat. Avoid building it below the smallest measured
+      // size with no observed end-to-end regression.
+      if (memberCount >= MIN_MEMBERS_FOR_C_COLLATION_INDEX) {
+        await client.query(`CREATE INDEX pg_community_graph_members_owner_digest_c
+          ON pg_temp.pg_community_graph_members (owner_digest COLLATE "C")`);
+        await client.query("ANALYZE pg_temp.pg_community_graph_members");
       }
 
       // Lock participant rows in the same global order as owner erasure, then

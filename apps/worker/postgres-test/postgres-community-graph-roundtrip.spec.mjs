@@ -29,7 +29,7 @@ const STRESS_NOW_MS = process.env.PG_GRAPH_STRESS_NOW_MS === undefined
   ? NOW : Number(process.env.PG_GRAPH_STRESS_NOW_MS);
 const STRESS_TIMEOUT_MS = process.env.PG_GRAPH_STRESS_TIMEOUT_MS === undefined
   ? 120_000 : Number(process.env.PG_GRAPH_STRESS_TIMEOUT_MS);
-const STRESS_C_COLLATION_INDEX = process.env.PG_GRAPH_STRESS_C_COLLATION_INDEX;
+const C_COLLATION_INDEX_MEMBER_THRESHOLD = 10_000;
 if (!Number.isSafeInteger(STRESS_MEMBERS) || STRESS_MEMBERS < 1_025
     || STRESS_MEMBERS > 100_000) {
   throw new Error("PG_GRAPH_STRESS_MEMBERS must be an integer from 1025 to 100000");
@@ -41,21 +41,16 @@ if (!Number.isSafeInteger(STRESS_TIMEOUT_MS) || STRESS_TIMEOUT_MS < 120_000
 if (!Number.isSafeInteger(STRESS_NOW_MS) || STRESS_NOW_MS < 0) {
   throw new Error("PG_GRAPH_STRESS_NOW_MS must be a nonnegative safe integer");
 }
-if (!(STRESS_C_COLLATION_INDEX === undefined || STRESS_C_COLLATION_INDEX === "0"
-    || STRESS_C_COLLATION_INDEX === "1")) {
-  throw new Error("PG_GRAPH_STRESS_C_COLLATION_INDEX must be unset, 0, or 1");
-}
-
 function measuredPool(base) {
   const timings = new Map();
   let connectionAcquisitions = 0;
   let checkedOutConnections = 0;
   let maxConcurrentCheckedOutConnections = 0;
   let explainedResultPage = false;
-  let pageIndexInstalled = false;
-  let pageIndexSetupMilliseconds = 0;
   const classify = (sql) => {
     if (/^FETCH FORWARD\b/u.test(sql)) return "member_readback_pages";
+    if (sql.includes("CREATE INDEX pg_community_graph_members_owner_digest_c")) return "member_page_index";
+    if (/^\s*ANALYZE pg_temp\.pg_community_graph_members\b/u.test(sql)) return "member_table_analyze";
     if (sql.includes("candidates AS MATERIALIZED")) return "result_pages";
     if (sql.includes("WITH locked AS MATERIALIZED")) return "authority_locks";
     if (sql.includes("WITH stored AS MATERIALIZED")) return "member_receipt";
@@ -77,15 +72,6 @@ function measuredPool(base) {
         );
         return {
           async query(sql, values) {
-            if (!pageIndexInstalled && STRESS_C_COLLATION_INDEX === "1"
-                && classify(sql) === "result_pages") {
-              pageIndexInstalled = true;
-              const indexStarted = performance.now();
-              await client.query(`CREATE INDEX pg_community_graph_members_owner_digest_c
-                ON pg_temp.pg_community_graph_members (owner_digest COLLATE "C")`);
-              await client.query("ANALYZE pg_temp.pg_community_graph_members");
-              pageIndexSetupMilliseconds = performance.now() - indexStarted;
-            }
             if (!explainedResultPage && process.env.PG_GRAPH_STRESS_EXPLAIN === "1"
                 && classify(sql) === "result_pages") {
               explainedResultPage = true;
@@ -177,8 +163,9 @@ function measuredPool(base) {
         connectionAcquisitions,
         maxConcurrentCheckedOutConnections,
         checkedOutConnectionsAtEnd: checkedOutConnections,
-        pageIndexMode: STRESS_C_COLLATION_INDEX === "1" ? "collate-c-index-experiment" : "primary-key-default-collation",
-        pageIndexSetupMilliseconds: Math.round(pageIndexSetupMilliseconds),
+        pageIndexMode: STRESS_MEMBERS >= C_COLLATION_INDEX_MEMBER_THRESHOLD
+          ? "collate-c-index" : "primary-key-default-collation",
+        pageIndexThresholdMembers: C_COLLATION_INDEX_MEMBER_THRESHOLD,
         queries: Object.fromEntries([...timings].sort(([left], [right]) => left.localeCompare(right))
           .map(([kind, timing]) => [kind, {
             count: timing.count,
@@ -814,6 +801,12 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     const publishCpu = cpuMilliseconds(process.cpuUsage(publishCpuStarted));
     const rssAfterPublish = memorySnapshot();
     expect(published).toMatchObject({ state: "published", memberCount: largeCount });
+    const publicationSqlSummary = publicationSql.summary();
+    const expectCollationIndex = largeCount >= C_COLLATION_INDEX_MEMBER_THRESHOLD;
+    expect(publicationSqlSummary.queries.member_page_index?.count ?? 0)
+      .toBe(expectCollationIndex ? 1 : 0);
+    expect(publicationSqlSummary.queries.member_table_analyze?.count ?? 0)
+      .toBe(expectCollationIndex ? 1 : 0);
     expect(await pool.query(`SELECT expected_members, payload_json
       FROM ${sqlSchema}.analytics_publication_captures`)).toMatchObject({
       rows: [{ expected_members: String(largeCount), payload_json: expect.stringContaining('"postgres-community-model-capture-v2"') }],
@@ -851,7 +844,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
         memorySnapshots: [rssBefore, rssAfterPublish, rssAfterRead],
         processMaxRssPlatformUnits: process.resourceUsage().maxRSS,
         poolMax: 4,
-        publicationSql: publicationSql.summary(),
+        publicationSql: publicationSqlSummary,
         readSql: readSql.summary(),
       }));
     }
