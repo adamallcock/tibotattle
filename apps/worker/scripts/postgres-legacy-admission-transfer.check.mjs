@@ -10,6 +10,7 @@ import {
   POSTGRES_LEGACY_ADMISSION_DEFAULT_PAGE_SIZE,
   POSTGRES_LEGACY_ADMISSION_MAX_PAGE_SIZE,
   POSTGRES_LEGACY_ADMISSION_TRANSFER_LAYOUT,
+  POSTGRES_LEGACY_ADMISSION_HEADER_LAYOUT,
   PostgresLegacyAdmissionTransferError,
   createSealedSqliteLegacyAdmissionSource,
   createSyntheticLegacyAdmissionSource,
@@ -62,12 +63,14 @@ function sourceTables({
   };
 }
 
-async function sealedMultiPageSource() {
+async function sealedMultiPageSource({ withAllocations = true, withHeaders = false,
+  partialV1Header = false, missingHeaderTable = null } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "legacy-admission-sealed-"));
   const path = join(await realpath(directory), "source.sqlite");
   const database = new DatabaseSync(path);
   try {
-    for (const spec of POSTGRES_LEGACY_ADMISSION_TRANSFER_LAYOUT) {
+    for (const spec of [...POSTGRES_LEGACY_ADMISSION_TRANSFER_LAYOUT, ...POSTGRES_LEGACY_ADMISSION_HEADER_LAYOUT]) {
+      if (spec.name === missingHeaderTable) continue;
       const columns = spec.columns.map((column, index) => {
         const type = spec.types[index];
         const sqlType = type === "bytes" ? "BLOB" : type.startsWith("i") ? "INTEGER" : "TEXT";
@@ -75,16 +78,61 @@ async function sealedMultiPageSource() {
       });
       database.exec(`CREATE TABLE ${quote(spec.name)} (${columns.join(",")})`);
     }
-    const spec = POSTGRES_LEGACY_ADMISSION_TRANSFER_LAYOUT.find((item) => item.name === "typed_v1_chunk_allocations");
-    const insert = database.prepare(`INSERT INTO typed_v1_chunk_allocations(${spec.columns.map(quote).join(",")}) VALUES(${spec.columns.map(() => "?").join(",")})`);
-    insert.run("chunk-a", 1, Buffer.from([0, 97]), 1, 1);
-    insert.run("chunk-b", 1, Buffer.from([0, 98]), 2, 1);
+    if (withAllocations) {
+      const spec = POSTGRES_LEGACY_ADMISSION_TRANSFER_LAYOUT.find((item) => item.name === "typed_v1_chunk_allocations");
+      const insert = database.prepare(`INSERT INTO typed_v1_chunk_allocations(${spec.columns.map(quote).join(",")}) VALUES(${spec.columns.map(() => "?").join(",")})`);
+      insert.run("chunk-a", 1, Buffer.from([0, 97]), 1, 1);
+      insert.run("chunk-b", 1, Buffer.from([0, 98]), 2, 1);
+    }
+    const insertRows = (spec, rows) => {
+      const insert = database.prepare(`INSERT INTO ${quote(spec.name)}(${spec.columns.map(quote).join(",")}) VALUES(${spec.columns.map(() => "?").join(",")})`);
+      for (const row of rows) insert.run(...spec.columns.map((column) => row[column] ?? null));
+    };
+    if (withHeaders) {
+      const headerNow = "2026-09-24T10:00:00.000Z";
+      const v1Rows = partialV1Header ? [] : ["chunk-a", "chunk-b"].map((id, index) => ({
+        id, participant_id: "synthetic-header-participant", device_id: "synthetic-header-device",
+        stream: "usage", chunk_day: "2026-09-24", chunk_seq: index, revision: 1,
+        chunk_digest: String(index + 1).repeat(64), envelope_digest: String(index + 3).repeat(64),
+        parser_version: "synthetic-header-v1", record_count: 1, accepted_record_count: 1,
+        r2_key: `synthetic/${id}`, device_upload_authorization_id: `synthetic-upload-${id}`,
+        superseded_at: null, quarantine_deleted_at: null, created_at: headerNow,
+      }));
+      insertRows(POSTGRES_LEGACY_ADMISSION_HEADER_LAYOUT.find((item) => item.name === "telemetry_v1_chunks"), v1Rows);
+      const manifestId = "00000000-0000-4000-8000-000000000011";
+      const v11ChunkId = "chunk:00000000-0000-4000-8000-000000000012";
+      const v11ChunkDigest = "f".repeat(64);
+      const v11ManifestJson = JSON.stringify({
+        schemaVersion: "telemetry-day-manifest-v1.1", day: "2026-09-24",
+        chunks: [{ chunkId: v11ChunkId, chunkDigest: v11ChunkDigest, recordCount: 1 }],
+      });
+      insertRows(POSTGRES_LEGACY_ADMISSION_HEADER_LAYOUT.find((item) => item.name === "telemetry_v11_day_manifests"), [{
+        id: manifestId, participant_id: "synthetic-header-participant", device_id: "synthetic-header-device",
+        chunk_day: "2026-09-24", manifest_digest: "e".repeat(64), parser_version: "synthetic-header-v11",
+        manifest_json: v11ManifestJson,
+        expected_chunk_count: 1, state: "ready", created_at: headerNow, ready_at: headerNow,
+      }]);
+      insertRows(POSTGRES_LEGACY_ADMISSION_HEADER_LAYOUT.find((item) => item.name === "telemetry_v11_chunks"), [{
+        id: v11ChunkId, manifest_id: manifestId, participant_id: "synthetic-header-participant",
+        device_id: "synthetic-header-device", stream: "usage", chunk_day: "2026-09-24",
+        chunk_seq: 0, chunk_id: v11ChunkId, chunk_digest: v11ChunkDigest,
+        envelope_digest: "9".repeat(64), parser_version: "synthetic-header-v11", record_count: 1,
+        r2_key: `synthetic/${v11ChunkId}`, device_upload_authorization_id: "synthetic-v11-upload",
+        quarantine_deleted_at: null, created_at: headerNow,
+      }]);
+      const states = [
+        { name: "typed_v1_admission_state", namespace: "synthetic-admission-v1" },
+        { name: "typed_v11_admission_state", namespace: "synthetic-admission-v11" },
+      ];
+      for (const item of states) {
+        database.prepare(`INSERT INTO ${quote(item.name)} (id,source_namespace,namespace_id,runtime_contract_version,next_source_row_id) VALUES (1,?,1,1,1)`)
+          .run(item.namespace);
+      }
+    }
     database.exec(`CREATE TABLE typed_v1_authority_requests(chunk_id TEXT PRIMARY KEY);
-      CREATE TABLE typed_telemetry_records(id INTEGER PRIMARY KEY,format INTEGER);
+      CREATE TABLE typed_telemetry_records(id INTEGER PRIMARY KEY,format INTEGER,manifest_id INTEGER);
       CREATE TABLE typed_telemetry_chunks(id INTEGER PRIMARY KEY);
       CREATE TABLE typed_telemetry_manifests(id INTEGER PRIMARY KEY);
-      CREATE TABLE telemetry_v11_day_manifests(id TEXT PRIMARY KEY,state TEXT,expected_chunk_count INTEGER);
-      CREATE TABLE telemetry_v11_chunks(id TEXT PRIMARY KEY,manifest_id TEXT);
       CREATE TABLE telemetry_v11_records(chunk_id TEXT,manifest_id TEXT)`);
     const cursorPlan = database.prepare(`EXPLAIN QUERY PLAN
       SELECT chunk_id FROM typed_v1_chunk_allocations WHERE chunk_id > ? ORDER BY chunk_id LIMIT ?`).all("chunk-a", 1);
@@ -111,6 +159,33 @@ test("sealed SQLite source pages past the first cursor and remains pinned", asyn
   } finally {
     source?.close();
     await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("sealed source refuses missing header tables and partial chunk prerequisites before destination writes", async () => {
+  const missing = await sealedMultiPageSource({ missingHeaderTable: "telemetry_v11_chunks" });
+  try {
+    await assert.rejects(createSealedSqliteLegacyAdmissionSource({ path: missing.path, expectedSha256: missing.digest }),
+      (error) => error instanceof PostgresLegacyAdmissionTransferError && error.code === "LEGACY_ADMISSION_SOURCE_TABLE_MISSING");
+  } finally { await rm(missing.directory, { recursive: true, force: true }); }
+
+  const partial = await sealedMultiPageSource({ withAllocations: true, withHeaders: true, partialV1Header: true });
+  let partialSource;
+  let destinationTouched = false;
+  try {
+    partialSource = await createSealedSqliteLegacyAdmissionSource({ path: partial.path, expectedSha256: partial.digest });
+    await assert.rejects(runPostgresLegacyAdmissionTransfer({
+      source: partialSource,
+      destinationPool: { query() { destinationTouched = true; }, connect() { destinationTouched = true; } },
+      targetSchema: "legacy_admission_target_partial",
+      controlSchema: "typed_legacy_admission_transfer_partialheader",
+      transferId: "partial-header-refusal",
+    }), (error) => error instanceof PostgresLegacyAdmissionTransferError
+      && error.code === "LEGACY_ADMISSION_SOURCE_HEADER_INCOMPLETE");
+    assert.equal(destinationTouched, false);
+  } finally {
+    partialSource?.close();
+    await rm(partial.directory, { recursive: true, force: true });
   }
 });
 
@@ -388,6 +463,98 @@ test("PG17 transfer requires both base receipts, checkpoints pages, resumes, and
     if (controlCreated) await pool.query(`DROP SCHEMA ${quote(controlSchema)} CASCADE`).catch(() => {});
     if (targetCreated) await pool.query(`DROP SCHEMA ${quote(targetSchema)} CASCADE`).catch(() => {});
     await pool.end();
+  }
+});
+
+test("PG17 stages exact sealed headers with a replay-safe control receipt before admission writes", { skip: !PG_TEST_SOCKET }, async () => {
+  const fixture = await sealedMultiPageSource({ withAllocations: false, withHeaders: true });
+  let source;
+  const socket = await localSocket();
+  const suffix = randomBytes(6).toString("hex");
+  const targetSchema = "legacy_header_target_" + suffix;
+  const controlSchema = "typed_legacy_admission_transfer_header_" + suffix;
+  const pool = new pg.Pool({ ...socket, user: process.env.PG_TEST_USER ?? "postgres", database: process.env.PG_TEST_DATABASE ?? "postgres", password: process.env.PG_TEST_PASSWORD ?? "synthetic-local-only", max: 4 });
+  let targetCreated = false;
+  let controlCreated = false;
+  try {
+    source = await createSealedSqliteLegacyAdmissionSource({ path: fixture.path, expectedSha256: fixture.digest });
+    const locality = await pool.query("SELECT inet_server_addr() AS address");
+    assert.equal(locality.rows[0]?.address, null);
+    await pool.query("CREATE SCHEMA " + quote(targetSchema));
+    targetCreated = true;
+    await pool.query("CREATE SCHEMA " + quote(controlSchema));
+    controlCreated = true;
+    const migration = await applyPostgresMigrations({ role: "primary", schema: targetSchema, pool });
+    assert.equal(migration.applied, 39);
+    const target = quote(targetSchema);
+    await pool.query("INSERT INTO " + target + ".typed_telemetry_namespaces(id,original_id) VALUES(1,$1)", [Buffer.from([1, 2])]);
+    await pool.query("INSERT INTO " + target + ".typed_telemetry_source_family_receipts " +
+      "(source_namespace,source_format,generation,source_digest,source_row_count,membership_row_count,reconciled_at) " +
+      "VALUES ($1,10,1,$3,0,0,clock_timestamp()),($2,11,1,$3,0,0,clock_timestamp())",
+    ["synthetic-admission-v1", "synthetic-admission-v11", "a".repeat(64)]);
+
+    let interruptReceipt = true;
+    const interruptedPool = {
+      async query(sql, values) {
+        if (interruptReceipt && typeof sql === "string"
+            && sql.startsWith("INSERT INTO ") && sql.includes("_legacy_admission_header_receipts_v1")) {
+          interruptReceipt = false;
+          throw new Error("synthetic_header_stage_interruption");
+        }
+        return pool.query(sql, values);
+      },
+      connect() { return pool.connect(); },
+    };
+    const transfer = {
+      source, destinationPool: interruptedPool, targetSchema, controlSchema,
+      transferId: "sealed-header-stage-v1", pageSize: 1,
+    };
+    await assert.rejects(runPostgresLegacyAdmissionTransfer(transfer), /synthetic_header_stage_interruption/u);
+    const v1Stage = quote(controlSchema) + "._legacy_source_telemetry_v1_chunks_v1";
+    const v11ManifestStage = quote(controlSchema) + "._legacy_source_telemetry_v11_day_manifests_v1";
+    const v11ChunkStage = quote(controlSchema) + "._legacy_source_telemetry_v11_chunks_v1";
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM " + v1Stage)).rows[0]?.n, 2);
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM " + v11ManifestStage)).rows[0]?.n, 1);
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM " + v11ChunkStage)).rows[0]?.n, 1);
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM " + target + ".typed_v1_admission_state")).rows[0]?.n, 0,
+      "the interruption is before any admission-table write");
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM " + quote(controlSchema) +
+      "._legacy_admission_header_receipts_v1")).rows[0]?.n, 0);
+
+    const completed = await runPostgresLegacyAdmissionTransfer({ ...transfer, destinationPool: pool });
+    assert.equal(completed.status, "staged_admission_lineage_transfer_complete");
+    assert.equal(completed.productionReady, false);
+    assert.equal(completed.readerActivationAuthorized, false);
+    assert.equal(completed.erasureAuthorized, false);
+    assert.deepEqual(completed.sourceHeaderTableRows, {
+      telemetry_v1_chunks: 2, telemetry_v11_day_manifests: 1, telemetry_v11_chunks: 1,
+    });
+    assert.match(completed.sourceHeaderManifestSha256, /^[0-9a-f]{64}$/u);
+    const receipt = await pool.query("SELECT source_snapshot_id,source_snapshot_sha256,header_manifest_sha256,header_table_row_counts " +
+      "FROM " + quote(controlSchema) + "._legacy_admission_header_receipts_v1 WHERE transfer_id=$1",
+    [transfer.transferId]);
+    assert.equal(receipt.rows[0]?.source_snapshot_id, "sha256:" + fixture.digest);
+    assert.equal(receipt.rows[0]?.source_snapshot_sha256, fixture.digest);
+    assert.equal(receipt.rows[0]?.header_manifest_sha256, completed.sourceHeaderManifestSha256);
+    assert.deepEqual(receipt.rows[0]?.header_table_row_counts, completed.sourceHeaderTableRows);
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM " + target + ".telemetry_v1_chunks")).rows[0]?.n, 0,
+      "mirrored historical headers never enter the application tables");
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM " + target + ".telemetry_v11_day_manifests")).rows[0]?.n, 0);
+
+    await assert.rejects(pool.query("UPDATE " + v1Stage + " SET stream='quota' WHERE id='chunk-a'"),
+      (error) => error?.code === "P1005");
+    await assert.rejects(pool.query("UPDATE " + quote(controlSchema) +
+      "._legacy_admission_header_receipts_v1 SET header_manifest_sha256=$2 WHERE transfer_id=$1",
+    [transfer.transferId, "f".repeat(64)]), (error) => error?.code === "P1005");
+    const replay = await runPostgresLegacyAdmissionTransfer({ ...transfer, destinationPool: pool });
+    assert.equal(replay.pagesCommittedThisRun, 0);
+    assert.equal(replay.sourceHeaderManifestSha256, completed.sourceHeaderManifestSha256);
+  } finally {
+    source?.close();
+    if (controlCreated) await pool.query("DROP SCHEMA IF EXISTS " + quote(controlSchema) + " CASCADE").catch(() => {});
+    if (targetCreated) await pool.query("DROP SCHEMA IF EXISTS " + quote(targetSchema) + " CASCADE").catch(() => {});
+    await pool.end();
+    await rm(fixture.directory, { recursive: true, force: true });
   }
 });
 

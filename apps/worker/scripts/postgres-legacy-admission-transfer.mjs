@@ -3,6 +3,15 @@ import { constants as fsConstants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import {
+  POSTGRES_TYPED_LEGACY_STAGING_FAMILY_EVIDENCE_TABLE,
+  POSTGRES_TYPED_LEGACY_TARGET_SCHEMA_PREFIX,
+  POSTGRES_TYPED_LEGACY_TRANSFER_CHECKPOINT_TABLE,
+  POSTGRES_TYPED_LEGACY_TRANSFER_RUN_TABLE,
+  POSTGRES_TYPED_LEGACY_TRANSFER_SCHEMA,
+  POSTGRES_TYPED_LEGACY_TRANSFER_TABLES,
+  typedLegacyStagingFamilyEvidenceSha256,
+} from "./postgres-typed-legacy-transfer.mjs";
 
 export const POSTGRES_LEGACY_ADMISSION_TRANSFER_SCHEMA = "legacy-admission-transfer-v1";
 export const POSTGRES_LEGACY_ADMISSION_DEFAULT_PAGE_SIZE = 100;
@@ -11,6 +20,7 @@ export const POSTGRES_LEGACY_ADMISSION_MAX_PAGE_SIZE = 250;
 const CONTROL_PREFIX = "typed_legacy_admission_transfer_";
 const RUN_TABLE = "_legacy_admission_transfer_runs_v1";
 const CHECKPOINT_TABLE = "_legacy_admission_transfer_checkpoints_v1";
+const STAGING_RECEIPT_TABLE = "_legacy_admission_staging_receipts_v1";
 const TRANSIENT_REQUEST_TABLE = "typed_v1_authority_requests";
 const SHA256 = /^[0-9a-f]{64}$/u;
 const IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
@@ -28,7 +38,17 @@ const TABLES = Object.freeze([
   table("typed_v1_event_sources", ["event_digest", "owner_digest", "participant_id", "chunk_id", "source_namespace"], ["event_digest"], ["text", "text", "text", "text", "text"]),
   table("storage_v11_event_sources", ["event_digest", "owner_digest", "participant_id", "device_id", "generation_id", "manifest_digest", "from_day", "through_day", "head_revision", "input_revision", "recorded_ms"], ["event_digest"], ["text", "text", "text", "text", "text", "text", "text", "text", "i64", "i64", "i64"]),
 ]);
-const TABLE_BY_NAME = new Map(TABLES.map((value) => [value.name, value]));
+const HEADER_TABLES = Object.freeze([
+  table("telemetry_v1_chunks", ["id", "participant_id", "device_id", "stream", "chunk_day", "chunk_seq", "revision", "chunk_digest", "envelope_digest", "parser_version", "record_count", "accepted_record_count", "r2_key", "device_upload_authorization_id", "superseded_at", "quarantine_deleted_at", "created_at"], ["id"], ["text", "text", "text", "text", "text", "i32", "i32", "text", "text", "text", "i32", "i32", "text", "text", "text", "text", "text"], "_legacy_source_telemetry_v1_chunks_v1"),
+  table("telemetry_v11_day_manifests", ["id", "participant_id", "device_id", "chunk_day", "manifest_digest", "parser_version", "manifest_json", "expected_chunk_count", "state", "created_at", "ready_at"], ["id"], ["text", "text", "text", "text", "text", "text", "longtext", "i32", "text", "text", "text"], "_legacy_source_telemetry_v11_day_manifests_v1"),
+  table("telemetry_v11_chunks", ["id", "manifest_id", "participant_id", "device_id", "stream", "chunk_day", "chunk_seq", "chunk_id", "chunk_digest", "envelope_digest", "parser_version", "record_count", "r2_key", "device_upload_authorization_id", "quarantine_deleted_at", "created_at"], ["id"], ["text", "text", "text", "text", "text", "text", "i32", "text", "text", "text", "text", "i32", "text", "text", "text", "text"], "_legacy_source_telemetry_v11_chunks_v1"),
+]);
+const SOURCE_TABLES = Object.freeze([...TABLES, ...HEADER_TABLES]);
+const TABLE_BY_NAME = new Map(SOURCE_TABLES.map((value) => [value.name, value]));
+const ALLOWED_TARGET_TABLES = new Set([
+  ...SOURCE_TABLES.map((value) => value.name),
+  ...HEADER_TABLES.map((value) => value.targetTable),
+]);
 const TARGET_SUPPORT_TABLES = new Set([
   "telemetry_v1_records",
   "typed_telemetry_manifests",
@@ -50,8 +70,8 @@ function fail(code) {
   throw new PostgresLegacyAdmissionTransferError(code);
 }
 
-function table(name, columns, primaryKey, types) {
-  return Object.freeze({ name, columns: Object.freeze(columns), primaryKey: Object.freeze(primaryKey), types: Object.freeze(types) });
+function table(name, columns, primaryKey, types, targetTable = undefined) {
+  return Object.freeze({ name, columns: Object.freeze(columns), primaryKey: Object.freeze(primaryKey), types: Object.freeze(types), ...(targetTable ? { targetTable } : {}) });
 }
 
 function schemaName(value) {
@@ -62,7 +82,7 @@ function schemaName(value) {
 
 function qschema(value) { return `"${schemaName(value)}"`; }
 function qtable(schema, name) {
-  if (!TABLE_BY_NAME.has(name) && name !== RUN_TABLE && name !== CHECKPOINT_TABLE
+  if (!ALLOWED_TARGET_TABLES.has(name) && name !== RUN_TABLE && name !== CHECKPOINT_TABLE
       && name !== "typed_telemetry_admission_transfer_receipts"
       && name !== "typed_telemetry_source_family_receipts"
       && !TARGET_SUPPORT_TABLES.has(name)) fail("LEGACY_ADMISSION_TABLE_INVALID");
@@ -89,6 +109,10 @@ function normalizeValue(type, value) {
   if (type === "text") {
     if (value instanceof Date && Number.isFinite(value.getTime())) return value.toISOString().slice(0, 10);
     if (typeof value !== "string" || encoder.encode(value).byteLength > 4096) fail("LEGACY_ADMISSION_SOURCE_VALUE_INVALID");
+    return value;
+  }
+  if (type === "longtext") {
+    if (typeof value !== "string" || encoder.encode(value).byteLength > 1_250_000) fail("LEGACY_ADMISSION_SOURCE_VALUE_INVALID");
     return value;
   }
   if (type === "bytes") {
@@ -155,7 +179,7 @@ function validatePageSize(value) {
 
 async function scanSource(source, pageSize) {
   const tables = Object.create(null);
-  for (const spec of TABLES) {
+  for (const spec of SOURCE_TABLES) {
     let after = null;
     let count = 0;
     const hash = createHash("sha256");
@@ -209,8 +233,8 @@ export function createSyntheticLegacyAdmissionSource({
   const transientRequests = tables[TRANSIENT_REQUEST_TABLE] ?? [];
   if (!Array.isArray(transientRequests)) fail("LEGACY_ADMISSION_SOURCE_TABLE_INVALID");
   const fixture = Object.create(null);
-  for (const spec of TABLES) {
-    const rows = tables[spec.name];
+  for (const spec of SOURCE_TABLES) {
+    const rows = tables[spec.name] ?? [];
     if (!Array.isArray(rows)) fail("LEGACY_ADMISSION_SOURCE_TABLE_MISSING");
     fixture[spec.name] = rows.map((row) => structuredClone(row)).sort((a, b) => compareKey(spec, normalizeRow(spec, a), normalizeRow(spec, b)));
   }
@@ -316,7 +340,7 @@ export async function createSealedSqliteLegacyAdmissionSource({ path, expectedSh
     if (database.prepare("PRAGMA foreign_key_check").all().length !== 0) fail("LEGACY_ADMISSION_SOURCE_PARENT_MISSING");
     const names = new Set(database.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((row) => row.name));
     const requiredSourceTables = [
-      ...TABLES.map((spec) => spec.name), TRANSIENT_REQUEST_TABLE,
+      ...SOURCE_TABLES.map((spec) => spec.name), TRANSIENT_REQUEST_TABLE,
       "typed_telemetry_records", "typed_telemetry_chunks", "typed_telemetry_manifests",
       "telemetry_v11_day_manifests", "telemetry_v11_chunks", "telemetry_v11_records",
     ];
@@ -344,6 +368,14 @@ export async function createSealedSqliteLegacyAdmissionSource({ path, expectedSh
       catch { fail("LEGACY_ADMISSION_SOURCE_TABLE_MISSING"); }
       if (Number(count) !== 0) fail("LEGACY_ADMISSION_PENDING_AUTHORITY_REQUESTS");
       const scalar = (sql) => Number(database.prepare(sql).get()?.n ?? 0);
+      if (scalar(`SELECT count(*) AS n FROM typed_v1_chunk_allocations allocation
+        LEFT JOIN telemetry_v1_chunks chunk ON chunk.id=allocation.chunk_id
+        WHERE chunk.id IS NULL OR chunk.record_count!=allocation.record_count`) > 0
+        || scalar(`SELECT count(*) AS n FROM typed_v11_chunk_allocations allocation
+          LEFT JOIN telemetry_v11_chunks chunk ON chunk.id=allocation.chunk_id
+          WHERE chunk.id IS NULL OR chunk.record_count!=allocation.record_count`) > 0) {
+        fail("LEGACY_ADMISSION_SOURCE_HEADER_INCOMPLETE");
+      }
       if (scalar(`SELECT count(*) AS n FROM typed_telemetry_records record
         WHERE record.format=10 AND NOT EXISTS (
           SELECT 1 FROM typed_v1_record_admissions admission WHERE admission.typed_record_id=record.id
@@ -413,7 +445,7 @@ async function scanTargetRows(pool, schema, spec, keys) {
   if (keys.length === 0) return [];
   const key = spec.primaryKey[0];
   const values = keys.map((value, index) => `$${index + 1}`).join(",");
-  const result = await pool.query(`SELECT ${spec.columns.map((column) => `"${column}"`).join(",")} FROM ${qtable(schema, spec.name)} WHERE "${key}" IN (${values})`, keys);
+  const result = await pool.query(`SELECT ${spec.columns.map((column) => `"${column}"`).join(",")} FROM ${qtable(schema, spec.targetTable ?? spec.name)} WHERE "${key}" IN (${values})`, keys);
   return result.rows;
 }
 
@@ -458,6 +490,252 @@ async function assertBaseReceipts(pool, schema, v1Namespace, v11Namespace) {
   return Object.freeze({ v1: Number(v1.generation), v11: Number(v11.generation) });
 }
 
+async function verifyBaseStagingEvidence({ pool, targetSchema, snapshot, state, controlSchema, transferId } = {}) {
+  if (snapshot.kind !== "sealed-sqlite-rehearsal" || !SHA256.test(snapshot.artifactSha256 ?? "")
+      || !targetSchema.startsWith(POSTGRES_TYPED_LEGACY_TARGET_SCHEMA_PREFIX)) {
+    fail("LEGACY_ADMISSION_BASE_STAGING_RECEIPT_REQUIRED");
+  }
+  if (typeof controlSchema !== "string" || !controlSchema.startsWith("typed_legacy_transfer_rehearsal_")
+      || controlSchema.length < "typed_legacy_transfer_rehearsal_".length + 8
+      || typeof transferId !== "string" || !TRANSFER_ID.test(transferId)) {
+    fail("LEGACY_ADMISSION_BASE_STAGING_RECEIPT_REQUIRED");
+  }
+  const control = qschema(controlSchema);
+  let run;
+  let checkpoints;
+  let evidence;
+  try {
+    const result = await pool.query(`SELECT schema_version,target_schema,source_snapshot_id,source_snapshot_kind,
+        source_artifact_sha256,source_manifest_sha256,status,target_manifest_sha256
+      FROM ${control}."${POSTGRES_TYPED_LEGACY_TRANSFER_RUN_TABLE}" WHERE transfer_id=$1`, [transferId]);
+    run = result.rows[0];
+    checkpoints = await pool.query(`SELECT table_name,complete FROM ${control}."${POSTGRES_TYPED_LEGACY_TRANSFER_CHECKPOINT_TABLE}"
+      WHERE transfer_id=$1 ORDER BY table_name`, [transferId]);
+    evidence = await pool.query(`SELECT target_schema,source_snapshot_id,source_artifact_sha256,source_manifest_sha256,
+        target_manifest_sha256,source_format,source_namespace,source_row_count::text AS source_row_count,
+        membership_row_count::text AS membership_row_count,membership_table_sha256,records_table_sha256,
+        family_evidence_sha256 FROM ${control}."${POSTGRES_TYPED_LEGACY_STAGING_FAMILY_EVIDENCE_TABLE}"
+      WHERE transfer_id=$1 ORDER BY source_format,source_namespace`, [transferId]);
+  } catch {
+    fail("LEGACY_ADMISSION_BASE_STAGING_RECEIPT_REQUIRED");
+  }
+  if (!run || run.schema_version !== POSTGRES_TYPED_LEGACY_TRANSFER_SCHEMA
+      || run.target_schema !== targetSchema || run.source_snapshot_id !== snapshot.snapshotId
+      || run.source_snapshot_kind !== "sealed-sqlite-rehearsal"
+      || run.source_artifact_sha256 !== snapshot.artifactSha256 || run.status !== "complete"
+      || !SHA256.test(run.source_manifest_sha256 ?? "") || !SHA256.test(run.target_manifest_sha256 ?? "")
+      || checkpoints.rows.length !== POSTGRES_TYPED_LEGACY_TRANSFER_TABLES.length
+      || POSTGRES_TYPED_LEGACY_TRANSFER_TABLES.some(name =>
+        !checkpoints.rows.some(row => row.table_name === name && row.complete === true))
+      || evidence.rows.length !== 2) {
+    fail("LEGACY_ADMISSION_BASE_STAGING_RECEIPT_REQUIRED");
+  }
+  const expectedNamespaces = new Map([
+    [10, state.typed_v1_admission_state.source_namespace],
+    [11, state.typed_v11_admission_state.source_namespace],
+  ]);
+  for (const row of evidence.rows) {
+    const sourceFormat = Number(row.source_format);
+    if (expectedNamespaces.get(sourceFormat) !== row.source_namespace
+        || row.target_schema !== targetSchema || row.source_snapshot_id !== run.source_snapshot_id
+        || row.source_artifact_sha256 !== run.source_artifact_sha256
+        || row.source_manifest_sha256 !== run.source_manifest_sha256
+        || row.target_manifest_sha256 !== run.target_manifest_sha256) {
+      fail("LEGACY_ADMISSION_BASE_STAGING_RECEIPT_MISMATCH");
+    }
+    let expectedDigest;
+    try {
+      expectedDigest = typedLegacyStagingFamilyEvidenceSha256({
+        sourceSnapshotId: row.source_snapshot_id,
+        sourceArtifactSha256: row.source_artifact_sha256,
+        sourceManifestSha256: row.source_manifest_sha256,
+        targetManifestSha256: row.target_manifest_sha256,
+        sourceFormat,
+        sourceNamespace: row.source_namespace,
+        sourceRowCount: row.source_row_count,
+        membershipRowCount: row.membership_row_count,
+        membershipTableSha256: row.membership_table_sha256,
+        recordsTableSha256: row.records_table_sha256,
+      });
+    } catch { fail("LEGACY_ADMISSION_BASE_STAGING_RECEIPT_MISMATCH"); }
+    if (expectedDigest !== row.family_evidence_sha256) fail("LEGACY_ADMISSION_BASE_STAGING_RECEIPT_MISMATCH");
+    const parity = await pool.query(`SELECT count(DISTINCT (membership.namespace_id,membership.source_format,membership.owner_id))::text AS memberships,
+        count(record.id)::text AS records
+      FROM ${qtable(targetSchema, "typed_telemetry_owner_memberships")} membership
+      LEFT JOIN ${qtable(targetSchema, "typed_telemetry_records")} record
+        ON record.namespace_id=membership.namespace_id AND record.format=membership.source_format
+       AND record.owner_id=membership.owner_id
+      WHERE membership.source_format=$1 AND membership.source_namespace=$2`, [sourceFormat, row.source_namespace]);
+    if (parity.rows[0]?.memberships !== row.membership_row_count
+        || parity.rows[0]?.records !== row.source_row_count) {
+      fail("LEGACY_ADMISSION_BASE_STAGING_RECEIPT_MISMATCH");
+    }
+  }
+  for (const sourceFormat of [10, 11]) {
+    if (!evidence.rows.some(row => Number(row.source_format) === sourceFormat
+        && row.source_namespace === expectedNamespaces.get(sourceFormat))) {
+      fail("LEGACY_ADMISSION_BASE_STAGING_RECEIPT_REQUIRED");
+    }
+  }
+  const proofSha256 = createHash("sha256").update(JSON.stringify(evidence.rows.map(row => row.family_evidence_sha256))).digest("hex");
+  return Object.freeze({
+    baseControlSchema: controlSchema,
+    baseTransferId: transferId,
+    sourceSnapshotId: run.source_snapshot_id,
+    sourceArtifactSha256: run.source_artifact_sha256,
+    sourceManifestSha256: run.source_manifest_sha256,
+    targetManifestSha256: run.target_manifest_sha256,
+    v1SourceNamespace: expectedNamespaces.get(10),
+    v11SourceNamespace: expectedNamespaces.get(11),
+    familyEvidenceSha256: proofSha256,
+  });
+}
+
+async function ensureAdmissionStagingReceiptTable(pool, controlSchema) {
+  const control = qschema(controlSchema);
+  const relation = `${control}."${STAGING_RECEIPT_TABLE}"`;
+  const guard = "_legacy_admission_staging_receipt_guard";
+  const guardFunction = `${control}."${guard}_fn"`;
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS ${relation} (
+      transfer_id text PRIMARY KEY REFERENCES ${control}."${RUN_TABLE}"(transfer_id) ON DELETE CASCADE,
+      target_schema text NOT NULL,
+      base_control_schema text NOT NULL,
+      base_transfer_id text NOT NULL,
+      source_snapshot_id text NOT NULL,
+      source_snapshot_kind text NOT NULL CHECK(source_snapshot_kind IN ('sealed-sqlite-rehearsal','synthetic-d1-fixture')),
+      source_snapshot_sha256 text NOT NULL CHECK(source_snapshot_sha256 ~ '^[0-9a-f]{64}$'),
+      base_source_manifest_sha256 text NOT NULL CHECK(base_source_manifest_sha256 ~ '^[0-9a-f]{64}$'),
+      base_target_manifest_sha256 text NOT NULL CHECK(base_target_manifest_sha256 ~ '^[0-9a-f]{64}$'),
+      v1_source_namespace text NOT NULL,
+      v11_source_namespace text NOT NULL,
+      family_evidence_sha256 text NOT NULL CHECK(family_evidence_sha256 ~ '^[0-9a-f]{64}$'),
+      header_manifest_sha256 text NOT NULL CHECK(header_manifest_sha256 ~ '^[0-9a-f]{64}$'),
+      header_table_row_counts jsonb NOT NULL CHECK(jsonb_typeof(header_table_row_counts)='object'),
+      lineage_manifest_sha256 text NOT NULL CHECK(lineage_manifest_sha256 ~ '^[0-9a-f]{64}$'),
+      table_row_counts jsonb NOT NULL CHECK(jsonb_typeof(table_row_counts)='object'),
+      completed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+    )`);
+    await pool.query(`CREATE OR REPLACE FUNCTION ${guardFunction}() RETURNS trigger
+      LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+      BEGIN RAISE EXCEPTION 'legacy_admission_staging_receipt_immutable' USING ERRCODE='P1005'; END; $$`);
+    await pool.query(`DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid='${controlSchema}.${STAGING_RECEIPT_TABLE}'::regclass
+        AND tgname='${guard}') THEN
+        CREATE TRIGGER ${guard} BEFORE UPDATE OR DELETE ON ${relation}
+          FOR EACH ROW EXECUTE FUNCTION ${guardFunction}();
+      END IF;
+    END $$`);
+  } catch { fail("LEGACY_ADMISSION_STAGING_RECEIPT_INVALID"); }
+}
+
+async function persistAdmissionStagingReceipt({ pool, controlSchema, transferId, targetSchema, baseProof, snapshot, sourceSnapshotSha256,
+  headerManifestSha256, headerTableRowCounts, lineageManifestSha256, tableRowCounts } = {}) {
+  await ensureAdmissionStagingReceiptTable(pool, controlSchema);
+  const relation = `${qschema(controlSchema)}."${STAGING_RECEIPT_TABLE}"`;
+  const inserted = await pool.query(`INSERT INTO ${relation}(
+      transfer_id,target_schema,base_control_schema,base_transfer_id,source_snapshot_id,source_snapshot_sha256,
+      base_source_manifest_sha256,base_target_manifest_sha256,v1_source_namespace,v11_source_namespace,
+      family_evidence_sha256,source_snapshot_kind,header_manifest_sha256,header_table_row_counts,
+      lineage_manifest_sha256,table_row_counts
+    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16::jsonb)
+    ON CONFLICT(transfer_id) DO NOTHING`, [transferId, targetSchema, baseProof.baseControlSchema,
+    baseProof.baseTransferId, baseProof.sourceSnapshotId, sourceSnapshotSha256,
+    baseProof.sourceManifestSha256, baseProof.targetManifestSha256, baseProof.v1SourceNamespace,
+    baseProof.v11SourceNamespace, baseProof.familyEvidenceSha256, snapshot.kind, headerManifestSha256,
+    JSON.stringify(headerTableRowCounts), lineageManifestSha256, JSON.stringify(tableRowCounts)]);
+  if (inserted.rowCount === 0) {
+    const current = await pool.query(`SELECT target_schema,base_control_schema,base_transfer_id,source_snapshot_id,
+        source_snapshot_sha256,base_source_manifest_sha256,base_target_manifest_sha256,v1_source_namespace,
+        v11_source_namespace,family_evidence_sha256,source_snapshot_kind,header_manifest_sha256,header_table_row_counts,
+        lineage_manifest_sha256,table_row_counts
+      FROM ${relation} WHERE transfer_id=$1`, [transferId]);
+    const row = current.rows[0];
+    if (!row || row.target_schema !== targetSchema || row.base_control_schema !== baseProof.baseControlSchema
+        || row.base_transfer_id !== baseProof.baseTransferId || row.source_snapshot_id !== baseProof.sourceSnapshotId
+        || row.source_snapshot_sha256 !== sourceSnapshotSha256
+        || row.base_source_manifest_sha256 !== baseProof.sourceManifestSha256
+        || row.base_target_manifest_sha256 !== baseProof.targetManifestSha256
+        || row.v1_source_namespace !== baseProof.v1SourceNamespace
+        || row.v11_source_namespace !== baseProof.v11SourceNamespace
+        || row.family_evidence_sha256 !== baseProof.familyEvidenceSha256
+        || row.source_snapshot_kind !== snapshot.kind
+        || row.header_manifest_sha256 !== headerManifestSha256
+        || !sameCounts(row.header_table_row_counts, headerTableRowCounts)
+        || row.lineage_manifest_sha256 !== lineageManifestSha256
+        || !sameCounts(row.table_row_counts, tableRowCounts)) fail("LEGACY_ADMISSION_STAGING_RECEIPT_MISMATCH");
+  }
+}
+
+function headerManifest(sourceManifest) {
+  const tables = Object.create(null);
+  for (const spec of HEADER_TABLES) {
+    const item = sourceManifest.tables[spec.name];
+    if (!item || !Number.isSafeInteger(item.rows) || item.rows < 0 || !SHA256.test(item.sha256 ?? "")) {
+      fail("LEGACY_ADMISSION_HEADER_MANIFEST_INVALID");
+    }
+    tables[spec.name] = Object.freeze({ rows: item.rows, sha256: item.sha256 });
+  }
+  return Object.freeze({
+    tables: Object.freeze(tables),
+    rowCounts: Object.freeze(Object.fromEntries(Object.entries(tables).map(([name, item]) => [name, item.rows]))),
+    sha256: createHash("sha256").update(JSON.stringify(tables)).digest("hex"),
+  });
+}
+
+async function persistHeaderStageReceipt({ pool, controlSchema, transferId, targetSchema, snapshot, sourceManifest,
+  state, proof } = {}) {
+  const control = qschema(controlSchema);
+  const table = `${control}."_legacy_admission_header_receipts_v1"`;
+  const functionName = `${control}."_legacy_admission_header_receipt_guard_fn"`;
+  const triggerName = "_legacy_admission_header_receipt_guard";
+  await pool.query(`CREATE TABLE IF NOT EXISTS ${table} (
+    transfer_id text PRIMARY KEY REFERENCES ${control}."${RUN_TABLE}"(transfer_id) ON DELETE CASCADE,
+    target_schema text NOT NULL,
+    source_snapshot_id text NOT NULL,
+    source_snapshot_kind text NOT NULL CHECK(source_snapshot_kind IN ('sealed-sqlite-rehearsal','synthetic-d1-fixture')),
+    source_snapshot_sha256 text NOT NULL CHECK(source_snapshot_sha256 ~ '^[0-9a-f]{64}$'),
+    source_manifest_sha256 text NOT NULL CHECK(source_manifest_sha256 ~ '^[0-9a-f]{64}$'),
+    v1_source_namespace text NOT NULL,
+    v11_source_namespace text NOT NULL,
+    header_manifest_sha256 text NOT NULL CHECK(header_manifest_sha256 ~ '^[0-9a-f]{64}$'),
+    header_table_row_counts jsonb NOT NULL CHECK(jsonb_typeof(header_table_row_counts)='object'),
+    completed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+  )`);
+  await pool.query(`CREATE OR REPLACE FUNCTION ${functionName}() RETURNS trigger
+    LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+    BEGIN RAISE EXCEPTION 'legacy_admission_header_receipt_immutable' USING ERRCODE='P1005'; END; $$`);
+  await pool.query(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid='${controlSchema}._legacy_admission_header_receipts_v1'::regclass
+      AND tgname='${triggerName}') THEN
+      CREATE TRIGGER ${triggerName} BEFORE UPDATE OR DELETE ON ${table}
+        FOR EACH ROW EXECUTE FUNCTION ${functionName}();
+    END IF;
+  END $$`);
+  const values = [transferId, targetSchema, snapshot.snapshotId, snapshot.kind,
+    snapshot.artifactSha256 ?? sourceManifest.sha256, sourceManifest.sha256,
+    state.typed_v1_admission_state.source_namespace, state.typed_v11_admission_state.source_namespace,
+    proof.sha256, JSON.stringify(proof.rowCounts)];
+  const inserted = await pool.query(`INSERT INTO ${table}(
+      transfer_id,target_schema,source_snapshot_id,source_snapshot_kind,source_snapshot_sha256,source_manifest_sha256,
+      v1_source_namespace,v11_source_namespace,header_manifest_sha256,header_table_row_counts
+    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb) ON CONFLICT(transfer_id) DO NOTHING`, values);
+  if (inserted.rowCount !== 0 && inserted.rowCount !== 1) fail("LEGACY_ADMISSION_HEADER_RECEIPT_MISMATCH");
+  const current = await pool.query(`SELECT target_schema,source_snapshot_id,source_snapshot_kind,source_snapshot_sha256,
+      source_manifest_sha256,v1_source_namespace,v11_source_namespace,header_manifest_sha256,header_table_row_counts
+    FROM ${table} WHERE transfer_id=$1`, [transferId]);
+  const row = current.rows[0];
+  if (!row || row.target_schema !== targetSchema || row.source_snapshot_id !== snapshot.snapshotId
+      || row.source_snapshot_kind !== snapshot.kind
+      || row.source_snapshot_sha256 !== (snapshot.artifactSha256 ?? sourceManifest.sha256)
+      || row.source_manifest_sha256 !== sourceManifest.sha256
+      || row.v1_source_namespace !== state.typed_v1_admission_state.source_namespace
+      || row.v11_source_namespace !== state.typed_v11_admission_state.source_namespace
+      || row.header_manifest_sha256 !== proof.sha256 || !sameCounts(row.header_table_row_counts, proof.rowCounts)) {
+    fail("LEGACY_ADMISSION_HEADER_RECEIPT_MISMATCH");
+  }
+}
+
 async function ensureControlTables(pool, controlSchema) {
   const ns = qschema(controlSchema);
   await pool.query(`CREATE TABLE IF NOT EXISTS ${ns}."${RUN_TABLE}" (
@@ -475,13 +753,35 @@ async function ensureControlTables(pool, controlSchema) {
     page_count bigint NOT NULL CHECK(page_count>=0), complete boolean NOT NULL,
     PRIMARY KEY(transfer_id,table_name)
   )`);
+  const immutableFunction = `${ns}."_legacy_header_stage_immutable_fn"`;
+  await pool.query(`CREATE OR REPLACE FUNCTION ${immutableFunction}() RETURNS trigger
+    LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+    BEGIN RAISE EXCEPTION 'legacy_header_stage_immutable' USING ERRCODE='P1005'; END; $$`);
+  for (const spec of HEADER_TABLES) {
+    const columns = spec.columns.map((column, index) => {
+      const type = spec.types[index];
+      const sqlType = type === "i16" ? "smallint" : type === "i32" ? "integer"
+        : type === "i64" ? "bigint" : type === "bytes" ? "bytea" : "text";
+      return `"${column}" ${sqlType}${spec.primaryKey.includes(column) ? " NOT NULL" : ""}`;
+    });
+    const primaryKey = spec.primaryKey.map((column) => `"${column}"`).join(",");
+    const relation = `${ns}."${spec.targetTable}"`;
+    const trigger = `${spec.targetTable}_immutable`;
+    await pool.query(`CREATE TABLE IF NOT EXISTS ${relation} (${columns.join(",")}, PRIMARY KEY(${primaryKey}))`);
+    await pool.query(`DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid='${controlSchema}.${spec.targetTable}'::regclass AND tgname='${trigger}') THEN
+        CREATE TRIGGER ${trigger} BEFORE UPDATE OR DELETE ON ${relation}
+          FOR EACH ROW EXECUTE FUNCTION ${immutableFunction}();
+      END IF;
+    END $$`);
+  }
 }
 
 function insertStatement(schema, spec, rows) {
   const columns = spec.columns.map((column) => `"${column}"`).join(",");
   const params = [];
   const groups = rows.map((row) => `(${spec.columns.map((column) => { params.push(row[column]); return `$${params.length}`; }).join(",")})`);
-  return { sql: `INSERT INTO ${qtable(schema, spec.name)} (${columns}) VALUES ${groups.join(",")} ON CONFLICT (${spec.primaryKey.map((key) => `"${key}"`).join(",")}) DO NOTHING`, params };
+  return { sql: `INSERT INTO ${qtable(schema, spec.targetTable ?? spec.name)} (${columns}) VALUES ${groups.join(",")} ON CONFLICT (${spec.primaryKey.map((key) => `"${key}"`).join(",")}) DO NOTHING`, params };
 }
 
 async function getRun(pool, controlSchema, transferId, snapshot, sourceManifest, v1Namespace, v11Namespace) {
@@ -505,6 +805,7 @@ async function getRun(pool, controlSchema, transferId, snapshot, sourceManifest,
 }
 
 async function copyTable({ source, pool, targetSchema, controlSchema, transferId, spec, pageSize }) {
+  const destinationSchema = spec.targetTable ? controlSchema : targetSchema;
   const checkpoint = qtable(controlSchema, CHECKPOINT_TABLE);
   const prior = await pool.query(`SELECT last_key,row_count,page_count,complete FROM ${checkpoint} WHERE transfer_id=$1 AND table_name=$2`, [transferId, spec.name]);
   if (prior.rows[0]?.complete) return { pages: 0, resumed: true };
@@ -521,10 +822,10 @@ async function copyTable({ source, pool, targetSchema, controlSchema, transferId
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
-        const statement = insertStatement(targetSchema, spec, rows);
+        const statement = insertStatement(destinationSchema, spec, rows);
         await client.query(statement.sql, statement.params);
         const keys = rows.map((row) => row[spec.primaryKey[0]]);
-        const stored = await scanTargetRows(client, targetSchema, spec, keys);
+        const stored = await scanTargetRows(client, destinationSchema, spec, keys);
         const byKey = new Map(stored.map((raw) => [String(raw[spec.primaryKey[0]]), raw]));
         if (stored.length !== rows.length || rows.some((row) => !equalRow(spec, row, byKey.get(String(row[spec.primaryKey[0]]))))) fail("LEGACY_ADMISSION_DESTINATION_ROW_MISMATCH");
         rowCount += rows.length; pageCount += 1; pages += 1;
@@ -547,14 +848,15 @@ async function copyTable({ source, pool, targetSchema, controlSchema, transferId
   }
 }
 
-async function verifyAllRows({ source, pool, schema, pageSize }) {
-  for (const spec of TABLES) {
+async function verifyAllRows({ source, pool, schema, controlSchema = schema, pageSize, specs = SOURCE_TABLES }) {
+  for (const spec of specs) {
     let after = null;
     for (;;) {
       const page = await source.listPage({ table: spec.name, after, limit: pageSize });
       const rows = page.rows.map((raw) => normalizeRow(spec, raw));
       if (rows.length === 0) break;
-      const stored = await scanTargetRows(pool, schema, spec, rows.map((row) => row[spec.primaryKey[0]]));
+      const destinationSchema = spec.targetTable ? controlSchema : schema;
+      const stored = await scanTargetRows(pool, destinationSchema, spec, rows.map((row) => row[spec.primaryKey[0]]));
       const byKey = new Map(stored.map((raw) => [String(raw[spec.primaryKey[0]]), raw]));
       if (stored.length !== rows.length || rows.some((row) => !equalRow(spec, row, byKey.get(String(row[spec.primaryKey[0]]))))) fail("LEGACY_ADMISSION_DESTINATION_PARITY_FAILED");
       after = cursor(spec, rows.at(-1));
@@ -643,7 +945,8 @@ async function verifyTargetCounts(pool, schema, expected, v1State, v11State) {
 /** Copy both admission/proof/publication families from a sealed D1 snapshot.
  * A successful return is staged import evidence only; this does not qualify or
  * activate the PostgreSQL effective reader. */
-export async function runPostgresLegacyAdmissionTransfer({ source, destinationPool, targetSchema: rawTargetSchema, controlSchema: rawControlSchema, transferId, pageSize } = {}) {
+export async function runPostgresLegacyAdmissionTransfer({ source, destinationPool, targetSchema: rawTargetSchema,
+  controlSchema: rawControlSchema, transferId, pageSize, baseStagingTransfer } = {}) {
   const targetSchema = schemaName(rawTargetSchema);
   const controlSchema = schemaName(rawControlSchema);
   if (!controlSchema.startsWith(CONTROL_PREFIX) || controlSchema.length < CONTROL_PREFIX.length + 8 || controlSchema === targetSchema) fail("LEGACY_ADMISSION_CONTROL_SCHEMA_INVALID");
@@ -667,7 +970,16 @@ export async function runPostgresLegacyAdmissionTransfer({ source, destinationPo
     // One D1 source can use one namespace for both formats; this is valid.
   }
   const sourceManifest = await scanSource(source, size);
-  const baseGenerations = await assertBaseReceipts(destinationPool, targetSchema,
+  const sourceHeaderManifest = headerManifest(sourceManifest);
+  const baseProof = baseStagingTransfer === undefined ? null : await verifyBaseStagingEvidence({
+    pool: destinationPool,
+    targetSchema,
+    snapshot,
+    state,
+    controlSchema: baseStagingTransfer?.controlSchema,
+    transferId: baseStagingTransfer?.transferId,
+  });
+  const baseGenerations = baseProof ? null : await assertBaseReceipts(destinationPool, targetSchema,
     state.typed_v1_admission_state.source_namespace, state.typed_v11_admission_state.source_namespace);
   await source.verifySnapshot();
   const controlNamespace = await destinationPool.query("SELECT to_regnamespace($1) AS namespace", [controlSchema]);
@@ -681,6 +993,13 @@ export async function runPostgresLegacyAdmissionTransfer({ source, destinationPo
     await getRun(destinationPool, controlSchema, transferId, snapshot, sourceManifest,
       state.typed_v1_admission_state.source_namespace, state.typed_v11_admission_state.source_namespace);
     let pages = 0;
+    for (const spec of HEADER_TABLES) {
+      const copied = await copyTable({ source, pool: destinationPool, targetSchema, controlSchema, transferId, spec, pageSize: size });
+      pages += copied.pages;
+    }
+    await verifyAllRows({ source, pool: destinationPool, schema: targetSchema, controlSchema, pageSize: size, specs: HEADER_TABLES });
+    await persistHeaderStageReceipt({ pool: destinationPool, controlSchema, transferId, targetSchema,
+      snapshot, sourceManifest, state, proof: sourceHeaderManifest });
     for (const spec of TABLES) {
       const copied = await copyTable({ source, pool: destinationPool, targetSchema, controlSchema, transferId, spec, pageSize: size });
       pages += copied.pages;
@@ -691,29 +1010,38 @@ export async function runPostgresLegacyAdmissionTransfer({ source, destinationPo
     if (finalSource.sha256 !== sourceManifest.sha256) fail("LEGACY_ADMISSION_SOURCE_CHANGED");
     const finalSnapshot = await source.verifySnapshot();
     if (finalSnapshot?.snapshotId !== snapshot.snapshotId) fail("LEGACY_ADMISSION_SOURCE_CHANGED");
-    await verifyAllRows({ source, pool: destinationPool, schema: targetSchema, pageSize: size });
+    await verifyAllRows({ source, pool: destinationPool, schema: targetSchema, controlSchema, pageSize: size });
     const tableCounts = Object.fromEntries(Object.entries(sourceManifest.tables).map(([name, value]) => [name, value.rows]));
     tableCounts[TRANSIENT_REQUEST_TABLE] = 0;
     await verifyTargetCounts(destinationPool, targetSchema, tableCounts,
       state.typed_v1_admission_state, state.typed_v11_admission_state);
-    const receipt = await destinationPool.query(`INSERT INTO ${qtable(targetSchema, "typed_telemetry_admission_transfer_receipts")}
+    if (baseProof) {
+      await persistAdmissionStagingReceipt({ pool: destinationPool, controlSchema, transferId, targetSchema,
+        baseProof, snapshot, sourceSnapshotSha256: snapshot.artifactSha256 ?? sourceManifest.sha256,
+        headerManifestSha256: sourceHeaderManifest.sha256,
+        headerTableRowCounts: sourceHeaderManifest.rowCounts,
+        lineageManifestSha256: sourceManifest.sha256, tableRowCounts });
+    } else {
+      const receipt = await destinationPool.query(`INSERT INTO ${qtable(targetSchema, "typed_telemetry_admission_transfer_receipts")}
       (transfer_id,v1_source_namespace,v11_source_namespace,v1_base_generation,v11_base_generation,source_snapshot_sha256,lineage_manifest_sha256,table_row_counts)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb) ON CONFLICT(transfer_id) DO NOTHING RETURNING transfer_id`,
-    [transferId, state.typed_v1_admission_state.source_namespace, state.typed_v11_admission_state.source_namespace,
-      baseGenerations.v1, baseGenerations.v11, snapshot.artifactSha256 ?? sourceManifest.sha256, sourceManifest.sha256, JSON.stringify(tableCounts)]);
-    if (receipt.rowCount === 0) {
-      const existing = await destinationPool.query(`SELECT v1_source_namespace,v11_source_namespace,v1_base_generation,v11_base_generation,source_snapshot_sha256,lineage_manifest_sha256,table_row_counts
-        FROM ${qtable(targetSchema, "typed_telemetry_admission_transfer_receipts")} WHERE transfer_id=$1`, [transferId]);
-      const row = existing.rows[0];
-      if (!row || row.v1_source_namespace !== state.typed_v1_admission_state.source_namespace
-          || row.v11_source_namespace !== state.typed_v11_admission_state.source_namespace
-          || Number(row.v1_base_generation) !== baseGenerations.v1 || Number(row.v11_base_generation) !== baseGenerations.v11
-          || row.source_snapshot_sha256 !== (snapshot.artifactSha256 ?? sourceManifest.sha256)
-          || row.lineage_manifest_sha256 !== sourceManifest.sha256
-          || !sameCounts(row.table_row_counts, tableCounts)) fail("LEGACY_ADMISSION_RECEIPT_MISMATCH");
+      [transferId, state.typed_v1_admission_state.source_namespace, state.typed_v11_admission_state.source_namespace,
+        baseGenerations.v1, baseGenerations.v11, snapshot.artifactSha256 ?? sourceManifest.sha256,
+        sourceManifest.sha256, JSON.stringify(tableCounts)]);
+      if (receipt.rowCount === 0) {
+        const existing = await destinationPool.query(`SELECT v1_source_namespace,v11_source_namespace,v1_base_generation,v11_base_generation,source_snapshot_sha256,lineage_manifest_sha256,table_row_counts
+          FROM ${qtable(targetSchema, "typed_telemetry_admission_transfer_receipts")} WHERE transfer_id=$1`, [transferId]);
+        const row = existing.rows[0];
+        if (!row || row.v1_source_namespace !== state.typed_v1_admission_state.source_namespace
+            || row.v11_source_namespace !== state.typed_v11_admission_state.source_namespace
+            || Number(row.v1_base_generation) !== baseGenerations.v1 || Number(row.v11_base_generation) !== baseGenerations.v11
+            || row.source_snapshot_sha256 !== (snapshot.artifactSha256 ?? sourceManifest.sha256)
+            || row.lineage_manifest_sha256 !== sourceManifest.sha256
+            || !sameCounts(row.table_row_counts, tableCounts)) fail("LEGACY_ADMISSION_RECEIPT_MISMATCH");
+      }
     }
     await destinationPool.query(`UPDATE ${qtable(controlSchema, RUN_TABLE)} SET status='complete',updated_at=clock_timestamp() WHERE transfer_id=$1`, [transferId]);
-    return Object.freeze({ schema: POSTGRES_LEGACY_ADMISSION_TRANSFER_SCHEMA, status: "staged_admission_lineage_transfer_complete", postgresMajor: Math.floor(postgresVersion / 10000), pageSize: size, pagesCommittedThisRun: pages, tableRows: Object.freeze(tableCounts), sourceSnapshotSha256: snapshot.artifactSha256 ?? sourceManifest.sha256, lineageManifestSha256: sourceManifest.sha256, productionReady: false, readerActivationAuthorized: false, erasureAuthorized: false });
+    return Object.freeze({ schema: POSTGRES_LEGACY_ADMISSION_TRANSFER_SCHEMA, status: "staged_admission_lineage_transfer_complete", postgresMajor: Math.floor(postgresVersion / 10000), pageSize: size, pagesCommittedThisRun: pages, tableRows: Object.freeze(tableCounts), sourceSnapshotSha256: snapshot.artifactSha256 ?? sourceManifest.sha256, sourceHeaderManifestSha256: sourceHeaderManifest.sha256, sourceHeaderTableRows: sourceHeaderManifest.rowCounts, lineageManifestSha256: sourceManifest.sha256, productionReady: false, readerActivationAuthorized: false, erasureAuthorized: false });
   } finally {
     if (lockAcquired) await lockClient.query("SELECT pg_advisory_unlock(hashtext($1))", [`legacy-admission:${transferId}`]).catch(() => {});
     lockClient.release();
@@ -722,6 +1050,12 @@ export async function runPostgresLegacyAdmissionTransfer({ source, destinationPo
 
 export const POSTGRES_LEGACY_ADMISSION_TRANSFER_TABLES = Object.freeze(TABLES.map((spec) => spec.name));
 export const POSTGRES_LEGACY_ADMISSION_TRANSFER_LAYOUT = Object.freeze(TABLES.map((spec) => Object.freeze({
+  name: spec.name,
+  columns: spec.columns,
+  primaryKey: spec.primaryKey,
+  types: spec.types,
+})));
+export const POSTGRES_LEGACY_ADMISSION_HEADER_LAYOUT = Object.freeze(HEADER_TABLES.map((spec) => Object.freeze({
   name: spec.name,
   columns: spec.columns,
   primaryKey: spec.primaryKey,
