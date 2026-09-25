@@ -9,6 +9,7 @@ export const SEALED_ANALYTICS_EVENT_EXPORT_SCHEMA = "sealed-sqlite-analytics-eve
 export const POSTGRES_ANALYTICS_HISTORY_DEFAULT_PAGE_SIZE = 100;
 export const POSTGRES_ANALYTICS_HISTORY_MAX_PAGE_SIZE = 200;
 export const POSTGRES_ANALYTICS_HISTORY_TARGET_SCHEMA_PREFIX = "analytics_history_transfer_target_";
+export const POSTGRES_ANALYTICS_HISTORY_BOOTSTRAP_TARGET_SCHEMA_PREFIX = "storage_journal_transfer_target_";
 
 const MAX_SQLITE_BYTES = 100 * 1024 * 1024 * 1024;
 const HASH_BUFFER_BYTES = 1024 * 1024;
@@ -17,6 +18,13 @@ const SCHEMA = /^[a-z_][a-z0-9_]{0,62}$/u;
 const TARGET_SUFFIX = /^[a-z0-9_]{8,}$/u;
 const SOURCE_ID = /^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/u;
 const OWNER_DIGEST = /^[0-9a-f]{64}$/u;
+const APPLIED_MAIN_TRANSFER_ID = /^synthetic-analytics-applied-main-[A-Za-z0-9._-]{1,96}$/u;
+const INGESTION_JOURNAL_TRANSFER_ID = /^synthetic-ingestion-journal-[A-Za-z0-9._-]{1,96}$/u;
+const APPLIED_MAIN_RUNS = "_synthetic_analytics_applied_main_transfer_runs_v1";
+const APPLIED_MAIN_CHECKPOINTS = "_synthetic_analytics_applied_main_transfer_checkpoints_v1";
+const INGESTION_JOURNAL_RUNS = "_storage_ingestion_journal_transfer_runs_v1";
+const INGESTION_JOURNAL_CHECKPOINTS = "_storage_ingestion_journal_transfer_checkpoints_v1";
+const MAX_INGESTION_JOURNAL_PAGE_SIZE = 250;
 const TRUSTED_SOURCES = new WeakSet();
 
 const SOURCE_TABLES = Object.freeze({
@@ -72,6 +80,7 @@ const SEALED_SOURCE_PAGE_SPEC_BY_NAME = new Map([
 // mistaken for a publication-ready analytics transfer.
 const TARGET_OPERATION_TABLES = Object.freeze([
   "analytics_applied_events",
+  "storage_ingestion_changes",
   "analytics_owner_results",
   "analytics_scheduler_delivery_cursors",
   "analytics_publication_captures",
@@ -499,7 +508,9 @@ function quoteSchema(schema) {
 }
 
 function relation(schema, name) {
-  if (!SPEC_BY_NAME.has(name) && !TARGET_OPERATION_TABLES.includes(name) && name !== "collection_controls") {
+  if (!SPEC_BY_NAME.has(name) && !TARGET_OPERATION_TABLES.includes(name) && name !== "collection_controls"
+      && !["storage_source_state", APPLIED_MAIN_RUNS, APPLIED_MAIN_CHECKPOINTS, INGESTION_JOURNAL_RUNS,
+        INGESTION_JOURNAL_CHECKPOINTS].includes(name)) {
     fail("ANALYTICS_HISTORY_TABLE_INVALID");
   }
   return `${quoteSchema(schema)}."${name}"`;
@@ -641,11 +652,303 @@ async function assertContained(client, schema) {
       || row.publication_enabled !== false) fail("ANALYTICS_HISTORY_TARGET_NOT_CONTAINED");
 }
 
-async function assertNoTargetOperations(client, schema) {
+async function assertNoTargetOperations(client, schema, { allowAppliedEventLane = false } = {}) {
   for (const table of TARGET_OPERATION_TABLES) {
+    if (allowAppliedEventLane && (table === "analytics_applied_events" || table === "storage_ingestion_changes")) {
+      continue;
+    }
     const result = await client.query(`SELECT EXISTS(SELECT 1 FROM ${relation(schema, table)} LIMIT 1) AS present`);
     if (result.rows[0]?.present !== false) fail("ANALYTICS_HISTORY_TARGET_NOT_EMPTY");
   }
+}
+
+function validateAppliedEventTransfer(value) {
+  if (value === undefined) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== "journalSource,journalTransferId,transferId"
+      || !APPLIED_MAIN_TRANSFER_ID.test(value.transferId ?? "")
+      || !INGESTION_JOURNAL_TRANSFER_ID.test(value.journalTransferId ?? "")) {
+    fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+  }
+  return value;
+}
+
+function transferHashChain(previous, spec, rows) {
+  const hash = sha256();
+  hash.update(`${previous}\n`);
+  for (const row of rows) hash.update(`${canonicalRow(spec, row)}\n`);
+  return hash.digest("hex");
+}
+
+function pageCount(rowCount, pageSize) {
+  const count = BigInt(rowCount);
+  if (count === 0n) return 0;
+  return Number((count + BigInt(pageSize) - 1n) / BigInt(pageSize));
+}
+
+async function scanBootstrapSources({ source, journalSource, pageSize }) {
+  try {
+    assertSource(source);
+    const identity = await inspectSealedSqliteAnalyticsSourceIdentity(source);
+    const { scanSealedSqliteIngestionJournal } = await import("./postgres-ingestion-journal-transfer.mjs");
+    const [events, journal] = await Promise.all([
+      scanSealedSqliteAnalyticsEventJournal({ source, pageSize }),
+      scanSealedSqliteIngestionJournal({ source: journalSource, pageSize }),
+    ]);
+    const journalSourceId = journalSource?.snapshot?.sourceId;
+    const journalAuthorityEpoch = normalizeInteger(journalSource?.snapshot?.sourceAuthorityEpoch);
+    if (identity.contractVersion !== 1 || identity.sourceSequence !== events.eventRows
+        || identity.snapshotSha256 !== events.sourceSnapshotSha256
+        || identity.sourceId !== journalSourceId || identity.sourceAuthorityEpoch !== journalAuthorityEpoch
+        || journal.sourceIdSha256 !== sha256().update(identity.sourceId).digest("hex")
+        || journal.sourceSnapshotSha256 !== journalSource.snapshot.artifactSha256
+        || journal.sourceAuthorityEpoch !== identity.sourceAuthorityEpoch
+        || journal.eventRows !== events.eventRows || journal.eventRowsSha256 !== events.eventRowsSha256
+        || journal.lastSequence !== identity.sourceSequence) {
+      fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+    }
+    return Object.freeze({ identity, events, journal });
+  } catch (error) {
+    if (error instanceof PostgresAnalyticsHistoryTransferError) {
+      if (error.code === "ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED") throw error;
+      fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+    }
+    fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+  }
+}
+
+async function readVerifiedJournalRows(client, schema, sourceId, sourceRows) {
+  if (sourceRows.length === 0) return [];
+  const columns = ANALYTICS_EVENT_SPEC.columns.map(column => `"${column}"`).join(",");
+  let result;
+  try {
+    result = await client.query(`SELECT ${columns},owner_revision::text AS owner_revision,event_tuple_version
+      FROM ${relation(schema, "storage_ingestion_changes")}
+      WHERE source_id=$1 AND sequence BETWEEN $2 AND $3 ORDER BY sequence`,
+    [sourceId, sourceRows[0].sequence, sourceRows.at(-1).sequence]);
+  } catch { fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED"); }
+  if (result.rowCount !== sourceRows.length) fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+  const rows = [];
+  for (let index = 0; index < sourceRows.length; index += 1) {
+    let row;
+    try { row = normalizeRow(ANALYTICS_EVENT_SPEC, result.rows[index]); }
+    catch { fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED"); }
+    if (normalizeInteger(result.rows[index].owner_revision) !== "0"
+        || normalizeInteger(result.rows[index].event_tuple_version) !== "1"
+        || !sameRow(ANALYTICS_EVENT_SPEC, sourceRows[index], row)) {
+      fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+async function readVerifiedAppliedRows(client, schema, sourceId, sourceRows) {
+  if (sourceRows.length === 0) return [];
+  const columns = ANALYTICS_EVENT_SPEC.columns.map(column => `"${column}"`).join(",");
+  let result;
+  try {
+    result = await client.query(`SELECT ${columns},projection_json,event_tuple_version
+      FROM ${relation(schema, "analytics_applied_events")}
+      WHERE source_id=$1 AND sequence BETWEEN $2 AND $3 ORDER BY sequence`,
+    [sourceId, sourceRows[0].sequence, sourceRows.at(-1).sequence]);
+  } catch { fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED"); }
+  if (result.rowCount !== sourceRows.length) fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+  const rows = [];
+  for (let index = 0; index < sourceRows.length; index += 1) {
+    let row;
+    try { row = normalizeRow(ANALYTICS_EVENT_SPEC, result.rows[index]); }
+    catch { fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED"); }
+    if (result.rows[index].projection_json !== null
+        || normalizeInteger(result.rows[index].event_tuple_version) !== "1"
+        || !sameRow(ANALYTICS_EVENT_SPEC, sourceRows[index], row)) {
+      fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+async function verifyBootstrapJournalTarget({ client, schema, journalSource, identity, journal, run, checkpoint }) {
+  const size = run.page_size;
+  if (!Number.isSafeInteger(size) || size < 1 || size > MAX_INGESTION_JOURNAL_PAGE_SIZE
+      || run.source_snapshot_id !== `sha256:${journal.sourceSnapshotSha256}`
+      || run.source_snapshot_sha256 !== journal.sourceSnapshotSha256 || run.source_id !== identity.sourceId
+      || normalizeInteger(run.source_authority_epoch) !== identity.sourceAuthorityEpoch
+      || normalizeInteger(run.source_row_count) !== journal.eventRows
+      || run.source_rows_sha256 !== journal.eventRowsSha256
+      || normalizeInteger(run.last_sequence) !== journal.lastSequence || run.status !== "complete" || !run.completed_at
+      || normalizeInteger(checkpoint.last_sequence) !== journal.lastSequence
+      || normalizeInteger(checkpoint.row_count) !== journal.eventRows || checkpoint.page_count !== pageCount(journal.eventRows, size)
+      || checkpoint.complete !== true || !SHA256.test(checkpoint.prefix_chain_sha256 ?? "")) {
+    fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+  }
+  let count = 0n;
+  let sourceHash = sha256();
+  let targetHash = sha256();
+  let chain = sha256().digest("hex");
+  let pages = 0;
+  let afterSequence = null;
+  for (;;) {
+    const page = await journalSource.listPage({ after: afterSequence, limit: size });
+    if (!page || !Array.isArray(page.rows) || page.rows.length > size) {
+      fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+    }
+    const sourceRows = page.rows.map(row => normalizeRow(ANALYTICS_EVENT_SPEC, row));
+    let sourceCursor = afterSequence === null ? null : { sourceId: identity.sourceId, sequence: afterSequence };
+    for (const row of sourceRows) {
+      if (row.source_id !== identity.sourceId || !cursorIsAfter(ANALYTICS_EVENT_SPEC, row, sourceCursor)) {
+        fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+      }
+      sourceCursor = { sourceId: row.source_id, sequence: row.sequence };
+      updateRowHash(sourceHash, ANALYTICS_EVENT_SPEC, row);
+      count += 1n;
+    }
+    if (sourceRows.length) {
+      const targetRows = await readVerifiedJournalRows(client, schema, identity.sourceId, sourceRows);
+      for (const row of targetRows) updateRowHash(targetHash, ANALYTICS_EVENT_SPEC, row);
+      chain = transferHashChain(chain, ANALYTICS_EVENT_SPEC, sourceRows);
+      pages += 1;
+      afterSequence = sourceRows.at(-1).sequence;
+    }
+    if (sourceRows.length < size) break;
+  }
+  const totals = await client.query(`SELECT count(*)::text AS rows,
+      count(*) FILTER (WHERE source_id<>$1)::text AS foreign_rows,
+      count(*) FILTER (WHERE event_tuple_version<>1 OR owner_revision<>0)::text AS unqualified_rows
+    FROM ${relation(schema, "storage_ingestion_changes")}`, [identity.sourceId]);
+  if (count.toString() !== journal.eventRows || sourceHash.digest("hex") !== journal.eventRowsSha256
+      || targetHash.digest("hex") !== journal.eventRowsSha256 || pages !== checkpoint.page_count
+      || chain !== checkpoint.prefix_chain_sha256 || totals.rows[0]?.rows !== journal.eventRows
+      || totals.rows[0]?.foreign_rows !== "0" || totals.rows[0]?.unqualified_rows !== "0") {
+    fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+  }
+}
+
+async function verifyBootstrapAppliedTarget({ client, schema, source, identity, events, run, checkpoint }) {
+  const size = run.page_size;
+  if (!Number.isSafeInteger(size) || size < 1 || size > POSTGRES_ANALYTICS_HISTORY_MAX_PAGE_SIZE
+      || run.source_snapshot_id !== identity.snapshotId || run.source_snapshot_sha256 !== identity.snapshotSha256
+      || run.source_id !== identity.sourceId || run.source_namespace_sha256 !== identity.namespaceSha256
+      || run.source_contract_version !== identity.contractVersion
+      || normalizeInteger(run.source_sequence) !== identity.sourceSequence
+      || normalizeInteger(run.source_authority_epoch) !== identity.sourceAuthorityEpoch
+      || normalizeInteger(run.source_event_count) !== events.eventRows
+      || run.source_events_sha256 !== events.eventRowsSha256 || run.status !== "complete" || !run.completed_at
+      || checkpoint.last_source_id !== (events.eventRows === "0" ? null : identity.sourceId)
+      || (events.eventRows === "0" ? checkpoint.last_sequence !== null
+        : normalizeInteger(checkpoint.last_sequence) !== identity.sourceSequence)
+      || normalizeInteger(checkpoint.row_count) !== events.eventRows
+      || checkpoint.page_count !== pageCount(events.eventRows, size) || checkpoint.complete !== true
+      || !SHA256.test(checkpoint.prefix_chain_sha256 ?? "")) {
+    fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+  }
+  let after = null;
+  let count = 0n;
+  let sourceHash = sha256();
+  let targetHash = sha256();
+  let chain = sha256().digest("hex");
+  let pages = 0;
+  for (;;) {
+    const page = await source.listPage({ table: ANALYTICS_EVENT_SPEC.name, after, limit: size });
+    if (!page || !Array.isArray(page.rows) || page.rows.length > size) {
+      fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+    }
+    const sourceRows = page.rows.map(row => normalizeRow(ANALYTICS_EVENT_SPEC, row));
+    let sourceCursor = after;
+    for (const row of sourceRows) {
+      if (row.source_id !== identity.sourceId || !cursorIsAfter(ANALYTICS_EVENT_SPEC, row, sourceCursor)) {
+        fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+      }
+      sourceCursor = cursorFor(ANALYTICS_EVENT_SPEC, row);
+      updateRowHash(sourceHash, ANALYTICS_EVENT_SPEC, row);
+      count += 1n;
+    }
+    if (sourceRows.length) {
+      const targetRows = await readVerifiedAppliedRows(client, schema, identity.sourceId, sourceRows);
+      for (const row of targetRows) updateRowHash(targetHash, ANALYTICS_EVENT_SPEC, row);
+      chain = transferHashChain(chain, ANALYTICS_EVENT_SPEC, sourceRows);
+      pages += 1;
+      after = cursorFor(ANALYTICS_EVENT_SPEC, sourceRows.at(-1));
+    }
+    if (sourceRows.length < size) break;
+  }
+  const totals = await client.query(`SELECT count(*)::text AS rows,
+      count(*) FILTER (WHERE source_id<>$1)::text AS foreign_rows,
+      count(*) FILTER (WHERE event_tuple_version<>1 OR projection_json IS NOT NULL)::text AS unqualified_rows
+    FROM ${relation(schema, "analytics_applied_events")}`, [identity.sourceId]);
+  if (count.toString() !== events.eventRows || sourceHash.digest("hex") !== events.eventRowsSha256
+      || targetHash.digest("hex") !== events.eventRowsSha256 || pages !== checkpoint.page_count
+      || chain !== checkpoint.prefix_chain_sha256 || totals.rows[0]?.rows !== events.eventRows
+      || totals.rows[0]?.foreign_rows !== "0" || totals.rows[0]?.unqualified_rows !== "0") {
+    fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+  }
+}
+
+async function verifyAppliedEventBootstrap({ client, schema, source, appliedEventTransfer, pageSize }) {
+  const manifests = await scanBootstrapSources({ source, journalSource: appliedEventTransfer.journalSource, pageSize });
+  let sourceState;
+  let triggerCount;
+  let mainRun;
+  let mainCheckpoint;
+  let journalRun;
+  let journalCheckpoint;
+  try {
+    sourceState = await client.query(`SELECT singleton,source_id,authority_epoch::text AS authority_epoch
+      FROM ${relation(schema, "storage_source_state")}`);
+    triggerCount = await client.query(`SELECT count(*)::int AS count FROM pg_trigger trigger_row
+        JOIN pg_class relation_row ON relation_row.oid=trigger_row.tgrelid
+        JOIN pg_namespace namespace_row ON namespace_row.oid=relation_row.relnamespace
+        WHERE namespace_row.nspname=$1 AND relation_row.relname='analytics_applied_events'
+          AND NOT trigger_row.tgisinternal`, [schema]);
+    mainRun = await client.query(`SELECT source_snapshot_id,source_snapshot_sha256,source_id,source_namespace_sha256,
+          source_contract_version,source_sequence::text AS source_sequence,
+          source_authority_epoch::text AS source_authority_epoch,source_event_count::text AS source_event_count,
+          source_events_sha256,journal_transfer_id,journal_source_snapshot_id,journal_source_snapshot_sha256,
+          journal_rows_sha256,page_size,last_source_id,last_sequence::text AS last_sequence,status,completed_at
+        FROM ${relation(schema, APPLIED_MAIN_RUNS)} WHERE transfer_id=$1`, [appliedEventTransfer.transferId]);
+    mainCheckpoint = await client.query(`SELECT last_source_id,last_sequence::text AS last_sequence,row_count::text AS row_count,
+          page_count,prefix_chain_sha256,complete FROM ${relation(schema, APPLIED_MAIN_CHECKPOINTS)} WHERE transfer_id=$1`,
+    [appliedEventTransfer.transferId]);
+    journalRun = await client.query(`SELECT source_snapshot_id,source_snapshot_sha256,source_id,
+          source_authority_epoch::text AS source_authority_epoch,source_row_count::text AS source_row_count,
+          source_rows_sha256,page_size,last_sequence::text AS last_sequence,status,completed_at
+        FROM ${relation(schema, INGESTION_JOURNAL_RUNS)} WHERE transfer_id=$1`, [appliedEventTransfer.journalTransferId]);
+    journalCheckpoint = await client.query(`SELECT last_sequence::text AS last_sequence,row_count::text AS row_count,
+          page_count,prefix_chain_sha256,complete FROM ${relation(schema, INGESTION_JOURNAL_CHECKPOINTS)}
+        WHERE transfer_id=$1`, [appliedEventTransfer.journalTransferId]);
+  } catch { fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED"); }
+  if (sourceState.rowCount !== 1 || sourceState.rows[0]?.singleton !== 1
+      || sourceState.rows[0]?.source_id !== manifests.identity.sourceId
+      || normalizeInteger(sourceState.rows[0]?.authority_epoch) !== manifests.identity.sourceAuthorityEpoch
+      || triggerCount.rows[0]?.count !== 0) {
+    fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+  }
+  const run = mainRun.rows[0];
+  const checkpoint = mainCheckpoint.rows[0];
+  const journalRunRow = journalRun.rows[0];
+  const journalCheckpointRow = journalCheckpoint.rows[0];
+  if (mainRun.rowCount !== 1 || mainCheckpoint.rowCount !== 1 || journalRun.rowCount !== 1
+      || journalCheckpoint.rowCount !== 1 || run.journal_transfer_id !== appliedEventTransfer.journalTransferId
+      || run.journal_source_snapshot_id !== `sha256:${manifests.journal.sourceSnapshotSha256}`
+      || run.journal_source_snapshot_sha256 !== manifests.journal.sourceSnapshotSha256
+      || run.journal_rows_sha256 !== manifests.journal.eventRowsSha256
+      || run.last_source_id !== checkpoint.last_source_id || run.last_sequence !== checkpoint.last_sequence) {
+    fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+  }
+  await verifyBootstrapJournalTarget({ client, schema, journalSource: appliedEventTransfer.journalSource,
+    identity: manifests.identity, journal: manifests.journal, run: journalRunRow, checkpoint: journalCheckpointRow });
+  await verifyBootstrapAppliedTarget({ client, schema, source, identity: manifests.identity,
+    events: manifests.events, run, checkpoint });
+  return Object.freeze({
+    sourceSnapshotSha256: manifests.identity.snapshotSha256,
+    sourceNamespaceSha256: manifests.identity.namespaceSha256,
+    eventRows: manifests.events.eventRows,
+    eventRowsSha256: manifests.events.eventRowsSha256,
+    journalSnapshotSha256: manifests.journal.sourceSnapshotSha256,
+    journalRows: manifests.journal.eventRows,
+    journalRowsSha256: manifests.journal.eventRowsSha256,
+  });
 }
 
 async function validateTarget(client, schema) {
@@ -662,6 +965,28 @@ async function acquireTargetLock(client, schema) {
   const result = await client.query("SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS locked",
     [`${schema}:analytics-history-state-transfer`]);
   if (result.rows?.[0]?.locked !== true) fail("ANALYTICS_HISTORY_TRANSFER_BUSY");
+}
+
+async function acquireBootstrapLocks(client, schema, held) {
+  try {
+    for (const name of ["ingestion-journal-transfer", "analytics-applied-main-transfer", "analytics-history-state-transfer"]) {
+      const lockKey = `${schema}:${name}`;
+      const result = await client.query("SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS locked", [lockKey]);
+      if (result.rows?.[0]?.locked !== true) fail("ANALYTICS_HISTORY_TRANSFER_BUSY");
+      held.push(lockKey);
+    }
+  } catch {
+    await releaseTargetLocks(client, held);
+    held.length = 0;
+    fail("ANALYTICS_HISTORY_TRANSFER_BUSY");
+  }
+  return held;
+}
+
+async function releaseTargetLocks(client, held) {
+  for (const lockKey of held.toReversed()) {
+    await client.query("SELECT pg_advisory_unlock(hashtextextended($1,0))", [lockKey]).catch(() => {});
+  }
 }
 
 async function verifyTargetPage(client, schema, spec, sourceRows) {
@@ -751,41 +1076,103 @@ async function scanTarget(client, schema, pageSize) {
   return Object.freeze({ tables: Object.freeze(tables), sha256: manifestDigest(tables) });
 }
 
+function compareSourceOrder(spec, left, right) {
+  const columns = spec.name === "analytics_source_cursors" ? ["source_id"] : ["source_id", "owner_digest"];
+  for (const column of columns) {
+    if (left[column] < right[column]) return -1;
+    if (left[column] > right[column]) return 1;
+  }
+  return 0;
+}
+
+async function assertTargetStateIsSourceSubset(client, schema, source, spec, pageSize) {
+  let targetAfter = null;
+  let sourceAfter = null;
+  let sourceRows = [];
+  let sourceIndex = 0;
+  const nextSourceRow = async () => {
+    if (sourceIndex >= sourceRows.length) {
+      const page = await source.listPage({ table: spec.name, after: sourceAfter, limit: pageSize });
+      if (!page || !Array.isArray(page.rows) || page.rows.length > pageSize) {
+        fail("ANALYTICS_HISTORY_SOURCE_PAGE_INVALID");
+      }
+      sourceRows = page.rows;
+      sourceIndex = 0;
+    }
+    const row = sourceRows[sourceIndex++];
+    if (row) {
+      if (!cursorIsAfter(spec, row, sourceAfter)) fail("ANALYTICS_HISTORY_SOURCE_ORDER_INVALID");
+      sourceAfter = cursorFor(spec, row);
+    }
+    return row ?? null;
+  };
+  for (;;) {
+    const { sql, values } = targetPageSql(schema, spec, targetAfter, pageSize);
+    const result = await client.query(sql, values);
+    if (result.rows.length > pageSize) fail("ANALYTICS_HISTORY_DESTINATION_PAGE_INVALID");
+    const targetRows = result.rows.map(row => normalizeTargetRow(spec, row));
+    for (const targetRow of targetRows) {
+      if (!cursorIsAfter(spec, targetRow, targetAfter)) fail("ANALYTICS_HISTORY_DESTINATION_ORDER_INVALID");
+      let sourceRow = await nextSourceRow();
+      while (sourceRow && compareSourceOrder(spec, sourceRow, targetRow) < 0) sourceRow = await nextSourceRow();
+      if (!sourceRow || compareSourceOrder(spec, sourceRow, targetRow) !== 0 || !sameRow(spec, sourceRow, targetRow)) {
+        fail("ANALYTICS_HISTORY_DESTINATION_ROW_MISMATCH");
+      }
+      targetAfter = cursorFor(spec, targetRow);
+    }
+    if (targetRows.length < pageSize) break;
+  }
+}
+
 function sameManifest(source, target) {
   return SPECS.every(spec => source.tables[spec.name].rowCount === target.tables[spec.name].rowCount
     && source.tables[spec.name].sha256 === target.tables[spec.name].sha256);
 }
 
 /**
- * Stage only the D1 owner-state and source-cursor rows that already have exact
- * PostgreSQL counterparts. The target must remain contained and have no
- * analytics events, work, results, or publications. Inserts are exact and
- * idempotent; a restart replays prior pages and verifies conflicts. This does
- * not transfer the applied-event journal or any public publication, and it
- * does not qualify continuity, a reader, publication, or cutover.
+ * Stage D1 owner-state and source-cursor rows with exact PostgreSQL counterparts.
+ * By default, the contained target must have no analytics events, work, results,
+ * or publications. The explicit appliedEventTransfer option permits the sealed
+ * bootstrap to verify exact journal and event receipts first. Inserts are exact
+ * and idempotent; restart replays prior pages and verifies conflicts. This never
+ * transfers result/work/publication history or qualifies continuity, readers,
+ * publication, or cutover.
  */
 export async function transferPostgresAnalyticsHistoryState({
   source,
   destinationPool,
   targetSchema: rawTargetSchema,
   pageSize = POSTGRES_ANALYTICS_HISTORY_DEFAULT_PAGE_SIZE,
+  appliedEventTransfer: rawAppliedEventTransfer,
 } = {}) {
+  const appliedEventTransfer = validateAppliedEventTransfer(rawAppliedEventTransfer);
   const schema = typeof rawTargetSchema === "string" ? rawTargetSchema : "";
-  const suffix = schema.startsWith(POSTGRES_ANALYTICS_HISTORY_TARGET_SCHEMA_PREFIX)
-    ? schema.slice(POSTGRES_ANALYTICS_HISTORY_TARGET_SCHEMA_PREFIX.length) : "";
+  const prefix = appliedEventTransfer
+    ? POSTGRES_ANALYTICS_HISTORY_BOOTSTRAP_TARGET_SCHEMA_PREFIX
+    : POSTGRES_ANALYTICS_HISTORY_TARGET_SCHEMA_PREFIX;
+  const suffix = schema.startsWith(prefix) ? schema.slice(prefix.length) : "";
   if (!SCHEMA.test(schema) || !TARGET_SUFFIX.test(suffix)) fail("ANALYTICS_HISTORY_TARGET_SCHEMA_REQUIRED");
   const size = validatePageSize(pageSize);
   const snapshot = assertSource(source);
   if (!destinationPool || typeof destinationPool.connect !== "function") fail("ANALYTICS_HISTORY_DESTINATION_REQUIRED");
   await source.verifySnapshot();
   const client = await destinationPool.connect();
-  let lockHeld = false;
+  const heldLocks = [];
   try {
     const postgresVersion = await validateTarget(client, schema);
-    await acquireTargetLock(client, schema);
-    lockHeld = true;
+    if (appliedEventTransfer) await acquireBootstrapLocks(client, schema, heldLocks);
+    else {
+      await acquireTargetLock(client, schema);
+      heldLocks.push(`${schema}:analytics-history-state-transfer`);
+    }
     await assertContained(client, schema);
-    await assertNoTargetOperations(client, schema);
+    let appliedEventReceipt = null;
+    if (appliedEventTransfer) {
+      appliedEventReceipt = await verifyAppliedEventBootstrap({ client, schema, source,
+        appliedEventTransfer, pageSize: size });
+      for (const spec of SPECS) await assertTargetStateIsSourceSubset(client, schema, source, spec, size);
+    }
+    await assertNoTargetOperations(client, schema, { allowAppliedEventLane: Boolean(appliedEventTransfer) });
     const sourceManifest = await scanSource(source, size);
     let pagesCommitted = 0;
     let rowsInserted = 0n;
@@ -800,7 +1187,11 @@ export async function transferPostgresAnalyticsHistoryState({
     const finalSourceManifest = await scanSource(source, size);
     if (finalSourceManifest.sha256 !== sourceManifest.sha256) fail("ANALYTICS_HISTORY_SOURCE_CHANGED");
     await assertContained(client, schema);
-    await assertNoTargetOperations(client, schema);
+    if (appliedEventTransfer) {
+      appliedEventReceipt = await verifyAppliedEventBootstrap({ client, schema, source,
+        appliedEventTransfer, pageSize: size });
+    }
+    await assertNoTargetOperations(client, schema, { allowAppliedEventLane: Boolean(appliedEventTransfer) });
     const targetManifest = await scanTarget(client, schema, size);
     if (!sameManifest(sourceManifest, targetManifest)) fail("ANALYTICS_HISTORY_SOURCE_DESTINATION_PARITY_FAILED");
     return Object.freeze({
@@ -822,9 +1213,10 @@ export async function transferPostgresAnalyticsHistoryState({
       rowsInserted: rowsInserted.toString(),
       resumed,
       restartMode: "replay_pages_and_verify_existing_rows",
+      appliedEventReceipt,
       fullAnalyticsTransfer: false,
       limitations: Object.freeze({
-        appliedEventJournalTransferred: false,
+        appliedEventJournalTransferred: Boolean(appliedEventTransfer),
         historicalPublicationRowsTransferred: false,
         sourceNamespaceRegistryTransferred: false,
         analyticsContinuityQualified: false,
@@ -834,10 +1226,109 @@ export async function transferPostgresAnalyticsHistoryState({
       }),
     });
   } finally {
-    if (lockHeld) await client.query("SELECT pg_advisory_unlock(hashtextextended($1,0))",
-      [`${schema}:analytics-history-state-transfer`]).catch(() => {});
+    await releaseTargetLocks(client, heldLocks);
     client.release();
   }
+}
+
+/**
+ * Rehearse the sealed analytics bootstrap in one contained PostgreSQL schema:
+ * ingestion journal, exact applied-event tuples, then exact owner/cursor state.
+ * Completed event stages are verified from their source pins and target rows;
+ * if state pages already exist, their exact source-subset proof resumes them
+ * without replaying an event importer that correctly refuses downstream state.
+ * This remains a partial, non-publishing rehearsal, not analytics cutover.
+ */
+export async function transferPostgresAnalyticsHistoryBootstrap({
+  source,
+  journalSource,
+  destinationPool,
+  targetSchema: rawTargetSchema,
+  transferId,
+  journalTransferId,
+  pageSize = POSTGRES_ANALYTICS_HISTORY_DEFAULT_PAGE_SIZE,
+} = {}) {
+  const schema = typeof rawTargetSchema === "string" ? rawTargetSchema : "";
+  const suffix = schema.startsWith(POSTGRES_ANALYTICS_HISTORY_BOOTSTRAP_TARGET_SCHEMA_PREFIX)
+    ? schema.slice(POSTGRES_ANALYTICS_HISTORY_BOOTSTRAP_TARGET_SCHEMA_PREFIX.length) : "";
+  if (!SCHEMA.test(schema) || !TARGET_SUFFIX.test(suffix)) fail("ANALYTICS_HISTORY_TARGET_SCHEMA_REQUIRED");
+  const size = validatePageSize(pageSize);
+  const appliedEventTransfer = validateAppliedEventTransfer({ transferId, journalTransferId, journalSource });
+  if (!destinationPool || typeof destinationPool.connect !== "function") fail("ANALYTICS_HISTORY_DESTINATION_REQUIRED");
+  const manifests = await scanBootstrapSources({ source, journalSource, pageSize: size });
+  let client;
+  try { client = await destinationPool.connect(); }
+  catch { fail("ANALYTICS_HISTORY_DESTINATION_REQUIRED"); }
+  let stateRows = "0";
+  let appliedEventRows = "0";
+  try {
+    await validateTarget(client, schema);
+    await assertContained(client, schema);
+    await assertNoTargetOperations(client, schema, { allowAppliedEventLane: true });
+    const counts = await client.query(`SELECT
+        (SELECT count(*)::text FROM ${relation(schema, "analytics_owner_state")}) AS owners,
+        (SELECT count(*)::text FROM ${relation(schema, "analytics_source_cursors")}) AS cursors,
+        (SELECT count(*)::text FROM ${relation(schema, "analytics_applied_events")}) AS applied_events`);
+    const row = counts.rows[0];
+    if (!row || !/^\d+$/u.test(row.owners ?? "") || !/^\d+$/u.test(row.cursors ?? "")
+        || !/^\d+$/u.test(row.applied_events ?? "")) fail("ANALYTICS_HISTORY_TARGET_READ_FAILED");
+    stateRows = (BigInt(row.owners) + BigInt(row.cursors)).toString();
+    appliedEventRows = row.applied_events;
+  } catch (error) {
+    client.release();
+    if (error instanceof PostgresAnalyticsHistoryTransferError) throw error;
+    fail("ANALYTICS_HISTORY_TARGET_READ_FAILED");
+  }
+  client.release();
+
+  let journalTransfer = null;
+  let appliedTransfer = null;
+  if (stateRows === "0") {
+    const { transferPostgresIngestionJournal } = await import("./postgres-ingestion-journal-transfer.mjs");
+    const { transferPostgresAnalyticsAppliedMain } = await import("./postgres-analytics-applied-main-transfer.mjs");
+    if (appliedEventRows === "0") {
+      journalTransfer = await transferPostgresIngestionJournal({ source: journalSource, destinationPool,
+        targetSchema: schema, transferId: journalTransferId, pageSize: size });
+    }
+    appliedTransfer = await transferPostgresAnalyticsAppliedMain({ source, destinationPool, targetSchema: schema,
+      transferId, journalTransferId, pageSize: size });
+  }
+  const state = await transferPostgresAnalyticsHistoryState({ source, destinationPool, targetSchema: schema,
+    pageSize: size, appliedEventTransfer });
+  const receipt = state.appliedEventReceipt;
+  if (!receipt || receipt.sourceSnapshotSha256 !== manifests.identity.snapshotSha256
+      || receipt.sourceNamespaceSha256 !== manifests.identity.namespaceSha256
+      || receipt.eventRows !== manifests.events.eventRows || receipt.eventRowsSha256 !== manifests.events.eventRowsSha256
+      || receipt.journalSnapshotSha256 !== manifests.journal.sourceSnapshotSha256
+      || receipt.journalRows !== manifests.journal.eventRows
+      || receipt.journalRowsSha256 !== manifests.journal.eventRowsSha256) {
+    fail("ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+  }
+  return Object.freeze({
+    schema: "sealed-analytics-owner-state-and-applied-events-bootstrap-v1",
+    status: "partial_analytics_bootstrap_complete",
+    targetSchema: schema,
+    sourceSnapshotSha256: receipt.sourceSnapshotSha256,
+    sourceNamespaceSha256: receipt.sourceNamespaceSha256,
+    journalSnapshotSha256: receipt.journalSnapshotSha256,
+    eventRows: receipt.eventRows,
+    eventRowsSha256: receipt.eventRowsSha256,
+    journalRows: receipt.journalRows,
+    journalRowsSha256: receipt.journalRowsSha256,
+    tables: state.tables,
+    pageSize: size,
+    pagesCommitted: state.pagesCommitted,
+    rowsInserted: state.rowsInserted,
+    resumed: state.resumed || stateRows !== "0" || Boolean(journalTransfer?.resumed) || Boolean(appliedTransfer?.resumed),
+    journalStage: journalTransfer?.status ?? (stateRows !== "0" ? "verified_existing" : "already_present"),
+    appliedEventStage: appliedTransfer?.status ?? (stateRows !== "0" ? "verified_existing" : "already_present"),
+    fullAnalyticsTransfer: false,
+    analyticsContinuityQualified: false,
+    readerEnabled: false,
+    publicationEnabled: false,
+    productionCutoverAuthorized: false,
+    limitations: state.limitations,
+  });
 }
 
 export const POSTGRES_ANALYTICS_HISTORY_SOURCE_COLUMNS = Object.freeze(

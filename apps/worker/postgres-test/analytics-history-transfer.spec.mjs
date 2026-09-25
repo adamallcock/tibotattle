@@ -6,8 +6,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import pg from "pg";
+import { createSealedSqliteIngestionJournalSource } from "../scripts/postgres-ingestion-journal-transfer.mjs";
 import {
   createSealedSqliteAnalyticsHistorySource,
+  transferPostgresAnalyticsHistoryBootstrap,
   transferPostgresAnalyticsHistoryState,
 } from "../scripts/postgres-analytics-history-transfer.mjs";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
@@ -22,7 +24,7 @@ function eventDigest(sequence, suffix) {
   return BigInt(sequence * 10 + suffix).toString(16).padStart(64, "0");
 }
 
-async function makeSealedSource() {
+async function makeSealedSource({ namespace = "synthetic-analytics-namespace", journalContentOverride = null } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "tibotattle-analytics-history-pg17-"));
   const path = join(await realpath(directory), "analytics-source.sqlite");
   const database = new DatabaseSync(path);
@@ -50,7 +52,7 @@ async function makeSealedSource() {
         owner_digest TEXT NOT NULL,revision INTEGER NOT NULL,kind TEXT NOT NULL,object_digest TEXT NOT NULL,
         content_digest TEXT NOT NULL,authority_epoch INTEGER NOT NULL,public_authority_epoch INTEGER NOT NULL,
         recorded_ms INTEGER NOT NULL,PRIMARY KEY(source_id,sequence),UNIQUE(source_id,event_digest));`);
-    database.prepare("INSERT INTO analytics_runtime_sources VALUES(?,?,1)").run(sourceId, "synthetic-analytics-namespace");
+    database.prepare("INSERT INTO analytics_runtime_sources VALUES(?,?,1)").run(sourceId, namespace);
     database.prepare("INSERT INTO analytics_source_cursors VALUES(?,?,?)").run(sourceId, 6n, 5n);
     const insertOwner = database.prepare("INSERT INTO analytics_owner_state VALUES(?,?,?,?,?)");
     for (const owner of owners) {
@@ -69,7 +71,43 @@ async function makeSealedSource() {
   await chmod(path, 0o400);
   const expectedSha256 = createHash("sha256").update(await readFile(path)).digest("hex");
   const source = await createSealedSqliteAnalyticsHistorySource({ path: await realpath(path), expectedSha256 });
-  return { directory, source };
+
+  const journalPath = join(await realpath(directory), "ingestion-journal.sqlite");
+  const journalDatabase = new DatabaseSync(journalPath);
+  try {
+    journalDatabase.exec(`
+      CREATE TABLE storage_source_state(
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1),source_id TEXT NOT NULL UNIQUE,
+        authority_epoch INTEGER NOT NULL DEFAULT 0 CHECK(authority_epoch>=0)
+      ) STRICT;
+      CREATE TABLE storage_ingestion_changes(
+        sequence INTEGER PRIMARY KEY,event_digest TEXT NOT NULL UNIQUE,owner_digest TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK(revision>0),
+        kind TEXT NOT NULL CHECK(kind IN('source-updated','owner-active','owner-withdrawn','owner-erased')),
+        object_digest TEXT NOT NULL,content_digest TEXT NOT NULL CHECK(length(content_digest)=64),
+        authority_epoch INTEGER NOT NULL CHECK(authority_epoch>0),
+        public_authority_epoch INTEGER NOT NULL CHECK(public_authority_epoch>0),
+        recorded_ms INTEGER NOT NULL CHECK(recorded_ms>=0),UNIQUE(owner_digest,revision)
+      ) STRICT;
+      CREATE INDEX storage_ingestion_owner_cursor ON storage_ingestion_changes(owner_digest,sequence);
+    `);
+    journalDatabase.prepare("INSERT INTO storage_source_state(singleton,source_id,authority_epoch) VALUES(1,?,5)")
+      .run(sourceId);
+    const insert = journalDatabase.prepare(`INSERT INTO storage_ingestion_changes(
+      sequence,event_digest,owner_digest,revision,kind,object_digest,content_digest,
+      authority_epoch,public_authority_epoch,recorded_ms) VALUES(?,?,?,?,?,?,?,?,?,?)`);
+    events.forEach(([owner, kind, revision, authorityEpoch, publicAuthorityEpoch], index) => {
+      const sequence = index + 1;
+      insert.run(sequence, eventDigest(sequence, 1), owner.digest, revision, kind, eventDigest(sequence, 2),
+        journalContentOverride === sequence ? eventDigest(sequence, 9) : eventDigest(sequence, 3),
+        authorityEpoch, publicAuthorityEpoch, 1_790_000_000_000 + sequence);
+    });
+  } finally { journalDatabase.close(); }
+  await chmod(journalPath, 0o400);
+  const expectedJournalSha256 = createHash("sha256").update(await readFile(journalPath)).digest("hex");
+  const journalSource = await createSealedSqliteIngestionJournalSource({ path: await realpath(journalPath),
+    expectedSha256: expectedJournalSha256, expectedSourceId: sourceId });
+  return { directory, source, journalSource };
 }
 
 async function localSocket() {
@@ -176,8 +214,131 @@ test("PG17 stages only exact analytics state/cursors behind contained controls",
     error => error?.code === "ANALYTICS_HISTORY_DESTINATION_ROW_MISMATCH");
   } finally {
     fixture?.source.close();
+    fixture?.journalSource.close();
     if (fixture) await rm(fixture.directory, { recursive: true, force: true });
     if (schemaCreated) await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});
     await pool.end();
   }
 });
+
+test("PG17 combined sealed analytics bootstrap resumes both event and owner-state pages with exact pins", {
+  skip: !PG_TEST_SOCKET,
+}, async () => {
+  const socket = await localSocket();
+  const pool = new pg.Pool({ ...socket, user: PG_TEST_USER, password: PG_TEST_PASSWORD,
+    database: PG_TEST_DATABASE, ssl: false, max: 3, connectionTimeoutMillis: 5_000,
+    application_name: "pg-analytics-history-bootstrap-test" });
+  const schema = `storage_journal_transfer_target_${randomBytes(6).toString("hex")}`;
+  const quoted = `"${schema}"`;
+  const table = name => `${quoted}."${name}"`;
+  let fixture;
+  let schemaCreated = false;
+  try {
+    const locality = await pool.query("SELECT inet_server_addr() AS address,current_setting('server_version_num') AS version");
+    assert.equal(locality.rows[0]?.address, null, "test database must use the local Unix socket");
+    assert.match(locality.rows[0]?.version ?? "", /^17\d+$/u, "test must run on PostgreSQL 17");
+    await pool.query(`CREATE SCHEMA ${quoted}`);
+    schemaCreated = true;
+    const migration = await applyPostgresMigrations({ role: "primary", schema, pool });
+    assert.equal(migration.applied, migration.migrations.length);
+    fixture = await makeSealedSource();
+    const bootstrap = () => transferPostgresAnalyticsHistoryBootstrap({ source: fixture.source,
+      journalSource: fixture.journalSource, destinationPool: pool, targetSchema: schema,
+      transferId: "synthetic-analytics-applied-main-history-bootstrap",
+      journalTransferId: "synthetic-ingestion-journal-history-bootstrap", pageSize: 1 });
+
+    await pool.query(`ALTER TABLE ${table("analytics_applied_events")}
+      ADD CONSTRAINT synthetic_bootstrap_event_interrupt CHECK(sequence < 3)`);
+    await assert.rejects(bootstrap(), error => error?.code === "ANALYTICS_APPLIED_MAIN_PAGE_COMMIT_FAILED");
+    const interruptedEvents = await pool.query(`SELECT
+      (SELECT count(*)::int FROM ${table("storage_ingestion_changes")}) AS journal_rows,
+      (SELECT count(*)::int FROM ${table("analytics_applied_events")}) AS event_rows,
+      (SELECT count(*)::int FROM ${table("analytics_owner_state")}) AS owner_rows,
+      (SELECT count(*)::int FROM ${table("analytics_source_cursors")}) AS cursor_rows`);
+    assert.deepEqual(interruptedEvents.rows[0], { journal_rows: 6, event_rows: 2, owner_rows: 0, cursor_rows: 0 });
+
+    await pool.query(`ALTER TABLE ${table("analytics_applied_events")}
+      DROP CONSTRAINT synthetic_bootstrap_event_interrupt`);
+    await pool.query(`ALTER TABLE ${table("analytics_owner_state")}
+      ADD CONSTRAINT synthetic_bootstrap_owner_interrupt CHECK(owner_digest <> '${"c".repeat(64)}')`);
+    await assert.rejects(bootstrap(), error => error?.code === "ANALYTICS_HISTORY_PAGE_COMMIT_FAILED");
+    const interruptedOwners = await pool.query(`SELECT
+      (SELECT count(*)::int FROM ${table("storage_ingestion_changes")}) AS journal_rows,
+      (SELECT count(*)::int FROM ${table("analytics_applied_events")}) AS event_rows,
+      (SELECT count(*)::int FROM ${table("analytics_owner_state")}) AS owner_rows,
+      (SELECT count(*)::int FROM ${table("analytics_source_cursors")}) AS cursor_rows,
+      (SELECT status FROM ${table("_synthetic_analytics_applied_main_transfer_runs_v1")}
+        WHERE transfer_id='synthetic-analytics-applied-main-history-bootstrap') AS applied_status`);
+    assert.deepEqual(interruptedOwners.rows[0], {
+      journal_rows: 6, event_rows: 6, owner_rows: 2, cursor_rows: 0, applied_status: "complete",
+    });
+
+    await pool.query(`ALTER TABLE ${table("analytics_owner_state")}
+      DROP CONSTRAINT synthetic_bootstrap_owner_interrupt`);
+    const result = await bootstrap();
+    assert.equal(result.schema, "sealed-analytics-owner-state-and-applied-events-bootstrap-v1");
+    assert.equal(result.status, "partial_analytics_bootstrap_complete");
+    assert.equal(result.eventRows, "6");
+    assert.equal(result.journalRows, "6");
+    assert.equal(result.eventRowsSha256, result.journalRowsSha256);
+    assert.equal(result.sourceNamespaceSha256.length, 64);
+    assert.equal(result.resumed, true);
+    assert.equal(result.fullAnalyticsTransfer, false);
+    assert.equal(result.analyticsContinuityQualified, false);
+    assert.equal(result.readerEnabled, false);
+    assert.equal(result.publicationEnabled, false);
+    assert.equal(result.productionCutoverAuthorized, false);
+    assert.equal(result.limitations.appliedEventJournalTransferred, true);
+    assert.equal(result.tables.analytics_owner_state.sourceRows, "3");
+    assert.equal(result.tables.analytics_source_cursors.sourceRows, "1");
+
+    const replay = await bootstrap();
+    assert.equal(replay.status, "partial_analytics_bootstrap_complete");
+    assert.equal(replay.rowsInserted, "0");
+    assert.equal(replay.eventRowsSha256, result.eventRowsSha256);
+    assert.equal(replay.tables.analytics_owner_state.targetSha256,
+      replay.tables.analytics_owner_state.sourceSha256);
+
+    const mismatchedJournal = await makeSealedSource({ journalContentOverride: 3 });
+    try {
+      await assert.rejects(transferPostgresAnalyticsHistoryBootstrap({ source: fixture.source,
+        journalSource: mismatchedJournal.journalSource, destinationPool: pool, targetSchema: schema,
+        transferId: "synthetic-analytics-applied-main-history-bootstrap",
+        journalTransferId: "synthetic-ingestion-journal-history-bootstrap", pageSize: 1 }),
+      error => error?.code === "ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+    } finally {
+      mismatchedJournal.source.close();
+      mismatchedJournal.journalSource.close();
+      await rm(mismatchedJournal.directory, { recursive: true, force: true });
+    }
+
+    const changedNamespace = await makeSealedSource({ namespace: "synthetic-analytics-namespace-changed" });
+    try {
+      await assert.rejects(transferPostgresAnalyticsHistoryBootstrap({ source: changedNamespace.source,
+        journalSource: fixture.journalSource, destinationPool: pool, targetSchema: schema,
+        transferId: "synthetic-analytics-applied-main-history-bootstrap",
+        journalTransferId: "synthetic-ingestion-journal-history-bootstrap", pageSize: 1 }),
+      error => error?.code === "ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED");
+    } finally {
+      changedNamespace.source.close();
+      changedNamespace.journalSource.close();
+      await rm(changedNamespace.directory, { recursive: true, force: true });
+    }
+
+    await pool.query(`UPDATE ${table("analytics_owner_state")} SET revision=3 WHERE owner_digest=$1`, ["a".repeat(64)]);
+    await assert.rejects(bootstrap(), error => error?.code === "ANALYTICS_HISTORY_DESTINATION_ROW_MISMATCH");
+    const counts = await pool.query(`SELECT
+      (SELECT count(*)::int FROM ${table("storage_ingestion_changes")}) AS journal_rows,
+      (SELECT count(*)::int FROM ${table("analytics_applied_events")}) AS event_rows,
+      (SELECT count(*)::int FROM ${table("analytics_owner_state")}) AS owner_rows,
+      (SELECT count(*)::int FROM ${table("analytics_source_cursors")}) AS cursor_rows`);
+    assert.deepEqual(counts.rows[0], { journal_rows: 6, event_rows: 6, owner_rows: 3, cursor_rows: 1 },
+      "a foreign state row must be rejected before further writes");
+  } finally {
+    fixture?.source.close();
+    fixture?.journalSource.close();
+    if (fixture) await rm(fixture.directory, { recursive: true, force: true });
+    if (schemaCreated) await pool.query(`DROP SCHEMA IF EXISTS ${quoted} CASCADE`).catch(() => {});
+    await pool.end();
+  }
+}, 120_000);

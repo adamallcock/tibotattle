@@ -9,6 +9,7 @@ import {
   createSealedSqliteAnalyticsHistorySource,
   POSTGRES_ANALYTICS_HISTORY_SOURCE_COLUMNS,
   scanSealedSqliteAnalyticsEventJournal,
+  transferPostgresAnalyticsHistoryBootstrap,
   transferPostgresAnalyticsHistoryState,
 } from "./postgres-analytics-history-transfer.mjs";
 
@@ -263,4 +264,19 @@ test("analytics transfer refuses unsealed sources, oversized pages, and invalid 
   await assert.rejects(transferPostgresAnalyticsHistoryState({
     source: {}, destinationPool: {}, targetSchema: "public",
   }), { code: "ANALYTICS_HISTORY_TARGET_SCHEMA_REQUIRED" });
+});
+
+test("combined bootstrap is an explicit sealed-event opt-in behind the storage rehearsal schema", async () => {
+  await assert.rejects(transferPostgresAnalyticsHistoryState({
+    targetSchema: "storage_journal_transfer_target_synthetic",
+  }), { code: "ANALYTICS_HISTORY_TARGET_SCHEMA_REQUIRED" });
+  await assert.rejects(transferPostgresAnalyticsHistoryState({
+    targetSchema: "analytics_history_transfer_target_synthetic",
+    appliedEventTransfer: { transferId: "bad", journalTransferId: "bad", journalSource: {} },
+  }), { code: "ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED" });
+  await assert.rejects(transferPostgresAnalyticsHistoryBootstrap({
+    targetSchema: "storage_journal_transfer_target_synthetic",
+    transferId: "unscoped",
+    journalTransferId: "unscoped",
+  }), { code: "ANALYTICS_HISTORY_APPLIED_EVENT_TRANSFER_NOT_QUALIFIED" });
 });
