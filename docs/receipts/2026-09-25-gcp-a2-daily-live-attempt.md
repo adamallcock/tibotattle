@@ -48,6 +48,13 @@ point-in-time record, not cutover or publication qualification.
   enrollment off, upload registration on, processing on, publication off, and
   reason `synthetic_v12_test_upload_only`.
 
+After these attempts, corrected-image daily preflight execution `kpdcr` exited
+2 with the expected blockers `SOURCE_STATE_UNAVAILABLE`,
+`V1_ADMISSION_UNAVAILABLE`, `V11_ADMISSION_UNAVAILABLE`, and
+`PUBLICATION_CONTROLS_DISABLED`. Its readback found no selected-day v1 or v1.1
+records and publication disabled. This was read-only confirmation of the
+fail-closed state; it made no fixture or publication writes.
+
 ## Result and authorization boundary
 
 No synthetic source, owner, device, usage event, or daily aggregate was
