@@ -4,9 +4,9 @@
  * Build the audited Cloud Run host context. The host is a Node composition
  * root around the existing Worker handlers; it must never be built from the
  * dirty repository root. Only the host, Worker source, canonical migrations,
- * migration runner, the read-only ledger diagnostic, the guarded test-only
- * ledger reconciler, and the three reviewed workspace packages enter this
- * context.
+ * migration runner, the private daily publication test Job, the read-only
+ * ledger diagnostic, the guarded test-only ledger reconciler, and the three
+ * reviewed workspace packages enter this context.
  */
 
 import { createHash } from "node:crypto";
@@ -86,6 +86,8 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/ledger-preflight-reconcile.check.mjs", destination: "apps/worker/cloud-run/ledger-preflight-reconcile.check.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-graph-benchmark.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-benchmark.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-graph-benchmark.check.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-benchmark.check.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-community-daily-publish-test.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-publish-test.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-community-daily-publish-test.check.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-publish-test.check.mjs" }),
   Object.freeze({ source: "cloud-run/node-crypto-adapter.mjs", destination: "apps/worker/cloud-run/node-crypto-adapter.mjs" }),
   Object.freeze({ source: "cloud-run/owner-bootstrap.mjs", destination: "apps/worker/cloud-run/owner-bootstrap.mjs" }),
   Object.freeze({ source: "cloud-run/request-boundary.mjs", destination: "apps/worker/cloud-run/request-boundary.mjs" }),

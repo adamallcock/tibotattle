@@ -5,6 +5,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { createPostgresWorkerBackend } from "../src/backend-composition.ts";
+import { readPostgresPublishedCommunityDaily } from "../src/postgres-community-daily.ts";
 import {
   handleRequest,
   isPostgresWorkerRequestPathSupported,
@@ -86,6 +87,7 @@ import {
 import { installNodeTimingSafeEqual } from "./node-crypto-adapter.mjs";
 import {
   CLOUD_RUN_IAM_TEST_TARGET,
+  createPostgresTestCommunityDailyDispatch,
   createPostgresTestV12DayManifestDispatch,
   createPostgresTestHealthDispatch,
   dispatchCloudRunHostRequest,
@@ -485,6 +487,14 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
         privateOrigin: hostOrigin,
       });
+      const communityDailyDispatch = createPostgresTestCommunityDailyDispatch({
+        primaryPool,
+        schemaOptions,
+        sourceIdentity: backend.sourceIdentity,
+        readPostgresPublishedCommunityDaily,
+        healthDispatch,
+        privateOrigin: hostOrigin,
+      });
       return {
         pools,
         connector,
@@ -497,7 +507,13 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         listenHost: privateHost.listenHost,
         listenPort: privateHost.port,
         postgresTestHostMode: privateHost.mode,
-        postgresTestDispatch: createPostgresTestV12DayManifestDispatch({
+        postgresTestDispatch: ((v12Dispatch) => async (request) => {
+          let pathname;
+          try { pathname = new URL(request.url).pathname; } catch { /* V12 dispatch returns a safe 503. */ }
+          return pathname === "/api/v1/community/daily"
+            ? communityDailyDispatch(request)
+            : v12Dispatch(request);
+        })(createPostgresTestV12DayManifestDispatch({
           primaryPool,
           ledgerPool,
           schemaOptions,
@@ -558,7 +574,7 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           envelopePrivateJwk,
           readBoundedRequestBody,
           maxRequestBytes: MAX_REQUEST_BYTES,
-        }),
+        })),
       };
     }
     const ingressBudget = createPostgresUploadIngressBudget(primaryPool, schemaOptions);

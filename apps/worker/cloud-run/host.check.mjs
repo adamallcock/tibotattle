@@ -22,6 +22,7 @@ import { createServer } from "vite";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import {
   CLOUD_RUN_IAM_TEST_TARGET,
+  createPostgresTestCommunityDailyDispatch,
   createPostgresTestV12DayManifestDispatch,
   createPostgresTestHealthDispatch,
   dispatchCloudRunHostRequest,
@@ -386,6 +387,132 @@ test("partial HTTP dispatch serves only current read-only health and never calls
   assert.equal(connections, 2);
   assert.equal(workerHandlerCalls, 0);
   assert.equal(d1Touched, 0);
+});
+
+test("private community daily dispatch validates ranges and exposes only the fenced activity projection", async () => {
+  let reads = 0;
+  let healthChecks = 0;
+  let d1Touched = 0;
+  let workerCalls = 0;
+  const primaryPool = { async connect() { throw new Error("the public reader facade owns PG access"); } };
+  const dailyRead = async (pool, options) => {
+    reads += 1;
+    assert.equal(pool, primaryPool);
+    assert.deepEqual(options, {
+      sourceId: "synthetic-source",
+      sourceNamespace: "synthetic-namespace",
+      fromDay: "2026-09-24",
+      throughDay: "2026-09-24",
+      schema: { primarySchema: "daily_test" },
+    });
+    return {
+      allowanceReadState: "confirmed",
+      rows: [{
+        day: "2026-09-24",
+        revision: 4,
+        released_at: "2026-09-25T12:00:00.000Z",
+        payload_json: JSON.stringify({
+          schemaVersion: "community-daily-aggregate-v1.0",
+          day: "2026-09-24",
+          revision: 4,
+          totals: { usageEvents: 2 },
+          allowance: { private: "must-not-cross" },
+          capacityByPlanType: { private: "must-not-cross" },
+        }),
+      }],
+    };
+  };
+  const healthDispatch = async (request) => {
+    healthChecks += 1;
+    assert.equal(request.url, "http://127.0.0.1:8080/api/health");
+    return new Response(JSON.stringify({ status: "ready" }), { status: 200 });
+  };
+  const dailyDispatch = createPostgresTestCommunityDailyDispatch({
+    primaryPool,
+    schemaOptions: { primarySchema: "daily_test", ledgerSchema: "daily_ledger_test" },
+    sourceIdentity: { sourceId: "synthetic-source", sourceNamespace: "synthetic-namespace" },
+    readPostgresPublishedCommunityDaily: dailyRead,
+    healthDispatch,
+    privateOrigin: "http://127.0.0.1:8080",
+  });
+  const runtime = {
+    postgresTestDispatch: dailyDispatch,
+    get env() { d1Touched += 1; throw new Error("D1 must remain unreachable"); },
+  };
+  const workerHandler = async () => { workerCalls += 1; throw new Error("Worker must not be called"); };
+
+  for (const url of [
+    "http://other-host:8080/api/v1/community/daily?from=2026-09-24&to=2026-09-24",
+    "http://127.0.0.1:8080/api/v1/community/daily?from=2026-09-24&to=2026-09-24&extra=1",
+    "http://127.0.0.1:8080/api/v1/community/daily?from=2026-09-24&from=2026-09-24&to=2026-09-24",
+    "http://127.0.0.1:8080/api/v1/community/daily?from=2026-09-24&to=2027-09-25",
+  ]) {
+    const response = await dispatchCloudRunHostRequest(new Request(url), runtime, workerHandler);
+    assert.notEqual(response.status, 200);
+  }
+  assert.equal(reads, 0);
+
+  const wrongMethod = await dispatchCloudRunHostRequest(new Request(
+    "http://127.0.0.1:8080/api/v1/community/daily?from=2026-09-24&to=2026-09-24",
+    { method: "POST" },
+  ), runtime, workerHandler);
+  assert.equal(wrongMethod.status, 405);
+  assert.equal(wrongMethod.headers.get("allow"), "GET");
+
+  const response = await dispatchCloudRunHostRequest(new Request(
+    "http://127.0.0.1:8080/api/v1/community/daily?from=2026-09-24&to=2026-09-24",
+  ), runtime, workerHandler);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.deepEqual(body, {
+    schemaVersion: "community-daily-read-v1.0",
+    from: "2026-09-24",
+    to: "2026-09-24",
+    allowanceState: "updating",
+    allowanceReadState: "confirmed",
+    days: [{
+      day: "2026-09-24",
+      revision: 4,
+      releasedAt: "2026-09-25T12:00:00.000Z",
+      payload: {
+        schemaVersion: "community-daily-aggregate-v1.0",
+        day: "2026-09-24",
+        revision: 4,
+        totals: { usageEvents: 2 },
+      },
+    }],
+  });
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.equal(reads, 1);
+  assert.equal(healthChecks, 1);
+  assert.equal(workerCalls, 0);
+  assert.equal(d1Touched, 0);
+});
+
+test("private community daily dispatch withholds unavailable PostgreSQL data and checks migration readiness", async () => {
+  let reads = 0;
+  const makeDispatch = (healthStatus, reader) => createPostgresTestCommunityDailyDispatch({
+    primaryPool: { async connect() { throw new Error("reader facade owns PG access"); } },
+    schemaOptions: { primarySchema: "daily_test", ledgerSchema: "daily_ledger_test" },
+    sourceIdentity: { sourceId: "synthetic-source", sourceNamespace: "synthetic-namespace" },
+    readPostgresPublishedCommunityDaily: reader,
+    healthDispatch: async () => new Response(null, { status: healthStatus }),
+    privateOrigin: "http://127.0.0.1:8080",
+  });
+  const request = new Request(
+    "http://127.0.0.1:8080/api/v1/community/daily?from=2026-09-24&to=2026-09-24",
+  );
+  const stale = await makeDispatch(503, async () => { reads += 1; return { rows: [] }; })(request);
+  assert.equal(stale.status, 503);
+  assert.equal(reads, 0, "daily reader is not reached when migration health is stale");
+
+  const unavailable = await makeDispatch(200, async () => {
+    reads += 1;
+    throw new Error("unavailable");
+  })(request);
+  assert.equal(unavailable.status, 503);
+  assert.equal((await unavailable.json()).error.code, "BACKEND_STORAGE_UNAVAILABLE");
+  assert.equal(reads, 1);
 });
 
 test("private-host envelope-key is public-only and bypasses PostgreSQL and Worker fallback", async () => {

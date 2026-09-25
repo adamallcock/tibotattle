@@ -1,0 +1,185 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  POSTGRES_COMMUNITY_DAILY_TEST_IAM_USER,
+  POSTGRES_COMMUNITY_DAILY_TEST_JOB,
+  POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT,
+  POSTGRES_COMMUNITY_DAILY_TEST_TARGET,
+  parsePostgresCommunityDailyTestConfig,
+  readAttachedPostgresCommunityDailyTestServiceAccount,
+  runPostgresCommunityDailyTest,
+} from "./dist/postgres-community-daily-publish-test.mjs";
+
+const EXECUTION = "tibotattle-community-daily-publish-test-00001-abc";
+const DAY = "2026-09-24";
+
+function validEnv(overrides = {}) {
+  return {
+    CLOUD_RUN_JOB: POSTGRES_COMMUNITY_DAILY_TEST_JOB,
+    CLOUD_RUN_EXECUTION: EXECUTION,
+    CLOUD_RUN_TASK_INDEX: "0",
+    CLOUD_RUN_TASK_COUNT: "1",
+    CLOUD_RUN_TASK_ATTEMPT: "0",
+    GOOGLE_CLOUD_PROJECT: "tibotattle",
+    CLOUD_RUN_TEST_SERVICE: "tibotattle-test-app",
+    HOST_ORIGIN: "https://tibotattle-test-app-5t5mehqi7a-ue.a.run.app",
+    POSTGRES_IAM_USER: POSTGRES_COMMUNITY_DAILY_TEST_IAM_USER,
+    PRIMARY_INSTANCE_CONNECTION_NAME: POSTGRES_COMMUNITY_DAILY_TEST_TARGET.instanceConnectionName,
+    PRIMARY_DATABASE: POSTGRES_COMMUNITY_DAILY_TEST_TARGET.database,
+    PRIMARY_SCHEMA: POSTGRES_COMMUNITY_DAILY_TEST_TARGET.schema,
+    POSTGRES_SOURCE_ID: "synthetic-community-source",
+    POSTGRES_SOURCE_NAMESPACE: "synthetic-community-namespace",
+    COMMUNITY_DAILY_SYNTHETIC_DAY: DAY,
+    ...overrides,
+  };
+}
+
+test("daily publisher Job accepts only its private single-task A2 target and one UTC day", () => {
+  const config = parsePostgresCommunityDailyTestConfig(validEnv(), POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT);
+  assert.deepEqual(config, {
+    job: POSTGRES_COMMUNITY_DAILY_TEST_JOB,
+    project: "tibotattle",
+    execution: EXECUTION,
+    service: "tibotattle-test-app",
+    origin: "https://tibotattle-test-app-5t5mehqi7a-ue.a.run.app",
+    instanceConnectionName: POSTGRES_COMMUNITY_DAILY_TEST_TARGET.instanceConnectionName,
+    database: POSTGRES_COMMUNITY_DAILY_TEST_TARGET.database,
+    schema: POSTGRES_COMMUNITY_DAILY_TEST_TARGET.schema,
+    iamUser: POSTGRES_COMMUNITY_DAILY_TEST_IAM_USER,
+    sourceId: "synthetic-community-source",
+    sourceNamespace: "synthetic-community-namespace",
+    day: DAY,
+  });
+  for (const overrides of [
+    { CLOUD_RUN_JOB: "other-job" },
+    { CLOUD_RUN_TASK_COUNT: "2" },
+    { CLOUD_RUN_TASK_ATTEMPT: "1" },
+    { GOOGLE_CLOUD_PROJECT: "production" },
+    { K_SERVICE: "tibotattle-test-app" },
+    { CLOUD_RUN_TEST_SERVICE: "other-service" },
+    { PRIMARY_SCHEMA: "tibotattle" },
+    { POSTGRES_IAM_USER: "other@tibotattle.iam" },
+    { COMMUNITY_DAILY_SYNTHETIC_DAY: "2026-02-30" },
+    { COMMUNITY_DAILY_SYNTHETIC_DAY: "2026-09-24..2026-09-25" },
+    { POSTGRES_SOURCE_ID: "account@example.com" },
+  ]) {
+    assert.throws(
+      () => parsePostgresCommunityDailyTestConfig(
+        validEnv(overrides), POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT,
+      ),
+    );
+  }
+  assert.throws(() => parsePostgresCommunityDailyTestConfig(
+    validEnv(), "tibotattle-test-migrator@tibotattle.iam.gserviceaccount.com",
+  ), /CLOUD_RUN_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT_INVALID/);
+});
+
+test("metadata identity requires Google's marker and the exact runtime service account", async () => {
+  const email = await readAttachedPostgresCommunityDailyTestServiceAccount({
+    fetchImpl: async (url, options) => {
+      assert.equal(url, "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email");
+      assert.equal(options.headers["Metadata-Flavor"], "Google");
+      return new Response(POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT, {
+        status: 200,
+        headers: { "Metadata-Flavor": "Google" },
+      });
+    },
+  });
+  assert.equal(email, POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT);
+  await assert.rejects(readAttachedPostgresCommunityDailyTestServiceAccount({
+    fetchImpl: async () => new Response(POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT, { status: 200 }),
+  }), /CLOUD_RUN_COMMUNITY_DAILY_TEST_METADATA_UNAVAILABLE/);
+});
+
+test("publisher calls one day, reads back that exact revision, and returns no source identity", async () => {
+  const calls = [];
+  const pool = { async end() {} };
+  const connector = {};
+  const receipt = await runPostgresCommunityDailyTest({
+    env: validEnv(),
+    dependencies: {
+      attachedServiceAccountEmail: POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT,
+      createConnector: () => connector,
+      createIamPool: async (options) => {
+        calls.push(["connect", options]);
+        return pool;
+      },
+      publish: async (actualPool, options) => {
+        calls.push(["publish", actualPool, options]);
+        return { state: "published", day: DAY, revision: 3 };
+      },
+      readPublished: async (actualPool, options) => {
+        calls.push(["read", actualPool, options]);
+        return {
+          rows: [{
+            day: DAY,
+            revision: 3,
+            payload_json: JSON.stringify({ day: DAY, revision: 3, totals: { usageEvents: 0 } }),
+          }],
+        };
+      },
+      closeResources: async (resources) => {
+        assert.deepEqual(resources, { pools: [pool], connector });
+        calls.push(["close"]);
+      },
+    },
+  });
+  assert.deepEqual(receipt, {
+    schemaVersion: "postgres-community-daily-test-v1",
+    status: "ok",
+    job: POSTGRES_COMMUNITY_DAILY_TEST_JOB,
+    project: "tibotattle",
+    execution: EXECUTION,
+    day: DAY,
+    publicationState: "published",
+    revision: 3,
+    readback: "exact_revision_verified",
+  });
+  assert.equal(JSON.stringify(receipt).includes("synthetic-community"), false);
+  assert.equal(calls[0][1].max, 1);
+  assert.deepEqual(calls[1][2], {
+    sourceId: "synthetic-community-source",
+    sourceNamespace: "synthetic-community-namespace",
+    day: DAY,
+    schema: { primarySchema: POSTGRES_COMMUNITY_DAILY_TEST_TARGET.schema },
+  });
+  assert.deepEqual(calls[2][2], {
+    sourceId: "synthetic-community-source",
+    sourceNamespace: "synthetic-community-namespace",
+    fromDay: DAY,
+    throughDay: DAY,
+    schema: { primarySchema: POSTGRES_COMMUNITY_DAILY_TEST_TARGET.schema },
+  });
+  assert.deepEqual(calls.at(-1), ["close"]);
+});
+
+test("publisher fails closed and closes the pool when exact-day readback does not match", async () => {
+  let closeCalls = 0;
+  await assert.rejects(runPostgresCommunityDailyTest({
+    env: validEnv(),
+    dependencies: {
+      attachedServiceAccountEmail: POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT,
+      createConnector: () => ({}),
+      createIamPool: async () => ({}),
+      publish: async () => ({ state: "unchanged", day: DAY, revision: 3 }),
+      readPublished: async () => ({ rows: [] }),
+      closeResources: async () => { closeCalls += 1; },
+    },
+  }), /POSTGRES_COMMUNITY_DAILY_TEST_READBACK_INVALID/);
+  assert.equal(closeCalls, 1);
+});
+
+test("invalid Job targets fail before metadata or database access", async () => {
+  let metadataCalls = 0;
+  let connectionCalls = 0;
+  await assert.rejects(runPostgresCommunityDailyTest({
+    env: validEnv({ GOOGLE_CLOUD_PROJECT: "production" }),
+    dependencies: {
+      readAttachedServiceAccount: async () => { metadataCalls += 1; return POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT; },
+      createIamPool: async () => { connectionCalls += 1; return {}; },
+      closeResources: async () => {},
+    },
+  }), /CLOUD_RUN_COMMUNITY_DAILY_TEST_JOB_CONTEXT_INVALID/);
+  assert.equal(metadataCalls, 0);
+  assert.equal(connectionCalls, 0);
+});

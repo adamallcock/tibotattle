@@ -8,6 +8,8 @@ const DIGEST = /^[0-9a-f]{64}$/u;
 const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
 const POSTGRES_MAJOR_REQUIRED = 17;
 const V12_CHUNK_UPLOAD_PATH = "/api/v1/contributions";
+const COMMUNITY_DAILY_PATH = "/api/v1/community/daily";
+const COMMUNITY_DAILY_MAX_RANGE_DAYS = 366;
 export const CLOUD_RUN_IAM_TEST_TARGET = Object.freeze({
   project: "tibotattle",
   region: "us-east1",
@@ -257,6 +259,141 @@ export function createPostgresTestHealthDispatch({
         },
       },
     });
+  };
+}
+
+function communityDailyQuery(url) {
+  const query = url.searchParams;
+  if ([...query.keys()].some((key) => !["from", "to"].includes(key))
+      || query.getAll("from").length !== 1 || query.getAll("to").length !== 1) {
+    throw Object.assign(new Error("BODY_INVALID"), { code: "BODY_INVALID", status: 400 });
+  }
+  const from = query.get("from");
+  const to = query.get("to");
+  const validDay = (day) => typeof day === "string"
+    && /^\d{4}-\d{2}-\d{2}$/u.test(day)
+    && Number.isFinite(Date.parse(`${day}T00:00:00.000Z`))
+    && new Date(`${day}T00:00:00.000Z`).toISOString().slice(0, 10) === day;
+  if (!validDay(from) || !validDay(to)) {
+    throw Object.assign(new Error("BODY_INVALID"), { code: "BODY_INVALID", status: 400 });
+  }
+  const rangeDays = (Date.parse(`${to}T00:00:00.000Z`)
+    - Date.parse(`${from}T00:00:00.000Z`)) / 86_400_000 + 1;
+  if (rangeDays < 1 || rangeDays > COMMUNITY_DAILY_MAX_RANGE_DAYS) {
+    throw Object.assign(new Error("BODY_INVALID"), { code: "BODY_INVALID", status: 400 });
+  }
+  return Object.freeze({ from, to });
+}
+
+/**
+ * Private GCP test route for the PostgreSQL-backed daily reader. The public
+ * projection is intentionally activity/spend only until PostgreSQL has the
+ * current allowance fit producer and cache-retention lane.
+ */
+export function createPostgresTestCommunityDailyDispatch({
+  primaryPool,
+  schemaOptions,
+  sourceIdentity,
+  readPostgresPublishedCommunityDaily,
+  healthDispatch,
+  privateOrigin,
+}) {
+  if (primaryPool === null || typeof primaryPool !== "object"
+      || typeof primaryPool.connect !== "function"
+      || sourceIdentity === null || typeof sourceIdentity !== "object"
+      || typeof sourceIdentity.sourceId !== "string" || sourceIdentity.sourceId.length < 1
+      || sourceIdentity.sourceId.length > 200
+      || !/^[\x21-\x7e]+$/u.test(sourceIdentity.sourceId)
+      || typeof sourceIdentity.sourceNamespace !== "string"
+      || sourceIdentity.sourceNamespace.length < 1 || sourceIdentity.sourceNamespace.length > 200
+      || !/^[\x21-\x7e]+$/u.test(sourceIdentity.sourceNamespace)
+      || typeof readPostgresPublishedCommunityDaily !== "function"
+      || typeof healthDispatch !== "function") {
+    configurationError("POSTGRES_TEST_COMMUNITY_DAILY_DISPATCH_CONFIGURATION_INVALID");
+  }
+  const schemas = validatedSchemas(schemaOptions);
+  if (!isAllowedPostgresTestOrigin(privateOrigin)) {
+    configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
+  }
+
+  return async function dispatchPostgresTestCommunityDaily(request) {
+    let url;
+    try { url = new URL(request.url); } catch {
+      return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
+    }
+    if (url.origin !== privateOrigin || url.pathname !== COMMUNITY_DAILY_PATH) {
+      return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
+    }
+    if (request.method !== "GET") {
+      return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
+        code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET" },
+      }), crypto.randomUUID());
+    }
+
+    const requestId = crypto.randomUUID();
+    try {
+      if (request.body !== null) {
+        throw Object.assign(new Error("BODY_INVALID"), { code: "BODY_INVALID", status: 400 });
+      }
+      const { from, to } = communityDailyQuery(url);
+      const health = await healthDispatch(new Request(`${privateOrigin}/api/health`));
+      if (health?.status !== 200) throw storageUnavailable();
+
+      let read;
+      try {
+        read = await readPostgresPublishedCommunityDaily(primaryPool, {
+          sourceId: sourceIdentity.sourceId,
+          sourceNamespace: sourceIdentity.sourceNamespace,
+          fromDay: from,
+          throughDay: to,
+          schema: { primarySchema: schemas.primary },
+        });
+      } catch {
+        throw storageUnavailable();
+      }
+      if (read === null || typeof read !== "object" || !Array.isArray(read.rows)
+          || read.rows.length > COMMUNITY_DAILY_MAX_RANGE_DAYS
+          || !["confirmed", "temporarily_unavailable"].includes(read.allowanceReadState)) {
+        throw storageUnavailable();
+      }
+      const days = read.rows.map((row) => {
+        if (row === null || typeof row !== "object"
+            || typeof row.day !== "string" || row.day < from || row.day > to
+            || !Number.isSafeInteger(row.revision) || row.revision < 1
+            || typeof row.released_at !== "string"
+            || !Number.isFinite(Date.parse(row.released_at))) throw storageUnavailable();
+        let payload;
+        try { payload = JSON.parse(row.payload_json); } catch { throw storageUnavailable(); }
+        if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+          throw storageUnavailable();
+        }
+        if (payload.day !== row.day || payload.revision !== row.revision) {
+          throw storageUnavailable();
+        }
+        // Fit readiness and allowance preview production have not been ported.
+        // Keep the activity contract closed even if the table contains legacy
+        // or externally-written fields.
+        const publicPayload = { ...payload };
+        delete publicPayload.allowance;
+        delete publicPayload.capacityByPlanType;
+        return {
+          day: row.day,
+          revision: row.revision,
+          releasedAt: row.released_at,
+          payload: publicPayload,
+        };
+      });
+      return json(200, {
+        schemaVersion: "community-daily-read-v1.0",
+        from,
+        to,
+        allowanceState: "updating",
+        allowanceReadState: read.allowanceReadState,
+        days,
+      });
+    } catch (error) {
+      return routeError(error, requestId);
+    }
   };
 }
 
