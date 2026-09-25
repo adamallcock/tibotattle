@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { lstat, realpath, stat } from "node:fs/promises";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import pg from "pg";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { deviceHash } from "../src/device-auth.ts";
+import { encodeBase64Url } from "../src/crypto.ts";
+import { disconnectPostgresAuthenticatedDevice } from "../src/postgres-device-disconnect.ts";
 import {
   publishPostgresCommunityDailyDay,
   readPostgresCommunityDailyDaySourceEligibility,
@@ -168,6 +171,144 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL explicit-day community daily produc
       record.provider, record.modelId, JSON.stringify(record)]);
   }
 
+  async function addAccountlessRetainedV11Day({ mismatchedLedgerHash = false } = {}) {
+    const deviceId = randomUUID();
+    const participantId = `synthetic-accountless-${randomUUID()}`;
+    const secret = randomBytes(32).toString("base64url");
+    const authorization = `Device um_device_${deviceId}.${secret}`;
+    const secretHash = Buffer.from(await deviceHash(deviceId, secret));
+    const storedLedgerHash = mismatchedLedgerHash ? Buffer.alloc(32, 0x3d) : secretHash;
+    const now = "2026-09-24T00:00:00.000Z";
+    const expires = "2027-09-24T00:00:00.000Z";
+    const generationId = randomUUID();
+    const predecessorHash = "2".repeat(64);
+    const manifestId = randomUUID();
+    const chunkId = `synthetic-v11-${randomUUID()}`;
+    const chunkDigest = "3".repeat(64);
+    const envelopeDigest = "4".repeat(64);
+    const chunkObjectKey = `synthetic/${chunkId}`;
+    const consumedAuthorizationId = `synthetic-consumed-${randomUUID()}`;
+    const pendingAuthorizationIds = [
+      `synthetic-unused-${randomUUID()}`,
+      `synthetic-consuming-${randomUUID()}`,
+    ];
+    const ownerDigest = "5".repeat(64);
+    const record = usageRecord();
+    const manifestJson = JSON.stringify({
+      schemaVersion: "telemetry-v11-day-manifest-v1.0",
+      chunks: [{ chunkId, chunkDigest, recordCount: 1, stream: "usage" }],
+    });
+
+    await pool.query(`INSERT INTO ${sqlSchema}.participants(id,owner_kind,state,created_at)
+      VALUES ($1,'accountless','active',$2::timestamptz)`, [participantId, now]);
+    await pool.query(`INSERT INTO ${sqlSchema}.accountless_enrollment_ledger(
+      device_id,device_secret_hash,installation_principal_id,schema_version,policy_version,
+      authorization_basis,state,issued_at,expires_at)
+      VALUES ($1,$2,$3,'accountless-enrollment-v0.1','accountless-opt-out-v1',
+        'accountless-policy-v1','active',$4::timestamptz,$5::timestamptz)`,
+    [deviceId, storedLedgerHash, `accountless:${deviceId}`, now, expires]);
+    await pool.query(`INSERT INTO ${sqlSchema}.device_credentials(
+      id,participant_id,authority_kind,accountless_enrollment_device_id,secret_hash,
+      state,issued_at,expires_at,last_used_at)
+      VALUES ($1,$2,'accountless',$1,$3,'active',$4::timestamptz,$5::timestamptz,$4::timestamptz)`,
+    [deviceId, participantId, secretHash, now, expires]);
+    await pool.query(`INSERT INTO ${sqlSchema}.accountless_upload_owners(
+      enrollment_device_id,participant_id,device_credential_id,policy_version,
+      authorization_basis,authorized_at,expires_at,state)
+      VALUES ($1,$2,$1,'accountless-opt-out-v1','accountless-policy-v1',
+        $3::timestamptz,$4::timestamptz,'active')`, [deviceId, participantId, now, expires]);
+    await pool.query(`INSERT INTO ${sqlSchema}.accountless_v11_device_authorizations(
+      enrollment_device_id,participant_id,device_credential_id,telemetry_schema_version,
+      field_dictionary_version,privacy_contract_version,authorized_at,expires_at,state)
+      VALUES ($1,$2,$1,'telemetry-contribution-v1.1',
+        'telemetry-v1.1-registry-2026-08-31.1','ongoing-privacy-safe-telemetry-v1.1',
+        $3::timestamptz,$4::timestamptz,'active')`,
+    [deviceId, participantId, now, expires]);
+
+    for (const [authorizationId, state] of [
+      [consumedAuthorizationId, "consumed"],
+      [pendingAuthorizationIds[0], "unused"],
+      [pendingAuthorizationIds[1], "consuming"],
+    ]) {
+      await pool.query(`INSERT INTO ${sqlSchema}.device_upload_authorizations(
+        id,participant_id,issued_by_device_id,secret_hash,envelope_digest,body_bytes,
+        content_type,state,issued_at,expires_at,consumed_at,consume_lease_expires_at,
+        consumed_contribution_id)
+        VALUES ($1,$2,$3,$4,$5,1,'application/json',$6,$7::timestamptz,
+          $8::timestamptz,CASE WHEN $6='consumed' THEN $7::timestamptz ELSE NULL END,
+          CASE WHEN $6='consuming' THEN $8::timestamptz ELSE NULL END,
+          CASE WHEN $6='consumed' THEN $9 ELSE NULL END)`,
+      [authorizationId, participantId, deviceId, Buffer.alloc(32, 0x2a),
+        (authorizationId === consumedAuthorizationId ? envelopeDigest : "6".repeat(64)),
+        state, now, expires, chunkId]);
+    }
+    await pool.query(`INSERT INTO ${sqlSchema}.pending_objects(contribution_id,object_key)
+      VALUES ($1,$2)`, [chunkId, chunkObjectKey]);
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_day_manifests(
+      id,participant_id,device_id,chunk_day,manifest_digest,parser_version,
+      manifest_json,expected_chunk_count,state,created_at,ready_at)
+      VALUES ($1,$2,$3,$4::date,$5,'synthetic-v11-day', $6,1,'ready',
+        $7::timestamptz,$7::timestamptz)`,
+    [manifestId, participantId, deviceId, DAY, "7".repeat(64), manifestJson, now]);
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_chunks(
+      id,manifest_id,participant_id,device_id,stream,chunk_day,chunk_seq,chunk_id,
+      chunk_digest,envelope_digest,parser_version,record_count,r2_key,
+      device_upload_authorization_id,created_at)
+      VALUES ($1,$2,$3,$4,'usage',$5::date,0,$6,$7,$8,'synthetic-v11-day',1,$9,$10,$11::timestamptz)`,
+    [chunkId, manifestId, participantId, deviceId, DAY, chunkId, chunkDigest,
+      envelopeDigest, chunkObjectKey, consumedAuthorizationId, now]);
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_records(
+      chunk_id,manifest_id,stream,occurrence_id,observed_at,record_json)
+      VALUES ($1,$2,'usage',$3,$4::timestamptz,$5)`,
+    [chunkId, manifestId, record.eventId, record.eventTime, JSON.stringify(record)]);
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domain_predecessors(
+      token_hash,participant_id,device_id,previous_generation_id,legacy_fingerprint,
+      input_revision,from_day,through_day,winners_json,created_at,expires_at,consumed_at)
+      VALUES ($1,$2,$3,NULL,$4,0,$5::date,$5::date,'{}',$6::timestamptz,
+        $7::timestamptz,$6::timestamptz)`,
+    [predecessorHash, participantId, deviceId, "8".repeat(64), DAY, now, expires]);
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domains(
+      id,participant_id,device_id,predecessor_token_hash,previous_generation_id,
+      manifest_digest,legacy_fingerprint,input_revision,from_day,through_day,days_json,created_at)
+      VALUES ($1,$2,$3,$4,NULL,$5,$6,0,$7::date,$7::date,$8,$9::timestamptz)`,
+    [generationId, participantId, deviceId, predecessorHash, "9".repeat(64),
+      "8".repeat(64), DAY, JSON.stringify([{ day: DAY, manifestId }]), now]);
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domain_days(generation_id,observed_day,manifest_id)
+      VALUES ($1,$2::date,$3)`, [generationId, DAY, manifestId]);
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domain_heads(
+      participant_id,generation_id,revision,updated_at)
+      VALUES ($1,$2,1,$3::timestamptz)`, [participantId, generationId, now]);
+    await pool.query(`INSERT INTO ${sqlSchema}.storage_v11_owner_links(
+      participant_id,owner_digest,state,generation_id,head_revision)
+      VALUES ($1,$2,'active',$3,1)`, [participantId, ownerDigest, generationId]);
+    await pool.query(`INSERT INTO ${sqlSchema}.analytics_owner_state(
+      source_id,owner_digest,revision,authority_epoch,state)
+      VALUES ($1,$2,1,0,'active')`, [SOURCE_ID, ownerDigest]);
+    await pool.query(`INSERT INTO ${sqlSchema}.analytics_publication_owner_members(
+      source_id,day,metric,generation,owner_digest)
+      VALUES ($1,$2::date,'daily','synthetic-daily-generation',$3)`, [SOURCE_ID, DAY, ownerDigest]);
+    const payloadJson = JSON.stringify({ schemaVersion: "community-daily-aggregate-v1.0", day: DAY });
+    const payloadDigest = createHash("sha256").update(payloadJson).digest("hex");
+    await pool.query(`INSERT INTO ${sqlSchema}.community_daily_aggregates(
+      source_id,source_namespace,day,revision,payload_json,payload_sha256,
+      source_authority_epoch,source_cursor_sequence,policy_revision,
+      collection_revision,release_state,released_at)
+      VALUES ($1,$2,$3::date,1,$4,$5,0,0,1,1,'published',$6::timestamptz)`,
+    [SOURCE_ID, SOURCE_NAMESPACE, DAY, payloadJson, payloadDigest, now]);
+
+    return {
+      authorization,
+      deviceId,
+      participantId,
+      ownerDigest,
+      consumedAuthorizationId,
+      pendingAuthorizationIds,
+      generationId,
+      secretHash,
+      nowEpoch: Date.parse("2026-09-25T12:00:00.000Z"),
+    };
+  }
+
   async function publish(options = {}) {
     return publishPostgresCommunityDailyDay(pool, {
       sourceId: SOURCE_ID,
@@ -209,6 +350,201 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL explicit-day community daily produc
       v1SelectedRecordsPresent: true,
       v11SelectedRecordsPresent: false,
     });
+  });
+
+  it("retains the exact accepted v1.1 day across accountless opt-out without withdrawing publication", async () => {
+    const fixture = await addAccountlessRetainedV11Day();
+    const readEligibility = () => readPostgresCommunityDailyDaySourceEligibility(pool, {
+      day: DAY,
+      schema: { primarySchema: schema },
+    });
+    expect(await readEligibility()).toEqual({
+      v1SelectedRecordsPresent: false,
+      v11SelectedRecordsPresent: true,
+    });
+    const changesBefore = await pool.query(`SELECT sequence,event_digest,owner_digest,owner_revision,
+      authority_epoch,kind,recorded_ms FROM ${sqlSchema}.storage_ingestion_changes
+      WHERE source_id=$1 ORDER BY sequence`, [SOURCE_ID]);
+    const publicationBefore = await pool.query(`SELECT revision,release_state,payload_sha256
+      FROM ${sqlSchema}.community_daily_aggregates WHERE source_id=$1 AND day=$2::date`,
+    [SOURCE_ID, DAY]);
+    const membersBefore = await pool.query(`SELECT source_id,day,metric,generation,owner_digest
+      FROM ${sqlSchema}.analytics_publication_owner_members
+      WHERE source_id=$1 AND owner_digest=$2`, [SOURCE_ID, fixture.ownerDigest]);
+
+    await expect(disconnectPostgresAuthenticatedDevice(pool, fixture.authorization, {
+      nowEpoch: fixture.nowEpoch,
+      schema: { primarySchema: schema },
+    })).resolves.toEqual({ deviceId: fixture.deviceId, revoked: true });
+
+    expect(await readEligibility()).toEqual({
+      v1SelectedRecordsPresent: false,
+      v11SelectedRecordsPresent: true,
+    });
+    const authority = await pool.query(`SELECT ledger.state AS ledger_state,
+      ledger.revoked_at,ledger.revocation_reason,owner.state AS owner_state,
+      owner.revoked_at AS owner_revoked_at,owner.revocation_reason AS owner_reason,
+      grant_row.state AS grant_state,grant_row.revoked_at AS grant_revoked_at,
+      grant_row.revocation_reason AS grant_reason,device.state AS device_state,
+      device.revoked_at AS device_revoked_at
+      FROM ${sqlSchema}.accountless_enrollment_ledger ledger
+      JOIN ${sqlSchema}.accountless_upload_owners owner
+        ON owner.enrollment_device_id=ledger.device_id
+      JOIN ${sqlSchema}.accountless_v11_device_authorizations grant_row
+        ON grant_row.enrollment_device_id=ledger.device_id
+      JOIN ${sqlSchema}.device_credentials device ON device.id=ledger.device_id
+      WHERE ledger.device_id=$1`, [fixture.deviceId]);
+    expect(authority.rows).toHaveLength(1);
+    const row = authority.rows[0];
+    expect(row).toMatchObject({
+      ledger_state: "revoked",
+      revocation_reason: "user_opt_out",
+      owner_state: "revoked",
+      owner_reason: "user_opt_out",
+      grant_state: "revoked",
+      grant_reason: "user_opt_out",
+      device_state: "revoked",
+    });
+    expect(row.owner_revoked_at).toEqual(row.revoked_at);
+    expect(row.grant_revoked_at).toEqual(row.revoked_at);
+    expect(row.device_revoked_at).toEqual(row.revoked_at);
+
+    const marker = await pool.query(`SELECT participant_id,enrollment_device_id,
+      device_credential_id,generation_id,head_revision,retained_at
+      FROM ${sqlSchema}.accountless_public_history_retention
+      WHERE enrollment_device_id=$1`, [fixture.deviceId]);
+    expect(marker.rows).toEqual([{
+      participant_id: fixture.participantId,
+      enrollment_device_id: fixture.deviceId,
+      device_credential_id: fixture.deviceId,
+      generation_id: fixture.generationId,
+      head_revision: 1,
+      retained_at: new Date(fixture.nowEpoch),
+    }]);
+    const uploads = await pool.query(`SELECT id,state,revoked_at,consume_lease_expires_at,consumed_at
+      FROM ${sqlSchema}.device_upload_authorizations WHERE issued_by_device_id=$1 ORDER BY id`,
+    [fixture.deviceId]);
+    expect(uploads.rows).toHaveLength(3);
+    for (const upload of uploads.rows) {
+      if (upload.id === fixture.consumedAuthorizationId) {
+        expect(upload).toMatchObject({ state: "consumed", revoked_at: null, consumed_at: expect.any(Date) });
+      } else {
+        expect(upload).toMatchObject({ state: "revoked", consume_lease_expires_at: null });
+        expect(upload.revoked_at).toEqual(row.revoked_at);
+      }
+    }
+
+    expect((await pool.query(`SELECT state FROM ${sqlSchema}.storage_v11_owner_links
+      WHERE participant_id=$1`, [fixture.participantId])).rows).toEqual([{ state: "active" }]);
+    expect((await pool.query(`SELECT state FROM ${sqlSchema}.analytics_owner_state
+      WHERE source_id=$1 AND owner_digest=$2`, [SOURCE_ID, fixture.ownerDigest])).rows)
+      .toEqual([{ state: "active" }]);
+    expect((await pool.query(`SELECT source_id,day,metric,generation,owner_digest
+      FROM ${sqlSchema}.analytics_publication_owner_members
+      WHERE source_id=$1 AND owner_digest=$2`, [SOURCE_ID, fixture.ownerDigest])).rows)
+      .toEqual(membersBefore.rows);
+    expect((await pool.query(`SELECT revision,release_state,payload_sha256
+      FROM ${sqlSchema}.community_daily_aggregates WHERE source_id=$1 AND day=$2::date`,
+    [SOURCE_ID, DAY])).rows).toEqual(publicationBefore.rows);
+    expect((await pool.query(`SELECT sequence,event_digest,owner_digest,owner_revision,
+      authority_epoch,kind,recorded_ms FROM ${sqlSchema}.storage_ingestion_changes
+      WHERE source_id=$1 ORDER BY sequence`, [SOURCE_ID])).rows).toEqual(changesBefore.rows);
+
+    await expect(disconnectPostgresAuthenticatedDevice(pool, fixture.authorization, {
+      nowEpoch: fixture.nowEpoch + 60_000,
+      schema: { primarySchema: schema },
+    })).resolves.toEqual({ deviceId: fixture.deviceId, revoked: true });
+    expect((await pool.query(`SELECT retained_at FROM ${sqlSchema}.accountless_public_history_retention
+      WHERE enrollment_device_id=$1`, [fixture.deviceId])).rows)
+      .toEqual([{ retained_at: new Date(fixture.nowEpoch) }]);
+    expect(await readEligibility()).toEqual({
+      v1SelectedRecordsPresent: false,
+      v11SelectedRecordsPresent: true,
+    });
+
+    await pool.query(`UPDATE ${sqlSchema}.telemetry_v11_domain_heads
+      SET revision=revision+1 WHERE participant_id=$1`, [fixture.participantId]);
+    expect(await readEligibility()).toEqual({
+      v1SelectedRecordsPresent: false,
+      v11SelectedRecordsPresent: false,
+    });
+    await pool.query(`UPDATE ${sqlSchema}.telemetry_v11_domain_heads
+      SET revision=revision-1 WHERE participant_id=$1`, [fixture.participantId]);
+
+    await pool.query(`UPDATE ${sqlSchema}.accountless_enrollment_ledger
+      SET device_secret_hash=$2 WHERE device_id=$1`,
+    [fixture.deviceId, Buffer.alloc(32, 0x5e)]);
+    expect(await readEligibility()).toEqual({
+      v1SelectedRecordsPresent: false,
+      v11SelectedRecordsPresent: false,
+    });
+  });
+
+  it("does not infer retained history for a pre-cutover opt-out without its exact marker", async () => {
+    const fixture = await addAccountlessRetainedV11Day();
+    // Model a transfer that copied the revoked authority rows and active
+    // owner link but omitted D1's exact retention marker. The current head is
+    // present, but inferring a marker from it would invent retained authority.
+    const revokedAt = new Date(fixture.nowEpoch);
+    await pool.query(`UPDATE ${sqlSchema}.accountless_enrollment_ledger
+      SET state='revoked',revoked_at=$2::timestamptz,revocation_reason='user_opt_out'
+      WHERE device_id=$1`, [fixture.deviceId, revokedAt]);
+    await pool.query(`UPDATE ${sqlSchema}.accountless_upload_owners
+      SET state='revoked',revoked_at=$2::timestamptz,revocation_reason='user_opt_out'
+      WHERE enrollment_device_id=$1`, [fixture.deviceId, revokedAt]);
+    await pool.query(`UPDATE ${sqlSchema}.accountless_v11_device_authorizations
+      SET state='revoked',revoked_at=$2::timestamptz,revocation_reason='user_opt_out'
+      WHERE enrollment_device_id=$1`, [fixture.deviceId, revokedAt]);
+    await pool.query(`UPDATE ${sqlSchema}.device_credentials
+      SET state='revoked',revoked_at=$2::timestamptz
+      WHERE id=$1`, [fixture.deviceId, revokedAt]);
+
+    expect((await pool.query(`SELECT state FROM ${sqlSchema}.storage_v11_owner_links
+      WHERE participant_id=$1`, [fixture.participantId])).rows).toEqual([{ state: "active" }]);
+    expect((await pool.query(`SELECT count(*)::integer AS count
+      FROM ${sqlSchema}.accountless_public_history_retention WHERE participant_id=$1`,
+    [fixture.participantId])).rows).toEqual([{ count: 0 }]);
+    expect(await readPostgresCommunityDailyDaySourceEligibility(pool, {
+      day: DAY,
+      schema: { primarySchema: schema },
+    })).toEqual({
+      v1SelectedRecordsPresent: false,
+      v11SelectedRecordsPresent: false,
+    });
+  });
+
+  it("fails closed and rolls back accountless opt-out if the exact v1.1 source authority is invalid", async () => {
+    const fixture = await addAccountlessRetainedV11Day({ mismatchedLedgerHash: true });
+    const statesBefore = await pool.query(`SELECT ledger.state AS ledger_state,
+      owner.state AS owner_state,grant_row.state AS grant_state,device.state AS device_state
+      FROM ${sqlSchema}.accountless_enrollment_ledger ledger
+      JOIN ${sqlSchema}.accountless_upload_owners owner
+        ON owner.enrollment_device_id=ledger.device_id
+      JOIN ${sqlSchema}.accountless_v11_device_authorizations grant_row
+        ON grant_row.enrollment_device_id=ledger.device_id
+      JOIN ${sqlSchema}.device_credentials device ON device.id=ledger.device_id
+      WHERE ledger.device_id=$1`, [fixture.deviceId]);
+    const journalBefore = await pool.query(`SELECT count(*)::integer AS count
+      FROM ${sqlSchema}.storage_ingestion_changes WHERE source_id=$1`, [SOURCE_ID]);
+    await expect(disconnectPostgresAuthenticatedDevice(pool, fixture.authorization, {
+      nowEpoch: fixture.nowEpoch,
+      schema: { primarySchema: schema },
+    })).rejects.toMatchObject({ status: 503, code: "BACKEND_STORAGE_UNAVAILABLE" });
+    expect((await pool.query(`SELECT ledger.state AS ledger_state,
+      owner.state AS owner_state,grant_row.state AS grant_state,device.state AS device_state
+      FROM ${sqlSchema}.accountless_enrollment_ledger ledger
+      JOIN ${sqlSchema}.accountless_upload_owners owner
+        ON owner.enrollment_device_id=ledger.device_id
+      JOIN ${sqlSchema}.accountless_v11_device_authorizations grant_row
+        ON grant_row.enrollment_device_id=ledger.device_id
+      JOIN ${sqlSchema}.device_credentials device ON device.id=ledger.device_id
+      WHERE ledger.device_id=$1`, [fixture.deviceId])).rows).toEqual(statesBefore.rows);
+    expect((await pool.query(`SELECT count(*)::integer AS count
+      FROM ${sqlSchema}.accountless_public_history_retention WHERE enrollment_device_id=$1`,
+    [fixture.deviceId])).rows).toEqual([{ count: 0 }]);
+    expect((await pool.query(`SELECT count(*)::integer AS count
+      FROM ${sqlSchema}.storage_ingestion_changes WHERE source_id=$1`, [SOURCE_ID])).rows)
+      .toEqual(journalBefore.rows);
   });
 
   it("publishes content-free activity and API spend once, then makes a new immutable revision after the cursor advances", async () => {

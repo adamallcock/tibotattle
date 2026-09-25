@@ -142,10 +142,11 @@ export interface ReadPostgresCommunityDailyDaySourceEligibilityOptions {
 }
 
 function publicDailySourceCtes(schema: string): string {
-  // This mirrors D1 migration 0060's public owner projection, including its
-  // v1.1-only accountless rule. Public social participants need no extra
-  // enrollment row; accountless sources require the live v1.1 grant and the
-  // exact current domain for the enrolled device.
+  // This mirrors the final D1 community_public_source_owners projection:
+  // active social/accountless authority, plus accountless v1.1 history that
+  // was pinned before an exact user opt-out. Opt-out retains the accepted
+  // current head but does not retain upload authority or create a terminal
+  // source event.
   return `WITH public_owners AS (
       SELECT participant.id AS participant_id, NULL::text AS device_id
         FROM ${schema}.participants participant
@@ -186,6 +187,56 @@ function publicDailySourceCtes(schema: string): string {
             WHERE head.participant_id = participant.id
               AND domain.participant_id = participant.id AND domain.device_id = device.id
          )
+      UNION ALL
+      SELECT participant.id AS participant_id, device.id AS device_id
+        FROM ${schema}.accountless_public_history_retention retained
+        JOIN ${schema}.participants participant
+          ON participant.id = retained.participant_id
+        JOIN ${schema}.accountless_upload_owners owner
+          ON owner.participant_id = retained.participant_id
+         AND owner.enrollment_device_id = retained.enrollment_device_id
+         AND owner.device_credential_id = retained.device_credential_id
+        JOIN ${schema}.accountless_enrollment_ledger ledger
+          ON ledger.device_id = retained.enrollment_device_id
+        JOIN ${schema}.device_credentials device
+          ON device.id = retained.device_credential_id
+         AND device.participant_id = retained.participant_id
+        JOIN ${schema}.accountless_v11_device_authorizations grant_row
+          ON grant_row.enrollment_device_id = retained.enrollment_device_id
+         AND grant_row.participant_id = retained.participant_id
+         AND grant_row.device_credential_id = retained.device_credential_id
+        JOIN ${schema}.telemetry_v11_domain_heads head
+          ON head.participant_id = retained.participant_id
+         AND head.generation_id = retained.generation_id
+         AND head.revision = retained.head_revision
+        JOIN ${schema}.telemetry_v11_domains domain
+          ON domain.id = retained.generation_id
+         AND domain.participant_id = retained.participant_id
+         AND domain.device_id = retained.device_credential_id
+       WHERE participant.owner_kind = 'accountless' AND participant.state = 'active'
+         AND ledger.state = 'revoked' AND ledger.revocation_reason = 'user_opt_out'
+         AND owner.state = 'revoked' AND owner.revocation_reason = 'user_opt_out'
+         AND grant_row.state = 'revoked' AND grant_row.revocation_reason = 'user_opt_out'
+         AND device.state = 'revoked' AND device.authority_kind = 'accountless'
+         AND ledger.revoked_at = retained.retained_at
+         AND owner.revoked_at = retained.retained_at
+         AND grant_row.revoked_at = retained.retained_at
+         AND device.revoked_at = retained.retained_at
+         AND device.id = ledger.device_id
+         AND device.accountless_enrollment_device_id = ledger.device_id
+         AND device.paired_via_pairing_id IS NULL AND device.social_verified_at IS NULL
+         AND device.secret_hash = ledger.device_secret_hash
+         AND ledger.schema_version = 'accountless-enrollment-v0.1'
+         AND ledger.policy_version = 'accountless-opt-out-v1'
+         AND ledger.authorization_basis = 'accountless-policy-v1'
+         AND owner.policy_version = ledger.policy_version
+         AND owner.authorization_basis = ledger.authorization_basis
+         AND grant_row.telemetry_schema_version = 'telemetry-contribution-v1.1'
+         AND grant_row.field_dictionary_version = 'telemetry-v1.1-registry-2026-08-31.1'
+         AND grant_row.privacy_contract_version = 'ongoing-privacy-safe-telemetry-v1.1'
+         AND owner.expires_at = ledger.expires_at
+         AND device.expires_at = ledger.expires_at
+         AND grant_row.expires_at = ledger.expires_at
     ), active_chunks AS (
       SELECT chunk.id AS chunk_id, chunk.participant_id, chunk.device_id,
              chunk.chunk_day AS observed_day, chunk.stream, chunk.created_at,

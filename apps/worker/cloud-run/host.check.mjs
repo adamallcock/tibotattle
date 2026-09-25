@@ -4037,12 +4037,14 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       },
     });
     const disconnectRouteRateStart = deviceDisconnectRateLimitCalls;
-    const readAccountlessDisconnectState = async () => primaryPool.query(
+    const readAccountlessDisconnectState = async (deviceId) => primaryPool.query(
       "SELECT ledger.state AS ledger_state, ledger.revoked_at::text AS ledger_revoked_at, "
         + "owner.state AS owner_state, owner.revoked_at::text AS owner_revoked_at, "
         + "v11.state AS v11_state, v11.revoked_at::text AS v11_revoked_at, "
         + "v12.state AS v12_state, v12.revoked_at::text AS v12_revoked_at, "
         + "device.state AS device_state, device.revoked_at::text AS device_revoked_at, "
+        + "EXISTS (SELECT 1 FROM " + primaryTable("accountless_public_history_retention")
+        + " marker WHERE marker.enrollment_device_id=$1) AS retained_marker, "
         + "(SELECT COALESCE(jsonb_agg(jsonb_build_array(upload.id, upload.state, "
         + "upload.revoked_at::text, upload.consume_lease_expires_at::text) ORDER BY upload.id), '[]'::jsonb) "
         + "FROM " + primaryTable("device_upload_authorizations")
@@ -4051,22 +4053,50 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
         + primaryTable("accountless_upload_owners") + " owner "
         + "ON owner.enrollment_device_id=ledger.device_id JOIN "
         + primaryTable("accountless_v11_device_authorizations") + " v11 "
-        + "ON v11.enrollment_device_id=ledger.device_id JOIN "
+        + "ON v11.enrollment_device_id=ledger.device_id LEFT JOIN "
         + primaryTable("accountless_v12_device_authorizations") + " v12 "
         + "ON v12.enrollment_device_id=ledger.device_id JOIN "
         + primaryTable("device_credentials") + " device ON device.id=ledger.device_id "
         + "WHERE ledger.device_id=$1",
-      [accountlessDeviceId],
+      [deviceId],
     );
-    const accountlessBeforeDisconnect = await readAccountlessDisconnectState();
+    const accountlessBeforeDisconnect = await readAccountlessDisconnectState(noV12DeviceId);
     assert.equal(accountlessBeforeDisconnect.rowCount, 1);
     const accountlessDisconnectResponse = await dispatch(disconnectRequest({
-      authorization: accountlessAuth,
+      authorization: noV12Auth,
     }));
-    await assertApiError(accountlessDisconnectResponse, 503, "BACKEND_STORAGE_UNAVAILABLE");
-    assert.deepEqual((await readAccountlessDisconnectState()).rows,
-      accountlessBeforeDisconnect.rows,
-      "accountless disconnect fails closed without partially revoking source authority or grants");
+    assert.equal(accountlessDisconnectResponse.status, 200,
+      "accountless opt-out revokes upload authority when there is no accepted v1.1 head to retain");
+    assert.deepEqual(await accountlessDisconnectResponse.json(), {
+      schemaVersion: "device-disconnect-v0.1",
+      disconnected: true,
+      deviceId: noV12DeviceId,
+    });
+    const accountlessAfterDisconnect = await readAccountlessDisconnectState(noV12DeviceId);
+    assert.equal(accountlessAfterDisconnect.rows.length, 1);
+    const accountlessAfterRow = accountlessAfterDisconnect.rows[0];
+    assert.deepEqual({
+      ...accountlessAfterRow,
+      ledger_revoked_at: null,
+      owner_revoked_at: null,
+      v11_revoked_at: null,
+      device_revoked_at: null,
+    }, {
+      ...accountlessBeforeDisconnect.rows[0],
+      ledger_state: "revoked",
+      owner_state: "revoked",
+      v11_state: "revoked",
+      device_state: "revoked",
+      retained_marker: false,
+    });
+    assert.equal(typeof accountlessAfterRow.ledger_revoked_at, "string");
+    assert.equal(accountlessAfterRow.ledger_revoked_at,
+      accountlessAfterRow.owner_revoked_at,
+      "accountless opt-out uses one timestamp for retained-source authority state");
+    assert.equal(accountlessAfterRow.ledger_revoked_at,
+      accountlessAfterRow.v11_revoked_at);
+    assert.equal(accountlessAfterRow.ledger_revoked_at,
+      accountlessAfterRow.device_revoked_at);
 
     // The social stop route remains usable while collection and upload
     // registration controls are degraded. Unlike accountless opt-out, social
@@ -4315,7 +4345,7 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       { state: "revoked", revoked: true, lease_cleared: true },
     ]);
     assert.equal(deviceDisconnectRateLimitCalls - disconnectRouteRateStart, 8,
-      "missing/cookie/body/credential, success, replay, accountless refusal, and credential-reuse requests are admitted");
+      "missing/cookie/body/credential, success, replay, accountless opt-out, and credential-reuse requests are admitted");
     assert.deepEqual((await primaryPool.query(
       `SELECT revision, control_state, enrollment_enabled,
               upload_registration_enabled, processing_enabled
