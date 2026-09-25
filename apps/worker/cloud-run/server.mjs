@@ -58,6 +58,7 @@ import {
 } from "../src/postgres-device-credential-renewal.ts";
 import {
   readPostgresDeviceSyncState,
+  readPostgresDeviceSyncCapabilities,
   readPostgresDeviceSyncV12Capabilities,
 } from "../src/postgres-device-sync.ts";
 import { readPostgresV12DayCandidates } from "../src/postgres-v12-manifest-candidates.ts";
@@ -579,6 +580,7 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           authenticatePostgresDevice,
           hasPostgresDeletionTombstone,
           readPostgresDeviceSyncState,
+          readPostgresDeviceSyncCapabilities,
           readPostgresDeviceSyncV12Capabilities,
           readPostgresV12DayCandidates,
           publicEnvelopeKey,

@@ -10,6 +10,7 @@ import { build } from "esbuild";
 import pg from "pg";
 import {
   canonicalTelemetryV12Json,
+  telemetryV11RequiredConsent,
   TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
   TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
   TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
@@ -759,6 +760,7 @@ test("private-host envelope-key is public-only and bypasses PostgreSQL and Worke
     authenticatePostgresDevice: async () => { throw new Error("must not authenticate"); },
     hasPostgresDeletionTombstone: async () => { throw new Error("must not read ledger"); },
     readPostgresDeviceSyncState: async () => ({}),
+    readPostgresDeviceSyncCapabilities: async () => ({}),
     readPostgresDeviceSyncV12Capabilities: async () => ({}),
     readPostgresV12DayCandidates: async () => ({}),
     createPostgresTypedV12Domain: () => ({
@@ -2194,6 +2196,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       authenticatePostgresDevice: transport.authenticatePostgresDevice,
       hasPostgresDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
       readPostgresDeviceSyncState: deviceSync.readPostgresDeviceSyncState,
+      readPostgresDeviceSyncCapabilities: deviceSync.readPostgresDeviceSyncCapabilities,
       readPostgresDeviceSyncV12Capabilities: deviceSync.readPostgresDeviceSyncV12Capabilities,
       readPostgresV12DayCandidates: v12ManifestCandidates.readPostgresV12DayCandidates,
       readPostgresTelemetryV12EffectivePage:
@@ -2270,6 +2273,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     assert.equal((await health.json()).workerApplicationReady, false);
 
     const syncStateUrl = "http://127.0.0.1:43817/api/v1/device/sync/state";
+    const syncCapabilitiesUrl = "http://127.0.0.1:43817/api/v1/device/sync-capabilities";
     const syncCapabilitiesV12Url = "http://127.0.0.1:43817/api/v1/device/sync-capabilities-v1.2";
     const envelopeKeyUrl = "http://127.0.0.1:43817/api/v1/envelope-key";
     const domainPredecessorUrl = "http://127.0.0.1:43817/api/v1/me/telemetry-v12/domain-predecessor";
@@ -2316,6 +2320,159 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
         activationTime: nowIso,
       },
     });
+
+    // The frozen legacy capability response advertises exactly its four
+    // schemas, even though PostgreSQL also contains the separately-negotiated
+    // v1.2 format row. A missing participant floor fails closed.
+    const legacyCapabilitiesRequestCount = deviceSyncRateLimitCalls;
+    const missingFloorResponse = await dispatch(request({ url: syncCapabilitiesUrl, method: "GET" }));
+    assert.equal(missingFloorResponse.status, 401, JSON.stringify(await missingFloorResponse.clone().json()));
+    await assertApiError(missingFloorResponse, 401, "DEVICE_AUTH_INVALID");
+    assert.equal(deviceSyncRateLimitCalls, legacyCapabilitiesRequestCount + 1);
+    await primaryPool.query(
+      `INSERT INTO ${primaryTable("telemetry_transport_participant_floors")} (
+         participant_id, minimum_rank, revision, changed_at
+       ) VALUES ($1, 1, 7, $2)`,
+      [participantId, nowIso],
+    );
+    await primaryPool.query(
+      `INSERT INTO ${primaryTable("telemetry_transport_device_floors")} (
+         participant_id, device_id, minimum_rank, revision, changed_at
+       ) VALUES ($1, $2, 10, 3, $3)`,
+      [participantId, deviceId, nowIso],
+    );
+    const legacyCapabilitiesResponse = await dispatch(request({
+      url: syncCapabilitiesUrl,
+      method: "GET",
+    }));
+    assert.equal(legacyCapabilitiesResponse.status, 200);
+    assert.equal(legacyCapabilitiesResponse.headers.get("cache-control"), "no-store");
+    assert.equal(deviceSyncRateLimitCalls, legacyCapabilitiesRequestCount + 2);
+    const legacyCapabilities = await legacyCapabilitiesResponse.json();
+    assert.deepEqual(legacyCapabilities, {
+      schemaVersion: "device-sync-capabilities-v1.1",
+      destinationOrigin: "http://127.0.0.1:43817",
+      enrollmentNamespace: sha256Hex(`synthetic-enrollment:${suffix}`),
+      identityVersion: "account-track-v2",
+      minimumWriteRank: 10,
+      policyRevision: 7,
+      requiredConsent: telemetryV11RequiredConsent(),
+      formats: [
+        { schemaVersion: "telemetry-contribution-v0.1", rank: 1, lifecycle: "accepted" },
+        { schemaVersion: "telemetry-contribution-v0.2", rank: 2, lifecycle: "blocked" },
+        { schemaVersion: "telemetry-contribution-v1.0", rank: 10, lifecycle: "accepted" },
+        { schemaVersion: "telemetry-contribution-v1.1", rank: 11, lifecycle: "staged" },
+      ],
+      consentCurrent: false,
+    });
+    assert.equal(legacyCapabilities.formats.length, 4);
+    assert.equal(legacyCapabilities.formats.some((format) => format.rank === 12), false);
+
+    const cookiesOnDeviceRoute = await dispatch(request({
+      url: syncCapabilitiesUrl,
+      method: "GET",
+      headers: { cookie: "session=synthetic" },
+    }));
+    await assertApiError(cookiesOnDeviceRoute, 401, "DEVICE_AUTH_INVALID");
+    await assertApiError(await dispatch(request({
+      url: syncCapabilitiesUrl,
+      method: "GET",
+      headers: { authorization: "Device um_device_invalid.invalid" },
+    })), 401, "DEVICE_AUTH_INVALID");
+    await assertApiError(await dispatch(request({
+      url: syncCapabilitiesUrl,
+      method: "POST",
+    })), 405, "METHOD_NOT_ALLOWED");
+
+    runtime.postgresTestDispatch = createPostgresTestV12DayManifestDispatch({
+      ...manifestDispatchOptions,
+      sourceNamespace: `${sourceNamespace}-mismatch`,
+    });
+    try {
+      await assertApiError(await dispatch(request({
+        url: syncCapabilitiesUrl,
+        method: "GET",
+      })), 503, "BACKEND_STORAGE_UNAVAILABLE");
+    } finally {
+      runtime.postgresTestDispatch = manifestDispatch;
+    }
+
+    await primaryPool.query(
+      `UPDATE ${primaryTable("telemetry_transport_formats")}
+          SET lifecycle='accepted' WHERE schema_version='telemetry-contribution-v1.1'`,
+    );
+    await primaryPool.query(
+      `INSERT INTO ${primaryTable("telemetry_v11_device_consents")} (
+         participant_id, device_id, telemetry_schema_version,
+         field_dictionary_version, privacy_contract_version, consented_at
+       ) VALUES ($1, $2, 'telemetry-contribution-v1.1',
+         'telemetry-v1.1-registry-2026-08-31.1',
+         'ongoing-privacy-safe-telemetry-v1.1', $3)`,
+      [participantId, deviceId, nowIso],
+    );
+    await primaryPool.query(
+      `UPDATE ${primaryTable("telemetry_transport_participant_floors")}
+          SET minimum_rank=11, revision=8, changed_at=$2 WHERE participant_id=$1`,
+      [participantId, nowIso],
+    );
+    await primaryPool.query(
+      `UPDATE ${primaryTable("telemetry_transport_device_floors")}
+          SET minimum_rank=11, revision=4, changed_at=$3
+        WHERE participant_id=$1 AND device_id=$2`,
+      [participantId, deviceId, nowIso],
+    );
+    const consentedCapabilities = await dispatch(request({
+      url: syncCapabilitiesUrl,
+      method: "GET",
+    }));
+    assert.equal(consentedCapabilities.status, 200);
+    const consentedLegacyCapabilities = await consentedCapabilities.json();
+    assert.equal(consentedLegacyCapabilities.minimumWriteRank, 11);
+    assert.equal(consentedLegacyCapabilities.policyRevision, 8);
+    assert.equal(consentedLegacyCapabilities.consentCurrent, true);
+    assert.equal(consentedLegacyCapabilities.formats[3].lifecycle, "accepted");
+
+    const incompatibleContributionId = `contribution:${randomUUID()}`;
+    const legacyHistoryClient = await primaryPool.connect();
+    try {
+      await legacyHistoryClient.query("BEGIN");
+      await legacyHistoryClient.query(
+        `SET LOCAL search_path TO "${primarySchema}", pg_catalog`,
+      );
+      await legacyHistoryClient.query(
+        `INSERT INTO ${primaryTable("telemetry_contributions")} (
+           id, participant_id, plaintext_digest, envelope_digest, r2_key, status,
+           schema_version, transport_schema_version, range_start, range_end,
+           client_platform, provider_policy_epoch, priced_event_coverage_percent,
+           unknown_model_event_count, unknown_billable_units, price_basis,
+           declared_record_count, created_at
+         ) VALUES ($1, $2, $3, $4, $5, 'accepted',
+           'telemetry-contribution-v0.1', 'telemetry-contribution-v0.2',
+           $6, $7, 'macos', 'unknown', 0, 0, 0, 'unavailable', 0, $7)`,
+        [incompatibleContributionId, participantId, "a".repeat(64), "b".repeat(64),
+          `synthetic/${suffix}/v02-history`, "2026-09-24T00:00:00.000Z", nowIso],
+      );
+      await legacyHistoryClient.query("COMMIT");
+    } catch (error) {
+      await legacyHistoryClient.query("ROLLBACK");
+      throw error;
+    } finally {
+      legacyHistoryClient.release();
+    }
+    const blockedSuccessorResponse = await dispatch(request({
+      url: syncCapabilitiesUrl,
+      method: "GET",
+    }));
+    assert.equal(blockedSuccessorResponse.status, 200);
+    const blockedSuccessorCapabilities = await blockedSuccessorResponse.json();
+    assert.equal(blockedSuccessorCapabilities.consentCurrent, true);
+    assert.equal(blockedSuccessorCapabilities.formats[3].lifecycle, "blocked",
+      "accepted legacy v0.2 history blocks v1.1 lifecycle without erasing consent");
+    await primaryPool.query(
+      `DELETE FROM ${primaryTable("telemetry_contributions")} WHERE id=$1`,
+      [incompatibleContributionId],
+    );
+
     const envelopeKeyResponse = await dispatch(new Request(envelopeKeyUrl));
     assert.equal(envelopeKeyResponse.status, 200);
     const envelopeKey = await envelopeKeyResponse.json();
@@ -3271,6 +3428,82 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     assert.equal(accountlessOwner.rows[0].accountless_enrollment_device_id, accountlessDeviceId);
     assert.equal(accountlessOwner.rows[0].telemetry_schema_version, "telemetry-contribution-v1.1");
     assert.equal(accountlessOwner.rows[0].v11_state, "active");
+    const accountlessParticipantId = accountlessOwner.rows[0].participant_id;
+    await primaryPool.query(
+      `INSERT INTO ${primaryTable("telemetry_transport_participant_floors")} (
+         participant_id, minimum_rank, revision, changed_at
+       ) VALUES ($1, 11, 0, $2)`,
+      [accountlessParticipantId, nowIso],
+    );
+    // PostgreSQL participant creation does not yet mirror D1's automatic
+    // attribution-enrollment trigger; seed the exact synthetic row required
+    // by the read contract so this assertion isolates capability semantics.
+    await primaryPool.query(
+      `INSERT INTO ${primaryTable("attribution_enrollments")} (
+         participant_id, namespace, created_at
+       ) VALUES ($1, $2, $3)`,
+      [accountlessParticipantId,
+        sha256Hex(`synthetic-accountless-enrollment:${suffix}`), nowIso],
+    );
+    const accountlessNamespace = await primaryPool.query(
+      `SELECT namespace FROM ${primaryTable("attribution_enrollments")} WHERE participant_id=$1`,
+      [accountlessParticipantId],
+    );
+    assert.equal(accountlessNamespace.rowCount, 1);
+    await assert.rejects(
+      transport.authenticatePostgresDevice(primaryPool, accountlessAuth, { schema: schemaOptions }),
+      (error) => error?.code === "DEVICE_AUTH_INVALID",
+      "the generic device authenticator must retain the stricter v1.2 authority fence",
+    );
+    const accountlessAuthProbe = await transport.authenticatePostgresDevice(
+      primaryPool, accountlessAuth,
+      { schema: schemaOptions, accountlessAuthorizationVersion: "v1.1" },
+    );
+    assert.equal(accountlessAuthProbe.participantId, accountlessParticipantId);
+    const accountlessCapabilitiesResponse = await dispatch(request({
+      url: syncCapabilitiesUrl,
+      method: "GET",
+      headers: { authorization: accountlessAuth },
+    }));
+    assert.equal(accountlessCapabilitiesResponse.status, 200,
+      JSON.stringify(await accountlessCapabilitiesResponse.clone().json()));
+    const accountlessCapabilities = await accountlessCapabilitiesResponse.json();
+    assert.equal(accountlessCapabilities.schemaVersion, "device-sync-capabilities-v1.1");
+    assert.equal(accountlessCapabilities.destinationOrigin, "http://127.0.0.1:43817");
+    assert.equal(accountlessCapabilities.enrollmentNamespace, accountlessNamespace.rows[0].namespace);
+    assert.equal(accountlessCapabilities.identityVersion, "account-track-v2");
+    assert.equal(accountlessCapabilities.minimumWriteRank, 11);
+    assert.equal(accountlessCapabilities.authorityKind, "accountless");
+    assert.equal(accountlessCapabilities.consentCurrent, false,
+      "accountless authorization does not become social consent");
+    assert.equal(accountlessCapabilities.authorizationCurrent, true);
+    assert.deepEqual(accountlessCapabilities.formats.map((format) => format.lifecycle), [
+      "blocked", "blocked", "blocked", "accepted",
+    ]);
+    assert.equal(accountlessCapabilities.formats.length, 4,
+      "the legacy accountless response must not expose the separate v1.2 format");
+    await assertApiError(await dispatch(request({
+      url: syncCapabilitiesV12Url,
+      method: "GET",
+      headers: { authorization: accountlessAuth },
+    })), 401, "DEVICE_AUTH_INVALID");
+    await primaryPool.query(
+      `UPDATE ${primaryTable("accountless_v11_device_authorizations")}
+          SET state='revoked', revoked_at=$2, revocation_reason='synthetic-test'
+        WHERE enrollment_device_id=$1`,
+      [accountlessDeviceId, nowIso],
+    );
+    await assertApiError(await dispatch(request({
+      url: syncCapabilitiesUrl,
+      method: "GET",
+      headers: { authorization: accountlessAuth },
+    })), 401, "DEVICE_AUTH_INVALID");
+    await primaryPool.query(
+      `UPDATE ${primaryTable("accountless_v11_device_authorizations")}
+          SET state='active', revoked_at=NULL, revocation_reason=NULL
+        WHERE enrollment_device_id=$1`,
+      [accountlessDeviceId],
+    );
     const socialSessionCount = await primaryPool.query(
       "SELECT count(*)::integer AS count FROM " + primaryTable("web_sessions")
         + " WHERE participant_id=$1",

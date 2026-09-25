@@ -1,5 +1,7 @@
 import {
   telemetryV12RequiredConsent,
+  telemetryV11RequiredConsent,
+  TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
   TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
   TELEMETRY_V12_ENVELOPE_SCHEMA_VERSION,
   TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
@@ -31,6 +33,12 @@ interface DeviceSyncStateOptions extends RuntimeOptions {
 }
 
 interface DeviceSyncCapabilitiesOptions extends RuntimeOptions {
+  readonly sourceNamespace: string;
+  readonly nowEpoch?: number;
+}
+
+interface PostgresLegacyDeviceSyncCapabilitiesOptions extends RuntimeOptions {
+  /** The imported typed v1/v1.1 source that this private host is serving. */
   readonly sourceNamespace: string;
   readonly nowEpoch?: number;
 }
@@ -69,6 +77,30 @@ interface CapabilitiesRow {
   accountless_dictionary_version: string | null;
   accountless_privacy_version: string | null;
 }
+
+interface LegacyCapabilitiesRow {
+  namespace: string;
+  minimum_rank: number;
+  revision: number;
+  consent_v11: boolean;
+  owner_kind: "social" | "accountless";
+  authority_kind: "social" | "accountless";
+  accountless_v11: boolean;
+  incompatible_history: boolean;
+}
+
+interface LegacyTransportFormatRow {
+  schema_version: string;
+  format_rank: number;
+  lifecycle: "accepted" | "staged" | "blocked";
+}
+
+const LEGACY_CAPABILITY_FORMATS = Object.freeze([
+  Object.freeze({ schemaVersion: "telemetry-contribution-v0.1", rank: 1 }),
+  Object.freeze({ schemaVersion: "telemetry-contribution-v0.2", rank: 2 }),
+  Object.freeze({ schemaVersion: "telemetry-contribution-v1.0", rank: 10 }),
+  Object.freeze({ schemaVersion: TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, rank: 11 }),
+]);
 
 function schemaName(options: RuntimeOptions): string {
   return `"${createPostgresSchemaConfig(options.schema ?? {}).primarySchema}"`;
@@ -290,6 +322,156 @@ async function readCapabilitiesRow(
     [participantId, deviceId, now],
   );
   return result.rows[0] ?? null;
+}
+
+async function readLegacyCapabilitiesRow(
+  client: PostgresClient,
+  schema: string,
+  participantId: string,
+  deviceId: string,
+  now: string,
+): Promise<LegacyCapabilitiesRow | null> {
+  const result = await client.query<LegacyCapabilitiesRow>(
+    `SELECT enrollment.namespace,
+            COALESCE(device_floor.minimum_rank, participant_floor.minimum_rank) AS minimum_rank,
+            participant_floor.revision,
+            EXISTS (
+              SELECT 1 FROM ${table(schema, "telemetry_v11_device_consents")} consent
+               WHERE consent.participant_id = participant.id
+                 AND consent.device_id = device.id
+            ) AS consent_v11,
+            participant.owner_kind, device.authority_kind,
+            EXISTS (
+              SELECT 1
+                FROM ${table(schema, "accountless_enrollment_ledger")} ledger
+                JOIN ${table(schema, "accountless_upload_owners")} owner
+                  ON owner.enrollment_device_id = ledger.device_id
+                 AND owner.participant_id = participant.id
+                 AND owner.device_credential_id = device.id
+                 AND owner.state = 'active' AND owner.expires_at = ledger.expires_at
+                JOIN ${table(schema, "accountless_v11_device_authorizations")} accountless_grant
+                  ON accountless_grant.enrollment_device_id = ledger.device_id
+                 AND accountless_grant.participant_id = participant.id
+                 AND accountless_grant.device_credential_id = device.id
+                 AND accountless_grant.state = 'active'
+                 AND accountless_grant.expires_at = ledger.expires_at
+               WHERE ledger.device_id = device.accountless_enrollment_device_id
+                 AND ledger.state = 'active' AND ledger.expires_at > $3::timestamptz
+                 AND ledger.expires_at = device.expires_at
+            ) AS accountless_v11,
+            EXISTS (
+              SELECT 1 FROM ${table(schema, "telemetry_contributions")} legacy
+               WHERE legacy.participant_id = participant.id AND legacy.status = 'accepted'
+                 AND legacy.transport_schema_version = 'telemetry-contribution-v0.2'
+            ) AS incompatible_history
+       FROM ${table(schema, "participants")} participant
+       JOIN ${table(schema, "attribution_enrollments")} enrollment
+         ON enrollment.participant_id = participant.id
+       JOIN ${table(schema, "telemetry_transport_participant_floors")} participant_floor
+         ON participant_floor.participant_id = participant.id
+       JOIN ${table(schema, "device_credentials")} device
+         ON device.participant_id = participant.id
+       LEFT JOIN ${table(schema, "telemetry_transport_device_floors")} device_floor
+         ON device_floor.participant_id = participant.id AND device_floor.device_id = device.id
+      WHERE participant.id = $1 AND participant.state = 'active'
+        AND device.id = $2 AND device.state = 'active'
+        AND device.expires_at > $3::timestamptz`,
+    [participantId, deviceId, now],
+  );
+  return result.rows[0] ?? null;
+}
+
+/** Read the frozen four-format v1.1 capability response from one source-pinned
+ * PostgreSQL snapshot. The v1.2 successor remains a separate capability route. */
+export async function readPostgresDeviceSyncCapabilities(
+  pool: PostgresPool,
+  participantId: string,
+  deviceId: string,
+  destinationOrigin: string,
+  options: PostgresLegacyDeviceSyncCapabilitiesOptions,
+) {
+  let origin: URL;
+  try { origin = new URL(destinationOrigin); } catch {
+    throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
+  }
+  if (origin.origin !== destinationOrigin || (origin.protocol !== "https:"
+      && !(origin.protocol === "http:"
+        && ["localhost", "127.0.0.1", "[::1]"].includes(origin.hostname)))) {
+    throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
+  }
+  const schema = schemaName(options);
+  const nowEpoch = options.nowEpoch ?? Date.now();
+  const now = nowIso(nowEpoch);
+  const snapshot = await withPostgresRead(pool, async (client) => {
+    await requireTypedStorageSourcePins(client, schema, options.sourceNamespace);
+    const row = await readLegacyCapabilitiesRow(
+      client, schema, participantId, deviceId, now,
+    );
+    const formatsResult = await client.query<LegacyTransportFormatRow>(
+      `SELECT schema_version, format_rank, lifecycle
+         FROM ${table(schema, "telemetry_transport_formats")}
+        WHERE schema_version IN (
+          'telemetry-contribution-v0.1', 'telemetry-contribution-v0.2',
+          'telemetry-contribution-v1.0', 'telemetry-contribution-v1.1'
+        )
+        ORDER BY format_rank ASC`,
+    );
+    return { row, formats: [...formatsResult.rows] };
+  }, {
+    operation: "device_sync.capabilities_v11",
+    statementTimeoutMilliseconds: 10_000,
+    lockTimeoutMilliseconds: 1_000,
+    preserveSafeError: safeError,
+  });
+  const { row, formats } = snapshot;
+  if (!row) throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  if (typeof row.namespace !== "string" || !/^[0-9a-f]{64}$/u.test(row.namespace)
+      || !Number.isSafeInteger(row.minimum_rank) || !Number.isSafeInteger(row.revision)
+      || typeof row.consent_v11 !== "boolean" || typeof row.accountless_v11 !== "boolean"
+      || typeof row.incompatible_history !== "boolean") {
+    throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  }
+  const accountless = row.owner_kind === "accountless";
+  if ((accountless && (row.authority_kind !== "accountless" || !row.accountless_v11))
+      || (!accountless && (row.owner_kind !== "social" || row.authority_kind !== "social"))) {
+    throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  }
+  if (formats.length !== LEGACY_CAPABILITY_FORMATS.length
+      || formats.some((format, index) => {
+        const expected = LEGACY_CAPABILITY_FORMATS[index];
+        return expected === undefined
+          || format.schema_version !== expected.schemaVersion
+          || format.format_rank !== expected.rank
+          || !["accepted", "staged", "blocked"].includes(format.lifecycle);
+      })) {
+    throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  }
+
+  const base = {
+    schemaVersion: "device-sync-capabilities-v1.1" as const,
+    destinationOrigin,
+    enrollmentNamespace: row.namespace,
+    identityVersion: "account-track-v2" as const,
+    minimumWriteRank: row.minimum_rank,
+    policyRevision: row.revision,
+    requiredConsent: telemetryV11RequiredConsent(),
+    formats: formats.map((format) => ({
+      schemaVersion: format.schema_version,
+      rank: format.format_rank,
+      lifecycle: (row.incompatible_history
+        && format.schema_version === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION)
+        || (accountless && format.schema_version !== TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION)
+        ? "blocked" as const : format.lifecycle,
+    })),
+  };
+  return accountless
+    ? Object.freeze({
+      ...base,
+      consentCurrent: false as const,
+      authorityKind: "accountless" as const,
+      authorizationCurrent: true as const,
+    })
+    : Object.freeze({ ...base, consentCurrent: row.consent_v11 });
 }
 
 /** Read the separately-negotiated v1.2 capability contract after matching

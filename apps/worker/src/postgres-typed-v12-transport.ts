@@ -25,6 +25,9 @@ import {
 
 export interface PostgresDeviceAuthenticationOptions extends DeviceLifecycleOptions {
   readonly schema?: PostgresSchemaConfig;
+  /** Legacy capability negotiation is authorized by the original v1.1 grant.
+   * All other callers retain the stricter typed-v1.2 accountless fence. */
+  readonly accountlessAuthorizationVersion?: "v1.1" | "v1.2";
 }
 
 export interface PostgresDeviceUploadClaimOptions {
@@ -62,14 +65,14 @@ interface AccountlessAuthorityRow {
   owner_expires_at: string | Date;
   shared_authorization_state: string;
   shared_authorization_expires_at: string | Date;
-  authorization_state: string;
-  authorization_expires_at: string | Date;
-  telemetry_schema_version: string;
-  field_dictionary_version: string;
-  privacy_contract_version: string;
-  schema_version: string;
-  policy_version: string;
-  authorization_basis: string;
+  authorization_state: string | null;
+  authorization_expires_at: string | Date | null;
+  telemetry_schema_version: string | null;
+  field_dictionary_version: string | null;
+  privacy_contract_version: string | null;
+  schema_version: string | null;
+  policy_version: string | null;
+  authorization_basis: string | null;
 }
 
 interface UploadAuthorizationRow {
@@ -171,18 +174,38 @@ async function readAccountlessAuthority(
   enrollmentDeviceId: string | null,
   deviceExpiresAt: string | Date,
   now: string,
+  authorizationVersion: "v1.1" | "v1.2",
 ): Promise<boolean> {
   if (enrollmentDeviceId !== deviceId) return false;
+  const typedAuthorizationSelect = authorizationVersion === "v1.2"
+    ? `typed_authorization.state AS authorization_state,
+       typed_authorization.expires_at AS authorization_expires_at,
+       typed_authorization.telemetry_schema_version, typed_authorization.field_dictionary_version,
+       typed_authorization.privacy_contract_version, typed_authorization.schema_version,
+       typed_authorization.policy_version, typed_authorization.authorization_basis`
+    : `NULL::text AS authorization_state, NULL::timestamptz AS authorization_expires_at,
+       NULL::text AS telemetry_schema_version, NULL::text AS field_dictionary_version,
+       NULL::text AS privacy_contract_version, NULL::text AS schema_version,
+       NULL::text AS policy_version, NULL::text AS authorization_basis`;
+  const typedAuthorizationJoin = authorizationVersion === "v1.2"
+    ? `JOIN ${table(schema, "accountless_v12_device_authorizations")} typed_authorization
+         ON typed_authorization.enrollment_device_id = ledger.device_id
+        AND typed_authorization.participant_id = owner.participant_id
+        AND typed_authorization.device_credential_id = owner.device_credential_id`
+    : "";
+  const typedAuthorizationLock = authorizationVersion === "v1.2"
+    ? ", typed_authorization"
+    : "";
+  const typedAuthorizationPredicate = authorizationVersion === "v1.2"
+    ? `AND typed_authorization.participant_id = $2
+       AND typed_authorization.device_credential_id = $3`
+    : "";
   const result = await client.query<AccountlessAuthorityRow>(
     `SELECT ledger.state AS ledger_state, ledger.expires_at AS ledger_expires_at,
             owner.state AS owner_state, owner.expires_at AS owner_expires_at,
             shared_authorization.state AS shared_authorization_state,
             shared_authorization.expires_at AS shared_authorization_expires_at,
-            typed_authorization.state AS authorization_state,
-            typed_authorization.expires_at AS authorization_expires_at,
-            typed_authorization.telemetry_schema_version, typed_authorization.field_dictionary_version,
-            typed_authorization.privacy_contract_version, typed_authorization.schema_version,
-            typed_authorization.policy_version, typed_authorization.authorization_basis
+            ${typedAuthorizationSelect}
        FROM ${table(schema, "accountless_enrollment_ledger")} ledger
        JOIN ${table(schema, "accountless_upload_owners")} owner
          ON owner.enrollment_device_id = ledger.device_id
@@ -190,15 +213,13 @@ async function readAccountlessAuthority(
          ON shared_authorization.enrollment_device_id = ledger.device_id
         AND shared_authorization.participant_id = owner.participant_id
         AND shared_authorization.device_credential_id = owner.device_credential_id
-       JOIN ${table(schema, "accountless_v12_device_authorizations")} typed_authorization
-         ON typed_authorization.enrollment_device_id = ledger.device_id
+       ${typedAuthorizationJoin}
       WHERE ledger.device_id = $1 AND owner.participant_id = $2
         AND owner.device_credential_id = $3
         AND shared_authorization.participant_id = $2
         AND shared_authorization.device_credential_id = $3
-        AND typed_authorization.participant_id = $2
-        AND typed_authorization.device_credential_id = $3
-      FOR SHARE OF ledger, owner, shared_authorization, typed_authorization`,
+        ${typedAuthorizationPredicate}
+      FOR SHARE OF ledger, owner, shared_authorization${typedAuthorizationLock}`,
     [deviceId, participantId, deviceId],
   );
   const row = result.rows[0];
@@ -208,19 +229,23 @@ async function readAccountlessAuthority(
   return row.ledger_state === "active"
     && row.owner_state === "active"
     && row.shared_authorization_state === "active"
-    && row.authorization_state === "active"
+    && (authorizationVersion === "v1.1" || row.authorization_state === "active")
     && Number.isFinite(expiresAt)
     && expiresAt === deviceExpiry
     && expiresAt > Date.parse(now)
     && time(row.owner_expires_at) === expiresAt
     && time(row.shared_authorization_expires_at) === expiresAt
-    && time(row.authorization_expires_at) === expiresAt
-    && row.telemetry_schema_version === "telemetry-contribution-v1.2"
-    && row.field_dictionary_version === "telemetry-v1.2-registry-2026-09-20.1"
-    && row.privacy_contract_version === "ongoing-privacy-safe-telemetry-v1.2"
-    && row.schema_version === "accountless-upload-owner-v1.2"
-    && row.policy_version === "accountless-telemetry-v1.2-policy-v1"
-    && row.authorization_basis === "accountless-policy-v1.2";
+    && (authorizationVersion === "v1.1" || (
+      row.authorization_state === "active"
+      && row.authorization_expires_at !== null
+      && time(row.authorization_expires_at) === expiresAt
+      && row.telemetry_schema_version === "telemetry-contribution-v1.2"
+      && row.field_dictionary_version === "telemetry-v1.2-registry-2026-09-20.1"
+      && row.privacy_contract_version === "ongoing-privacy-safe-telemetry-v1.2"
+      && row.schema_version === "accountless-upload-owner-v1.2"
+      && row.policy_version === "accountless-telemetry-v1.2-policy-v1"
+      && row.authorization_basis === "accountless-policy-v1.2"
+    ));
 }
 
 function uploadSecret(header: string | null): { id: string; secret: string } {
@@ -312,7 +337,8 @@ export async function authenticatePostgresDevice(
       if (row.authority_kind === "accountless") {
         if (row.participant_consent_version !== null || row.social_verified_at !== null
             || !await readAccountlessAuthority(client, schema, row.participant_id, row.id,
-              row.accountless_enrollment_device_id, row.expires_at, now)) {
+              row.accountless_enrollment_device_id, row.expires_at, now,
+              options.accountlessAuthorizationVersion ?? "v1.2")) {
           throw new ApiError(401, "DEVICE_AUTH_INVALID");
         }
         const updated = await client.query(
@@ -446,7 +472,7 @@ export async function claimPostgresDeviceUploadAuthorization(
       if (row.device_authority_kind === "accountless"
           && !await readAccountlessAuthority(client, schema, row.participant_id,
             row.issued_by_device_id, row.accountless_enrollment_device_id,
-            row.device_expires_at, now)) {
+            row.device_expires_at, now, "v1.2")) {
         throw new ApiError(401, "UPLOAD_AUTH_INVALID");
       }
       const updated = await client.query(

@@ -562,6 +562,7 @@ const V12_DAY_MANIFEST_PATH = "/api/v1/device/telemetry/v1.2/day-manifests";
 const ENVELOPE_KEY_PATH = "/api/v1/envelope-key";
 const DEVICE_UPLOAD_AUTHORIZATION_PATH = "/api/v1/device/upload-authorizations";
 const DEVICE_SYNC_STATE_PATH = "/api/v1/device/sync/state";
+const DEVICE_SYNC_CAPABILITIES_PATH = "/api/v1/device/sync-capabilities";
 const DEVICE_SYNC_CAPABILITIES_V12_PATH = "/api/v1/device/sync-capabilities-v1.2";
 const V12_DOMAIN_PREDECESSOR_PATH = "/api/v1/me/telemetry-v12/domain-predecessor";
 const V12_DOMAIN_ACTIVATE_PATH = "/api/v1/me/telemetry-v12/domain-activate";
@@ -1336,6 +1337,7 @@ export function createPostgresTestV12DayManifestDispatch({
   authenticatePostgresDevice,
   hasPostgresDeletionTombstone,
   readPostgresDeviceSyncState,
+  readPostgresDeviceSyncCapabilities,
   readPostgresDeviceSyncV12Capabilities,
   readPostgresV12DayCandidates,
   readPostgresTelemetryV12EffectivePage,
@@ -1370,6 +1372,7 @@ export function createPostgresTestV12DayManifestDispatch({
       || typeof assertUploadAuthorizationAllowed !== "function"
       || typeof authenticatePostgresDevice !== "function"
       || typeof hasPostgresDeletionTombstone !== "function"
+      || typeof readPostgresDeviceSyncCapabilities !== "function"
       || typeof assertPostgresV12UploadAllowed !== "function"
       || typeof createPostgresDeviceUploadAuthorization !== "function"
       || typeof registerPostgresTypedV12DayManifest !== "function"
@@ -1447,6 +1450,7 @@ export function createPostgresTestV12DayManifestDispatch({
     const v12ChunkUploadRoute = request.method === "POST"
       && url.pathname === V12_CHUNK_UPLOAD_PATH;
     const syncStatePath = url.pathname === DEVICE_SYNC_STATE_PATH;
+    const syncCapabilitiesPath = url.pathname === DEVICE_SYNC_CAPABILITIES_PATH;
     const syncCapabilitiesV12Path = url.pathname === DEVICE_SYNC_CAPABILITIES_V12_PATH;
     const v12DomainPredecessorPath = url.pathname === V12_DOMAIN_PREDECESSOR_PATH;
     const v12DomainActivatePath = url.pathname === V12_DOMAIN_ACTIVATE_PATH;
@@ -1463,6 +1467,7 @@ export function createPostgresTestV12DayManifestDispatch({
     const accountlessRenewalRoute = accountlessRenewalPath && request.method === "POST";
     const deviceCredentialRenewalRoute = deviceCredentialRenewalPath && request.method === "POST";
     const syncStateRoute = syncStatePath && request.method === "GET";
+    const syncCapabilitiesRoute = syncCapabilitiesPath && request.method === "GET";
     const syncCapabilitiesV12Route = syncCapabilitiesV12Path && request.method === "GET";
     const v12DomainPredecessorRoute = v12DomainPredecessorPath && request.method === "POST";
     const v12DomainActivateRoute = v12DomainActivatePath && request.method === "POST";
@@ -1477,7 +1482,8 @@ export function createPostgresTestV12DayManifestDispatch({
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET, POST" },
       }), crypto.randomUUID());
     }
-    if ((syncStatePath || syncCapabilitiesV12Path) && request.method !== "GET") {
+    if ((syncStatePath || syncCapabilitiesPath || syncCapabilitiesV12Path)
+        && request.method !== "GET") {
       return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET" },
       }), crypto.randomUUID());
@@ -1519,13 +1525,14 @@ export function createPostgresTestV12DayManifestDispatch({
     }
     if ((!envelopeKeyRoute && !manifestRoute && !manifestReadRoute
         && !uploadAuthorizationRoute && !v12ChunkUploadRoute
-        && !syncStateRoute && !syncCapabilitiesV12Route
+        && !syncStateRoute && !syncCapabilitiesRoute && !syncCapabilitiesV12Route
         && !v12DomainPredecessorRoute && !v12DomainActivateRoute
         && !v12EffectivePageRoute && !accountlessEnrollmentRoute
         && !accountlessOwnershipRoute && !accountlessV12AuthorizationRoute
         && !accountlessRenewalRoute && !deviceCredentialRenewalRoute)
         || (url.search && !envelopeKeyRoute && !manifestReadRoute
-          && !syncStatePath && !syncCapabilitiesV12Path && !v12EffectivePageRoute)) {
+          && !syncStatePath && !syncCapabilitiesPath && !syncCapabilitiesV12Path
+          && !v12EffectivePageRoute)) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
     if ((accountlessEnrollmentRoute || accountlessOwnershipRoute || accountlessV12AuthorizationRoute
@@ -1704,7 +1711,8 @@ export function createPostgresTestV12DayManifestDispatch({
         );
         return json(201, body);
       }
-      if (syncStateRoute || syncCapabilitiesV12Route || manifestReadRoute || v12EffectivePageRoute) {
+      if (syncStateRoute || syncCapabilitiesRoute || syncCapabilitiesV12Route
+          || manifestReadRoute || v12EffectivePageRoute) {
         await assertAttemptAllowed(
           admissionEnv.RECOVERY_RATE_LIMIT,
           admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
@@ -1745,7 +1753,10 @@ export function createPostgresTestV12DayManifestDispatch({
       const device = await authenticatePostgresDevice(
         primaryPool,
         request.headers.get("authorization"),
-        { schema },
+        {
+          schema,
+          ...(syncCapabilitiesRoute ? { accountlessAuthorizationVersion: "v1.1" } : {}),
+        },
       );
       if (await hasPostgresDeletionTombstone(ledgerPool, device.participantId, Date.now(), { schema })) {
         throw Object.assign(new Error("DEVICE_AUTH_INVALID"), {
@@ -1765,6 +1776,15 @@ export function createPostgresTestV12DayManifestDispatch({
           device.participantId,
           device.deviceId,
           { schema, nowEpoch: Date.now() },
+        ));
+      }
+      if (syncCapabilitiesRoute) {
+        return json(200, await readPostgresDeviceSyncCapabilities(
+          primaryPool,
+          device.participantId,
+          device.deviceId,
+          url.origin,
+          { schema, sourceNamespace, nowEpoch: Date.now() },
         ));
       }
       if (syncCapabilitiesV12Route) {
