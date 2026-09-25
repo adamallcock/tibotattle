@@ -18,6 +18,7 @@ import {
   PostgresStorageError,
   quotePostgresIdentifier,
   withPostgresRead,
+  type PostgresClient,
   type PostgresPool,
   type PostgresSchemaOptions,
 } from "./postgres-client";
@@ -75,6 +76,33 @@ interface AllowancePreviewQueryRow {
   readonly generated_at: string;
   readonly payload_json: string;
   readonly payload_sha256: string;
+}
+
+interface CommunityDailySourceFenceRow {
+  readonly source_id: string;
+  readonly source_authority_epoch: string | number;
+  readonly source_cursor_sequence: string | number;
+  readonly terminal_sequence: string | number;
+  readonly v1_source_namespace: string;
+  readonly v1_runtime_contract_version: string | number;
+  readonly v11_source_namespace: string;
+  readonly v11_runtime_contract_version: string | number;
+  readonly policy_revision: string | number;
+  readonly collection_revision: string | number;
+  readonly control_state: string;
+  readonly publication_enabled: boolean;
+}
+
+interface CommunityDailySourceFence {
+  readonly sourceId: string;
+  readonly sourceAuthorityEpoch: number;
+  readonly sourceCursorSequence: number;
+  readonly terminalSequence: number;
+  readonly sourceNamespace: string;
+  readonly v1RuntimeContractVersion: number;
+  readonly v11RuntimeContractVersion: number;
+  readonly policyRevision: number;
+  readonly collectionRevision: number;
 }
 
 function fail(): never {
@@ -228,6 +256,92 @@ function validPreviewHash(row: AllowancePreviewQueryRow): Promise<boolean> {
   return sha256Hex(row.payload_json).then((hash) => hash === row.payload_sha256);
 }
 
+async function readCommunityDailySourceFence(
+  client: PostgresClient,
+  schema: string,
+  sourceId: string,
+  sourceNamespace: string,
+): Promise<CommunityDailySourceFence> {
+  const result = await client.query<CommunityDailySourceFenceRow>(
+    `SELECT source.source_id,
+            source.authority_epoch AS source_authority_epoch,
+            cursor.sequence AS source_cursor_sequence,
+            COALESCE((SELECT max(change.sequence) FROM ${schema}.storage_ingestion_changes change
+              WHERE change.source_id=source.source_id
+                AND change.kind IN ('owner-withdrawn', 'owner-erased')), 0) AS terminal_sequence,
+            v1.source_namespace AS v1_source_namespace,
+            v1.runtime_contract_version AS v1_runtime_contract_version,
+            v11.source_namespace AS v11_source_namespace,
+            v11.runtime_contract_version AS v11_runtime_contract_version,
+            policy.policy_revision,
+            controls.revision AS collection_revision,
+            controls.control_state,
+            controls.publication_enabled
+       FROM ${schema}.storage_source_state source
+       JOIN ${schema}.analytics_source_cursors cursor ON cursor.source_id=source.source_id
+       JOIN ${schema}.typed_v1_admission_state v1 ON v1.id=1
+       JOIN ${schema}.typed_v11_admission_state v11 ON v11.id=1
+       JOIN ${schema}.publication_state policy ON policy.singleton=1
+       JOIN ${schema}.collection_controls controls ON controls.singleton=1
+      WHERE source.singleton=1 AND source.source_id=$1`,
+    [sourceId],
+  );
+  const row = result.rows[0];
+  if (!Array.isArray(result.rows) || result.rows.length !== 1 || !row
+      || row.source_id !== sourceId
+      || row.v1_source_namespace !== sourceNamespace
+      || row.v11_source_namespace !== sourceNamespace
+      || integer(row.source_authority_epoch) < 0
+      || integer(row.source_cursor_sequence) < 0
+      || integer(row.terminal_sequence) < 0
+      || integer(row.v1_runtime_contract_version) !== 1
+      || integer(row.v11_runtime_contract_version) !== 1
+      || integer(row.policy_revision, 1) < 1
+      || integer(row.collection_revision, 1) < 1
+      || row.control_state !== "operational" || row.publication_enabled !== true) {
+    throw new PostgresStorageError("unavailable", "community_daily.authority", { retryable: false });
+  }
+  return Object.freeze({
+    sourceId: row.source_id,
+    sourceAuthorityEpoch: integer(row.source_authority_epoch),
+    sourceCursorSequence: integer(row.source_cursor_sequence),
+    terminalSequence: integer(row.terminal_sequence),
+    sourceNamespace: row.v1_source_namespace,
+    v1RuntimeContractVersion: integer(row.v1_runtime_contract_version),
+    v11RuntimeContractVersion: integer(row.v11_runtime_contract_version),
+    policyRevision: integer(row.policy_revision, 1),
+    collectionRevision: integer(row.collection_revision, 1),
+  });
+}
+
+function sameCommunityDailyHardAuthority(
+  snapshot: CommunityDailySourceFence,
+  current: CommunityDailySourceFence,
+): boolean {
+  return current.sourceId === snapshot.sourceId
+    && current.sourceNamespace === snapshot.sourceNamespace
+    && current.v1RuntimeContractVersion === snapshot.v1RuntimeContractVersion
+    && current.v11RuntimeContractVersion === snapshot.v11RuntimeContractVersion
+    && current.policyRevision === snapshot.policyRevision
+    && current.collectionRevision === snapshot.collectionRevision;
+}
+
+function assertCommunityDailyFinalFence(
+  snapshot: CommunityDailySourceFence,
+  current: CommunityDailySourceFence,
+): void {
+  // Accepted nonterminal input may advance the source/cursor while the last
+  // complete daily revision remains public. A new terminal sequence or any
+  // identity, policy, collection, or publication-control change must fail the
+  // whole read, matching the Worker source lane's final fence.
+  if (!sameCommunityDailyHardAuthority(snapshot, current)
+      || current.sourceAuthorityEpoch < snapshot.sourceAuthorityEpoch
+      || current.sourceCursorSequence < snapshot.sourceCursorSequence
+      || current.terminalSequence !== snapshot.terminalSequence) {
+    throw new PostgresStorageError("unavailable", "community_daily.authority", { retryable: false });
+  }
+}
+
 /**
  * Read the immutable published daily revisions on one repeatable-read
  * snapshot. Latest revisions are selected before withdrawal and authority
@@ -265,7 +379,10 @@ export async function readPostgresPublishedCommunityDaily(
   const schemas = createPostgresSchemaConfig(options.schema);
   const schema = quotePostgresIdentifier(schemas.primarySchema);
 
-  return withPostgresRead(pool, async (client) => {
+  const read = await withPostgresRead(pool, async (client) => {
+    const sourceFence = await readCommunityDailySourceFence(
+      client, schema, identity.sourceId, identity.sourceNamespace,
+    );
     const dailyResult = await client.query<CommunityDailyQueryRow>(
       `WITH ranked AS (
          SELECT aggregate.*,
@@ -391,6 +508,7 @@ export async function readPostgresPublishedCommunityDaily(
       });
     }
     return {
+      sourceFence,
       rows,
       allowancePublicationState,
       allowanceBreakdownsCache,
@@ -403,4 +521,13 @@ export async function readPostgresPublishedCommunityDaily(
     operation: "community_daily.read",
     preserveSafeError: (error) => error instanceof PostgresStorageError ? error : null,
   });
+  const finalFence = await withPostgresRead(pool, (client) => readCommunityDailySourceFence(
+    client, schema, identity.sourceId, identity.sourceNamespace,
+  ), {
+    operation: "community_daily.final_fence",
+    preserveSafeError: (error) => error instanceof PostgresStorageError ? error : null,
+  });
+  assertCommunityDailyFinalFence(read.sourceFence, finalFence);
+  const { sourceFence: _sourceFence, ...publicRead } = read;
+  return publicRead;
 }

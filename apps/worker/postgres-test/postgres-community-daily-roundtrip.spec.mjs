@@ -111,6 +111,14 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community daily publication read co
     sqlSchema = `"${schema}"`;
     await pool.query(`CREATE SCHEMA ${sqlSchema}`);
     await applyPostgresMigrations({ role: "primary", schema, pool });
+    await pool.query(`INSERT INTO ${sqlSchema}.typed_telemetry_namespaces(id,original_id)
+      VALUES (1,decode('0102','hex'))`);
+    await pool.query(`INSERT INTO ${sqlSchema}.typed_v1_admission_state(
+      id,source_namespace,namespace_id,runtime_contract_version,next_source_row_id)
+      VALUES (1,$1,1,1,1)`, [SOURCE_NAMESPACE]);
+    await pool.query(`INSERT INTO ${sqlSchema}.typed_v11_admission_state(
+      id,source_namespace,namespace_id,runtime_contract_version,next_source_row_id)
+      VALUES (1,$1,1,1,1)`, [SOURCE_NAMESPACE]);
     await pool.query(`INSERT INTO ${sqlSchema}.storage_source_state(singleton,source_id,authority_epoch)
       VALUES (1,$1,0)`, [SOURCE_ID]);
     await pool.query(`INSERT INTO ${sqlSchema}.analytics_source_cursors(source_id,sequence,authority_epoch)
@@ -144,8 +152,8 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community daily publication read co
     [SOURCE_ID, SOURCE_NAMESPACE, DAY, revision, json, digest(json), releaseState, RELEASED_AT]);
   }
 
-  async function read(options = {}) {
-    return readPostgresPublishedCommunityDaily(pool, {
+  async function readWithPool(readPool, options = {}) {
+    return readPostgresPublishedCommunityDaily(readPool, {
       sourceId: SOURCE_ID,
       sourceNamespace: SOURCE_NAMESPACE,
       fromDay: DAY,
@@ -155,6 +163,8 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community daily publication read co
       ...options,
     });
   }
+
+  async function read(options = {}) { return readWithPool(pool, options); }
 
   it("reads latest authorized rows, verifies payload hashes, and strips private/unknown fields", async () => {
     const today = new Date(NOW_MS).toISOString().slice(0, 10);
@@ -196,6 +206,43 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community daily publication read co
     await publish(2, dailyPayload(2), "withdrawn");
     const result = await read();
     assert.deepEqual(result.rows, []);
+  });
+
+  it("fails closed when a terminal event commits during the snapshot read", async () => {
+    await publish(1);
+    let signalPaused;
+    let resumeRead;
+    const paused = new Promise((resolve) => { signalPaused = resolve; });
+    const resume = new Promise((resolve) => { resumeRead = resolve; });
+    let intercepted = false;
+    const interleavedPool = {
+      async connect() {
+        const client = await pool.connect();
+        return {
+          async query(text, values) {
+            const result = await client.query(text, values);
+            if (!intercepted && text === "RELEASE SAVEPOINT community_daily_optional_reads") {
+              intercepted = true;
+              signalPaused();
+              await resume;
+            }
+            return result;
+          },
+          release: client.release.bind(client),
+        };
+      },
+    };
+    const pendingRead = readWithPool(interleavedPool);
+    await paused;
+    await pool.query(`INSERT INTO ${sqlSchema}.storage_ingestion_changes(
+      source_id,sequence,event_digest,owner_digest,owner_revision,authority_epoch,kind,recorded_ms)
+      VALUES ($1,1,$2,$3,1,1,'owner-erased',${NOW_MS})`,
+    [SOURCE_ID, "c".repeat(64), OWNER_DIGEST]);
+    resumeRead();
+
+    await expect(pendingRead).rejects.toMatchObject({
+      code: "unavailable", operation: "community_daily.authority",
+    });
   });
 
   it("terminal withdrawal tombstones every revision and invalidates optional allowance cache", async () => {
