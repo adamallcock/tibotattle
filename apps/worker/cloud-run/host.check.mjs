@@ -521,6 +521,9 @@ test("private participant-device dispatch preserves cookie auth, owner scope, an
   let authCalls = 0;
   let tombstoneChecks = 0;
   let deviceReads = 0;
+  let csrfChecks = 0;
+  let deviceRevocations = 0;
+  let revocationResult = true;
   let workerCalls = 0;
   const primaryPool = { async connect() { throw new Error("the PostgreSQL facades own reads"); } };
   const ledgerPool = { async connect() { throw new Error("the tombstone facade owns reads"); } };
@@ -537,7 +540,15 @@ test("private participant-device dispatch preserves cookie auth, owner scope, an
       assert.equal(pool, primaryPool);
       assert.equal(cookie, "__Host-usage_monitor_session=synthetic-session");
       assert.deepEqual(options, { schema: { primarySchema: "devices_test" } });
-      return { participantId: "synthetic-owner-a" };
+      return { participantId: "synthetic-owner-a", csrfToken: "synthetic-csrf-token" };
+    },
+    assertPostgresPersonalSessionCsrf: (request, csrfToken) => {
+      csrfChecks += 1;
+      if (new URL(request.url).origin !== request.headers.get("origin")
+          || request.headers.get("sec-fetch-site") !== "same-origin"
+          || request.headers.get("x-usage-monitor-csrf") !== csrfToken) {
+        throw Object.assign(new Error("CSRF_INVALID"), { code: "CSRF_INVALID", status: 403 });
+      }
     },
     hasPostgresDeletionTombstone: async (pool, participantId, _now, options) => {
       tombstoneChecks += 1;
@@ -560,6 +571,24 @@ test("private participant-device dispatch preserves cookie auth, owner scope, an
         revokedAt: null,
       }];
     },
+    revokePostgresParticipantDevice: async (pool, participantId, deviceId, options) => {
+      deviceRevocations += 1;
+      assert.equal(pool, primaryPool);
+      assert.equal(participantId, "synthetic-owner-a");
+      assert.equal(typeof deviceId, "string");
+      assert.deepEqual(options, { schema: { primarySchema: "devices_test" } });
+      return revocationResult;
+    },
+    readBoundedRequestBody: async (request, maximumBytes) => {
+      const bytes = new Uint8Array(await request.arrayBuffer());
+      if (bytes.byteLength > maximumBytes) {
+        throw Object.assign(new Error("BODY_TOO_LARGE"), {
+          code: "BODY_TOO_LARGE", status: 413,
+        });
+      }
+      return bytes;
+    },
+    maxRequestBytes: 2 * 1024 * 1024,
     healthDispatch,
     privateOrigin: "http://127.0.0.1:8080",
   });
@@ -569,6 +598,7 @@ test("private participant-device dispatch preserves cookie auth, owner scope, an
   };
   const workerHandler = async () => { workerCalls += 1; throw new Error("Worker must not be called"); };
   const path = "http://127.0.0.1:8080/api/v1/me/devices";
+  const revokePath = "http://127.0.0.1:8080/api/v1/me/devices/revoke";
 
   const wrongOrigin = await dispatchCloudRunHostRequest(
     new Request("http://other-host:8080/api/v1/me/devices"), runtime, workerHandler,
@@ -581,6 +611,22 @@ test("private participant-device dispatch preserves cookie auth, owner scope, an
   );
   assert.equal(wrongMethod.status, 405);
   assert.equal(wrongMethod.headers.get("allow"), "GET");
+
+  const wrongRevokeMethod = await dispatchCloudRunHostRequest(
+    new Request(revokePath), runtime, workerHandler,
+  );
+  assert.equal(wrongRevokeMethod.status, 405);
+  assert.equal(wrongRevokeMethod.headers.get("allow"), "POST");
+
+  const revokeAuthorization = await dispatchCloudRunHostRequest(new Request(revokePath, {
+    method: "POST",
+    headers: {
+      cookie: "__Host-usage_monitor_session=synthetic-session",
+      authorization: "Bearer device-capability",
+    },
+  }), runtime, workerHandler);
+  await assertApiError(revokeAuthorization, 401, "AUTH_INVALID");
+  assert.equal(authCalls, 0, "capability Authorization is rejected before session or database reads");
 
   const authorization = await dispatchCloudRunHostRequest(new Request(path, {
     headers: {
@@ -608,12 +654,73 @@ test("private participant-device dispatch preserves cookie auth, owner scope, an
   assert.equal(deviceReads, 1);
   assert.equal(workerCalls, 0);
 
+  const revokeRequest = (body, overrides = {}) => new Request(revokePath, {
+    method: "POST",
+    headers: {
+      cookie: "__Host-usage_monitor_session=synthetic-session",
+      origin: "http://127.0.0.1:8080",
+      "sec-fetch-site": "same-origin",
+      "x-usage-monitor-csrf": "synthetic-csrf-token",
+      "content-type": "application/json",
+      ...overrides,
+    },
+    body,
+  });
+  const csrfRejected = await dispatchCloudRunHostRequest(
+    revokeRequest(JSON.stringify({ deviceId: "synthetic-owner-a-device" }), {
+      "x-usage-monitor-csrf": "wrong-token",
+    }),
+    runtime,
+    workerHandler,
+  );
+  await assertApiError(csrfRejected, 403, "CSRF_INVALID");
+  assert.equal(deviceRevocations, 0, "the adapter must not mutate before valid CSRF");
+
+  const invalidBody = await dispatchCloudRunHostRequest(
+    revokeRequest(JSON.stringify({
+      deviceId: "synthetic-owner-a-device",
+      unexpected: true,
+    })),
+    runtime,
+    workerHandler,
+  );
+  await assertApiError(invalidBody, 400, "BODY_INVALID");
+  assert.equal(deviceRevocations, 0, "closed body validation precedes the mutation");
+
+  const revoked = await dispatchCloudRunHostRequest(
+    revokeRequest(JSON.stringify({ deviceId: "synthetic-owner-a-device" })),
+    runtime,
+    workerHandler,
+  );
+  assert.equal(revoked.status, 200);
+  assert.equal(revoked.headers.get("vary"), "Cookie");
+  assert.deepEqual(await revoked.json(), {
+    revoked: true,
+    deviceId: "synthetic-owner-a-device",
+  });
+  assert.equal(csrfChecks, 3);
+  assert.equal(deviceRevocations, 1);
+
+  revocationResult = false;
+  const wrongOwner = await dispatchCloudRunHostRequest(
+    revokeRequest(JSON.stringify({ deviceId: "synthetic-owner-b-device" })),
+    runtime,
+    workerHandler,
+  );
+  await assertApiError(wrongOwner, 404, "DEVICE_NOT_FOUND");
+  assert.equal(deviceRevocations, 2);
+  assert.equal(workerCalls, 0);
+
   const staleReadiness = createPostgresTestParticipantDevicesDispatch({
     primaryPool,
     ledgerPool,
     schemaOptions: { primarySchema: "devices_test", ledgerSchema: "devices_ledger_test" },
     authenticatePostgresPersonalSession: async () => { throw new Error("must not authenticate when stale"); },
+    assertPostgresPersonalSessionCsrf: () => { throw new Error("must not check CSRF when stale"); },
     listPostgresParticipantDevices: async () => { throw new Error("must not read when stale"); },
+    revokePostgresParticipantDevice: async () => { throw new Error("must not mutate when stale"); },
+    readBoundedRequestBody: async () => { throw new Error("must not read body when stale"); },
+    maxRequestBytes: 2 * 1024 * 1024,
     hasPostgresDeletionTombstone: async () => { throw new Error("must not check ledger when stale"); },
     healthDispatch: async () => new Response(null, { status: 503 }),
     privateOrigin: "http://127.0.0.1:8080",
@@ -1134,9 +1241,44 @@ test("PostgreSQL personal-device adapter validates Worker session bindings and m
         session.sessionCookie(valid),
         { schema, nowEpoch: now },
       ),
-      { participantId },
+      { participantId, csrfToken: valid.csrfToken },
       "a valid cookie remains readable without a consent-version requirement",
     );
+    const csrfRequest = new Request("https://private.example.test/api/v1/me/devices/revoke", {
+      method: "POST",
+      headers: {
+        origin: "https://private.example.test",
+        "sec-fetch-site": "same-origin",
+        "x-usage-monitor-csrf": valid.csrfToken,
+      },
+    });
+    assert.doesNotThrow(() => personalDevices.assertPostgresPersonalSessionCsrf(
+      csrfRequest,
+      valid.csrfToken,
+    ));
+    for (const request of [
+      new Request(csrfRequest.url, {
+        method: "POST",
+        headers: { origin: "https://attacker.example.test", "x-usage-monitor-csrf": valid.csrfToken },
+      }),
+      new Request(csrfRequest.url, {
+        method: "POST",
+        headers: { origin: "https://private.example.test", "x-usage-monitor-csrf": "wrong" },
+      }),
+      new Request(csrfRequest.url, {
+        method: "POST",
+        headers: {
+          origin: "https://private.example.test",
+          "sec-fetch-site": "cross-site",
+          "x-usage-monitor-csrf": valid.csrfToken,
+        },
+      }),
+    ]) {
+      assert.throws(
+        () => personalDevices.assertPostgresPersonalSessionCsrf(request, valid.csrfToken),
+        { code: "CSRF_INVALID", status: 403 },
+      );
+    }
     assert.deepEqual(
       await personalDevices.listPostgresParticipantDevices(pool, participantId, { schema }),
       [{
@@ -1281,7 +1423,7 @@ test("private health dispatch validates current primary and independent ledger P
   }
 });
 
-test("private PostgreSQL 17 participant devices GET preserves session semantics and owner isolation", {
+test("private PostgreSQL 17 participant-device routes preserve revocation effects and owner isolation", {
   skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
   timeout: 90_000,
 }, async () => {
@@ -1332,13 +1474,16 @@ test("private PostgreSQL 17 participant devices GET preserves session semantics 
       server: { middlewareMode: true },
       appType: "custom",
     });
-    const [session, personalDevices, ledgerAuthority, deletionDigest, runtimeSchema]
+    const [session, personalDevices, ledgerAuthority, deletionDigest, runtimeSchema,
+      bodyReader, workerConstants]
       = await Promise.all([
         vite.ssrLoadModule("/src/session.ts"),
         vite.ssrLoadModule("/src/postgres-personal-devices.ts"),
         vite.ssrLoadModule("/src/postgres-ledger-authority.ts"),
         vite.ssrLoadModule("/src/participant-deletion-digest.ts"),
         vite.ssrLoadModule("/src/postgres-runtime-schema.ts"),
+        vite.ssrLoadModule("/src/bounded-body.ts"),
+        vite.ssrLoadModule("/src/constants.ts"),
       ]);
     const primaryTable = (name) => quotedTable(primarySchema, name);
     const ledgerTable = (name) => quotedTable(ledgerSchema, name);
@@ -1410,6 +1555,27 @@ test("private PostgreSQL 17 participant devices GET preserves session semantics 
       };
     }
 
+    async function insertUploadAuthorization(deviceId, participantId, {
+      state,
+      leaseExpiresAt = null,
+    }) {
+      const id = `synthetic-device-upload-${randomUUID()}`;
+      await primaryPool.query(
+        `INSERT INTO ${primaryTable("device_upload_authorizations")} (
+           id, participant_id, issued_by_device_id, secret_hash, envelope_digest,
+           body_bytes, content_type, state, issued_at, expires_at,
+           consumed_at, revoked_at, consume_lease_expires_at
+         ) VALUES ($1,$2,$3,$4,$5,1,'application/json',$6,$7,$8,
+           CASE WHEN $6 = 'consumed' THEN $7::timestamptz ELSE NULL END,
+           CASE WHEN $6 = 'revoked' THEN $7::timestamptz ELSE NULL END,
+           $9::timestamptz)`,
+        [id, participantId, deviceId, randomBytes(32), "a".repeat(64), state,
+          new Date(now - 1_000).toISOString(), new Date(now + 60_000).toISOString(),
+          leaseExpiresAt],
+      );
+      return id;
+    }
+
     const sessionA = await insertSession(participantA);
     const sessionB = await insertSession(participantB);
     const oldSessionA = await insertSession(participantA, {
@@ -1421,6 +1587,9 @@ test("private PostgreSQL 17 participant devices GET preserves session semantics 
     const deviceAOld = await insertDevice(participantA, sessionA.id, {
       issuedAt: new Date(now - 120_000).toISOString(),
     });
+    const deviceAOther = await insertDevice(participantA, sessionA.id, {
+      issuedAt: new Date(now - 180_000).toISOString(),
+    });
     const deviceARevokedExpired = await insertDevice(participantA, sessionA.id, {
       issuedAt: new Date(now - 60_000).toISOString(),
       state: "revoked",
@@ -1428,6 +1597,22 @@ test("private PostgreSQL 17 participant devices GET preserves session semantics 
     });
     const deviceB = await insertDevice(participantB, sessionB.id, {
       issuedAt: new Date(now - 10_000).toISOString(),
+    });
+    const unusedGrant = await insertUploadAuthorization(deviceAOld.deviceId, participantA, {
+      state: "unused",
+    });
+    const consumingGrant = await insertUploadAuthorization(deviceAOld.deviceId, participantA, {
+      state: "consuming",
+      leaseExpiresAt: new Date(now + 30_000).toISOString(),
+    });
+    const consumedGrant = await insertUploadAuthorization(deviceAOld.deviceId, participantA, {
+      state: "consumed",
+    });
+    const unrelatedGrant = await insertUploadAuthorization(deviceAOther.deviceId, participantA, {
+      state: "unused",
+    });
+    const crossOwnerGrant = await insertUploadAuthorization(deviceB.deviceId, participantB, {
+      state: "unused",
     });
 
     const digest = await deletionDigest.participantDeletionDigest(participantB);
@@ -1450,7 +1635,11 @@ test("private PostgreSQL 17 participant devices GET preserves session semantics 
       ledgerPool,
       schemaOptions: schemas,
       authenticatePostgresPersonalSession: personalDevices.authenticatePostgresPersonalSession,
+      assertPostgresPersonalSessionCsrf: personalDevices.assertPostgresPersonalSessionCsrf,
       listPostgresParticipantDevices: personalDevices.listPostgresParticipantDevices,
+      revokePostgresParticipantDevice: personalDevices.revokePostgresParticipantDevice,
+      readBoundedRequestBody: bodyReader.readBoundedRequestBody,
+      maxRequestBytes: workerConstants.MAX_REQUEST_BYTES,
       hasPostgresDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
       healthDispatch,
       privateOrigin: "http://127.0.0.1:43818",
@@ -1487,11 +1676,171 @@ test("private PostgreSQL 17 participant devices GET preserves session semantics 
           lastUsedAt: deviceAOld.lastUsedAt,
           revokedAt: null,
         },
+        {
+          deviceId: deviceAOther.deviceId,
+          state: "active",
+          createdAt: deviceAOther.createdAt,
+          expiresAt: deviceAOther.expiresAt,
+          lastUsedAt: deviceAOther.lastUsedAt,
+          revokedAt: null,
+        },
       ],
     }, "the route returns all of the authenticated owner's devices in Worker order");
     assert.equal(JSON.stringify(bodyA).includes(deviceB.deviceId), false,
       "a query parameter cannot select or disclose another participant's device");
     assert.equal(JSON.stringify(bodyA).includes(participantB), false);
+
+    const revokeUrl = "http://127.0.0.1:43818/api/v1/me/devices/revoke";
+    const revoke = (material, value, extraHeaders = {}) => new Request(revokeUrl, {
+      method: "POST",
+      headers: {
+        cookie: session.sessionCookie(material),
+        origin: "http://127.0.0.1:43818",
+        "sec-fetch-site": "same-origin",
+        "x-usage-monitor-csrf": material.csrfToken,
+        "content-type": "application/json",
+        ...extraHeaders,
+      },
+      body: JSON.stringify(value),
+    });
+
+    await assertApiError(
+      await dispatchCloudRunHostRequest(
+        revoke(sessionA, { deviceId: deviceAOld.deviceId }, {
+          "x-usage-monitor-csrf": "um_csrf_invalid",
+        }),
+        runtime,
+        workerHandler,
+      ),
+      403,
+      "CSRF_INVALID",
+    );
+    await assertApiError(
+      await dispatchCloudRunHostRequest(
+        revoke(sessionA, { deviceId: deviceAOld.deviceId }, {
+          origin: "http://attacker.invalid",
+        }),
+        runtime,
+        workerHandler,
+      ),
+      403,
+      "CSRF_INVALID",
+    );
+    await assertApiError(
+      await dispatchCloudRunHostRequest(
+        revoke(oldSessionA, { deviceId: deviceAOld.deviceId }),
+        runtime,
+        workerHandler,
+      ),
+      401,
+      "AUTH_INVALID",
+    );
+    await assertApiError(
+      await dispatchCloudRunHostRequest(
+        revoke(sessionA, { deviceId: deviceAOld.deviceId, unexpected: true }),
+        runtime,
+        workerHandler,
+      ),
+      400,
+      "BODY_INVALID",
+    );
+    await assertApiError(
+      await dispatchCloudRunHostRequest(
+        revoke(sessionA, { deviceId: deviceAOld.deviceId }, { "content-type": "text/plain" }),
+        runtime,
+        workerHandler,
+      ),
+      415,
+      "CONTENT_TYPE_INVALID",
+    );
+    const unchangedAfterDeniedRequests = await primaryPool.query(
+      `SELECT state FROM ${primaryTable("device_credentials")} WHERE id=$1`,
+      [deviceAOld.deviceId],
+    );
+    assert.equal(unchangedAfterDeniedRequests.rows[0]?.state, "active",
+      "failed CSRF, stale session, and body validation leave the credential untouched");
+
+    const firstRevocation = await dispatchCloudRunHostRequest(
+      revoke(sessionA, { deviceId: deviceAOld.deviceId }), runtime, workerHandler,
+    );
+    assert.equal(firstRevocation.status, 200);
+    assert.equal(firstRevocation.headers.get("vary"), "Cookie");
+    assert.deepEqual(await firstRevocation.json(), {
+      revoked: true,
+      deviceId: deviceAOld.deviceId,
+    });
+
+    const firstState = await primaryPool.query(
+      `SELECT state, revoked_at FROM ${primaryTable("device_credentials")} WHERE id=$1`,
+      [deviceAOld.deviceId],
+    );
+    assert.equal(firstState.rows[0]?.state, "revoked");
+    assert.ok(firstState.rows[0]?.revoked_at instanceof Date);
+    const revokedAt = firstState.rows[0].revoked_at.toISOString();
+    const replay = await dispatchCloudRunHostRequest(
+      revoke(sessionA, { deviceId: deviceAOld.deviceId }), runtime, workerHandler,
+    );
+    assert.equal(replay.status, 200, "owner revocation is idempotent for terminal devices");
+    assert.deepEqual(await replay.json(), {
+      revoked: true,
+      deviceId: deviceAOld.deviceId,
+    });
+    const replayState = await primaryPool.query(
+      `SELECT state, revoked_at FROM ${primaryTable("device_credentials")} WHERE id=$1`,
+      [deviceAOld.deviceId],
+    );
+    assert.equal(replayState.rows[0]?.state, "revoked");
+    assert.equal(replayState.rows[0]?.revoked_at.toISOString(), revokedAt,
+      "replaying revocation preserves the terminal timestamp");
+
+    const grantStates = await primaryPool.query(
+      `SELECT id, state, revoked_at, consume_lease_expires_at
+         FROM ${primaryTable("device_upload_authorizations")}
+        WHERE id = ANY($1::text[])`,
+      [[unusedGrant, consumingGrant, consumedGrant, unrelatedGrant]],
+    );
+    const grants = new Map(grantStates.rows.map((row) => [row.id, row]));
+    assert.equal(grants.get(unusedGrant)?.state, "revoked");
+    assert.equal(grants.get(consumingGrant)?.state, "revoked");
+    assert.equal(grants.get(consumingGrant)?.consume_lease_expires_at, null,
+      "revocation clears an interrupted upload lease");
+    assert.ok(grants.get(unusedGrant)?.revoked_at instanceof Date);
+    assert.equal(grants.get(consumedGrant)?.state, "consumed",
+      "consumed upload receipts remain historical and immutable");
+    assert.equal(grants.get(unrelatedGrant)?.state, "unused",
+      "a sibling device's grant is unaffected");
+
+    const crossOwner = await dispatchCloudRunHostRequest(
+      revoke(sessionA, { deviceId: deviceB.deviceId }), runtime, workerHandler,
+    );
+    const crossOwnerBody = await assertApiError(crossOwner, 404, "DEVICE_NOT_FOUND");
+    assert.equal(JSON.stringify(crossOwnerBody).includes(deviceB.deviceId), false,
+      "cross-owner revocation returns a uniform not-found without echoing the target");
+    const stillActiveB = await primaryPool.query(
+      `SELECT state FROM ${primaryTable("device_credentials")} WHERE id=$1 AND participant_id=$2`,
+      [deviceB.deviceId, participantB],
+    );
+    assert.equal(stillActiveB.rows[0]?.state, "active");
+    const crossOwnerGrantState = await primaryPool.query(
+      `SELECT state FROM ${primaryTable("device_upload_authorizations")} WHERE id=$1`,
+      [crossOwnerGrant],
+    );
+    assert.equal(crossOwnerGrantState.rows[0]?.state, "unused",
+      "a non-owner cannot revoke another participant's pending upload grant");
+    await assertApiError(
+      await dispatchCloudRunHostRequest(
+        revoke(sessionA, { deviceId: "not-a-uuid" }), runtime, workerHandler,
+      ),
+      404,
+      "DEVICE_NOT_FOUND",
+    );
+
+    const afterRevocation = await dispatchCloudRunHostRequest(
+      request(sessionA), runtime, workerHandler,
+    );
+    const afterRevocationBody = await afterRevocation.json();
+    assert.equal(afterRevocationBody.devices.find((device) => device.deviceId === deviceAOld.deviceId)?.state,
+      "revoked", "the owner-visible device history reflects the committed revocation");
 
     for (const [material, code] of [
       [oldSessionA, "AUTH_INVALID"],

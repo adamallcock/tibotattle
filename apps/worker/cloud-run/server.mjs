@@ -7,8 +7,10 @@ import { fileURLToPath } from "node:url";
 import { createPostgresWorkerBackend } from "../src/backend-composition.ts";
 import { readPostgresPublishedCommunityDaily } from "../src/postgres-community-daily.ts";
 import {
+  assertPostgresPersonalSessionCsrf,
   authenticatePostgresPersonalSession,
   listPostgresParticipantDevices,
+  revokePostgresParticipantDevice,
 } from "../src/postgres-personal-devices.ts";
 import {
   handleRequest,
@@ -505,7 +507,11 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         ledgerPool,
         schemaOptions,
         authenticatePostgresPersonalSession,
+        assertPostgresPersonalSessionCsrf,
         listPostgresParticipantDevices,
+        revokePostgresParticipantDevice,
+        readBoundedRequestBody,
+        maxRequestBytes: MAX_REQUEST_BYTES,
         hasPostgresDeletionTombstone,
         healthDispatch,
         privateOrigin: hostOrigin,
@@ -526,7 +532,10 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           let pathname;
           try { pathname = new URL(request.url).pathname; } catch { /* V12 dispatch returns a safe 503. */ }
           if (pathname === "/api/v1/community/daily") return communityDailyDispatch(request);
-          if (pathname === "/api/v1/me/devices") return participantDevicesDispatch(request);
+          if (pathname === "/api/v1/me/devices"
+              || pathname === "/api/v1/me/devices/revoke") {
+            return participantDevicesDispatch(request);
+          }
           return v12Dispatch(request);
         })(createPostgresTestV12DayManifestDispatch({
           primaryPool,

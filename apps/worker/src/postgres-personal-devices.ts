@@ -4,12 +4,14 @@ import { ApiError } from "./errors";
 import {
   createPostgresSchemaConfig,
   quotePostgresIdentifier,
+  withPostgresMutation,
   withPostgresRead,
   type PostgresPool,
   type PostgresSchemaOptions,
 } from "./postgres-client";
 
 const SESSION_TOKEN = /^um_session_([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43})$/u;
+const DEVICE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const UTC_MILLISECOND_INSTANT = 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"';
 const MAX_PARTICIPANT_DEVICES = 100;
 
@@ -73,7 +75,7 @@ export async function authenticatePostgresPersonalSession(
   pool: PostgresPool,
   cookieHeader: string | null,
   options: { readonly schema?: PostgresSchemaOptions; readonly nowEpoch?: number } = {},
-): Promise<{ readonly participantId: string }> {
+): Promise<{ readonly participantId: string; readonly csrfToken: string }> {
   const parsed = parseSessionCookie(cookieHeader);
   const schemas = createPostgresSchemaConfig(options.schema);
   const primary = quotePostgresIdentifier(schemas.primarySchema);
@@ -119,7 +121,29 @@ export async function authenticatePostgresPersonalSession(
   if (typeof row.participant_id !== "string" || row.participant_id.length === 0) {
     throw new ApiError(401, "AUTH_INVALID");
   }
-  return Object.freeze({ participantId: row.participant_id });
+  return Object.freeze({ participantId: row.participant_id, csrfToken });
+}
+
+/** Apply the Worker session-bound same-origin and CSRF checks to a private-host mutation. */
+export function assertPostgresPersonalSessionCsrf(
+  request: Request,
+  csrfToken: string,
+): void {
+  const origin = request.headers.get("origin");
+  if (origin !== new URL(request.url).origin) throw new ApiError(403, "CSRF_INVALID");
+  const fetchSite = request.headers.get("sec-fetch-site");
+  if (fetchSite !== null && fetchSite !== "same-origin") {
+    throw new ApiError(403, "CSRF_INVALID");
+  }
+  const value = request.headers.get("x-usage-monitor-csrf");
+  if (typeof value !== "string"
+      || value.length > 96
+      || !timingSafeEqual(
+        new TextEncoder().encode(value),
+        new TextEncoder().encode(csrfToken),
+      )) {
+    throw new ApiError(403, "CSRF_INVALID");
+  }
 }
 
 /** Read the same bounded device projection as Worker listParticipantDevices. */
@@ -179,5 +203,52 @@ export async function listPostgresParticipantDevices(
       lastUsedAt: row.last_used_at,
       revokedAt: row.revoked_at,
     };
+  });
+}
+
+/** Revoke an owner-held device and its pending upload capabilities atomically. */
+export async function revokePostgresParticipantDevice(
+  pool: PostgresPool,
+  participantId: string,
+  deviceId: string,
+  options: { readonly schema?: PostgresSchemaOptions } = {},
+): Promise<boolean> {
+  if (typeof participantId !== "string" || participantId.length === 0) {
+    throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  }
+  if (typeof deviceId !== "string" || !DEVICE_ID.test(deviceId)) return false;
+
+  const schemas = createPostgresSchemaConfig(options.schema);
+  const primary = quotePostgresIdentifier(schemas.primarySchema);
+  return withPostgresMutation(pool, async (client) => {
+    const ownerDevice = await client.query<{ readonly id: string }>(
+      `SELECT device.id
+         FROM ${primary}."device_credentials" device
+        WHERE device.id = $1 AND device.participant_id = $2
+        FOR UPDATE`,
+      [deviceId, participantId],
+    );
+    if (ownerDevice.rows.length !== 1) return false;
+
+    const now = new Date().toISOString();
+    await client.query(
+      `UPDATE ${primary}."device_credentials"
+          SET state = 'revoked', revoked_at = $3::timestamptz
+        WHERE id = $1 AND participant_id = $2 AND state = 'active'`,
+      [deviceId, participantId, now],
+    );
+    await client.query(
+      `UPDATE ${primary}."device_upload_authorizations"
+          SET state = 'revoked', revoked_at = $3::timestamptz,
+              consume_lease_expires_at = NULL
+        WHERE participant_id = $1 AND issued_by_device_id = $2
+          AND state IN ('unused', 'consuming')`,
+      [participantId, deviceId, now],
+    );
+    return true;
+  }, {
+    operation: "personal_devices.revoke",
+    statementTimeoutMilliseconds: 5_000,
+    lockTimeoutMilliseconds: 2_000,
   });
 }

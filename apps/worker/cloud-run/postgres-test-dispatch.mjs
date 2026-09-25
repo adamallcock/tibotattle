@@ -10,6 +10,7 @@ const POSTGRES_MAJOR_REQUIRED = 17;
 const V12_CHUNK_UPLOAD_PATH = "/api/v1/contributions";
 const COMMUNITY_DAILY_PATH = "/api/v1/community/daily";
 const PARTICIPANT_DEVICES_PATH = "/api/v1/me/devices";
+const PARTICIPANT_DEVICE_REVOKE_PATH = "/api/v1/me/devices/revoke";
 const COMMUNITY_DAILY_MAX_RANGE_DAYS = 366;
 export const CLOUD_RUN_IAM_TEST_TARGET = Object.freeze({
   project: "tibotattle",
@@ -398,13 +399,57 @@ export function createPostgresTestCommunityDailyDispatch({
   };
 }
 
-/** Private Cloud Run test route for the Worker-compatible personal device read. */
+function personalDevicesRequestError(status, code, responseHeaders) {
+  return Object.assign(new Error(code), {
+    code,
+    status,
+    ...(responseHeaders === undefined ? {} : { responseHeaders }),
+  });
+}
+
+async function readPersonalDeviceRevocationId(request, readBoundedRequestBody, maxRequestBytes) {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+  if (contentType !== "application/json") {
+    throw personalDevicesRequestError(415, "CONTENT_TYPE_INVALID");
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw personalDevicesRequestError(400, "BODY_INVALID");
+    }
+    if (length > maxRequestBytes) {
+      throw personalDevicesRequestError(413, "BODY_TOO_LARGE");
+    }
+  }
+  const bytes = await readBoundedRequestBody(request, maxRequestBytes, {
+    maximumTotalMilliseconds: 15_000,
+    maximumIdleMilliseconds: 5_000,
+  });
+  let value;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
+  } catch {
+    throw personalDevicesRequestError(400, "BODY_INVALID");
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)
+      || Object.keys(value).length !== 1 || typeof value.deviceId !== "string") {
+    throw personalDevicesRequestError(400, "BODY_INVALID");
+  }
+  return value.deviceId;
+}
+
+/** Private Cloud Run test routes for Worker-compatible personal device reads and revocation. */
 export function createPostgresTestParticipantDevicesDispatch({
   primaryPool,
   ledgerPool,
   schemaOptions,
   authenticatePostgresPersonalSession,
+  assertPostgresPersonalSessionCsrf,
   listPostgresParticipantDevices,
+  revokePostgresParticipantDevice,
+  readBoundedRequestBody,
+  maxRequestBytes,
   hasPostgresDeletionTombstone,
   healthDispatch,
   privateOrigin,
@@ -415,7 +460,11 @@ export function createPostgresTestParticipantDevicesDispatch({
       || typeof ledgerPool.connect !== "function"
       || primaryPool === ledgerPool
       || typeof authenticatePostgresPersonalSession !== "function"
+      || typeof assertPostgresPersonalSessionCsrf !== "function"
       || typeof listPostgresParticipantDevices !== "function"
+      || typeof revokePostgresParticipantDevice !== "function"
+      || typeof readBoundedRequestBody !== "function"
+      || !Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1
       || typeof hasPostgresDeletionTombstone !== "function"
       || typeof healthDispatch !== "function") {
     configurationError("POSTGRES_TEST_PARTICIPANT_DEVICES_DISPATCH_CONFIGURATION_INVALID");
@@ -430,20 +479,23 @@ export function createPostgresTestParticipantDevicesDispatch({
     try { url = new URL(request.url); } catch {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
-    if (url.origin !== privateOrigin || url.pathname !== PARTICIPANT_DEVICES_PATH) {
+    const isDeviceList = url.pathname === PARTICIPANT_DEVICES_PATH;
+    const isDeviceRevocation = url.pathname === PARTICIPANT_DEVICE_REVOKE_PATH;
+    if (url.origin !== privateOrigin || (!isDeviceList && !isDeviceRevocation)) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
-    if (request.method !== "GET") {
-      return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
-        code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET" },
-      }), crypto.randomUUID());
+    const requestId = crypto.randomUUID();
+    const requiredMethod = isDeviceList ? "GET" : "POST";
+    if (request.method !== requiredMethod) {
+      return routeError(personalDevicesRequestError(405, "METHOD_NOT_ALLOWED", {
+        allow: requiredMethod,
+      }), requestId);
     }
 
-    const requestId = crypto.randomUUID();
     try {
       // Cloud Run carries its IAM assertion in x-serverless-authorization;
       // the Node boundary removes that header. Authorization remains reserved
-      // for Worker capabilities and personalSession rejects it for this GET.
+      // for Worker capabilities and personalSession rejects it for these routes.
       if (request.headers.has("authorization")) {
         throw Object.assign(new Error("AUTH_INVALID"), { code: "AUTH_INVALID", status: 401 });
       }
@@ -467,13 +519,34 @@ export function createPostgresTestParticipantDevicesDispatch({
       )) {
         throw Object.assign(new Error("AUTH_INVALID"), { code: "AUTH_INVALID", status: 401 });
       }
-      const devices = await listPostgresParticipantDevices(
+      const schema = { primarySchema: schemas.primary };
+      if (isDeviceList) {
+        const devices = await listPostgresParticipantDevices(
+          primaryPool,
+          principal.participantId,
+          { schema },
+        );
+        if (!Array.isArray(devices) || devices.length > 100) throw storageUnavailable();
+        return json(200, { devices }, { vary: "Cookie" });
+      }
+      if (typeof principal.csrfToken !== "string" || principal.csrfToken.length === 0) {
+        throw storageUnavailable();
+      }
+      assertPostgresPersonalSessionCsrf(request, principal.csrfToken);
+      const deviceId = await readPersonalDeviceRevocationId(
+        request,
+        readBoundedRequestBody,
+        maxRequestBytes,
+      );
+      const revoked = await revokePostgresParticipantDevice(
         primaryPool,
         principal.participantId,
-        { schema: { primarySchema: schemas.primary } },
+        deviceId,
+        { schema },
       );
-      if (!Array.isArray(devices) || devices.length > 100) throw storageUnavailable();
-      return json(200, { devices }, { vary: "Cookie" });
+      if (typeof revoked !== "boolean") throw storageUnavailable();
+      if (!revoked) throw personalDevicesRequestError(404, "DEVICE_NOT_FOUND");
+      return json(200, { revoked: true, deviceId }, { vary: "Cookie" });
     } catch (error) {
       if (Number.isSafeInteger(error?.status)
           && typeof error?.code === "string" && /^[A-Z0-9_]+$/u.test(error.code)) {
