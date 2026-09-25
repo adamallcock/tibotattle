@@ -29,6 +29,17 @@ selected-day records, plus disabled publication controls; the daily route
 remained fail-closed. A synthetic activation and publication proof are the
 next test-only gates.
 
+The private Cloud Run dispatch recognizes at most 16 of the 51 exact Worker
+registry paths, plus one private test-only effective-page path. The other 35
+registry paths include six identity handoff, six admin, nine session, and
+eight device routes. The normal Worker request path still explicitly rejects
+the PostgreSQL backend (`isPostgresWorkerRequestPathSupported()` returns
+`false`). A complete traffic cutover therefore requires the remaining route
+contracts, authentication and authorization, and public/admin ingress to be
+ported and tested; private test health and a synthetic upload do not qualify
+that switch. This is a source inventory at commit `b2dea68a`, not a live
+public deployment observation.
+
 The subsequent [private daily and readpaged graph receipt](../receipts/2026-09-25-gcp-a2-daily-and-readpaged-graph.md)
 records ready private revision `tibotattle-test-app-00031-lg7`, current
 37/37 primary and 6/6 ledger migration health, and a guarded daily preflight
