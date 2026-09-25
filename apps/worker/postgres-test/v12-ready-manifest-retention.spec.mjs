@@ -309,8 +309,9 @@ test("0035 audits existing ready data, preserves exact admission replay, and all
 
     const migrations = await readPostgresMigrations({ role: "primary" });
     const result = await applyPostgresMigrations({ role: "primary", schema, pool });
-    assert.equal(result.applied, BASELINE_VERSION + 1);
-    assert.equal(migrations.at(-1)?.name, RETENTION_MIGRATION);
+    assert.equal(result.applied, BASELINE_VERSION + 2);
+    assert.equal(migrations[BASELINE_VERSION]?.name, RETENTION_MIGRATION);
+    assert.equal(migrations[BASELINE_VERSION + 1]?.name, "0036_streamed_publication_proofs.sql");
 
     const table = (name) => `"${schema}"."${name}"`;
     await assertP1005(pool.query(

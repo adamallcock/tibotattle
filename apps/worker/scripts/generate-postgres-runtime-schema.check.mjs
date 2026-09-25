@@ -76,13 +76,13 @@ test("Worker migration receipt source is generated exactly from canonical SQL", 
     ),
     true,
   );
-  assert.equal(
-    renderPostgresRuntimeSchema(manifest).includes(
-      '"0034_usage_correction_history.sql"',
-      '"0035_v12_ready_manifest_retention.sql"',
-    ),
-    true,
-  );
+  for (const migration of [
+    '"0034_usage_correction_history.sql"',
+    '"0035_v12_ready_manifest_retention.sql"',
+    '"0036_streamed_publication_proofs.sql"',
+  ]) {
+    assert.equal(renderPostgresRuntimeSchema(manifest).includes(migration), true);
+  }
   assert.equal(
     renderPostgresRuntimeSchema(manifest).includes(
       '"0006_erasure_ledger_transfer_receipts.sql"',

@@ -48,6 +48,9 @@ export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS =
 
 export const ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG =
   COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG;
+const ADMIN_COMMUNITY_ALLOWANCE_PLAN_MULTIPLIER_BY_TYPE: ReadonlyMap<string, number> = new Map(
+  ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG.map((plan) => [plan.planType, plan.multiplier] as const),
+);
 
 // Visibility is not fit eligibility or availability. Raw/custom model strings
 // cannot enter the dashboard through this shared reviewed identity catalog.
@@ -447,6 +450,82 @@ function medianOf(values: readonly number[]): number | null {
   return (ordered[lower]! + ordered[upper]!) / 2;
 }
 
+export type CommunityModelCompositionNormalization =
+  | { readonly state: "stale" }
+  | { readonly state: "unstable" }
+  | { readonly state: "fitted"; readonly values: Readonly<Record<string, number>> };
+
+export interface CommunityModelCompositionDaySummary {
+  readonly mediansByModel: ReadonlyMap<string, { readonly median: number; readonly participantCount: number }>;
+  readonly fittedParticipantCount: number;
+  readonly unstableParticipantCount: number;
+  readonly staleParticipantCount: number;
+  readonly refusedParticipantCount: number;
+  readonly v1ParticipantCount: number;
+  readonly unsupportedSourceParticipantCount: number;
+}
+
+/** Apply the public graph's day-window and plan-normalization rules to one
+ * cached owner result. The PostgreSQL publisher uses this while streaming rows
+ * into database-side exact-median aggregates. */
+export function normalizeCommunityModelCompositionForDay(
+  composition: CommunityModelComposition["composition"],
+  day: string,
+): CommunityModelCompositionNormalization {
+  const dayEndMs = Date.parse(`${day}T00:00:00.000Z`) + MILLISECONDS_PER_DAY;
+  const recencyFloorMs = dayEndMs
+    - COMMUNITY_ALLOWANCE_TRAILING_DAYS * MILLISECONDS_PER_DAY;
+  const latestMs = Date.parse(composition.latestQuotaObservedAt);
+  if (!Number.isFinite(latestMs) || latestMs <= recencyFloorMs || latestMs > dayEndMs) {
+    return { state: "stale" };
+  }
+  const multiplier = ADMIN_COMMUNITY_ALLOWANCE_PLAN_MULTIPLIER_BY_TYPE.get(composition.planType);
+  const vector = composition.fit.capacityUsdByModel;
+  if (composition.fit.status !== "fitted" || vector === null || multiplier === undefined) {
+    return { state: "unstable" };
+  }
+  const values: Record<string, number> = {};
+  for (const [model, capacity] of Object.entries(vector)) {
+    if (typeof capacity === "number" && Number.isFinite(capacity) && capacity > 0) {
+      values[model] = capacity * multiplier;
+    }
+  }
+  return { state: "fitted", values };
+}
+
+/** Build the reviewed public graph projection from bounded aggregate
+ * statistics. `mediansByModel` can be produced by PostgreSQL's ordered-set
+ * aggregate so the application does not retain one value per participant. */
+export function buildCommunityModelCompositionDayFromSummary(
+  summary: CommunityModelCompositionDaySummary,
+  day: string,
+): AdminCommunityModelCompositionDay {
+  const values = ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG
+    .filter((model) => model.allowanceTrack === "primary")
+    .flatMap((model) => {
+      const aggregate = summary.mediansByModel.get(model.modelId);
+      if (!aggregate) return [];
+      if (!Number.isFinite(aggregate.median) || aggregate.median <= 0
+          || !Number.isSafeInteger(aggregate.participantCount) || aggregate.participantCount < 1) {
+        throw new Error("invalid admin model composition aggregate");
+      }
+      return [[model.modelId, usd4(aggregate.median), aggregate.participantCount]];
+    });
+  const result = projectAdminModelHistoryDay({
+    day,
+    catalogVersion: ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+    values,
+    fittedParticipantCount: summary.fittedParticipantCount,
+    unstableParticipantCount: summary.unstableParticipantCount,
+    staleParticipantCount: summary.staleParticipantCount,
+    refusedParticipantCount: summary.refusedParticipantCount,
+    v1ParticipantCount: summary.v1ParticipantCount,
+    unsupportedSourceParticipantCount: summary.unsupportedSourceParticipantCount,
+  });
+  if (result === null) throw new Error("invalid admin model composition aggregate");
+  return result;
+}
+
 /**
  * One published day of the per-model series: for each pinned model, the median
  * across identification-passing participants of that participant's fitted
@@ -463,16 +542,8 @@ export function buildCommunityModelCompositionDay(
   },
   day: string,
 ): AdminCommunityModelCompositionDay {
-  const planMultiplier = new Map<string, number>(
-    ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG.map((plan) => [
-      plan.planType,
-      plan.multiplier,
-    ]),
-  );
-  const dayEndMs = Date.parse(`${day}T00:00:00.000Z`) + MILLISECONDS_PER_DAY;
-  const recencyFloorMs = dayEndMs
-    - COMMUNITY_ALLOWANCE_TRAILING_DAYS * MILLISECONDS_PER_DAY;
-  const normalized: Array<Readonly<Record<string, number>>> = [];
+  const valuesByModel = new Map<string, number[]>();
+  let fittedParticipantCount = 0;
   let unstableParticipantCount = 0;
   let staleParticipantCount = 0;
   for (const { composition } of collection.compositions) {
@@ -480,53 +551,36 @@ export function buildCommunityModelCompositionDay(
     // day membership needs its own recency evidence: the same trailing
     // window the blended preview uses, against the composition's newest
     // retained quota reading.
-    const latestMs = Date.parse(composition.latestQuotaObservedAt);
-    if (!Number.isFinite(latestMs)
-        || latestMs <= recencyFloorMs
-        || latestMs > dayEndMs) {
+    const normalized = normalizeCommunityModelCompositionForDay(composition, day);
+    if (normalized.state === "stale") {
       staleParticipantCount += 1;
       continue;
     }
-    const multiplier = planMultiplier.get(composition.planType);
-    const vector = composition.fit.capacityUsdByModel;
-    if (composition.fit.status !== "fitted"
-        || vector === null
-        || multiplier === undefined) {
+    if (normalized.state === "unstable") {
       unstableParticipantCount += 1;
       continue;
     }
-    const scaled: Record<string, number> = {};
-    for (const [model, capacity] of Object.entries(vector)) {
-      if (typeof capacity === "number" && Number.isFinite(capacity) && capacity > 0) {
-        scaled[model] = capacity * multiplier;
-      }
+    fittedParticipantCount += 1;
+    for (const [model, capacity] of Object.entries(normalized.values)) {
+      const values = valuesByModel.get(model) ?? [];
+      values.push(capacity);
+      valuesByModel.set(model, values);
     }
-    normalized.push(scaled);
   }
-  const values = ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG
-    .filter((model) => model.allowanceTrack === "primary")
-    .flatMap((model) => {
-      const values = normalized
-        .map((vector) => vector[model.modelId])
-        .filter((value): value is number => value !== undefined);
-      const central = medianOf(values);
-      if (central === null) return [];
-      return [[model.modelId, usd4(central), values.length]];
-    });
-  const result = projectAdminModelHistoryDay({
-    day,
-    catalogVersion: ADMIN_MODEL_HISTORY_CATALOG_VERSION,
-    values,
-    fittedParticipantCount: normalized.length,
+  const mediansByModel = new Map<string, { median: number; participantCount: number }>();
+  for (const [model, values] of valuesByModel) {
+    const median = medianOf(values);
+    if (median !== null) mediansByModel.set(model, { median, participantCount: values.length });
+  }
+  return buildCommunityModelCompositionDayFromSummary({
+    mediansByModel,
+    fittedParticipantCount,
     unstableParticipantCount,
     staleParticipantCount,
     refusedParticipantCount: collection.refusedParticipantCount,
     v1ParticipantCount: collection.v1ParticipantCount,
-    unsupportedSourceParticipantCount:
-      collection.unsupportedSourceParticipantCount,
-  });
-  if (result === null) throw new Error("invalid admin model composition aggregate");
-  return result;
+    unsupportedSourceParticipantCount: collection.unsupportedSourceParticipantCount,
+  }, day);
 }
 
 const MODEL_COMPOSITION_DAY_JSON_LIMIT_BYTES = 16 * 1024;

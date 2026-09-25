@@ -1150,52 +1150,67 @@ export async function listPostgresEffectiveOwners(
   pool: PostgresPool,
   input: ListPostgresEffectiveOwnersOptions,
 ): Promise<PostgresEffectiveOwnersPage> {
-  const identity = normalizeIdentity(input);
-  const schema = schemaName(input);
-  const after = normalizeOwnersCursor(input.after);
-  const limit = normalizeLimit(input.limit);
   try {
     return await withPostgresRead(pool, async (client) => {
-      await assertSchema(client, schema);
-      const sourcePin = await readGlobalPin(client, schema, identity);
-      if (after && !sameSourcePin(sourcePin, after.sourcePin)) {
-        fail("POSTGRES_LEGACY_EFFECTIVE_CAS_MISMATCH");
-      }
-      const flags = historyFlagsSql(schema);
-      const result = await client.query<OwnerListRow>(
-        `SELECT link.participant_id,owner.owner_digest,owner.revision AS owner_revision,
-                owner.authority_epoch,input.revision AS input_revision,
-                (COALESCE(runtime.state,'missing')||':'||COALESCE(typed_runtime.state,'missing')) AS v12_state,
-                head.generation_id AS v12_generation_id,
-                flags.has_v1,flags.has_v11,flags.has_v12
-           FROM ${table(schema, "storage_v11_owner_links")} link
-           JOIN ${table(schema, "participants")} participant
-             ON participant.id=link.participant_id AND participant.state='active'
-           JOIN ${table(schema, "analytics_owner_state")} owner
-             ON owner.owner_digest=link.owner_digest AND owner.source_id=$1 AND owner.state='active'
-           JOIN ${table(schema, "community_analytical_input_versions")} input
-             ON input.participant_id=participant.id
-           LEFT JOIN ${table(schema, "telemetry_v12_runtime")} runtime ON runtime.id=1
-           LEFT JOIN ${table(schema, "telemetry_v12_typed_runtime")} typed_runtime ON typed_runtime.id=1
-           LEFT JOIN ${table(schema, "telemetry_v12_domain_heads")} head
-             ON head.participant_id=participant.id
-           CROSS JOIN LATERAL (${flags}) flags
-          WHERE link.state='active'
-            AND NOT EXISTS (SELECT 1 FROM ${table(schema, "storage_owner_erasure_receipts")} erased
-                             WHERE erased.owner_digest=link.owner_digest)
-            AND (flags.has_v1 OR flags.has_v11 OR flags.has_v12)
-            AND ($3::text IS NULL OR owner.owner_digest COLLATE "C" > $3::text COLLATE "C")
-          ORDER BY owner.owner_digest COLLATE "C" LIMIT $4`,
-        [identity.sourceId, identity.sourceNamespace, after?.ownerDigest ?? null, limit + 1],
-      );
-      const hasMore = result.rows.length > limit;
-      const owners = result.rows.slice(0, limit).map((row) => ownerFromRow(row, sourcePin));
-      const next = hasMore && owners.length > 0
-        ? Object.freeze({ ownerDigest: owners.at(-1)!.ownerDigest, sourcePin }) : null;
-      return Object.freeze({ available: true, sourceId: identity.sourceId, sourceNamespace: identity.sourceNamespace,
-        owners: Object.freeze(owners), sourcePin, next });
+      return await listPostgresEffectiveOwnersOnClient(client, input);
     }, { operation: "legacy_effective.owners", statementTimeoutMilliseconds: 15_000, lockTimeoutMilliseconds: 5_000,
       preserveSafeError: (error) => error instanceof PostgresLegacyEffectiveError ? error : null });
+  } catch (error) {
+    if (error instanceof PostgresLegacyEffectiveError) throw error;
+    throw new PostgresLegacyEffectiveError("POSTGRES_LEGACY_EFFECTIVE_UNAVAILABLE");
+  }
+}
+
+/** Read one bounded effective-owner page on an already-owned transaction
+ * client. This lets compound callers keep publication paging and owner locks
+ * on one pool connection instead of opening a nested connection per page. */
+export async function listPostgresEffectiveOwnersOnClient(
+  client: PostgresClient,
+  input: ListPostgresEffectiveOwnersOptions,
+): Promise<PostgresEffectiveOwnersPage> {
+  try {
+    const identity = normalizeIdentity(input);
+    const schema = schemaName(input);
+    const after = normalizeOwnersCursor(input.after);
+    const limit = normalizeLimit(input.limit);
+    await assertSchema(client, schema);
+    const sourcePin = await readGlobalPin(client, schema, identity);
+    if (after && !sameSourcePin(sourcePin, after.sourcePin)) {
+      fail("POSTGRES_LEGACY_EFFECTIVE_CAS_MISMATCH");
+    }
+    const flags = historyFlagsSql(schema);
+    const result = await client.query<OwnerListRow>(
+      `SELECT link.participant_id,owner.owner_digest,owner.revision AS owner_revision,
+              owner.authority_epoch,input.revision AS input_revision,
+              (COALESCE(runtime.state,'missing')||':'||COALESCE(typed_runtime.state,'missing')) AS v12_state,
+              head.generation_id AS v12_generation_id,
+              flags.has_v1,flags.has_v11,flags.has_v12
+         FROM ${table(schema, "storage_v11_owner_links")} link
+         JOIN ${table(schema, "participants")} participant
+           ON participant.id=link.participant_id AND participant.state='active'
+         JOIN ${table(schema, "analytics_owner_state")} owner
+           ON owner.owner_digest=link.owner_digest AND owner.source_id=$1 AND owner.state='active'
+         JOIN ${table(schema, "community_analytical_input_versions")} input
+           ON input.participant_id=participant.id
+         LEFT JOIN ${table(schema, "telemetry_v12_runtime")} runtime ON runtime.id=1
+         LEFT JOIN ${table(schema, "telemetry_v12_typed_runtime")} typed_runtime ON typed_runtime.id=1
+         LEFT JOIN ${table(schema, "telemetry_v12_domain_heads")} head
+           ON head.participant_id=participant.id
+         CROSS JOIN LATERAL (${flags}) flags
+        WHERE link.state='active'
+          AND NOT EXISTS (SELECT 1 FROM ${table(schema, "storage_owner_erasure_receipts")} erased
+                           WHERE erased.owner_digest=link.owner_digest)
+          AND (flags.has_v1 OR flags.has_v11 OR flags.has_v12)
+          AND ($3::text IS NULL OR owner.owner_digest COLLATE "C" > $3::text COLLATE "C")
+        ORDER BY owner.owner_digest COLLATE "C" LIMIT $4`,
+      [identity.sourceId, identity.sourceNamespace, after?.ownerDigest ?? null, limit + 1],
+    );
+    const hasMore = result.rows.length > limit;
+    const owners = result.rows.slice(0, limit).map((row) => ownerFromRow(row, sourcePin));
+    const next = hasMore && owners.length > 0
+      ? Object.freeze({ ownerDigest: owners.at(-1)!.ownerDigest, sourcePin }) : null;
+    return Object.freeze({ available: true, sourceId: identity.sourceId, sourceNamespace: identity.sourceNamespace,
+      owners: Object.freeze(owners), sourcePin, next });
   } catch (error) {
     if (error instanceof PostgresLegacyEffectiveError) throw error;
     throw new PostgresLegacyEffectiveError("POSTGRES_LEGACY_EFFECTIVE_UNAVAILABLE");
