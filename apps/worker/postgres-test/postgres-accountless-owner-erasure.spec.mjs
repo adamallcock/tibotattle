@@ -231,6 +231,36 @@ async function seedAccountlessOwner(pool, schema, supplied = {}) {
       randomDigest(), v12.objectKey, v12.authorizationId, now],
   );
 
+  const legacyTelemetryId = `synthetic-history-${randomUUID()}`;
+  const legacyTelemetryObjectKey = supplied.legacyTelemetryObjectKey
+    ?? `telemetry/erasure/legacy-telemetry/${randomUUID()}`;
+  const legacyClient = await pool.connect();
+  try {
+    await legacyClient.query("BEGIN");
+    await legacyClient.query(`SET LOCAL search_path TO ${q(schema, "unused").split(".")[0]}, pg_catalog`);
+    await legacyClient.query(
+      `INSERT INTO ${q(schema, "telemetry_contributions")} (
+         id,participant_id,plaintext_digest,envelope_digest,r2_key,status,schema_version,
+         transport_schema_version,range_start,range_end,client_platform,provider_policy_epoch,
+         priced_event_coverage_percent,unknown_model_event_count,unknown_billable_units,
+         price_basis,declared_record_count,created_at
+       ) VALUES ($1,$2,$3,$4,$5,'accepted','telemetry-contribution-v0.1',
+         'telemetry-contribution-v0.2',$6,$6,'synthetic','synthetic-policy',0,0,0,'synthetic',0,$6)`,
+      [legacyTelemetryId, participantId, randomDigest(), randomDigest(), legacyTelemetryObjectKey, now],
+    );
+    await legacyClient.query(
+      `INSERT INTO ${q(schema, "pending_objects")} (contribution_id,object_key,object_kind)
+       VALUES ($1,$2,'telemetry')`,
+      [legacyTelemetryId, legacyTelemetryObjectKey],
+    );
+    await legacyClient.query("COMMIT");
+  } catch (error) {
+    await legacyClient.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    legacyClient.release();
+  }
+
   const headerCounts = {
     telemetry_v11_chunks: 1,
     telemetry_v11_day_manifests: 1,
@@ -337,8 +367,9 @@ async function seedAccountlessOwner(pool, schema, supplied = {}) {
     generationId: v11GenerationId,
     ownerDigest,
     sourceImportId,
+    legacyTelemetryObjectKey,
     objectKeys: [v1.objectKey, v11.objectKey, v12.objectKey,
-      "synthetic/erasure/archive/v1", "synthetic/erasure/archive/v1.1"].sort(),
+      legacyTelemetryObjectKey, "synthetic/erasure/archive/v1", "synthetic/erasure/archive/v1.1"].sort(),
   };
 }
 
@@ -531,9 +562,11 @@ test("PG17 accountless erasure removes opt-out history markers across v1/v1.1/v1
     assert.equal(await count(primaryPool, primarySchema, "participants", "id", fixture.participantId), 1);
     assert.equal(await count(primaryPool, primarySchema, "accountless_public_history_retention", "participant_id", fixture.participantId), 1);
     assert.equal(await count(primaryPool, primarySchema, "accountless_enrollment_ledger", "device_id", fixture.deviceId), 1);
+    assert.equal(await count(primaryPool, primarySchema, "pending_objects", "object_key", fixture.legacyTelemetryObjectKey), 1,
+      "the legacy telemetry reference and its journal remain until provider deletion and primary erasure commit");
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0].map((ref) => ref.key).sort(), fixture.objectKeys);
-    assert.deepEqual(new Set(calls[0].map((ref) => ref.source)), new Set(["telemetry_v1", "telemetry_v11", "telemetry_v12"]));
+    assert.deepEqual(new Set(calls[0].map((ref) => ref.source)), new Set(["telemetry", "telemetry_v1", "telemetry_v11", "telemetry_v12"]));
     assert.ok(calls[0].every((ref) => ref.version === null));
 
     const interruptedAfterObjectDelete = await erasePostgresAccountlessOwner({
@@ -546,6 +579,8 @@ test("PG17 accountless erasure removes opt-out history markers across v1/v1.1/v1
     assert.equal(calls.length, 2, "provider success before primary failure is replayed idempotently");
     assert.deepEqual(calls[1].map((ref) => ref.key).sort(), fixture.objectKeys);
     assert.equal(await count(primaryPool, primarySchema, "participants", "id", fixture.participantId), 1);
+    assert.equal(await count(primaryPool, primarySchema, "pending_objects", "object_key", fixture.legacyTelemetryObjectKey), 1,
+      "a partial primary failure rolls back legacy journal cleanup for safe retry");
     assert.equal(await count(primaryPool, primarySchema, "accountless_public_history_retention", "participant_id", fixture.participantId), 1,
       "the pinned public-history marker remains until the primary erasure transaction commits");
     const retainedMarker = await primaryPool.query(
@@ -562,13 +597,17 @@ test("PG17 accountless erasure removes opt-out history markers across v1/v1.1/v1
     assert.equal(interruptedReceipt.rows[0]?.details_json.includes("synthetic/erasure"), false);
 
     const completed = await erasePostgresAccountlessOwner(options);
-    assert.deepEqual(completed, { status: "complete", objectsDeleted: 5 });
+    assert.deepEqual(completed, { status: "complete", objectsDeleted: 6 });
     assert.equal(calls.length, 3);
     assert.deepEqual(calls[2].map((ref) => ref.key).sort(), fixture.objectKeys);
     assert.equal(await count(primaryPool, primarySchema, "participants", "id", fixture.participantId), 0);
     assert.equal(await count(primaryPool, primarySchema, "accountless_public_history_retention", "participant_id", fixture.participantId), 0,
       "participant erasure cascades the accountless opt-out retained-history marker");
     assert.equal(await count(primaryPool, primarySchema, "accountless_upload_owners", "participant_id", fixture.participantId), 0);
+    assert.equal(await count(primaryPool, primarySchema, "telemetry_contributions", "participant_id", fixture.participantId), 0,
+      "the legacy telemetry source row cascades after its object key is removed");
+    assert.equal(await count(primaryPool, primarySchema, "pending_objects", "object_key", fixture.legacyTelemetryObjectKey), 0,
+      "the exact legacy object registration is removed with its source row");
     assert.equal(await count(primaryPool, primarySchema, "accountless_enrollment_ledger", "device_id", fixture.deviceId), 0,
       "accountless installation identity is removed after all restrict references cascade");
     if (importClaimTransferId !== null) {
@@ -586,9 +625,9 @@ test("PG17 accountless erasure removes opt-out history markers across v1/v1.1/v1
       `SELECT outcome,details_json FROM ${q(ledgerSchema, "participant_erasure_receipts")}`,
     );
     assert.equal(durable.rows[0]?.outcome, "completed");
-    assert.equal(JSON.parse(durable.rows[0]?.details_json).objectCount, 5);
+    assert.equal(JSON.parse(durable.rows[0]?.details_json).objectCount, 6);
     const repeated = await erasePostgresAccountlessOwner(options);
-    assert.deepEqual(repeated, { status: "already_complete", objectsDeleted: 5 });
+    assert.deepEqual(repeated, { status: "already_complete", objectsDeleted: 6 });
     assert.equal(calls.length, 3, "already-complete retry performs no provider operations");
 
     // Restore the participant and its retained marker from a pre-erasure
@@ -601,7 +640,7 @@ test("PG17 accountless erasure removes opt-out history markers across v1/v1.1/v1
       primaryPool: restoredPool,
       schema: { primarySchema: restoredSchema, ledgerSchema },
     });
-    assert.deepEqual(restored, { status: "complete", objectsDeleted: 5 });
+    assert.deepEqual(restored, { status: "complete", objectsDeleted: 6 });
     assert.equal(await count(restoredPool, restoredSchema, "participants", "id", fixture.participantId), 0);
     assert.equal(await count(restoredPool, restoredSchema, "accountless_public_history_retention", "participant_id", fixture.participantId), 0,
       "a restored marker is removed again under the prior durable owner-erasure receipt");
@@ -617,6 +656,75 @@ test("PG17 accountless erasure removes opt-out history markers across v1/v1.1/v1
       try { await primaryPool.query(`DROP SCHEMA IF EXISTS ${q(schema, "unused").split(".")[0]} CASCADE`); } catch {}
     }
     await Promise.all([primaryPool.end(), restoredPool.end(), ledgerPool.end()]);
+  }
+});
+
+test("PG17 accountless erasure refuses an unmigrated legacy contributions table before fencing or deleting", {
+  skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  const endpoint = await localEndpoint();
+  const suffix = randomBytes(5).toString("hex");
+  const primarySchema = `typed_legacy_target_payload_${suffix}`;
+  const ledgerSchema = `${primarySchema}_ledger`;
+  const poolOptions = {
+    host: endpoint.host,
+    port: endpoint.port,
+    user: PG_TEST_USER,
+    ...(PG_TEST_PASSWORD === undefined ? { password: "synthetic-local-only" } : { password: PG_TEST_PASSWORD }),
+    database: PG_TEST_DATABASE,
+    ssl: false,
+    max: 6,
+    connectionTimeoutMillis: 5_000,
+  };
+  const primaryPool = new pg.Pool(poolOptions);
+  const ledgerPool = new pg.Pool(poolOptions);
+  const schemas = [];
+  let vite;
+  try {
+    const version = await primaryPool.query("SELECT current_setting('server_version_num')::integer AS version");
+    assert.equal(Math.floor(version.rows[0].version / 10_000), 17);
+    await createSchema(primaryPool, primarySchema);
+    schemas.push(primarySchema);
+    await createSchema(primaryPool, ledgerSchema, "ledger");
+    schemas.push(ledgerSchema);
+    vite = await createServer({ root: WORKER_ROOT, configFile: false, server: { middlewareMode: true }, appType: "custom" });
+    const { erasePostgresAccountlessOwner, PostgresAccountlessOwnerErasureError } = await loadEraser(vite);
+    const fixture = await seedAccountlessOwner(primaryPool, primarySchema);
+    await primaryPool.query(
+      `CREATE TABLE ${q(primarySchema, "contributions")} (
+         id text PRIMARY KEY, participant_id text NOT NULL REFERENCES ${q(primarySchema, "participants")} (id),
+         r2_key text NOT NULL, created_at timestamptz NOT NULL
+       )`,
+    );
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "contributions")} (id,participant_id,r2_key,created_at)
+       VALUES ('synthetic-legacy-payload',$1,'synthetic/erasure/unmigrated-legacy-payload','2026-09-24T12:00:00Z')`,
+      [fixture.participantId],
+    );
+    let deletes = 0;
+    await assert.rejects(
+      erasePostgresAccountlessOwner({
+        primaryPool,
+        ledgerPool,
+        participantId: fixture.participantId,
+        schema: { primarySchema, ledgerSchema },
+        objectStore: { async deleteBatch() { deletes += 1; } },
+      }),
+      (error) => error instanceof PostgresAccountlessOwnerErasureError
+        && error.code === "ACCOUNTLESS_OWNER_ERASURE_FAMILY_UNSUPPORTED",
+    );
+    assert.equal(deletes, 0, "the unknown payload reference is never skipped or sent for deletion");
+    assert.equal((await primaryPool.query(
+      `SELECT state FROM ${q(primarySchema, "participants")} WHERE id=$1`, [fixture.participantId],
+    )).rows[0]?.state, "active", "the schema refusal happens before the owner is fenced");
+    assert.equal(await count(primaryPool, primarySchema, "contributions", "participant_id", fixture.participantId), 1);
+  } finally {
+    if (vite) await vite.close();
+    for (const schema of schemas.reverse()) {
+      try { await primaryPool.query(`DROP SCHEMA IF EXISTS ${q(schema, "unused").split(".")[0]} CASCADE`); } catch {}
+    }
+    await Promise.all([primaryPool.end(), ledgerPool.end()]);
   }
 });
 

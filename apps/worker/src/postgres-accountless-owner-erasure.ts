@@ -100,7 +100,7 @@ interface ReceiptDetails {
 }
 
 interface ObjectInventoryRow {
-  readonly source: "telemetry_v1" | "telemetry_v11" | "telemetry_v12";
+  readonly source: "telemetry" | "telemetry_v1" | "telemetry_v11" | "telemetry_v12";
   readonly ref_id: string;
   readonly cursor_id: string;
   readonly object_key: string;
@@ -522,6 +522,15 @@ async function fenceAndRead(
 }
 
 function inventorySql(primarySchema: string): string {
+  const legacyTelemetry = `SELECT 'telemetry'::text AS source, contribution.id::text AS ref_id,
+            ('0:' || contribution.id)::text AS cursor_id, contribution.r2_key::text AS object_key,
+            contribution.created_at::text AS created_at, pending.object_kind::text AS object_kind,
+            pending.reconciliation_state::text AS reconciliation_state,
+            pending.registration_token::text AS registration_token
+       FROM ${table(primarySchema, "telemetry_contributions")} contribution
+       LEFT JOIN ${table(primarySchema, "pending_objects")} pending
+         ON pending.contribution_id=contribution.id AND pending.object_key=contribution.r2_key
+      WHERE contribution.participant_id=$1`;
   const live = (name: "telemetry_v1_chunks" | "telemetry_v11_chunks" | "telemetry_v12_chunks", source: "telemetry_v1" | "telemetry_v11" | "telemetry_v12") =>
     `SELECT '${source}'::text AS source, chunk.id::text AS ref_id,
             ('0:' || chunk.id)::text AS cursor_id, chunk.r2_key::text AS object_key,
@@ -547,7 +556,7 @@ function inventorySql(primarySchema: string): string {
        FROM ${table(primarySchema, "historical_telemetry_v11_chunk_headers")} archive
       WHERE archive.participant_id=$1`;
   return `SELECT * FROM (${[
-    live("telemetry_v1_chunks", "telemetry_v1"), archivedV1,
+    legacyTelemetry, live("telemetry_v1_chunks", "telemetry_v1"), archivedV1,
     live("telemetry_v11_chunks", "telemetry_v11"), archivedV11,
     live("telemetry_v12_chunks", "telemetry_v12"),
   ].join(" UNION ALL ")}) inventory
@@ -567,7 +576,7 @@ async function readObjectPage(
         participantId, cursor?.source ?? null, cursor?.refId ?? null, PARTICIPANT_ERASURE_OBJECT_BATCH_LIMIT,
       ]));
       return Object.freeze(rows.map((row) => {
-        if (!["telemetry_v1", "telemetry_v11", "telemetry_v12"].includes(row.source)
+        if (!["telemetry", "telemetry_v1", "telemetry_v11", "telemetry_v12"].includes(row.source)
             || typeof row.ref_id !== "string" || row.ref_id.length === 0 || row.ref_id.length > 1024
             || typeof row.cursor_id !== "string" || row.cursor_id.length === 0 || row.cursor_id.length > 2048
             || typeof row.object_key !== "string" || row.object_key.length === 0
@@ -606,13 +615,15 @@ async function hasUnattributablePendingObject(client: PostgresClient, primarySch
   const rows = parseRows<{ readonly contribution_id: string }>(await client.query(
     `SELECT pending.contribution_id
        FROM ${table(primarySchema, "pending_objects")} pending
-      WHERE pending.object_kind IN ('telemetry_v1','telemetry_v11','telemetry_v12')
+      WHERE pending.object_kind IN ('telemetry','telemetry_v1','telemetry_v11','telemetry_v12')
         AND NOT EXISTS (SELECT 1 FROM ${table(primarySchema, "telemetry_v1_chunks")} chunk
           WHERE chunk.id=pending.contribution_id AND chunk.r2_key=pending.object_key)
         AND NOT EXISTS (SELECT 1 FROM ${table(primarySchema, "telemetry_v11_chunks")} chunk
           WHERE chunk.id=pending.contribution_id AND chunk.r2_key=pending.object_key)
         AND NOT EXISTS (SELECT 1 FROM ${table(primarySchema, "telemetry_v12_chunks")} chunk
           WHERE chunk.id=pending.contribution_id AND chunk.r2_key=pending.object_key)
+        AND NOT EXISTS (SELECT 1 FROM ${table(primarySchema, "telemetry_contributions")} contribution
+          WHERE contribution.id=pending.contribution_id AND contribution.r2_key=pending.object_key)
       LIMIT 1`,
   ));
   return rows.length > 0;
@@ -627,9 +638,12 @@ async function assertInventoryComplete(
     return await withPostgresRead(primaryPool, async (client) => {
       const pendingBad = parseRows<{ readonly contribution_id: string }>(await client.query(
         `SELECT pending.contribution_id FROM ${table(primarySchema, "pending_objects")} pending
-          WHERE pending.object_kind IN ('telemetry_v1','telemetry_v11','telemetry_v12')
+          WHERE pending.object_kind IN ('telemetry','telemetry_v1','telemetry_v11','telemetry_v12')
             AND pending.reconciliation_state <> 'registered'
             AND EXISTS (
+              SELECT 1 FROM ${table(primarySchema, "telemetry_contributions")} contribution
+               WHERE contribution.id=pending.contribution_id AND contribution.participant_id=$1
+              UNION ALL
               SELECT 1 FROM ${table(primarySchema, "telemetry_v1_chunks")} chunk
                WHERE chunk.id=pending.contribution_id AND chunk.participant_id=$1
               UNION ALL
