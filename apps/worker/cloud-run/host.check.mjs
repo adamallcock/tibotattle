@@ -415,6 +415,9 @@ test("private-host envelope-key is public-only and bypasses PostgreSQL and Worke
       async createPredecessor() { throw new Error("must not create predecessor"); },
       async activate() { throw new Error("must not activate domain"); },
     }),
+    async readPostgresTelemetryV12EffectivePage() {
+      throw new Error("must not read a page for envelope-key");
+    },
     publicEnvelopeKey(raw) {
       projectionCalls += 1;
       assert.equal(raw, '{"synthetic":"public-key-config"}');
@@ -862,7 +865,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       appType: "custom",
     });
     const [transport, v12Admission, ledgerAuthority, admission, rateLimit, bodyReader, constants,
-      cryptoModule, telemetryV12Repository, deviceSync, typedCodec]
+      cryptoModule, telemetryV12Repository, deviceSync, typedCodec, typedV12EffectiveReader]
       = await Promise.all([
         vite.ssrLoadModule("/src/postgres-typed-v12-transport.ts"),
         vite.ssrLoadModule("/src/postgres-typed-v12-admission.ts"),
@@ -875,6 +878,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
         vite.ssrLoadModule("/src/telemetry-v12-repository.ts"),
         vite.ssrLoadModule("/src/postgres-device-sync.ts"),
         vite.ssrLoadModule("/src/typed-telemetry-codec.ts"),
+        vite.ssrLoadModule("/src/postgres-typed-v12-effective-reader.ts"),
       ]);
     const v12ManifestCandidates = await vite.ssrLoadModule("/src/postgres-v12-manifest-candidates.ts");
     const [uploadAuthorization, formatAuthority] = await Promise.all([
@@ -940,6 +944,8 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     const deviceSecret = randomBytes(32).toString("base64url");
     const primaryTable = (name) => quotedTable(primarySchema, name);
     const schemaOptions = { primarySchema, ledgerSchema };
+    const unknownEffectivePageSchema = `host_missing_v12_${suffix}`;
+    let useUnknownEffectivePageSchema = false;
     const sourceNamespace = `synthetic-host-source-${suffix}`;
     const encodedSourceNamespace = Buffer.from(typedCodec.encodeTypedTelemetryId(sourceNamespace));
     const auth = `Device um_device_${deviceId}.${deviceSecret}`;
@@ -1084,6 +1090,17 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       readPostgresDeviceSyncState: deviceSync.readPostgresDeviceSyncState,
       readPostgresDeviceSyncV12Capabilities: deviceSync.readPostgresDeviceSyncV12Capabilities,
       readPostgresV12DayCandidates: v12ManifestCandidates.readPostgresV12DayCandidates,
+      readPostgresTelemetryV12EffectivePage:
+        (pool, options, readerOptions) => typedV12EffectiveReader.readPostgresTelemetryV12EffectivePage(
+          pool,
+          options,
+          {
+            ...readerOptions,
+            schema: useUnknownEffectivePageSchema
+              ? { ...schemaOptions, primarySchema: unknownEffectivePageSchema }
+              : readerOptions?.schema,
+          },
+        ),
       publicEnvelopeKey: cryptoModule.publicEnvelopeKey,
       sourceNamespace,
       createPostgresTypedV12Domain: typedV12Domain.createPostgresTypedV12Domain,
@@ -1151,6 +1168,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     const envelopeKeyUrl = "http://127.0.0.1:43817/api/v1/envelope-key";
     const domainPredecessorUrl = "http://127.0.0.1:43817/api/v1/me/telemetry-v12/domain-predecessor";
     const domainActivateUrl = "http://127.0.0.1:43817/api/v1/me/telemetry-v12/domain-activate";
+    const effectivePageUrl = "http://127.0.0.1:43817/api/v1/me/telemetry-v12/effective-page";
     const emptySyncStateResponse = await dispatch(request({ url: syncStateUrl, method: "GET" }));
     assert.equal(emptySyncStateResponse.status, 200);
     const emptySyncState = await emptySyncStateResponse.json();
@@ -1812,6 +1830,72 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     assert.equal(deviceSyncRateLimitCalls, syncRateBeforeDomain + 3,
       "domain predecessor and activation requests must consume the authenticated device-sync limiter");
 
+    const effectivePageQuery = new URLSearchParams({
+      day: uploadDay,
+      stream: "usage",
+      limit: "2",
+    });
+    const firstEffectivePageResponse = await dispatch(request({
+      method: "GET",
+      url: `${effectivePageUrl}?${effectivePageQuery}`,
+    }));
+    assert.equal(firstEffectivePageResponse.status, 200);
+    const firstEffectivePage = await firstEffectivePageResponse.json();
+    assert.equal(firstEffectivePage.schemaVersion, "postgres-telemetry-v12-effective-page-v1");
+    assert.equal(firstEffectivePage.available, true);
+    assert.equal(firstEffectivePage.records.length, 2);
+    assert.ok(firstEffectivePage.next);
+    assert.equal(JSON.parse(firstEffectivePage.records[0].sourceRecordJson).schemaVersion, "usage-event-v1.2");
+    assert.equal(JSON.parse(firstEffectivePage.records[0].recordJson).schemaVersion, "usage-event-v1.1");
+
+    const nextEffectivePageQuery = new URLSearchParams({
+      ...Object.fromEntries(effectivePageQuery),
+      afterObservedAtMs: String(firstEffectivePage.next.observedAtMs),
+      afterOccurrenceId: firstEffectivePage.next.occurrenceId,
+    });
+    const nextEffectivePageResponse = await dispatch(request({
+      method: "GET",
+      url: `${effectivePageUrl}?${nextEffectivePageQuery}`,
+    }));
+    assert.equal(nextEffectivePageResponse.status, 200);
+    const nextEffectivePage = await nextEffectivePageResponse.json();
+    assert.equal(nextEffectivePage.records.length, 2);
+    assert.equal(nextEffectivePage.next, null);
+    assert.equal(deviceSyncRateLimitCalls, syncRateBeforeDomain + 5,
+      "each effective page must consume the authenticated device-sync limiter");
+    const rateCallsBeforeUnauthenticatedPage = deviceSyncRateLimitCalls;
+    await assertApiError(await dispatch(new Request(
+      `${effectivePageUrl}?${effectivePageQuery}`, { method: "GET" },
+    )), 401, "DEVICE_AUTH_INVALID");
+    assert.equal(deviceSyncRateLimitCalls, rateCallsBeforeUnauthenticatedPage + 1,
+      "a rejected effective-page bearer must consume the pre-auth device-sync limiter");
+
+    for (const query of [
+      `${effectivePageQuery}&limit=201`,
+      `${effectivePageQuery}&limit=0`,
+      `${effectivePageQuery}&participantId=some-other-owner`,
+      `${effectivePageQuery}&afterOccurrenceId=event%3Av2%3A${"a".repeat(64)}`,
+      `${effectivePageQuery}&afterObservedAtMs=8640000000000001&afterOccurrenceId=event%3Av2%3A${"a".repeat(64)}`,
+    ]) {
+      await assertApiError(await dispatch(request({
+        method: "GET",
+        url: `${effectivePageUrl}?${query}`,
+      })), 400, "BODY_INVALID");
+    }
+    await assertApiError(await dispatch(new Request(
+      `${effectivePageUrl}?${effectivePageQuery}`, { method: "GET" },
+    )), 401, "DEVICE_AUTH_INVALID");
+
+    useUnknownEffectivePageSchema = true;
+    try {
+      await assertApiError(await dispatch(request({
+        method: "GET",
+        url: `${effectivePageUrl}?${effectivePageQuery}`,
+      })), 503, "BACKEND_STORAGE_UNAVAILABLE");
+    } finally {
+      useUnknownEffectivePageSchema = false;
+    }
+
     const activeHead = await primaryPool.query(
       `SELECT head.generation_id, head.revision::text AS revision, domain.manifest_digest
          FROM ${primaryTable("telemetry_v12_domain_heads")} head
@@ -1843,6 +1927,10 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     })), 401, "DEVICE_AUTH_INVALID");
     await assertApiError(await dispatch(request({
       url: domainActivateUrl, body: JSON.stringify(domainManifest),
+    })), 401, "DEVICE_AUTH_INVALID");
+    await assertApiError(await dispatch(request({
+      method: "GET",
+      url: `${effectivePageUrl}?${effectivePageQuery}`,
     })), 401, "DEVICE_AUTH_INVALID");
     await assertApiError(await dispatch(request({
       method: "GET",

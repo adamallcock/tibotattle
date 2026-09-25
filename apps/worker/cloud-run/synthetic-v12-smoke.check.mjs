@@ -6,6 +6,8 @@ import test from "node:test";
 import {
   canonicalTelemetryV12Json,
   parseTelemetryV12Chunk,
+  TELEMETRY_V12_DOMAIN_MANIFEST_SCHEMA_VERSION,
+  telemetryV12DomainManifestDigestInput,
 } from "@app-usagemonitor/telemetry-contract";
 import {
   CLOUD_RUN_IAM_TEST_TARGET,
@@ -36,6 +38,10 @@ const IDS = [
 ];
 const MANIFEST_ID = "30000000-0000-4000-8000-000000000001";
 const CONTRIBUTION_ID = "chunk:30000000-0000-4000-8000-000000000002";
+const PREDECESSOR_TOKEN = "50000000-0000-4000-8000-000000000001";
+const GENERATION_ID = "50000000-0000-4000-8000-000000000002";
+const DOMAIN_FINGERPRINT = "d".repeat(64);
+const OBJECT_KEY = "telemetry/v12-50000000-0000-4000-8000-000000000003";
 const SERVERLESS_TOKEN = "synthetic-iam-token-never-print";
 const DEVICE_SECRET = "synthetic-device-secret-never-print";
 const GRANT_TOKEN_1 = "um_device_upload_40000000-0000-4000-8000-000000000001.synthetic-grant-one";
@@ -75,10 +81,114 @@ function response(status, value, url = "") {
   return result;
 }
 
-function fakeDependencies({ failManifest = false, anonymousStatus = 403 } = {}) {
+function fakeEnvelope() {
+  return {
+    schemaVersion: "telemetry-envelope-v1.2",
+    synthetic: false,
+    keyId: "key:test",
+    wrappedKey: "synthetic-wrapped-key",
+    iv: "synthetic-iv",
+    ciphertext: "synthetic-ciphertext",
+  };
+}
+
+function mockReadback(input, envelopeBytes, getFailureStage = () => "", onGcsRead = () => {}) {
+  const expectedRecord = input.expectedRecord;
+  const expectedProjection = { ...expectedRecord, schemaVersion: "usage-event-v1.1" };
+  delete expectedProjection.boundaryFlags;
+  delete expectedProjection.tieOrder;
+  delete expectedProjection.cacheWriteTtl;
+  return {
+    primaryPool: {
+      async query(sql) {
+        const failureStage = getFailureStage();
+        if (sql.includes('"telemetry_v12_day_manifests"')) {
+          return { rows: [{
+            id: MANIFEST_ID,
+            manifest_digest: input.manifest.manifestDigest,
+            chunk_day: failureStage === "manifest" ? "2026-09-23" : input.manifest.day,
+            expected_chunk_count: 1,
+          }] };
+        }
+        if (sql.includes('"telemetry_v12_chunks"')) {
+          return { rows: [{
+            id: CONTRIBUTION_ID,
+            chunk_id: input.chunk.chunkId,
+            chunk_digest: failureStage === "chunk" ? "c".repeat(64) : input.chunk.chunkDigest,
+            envelope_digest: input.envelopeDigest,
+            record_count: 1,
+            r2_key: OBJECT_KEY,
+            device_upload_authorization_id: "synthetic-authority",
+          }] };
+        }
+        if (sql.includes('"device_upload_authorizations"')) {
+          return { rows: failureStage === "grants" ? [] : [
+            { state: "consumed", consumed_contribution_id: CONTRIBUTION_ID },
+            { state: "revoked", consumed_contribution_id: null },
+          ] };
+        }
+        if (sql.includes('"pending_objects"')) {
+          return { rows: failureStage === "journal" ? [] : [{
+            object_key: OBJECT_KEY,
+            object_kind: "telemetry_v12",
+            reconciliation_state: "registered",
+          }] };
+        }
+        if (sql.includes('"telemetry_v12_domain_heads"')) {
+          return { rows: failureStage === "domain" ? [] : [{
+            id: GENERATION_ID,
+            manifest_digest: input.domainManifest.manifestDigest,
+            from_day: input.domainManifest.fromDay,
+            through_day: input.domainManifest.throughDay,
+          }] };
+        }
+        if (sql.includes('"telemetry_v12_domain_days"')) {
+          const day = input.domainManifest.days[0];
+          return { rows: failureStage === "domain-days" ? [] : [{
+            observed_day: day.day,
+            manifest_id: day.manifestId,
+            manifest_digest: day.manifestDigest,
+          }] };
+        }
+        throw new Error("unexpected synthetic PostgreSQL readback query");
+      },
+    },
+    async readGcsObject({ bucket, key }) {
+      assert.equal(bucket, SYNTHETIC_V12_SMOKE_BUCKET);
+      assert.equal(key, OBJECT_KEY);
+      onGcsRead();
+      return { size: envelopeBytes.byteLength, bytes: new Uint8Array(envelopeBytes) };
+    },
+    async readEffectivePage(options) {
+      assert.deepEqual(options, {
+        participantId: PARTICIPANT_ID,
+        day: input.manifest.day,
+        stream: "usage",
+        limit: 2,
+      });
+      return {
+        available: true,
+        records: [{
+          stream: "usage",
+          occurrenceId: getFailureStage() === "effective" ? "event:v2:wrong" : expectedRecord.eventId,
+          observedAt: expectedRecord.eventTime,
+          observedAtMs: Date.parse(expectedRecord.eventTime),
+          sourceRecordJson: canonicalTelemetryV12Json(expectedRecord),
+          recordJson: canonicalTelemetryV12Json(expectedProjection),
+          sourceRecordKey: "v12:record:synthetic",
+        }],
+        next: null,
+      };
+    },
+  };
+}
+
+function fakeDependencies({ failManifest = false, anonymousStatus = 403, effectiveMismatch = false,
+  oversizedHealth = false } = {}) {
   const calls = [];
   let seedCount = 0;
   let getTokenCount = 0;
+  let encryptedEnvelopeBytes;
   const fixture = {
     participantId: PARTICIPANT_ID,
     sessionId: IDS[1],
@@ -93,7 +203,9 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403 } = {}) 
     fixture,
     dependencies: {
       async validateEnvelopeKey(jwk) { assert.equal(jwk.kid, "key:test"); },
-      async assertRuntimeReady() {},
+      async assertRuntimeReady() {
+        return { controlState: "degraded", publicationEnabled: false };
+      },
       async seedFixture() { seedCount += 1; return fixture; },
       async getIdToken(audience) {
         assert.equal(audience, CLOUD_RUN_IAM_TEST_TARGET.origin);
@@ -106,6 +218,7 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403 } = {}) 
           return response(anonymousStatus, { status: "blocked" });
         }
         if (url.pathname === "/api/health") {
+          if (oversizedHealth) return new Response("x".repeat(64 * 1024 + 1), { status: 200 });
           return response(200, {
             schemaVersion: "gcp-postgres-test-health-v1",
             scope: "postgres_schema_and_migrations_only",
@@ -130,6 +243,39 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403 } = {}) 
               schemaVersion: "telemetry-chunk-admission-v1.0",
               state: "available",
             },
+          });
+        }
+        if (url.pathname === "/api/v1/me/telemetry-v12/domain-predecessor") {
+          assert.equal(options.method, "POST");
+          assert.equal(options.headers.authorization, fixture.deviceAuthorization);
+          assert.equal(options.body, "{}");
+          return response(201, {
+            schemaVersion: "telemetry-domain-predecessor-v1.2",
+            token: PREDECESSOR_TOKEN,
+            previousGenerationId: null,
+            legacyFingerprint: DOMAIN_FINGERPRINT,
+            fromDay: env().SYNTHETIC_V12_SMOKE_DAY,
+            throughDay: env().SYNTHETIC_V12_SMOKE_DAY,
+            expiresAt: "2030-01-01T00:00:00.000Z",
+          });
+        }
+        if (url.pathname === "/api/v1/me/telemetry-v12/domain-activate") {
+          assert.equal(options.method, "POST");
+          assert.equal(options.headers.authorization, fixture.deviceAuthorization);
+          const manifest = JSON.parse(options.body);
+          assert.equal(manifest.schemaVersion, TELEMETRY_V12_DOMAIN_MANIFEST_SCHEMA_VERSION);
+          assert.equal(manifest.fromDay, env().SYNTHETIC_V12_SMOKE_DAY);
+          assert.equal(manifest.throughDay, env().SYNTHETIC_V12_SMOKE_DAY);
+          assert.equal(manifest.days.length, 1);
+          assert.equal(manifest.days[0].day, env().SYNTHETIC_V12_SMOKE_DAY);
+          const replay = calls.filter((call) => call.url.pathname === url.pathname).length === 2;
+          return response(201, {
+            schemaVersion: "telemetry-domain-activation-v1.2",
+            generationId: GENERATION_ID,
+            manifestDigest: manifest.manifestDigest,
+            fromDay: manifest.fromDay,
+            throughDay: manifest.throughDay,
+            replay,
           });
         }
         if (url.pathname === "/api/v1/device/telemetry/v1.2/day-manifests") {
@@ -166,28 +312,27 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403 } = {}) 
       async encryptEnvelope(chunk, jwk) {
         assert.equal(chunk.schemaVersion, "telemetry-contribution-v1.2");
         assert.equal(jwk.kid, "key:test");
-        return {
-          schemaVersion: "telemetry-envelope-v1.2",
-          synthetic: false,
-          keyId: jwk.kid,
-          wrappedKey: "synthetic-wrapped-key",
-          iv: "synthetic-iv",
-          ciphertext: "synthetic-ciphertext",
-        };
+        encryptedEnvelopeBytes = Buffer.from(JSON.stringify(fakeEnvelope()));
+        return fakeEnvelope();
       },
       async readback(input) {
         assert.equal(input.fixture.participantId, PARTICIPANT_ID);
         assert.equal(input.manifestId, MANIFEST_ID);
         assert.equal(input.contributionId, CONTRIBUTION_ID);
-        assert.equal(input.envelopeByteLength, Buffer.byteLength(JSON.stringify({
-          schemaVersion: "telemetry-envelope-v1.2",
-          synthetic: false,
-          keyId: "key:test",
-          wrappedKey: "synthetic-wrapped-key",
-          iv: "synthetic-iv",
-          ciphertext: "synthetic-ciphertext",
-        })));
-        return { postgres: true, gcs: true };
+        assert.equal(input.envelopeByteLength, encryptedEnvelopeBytes.byteLength);
+        assert.equal(input.generationId, GENERATION_ID);
+        assert.equal(input.domainManifest.predecessor.token, PREDECESSOR_TOKEN);
+        assert.equal(input.domainManifest.days.length, 1);
+        const mock = mockReadback(input, encryptedEnvelopeBytes,
+          () => effectiveMismatch ? "effective" : "");
+        return postgresAndGcsReadback({
+          ...input,
+          primaryPool: mock.primaryPool,
+          primarySchema: "tibotattle",
+          bucket: SYNTHETIC_V12_SMOKE_BUCKET,
+          readGcsObject: mock.readGcsObject,
+          readEffectivePage: mock.readEffectivePage,
+        });
       },
       randomUUID() { return IDS[6]; },
     },
@@ -359,77 +504,55 @@ test("synthetic encrypted chunk round-trips using only the public envelope key",
 test("PostgreSQL readback uses ISO date text and identifies the failing stage", async () => {
   const envelopeBytes = Buffer.from('{"synthetic":"v12-readback-test"}');
   const envelopeDigest = createHash("sha256").update(envelopeBytes).digest("hex");
-  const manifestDigest = "a".repeat(64);
-  const chunkDigest = "b".repeat(64);
-  const objectKey = "telemetry/v12-50000000-0000-4000-8000-000000000001";
+  const { manifest, chunk } = makeManifestAndChunk({
+    day: "2026-09-24", sessionId: IDS[1], randomUUIDImpl: () => IDS[6],
+  });
+  const domainManifest = {
+    schemaVersion: TELEMETRY_V12_DOMAIN_MANIFEST_SCHEMA_VERSION,
+    fromDay: manifest.day,
+    throughDay: manifest.day,
+    predecessor: {
+      token: PREDECESSOR_TOKEN,
+      previousGenerationId: null,
+      legacyFingerprint: DOMAIN_FINGERPRINT,
+    },
+    days: [{ day: manifest.day, manifestId: MANIFEST_ID, manifestDigest: manifest.manifestDigest }],
+    manifestDigest: "0".repeat(64),
+  };
+  domainManifest.manifestDigest = createHash("sha256")
+    .update(telemetryV12DomainManifestDigestInput(domainManifest)).digest("hex");
   let failureStage = "";
   let gcsReads = 0;
-  const primaryPool = {
-    async query(sql) {
-      if (sql.includes('"telemetry_v12_day_manifests"')) {
-        assert.match(sql, /chunk_day::text AS chunk_day/u);
-        return { rows: [{
-          id: MANIFEST_ID,
-          manifest_digest: manifestDigest,
-          chunk_day: failureStage === "manifest" ? "2026-09-23" : "2026-09-24",
-          expected_chunk_count: 1,
-        }] };
-      }
-      if (sql.includes('"telemetry_v12_chunks"')) {
-        return { rows: [{
-          id: CONTRIBUTION_ID,
-          chunk_id: "usage:2026-09-24:0",
-          chunk_digest: failureStage === "chunk" ? "c".repeat(64) : chunkDigest,
-          envelope_digest: envelopeDigest,
-          record_count: 1,
-          r2_key: objectKey,
-        }] };
-      }
-      if (sql.includes('"device_upload_authorizations"')) {
-        return { rows: failureStage === "grants" ? [] : [
-          { state: "consumed", consumed_contribution_id: CONTRIBUTION_ID },
-          { state: "revoked", consumed_contribution_id: null },
-        ] };
-      }
-      if (sql.includes('"pending_objects"')) {
-        return { rows: failureStage === "journal" ? [] : [{
-          object_key: objectKey,
-          object_kind: "telemetry_v12",
-          reconciliation_state: "registered",
-        }] };
-      }
-      throw new Error("unexpected PostgreSQL readback query");
-    },
-  };
   const input = {
-    primaryPool,
     primarySchema: "tibotattle",
-    async readGcsObject({ bucket, key }) {
-      assert.equal(bucket, SYNTHETIC_V12_SMOKE_BUCKET);
-      assert.equal(key, objectKey);
-      gcsReads += 1;
-      return { size: envelopeBytes.length, bytes: new Uint8Array(envelopeBytes) };
-    },
     bucket: SYNTHETIC_V12_SMOKE_BUCKET,
     fixture: { participantId: PARTICIPANT_ID, deviceId: DEVICE_ID },
-    manifest: { manifestDigest, day: "2026-09-24" },
+    manifest,
     manifestId: MANIFEST_ID,
-    chunk: { chunkId: "usage:2026-09-24:0", chunkDigest },
+    chunk,
     envelopeDigest,
     envelopeByteLength: envelopeBytes.length,
     contributionId: CONTRIBUTION_ID,
+    domainManifest,
+    generationId: GENERATION_ID,
+    expectedRecord: chunk.records[0],
   };
-  assert.deepEqual(await postgresAndGcsReadback(input), { postgres: true, gcs: true });
+  const mock = mockReadback(input, envelopeBytes, () => failureStage, () => { gcsReads += 1; });
+  const readback = () => postgresAndGcsReadback({ ...input, ...mock });
+  assert.deepEqual(await readback(), { postgres: true, gcs: true, effectiveRecord: true });
   assert.equal(gcsReads, 1);
   for (const [stage, code] of [
     ["manifest", "SMOKE_POSTGRES_READBACK_MANIFEST_MISMATCH"],
     ["chunk", "SMOKE_POSTGRES_READBACK_CHUNK_MISMATCH"],
     ["grants", "SMOKE_POSTGRES_READBACK_GRANTS_MISMATCH"],
     ["journal", "SMOKE_POSTGRES_READBACK_JOURNAL_MISMATCH"],
+    ["domain", "SMOKE_POSTGRES_READBACK_DOMAIN_MISMATCH"],
+    ["domain-days", "SMOKE_POSTGRES_READBACK_DOMAIN_DAYS_MISMATCH"],
+    ["effective", "SMOKE_POSTGRES_EFFECTIVE_RECORD_MISMATCH"],
   ]) {
     failureStage = stage;
-    await assert.rejects(postgresAndGcsReadback(input), { code });
-    assert.equal(gcsReads, 1);
+    await assert.rejects(readback(), { code });
+    assert.equal(gcsReads, stage === "effective" ? 2 : 1);
   }
 });
 
@@ -483,22 +606,28 @@ test("smoke journey keeps IAM and participant credentials separate and replays e
   assert.deepEqual({
     manifest: receipt.manifest,
     chunk: receipt.chunk,
+    domain: receipt.domain,
     syncState: receipt.syncState,
     postgresReadback: receipt.postgresReadback,
+    effectiveRecordReadback: receipt.effectiveRecordReadback,
     gcsReadback: receipt.gcsReadback,
+    publication: receipt.publication,
   }, {
     manifest: "staged_and_exactly_replayed",
     chunk: "staged_and_exactly_replayed",
+    domain: "activated_and_exactly_replayed",
     syncState: "empty_history_admission_available",
     postgresReadback: true,
+    effectiveRecordReadback: true,
     gcsReadback: true,
+    publication: "withheld_by_verified_degraded_controls",
   });
-  assert.equal(fake.getTokenCount, 8);
+  assert.equal(fake.getTokenCount, 11);
   const anonymous = fake.calls[0];
   assert.equal(anonymous.options.headers.authorization, undefined);
   assert.equal(anonymous.options.headers["x-serverless-authorization"], undefined);
   const authenticated = fake.calls.slice(1);
-  assert.equal(authenticated.length, 8);
+  assert.equal(authenticated.length, 11);
   for (const call of authenticated) {
     assert.equal(call.url.origin, CLOUD_RUN_IAM_TEST_TARGET.origin);
     assert.equal(call.options.redirect, "manual");
@@ -511,7 +640,7 @@ test("smoke journey keeps IAM and participant credentials separate and replays e
     call.options.headers.authorization?.startsWith("Device "));
   const grantAuthCalls = authenticated.filter((call) =>
     call.options.headers.authorization?.startsWith("Upload "));
-  assert.equal(deviceAuthCalls.length, 5);
+  assert.equal(deviceAuthCalls.length, 8);
   assert.equal(grantAuthCalls.length, 2);
   assert.equal(grantAuthCalls[0].options.headers.authorization, `Upload ${GRANT_TOKEN_1}`);
   assert.equal(grantAuthCalls[1].options.headers.authorization, `Upload ${GRANT_TOKEN_2}`);
@@ -521,11 +650,56 @@ test("smoke journey keeps IAM and participant credentials separate and replays e
   const chunks = authenticated.filter((call) => call.url.pathname === "/api/v1/contributions");
   assert.equal(chunks.length, 2);
   assert.equal(chunks[0].options.body, chunks[1].options.body);
+  const predecessors = authenticated.filter((call) =>
+    call.url.pathname === "/api/v1/me/telemetry-v12/domain-predecessor");
+  assert.equal(predecessors.length, 1);
+  assert.equal(predecessors[0].options.method, "POST");
+  assert.equal(predecessors[0].options.headers.authorization, fake.fixture.deviceAuthorization);
+  const activations = authenticated.filter((call) =>
+    call.url.pathname === "/api/v1/me/telemetry-v12/domain-activate");
+  assert.equal(activations.length, 2);
+  assert.ok(activations.every((call) => call.options.headers.authorization === fake.fixture.deviceAuthorization));
+  assert.equal(activations[0].options.body, activations[1].options.body);
+  const domainManifest = JSON.parse(activations[0].options.body);
+  assert.equal(domainManifest.schemaVersion, TELEMETRY_V12_DOMAIN_MANIFEST_SCHEMA_VERSION);
+  assert.equal(domainManifest.fromDay, env().SYNTHETIC_V12_SMOKE_DAY);
+  assert.equal(domainManifest.throughDay, env().SYNTHETIC_V12_SMOKE_DAY);
+  assert.deepEqual(domainManifest.predecessor, {
+    token: PREDECESSOR_TOKEN,
+    previousGenerationId: null,
+    legacyFingerprint: DOMAIN_FINGERPRINT,
+  });
+  assert.equal(domainManifest.days.length, 1);
+  assert.equal(domainManifest.days[0].manifestId, MANIFEST_ID);
+  assert.equal(domainManifest.days[0].manifestDigest,
+    JSON.parse(manifests[0].options.body).manifestDigest);
+  assert.equal(domainManifest.manifestDigest, createHash("sha256")
+    .update(telemetryV12DomainManifestDigestInput(domainManifest)).digest("hex"));
   assert.equal(JSON.stringify(receipt).includes(SERVERLESS_TOKEN), false);
   assert.equal(JSON.stringify(receipt).includes(DEVICE_SECRET), false);
   assert.equal(JSON.stringify(receipt).includes(GRANT_TOKEN_1), false);
+  assert.equal(JSON.stringify(receipt).includes(PREDECESSOR_TOKEN), false);
+  assert.equal(JSON.stringify(receipt).includes(DOMAIN_FINGERPRINT), false);
+  assert.equal(JSON.stringify(receipt).includes(GENERATION_ID), false);
   assert.equal(JSON.stringify(receipt).includes(MANIFEST_ID), false);
   assert.equal(JSON.stringify(receipt).includes(CONTRIBUTION_ID), false);
+});
+
+test("oversized hosted JSON response is rejected before synthetic authority is seeded", async () => {
+  const fake = fakeDependencies({ oversizedHealth: true });
+  await assert.rejects(
+    runSyntheticV12Smoke({ config: parseSyntheticV12SmokeConfig(env()), dependencies: fake.dependencies }),
+    { code: "SMOKE_RESPONSE_TOO_LARGE" },
+  );
+  assert.equal(fake.seedCount, 0);
+});
+
+test("effective readback mismatch fails closed after domain activation", async () => {
+  const fake = fakeDependencies({ effectiveMismatch: true });
+  await assert.rejects(
+    runSyntheticV12Smoke({ config: parseSyntheticV12SmokeConfig(env()), dependencies: fake.dependencies }),
+    { code: "SMOKE_POSTGRES_EFFECTIVE_RECORD_MISMATCH", orphaned: true },
+  );
 });
 
 test("unauthenticated direct-origin health must fail before fixture creation", async () => {

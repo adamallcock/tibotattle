@@ -267,7 +267,67 @@ const DEVICE_SYNC_STATE_PATH = "/api/v1/device/sync/state";
 const DEVICE_SYNC_CAPABILITIES_V12_PATH = "/api/v1/device/sync-capabilities-v1.2";
 const V12_DOMAIN_PREDECESSOR_PATH = "/api/v1/me/telemetry-v12/domain-predecessor";
 const V12_DOMAIN_ACTIVATE_PATH = "/api/v1/me/telemetry-v12/domain-activate";
+const V12_EFFECTIVE_PAGE_PATH = "/api/v1/me/telemetry-v12/effective-page";
 const MAX_V12_DAY_CHUNKS = 4_096;
+const MAX_V12_EFFECTIVE_PAGE_LIMIT = 200;
+const MAX_V12_EFFECTIVE_TIME_MS = 8_640_000_000_000_000;
+const V12_EFFECTIVE_OCCURRENCE = /^[A-Za-z0-9._:-]{8,128}$/u;
+
+function invalidEffectivePageQuery() {
+  return Object.assign(new Error("BODY_INVALID"), { code: "BODY_INVALID", status: 400 });
+}
+
+function parseV12EffectivePageQuery(url) {
+  const allowed = new Set([
+    "day", "stream", "limit", "afterObservedAtMs", "afterOccurrenceId",
+  ]);
+  if ([...url.searchParams.keys()].some((key) => !allowed.has(key))) {
+    throw invalidEffectivePageQuery();
+  }
+  const single = (key, required = false) => {
+    const values = url.searchParams.getAll(key);
+    if (values.length > 1 || (required && values.length !== 1)) throw invalidEffectivePageQuery();
+    return values[0];
+  };
+  const day = single("day", true);
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(day)
+      || !Number.isFinite(Date.parse(`${day}T00:00:00.000Z`))
+      || new Date(`${day}T00:00:00.000Z`).toISOString().slice(0, 10) !== day) {
+    throw invalidEffectivePageQuery();
+  }
+  const stream = single("stream", true);
+  if (stream !== "usage" && stream !== "quota" && stream !== "session") {
+    throw invalidEffectivePageQuery();
+  }
+  const rawLimit = single("limit");
+  const limit = rawLimit === undefined ? 100 : Number(rawLimit);
+  if (rawLimit !== undefined && !/^[1-9]\d{0,2}$/u.test(rawLimit)) {
+    throw invalidEffectivePageQuery();
+  }
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_V12_EFFECTIVE_PAGE_LIMIT) {
+    throw invalidEffectivePageQuery();
+  }
+  const rawObservedAtMs = single("afterObservedAtMs");
+  const occurrenceId = single("afterOccurrenceId");
+  if ((rawObservedAtMs === undefined) !== (occurrenceId === undefined)) {
+    throw invalidEffectivePageQuery();
+  }
+  let after;
+  if (rawObservedAtMs !== undefined) {
+    if (typeof occurrenceId !== "string" || !/^-?\d{1,16}$/u.test(rawObservedAtMs)
+        || !V12_EFFECTIVE_OCCURRENCE.test(occurrenceId)) {
+      throw invalidEffectivePageQuery();
+    }
+    const observedAtMs = Number(rawObservedAtMs);
+    if (!Number.isSafeInteger(observedAtMs)
+        || observedAtMs < -MAX_V12_EFFECTIVE_TIME_MS
+        || observedAtMs > MAX_V12_EFFECTIVE_TIME_MS) {
+      throw invalidEffectivePageQuery();
+    }
+    after = Object.freeze({ observedAtMs, occurrenceId });
+  }
+  return Object.freeze({ day, stream, limit, ...(after === undefined ? {} : { after }) });
+}
 
 function routeError(error, requestId) {
   const code = typeof error?.code === "string" && /^[A-Z0-9_]+$/u.test(error.code)
@@ -934,6 +994,7 @@ export function createPostgresTestV12DayManifestDispatch({
   readPostgresDeviceSyncState,
   readPostgresDeviceSyncV12Capabilities,
   readPostgresV12DayCandidates,
+  readPostgresTelemetryV12EffectivePage,
   publicEnvelopeKey,
   sourceNamespace,
   createPostgresTypedV12Domain,
@@ -984,6 +1045,7 @@ export function createPostgresTestV12DayManifestDispatch({
       || typeof readPostgresV12DayCandidates !== "function"
       || typeof publicEnvelopeKey !== "function"
       || typeof createPostgresTypedV12Domain !== "function"
+      || typeof readPostgresTelemetryV12EffectivePage !== "function"
       || !Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1) {
     configurationError("POSTGRES_TEST_V12_DISPATCH_CONFIGURATION_INVALID");
   }
@@ -1020,10 +1082,12 @@ export function createPostgresTestV12DayManifestDispatch({
     const syncCapabilitiesV12Path = url.pathname === DEVICE_SYNC_CAPABILITIES_V12_PATH;
     const v12DomainPredecessorPath = url.pathname === V12_DOMAIN_PREDECESSOR_PATH;
     const v12DomainActivatePath = url.pathname === V12_DOMAIN_ACTIVATE_PATH;
+    const v12EffectivePagePath = url.pathname === V12_EFFECTIVE_PAGE_PATH;
     const syncStateRoute = syncStatePath && request.method === "GET";
     const syncCapabilitiesV12Route = syncCapabilitiesV12Path && request.method === "GET";
     const v12DomainPredecessorRoute = v12DomainPredecessorPath && request.method === "POST";
     const v12DomainActivateRoute = v12DomainActivatePath && request.method === "POST";
+    const v12EffectivePageRoute = v12EffectivePagePath && request.method === "GET";
     if (envelopeKeyPath && request.method !== "GET") {
       return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET" },
@@ -1045,12 +1109,18 @@ export function createPostgresTestV12DayManifestDispatch({
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "POST" },
       }), crypto.randomUUID());
     }
+    if (v12EffectivePagePath && request.method !== "GET") {
+      return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
+        code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET" },
+      }), crypto.randomUUID());
+    }
     if ((!envelopeKeyRoute && !manifestRoute && !manifestReadRoute
         && !uploadAuthorizationRoute && !v12ChunkUploadRoute
         && !syncStateRoute && !syncCapabilitiesV12Route
-        && !v12DomainPredecessorRoute && !v12DomainActivateRoute)
+        && !v12DomainPredecessorRoute && !v12DomainActivateRoute
+        && !v12EffectivePageRoute)
         || (url.search && !envelopeKeyRoute && !manifestReadRoute
-          && !syncStatePath && !syncCapabilitiesV12Path)) {
+          && !syncStatePath && !syncCapabilitiesV12Path && !v12EffectivePageRoute)) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
 
@@ -1069,7 +1139,7 @@ export function createPostgresTestV12DayManifestDispatch({
       }
 
       assertAdmissionBindings(admissionEnv);
-      if (syncStateRoute || syncCapabilitiesV12Route || manifestReadRoute) {
+      if (syncStateRoute || syncCapabilitiesV12Route || manifestReadRoute || v12EffectivePageRoute) {
         await assertAttemptAllowed(
           admissionEnv.RECOVERY_RATE_LIMIT,
           admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
@@ -1162,6 +1232,27 @@ export function createPostgresTestV12DayManifestDispatch({
             sourceNamespace,
           },
         ));
+      }
+      if (v12EffectivePageRoute) {
+        if (request.body !== null) throw invalidEffectivePageQuery();
+        const query = parseV12EffectivePageQuery(url);
+        let page;
+        try {
+          page = await readPostgresTelemetryV12EffectivePage(primaryPool, {
+            participantId: device.participantId,
+            ...query,
+          }, { schema });
+        } catch {
+          throw storageUnavailable();
+        }
+        if (page?.available !== true || !Array.isArray(page.records)
+            || page.records.length > query.limit) {
+          throw storageUnavailable();
+        }
+        return json(200, {
+          schemaVersion: "postgres-telemetry-v12-effective-page-v1",
+          ...page,
+        });
       }
 
       if (uploadAuthorizationRoute) {

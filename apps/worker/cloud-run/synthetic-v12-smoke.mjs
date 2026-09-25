@@ -8,10 +8,12 @@ import { GoogleAuth } from "google-auth-library";
 import {
   canonicalTelemetryV12Json,
   TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+  TELEMETRY_V12_DOMAIN_MANIFEST_SCHEMA_VERSION,
   TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
   TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
   parseTelemetryV12Chunk,
   telemetryV12DayManifestDigestInput,
+  telemetryV12DomainManifestDigestInput,
   telemetryV12RequiredConsent,
   validateTelemetryV12Envelope,
 } from "@app-usagemonitor/telemetry-contract";
@@ -46,10 +48,15 @@ const RUN_EXECUTION_PATTERN = /^[a-z][a-z0-9-]{0,62}$/u;
 const SMOKE_ORIGIN = CLOUD_RUN_IAM_TEST_TARGET.origin;
 const GCS_MEDIA_ORIGIN = "https://storage.googleapis.com";
 const MAX_ENVELOPE_BYTES = 2_100_000;
+const MAX_HTTP_REQUEST_BYTES = MAX_ENVELOPE_BYTES + 16_384;
+const MAX_HTTP_RESPONSE_BYTES = 64 * 1024;
+const MAX_EFFECTIVE_RECORD_BYTES = 64 * 1024;
 const MANIFEST_PATH = "/api/v1/device/telemetry/v1.2/day-manifests";
 const GRANT_PATH = "/api/v1/device/upload-authorizations";
 const CHUNK_PATH = "/api/v1/contributions";
 const SYNC_STATE_PATH = "/api/v1/device/sync/state";
+const DOMAIN_PREDECESSOR_PATH = "/api/v1/me/telemetry-v12/domain-predecessor";
+const DOMAIN_ACTIVATE_PATH = "/api/v1/me/telemetry-v12/domain-activate";
 const encoder = new TextEncoder();
 
 function fail(code, extras = {}) {
@@ -191,6 +198,10 @@ export async function assertSyntheticV12RuntimeReady({ primaryPool, schema }) {
         || control.publication_enabled !== false) {
       fail("SMOKE_RUNTIME_CONTROLS_NOT_READY");
     }
+    return Object.freeze({
+      controlState: control.control_state,
+      publicationEnabled: control.publication_enabled,
+    });
   } catch (error) {
     if (error?.code === "SMOKE_RUNTIME_CONTROLS_NOT_READY") throw error;
     fail("SMOKE_RUNTIME_CONTROLS_UNAVAILABLE");
@@ -373,12 +384,48 @@ function safeObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+async function boundedHttpResponseBytes(response, maximumBytes) {
+  const declaredLength = response.headers?.get?.("content-length");
+  if (declaredLength !== null && declaredLength !== undefined) {
+    if (!/^(?:0|[1-9][0-9]*)$/u.test(declaredLength)
+        || Number(declaredLength) > maximumBytes) fail("SMOKE_RESPONSE_TOO_LARGE");
+  }
+  const reader = response.body?.getReader?.();
+  if (!reader) fail("SMOKE_RESPONSE_INVALID");
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maximumBytes) {
+        await reader.cancel().catch(() => undefined);
+        fail("SMOKE_RESPONSE_TOO_LARGE");
+      }
+      chunks.push(value);
+    }
+  } catch (error) {
+    if (error?.code === "SMOKE_RESPONSE_TOO_LARGE") throw error;
+    fail("SMOKE_RESPONSE_INVALID");
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
 async function readJson(response) {
   try {
-    const value = await response.json();
+    const bytes = await boundedHttpResponseBytes(response, MAX_HTTP_RESPONSE_BYTES);
+    const value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
     if (!safeObject(value)) fail("SMOKE_RESPONSE_INVALID");
     return value;
-  } catch {
+  } catch (error) {
+    if (error?.code === "SMOKE_RESPONSE_TOO_LARGE") throw error;
     fail("SMOKE_RESPONSE_INVALID");
   }
 }
@@ -466,9 +513,17 @@ async function requestJson({ fetchImpl, getIdToken, origin, method, path, author
     accept: "application/json",
   };
   if (authorization !== undefined) headers.authorization = authorization;
-  if (body !== undefined) headers["content-type"] = "application/json; charset=utf-8";
+  if (body !== undefined) {
+    if (typeof body !== "string" || Buffer.byteLength(body) > MAX_HTTP_REQUEST_BYTES) {
+      fail("SMOKE_REQUEST_TOO_LARGE");
+    }
+    headers["content-type"] = "application/json; charset=utf-8";
+  }
   const url = new URL(path, origin);
-  if (url.origin !== origin || ![MANIFEST_PATH, GRANT_PATH, CHUNK_PATH, SYNC_STATE_PATH, "/api/health"].includes(path)) {
+  const allowedPaths = [MANIFEST_PATH, GRANT_PATH, CHUNK_PATH, SYNC_STATE_PATH,
+    DOMAIN_PREDECESSOR_PATH, DOMAIN_ACTIVATE_PATH, "/api/health"];
+  if (url.origin !== origin || !allowedPaths.includes(path)
+      || (["/api/health", SYNC_STATE_PATH].includes(path) ? method !== "GET" : method !== "POST")) {
     fail("SMOKE_ROUTE_INVALID");
   }
   let response;
@@ -673,7 +728,9 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
   let seeded = false;
   try {
     await deps.validateEnvelopeKey(config.envelopePublicJwk);
-    await deps.assertRuntimeReady(config);
+    const controls = await deps.assertRuntimeReady(config);
+    if (!safeObject(controls) || controls.controlState !== "degraded"
+        || controls.publicationEnabled !== false) fail("SMOKE_RUNTIME_CONTROLS_NOT_READY");
     await checkUnauthenticatedOrigin({ fetchImpl: deps.fetchImpl, origin: config.origin });
     const { response: healthResponse, value: health } = await requestJson({
       fetchImpl: deps.fetchImpl,
@@ -809,6 +866,76 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       fail("SMOKE_CHUNK_REPLAY_MISMATCH");
     }
 
+    const { response: predecessorResponse, value: predecessor } = await requestJson({
+      fetchImpl: deps.fetchImpl,
+      getIdToken: deps.getIdToken,
+      origin: config.origin,
+      method: "POST",
+      path: DOMAIN_PREDECESSOR_PATH,
+      authorization: fixture.deviceAuthorization,
+      body: "{}",
+    });
+    expectStatus(predecessorResponse, predecessor, 201, "SMOKE_DOMAIN_PREDECESSOR_FAILED");
+    const predecessorToken = responseUuid(
+      predecessor, "token", "SMOKE_DOMAIN_PREDECESSOR_RECEIPT_INVALID",
+    );
+    if (predecessor.schemaVersion !== "telemetry-domain-predecessor-v1.2"
+        || predecessor.previousGenerationId !== null
+        || !safeDigest(predecessor.legacyFingerprint)
+        || predecessor.fromDay !== config.day || predecessor.throughDay !== config.day
+        || typeof predecessor.expiresAt !== "string"
+        || !Number.isFinite(Date.parse(predecessor.expiresAt))
+        || Date.parse(predecessor.expiresAt) <= Date.now()) {
+      fail("SMOKE_DOMAIN_PREDECESSOR_RECEIPT_INVALID");
+    }
+    const domainManifest = {
+      schemaVersion: TELEMETRY_V12_DOMAIN_MANIFEST_SCHEMA_VERSION,
+      fromDay: predecessor.fromDay,
+      throughDay: predecessor.throughDay,
+      predecessor: {
+        token: predecessorToken,
+        previousGenerationId: predecessor.previousGenerationId,
+        legacyFingerprint: predecessor.legacyFingerprint,
+      },
+      days: [{ day: config.day, manifestId, manifestDigest: manifest.manifestDigest }],
+      manifestDigest: "0".repeat(64),
+    };
+    domainManifest.manifestDigest = sha256Hex(Buffer.from(
+      telemetryV12DomainManifestDigestInput(domainManifest),
+    ));
+    const domainManifestBody = JSON.stringify(domainManifest);
+    const activateDomain = async () => requestJson({
+      fetchImpl: deps.fetchImpl,
+      getIdToken: deps.getIdToken,
+      origin: config.origin,
+      method: "POST",
+      path: DOMAIN_ACTIVATE_PATH,
+      authorization: fixture.deviceAuthorization,
+      body: domainManifestBody,
+    });
+    const firstActivation = await activateDomain();
+    expectStatus(firstActivation.response, firstActivation.value, 201, "SMOKE_DOMAIN_ACTIVATE_FAILED");
+    const generationId = responseUuid(
+      firstActivation.value, "generationId", "SMOKE_DOMAIN_ACTIVATION_RECEIPT_INVALID",
+    );
+    if (firstActivation.value.schemaVersion !== "telemetry-domain-activation-v1.2"
+        || firstActivation.value.manifestDigest !== domainManifest.manifestDigest
+        || firstActivation.value.fromDay !== config.day
+        || firstActivation.value.throughDay !== config.day
+        || firstActivation.value.replay !== false) {
+      fail("SMOKE_DOMAIN_ACTIVATION_RECEIPT_INVALID");
+    }
+    const replayActivation = await activateDomain();
+    expectStatus(replayActivation.response, replayActivation.value, 201, "SMOKE_DOMAIN_REPLAY_FAILED");
+    if (replayActivation.value.schemaVersion !== firstActivation.value.schemaVersion
+        || replayActivation.value.generationId !== generationId
+        || replayActivation.value.manifestDigest !== domainManifest.manifestDigest
+        || replayActivation.value.fromDay !== config.day
+        || replayActivation.value.throughDay !== config.day
+        || replayActivation.value.replay !== true) {
+      fail("SMOKE_DOMAIN_REPLAY_MISMATCH");
+    }
+
     const storage = await deps.readback({
       config,
       fixture,
@@ -818,8 +945,11 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       envelopeDigest,
       envelopeByteLength: envelopeBytes.byteLength,
       contributionId,
+      domainManifest,
+      generationId,
+      expectedRecord: chunk.records[0],
     });
-    if (storage?.postgres !== true || storage?.gcs !== true) {
+    if (storage?.postgres !== true || storage?.gcs !== true || storage?.effectiveRecord !== true) {
       fail("SMOKE_STORAGE_READBACK_FAILED");
     }
     return Object.freeze({
@@ -829,9 +959,12 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       origin: config.origin,
       manifest: "staged_and_exactly_replayed",
       chunk: "staged_and_exactly_replayed",
+      domain: "activated_and_exactly_replayed",
       syncState: "empty_history_admission_available",
       postgresReadback: true,
+      effectiveRecordReadback: true,
       gcsReadback: true,
+      publication: "withheld_by_verified_degraded_controls",
       retainedFixturePrefix: SYNTHETIC_V12_SMOKE_PARTICIPANT_PREFIX,
     });
   } catch (error) {
@@ -853,6 +986,10 @@ function safeReadbackFailure(error) {
     "SMOKE_POSTGRES_READBACK_CHUNK_MISMATCH",
     "SMOKE_POSTGRES_READBACK_GRANTS_MISMATCH",
     "SMOKE_POSTGRES_READBACK_JOURNAL_MISMATCH",
+    "SMOKE_POSTGRES_READBACK_DOMAIN_MISMATCH",
+    "SMOKE_POSTGRES_READBACK_DOMAIN_DAYS_MISMATCH",
+    "SMOKE_POSTGRES_EFFECTIVE_RECORD_MISMATCH",
+    "SMOKE_POSTGRES_EFFECTIVE_READBACK_UNAVAILABLE",
   ]).has(error?.code)
       || error?.code === "SMOKE_GCS_OBJECT_MISSING"
       || typeof error?.code === "string" && error.code.startsWith("SMOKE_GCS_")) throw error;
@@ -871,8 +1008,18 @@ export async function postgresAndGcsReadback({
   envelopeDigest,
   envelopeByteLength,
   contributionId,
+  domainManifest,
+  generationId,
+  expectedRecord,
+  readEffectivePage,
 }) {
   try {
+    if (!safeObject(domainManifest) || domainManifest.fromDay !== manifest.day
+        || domainManifest.throughDay !== manifest.day || !Array.isArray(domainManifest.days)
+        || domainManifest.days.length !== 1 || domainManifest.days[0]?.day !== manifest.day
+        || typeof generationId !== "string" || !UUID_PATTERN.test(generationId)) {
+      fail("SMOKE_POSTGRES_READBACK_DOMAIN_MISMATCH");
+    }
     const manifests = await primaryPool.query(
       `SELECT id, manifest_digest, chunk_day::text AS chunk_day, expected_chunk_count
          FROM ${quotedTable(primarySchema, "telemetry_v12_day_manifests")}
@@ -920,6 +1067,35 @@ export async function postgresAndGcsReadback({
         || journal.rows[0].reconciliation_state !== "registered") {
       fail("SMOKE_POSTGRES_READBACK_JOURNAL_MISMATCH");
     }
+    const activeDomain = await primaryPool.query(
+      `SELECT domain.id, domain.manifest_digest,
+              to_char(domain.from_day, 'YYYY-MM-DD') AS from_day,
+              to_char(domain.through_day, 'YYYY-MM-DD') AS through_day
+         FROM ${quotedTable(primarySchema, "telemetry_v12_domain_heads")} head
+         JOIN ${quotedTable(primarySchema, "telemetry_v12_domains")} domain
+           ON domain.id = head.generation_id
+        WHERE head.participant_id = $1 AND head.generation_id = $2 AND domain.device_id = $3`,
+      [fixture.participantId, generationId, fixture.deviceId],
+    );
+    if (activeDomain.rows.length !== 1 || activeDomain.rows[0].id !== generationId
+        || activeDomain.rows[0].manifest_digest !== domainManifest.manifestDigest
+        || activeDomain.rows[0].from_day !== domainManifest.fromDay
+        || activeDomain.rows[0].through_day !== domainManifest.throughDay) {
+      fail("SMOKE_POSTGRES_READBACK_DOMAIN_MISMATCH");
+    }
+    const domainDays = await primaryPool.query(
+      `SELECT to_char(observed_day, 'YYYY-MM-DD') AS observed_day, manifest_id, manifest_digest
+         FROM ${quotedTable(primarySchema, "telemetry_v12_domain_days")}
+        WHERE generation_id = $1 ORDER BY observed_day LIMIT 2`,
+      [generationId],
+    );
+    const expectedDay = domainManifest.days[0];
+    if (domainDays.rows.length !== 1
+        || domainDays.rows[0].observed_day !== expectedDay.day
+        || domainDays.rows[0].manifest_id !== expectedDay.manifestId
+        || domainDays.rows[0].manifest_digest !== expectedDay.manifestDigest) {
+      fail("SMOKE_POSTGRES_READBACK_DOMAIN_DAYS_MISMATCH");
+    }
     if (bucket !== SYNTHETIC_V12_SMOKE_BUCKET || !safeSyntheticObjectKey(storedChunk.r2_key)
         || typeof readGcsObject !== "function") fail("SMOKE_GCS_CONFIGURATION_INVALID");
     const object = await readGcsObject({
@@ -930,7 +1106,44 @@ export async function postgresAndGcsReadback({
     if (!safeObject(object) || object.size !== envelopeByteLength
         || !(object.bytes instanceof Uint8Array) || object.bytes.byteLength !== envelopeByteLength
         || sha256Hex(object.bytes) !== envelopeDigest) fail("SMOKE_GCS_READBACK_MISMATCH");
-    return Object.freeze({ postgres: true, gcs: true });
+    if (typeof readEffectivePage !== "function" || !safeObject(expectedRecord)) {
+      fail("SMOKE_POSTGRES_EFFECTIVE_READBACK_UNAVAILABLE");
+    }
+    const page = await readEffectivePage({
+      participantId: fixture.participantId,
+      day: manifest.day,
+      stream: "usage",
+      limit: 2,
+    });
+    if (!safeObject(page) || page.available !== true || !Array.isArray(page.records)
+        || page.records.length !== 1 || page.next !== null) {
+      fail("SMOKE_POSTGRES_EFFECTIVE_RECORD_MISMATCH");
+    }
+    const effective = page.records[0];
+    if (!safeObject(effective) || effective.occurrenceId !== expectedRecord.eventId
+        || typeof effective.sourceRecordJson !== "string"
+        || Buffer.byteLength(effective.sourceRecordJson) > MAX_EFFECTIVE_RECORD_BYTES
+        || typeof effective.recordJson !== "string"
+        || Buffer.byteLength(effective.recordJson) > MAX_EFFECTIVE_RECORD_BYTES) {
+      fail("SMOKE_POSTGRES_EFFECTIVE_RECORD_MISMATCH");
+    }
+    let sourceRecord;
+    let projectedRecord;
+    try {
+      sourceRecord = JSON.parse(effective.sourceRecordJson);
+      projectedRecord = JSON.parse(effective.recordJson);
+    } catch {
+      fail("SMOKE_POSTGRES_EFFECTIVE_RECORD_MISMATCH");
+    }
+    const expectedProjection = { ...expectedRecord, schemaVersion: "usage-event-v1.1" };
+    delete expectedProjection.boundaryFlags;
+    delete expectedProjection.tieOrder;
+    delete expectedProjection.cacheWriteTtl;
+    if (canonicalTelemetryV12Json(sourceRecord) !== canonicalTelemetryV12Json(expectedRecord)
+        || canonicalTelemetryV12Json(projectedRecord) !== canonicalTelemetryV12Json(expectedProjection)) {
+      fail("SMOKE_POSTGRES_EFFECTIVE_RECORD_MISMATCH");
+    }
+    return Object.freeze({ postgres: true, gcs: true, effectiveRecord: true });
   } catch (error) {
     safeReadbackFailure(error);
   }
@@ -976,6 +1189,23 @@ async function createNativeDependencies(config) {
         fail("SMOKE_ID_TOKEN_UNAVAILABLE");
       }
     };
+    let effectiveReaderPromise;
+    const readEffectivePage = async (options) => {
+      try {
+        effectiveReaderPromise ??= import("../src/postgres-typed-v12-effective-reader.ts")
+          .then((module) => module.readPostgresTelemetryV12EffectivePage);
+        const readPage = await effectiveReaderPromise;
+        if (typeof readPage !== "function") fail("SMOKE_POSTGRES_EFFECTIVE_READBACK_UNAVAILABLE");
+        return await readPage(primaryPool, options, {
+          schema: {
+            primarySchema: config.primarySchema,
+            ledgerSchema: config.ledgerSchema,
+          },
+        });
+      } catch {
+        fail("SMOKE_POSTGRES_EFFECTIVE_READBACK_UNAVAILABLE");
+      }
+    };
     const fetchImpl = globalThis.fetch.bind(globalThis);
     return {
       dependencies: {
@@ -1002,6 +1232,7 @@ async function createNativeDependencies(config) {
             accessToken,
             fetchImpl,
           }),
+          readEffectivePage,
           ...input,
         }),
         randomUUID,
