@@ -141,7 +141,9 @@ repeated broad-suite runs. No production data, DNS or route changes are part
 of this source integration. Synthetic GCS transfer-rehearsal objects in the
 private test bucket were removed. Later hosted v1.2 smokes retained tagged
 synthetic database and object fixtures for exact owner-erasure validation;
-the bucket is no longer empty.
+that earlier bucket retained those fixtures. The isolated A2 bucket in the
+latest checkpoint above was created empty and returned to empty after its
+exact-owner cleanup.
 
 The normalized v1.2 PostgreSQL extension uses the existing primary database,
 schema and forward migration history. Migrations 0025 through 0030 follow the
