@@ -111,7 +111,7 @@ function fakeMigrations() {
   }));
 }
 
-function migrationPool(rows) {
+function migrationPool(rows, schema = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["10k"].schema) {
   const statements = [];
   let releases = 0;
   return {
@@ -121,7 +121,7 @@ function migrationPool(rows) {
       return {
         async query(sql) {
           statements.push(sql);
-          if (sql.includes("FROM \"tibotattle_graph_benchmark_10k_20260925\".\"_tibotattle_migration_history\"")) {
+          if (sql.includes(`FROM ${JSON.stringify(schema)}.${JSON.stringify("_tibotattle_migration_history")}`)) {
             return { rows, rowCount: rows.length };
           }
           return { rows: [], rowCount: 0 };
@@ -163,7 +163,7 @@ function validPreflightRow() {
   return row;
 }
 
-test("both synthetic profiles keep the exact matched local workload and source digests", () => {
+test("the isolated insights profile keeps the exact matched 100k digests with a distinct schema", () => {
   assert.deepEqual(computePostgresCommunityGraphBenchmarkDigests("10k"), {
     workloadDigest: POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["10k"].workloadDigest,
     sourceDigest: "dcab757ec3e6be58ca2a881586f9a73642ddb6e66e161445587369f288500056",
@@ -172,6 +172,25 @@ test("both synthetic profiles keep the exact matched local workload and source d
     workloadDigest: POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k"].workloadDigest,
     sourceDigest: POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k"].sourceDigest,
   });
+  const matched100k = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k"];
+  const insights100k = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-insights"];
+  assert.deepEqual(computePostgresCommunityGraphBenchmarkDigests("100k-insights"), {
+    workloadDigest: matched100k.workloadDigest,
+    sourceDigest: matched100k.sourceDigest,
+  });
+  assert.deepEqual({
+    members: insights100k.members,
+    workloadDigest: insights100k.workloadDigest,
+    sourceDigest: insights100k.sourceDigest,
+    outputDigest: insights100k.outputDigest,
+  }, {
+    members: matched100k.members,
+    workloadDigest: matched100k.workloadDigest,
+    sourceDigest: matched100k.sourceDigest,
+    outputDigest: matched100k.outputDigest,
+  });
+  assert.notEqual(insights100k.schema, matched100k.schema);
+  assert.equal(insights100k.schema, "tibotattle_graph_benchmark_100k_insights_20260925");
   assert.equal(POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["10k"].members, 10_000);
   assert.equal(POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k"].members, 100_000);
 });
@@ -183,6 +202,16 @@ test("configuration pins one single-attempt primary test Job, schema and runtime
   assert.equal(config.profile, "10k");
   assert.equal(config.schema, "tibotattle_graph_benchmark_10k_20260925");
   assert.equal(config.iamUser, POSTGRES_COMMUNITY_GRAPH_BENCHMARK_IAM_USER);
+  const insightsConfig = parsePostgresCommunityGraphBenchmarkConfig(
+    validEnv("100k-insights"), POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SERVICE_ACCOUNT,
+  );
+  assert.equal(insightsConfig.profile, "100k-insights");
+  assert.equal(insightsConfig.members, 100_000);
+  assert.equal(insightsConfig.schema, "tibotattle_graph_benchmark_100k_insights_20260925");
+  assert.throws(() => parsePostgresCommunityGraphBenchmarkConfig(
+    validEnv("100k-insights", { PRIMARY_SCHEMA: "tibotattle_graph_benchmark_100k_20260925" }),
+    POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SERVICE_ACCOUNT,
+  ), (error) => error?.code === "POSTGRES_COMMUNITY_GRAPH_BENCHMARK_TARGET_INVALID");
   for (const overrides of [
     { CLOUD_RUN_JOB: "other-job" },
     { GOOGLE_CLOUD_PROJECT: "other-project" },
@@ -273,6 +302,15 @@ test("migration receipt is compared row-for-row and fails closed on drift", asyn
   assert.match(receipt.sha256, /^[a-f0-9]{64}$/u);
   assert.equal(pool.releases, 1);
   assert.ok(pool.statements.some((sql) => sql.includes('ORDER BY version')));
+
+  const insightsSchema = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-insights"].schema;
+  const insightsPool = migrationPool(rows, insightsSchema);
+  const insightsReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
+    insightsPool, insightsSchema, migrations,
+  );
+  assert.equal(insightsReceipt.count, 37);
+  assert.equal(insightsReceipt.tail, "0037_community_daily_publications.sql");
+  assert.match(insightsReceipt.sha256, /^[a-f0-9]{64}$/u);
 
   const drifted = migrationPool(rows.map((row, index) => index === 4
     ? { ...row, checksum_sha256: "f".repeat(64) } : row));
