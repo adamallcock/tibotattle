@@ -43,7 +43,7 @@ are recorded below.
 
 ## Why the proposal could help
 
-The current `priceDailySpend()` reissues the owner, active-chunk, winning-device
+Before the cursor patch, `priceDailySpend()` reissued the owner, active-chunk, winning-device
 and record CTE for every 1,000-row page. Spend pricing is permitted for up to
 200,000 usage events, so a large day can issue 200 such source-selection
 statements. A CTE shares work within a statement, not across those successive
