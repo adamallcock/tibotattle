@@ -206,7 +206,15 @@ function migrationSummary(migrations) {
   return Object.freeze(expected);
 }
 
-async function verifyPostgresAndMigrations(client, migrations, schema) {
+async function verifyPostgresAndMigrations(client, migrations, schemaName) {
+  const schema = quotedSchema(schemaName);
+  const migrationLock = await queryOne(client,
+    "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS acquired",
+    [`tibotattle:primary:${schemaName}`],
+    "POSTGRES_COMMUNITY_DAILY_ACTIVATION_MIGRATION_LOCK_READ_FAILED");
+  if (migrationLock?.acquired !== true) {
+    fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_MIGRATION_BUSY");
+  }
   let version;
   try {
     version = await client.query("SELECT current_setting('server_version_num')::integer AS server_version_num");
@@ -222,7 +230,7 @@ async function verifyPostgresAndMigrations(client, migrations, schema) {
     receipt = await client.query(
       `SELECT version,name,checksum_sha256
          FROM ${schema}._tibotattle_migration_history
-        ORDER BY version FOR SHARE`,
+        ORDER BY version`,
     );
   } catch {
     fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_MIGRATION_RECEIPT_READ_FAILED");
@@ -527,7 +535,7 @@ async function prepareTransaction(client, config, migrations) {
     await client.query("SET LOCAL statement_timeout='30000ms'");
     await client.query("SET LOCAL lock_timeout='5000ms'");
     await client.query(`SET LOCAL search_path TO ${schema}, pg_catalog`);
-    await verifyPostgresAndMigrations(client, migrations, schema);
+    await verifyPostgresAndMigrations(client, migrations, config.schema);
     await assertControlState(client, schema, BASELINE_CONTROLS,
       "POSTGRES_COMMUNITY_DAILY_ACTIVATION_CONTROLS_BASELINE_MISMATCH", true);
     await assertFixturePreconditions(client, schema, config);
@@ -561,7 +569,7 @@ async function restoreTransaction(client, config, migrations) {
     await client.query("SET LOCAL statement_timeout='30000ms'");
     await client.query("SET LOCAL lock_timeout='5000ms'");
     await client.query(`SET LOCAL search_path TO ${schema}, pg_catalog`);
-    await verifyPostgresAndMigrations(client, migrations, schema);
+    await verifyPostgresAndMigrations(client, migrations, config.schema);
     const current = await queryOne(client, controlsSelect(schema, true), [],
       "POSTGRES_COMMUNITY_DAILY_ACTIVATION_RESTORE_STATE_READ_FAILED");
     let status;

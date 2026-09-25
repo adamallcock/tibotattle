@@ -1876,7 +1876,7 @@ test("private PostgreSQL 17 participant-device routes preserve revocation effect
   }
 });
 
-test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never reaches D1", {
+test("loopback device sync dispatch uses real PostgreSQL authority and never reaches D1", {
   skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
   timeout: 180_000,
 }, async () => {
@@ -1969,6 +1969,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
         vite.ssrLoadModule("/src/postgres-device-credential-renewal.ts"),
         vite.ssrLoadModule("/src/postgres-device-disconnect.ts"),
       ]);
+    const deviceSyncReads = await vite.ssrLoadModule("/src/postgres-device-sync-reads.ts");
     const v12ManifestCandidates = await vite.ssrLoadModule("/src/postgres-v12-manifest-candidates.ts");
     const [uploadAuthorization, formatAuthority] = await Promise.all([
       vite.ssrLoadModule("/src/postgres-upload-authorization.ts"),
@@ -2204,7 +2205,8 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       disconnectPostgresAuthenticatedDevice:
         postgresDeviceDisconnectAdapter.disconnectPostgresAuthenticatedDevice,
       hasPostgresDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
-      readPostgresDeviceSyncState: deviceSync.readPostgresDeviceSyncState,
+      readPostgresDeviceSyncState: deviceSyncReads.readPostgresDeviceSyncState,
+      readPostgresDeviceSyncManifest: deviceSyncReads.readPostgresDeviceSyncManifest,
       readPostgresDeviceSyncCapabilities: deviceSync.readPostgresDeviceSyncCapabilities,
       readPostgresDeviceSyncV12Capabilities: deviceSync.readPostgresDeviceSyncV12Capabilities,
       readPostgresV12DayCandidates: v12ManifestCandidates.readPostgresV12DayCandidates,
@@ -2282,6 +2284,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     assert.equal((await health.json()).workerApplicationReady, false);
 
     const syncStateUrl = "http://127.0.0.1:43817/api/v1/device/sync/state";
+    const syncManifestUrl = "http://127.0.0.1:43817/api/v1/device/sync/manifest";
     const syncCapabilitiesUrl = "http://127.0.0.1:43817/api/v1/device/sync-capabilities";
     const syncCapabilitiesV12Url = "http://127.0.0.1:43817/api/v1/device/sync-capabilities-v1.2";
     const envelopeKeyUrl = "http://127.0.0.1:43817/api/v1/envelope-key";
@@ -2310,6 +2313,40 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       },
     });
     assert.match(retryAt, /^\d{4}-\d{2}-\d{2}T00:00:00\.000Z$/u);
+    const syncManifestRequestCount = deviceSyncRateLimitCalls;
+    const emptySyncManifestResponse = await dispatch(request({
+      url: `${syncManifestUrl}?fromDay=2026-08-01&toDay=2026-08-02&ignored=1`, method: "GET",
+    }));
+    assert.equal(emptySyncManifestResponse.status, 200);
+    assert.deepEqual(await emptySyncManifestResponse.json(), {
+      schemaVersion: "device-sync-manifest-v1.0",
+      contractVersion: "telemetry-contribution-v1.0",
+      fromDay: "2026-08-01",
+      toDay: "2026-08-02",
+      days: [],
+    });
+    assert.equal(deviceSyncRateLimitCalls, syncManifestRequestCount + 1,
+      "legacy manifest reads must consume the authenticated device-sync limiter");
+    const normalizedDayManifestResponse = await dispatch(request({
+      url: `${syncManifestUrl}?fromDay=2026-02-30&toDay=2026-03-03`, method: "GET",
+    }));
+    assert.equal(normalizedDayManifestResponse.status, 200);
+    assert.deepEqual(await normalizedDayManifestResponse.json(), {
+      schemaVersion: "device-sync-manifest-v1.0",
+      contractVersion: "telemetry-contribution-v1.0",
+      fromDay: "2026-02-30",
+      toDay: "2026-03-03",
+      days: [],
+    }, "the private PG route preserves D1's Date.parse-normalized day boundary");
+    await assertApiError(await dispatch(request({
+      url: syncManifestUrl, method: "GET",
+    })), 400, "BODY_INVALID");
+    await assertApiError(await dispatch(request({
+      url: `${syncManifestUrl}?fromDay=2026-01-01&toDay=2026-02-01`, method: "GET",
+    })), 400, "SYNC_RANGE_TOO_LARGE");
+    await assertApiError(await dispatch(request({
+      url: `${syncManifestUrl}?fromDay=2026-02-32&toDay=2026-03-01`, method: "GET",
+    })), 400, "BODY_INVALID");
     const capabilitiesResponse = await dispatch(request({ url: syncCapabilitiesV12Url, method: "GET" }));
     assert.equal(capabilitiesResponse.status, 200);
     const capabilities = await capabilitiesResponse.json();
@@ -2561,6 +2598,9 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     const wrongMethodResponse = await dispatch(request({ url: syncStateUrl }));
     await assertApiError(wrongMethodResponse, 405, "METHOD_NOT_ALLOWED");
     assert.equal(wrongMethodResponse.headers.get("allow"), "GET");
+    const wrongSyncManifestMethodResponse = await dispatch(request({ url: syncManifestUrl }));
+    await assertApiError(wrongSyncManifestMethodResponse, 405, "METHOD_NOT_ALLOWED");
+    assert.equal(wrongSyncManifestMethodResponse.headers.get("allow"), "GET");
     const wrongPredecessorMethod = await dispatch(request({
       url: domainPredecessorUrl, method: "GET",
     }));
@@ -2568,6 +2608,9 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     assert.equal(wrongPredecessorMethod.headers.get("allow"), "POST");
     await assertApiError(await dispatch(request({
       url: syncStateUrl, method: "GET", headers: { cookie: "session=not-used" },
+    })), 401, "DEVICE_AUTH_INVALID");
+    await assertApiError(await dispatch(request({
+      url: syncManifestUrl, method: "GET", headers: { cookie: "session=not-used" },
     })), 401, "DEVICE_AUTH_INVALID");
     await assertApiError(await dispatch(request({
       url: manifestUrl, method: "GET", headers: { cookie: "session=not-used" },

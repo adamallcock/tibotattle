@@ -79,9 +79,24 @@ test("manifest range accepts 31 inclusive days and rejects invalid or wider rang
   });
   assert.equal(pool.connects, 1);
   assert.equal(queries.find((query) => query.text.includes("telemetry_v1_chunks"))?.values?.[4], 10_001);
+  const normalizedQueries = [];
+  const normalizedPool = mockPoolFor([], normalizedQueries);
+  const normalizedFrom = await syncReads.readPostgresDeviceSyncManifest(
+    normalizedPool, "synthetic-owner", "synthetic-device", "2026-02-30", "2026-03-03", { schema },
+  );
+  assert.equal(normalizedFrom.fromDay, "2026-02-30");
+  assert.deepEqual(normalizedQueries.find((query) => query.text.includes("telemetry_v1_chunks"))?.values?.slice(2, 4), [
+    "2026-03-01", "2026-03-03",
+  ], "the lower SQL boundary matches D1's raw text comparison for Date.parse-normalized days");
+  await syncReads.readPostgresDeviceSyncManifest(
+    normalizedPool, "synthetic-owner", "synthetic-device", "2026-02-01", "2026-02-30", { schema },
+  );
+  assert.deepEqual(normalizedQueries.filter((query) => query.text.includes("telemetry_v1_chunks"))[1]?.values?.slice(2, 4), [
+    "2026-02-01", "2026-02-28",
+  ], "the upper SQL boundary matches D1's raw text comparison for Date.parse-normalized days");
   for (const [fromDay, toDay, code] of [
     ["2026-01-01", "2026-02-01", "SYNC_RANGE_TOO_LARGE"],
-    ["2026-02-30", "2026-03-01", "BODY_INVALID"],
+    ["2026-02-32", "2026-03-01", "BODY_INVALID"],
     ["2026-02-02", "2026-02-01", "BODY_INVALID"],
   ]) {
     await assert.rejects(
@@ -92,6 +107,7 @@ test("manifest range accepts 31 inclusive days and rejects invalid or wider rang
     );
   }
   assert.equal(pool.connects, 1, "invalid ranges do not consume a PostgreSQL connection");
+  assert.equal(normalizedPool.connects, 2);
 });
 
 test("state and manifest fail closed when their bounded chunk result exceeds the D1 caps", async () => {

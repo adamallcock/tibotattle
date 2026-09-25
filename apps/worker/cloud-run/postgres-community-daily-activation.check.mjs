@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { lstat, realpath, stat } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import pg from "pg";
 import { applyPostgresMigrations, readPostgresMigrations } from "../scripts/postgres-migrations.mjs";
@@ -83,6 +85,7 @@ function migrationFixtures() {
 function harness({
   controls = BASELINE,
   conflict = false,
+  migrationLock = true,
   selectedDay = { v1_selected_records_present: false, v11_selected_records_present: false },
   policy = { publication_state: "ready", policy_revision: 1 },
 } = {}) {
@@ -92,6 +95,7 @@ function harness({
     prepared: false,
     selectedDay,
     conflict,
+    migrationLock,
     policy,
     recordJson: undefined,
   };
@@ -103,6 +107,9 @@ function harness({
       if (sql.startsWith("BEGIN TRANSACTION")) return { rows: [], rowCount: 0 };
       if (sql === "COMMIT" || sql === "ROLLBACK" || sql.startsWith("SET LOCAL")) {
         return { rows: [], rowCount: 0 };
+      }
+      if (sql.includes("pg_try_advisory_xact_lock")) {
+        return { rows: [{ acquired: state.migrationLock }], rowCount: 1 };
       }
       if (sql.includes("current_setting('server_version_num')")) {
         return { rows: [{ server_version_num: 170006 }], rowCount: 1 };
@@ -276,6 +283,13 @@ test("prepare inserts the reviewed content-free fixture and opens only revision 
   assert.equal(h.events.filter(({ sql }) => sql === "ROLLBACK").length, 0);
   assert.equal(h.events.filter(({ sql }) => sql.startsWith("INSERT INTO ")).length, 13);
   assert.equal(h.events.some(({ sql }) => /storage\.googleapis|gcs|r2\.put/iu.test(sql)), false);
+  const migrationLock = h.events.find(({ sql }) => sql.includes("pg_try_advisory_xact_lock"));
+  assert.deepEqual(migrationLock?.params, [
+    `tibotattle:primary:${POSTGRES_COMMUNITY_DAILY_ACTIVATION_TARGET.schema}`,
+  ]);
+  const migrationReceipt = h.events.find(({ sql }) => sql.includes("_tibotattle_migration_history"));
+  assert.doesNotMatch(migrationReceipt?.sql ?? "", /FOR SHARE/u);
+  assert.ok(h.events.indexOf(migrationLock) < h.events.indexOf(migrationReceipt));
   assert.ok(h.events.some(({ sql }) => sql.startsWith("WITH public_owners AS (") && sql.includes("$1")));
   assert.ok(h.events.some(({ sql }) => sql.includes("SET revision=16")
     && sql.includes("enrollment_enabled=false") && sql.includes("publication_enabled=true")));
@@ -290,6 +304,17 @@ test("prepare fails closed before fixture inserts when an A2 source-state precon
   assert.deepEqual(h.state.controls, BASELINE);
   assert.equal(h.events.filter(({ sql }) => sql === "ROLLBACK").length, 1);
   assert.equal(h.events.some(({ sql }) => sql === "COMMIT"), false);
+});
+
+test("prepare refuses without writes while the canonical migrator lock is held", async () => {
+  const h = harness({ migrationLock: false });
+  await assert.rejects(preparePostgresCommunityDailyTestActivation({
+    env: validEnv("prepare"), dependencies: h.dependencies,
+  }), /MIGRATION_BUSY/u);
+  assert.equal(h.state.insertCount, 0);
+  assert.deepEqual(h.state.controls, BASELINE);
+  assert.equal(h.events.filter(({ sql }) => sql === "ROLLBACK").length, 1);
+  assert.equal(h.events.some(({ sql }) => sql.includes("_tibotattle_migration_history")), false);
 });
 
 test("prepare fails closed if the selected day contains v1 or v1.1 eligible records", async () => {
@@ -346,12 +371,26 @@ test("restore refuses any revision or field state outside the exact temporary ga
   assert.equal(h.events.filter(({ sql }) => sql === "ROLLBACK").length, 1);
 });
 
-async function createDisposableSchema(pool) {
+async function createDisposableSchema(pool, migrationRoot) {
   const schema = `a2_daily_activation_${randomBytes(6).toString("hex")}`;
+  const runtimeRole = `${schema}_runtime`;
   const quoted = `"${schema}"`;
+  const quotedRuntimeRole = `"${runtimeRole}"`;
   await pool.query(`CREATE SCHEMA ${quoted}`);
+  let roleCreated = false;
   try {
-    await applyPostgresMigrations({ role: "primary", schema, pool });
+    await applyPostgresMigrations({ role: "primary", schema, pool, rootDirectory: migrationRoot });
+    await pool.query(`CREATE ROLE ${quotedRuntimeRole} NOLOGIN`);
+    roleCreated = true;
+    await pool.query(`GRANT USAGE ON SCHEMA ${quoted} TO ${quotedRuntimeRole}`);
+    await pool.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ${quoted}
+      TO ${quotedRuntimeRole}`);
+    await pool.query(`GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA ${quoted}
+      TO ${quotedRuntimeRole}`);
+    await pool.query(`REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
+      ON ${quoted}._tibotattle_migration_history FROM ${quotedRuntimeRole}`);
+    await pool.query(`GRANT EXECUTE ON FUNCTION ${quoted}.insert_telemetry_v1_contribution(jsonb)
+      TO ${quotedRuntimeRole}`);
     await pool.query(`UPDATE ${quoted}.collection_controls
       SET revision=15,control_state='degraded',enrollment_enabled=false,
           upload_registration_enabled=true,processing_enabled=true,
@@ -359,9 +398,42 @@ async function createDisposableSchema(pool) {
           updated_at=clock_timestamp() WHERE singleton=1`);
     await pool.query(`UPDATE ${quoted}.publication_state
       SET publication_state='ready',policy_revision=1 WHERE singleton=1`);
-    return { schema, quoted };
+    const privileges = await pool.query(`SELECT
+      has_table_privilege($1,$2::regclass,'SELECT') AS migration_select,
+      has_table_privilege($1,$2::regclass,'UPDATE') AS migration_update,
+      has_table_privilege($1,$3::regclass,'UPDATE') AS controls_update`, [
+      runtimeRole,
+      `${schema}._tibotattle_migration_history`,
+      `${schema}.collection_controls`,
+    ]);
+    assert.deepEqual(privileges.rows[0], {
+      migration_select: true,
+      migration_update: false,
+      controls_update: true,
+    });
+    return { schema, quoted, runtimeRole, quotedRuntimeRole };
   } catch (error) {
     await pool.query(`DROP SCHEMA ${quoted} CASCADE`);
+    if (roleCreated) await pool.query(`DROP ROLE ${quotedRuntimeRole}`);
+    throw error;
+  }
+}
+
+async function createPinnedMigrationRoot() {
+  const current = await readPostgresMigrations({ role: "primary" });
+  const pinned = current.filter(migration => migration.version <= 39);
+  assert.equal(pinned.length, 39, "the A2 integration targets the deployed 39-migration manifest");
+  assert.equal(pinned.at(-1)?.name, "0039_analytics_applied_projection_v1.sql");
+  const root = await mkdtemp(join(tmpdir(), `a2-daily-activation-${randomBytes(6).toString("hex")}-`));
+  try {
+    const directory = join(root, "primary");
+    await mkdir(directory, { mode: 0o700 });
+    for (const migration of pinned) {
+      await writeFile(join(directory, migration.name), migration.sql, { flag: "wx", mode: 0o600 });
+    }
+    return { root, migrations: await readPostgresMigrations({ role: "primary", rootDirectory: root }) };
+  } catch (error) {
+    await rm(root, { recursive: true, force: true });
     throw error;
   }
 }
@@ -376,9 +448,15 @@ function disposableConfig(schema) {
   };
 }
 
-async function runInClient(pool, fn) {
+async function runInClient(pool, fn, runtimeRole) {
   const client = await pool.connect();
-  try { return await fn(client); } finally { client.release(); }
+  try {
+    if (runtimeRole !== undefined) await client.query(`SET ROLE "${runtimeRole}"`);
+    return await fn(client);
+  } finally {
+    if (runtimeRole !== undefined) await client.query("RESET ROLE");
+    client.release();
+  }
 }
 
 test("real disposable PostgreSQL 17 runs prepare, restore, conflict rollback, and repeat restore", {
@@ -396,6 +474,7 @@ test("real disposable PostgreSQL 17 runs prepare, restore, conflict rollback, an
     application_name: "tibotattle-daily-activation-local-integration",
   });
   const created = [];
+  let migrationRoot;
   try {
     const runtime = await pool.query(`SELECT current_database() AS database,
         inet_server_addr()::text AS server_address,
@@ -403,13 +482,33 @@ test("real disposable PostgreSQL 17 runs prepare, restore, conflict rollback, an
     assert.equal(runtime.rows[0]?.database, "postgres");
     assert.ok(runtime.rows[0]?.server_address, "integration requires local loopback TCP, not a Unix socket");
     assert.equal(Math.floor(Number(runtime.rows[0]?.server_version_num) / 10_000), 17);
-    const migrations = await readPostgresMigrations({ role: "primary" });
+    const pinned = await createPinnedMigrationRoot();
+    migrationRoot = pinned.root;
+    const migrations = pinned.migrations;
 
-    const preparedSchema = await createDisposableSchema(pool);
+    const preparedSchema = await createDisposableSchema(pool, migrationRoot);
     created.push(preparedSchema);
     const config = disposableConfig(preparedSchema.schema);
+    const migrationLockClient = await pool.connect();
+    const migrationLockKey = `tibotattle:primary:${preparedSchema.schema}`;
+    try {
+      await migrationLockClient.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [migrationLockKey]);
+      await assert.rejects(runInClient(pool, client =>
+        preparePostgresCommunityDailyActivationInDisposableSchema({ client, config, migrations }),
+      preparedSchema.runtimeRole), error =>
+        error?.code === "POSTGRES_COMMUNITY_DAILY_ACTIVATION_MIGRATION_BUSY");
+    } finally {
+      await migrationLockClient.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [migrationLockKey]);
+      migrationLockClient.release();
+    }
+    const blockedReadback = await pool.query(`SELECT
+      (SELECT revision::integer FROM ${preparedSchema.quoted}.collection_controls WHERE singleton=1) AS revision,
+      (SELECT count(*) FROM ${preparedSchema.quoted}.participants WHERE id='synthetic-social-owner') AS owner_count,
+      (SELECT count(*) FROM ${preparedSchema.quoted}.typed_telemetry_namespaces WHERE id=1) AS namespace_count`);
+    assert.deepEqual(blockedReadback.rows[0], { revision: 15, owner_count: "0", namespace_count: "0" });
     const prep = await runInClient(pool, client =>
-      preparePostgresCommunityDailyActivationInDisposableSchema({ client, config, migrations }));
+      preparePostgresCommunityDailyActivationInDisposableSchema({ client, config, migrations }),
+    preparedSchema.runtimeRole);
     assert.equal(prep.status, "prepared");
     assert.equal(prep.collectionControlsRevision, 16);
     assert.deepEqual(await readPostgresCommunityDailyDaySourceEligibility(pool, {
@@ -430,11 +529,13 @@ test("real disposable PostgreSQL 17 runs prepare, restore, conflict rollback, an
       record_count: "1", publication_count: "0",
     });
     const restored = await runInClient(pool, client =>
-      restorePostgresCommunityDailyActivationInDisposableSchema({ client, config, migrations }));
+      restorePostgresCommunityDailyActivationInDisposableSchema({ client, config, migrations }),
+    preparedSchema.runtimeRole);
     assert.equal(restored.status, "restored");
     assert.equal(restored.collectionControlsRevision, 17);
     const repeated = await runInClient(pool, client =>
-      restorePostgresCommunityDailyActivationInDisposableSchema({ client, config, migrations }));
+      restorePostgresCommunityDailyActivationInDisposableSchema({ client, config, migrations }),
+    preparedSchema.runtimeRole);
     assert.equal(repeated.status, "already_restored");
     const restoredState = await pool.query(`SELECT singleton,revision::integer AS revision,
         control_state,enrollment_enabled,
@@ -446,7 +547,7 @@ test("real disposable PostgreSQL 17 runs prepare, restore, conflict rollback, an
       WHERE occurrence_id=$1 AND observed_day=$2::date`, [OCCURRENCE_ID, config.day]);
     assert.equal(retained.rows[0]?.row_count, "1");
 
-    const conflictSchema = await createDisposableSchema(pool);
+    const conflictSchema = await createDisposableSchema(pool, migrationRoot);
     created.push(conflictSchema);
     const conflictConfig = disposableConfig(conflictSchema.schema);
     await pool.query(`INSERT INTO ${conflictSchema.quoted}.analytics_source_cursors(
@@ -454,7 +555,7 @@ test("real disposable PostgreSQL 17 runs prepare, restore, conflict rollback, an
     await assert.rejects(runInClient(pool, client =>
       preparePostgresCommunityDailyActivationInDisposableSchema({
         client, config: conflictConfig, migrations,
-      })), error => error?.code === "POSTGRES_COMMUNITY_DAILY_ACTIVATION_FIXTURE_CONFLICT");
+      }), conflictSchema.runtimeRole), error => error?.code === "POSTGRES_COMMUNITY_DAILY_ACTIVATION_FIXTURE_CONFLICT");
     const conflictReadback = await pool.query(`SELECT
       (SELECT revision FROM ${conflictSchema.quoted}.collection_controls WHERE singleton=1) AS revision,
       (SELECT count(*) FROM ${conflictSchema.quoted}.participants WHERE id='synthetic-social-owner') AS owner_count,
@@ -466,7 +567,9 @@ test("real disposable PostgreSQL 17 runs prepare, restore, conflict rollback, an
   } finally {
     for (const target of created.reverse()) {
       await pool.query(`DROP SCHEMA IF EXISTS ${target.quoted} CASCADE`);
+      await pool.query(`DROP ROLE IF EXISTS ${target.quotedRuntimeRole}`);
     }
+    if (migrationRoot !== undefined) await rm(migrationRoot, { recursive: true, force: true });
     await pool.end();
   }
 });

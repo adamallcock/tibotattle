@@ -57,10 +57,13 @@ import {
   renewPostgresDeviceCredential,
 } from "../src/postgres-device-credential-renewal.ts";
 import {
-  readPostgresDeviceSyncState,
   readPostgresDeviceSyncCapabilities,
   readPostgresDeviceSyncV12Capabilities,
 } from "../src/postgres-device-sync.ts";
+import {
+  readPostgresDeviceSyncState,
+  readPostgresDeviceSyncManifest,
+} from "../src/postgres-device-sync-reads.ts";
 import { disconnectPostgresAuthenticatedDevice } from "../src/postgres-device-disconnect.ts";
 import { readPostgresV12DayCandidates } from "../src/postgres-v12-manifest-candidates.ts";
 import {
@@ -582,6 +585,7 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           disconnectPostgresAuthenticatedDevice,
           hasPostgresDeletionTombstone,
           readPostgresDeviceSyncState,
+          readPostgresDeviceSyncManifest,
           readPostgresDeviceSyncCapabilities,
           readPostgresDeviceSyncV12Capabilities,
           readPostgresV12DayCandidates,

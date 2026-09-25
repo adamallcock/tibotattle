@@ -46,10 +46,7 @@ function safeError(error: unknown): Error | null {
 function dateEpoch(value: string): number {
   if (!ISO_DAY.test(value)) throw new ApiError(400, "BODY_INVALID");
   const epoch = Date.parse(`${value}T00:00:00.000Z`);
-  if (!Number.isFinite(epoch)
-      || new Date(epoch).toISOString().slice(0, 10) !== value) {
-    throw new ApiError(400, "BODY_INVALID");
-  }
+  if (!Number.isFinite(epoch)) throw new ApiError(400, "BODY_INVALID");
   return epoch;
 }
 
@@ -60,6 +57,34 @@ function postgresDate(value: string): string {
   return value.startsWith("0000-")
     ? `0001-${value.slice(5)} BC`
     : value;
+}
+
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) {
+    const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    return leap ? 29 : 28;
+  }
+  return [4, 6, 9, 11].includes(month) ? 30 : 31;
+}
+
+function postgresLexicalDateBoundary(
+  value: string,
+  edge: "lower" | "upper",
+): string {
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(5, 7));
+  const day = Number(value.slice(8, 10));
+  const lastDay = daysInMonth(year, month);
+  if (day <= lastDay) return postgresDate(value);
+
+  if (edge === "upper") {
+    return postgresDate(`${value.slice(0, 8)}${String(lastDay).padStart(2, "0")}`);
+  }
+  const nextYear = month === 12 ? year + 1 : year;
+  const nextMonth = month === 12 ? 1 : month + 1;
+  return postgresDate(
+    `${String(nextYear).padStart(4, "0")}-${String(nextMonth).padStart(2, "0")}-01`,
+  );
 }
 
 function isoDayFromPostgres(value: string): string {
@@ -114,7 +139,9 @@ export async function readPostgresDeviceSyncManifest(
           AND chunk_day >= $3::date AND chunk_day <= $4::date
         ORDER BY chunk_day ASC, stream COLLATE "C" ASC, chunk_seq ASC
         LIMIT $5`,
-      [participantId, deviceId, postgresDate(fromDay), postgresDate(toDay),
+      [participantId, deviceId,
+        postgresLexicalDateBoundary(fromDay, "lower"),
+        postgresLexicalDateBoundary(toDay, "upper"),
         MAX_SYNC_MANIFEST_CHUNKS + 1],
     );
     if (result.rows.length > MAX_SYNC_MANIFEST_CHUNKS) {
