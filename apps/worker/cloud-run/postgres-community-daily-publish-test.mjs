@@ -20,6 +20,7 @@ import {
 import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
 
 export { POSTGRES_COMMUNITY_DAILY_TEST_JOB, POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE };
+export { publishPostgresCommunityDailyDay, readPostgresPublishedCommunityDaily };
 export const POSTGRES_COMMUNITY_DAILY_TEST_PROJECT = CLOUD_RUN_IAM_TEST_TARGET.project;
 export const POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT =
   "tibotattle-test-runtime@tibotattle.iam.gserviceaccount.com";
