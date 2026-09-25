@@ -21,6 +21,14 @@ source archive, not to a production Worker build.
 
 ### Latest test-project checkpoint: 2026-09-25
 
+The [A2 preflight-v2 receipt](../receipts/2026-09-25-gcp-a2-daily-preflight-v2.md)
+records a source-pinned private image deployed after primary migration 38/38,
+with independent ledger 6/6 and HTTP health current. The read-only daily
+preflight identified absent source state, cursor, v1/v1.1 admission, and
+selected-day records, plus disabled publication controls; the daily route
+remained fail-closed. A synthetic activation and publication proof are the
+next test-only gates.
+
 The subsequent [private daily and readpaged graph receipt](../receipts/2026-09-25-gcp-a2-daily-and-readpaged-graph.md)
 records ready private revision `tibotattle-test-app-00031-lg7`, current
 37/37 primary and 6/6 ledger migration health, and a guarded daily preflight
