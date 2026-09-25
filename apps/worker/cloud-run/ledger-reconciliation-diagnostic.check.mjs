@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 import {
   LEDGER_RECONCILIATION_DIAGNOSTIC_IAM_USER,
   LEDGER_RECONCILIATION_DIAGNOSTIC_JOB,
@@ -79,7 +80,7 @@ test("configuration is pinned to the one test ledger Job and migrator identity",
   );
   assert.equal(config.project, "tibotattle");
   assert.equal(config.database, "tibotattle_ledger");
-  assert.equal(config.schema, '"tibotattle_ledger"');
+  assert.equal(config.schema, "tibotattle_ledger");
   assert.equal(config.iamUser, LEDGER_RECONCILIATION_DIAGNOSTIC_IAM_USER);
 
   for (const overrides of [
@@ -205,7 +206,7 @@ test("runner uses one pinned IAM pool and returns counts without row content", a
       async createPool(options) { poolOptions.push(options); return pool; },
       async readPreflight(actualPool, schema) {
         assert.equal(actualPool, pool);
-        assert.equal(schema, '"tibotattle_ledger"');
+        assert.equal(schema, "tibotattle_ledger");
         return {
           ledgerMigrationVersion: 5,
           ledgerMigrationReceiptCount: 5,
@@ -244,4 +245,23 @@ test("runner uses one pinned IAM pool and returns counts without row content", a
   assert.doesNotMatch(JSON.stringify(result), /terminal_json|digest|source_id|execution|tibotattle-test/u);
   assert.equal(closeCalls.length, 1);
   assert.equal(closeCalls[0].pools[0], pool);
+});
+
+test("bundled diagnostic entrypoint does not invoke the migration job", () => {
+  const built = spawnSync(process.execPath, ["./build.mjs"], {
+    cwd: new URL(".", import.meta.url),
+    encoding: "utf8",
+  });
+  assert.equal(built.status, 0, built.stderr);
+  const invoked = spawnSync(process.execPath, ["./dist/ledger-reconciliation-diagnostic.mjs"], {
+    cwd: new URL(".", import.meta.url),
+    encoding: "utf8",
+    env: { ...process.env, CLOUD_RUN_JOB: "invalid-job" },
+  });
+  assert.equal(invoked.status, 1);
+  const lines = invoked.stderr.trim().split("\n");
+  assert.deepEqual(lines.map((line) => JSON.parse(line)), [{
+    status: "error",
+    code: "CLOUD_RUN_TEST_LEDGER_DIAGNOSTIC_JOB_CONTEXT_INVALID",
+  }]);
 });

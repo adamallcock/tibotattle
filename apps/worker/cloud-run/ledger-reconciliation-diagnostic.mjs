@@ -7,15 +7,21 @@ import {
   closeCloudSqlResources,
   createIamPool as createCloudSqlIamPool,
 } from "./cloud-sql.mjs";
-import { TEST_MIGRATIONS_IAM_USER, TEST_MIGRATIONS_TARGETS } from "./test-migrations.mjs";
 
 export const LEDGER_RECONCILIATION_DIAGNOSTIC_JOB =
   "tibotattle-test-ledger-reconciliation-diagnostic";
 export const LEDGER_RECONCILIATION_DIAGNOSTIC_PROJECT = "tibotattle";
 export const LEDGER_RECONCILIATION_DIAGNOSTIC_SERVICE_ACCOUNT =
   "tibotattle-test-migrator@tibotattle.iam.gserviceaccount.com";
-export const LEDGER_RECONCILIATION_DIAGNOSTIC_TARGET = TEST_MIGRATIONS_TARGETS.ledger;
-export const LEDGER_RECONCILIATION_DIAGNOSTIC_IAM_USER = TEST_MIGRATIONS_IAM_USER;
+// Keep the job's target self-contained: importing an executable entrypoint
+// would run that entrypoint's CLI guard when esbuild bundles this Job.
+export const LEDGER_RECONCILIATION_DIAGNOSTIC_TARGET = Object.freeze({
+  instanceConnectionName: "tibotattle:us-east1:tibotattle-test-ledger-20260922",
+  database: "tibotattle_ledger",
+  schema: "tibotattle_ledger",
+});
+export const LEDGER_RECONCILIATION_DIAGNOSTIC_IAM_USER =
+  "tibotattle-test-migrator@tibotattle.iam";
 
 const METADATA_EMAIL_URL =
   "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email";
@@ -92,7 +98,7 @@ function validateContext(env) {
     project: LEDGER_RECONCILIATION_DIAGNOSTIC_PROJECT,
     instanceConnectionName: target.instanceConnectionName,
     database: target.database,
-    schema: quoteSchema(target.schema),
+    schema: target.schema,
     iamUser: LEDGER_RECONCILIATION_DIAGNOSTIC_IAM_USER,
   });
 }
