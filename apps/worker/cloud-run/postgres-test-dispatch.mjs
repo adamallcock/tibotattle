@@ -13,7 +13,17 @@ const PARTICIPANT_DEVICES_PATH = "/api/v1/me/devices";
 const PARTICIPANT_DEVICE_REVOKE_PATH = "/api/v1/me/devices/revoke";
 const PERSONAL_SESSION_PATH = "/api/v1/session";
 const PERSONAL_LOGOUT_PATH = "/api/v1/logout";
+const PERSONAL_DEVICE_PAIRING_PATH = "/api/v1/me/device-pairings";
 const COMMUNITY_DAILY_MAX_RANGE_DAYS = 366;
+const TELEMETRY_CONSENT_VERSION = "privacy-safe-telemetry-v0.1";
+const ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION = "privacy-safe-telemetry-v0.2";
+const ONGOING_TELEMETRY_CONSENT_VERSION = "ongoing-privacy-safe-telemetry-v0.1";
+const ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION = "ongoing-privacy-safe-telemetry-v0.2";
+const ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION = "ongoing-privacy-safe-telemetry-v1.0";
+const PAIRING_BODY_READ_POLICY = Object.freeze({
+  maximumTotalMilliseconds: 15_000,
+  maximumIdleMilliseconds: 5_000,
+});
 export const CLOUD_RUN_IAM_TEST_TARGET = Object.freeze({
   project: "tibotattle",
   region: "us-east1",
@@ -681,6 +691,155 @@ export function createPostgresTestPersonalSessionDispatch({
         return routeError(error, requestId);
       }
       // Never expose PostgreSQL driver errors or database object details.
+      return routeError(storageUnavailable(), requestId);
+    }
+  };
+}
+
+/** Private Cloud Run test route for issuing a session-bound device pairing. */
+export function createPostgresTestDevicePairingDispatch({
+  primaryPool,
+  ledgerPool,
+  schemaOptions,
+  authenticatePostgresPersonalSession,
+  assertPostgresPersonalSessionCsrf,
+  assertAccountScopedLocalPreview,
+  createPostgresDevicePairing,
+  hasPostgresDeletionTombstone,
+  healthDispatch,
+  readBoundedRequestBody,
+  maxRequestBytes,
+  admissionEnv,
+  privateOrigin,
+}) {
+  if (primaryPool === null || typeof primaryPool !== "object"
+      || typeof primaryPool.connect !== "function"
+      || ledgerPool === null || typeof ledgerPool !== "object"
+      || typeof ledgerPool.connect !== "function"
+      || primaryPool === ledgerPool
+      || typeof authenticatePostgresPersonalSession !== "function"
+      || typeof assertPostgresPersonalSessionCsrf !== "function"
+      || typeof assertAccountScopedLocalPreview !== "function"
+      || typeof createPostgresDevicePairing !== "function"
+      || typeof hasPostgresDeletionTombstone !== "function"
+      || typeof healthDispatch !== "function"
+      || typeof readBoundedRequestBody !== "function"
+      || !Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1) {
+    configurationError("POSTGRES_TEST_DEVICE_PAIRING_DISPATCH_CONFIGURATION_INVALID");
+  }
+  const schemas = validatedSchemas(schemaOptions);
+  if (!isAllowedPostgresTestOrigin(privateOrigin)) {
+    configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
+  }
+
+  return async function dispatchPostgresTestDevicePairing(request) {
+    let url;
+    try { url = new URL(request.url); } catch {
+      return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
+    }
+    if (url.origin !== privateOrigin || url.pathname !== PERSONAL_DEVICE_PAIRING_PATH) {
+      return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
+    }
+    const requestId = crypto.randomUUID();
+    if (request.method !== "POST") {
+      return routeError(personalDevicesRequestError(405, "METHOD_NOT_ALLOWED", {
+        allow: "POST",
+      }), requestId);
+    }
+
+    try {
+      const health = await healthDispatch(new Request(`${privateOrigin}/api/health`));
+      if (health?.status !== 200) throw storageUnavailable();
+      await assertPostgresUploadRegistrationEnabled(primaryPool, schemas.primary);
+      if (request.headers.has("authorization")) {
+        throw personalDevicesRequestError(401, "AUTH_INVALID");
+      }
+      const principal = await authenticatePostgresPersonalSession(
+        primaryPool,
+        request.headers.get("cookie"),
+        { schema: { primarySchema: schemas.primary } },
+      );
+      if (principal === null || typeof principal !== "object"
+          || typeof principal.participantId !== "string" || principal.participantId.length === 0
+          || typeof principal.sessionId !== "string" || principal.sessionId.length === 0
+          || typeof principal.csrfToken !== "string" || principal.csrfToken.length === 0
+          || (principal.consentVersion !== null && typeof principal.consentVersion !== "string")) {
+        throw storageUnavailable();
+      }
+      if (await hasPostgresDeletionTombstone(
+        ledgerPool,
+        principal.participantId,
+        Date.now(),
+        { schema: { ledgerSchema: schemas.ledger } },
+      )) {
+        throw personalDevicesRequestError(401, "AUTH_INVALID");
+      }
+      assertPostgresPersonalSessionCsrf(request, principal.csrfToken);
+
+      const accountScoped = principal.consentVersion
+        === ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION;
+      if (accountScoped) {
+        assertAccountScopedLocalPreview(request, admissionEnv);
+      } else if (principal.consentVersion !== TELEMETRY_CONSENT_VERSION) {
+        throw personalDevicesRequestError(400, "TELEMETRY_REQUIRED");
+      }
+
+      const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+      if (contentType !== "application/json") {
+        throw personalDevicesRequestError(415, "CONTENT_TYPE_INVALID");
+      }
+      const declared = request.headers.get("content-length");
+      if (declared !== null) {
+        const length = Number(declared);
+        if (!Number.isSafeInteger(length) || length < 0) {
+          throw personalDevicesRequestError(400, "BODY_INVALID");
+        }
+        if (length > maxRequestBytes) {
+          throw personalDevicesRequestError(413, "BODY_TOO_LARGE");
+        }
+      }
+      const bytes = await readBoundedRequestBody(
+        request,
+        maxRequestBytes,
+        PAIRING_BODY_READ_POLICY,
+      );
+      let body;
+      try {
+        body = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
+      } catch {
+        throw personalDevicesRequestError(400, "BODY_INVALID");
+      }
+      if (body === null || typeof body !== "object" || Array.isArray(body)
+          || Object.keys(body).length !== 2
+          || typeof body.consentVersion !== "string"
+          || body.ongoingUpload !== true) {
+        throw personalDevicesRequestError(400, "BODY_INVALID");
+      }
+      const allowedConsentVersions = accountScoped
+        ? [ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION]
+        : [ONGOING_TELEMETRY_CONSENT_VERSION, ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION];
+      if (!allowedConsentVersions.includes(body.consentVersion)) {
+        throw personalDevicesRequestError(400, "BODY_INVALID");
+      }
+      const pairing = await createPostgresDevicePairing(
+        primaryPool,
+        principal.participantId,
+        principal.sessionId,
+        principal.consentVersion,
+        body.consentVersion,
+        { schema: { primarySchema: schemas.primary } },
+      );
+      if (pairing === null || typeof pairing !== "object"
+          || typeof pairing.pairingCode !== "string"
+          || typeof pairing.expiresAt !== "string") {
+        throw storageUnavailable();
+      }
+      return json(201, pairing, { vary: "Cookie" });
+    } catch (error) {
+      if (Number.isSafeInteger(error?.status)
+          && typeof error?.code === "string" && /^[A-Z0-9_]+$/u.test(error.code)) {
+        return routeError(error, requestId);
+      }
       return routeError(storageUnavailable(), requestId);
     }
   };

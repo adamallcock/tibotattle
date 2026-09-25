@@ -22,6 +22,8 @@ import {
   isPostgresWorkerRequestPathSupported,
 } from "../src/index.ts";
 import { runPostgresScheduledMaintenance } from "../src/postgres-maintenance.ts";
+import { assertAccountScopedLocalPreview } from "../src/account-scoped-ingest.ts";
+import { createPostgresDevicePairing } from "../src/postgres-device-pairing.ts";
 import {
   assertAdmissionBindings,
   assertAttemptAllowed,
@@ -106,6 +108,7 @@ import { installNodeTimingSafeEqual } from "./node-crypto-adapter.mjs";
 import {
   CLOUD_RUN_IAM_TEST_TARGET,
   createPostgresTestCommunityDailyDispatch,
+  createPostgresTestDevicePairingDispatch,
   createPostgresTestParticipantDevicesDispatch,
   createPostgresTestPersonalSessionDispatch,
   createPostgresTestV12DayManifestDispatch,
@@ -561,6 +564,21 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         clearSessionCookie: clearedSessionCookie(),
         privateOrigin: hostOrigin,
       });
+      const devicePairingDispatch = createPostgresTestDevicePairingDispatch({
+        primaryPool,
+        ledgerPool,
+        schemaOptions,
+        authenticatePostgresPersonalSession: authenticatePostgresPersonalSessionForRead,
+        assertPostgresPersonalSessionCsrf,
+        assertAccountScopedLocalPreview,
+        createPostgresDevicePairing,
+        hasPostgresDeletionTombstone,
+        healthDispatch,
+        readBoundedRequestBody,
+        maxRequestBytes: MAX_REQUEST_BYTES,
+        admissionEnv,
+        privateOrigin: hostOrigin,
+      });
       const googleHandoffDispatch = postgresTestMode === "cloud-run-iam"
         ? createPostgresGoogleHandoffDispatch({
           primaryPool,
@@ -607,6 +625,9 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           }
           if (pathname === "/api/v1/session" || pathname === "/api/v1/logout") {
             return personalSessionDispatch(request);
+          }
+          if (pathname === "/api/v1/me/device-pairings") {
+            return devicePairingDispatch(request);
           }
           if (googleEnrollmentDispatch && pathname === "/api/v1/enroll") {
             return googleEnrollmentDispatch(request);
