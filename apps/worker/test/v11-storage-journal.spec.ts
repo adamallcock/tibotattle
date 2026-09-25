@@ -70,7 +70,9 @@ async function accountlessFixture(): Promise<Awaited<ReturnType<typeof createV11
 describe('optional baseline v1.1 storage journal bridge', () => {
   it('refuses opt-out atomically before the retention schema is installed', async () => {
     await reset();
-    await applyD1Migrations(db(), bindings.TEST_MIGRATIONS.filter((item) => !item.name.startsWith('0061_')));
+    // Later source-transfer migrations depend on the retention table, so this
+    // pre-retention case must stop at the migration immediately before 0061.
+    await applyD1Migrations(db(), bindings.TEST_MIGRATIONS.filter((item) => item.name < '0061_'));
     await applyD1Migrations(db(), bindings.TEST_TYPED_INGESTION_MIGRATIONS.filter((item) => item.name.startsWith('0002_')));
     await applyD1Migrations(db(), bindings.TEST_INGESTION_BRIDGE_MIGRATIONS);
     await initializeStorageSource(db(), sourceId);
