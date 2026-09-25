@@ -18,6 +18,8 @@ const COMMUNITY_GRAPH_BENCHMARK_ENTRY = resolve(ROOT, "postgres-community-graph-
 const COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_ENTRY = resolve(ROOT, "postgres-community-graph-readback-diagnostic.mjs");
 const COMMUNITY_DAILY_TEST_ENTRY = resolve(ROOT, "postgres-community-daily-publish-test.mjs");
 const COMMUNITY_DAILY_LIVE_SMOKE_ENTRY = resolve(ROOT, "postgres-community-daily-live-smoke.mjs");
+const COMMUNITY_DAILY_PREPARE_ENTRY = resolve(ROOT, "postgres-community-daily-prepare-test.mjs");
+const COMMUNITY_DAILY_RESTORE_ENTRY = resolve(ROOT, "postgres-community-daily-restore-test.mjs");
 const OUTDIR = resolve(ROOT, "dist");
 const options = {
   entryPoints: {
@@ -33,6 +35,8 @@ const options = {
     "postgres-community-graph-readback-diagnostic": COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_ENTRY,
     "postgres-community-daily-publish-test": COMMUNITY_DAILY_TEST_ENTRY,
     "postgres-community-daily-live-smoke": COMMUNITY_DAILY_LIVE_SMOKE_ENTRY,
+    "postgres-community-daily-prepare-test": COMMUNITY_DAILY_PREPARE_ENTRY,
+    "postgres-community-daily-restore-test": COMMUNITY_DAILY_RESTORE_ENTRY,
   },
   bundle: true,
   platform: "node",
@@ -50,7 +54,7 @@ if (process.argv.includes("--check")) {
   console.log(JSON.stringify({
     status: "ok",
     mode: "check",
-    entries: ["server.mjs", "synthetic-v12-smoke.mjs", "test-migrations.mjs", "test-activation.mjs", "synthetic-v12-cleanup.mjs", "synthetic-v12-discovery.mjs", "ledger-reconciliation-diagnostic.mjs", "ledger-preflight-reconcile.mjs", "postgres-community-graph-benchmark.mjs", "postgres-community-graph-readback-diagnostic.mjs", "postgres-community-daily-publish-test.mjs", "postgres-community-daily-live-smoke.mjs"],
+    entries: ["server.mjs", "synthetic-v12-smoke.mjs", "test-migrations.mjs", "test-activation.mjs", "synthetic-v12-cleanup.mjs", "synthetic-v12-discovery.mjs", "ledger-reconciliation-diagnostic.mjs", "ledger-preflight-reconcile.mjs", "postgres-community-graph-benchmark.mjs", "postgres-community-graph-readback-diagnostic.mjs", "postgres-community-daily-publish-test.mjs", "postgres-community-daily-live-smoke.mjs", "postgres-community-daily-prepare-test.mjs", "postgres-community-daily-restore-test.mjs"],
   }));
 } else {
   await mkdir(OUTDIR, { recursive: true });
@@ -58,6 +62,6 @@ if (process.argv.includes("--check")) {
   console.log(JSON.stringify({
     status: "ok",
     mode: "build",
-    outputs: ["dist/server.mjs", "dist/synthetic-v12-smoke.mjs", "dist/test-migrations.mjs", "dist/test-activation.mjs", "dist/synthetic-v12-cleanup.mjs", "dist/synthetic-v12-discovery.mjs", "dist/ledger-reconciliation-diagnostic.mjs", "dist/ledger-preflight-reconcile.mjs", "dist/postgres-community-graph-benchmark.mjs", "dist/postgres-community-graph-readback-diagnostic.mjs", "dist/postgres-community-daily-publish-test.mjs", "dist/postgres-community-daily-live-smoke.mjs"],
+    outputs: ["dist/server.mjs", "dist/synthetic-v12-smoke.mjs", "dist/test-migrations.mjs", "dist/test-activation.mjs", "dist/synthetic-v12-cleanup.mjs", "dist/synthetic-v12-discovery.mjs", "dist/ledger-reconciliation-diagnostic.mjs", "dist/ledger-preflight-reconcile.mjs", "dist/postgres-community-graph-benchmark.mjs", "dist/postgres-community-graph-readback-diagnostic.mjs", "dist/postgres-community-daily-publish-test.mjs", "dist/postgres-community-daily-live-smoke.mjs", "dist/postgres-community-daily-prepare-test.mjs", "dist/postgres-community-daily-restore-test.mjs"],
   }));
 }

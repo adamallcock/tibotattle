@@ -2,24 +2,26 @@
 title: A2 synthetic daily publication review
 date: 2026-09-25
 type: plan
-status: proposed
+status: approved-test-only
 ---
 
 # A2 synthetic daily publication review
 
 ## Status and boundary
 
-This is a proposed exact-effect review for one private, test-only daily
-publication in the existing A2 PostgreSQL schema. It is not an execution
-receipt or authorization to write. No activation code has been added and no
-GCP writes have been made by this workstream.
+This is the exact-effect review for one private, test-only daily publication in
+the existing A2 PostgreSQL schema. The project owner approved this effect on
+2026-09-25 through the A2 synthetic-publication approval prompt. Test-only
+preparation and independent restore commands are now implemented and locally
+qualified against disposable PostgreSQL 17 schemas. This is not an execution
+receipt: this workstream has made no GCP writes or deployment changes.
 
-The attempted write-capable activation implementation was rejected by the
-automatic approval review because it could insert rows into the shared A2
-Cloud SQL schema and change collection controls to operational with publication
-enabled. The review explicitly directed us not to reproduce that capability
-through another entrypoint, feature flag, or indirect execution. The exact
-owner approval needed before implementation or execution is listed below.
+An earlier automatic approval review rejected the initial write-capable
+activation attempt because it could insert rows into the shared A2 Cloud SQL
+schema and change collection controls to operational with publication enabled.
+The project owner later explicitly approved the exact test-only effect below.
+The implementation remains pinned to this effect and cannot select another
+schema, day, source, project, or Cloud Run job.
 
 ## Fixed target and current evidence
 
@@ -152,11 +154,10 @@ There is no GCS byte charge because no object is written. Exact billing depends
 on configured Job CPU/memory and current regional rates, so this is a
 small-order estimate, not a billing quote.
 
-## Exact approval needed
+## Approved test-only effect and remaining execution gates
 
-Before write-capable activation code is implemented or run, the project owner
-must explicitly approve this test-only effect in
-tibotattle_v12_a2_20260925:
+The project owner approved this exact effect in the private A2 schema on
+2026-09-25:
 
 - Seed the single synthetic social v1 owner/device/usage fixture and empty
   source/cursor/admission fence listed above.
@@ -169,8 +170,7 @@ tibotattle_v12_a2_20260925:
 - Retain the content-free fixture and aggregate in the private test schema,
   with no GCS object, bucket mutation, or production authority inferred.
 
-Approval is distinct from running the route verifier against the current
-private service. The exact source image, live preconditions, fresh backup, and
-restore implementation must be reviewed before dispatch. This proposal
-supplies that review target; it does not authorize a production write or make
-one.
+Execution still requires review of the exact source image, live preconditions,
+and a fresh backup immediately before the database write. The local tests do
+not prove Cloud Run job configuration, migration application, GCP execution, or
+the private HTTP readback. Production Cloudflare remains unchanged.
