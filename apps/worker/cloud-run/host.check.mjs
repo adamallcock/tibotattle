@@ -979,7 +979,8 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     });
     const [transport, v12Admission, ledgerAuthority, admission, rateLimit, bodyReader, constants,
       cryptoModule, telemetryV12Repository, deviceSync, typedCodec, typedV12EffectiveReader,
-      accountlessAdapter, accountlessEnrollment, accountlessOwnership, transportPolicy]
+      accountlessAdapter, accountlessRenewalAdapter, accountlessEnrollment, accountlessOwnership,
+      accountlessRenewal, transportPolicy]
       = await Promise.all([
         vite.ssrLoadModule("/src/postgres-typed-v12-transport.ts"),
         vite.ssrLoadModule("/src/postgres-typed-v12-admission.ts"),
@@ -994,8 +995,10 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
         vite.ssrLoadModule("/src/typed-telemetry-codec.ts"),
         vite.ssrLoadModule("/src/postgres-typed-v12-effective-reader.ts"),
         vite.ssrLoadModule("/src/postgres-accountless-enrollment.ts"),
+        vite.ssrLoadModule("/src/postgres-accountless-renewal.ts"),
         vite.ssrLoadModule("/src/accountless-enrollment.ts"),
         vite.ssrLoadModule("/src/accountless-ownership.ts"),
+        vite.ssrLoadModule("/src/accountless-renewal.ts"),
         vite.ssrLoadModule("/src/telemetry-transport-policy.ts"),
       ]);
     const v12ManifestCandidates = await vite.ssrLoadModule("/src/postgres-v12-manifest-candidates.ts");
@@ -1204,11 +1207,14 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
         enroll: accountlessAdapter.enrollPostgresAccountlessDevice,
         createOwner: accountlessAdapter.createPostgresAccountlessUploadOwner,
         grantV12: accountlessAdapter.grantPostgresTelemetryV12AccountlessAuthorization,
+        renew: accountlessRenewalAdapter.renewPostgresAccountlessUploadOwner,
         parseEnrollmentJson: accountlessEnrollment.parseAccountlessEnrollmentJson,
         parseOwnershipJson: accountlessOwnership.parseAccountlessOwnershipJson,
         parseV12AuthorizationJson: transportPolicy.parseTelemetryV12AccountlessAuthorizationJson,
+        parseRenewalJson: accountlessRenewal.parseAccountlessRenewalJson,
         maxEnrollmentBytes: accountlessEnrollment.ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
         maxOwnershipBytes: accountlessOwnership.ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES,
+        maxRenewalBytes: accountlessRenewal.ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
       }),
       admissionEnv: Object.freeze(admissionEnv),
       assertAdmissionBindings: admission.assertAdmissionBindings,
@@ -2075,6 +2081,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     const accountlessOwnershipUrl = "http://127.0.0.1:43817/api/v1/accountless/ownership";
     const accountlessV12AuthorizationUrl =
       "http://127.0.0.1:43817/api/v1/accountless/telemetry-v1.2-authorization";
+    const accountlessRenewalUrl = "http://127.0.0.1:43817/api/v1/accountless/renewal";
     const accountlessDeviceId = randomUUID();
     const accountlessSecret = randomBytes(32).toString("base64url");
     const accountlessAuth = "Device um_device_" + accountlessDeviceId + "." + accountlessSecret;
@@ -2104,6 +2111,19 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
         method: "POST",
         headers: { "content-type": "application/json", authorization, ...headers },
         body,
+      });
+    const renewalBody = {
+      schemaVersion: "accountless-renewal-v0.1",
+      policyVersion: "accountless-opt-out-v1",
+      authorizationBasis: "accountless-policy-v1",
+      telemetrySchemaVersion: "telemetry-contribution-v1.1",
+    };
+    const renewalJson = JSON.stringify(renewalBody);
+    const renewalHttp = (body = renewalJson, headers = {}, method = "POST") =>
+      new Request(accountlessRenewalUrl, {
+        method,
+        headers: { "content-type": "application/json", authorization: accountlessAuth, ...headers },
+        ...(method === "GET" || method === "HEAD" ? {} : { body }),
       });
 
     await assertApiError(await dispatch(enrollmentHttp(undefined, {}, "GET")), 405, "METHOD_NOT_ALLOWED");
@@ -2275,6 +2295,30 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     assert.equal(Date.parse(accountlessGrant.rows[0].expires_at),
       Date.parse(accountlessOwner.rows[0].owner_expires_at));
 
+    await assertApiError(await dispatch(renewalHttp(undefined, {}, "GET")),
+      405, "METHOD_NOT_ALLOWED");
+    await assertApiError(await dispatch(renewalHttp(renewalJson, { cookie: "session=synthetic" })),
+      401, "AUTH_INVALID");
+    await assertApiError(await dispatch(renewalHttp(JSON.stringify({
+      ...renewalBody, unexpected: true,
+    }))), 400, "BODY_INVALID");
+    await assertApiError(await dispatch(renewalHttp(
+      '{"schemaVersion":"wrong","schemaVersion":"accountless-renewal-v0.1"}',
+    )), 400, "BODY_INVALID");
+    const existingRenewal = await dispatch(renewalHttp());
+    assert.equal(existingRenewal.status, 200);
+    assert.deepEqual(await existingRenewal.json(), {
+      schemaVersion: "accountless-renewal-v0.1",
+      state: "existing",
+      deviceId: accountlessDeviceId,
+      expiresAt: new Date(Date.parse(accountlessOwner.rows[0].owner_expires_at)).toISOString(),
+      renewalGeneration: 0,
+      policyVersion: "accountless-opt-out-v1",
+      authorizationBasis: "accountless-policy-v1",
+      scope: "upload_registration",
+      telemetrySchemaVersion: "telemetry-contribution-v1.1",
+    });
+
     const tombstonedDeviceId = randomUUID();
     const tombstonedSecret = randomBytes(32).toString("base64url");
     const tombstonedAuth = `Device um_device_${tombstonedDeviceId}.${tombstonedSecret}`;
@@ -2317,6 +2361,81 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     }));
     assert.equal(uploadAuthorizationReceipt.status, 201,
       "an active accountless v1.2 grant admits upload authorization in PostgreSQL");
+
+    const renewalNow = Date.now();
+    const dueIssuedAt = new Date(renewalNow - 29 * 24 * 60 * 60_000).toISOString();
+    const dueExpiresAt = new Date(renewalNow + 24 * 60 * 60_000).toISOString();
+    await primaryPool.query("BEGIN");
+    try {
+      await primaryPool.query(
+        "UPDATE " + primaryTable("accountless_enrollment_ledger")
+          + " SET issued_at=$2::timestamptz, expires_at=$3::timestamptz, "
+          + "renewed_at=NULL, renewal_generation=0 WHERE device_id=$1",
+        [accountlessDeviceId, dueIssuedAt, dueExpiresAt],
+      );
+      for (const table of [
+        "device_credentials", "accountless_upload_owners",
+        "accountless_v11_device_authorizations", "accountless_v12_device_authorizations",
+      ]) {
+        const key = table === "device_credentials" ? "id" : "enrollment_device_id";
+        await primaryPool.query(
+          "UPDATE " + primaryTable(table) + " SET expires_at=$2::timestamptz WHERE " + key + "=$1",
+          [accountlessDeviceId, dueExpiresAt],
+        );
+      }
+      await primaryPool.query("COMMIT");
+    } catch (error) {
+      await primaryPool.query("ROLLBACK");
+      throw error;
+    }
+    const renewedResponse = await dispatch(renewalHttp());
+    assert.equal(renewedResponse.status, 200);
+    const renewedReceipt = await renewedResponse.json();
+    assert.equal(renewedReceipt.state, "renewed");
+    assert.equal(renewedReceipt.renewalGeneration, 1);
+    assert.ok(Date.parse(renewedReceipt.expiresAt) > Date.parse(dueExpiresAt));
+    const renewedGraph = await primaryPool.query(
+      "SELECT ledger.renewal_generation, ledger.renewed_at::text AS renewed_at, "
+        + "ledger.expires_at::text AS ledger_expires_at, device.expires_at::text AS device_expires_at, "
+        + "owner.expires_at::text AS owner_expires_at, v11.expires_at::text AS v11_expires_at, "
+        + "v12.expires_at::text AS v12_expires_at FROM "
+        + primaryTable("accountless_enrollment_ledger") + " ledger JOIN "
+        + primaryTable("device_credentials") + " device ON device.id=ledger.device_id JOIN "
+        + primaryTable("accountless_upload_owners") + " owner ON owner.enrollment_device_id=ledger.device_id JOIN "
+        + primaryTable("accountless_v11_device_authorizations") + " v11 ON v11.enrollment_device_id=ledger.device_id JOIN "
+        + primaryTable("accountless_v12_device_authorizations") + " v12 ON v12.enrollment_device_id=ledger.device_id "
+        + "WHERE ledger.device_id=$1",
+      [accountlessDeviceId],
+    );
+    assert.equal(renewedGraph.rowCount, 1);
+    const renewedRow = renewedGraph.rows[0];
+    assert.equal(renewedRow.renewal_generation, 1);
+    assert.ok(renewedRow.renewed_at);
+    assert.equal(new Set([
+      renewedRow.ledger_expires_at, renewedRow.device_expires_at,
+      renewedRow.owner_expires_at, renewedRow.v11_expires_at,
+    ].map((value) => Date.parse(value))).size, 1,
+    "ledger, device, owner, and v1.1 authorization renew atomically");
+    assert.equal(Date.parse(renewedReceipt.expiresAt),
+      Date.parse(renewedRow.renewed_at) + 30 * 24 * 60 * 60_000);
+    assert.equal(Date.parse(renewedRow.v12_expires_at), Date.parse(dueExpiresAt),
+      "Cloudflare parity leaves the separate v1.2 authorization expiry unchanged");
+    assert.notEqual(Date.parse(renewedRow.v12_expires_at), Date.parse(renewedReceipt.expiresAt));
+    await assertApiError(await dispatch(request({
+      url: uploadAuthorizationUrl,
+      headers: { authorization: accountlessAuth },
+      body: JSON.stringify({
+        envelopeDigest: "b".repeat(64), contentLengthBytes: 1,
+        contentType: "application/json", telemetrySchemaVersion: TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+      }),
+    })), 401, "DEVICE_AUTH_INVALID");
+    const renewalReplay = await dispatch(renewalHttp());
+    assert.equal(renewalReplay.status, 200);
+    assert.equal((await renewalReplay.json()).state, "existing");
+    assert.equal((await primaryPool.query(
+      "SELECT renewal_generation FROM " + primaryTable("accountless_enrollment_ledger")
+        + " WHERE device_id=$1", [accountlessDeviceId],
+    )).rows[0].renewal_generation, 1, "replay does not create another generation");
 
     // Simulate the persisted result of an opt-out. The Cloud Run test host
     // does not expose disconnect until PostgreSQL v1.1 history-retention

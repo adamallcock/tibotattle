@@ -271,6 +271,7 @@ const V12_EFFECTIVE_PAGE_PATH = "/api/v1/me/telemetry-v12/effective-page";
 const ACCOUNTLESS_ENROLLMENT_PATH = "/api/v1/accountless/enrollment";
 const ACCOUNTLESS_OWNERSHIP_PATH = "/api/v1/accountless/ownership";
 const ACCOUNTLESS_V12_AUTHORIZATION_PATH = "/api/v1/accountless/telemetry-v1.2-authorization";
+const ACCOUNTLESS_RENEWAL_PATH = "/api/v1/accountless/renewal";
 const MAX_V12_DAY_CHUNKS = 4_096;
 const MAX_V12_EFFECTIVE_PAGE_LIMIT = 200;
 const MAX_V12_EFFECTIVE_TIME_MS = 8_640_000_000_000_000;
@@ -1106,11 +1107,14 @@ export function createPostgresTestV12DayManifestDispatch({
         || typeof accountlessAuthority.enroll !== "function"
         || typeof accountlessAuthority.createOwner !== "function"
         || typeof accountlessAuthority.grantV12 !== "function"
+        || typeof accountlessAuthority.renew !== "function"
         || typeof accountlessAuthority.parseEnrollmentJson !== "function"
         || typeof accountlessAuthority.parseOwnershipJson !== "function"
         || typeof accountlessAuthority.parseV12AuthorizationJson !== "function"
+        || typeof accountlessAuthority.parseRenewalJson !== "function"
         || accountlessAuthority.maxEnrollmentBytes !== 512
-        || accountlessAuthority.maxOwnershipBytes !== 512)) {
+        || accountlessAuthority.maxOwnershipBytes !== 512
+        || accountlessAuthority.maxRenewalBytes !== 512)) {
     configurationError("POSTGRES_TEST_ACCOUNTLESS_AUTHORITY_CONFIGURATION_INVALID");
   }
 
@@ -1142,10 +1146,12 @@ export function createPostgresTestV12DayManifestDispatch({
     const accountlessEnrollmentPath = url.pathname === ACCOUNTLESS_ENROLLMENT_PATH;
     const accountlessOwnershipPath = url.pathname === ACCOUNTLESS_OWNERSHIP_PATH;
     const accountlessV12AuthorizationPath = url.pathname === ACCOUNTLESS_V12_AUTHORIZATION_PATH;
+    const accountlessRenewalPath = url.pathname === ACCOUNTLESS_RENEWAL_PATH;
     const accountlessEnrollmentRoute = accountlessEnrollmentPath && request.method === "POST";
     const accountlessOwnershipRoute = accountlessOwnershipPath && request.method === "POST";
     const accountlessV12AuthorizationRoute = accountlessV12AuthorizationPath
       && request.method === "POST";
+    const accountlessRenewalRoute = accountlessRenewalPath && request.method === "POST";
     const syncStateRoute = syncStatePath && request.method === "GET";
     const syncCapabilitiesV12Route = syncCapabilitiesV12Path && request.method === "GET";
     const v12DomainPredecessorRoute = v12DomainPredecessorPath && request.method === "POST";
@@ -1177,15 +1183,18 @@ export function createPostgresTestV12DayManifestDispatch({
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET" },
       }), crypto.randomUUID());
     }
-    if ((accountlessEnrollmentPath || accountlessOwnershipPath || accountlessV12AuthorizationPath)
+    if ((accountlessEnrollmentPath || accountlessOwnershipPath || accountlessV12AuthorizationPath
+      || accountlessRenewalPath)
         && request.method !== "POST") {
       return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "POST" },
       }), crypto.randomUUID());
     }
-    if ((accountlessEnrollmentPath || accountlessOwnershipPath || accountlessV12AuthorizationPath)
+    if ((accountlessEnrollmentPath || accountlessOwnershipPath || accountlessV12AuthorizationPath
+      || accountlessRenewalPath)
         && request.headers.has("cookie")) {
-      const code = accountlessEnrollmentPath ? "AUTH_INVALID" : "DEVICE_AUTH_INVALID";
+      const code = accountlessEnrollmentPath || accountlessRenewalPath
+        ? "AUTH_INVALID" : "DEVICE_AUTH_INVALID";
       return routeError(Object.assign(new Error(code), { code, status: 401 }), crypto.randomUUID());
     }
     if ((!envelopeKeyRoute && !manifestRoute && !manifestReadRoute
@@ -1193,12 +1202,14 @@ export function createPostgresTestV12DayManifestDispatch({
         && !syncStateRoute && !syncCapabilitiesV12Route
         && !v12DomainPredecessorRoute && !v12DomainActivateRoute
         && !v12EffectivePageRoute && !accountlessEnrollmentRoute
-        && !accountlessOwnershipRoute && !accountlessV12AuthorizationRoute)
+        && !accountlessOwnershipRoute && !accountlessV12AuthorizationRoute
+        && !accountlessRenewalRoute)
         || (url.search && !envelopeKeyRoute && !manifestReadRoute
           && !syncStatePath && !syncCapabilitiesV12Path && !v12EffectivePageRoute)) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
-    if ((accountlessEnrollmentRoute || accountlessOwnershipRoute || accountlessV12AuthorizationRoute)
+    if ((accountlessEnrollmentRoute || accountlessOwnershipRoute || accountlessV12AuthorizationRoute
+      || accountlessRenewalRoute)
         && !accountlessAuthority) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
@@ -1248,6 +1259,47 @@ export function createPostgresTestV12DayManifestDispatch({
         );
         const result = await accountlessAuthority.enroll(primaryPool, body, { schema });
         return json(result.status, result.response);
+      }
+      if (accountlessRenewalRoute) {
+        const enrollmentMode = admissionEnv.ACCOUNTLESS_ENROLLMENT_MODE;
+        if (enrollmentMode === undefined || enrollmentMode === "disabled") {
+          throw Object.assign(new Error("ACCOUNTLESS_ENROLLMENT_DISABLED"), {
+            code: "ACCOUNTLESS_ENROLLMENT_DISABLED", status: 503,
+          });
+        }
+        if (enrollmentMode !== "enabled") {
+          throw Object.assign(new Error("ADMISSION_CONFIGURATION_INVALID"), {
+            code: "ADMISSION_CONFIGURATION_INVALID", status: 503,
+          });
+        }
+        const ownershipMode = admissionEnv.ACCOUNTLESS_OWNERSHIP_MODE;
+        if (ownershipMode === undefined || ownershipMode === "disabled") {
+          throw Object.assign(new Error("ACCOUNTLESS_OWNERSHIP_DISABLED"), {
+            code: "ACCOUNTLESS_OWNERSHIP_DISABLED", status: 503,
+          });
+        }
+        if (ownershipMode !== "enabled") {
+          throw Object.assign(new Error("ACCOUNTLESS_OWNERSHIP_CONFIGURATION_INVALID"), {
+            code: "ACCOUNTLESS_OWNERSHIP_CONFIGURATION_INVALID", status: 503,
+          });
+        }
+        await assertPostgresUploadRegistrationEnabled(primaryPool, schemas.primary);
+        await assertAttemptAllowed(
+          admissionEnv.RECOVERY_RATE_LIMIT,
+          admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
+          request,
+          admissionEnv,
+          "accountless_renewal",
+        );
+        const body = await readAccountlessJson(
+          request,
+          accountlessAuthority.maxRenewalBytes,
+          readBoundedRequestBody,
+          accountlessAuthority.parseRenewalJson,
+        );
+        return json(200, await accountlessAuthority.renew(
+          primaryPool, request.headers.get("authorization"), body, { schema },
+        ));
       }
       if (accountlessOwnershipRoute || accountlessV12AuthorizationRoute) {
         const mode = admissionEnv.ACCOUNTLESS_OWNERSHIP_MODE;

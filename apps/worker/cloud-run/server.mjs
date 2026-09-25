@@ -34,11 +34,16 @@ import {
 } from "../src/accountless-ownership.ts";
 import { parseTelemetryV12AccountlessAuthorizationJson } from "../src/telemetry-transport-policy.ts";
 import {
+  ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
+  parseAccountlessRenewalJson,
+} from "../src/accountless-renewal.ts";
+import {
   authenticatePostgresAccountlessOwnerForV12Grant,
   createPostgresAccountlessUploadOwner,
   enrollPostgresAccountlessDevice,
   grantPostgresTelemetryV12AccountlessAuthorization,
 } from "../src/postgres-accountless-enrollment.ts";
+import { renewPostgresAccountlessUploadOwner } from "../src/postgres-accountless-renewal.ts";
 import {
   readPostgresDeviceSyncState,
   readPostgresDeviceSyncV12Capabilities,
@@ -496,11 +501,14 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
             enroll: enrollPostgresAccountlessDevice,
             createOwner: createPostgresAccountlessUploadOwner,
             grantV12: grantPostgresTelemetryV12AccountlessAuthorization,
+            renew: renewPostgresAccountlessUploadOwner,
             parseEnrollmentJson: parseAccountlessEnrollmentJson,
             parseOwnershipJson: parseAccountlessOwnershipJson,
             parseV12AuthorizationJson: parseTelemetryV12AccountlessAuthorizationJson,
+            parseRenewalJson: parseAccountlessRenewalJson,
             maxEnrollmentBytes: ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
             maxOwnershipBytes: ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES,
+            maxRenewalBytes: ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
           }),
           expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
           privateOrigin: hostOrigin,
