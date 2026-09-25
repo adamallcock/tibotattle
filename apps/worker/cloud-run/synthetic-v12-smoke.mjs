@@ -107,8 +107,8 @@ export function parseSyntheticV12SmokeConfig(env) {
   if (env.HOST_ORIGIN !== SMOKE_ORIGIN) fail("HOST_ORIGIN_INVALID");
   if (env.GCS_BUCKET_NAME !== SYNTHETIC_V12_SMOKE_BUCKET) fail("GCS_BUCKET_NAME_INVALID");
 
-  const primarySchema = env.PRIMARY_SCHEMA ?? "tibotattle";
-  const ledgerSchema = env.LEDGER_SCHEMA ?? "tibotattle_ledger";
+  const primarySchema = required(env.PRIMARY_SCHEMA, "PRIMARY_SCHEMA", SCHEMA_PATTERN);
+  const ledgerSchema = required(env.LEDGER_SCHEMA, "LEDGER_SCHEMA", SCHEMA_PATTERN);
   if (!SCHEMA_PATTERN.test(primarySchema) || primarySchema.startsWith("pg_")
       || primarySchema === "information_schema"
       || !SCHEMA_PATTERN.test(ledgerSchema) || ledgerSchema.startsWith("pg_")
@@ -956,6 +956,7 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       status: "ok",
       kind: "synthetic-v12-smoke",
       synthetic: true,
+      participantId: fixture.participantId,
       origin: config.origin,
       manifest: "staged_and_exactly_replayed",
       chunk: "staged_and_exactly_replayed",

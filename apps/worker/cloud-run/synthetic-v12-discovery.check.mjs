@@ -32,6 +32,8 @@ const {
 } = await import(pathToFileURL(cliPath).href);
 test.after(async () => { await rm(cliDirectory, { recursive: true, force: true }); });
 
+const PARTICIPANT_ID = "synthetic-v12-smoke-20000000-0000-4000-8000-000000000001";
+
 const TABLES = Object.freeze([
   "web_sessions",
   "device_pairings",
@@ -70,6 +72,7 @@ function validEnv(overrides = {}) {
     LEDGER_DATABASE: SYNTHETIC_V12_DISCOVERY_TARGETS.ledger.database,
     LEDGER_SCHEMA: SYNTHETIC_V12_DISCOVERY_TARGETS.ledger.schema,
     GCS_BUCKET_NAME: SYNTHETIC_V12_DISCOVERY_TARGETS.bucket,
+    SYNTHETIC_V12_DISCOVERY_PARTICIPANT_ID: PARTICIPANT_ID,
     ...overrides,
   };
 }
@@ -86,8 +89,7 @@ function fakeManifest() {
   return { roles: { primary: migrations("primary"), ledger: migrations("ledger") } };
 }
 
-function participantFixture() {
-  const participantId = `synthetic-v12-smoke-${randomUUID()}`;
+function participantFixture(participantId = `synthetic-v12-smoke-${randomUUID()}`) {
   const manifestId = randomUUID();
   const chunkUuid = randomUUID();
   const contributionId = `chunk:${chunkUuid}`;
@@ -206,10 +208,14 @@ function fakePrimaryPool({
 
 test("discovery config pins the single IAM-private Job and exact test Cloud SQL/GCS targets", () => {
   const parsed = parseSyntheticV12DiscoveryConfig(validEnv());
+  assert.equal(SYNTHETIC_V12_DISCOVERY_TARGETS.primary.schema, "tibotattle_v12_a2_20260925");
+  assert.equal(SYNTHETIC_V12_DISCOVERY_TARGETS.ledger.schema, "tibotattle_ledger_v12_a2_20260925");
+  assert.equal(SYNTHETIC_V12_DISCOVERY_TARGETS.bucket, "tibotattle-gcs-test-cleanup-20260925-a2");
   assert.equal(parsed.job, SYNTHETIC_V12_DISCOVERY_JOB);
   assert.equal(parsed.primary.instanceConnectionName, SYNTHETIC_V12_DISCOVERY_TARGETS.primary.instanceConnectionName);
   assert.equal(parsed.ledger.instanceConnectionName, SYNTHETIC_V12_DISCOVERY_TARGETS.ledger.instanceConnectionName);
   assert.equal(parsed.bucket, SYNTHETIC_V12_DISCOVERY_TARGETS.bucket);
+  assert.equal(parsed.participantId, PARTICIPANT_ID);
   for (const overrides of [
     { CLOUD_RUN_TASK_INDEX: "1" },
     { CLOUD_RUN_TASK_COUNT: "2" },
@@ -226,6 +232,10 @@ test("discovery config pins the single IAM-private Job and exact test Cloud SQL/
     { LEDGER_DATABASE: "another" },
     { LEDGER_SCHEMA: "another" },
     { GCS_BUCKET_NAME: "another-test-bucket" },
+    { PRIMARY_SCHEMA: "tibotattle" },
+    { LEDGER_SCHEMA: "tibotattle_ledger" },
+    { SYNTHETIC_V12_DISCOVERY_PARTICIPANT_ID: undefined },
+    { SYNTHETIC_V12_DISCOVERY_PARTICIPANT_ID: "synthetic-v12-smoke-not-a-uuid" },
     { K_SERVICE: "accidental-service-context" },
   ]) {
     assert.throws(() => parseSyntheticV12DiscoveryConfig(validEnv(overrides)));
@@ -331,7 +341,7 @@ test("job execution uses only pinned IAM database pools and keeps database snaps
   const manifest = fakeManifest();
   const poolCalls = [];
   let closed = false;
-  const owners = [participantFixture()];
+  const owners = [participantFixture(PARTICIPANT_ID)];
   const primaryPool = {};
   const ledgerPool = {};
   const result = await runSyntheticV12Discovery({
@@ -375,7 +385,71 @@ test("job execution uses only pinned IAM database pools and keeps database snaps
   ]);
   assert.equal(closed, true);
   assert.notEqual(result.primarySnapshotObservedAt, result.ledgerMigrationSnapshotObservedAt);
+  assert.equal(result.targetParticipantId, PARTICIPANT_ID);
   assert.equal(result.owners[0].participantId, owners[0].participant.id);
   assert.equal(result.referencedGcsObjectCount, 1);
   assert.doesNotMatch(JSON.stringify(result), /telemetry\/v12-/u);
+});
+
+test("discovery refuses an ambiguous cohort or a target without one uploaded reference", async (t) => {
+  const target = participantFixture(PARTICIPANT_ID);
+  const legacyShapedOwners = Array.from({ length: 4 }, (_, index) =>
+    participantFixture(`synthetic-v12-smoke-30000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`));
+  const noUpload = {
+    observedAt: "2026-09-25T00:00:00.000Z",
+    owners: [{
+      participantId: target.participant.id,
+      referencedGcsObjectCount: 0,
+      registeredPendingReferenceCount: 0,
+    }],
+    referencedGcsObjectCount: 0,
+    registeredPendingReferenceCount: 0,
+    unattributablePendingReferenceCount: 0,
+  };
+  const cases = [
+    ["legacy-shaped four-owner cohort", {
+      observedAt: "2026-09-25T00:00:00.000Z",
+      owners: [target, ...legacyShapedOwners].map(({ participant }) => ({
+        participantId: participant.id,
+        referencedGcsObjectCount: 1,
+        registeredPendingReferenceCount: 1,
+      })),
+      referencedGcsObjectCount: 5,
+      registeredPendingReferenceCount: 5,
+      unattributablePendingReferenceCount: 0,
+    }],
+    ["requested owner differs from the A2 inventory", {
+      observedAt: "2026-09-25T00:00:00.000Z",
+      owners: [{
+        participantId: legacyShapedOwners[0].participant.id,
+        referencedGcsObjectCount: 1,
+        registeredPendingReferenceCount: 1,
+      }],
+      referencedGcsObjectCount: 1,
+      registeredPendingReferenceCount: 1,
+      unattributablePendingReferenceCount: 0,
+    }],
+    ["target owner has no uploaded v1.2 object", noUpload],
+  ];
+
+  for (const [name, inventory] of cases) {
+    await t.test(name, async () => {
+      let closed = false;
+      await assert.rejects(runSyntheticV12Discovery({
+        env: validEnv({ SYNTHETIC_V12_DISCOVERY_PARTICIPANT_ID: target.participant.id }),
+        dependencies: {
+          async readServiceAccountEmail() { return SYNTHETIC_V12_DISCOVERY_SERVICE_ACCOUNT; },
+          buildManifest: async () => fakeManifest(),
+          createConnector: async () => ({ connector: true }),
+          async createPool() { return {}; },
+          async readPrimarySnapshot() { return inventory; },
+          async readLedgerSnapshot() {
+            return { observedAt: "2026-09-25T00:00:01.000Z", migrationReceiptMatched: true };
+          },
+          async closeResources() { closed = true; },
+        },
+      }), { code: "SYNTHETIC_DISCOVERY_TARGET_OWNER_INVENTORY_MISMATCH" });
+      assert.equal(closed, true);
+    });
+  }
 });

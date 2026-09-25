@@ -28,7 +28,7 @@ export const SYNTHETIC_V12_CLEANUP_TARGETS = Object.freeze({
   iamUser: CLOUD_RUN_IAM_TEST_TARGET.postgres.iamUser,
   project: CLOUD_RUN_IAM_TEST_TARGET.project,
   origin: CLOUD_RUN_IAM_TEST_TARGET.origin,
-  bucketPrefix: "tibotattle-gcs-test-cleanup-",
+  bucket: CLOUD_RUN_IAM_TEST_TARGET.gcsBucket,
 });
 
 const METADATA_EMAIL_URL =
@@ -68,14 +68,6 @@ function validateParticipantId(value) {
 
 function record(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function cleanupBucketName(value) {
-  return typeof value === "string"
-    && value.startsWith(SYNTHETIC_V12_CLEANUP_TARGETS.bucketPrefix)
-    && value.length > SYNTHETIC_V12_CLEANUP_TARGETS.bucketPrefix.length
-    && value.length <= 63
-    && /^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/u.test(value);
 }
 
 function expectedBucketCreateRequest(bucket) {
@@ -183,7 +175,7 @@ export function parseSyntheticV12CleanupConfig(env, attachedServiceAccountEmail)
       || !DATABASE_PATTERN.test(env.LEDGER_DATABASE ?? "")) {
     fail("POSTGRES_SYNTHETIC_CLEANUP_TARGET_INVALID");
   }
-  if (!cleanupBucketName(env.GCS_BUCKET_NAME)) {
+  if (env.GCS_BUCKET_NAME !== SYNTHETIC_V12_CLEANUP_TARGETS.bucket) {
     fail("GCS_SYNTHETIC_CLEANUP_BUCKET_INVALID");
   }
   const historyProof = validateBucketProof(env.GCS_ERASURE_BUCKET_HISTORY_PROOF, env.GCS_BUCKET_NAME);

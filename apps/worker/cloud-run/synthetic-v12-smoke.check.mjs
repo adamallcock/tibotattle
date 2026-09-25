@@ -341,8 +341,13 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
 
 test("job config pins the single Cloud Run job, app origin, project, bucket, and fixed day", () => {
   const config = parseSyntheticV12SmokeConfig(env());
+  assert.equal(CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.schema, "tibotattle_v12_a2_20260925");
+  assert.equal(CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.schema, "tibotattle_ledger_v12_a2_20260925");
+  assert.equal(CLOUD_RUN_IAM_TEST_TARGET.gcsBucket, "tibotattle-gcs-test-cleanup-20260925-a2");
   assert.equal(config.origin, CLOUD_RUN_IAM_TEST_TARGET.origin);
   assert.equal(config.bucket, SYNTHETIC_V12_SMOKE_BUCKET);
+  assert.equal(config.primarySchema, "tibotattle_v12_a2_20260925");
+  assert.equal(config.ledgerSchema, "tibotattle_ledger_v12_a2_20260925");
   assert.equal(config.day, "2026-09-24");
   assert.equal(config.envelopePublicJwk.kid, "key:test");
 });
@@ -361,7 +366,10 @@ test("job config rejects local execution, spoofable origins, wrong bucket, inval
     { GCS_BUCKET_NAME: "another-test-bucket" },
     { PRIMARY_INSTANCE_CONNECTION_NAME: "other-project:us-east1:test-primary" },
     { PRIMARY_DATABASE: "production" },
-    { LEDGER_SCHEMA: "public" },
+    { PRIMARY_SCHEMA: "tibotattle" },
+    { PRIMARY_SCHEMA: undefined },
+    { LEDGER_SCHEMA: "tibotattle_ledger" },
+    { LEDGER_SCHEMA: undefined },
     { POSTGRES_IAM_USER: "other-runtime@other-project.iam" },
     { SYNTHETIC_V12_SMOKE_DAY: "2026-02-30" },
     { ENVELOPE_PUBLIC_JWK: JSON.stringify({ kty: "RSA", n: "n", e: "AQAB", kid: "x", d: "private" }) },
@@ -524,7 +532,7 @@ test("PostgreSQL readback uses ISO date text and identifies the failing stage", 
   let failureStage = "";
   let gcsReads = 0;
   const input = {
-    primarySchema: "tibotattle",
+    primarySchema: SYNTHETIC_V12_SMOKE_DATABASE_TARGET.primarySchema,
     bucket: SYNTHETIC_V12_SMOKE_BUCKET,
     fixture: { participantId: PARTICIPANT_ID, deviceId: DEVICE_ID },
     manifest,
@@ -604,6 +612,7 @@ test("smoke journey keeps IAM and participant credentials separate and replays e
     dependencies: fake.dependencies,
   });
   assert.deepEqual({
+    participantId: receipt.participantId,
     manifest: receipt.manifest,
     chunk: receipt.chunk,
     domain: receipt.domain,
@@ -613,6 +622,7 @@ test("smoke journey keeps IAM and participant credentials separate and replays e
     gcsReadback: receipt.gcsReadback,
     publication: receipt.publication,
   }, {
+    participantId: PARTICIPANT_ID,
     manifest: "staged_and_exactly_replayed",
     chunk: "staged_and_exactly_replayed",
     domain: "activated_and_exactly_replayed",

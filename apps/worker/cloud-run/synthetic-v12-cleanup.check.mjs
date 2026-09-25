@@ -43,7 +43,10 @@ const {
 } = await import(pathToFileURL(cliPath).href);
 test.after(async () => { await rm(cliDirectory, { recursive: true, force: true }); });
 
-const CLEANUP_BUCKET = "tibotattle-gcs-test-cleanup-20260925-smoke";
+const CLEANUP_BUCKET = "tibotattle-gcs-test-cleanup-20260925-a2";
+const OLD_APP_BUCKET = "tibotattle-gcs-test-app-20260922";
+const A1_BUCKET = "tibotattle-gcs-test-cleanup-20260925-a1";
+const PARTICIPANT_ID = "synthetic-v12-smoke-20000000-0000-4000-8000-000000000001";
 
 function digest(value) {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -111,7 +114,7 @@ function validEnv(overrides = {}) {
     LEDGER_SCHEMA: SYNTHETIC_V12_CLEANUP_TARGETS.ledger.schema,
     GCS_BUCKET_NAME: CLEANUP_BUCKET,
     GCS_ERASURE_BUCKET_HISTORY_PROOF: proof(),
-    SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID: `synthetic-v12-smoke-${randomUUID()}`,
+    SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID: PARTICIPANT_ID,
     ...overrides,
   };
 }
@@ -162,10 +165,13 @@ function migrationPool(role, migrations) {
 test("cleanup config requires a provisioned test bucket receipt and pins the one-task owner target", () => {
   const env = validEnv();
   const parsed = parseSyntheticV12CleanupConfig(env, SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT);
+  assert.equal(SYNTHETIC_V12_CLEANUP_TARGETS.primary.schema, "tibotattle_v12_a2_20260925");
+  assert.equal(SYNTHETIC_V12_CLEANUP_TARGETS.ledger.schema, "tibotattle_ledger_v12_a2_20260925");
+  assert.equal(SYNTHETIC_V12_CLEANUP_TARGETS.bucket, CLEANUP_BUCKET);
   assert.equal(parsed.job, SYNTHETIC_V12_CLEANUP_JOB);
   assert.equal(parsed.origin, SYNTHETIC_V12_CLEANUP_TARGETS.origin);
   assert.equal(parsed.bucket, CLEANUP_BUCKET);
-  assert.match(parsed.participantId, /^synthetic-v12-smoke-[0-9a-f-]{36}$/u);
+  assert.equal(parsed.participantId, PARTICIPANT_ID);
   for (const overrides of [
     { CLOUD_RUN_TASK_INDEX: "1" },
     { CLOUD_RUN_TASK_COUNT: "2" },
@@ -178,11 +184,16 @@ test("cleanup config requires a provisioned test bucket receipt and pins the one
     { PRIMARY_INSTANCE_CONNECTION_NAME: "another:region:instance" },
     { PRIMARY_DATABASE: "another" },
     { PRIMARY_SCHEMA: "another" },
+    { PRIMARY_SCHEMA: "tibotattle" },
     { LEDGER_INSTANCE_CONNECTION_NAME: "another:region:instance" },
     { LEDGER_DATABASE: "another" },
     { LEDGER_SCHEMA: "another" },
+    { LEDGER_SCHEMA: "tibotattle_ledger" },
     { GCS_BUCKET_NAME: "another-test-bucket" },
-    { GCS_BUCKET_NAME: SYNTHETIC_V12_CLEANUP_TARGETS.bucket },
+    { GCS_BUCKET_NAME: OLD_APP_BUCKET },
+    { GCS_BUCKET_NAME: A1_BUCKET },
+    { GCS_BUCKET_NAME: OLD_APP_BUCKET, GCS_ERASURE_BUCKET_HISTORY_PROOF: proof(OLD_APP_BUCKET) },
+    { GCS_BUCKET_NAME: A1_BUCKET, GCS_ERASURE_BUCKET_HISTORY_PROOF: proof(A1_BUCKET) },
     { GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("another-test-bucket") },
     { SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID: "participant:real-user" },
     { SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID: "synthetic-v12-smoke-not-a-uuid" },

@@ -168,6 +168,7 @@ export function parseSyntheticV12DiscoveryConfig(env) {
   if (env.GCS_BUCKET_NAME !== SYNTHETIC_V12_DISCOVERY_TARGETS.bucket) {
     fail("GCS_SYNTHETIC_DISCOVERY_BUCKET_INVALID");
   }
+  const participantId = validateParticipantId(env.SYNTHETIC_V12_DISCOVERY_PARTICIPANT_ID);
   return Object.freeze({
     job: SYNTHETIC_V12_DISCOVERY_JOB,
     execution: env.CLOUD_RUN_EXECUTION,
@@ -178,6 +179,7 @@ export function parseSyntheticV12DiscoveryConfig(env) {
     ledger,
     iamUser: SYNTHETIC_V12_DISCOVERY_TARGETS.iamUser,
     bucket: SYNTHETIC_V12_DISCOVERY_TARGETS.bucket,
+    participantId,
   });
 }
 
@@ -551,9 +553,19 @@ export async function runSyntheticV12Discovery({ env = process.env, dependencies
     const ledger = await (dependencies.readLedgerSnapshot ?? readSyntheticV12LedgerSnapshot)(
       ledgerPool, config.ledger.schema, manifest.roles.ledger,
     );
+    if (primary.owners.length !== 1
+        || primary.owners[0]?.participantId !== config.participantId
+        || primary.owners[0]?.referencedGcsObjectCount !== 1
+        || primary.owners[0]?.registeredPendingReferenceCount !== 1
+        || primary.referencedGcsObjectCount !== 1
+        || primary.registeredPendingReferenceCount !== 1
+        || primary.unattributablePendingReferenceCount !== 0) {
+      fail("SYNTHETIC_DISCOVERY_TARGET_OWNER_INVENTORY_MISMATCH");
+    }
     result = Object.freeze({
       schemaVersion: "synthetic-v12-owner-discovery-v1",
       status: "ready",
+      targetParticipantId: config.participantId,
       primarySnapshotObservedAt: primary.observedAt,
       ledgerMigrationSnapshotObservedAt: ledger.observedAt,
       ownerCount: primary.owners.length,
