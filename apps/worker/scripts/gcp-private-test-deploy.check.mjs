@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { chmod, lstat, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import test, { after } from "node:test";
 import {
   buildGcpTestBucketCreateRequest,
@@ -31,6 +32,7 @@ const image = GCP_PRIVATE_TEST_TARGET.imageRepository + "@sha256:" + imageDigest
 const sourceGeneration = "1733521432198765";
 const sourceObject = GCP_PRIVATE_TEST_BUILD.sourceObjectPrefix
   + sourceDigest + "-" + archiveSha256 + ".tar.gz";
+const PUBLIC_WEB_ASSETS = resolve(dirname(fileURLToPath(import.meta.url)), "../../web/public");
 const backingTargetEnvironment = {
   PRIMARY_INSTANCE_CONNECTION_NAME: GCP_PRIVATE_TEST_TARGET.primaryInstanceConnectionName,
   PRIMARY_DATABASE: GCP_PRIVATE_TEST_TARGET.primaryDatabase,
@@ -895,6 +897,8 @@ test("deploy refuses unqualified build provenance before any remote Cloud Run op
     ],
   });
   assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].args.slice(-2), [`--assets=${PUBLIC_WEB_ASSETS}`, "--check"],
+    "the source gate must digest the same reviewed web assets as the canonical archive builder");
   assert.equal(calls[0].args.at(-1), "--check");
   assert.notEqual(calls[0].command, "gcloud");
 });

@@ -55,7 +55,9 @@ export const GCP_PRIVATE_TEST_BUILD = Object.freeze({
 });
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const REPOSITORY_ROOT = resolve(WORKER_ROOT, "../..");
 const BUILD_CONTEXT_CHECK = resolve(WORKER_ROOT, "scripts/cloud-run-build-context.mjs");
+const PUBLIC_WEB_ASSETS = resolve(REPOSITORY_ROOT, "apps/web/public");
 const DIGEST = /^[a-f0-9]{64}$/u;
 const BUILD_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u;
 const MAX_SOURCE_ARCHIVE_BYTES = 64 * 1024 * 1024;
@@ -978,7 +980,11 @@ function spawnGcloud(args, spawn = spawnSync) {
 }
 
 function checkedBuildContext(sourceDigest, spawn = spawnSync) {
-  const result = spawn(process.execPath, [BUILD_CONTEXT_CHECK, "--check"], {
+  const result = spawn(process.execPath, [
+    BUILD_CONTEXT_CHECK,
+    `--assets=${PUBLIC_WEB_ASSETS}`,
+    "--check",
+  ], {
     cwd: WORKER_ROOT,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
