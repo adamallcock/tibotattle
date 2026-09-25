@@ -86,12 +86,33 @@ full application qualification.
   `tibotattle-v12-synthetic-discovery-tdth5` failed with the expected
   `SYNTHETIC_DISCOVERY_TARGET_OWNER_INVENTORY_MISMATCH`: the target owner was
   no longer present.
+- A retry of the same pinned cleanup Job, execution
+  `tibotattle-v12-synthetic-cleanup-kxwvr`, succeeded with
+  `status=already_complete` and `objectsDeleted=1`. No additional live or
+  versioned object appeared in the bucket. This qualifies the completed
+  operation's retry path for this one synthetic target.
 - Independent bucket listing found no live objects and no versioned objects.
   The current bucket still had metageneration `1` and zero soft-delete
   retention. The provider rejected a soft-deleted-object listing because no
   soft-delete policy exists; that command was not counted as a successful
   negative inventory. The exact-object adapter and retained bucket settings
   provide the deletion evidence for this one test object.
+
+## One-off maintenance probe
+
+The manually invoked `tibotattle-a2-maintenance-once` Job pinned the same
+image, A2 schemas, bucket, and runtime identity, with one task and no retry.
+Execution `tibotattle-a2-maintenance-once-cvhf9` exited nonzero by design.
+Its structured result was `outcome=partial`, `status=incomplete`,
+`code=POSTGRES_MAINTENANCE_INCOMPLETE_UNSUPPORTED_PHASES`, and
+`complete=false`: it acquired the PostgreSQL advisory lock, completed the
+primary and ledger identity-expiry scans with zero rows purged, and completed
+the bounded pending-object reconciliation. Device lifecycle, owner-erasure
+jobs, restore replay, telemetry and tombstone retention, and analytics
+maintenance all remained explicitly incomplete. The bucket remained empty
+and the recurring test Scheduler remained `PAUSED` after this probe. This
+proves the supported phases run against the isolated test resources and the
+Job does not silently report full readiness.
 
 ## Validation and cutover boundary
 
