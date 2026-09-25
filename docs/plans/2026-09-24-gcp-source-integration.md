@@ -21,11 +21,14 @@ source archive, not to a production Worker build.
 
 ### Latest test-project checkpoint: 2026-09-25
 
-The [hosted graph readback plan receipt](../receipts/2026-09-25-gcp-graph-readback-plan.md)
-reports a read-only `EXPLAIN` on the seeded 100,000-member test schema: the
-readback query has a `Gather Merge`, a blocking sort, three left hash joins,
-and no index scan. An indexed bounded-page rewrite and fresh-schema hosted
-timing are the next performance gates; the plan alone is not a speed result.
+The [indexed hosted graph receipt](../receipts/2026-09-25-gcp-graph-readindexed-hosted.md)
+records a completed, exact-digest 100,000-member synthetic run on the zonal
+test primary: 186.3 seconds to publish and 47.3 seconds to read back, with
+one checked-out database connection. Its read-only hosted plan uses indexed
+bounded pages and no sort, resolving the earlier 120-second readback timeout
+described in the [plan diagnosis](../receipts/2026-09-25-gcp-graph-readback-plan.md).
+Publication batching and a matched hosted Cloudflare comparison remain open;
+the benchmark explicitly did not qualify a tenfold speedup.
 
 The [A2 preflight-v2 receipt](../receipts/2026-09-25-gcp-a2-daily-preflight-v2.md)
 records a source-pinned private image deployed after primary migration 38/38,
@@ -34,6 +37,11 @@ preflight identified absent source state, cursor, v1/v1.1 admission, and
 selected-day records, plus disabled publication controls; the daily route
 remained fail-closed. A synthetic activation and publication proof are the
 next test-only gates.
+
+The [A2 synthetic daily publication review](./2026-09-25-a2-synthetic-daily-publication-review.md)
+defines the exact private fixture and temporary collection-control transition.
+Automatic approval review blocked its write-capable runner; owner approval is
+pending. The review is a proposal, not an activation or publication receipt.
 
 The private Cloud Run dispatch recognizes at most 16 of the 51 exact Worker
 registry paths, plus one private test-only effective-page path. The other 35
@@ -45,6 +53,9 @@ contracts, authentication and authorization, and public/admin ingress to be
 ported and tested; private test health and a synthetic upload do not qualify
 that switch. This is a source inventory at commit `b2dea68a`, not a live
 public deployment observation.
+Commit `26cdb519` subsequently adds private-host participant device
+revocation with focused PostgreSQL 17 tests; it has not been deployed to the
+test service. The inventory above remains its named earlier snapshot.
 
 The subsequent [private daily and readpaged graph receipt](../receipts/2026-09-25-gcp-a2-daily-and-readpaged-graph.md)
 records ready private revision `tibotattle-test-app-00031-lg7`, current
