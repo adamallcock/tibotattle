@@ -25,6 +25,7 @@ import { runPostgresScheduledMaintenance } from "../src/postgres-maintenance.ts"
 import { assertAccountScopedLocalPreview } from "../src/account-scoped-ingest.ts";
 import { createPostgresDevicePairing } from "../src/postgres-device-pairing.ts";
 import { claimPostgresDevicePairing } from "../src/postgres-device-pairing-claim.ts";
+import { grantPostgresTelemetryV12Consent } from "../src/postgres-telemetry-v12-consent.ts";
 import {
   assertAdmissionBindings,
   assertAttemptAllowed,
@@ -113,6 +114,7 @@ import {
   createPostgresTestDevicePairingClaimDispatch,
   createPostgresTestParticipantDevicesDispatch,
   createPostgresTestPersonalSessionDispatch,
+  createPostgresTestTelemetryV12ConsentDispatch,
   createPostgresTestV12DayManifestDispatch,
   createPostgresTestHealthDispatch,
   dispatchCloudRunHostRequest,
@@ -591,6 +593,19 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         maxRequestBytes: MAX_REQUEST_BYTES,
         privateOrigin: hostOrigin,
       });
+      const telemetryV12ConsentDispatch = createPostgresTestTelemetryV12ConsentDispatch({
+        primaryPool,
+        ledgerPool,
+        schemaOptions,
+        authenticatePostgresPersonalSession: authenticatePostgresPersonalSessionForRead,
+        assertPostgresPersonalSessionCsrf,
+        grantPostgresTelemetryV12Consent,
+        hasPostgresDeletionTombstone,
+        healthDispatch,
+        readBoundedRequestBody,
+        maxRequestBytes: MAX_REQUEST_BYTES,
+        privateOrigin: hostOrigin,
+      });
       const googleHandoffDispatch = postgresTestMode === "cloud-run-iam"
         ? createPostgresGoogleHandoffDispatch({
           primaryPool,
@@ -643,6 +658,9 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           }
           if (pathname === "/api/v1/device-pairings/claim") {
             return devicePairingClaimDispatch(request);
+          }
+          if (pathname === "/api/v1/me/device-telemetry-v12-consents") {
+            return telemetryV12ConsentDispatch(request);
           }
           if (googleEnrollmentDispatch && pathname === "/api/v1/enroll") {
             return googleEnrollmentDispatch(request);
