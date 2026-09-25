@@ -24,6 +24,7 @@ import {
 import { runPostgresScheduledMaintenance } from "../src/postgres-maintenance.ts";
 import { assertAccountScopedLocalPreview } from "../src/account-scoped-ingest.ts";
 import { createPostgresDevicePairing } from "../src/postgres-device-pairing.ts";
+import { claimPostgresDevicePairing } from "../src/postgres-device-pairing-claim.ts";
 import {
   assertAdmissionBindings,
   assertAttemptAllowed,
@@ -109,6 +110,7 @@ import {
   CLOUD_RUN_IAM_TEST_TARGET,
   createPostgresTestCommunityDailyDispatch,
   createPostgresTestDevicePairingDispatch,
+  createPostgresTestDevicePairingClaimDispatch,
   createPostgresTestParticipantDevicesDispatch,
   createPostgresTestPersonalSessionDispatch,
   createPostgresTestV12DayManifestDispatch,
@@ -579,6 +581,16 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         admissionEnv,
         privateOrigin: hostOrigin,
       });
+      const devicePairingClaimDispatch = createPostgresTestDevicePairingClaimDispatch({
+        primaryPool,
+        ledgerPool,
+        schemaOptions,
+        claimPostgresDevicePairing,
+        healthDispatch,
+        readBoundedRequestBody,
+        maxRequestBytes: MAX_REQUEST_BYTES,
+        privateOrigin: hostOrigin,
+      });
       const googleHandoffDispatch = postgresTestMode === "cloud-run-iam"
         ? createPostgresGoogleHandoffDispatch({
           primaryPool,
@@ -628,6 +640,9 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           }
           if (pathname === "/api/v1/me/device-pairings") {
             return devicePairingDispatch(request);
+          }
+          if (pathname === "/api/v1/device-pairings/claim") {
+            return devicePairingClaimDispatch(request);
           }
           if (googleEnrollmentDispatch && pathname === "/api/v1/enroll") {
             return googleEnrollmentDispatch(request);

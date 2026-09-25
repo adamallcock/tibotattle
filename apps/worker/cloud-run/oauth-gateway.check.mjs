@@ -167,6 +167,19 @@ test("the companion health, enrollment, session, and pairing journey uses exact 
       body: JSON.stringify({ consentVersion: "ongoing-privacy-safe-telemetry-v1.0", ongoingUpload: true }),
       contentType: "application/json", status: 201,
     },
+    {
+      path: "/api/v1/device-pairings/claim", method: "POST",
+      body: JSON.stringify({
+        deviceId: "d81c0f3b-9d3e-4dc8-b367-9709e3f3fe9c",
+        deviceSecretHash: "a".repeat(64),
+      }),
+      contentType: "application/json", status: 201,
+      headers: {
+        authorization: `Pairing um_pair_f50be1d0-5233-4e02-8f34-f7336d837d20.${"a".repeat(43)}`,
+        "x-previous-device-authorization": `Device um_device_d81c0f3b-9d3e-4dc8-b367-9709e3f3fe9c.${"b".repeat(43)}`,
+        "x-forwarded-host": "spoofed.invalid",
+      },
+    },
   ];
   const { fetchImpl: metadata } = metadataFetch();
   const backendCalls = [];
@@ -178,7 +191,8 @@ test("the companion health, enrollment, session, and pairing journey uses exact 
       return new Response(
         options.headers.get("accept") === "text/html" ? "<html>complete</html>" : "{}",
         {
-          status: new URL(input).pathname === "/api/v1/me/device-pairings" ? 201 : 200,
+          status: ["/api/v1/me/device-pairings", "/api/v1/device-pairings/claim"]
+            .includes(new URL(input).pathname) ? 201 : 200,
           headers: { "content-type": `${options.headers.get("accept")}; charset=utf-8` },
         },
       );
@@ -192,9 +206,12 @@ test("the companion health, enrollment, session, and pairing journey uses exact 
       url: route.path,
       body: route.body,
       headers: {
-        cookie: "__Host-usage_monitor_session=opaque",
-        authorization: "Bearer caller-forgery",
-        "x-usage-monitor-csrf": "csrf-test-token",
+        ...(route.path === "/api/v1/device-pairings/claim" ? {} : {
+          cookie: "__Host-usage_monitor_session=opaque",
+          authorization: "Bearer caller-forgery",
+          "x-usage-monitor-csrf": "csrf-test-token",
+        }),
+        ...route.headers,
       },
     });
     assert.equal(result.status, route.status ?? 200,
@@ -214,11 +231,21 @@ test("the companion health, enrollment, session, and pairing journey uses exact 
       sessionRoute
         ? "__Host-usage_monitor_session=opaque" : null);
     assert.equal(options.headers.has("authorization"), !sessionRoute && route.path !== "/api/health");
+    if (route.path === "/api/v1/device-pairings/claim") {
+      assert.equal(options.headers.get("authorization"), route.headers.authorization);
+      assert.equal(options.headers.get("x-previous-device-authorization"), route.headers["x-previous-device-authorization"]);
+      assert.equal(options.headers.has("cookie"), false);
+      assert.equal(options.headers.has("x-usage-monitor-csrf"), false);
+      assert.equal(options.headers.has("x-forwarded-host"), false);
+    }
     assert.equal(options.headers.get("x-serverless-authorization"), `Bearer ${TOKEN}`);
     if (route.method === "POST" && (route.path.endsWith("/logout")
-        || route.path === "/api/v1/me/device-pairings")) {
+        || route.path === "/api/v1/me/device-pairings"
+        || route.path === "/api/v1/device-pairings/claim")) {
       assert.equal(options.headers.get("origin"), BACKEND_ORIGIN);
-      assert.equal(options.headers.get("x-usage-monitor-csrf"), "csrf-test-token");
+      if (route.path !== "/api/v1/device-pairings/claim") {
+        assert.equal(options.headers.get("x-usage-monitor-csrf"), "csrf-test-token");
+      }
       if (route.path.endsWith("/logout")) {
         assert.equal(options.headers.has("content-type"), false);
         assert.equal(options.body, undefined);
@@ -240,6 +267,72 @@ test("the companion health, enrollment, session, and pairing journey uses exact 
   }
   assert.equal(backendCalls[2].options.headers.get("x-tibotattle-google-callback-query"), "?state=opaque&code=opaque");
   assert.equal(backendCalls[2].url.search, "", "callback query stays out of the private URL");
+});
+
+test("desktop pairing claim permits a missing Node Origin but still requires the pairing credential", async () => {
+  let backendCall;
+  const { fetchImpl: metadata } = metadataFetch();
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      backendCall = { url: new URL(input), options };
+      return new Response("{}", { status: 201, headers: { "content-type": "application/json" } });
+    },
+    logger: () => {},
+  });
+  const url = "/api/v1/device-pairings/claim";
+  const body = JSON.stringify({
+    deviceId: "d81c0f3b-9d3e-4dc8-b367-9709e3f3fe9c",
+    deviceSecretHash: "a".repeat(64),
+  });
+  const authorization = `Pairing um_pair_f50be1d0-5233-4e02-8f34-f7336d837d20.${"a".repeat(43)}`;
+  const desktop = await invoke(handler, {
+    url,
+    body,
+    headers: { origin: undefined, authorization },
+  });
+  assert.equal(desktop.status, 201);
+  assert.equal(backendCall.url.origin, BACKEND_ORIGIN);
+  assert.equal(backendCall.options.headers.get("origin"), BACKEND_ORIGIN);
+  assert.equal(backendCall.options.headers.get("authorization"), authorization);
+  assert.equal(backendCall.options.headers.has("cookie"), false);
+
+  const missingCredential = await invoke(handler, { url, body, headers: { origin: undefined } });
+  assert.equal(missingCredential.status, 401);
+  assert.equal(missingCredential.json().error.code, "PAIRING_AUTH_INVALID");
+});
+
+test("device pairing claim rejects cookies and oversized continuity credentials before private forwarding", async () => {
+  let backendCount = 0;
+  const { fetchImpl: metadata } = metadataFetch();
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      backendCount += 1;
+      return new Response("{}", { status: 201, headers: { "content-type": "application/json" } });
+    },
+    logger: () => {},
+  });
+  const base = {
+    url: "/api/v1/device-pairings/claim",
+    body: JSON.stringify({ deviceId: "d81c0f3b-9d3e-4dc8-b367-9709e3f3fe9c", deviceSecretHash: "a".repeat(64) }),
+    headers: { authorization: `Pairing um_pair_f50be1d0-5233-4e02-8f34-f7336d837d20.${"a".repeat(43)}` },
+  };
+  const cookie = await invoke(handler, {
+    ...base,
+    headers: { ...base.headers, cookie: "__Host-usage_monitor_session=opaque" },
+  });
+  assert.equal(cookie.status, 401);
+  assert.equal(cookie.json().error.code, "PAIRING_AUTH_INVALID");
+  const oversizedContinuity = await invoke(handler, {
+    ...base,
+    headers: { ...base.headers, "x-previous-device-authorization": "x".repeat(257) },
+  });
+  assert.equal(oversizedContinuity.status, 400);
+  assert.equal(oversizedContinuity.json().error.code, "PREVIOUS_DEVICE_AUTHORIZATION_INVALID");
+  assert.equal(backendCount, 0);
 });
 
 test("Google callback stays on the configured public callback origin and query material stays out of logs", async () => {
@@ -300,6 +393,7 @@ test("wrong methods, extra paths, and query parameters on POST routes never reac
     ["/api/v1/session", "GET"],
     ["/api/v1/logout", "POST"],
     ["/api/v1/me/device-pairings", "POST"],
+    ["/api/v1/device-pairings/claim", "POST"],
   ]) {
     const wrong = await invoke(handler, {
       method: method === "GET" ? "POST" : "GET",
@@ -316,6 +410,8 @@ test("wrong methods, extra paths, and query parameters on POST routes never reac
     "/api/v1/enroll?unexpected=1",
     "/api/v1/enroll?",
     "/api/v1/enroll/",
+    "/api/v1/device-pairings/claim?unexpected=1",
+    "/api/v1/device-pairings/claim/",
     "/api/v1/extra/../enroll",
     "/api/v1/%2e%2e/enroll",
   ]) {
@@ -346,6 +442,15 @@ test("spoofed origins and authorities are rejected while forwarded security head
     headers: { origin: "https://attacker.example" },
   });
   assert.equal(callbackSpoofedOrigin.status, 403);
+  const claimSpoofedOrigin = await invoke(handler, {
+    url: "/api/v1/device-pairings/claim",
+    body: JSON.stringify({ deviceId: "d81c0f3b-9d3e-4dc8-b367-9709e3f3fe9c", deviceSecretHash: "a".repeat(64) }),
+    headers: {
+      origin: "https://attacker.example",
+      authorization: `Pairing um_pair_f50be1d0-5233-4e02-8f34-f7336d837d20.${"a".repeat(43)}`,
+    },
+  });
+  assert.equal(claimSpoofedOrigin.status, 403);
   const spoofedHost = await invoke(handler, { host: "attacker.example" });
   assert.equal(spoofedHost.status, 421);
   const ignoredSpoofedForwarding = await invoke(handler, {
@@ -388,6 +493,15 @@ test("request and response bodies, unsupported content, and upstream redirects s
     body: "{}",
   });
   assert.equal(tooLargePairing.status, 413);
+  const tooLargeClaim = await invoke(handler, {
+    url: "/api/v1/device-pairings/claim",
+    headers: {
+      "content-length": "4097",
+      authorization: `Pairing um_pair_f50be1d0-5233-4e02-8f34-f7336d837d20.${"a".repeat(43)}`,
+    },
+    body: "{}",
+  });
+  assert.equal(tooLargeClaim.status, 413);
   const wrongContentType = await invoke(handler, {
     headers: { "content-type": "text/plain" }, body: "{}",
   });
@@ -408,7 +522,8 @@ test("route-specific response bounds and media types fail closed", async () => {
     fetchImpl: async (input, options) => {
       if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
       if (new URL(input).pathname === "/api/v1/session"
-          || new URL(input).pathname === "/api/v1/me/device-pairings") {
+          || new URL(input).pathname === "/api/v1/me/device-pairings"
+          || new URL(input).pathname === "/api/v1/device-pairings/claim") {
         return new Response("x".repeat(8 * 1_024 + 1), {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -434,6 +549,15 @@ test("route-specific response bounds and media types fail closed", async () => {
   });
   assert.equal(oversizedPairing.status, 502);
   assert.equal(oversizedPairing.json().error.code, "UPSTREAM_UNAVAILABLE");
+  const oversizedClaim = await invoke(handler, {
+    url: "/api/v1/device-pairings/claim",
+    body: JSON.stringify({ deviceId: "d81c0f3b-9d3e-4dc8-b367-9709e3f3fe9c", deviceSecretHash: "a".repeat(64) }),
+    headers: {
+      authorization: `Pairing um_pair_f50be1d0-5233-4e02-8f34-f7336d837d20.${"a".repeat(43)}`,
+    },
+  });
+  assert.equal(oversizedClaim.status, 502);
+  assert.equal(oversizedClaim.json().error.code, "UPSTREAM_UNAVAILABLE");
   const wrongMediaType = await invoke(handler, { url: "/api/v1/enroll", body: "{}" });
   assert.equal(wrongMediaType.status, 502);
   assert.equal(wrongMediaType.json().error.code, "UPSTREAM_UNAVAILABLE");

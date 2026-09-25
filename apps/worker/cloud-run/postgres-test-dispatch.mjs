@@ -14,6 +14,7 @@ const PARTICIPANT_DEVICE_REVOKE_PATH = "/api/v1/me/devices/revoke";
 const PERSONAL_SESSION_PATH = "/api/v1/session";
 const PERSONAL_LOGOUT_PATH = "/api/v1/logout";
 const PERSONAL_DEVICE_PAIRING_PATH = "/api/v1/me/device-pairings";
+const DEVICE_PAIRING_CLAIM_PATH = "/api/v1/device-pairings/claim";
 const COMMUNITY_DAILY_MAX_RANGE_DAYS = 366;
 const TELEMETRY_CONSENT_VERSION = "privacy-safe-telemetry-v0.1";
 const ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION = "privacy-safe-telemetry-v0.2";
@@ -835,6 +836,109 @@ export function createPostgresTestDevicePairingDispatch({
         throw storageUnavailable();
       }
       return json(201, pairing, { vary: "Cookie" });
+    } catch (error) {
+      if (Number.isSafeInteger(error?.status)
+          && typeof error?.code === "string" && /^[A-Z0-9_]+$/u.test(error.code)) {
+        return routeError(error, requestId);
+      }
+      return routeError(storageUnavailable(), requestId);
+    }
+  };
+}
+
+/** Private Cloud Run test route for claiming a social device pairing. */
+export function createPostgresTestDevicePairingClaimDispatch({
+  primaryPool,
+  ledgerPool,
+  schemaOptions,
+  claimPostgresDevicePairing,
+  healthDispatch,
+  readBoundedRequestBody,
+  maxRequestBytes,
+  privateOrigin,
+}) {
+  if (primaryPool === null || typeof primaryPool !== "object"
+      || typeof primaryPool.connect !== "function"
+      || ledgerPool === null || typeof ledgerPool !== "object"
+      || typeof ledgerPool.connect !== "function"
+      || primaryPool === ledgerPool
+      || typeof claimPostgresDevicePairing !== "function"
+      || typeof healthDispatch !== "function"
+      || typeof readBoundedRequestBody !== "function"
+      || !Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1) {
+    configurationError("POSTGRES_TEST_DEVICE_PAIRING_CLAIM_DISPATCH_CONFIGURATION_INVALID");
+  }
+  const schemas = validatedSchemas(schemaOptions);
+  if (!isAllowedPostgresTestOrigin(privateOrigin)) {
+    configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
+  }
+
+  return async function dispatchPostgresTestDevicePairingClaim(request) {
+    let url;
+    try { url = new URL(request.url); } catch {
+      return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
+    }
+    if (url.origin !== privateOrigin || url.pathname !== DEVICE_PAIRING_CLAIM_PATH) {
+      return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
+    }
+    const requestId = crypto.randomUUID();
+    if (request.method !== "POST") {
+      return routeError(personalDevicesRequestError(405, "METHOD_NOT_ALLOWED", {
+        allow: "POST",
+      }), requestId);
+    }
+
+    try {
+      const health = await healthDispatch(new Request(`${privateOrigin}/api/health`));
+      if (health?.status !== 200) throw storageUnavailable();
+      await assertPostgresUploadRegistrationEnabled(primaryPool, schemas.primary);
+      if (request.headers.has("cookie")) {
+        throw personalDevicesRequestError(401, "PAIRING_AUTH_INVALID");
+      }
+      const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+      if (contentType !== "application/json") {
+        throw personalDevicesRequestError(415, "CONTENT_TYPE_INVALID");
+      }
+      const declared = request.headers.get("content-length");
+      if (declared !== null) {
+        const length = Number(declared);
+        if (!Number.isSafeInteger(length) || length < 0) {
+          throw personalDevicesRequestError(400, "BODY_INVALID");
+        }
+        if (length > maxRequestBytes) {
+          throw personalDevicesRequestError(413, "BODY_TOO_LARGE");
+        }
+      }
+      const bytes = await readBoundedRequestBody(request, maxRequestBytes, PAIRING_BODY_READ_POLICY);
+      let body;
+      try {
+        body = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
+      } catch {
+        throw personalDevicesRequestError(400, "BODY_INVALID");
+      }
+      if (body === null || typeof body !== "object" || Array.isArray(body)
+          || Object.keys(body).length !== 2
+          || typeof body.deviceId !== "string"
+          || typeof body.deviceSecretHash !== "string") {
+        throw personalDevicesRequestError(400, "BODY_INVALID");
+      }
+      const result = await claimPostgresDevicePairing(
+        primaryPool,
+        ledgerPool,
+        request.headers.get("authorization"),
+        body.deviceId,
+        body.deviceSecretHash,
+        request.headers.get("x-previous-device-authorization"),
+        { schema: { primarySchema: schemas.primary, ledgerSchema: schemas.ledger } },
+      );
+      if (result === null || typeof result !== "object"
+          || typeof result.deviceId !== "string"
+          || result.state !== "active"
+          || result.scope !== "upload_registration"
+          || typeof result.expiresAt !== "string") {
+        throw storageUnavailable();
+      }
+      return json(201, result);
     } catch (error) {
       if (Number.isSafeInteger(error?.status)
           && typeof error?.code === "string" && /^[A-Z0-9_]+$/u.test(error.code)) {

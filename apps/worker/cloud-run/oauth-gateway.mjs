@@ -47,12 +47,22 @@ const ROUTES = new Map([
     sessionCookie: true, forwardAuthorization: false, forwardCsrf: true,
     originContract: "backend",
   })],
+  ["/api/v1/device-pairings/claim", Object.freeze({
+    id: "device_pairing_claim", method: "POST", body: "json", maxBodyBytes: 4_096,
+    responseTypes: ["application/json"], maxResponseBytes: 8 * 1_024,
+    sessionCookie: false, forwardCsrf: false, forwardPreviousDeviceAuthorization: true,
+    requirePairingAuthorization: true, allowMissingOrigin: true,
+    rejectCookie: true, cookieError: "PAIRING_AUTH_INVALID", cookieErrorStatus: 401,
+    originContract: "backend",
+  })],
 ]);
 const MAX_URL_LENGTH = 8_192;
 const BACKEND_TIMEOUT_MS = 30_000;
 const METADATA_TIMEOUT_MS = 3_000;
 const MAX_AUTHORIZATION_LENGTH = 8_192;
 const MAX_REQUEST_CSRF_LENGTH = 96;
+const MAX_PREVIOUS_DEVICE_AUTHORIZATION_LENGTH = 256;
+const PAIRING_AUTHORIZATION_PATTERN = /^Pairing um_pair_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/u;
 const CALLBACK_QUERY_HEADER = "x-tibotattle-google-callback-query";
 const SESSION_COOKIE_MEMBER = /^__Host-usage_monitor_session=[A-Za-z0-9_.-]{0,384}$/u;
 const JWT_PATTERN = /^[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}$/u;
@@ -198,6 +208,12 @@ function upstreamHeaders(request, publicOrigin, backendOrigin, route, url) {
   }
 
   const authorization = request.headers.authorization;
+  if (route.requirePairingAuthorization
+      && (typeof authorization !== "string" || !PAIRING_AUTHORIZATION_PATTERN.test(authorization))) {
+    const error = new Error("PAIRING_AUTH_INVALID");
+    error.status = 401;
+    throw error;
+  }
   if (route.forwardAuthorization !== false && authorization !== undefined) {
     if (typeof authorization !== "string" || authorization.length > MAX_AUTHORIZATION_LENGTH
         || /[\r\n]/u.test(authorization)) {
@@ -208,6 +224,11 @@ function upstreamHeaders(request, publicOrigin, backendOrigin, route, url) {
     result.set("authorization", authorization);
   }
   const cookie = request.headers.cookie;
+  if (route.rejectCookie && cookie !== undefined) {
+    const error = new Error(route.cookieError ?? "COOKIE_INVALID");
+    error.status = route.cookieErrorStatus ?? 400;
+    throw error;
+  }
   if (route.sessionCookie && cookie !== undefined) {
     if (typeof cookie !== "string" || !SESSION_COOKIE_MEMBER.test(cookie)) {
       const error = new Error("COOKIE_INVALID");
@@ -224,6 +245,17 @@ function upstreamHeaders(request, publicOrigin, backendOrigin, route, url) {
       throw error;
     }
     result.set("x-usage-monitor-csrf", csrf);
+  }
+  const previousDeviceAuthorization = request.headers["x-previous-device-authorization"];
+  if (route.forwardPreviousDeviceAuthorization && previousDeviceAuthorization !== undefined) {
+    if (typeof previousDeviceAuthorization !== "string"
+        || previousDeviceAuthorization.length > MAX_PREVIOUS_DEVICE_AUTHORIZATION_LENGTH
+        || /[\r\n]/u.test(previousDeviceAuthorization)) {
+      const error = new Error("PREVIOUS_DEVICE_AUTHORIZATION_INVALID");
+      error.status = 400;
+      throw error;
+    }
+    result.set("x-previous-device-authorization", previousDeviceAuthorization);
   }
   return result;
 }
@@ -365,7 +397,9 @@ export function createOauthGatewayHandler({
       return;
     }
     const origin = request.headers.origin;
-    if ((route.method === "POST" && origin !== configuration.publicOrigin)
+    const allowedOrigin = origin === configuration.publicOrigin
+      || (route.allowMissingOrigin === true && origin === undefined);
+    if ((route.method === "POST" && !allowedOrigin)
         || (origin !== undefined && origin !== configuration.publicOrigin)) {
       finish(route.id, safeError(403, "CSRF_INVALID"));
       return;
