@@ -42,7 +42,7 @@ test("0026 preserves legacy winner bytes and admits a distinct current day repre
     await client.query(`CREATE SCHEMA "${schema}"`);
     await client.query(`SET LOCAL search_path TO "${schema}", pg_catalog`);
     const migrations = await readPostgresMigrations({ role: "primary" });
-    assert.equal(migrations.length, 37);
+    assert.equal(migrations.length, 38);
     assert.equal(migrations[25].name, "0026_v12_domain_days_and_input_revision.sql");
     assert.equal(migrations[26].name, "0027_typed_v12_published_delete_guard.sql");
     assert.equal(migrations[27].name, "0028_typed_v12_ready_integrity_guard.sql");
@@ -51,6 +51,7 @@ test("0026 preserves legacy winner bytes and admits a distinct current day repre
     assert.equal(migrations[34].name, "0035_v12_ready_manifest_retention.sql");
     assert.equal(migrations[35].name, "0036_streamed_publication_proofs.sql");
     assert.equal(migrations[36].name, "0037_community_daily_publications.sql");
+    assert.equal(migrations[37].name, "0038_analytics_event_tuple_versions.sql");
     for (const migration of migrations.slice(0, 25)) await client.query(migration.sql);
 
     const now = "2026-09-24T12:00:00.000Z";
