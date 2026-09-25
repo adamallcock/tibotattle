@@ -79,7 +79,7 @@ function makeState({ poststate = false } = {}) {
       completed_at_utc: poststate ? null : `2026-09-25T00:00:${String(index).padStart(2, "0")}.000000Z`,
     };
   });
-  const receipts = jobs.map((job) => ({
+  const matchingReceipts = jobs.map((job) => ({
     participant_digest: job.participant_digest,
     operation_id: stableOperationId(job.participant_digest),
     outcome: "completed",
@@ -91,7 +91,7 @@ function makeState({ poststate = false } = {}) {
     }),
     has_completion_time: true,
   }));
-  return { jobs, receipts, updated: 0, rollbackCount: 0, unlockCount: 0 };
+  return { jobs, receipts: [], matchingReceipts, updated: 0, rollbackCount: 0, unlockCount: 0 };
 }
 
 function result(rows) {
@@ -260,7 +260,7 @@ test("exact 15-row test-only prestate is reopened without creating proof or dele
   assert.equal(receipt.jobsReopened, JOB_COUNT);
   assert.equal(receipt.jobsPendingUnverified, JOB_COUNT);
   assert.equal(receipt.tombstoneParentsPreserved, JOB_COUNT);
-  assert.equal(receipt.syntheticOwnersProven, JOB_COUNT);
+  assert.equal(receipt.ownerCompletionReceiptsMatched, 0);
   assert.equal(receipt.sourceIdNamespaceMatches, JOB_COUNT);
   assert.match(receipt.prestateSha256, /^[0-9a-f]{64}$/u);
   assert.match(receipt.poststateSha256, /^[0-9a-f]{64}$/u);
@@ -315,7 +315,7 @@ test("an exact poststate replay is idempotent and produces equal before/after di
   assert.equal(state.updated, 0);
 });
 
-test("wrong checksum, source pin, missing synthetic provenance, row drift, and metadata violations fail closed", async (t) => {
+test("wrong checksum, source pin, unexpected owner proof, row drift, and metadata violations fail closed", async (t) => {
   const cases = [
     ["migration checksum drift", () => reconcile(makeState(), { badReceipt: true }),
       "POSTGRES_TEST_LEDGER_RECONCILE_MIGRATION_RECEIPTS_INVALID"],
@@ -323,9 +323,9 @@ test("wrong checksum, source pin, missing synthetic provenance, row drift, and m
       "POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID"],
     ["multiple ledger namespaces", () => reconcile(makeState(), { multipleNamespaces: true }),
       "POSTGRES_TEST_LEDGER_RECONCILE_SOURCE_PIN_INVALID"],
-    ["synthetic owner receipt missing", () => {
+    ["unexpected synthetic owner completion receipt", () => {
       const state = makeState();
-      state.receipts.pop();
+      state.receipts.push(state.matchingReceipts[0]);
       return reconcile(state);
     }, "POSTGRES_TEST_LEDGER_RECONCILE_SYNTHETIC_COHORT_INVALID"],
     ["job count drift", () => {
@@ -342,7 +342,7 @@ test("wrong checksum, source pin, missing synthetic provenance, row drift, and m
       await assert.rejects(prepared.promise, (error) => {
         assert.equal(error?.code, code);
         if (name === "migration checksum drift") assert.equal(error.safeCounts?.migrationReceiptsMatched, 4);
-        if (name === "synthetic owner receipt missing") assert.equal(error.safeCounts?.syntheticReceiptMatches, 14);
+        if (name === "unexpected synthetic owner completion receipt") assert.equal(error.safeCounts?.syntheticReceiptMatches, 1);
         if (name === "job count drift") assert.equal(error.safeCounts?.jobsTotal, 14);
         return true;
       });

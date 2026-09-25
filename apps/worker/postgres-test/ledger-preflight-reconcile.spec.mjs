@@ -14,14 +14,6 @@ const PG_TEST_USER = process.env.PG_TEST_USER ?? "postgres";
 const PG_TEST_PASSWORD = process.env.PG_TEST_PASSWORD ?? "synthetic-local-only";
 const PG_TEST_DATABASE = process.env.PG_TEST_DATABASE ?? "postgres";
 
-function stableOperationId(participantDigest) {
-  const source = participantDigest.slice(0, 32).split("");
-  source[12] = "4";
-  source[16] = ((Number.parseInt(source[16], 16) & 0x3) | 0x8).toString(16);
-  const hex = source.join("");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
-
 async function localSocket() {
   assert.match(PG_TEST_SOCKET ?? "", /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u);
   const { lstat, realpath, stat } = await import("node:fs/promises");
@@ -92,15 +84,6 @@ test("PG17 inspect is read-only and exact candidate reopens 15 jobs for ledger m
         (participant_digest,source_id,owner_digest,source_namespace,state,terminal_json,attempted_ms,completed_at)
         VALUES($1,'synthetic:reconcile-test',$2,'synthetic-reconcile-namespace','complete',NULL,$3,$4)`,
       [row.participant, row.owner, row.attempted, row.completedAt]);
-      await pool.query(`INSERT INTO "${ledgerSchema}".participant_erasure_receipts
-        (operation_id,participant_digest,outcome,details_json,created_at,completed_at)
-        VALUES($1,$2,'completed',$3,'2026-09-01T00:00:00Z','2026-09-01T00:00:01Z')`,
-      [stableOperationId(row.participant), row.participant, JSON.stringify({
-        schemaVersion: "postgres-synthetic-owner-erasure-v1",
-        phase: "completed",
-        ownerDigest: row.owner,
-        objectCount: 0,
-      })]);
     }
     const primaryPool = new pg.Pool({ ...socket, user: PG_TEST_USER, password: PG_TEST_PASSWORD,
       database: PG_TEST_DATABASE, ssl: false, max: 1, connectionTimeoutMillis: 5_000 });
@@ -127,7 +110,7 @@ test("PG17 inspect is read-only and exact candidate reopens 15 jobs for ledger m
       assert.equal(inspection.mode, "prestate_qualified");
       assert.equal(inspection.jobsThatWouldReopen, 15);
       assert.equal(inspection.sourceIdNamespaceMatches, 15);
-      assert.equal(inspection.syntheticOwnersProven, 15);
+      assert.equal(inspection.ownerCompletionReceiptsMatched, 0);
       assert.equal(inspection.sourcePinSha256, expectedSourcePinSha256);
       const unchanged = await pool.query(`SELECT count(*) FILTER (WHERE state='complete' AND terminal_json IS NULL)::int AS complete,
         count(*)::int AS total FROM "${ledgerSchema}".storage_erasure_jobs`);

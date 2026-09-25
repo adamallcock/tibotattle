@@ -317,9 +317,12 @@ function countSyntheticReceiptMatches(jobRows, receiptRows) {
   return matches;
 }
 
-function assertSyntheticCohortMatched(jobRows, receiptRows) {
+function assertLegacyCohortHasNoOwnerCompletionProof(jobRows, receiptRows) {
   const matches = countSyntheticReceiptMatches(jobRows, receiptRows);
-  if (matches !== EXPECTED_UNPROVEN_JOB_COUNT || jobRows.length !== EXPECTED_UNPROVEN_JOB_COUNT) {
+  // The named test ledger has no synthetic v1.2 owner-erasure receipt for these
+  // unproven jobs. A matching receipt changes the provenance question; stop rather
+  // than silently treating a proven and an unproven job as the same cohort.
+  if (matches !== 0 || jobRows.length !== EXPECTED_UNPROVEN_JOB_COUNT) {
     fail("POSTGRES_TEST_LEDGER_RECONCILE_SYNTHETIC_COHORT_INVALID", {
       jobsTotal: jobRows.length,
       syntheticReceiptMatches: matches,
@@ -439,7 +442,7 @@ function buildReceipt({ actionMode, resultMode, beforeRows, afterRows, sourcePin
     mode: resultMode,
     action: actionMode,
     migrationReceiptsVerified: EXPECTED_MIGRATION_RECEIPTS_BEFORE,
-    syntheticOwnersProven: syntheticReceiptMatches,
+    ownerCompletionReceiptsMatched: syntheticReceiptMatches,
     sourceIdNamespaceMatches: EXPECTED_UNPROVEN_JOB_COUNT,
     jobsBefore: beforeRows.length,
     jobsAfter: afterRows.length,
@@ -569,7 +572,7 @@ export async function reconcileUnprovenCompleteLedgerJobs({
       "POSTGRES_TEST_LEDGER_RECONCILE_READBACK_INVALID");
     const syntheticReceipts = rowsFrom(await client.query(SYNTHETIC_RECEIPTS_SQL(ledger)),
       "POSTGRES_TEST_LEDGER_RECONCILE_SYNTHETIC_COHORT_INVALID");
-    const syntheticReceiptMatches = assertSyntheticCohortMatched(initialJobs, syntheticReceipts);
+    const syntheticReceiptMatches = assertLegacyCohortHasNoOwnerCompletionProof(initialJobs, syntheticReceipts);
 
     const preflightRows = rowsFrom(await client.query(JOB_PREFLIGHT_SQL(ledger)),
       "POSTGRES_TEST_LEDGER_RECONCILE_PREFLIGHT_FAILED");
@@ -668,7 +671,7 @@ export async function reconcileUnprovenCompleteLedgerJobs({
     if (receipt.prestateSha256 !== prestateSha256) {
       fail("POSTGRES_TEST_LEDGER_RECONCILE_READBACK_INVALID");
     }
-    if (receipt.syntheticOwnersProven !== syntheticReceiptMatches) {
+    if (receipt.ownerCompletionReceiptsMatched !== syntheticReceiptMatches) {
       fail("POSTGRES_TEST_LEDGER_RECONCILE_SYNTHETIC_COHORT_INVALID");
     }
     await client.query("COMMIT");
