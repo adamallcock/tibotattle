@@ -57,6 +57,12 @@ import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from 
 import { activateTelemetryV12Domain, createTelemetryV12DomainPredecessor } from "../src/telemetry-v12-domain";
 import { readEffectiveUsageOwnerDayPage } from "../src/telemetry-usage-effective-reader";
 import { initializeStorageSource } from "../src/analytics-delivery";
+import { readAdminOverview } from "../src/admin-operations";
+import { captureStorageAdminMetricSnapshot, readCachedStorageAdminMetricsHistory, warmStorageAdminMetricsHistoryCache } from "../src/admin-metrics-history";
+import { QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS } from "../src/constants";
+import { reconcilePendingQuarantineObjects, registerPendingQuarantineObject } from "../src/quarantine-reconciliation";
+import { readStorageAdminOverview } from "../src/storage-admin-overview";
+import { initializeStorageAnalyticsRuntime } from "../src/storage-analytics-runtime";
 import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../src/typed-v11-admission";
 import { initializeTypedV1Admission, insertTypedTelemetryV1Chunk } from "../src/typed-v1-admission";
 import { parseTelemetryV1Chunk } from "../src/telemetry-v1";
@@ -70,6 +76,8 @@ interface TestBindings extends Env {
   TEST_TYPED_V11_ADMISSION_MIGRATIONS: D1Migration[];
   TEST_TYPED_V1_ADMISSION_MIGRATIONS: D1Migration[];
   TEST_INGESTION_ISOLATION_MIGRATIONS: D1Migration[];
+  TEST_ANALYTICS_MIGRATIONS: D1Migration[];
+  STORAGE_ANALYTICS_DB: D1Database;
 }
 const bindings = () => env as TestBindings;
 const db = () => bindings().USAGE_MONITOR_DB;
@@ -191,7 +199,7 @@ async function persistMixedV12Day(
   });
   await persistTelemetryV12StagedChunk(db(), fixture, chunk, {
     chunkRowId: `chunk:${crypto.randomUUID()}`,
-    r2Key: `synthetic/mixed-v12-${crypto.randomUUID()}`, envelopeDigest,
+    r2Key: `telemetry/mixed-v12-${crypto.randomUUID()}`, envelopeDigest,
     deviceUploadAuthorizationId: claimed.authorizationId,
   }, nowEpoch);
   return { ...candidate, manifest };
@@ -219,6 +227,38 @@ beforeEach(async () => {
 });
 
 describe("staged v1.2 successor transport", () => {
+  it("counts an accepted staged v1.2 upload without claiming it is selected", async () => {
+    const sourceNamespace = "synthetic-staged-v12-admin";
+    const sourceId = "synthetic-staged-v12-source";
+    await initializeStorageSource(db(), sourceId);
+    await initializeTypedV1Admission(db(), sourceNamespace);
+    await initializeTypedV11Admission(db(), sourceNamespace);
+    await db().prepare("UPDATE telemetry_v12_runtime SET state='active' WHERE id=1").run();
+    const fixture = await createV11DeviceFixture(db(), { nowEpoch: MIXED_CLIENT_NOW_EPOCH });
+    await grantTelemetryV12Consent(db(), fixture, telemetryV12RequiredConsent(), MIXED_CLIENT_NOW_EPOCH);
+    await persistMixedV12Day(fixture, [mixedV12UsageRecord(`event:v2:${"a".repeat(64)}`, 1000, 75)], MIXED_CLIENT_NOW_EPOCH);
+    const target = bindings().STORAGE_ANALYTICS_DB;
+    await applyD1Migrations(target, bindings().TEST_ANALYTICS_MIGRATIONS);
+    const storage = { source: db(), target, sourceId, sourceNamespace };
+    await initializeStorageAnalyticsRuntime(storage);
+    const overview = await readStorageAdminOverview(storage, MIXED_CLIENT_NOW_EPOCH + 1_000);
+    expect(overview.contributions).toMatchObject({
+      contributingAccounts: { total: 1 },
+      incrementalChunks: { total: 1, current: 0, acceptedLast24Hours: 1 },
+      storedTelemetryRecords: 1,
+    });
+    expect(await captureStorageAdminMetricSnapshot(storage, MIXED_CLIENT_NOW_EPOCH + 1_000))
+      .toEqual({ code: "SNAPSHOT_CAPTURED" });
+    expect(await warmStorageAdminMetricsHistoryCache(storage, MIXED_CLIENT_NOW_EPOCH + 1_000))
+      .toEqual({ code: "HISTORY_CACHE_REFRESHED" });
+    const history = await readCachedStorageAdminMetricsHistory(storage, MIXED_CLIENT_NOW_EPOCH + 2_000);
+    expect(history.events.uploadedChunks.total).toBe(1);
+    expect(history.events.uploadingParticipants.total).toBe(1);
+    expect(history.gauges.snapshots.at(-1)?.metrics).toMatchObject({
+      corpusChunks: 1, corpusCurrentChunks: 0, corpusCurrentRecords: 0,
+    });
+  });
+
   it("advertises a separate staged capability without changing the frozen legacy dictionary", async () => {
     const fixture = await createV11DeviceFixture(db());
     const capabilities = await telemetryTransportV12Capabilities(db(), fixture, "https://example.test");
@@ -721,6 +761,61 @@ describe("staged v1.2 successor transport", () => {
     expect(page.rows.find((row) => row.occurrenceId === lateOldId)).toMatchObject({
       status: "compatible", sourceCount: 1, sourceFormats: ["v1"],
     });
+
+    const v12Chunk = await db().prepare(
+      "SELECT id,r2_key FROM telemetry_v12_chunks LIMIT 1",
+    ).first<{ id: string; r2_key: string }>();
+    expect(v12Chunk).not.toBeNull();
+    await bindings().QUARANTINE.put(v12Chunk!.r2_key, "synthetic-encrypted-object");
+    await registerPendingQuarantineObject(db(), {
+      contributionId: v12Chunk!.id, objectKind: "telemetry", r2Key: v12Chunk!.r2_key,
+      registeredAt: new Date(MIXED_CLIENT_NOW_EPOCH - QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS - 1_000).toISOString(),
+    });
+
+    const target = bindings().STORAGE_ANALYTICS_DB;
+    await applyD1Migrations(target, bindings().TEST_ANALYTICS_MIGRATIONS);
+    await applyD1Migrations(bindings().DELETION_LEDGER, bindings().TEST_DELETION_LEDGER_MIGRATIONS);
+    const storage = {
+      source: db(), target, sourceId: "synthetic-mixed-client-journal", sourceNamespace,
+    };
+    await initializeStorageAnalyticsRuntime(storage);
+    const overview = await readStorageAdminOverview(storage, MIXED_CLIENT_NOW_EPOCH + 1_000);
+    expect(overview.contributions).toMatchObject({
+      contributingAccounts: { total: 1 },
+      incrementalChunks: { total: 4, acceptedLast24Hours: 4 },
+      acceptedLast24Hours: 4,
+      storedTelemetryRecords: 6,
+    });
+    const selectedBeforeV12 = await db().prepare(
+      `SELECT COUNT(*) AS chunks, COALESCE(SUM(accepted_record_count),0) AS records
+         FROM telemetry_analytical_chunks`,
+    ).first<{ chunks: number; records: number }>();
+    expect(overview.contributions.incrementalChunks.current)
+      .toBe((selectedBeforeV12?.chunks ?? 0) + 1);
+    expect(await readAdminOverview(db(), bindings().DELETION_LEDGER, {
+      environment: "synthetic-development", enrollmentMode: "open",
+      accountScopedIngestMode: "disabled", storage,
+      nowEpoch: MIXED_CLIENT_NOW_EPOCH + 1_000,
+    })).toMatchObject({
+      quarantine: { dueReferenced: 1, dueUnreferenced: 0 },
+    });
+    expect(await captureStorageAdminMetricSnapshot(storage, MIXED_CLIENT_NOW_EPOCH + 1_000))
+      .toEqual({ code: "SNAPSHOT_CAPTURED" });
+    expect(await warmStorageAdminMetricsHistoryCache(storage, MIXED_CLIENT_NOW_EPOCH + 1_000))
+      .toEqual({ code: "HISTORY_CACHE_REFRESHED" });
+    const history = await readCachedStorageAdminMetricsHistory(storage, MIXED_CLIENT_NOW_EPOCH + 2_000);
+    expect(history.events.uploadedChunks.total).toBe(4);
+    expect(history.events.uploadedRecords.total).toBe(6);
+    expect(history.events.uploadingParticipants.total).toBe(1);
+    expect(history.gauges.snapshots.at(-1)?.metrics).toMatchObject({
+      corpusChunks: 4,
+      corpusCurrentChunks: (selectedBeforeV12?.chunks ?? 0) + 1,
+      corpusCurrentRecords: (selectedBeforeV12?.records ?? 0) + 2,
+      contributingAccountsTotal: 1, quarantineDueReferenced: 1,
+    });
+    expect(await reconcilePendingQuarantineObjects(db(), bindings().QUARANTINE, MIXED_CLIENT_NOW_EPOCH))
+      .toMatchObject({ registrationsExamined: 1, referencedObjectsPreserved: 1, orphanObjectsDeleted: 0 });
+    expect(await bindings().QUARANTINE.head(v12Chunk!.r2_key)).not.toBeNull();
   });
 });
 

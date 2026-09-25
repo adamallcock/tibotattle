@@ -369,6 +369,18 @@ beforeEach(async () => {
 });
 
 describe("quarantine crash reconciliation", () => {
+  it("preserves objects when the v1.2 schema is only partly present", async () => {
+    const object = registration("partial-v12-schema");
+    const database = bindings().USAGE_MONITOR_DB;
+    await putTrackedQuarantineObject(database, bindings().QUARANTINE, object, "{}");
+    await database.prepare("CREATE TABLE telemetry_v12_runtime (id INTEGER PRIMARY KEY)").run();
+    await expect(reconcilePendingQuarantineObjects(
+      database, bindings().QUARANTINE, RECONCILIATION_NOW,
+    )).rejects.toMatchObject({ status: 503, code: "BACKEND_STORAGE_UNAVAILABLE" });
+    expect(await pendingCount()).toBe(1);
+    expect(await bindings().QUARANTINE.head(object.r2Key)).not.toBeNull();
+  });
+
   it("registers before put and recovers a put-before-D1 termination", async () => {
     const object = registration("put-before-d1");
     const baseBucket = bindings().QUARANTINE;

@@ -17,7 +17,7 @@ const ADMIN_READ_PATHS = [
 
 function metricsHistoryPayload() {
   return {
-    schemaVersion: "admin-metrics-history-v0.2",
+    schemaVersion: "admin-metrics-history-v0.3",
     generatedAt: "2026-09-07T12:00:00.000Z",
     events: Object.fromEntries([
       "participants", "webSessions", "devicePairings", "deviceCredentials", "deviceConsents",
