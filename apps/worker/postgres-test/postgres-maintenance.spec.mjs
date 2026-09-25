@@ -215,7 +215,15 @@ test("PostgreSQL scheduled slice purges expired identity state, fences orphan cl
     assert.equal(first.identityPurge.complete, true);
     assert.equal(first.objectReconciliation?.deletionGraceStarted, 1);
     assert.equal(first.objectReconciliationComplete, true);
-    assert.equal(first.deviceLifecycleComplete, false);
+    assert.equal(first.deviceLifecycleComplete, true);
+    assert.deepEqual(first.deviceLifecycle, {
+      pairingsRevoked: 0,
+      devicesRevoked: 0,
+      uploadsRevoked: 0,
+      rotationsPurged: 0,
+      pairingEventsPurged: 0,
+      complete: true,
+    });
     assert.equal(first.ownerErasureJobsComplete, false);
     assert.equal(first.restoreReplayComplete, false);
     assert.equal(first.telemetryRetentionComplete, false);

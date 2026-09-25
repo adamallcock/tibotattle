@@ -15,6 +15,10 @@ import {
   type PostgresSchemaOptions,
 } from "./postgres-client";
 import {
+  purgePostgresStaleDeviceLifecycleRows,
+  type PostgresDeviceLifecycleReceipt,
+} from "./postgres-device-lifecycle";
+import {
   reconcilePostgresPendingObjects,
   DEFAULT_POSTGRES_PENDING_OBJECT_SAFETY_WINDOW_MILLISECONDS,
   type PostgresPendingObjectReconciliationResult,
@@ -73,7 +77,8 @@ export interface PostgresScheduledMaintenanceResult {
   }>;
   readonly objectReconciliation: PostgresPendingObjectReconciliationResult | null;
   readonly objectReconciliationComplete: boolean;
-  readonly deviceLifecycleComplete: false;
+  readonly deviceLifecycle: PostgresDeviceLifecycleReceipt;
+  readonly deviceLifecycleComplete: boolean;
   readonly ownerErasureJobsComplete: false;
   readonly restoreReplayComplete: false;
   readonly telemetryRetentionComplete: false;
@@ -247,6 +252,14 @@ function baseResult(
   ledger: PostgresIdentityPurgeReceipt = Object.freeze({ purged: 0, complete: false }),
   objectReconciliation: PostgresPendingObjectReconciliationResult | null = null,
   objectReconciliationComplete = false,
+  deviceLifecycle: PostgresDeviceLifecycleReceipt = Object.freeze({
+    pairingsRevoked: 0,
+    devicesRevoked: 0,
+    uploadsRevoked: 0,
+    rotationsPurged: 0,
+    pairingEventsPurged: 0,
+    complete: false,
+  }),
 ): PostgresScheduledMaintenanceResult {
   return Object.freeze({
     outcome,
@@ -256,7 +269,8 @@ function baseResult(
     identityPurge: Object.freeze({ primary, ledger, complete: primary.complete && ledger.complete }),
     objectReconciliation,
     objectReconciliationComplete,
-    deviceLifecycleComplete: false,
+    deviceLifecycle,
+    deviceLifecycleComplete: deviceLifecycle.complete,
     ownerErasureJobsComplete: false,
     restoreReplayComplete: false,
     telemetryRetentionComplete: false,
@@ -285,6 +299,14 @@ export async function runPostgresScheduledMaintenance(
   let primary: PostgresIdentityPurgeReceipt = Object.freeze({ purged: 0, complete: false });
   let ledger: PostgresIdentityPurgeReceipt = Object.freeze({ purged: 0, complete: false });
   let objectReconciliation: PostgresPendingObjectReconciliationResult | null = null;
+  let deviceLifecycle: PostgresDeviceLifecycleReceipt = Object.freeze({
+    pairingsRevoked: 0,
+    devicesRevoked: 0,
+    uploadsRevoked: 0,
+    rotationsPurged: 0,
+    pairingEventsPurged: 0,
+    complete: false,
+  });
   try {
     const locked = await withSessionLock(options.primaryPool, async () => {
       leaseAcquired = true;
@@ -305,6 +327,10 @@ export async function runPostgresScheduledMaintenance(
         complete: primaryHandoffs.complete && admission.complete,
       });
       ledger = await purgeSpecs(options.ledgerPool, schema.ledger, LEDGER_PURGES, cutoff);
+      deviceLifecycle = await purgePostgresStaleDeviceLifecycleRows(options.primaryPool, {
+        schema: options.schema,
+        nowEpoch,
+      });
       objectReconciliation = await reconcilePostgresPendingObjects(
         options.primaryPool,
         options.objectStore,
@@ -315,26 +341,32 @@ export async function runPostgresScheduledMaintenance(
           maximumRegistrations: POSTGRES_MAINTENANCE_OBJECT_PAGE_SIZE,
         },
       );
-      return Object.freeze({ primary, ledger, objectReconciliation });
+      return Object.freeze({ primary, ledger, deviceLifecycle, objectReconciliation });
     });
     if (!locked.acquired) {
       return baseResult("skipped", "MAINTENANCE_IN_PROGRESS", false);
     }
-    const { primary: completedPrimary, ledger: completedLedger, objectReconciliation: completedObjects } = locked.value;
+    const {
+      primary: completedPrimary,
+      ledger: completedLedger,
+      deviceLifecycle: completedDeviceLifecycle,
+      objectReconciliation: completedObjects,
+    } = locked.value;
     const reconciliationComplete = !completedObjects.hasMore
       && completedObjects.candidatesDeferred === 0;
     const identityComplete = completedPrimary.complete && completedLedger.complete;
-    const code = !identityComplete || !reconciliationComplete
+    const code = !identityComplete || !reconciliationComplete || !completedDeviceLifecycle.complete
       ? "POSTGRES_MAINTENANCE_BACKLOG"
       : "POSTGRES_MAINTENANCE_INCOMPLETE_UNSUPPORTED_PHASES";
     return baseResult("partial", code, true, completedPrimary, completedLedger,
-      completedObjects, reconciliationComplete);
+      completedObjects, reconciliationComplete, completedDeviceLifecycle);
   } catch (error) {
     const code = error instanceof PostgresStorageError
       ? "POSTGRES_MAINTENANCE_UNAVAILABLE"
       : error instanceof Error && error.name === "QuarantineObjectStorageUnavailableError"
         ? "QUARANTINE_OBJECT_STORAGE_UNAVAILABLE"
         : "POSTGRES_MAINTENANCE_UNAVAILABLE";
-    return baseResult("failure", code, leaseAcquired, primary, ledger, objectReconciliation, false);
+    return baseResult("failure", code, leaseAcquired, primary, ledger, objectReconciliation, false,
+      deviceLifecycle);
   }
 }
