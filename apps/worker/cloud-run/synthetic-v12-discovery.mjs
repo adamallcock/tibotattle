@@ -67,6 +67,16 @@ function fail(code) {
   throw Object.assign(new Error(code), { code });
 }
 
+function failFamilyCount(table, actual, bounds) {
+  const code = "POSTGRES_SYNTHETIC_DISCOVERY_FAMILY_INVALID";
+  if (!SCHEMA_PATTERN.test(table) || !Number.isSafeInteger(actual) || actual < 0
+      || !Array.isArray(bounds) || bounds.length !== 2) fail(code);
+  throw Object.assign(new Error(code), {
+    code,
+    safeFamily: Object.freeze({ table, actual, expectedMinimum: bounds[0], expectedMaximum: bounds[1] }),
+  });
+}
+
 function preserveDiscoveryError(error) {
   return error instanceof Error
       && error.message === error.code
@@ -284,7 +294,7 @@ async function readParticipantFamily(client, schema, participantId) {
       ? ALLOWED_PARTICIPANT_TABLES[row.table_name]
       : [0, 0];
     if (count < bounds[0] || count > bounds[1]) {
-      fail("POSTGRES_SYNTHETIC_DISCOVERY_FAMILY_INVALID");
+      failFamilyCount(row.table_name, count, bounds);
     }
   }
 }
@@ -572,6 +582,8 @@ async function main() {
       schemaVersion: "synthetic-v12-owner-discovery-v1",
       status: "error",
       code: safeCode(error),
+      ...(error?.code === "POSTGRES_SYNTHETIC_DISCOVERY_FAMILY_INVALID"
+        && error?.safeFamily ? { safeFamily: error.safeFamily } : {}),
     }));
     process.exitCode = 1;
   }

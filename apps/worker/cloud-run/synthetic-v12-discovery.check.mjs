@@ -115,6 +115,7 @@ function fakePrimaryPool({
   fixtures = [participantFixture()],
   unattributableCount = 0,
   consumingCount = 0,
+  familyCountOverrides = {},
   migrationRows = fakeManifest().roles.primary,
 } = {}) {
   const statements = [];
@@ -155,7 +156,9 @@ function fakePrimaryPool({
             return {
               rows: TABLES.map((table_name) => ({
                 table_name,
-                row_count: table_name === "device_upload_authorizations" ? "2"
+                row_count: Object.hasOwn(familyCountOverrides, table_name)
+                  ? String(familyCountOverrides[table_name])
+                  : table_name === "device_upload_authorizations" ? "2"
                   : ["web_sessions", "device_pairings", "device_credentials",
                     "telemetry_v12_device_capabilities", "storage_v11_owner_links",
                     "telemetry_v12_day_manifests", "telemetry_v12_chunks",
@@ -266,6 +269,22 @@ test("primary discovery uses read-only SQL and returns only exact synthetic ids 
   assert.equal(pool.statements[0].sql, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
   assert.equal(pool.statements.at(-1).sql, "COMMIT");
   assert.equal(pool.statements.some(({ sql }) => /\b(?:INSERT|UPDATE|DELETE|TRUNCATE|ALTER|DROP)\b/iu.test(sql)), false);
+});
+
+test("family refusal reports only a catalog table and bounded aggregate count", async () => {
+  const fixture = participantFixture();
+  fixture.pending.object_key = fixture.chunk.r2_key;
+  await assert.rejects(readSyntheticV12PrimarySnapshot(fakePrimaryPool({
+    fixtures: [fixture],
+    familyCountOverrides: { device_credentials: 2 },
+  }), "tibotattle", fakeManifest().roles.primary), (error) => {
+    assert.equal(error?.code, "POSTGRES_SYNTHETIC_DISCOVERY_FAMILY_INVALID");
+    assert.deepEqual(error?.safeFamily, {
+      table: "device_credentials", actual: 2, expectedMinimum: 1, expectedMaximum: 1,
+    });
+    assert.doesNotMatch(JSON.stringify(error.safeFamily), /synthetic-v12-smoke-|telemetry\/v12-/u);
+    return true;
+  });
 });
 
 test("tagged malformed ids, shared object keys, pending mismatches and unattributable refs fail closed", async (t) => {
