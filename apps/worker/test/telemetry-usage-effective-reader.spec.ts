@@ -33,9 +33,10 @@ beforeEach(async () => {
   await applyD1Migrations(db(), bindings.TEST_TYPED_V11_ADMISSION_MIGRATIONS);
   await applyD1Migrations(db(), bindings.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
   // v1.2 transport migration is being qualified separately; this reader is
-  // intentionally exercised against the frozen v1/v1.1 tables plus 0006.
+  // intentionally exercised against the frozen v1/v1.1 tables plus 0006. The
+  // successor's own follow-up migrations depend on 0008 and stay out too.
   await applyD1Migrations(db(), bindings.TEST_INGESTION_ISOLATION_MIGRATIONS
-    .filter((migration) => !migration.name.startsWith("0008_")));
+    .filter((migration) => !/^(0008|0010)_/u.test(migration.name)));
   await initializeStorageSource(db(), "synthetic-effective-usage-journal");
   await initializeTypedV1Admission(db(), sourceNamespace);
 });

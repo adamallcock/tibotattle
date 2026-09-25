@@ -73,7 +73,11 @@ requires the same secret, active installation/owner/device/authorization graph,
 and unchanged policy. It renews within the final seven days or after an offline
 period, keeping the same identities and accepted upload history. Ordinary
 enrollment replay does not renew. Lost responses converge on the existing
-renewed lease, without consuming another installation slot.
+renewed lease, without consuming another installation slot. The optional v1.2
+successor grant belongs to the same lease: renewal extends it with the rest of
+the graph (ingestion-isolation migration `0010`, 2026-09-25), and a grant that
+a renewal left behind is reported as not current and caught up by the next
+successor authorization request instead of silently blocking v1.2 uploads.
 
 Revocation, erasure, containment, conflicting identities and policy mismatches
 remain terminal. Renewal never clears a local opt-out, recreates an erased
