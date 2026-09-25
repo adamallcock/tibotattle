@@ -52,7 +52,7 @@ const OBJECT_KEY = `synthetic/${CHUNK_ID}`;
 const OCCURRENCE_ID = `event:v2:${"a".repeat(64)}`;
 const BASELINE_CONTROLS = Object.freeze({
   singleton: 1,
-  revision: 15,
+  revision: 2,
   control_state: "degraded",
   enrollment_enabled: false,
   upload_registration_enabled: true,
@@ -62,14 +62,14 @@ const BASELINE_CONTROLS = Object.freeze({
 });
 const ACTIVE_CONTROLS = Object.freeze({
   ...BASELINE_CONTROLS,
-  revision: 16,
+  revision: 3,
   control_state: "operational",
   publication_enabled: true,
   reason_code: "synthetic_daily_publication_test",
 });
 const RESTORED_CONTROLS = Object.freeze({
   ...BASELINE_CONTROLS,
-  revision: 17,
+  revision: 4,
 });
 
 function fail(code) {
@@ -443,11 +443,11 @@ async function activatePublicationControls(client, schema) {
   try {
     result = await client.query(
       `UPDATE ${schema}.collection_controls
-          SET revision=16,control_state='operational',enrollment_enabled=false,
+          SET revision=3,control_state='operational',enrollment_enabled=false,
               upload_registration_enabled=true,processing_enabled=true,
               publication_enabled=true,reason_code='synthetic_daily_publication_test',
               updated_at=clock_timestamp()
-        WHERE singleton=1 AND revision=15 AND control_state='degraded'
+        WHERE singleton=1 AND revision=2 AND control_state='degraded'
           AND enrollment_enabled=false AND upload_registration_enabled=true
           AND processing_enabled=true AND publication_enabled=false
           AND reason_code='synthetic_v12_test_upload_only'
@@ -550,7 +550,7 @@ async function prepareTransaction(client, config, migrations) {
       project: config.project,
       schema: config.schema,
       day: config.day,
-      collectionControlsRevision: 16,
+      collectionControlsRevision: 3,
       fixture: "one_content_free_social_v1_usage_event",
     });
   } catch (error) {
@@ -582,11 +582,11 @@ async function restoreTransaction(client, config, migrations) {
       try {
         updated = await client.query(
           `UPDATE ${schema}.collection_controls
-              SET revision=17,control_state='degraded',enrollment_enabled=false,
+              SET revision=4,control_state='degraded',enrollment_enabled=false,
                   upload_registration_enabled=true,processing_enabled=true,
                   publication_enabled=false,reason_code='synthetic_v12_test_upload_only',
                   updated_at=clock_timestamp()
-            WHERE singleton=1 AND revision=16 AND control_state='operational'
+            WHERE singleton=1 AND revision=3 AND control_state='operational'
               AND enrollment_enabled=false AND upload_registration_enabled=true
               AND processing_enabled=true AND publication_enabled=true
               AND reason_code='synthetic_daily_publication_test'
@@ -609,7 +609,7 @@ async function restoreTransaction(client, config, migrations) {
       status,
       project: config.project,
       schema: config.schema,
-      collectionControlsRevision: 17,
+      collectionControlsRevision: 4,
       publicationEnabled: false,
       enrollmentEnabled: false,
       fixtureRetained: true,

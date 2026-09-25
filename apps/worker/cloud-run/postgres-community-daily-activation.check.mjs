@@ -26,7 +26,7 @@ import {
 
 const BASELINE = Object.freeze({
   singleton: 1,
-  revision: 15,
+  revision: 2,
   control_state: "degraded",
   enrollment_enabled: false,
   upload_registration_enabled: true,
@@ -36,12 +36,12 @@ const BASELINE = Object.freeze({
 });
 const ACTIVE = Object.freeze({
   ...BASELINE,
-  revision: 16,
+  revision: 3,
   control_state: "operational",
   publication_enabled: true,
   reason_code: "synthetic_daily_publication_test",
 });
-const RESTORED = Object.freeze({ ...BASELINE, revision: 17 });
+const RESTORED = Object.freeze({ ...BASELINE, revision: 4 });
 const OCCURRENCE_ID = `event:v2:${"a".repeat(64)}`;
 const REAL_PG_HOST = process.env.A2_DAILY_ACTIVATION_TEST_HOST;
 const REAL_PG_PORT = Number(process.env.A2_DAILY_ACTIVATION_TEST_PORT);
@@ -189,12 +189,12 @@ function harness({
         return { rows: [], rowCount: 1 };
       }
       if (sql.includes("UPDATE \"tibotattle_v12_a2_20260925\".collection_controls")
-          && sql.includes("SET revision=16")) {
+          && sql.includes("SET revision=3")) {
         state.controls = structuredClone(ACTIVE);
         return { rows: [{ singleton: 1 }], rowCount: 1 };
       }
       if (sql.includes("UPDATE \"tibotattle_v12_a2_20260925\".collection_controls")
-          && sql.includes("SET revision=17")) {
+          && sql.includes("SET revision=4")) {
         state.controls = structuredClone(RESTORED);
         return { rows: [{ singleton: 1 }], rowCount: 1 };
       }
@@ -257,7 +257,7 @@ test("activation jobs accept only the pinned one-task A2 runtime identity and on
   ), /SERVICE_ACCOUNT_INVALID/);
 });
 
-test("prepare inserts the reviewed content-free fixture and opens only revision 16 in one transaction", async () => {
+test("prepare inserts the reviewed content-free fixture and opens only revision 3 in one transaction", async () => {
   const h = harness();
   const receipt = await preparePostgresCommunityDailyTestActivation({
     env: validEnv("prepare"), dependencies: h.dependencies,
@@ -268,7 +268,7 @@ test("prepare inserts the reviewed content-free fixture and opens only revision 
     project: "tibotattle",
     schema: POSTGRES_COMMUNITY_DAILY_ACTIVATION_TARGET.schema,
     day: POSTGRES_COMMUNITY_DAILY_ACTIVATION_DAY,
-    collectionControlsRevision: 16,
+    collectionControlsRevision: 3,
     fixture: "one_content_free_social_v1_usage_event",
   });
   assert.equal(h.state.insertCount, 13);
@@ -293,7 +293,7 @@ test("prepare inserts the reviewed content-free fixture and opens only revision 
   assert.doesNotMatch(migrationReceipt?.sql ?? "", /FOR SHARE/u);
   assert.ok(h.events.indexOf(migrationLock) < h.events.indexOf(migrationReceipt));
   assert.ok(h.events.some(({ sql }) => sql.startsWith("WITH public_owners AS (") && sql.includes("$1")));
-  assert.ok(h.events.some(({ sql }) => sql.includes("SET revision=16")
+  assert.ok(h.events.some(({ sql }) => sql.includes("SET revision=3")
     && sql.includes("enrollment_enabled=false") && sql.includes("publication_enabled=true")));
 });
 
@@ -329,7 +329,7 @@ test("prepare fails closed if the selected day contains v1 or v1.1 eligible reco
   assert.equal(h.events.filter(({ sql }) => sql === "ROLLBACK").length, 1);
 });
 
-test("restore is independently invokable and changes only the exact revision-16 test gate", async () => {
+test("restore is independently invokable and changes only the exact revision-3 test gate", async () => {
   const h = harness({ controls: ACTIVE });
   const receipt = await restorePostgresCommunityDailyTestActivation({
     env: validEnv("restore"), dependencies: h.dependencies,
@@ -339,7 +339,7 @@ test("restore is independently invokable and changes only the exact revision-16 
     status: "restored",
     project: "tibotattle",
     schema: POSTGRES_COMMUNITY_DAILY_ACTIVATION_TARGET.schema,
-    collectionControlsRevision: 17,
+    collectionControlsRevision: 4,
     publicationEnabled: false,
     enrollmentEnabled: false,
     fixtureRetained: true,
@@ -348,12 +348,12 @@ test("restore is independently invokable and changes only the exact revision-16 
   assert.equal(h.state.insertCount, 0);
   const updates = h.events.filter(({ sql }) => sql.startsWith("UPDATE "));
   assert.equal(updates.length, 1);
-  assert.match(updates[0].sql, /SET revision=17/u);
-  assert.ok(updates[0].sql.includes("revision=16"));
+  assert.match(updates[0].sql, /SET revision=4/u);
+  assert.ok(updates[0].sql.includes("revision=3"));
   assert.equal(h.events.filter(({ sql }) => sql === "COMMIT").length, 1);
 });
 
-test("restore is safely idempotent after full revision-17 readback", async () => {
+test("restore is safely idempotent after full revision-4 readback", async () => {
   const h = harness({ controls: RESTORED });
   const receipt = await restorePostgresCommunityDailyTestActivation({
     env: validEnv("restore"), dependencies: h.dependencies,
@@ -393,11 +393,17 @@ async function createDisposableSchema(pool, migrationRoot) {
       ON ${quoted}._tibotattle_migration_history FROM ${quotedRuntimeRole}`);
     await pool.query(`GRANT EXECUTE ON FUNCTION ${quoted}.insert_telemetry_v1_contribution(jsonb)
       TO ${quotedRuntimeRole}`);
-    await pool.query(`UPDATE ${quoted}.collection_controls
-      SET revision=15,control_state='degraded',enrollment_enabled=false,
+    const seedControls = await pool.query(`UPDATE ${quoted}.collection_controls
+      SET revision=2,control_state='degraded',enrollment_enabled=false,
           upload_registration_enabled=true,processing_enabled=true,
           publication_enabled=false,reason_code='synthetic_v12_test_upload_only',
-          updated_at=clock_timestamp() WHERE singleton=1`);
+          updated_at=clock_timestamp()
+      WHERE singleton=1 AND revision=1 AND control_state='contained'
+        AND enrollment_enabled=false AND upload_registration_enabled=false
+        AND processing_enabled=false AND publication_enabled=false AND reason_code IS NULL
+      RETURNING singleton`);
+    assert.equal(seedControls.rowCount, 1, "fresh migrations must match the exact contained baseline");
+    assert.deepEqual(seedControls.rows, [{ singleton: 1 }]);
     await pool.query(`UPDATE ${quoted}.publication_state
       SET publication_state='ready',policy_revision=1 WHERE singleton=1`);
     const privileges = await pool.query(`SELECT
@@ -507,12 +513,12 @@ test("real disposable PostgreSQL 17 runs prepare, restore, conflict rollback, an
       (SELECT revision::integer FROM ${preparedSchema.quoted}.collection_controls WHERE singleton=1) AS revision,
       (SELECT count(*) FROM ${preparedSchema.quoted}.participants WHERE id='synthetic-social-owner') AS owner_count,
       (SELECT count(*) FROM ${preparedSchema.quoted}.typed_telemetry_namespaces WHERE id=1) AS namespace_count`);
-    assert.deepEqual(blockedReadback.rows[0], { revision: 15, owner_count: "0", namespace_count: "0" });
+    assert.deepEqual(blockedReadback.rows[0], { revision: 2, owner_count: "0", namespace_count: "0" });
     const prep = await runInClient(pool, client =>
       preparePostgresCommunityDailyActivationInDisposableSchema({ client, config, migrations }),
     preparedSchema.runtimeRole);
     assert.equal(prep.status, "prepared");
-    assert.equal(prep.collectionControlsRevision, 16);
+    assert.equal(prep.collectionControlsRevision, 3);
     assert.deepEqual(await readPostgresCommunityDailyDaySourceEligibility(pool, {
       day: config.day,
       schema: { primarySchema: config.schema },
@@ -534,7 +540,7 @@ test("real disposable PostgreSQL 17 runs prepare, restore, conflict rollback, an
       restorePostgresCommunityDailyActivationInDisposableSchema({ client, config, migrations }),
     preparedSchema.runtimeRole);
     assert.equal(restored.status, "restored");
-    assert.equal(restored.collectionControlsRevision, 17);
+    assert.equal(restored.collectionControlsRevision, 4);
     const repeated = await runInClient(pool, client =>
       restorePostgresCommunityDailyActivationInDisposableSchema({ client, config, migrations }),
     preparedSchema.runtimeRole);
@@ -564,7 +570,7 @@ test("real disposable PostgreSQL 17 runs prepare, restore, conflict rollback, an
       (SELECT count(*) FROM ${conflictSchema.quoted}.storage_source_state WHERE singleton=1) AS source_state_count,
       (SELECT count(*) FROM ${conflictSchema.quoted}.typed_telemetry_namespaces WHERE id=1) AS namespace_count`);
     assert.deepEqual(conflictReadback.rows[0], {
-      revision: "15", owner_count: "0", source_state_count: "0", namespace_count: "0",
+      revision: "2", owner_count: "0", source_state_count: "0", namespace_count: "0",
     });
   } finally {
     for (const target of created.reverse()) {
