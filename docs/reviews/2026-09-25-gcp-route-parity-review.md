@@ -146,7 +146,7 @@ desktop/browser behavior accordingly.
   route set ([`postgres-test-dispatch.mjs`](../../apps/worker/cloud-run/postgres-test-dispatch.mjs#L1980)).
 - [`oauth-gateway.mjs`](../../apps/worker/cloud-run/oauth-gateway.mjs#L25)
   contains the 18 public API routes. Its asset fallback refuses `/api/` paths
-  ([same file](../../apps/worker/cloud-run/oauth-gateway.mjs#L214)), and its
+  ([same file](../../apps/worker/cloud-run/oauth-gateway.mjs#L230)), and its
   request handler returns 404 when neither the exact route table nor static
   assets match ([same file](../../apps/worker/cloud-run/oauth-gateway.mjs#L619)).
 - Nearby behavior tests include

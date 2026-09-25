@@ -49,7 +49,11 @@ also intentionally withholds the public community-daily read even though the
 private host has a handler. Before a traffic switch, classify each route as
 ported, deliberately retained on a separate service, or retired under an
 explicit contract, then exercise every client-visible path against the chosen
-ingress.
+ingress. The [route parity review](../reviews/2026-09-25-gcp-route-parity-review.md)
+makes that classification for all 51 registry contracts at candidate
+`c388769b` (the 50 `/api/` paths plus the retired Apple association file),
+confirms that the public test gateway forwards 18 of them, and ranks the
+remaining work into five batches. It is a source review, not a live route test.
 
 The [migration-41 A2 v1.2 journey](../receipts/2026-09-25-gcp-a2-v12-migration41-journey.md)
 records clean-candidate qualification, a successful pre-migration backup,
@@ -72,6 +76,14 @@ records the exact-source test build, a successful pre-migration backup,
 a public narrow gateway with callback request-log exclusion, fresh synthetic
 v1.2 readback, and exact-owner erasure with an empty all-versions bucket.
 Google OAuth client credentials and a real browser journey remain open.
+
+The [restored-control gateway journey](../receipts/2026-09-25-gcp-restored-control-gateway-journey.md)
+records a later exact image on both test services. A smoke rule tied to old
+control revision numbers was corrected to check the exact synthetic upload-only
+state after a publication rehearsal restored revision 4. The public-gateway
+v1.2 upload/readback, exact-owner cleanup and idempotent replay passed, and
+the isolated bucket again had no object generations. This remains a scoped
+test journey, not browser sign-in or production route parity.
 
 The deployed OAuth gateway is isolated to a small explicit route allowlist. It
 pins the IAM-private backend URL and
