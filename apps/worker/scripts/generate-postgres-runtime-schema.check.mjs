@@ -78,6 +78,18 @@ test("Worker migration receipt source is generated exactly from canonical SQL", 
   );
   assert.equal(
     renderPostgresRuntimeSchema(manifest).includes(
+      '"0040_historical_transport_headers.sql"',
+    ),
+    true,
+  );
+  assert.equal(
+    renderPostgresRuntimeSchema(manifest).includes(
+      '"0041_accountless_history_retention.sql"',
+    ),
+    true,
+  );
+  assert.equal(
+    renderPostgresRuntimeSchema(manifest).includes(
       '"0031_typed_legacy_source_family_receipts.sql"',
     ),
     true,
