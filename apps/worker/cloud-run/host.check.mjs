@@ -517,7 +517,8 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
     const baseEnv = { ...process.env };
     for (const name of ["POSTGRES_TEST_HTTP_MODE", "HOST", "HOST_ORIGIN", "PUBLIC_ORIGIN",
       "ADMIN_HOST_ORIGIN", "PORT", "K_SERVICE", "PRIMARY_DATABASE", "LEDGER_DATABASE",
-      "PRIMARY_INSTANCE_CONNECTION_NAME", "LEDGER_INSTANCE_CONNECTION_NAME", "POSTGRES_IAM_USER"]) {
+      "PRIMARY_INSTANCE_CONNECTION_NAME", "LEDGER_INSTANCE_CONNECTION_NAME", "POSTGRES_IAM_USER",
+      "POSTGRES_SCHEDULED_MAINTENANCE_ENABLED"]) {
       delete baseEnv[name];
     }
     const blocked = spawnSync(process.execPath, [bundlePath], {
@@ -531,6 +532,30 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
       status: "error",
       code: "POSTGRES_WORKER_REQUEST_PATH_UNSUPPORTED",
     });
+
+    const scheduledDisabled = spawnSync(process.execPath, [bundlePath, "--scheduled"], {
+      cwd: ROOT,
+      env: { ...baseEnv, POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: "disabled" },
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    assert.equal(scheduledDisabled.status, 1);
+    assert.deepEqual(JSON.parse(scheduledDisabled.stderr.trim()), {
+      status: "error",
+      code: "POSTGRES_SCHEDULED_MAINTENANCE_DISABLED",
+    }, "the opt-in gate must stop the scheduled CLI before runtime configuration");
+
+    const scheduledEnabledWithoutDatabase = spawnSync(process.execPath, [bundlePath, "--scheduled"], {
+      cwd: ROOT,
+      env: { ...baseEnv, POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: "enabled" },
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    assert.equal(scheduledEnabledWithoutDatabase.status, 1);
+    assert.deepEqual(JSON.parse(scheduledEnabledWithoutDatabase.stderr.trim()), {
+      status: "error",
+      code: "PRIMARY_DATABASE_MISSING",
+    }, "enabled scheduled startup must enter its database-only composition");
 
     for (const mode of ["health-only", "health-and-v12-day-manifest"]) {
       const publicBind = spawnSync(process.execPath, [bundlePath], {
@@ -685,6 +710,82 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
       }
     } finally {
       for (const [name, value] of originalEnvironment) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+
+    const scheduledBucket = "synthetic-maintenance-bucket";
+    const scheduledEnvironment = {
+      PRIMARY_DATABASE: "synthetic_primary",
+      PRIMARY_SCHEMA: "scheduled_primary",
+      PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:primary",
+      LEDGER_DATABASE: "synthetic_ledger",
+      LEDGER_SCHEMA: "scheduled_ledger",
+      LEDGER_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:ledger",
+      POSTGRES_IAM_USER: "scheduled-runtime@tibotattle.iam",
+      GCS_BUCKET_NAME: scheduledBucket,
+      GCS_ERASURE_BUCKET_HISTORY_PROOF: proof(scheduledBucket),
+    };
+    const scheduledEnvironmentNames = new Set([
+      ...Object.keys(scheduledEnvironment),
+      "POSTGRES_TEST_HTTP_MODE", "HOST", "HOST_ORIGIN", "PUBLIC_ORIGIN",
+      "ADMIN_HOST_ORIGIN", "PORT", "K_SERVICE", "SOURCE_CONTENT_DIGEST",
+      "POSTGRES_RATE_LIMIT_SECRET", "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK",
+      "ASSET_ROOT",
+    ]);
+    const previousScheduledEnvironment = new Map(
+      [...scheduledEnvironmentNames].map((name) => [name, process.env[name]]),
+    );
+    try {
+      for (const name of scheduledEnvironmentNames) delete process.env[name];
+      Object.assign(process.env, scheduledEnvironment);
+      const connector = { close() {} };
+      const poolInputs = [];
+      const pools = [];
+      const provider = async () => "synthetic-access-token";
+      const objectStore = { head() {}, delete() {} };
+      let objectStoreInput;
+      const runtime = await serverModule.createScheduledMaintenanceRuntime({
+        dependencies: {
+          createConnector() { return connector; },
+          createIamPool(options) {
+            poolInputs.push(options);
+            const pool = { end() {} };
+            pools.push(pool);
+            return pool;
+          },
+          async createGoogleAccessTokenProvider() { return provider; },
+          createGcsQuarantineObjectStore(...args) {
+            objectStoreInput = args;
+            return objectStore;
+          },
+        },
+      });
+      assert.deepEqual(poolInputs.map(({ role, database, schema, max, user }) =>
+        ({ role, database, schema, max, user })), [
+        {
+          role: "primary", database: "synthetic_primary", schema: "scheduled_primary",
+          max: 3, user: "scheduled-runtime@tibotattle.iam",
+        },
+        {
+          role: "ledger", database: "synthetic_ledger", schema: "scheduled_ledger",
+          max: 2, user: "scheduled-runtime@tibotattle.iam",
+        },
+      ]);
+      assert.equal(runtime.primaryPool, pools[0]);
+      assert.equal(runtime.ledgerPool, pools[1]);
+      assert.equal(runtime.connector, connector);
+      assert.equal(runtime.objectStore, objectStore);
+      assert.deepEqual(runtime.schemaOptions, {
+        primarySchema: "scheduled_primary",
+        ledgerSchema: "scheduled_ledger",
+      });
+      assert.equal(objectStoreInput[0], scheduledBucket);
+      assert.equal(objectStoreInput[1], provider);
+      assert.deepEqual(objectStoreInput[4], JSON.parse(proof(scheduledBucket)));
+    } finally {
+      for (const [name, value] of previousScheduledEnvironment) {
         if (value === undefined) delete process.env[name];
         else process.env[name] = value;
       }

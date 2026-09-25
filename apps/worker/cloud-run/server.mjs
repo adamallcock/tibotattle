@@ -591,6 +591,47 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
   }
 }
 
+/** Compose only the resources required by the fail-closed scheduled job. */
+export async function createScheduledMaintenanceRuntime({ dependencies = {} } = {}) {
+  const database = databaseConfig();
+  const iamUser = normalizeIamUser(required("POSTGRES_IAM_USER"), "POSTGRES_IAM_USER");
+  const bucket = required("GCS_BUCKET_NAME");
+  const historyProof = gcsHistoryProof();
+  if (historyProof.bucket !== bucket) {
+    configurationError("GCS_ERASURE_BUCKET_HISTORY_PROOF_INVALID");
+  }
+  const connector = typeof dependencies.createConnector === "function"
+    ? dependencies.createConnector()
+    : new Connector();
+  const createPool = dependencies.createIamPool ?? createIamPool;
+  const pools = [];
+  try {
+    const primaryPool = await createPool({ connector, ...database.primary, user: iamUser });
+    pools.push(primaryPool);
+    const ledgerPool = await createPool({ connector, ...database.ledger, user: iamUser });
+    pools.push(ledgerPool);
+    const accessToken = await (dependencies.createGoogleAccessTokenProvider
+      ?? createGoogleAccessTokenProvider)();
+    const objectStore = (dependencies.createGcsQuarantineObjectStore
+      ?? createGcsQuarantineObjectStore)(bucket, accessToken, undefined, undefined, historyProof);
+    return {
+      pools,
+      connector,
+      primaryPool,
+      ledgerPool,
+      objectStore,
+      schemaOptions: {
+        primarySchema: database.primary.schema,
+        ledgerSchema: database.ledger.schema,
+      },
+    };
+  } catch (error) {
+    await closeCloudSqlResources({ pools, connector }).catch(() => undefined);
+    if (error?.code) throw error;
+    throw new Error("CLOUD_RUN_SCHEDULED_MAINTENANCE_CONFIGURATION_FAILED");
+  }
+}
+
 async function requestFromNode(req, requestOriginAllowlist, response) {
   const host = req.headers.host;
   const allowedOrigin = requestOriginForHost(host, requestOriginAllowlist);
@@ -733,7 +774,7 @@ async function main() {
   if (process.argv.includes("--scheduled")) {
     try { assertPostgresScheduledMaintenanceEnabled(process.env); }
     catch { configurationError("POSTGRES_SCHEDULED_MAINTENANCE_DISABLED"); }
-    const runtime = await createRuntime();
+    const runtime = await createScheduledMaintenanceRuntime();
     try {
       const result = await runPostgresScheduledMaintenance({
         primaryPool: runtime.primaryPool,
