@@ -116,6 +116,7 @@ import {
 import { Connector } from "@google-cloud/cloud-sql-connector";
 import { POSTGRES_RUNTIME_MIGRATIONS } from "../src/postgres-runtime-schema.ts";
 import {
+  buildPublicGoogleRequestUrl,
   buildRequestUrl,
   createRequestOriginAllowlist,
   requestOriginForHost,
@@ -217,6 +218,7 @@ function privatePostgresTestHostConfiguration(mode) {
     const listenHost = optional("HOST");
     const configuredPort = optional("PORT");
     const hostOrigin = optional("HOST_ORIGIN");
+    const publicOrigin = configuredPublicOrigin();
     const service = optional("K_SERVICE");
     if (!isPrivatePostgresTestHost({
       mode,
@@ -227,7 +229,8 @@ function privatePostgresTestHostConfiguration(mode) {
       hostOrigin,
       port: configuredPort === String(CLOUD_RUN_IAM_TEST_TARGET.port)
         ? CLOUD_RUN_IAM_TEST_TARGET.port : null,
-    }) || optional("PUBLIC_ORIGIN") !== undefined
+    }) || (publicOrigin !== undefined
+        && (new URL(publicOrigin).protocol !== "https:" || publicOrigin === hostOrigin))
         || optional("ADMIN_HOST_ORIGIN") !== undefined) {
       configurationError("POSTGRES_TEST_CLOUD_RUN_IAM_CONFIGURATION_INVALID");
     }
@@ -235,6 +238,7 @@ function privatePostgresTestHostConfiguration(mode) {
       listenHost,
       port: CLOUD_RUN_IAM_TEST_TARGET.port,
       hostOrigin,
+      publicOrigin,
       mode,
       requestOriginAllowlist: createRequestOriginAllowlist({ publicHostOrigin: hostOrigin }),
     });
@@ -262,6 +266,7 @@ function throwingD1(name) {
   });
 }
 export {
+  buildPublicGoogleRequestUrl,
   buildRequestUrl,
   createRequestOriginAllowlist,
   requestOriginForHost,
@@ -399,8 +404,8 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
   const privateHost = postgresTestHttpEnabled
     ? privatePostgresTestHostConfiguration(postgresTestMode) : null;
   const hostOrigin = databaseOnly ? null : privateHost?.hostOrigin ?? configuredHostOrigin();
-  const publicOrigin = databaseOnly || postgresTestHttpEnabled
-    ? undefined : configuredPublicOrigin();
+  const publicOrigin = databaseOnly ? undefined : postgresTestHttpEnabled
+    ? privateHost?.publicOrigin : configuredPublicOrigin();
   const requestOriginAllowlist = databaseOnly
     ? null
     : privateHost?.requestOriginAllowlist ?? configuredRequestOrigins(hostOrigin, publicOrigin);
@@ -512,6 +517,16 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
         privateOrigin: hostOrigin,
       });
+      const googleOrigin = publicOrigin ?? hostOrigin;
+      const googleHealthDispatch = publicOrigin === undefined
+        ? healthDispatch
+        : (request) => {
+          let requestUrl;
+          try { requestUrl = new URL(request.url); } catch { return new Response(null, { status: 503 }); }
+          if (request.method !== "GET" || requestUrl.origin !== publicOrigin
+              || requestUrl.pathname !== "/api/health") return new Response(null, { status: 503 });
+          return healthDispatch(new Request(`${hostOrigin}/api/health`));
+        };
       const communityDailyDispatch = createPostgresTestCommunityDailyDispatch({
         primaryPool,
         schemaOptions,
@@ -550,11 +565,11 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         ? createPostgresGoogleHandoffDispatch({
           primaryPool,
           schemaOptions,
-          privateOrigin: hostOrigin,
+          privateOrigin: googleOrigin,
           env: admissionEnv,
           assertAdmissionBindings,
           assertAttemptAllowed,
-          healthDispatch,
+          healthDispatch: googleHealthDispatch,
         })
         : null;
       const googleEnrollmentDispatch = postgresTestMode === "cloud-run-iam"
@@ -562,11 +577,11 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           primaryPool,
           ledgerPool,
           schemaOptions,
-          privateOrigin: hostOrigin,
+          privateOrigin: googleOrigin,
           env: admissionEnv,
           assertAdmissionBindings,
           assertAttemptAllowed,
-          healthDispatch,
+          healthDispatch: googleHealthDispatch,
         })
         : null;
       return {
@@ -577,6 +592,7 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         ledgerPool,
         schemaOptions,
         hostOrigin,
+        publicOrigin,
         requestOriginAllowlist,
         listenHost: privateHost.listenHost,
         listenPort: privateHost.port,
@@ -757,10 +773,31 @@ export async function createScheduledMaintenanceRuntime({ dependencies = {} } = 
   }
 }
 
-async function requestFromNode(req, requestOriginAllowlist, response) {
+async function requestFromNode(req, requestOriginAllowlist, response, publicOrigin) {
   const host = req.headers.host;
   const allowedOrigin = requestOriginForHost(host, requestOriginAllowlist);
-  const url = buildRequestUrl(req.url ?? "/", allowedOrigin.host, allowedOrigin.origin);
+  const backendUrl = buildRequestUrl(req.url ?? "/", allowedOrigin.host, allowedOrigin.origin);
+  const callbackQuery = req.headers["x-tibotattle-google-callback-query"];
+  if (callbackQuery !== undefined && (Array.isArray(callbackQuery)
+      || allowedOrigin.kind !== "public"
+      || publicOrigin === undefined
+      || backendUrl.pathname !== "/api/v1/identity/google/callback")) {
+    throw Object.assign(new Error("OAUTH_CALLBACK_QUERY_INVALID"), { status: 400 });
+  }
+  const publicUrl = allowedOrigin.kind === "public"
+    ? buildPublicGoogleRequestUrl(
+      req.url ?? "/",
+      allowedOrigin.host,
+      allowedOrigin.origin,
+      publicOrigin,
+      callbackQuery,
+    )
+    : null;
+  if (publicUrl !== null && req.headers.origin !== undefined
+      && req.headers.origin !== publicOrigin) {
+    throw Object.assign(new Error("REQUEST_ORIGIN_INVALID"), { status: 403 });
+  }
+  const url = publicUrl ?? backendUrl;
   const headers = sanitizeHeaders(req.headers, {
     preserveAccessAssertion: allowedOrigin.kind === "admin",
   });
@@ -796,7 +833,12 @@ async function writeResponse(res, response) {
 async function serve(runtime) {
   const server = http.createServer(async (req, res) => {
     try {
-      const request = await requestFromNode(req, runtime.requestOriginAllowlist, res);
+      const request = await requestFromNode(
+        req,
+        runtime.requestOriginAllowlist,
+        res,
+        runtime.publicOrigin,
+      );
       const response = await dispatchCloudRunHostRequest(request, runtime, handleRequest);
       await writeResponse(res, response);
     } catch (error) {

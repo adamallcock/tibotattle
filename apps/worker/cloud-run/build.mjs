@@ -7,6 +7,7 @@ import { build } from "esbuild";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)));
 const ENTRY = resolve(ROOT, "server.mjs");
+const OAUTH_GATEWAY_ENTRY = resolve(ROOT, "oauth-gateway.mjs");
 const SMOKE_ENTRY = resolve(ROOT, "synthetic-v12-smoke.mjs");
 const MIGRATIONS_ENTRY = resolve(ROOT, "test-migrations.mjs");
 const ACTIVATION_ENTRY = resolve(ROOT, "test-activation.mjs");
@@ -24,6 +25,7 @@ const OUTDIR = resolve(ROOT, "dist");
 const options = {
   entryPoints: {
     server: ENTRY,
+    "oauth-gateway": OAUTH_GATEWAY_ENTRY,
     "synthetic-v12-smoke": SMOKE_ENTRY,
     "test-migrations": MIGRATIONS_ENTRY,
     "test-activation": ACTIVATION_ENTRY,
@@ -54,7 +56,7 @@ if (process.argv.includes("--check")) {
   console.log(JSON.stringify({
     status: "ok",
     mode: "check",
-    entries: ["server.mjs", "synthetic-v12-smoke.mjs", "test-migrations.mjs", "test-activation.mjs", "synthetic-v12-cleanup.mjs", "synthetic-v12-discovery.mjs", "ledger-reconciliation-diagnostic.mjs", "ledger-preflight-reconcile.mjs", "postgres-community-graph-benchmark.mjs", "postgres-community-graph-readback-diagnostic.mjs", "postgres-community-daily-publish-test.mjs", "postgres-community-daily-live-smoke.mjs", "postgres-community-daily-prepare-test.mjs", "postgres-community-daily-restore-test.mjs"],
+    entries: ["server.mjs", "oauth-gateway.mjs", "synthetic-v12-smoke.mjs", "test-migrations.mjs", "test-activation.mjs", "synthetic-v12-cleanup.mjs", "synthetic-v12-discovery.mjs", "ledger-reconciliation-diagnostic.mjs", "ledger-preflight-reconcile.mjs", "postgres-community-graph-benchmark.mjs", "postgres-community-graph-readback-diagnostic.mjs", "postgres-community-daily-publish-test.mjs", "postgres-community-daily-live-smoke.mjs", "postgres-community-daily-prepare-test.mjs", "postgres-community-daily-restore-test.mjs"],
   }));
 } else {
   await mkdir(OUTDIR, { recursive: true });
@@ -62,6 +64,6 @@ if (process.argv.includes("--check")) {
   console.log(JSON.stringify({
     status: "ok",
     mode: "build",
-    outputs: ["dist/server.mjs", "dist/synthetic-v12-smoke.mjs", "dist/test-migrations.mjs", "dist/test-activation.mjs", "dist/synthetic-v12-cleanup.mjs", "dist/synthetic-v12-discovery.mjs", "dist/ledger-reconciliation-diagnostic.mjs", "dist/ledger-preflight-reconcile.mjs", "dist/postgres-community-graph-benchmark.mjs", "dist/postgres-community-graph-readback-diagnostic.mjs", "dist/postgres-community-daily-publish-test.mjs", "dist/postgres-community-daily-live-smoke.mjs", "dist/postgres-community-daily-prepare-test.mjs", "dist/postgres-community-daily-restore-test.mjs"],
+    outputs: ["dist/server.mjs", "dist/oauth-gateway.mjs", "dist/synthetic-v12-smoke.mjs", "dist/test-migrations.mjs", "dist/test-activation.mjs", "dist/synthetic-v12-cleanup.mjs", "dist/synthetic-v12-discovery.mjs", "dist/ledger-reconciliation-diagnostic.mjs", "dist/ledger-preflight-reconcile.mjs", "dist/postgres-community-graph-benchmark.mjs", "dist/postgres-community-graph-readback-diagnostic.mjs", "dist/postgres-community-daily-publish-test.mjs", "dist/postgres-community-daily-live-smoke.mjs", "dist/postgres-community-daily-prepare-test.mjs", "dist/postgres-community-daily-restore-test.mjs"],
   }));
 }

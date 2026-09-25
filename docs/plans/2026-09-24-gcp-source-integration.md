@@ -30,7 +30,7 @@ candidate revision and source snapshot before moving live traffic:
 | Gate | Evidence now | Still required |
 | --- | --- | --- |
 | Private GCP data plane | Zonal Cloud SQL primary and independent erasure ledger, GCS, IAM-private Cloud Run, and a cleaned-up synthetic v1.2 journey at primary 42/42 and ledger 6/6 | Requalify each forward migration and serving image; preserve exact-owner erasure and restore behavior |
-| Application routes and identity | Partial private host and tested v1.2 upload/domain path; social device disconnect and some device/accountless source adapters are local-only | Complete or explicitly retire every live Worker route, OAuth/session/admin ingress, accountless opt-out, and the production composition root |
+| Application routes and identity | Partial private host and tested v1.2 upload/domain path; a separate test-only OAuth gateway source entry exposes only Google start/callback/result and enrollment to the IAM-private host | Deploy the gateway with backend-only invocation permission; wire browser UI and prove sign-in/enrollment; complete or retire remaining Worker routes and the production composition root |
 | Historical source transfer | Sealed local rehearsals cover several typed source, journal, correction, and ledger families | Export and reconcile the real D1/R2 snapshot under a source fence, import exact history and objects, and prove no admitted writes are lost or duplicated |
 | Public analytics and maintenance | Read-only daily preflight is fail-closed; 100,000-member graph publishes in the isolated benchmark | Complete daily source/claim/cursor/publication lifecycle, full scheduled maintenance and public reads, then rehearse replay, rollback, and recovery |
 | Performance and cost | One 100,000-member hosted graph run completed in about 284 seconds; batching preserved output but did not materially improve time | Run a matched Cloudflare workload and sustained GCP load, measure database saturation and cost, and decide the acceptable throughput target |
@@ -54,6 +54,45 @@ receipts, exact-image IAM-private revision `tibotattle-test-app-00038-qh2`,
 fresh synthetic v1.2 upload and readback, and exact-owner cleanup with an
 empty all-versions bucket. Migration 42's retention permit accepts only a
 synthetic source; it does not import production D1 history.
+
+The source-only OAuth gateway addition is isolated to the Google start,
+callback, result, and enrollment paths. It pins the IAM-private backend URL and
+ID-token audience, preserves the application `Authorization` header separately
+from Cloud Run's `X-Serverless-Authorization`, ignores caller-supplied forwarded
+and Cloudflare identity headers, limits request/response bodies and timeouts,
+rejects redirects, and logs only a route enum, method, status, and duration.
+The private host rebases only those four paths to its configured HTTPS
+`PUBLIC_ORIGIN`; its service URL remains the only accepted incoming backend
+authority. This branch has not deployed or configured either service, Google
+OAuth credentials, a public domain, or IAM. The live gate still needs a
+dedicated gateway runtime identity with backend-only invocation permission,
+public test-service ingress, an exact OAuth callback registration, same-origin
+or API-base wiring from the existing browser UI to this exact-route gateway, and
+an end-to-end journey against the test backend. That UI wiring is a separate
+integration gate; this gateway does not proxy unrelated paths. Before enabling any live OAuth
+redirect or callback, create and read back an enabled, full-sample Cloud Logging
+request-log exclusion scoped to the deployed gateway service. With the
+exclusion active, send one synthetic callback query and check every applicable
+sink and exported destination for a retained request record whose
+`httpRequest.requestUrl` contains its fake code or state; any such record blocks
+test OAuth. The gateway sends callback parameters over the private hop in a
+dedicated header, reconstructs the application callback URL inside the private
+host, and strips that handoff header before dispatch; therefore the private
+backend request URL stays query-free.
+Cloud Run creates request logs automatically and directs operators to Cloud
+Logging exclusions ([Cloud Run logging](https://docs.cloud.google.com/run/docs/logging)).
+The exclusion API applies exclusions to the `_Default` sink and cannot exclude
+entries from `_Required`
+([Cloud Logging exclusion API](https://docs.cloud.google.com/logging/docs/reference/v2/rest/v2/exclusions));
+project and aggregated sinks or exported destinations must also be checked for
+query persistence. Confirm the enabled filter matches 100% of Cloud Run request
+logs for the exact deployed gateway service using
+`resource.type="cloud_run_revision"`, its exact `resource.labels.service_name`,
+and `log_id("run.googleapis.com/requests")`; inspect any returned request-log
+entry's `httpRequest.requestUrl` field for the synthetic query markers
+([Cloud Logging HTTP request fields](https://docs.cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry)).
+If that readback cannot establish that callback query values will not persist,
+keep test OAuth disabled. The backend remains IAM-private throughout this gate.
 
 The [source-pinned private route candidate journey](../receipts/2026-09-25-gcp-private-route-candidate-journey.md)
 now records exact-image revision `tibotattle-test-app-00035-ws7`, a passing full

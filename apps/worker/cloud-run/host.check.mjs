@@ -32,6 +32,7 @@ import {
   isPrivatePostgresTestHost,
 } from "./postgres-test-dispatch.mjs";
 import {
+  buildPublicGoogleRequestUrl,
   buildRequestUrl,
   createRequestOriginAllowlist,
   requestOriginForHost,
@@ -197,6 +198,56 @@ test("host URL uses the configured origin and rejects mismatched absolute URLs",
   const url = buildRequestUrl("/api/ready?x=1", "test.example", "https://test.example");
   assert.equal(url.href, "https://test.example/api/ready?x=1");
   assert.throws(() => buildRequestUrl("https://evil.example/api/ready", "test.example", "https://test.example"), /REQUEST_HOST_INVALID/);
+});
+
+test("only exact Google enrollment paths are rebased to a configured public callback origin", () => {
+  const rebased = buildPublicGoogleRequestUrl(
+    "/api/v1/identity/google/callback",
+    new URL(CLOUD_RUN_IAM_TEST_TARGET.origin).host,
+    CLOUD_RUN_IAM_TEST_TARGET.origin,
+    "https://tibotattle.example",
+    "?state=opaque&code=opaque",
+  );
+  assert.equal(
+    rebased.href,
+    "https://tibotattle.example/api/v1/identity/google/callback?state=opaque&code=opaque",
+  );
+  for (const path of ["/api/health", "/api/v1/admin/action", "/api/v1/enroll/", "/api/v1/me/devices"]) {
+    assert.equal(buildPublicGoogleRequestUrl(
+      path,
+      new URL(CLOUD_RUN_IAM_TEST_TARGET.origin).host,
+      CLOUD_RUN_IAM_TEST_TARGET.origin,
+      "https://tibotattle.example",
+    ), null);
+  }
+  assert.throws(() => buildPublicGoogleRequestUrl(
+    "/api/v1/enroll",
+    "attacker.example",
+    CLOUD_RUN_IAM_TEST_TARGET.origin,
+    "https://tibotattle.example",
+  ), /REQUEST_HOST_INVALID/);
+  assert.throws(() => buildPublicGoogleRequestUrl(
+    "/api/v1/enroll",
+    new URL(CLOUD_RUN_IAM_TEST_TARGET.origin).host,
+    CLOUD_RUN_IAM_TEST_TARGET.origin,
+    CLOUD_RUN_IAM_TEST_TARGET.origin,
+  ), /PUBLIC_ORIGIN_INVALID/);
+  assert.throws(() => buildPublicGoogleRequestUrl(
+    "/api/v1/identity/google/callback?state=raw&code=raw",
+    new URL(CLOUD_RUN_IAM_TEST_TARGET.origin).host,
+    CLOUD_RUN_IAM_TEST_TARGET.origin,
+    "https://tibotattle.example",
+  ), /OAUTH_CALLBACK_QUERY_INVALID/);
+  assert.throws(() => buildPublicGoogleRequestUrl(
+    "/api/v1/enroll",
+    new URL(CLOUD_RUN_IAM_TEST_TARGET.origin).host,
+    CLOUD_RUN_IAM_TEST_TARGET.origin,
+    "https://tibotattle.example",
+    "?state=opaque",
+  ), /OAUTH_CALLBACK_QUERY_INVALID/);
+  assert.equal(sanitizeHeaders({
+    "x-tibotattle-google-callback-query": "?state=opaque&code=opaque",
+  }).has("x-tibotattle-google-callback-query"), false);
 });
 
 test("host allowlist accepts only the configured public and Access admin authorities", () => {
@@ -960,7 +1011,8 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
       { HOST_ORIGIN: "https://service.invalid" },
       { HOST_ORIGIN: "https://other-service-5t5mehqi7a-ue.a.run.app" },
       { HOST_ORIGIN: "https://tibotattle-test-app-806510610397.us-east1.run.app" },
-      { PUBLIC_ORIGIN: "https://tibotattle.example" },
+      { PUBLIC_ORIGIN: "http://tibotattle.example" },
+      { PUBLIC_ORIGIN: CLOUD_RUN_IAM_TEST_TARGET.origin },
       { ADMIN_HOST_ORIGIN: "https://admin.tibotattle.example" },
     ]) {
       const environment = { ...cloudRunEnv, ...override };
@@ -991,6 +1043,18 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
       status: "error",
       code: "PRIMARY_DATABASE_MISSING",
     }, "a fully qualified IAM host passes host checks before database startup");
+
+    const configuredPublicOrigin = spawnSync(process.execPath, [bundlePath], {
+      cwd: ROOT,
+      env: { ...cloudRunEnv, PUBLIC_ORIGIN: "https://tibotattle.example" },
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    assert.equal(configuredPublicOrigin.status, 1);
+    assert.deepEqual(JSON.parse(configuredPublicOrigin.stderr.trim()), {
+      status: "error",
+      code: "PRIMARY_DATABASE_MISSING",
+    }, "the exact public OAuth origin is accepted only by the private IAM backend mode");
 
     const proof = (bucket) => JSON.stringify({
       bucket,

@@ -9,6 +9,9 @@ function invalidRequestHost() {
   });
 }
 
+const OAUTH_CALLBACK_QUERY_HEADER = "x-tibotattle-google-callback-query";
+const MAX_OAUTH_CALLBACK_QUERY_LENGTH = 8_192;
+
 function canonicalOrigin(value, name) {
   let url;
   try { url = new URL(value); } catch { configurationError(`${name}_INVALID`); }
@@ -70,7 +73,8 @@ export function sanitizeHeaders(headers, { preserveAccessAssertion = false } = {
     const accessAssertion = lower === "cf-access-jwt-assertion";
     if ((lower.startsWith("cf-") && !(preserveAccessAssertion && accessAssertion))
         || lower.startsWith("x-forwarded-")
-        || lower === "x-serverless-authorization") continue;
+        || lower === "x-serverless-authorization"
+        || lower === OAUTH_CALLBACK_QUERY_HEADER) continue;
     if (rawValue === undefined) continue;
     const value = Array.isArray(rawValue) ? rawValue.join(", ") : String(rawValue);
     result.append(name, value);
@@ -89,4 +93,47 @@ export function buildRequestUrl(rawUrl, host, publicOrigin) {
     configurationError("REQUEST_HOST_INVALID");
   }
   return url;
+}
+
+/**
+ * Rebase only the four account-enrollment Google routes onto the configured
+ * public origin. The incoming authority is still checked against the private
+ * Cloud Run origin first; forwarded-host metadata is never consulted.
+ */
+export function buildPublicGoogleRequestUrl(
+  rawUrl,
+  host,
+  privateOrigin,
+  publicOrigin,
+  callbackQuery = undefined,
+) {
+  const privateUrl = buildRequestUrl(rawUrl, host, privateOrigin);
+  if (publicOrigin === undefined) return null;
+  const publicUrl = canonicalOrigin(publicOrigin, "PUBLIC_ORIGIN");
+  if (publicUrl.protocol !== "https:" || publicUrl.origin === privateOrigin) {
+    configurationError("PUBLIC_ORIGIN_INVALID");
+  }
+  if (!new Set([
+    "/api/v1/identity/google/start",
+    "/api/v1/identity/google/callback",
+    "/api/v1/identity/google/result",
+    "/api/v1/enroll",
+  ]).has(privateUrl.pathname)) return null;
+  let search = privateUrl.search;
+  if (privateUrl.pathname === "/api/v1/identity/google/callback") {
+    if (search !== "") {
+      throw Object.assign(new Error("OAUTH_CALLBACK_QUERY_INVALID"), { status: 400 });
+    }
+    if (callbackQuery !== undefined) {
+      if (typeof callbackQuery !== "string" || callbackQuery.length === 0
+          || callbackQuery.length > MAX_OAUTH_CALLBACK_QUERY_LENGTH
+          || !callbackQuery.startsWith("?") || /[\u0000-\u0020\u007f#\\]/u.test(callbackQuery)) {
+        throw Object.assign(new Error("OAUTH_CALLBACK_QUERY_INVALID"), { status: 400 });
+      }
+      search = callbackQuery;
+    }
+  } else if (callbackQuery !== undefined) {
+    throw Object.assign(new Error("OAUTH_CALLBACK_QUERY_INVALID"), { status: 400 });
+  }
+  return new URL(`${privateUrl.pathname}${search}`, publicUrl.origin);
 }
