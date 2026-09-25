@@ -233,6 +233,26 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community daily publication read co
     const cache = await pool.query(`SELECT count(*)::int AS count
       FROM ${sqlSchema}.community_daily_allowance_preview_cache`);
     assert.equal(cache.rows[0]?.count, 0);
+    await expect(pool.query(`UPDATE ${sqlSchema}.community_daily_aggregates
+      SET release_state='published', withdrawn_at=NULL
+      WHERE source_id=$1 AND day=$2 AND revision=1`, [SOURCE_ID, DAY]))
+      .rejects.toMatchObject({ code: "P1005" });
+    assert.deepEqual((await read()).rows, []);
+  });
+
+  it("commits an owner-erased journal event without daily publication state", async () => {
+    const dailyState = await pool.query(`SELECT count(*)::int AS count
+      FROM ${sqlSchema}.community_daily_allowance_publication_state WHERE source_id=$1`, [SOURCE_ID]);
+    assert.equal(dailyState.rows[0]?.count, 0);
+
+    await pool.query(`INSERT INTO ${sqlSchema}.storage_ingestion_changes(
+      source_id,sequence,event_digest,owner_digest,owner_revision,authority_epoch,kind,recorded_ms)
+      VALUES ($1,1,$2,$3,1,1,'owner-erased',${NOW_MS})`,
+    [SOURCE_ID, "b".repeat(64), OWNER_DIGEST]);
+
+    const event = await pool.query(`SELECT kind FROM ${sqlSchema}.storage_ingestion_changes
+      WHERE source_id=$1 AND sequence=1`, [SOURCE_ID]);
+    assert.equal(event.rows[0]?.kind, "owner-erased");
     assert.deepEqual((await read()).rows, []);
   });
 

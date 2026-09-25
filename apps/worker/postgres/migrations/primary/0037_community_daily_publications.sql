@@ -101,12 +101,12 @@ CREATE FUNCTION community_daily_terminal_event_withdrawal()
 RETURNS trigger
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
+  -- Migration 0032 owns the canonical source-state fence. A missing daily
+  -- readiness row means there is nothing to invalidate; analytics tables must
+  -- never become a prerequisite for committing an owner terminal event.
   PERFORM 1 FROM storage_source_state source
    WHERE source.singleton = 1 AND source.source_id = NEW.source_id
    FOR UPDATE;
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'community_daily_publication_source_missing' USING ERRCODE = 'P1005';
-  END IF;
   PERFORM 1 FROM analytics_source_cursors cursor
    WHERE cursor.source_id = NEW.source_id
    FOR UPDATE;
