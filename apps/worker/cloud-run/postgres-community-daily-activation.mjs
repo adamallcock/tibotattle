@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { resolve } from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { Connector } from "@google-cloud/cloud-sql-connector";
@@ -52,7 +53,7 @@ const OBJECT_KEY = `synthetic/${CHUNK_ID}`;
 const OCCURRENCE_ID = `event:v2:${"a".repeat(64)}`;
 const BASELINE_CONTROLS = Object.freeze({
   singleton: 1,
-  revision: 15,
+  revision: 2,
   control_state: "degraded",
   enrollment_enabled: false,
   upload_registration_enabled: true,
@@ -62,14 +63,25 @@ const BASELINE_CONTROLS = Object.freeze({
 });
 const ACTIVE_CONTROLS = Object.freeze({
   ...BASELINE_CONTROLS,
-  revision: 16,
+  revision: 3,
   control_state: "operational",
   publication_enabled: true,
   reason_code: "synthetic_daily_publication_test",
 });
 const RESTORED_CONTROLS = Object.freeze({
   ...BASELINE_CONTROLS,
-  revision: 17,
+  revision: 4,
+});
+const RETRY_ACTIVE_CONTROLS = Object.freeze({
+  ...BASELINE_CONTROLS,
+  revision: 5,
+  control_state: "operational",
+  publication_enabled: true,
+  reason_code: "synthetic_daily_publication_test",
+});
+const RETRY_RESTORED_CONTROLS = Object.freeze({
+  ...BASELINE_CONTROLS,
+  revision: 6,
 });
 
 function fail(code) {
@@ -98,7 +110,9 @@ function exactControlState(row, expected) {
 
 function parseConfig(env, attachedServiceAccountEmail, mode) {
   const target = POSTGRES_COMMUNITY_DAILY_ACTIVATION_TARGET;
-  const expectedJob = POSTGRES_COMMUNITY_DAILY_ACTIVATION_JOBS[mode];
+  const action = mode === "retry-prepare" ? "prepare"
+    : mode === "retry-restore" ? "restore" : mode;
+  const expectedJob = POSTGRES_COMMUNITY_DAILY_ACTIVATION_JOBS[action];
   if (env === null || typeof env !== "object" || expectedJob === undefined
       || env.CLOUD_RUN_JOB !== expectedJob
       || !EXECUTION_PATTERN.test(env.CLOUD_RUN_EXECUTION ?? "")
@@ -131,6 +145,8 @@ function parseConfig(env, attachedServiceAccountEmail, mode) {
   }
   return Object.freeze({
     mode,
+    action,
+    retry: mode.startsWith("retry-"),
     job: expectedJob,
     project: CLOUD_RUN_IAM_TEST_TARGET.project,
     schema: target.schema,
@@ -319,11 +335,12 @@ async function assertFixturePreconditions(client, schema, config) {
   "POSTGRES_COMMUNITY_DAILY_ACTIVATION_PRECONDITION_READ_FAILED");
   checkFixtureConflict(row);
   let policy = await queryOne(client,
-    `SELECT publication_state,policy_revision FROM ${schema}.publication_state
+    `SELECT singleton,publication_state,policy_revision FROM ${schema}.publication_state
       WHERE singleton=1 FOR SHARE`, [],
     "POSTGRES_COMMUNITY_DAILY_ACTIVATION_POLICY_READ_FAILED");
-  if (policy?.publication_state !== "ready" || Number(policy.policy_revision) !== 1) {
-    fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_POLICY_NOT_READY");
+  if (Number(policy.singleton) !== 1 || Number(policy.policy_revision) !== 1
+      || !["updating", "ready"].includes(policy.publication_state)) {
+    fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_POLICY_INVALID");
   }
   let eligibility;
   try {
@@ -443,11 +460,11 @@ async function activatePublicationControls(client, schema) {
   try {
     result = await client.query(
       `UPDATE ${schema}.collection_controls
-          SET revision=16,control_state='operational',enrollment_enabled=false,
+          SET revision=3,control_state='operational',enrollment_enabled=false,
               upload_registration_enabled=true,processing_enabled=true,
               publication_enabled=true,reason_code='synthetic_daily_publication_test',
               updated_at=clock_timestamp()
-        WHERE singleton=1 AND revision=15 AND control_state='degraded'
+        WHERE singleton=1 AND revision=2 AND control_state='degraded'
           AND enrollment_enabled=false AND upload_registration_enabled=true
           AND processing_enabled=true AND publication_enabled=false
           AND reason_code='synthetic_v12_test_upload_only'
@@ -461,7 +478,10 @@ async function activatePublicationControls(client, schema) {
   }
 }
 
-async function assertPreparedReadback(client, schema, config) {
+async function assertPreparedReadback(client, schema, config, {
+  expectedControls = ACTIVE_CONTROLS,
+  expectedPublicationCount = 0,
+} = {}) {
   const counts = await queryOne(client, `
     SELECT
       (SELECT count(*) FROM ${schema}.typed_telemetry_namespaces WHERE id=1) AS namespace_count,
@@ -497,7 +517,7 @@ async function assertPreparedReadback(client, schema, config) {
     "authorization_count", "pending_object_count", "chunk_count", "record_count",
   ];
   if (expectedCounts.some((key) => Number(counts[key]) !== 1)
-      || Number(counts.publication_count) !== 0) {
+      || Number(counts.publication_count) !== expectedPublicationCount) {
     fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_READBACK_INVALID");
   }
   const recordRows = await queryOne(client,
@@ -523,8 +543,131 @@ async function assertPreparedReadback(client, schema, config) {
       || eligibility?.v11SelectedRecordsPresent !== false) {
     fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_READBACK_INVALID");
   }
-  await assertControlState(client, schema, ACTIVE_CONTROLS,
+  await assertControlState(client, schema, expectedControls,
     "POSTGRES_COMMUNITY_DAILY_ACTIVATION_READBACK_INVALID");
+}
+
+async function assertRetainedPublication(client, schema, config) {
+  const fence = await queryOne(client, `
+    SELECT source.source_id,source.authority_epoch AS source_epoch,
+           cursor.sequence AS cursor_sequence,cursor.authority_epoch AS cursor_epoch,
+           policy.singleton AS policy_singleton,policy.publication_state,
+           policy.policy_revision,
+           COALESCE((SELECT max(change.sequence) FROM ${schema}.storage_ingestion_changes change
+             WHERE change.source_id=$1),0)::text AS latest_sequence,
+           COALESCE((SELECT max(change.sequence) FROM ${schema}.storage_ingestion_changes change
+             WHERE change.source_id=$1 AND change.kind IN ('owner-withdrawn','owner-erased')),0)::text
+             AS terminal_sequence
+      FROM ${schema}.storage_source_state source
+      JOIN ${schema}.analytics_source_cursors cursor ON cursor.source_id=source.source_id
+      JOIN ${schema}.publication_state policy ON policy.singleton=1
+     WHERE source.singleton=1 AND source.source_id=$1 AND cursor.source_id=$1
+     FOR SHARE OF source,cursor,policy`,
+  [config.sourceId],
+  "POSTGRES_COMMUNITY_DAILY_ACTIVATION_RETRY_FENCE_READ_FAILED");
+  if (fence.source_id !== config.sourceId
+      || Number(fence.source_epoch) !== 0
+      || Number(fence.cursor_sequence) !== 0
+      || Number(fence.cursor_epoch) !== 0
+      || Number(fence.latest_sequence) !== 0
+      || Number(fence.terminal_sequence) !== 0
+      || Number(fence.policy_singleton) !== 1
+      || Number(fence.policy_revision) !== 1
+      || !["updating", "ready"].includes(fence.publication_state)) {
+    fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_RETRY_FENCE_INVALID");
+  }
+
+  let result;
+  try {
+    result = await client.query(
+      `SELECT source_namespace,day::text AS day,revision,payload_json,payload_sha256,
+              source_authority_epoch,source_cursor_sequence,policy_revision,
+              collection_revision,release_state,(withdrawn_at IS NULL) AS not_withdrawn
+         FROM ${schema}.community_daily_aggregates
+        WHERE source_id=$1 AND day=$2::date
+        ORDER BY revision FOR SHARE`,
+      [config.sourceId, config.day],
+    );
+  } catch {
+    fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_RETRY_PUBLICATION_READ_FAILED");
+  }
+  if (result?.rowCount !== 1 || !Array.isArray(result.rows) || result.rows.length !== 1) {
+    fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_RETRY_PUBLICATION_INVALID");
+  }
+  const row = result.rows[0];
+  if (row.source_namespace !== config.sourceNamespace || row.day !== config.day
+      || Number(row.revision) !== 1 || Number(row.source_authority_epoch) !== 0
+      || Number(row.source_cursor_sequence) !== 0 || Number(row.policy_revision) !== 1
+      || Number(row.collection_revision) !== 3 || row.release_state !== "published"
+      || row.not_withdrawn !== true || typeof row.payload_json !== "string"
+      || !/^[0-9a-f]{64}$/u.test(row.payload_sha256 ?? "")) {
+    fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_RETRY_PUBLICATION_INVALID");
+  }
+  const digest = createHash("sha256").update(row.payload_json, "utf8").digest("hex");
+  if (digest !== row.payload_sha256) {
+    fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_RETRY_PUBLICATION_INVALID");
+  }
+  let payload;
+  try { payload = JSON.parse(row.payload_json); } catch {
+    fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_RETRY_PUBLICATION_INVALID");
+  }
+  const expectedTotals = {
+    contributingParticipants: 1,
+    contributingDevices: 1,
+    usageEvents: 1,
+    quotaObservations: 0,
+    sessionDimensions: 0,
+    inputUncachedTokens: 100,
+    inputCacheReadTokens: 900,
+    inputCacheWriteTokens: 0,
+    outputTextTokens: 50,
+    outputReasoningTokens: 25,
+    outputCombinedTokens: 75,
+  };
+  const expectedCell = {
+    provider: "openai_codex",
+    modelId: "gpt-5.6-sol",
+    usageEvents: 1,
+    inputUncachedTokens: 100,
+    inputCacheReadTokens: 900,
+    inputCacheWriteTokens: 0,
+    outputTextTokens: 50,
+    outputReasoningTokens: 25,
+    outputCombinedTokens: 75,
+  };
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)
+      || payload.schemaVersion !== "community-daily-aggregate-v1.0"
+      || payload.aggregateId !== `community-daily:${config.day}:r1`
+      || payload.day !== config.day || payload.revision !== 1
+      || payload.immutableRevision !== true
+      || !isDeepStrictEqual(payload.totals, expectedTotals)
+      || !Array.isArray(payload.cells) || payload.cells.length !== 1
+      || !isDeepStrictEqual(payload.cells[0], expectedCell)) {
+    fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_RETRY_PUBLICATION_INVALID");
+  }
+}
+
+async function activateRetryPublicationControls(client, schema) {
+  let result;
+  try {
+    result = await client.query(
+      `UPDATE ${schema}.collection_controls
+          SET revision=5,control_state='operational',enrollment_enabled=false,
+              upload_registration_enabled=true,processing_enabled=true,
+              publication_enabled=true,reason_code='synthetic_daily_publication_test',
+              updated_at=clock_timestamp()
+        WHERE singleton=1 AND revision=4 AND control_state='degraded'
+          AND enrollment_enabled=false AND upload_registration_enabled=true
+          AND processing_enabled=true AND publication_enabled=false
+          AND reason_code='synthetic_v12_test_upload_only'
+        RETURNING singleton`,
+    );
+  } catch {
+    fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_RETRY_CONTROLS_UPDATE_FAILED");
+  }
+  if (result?.rowCount !== 1 || result.rows?.length !== 1) {
+    fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_RETRY_CONTROLS_UPDATE_FAILED");
+  }
 }
 
 async function prepareTransaction(client, config, migrations) {
@@ -550,8 +693,49 @@ async function prepareTransaction(client, config, migrations) {
       project: config.project,
       schema: config.schema,
       day: config.day,
-      collectionControlsRevision: 16,
+      collectionControlsRevision: 3,
       fixture: "one_content_free_social_v1_usage_event",
+    });
+  } catch (error) {
+    if (open) {
+      try { await client.query("ROLLBACK"); } catch { /* safe code reported below */ }
+    }
+    throw error;
+  }
+}
+
+async function retryPrepareTransaction(client, config, migrations) {
+  const schema = quotedSchema(config.schema);
+  await client.query("BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+  let open = true;
+  try {
+    await client.query("SET LOCAL statement_timeout='30000ms'");
+    await client.query("SET LOCAL lock_timeout='5000ms'");
+    await client.query(`SET LOCAL search_path TO ${schema}, pg_catalog`);
+    await verifyPostgresAndMigrations(client, migrations, config.schema);
+    await assertControlState(client, schema, RESTORED_CONTROLS,
+      "POSTGRES_COMMUNITY_DAILY_ACTIVATION_RETRY_CONTROLS_BASELINE_MISMATCH", true);
+    await assertPreparedReadback(client, schema, config, {
+      expectedControls: RESTORED_CONTROLS,
+      expectedPublicationCount: 1,
+    });
+    await assertRetainedPublication(client, schema, config);
+    await activateRetryPublicationControls(client, schema);
+    await assertPreparedReadback(client, schema, config, {
+      expectedControls: RETRY_ACTIVE_CONTROLS,
+      expectedPublicationCount: 1,
+    });
+    await client.query("COMMIT");
+    open = false;
+    return Object.freeze({
+      schemaVersion: "postgres-community-daily-retry-activation-v1",
+      status: "retry_prepared",
+      project: config.project,
+      schema: config.schema,
+      day: config.day,
+      collectionControlsRevision: 5,
+      retainedPublicationRevision: 1,
+      fixtureInserted: false,
     });
   } catch (error) {
     if (open) {
@@ -582,11 +766,11 @@ async function restoreTransaction(client, config, migrations) {
       try {
         updated = await client.query(
           `UPDATE ${schema}.collection_controls
-              SET revision=17,control_state='degraded',enrollment_enabled=false,
+              SET revision=4,control_state='degraded',enrollment_enabled=false,
                   upload_registration_enabled=true,processing_enabled=true,
                   publication_enabled=false,reason_code='synthetic_v12_test_upload_only',
                   updated_at=clock_timestamp()
-            WHERE singleton=1 AND revision=16 AND control_state='operational'
+            WHERE singleton=1 AND revision=3 AND control_state='operational'
               AND enrollment_enabled=false AND upload_registration_enabled=true
               AND processing_enabled=true AND publication_enabled=true
               AND reason_code='synthetic_daily_publication_test'
@@ -609,7 +793,68 @@ async function restoreTransaction(client, config, migrations) {
       status,
       project: config.project,
       schema: config.schema,
-      collectionControlsRevision: 17,
+      collectionControlsRevision: 4,
+      publicationEnabled: false,
+      enrollmentEnabled: false,
+      fixtureRetained: true,
+    });
+  } catch (error) {
+    if (open) {
+      try { await client.query("ROLLBACK"); } catch { /* safe code reported below */ }
+    }
+    throw error;
+  }
+}
+
+async function retryRestoreTransaction(client, config, migrations) {
+  const schema = quotedSchema(config.schema);
+  await client.query("BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+  let open = true;
+  try {
+    await client.query("SET LOCAL statement_timeout='30000ms'");
+    await client.query("SET LOCAL lock_timeout='5000ms'");
+    await client.query(`SET LOCAL search_path TO ${schema}, pg_catalog`);
+    await verifyPostgresAndMigrations(client, migrations, config.schema);
+    const current = await queryOne(client, controlsSelect(schema, true), [],
+      "POSTGRES_COMMUNITY_DAILY_ACTIVATION_RETRY_RESTORE_STATE_READ_FAILED");
+    let status;
+    if (exactControlState(current, RETRY_RESTORED_CONTROLS)) {
+      status = "already_restored";
+    } else {
+      assertExpectedControls(current, RETRY_ACTIVE_CONTROLS,
+        "POSTGRES_COMMUNITY_DAILY_ACTIVATION_RETRY_RESTORE_STATE_MISMATCH");
+      let updated;
+      try {
+        updated = await client.query(
+          `UPDATE ${schema}.collection_controls
+              SET revision=6,control_state='degraded',enrollment_enabled=false,
+                  upload_registration_enabled=true,processing_enabled=true,
+                  publication_enabled=false,reason_code='synthetic_v12_test_upload_only',
+                  updated_at=clock_timestamp()
+            WHERE singleton=1 AND revision=5 AND control_state='operational'
+              AND enrollment_enabled=false AND upload_registration_enabled=true
+              AND processing_enabled=true AND publication_enabled=true
+              AND reason_code='synthetic_daily_publication_test'
+            RETURNING singleton`,
+        );
+      } catch {
+        fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_RETRY_RESTORE_UPDATE_FAILED");
+      }
+      if (updated?.rowCount !== 1 || updated.rows?.length !== 1) {
+        fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_RETRY_RESTORE_UPDATE_FAILED");
+      }
+      await assertControlState(client, schema, RETRY_RESTORED_CONTROLS,
+        "POSTGRES_COMMUNITY_DAILY_ACTIVATION_RETRY_RESTORE_READBACK_INVALID");
+      status = "restored";
+    }
+    await client.query("COMMIT");
+    open = false;
+    return Object.freeze({
+      schemaVersion: "postgres-community-daily-retry-activation-v1",
+      status,
+      project: config.project,
+      schema: config.schema,
+      collectionControlsRevision: 6,
       publicationEnabled: false,
       enrollmentEnabled: false,
       fixtureRetained: true,
@@ -658,6 +903,30 @@ export async function restorePostgresCommunityDailyActivationInDisposableSchema(
   return restoreTransaction(client, disposableIntegrationConfig(config), migrationSummary(migrations));
 }
 
+/** Exercise the retry prepare transaction only in a disposable local test schema. */
+export async function preparePostgresCommunityDailyRetryActivationInDisposableSchema({
+  client,
+  config,
+  migrations,
+} = {}) {
+  if (client === null || typeof client?.query !== "function") {
+    fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_TEST_CLIENT_INVALID");
+  }
+  return retryPrepareTransaction(client, disposableIntegrationConfig(config), migrationSummary(migrations));
+}
+
+/** Exercise the independent retry restore transaction only in a disposable local test schema. */
+export async function restorePostgresCommunityDailyRetryActivationInDisposableSchema({
+  client,
+  config,
+  migrations,
+} = {}) {
+  if (client === null || typeof client?.query !== "function") {
+    fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_TEST_CLIENT_INVALID");
+  }
+  return retryRestoreTransaction(client, disposableIntegrationConfig(config), migrationSummary(migrations));
+}
+
 async function runActivation(mode, { env = process.env, dependencies = {} } = {}) {
   const readServiceAccount = dependencies.readServiceAccountEmail
     ?? readAttachedPostgresCommunityDailyActivationServiceAccount;
@@ -685,9 +954,10 @@ async function runActivation(mode, { env = process.env, dependencies = {} } = {}
       applicationName: "tibotattle-community-daily-test-activation",
     });
     client = await pool.connect();
-    result = mode === "prepare"
-      ? await prepareTransaction(client, config, migrations)
-      : await restoreTransaction(client, config, migrations);
+    if (mode === "prepare") result = await prepareTransaction(client, config, migrations);
+    else if (mode === "restore") result = await restoreTransaction(client, config, migrations);
+    else if (mode === "retry-prepare") result = await retryPrepareTransaction(client, config, migrations);
+    else result = await retryRestoreTransaction(client, config, migrations);
   } catch (error) {
     failure = error;
   }
@@ -716,6 +986,21 @@ export async function preparePostgresCommunityDailyTestActivation(options = {}) 
 
 export async function restorePostgresCommunityDailyTestActivation(options = {}) {
   return runActivation("restore", options);
+}
+
+export async function preparePostgresCommunityDailyRetryTestActivation(options = {}) {
+  return runActivation("retry-prepare", options);
+}
+
+export async function restorePostgresCommunityDailyRetryTestActivation(options = {}) {
+  return runActivation("retry-restore", options);
+}
+
+export function isPostgresCommunityDailyRetryActivationInvocation(args) {
+  if (!Array.isArray(args)) fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_ARGUMENTS_INVALID");
+  if (args.length === 0) return false;
+  if (args.length === 1 && args[0] === "--retry-retained-a2-publication") return true;
+  fail("POSTGRES_COMMUNITY_DAILY_ACTIVATION_ARGUMENTS_INVALID");
 }
 
 export function postgresCommunityDailyActivationErrorReceipt(error, mode) {

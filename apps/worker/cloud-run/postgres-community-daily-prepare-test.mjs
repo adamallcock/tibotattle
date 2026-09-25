@@ -4,9 +4,12 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   parsePostgresCommunityDailyActivationConfig,
+  isPostgresCommunityDailyRetryActivationInvocation,
   preparePostgresCommunityDailyActivationInDisposableSchema,
   postgresCommunityDailyActivationErrorReceipt,
   preparePostgresCommunityDailyTestActivation,
+  preparePostgresCommunityDailyRetryActivationInDisposableSchema,
+  preparePostgresCommunityDailyRetryTestActivation,
   readPostgresCommunityDailyDaySourceEligibility,
   POSTGRES_COMMUNITY_DAILY_ACTIVATION_DAY,
   POSTGRES_COMMUNITY_DAILY_ACTIVATION_IAM_USER,
@@ -19,8 +22,11 @@ import {
 
 export {
   parsePostgresCommunityDailyActivationConfig,
+  isPostgresCommunityDailyRetryActivationInvocation,
   preparePostgresCommunityDailyTestActivation,
+  preparePostgresCommunityDailyRetryTestActivation,
   preparePostgresCommunityDailyActivationInDisposableSchema,
+  preparePostgresCommunityDailyRetryActivationInDisposableSchema,
   readPostgresCommunityDailyDaySourceEligibility,
   POSTGRES_COMMUNITY_DAILY_ACTIVATION_DAY,
   POSTGRES_COMMUNITY_DAILY_ACTIVATION_IAM_USER,
@@ -33,10 +39,14 @@ export {
 
 async function main() {
   try {
-    const result = await preparePostgresCommunityDailyTestActivation();
+    const retry = isPostgresCommunityDailyRetryActivationInvocation(process.argv.slice(2));
+    const result = retry
+      ? await preparePostgresCommunityDailyRetryTestActivation()
+      : await preparePostgresCommunityDailyTestActivation();
     process.stdout.write(`${JSON.stringify(result)}\n`);
   } catch (error) {
-    process.stderr.write(`${JSON.stringify(postgresCommunityDailyActivationErrorReceipt(error, "prepare"))}\n`);
+    process.stderr.write(`${JSON.stringify(postgresCommunityDailyActivationErrorReceipt(error,
+      process.argv.includes("--retry-retained-a2-publication") ? "retry-prepare" : "prepare"))}\n`);
     process.exitCode = 1;
   }
 }
