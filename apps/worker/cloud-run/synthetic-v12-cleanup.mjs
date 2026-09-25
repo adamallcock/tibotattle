@@ -83,8 +83,10 @@ function expectedBucketCreateRequest(bucket) {
     name: bucket,
     location: "US-EAST1",
     storageClass: "STANDARD",
-    iamConfiguration: { uniformBucketLevelAccess: { enabled: true } },
-    publicAccessPrevention: "enforced",
+    iamConfiguration: {
+      uniformBucketLevelAccess: { enabled: true },
+      publicAccessPrevention: "enforced",
+    },
     softDeletePolicy: { retentionDurationSeconds: "0" },
     versioning: { enabled: false },
   };
@@ -109,8 +111,7 @@ function validateBucketProof(value, expectedBucket) {
     const response = parsed.creationResponse;
     const allowedFields = [
       "bucket", "projectNumber", "bucketGeneration", "bucketMetageneration", "location", "timeCreated",
-      "softDeleteRetentionDurationSeconds", "uniformBucketLevelAccess",
-      "publicAccessPrevention", "versioningEnabled",
+      "softDeleteRetentionDurationSeconds", "iamConfiguration", "versioningEnabled",
     ].sort();
     if (Object.keys(response).sort().join("\n") !== allowedFields.join("\n")
         || response.bucket !== expectedBucket
@@ -118,8 +119,11 @@ function validateBucketProof(value, expectedBucket) {
         || response.bucketMetageneration !== "1"
         || response.location !== "US-EAST1"
         || response.softDeleteRetentionDurationSeconds !== "0"
-        || response.uniformBucketLevelAccess !== true
-        || response.publicAccessPrevention !== "enforced"
+        || !record(response.iamConfiguration)
+        || Object.keys(response.iamConfiguration).sort().join("\n")
+          !== "publicAccessPrevention\nuniformBucketLevelAccess"
+        || response.iamConfiguration.publicAccessPrevention !== "enforced"
+        || response.iamConfiguration.uniformBucketLevelAccess !== true
         || response.versioningEnabled !== false
         || typeof response.timeCreated !== "string"
         || !Number.isFinite(Date.parse(response.timeCreated))

@@ -54,8 +54,10 @@ function proof(bucket = CLEANUP_BUCKET) {
     name: bucket,
     location: "US-EAST1",
     storageClass: "STANDARD",
-    iamConfiguration: { uniformBucketLevelAccess: { enabled: true } },
-    publicAccessPrevention: "enforced",
+    iamConfiguration: {
+      uniformBucketLevelAccess: { enabled: true },
+      publicAccessPrevention: "enforced",
+    },
     softDeletePolicy: { retentionDurationSeconds: "0" },
     versioning: { enabled: false },
   };
@@ -67,8 +69,10 @@ function proof(bucket = CLEANUP_BUCKET) {
     location: "US-EAST1",
     timeCreated: "2026-09-25T04:30:00.000Z",
     softDeleteRetentionDurationSeconds: "0",
-    uniformBucketLevelAccess: true,
-    publicAccessPrevention: "enforced",
+    iamConfiguration: {
+      uniformBucketLevelAccess: true,
+      publicAccessPrevention: "enforced",
+    },
     versioningEnabled: false,
   };
   return JSON.stringify({

@@ -99,8 +99,8 @@ export function buildGcpTestBucketCreateRequest(bucket) {
     storageClass: "STANDARD",
     iamConfiguration: Object.freeze({
       uniformBucketLevelAccess: Object.freeze({ enabled: true }),
+      publicAccessPrevention: "enforced",
     }),
-    publicAccessPrevention: "enforced",
     softDeletePolicy: Object.freeze({ retentionDurationSeconds: "0" }),
     versioning: Object.freeze({ enabled: false }),
   });
@@ -135,7 +135,7 @@ function bucketSnapshot(value, expectedBucket) {
       || typeof value.timeCreated !== "string"
       || !Number.isFinite(Date.parse(value.timeCreated))
       || value.iamConfiguration?.uniformBucketLevelAccess?.enabled !== true
-      || value.publicAccessPrevention !== "enforced"
+      || value.iamConfiguration?.publicAccessPrevention !== "enforced"
       || (value.versioning !== undefined
         && (value.versioning === null || typeof value.versioning !== "object"
           || value.versioning.enabled !== false))
@@ -150,8 +150,10 @@ function bucketSnapshot(value, expectedBucket) {
     location: value.location,
     timeCreated: value.timeCreated,
     softDeleteRetentionDurationSeconds: disabledSoftDeleteDuration(value.softDeletePolicy),
-    uniformBucketLevelAccess: true,
-    publicAccessPrevention: "enforced",
+    iamConfiguration: Object.freeze({
+      uniformBucketLevelAccess: true,
+      publicAccessPrevention: "enforced",
+    }),
     versioningEnabled: false,
   });
 }
@@ -277,7 +279,7 @@ function bucketUrls(bucket) {
   );
   readback.searchParams.set(
     "fields",
-    "projectNumber,name,generation,metageneration,location,timeCreated,softDeletePolicy(retentionDurationSeconds),iamConfiguration(uniformBucketLevelAccess(enabled)),publicAccessPrevention,versioning(enabled),retentionPolicy",
+    "projectNumber,name,generation,metageneration,location,timeCreated,softDeletePolicy(retentionDurationSeconds),iamConfiguration(uniformBucketLevelAccess(enabled),publicAccessPrevention),versioning(enabled),retentionPolicy",
   );
   return { create: url, readback };
 }

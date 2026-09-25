@@ -23,8 +23,10 @@ function bucketResource(overrides = {}) {
     metageneration: "1",
     location: GCP_TEST_BUCKET_HISTORY_TARGET.location,
     timeCreated,
-    iamConfiguration: { uniformBucketLevelAccess: { enabled: true } },
-    publicAccessPrevention: "enforced",
+    iamConfiguration: {
+      uniformBucketLevelAccess: { enabled: true },
+      publicAccessPrevention: "enforced",
+    },
     softDeletePolicy: { retentionDurationSeconds: "0" },
     versioning: { enabled: false },
     ...overrides,
@@ -59,8 +61,10 @@ test("creation request starts with no data, no object versioning, and soft delet
     name: bucket,
     location: "US-EAST1",
     storageClass: "STANDARD",
-    iamConfiguration: { uniformBucketLevelAccess: { enabled: true } },
-    publicAccessPrevention: "enforced",
+    iamConfiguration: {
+      uniformBucketLevelAccess: { enabled: true },
+      publicAccessPrevention: "enforced",
+    },
     softDeletePolicy: { retentionDurationSeconds: "0" },
     versioning: { enabled: false },
   });
@@ -94,7 +98,12 @@ test("receipt refuses a disabled policy that was not configured at creation or c
     [bucketResource(), bucketResource({ projectNumber: "123456789012" })],
     [bucketResource({ generation: 1 }), bucketResource()],
     [bucketResource({ versioning: { enabled: true } }), bucketResource()],
-    [bucketResource({ publicAccessPrevention: "inherited" }), bucketResource()],
+    [bucketResource({
+      iamConfiguration: {
+        uniformBucketLevelAccess: { enabled: true },
+        publicAccessPrevention: "inherited",
+      },
+    }), bucketResource()],
   ]) {
     assert.throws(() => createGcpTestBucketHistoryReceipt({
       bucket, createResponse, readbackResponse, request,
@@ -145,6 +154,10 @@ test("live mode creates the bucket, reads back the same incarnation, and writes 
   assert.deepEqual(JSON.parse(requests[0].options.body), buildGcpTestBucketCreateRequest(bucket));
   assert.equal(requests[0].options.headers.authorization, "Bearer synthetic-access-token");
   assert.equal(requests[1].url.pathname, `/storage/v1/b/${bucket}`);
+  assert.equal(
+    requests[1].url.searchParams.get("fields"),
+    "projectNumber,name,generation,metageneration,location,timeCreated,softDeletePolicy(retentionDurationSeconds),iamConfiguration(uniformBucketLevelAccess(enabled),publicAccessPrevention),versioning(enabled),retentionPolicy",
+  );
   assert.equal(requests[1].options.method, "GET");
   assert.equal(writtenPath, "/private/tmp/gcs-history-proof.json");
   assert.deepEqual(writtenReceipt, result.receipt);
