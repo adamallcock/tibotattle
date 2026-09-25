@@ -29,7 +29,7 @@ candidate revision and source snapshot before moving live traffic:
 
 | Gate | Evidence now | Still required |
 | --- | --- | --- |
-| Private GCP data plane | Zonal Cloud SQL primary and independent erasure ledger, GCS, IAM-private Cloud Run, and a cleaned-up synthetic v1.2 journey at primary 44/44 and ledger 6/6 | Requalify the next integrated revision; preserve exact-owner erasure and restore behavior |
+| Private GCP data plane | Zonal Cloud SQL primary and independent erasure ledger, GCS, IAM-private Cloud Run, and a cleaned-up synthetic v1.2 journey at primary 44/44 and ledger 6/6, most recently for [candidate `9c2a5861`](../receipts/2026-09-25-gcp-reconciled-candidate-journey.md) | Requalify each later integrated revision; preserve exact-owner erasure and restore behavior |
 | Application routes and identity | The separate narrow test OAuth gateway is deployed and public, invokes the IAM-private backend, and passed synthetic callback-log probes; the private host serves sessions, logout, pairing mint, Google handoff and enrollment in addition to the v1.2 path | Register a dedicated test OAuth client and user, prove browser sign-in/enrollment and device claim, then complete or retire remaining Worker routes and the production composition root |
 | Historical source transfer | Sealed local rehearsals cover several typed source, journal, correction, and ledger families | Export and reconcile the real D1/R2 snapshot under a source fence, import exact history and objects, and prove no admitted writes are lost or duplicated |
 | Public analytics and maintenance | Read-only daily preflight is fail-closed; 100,000-member graph publishes in the isolated benchmark | Complete daily source/claim/cursor/publication lifecycle, full scheduled maintenance and public reads, then rehearse replay, rollback, and recovery |
@@ -38,7 +38,9 @@ candidate revision and source snapshot before moving live traffic:
 
 The route, transfer, and analytics rows are material blockers. A private test
 service that accepts one synthetic upload is useful evidence but cannot serve
-the complete application yet.
+the complete application yet. The
+[GCP handover readiness catalog](../reviews/2026-09-25-gcp-handover-readiness.md)
+lists the requirements and owner decisions behind every row.
 
 At this checkpoint, the Worker route registry defines 50 exact `/api/` paths.
 A source-level comparison with the Cloud Run host and gateway finds 21 paths
