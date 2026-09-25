@@ -25,6 +25,7 @@ import {
   SYNTHETIC_V12_SMOKE_DATABASE_TARGET,
   SYNTHETIC_V12_SMOKE_JOB,
   SYNTHETIC_V12_SMOKE_PARTICIPANT_PREFIX,
+  SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN,
 } from "./synthetic-v12-smoke.mjs";
 
 const IDS = [
@@ -191,7 +192,8 @@ function mockReadback(input, envelopeBytes, getFailureStage = () => "", onGcsRea
 }
 
 function fakeDependencies({ failManifest = false, anonymousStatus = 403, effectiveMismatch = false,
-  oversizedHealth = false, healthPrimaryVersion = 39, healthLedgerVersion = 6 } = {}) {
+  oversizedHealth = false, healthPrimaryVersion = 39, healthLedgerVersion = 6,
+  gatewayResponseUrl, gatewayRedirectStatus, gatewaySetCookie = false } = {}) {
   const calls = [];
   let seedCount = 0;
   let getTokenCount = 0;
@@ -231,13 +233,31 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
         return SERVERLESS_TOKEN;
       },
       async fetchImpl(url, options) {
-        calls.push({ url: new URL(url), options });
-        if (options.headers?.["x-serverless-authorization"] === undefined) {
-          return response(anonymousStatus, { status: "blocked" });
+        const requestUrl = new URL(url);
+        const isPublicGateway = requestUrl.origin === SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN;
+        calls.push({ url: requestUrl, options });
+        const respond = (status, value) => {
+          const result = response(
+            isPublicGateway && gatewayRedirectStatus !== undefined ? gatewayRedirectStatus : status,
+            value,
+            isPublicGateway ? gatewayResponseUrl ?? requestUrl.href : "",
+          );
+          if (isPublicGateway && gatewaySetCookie) {
+            result.headers.set("set-cookie", "session=must-not-be-set; Secure; HttpOnly");
+          }
+          return result;
+        };
+        if (isPublicGateway) {
+          assert.equal(options.credentials, "omit");
+          assert.equal(options.headers?.["x-serverless-authorization"], undefined);
+          assert.equal(options.headers?.cookie, undefined);
+          assert.equal(options.headers?.origin, SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN);
+        } else if (options.headers?.["x-serverless-authorization"] === undefined) {
+          return respond(anonymousStatus, { status: "blocked" });
         }
         if (url.pathname === "/api/health") {
           if (oversizedHealth) return new Response("x".repeat(64 * 1024 + 1), { status: 200 });
-          return response(200, {
+          return respond(200, {
             schemaVersion: "gcp-postgres-test-health-v1",
             scope: "postgres_schema_and_migrations_only",
             status: "ready",
@@ -254,15 +274,15 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
             call.url.pathname === "/api/v1/device/credential/renew");
           const suppliedAuthorization = options.headers.authorization;
           if (renewalCalls.length >= 2 && suppliedAuthorization === fixture.deviceAuthorization) {
-            return response(401, { error: { code: "DEVICE_AUTH_INVALID" } });
+            return respond(401, { error: { code: "DEVICE_AUTH_INVALID" } });
           }
           if (renewalCalls.length >= 2 && suppliedAuthorization !== replacementAuthorization) {
-            return response(401, { error: { code: "DEVICE_AUTH_INVALID" } });
+            return respond(401, { error: { code: "DEVICE_AUTH_INVALID" } });
           }
           if (renewalCalls.length < 2 && suppliedAuthorization !== fixture.deviceAuthorization) {
-            return response(401, { error: { code: "DEVICE_AUTH_INVALID" } });
+            return respond(401, { error: { code: "DEVICE_AUTH_INVALID" } });
           }
-          return response(200, {
+          return respond(200, {
             schemaVersion: "device-sync-state-v1.0",
             contractVersion: "telemetry-contribution-v1.0",
             acknowledgedThroughDay: null,
@@ -283,13 +303,13 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
             nextDeviceSecretHash: deviceSecretHash(DEVICE_ID, replacementSecret),
             rotationAttemptId: IDS[6],
           });
-          return response(200, renewalReceipt);
+          return respond(200, renewalReceipt);
         }
         if (url.pathname === "/api/v1/me/telemetry-v12/domain-predecessor") {
           assert.equal(options.method, "POST");
           assert.equal(options.headers.authorization, fixture.deviceAuthorization);
           assert.equal(options.body, "{}");
-          return response(201, {
+          return respond(201, {
             schemaVersion: "telemetry-domain-predecessor-v1.2",
             token: PREDECESSOR_TOKEN,
             previousGenerationId: null,
@@ -309,7 +329,7 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
           assert.equal(manifest.days.length, 1);
           assert.equal(manifest.days[0].day, env().SYNTHETIC_V12_SMOKE_DAY);
           const replay = calls.filter((call) => call.url.pathname === url.pathname).length === 2;
-          return response(201, {
+          return respond(201, {
             schemaVersion: "telemetry-domain-activation-v1.2",
             generationId: GENERATION_ID,
             manifestDigest: manifest.manifestDigest,
@@ -320,12 +340,12 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
         }
         if (url.pathname === "/api/v1/device/telemetry/v1.2/day-manifests") {
           if (failManifest) {
-            return response(503, {
+            return respond(503, {
               requestId: "sensitive-request-id",
               error: { code: "REQUEST_REJECTED", secret: DEVICE_SECRET },
             });
           }
-          return response(201, {
+          return respond(201, {
             manifestId: MANIFEST_ID,
             manifestDigest: JSON.parse(options.body).manifestDigest,
             state: "staged",
@@ -335,11 +355,11 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
         }
         if (url.pathname === "/api/v1/device/upload-authorizations") {
           const grantIndex = calls.filter((call) => call.url.pathname === url.pathname).length;
-          return response(201, { uploadAuthorization: grantIndex === 1 ? GRANT_TOKEN_1 : GRANT_TOKEN_2 });
+          return respond(201, { uploadAuthorization: grantIndex === 1 ? GRANT_TOKEN_1 : GRANT_TOKEN_2 });
         }
         if (url.pathname === "/api/v1/contributions") {
           const replayed = calls.filter((call) => call.url.pathname === url.pathname).length === 2;
-          return response(202, {
+          return respond(202, {
             schemaVersion: "telemetry-chunk-receipt-v1.2",
             contributionId: CONTRIBUTION_ID,
             manifestId: MANIFEST_ID,
@@ -347,7 +367,7 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
             replayed,
           });
         }
-        return response(404, { error: "unexpected fake route" });
+        return respond(404, { error: "unexpected fake route" });
       },
       async encryptEnvelope(chunk, jwk) {
         assert.equal(chunk.schemaVersion, "telemetry-contribution-v1.2");
@@ -393,6 +413,24 @@ test("job config pins the single Cloud Run job, app origin, project, bucket, and
   assert.equal(config.ledgerSchema, "tibotattle_ledger_v12_a2_20260925");
   assert.equal(config.day, "2026-09-24");
   assert.equal(config.envelopePublicJwk.kid, "key:test");
+  assert.equal(config.publicV12GatewayOrigin, null);
+});
+
+test("public v1.2 gateway mode opts in only with the pinned GCP test origin", () => {
+  const config = parseSyntheticV12SmokeConfig(env({
+    PUBLIC_V12_GATEWAY_ORIGIN: SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN,
+  }));
+  assert.equal(config.publicV12GatewayOrigin, SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN);
+  for (const value of [
+    "https://tibotattle-test-oauth-gateway.example",
+    "http://tibotattle-test-oauth-gateway-806510610397.us-east1.run.app",
+    `${SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN}/api/v1/session`,
+    "https://user@tibotattle-test-oauth-gateway-806510610397.us-east1.run.app",
+  ]) {
+    assert.throws(() => parseSyntheticV12SmokeConfig(env({ PUBLIC_V12_GATEWAY_ORIGIN: value })), {
+      code: "PUBLIC_V12_GATEWAY_ORIGIN_INVALID",
+    });
+  }
 });
 
 test("job config rejects local execution, spoofable origins, wrong bucket, invalid task shape, and private JWK", () => {
@@ -406,6 +444,7 @@ test("job config rejects local execution, spoofable origins, wrong bucket, inval
     { K_SERVICE: "tibotattle-test-app" },
     { HOST_ORIGIN: "https://service.invalid" },
     { HOST_ORIGIN: "https://tibotattle-test-app-806510610397.us-east1.run.app" },
+    { PUBLIC_V12_GATEWAY_ORIGIN: "https://untrusted.example" },
     { GCS_BUCKET_NAME: "another-test-bucket" },
     { PRIMARY_INSTANCE_CONNECTION_NAME: "other-project:us-east1:test-primary" },
     { PRIMARY_DATABASE: "production" },
@@ -759,6 +798,80 @@ test("smoke journey keeps IAM and participant credentials separate and replays e
   assert.equal(JSON.stringify(receipt).includes(GENERATION_ID), false);
   assert.equal(JSON.stringify(receipt).includes(MANIFEST_ID), false);
   assert.equal(JSON.stringify(receipt).includes(CONTRIBUTION_ID), false);
+});
+
+test("opt-in public v1.2 mode splits private health from cookie-free Device requests", async () => {
+  const fake = fakeDependencies();
+  const receipt = await runSyntheticV12Smoke({
+    config: parseSyntheticV12SmokeConfig(env({
+      PUBLIC_V12_GATEWAY_ORIGIN: SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN,
+    })),
+    dependencies: fake.dependencies,
+  });
+  const privateCalls = fake.calls.filter((call) => call.url.origin === CLOUD_RUN_IAM_TEST_TARGET.origin);
+  const gatewayCalls = fake.calls.filter((call) =>
+    call.url.origin === SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN);
+  assert.equal(privateCalls.length, 2, "only the anonymous probe and IAM health check use the backend");
+  assert.equal(privateCalls[0].options.headers["x-serverless-authorization"], undefined);
+  assert.match(privateCalls[1].options.headers["x-serverless-authorization"], /^Bearer /u);
+  assert.equal(privateCalls[1].url.pathname, "/api/health");
+  assert.equal(gatewayCalls.length, 14);
+  assert.equal(fake.getTokenCount, 1, "the backend ID token is acquired only for private health");
+  const expectedPaths = new Set([
+    "/api/v1/device/sync/state",
+    "/api/v1/device/telemetry/v1.2/day-manifests",
+    "/api/v1/device/upload-authorizations",
+    "/api/v1/contributions",
+    "/api/v1/me/telemetry-v12/domain-predecessor",
+    "/api/v1/me/telemetry-v12/domain-activate",
+    "/api/v1/device/credential/renew",
+  ]);
+  assert.deepEqual(new Set(gatewayCalls.map((call) => call.url.pathname)), expectedPaths);
+  assert.equal(receipt.deviceRequestPath, "public_test_gateway");
+  for (const call of gatewayCalls) {
+    assert.equal(call.options.redirect, "manual");
+    assert.equal(call.options.credentials, "omit");
+    assert.equal(call.options.headers.origin, SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN);
+    assert.equal(call.options.headers.cookie, undefined);
+    assert.equal(call.options.headers["x-serverless-authorization"], undefined);
+    assert.match(call.options.headers.authorization, /^(?:Device um_device_|Upload um_device_upload_)/u);
+  }
+  for (const secret of [SERVERLESS_TOKEN, DEVICE_SECRET, fake.replacementSecret,
+    fake.replacementAuthorization, GRANT_TOKEN_1, PREDECESSOR_TOKEN, DOMAIN_FINGERPRINT]) {
+    assert.equal(JSON.stringify(receipt).includes(secret), false);
+  }
+});
+
+test("public v1.2 mode rejects unpinned gateway config before checking or seeding", async () => {
+  const fake = fakeDependencies();
+  const config = {
+    ...parseSyntheticV12SmokeConfig(env()),
+    publicV12GatewayOrigin: "https://untrusted.example",
+  };
+  await assert.rejects(
+    runSyntheticV12Smoke({ config, dependencies: fake.dependencies }),
+    { code: "SMOKE_CONFIGURATION_INVALID" },
+  );
+  assert.equal(fake.seedCount, 0);
+  assert.equal(fake.calls.length, 0);
+});
+
+test("public v1.2 mode rejects cross-origin replies, redirects, and cookies", async () => {
+  const config = parseSyntheticV12SmokeConfig(env({
+    PUBLIC_V12_GATEWAY_ORIGIN: SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN,
+  }));
+  for (const [dependencies, code] of [
+    [fakeDependencies({
+      gatewayResponseUrl: "https://attacker.invalid/api/v1/device/sync/state",
+    }).dependencies, "SMOKE_GATEWAY_ORIGIN_REJECTED"],
+    [fakeDependencies({ gatewayRedirectStatus: 302 }).dependencies, "SMOKE_GATEWAY_REDIRECT_REJECTED"],
+    [fakeDependencies({ gatewaySetCookie: true }).dependencies, "SMOKE_GATEWAY_COOKIE_REJECTED"],
+  ]) {
+    await assert.rejects(
+      runSyntheticV12Smoke({ config, dependencies }),
+      { code, orphaned: true },
+    );
+  }
 });
 
 test("oversized hosted JSON response is rejected before synthetic authority is seeded", async () => {

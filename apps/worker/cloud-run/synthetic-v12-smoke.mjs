@@ -29,6 +29,8 @@ import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
 export const SYNTHETIC_V12_SMOKE_JOB = "tibotattle-v12-smoke";
 export const SYNTHETIC_V12_SMOKE_BUCKET = CLOUD_RUN_IAM_TEST_TARGET.gcsBucket;
 export const SYNTHETIC_V12_SMOKE_PARTICIPANT_PREFIX = "synthetic-v12-smoke-";
+export const SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN =
+  "https://tibotattle-test-oauth-gateway-806510610397.us-east1.run.app";
 export const SYNTHETIC_V12_SMOKE_DATABASE_TARGET = Object.freeze({
   primaryDatabase: CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.database,
   primarySchema: CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.schema,
@@ -58,6 +60,15 @@ const SYNC_STATE_PATH = "/api/v1/device/sync/state";
 const DOMAIN_PREDECESSOR_PATH = "/api/v1/me/telemetry-v12/domain-predecessor";
 const DOMAIN_ACTIVATE_PATH = "/api/v1/me/telemetry-v12/domain-activate";
 const DEVICE_CREDENTIAL_RENEWAL_PATH = "/api/v1/device/credential/renew";
+const PUBLIC_V12_DEVICE_PATHS = new Set([
+  SYNC_STATE_PATH,
+  MANIFEST_PATH,
+  GRANT_PATH,
+  CHUNK_PATH,
+  DOMAIN_PREDECESSOR_PATH,
+  DOMAIN_ACTIVATE_PATH,
+  DEVICE_CREDENTIAL_RENEWAL_PATH,
+]);
 const encoder = new TextEncoder();
 
 function fail(code, extras = {}) {
@@ -107,6 +118,11 @@ export function parseSyntheticV12SmokeConfig(env) {
   }
   if (env.HOST_ORIGIN !== SMOKE_ORIGIN) fail("HOST_ORIGIN_INVALID");
   if (env.GCS_BUCKET_NAME !== SYNTHETIC_V12_SMOKE_BUCKET) fail("GCS_BUCKET_NAME_INVALID");
+  const publicV12GatewayOrigin = env.PUBLIC_V12_GATEWAY_ORIGIN ?? null;
+  if (publicV12GatewayOrigin !== null
+      && publicV12GatewayOrigin !== SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN) {
+    fail("PUBLIC_V12_GATEWAY_ORIGIN_INVALID");
+  }
 
   const primarySchema = required(env.PRIMARY_SCHEMA, "PRIMARY_SCHEMA", SCHEMA_PATTERN);
   const ledgerSchema = required(env.LEDGER_SCHEMA, "LEDGER_SCHEMA", SCHEMA_PATTERN);
@@ -142,6 +158,7 @@ export function parseSyntheticV12SmokeConfig(env) {
     execution: env.CLOUD_RUN_EXECUTION,
     project: env.GOOGLE_CLOUD_PROJECT,
     origin: SMOKE_ORIGIN,
+    publicV12GatewayOrigin,
     primarySchema,
     ledgerSchema,
     primaryDatabase,
@@ -505,14 +522,35 @@ function sha256Hex(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-async function requestJson({ fetchImpl, getIdToken, origin, method, path, authorization, body }) {
-  const token = await getIdToken(origin);
-  if (typeof token !== "string" || token.length < 1 || token.length > 8192
-      || /[\r\n]/u.test(token)) fail("SMOKE_ID_TOKEN_UNAVAILABLE");
-  const headers = {
-    "x-serverless-authorization": `Bearer ${token}`,
-    accept: "application/json",
-  };
+async function requestJson({
+  fetchImpl,
+  getIdToken,
+  origin,
+  publicV12GatewayOrigin,
+  method,
+  path,
+  authorization,
+  body,
+}) {
+  const publicGatewayRequest = publicV12GatewayOrigin !== null
+    && publicV12GatewayOrigin !== undefined
+    && PUBLIC_V12_DEVICE_PATHS.has(path);
+  if (publicGatewayRequest
+      && publicV12GatewayOrigin !== SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN) {
+    fail("PUBLIC_V12_GATEWAY_ORIGIN_INVALID");
+  }
+  const requestOrigin = publicGatewayRequest ? publicV12GatewayOrigin : origin;
+  const headers = { accept: "application/json" };
+  if (publicGatewayRequest) {
+    // The public gateway checks Origin on POSTs; it obtains its own backend ID
+    // token. This job sends only the participant's Device or Upload capability.
+    headers.origin = publicV12GatewayOrigin;
+  } else {
+    const token = await getIdToken(origin);
+    if (typeof token !== "string" || token.length < 1 || token.length > 8192
+        || /[\r\n]/u.test(token)) fail("SMOKE_ID_TOKEN_UNAVAILABLE");
+    headers["x-serverless-authorization"] = `Bearer ${token}`;
+  }
   if (authorization !== undefined) headers.authorization = authorization;
   if (body !== undefined) {
     if (typeof body !== "string" || Buffer.byteLength(body) > MAX_HTTP_REQUEST_BYTES) {
@@ -520,10 +558,10 @@ async function requestJson({ fetchImpl, getIdToken, origin, method, path, author
     }
     headers["content-type"] = "application/json; charset=utf-8";
   }
-  const url = new URL(path, origin);
+  const url = new URL(path, requestOrigin);
   const allowedPaths = [MANIFEST_PATH, GRANT_PATH, CHUNK_PATH, SYNC_STATE_PATH,
     DOMAIN_PREDECESSOR_PATH, DOMAIN_ACTIVATE_PATH, DEVICE_CREDENTIAL_RENEWAL_PATH, "/api/health"];
-  if (url.origin !== origin || !allowedPaths.includes(path)
+  if (url.origin !== requestOrigin || !allowedPaths.includes(path)
       || (["/api/health", SYNC_STATE_PATH].includes(path) ? method !== "GET" : method !== "POST")) {
     fail("SMOKE_ROUTE_INVALID");
   }
@@ -534,13 +572,41 @@ async function requestJson({ fetchImpl, getIdToken, origin, method, path, author
       headers,
       ...(body === undefined ? {} : { body }),
       redirect: "manual",
+      ...(publicGatewayRequest ? { credentials: "omit" } : {}),
       signal: AbortSignal.timeout(120_000),
     });
   } catch {
     fail("SMOKE_HTTP_UNAVAILABLE");
   }
-  safeRedirect(response, origin);
+  if (publicGatewayRequest) safePublicGatewayResponse(response, url);
+  else safeRedirect(response, origin);
   return { response, value: await readJson(response) };
+}
+
+function safePublicGatewayResponse(response, requestUrl) {
+  if (response === null || typeof response !== "object"
+      || response.redirected === true
+      || (Number.isInteger(response.status) && response.status >= 300 && response.status < 400)) {
+    fail("SMOKE_GATEWAY_REDIRECT_REJECTED");
+  }
+  let responseUrl;
+  try {
+    if (typeof response.url !== "string" || response.url.length === 0) {
+      fail("SMOKE_GATEWAY_ORIGIN_REJECTED");
+    }
+    responseUrl = new URL(response.url);
+  } catch {
+    fail("SMOKE_GATEWAY_ORIGIN_REJECTED");
+  }
+  if (responseUrl.origin !== SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN
+      || responseUrl.href !== requestUrl.href) {
+    fail("SMOKE_GATEWAY_ORIGIN_REJECTED");
+  }
+  const cookies = response.headers?.getSetCookie?.() ?? [];
+  const combinedCookie = response.headers?.get?.("set-cookie");
+  if (cookies.length > 0 || (typeof combinedCookie === "string" && combinedCookie.length > 0)) {
+    fail("SMOKE_GATEWAY_COOKIE_REJECTED");
+  }
 }
 
 async function checkUnauthenticatedOrigin({ fetchImpl, origin }) {
@@ -723,9 +789,19 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
     if (typeof deps?.[name] !== "function") fail("SMOKE_DEPENDENCIES_INVALID");
   }
   if (config?.origin !== SMOKE_ORIGIN || config?.bucket !== SYNTHETIC_V12_SMOKE_BUCKET
-      || typeof config?.day !== "string" || !DAY_PATTERN.test(config.day)) {
+      || typeof config?.day !== "string" || !DAY_PATTERN.test(config.day)
+      || (config.publicV12GatewayOrigin !== null
+        && config.publicV12GatewayOrigin !== undefined
+        && config.publicV12GatewayOrigin !== SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN)) {
     fail("SMOKE_CONFIGURATION_INVALID");
   }
+  const request = (options) => requestJson({
+    fetchImpl: deps.fetchImpl,
+    getIdToken: deps.getIdToken,
+    origin: config.origin,
+    publicV12GatewayOrigin: config.publicV12GatewayOrigin,
+    ...options,
+  });
   let seeded = false;
   try {
     await deps.validateEnvelopeKey(config.envelopePublicJwk);
@@ -733,10 +809,7 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
     if (!safeObject(controls) || controls.controlState !== "degraded"
         || controls.publicationEnabled !== false) fail("SMOKE_RUNTIME_CONTROLS_NOT_READY");
     await checkUnauthenticatedOrigin({ fetchImpl: deps.fetchImpl, origin: config.origin });
-    const { response: healthResponse, value: health } = await requestJson({
-      fetchImpl: deps.fetchImpl,
-      getIdToken: deps.getIdToken,
-      origin: config.origin,
+    const { response: healthResponse, value: health } = await request({
       method: "GET",
       path: "/api/health",
     });
@@ -764,10 +837,7 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       fail("SMOKE_FIXTURE_INVALID", { orphaned: true });
     }
 
-    const { response: syncResponse, value: syncState } = await requestJson({
-      fetchImpl: deps.fetchImpl,
-      getIdToken: deps.getIdToken,
-      origin: config.origin,
+    const { response: syncResponse, value: syncState } = await request({
       method: "GET",
       path: SYNC_STATE_PATH,
       authorization: fixture.deviceAuthorization,
@@ -788,10 +858,7 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       randomUUIDImpl: deps.randomUUID,
     });
     const manifestBody = JSON.stringify(manifest);
-    const postManifest = async () => requestJson({
-      fetchImpl: deps.fetchImpl,
-      getIdToken: deps.getIdToken,
-      origin: config.origin,
+    const postManifest = async () => request({
       method: "POST",
       path: MANIFEST_PATH,
       authorization: fixture.deviceAuthorization,
@@ -821,19 +888,13 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       contentType: "application/json",
       telemetrySchemaVersion: TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
     });
-    const issueGrant = async () => requestJson({
-      fetchImpl: deps.fetchImpl,
-      getIdToken: deps.getIdToken,
-      origin: config.origin,
+    const issueGrant = async () => request({
       method: "POST",
       path: GRANT_PATH,
       authorization: fixture.deviceAuthorization,
       body: grantBody,
     });
-    const uploadChunk = async (uploadAuthorization) => requestJson({
-      fetchImpl: deps.fetchImpl,
-      getIdToken: deps.getIdToken,
-      origin: config.origin,
+    const uploadChunk = async (uploadAuthorization) => request({
       method: "POST",
       path: CHUNK_PATH,
       authorization: uploadAuthorization,
@@ -869,10 +930,7 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       fail("SMOKE_CHUNK_REPLAY_MISMATCH");
     }
 
-    const { response: predecessorResponse, value: predecessor } = await requestJson({
-      fetchImpl: deps.fetchImpl,
-      getIdToken: deps.getIdToken,
-      origin: config.origin,
+    const { response: predecessorResponse, value: predecessor } = await request({
       method: "POST",
       path: DOMAIN_PREDECESSOR_PATH,
       authorization: fixture.deviceAuthorization,
@@ -907,10 +965,7 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       telemetryV12DomainManifestDigestInput(domainManifest),
     ));
     const domainManifestBody = JSON.stringify(domainManifest);
-    const activateDomain = async () => requestJson({
-      fetchImpl: deps.fetchImpl,
-      getIdToken: deps.getIdToken,
-      origin: config.origin,
+    const activateDomain = async () => request({
       method: "POST",
       path: DOMAIN_ACTIVATE_PATH,
       authorization: fixture.deviceAuthorization,
@@ -952,10 +1007,7 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       nextDeviceSecretHash: deviceSecretHash(fixture.deviceId, replacementSecret).toString("hex"),
       rotationAttemptId,
     });
-    const rotateDeviceCredential = () => requestJson({
-      fetchImpl: deps.fetchImpl,
-      getIdToken: deps.getIdToken,
-      origin: config.origin,
+    const rotateDeviceCredential = () => request({
       method: "POST",
       path: DEVICE_CREDENTIAL_RENEWAL_PATH,
       authorization: fixture.deviceAuthorization,
@@ -985,10 +1037,7 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
     }
 
     const replacementAuthorization = `Device um_device_${fixture.deviceId}.${replacementSecret}`;
-    const { response: replacementSyncResponse, value: replacementSyncState } = await requestJson({
-      fetchImpl: deps.fetchImpl,
-      getIdToken: deps.getIdToken,
-      origin: config.origin,
+    const { response: replacementSyncResponse, value: replacementSyncState } = await request({
       method: "GET",
       path: SYNC_STATE_PATH,
       authorization: replacementAuthorization,
@@ -1000,10 +1049,7 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       fail("SMOKE_DEVICE_CREDENTIAL_RENEWAL_NEW_SECRET_AUTHORITY_INVALID");
     }
 
-    const { response: priorSecretResponse, value: priorSecretResult } = await requestJson({
-      fetchImpl: deps.fetchImpl,
-      getIdToken: deps.getIdToken,
-      origin: config.origin,
+    const { response: priorSecretResponse, value: priorSecretResult } = await request({
       method: "GET",
       path: SYNC_STATE_PATH,
       authorization: fixture.deviceAuthorization,
@@ -1036,6 +1082,8 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       synthetic: true,
       participantId: fixture.participantId,
       origin: config.origin,
+      ...(config.publicV12GatewayOrigin === SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN
+        ? { deviceRequestPath: "public_test_gateway" } : {}),
       manifest: "staged_and_exactly_replayed",
       chunk: "staged_and_exactly_replayed",
       domain: "activated_and_exactly_replayed",
