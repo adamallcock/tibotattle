@@ -109,8 +109,8 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL 17 sealed ingestion journal transfe
       await pool.query(`CREATE SCHEMA ${quoted}`);
       schemaCreated = true;
       const migration = await applyPostgresMigrations({ role: "primary", schema, pool });
-      expect(migration.applied).toBe(38);
-      expect(migration.migrations.at(-1)?.name).toBe("0038_analytics_event_tuple_versions.sql");
+      expect(migration.applied).toBe(39);
+      expect(migration.migrations.at(-1)?.name).toBe("0039_analytics_applied_projection_v1.sql");
       fixture = await makeSealedSource();
 
       await pool.query(`ALTER TABLE ${table("storage_ingestion_changes")}

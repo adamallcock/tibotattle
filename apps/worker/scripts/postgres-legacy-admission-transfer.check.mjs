@@ -197,7 +197,7 @@ test("PG17 transfer requires both base receipts, checkpoints pages, resumes, and
     await pool.query(`CREATE SCHEMA ${quote(controlSchema)}`);
     controlCreated = true;
     const migration = await applyPostgresMigrations({ role: "primary", schema: targetSchema, pool });
-    assert.equal(migration.applied, 38);
+    assert.equal(migration.applied, 39);
     await pool.query(`INSERT INTO ${quote(targetSchema)}.typed_telemetry_namespaces(id,original_id) VALUES(1,$1)`, [Buffer.from([1, 2])]);
     await pool.query(`INSERT INTO ${quote(targetSchema)}.typed_telemetry_source_family_receipts
       (source_namespace,source_format,generation,source_digest,source_row_count,membership_row_count,reconciled_at)
