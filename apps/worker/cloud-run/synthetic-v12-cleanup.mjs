@@ -2,6 +2,7 @@
 
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { Connector } from "@google-cloud/cloud-sql-connector";
 import { GcsErasureObjectStore, createGcsErasureBucketHistoryProof } from "../src/gcs-erasure-object-store.ts";
 import { eraseSyntheticPostgresV12Owner } from "../src/postgres-owner-erasure.ts";
@@ -27,7 +28,7 @@ export const SYNTHETIC_V12_CLEANUP_TARGETS = Object.freeze({
   iamUser: CLOUD_RUN_IAM_TEST_TARGET.postgres.iamUser,
   project: CLOUD_RUN_IAM_TEST_TARGET.project,
   origin: CLOUD_RUN_IAM_TEST_TARGET.origin,
-  bucket: CLOUD_RUN_IAM_TEST_TARGET.gcsBucket,
+  bucketPrefix: "tibotattle-gcs-test-cleanup-",
 });
 
 const METADATA_EMAIL_URL =
@@ -65,12 +66,73 @@ function validateParticipantId(value) {
   return value;
 }
 
-function validateBucketProof(value) {
+function record(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function cleanupBucketName(value) {
+  return typeof value === "string"
+    && value.startsWith(SYNTHETIC_V12_CLEANUP_TARGETS.bucketPrefix)
+    && value.length > SYNTHETIC_V12_CLEANUP_TARGETS.bucketPrefix.length
+    && value.length <= 63
+    && /^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/u.test(value);
+}
+
+function expectedBucketCreateRequest(bucket) {
+  return {
+    name: bucket,
+    location: "US-EAST1",
+    storageClass: "STANDARD",
+    iamConfiguration: { uniformBucketLevelAccess: { enabled: true } },
+    publicAccessPrevention: "enforced",
+    softDeletePolicy: { retentionDurationSeconds: "0" },
+    versioning: { enabled: false },
+  };
+}
+
+function validateBucketProof(value, expectedBucket) {
   let parsed;
   try { parsed = JSON.parse(value); } catch { fail("SYNTHETIC_CLEANUP_BUCKET_PROOF_INVALID"); }
   try {
-    const proof = createGcsErasureBucketHistoryProof(parsed);
-    if (proof.bucket !== SYNTHETIC_V12_CLEANUP_TARGETS.bucket) {
+    if (!record(parsed)
+        || parsed.schemaVersion !== "gcs-erasure-bucket-history-receipt-v1"
+        || parsed.source !== "storage.buckets.insert"
+        || parsed.project !== SYNTHETIC_V12_CLEANUP_TARGETS.project
+        || parsed.projectNumber !== "806510610397"
+        || !SHA256_PATTERN.test(parsed.creationRequestSha256 ?? "")
+        || !SHA256_PATTERN.test(parsed.creationResponseSha256 ?? "")
+        || parsed.creationRequestSha256 !== createHash("sha256")
+          .update(JSON.stringify(expectedBucketCreateRequest(expectedBucket))).digest("hex")
+        || !record(parsed.creationResponse)) {
+      fail("SYNTHETIC_CLEANUP_BUCKET_PROOF_INVALID");
+    }
+    const response = parsed.creationResponse;
+    const allowedFields = [
+      "bucket", "projectNumber", "bucketGeneration", "bucketMetageneration", "location", "timeCreated",
+      "softDeleteRetentionDurationSeconds", "uniformBucketLevelAccess",
+      "publicAccessPrevention", "versioningEnabled",
+    ].sort();
+    if (Object.keys(response).sort().join("\n") !== allowedFields.join("\n")
+        || response.bucket !== expectedBucket
+        || response.projectNumber !== "806510610397"
+        || response.bucketMetageneration !== "1"
+        || response.location !== "US-EAST1"
+        || response.softDeleteRetentionDurationSeconds !== "0"
+        || response.uniformBucketLevelAccess !== true
+        || response.publicAccessPrevention !== "enforced"
+        || response.versioningEnabled !== false
+        || typeof response.timeCreated !== "string"
+        || !Number.isFinite(Date.parse(response.timeCreated))
+        || createHash("sha256").update(JSON.stringify(response)).digest("hex")
+          !== parsed.creationResponseSha256) {
+      fail("SYNTHETIC_CLEANUP_BUCKET_PROOF_INVALID");
+    }
+    const proof = createGcsErasureBucketHistoryProof(parsed.proof);
+    if (proof.bucket !== expectedBucket
+        || proof.bucketGeneration !== response.bucketGeneration
+        || proof.bucketMetageneration !== response.bucketMetageneration
+        || proof.softDeleteRetentionDurationSeconds
+          !== response.softDeleteRetentionDurationSeconds) {
       fail("SYNTHETIC_CLEANUP_BUCKET_PROOF_INVALID");
     }
     return proof;
@@ -117,10 +179,10 @@ export function parseSyntheticV12CleanupConfig(env, attachedServiceAccountEmail)
       || !DATABASE_PATTERN.test(env.LEDGER_DATABASE ?? "")) {
     fail("POSTGRES_SYNTHETIC_CLEANUP_TARGET_INVALID");
   }
-  if (env.GCS_BUCKET_NAME !== SYNTHETIC_V12_CLEANUP_TARGETS.bucket) {
+  if (!cleanupBucketName(env.GCS_BUCKET_NAME)) {
     fail("GCS_SYNTHETIC_CLEANUP_BUCKET_INVALID");
   }
-  const historyProof = validateBucketProof(env.GCS_ERASURE_BUCKET_HISTORY_PROOF);
+  const historyProof = validateBucketProof(env.GCS_ERASURE_BUCKET_HISTORY_PROOF, env.GCS_BUCKET_NAME);
   const participantId = validateParticipantId(env.SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID);
   return Object.freeze({
     job: SYNTHETIC_V12_CLEANUP_JOB,
@@ -131,7 +193,7 @@ export function parseSyntheticV12CleanupConfig(env, attachedServiceAccountEmail)
     primary,
     ledger,
     iamUser: SYNTHETIC_V12_CLEANUP_TARGETS.iamUser,
-    bucket: SYNTHETIC_V12_CLEANUP_TARGETS.bucket,
+    bucket: env.GCS_BUCKET_NAME,
     historyProof,
     participantId,
   });

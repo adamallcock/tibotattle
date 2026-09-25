@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { lstat, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
@@ -43,12 +43,48 @@ const {
 } = await import(pathToFileURL(cliPath).href);
 test.after(async () => { await rm(cliDirectory, { recursive: true, force: true }); });
 
-function proof(bucket = SYNTHETIC_V12_CLEANUP_TARGETS.bucket) {
-  return JSON.stringify({
+const CLEANUP_BUCKET = "tibotattle-gcs-test-cleanup-20260925-smoke";
+
+function digest(value) {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function proof(bucket = CLEANUP_BUCKET) {
+  const creationRequest = {
+    name: bucket,
+    location: "US-EAST1",
+    storageClass: "STANDARD",
+    iamConfiguration: { uniformBucketLevelAccess: { enabled: true } },
+    publicAccessPrevention: "enforced",
+    softDeletePolicy: { retentionDurationSeconds: "0" },
+    versioning: { enabled: false },
+  };
+  const creationResponse = {
     bucket,
+    projectNumber: "806510610397",
     bucketGeneration: "1",
     bucketMetageneration: "1",
+    location: "US-EAST1",
+    timeCreated: "2026-09-25T04:30:00.000Z",
     softDeleteRetentionDurationSeconds: "0",
+    uniformBucketLevelAccess: true,
+    publicAccessPrevention: "enforced",
+    versioningEnabled: false,
+  };
+  return JSON.stringify({
+    schemaVersion: "gcs-erasure-bucket-history-receipt-v1",
+    source: "storage.buckets.insert",
+    project: SYNTHETIC_V12_CLEANUP_TARGETS.project,
+    projectNumber: "806510610397",
+    creationRequestSha256: digest(creationRequest),
+    creationResponse,
+    creationResponseSha256: digest(creationResponse),
+    proof: {
+      bucket,
+      bucketGeneration: "1",
+      bucketMetageneration: "1",
+      softDeleteRetentionDurationSeconds: "0",
+    },
   });
 }
 
@@ -69,7 +105,7 @@ function validEnv(overrides = {}) {
     LEDGER_INSTANCE_CONNECTION_NAME: SYNTHETIC_V12_CLEANUP_TARGETS.ledger.instanceConnectionName,
     LEDGER_DATABASE: SYNTHETIC_V12_CLEANUP_TARGETS.ledger.database,
     LEDGER_SCHEMA: SYNTHETIC_V12_CLEANUP_TARGETS.ledger.schema,
-    GCS_BUCKET_NAME: SYNTHETIC_V12_CLEANUP_TARGETS.bucket,
+    GCS_BUCKET_NAME: CLEANUP_BUCKET,
     GCS_ERASURE_BUCKET_HISTORY_PROOF: proof(),
     SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID: `synthetic-v12-smoke-${randomUUID()}`,
     ...overrides,
@@ -119,12 +155,12 @@ function migrationPool(role, migrations) {
   };
 }
 
-test("cleanup config pins the one-task job, service, origin, IAM identity, PG targets, bucket and one v1.2 fixture", () => {
+test("cleanup config requires a provisioned test bucket receipt and pins the one-task owner target", () => {
   const env = validEnv();
   const parsed = parseSyntheticV12CleanupConfig(env, SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT);
   assert.equal(parsed.job, SYNTHETIC_V12_CLEANUP_JOB);
   assert.equal(parsed.origin, SYNTHETIC_V12_CLEANUP_TARGETS.origin);
-  assert.equal(parsed.bucket, SYNTHETIC_V12_CLEANUP_TARGETS.bucket);
+  assert.equal(parsed.bucket, CLEANUP_BUCKET);
   assert.match(parsed.participantId, /^synthetic-v12-smoke-[0-9a-f-]{36}$/u);
   for (const overrides of [
     { CLOUD_RUN_TASK_INDEX: "1" },
@@ -142,12 +178,26 @@ test("cleanup config pins the one-task job, service, origin, IAM identity, PG ta
     { LEDGER_DATABASE: "another" },
     { LEDGER_SCHEMA: "another" },
     { GCS_BUCKET_NAME: "another-test-bucket" },
+    { GCS_BUCKET_NAME: SYNTHETIC_V12_CLEANUP_TARGETS.bucket },
     { GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("another-test-bucket") },
     { SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID: "participant:real-user" },
     { SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID: "synthetic-v12-smoke-not-a-uuid" },
   ]) {
     assert.throws(() => parseSyntheticV12CleanupConfig({ ...env, ...overrides }, SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT));
   }
+  const alteredReceipt = JSON.parse(proof());
+  alteredReceipt.creationResponse.softDeleteRetentionDurationSeconds = "604800";
+  assert.throws(() => parseSyntheticV12CleanupConfig({
+    ...env,
+    GCS_ERASURE_BUCKET_HISTORY_PROOF: JSON.stringify(alteredReceipt),
+  }, SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT));
+  const wrongProjectReceipt = JSON.parse(proof());
+  wrongProjectReceipt.creationResponse.projectNumber = "123456789012";
+  wrongProjectReceipt.creationResponseSha256 = digest(wrongProjectReceipt.creationResponse);
+  assert.throws(() => parseSyntheticV12CleanupConfig({
+    ...env,
+    GCS_ERASURE_BUCKET_HISTORY_PROOF: JSON.stringify(wrongProjectReceipt),
+  }, SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT));
   assert.throws(() => parseSyntheticV12CleanupConfig(env, "another@tibotattle.iam.gserviceaccount.com"));
   assert.throws(() => parseSyntheticV12CleanupConfig(env, SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT + ".evil"));
 });
@@ -211,8 +261,8 @@ test("injected cleanup execution verifies both PG receipts and returns a redacte
       async createAccessTokenProvider() { return async () => "synthetic-token"; },
       createObjectStore({ bucket, historyProof }) {
         storeConstructed = true;
-        assert.equal(bucket, SYNTHETIC_V12_CLEANUP_TARGETS.bucket);
-        assert.equal(historyProof.bucket, SYNTHETIC_V12_CLEANUP_TARGETS.bucket);
+        assert.equal(bucket, CLEANUP_BUCKET);
+        assert.equal(historyProof.bucket, CLEANUP_BUCKET);
         return { async deleteBatch() {} };
       },
       async eraseOwner(options) {

@@ -382,14 +382,22 @@ export class GcsErasureObjectStore implements ParticipantErasureObjectStore {
     close(context, false);
     if (!isRecord(value)) throw unavailable();
     const policy = value.softDeletePolicy;
-    if (!isRecord(policy)) throw unavailable();
-    if (typeof policy.retentionDurationSeconds !== "string") throw unavailable();
+    // Cloud Storage omits softDeletePolicy when it is disabled (the JSON
+    // representation of retentionDurationSeconds=0). That absence is safe to
+    // interpret only in conjunction with the separately pinned provisioning
+    // proof checked by the caller. A present but malformed policy still fails
+    // closed.
+    if (policy !== undefined && !isRecord(policy)) throw unavailable();
+    const retentionDurationSeconds = policy === undefined
+      ? GCS_BUCKET_HISTORY_PROOF_RETENTION_SECONDS
+      : policy.retentionDurationSeconds;
+    if (typeof retentionDurationSeconds !== "string") throw unavailable();
     // Validate the two opaque counters with BigInt-backed generation(), but
     // retain their exact decimal strings for the proof comparison.
     return {
       bucketGeneration: generation(value.generation),
       bucketMetageneration: generation(value.metageneration),
-      softDeleteRetentionDurationSeconds: policy.retentionDurationSeconds,
+      softDeleteRetentionDurationSeconds: retentionDurationSeconds,
     };
   }
 
