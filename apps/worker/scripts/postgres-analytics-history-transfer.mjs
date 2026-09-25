@@ -5,6 +5,7 @@ import { isAbsolute } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 export const POSTGRES_ANALYTICS_HISTORY_TRANSFER_SCHEMA = "postgres-analytics-history-transfer-v1";
+export const SEALED_ANALYTICS_EVENT_EXPORT_SCHEMA = "sealed-sqlite-analytics-events-v1";
 export const POSTGRES_ANALYTICS_HISTORY_DEFAULT_PAGE_SIZE = 100;
 export const POSTGRES_ANALYTICS_HISTORY_MAX_PAGE_SIZE = 200;
 export const POSTGRES_ANALYTICS_HISTORY_TARGET_SCHEMA_PREFIX = "analytics_history_transfer_target_";
@@ -54,6 +55,16 @@ const SPECS = Object.freeze([
   }),
 ]);
 const SPEC_BY_NAME = new Map(SPECS.map(spec => [spec.name, spec]));
+const ANALYTICS_EVENT_SPEC = Object.freeze({
+  name: "analytics_applied_events",
+  columns: SOURCE_TABLES.analytics_applied_events.columns,
+  types: Object.freeze(["text", "i64", "text", "text", "i64", "text", "text", "text", "i64", "i64", "i64"]),
+  key: Object.freeze(["source_id", "sequence"]),
+});
+const SEALED_SOURCE_PAGE_SPEC_BY_NAME = new Map([
+  ...SPECS.map(spec => [spec.name, spec]),
+  [ANALYTICS_EVENT_SPEC.name, ANALYTICS_EVENT_SPEC],
+]);
 
 // These families are deliberately not part of this import. They either have a
 // different PostgreSQL contract or require authority fields not present in the
@@ -145,6 +156,16 @@ function validateTransferRow(spec, row) {
   validateSourceId(row.source_id);
   if (spec.name === "analytics_source_cursors") {
     if (BigInt(row.sequence) < 0n || BigInt(row.authority_epoch) < 0n) fail("ANALYTICS_HISTORY_CURSOR_INVALID");
+    return;
+  }
+  if (spec.name === "analytics_applied_events") {
+    validateOwnerDigest(row.owner_digest);
+    if (BigInt(row.sequence) < 1n || BigInt(row.revision) < 1n || BigInt(row.authority_epoch) < 1n
+        || BigInt(row.public_authority_epoch) < 1n || BigInt(row.recorded_ms) < 0n
+        || ![row.event_digest, row.object_digest, row.content_digest].every(value => SHA256.test(value ?? ""))
+        || !["source-updated", "owner-active", "owner-withdrawn", "owner-erased"].includes(row.kind)) {
+      fail("ANALYTICS_HISTORY_EVENT_INVALID");
+    }
     return;
   }
   validateOwnerDigest(row.owner_digest);
@@ -341,7 +362,7 @@ export async function createSealedSqliteAnalyticsHistorySource({ path, expectedS
     },
     async listPage({ table, after = null, limit } = {}) {
       if (closed) fail("ANALYTICS_HISTORY_SQLITE_CLOSED");
-      const spec = SPEC_BY_NAME.get(table);
+      const spec = SEALED_SOURCE_PAGE_SPEC_BY_NAME.get(table);
       if (!spec) fail("ANALYTICS_HISTORY_TABLE_INVALID");
       validatePageSize(limit);
       if (table === "analytics_source_cursors" && after !== null) validateSourceId(after);
@@ -349,6 +370,11 @@ export async function createSealedSqliteAnalyticsHistorySource({ path, expectedS
         if (!after || typeof after !== "object" || Array.isArray(after)) fail("ANALYTICS_HISTORY_CURSOR_INVALID");
         validateSourceId(after.sourceId);
         validateOwnerDigest(after.ownerDigest);
+      }
+      if (table === "analytics_applied_events" && after !== null) {
+        if (!after || typeof after !== "object" || Array.isArray(after)) fail("ANALYTICS_HISTORY_CURSOR_INVALID");
+        validateSourceId(after.sourceId);
+        if (BigInt(normalizeInteger(after.sequence)) < 1n) fail("ANALYTICS_HISTORY_CURSOR_INVALID");
       }
       const statementKey = `${table}:${after === null ? "first" : "next"}`;
       let statement = prepared.get(statementKey);
@@ -358,6 +384,12 @@ export async function createSealedSqliteAnalyticsHistorySource({ path, expectedS
           ? after === null
             ? `SELECT ${columns} FROM "${table}" ORDER BY source_id COLLATE BINARY LIMIT ?`
             : `SELECT ${columns} FROM "${table}" WHERE source_id COLLATE BINARY > ? COLLATE BINARY ORDER BY source_id COLLATE BINARY LIMIT ?`
+          : table === "analytics_applied_events"
+            ? after === null
+              ? `SELECT ${columns} FROM "${table}" ORDER BY source_id COLLATE BINARY,sequence LIMIT ?`
+              : `SELECT ${columns} FROM "${table}" WHERE source_id COLLATE BINARY > ? COLLATE BINARY
+                  OR (source_id COLLATE BINARY = ? COLLATE BINARY AND sequence > ?)
+                  ORDER BY source_id COLLATE BINARY,sequence LIMIT ?`
           : after === null
             ? `SELECT ${columns} FROM "${table}" ORDER BY source_id COLLATE BINARY, owner_digest COLLATE BINARY LIMIT ?`
             : `SELECT ${columns} FROM "${table}" WHERE source_id COLLATE BINARY > ? COLLATE BINARY
@@ -375,6 +407,9 @@ export async function createSealedSqliteAnalyticsHistorySource({ path, expectedS
         let rawRows;
         if (table === "analytics_source_cursors") {
           rawRows = after === null ? statement.all(BigInt(limit)) : statement.all(after, BigInt(limit));
+        } else if (table === "analytics_applied_events") {
+          rawRows = after === null ? statement.all(BigInt(limit))
+            : statement.all(after.sourceId, after.sourceId, BigInt(normalizeInteger(after.sequence)), BigInt(limit));
         } else if (after === null) rawRows = statement.all(BigInt(limit));
         else rawRows = statement.all(after.sourceId, after.sourceId, after.ownerDigest, BigInt(limit));
         if (rawRows.length > limit) fail("ANALYTICS_HISTORY_SOURCE_PAGE_INVALID");
@@ -419,12 +454,17 @@ function relation(schema, name) {
 
 function cursorFor(spec, row) {
   if (spec.name === "analytics_source_cursors") return row.source_id;
+  if (spec.name === "analytics_applied_events") {
+    return Object.freeze({ sourceId: row.source_id, sequence: row.sequence });
+  }
   return Object.freeze({ sourceId: row.source_id, ownerDigest: row.owner_digest });
 }
 
 function cursorIsAfter(spec, row, after) {
   if (after === null) return true;
   if (spec.name === "analytics_source_cursors") return row.source_id > after;
+  if (spec.name === "analytics_applied_events") return row.source_id > after.sourceId
+    || (row.source_id === after.sourceId && BigInt(row.sequence) > BigInt(after.sequence));
   return row.source_id > after.sourceId
     || (row.source_id === after.sourceId && row.owner_digest > after.ownerDigest);
 }
@@ -461,6 +501,54 @@ async function scanSourceTable(source, spec, pageSize) {
     if (page.rows.length < pageSize) break;
   }
   return Object.freeze({ rowCount: rowCount.toString(), sha256: hash.digest("hex") });
+}
+
+/**
+ * Produce a content-free receipt for the sealed D1 event journal. Callers can
+ * separately consume `source.listPage({ table: "analytics_applied_events" })`
+ * for bounded row export; this scanner never writes to PostgreSQL or advances
+ * an analytics cursor.
+ */
+export async function scanSealedSqliteAnalyticsEventJournal({
+  source,
+  pageSize = POSTGRES_ANALYTICS_HISTORY_DEFAULT_PAGE_SIZE,
+} = {}) {
+  const snapshot = assertSource(source);
+  const size = validatePageSize(pageSize);
+  const initial = await source.verifySnapshot();
+  if (initial?.snapshotId !== snapshot.snapshotId
+      || initial?.artifactSha256 !== snapshot.artifactSha256) fail("ANALYTICS_HISTORY_SOURCE_CHANGED");
+  const hash = sha256();
+  let rowCount = 0n;
+  let after = null;
+  let pagesRead = 0;
+  for (;;) {
+    const page = await source.listPage({ table: ANALYTICS_EVENT_SPEC.name, after, limit: size });
+    if (!page || !Array.isArray(page.rows) || page.rows.length > size) {
+      fail("ANALYTICS_HISTORY_SOURCE_PAGE_INVALID");
+    }
+    pagesRead += 1;
+    for (const row of page.rows) {
+      if (!cursorIsAfter(ANALYTICS_EVENT_SPEC, row, after)) fail("ANALYTICS_HISTORY_SOURCE_ORDER_INVALID");
+      updateRowHash(hash, ANALYTICS_EVENT_SPEC, row);
+      after = cursorFor(ANALYTICS_EVENT_SPEC, row);
+      rowCount += 1n;
+    }
+    if (page.rows.length < size) break;
+  }
+  const final = await source.verifySnapshot();
+  if (final?.snapshotId !== snapshot.snapshotId
+      || final?.artifactSha256 !== snapshot.artifactSha256) fail("ANALYTICS_HISTORY_SOURCE_CHANGED");
+  return Object.freeze({
+    schema: SEALED_ANALYTICS_EVENT_EXPORT_SCHEMA,
+    sourceSnapshotSha256: snapshot.artifactSha256,
+    eventRows: rowCount.toString(),
+    eventRowsSha256: hash.digest("hex"),
+    pageSize: size,
+    pagesRead,
+    postgresWrites: 0,
+    sourceCursorAdvanced: false,
+  });
 }
 
 async function scanSource(source, pageSize) {
