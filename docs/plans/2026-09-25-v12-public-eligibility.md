@@ -54,19 +54,22 @@ the reviewed source is deployed in the order below.
 
 ## Deployment order (owner-authorized, protected)
 
-1. Deploy the reviewed source first. Before `0011` it classifies no v1.2
-   events, and before `0010` it keeps the four-row renewal.
-2. Apply `0010`, then `0011`, to the live primary role. The 2026-09-22 typed
-   forward operator is pinned to its own predecessor and applies only
-   `0006`–`0009`. These two files need a reviewed forward operation of their
-   own. Do not append them to that operator's historical plan.
-3. Never apply `0011` before the source that understands its journal events.
-   Older runtimes route an unknown event to the v1.1 handler, which refuses it
-   and stalls ordered delivery. The ordered ledger already puts `0010` first,
-   so a grant that drifted before `0010` is repaired before its head can be
-   bridged.
-4. Verify health, then the public daily rows for recent days, then the admin
-   upload and eligibility counts.
+1. Deploy the two scheduled Workers (journal delivery and publication) first.
+   Their new code classifies no v1.2 event before `0011` and counts devices on
+   either schema, so no ordered-delivery stall can occur.
+2. Apply `0010`, then `0011`, to the live primary role, each with its ledger
+   row in the same request. The 2026-09-22 typed forward operator is pinned to
+   its own predecessor and applies only `0006`–`0009`; do not append these files
+   to that historical plan.
+3. Deploy the main Worker through the guarded typed wrapper. It derives the
+   expected schema from source migrations, so it can run only after step 2.
+4. Verify health, the public daily rows for recent days, and the admin upload
+   and eligibility counts.
+
+Never leave `0011` applied under a journal-delivery Worker older than this
+source: it would route a v1.2 event to the v1.1 handler, which refuses it and
+stalls ordered delivery. The ordered ledger already puts `0010` first, so a
+grant that drifted before `0010` is repaired before its head can be bridged.
 
 ## Validation
 
@@ -74,12 +77,32 @@ Recorded in the pull requests. The local gates are the full Worker Vitest
 suite, the typed preflight and forward-operator script checks, typecheck,
 documentation preflight and the architecture check.
 
+## Allowance and contributing devices
+
+- Allowance fits need no separate v1.2 path. Once a v1.2-only owner has an
+  analytics identity, the scheduled graph-work lane computes its fit from the
+  effective (v1/v1.1/v1.2) evidence and the preview publishes it. A graph test
+  covers a v1.2-only owner end to end through the public daily route.
+- `contributingDevices` now counts the distinct devices whose accepted,
+  non-empty evidence each contributing owner's day fold reads: every
+  owner-linked v1 chunk, retained v1.1 generation and retained v1.2 generation
+  for the effective reader; the head's device for the v1.1 projection; the
+  elected winner for the v1 projection. A contributing owner is at least one
+  device. Publications carry a private `dailyDeviceMethod` marker; the stale-head
+  pass recounts each day published under an older method exactly once.
+
+## Live findings outside this change (2026-09-25, read-only)
+
+- Production had zero v1.2 manifests, chunks or domains while seven accountless
+  installs held a v1.2 grant; none of those installs has uploaded anything since
+  receiving it. The desktop v1.2 run fails before recording progress.
+- Most v1.1 domain activations have failed since about 2026-09-16; the last
+  succeeded at 2026-09-23T23:56Z. Only activated days are public, so the public
+  daily count is accurate to accepted data but far below uploads.
+- Both are separate defects and need the exact server rejection codes.
+
 ## Open follow-ups
 
-- Allowance fits still select only v1, v1.1 and legacy sources, so a
-  v1.2-only source contributes daily activity but no allowance fit.
-- The storage daily payload sets `contributingDevices` equal to contributing
-  owners. Relabel it or count devices.
 - The graph readiness hint omits v1.2-only members. Publication's full member
   check includes them.
 - Confirm live eligibility and publication counts with read-only aggregate

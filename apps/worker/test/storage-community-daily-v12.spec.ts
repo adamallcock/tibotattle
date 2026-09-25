@@ -14,7 +14,7 @@ import { authenticateDevice, claimDeviceUploadAuthorization, createDeviceUploadA
 import { grantTelemetryV12AccountlessAuthorization, grantTelemetryV12Consent } from "../src/telemetry-transport-policy";
 import { persistTelemetryV12StagedChunk, registerTelemetryV12DayManifest } from "../src/telemetry-v12-repository";
 import { activateTelemetryV12Domain, createTelemetryV12DomainPredecessor } from "../src/telemetry-v12-domain";
-import { advanceStorageCommunityDaily, readPublishedStorageCommunityDaily } from "../src/storage-community-daily";
+import { advanceNextStorageCommunityDaily, advanceStorageCommunityDaily, readPublishedStorageCommunityDaily } from "../src/storage-community-daily";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
 import { initializeStorageSource } from "../src/analytics-delivery";
 import { initializeTypedV11Admission } from "../src/typed-v11-admission";
@@ -223,5 +223,38 @@ describe("public daily evidence from v1.2 uploads", () => {
     const other = await createV11DeviceFixture(source());
     expect(await source().prepare("SELECT count(*) AS n FROM storage_v12_event_sources WHERE participant_id=?")
       .bind(other.participantId).first("n")).toBe(0);
+  });
+
+  it("counts each device whose records a day includes, not one per owner", async () => {
+    const first = await createV11DeviceFixture(source());
+    const second = await createV11DeviceFixture(source(), { participantId: first.participantId });
+    await grantTelemetryV12Consent(source(), first, telemetryV12RequiredConsent());
+    await grantTelemetryV12Consent(source(), second, telemetryV12RequiredConsent());
+    await uploadV12Day(first, [1, 2]);
+    await uploadV12Day(second, [3]);
+    await deliverAndPublish();
+    expect(await publishedTotals()).toMatchObject({ contributingParticipants: 1, contributingDevices: 2, usageEvents: 3 });
+  });
+
+  it("recounts a day published under an earlier device method", async () => {
+    const device = await accountlessV12Device();
+    await uploadV12Day(device, [1]);
+    await deliverAndPublish();
+    const current = await target().prepare(`SELECT * FROM analytics_community_daily_publications
+      WHERE day=? ORDER BY revision DESC LIMIT 1`).bind(today()).first<Record<string, unknown>>();
+    // Model the latest revision written before the device-count method existed:
+    // same cohort payload, authority without the method marker.
+    const legacy = { ...current!, revision: Number(current!.revision) + 1,
+      authority_json: JSON.stringify(Object.fromEntries(Object.entries(JSON.parse(String(current!.authority_json)))
+        .filter(([key]) => key !== "dailyDeviceMethod"))) };
+    await target().prepare(`INSERT INTO analytics_community_daily_publications (${Object.keys(legacy).join(",")})
+      VALUES (${Object.keys(legacy).map(() => "?").join(",")})`).bind(...Object.values(legacy)).run();
+    expect(await advanceNextStorageCommunityDaily({ ...options(), preferStaleHead: true }))
+      .toMatchObject({ state: "published", day: today() });
+    const latest = await target().prepare(`SELECT revision, json_extract(authority_json,'$.dailyDeviceMethod') AS method
+      FROM analytics_community_daily_publications WHERE day=? ORDER BY revision DESC LIMIT 1`).bind(today()).first();
+    expect(latest).toEqual({ revision: legacy.revision + 1, method: "contributing-devices-by-reader-v1" });
+    // A current publication is not stale again.
+    expect(await advanceNextStorageCommunityDaily({ ...options(), preferStaleHead: true })).toMatchObject({ state: "idle" });
   });
 });

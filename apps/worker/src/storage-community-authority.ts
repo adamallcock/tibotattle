@@ -168,7 +168,7 @@ const v12SchemaCache = new WeakMap<object, boolean>();
  * accepted rows after an upload lease expires or an ordinary user opt-out.
  * The owner link/participant state remains the erasure fence; only those
  * retained owner scopes may reach this historical union. */
-const V12_RETAINED_AUTHORIZATION_SCOPE = `
+export const V12_RETAINED_AUTHORIZATION_SCOPE = `
       SELECT participant_id,device_id FROM telemetry_v12_active_authorizations
       UNION
       SELECT capability.participant_id,capability.device_id
