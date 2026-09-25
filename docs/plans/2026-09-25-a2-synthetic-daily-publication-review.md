@@ -2,26 +2,46 @@
 title: A2 synthetic daily publication review
 date: 2026-09-25
 type: plan
-status: approved-test-only
+status: blocked
 ---
 
 # A2 synthetic daily publication review
 
 ## Status and boundary
 
-This is the exact-effect review for one private, test-only daily publication in
-the existing A2 PostgreSQL schema. The project owner approved this effect on
-2026-09-25 through the A2 synthetic-publication approval prompt. Test-only
-preparation and independent restore commands are now implemented and locally
-qualified against disposable PostgreSQL 17 schemas. This is not an execution
-receipt: this workstream has made no GCP writes or deployment changes.
+Current status: blocked pending explicit approval of a revised control-revision
+sequence and a matching daily Job configuration. The project owner approved the
+exact test-only effect recorded below on 2026-09-25, scoped to the reported
+collection-controls transition 15→16→17. The later live readback found
+revision 2 instead. The corrected preparation attempt stopped on that baseline
+mismatch before inserting the fixture. The original approval does not authorize
+a changed 2→3→4 sequence.
+
+The later A2 v1.2 journey migrated this same primary schema to 41/41 and the
+independent erasure ledger to 6/6, and deployed the private service from image
+`sha256:95c15fa41597c1d676aa78bcc2b28dd4bb7289cd8db32acf4839fd0d40d2e665`.
+That receipt reports no daily aggregate; the daily publication runner remained
+in read-only `--preflight` mode. The daily preparation attempts committed no
+daily-publication fixture or aggregate, and no daily publisher run or daily
+route readback occurred. The maintenance Scheduler remains paused. See the
+[daily live-attempt receipt](../receipts/2026-09-25-gcp-a2-daily-live-attempt.md)
+and [later migration-41 journey receipt](../receipts/2026-09-25-gcp-a2-v12-migration41-journey.md).
+The latter does not record a fresh collection-controls revision readback.
+The daily prepare, publisher, and restore Jobs still use the earlier
+39-migration image; only the private service uses the 41-migration image. The
+publisher Job is still configured for `--preflight`, not publication. Rebuild
+or repin and read back the exact Job images before any Job run. This plan is not
+an execution receipt.
 
 An earlier automatic approval review rejected the initial write-capable
 activation attempt because it could insert rows into the shared A2 Cloud SQL
 schema and change collection controls to operational with publication enabled.
-The project owner later explicitly approved the exact test-only effect below.
-The implementation remains pinned to this effect and cannot select another
-schema, day, source, project, or Cloud Run job.
+The project owner later approved the exact test-only effect below. After the
+live revision-2 readback, a revision-only 2→3→4 amendment was proposed and
+automatic review rejected that changed control mutation. It remains pending
+explicit owner approval, conditional on all other target and data-effect
+preconditions matching. The historical table below does not approve that
+amendment.
 
 ## Fixed target and current evidence
 
@@ -30,23 +50,43 @@ primary tibotattle-test-primary-20260922, database tibotattle, schema
 tibotattle_v12_a2_20260925. The private service is tibotattle-test-app; the
 existing single-task publication Job is
 tibotattle-community-daily-publish-test. The A2 maintenance Scheduler must
-remain paused. Production Cloudflare remains the serving system.
+remain paused; the 2026-09-25 read-only Scheduler describe confirmed
+`tibotattle-test-maintenance-hourly` is `PAUSED`. Production Cloudflare remains
+the serving system.
 
-The 2026-09-25 read-only preflight for day 2026-09-25 found PostgreSQL 17 and
-a ready publication policy, but no singleton source-state row, analytics
-cursor, v1 admission state, or v1.1 admission state. Its exact publisher CTE
-found no selected v1 or v1.1 records for that day. Collection controls were
-publication-disabled. The authenticated private daily GET therefore returned
-503, the expected fail-closed result while the fence is absent. See the [A2
-daily preflight receipt](../receipts/2026-09-25-gcp-a2-daily-preflight-v2.md).
+The original approval was based on collection-controls revision 15. The latest
+explicit daily-control readback recorded revision 2, degraded state, enrollment
+off, upload registration on, processing on, and publication off. The corrected
+daily preparation attempt stopped at its revision-15 precondition before
+fixture inserts. A later v1.2 journey receipt says publication remained withheld
+by degraded controls but gives no control revision; a fresh exact revision
+readback is required before any future preparation.
 
-The current source tree has 39 primary migrations ending in
-0039_analytics_applied_projection_v1.sql. Any eventual Job and service must
-use the same pinned source and its migration receipt must match that build's
-complete canonical primary manifest. This count and tail describe this source
-revision; future images must use their own current manifest. A fresh backup
-and readback are required immediately before any approved database write; the
-older backup in the receipt is not a substitute for that gate.
+The 2026-09-25 read-only Cloud Run readback found all three daily Jobs targeting
+project `tibotattle`, schema `tibotattle_v12_a2_20260925`, source
+`synthetic-community-source` / `synthetic-community-namespace`, and day
+`2026-09-25`. Prepare uses
+`node dist/postgres-community-daily-prepare-test.mjs`; publish uses
+`node dist/postgres-community-daily-publish-test.mjs --preflight`; restore uses
+`node dist/postgres-community-daily-restore-test.mjs`. Each has one task and
+zero retries, but all three still use the old 39-migration image with digest
+prefix `sha256:a5c5dd5…`. The private service separately receives 100% of
+traffic on revision `00037-4tl` with 41-migration image
+`sha256:95c15fa…`. No daily Job was run in this read-only inspection. The
+publisher's current `--preflight` invocation cannot publish; these Job image
+and mode mismatches are execution blockers.
+
+The earlier daily attempt receipt records an image with 39/39 primary
+migrations through `0039_analytics_applied_projection_v1.sql` and 6/6
+independent-ledger migrations. This is historical and superseded by the later
+v1.2 journey receipt, which records the same primary schema at 41/41 through
+`0041_accountless_history_retention.sql`, with the latest-migration checksum
+`19c1f19a1ec333012c70334bf8ac8f6c1ca5b2a2c9e67d3b716eaa81dcbcd45b`, and the
+independent ledger at 6/6. The current source guard also expects 41 primary
+migrations through 0041. Before a newly approved database write, match each Job
+image's complete canonical migration manifest to the database, freshly read
+controls, and take a new backup immediately before the write. The earlier
+backup is not a substitute for that gate.
 
 ## Exact proposed data effect
 
@@ -73,7 +113,17 @@ passing local PostgreSQL 17 publisher fixture:
 No telemetry_v11 day data is added. No v1.2 table is seeded, relabeled,
 reused, or included in the daily result. This direct synthetic fixture
 qualifies the v1 daily projection and private read path only; it does not
-qualify the authenticated upload or Cloud Storage ingestion journey.
+qualify that v1 event's authenticated upload or Cloud Storage ingestion
+journey. A separate v1.2 upload, activation, renewal, readback, and cleanup
+journey is recorded in the [migration-41 journey receipt](../receipts/2026-09-25-gcp-a2-v12-migration41-journey.md);
+it does not prove that this v1 fixture entered through that flow or that a daily
+aggregate was published. The temporary gate enables publication for the
+private daily read while enrollment remains off. The observed revision-2
+degraded baseline was already fail-closed for ordinary dispatch; the temporary
+gate does not enable enrollment, so ordinary enrollment and ingestion dispatch
+remain fail-closed. The synthetic rows are inserted directly and bypass that
+journey. The daily publisher and private reader use their separate publication
+checks.
 
 The publisher is expected to add one immutable row to
 community_daily_aggregates for this synthetic source and day. Its Job receipt
@@ -84,9 +134,13 @@ establish allowance readiness. The private HTTP verifier must read exactly
 that day and revision, return one day without source identity, and confirm
 usageEvents: 1 before controls are restored.
 
-## Controls and ordered execution
+## Original approved controls and ordered execution
 
-The observed A2 baseline is collection-controls revision 15:
+The following table preserves the original owner-approved control proposal,
+which assumed revision 15. The live readback later found revision 2, so this is
+historical and cannot be executed against the current baseline. A proposed
+revision-only 2→3→4 amendment is still awaiting explicit owner approval; the
+table remains unchanged until that approval is given:
 
 | Revision | control_state | Enrollment | Upload registration | Processing | Publication | Reason |
 |---:|---|---|---|---|---|---|
@@ -94,14 +148,20 @@ The observed A2 baseline is collection-controls revision 15:
 | 16 temporary test gate | operational | **off** | on | on | on | synthetic_daily_publication_test |
 | 17 restored | degraded | off | on | on | off | synthetic_v12_test_upload_only |
 
-Revision advances monotonically. One preparation transaction would lock and
-compare the exact revision-15 baseline, insert the fixture, then conditionally
-set only the temporary revision-16 fields above. Enrollment stays disabled at
-every point. Any changed baseline field, existing source/admission/cursor row,
-selected-day v1/v1.1 record, or publication conflict stops the transaction
-before commit.
+Under the original proposal, revision advances monotonically. One preparation
+transaction would lock and compare the exact revision-15 baseline, insert the
+fixture, then conditionally set only the temporary revision-16 fields above.
+Enrollment stays disabled at every point. Any changed baseline field, existing
+source/admission/cursor row, selected-day v1/v1.1 record, or publication
+conflict stops the transaction before commit. These steps remain the approved
+effect's historical specification, not authorization for the changed live
+baseline.
 
-After preparation commits:
+The sequence below preserves the original approved design. It does not
+describe the current Job configuration: the publisher currently runs only
+`--preflight`. The publishing step requires a reviewed write-capable Job
+configuration under the revised approval, and all three Jobs must first use an
+image matching the migrated 41/41 schema. After preparation commits:
 
 1. Run the existing daily Job with one task, zero retries, the exact A2 target,
    source identity, and day. It repeats the publisher fence inside its write
@@ -154,10 +214,11 @@ There is no GCS byte charge because no object is written. Exact billing depends
 on configured Job CPU/memory and current regional rates, so this is a
 small-order estimate, not a billing quote.
 
-## Approved test-only effect and remaining execution gates
+## Original approved test-only proposal and current execution gate
 
-The project owner approved this exact effect in the private A2 schema on
-2026-09-25:
+The project owner approved this exact 15→16→17 effect in the private A2 schema
+on 2026-09-25, based on the revision-15 baseline. That approval is historical
+and does not authorize execution against the live revision-2 baseline:
 
 - Seed the single synthetic social v1 owner/device/usage fixture and empty
   source/cursor/admission fence listed above.
@@ -170,7 +231,24 @@ The project owner approved this exact effect in the private A2 schema on
 - Retain the content-free fixture and aggregate in the private test schema,
   with no GCS object, bucket mutation, or production authority inferred.
 
-Execution still requires review of the exact source image, live preconditions,
-and a fresh backup immediately before the database write. The local tests do
-not prove Cloud Run job configuration, migration application, GCP execution, or
-the private HTTP readback. Production Cloudflare remains unchanged.
+The proposed minimal amendment would change only the control revisions to
+2→3→4, retaining the same exact target, source, day, one-task/zero-retry Job,
+publisher receipt, private HTTP readback, and retained fixture and aggregate,
+provided every non-revision precondition still matches. This amendment remains
+blocked pending explicit owner approval after automatic review rejected it.
+The current Jobs also fail the non-revision image and mode preconditions: all
+three use the old 39-migration image, and the publisher remains `--preflight`.
+No daily-publication fixture or aggregate has been committed. Approval of the
+revision-only amendment would not make these Jobs eligible to run. Before any
+later execution, obtain that approval, rebuild or repin all three Jobs to the
+image matching the migrated 41/41 schema. Under that approval, configure the
+publisher from `--preflight` to the single write-capable invocation in the
+approved effect. Then freshly read back exact immutable images, task counts,
+retry counts, invocation modes, source, day, target, and private HTTP readback
+contract. Verify live controls and all other preconditions, match the database
+receipt to the current 41-migration manifest, and take a fresh backup
+immediately before the database write. The v1.2
+journey's private-service image does not by itself qualify any of those Jobs.
+Local tests do not prove Cloud Run job configuration, live migration match, GCP
+execution, or private daily HTTP readback. Production Cloudflare remains
+unchanged.
