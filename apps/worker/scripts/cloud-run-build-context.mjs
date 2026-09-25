@@ -34,9 +34,9 @@ const SECRET_PATH_PARTS = new Set([
   "credentials.json",
   "service-account.json",
 ]);
-const EXPECTED_PRIMARY_MIGRATION_COUNT = 35;
+const EXPECTED_PRIMARY_MIGRATION_COUNT = 36;
 const EXPECTED_LEDGER_MIGRATION_COUNT = 6;
-const EXPECTED_PRIMARY_MIGRATION_TAIL = "0035_v12_ready_manifest_retention.sql";
+const EXPECTED_PRIMARY_MIGRATION_TAIL = "0036_streamed_publication_proofs.sql";
 const REQUIRED_LEDGER_DIAGNOSTIC_PATHS = new Set([
   "apps/worker/cloud-run/ledger-reconciliation-diagnostic.mjs",
   "apps/worker/cloud-run/ledger-reconciliation-diagnostic.check.mjs",

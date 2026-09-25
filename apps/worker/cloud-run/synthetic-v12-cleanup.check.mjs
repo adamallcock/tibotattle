@@ -79,7 +79,7 @@ function validEnv(overrides = {}) {
 function fakeManifest() {
   const roles = {};
   for (const [role, expected, tail] of [
-    ["primary", 35, "0035_v12_ready_manifest_retention.sql"],
+    ["primary", 36, "0036_streamed_publication_proofs.sql"],
     ["ledger", 6, "0006_erasure_ledger_transfer_receipts.sql"],
   ]) {
     roles[role] = Array.from({ length: expected }, (_, index) => ({

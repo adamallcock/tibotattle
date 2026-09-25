@@ -24,7 +24,7 @@ export const TEST_MIGRATIONS_TARGETS = Object.freeze({
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle",
-    expectedMigrations: 35,
+    expectedMigrations: 36,
   }),
   ledger: Object.freeze({
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-ledger-20260922",
