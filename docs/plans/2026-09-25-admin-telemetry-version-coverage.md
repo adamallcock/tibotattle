@@ -66,6 +66,12 @@ deploy, migrate, activate telemetry, or change production data.
 - The admin contributor cards rendered in a local browser at 1280px and 390px
   with the synthetic overview fixture. The v1/v1.1/v1.2 explanation opened;
   independent unavailable sources remained visibly unavailable.
+- The public-release-site boundary suite passed all 68 tests, including
+  exclusion of admin dashboard assets from the public site. The Worker
+  `deploy:dry` step could not complete because this checkout lacks its generated
+  public release manifest. The hosted social image observed on 2026-09-25 is 1024×1024,
+  whereas this local release-site builder requires a reviewed 1200×630 card;
+  no substitute release asset was created for this admin-only change.
 
 ## Remaining gate
 
