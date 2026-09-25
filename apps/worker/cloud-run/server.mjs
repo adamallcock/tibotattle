@@ -8,8 +8,8 @@ import { createPostgresWorkerBackend } from "../src/backend-composition.ts";
 import {
   handleRequest,
   isPostgresWorkerRequestPathSupported,
-  runScheduledMaintenance,
 } from "../src/index.ts";
+import { runPostgresScheduledMaintenance } from "../src/postgres-maintenance.ts";
 import {
   assertAdmissionBindings,
   assertAttemptAllowed,
@@ -21,6 +21,7 @@ import { readBoundedRequestBody } from "../src/bounded-body.ts";
 import { createGcsQuarantineObjectStore } from "../src/gcs-quarantine-object-store.ts";
 import { createGcsErasureBucketHistoryProof } from "../src/gcs-erasure-object-store.ts";
 import { createFilesystemAssets } from "./assets.mjs";
+import { assertPostgresScheduledMaintenanceEnabled } from "./postgres-maintenance-gate.mjs";
 import { createPostgresUploadIngressBudget } from "../src/postgres-ingress-budget.ts";
 import { createPostgresRateLimiter } from "../src/postgres-rate-limiter.ts";
 import {
@@ -571,7 +572,18 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
       rateLimitSecret,
       digest,
     });
-    return { env, pools, connector, backend, hostOrigin, requestOriginAllowlist };
+    return {
+      env,
+      pools,
+      connector,
+      backend,
+      primaryPool,
+      ledgerPool,
+      schemaOptions,
+      objectStore,
+      hostOrigin,
+      requestOriginAllowlist,
+    };
   } catch (error) {
     await closeCloudSqlResources({ pools, connector }).catch(() => undefined);
     if (error?.code) throw error;
@@ -718,17 +730,27 @@ async function main() {
     }
     return;
   }
-  const runtime = await createRuntime();
   if (process.argv.includes("--scheduled")) {
+    try { assertPostgresScheduledMaintenanceEnabled(process.env); }
+    catch { configurationError("POSTGRES_SCHEDULED_MAINTENANCE_DISABLED"); }
+    const runtime = await createRuntime();
     try {
-      const result = await runScheduledMaintenance(runtime.env, Date.now());
-      console.log(JSON.stringify({ status: result.outcome === "success" ? "ok" : "error", mode: "scheduled", code: result.code }));
-      if (result.outcome !== "success") process.exitCode = 1;
+      const result = await runPostgresScheduledMaintenance({
+        primaryPool: runtime.primaryPool,
+        ledgerPool: runtime.ledgerPool,
+        objectStore: runtime.objectStore,
+        schema: runtime.schemaOptions,
+        nowEpoch: Date.now(),
+      });
+      const status = result.outcome === "partial" ? "incomplete" : result.outcome;
+      console.log(JSON.stringify({ ...result, status, mode: "scheduled" }));
+      if (result.outcome !== "skipped") process.exitCode = 1;
     } finally {
       await closeCloudSqlResources(runtime);
     }
     return;
   }
+  const runtime = await createRuntime();
   await serve(runtime);
 }
 

@@ -346,8 +346,9 @@ function validHead(value: unknown): boolean {
  * completion would need provider-specific operation identity to be proven
  * safe and is outside this adapter's contract.
  *
- * No timer or host composition root calls this function. A caller must opt in
- * explicitly, and tests use only a synthetic object store.
+ * The Cloud Run scheduled path opts into this function only when its explicit
+ * maintenance enable flag is set. The Cloudflare scheduled handler does not
+ * call it, and tests use only a synthetic object store.
  */
 export async function reconcilePostgresPendingObjects(
   pool: PostgresPool,
