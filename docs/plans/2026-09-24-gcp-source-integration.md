@@ -29,7 +29,7 @@ candidate revision and source snapshot before moving live traffic:
 
 | Gate | Evidence now | Still required |
 | --- | --- | --- |
-| Private GCP data plane | Zonal Cloud SQL primary and independent erasure ledger, GCS, IAM-private Cloud Run, and a cleaned-up synthetic v1.2 journey at primary 39/39 and ledger 6/6 | Requalify each forward migration and serving image; preserve exact-owner erasure and restore behavior |
+| Private GCP data plane | Zonal Cloud SQL primary and independent erasure ledger, GCS, IAM-private Cloud Run, and a cleaned-up synthetic v1.2 journey at primary 41/41 and ledger 6/6 | Requalify each forward migration and serving image; preserve exact-owner erasure and restore behavior |
 | Application routes and identity | Partial private host and tested v1.2 upload/domain path; social device disconnect and some device/accountless source adapters are local-only | Complete or explicitly retire every live Worker route, OAuth/session/admin ingress, accountless opt-out, and the production composition root |
 | Historical source transfer | Sealed local rehearsals cover several typed source, journal, correction, and ledger families | Export and reconcile the real D1/R2 snapshot under a source fence, import exact history and objects, and prove no admitted writes are lost or duplicated |
 | Public analytics and maintenance | Read-only daily preflight is fail-closed; 100,000-member graph publishes in the isolated benchmark | Complete daily source/claim/cursor/publication lifecycle, full scheduled maintenance and public reads, then rehearse replay, rollback, and recovery |
@@ -39,6 +39,14 @@ candidate revision and source snapshot before moving live traffic:
 The route, transfer, and analytics rows are material blockers. A private test
 service that accepts one synthetic upload is useful evidence but cannot serve
 the complete application yet.
+
+The [migration-41 A2 v1.2 journey](../receipts/2026-09-25-gcp-a2-v12-migration41-journey.md)
+records clean-candidate qualification, a successful pre-migration backup,
+41/41 primary and 6/6 ledger migrations, an exact-image IAM-private service,
+and a fresh upload, activation, rotation and readback journey. Its one-owner
+cleanup completed and replayed as `already_complete`; the isolated bucket
+has no live or versioned objects. The serving image predates later integration
+commits and does not qualify them.
 
 The [source-pinned private route candidate journey](../receipts/2026-09-25-gcp-private-route-candidate-journey.md)
 now records exact-image revision `tibotattle-test-app-00035-ws7`, a passing full
