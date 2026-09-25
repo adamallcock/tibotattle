@@ -37,6 +37,7 @@ import { assertPostgresScheduledMaintenanceEnabled } from "./postgres-maintenanc
 import { createPostgresUploadIngressBudget } from "../src/postgres-ingress-budget.ts";
 import { createPostgresRateLimiter } from "../src/postgres-rate-limiter.ts";
 import { createPostgresGoogleHandoffDispatch } from "../src/postgres-google-handoff.ts";
+import { createPostgresGoogleEnrollmentDispatch } from "../src/postgres-google-enrollment.ts";
 import {
   ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
   parseAccountlessEnrollmentJson,
@@ -556,6 +557,18 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           healthDispatch,
         })
         : null;
+      const googleEnrollmentDispatch = postgresTestMode === "cloud-run-iam"
+        ? createPostgresGoogleEnrollmentDispatch({
+          primaryPool,
+          ledgerPool,
+          schemaOptions,
+          privateOrigin: hostOrigin,
+          env: admissionEnv,
+          assertAdmissionBindings,
+          assertAttemptAllowed,
+          healthDispatch,
+        })
+        : null;
       return {
         pools,
         connector,
@@ -578,6 +591,9 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           }
           if (pathname === "/api/v1/session" || pathname === "/api/v1/logout") {
             return personalSessionDispatch(request);
+          }
+          if (googleEnrollmentDispatch && pathname === "/api/v1/enroll") {
+            return googleEnrollmentDispatch(request);
           }
           if (googleHandoffDispatch && (pathname === "/api/v1/identity/google/start"
               || pathname === "/api/v1/identity/google/callback"

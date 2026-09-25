@@ -542,6 +542,31 @@ accountless consent, with D1's `400 TELEMETRY_REQUIRED` response. A real
 PostgreSQL 17 regression checks grant issuance and chunk persistence while
 the v1.2 device capability remains accepted. The focused test passes.
 
+The current source candidate additionally dispatches Google handoff
+`start`/`callback`/`result` and `POST /api/v1/enroll` to PostgreSQL. Its local
+PostgreSQL 17 qualification uses injected synthetic provider exchange and
+verification; it checks PKCE binding, proof consumption/replay, enrollment,
+session-cookie authentication, social-owner continuity, consent controls,
+cooldowns, and concurrent races. This code has not been built into or deployed
+to the current GCP image, and the tests do not contact Google. The private
+Cloud Run service cannot receive Google's browser redirect directly, and a
+browser also cannot call its start/result/enrollment paths without an
+IAM-authenticated proxy. Keep the service IAM-private. The smallest test-only
+path is a separate, narrowly allowlisted public gateway with no database access
+or Google client secret; it should call the existing service with a dedicated
+Cloud Run service identity granted only `roles/run.invoker`, and avoid logging
+callback query strings. Route all four browser-facing paths through it, then
+configure the OAuth web client with the exact HTTPS gateway URI
+`/api/v1/identity/google/callback`. Before that can work, source/configuration
+must allow the external callback origin to be configured independently from
+the private service origin: `cloud-run-iam` currently rejects `PUBLIC_ORIGIN`,
+and the Google adapter requires the request origin to equal it. Keep the
+backend's IAM policy unchanged. Cloud Run's service-to-service contract
+requires a Google-signed ID token whose audience identifies the receiving
+service ([Cloud Run authentication](https://docs.cloud.google.com/run/docs/authenticating/service-to-service));
+Google requires the OAuth `redirect_uri` to exactly match a URI registered on
+the client ([OAuth web-server flow](https://developers.google.com/identity/protocols/oauth2/web-server)).
+
 This is a local v1.2 admission slice, not the complete application. Device
 enrollment/refresh, v1/v1.1 contributions, effective mixed-format reads,
 analytics publication, and owner erasure still have D1-owned routes or missing
