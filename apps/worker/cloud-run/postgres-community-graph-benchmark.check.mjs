@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { lstat, realpath, stat } from "node:fs/promises";
 import test from "node:test";
+import pg from "pg";
+import { applyPostgresMigrations } from "./postgres-migrations.mjs";
 import {
   POSTGRES_COMMUNITY_GRAPH_BENCHMARK_IAM_USER,
   POSTGRES_COMMUNITY_GRAPH_BENCHMARK_JOB,
@@ -15,11 +19,14 @@ import {
   readAttachedCommunityGraphBenchmarkServiceAccount,
   readPostgresCommunityGraphBenchmarkMigrations,
   runPostgresCommunityGraphBenchmark,
+  seedPostgresCommunityGraphBenchmark,
   validatePostgresCommunityGraphBenchmarkPreflight,
   verifyPostgresCommunityGraphBenchmarkMigrationReceipt,
 } from "./dist/postgres-community-graph-benchmark.mjs";
 
 const EXECUTION = "tibotattle-public-graph-benchmark-00001-abc";
+const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
+const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
 const EMPTY_TABLES = [
   "storage_source_state",
   "analytics_source_cursors",
@@ -335,4 +342,88 @@ test("invalid benchmark target is rejected before metadata, connector or databas
   }), (error) => error?.code === "POSTGRES_COMMUNITY_GRAPH_BENCHMARK_TARGET_INVALID");
   assert.equal(metadataCalls, 1);
   assert.equal(connectorCalls, 0);
+});
+
+test("benchmark failures expose only a bounded phase and safe code", async () => {
+  await assert.rejects(runPostgresCommunityGraphBenchmark({
+    env: validEnv(),
+    dependencies: {
+      async readServiceAccountEmail() { return POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SERVICE_ACCOUNT; },
+      createConnector() { return { getOptions() {} }; },
+      async createPool() { throw new Error("provider detail must not escape"); },
+      async closeResources() {},
+    },
+  }), (error) => {
+    assert.equal(error?.code, "POSTGRES_COMMUNITY_GRAPH_BENCHMARK_FAILED");
+    assert.equal(error?.phase, "connection");
+    assert.equal(error?.message, "POSTGRES_COMMUNITY_GRAPH_BENCHMARK_FAILED");
+    return !String(error).includes("provider detail");
+  });
+});
+
+test("PG17 synthetic seed relies on the participant input-version trigger", {
+  skip: !PG_TEST_SOCKET,
+}, async () => {
+  assert.match(PG_TEST_SOCKET ?? "", /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u);
+  assert.ok(Number.isSafeInteger(PG_TEST_PORT) && PG_TEST_PORT > 0 && PG_TEST_PORT <= 65535);
+  const link = await lstat(PG_TEST_SOCKET);
+  const host = await realpath(PG_TEST_SOCKET);
+  const metadata = await stat(host);
+  assert.equal(link.isSymbolicLink(), false);
+  assert.ok(host.startsWith("/private/tmp/tibotattle-pg-"));
+  assert.equal(metadata.mode & 0o077, 0);
+  assert.equal(metadata.uid, process.getuid());
+
+  const pool = new pg.Pool({
+    host,
+    port: PG_TEST_PORT,
+    user: process.env.PG_TEST_USER || "postgres",
+    password: process.env.PG_TEST_PASSWORD || "synthetic-local-only",
+    database: process.env.PG_TEST_DATABASE || "postgres",
+    application_name: "pg-community-graph-benchmark-seed-check",
+    ssl: false,
+    max: 2,
+    connectionTimeoutMillis: 5_000,
+  });
+  const locality = await pool.query("SELECT inet_server_addr() AS address, version() AS version");
+  assert.equal(locality.rows[0]?.address, null, "qualification requires a local Unix socket");
+  assert.match(locality.rows[0]?.version ?? "", /^PostgreSQL 17\./u);
+
+  const schema = `benchmark_seed_${randomBytes(6).toString("hex")}`;
+  const sqlSchema = `"${schema}"`;
+  try {
+    await pool.query(`CREATE SCHEMA ${sqlSchema}`);
+    await applyPostgresMigrations({ role: "primary", schema, pool });
+    const parsed = parsePostgresCommunityGraphBenchmarkConfig(
+      validEnv(), POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SERVICE_ACCOUNT,
+    );
+    const localSeedConfig = Object.freeze({ ...parsed, schema });
+    const seedPool = {
+      async connect() {
+        const client = await pool.connect();
+        return {
+          async query(sql, values) {
+            if (typeof sql === "string" && sql.includes("current_database() AS database_name")) {
+              return { rows: [validPreflightRow()], rowCount: 1 };
+            }
+            return client.query(sql, values);
+          },
+          release: client.release.bind(client),
+        };
+      },
+    };
+    await seedPostgresCommunityGraphBenchmark(seedPool, localSeedConfig);
+    const counts = await pool.query(`SELECT
+      (SELECT count(*)::int FROM ${sqlSchema}.participants) AS participants,
+      (SELECT count(*)::int FROM ${sqlSchema}.input_versions) AS input_versions,
+      (SELECT count(*)::int FROM ${sqlSchema}.input_versions WHERE revision<>0) AS changed_input_versions`);
+    assert.deepEqual(counts.rows[0], {
+      participants: 10_000,
+      input_versions: 10_000,
+      changed_input_versions: 0,
+    });
+  } finally {
+    await pool.query(`DROP SCHEMA IF EXISTS ${sqlSchema} CASCADE`);
+    await pool.end();
+  }
 });

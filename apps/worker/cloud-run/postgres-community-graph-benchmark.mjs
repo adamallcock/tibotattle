@@ -535,7 +535,7 @@ function checkedMutation(result, expectedRows, code) {
       || result.rowCount !== expectedRows) fail(code);
 }
 
-async function seedPostgresCommunityGraphBenchmark(pool, config) {
+export async function seedPostgresCommunityGraphBenchmark(pool, config) {
   const profile = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES[config.profile];
   const schema = quoteSchema(config.schema);
   const { payloadJson, payloadSha256 } = sourceResultPayload();
@@ -587,12 +587,6 @@ async function seedPostgresCommunityGraphBenchmark(pool, config) {
     checkedMutation(await client.query(
       `INSERT INTO ${schema}.storage_v11_owner_links(participant_id, owner_digest, state)
        SELECT 'synthetic-stream-'||index, lpad(to_hex(index), 64, '0'), 'active'
-         FROM generate_series(1, $1::integer) AS generated(index)`,
-      [profile.members],
-    ), profile.members, "POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SEED_FAILED");
-    checkedMutation(await client.query(
-      `INSERT INTO ${schema}.input_versions(participant_id, revision)
-       SELECT 'synthetic-stream-'||index, 0
          FROM generate_series(1, $1::integer) AS generated(index)`,
       [profile.members],
     ), profile.members, "POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SEED_FAILED");
@@ -837,6 +831,15 @@ function safeErrorCode(error) {
     : "POSTGRES_COMMUNITY_GRAPH_BENCHMARK_FAILED";
 }
 
+const FAILURE_PHASES = new Set([
+  "configuration", "identity", "connection", "migration_source", "preflight",
+  "seed", "publish", "readback", "verification", "cleanup", "entrypoint",
+]);
+
+function safeFailurePhase(value) {
+  return FAILURE_PHASES.has(value) ? value : "entrypoint";
+}
+
 export async function runPostgresCommunityGraphBenchmark({ env = process.env, dependencies = {} } = {}) {
   const runStarted = performance.now();
   const cpuStart = process.cpuUsage();
@@ -850,6 +853,7 @@ export async function runPostgresCommunityGraphBenchmark({ env = process.env, de
   let connector;
   let pool;
   let closeFailure = null;
+  let phase = "configuration";
   try {
     const profileName = env?.POSTGRES_GRAPH_BENCHMARK_PROFILE;
     const profile = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES[profileName];
@@ -857,8 +861,10 @@ export async function runPostgresCommunityGraphBenchmark({ env = process.env, de
     if (digests.workloadDigest !== profile.workloadDigest || digests.sourceDigest !== profile.sourceDigest) {
       fail("POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SOURCE_DIGEST_INVALID");
     }
+    phase = "identity";
     const serviceAccountEmail = await readServiceAccountEmail();
     const config = parsePostgresCommunityGraphBenchmarkConfig(env, serviceAccountEmail);
+    phase = "connection";
     const setupStart = performance.now();
     connector = createConnector();
     if (!connector || typeof connector.getOptions !== "function") {
@@ -877,9 +883,11 @@ export async function runPostgresCommunityGraphBenchmark({ env = process.env, de
     }
     const connectionSetupMilliseconds = durationMilliseconds(setupStart);
     const metrics = createPostgresCommunityGraphBenchmarkMetrics(pool);
+    phase = "migration_source";
     const migrations = await readPostgresCommunityGraphBenchmarkMigrations({ readMigrations });
     const migrationExpected = migrationManifestReceipt(migrations);
 
+    phase = "preflight";
     metrics.setPhase("target_preflight");
     const preflightStart = performance.now();
     await verifyTargetPreflight(metrics.pool, config);
@@ -893,6 +901,7 @@ export async function runPostgresCommunityGraphBenchmark({ env = process.env, de
     }
     const preflightMilliseconds = durationMilliseconds(preflightStart);
 
+    phase = "seed";
     metrics.setPhase("seed");
     const seedStart = performance.now();
     await seedPostgresCommunityGraphBenchmark(metrics.pool, config);
@@ -902,6 +911,7 @@ export async function runPostgresCommunityGraphBenchmark({ env = process.env, de
       primarySchema: config.schema,
       ledgerSchema: POSTGRES_COMMUNITY_GRAPH_BENCHMARK_UNUSED_LEDGER_SCHEMA,
     });
+    phase = "publish";
     metrics.setPhase("publish");
     const publishCpuStart = process.cpuUsage();
     const publishStart = performance.now();
@@ -918,6 +928,7 @@ export async function runPostgresCommunityGraphBenchmark({ env = process.env, de
       fail("POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PUBLICATION_INVALID");
     }
 
+    phase = "readback";
     metrics.setPhase("readback");
     const readCpuStart = process.cpuUsage();
     const readStart = performance.now();
@@ -937,6 +948,7 @@ export async function runPostgresCommunityGraphBenchmark({ env = process.env, de
         || canonicalJson(readback.values) !== canonicalJson([["gpt-6-astra", 1000, profile.members]])) {
       fail("POSTGRES_COMMUNITY_GRAPH_BENCHMARK_READBACK_INVALID");
     }
+    phase = "verification";
     const outputDigest = sha256(canonicalJson(readback));
     if (outputDigest !== profile.outputDigest) fail("POSTGRES_COMMUNITY_GRAPH_BENCHMARK_OUTPUT_DIGEST_INVALID");
     const metricsSnapshot = metrics.snapshot();
@@ -997,15 +1009,17 @@ export async function runPostgresCommunityGraphBenchmark({ env = process.env, de
       claims: Object.freeze({ hostedTenfoldClaimQualified: false }),
     });
   } catch (error) {
-    throw Object.assign(new Error(safeErrorCode(error)), { code: safeErrorCode(error) });
+    const code = safeErrorCode(error);
+    throw Object.assign(new Error(code), { code, phase: safeFailurePhase(phase) });
   } finally {
+    phase = "cleanup";
     try {
       await closeResources({ pools: [pool], connector });
     } catch (error) {
       closeFailure = safeErrorCode(error);
     }
     if (closeFailure !== null) {
-      throw Object.assign(new Error(closeFailure), { code: closeFailure });
+      throw Object.assign(new Error(closeFailure), { code: closeFailure, phase: "cleanup" });
     }
   }
 }
@@ -1033,6 +1047,7 @@ async function main() {
       schemaVersion: "postgres-community-graph-cloud-run-benchmark-v1",
       status: "failed",
       code: safeErrorCode(error),
+      phase: safeFailurePhase(error?.phase),
     })}\n`);
     process.exitCode = 1;
   }
