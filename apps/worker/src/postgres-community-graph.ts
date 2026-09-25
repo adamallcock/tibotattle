@@ -49,6 +49,9 @@ interface PublicationMemberReadbackRow {
   readonly source_kind: string | null;
   readonly input_fingerprint: string | null;
   readonly result_sha256: string | null;
+  readonly owner_state: string | null;
+  readonly link_state: string | null;
+  readonly participant_state: string | null;
 }
 
 interface PublicationMemberReadbackScope {
@@ -57,9 +60,9 @@ interface PublicationMemberReadbackScope {
   readonly generation: string;
 }
 
-/** Read publication member receipts in bounded batches without reopening the
- * ordered index scan for every keyset page. The transaction pins the same
- * snapshot used by the owner-authority preflight query. */
+/** Read member receipts and current authority rows in bounded batches without
+ * reopening the ordered index scan for every keyset page. The repeatable-read
+ * transaction keeps the page checks on the same snapshot as publication gates. */
 async function readPublicationMembers(
   client: PostgresClient,
   schema: string,
@@ -70,8 +73,13 @@ async function readPublicationMembers(
     `DECLARE ${MEMBER_READBACK_CURSOR} NO SCROLL CURSOR FOR
        SELECT member.owner_digest, member.input_revision, member.owner_revision,
               member.authority_epoch, member.source_kind, member.input_fingerprint,
-              member.result_sha256
+              member.result_sha256, owner.state AS owner_state, link.state AS link_state,
+              participant.state AS participant_state
          FROM ${schema}.analytics_publication_owner_members member
+         LEFT JOIN ${schema}.analytics_owner_state owner
+           ON owner.source_id = member.source_id AND owner.owner_digest = member.owner_digest
+         LEFT JOIN ${schema}.storage_v11_owner_links link ON link.owner_digest = member.owner_digest
+         LEFT JOIN ${schema}.participants participant ON participant.id = link.participant_id
         WHERE member.source_id = $1 AND member.day = $2::date
           AND member.metric = 'model' AND member.generation = $3
         ORDER BY member.owner_digest COLLATE "C"`,
@@ -87,7 +95,8 @@ async function readPublicationMembers(
       for (const row of page.rows) {
         const index = count;
         count += 1;
-        if (!await visit(row, index)) return { complete: false, count };
+        if (row.owner_state !== "active" || row.link_state !== "active" || row.participant_state !== "active"
+            || !await visit(row, index)) return { complete: false, count };
       }
       if (page.rows.length < MEMBER_READBACK_FETCH_SIZE) return { complete: true, count };
     }
@@ -162,7 +171,6 @@ export async function readPostgresCommunityModelDay(
       control_state: string;
       publication_enabled: boolean;
       expected_members: string | number;
-      actual_members: string | number;
       capture_policy_revision: string | number;
       capture_collection_revision: string | number;
     }>(
@@ -180,10 +188,7 @@ export async function readPostgresCommunityModelDay(
               controls.revision AS current_collection_revision, controls.control_state, controls.publication_enabled,
               capture.expected_members, capture.payload_json AS capture_json,
               capture.policy_revision AS capture_policy_revision,
-              capture.collection_revision AS capture_collection_revision,
-              (SELECT count(*) FROM ${schema}.analytics_publication_owner_members member
-                WHERE member.source_id = publication.source_id AND member.day = publication.day
-                  AND member.metric = publication.metric AND member.generation = publication.generation) AS actual_members
+              capture.collection_revision AS capture_collection_revision
          FROM ${schema}.analytics_publications publication
          JOIN ${schema}.storage_source_state source ON source.singleton = 1 AND source.source_id = publication.source_id
          JOIN ${schema}.analytics_source_cursors cursor ON cursor.source_id = source.source_id
@@ -196,23 +201,13 @@ export async function readPostgresCommunityModelDay(
         WHERE publication.source_id = $1 AND publication.day = $2::date AND publication.metric = 'model'
           AND NOT EXISTS (SELECT 1 FROM ${schema}.analytics_publication_invalidations invalidation
             WHERE invalidation.source_id = publication.source_id AND invalidation.day = publication.day
-              AND invalidation.metric = publication.metric AND invalidation.generation = publication.generation)
-          AND NOT EXISTS (SELECT 1 FROM ${schema}.analytics_publication_owner_members member
-            LEFT JOIN ${schema}.analytics_owner_state owner
-              ON owner.source_id = member.source_id AND owner.owner_digest = member.owner_digest
-            LEFT JOIN ${schema}.storage_v11_owner_links link ON link.owner_digest = member.owner_digest
-            LEFT JOIN ${schema}.participants participant ON participant.id = link.participant_id
-            WHERE member.source_id = publication.source_id AND member.day = publication.day
-              AND member.metric = publication.metric AND member.generation = publication.generation
-              AND (owner.state IS DISTINCT FROM 'active' OR link.state IS DISTINCT FROM 'active'
-                OR participant.state IS DISTINCT FROM 'active'))`,
+              AND invalidation.metric = publication.metric AND invalidation.generation = publication.generation)`,
       [identity.sourceId, capturedDay],
     );
     const row = result.rows[0];
     if (!row || row.policy_state !== "ready" || row.control_state !== "operational" || row.publication_enabled !== true
         || integer(row.policy_revision, 1) !== integer(row.current_policy_revision, 1)
         || integer(row.collection_revision, 1) !== integer(row.current_collection_revision, 1)
-        || integer(row.expected_members) !== integer(row.actual_members)
         || new TextEncoder().encode(row.payload_json).byteLength > MAX_PUBLICATION_BYTES
         || !await hashMatches(row.payload_json, row.payload_sha256)) return null;
     let authority: unknown;

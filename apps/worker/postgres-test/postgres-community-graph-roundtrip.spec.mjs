@@ -551,6 +551,126 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     })).toBeNull();
   }, 120_000);
 
+  it("checks each paged member owner, link, and participant authority row", async () => {
+    await seedOwner();
+    const schemaOptions = { primarySchema: schema, ledgerSchema: "tibotattle_ledger" };
+    const published = await publishPostgresCommunityModelDay(pool, {
+      sourcePin, members: [member()], day: DAY, nowMs: NOW, schema: schemaOptions,
+    });
+    expect(published).toMatchObject({ state: "published", memberCount: 1 });
+    const read = () => readPostgresCommunityModelDay(pool, {
+      sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: DAY, schema: schemaOptions,
+    });
+    const clearInvalidations = async () => pool.query(`DELETE FROM ${sqlSchema}.analytics_publication_invalidations
+      WHERE source_id=$1 AND day=$2::date AND metric='model' AND generation=$3`, [
+      SOURCE_ID, DAY, published.generation,
+    ]);
+    expect(await read()).toMatchObject({ day: DAY, fittedParticipantCount: 1 });
+
+    await pool.query(`UPDATE ${sqlSchema}.analytics_owner_state SET state='withdrawn'
+      WHERE source_id=$1 AND owner_digest=$2`, [SOURCE_ID, OWNER_DIGEST]);
+    await clearInvalidations();
+    expect(await read()).toBeNull();
+    await pool.query(`UPDATE ${sqlSchema}.analytics_owner_state SET state='active'
+      WHERE source_id=$1 AND owner_digest=$2`, [SOURCE_ID, OWNER_DIGEST]);
+    expect(await read()).toMatchObject({ day: DAY, fittedParticipantCount: 1 });
+
+    await pool.query(`UPDATE ${sqlSchema}.storage_v11_owner_links SET state='withdrawn' WHERE owner_digest=$1`, [OWNER_DIGEST]);
+    await clearInvalidations();
+    expect(await read()).toBeNull();
+    await pool.query(`UPDATE ${sqlSchema}.storage_v11_owner_links SET state='active' WHERE owner_digest=$1`, [OWNER_DIGEST]);
+    expect(await read()).toMatchObject({ day: DAY, fittedParticipantCount: 1 });
+
+    // Remove each side of the join independently in this disposable schema.
+    // The publication member remains intact, so only the paged left-join proof
+    // can reject these deliberately inconsistent authority states.
+    await pool.query(`DELETE FROM ${sqlSchema}.analytics_owner_state WHERE source_id=$1 AND owner_digest=$2`, [
+      SOURCE_ID, OWNER_DIGEST,
+    ]);
+    await clearInvalidations();
+    expect(await read()).toBeNull();
+    await pool.query(`INSERT INTO ${sqlSchema}.analytics_owner_state(source_id, owner_digest, revision, authority_epoch, state)
+      VALUES ($1,$2,1,0,'active')`, [SOURCE_ID, OWNER_DIGEST]);
+    await writeResult(FINGERPRINT, 0, 1);
+    expect(await read()).toMatchObject({ day: DAY, fittedParticipantCount: 1 });
+
+    const corruptAuthorityRow = async (sql, values) => {
+      const client = await pool.connect();
+      try {
+        await client.query("SET session_replication_role = replica");
+        await client.query(sql, values);
+      } finally {
+        await client.query("RESET session_replication_role").catch(() => {});
+        client.release();
+      }
+    };
+    await corruptAuthorityRow(`DELETE FROM ${sqlSchema}.storage_v11_owner_links WHERE owner_digest=$1`, [OWNER_DIGEST]);
+    await clearInvalidations();
+    expect(await read()).toBeNull();
+    await pool.query(`INSERT INTO ${sqlSchema}.storage_v11_owner_links(participant_id, owner_digest, state)
+      VALUES ($1,$2,'active')`, [PARTICIPANT_ID, OWNER_DIGEST]);
+    expect(await read()).toMatchObject({ day: DAY, fittedParticipantCount: 1 });
+
+    const participant = (await pool.query(`SELECT owner_kind, created_at FROM ${sqlSchema}.participants WHERE id=$1`, [
+      PARTICIPANT_ID,
+    ])).rows[0];
+    expect(participant).toBeDefined();
+    await corruptAuthorityRow(`DELETE FROM ${sqlSchema}.participants WHERE id=$1`, [PARTICIPANT_ID]);
+    await clearInvalidations();
+    expect(await read()).toBeNull();
+    await corruptAuthorityRow(`INSERT INTO ${sqlSchema}.participants(id, owner_kind, state, created_at)
+      VALUES ($1,$2,'active',$3)`, [PARTICIPANT_ID, participant.owner_kind, participant.created_at]);
+    expect(await read()).toMatchObject({ day: DAY, fittedParticipantCount: 1 });
+
+    // Bypass only local fixture triggers so the row-level state check is
+    // isolated from the separate terminal-journal publication fence.
+    await corruptAuthorityRow(`UPDATE ${sqlSchema}.participants SET state='deleting' WHERE id=$1`, [PARTICIPANT_ID]);
+    await clearInvalidations();
+    expect(await read()).toBeNull();
+    await corruptAuthorityRow(`UPDATE ${sqlSchema}.participants SET state='active' WHERE id=$1`, [PARTICIPANT_ID]);
+    expect(await read()).toMatchObject({ day: DAY, fittedParticipantCount: 1 });
+  }, 120_000);
+
+  it("rolls back a failed member-page read and releases its PostgreSQL client", async () => {
+    await seedOwner();
+    const schemaOptions = { primarySchema: schema, ledgerSchema: "tibotattle_ledger" };
+    const published = await publishPostgresCommunityModelDay(pool, {
+      sourcePin, members: [member()], day: DAY, nowMs: NOW, schema: schemaOptions,
+    });
+    expect(published).toMatchObject({ state: "published", memberCount: 1 });
+    let fetchFailed = false;
+    let rolledBack = false;
+    let released = false;
+    const failingReadPool = {
+      async connect() {
+        const client = await pool.connect();
+        return {
+          async query(sql, values) {
+            if (!fetchFailed && typeof sql === "string" && /^FETCH FORWARD\b/u.test(sql)) {
+              fetchFailed = true;
+              throw new Error("synthetic read-page failure");
+            }
+            if (sql === "ROLLBACK") rolledBack = true;
+            return client.query(sql, values);
+          },
+          release(discard) {
+            released = true;
+            return client.release(discard);
+          },
+        };
+      },
+    };
+    await expect(readPostgresCommunityModelDay(failingReadPool, {
+      sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: DAY, schema: schemaOptions,
+    })).rejects.toMatchObject({
+      code: "unavailable", operation: "postgres.community_graph.read_model_day",
+    });
+    expect(fetchFailed).toBe(true);
+    expect(rolledBack).toBe(true);
+    expect(released).toBe(true);
+    expect(await pool.query("SELECT 1 AS available")).toMatchObject({ rows: [{ available: 1 }] });
+  }, 120_000);
+
   it("accepts a terminal source event before analytics cursor initialization and keeps reads closed", async () => {
     await pool.query(`INSERT INTO ${sqlSchema}.storage_source_state(singleton, source_id, authority_epoch)
       VALUES (1, $1, 0)`, [SOURCE_ID]);
@@ -860,6 +980,12 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     const readMilliseconds = performance.now() - readStarted;
     const readCpu = cpuMilliseconds(process.cpuUsage(readCpuStarted));
     const rssAfterRead = memorySnapshot();
+    const readSqlSummary = readSql.summary();
+    expect(readSqlSummary.queries.member_readback_pages?.returnedRows ?? 0).toBe(largeCount);
+    expect(readSqlSummary.queries.member_readback_pages?.pages.rows.max ?? 0).toBeLessThanOrEqual(4_096);
+    expect(readSqlSummary.queries.member_readback_pages?.count ?? 0)
+      .toBe(Math.ceil(largeCount / 4_096));
+    expect(readSqlSummary.checkedOutConnectionsAtEnd).toBe(0);
     const outputDigest = createHash("sha256").update(canonicalJson(readback)).digest("hex");
     if (largeCount === 100_000 && STRESS_NOW_MS === 1_790_294_400_000) {
       expect(workloadDigests).toMatchObject({
@@ -885,7 +1011,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
         processMaxRssPlatformUnits: process.resourceUsage().maxRSS,
         poolMax: 4,
         publicationSql: publicationSqlSummary,
-        readSql: readSql.summary(),
+        readSql: readSqlSummary,
       }));
     }
     expect(await publishPostgresCommunityModelDayStream(pool, {

@@ -59,10 +59,17 @@ export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES = Object.freeze({
     sourceDigest: "c90d7927e4444ccb53db17822d5c11fa42adfd933854fbc50123a70cc9dde934",
     outputDigest: "4025b72539599beb754fb0b3a476203d05b2c0ff07fb824f9287656b40f7b10f",
   }),
+  "100k-readpaged": Object.freeze({
+    members: 100_000,
+    schema: "tibotattle_graph_benchmark_100k_readpaged_20260925",
+    workloadDigest: "7b3199c3da470fd8c55806f275f4f3094cb5be4fff7158aa1d07bcfc7a27f5fc",
+    sourceDigest: "c90d7927e4444ccb53db17822d5c11fa42adfd933854fbc50123a70cc9dde934",
+    outputDigest: "4025b72539599beb754fb0b3a476203d05b2c0ff07fb824f9287656b40f7b10f",
+  }),
 });
 
-const MIGRATION_COUNT = 37;
-const MIGRATION_TAIL = "0037_community_daily_publications.sql";
+const MIGRATION_COUNT = 38;
+const MIGRATION_TAIL = "0038_analytics_event_tuple_versions.sql";
 export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_MIGRATION_ROOT =
   "/app/apps/worker/postgres/migrations";
 const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
