@@ -322,6 +322,7 @@ test("benchmark migrator profile pins all isolated primary-only schemas and reje
     ["primary", "tibotattle_graph_benchmark_10k_20260925"],
     ["primary", "tibotattle_graph_benchmark_100k_20260925"],
     ["primary", "tibotattle_graph_benchmark_100k_insights_20260925"],
+    ["primary", "tibotattle_graph_benchmark_100k_paged_20260925"],
   ]);
   for (const overrides of [
     { CLOUD_RUN_JOB: TEST_MIGRATIONS_JOB },
@@ -472,11 +473,11 @@ test("benchmark profile applies 37 receipts and verifies runtime grants on every
   });
   assert.equal(result.job, GRAPH_BENCHMARK_MIGRATIONS_JOB);
   assert.equal(result.profile, GRAPH_BENCHMARK_MIGRATION_PROFILE);
-  assert.equal(result.migrations.primarySchemas.length, 3);
+  assert.equal(result.migrations.primarySchemas.length, 4);
   assert.deepEqual(result.migrations.primarySchemas.map(({ schema, applied }) => [schema, applied]),
     GRAPH_BENCHMARK_MIGRATION_TARGETS.map(({ schema }) => [schema, 37]));
   assert.equal(harness.poolCount, 1, "both schemas use only the pinned primary database pool");
-  assert.equal(harness.applyCalls, 3);
+  assert.equal(harness.applyCalls, 4);
   assert.equal(harness.cleanupCalls, 1);
   assert.equal(harness.connectorCount, 1);
   assert.equal(harness.events.some(({ role }) => role === "ledger"), false);

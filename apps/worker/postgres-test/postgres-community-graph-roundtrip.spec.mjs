@@ -54,6 +54,9 @@ function measuredPool(base) {
     if (sql.includes("candidates AS MATERIALIZED")) return "result_pages";
     if (sql.includes("WITH locked AS MATERIALIZED")) return "authority_locks";
     if (sql.includes("WITH stored AS MATERIALIZED")) return "member_receipt";
+    if (/\bINSERT INTO\b/u.test(sql) && sql.includes("analytics_publication_owner_members")) {
+      return "publication_members";
+    }
     if (sql.includes("percentile_cont(0.5)")) return "database_median";
     if (sql.includes("pg_temp.pg_community_graph_members")) return "member_temp_table";
     if (sql.includes("pg_temp.pg_community_graph_capacities")) return "capacity_temp_table";
@@ -781,6 +784,34 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
       (SELECT count(*) FROM ${sqlSchema}.analytics_publication_owner_members) AS members`))
       .toMatchObject({ rows: [{ publications: "0", captures: "0", members: "0" }] });
 
+    let membershipPageCalls = 0;
+    const failSecondMembershipPagePool = {
+      async connect() {
+        const client = await pool.connect();
+        return {
+          async query(sql, values) {
+            if (typeof sql === "string"
+                && sql.includes("analytics_publication_owner_members")
+                && /\bINSERT INTO\b/u.test(sql)) {
+              membershipPageCalls += 1;
+              if (membershipPageCalls === 2) throw new Error("synthetic membership page failure");
+            }
+            return client.query(sql, values);
+          },
+          release: client.release.bind(client),
+        };
+      },
+    };
+    await expect(publishPostgresCommunityModelDayStream(failSecondMembershipPagePool, {
+      sourcePin, members: stream(), day: DAY, nowMs: STRESS_NOW_MS, schema: schemaOptions,
+    })).rejects.toMatchObject({ code: "unavailable", operation: "postgres.community_graph.publish_model_day" });
+    expect(membershipPageCalls).toBe(2);
+    expect(await pool.query(`SELECT
+      (SELECT count(*) FROM ${sqlSchema}.analytics_publications) AS publications,
+      (SELECT count(*) FROM ${sqlSchema}.analytics_publication_captures) AS captures,
+      (SELECT count(*) FROM ${sqlSchema}.analytics_publication_owner_members) AS members`))
+      .toMatchObject({ rows: [{ publications: "0", captures: "0", members: "0" }] });
+
     const memorySnapshot = () => {
       const { rss, heapUsed, external } = process.memoryUsage();
       return { rssBytes: rss, heapUsedBytes: heapUsed, externalBytes: external };
@@ -802,6 +833,8 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     const rssAfterPublish = memorySnapshot();
     expect(published).toMatchObject({ state: "published", memberCount: largeCount });
     const publicationSqlSummary = publicationSql.summary();
+    expect(publicationSqlSummary.queries.publication_members?.count ?? 0)
+      .toBe(Math.ceil(largeCount / 1_000));
     const expectCollationIndex = largeCount >= C_COLLATION_INDEX_MEMBER_THRESHOLD;
     expect(publicationSqlSummary.queries.member_page_index?.count ?? 0)
       .toBe(expectCollationIndex ? 1 : 0);
@@ -828,6 +861,13 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     const readCpu = cpuMilliseconds(process.cpuUsage(readCpuStarted));
     const rssAfterRead = memorySnapshot();
     const outputDigest = createHash("sha256").update(canonicalJson(readback)).digest("hex");
+    if (largeCount === 100_000 && STRESS_NOW_MS === 1_790_294_400_000) {
+      expect(workloadDigests).toMatchObject({
+        workloadDigest: "7b3199c3da470fd8c55806f275f4f3094cb5be4fff7158aa1d07bcfc7a27f5fc",
+        sourceDigest: "c90d7927e4444ccb53db17822d5c11fa42adfd933854fbc50123a70cc9dde934",
+      });
+      expect(outputDigest).toBe("4025b72539599beb754fb0b3a476203d05b2c0ff07fb824f9287656b40f7b10f");
+    }
     if (process.env.PG_GRAPH_STRESS_MEMBERS !== undefined) {
       console.log(JSON.stringify({
         kind: "synthetic-postgres-graph-stress-v2",

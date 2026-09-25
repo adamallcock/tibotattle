@@ -52,6 +52,13 @@ export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES = Object.freeze({
     sourceDigest: "c90d7927e4444ccb53db17822d5c11fa42adfd933854fbc50123a70cc9dde934",
     outputDigest: "4025b72539599beb754fb0b3a476203d05b2c0ff07fb824f9287656b40f7b10f",
   }),
+  "100k-paged": Object.freeze({
+    members: 100_000,
+    schema: "tibotattle_graph_benchmark_100k_paged_20260925",
+    workloadDigest: "7b3199c3da470fd8c55806f275f4f3094cb5be4fff7158aa1d07bcfc7a27f5fc",
+    sourceDigest: "c90d7927e4444ccb53db17822d5c11fa42adfd933854fbc50123a70cc9dde934",
+    outputDigest: "4025b72539599beb754fb0b3a476203d05b2c0ff07fb824f9287656b40f7b10f",
+  }),
 });
 
 const MIGRATION_COUNT = 37;
@@ -657,7 +664,9 @@ function statementKind(statement) {
   if (/^ANALYZE\s+PG_TEMP\.PG_COMMUNITY_GRAPH_MEMBERS/u.test(sql)) return "member_table_analyze";
   if (/^INSERT INTO PG_TEMP\.PG_COMMUNITY_GRAPH_MEMBERS/u.test(sql)) return "member_stage_page";
   if (/ANALYTICS_OWNER_RESULTS/u.test(sql) && /\bLIMIT\b/u.test(sql)) return "owner_result_page";
-  if (/^INSERT INTO .*ANALYTICS_PUBLICATION_OWNER_MEMBERS/u.test(sql)) return "publication_member_write";
+  if (/^INSERT INTO .*ANALYTICS_PUBLICATION_OWNER_MEMBERS/u.test(sql)
+      || (/^WITH\b/u.test(sql) && /\bINSERT INTO\b/u.test(sql)
+        && /ANALYTICS_PUBLICATION_OWNER_MEMBERS/u.test(sql))) return "publication_member_write";
   if (/ANALYTICS_PUBLICATION_OWNER_MEMBERS/u.test(sql)) return "publication_member_read";
   if (/ANALYTICS_PUBLICATION_CAPTURES/u.test(sql)) return "publication_capture";
   if (/ANALYTICS_PUBLICATIONS/u.test(sql)) return "publication_row";

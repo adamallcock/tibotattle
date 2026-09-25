@@ -163,7 +163,7 @@ function validPreflightRow() {
   return row;
 }
 
-test("the isolated insights profile keeps the exact matched 100k digests with a distinct schema", () => {
+test("isolated 100k diagnostic profiles keep exact matched digests with distinct schemas", () => {
   assert.deepEqual(computePostgresCommunityGraphBenchmarkDigests("10k"), {
     workloadDigest: POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["10k"].workloadDigest,
     sourceDigest: "dcab757ec3e6be58ca2a881586f9a73642ddb6e66e161445587369f288500056",
@@ -191,6 +191,25 @@ test("the isolated insights profile keeps the exact matched 100k digests with a 
   });
   assert.notEqual(insights100k.schema, matched100k.schema);
   assert.equal(insights100k.schema, "tibotattle_graph_benchmark_100k_insights_20260925");
+  const paged100k = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-paged"];
+  assert.deepEqual(computePostgresCommunityGraphBenchmarkDigests("100k-paged"), {
+    workloadDigest: matched100k.workloadDigest,
+    sourceDigest: matched100k.sourceDigest,
+  });
+  assert.deepEqual({
+    members: paged100k.members,
+    workloadDigest: paged100k.workloadDigest,
+    sourceDigest: paged100k.sourceDigest,
+    outputDigest: paged100k.outputDigest,
+  }, {
+    members: matched100k.members,
+    workloadDigest: matched100k.workloadDigest,
+    sourceDigest: matched100k.sourceDigest,
+    outputDigest: matched100k.outputDigest,
+  });
+  assert.notEqual(paged100k.schema, matched100k.schema);
+  assert.notEqual(paged100k.schema, insights100k.schema);
+  assert.equal(paged100k.schema, "tibotattle_graph_benchmark_100k_paged_20260925");
   assert.equal(POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["10k"].members, 10_000);
   assert.equal(POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k"].members, 100_000);
 });
@@ -210,6 +229,16 @@ test("configuration pins one single-attempt primary test Job, schema and runtime
   assert.equal(insightsConfig.schema, "tibotattle_graph_benchmark_100k_insights_20260925");
   assert.throws(() => parsePostgresCommunityGraphBenchmarkConfig(
     validEnv("100k-insights", { PRIMARY_SCHEMA: "tibotattle_graph_benchmark_100k_20260925" }),
+    POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SERVICE_ACCOUNT,
+  ), (error) => error?.code === "POSTGRES_COMMUNITY_GRAPH_BENCHMARK_TARGET_INVALID");
+  const pagedConfig = parsePostgresCommunityGraphBenchmarkConfig(
+    validEnv("100k-paged"), POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SERVICE_ACCOUNT,
+  );
+  assert.equal(pagedConfig.profile, "100k-paged");
+  assert.equal(pagedConfig.members, 100_000);
+  assert.equal(pagedConfig.schema, "tibotattle_graph_benchmark_100k_paged_20260925");
+  assert.throws(() => parsePostgresCommunityGraphBenchmarkConfig(
+    validEnv("100k-paged", { PRIMARY_SCHEMA: "tibotattle_graph_benchmark_100k_20260925" }),
     POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SERVICE_ACCOUNT,
   ), (error) => error?.code === "POSTGRES_COMMUNITY_GRAPH_BENCHMARK_TARGET_INVALID");
   for (const overrides of [
@@ -312,6 +341,15 @@ test("migration receipt is compared row-for-row and fails closed on drift", asyn
   assert.equal(insightsReceipt.tail, "0037_community_daily_publications.sql");
   assert.match(insightsReceipt.sha256, /^[a-f0-9]{64}$/u);
 
+  const pagedSchema = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-paged"].schema;
+  const pagedPool = migrationPool(rows, pagedSchema);
+  const pagedReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
+    pagedPool, pagedSchema, migrations,
+  );
+  assert.equal(pagedReceipt.count, 37);
+  assert.equal(pagedReceipt.tail, "0037_community_daily_publications.sql");
+  assert.match(pagedReceipt.sha256, /^[a-f0-9]{64}$/u);
+
   const drifted = migrationPool(rows.map((row, index) => index === 4
     ? { ...row, checksum_sha256: "f".repeat(64) } : row));
   await assert.rejects(
@@ -354,12 +392,19 @@ test("query receipt metrics count pages and connections without retaining SQL or
   metrics.setPhase("readback");
   const client = await metrics.pool.connect();
   await client.query("FETCH FORWARD 4096 FROM synthetic_cursor");
+  metrics.setPhase("publish");
+  await client.query(`WITH page AS MATERIALIZED (SELECT 'synthetic'::text AS owner_digest),
+    inserted AS (INSERT INTO synthetic.analytics_publication_owner_members(owner_digest)
+      SELECT owner_digest FROM page ON CONFLICT DO NOTHING RETURNING owner_digest)
+    SELECT count(*) FROM inserted`);
   client.release();
   const snapshot = metrics.snapshot();
   assert.equal(releaseCount, 1);
-  assert.equal(snapshot.queryCalls, 1);
+  assert.equal(snapshot.queryCalls, 2);
   assert.equal(snapshot.rowsRead, 1);
   assert.equal(snapshot.pages.publicationMemberReadPages, 1);
+  assert.equal(snapshot.pages.publicationMemberWriteQueries, 1);
+  assert.equal(snapshot.queries["publish.publication_member_write"].calls, 1);
   assert.equal(snapshot.connections.poolCheckouts, 1);
   assert.equal(snapshot.connections.maxCheckedOut, 1);
   assert.equal(snapshot.connections.checkedOutAtEnd, 0);

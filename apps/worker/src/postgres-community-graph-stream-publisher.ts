@@ -822,16 +822,8 @@ async function publishPostgresCommunityModelDayStreamWithClientMembers(
           || storedCapture.payload_json !== captureJson
           || integer(storedCapture.policy_revision, 1) !== authority.policyRevision
           || integer(storedCapture.collection_revision, 1) !== authority.collectionRevision) throw fail();
-      await client.query(
-        `INSERT INTO ${schema}.analytics_publication_owner_members
-          (source_id, day, metric, generation, owner_digest, input_revision, owner_revision,
-           authority_epoch, source_kind, input_fingerprint, result_sha256)
-         SELECT $1, $2::date, 'model', $3, member.owner_digest, member.input_revision,
-                member.owner_revision, member.authority_epoch, member.source_kind,
-                member.input_fingerprint, member.result_sha256
-           FROM pg_temp.pg_community_graph_members member
-         ON CONFLICT (source_id, day, metric, generation, owner_digest) DO NOTHING`,
-        [capturedPin.sourceId, capturedDay, generation],
+      await insertMemberPages(
+        client, schema, capturedPin.sourceId, capturedDay, generation, memberCount,
       );
       if (!await memberReceipt(client, schema, capturedPin.sourceId, capturedDay, generation, memberCount)) throw fail();
 
@@ -945,4 +937,60 @@ async function memberReceipt(
   );
   return integer(result.rows[0]?.stored_count) === expectedCount
     && integer(result.rows[0]?.mismatch_count) === 0;
+}
+
+async function insertMemberPages(
+  client: import("./postgres-client").PostgresClient,
+  schema: string,
+  sourceId: string,
+  capturedDay: string,
+  generation: string,
+  expectedCount: number,
+): Promise<void> {
+  let afterOwnerDigest = "";
+  let copiedCount = 0;
+  while (copiedCount < expectedCount) {
+    const result = await client.query<{
+      candidate_count: string | number;
+      last_owner_digest: string | null;
+      inserted_count: string | number;
+    }>(
+      `WITH page AS MATERIALIZED (
+         SELECT owner_digest, input_revision, owner_revision, authority_epoch,
+                source_kind, input_fingerprint, result_sha256
+           FROM pg_temp.pg_community_graph_members member
+          WHERE member.owner_digest COLLATE "C" > $4::text COLLATE "C"
+          ORDER BY member.owner_digest COLLATE "C"
+          LIMIT $5::integer
+       ), inserted AS (
+         INSERT INTO ${schema}.analytics_publication_owner_members
+           (source_id, day, metric, generation, owner_digest, input_revision, owner_revision,
+            authority_epoch, source_kind, input_fingerprint, result_sha256)
+         SELECT $1, $2::date, 'model', $3, page.owner_digest, page.input_revision,
+                page.owner_revision, page.authority_epoch, page.source_kind,
+                page.input_fingerprint, page.result_sha256
+           FROM page
+         ON CONFLICT (source_id, day, metric, generation, owner_digest) DO NOTHING
+         RETURNING owner_digest
+       )
+       SELECT count(*)::text AS candidate_count,
+              max(owner_digest COLLATE "C") AS last_owner_digest,
+              (SELECT count(*)::text FROM inserted) AS inserted_count
+         FROM page`,
+      [sourceId, capturedDay, generation, afterOwnerDigest, MAX_MEMBER_INSERT_BATCH],
+    );
+    const row = result.rows[0];
+    if (result.rows.length !== 1 || !row) throw fail();
+    const pageCount = integer(row.candidate_count);
+    const insertedCount = integer(row.inserted_count);
+    const nextOwnerDigest = row.last_owner_digest;
+    if (pageCount < 1 || pageCount > MAX_MEMBER_INSERT_BATCH
+        || insertedCount > pageCount
+        || pageCount > expectedCount - copiedCount
+        || typeof nextOwnerDigest !== "string"
+        || !/^[a-f0-9]{64}$/u.test(nextOwnerDigest)
+        || nextOwnerDigest <= afterOwnerDigest) throw fail();
+    copiedCount += pageCount;
+    afterOwnerDigest = nextOwnerDigest;
+  }
 }
