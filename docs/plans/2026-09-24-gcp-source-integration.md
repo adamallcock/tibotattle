@@ -79,8 +79,11 @@ next test-only gates.
 
 The [A2 synthetic daily publication review](./2026-09-25-a2-synthetic-daily-publication-review.md)
 defines the exact private fixture and temporary collection-control transition.
-Automatic approval review blocked its write-capable runner; owner approval is
-pending. The review is a proposal, not an activation or publication receipt.
+Automatic approval review initially blocked its write-capable runner. The
+owner subsequently approved the exact test-only effect recorded in that
+review. Execution still requires an exact-image qualification, live
+preconditions, and a fresh backup; approval is not an activation or
+publication receipt.
 
 The private Cloud Run dispatch recognizes at most 16 of the 51 exact Worker
 registry paths, plus one private test-only effective-page path. The other 35
