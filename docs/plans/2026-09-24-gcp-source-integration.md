@@ -19,10 +19,33 @@ The branch later merged remote `main` at `db470190`; the exact private test
 image and receipt described below apply only to the allowlisted Cloud Run
 source archive, not to a production Worker build.
 
+### Latest test-project checkpoint: 2026-09-25
+
+The [migration 36 and hosted v1.2 receipt](../receipts/2026-09-25-gcp-test-graph36.md)
+is the latest named-test-project evidence. The private Cloud Run service now
+runs a source-pinned image with 36/36 primary and 6/6 ledger migrations.
+Synthetic v1.2 admission, domain activation, effective-record read-back and
+exact GCS byte read-back passed against real Cloud SQL and GCS. Read-only
+discovery found four tagged synthetic owners and four referenced objects with
+no unattributable pending reference. This does not qualify public/admin
+ingress, scheduled work, owner erasure, production data transfer or a hosted
+graph speedup. The test maintenance Scheduler remains paused; production
+Cloudflare remains the serving system.
+
+The streamed PostgreSQL graph publisher, PostgreSQL accountless v1.2
+enrollment/grant adapter, migration 36 and exact-owner discovery family
+checks are integrated in this worktree. The accountless adapter is still
+disabled in the hosted test service; opt-out/public-history parity and most
+routes remain absent. The local 1,025-member graph regression is a bounded
+correctness test, not a 10-times hosted throughput claim. The earlier
+checkpoint narrative below is retained for source and recovery context;
+this section supersedes its then-current deployment statements.
+
 ### 2026-09-25 integration checkpoint
 
-The current local integration has 35 primary and six independent erasure-ledger
-PostgreSQL migrations. Primary migration 0035 closes the direct ready-v1.2
+At this earlier checkpoint the local integration had 35 primary and six
+independent erasure-ledger PostgreSQL migrations. Primary migration 0035 closes
+the direct ready-v1.2
 mutation/deletion gap and permits a terminal owner-erasure cascade only when
 that participant's owner link transitions to erased and its matching receipt
 is inserted in the same transaction. PostgreSQL 17 regressions cover both a
@@ -36,9 +59,9 @@ migration chain: automatic approval review rejected the proposed wrapper for
 reading a private sealed ledger export and sending its rows to the named GCP
 test database. No private ledger rows were transferred, and no dedicated
 transfer identity was provisioned. The
-generated runtime schema, migration runner, and reviewed build contexts now
-agree on these exact migration tails. This revision has **not** been built or
-applied to the private GCP test service yet.
+generated runtime schema, migration runner, and reviewed build contexts
+agreed on those migration tails. The newer migration 36 and private test
+deployment are recorded above.
 
 Local sealed-source transfer coverage now includes typed v1/v1.1 base rows,
 event-source memberships, admission/proof families, usage-correction history,
@@ -50,13 +73,14 @@ No live D1 export, R2 object copy, source freeze, or end-to-end production
 reconciliation has occurred. The test-only transfer importers do not by
 themselves establish a production activation path.
 
-The Worker registry has 51 exact routes. The currently deployed private GCP
-host serves health and three v1.2 upload routes. The local source adds bounded
+The Worker registry has 51 exact routes. At this checkpoint the deployed
+private GCP host served health and three v1.2 upload routes. The local source
+added bounded
 device sync-state, v1.2 sync-capability, envelope-key and day-manifest reads,
-but that revision has not been deployed. The full public, desktop, admin,
-scheduled, and owner-erasure application path is still absent.
-The previous exact-image hosted v1.2 synthetic journey remains valid only for
-its older 30-primary/five-ledger image. Fresh on-demand backups completed for
+which were subsequently deployed to the test service. The full public,
+desktop, admin, scheduled, and owner-erasure application path is still absent.
+The earlier exact-image hosted v1.2 synthetic journey applied only to
+its older 30-primary/five-ledger image. On-demand backups completed for
 the named GCP test primary (`1790311919040`) and ledger (`1790312021531`)
 before the pending forward migration. The live Cloudflare Worker still serves.
 
@@ -65,9 +89,10 @@ one-minute maintenance lease runs required identity, retention, restore and
 object reconciliation phases before optional analytics. The analytics path
 delivers ordered source journal entries, then calculates and publishes public
 days and graph work with durable claims, checkpoints and authority rechecks.
-The current PostgreSQL graph module stores and reads supplied precomputed
-model-day cohorts; it does not schedule, select, calculate or serve the public
-graph. A successful GCP synthetic upload therefore cannot qualify a public
+The PostgreSQL graph module then stored and read supplied precomputed
+model-day cohorts. The later streamed publisher adds bounded selection and
+calculation, but scheduled delivery and the complete public serving path
+remain unqualified. A successful GCP synthetic upload cannot qualify a public
 graph or a complete application cutover.
 
 The local private host now routes
@@ -75,8 +100,8 @@ The local private host now routes
 `POST /api/v1/me/telemetry-v12/domain-activate` through the PostgreSQL domain
 adapter. The disposable PostgreSQL 17 HTTP test covers predecessor creation,
 ready-day activation, replay, active-head read-back and tombstone refusal.
-These routes are not yet deployed to the private GCP test service, and the
-hosted smoke still stops at admission and storage read-back. Legacy v1/v1.1
+These routes were later deployed to the private GCP test service; the latest
+hosted smoke also proves effective-record read-back. Legacy v1/v1.1
 writers and authority transfer remain separate follow-on work.
 
 The accepted local PostgreSQL graph optimization improved the 10,000-record
@@ -123,7 +148,7 @@ the older raw-only representation, and refuses mixed raw/typed storage. The
 later 0035 upgrade audits existing ready days with that validator, then guards
 ready headers, chunks, records and children against direct changes or deletion.
 Its PostgreSQL 17 tests cover exact replay and terminal owner-erasure cascade;
-it is not yet applied to the GCP test database.
+it was subsequently applied to the GCP test database.
 Migration 0029 adds D1-shaped v1 and v1.1 effective-source membership tables
 with identity, lineage and retention guards. A PG17 regression proves
 forward application and owner-erasure behavior. A follow-up review closed the
@@ -171,8 +196,8 @@ preserve the exact source participant-to-owner mapping and leave missing owner
 links unknown; local fixture parity is not live reconciliation.
 
 The generated PostgreSQL runtime receipt, migration runner, local Cloud Run
-host and database build-context checks now agree on 35 primary migrations and
-six ledger migrations. The focused 0029 through 0035 tests applied the full
+host and database build-context checks now agree on 36 primary migrations and
+six ledger migrations. The focused 0029 through 0036 tests applied the full
 stream against disposable PostgreSQL 17. The private loopback host suite
 passes 15/15 with PostgreSQL 17 and the synthetic cutover rehearsal passes
 13/13. The 25-to-26
@@ -671,10 +696,11 @@ invoker binding appeared. A service-level `roles/run.invoker` grant was added
 for only `tibotattle-test-runtime@tibotattle.iam.gserviceaccount.com` so a
 single-task synthetic Cloud Run Job can call the named service with an IAM ID
 token; the policy was read back, and anonymous health remained HTTP 403.
-Project Owner and Editor roles remain inherited invocation paths. The deployed
-private test image is the verified
-`sha256:b7f4a2339965e5773e1dd786f356c345f8b1be2710f9c9e676188159c66103d2`
-digest described above. The service uses 1 vCPU and 1 GiB RAM.
+Project Owner and Editor roles remain inherited invocation paths. The latest
+verified private test image is
+`sha256:aa512247592a44dcf376b6612b2fa13551374aa7ff838b6ca7d25ba49dd2094e`,
+as recorded in the linked 2026-09-25 receipt. The service uses 1 vCPU and
+1 GiB RAM.
 
 The test primary and independent ledger are PostgreSQL 17.11 Cloud SQL
 Enterprise instances in the single `us-east1-c` zone. Both have 10 GiB SSD;
@@ -694,14 +720,15 @@ journeys have since retained tagged synthetic fixtures and their referenced
 objects in the test bucket. It has not been populated with the 7.92 GB
 production quarantine set.
 A read-only bucket metadata sweep on 2026-09-24 counted two test object
-generations totaling 4,674 bytes, with no noncurrent generation listed. A
-separate IAM-private synthetic discovery Job now passes 11 focused local
-checks and is included in the Cloud Run image build. It enumerates only exact
-synthetic UUIDv4 owner tags and aggregate PostgreSQL references under read-only
-transactions; it has not been deployed or run. Its database counts cannot by
-themselves prove that specific GCS keys and generations match. Exact-owner
-cleanup still requires the independent bucket-history proof and a hosted
-read-back before deleting either retained fixture.
+generations totaling 4,674 bytes, with no noncurrent generation listed. The
+IAM-private synthetic discovery Job was subsequently deployed and ran
+read-only against the migrated test databases. It found four exact synthetic
+UUIDv4 owner tags, four referenced GCS objects and zero unattributable pending
+references. Its database counts cannot by themselves prove that specific GCS
+keys and generations match. Exact-owner cleanup still requires independent
+bucket-history proof and a hosted read-back before deleting any retained
+fixture. The current bucket's creation-to-present soft-delete history cannot
+be established from its current metadata alone.
 
 The local `gcloud` CLI has an active account and can read the test service
 when commands specify `--project tibotattle`; its default project is unrelated.
