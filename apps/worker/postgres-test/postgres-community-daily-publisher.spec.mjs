@@ -4,7 +4,10 @@ import { lstat, realpath, stat } from "node:fs/promises";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import pg from "pg";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
-import { publishPostgresCommunityDailyDay } from "../src/postgres-community-daily-publisher.ts";
+import {
+  publishPostgresCommunityDailyDay,
+  readPostgresCommunityDailyDaySourceEligibility,
+} from "../src/postgres-community-daily-publisher.ts";
 import { readPostgresPublishedCommunityDaily } from "../src/postgres-community-daily.ts";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
@@ -175,6 +178,38 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL explicit-day community daily produc
       ...options,
     });
   }
+
+  it("reports only exact selected-day v1 and v1.1 record-presence booleans", async () => {
+    const readEligibility = () => readPostgresCommunityDailyDaySourceEligibility(pool, {
+      day: DAY,
+      schema: { primarySchema: schema },
+    });
+
+    expect(await readEligibility()).toEqual({
+      v1SelectedRecordsPresent: false,
+      v11SelectedRecordsPresent: false,
+    });
+    const client = await pool.connect();
+    let transactionOpen = false;
+    try {
+      await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      transactionOpen = true;
+      expect(await readPostgresCommunityDailyDaySourceEligibility(client, {
+        day: DAY,
+        schema: { primarySchema: schema },
+      })).toEqual({ v1SelectedRecordsPresent: false, v11SelectedRecordsPresent: false });
+      await client.query("COMMIT");
+      transactionOpen = false;
+    } finally {
+      if (transactionOpen) await client.query("ROLLBACK");
+      client.release();
+    }
+    await addOneUsageEvent();
+    expect(await readEligibility()).toEqual({
+      v1SelectedRecordsPresent: true,
+      v11SelectedRecordsPresent: false,
+    });
+  });
 
   it("publishes content-free activity and API spend once, then makes a new immutable revision after the cursor advances", async () => {
     await addOneUsageEvent();

@@ -3,7 +3,10 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Connector } from "@google-cloud/cloud-sql-connector";
-import { publishPostgresCommunityDailyDay } from "../src/postgres-community-daily-publisher.ts";
+import {
+  publishPostgresCommunityDailyDay,
+  readPostgresCommunityDailyDaySourceEligibility,
+} from "../src/postgres-community-daily-publisher.ts";
 import { readPostgresPublishedCommunityDaily } from "../src/postgres-community-daily.ts";
 import {
   closeCloudSqlResources,
@@ -155,11 +158,15 @@ function assertPublishedReadback(read, day, revision) {
 
 const PREFLIGHT_BLOCKERS = new Set([
   "POSTGRES_MAJOR_VERSION_UNSUPPORTED",
-  "SOURCE_FENCE_UNAVAILABLE",
+  "SOURCE_STATE_UNAVAILABLE",
   "SOURCE_IDENTITY_MISMATCH",
+  "ANALYTICS_CURSOR_UNAVAILABLE",
   "V1_ADMISSION_NOT_CURRENT",
+  "V1_ADMISSION_UNAVAILABLE",
   "V11_ADMISSION_NOT_CURRENT",
+  "V11_ADMISSION_UNAVAILABLE",
   "PUBLICATION_POLICY_UNAVAILABLE",
+  "COLLECTION_CONTROLS_UNAVAILABLE",
   "PUBLICATION_CONTROLS_DISABLED",
   "ANALYTICS_CURSOR_AUTHORITY_MISMATCH",
   "ANALYTICS_CURSOR_BEHIND_JOURNAL",
@@ -187,18 +194,22 @@ export async function readPostgresCommunityDailyTestPreflight(pool, config) {
       || config.schema.startsWith("pg_") || config.schema === "information_schema"
       || typeof config.sourceId !== "string" || !/^[\x21-\x7e]{1,200}$/u.test(config.sourceId)
       || typeof config.sourceNamespace !== "string"
-      || !/^[\x21-\x7e]{1,200}$/u.test(config.sourceNamespace)) {
+      || !/^[\x21-\x7e]{1,200}$/u.test(config.sourceNamespace)
+      || !validDay(config.day)) {
     fail("POSTGRES_COMMUNITY_DAILY_TEST_PREFLIGHT_CONFIGURATION_INVALID");
   }
   const schema = `"${config.schema}"`;
   const client = await pool.connect();
   let transactionOpen = false;
   let result;
+  let sourceEligibility;
   try {
     await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
     transactionOpen = true;
+    await client.query("SET LOCAL statement_timeout = '10000ms'");
+    await client.query("SET LOCAL lock_timeout = '2000ms'");
     result = await client.query(
-      `SELECT current_setting('server_version_num')::integer AS server_version_num,
+      `SELECT runtime.server_version_num,
               source.source_id, source.authority_epoch AS source_authority_epoch,
               cursor.sequence AS cursor_sequence,
               cursor.authority_epoch AS cursor_authority_epoch,
@@ -210,22 +221,27 @@ export async function readPostgresCommunityDailyTestPreflight(pool, config) {
               controls.control_state, controls.publication_enabled,
               COALESCE((SELECT max(change.sequence)
                 FROM ${schema}.storage_ingestion_changes change
-                WHERE change.source_id=source.source_id), 0)::text AS latest_sequence,
+                WHERE change.source_id=source.source_id AND source.source_id=$1), 0)::text AS latest_sequence,
               COALESCE((SELECT max(change.sequence)
                 FROM ${schema}.storage_ingestion_changes change
                 WHERE change.source_id=source.source_id
+                  AND source.source_id=$1
                   AND change.kind IN ('owner-withdrawn', 'owner-erased')), 0)::text
                 AS terminal_sequence
-         FROM ${schema}.storage_source_state source
-         JOIN ${schema}.analytics_source_cursors cursor
-           ON cursor.source_id=source.source_id
-         JOIN ${schema}.typed_v1_admission_state v1 ON v1.id=1
-         JOIN ${schema}.typed_v11_admission_state v11 ON v11.id=1
-         JOIN ${schema}.publication_state policy ON policy.singleton=1
-         JOIN ${schema}.collection_controls controls ON controls.singleton=1
-        WHERE source.singleton=1 AND source.source_id=$1`,
+         FROM (SELECT current_setting('server_version_num')::integer AS server_version_num) runtime
+         LEFT JOIN ${schema}.storage_source_state source ON source.singleton=1
+         LEFT JOIN ${schema}.analytics_source_cursors cursor
+           ON cursor.source_id=source.source_id AND source.source_id=$1
+         LEFT JOIN ${schema}.typed_v1_admission_state v1 ON v1.id=1
+         LEFT JOIN ${schema}.typed_v11_admission_state v11 ON v11.id=1
+         LEFT JOIN ${schema}.publication_state policy ON policy.singleton=1
+         LEFT JOIN ${schema}.collection_controls controls ON controls.singleton=1`,
       [config.sourceId],
     );
+    sourceEligibility = await readPostgresCommunityDailyDaySourceEligibility(client, {
+      day: config.day,
+      schema: { primarySchema: config.schema },
+    });
     await client.query("COMMIT");
     transactionOpen = false;
   } catch {
@@ -241,47 +257,88 @@ export async function readPostgresCommunityDailyTestPreflight(pool, config) {
   const blockers = [];
   if (!Array.isArray(result?.rows) || result.rows.length !== 1
       || row === null || typeof row !== "object") {
-    blockers.push("SOURCE_FENCE_UNAVAILABLE");
-  } else {
-    if (Math.floor(Number(row.server_version_num) / 10_000) !== 17) {
-      blockers.push("POSTGRES_MAJOR_VERSION_UNSUPPORTED");
-    }
-    if (row.source_id !== config.sourceId) blockers.push("SOURCE_IDENTITY_MISMATCH");
-    if (row.v1_source_namespace !== config.sourceNamespace
-        || Number(row.v1_runtime_contract_version) !== 1) {
-      blockers.push("V1_ADMISSION_NOT_CURRENT");
-    }
-    if (row.v11_source_namespace !== config.sourceNamespace
-        || Number(row.v11_runtime_contract_version) !== 1) {
-      blockers.push("V11_ADMISSION_NOT_CURRENT");
-    }
-    const policyRevision = Number(row.policy_revision);
-    const collectionRevision = Number(row.collection_revision);
-    if (!Number.isSafeInteger(policyRevision) || policyRevision < 1
-        || !Number.isSafeInteger(collectionRevision) || collectionRevision < 1) {
-      blockers.push("PUBLICATION_POLICY_UNAVAILABLE");
-    }
-    if (row.control_state !== "operational" || row.publication_enabled !== true) {
-      blockers.push("PUBLICATION_CONTROLS_DISABLED");
-    }
-    const sourceEpoch = parseNonNegativeBigInt(row.source_authority_epoch);
-    const cursorEpoch = parseNonNegativeBigInt(row.cursor_authority_epoch);
-    const cursorSequence = parseNonNegativeBigInt(row.cursor_sequence);
-    const latestSequence = parseNonNegativeBigInt(row.latest_sequence);
-    const terminalSequence = parseNonNegativeBigInt(row.terminal_sequence);
-    if (sourceEpoch === null || cursorEpoch === null || sourceEpoch !== cursorEpoch) {
-      blockers.push("ANALYTICS_CURSOR_AUTHORITY_MISMATCH");
-    }
-    if (cursorSequence === null || latestSequence === null || cursorSequence < latestSequence) {
-      blockers.push("ANALYTICS_CURSOR_BEHIND_JOURNAL");
-    }
-    if (cursorSequence === null || terminalSequence === null || cursorSequence < terminalSequence) {
-      blockers.push("TERMINAL_EVENT_BEHIND_CURSOR");
-    }
+    fail("POSTGRES_COMMUNITY_DAILY_TEST_PREFLIGHT_UNAVAILABLE");
   }
+
+  const postgres17 = Math.floor(Number(row.server_version_num) / 10_000) === 17;
+  const sourceStatePresent = row.source_id !== null && row.source_id !== undefined;
+  const sourceIdentityMatches = sourceStatePresent && row.source_id === config.sourceId;
+  const analyticsCursorPresent = row.cursor_sequence !== null && row.cursor_sequence !== undefined;
+  const v1AdmissionPresent = row.v1_source_namespace !== null
+    && row.v1_source_namespace !== undefined;
+  const v1AdmissionCurrent = v1AdmissionPresent
+    && row.v1_source_namespace === config.sourceNamespace
+    && Number(row.v1_runtime_contract_version) === 1;
+  const v11AdmissionPresent = row.v11_source_namespace !== null
+    && row.v11_source_namespace !== undefined;
+  const v11AdmissionCurrent = v11AdmissionPresent
+    && row.v11_source_namespace === config.sourceNamespace
+    && Number(row.v11_runtime_contract_version) === 1;
+  const policyPresent = row.policy_revision !== null && row.policy_revision !== undefined;
+  const policyReady = policyPresent && Number.isSafeInteger(Number(row.policy_revision))
+    && Number(row.policy_revision) >= 1;
+  const collectionControlsPresent = row.collection_revision !== null
+    && row.collection_revision !== undefined;
+  const collectionControlsOperational = collectionControlsPresent
+    && row.control_state === "operational";
+  const publicationEnabled = collectionControlsPresent && row.publication_enabled === true;
+  const dailyPublicationEnabled = collectionControlsPresent
+    && Number.isSafeInteger(Number(row.collection_revision))
+    && Number(row.collection_revision) >= 1
+    && collectionControlsOperational && publicationEnabled;
+  const sourceEpoch = parseNonNegativeBigInt(row.source_authority_epoch);
+  const cursorEpoch = parseNonNegativeBigInt(row.cursor_authority_epoch);
+  const cursorSequence = parseNonNegativeBigInt(row.cursor_sequence);
+  const latestSequence = parseNonNegativeBigInt(row.latest_sequence);
+  const terminalSequence = parseNonNegativeBigInt(row.terminal_sequence);
+  const analyticsCursorAuthorityCurrent = sourceIdentityMatches && analyticsCursorPresent
+    && sourceEpoch !== null && cursorEpoch !== null && sourceEpoch === cursorEpoch;
+  const analyticsCursorCaughtUp = sourceIdentityMatches && analyticsCursorPresent
+    && cursorSequence !== null && latestSequence !== null && cursorSequence >= latestSequence;
+  const terminalEventsDelivered = sourceIdentityMatches && analyticsCursorPresent
+    && cursorSequence !== null && terminalSequence !== null && cursorSequence >= terminalSequence;
+
+  if (!postgres17) blockers.push("POSTGRES_MAJOR_VERSION_UNSUPPORTED");
+  if (!sourceStatePresent) blockers.push("SOURCE_STATE_UNAVAILABLE");
+  else if (!sourceIdentityMatches) blockers.push("SOURCE_IDENTITY_MISMATCH");
+  if (sourceIdentityMatches && !analyticsCursorPresent) blockers.push("ANALYTICS_CURSOR_UNAVAILABLE");
+  if (!v1AdmissionPresent) blockers.push("V1_ADMISSION_UNAVAILABLE");
+  else if (!v1AdmissionCurrent) blockers.push("V1_ADMISSION_NOT_CURRENT");
+  if (!v11AdmissionPresent) blockers.push("V11_ADMISSION_UNAVAILABLE");
+  else if (!v11AdmissionCurrent) blockers.push("V11_ADMISSION_NOT_CURRENT");
+  if (!policyReady) blockers.push("PUBLICATION_POLICY_UNAVAILABLE");
+  if (!collectionControlsPresent) blockers.push("COLLECTION_CONTROLS_UNAVAILABLE");
+  else if (!dailyPublicationEnabled) blockers.push("PUBLICATION_CONTROLS_DISABLED");
+  if (sourceIdentityMatches && analyticsCursorPresent) {
+    if (!analyticsCursorAuthorityCurrent) blockers.push("ANALYTICS_CURSOR_AUTHORITY_MISMATCH");
+    if (!analyticsCursorCaughtUp) blockers.push("ANALYTICS_CURSOR_BEHIND_JOURNAL");
+    if (!terminalEventsDelivered) blockers.push("TERMINAL_EVENT_BEHIND_CURSOR");
+  }
+
   return Object.freeze({
     status: blockers.length === 0 ? "ready" : "blocked",
     blockers: Object.freeze(blockers),
+    readiness: Object.freeze({
+      postgres17,
+      sourceStatePresent,
+      sourceIdentityMatches,
+      analyticsCursorPresent,
+      analyticsCursorAuthorityCurrent,
+      analyticsCursorCaughtUp,
+      terminalEventsDelivered,
+      v1AdmissionPresent,
+      v1AdmissionCurrent,
+      v11AdmissionPresent,
+      v11AdmissionCurrent,
+      publicationPolicyPresent: policyPresent,
+      publicationPolicyReady: policyReady,
+      collectionControlsPresent,
+      collectionControlsOperational,
+      publicationEnabled,
+      dailyPublicationEnabled,
+      selectedDayV1RecordsPresent: sourceEligibility.v1SelectedRecordsPresent,
+      selectedDayV11RecordsPresent: sourceEligibility.v11SelectedRecordsPresent,
+    }),
     projectionScope: POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE,
   });
 }
@@ -291,6 +348,18 @@ function validatePreflightResult(result) {
       || !["ready", "blocked"].includes(result.status)
       || !Array.isArray(result.blockers)
       || result.blockers.some((code) => !PREFLIGHT_BLOCKERS.has(code))
+      || result.readiness === null || typeof result.readiness !== "object"
+      || Array.isArray(result.readiness)
+      || Object.keys(result.readiness).sort().join(",") !== [
+        "analyticsCursorAuthorityCurrent", "analyticsCursorCaughtUp", "analyticsCursorPresent",
+        "collectionControlsOperational", "collectionControlsPresent", "dailyPublicationEnabled",
+        "postgres17", "publicationEnabled",
+        "publicationPolicyPresent", "publicationPolicyReady", "sourceIdentityMatches",
+        "selectedDayV11RecordsPresent", "selectedDayV1RecordsPresent", "sourceStatePresent",
+        "terminalEventsDelivered", "v1AdmissionCurrent",
+        "v1AdmissionPresent", "v11AdmissionCurrent", "v11AdmissionPresent",
+      ].sort().join(",")
+      || Object.values(result.readiness).some((value) => typeof value !== "boolean")
       || result.projectionScope !== POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE
       || (result.status === "ready" && result.blockers.length !== 0)
       || (result.status === "blocked" && result.blockers.length === 0)) {
@@ -333,7 +402,7 @@ export async function runPostgresCommunityDailyTest({
       ?? readPostgresCommunityDailyTestPreflight)(pool, config));
     if (preflightOnly) {
       receipt = Object.freeze({
-        schemaVersion: "postgres-community-daily-test-preflight-v1",
+        schemaVersion: "postgres-community-daily-test-preflight-v2",
         status: preflight.status,
         job: config.job,
         project: config.project,
@@ -342,6 +411,7 @@ export async function runPostgresCommunityDailyTest({
         readOnly: true,
         projectionScope: preflight.projectionScope,
         blockers: preflight.blockers,
+        readiness: preflight.readiness,
       });
     } else {
       if (preflight.status !== "ready") {
@@ -420,7 +490,7 @@ async function main() {
     const blocked = error?.code === "POSTGRES_COMMUNITY_DAILY_TEST_PREFLIGHT_BLOCKED";
     process.stderr.write(`${JSON.stringify({
       schemaVersion: blocked
-        ? "postgres-community-daily-test-preflight-v1"
+        ? "postgres-community-daily-test-preflight-v2"
         : "postgres-community-daily-test-v1",
       status: blocked ? "blocked" : "failed",
       code: safeErrorCode(error),

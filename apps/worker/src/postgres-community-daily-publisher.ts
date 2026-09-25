@@ -19,9 +19,11 @@ import { sha256Hex } from "./crypto";
 import {
   createPostgresSchemaConfig,
   createPostgresSourceIdentityConfig,
+  normalizePostgresError,
   PostgresStorageError,
   quotePostgresIdentifier,
   withPostgresMutation,
+  withPostgresRead,
   type PostgresClient,
   type PostgresPool,
   type PostgresQueryResult,
@@ -127,6 +129,16 @@ function dayValue(value: unknown): string {
 
 function schemaName(options: PostgresSchemaOptions | undefined): string {
   return quotePostgresIdentifier(createPostgresSchemaConfig(options).primarySchema);
+}
+
+export type PostgresCommunityDailyDaySourceEligibility = Readonly<{
+  v1SelectedRecordsPresent: boolean;
+  v11SelectedRecordsPresent: boolean;
+}>;
+
+export interface ReadPostgresCommunityDailyDaySourceEligibilityOptions {
+  readonly day: string;
+  readonly schema?: PostgresSchemaOptions;
 }
 
 function publicDailySourceCtes(schema: string): string {
@@ -256,6 +268,67 @@ function publicDailySourceCtes(schema: string): string {
          AND record.manifest_id = chunk.manifest_id
          AND record.stream = chunk.stream
     )`;
+}
+
+/**
+ * Report whether this exact publisher projection would select any v1/v1.1
+ * records for one day. A pool call opens a bounded read-only transaction; a
+ * client call uses the caller's current transaction and leaves its snapshot,
+ * bounds, and lifecycle to the caller. The result contains booleans only; a
+ * missing query result is unavailable rather than an empty day.
+ */
+export async function readPostgresCommunityDailyDaySourceEligibility(
+  poolOrClient: PostgresPool | PostgresClient,
+  options: ReadPostgresCommunityDailyDaySourceEligibilityOptions,
+): Promise<PostgresCommunityDailyDaySourceEligibility> {
+  const capturedDay = dayValue(options.day);
+  const schema = schemaName(options.schema);
+  const ctes = publicDailySourceCtes(schema);
+  const read = async (client: PostgresClient) => {
+    const result = await client.query<{
+      readonly v1_selected_records_present: boolean;
+      readonly v11_selected_records_present: boolean;
+    }>(
+      `${ctes}
+       SELECT COALESCE(bool_or(record.source_format = 10), false)
+                AS v1_selected_records_present,
+              COALESCE(bool_or(record.source_format = 11), false)
+                AS v11_selected_records_present
+         FROM active_records record`,
+      [capturedDay],
+    );
+    if (!Array.isArray(result.rows) || result.rows.length !== 1) {
+      unavailable("community_daily.source_eligibility");
+    }
+    const row = result.rows[0];
+    if (row === undefined || typeof row.v1_selected_records_present !== "boolean"
+        || typeof row.v11_selected_records_present !== "boolean") {
+      unavailable("community_daily.source_eligibility");
+    }
+    return Object.freeze({
+      v1SelectedRecordsPresent: row.v1_selected_records_present,
+      v11SelectedRecordsPresent: row.v11_selected_records_present,
+    });
+  };
+  if (poolOrClient !== null && typeof poolOrClient === "object"
+      && typeof (poolOrClient as PostgresClient).release !== "function"
+      && typeof (poolOrClient as PostgresPool).connect === "function") {
+    return withPostgresRead(poolOrClient as PostgresPool, read, {
+      operation: "community_daily.source_eligibility",
+      statementTimeoutMilliseconds: 10_000,
+      lockTimeoutMilliseconds: 2_000,
+    });
+  }
+  if (poolOrClient !== null && typeof poolOrClient === "object"
+      && typeof (poolOrClient as PostgresClient).query === "function") {
+    try {
+      return await read(poolOrClient as PostgresClient);
+    } catch (error) {
+      if (error instanceof PostgresStorageError) throw error;
+      throw normalizePostgresError(error, "community_daily.source_eligibility");
+    }
+  }
+  unavailable("community_daily.source_eligibility");
 }
 
 function safeTotals(row: DailyTotalsQueryRow | undefined): DailyTotalsRow {

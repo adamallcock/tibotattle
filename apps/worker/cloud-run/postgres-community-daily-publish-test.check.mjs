@@ -14,9 +14,31 @@ import {
 
 const EXECUTION = "tibotattle-community-daily-publish-test-00001-abc";
 const DAY = "2026-09-24";
+const READY_DIAGNOSTICS = Object.freeze({
+  postgres17: true,
+  sourceStatePresent: true,
+  sourceIdentityMatches: true,
+  analyticsCursorPresent: true,
+  analyticsCursorAuthorityCurrent: true,
+  analyticsCursorCaughtUp: true,
+  terminalEventsDelivered: true,
+  v1AdmissionPresent: true,
+  v1AdmissionCurrent: true,
+  v11AdmissionPresent: true,
+  v11AdmissionCurrent: true,
+  publicationPolicyPresent: true,
+  publicationPolicyReady: true,
+  collectionControlsPresent: true,
+  collectionControlsOperational: true,
+  publicationEnabled: true,
+  dailyPublicationEnabled: true,
+  selectedDayV1RecordsPresent: false,
+  selectedDayV11RecordsPresent: false,
+});
 const READY_PREFLIGHT = {
   status: "ready",
   blockers: [],
+  readiness: READY_DIAGNOSTICS,
   projectionScope: POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE,
 };
 
@@ -104,7 +126,7 @@ test("publisher preflight uses a read-only snapshot and reports disabled control
   const client = {
     async query(sql, params) {
       calls.push({ sql, params });
-      if (sql.startsWith("SELECT current_setting")) {
+      if (sql.startsWith("SELECT runtime.server_version_num")) {
         return { rows: [{
           server_version_num: serverVersionNum,
           source_id: "synthetic-community-source",
@@ -123,6 +145,12 @@ test("publisher preflight uses a read-only snapshot and reports disabled control
           terminal_sequence: "6",
         }] };
       }
+      if (sql.startsWith("WITH public_owners AS (")) {
+        return { rows: [{
+          v1_selected_records_present: true,
+          v11_selected_records_present: false,
+        }] };
+      }
       return { rows: [] };
     },
     release() { calls.push({ sql: "release" }); },
@@ -138,18 +166,146 @@ test("publisher preflight uses a read-only snapshot and reports disabled control
       "ANALYTICS_CURSOR_BEHIND_JOURNAL",
       "TERMINAL_EVENT_BEHIND_CURSOR",
     ],
+    readiness: {
+      ...READY_DIAGNOSTICS,
+      analyticsCursorCaughtUp: false,
+      terminalEventsDelivered: false,
+      collectionControlsOperational: false,
+      publicationEnabled: false,
+      dailyPublicationEnabled: false,
+      selectedDayV1RecordsPresent: true,
+      selectedDayV11RecordsPresent: false,
+    },
     projectionScope: POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE,
   });
   assert.match(calls[0].sql, /^BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY$/u);
-  assert.match(calls[1].sql, /^SELECT current_setting/u);
-  assert.deepEqual(calls[1].params, ["synthetic-community-source"]);
-  assert.equal(calls[1].sql.includes("v1.2"), false);
+  assert.ok(calls.some((call) => call.sql === "SET LOCAL statement_timeout = '10000ms'"));
+  assert.ok(calls.some((call) => call.sql === "SET LOCAL lock_timeout = '2000ms'"));
+  const fenceQuery = calls.find((call) => call.sql.startsWith("SELECT runtime.server_version_num"));
+  const eligibilityQuery = calls.find((call) => call.sql.startsWith("WITH public_owners AS ("));
+  assert.ok(fenceQuery);
+  assert.ok(eligibilityQuery);
+  assert.match(fenceQuery.sql, /LEFT JOIN .*storage_source_state/u);
+  assert.match(fenceQuery.sql, /source\.source_id=\$1/u);
+  assert.deepEqual(fenceQuery.params, ["synthetic-community-source"]);
+  assert.equal(fenceQuery.sql.includes("v1.2"), false);
+  assert.match(eligibilityQuery.sql, /bool_or\(record\.source_format = 10\)/u);
+  assert.match(eligibilityQuery.sql, /bool_or\(record\.source_format = 11\)/u);
+  assert.deepEqual(eligibilityQuery.params, [DAY]);
+  assert.ok(calls.indexOf(fenceQuery) < calls.indexOf(eligibilityQuery));
+  assert.ok(calls.indexOf(eligibilityQuery) < calls.findIndex((call) => call.sql === "COMMIT"));
   assert.equal(calls.at(-2).sql, "COMMIT");
   assert.equal(calls.at(-1).sql, "release");
   assert.equal(JSON.stringify(result).includes("synthetic-community"), false);
   serverVersionNum = 160005;
   const oldMajor = await readPostgresCommunityDailyTestPreflight({ connect: async () => client }, config);
   assert.equal(oldMajor.blockers[0], "POSTGRES_MAJOR_VERSION_UNSUPPORTED");
+});
+
+test("publisher preflight diagnoses missing fence rows using only booleans and safe codes", async () => {
+  const client = {
+    async query(sql) {
+      if (sql.startsWith("SELECT runtime.server_version_num")) {
+        return { rows: [{
+          server_version_num: 170006,
+          source_id: null,
+          source_authority_epoch: null,
+          cursor_sequence: null,
+          cursor_authority_epoch: null,
+          v1_source_namespace: null,
+          v1_runtime_contract_version: null,
+          v11_source_namespace: null,
+          v11_runtime_contract_version: null,
+          policy_revision: null,
+          collection_revision: null,
+          control_state: null,
+          publication_enabled: null,
+          latest_sequence: "0",
+          terminal_sequence: "0",
+        }] };
+      }
+      if (sql.startsWith("WITH public_owners AS (")) {
+        return { rows: [{
+          v1_selected_records_present: false,
+          v11_selected_records_present: false,
+        }] };
+      }
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const config = parsePostgresCommunityDailyTestConfig(
+    validEnv(), POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT,
+  );
+  const result = await readPostgresCommunityDailyTestPreflight({ connect: async () => client }, config);
+  assert.deepEqual(result.blockers, [
+    "SOURCE_STATE_UNAVAILABLE",
+    "V1_ADMISSION_UNAVAILABLE",
+    "V11_ADMISSION_UNAVAILABLE",
+    "PUBLICATION_POLICY_UNAVAILABLE",
+    "COLLECTION_CONTROLS_UNAVAILABLE",
+  ]);
+  assert.deepEqual(result.readiness, {
+    postgres17: true,
+    sourceStatePresent: false,
+    sourceIdentityMatches: false,
+    analyticsCursorPresent: false,
+    analyticsCursorAuthorityCurrent: false,
+    analyticsCursorCaughtUp: false,
+    terminalEventsDelivered: false,
+    v1AdmissionPresent: false,
+    v1AdmissionCurrent: false,
+    v11AdmissionPresent: false,
+    v11AdmissionCurrent: false,
+    publicationPolicyPresent: false,
+    publicationPolicyReady: false,
+    collectionControlsPresent: false,
+    collectionControlsOperational: false,
+    publicationEnabled: false,
+    dailyPublicationEnabled: false,
+    selectedDayV1RecordsPresent: false,
+    selectedDayV11RecordsPresent: false,
+  });
+  assert.equal(JSON.stringify(result).includes("synthetic-community"), false);
+});
+
+test("publisher preflight does not turn an unavailable source CTE into an empty day", async () => {
+  const client = {
+    async query(sql) {
+      if (sql.startsWith("SELECT runtime.server_version_num")) {
+        return { rows: [{
+          server_version_num: 170006,
+          source_id: null,
+          source_authority_epoch: null,
+          cursor_sequence: null,
+          cursor_authority_epoch: null,
+          v1_source_namespace: null,
+          v1_runtime_contract_version: null,
+          v11_source_namespace: null,
+          v11_runtime_contract_version: null,
+          policy_revision: null,
+          collection_revision: null,
+          control_state: null,
+          publication_enabled: null,
+          latest_sequence: "0",
+          terminal_sequence: "0",
+        }] };
+      }
+      if (sql.startsWith("WITH public_owners AS (")) {
+        throw new Error("private database diagnostic");
+      }
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const config = parsePostgresCommunityDailyTestConfig(
+    validEnv(), POSTGRES_COMMUNITY_DAILY_TEST_SERVICE_ACCOUNT,
+  );
+  await assert.rejects(
+    readPostgresCommunityDailyTestPreflight({ connect: async () => client }, config),
+    (error) => error.code === "POSTGRES_COMMUNITY_DAILY_TEST_PREFLIGHT_UNAVAILABLE"
+      && !error.message.includes("private database diagnostic"),
+  );
 });
 
 test("publisher calls one day, reads back that exact revision, and returns no source identity", async () => {
@@ -241,6 +397,13 @@ test("blocked preflight makes no publication or readback call and can return a s
   const blocked = {
     status: "blocked",
     blockers: ["PUBLICATION_CONTROLS_DISABLED", "ANALYTICS_CURSOR_BEHIND_JOURNAL"],
+    readiness: {
+      ...READY_DIAGNOSTICS,
+      collectionControlsOperational: false,
+      publicationEnabled: false,
+      dailyPublicationEnabled: false,
+      analyticsCursorCaughtUp: false,
+    },
     projectionScope: POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE,
   };
   const dependencies = {
@@ -260,7 +423,7 @@ test("blocked preflight makes no publication or readback call and can return a s
     env, dependencies, preflightOnly: true,
   });
   assert.deepEqual(receipt, {
-    schemaVersion: "postgres-community-daily-test-preflight-v1",
+    schemaVersion: "postgres-community-daily-test-preflight-v2",
     status: "blocked",
     job: POSTGRES_COMMUNITY_DAILY_TEST_JOB,
     project: "tibotattle",
@@ -269,6 +432,7 @@ test("blocked preflight makes no publication or readback call and can return a s
     readOnly: true,
     projectionScope: POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE,
     blockers: blocked.blockers,
+    readiness: blocked.readiness,
   });
   assert.deepEqual(calls, []);
 });
