@@ -116,6 +116,9 @@ const ALLOWED_PARTICIPANT_TABLES = Object.freeze({
   // cleanup fences active -> deleting. It cascades with that exact owner.
   community_analytical_input_versions: [1, 1],
   input_versions: [0, 1],
+  // Migration 0014 appends one bounded source digest for admitted v1.2 data.
+  // This row is owner-scoped and cascades with the participant.
+  input_source_digests: [0, 1],
   current_queue: [0, 1],
   telemetry_transport_participant_floors: [0, 1],
   telemetry_transport_device_floors: [0, 1],

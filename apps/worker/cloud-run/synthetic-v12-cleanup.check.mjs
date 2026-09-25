@@ -414,6 +414,17 @@ test("PG17 owner-erasure fixture fences one exact owner, retries an object failu
     const { eraseSyntheticPostgresV12Owner } = await importOwnerErasure(temporary);
 
     const fixture = await seedOwner(primaryPool, primarySchema, { withChunk: true });
+    await primaryPool.query(
+      `INSERT INTO ${qualified(primarySchema, "input_source_digests")}
+        (participant_id,digest) VALUES($1,$2)`,
+      [fixture.participantId, randomBytes(16).toString("hex")],
+    );
+    const sourceDigestBefore = await primaryPool.query(
+      `SELECT count(*)::int AS count FROM ${qualified(primarySchema, "input_source_digests")}
+        WHERE participant_id=$1`,
+      [fixture.participantId],
+    );
+    assert.equal(sourceDigestBefore.rows[0]?.count, 1);
     const deletes = [];
     let shouldFail = true;
     const objectStore = {
@@ -475,6 +486,12 @@ test("PG17 owner-erasure fixture fences one exact owner, retries an object failu
       [fixture.participantId],
     );
     assert.equal(enrollment.rows.length, 0);
+    const sourceDigestAfter = await primaryPool.query(
+      `SELECT count(*)::int AS count FROM ${qualified(primarySchema, "input_source_digests")}
+        WHERE participant_id=$1`,
+      [fixture.participantId],
+    );
+    assert.equal(sourceDigestAfter.rows[0]?.count, 0);
     const ownerProof = await primaryPool.query(
       `SELECT owner_digest FROM ${qualified(primarySchema, "storage_owner_erasure_receipts")}
         WHERE owner_digest=$1`,

@@ -58,6 +58,7 @@ const ALLOWED_PARTICIPANT_TABLES = Object.freeze({
   telemetry_v12_chunks: [0, 1],
   community_analytical_input_versions: [1, 1],
   input_versions: [0, 1],
+  input_source_digests: [0, 1],
   current_queue: [0, 1],
   telemetry_transport_participant_floors: [0, 1],
   telemetry_transport_device_floors: [0, 1],

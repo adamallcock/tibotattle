@@ -43,6 +43,7 @@ const TABLES = Object.freeze([
   "telemetry_v12_chunks",
   "community_analytical_input_versions",
   "input_versions",
+  "input_source_digests",
   "current_queue",
   "telemetry_transport_participant_floors",
   "telemetry_transport_device_floors",
@@ -162,7 +163,7 @@ function fakePrimaryPool({
                   : ["web_sessions", "device_pairings", "device_credentials",
                     "telemetry_v12_device_capabilities", "storage_v11_owner_links",
                     "telemetry_v12_day_manifests", "telemetry_v12_chunks",
-                    "community_analytical_input_versions"].includes(table_name) ? "1" : "0",
+                    "community_analytical_input_versions", "input_source_digests"].includes(table_name) ? "1" : "0",
               })),
               rowCount: TABLES.length,
             };
