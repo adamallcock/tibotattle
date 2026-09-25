@@ -746,7 +746,7 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
         || health.scope !== "postgres_schema_and_migrations_only"
         || health.status !== "ready" || health.workerApplicationReady !== false
         || health.checks?.postgresMajor !== 17
-        || primaryReceipt?.status !== "current" || primaryReceipt.version !== 36
+        || primaryReceipt?.status !== "current" || primaryReceipt.version !== 37
         || ledgerReceipt?.status !== "current" || ledgerReceipt.version !== 6) {
       fail("SMOKE_HEALTH_CONTRACT_INVALID");
     }

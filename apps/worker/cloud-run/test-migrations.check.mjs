@@ -261,7 +261,7 @@ test("configuration is pinned to the one-task tibotattle migration Job and exact
   const config = parseTestMigrationsConfig(validEnv(), TEST_MIGRATIONS_SERVICE_ACCOUNT);
   assert.equal(config.job, TEST_MIGRATIONS_JOB);
   assert.equal(config.project, TEST_MIGRATIONS_PROJECT);
-  assert.equal(manifest.roles.primary.length, 36);
+  assert.equal(manifest.roles.primary.length, 37);
   assert.equal(manifest.roles.ledger.length, 6);
   assert.equal(TEST_MIGRATIONS_TARGETS.primary.schema, "tibotattle_v12_a2_20260925");
   assert.equal(TEST_MIGRATIONS_TARGETS.ledger.schema, "tibotattle_ledger_v12_a2_20260925");
@@ -340,11 +340,11 @@ test("primary and ledger migrations are checksum-read back and repeated runs are
   const first = await runTestMigrations({ env: validEnv(), dependencies: harness.dependencies });
   const second = await runTestMigrations({ env: validEnv(), dependencies: harness.dependencies });
   assert.deepEqual(first, second);
-  assert.equal(first.migrations.primary.applied, 36);
+  assert.equal(first.migrations.primary.applied, 37);
   assert.equal(first.migrations.ledger.applied, 6);
   assert.match(first.migrations.primary.manifestSha256, /^[0-9a-f]{64}$/u);
   assert.match(first.migrations.ledger.latest.sha256, /^[0-9a-f]{64}$/u);
-  assert.equal(harness.state.primary.receipts.length, 36);
+  assert.equal(harness.state.primary.receipts.length, 37);
   assert.equal(harness.state.ledger.receipts.length, 6);
   assert.equal(harness.applyCalls, 4);
   assert.equal(harness.cleanupCalls, 2);

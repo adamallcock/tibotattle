@@ -40,7 +40,7 @@ const SCHEMA_PATTERN = /^[a-z_][a-z0-9_]{0,62}$/u;
 const INSTANCE_PATTERN = /^[A-Za-z0-9_.:-]{1,200}$/u;
 const DATABASE_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/u;
 const EXPECTED_MIGRATION_SHAPES = Object.freeze({
-  primary: Object.freeze({ count: 36, tail: "0036_streamed_publication_proofs.sql" }),
+  primary: Object.freeze({ count: 37, tail: "0037_community_daily_publications.sql" }),
   ledger: Object.freeze({ count: 6, tail: "0006_erasure_ledger_transfer_receipts.sql" }),
 });
 const APPLICATION_NAME = "tibotattle-synthetic-v12-cleanup";

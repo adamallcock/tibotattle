@@ -226,7 +226,7 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
             workerApplicationReady: false,
             checks: {
               postgresMajor: 17,
-              primaryMigrationReceipt: { status: "current", version: 36 },
+              primaryMigrationReceipt: { status: "current", version: 37 },
               ledgerMigrationReceipt: { status: "current", version: 6 },
             },
           });

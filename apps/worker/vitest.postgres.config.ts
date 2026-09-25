@@ -6,6 +6,7 @@ export default defineConfig({
       "postgres-test/v12-domain-roundtrip.spec.mjs",
       "postgres-test/postgres-community-graph-roundtrip.spec.mjs",
       "postgres-test/postgres-community-graph-cohort.spec.mjs",
+      "postgres-test/postgres-community-daily-roundtrip.spec.mjs",
     ],
     fileParallelism: false,
   },
