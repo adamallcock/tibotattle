@@ -29,8 +29,8 @@ candidate revision and source snapshot before moving live traffic:
 
 | Gate | Evidence now | Still required |
 | --- | --- | --- |
-| Private GCP data plane | Zonal Cloud SQL primary and independent erasure ledger, GCS, IAM-private Cloud Run, and a cleaned-up synthetic v1.2 journey at primary 42/42 and ledger 6/6 | Requalify each forward migration and serving image; preserve exact-owner erasure and restore behavior |
-| Application routes and identity | Partial private host and tested v1.2 upload/domain path; a separate test-only OAuth gateway source entry exposes only Google start/callback/result and enrollment to the IAM-private host | Deploy the gateway with backend-only invocation permission; wire browser UI and prove sign-in/enrollment; complete or retire remaining Worker routes and the production composition root |
+| Private GCP data plane | Zonal Cloud SQL primary and independent erasure ledger, GCS, IAM-private Cloud Run, and a cleaned-up synthetic v1.2 journey at primary 44/44 and ledger 6/6 | Requalify the next integrated revision; preserve exact-owner erasure and restore behavior |
+| Application routes and identity | The separate narrow test OAuth gateway is deployed and public, invokes the IAM-private backend, and passed synthetic callback-log probes; the private host serves sessions, logout, pairing mint, Google handoff and enrollment in addition to the v1.2 path | Register a dedicated test OAuth client and user, prove browser sign-in/enrollment and device claim, then complete or retire remaining Worker routes and the production composition root |
 | Historical source transfer | Sealed local rehearsals cover several typed source, journal, correction, and ledger families | Export and reconcile the real D1/R2 snapshot under a source fence, import exact history and objects, and prove no admitted writes are lost or duplicated |
 | Public analytics and maintenance | Read-only daily preflight is fail-closed; 100,000-member graph publishes in the isolated benchmark | Complete daily source/claim/cursor/publication lifecycle, full scheduled maintenance and public reads, then rehearse replay, rollback, and recovery |
 | Performance and cost | One 100,000-member hosted graph run completed in about 284 seconds; batching preserved output but did not materially improve time | Run a matched Cloudflare workload and sustained GCP load, measure database saturation and cost, and decide the acceptable throughput target |
@@ -55,27 +55,34 @@ fresh synthetic v1.2 upload and readback, and exact-owner cleanup with an
 empty all-versions bucket. Migration 42's retention permit accepts only a
 synthetic source; it does not import production D1 history.
 
-The source-only OAuth gateway addition is isolated to the Google start,
-callback, result, and enrollment paths. It pins the IAM-private backend URL and
+The [migration-44 and gateway journey](../receipts/2026-09-25-gcp-migration44-gateway-journey.md)
+records the exact-source test build, a successful pre-migration backup,
+44/44 primary and 6/6 ledger receipts, a new IAM-private backend revision,
+a public narrow gateway with callback request-log exclusion, fresh synthetic
+v1.2 readback, and exact-owner erasure with an empty all-versions bucket.
+Google OAuth client credentials and a real browser journey remain open.
+
+The deployed OAuth gateway is isolated to a small explicit route allowlist. It
+pins the IAM-private backend URL and
 ID-token audience, preserves the application `Authorization` header separately
 from Cloud Run's `X-Serverless-Authorization`, ignores caller-supplied forwarded
 and Cloudflare identity headers, limits request/response bodies and timeouts,
 rejects redirects, and logs only a route enum, method, status, and duration.
 The private host rebases only those four paths to its configured HTTPS
 `PUBLIC_ORIGIN`; its service URL remains the only accepted incoming backend
-authority. This branch has not deployed or configured either service, Google
-OAuth credentials, a public domain, or IAM. The live gate still needs a
-dedicated gateway runtime identity with backend-only invocation permission,
-public test-service ingress, an exact OAuth callback registration, same-origin
-or API-base wiring from the existing browser UI to this exact-route gateway, and
-an end-to-end journey against the test backend. That UI wiring is a separate
-integration gate; this gateway does not proxy unrelated paths. Before enabling any live OAuth
-redirect or callback, create and read back an enabled, full-sample Cloud Logging
-request-log exclusion scoped to the deployed gateway service. With the
-exclusion active, send one synthetic callback query and check every applicable
-sink and exported destination for a retained request record whose
-`httpRequest.requestUrl` contains its fake code or state; any such record blocks
-test OAuth. The gateway sends callback parameters over the private hop in a
+authority. The gateway now has a dedicated runtime identity with backend-only
+invocation permission and public test-service ingress. The live gate still needs
+an exact OAuth callback registration, same-origin or API-base wiring from the
+existing browser UI to this exact-route gateway, and an end-to-end journey
+against the test backend. That UI wiring is a separate integration gate; this
+gateway does not proxy unrelated paths. Before any real OAuth credential was
+configured, an enabled, full-sample Cloud Logging request-log exclusion was
+created and read back for the deployed gateway. A synthetic callback query
+then left no request entry or fake marker in the project's logs; only the
+content-free route event was retained. The project has no folder or
+organization ancestor and only its built-in sinks. Recheck the logging route
+if this configuration changes; any retained fake code or state blocks test
+OAuth. The gateway sends callback parameters over the private hop in a
 dedicated header, reconstructs the application callback URL inside the private
 host, and strips that handoff header before dispatch; therefore the private
 backend request URL stays query-free.
