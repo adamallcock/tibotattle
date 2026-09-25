@@ -1,6 +1,6 @@
 import { ApiError } from "./errors";
 
-const IDENTITY_LINK_SECRET_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
+export const IDENTITY_LINK_SECRET_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
 const IDENTITY_LINK_SECRET_FINGERPRINT_DOMAIN =
   "app-usagemonitor/identity-link-secret-fingerprint/v1\0";
 
@@ -24,7 +24,8 @@ function configuredIdentityLinkSecretVersion(value: unknown): string {
   return value;
 }
 
-async function identityLinkSecretFingerprint(secret: string): Promise<string> {
+/** The pinned fingerprint also recorded by the PostgreSQL Google adapters. */
+export async function identityLinkSecretFingerprint(secret: string): Promise<string> {
   const hmacKey = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(secret),

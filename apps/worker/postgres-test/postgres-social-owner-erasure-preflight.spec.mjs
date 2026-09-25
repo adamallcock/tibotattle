@@ -176,6 +176,7 @@ test("PG17 social owner preflight inventories paired devices and source refs, th
     const reconciledInventory = await inspect(owner.participantId);
     assert.equal(reconciledInventory.objectCounts.telemetry_v1, 1,
       "a reconciled source row still inventories its durable object key after the temporary marker clears");
+    const typedOwner = await seedSocialOwner(primaryPool, primarySchema, { identityLinkKey: null });
     await primaryPool.query(
       `INSERT INTO ${q(primarySchema, "pending_objects")} (contribution_id,object_key,object_kind)
        VALUES ($1,$2,'telemetry_v1')`, [owner.chunkId, owner.objectKey],
@@ -227,6 +228,41 @@ test("PG17 social owner preflight inventories paired devices and source refs, th
     await assert.rejects(inspect(owner.participantId), (error) =>
       error.code === "SOCIAL_OWNER_ERASURE_FAMILY_UNSUPPORTED");
     await primaryPool.query(`DROP TABLE ${q(primarySchema, unknownTable)}`);
+
+    const webSession = await primaryPool.query(
+      `SELECT id FROM ${q(primarySchema, "web_sessions")} WHERE participant_id=$1 ORDER BY id LIMIT 1`,
+      [owner.participantId],
+    );
+    assert.equal(webSession.rows.length, 1);
+    const webUploadId = randomUUID();
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "upload_authorizations")} (
+         id,participant_id,issued_by_session_id,secret_hash,envelope_digest,body_bytes,
+         content_type,state,issued_at,expires_at,consume_lease_expires_at
+       ) VALUES ($1,$2,$3,$4,$5,1,'application/json','consuming',$6,$7,$7)`,
+      [webUploadId, owner.participantId, webSession.rows[0].id,
+        randomBytes(32), digest(), owner.now, owner.later],
+    );
+    await assert.rejects(inspect(owner.participantId), (error) =>
+      error.code === "SOCIAL_OWNER_ERASURE_UPLOAD_IN_PROGRESS");
+    await primaryPool.query(`DELETE FROM ${q(primarySchema, "upload_authorizations")} WHERE id=$1`,
+      [webUploadId]);
+
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "typed_telemetry_namespaces")} (id,original_id)
+       VALUES (1,decode('0102','hex'))`,
+    );
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "typed_telemetry_owners")} (id,namespace_id,original_id)
+       VALUES (1,1,decode('0304','hex'))`,
+    );
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "typed_telemetry_owner_memberships")} (
+       namespace_id,source_format,owner_id,participant_id,source_namespace
+       ) VALUES (1,10,1,$1,'typed-social-test')`, [typedOwner.participantId],
+    );
+    await assert.rejects(inspect(typedOwner.participantId), (error) =>
+      error.code === "SOCIAL_OWNER_ERASURE_FAMILY_UNSUPPORTED");
 
     await primaryPool.query(
       `INSERT INTO ${q(primarySchema, "device_upload_authorizations")} (

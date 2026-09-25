@@ -44,6 +44,21 @@ export interface PostgresSocialOwnerErasurePreflightOptions {
   readonly schema?: PostgresSchemaOptions;
 }
 
+/**
+ * Transaction-only validation context for the owner eraser. Callers must first
+ * lock the exact participant row; the optional fence then permits only the
+ * same already-claimed deletion to resume. This keeps the detailed inspection
+ * logic shared with the public read-only preflight without treating the
+ * preflight's result as authorization.
+ */
+export interface PostgresSocialOwnerErasureClientInspectionOptions {
+  readonly client: PostgresClient;
+  readonly participantId: string;
+  readonly schema: PostgresSchemaOptions;
+  readonly deletionFenceId: string;
+  readonly lockRows?: boolean;
+}
+
 export interface PostgresSocialOwnerErasureInventory {
   readonly status: "inspectable";
   /** This inspection is read-only and is not authorization or proof of erasure. */
@@ -81,6 +96,25 @@ interface ObjectInventoryRow {
 interface Cursor {
   readonly source: ObjectInventoryRow["source"];
   readonly cursorId: string;
+}
+
+export interface PostgresSocialOwnerErasureObjectCursor {
+  readonly source: ObjectInventoryRow["source"];
+  readonly cursorId: string;
+}
+
+export interface PostgresSocialOwnerErasureObjectRef {
+  readonly source: ObjectInventoryRow["source"];
+  readonly id: string;
+  readonly key: string;
+  readonly createdAt: string;
+  /** A pending registration token exists only for a still-registered live row. */
+  readonly registrationToken: string | null;
+}
+
+export interface PostgresSocialOwnerErasureObjectPage {
+  readonly objects: readonly PostgresSocialOwnerErasureObjectRef[];
+  readonly nextCursor: PostgresSocialOwnerErasureObjectCursor | null;
 }
 
 function fail(code: PostgresSocialOwnerErasurePreflightCode): never {
@@ -242,19 +276,64 @@ async function inventoryObjects(
   };
   let cursor: Cursor | null = null;
   for (;;) {
-    const page: readonly ObjectInventoryRow[] = rows<ObjectInventoryRow>(await client.query(objectInventorySql(primarySchema), [
-      participantId, cursor?.source ?? null, cursor?.cursorId ?? null,
-    ]));
-    if (page.length === 0) break;
-    for (const object of page) {
-      validateObject(object);
+    const page = await readPostgresSocialOwnerErasureObjectPage(
+      client, { primarySchema }, participantId, cursor,
+    );
+    if (page.objects.length === 0) break;
+    for (const object of page.objects) {
       result[object.source] += 1;
       if (!Number.isSafeInteger(result[object.source])) fail("SOCIAL_OWNER_ERASURE_READBACK_FAILED");
     }
-    const last: ObjectInventoryRow = page[page.length - 1]!;
-    cursor = { source: last.source, cursorId: last.cursor_id };
+    cursor = page.nextCursor;
   }
   return Object.freeze(result);
+}
+
+/**
+ * Read the next bounded set of exact object identities using the same closed
+ * family inventory validated by preflight. Keys remain inside the private
+ * erasure adapter; callers must not return them through an HTTP surface or
+ * include them in receipts.
+ */
+export async function readPostgresSocialOwnerErasureObjectPage(
+  client: PostgresClient,
+  schemaOptions: PostgresSchemaOptions,
+  participantId: string,
+  cursor: PostgresSocialOwnerErasureObjectCursor | null = null,
+): Promise<PostgresSocialOwnerErasureObjectPage> {
+  if (!PARTICIPANT_ID.test(participantId)
+      || typeof client?.query !== "function"
+      || cursor !== null && (!Object.hasOwn({ telemetry: true, telemetry_v1: true, telemetry_v11: true, telemetry_v12: true }, cursor.source)
+        || typeof cursor.cursorId !== "string" || cursor.cursorId.length === 0 || cursor.cursorId.length > 2048)) {
+    fail("SOCIAL_OWNER_ERASURE_TARGET_INVALID");
+  }
+  let primarySchema: string;
+  try { primarySchema = createPostgresSchemaConfig(schemaOptions).primarySchema; } catch {
+    fail("SOCIAL_OWNER_ERASURE_TARGET_INVALID");
+  }
+  try {
+    const page = rows<ObjectInventoryRow>(await client.query(objectInventorySql(primarySchema), [
+      participantId, cursor?.source ?? null, cursor?.cursorId ?? null,
+    ]));
+    const objects = page.map((row) => {
+      validateObject(row);
+      return Object.freeze({
+        source: row.source,
+        id: row.ref_id,
+        key: row.object_key,
+        createdAt: new Date(Date.parse(row.created_at)).toISOString(),
+        registrationToken: row.registration_token,
+      });
+    });
+    const last = page.at(-1);
+    return Object.freeze({
+      objects: Object.freeze(objects),
+      nextCursor: last === undefined ? null : Object.freeze({ source: last.source, cursorId: last.cursor_id }),
+    });
+  } catch (error) {
+    if (error instanceof PostgresSocialOwnerErasurePreflightError) throw error;
+    fail("SOCIAL_OWNER_ERASURE_READBACK_FAILED");
+  }
 }
 
 async function hasUnattributedPendingObject(client: PostgresClient, primarySchema: string): Promise<boolean> {
@@ -277,11 +356,10 @@ async function hasUnattributedPendingObject(client: PostgresClient, primarySchem
 }
 
 /**
- * Read-only evidence boundary for the not-yet-implemented social owner eraser.
- * It inventories social pairing/device authority and every GCS-backed source
- * family without mutating either database or deleting objects. An eventual
- * eraser must repeat all checks under its own deletion fence and still prove
- * analytics retirement and restore replay before claiming completion.
+ * Read-only evidence boundary for social owner erasure. It inventories social
+ * pairing/device authority and every GCS-backed source family without
+ * mutating either database or deleting objects. The eraser reuses the same
+ * validation against its participant-row-locked transaction before fencing.
  */
 export async function inspectPostgresSocialOwnerErasureTarget(
   options: PostgresSocialOwnerErasurePreflightOptions,
@@ -296,165 +374,193 @@ export async function inspectPostgresSocialOwnerErasureTarget(
   }
   try {
     return await withPostgresRead(options.primaryPool, async (client) => {
-      const participants = rows<ParticipantRow>(await client.query(
-        `SELECT id,state,owner_kind,deletion_session_id,identity_link_key
-           FROM ${table(schema, "participants")} WHERE id=$1 LIMIT 2`, [options.participantId],
-      ));
-      if (participants.length === 0) fail("SOCIAL_OWNER_ERASURE_PARTICIPANT_NOT_FOUND");
-      const participant = participants[0]!;
-      if (participants.length !== 1 || participant.owner_kind !== "social"
-          || participant.state !== "active" || participant.deletion_session_id !== null
-          || participant.identity_link_key !== null && !DIGEST.test(participant.identity_link_key)) {
-        fail("SOCIAL_OWNER_ERASURE_STATE_UNEXPECTED");
-      }
-      const participantFamilyTables = await assertKnownParticipantTables(client, schema);
-      for (const name of ACCOUNTLESS_PARTICIPANT_TABLES) {
-        const ownerColumn = name === "accountless_public_history_import_claims"
-          ? "target_participant_id" : "participant_id";
-        const result = rows<{ readonly count: string | number }>(await client.query(
-          `SELECT count(*)::text AS count FROM ${table(schema, name)} WHERE ${quotePostgresIdentifier(ownerColumn)}=$1`,
-          [options.participantId],
-        ));
-        if (result.length !== 1 || count(result[0]?.count) !== 0) {
-          fail("SOCIAL_OWNER_ERASURE_FAMILY_UNSUPPORTED");
-        }
-      }
-
-      const sessions = rows<{ readonly id: string; readonly scope: string; readonly state: string }>(await client.query(
-        `SELECT id,scope,state FROM ${table(schema, "web_sessions")} WHERE participant_id=$1 ORDER BY id`,
-        [options.participantId],
-      ));
-      if (sessions.some((session) => !["personal", "deletion_only"].includes(session.scope)
-          || !["active", "revoked"].includes(session.state))) {
-        fail("SOCIAL_OWNER_ERASURE_AUTHORITY_MISMATCH");
-      }
-      const sessionIds = new Set(sessions.map((session) => session.id));
-
-      const pairings = rows<{
-        readonly id: string; readonly issued_by_session_id: string; readonly state: string;
-        readonly claimed_device_id: string | null;
-      }>(await client.query(
-        `SELECT id,issued_by_session_id,state,claimed_device_id
-           FROM ${table(schema, "device_pairings")} WHERE participant_id=$1 ORDER BY id`,
-        [options.participantId],
-      ));
-      const pairingById = new Map<string, typeof pairings[number]>();
-      for (const pairing of pairings) {
-        if (!sessionIds.has(pairing.issued_by_session_id)
-            || !["unused", "consumed", "revoked"].includes(pairing.state)
-            || pairing.state === "consumed" && typeof pairing.claimed_device_id !== "string"
-            || pairing.state !== "consumed" && pairing.claimed_device_id !== null) {
-          fail("SOCIAL_OWNER_ERASURE_AUTHORITY_MISMATCH");
-        }
-        pairingById.set(pairing.id, pairing);
-      }
-
-      const credentials = rows<{
-        readonly id: string; readonly authority_kind: string; readonly state: string;
-        readonly paired_via_pairing_id: string | null; readonly accountless_enrollment_device_id: string | null;
-      }>(await client.query(
-        `SELECT id,authority_kind,state,paired_via_pairing_id,accountless_enrollment_device_id
-           FROM ${table(schema, "device_credentials")} WHERE participant_id=$1 ORDER BY id`,
-        [options.participantId],
-      ));
-      const credentialsById = new Map(credentials.map((credential) => [credential.id, credential]));
-      for (const credential of credentials) {
-        const pairing = credential.paired_via_pairing_id === null
-          ? undefined : pairingById.get(credential.paired_via_pairing_id);
-        if (credential.authority_kind !== "social" || !["active", "revoked"].includes(credential.state)
-            || credential.accountless_enrollment_device_id !== null || !pairing
-            || pairing.state !== "consumed" || pairing.claimed_device_id !== credential.id) {
-          fail("SOCIAL_OWNER_ERASURE_AUTHORITY_MISMATCH");
-        }
-      }
-      for (const pairing of pairings) {
-        if (pairing.state === "consumed") {
-          const credential = credentialsById.get(pairing.claimed_device_id!);
-          if (credential?.paired_via_pairing_id !== pairing.id) {
-            fail("SOCIAL_OWNER_ERASURE_AUTHORITY_MISMATCH");
-          }
-        }
-      }
-      const badEvents = rows<{ readonly count: string | number }>(await client.query(
-        `SELECT count(*)::text AS count FROM ${table(schema, "device_pairing_events")} event
-          WHERE event.participant_id=$1 AND NOT EXISTS (
-            SELECT 1 FROM ${table(schema, "device_pairings")} pairing
-             WHERE pairing.id=event.pairing_id AND pairing.participant_id=event.participant_id
-          )`, [options.participantId],
-      ));
-      if (badEvents.length !== 1 || count(badEvents[0]?.count) !== 0) {
-        fail("SOCIAL_OWNER_ERASURE_AUTHORITY_MISMATCH");
-      }
-
-      const consuming = rows<{ readonly count: string | number }>(await client.query(
-        `SELECT count(*)::text AS count FROM ${table(schema, "device_upload_authorizations")}
-          WHERE participant_id=$1 AND state='consuming'`, [options.participantId],
-      ));
-      if (consuming.length !== 1 || count(consuming[0]?.count) !== 0) {
-        fail("SOCIAL_OWNER_ERASURE_UPLOAD_IN_PROGRESS");
-      }
-      const invalidUploads = rows<{ readonly count: string | number }>(await client.query(
-        `SELECT count(*)::text AS count FROM ${table(schema, "device_upload_authorizations")}
-          WHERE participant_id=$1 AND state NOT IN ('unused','consuming','consumed','revoked')`,
-        [options.participantId],
-      ));
-      if (invalidUploads.length !== 1 || count(invalidUploads[0]?.count) !== 0) {
-        fail("SOCIAL_OWNER_ERASURE_AUTHORITY_MISMATCH");
-      }
-      const badDeviceUploadAuthorities = rows<{ readonly count: string | number }>(await client.query(
-        `SELECT count(*)::text AS count FROM ${table(schema, "device_upload_authorizations")} upload_auth
-          LEFT JOIN ${table(schema, "device_credentials")} device
-            ON device.id=upload_auth.issued_by_device_id
-           AND device.participant_id=upload_auth.participant_id
-           AND device.authority_kind='social'
-         WHERE upload_auth.participant_id=$1 AND device.id IS NULL`,
-        [options.participantId],
-      ));
-      const badWebUploadAuthorities = rows<{ readonly count: string | number }>(await client.query(
-        `SELECT count(*)::text AS count FROM ${table(schema, "upload_authorizations")} upload_auth
-          LEFT JOIN ${table(schema, "web_sessions")} session
-            ON session.id=upload_auth.issued_by_session_id
-           AND session.participant_id=upload_auth.participant_id
-         WHERE upload_auth.participant_id=$1 AND session.id IS NULL`,
-        [options.participantId],
-      ));
-      if (badDeviceUploadAuthorities.length !== 1 || count(badDeviceUploadAuthorities[0]?.count) !== 0
-          || badWebUploadAuthorities.length !== 1 || count(badWebUploadAuthorities[0]?.count) !== 0) {
-        fail("SOCIAL_OWNER_ERASURE_AUTHORITY_MISMATCH");
-      }
-      const grants = rows<{ readonly count: string | number }>(await client.query(
-        `SELECT count(*)::text AS count FROM ${table(schema, "enrollment_grants")}
-          WHERE redeemed_participant_id=$1`, [options.participantId],
-      ));
-      const communityGrants = count(grants[0]?.count);
-      if (grants.length !== 1) fail("SOCIAL_OWNER_ERASURE_READBACK_FAILED");
-      if (communityGrants > 0) fail("SOCIAL_OWNER_ERASURE_GRANT_POLICY_REQUIRED");
-
-      const ownerLinks = rows<{ readonly owner_digest: string; readonly state: string }>(await client.query(
-        `SELECT owner_digest,state FROM ${table(schema, "storage_v11_owner_links")}
-          WHERE participant_id=$1 LIMIT 2`, [options.participantId],
-      ));
-      if (ownerLinks.length > 1 || ownerLinks.some((link) => !DIGEST.test(link.owner_digest)
-          || !["active", "withdrawn"].includes(link.state))) {
-        fail("SOCIAL_OWNER_ERASURE_STATE_UNEXPECTED");
-      }
-      const objectCounts = await inventoryObjects(client, schema, options.participantId);
-      if (await hasUnattributedPendingObject(client, schema)) {
-        fail("SOCIAL_OWNER_ERASURE_PENDING_UNATTRIBUTED");
-      }
-      return Object.freeze({
-        status: "inspectable",
-        erasureAuthorized: false,
-        identityCooldownRequired: participant.identity_link_key !== null,
-        ownerDigest: ownerLinks[0]?.owner_digest ?? null,
-        participantFamilyTables,
-        webSessions: sessions.length,
-        pairings: pairings.length,
-        deviceCredentials: credentials.length,
-        communityGrants,
-        objectCounts,
+      return inspectPostgresSocialOwnerErasureClient({
+        client,
+        participantId: options.participantId,
+        schema: { primarySchema: schema },
+        deletionFenceId: "",
+        lockRows: false,
       });
     }, { ...TIMEOUTS, preserveSafeError: safeError });
+  } catch (error) {
+    if (error instanceof PostgresSocialOwnerErasurePreflightError) throw error;
+    fail("SOCIAL_OWNER_ERASURE_READBACK_FAILED");
+  }
+}
+
+/**
+ * Repeat the reviewed authority/source-family inventory from inside a caller's
+ * already-open, participant-row-locked transaction. The caller supplies its
+ * deterministic fence; an active row is allowed only before this transaction
+ * claims it, while a deleting row is accepted only for that same fence.
+ */
+export async function inspectPostgresSocialOwnerErasureClient(
+  options: PostgresSocialOwnerErasureClientInspectionOptions,
+): Promise<PostgresSocialOwnerErasureInventory> {
+  if (!PARTICIPANT_ID.test(options?.participantId ?? "")
+      || typeof options.client?.query !== "function"
+      || typeof options.deletionFenceId !== "string"
+      || options.deletionFenceId !== "" && !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(options.deletionFenceId)) {
+    fail("SOCIAL_OWNER_ERASURE_TARGET_INVALID");
+  }
+  let schema: string;
+  try { schema = createPostgresSchemaConfig(options.schema).primarySchema; } catch {
+    fail("SOCIAL_OWNER_ERASURE_TARGET_INVALID");
+  }
+  try {
+    const client = options.client;
+    const participants = rows<ParticipantRow>(await client.query(
+      `SELECT id,state,owner_kind,deletion_session_id,identity_link_key
+         FROM ${table(schema, "participants")} WHERE id=$1 LIMIT 2`, [options.participantId],
+    ));
+    if (participants.length === 0) fail("SOCIAL_OWNER_ERASURE_PARTICIPANT_NOT_FOUND");
+    const participant = participants[0]!;
+    const stateAllowed = options.deletionFenceId === ""
+      ? participant.state === "active" && participant.deletion_session_id === null
+      : participant.state === "active" && participant.deletion_session_id === null
+        || participant.state === "deleting" && participant.deletion_session_id === options.deletionFenceId;
+    if (participants.length !== 1 || participant.owner_kind !== "social" || !stateAllowed
+        || participant.identity_link_key !== null && !DIGEST.test(participant.identity_link_key)) {
+      fail("SOCIAL_OWNER_ERASURE_STATE_UNEXPECTED");
+    }
+    const participantFamilyTables = await assertKnownParticipantTables(client, schema);
+    for (const name of ACCOUNTLESS_PARTICIPANT_TABLES) {
+      const ownerColumn = name === "accountless_public_history_import_claims"
+        ? "target_participant_id" : "participant_id";
+      const result = rows<{ readonly count: string | number }>(await client.query(
+        `SELECT count(*)::text AS count FROM ${table(schema, name)} WHERE ${quotePostgresIdentifier(ownerColumn)}=$1`,
+        [options.participantId],
+      ));
+      if (result.length !== 1 || count(result[0]?.count) !== 0) fail("SOCIAL_OWNER_ERASURE_FAMILY_UNSUPPORTED");
+    }
+    // This legacy typed projection owns a RESTRICT edge to participants and
+    // may retain normalized source records with no GCS key to enumerate. It is
+    // not covered by the live/history object inventory, so only a dedicated
+    // typed-family eraser may accept a participant that still has this map.
+    const typedMemberships = rows<{ readonly count: string | number }>(await client.query(
+      `SELECT count(*)::text AS count FROM ${table(schema, "typed_telemetry_owner_memberships")}
+        WHERE participant_id=$1`, [options.participantId],
+    ));
+    if (typedMemberships.length !== 1 || count(typedMemberships[0]?.count) !== 0) {
+      fail("SOCIAL_OWNER_ERASURE_FAMILY_UNSUPPORTED");
+    }
+    const lock = options.lockRows === true ? " FOR UPDATE" : "";
+    const sessions = rows<{ readonly id: string; readonly scope: string; readonly state: string }>(await client.query(
+      `SELECT id,scope,state FROM ${table(schema, "web_sessions")} WHERE participant_id=$1 ORDER BY id${lock}`,
+      [options.participantId],
+    ));
+    if (sessions.some((session) => !["personal", "deletion_only"].includes(session.scope)
+        || !["active", "revoked"].includes(session.state))) fail("SOCIAL_OWNER_ERASURE_AUTHORITY_MISMATCH");
+    const sessionIds = new Set(sessions.map((session) => session.id));
+    const pairings = rows<{
+      readonly id: string; readonly issued_by_session_id: string; readonly state: string;
+      readonly claimed_device_id: string | null;
+    }>(await client.query(
+      `SELECT id,issued_by_session_id,state,claimed_device_id
+         FROM ${table(schema, "device_pairings")} WHERE participant_id=$1 ORDER BY id${lock}`,
+      [options.participantId],
+    ));
+    const pairingById = new Map<string, typeof pairings[number]>();
+    for (const pairing of pairings) {
+      if (!sessionIds.has(pairing.issued_by_session_id)
+          || !["unused", "consumed", "revoked"].includes(pairing.state)
+          || pairing.state === "consumed" && typeof pairing.claimed_device_id !== "string"
+          || pairing.state !== "consumed" && pairing.claimed_device_id !== null) {
+        fail("SOCIAL_OWNER_ERASURE_AUTHORITY_MISMATCH");
+      }
+      pairingById.set(pairing.id, pairing);
+    }
+    const credentials = rows<{
+      readonly id: string; readonly authority_kind: string; readonly state: string;
+      readonly paired_via_pairing_id: string | null; readonly accountless_enrollment_device_id: string | null;
+    }>(await client.query(
+      `SELECT id,authority_kind,state,paired_via_pairing_id,accountless_enrollment_device_id
+         FROM ${table(schema, "device_credentials")} WHERE participant_id=$1 ORDER BY id${lock}`,
+      [options.participantId],
+    ));
+    const credentialsById = new Map(credentials.map((credential) => [credential.id, credential]));
+    for (const credential of credentials) {
+      const pairing = credential.paired_via_pairing_id === null ? undefined : pairingById.get(credential.paired_via_pairing_id);
+      if (credential.authority_kind !== "social" || !["active", "revoked"].includes(credential.state)
+          || credential.accountless_enrollment_device_id !== null || !pairing
+          || pairing.state !== "consumed" || pairing.claimed_device_id !== credential.id) {
+        fail("SOCIAL_OWNER_ERASURE_AUTHORITY_MISMATCH");
+      }
+    }
+    for (const pairing of pairings) {
+      if (pairing.state === "consumed") {
+        const credential = credentialsById.get(pairing.claimed_device_id!);
+        if (credential?.paired_via_pairing_id !== pairing.id) fail("SOCIAL_OWNER_ERASURE_AUTHORITY_MISMATCH");
+      }
+    }
+    for (const [name, stateful] of [
+      ["telemetry_v1_device_consents", false],
+      ["telemetry_v11_device_consents", false],
+      ["telemetry_v12_device_capabilities", true],
+    ] as const) {
+      const consentRows = rows<{
+        readonly device_id: string;
+        readonly state?: string;
+      }>(await client.query(
+        `SELECT device_id${stateful ? ",state" : ""}
+           FROM ${table(schema, name)} WHERE participant_id=$1 ORDER BY device_id${lock}`,
+        [options.participantId],
+      ));
+      if (consentRows.some((consent) => !credentialsById.has(consent.device_id)
+          || stateful && !["accepted", "revoked"].includes(consent.state ?? ""))) {
+        fail("SOCIAL_OWNER_ERASURE_AUTHORITY_MISMATCH");
+      }
+    }
+    const badEvents = rows<{ readonly count: string | number }>(await client.query(
+      `SELECT count(*)::text AS count FROM ${table(schema, "device_pairing_events")} event
+        WHERE event.participant_id=$1 AND NOT EXISTS (
+          SELECT 1 FROM ${table(schema, "device_pairings")} pairing
+           WHERE pairing.id=event.pairing_id AND pairing.participant_id=event.participant_id
+        )`, [options.participantId],
+    ));
+    if (badEvents.length !== 1 || count(badEvents[0]?.count) !== 0) fail("SOCIAL_OWNER_ERASURE_AUTHORITY_MISMATCH");
+    const deviceUploads = rows<{
+      readonly id: string; readonly state: string; readonly issued_by_device_id: string;
+    }>(await client.query(
+      `SELECT id,state,issued_by_device_id FROM ${table(schema, "device_upload_authorizations")}
+        WHERE participant_id=$1 ORDER BY id${lock}`, [options.participantId],
+    ));
+    if (deviceUploads.some((upload) => upload.state === "consuming")) fail("SOCIAL_OWNER_ERASURE_UPLOAD_IN_PROGRESS");
+    if (deviceUploads.some((upload) => !["unused", "consuming", "consumed", "revoked"].includes(upload.state)
+        || !credentialsById.has(upload.issued_by_device_id))) fail("SOCIAL_OWNER_ERASURE_AUTHORITY_MISMATCH");
+    const webUploads = rows<{
+      readonly id: string; readonly issued_by_session_id: string; readonly state: string;
+    }>(await client.query(
+      `SELECT id,issued_by_session_id,state FROM ${table(schema, "upload_authorizations")}
+        WHERE participant_id=$1 ORDER BY id${lock}`, [options.participantId],
+    ));
+    if (webUploads.some((upload) => upload.state === "consuming")) fail("SOCIAL_OWNER_ERASURE_UPLOAD_IN_PROGRESS");
+    if (webUploads.some((upload) => !["unused", "consuming", "consumed", "revoked"].includes(upload.state)
+        || !sessionIds.has(upload.issued_by_session_id))) {
+      fail("SOCIAL_OWNER_ERASURE_AUTHORITY_MISMATCH");
+    }
+    const grants = rows<{ readonly count: string | number }>(await client.query(
+      `SELECT count(*)::text AS count FROM ${table(schema, "enrollment_grants")}
+        WHERE redeemed_participant_id=$1`, [options.participantId],
+    ));
+    const communityGrants = count(grants[0]?.count);
+    if (grants.length !== 1) fail("SOCIAL_OWNER_ERASURE_READBACK_FAILED");
+    if (communityGrants > 0) fail("SOCIAL_OWNER_ERASURE_GRANT_POLICY_REQUIRED");
+    const ownerLinks = rows<{ readonly owner_digest: string; readonly state: string }>(await client.query(
+      `SELECT owner_digest,state FROM ${table(schema, "storage_v11_owner_links")}
+        WHERE participant_id=$1 LIMIT 2${lock}`, [options.participantId],
+    ));
+    if (ownerLinks.length > 1 || ownerLinks.some((link) => !DIGEST.test(link.owner_digest)
+        || !["active", "withdrawn"].includes(link.state))) fail("SOCIAL_OWNER_ERASURE_STATE_UNEXPECTED");
+    const objectCounts = await inventoryObjects(client, schema, options.participantId);
+    if (await hasUnattributedPendingObject(client, schema)) fail("SOCIAL_OWNER_ERASURE_PENDING_UNATTRIBUTED");
+    return Object.freeze({
+      status: "inspectable", erasureAuthorized: false,
+      identityCooldownRequired: participant.identity_link_key !== null,
+      ownerDigest: ownerLinks[0]?.owner_digest ?? null,
+      participantFamilyTables, webSessions: sessions.length, pairings: pairings.length,
+      deviceCredentials: credentials.length, communityGrants, objectCounts,
+    });
   } catch (error) {
     if (error instanceof PostgresSocialOwnerErasurePreflightError) throw error;
     fail("SOCIAL_OWNER_ERASURE_READBACK_FAILED");
