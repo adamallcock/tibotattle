@@ -468,6 +468,7 @@ function runtimePool(controlOverrides = {}) {
     upload_registration_enabled: true,
     processing_enabled: true,
     publication_enabled: false,
+    reason_code: "synthetic_v12_test_upload_only",
     ...controlOverrides,
   };
   return {
@@ -479,6 +480,7 @@ function runtimePool(controlOverrides = {}) {
         return { rows: [{ state: "active" }], rowCount: 1 };
       }
       if (sql.includes('"collection_controls"')) {
+        assert.match(sql, /\breason_code\b/u);
         return { rows: [controls], rowCount: 1 };
       }
       throw new Error("unexpected runtime readiness query");
@@ -487,23 +489,31 @@ function runtimePool(controlOverrides = {}) {
 }
 
 test("runtime readiness accepts only the narrow degraded v1.2 upload controls", async () => {
-  await assertSyntheticV12RuntimeReady({ primaryPool: runtimePool(), schema: "tibotattle" });
-  await assertSyntheticV12RuntimeReady({
-    primaryPool: runtimePool({ revision: 15 }),
-    schema: "tibotattle",
-  });
+  for (const revision of [1, 2, 4, 15, 17, "4", "17", 9_223_372_036_854_775_807n,
+    "9223372036854775807"]) {
+    await assertSyntheticV12RuntimeReady({
+      primaryPool: runtimePool({ revision }),
+      schema: "tibotattle",
+    });
+  }
   for (const controls of [
     { control_state: "operational", enrollment_enabled: true,
       upload_registration_enabled: true, processing_enabled: true, publication_enabled: true },
     { control_state: "contained", enrollment_enabled: false,
       upload_registration_enabled: false, processing_enabled: false, publication_enabled: false },
-    { revision: 1 },
-    { revision: 14 },
-    { revision: 16 },
+    { revision: 0 },
+    { revision: -1 },
+    { revision: 1.5 },
+    { revision: Number.MAX_SAFE_INTEGER + 1 },
+    { revision: "0" },
+    { revision: "01" },
+    { revision: "9223372036854775808" },
     { enrollment_enabled: true },
     { upload_registration_enabled: false },
     { processing_enabled: false },
     { publication_enabled: true },
+    { reason_code: null },
+    { reason_code: "synthetic_daily_publication_test" },
   ]) {
     await assert.rejects(
       assertSyntheticV12RuntimeReady({ primaryPool: runtimePool(controls), schema: "tibotattle" }),
@@ -512,13 +522,16 @@ test("runtime readiness accepts only the narrow degraded v1.2 upload controls", 
   }
 });
 
-test("a wrong revision blocks fixture seeding before the authenticated journey", async () => {
+test("a non-synthetic control reason blocks fixture seeding before the authenticated journey", async () => {
   const fake = fakeDependencies();
   const dependencies = {
     ...fake.dependencies,
     async assertRuntimeReady() {
       await assertSyntheticV12RuntimeReady({
-        primaryPool: runtimePool({ revision: 14 }),
+        primaryPool: runtimePool({
+          revision: 4,
+          reason_code: "synthetic_daily_publication_test",
+        }),
         schema: "tibotattle",
       });
     },

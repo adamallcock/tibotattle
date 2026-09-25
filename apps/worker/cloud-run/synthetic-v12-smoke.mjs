@@ -186,6 +186,15 @@ function deviceSecretHash(deviceId, secret) {
     .digest();
 }
 
+const POSTGRES_BIGINT_MAX = 9_223_372_036_854_775_807n;
+
+function isPositivePostgresRevision(value) {
+  if (typeof value === "number") return Number.isSafeInteger(value) && value > 0;
+  if (typeof value === "bigint") return value > 0n && value <= POSTGRES_BIGINT_MAX;
+  if (typeof value !== "string" || !/^[1-9][0-9]{0,18}$/u.test(value)) return false;
+  try { return BigInt(value) <= POSTGRES_BIGINT_MAX; } catch { return false; }
+}
+
 export async function assertSyntheticV12RuntimeReady({ primaryPool, schema }) {
   try {
     const [baseRuntime, typedRuntime, controls] = await Promise.all([
@@ -197,23 +206,20 @@ export async function assertSyntheticV12RuntimeReady({ primaryPool, schema }) {
       ),
       primaryPool.query(
         `SELECT revision, control_state, enrollment_enabled, upload_registration_enabled,
-                processing_enabled, publication_enabled
+                processing_enabled, publication_enabled, reason_code
            FROM ${quotedTable(schema, "collection_controls")} WHERE singleton = 1`,
       ),
     ]);
     const control = controls.rows.length === 1 ? controls.rows[0] : null;
-    const revision = control?.revision;
-    const revisionReady = (typeof revision === "number" && Number.isSafeInteger(revision)
-        && (revision === 2 || revision === 15))
-      || (typeof revision === "string" && /^(?:2|15)$/u.test(revision));
     if (baseRuntime.rows.length !== 1 || baseRuntime.rows[0].state !== "active"
         || typedRuntime.rows.length !== 1 || typedRuntime.rows[0].state !== "active"
-        || control === null || !revisionReady
+        || control === null || !isPositivePostgresRevision(control.revision)
         || control.control_state !== "degraded"
         || control.enrollment_enabled !== false
         || control.upload_registration_enabled !== true
         || control.processing_enabled !== true
-        || control.publication_enabled !== false) {
+        || control.publication_enabled !== false
+        || control.reason_code !== "synthetic_v12_test_upload_only") {
       fail("SMOKE_RUNTIME_CONTROLS_NOT_READY");
     }
     return Object.freeze({
