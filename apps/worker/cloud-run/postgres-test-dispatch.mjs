@@ -561,6 +561,7 @@ export function createPostgresTestParticipantDevicesDispatch({
 const V12_DAY_MANIFEST_PATH = "/api/v1/device/telemetry/v1.2/day-manifests";
 const ENVELOPE_KEY_PATH = "/api/v1/envelope-key";
 const DEVICE_UPLOAD_AUTHORIZATION_PATH = "/api/v1/device/upload-authorizations";
+const DEVICE_DISCONNECT_PATH = "/api/v1/device/disconnect";
 const DEVICE_SYNC_STATE_PATH = "/api/v1/device/sync/state";
 const DEVICE_SYNC_CAPABILITIES_PATH = "/api/v1/device/sync-capabilities";
 const DEVICE_SYNC_CAPABILITIES_V12_PATH = "/api/v1/device/sync-capabilities-v1.2";
@@ -1335,6 +1336,7 @@ export function createPostgresTestV12DayManifestDispatch({
   assertUploadAuthorizationBindings,
   assertUploadAuthorizationAllowed,
   authenticatePostgresDevice,
+  disconnectPostgresAuthenticatedDevice,
   hasPostgresDeletionTombstone,
   readPostgresDeviceSyncState,
   readPostgresDeviceSyncCapabilities,
@@ -1371,6 +1373,7 @@ export function createPostgresTestV12DayManifestDispatch({
       || typeof assertUploadAuthorizationBindings !== "function"
       || typeof assertUploadAuthorizationAllowed !== "function"
       || typeof authenticatePostgresDevice !== "function"
+      || typeof disconnectPostgresAuthenticatedDevice !== "function"
       || typeof hasPostgresDeletionTombstone !== "function"
       || typeof readPostgresDeviceSyncCapabilities !== "function"
       || typeof assertPostgresV12UploadAllowed !== "function"
@@ -1447,6 +1450,8 @@ export function createPostgresTestV12DayManifestDispatch({
     const manifestReadRoute = manifestPath && request.method === "GET";
     const uploadAuthorizationRoute = request.method === "POST"
       && url.pathname === DEVICE_UPLOAD_AUTHORIZATION_PATH;
+    const disconnectPath = url.pathname === DEVICE_DISCONNECT_PATH;
+    const disconnectRoute = disconnectPath && request.method === "POST";
     const v12ChunkUploadRoute = request.method === "POST"
       && url.pathname === V12_CHUNK_UPLOAD_PATH;
     const syncStatePath = url.pathname === DEVICE_SYNC_STATE_PATH;
@@ -1488,6 +1493,11 @@ export function createPostgresTestV12DayManifestDispatch({
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET" },
       }), crypto.randomUUID());
     }
+    if (disconnectPath && request.method !== "POST") {
+      return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
+        code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "POST" },
+      }), crypto.randomUUID());
+    }
     if ((v12DomainPredecessorPath || v12DomainActivatePath)
         && request.method !== "POST") {
       return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
@@ -1524,14 +1534,14 @@ export function createPostgresTestV12DayManifestDispatch({
       }), crypto.randomUUID());
     }
     if ((!envelopeKeyRoute && !manifestRoute && !manifestReadRoute
-        && !uploadAuthorizationRoute && !v12ChunkUploadRoute
+        && !uploadAuthorizationRoute && !disconnectRoute && !v12ChunkUploadRoute
         && !syncStateRoute && !syncCapabilitiesRoute && !syncCapabilitiesV12Route
         && !v12DomainPredecessorRoute && !v12DomainActivateRoute
         && !v12EffectivePageRoute && !accountlessEnrollmentRoute
         && !accountlessOwnershipRoute && !accountlessV12AuthorizationRoute
         && !accountlessRenewalRoute && !deviceCredentialRenewalRoute)
         || (url.search && !envelopeKeyRoute && !manifestReadRoute
-          && !syncStatePath && !syncCapabilitiesPath && !syncCapabilitiesV12Path
+          && !disconnectPath && !syncStatePath && !syncCapabilitiesPath && !syncCapabilitiesV12Path
           && !v12EffectivePageRoute)) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
@@ -1711,6 +1721,15 @@ export function createPostgresTestV12DayManifestDispatch({
         );
         return json(201, body);
       }
+      if (disconnectRoute) {
+        await assertAttemptAllowed(
+          admissionEnv.RECOVERY_RATE_LIMIT,
+          admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
+          request,
+          admissionEnv,
+          "device_disconnect",
+        );
+      }
       if (syncStateRoute || syncCapabilitiesRoute || syncCapabilitiesV12Route
           || manifestReadRoute || v12EffectivePageRoute) {
         await assertAttemptAllowed(
@@ -1724,6 +1743,24 @@ export function createPostgresTestV12DayManifestDispatch({
       if (request.headers.has("cookie")) {
         throw Object.assign(new Error("DEVICE_AUTH_INVALID"), {
           code: "DEVICE_AUTH_INVALID", status: 401,
+        });
+      }
+      if (disconnectRoute) {
+        const contentLength = request.headers.get("content-length");
+        if (contentLength !== null && contentLength !== "0") {
+          throw Object.assign(new Error("BODY_INVALID"), {
+            code: "BODY_INVALID", status: 400,
+          });
+        }
+        const disconnected = await disconnectPostgresAuthenticatedDevice(
+          primaryPool,
+          request.headers.get("authorization"),
+          { schema },
+        );
+        return json(200, {
+          schemaVersion: "device-disconnect-v0.1",
+          disconnected: true,
+          deviceId: disconnected.deviceId,
         });
       }
       if (v12ChunkUploadRoute) {

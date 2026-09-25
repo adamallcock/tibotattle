@@ -61,6 +61,7 @@ import {
   readPostgresDeviceSyncCapabilities,
   readPostgresDeviceSyncV12Capabilities,
 } from "../src/postgres-device-sync.ts";
+import { disconnectPostgresAuthenticatedDevice } from "../src/postgres-device-disconnect.ts";
 import { readPostgresV12DayCandidates } from "../src/postgres-v12-manifest-candidates.ts";
 import {
   abandonPostgresDeviceUploadAuthorization,
@@ -578,6 +579,7 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
             ),
           createPostgresDeviceUploadAuthorization,
           authenticatePostgresDevice,
+          disconnectPostgresAuthenticatedDevice,
           hasPostgresDeletionTombstone,
           readPostgresDeviceSyncState,
           readPostgresDeviceSyncCapabilities,

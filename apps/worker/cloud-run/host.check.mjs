@@ -758,6 +758,9 @@ test("private-host envelope-key is public-only and bypasses PostgreSQL and Worke
     assertUploadAuthorizationBindings() {},
     assertUploadAuthorizationAllowed: async () => {},
     authenticatePostgresDevice: async () => { throw new Error("must not authenticate"); },
+    disconnectPostgresAuthenticatedDevice: async () => {
+      throw new Error("must not disconnect");
+    },
     hasPostgresDeletionTombstone: async () => { throw new Error("must not read ledger"); },
     readPostgresDeviceSyncState: async () => ({}),
     readPostgresDeviceSyncCapabilities: async () => ({}),
@@ -1942,7 +1945,8 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
     const [transport, v12Admission, ledgerAuthority, admission, rateLimit, bodyReader, constants,
       cryptoModule, telemetryV12Repository, deviceSync, typedCodec, typedV12EffectiveReader,
       accountlessAdapter, accountlessRenewalAdapter, accountlessEnrollment, accountlessOwnership,
-      accountlessRenewal, transportPolicy, postgresCredentialRenewalAdapter]
+      accountlessRenewal, transportPolicy, postgresCredentialRenewalAdapter,
+      postgresDeviceDisconnectAdapter]
       = await Promise.all([
         vite.ssrLoadModule("/src/postgres-typed-v12-transport.ts"),
         vite.ssrLoadModule("/src/postgres-typed-v12-admission.ts"),
@@ -1963,6 +1967,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
         vite.ssrLoadModule("/src/accountless-renewal.ts"),
         vite.ssrLoadModule("/src/telemetry-transport-policy.ts"),
         vite.ssrLoadModule("/src/postgres-device-credential-renewal.ts"),
+        vite.ssrLoadModule("/src/postgres-device-disconnect.ts"),
       ]);
     const v12ManifestCandidates = await vite.ssrLoadModule("/src/postgres-v12-manifest-candidates.ts");
     const [uploadAuthorization, formatAuthority] = await Promise.all([
@@ -2158,6 +2163,7 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       privateOrigin: "http://127.0.0.1:43817",
     });
     let deviceSyncRateLimitCalls = 0;
+    let deviceDisconnectRateLimitCalls = 0;
     const manifestDispatchOptions = {
       primaryPool,
       ledgerPool,
@@ -2189,11 +2195,14 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       assertAdmissionBindings: admission.assertAdmissionBindings,
       assertAttemptAllowed: (...args) => {
         if (args[4] === "device_sync") deviceSyncRateLimitCalls += 1;
+        if (args[4] === "device_disconnect") deviceDisconnectRateLimitCalls += 1;
         return admission.assertAttemptAllowed(...args);
       },
       assertUploadAuthorizationBindings: admission.assertUploadAuthorizationBindings,
       assertUploadAuthorizationAllowed: admission.assertUploadAuthorizationAllowed,
       authenticatePostgresDevice: transport.authenticatePostgresDevice,
+      disconnectPostgresAuthenticatedDevice:
+        postgresDeviceDisconnectAdapter.disconnectPostgresAuthenticatedDevice,
       hasPostgresDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
       readPostgresDeviceSyncState: deviceSync.readPostgresDeviceSyncState,
       readPostgresDeviceSyncCapabilities: deviceSync.readPostgresDeviceSyncCapabilities,
@@ -3782,9 +3791,319 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
         + " WHERE device_id=$1", [accountlessDeviceId],
     )).rows[0].renewal_generation, 1, "replay does not create another generation");
 
-    // Simulate the persisted result of an opt-out. The Cloud Run test host
-    // does not expose disconnect until PostgreSQL v1.1 history-retention
-    // semantics are implemented. All later authority requests must fail closed.
+    const disconnectUrl = "http://127.0.0.1:43817/api/v1/device/disconnect";
+    const disconnectRequest = ({
+      authorization = undefined,
+      headers = {},
+      method = "POST",
+    } = {}) => new Request(disconnectUrl, {
+      method,
+      headers: {
+        ...(authorization === undefined ? {} : { authorization }),
+        ...headers,
+      },
+    });
+    const disconnectRouteRateStart = deviceDisconnectRateLimitCalls;
+    const readAccountlessDisconnectState = async () => primaryPool.query(
+      "SELECT ledger.state AS ledger_state, ledger.revoked_at::text AS ledger_revoked_at, "
+        + "owner.state AS owner_state, owner.revoked_at::text AS owner_revoked_at, "
+        + "v11.state AS v11_state, v11.revoked_at::text AS v11_revoked_at, "
+        + "v12.state AS v12_state, v12.revoked_at::text AS v12_revoked_at, "
+        + "device.state AS device_state, device.revoked_at::text AS device_revoked_at, "
+        + "(SELECT COALESCE(jsonb_agg(jsonb_build_array(upload.id, upload.state, "
+        + "upload.revoked_at::text, upload.consume_lease_expires_at::text) ORDER BY upload.id), '[]'::jsonb) "
+        + "FROM " + primaryTable("device_upload_authorizations")
+        + " upload WHERE upload.issued_by_device_id=$1) AS upload_authorizations "
+        + "FROM " + primaryTable("accountless_enrollment_ledger") + " ledger JOIN "
+        + primaryTable("accountless_upload_owners") + " owner "
+        + "ON owner.enrollment_device_id=ledger.device_id JOIN "
+        + primaryTable("accountless_v11_device_authorizations") + " v11 "
+        + "ON v11.enrollment_device_id=ledger.device_id JOIN "
+        + primaryTable("accountless_v12_device_authorizations") + " v12 "
+        + "ON v12.enrollment_device_id=ledger.device_id JOIN "
+        + primaryTable("device_credentials") + " device ON device.id=ledger.device_id "
+        + "WHERE ledger.device_id=$1",
+      [accountlessDeviceId],
+    );
+    const accountlessBeforeDisconnect = await readAccountlessDisconnectState();
+    assert.equal(accountlessBeforeDisconnect.rowCount, 1);
+    const accountlessDisconnectResponse = await dispatch(disconnectRequest({
+      authorization: accountlessAuth,
+    }));
+    await assertApiError(accountlessDisconnectResponse, 503, "BACKEND_STORAGE_UNAVAILABLE");
+    assert.deepEqual((await readAccountlessDisconnectState()).rows,
+      accountlessBeforeDisconnect.rows,
+      "accountless disconnect fails closed without partially revoking source authority or grants");
+
+    // The social stop route remains usable while collection and upload
+    // registration controls are degraded. Unlike accountless opt-out, social
+    // device revocation has no PostgreSQL public-source withdrawal side effect.
+    const disconnectControlsOriginal = await primaryPool.query(
+      `SELECT control_state, enrollment_enabled, upload_registration_enabled,
+              processing_enabled, publication_enabled, reason_code
+         FROM ${primaryTable("collection_controls")} WHERE singleton=1`,
+    );
+    const degradedAt = new Date().toISOString();
+    await primaryPool.query(
+      `UPDATE ${primaryTable("collection_controls")}
+          SET revision=revision+1, control_state='degraded', enrollment_enabled=false,
+              upload_registration_enabled=false, processing_enabled=false,
+              updated_at=$1::timestamptz
+        WHERE singleton=1`,
+      [degradedAt],
+    );
+    const disconnectControlsBefore = await primaryPool.query(
+      `SELECT revision, control_state, enrollment_enabled,
+              upload_registration_enabled, processing_enabled
+         FROM ${primaryTable("collection_controls")} WHERE singleton=1`,
+    );
+    assert.equal(disconnectControlsBefore.rows[0].control_state, "degraded");
+    assert.equal(disconnectControlsBefore.rows[0].enrollment_enabled, false);
+    assert.equal(disconnectControlsBefore.rows[0].upload_registration_enabled, false);
+    assert.equal(disconnectControlsBefore.rows[0].processing_enabled, false);
+
+    async function insertSyntheticSocialDevice(label) {
+      const id = randomUUID();
+      const session = randomUUID();
+      const pairing = randomUUID();
+      const participant = `synthetic-${label}-${randomUUID()}`;
+      const secret = randomBytes(32).toString("base64url");
+      const issuedAt = new Date().toISOString();
+      // D1 accepts a valid device bearer for disconnect even after ordinary
+      // upload expiry; the stop route must not strand an installation.
+      const expiresAt = new Date(Date.now() - 60_000).toISOString();
+      const sessionExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60_000).toISOString();
+      await primaryPool.query(
+        `INSERT INTO ${primaryTable("participants")} (
+           id, owner_kind, state, consent_version, created_at
+         ) VALUES ($1, 'social', 'active', $2, $3::timestamptz)`,
+        [participant, constants.TELEMETRY_CONSENT_VERSION, issuedAt],
+      );
+      await primaryPool.query(
+        `INSERT INTO ${primaryTable("web_sessions")} (
+           id, participant_id, secret_hash, csrf_hash, issued_at, expires_at, last_used_at
+         ) VALUES ($1, $2, $3, $4, $5::timestamptz, $6::timestamptz, $5::timestamptz)`,
+        [session, participant, randomBytes(32), randomBytes(32), issuedAt, sessionExpiresAt],
+      );
+      await primaryPool.query(
+        `INSERT INTO ${primaryTable("device_pairings")} (
+           id, participant_id, issued_by_session_id, secret_hash, consent_version,
+           transport_consent_version, state, issued_at, expires_at, consumed_at, claimed_device_id
+         ) VALUES ($1, $2, $3, $4, $5, $5, 'consumed', $6::timestamptz,
+           $7::timestamptz, $6::timestamptz, $8)`,
+        [pairing, participant, session, randomBytes(32),
+          constants.TELEMETRY_CONSENT_VERSION, issuedAt, sessionExpiresAt, id],
+      );
+      await primaryPool.query(
+        `INSERT INTO ${primaryTable("device_credentials")} (
+           id, participant_id, authority_kind, paired_via_pairing_id, secret_hash,
+           state, issued_at, expires_at, last_used_at, social_verified_at
+         ) VALUES ($1, $2, 'social', $3, $4, 'active', $5::timestamptz,
+           $6::timestamptz, $5::timestamptz, $5::timestamptz)`,
+        [id, participant, pairing, deviceSecretHash(id, secret), issuedAt, expiresAt],
+      );
+      return {
+        id,
+        participant,
+        secret,
+        auth: `Device um_device_${id}.${secret}`,
+        issuedAt,
+        expiresAt,
+      };
+    }
+    async function insertSyntheticUpload(device, state) {
+      const id = `synthetic-disconnect-upload-${randomUUID()}`;
+      const issuedAt = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + 60_000).toISOString();
+      await primaryPool.query(
+        `INSERT INTO ${primaryTable("device_upload_authorizations")} (
+           id, participant_id, issued_by_device_id, secret_hash, envelope_digest,
+           body_bytes, content_type, state, issued_at, expires_at,
+           consumed_at, revoked_at, consume_lease_expires_at
+         ) VALUES ($1, $2, $3, $4, $5, 1, 'application/json', $6,
+           $7::timestamptz, $8::timestamptz,
+           CASE WHEN $6='consumed' THEN $7::timestamptz ELSE NULL END,
+           CASE WHEN $6='revoked' THEN $7::timestamptz ELSE NULL END,
+           CASE WHEN $6='consuming' THEN $8::timestamptz ELSE NULL END)`,
+        [id, device.participant, device.id, randomBytes(32), "d".repeat(64), state,
+          issuedAt, expiresAt],
+      );
+      return id;
+    }
+    const socialDisconnectDevice = await insertSyntheticSocialDevice("disconnect");
+    assert.ok(Date.parse(socialDisconnectDevice.expiresAt) < Date.now(),
+      "disconnect fixture has an expired but still valid credential");
+    const disconnectUploadIds = await Promise.all([
+      insertSyntheticUpload(socialDisconnectDevice, "unused"),
+      insertSyntheticUpload(socialDisconnectDevice, "consuming"),
+      insertSyntheticUpload(socialDisconnectDevice, "consumed"),
+      insertSyntheticUpload(socialDisconnectDevice, "revoked"),
+    ]);
+    const methodRateCalls = deviceDisconnectRateLimitCalls;
+    const disconnectWrongMethod = await dispatch(disconnectRequest({ method: "GET" }));
+    await assertApiError(disconnectWrongMethod, 405, "METHOD_NOT_ALLOWED");
+    assert.equal(disconnectWrongMethod.headers.get("allow"), "POST");
+    assert.equal(deviceDisconnectRateLimitCalls, methodRateCalls,
+      "method rejection happens before device-disconnect admission");
+    const socialDeviceBeforeInvalid = await primaryPool.query(
+      `SELECT state, revoked_at::text AS revoked_at
+         FROM ${primaryTable("device_credentials")} WHERE id=$1`,
+      [socialDisconnectDevice.id],
+    );
+    const uploadStatesBeforeInvalid = await primaryPool.query(
+      `SELECT id, state, revoked_at::text AS revoked_at,
+              consume_lease_expires_at::text AS consume_lease_expires_at
+         FROM ${primaryTable("device_upload_authorizations")}
+        WHERE id = ANY($1::text[]) ORDER BY id`,
+      [disconnectUploadIds],
+    );
+    await assertApiError(await dispatch(disconnectRequest()), 401, "DEVICE_AUTH_INVALID");
+    await assertApiError(await dispatch(disconnectRequest({
+      authorization: socialDisconnectDevice.auth,
+      headers: { cookie: "session=not-allowed" },
+    })), 401, "DEVICE_AUTH_INVALID");
+    await assertApiError(await dispatch(disconnectRequest({
+      authorization: socialDisconnectDevice.auth,
+      headers: { "content-length": "1" },
+    })), 400, "BODY_INVALID");
+    await assertApiError(await dispatch(disconnectRequest({
+      authorization: `Device um_device_${socialDisconnectDevice.id}.${randomBytes(32).toString("base64url")}`,
+    })), 401, "DEVICE_AUTH_INVALID");
+    const unchangedSocialDevice = await primaryPool.query(
+      `SELECT state, revoked_at::text AS revoked_at
+         FROM ${primaryTable("device_credentials")} WHERE id=$1`,
+      [socialDisconnectDevice.id],
+    );
+    assert.deepEqual(unchangedSocialDevice.rows, socialDeviceBeforeInvalid.rows,
+      "cookie, body, and wrong-secret failures do not revoke a device");
+    const unchangedUploadStates = await primaryPool.query(
+      `SELECT id, state, revoked_at::text AS revoked_at,
+              consume_lease_expires_at::text AS consume_lease_expires_at
+         FROM ${primaryTable("device_upload_authorizations")}
+        WHERE id = ANY($1::text[]) ORDER BY id`,
+      [disconnectUploadIds],
+    );
+    assert.deepEqual(unchangedUploadStates.rows, uploadStatesBeforeInvalid.rows,
+      "invalid credentials and request forms do not alter upload grants");
+
+    const disconnectStartedAt = Date.now();
+    const socialDisconnectResponse = await dispatch(disconnectRequest({
+      authorization: socialDisconnectDevice.auth,
+    }));
+    assert.equal(socialDisconnectResponse.status, 200);
+    assert.deepEqual(await socialDisconnectResponse.json(), {
+      schemaVersion: "device-disconnect-v0.1",
+      disconnected: true,
+      deviceId: socialDisconnectDevice.id,
+    });
+    const disconnectedSocial = await primaryPool.query(
+      `SELECT state, revoked_at::text AS revoked_at
+         FROM ${primaryTable("device_credentials")} WHERE id=$1`,
+      [socialDisconnectDevice.id],
+    );
+    assert.equal(disconnectedSocial.rows[0].state, "revoked");
+    assert.ok(Date.parse(disconnectedSocial.rows[0].revoked_at) >= disconnectStartedAt);
+    const disconnectedUploads = await primaryPool.query(
+      `SELECT id, state, revoked_at::text AS revoked_at,
+              consumed_at::text AS consumed_at,
+              consume_lease_expires_at::text AS consume_lease_expires_at
+         FROM ${primaryTable("device_upload_authorizations")}
+        WHERE id = ANY($1::text[]) ORDER BY id`,
+      [disconnectUploadIds],
+    );
+    assert.deepEqual(disconnectedUploads.rows.map((row) => ({
+      id: row.id,
+      state: row.state,
+      revoked: row.revoked_at !== null,
+      consumed: row.consumed_at !== null,
+      lease: row.consume_lease_expires_at,
+    })).sort((left, right) => left.id.localeCompare(right.id)),
+    disconnectUploadIds.map((id, index) => ({
+      id,
+      state: ["revoked", "revoked", "consumed", "revoked"][index],
+      revoked: index !== 2,
+      consumed: index === 2,
+      lease: null,
+    })).sort((left, right) => left.id.localeCompare(right.id)),
+    "disconnect revokes only pending unused/consuming grants and clears leases");
+    const disconnectReplay = await dispatch(disconnectRequest({
+      authorization: socialDisconnectDevice.auth,
+    }));
+    assert.equal(disconnectReplay.status, 200,
+      "a valid bearer remains idempotently accepted after revocation");
+    assert.deepEqual(await disconnectReplay.json(), {
+      schemaVersion: "device-disconnect-v0.1",
+      disconnected: true,
+      deviceId: socialDisconnectDevice.id,
+    });
+    const replayedSocial = await primaryPool.query(
+      `SELECT state, revoked_at::text AS revoked_at
+         FROM ${primaryTable("device_credentials")} WHERE id=$1`,
+      [socialDisconnectDevice.id],
+    );
+    assert.deepEqual(replayedSocial.rows, disconnectedSocial.rows,
+      "disconnect replay preserves the original revocation receipt");
+
+    const reuseDevice = await insertSyntheticSocialDevice("disconnect-reuse");
+    const priorSecret = randomBytes(32).toString("base64url");
+    const priorSecretHash = deviceSecretHash(reuseDevice.id, priorSecret);
+    const reuseGrantIds = await Promise.all([
+      insertSyntheticUpload(reuseDevice, "unused"),
+      insertSyntheticUpload(reuseDevice, "consuming"),
+    ]);
+    await primaryPool.query(
+      `INSERT INTO ${primaryTable("device_credential_rotations")} (
+         id, device_id, participant_id, prior_secret_hash, replacement_secret_hash,
+         attempt_id, generation, rotated_at, retire_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, 2, $7::timestamptz, $8::timestamptz)`,
+      [randomUUID(), reuseDevice.id, reuseDevice.participant, priorSecretHash,
+        deviceSecretHash(reuseDevice.id, reuseDevice.secret), randomUUID(), reuseDevice.issuedAt,
+        new Date(Date.now() + 60_000).toISOString()],
+    );
+    await assertApiError(await dispatch(disconnectRequest({
+      authorization: `Device um_device_${reuseDevice.id}.${priorSecret}`,
+    })), 401, "DEVICE_AUTH_INVALID");
+    const reusedCredentialState = await primaryPool.query(
+      `SELECT state, revoked_at IS NOT NULL AS revoked
+         FROM ${primaryTable("device_credentials")} WHERE id=$1`,
+      [reuseDevice.id],
+    );
+    assert.deepEqual(reusedCredentialState.rows, [{ state: "revoked", revoked: true }],
+      "a retired bearer from a still-valid rotation revokes its social device lineage");
+    const reusedUploadStates = await primaryPool.query(
+      `SELECT state, revoked_at IS NOT NULL AS revoked,
+              consume_lease_expires_at IS NULL AS lease_cleared
+         FROM ${primaryTable("device_upload_authorizations")}
+        WHERE id = ANY($1::text[]) ORDER BY state`,
+      [reuseGrantIds],
+    );
+    assert.deepEqual(reusedUploadStates.rows, [
+      { state: "revoked", revoked: true, lease_cleared: true },
+      { state: "revoked", revoked: true, lease_cleared: true },
+    ]);
+    assert.equal(deviceDisconnectRateLimitCalls - disconnectRouteRateStart, 8,
+      "missing/cookie/body/credential, success, replay, accountless refusal, and credential-reuse requests are admitted");
+    assert.deepEqual((await primaryPool.query(
+      `SELECT revision, control_state, enrollment_enabled,
+              upload_registration_enabled, processing_enabled
+         FROM ${primaryTable("collection_controls")} WHERE singleton=1`,
+    )).rows, disconnectControlsBefore.rows,
+    "disconnect does not alter degraded enrollment, upload, or processing controls");
+    const priorControls = disconnectControlsOriginal.rows[0];
+    await primaryPool.query(
+      `UPDATE ${primaryTable("collection_controls")}
+          SET revision=revision+1, control_state=$1, enrollment_enabled=$2,
+              upload_registration_enabled=$3, processing_enabled=$4,
+              publication_enabled=$5, reason_code=$6, updated_at=clock_timestamp()
+        WHERE singleton=1`,
+      [priorControls.control_state, priorControls.enrollment_enabled,
+        priorControls.upload_registration_enabled, priorControls.processing_enabled,
+        priorControls.publication_enabled, priorControls.reason_code],
+    );
+
+    // Simulate a persisted opt-out only after the explicit fail-closed route
+    // assertion. PostgreSQL still needs publication-withdrawal parity before
+    // accountless disconnect can be implemented as a write.
     const optedOutAt = new Date().toISOString();
     await primaryPool.query("BEGIN");
     try {
