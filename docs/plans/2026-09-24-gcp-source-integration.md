@@ -21,14 +21,28 @@ source archive, not to a production Worker build.
 
 ### Latest test-project checkpoint: 2026-09-25
 
+The [migration-39 A2 v1.2 journey](../receipts/2026-09-25-gcp-a2-v12-migration39-journey.md)
+now proves a fresh synthetic upload, exact replay, domain activation,
+PostgreSQL/GCS readback, and exact-owner cleanup against the current private
+test service. One pre-seed harness failure exposed a stale migration-version
+assertion; the corrected smoke passed and the isolated bucket returned to
+empty. The test Scheduler remains paused and production Cloudflare serves.
+
+The [batched hosted graph receipt](../receipts/2026-09-25-gcp-graph-batched-hosted.md)
+records a second exact-digest 100,000-member run on a fresh schema. Batching
+cut SQL calls from 864 to 325, but measured workload time was 284.0 seconds
+versus 285.4 seconds in the preceding single run. This does not qualify a
+material hosted speedup or a tenfold Cloudflare comparison. Statement-level
+PostgreSQL work is under investigation.
+
 The [indexed hosted graph receipt](../receipts/2026-09-25-gcp-graph-readindexed-hosted.md)
 records a completed, exact-digest 100,000-member synthetic run on the zonal
 test primary: 186.3 seconds to publish and 47.3 seconds to read back, with
 one checked-out database connection. Its read-only hosted plan uses indexed
 bounded pages and no sort, resolving the earlier 120-second readback timeout
 described in the [plan diagnosis](../receipts/2026-09-25-gcp-graph-readback-plan.md).
-Publication batching and a matched hosted Cloudflare comparison remain open;
-the benchmark explicitly did not qualify a tenfold speedup.
+Publication batching was tested in the newer receipt above. A matched hosted
+Cloudflare comparison remains open; neither run qualified a tenfold speedup.
 
 The [A2 preflight-v2 receipt](../receipts/2026-09-25-gcp-a2-daily-preflight-v2.md)
 records a source-pinned private image deployed after primary migration 38/38,
@@ -55,7 +69,11 @@ that switch. This is a source inventory at commit `b2dea68a`, not a live
 public deployment observation.
 Commit `26cdb519` subsequently adds private-host participant device
 revocation with focused PostgreSQL 17 tests; it has not been deployed to the
-test service. The inventory above remains its named earlier snapshot.
+test service. Commits `5beddc9c` and `a5531287` add the legacy device
+sync-capabilities route and D1-equivalent PostgreSQL accountless participant
+defaults, respectively, with local PostgreSQL 17 tests; they are not yet in
+the serving test revision. The inventory above remains its named earlier
+snapshot.
 
 The subsequent [private daily and readpaged graph receipt](../receipts/2026-09-25-gcp-a2-daily-and-readpaged-graph.md)
 records ready private revision `tibotattle-test-app-00031-lg7`, current
@@ -75,10 +93,10 @@ graph benchmark and two separate 100,000-member hosted runs that each hit a
 insert rewrite and fresh-schema hosted proof are in progress. No matched
 hosted Cloudflare comparator or 10-times speedup has been established.
 
-The [A2 isolated v1.2 test-journey receipt](../receipts/2026-09-25-gcp-a2-v12-test-journey.md)
-is the latest named-test-project evidence. A new primary schema, independent
-ledger schema, and bucket with a recorded birth state were migrated and
-deployed through a source-pinned private Cloud Run image. The real Cloud SQL
+The earlier [A2 isolated v1.2 test-journey receipt](../receipts/2026-09-25-gcp-a2-v12-test-journey.md)
+records a new primary schema, independent ledger schema, and bucket with a
+recorded birth state, exercised through a source-pinned private Cloud Run
+image. The real Cloud SQL
 and GCS path passed synthetic v1.2 admission, replay, domain activation,
 effective-record and exact-object read-back, then exact-owner discovery and
 one-owner erasure. The owner-erasure result was checked against primary and

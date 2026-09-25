@@ -73,6 +73,13 @@ capacity forecast. They point to roundtrip and per-page work as the next
 optimization target; the whole readback phase includes work beyond its SQL
 category.
 
+Cloud Monitoring's one-minute points during 14:31–14:38 UTC peaked at 0.678
+CPU utilization, 0.499 memory utilization, and 0.233 reported disk
+utilization. At 14:43 UTC, disk bytes used were 2,438,164,480 on the fixed
+10 GB test primary. These coarse samples show no sustained resource ceiling;
+they do not by themselves isolate database execution from roundtrip or client
+time.
+
 The separate read-only diagnostic execution
 `tibotattle-public-graph-readback-diagnostic-b9jgd` succeeded on this exact
 seeded schema and image. Its plain `EXPLAIN` took 17 ms and reported a
