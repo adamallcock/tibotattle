@@ -21,6 +21,12 @@ source archive, not to a production Worker build.
 
 ### Latest test-project checkpoint: 2026-09-25
 
+The [hosted graph readback plan receipt](../receipts/2026-09-25-gcp-graph-readback-plan.md)
+reports a read-only `EXPLAIN` on the seeded 100,000-member test schema: the
+readback query has a `Gather Merge`, a blocking sort, three left hash joins,
+and no index scan. An indexed bounded-page rewrite and fresh-schema hosted
+timing are the next performance gates; the plan alone is not a speed result.
+
 The [A2 preflight-v2 receipt](../receipts/2026-09-25-gcp-a2-daily-preflight-v2.md)
 records a source-pinned private image deployed after primary migration 38/38,
 with independent ledger 6/6 and HTTP health current. The read-only daily
