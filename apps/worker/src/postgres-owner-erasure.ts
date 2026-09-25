@@ -112,6 +112,11 @@ const ALLOWED_PARTICIPANT_TABLES = Object.freeze({
   storage_v11_owner_links: [1, 1],
   telemetry_v12_day_manifests: [0, 1],
   telemetry_v12_chunks: [0, 1],
+  // A completed synthetic v1.2 journey has one predecessor, generation and
+  // current head; older partial fixtures may have none of these rows.
+  telemetry_v12_domain_predecessors: [0, 1],
+  telemetry_v12_domains: [0, 1],
+  telemetry_v12_domain_heads: [0, 1],
   // Created for every participant by migration 0026 and incremented when the
   // cleanup fences active -> deleting. It cascades with that exact owner.
   community_analytical_input_versions: [1, 1],

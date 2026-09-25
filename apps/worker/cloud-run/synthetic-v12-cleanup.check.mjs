@@ -361,6 +361,53 @@ async function seedOwner(pool, schema, { withChunk = false } = {}) {
   return { participantId, ownerDigest, objectKey };
 }
 
+async function seedActivatedDomain(pool, schema, participantId) {
+  const device = await pool.query(
+    `SELECT id FROM ${qualified(schema, "device_credentials")} WHERE participant_id=$1`,
+    [participantId],
+  );
+  const manifest = await pool.query(
+    `SELECT id,manifest_digest FROM ${qualified(schema, "telemetry_v12_day_manifests")}
+      WHERE participant_id=$1`,
+    [participantId],
+  );
+  assert.equal(device.rows.length, 1);
+  assert.equal(manifest.rows.length, 1);
+  const now = new Date();
+  const later = new Date(now.getTime() + 86_400_000);
+  const tokenHash = randomBytes(32).toString("hex");
+  const fingerprint = randomBytes(32).toString("hex");
+  const generationId = randomUUID();
+  await pool.query(
+    `INSERT INTO ${qualified(schema, "telemetry_v12_domain_predecessors")} (
+      token_hash,participant_id,device_id,legacy_fingerprint,input_revision,
+      from_day,through_day,days_json,created_at,expires_at
+    ) VALUES ($1,$2,$3,$4,0,DATE '2026-09-24',DATE '2026-09-24','[]',$5,$6)`,
+    [tokenHash, participantId, device.rows[0].id, fingerprint, now, later],
+  );
+  await pool.query(
+    `INSERT INTO ${qualified(schema, "telemetry_v12_domains")} (
+      id,participant_id,device_id,predecessor_token_hash,manifest_digest,
+      legacy_fingerprint,input_revision,from_day,through_day,days_json,created_at
+    ) VALUES ($1,$2,$3,$4,$5,$6,0,DATE '2026-09-24',DATE '2026-09-24','[]',$7)`,
+    [generationId, participantId, device.rows[0].id, tokenHash,
+      randomBytes(32).toString("hex"), fingerprint, now],
+  );
+  await pool.query(
+    `INSERT INTO ${qualified(schema, "telemetry_v12_domain_days")} (
+      generation_id,observed_day,manifest_id,manifest_digest
+    ) VALUES ($1,DATE '2026-09-24',$2,$3)`,
+    [generationId, manifest.rows[0].id, manifest.rows[0].manifest_digest],
+  );
+  await pool.query(
+    `INSERT INTO ${qualified(schema, "telemetry_v12_domain_heads")} (
+      participant_id,generation_id,revision,updated_at
+    ) VALUES ($1,$2,1,$3)`,
+    [participantId, generationId, now],
+  );
+  return generationId;
+}
+
 async function importOwnerErasure(temporary) {
   const result = await build({
     entryPoints: [resolve(WORKER_ROOT, "src/postgres-owner-erasure.ts")],
@@ -418,6 +465,9 @@ test("PG17 owner-erasure fixture fences one exact owner, retries an object failu
       `INSERT INTO ${qualified(primarySchema, "input_source_digests")}
         (participant_id,digest) VALUES($1,$2)`,
       [fixture.participantId, randomBytes(16).toString("hex")],
+    );
+    const generationId = await seedActivatedDomain(
+      primaryPool, primarySchema, fixture.participantId,
     );
     const sourceDigestBefore = await primaryPool.query(
       `SELECT count(*)::int AS count FROM ${qualified(primarySchema, "input_source_digests")}
@@ -492,6 +542,17 @@ test("PG17 owner-erasure fixture fences one exact owner, retries an object failu
       [fixture.participantId],
     );
     assert.equal(sourceDigestAfter.rows[0]?.count, 0);
+    for (const name of ["telemetry_v12_domain_predecessors", "telemetry_v12_domains",
+      "telemetry_v12_domain_heads", "telemetry_v12_domain_days"]) {
+      const remaining = await primaryPool.query(
+        `SELECT count(*)::int AS count FROM ${qualified(primarySchema, name)} WHERE ${
+          name === "telemetry_v12_domain_days" ? "generation_id=$1" :
+            name === "telemetry_v12_domains" ? "id=$1" : "participant_id=$1"}`,
+        [name === "telemetry_v12_domain_days" || name === "telemetry_v12_domains"
+          ? generationId : fixture.participantId],
+      );
+      assert.equal(remaining.rows[0]?.count, 0, `${name} must cascade with the owner`);
+    }
     const ownerProof = await primaryPool.query(
       `SELECT owner_digest FROM ${qualified(primarySchema, "storage_owner_erasure_receipts")}
         WHERE owner_digest=$1`,
