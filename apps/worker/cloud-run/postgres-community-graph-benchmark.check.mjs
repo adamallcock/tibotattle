@@ -249,6 +249,25 @@ test("isolated 100k diagnostic profiles keep exact matched digests with distinct
   assert.notEqual(readindexed100k.schema, matched100k.schema);
   assert.notEqual(readindexed100k.schema, readpaged100k.schema);
   assert.equal(readindexed100k.schema, "tibotattle_graph_benchmark_100k_readindexed_20260925");
+  const batched100k = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-batched"];
+  assert.deepEqual(computePostgresCommunityGraphBenchmarkDigests("100k-batched"), {
+    workloadDigest: matched100k.workloadDigest,
+    sourceDigest: matched100k.sourceDigest,
+  });
+  assert.deepEqual({
+    members: batched100k.members,
+    workloadDigest: batched100k.workloadDigest,
+    sourceDigest: batched100k.sourceDigest,
+    outputDigest: batched100k.outputDigest,
+  }, {
+    members: matched100k.members,
+    workloadDigest: matched100k.workloadDigest,
+    sourceDigest: matched100k.sourceDigest,
+    outputDigest: matched100k.outputDigest,
+  });
+  assert.notEqual(batched100k.schema, matched100k.schema);
+  assert.notEqual(batched100k.schema, readindexed100k.schema);
+  assert.equal(batched100k.schema, "tibotattle_graph_benchmark_100k_batched_20260925");
   assert.equal(POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["10k"].members, 10_000);
   assert.equal(POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k"].members, 100_000);
 });
@@ -298,6 +317,16 @@ test("configuration pins one single-attempt primary test Job, schema and runtime
   assert.equal(readindexedConfig.schema, "tibotattle_graph_benchmark_100k_readindexed_20260925");
   assert.throws(() => parsePostgresCommunityGraphBenchmarkConfig(
     validEnv("100k-readindexed", { PRIMARY_SCHEMA: "tibotattle_graph_benchmark_100k_20260925" }),
+    POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SERVICE_ACCOUNT,
+  ), (error) => error?.code === "POSTGRES_COMMUNITY_GRAPH_BENCHMARK_TARGET_INVALID");
+  const batchedConfig = parsePostgresCommunityGraphBenchmarkConfig(
+    validEnv("100k-batched"), POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SERVICE_ACCOUNT,
+  );
+  assert.equal(batchedConfig.profile, "100k-batched");
+  assert.equal(batchedConfig.members, 100_000);
+  assert.equal(batchedConfig.schema, "tibotattle_graph_benchmark_100k_batched_20260925");
+  assert.throws(() => parsePostgresCommunityGraphBenchmarkConfig(
+    validEnv("100k-batched", { PRIMARY_SCHEMA: "tibotattle_graph_benchmark_100k_20260925" }),
     POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SERVICE_ACCOUNT,
   ), (error) => error?.code === "POSTGRES_COMMUNITY_GRAPH_BENCHMARK_TARGET_INVALID");
   for (const overrides of [
@@ -423,6 +452,14 @@ test("migration receipt is compared row-for-row and fails closed on drift", asyn
   assert.equal(readindexedReceipt.count, 39);
   assert.equal(readindexedReceipt.tail, "0039_analytics_applied_projection_v1.sql");
   assert.match(readindexedReceipt.sha256, /^[a-f0-9]{64}$/u);
+  const batchedSchema = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-batched"].schema;
+  const batchedPool = migrationPool(rows, batchedSchema);
+  const batchedReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
+    batchedPool, batchedSchema, migrations,
+  );
+  assert.equal(batchedReceipt.count, 39);
+  assert.equal(batchedReceipt.tail, "0039_analytics_applied_projection_v1.sql");
+  assert.match(batchedReceipt.sha256, /^[a-f0-9]{64}$/u);
   assert.match(pagedReceipt.sha256, /^[a-f0-9]{64}$/u);
 
   const drifted = migrationPool(rows.map((row, index) => index === 4
@@ -460,6 +497,9 @@ test("query receipt metrics count pages and connections without retaining SQL or
               && sql.includes("member.owner_digest > $4::text")) {
             return { rows: [{ synthetic: "x" }], rowCount: 1 };
           }
+          if (sql.includes("WITH graph_result_page AS MATERIALIZED")) {
+            return { rows: [{ updated_count: "1", inserted_count: "1" }], rowCount: 1 };
+          }
           return { rows: [], rowCount: 0 };
         },
         release() { releaseCount += 1; },
@@ -474,6 +514,12 @@ test("query receipt metrics count pages and connections without retaining SQL or
     WHERE member.owner_digest > $4::text ORDER BY member.owner_digest LIMIT $5::integer
   ) SELECT page.owner_digest FROM page`);
   metrics.setPhase("publish");
+  await client.query(`WITH graph_result_page AS MATERIALIZED (SELECT 'digest' AS owner_digest),
+    updated_members AS (UPDATE pg_temp.pg_community_graph_members SET result_sha256='hash'
+      FROM graph_result_page WHERE true RETURNING owner_digest),
+    inserted_capacities AS (INSERT INTO pg_temp.pg_community_graph_capacities(owner_digest, model_id, capacity)
+      SELECT owner_digest, 'model', 1 FROM graph_result_page RETURNING owner_digest)
+    SELECT (SELECT count(*) FROM updated_members), (SELECT count(*) FROM inserted_capacities)`);
   await client.query(`WITH page AS MATERIALIZED (SELECT 'synthetic'::text AS owner_digest),
     inserted AS (INSERT INTO synthetic.analytics_publication_owner_members(owner_digest)
       SELECT owner_digest FROM page ON CONFLICT DO NOTHING RETURNING owner_digest)
@@ -481,10 +527,12 @@ test("query receipt metrics count pages and connections without retaining SQL or
   client.release();
   const snapshot = metrics.snapshot();
   assert.equal(releaseCount, 1);
-  assert.equal(snapshot.queryCalls, 2);
-  assert.equal(snapshot.rowsRead, 1);
+  assert.equal(snapshot.queryCalls, 3);
+  assert.equal(snapshot.rowsRead, 2);
   assert.equal(snapshot.pages.publicationMemberReadPages, 1);
   assert.equal(snapshot.pages.publicationMemberWriteQueries, 1);
+  assert.equal(snapshot.pages.resultPageApplyQueries, 1);
+  assert.equal(snapshot.queries["publish.result_page_apply"].calls, 1);
   assert.equal(snapshot.queries["publish.publication_member_write"].calls, 1);
   assert.equal(snapshot.connections.poolCheckouts, 1);
   assert.equal(snapshot.connections.maxCheckedOut, 1);

@@ -30,6 +30,8 @@ const STRESS_NOW_MS = process.env.PG_GRAPH_STRESS_NOW_MS === undefined
 const STRESS_TIMEOUT_MS = process.env.PG_GRAPH_STRESS_TIMEOUT_MS === undefined
   ? 120_000 : Number(process.env.PG_GRAPH_STRESS_TIMEOUT_MS);
 const C_COLLATION_INDEX_MEMBER_THRESHOLD = 10_000;
+const MEMBER_BATCH_SIZE = 4_000;
+const RESULT_CANDIDATE_PAGE_SIZE = 1_024;
 if (!Number.isSafeInteger(STRESS_MEMBERS) || STRESS_MEMBERS < 1_025
     || STRESS_MEMBERS > 100_000) {
   throw new Error("PG_GRAPH_STRESS_MEMBERS must be an integer from 1025 to 100000");
@@ -59,6 +61,9 @@ function measuredPool(base) {
     if (sql.includes("candidates AS MATERIALIZED")) return "result_pages";
     if (sql.includes("WITH locked AS MATERIALIZED")) return "authority_locks";
     if (sql.includes("WITH stored AS MATERIALIZED")) return "member_receipt";
+    if (sql.includes("WITH graph_result_page AS MATERIALIZED")
+        && /UPDATE\s+pg_temp\.pg_community_graph_members/u.test(sql)
+        && /INSERT INTO\s+pg_temp\.pg_community_graph_capacities/u.test(sql)) return "result_page_apply";
     if (/\bINSERT INTO\b/u.test(sql) && sql.includes("analytics_publication_owner_members")) {
       return "publication_members";
     }
@@ -993,6 +998,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
       .toMatchObject({ rows: [{ publications: "0", captures: "0", members: "0" }] });
 
     let membershipPageCalls = 0;
+    const injectedMembershipPage = Math.min(2, Math.ceil(largeCount / MEMBER_BATCH_SIZE));
     const failSecondMembershipPagePool = {
       async connect() {
         const client = await pool.connect();
@@ -1002,7 +1008,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
                 && sql.includes("analytics_publication_owner_members")
                 && /\bINSERT INTO\b/u.test(sql)) {
               membershipPageCalls += 1;
-              if (membershipPageCalls === 2) throw new Error("synthetic membership page failure");
+              if (membershipPageCalls === injectedMembershipPage) throw new Error("synthetic membership page failure");
             }
             return client.query(sql, values);
           },
@@ -1013,7 +1019,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     await expect(publishPostgresCommunityModelDayStream(failSecondMembershipPagePool, {
       sourcePin, members: stream(), day: DAY, nowMs: STRESS_NOW_MS, schema: schemaOptions,
     })).rejects.toMatchObject({ code: "unavailable", operation: "postgres.community_graph.publish_model_day" });
-    expect(membershipPageCalls).toBe(2);
+    expect(membershipPageCalls).toBe(injectedMembershipPage);
     expect(await pool.query(`SELECT
       (SELECT count(*) FROM ${sqlSchema}.analytics_publications) AS publications,
       (SELECT count(*) FROM ${sqlSchema}.analytics_publication_captures) AS captures,
@@ -1042,7 +1048,17 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     expect(published).toMatchObject({ state: "published", memberCount: largeCount });
     const publicationSqlSummary = publicationSql.summary();
     expect(publicationSqlSummary.queries.publication_members?.count ?? 0)
-      .toBe(Math.ceil(largeCount / 1_000));
+      .toBe(Math.ceil(largeCount / MEMBER_BATCH_SIZE));
+    expect(publicationSqlSummary.queries.member_temp_table?.count ?? 0)
+      .toBe(Math.ceil(largeCount / MEMBER_BATCH_SIZE) + 2);
+    expect(publicationSqlSummary.queries.result_pages?.count ?? 0)
+      .toBe(Math.ceil(largeCount / RESULT_CANDIDATE_PAGE_SIZE));
+    expect(publicationSqlSummary.queries.result_pages?.pages.rows.max ?? 0)
+      .toBeLessThanOrEqual(RESULT_CANDIDATE_PAGE_SIZE);
+    expect(publicationSqlSummary.queries.result_pages?.pages.resultPayloadJsonBytes.max ?? 0)
+      .toBeLessThanOrEqual(1_048_576);
+    expect(publicationSqlSummary.queries.result_page_apply?.count ?? 0)
+      .toBe(Math.ceil(largeCount / RESULT_CANDIDATE_PAGE_SIZE));
     const expectCollationIndex = largeCount >= C_COLLATION_INDEX_MEMBER_THRESHOLD;
     expect(publicationSqlSummary.queries.member_page_index?.count ?? 0)
       .toBe(expectCollationIndex ? 1 : 0);

@@ -41,9 +41,9 @@ import { MODEL_HISTORY_METHOD_VERSION } from "./quota-analysis-v1";
 import { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from "./quota-analysis-v11";
 
 const MAX_RESULT_BYTES = 1024 * 1024;
-const MAX_MEMBER_INSERT_BATCH = 1_000;
+const MAX_MEMBER_INSERT_BATCH = 4_000;
 const MIN_MEMBERS_FOR_C_COLLATION_INDEX = 10_000;
-const MAX_RESULT_CANDIDATE_ROWS = 512;
+const MAX_RESULT_CANDIDATE_ROWS = 1_024;
 const MAX_RESULT_BATCH_BYTES = 1024 * 1024;
 const MAX_PUBLICATION_BYTES = 16 * 1024;
 const MAX_FUTURE_SKEW_MS = 5 * 60_000;
@@ -589,10 +589,11 @@ async function publishPostgresCommunityModelDayStreamWithClientMembers(
                   sequence, method, status, reason, payload_json, payload_sha256, computed_at_ms,
                   cumulative_payload_bytes, page_ordinal, candidate_count
              FROM sized
-            WHERE cumulative_payload_bytes <= $6 OR page_ordinal=1
+            WHERE page_ordinal <= $7::integer
+              AND (cumulative_payload_bytes <= $6 OR page_ordinal=1)
             ORDER BY owner_digest COLLATE "C"`,
           [capturedPin.sourceId, capturedPin.sourceNamespace, capturedDay, resultCursor,
-            MAX_RESULT_CANDIDATE_ROWS + 1, MAX_RESULT_BATCH_BYTES],
+            MAX_RESULT_CANDIDATE_ROWS + 1, MAX_RESULT_BATCH_BYTES, MAX_RESULT_CANDIDATE_ROWS],
         );
         if (results.rows.length === 0) break;
         for (const row of results.rows) {
@@ -670,28 +671,44 @@ async function publishPostgresCommunityModelDayStreamWithClientMembers(
           await proof.add(proofTuple);
           resultCursor = row.owner_digest;
         }
-        if (proofUpdates.length > 0) {
-          await client.query(
-            `UPDATE pg_temp.pg_community_graph_members member
-                SET input_fingerprint = proof.input_fingerprint,
-                    result_sha256 = proof.result_sha256
-               FROM unnest($1::text[], $2::text[], $3::text[])
-                    AS proof(owner_digest, input_fingerprint, result_sha256)
-              WHERE member.owner_digest=proof.owner_digest`,
+        if (proofUpdates.length > 0 || capacityRows.length > 0) {
+          const applied = await client.query<{
+            updated_count: string | number;
+            inserted_count: string | number;
+          }>(
+            `WITH graph_result_page AS MATERIALIZED (
+               SELECT proof.owner_digest, proof.input_fingerprint, proof.result_sha256
+                 FROM unnest($1::text[], $2::text[], $3::text[])
+                      AS proof(owner_digest, input_fingerprint, result_sha256)
+             ), updated_members AS (
+               UPDATE pg_temp.pg_community_graph_members member
+                  SET input_fingerprint = graph_result_page.input_fingerprint,
+                      result_sha256 = graph_result_page.result_sha256
+                 FROM graph_result_page
+                WHERE member.owner_digest = graph_result_page.owner_digest
+               RETURNING member.owner_digest
+             ), capacity_rows AS MATERIALIZED (
+               SELECT capacity.owner_digest, capacity.model_id, capacity.value
+                 FROM unnest($4::text[], $5::text[], $6::float8[])
+                      AS capacity(owner_digest, model_id, value)
+             ), inserted_capacities AS (
+               INSERT INTO pg_temp.pg_community_graph_capacities(owner_digest, model_id, capacity)
+               SELECT capacity_rows.owner_digest, capacity_rows.model_id, capacity_rows.value
+                 FROM capacity_rows
+               RETURNING owner_digest, model_id
+             )
+             SELECT (SELECT count(*)::text FROM updated_members) AS updated_count,
+                    (SELECT count(*)::text FROM inserted_capacities) AS inserted_count`,
             [proofUpdates.map((item) => item.ownerDigest),
-              proofUpdates.map((item) => item.fingerprint), proofUpdates.map((item) => item.resultHash)],
-          );
-          proofUpdates.length = 0;
-        }
-        if (capacityRows.length > 0) {
-          await client.query(
-            `INSERT INTO pg_temp.pg_community_graph_capacities(owner_digest, model_id, capacity)
-             SELECT capacity.owner_digest, capacity.model_id, capacity.value
-               FROM unnest($1::text[], $2::text[], $3::float8[])
-                    AS capacity(owner_digest, model_id, value)`,
-            [capacityRows.map((item) => item.ownerDigest), capacityRows.map((item) => item.modelId),
+              proofUpdates.map((item) => item.fingerprint), proofUpdates.map((item) => item.resultHash),
+              capacityRows.map((item) => item.ownerDigest), capacityRows.map((item) => item.modelId),
               capacityRows.map((item) => item.capacity)],
           );
+          const appliedRow = applied.rows[0];
+          if (applied.rows.length !== 1 || !appliedRow
+              || integer(appliedRow.updated_count) !== proofUpdates.length
+              || integer(appliedRow.inserted_count) !== capacityRows.length) throw fail();
+          proofUpdates.length = 0;
           capacityRows.length = 0;
         }
         const candidatesInPage = integer(results.rows[0]?.candidate_count);
