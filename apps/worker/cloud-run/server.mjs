@@ -24,6 +24,21 @@ import { createFilesystemAssets } from "./assets.mjs";
 import { createPostgresUploadIngressBudget } from "../src/postgres-ingress-budget.ts";
 import { createPostgresRateLimiter } from "../src/postgres-rate-limiter.ts";
 import {
+  ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
+  parseAccountlessEnrollmentJson,
+} from "../src/accountless-enrollment.ts";
+import {
+  ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES,
+  parseAccountlessOwnershipJson,
+} from "../src/accountless-ownership.ts";
+import { parseTelemetryV12AccountlessAuthorizationJson } from "../src/telemetry-transport-policy.ts";
+import {
+  authenticatePostgresAccountlessOwnerForV12Grant,
+  createPostgresAccountlessUploadOwner,
+  enrollPostgresAccountlessDevice,
+  grantPostgresTelemetryV12AccountlessAuthorization,
+} from "../src/postgres-accountless-enrollment.ts";
+import {
   readPostgresDeviceSyncState,
   readPostgresDeviceSyncV12Capabilities,
 } from "../src/postgres-device-sync.ts";
@@ -444,6 +459,8 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
       const admissionEnv = {
         ENVIRONMENT: optional("ENVIRONMENT", "synthetic-development"),
         IDENTITY_LINK_SECRET: optional("IDENTITY_LINK_SECRET"),
+        ACCOUNTLESS_ENROLLMENT_MODE: optional("ACCOUNTLESS_ENROLLMENT_MODE", "disabled"),
+        ACCOUNTLESS_OWNERSHIP_MODE: optional("ACCOUNTLESS_OWNERSHIP_MODE", "disabled"),
       };
       for (const definition of RATE_LIMIT_BINDINGS) {
         admissionEnv[definition[0]] = rateLimitBinding(
@@ -473,6 +490,17 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           primaryPool,
           ledgerPool,
           schemaOptions,
+          accountlessAuthority: Object.freeze({
+            authenticateV12Grant: authenticatePostgresAccountlessOwnerForV12Grant,
+            enroll: enrollPostgresAccountlessDevice,
+            createOwner: createPostgresAccountlessUploadOwner,
+            grantV12: grantPostgresTelemetryV12AccountlessAuthorization,
+            parseEnrollmentJson: parseAccountlessEnrollmentJson,
+            parseOwnershipJson: parseAccountlessOwnershipJson,
+            parseV12AuthorizationJson: parseTelemetryV12AccountlessAuthorizationJson,
+            maxEnrollmentBytes: ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
+            maxOwnershipBytes: ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES,
+          }),
           expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
           privateOrigin: hostOrigin,
           healthDispatch,

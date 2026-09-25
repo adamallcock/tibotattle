@@ -268,6 +268,9 @@ const DEVICE_SYNC_CAPABILITIES_V12_PATH = "/api/v1/device/sync-capabilities-v1.2
 const V12_DOMAIN_PREDECESSOR_PATH = "/api/v1/me/telemetry-v12/domain-predecessor";
 const V12_DOMAIN_ACTIVATE_PATH = "/api/v1/me/telemetry-v12/domain-activate";
 const V12_EFFECTIVE_PAGE_PATH = "/api/v1/me/telemetry-v12/effective-page";
+const ACCOUNTLESS_ENROLLMENT_PATH = "/api/v1/accountless/enrollment";
+const ACCOUNTLESS_OWNERSHIP_PATH = "/api/v1/accountless/ownership";
+const ACCOUNTLESS_V12_AUTHORIZATION_PATH = "/api/v1/accountless/telemetry-v1.2-authorization";
 const MAX_V12_DAY_CHUNKS = 4_096;
 const MAX_V12_EFFECTIVE_PAGE_LIMIT = 200;
 const MAX_V12_EFFECTIVE_TIME_MS = 8_640_000_000_000_000;
@@ -944,6 +947,45 @@ async function assertPostgresUploadRegistrationEnabled(pool, schema) {
   }
 }
 
+async function assertPostgresEnrollmentEnabled(pool, schema) {
+  const controls = await readPostgresCollectionControls(pool, schema);
+  if (controls.enrollment_enabled !== true) {
+    throw Object.assign(new Error("COLLECTION_ENROLLMENT_DISABLED"), {
+      code: "COLLECTION_ENROLLMENT_DISABLED",
+      status: 503,
+    });
+  }
+}
+
+async function readAccountlessJson(request, maximumBytes, readBody, parse) {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+  if (contentType !== "application/json") {
+    throw Object.assign(new Error("CONTENT_TYPE_INVALID"), {
+      code: "CONTENT_TYPE_INVALID", status: 415,
+    });
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw Object.assign(new Error("BODY_INVALID"), { code: "BODY_INVALID", status: 400 });
+    }
+    if (length > maximumBytes) {
+      throw Object.assign(new Error("BODY_TOO_LARGE"), { code: "BODY_TOO_LARGE", status: 413 });
+    }
+  }
+  const bytes = await readBody(request, maximumBytes, {
+    maximumTotalMilliseconds: 15_000,
+    maximumIdleMilliseconds: 5_000,
+  });
+  try {
+    return parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
+  } catch (error) {
+    if (Number.isSafeInteger(error?.status) && typeof error?.code === "string") throw error;
+    throw Object.assign(new Error("BODY_INVALID"), { code: "BODY_INVALID", status: 400 });
+  }
+}
+
 async function readV12StagedChunkVector(pool, schema, principal, manifestId) {
   const table = `${schemaTable(schema)}."telemetry_v12_chunks"`;
   const manifests = `${schemaTable(schema)}."telemetry_v12_day_manifests"`;
@@ -984,6 +1026,7 @@ export function createPostgresTestV12DayManifestDispatch({
   expectedMigrations,
   privateOrigin,
   healthDispatch,
+  accountlessAuthority,
   admissionEnv,
   assertAdmissionBindings,
   assertAttemptAllowed,
@@ -1057,6 +1100,19 @@ export function createPostgresTestV12DayManifestDispatch({
   if (!isAllowedPostgresTestOrigin(privateOrigin)) {
     configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
   }
+  if (accountlessAuthority !== undefined
+      && (accountlessAuthority === null || typeof accountlessAuthority !== "object"
+        || typeof accountlessAuthority.authenticateV12Grant !== "function"
+        || typeof accountlessAuthority.enroll !== "function"
+        || typeof accountlessAuthority.createOwner !== "function"
+        || typeof accountlessAuthority.grantV12 !== "function"
+        || typeof accountlessAuthority.parseEnrollmentJson !== "function"
+        || typeof accountlessAuthority.parseOwnershipJson !== "function"
+        || typeof accountlessAuthority.parseV12AuthorizationJson !== "function"
+        || accountlessAuthority.maxEnrollmentBytes !== 512
+        || accountlessAuthority.maxOwnershipBytes !== 512)) {
+    configurationError("POSTGRES_TEST_ACCOUNTLESS_AUTHORITY_CONFIGURATION_INVALID");
+  }
 
   return async function dispatchPostgresTestV12DayManifest(request) {
     let url;
@@ -1083,6 +1139,13 @@ export function createPostgresTestV12DayManifestDispatch({
     const v12DomainPredecessorPath = url.pathname === V12_DOMAIN_PREDECESSOR_PATH;
     const v12DomainActivatePath = url.pathname === V12_DOMAIN_ACTIVATE_PATH;
     const v12EffectivePagePath = url.pathname === V12_EFFECTIVE_PAGE_PATH;
+    const accountlessEnrollmentPath = url.pathname === ACCOUNTLESS_ENROLLMENT_PATH;
+    const accountlessOwnershipPath = url.pathname === ACCOUNTLESS_OWNERSHIP_PATH;
+    const accountlessV12AuthorizationPath = url.pathname === ACCOUNTLESS_V12_AUTHORIZATION_PATH;
+    const accountlessEnrollmentRoute = accountlessEnrollmentPath && request.method === "POST";
+    const accountlessOwnershipRoute = accountlessOwnershipPath && request.method === "POST";
+    const accountlessV12AuthorizationRoute = accountlessV12AuthorizationPath
+      && request.method === "POST";
     const syncStateRoute = syncStatePath && request.method === "GET";
     const syncCapabilitiesV12Route = syncCapabilitiesV12Path && request.method === "GET";
     const v12DomainPredecessorRoute = v12DomainPredecessorPath && request.method === "POST";
@@ -1114,13 +1177,29 @@ export function createPostgresTestV12DayManifestDispatch({
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET" },
       }), crypto.randomUUID());
     }
+    if ((accountlessEnrollmentPath || accountlessOwnershipPath || accountlessV12AuthorizationPath)
+        && request.method !== "POST") {
+      return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
+        code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "POST" },
+      }), crypto.randomUUID());
+    }
+    if ((accountlessEnrollmentPath || accountlessOwnershipPath || accountlessV12AuthorizationPath)
+        && request.headers.has("cookie")) {
+      const code = accountlessEnrollmentPath ? "AUTH_INVALID" : "DEVICE_AUTH_INVALID";
+      return routeError(Object.assign(new Error(code), { code, status: 401 }), crypto.randomUUID());
+    }
     if ((!envelopeKeyRoute && !manifestRoute && !manifestReadRoute
         && !uploadAuthorizationRoute && !v12ChunkUploadRoute
         && !syncStateRoute && !syncCapabilitiesV12Route
         && !v12DomainPredecessorRoute && !v12DomainActivateRoute
-        && !v12EffectivePageRoute)
+        && !v12EffectivePageRoute && !accountlessEnrollmentRoute
+        && !accountlessOwnershipRoute && !accountlessV12AuthorizationRoute)
         || (url.search && !envelopeKeyRoute && !manifestReadRoute
           && !syncStatePath && !syncCapabilitiesV12Path && !v12EffectivePageRoute)) {
+      return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
+    }
+    if ((accountlessEnrollmentRoute || accountlessOwnershipRoute || accountlessV12AuthorizationRoute)
+        && !accountlessAuthority) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
 
@@ -1139,6 +1218,89 @@ export function createPostgresTestV12DayManifestDispatch({
       }
 
       assertAdmissionBindings(admissionEnv);
+      const schema = Object.freeze({
+        primarySchema: schemas.primary,
+        ledgerSchema: schemas.ledger,
+      });
+      if (accountlessEnrollmentRoute) {
+        const mode = admissionEnv.ACCOUNTLESS_ENROLLMENT_MODE;
+        if (mode === undefined || mode === "disabled") {
+          throw Object.assign(new Error("ACCOUNTLESS_ENROLLMENT_DISABLED"), {
+            code: "ACCOUNTLESS_ENROLLMENT_DISABLED", status: 503,
+          });
+        }
+        if (mode !== "enabled") {
+          throw Object.assign(new Error("ADMISSION_CONFIGURATION_INVALID"), {
+            code: "ADMISSION_CONFIGURATION_INVALID", status: 503,
+          });
+        }
+        await assertPostgresEnrollmentEnabled(primaryPool, schemas.primary);
+        await assertAttemptAllowed(
+          admissionEnv.ENROLLMENT_RATE_LIMIT,
+          admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
+          request,
+          admissionEnv,
+          "enrollment",
+        );
+        const body = await readAccountlessJson(
+          request, accountlessAuthority.maxEnrollmentBytes, readBoundedRequestBody,
+          accountlessAuthority.parseEnrollmentJson,
+        );
+        const result = await accountlessAuthority.enroll(primaryPool, body, { schema });
+        return json(result.status, result.response);
+      }
+      if (accountlessOwnershipRoute || accountlessV12AuthorizationRoute) {
+        const mode = admissionEnv.ACCOUNTLESS_OWNERSHIP_MODE;
+        if (mode === undefined || mode === "disabled") {
+          throw Object.assign(new Error("ACCOUNTLESS_OWNERSHIP_DISABLED"), {
+            code: "ACCOUNTLESS_OWNERSHIP_DISABLED", status: 503,
+          });
+        }
+        if (mode !== "enabled") {
+          throw Object.assign(new Error("ACCOUNTLESS_OWNERSHIP_CONFIGURATION_INVALID"), {
+            code: "ACCOUNTLESS_OWNERSHIP_CONFIGURATION_INVALID", status: 503,
+          });
+        }
+        await assertPostgresUploadRegistrationEnabled(primaryPool, schemas.primary);
+        await assertAttemptAllowed(
+          admissionEnv.RECOVERY_RATE_LIMIT,
+          admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
+          request,
+          admissionEnv,
+          "accountless_ownership",
+        );
+        const body = await readAccountlessJson(
+          request,
+          accountlessAuthority.maxOwnershipBytes,
+          readBoundedRequestBody,
+          accountlessV12AuthorizationRoute
+            ? accountlessAuthority.parseV12AuthorizationJson
+            : accountlessAuthority.parseOwnershipJson,
+        );
+        if (accountlessOwnershipRoute) {
+          const result = await accountlessAuthority.createOwner(
+            primaryPool, request.headers.get("authorization"), body, { schema },
+          );
+          return json(result.status, result.response);
+        }
+        const principal = await accountlessAuthority.authenticateV12Grant(
+          primaryPool, request.headers.get("authorization"), { schema },
+        );
+        if (await hasPostgresDeletionTombstone(
+          ledgerPool, principal.participantId, Date.now(), { schema },
+        )) {
+          throw Object.assign(new Error("DEVICE_AUTH_INVALID"), {
+            code: "DEVICE_AUTH_INVALID", status: 401,
+          });
+        }
+        await accountlessAuthority.grantV12(
+          primaryPool,
+          principal,
+          body,
+          { schema },
+        );
+        return json(201, body);
+      }
       if (syncStateRoute || syncCapabilitiesV12Route || manifestReadRoute || v12EffectivePageRoute) {
         await assertAttemptAllowed(
           admissionEnv.RECOVERY_RATE_LIMIT,
@@ -1153,10 +1315,6 @@ export function createPostgresTestV12DayManifestDispatch({
           code: "DEVICE_AUTH_INVALID", status: 401,
         });
       }
-      const schema = Object.freeze({
-        primarySchema: schemas.primary,
-        ledgerSchema: schemas.ledger,
-      });
       if (v12ChunkUploadRoute) {
         return await handlePostgresTestV12ChunkUpload({
           request,

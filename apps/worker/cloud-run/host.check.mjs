@@ -865,7 +865,8 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       appType: "custom",
     });
     const [transport, v12Admission, ledgerAuthority, admission, rateLimit, bodyReader, constants,
-      cryptoModule, telemetryV12Repository, deviceSync, typedCodec, typedV12EffectiveReader]
+      cryptoModule, telemetryV12Repository, deviceSync, typedCodec, typedV12EffectiveReader,
+      accountlessAdapter, accountlessEnrollment, accountlessOwnership, transportPolicy]
       = await Promise.all([
         vite.ssrLoadModule("/src/postgres-typed-v12-transport.ts"),
         vite.ssrLoadModule("/src/postgres-typed-v12-admission.ts"),
@@ -879,6 +880,10 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
         vite.ssrLoadModule("/src/postgres-device-sync.ts"),
         vite.ssrLoadModule("/src/typed-telemetry-codec.ts"),
         vite.ssrLoadModule("/src/postgres-typed-v12-effective-reader.ts"),
+        vite.ssrLoadModule("/src/postgres-accountless-enrollment.ts"),
+        vite.ssrLoadModule("/src/accountless-enrollment.ts"),
+        vite.ssrLoadModule("/src/accountless-ownership.ts"),
+        vite.ssrLoadModule("/src/telemetry-transport-policy.ts"),
       ]);
     const v12ManifestCandidates = await vite.ssrLoadModule("/src/postgres-v12-manifest-candidates.ts");
     const [uploadAuthorization, formatAuthority] = await Promise.all([
@@ -1029,7 +1034,11 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       [nowIso],
     );
 
-    const admissionEnv = { ENVIRONMENT: "test" };
+    const admissionEnv = {
+      ENVIRONMENT: "test",
+      ACCOUNTLESS_ENROLLMENT_MODE: "enabled",
+      ACCOUNTLESS_OWNERSHIP_MODE: "enabled",
+    };
     for (const [binding, name, limit] of [
       ["ENROLLMENT_RATE_LIMIT", "ENROLLMENT", 20],
       // This end-to-end fixture exercises more than 20 authenticated sync
@@ -1077,6 +1086,17 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
       privateOrigin: "http://127.0.0.1:43817",
       healthDispatch,
+      accountlessAuthority: Object.freeze({
+        authenticateV12Grant: accountlessAdapter.authenticatePostgresAccountlessOwnerForV12Grant,
+        enroll: accountlessAdapter.enrollPostgresAccountlessDevice,
+        createOwner: accountlessAdapter.createPostgresAccountlessUploadOwner,
+        grantV12: accountlessAdapter.grantPostgresTelemetryV12AccountlessAuthorization,
+        parseEnrollmentJson: accountlessEnrollment.parseAccountlessEnrollmentJson,
+        parseOwnershipJson: accountlessOwnership.parseAccountlessOwnershipJson,
+        parseV12AuthorizationJson: transportPolicy.parseTelemetryV12AccountlessAuthorizationJson,
+        maxEnrollmentBytes: accountlessEnrollment.ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
+        maxOwnershipBytes: accountlessOwnership.ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES,
+      }),
       admissionEnv: Object.freeze(admissionEnv),
       assertAdmissionBindings: admission.assertAdmissionBindings,
       assertAttemptAllowed: (...args) => {
@@ -1936,6 +1956,327 @@ test("loopback v1.2 manifest dispatch uses real PostgreSQL authority and never r
       method: "GET",
       url: `${manifestUrl}?fromDay=2020-01-01&toDay=2020-01-31`,
     })), 401, "DEVICE_AUTH_INVALID");
+    // Exercise accountless enrollment and separate v1.2 authority through
+    // private HTTP dispatch. All durable writes go through PostgreSQL.
+    const accountlessEnrollmentUrl = "http://127.0.0.1:43817/api/v1/accountless/enrollment";
+    const accountlessOwnershipUrl = "http://127.0.0.1:43817/api/v1/accountless/ownership";
+    const accountlessV12AuthorizationUrl =
+      "http://127.0.0.1:43817/api/v1/accountless/telemetry-v1.2-authorization";
+    const accountlessDeviceId = randomUUID();
+    const accountlessSecret = randomBytes(32).toString("base64url");
+    const accountlessAuth = "Device um_device_" + accountlessDeviceId + "." + accountlessSecret;
+    const accountlessEnrollmentBody = {
+      schemaVersion: "accountless-enrollment-v0.1",
+      deviceId: accountlessDeviceId,
+      deviceSecretHash: deviceSecretHash(accountlessDeviceId, accountlessSecret).toString("hex"),
+      policyVersion: "accountless-opt-out-v1",
+      authorizationBasis: "accountless-policy-v1",
+    };
+    const accountlessEnrollmentJson = JSON.stringify(accountlessEnrollmentBody);
+    assert.equal(accountlessEnrollment.parseAccountlessEnrollmentJson(accountlessEnrollmentJson).deviceId,
+      accountlessDeviceId);
+    const enrollmentHttp = (body = accountlessEnrollmentJson, headers = {}, method = "POST") =>
+      new Request(accountlessEnrollmentUrl, {
+        method,
+        headers: { "content-type": "application/json", ...headers },
+        ...(method === "GET" || method === "HEAD" ? {} : { body }),
+      });
+    const ownershipHttp = (body, headers = {}) => new Request(accountlessOwnershipUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: accountlessAuth, ...headers },
+      body,
+    });
+    const authorizationHttp = (body, headers = {}, authorization = accountlessAuth) =>
+      new Request(accountlessV12AuthorizationUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization, ...headers },
+        body,
+      });
+
+    await assertApiError(await dispatch(enrollmentHttp(undefined, {}, "GET")), 405, "METHOD_NOT_ALLOWED");
+    await assertApiError(await dispatch(enrollmentHttp(accountlessEnrollmentJson, {
+      cookie: "session=synthetic",
+    })), 401, "AUTH_INVALID");
+    await assertApiError(await dispatch(enrollmentHttp(JSON.stringify({
+      ...accountlessEnrollmentBody, unexpected: true,
+    }))), 400, "BODY_INVALID");
+    await assertApiError(await dispatch(enrollmentHttp(
+      '{"schemaVersion":"wrong","schemaVersion":"accountless-enrollment-v0.1"}',
+    )), 400, "BODY_INVALID");
+
+    const concurrentEnrollments = await Promise.all([
+      dispatch(enrollmentHttp()),
+      dispatch(enrollmentHttp()),
+    ]);
+    assert.deepEqual(concurrentEnrollments.map((response) => response.status).sort(), [200, 201],
+      `concurrent retries issue one ledger row and return one stable replay; received ${JSON.stringify(
+        await Promise.all(concurrentEnrollments.map(async (response) => ({
+          status: response.status, body: await response.clone().json(),
+        }))),
+      )}`);
+    const enrollmentReceipts = await Promise.all(concurrentEnrollments.map((response) => response.json()));
+    assert.ok(enrollmentReceipts.every((receipt) => receipt.schemaVersion === "accountless-enrollment-v0.1"
+      && receipt.deviceId === accountlessDeviceId
+      && receipt.policyVersion === "accountless-opt-out-v1"
+      && receipt.authorizationBasis === "accountless-policy-v1"
+      && receipt.scope === "enrollment_only"));
+    assert.ok(enrollmentReceipts.every((receipt) => receipt.expiresAt === enrollmentReceipts[0].expiresAt));
+    const replayedEnrollment = await dispatch(enrollmentHttp());
+    assert.equal(replayedEnrollment.status, 200);
+    assert.equal((await replayedEnrollment.json()).state, "existing");
+    await assertApiError(await dispatch(enrollmentHttp(JSON.stringify({
+      ...accountlessEnrollmentBody,
+      deviceSecretHash: "f".repeat(64),
+    }))), 409, "ACCOUNTLESS_ENROLLMENT_CONFLICT");
+    const issuance = await primaryPool.query(
+      "SELECT daily_issued, lifetime_issued FROM " + primaryTable("accountless_enrollment_issuance")
+        + " WHERE singleton=1",
+    );
+    assert.deepEqual(issuance.rows[0], { daily_issued: 1, lifetime_issued: 1 },
+      "a duplicate insert rolls back its candidate issuance budget");
+    const enrollmentRow = await primaryPool.query(
+      "SELECT state, schema_version, policy_version, authorization_basis, "
+        + "octet_length(device_secret_hash) AS secret_hash_bytes FROM "
+        + primaryTable("accountless_enrollment_ledger") + " WHERE device_id=$1",
+      [accountlessDeviceId],
+    );
+    assert.deepEqual(enrollmentRow.rows[0], {
+      state: "active", schema_version: "accountless-enrollment-v0.1",
+      policy_version: "accountless-opt-out-v1", authorization_basis: "accountless-policy-v1",
+      secret_hash_bytes: 32,
+    });
+
+    const ownershipBody = {
+      schemaVersion: "accountless-upload-owner-v0.1",
+      policyVersion: "accountless-opt-out-v1",
+      authorizationBasis: "accountless-policy-v1",
+      telemetrySchemaVersion: "telemetry-contribution-v1.1",
+    };
+    await assertApiError(await dispatch(ownershipHttp(JSON.stringify(ownershipBody), {
+      authorization: auth,
+    })), 401, "DEVICE_AUTH_INVALID");
+    const concurrentOwners = await Promise.all([
+      dispatch(ownershipHttp(JSON.stringify(ownershipBody))),
+      dispatch(ownershipHttp(JSON.stringify(ownershipBody))),
+    ]);
+    assert.deepEqual(concurrentOwners.map((response) => response.status).sort(), [200, 201],
+      "owner graph creation and duplicate retry converge under PostgreSQL row locking");
+    const ownerReceipts = await Promise.all(concurrentOwners.map((response) => response.json()));
+    assert.ok(ownerReceipts.some((receipt) => receipt.state === "created"));
+    assert.ok(ownerReceipts.some((receipt) => receipt.state === "existing"));
+    assert.ok(ownerReceipts.every((receipt) => receipt.deviceId === accountlessDeviceId
+      && receipt.scope === "upload_registration"
+      && receipt.telemetrySchemaVersion === "telemetry-contribution-v1.1"));
+    const accountlessOwner = await primaryPool.query(
+      "SELECT owner.participant_id, owner.expires_at::text AS owner_expires_at, "
+        + "participant.owner_kind, participant.consent_version, device.authority_kind, "
+        + "device.paired_via_pairing_id, device.accountless_enrollment_device_id, "
+        + "grant_row.telemetry_schema_version, grant_row.state AS v11_state FROM "
+        + primaryTable("accountless_upload_owners") + " owner JOIN "
+        + primaryTable("participants") + " participant ON participant.id=owner.participant_id JOIN "
+        + primaryTable("device_credentials") + " device ON device.id=owner.device_credential_id JOIN "
+        + primaryTable("accountless_v11_device_authorizations")
+        + " grant_row ON grant_row.enrollment_device_id=owner.enrollment_device_id "
+        + "WHERE owner.enrollment_device_id=$1",
+      [accountlessDeviceId],
+    );
+    assert.equal(accountlessOwner.rowCount, 1);
+    assert.equal(accountlessOwner.rows[0].owner_kind, "accountless");
+    assert.equal(accountlessOwner.rows[0].consent_version, null,
+      "accountless ownership does not synthesize social consent");
+    assert.equal(accountlessOwner.rows[0].authority_kind, "accountless");
+    assert.equal(accountlessOwner.rows[0].paired_via_pairing_id, null,
+      "accountless authority has no social pairing");
+    assert.equal(accountlessOwner.rows[0].accountless_enrollment_device_id, accountlessDeviceId);
+    assert.equal(accountlessOwner.rows[0].telemetry_schema_version, "telemetry-contribution-v1.1");
+    assert.equal(accountlessOwner.rows[0].v11_state, "active");
+    const socialSessionCount = await primaryPool.query(
+      "SELECT count(*)::integer AS count FROM " + primaryTable("web_sessions")
+        + " WHERE participant_id=$1",
+      [accountlessOwner.rows[0].participant_id],
+    );
+    assert.equal(socialSessionCount.rows[0].count, 0);
+
+    const accountlessV12Body = {
+      schemaVersion: "accountless-upload-owner-v1.2",
+      policyVersion: "accountless-telemetry-v1.2-policy-v1",
+      authorizationBasis: "accountless-policy-v1.2",
+      telemetrySchemaVersion: TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+    };
+    await assertApiError(await dispatch(authorizationHttp(JSON.stringify({
+      ...accountlessV12Body, unexpected: true,
+    }))), 400, "BODY_INVALID");
+    await assertApiError(await dispatch(authorizationHttp(
+      '{"schemaVersion":"wrong","schemaVersion":"accountless-upload-owner-v1.2"}',
+    )), 400, "BODY_INVALID");
+    await assertApiError(await dispatch(authorizationHttp(
+      JSON.stringify(accountlessV12Body), {}, auth,
+    )), 401, "DEVICE_AUTH_INVALID");
+    await assertApiError(await dispatch(authorizationHttp(
+      JSON.stringify(accountlessV12Body), {},
+      `Device um_device_${accountlessDeviceId}.${randomBytes(32).toString("base64url")}`,
+    )), 401, "DEVICE_AUTH_INVALID");
+    await primaryPool.query(
+      "UPDATE " + primaryTable("telemetry_v12_runtime") + " SET state='staged' WHERE id=1",
+    );
+    await assertApiError(await dispatch(authorizationHttp(JSON.stringify(accountlessV12Body))),
+      403, "TELEMETRY_TRANSPORT_BLOCKED");
+    const stagedGrant = await primaryPool.query(
+      "SELECT count(*)::integer AS count FROM "
+        + primaryTable("accountless_v12_device_authorizations") + " WHERE enrollment_device_id=$1",
+      [accountlessDeviceId],
+    );
+    assert.equal(stagedGrant.rows[0].count, 0,
+      "v1.2 authority cannot be minted before runtime activation");
+    await primaryPool.query(
+      "UPDATE " + primaryTable("telemetry_v12_runtime") + " SET state='active' WHERE id=1",
+    );
+    const concurrentV12Grants = await Promise.all([
+      dispatch(authorizationHttp(JSON.stringify(accountlessV12Body))),
+      dispatch(authorizationHttp(JSON.stringify(accountlessV12Body))),
+    ]);
+    assert.deepEqual(concurrentV12Grants.map((response) => response.status), [201, 201],
+      `concurrent v1.2 grants must replay one stable active grant; received ${JSON.stringify(
+        await Promise.all(concurrentV12Grants.map(async (response) => ({
+          status: response.status, body: await response.clone().json(),
+        }))),
+      )}`);
+    const grantReceipts = await Promise.all(concurrentV12Grants.map((response) => response.json()));
+    assert.deepEqual(grantReceipts, [accountlessV12Body, accountlessV12Body],
+      "the receipt includes only the closed v1.2 authorization tuple");
+    const accountlessGrant = await primaryPool.query(
+      "SELECT state, schema_version, policy_version, authorization_basis, "
+        + "telemetry_schema_version, field_dictionary_version, privacy_contract_version, "
+        + "authorized_at::text AS authorized_at, expires_at::text AS expires_at FROM "
+        + primaryTable("accountless_v12_device_authorizations") + " WHERE enrollment_device_id=$1",
+      [accountlessDeviceId],
+    );
+    assert.equal(accountlessGrant.rowCount, 1);
+    assert.equal(accountlessGrant.rows[0].state, "active");
+    assert.equal(accountlessGrant.rows[0].schema_version, "accountless-upload-owner-v1.2");
+    assert.equal(accountlessGrant.rows[0].policy_version, "accountless-telemetry-v1.2-policy-v1");
+    assert.equal(accountlessGrant.rows[0].authorization_basis, "accountless-policy-v1.2");
+    assert.equal(accountlessGrant.rows[0].telemetry_schema_version, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION);
+    assert.equal(accountlessGrant.rows[0].field_dictionary_version, TELEMETRY_V12_FIELD_DICTIONARY_VERSION);
+    assert.equal(accountlessGrant.rows[0].privacy_contract_version, TELEMETRY_V12_PRIVACY_CONTRACT_VERSION);
+    assert.equal(Date.parse(accountlessGrant.rows[0].expires_at),
+      Date.parse(accountlessOwner.rows[0].owner_expires_at));
+
+    const tombstonedDeviceId = randomUUID();
+    const tombstonedSecret = randomBytes(32).toString("base64url");
+    const tombstonedAuth = `Device um_device_${tombstonedDeviceId}.${tombstonedSecret}`;
+    const tombstonedEnrollmentBody = {
+      ...accountlessEnrollmentBody,
+      deviceId: tombstonedDeviceId,
+      deviceSecretHash: deviceSecretHash(tombstonedDeviceId, tombstonedSecret).toString("hex"),
+    };
+    assert.equal((await dispatch(enrollmentHttp(JSON.stringify(tombstonedEnrollmentBody)))).status, 201);
+    assert.equal((await dispatch(ownershipHttp(JSON.stringify(ownershipBody), {
+      authorization: tombstonedAuth,
+    }))).status, 201);
+    const tombstonedOwner = await primaryPool.query(
+      "SELECT participant_id FROM " + primaryTable("accountless_upload_owners")
+        + " WHERE enrollment_device_id=$1",
+      [tombstonedDeviceId],
+    );
+    assert.equal(tombstonedOwner.rowCount, 1);
+    await ledgerAuthority.recordPostgresDeletionTombstone(
+      ledgerPool, tombstonedOwner.rows[0].participant_id, Date.now(), { schema: schemaOptions },
+    );
+    await assertApiError(await dispatch(authorizationHttp(
+      JSON.stringify(accountlessV12Body), {}, tombstonedAuth,
+    )), 401, "DEVICE_AUTH_INVALID");
+    const tombstonedGrant = await primaryPool.query(
+      "SELECT count(*)::integer AS count FROM "
+        + primaryTable("accountless_v12_device_authorizations") + " WHERE enrollment_device_id=$1",
+      [tombstonedDeviceId],
+    );
+    assert.equal(tombstonedGrant.rows[0].count, 0,
+      "a separately tombstoned owner cannot acquire a v1.2 grant");
+
+    const uploadAuthorizationReceipt = await dispatch(request({
+      url: uploadAuthorizationUrl,
+      headers: { authorization: accountlessAuth },
+      body: JSON.stringify({
+        envelopeDigest: "a".repeat(64), contentLengthBytes: 1,
+        contentType: "application/json", telemetrySchemaVersion: TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+      }),
+    }));
+    assert.equal(uploadAuthorizationReceipt.status, 201,
+      "an active accountless v1.2 grant admits upload authorization in PostgreSQL");
+
+    // Simulate the persisted result of an opt-out. The Cloud Run test host
+    // does not expose disconnect until PostgreSQL v1.1 history-retention
+    // semantics are implemented. All later authority requests must fail closed.
+    const optedOutAt = new Date().toISOString();
+    await primaryPool.query("BEGIN");
+    try {
+      const revocableTables = [
+        ["accountless_enrollment_ledger", "device_id"],
+        ["accountless_upload_owners", "enrollment_device_id"],
+        ["accountless_v11_device_authorizations", "enrollment_device_id"],
+        ["accountless_v12_device_authorizations", "enrollment_device_id"],
+      ];
+      for (const [name, idColumn] of revocableTables) {
+        await primaryPool.query(
+          "UPDATE " + primaryTable(name)
+            + " SET state='revoked', revoked_at=$2::timestamptz, revocation_reason='user_opt_out' "
+            + "WHERE " + idColumn + "=$1",
+          [accountlessDeviceId, optedOutAt],
+        );
+      }
+      await primaryPool.query(
+        "UPDATE " + primaryTable("device_credentials")
+          + " SET state='revoked', revoked_at=$2::timestamptz WHERE id=$1",
+        [accountlessDeviceId, optedOutAt],
+      );
+      await primaryPool.query(
+        "UPDATE " + primaryTable("device_upload_authorizations")
+          + " SET state='revoked', revoked_at=$2::timestamptz, consume_lease_expires_at=NULL "
+          + "WHERE issued_by_device_id=$1 AND state IN ('unused','consuming')",
+        [accountlessDeviceId, optedOutAt],
+      );
+      await primaryPool.query("COMMIT");
+    } catch (error) {
+      await primaryPool.query("ROLLBACK");
+      throw error;
+    }
+    await assertApiError(await dispatch(enrollmentHttp()), 401, "ACCOUNTLESS_ENROLLMENT_REVOKED");
+    await assertApiError(await dispatch(ownershipHttp(JSON.stringify(ownershipBody))),
+      401, "ACCOUNTLESS_OWNERSHIP_REVOKED");
+    await assertApiError(await dispatch(authorizationHttp(JSON.stringify(accountlessV12Body))),
+      401, "ACCOUNTLESS_OWNERSHIP_REVOKED");
+    await assertApiError(await dispatch(request({
+      url: uploadAuthorizationUrl,
+      headers: { authorization: accountlessAuth },
+      body: JSON.stringify({
+        envelopeDigest: "b".repeat(64), contentLengthBytes: 1,
+        contentType: "application/json", telemetrySchemaVersion: TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+      }),
+    })), 401, "DEVICE_AUTH_INVALID");
+    const optedOutState = await primaryPool.query(
+      "SELECT ledger.state AS ledger_state, owner.state AS owner_state, "
+        + "v11.state AS v11_state, v12.state AS v12_state, "
+        + "v12.revocation_reason AS v12_revocation_reason, device.state AS device_state, "
+        + "(SELECT count(*)::integer FROM " + primaryTable("device_upload_authorizations")
+        + " WHERE issued_by_device_id=$1 AND state IN ('unused','consuming')) AS pending_uploads "
+        + "FROM " + primaryTable("accountless_enrollment_ledger") + " ledger JOIN "
+        + primaryTable("accountless_upload_owners") + " owner "
+        + "ON owner.enrollment_device_id=ledger.device_id JOIN "
+        + primaryTable("accountless_v11_device_authorizations") + " v11 "
+        + "ON v11.enrollment_device_id=ledger.device_id JOIN "
+        + primaryTable("accountless_v12_device_authorizations") + " v12 "
+        + "ON v12.enrollment_device_id=ledger.device_id JOIN "
+        + primaryTable("device_credentials") + " device ON device.id=ledger.device_id "
+        + "WHERE ledger.device_id=$1",
+      [accountlessDeviceId],
+    );
+    assert.deepEqual(optedOutState.rows[0], {
+      ledger_state: "revoked", owner_state: "revoked", v11_state: "revoked",
+      v12_state: "revoked", v12_revocation_reason: "user_opt_out",
+      device_state: "revoked", pending_uploads: 0,
+    });
+
     assert.equal(d1Touched, 0);
     assert.equal(workerCalls, 0);
   } finally {
