@@ -448,7 +448,8 @@ function buildReceipt({ actionMode, resultMode, beforeRows, afterRows, sourcePin
     jobsAfter: afterRows.length,
     jobsReopened: resultMode === "reconciled" ? EXPECTED_UNPROVEN_JOB_COUNT : 0,
     jobsThatWouldReopen: inspectOnly && !alreadyApplied ? EXPECTED_UNPROVEN_JOB_COUNT : 0,
-    jobsPendingUnverified: afterRows.length,
+    jobsPendingUnverified: afterRows.filter((row) => row.state === "pending"
+      && row.terminal_is_null === true && row.completed_at_utc === null).length,
     tombstoneParentsPreserved: afterRows.length,
     prestateSha256: digestExactRows(beforeRows),
     poststateSha256: digestExactRows(afterRows),

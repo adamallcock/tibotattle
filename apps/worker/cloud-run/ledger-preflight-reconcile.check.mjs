@@ -298,6 +298,7 @@ test("read-only inspect applies the same guards and returns digests without issu
   assert.equal(receipt.jobsAfter, JOB_COUNT);
   assert.equal(receipt.jobsReopened, 0);
   assert.equal(receipt.jobsThatWouldReopen, JOB_COUNT);
+  assert.equal(receipt.jobsPendingUnverified, 0);
   assert.equal(receipt.prestateSha256, receipt.poststateSha256);
   assert.match(receipt.sourcePinSha256, /^[0-9a-f]{64}$/u);
   assert.equal(state.updated, 0);
