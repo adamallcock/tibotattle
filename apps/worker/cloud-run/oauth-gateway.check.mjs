@@ -1,15 +1,29 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
+import { createFilesystemAssets } from "./assets.mjs";
 import {
   createOauthGatewayConfiguration,
   createOauthGatewayHandler,
+  createOauthGatewayServer,
 } from "./oauth-gateway.mjs";
 
 const PUBLIC_ORIGIN = "https://tibotattle-gateway-test.example";
 const BACKEND_ORIGIN = "https://tibotattle-test-app-5t5mehqi7a-ue.a.run.app";
 const TOKEN = "eyJhbGciOiJSUzI1NiJ9.eyJhdWQiOiJ0ZXN0In0.signature";
+const DEVICE_ID = "d81c0f3b-9d3e-4dc8-b367-9709e3f3fe9c";
+const DEVICE_AUTHORIZATION = `Device um_device_${DEVICE_ID}.${"d".repeat(43)}`;
+const UPLOAD_AUTHORIZATION = `Upload um_device_upload_${DEVICE_ID}.${"u".repeat(43)}`;
+const SESSION_COOKIE = "__Host-usage_monitor_session=opaque";
+const V12_CONSENT = Object.freeze({
+  telemetrySchemaVersion: "telemetry-contribution-v1.2",
+  fieldDictionaryVersion: "telemetry-v1.2-registry-2026-09-20.1",
+  privacyContractVersion: "ongoing-privacy-safe-telemetry-v1.2",
+});
 
 class MemoryResponse extends EventEmitter {
   constructor() {
@@ -25,9 +39,10 @@ class MemoryResponse extends EventEmitter {
     this.headers = headers;
   }
 
-  end(body = Buffer.alloc(0)) {
+  end(body = Buffer.alloc(0), callback) {
     this.body = Buffer.from(body);
     this.writableEnded = true;
+    callback?.();
   }
 }
 
@@ -47,8 +62,9 @@ function request({
   host = new URL(PUBLIC_ORIGIN).host,
   headers = {},
   body = "{}",
+  stream = null,
 } = {}) {
-  const input = Readable.from(body === null ? [] : [Buffer.from(body)]);
+  const input = stream ?? Readable.from(body === null ? [] : [Buffer.from(body)]);
   input.method = method;
   input.url = url;
   const bodyHeaders = method === "POST" && body !== null
@@ -267,6 +283,359 @@ test("the companion health, enrollment, session, and pairing journey uses exact 
   }
   assert.equal(backendCalls[2].options.headers.get("x-tibotattle-google-callback-query"), "?state=opaque&code=opaque");
   assert.equal(backendCalls[2].url.search, "", "callback query stays out of the private URL");
+});
+
+test("the v1.2 desktop edge forwards only its exact routes and never logs credentials or payloads", async () => {
+  const routes = [
+    { path: "/api/v1/device/sync/state", method: "GET", body: null, authorization: DEVICE_AUTHORIZATION },
+    { path: "/api/v1/device/sync-capabilities-v1.2", method: "GET", body: null, authorization: DEVICE_AUTHORIZATION },
+    { path: "/api/v1/me/telemetry-v12/domain-predecessor", method: "POST", body: "{}", authorization: DEVICE_AUTHORIZATION },
+    {
+      path: "/api/v1/device/telemetry/v1.2/day-manifests", method: "POST",
+      body: JSON.stringify({ schemaVersion: "telemetry-day-manifest-v1.2", day: "2026-09-25", privateMarker: "manifest-payload-secret" }),
+      authorization: DEVICE_AUTHORIZATION,
+    },
+    {
+      path: "/api/v1/device/upload-authorizations", method: "POST",
+      body: JSON.stringify({ envelopeDigest: "a".repeat(64), contentLengthBytes: 42, contentType: "application/json", telemetrySchemaVersion: "telemetry-contribution-v1.2" }),
+      authorization: DEVICE_AUTHORIZATION,
+    },
+    {
+      path: "/api/v1/contributions", method: "POST",
+      body: JSON.stringify({ schemaVersion: "telemetry-envelope-v1.2", ciphertext: "synthetic-ciphertext" }),
+      authorization: UPLOAD_AUTHORIZATION,
+    },
+    {
+      path: "/api/v1/me/telemetry-v12/domain-activate", method: "POST",
+      body: JSON.stringify({ schemaVersion: "telemetry-domain-manifest-v1.2", privateMarker: "activation-payload-secret" }),
+      authorization: DEVICE_AUTHORIZATION,
+    },
+    {
+      path: "/api/v1/device/credential/renew", method: "POST",
+      body: JSON.stringify({ nextDeviceSecretHash: "b".repeat(64), rotationAttemptId: "4f50c4ce-13db-4ab3-84f0-f262b599f65a" }),
+      authorization: DEVICE_AUTHORIZATION,
+    },
+    {
+      path: "/api/v1/me/device-telemetry-v12-consents", method: "POST",
+      body: JSON.stringify({ deviceId: DEVICE_ID, consent: V12_CONSENT, ongoingUpload: true }),
+      authorization: undefined,
+      session: true,
+    },
+  ];
+  const { calls: metadataCalls, fetchImpl: metadata } = metadataFetch();
+  const backendCalls = [];
+  const logs = [];
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      backendCalls.push({ url: new URL(input), options });
+      const status = new URL(input).pathname === "/api/v1/me/device-telemetry-v12-consents" ? 201 : 200;
+      return new Response("{}", { status, headers: { "content-type": "application/json" } });
+    },
+    logger: (line) => logs.push(line),
+  });
+
+  for (const route of routes) {
+    const result = await invoke(handler, {
+      method: route.method,
+      url: route.path,
+      body: route.body,
+      headers: {
+        origin: route.session ? PUBLIC_ORIGIN : undefined,
+        ...(route.authorization === undefined ? {} : { authorization: route.authorization }),
+        ...(route.session ? {
+          cookie: SESSION_COOKIE,
+          "x-usage-monitor-csrf": "csrf-v12-consent",
+          "sec-fetch-site": "same-origin",
+        } : {}),
+        "x-serverless-authorization": "Bearer caller-controlled",
+        "x-forwarded-host": "attacker.invalid",
+        "cf-connecting-ip": "203.0.113.9",
+      },
+    });
+    assert.equal(result.status, route.session ? 201 : 200, route.path);
+  }
+
+  assert.equal(backendCalls.length, routes.length);
+  assert.equal(metadataCalls.length, routes.length);
+  for (let index = 0; index < routes.length; index += 1) {
+    const route = routes[index];
+    const { url, options } = backendCalls[index];
+    assert.equal(url.origin, BACKEND_ORIGIN);
+    assert.equal(url.pathname, route.path);
+    assert.equal(url.search, "");
+    assert.equal(options.method, route.method);
+    assert.equal(options.headers.get("x-serverless-authorization"), `Bearer ${TOKEN}`);
+    assert.equal(options.headers.get("authorization"), route.authorization ?? null);
+    assert.equal(options.headers.get("origin"), route.method === "POST" ? BACKEND_ORIGIN : null);
+    assert.equal(options.headers.get("cookie"), route.session ? SESSION_COOKIE : null);
+    assert.equal(options.headers.get("x-usage-monitor-csrf"), route.session ? "csrf-v12-consent" : null);
+    assert.equal(options.headers.get("sec-fetch-site"), route.session ? "same-origin" : null);
+    assert.equal(options.headers.has("x-forwarded-host"), false);
+    assert.equal(options.headers.has("cf-connecting-ip"), false);
+    if (route.body === null) {
+      assert.equal(options.body, undefined);
+    } else {
+      assert.equal(options.headers.get("content-type"), "application/json");
+      assert.equal(options.body.toString("utf8"), route.body);
+    }
+  }
+  const serializedLogs = logs.join("\n");
+  for (const secret of [DEVICE_AUTHORIZATION, UPLOAD_AUTHORIZATION, DEVICE_ID,
+    "manifest-payload-secret", "activation-payload-secret", "csrf-v12-consent"]) {
+    assert.equal(serializedLogs.includes(secret), false, `log leaked ${secret}`);
+  }
+  assert.match(serializedLogs, /"route":"contribution_upload"/u);
+  assert.match(serializedLogs, /"route":"telemetry_v12_consent"/u);
+});
+
+test("the v1.2 edge rejects unlisted, cross-origin, cookie-bearing, or unauthenticated device requests before metadata access", async () => {
+  let metadataCount = 0;
+  let backendCount = 0;
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input) => {
+      if (new URL(input).origin === "http://metadata.google.internal") {
+        metadataCount += 1;
+        return metadataResponse();
+      }
+      backendCount += 1;
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    },
+    logger: () => {},
+  });
+  const invalidRequests = [
+    { url: "/api/v1/admin/action", body: "{}" },
+    { method: "GET", url: "/api/v1/contributions", body: null, headers: { authorization: UPLOAD_AUTHORIZATION } },
+    { url: "/api/v1/device/upload-authorizations", body: "{}", headers: { authorization: "Bearer malformed" } },
+    { url: "/api/v1/device/sync/state", method: "GET", body: null, headers: { authorization: undefined } },
+    { url: "/api/v1/device/sync/state", method: "GET", body: null, headers: { authorization: DEVICE_AUTHORIZATION, origin: "https://attacker.invalid" } },
+    { url: "/api/v1/device/sync/state", method: "GET", body: null, headers: { authorization: DEVICE_AUTHORIZATION, cookie: SESSION_COOKIE } },
+    { url: "/api/v1/device/telemetry/v1.2/day-manifests", body: "{}", headers: { authorization: UPLOAD_AUTHORIZATION } },
+    { url: "/api/v1/contributions", body: "{}", headers: { authorization: DEVICE_AUTHORIZATION } },
+  ];
+  for (const options of invalidRequests) {
+    const result = await invoke(handler, options);
+    assert.ok([400, 401, 403, 404, 405].includes(result.status), `${options.url}: ${result.status}`);
+  }
+
+  const consentBody = JSON.stringify({ deviceId: DEVICE_ID, consent: V12_CONSENT, ongoingUpload: true });
+  const consentBase = {
+    url: "/api/v1/me/device-telemetry-v12-consents",
+    body: consentBody,
+    headers: { cookie: SESSION_COOKIE, "x-usage-monitor-csrf": "csrf-test" },
+  };
+  for (const headers of [
+    { ...consentBase.headers, origin: "https://attacker.invalid", "sec-fetch-site": "same-origin" },
+    { ...consentBase.headers, origin: PUBLIC_ORIGIN, "sec-fetch-site": "cross-site" },
+    { cookie: SESSION_COOKIE, origin: PUBLIC_ORIGIN, "sec-fetch-site": "same-origin" },
+    { ...consentBase.headers, origin: PUBLIC_ORIGIN },
+    { ...consentBase.headers, origin: PUBLIC_ORIGIN, "sec-fetch-site": "same-origin", authorization: "Bearer unexpected" },
+  ]) {
+    const result = await invoke(handler, { ...consentBase, headers });
+    assert.ok([400, 401, 403].includes(result.status), `consent refusal: ${result.status}`);
+  }
+
+  const oversizedChunk = await invoke(handler, {
+    url: "/api/v1/contributions",
+    body: "{}",
+    headers: { origin: undefined, authorization: UPLOAD_AUTHORIZATION, "content-length": "2116385" },
+  });
+  const oversizedManifest = await invoke(handler, {
+    url: "/api/v1/device/telemetry/v1.2/day-manifests",
+    body: "{}",
+    headers: { origin: undefined, authorization: DEVICE_AUTHORIZATION, "content-length": "1250001" },
+  });
+  assert.equal(oversizedChunk.status, 413);
+  assert.equal(oversizedManifest.status, 413);
+  assert.equal(metadataCount, 0);
+  assert.equal(backendCount, 0);
+});
+
+test("the gateway bounds concurrently active request bodies and releases slots on completion", async () => {
+  let metadataCount = 0;
+  const pendingMetadata = [];
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input) => {
+      if (new URL(input).origin === "http://metadata.google.internal") {
+        metadataCount += 1;
+        if (metadataCount > 4) return metadataResponse();
+        return new Promise((resolve) => pendingMetadata.push(() => resolve(metadataResponse())));
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    },
+    logger: () => {},
+  });
+  const deviceState = () => invoke(handler, {
+    method: "GET",
+    url: "/api/v1/device/sync/state",
+    body: null,
+    headers: { origin: undefined, authorization: DEVICE_AUTHORIZATION },
+  });
+  const inFlight = Array.from({ length: 4 }, deviceState);
+  for (let attempt = 0; attempt < 10 && metadataCount < 4; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(metadataCount, 4);
+  const saturated = await deviceState();
+  assert.equal(saturated.status, 503);
+  assert.equal(saturated.json().error.code, "GATEWAY_BUSY");
+  assert.equal(metadataCount, 4);
+  for (const release of pendingMetadata) release();
+  const completed = await Promise.all(inFlight);
+  assert.ok(completed.every((result) => result.status === 200));
+  const afterRelease = await deviceState();
+  assert.equal(afterRelease.status, 200);
+});
+
+test("the gateway serves only bounded reviewed GET/HEAD assets and keeps API/admin paths private", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-oauth-assets-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, "index.html"), "<html>synthetic public UI</html>", "utf8");
+  await writeFile(join(root, "app.js"), "export const value = 1;", "utf8");
+  await writeFile(join(root, "admin.html"), "private admin shell", "utf8");
+  await writeFile(join(root, "app.js.map"), "private source map", "utf8");
+  await writeFile(join(root, "contract.json"), "{}", "utf8");
+  await writeFile(join(root, "untyped.bin"), "opaque", "utf8");
+  const assets = await createFilesystemAssets(root);
+  let upstreamCalls = 0;
+  const logs = [];
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    assets,
+    fetchImpl: async () => {
+      upstreamCalls += 1;
+      throw new Error("static requests must not call metadata or the backend");
+    },
+    logger: (line) => logs.push(line),
+  });
+
+  const home = await invoke(handler, { method: "GET", url: "/", body: null });
+  assert.equal(home.status, 200);
+  assert.equal(home.headers["content-type"], "text/html; charset=utf-8");
+  assert.equal(home.headers["content-length"], String(Buffer.byteLength("<html>synthetic public UI</html>")));
+  assert.equal(home.headers["content-security-policy"],
+    "default-src 'self'; connect-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+  assert.equal(home.headers["permissions-policy"], "camera=(), microphone=(), geolocation=()");
+  assert.equal(home.headers["referrer-policy"], "no-referrer");
+  assert.equal(home.headers["x-content-type-options"], "nosniff");
+  assert.equal(home.body.toString("utf8"), "<html>synthetic public UI</html>");
+  const head = await invoke(handler, { method: "HEAD", url: "/app.js?cache=1", body: null });
+  assert.equal(head.status, 200);
+  assert.equal(head.headers["content-type"], "text/javascript; charset=utf-8");
+  assert.equal(head.headers["content-length"], String(Buffer.byteLength("export const value = 1;")));
+  assert.equal(head.body.byteLength, 0);
+
+  for (const path of [
+    "/admin.html",
+    "/app.js.map",
+    "/contract.json",
+    "/untyped.bin",
+    "/api/v1/admin/action",
+    "/%2e%2e/index.html",
+    "/missing.js",
+  ]) {
+    const result = await invoke(handler, { method: "GET", url: path, body: null });
+    assert.equal(result.status, 404, path);
+  }
+  const foreignOrigin = await invoke(handler, {
+    method: "GET", url: "/app.js", body: null,
+    headers: { origin: "https://attacker.invalid" },
+  });
+  assert.equal(foreignOrigin.status, 403);
+  const spoofedHost = await invoke(handler, {
+    method: "GET", url: "/app.js", body: null, host: "attacker.invalid",
+  });
+  assert.equal(spoofedHost.status, 421);
+  const staticPost = await invoke(handler, { method: "POST", url: "/app.js", body: "{}" });
+  assert.equal(staticPost.status, 404);
+  assert.equal(upstreamCalls, 0);
+  assert.equal(logs.join("\n").includes("private admin shell"), false);
+});
+
+test("contribution streaming allows the bounded upload window while control routes keep short body deadlines", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.after(() => t.mock.timers.reset());
+  const server = createOauthGatewayServer({ configuration: configuration() });
+  assert.equal(server.requestTimeout, 60_000);
+
+  const { fetchImpl: metadata } = metadataFetch();
+  let backendCalls = 0;
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      backendCalls += 1;
+      return new Response("{}", { status: 201, headers: { "content-type": "application/json" } });
+    },
+    logger: () => {},
+  });
+  const body = JSON.stringify({ encryptedContribution: "synthetic" });
+  const split = Math.floor(body.length / 2);
+  const slowContribution = Readable.from((async function* () {
+    await new Promise((resolve) => setTimeout(resolve, 8_000));
+    yield Buffer.from(body.slice(0, split));
+    await new Promise((resolve) => setTimeout(resolve, 8_000));
+    yield Buffer.from(body.slice(split));
+  })());
+  const upload = invoke(handler, {
+    url: "/api/v1/contributions",
+    body: null,
+    stream: slowContribution,
+    headers: {
+      authorization: UPLOAD_AUTHORIZATION,
+      "content-type": "application/json",
+      "content-length": String(Buffer.byteLength(body)),
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(8_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(8_000);
+  const uploadResult = await upload;
+  assert.equal(uploadResult.status, 201);
+  assert.equal(backendCalls, 1);
+
+  const slowControl = Readable.from((async function* () {
+    await new Promise((resolve) => setTimeout(resolve, 6_000));
+    yield Buffer.from("{}");
+  })());
+  const control = invoke(handler, {
+    url: "/api/v1/identity/google/start",
+    stream: slowControl,
+    headers: { "content-length": "2" },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(5_001);
+  await new Promise((resolve) => setImmediate(resolve));
+  const controlResult = await control;
+  assert.equal(controlResult.status, 408);
+  assert.equal(controlResult.json().error.code, "BODY_TIMEOUT");
+  assert.equal(backendCalls, 1);
+
+  const stalledUpload = Readable.from((async function* () {
+    await new Promise((resolve) => setTimeout(resolve, 16_000));
+    yield Buffer.from(body);
+  })());
+  const stalled = invoke(handler, {
+    url: "/api/v1/contributions",
+    body: null,
+    stream: stalledUpload,
+    headers: {
+      authorization: UPLOAD_AUTHORIZATION,
+      "content-type": "application/json",
+      "content-length": String(Buffer.byteLength(body)),
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(15_001);
+  await new Promise((resolve) => setImmediate(resolve));
+  const stalledResult = await stalled;
+  assert.equal(stalledResult.status, 408);
+  assert.equal(stalledResult.json().error.code, "BODY_TIMEOUT");
+  assert.equal(backendCalls, 1);
 });
 
 test("desktop pairing claim permits a missing Node Origin but still requires the pairing credential", async () => {

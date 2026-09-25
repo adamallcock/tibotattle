@@ -17,6 +17,8 @@ function digestFromTar(bytes) {
   const hash = createHash("sha256");
   let cloudBuildConfigBytes = null;
   let maintenanceGateBytes = null;
+  let publicIndexBytes = null;
+  let publicAppBytes = null;
   let offset = 0;
   let count = 0;
   while (offset + 512 <= bytes.length) {
@@ -37,6 +39,12 @@ function digestFromTar(bytes) {
     if (path === "apps/worker/cloud-run/postgres-maintenance-gate.mjs") {
       maintenanceGateBytes = Buffer.from(content);
     }
+    if (path === "apps/worker/cloud-run/assets/index.html") {
+      publicIndexBytes = Buffer.from(content);
+    }
+    if (path === "apps/worker/cloud-run/assets/app.js") {
+      publicAppBytes = Buffer.from(content);
+    }
     if (path !== "apps/worker/cloud-run/source-content-digest.txt") {
       hash.update(path);
       hash.update(Buffer.from([0]));
@@ -46,7 +54,14 @@ function digestFromTar(bytes) {
     offset = start + size + padding;
     count += 1;
   }
-  return { digest: hash.digest("hex"), count, cloudBuildConfigBytes, maintenanceGateBytes };
+  return {
+    digest: hash.digest("hex"),
+    count,
+    cloudBuildConfigBytes,
+    maintenanceGateBytes,
+    publicIndexBytes,
+    publicAppBytes,
+  };
 }
 
 test("archive helper proves digest from tar members and returns shell-safe argument vectors", async () => {
@@ -70,6 +85,10 @@ test("archive helper proves digest from tar members and returns shell-safe argum
       /from\s+["']\.\/postgres-maintenance-gate\.mjs["']/u);
     assert.deepEqual(members.maintenanceGateBytes,
       readFileSync(join(workerRoot, "cloud-run/postgres-maintenance-gate.mjs")));
+    assert.deepEqual(members.publicIndexBytes,
+      readFileSync(join(workerRoot, "../web/public/index.html")));
+    assert.deepEqual(members.publicAppBytes,
+      readFileSync(join(workerRoot, "../web/public/app.js")));
     assert.equal(receipt.buildConfigSha256,
       createHash("sha256").update(members.cloudBuildConfigBytes).digest("hex"));
     assert.equal(receipt.buildConfigPath, outputPath + ".cloudbuild.yaml");

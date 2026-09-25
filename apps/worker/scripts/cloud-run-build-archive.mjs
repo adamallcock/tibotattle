@@ -28,6 +28,7 @@ const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REPOSITORY_ROOT = resolve(WORKER_ROOT, "../..");
 const CONTEXT_CHECK = resolve(WORKER_ROOT, "scripts/cloud-run-build-context.mjs");
 const SOURCE_BUILD_SUBMIT = resolve(WORKER_ROOT, "scripts/cloud-run-source-build-submit.mjs");
+const PUBLIC_WEB_ASSETS = resolve(REPOSITORY_ROOT, "apps/web/public");
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
 const MAX_FILE_COUNT = 100_000;
@@ -183,7 +184,11 @@ export async function createCloudRunBuildArchive({
   const scratch = await mkdtemp(join(tmpdir(), "tibotattle-cloud-run-source-"));
   const contextRoot = join(scratch, "context");
   try {
-    const created = spawn(process.execPath, [CONTEXT_CHECK, `--output=${contextRoot}`], {
+    const created = spawn(process.execPath, [
+      CONTEXT_CHECK,
+      `--output=${contextRoot}`,
+      `--assets=${PUBLIC_WEB_ASSETS}`,
+    ], {
       cwd: WORKER_ROOT,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
