@@ -15,7 +15,10 @@
  *     origin-tier limits, whose values must match;
  *   - the Worker's required secrets are a subset of the origin's, and the
  *     production hostnames and Cloudflare resource names match the frozen
- *     origins and fingerprint.
+ *     origins and fingerprint;
+ *   - the staging plane's closed posture (STAGING_CONTAINMENT_VARS and
+ *     STAGING_ORIGIN_TIER_RATE_LIMITS) equals the checked-in staging Worker's
+ *     (wrangler.jsonc env.staging), which declares no external participants.
  *
  * It also pins cloudbuild.production.yaml to the test build line for line,
  * apart from its placeholder service account and image. Nothing here reads a
@@ -205,6 +208,28 @@ function fingerprintFindings(production) {
     : ["FINGERPRINT_CLOUDFLARE_RESOURCES_DRIFT"];
 }
 
+/** The staging plane's closed posture must stay the staging Worker's. */
+function stagingFindings(staging) {
+  if (!isObject(staging) || !isObject(staging.vars) || !Array.isArray(staging.ratelimits)) {
+    return ["WRANGLER_STAGING_INVALID"];
+  }
+  const findings = [];
+  for (const [name, value] of Object.entries(configuration.STAGING_CONTAINMENT_VARS)) {
+    if (staging.vars[name] !== value) findings.push(`STAGING_VAR_DRIFT:${name}`);
+  }
+  for (const name of configuration.STAGING_ABSENT_VAR_NAMES) {
+    if (Object.hasOwn(staging.vars, name)) findings.push(`STAGING_VAR_PRESENT:${name}`);
+  }
+  for (const [name, limit] of Object.entries(configuration.STAGING_ORIGIN_TIER_RATE_LIMITS)) {
+    const entries = staging.ratelimits.filter((entry) => entry?.name === limit.binding);
+    if (entries.length !== 1 || entries[0].simple?.limit !== limit.limit
+        || entries[0].simple?.period !== limit.periodSeconds) {
+      findings.push(`STAGING_ORIGIN_TIER_LIMIT_DRIFT:${name}`);
+    }
+  }
+  return findings;
+}
+
 /** Returns sorted findings; an empty list means no drift. */
 function productionConfigurationDrift({ wranglerText, receiptText }) {
   let wrangler;
@@ -225,6 +250,7 @@ function productionConfigurationDrift({ wranglerText, receiptText }) {
     ...secretFindings(production.secrets),
     ...hostFindings(production),
     ...fingerprintFindings(production),
+    ...stagingFindings(wrangler.env.staging),
   ].sort();
 }
 
@@ -284,6 +310,14 @@ function doctorProduction(text, from, to) {
   const start = text.indexOf("\n    \"production\": {");
   assert.ok(start > 0);
   return text.slice(0, start) + doctor(text.slice(start), from, to);
+}
+
+/** Doctors a line inside env.staging only (env.production follows it). */
+function doctorStaging(text, from, to) {
+  const start = text.indexOf("\n    \"staging\": {");
+  const end = text.indexOf("\n    \"production\": {");
+  assert.ok(start > 0 && end > start);
+  return text.slice(0, start) + doctor(text.slice(start, end), from, to) + text.slice(end);
 }
 
 function doctorReceipt(mutate) {
@@ -348,6 +382,58 @@ test("a changed origin-tier limit in a temp copy fails", async () => {
       "\"name\": \"UPLOAD_PRINCIPAL_RATE_LIMIT\",", "\"name\": \"UPLOAD_PRINCIPAL_RATE_LIMIT_V2\","),
   }), ["ORIGIN_TIER_RATE_LIMIT_MISSING:UPLOAD_PRINCIPAL_RATE_LIMIT",
     "RATE_LIMIT_UNCLASSIFIED:UPLOAD_PRINCIPAL_RATE_LIMIT_V2"]);
+});
+
+test("a malformed or repeated rate limit fails, even an edge-tier one", async () => {
+  assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorProduction(WRANGLER_TEXT,
+      "\"simple\": { \"limit\": 5, \"period\": 60 }", "\"simple\": { \"limit\": \"5\", \"period\": 60 }"),
+  }), ["RATE_LIMIT_INVALID:CLIENT_ATTEMPT_RATE_LIMIT"]);
+  assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorProduction(WRANGLER_TEXT,
+      "\"simple\": { \"limit\": 5, \"period\": 60 }", "\"simple\": { \"limit\": 5, \"period\": 0 }"),
+  }), ["RATE_LIMIT_INVALID:CLIENT_ATTEMPT_RATE_LIMIT"]);
+  assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorProduction(WRANGLER_TEXT, UPLOAD_AUTHORIZATION_LIMIT,
+      UPLOAD_AUTHORIZATION_LIMIT.replace("\"limit\": 3000", "\"limit\": 3000.5")),
+  }), ["RATE_LIMIT_INVALID:UPLOAD_AUTHORIZATION_RATE_LIMIT"]);
+  assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorProduction(WRANGLER_TEXT,
+      "\"name\": \"RECOVERY_RATE_LIMIT\",", "\"name\": \"ENROLLMENT_RATE_LIMIT\","),
+  }), ["EDGE_TIER_RATE_LIMIT_MISSING:RECOVERY_RATE_LIMIT", "RATE_LIMIT_DUPLICATE:ENROLLMENT_RATE_LIMIT"]);
+  assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorProduction(WRANGLER_TEXT,
+      "\"name\": \"UPLOAD_PRINCIPAL_RATE_LIMIT\",", "\"name\": \"UPLOAD_AUTHORIZATION_RATE_LIMIT\","),
+  }), ["ORIGIN_TIER_RATE_LIMIT_MISSING:UPLOAD_PRINCIPAL_RATE_LIMIT",
+    "RATE_LIMIT_DUPLICATE:UPLOAD_AUTHORIZATION_RATE_LIMIT"]);
+  assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorProduction(WRANGLER_TEXT,
+      "\"name\": \"PUBLIC_READ_RATE_LIMIT\",", "\"name\": 4,"),
+  }), ["EDGE_TIER_RATE_LIMIT_MISSING:PUBLIC_READ_RATE_LIMIT", "RATE_LIMIT_INVALID"]);
+});
+
+test("the staging plane's closed posture matches the staging Worker's", async () => {
+  assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorStaging(WRANGLER_TEXT,
+      "\"SIGN_IN_START_MAX_PER_MINUTE\": \"5\"", "\"SIGN_IN_START_MAX_PER_MINUTE\": \"300\""),
+  }), ["STAGING_VAR_DRIFT:SIGN_IN_START_MAX_PER_MINUTE"]);
+  assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorStaging(WRANGLER_TEXT,
+      "\"ENROLLMENT_MODE\": \"disabled\"", "\"ENROLLMENT_MODE\": \"open\""),
+  }), ["STAGING_VAR_DRIFT:ENROLLMENT_MODE"]);
+  assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorStaging(WRANGLER_TEXT,
+      "\"ACCOUNTLESS_OWNERSHIP_MODE\": \"disabled\",",
+      "\"ACCOUNTLESS_OWNERSHIP_MODE\": \"disabled\",\n        \"INCREMENTAL_EXTERNAL_PARTICIPANTS\": \"authorized\","),
+  }), ["STAGING_VAR_PRESENT:INCREMENTAL_EXTERNAL_PARTICIPANTS"]);
+  assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorStaging(WRANGLER_TEXT,
+      "\"simple\": { \"limit\": 6, \"period\": 60 }", "\"simple\": { \"limit\": 7, \"period\": 60 }"),
+  }), ["STAGING_ORIGIN_TIER_LIMIT_DRIFT:UPLOAD_PRINCIPAL"]);
+  assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorStaging(WRANGLER_TEXT,
+      "\"name\": \"UPLOAD_AUTHORIZATION_RATE_LIMIT\",", "\"name\": \"UPLOAD_AUTHORIZATION_RATE_LIMIT_V2\","),
+  }), ["STAGING_ORIGIN_TIER_LIMIT_DRIFT:UPLOAD_AUTHORIZATION"]);
 });
 
 test("edge-tier limits must all be present, and their values stay with the edge", async () => {

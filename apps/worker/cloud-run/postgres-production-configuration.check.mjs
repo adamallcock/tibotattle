@@ -36,15 +36,16 @@ const vite = await createServer({
 });
 let canonical;
 try {
-  const [storage, crypto, identityLink, gcs, postgresClient, apple] = await Promise.all([
+  const [storage, crypto, identityLink, gcs, postgresClient, apple, rateLimiter] = await Promise.all([
     vite.ssrLoadModule("/src/telemetry-storage-mode.ts"),
     vite.ssrLoadModule("/src/crypto.ts"),
     vite.ssrLoadModule("/src/identity-link-configuration.ts"),
     vite.ssrLoadModule("/src/gcs-erasure-object-store.ts"),
     vite.ssrLoadModule("/src/postgres-client.ts"),
     vite.ssrLoadModule("/src/identity-apple.ts"),
+    vite.ssrLoadModule("/src/postgres-rate-limiter.ts"),
   ]);
-  canonical = { storage, crypto, identityLink, gcs, postgresClient, apple };
+  canonical = { storage, crypto, identityLink, gcs, postgresClient, apple, rateLimiter };
 } finally {
   await vite.close();
 }
@@ -103,6 +104,11 @@ function productionResources() {
     POSTGRES_IAM_USER: "origin-runtime@synthetic-project.iam",
     GCS_BUCKET_NAME: "synthetic-origin-quarantine",
     GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("synthetic-origin-quarantine"),
+  };
+}
+
+function serviceSecrets() {
+  return {
     ...envelopeKeys("key:synthetic-production-check"),
     IDENTITY_LINK_SECRET: SECRET_VALUES.IDENTITY_LINK_SECRET,
     POSTGRES_RATE_LIMIT_SECRET: SECRET_VALUES.POSTGRES_RATE_LIMIT_SECRET,
@@ -111,6 +117,19 @@ function productionResources() {
     DISTRIBUTION_GITHUB_API_TOKEN: SECRET_VALUES.DISTRIBUTION_GITHUB_API_TOKEN,
   };
 }
+
+// The secrets each job consumes, listed here independently of the module.
+const JOB_SECRET_NAMES = Object.freeze({
+  "maintenance-job": ["IDENTITY_LINK_SECRET", "DISTRIBUTION_GITHUB_API_TOKEN"],
+  "analytics-job": [],
+  "staging-maintenance-job": ["IDENTITY_LINK_SECRET"],
+  "staging-analytics-job": [],
+});
+const JOB_PROFILES = Object.freeze(Object.keys(JOB_SECRET_NAMES));
+const SERVICE_ONLY_SECRET_NAMES = Object.freeze([
+  "POSTGRES_RATE_LIMIT_SECRET", "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK",
+  "GOOGLE_OIDC_CLIENT_SECRET", "APPLE_PRIVATE_KEY",
+]);
 
 function productionEnv(overrides = {}) {
   return {
@@ -124,7 +143,29 @@ function productionEnv(overrides = {}) {
     EDGE_INVOKER_SERVICE_ACCOUNT: EDGE_INVOKER,
     EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS: "",
     ...productionResources(),
+    ...serviceSecrets(),
     ...overrides,
+  };
+}
+
+/** The staging plane's own origins, resources and identity vars. */
+function stagingPlane() {
+  return {
+    PUBLIC_ORIGIN: "https://staging.synthetic.example",
+    ADMIN_HOST_ORIGIN: "https://admin.staging.synthetic.example",
+    TELEMETRY_STORAGE_NAMESPACE: "synthetic-staging-namespace",
+    PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-staging-primary",
+    LEDGER_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-staging-ledger",
+    GCS_BUCKET_NAME: "synthetic-staging-quarantine",
+    GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("synthetic-staging-quarantine"),
+    ACCESS_TEAM_DOMAIN: "synthetic.cloudflareaccess.com",
+    ACCESS_AUD: "a".repeat(64),
+    ACCESS_ADMIN_EMAIL: "owner@synthetic.example",
+    IDENTITY_LINK_SECRET_VERSION: "staging-v1",
+    GOOGLE_OIDC_CLIENT_ID: "123456789012-syntheticstaging.apps.googleusercontent.com",
+    APPLE_SERVICES_ID: "example.synthetic.staging",
+    APPLE_KEY_ID: "SYNTHKEY01",
+    APPLE_TEAM_ID: "SYNTHTEAM1",
   };
 }
 
@@ -134,32 +175,22 @@ function stagingEnv(overrides = {}) {
     HOST_MODE: "staging",
     K_SERVICE: "tibotattle-staging-origin",
     HOST_ORIGIN: "https://tibotattle-staging-origin-abc123def4-ue.a.run.app",
-    PUBLIC_ORIGIN: "https://staging.synthetic.example",
-    ADMIN_HOST_ORIGIN: "https://admin.staging.synthetic.example",
     EDGE_ORIGIN_AUDIENCE: "tibotattle-staging-origin-audience",
-    TELEMETRY_STORAGE_NAMESPACE: "synthetic-staging-namespace",
-    PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-staging-primary",
-    LEDGER_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-staging-ledger",
-    GCS_BUCKET_NAME: "synthetic-staging-quarantine",
-    GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("synthetic-staging-quarantine"),
+    ...stagingPlane(),
     ...envelopeKeys("key:staging-synthetic-check"),
-    ACCESS_TEAM_DOMAIN: "synthetic.cloudflareaccess.com",
-    ACCESS_AUD: "a".repeat(64),
-    ACCESS_ADMIN_EMAIL: "owner@synthetic.example",
-    IDENTITY_LINK_SECRET_VERSION: "staging-v1",
-    GOOGLE_OIDC_CLIENT_ID: "123456789012-syntheticstaging.apps.googleusercontent.com",
-    APPLE_SERVICES_ID: "example.synthetic.staging",
-    APPLE_KEY_ID: "SYNTHKEY01",
-    APPLE_TEAM_ID: "SYNTHTEAM1",
     ...overrides,
   };
 }
 
 function jobEnv(profile, overrides = {}) {
+  const staging = profile.startsWith("staging-");
+  const maintenance = profile.endsWith("maintenance-job");
   return {
-    CLOUD_RUN_JOB: profile === "maintenance-job" ? "tibotattle-maintenance" : "tibotattle-analytics-delivery",
+    CLOUD_RUN_JOB: `tibotattle-${staging ? "staging-" : ""}${maintenance ? "maintenance" : "analytics-delivery"}`,
     ...productionResources(),
-    ...(profile === "maintenance-job" ? { POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: "enabled" } : {}),
+    ...(staging ? stagingPlane() : {}),
+    ...Object.fromEntries(JOB_SECRET_NAMES[profile].map((name) => [name, SECRET_VALUES[name]])),
+    ...(maintenance ? { POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: "enabled" } : {}),
     ...overrides,
   };
 }
@@ -272,6 +303,11 @@ test("exports the frozen production constants", () => {
   assert.equal(configuration.PRODUCTION_ADMIN_ORIGIN, "https://admin.tibotattle.com");
   assert.equal(configuration.PRODUCTION_WWW_HOST, "www.tibotattle.com");
   assert.deepEqual(configuration.PRODUCTION_POOL_SIZES, { data: 3, ledger: 2, admission: 4, readiness: 1 });
+  // One readiness pool on each instance: primary 3 + 4 + 1, ledger 2 + 1.
+  assert.deepEqual(configuration.PRODUCTION_POOL_INSTANCES, {
+    data: ["primary"], ledger: ["ledger"], admission: ["primary"], readiness: ["primary", "ledger"],
+  });
+  assert.deepEqual(configuration.PRODUCTION_POOL_CONNECTIONS_PER_INSTANCE, { primary: 8, ledger: 3 });
   assert.deepEqual(configuration.PRODUCTION_ADMISSION_TIMEOUTS, {
     lockTimeoutMilliseconds: 1_000,
     statementTimeoutMilliseconds: 2_000,
@@ -284,6 +320,44 @@ test("exports the frozen production constants", () => {
     UPLOAD_AUTHORIZATION: { binding: "UPLOAD_AUTHORIZATION_RATE_LIMIT", limit: 3_000, periodSeconds: 60 },
     UPLOAD_PRINCIPAL: { binding: "UPLOAD_PRINCIPAL_RATE_LIMIT", limit: 3_000, periodSeconds: 60 },
   });
+  assert.deepEqual(configuration.STAGING_ORIGIN_TIER_RATE_LIMITS, {
+    UPLOAD_AUTHORIZATION: { binding: "UPLOAD_AUTHORIZATION_RATE_LIMIT", limit: 300, periodSeconds: 60 },
+    UPLOAD_PRINCIPAL: { binding: "UPLOAD_PRINCIPAL_RATE_LIMIT", limit: 6, periodSeconds: 60 },
+  });
+  assert.deepEqual(configuration.PRODUCTION_CONFIGURATION_PROFILES, [
+    "production", "staging", "maintenance-job", "analytics-job",
+    "staging-maintenance-job", "staging-analytics-job",
+  ]);
+  const analyticsSwitches = [
+    "POSTGRES_ANALYTICS_MODE", "POSTGRES_ANALYTICS_PUBLICATION_LANE",
+    "POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL",
+  ];
+  assert.deepEqual(configuration.PRODUCTION_JOB_SWITCH_NAMES, {
+    "maintenance-job": ["POSTGRES_SCHEDULED_MAINTENANCE_ENABLED"],
+    "analytics-job": analyticsSwitches,
+    "staging-maintenance-job": ["POSTGRES_SCHEDULED_MAINTENANCE_ENABLED"],
+    "staging-analytics-job": analyticsSwitches,
+  });
+  // The staging Worker's closed posture (wrangler.jsonc env.staging).
+  assert.deepEqual(configuration.STAGING_CONTAINMENT_VARS, {
+    ENROLLMENT_MODE: "disabled",
+    ACCOUNTLESS_ENROLLMENT_MODE: "disabled",
+    ACCOUNTLESS_OWNERSHIP_MODE: "disabled",
+    ACCOUNT_SCOPED_INGEST_MODE: "disabled",
+    UPLOAD_INGRESS_QUEUE_MODE: "disabled",
+    UPLOAD_INGRESS_MAX_CONCURRENT: "8",
+    UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE: "120",
+    UPLOAD_INGRESS_BURST: "16",
+    UPLOAD_INGRESS_LEASE_SECONDS: "90",
+    UPLOAD_INGRESS_BODY_TOTAL_SECONDS: "60",
+    UPLOAD_INGRESS_BODY_IDLE_SECONDS: "15",
+    SIGN_IN_START_MAX_PER_MINUTE: "5",
+  });
+  assert.deepEqual(configuration.STAGING_ABSENT_VAR_NAMES, ["INCREMENTAL_EXTERNAL_PARTICIPANTS"]);
+  assert.deepEqual(configuration.STAGING_ADMISSION_MODES, {
+    closed: {},
+    "synthetic-rehearsal": { ACCOUNTLESS_ENROLLMENT_MODE: "enabled", ACCOUNTLESS_OWNERSHIP_MODE: "enabled" },
+  });
   assert.deepEqual(configuration.PRODUCTION_WORKER_BINDING_NAMES, [
     "ENROLLMENT_RATE_LIMIT", "RECOVERY_RATE_LIMIT", "CLIENT_ATTEMPT_RATE_LIMIT",
     "PUBLIC_READ_RATE_LIMIT", "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
@@ -295,6 +369,22 @@ test("exports the frozen production constants", () => {
     "ENVELOPE_PRIVATE_JWK", "GOOGLE_OIDC_CLIENT_SECRET", "APPLE_PRIVATE_KEY",
   ]);
   assert.deepEqual(configuration.OPTIONAL_SECRET_NAMES, ["DISTRIBUTION_GITHUB_API_TOKEN"]);
+  const service = {
+    required: configuration.REQUIRED_SECRET_NAMES,
+    optional: configuration.OPTIONAL_SECRET_NAMES,
+  };
+  assert.deepEqual(configuration.PRODUCTION_PROFILE_SECRET_NAMES, {
+    production: service,
+    staging: service,
+    "maintenance-job": { required: ["IDENTITY_LINK_SECRET"], optional: ["DISTRIBUTION_GITHUB_API_TOKEN"] },
+    "analytics-job": { required: [], optional: [] },
+    "staging-maintenance-job": { required: ["IDENTITY_LINK_SECRET"], optional: [] },
+    "staging-analytics-job": { required: [], optional: [] },
+  });
+  for (const profile of JOB_PROFILES) {
+    const { required, optional } = configuration.PRODUCTION_PROFILE_SECRET_NAMES[profile];
+    assert.deepEqual([...required, ...optional], JOB_SECRET_NAMES[profile], profile);
+  }
   // Pinned independently of the module, so dropping an entry fails here.
   assert.deepEqual(Object.keys(configuration.PRODUCTION_FORBIDDEN_VARIABLES).sort(), [
     "ACCESS_TEST_JWKS_JSON", "ADMIN_OWNER_FIXTURE_JSON", "ADMIN_OWNER_PREVIOUS_FIXTURE_JSON",
@@ -366,7 +456,9 @@ test("a valid production environment yields a frozen configuration with opaque s
   const config = expectAccepted(productionEnv(), "production");
   assertDeepFrozen(config, "configuration");
   assert.equal(config.profile, "production");
+  assert.equal(config.plane, "production");
   assert.equal(config.environment, "production");
+  assert.equal(config.stagingAdmissionMode, null);
   assert.deepEqual(config.origins, {
     public: "https://tibotattle.com",
     admin: "https://admin.tibotattle.com",
@@ -446,7 +538,7 @@ test("each forbidden variable aborts with its own code in every profile, even wh
     for (const value of ["synthetic-forbidden-value", ""]) {
       expectCode(() => readProductionConfiguration(productionEnv({ [name]: value }), "production"), code);
       expectCode(() => readProductionConfiguration(stagingEnv({ [name]: value }), "staging"), code);
-      for (const profile of ["maintenance-job", "analytics-job"]) {
+      for (const profile of JOB_PROFILES) {
         expectCode(() => readProductionConfiguration(jobEnv(profile, { [name]: value }), profile), code);
       }
     }
@@ -461,8 +553,43 @@ test("missing secrets abort naming only the secret", () => {
       `${name}_MISSING`);
     expectCode(() => readProductionConfiguration(without(stagingEnv(), name), "staging"),
       `${name}_MISSING`);
-    expectCode(() => readProductionConfiguration(without(jobEnv("maintenance-job"), name),
-      "maintenance-job"), `${name}_MISSING`);
+  }
+  for (const profile of ["maintenance-job", "staging-maintenance-job"]) {
+    expectCode(() => readProductionConfiguration(without(jobEnv(profile), "IDENTITY_LINK_SECRET"), profile),
+      "IDENTITY_LINK_SECRET_MISSING");
+    expectCode(() => readProductionConfiguration(jobEnv(profile, { IDENTITY_LINK_SECRET: "" }), profile),
+      "IDENTITY_LINK_SECRET_MISSING");
+    expectCode(() => readProductionConfiguration(jobEnv(profile, {
+      IDENTITY_LINK_SECRET: "x".repeat(31),
+    }), profile), "IDENTITY_LINK_SECRET_INVALID");
+  }
+});
+
+test("each job requires only the secrets it consumes and refuses the rest", () => {
+  const all = serviceSecrets();
+  for (const profile of JOB_PROFILES) {
+    const config = expectAccepted(jobEnv(profile), profile);
+    assert.deepEqual(Object.keys(config.secrets).sort(), [...JOB_SECRET_NAMES[profile]].sort(), profile);
+    const env = createProductionWorkerEnv(config);
+    for (const name of [...configuration.REQUIRED_SECRET_NAMES, ...configuration.OPTIONAL_SECRET_NAMES]) {
+      const consumed = JOB_SECRET_NAMES[profile].includes(name);
+      assert.equal(Object.hasOwn(env, name), consumed, `${profile} ${name}`);
+      if (consumed) continue;
+      // A secret the job never reads is refused, even when rendered empty.
+      for (const value of [all[name], ""]) {
+        expectCode(() => readProductionConfiguration(jobEnv(profile, { [name]: value }), profile),
+          `${name}_PROFILE_FORBIDDEN`);
+      }
+    }
+    assertNoLeak(env, [SECRET_VALUES.POSTGRES_RATE_LIMIT_SECRET, SECRET_VALUES.APPLE_PRIVATE_KEY,
+      SECRET_VALUES.GOOGLE_OIDC_CLIENT_SECRET, PRIVATE_EXPONENT]);
+  }
+  // The production maintenance job reads the optional GitHub token; the staging one never does.
+  const withoutToken = expectAccepted(without(jobEnv("maintenance-job"), "DISTRIBUTION_GITHUB_API_TOKEN"),
+    "maintenance-job");
+  assert.deepEqual(Object.keys(withoutToken.secrets), ["IDENTITY_LINK_SECRET"]);
+  for (const name of SERVICE_ONLY_SECRET_NAMES) {
+    assert.equal(configuration.PRODUCTION_PROFILE_SECRET_NAMES["maintenance-job"].required.includes(name), false);
   }
 });
 
@@ -502,12 +629,15 @@ test("test-target resources abort", () => {
     [{ HOST_ORIGIN: target.origin }, "HOST_ORIGIN_TEST_TARGET_FORBIDDEN"],
     [{ PRIMARY_INSTANCE_CONNECTION_NAME: target.postgres.primary.instanceConnectionName },
       "PRIMARY_INSTANCE_CONNECTION_NAME_TEST_TARGET_FORBIDDEN"],
-    [{ PRIMARY_DATABASE: target.postgres.primary.database }, "PRIMARY_DATABASE_TEST_TARGET_FORBIDDEN"],
     [{ PRIMARY_SCHEMA: target.postgres.primary.schema }, "PRIMARY_SCHEMA_TEST_TARGET_FORBIDDEN"],
     [{ LEDGER_INSTANCE_CONNECTION_NAME: target.postgres.ledger.instanceConnectionName },
       "LEDGER_INSTANCE_CONNECTION_NAME_TEST_TARGET_FORBIDDEN"],
-    [{ LEDGER_DATABASE: target.postgres.ledger.database }, "LEDGER_DATABASE_TEST_TARGET_FORBIDDEN"],
     [{ LEDGER_SCHEMA: target.postgres.ledger.schema }, "LEDGER_SCHEMA_TEST_TARGET_FORBIDDEN"],
+    // A test database is refused through its instance.
+    [{
+      LEDGER_INSTANCE_CONNECTION_NAME: target.postgres.ledger.instanceConnectionName,
+      LEDGER_DATABASE: target.postgres.ledger.database,
+    }, "LEDGER_INSTANCE_CONNECTION_NAME_TEST_TARGET_FORBIDDEN"],
     [{ POSTGRES_IAM_USER: target.postgres.iamUser }, "POSTGRES_IAM_USER_TEST_TARGET_FORBIDDEN"],
     [{ POSTGRES_IAM_USER: `${target.postgres.iamUser}.gserviceaccount.com` },
       "POSTGRES_IAM_USER_TEST_TARGET_FORBIDDEN"],
@@ -515,6 +645,8 @@ test("test-target resources abort", () => {
       "GCS_BUCKET_NAME_TEST_TARGET_FORBIDDEN"],
     [{ EDGE_INVOKER_SERVICE_ACCOUNT: `${target.postgres.iamUser}.gserviceaccount.com` },
       "EDGE_INVOKER_SERVICE_ACCOUNT_TEST_TARGET_FORBIDDEN"],
+    [{ EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS: `${VERIFIERS[0]},${target.postgres.iamUser}.gserviceaccount.com` },
+      "EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS_TEST_TARGET_FORBIDDEN"],
     [{ EDGE_ORIGIN_AUDIENCE: target.origin }, "EDGE_ORIGIN_AUDIENCE_TEST_TARGET_FORBIDDEN"],
     [{ TELEMETRY_STORAGE_NAMESPACE: target.postgres.primary.schema },
       "TELEMETRY_STORAGE_NAMESPACE_TEST_TARGET_FORBIDDEN"],
@@ -522,9 +654,30 @@ test("test-target resources abort", () => {
   for (const [overrides, code] of cases) {
     expectCode(() => readProductionConfiguration(productionEnv(overrides), "production"), code);
   }
-  expectCode(() => readProductionConfiguration(
-    jobEnv("analytics-job", { PRIMARY_DATABASE: target.postgres.primary.database }), "analytics-job"),
-  "PRIMARY_DATABASE_TEST_TARGET_FORBIDDEN");
+  for (const profile of JOB_PROFILES) {
+    expectCode(() => readProductionConfiguration(jobEnv(profile, {
+      PRIMARY_INSTANCE_CONNECTION_NAME: target.postgres.primary.instanceConnectionName,
+    }), profile), "PRIMARY_INSTANCE_CONNECTION_NAME_TEST_TARGET_FORBIDDEN");
+    expectCode(() => readProductionConfiguration(jobEnv(profile, { CLOUD_RUN_JOB: target.service }), profile),
+      "CLOUD_RUN_JOB_TEST_TARGET_FORBIDDEN");
+  }
+  expectCode(() => readProductionConfiguration(stagingEnv({ GCS_BUCKET_NAME: target.gcsBucket,
+    GCS_ERASURE_BUCKET_HISTORY_PROOF: testProof }), "staging"), "GCS_BUCKET_NAME_TEST_TARGET_FORBIDDEN");
+  // Resource identities, not name coincidences: the repository's conventional
+  // database and schema names ('tibotattle', 'tibotattle_ledger', which the
+  // test deployment's databases also use) are accepted on other instances.
+  const conventional = expectAccepted(productionEnv({
+    PRIMARY_DATABASE: target.postgres.primary.database,
+    PRIMARY_SCHEMA: target.postgres.primary.database,
+    LEDGER_DATABASE: target.postgres.ledger.database,
+    LEDGER_SCHEMA: target.postgres.ledger.database,
+    TELEMETRY_STORAGE_NAMESPACE: target.project,
+  }), "production");
+  assert.deepEqual(conventional.resources.primary, {
+    instanceConnectionName: "synthetic-project:us-east1:origin-primary",
+    database: "tibotattle",
+    schema: "tibotattle",
+  });
   // The whole test deployment, as the IAM test host is configured.
   expectCode(() => readProductionConfiguration(productionEnv({
     K_SERVICE: target.service,
@@ -616,6 +769,11 @@ test("Cloud SQL and bucket resources are validated", () => {
       "GCS_ERASURE_BUCKET_HISTORY_PROOF_INVALID"],
     [{ GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("synthetic-origin-quarantine",
       { softDeleteRetentionDurationSeconds: "604800" }) }, "GCS_ERASURE_BUCKET_HISTORY_PROOF_INVALID"],
+    // Over 16 KiB, although otherwise a valid wrapped proof.
+    [{ GCS_ERASURE_BUCKET_HISTORY_PROOF: JSON.stringify({
+      padding: "x".repeat(16_384),
+      proof: JSON.parse(proof("synthetic-origin-quarantine")),
+    }) }, "GCS_ERASURE_BUCKET_HISTORY_PROOF_INVALID"],
   ];
   for (const [overrides, code] of cases) {
     expectCode(() => readProductionConfiguration(productionEnv(overrides), "production"), code);
@@ -636,6 +794,7 @@ test("Cloud SQL and bucket resources are validated", () => {
 test("staging requires its own plane and aborts on any production value", () => {
   const staging = expectAccepted(stagingEnv(), "staging");
   assert.equal(staging.environment, "staging");
+  assert.equal(staging.plane, "staging");
   assert.deepEqual(staging.origins, {
     public: "https://staging.synthetic.example",
     admin: "https://admin.staging.synthetic.example",
@@ -649,10 +808,13 @@ test("staging requires its own plane and aborts on any production value", () => 
   assert.equal(staging.vars.TELEMETRY_STORAGE_MODE, "typed");
 
   const production = configuration.PRODUCTION_VARS;
+  const email254 = `${"a".repeat(64)}@${"b".repeat(185)}.com`;
+  assert.equal(email254.length, 254);
   const cases = [
-    [{ PUBLIC_ORIGIN: "https://tibotattle.com" }, "PUBLIC_ORIGIN_PRODUCTION_VALUE_FORBIDDEN"],
-    [{ PUBLIC_ORIGIN: "https://www.tibotattle.com" }, "PUBLIC_ORIGIN_PRODUCTION_VALUE_FORBIDDEN"],
-    [{ ADMIN_HOST_ORIGIN: "https://admin.tibotattle.com" }, "ADMIN_HOST_ORIGIN_PRODUCTION_VALUE_FORBIDDEN"],
+    [{ PUBLIC_ORIGIN: "https://tibotattle.com", ADMIN_HOST_ORIGIN: "https://admin.tibotattle.com" },
+      "PUBLIC_ORIGIN_PRODUCTION_VALUE_FORBIDDEN"],
+    [{ PUBLIC_ORIGIN: "https://www.tibotattle.com", ADMIN_HOST_ORIGIN: "https://admin.www.tibotattle.com" },
+      "PUBLIC_ORIGIN_PRODUCTION_VALUE_FORBIDDEN"],
     [{ ACCESS_AUD: production.ACCESS_AUD }, "ACCESS_AUD_PRODUCTION_VALUE_FORBIDDEN"],
     [{ IDENTITY_LINK_SECRET_VERSION: "production-v1" }, "IDENTITY_LINK_SECRET_VERSION_PRODUCTION_VALUE_FORBIDDEN"],
     [{ GOOGLE_OIDC_CLIENT_ID: production.GOOGLE_OIDC_CLIENT_ID }, "GOOGLE_OIDC_CLIENT_ID_PRODUCTION_VALUE_FORBIDDEN"],
@@ -673,10 +835,31 @@ test("staging requires its own plane and aborts on any production value", () => 
     // A marker must be a delimited token, not a substring.
     [envelopeKeys("key:nonstaging"), "ENVELOPE_KEY_ID_STAGING_MARKER_MISSING"],
     [{ PUBLIC_ORIGIN: "https://tibotattle-staging-origin-abc123def4-ue.a.run.app" }, "PUBLIC_ORIGIN_INVALID"],
+    [{ PUBLIC_ORIGIN: "https://staging.synthetic.example/" }, "PUBLIC_ORIGIN_INVALID"],
+    // The public origin is never itself an admin host.
+    [{ PUBLIC_ORIGIN: "https://admin.synthetic.example", ADMIN_HOST_ORIGIN: "https://admin.admin.synthetic.example" },
+      "PUBLIC_ORIGIN_INVALID"],
+    // The admin origin is exactly admin.<public hostname>, as the Worker and the edge derive it.
     [{ ADMIN_HOST_ORIGIN: "https://staging.synthetic.example" }, "ADMIN_HOST_ORIGIN_INVALID"],
+    [{ ADMIN_HOST_ORIGIN: "https://ops.other.example" }, "ADMIN_HOST_ORIGIN_INVALID"],
+    [{ ADMIN_HOST_ORIGIN: "https://admin.tibotattle.com" }, "ADMIN_HOST_ORIGIN_INVALID"],
+    [{ ADMIN_HOST_ORIGIN: "https://admin.staging.synthetic.example:8443" }, "ADMIN_HOST_ORIGIN_INVALID"],
     [without(stagingEnv(), "ADMIN_HOST_ORIGIN"), "ADMIN_HOST_ORIGIN_MISSING"],
     [{ ACCESS_AUD: "A".repeat(64) }, "ACCESS_AUD_INVALID"],
+    [{ ACCESS_TEAM_DOMAIN: "access.synthetic.example" }, "ACCESS_TEAM_DOMAIN_INVALID"],
+    [{ ACCESS_TEAM_DOMAIN: "-synthetic.cloudflareaccess.com" }, "ACCESS_TEAM_DOMAIN_INVALID"],
+    [{ ACCESS_ADMIN_EMAIL: "owner.synthetic.example" }, "ACCESS_ADMIN_EMAIL_INVALID"],
+    [{ ACCESS_ADMIN_EMAIL: "owner@Synthetic.example" }, "ACCESS_ADMIN_EMAIL_INVALID"],
+    [{ ACCESS_ADMIN_EMAIL: `${"a".repeat(65)}@synthetic.example` }, "ACCESS_ADMIN_EMAIL_INVALID"],
+    [{ ACCESS_ADMIN_EMAIL: `${"a".repeat(64)}@${"b".repeat(186)}.com` }, "ACCESS_ADMIN_EMAIL_INVALID"],
     [{ IDENTITY_LINK_SECRET_VERSION: "-staging" }, "IDENTITY_LINK_SECRET_VERSION_INVALID"],
+    [{ GOOGLE_OIDC_CLIENT_ID: "not-a-client-id" }, "GOOGLE_OIDC_CLIENT_ID_INVALID"],
+    [{ GOOGLE_OIDC_CLIENT_ID: "123456789012-synthetic.apps.example.com" }, "GOOGLE_OIDC_CLIENT_ID_INVALID"],
+    [{ APPLE_SERVICES_ID: ".synthetic.staging" }, "APPLE_SERVICES_ID_INVALID"],
+    [{ APPLE_SERVICES_ID: "synthetic staging" }, "APPLE_SERVICES_ID_INVALID"],
+    [{ APPLE_TEAM_ID: "synthteam1" }, "APPLE_TEAM_ID_INVALID"],
+    [{ APPLE_TEAM_ID: "SYNTHTEAM" }, "APPLE_TEAM_ID_INVALID"],
+    [{ APPLE_KEY_ID: "SYNTHKEY001" }, "APPLE_KEY_ID_INVALID"],
     [without(stagingEnv(), "APPLE_KEY_ID"), "APPLE_KEY_ID_MISSING"],
   ];
   for (const [overrides, code] of cases) {
@@ -691,6 +874,124 @@ test("staging requires its own plane and aborts on any production value", () => 
     APPLE_TEAM_ID: production.APPLE_TEAM_ID,
     APPLE_SERVICES_ID: production.APPLE_SERVICES_ID,
   }), "staging");
+  assert.equal(expectAccepted(stagingEnv({ ACCESS_ADMIN_EMAIL: email254 }), "staging")
+    .vars.ACCESS_ADMIN_EMAIL, email254);
+});
+
+test("staging is synthetic-only by default: a closed posture no setting can open", () => {
+  const production = expectAccepted(productionEnv(), "production");
+  assert.equal(production.vars.ENROLLMENT_MODE, "open");
+  assert.equal(production.vars.INCREMENTAL_EXTERNAL_PARTICIPANTS, "authorized");
+  assert.equal(production.rateLimits.originTier, configuration.ORIGIN_TIER_RATE_LIMITS);
+
+  // The process environment asks for production's open posture; it is ignored.
+  const open = {
+    ENROLLMENT_MODE: "open",
+    ACCOUNTLESS_ENROLLMENT_MODE: "enabled",
+    ACCOUNTLESS_OWNERSHIP_MODE: "enabled",
+    INCREMENTAL_EXTERNAL_PARTICIPANTS: "authorized",
+    SIGN_IN_START_MAX_PER_MINUTE: "300",
+    UPLOAD_INGRESS_MAX_CONCURRENT: "64",
+  };
+  for (const env of [stagingEnv(), stagingEnv(open), stagingEnv({ ...open, STAGING_ADMISSION_MODE: "closed" })]) {
+    const config = expectAccepted(env, "staging");
+    assert.equal(config.stagingAdmissionMode, "closed");
+    assert.equal(config.rateLimits.originTier, configuration.STAGING_ORIGIN_TIER_RATE_LIMITS);
+    const workerEnv = createProductionWorkerEnv(config, { bindings: serviceBindings() });
+    for (const [name, value] of Object.entries(configuration.STAGING_CONTAINMENT_VARS)) {
+      assert.equal(workerEnv[name], value, name);
+    }
+    assert.equal(workerEnv.ENROLLMENT_MODE, "disabled");
+    assert.equal(workerEnv.ACCOUNTLESS_ENROLLMENT_MODE, "disabled");
+    assert.equal(workerEnv.ACCOUNTLESS_OWNERSHIP_MODE, "disabled");
+    assert.equal(workerEnv.SIGN_IN_START_MAX_PER_MINUTE, "5");
+    assert.equal(workerEnv.UPLOAD_INGRESS_MAX_CONCURRENT, "8");
+    assert.equal(Object.hasOwn(workerEnv, "INCREMENTAL_EXTERNAL_PARTICIPANTS"), false);
+    assert.equal(Reflect.get(workerEnv, "INCREMENTAL_EXTERNAL_PARTICIPANTS"), undefined);
+    assert.equal(Reflect.get(workerEnv, "STAGING_ADMISSION_MODE"), undefined);
+    assert.equal(workerEnv.ENVIRONMENT, "staging");
+    // Everything else is production's pinned configuration.
+    assert.equal(workerEnv.TELEMETRY_STORAGE_MODE, "typed");
+    assert.equal(workerEnv.PERFORMANCE_TELEMETRY_STORAGE_MODE, "enabled");
+    assert.equal(workerEnv.EDGE_ORIGIN_MODE, "cloudflare-worker-iam");
+    assert.equal(workerEnv.ALLOWANCE_RECONSTRUCTION_MODE, "resumable");
+  }
+
+  // The owner-reviewed rehearsal override opens accountless admission only.
+  const rehearsal = expectAccepted(stagingEnv({ ...open, STAGING_ADMISSION_MODE: "synthetic-rehearsal" }),
+    "staging");
+  assert.equal(rehearsal.stagingAdmissionMode, "synthetic-rehearsal");
+  assert.equal(rehearsal.vars.ACCOUNTLESS_ENROLLMENT_MODE, "enabled");
+  assert.equal(rehearsal.vars.ACCOUNTLESS_OWNERSHIP_MODE, "enabled");
+  assert.equal(rehearsal.vars.ENROLLMENT_MODE, "disabled");
+  assert.equal(rehearsal.vars.SIGN_IN_START_MAX_PER_MINUTE, "5");
+  assert.equal(Object.hasOwn(rehearsal.vars, "INCREMENTAL_EXTERNAL_PARTICIPANTS"), false);
+  assert.equal(rehearsal.rateLimits.originTier, configuration.STAGING_ORIGIN_TIER_RATE_LIMITS);
+
+  for (const value of ["", "open", "Closed", "synthetic_rehearsal", "real-clients", "__proto__", "constructor"]) {
+    expectCode(() => readProductionConfiguration(stagingEnv({ STAGING_ADMISSION_MODE: value }), "staging"),
+      "STAGING_ADMISSION_MODE_INVALID");
+  }
+  // Only the staging service reads the switch; everywhere else it is refused.
+  for (const value of ["closed", "synthetic-rehearsal", ""]) {
+    expectCode(() => readProductionConfiguration(productionEnv({ STAGING_ADMISSION_MODE: value }),
+      "production"), "STAGING_ADMISSION_MODE_FORBIDDEN");
+    for (const profile of JOB_PROFILES) {
+      expectCode(() => readProductionConfiguration(jobEnv(profile, { STAGING_ADMISSION_MODE: value }), profile),
+        "STAGING_ADMISSION_MODE_FORBIDDEN");
+    }
+  }
+});
+
+test("staging jobs run on the staging plane with its identity, origins and markers", () => {
+  for (const profile of ["staging-maintenance-job", "staging-analytics-job"]) {
+    const config = expectAccepted(jobEnv(profile, {
+      ENROLLMENT_MODE: "open",
+      INCREMENTAL_EXTERNAL_PARTICIPANTS: "authorized",
+    }), profile);
+    assert.equal(config.plane, "staging", profile);
+    assert.equal(config.environment, "staging", profile);
+    assert.equal(config.stagingAdmissionMode, null, profile);
+    assert.equal(config.edge, null, profile);
+    assert.deepEqual(config.origins, {
+      public: "https://staging.synthetic.example",
+      admin: "https://admin.staging.synthetic.example",
+      wwwHost: null,
+      host: null,
+    });
+    assert.equal(config.rateLimits.originTier, configuration.STAGING_ORIGIN_TIER_RATE_LIMITS);
+    const env = createProductionWorkerEnv(config);
+    assert.equal(env.ENVIRONMENT, "staging");
+    assert.equal(env.PUBLIC_ORIGIN, "https://staging.synthetic.example");
+    assert.equal(env.IDENTITY_LINK_SECRET_VERSION, "staging-v1");
+    assert.equal(env.ACCESS_AUD, "a".repeat(64));
+    assert.equal(env.ENROLLMENT_MODE, "disabled");
+    assert.equal(Reflect.get(env, "INCREMENTAL_EXTERNAL_PARTICIPANTS"), undefined);
+    assert.equal(env.TELEMETRY_STORAGE_NAMESPACE, "synthetic-staging-namespace");
+    for (const name of configuration.PRODUCTION_WORKER_BINDING_NAMES) {
+      assert.equal(Reflect.get(env, name), undefined, name);
+    }
+    const cases = [
+      [{ CLOUD_RUN_JOB: "tibotattle-maintenance" }, "CLOUD_RUN_JOB_STAGING_MARKER_MISSING"],
+      [{ CLOUD_RUN_JOB: "tibotattle-production-staging-maintenance" }, "CLOUD_RUN_JOB_PRODUCTION_VALUE_FORBIDDEN"],
+      [{ PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-primary" },
+        "PRIMARY_INSTANCE_CONNECTION_NAME_STAGING_MARKER_MISSING"],
+      [{ GCS_BUCKET_NAME: "synthetic-quarantine", GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("synthetic-quarantine") },
+        "GCS_BUCKET_NAME_STAGING_MARKER_MISSING"],
+      [{ ACCESS_AUD: configuration.PRODUCTION_VARS.ACCESS_AUD }, "ACCESS_AUD_PRODUCTION_VALUE_FORBIDDEN"],
+      [{ IDENTITY_LINK_SECRET_VERSION: "production-v1" },
+        "IDENTITY_LINK_SECRET_VERSION_PRODUCTION_VALUE_FORBIDDEN"],
+      [{ PUBLIC_ORIGIN: "https://tibotattle.com", ADMIN_HOST_ORIGIN: "https://admin.tibotattle.com" },
+        "PUBLIC_ORIGIN_PRODUCTION_VALUE_FORBIDDEN"],
+      [{ ADMIN_HOST_ORIGIN: "https://ops.other.example" }, "ADMIN_HOST_ORIGIN_INVALID"],
+      [without(jobEnv(profile), "PUBLIC_ORIGIN"), "PUBLIC_ORIGIN_MISSING"],
+      [without(jobEnv(profile), "APPLE_TEAM_ID"), "APPLE_TEAM_ID_MISSING"],
+    ];
+    for (const [overrides, code] of cases) {
+      const env = "DEPLOYMENT_SOURCE_COMMIT" in overrides ? overrides : jobEnv(profile, overrides);
+      expectCode(() => readProductionConfiguration(env, profile), code);
+    }
+  }
 });
 
 test("production and its jobs refuse staging-marked resources", () => {
@@ -809,8 +1110,7 @@ test("processEnv TELEMETRY_STORAGE_MODE=json keeps the pinned 'typed' in every p
   for (const [profile, env] of [
     ["production", productionEnv({ TELEMETRY_STORAGE_MODE: "json" })],
     ["staging", stagingEnv({ TELEMETRY_STORAGE_MODE: "json" })],
-    ["maintenance-job", jobEnv("maintenance-job", { TELEMETRY_STORAGE_MODE: "json" })],
-    ["analytics-job", jobEnv("analytics-job", { TELEMETRY_STORAGE_MODE: "json" })],
+    ...JOB_PROFILES.map((job) => [job, jobEnv(job, { TELEMETRY_STORAGE_MODE: "json" })]),
   ]) {
     const config = expectAccepted(env, profile);
     const workerEnv = createProductionWorkerEnv(config, profile.endsWith("-job") ? {} : {
@@ -838,6 +1138,50 @@ test("service envs require exactly the nine injected bindings", () => {
   }
   expectCode(() => createProductionWorkerEnv(config, {}), "PRODUCTION_BINDINGS_INVALID");
   expectCode(() => createProductionWorkerEnv(config), "PRODUCTION_BINDINGS_INVALID");
+  // Origin-tier limiters are PostgreSQL limiters; class instances are accepted there.
+  const originTier = Object.values(configuration.ORIGIN_TIER_RATE_LIMITS);
+  const postgresLimiter = (name) => canonical.rateLimiter.createPostgresRateLimiter(
+    { connect() { throw new Error("SYNTHETIC_POOL_UNUSED"); } },
+    {
+      name,
+      limit: 3_000,
+      periodSeconds: 60,
+      keyHashSecret: SECRET_VALUES.POSTGRES_RATE_LIMIT_SECRET,
+    },
+  );
+  const withOriginLimiters = createProductionWorkerEnv(config, { bindings: {
+    ...serviceBindings(),
+    ...Object.fromEntries(originTier.map(({ binding }) => [binding, postgresLimiter(binding)])),
+  } });
+  for (const { binding } of originTier) {
+    assert.ok(withOriginLimiters[binding] instanceof canonical.rateLimiter.PostgresRateLimiter, binding);
+  }
+  // Edge-tier names take only edge replay bindings, never a PostgreSQL limiter.
+  class SyntheticReplay {
+    async limit() { return { success: true }; }
+  }
+  const getterLimit = Object.freeze(Object.defineProperty({}, "limit", {
+    get() { return async () => ({ success: true }); },
+    enumerable: true,
+  }));
+  for (const name of configuration.EDGE_TIER_RATE_LIMIT_BINDINGS) {
+    for (const binding of [
+      postgresLimiter(name),
+      Object.freeze(postgresLimiter(name)),
+      Object.freeze(new SyntheticReplay()),
+      { async limit() { return { success: true }; } },
+      Object.freeze({ async limit() { return { success: true }; }, name }),
+      Object.freeze({ limit: limiter().limit, [Symbol("synthetic")]: true }),
+      getterLimit,
+    ]) {
+      expectCode(() => createProductionWorkerEnv(config, { bindings: { ...serviceBindings(), [name]: binding } }),
+        `${name}_BINDING_NOT_EDGE_REPLAY`);
+    }
+    const nullPrototype = Object.freeze(Object.assign(Object.create(null), { limit: limiter().limit }));
+    assert.equal(createProductionWorkerEnv(config, {
+      bindings: { ...serviceBindings(), [name]: nullPrototype },
+    })[name], nullPrototype, name);
+  }
   expectCode(() => createProductionWorkerEnv(config, { bindings: serviceBindings(), extra: true }),
     "PRODUCTION_ENV_OPTIONS_INVALID");
   expectCode(() => createProductionWorkerEnv(config, null), "PRODUCTION_ENV_OPTIONS_INVALID");
@@ -882,29 +1226,42 @@ test("the maintenance-job profile requires the enabled switch and carries it", (
     "PRODUCTION_JOB_BINDINGS_FORBIDDEN");
 });
 
-test("the analytics-job profile carries its switches with Worker semantics", () => {
-  const defaults = expectAccepted(jobEnv("analytics-job"), "analytics-job");
-  assert.deepEqual(defaults.jobSwitches, {
-    POSTGRES_ANALYTICS_MODE: "disabled",
-    POSTGRES_ANALYTICS_PUBLICATION_LANE: "disabled",
-    POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL: "disabled",
-  });
-  const enabled = expectAccepted(jobEnv("analytics-job", {
-    POSTGRES_ANALYTICS_MODE: "enabled",
-    POSTGRES_ANALYTICS_PUBLICATION_LANE: "",
-    POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL: "enabled",
-    POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: "enabled",
-  }), "analytics-job");
-  const env = createProductionWorkerEnv(enabled);
-  assert.equal(env.POSTGRES_ANALYTICS_MODE, "enabled");
-  assert.equal(env.POSTGRES_ANALYTICS_PUBLICATION_LANE, "disabled");
-  assert.equal(env.POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL, "enabled");
-  assert.equal(env.PUBLIC_ANALYTICS_MODE, "enabled");
-  assert.equal(Reflect.get(env, "POSTGRES_SCHEDULED_MAINTENANCE_ENABLED"), undefined);
-  for (const name of configuration.PRODUCTION_JOB_SWITCH_NAMES["analytics-job"]) {
-    for (const value of ["Enabled", "true", "on"]) {
-      expectCode(() => readProductionConfiguration(jobEnv("analytics-job", { [name]: value }),
-        "analytics-job"), `${name}_INVALID`);
+test("the analytics-job profiles carry their switches with Worker semantics", () => {
+  for (const profile of ["analytics-job", "staging-analytics-job"]) {
+    const defaults = expectAccepted(jobEnv(profile), profile);
+    assert.deepEqual(defaults.jobSwitches, {
+      POSTGRES_ANALYTICS_MODE: "disabled",
+      POSTGRES_ANALYTICS_PUBLICATION_LANE: "disabled",
+      POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL: "disabled",
+    });
+    const enabled = expectAccepted(jobEnv(profile, {
+      POSTGRES_ANALYTICS_MODE: "enabled",
+      POSTGRES_ANALYTICS_PUBLICATION_LANE: "",
+      POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL: "enabled",
+      POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: "enabled",
+    }), profile);
+    const env = createProductionWorkerEnv(enabled);
+    assert.equal(env.POSTGRES_ANALYTICS_MODE, "enabled");
+    assert.equal(env.POSTGRES_ANALYTICS_PUBLICATION_LANE, "disabled");
+    assert.equal(env.POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL, "enabled");
+    assert.equal(env.PUBLIC_ANALYTICS_MODE, "enabled");
+    assert.equal(Reflect.get(env, "POSTGRES_SCHEDULED_MAINTENANCE_ENABLED"), undefined);
+    assert.deepEqual(expectAccepted(jobEnv(profile, {
+      POSTGRES_ANALYTICS_MODE: "disabled",
+      POSTGRES_ANALYTICS_PUBLICATION_LANE: "disabled",
+      POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL: "",
+    }), profile).jobSwitches, defaults.jobSwitches);
+    // As STORAGE_ANALYTICS_MODE: only unset or 'disabled' is off; an empty
+    // value is a configuration error, never a silent no-op.
+    expectCode(() => readProductionConfiguration(jobEnv(profile, { POSTGRES_ANALYTICS_MODE: "" }), profile),
+      "POSTGRES_ANALYTICS_MODE_INVALID");
+    // The lane switches refuse what the Worker would read as off (documented
+    // as deliberately stricter in the module).
+    for (const name of configuration.PRODUCTION_JOB_SWITCH_NAMES[profile]) {
+      for (const value of ["Enabled", "true", "on", " enabled"]) {
+        expectCode(() => readProductionConfiguration(jobEnv(profile, { [name]: value }), profile),
+          `${name}_INVALID`);
+      }
     }
   }
   const service = createProductionWorkerEnv(
@@ -914,6 +1271,15 @@ test("the analytics-job profile carries its switches with Worker semantics", () 
   for (const names of Object.values(configuration.PRODUCTION_JOB_SWITCH_NAMES)) {
     for (const name of names) assert.equal(Reflect.get(service, name), undefined, name);
   }
+});
+
+test("the staging maintenance job requires the enabled switch too", () => {
+  expectCode(() => readProductionConfiguration(
+    without(jobEnv("staging-maintenance-job"), "POSTGRES_SCHEDULED_MAINTENANCE_ENABLED"),
+    "staging-maintenance-job"), "POSTGRES_SCHEDULED_MAINTENANCE_DISABLED");
+  const config = expectAccepted(jobEnv("staging-maintenance-job"), "staging-maintenance-job");
+  assert.deepEqual(config.jobSwitches, { POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: "enabled" });
+  assert.deepEqual(config.deployment.workload, { kind: "job", name: "tibotattle-staging-maintenance" });
 });
 
 // ---------------------------------------------------------------------------
