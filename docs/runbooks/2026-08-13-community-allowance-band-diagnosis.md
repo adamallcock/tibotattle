@@ -119,6 +119,17 @@ allowance publication. `admin_metrics_snapshot` and `admin_metrics_history_cache
 log refresh/failure timing or `OWNER_METRICS_BUDGET_DEFERRED`; a current cache is
 quiet. Their failure must not be reported as an allowance or database outage.
 
+In typed storage these are analytics tables, and the analytics scheduler writes
+them without logging the outcome. It captures `analytics_admin_metric_snapshots`
+and writes one `analytics_admin_metrics_history_publications` row per source
+and payload contract. The main Worker serves only its own contract's row. Before
+analytics migration 0027 it used the single source-keyed
+`analytics_admin_metrics_history_cache` row, which it still reads only when that
+row carries the same contract. A 503 `ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE`
+beside a fresh publication for another `schema_version` means the scheduler has
+not published the main Worker's contract yet. Deploy the Worker that is behind;
+do not edit or relabel rows. Compare `schema_version` and `generated_at` only.
+
 The independent owner-only `/api/v1/admin/reconstruction-progress` request
 shows exact requested/prepared/published generations and historical progress.
 A temporary storage failure preserves the last validated graph while this lane
