@@ -18,7 +18,7 @@ const TIMEOUTS = Object.freeze({
 });
 
 /** Closed inventory of every PostgreSQL primary relation carrying owner_digest
- * at migration 0046. New owner-bearing relations block retirement until they
+ * at migration 0053. New owner-bearing relations block retirement until they
  * receive an explicit deletion or retained-proof decision here.
  */
 const OWNER_DIGEST_TABLES = Object.freeze([
@@ -35,6 +35,11 @@ const OWNER_DIGEST_TABLES = Object.freeze([
   "analytics_publication_invalidations",
   "analytics_publication_owner_members",
   "analytics_scheduler_delivery_cursors",
+  // Retained proof, like storage_owner_erasure_receipts: source-proven
+  // erasure fences and their payload receipts (0053) refuse DELETE, so
+  // retirement neither deletes nor counts them as residue.
+  "analytics_storage_erasure_fences",
+  "analytics_storage_erasure_receipts",
   "storage_ingestion_changes",
   "storage_owner_erasure_receipts",
   // Retained tombstone: the owner's journal revision head (see
