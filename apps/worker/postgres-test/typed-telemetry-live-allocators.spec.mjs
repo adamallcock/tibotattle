@@ -84,7 +84,12 @@ async function stagedSql() {
   return sql;
 }
 
-/** Stock migrations, then the staged file in one bounded transaction (the CR-1 harness shape). */
+/**
+ * Stock migrations, then the staged file in one bounded transaction (the CR-1 harness shape).
+ * On promotion this spec applies 0052 through applyPostgresMigrations instead, and every
+ * primary migration count and tail pin in the Worker moves with it (plan integrationChecklist:
+ * "update every tail pin"); grep the current tail filename and count rather than trusting a list.
+ */
 async function applyStockMigrations(pool, schema) {
   const stock = await readPostgresMigrations({ role: "primary" });
   const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
@@ -515,6 +520,162 @@ test("PG17 the typed-legacy importer writes explicit ids into the 0052 identitie
     if (vite) await vite.close();
     if (targetCreated) await pool.query(`DROP SCHEMA "${targetSchema}" CASCADE`);
     if (controlCreated) await pool.query(`DROP SCHEMA "${controlSchema}" CASCADE`);
+    await pool.end();
+  }
+});
+
+/** Poll until `waitingPid` is blocked by `blockingPid`, bounded so a missing wait fails instead of hanging. */
+async function waitUntilBlocked(pool, waitingPid, blockingPid) {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const result = await pool.query(
+      "SELECT $2::integer = ANY(pg_catalog.pg_blocking_pids($1::integer)) AS blocked", [waitingPid, blockingPid],
+    );
+    if (result.rows[0]?.blocked === true) return;
+    assert.ok(Date.now() < deadline, "the restart never waited for the in-flight explicit-id import");
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+  }
+}
+
+test("PG17 staged 0052 restarts over already-imported rows, refuses drifted identities and waits for in-flight imports", {
+  skip: !PG_TEST_SOCKET,
+}, async () => {
+  const pool = await testPool();
+  const schema = `typed_live_alloc_${randomBytes(6).toString("hex")}`;
+  const schemaOptions = { primarySchema: schema };
+  const table = (name) => `"${schema}"."${name}"`;
+  const sequence = (name) => `"${schema}"."${name}_id_seq"`;
+  let vite;
+  let schemaCreated = false;
+  try {
+    const loaded = await loadAllocators();
+    vite = loaded.vite;
+    const { allocators } = loaded;
+    const verify = (client) => allocators.verifyPostgresTypedIdentityHeadroom(client, schemaOptions);
+    const restart = (client) => allocators.restartPostgresTypedIdentities(client, schemaOptions);
+
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    schemaCreated = true;
+    await applyStockMigrations(pool, schema);
+
+    // Rows imported before 0052 exists (ids to 500 everywhere, 700 on
+    // namespaces). Applying the migration alone, with no restart call, leaves
+    // every identity just above its own table's max(id).
+    assert.deepEqual(await insertTypedChain(pool, schema, { id: 500, tag: "pre-migration" }), everyTable(500));
+    await pool.query(`INSERT INTO ${table("typed_telemetry_namespaces")}(id, original_id) VALUES (700, $1)`,
+      [randomBytes(24)]);
+    await applyStagedMigration(pool, schema);
+    const applied = { ...everyTable(501), typed_telemetry_namespaces: "701" };
+    assert.deepEqual(await nextValues(pool, schema), applied);
+    await withClient(pool, verify);
+    assert.deepEqual(await insertTypedChain(pool, schema, { id: null, tag: "post-migration" }), applied);
+    const healthy = { ...everyTable(502), typed_telemetry_namespaces: "702" };
+    assert.deepEqual(await nextValues(pool, schema), healthy);
+
+    // Each drift runs in a transaction that is rolled back, after which the
+    // schema must be exactly as healthy as before (sequence state included).
+    const withRolledBack = async (label, operation) => {
+      await withClient(pool, async (client) => {
+        await client.query("BEGIN");
+        try {
+          await operation(client);
+        } finally {
+          await client.query("ROLLBACK");
+        }
+      });
+      assert.deepEqual(await nextValues(pool, schema), healthy, `${label} must roll back`);
+      await withClient(pool, verify);
+    };
+
+    // Every guard is reached on its own: each drift leaves the next value
+    // above max(id), so only the named property can fail the check.
+    const drifts = [
+      ["GENERATED ALWAYS rejects importer ids", async (client, name) => {
+        await client.query(`ALTER TABLE ${table(name)} ALTER COLUMN id SET GENERATED ALWAYS`);
+      }],
+      ["INCREMENT BY 2", async (client, name) => {
+        await client.query(`ALTER TABLE ${table(name)} ALTER COLUMN id SET INCREMENT BY 2`);
+      }],
+      ["CYCLE", async (client, name) => {
+        await client.query(`ALTER TABLE ${table(name)} ALTER COLUMN id SET CYCLE`);
+      }],
+      ["a same-named sequence that is not the column identity", async (client, name) => {
+        await client.query(`ALTER SEQUENCE ${sequence(name)} RENAME TO "${name}_id_seq_detached"`);
+        await client.query(`CREATE SEQUENCE ${sequence(name)} MINVALUE 1 MAXVALUE ${MAX_TYPED_ID} START WITH 1000`);
+      }],
+      ["the sequence MAXVALUE already issued", async (client, name) => {
+        await client.query(`ALTER TABLE ${table(name)} ALTER COLUMN id SET MAXVALUE 600 RESTART WITH 600`);
+        await verify(client);
+        await client.query(`SELECT pg_catalog.nextval('${sequence(name)}'::regclass)`);
+      }],
+      ["a next value above the retained id range", async (client, name) => {
+        await client.query(`ALTER TABLE ${table(name)} ALTER COLUMN id
+          SET MAXVALUE 9223372036854775807 RESTART WITH ${MAX_TYPED_ID + 1n}`);
+      }],
+      ["the last id in the range already issued", async (client, name) => {
+        await client.query(`ALTER TABLE ${table(name)} ALTER COLUMN id RESTART WITH ${MAX_TYPED_ID}`);
+        await verify(client);
+        await client.query(`SELECT pg_catalog.nextval('${sequence(name)}'::regclass)`);
+      }],
+    ];
+    for (const [index, [label, drift]] of drifts.entries()) {
+      const name = TYPED_TABLES[index];
+      await withRolledBack(`${name}: ${label}`, async (client) => {
+        await drift(client, name);
+        await assert.rejects(verify(client), isUnavailable, `${name}: ${label} must fail the headroom check`);
+      });
+    }
+
+    // An import at 2^53-2 restarts to 2^53-1, which verifies and allocates;
+    // after that the range is exhausted and the restart refuses.
+    await withRolledBack("restart to the last id", async (client) => {
+      await client.query(`INSERT INTO ${table("typed_telemetry_namespaces")}(id, original_id) VALUES ($1::bigint, $2)`,
+        [String(MAX_TYPED_ID - 1n), randomBytes(24)]);
+      await restart(client);
+      await verify(client);
+      const allocated = await client.query(`INSERT INTO ${table("typed_telemetry_namespaces")}(original_id)
+        VALUES ($1) RETURNING id::text AS id`, [randomBytes(24)]);
+      assert.equal(allocated.rows[0]?.id, String(MAX_TYPED_ID));
+      await assert.rejects(verify(client), isUnavailable);
+      await client.query("SAVEPOINT exhausted");
+      await assert.rejects(client.query(`SELECT "${schema}".typed_telemetry_restart_identities()`),
+        (error) => error?.code === "2200H" && error.message === "typed_telemetry_identity_exhausted");
+      await client.query("ROLLBACK TO SAVEPOINT exhausted");
+    });
+
+    // An explicit-id import still open when the restart starts. The up-front
+    // ACCESS EXCLUSIVE lock makes the restart wait for it and read max(id)
+    // afterwards; restarting from a max(id) read before the commit would hand
+    // out 702 while 900 exists.
+    const importer = await pool.connect();
+    const restarter = await pool.connect();
+    let importerOpen = false;
+    let restarted;
+    try {
+      await importer.query("BEGIN");
+      importerOpen = true;
+      await importer.query(`INSERT INTO ${table("typed_telemetry_namespaces")}(id, original_id) VALUES (900, $1)`,
+        [randomBytes(24)]);
+      const importerPid = (await importer.query("SELECT pg_catalog.pg_backend_pid() AS pid")).rows[0].pid;
+      const restarterPid = (await restarter.query("SELECT pg_catalog.pg_backend_pid() AS pid")).rows[0].pid;
+      await restarter.query("SET lock_timeout = '20s'");
+      restarted = restart(restarter).then(() => null, (error) => error);
+      await waitUntilBlocked(pool, restarterPid, importerPid);
+      await importer.query("COMMIT");
+      importerOpen = false;
+      assert.equal(await restarted, null);
+    } finally {
+      if (importerOpen) await importer.query("ROLLBACK").catch(() => {});
+      if (restarted) await restarted;
+      await restarter.query("RESET lock_timeout").catch(() => {});
+      importer.release();
+      restarter.release();
+    }
+    assert.deepEqual(await nextValues(pool, schema), { ...healthy, typed_telemetry_namespaces: "901" });
+    await withClient(pool, verify);
+  } finally {
+    if (vite) await vite.close();
+    if (schemaCreated) await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
     await pool.end();
   }
 });
