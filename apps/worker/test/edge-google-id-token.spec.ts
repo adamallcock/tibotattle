@@ -22,6 +22,8 @@ const MAX_TOKEN_RESPONSE_BYTES = 16_384;
 const CONSOLE_METHODS = ["log", "info", "warn", "error", "debug", "trace"] as const;
 
 const encoder = new TextEncoder();
+// Captured before any case installs fake timers.
+const realSetTimeout = globalThis.setTimeout;
 let audienceSequence = 0;
 
 // The token cache is per isolate and keyed by account + audience, so each
@@ -123,6 +125,19 @@ function fakeIdToken(claims: Record<string, unknown>): string {
     jsonSegment({ iss: "https://accounts.google.com", ...claims }),
     base64Url(crypto.getRandomValues(new Uint8Array(256))),
   ].join(".");
+}
+
+// Lengthens a token's signature segment so the token is exactly `length`
+// characters and still three base64url segments.
+function paddedIdToken(token: string, length: number): string {
+  if (token.length > length) throw new Error("token already too long");
+  return `${token}${"A".repeat(length - token.length)}`;
+}
+
+function tokenSegments(token: string): [string, string, string] {
+  const segments = token.split(".");
+  if (segments.length !== 3) throw new Error("not a three-segment token");
+  return segments as [string, string, string];
 }
 
 interface Exchange {
@@ -338,14 +353,24 @@ describe("edge Google ID-token source: the JWT-bearer exchange", () => {
       .toThrow(/Invalid redirect value/u);
   });
 
-  it("uses the global fetch when no fetcher is injected", async () => {
+  it("uses the global fetch when no fetcher is injected, called without a foreign receiver", async () => {
     const audience = freshAudience();
     const realFetch = globalThis.fetch;
     const calls: string[] = [];
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const receivers: unknown[] = [];
+    // A non-arrow function sees its real receiver. workerd's fetch throws
+    // "Illegal invocation" for any receiver other than undefined or the
+    // global scope, which this Workers pool does not reproduce, so the
+    // receiver itself is the pinned contract.
+    globalThis.fetch = async function recordingGlobalFetch(
+      this: unknown,
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> {
+      receivers.push(this);
       calls.push(`${String(input)} ${init?.method ?? ""}`);
       return tokenResponse(mintedToken(audience, Date.now));
-    }) as typeof fetch;
+    } as typeof fetch;
     try {
       const source = await createGoogleIdTokenSource({
         serviceAccountKeyJson: keyJson(primary),
@@ -357,6 +382,27 @@ describe("edge Google ID-token source: the JWT-bearer exchange", () => {
       globalThis.fetch = realFetch;
     }
     expect(calls).toEqual([`${GOOGLE_OAUTH_TOKEN_URL} POST`]);
+    expect(receivers).toHaveLength(1);
+    expect(receivers[0] === undefined || receivers[0] === globalThis).toBe(true);
+  });
+
+  it("calls an injected fetcher as a plain function, so the runtime's own fetch can be injected", async () => {
+    const audience = freshAudience();
+    const receivers: unknown[] = [];
+    const source = await createGoogleIdTokenSource({
+      serviceAccountKeyJson: keyJson(primary),
+      expectedServiceAccount: SERVICE_ACCOUNT,
+      audience,
+      fetcher: async function injectedFetcher(this: unknown): Promise<Response> {
+        receivers.push(this);
+        return tokenResponse(mintedToken(audience, () => T0));
+      },
+      clock: () => T0,
+    });
+    await expect(source.getToken()).resolves.toMatch(/^[^.]+\.[^.]+\.[^.]+$/u);
+    // Called as a method, the receiver would be the source's internal context
+    // and an injected `fetch` would throw "Illegal invocation" in workerd.
+    expect(receivers).toEqual([undefined]);
   });
 });
 
@@ -404,6 +450,30 @@ describe("edge Google ID-token source: cache, single flight and negative cache",
     expect(recorder.exchanges).toHaveLength(1);
     clock.now = T0 + (3_600 - 300) * 1_000;
     await source.getToken();
+    expect(recorder.exchanges).toHaveLength(2);
+  });
+
+  it("refreshes by the token's own exp when it is shorter than the one-hour cap", async () => {
+    const audience = freshAudience();
+    const clock = { now: T0 };
+    // Ten minutes of validity, as seen by this clock: a short-lived token or a
+    // Worker clock running ahead of the issuer's.
+    const recorder = recordingFetcher(() => tokenResponse(
+      mintedToken(audience, () => clock.now, { exp: Math.floor(clock.now / 1_000) + 600 }),
+    ));
+    const source = await createGoogleIdTokenSource({
+      serviceAccountKeyJson: keyJson(primary),
+      expectedServiceAccount: SERVICE_ACCOUNT,
+      audience,
+      fetcher: recorder.fetcher,
+      clock: () => clock.now,
+    });
+    const first = await source.getToken();
+    clock.now = T0 + (600 - 300 - 1) * 1_000;
+    await expect(source.getToken()).resolves.toBe(first);
+    expect(recorder.exchanges).toHaveLength(1);
+    clock.now = T0 + (600 - 300) * 1_000;
+    await expect(source.getToken()).resolves.not.toBe(first);
     expect(recorder.exchanges).toHaveLength(2);
   });
 
@@ -591,14 +661,38 @@ describe("edge Google ID-token source: every exchange failure is content-free", 
     { name: "a missing id_token", respond: () => Response.json({ access_token: BODY_MARKER, token_type: "Bearer" }) },
     { name: "a non-string id_token", respond: () => Response.json({ id_token: { value: BODY_MARKER } }) },
     { name: "an id_token without three segments", respond: () => Response.json({ id_token: `${BODY_MARKER}.segment` }) },
+    {
+      // Only the segment count is wrong: the payload is valid.
+      name: "an otherwise valid id_token with two segments",
+      respond: (audience, now) => {
+        const [header, payload] = tokenSegments(mintedToken(audience, now));
+        return tokenResponse(`${header}.${payload}`);
+      },
+    },
+    {
+      name: "an otherwise valid id_token with four segments",
+      respond: (audience, now) => {
+        const [header, payload, signature] = tokenSegments(mintedToken(audience, now));
+        return tokenResponse(`${header}.${payload}.${signature}.${signature}`);
+      },
+    },
     { name: "an id_token whose payload is not JSON", respond: () => Response.json({ id_token: `header.${base64Url(encoder.encode(BODY_MARKER))}.signature` }) },
     { name: "an id_token over the origin's bearer bound", respond: (audience, now) => Response.json({ id_token: `${mintedToken(audience, now)}${"A".repeat(8_192)}` }) },
+    {
+      name: "an id_token one character over the origin's bearer bound",
+      respond: (audience, now) => tokenResponse(paddedIdToken(mintedToken(audience, now), 8_192 - "Bearer ".length + 1)),
+    },
     { name: "a wrong aud", respond: (_, now) => tokenResponse(mintedToken("https://other-origin.synthetic.test", now)) },
     { name: "an aud array", respond: (audience, now) => tokenResponse(mintedToken(audience, now, { aud: [audience] })) },
     { name: "a wrong email", respond: (audience, now) => tokenResponse(mintedToken(audience, now, { email: OTHER_SERVICE_ACCOUNT })) },
     { name: "a missing email", respond: (audience, now) => tokenResponse(mintedToken(audience, now, { email: undefined })) },
+    { name: "email_verified false", respond: (audience, now) => tokenResponse(mintedToken(audience, now, { email_verified: false })) },
+    { name: "a missing email_verified", respond: (audience, now) => tokenResponse(mintedToken(audience, now, { email_verified: undefined })) },
+    { name: "a string email_verified", respond: (audience, now) => tokenResponse(mintedToken(audience, now, { email_verified: "true" })) },
     { name: "an expired token", respond: (audience, now) => tokenResponse(mintedToken(audience, now, { exp: Math.floor(now() / 1_000) })) },
-    { name: "a non-integer exp", respond: (audience, now) => tokenResponse(mintedToken(audience, now, { exp: `${Math.floor(now() / 1_000) + 3_600}` })) },
+    { name: "a string exp", respond: (audience, now) => tokenResponse(mintedToken(audience, now, { exp: `${Math.floor(now() / 1_000) + 3_600}` })) },
+    { name: "a fractional exp", respond: (audience, now) => tokenResponse(mintedToken(audience, now, { exp: Math.floor(now() / 1_000) + 3_600.5 })) },
+    { name: "an exp beyond the safe integers", respond: (audience, now) => tokenResponse(mintedToken(audience, now, { exp: 2 ** 53 })) },
     { name: "a network error", respond: () => Promise.reject(new TypeError(`network failure ${BODY_MARKER}`)) },
     { name: "a non-Response result", respond: () => ({ status: 200, body: BODY_MARKER }) as unknown as Response },
   ];
@@ -681,6 +775,17 @@ describe("edge Google ID-token source: every exchange failure is content-free", 
     await expect(source.getToken()).resolves.toMatch(/^[^.]+\.[^.]+\.[^.]+$/u);
   });
 
+  it("accepts an id_token at the origin's bearer bound (8192 characters less 'Bearer ')", async () => {
+    let served = "";
+    const { source } = await harness((audience, clock) => () => {
+      served = paddedIdToken(mintedToken(audience, () => clock.now), 8_192 - "Bearer ".length);
+      return tokenResponse(served);
+    });
+    const token = await source.getToken();
+    expect(served).toHaveLength(8_185);
+    expect(token).toBe(served);
+  });
+
   it("rejects a fetcher that throws synchronously", async () => {
     const audience = freshAudience();
     const source = await createGoogleIdTokenSource({
@@ -693,6 +798,21 @@ describe("edge Google ID-token source: every exchange failure is content-free", 
       clock: () => T0,
     });
     expectCodeWithoutSecrets(await rejection(source.getToken()), EDGE_TOKEN_UNAVAILABLE, [BODY_MARKER]);
+  });
+
+  it("rejects a throwing clock with EDGE_TOKEN_UNAVAILABLE and without a fetch", async () => {
+    const recorder = recordingFetcher(() => new Response(BODY_MARKER));
+    const source = await createGoogleIdTokenSource({
+      serviceAccountKeyJson: keyJson(primary),
+      expectedServiceAccount: SERVICE_ACCOUNT,
+      audience: freshAudience(),
+      fetcher: recorder.fetcher,
+      clock: () => {
+        throw new Error(`clock failure ${BODY_MARKER}`);
+      },
+    });
+    expectCodeWithoutSecrets(await rejection(source.getToken()), EDGE_TOKEN_UNAVAILABLE, [BODY_MARKER]);
+    expect(recorder.exchanges).toHaveLength(0);
   });
 
   it("rejects an unusable clock without a fetch", async () => {
@@ -722,6 +842,46 @@ describe("edge Google ID-token source: the 5 s deadline", () => {
     await vi.advanceTimersByTimeAsync(0);
     return state;
   }
+
+  const TOKEN_SHAPE = /^[^.]+\.[^.]+\.[^.]+$/u;
+
+  // A cancelled request loses its timers with it. Installed after the fake
+  // timers, this drops the next timer set (the originating request's exchange
+  // deadline) so that exchange's fetch can stay pending forever.
+  function dropOriginatorDeadline(): { dropped: () => boolean; restore: () => void } {
+    const fakeSetTimeout = globalThis.setTimeout;
+    let pending = true;
+    const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+      handler: () => void,
+      milliseconds?: number,
+    ) => {
+      if (pending) {
+        pending = false;
+        return 0;
+      }
+      return fakeSetTimeout(handler, milliseconds);
+    }) as unknown as typeof setTimeout);
+    return { dropped: () => !pending, restore: () => spy.mockRestore() };
+  }
+
+  // Resolves to the promise's value, or to "still-pending" after `milliseconds`
+  // of real time, so a caller that wrongly waits on a fake timer fails fast.
+  function withinRealTime<T>(promise: Promise<T>, milliseconds: number): Promise<T | "still-pending"> {
+    return Promise.race([
+      promise,
+      new Promise<"still-pending">((resolve) => realSetTimeout(() => resolve("still-pending"), milliseconds)),
+    ]);
+  }
+
+  // The first exchange is orphaned (its fetch never settles); later ones mint.
+  const orphanThenMint = (called: { resolve: () => void }): ResponderFactory =>
+    (audience, providerClock) => (_, index) => {
+      if (index === 0) {
+        called.resolve();
+        return new Promise<Response>(() => undefined);
+      }
+      return tokenResponse(mintedToken(audience, () => providerClock.now));
+    };
 
   it("aborts an exchange whose headers do not arrive within 5 s", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -822,32 +982,13 @@ describe("edge Google ID-token source: the 5 s deadline", () => {
 
   it("frees an exchange orphaned by a cancelled originating request after a joiner's own 6 s wait", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const fakeSetTimeout = globalThis.setTimeout;
-    let originatorTimerPending = true;
-    // A cancelled request loses its timers with it: drop the originator's
-    // exchange deadline and leave its fetch pending forever.
-    const timerSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
-      handler: () => void,
-      milliseconds?: number,
-    ) => {
-      if (originatorTimerPending) {
-        originatorTimerPending = false;
-        return 0;
-      }
-      return fakeSetTimeout(handler, milliseconds);
-    }) as unknown as typeof setTimeout);
+    const timers = dropOriginatorDeadline();
     try {
       const called = deferred();
-      const { source, recorder } = await harness((audience, providerClock) => (_, index) => {
-        if (index === 0) {
-          called.resolve();
-          return new Promise<Response>(() => undefined);
-        }
-        return tokenResponse(mintedToken(audience, () => providerClock.now));
-      });
+      const { source, recorder } = await harness(orphanThenMint(called));
       void source.getToken();
       await called.promise;
-      expect(originatorTimerPending).toBe(false);
+      expect(timers.dropped()).toBe(true);
 
       const joined = source.getToken();
       const joinedOutcome = rejection(joined);
@@ -857,10 +998,183 @@ describe("edge Google ID-token source: the 5 s deadline", () => {
       expectCodeWithoutSecrets(await joinedOutcome, EDGE_TOKEN_UNAVAILABLE, []);
 
       // An orphan is not a provider failure: no negative cache, a fresh mint.
-      await expect(source.getToken()).resolves.toMatch(/^[^.]+\.[^.]+\.[^.]+$/u);
+      await expect(source.getToken()).resolves.toMatch(TOKEN_SHAPE);
       expect(recorder.exchanges).toHaveLength(2);
     } finally {
-      timerSpy.mockRestore();
+      timers.restore();
+    }
+  });
+
+  it("replaces an orphaned exchange found 6 s or more after it started instead of joining it", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const timers = dropOriginatorDeadline();
+    try {
+      const called = deferred();
+      const { source, recorder, clock } = await harness(orphanThenMint(called));
+      void source.getToken();
+      await called.promise;
+      expect(timers.dropped()).toBe(true);
+
+      // Ten minutes later no fake timer is advanced: a caller that joined the
+      // orphan would never settle here.
+      clock.now = T0 + 600_000;
+      await expect(withinRealTime(source.getToken(), 2_000)).resolves.toMatch(TOKEN_SHAPE);
+      expect(recorder.exchanges).toHaveLength(2);
+    } finally {
+      timers.restore();
+    }
+  });
+
+  it("bounds a late joiner by the exchange's age, not by when it joined", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const timers = dropOriginatorDeadline();
+    try {
+      const called = deferred();
+      const { source, recorder, clock } = await harness(orphanThenMint(called));
+      void source.getToken();
+      await called.promise;
+
+      await vi.advanceTimersByTimeAsync(5_500);
+      clock.now = T0 + 5_500;
+      const joined = source.getToken();
+      const joinedOutcome = rejection(joined);
+      await vi.advanceTimersByTimeAsync(499);
+      expect(await settledState(joined)).toBe("pending");
+      clock.now = T0 + 6_000;
+      await vi.advanceTimersByTimeAsync(1);
+      // 0.5 s after joining, not 6 s: the orphan's own budget has run out.
+      expect(await settledState(joined)).toBe("settled");
+      expectCodeWithoutSecrets(await joinedOutcome, EDGE_TOKEN_UNAVAILABLE, []);
+
+      clock.now = T0 + 6_020;
+      await expect(withinRealTime(source.getToken(), 2_000)).resolves.toMatch(TOKEN_SHAPE);
+      expect(recorder.exchanges).toHaveLength(2);
+    } finally {
+      timers.restore();
+    }
+  });
+
+  it("hands a joiner whose wait ends late the newer exchange that replaced its orphan", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const timers = dropOriginatorDeadline();
+    try {
+      const called = deferred();
+      const secondCalled = deferred();
+      const secondGate = deferred();
+      const { source, recorder, clock } = await harness((audience, providerClock) => async (_, index) => {
+        if (index === 0) {
+          called.resolve();
+          return new Promise<Response>(() => undefined);
+        }
+        secondCalled.resolve();
+        await secondGate.promise;
+        return tokenResponse(mintedToken(audience, () => providerClock.now));
+      });
+      void source.getToken();
+      await called.promise;
+      const joined = source.getToken();
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      // The joiner's timer runs late against the clock: a new caller already
+      // sees the orphan as 6 s old and replaces it.
+      clock.now = T0 + 6_000;
+      const replacing = source.getToken();
+      await secondCalled.promise;
+      expect(recorder.exchanges).toHaveLength(2);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      // The joiner's wait has ended; it is now waiting on the newer exchange.
+      expect(await settledState(joined)).toBe("pending");
+      secondGate.resolve();
+      const [joinedToken, replacingToken] = await Promise.all([joined, replacing]);
+      expect(joinedToken).toBe(replacingToken);
+      expect(recorder.exchanges).toHaveLength(2);
+    } finally {
+      timers.restore();
+    }
+  });
+
+  it("caches a slow exchange that succeeds after a joiner freed its slot, when nothing newer started", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const timers = dropOriginatorDeadline();
+    try {
+      const called = deferred();
+      let settleSlow!: (response: Response) => void;
+      const { source, recorder, audience } = await harness(() => (_, index) => {
+        if (index === 0) {
+          called.resolve();
+          return new Promise<Response>((resolve) => { settleSlow = resolve; });
+        }
+        return new Response(BODY_MARKER, { status: 500 });
+      });
+      const slow = source.getToken();
+      await called.promise;
+      const joinedOutcome = rejection(source.getToken());
+      await vi.advanceTimersByTimeAsync(6_000);
+      expectCodeWithoutSecrets(await joinedOutcome, EDGE_TOKEN_UNAVAILABLE, []);
+
+      settleSlow(tokenResponse(mintedToken(audience, () => T0)));
+      const token = await slow;
+      await expect(source.getToken()).resolves.toBe(token);
+      expect(recorder.exchanges).toHaveLength(1);
+    } finally {
+      timers.restore();
+    }
+  });
+
+  it("does not let a replaced orphan's late success overwrite the newer token", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const timers = dropOriginatorDeadline();
+    try {
+      const called = deferred();
+      let settleOrphan!: (response: Response) => void;
+      const { source, recorder, clock, audience } = await harness((providerAudience, providerClock) => (_, index) => {
+        if (index === 0) {
+          called.resolve();
+          return new Promise<Response>((resolve) => { settleOrphan = resolve; });
+        }
+        return tokenResponse(mintedToken(providerAudience, () => providerClock.now));
+      });
+      const orphan = source.getToken();
+      await called.promise;
+
+      clock.now = T0 + 6_000;
+      const replacement = await source.getToken();
+      settleOrphan(tokenResponse(mintedToken(audience, () => T0)));
+      await expect(orphan).resolves.not.toBe(replacement);
+      await expect(source.getToken()).resolves.toBe(replacement);
+      expect(recorder.exchanges).toHaveLength(2);
+    } finally {
+      timers.restore();
+    }
+  });
+
+  it("ignores a replaced orphan that settles late: no clobbered token, no negative cache", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const timers = dropOriginatorDeadline();
+    try {
+      const called = deferred();
+      let settleOrphan!: (response: Response) => void;
+      const { source, recorder, clock } = await harness((audience, providerClock) => (_, index) => {
+        if (index === 0) {
+          called.resolve();
+          return new Promise<Response>((resolve) => { settleOrphan = resolve; });
+        }
+        return tokenResponse(mintedToken(audience, () => providerClock.now));
+      });
+      const orphanOutcome = rejection(source.getToken());
+      await called.promise;
+
+      clock.now = T0 + 6_000;
+      const replacement = await source.getToken();
+      expect(recorder.exchanges).toHaveLength(2);
+
+      settleOrphan(new Response(BODY_MARKER, { status: 500 }));
+      expectCodeWithoutSecrets(await orphanOutcome, EDGE_TOKEN_UNAVAILABLE, [BODY_MARKER]);
+      await expect(source.getToken()).resolves.toBe(replacement);
+      expect(recorder.exchanges).toHaveLength(2);
+    } finally {
+      timers.restore();
     }
   });
 });
@@ -921,6 +1235,79 @@ describe("edge Google ID-token source: invoker key validation", () => {
       expectCodeWithoutSecrets(error, EDGE_INVOKER_KEY_INVALID, keySecrets(primary));
     });
   }
+
+  // The EP-0 contract vectors for isEdgeServiceAccountEmail and
+  // isEdgeOriginAudience (edge-origin-contract-vectors.ts). The source keeps
+  // private copies of those shapes until EP-0 lands; these tables keep the
+  // copies identical at every edge, so swapping in the imports changes nothing.
+  const VALID_SERVICE_ACCOUNTS: readonly string[] = [
+    SERVICE_ACCOUNT,
+    "abcdef@ghijkl.iam.gserviceaccount.com",
+    `a${"b".repeat(28)}c@d${"e".repeat(28)}f.iam.gserviceaccount.com`,
+  ];
+  const INVALID_SERVICE_ACCOUNTS: readonly (readonly [unknown, string])[] = [
+    [undefined, "absent"],
+    ["", "empty"],
+    ["Edge-invoker@synthetic-edge-0.iam.gserviceaccount.com", "uppercase"],
+    ["edge@synthetic-edge-0.iam.gserviceaccount.com", "a four-character local part"],
+    ["abcde@synthetic-edge-0.iam.gserviceaccount.com", "a five-character local part"],
+    [`a${"b".repeat(29)}c@synthetic-edge-0.iam.gserviceaccount.com`, "a 31-character local part"],
+    ["edge-invoker-@synthetic-edge-0.iam.gserviceaccount.com", "a local part ending in a hyphen"],
+    ["1edge-invoker@synthetic-edge-0.iam.gserviceaccount.com", "a local part starting with a digit"],
+    ["edge-invoker@edge.iam.gserviceaccount.com", "a four-character project"],
+    ["edge-invoker@abcde.iam.gserviceaccount.com", "a five-character project"],
+    [`edge-invoker@a${"b".repeat(29)}c.iam.gserviceaccount.com`, "a 31-character project"],
+    ["edge-invoker@synthetic-edge-0.iam.gserviceaccount.com.synthetic.example", "suffixed"],
+    ["123456789012-compute@developer.gserviceaccount.com", "the default compute account"],
+    ["edge-invoker@synthetic-edge-0.iam.gserviceaccount.co", "the wrong domain"],
+    [`${SERVICE_ACCOUNT} `, "trailing-spaced"],
+    [42, "a number"],
+  ];
+  const VALID_AUDIENCES: readonly string[] = ["a", "a".repeat(256), "edge origin"];
+  const INVALID_AUDIENCES: readonly (readonly [unknown, string])[] = [
+    [undefined, "absent"],
+    ["", "empty"],
+    [" ", "a lone space"],
+    [" aud", "leading-spaced"],
+    ["aud ", "trailing-spaced"],
+    [" https://origin.synthetic.test", "a leading-spaced URL"],
+    ["https://origin.synthetic.test ", "a trailing-spaced URL"],
+    ["a".repeat(257), "257 characters"],
+    ["a\u0000b", "holding NUL"],
+    ["a\nb", "holding a line feed"],
+    ["a\u007fb", "holding DEL"],
+    ["\u00e9", "non-ASCII"],
+    [42, "a number"],
+  ];
+
+  for (const [account, label] of INVALID_SERVICE_ACCOUNTS) {
+    it(`refuses an expected account that is ${label}, even when the key names it`, async () => {
+      const error = await rejection(createGoogleIdTokenSource(baseOptions({
+        serviceAccountKeyJson: keyJson(primary, { client_email: account }),
+        expectedServiceAccount: account,
+      }) as never));
+      expectCodeWithoutSecrets(error, EDGE_INVOKER_KEY_INVALID, keySecrets(primary));
+    });
+  }
+
+  for (const [audience, label] of INVALID_AUDIENCES) {
+    it(`refuses an audience that is ${label}`, async () => {
+      const error = await rejection(createGoogleIdTokenSource(baseOptions({ audience }) as never));
+      expectCodeWithoutSecrets(error, EDGE_INVOKER_KEY_INVALID, keySecrets(primary));
+    });
+  }
+
+  it("accepts every account and audience shape the edge origin configuration accepts", async () => {
+    for (const account of VALID_SERVICE_ACCOUNTS) {
+      await expect(createGoogleIdTokenSource(baseOptions({
+        serviceAccountKeyJson: keyJson(primary, { client_email: account }),
+        expectedServiceAccount: account,
+      }) as never)).resolves.toBeDefined();
+    }
+    for (const audience of VALID_AUDIENCES) {
+      await expect(createGoogleIdTokenSource(baseOptions({ audience }) as never)).resolves.toBeDefined();
+    }
+  });
 
   it("accepts exactly 8 KiB of key JSON and makes no fetch while constructing", async () => {
     const json = paddedKeyJson(primary, MAX_SERVICE_ACCOUNT_KEY_JSON_BYTES);

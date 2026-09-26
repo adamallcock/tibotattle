@@ -14,15 +14,23 @@ import { encodeBase64Url } from "./crypto";
  *   The parsed JSON is not retained; only the key id, the account and the
  *   CryptoKey survive construction.
  * - Minted tokens are cached per isolate, keyed by account and audience, and
- *   served while more than five minutes of validity remain. Concurrent callers
- *   share one in-flight exchange (each under its own bounded wait), and a
- *   failed exchange makes every caller fail fast for ten seconds so an outage
- *   cannot amplify into a token-endpoint stampede.
+ *   served while more than five minutes of validity remain (never past the
+ *   token's own exp, never longer than one hour). Concurrent callers share one
+ *   in-flight exchange; a joiner waits at most until six seconds after that
+ *   exchange started, and an exchange older than that is treated as orphaned
+ *   and replaced. A failed exchange makes every caller fail fast for ten
+ *   seconds so an outage cannot amplify into a token-endpoint stampede.
  * - Every exchange is bounded: one fixed URL, a five-second deadline covering
  *   the headers and the body, and a 16 KiB streaming cap on the response.
+ * - A token is accepted only when its payload names the configured audience,
+ *   the expected account with email_verified true (the origin's own rule), and
+ *   an integer exp still in the future.
  * - Every failure is the same content-free error. Messages never carry the
  *   provider body, the signed assertion, a token, or key material, and this
  *   module never writes to the console.
+ * - The injected fetcher is always called as a plain function, never as a
+ *   method: workerd's global fetch throws "Illegal invocation" when called
+ *   with a foreign `this`, so passing `fetch` itself must keep working.
  *
  * Redirects are refused with `redirect: "manual"` plus the exact-200 check.
  * workerd rejects `redirect: "error"` outright ("won't be implemented since it
@@ -40,7 +48,12 @@ export const MAX_SERVICE_ACCOUNT_KEY_JSON_BYTES = 8_192;
 export const ID_TOKEN_REFRESH_MARGIN_MILLISECONDS = 300_000;
 export const ID_TOKEN_NEGATIVE_CACHE_MILLISECONDS = 10_000;
 export const TOKEN_EXCHANGE_TIMEOUT_MILLISECONDS = 5_000;
-/** How long a caller that joined another request's exchange waits for it. */
+/**
+ * The age at which an in-flight exchange is treated as orphaned. A live
+ * exchange settles within its own 5 s deadline, so a joiner waits at most
+ * until this long after the exchange started, and a caller that finds an
+ * exchange at least this old replaces it instead of joining.
+ */
 export const IN_FLIGHT_JOIN_TIMEOUT_MILLISECONDS = TOKEN_EXCHANGE_TIMEOUT_MILLISECONDS + 1_000;
 export const MAX_TOKEN_RESPONSE_BYTES = 16_384;
 export const ASSERTION_LIFETIME_SECONDS = 3_600;
@@ -51,16 +64,21 @@ export const MAX_ID_TOKEN_CHARACTERS = 8_192 - "Bearer ".length;
 
 const MIN_RSA_MODULUS_BITS = 2_048;
 const MAX_CACHED_IDENTITIES = 16;
-// The same account and audience shapes the edge origin configuration accepts
-// for EDGE_INVOKER_SERVICE_ACCOUNT and EDGE_ORIGIN_AUDIENCE.
+// Verbatim copies of the EP-0 edge/origin contract's shapes for
+// EDGE_INVOKER_SERVICE_ACCOUNT (isEdgeServiceAccountEmail) and
+// EDGE_ORIGIN_AUDIENCE (isEdgeOriginAudience): a user-managed account with a
+// 6-30 character account id and project id, and 1-256 printable ASCII
+// characters without leading or trailing spaces. The spec pins both edges so
+// swapping in the EP-0 imports stays behaviour-preserving.
 const SERVICE_ACCOUNT_PATTERN =
   /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/u;
-const AUDIENCE_PATTERN = /^[\x20-\x7e]{1,256}$/u;
+const AUDIENCE_PATTERN = /^[!-~](?:[ -~]{0,254}[!-~])?$/u;
 const PRIVATE_KEY_ID_PATTERN = /^[0-9a-f]{40}$/u;
 const PKCS8_PEM_PATTERN =
   /^-----BEGIN PRIVATE KEY-----\r?\n((?:[A-Za-z0-9+/=]{1,76}\r?\n)+)-----END PRIVATE KEY-----(?:\r?\n)?$/u;
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 const JWT_PATTERN = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u;
+const JOIN_WAIT_EXPIRED: unique symbol = Symbol("join-wait-expired");
 const encoder = new TextEncoder();
 
 export type EdgeGoogleIdTokenErrorCode =
@@ -97,11 +115,19 @@ export interface GoogleIdTokenSource {
   getToken(): Promise<string>;
 }
 
+interface InFlightExchange {
+  readonly generation: number;
+  readonly startedAtMilliseconds: number;
+  readonly promise: Promise<string>;
+}
+
 interface IdentityTokenState {
   token: string | null;
   expiresAtMilliseconds: number;
   unavailableUntilMilliseconds: number;
-  inFlight: Promise<string> | null;
+  /** Increments per exchange, so a late-settling exchange can tell it was superseded. */
+  generation: number;
+  inFlight: InFlightExchange | null;
 }
 
 // Per-isolate cache. The token is minted for exactly one account and one
@@ -121,6 +147,7 @@ function identityState(serviceAccount: string, audience: string): IdentityTokenS
     token: null,
     expiresAtMilliseconds: 0,
     unavailableUntilMilliseconds: 0,
+    generation: 0,
     inFlight: null,
   };
   isolateTokenStates.set(key, created);
@@ -136,7 +163,8 @@ function tokenUnavailable(): EdgeGoogleIdTokenError {
 }
 
 function defaultFetcher(input: string, init: RequestInit): Promise<Response> {
-  // Called as a plain function: workerd refuses fetch with a foreign `this`.
+  // Read at call time and called as a plain function: workerd refuses fetch
+  // with a foreign `this`.
   return fetch(input, init);
 }
 
@@ -381,9 +409,13 @@ function acceptedIdToken(
   const payloadBytes = payloadSegment === undefined ? null : decodeBase64Url(payloadSegment);
   const payload = payloadBytes === null ? null : decodeJsonObject(payloadBytes);
   const expiresAtSeconds = payload?.["exp"];
+  // The origin requires aud, email and email_verified true; a token it would
+  // always refuse must fail here (and start the negative cache) rather than
+  // be cached as good.
   if (payload === null
       || payload["aud"] !== context.audience
       || payload["email"] !== context.serviceAccount
+      || payload["email_verified"] !== true
       || typeof expiresAtSeconds !== "number"
       || !Number.isSafeInteger(expiresAtSeconds)
       || expiresAtSeconds * 1_000 <= nowMilliseconds) {
@@ -405,10 +437,14 @@ async function mintIdToken(context: MintContext, nowMilliseconds: number): Promi
     assertion,
   }).toString();
   const deadline = startDeadline(TOKEN_EXCHANGE_TIMEOUT_MILLISECONDS);
+  // Never `context.fetcher(...)`: that passes the context as `this`, and
+  // workerd's global fetch rejects any foreign receiver with "Illegal
+  // invocation", so an injected `fetch` would fail every exchange.
+  const { fetcher } = context;
   try {
     let pending: Promise<Response>;
     try {
-      pending = Promise.resolve(context.fetcher(GOOGLE_OAUTH_TOKEN_URL, {
+      pending = Promise.resolve(fetcher(GOOGLE_OAUTH_TOKEN_URL, {
         method: "POST",
         headers: {
           accept: "application/json",
@@ -482,72 +518,136 @@ export async function createGoogleIdTokenSource(
   const state = identityState(expectedServiceAccount, audience);
 
   function now(): number {
-    const value = clock();
+    let value: unknown;
+    try {
+      value = clock();
+    } catch {
+      // A throwing clock must not let its own error escape getToken().
+      throw tokenUnavailable();
+    }
     if (typeof value !== "number" || !Number.isFinite(value)) throw tokenUnavailable();
     return value;
   }
 
-  async function refresh(startedAt: number): Promise<string> {
+  function cachedToken(current: number): string | null {
+    return state.token !== null
+      && state.expiresAtMilliseconds - current > ID_TOKEN_REFRESH_MARGIN_MILLISECONDS
+      ? state.token
+      : null;
+  }
+
+  // The in-flight exchange a caller may join, or null. An exchange at least
+  // IN_FLIGHT_JOIN_TIMEOUT_MILLISECONDS old has outlived its own deadline, so
+  // the request that started it was cancelled together with its timers: the
+  // slot is freed and the caller mints afresh instead of waiting on it.
+  function joinableInFlight(current: number): InFlightExchange | null {
+    const exchange = state.inFlight;
+    if (exchange === null) return null;
+    if (current - exchange.startedAtMilliseconds < IN_FLIGHT_JOIN_TIMEOUT_MILLISECONDS) {
+      return exchange;
+    }
+    state.inFlight = null;
+    return null;
+  }
+
+  async function refresh(generation: number, startedAt: number): Promise<string> {
+    // An exchange that settles late must not undo newer state. A success is
+    // cached unless a later exchange has started (a slow exchange whose slot a
+    // joiner freed is still the newest evidence); a failure clears the token
+    // and starts the negative cache only while this exchange holds the slot,
+    // so an abandoned or replaced orphan never does.
     try {
       const minted = await mintIdToken(context, startedAt);
-      state.token = minted.token;
-      state.expiresAtMilliseconds = minted.expiresAtMilliseconds;
-      state.unavailableUntilMilliseconds = 0;
+      if (state.generation === generation) {
+        state.token = minted.token;
+        state.expiresAtMilliseconds = minted.expiresAtMilliseconds;
+        state.unavailableUntilMilliseconds = 0;
+      }
       return minted.token;
     } catch {
-      state.token = null;
-      state.expiresAtMilliseconds = 0;
-      let failedAt = startedAt;
-      try {
-        failedAt = now();
-      } catch {
-        // Keep the start time when the clock itself is unusable.
+      if (state.inFlight?.generation === generation) {
+        state.token = null;
+        state.expiresAtMilliseconds = 0;
+        let failedAt = startedAt;
+        try {
+          failedAt = now();
+        } catch {
+          // Keep the start time when the clock itself is unusable.
+        }
+        state.unavailableUntilMilliseconds = failedAt + ID_TOKEN_NEGATIVE_CACHE_MILLISECONDS;
       }
-      state.unavailableUntilMilliseconds = failedAt + ID_TOKEN_NEGATIVE_CACHE_MILLISECONDS;
       throw tokenUnavailable();
     }
   }
 
+  function startExchange(current: number): Promise<string> {
+    state.generation += 1;
+    const generation = state.generation;
+    // refresh() reaches its first await before it reads the generation or the
+    // slot, so both below are set by the time it checks them.
+    const promise = refresh(generation, current);
+    const exchange: InFlightExchange = { generation, startedAtMilliseconds: current, promise };
+    state.inFlight = exchange;
+    // Clear the single-flight slot once settled; this branch handles the
+    // rejection so it never becomes an unhandled one.
+    const release = (): void => {
+      if (state.inFlight === exchange) state.inFlight = null;
+    };
+    promise.then(release, release);
+    return promise;
+  }
+
   // A joining caller is usually a different request on this isolate. If the
-  // request that started the exchange is cancelled, its fetch and its
-  // deadline timer can be torn down with it and the shared promise may never
-  // settle. Each joiner therefore waits under its own timer, a little longer
-  // than the exchange deadline, and then frees the orphaned slot so the next
-  // caller mints afresh. An orphan is not a provider failure, so it does not
-  // start the negative cache.
-  async function joinInFlight(shared: Promise<string>): Promise<string> {
-    const wait = startDeadline(IN_FLIGHT_JOIN_TIMEOUT_MILLISECONDS);
+  // request that started the exchange is cancelled, its fetch and deadline
+  // timer can be torn down with it and the shared promise may never settle.
+  // A joiner therefore waits only until the exchange is
+  // IN_FLIGHT_JOIN_TIMEOUT_MILLISECONDS old, however late it joined. When
+  // that wait ends it uses a token or a newer exchange that appeared in the
+  // meantime (rejoining at most once); otherwise it frees the orphaned slot and
+  // fails. An orphan is not a provider failure, so it never starts the negative
+  // cache.
+  async function joinInFlight(
+    exchange: InFlightExchange,
+    joinedAt: number,
+    mayRejoin: boolean,
+  ): Promise<string> {
+    const remaining = Math.min(
+      IN_FLIGHT_JOIN_TIMEOUT_MILLISECONDS,
+      exchange.startedAtMilliseconds + IN_FLIGHT_JOIN_TIMEOUT_MILLISECONDS - joinedAt,
+    );
+    const wait = startDeadline(remaining);
+    let outcome: string | typeof JOIN_WAIT_EXPIRED;
     try {
-      return await Promise.race([shared, wait.expired]);
+      outcome = await Promise.race([
+        exchange.promise,
+        wait.expired.catch((): typeof JOIN_WAIT_EXPIRED => JOIN_WAIT_EXPIRED),
+      ]);
     } catch {
-      if (state.inFlight === shared) state.inFlight = null;
       throw tokenUnavailable();
     } finally {
       wait.clear();
     }
+    if (outcome !== JOIN_WAIT_EXPIRED) return outcome;
+    const current = now();
+    const token = cachedToken(current);
+    if (token !== null) return token;
+    if (state.inFlight === exchange) {
+      state.inFlight = null;
+      throw tokenUnavailable();
+    }
+    const newer = mayRejoin ? joinableInFlight(current) : null;
+    if (newer === null) throw tokenUnavailable();
+    return joinInFlight(newer, current, false);
   }
 
   async function getToken(): Promise<string> {
     const current = now();
-    if (state.token !== null
-        && state.expiresAtMilliseconds - current > ID_TOKEN_REFRESH_MARGIN_MILLISECONDS) {
-      return state.token;
-    }
-    if (state.inFlight !== null) return joinInFlight(state.inFlight);
+    const token = cachedToken(current);
+    if (token !== null) return token;
+    const inFlight = joinableInFlight(current);
+    if (inFlight !== null) return joinInFlight(inFlight, current, true);
     if (current < state.unavailableUntilMilliseconds) throw tokenUnavailable();
-    const attempt = refresh(current);
-    state.inFlight = attempt;
-    // Clear the single-flight slot once settled; this branch handles the
-    // rejection so it never becomes an unhandled one.
-    attempt.then(
-      () => {
-        if (state.inFlight === attempt) state.inFlight = null;
-      },
-      () => {
-        if (state.inFlight === attempt) state.inFlight = null;
-      },
-    );
-    return attempt;
+    return startExchange(current);
   }
 
   return Object.freeze({ getToken });
