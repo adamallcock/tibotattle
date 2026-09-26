@@ -615,7 +615,9 @@ for a never-uploaded accountless install:
   through its `0008` schema until `main`'s production hotfix (isolation
   `0012_v12_empty_day_manifests.sql`, PR #226, merged into this line on
   2026-09-26) re-created the manifest table with the v1.1 bound; registration
-  now marks an idle day ready on both backends.
+  now marks an idle day ready on both backends. A real-client D1 journey
+  (`apps/worker/test/telemetry-v12-empty-day-journey.spec.ts`) activates a
+  domain across an idle day with the quarantine fence applied.
 - The PostgreSQL v1.2 capability read required the v1.2 grant it reports on,
   so an ungranted accountless install got `401 DEVICE_AUTH_INVALID` and the
   desktop never requested the grant. It now authenticates the base lease graph

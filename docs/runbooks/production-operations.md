@@ -519,6 +519,19 @@ the same separate authorization, rehearsal and receipt, and the same deploy
 gating applies: a source tree that contains `0014` cannot deploy until `0014`
 is applied.
 
+The GCP line carried `0013` and `0014` under earlier numbers until they were
+renamed, byte-identically, to follow `0012`. The D1 ledgers record bare file
+names, so before applying `0013` or `0014` to any role, read back only the
+migration names in `d1_storage_migrations` and `d1_migrations` and confirm
+that none is one of the retired names listed as
+`RETIRED_ISOLATION_NAMES` in
+`apps/worker/scripts/ingestion-isolation-sequence.check.mjs`. If one is
+present, stop and re-plan: never relabel or re-apply an applied migration.
+Apply `0013`, then `0014`, each with its bare-name `d1_storage_migrations`
+row in the same submission through the reviewed storage-migration path, and
+read the bare names back afterwards. That check also pins every isolation
+file's bytes and name.
+
 Run the local populated rehearsal from the repository root. It uses
 synthetic content-free rows, enables foreign-key checks, verifies every mapped
 column and staged/default value, and proves the carried analytics columns with
