@@ -743,10 +743,19 @@ action result alone does not prove publication.
 
 Follow the catch-up on the admin console's **Processing pipeline** panel. It
 shows the ingestion journal, the delivery backlog with the device currently
-being folded, the daily queue and the allowance graph. Delivery folds about one
-bounded step a minute. A day republishes only after every public owner's latest
-change has been delivered, so a large activation holds the whole daily queue
-until delivery catches up.
+being folded, the daily queue and the allowance graph. A day republishes only
+after every public owner's latest change has been delivered, so a large
+activation holds the whole daily queue until delivery catches up.
+
+The analytics Worker gives delivery a guaranteed first slice of each minute
+(175 statements, 10 seconds), about one step of 1,000 records. When that slice
+ends with delivery work pending, the minute pass gives delivery a second slice
+of the same invocation: up to 600 more statements, ending 45 seconds in and
+leaving at least 100 statements for the rest of the pass. There is still one
+cursor writer and one meter. The every-tenth-minute long pass keeps the graph
+lane's window, so graph work slows during a catch-up. Setting
+`STORAGE_DELIVERY_CATCH_UP` to `disabled` on that Worker returns delivery to
+its fixed slice.
 
 ### Guarded deployment wrapper
 

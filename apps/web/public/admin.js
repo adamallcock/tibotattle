@@ -97,7 +97,7 @@ let infoHintSequence = 0;
 
 const INFO_HINTS = Object.freeze({
   "Ingestion journal": "Every accepted change (an upload that changes a contributor's evidence, an activation, an opt-out or an erasure) is recorded here in order. The value is the latest change's position in that order.",
-  "Delivery into analytics": "The analytics Worker applies journal changes in order, one bounded step a minute. A device activation is folded in day by day, so a large backlog of activations takes hours. The movement line is what this page saw between two refreshes.",
+  "Delivery into analytics": "The analytics Worker applies journal changes in order in bounded steps each minute, taking most of the minute while a backlog exists. A device activation is folded in day by day, so a large backlog of activations still takes hours. The movement line is what this page saw between two refreshes.",
   "Daily publication": "Days waiting to have their public daily figures rebuilt. A day republishes only after every public owner's latest change has been delivered, so a delivery backlog holds the whole queue.",
   "Allowance graph": "The allowance and model graph is rebuilt separately from daily figures. Its full breakdown is under Allowance diagnostics.",
   "Active contributor identities": "Active pseudonymous contributor identities, including accountless installations. These are not verified people or a device census and may include identities without accepted data.",
