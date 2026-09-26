@@ -374,16 +374,33 @@ async function backendPid(client) {
 // behind the global journal lock. Unheaded owners still take it; LF-2 must
 // record that for v0.x-only owners.
 
+/**
+ * Every retained head skips the lock, whatever its state or its link's state:
+ * the locked 0046 check matches any head behind the owner's link, so the
+ * pre-check must as well.
+ */
+const LOCK_HEADED_OWNERS = Object.freeze([
+  { name: "active", link: "active", journal: ["owner-active"] },
+  { name: "withdrawn", link: "active", journal: ["owner-active", "owner-withdrawn"] },
+  { name: "erased", link: "active", journal: ["owner-active", "owner-erased"] },
+  { name: "link-withdrawn", link: "withdrawn", journal: ["owner-active"] },
+].map((owner) => ({
+  ...owner, participantId: `synthetic-lock-headed-${owner.name}`, owner: digest(`lock-headed-${owner.name}`), analytics: "active",
+})));
+
 test("PG17 a headed owner's raw changes skip the global journal lock, while an unheaded owner's still take it",
   { skip: SKIP, timeout: 180_000 }, async () => {
     const outcome = async (emitter) => {
       let result;
       await withSchema(async ({ pool, quoted, table }) => {
         await initializeSource(pool, table);
-        const headed = { participantId: "synthetic-lock-headed", owner: digest("lock-headed"), analytics: "active" };
         const unheaded = { participantId: "synthetic-lock-unheaded", owner: digest("lock-unheaded"), analytics: "active" };
-        for (const participant of [headed, unheaded]) await createOwner(pool, table, participant);
-        await append(pool, quoted, "owner-active", headed.owner, "lock-headed");
+        for (const participant of [...LOCK_HEADED_OWNERS, unheaded]) await createOwner(pool, table, participant);
+        for (const headed of LOCK_HEADED_OWNERS) {
+          for (const [index, kind] of headed.journal.entries()) {
+            await append(pool, quoted, kind, headed.owner, `lock-headed-${headed.name}-${index}`);
+          }
+        }
 
         // Another producer holds the global lock: an uncommitted append.
         const holder = await session(pool, quoted);
@@ -404,32 +421,41 @@ test("PG17 a headed owner's raw changes skip the global journal lock, while an u
         try {
           await holder.query("BEGIN");
           await append(holder, quoted, "owner-active", digest("lock-holder"), "lock-holder");
-          result = {
-            headed: await attempt(headed.participantId, "lock-headed-records"),
-            unheaded: await attempt(unheaded.participantId, "lock-unheaded-records"),
-          };
+          result = { headed: {} };
+          for (const headed of LOCK_HEADED_OWNERS) {
+            result.headed[headed.name] = await attempt(headed.participantId, `lock-headed-${headed.name}-records`);
+          }
+          result.unheaded = await attempt(unheaded.participantId, "lock-unheaded-records");
           await holder.query("COMMIT");
         } finally {
           await release(holder);
         }
         const rows = await journal(pool, table);
-        result.headedRows = rows.filter((row) => row.owner_digest === headed.owner).map((row) => [row.version, row.kind]);
+        result.headedRows = Object.fromEntries(LOCK_HEADED_OWNERS.map((headed) => [headed.name,
+          rows.filter((row) => row.owner_digest === headed.owner).map((row) => [row.version, row.kind])]));
         result.unheadedRows = rows.filter((row) => row.owner_digest === unheaded.owner).length;
-        result.headedInput = await inputRevision(pool, table, headed.participantId);
+        result.headedInput = {};
+        for (const headed of LOCK_HEADED_OWNERS) {
+          result.headedInput[headed.name] = await inputRevision(pool, table, headed.participantId);
+        }
         assertGapless(rows);
       }, { emitter });
       return result;
     };
+    const each = (value) => Object.fromEntries(LOCK_HEADED_OWNERS.map((headed) => [headed.name, value]));
 
     const precheck = await outcome("precheck");
-    assert.equal(precheck.headed, "committed", "a headed owner's raw changes commit while another producer holds the lock");
-    assert.deepEqual(precheck.headedRows, [[1, "owner-active"]], "and, as in 0046, journal nothing");
-    assert.equal(precheck.headedInput, RECORDS_PER_UPLOAD, "while its input revision still advances per raw change");
+    assert.deepEqual(precheck.headed, each("committed"),
+      "a headed owner's raw changes commit while another producer holds the lock, whatever the head or link state");
+    assert.deepEqual(precheck.headedRows, Object.fromEntries(LOCK_HEADED_OWNERS.map((headed) => [headed.name,
+      headed.journal.map((kind) => [1, kind])])), "and, as in 0046, journal nothing");
+    assert.deepEqual(precheck.headedInput, each(RECORDS_PER_UPLOAD), "while the input revision still advances per raw change");
     assert.equal(precheck.unheaded, "55P03", "an unheaded owner's raw change still waits for the global lock");
     assert.equal(precheck.unheadedRows, 0);
 
     const baseline = await outcome("0046");
-    assert.equal(baseline.headed, "55P03", "control: the 0046 emitter makes the same headed change wait for the lock");
+    assert.deepEqual(baseline.headed, each("55P03"),
+      "control: the 0046 emitter makes the same headed changes wait for the lock");
     assert.equal(baseline.unheaded, "55P03");
   });
 
@@ -527,23 +553,35 @@ test("PG17 a first upload whose emitter misses an uncommitted first head re-chec
 // ---------------------------------------------------------------------------
 // Two concurrent first uploads for the same new owner. The 0014 triggers
 // lock the participant's input_source_digests and input_versions rows before
-// they call the emitter. Two uploads that write the same owner's raw rows
-// therefore reach the emitter one after the other. The re-check under the
-// lock is exercised by the deterministic test above, not here. This test
-// guards the outcome of both upload orders.
+// they call the emitter. Two uploads that both write the same owner's raw
+// rows therefore reach the emitter one after the other, and those rounds
+// guard the outcome only.
+//
+// The head-then-rows rounds pair a head-only first upload (one that journals
+// the owner's first head without writing its raw rows, such as the OJ-2 v1.2
+// bridge) with a rows-first upload for an owner whose imported analytics
+// state is active. The head-only upload takes the lock and appends first.
+// The rows-first upload's first raw row then reaches the emitter while that
+// head is still uncommitted, so its lock-free check misses. Only the re-check
+// under the lock stops a version-0 row that the mixing guard would refuse.
+// That is the interleaving the re-check exists for, so this test fails without
+// it. The deterministic test above isolates the same step.
 
 test("PG17 two concurrent first uploads for a new owner produce one head, no version-0 row and a gapless journal",
   { skip: SKIP, timeout: 240_000 }, async () => withSchema(async ({ pool, quoted, table }) => {
     await initializeSource(pool, table);
     // Journal-first is the order LF-3 appends in, and the order V11-C adopts
     // under review recommendation 5. Rows-first is the order V11-C has today.
-    // In rows-first, an owner whose imported analytics state is active
-    // correctly gets 0046's version-0 row from the first raw row, because no
-    // head exists yet. So rows-first rounds use owners with no analytics state.
+    // When two rows-first uploads race for an owner whose imported analytics
+    // state is active, the first raw row correctly gets 0046's version-0 row,
+    // because no head exists yet. So unordered rows-first rounds use owners
+    // with no analytics state; the ordered head-then-rows rounds cover an
+    // owner whose analytics state is active.
     const variants = [
       { order: "journal-first", analytics: "active" },
       { order: "journal-first", analytics: null },
       { order: "rows-first", analytics: null },
+      { order: "head-then-rows", analytics: "active" },
     ];
     const rounds = 4;
     const owners = [];
@@ -552,17 +590,46 @@ test("PG17 two concurrent first uploads for a new owner produce one head, no ver
         const label = `first-upload-${variantIndex}-${round}`;
         const owner = { participantId: `synthetic-${label}`, owner: digest(label), analytics: variant.analytics };
         await createOwner(pool, table, owner);
-        owners.push(owner);
-        const upload = (side) => async (client) => {
-          if (variant.order === "journal-first") {
-            const kind = await journalUpload(client, table, quoted, owner.owner, `${label}-${side}`);
+        let jobs;
+        if (variant.order === "head-then-rows") {
+          owner.rawUploads = 1;
+          let headAppended;
+          const appended = new Promise((resolve) => { headAppended = resolve; });
+          let uploadPidKnown;
+          const uploadPid = new Promise((resolve) => { uploadPidKnown = resolve; });
+          jobs = [
+            async (client) => {
+              try {
+                await append(client, quoted, "owner-active", owner.owner, `${label}-a`);
+              } finally {
+                headAppended();
+              }
+              // Commit only once the rows-first upload waits on this head's lock.
+              await waitUntilBlocked(pool, await uploadPid, await backendPid(client));
+              return "owner-active";
+            },
+            async (client) => {
+              uploadPidKnown(await backendPid(client));
+              await appended;
+              await rawRecords(client, table, owner.participantId, `${label}-b`);
+              return journalUpload(client, table, quoted, owner.owner, `${label}-b`);
+            },
+          ];
+        } else {
+          owner.rawUploads = 2;
+          const upload = (side) => async (client) => {
+            if (variant.order === "journal-first") {
+              const kind = await journalUpload(client, table, quoted, owner.owner, `${label}-${side}`);
+              await rawRecords(client, table, owner.participantId, `${label}-${side}`);
+              return kind;
+            }
             await rawRecords(client, table, owner.participantId, `${label}-${side}`);
-            return kind;
-          }
-          await rawRecords(client, table, owner.participantId, `${label}-${side}`);
-          return journalUpload(client, table, quoted, owner.owner, `${label}-${side}`);
-        };
-        const settled = await concurrently(pool, quoted, [upload("a"), upload("b")]);
+            return journalUpload(client, table, quoted, owner.owner, `${label}-${side}`);
+          };
+          jobs = [upload("a"), upload("b")];
+        }
+        owners.push(owner);
+        const settled = await concurrently(pool, quoted, jobs);
         assert.deepEqual(rejectedCodes(settled), [], `${variant.order}: both uploads commit`);
         assert.deepEqual(settled.map((result) => result.value).sort(), ["owner-active", "source-updated"],
           `${variant.order}: exactly one upload initializes the owner`);
@@ -581,8 +648,8 @@ test("PG17 two concurrent first uploads for a new owner produce one head, no ver
       const head = headRows.find((row) => row.owner_digest === owner.owner);
       assert.deepEqual([head.revision, head.epoch, head.state, head.last_sequence, head.seeded_partial],
         [2, 1, "active", chain[1].sequence, false]);
-      assert.equal(await inputRevision(pool, table, owner.participantId), 2 * RECORDS_PER_UPLOAD,
-        "both uploads' raw changes advanced the input revision");
+      assert.equal(await inputRevision(pool, table, owner.participantId), owner.rawUploads * RECORDS_PER_UPLOAD,
+        "every upload's raw changes advanced the input revision");
     }
   }));
 

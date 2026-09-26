@@ -36,7 +36,10 @@
 -- remaining record insert until commit, journaling one version-0 row per
 -- record while the owner's analytics state is active. Recommendation 6
 -- (OPS-11) sizes that hold. If it is long, LF-2 switches to one append per
--- contribution under its D1 parity oracle.
+-- contribution under a D1 parity oracle. LF-2 defines none yet, because D1's
+-- legacy bridge is not ported, so that switch must add one. Until then, the
+-- differential oracle in postgres-owner-journal-emitter-precheck.spec.mjs
+-- stands in: every emitter outcome equals 0046's, row for row.
 
 CREATE OR REPLACE FUNCTION telemetry_emit_source_event(
   event_owner_id text,

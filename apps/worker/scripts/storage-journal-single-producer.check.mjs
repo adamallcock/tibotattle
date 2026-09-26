@@ -18,7 +18,8 @@
 //   * the 0046 telemetry_emit_source_event replacement, which keeps the
 //     pre-0046 version-0 body verbatim for owners without a head and may not
 //     name the exact tuple columns, and the later replacements named in
-//     REVIEWED_EMITTER_REPLACEMENTS under the same rule;
+//     REVIEWED_EMITTER_REPLACEMENTS under the same rule, whose emitter
+//     journal writes must equal 0046's, statement for statement;
 //   * primary migrations numbered before 0046 (legacy history);
 //   * scripts/postgres-ingestion-journal-transfer.mjs, the sealed D1 import;
 //   * D1 prepared statements in src/analytics-delivery.ts, the D1 Worker
@@ -51,11 +52,14 @@ const LEGACY_EMITTER = "telemetry_emit_source_event";
 /**
  * Primary migrations after 0046 that may replace the legacy emitter, keyed by
  * name because the integrator renumbers staged files at promotion. Each keeps
- * the 0046 emitter body, including its version-0 INSERT, verbatim.
+ * the 0046 emitter body, including its version-0 INSERT, verbatim. This check
+ * holds the journal part itself: a replacement's emitter journal writes must
+ * equal, statement for statement, those of the 0046 emitter in the same tree,
+ * and without that 0046 file the exemption does not apply.
  *   owner_journal_emitter_head_precheck (ISO-2): a lock-free head pre-check
- *   ahead of the unchanged 0046 body, which
- *   postgres-test/postgres-owner-journal-emitter-precheck.spec.mjs compares
- *   against 0046 text.
+ *   ahead of the unchanged 0046 body. The rest of the body is compared with
+ *   0046 text by postgres-test/postgres-owner-journal-emitter-precheck.spec.mjs
+ *   (postgres:domain:check).
  */
 const REVIEWED_EMITTER_REPLACEMENTS = new Set(["owner_journal_emitter_head_precheck"]);
 const EXACT_TUPLE_COLUMNS = /\b(?:event_tuple_version|object_digest|content_digest|public_authority_epoch)\b/iu;
@@ -276,16 +280,20 @@ function enclosingStatement(sql, offset) {
   return sql.slice(start, sql.indexOf(";", offset) < 0 ? sql.length : sql.indexOf(";", offset));
 }
 
+/** A statement's text, comments already blanked, with whitespace collapsed. */
+const normalizedStatement = (sql, offset) => statementAt(sql, offset).replace(/\s+/gu, " ").trim();
+
 function scanSql(path, text) {
   const sql = stripSqlComments(text);
   const migration = PRIMARY_MIGRATION.exec(path);
   const version = migration ? Number(migration[1]) : null;
-  if (version !== null && version < AUTHORITY_VERSION) return { violation: false, appendDefinitions: 0 };
+  if (version !== null && version < AUTHORITY_VERSION) return { violation: false, appendDefinitions: 0, emitterWrites: [] };
   const emitterMigration = version === AUTHORITY_VERSION
     || (version > AUTHORITY_VERSION && REVIEWED_EMITTER_REPLACEMENTS.has(migration[2]));
   const bodies = functionBodies(sql);
   let appendDefinitions = 0;
   let violation = false;
+  const emitterWrites = [];
   for (const { offset, kind } of writes(sql, new Set(), { sql: true })) {
     if (kind === "static") continue;
     const body = bodies.find(([, start, end]) => offset >= start && offset < end);
@@ -300,11 +308,12 @@ function scanSql(path, text) {
     } else if (enclosing === LEGACY_EMITTER && emitterMigration
         && !EXACT_TUPLE_COLUMNS.test(statementAt(sql, offset))) {
       // The verbatim version-0 emitter body for owners without a head.
+      emitterWrites.push(normalizedStatement(sql, offset));
     } else {
       violation = true;
     }
   }
-  return { violation, appendDefinitions };
+  return { violation, appendDefinitions, emitterWrites };
 }
 
 /**
@@ -314,7 +323,7 @@ function scanSql(path, text) {
  */
 export function scanJournalProducers(path, text, { importedAliases = new Set() } = {}) {
   if (path.endsWith(".sql")) return { ...scanSql(path, text), dynamicWrites: 0 };
-  if (path === JOURNAL_TRANSFER) return { violation: false, appendDefinitions: 0, dynamicWrites: 0 };
+  if (path === JOURNAL_TRANSFER) return { violation: false, appendDefinitions: 0, dynamicWrites: 0, emitterWrites: [] };
   const code = stripScriptComments(text);
   const aliases = journalAliases(code);
   const imported = [...importedAliases].filter((alias) => word(alias).test(code));
@@ -332,7 +341,7 @@ export function scanJournalProducers(path, text, { importedAliases = new Set() }
   }
   const reviewed = REVIEWED_DYNAMIC_WRITERS.get(path);
   if (dynamicWrites > 0 && dynamicWrites !== reviewed) violation = true;
-  return { violation, appendDefinitions: 0, dynamicWrites };
+  return { violation, appendDefinitions: 0, dynamicWrites, emitterWrites: [] };
 }
 
 async function sourceFiles(root) {
@@ -373,13 +382,23 @@ export async function checkJournalSingleProducer(root = WORKER_ROOT) {
   const violations = [];
   let appendDefinitions = 0;
   const reviewedDynamicWriters = new Map();
+  const authorityEmitterWrites = [];
+  const replacementEmitterWrites = [];
   for (const [path, text] of sources) {
     const result = scanJournalProducers(path, text, { importedAliases });
     if (result.violation) violations.push(path);
     if (REVIEWED_DYNAMIC_WRITERS.has(path)) reviewedDynamicWriters.set(path, result.dynamicWrites);
     appendDefinitions += result.appendDefinitions;
+    const version = Number(PRIMARY_MIGRATION.exec(path)?.[1]);
+    if (version === AUTHORITY_VERSION) authorityEmitterWrites.push(result.emitterWrites);
+    else if (version > AUTHORITY_VERSION && result.emitterWrites.length > 0) replacementEmitterWrites.push([path, result.emitterWrites]);
   }
-  return { violations, appendDefinitions, reviewedDynamicWriters };
+  // A reviewed replacement may write only what the one 0046 emitter writes.
+  const authority = authorityEmitterWrites.length === 1 ? JSON.stringify(authorityEmitterWrites[0]) : null;
+  for (const [path, emitterWrites] of replacementEmitterWrites) {
+    if (JSON.stringify(emitterWrites) !== authority && !violations.includes(path)) violations.push(path);
+  }
+  return { violations: violations.sort(), appendDefinitions, reviewedDynamicWriters };
 }
 
 test("PostgreSQL exact journal rows have exactly one live producer", async () => {
@@ -427,6 +446,25 @@ INSERT INTO storage_ingestion_changes (source_id,kind) VALUES ('s','source-updat
     const clean = await checkJournalSingleProducer(root);
     assert.deepEqual(clean.violations, []);
     assert.equal(clean.appendDefinitions, 1);
+
+    // The reviewed exemption covers only the 0046 emitter's own journal writes, text for text.
+    const authorityPath = "postgres/staged-migrations/primary/0046_owner_journal_authority.sql";
+    const beforeEnd = (text, statement) => text.replace("END; $$;", () => `${statement} END; $$;`);
+    for (const doctored of [
+      beforeEnd(emitterReplacement,
+        "INSERT INTO storage_ingestion_changes (source_id,kind) VALUES ('s','source-updated') ON CONFLICT DO NOTHING;"),
+      emitterReplacement.replace("'source-updated'", "'owner-active'"),
+    ]) {
+      await write(reviewedEmitter, doctored);
+      assert.deepEqual((await checkJournalSingleProducer(root)).violations, [reviewedEmitter],
+        "a reviewed replacement may not add or change a journal write");
+    }
+    await write(reviewedEmitter, emitterReplacement);
+    await rm(join(root, authorityPath));
+    assert.deepEqual((await checkJournalSingleProducer(root)).violations, [reviewedEmitter],
+      "without the 0046 emitter to match, the reviewed exemption does not apply");
+    await write(authorityPath, appendDefinition);
+    assert.deepEqual((await checkJournalSingleProducer(root)).violations, []);
 
     const producers = {
       "src/raw-producer.ts": "await client.query(`INSERT INTO ${schema}.storage_ingestion_changes (source_id) VALUES ($1)`);",
@@ -481,6 +519,7 @@ CREATE FUNCTION rogue() RETURNS void AS $$ BEGIN INSERT INTO storage_ingestion_c
       "(source_id,kind) VALUES ('s','source-updated')", "(source_id,event_tuple_version) VALUES ('s',1)"));
     assert.ok((await checkJournalSingleProducer(root)).violations
       .includes("postgres/staged-migrations/primary/0046_owner_journal_authority.sql"));
+    await write(authorityPath, appendDefinition);
     await write(reviewedEmitter, emitterReplacement.replace(
       "(source_id,kind) VALUES ('s','source-updated')", "(source_id,event_tuple_version) VALUES ('s',1)"));
     assert.ok((await checkJournalSingleProducer(root)).violations.includes(reviewedEmitter),
