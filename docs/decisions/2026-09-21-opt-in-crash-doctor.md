@@ -48,10 +48,16 @@ target. The independent doctor and explicit private export read this location
 first, falling back to the older `desktop-settings` location only when the new
 record is absent; unsafe or invalid current evidence is not hidden by an older
 record. It contains only version/platform labels, timestamps, the
-last fixed startup phase, outcome, and an allowlisted code. A handled startup
-failure after profile selection is durably recorded before the deliberate quit,
-so the independent doctor can distinguish credential, settings, lifecycle, and
-updater failure families without retaining an exception message or path.
+last fixed startup phase, outcome, and an allowlisted code. Each startup phase
+now attempts to save its checkpoint before work begins, and deliberate early
+quit paths attempt to save a stopped result before quitting. A handled startup
+failure attempts to save its result before the deliberate quit. When these
+writes succeed, the independent doctor can distinguish credential,
+settings, lifecycle, and updater failure families without retaining an exception
+message or path. The released v0.1.24 journal wrote only its initial and terminal states:
+`in_progress at profile_selection` in that release does not prove the process
+stopped during profile selection; it may have proceeded to a later phase and
+quit before the terminal write.
 The separate `--export-private` mode is an explicit owner action that creates a
 new owner-only local directory outside the source checkout. It copies bounded,
 matching original Apple reports and companion diagnostic log generations under

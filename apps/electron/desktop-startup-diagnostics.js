@@ -166,6 +166,11 @@ export function createDesktopStartupDiagnostics({
     mark(nextPhase) {
       if (!settled && STARTUP_PHASES.has(nextPhase)) phase = nextPhase;
     },
+    async checkpoint(nextPhase) {
+      if (settled || !STARTUP_PHASES.has(nextPhase)) return false;
+      phase = nextPhase;
+      return persist("in_progress", null);
+    },
     async fail(error) {
       if (settled) return false;
       settled = true;

@@ -71,6 +71,34 @@ test("startup diagnostics overwrite an in-progress record with ready state", asy
   assert.equal(value.code, null);
 });
 
+test("startup checkpoints durably retain the last accepted phase before an interrupted launch", async (t) => {
+  const parent = await fixture(t);
+  const rootPath = join(parent, "desktop-settings");
+  const diagnostics = createDesktopStartupDiagnostics({
+    app: { getVersion: () => "0.1.24" }, rootPath,
+    now: clock("2026-09-26T06:47:36.000Z", "2026-09-26T06:47:36.100Z",
+      "2026-09-26T06:47:36.200Z", "2026-09-26T06:47:36.300Z"),
+  });
+  assert.equal(await diagnostics.start(), true);
+  assert.equal(await diagnostics.checkpoint("native_handover"), true);
+  assert.equal(await diagnostics.checkpoint("private path"), false);
+  const path = join(rootPath, DESKTOP_STARTUP_DIAGNOSTIC_FILE);
+  const value = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(value.phase, "native_handover");
+  assert.equal(value.outcome, "in_progress");
+  assert.equal(value.code, null);
+  assert.equal(value.recordedAt, "2026-09-26T06:47:36.200Z");
+  assert.equal((await lstat(path)).mode & 0o077, 0);
+  assert.equal(await diagnostics.stop("native_handover_blocked"), true);
+  assert.equal(await diagnostics.checkpoint("ready"), false);
+  assert.deepEqual(JSON.parse(await readFile(path, "utf8")), {
+    ...value,
+    recordedAt: "2026-09-26T06:47:36.300Z",
+    outcome: "stopped",
+    code: "native_handover_blocked",
+  });
+});
+
 test("startup diagnostics retain only allowlisted error and stop codes", async (t) => {
   const parent = await fixture(t);
   const firstRoot = join(parent, "first");

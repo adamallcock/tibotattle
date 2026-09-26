@@ -713,6 +713,7 @@ export async function launchDesktopRuntime({
   productionDistribution,
   prepareNativeHandover,
   onStartupPhase,
+  onStartupStop,
   getuid = typeof process.getuid === "function" ? process.getuid.bind(process) : undefined,
   getUserInfo = userInfo,
   loadProductionUpdater = () => import("electron-updater"),
@@ -727,11 +728,18 @@ export async function launchDesktopRuntime({
     throw new TypeError("companion launch paths are invalid");
   }
   assertObject(environment, "environment");
-  const markStartupPhase = (phase) => {
+  const markStartupPhase = async (phase) => {
     try {
-      if (typeof onStartupPhase === "function") onStartupPhase(phase);
+      if (typeof onStartupPhase === "function") await onStartupPhase(phase);
     } catch {
       // Startup diagnostics are observational and never control startup.
+    }
+  };
+  const stopStartup = async (code) => {
+    try {
+      if (typeof onStartupStop === "function") await onStartupStop(code);
+    } catch {
+      // Startup diagnostics are observational and never control shutdown.
     }
   };
   // Test-only loopback composition. Normal main.js does not provide this port.
@@ -1049,6 +1057,7 @@ export async function launchDesktopRuntime({
     ? app.requestSingleInstanceLock()
     : true;
   if (!singleInstanceLockAcquired) {
+    await stopStartup("secondary_instance");
     app.quit?.();
     return Object.freeze({
       firstRun: null,
@@ -1107,10 +1116,10 @@ export async function launchDesktopRuntime({
   if (platform !== "darwin") acceptDeepLinkArgv(argv ?? process.argv);
   // Electron's native dialog must be shown only after the app is ready. This
   // does not start the companion, register a login item, or enable updates.
-  markStartupPhase("app_ready");
+  await markStartupPhase("app_ready");
   await app.whenReady?.();
   if (prepareNativeHandover !== undefined) {
-    markStartupPhase("native_handover");
+    await markStartupPhase("native_handover");
     while (true) {
       let handover;
       try {
@@ -1134,6 +1143,7 @@ export async function launchDesktopRuntime({
           continue;
         }
         deepLinkIntakeCleanup();
+        await stopStartup(`secure_storage_${reason}`);
         app.quit?.();
         return Object.freeze({
           status: "native_handover_blocked",
@@ -1161,6 +1171,7 @@ export async function launchDesktopRuntime({
         buttons: ["Quit"], defaultId: 0, cancelId: 0, noLink: true,
       });
       deepLinkIntakeCleanup();
+      await stopStartup("native_handover_blocked");
       app.quit?.();
       return Object.freeze({ status: "native_handover_blocked", firstRun: null,
         lifecycle: null, supervisor: null, controller: null, settingsStore: null,
@@ -1189,7 +1200,7 @@ export async function launchDesktopRuntime({
   }
   // Establish provenance before the first-run receipt or settings create a new
   // managed marker. Injected test backends never inspect real profile state.
-  markStartupPhase("installation_state");
+  await markStartupPhase("installation_state");
   const installationState = sharingInstallationState ?? (injectedSettings
     ? "unknown"
     : await classifyDesktopSharingInstallation({
@@ -1273,11 +1284,14 @@ export async function launchDesktopRuntime({
       rootPath: settingsRootPath,
       windowsProtectedStateStore,
     });
-  markStartupPhase("first_run");
+  await markStartupPhase("first_run");
   const firstRun = await ensureDesktopFirstRunAcknowledged({
     dialog: runtime.dialog,
     receiptBackend: firstRunBackend,
-    quit: () => app.quit?.(),
+    quit: async () => {
+      await stopStartup("startup_stopped");
+      app.quit?.();
+    },
     locale: firstRunLocale,
     systemLocales: desktopSystemLocales,
     production: productionDistribution !== undefined
@@ -1316,7 +1330,7 @@ export async function launchDesktopRuntime({
         enabled: false, policyVersion: null, destinationOrigin: null }),
       updateTransport() {}, dispose() {} };
   }
-  markStartupPhase("secure_storage");
+  await markStartupPhase("secure_storage");
   if (accountlessNativeCredentialUsesMac && initialSharingSnapshot?.enabled === true) {
     while (true) {
       try {
@@ -1329,6 +1343,7 @@ export async function launchDesktopRuntime({
         }
         deepLinkIntakeCleanup();
         sharingCoordinator.dispose();
+        await stopStartup(`secure_storage_${reason}`);
         app.quit?.();
         return Object.freeze({
           status: "secure_storage_blocked",
@@ -1345,7 +1360,7 @@ export async function launchDesktopRuntime({
       }
     }
   }
-  markStartupPhase("runtime_services");
+  await markStartupPhase("runtime_services");
   const runtimeOwnedDownloadsRegistry = await createRuntimeOwnedDownloadsRegistry({
     app,
     runtime,
@@ -1702,7 +1717,7 @@ export async function launchDesktopRuntime({
   let initialDesktopSnapshot;
   let firstRunLogin = Object.freeze({ status: "not_requested" });
   let recoverySettingsAction;
-  markStartupPhase("settings");
+  await markStartupPhase("settings");
   try {
     initialDesktopSnapshot = await controller.initialize();
     const firstRunLoginRegistrar = createDesktopFirstRunLoginRegistrar({
@@ -1903,10 +1918,10 @@ export async function launchDesktopRuntime({
         runtime.nativeTheme.removeListener?.("updated", onNativeThemeUpdated);
       };
     }
-    markStartupPhase("lifecycle");
+    await markStartupPhase("lifecycle");
     await lifecycle.start();
     if (productionDistribution !== undefined) {
-      markStartupPhase("updater");
+      await markStartupPhase("updater");
       // Electron's built-in autoUpdater has no supported Linux implementation
       // and lacks electron-updater's explicit download contract on every
       // platform. The selected package consistently uses the pinned updater.
@@ -1926,7 +1941,7 @@ export async function launchDesktopRuntime({
       });
       await updater.start();
     }
-    markStartupPhase("ready");
+    await markStartupPhase("ready");
   } catch (error) {
     deepLinkIntakeCleanup();
     await disposeControllerAndIpc();
