@@ -15,6 +15,7 @@ import {
   IDENTITY_LINK_SECRET_VERSION_PATTERN,
   identityLinkSecretFingerprint,
 } from "./identity-link-configuration";
+import { identityRequired } from "./identity-oidc";
 import {
   normalizePostgresError,
   PostgresStorageError,
@@ -40,19 +41,26 @@ export const SIGNIN_HANDOFF_TABLES = Object.freeze([
 
 export type PostgresSignInHandoffTable = (typeof SIGNIN_HANDOFF_TABLES)[number];
 
+/** The part of the collection-controls snapshot a sign-in start depends on. */
+export interface PostgresSignInEnrollmentControl {
+  readonly enrollment: boolean;
+}
+
 /**
  * The shared collection-control check for "enrollment". It is injected
- * because the PostgreSQL collection-controls module is composed separately.
- * It either rejects with the reader's ApiError (COLLECTION_ENROLLMENT_DISABLED
- * or COLLECTION_CONTROL_UNAVAILABLE) or resolves. When it resolves with the
- * controls snapshot, the enrollment flag is re-checked here, so wiring a
- * non-asserting reader can never admit a paused service.
+ * because the PostgreSQL collection-controls module is composed separately
+ * (assertPostgresCollectionControlFromPool has this shape). It either rejects
+ * with the reader's ApiError (COLLECTION_ENROLLMENT_DISABLED or
+ * COLLECTION_CONTROL_UNAVAILABLE) or resolves with the controls snapshot. The
+ * snapshot is required and its enrollment flag is re-checked here: a reader
+ * that resolves without a snapshot is 503 COLLECTION_CONTROL_UNAVAILABLE, so
+ * wiring a non-asserting or void reader can never admit a paused service.
  */
 export type PostgresSignInCollectionControlCheck = (
   pool: PostgresPool,
   schema: string,
   name: "enrollment",
-) => Promise<unknown>;
+) => Promise<PostgresSignInEnrollmentControl>;
 
 export interface PostgresHostedSignInStartOptions {
   readonly readControl: PostgresSignInCollectionControlCheck;
@@ -173,7 +181,6 @@ export async function assertExistingPostgresIdentityLinkPin(
 }
 
 function assertEnrollmentControlResult(controls: unknown): void {
-  if (controls === undefined) return;
   if (controls === null || typeof controls !== "object") {
     throw new ApiError(503, "COLLECTION_CONTROL_UNAVAILABLE");
   }
@@ -190,10 +197,12 @@ function assertEnrollmentControlResult(controls: unknown): void {
  *    outside development, is 503 ADMISSION_CONFIGURATION_INVALID; 'disabled'
  *    is allowed because existing participants reattach through sign-in);
  * 2. the 'enrollment' collection control is enabled;
- * 3. the existing identity-link pin matches.
+ * 3. when identityRequired(env), the existing identity-link pin matches.
  *
- * The pin is checked unconditionally: this primitive is hosted-only, and a
- * production host never establishes a pin.
+ * Step 3 keeps the Worker gate: a development environment (which carries no
+ * identity secret by design) skips the pin, as the Worker does, and every
+ * other environment, including one with no ENVIRONMENT, requires it. The pin
+ * check itself stays SELECT-only, so no environment ever establishes a pin.
  */
 export async function assertPostgresHostedSignInStartAllowed(
   pool: PostgresPool,
@@ -220,7 +229,9 @@ export async function assertPostgresHostedSignInStartAllowed(
     throw new ApiError(503, "COLLECTION_CONTROL_UNAVAILABLE");
   }
   assertEnrollmentControlResult(controls);
-  await assertExistingPostgresIdentityLinkPin(pool, schema, env);
+  if (identityRequired(env)) {
+    await assertExistingPostgresIdentityLinkPin(pool, schema, env);
+  }
 }
 
 /**
@@ -232,7 +243,9 @@ export async function assertPostgresHostedSignInStartAllowed(
  * accepted_count < limit. When the window is exhausted the result is
  * 429 SIGN_IN_START_LIMIT_REACHED with retry-after =
  * max(1, ceil((windowEnd - now) / 1000)). A storage fault is
- * 503 ADMISSION_RATE_LIMIT_UNAVAILABLE with the Worker's retry-after of 60.
+ * 503 ADMISSION_RATE_LIMIT_UNAVAILABLE with no retry-after header, exactly as
+ * in the PostgreSQL reference (postgres-google-handoff.ts). The D1 Worker has
+ * no equivalent: its coordinated-window fault surfaces as 500 INTERNAL_ERROR.
  *
  * The address-keyed sign_in_start attempt limit is a separate edge-tier
  * control and is not applied here. Only the minute bucket and an aggregate
@@ -278,9 +291,7 @@ export async function admitPostgresSignInStart(
       lockTimeoutMilliseconds: LOCK_TIMEOUT_MILLISECONDS,
     });
   } catch {
-    throw new ApiError(503, "ADMISSION_RATE_LIMIT_UNAVAILABLE", {
-      responseHeaders: { "retry-after": "60" },
-    });
+    throw new ApiError(503, "ADMISSION_RATE_LIMIT_UNAVAILABLE");
   }
   if (typeof acceptedCount !== "number" || !Number.isSafeInteger(acceptedCount)
       || acceptedCount < 1 || acceptedCount > limit) {
@@ -296,6 +307,13 @@ export async function admitPostgresSignInStart(
 /**
  * Delete at most 100 expired rows (expires_at <= now) from one handoff table,
  * oldest first by (expires_at, state), and return how many were deleted.
+ *
+ * Candidates are locked FOR UPDATE SKIP LOCKED (the maintenance purge shape)
+ * and the DELETE re-checks the expiry. A row a concurrent callback is
+ * completing (filling its proof and moving its expiry forward) is therefore
+ * skipped rather than deleted after its commit, and the purge never waits on
+ * a callback's row lock. D1 serializes statements, so the Worker cannot
+ * interleave this way; PostgreSQL can.
  *
  * A pool runs the delete in its own bounded transaction; a client runs it in
  * the caller's transaction. Storage faults surface as a sanitized
@@ -322,9 +340,11 @@ export async function purgeExpiredHandoffs(
           WHERE expires_at <= $1::timestamptz
           ORDER BY expires_at, state
           LIMIT $2
+          FOR UPDATE SKIP LOCKED
        )
        DELETE FROM ${qualified} AS handoff USING expired
-        WHERE handoff.state = expired.state`,
+        WHERE handoff.state = expired.state
+          AND handoff.expires_at <= $1::timestamptz`,
       [nowIso, MAX_EXPIRED_SIGNIN_HANDOFFS_PER_REQUEST],
     );
     const purged = result?.rowCount;

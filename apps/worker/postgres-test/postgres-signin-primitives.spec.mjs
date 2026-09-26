@@ -303,11 +303,12 @@ test("storage faults map to the Worker codes without driver text", async () => {
     503,
     "BACKEND_STORAGE_UNAVAILABLE",
   );
+  // As in the named PostgreSQL reference (postgres-google-handoff.ts), the
+  // coordinated-window storage fault carries no retry-after header.
   await rejectsApi(
     primitives.admitPostgresSignInStart(pool, "tibotattle", hostedEnv(), NOW),
     503,
     "ADMISSION_RATE_LIMIT_UNAVAILABLE",
-    { "retry-after": "60" },
   );
   const failingClient = {
     async query() {
@@ -364,7 +365,9 @@ test("hosted start preconditions keep Worker order and fail closed on the contro
     await rejectsApi(run(() => { throw thrown; }), 503, "COLLECTION_CONTROL_UNAVAILABLE");
   }
   await rejectsApi(run(() => ({ enrollment: false })), 503, "COLLECTION_ENROLLMENT_DISABLED");
-  for (const value of [null, "enabled", { enrollment: "true" }, { state: "operational" }]) {
+  // The reader must resolve with the controls snapshot: a void result (a
+  // reader that neither asserts nor returns) is never taken as permission.
+  for (const value of [undefined, null, "enabled", { enrollment: "true" }, { state: "operational" }]) {
     await rejectsApi(run(() => value), 503, "COLLECTION_CONTROL_UNAVAILABLE");
   }
   // The control is read with the pool, the schema and exactly 'enrollment'.
@@ -373,22 +376,76 @@ test("hosted start preconditions keep Worker order and fail closed on the contro
   // Nothing reached the pin while the control refused.
   assert.equal(pool.connects, 0);
 
-  // An enabled control (void asserter or a snapshot) moves on to the pin,
-  // including in 'disabled' enrollment mode.
-  for (const env of [hostedEnv(), hostedEnv({ ENROLLMENT_MODE: "disabled" })]) {
-    for (const value of [undefined, { enrollment: true }]) {
-      await rejectsApi(
-        primitives.assertPostgresHostedSignInStartAllowed(
-          faultingPool(),
-          "tibotattle",
-          env,
-          { readControl: async () => value },
-        ),
-        503,
-        "BACKEND_STORAGE_UNAVAILABLE",
-      );
-    }
+  // An enabled control snapshot moves on to the pin, including in 'disabled'
+  // enrollment mode and when ENVIRONMENT is absent (identity is then required).
+  for (const env of [
+    hostedEnv(),
+    hostedEnv({ ENROLLMENT_MODE: "disabled" }),
+    hostedEnv({ ENVIRONMENT: undefined }),
+    hostedEnv({ ENVIRONMENT: "staging" }),
+  ]) {
+    await rejectsApi(
+      primitives.assertPostgresHostedSignInStartAllowed(
+        faultingPool(),
+        "tibotattle",
+        env,
+        { readControl: async () => ({ enrollment: true }) },
+      ),
+      503,
+      "BACKEND_STORAGE_UNAVAILABLE",
+    );
   }
+
+  // Worker parity (index.ts assertHostedSignInStartAllowed): the pin is only
+  // required when identityRequired(env). A development environment, which
+  // deliberately carries no identity secret, passes without touching storage,
+  // but still runs the enrollment-mode and control checks first.
+  const developmentEnvs = ["synthetic-development", "development", "local-development", "test"]
+    .flatMap((environment) => ["local_open", "open", "disabled"].map((mode) => ({
+      ENVIRONMENT: environment,
+      ENROLLMENT_MODE: mode,
+    })));
+  for (const env of developmentEnvs) {
+    const developmentPool = untouchablePool();
+    await primitives.assertPostgresHostedSignInStartAllowed(
+      developmentPool,
+      "tibotattle",
+      env,
+      { readControl: async () => ({ enrollment: true }) },
+    );
+    assert.equal(developmentPool.connects, 0);
+    await rejectsApi(
+      primitives.assertPostgresHostedSignInStartAllowed(
+        developmentPool,
+        "tibotattle",
+        env,
+        { readControl: async () => ({ enrollment: false }) },
+      ),
+      503,
+      "COLLECTION_ENROLLMENT_DISABLED",
+    );
+    await rejectsApi(
+      primitives.assertPostgresHostedSignInStartAllowed(
+        developmentPool,
+        "tibotattle",
+        env,
+        { readControl: async () => undefined },
+      ),
+      503,
+      "COLLECTION_CONTROL_UNAVAILABLE",
+    );
+    assert.equal(developmentPool.connects, 0);
+  }
+  await rejectsApi(
+    primitives.assertPostgresHostedSignInStartAllowed(
+      untouchablePool(),
+      "tibotattle",
+      { ENVIRONMENT: "synthetic-development", ENROLLMENT_MODE: "wide_open" },
+      { readControl: async () => ({ enrollment: true }) },
+    ),
+    503,
+    "ADMISSION_CONFIGURATION_INVALID",
+  );
 });
 
 async function localPostgresEndpoint() {
@@ -537,7 +594,38 @@ test("PostgreSQL sign-in primitives: SELECT-only pin, global start admission, pu
       }
       assert.deepEqual(await pinRows(pool, schema), []);
 
-      // The hosted start preconditions surface the same refusal with no pin row.
+      // The client path reads inside the caller's transaction: it sees the
+      // caller's uncommitted pin row, commits nothing, and the caller's
+      // ROLLBACK still discards that row.
+      const callerTransaction = await pool.connect();
+      try {
+        await callerTransaction.query("BEGIN");
+        await callerTransaction.query(
+          `INSERT INTO ${q(schema, "identity_link_secret_configuration")}
+             (singleton, key_version, secret_fingerprint, recorded_at)
+           VALUES (1, $1, $2, '2026-01-01T00:00:00.000Z')`,
+          [SECRET_VERSION, SECRET_FINGERPRINT],
+        );
+        await primitives.assertExistingPostgresIdentityLinkPin(callerTransaction, schema, hostedEnv());
+        const status = await callerTransaction.query(
+          "SELECT txid_current_if_assigned() IS NOT NULL AS open",
+        );
+        assert.deepEqual(status.rows, [{ open: true }],
+          "the pin check must not end the caller's transaction");
+        // Outside the caller's transaction the row is still invisible.
+        await rejectsApi(
+          primitives.assertExistingPostgresIdentityLinkPin(pool, schema, hostedEnv()),
+          503,
+          "IDENTITY_CONFIGURATION_INVALID",
+        );
+        await callerTransaction.query("ROLLBACK");
+      } finally {
+        callerTransaction.release();
+      }
+      assert.deepEqual(await pinRows(pool, schema), []);
+
+      // The hosted start preconditions surface the same refusal with no pin
+      // row. The injected reader resolves with the controls snapshot.
       const readControl = async (controlPool, controlSchema, name) => {
         assert.equal(controlPool, pool);
         assert.equal(controlSchema, schema);
@@ -549,11 +637,21 @@ test("PostgreSQL sign-in primitives: SELECT-only pin, global start admission, pu
         if (result.rows[0]?.enrollment_enabled !== true) {
           throw new errors.ApiError(503, "COLLECTION_ENROLLMENT_DISABLED");
         }
+        return { enrollment: result.rows[0].enrollment_enabled };
       };
       await rejectsApi(
         primitives.assertPostgresHostedSignInStartAllowed(pool, schema, hostedEnv(), { readControl }),
         503,
         "IDENTITY_CONFIGURATION_INVALID",
+      );
+      assert.deepEqual(await pinRows(pool, schema), []);
+      // A development environment (no identity secret, Worker dev parity)
+      // starts without a pin row and still founds none.
+      await primitives.assertPostgresHostedSignInStartAllowed(
+        pool,
+        schema,
+        { ENVIRONMENT: "synthetic-development", ENROLLMENT_MODE: "local_open" },
+        { readControl },
       );
       assert.deepEqual(await pinRows(pool, schema), []);
 
@@ -663,6 +761,20 @@ test("PostgreSQL sign-in primitives: SELECT-only pin, global start admission, pu
         "SIGN_IN_START_LIMIT_REACHED",
         { "retry-after": "43" },
       );
+      // retry-after is a ceiling, never a rounding or a floor: 42.4 s and
+      // 59.999 s remaining must both round up.
+      for (const [at, retryAfter] of [
+        [Date.UTC(2026, 8, 26, 12, 0, 17, 600), "43"],
+        [Date.UTC(2026, 8, 26, 12, 0, 0, 1), "60"],
+        [Date.UTC(2026, 8, 26, 12, 0, 59, 999), "1"],
+      ]) {
+        await rejectsApi(
+          primitives.admitPostgresSignInStart(pool, schema, hostedEnv(), at),
+          429,
+          "SIGN_IN_START_LIMIT_REACHED",
+          { "retry-after": retryAfter },
+        );
+      }
       await rejectsApi(
         primitives.admitPostgresSignInStart(
           pool,
@@ -711,7 +823,6 @@ test("PostgreSQL sign-in primitives: SELECT-only pin, global start admission, pu
         ),
         503,
         "ADMISSION_RATE_LIMIT_UNAVAILABLE",
-        { "retry-after": "60" },
       );
       // Concurrent starts are admitted exactly up to the limit.
       const burstAt = Date.UTC(2026, 8, 26, 12, 2, 30, 0);
@@ -735,15 +846,32 @@ test("PostgreSQL sign-in primitives: SELECT-only pin, global start admission, pu
       assert.deepEqual((await windows()).map((row) => row.acceptedCount), [2, 1, 3]);
     });
 
-    await t.test("expired handoff purge deletes at most 100 rows, oldest first", async () => {
+    await t.test("expired handoff purge deletes at most 100 rows, oldest first by (expires_at, state)", async () => {
       const googleTable = q(schema, "google_signin_handoffs");
-      for (let index = 0; index < 105; index += 1) {
-        await insertGoogleHandoff(pool, schema, {
-          state: `expired-${String(index).padStart(3, "0")}`,
-          expiresAt: NOW - 1_000 * (105 - index),
+      // Only ORDER BY expires_at, state selects the expected 100 rows: state
+      // order runs opposite to expiry order, the rows are inserted in an order
+      // that is neither, and two rows share the boundary expiry so the state
+      // tie-break decides which of them is purged.
+      const expired = [];
+      for (let rank = 0; rank < 99; rank += 1) {
+        expired.push({
+          state: `old-${String(98 - rank).padStart(3, "0")}`,
+          expiresAt: NOW - 1_000 * (200 - rank),
         });
       }
-      await insertGoogleHandoff(pool, schema, { state: "expired-at-now", expiresAt: NOW });
+      expired.push({ state: "tie-b", expiresAt: NOW - 50_000 });
+      expired.push({ state: "tie-a", expiresAt: NOW - 50_000 });
+      for (let rank = 0; rank < 4; rank += 1) {
+        expired.push({ state: `new-${3 - rank}`, expiresAt: NOW - 1_000 * (4 - rank) });
+      }
+      expired.push({ state: "expired-at-now", expiresAt: NOW });
+      const insertionOrder = Array.from(
+        { length: expired.length },
+        (_, index) => (index * 37) % expired.length,
+      );
+      assert.equal(expired.length, 106);
+      assert.equal(new Set(insertionOrder).size, expired.length);
+      for (const index of insertionOrder) await insertGoogleHandoff(pool, schema, expired[index]);
       await insertGoogleHandoff(pool, schema, { state: "live-one", expiresAt: NOW + 1 });
       await insertGoogleHandoff(pool, schema, { state: "live-two", expiresAt: NOW + 60_000 });
       const rolledBack = await pool.connect();
@@ -762,11 +890,12 @@ test("PostgreSQL sign-in primitives: SELECT-only pin, global start admission, pu
         await primitives.purgeExpiredHandoffs(pool, schema, "google_signin_handoffs", NOW),
         100,
       );
+      // Exactly the 99 oldest rows and tie-a (the smaller state at the
+      // boundary expiry) are gone.
       assert.deepEqual(
         (await pool.query(`SELECT state FROM ${googleTable} ORDER BY expires_at, state`)).rows
           .map((row) => row.state),
-        ["expired-100", "expired-101", "expired-102", "expired-103", "expired-104",
-          "expired-at-now", "live-one", "live-two"],
+        ["tie-b", "new-3", "new-2", "new-1", "new-0", "expired-at-now", "live-one", "live-two"],
       );
       assert.equal(
         await primitives.purgeExpiredHandoffs(pool, schema, "google_signin_handoffs", NOW),
@@ -794,6 +923,84 @@ test("PostgreSQL sign-in primitives: SELECT-only pin, global start admission, pu
       assert.equal((await pool.query(`SELECT count(*)::integer AS n FROM ${googleTable}`)).rows[0].n, 2);
     });
 
+    await t.test("purge skips, and never waits on, a handoff a concurrent callback is completing", async () => {
+      const googleTable = q(schema, "google_signin_handoffs");
+      const completedExpiry = new Date(NOW + 300_000).toISOString();
+      const proof = claimId(64);
+      // Start from an empty table in this test's own schema, so the purge
+      // count covers only the two rows below.
+      await pool.query(`DELETE FROM ${googleTable}`);
+      // The completing row expires at NOW; an unrelated row expired earlier.
+      await insertGoogleHandoff(pool, schema, {
+        state: "race-completing",
+        expiresAt: NOW,
+        claim: claimId(64),
+      });
+      await insertGoogleHandoff(pool, schema, { state: "race-expired", expiresAt: NOW - 1_000 });
+      const callback = await pool.connect();
+      let callbackOpen = false;
+      let blocked = false;
+      let purged;
+      try {
+        await callback.query("BEGIN");
+        callbackOpen = true;
+        // A callback fills the proof at NOW - 50 ms (still unexpired) and moves
+        // the expiry five minutes out, holding the row lock uncommitted.
+        const completion = await callback.query(
+          `UPDATE ${googleTable}
+              SET proof = $1, claim_id = NULL, claimed_at = NULL, expires_at = $2::timestamptz
+            WHERE state = 'race-completing' AND proof IS NULL AND expires_at > $3::timestamptz`,
+          [proof, completedExpiry, new Date(NOW - 50).toISOString()],
+        );
+        assert.equal(completion.rowCount, 1);
+        const callbackPid = (await callback.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+        // A sign-in start purges at NOW + 100 ms, while the completion is open:
+        // its snapshot still sees the old expiry.
+        const purge = primitives.purgeExpiredHandoffs(
+          pool,
+          schema,
+          "google_signin_handoffs",
+          NOW + 100,
+        );
+        let settled = false;
+        purge.then(() => { settled = true; }, () => { settled = true; });
+        const deadline = Date.now() + 10_000;
+        while (!settled && !blocked && Date.now() < deadline) {
+          const waiting = await pool.query(
+            `SELECT count(*)::integer AS n
+               FROM pg_stat_activity
+              WHERE $1::integer = ANY(pg_blocking_pids(pid))`,
+            [callbackPid],
+          );
+          blocked = waiting.rows[0].n > 0;
+          if (!blocked && !settled) await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        assert.ok(settled || blocked, "purge neither settled nor blocked within 10 s");
+        // Commit the completion before any assertion so no lock is stranded.
+        await callback.query("COMMIT");
+        callbackOpen = false;
+        purged = await purge;
+      } finally {
+        if (callbackOpen) await callback.query("ROLLBACK").catch(() => {});
+        callback.release();
+      }
+      assert.equal(blocked, false, "the purge must skip a locked handoff, not wait on its lock");
+      assert.equal(purged, 1);
+      const rows = await pool.query(
+        `SELECT state, proof, expires_at FROM ${googleTable}
+          WHERE state LIKE 'race-%' ORDER BY state`,
+      );
+      assert.deepEqual(
+        rows.rows.map((row) => ({
+          state: row.state,
+          proof: row.proof,
+          expiresAt: row.expires_at.toISOString(),
+        })),
+        [{ state: "race-completing", proof, expiresAt: completedExpiry }],
+      );
+      await pool.query(`DELETE FROM ${googleTable} WHERE state LIKE 'race-%'`);
+    });
+
     await t.test("0054 enforces the claim_id shape on both handoff tables", async () => {
       const constraints = await pool.query(
         `SELECT rel.relname, con.conname, con.convalidated
@@ -808,17 +1015,34 @@ test("PostgreSQL sign-in primitives: SELECT-only pin, global start admission, pu
         { relname: "apple_signin_handoffs", conname: "apple_signin_handoffs_claim_id_shape", convalidated: true },
         { relname: "google_signin_handoffs", conname: "google_signin_handoffs_claim_id_shape", convalidated: true },
       ]);
+      // Length probes, then character-class probes that are exactly 64
+      // characters, so only the base64url allowlist (D1 0033: length 64 and
+      // no character outside A-Za-z0-9_-) can reject them.
+      const classProbes = ["=", "+", ".", "/", "*", " ", "\t", "\n", "~", "é"]
+        .map((character) => `${claimId(63)}${character}`);
+      for (const probe of classProbes) assert.equal([...probe].length, 64);
       const shapeRejections = [
         claimId(63),
         claimId(65),
         "",
-        `${claimId(63)}=`,
-        `${claimId(63)}+`,
-        `${claimId(63)}.`,
         `${claimId(64)}\n`,
         `\n${claimId(64)}`,
-        `${claimId(62)}é`,
+        ...classProbes,
+        `é${claimId(63)}`,
       ];
+      const shapeAcceptances = [
+        claimId(64),
+        `${"A".repeat(31)}-${"z".repeat(31)}_`,
+        "-_".repeat(32),
+        "0123456789".repeat(6).concat("abcd"),
+      ];
+      for (const probe of shapeAcceptances) assert.equal(probe.length, 64);
+      // The server agrees every class probe is 64 characters long.
+      const serverLengths = await pool.query(
+        "SELECT char_length(probe)::integer AS length FROM unnest($1::text[]) AS probe",
+        [classProbes],
+      );
+      assert.deepEqual(serverLengths.rows.map((row) => row.length), classProbes.map(() => 64));
       for (const [insert, table] of [
         [insertGoogleHandoff, "google_signin_handoffs"],
         [insertAppleHandoff, "apple_signin_handoffs"],
@@ -830,6 +1054,9 @@ test("PostgreSQL sign-in primitives: SELECT-only pin, global start admission, pu
           );
         }
         await insert(pool, schema, { state: `${table}-null`, expiresAt: NOW + 60_000, claim: null });
+        for (const [index, claim] of shapeAcceptances.entries()) {
+          await insert(pool, schema, { state: `${table}-accepted-${index}`, expiresAt: NOW + 60_000, claim });
+        }
         await insert(pool, schema, {
           state: `${table}-valid`,
           expiresAt: NOW + 60_000,
