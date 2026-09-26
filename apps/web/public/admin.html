@@ -23,7 +23,7 @@
 
     <main id="main" class="admin-main">
       <nav class="admin-section-nav" aria-label="Monitoring sections">
-        <a href="#operator-attention-title">Attention</a><a href="#counts-title">Contributors</a>
+        <a href="#operator-attention-title">Attention</a><a href="#pipeline-title">Pipeline</a><a href="#counts-title">Contributors</a>
         <a href="#growth-title">Activity</a><a href="#storage-safety-title">Storage</a>
         <a href="#distribution-title">Apps &amp; updates</a><a href="#admin-community-title">Allowance</a>
         <a href="#controls-title">Controls</a><a href="#ingress-title">Ingress</a>
@@ -111,6 +111,23 @@
           id="operator-attention"
           aria-live="polite"
         ></div>
+      </section>
+
+      <section class="admin-section" aria-labelledby="pipeline-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Analytics processing</p>
+            <h2 id="pipeline-title">Processing pipeline</h2>
+          </div>
+          <span class="admin-source-badge" id="pipeline-badge">Checking progress…</span>
+        </div>
+        <p class="admin-copy">
+          Every accepted change is written to the ingestion journal, then delivered into analytics in order.
+          A device activation is folded in day by day. A day's public figures republish only after every public
+          owner's latest change has been delivered. The allowance graph is rebuilt separately. Counts only; the
+          movement since the last refresh is what this page observed, not a forecast.
+        </p>
+        <div class="admin-card-grid admin-pipeline-grid" id="pipeline-stages" aria-live="polite"></div>
       </section>
 
       <section class="admin-section" aria-labelledby="counts-title">

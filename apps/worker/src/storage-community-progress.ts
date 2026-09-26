@@ -59,9 +59,29 @@ export interface StorageCommunityProgressGraph {
  };
  retirement: { staleResults: number | null };
 }
+/** Where analytics processing stands between an upload and a publication.
+ * Counts, UTC days and instants only: no digest, owner or content crosses. */
+export interface StoragePipelineProgress {
+ /** The ingestion journal every accepted change is written to. */
+ ingestion: { journalHead: number; latestRecordedAt: string | null };
+ /** Ordered delivery of journal changes into analytics. A device activation
+  * is folded day by day; `current` is the change being folded now. */
+ delivery: {
+  appliedSequence: number; pendingChanges: number; pendingActivations: number;
+  current: { fromDay: string; throughDay: string; nextDay: string; daysDone: number; daysTotal: number } | null;
+ };
+ /** The daily lane publishes a day only once every public owner's latest
+  * change has been delivered, so a delivery backlog holds the whole queue. */
+ daily: {
+  queuedDays: number; oldestQueuedDay: string | null; newestQueuedDay: string | null;
+  lastReleasedAt: string | null; releasedLastHour: number;
+ };
+}
 export interface StorageCommunityProgress {
  schemaVersion: 3;
  preparation?: null;
+ /** Null when this block alone could not be read; the graph view still stands. */
+ pipeline: StoragePipelineProgress | null;
  generatedAt: string;
  publication: { state: 'ready' | 'invalidated' | 'empty'; requestedGeneration: number; preparedGeneration: number | null;
   publishedGeneration: number | null; publishedAt: string | null };
@@ -97,6 +117,67 @@ function bounded(total: number): number {
  if (total > MAX_ADMIN_AGGREGATE_ROWS) throw unavailable();
  return total;
 }
+const inclusiveDays = (from: string, through: string): number =>
+ Math.round((Date.parse(`${through}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`)) / DAY_MS) + 1;
+
+/** Read separately from the graph census and never allowed to take it down:
+ * a failure here reports the pipeline as unavailable, not the whole panel. */
+export async function readStoragePipelineProgress(bindings: StorageAnalyticsBindings,
+ nowMs: number): Promise<StoragePipelineProgress | null> {
+ try {
+  const cursor = await bindings.target.prepare('SELECT sequence FROM analytics_source_cursors WHERE source_id=?')
+   .bind(bindings.sourceId).first<{ sequence: number }>();
+  const appliedSequence = count(cursor?.sequence ?? 0);
+  const [head, pending, next] = await bindings.source.batch([
+   bindings.source.prepare(`SELECT sequence, recorded_ms FROM storage_ingestion_changes
+    ORDER BY sequence DESC LIMIT 1`),
+   bindings.source.prepare(`SELECT COUNT(*) AS changes,
+     COALESCE(SUM(CASE WHEN kind='owner-active' THEN 1 ELSE 0 END),0) AS activations
+    FROM storage_ingestion_changes WHERE sequence>?`).bind(appliedSequence),
+   bindings.source.prepare('SELECT event_digest FROM storage_ingestion_changes WHERE sequence>? ORDER BY sequence LIMIT 1')
+    .bind(appliedSequence),
+  ]);
+  const headRow = head!.results[0] as { sequence: number; recorded_ms: number } | undefined;
+  const pendingRow = pending!.results[0] as { changes: number; activations: number } | undefined;
+  const nextDigest = (next!.results[0] as { event_digest: string } | undefined)?.event_digest ?? null;
+  const journalHead = count(headRow?.sequence ?? 0);
+  const pendingChanges = count(pendingRow?.changes ?? 0), pendingActivations = count(pendingRow?.activations ?? 0);
+  if (appliedSequence > journalHead || pendingActivations > pendingChanges) return null;
+  const [work, queue, published] = await bindings.target.batch([
+   bindings.target.prepare(`SELECT from_day, through_day, next_day FROM analytics_v11_projection_work
+    WHERE source_id=? AND event_digest=? AND phase='building'`).bind(bindings.sourceId, nextDigest ?? ''),
+   bindings.target.prepare(`SELECT COUNT(*) AS days, MIN(day) AS oldest, MAX(day) AS newest
+    FROM analytics_community_daily_queue WHERE source_id=?`).bind(bindings.sourceId),
+   bindings.target.prepare(`SELECT MAX(released_at) AS last,
+     COALESCE(SUM(CASE WHEN released_at>=? THEN 1 ELSE 0 END),0) AS last_hour
+    FROM analytics_community_daily_publications WHERE source_id=?`)
+    .bind(new Date(nowMs - HOUR_MS).toISOString(), bindings.sourceId),
+  ]);
+  const workRow = work!.results[0] as { from_day: string; through_day: string; next_day: string } | undefined;
+  let current: StoragePipelineProgress['delivery']['current'] = null;
+  if (workRow) {
+   const fromDay = utcDay(workRow.from_day), throughDay = utcDay(workRow.through_day), nextDay = utcDay(workRow.next_day);
+   const daysTotal = inclusiveDays(fromDay, throughDay), daysDone = inclusiveDays(fromDay, nextDay) - 1;
+   if (daysTotal < 1 || daysDone < 0 || daysDone > daysTotal) return null;
+   current = { fromDay, throughDay, nextDay, daysDone, daysTotal };
+  }
+  const queueRow = queue!.results[0] as { days: number; oldest: string | null; newest: string | null } | undefined;
+  const publishedRow = published!.results[0] as { last: string | null; last_hour: number } | undefined;
+  const queuedDays = count(queueRow?.days ?? 0);
+  return {
+   ingestion: { journalHead, latestRecordedAt: headRow ? instant(headRow.recorded_ms) : null },
+   delivery: { appliedSequence, pendingChanges, pendingActivations, current },
+   daily: {
+    queuedDays,
+    oldestQueuedDay: queuedDays > 0 && queueRow?.oldest ? utcDay(queueRow.oldest) : null,
+    newestQueuedDay: queuedDays > 0 && queueRow?.newest ? utcDay(queueRow.newest) : null,
+    lastReleasedAt: publishedRow?.last ? new Date(Date.parse(publishedRow.last)).toISOString() : null,
+    releasedLastHour: count(publishedRow?.last_hour ?? 0),
+   },
+  };
+ } catch { return null; }
+}
+
 /** The same cap for a display-only counter: null rather than a 503. */
 function counted(total: number): number | null {
  return total > MAX_ADMIN_AGGREGATE_ROWS ? null : total;
@@ -337,9 +418,11 @@ export async function readStorageCommunityProgress(bindings: StorageAnalyticsBin
    : pendingSelections > 0 || remainingResults > 0 ? 'queued' : 'idle';
   if (!await storageCommunityCalculationAuthorityIsCurrent(bindings.source, authority)) throw new Error('source changed');
   const activeCoverage = activeDay === null ? null : coverage.get(activeDay) ?? empty;
+  const pipeline = await readStoragePipelineProgress(bindings, nowMs);
   return {
    ...(options.includePreparation ? { schemaVersion: 3 as const, preparation: null } : { schemaVersion: 3 as const }),
    generatedAt,
+   pipeline,
    publication: { state: ready ? 'ready' as const : preview ? 'invalidated' as const : 'empty' as const,
     requestedGeneration: authority.sourceEpoch, preparedGeneration: phase === null ? authority.sourceEpoch : null,
     publishedGeneration: ready ? published!.sourceEpoch : null, publishedAt: ready ? preview!.generated_at : null },
