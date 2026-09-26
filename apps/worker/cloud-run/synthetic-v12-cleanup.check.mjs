@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { lstat, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { build } from "esbuild";
 import pg from "pg";
-import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { applyPostgresMigrations, renderPostgresSearchPath } from "../scripts/postgres-migrations.mjs";
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const WORKER_ROOT = resolve(ROOT, "..");
 const PG_TEST_HOST = process.env.PG_TEST_HOST;
@@ -825,6 +825,125 @@ test("PG17 cleanup refuses an unattributable pending v1.2 object and leaves it u
     assert.equal(receipt.rows[0]?.outcome, "failed");
     assert.equal(receipt.rows[0]?.details_json.includes(orphanKey), false);
     assert.equal(receipt.rows[0]?.details_json.includes(fixture.participantId), false);
+  } finally {
+    for (const schema of createdSchemas.reverse()) {
+      try { await primaryPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); } catch {}
+    }
+    await rm(temporary, { recursive: true, force: true });
+    await Promise.all([primaryPool.end(), ledgerPool.end()]);
+  }
+});
+
+// The v1.2 owner bridge (primary 0055) journals an eligible v1.2 head on a
+// journal-enabled target. Until the wave integrator promotes it, apply the
+// staged file after the stock chain; once promoted, the stock chain carries it.
+const V12_OWNER_BRIDGE = "0055_v12_owner_bridge.sql";
+
+async function applyV12OwnerBridge(pool, schema) {
+  let sql;
+  try {
+    sql = await readFile(resolve(WORKER_ROOT, "postgres/staged-migrations/primary", V12_OWNER_BRIDGE), "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const promoted = (await readdir(resolve(WORKER_ROOT, "postgres/migrations/primary")))
+    .some((name) => name.endsWith("_v12_owner_bridge.sql"));
+  assert.notEqual(sql !== undefined, promoted, "the v1.2 owner bridge is either staged or promoted, never both or neither");
+  if (sql === undefined) return;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(renderPostgresSearchPath(schema));
+    await client.query(sql);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+test("PG17 cleanup erases a bridged smoke owner whose v1.2 receipt reuses the seeded owner link", {
+  skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  const endpoint = await localPostgresEndpoint();
+  const suffix = randomBytes(5).toString("hex");
+  const primarySchema = `owner_bridged_${suffix}`;
+  const ledgerSchema = `${primarySchema}_ledger`;
+  const poolOptions = {
+    host: endpoint.host,
+    port: endpoint.port,
+    user: PG_TEST_USER,
+    ...(PG_TEST_PASSWORD === undefined ? { password: "synthetic-local-only" } : { password: PG_TEST_PASSWORD }),
+    database: PG_TEST_DATABASE,
+    ssl: false,
+    max: 3,
+    connectionTimeoutMillis: 3_000,
+  };
+  const primaryPool = new pg.Pool(poolOptions);
+  const ledgerPool = new pg.Pool(poolOptions);
+  const temporary = await mkdtemp(join(ROOT, ".tmp-postgres-owner-bridged-"));
+  const createdSchemas = [];
+  try {
+    const server = await primaryPool.query("SELECT current_setting('server_version_num')::integer AS version");
+    assert.equal(Math.floor(server.rows[0].version / 10_000), 17);
+    await primaryPool.query(`CREATE SCHEMA "${primarySchema}"`);
+    createdSchemas.push(primarySchema);
+    await primaryPool.query(`CREATE SCHEMA "${ledgerSchema}"`);
+    createdSchemas.push(ledgerSchema);
+    await Promise.all([
+      applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: primaryPool }),
+      applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: ledgerPool }),
+    ]);
+    await applyV12OwnerBridge(primaryPool, primarySchema);
+    const { eraseSyntheticPostgresV12Owner } = await importOwnerErasure(temporary);
+    // A journal-enabled test target: the smoke owner's head is bridged.
+    await primaryPool.query(
+      `INSERT INTO ${qualified(primarySchema, "storage_source_state")} (singleton, source_id, authority_epoch)
+       VALUES (1, 'synthetic-cleanup-source', 0)`,
+    );
+    const fixture = await seedOwner(primaryPool, primarySchema, { withChunk: true });
+    const generationId = await seedActivatedDomain(primaryPool, primarySchema, fixture.participantId);
+    const bridged = await primaryPool.query(
+      `SELECT event_digest, owner_digest, generation_id, head_revision
+         FROM ${qualified(primarySchema, "storage_v12_event_sources")} WHERE participant_id=$1`,
+      [fixture.participantId],
+    );
+    assert.equal(bridged.rows.length, 1, "the smoke owner's head is bridged once");
+    assert.equal(bridged.rows[0].owner_digest, fixture.ownerDigest, "the bridge reuses the smoke's seeded owner link");
+    assert.equal(bridged.rows[0].generation_id, generationId);
+    assert.equal(Number(bridged.rows[0].head_revision), 1);
+    const journalRows = async () => (await primaryPool.query(
+      `SELECT kind, event_tuple_version, owner_digest, object_digest
+         FROM ${qualified(primarySchema, "storage_ingestion_changes")} ORDER BY sequence`,
+    )).rows;
+    assert.deepEqual(await journalRows(), [{
+      kind: "owner-active", event_tuple_version: 1, owner_digest: fixture.ownerDigest,
+      object_digest: bridged.rows[0].event_digest,
+    }]);
+
+    let deletes = 0;
+    const result = await eraseSyntheticPostgresV12Owner({
+      primaryPool,
+      ledgerPool,
+      participantId: fixture.participantId,
+      schema: { primarySchema, ledgerSchema },
+      objectStore: { async deleteBatch() { deletes += 1; } },
+    });
+    assert.deepEqual(result, { status: "complete", objectsDeleted: 1 });
+    assert.equal(deletes, 1);
+    const remaining = await primaryPool.query(
+      `SELECT
+         (SELECT count(*)::int FROM ${qualified(primarySchema, "participants")} WHERE id=$1) AS participants,
+         (SELECT count(*)::int FROM ${qualified(primarySchema, "storage_v12_event_sources")} WHERE participant_id=$1) AS receipts,
+         (SELECT count(*)::int FROM ${qualified(primarySchema, "storage_owner_erasure_receipts")} WHERE owner_digest=$2) AS erasure_receipts`,
+      [fixture.participantId, fixture.ownerDigest],
+    );
+    assert.deepEqual(remaining.rows[0], { participants: 0, receipts: 0, erasure_receipts: 1 },
+      "the bridge receipt cascades with the owner under its erasure receipt");
+    assert.equal((await journalRows()).length, 1, "the exact journal row is retained");
   } finally {
     for (const schema of createdSchemas.reverse()) {
       try { await primaryPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); } catch {}

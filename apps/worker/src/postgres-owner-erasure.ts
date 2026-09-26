@@ -120,6 +120,10 @@ const ALLOWED_PARTICIPANT_TABLES = Object.freeze({
   telemetry_v12_domain_predecessors: [0, 1],
   telemetry_v12_domains: [0, 1],
   telemetry_v12_domain_heads: [0, 1],
+  // On a journal-enabled target the v1.2 owner bridge (migration 0055) records
+  // one receipt for that head under the smoke's seeded owner link. It cascades
+  // with the participant once the link's erasure receipt exists.
+  storage_v12_event_sources: [0, 1],
   // Created for every participant by migration 0026 and incremented when the
   // cleanup fences active -> deleting. It cascades with that exact owner.
   community_analytical_input_versions: [1, 1],
