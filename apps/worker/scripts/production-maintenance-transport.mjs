@@ -25,15 +25,13 @@ export function createMaintenanceTransport({plan,operationDirectory,cliPath,fetc
     try{while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>2_000_000)fail('RESPONSE_TOO_LARGE');parts.push(value);}}finally{await reader.cancel().catch(()=>{});}
     return Buffer.concat(parts);
   };
-  const api=async(path,body,{mutation=false,method}={})=>{
+  const api=async(path,body,{mutation=false}={})=>{
     if(typeof mutation!=='boolean'||mutation&&!body)fail('REQUEST_INVALID');
-    // PUT/PATCH exist only as explicit provider mutations; reads stay GET or a POST query.
-    if(method!==undefined&&(!mutation||!['PUT','PATCH'].includes(method)))fail('REQUEST_INVALID');
     if(typeof token!=='string'||token.length<16)fail('CREDENTIAL_REQUIRED');
     if(++requests>600||!path.startsWith(account+'/'))fail('READ_BUDGET');
     let response,bytes;
-    try{response=await fetcher('https://api.cloudflare.com/client/v4'+path,{method:method??(body?'POST':'GET'),headers:{authorization:`Bearer ${token}`,...(body?{'content-type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{}),redirect:'error',signal:AbortSignal.timeout(20000)});bytes=await responseBytes(response);}catch{fail(mutation?'MUTATION_UNCERTAIN':'READ_UNCERTAIN');}
-    await receipt({kind:'provider-read',method:method?`${method}_WRITE`:body?(mutation?'POST_WRITE_QUERY':'POST_READ_QUERY'):'GET',pathSha256:hash(path),status:response.status,bytes:bytes.length,sha256:hash(bytes)});
+    try{response=await fetcher('https://api.cloudflare.com/client/v4'+path,{method:body?'POST':'GET',headers:{authorization:`Bearer ${token}`,...(body?{'content-type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{}),redirect:'error',signal:AbortSignal.timeout(20000)});bytes=await responseBytes(response);}catch{fail(mutation?'MUTATION_UNCERTAIN':'READ_UNCERTAIN');}
+    await receipt({kind:'provider-read',method:body?(mutation?'POST_WRITE_QUERY':'POST_READ_QUERY'):'GET',pathSha256:hash(path),status:response.status,bytes:bytes.length,sha256:hash(bytes)});
     let json;try{json=JSON.parse(bytes);}catch{fail('RESPONSE_INVALID');}
     if(!response.ok||json.success!==true)fail('READ_REFUSED');
     if(json.result_info?.total_pages>1||json.result_info?.has_more===true||json.result_info?.cursor||Number.isSafeInteger(json.result_info?.total_count)&&Number.isSafeInteger(json.result_info?.count)&&json.result_info.total_count>json.result_info.count)fail('INVENTORY_UNBOUNDED');

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createMaintenanceTransport } from './production-maintenance-transport.mjs';
@@ -15,39 +15,47 @@ import { durablePrivateJson, identityDigest, operationError } from '../../../scr
  * Worker, plus the quiescence proof consumed by the source export (PT-2) and
  * the analytics cutover record (HX-6).
  *
- * - inventory (read-only): classify every script against an owner plan;
- *   WRITER_UNACCOUNTED when a script outside the fence binds a listed D1 or
- *   R2 resource, SCHEDULE_DRIFT when a fenced script's crons differ.
+ * - inventory (read-only): every script with its classification, bindings
+ *   (type, name, id digest, listed label) and crons, and every queue with
+ *   its consumers and delivery state; WRITER_UNACCOUNTED when a script
+ *   outside the fence binds a listed D1 or R2 resource, SCHEDULE_DRIFT when
+ *   a fenced script's crons differ. A writer-set refusal still writes an
+ *   inventory-refusal receipt naming the offending scripts or labels.
  * - plan (read-only): inventory plus the exact mutation list; its receipt
  *   sha256 is the only accepted --confirm value.
  * - apply --confirm=<plan receipt sha256> --analytics-drain-complete: one
  *   schedules PUT [] per cron script and one delivery pause per consumer,
- *   journalled before the first write. Ordering: the production Worker must
- *   already be fenced and its analytics drain complete (the drain is proved
- *   by HX-6, not here; the operator attests to it and the receipt says so).
- * - verify --fence=<plan receipt sha256> (read-only): production Worker is
- *   one version at 100% with EDGE_UPSTREAM_MODE='fenced' since the fence;
- *   zero schedules and paused delivery; D1 time-travel bookmarks equal at a
- *   window start at least quietWindowMinutes after the last apply and at the
- *   window end, the window itself at least quietWindowMinutes long (so a
- *   verify cannot prove quiescence over an empty interval); R2 quarantine
- *   digest equal to the baseline taken at apply, before any write; GraphQL
- *   rowsWritten/writeQueries 0 per listed database and no invocation of any
- *   fenced script. Emits the fence receipt that pins bookmarks and digest.
+ *   journalled (with the prior state) before the first write. Ordering: the
+ *   production Worker must already be fenced and its analytics drain
+ *   complete (the drain is proved by HX-6, not here; the operator attests to
+ *   it and the receipt says so). A released fence is never re-applied.
+ * - verify --fence=<plan receipt sha256> (read-only against the provider,
+ *   serialised with apply and release): production Worker is one version at
+ *   100% with EDGE_UPSTREAM_MODE='fenced' since the fence; zero schedules and
+ *   paused delivery as observed; D1 time-travel bookmarks equal at a window
+ *   start at least quietWindowMinutes after the last apply and at the window
+ *   end; R2 quarantine digest equal to the baseline taken at apply, before
+ *   any write; GraphQL rowsWritten/writeQueries 0 per listed database and no
+ *   invocation of any fenced script over [start, end - analytics lag], an
+ *   interval itself at least quietWindowMinutes long (so neither proof covers
+ *   an empty interval). Emits the fence receipt that pins bookmarks and digest.
  * - release --confirm=<plan receipt sha256> --pre-gcp: restores the exact
- *   prior schedules and delivery; refused once any gcp-mode production
+ *   prior schedules and delivery from the apply journal, so an apply that
+ *   stopped partway is recoverable; refused once any gcp-mode production
  *   version has been deployed since the fence.
  *
- * Every request goes through one budgeted fetcher restricted to the
- * Cloudflare v4 API. Receipts are 0600, content-addressed or keyed by the
- * plan receipt, and hold names, binding types, id digests, crons, counts,
- * bookmarks and digests only: never the token, rows, R2 keys or addresses.
- * GraphQL analytics are provider-lagged corroboration; the D1 bookmarks are
- * the authoritative write-quiescence evidence.
+ * Every request, reads and the two mutation shapes alike, goes through one
+ * budgeted fetcher restricted to the Cloudflare v4 API. Receipts are 0600,
+ * content-addressed or keyed by the plan receipt, and hold names, binding
+ * types, id digests, crons, counts, bookmarks and digests only: never the
+ * token, rows, R2 keys, variable text or addresses. GraphQL analytics are
+ * provider-lagged corroboration; the D1 bookmarks are the authoritative
+ * write-quiescence evidence.
  */
 
 export const FENCE_PLAN_SCHEMA = 'cloudflare-writer-fence-plan-v1';
 export const FENCE_INVENTORY_SCHEMA = 'cloudflare-writer-fence-inventory-v1';
+export const FENCE_INVENTORY_REFUSAL_SCHEMA = 'cloudflare-writer-fence-inventory-refusal-v1';
 export const FENCE_PLAN_RECEIPT_SCHEMA = 'cloudflare-writer-fence-plan-receipt-v1';
 export const FENCE_APPLY_INTENT_SCHEMA = 'cloudflare-writer-fence-apply-intent-v1';
 export const FENCE_APPLY_RECEIPT_SCHEMA = 'cloudflare-writer-fence-apply-v1';
@@ -55,6 +63,10 @@ export const FENCE_RECEIPT_SCHEMA = 'cloudflare-writer-fence-receipt-v1';
 export const FENCE_RELEASE_RECEIPT_SCHEMA = 'cloudflare-writer-fence-release-v1';
 export const FENCE_EDGE_MODE_BINDING = 'EDGE_UPSTREAM_MODE';
 export const FENCE_MIN_QUIET_WINDOW_MINUTES = 15;
+// Margin for provider analytics ingestion: GraphQL is queried only up to this
+// long before verify runs, and the receipt says which interval it covered.
+// A margin, not a provider-guaranteed bound; the bookmarks cover up to now.
+export const FENCE_ANALYTICS_LAG_MINUTES = 5;
 
 // Label -> the live binding that proves it, so a plan can never fence (or
 // pin) a D1 other than the one production and the catch-up consumer use.
@@ -106,13 +118,15 @@ const MAX_HISTORY_DEPLOYMENTS = 25;
 const R2_PAGE_SIZE = 1_000;
 // Worst case per subcommand: listing + 5 reads/script + queue list + 1
 // read/queue; R2 scan 100 pages (100k objects) + 1; history 1 + 2/deployment.
+// apply after its inventory: R2 baseline + one write per pending mutation +
+// a schedules readback per fenced script + a queue readback per consumer.
 const INVENTORY_READS = 1 + MAX_ACCOUNT_SCRIPTS * 5 + 1 + MAX_ACCOUNT_QUEUES;
 const R2_READS = 101;
 const HISTORY_READS = 1 + MAX_HISTORY_DEPLOYMENTS * 2;
 export const FENCE_REQUEST_BUDGETS = Object.freeze({
   inventory: INVENTORY_READS,
   plan: INVENTORY_READS,
-  apply: INVENTORY_READS + R2_READS + 2 * MAX_FENCED_SCRIPTS,
+  apply: INVENTORY_READS + R2_READS + 3 * MAX_FENCED_SCRIPTS,
   verify: INVENTORY_READS + HISTORY_READS + 2 * Object.keys(FENCE_D1_LABELS).length + R2_READS + 2,
   release: HISTORY_READS + 3 * MAX_FENCED_SCRIPTS,
 });
@@ -127,6 +141,7 @@ const SCRIPT = /^[a-zA-Z0-9_-]{1,63}$/;
 const CRON = /^[0-9A-Za-z*/,?#\- ]{1,64}$/;
 const BINDING_TYPE = /^[a-z0-9_]{1,64}$/;
 const BINDING_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/;
+const CONSUMER_TYPE = /^[a-z0-9_-]{1,32}$/;
 const OPAQUE = /^[A-Za-z0-9-]{8,128}$/;
 const EDGE_MODES = new Set(['worker', 'fenced', 'gcp']);
 const DEFAULT_CLI_PATH = fileURLToPath(new URL('../node_modules/wrangler/wrangler-dist/cli.js', import.meta.url));
@@ -140,6 +155,11 @@ const exactKeys = (value, keys, code) => {
 };
 const sameList = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const iso = ms => new Date(ms).toISOString();
+const isoMs = value => {
+  const ms = typeof value === 'string' ? Date.parse(value) : Number.NaN;
+  return Number.isSafeInteger(ms) && iso(ms) === value ? ms : null;
+};
+const count = value => Number.isSafeInteger(value) && value >= 0;
 const rows = (value, key, maximum, code = 'FENCE_PROVIDER_RESPONSE_INVALID') => {
   const list = Array.isArray(value) ? value : key === null ? undefined : value?.[key];
   if (!Array.isArray(list)) fail('FENCE_PROVIDER_RESPONSE_INVALID');
@@ -343,7 +363,7 @@ async function writeReceipt(path, value) {
 }
 const contentPath = (directory, prefix, value) => join(directory, `${prefix}-${sha256(`${JSON.stringify(value)}\n`)}.json`);
 
-async function boundedBytes(response, maximum) {
+async function boundedBytes(response, maximum, code) {
   if (!response?.body) return Buffer.alloc(0);
   const reader = response.body.getReader();
   const parts = [];
@@ -353,15 +373,21 @@ async function boundedBytes(response, maximum) {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > maximum) fail('FENCE_ANALYTICS_UNBOUNDED');
+      if (size > maximum) fail(code);
       parts.push(value);
     }
   } finally { await reader.cancel().catch(() => {}); }
   return Buffer.concat(parts);
 }
 
+const MUTATION_ENDPOINTS = Object.freeze({
+  PUT: /^\/accounts\/[a-f0-9]{32}\/workers\/scripts\/[a-zA-Z0-9_-]{1,63}\/schedules$/,
+  PATCH: /^\/accounts\/[a-f0-9]{32}\/queues\/[a-f0-9]{32}$/,
+});
+
 /** One budgeted, Cloudflare-v4-only fetcher shared by the maintenance
- * transport, the R2 scan and the pinned analytics reads. */
+ * transport's reads, the fence's two mutation shapes, the R2 scan and the
+ * pinned analytics reads. */
 function createFenceClient({ plan, subcommand, receiptsDirectory, cliPath, fetcher, environment }) {
   const limit = FENCE_REQUEST_BUDGETS[subcommand];
   const token = environment.CLOUDFLARE_API_TOKEN;
@@ -378,6 +404,36 @@ function createFenceClient({ plan, subcommand, receiptsDirectory, cliPath, fetch
   const transport = createMaintenanceTransport({
     plan: { accountId: plan.accountId }, operationDirectory: receiptsDirectory, cliPath, fetcher: guarded, environment,
   });
+  // The only writes the fence makes: schedules PUT and queue delivery PATCH,
+  // each to its one closed endpoint in this account. A lost, unreadable or
+  // 5xx response is uncertain (resume or release reconciles it against the
+  // live state); a 4xx or success:false answer is a refusal.
+  const mutate = async (method, path, body) => {
+    if (!Object.hasOwn(MUTATION_ENDPOINTS, method) || !MUTATION_ENDPOINTS[method].test(path)
+        || !path.startsWith(`/accounts/${plan.accountId}/`) || body === undefined) fail('FENCE_MUTATION_INVALID');
+    let response;
+    let bytes;
+    try {
+      response = await guarded(`${API_PREFIX}${path.slice(1)}`, {
+        method,
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        redirect: 'error',
+        signal: AbortSignal.timeout(20_000),
+      });
+      bytes = await boundedBytes(response, 2_000_000, 'FENCE_MUTATION_UNCERTAIN');
+    } catch (error) {
+      if (error?.code === 'FENCE_REQUEST_BUDGET' || error?.code === 'FENCE_ENDPOINT_REFUSED') throw error;
+      fail('FENCE_MUTATION_UNCERTAIN');
+    }
+    await transport.receipt({ kind: 'provider-write', method: `${method}_WRITE`, pathSha256: sha256(path),
+      status: response.status, bytes: bytes.length, sha256: sha256(bytes) });
+    let json;
+    if (response.status >= 500) fail('FENCE_MUTATION_UNCERTAIN');
+    try { json = JSON.parse(bytes.toString('utf8')); } catch { fail('FENCE_MUTATION_UNCERTAIN'); }
+    if (!response.ok || !record(json) || json.success !== true) fail('FENCE_MUTATION_REFUSED');
+    return json.result;
+  };
   const graphql = async (name, variables) => {
     let response;
     let bytes;
@@ -389,7 +445,7 @@ function createFenceClient({ plan, subcommand, receiptsDirectory, cliPath, fetch
         redirect: 'error',
         signal: AbortSignal.timeout(20_000),
       });
-      bytes = await boundedBytes(response, 1_000_000);
+      bytes = await boundedBytes(response, 1_000_000, 'FENCE_ANALYTICS_UNBOUNDED');
     } catch (error) {
       if (error?.code === 'FENCE_ANALYTICS_UNBOUNDED') throw error;
       fail('FENCE_ANALYTICS_UNAVAILABLE');
@@ -413,6 +469,7 @@ function createFenceClient({ plan, subcommand, receiptsDirectory, cliPath, fetch
   };
   return {
     api: transport.api,
+    mutate,
     graphql,
     r2Digest,
     remaining: () => limit - used,
@@ -456,7 +513,7 @@ async function readQueue(client, plan, queueId) {
     fail('FENCE_PROVIDER_RESPONSE_INVALID');
   }
   const consumers = rows(detail.consumers, null, 20).map(item => {
-    if (!record(item) || typeof item.type !== 'string') fail('FENCE_PROVIDER_RESPONSE_INVALID');
+    if (!record(item) || !CONSUMER_TYPE.test(item.type ?? '')) fail('FENCE_PROVIDER_RESPONSE_INVALID');
     const aliases = [item.script, item.script_name, item.service].filter(value => value !== undefined && value !== null);
     if (aliases.some(value => !SCRIPT.test(value)) || new Set(aliases).size > 1) fail('FENCE_PROVIDER_RESPONSE_INVALID');
     return { type: item.type, script: aliases[0] ?? null };
@@ -466,20 +523,21 @@ async function readQueue(client, plan, queueId) {
 }
 
 /**
- * Read-only writer inventory. Fails closed on an unaccounted writer, a label
- * that is not the live binding, an unlisted resource bound by a fenced script,
- * or a consumer mapping that differs from the plan. Mutable state (crons and
- * delivery) is returned for the caller's phase-specific comparison.
+ * Read-only writer inventory. Reads every script and queue first, then fails
+ * closed on a missing planned script, an unaccounted writer, a label that is
+ * not the live binding, an unlisted resource bound by a fenced script, a
+ * consumer mapping that differs from the plan or (inventory and plan only) a
+ * fenced cron that differs from the plan. Each of these writer-set refusals
+ * first writes a content-free inventory-refusal receipt naming what refused,
+ * so the owner never has to guess and re-read production. Mutable state
+ * (crons and delivery) is returned for the caller's phase-specific comparison.
  */
-async function collectInventory(client, plan, { now, requireFenced }) {
+async function collectInventory(client, plan, { now, requireFenced, expectPlannedCrons = false, receiptsDirectory }) {
   const account = `/accounts/${plan.accountId}`;
   const listed = rows(await client.api(`${account}/workers/scripts?per_page=100`), 'scripts', MAX_ACCOUNT_SCRIPTS, 'FENCE_INVENTORY_UNBOUNDED');
   const names = listed.map(item => { if (!SCRIPT.test(item?.id ?? '')) fail('FENCE_PROVIDER_RESPONSE_INVALID'); return item.id; });
   if (new Set(names).size !== names.length) fail('FENCE_PROVIDER_RESPONSE_INVALID');
   const present = new Set(names);
-  if (!present.has(plan.productionWorker) || plan.fencedScripts.some(item => !present.has(item.name))) {
-    fail('FENCE_PLAN_SCRIPT_MISSING');
-  }
   const fenced = new Map(plan.fencedScripts.map(item => [item.name, item]));
   const outOfScope = new Map(plan.outOfScopeScripts.map(item => [item.name, item]));
   const scripts = [];
@@ -488,14 +546,49 @@ async function collectInventory(client, plan, { now, requireFenced }) {
       : outOfScope.has(name) ? 'out-of-scope' : 'unlisted';
     scripts.push(await readScript(client, plan, name, classification));
   }
+  const queueList = rows(await client.api(`${account}/queues?page=1&per_page=100`), 'queues', MAX_ACCOUNT_QUEUES, 'FENCE_INVENTORY_UNBOUNDED');
+  const queues = new Map();
+  for (const item of queueList) {
+    if (!HEX32.test(item?.queue_id ?? '') || queues.has(item.queue_id)) fail('FENCE_PROVIDER_RESPONSE_INVALID');
+    queues.set(item.queue_id, await readQueue(client, plan, item.queue_id));
+  }
+
   const allBindings = script => [...script.versions.flatMap(version => version.bindings), ...script.settingsBindings];
   const listedD1 = new Map(Object.entries(plan.d1).map(([label, id]) => [id, label]));
-  const bindsListed = binding => (binding.d1Id !== null && listedD1.has(binding.d1Id)) || binding.bucket === plan.r2.bucket;
+  const listedLabel = binding => (binding.d1Id !== null ? listedD1.get(binding.d1Id) ?? null
+    : binding.bucket !== null && binding.bucket === plan.r2.bucket ? 'quarantine' : null);
+  const labelled = binding => {
+    const label = listedLabel(binding);
+    return label === null ? publicBinding(binding) : { ...publicBinding(binding), label };
+  };
+  const unique = list => sortBindings(list.filter((item, index) => list.findIndex(other => sameList(other, item)) === index));
+  const fencedList = scripts.filter(item => item.classification === 'fenced');
+  // Content-free survey of the whole account: every script and every queue.
+  const survey = {
+    scripts: scripts.map(script => ({ name: script.name, classification: script.classification, crons: script.crons,
+      bindings: unique(allBindings(script).map(labelled)) })),
+    queues: [...queues.values()].map(queue => ({ queueIdSha256: idDigest('queue', queue.queueId),
+      consumers: queue.consumers, deliveryPaused: queue.deliveryPaused }))
+      .sort((a, b) => a.queueIdSha256.localeCompare(b.queueIdSha256)),
+  };
+  const capturedAt = iso(now());
+  const refuse = async (code, { scripts: subjectScripts = [], labels = [] }) => {
+    const receipt = { schema: FENCE_INVENTORY_REFUSAL_SCHEMA, planSha256: plan.planSha256,
+      accountSha256: idDigest('account', plan.accountId), capturedAt,
+      refusal: { code, scripts: [...subjectScripts].sort(), labels: [...labels].sort() }, ...survey };
+    const written = await writeReceipt(contentPath(receiptsDirectory, 'inventory-refusal', receipt), receipt);
+    throw Object.assign(operationError(code), { refusalReceipt: basename(written.path) });
+  };
 
+  // 0. Every planned script exists.
+  const missing = [plan.productionWorker, ...plan.fencedScripts.map(item => item.name)].filter(name => !present.has(name));
+  if (missing.length) await refuse('FENCE_PLAN_SCRIPT_MISSING', { scripts: missing });
   // 1. Anything outside production and the fence that binds a listed resource.
-  for (const script of scripts) {
-    if ((script.classification === 'unlisted' || script.classification === 'out-of-scope')
-        && allBindings(script).some(bindsListed)) fail('WRITER_UNACCOUNTED');
+  const unaccounted = scripts.filter(script => (script.classification === 'unlisted' || script.classification === 'out-of-scope')
+    && allBindings(script).some(binding => listedLabel(binding) !== null));
+  if (unaccounted.length) {
+    await refuse('WRITER_UNACCOUNTED', { scripts: unaccounted.map(script => script.name),
+      labels: [...new Set(unaccounted.flatMap(allBindings).map(listedLabel).filter(label => label !== null))] });
   }
   // 2. Production identity: one version at 100%; fenced where required.
   const production = scripts.find(script => script.classification === 'production');
@@ -508,58 +601,60 @@ async function collectInventory(client, plan, { now, requireFenced }) {
   // 3. Labels must be the live bindings (never the checked-in wrangler.jsonc).
   const productionBinding = (name, type) => {
     const matches = productionBindings.filter(binding => binding.name === name);
-    if (matches.length !== 1 || matches[0].type !== type) fail('FENCE_RESOURCE_LABEL_MISMATCH');
-    return matches[0];
+    return matches.length === 1 && matches[0].type === type ? matches[0] : null;
   };
+  const mismatched = [];
   for (const [label, { owner, binding }] of Object.entries(FENCE_D1_LABELS)) {
     if (owner === 'production') {
-      if (productionBinding(binding, 'd1').d1Id !== plan.d1[label]) fail('FENCE_RESOURCE_LABEL_MISMATCH');
+      if (productionBinding(binding, 'd1')?.d1Id !== plan.d1[label]) mismatched.push(label);
     } else {
-      const ids = new Set(scripts.filter(script => script.classification === 'fenced').flatMap(allBindings)
-        .filter(item => item.name === binding && item.type === 'd1').map(item => item.d1Id));
-      if (ids.size !== 1 || !ids.has(plan.d1[label])) fail('FENCE_RESOURCE_LABEL_MISMATCH');
+      const ids = new Set(fencedList.flatMap(allBindings).filter(item => item.name === binding && item.type === 'd1')
+        .map(item => item.d1Id));
+      if (ids.size !== 1 || !ids.has(plan.d1[label])) mismatched.push(label);
     }
   }
-  if (productionBinding(FENCE_R2_BINDING, 'r2_bucket').bucket !== plan.r2.bucket) fail('FENCE_RESOURCE_LABEL_MISMATCH');
+  if (productionBinding(FENCE_R2_BINDING, 'r2_bucket')?.bucket !== plan.r2.bucket) mismatched.push('quarantine');
+  if (mismatched.length) await refuse('FENCE_RESOURCE_LABEL_MISMATCH', { labels: mismatched });
   // 4. The fence proves quiescence only for listed resources; a fenced
   // script writing anything else is outside the proof.
-  for (const script of scripts.filter(item => item.classification === 'fenced')) {
-    for (const binding of allBindings(script)) {
-      if ((binding.d1Id !== null && !listedD1.has(binding.d1Id)) || (binding.bucket !== null && binding.bucket !== plan.r2.bucket)) {
-        fail('FENCE_RESOURCE_UNLISTED');
-      }
-    }
-  }
-  // 5. Queue consumers: each fenced consumer owns exactly its planned queue;
-  // no fenced script consumes any other queue.
-  const queueList = rows(await client.api(`${account}/queues?page=1&per_page=100`), 'queues', MAX_ACCOUNT_QUEUES, 'FENCE_INVENTORY_UNBOUNDED');
-  const queues = new Map();
-  for (const item of queueList) {
-    if (!HEX32.test(item?.queue_id ?? '') || queues.has(item.queue_id)) fail('FENCE_PROVIDER_RESPONSE_INVALID');
-    queues.set(item.queue_id, await readQueue(client, plan, item.queue_id));
-  }
+  const unlistedWriters = fencedList.filter(script => allBindings(script)
+    .some(binding => (binding.d1Id !== null || binding.bucket !== null) && listedLabel(binding) === null));
+  if (unlistedWriters.length) await refuse('FENCE_RESOURCE_UNLISTED', { scripts: unlistedWriters.map(script => script.name) });
+  // 5. Queue consumers: each fenced consumer is the only consumer of exactly
+  // its planned queue; no fenced script consumes any other queue.
+  const consumerDrift = new Set();
   for (const queue of queues.values()) {
     for (const consumer of queue.consumers) {
       const spec = consumer.script === null ? null : fenced.get(consumer.script);
-      if (spec && (spec.kind !== 'queue-consumer' || spec.queueId !== queue.queueId)) fail('CONSUMER_DRIFT');
+      if (spec && (spec.kind !== 'queue-consumer' || spec.queueId !== queue.queueId)) consumerDrift.add(spec.name);
     }
   }
   const delivery = new Map();
   for (const spec of plan.fencedScripts.filter(item => item.kind === 'queue-consumer')) {
     const queue = queues.get(spec.queueId);
     if (!queue || queue.consumers.length !== 1 || queue.consumers[0].type !== 'worker'
-        || queue.consumers[0].script !== spec.name) fail('CONSUMER_DRIFT');
+        || queue.consumers[0].script !== spec.name) {
+      consumerDrift.add(spec.name);
+      continue;
+    }
     if (queue.deliveryPaused === null) fail('FENCE_PROVIDER_RESPONSE_INVALID');
     delivery.set(spec.name, { queueId: spec.queueId, queueName: queue.queueName, paused: queue.deliveryPaused });
   }
+  if (consumerDrift.size) await refuse('CONSUMER_DRIFT', { scripts: [...consumerDrift] });
+  const crons = new Map(fencedList.map(item => [item.name, item.crons]));
+  // 6. Before any apply the crons must be the planned ones; apply, verify and
+  // release compare against their own phase state instead.
+  if (expectPlannedCrons) {
+    const drifted = plan.fencedScripts.filter(spec => !sameList(crons.get(spec.name), [...spec.expectedCrons]));
+    if (drifted.length) await refuse('SCHEDULE_DRIFT', { scripts: drifted.map(spec => spec.name) });
+  }
 
-  const crons = new Map(scripts.filter(item => item.classification === 'fenced').map(item => [item.name, item.crons]));
   const productionStorage = [
     ...Object.entries(FENCE_D1_LABELS).filter(([, spec]) => spec.owner === 'production')
       .map(([label, spec]) => ({ label, binding: spec.binding, ref: idDigest('d1', plan.d1[label]) })),
     { label: 'quarantine', binding: FENCE_R2_BINDING, ref: idDigest('r2', plan.r2.bucket) },
   ];
-  const fencedEntries = scripts.filter(item => item.classification === 'fenced').map(script => {
+  const fencedEntries = fencedList.map(script => {
     const spec = fenced.get(script.name);
     return {
       name: script.name,
@@ -567,8 +662,7 @@ async function collectInventory(client, plan, { now, requireFenced }) {
       queueIdSha256: spec.queueId === null ? null : idDigest('queue', spec.queueId),
       versions: script.versions.map(({ versionId, percentage, bindingsSha256 }) => ({ versionId, percentage, bindingsSha256 })),
       settingsBindingsSha256: script.settingsBindingsSha256,
-      bindings: sortBindings(allBindings(script).map(publicBinding)
-        .filter((item, index, list) => list.findIndex(other => sameList(other, item)) === index)),
+      bindings: unique(allBindings(script).map(publicBinding)),
     };
   });
   const dataResources = [
@@ -591,7 +685,7 @@ async function collectInventory(client, plan, { now, requireFenced }) {
     schema: FENCE_INVENTORY_SCHEMA,
     planSha256: plan.planSha256,
     accountSha256: idDigest('account', plan.accountId),
-    capturedAt: iso(now()),
+    capturedAt,
     productionWorker: {
       name: plan.productionWorker,
       deploymentId: production.deployment.deploymentId,
@@ -606,7 +700,8 @@ async function collectInventory(client, plan, { now, requireFenced }) {
       deliveryPaused: delivery.get(entry.name)?.paused ?? null,
     })),
     outOfScopeScripts: plan.outOfScopeScripts.map(item => ({ name: item.name, reason: item.reason, present: present.has(item.name) })),
-    unlistedScripts: scripts.filter(item => item.classification === 'unlisted').length,
+    scripts: survey.scripts,
+    queues: survey.queues,
     dataResources,
     fingerprintSha256,
   };
@@ -625,12 +720,6 @@ async function collectInventory(client, plan, { now, requireFenced }) {
   };
 }
 
-function scheduleDrift(inventory, plan) {
-  for (const spec of plan.fencedScripts) {
-    if (!sameList(inventory.crons.get(spec.name), [...spec.expectedCrons])) fail('SCHEDULE_DRIFT');
-  }
-}
-
 function plannedMutations(inventory, plan) {
   return plan.fencedScripts.map(spec => (spec.kind === 'cron'
     ? { action: 'clear-schedules', script: spec.name, before: { crons: inventory.crons.get(spec.name) }, after: { crons: [] } }
@@ -644,8 +733,8 @@ async function readSchedules(client, plan, name) {
 }
 
 async function putSchedules(client, plan, name, crons) {
-  const result = await client.api(`/accounts/${plan.accountId}/workers/scripts/${name}/schedules`,
-    crons.map(cron => ({ cron })), { mutation: true, method: 'PUT' });
+  const result = await client.mutate('PUT', `/accounts/${plan.accountId}/workers/scripts/${name}/schedules`,
+    crons.map(cron => ({ cron })));
   const echoed = rows(result, 'schedules', 16);
   if (!sameList(cronList(echoed.map(item => item?.cron), 'FENCE_PROVIDER_RESPONSE_INVALID'), [...crons].sort())) {
     fail('FENCE_MUTATION_UNVERIFIED');
@@ -653,20 +742,74 @@ async function putSchedules(client, plan, name, crons) {
 }
 
 async function setDelivery(client, plan, queueId, queueName, paused) {
-  const result = await client.api(`/accounts/${plan.accountId}/queues/${queueId}`,
-    { queue_name: queueName, settings: { delivery_paused: paused } }, { mutation: true, method: 'PATCH' });
+  const result = await client.mutate('PATCH', `/accounts/${plan.accountId}/queues/${queueId}`,
+    { queue_name: queueName, settings: { delivery_paused: paused } });
   if (record(result?.settings) && result.settings.delivery_paused !== undefined && result.settings.delivery_paused !== paused) {
     fail('FENCE_MUTATION_UNVERIFIED');
   }
 }
 
+const RECEIPT_INVALID = 'FENCE_RECEIPT_INVALID';
+
+/** The prior state journalled before apply's first write: exactly one entry
+ * per fenced script, with the action its kind implies and a well-formed
+ * before value. release restores exactly this. */
+function checkPriorState(value, plan) {
+  if (!Array.isArray(value) || value.length !== plan.fencedScripts.length) fail(RECEIPT_INVALID);
+  const seen = new Set();
+  for (const item of value) {
+    exactKeys(item, ['script', 'action', 'before'], RECEIPT_INVALID);
+    const spec = plan.fencedScripts.find(candidate => candidate.name === item.script);
+    if (!spec || seen.has(spec.name)) fail(RECEIPT_INVALID);
+    seen.add(spec.name);
+    if (spec.kind === 'cron') {
+      exactKeys(item.before, ['crons'], RECEIPT_INVALID);
+      if (item.action !== 'clear-schedules' || !sameList(cronList(item.before.crons, RECEIPT_INVALID), item.before.crons)) {
+        fail(RECEIPT_INVALID);
+      }
+    } else {
+      exactKeys(item.before, ['deliveryPaused'], RECEIPT_INVALID);
+      if (item.action !== 'pause-delivery' || typeof item.before.deliveryPaused !== 'boolean') fail(RECEIPT_INVALID);
+    }
+  }
+}
+
+// The production deployment that was fenced and active at apply: the anchor
+// for every "since the fence" history check.
+function checkProductionAnchor(value) {
+  if (!record(value) || !OPAQUE.test(value.deploymentId ?? '') || !UUID.test(value.versionId ?? '')
+      || value.mode !== 'fenced') fail(RECEIPT_INVALID);
+}
+
+function checkR2Digest(value) {
+  exactKeys(value, ['bucketSha256', 'inventorySha256', 'objects', 'bytes'], RECEIPT_INVALID);
+  if (!SHA256.test(value.bucketSha256 ?? '') || !SHA256.test(value.inventorySha256 ?? '')
+      || !count(value.objects) || !count(value.bytes)) fail(RECEIPT_INVALID);
+}
+
+function checkApplyIntent(value, plan, planReceiptSha256) {
+  exactKeys(value, ['schema', 'planSha256', 'planReceiptSha256', 'startedAtMs', 'analyticsDrainAttested',
+    'productionWorker', 'r2Baseline', 'priorState'], RECEIPT_INVALID);
+  if (value.planSha256 !== plan.planSha256 || value.planReceiptSha256 !== planReceiptSha256
+      || !Number.isSafeInteger(value.startedAtMs) || value.analyticsDrainAttested !== true) fail(RECEIPT_INVALID);
+  checkProductionAnchor(value.productionWorker);
+  checkR2Digest(value.r2Baseline);
+  checkPriorState(value.priorState, plan);
+}
+
 function checkApplyReceipt(value, plan, planReceiptSha256) {
+  exactKeys(value, ['schema', 'planSha256', 'planReceiptSha256', 'fingerprintSha256', 'startedAtMs', 'appliedAtMs',
+    'quietWindowMinutes', 'analyticsDrainAttested', 'productionWorker', 'r2Baseline', 'priorState', 'fencedState',
+    'mutationsIssued'], RECEIPT_INVALID);
   if (value.planSha256 !== plan.planSha256 || value.planReceiptSha256 !== planReceiptSha256
       || !Number.isSafeInteger(value.appliedAtMs) || !Number.isSafeInteger(value.startedAtMs)
       || value.appliedAtMs < value.startedAtMs || !SHA256.test(value.fingerprintSha256 ?? '')
-      || !record(value.productionWorker) || !Array.isArray(value.priorState) || !record(value.r2Baseline)) {
-    fail('FENCE_RECEIPT_INVALID');
+      || value.quietWindowMinutes !== plan.quietWindowMinutes || value.analyticsDrainAttested !== true) {
+    fail(RECEIPT_INVALID);
   }
+  checkProductionAnchor(value.productionWorker);
+  checkR2Digest(value.r2Baseline);
+  checkPriorState(value.priorState, plan);
 }
 
 /** Production deployments from newest back to the fenced deployment that was
@@ -697,14 +840,12 @@ async function productionHistory(client, plan, fencedDeploymentId) {
 }
 
 async function inventoryCommand({ client, plan, now, receiptsDirectory }) {
-  const inventory = await collectInventory(client, plan, { now, requireFenced: false });
-  scheduleDrift(inventory, plan);
+  const inventory = await collectInventory(client, plan, { now, requireFenced: false, expectPlannedCrons: true, receiptsDirectory });
   return writeReceipt(contentPath(receiptsDirectory, 'inventory', inventory.receipt), inventory.receipt);
 }
 
 async function planCommand({ client, plan, now, receiptsDirectory }) {
-  const inventory = await collectInventory(client, plan, { now, requireFenced: false });
-  scheduleDrift(inventory, plan);
+  const inventory = await collectInventory(client, plan, { now, requireFenced: false, expectPlannedCrons: true, receiptsDirectory });
   const receipt = {
     schema: FENCE_PLAN_RECEIPT_SCHEMA,
     planSha256: plan.planSha256,
@@ -725,35 +866,48 @@ async function applyCommand({ client, plan, now, receiptsDirectory, confirm, ana
   if (planReceiptSha256 !== confirm) fail('FENCE_CONFIRMATION_MISMATCH');
   if (planReceipt.planSha256 !== plan.planSha256 || !Array.isArray(planReceipt.mutations)
       || planReceipt.mutations.length !== plan.fencedScripts.length) fail('FENCE_PLAN_RECEIPT_MISMATCH');
+  const priorState = planReceipt.mutations.map(item => (record(item)
+    ? { script: item.script, action: item.action, before: item.before } : item));
+  checkPriorState(priorState, plan);
+  // A released fence is over: its journal and R2 baseline describe a state
+  // the writers have since moved past, so only a fresh plan fences again.
+  if (await exists(join(receiptsDirectory, `release-${confirm}.json`))) fail('FENCE_RELEASED');
   const receiptPath = join(receiptsDirectory, `apply-${confirm}.json`);
   if (await exists(receiptPath)) fail('FENCE_ALREADY_APPLIED');
   const intentPath = join(receiptsDirectory, `apply-intent-${confirm}.json`);
   const resuming = await exists(intentPath);
-  const inventory = await collectInventory(client, plan, { now, requireFenced: true });
+  let intent = null;
+  if (resuming) {
+    ({ value: intent } = await readReceipt(intentPath, FENCE_APPLY_INTENT_SCHEMA));
+    checkApplyIntent(intent, plan, confirm);
+    if (!sameList(intent.priorState, priorState)) fail(RECEIPT_INVALID);
+  }
+  const inventory = await collectInventory(client, plan, { now, requireFenced: true, receiptsDirectory });
   if (inventory.fingerprintSha256 !== planReceipt.fingerprintSha256) fail('FENCE_INVENTORY_CHANGED');
   const pending = [];
   for (const mutation of planReceipt.mutations) {
     const spec = plan.fencedScripts.find(item => item.name === mutation.script);
-    if (!spec) fail('FENCE_PLAN_RECEIPT_MISMATCH');
-    if (mutation.action === 'clear-schedules' && spec.kind === 'cron') {
+    if (mutation.action === 'clear-schedules') {
       const current = inventory.crons.get(spec.name);
-      if (sameList(current, mutation.after.crons) && (resuming || sameList(mutation.before.crons, mutation.after.crons))) continue;
+      if (sameList(current, mutation.after?.crons) && (resuming || sameList(mutation.before.crons, current))) continue;
       if (!sameList(current, mutation.before.crons)) fail('SCHEDULE_DRIFT');
       pending.push({ spec, mutation });
-    } else if (mutation.action === 'pause-delivery' && spec.kind === 'queue-consumer') {
+    } else {
       const current = inventory.delivery.get(spec.name);
       if (!sameList(inventory.crons.get(spec.name), [])) fail('SCHEDULE_DRIFT');
-      if (current.paused === mutation.after.deliveryPaused && (resuming || mutation.before.deliveryPaused === true)) continue;
+      if (current.paused === mutation.after?.deliveryPaused && (resuming || mutation.before.deliveryPaused === true)) continue;
       if (current.paused !== mutation.before.deliveryPaused) fail('CONSUMER_DRIFT');
       pending.push({ spec, mutation, queue: current });
-    } else fail('FENCE_PLAN_RECEIPT_MISMATCH');
+    }
   }
-  if (client.remaining() < 2 * pending.length + R2_READS) fail('FENCE_REQUEST_BUDGET');
-  let intent;
-  if (resuming) {
-    ({ value: intent } = await readReceipt(intentPath, FENCE_APPLY_INTENT_SCHEMA));
-    if (intent.planReceiptSha256 !== confirm || intent.planSha256 !== plan.planSha256) fail('FENCE_RECEIPT_INVALID');
-  } else {
+  // Every read and write this apply still needs must fit before the first
+  // write: the R2 baseline (fresh apply only), one write per pending
+  // mutation, and the schedules and queue readbacks.
+  const consumers = plan.fencedScripts.filter(spec => spec.kind === 'queue-consumer').length;
+  if (client.remaining() < (resuming ? 0 : R2_READS) + pending.length + plan.fencedScripts.length + consumers) {
+    fail('FENCE_REQUEST_BUDGET');
+  }
+  if (!resuming) {
     // The R2 quarantine baseline is taken with production already fenced and
     // before any write: verify must see the same digest at the window end.
     intent = {
@@ -764,7 +918,7 @@ async function applyCommand({ client, plan, now, receiptsDirectory, confirm, ana
       analyticsDrainAttested: analyticsDrainComplete === true,
       productionWorker: inventory.production,
       r2Baseline: await client.r2Digest(),
-      priorState: planReceipt.mutations.map(({ script, action, before }) => ({ script, action, before })),
+      priorState,
     };
     await writeReceipt(intentPath, intent);
   }
@@ -802,26 +956,33 @@ async function applyCommand({ client, plan, now, receiptsDirectory, confirm, ana
 }
 
 async function verifyCommand({ client, plan, now, receiptsDirectory, fence, windowStartMs }) {
+  const releasePath = join(receiptsDirectory, `release-${fence}.json`);
+  if (await exists(releasePath)) fail('FENCE_RELEASED');
   const applyPath = join(receiptsDirectory, `apply-${fence}.json`);
   if (!await exists(applyPath)) fail('FENCE_NOT_APPLIED');
-  if (await exists(join(receiptsDirectory, `release-${fence}.json`))) fail('FENCE_RELEASED');
   const { value: apply, sha256: applyReceiptSha256 } = await readReceipt(applyPath, FENCE_APPLY_RECEIPT_SCHEMA);
   checkApplyReceipt(apply, plan, fence);
   const quietMs = plan.quietWindowMinutes * 60_000;
   const endMs = now();
+  // Analytics stop a lag margin short of now; that interval must itself be a
+  // full quiet window, so absent (not yet ingested) data is never the proof.
+  const analyticsEndMs = endMs - FENCE_ANALYTICS_LAG_MINUTES * 60_000;
   const startMs = windowStartMs ?? apply.appliedAtMs + quietMs;
   if (startMs < apply.appliedAtMs + quietMs) fail('FENCE_WINDOW_TOO_EARLY');
-  if (endMs - startMs < quietMs) fail('FENCE_WINDOW_TOO_SHORT');
+  if (analyticsEndMs - startMs < quietMs) fail('FENCE_WINDOW_TOO_SHORT');
 
-  const inventory = await collectInventory(client, plan, { now, requireFenced: true });
+  const inventory = await collectInventory(client, plan, { now, requireFenced: true, receiptsDirectory });
   if (inventory.fingerprintSha256 !== apply.fingerprintSha256) fail('FENCE_INVENTORY_CHANGED');
   for (const deployment of await productionHistory(client, plan, apply.productionWorker.deploymentId)) {
     if (!singleVersion(deployment) || deployment.modes[0] !== 'fenced') fail('PRODUCTION_WORKER_NOT_FENCED');
   }
-  for (const spec of plan.fencedScripts) {
-    if (inventory.crons.get(spec.name).length !== 0) fail('FENCE_NOT_APPLIED');
-    if (spec.kind === 'queue-consumer' && inventory.delivery.get(spec.name).paused !== true) fail('FENCE_NOT_APPLIED');
-  }
+  // The receipt states the observed schedules and delivery, not the target.
+  const fencedScripts = plan.fencedScripts.map(spec => {
+    const crons = inventory.crons.get(spec.name);
+    const deliveryPaused = spec.kind === 'queue-consumer' ? inventory.delivery.get(spec.name).paused : null;
+    if (crons.length !== 0 || (spec.kind === 'queue-consumer' && deliveryPaused !== true)) fail('FENCE_NOT_APPLIED');
+    return { name: spec.name, kind: spec.kind, crons, deliveryPaused };
+  });
 
   const bookmark = async (id, atMs) => {
     const query = atMs === null ? '' : `?timestamp=${encodeURIComponent(iso(atMs))}`;
@@ -843,35 +1004,35 @@ async function verifyCommand({ client, plan, now, receiptsDirectory, fence, wind
       || r2.objects !== apply.r2Baseline.objects || r2.bytes !== apply.r2Baseline.bytes) fail('FENCE_NOT_QUIESCENT');
 
   const window = { start: iso(startMs), end: iso(endMs) };
+  const analyticsWindow = { start: window.start, end: iso(analyticsEndMs) };
   const labelOf = new Map(Object.entries(plan.d1).map(([label, id]) => [id, label]));
   const writes = Object.fromEntries(Object.keys(plan.d1).map(label => [label, { rowsWritten: 0, writeQueries: 0 }]));
-  const d1Groups = (await client.graphql('d1Writes', { accountTag: plan.accountId, ...window, databaseIds: Object.values(plan.d1) }))
-    .d1AnalyticsAdaptiveGroups;
+  const d1Groups = (await client.graphql('d1Writes', { accountTag: plan.accountId, ...analyticsWindow,
+    databaseIds: Object.values(plan.d1) })).d1AnalyticsAdaptiveGroups;
   if (!Array.isArray(d1Groups) || d1Groups.length >= 100) fail('FENCE_ANALYTICS_INVALID');
   for (const group of d1Groups) {
     const label = labelOf.get(group?.dimensions?.databaseId);
     const { rowsWritten, writeQueries } = group?.sum ?? {};
-    if (!label || !Number.isSafeInteger(rowsWritten) || rowsWritten < 0 || !Number.isSafeInteger(writeQueries) || writeQueries < 0) {
-      fail('FENCE_ANALYTICS_INVALID');
-    }
+    if (!label || !count(rowsWritten) || !count(writeQueries)) fail('FENCE_ANALYTICS_INVALID');
     writes[label].rowsWritten += rowsWritten;
     writes[label].writeQueries += writeQueries;
   }
   if (Object.values(writes).some(item => item.rowsWritten !== 0 || item.writeQueries !== 0)) fail('FENCE_NOT_QUIESCENT');
   const fencedNames = plan.fencedScripts.map(spec => spec.name);
-  const invocationGroups = (await client.graphql('invocations', { accountTag: plan.accountId, ...window, scriptNames: fencedNames }))
-    .workersInvocationsAdaptive;
+  const invocationGroups = (await client.graphql('invocations', { accountTag: plan.accountId, ...analyticsWindow,
+    scriptNames: fencedNames })).workersInvocationsAdaptive;
   if (!Array.isArray(invocationGroups) || invocationGroups.length >= 100) fail('FENCE_ANALYTICS_INVALID');
   let invocations = 0;
   for (const group of invocationGroups) {
     const requests = group?.sum?.requests;
-    if (!fencedNames.includes(group?.dimensions?.scriptName) || !Number.isSafeInteger(requests) || requests < 0) {
-      fail('FENCE_ANALYTICS_INVALID');
-    }
+    if (!fencedNames.includes(group?.dimensions?.scriptName) || !count(requests)) fail('FENCE_ANALYTICS_INVALID');
     invocations += requests;
   }
   if (invocations !== 0) fail('FENCE_NOT_QUIESCENT');
 
+  // verify holds the receipts lock, so no release runs concurrently; the
+  // re-check keeps a fence receipt from ever post-dating a release receipt.
+  if (await exists(releasePath)) fail('FENCE_RELEASED');
   const receipt = {
     schema: FENCE_RECEIPT_SCHEMA,
     planSha256: plan.planSha256,
@@ -881,13 +1042,13 @@ async function verifyCommand({ client, plan, now, receiptsDirectory, fence, wind
     verifiedAt: iso(endMs),
     productionWorker: { name: plan.productionWorker, deploymentId: inventory.production.deploymentId,
       versionId: inventory.production.versionId, mode: 'fenced', sourceCommit: inventory.production.sourceCommit },
-    fencedScripts: plan.fencedScripts.map(spec => ({ name: spec.name, kind: spec.kind, crons: [],
-      deliveryPaused: spec.kind === 'queue-consumer' ? true : null })),
+    fencedScripts,
     window: { appliedAt: iso(apply.appliedAtMs), quietWindowMinutes: plan.quietWindowMinutes, ...window },
     d1,
     r2,
     analytics: {
       querySha256: { ...FENCE_GRAPHQL_QUERY_SHA256 },
+      window: { ...analyticsWindow, lagMinutes: FENCE_ANALYTICS_LAG_MINUTES },
       d1: Object.entries(writes).map(([label, item]) => ({ label, ...item })),
       fencedScriptInvocations: invocations,
     },
@@ -896,34 +1057,43 @@ async function verifyCommand({ client, plan, now, receiptsDirectory, fence, wind
 }
 
 async function releaseCommand({ client, plan, now, receiptsDirectory, confirm }) {
-  const applyPath = join(receiptsDirectory, `apply-${confirm}.json`);
-  if (!await exists(applyPath)) fail('FENCE_CONFIRMATION_MISMATCH');
-  const { value: apply, sha256: applyReceiptSha256 } = await readReceipt(applyPath, FENCE_APPLY_RECEIPT_SCHEMA);
-  checkApplyReceipt(apply, plan, confirm);
   const receiptPath = join(receiptsDirectory, `release-${confirm}.json`);
   if (await exists(receiptPath)) fail('FENCE_ALREADY_RELEASED');
-  const history = await productionHistory(client, plan, apply.productionWorker.deploymentId);
+  // apply journals the prior state before its first write, so the journal
+  // exists both for a complete apply and for one that stopped partway (and
+  // cannot resume); the apply receipt, when present, must agree with it.
+  const intentPath = join(receiptsDirectory, `apply-intent-${confirm}.json`);
+  const applyPath = join(receiptsDirectory, `apply-${confirm}.json`);
+  const intent = await exists(intentPath) ? await readReceipt(intentPath, FENCE_APPLY_INTENT_SCHEMA) : null;
+  const apply = await exists(applyPath) ? await readReceipt(applyPath, FENCE_APPLY_RECEIPT_SCHEMA) : null;
+  if (intent === null && apply === null) fail('FENCE_CONFIRMATION_MISMATCH');
+  if (intent !== null) checkApplyIntent(intent.value, plan, confirm);
+  if (apply !== null) checkApplyReceipt(apply.value, plan, confirm);
+  if (intent !== null && apply !== null && (!sameList(intent.value.priorState, apply.value.priorState)
+      || intent.value.productionWorker.deploymentId !== apply.value.productionWorker.deploymentId)) fail(RECEIPT_INVALID);
+  const origin = (apply ?? intent).value;
+  const history = await productionHistory(client, plan, origin.productionWorker.deploymentId);
   // An unrecognized mode cannot be proved non-gcp, so it refuses too.
   if (history.some(deployment => deployment.modes.some(mode => mode !== null && mode !== 'worker' && mode !== 'fenced'))) {
     fail('FENCE_RELEASE_AFTER_GCP');
   }
 
+  // Only a script still at the fenced target is restored; one already at its
+  // prior value is left alone, and any other value is someone else's change.
   const targets = [];
-  for (const prior of apply.priorState) {
+  for (const prior of origin.priorState) {
     const spec = plan.fencedScripts.find(item => item.name === prior.script);
-    if (!spec) fail('FENCE_RECEIPT_INVALID');
-    if (prior.action === 'clear-schedules' && spec.kind === 'cron') {
-      const restore = cronList(prior.before?.crons, 'FENCE_RECEIPT_INVALID');
+    if (spec.kind === 'cron') {
+      const restore = prior.before.crons;
       const current = await readSchedules(client, plan, spec.name);
       if (!sameList(current, []) && !sameList(current, restore)) fail('SCHEDULE_DRIFT');
       targets.push({ spec, prior: { crons: restore }, pending: !sameList(current, restore) });
-    } else if (prior.action === 'pause-delivery' && spec.kind === 'queue-consumer') {
-      const restore = prior.before?.deliveryPaused;
-      if (typeof restore !== 'boolean') fail('FENCE_RECEIPT_INVALID');
+    } else {
+      const restore = prior.before.deliveryPaused;
       const queue = await readQueue(client, plan, spec.queueId);
       if (queue.deliveryPaused !== true && queue.deliveryPaused !== restore) fail('CONSUMER_DRIFT');
       targets.push({ spec, prior: { deliveryPaused: restore }, queue, pending: queue.deliveryPaused !== restore });
-    } else fail('FENCE_RECEIPT_INVALID');
+    }
   }
   if (client.remaining() < 2 * targets.length) fail('FENCE_REQUEST_BUDGET');
   let mutationsIssued = 0;
@@ -948,7 +1118,9 @@ async function releaseCommand({ client, plan, now, receiptsDirectory, confirm })
     schema: FENCE_RELEASE_RECEIPT_SCHEMA,
     planSha256: plan.planSha256,
     planReceiptSha256: confirm,
-    applyReceiptSha256,
+    releasedFrom: apply === null ? 'apply-intent' : 'apply',
+    applyReceiptSha256: apply?.sha256 ?? null,
+    applyIntentSha256: intent?.sha256 ?? null,
     releasedAt: iso(now()),
     preGcp: true,
     productionHistory: history.map(({ deploymentId, modes }) => ({ deploymentId, modes })),
@@ -986,7 +1158,9 @@ export async function runCloudflareWriterFence({ subcommand, plan: input, receip
   receiptsDirectory = resolve(receiptsDirectory);
   await assertPrivateDirectory(receiptsDirectory);
   const client = createFenceClient({ plan, subcommand, receiptsDirectory, cliPath, fetcher, environment });
-  const unlock = subcommand === 'apply' || subcommand === 'release' ? await lockReceipts(receiptsDirectory) : () => {};
+  // apply, verify and release serialise on the receipts directory, so a fence
+  // receipt is never written while a release of the same fence is running.
+  const unlock = ['apply', 'verify', 'release'].includes(subcommand) ? await lockReceipts(receiptsDirectory) : () => {};
   try {
     return await COMMANDS[subcommand]({ client, plan, now, receiptsDirectory, confirm, fence, windowStartMs, analyticsDrainComplete });
   } catch (error) {
@@ -999,23 +1173,94 @@ export async function runCloudflareWriterFence({ subcommand, plan: input, receip
   }
 }
 
-/** Consumer-side reader for PT-2 and HX-6: returns the fence receipt only when
- * its bytes hash to the pinned sha256 and its closed shape holds. */
-export async function readCloudflareWriterFenceReceipt(path, expectedSha256) {
-  if (!SHA256.test(expectedSha256 ?? '')) fail('FENCE_RECEIPT_INVALID');
-  const { value, sha256: actual } = await readReceipt(path, FENCE_RECEIPT_SCHEMA);
-  if (actual !== expectedSha256) fail('FENCE_RECEIPT_INVALID');
+function checkFenceReceipt(value) {
   exactKeys(value, ['schema', 'planSha256', 'planReceiptSha256', 'applyReceiptSha256', 'accountSha256', 'verifiedAt',
-    'productionWorker', 'fencedScripts', 'window', 'd1', 'r2', 'analytics'], 'FENCE_RECEIPT_INVALID');
-  if (value.productionWorker?.mode !== 'fenced' || !Array.isArray(value.fencedScripts)
-      || value.fencedScripts.some(item => item?.crons?.length !== 0 || (item.kind === 'queue-consumer' && item.deliveryPaused !== true))
-      || !Array.isArray(value.d1) || value.d1.length !== Object.keys(FENCE_D1_LABELS).length
-      || value.d1.some(item => !Object.hasOwn(FENCE_D1_LABELS, item?.label) || !OPAQUE.test(item.bookmark ?? '') || !SHA256.test(item.idSha256 ?? ''))
-      || !SHA256.test(value.r2?.inventorySha256 ?? '') || value.analytics?.fencedScriptInvocations !== 0
-      || !Array.isArray(value.analytics?.d1) || value.analytics.d1.some(item => item?.rowsWritten !== 0 || item.writeQueries !== 0)
-      || Date.parse(value.window?.start) < Date.parse(value.window?.appliedAt) + value.window?.quietWindowMinutes * 60_000
-      || Date.parse(value.window?.end) - Date.parse(value.window?.start) < value.window?.quietWindowMinutes * 60_000) {
-    fail('FENCE_RECEIPT_INVALID');
+    'productionWorker', 'fencedScripts', 'window', 'd1', 'r2', 'analytics'], RECEIPT_INVALID);
+  if (['planSha256', 'planReceiptSha256', 'applyReceiptSha256', 'accountSha256'].some(key => !SHA256.test(value[key] ?? ''))) {
+    fail(RECEIPT_INVALID);
+  }
+  const production = value.productionWorker;
+  exactKeys(production, ['name', 'deploymentId', 'versionId', 'mode', 'sourceCommit'], RECEIPT_INVALID);
+  if (!SCRIPT.test(production.name ?? '') || !OPAQUE.test(production.deploymentId ?? '') || !UUID.test(production.versionId ?? '')
+      || production.mode !== 'fenced'
+      || !(production.sourceCommit === null || (typeof production.sourceCommit === 'string' && COMMIT.test(production.sourceCommit)))) {
+    fail(RECEIPT_INVALID);
+  }
+  if (!Array.isArray(value.fencedScripts) || value.fencedScripts.length < 1 || value.fencedScripts.length > MAX_FENCED_SCRIPTS) {
+    fail(RECEIPT_INVALID);
+  }
+  const names = new Set([production.name]);
+  for (const item of value.fencedScripts) {
+    exactKeys(item, ['name', 'kind', 'crons', 'deliveryPaused'], RECEIPT_INVALID);
+    if (!SCRIPT.test(item.name ?? '') || names.has(item.name) || !Array.isArray(item.crons) || item.crons.length !== 0
+        || !(item.kind === 'cron' ? item.deliveryPaused === null : item.kind === 'queue-consumer' && item.deliveryPaused === true)) {
+      fail(RECEIPT_INVALID);
+    }
+    names.add(item.name);
+  }
+  // Every time must be a canonical ISO instant; NaN never passes a comparison.
+  exactKeys(value.window, ['appliedAt', 'quietWindowMinutes', 'start', 'end'], RECEIPT_INVALID);
+  const quiet = value.window.quietWindowMinutes;
+  const [appliedAtMs, startMs, endMs, verifiedAtMs] = [value.window.appliedAt, value.window.start, value.window.end,
+    value.verifiedAt].map(isoMs);
+  if (!Number.isSafeInteger(quiet) || quiet < FENCE_MIN_QUIET_WINDOW_MINUTES || quiet > 1_440
+      || [appliedAtMs, startMs, endMs, verifiedAtMs].includes(null)
+      || startMs < appliedAtMs + quiet * 60_000 || endMs - startMs < quiet * 60_000 || verifiedAtMs !== endMs) {
+    fail(RECEIPT_INVALID);
+  }
+  const labels = Object.keys(FENCE_D1_LABELS);
+  if (!Array.isArray(value.d1) || value.d1.length !== labels.length) fail(RECEIPT_INVALID);
+  value.d1.forEach((item, index) => {
+    exactKeys(item, ['label', 'idSha256', 'bookmark'], RECEIPT_INVALID);
+    if (item.label !== labels[index] || !SHA256.test(item.idSha256 ?? '') || !OPAQUE.test(item.bookmark ?? '')) fail(RECEIPT_INVALID);
+  });
+  if (new Set(value.d1.map(item => item.idSha256)).size !== labels.length) fail(RECEIPT_INVALID);
+  checkR2Digest(value.r2);
+  const { analytics } = value;
+  exactKeys(analytics, ['querySha256', 'window', 'd1', 'fencedScriptInvocations'], RECEIPT_INVALID);
+  exactKeys(analytics.querySha256, Object.keys(FENCE_GRAPHQL_QUERY_SHA256), RECEIPT_INVALID);
+  if (Object.entries(FENCE_GRAPHQL_QUERY_SHA256).some(([name, digest]) => analytics.querySha256[name] !== digest)) {
+    fail(RECEIPT_INVALID);
+  }
+  exactKeys(analytics.window, ['start', 'end', 'lagMinutes'], RECEIPT_INVALID);
+  const lag = analytics.window.lagMinutes;
+  const analyticsEndMs = isoMs(analytics.window.end);
+  if (analytics.window.start !== value.window.start || !Number.isSafeInteger(lag) || lag < FENCE_ANALYTICS_LAG_MINUTES
+      || analyticsEndMs === null || analyticsEndMs !== endMs - lag * 60_000 || analyticsEndMs - startMs < quiet * 60_000) {
+    fail(RECEIPT_INVALID);
+  }
+  if (!Array.isArray(analytics.d1) || analytics.d1.length !== labels.length) fail(RECEIPT_INVALID);
+  analytics.d1.forEach((item, index) => {
+    exactKeys(item, ['label', 'rowsWritten', 'writeQueries'], RECEIPT_INVALID);
+    if (item.label !== labels[index] || item.rowsWritten !== 0 || item.writeQueries !== 0) fail(RECEIPT_INVALID);
+  });
+  if (analytics.fencedScriptInvocations !== 0) fail(RECEIPT_INVALID);
+}
+
+/**
+ * Consumer-side reader for PT-2 and HX-6. Returns the fence receipt only when
+ * its bytes hash to the pinned sha256, its closed shape holds, it still sits
+ * in its private receipts directory beside the apply receipt it names, and
+ * that fence has not been released. The answer holds as of the read: a
+ * consumer that acts later reads again.
+ */
+export async function readCloudflareWriterFenceReceipt(path, expectedSha256) {
+  if (typeof path !== 'string' || !SHA256.test(expectedSha256 ?? '')) fail(RECEIPT_INVALID);
+  const receiptPath = resolve(path);
+  const directory = dirname(receiptPath);
+  await assertPrivateDirectory(directory);
+  const { value, sha256: actual } = await readReceipt(receiptPath, FENCE_RECEIPT_SCHEMA);
+  if (actual !== expectedSha256) fail(RECEIPT_INVALID);
+  checkFenceReceipt(value);
+  if (await exists(join(directory, `release-${value.planReceiptSha256}.json`))) fail('FENCE_RELEASED');
+  const applyPath = join(directory, `apply-${value.planReceiptSha256}.json`);
+  if (!await exists(applyPath)) fail(RECEIPT_INVALID);
+  const { value: apply, sha256: applySha256 } = await readReceipt(applyPath, FENCE_APPLY_RECEIPT_SCHEMA);
+  if (applySha256 !== value.applyReceiptSha256 || apply.planSha256 !== value.planSha256
+      || apply.planReceiptSha256 !== value.planReceiptSha256 || !Number.isSafeInteger(apply.appliedAtMs)
+      || iso(apply.appliedAtMs) !== value.window.appliedAt || apply.quietWindowMinutes !== value.window.quietWindowMinutes
+      || !sameList(apply.r2Baseline, value.r2)) {
+    fail(RECEIPT_INVALID);
   }
   return value;
 }
@@ -1046,6 +1291,16 @@ export function parseCloudflareWriterFenceArguments(args) {
   return options;
 }
 
+/** Provider failures can carry tokens, ids or metadata, so the CLI emits only
+ * the code, plus the content-addressed inventory-refusal receipt when one was
+ * written. */
+export function cloudflareWriterFenceErrorLine(error) {
+  const code = /^[A-Z][A-Z0-9_]{2,95}$/.test(error?.code ?? '') ? error.code : 'FENCE_FAILED';
+  const refusal = typeof error?.refusalReceipt === 'string' && /^inventory-refusal-[a-f0-9]{64}\.json$/.test(error.refusalReceipt)
+    ? ` ${error.refusalReceipt}` : '';
+  return `${code}${refusal}\n`;
+}
+
 async function main() {
   try {
     const { planPath, ...options } = parseCloudflareWriterFenceArguments(process.argv.slice(2));
@@ -1059,8 +1314,7 @@ async function main() {
     }
     process.stdout.write(`${JSON.stringify(summary)}\n`);
   } catch (error) {
-    // Provider failures can carry tokens, ids or metadata; emit only codes.
-    process.stderr.write(`${/^[A-Z][A-Z0-9_]{2,95}$/.test(error?.code ?? '') ? error.code : 'FENCE_FAILED'}\n`);
+    process.stderr.write(cloudflareWriterFenceErrorLine(error));
     process.exitCode = 1;
   }
 }
