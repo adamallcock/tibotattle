@@ -20,6 +20,10 @@ import {
   assertPostgresTypedV12WriteAllowed,
   type PostgresTypedV12Principal,
 } from "./postgres-typed-v12-admission";
+import {
+  classifyPostgresTelemetryV12StorageError,
+  postgresTelemetryV12StorageFailure,
+} from "./postgres-telemetry-v12-storage-refusal";
 import type {
   TelemetryV12DomainActivation as TelemetryV12DomainActivationBase,
   TelemetryV12DomainPredecessor,
@@ -100,8 +104,11 @@ function iso(epoch: number): string {
   return new Date(epoch).toISOString();
 }
 
+// A table constraint failure is the paced 503 TELEMETRY_STORAGE_CONSTRAINT,
+// a concurrent writer or telemetry_v12 unique key is 409, and a lock or
+// statement timeout is an unpaced 503, never a 500.
 function preserveSafeError(error: unknown): Error | null {
-  return error instanceof ApiError ? error : null;
+  return classifyPostgresTelemetryV12StorageError(error);
 }
 
 function conflict(): ApiError {
@@ -352,7 +359,9 @@ export function createPostgresTypedV12Domain(
           token, previousGenerationId: state.generation_id,
           legacyFingerprint, fromDay, throughDay, expiresAt,
         };
-      }, { operation: "telemetry.v12.domain.predecessor", preserveSafeError });
+      }, { operation: "telemetry.v12.domain.predecessor", preserveSafeError }).catch((error) => {
+        throw postgresTelemetryV12StorageFailure(error);
+      });
     },
 
     async activate(principal: PostgresTypedV12Principal, value: unknown, nowEpoch = Date.now()) {
@@ -520,7 +529,7 @@ export function createPostgresTypedV12Domain(
           (client) => activeDomainByDigest(client, schema, principal, manifest.manifestDigest),
           { operation: "telemetry.v12.domain.replay" }).catch(() => null);
         if (replay) return activationResult(replay, true);
-        throw error;
+        throw postgresTelemetryV12StorageFailure(error);
       });
     },
   });
