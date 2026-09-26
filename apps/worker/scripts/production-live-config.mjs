@@ -10,6 +10,37 @@ import { operationError } from "../../../scripts/lib/release-operation.mjs";
 export const PRODUCTION_LIVE_CONFIG_SCHEMA = "production-live-config-v1";
 export const PRODUCTION_LIVE_CONFIG_SOURCE_BINDING = "DEPLOYMENT_SOURCE_COMMIT";
 
+/**
+ * The only bindings a typed production deployment may add. That path otherwise
+ * reproduces the live bindings exactly, so a Rate Limit binding the source
+ * requires and the live Worker lacks could never reach production, and every
+ * route that asserts it would answer 503. A binding listed here is added only
+ * while the tracked production config declares it with exactly these values
+ * and the live Worker has neither its name nor its namespace. A tracked Rate
+ * Limit binding that live lacks and this list does not pin fails closed; a
+ * binding live already has keeps its live values. An entry is inert once live.
+ */
+export const PRODUCTION_RATE_LIMIT_ADDITIONS = Object.freeze([
+  Object.freeze({
+    name: "DEVICE_SYNC_RATE_LIMIT",
+    type: "ratelimit",
+    namespace_id: "3009",
+    simple: Object.freeze({ limit: 6000, period: 60 }),
+  }),
+  Object.freeze({
+    name: "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT",
+    type: "ratelimit",
+    namespace_id: "3010",
+    simple: Object.freeze({ limit: 4200, period: 60 }),
+  }),
+  Object.freeze({
+    name: "DEVICE_SYNC_CLIENT_RATE_LIMIT",
+    type: "ratelimit",
+    namespace_id: "3011",
+    simple: Object.freeze({ limit: 4200, period: 60 }),
+  }),
+]);
+
 const SHA = /^[0-9a-f]{40}$/u;
 const HEX32 = /^[0-9a-f]{32}$/u;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u;
@@ -266,6 +297,51 @@ function bindingsByName(bindings) {
 
 function bindingsEquivalent(left, right) {
   return JSON.stringify(sorted(left)) === JSON.stringify(sorted(right));
+}
+
+// Candidate Rate Limit bindings the live Worker does not have. Each must be a
+// pinned addition, and none may reuse a live namespace: a shared namespace
+// would silently merge two counters.
+function reviewedRateLimitAdditions(liveBindings, candidates) {
+  const liveNamespaces = new Set(liveBindings
+    .filter((binding) => binding.type === "ratelimit")
+    .map((binding) => binding.namespace_id));
+  const namespaces = new Set();
+  return sorted(candidates.map((binding) => {
+    const pinned = PRODUCTION_RATE_LIMIT_ADDITIONS.find((entry) => entry.name === binding.name);
+    if (pinned === undefined || digest(pinned) !== digest(binding)) {
+      fail("CONFIG_RATELIMIT_ADDITION_UNREVIEWED");
+    }
+    if (liveNamespaces.has(binding.namespace_id) || namespaces.has(binding.namespace_id)) {
+      fail("CONFIG_RATELIMIT_NAMESPACE_CONFLICT");
+    }
+    namespaces.add(binding.namespace_id);
+    return {
+      name: binding.name,
+      type: binding.type,
+      namespace_id: binding.namespace_id,
+      simple: { limit: binding.simple.limit, period: binding.simple.period },
+    };
+  }));
+}
+
+function trackedRateLimitAdditions(environment, liveBindings) {
+  if (!Array.isArray(environment.ratelimits)) fail("CONFIG_RATELIMIT_INVALID");
+  const liveNames = new Set(liveBindings.map((binding) => binding.name));
+  return reviewedRateLimitAdditions(liveBindings, environment.ratelimits
+    .filter((entry) => !liveNames.has(entry?.name))
+    .map((entry) => normalizeBinding({
+      ...requiredObject(entry, "CONFIG_RATELIMIT_INVALID"),
+      type: "ratelimit",
+    })));
+}
+
+// The live configuration a candidate with these additions produces once
+// deployed; with no additions it is the snapshot itself.
+function snapshotWithRateLimitAdditions(snapshot, additions) {
+  if (additions.length === 0) return snapshot;
+  const expected = { ...snapshot, bindings: sorted([...snapshot.bindings, ...additions]) };
+  return { ...expected, fingerprint: digest(comparableSnapshot(expected)) };
 }
 
 function normalizeRuntime(runtime) {
@@ -776,8 +852,11 @@ export function createProductionLiveConfigSnapshot(inventory) {
 /**
  * Render a complete config that can be passed to Wrangler with
  * `--env production`. Only the production environment is replaced; staging
- * and root configuration remain source-owned. The resulting object contains
- * live plain vars and resource identifiers and must therefore stay private.
+ * and root configuration remain source-owned. Every live binding is carried
+ * with its live values; the only addition is a pinned Rate Limit binding the
+ * tracked config declares and live lacks (PRODUCTION_RATE_LIMIT_ADDITIONS).
+ * The resulting object contains live plain vars and resource identifiers and
+ * must therefore stay private.
  */
 export function renderProductionLiveConfig({ trackedConfig, snapshot, sourceCommit }) {
   const inventoryBindings = snapshot?.schema === PRODUCTION_LIVE_CONFIG_SCHEMA
@@ -811,6 +890,7 @@ export function renderProductionLiveConfig({ trackedConfig, snapshot, sourceComm
   const original = configEnvironment(trackedConfig);
   checkUnsupportedResources(original);
   if (original.name !== normalized.workerName) fail("CONFIG_NAME_DRIFT");
+  const rateLimitAdditions = trackedRateLimitAdditions(original, normalized.bindings);
   const base = cloneJson(original, "CONFIG_INVALID");
   const existingD1 = new Map((base.d1_databases ?? []).map((entry) => [entry.binding, entry]));
   const existingR2 = new Map((base.r2_buckets ?? []).map((entry) => [entry.binding, entry]));
@@ -866,7 +946,12 @@ export function renderProductionLiveConfig({ trackedConfig, snapshot, sourceComm
     secrets: { required: normalized.bindings.filter((binding) => binding.type === "secret_text").map((binding) => binding.name).sort() },
     d1_databases,
     r2_buckets,
-    ratelimits: normalized.bindings.filter((binding) => binding.type === "ratelimit").map(({ name, namespace_id, simple }) => ({ name, namespace_id, simple })),
+    // Live Rate Limit bindings keep their live values; only the reviewed
+    // additions the tracked config declares and live lacks are appended.
+    ratelimits: [
+      ...normalized.bindings.filter((binding) => binding.type === "ratelimit"),
+      ...rateLimitAdditions,
+    ].map(({ name, namespace_id, simple }) => ({ name, namespace_id, simple })),
     durable_objects: { ...base.durable_objects, bindings: durableBindings },
     assets,
     ...(Object.keys(normalized.settings.placement).length > 0
@@ -895,7 +980,10 @@ export function renderProductionLiveConfig({ trackedConfig, snapshot, sourceComm
 
 /**
  * Compare a rendered candidate config with a captured live baseline. The
- * result is intentionally limited to status, a stable code, and digests.
+ * result is intentionally limited to status, a stable code, digests and the
+ * names of pinned Rate Limit additions (public source values). The candidate
+ * must equal the baseline plus only such additions; expectedFingerprint is
+ * the live fingerprint once this candidate is deployed.
  */
 export function verifyProductionLiveConfig({ snapshot, candidateConfig, sourceCommit }) {
   try {
@@ -905,8 +993,12 @@ export function verifyProductionLiveConfig({ snapshot, candidateConfig, sourceCo
     const environment = configEnvironment(candidateConfig);
     checkUnsupportedResources(environment);
     const candidate = candidateComparable({ config: candidateConfig, snapshot: normalized });
-    assertCandidateMatches({ candidate, snapshot: normalized, sourceCommit });
-    const expectedFingerprint = normalized.fingerprint ?? digest(comparableSnapshot(normalized));
+    const liveNames = new Set(normalized.bindings.map((binding) => binding.name));
+    const additions = reviewedRateLimitAdditions(normalized.bindings, candidate.bindings
+      .filter((binding) => binding.type === "ratelimit" && !liveNames.has(binding.name)));
+    const expected = snapshotWithRateLimitAdditions(normalized, additions);
+    assertCandidateMatches({ candidate, snapshot: expected, sourceCommit });
+    const expectedFingerprint = expected.fingerprint ?? digest(comparableSnapshot(expected));
     const actualFingerprint = digest({
       accountId: candidate.accountId,
       bindings: candidate.bindings,
@@ -922,7 +1014,13 @@ export function verifyProductionLiveConfig({ snapshot, candidateConfig, sourceCo
     if (expectedFingerprint !== actualFingerprint) {
       return { ok: false, code: "PRODUCTION_LIVE_CONFIG_DRIFT", expectedFingerprint, actualFingerprint };
     }
-    return { ok: true, code: null, expectedFingerprint, actualFingerprint };
+    return {
+      ok: true,
+      code: null,
+      expectedFingerprint,
+      actualFingerprint,
+      rateLimitAdditions: additions.map((binding) => binding.name),
+    };
   } catch (error) {
     if (typeof error?.code === "string" && error.code.startsWith("PRODUCTION_LIVE_CONFIG_")) {
       return { ok: false, code: error.code };

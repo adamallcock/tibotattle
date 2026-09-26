@@ -80,7 +80,7 @@ site.
 | `POST` | `/api/v1/me/device-telemetry-v12-consents` | Contribution client | Session | Grant the exact v1.2 contract for one reviewed device. | Contribution telemetry |
 | `GET`, `POST` | `/api/v1/device/telemetry/v1.2/day-manifests` | Contribution client | Device | Read or register bounded immutable successor manifests and staged chunk receipts. | Contribution telemetry |
 | `POST` | `/api/v1/me/telemetry-v12/domain-predecessor` | Contribution client | Device | Pin a complete mixed-client predecessor for successor activation. | Contribution telemetry |
-| `POST` | `/api/v1/me/telemetry-v12/domain-activate` | Contribution client | Device | Activate a complete proven successor domain under the pinned predecessor. | Contribution telemetry |
+| `POST` | `/api/v1/me/telemetry-v12/domain-activate` | Contribution client | Device | Activate a complete proven successor domain under the pinned predecessor, or acknowledge an unchanged vector without a new generation. | Contribution telemetry |
 | `POST` | `/api/v1/accountless/telemetry-v1.2-authorization` | Contribution client | Device | Record the independent accountless successor policy for the current enrollment and device. | Contribution telemetry |
 | `POST` | `/api/v1/accountless/telemetry-performance-authorization` | Contribution client | Device | Record the independent accountless performance policy for the current enrollment and device. | Contribution telemetry |
 | `GET` | `/api/v1/device/telemetry/performance/capabilities` | Contribution client | Device | Read the separate daily-performance capability and authorization. | Contribution telemetry |

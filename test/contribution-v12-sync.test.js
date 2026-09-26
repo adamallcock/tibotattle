@@ -46,13 +46,26 @@ function preparedDay(selectedDay = day, count = 1, parserVersion = "synthetic-v1
     recordsByStream: { usage: Array.from({ length: count }, (_, index) => usage(index, selectedDay)) } });
 }
 
-function server({ count = 1, capabilitiesChange = {}, predecessorChange = {}, destinationOrigin = origin } = {}) {
+// The synthetic predecessor follows the Worker contract: its range is the
+// device's ready days, seeded with the current day while none is ready, and its
+// fingerprint pins only the active generation. A day without records is an
+// empty manifest that is ready at registration, and activating the active
+// generation's exact day vector again is acknowledged as unchanged. The legacy
+// switches restore the earlier server contract (refuse a device without a
+// ready day; fingerprint its ready days; refuse an empty day as storage
+// without ingestion-isolation 0012 does; write a generation for an unchanged
+// vector) so the client-visible consequence of each stays tested.
+function server({ count = 1, capabilitiesChange = {}, predecessorChange = {}, destinationOrigin = origin,
+  refuseWithoutReadyDay = false, fingerprintReadyDays = false, refuseEmptyDays = false,
+  writeUnchangedGeneration = false } = {}) {
   let sequence = 10;
   const manifests = new Map();
   const envelopes = new Map();
   const authorizations = new Map();
   const calls = [];
   let active = null;
+  let activeDays = null;
+  let generations = 0;
   const capability = {
     schemaVersion: "device-sync-capabilities-v1.2", destinationOrigin,
     enrollmentNamespace: "synthetic_enrollment_namespace", identityVersion: "account-track-v2",
@@ -74,14 +87,26 @@ function server({ count = 1, capabilitiesChange = {}, predecessorChange = {}, de
     if (path === "/api/v1/device/sync-capabilities-v1.2") return json(capability);
     if (path === "/api/v1/me/telemetry-v12/domain-predecessor") {
       assert.deepEqual(body, {});
+      const readyDays = [...manifests.values()]
+        .filter((candidate) => candidate.chunks.size === candidate.manifest.chunks.length)
+        .map((candidate) => candidate.manifest.day).sort();
+      if (refuseWithoutReadyDay && readyDays.length === 0) {
+        return json({ error: { code: "TELEMETRY_MANIFEST_INCOMPLETE" } }, 409);
+      }
+      const known = readyDays.length ? readyDays : [new Date(now).toISOString().slice(0, 10)];
       return json({
         schemaVersion: "telemetry-domain-predecessor-v1.2", token: uuid(sequence++),
-        previousGenerationId: active?.generationId ?? null, legacyFingerprint: "e".repeat(64),
-        fromDay: day, throughDay: day, expiresAt: "2026-08-29T13:00:00.000Z", ...predecessorChange,
+        previousGenerationId: active?.generationId ?? null,
+        legacyFingerprint: hash(JSON.stringify([active?.generationId ?? null,
+          ...(fingerprintReadyDays ? readyDays : [])])),
+        fromDay: known[0], throughDay: known.at(-1), expiresAt: "2026-08-29T13:00:00.000Z", ...predecessorChange,
       }, 201);
     }
     if (path === "/api/v1/device/telemetry/v1.2/day-manifests") {
       parseTelemetryV12DayManifest(body);
+      if (refuseEmptyDays && body.chunks.length === 0) {
+        return json({ error: { code: "TELEMETRY_STORAGE_CONSTRAINT" } }, 503, { "retry-after": "3600" });
+      }
       const key = body.day + ":" + body.manifestDigest;
       if (!manifests.has(key)) manifests.set(key, { manifest: body, id: uuid(sequence++), chunks: new Map() });
       const candidate = manifests.get(key);
@@ -121,14 +146,22 @@ function server({ count = 1, capabilitiesChange = {}, predecessorChange = {}, de
         assert.equal(candidate.id, entry.manifestId);
         assert.equal(candidate.chunks.size, candidate.manifest.chunks.length);
       }
+      if (!writeUnchangedGeneration && active !== null
+          && body.predecessor.previousGenerationId === active.generationId
+          && body.fromDay === active.fromDay && body.throughDay === active.throughDay
+          && JSON.stringify(body.days) === JSON.stringify(activeDays)) {
+        return json({ ...active, replay: true, unchanged: true, requestedManifestDigest: body.manifestDigest }, 201);
+      }
       active = { schemaVersion: "telemetry-domain-activation-v1.2", generationId: uuid(sequence++),
         manifestDigest: body.manifestDigest, fromDay: body.fromDay, throughDay: body.throughDay, replay: false };
+      activeDays = body.days;
+      generations += 1;
       return json(active, 201);
     }
     throw new Error("Unexpected synthetic route");
   };
   return {
-    calls, manifests, envelopes, capability, active: () => active,
+    calls, manifests, envelopes, capability, active: () => active, generations: () => generations,
     options: {
       serverBaseUrl: destinationOrigin, deviceAuthorization: authorization, consent: telemetryV12RequiredConsent(),
       days: [day], clock: () => now, readDay: (selectedDay) => preparedDay(selectedDay, selectedDay === day ? count : 0),
@@ -172,6 +205,127 @@ test("v1.2 resumes a partial day without reposting an accepted chunk", async () 
   assert.equal(second.chunksUploaded, 1);
   assert.equal(second.chunksSkipped, 1);
   assert.equal(fixture.calls.filter(({ path }) => path === "/api/v1/contributions").length, 2);
+});
+
+function recordedPredecessors(fixture) {
+  const responses = [];
+  return {
+    responses,
+    fetchImpl: async (url, request) => {
+      const response = await fixture.options.fetchImpl(url, request);
+      if (new URL(url).pathname === "/api/v1/me/telemetry-v12/domain-predecessor") {
+        responses.push({ status: response.status, body: await response.clone().json() });
+      }
+      return response;
+    },
+  };
+}
+
+function journalOptions() {
+  let saved = null;
+  return {
+    current: () => saved,
+    options: {
+      progressStore: { read: async () => saved, write: async (value) => { saved = value; } },
+      sourcePublication: { fingerprint: "synthetic-v12-publication", parserVersion: "synthetic-v12-sync" },
+    },
+  };
+}
+
+test("a never-uploaded install bootstraps its first domain and keeps the journal's pin", async () => {
+  const fixture = server();
+  const recorded = recordedPredecessors(fixture);
+  const journal = journalOptions();
+  const result = await runTelemetryV12Sync({ ...fixture.options, ...journal.options,
+    days: ["2026-08-27", day], readDay: (selectedDay) => preparedDay(selectedDay, 1),
+    fetchImpl: recorded.fetchImpl });
+  assert.equal(result.status, "complete");
+  assert.equal(result.failure, null);
+  assert.equal(result.chunksUploaded, 2);
+  assert.equal(result.acknowledgedThroughDay, day);
+  assert.equal(journal.current(), null);
+  // Before staging: nothing is ready, so the range is the current day. After
+  // staging: the range is the run's own ready days, under the same pin.
+  assert.deepEqual(recorded.responses.map(({ status, body }) => [status, body.fromDay, body.throughDay]),
+    [[201, day, day], [201, "2026-08-27", day]]);
+  assert.equal(recorded.responses[1].body.legacyFingerprint, recorded.responses[0].body.legacyFingerprint);
+});
+
+test("a predecessor refused until a day is ready strands a never-uploaded install", async () => {
+  const fixture = server({ refuseWithoutReadyDay: true });
+  for (let pass = 0; pass < 2; pass += 1) {
+    const result = await runTelemetryV12Sync(fixture.options);
+    assert.equal(result.status, "failed");
+    assert.equal(result.failure.code, "revision_conflict");
+    assert.equal(result.failure.retryable, true);
+    assert.equal(result.chunksUploaded, 0);
+  }
+  assert.equal(fixture.manifests.size, 0);
+  assert.ok(fixture.calls.every(({ path }) => path !== "/api/v1/contributions"));
+});
+
+test("a fingerprint that moves when the run's own days become ready fails the journal's final check", async () => {
+  const fixture = server({ fingerprintReadyDays: true });
+  const journal = journalOptions();
+  const result = await runTelemetryV12Sync({ ...fixture.options, ...journal.options });
+  assert.equal(result.status, "failed");
+  assert.equal(result.failure.code, "revision_conflict");
+  assert.equal(result.chunksUploaded, 1);
+  assert.equal(fixture.active(), null);
+  assert.ok(fixture.calls.every(({ path }) => !path.endsWith("/domain-activate")));
+});
+
+test("a day without records is an empty manifest inside the activated domain", async () => {
+  const fixture = server();
+  const journal = journalOptions();
+  const result = await runTelemetryV12Sync({ ...fixture.options, ...journal.options,
+    days: ["2026-08-26", day], readDay: (selectedDay) => preparedDay(selectedDay, selectedDay === "2026-08-27" ? 0 : 1) });
+  assert.equal(result.status, "complete");
+  assert.equal(result.failure, null);
+  assert.equal(result.chunksUploaded, 2);
+  const empty = [...fixture.manifests.values()].find(({ manifest }) => manifest.day === "2026-08-27");
+  assert.equal(empty.manifest.chunks.length, 0);
+  const activation = fixture.calls.find(({ path }) => path === "/api/v1/me/telemetry-v12/domain-activate");
+  assert.deepEqual(activation.body.days.map((entry) => entry.day), ["2026-08-26", "2026-08-27", day]);
+});
+
+test("a storage refusal of an empty day is retried at its pace and keeps the journal", async () => {
+  const fixture = server({ refuseEmptyDays: true });
+  const journal = journalOptions();
+  const result = await runTelemetryV12Sync({ ...fixture.options, ...journal.options,
+    days: ["2026-08-26", day], readDay: (selectedDay) => preparedDay(selectedDay, selectedDay === "2026-08-27" ? 0 : 1) });
+  assert.equal(result.status, "failed");
+  assert.deepEqual(result.failure, { code: "service_unavailable", retryable: true, deviceUnavailable: false,
+    retryAfterMilliseconds: 3_600_000 });
+  assert.equal(result.chunksUploaded, 1);
+  assert.notEqual(journal.current(), null);
+  assert.equal(fixture.active(), null);
+});
+
+test("an unchanged pass is acknowledged with the active generation instead of a new one", async () => {
+  for (const writeUnchangedGeneration of [false, true]) {
+    const fixture = server({ writeUnchangedGeneration });
+    const journal = journalOptions();
+    const first = await runTelemetryV12Sync({ ...fixture.options, ...journal.options });
+    assert.equal(first.status, "complete");
+    const second = await runTelemetryV12Sync({ ...fixture.options, ...journal.options });
+    assert.equal(second.status, "complete");
+    assert.equal(second.failure, null);
+    assert.equal(second.chunksUploaded, 0);
+    assert.equal(journal.current(), null);
+    const receipts = fixture.calls.filter(({ path }) => path.endsWith("/domain-activate"));
+    assert.equal(receipts.length, 2);
+    assert.notEqual(receipts[1].body.manifestDigest, receipts[0].body.manifestDigest);
+    if (writeUnchangedGeneration) {
+      // The earlier server wrote a generation for every pass, changed or not.
+      assert.notEqual(second.domainGenerationId, first.domainGenerationId);
+      assert.equal(fixture.generations(), 2);
+    } else {
+      assert.equal(second.domainGenerationId, first.domainGenerationId);
+      assert.equal(second.acknowledgedThroughDay, first.acknowledgedThroughDay);
+      assert.equal(fixture.generations(), 1);
+    }
+  }
 });
 
 test("v1.2 rejects legacy consent and legacy capability shapes before preparing data", async () => {

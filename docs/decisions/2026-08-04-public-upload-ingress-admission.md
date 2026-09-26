@@ -88,7 +88,7 @@ so a future change cannot silently turn on an incomplete asynchronous path.
 ## Rollout and operating limits
 
 Source configuration and deployment state are separate evidence gates. The
-staging gate verifies all ingress variables, all eight Rate Limit bindings,
+staging gate verifies all ingress variables, every required Rate Limit binding,
 the Durable Object binding, and its migration; post-deploy `/api/ready`
 performs a non-consuming Durable Object RPC. Queue mode remains disabled. Run
 a staged concurrent-upload profile against the actual Worker/D1/R2 region mix

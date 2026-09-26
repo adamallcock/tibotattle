@@ -79,6 +79,27 @@ function manifestSnapshot(value: unknown): TelemetryV12DayManifest {
   }
 }
 
+// A deterministic storage refusal is retried no sooner than this. It stays
+// below the desktop scheduler's four-hour pass interval, and a retryable
+// answer never pauses the install.
+const STORAGE_CONSTRAINT_RETRY_AFTER_SECONDS = "3600";
+
+/**
+ * The reviewed contract already admitted the input, so a remaining SQLite
+ * constraint failure (CHECK, NOT NULL, FOREIGN KEY, or a UNIQUE key not mapped
+ * to a conflict) is a server-side schema gap, such as an empty day before
+ * ingestion-isolation 0012. It is neither a storage outage nor the client's
+ * fault: the same request fails the same way until the schema changes. Say so
+ * and pace the retry, instead of an unavailable-storage answer that the client
+ * retries on its own backoff, from one minute, while the refusal repeats.
+ */
+export function telemetryV12StorageConstraintRefusal(error: unknown): ApiError | null {
+  if (error instanceof ApiError || !/\bconstraint failed\b/iu.test(String(error))) return null;
+  return new ApiError(503, "TELEMETRY_STORAGE_CONSTRAINT", {
+    responseHeaders: { "retry-after": STORAGE_CONSTRAINT_RETRY_AFTER_SECONDS },
+  });
+}
+
 function mapStagingError(error: unknown): ApiError {
   const message = String(error);
   if (message.includes("telemetry_v12_transport_blocked")) {
@@ -102,7 +123,8 @@ function mapStagingError(error: unknown): ApiError {
   if (message.includes("UNIQUE constraint failed: telemetry_v12")) {
     return new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
   }
-  return error instanceof ApiError ? error : new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  if (error instanceof ApiError) return error;
+  return telemetryV12StorageConstraintRefusal(error) ?? new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
 }
 
 async function manifestByDigest(

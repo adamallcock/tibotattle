@@ -1710,6 +1710,9 @@ export const REQUIRED_RATE_LIMITS = Object.freeze([
   Object.freeze({ name: "UPLOAD_PRINCIPAL_RATE_LIMIT", limit: 6 }),
   Object.freeze({ name: "UPLOAD_INGRESS_REQUEST_RATE_LIMIT", limit: 240 }),
   Object.freeze({ name: "UPLOAD_INGRESS_CLIENT_RATE_LIMIT", limit: 20 }),
+  Object.freeze({ name: "DEVICE_SYNC_RATE_LIMIT", limit: 6000 }),
+  Object.freeze({ name: "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT", limit: 4200 }),
+  Object.freeze({ name: "DEVICE_SYNC_CLIENT_RATE_LIMIT", limit: 4200 }),
 ]);
 export const REQUIRED_STAGING_VARIABLES = Object.freeze({
   PUBLIC_ANALYTICS_MODE: "enabled",
