@@ -1,0 +1,6 @@
+{
+  "schemaVersion": "tibotattle-production-live-settings-v1",
+  "overrides": {
+    "TELEMETRY_STORAGE_MODE": "typed"
+  }
+}
