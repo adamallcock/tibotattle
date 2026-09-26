@@ -14,7 +14,8 @@
  * 3. for the invoker, accepts only the contract's x-tibotattle-* request
  *    headers (src/edge-origin-contract.ts): a valid host kind (apex|admin)
  *    and request id, an optional decodable admission outcome, and a Google
- *    callback query only on the apex callback route with an empty raw query;
+ *    callback query only on the apex callback route; the callback route
+ *    never carries a raw query, with or without that header;
  * 4. rebuilds the request on the public origin (the admin host is
  *    'admin.' + the public hostname) by assigning the raw path and query to
  *    that base, so no path can move it to another host, with at most 16384
@@ -190,11 +191,18 @@ function invokerEdge(request, rawUrl, edgeNames) {
     admission = decodeEdgeAdmission(headers.get(EDGE_HEADERS.admission));
     if (admission === null) refuse();
   }
+  // The edge never forwards the callback's own query: the OAuth code and state
+  // travel only in the callback header, and on the admin host not at all. So
+  // a raw query on the callback path is refused with or without that header,
+  // as request-boundary.mjs refuses it: an edge that puts the query on the
+  // origin URL (and so in the origin's request logs) fails at once instead of
+  // completing the sign-in.
+  if (rawUrl.pathname === GOOGLE_CALLBACK_PATH && rawUrl.search !== "") refuse();
   let callbackQuery = null;
   if (headers.has(EDGE_HEADERS.callbackQuery)) {
     callbackQuery = headers.get(EDGE_HEADERS.callbackQuery);
     if (hostKind !== "apex" || request.method !== "GET"
-        || rawUrl.pathname !== GOOGLE_CALLBACK_PATH || rawUrl.search !== ""
+        || rawUrl.pathname !== GOOGLE_CALLBACK_PATH
         || !validGoogleCallbackQuery(callbackQuery)) {
       refuse();
     }

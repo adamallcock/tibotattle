@@ -10,6 +10,11 @@ import { createServer } from "vite";
 // Drives the REAL src/admission.ts helpers through the origin's edge-admission
 // replay bindings, with an origin IDENTITY_LINK_SECRET and no
 // cf-connecting-ip, exactly as the Cloud Run origin runs them.
+//
+// Merge prerequisite: the last replay test reads EP-1's
+// src/edge-admission-policy.ts and fails without it. EP-1 therefore merges
+// before or together with EP-6, and this check is registered in a gate only
+// in a tree that holds both.
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const WORKER_ROOT = resolve(ROOT, "..");
@@ -621,28 +626,14 @@ async function edgePolicyAvailable() {
   }
 }
 
-// EP-1's src/edge-admission-policy.ts is required: a missing, renamed or moved
-// module FAILS this test rather than switching it off. The only skip is an
-// explicit pre-integration opt-out for a tree cut before EP-1 merged, which the
-// registered cloud-run `check` script never sets. Setting it in a tree that
-// holds the module also fails, so the opt-out cannot outlive the integration.
-// Remove the opt-out once EP-1 is integrated.
-const EDGE_POLICY_PENDING_FLAG = "TIBOTATTLE_EDGE_ADMISSION_POLICY_PENDING";
-const edgePolicyPresent = await edgePolicyAvailable();
-const edgePolicyPendingOptOut = process.env[EDGE_POLICY_PENDING_FLAG] === "1";
-
-test("replays every EP-1 edge admission policy entry through its own bindings", {
-  skip: !edgePolicyPresent && edgePolicyPendingOptOut
-    && `${EDGE_POLICY_PENDING_FLAG}=1: src/edge-admission-policy.ts (EP-1) is not integrated yet`,
-}, async () => {
+// EP-1's src/edge-admission-policy.ts is a merge prerequisite of this check
+// (see the header): a missing, renamed or moved module FAILS this test. There
+// is no skip and no opt-out, so no gate can run the check without the replay.
+test("replays every EP-1 edge admission policy entry through its own bindings", async () => {
   assert.ok(
-    edgePolicyPresent,
-    "src/edge-admission-policy.ts (EP-1 EDGE_ADMISSION_BINDINGS and EDGE_ADMISSION_POLICY) is required",
-  );
-  assert.equal(
-    edgePolicyPendingOptOut,
-    false,
-    `${EDGE_POLICY_PENDING_FLAG} is set but EP-1's policy module is present: remove the opt-out`,
+    await edgePolicyAvailable(),
+    "src/edge-admission-policy.ts (EP-1 EDGE_ADMISSION_BINDINGS and EDGE_ADMISSION_POLICY) is required:"
+      + " merge EP-1 before or with EP-6",
   );
   const policy = await vite.ssrLoadModule("/src/edge-admission-policy.ts");
   assert.deepEqual([...policy.EDGE_ADMISSION_BINDINGS], BINDING_NAMES);

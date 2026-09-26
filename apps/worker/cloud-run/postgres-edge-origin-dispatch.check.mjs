@@ -259,6 +259,11 @@ const INVALID_CASES = Object.freeze([
   { label: "a callback query with a backslash", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", "?code=a\\b"]] } },
   { label: "an 8193-character callback query", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", `?${"a".repeat(8192)}`]] } },
   { label: "a duplicate callback query", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", "?a=1"], ["x-tibotattle-google-callback-query", "?a=1"]] } },
+  // The callback route never carries a raw query, with or without the header.
+  { label: "a raw callback query without the header", request: { method: "GET", path: `${CALLBACK_PATH}?code=4%2F0Asynthetic&state=s` } },
+  { label: "a raw callback query on the admin host", request: { method: "GET", path: `${CALLBACK_PATH}?code=4%2F0Asynthetic&state=s`, headers: [["x-tibotattle-edge-host", "admin"]] } },
+  { label: "a raw callback query on POST", request: { method: "POST", path: `${CALLBACK_PATH}?code=4%2F0Asynthetic&state=s` } },
+  { label: "a raw callback query after dot segments", request: { method: "GET", path: `/api/v1/identity/google/../google/callback?code=4%2F0Asynthetic` } },
   // Verifier restrictions.
   { label: "a verifier POST", request: { auth: token({ email: VERIFIER }), edge: false, path: "/api/health" } },
   { label: "a verifier HEAD", request: { auth: token({ email: VERIFIER }), edge: false, method: "HEAD", path: "/api/ready" } },
@@ -325,6 +330,31 @@ test("the boundary refuses a non-Request and a clock it cannot read", async () =
   assert.equal(calls.length, 1);
 });
 
+test("the production default clock reads epoch milliseconds", async () => {
+  // Built exactly as the host wires it: no clock. Tokens are relative to the
+  // real wall clock, so a default that is not epoch milliseconds (seconds, a
+  // monotonic clock, microseconds) refuses the live token and fails here.
+  const { inner, calls } = recordingInner();
+  const dispatch = dispatchModule.createEdgeOriginDispatch({
+    invokerServiceAccount: INVOKER,
+    verifierServiceAccounts: [VERIFIER],
+    audience: AUDIENCE,
+    publicOrigin: PUBLIC_ORIGIN,
+    admission: limiters.createEdgeAdmissionLimiters(),
+    inner,
+  });
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const live = await dispatch(rawRequest({ auth: token({ exp: nowSeconds + 3_000, iat: nowSeconds - 600 }) }));
+  assert.equal(live.status, 200);
+  assertMarked(live);
+  assert.equal(calls.length, 1);
+  await assertRefusal(
+    await dispatch(rawRequest({ auth: token({ exp: nowSeconds - 61, iat: nowSeconds - 3_661 }) })),
+    "expired 61 s ago under the default clock",
+  );
+  assert.equal(calls.length, 1);
+});
+
 test("a valid invoker is accepted for apex and admin with exact rebuilt URLs", async () => {
   const { inner, calls } = recordingInner();
   const dispatch = createDispatch({ inner });
@@ -380,9 +410,13 @@ test("the Google callback header becomes the query of the apex callback", async 
     assert.equal(calls.at(-1).url, expected);
     assert.ok(!calls.at(-1).headers.some(([name]) => name.startsWith("x-tibotattle-")));
   }
-  // Without the header the callback keeps its (empty) raw query.
-  await dispatch(rawRequest({ method: "GET", path: CALLBACK_PATH }));
-  assert.equal(calls.at(-1).url, `${PUBLIC_ORIGIN}${CALLBACK_PATH}`);
+  // Without the header the callback is forwarded with an empty query (a bare
+  // raw '?' is an empty query); any raw query is in the 421 matrix above.
+  for (const path of [CALLBACK_PATH, `${CALLBACK_PATH}?`]) {
+    const response = await dispatch(rawRequest({ method: "GET", path }));
+    assert.equal(response.status, 200, path);
+    assert.equal(calls.at(-1).url, `${PUBLIC_ORIGIN}${CALLBACK_PATH}`, path);
+  }
 });
 
 test("inner sees only the forwarded headers; cf-access-jwt-assertion only on admin", async () => {
