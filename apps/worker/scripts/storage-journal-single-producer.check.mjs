@@ -17,7 +17,8 @@
 //   * the storage_journal_append definition itself;
 //   * the 0046 telemetry_emit_source_event replacement, which keeps the
 //     pre-0046 version-0 body verbatim for owners without a head and may not
-//     name the exact tuple columns;
+//     name the exact tuple columns, and the later replacements named in
+//     REVIEWED_EMITTER_REPLACEMENTS under the same rule;
 //   * primary migrations numbered before 0046 (legacy history);
 //   * scripts/postgres-ingestion-journal-transfer.mjs, the sealed D1 import;
 //   * D1 prepared statements in src/analytics-delivery.ts, the D1 Worker
@@ -42,11 +43,21 @@ const SCAN_ROOTS = Object.freeze(["src", "cloud-run", "scripts", "gcp-test", "po
 const SKIPPED_DIRECTORIES = new Set(["node_modules", "dist", ".wrangler", "fixtures"]);
 const SOURCE_FILE = /\.(?:[cm]?[jt]s|sql)$/u;
 const TEST_FILE = /\.(?:check|test|spec|bench)\.[cm]?[jt]s$|\.d\.ts$/u;
-const PRIMARY_MIGRATION = /^postgres\/(?:staged-)?migrations\/primary\/(\d{4})_[a-z0-9_-]+\.sql$/u;
+const PRIMARY_MIGRATION = /^postgres\/(?:staged-)?migrations\/primary\/(\d{4})_([a-z0-9_-]+)\.sql$/u;
 const JOURNAL_TRANSFER = "scripts/postgres-ingestion-journal-transfer.mjs";
 const D1_PRODUCERS = new Set(["src/analytics-delivery.ts"]);
 const APPEND_FUNCTION = "storage_journal_append";
 const LEGACY_EMITTER = "telemetry_emit_source_event";
+/**
+ * Primary migrations after 0046 that may replace the legacy emitter, keyed by
+ * name because the integrator renumbers staged files at promotion. Each keeps
+ * the 0046 emitter body, including its version-0 INSERT, verbatim.
+ *   owner_journal_emitter_head_precheck (ISO-2): a lock-free head pre-check
+ *   ahead of the unchanged 0046 body, which
+ *   postgres-test/postgres-owner-journal-emitter-precheck.spec.mjs compares
+ *   against 0046 text.
+ */
+const REVIEWED_EMITTER_REPLACEMENTS = new Set(["owner_journal_emitter_head_precheck"]);
 const EXACT_TUPLE_COLUMNS = /\b(?:event_tuple_version|object_digest|content_digest|public_authority_epoch)\b/iu;
 const WRITE = /\b(?:INSERT\s+INTO|MERGE\s+INTO)\s+|\bCOPY\s+(?=[^\s;]+\s*(?:\(|FROM\b|TO\b))/giu;
 const STATIC_TARGET = /^(?:(?:\$\{[A-Za-z_$][\w$]*\}|"?[A-Za-z_][A-Za-z0-9_$]*"?)\.)?"?[A-Za-z_][A-Za-z0-9_]*"?$/u;
@@ -270,6 +281,8 @@ function scanSql(path, text) {
   const migration = PRIMARY_MIGRATION.exec(path);
   const version = migration ? Number(migration[1]) : null;
   if (version !== null && version < AUTHORITY_VERSION) return { violation: false, appendDefinitions: 0 };
+  const emitterMigration = version === AUTHORITY_VERSION
+    || (version > AUTHORITY_VERSION && REVIEWED_EMITTER_REPLACEMENTS.has(migration[2]));
   const bodies = functionBodies(sql);
   let appendDefinitions = 0;
   let violation = false;
@@ -284,7 +297,7 @@ function scanSql(path, text) {
     const enclosing = body?.[0];
     if (enclosing === APPEND_FUNCTION && version === AUTHORITY_VERSION) {
       appendDefinitions += 1;
-    } else if (enclosing === LEGACY_EMITTER && version === AUTHORITY_VERSION
+    } else if (enclosing === LEGACY_EMITTER && emitterMigration
         && !EXACT_TUPLE_COLUMNS.test(statementAt(sql, offset))) {
       // The verbatim version-0 emitter body for owners without a head.
     } else {
@@ -405,6 +418,12 @@ INSERT INTO storage_owner_revisions (source_id) SELECT source_id FROM storage_in
     await write("src/raw.test.ts", "await client.query(`INSERT INTO ${schema}.storage_ingestion_changes VALUES ($1)`);");
     await write("scripts/postgres-analytics-history-transfer.mjs", "const T = [\"storage_ingestion_changes\"];\n"
       + "const sql = (schema, spec) => `INSERT INTO ${relation(schema, spec.name)} VALUES ($1)`;");
+    // A reviewed later emitter replacement, at any number, keeps the version-0 body.
+    const reviewedEmitter = "postgres/staged-migrations/primary/0091_owner_journal_emitter_head_precheck.sql";
+    const emitterReplacement = `CREATE OR REPLACE FUNCTION telemetry_emit_source_event(a text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN IF EXISTS (SELECT 1 FROM storage_owner_revisions) THEN RETURN; END IF;
+INSERT INTO storage_ingestion_changes (source_id,kind) VALUES ('s','source-updated'); END; $$;`;
+    await write(reviewedEmitter, emitterReplacement);
     const clean = await checkJournalSingleProducer(root);
     assert.deepEqual(clean.violations, []);
     assert.equal(clean.appendDefinitions, 1);
@@ -435,6 +454,8 @@ INSERT INTO storage_owner_revisions (source_id) SELECT source_id FROM storage_in
       "postgres/staged-migrations/primary/0050_dollar_quoted.sql":
         "CREATE FUNCTION k() RETURNS void LANGUAGE plpgsql AS $$ BEGIN\n"
         + "EXECUTE $q$INSERT INTO storage_ingestion_changes (source_id) VALUES ('s')$q$; END; $$;",
+      // Only named, reviewed migrations after 0046 may replace the legacy emitter.
+      "postgres/staged-migrations/primary/0092_unreviewed_emitter.sql": emitterReplacement,
     };
     for (const [path, text] of Object.entries(producers)) await write(path, text);
     await write("postgres/staged-migrations/primary/0046_owner_journal_authority.sql", `${appendDefinition}
@@ -460,6 +481,10 @@ CREATE FUNCTION rogue() RETURNS void AS $$ BEGIN INSERT INTO storage_ingestion_c
       "(source_id,kind) VALUES ('s','source-updated')", "(source_id,event_tuple_version) VALUES ('s',1)"));
     assert.ok((await checkJournalSingleProducer(root)).violations
       .includes("postgres/staged-migrations/primary/0046_owner_journal_authority.sql"));
+    await write(reviewedEmitter, emitterReplacement.replace(
+      "(source_id,kind) VALUES ('s','source-updated')", "(source_id,event_tuple_version) VALUES ('s',1)"));
+    assert.ok((await checkJournalSingleProducer(root)).violations.includes(reviewedEmitter),
+      "a reviewed emitter replacement is held to the same version-0 rule");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
