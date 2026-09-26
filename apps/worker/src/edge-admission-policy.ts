@@ -9,9 +9,20 @@
  *
  * EDGE_ADMISSION_POLICY is the reviewed map from Worker route id to the
  * helper, purpose and bindings that index.ts uses for that route. It is not a
- * second policy: test/edge-admission-policy.spec.ts derives it from
- * handleRequest for every registry route and method, and ratchets the helper
- * call sites in index.ts.
+ * second policy; test/edge-admission-policy.spec.ts holds it to index.ts in
+ * two ways. A probe drives handleRequest for every registry route and method
+ * with spy limiters and compares the address-keyed calls it observes, both
+ * when the last predicted call is limited and when every call is admitted.
+ * The probe sees only the calls a synthetic request reaches before an earlier
+ * guard refuses it, so a raw-source ratchet also ties every helper call site
+ * in index.ts, directly or through a wrapper such as deviceSyncPrincipal, to
+ * the routeApi route ids and signatures in this policy.
+ *
+ * The purpose and outcome wire vocabulary belongs to the edge/origin contract
+ * (edge-origin-contract.ts). This module deliberately exports no competing
+ * vocabulary: EdgePolicyPurpose and EdgePolicyOutcome name only what this
+ * policy can report, and each must stay assignable to the contract's
+ * admission types where the edge proxy encodes an evaluation.
  *
  * Identity-keyed limits (UPLOAD_AUTHORIZATION, UPLOAD_PRINCIPAL), the upload
  * ingress budget and the global sign-in start window stay at the origin, so
@@ -48,18 +59,14 @@ export type EdgeAttemptPurpose =
   | "accountless_ownership"
   | "accountless_renewal";
 
-export type EdgeAdmissionPurpose =
+/** The purposes this policy can report; a subset of the contract's purposes. */
+export type EdgePolicyPurpose =
   | EdgeAttemptPurpose
   | "public_aggregate_read"
   | "upload_ingress";
 
-export const EDGE_ADMISSION_OUTCOMES = Object.freeze([
-  "allowed",
-  "limited",
-  "unavailable",
-] as const);
-
-export type EdgeAdmissionOutcome = (typeof EDGE_ADMISSION_OUTCOMES)[number];
+/** The outcomes this policy can report; the contract owns their encoding. */
+export type EdgePolicyOutcome = "allowed" | "limited" | "unavailable";
 
 export type EdgeAdmissionPolicyEntry =
   | Readonly<{
@@ -171,8 +178,8 @@ export type EdgeAdmissionLimiters = Readonly<
 >;
 
 export interface EdgeAdmissionEvaluation {
-  readonly purpose: EdgeAdmissionPurpose;
-  readonly outcome: EdgeAdmissionOutcome;
+  readonly purpose: EdgePolicyPurpose;
+  readonly outcome: EdgePolicyOutcome;
 }
 
 export interface EdgeAdmissionInput {
@@ -189,8 +196,8 @@ export interface EdgeAdmissionInput {
 const MINIMUM_CLIENT_KEY_SECRET_LENGTH = 32;
 
 function evaluation(
-  purpose: EdgeAdmissionPurpose,
-  outcome: EdgeAdmissionOutcome,
+  purpose: EdgePolicyPurpose,
+  outcome: EdgePolicyOutcome,
 ): EdgeAdmissionEvaluation {
   return Object.freeze({ purpose, outcome });
 }
