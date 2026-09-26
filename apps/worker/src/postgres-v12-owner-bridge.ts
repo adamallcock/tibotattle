@@ -16,12 +16,22 @@ import {
  *
  * A head that changed while it could not be bridged (for example before
  * storage_source_state existed) stays pending. These helpers report and repair
- * that backlog in short, bounded transactions. They return content-free counts
- * only: no digest, participant, device or source identifier leaves this module.
- * Scheduling the backfill belongs to the maintenance composition root.
+ * that backlog in short transactions of at most one bridged head each, so the
+ * repair never holds the source authority while it waits on another owner.
+ * They return content-free counts only: no digest, participant, device or
+ * source identifier leaves this module.
+ *
+ * Once 0055 is applied every new head bridges itself, so the backfill is a
+ * one-time cutover stage, not part of the every-minute maintenance pass;
+ * afterwards a pending count above zero is an alert. Wiring either belongs to
+ * its composition root.
  */
 
-/** The database refuses larger batches (storage_v12_bridge_limit_invalid). */
+/**
+ * The most pending heads one backfill transaction inspects; the database
+ * refuses more (storage_v12_bridge_limit_invalid). Each transaction bridges at
+ * most one of them.
+ */
 export const POSTGRES_V12_OWNER_BRIDGE_MAX_BATCH = 500;
 
 export type PostgresV12OwnerBridgeCode =
@@ -54,7 +64,11 @@ export interface ReadPostgresV12OwnerBridgePendingOptions {
 export interface RunPostgresV12OwnerBridgeBackfillOptions {
   readonly pool: PostgresPool;
   readonly schema?: PostgresSchemaOptions;
-  /** Heads per transaction, 1..500. Defaults to 500. */
+  /**
+   * Pending heads one transaction may inspect, 1..500 (default 500). Heads
+   * that another transaction holds are skipped, so a larger window lets a
+   * transaction reach an unheld head; it still bridges at most one.
+   */
   readonly limit?: number;
   /** Absolute epoch milliseconds after which no further batch starts. */
   readonly deadlineMs: number;
@@ -64,14 +78,20 @@ export interface RunPostgresV12OwnerBridgeBackfillOptions {
 
 export interface PostgresV12OwnerBridgeBackfillResult {
   /**
-   * complete: nothing is pending. deferred: the deadline passed, or a batch
-   * bridged nothing while heads were still reported pending (a concurrent
-   * change; the next run retries). source_uninitialized: storage_source_state
-   * does not exist, so nothing can be bridged yet.
+   * complete: nothing is pending. deferred: the deadline passed, or a
+   * transaction bridged nothing while heads were still reported pending (held
+   * by a concurrent change; the next run retries). source_uninitialized:
+   * storage_source_state does not exist, so nothing can be bridged yet.
    */
   readonly status: "complete" | "deferred" | "source_uninitialized";
+  /** Heads bridged by this run. */
   readonly bridged: number;
+  /** Backfill transactions this run committed; each bridged at most one head. */
   readonly batches: number;
+  /**
+   * Heads still pending: read from the database, except after a deadline that
+   * passed mid-run, where it is the last count less the heads bridged since.
+   */
   readonly pending: number;
 }
 
@@ -149,10 +169,13 @@ export async function readPostgresV12OwnerBridgePending(
 }
 
 /**
- * Bridge pending v1.2 heads in short transactions of at most `limit` heads
- * until none is pending or `deadlineMs` passes. Each batch is idempotent: a
- * head is bridged at most once whatever runs concurrently, and a head that an
- * activation bridged meanwhile is skipped. Refused in transfer sessions.
+ * Bridge pending v1.2 heads, one head per short transaction, until none is
+ * pending or `deadlineMs` passes. Each transaction is idempotent: a head is
+ * bridged at most once whatever runs concurrently, and a head that an
+ * activation bridged meanwhile is skipped. The backlog is counted once, and
+ * again only when the heads bridged since reach that count, so a long backlog
+ * costs one count per pass rather than one per head. Refused in transfer
+ * sessions.
  */
 export async function runPostgresV12OwnerBridgeBackfill(
   options: RunPostgresV12OwnerBridgeBackfillOptions,
@@ -171,11 +194,20 @@ export async function runPostgresV12OwnerBridgeBackfill(
   let batches = 0;
   const result = (status: PostgresV12OwnerBridgeBackfillResult["status"], pending: number) =>
     Object.freeze({ status, bridged, batches, pending });
+  let state = await readPending(options.pool, schema);
+  // `pending` is exact right after a read and an estimate after bridging.
+  let pending = state.pending;
+  let exact = true;
   for (;;) {
-    const state = await readPending(options.pool, schema);
-    if (!state.sourceInitialized) return result("source_uninitialized", state.pending);
-    if (state.pending === 0) return result("complete", 0);
-    if (now() >= options.deadlineMs) return result("deferred", state.pending);
+    if (!state.sourceInitialized) return result("source_uninitialized", pending);
+    if (pending === 0 && exact) return result("complete", 0);
+    if (pending === 0) {
+      state = await readPending(options.pool, schema);
+      pending = state.pending;
+      exact = true;
+      continue;
+    }
+    if (now() >= options.deadlineMs) return result("deferred", pending);
     const row = singleRow(await withPostgresMutation(options.pool, (client) => client.query(
       `SELECT ${schema}.storage_v12_bridge_backfill($1::integer)::text AS bridged`, [limit],
     ), { ...OPERATION_TIMEOUTS, operation: "postgres.v12_owner_bridge.backfill", preserveSafeError }));
@@ -184,7 +216,10 @@ export async function runPostgresV12OwnerBridgeBackfill(
     bridged += batch;
     if (batch === 0) {
       const after = await readPending(options.pool, schema);
+      if (!after.sourceInitialized) return result("source_uninitialized", after.pending);
       return result(after.pending === 0 ? "complete" : "deferred", after.pending);
     }
+    pending = Math.max(0, pending - batch);
+    exact = false;
   }
 }

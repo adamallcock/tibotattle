@@ -224,8 +224,8 @@ async function seedAccountless(pool, table, {
   successorExpiresAt = expiresAt,
   deviceState = "active",
   participantState = "active",
+  participantId = `participant:${randomUUID()}`,
 } = {}) {
-  const participantId = `participant:${randomUUID()}`;
   const deviceId = randomUUID();
   const issuedAt = new Date(Date.now() - HOUR_MS);
   const secret = randomBytes(32);
@@ -400,6 +400,106 @@ async function domainManifest(pool, table, generationId) {
     .rows[0].manifest_digest;
 }
 
+/**
+ * An ordinary accountless opt-out that pins the owner's current accepted
+ * v1.2 head with a prospective marker (0045), then revokes the device lineage
+ * at the marker's instant, as the disconnect path does.
+ */
+async function retainV12(pool, table, { participantId, deviceId }) {
+  const head = (await pool.query(`SELECT generation_id,revision FROM ${table("telemetry_v12_domain_heads")}
+    WHERE participant_id=$1`, [participantId])).rows[0];
+  const retainedAt = new Date(Date.now() - 60_000);
+  await pool.query(`INSERT INTO ${table("accountless_public_history_retention")} (
+      participant_id,enrollment_device_id,device_credential_id,generation_id,head_revision,retained_at
+    ) VALUES ($1,$2,$2,$3,$4,$5)`, [participantId, deviceId, head.generation_id, head.revision, retainedAt]);
+  await pool.query(`UPDATE ${table("accountless_enrollment_ledger")}
+    SET state='revoked', revoked_at=$2, revocation_reason='user_opt_out' WHERE device_id=$1`, [deviceId, retainedAt]);
+  for (const name of ["accountless_upload_owners", "accountless_v12_device_authorizations"]) {
+    await pool.query(`UPDATE ${table(name)} SET state='revoked', revoked_at=$2, revocation_reason='user_opt_out'
+      WHERE enrollment_device_id=$1`, [deviceId, retainedAt]);
+  }
+  await pool.query(`UPDATE ${table("device_credentials")} SET state='revoked', revoked_at=$2 WHERE id=$1`,
+    [deviceId, retainedAt]);
+}
+
+async function eligibleOwners(pool, table, participantId) {
+  return (await pool.query(`SELECT owner_kind,device_id FROM ${table("community_public_source_owners")}
+    WHERE participant_id=$1`, [participantId])).rows;
+}
+
+/** A dedicated session with an open transaction, for deterministic lock races. */
+async function openTransaction(pool) {
+  const client = await pool.connect();
+  let open = true;
+  const end = async (verb) => {
+    if (!open) return;
+    open = false;
+    try {
+      await client.query(verb);
+    } finally {
+      client.release();
+    }
+  };
+  try {
+    await client.query("BEGIN");
+    const pid = (await client.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+    return { client, pid, commit: () => end("COMMIT"), rollback: () => end("ROLLBACK") };
+  } catch (error) {
+    await end("ROLLBACK").catch(() => {});
+    throw error;
+  }
+}
+
+/** True once another backend is observed waiting on a lock that `pid` holds. */
+async function blockedBy(pool, pid) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const { rows } = await pool.query(`SELECT count(*)::int AS waiting FROM pg_stat_activity
+      WHERE $1 = ANY(pg_blocking_pids(pid))`, [pid]);
+    if (rows[0].waiting > 0) return true;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+  }
+  return false;
+}
+
+/**
+ * One storage_v12_bridge_backfill call in its own transaction under a short
+ * lock_timeout: a call that waited on another session's row lock fails with
+ * 55P03 instead of returning. `keepOpen` leaves the transaction (and whatever
+ * the call locked) open for the caller to commit.
+ */
+async function backfillOnce(pool, quoted, limit, { keepOpen = false } = {}) {
+  const session = await openTransaction(pool);
+  try {
+    await session.client.query("SET LOCAL lock_timeout = '2s'");
+    const bridged = (await session.client.query(`SELECT ${quoted}.storage_v12_bridge_backfill($1) AS bridged`,
+      [limit])).rows[0].bridged;
+    if (keepOpen) return { bridged, session };
+    await session.commit();
+    return { bridged };
+  } catch (error) {
+    await session.rollback().catch(() => {});
+    throw error;
+  }
+}
+
+/**
+ * Per owner: its exact journal rows, receipts and link. Every exact row's
+ * object digest names one of the owner's receipts, no receipt is named twice,
+ * and a v1.2-only link carries the latest receipt as its terminal object.
+ */
+async function assertOneRowPerReceipt(pool, table, participantId) {
+  const ownerLink = await link(pool, table, participantId);
+  const ownerReceipts = await receipts(pool, table, participantId);
+  const rows = (await journal(pool, table)).filter((row) => row.owner_digest === ownerLink?.owner_digest);
+  assert.deepEqual(rows.map((row) => row.object_digest).sort(), ownerReceipts.map((receipt) => receipt.event_digest).sort(),
+    "exactly one owner-active per receipt");
+  assert.ok(rows.every((row) => row.kind === "owner-active" && row.version === 1));
+  if (ownerReceipts.length > 0 && ownerLink.generation_id === null) {
+    assert.equal(ownerLink.object_digest, ownerReceipts.at(-1).event_digest);
+  }
+  return { ownerLink, ownerReceipts, rows };
+}
+
 // ---------------------------------------------------------------------------
 
 test("0055 replaces only the v1.2 head trigger, journals only through storage_journal_append, and raises constants",
@@ -502,6 +602,24 @@ test("PG17 a v1.2-only accountless activation bridges one link, receipt and owne
     const relinked = await link(pool, table, owner.participantId);
     assert.equal(relinked.owner_digest, ownerLink.owner_digest);
     assert.deepEqual([relinked.object_digest, relinked.manifest_digest], [receipt2.event_digest, second.manifest.manifestDigest]);
+
+    // Bridging a head that already has its receipt (the current one, or an
+    // earlier one on the chain) records nothing and journals nothing.
+    for (const [generationId, revision] of [[second.activation.generationId, 2], [generation1, 1]]) {
+      const again = await pool.query(`SELECT ${quoted}.storage_v12_bridge_head($1,$2,$3) AS bridged`,
+        [owner.participantId, generationId, revision]);
+      assert.equal(again.rows[0].bridged, false);
+    }
+    assert.deepEqual(await journal(pool, table), after, "an existing receipt adds no journal row");
+    assert.equal((await receipts(pool, table, owner.participantId)).length, 2);
+    assert.equal(await sourceEpoch(pool, table), 7);
+
+    const executable = await pool.query(`SELECT
+        has_function_privilege('public', $1, 'EXECUTE') AS backfill,
+        has_function_privilege('public', $2, 'EXECUTE') AS append`,
+    [`${quoted}.storage_v12_bridge_backfill(integer)`, `${quoted}.storage_journal_append(text,text,text,text,text)`]);
+    assert.deepEqual(executable.rows[0], { backfill: false, append: false },
+      "the backfill is a maintenance entrypoint, not executable by PUBLIC");
   }));
 
 const PARITY_OWNERS = Object.freeze(["synthetic-parity-p", "synthetic-parity-q", "synthetic-parity-r", "synthetic-parity-d"]);
@@ -972,6 +1090,341 @@ test("PG17 concurrent v1.2 activation and accountless erasure serialize without 
     }
   }, { ledger: true }));
 
+test("PG17 the backfill bridges one head per transaction and never waits on another owner while the source is held",
+  { skip: SKIP, timeout: 240_000 }, async () => withSchema(async ({ pool, schema, quoted, table }) => {
+    const { runPostgresV12OwnerBridgeBackfill } = await workerModule("/src/postgres-v12-owner-bridge.ts");
+    const options = { pool, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` } };
+    await activateRuntime(pool, table);
+    // Heads accepted before storage_source_state existed, as at cutover, for
+    // owners a < b < c in "C" order. c's head came through the real path so
+    // that c can activate again while the backfill runs.
+    const run = randomUUID();
+    const owners = [];
+    for (const name of ["a", "b", "c"]) {
+      owners.push(await seedAccountless(pool, table, { participantId: `participant:oj2-${name}-${run}` }));
+    }
+    for (const raw of owners.slice(0, 2)) {
+      await publishHead(pool, table, raw.participantId, await insertDomain(pool, table, raw), 1);
+    }
+    const cDay1 = await readyDay(pool, table, owners[2], DAY_1);
+    await activateDomain(schema, owners[2], [cDay1]);
+    await initializeSource(pool, table, 5);
+    assert.equal(await pendingCount(pool, quoted), 3);
+    const [ownerA, ownerB, ownerC] = owners;
+
+    // The reviewed deadlock: an eraser-style fence holds b's participant. The
+    // backfill bridges a and returns at once instead of waiting on b while it
+    // holds the source, so its caller's transaction ends before c's
+    // activation, which queues on that source, can be waited on in turn.
+    const fence = await openTransaction(pool);
+    const activationPool = instrumentedPool(pool);
+    try {
+      await fence.client.query(`SELECT 1 FROM ${table("participants")} WHERE id=$1 FOR UPDATE`, [ownerB.participantId]);
+      const prepared = await prepareActivation(schema, ownerC, [cDay1, await readyDay(pool, table, ownerC, DAY_2)]);
+      const first = await backfillOnce(pool, quoted, 500, { keepOpen: true });
+      let activation;
+      try {
+        assert.equal(first.bridged, 1, "one head per call, and no wait on the fenced owner");
+        activation = prepared.activate(activationPool).then((value) => ({ ok: true, value }), (error) => ({ ok: false, error }));
+        assert.equal(await blockedBy(pool, first.session.pid), true, "c's activation queues on the held source");
+      } finally {
+        await first.session.commit();
+      }
+      const activated = await activation;
+      assert.equal(activated.ok, true, `c's activation completes once the backfill commits: ${activated.error?.code}`);
+      // b is fenced and c's current head bridged itself: nothing else can
+      // progress, so the run stops after one transaction instead of retrying.
+      assert.deepEqual(await runPostgresV12OwnerBridgeBackfill({ ...options, deadlineMs: Date.now() + 60_000 }),
+        { status: "deferred", bridged: 0, batches: 1, pending: 1 });
+    } finally {
+      await fence.rollback();
+    }
+    assert.deepEqual(await runPostgresV12OwnerBridgeBackfill({ ...options, deadlineMs: Date.now() + 60_000 }),
+      { status: "complete", bridged: 1, batches: 1, pending: 0 });
+    for (const owner of [ownerA, ownerB]) {
+      const { rows, ownerLink } = await assertOneRowPerReceipt(pool, table, owner.participantId);
+      assert.deepEqual(rows.map(({ revision }) => revision), [1]);
+      assert.equal(ownerLink.state, "active");
+    }
+    const cState = await assertOneRowPerReceipt(pool, table, ownerC.participantId);
+    assert.deepEqual(cState.ownerReceipts.map(({ head_revision }) => head_revision), [2],
+      "a head superseded before it was bridged is not journaled; its successor is, once");
+    assert.equal(cState.ownerLink.state, "active");
+    for (const code of ["40P01", "55P03", "23505"]) {
+      assert.equal(activationPool.errors.includes(code), false, `the activation saw no ${code}`);
+    }
+  }));
+
+test("PG17 the backfill and an activation of the same owner bridge each head once, in either order",
+  { skip: SKIP, timeout: 240_000 }, async () => withSchema(async ({ pool, schema, quoted, table }) => {
+    await activateRuntime(pool, table);
+    const run = randomUUID();
+    const d = await seedAccountless(pool, table, { participantId: `participant:oj2-d-${run}` });
+    const e = await seedAccountless(pool, table, { participantId: `participant:oj2-e-${run}` });
+    const eDay1 = await readyDay(pool, table, e, DAY_1);
+    const dFirst = await activateDomain(schema, d, [await readyDay(pool, table, d, DAY_1)]);
+    await activateDomain(schema, e, [eDay1]);
+    await initializeSource(pool, table, 5);
+    assert.equal(await pendingCount(pool, quoted), 2);
+
+    // Activation first: a change of d's head is under way, and has bridged its
+    // new head, when the backfill reaches d's still-pending committed head.
+    // The backfill skips d (limit 1 inspects d alone) rather than waiting and
+    // then bridging the superseded head a second time.
+    const d2 = await insertDomain(pool, table, d, dFirst.activation.generationId);
+    const change = await openTransaction(pool);
+    try {
+      await change.client.query(`UPDATE ${table("telemetry_v12_domain_heads")} SET generation_id=$2, revision=2,
+        updated_at=clock_timestamp() WHERE participant_id=$1`, [d.participantId, d2]);
+      assert.equal((await backfillOnce(pool, quoted, 1)).bridged, 0, "the held head is skipped, not awaited");
+      await change.commit();
+    } finally {
+      await change.rollback();
+    }
+    const dState = await assertOneRowPerReceipt(pool, table, d.participantId);
+    assert.deepEqual(dState.ownerReceipts.map(({ generation_id, head_revision }) => [generation_id, head_revision]),
+      [[d2, 2]]);
+    assert.deepEqual(dState.rows.map(({ revision }) => revision), [1]);
+    assert.equal(await pendingCount(pool, quoted), 1);
+
+    // Backfill first: it holds e's rows when e activates again. The activation
+    // waits for it, then journals its own new head once.
+    const prepared = await prepareActivation(schema, e, [eDay1, await readyDay(pool, table, e, DAY_2)]);
+    const held = await backfillOnce(pool, quoted, 500, { keepOpen: true });
+    const activationPool = instrumentedPool(pool);
+    let activation;
+    try {
+      assert.equal(held.bridged, 1);
+      activation = prepared.activate(activationPool).then((value) => ({ ok: true, value }), (error) => ({ ok: false, error }));
+      assert.equal(await blockedBy(pool, held.session.pid), true, "e's activation waits on the backfill");
+    } finally {
+      await held.session.commit();
+    }
+    assert.equal((await activation).ok, true);
+    const eState = await assertOneRowPerReceipt(pool, table, e.participantId);
+    assert.deepEqual(eState.ownerReceipts.map(({ head_revision }) => head_revision), [1, 2]);
+    assert.deepEqual(eState.rows.map(({ revision }) => revision), [1, 2]);
+    assert.equal(await pendingCount(pool, quoted), 0);
+    for (const code of ["40P01", "55P03", "23505"]) {
+      assert.equal(activationPool.errors.includes(code), false, `the activation saw no ${code}`);
+    }
+  }));
+
+test("PG17 a retained v1.2 owner is bridged once, and a marker retirement under way is never reversed",
+  { skip: SKIP, timeout: 240_000 }, async () => withSchema(async ({ pool, schema, quoted, table }) => {
+    const { ensurePostgresOwnerLink } = await workerModule("/src/postgres-owner-journal.ts");
+    const { runPostgresV12OwnerBridgeBackfill } = await workerModule("/src/postgres-v12-owner-bridge.ts");
+    const run = randomUUID();
+    // Ordinary opt-outs whose markers pin heads accepted before
+    // storage_source_state existed. linked had an owner link already; kept
+    // and unlinked had none.
+    const kept = await seedAccountless(pool, table, { participantId: `participant:oj2-r1-${run}` });
+    const linked = await seedAccountless(pool, table, { participantId: `participant:oj2-r2-${run}` });
+    const unlinked = await seedAccountless(pool, table, { participantId: `participant:oj2-r3-${run}` });
+    const direct = await seedAccountless(pool, table, { participantId: `participant:oj2-r4-${run}` });
+    const client = await pool.connect();
+    try {
+      await ensurePostgresOwnerLink(client, schema, linked.participantId, "active");
+    } finally {
+      client.release();
+    }
+    const directGeneration = await insertDomain(pool, table, direct);
+    for (const owner of [kept, linked, unlinked, direct]) {
+      await publishHead(pool, table, owner.participantId,
+        owner === direct ? directGeneration : await insertDomain(pool, table, owner), 1);
+      await retainV12(pool, table, owner);
+      assert.deepEqual(await eligibleOwners(pool, table, owner.participantId),
+        [{ owner_kind: "accountless", device_id: owner.deviceId }], "eligible through the retained v1.2 branch");
+    }
+    await initializeSource(pool, table, 5);
+    assert.equal(await pendingCount(pool, quoted), 4);
+
+    // Retiring the other markers withdraws linked's link (0041) and holds the
+    // markers until it commits.
+    const retirement = await openTransaction(pool);
+    let directBridge;
+    try {
+      await retirement.client.query(`DELETE FROM ${table("accountless_public_history_retention")}
+        WHERE participant_id = ANY($1::text[])`, [[linked.participantId, unlinked.participantId, direct.participantId]]);
+      assert.equal((await backfillOnce(pool, quoted, 500)).bridged, 1, "the retained owner is bridged");
+      assert.equal((await backfillOnce(pool, quoted, 500)).bridged, 0,
+        "owners whose markers are being retired are skipped, not awaited or bridged");
+      // A direct bridge of a retained head (the call every path makes) waits
+      // for the retirement instead of reading the marker it is removing.
+      directBridge = pool.query(`SELECT ${quoted}.storage_v12_bridge_head($1,$2,1) AS bridged`,
+        [direct.participantId, directGeneration]);
+      assert.equal(await blockedBy(pool, retirement.pid), true, "the direct bridge waits on the marker");
+      await retirement.commit();
+    } finally {
+      await retirement.rollback();
+    }
+    assert.equal((await directBridge).rows[0].bridged, false, "the retired owner is not bridged after the wait");
+    assert.deepEqual(await runPostgresV12OwnerBridgeBackfill({ pool, schema: { primarySchema: schema,
+      ledgerSchema: `${schema}_ledger` }, deadlineMs: Date.now() + 60_000 }),
+    { status: "complete", bridged: 0, batches: 0, pending: 0 });
+
+    const keptState = await assertOneRowPerReceipt(pool, table, kept.participantId);
+    assert.equal(keptState.ownerLink.state, "active");
+    assert.deepEqual(keptState.rows.map(({ revision }) => revision), [1]);
+    for (const owner of [linked, unlinked, direct]) {
+      assert.deepEqual(await eligibleOwners(pool, table, owner.participantId), []);
+      assert.deepEqual(await receipts(pool, table, owner.participantId), [], "a retired owner gets no receipt");
+    }
+    assert.equal((await link(pool, table, linked.participantId)).state, "withdrawn", "the withdrawal stands");
+    for (const owner of [unlinked, direct]) {
+      assert.equal(await link(pool, table, owner.participantId), null, "no link is minted for a retired owner");
+    }
+    assert.deepEqual((await journal(pool, table)).map(({ owner_digest }) => owner_digest), [keptState.ownerLink.owner_digest],
+      "only the retained owner is journaled");
+  }));
+
+test("PG17 a bridge never outlives a revocation under way: the backfill skips it, a head change re-reads after it",
+  { skip: SKIP, timeout: 180_000 }, async () => withSchema(async ({ pool, quoted, table }) => {
+    // A pending owner without a link whose device a revocation holds: the
+    // backfill skips it rather than bridging an owner that is leaving.
+    const leaving = await seedAccountless(pool, table);
+    await publishHead(pool, table, leaving.participantId, await insertDomain(pool, table, leaving), 1);
+    await initializeSource(pool, table, 5);
+    assert.equal(await pendingCount(pool, quoted), 1);
+    const disconnect = await openTransaction(pool);
+    try {
+      await disconnect.client.query(`UPDATE ${table("device_credentials")}
+        SET state='revoked', revoked_at=clock_timestamp() WHERE id=$1`, [leaving.deviceId]);
+      assert.equal((await backfillOnce(pool, quoted, 500)).bridged, 0, "a device being revoked is skipped");
+      await disconnect.commit();
+    } finally {
+      await disconnect.rollback();
+    }
+    assert.equal(await pendingCount(pool, quoted), 0);
+    assert.equal(await link(pool, table, leaving.participantId), null);
+    assert.deepEqual(await receipts(pool, table, leaving.participantId), []);
+
+    const owner = await seedAccountless(pool, table);
+    const g1 = await insertDomain(pool, table, owner);
+    await publishHead(pool, table, owner.participantId, g1, 1);
+    const bridged = await assertOneRowPerReceipt(pool, table, owner.participantId);
+    assert.equal(bridged.rows.length, 1);
+    const g2 = await insertDomain(pool, table, owner, g1);
+
+    // A revocation that also withdraws the owner link (the shape of the
+    // planned device withdrawal trigger) is under way when the head changes.
+    const revocation = await openTransaction(pool);
+    let headChange;
+    try {
+      await revocation.client.query(`UPDATE ${table("device_credentials")}
+        SET state='revoked', revoked_at=clock_timestamp() WHERE id=$1`, [owner.deviceId]);
+      await revocation.client.query(`UPDATE ${table("storage_v11_owner_links")} SET state='withdrawn'
+        WHERE participant_id=$1`, [owner.participantId]);
+      headChange = publishHead(pool, table, owner.participantId, g2, 2).then(() => ({ ok: true }), (error) => ({ ok: false, error }));
+      assert.equal(await blockedBy(pool, revocation.pid), true, "the head change waits on the link");
+      await revocation.commit();
+    } finally {
+      await revocation.rollback();
+    }
+    assert.equal((await headChange).ok, true);
+    const after = await assertOneRowPerReceipt(pool, table, owner.participantId);
+    assert.equal(after.ownerLink.state, "withdrawn", "the withdrawal is not reversed");
+    assert.deepEqual(after.ownerReceipts.map(({ generation_id }) => generation_id), [g1], "no receipt for the new head");
+    assert.deepEqual(after.rows, bridged.rows, "no journal row for the new head");
+    assert.equal(await pendingCount(pool, quoted), 0);
+  }));
+
+test("PG17 the backfill inspects at most its limit and a run that makes no progress stops",
+  { skip: SKIP, timeout: 180_000 }, async () => withSchema(async ({ pool, schema, quoted, table }) => {
+    const { runPostgresV12OwnerBridgeBackfill } = await workerModule("/src/postgres-v12-owner-bridge.ts");
+    const options = { pool, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` } };
+    const run = randomUUID();
+    const owners = [];
+    for (const name of ["p1", "p2", "p3"]) {
+      const owner = await seedAccountless(pool, table, { participantId: `participant:oj2-${name}-${run}` });
+      await publishHead(pool, table, owner.participantId, await insertDomain(pool, table, owner), 1);
+      owners.push(owner);
+    }
+    await initializeSource(pool, table, 5);
+    const fence = await openTransaction(pool);
+    try {
+      await fence.client.query(`SELECT 1 FROM ${table("participants")} WHERE id=$1 FOR UPDATE`, [owners[0].participantId]);
+      assert.equal((await backfillOnce(pool, quoted, 1)).bridged, 0, "a limit of one inspects only the first, held head");
+      assert.equal(await pendingCount(pool, quoted), 3);
+      assert.deepEqual(await runPostgresV12OwnerBridgeBackfill({ ...options, limit: 1, deadlineMs: Date.now() + 60_000 }),
+        { status: "deferred", bridged: 0, batches: 1, pending: 3 }, "a transaction without progress ends the run");
+      assert.deepEqual(await runPostgresV12OwnerBridgeBackfill({ ...options, deadlineMs: Date.now() + 60_000 }),
+        { status: "deferred", bridged: 2, batches: 3, pending: 1 }, "one head per transaction past the held one");
+    } finally {
+      await fence.rollback();
+    }
+    assert.deepEqual(await runPostgresV12OwnerBridgeBackfill({ ...options, limit: 1, deadlineMs: Date.now() + 60_000 }),
+      { status: "complete", bridged: 1, batches: 1, pending: 0 });
+    for (const owner of owners) {
+      assert.deepEqual((await assertOneRowPerReceipt(pool, table, owner.participantId)).rows.map(({ revision }) => revision), [1]);
+    }
+  }));
+
+test("PG17 a v1.2 head on a device other than the owner's eligible device mints nothing and is not pending",
+  { skip: SKIP, timeout: 180_000 }, async () => withSchema(async ({ pool, quoted, table }) => {
+    await initializeSource(pool, table, 5);
+    // An accountless owner eligible through the v1.1 branch for v11Device,
+    // with a second enrolled device that holds no grant.
+    const participantId = `participant:${randomUUID()}`;
+    const [v11Device, otherDevice] = [randomUUID(), randomUUID()];
+    const issuedAt = new Date(Date.now() - HOUR_MS);
+    const expiresAt = new Date(Date.now() + 30 * 24 * HOUR_MS);
+    await pool.query(`INSERT INTO ${table("participants")} (id,owner_kind,state,created_at) VALUES ($1,'accountless','active',$2)`,
+      [participantId, issuedAt]);
+    for (const deviceId of [v11Device, otherDevice]) {
+      const secret = randomBytes(32);
+      await pool.query(`INSERT INTO ${table("accountless_enrollment_ledger")} (
+          device_id,device_secret_hash,installation_principal_id,schema_version,policy_version,authorization_basis,
+          state,issued_at,expires_at
+        ) VALUES ($1,$2,$3,'accountless-enrollment-v0.1','accountless-opt-out-v1','accountless-policy-v1','active',$4,$5)`,
+      [deviceId, secret, `synthetic-install-${deviceId}`, issuedAt, expiresAt]);
+      await pool.query(`INSERT INTO ${table("device_credentials")} (
+          id,participant_id,authority_kind,accountless_enrollment_device_id,secret_hash,state,issued_at,expires_at,last_used_at
+        ) VALUES ($1,$2,'accountless',$1,$3,'active',$4,$5,$4)`, [deviceId, participantId, secret, issuedAt, expiresAt]);
+    }
+    await pool.query(`INSERT INTO ${table("accountless_upload_owners")} (
+        enrollment_device_id,participant_id,device_credential_id,policy_version,authorization_basis,
+        authorized_at,expires_at,state
+      ) VALUES ($1,$2,$1,'accountless-opt-out-v1','accountless-policy-v1',$3,$4,'active')`,
+    [v11Device, participantId, issuedAt, expiresAt]);
+    await pool.query(`INSERT INTO ${table("accountless_v11_device_authorizations")} (
+        enrollment_device_id,participant_id,device_credential_id,telemetry_schema_version,field_dictionary_version,
+        privacy_contract_version,authorized_at,expires_at,state
+      ) VALUES ($1,$2,$1,'telemetry-contribution-v1.1','telemetry-v1.1-registry-2026-08-31.1',
+        'ongoing-privacy-safe-telemetry-v1.1',$3,$4,'active')`, [v11Device, participantId, issuedAt, expiresAt]);
+    const v11Token = digest(`v11-token-${participantId}`);
+    const v11Generation = randomUUID();
+    await pool.query(`INSERT INTO ${table("telemetry_v11_domain_predecessors")} (
+        token_hash,participant_id,device_id,legacy_fingerprint,input_revision,from_day,through_day,winners_json,
+        created_at,expires_at
+      ) VALUES ($1,$2,$3,$4,0,$5::date,$5::date,'[]',clock_timestamp(),clock_timestamp() + interval '1 day')`,
+    [v11Token, participantId, v11Device, digest(`v11-fingerprint-${participantId}`), DAY_1]);
+    await pool.query(`INSERT INTO ${table("telemetry_v11_domains")} (
+        id,participant_id,device_id,predecessor_token_hash,manifest_digest,legacy_fingerprint,input_revision,
+        from_day,through_day,days_json,created_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,0,$7::date,$7::date,'[]',clock_timestamp())`,
+    [v11Generation, participantId, v11Device, v11Token, digest(`v11-manifest-${participantId}`),
+      digest(`v11-fingerprint-${participantId}`), DAY_1]);
+    await pool.query(`INSERT INTO ${table("telemetry_v11_domain_heads")} (participant_id,generation_id,revision,updated_at)
+      VALUES ($1,$2,1,clock_timestamp())`, [participantId, v11Generation]);
+    assert.deepEqual(await eligibleOwners(pool, table, participantId), [{ owner_kind: "accountless", device_id: v11Device }]);
+
+    const elsewhere = await insertDomain(pool, table, { participantId, deviceId: otherDevice });
+    await publishHead(pool, table, participantId, elsewhere, 1);
+    assert.equal(await link(pool, table, participantId), null, "no link for a head on another device");
+    assert.deepEqual(await receipts(pool, table, participantId), []);
+    assert.equal(await pendingCount(pool, quoted), 0, "a head on another device is not pending");
+    assert.equal((await backfillOnce(pool, quoted, 500)).bridged, 0);
+    assert.deepEqual((await journal(pool, table)).filter((row) => row.version === 1), []);
+
+    // Control: the same owner's next head on the eligible device is bridged.
+    const here = await insertDomain(pool, table, { participantId, deviceId: v11Device }, elsewhere);
+    await publishHead(pool, table, participantId, here, 2);
+    const control = await assertOneRowPerReceipt(pool, table, participantId);
+    assert.equal(control.ownerLink.state, "active");
+    assert.deepEqual(control.ownerReceipts.map(({ generation_id, device_id }) => [generation_id, device_id]), [[here, v11Device]]);
+  }));
+
 test("the bridge wrappers validate input, map constant refusals and rethrow anything else sanitized", async () => {
   const { readPostgresV12OwnerBridgePending, runPostgresV12OwnerBridgeBackfill, PostgresV12OwnerBridgeError,
     POSTGRES_V12_OWNER_BRIDGE_MAX_BATCH } = await workerModule("/src/postgres-v12-owner-bridge.ts");
@@ -1032,4 +1485,39 @@ test("the bridge wrappers validate input, map constant refusals and rethrow anyt
     deadlineMs: Date.now() + 1_000,
   });
   assert.deepEqual(counted, { status: "complete", bridged: 4, batches: 2, pending: 0 });
+
+  // A transaction that bridges nothing while heads are still pending (all of
+  // them held by concurrent changes) ends the run as deferred, without retrying.
+  let stalled = 0;
+  const deferred = await runPostgresV12OwnerBridgeBackfill({
+    pool: stub((text) => {
+      if (text.includes("storage_v12_bridge_backfill")) {
+        stalled += 1;
+        return { rows: [{ bridged: "0" }], rowCount: 1 };
+      }
+      return pending(text);
+    }),
+    deadlineMs: Date.now() + 60_000,
+  });
+  assert.deepEqual(deferred, { status: "deferred", bridged: 0, batches: 1, pending: 3 });
+  assert.equal(stalled, 1, "a zero-progress transaction is not retried within the run");
+
+  // The backlog is counted once, and again only when the heads bridged since
+  // reach that count; the deadline stops the run between transactions.
+  let reads = 0;
+  let clock = 0;
+  const bounded = await runPostgresV12OwnerBridgeBackfill({
+    pool: stub((text) => {
+      if (text.includes("storage_v12_bridge_backfill")) {
+        clock += 10;
+        return { rows: [{ bridged: "1" }], rowCount: 1 };
+      }
+      reads += 1;
+      return { rows: [{ source_initialized: true, pending: "5" }], rowCount: 1 };
+    }),
+    deadlineMs: 30,
+    now: () => clock,
+  });
+  assert.deepEqual(bounded, { status: "deferred", bridged: 3, batches: 3, pending: 2 });
+  assert.equal(reads, 1, "one count serves every transaction of the run");
 });
