@@ -693,6 +693,50 @@ is a conflict, never permission to retry with an invented one. Lowering a floor
 does not unpin the active analytical history, delete consent, reactivate erased
 data or authorize a different cross-format join.
 
+### Adopting stranded accountless v1.1 uploads
+
+A v1.1 day is public only once a domain generation covers it. Some accountless
+devices upload complete days but never activate one: a first sync is cut off by
+the client's pass budget, or a newer build re-emits an accepted day without one
+of its records, so the device's own activation fails the preservation proof.
+The owner can activate such uploads with the existing admin action and one
+closed object:
+
+```json
+{ "action": "run_maintenance",
+  "v11EvidenceAdoption": { "dryRun": true, "maxDevices": 10, "afterParticipantId": null } }
+```
+
+Send it from the admin origin with the Access owner identity and
+`x-usage-monitor-admin: 1`. Always run the dry run first. Page with the returned
+`nextAfterParticipantId` until it is `null` (`maxDevices` is 1–25). Applying it
+(`dryRun: false`) is a production write and needs explicit authorization.
+
+For each device, the action uses only that device's own complete uploads. With
+no head, it takes the longest contiguous run of ready days (the latest run on a
+tie). With a head, it keeps the head's range and adds the contiguous ready days
+after it. For a covered day, it takes a newer upload only when every accepted
+record survives. It then activates through the ordinary predecessor and
+activation path, so every database proof still applies.
+
+It skips a device when any of these hold:
+
+- it lacks current v1.1 upload authority, for example after an opt-out;
+- it holds an active v1.2 authorization, so its client re-uploads through v1.2;
+- its client issued a predecessor in the last 10 minutes, so a pass may be in flight;
+- it has v1 or v0.2 history, or a head from another device;
+- it has no contiguous complete day.
+
+The result and the `run_maintenance` audit (`task: "v11_evidence_adoption"`)
+hold outcome counts, refusal codes, days covered, new days and accepted days
+kept. They never hold identifiers. A rerun with nothing new returns `unchanged`.
+
+Adoption does not unblock the client. A device whose build dropped an accepted
+record keeps being refused, so later runs extend its head over newer complete
+days until it moves to v1.2. Adoption never fills gaps, invents days or changes
+consent. Read back public eligibility and analytics delivery independently; the
+action result alone does not prove publication.
+
 ### Guarded deployment wrapper
 
 Without inventory flags, the routine wrapper below uses the checked-in JSON

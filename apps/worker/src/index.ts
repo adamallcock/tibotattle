@@ -194,6 +194,7 @@ import {
   telemetryTransportSchemaForEnvelope,
   telemetryTransportSchemaVersion,
 } from "./telemetry-transport-policy";
+import { adoptV11UploadedEvidenceAsOwner, parseV11EvidenceAdoptionRequest } from "./v11-evidence-adoption";
 import {
   readTelemetryV11DayCandidates,
   readTelemetryV11DayChunkVector,
@@ -3777,6 +3778,12 @@ async function handleAdminAction(
     if (Object.hasOwn(body.value, "transportRollback")) {
       const target = parseTelemetryTransportRollbackRequest(body.value);
       const result = await rollbackTelemetryTransportAsOwner(env.USAGE_MONITOR_DB, identityKey, target);
+      return jsonResponse({ schemaVersion: "admin-action-v0.1", action, result }, 200,
+        { "cache-control": "no-store", vary: "Cookie" });
+    }
+    if (Object.hasOwn(body.value, "v11EvidenceAdoption")) {
+      const target = parseV11EvidenceAdoptionRequest(body.value);
+      const result = await adoptV11UploadedEvidenceAsOwner(env.USAGE_MONITOR_DB, identityKey, target);
       return jsonResponse({ schemaVersion: "admin-action-v0.1", action, result }, 200,
         { "cache-control": "no-store", vary: "Cookie" });
     }
