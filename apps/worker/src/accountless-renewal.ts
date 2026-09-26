@@ -7,16 +7,6 @@ import {
   ACCOUNTLESS_UPLOAD_OWNER_SCOPE,
   ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
 } from "./accountless-ownership";
-import {
-  ACCOUNTLESS_V12_UPLOAD_AUTHORIZATION_BASIS,
-  ACCOUNTLESS_V12_UPLOAD_POLICY_VERSION,
-  ACCOUNTLESS_V12_UPLOAD_SCHEMA_VERSION,
-} from "./telemetry-transport-policy";
-import {
-  TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
-  TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
-  TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
-} from "@app-usagemonitor/telemetry-contract";
 import { timingSafeEqual } from "./crypto";
 import { deviceHash, parseDeviceAuthorization } from "./device-auth";
 import { ApiError } from "./errors";
@@ -342,6 +332,16 @@ async function authenticatedRenewableGraph(
   return { ledger, presentedHash, graph };
 }
 
+/** The successor grant exists only after isolation 0008 and becomes
+ * renewable only with 0010's trigger. One schema read per renewal keeps older
+ * databases on the unchanged four-row renewal. A grant a race leaves behind is
+ * reported as not current and caught up by its next authorization request. */
+async function v12RenewalInstalled(db: D1Database): Promise<boolean> {
+  return await db.prepare(`SELECT 1 AS present FROM sqlite_schema
+    WHERE type = 'trigger' AND name = 'accountless_v12_authorization_immutable'
+      AND sql LIKE '%renewal_generation%'`).first<number>("present") === 1;
+}
+
 /**
  * Extend only an exact, active accountless owner graph. A replay of the
  * original enrollment remains finite; this explicit bearer action is what
@@ -379,10 +379,7 @@ export async function renewAccountlessUploadOwner(
   ).toISOString();
   const nextGeneration = ledger.renewal_generation + 1;
   try {
-    const v12Table = await db.prepare(
-      "SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = ?",
-    ).bind("accountless_v12_device_authorizations").first<{ present: number }>();
-    const statements: D1PreparedStatement[] = [
+    const results = await db.batch([
       db.prepare(`
         UPDATE accountless_enrollment_ledger
            SET expires_at = ?, renewed_at = ?, renewal_generation = ?
@@ -434,67 +431,6 @@ export async function renewAccountlessUploadOwner(
         ledger.renewal_generation,
         ledger.renewed_at,
       ),
-    ];
-    if (v12Table?.present === 1) {
-      // This statement follows the ledger CAS but precedes the device, owner,
-      // and v1.1 updates. The D1 trigger permits an expiry change only while
-      // those prior rows still prove the same active, matching graph. Missing,
-      // revoked, or mismatched v1.2 grants are deliberately a no-op.
-      statements.push(db.prepare(`
-        UPDATE accountless_v12_device_authorizations
-           SET expires_at = ?
-         WHERE enrollment_device_id = ? AND participant_id = ?
-           AND device_credential_id = ?
-           AND schema_version = ? AND policy_version = ? AND authorization_basis = ?
-           AND telemetry_schema_version = ? AND field_dictionary_version = ?
-           AND privacy_contract_version = ?
-           AND state = 'active' AND expires_at = ?
-           AND EXISTS (
-             SELECT 1 FROM accountless_enrollment_ledger ledger
-               JOIN accountless_upload_owners owner
-                 ON owner.enrollment_device_id = ledger.device_id
-               JOIN device_credentials device ON device.id = owner.device_credential_id
-               JOIN accountless_v11_device_authorizations grant_row
-                 ON grant_row.enrollment_device_id = ledger.device_id
-                AND grant_row.participant_id = owner.participant_id
-                AND grant_row.device_credential_id = device.id
-              WHERE ledger.device_id = accountless_v12_device_authorizations.enrollment_device_id
-                AND ledger.state = 'active' AND ledger.expires_at = ?
-                AND ledger.renewal_generation = ? AND ledger.renewed_at = ?
-                AND owner.participant_id = accountless_v12_device_authorizations.participant_id
-                AND owner.device_credential_id = accountless_v12_device_authorizations.device_credential_id
-                AND owner.state = 'active'
-                AND owner.expires_at = accountless_v12_device_authorizations.expires_at
-                AND device.participant_id = owner.participant_id
-                AND device.authority_kind = 'accountless'
-                AND device.accountless_enrollment_device_id = ledger.device_id
-                AND device.secret_hash = ledger.device_secret_hash
-                AND device.state = 'active' AND device.social_verified_at IS NULL
-                AND device.expires_at = accountless_v12_device_authorizations.expires_at
-                AND grant_row.state = 'active'
-                AND grant_row.telemetry_schema_version = ?
-                AND grant_row.expires_at = accountless_v12_device_authorizations.expires_at
-           )
-         RETURNING enrollment_device_id
-      `).bind(
-        expiresAt,
-        ledger.device_id,
-        graph.participant_id,
-        ledger.device_id,
-        ACCOUNTLESS_V12_UPLOAD_SCHEMA_VERSION,
-        ACCOUNTLESS_V12_UPLOAD_POLICY_VERSION,
-        ACCOUNTLESS_V12_UPLOAD_AUTHORIZATION_BASIS,
-        TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
-        TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
-        TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
-        ledger.expires_at,
-        expiresAt,
-        nextGeneration,
-        renewedAt,
-        ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
-      ));
-    }
-    statements.push(
       db.prepare(`
         UPDATE device_credentials
            SET expires_at = ?
@@ -581,8 +517,41 @@ export async function renewAccountlessUploadOwner(
         nextGeneration,
         renewedAt,
       ),
-    );
-    const results = await db.batch(statements);
+      // The optional v1.2 successor grant moves with the same lease. Before
+      // isolation 0010 its trigger forbids any expiry change and would abort
+      // this whole renewal, so the row is only addressed once the
+      // renewal-aware trigger is installed; an absent grant matches nothing.
+      ...(await v12RenewalInstalled(db) ? [db.prepare(`
+        UPDATE accountless_v12_device_authorizations
+           SET expires_at = ?
+         WHERE enrollment_device_id = ? AND participant_id = ?
+           AND device_credential_id = ? AND state = 'active' AND expires_at = ?
+           AND EXISTS (
+             SELECT 1
+               FROM accountless_enrollment_ledger ledger
+               JOIN device_credentials device
+                 ON device.id = accountless_v12_device_authorizations.device_credential_id
+               JOIN accountless_upload_owners owner
+                 ON owner.enrollment_device_id = ledger.device_id
+                AND owner.participant_id = accountless_v12_device_authorizations.participant_id
+                AND owner.device_credential_id = device.id
+              WHERE ledger.device_id = accountless_v12_device_authorizations.enrollment_device_id
+                AND ledger.state = 'active' AND ledger.expires_at = ?
+                AND ledger.renewal_generation = ? AND ledger.renewed_at = ?
+                AND device.state = 'active' AND device.expires_at = ledger.expires_at
+                AND owner.state = 'active' AND owner.expires_at = ledger.expires_at
+           )
+      `).bind(
+        expiresAt,
+        ledger.device_id,
+        graph.participant_id,
+        ledger.device_id,
+        ledger.expires_at,
+        expiresAt,
+        nextGeneration,
+        renewedAt,
+      )] : []),
+    ]);
     // RETURNING identifies the exact fenced ledger row without relying on D1
     // change counts, which can include trigger work. Exact graph/generation
     // readback remains the authority for issuing its renewal receipt. A

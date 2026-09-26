@@ -5,6 +5,7 @@ import { advanceAdmittedV11DailyProjection, retireV11DailyProjectionPage,
  V11ProjectionDeadlineExceededError } from './v11-daily-projection';
 import { advanceV1DailyProjection, advanceV1DailyProjectionPage, prepareV1ProjectionOwnerFence, retireV1DailyProjectionPage } from './v1-daily-projection';
 import { advanceLegacyStorageAcknowledgement } from './legacy-storage-journal';
+import { advanceV12StorageAcknowledgement, isV12StorageChange } from './v12-storage-journal';
 import { advanceNextStorageCommunityDaily, retireStorageCommunityDailyPage } from './storage-community-daily';
 import { advanceStorageCommunityGraphWork, type StorageGraphWorkProgress } from './storage-community-graph-work';
 import { retireStorageGraphPage } from './storage-graph-retirement';
@@ -245,6 +246,7 @@ export async function advanceStorageAnalytics(options:StorageAnalyticsBindings&{
  const format=await classifyOrdinaryChange(source,change);
  if(format==='legacy')return advanceLegacyStorageAcknowledgement({source,target,sourceId,signal:options.signal});
  if(format==='v1')return advanceV1DailyProjection({...options});
+ if(await isV12StorageChange(source,change))return advanceV12StorageAcknowledgement({source,target,sourceId,signal:options.signal});
  const proof=await lookupV11StorageSource(source,change);
  if(proof.disposition==='discard') {
   const statements=prepareV1ProjectionOwnerFence(target,change,proof);

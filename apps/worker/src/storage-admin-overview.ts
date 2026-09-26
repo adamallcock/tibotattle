@@ -1,5 +1,6 @@
 import type { StorageAnalyticsBindings } from "./analytics-delivery";
 import { ApiError } from "./errors";
+import { hasTelemetryV12ChunkTable } from "./telemetry-v12-table";
 
 const MAX_ADMIN_AGGREGATE_ROWS = 10_000;
 
@@ -143,6 +144,22 @@ export async function readStorageAdminOverview(
     throw unavailable();
   }
 
+  const includeV12 = await hasTelemetryV12ChunkTable(bindings.source);
+  const v12ChunkHeaders = includeV12 ? `UNION ALL
+         SELECT participant_id, created_at, record_count AS records
+           FROM telemetry_v12_chunks` : "";
+  const v12AcceptedUploads = includeV12 ? `UNION ALL
+         SELECT participant_id, created_at FROM telemetry_v12_chunks` : "";
+  const v12StoredRecords = includeV12
+    ? " + COALESCE((SELECT SUM(record_count) FROM telemetry_v12_chunks),0)"
+    : "";
+  const v12SelectedChunks = includeV12 ? ` + (
+       SELECT COUNT(*) FROM telemetry_v12_domain_heads head
+       JOIN telemetry_v12_domain_days day ON day.generation_id=head.generation_id
+       JOIN telemetry_v12_chunks chunk ON chunk.participant_id=head.participant_id
+        AND chunk.manifest_id=day.manifest_id
+     )` : "";
+
   const [chunks, accounts, storedRecords, latestDaily, pendingDaily,
     historical, preview] = await Promise.all([
     bindings.source.prepare(
@@ -152,9 +169,11 @@ export async function readStorageAdminOverview(
          UNION ALL
          SELECT participant_id, created_at, record_count AS records
            FROM telemetry_v11_chunks
+         ${v12ChunkHeaders}
        )
        SELECT COUNT(*) AS total,
-              (SELECT COUNT(*) FROM telemetry_analytical_chunks) AS current,
+              ((SELECT COUNT(*) FROM telemetry_analytical_chunks)
+                ${v12SelectedChunks}) AS current,
               COALESCE(SUM(CASE WHEN created_at>=?1 THEN 1 ELSE 0 END),0)
                 AS accepted_last_24h,
               COALESCE(SUM(CASE WHEN created_at>=?2 THEN 1 ELSE 0 END),0)
@@ -170,6 +189,7 @@ export async function readStorageAdminOverview(
          SELECT participant_id, created_at FROM telemetry_v1_chunks
          UNION ALL
          SELECT participant_id, created_at FROM telemetry_v11_chunks
+         ${v12AcceptedUploads}
        ), latest_by_account AS (
          SELECT participant_id, MAX(created_at) AS latest_accepted_at
            FROM accepted_uploads GROUP BY participant_id
@@ -187,6 +207,7 @@ export async function readStorageAdminOverview(
       `SELECT
          COALESCE((SELECT SUM(accepted_record_count) FROM telemetry_v1_chunks),0)
          + COALESCE((SELECT SUM(record_count) FROM telemetry_v11_chunks),0)
+         ${v12StoredRecords}
            AS total`,
     ).first<CountRow>(),
     bindings.target.prepare(

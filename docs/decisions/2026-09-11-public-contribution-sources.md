@@ -23,6 +23,11 @@ are separate gates; the checklist below records their actual state.
 - Accountless admission requires the exact durable active owner, enrollment,
   device, and v1.1 authorization chain, including its versioned policy and bound
   source device. Do not create social sign-in, consent, or legacy cohort grants.
+  The owner extended this on 2026-09-25: a device with no v1.1 domain is
+  admitted through the same chain with the v1.2 successor authorization and an
+  accepted v1.2 head for that device, on the same statistical, opt-out
+  retention, withdrawal and erasure terms. Ingestion-isolation migration `0011`
+  implements it; production application and deployment are separate gates.
 - Upload credential expiry, ordinary opt-out, and device disconnect stop new
   uploads without withdrawing already accepted data. The owner clarified the
   opt-out rule on 2026-09-15 in the

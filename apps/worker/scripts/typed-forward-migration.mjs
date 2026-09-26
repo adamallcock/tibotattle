@@ -50,7 +50,6 @@ export const TYPED_FORWARD_MIGRATIONS = Object.freeze([
   Object.freeze({ role: 'primary', binding: 'USAGE_MONITOR_DB', directory: 'ingestion-isolation-migrations', name: '0007_usage_correction_admission.sql', sha256: '3893f350f4c76481a1a0fcc88fd8b5516ec8239fb100f21942c35105263f19ba' }),
   Object.freeze({ role: 'primary', binding: 'USAGE_MONITOR_DB', directory: 'ingestion-isolation-migrations', name: '0008_telemetry_v12.sql', sha256: 'd5802b4a1d228c8b4388b5effe67cbf4e61605628eec00d54f0d1669c988c9e1' }),
   Object.freeze({ role: 'primary', binding: 'USAGE_MONITOR_DB', directory: 'ingestion-isolation-migrations', name: '0009_performance_reports.sql', sha256: 'cfd43797151ea3d5a6740da9792be49bf897968094347cd6fbbb9a0cf6510825' }),
-  Object.freeze({ role: 'primary', binding: 'USAGE_MONITOR_DB', directory: 'ingestion-isolation-migrations', name: '0011_accountless_v12_renewal.sql', sha256: 'ceea5b75e03d37915cfc11db93fb1cb8273862d7f6e14b1e9abc09d88e0ad272' }),
   Object.freeze({ role: 'analytics', binding: 'ANALYTICS_DB', directory: 'analytics-migrations', name: '0024_effective_owner_daily_cursor.sql', sha256: 'f4eef3495ae3e5f1088ddea695607471dcbc2ea871291274ce50ef1295a05e68' }),
   Object.freeze({ role: 'analytics', binding: 'ANALYTICS_DB', directory: 'analytics-migrations', name: '0025_effective_graph_source.sql', sha256: 'a99ba82106e53ac2eda3ac9078784e22774ba0fc099265a66dacc5b1765fe84b' }),
   Object.freeze({ role: 'analytics', binding: 'ANALYTICS_DB', directory: 'analytics-migrations', name: '0026_cache_retention_effective_layout.sql', sha256: 'bac1838613b292b97bfee5022f6b43b6f52c9bc225d6d26f918cdcd7e454a2a1' }),
@@ -131,7 +130,6 @@ const REQUIRED_COLUMNS = Object.freeze({
   'primary:0007_usage_correction_admission.sql': [['telemetry_v11_domain_complete_before_insert', null]],
   'primary:0008_telemetry_v12.sql': [['telemetry_v12_runtime', ['state', 'policy_revision']], ['telemetry_transport_device_floors', ['participant_id', 'device_id', 'minimum_rank']]],
   'primary:0009_performance_reports.sql': [['telemetry_performance_runtime', ['state', 'method_version']], ['telemetry_performance_reports', ['report_day', 'record_count', 'bucket_scheme_version']]],
-  'primary:0011_accountless_v12_renewal.sql': [['accountless_v12_authorization_immutable', null]],
   'analytics:0024_effective_owner_daily_cursor.sql': [['analytics_community_daily_owners', ['source_format', 'progress_revision', 'next_index']]],
   'analytics:0025_effective_graph_source.sql': [['analytics_community_graph_results', ['source_kind']]],
   'analytics:0026_cache_retention_effective_layout.sql': [['analytics_cache_retention_day_marks', ['source_layout']], ['analytics_cache_retention_day_progress', ['source_layout', 'state_json']]],
@@ -279,14 +277,13 @@ export function validateTypedForwardPlan(plan, { now = Date.now(), allowExpired 
   let previousStep = null;
   for (const [index, step] of plan.steps.entries()) {
     const expected = TYPED_FORWARD_MIGRATIONS[index];
-    const previousStepForRole = previousStep?.role === step.role ? previousStep : null;
     if (!exact(step, ['role', 'binding', 'directory', 'name', 'sha256', 'beforeSchemaSha256', 'afterSchemaSha256', 'dataInvariantSha256', 'statements'])
         || step.role !== expected.role || step.binding !== expected.binding || step.directory !== expected.directory
         || step.name !== expected.name || step.sha256 !== expected.sha256 || !SHA256.test(step.beforeSchemaSha256 ?? '')
         || !SHA256.test(step.afterSchemaSha256 ?? '') || !SHA256.test(step.dataInvariantSha256 ?? '')
-        || step.beforeSchemaSha256 !== (previousStepForRole?.afterSchemaSha256 ?? previousByRole[step.role].schemaSha256)
+        || step.beforeSchemaSha256 !== (previousStep?.afterSchemaSha256 ?? previousByRole[step.role].schemaSha256)
         || !Array.isArray(step.statements) || step.statements.length < 1) fail('STEP_ORDER_INVALID');
-    let prior = { schemaSha256: step.beforeSchemaSha256, ledgerSha256: identityDigest(previousStepForRole ? expectedLedger(plan.targets.find(target => target.role === step.role), TYPED_FORWARD_MIGRATIONS.filter(item => item.role === step.role).indexOf(expected)) : previousByRole[step.role].ledger), progressSha256: previousByRole[step.role].dataInvariantSha256 };
+    let prior = { schemaSha256: step.beforeSchemaSha256, ledgerSha256: identityDigest(previousStep ? expectedLedger(plan.targets.find(target => target.role === step.role), TYPED_FORWARD_MIGRATIONS.filter(item => item.role === step.role).indexOf(expected)) : previousByRole[step.role].ledger), progressSha256: previousByRole[step.role].dataInvariantSha256 };
     for (const [statementIndex, statement] of step.statements.entries()) {
       if (!exact(statement, ['index', 'kind', 'sha256', 'resultCount', 'atomic', 'beforeSchemaSha256', 'afterSchemaSha256', 'beforeLedgerSha256', 'afterLedgerSha256', 'beforeProgressSha256', 'afterProgressSha256'])
           || statement.index !== statementIndex || !['migration', 'ledger'].includes(statement.kind)
@@ -306,6 +303,7 @@ export function validateTypedForwardPlan(plan, { now = Date.now(), allowExpired 
     }
     if (prior.schemaSha256 !== step.afterSchemaSha256 || prior.progressSha256 !== step.dataInvariantSha256) fail('STEP_ORDER_INVALID');
     previousStep = step;
+    if (index === 3) previousStep = null;
   }
   return structuredClone(plan);
 }
@@ -588,12 +586,6 @@ function assertSemanticMappings(database, role, step) {
     const row = database.prepare('SELECT schema_version,method_version,state,policy_revision FROM telemetry_performance_runtime WHERE id=1').get();
     if (!row || row.schema_version !== 'model-performance-daily-v1' || row.method_version !== 'performance-daily-histogram-v1'
         || row.state !== 'staged' || row.policy_revision !== 1 || !tableSql(database, 'telemetry_performance_reports').includes("bucket_scheme_version = 'performance-histogram-v1'")) fail('REHEARSAL_MAPPING_INVALID');
-  } else if (key === 'primary:0011_accountless_v12_renewal.sql') {
-    const trigger = database.prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='accountless_v12_authorization_immutable'").get()?.sql ?? '';
-    if (!trigger.includes("NEW.expires_at > OLD.expires_at")
-        || !trigger.includes("ledger.renewal_generation BETWEEN 1 AND 2147483647")
-        || !trigger.includes("owner.expires_at = OLD.expires_at")
-        || !trigger.includes("grant_row.expires_at = OLD.expires_at")) fail('REHEARSAL_MAPPING_INVALID');
   } else if (key === 'analytics:0024_effective_owner_daily_cursor.sql') {
     const row = database.prepare('SELECT source_format,method,progress_revision,next_index,complete,values_json FROM analytics_community_daily_owners WHERE source_id=?').get('synthetic-forward-source');
     if (!row || row.source_format !== 'v11' || row.method !== 'synthetic-forward' || row.progress_revision !== 1

@@ -112,6 +112,9 @@ export async function assertTelemetryV12WriteAllowed(
          ON a.participant_id = p.id AND a.device_credential_id = d.id
          AND a.enrollment_device_id = owner.enrollment_device_id
         AND ledger.device_id IS NOT NULL
+        -- Same lease equality as telemetry_v12_active_authorizations, so a
+        -- grant a renewal left behind is refused here, not by a later trigger.
+        AND a.expires_at = ledger.expires_at AND d.expires_at = ledger.expires_at
       WHERE r.id = 1`)
     .bind(principal.participantId, principal.deviceId)
     .first<{
@@ -370,7 +373,11 @@ export async function grantTelemetryV12AccountlessAuthorization(
         field_dictionary_version, privacy_contract_version, authorized_at,
         expires_at, state
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
-      ON CONFLICT(enrollment_device_id) DO NOTHING`,
+      ON CONFLICT(enrollment_device_id) DO UPDATE SET expires_at = excluded.expires_at
+       WHERE accountless_v12_device_authorizations.state = 'active'
+         AND accountless_v12_device_authorizations.participant_id = excluded.participant_id
+         AND accountless_v12_device_authorizations.device_credential_id = excluded.device_credential_id
+         AND accountless_v12_device_authorizations.expires_at < excluded.expires_at`,
     ).bind(owner.enrollment_device_id, principal.participantId, principal.deviceId,
       request.schemaVersion, request.policyVersion, request.authorizationBasis,
       request.telemetrySchemaVersion, TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
@@ -624,6 +631,10 @@ export async function telemetryTransportV12Capabilities(
          ON a.participant_id = p.id AND a.device_credential_id = d.id
         AND a.enrollment_device_id = owner.enrollment_device_id
         AND ledger.device_id IS NOT NULL
+        -- A grant left behind by a lease renewal is refused by the active
+        -- authorization view, so it must not be reported as current either;
+        -- the client then re-requests it and the grant below catches up.
+        AND a.expires_at = ledger.expires_at
       WHERE p.id = ? AND p.state = 'active' AND d.id = ? AND d.state = 'active'
         AND d.expires_at > ?`,
   ).bind(principal.participantId, principal.deviceId, now).first<{

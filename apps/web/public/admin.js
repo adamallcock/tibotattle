@@ -77,7 +77,7 @@ const INFO_HINTS = Object.freeze({
   "Active contributor identities": "Active pseudonymous contributor identities, including accountless installations. These are not verified people or a device census and may include identities without accepted data.",
   "Identities with accepted data": "Distinct contributor identities with retained accepted uploads in the active storage mode. The exact value as of the displayed snapshot and recent history come from the scheduled aggregate cache, independently of the overview's bounded newest-row sample.",
   "Identities added last 24h": "Contributor identities created during the trailing 24 hours. The caption gives the corresponding trailing seven-day count.",
-  "Current incremental chunks": "Accepted incremental journal chunks that have not been superseded. The caption includes every retained chunk row, including older superseded rows.",
+  "Current incremental chunks": "Selected source chunks from v1 and v1.1 analytical storage plus v1.2 active domain heads. The caption counts every retained accepted v1, v1.1 and v1.2 chunk, including staged or superseded rows.",
   "Accepted uploads last 24h": "Accepted whole contributions plus incremental chunks received during the trailing 24 hours. One account can send many uploads.",
   "Upload safety registrations": "Crash-safety markers created before uploaded objects are committed to the database. Recent markers are normal; older markers are reconciled.",
   "Recent registrations": "Upload safety markers still inside the one-hour grace period. They are expected and are not yet eligible for reconciliation.",
@@ -138,8 +138,8 @@ const INFO_HINTS = Object.freeze({
   "Legacy device pairings": "Retained handshakes from legacy device pairing. Accountless Electron enrollment does not use this flow.",
   "Device credentials": "Retained upload credentials issued through legacy pairing or accountless enrollment. Revoked or expired credentials may still be retained; this is not a count of currently connected devices.",
   "Legacy upload consents": "Retained consent records from the legacy sharing flow. This is not coverage of the accountless Electron sharing policy.",
-  "Chunks uploaded": "Incremental contribution chunks accepted into the corpus.",
-  "Records uploaded": "Usage records inside accepted chunks, summed per day.",
+  "Chunks uploaded": "Accepted v1, v1.1 and v1.2 incremental chunks, including staged and later superseded chunks. This is a retained upload total, not a count of currently selected evidence.",
+  "Records uploaded": "Records inside accepted v1, v1.1 and v1.2 chunks, summed per upload day. Overlapping source records can appear more than once here; the effective public series resolves them separately.",
   "Identities uploading": "Distinct pseudonymous contributor identities with accepted chunks. The headline covers retained evidence; daily points count identities active on each UTC day and must not be summed as unique people.",
   "DMG downloads": "Cumulative installer downloads across all GitHub releases, sampled by the distribution sync. The delta is movement since the prior day's last sample.",
   "Published band cohort": "People inside the published community allowance band (the site's “from N people”).",
@@ -719,7 +719,7 @@ function renderMetricCards(selector, metrics) {
 }
 
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
-const GROWTH_SCHEMA_VERSION = "admin-metrics-history-v0.2";
+const GROWTH_SCHEMA_VERSION = "admin-metrics-history-v0.3";
 
 /**
  * A day-by-day count series with calendar gaps filled: event tables have no

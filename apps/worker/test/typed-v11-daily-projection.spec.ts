@@ -342,8 +342,10 @@ describe("typed accountless upload to isolated projection", () => {
     expect(await target().prepare("SELECT COUNT(*) n FROM analytics_v11_value_pages").first<number>("n")).toBe(10);
     expect(await target().prepare("SELECT MAX(length(values_json)) n FROM analytics_v11_value_pages").first<number>("n"))
       .toBeLessThanOrEqual(262_144);
+    // One ordinary-dispatch probe per journal event distinguishes a v1.2 head
+    // acknowledgement (isolation 0011) from the default v1.1 projection.
     expect({ queries: measured.queriesUsed, prepared: stats.prepared, roundTrips: stats.roundTrips })
-      .toEqual({ queries: 77, prepared: 77, roundTrips: 40 });
+      .toEqual({ queries: 78, prepared: 78, roundTrips: 41 });
     expect(measured.queriesUsed).toBeLessThan(840);
   });
 

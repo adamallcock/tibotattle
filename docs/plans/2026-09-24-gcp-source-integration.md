@@ -570,13 +570,17 @@ read and claim. The retention sweep still excludes v1.2 chunks: there is no
 approved age-based deletion policy or `quarantine_deleted_at` state for that
 format. No live reconciliation or copy has run.
 The inverse race is now fenced locally by forward D1 migration
-`0010_v12_quarantine_admission.sql`: a new v1.2 chunk requires an exact pending
-object registration still in `registered` state. Seven focused tests cover
+`0012_v12_quarantine_admission.sql`: a new v1.2 chunk requires an exact pending
+object registration still in `registered` state. It was numbered `0010` on this
+line until the 2026-09-25 merge with `main`, whose owner-authorized
+`0010_accountless_v12_renewal.sql` and `0011_v12_public_eligibility.sql` keep
+their numbers; this line's own v1.2 renewal-trigger migration (then `0011`)
+was dropped in favour of `main`'s `0010`. Seven focused tests cover
 admission, missing/mismatched/deleting registrations and transaction rollback.
 Usage activation pins the migration ledger hash and trigger. The historical
-source-pinned migration operator ends at `0009`; `0010` needs a separately
-reviewed forward application and receipt after `0009` in the ordered D1
-stream. The production D1 schema has not been changed.
+source-pinned migration operator ends at `0009`; `0012` needs a separately
+reviewed forward application and receipt after `0009`–`0011` in the ordered D1
+stream. This line has not changed the production D1 schema.
 The PostgreSQL pending-object journal now has a separate, source-only
 reconciler. A focused PostgreSQL 17 test passes for committed-reference
 preservation, exact journal cleanup, late object creation, a lost delete

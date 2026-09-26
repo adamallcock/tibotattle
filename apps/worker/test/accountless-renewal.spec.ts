@@ -152,19 +152,34 @@ async function applyV12AuthorityMigrations(): Promise<void> {
   await applyD1Migrations(db(), bindings().TEST_INGESTION_ISOLATION_MIGRATIONS);
 }
 
+// Isolation 0010 is the migration that makes an existing v1.2 grant renewable
+// and repairs grants an earlier renewal left behind.
+const V12_RENEWAL_MIGRATION = "0010_accountless_v12_renewal.sql";
+
+/** The deployed predecessor: every isolation migration before 0010, so the
+ * original 0008 trigger still forbids any v1.2 expiry change. */
 async function applyV12AuthorityMigrationsBeforeRenewal(): Promise<void> {
   await applyD1Migrations(db(), bindings().TEST_TYPED_INGESTION_MIGRATIONS);
   await applyD1Migrations(db(), bindings().TEST_INGESTION_BRIDGE_MIGRATIONS);
   await applyD1Migrations(db(), bindings().TEST_TYPED_V11_ADMISSION_MIGRATIONS);
   await applyD1Migrations(db(), bindings().TEST_TYPED_V1_ADMISSION_MIGRATIONS);
   const migrations = bindings().TEST_INGESTION_ISOLATION_MIGRATIONS;
-  const lastPreRenewalIndex = migrations.findIndex(
-    (migration) => migration.name === "0010_v12_quarantine_admission.sql",
-  );
-  if (lastPreRenewalIndex < 0) {
+  if (!migrations.some((migration) => migration.name === "0009_performance_reports.sql")
+      || !migrations.some((migration) => migration.name === V12_RENEWAL_MIGRATION)) {
     throw new Error("missing v1.2 pre-renewal migration boundary");
   }
-  await applyD1Migrations(db(), migrations.slice(0, lastPreRenewalIndex + 1));
+  await applyD1Migrations(
+    db(),
+    migrations.filter((migration) => migration.name < V12_RENEWAL_MIGRATION),
+  );
+}
+
+/** A v1.2-only install: ownership always creates the v1.1 grant, but the
+ * device has never activated a v1.1 domain (the public-eligibility test). */
+async function v11DomainCount(deviceId: string): Promise<number | null> {
+  return await db().prepare(
+    "SELECT count(*) AS count FROM telemetry_v11_domains WHERE device_id = ?",
+  ).bind(deviceId).first<number>("count");
 }
 
 async function insertV12Grant(
@@ -249,7 +264,7 @@ beforeEach(async () => {
 });
 
 describe("accountless owner lease renewal", () => {
-  it("fails closed and rolls back the whole lease graph before migration 0011", async () => {
+  it("renews a v1.2-only lease before migration 0010, reports its grant stale, and 0010 repairs it", async () => {
     const wallClock = Date.now();
     const issuedAtEpoch = wallClock - 23 * DAY;
     const issuedAt = new Date(issuedAtEpoch).toISOString();
@@ -262,6 +277,7 @@ describe("accountless owner lease renewal", () => {
       await applyV12AuthorityMigrationsBeforeRenewal();
       const { authorization, participantId } = await enrollAndOwn(deviceId, secret);
       await insertV12Grant(deviceId, participantId, issuedAt, oldExpiry);
+      expect(await v11DomainCount(deviceId)).toBe(0);
 
       const snapshot = async () => db().prepare(`
         SELECT ledger.expires_at AS ledger_expires_at,
@@ -292,6 +308,7 @@ describe("accountless owner lease renewal", () => {
         v12_expires_at: oldExpiry,
       });
 
+      // Before 0010 the original trigger forbids any v1.2 expiry change.
       await expect(db().prepare(`
         UPDATE accountless_v12_device_authorizations SET expires_at = ?
          WHERE enrollment_device_id = ?
@@ -299,15 +316,44 @@ describe("accountless owner lease renewal", () => {
         "accountless v12 authorization immutable",
       );
 
+      // On the old schema the four-row lease still renews; only the grant is
+      // left behind, instead of the whole renewal failing and the lease lapsing.
       clock.mockReturnValue(wallClock);
       const response = await api("/api/v1/accountless/renewal", {
         method: "POST",
         headers: { authorization, "content-type": "application/json" },
         body: JSON.stringify(RENEWAL_BODY),
       });
-      expect(response.status).toBe(503);
-      expect(await errorCode(response)).toBe("BACKEND_STORAGE_UNAVAILABLE");
-      expect(await snapshot()).toEqual(before);
+      expect(response.status, await response.clone().text()).toBe(200);
+      expect(await response.json()).toMatchObject({
+        state: "renewed", renewalGeneration: 1, expiresAt: nextExpiry,
+      });
+      expect(await snapshot()).toEqual({
+        ledger_expires_at: nextExpiry,
+        renewal_generation: 1,
+        renewed_at: new Date(wallClock).toISOString(),
+        device_expires_at: nextExpiry,
+        owner_expires_at: nextExpiry,
+        v11_expires_at: nextExpiry,
+        v12_state: "active",
+        v12_expires_at: oldExpiry,
+      });
+      // The stale grant is honestly not current: the v1.2 write gate refuses it.
+      await db().prepare("UPDATE telemetry_v12_runtime SET state = 'active' WHERE id = 1").run();
+      await expect(assertTelemetryV12WriteAllowed(db(), { participantId, deviceId }))
+        .rejects.toMatchObject({ code: "TELEMETRY_TRANSPORT_BLOCKED" });
+
+      // Applying 0010 (and the later isolation migrations) repairs the grant
+      // onto the renewed lease, and v1.2 uploads are admitted again.
+      await applyD1Migrations(db(), bindings().TEST_INGESTION_ISOLATION_MIGRATIONS);
+      expect(await snapshot()).toMatchObject({
+        ledger_expires_at: nextExpiry,
+        renewal_generation: 1,
+        v12_state: "active",
+        v12_expires_at: nextExpiry,
+      });
+      await expect(assertTelemetryV12WriteAllowed(db(), { participantId, deviceId }))
+        .resolves.toBeUndefined();
     } finally {
       clock.mockRestore();
       secret.fill(0);
@@ -771,6 +817,8 @@ describe("accountless owner lease renewal", () => {
       const originalExpiry = new Date(issuedAt + 30 * DAY).toISOString();
       await insertV12Grant(deviceId, participantId,
         new Date(issuedAt).toISOString(), originalExpiry);
+      // The renewed grant belongs to a v1.2-only install: no v1.1 domain.
+      expect(await v11DomainCount(deviceId)).toBe(0);
       clock.mockReturnValue(wallClock);
       const concurrent = await Promise.all(Array.from({ length: 4 }, () =>
         renewAccountlessUploadOwner(db(), authorization, RENEWAL_BODY, wallClock),

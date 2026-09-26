@@ -6,6 +6,7 @@ import { readQuarantineReconciliationStatus } from "./quarantine-reconciliation"
 import { parseStoredJson } from "./stored-record";
 import type { StorageAnalyticsBindings } from "./analytics-delivery";
 import { readStorageAdminOverview } from "./storage-admin-overview";
+import { hasTelemetryV12ChunkTable } from "./telemetry-v12-table";
 import type { UploadIngressStatus } from "./upload-ingress-admission";
 
 const ADMIN_IDENTITY_DOMAIN = "app-usagemonitor/admin-actor/v1\0";
@@ -470,9 +471,18 @@ export async function readAdminOverview(
   const quarantineCutoffAt = new Date(
     nowEpoch - QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS,
   ).toISOString();
+  const includeV12 = await hasTelemetryV12ChunkTable(db);
   const storageOverview = options.storage
     ? readStorageAdminOverview(options.storage, nowEpoch)
     : Promise.resolve(null);
+  const v12DueReferenced = includeV12 ? `OR EXISTS (
+                  SELECT 1 FROM telemetry_v12_chunks
+                   WHERE r2_key = pending.r2_key
+                )` : "";
+  const v12DueUnreferenced = includeV12 ? `AND NOT EXISTS (
+                  SELECT 1 FROM telemetry_v12_chunks
+                   WHERE r2_key = pending.r2_key
+                )` : "";
   const skippedLegacyCount: CountRow = { total: 0 };
   const skippedLegacyAccounts: ContributingAccountsRow = { total: 0 };
   const [
@@ -599,6 +609,7 @@ export async function readAdminOverview(
                   SELECT 1 FROM telemetry_v11_chunks
                    WHERE r2_key = pending.r2_key
                 )
+                ${v12DueReferenced}
               ) THEN 1 ELSE 0 END) AS due_referenced,
               SUM(CASE WHEN registered_at <= ?1
                 AND NOT EXISTS (
@@ -616,6 +627,7 @@ export async function readAdminOverview(
                   SELECT 1 FROM telemetry_v11_chunks
                    WHERE r2_key = pending.r2_key
                 )
+                ${v12DueUnreferenced}
                 THEN 1 ELSE 0 END) AS due_unreferenced,
               MIN(registered_at) AS oldest_registered_at,
               MAX(registered_at) AS newest_registered_at,

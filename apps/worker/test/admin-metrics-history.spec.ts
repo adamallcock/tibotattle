@@ -461,7 +461,7 @@ describe("admin metrics history aggregate cache", () => {
     expect(statements[0]).not.toMatch(
       /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu,
     );
-    expect(history.schemaVersion).toBe("admin-metrics-history-v0.2");
+    expect(history.schemaVersion).toBe("admin-metrics-history-v0.3");
     expect(history.events.participants).toMatchObject({
       total: 2,
       byDayStartsAt: "2026-07-23",
@@ -534,7 +534,7 @@ describe("admin metrics history aggregate cache", () => {
       bindings.USAGE_MONITOR_DB,
       nowEpoch,
     )).resolves.toMatchObject({
-      schemaVersion: "admin-metrics-history-v0.2",
+      schemaVersion: "admin-metrics-history-v0.3",
     });
   });
 

@@ -433,7 +433,7 @@ function metricsHistoryPayload() {
     ],
   };
   return {
-    schemaVersion: "admin-metrics-history-v0.2",
+    schemaVersion: "admin-metrics-history-v0.3",
     generatedAt: "2026-08-23T12:00:00.000Z",
     events: Object.fromEntries([
       "participants",
@@ -586,7 +586,7 @@ test("metrics history projector enforces the declared recent window", () => {
   );
 
   const oldSchema = metricsHistoryPayload();
-  oldSchema.schemaVersion = "admin-metrics-history-v0.1";
+  oldSchema.schemaVersion = "admin-metrics-history-v0.2";
   assert.throws(
     () => projectAdminMetricsHistory(oldSchema),
     /ADMIN_METRICS_HISTORY_INVALID/u,

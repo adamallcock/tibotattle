@@ -1566,6 +1566,11 @@ export async function createSyntheticCanonicalD1({ extraV1Chunks = 0, v1RecordPa
       }
     }
   }
+  // A deployed ingestion role has an initialized delivery-journal source. The
+  // isolation-0011 v1.2 head bridge journals an eligible accepted head through
+  // it, and refuses the head on an uninitialized source.
+  database.prepare("INSERT INTO storage_source_state(singleton, source_id) VALUES (1, ?)")
+    .run("cutover-synthetic-source");
   const now = new Date().toISOString();
   const day = now.slice(0, 10);
   const participant = "cutover-synthetic-participant";
