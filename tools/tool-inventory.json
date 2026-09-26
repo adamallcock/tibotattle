@@ -1945,6 +1945,7 @@
       "callers": [
         ".github/workflows/release-trust-policy.yml",
         "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+        "test/hosted-backend-workflow.test.js",
         "test/release-workflow-policy.test.js"
       ],
       "decision": "retain_as_protected_release_quality_gate",

@@ -139,36 +139,52 @@ async function exists(path) {
 // ---------------------------------------------------------------------------
 
 /**
- * Tokenize the `postgres:domain:check` script. Only `./postgres-test/*.mjs`
- * arguments of a `node --test` command are node:test registrations; any other
- * mention of postgres-test is an unsupported shape and fails closed.
+ * Tokenize the `postgres:domain:check` script. It may contain only two command
+ * shapes, joined by `&&`:
+ *
+ *   node --test [--test-*[=value]]... ./postgres-test/<file>.mjs...
+ *   vitest run --config <one of VITEST_REGISTRATION_CONFIGS>
+ *
+ * Anything else (a file outside ./postgres-test/, another vitest config, a
+ * filter, a flag taking a separate value, another command) is a registration
+ * this runner would not execute, so it fails REGISTRATION_PARSE_FAILED.
  */
 export function parseDomainCheckRegistration(script) {
   if (typeof script !== "string" || script.trim() === "") {
     throw new CiPostgresSuiteError("REGISTRATION_PARSE_FAILED",
       `package.json scripts["${DOMAIN_CHECK_SCRIPT}"] is missing`);
   }
+  const unsupported = (detail) => new CiPostgresSuiteError("REGISTRATION_PARSE_FAILED",
+    `unsupported ${DOMAIN_CHECK_SCRIPT} ${detail}`);
   const nodeFiles = [];
   const vitestConfigs = [];
   for (const segment of script.split("&&")) {
     const tokens = segment.trim().split(/\s+/u).filter(Boolean);
-    const isNodeTest = tokens[0] === "node" && tokens.includes("--test");
-    const isVitest = tokens[0] === "vitest";
-    for (let index = 0; index < tokens.length; index += 1) {
-      const token = tokens[index];
-      if (isVitest && token === "--config" && index + 1 < tokens.length) {
-        vitestConfigs.push(tokens[index + 1]);
-      } else if (isVitest && token.startsWith("--config=")) {
-        vitestConfigs.push(token.slice("--config=".length));
+    if (tokens[0] === "node" && tokens[1] === "--test") {
+      let files = 0;
+      for (const token of tokens.slice(2)) {
+        if (/^--test(?:-[a-z]+)+(?:=[^\s=]+)?$/u.test(token)) continue;
+        const match = DOMAIN_TOKEN_PATTERN.exec(token);
+        if (match === null) throw unsupported(`node --test argument ${JSON.stringify(token)}`);
+        nodeFiles.push(`${POSTGRES_TEST_DIRECTORY}/${match[1]}`);
+        files += 1;
       }
-      if (!token.includes("postgres-test")) continue;
-      const match = DOMAIN_TOKEN_PATTERN.exec(token);
-      if (!isNodeTest || match === null) {
-        throw new CiPostgresSuiteError("REGISTRATION_PARSE_FAILED",
-          `unsupported ${DOMAIN_CHECK_SCRIPT} argument ${JSON.stringify(token)}`);
-      }
-      nodeFiles.push(`${POSTGRES_TEST_DIRECTORY}/${match[1]}`);
+      if (files === 0) throw unsupported("node --test command without ./postgres-test/ files");
+      continue;
     }
+    if (tokens[0] === "vitest") {
+      const config = tokens.length === 4 && tokens[1] === "run" && tokens[2] === "--config"
+        ? tokens[3]
+        : tokens.length === 3 && tokens[1] === "run" && tokens[2].startsWith("--config=")
+          ? tokens[2].slice("--config=".length)
+          : null;
+      if (config === null || !VITEST_REGISTRATION_CONFIGS.includes(config)) {
+        throw unsupported(`vitest command ${JSON.stringify(tokens.join(" "))}`);
+      }
+      vitestConfigs.push(config);
+      continue;
+    }
+    throw unsupported(`command ${JSON.stringify(tokens.join(" "))}`);
   }
   return Object.freeze({
     nodeFiles: Object.freeze(nodeFiles),

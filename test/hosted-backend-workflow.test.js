@@ -218,6 +218,10 @@ test("no run block interpolates GitHub expressions into a shell", async () => {
       assert.doesNotMatch(command, /\$\{\{/u, `${id} run blocks use environment variables, not expressions`);
     }
     for (const step of job.steps) assert.equal(step.env, undefined, `${id} steps take no expression env`);
+    for (const [name, value] of Object.entries(job.env ?? {})) {
+      assert.equal(typeof value, "string", `${id} env ${name} is a quoted literal`);
+      assert.doesNotMatch(value, /\$\{\{/u, `${id} env ${name} is static`);
+    }
   }
 });
 
@@ -255,12 +259,44 @@ test("three jobs run the Worker gate, the Cloud Run check and the routed Postgre
     assert.equal(job.steps.filter((step) => step.if !== undefined).length, 1, `${id} has one conditional step`);
   }
   const worker = runs(workflow.jobs["worker-gate"]);
-  const guard = worker.indexOf("node --test apps/worker/scripts/migration-numbering.check.mjs apps/worker/scripts/ci-postgres-suite.check.mjs");
+  // This contract test runs in CI too, so a change that only a local root
+  // `npm test` would catch (a new uncovered import, a dropped stop step) fails
+  // the Worker gate.
+  const guard = worker.indexOf([
+    "node --test",
+    "test/hosted-backend-workflow.test.js",
+    "apps/worker/scripts/migration-numbering.check.mjs",
+    "apps/worker/scripts/ci-postgres-suite.check.mjs",
+  ].join(" "));
   const site = worker.findIndex((command) => command.includes("node scripts/build-public-release-site.js"));
   assert.ok(guard >= 0 && site > guard && worker.indexOf(gates["worker-gate"]) > site);
   assert.match(worker[site], /--output "\$GITHUB_WORKSPACE\/\.release-build\/public-release-site"/u);
   assert.match(worker[site], /--social-image "\$social_card"/u);
-  assert.equal(workflow.jobs["worker-gate"].env.WRANGLER_SEND_METRICS, "false");
+  assert.deepEqual(workflow.jobs["worker-gate"].env, { WRANGLER_SEND_METRICS: "false" });
+  assert.equal(workflow.jobs["postgres-17-suite"].env, undefined);
+});
+
+test("the Cloud Run check gives the daily-activation integration test the container's loopback TCP port", async () => {
+  // Without these two variables the real PostgreSQL 17 test in
+  // postgres-community-daily-activation.check.mjs skips and the job stays green.
+  const { workflow } = await loadWorkflow();
+  const container = await readFile(join(REPOSITORY_ROOT, CONTAINER_SCRIPT), "utf8");
+  const publish = [...container.matchAll(/^export const LOOPBACK_PUBLISH = "127\.0\.0\.1:(\d+):5432";$/gmu)];
+  assert.equal(publish.length, 1, "the container publishes exactly one loopback TCP port");
+  assert.deepEqual(workflow.jobs["cloud-run-check"].env, {
+    A2_DAILY_ACTIVATION_TEST_HOST: "127.0.0.1",
+    A2_DAILY_ACTIVATION_TEST_PORT: publish[0][1],
+  });
+
+  const cloudRun = "apps/worker/cloud-run";
+  const activation = "postgres-community-daily-activation.check.mjs";
+  const source = await readFile(join(REPOSITORY_ROOT, cloudRun, activation), "utf8");
+  assert.match(source, /process\.env\.A2_DAILY_ACTIVATION_TEST_HOST\b/u);
+  assert.match(source, /process\.env\.A2_DAILY_ACTIVATION_TEST_PORT\b/u);
+  assert.match(source, /REAL_PG_HOST === "127\.0\.0\.1"/u);
+  const packageJson = JSON.parse(await readFile(join(REPOSITORY_ROOT, cloudRun, "package.json"), "utf8"));
+  assert.match(packageJson.scripts.check, new RegExp(`node --test [^&]*\\./${activation.replaceAll(".", "\\.")}`, "u"),
+    "the Cloud Run check runs the daily-activation check under node --test");
 });
 
 test("the PostgreSQL image is PostgreSQL 17 pinned by digest", async () => {

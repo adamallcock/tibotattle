@@ -236,6 +236,19 @@ test("a missing number or a late run start fails MIGRATION_NUMBER_GAP", async ()
       assert.deepEqual(codes(result), ["MIGRATION_NUMBER_GAP"]);
     });
   });
+  // A late run start: the remaining files are contiguous, but D1 would apply a
+  // history whose first migration is missing.
+  await withWorkerCopy(["typed-ingestion-migrations"], async (root) => {
+    const typed = join(root, "typed-ingestion-migrations");
+    const files = (await readdir(typed)).filter((name) => name.endsWith(".sql")).sort();
+    assert.ok(files.length >= 3 && files[0].startsWith("0001_"), "a multi-file run starting at 0001");
+    assert.deepEqual((await inspectMigrationNumbering(root)).failures, []);
+    await rm(join(typed, files[0]));
+    const result = await inspectMigrationNumbering(root);
+    assert.deepEqual(result.failures.map(({ code, directory, expected, found }) => [code, directory, expected, found]), [
+      ["MIGRATION_NUMBER_GAP", "typed-ingestion-migrations", "0001", "0002"],
+    ]);
+  });
   await withWorkerCopy(["legacy-migrations"], async (root) => {
     assert.deepEqual((await inspectMigrationNumbering(root)).failures, [],
       "legacy-migrations may start its run at 0046");
@@ -262,6 +275,23 @@ test("staged migrations continue the promoted role without reusing its numbers",
     assert.ok(codes(result).includes("MIGRATION_NUMBER_DUPLICATE"));
     assert.equal(result.failures.find(({ code }) => code === "MIGRATION_NUMBER_DUPLICATE").promoted,
       "postgres/migrations/primary");
+  });
+});
+
+test("a staged role with no promoted directory must start its run at 0001", async () => {
+  await withWorkerCopy(["postgres/migrations/primary"], async (root) => {
+    const staged = join(root, "postgres", "staged-migrations", "synthetic-role");
+    await mkdir(staged, { recursive: true });
+    await writeFile(join(staged, "0001_synthetic_first.sql"), "-- synthetic\n");
+    await writeFile(join(staged, "0002_synthetic_second.sql"), "-- synthetic\n");
+    assert.deepEqual((await inspectMigrationNumbering(root)).failures, [],
+      "a new role may be staged from 0001");
+
+    await rm(join(staged, "0001_synthetic_first.sql"));
+    const result = await inspectMigrationNumbering(root);
+    assert.deepEqual(result.failures.map(({ code, directory, expected, found }) => [code, directory, expected, found]), [
+      ["MIGRATION_NUMBER_GAP", "postgres/staged-migrations/synthetic-role", "0001", "0002"],
+    ]);
   });
 });
 

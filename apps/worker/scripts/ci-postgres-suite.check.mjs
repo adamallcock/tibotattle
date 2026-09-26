@@ -8,6 +8,7 @@ import {
   readFile,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -21,6 +22,7 @@ import {
   deriveFileProfile,
   evaluatePostgresSuite,
   EXPECTED_HOST_PROFILE_FILES,
+  extractGateExpressions,
   listPostgresTestFiles,
   loadRegistration,
   parseDomainCheckRegistration,
@@ -44,6 +46,7 @@ import {
   POSTGRES_IMAGE,
   startCiPostgres,
   stopCiPostgres,
+  verifyPrivateDirectory,
   verifyServer,
 } from "./ci-postgres-container.mjs";
 
@@ -169,6 +172,49 @@ test("imported", { skip: !PG_TEST_HOST }, async () => {});
   assert.match(unresolved.reasons.join(";"), /unresolved PG_TEST_HOST/u);
 });
 
+test("vitest skipIf and runIf arguments are gates too", () => {
+  // Every real vitest spec gates dual-key, which routes SOCKET like an ungated
+  // file; these fixtures prove skipIf/runIf are read, not defaulted.
+  assert.deepEqual(extractGateExpressions(`
+describe.skipIf(!process.env.PG_TEST_HOST)("suite", () => {});
+it.runIf(Boolean(process.env.PG_TEST_SOCKET))("case", () => {});
+`), ["!process.env.PG_TEST_HOST", "Boolean(process.env.PG_TEST_SOCKET)"]);
+  assert.equal(deriveFileProfile(`
+describe.skipIf(!process.env.PG_TEST_HOST)("suite", () => {});
+`).profile, "HOST");
+  assert.equal(deriveFileProfile(`
+const PG_TEST_HOST = process.env.PG_TEST_HOST;
+describe.runIf(PG_TEST_HOST)("suite", () => {});
+`).profile, "HOST");
+  const unbound = deriveFileProfile(`
+describe.runIf(PG_TEST_UNBOUND)("suite", () => {});
+`);
+  assert.deepEqual([unbound.ambiguous, unbound.profile], [true, null]);
+  assert.match(unbound.reasons.join(";"), /unresolved PG_TEST_UNBOUND/u);
+  const mixed = deriveFileProfile(`
+describe.skipIf(!process.env.PG_TEST_HOST)("host", () => {});
+describe.skipIf(!process.env.PG_TEST_SOCKET)("socket", () => {});
+`);
+  assert.equal(mixed.ambiguous, true);
+});
+
+test("a vitest-registered spec that derives HOST fails PROFILE_ROUTING_DRIFT (the HOST pass is node:test only)", async () => {
+  const vitestSpec = "postgres-test/postgres-community-daily-host.spec.mjs";
+  await withWorkerCopy(async (root) => {
+    assert.ok((await readFile(join(root, "vitest.postgres.config.ts"), "utf8")).includes(vitestSpec));
+    await writeFile(join(root, vitestSpec),
+      "import { describe, it } from \"vitest\";\n"
+      + "describe.skipIf(!process.env.PG_TEST_HOST)(\"synthetic\", () => { it(\"runs\", () => {}); });\n");
+    const plan = await planPostgresSuite({
+      workerRoot: root,
+      expectedHostFiles: [...EXPECTED_HOST_PROFILE_FILES, vitestSpec],
+    });
+    assert.deepEqual(plan.failures.map(({ code, file, detail }) => [code, file, detail]), [
+      ["PROFILE_ROUTING_DRIFT", vitestSpec, "HOST-routed specs must be node:test files"],
+    ]);
+  });
+});
+
 test("a spec whose derived route changes fails PROFILE_ROUTING_DRIFT or PROFILE_ROUTING_AMBIGUOUS", async () => {
   await withWorkerCopy(async (root) => {
     const maintenance = join(root, "postgres-test/postgres-maintenance.spec.mjs");
@@ -287,6 +333,36 @@ test("registration drift fails closed: missing, duplicated or unparseable regist
     nodeFiles: ["postgres-test/a.spec.mjs", "postgres-test/b.check.mjs"],
     vitestConfigs: ["vitest.postgres.config.ts"],
   });
+  assert.deepEqual(parseDomainCheckRegistration("vitest run --config=vitest.node.config.ts").vitestConfigs,
+    ["vitest.node.config.ts"]);
+});
+
+test("a postgres:domain:check registration the runner would not execute fails REGISTRATION_PARSE_FAILED", async () => {
+  const base = "vitest run --config vitest.postgres.config.ts && node --test --test-concurrency=1 ./postgres-test/a.spec.mjs";
+  for (const script of [
+    `${base} ./scripts/pg-extra.check.mjs`,
+    `${base} ./test/pg-other.spec.mjs`,
+    `${base} && vitest run --config vitest.graph.config.ts`,
+    `${base} && vitest run`,
+    `${base} && vitest run --config vitest.postgres.config.ts ./postgres-test/filter.spec.mjs`,
+    `${base} && node ./scripts/pg-extra.check.mjs`,
+    `${base} && node --test`,
+    `${base} && npm run other:check`,
+    "node --test --import ./setup.mjs ./postgres-test/a.spec.mjs",
+    "node --test ./postgres-test/a.spec.mjs; node --test ./postgres-test/b.spec.mjs",
+  ]) {
+    assert.throws(() => parseDomainCheckRegistration(script), /REGISTRATION_PARSE_FAILED/u, script);
+  }
+  for (const appended of [" ./scripts/pg-extra.check.mjs", " && vitest run --config vitest.graph.config.ts"]) {
+    await withWorkerCopy(async (root) => {
+      await editJson(join(root, "package.json"), (value) => {
+        value.scripts["postgres:domain:check"] += appended;
+      });
+      const plan = await planPostgresSuite({ workerRoot: root });
+      assert.deepEqual(codes(plan.failures), ["REGISTRATION_PARSE_FAILED"], appended);
+      assert.deepEqual(plan.files, []);
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -606,6 +682,28 @@ test("vitest JSON: skipped, pending and todo fail; missing, empty and unplanned 
   assert.deepEqual(parseVitestReport(null, { workerRoot: WORKER_ROOT }).parseFailures, ["VITEST_REPORT_INVALID"]);
 });
 
+test("vitest JSON: a disabled test is a skip and an unknown status is a failure, never a pass", () => {
+  const a = "postgres-test/a.spec.mjs";
+  const parsed = parseVitestReport(vitestReport([
+    { file: a, assertions: [
+      [["suite"], "disabled", "disabled"],
+      [["suite"], "from a newer vitest", "some-future-status"],
+      [["suite"], "no status", undefined],
+    ] },
+  ]), { workerRoot: WORKER_ROOT });
+  assert.deepEqual(parsed.files.get(a).tests.map(({ status }) => status), ["skipped", "failed", "failed"]);
+  const summary = evaluatePostgresSuite({
+    plan: { files: [{ file: a, profile: "SOCKET" }] },
+    records: [vitestRecord(parsed)],
+  });
+  assert.deepEqual(summary.failures.map(({ code, test: name }) => [code, name]), [
+    ["SILENTLY_SKIPPED", "suite > disabled"],
+    ["FAILED", "suite > from a newer vitest"],
+    ["FAILED", "suite > no status"],
+  ]);
+  assert.equal(summary.passedByPass.SOCKET, 0);
+});
+
 test("the union of passes must place every planned file in its routed pass exactly once", () => {
   const hostFile = "postgres-test/host.spec.mjs";
   const socketFile = "postgres-test/socket.spec.mjs";
@@ -769,6 +867,29 @@ test("a skip inside the routed pass fails the whole run", async () => {
   assert.deepEqual(codes(summary.failures), ["SILENTLY_SKIPPED"]);
 });
 
+test("a static plan failure fails the run before any spec process starts", async () => {
+  const plan = await planPostgresSuite({ workerRoot: WORKER_ROOT });
+  const unregistered = Object.freeze({
+    code: "UNREGISTERED_POSTGRES_SPEC",
+    file: "postgres-test/new-synthetic.spec.mjs",
+  });
+  const calls = [];
+  const summary = await runPostgresSuite({
+    workerRoot: WORKER_ROOT,
+    environment: { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" },
+    run: async (...args) => {
+      calls.push(args);
+      return { exitCode: 0, stdout: "" };
+    },
+    onOutput: () => {},
+    plan: { ...plan, failures: [unregistered] },
+  });
+  assert.equal(summary.status, "failed");
+  assert.deepEqual(summary.failures, [unregistered]);
+  assert.equal(summary.tests, 0);
+  assert.deepEqual(calls, [], "no spec runs while the plan has failures");
+});
+
 test("the caller supplies only the SOCKET profile; the runner builds each pass environment", () => {
   assert.deepEqual(readSocketProfileInput({ PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" }),
     { socket: SOCKET, port: "5432" });
@@ -810,6 +931,7 @@ function fakeDocker({
   state = "running",
   exists = false,
   readyAfter = 0,
+  rmStatus = 0,
 } = {}) {
   const calls = [];
   let readinessProbes = 0;
@@ -823,7 +945,7 @@ function fakeDocker({
       case "inspect": return { status: 0, stdout: `${state}\n`, stderr: "" };
       case "logs": return { status: 0, stdout: logs, stderr: "" };
       case "exec": readinessProbes += 1; return { status: readinessProbes > readyAfter ? 0 : 2, stdout: "", stderr: "" };
-      case "rm": return { status: 0, stdout: "", stderr: "" };
+      case "rm": return { status: rmStatus, stdout: "", stderr: "" };
       default: throw new Error(`unexpected docker ${args[0]}`);
     }
   };
@@ -850,6 +972,7 @@ test("the container runs the digest-pinned PostgreSQL 17 image as the caller wit
   const args = dockerRunArguments({ uid: 1001, gid: 118 });
   const pairs = (flag) => args.flatMap((value, index) => (value === flag ? [args[index + 1]] : []));
   assert.deepEqual(pairs("--user"), ["1001:118"]);
+  assert.deepEqual(pairs("--platform"), ["linux/amd64"], "the amd64 digest never runs under emulation");
   assert.deepEqual(pairs("--publish"), ["127.0.0.1:55432:5432"]);
   assert.deepEqual(pairs("--env"), ["POSTGRES_HOST_AUTH_METHOD=trust"]);
   assert.deepEqual(pairs("--volume"), [
@@ -950,8 +1073,10 @@ test("bring-up fails closed on the wrong server, a dead container, a timeout or 
     await assert.rejects(startCiPostgres({ ...base, ...paths, run: fakeDocker({ exists: true }).run,
       createClient: fakeClient().createClient }), /CI_POSTGRES_CONTAINER_EXISTS/u);
   });
-  await assert.rejects(startCiPostgres({ ...base, platform: "darwin", arch: "arm64" }),
-    /CI_POSTGRES_PLATFORM_UNSUPPORTED/u);
+  for (const [platform, arch] of [["darwin", "arm64"], ["linux", "arm64"], ["darwin", "x64"]]) {
+    await assert.rejects(startCiPostgres({ ...base, platform, arch }),
+      /CI_POSTGRES_PLATFORM_UNSUPPORTED/u, `${platform}/${arch}`);
+  }
   await assert.rejects(verifyServer({ socketDirectory: SOCKET,
     createClient: fakeClient({ server_version_num: "180000", unix_socket: true }).createClient }),
   /CI_POSTGRES_VERSION_UNEXPECTED/u);
@@ -964,6 +1089,29 @@ test("stop removes only the named container and tolerates its absence", () => {
   const present = fakeDocker({ exists: true });
   assert.deepEqual(stopCiPostgres({ run: present.run }), { status: "stopped", container: CONTAINER_NAME });
   assert.deepEqual(present.calls.at(-1), ["rm", "--force", CONTAINER_NAME]);
+  assert.throws(() => stopCiPostgres({ run: fakeDocker({ exists: true, rmStatus: 1 }).run }),
+    /CI_POSTGRES_STOP_FAILED/u);
+});
+
+test("the socket directory check rejects another owner, a symlink, a loose mode or a missing directory", async () => {
+  await withPrivateTmp(async ({ privateTmpDirectory }) => {
+    const directory = join(privateTmpDirectory, "socket");
+    await mkdir(directory, { mode: 0o700 });
+    await chmod(directory, 0o700);
+    const code = "CI_SOCKET_DIR_MODE_CHANGED";
+    await verifyPrivateDirectory(directory, { uid: process.getuid(), code });
+    await assert.rejects(verifyPrivateDirectory(directory, { uid: process.getuid() + 1, code }),
+      /CI_SOCKET_DIR_MODE_CHANGED/u, "another uid owns it");
+    const link = join(privateTmpDirectory, "socket-link");
+    await symlink(directory, link);
+    await assert.rejects(verifyPrivateDirectory(link, { uid: process.getuid(), code }),
+      /CI_SOCKET_DIR_MODE_CHANGED/u, "a symlink to a private directory");
+    await chmod(directory, 0o750);
+    await assert.rejects(verifyPrivateDirectory(directory, { uid: process.getuid(), code }),
+      /CI_SOCKET_DIR_MODE_CHANGED/u, "group-readable");
+    await assert.rejects(verifyPrivateDirectory(join(privateTmpDirectory, "missing"), { uid: process.getuid(), code }),
+      /CI_SOCKET_DIR_MODE_CHANGED/u, "missing");
+  });
 });
 
 test("only the SOCKET profile is exported to the GitHub environment file", async () => {

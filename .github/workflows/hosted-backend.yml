@@ -1,12 +1,21 @@
 name: Hosted backend
 
 # Source-level CI for the hosted backend: the Worker gate, the Cloud Run host
-# check and every PostgreSQL 17 spec in its routed environment profile.
+# check and every apps/worker/postgres-test spec against PostgreSQL 17 in its
+# routed environment profile.
 #
 # PostgreSQL 17 is the official postgres image pinned by digest in
 # apps/worker/scripts/ci-postgres-container.mjs, run as the runner uid with a
 # private 0700 socket directory. The PGDG apt fallback documented there is not
 # in use.
+#
+# Skip enforcement is machine-checked only for apps/worker/postgres-test: the
+# postgres-17-suite job fails on any skipped or todo test there. The Worker gate
+# and the Cloud Run check run their own PostgreSQL-gated checks (for example
+# apps/worker/scripts/postgres-*.check.mjs and apps/worker/cloud-run/*.check.mjs)
+# with the SOCKET profile exported, and the Cloud Run check also gets the
+# loopback TCP endpoint its daily-activation integration test requires, but a
+# skip inside those checks is reported by node:test without failing the job.
 #
 # Read-only by construction: no secrets, no environments, no deployment, no
 # remote database or Cloudflare writes. A green run proves these source gates on
@@ -98,8 +107,8 @@ jobs:
       - name: Start PostgreSQL 17 and export the SOCKET profile
         run: node apps/worker/scripts/ci-postgres-container.mjs --export-socket-profile
 
-      - name: Check migration numbering and PostgreSQL suite routing
-        run: node --test apps/worker/scripts/migration-numbering.check.mjs apps/worker/scripts/ci-postgres-suite.check.mjs
+      - name: Check this workflow's contract, migration numbering and PostgreSQL suite routing
+        run: node --test test/hosted-backend-workflow.test.js apps/worker/scripts/migration-numbering.check.mjs apps/worker/scripts/ci-postgres-suite.check.mjs
 
       # deploy:dry and staging:check stage production assets from a generated
       # public release site. Build one locally from the checked-out source with a
@@ -152,6 +161,12 @@ jobs:
     name: Cloud Run check
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    # postgres-community-daily-activation.check.mjs runs its real PostgreSQL 17
+    # test only over loopback TCP (it skips otherwise); this is the container's
+    # published 127.0.0.1 port.
+    env:
+      A2_DAILY_ACTIVATION_TEST_HOST: "127.0.0.1"
+      A2_DAILY_ACTIVATION_TEST_PORT: "55432"
     steps:
       - name: Check out the selected revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
