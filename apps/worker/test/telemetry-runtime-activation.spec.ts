@@ -503,7 +503,7 @@ describe("protected telemetry runtime activation", () => {
   it("refuses a forward migration ledger hash mismatch", async () => {
     const tampered = await db().prepare(
       "UPDATE d1_storage_migrations SET sha256 = ? WHERE name = ?",
-    ).bind("0".repeat(64), "0012_v12_quarantine_admission.sql").run();
+    ).bind("0".repeat(64), "0013_v12_quarantine_admission.sql").run();
     expect(tampered.meta.changes).toBe(1);
     await expect(activateTelemetryRuntimeAsOwner(db(), settings, ACTOR_IDENTITY_KEY,
       request("usage_v12"), NOW_EPOCH)).rejects.toMatchObject({

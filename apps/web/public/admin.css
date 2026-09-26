@@ -99,6 +99,10 @@
 .admin-table-wrap th, .admin-table-wrap td { padding: 11px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
 .admin-table-wrap td { white-space: nowrap; }
 .admin-table-wrap tr:last-child td { border-bottom: 0; }
+.admin-adoption-summary { margin-top: 10px; }
+.admin-adoption-summary table { width: auto; min-width: min(100%, 420px); }
+.admin-adoption-summary th { color: var(--ink); font-size: .74rem; font-weight: 500; letter-spacing: 0; text-transform: none; }
+.admin-adoption-summary td { font-variant-numeric: tabular-nums; text-align: right; }
 .admin-empty { color: var(--muted); font-size: .78rem; }
 .admin-status-line strong .admin-label-with-info { vertical-align: text-bottom; }
 .admin-audit-copy { max-width: 760px; }

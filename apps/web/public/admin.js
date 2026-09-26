@@ -10,6 +10,8 @@ import {
   projectAdminOverview,
   projectAdminDatabaseHealth,
   projectAdminReconstructionProgress,
+  projectV11EvidenceAdoption,
+  V11_ADOPTION_OUTCOMES,
 } from "./admin-client.js";
 import { formatNumber, formatReportingTime } from "./ui-format.js";
 import { planWeeklyApiEquivalentUsd } from "./community-data.js";
@@ -48,6 +50,7 @@ const state = {
   diagnosticLookup: null,
   diagnosticLookupGeneration: 0,
   loadGeneration: 0,
+  v11AdoptionPreview: null,
 };
 const $ = (selector) => document.querySelector(selector);
 const ADMIN_PAGE_CLASS = "admin-operator-page";
@@ -70,6 +73,24 @@ const RETAINED_SERVICE_REQUEST_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const LOCAL_DIAGNOSTIC_REFERENCE = /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u;
 const ADMIN_TITLE = "TiboTattle operations";
+// Owner adoption of stranded v1.1 uploads pages 25 devices per request. The
+// page bound only stops a runaway loop; it is far above the device population.
+const V11_ADOPTION_PAGE_SIZE = 25;
+const V11_ADOPTION_MAX_PAGES = 200;
+// The service rechecks every device on activation; this only keeps the
+// previewed count on the button from outliving the evidence behind it.
+const V11_ADOPTION_PREVIEW_TTL_MILLISECONDS = 15 * 60 * 1_000;
+const V11_ADOPTION_ROWS = Object.freeze([
+  ["adopted", "Activated"],
+  ["adoptable", "Can be activated"],
+  ["unchanged", "Already current"],
+  ["client_syncing", "Syncing now, left to the app"],
+  ["successor_active", "On v1.2, left to the app"],
+  ["authority_unavailable", "No current sharing authority"],
+  ["unsupported_history", "Older upload history, not supported"],
+  ["no_contiguous_days", "No complete consecutive days"],
+  ["refused", "Refused by database checks"],
+]);
 const isAdminPage = document.body?.classList?.contains(ADMIN_PAGE_CLASS) === true;
 let infoHintSequence = 0;
 
@@ -389,6 +410,41 @@ function auditResult(label, tone, explanation) {
   return { label, tone, explanation };
 }
 
+const V11_ADOPTION_AUDIT_ACTION = Object.freeze({
+  label: "Stranded upload activation",
+  explanation: "An owner-run pass over stranded v1.1 uploads. A preview changes nothing; an activation makes each device's complete, consecutive days public through the normal database checks.",
+});
+
+function auditCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? formatNumber(value) : "unknown";
+}
+
+function v11AdoptionAuditPresentation(outcome, details) {
+  if (outcome === "started") {
+    return {
+      result: auditResult("In progress", "warning", "The request was recorded, but this entry does not contain a final result yet."),
+      summary: "A stranded-upload pass was requested; no final outcome has been recorded.",
+    };
+  }
+  if (outcome === "failure") {
+    return {
+      result: auditResult("Failed", "failure", "The pass failed. Devices it had already activated stay activated; running it again is safe."),
+      summary: details?.code ? `The pass failed with result code ${details.code}.` : "The pass failed before it produced a usable result.",
+    };
+  }
+  const outcomes = plainRecord(details?.outcomes) ?? {};
+  if (details?.dryRun === true) {
+    return {
+      result: auditResult("Previewed", "success", "A preview. Nothing was changed."),
+      summary: `Previewed ${auditCount(details.examined)} examined devices; ${auditCount(outcomes.adoptable)} could be activated.`,
+    };
+  }
+  return {
+    result: auditResult("Completed", "success", "Activation finished for this page of devices."),
+    summary: `Activated ${auditCount(outcomes.adopted)} of ${auditCount(details?.examined)} examined devices, adding ${auditCount(details?.newDays)} new days.`,
+  };
+}
+
 function maintenancePresentation(outcome, details) {
   const code = details?.code;
   if (outcome === "started") {
@@ -543,11 +599,14 @@ function collectionControlPresentation(outcome, details) {
 
 function auditPresentation(item) {
   const details = plainRecord(item.details);
-  const action = AUDIT_ACTIONS[item.action] ?? {
+  const adoption = item.action === "run_maintenance" && details?.task === "v11_evidence_adoption";
+  const action = adoption ? V11_ADOPTION_AUDIT_ACTION : AUDIT_ACTIONS[item.action] ?? {
     label: humanizeToken(item.action),
     explanation: "An owner control action recorded by the service.",
   };
-  const presentation = item.action === "run_maintenance"
+  const presentation = adoption
+    ? v11AdoptionAuditPresentation(item.outcome, details)
+    : item.action === "run_maintenance"
     ? maintenancePresentation(item.outcome, details)
     : item.action === "set_collection_controls"
       ? collectionControlPresentation(item.outcome, details)
@@ -1950,6 +2009,9 @@ function renderControlStatus() {
   $("#discard-controls").disabled = state.actionPending || !state.controlsDirty || state.overviewUnavailable;
   $("#run-maintenance").disabled = state.overviewUnavailable || state.actionPending;
   $("#sync-distribution").disabled = state.overviewUnavailable || state.actionPending;
+  $("#preview-v11-adoption").disabled = state.overviewUnavailable || state.actionPending;
+  $("#apply-v11-adoption").disabled = state.overviewUnavailable || state.actionPending
+    || !(state.v11AdoptionPreview?.adoptable > 0);
   $("#controls-status").textContent = state.overviewUnavailable
     ? "Load a current service snapshot before changing controls."
     : state.controlsDirty
@@ -3718,6 +3780,7 @@ function refuseAdminAccess(error) {
   state.diagnosticLookup = null;
   state.diagnosticLookupGeneration += 1;
   state.auditRows = [];
+  if (isAdminPage) resetV11Adoption("Owner access is unavailable. Sign in again before previewing.");
   for (const id of [
     "counts", "quarantine-counts", "quarantine-status", "distribution-counts",
     "distribution-version-rows", "distribution-total-rows", "distribution-source-status",
@@ -3897,6 +3960,84 @@ $("#controls-form").addEventListener("submit", async (event) => {
     endAdminAction();
   }
 });
+function countWith(value, singular, plural = `${singular}s`) {
+  return `${formatNumber(value)} ${value === 1 ? singular : plural}`;
+}
+
+function resetV11Adoption(message) {
+  state.v11AdoptionPreview = null;
+  $("#apply-v11-adoption").textContent = "Activate previewed devices";
+  $("#v11-adoption-rows").replaceChildren();
+  $("#v11-adoption-summary").hidden = true;
+  $("#v11-adoption-status").textContent = message;
+}
+
+function renderV11AdoptionSummary(total) {
+  const headline = total.dryRun ? "adoptable" : "adopted";
+  const rows = [["Devices examined", total.examined]];
+  for (const [key, label] of V11_ADOPTION_ROWS) {
+    if (key === headline || total.outcomes[key] > 0) rows.push([label, total.outcomes[key]]);
+  }
+  for (const [code, value] of Object.entries(total.refusals)) rows.push([`Refusal ${code}`, value]);
+  rows.push(["Days covered", total.daysCovered], ["New days", total.newDays],
+    ["Accepted days kept", total.keptAcceptedDays]);
+  $("#v11-adoption-rows").replaceChildren(...rows.map(([label, value]) => {
+    const row = document.createElement("tr");
+    const name = document.createElement("th");
+    name.setAttribute("scope", "row");
+    name.textContent = label;
+    const cell = document.createElement("td");
+    cell.textContent = formatNumber(value);
+    row.append(name, cell);
+    return row;
+  }));
+  $("#v11-adoption-summary").hidden = false;
+}
+
+/** Pages through every candidate device. The service's cursor stays in this
+ * closure and is never rendered, stored or logged. What completed is returned
+ * even when a later page fails, so a partial activation is reported honestly. */
+async function runV11Adoption(dryRun, onProgress) {
+  const total = {
+    dryRun, pages: 0, examined: 0, truncated: false,
+    outcomes: Object.fromEntries(V11_ADOPTION_OUTCOMES.map((key) => [key, 0])),
+    refusals: {}, daysCovered: 0, newDays: 0, keptAcceptedDays: 0,
+  };
+  let after = null;
+  try {
+    do {
+      const page = projectV11EvidenceAdoption(await request("/api/v1/admin/action", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          action: "run_maintenance",
+          v11EvidenceAdoption: { dryRun, maxDevices: V11_ADOPTION_PAGE_SIZE, afterParticipantId: after },
+        }),
+      }), dryRun);
+      total.pages += 1;
+      total.examined += page.examined;
+      for (const key of V11_ADOPTION_OUTCOMES) total.outcomes[key] += page.outcomes[key];
+      for (const [code, value] of Object.entries(page.refusals)) {
+        total.refusals[code] = (total.refusals[code] ?? 0) + value;
+      }
+      total.daysCovered += page.daysCovered;
+      total.newDays += page.newDays;
+      total.keptAcceptedDays += page.keptAcceptedDays;
+      // The service pages by strictly increasing participant. Anything else
+      // would repeat or skip devices, so stop instead of following it.
+      if (page.nextAfterParticipantId !== null && after !== null && page.nextAfterParticipantId <= after) {
+        throw new AdminResponseError("ADMIN_ACTION_INVALID");
+      }
+      after = page.nextAfterParticipantId;
+      onProgress(total);
+      if (after !== null && total.pages >= V11_ADOPTION_MAX_PAGES) total.truncated = true;
+    } while (after !== null && !total.truncated);
+    return { total, error: null };
+  } catch (error) {
+    return { total, error };
+  }
+}
+
 $("#run-maintenance").addEventListener("click", async () => {
   if (!beginAdminAction()) return;
   $("#run-maintenance").disabled = true;
@@ -4086,6 +4227,68 @@ if (isAdminPage) {
       await load();
     } catch (error) {
       if (!refuseAdminAccess(error)) showNotice(`GitHub release sync did not complete: ${adminActionErrorMessage(error)}`);
+    } finally {
+      endAdminAction();
+    }
+  });
+  $("#preview-v11-adoption").addEventListener("click", async () => {
+    if (!beginAdminAction()) return;
+    resetV11Adoption("Previewing…");
+    try {
+      const { total, error } = await runV11Adoption(true, (progress) => {
+        $("#v11-adoption-status").textContent = `Previewing… ${countWith(progress.examined, "device")} examined.`;
+      });
+      if (error) {
+        if (!refuseAdminAccess(error)) {
+          resetV11Adoption(`Preview stopped: ${adminActionErrorMessage(error)}. Nothing was changed.`);
+        }
+        return;
+      }
+      const adoptable = total.outcomes.adoptable;
+      renderV11AdoptionSummary(total);
+      state.v11AdoptionPreview = { adoptable, at: Date.now() };
+      if (adoptable > 0) $("#apply-v11-adoption").textContent = `Activate ${countWith(adoptable, "device")}`;
+      $("#v11-adoption-status").textContent = [
+        adoptable > 0
+          ? `Preview: ${countWith(adoptable, "device")} can be activated, adding ${countWith(total.newDays, "new day")}.`
+          : "Preview: nothing to activate.",
+        total.truncated ? `The preview stopped after ${countWith(total.pages, "page")}.` : "",
+        "Nothing was changed.",
+      ].filter(Boolean).join(" ");
+    } finally {
+      endAdminAction();
+    }
+  });
+  $("#apply-v11-adoption").addEventListener("click", async () => {
+    if (!(state.v11AdoptionPreview?.adoptable > 0)) return;
+    if (Date.now() - state.v11AdoptionPreview.at > V11_ADOPTION_PREVIEW_TTL_MILLISECONDS) {
+      resetV11Adoption("The preview is more than 15 minutes old. Preview again before activating.");
+      renderControlStatus();
+      return;
+    }
+    if (!beginAdminAction()) return;
+    // One preview authorizes one activation; the service rechecks every device.
+    state.v11AdoptionPreview = null;
+    $("#apply-v11-adoption").textContent = "Activate previewed devices";
+    $("#v11-adoption-status").textContent = "Activating…";
+    try {
+      const { total, error } = await runV11Adoption(false, (progress) => {
+        $("#v11-adoption-status").textContent = `Activating… ${countWith(progress.outcomes.adopted, "device")} activated so far.`;
+      });
+      if (error && refuseAdminAccess(error)) return;
+      if (total.pages > 0) renderV11AdoptionSummary(total);
+      else $("#v11-adoption-summary").hidden = true;
+      const adopted = total.outcomes.adopted;
+      const refused = total.outcomes.refused;
+      const leftAlone = total.examined - adopted - refused;
+      $("#v11-adoption-status").textContent = [
+        error ? `Activation stopped after ${countWith(total.pages, "page")}: ${adminActionErrorMessage(error)}.` : "",
+        `Activated ${countWith(adopted, "device")}, adding ${countWith(total.newDays, "new day")}.`,
+        refused > 0 ? `${countWith(refused, "device")} refused by database checks.` : "",
+        leftAlone > 0 ? `${countWith(leftAlone, "examined device")} left unchanged; see the table.` : "",
+        error || total.truncated ? "Running it again is safe." : "",
+      ].filter(Boolean).join(" ");
+      await load();
     } finally {
       endAdminAction();
     }

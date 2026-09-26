@@ -490,29 +490,33 @@ detects an edited or internally inconsistent plan.
 
 This operator intentionally stops at `0009`. The later ingestion-isolation
 migrations are separate forward steps in the ordered D1 stream.
-`0010_accountless_v12_renewal.sql` and `0011_v12_public_eligibility.sql` have
-their own owner-authorized application, described in the
+`0010_accountless_v12_renewal.sql`, `0011_v12_public_eligibility.sql` and
+`0012_v12_empty_day_manifests.sql` have their own owner-authorized
+application, described in the
 [v1.2 public eligibility plan](../plans/2026-09-25-v12-public-eligibility.md).
-`ingestion-isolation-migrations/0012_v12_quarantine_admission.sql` adds a
+`0012` drops and re-creates the v1.2 manifest, domain, domain-day and head
+tables, so every later file that attaches a trigger to them must run after it.
+`ingestion-isolation-migrations/0013_v12_quarantine_admission.sql` adds a
 v1.2 chunk-admission fence against objects already claimed for orphan deletion.
 It is outside that authorization and needs its own authorization, reviewed and
-rehearsed forward application after `0010` and `0011`, and post-migration
+rehearsed forward application after `0010`–`0012`, and post-migration
 receipt. Do not extend the historical operator's pinned source sequence or
 assume that a Worker deploy applies any of these migrations. The guarded typed
 deploy derives its expected primary schema from every source migration, so a
-source tree that contains `0012` cannot deploy until `0012` is applied. The
+source tree that contains `0013` cannot deploy until `0013` is applied. The
 protected usage activation gate requires that exact migration and trigger; its
-ordered D1 prefix also requires `0009`, `0010` and `0011` to have been applied
+ordered D1 prefix also requires `0009` through `0012` to have been applied
 first.
-`ingestion-isolation-migrations/0013_accountless_history_transfer_v12.sql`
+`ingestion-isolation-migrations/0014_accountless_history_transfer_v12.sql`
 re-creates the retained-history transfer view from baseline migration `0063`
-with a separate v1.2 lineage and adds the matching v1.2 invalidation triggers.
+with a separate v1.2 lineage and adds the matching v1.2 invalidation triggers,
+six of them on the domain and head tables that `0012` re-creates.
 Without it, one v1.2-only opt-out marker (allowed by `0011`) makes every
 transfer capture refuse. It changes no row, needs the baseline `0063` view
-and the `0008` v1.2 tables, and follows `0012` in the ordered stream; applied
+and the `0008` v1.2 tables, and follows `0013` in the ordered stream; applied
 before `0063`, its `DROP VIEW` fails and nothing changes. It needs
 the same separate authorization, rehearsal and receipt, and the same deploy
-gating applies: a source tree that contains `0013` cannot deploy until `0013`
+gating applies: a source tree that contains `0014` cannot deploy until `0014`
 is applied.
 
 Run the local populated rehearsal from the repository root. It uses
@@ -719,6 +723,59 @@ a purpose-separated participant digest, not the raw target. A stale revision
 is a conflict, never permission to retry with an invented one. Lowering a floor
 does not unpin the active analytical history, delete consent, reactivate erased
 data or authorize a different cross-format join.
+
+### Adopting stranded accountless v1.1 uploads
+
+A v1.1 day is public only once a domain generation covers it. Some accountless
+devices upload complete days but never activate one: a first sync is cut off by
+the client's pass budget, or a newer build re-emits an accepted day without one
+of its records, so the device's own activation fails the preservation proof.
+The owner can activate such uploads from the admin console's **Activate
+stranded v1.1 uploads** card. **Preview** pages through every device without
+changing anything and shows the counts. **Activate N devices** is enabled only
+by a successful preview from the last 15 minutes, runs once per preview, and
+reports what it activated, including after a partial failure. Activation is a production write and needs
+explicit authorization.
+
+Both buttons send the existing admin action with one closed object, which can
+also be sent directly:
+
+```json
+{ "action": "run_maintenance",
+  "v11EvidenceAdoption": { "dryRun": true, "maxDevices": 10, "afterParticipantId": null } }
+```
+
+Send it from the admin origin with the Access owner identity and
+`x-usage-monitor-admin: 1`. Always run the dry run first. Page with the returned
+`nextAfterParticipantId` until it is `null` (`maxDevices` is 1–25).
+
+For each device, the action uses only that device's own complete uploads. With
+no head, it takes the longest contiguous run of ready days (the latest run on a
+tie). With a head, it keeps the head's range and adds the contiguous ready days
+after it. For a covered day, it takes a newer upload only when every accepted
+record survives. It then activates through the ordinary predecessor and
+activation path, so every database proof still applies.
+
+It skips a device when any of these hold:
+
+- it lacks current v1.1 upload authority, for example after an opt-out;
+- it holds an active v1.2 authorization, so its client re-uploads through v1.2;
+- its client issued a predecessor in the last 10 minutes, so a pass may be in flight;
+- it has v1 or v0.2 history, or a head from another device;
+- it has no contiguous complete day.
+
+The `run_maintenance` audit (`task: "v11_evidence_adoption"`) holds only
+outcome counts, refusal codes, days covered, new days and accepted days kept.
+The owner's response adds one identifier: when more devices remain,
+`nextAfterParticipantId` is the last examined pseudonymous participant, used as
+the paging cursor. Keep it out of notes, issues and receipts. A rerun with
+nothing new returns `unchanged`.
+
+Adoption does not unblock the client. A device whose build dropped an accepted
+record keeps being refused, so later runs extend its head over newer complete
+days until it moves to v1.2. Adoption never fills gaps, invents days or changes
+consent. Read back public eligibility and analytics delivery independently; the
+action result alone does not prove publication.
 
 ### Guarded deployment wrapper
 

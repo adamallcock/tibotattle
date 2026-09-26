@@ -1839,6 +1839,44 @@ export function projectAdminAction(value, expectedAction) {
   });
 }
 
+export const V11_ADOPTION_OUTCOMES = Object.freeze([
+  "adopted", "adoptable", "unchanged", "authority_unavailable", "client_syncing",
+  "successor_active", "unsupported_history", "no_contiguous_days", "refused",
+]);
+const V11_ADOPTION_METHOD = "v11-uploaded-evidence-adoption-1";
+const V11_ADOPTION_CURSOR_PATTERN = /^[A-Za-z0-9._:-]{1,256}$/u;
+const V11_ADOPTION_MAX_REFUSAL_CODES = 32;
+
+/** One page of the owner's stranded v1.1 upload adoption. Counts are closed;
+ * `nextAfterParticipantId` is the service's paging cursor and is returned only
+ * for the next request, never for display or storage. */
+export function projectV11EvidenceAdoption(value, expectedDryRun) {
+  const code = "ADMIN_ACTION_INVALID";
+  const action = record(value, code);
+  if (action.schemaVersion !== ADMIN_ACTION_SCHEMA_VERSION || action.action !== "run_maintenance") invalid(code);
+  const result = record(action.result, code);
+  if (result.task !== "v11_evidence_adoption" || result.method !== V11_ADOPTION_METHOD
+      || boolean(result.dryRun, code) !== expectedDryRun) invalid(code);
+  const outcomes = record(result.outcomes, code);
+  if (Object.keys(outcomes).sort().join("\0") !== [...V11_ADOPTION_OUTCOMES].sort().join("\0")) invalid(code);
+  const refusals = record(result.refusals, code);
+  const refusalEntries = Object.entries(refusals);
+  if (refusalEntries.length > V11_ADOPTION_MAX_REFUSAL_CODES
+      || refusalEntries.some(([key]) => !ERROR_CODE_PATTERN.test(key))) invalid(code);
+  const cursor = result.nextAfterParticipantId;
+  if (cursor !== null && (typeof cursor !== "string" || !V11_ADOPTION_CURSOR_PATTERN.test(cursor))) invalid(code);
+  return Object.freeze({
+    dryRun: expectedDryRun,
+    examined: count(result.examined, code),
+    outcomes: Object.freeze(Object.fromEntries(V11_ADOPTION_OUTCOMES.map((key) => [key, count(outcomes[key], code)]))),
+    refusals: Object.freeze(Object.fromEntries(refusalEntries.map(([key, value]) => [key, positiveInteger(value, code)]))),
+    daysCovered: count(result.daysCovered, code),
+    newDays: count(result.newDays, code),
+    keptAcceptedDays: count(result.keptAcceptedDays, code),
+    nextAfterParticipantId: cursor,
+  });
+}
+
 export function adminResponseError(status, value) {
   const error = typeof value === "object" && value !== null && !Array.isArray(value)
     ? value.error

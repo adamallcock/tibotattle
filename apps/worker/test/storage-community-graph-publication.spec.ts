@@ -268,7 +268,7 @@ async function v12Fixture(id=participantId){
   const grant=await createDeviceUploadAuthorization(typed(),device,digest,4096);
   const claim=await claimDeviceUploadAuthorization(typed(),`Upload ${grant.uploadAuthorization}`,
    {envelopeDigest:digest,bodyBytes:4096,contentType:'application/json'});
-  // Upload-route order: the object is registered before isolation 0012 admits its chunk.
+  // Upload-route order: the object is registered before isolation 0013 admits its chunk.
   const chunkRowId=`chunk:${crypto.randomUUID()}`,r2Key=`telemetry/v12-graph/${crypto.randomUUID()}`;
   await putTrackedQuarantineObject(typed(),b.QUARANTINE,{contributionId:chunkRowId,objectKind:'telemetry',r2Key,
    registeredAt:new Date().toISOString()},'synthetic v1.2 bytes');

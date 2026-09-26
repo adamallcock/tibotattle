@@ -318,6 +318,29 @@
         </section>
       </div>
 
+      <section class="admin-card admin-section" aria-labelledby="v11-adoption-title">
+        <p class="eyebrow">Stranded uploads</p>
+        <h2 id="v11-adoption-title">Activate stranded v1.1 uploads</h2>
+        <p class="admin-copy">
+          Some Macs uploaded complete v1.1 days that never became public. Their app stopped before
+          activating them, or a newer build re-sent an accepted day with a record missing. This activates
+          each device's own complete, consecutive days through the normal database checks. It leaves alone
+          devices that are syncing right now, devices already on v1.2 and devices without current sharing
+          authority. Preview changes nothing. Activation is audited and safe to repeat.
+        </p>
+        <div class="admin-control-actions">
+          <button class="button button-secondary" id="preview-v11-adoption" type="button" disabled>Preview</button>
+          <button class="button button-primary" id="apply-v11-adoption" type="button" disabled>Activate previewed devices</button>
+        </div>
+        <p class="admin-result" id="v11-adoption-status" role="status">Preview to see which devices can be activated.</p>
+        <div class="admin-table-wrap admin-adoption-summary" id="v11-adoption-summary" hidden>
+          <table>
+            <caption class="sr-only">Stranded v1.1 upload counts from the latest preview or activation</caption>
+            <tbody id="v11-adoption-rows"></tbody>
+          </table>
+        </div>
+      </section>
+
       <section class="admin-section" aria-labelledby="ingress-title">
         <p class="eyebrow">Upload ingress</p>
         <h2 id="ingress-title">Ingress pressure</h2>

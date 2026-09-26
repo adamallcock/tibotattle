@@ -33,11 +33,12 @@ the schema digest, so exact provider-owned metadata is excluded while a shadow
 object remains visible as drift.
 
 Usage activation requires the common primary forward rows through
-`0008_telemetry_v12.sql`, the exact `0012_v12_quarantine_admission.sql` ledger
+`0008_telemetry_v12.sql`, the exact `0013_v12_quarantine_admission.sql` ledger
 row and trigger, and the final typed v1/v1.1 and successor usage objects. In
-the ordered D1 migration stream `0012` follows `0009_performance_reports.sql`,
-`0010_accountless_v12_renewal.sql` and `0011_v12_public_eligibility.sql`, so
-applying `0012` also requires applying those three first. Usage activation
+the ordered D1 migration stream `0013` follows `0009_performance_reports.sql`,
+`0010_accountless_v12_renewal.sql`, `0011_v12_public_eligibility.sql` and
+`0012_v12_empty_day_manifests.sql`, so applying `0013` also requires applying
+those four first. Usage activation
 does not inspect the independent performance tables or histogram bucket
 contract, and the performance runtime may remain staged. Performance
 activation additionally requires the `0009` ledger row, every pinned
@@ -45,10 +46,10 @@ performance object, and the exact report bucket and measurement checks. Both
 targets require typed storage, the same valid source namespace for v1 and v1.1,
 and enabled upload registration and processing controls. The historical
 existing-role operator described in the production runbook is source-pinned
-through `0009`; it applies none of `0010`–`0012`. `0010` and `0011` have their
-own owner-authorized forward step (see the
+through `0009`; it applies none of `0010`–`0014`. `0010`, `0011` and `0012`
+have their own owner-authorized forward steps (see the
 [v1.2 public eligibility plan](../plans/2026-09-25-v12-public-eligibility.md)).
-`0012` needs its own reviewed, rehearsed forward application and receipt;
+`0013` needs its own reviewed, rehearsed forward application and receipt;
 complete that step separately before attempting activation.
 
 The runtime row must still be `staged`. Record its current `policy_revision`

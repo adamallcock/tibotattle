@@ -120,7 +120,7 @@ async function uploadV12Day(principal: Principal, eventNumbers: readonly number[
   const claimed = await claimDeviceUploadAuthorization(source(), `Upload ${upload.uploadAuthorization}`,
     { envelopeDigest, bodyBytes: 4096, contentType: "application/json" });
   // The upload route's order: register and store the object, then admit the
-  // chunk (isolation 0012 refuses a chunk without its registration).
+  // chunk (isolation 0013 refuses a chunk without its registration).
   const chunkRowId = `chunk:${crypto.randomUUID()}`, r2Key = `telemetry/v12-daily/${crypto.randomUUID()}`;
   await putTrackedQuarantineObject(source(), b.QUARANTINE, { contributionId: chunkRowId, objectKind: "telemetry", r2Key,
     registeredAt: new Date().toISOString() }, "synthetic v1.2 bytes");

@@ -33,11 +33,12 @@ beforeEach(async () => {
   await applyD1Migrations(db(), bindings.TEST_TYPED_V11_ADMISSION_MIGRATIONS);
   await applyD1Migrations(db(), bindings.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
   // v1.2 transport 0008 and its successor migrations (0010 renewal, 0011
-  // public eligibility, 0012 quarantine admission, 0013 v1.2 retained-history
-  // transfer) all depend on 0008 tables. This reader is exercised against the
-  // frozen v1/v1.1 tables plus 0006, so the whole v1.2 chain stays out.
+  // public eligibility, 0012 empty-day manifest rebuild, 0013 quarantine
+  // admission, 0014 v1.2 retained-history transfer) all depend on 0008
+  // tables. This reader is exercised against the frozen v1/v1.1 tables plus
+  // 0006, so the whole v1.2 chain stays out.
   await applyD1Migrations(db(), bindings.TEST_INGESTION_ISOLATION_MIGRATIONS
-    .filter((migration) => !/^(0008|0010|0011|0012|0013)_/u.test(migration.name)));
+    .filter((migration) => !/^(0008|0010|0011|0012|0013|0014)_/u.test(migration.name)));
   await initializeStorageSource(db(), "synthetic-effective-usage-journal");
   await initializeTypedV1Admission(db(), sourceNamespace);
 });

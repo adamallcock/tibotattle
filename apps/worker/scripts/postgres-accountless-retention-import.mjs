@@ -458,7 +458,7 @@ function normalizeSourceRow(value) {
   same(grant.deviceCredentialId, normalizedMarker.deviceCredentialId);
   same(grant.state, "revoked");
   same(grant.revocationReason, "user_opt_out");
-  // D1 isolation 0013 captures a v1.2-only opt-out marker with its successor
+  // D1 isolation 0014 captures a v1.2-only opt-out marker with its successor
   // grant in these fields. No PostgreSQL import path proves that lineage yet,
   // so refuse it by name instead of reporting a damaged v1.1 proof. The whole
   // run stops; a retained marker is never skipped.

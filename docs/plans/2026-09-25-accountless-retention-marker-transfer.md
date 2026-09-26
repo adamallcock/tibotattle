@@ -37,7 +37,7 @@ data.
 Since D1 isolation migration 0011 an ordinary opt-out may pin an accepted
 v1.2 head for a device with no v1.1 domain. Migration 0063 alone proved every
 marker through the v1.1 grant, head and domain, so one such marker made every
-capture refuse with `SOURCE_MARKER_INELIGIBLE`. Isolation migration 0013 now
+capture refuse with `SOURCE_MARKER_INELIGIBLE`. Isolation migration 0014 now
 re-creates the candidate view with a separate v1.2 lineage, proved like 0011's
 retained v1.2 public-source branch (revoked successor grant, the device's v1.2
 head and domain, no v1.1 domain), and adds v1.2 invalidation triggers. A v1.2
@@ -75,7 +75,7 @@ Retain the existing exact D1 rules:
   `head_revision`; the domain belongs to that participant and device.
 - Version, expiry, device, enrollment, and secret-hash relations match exactly.
   Compare hashes as bytes and never place their values in receipts or logs.
-- A v1.2 marker is captured with its own successor proof (isolation 0013) and
+- A v1.2 marker is captured with its own successor proof (isolation 0014) and
   is never relabelled as, or imported into, v1.1 retained history.
 
 Map source identities to PostgreSQL identities with an explicit one-to-one

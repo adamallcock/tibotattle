@@ -587,16 +587,20 @@ read and claim. The retention sweep still excludes v1.2 chunks: there is no
 approved age-based deletion policy or `quarantine_deleted_at` state for that
 format. No live reconciliation or copy has run.
 The inverse race is now fenced locally by forward D1 migration
-`0012_v12_quarantine_admission.sql`: a new v1.2 chunk requires an exact pending
+`0013_v12_quarantine_admission.sql`: a new v1.2 chunk requires an exact pending
 object registration still in `registered` state. It was numbered `0010` on this
 line until the 2026-09-25 merge with `main`, whose owner-authorized
 `0010_accountless_v12_renewal.sql` and `0011_v12_public_eligibility.sql` keep
 their numbers; this line's own v1.2 renewal-trigger migration (then `0011`)
-was dropped in favour of `main`'s `0010`. Seven focused tests cover
+was dropped in favour of `main`'s `0010`. It was then `0012` until the
+2026-09-26 merge of `main`'s production hotfix
+`0012_v12_empty_day_manifests.sql`, when it and the retained-history transfer
+migration were renamed byte-identically to `0013` and `0014` so both run after
+the hotfix re-creates the v1.2 tables. Seven focused tests cover
 admission, missing/mismatched/deleting registrations and transaction rollback.
 Usage activation pins the migration ledger hash and trigger. The historical
-source-pinned migration operator ends at `0009`; `0012` needs a separately
-reviewed forward application and receipt after `0009`–`0011` in the ordered D1
+source-pinned migration operator ends at `0009`; `0013` needs a separately
+reviewed forward application and receipt after `0009`–`0012` in the ordered D1
 stream. This line has not changed the production D1 schema.
 
 The v1.2-only follow-up to that merge (local source and tests, 2026-09-25)
@@ -607,9 +611,11 @@ for a never-uploaded accountless install:
   fingerprint moved when the client's own days became ready, so such an
   install never staged anything. Both D1 and PostgreSQL now seed the first
   range with the current UTC day and pin only the prior head and input
-  revision. PostgreSQL also registers an empty day as ready; D1 still refuses
-  one through its `0008` schema, which remains a Cloudflare upload blocker for
-  any install whose range has a day without records.
+  revision. PostgreSQL also registers an empty day as ready. D1 refused one
+  through its `0008` schema until `main`'s production hotfix (isolation
+  `0012_v12_empty_day_manifests.sql`, PR #226, merged into this line on
+  2026-09-26) re-created the manifest table with the v1.1 bound; registration
+  now marks an idle day ready on both backends.
 - The PostgreSQL v1.2 capability read required the v1.2 grant it reports on,
   so an ungranted accountless install got `401 DEVICE_AUTH_INVALID` and the
   desktop never requested the grant. It now authenticates the base lease graph
@@ -618,7 +624,7 @@ for a never-uploaded accountless install:
 - PostgreSQL opt-out now revokes the v1.2 grant with the lease graph and, with
   primary migration `0045`, retains an eligible v1.2-only head. The daily
   publisher still reads only v1/v1.1 records, so it counts no v1.2 evidence.
-- D1 isolation migration `0013` lets the retained-history transfer capture a
+- D1 isolation migration `0014` lets the retained-history transfer capture a
   v1.2-only opt-out marker instead of refusing every capture; the PostgreSQL
   importer refuses that lineage by name until a reviewed import path exists.
 

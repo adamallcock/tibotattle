@@ -69,7 +69,7 @@ beforeAll(async () => {
   privateText = JSON.stringify({ ...await crypto.subtle.exportKey("jwk", pair.privateKey), kid: keyId });
 });
 
-const TRANSFER_V12_MIGRATION = "0013_accountless_history_transfer_v12.sql";
+const TRANSFER_V12_MIGRATION = "0014_accountless_history_transfer_v12.sql";
 
 async function prepare(options: { withoutTransferV12?: boolean } = {}): Promise<void> {
   await reset();
@@ -83,8 +83,9 @@ async function prepare(options: { withoutTransferV12?: boolean } = {}): Promise<
   await initializeTypedV11Admission(db(), namespace);
   await initializeTypedV1Admission(db(), namespace);
   // Every isolation migration, including 0010 (v1.2 renewal), 0011 (v1.2
-  // public eligibility), 0012 (v1.2 quarantine admission fence) and 0013
-  // (v1.2 retained-history transfer source), unless a case omits 0013.
+  // public eligibility), 0012 (v1.2 empty-day manifest rebuild), 0013 (v1.2
+  // quarantine admission fence) and 0014 (v1.2 retained-history transfer
+  // source), unless a case omits 0014.
   if (!b.TEST_INGESTION_ISOLATION_MIGRATIONS.some((migration) => migration.name === TRANSFER_V12_MIGRATION)) {
     throw new Error("missing v1.2 retained-history transfer migration");
   }
@@ -373,7 +374,7 @@ async function optOutAfterUpload(): Promise<{ deviceId: string; participantId: s
 }
 
 describe("retained-history transfer source for a v1.2-only opt-out", () => {
-  it("before isolation 0013 one v1.2-only opt-out refuses the whole capture", async () => {
+  it("before isolation 0014 one v1.2-only opt-out refuses the whole capture", async () => {
     await prepare({ withoutTransferV12: true });
     await optOutAfterUpload();
     await expect(captureAccountlessRetentionSourceSnapshot(db(), {

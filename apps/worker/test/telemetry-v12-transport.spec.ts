@@ -942,7 +942,7 @@ describe("staged v1.2 successor transport", () => {
     ).first<{ id: string; r2_key: string }>();
     expect(v12Chunk).not.toBeNull();
     // The upload already registered and stored this object before its chunk
-    // row was admitted (the production write order the 0012 fence requires).
+    // row was admitted (the production write order the 0013 fence requires).
     // Age that exact registration past the grace window so it is due.
     expect(await bindings().QUARANTINE.head(v12Chunk!.r2_key)).not.toBeNull();
     const aged = await db().prepare(

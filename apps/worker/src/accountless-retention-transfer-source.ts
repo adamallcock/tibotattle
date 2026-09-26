@@ -1,6 +1,6 @@
 /**
  * Private source-side snapshot support for transferring opted-out accountless
- * retention markers: v1.1 markers, and since ingestion-isolation migration 0013
+ * retention markers: v1.1 markers, and since ingestion-isolation migration 0014
  * also v1.2-only markers, whose rows carry the successor grant in their grant
  * fields (see that migration). This module has no route or authorization surface;
  * its caller must be an owner-only migration operator. Never log returned rows,

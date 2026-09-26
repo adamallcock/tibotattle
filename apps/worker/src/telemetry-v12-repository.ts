@@ -151,14 +151,22 @@ export async function registerTelemetryV12DayManifest(
   const id = crypto.randomUUID();
   const now = new Date(nowEpoch).toISOString();
   try {
-    await db.prepare(
-      `INSERT INTO telemetry_v12_day_manifests (
-        id, participant_id, device_id, chunk_day, manifest_digest, parser_version,
-        manifest_json, expected_chunk_count, state, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'staged', ?)
-      ON CONFLICT(participant_id, device_id, chunk_day, manifest_digest) DO NOTHING`,
-    ).bind(id, principal.participantId, principal.deviceId, manifest.day, manifest.manifestDigest,
-      manifest.parserVersion, canonical, manifest.chunks.length, now).run();
+    await db.batch([
+      db.prepare(
+        `INSERT INTO telemetry_v12_day_manifests (
+          id, participant_id, device_id, chunk_day, manifest_digest, parser_version,
+          manifest_json, expected_chunk_count, state, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'staged', ?)
+        ON CONFLICT(participant_id, device_id, chunk_day, manifest_digest) DO NOTHING`,
+      ).bind(id, principal.participantId, principal.deviceId, manifest.day, manifest.manifestDigest,
+        manifest.parserVersion, canonical, manifest.chunks.length, now),
+      // An idle day has nothing to upload; it is complete when registered,
+      // exactly as a v1.1 day manifest with zero chunks.
+      db.prepare(
+        `UPDATE telemetry_v12_day_manifests SET state = 'ready', ready_at = ?
+          WHERE id = ? AND state = 'staged' AND expected_chunk_count = 0`,
+      ).bind(now, id),
+    ]);
   } catch (error) {
     throw mapStagingError(error);
   }
