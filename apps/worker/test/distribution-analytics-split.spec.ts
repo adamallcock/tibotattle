@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  cloudflareDistributionFromSegments,
+  readCloudflareDistributionSegments,
   readDistributionAnalytics,
   type CloudflareDistributionAnalytics,
+  type CloudflareDistributionSegment,
   type DistributionAnalyticsConfiguration,
   type DistributionAnalyticsOverview,
 } from "../src/distribution-analytics";
@@ -17,6 +20,11 @@ import type { GithubDistributionAnalytics } from "../src/github-distribution-his
  * fetch sequence and the exact overview (including key order, because the
  * admin overview serializes it verbatim). Never regenerate them from
  * refactored code: a fixture change is a behaviour change.
+ *
+ * The split tests then prove that readCloudflareDistributionSegments plus
+ * cloudflareDistributionFromSegments (the pair the edge uses) reproduce the
+ * same Cloudflare value, and that no source address or user agent from the
+ * fake rows reaches any returned analytics value.
  *
  * Every address is from a documentation range (RFC 5737 / RFC 3849) and every
  * user agent, zone id and token is synthetic.
@@ -1097,4 +1105,191 @@ describe("readDistributionAnalytics keeps its pre-split behaviour", () => {
       expect(JSON.stringify(overview)).toBe(JSON.stringify(expected.overview));
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// The edge-reusable split.
+// ---------------------------------------------------------------------------
+
+function scenario(name: string): Scenario {
+  const found = SCENARIOS.find((candidate) => candidate.name === name);
+  if (found === undefined) throw new Error(`unknown scenario ${name}`);
+  return found;
+}
+
+async function readSegments(
+  current: Pick<Scenario, "analytics" | "github">,
+): Promise<readonly CloudflareDistributionSegment[]> {
+  const segments = await readCloudflareDistributionSegments(
+    ZONE_ID,
+    API_TOKEN,
+    NOW,
+    fakeFetcher(current).fetcher,
+  );
+  if (segments === null) throw new Error("expected configured analytics");
+  return segments;
+}
+
+function rowStrings(rows: readonly SegmentRows[]): string[] {
+  return rows.flatMap((segment) => Object.values(segment).flatMap((groupRows) =>
+    groupRows.flatMap((row) => [
+      row.clientIP,
+      ...(row.userAgent === null ? [] : [row.userAgent]),
+    ])));
+}
+
+/** Raw values that must never leave the analytics module's transient memory. */
+const FORBIDDEN_OUTPUT_STRINGS = [
+  ...new Set([...rowStrings(ENABLED_ROWS), ...rowStrings(OVERFLOW_ROWS), ZONE_ID, API_TOKEN]),
+];
+
+function expectNoRawAnalyticsValues(value: unknown): void {
+  const serialized = JSON.stringify(value);
+  for (const forbidden of FORBIDDEN_OUTPUT_STRINGS) {
+    expect(serialized).not.toContain(forbidden);
+  }
+}
+
+describe("readCloudflareDistributionSegments + cloudflareDistributionFromSegments", () => {
+  const configuredScenarios = SCENARIOS.filter((candidate) => candidate.configuration.enabled);
+
+  for (const current of configuredScenarios) {
+    it(`compose to readDistributionAnalytics(...).cloudflare: ${current.name}`, async () => {
+      const overview = await readDistributionAnalytics(
+        current.configuration,
+        NOW,
+        fakeFetcher(current).fetcher,
+      );
+      const { fetcher, calls } = fakeFetcher(current);
+      const segments = await readCloudflareDistributionSegments(
+        current.configuration.cloudflareZoneId,
+        current.configuration.cloudflareApiToken,
+        NOW,
+        fetcher,
+      );
+      const composed = cloudflareDistributionFromSegments(
+        segments,
+        overview.github.release === null ? null : overview.github.release.tag,
+      );
+      const recorded = preSplitFixture(current.name);
+      expect(composed).toStrictEqual(overview.cloudflare);
+      expect(composed).toStrictEqual(recorded.overview.cloudflare);
+      expect(JSON.stringify(composed)).toBe(JSON.stringify(recorded.overview.cloudflare));
+      // The reader issues exactly the recorded GraphQL requests, in order.
+      expect(calls).toStrictEqual(recorded.calls.filter((call) => call.includes(" graphql ")));
+    });
+  }
+
+  it("reads nothing and returns null unless both the zone id and API token are configured", async () => {
+    const unconfigured: readonly (readonly [unknown, unknown])[] = [
+      [undefined, API_TOKEN],
+      [ZONE_ID, undefined],
+      ["", API_TOKEN],
+      [ZONE_ID, " \n\t "],
+      [null, API_TOKEN],
+      [ZONE_ID, 42],
+      [{ zone: ZONE_ID }, API_TOKEN],
+      [undefined, undefined],
+    ];
+    for (const [zoneId, apiToken] of unconfigured) {
+      const { fetcher, calls } = fakeFetcher(scenario("enabled"));
+      await expect(readCloudflareDistributionSegments(zoneId, apiToken, NOW, fetcher))
+        .resolves.toBeNull();
+      expect(calls).toStrictEqual([]);
+    }
+    expect(cloudflareDistributionFromSegments(null, "v0.1.23"))
+      .toStrictEqual(RECORDED_CLOUDFLARE_NOT_CONFIGURED);
+    expect(cloudflareDistributionFromSegments(null, null))
+      .toStrictEqual(RECORDED_CLOUDFLARE_NOT_CONFIGURED);
+  });
+
+  it("returns the seven lookback windows oldest first", async () => {
+    const segments = await readSegments(scenario("enabled"));
+    expect(segments.map(({ startsAt, endsAt }) => [startsAt, endsAt])).toStrictEqual(
+      Array.from({ length: 7 }, (_, index) => [
+        new Date(NOW - (7 - index) * DAY_MILLISECONDS).toISOString(),
+        new Date(NOW - (6 - index) * DAY_MILLISECONDS).toISOString(),
+      ]),
+    );
+  });
+
+  it("collapses any failed window read to an empty list instead of rejecting", async () => {
+    const failures: readonly AnalyticsBehaviour[] = [
+      { kind: "graphql_errors" },
+      { kind: "http_status", status: 500 },
+      { kind: "http_status", status: 429 },
+      { kind: "fail_one_segment", failingIndex: 0, rows: ENABLED_ROWS },
+      { kind: "fail_one_segment", failingIndex: 6, rows: ENABLED_ROWS },
+    ];
+    for (const analytics of failures) {
+      await expect(readSegments({ analytics, github: { kind: "never_called" } }))
+        .resolves.toStrictEqual([]);
+    }
+    const networkFailure = (async () => {
+      throw new TypeError("fixture network failure");
+    }) as typeof fetch;
+    await expect(readCloudflareDistributionSegments(ZONE_ID, API_TOKEN, NOW, networkFailure))
+      .resolves.toStrictEqual([]);
+  });
+
+  it("rejects an invalid time before making any request", async () => {
+    for (const invalid of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      const { fetcher, calls } = fakeFetcher(scenario("enabled"));
+      await expect(readCloudflareDistributionSegments(ZONE_ID, API_TOKEN, invalid, fetcher))
+        .rejects.toThrow("invalid analytics time");
+      expect(calls).toStrictEqual([]);
+    }
+  });
+
+  it("maps window counts and release tags exactly like the pre-split branch", async () => {
+    const segments = await readSegments(scenario("enabled"));
+    const unchanged = structuredClone(segments);
+    const cases: readonly (readonly [
+      readonly CloudflareDistributionSegment[],
+      string | null,
+      CloudflareDistributionAnalytics,
+    ])[] = [
+      [segments, "v0.1.23", RECORDED_CLOUDFLARE_AVAILABLE_CURRENT_VERSION],
+      [segments, "0.1.23", RECORDED_CLOUDFLARE_AVAILABLE_CURRENT_VERSION],
+      [segments, null, RECORDED_CLOUDFLARE_AVAILABLE_NO_CURRENT_VERSION],
+      [segments, "nightly", RECORDED_CLOUDFLARE_AVAILABLE_NO_CURRENT_VERSION],
+      [[], "v0.1.23", RECORDED_CLOUDFLARE_UNAVAILABLE],
+      [segments.slice(0, 6), "v0.1.23", RECORDED_CLOUDFLARE_UNAVAILABLE],
+      [segments.slice(1), null, RECORDED_CLOUDFLARE_UNAVAILABLE],
+      [[...segments, ...segments.slice(0, 1)], "v0.1.23", RECORDED_CLOUDFLARE_UNAVAILABLE],
+      [await readSegments(scenario("aggregation failure: count overflow")), "v0.1.23",
+        RECORDED_CLOUDFLARE_UNAVAILABLE],
+    ];
+    for (const [input, tag, expected] of cases) {
+      const cloudflare = cloudflareDistributionFromSegments(input, tag);
+      expect(cloudflare).toStrictEqual(expected);
+      expect(JSON.stringify(cloudflare)).toBe(JSON.stringify(expected));
+    }
+    // A pure reduction: the raw windows are not modified.
+    expect(segments).toStrictEqual(unchanged);
+  });
+
+  it("never returns a fake source address, user agent, zone id or token", async () => {
+    expect(FORBIDDEN_OUTPUT_STRINGS.length).toBeGreaterThan(20);
+    // Non-vacuous: the enabled scenario really counted the fake addresses.
+    expect(RECORDED_CLOUDFLARE_AVAILABLE_CURRENT_VERSION.activeSourceAddresses?.last7Days)
+      .toBeGreaterThan(0);
+    for (const current of SCENARIOS) {
+      const overview = await readDistributionAnalytics(
+        current.configuration,
+        NOW,
+        fakeFetcher(current).fetcher,
+      );
+      expectNoRawAnalyticsValues(overview);
+      const segments = await readCloudflareDistributionSegments(
+        current.configuration.cloudflareZoneId,
+        current.configuration.cloudflareApiToken,
+        NOW,
+        fakeFetcher(current).fetcher,
+      );
+      for (const tag of ["v0.1.23", "v0.1.22", null]) {
+        expectNoRawAnalyticsValues(cloudflareDistributionFromSegments(segments, tag));
+      }
+    }
+  });
 });
