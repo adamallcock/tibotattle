@@ -13,6 +13,7 @@ import {
   digestRows,
   EMPTY_PREFIX_CHAIN,
   instantFromPostgres,
+  markLive,
   POSTGRES_TRANSFER_TARGET_ERROR_CODES,
   PostgresTransferTargetError,
   productionTransferId,
@@ -258,6 +259,13 @@ test("CONTROL_SCHEMA_RELATIONS and RETAINED_CONTROL_FUNCTIONS equal what the con
     assert.equal(sql.primary.includes(forbidden) || sql.ledger.includes(forbidden), false, forbidden);
   }
   assert.match(sql.primary, /CHECK \(state <> 'complete' OR last_key IS NULL\)/u);
+  // An abandoned run's checkpoint admits only NULLing its cursor.
+  assert.match(sql.primary, /OLD\.last_key IS NOT NULL AND NEW\.last_key IS NULL[\s\S]{0,400}run\.state = 'abandoned'/u);
+  // Installing the live lock revokes CREATE on the control schema and verifies it.
+  for (const text of [sql.primary, sql.ledger]) {
+    assert.match(text, /EXECUTE format\('REVOKE CREATE ON SCHEMA tibotattle_transfer FROM %I'/u);
+    assert.match(text, /acl\.privilege_type = 'CREATE'/u);
+  }
   assert.match(sql.primary, /CREATE UNIQUE INDEX transfer_runs_one_open\s+ON tibotattle_transfer\.transfer_runs \(\(true\)\) WHERE state <> 'abandoned';/u);
   assert.match(sql.ledger, /CREATE UNIQUE INDEX ledger_transfer_runs_one_open\s+ON tibotattle_transfer\.ledger_transfer_runs \(\(true\)\) WHERE state <> 'abandoned';/u);
 });
@@ -351,6 +359,13 @@ test("withTriggerPolicy restores triggers after a failing page and refuses unsaf
       () => withTriggerPolicy(triggerCatalog({ triggers: [GUARD] }), { schema: "app", table: "domain_days", suppress },
         async () => {}));
   }
+  // The control schema and the reserved schemas are refused before any statement.
+  for (const schema of [TRANSFER_CONTROL_SCHEMA, "public", "information_schema"]) {
+    const reserved = triggerCatalog({ triggers: [GUARD] });
+    await rejectsWith("CUTOVER_TRIGGER_POLICY_INVALID",
+      () => withTriggerPolicy(reserved, { schema, table: "domain_days", suppress: ["domain_guard"] }, async () => {}));
+    assert.deepEqual(reserved.statements, []);
+  }
   const outside = fakeClient((sql) => {
     if (sql.startsWith("SAVEPOINT")) throw Object.assign(new Error("no transaction"), { code: "25P01" });
   });
@@ -398,9 +413,27 @@ test("production-mode operations refuse forged handles and clients outside a tra
     stage: "objects", state: "started",
   }));
   await rejectsWith("CUTOVER_SEALED_CONTROLS_INVALID", () => recordSealedCollectionControls(
-    fakeClient(() => undefined), forged, { control_state: "degraded", enrollment_enabled: 1,
-      upload_registration_enabled: 1, processing_enabled: 1, publication_enabled: 1, revision: 3,
-      reason_code: "maintenance", updated_at: "2026-09-20T10:11:12.345Z" }));
+    fakeClient(() => undefined), forged, { singleton: 1, schema_version: "collection-controls-v0.1",
+      control_state: "degraded", enrollment_enabled: 1, upload_registration_enabled: 1, processing_enabled: 1,
+      publication_enabled: 1, revision: 3, reason_code: "maintenance", updated_at: "2026-09-20T10:11:12.345Z" }));
+  // Flip options are closed before any connection: evidence digest, a
+  // bounded, duplicate-free list of waived role names, and nothing else.
+  for (const options of [
+    {}, { flipEvidenceSha256: "not-a-digest" },
+  ]) {
+    await rejectsWith("CUTOVER_FLIP_EVIDENCE_INVALID", () => markLive(forged, options));
+  }
+  for (const options of [
+    { flipEvidenceSha256: SEAL, allowedRoleMembers: ["member", "member"] },
+    { flipEvidenceSha256: SEAL, allowedRoleMembers: "member" },
+    { flipEvidenceSha256: SEAL, allowedRoleMembers: ["bad role"] },
+    { flipEvidenceSha256: SEAL, allowedRoleMembers: Array.from({ length: 9 }, (_, index) => `member${index}`) },
+    { flipEvidenceSha256: SEAL, extra: true },
+  ]) {
+    await rejectsWith("CUTOVER_TARGET_ARGUMENT_INVALID", () => markLive(forged, options));
+  }
+  await rejectsWith("CUTOVER_TARGET_HANDLE_INVALID", () => markLive(forged, { flipEvidenceSha256: SEAL,
+    allowedRoleMembers: ["migration-owner"] }));
 });
 
 test("sealed collection-controls input is closed and D1-consistent", async () => {
@@ -417,9 +450,17 @@ test("sealed collection-controls input is closed and D1-consistent", async () =>
     { schema_version: "collection-controls-v0.2" }, { singleton: 2 }, { revision: 0 }, { revision: 1.5 },
     { reason_code: "unknown" }, { control_state: "open" }, { enrollment_enabled: 2 },
     { updated_at: "2026-09-20T10:11:12Z" }, { extra: 1 }, { control_state: "contained" },
+    { singleton: undefined }, { schema_version: undefined }, { singleton: "1" },
   ]) {
     await rejectsWith("CUTOVER_SEALED_CONTROLS_INVALID", () => recordSealedCollectionControls(
       fakeClient(() => undefined), forged, { ...valid, ...change }));
+  }
+  // The schema_version and singleton markers are required, not optional.
+  for (const omitted of ["singleton", "schema_version"]) {
+    const { [omitted]: removed, ...partial } = valid;
+    assert.notEqual(removed, undefined);
+    await rejectsWith("CUTOVER_SEALED_CONTROLS_INVALID", () => recordSealedCollectionControls(
+      fakeClient(() => undefined), forged, partial));
   }
 });
 

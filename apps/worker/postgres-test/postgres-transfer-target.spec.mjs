@@ -15,6 +15,7 @@ import {
   abandonRun,
   advanceRun,
   applyIdentityHighWater,
+  assertCollectionControlsDegradedForImport,
   assertFlipReady,
   assertInstantRoundTrip,
   assertNoTransferUserOwnership,
@@ -66,6 +67,8 @@ const PRIMARY_SCHEMA = "synthetic_primary";
 const LEDGER_SCHEMA = "synthetic_ledger";
 const SEAL_A = createHash("sha256").update("synthetic-seal-a").digest("hex");
 const SEAL_B = createHash("sha256").update("synthetic-seal-b").digest("hex");
+const SEAL_C = createHash("sha256").update("synthetic-seal-c").digest("hex");
+const SEAL_D = createHash("sha256").update("synthetic-seal-d").digest("hex");
 const FLIP = createHash("sha256").update("synthetic-flip-evidence").digest("hex");
 const GUARD = "telemetry_v12_domain_day_immutable_guard";
 
@@ -130,6 +133,47 @@ function stubPool(pool, rewrite) {
       };
     },
   };
+}
+
+// A pool whose connections can be made to fail after the handle is open,
+// to tear a two-database step between its primary and ledger commits.
+function flakyPool(pool) {
+  const switchable = {
+    fail: false,
+    async connect() {
+      if (switchable.fail) throw new Error("synthetic connection loss");
+      return pool.connect();
+    },
+  };
+  return switchable;
+}
+
+// A pool whose session facts can be rewritten after the handle is open, to
+// prove every transaction re-asserts the database and the IAM login.
+function sessionPool(pool) {
+  const switchable = stubPool(pool, (text, result) => {
+    if (!text.includes("server_version_num") || switchable.rewrite === undefined) return result;
+    return { ...result, rows: result.rows.map(row => ({ ...row, ...switchable.rewrite })) };
+  });
+  switchable.rewrite = undefined;
+  return switchable;
+}
+
+// A pool that hides one complete stage receipt from the all-stages check.
+function stageHidingPool(pool, stage) {
+  return stubPool(pool, (text, result) => (text.startsWith("SELECT stage FROM")
+    ? { ...result, rows: result.rows.filter(row => row.stage !== stage) } : result));
+}
+
+// A plain application table (no triggers, no foreign keys) that every
+// wave-1 migration leaves insertable and deletable.
+function insertProbeRow(pool, { day = "2026-09-25", requestedAt = "2026-09-25T12:00:00.123Z" } = {}) {
+  return pool.query(`INSERT INTO "${PRIMARY_SCHEMA}".daily_rebuilds(day, requested_epoch, requested_at)
+    VALUES ($1::date, 1, $2)`, [day, requestedAt]);
+}
+
+function deleteProbeRows(pool) {
+  return pool.query(`DELETE FROM "${PRIMARY_SCHEMA}".daily_rebuilds`);
 }
 
 async function seedV12Domain(pool) {
@@ -390,7 +434,7 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
       temporaryDirectory = await mkdtemp(join(tmpdir(), "tibotattle-transfer-target-"));
       const primaryMigrations = await readPostgresMigrations({ role: "primary" });
       const ledgerMigrations = await readPostgresMigrations({ role: "ledger" });
-      const root = async (name, primarySelection, extra = null) => {
+      const root = async (name, primarySelection, extra = null, drift = false) => {
         const directory = join(temporaryDirectory, name);
         await mkdir(join(directory, "primary"), { recursive: true });
         await mkdir(join(directory, "ledger"), { recursive: true });
@@ -401,22 +445,33 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
           await copyFile(join(WORKER_ROOT, "postgres/migrations/ledger", migration.name), join(directory, "ledger", migration.name));
         }
         if (extra !== null) await writeFile(join(directory, "primary", extra), "SELECT 1;\n", { mode: 0o600 });
+        if (drift) {
+          // Same version and name as the applied migration, different bytes.
+          const last = primarySelection.at(-1).name;
+          const bytes = await readFile(join(directory, "primary", last), "utf8");
+          await writeFile(join(directory, "primary", last), `${bytes}\n-- synthetic post-apply edit\n`, { mode: 0o600 });
+        }
         return directory;
       };
       const missingInSource = await root("receipt-extra", primaryMigrations.slice(0, -1));
       const missingInTarget = await root("receipt-missing", primaryMigrations,
         `${String(primaryMigrations.length + 1).padStart(4, "0")}_synthetic_unapplied.sql`);
-      for (const rootDirectory of [missingInSource, missingInTarget]) {
+      const checksumDrift = await root("receipt-drift", primaryMigrations, null, true);
+      // The drifted root reads cleanly; only the last checksum differs.
+      const drifted = await readPostgresMigrations({ role: "primary", rootDirectory: checksumDrift });
+      assert.deepEqual(drifted.map(migration => migration.name), primaryMigrations.map(migration => migration.name));
+      assert.deepEqual(drifted.slice(0, -1).map(migration => migration.sha256),
+        primaryMigrations.slice(0, -1).map(migration => migration.sha256));
+      assert.notEqual(drifted.at(-1).sha256, primaryMigrations.at(-1).sha256);
+      for (const rootDirectory of [missingInSource, missingInTarget, checksumDrift]) {
         await assert.rejects(openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_A, rootDirectory }),
           isCode("CUTOVER_TARGET_MIGRATION_RECEIPTS_MISMATCH"));
       }
 
-      await ownerPrimary.query(`INSERT INTO "${PRIMARY_SCHEMA}".admin_action_audit(operation_id, action,
-          actor_identity_digest, outcome, details_json, created_at)
-        VALUES ('synthetic-operation', 'run_maintenance', $1, 'success', '{}', clock_timestamp())`, ["d".repeat(64)]);
+      await insertProbeRow(ownerPrimary);
       await assert.rejects(openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_A }),
-        error => isCode("CUTOVER_TARGET_NOT_EMPTY")(error) && error.relation === "admin_action_audit");
-      await ownerPrimary.query(`DELETE FROM "${PRIMARY_SCHEMA}".admin_action_audit`);
+        error => isCode("CUTOVER_TARGET_NOT_EMPTY")(error) && error.relation === "daily_rebuilds");
+      await deleteProbeRows(ownerPrimary);
       await ownerLedger.query(`INSERT INTO "${LEDGER_SCHEMA}".identity_reenrollment_cooldowns(identity_cooldown_digest,
           schema_version, deleted_at, retain_until) VALUES ($1, 'identity-reenrollment-cooldown-v0.1',
           '2026-09-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')`, ["e".repeat(64)]);
@@ -425,15 +480,111 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
       await ownerLedger.query(`DELETE FROM "${LEDGER_SCHEMA}".identity_reenrollment_cooldowns`);
 
       // AN-1's public-source bootstrap is a seeded singleton where it exists.
-      await ownerPrimary.query(`CREATE TABLE "${PRIMARY_SCHEMA}".community_public_source_bootstrap (
-        singleton integer PRIMARY KEY, completed integer NOT NULL)`);
-      await ownerPrimary.query(`INSERT INTO "${PRIMARY_SCHEMA}".community_public_source_bootstrap VALUES (1, 0)`);
-      const seededOpen = await openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_A });
-      assert.equal(seededOpen.resumed, false);
-      await ownerPrimary.query(`INSERT INTO "${PRIMARY_SCHEMA}".community_public_source_bootstrap VALUES (2, 0)`);
+      // Once AN-1's 0053 is applied the migration seeds it (a CHECKed
+      // singleton), and a fresh open must not count it; until then a
+      // stand-in proves the seed allowance and that a row beyond it counts.
+      const bootstrap = `"${PRIMARY_SCHEMA}".community_public_source_bootstrap`;
+      const [{ present: bootstrapMigrated }] = (await ownerPrimary.query("SELECT to_regclass($1) IS NOT NULL AS present",
+        [bootstrap])).rows;
+      if (bootstrapMigrated) {
+        const seededRows = await ownerPrimary.query(`SELECT count(*)::int AS n FROM ${bootstrap}`);
+        assert.deepEqual(seededRows.rows, [{ n: 1 }]);
+        const seededOpen = await openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_A });
+        assert.equal(seededOpen.resumed, false);
+      } else {
+        await ownerPrimary.query(`CREATE TABLE ${bootstrap} (singleton integer PRIMARY KEY, completed integer NOT NULL)`);
+        await ownerPrimary.query(`INSERT INTO ${bootstrap} VALUES (1, 0)`);
+        const seededOpen = await openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_A });
+        assert.equal(seededOpen.resumed, false);
+        await ownerPrimary.query(`INSERT INTO ${bootstrap} VALUES (2, 0)`);
+        await assert.rejects(openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_A }),
+          error => isCode("CUTOVER_TARGET_NOT_EMPTY")(error) && error.relation === "community_public_source_bootstrap");
+        await ownerPrimary.query(`DROP TABLE ${bootstrap}`);
+      }
+    });
+
+    const checkpointWithCursor = Object.freeze({ stage: "typed-legacy", name: "typed_v1_rows", state: "pending",
+      lastKey: ["synthetic-key", 3], rowCount: 3, prefixChainSha256: EMPTY_PREFIX_CHAIN });
+    let residualRunId;
+
+    await t.test("abandoned runs keep no cursor, a torn abandon converges on reopen, divergent mirrors are refused", async () => {
+      const cursors = async id => (await adminPrimary.query(`SELECT last_key FROM tibotattle_transfer.transfer_checkpoints
+        WHERE run_id = $1`, [id])).rows;
+      const stateOf = async (adminPool, table, id) => (await adminPool.query(`SELECT state FROM tibotattle_transfer.${table}
+        WHERE run_id = $1`, [id])).rows[0]?.state;
+      const storedCursor = JSON.stringify(checkpointWithCursor.lastKey);
+
+      // Emptiness is re-checked at begin, after open.
+      const runB = await openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_B });
+      await insertProbeRow(ownerPrimary);
+      await assert.rejects(beginRun(runB, { sealedAt: "2026-09-24T12:00:00.000Z" }),
+        error => isCode("CUTOVER_TARGET_NOT_EMPTY")(error) && error.relation === "daily_rebuilds");
+      await deleteProbeRows(ownerPrimary);
+      const { runId: runIdB } = await beginRun(runB, { sealedAt: "2026-09-24T12:00:00.000Z" });
+      await advanceRun(runB, "importing");
+      await withTransferTransaction(runB, "primary", client => recordCheckpoint(client, runB, checkpointWithCursor));
+      assert.deepEqual(await cursors(runIdB), [{ last_key: storedCursor }]);
+      // A ledger mirror ahead of its primary run is divergent.
+      await adminLedger.query(`UPDATE tibotattle_transfer.ledger_transfer_runs SET state = 'verifying'
+        WHERE run_id = $1`, [runIdB]);
+      await assert.rejects(openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_B }),
+        isCode("CUTOVER_RUN_STATE_DIVERGED"));
+      // abandonRun NULLs the run's cursor in the abandoning transaction.
+      const abandonedB = await abandonRun(runB);
+      assert.deepEqual({ ...abandonedB }, { runId: runIdB, state: "abandoned", ledgerState: "abandoned" });
+      assert.deepEqual(await cursors(runIdB), [{ last_key: null }]);
+      assert.deepEqual({ ...await abandonRun(runB) }, { ...abandonedB });
+      // An abandoned handle writes nothing more; it can still read.
+      await assert.rejects(withTransferTransaction(runB, "primary", client => insertProbeRow(client)),
+        isCode("CUTOVER_RUN_STATE_INVALID"));
+      await withTransferTransaction(runB, "primary", client => client.query("SELECT 1"), { readOnly: true });
+
+      // A torn abandon: the primary commits, the ledger connection is lost.
+      const flaky = flakyPool(transferLedger);
+      const runC = await openProductionTransferTarget({ primaryPool: transferPrimary, ledgerPool: flaky, ...openArgs,
+        sealManifestSha256: SEAL_C });
+      const { runId: runIdC } = await beginRun(runC, { sealedAt: "2026-09-24T13:00:00.000Z" });
+      await advanceRun(runC, "importing");
+      await withTransferTransaction(runC, "primary", client => recordCheckpoint(client, runC, checkpointWithCursor));
+      flaky.fail = true;
+      await assert.rejects(abandonRun(runC), isCode("CUTOVER_TARGET_CONNECT_FAILED"));
+      flaky.fail = false;
+      assert.equal(await stateOf(adminPrimary, "transfer_runs", runIdC), "abandoned");
+      assert.equal(await stateOf(adminLedger, "ledger_transfer_runs", runIdC), "importing");
+      assert.deepEqual(await cursors(runIdC), [{ last_key: null }]);
+      // The next open converges the stranded mirror before anything else.
+      const reopened = await openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_C });
+      assert.equal(reopened.resumed, false);
+      assert.equal(await stateOf(adminLedger, "ledger_transfer_runs", runIdC), "abandoned");
+
+      // A mirror whose run the primary does not hold as abandoned is refused.
+      const foreignRunId = randomUUID();
+      await adminLedger.query(`INSERT INTO tibotattle_transfer.ledger_transfer_runs
+          (run_id, contract_id, seal_manifest_sha256, sealed_at, state)
+        VALUES ($1, $2, $3, '2026-09-24T14:00:00.000Z', 'preflight')`, [foreignRunId, contract.contractId, SEAL_D]);
       await assert.rejects(openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_A }),
-        error => isCode("CUTOVER_TARGET_NOT_EMPTY")(error) && error.relation === "community_public_source_bootstrap");
-      await ownerPrimary.query(`DROP TABLE "${PRIMARY_SCHEMA}".community_public_source_bootstrap`);
+        isCode("CUTOVER_RUN_STATE_DIVERGED"));
+      await adminLedger.query(`UPDATE tibotattle_transfer.ledger_transfer_runs SET state = 'abandoned',
+        abandoned_at = clock_timestamp() WHERE run_id = $1`, [foreignRunId]);
+
+      // A run abandoned outside the module keeps its cursor until a scrub;
+      // the guard admits only NULLing it. The main run must clear it.
+      const runD = await openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_D });
+      const { runId: runIdD } = await beginRun(runD, { sealedAt: "2026-09-24T15:00:00.000Z" });
+      await advanceRun(runD, "importing");
+      await withTransferTransaction(runD, "primary", client => recordCheckpoint(client, runD, checkpointWithCursor));
+      await adminPrimary.query(`UPDATE tibotattle_transfer.transfer_runs SET state = 'abandoned',
+        abandoned_at = clock_timestamp() WHERE run_id = $1`, [runIdD]);
+      assert.deepEqual(await cursors(runIdD), [{ last_key: storedCursor }]);
+      for (const statement of [
+        "UPDATE tibotattle_transfer.transfer_checkpoints SET row_count = 4 WHERE run_id = $1",
+        "UPDATE tibotattle_transfer.transfer_checkpoints SET last_key = '[\"synthetic-other\"]' WHERE run_id = $1",
+        "UPDATE tibotattle_transfer.transfer_checkpoints SET last_key = NULL, row_count = 4 WHERE run_id = $1",
+      ]) {
+        await assert.rejects(adminPrimary.query(statement, [runIdD]), isSqlState("P1005", "TRANSFER_WRITE_REFUSED"));
+      }
+      assert.equal(await stateOf(adminLedger, "ledger_transfer_runs", runIdD), "importing");
+      residualRunId = runIdD;
     });
 
     const handle = await openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_A });
@@ -447,9 +598,13 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
       await assert.rejects(advanceRun(handle, "importing"), isCode("CUTOVER_RUN_MISSING"));
       ({ runId } = await beginRun(handle, { sealedAt: "2026-09-25T12:00:00.000Z" }));
       await assert.rejects(beginRun(handle, { sealedAt: "2026-09-25T12:00:00.000Z" }), isCode("CUTOVER_RUN_EXISTS"));
+      // Opening converged run D's stranded mirror; every other run is abandoned.
       const mirror = await adminLedger.query(`SELECT run_id, state, seal_manifest_sha256
-        FROM tibotattle_transfer.ledger_transfer_runs`);
+        FROM tibotattle_transfer.ledger_transfer_runs WHERE state <> 'abandoned'`);
       assert.deepEqual(mirror.rows, [{ run_id: runId, state: "preflight", seal_manifest_sha256: SEAL_A }]);
+      const residualMirror = await adminLedger.query(`SELECT state FROM tibotattle_transfer.ledger_transfer_runs
+        WHERE run_id = $1`, [residualRunId]);
+      assert.deepEqual(residualMirror.rows, [{ state: "abandoned" }]);
       const progressed = await advanceRun(handle, "importing");
       assert.deepEqual({ ...progressed }, { runId, state: "importing", ledgerState: "importing" });
       await assert.rejects(adminPrimary.query(`INSERT INTO tibotattle_transfer.transfer_runs
@@ -461,16 +616,27 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
       await assert.rejects(adminPrimary.query(`DELETE FROM tibotattle_transfer.transfer_runs`),
         isSqlState("P1005", "TRANSFER_RUN_IMMUTABLE"));
 
-      await ownerPrimary.query(`INSERT INTO "${PRIMARY_SCHEMA}".admin_action_audit(operation_id, action,
-          actor_identity_digest, outcome, details_json, created_at)
-        VALUES ('synthetic-imported-operation', 'run_maintenance', $1, 'success', '{}',
-          '2026-09-25T12:00:00.123Z')`, ["d".repeat(64)]);
+      // An imported row: only a resume of the same seal skips the emptiness check.
+      await insertProbeRow(ownerPrimary);
       const resumed = await openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_A });
       assert.equal(resumed.resumed, true);
       assert.equal(resumed.openedRunState, "importing");
       await assert.rejects(beginRun(resumed, { sealedAt: "2026-09-25T12:00:00.000Z" }), isCode("CUTOVER_RUN_EXISTS"));
       await assert.rejects(openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_B }),
         isCode("CUTOVER_TARGET_SEAL_MISMATCH"));
+
+      // Every transaction re-asserts the database and the IAM login, not only the open.
+      const sessions = sessionPool(transferPrimary);
+      const watched = await openProductionTransferTarget({ ...target, primaryPool: sessions, ...openArgs,
+        sealManifestSha256: SEAL_A });
+      const probe = () => withTransferTransaction(watched, "primary", client => client.query("SELECT 1"), { readOnly: true });
+      await probe();
+      sessions.rewrite = { database_name: databases.clone };
+      await assert.rejects(probe(), isCode("CUTOVER_TARGET_DATABASE_MISMATCH"));
+      sessions.rewrite = { login_role: roles.other, effective_role: roles.other };
+      await assert.rejects(probe(), isCode("CUTOVER_TARGET_SESSION_USER_MISMATCH"));
+      sessions.rewrite = undefined;
+      await probe();
     });
 
     await t.test("receipts never overwrite completed digests and bind the production transfer id", async () => {
@@ -505,6 +671,34 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
       [runId]), isSqlState("P1005", "TRANSFER_RECEIPT_REFUSED"));
       await assert.rejects(ownerPrimary.query(`DELETE FROM tibotattle_transfer.transfer_table_receipts`),
         isSqlState("P1005", "TRANSFER_RECEIPT_IMMUTABLE"));
+
+      // Object receipts move only copied -> verified with every other column
+      // frozen; object erasure receipts are insert-only.
+      await withTransferTransaction(handle, "primary", async (client) => {
+        await client.query(`INSERT INTO tibotattle_transfer.transfer_object_receipts
+            (run_id, key_sha256, object_class, size_bytes, content_sha256, metadata_sha256, gcs_generation, state)
+          VALUES ($1, $2, 'live', 10, $3, $4, '1790000000000003', 'copied')`,
+        [runId, "1".repeat(64), "2".repeat(64), "3".repeat(64)]);
+        await client.query(`INSERT INTO tibotattle_transfer.transfer_object_erasures
+            (run_id, key_sha256, gcs_generation, reason) VALUES ($1, $2, '1790000000000004', 'stale-generation')`,
+        [runId, "4".repeat(64)]);
+      });
+      for (const client of [ownerPrimary, adminPrimary]) {
+        for (const statement of [
+          `UPDATE tibotattle_transfer.transfer_object_receipts SET content_sha256 = '${"5".repeat(64)}'`,
+          `UPDATE tibotattle_transfer.transfer_object_receipts SET state = 'verified', verified_at = clock_timestamp(),
+             gcs_generation = '1790000000000005'`,
+          "DELETE FROM tibotattle_transfer.transfer_object_receipts",
+          "UPDATE tibotattle_transfer.transfer_object_erasures SET reason = 'tombstone'",
+          "DELETE FROM tibotattle_transfer.transfer_object_erasures",
+        ]) {
+          await assert.rejects(client.query(statement), isSqlState("P1005", "TRANSFER_RECEIPT_IMMUTABLE"), statement);
+        }
+      }
+      await ownerPrimary.query(`UPDATE tibotattle_transfer.transfer_object_receipts
+        SET state = 'verified', verified_at = clock_timestamp()`);
+      await assert.rejects(ownerPrimary.query(`UPDATE tibotattle_transfer.transfer_object_receipts
+        SET state = 'copied', verified_at = NULL`), isSqlState("P1005", "TRANSFER_RECEIPT_IMMUTABLE"));
     });
 
     const sealedRow = {
@@ -521,9 +715,26 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
         { tgname: "accountless_public_history_d1_fence_controls_guard", enabled: "O" },
         { tgname: "accountless_public_history_import_controls_guard", enabled: "O" },
       ]);
-      const seed = await ownerPrimary.query(`SELECT control_state, revision::int AS revision
-        FROM "${PRIMARY_SCHEMA}".collection_controls`);
-      assert.deepEqual(seed.rows, [{ control_state: "contained", revision: 1 }]);
+      const seedControls = async () => (await ownerPrimary.query(`SELECT control_state, revision::int AS revision
+        FROM "${PRIMARY_SCHEMA}".collection_controls`)).rows;
+      assert.deepEqual(await seedControls(), [{ control_state: "contained", revision: 1 }]);
+      // A sealed row with neither upload registration nor processing on has
+      // no consistent degraded form; the degrade is refused before any write.
+      const off = { enrollment_enabled: 0, upload_registration_enabled: 0, processing_enabled: 0, publication_enabled: 0 };
+      for (const impossible of [
+        { ...sealedRow, ...off, control_state: "contained" },
+        { ...sealedRow, ...off, control_state: "degraded", enrollment_enabled: 1, publication_enabled: 1 },
+      ]) {
+        await assert.rejects(withTransferTransaction(handle, "primary", async (client) => {
+          await recordSealedCollectionControls(client, handle, impossible);
+          await assert.rejects(degradeCollectionControlsForImport(client, handle),
+            isCode("CUTOVER_CONTROLS_DEGRADE_IMPOSSIBLE"));
+          assert.deepEqual((await client.query(`SELECT control_state, revision::int AS revision
+            FROM "${PRIMARY_SCHEMA}".collection_controls`)).rows, [{ control_state: "contained", revision: 1 }]);
+          throw new Error("synthetic impossible-degrade rollback");
+        }), /synthetic impossible-degrade rollback/u);
+      }
+      assert.deepEqual(await seedControls(), [{ control_state: "contained", revision: 1 }]);
       await withTransferTransaction(handle, "primary", async (client) => {
         const recorded = await recordSealedCollectionControls(client, handle, sealedRow);
         assert.equal(recorded.sealedRowSha256, sealedCollectionControlsSha256({ ...sealedRow,
@@ -539,6 +750,21 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
       assert.deepEqual(degraded.rows, [{ control_state: "degraded", enrollment_enabled: false,
         upload_registration_enabled: true, processing_enabled: true, publication_enabled: false, revision: 7,
         reason_code: "drill_restore" }]);
+      // The sealed record is insert-only, for the owner and a superuser alike.
+      for (const client of [ownerPrimary, adminPrimary]) {
+        await assert.rejects(client.query(`UPDATE tibotattle_transfer.sealed_collection_controls
+          SET revision = 8, sealed_row_sha256 = $1`, ["6".repeat(64)]), isSqlState("P1005", "TRANSFER_RECEIPT_IMMUTABLE"));
+        await assert.rejects(client.query("DELETE FROM tibotattle_transfer.sealed_collection_controls"),
+          isSqlState("P1005", "TRANSFER_RECEIPT_IMMUTABLE"));
+      }
+      // A control change outside the degrade is detected and re-degraded.
+      await ownerPrimary.query(`UPDATE "${PRIMARY_SCHEMA}".collection_controls SET processing_enabled = false`);
+      await assert.rejects(withTransferTransaction(handle, "primary",
+        client => assertCollectionControlsDegradedForImport(client, handle), { readOnly: true }),
+      isCode("CUTOVER_CONTROLS_NOT_DEGRADED"));
+      await withTransferTransaction(handle, "primary", client => degradeCollectionControlsForImport(client, handle));
+      await withTransferTransaction(handle, "primary",
+        client => assertCollectionControlsDegradedForImport(client, handle), { readOnly: true });
 
       // A D1-sourced accountless retention import is admitted only under these
       // degraded controls; while it is open the guards refuse enabling.
@@ -626,6 +852,37 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
       }
       await assert.rejects(withTransferTransaction(handle, "primary", client => withTriggerPolicy(client,
         { ...domainDays, suppress: ["RI_ConstraintTrigger_c_1"] }, async () => {})), isCode("CUTOVER_TRIGGER_POLICY_INVALID"));
+      // The control schema's guards are never suppressed.
+      await assert.rejects(withTransferTransaction(handle, "primary", client => withTriggerPolicy(client,
+        { schema: "tibotattle_transfer", table: "transfer_checkpoints", suppress: ["transfer_checkpoints_guard"] },
+        async () => {})), isCode("CUTOVER_TRIGGER_POLICY_INVALID"));
+
+      // A page on telemetry_v12_day_manifests deletes an unreferenced manifest.
+      // The inbound deferred 0026 FK of telemetry_v12_domain_days (a foreign-key
+      // neighbour, not a constraint of the page's table) queues an event on
+      // manifests, which only the neighbour IMMEDIATE step clears.
+      const manifests = { schema: PRIMARY_SCHEMA, table: "telemetry_v12_day_manifests",
+        suppress: ["telemetry_v12_day_manifest_retention_guard", "telemetry_v12_manifest_immutable_guard"] };
+      const deleteManifest = page => page.query(`DELETE FROM "${PRIMARY_SCHEMA}".telemetry_v12_day_manifests
+        WHERE id = $1`, [fixture.manifests["2026-09-23"].id]);
+      const neighbourClient = await ownerPrimary.connect();
+      try {
+        await neighbourClient.query("BEGIN");
+        await assert.rejects(doctored.withTriggerPolicy(neighbourClient, manifests, deleteManifest),
+          error => error.code === "CUTOVER_TRIGGER_POLICY_REENABLE_FAILED" && error.sqlState === "55006");
+        await neighbourClient.query("ROLLBACK");
+      } finally {
+        neighbourClient.release();
+      }
+      await assert.rejects(withTransferTransaction(handle, "primary", async (client) => {
+        const deleted = await withTriggerPolicy(client, manifests, deleteManifest);
+        assert.equal(deleted.rowCount, 1);
+        const enabled = await client.query(`SELECT count(*)::int AS n FROM pg_trigger
+          WHERE tgrelid = $1::regclass AND tgname = ANY($2::text[]) AND tgenabled = 'O'`,
+        [`"${PRIMARY_SCHEMA}".telemetry_v12_day_manifests`, manifests.suppress]);
+        assert.equal(enabled.rows[0].n, 2);
+        throw new Error("synthetic manifest rollback");
+      }), /synthetic manifest rollback/u);
     });
 
     await t.test("assertTriggerPolicyCoverage fails for an unclassified trigger and for a stale policy", async () => {
@@ -668,6 +925,18 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
     });
 
     await t.test("identity high water rises to the sealed sequence and max id and is never lowered", async () => {
+      // Every identity table needs explicit sealed evidence: a sqlite_sequence
+      // value, or null for "no sqlite_sequence row". The catalog names them,
+      // so later migrations that add identity columns stay covered.
+      const identityTables = (await ownerPrimary.query(`SELECT DISTINCT c.relname::text AS name
+          FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+         WHERE c.relnamespace = $1::regnamespace AND c.relkind IN ('r', 'p')
+           AND pg_get_serial_sequence(format('%I.%I', $2::text, c.relname), a.attname) IS NOT NULL
+         ORDER BY 1`, [PRIMARY_SCHEMA, PRIMARY_SCHEMA])).rows.map(row => row.name);
+      assert.ok(identityTables.includes("typed_telemetry_dictionary"));
+      assert.ok(identityTables.includes("telemetry_v1_records"));
+      const sealedWith = value => ({ ...Object.fromEntries(identityTables.map(name => [name, null])),
+        typed_telemetry_dictionary: value });
       await ownerPrimary.query(`INSERT INTO "${PRIMARY_SCHEMA}".typed_telemetry_dictionary(id, value)
         VALUES (30, 'synthetic-value')`);
       const sequenceState = async () => (await ownerPrimary.query(`SELECT last_value::int AS last_value, is_called
@@ -676,39 +945,43 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
       const entry = applied => applied.find(row => row.table === "typed_telemetry_dictionary");
       await withTransferTransaction(handle, "primary", async (client) => {
         assert.equal(entry(await applyIdentityHighWater(client, handle, {
-          sealedSequences: { typed_telemetry_dictionary: 41 } })).highWater, "41");
+          sealedSequences: sealedWith(41) })).highWater, "41");
       });
       assert.deepEqual(await sequenceState(), { last_value: 41, is_called: true });
       await withTransferTransaction(handle, "primary", async (client) => {
         assert.equal(entry(await applyIdentityHighWater(client, handle, {
-          sealedSequences: { typed_telemetry_dictionary: 5 } })).highWater, "41");
-        await assert.rejects(applyIdentityHighWater(client, handle, { sealedSequences: { participants: 5 } }),
+          sealedSequences: sealedWith(5) })).highWater, "41");
+        await assert.rejects(applyIdentityHighWater(client, handle, { sealedSequences: { ...sealedWith(5), participants: 5 } }),
           isCode("CUTOVER_IDENTITY_HIGH_WATER_INVALID"));
+        const { telemetry_v1_records: omitted, ...partial } = sealedWith(5);
+        assert.equal(omitted, null);
+        await assert.rejects(applyIdentityHighWater(client, handle, { sealedSequences: partial }),
+          error => isCode("CUTOVER_IDENTITY_HIGH_WATER_INVALID")(error) && error.table === "telemetry_v1_records");
+        await assert.rejects(applyIdentityHighWater(client, handle, {}), isCode("CUTOVER_IDENTITY_HIGH_WATER_INVALID"));
+      });
+      await withTransferTransaction(handle, "ledger", async (client) => {
+        assert.deepEqual([...await applyIdentityHighWater(client, handle, { sealedSequences: {} })], []);
       });
       await ownerPrimary.query(`INSERT INTO "${PRIMARY_SCHEMA}".typed_telemetry_dictionary(id, value)
         VALUES (50, 'synthetic-value-2')`);
       await withTransferTransaction(handle, "primary", async (client) => {
         assert.equal(entry(await applyIdentityHighWater(client, handle, {
-          sealedSequences: { typed_telemetry_dictionary: 41 } })).highWater, "50");
+          sealedSequences: sealedWith(41) })).highWater, "50");
       });
       assert.deepEqual(await sequenceState(), { last_value: 50, is_called: true });
     });
 
     await t.test("instant round trips name only the table and column", async () => {
-      await withTransferTransaction(handle, "primary", client => assertInstantRoundTrip(client,
-        { schema: PRIMARY_SCHEMA, table: "admin_action_audit", columns: ["created_at"] }), { readOnly: true });
-      await ownerPrimary.query(`INSERT INTO "${PRIMARY_SCHEMA}".admin_action_audit(operation_id, action,
-          actor_identity_digest, outcome, details_json, created_at)
-        VALUES ('synthetic-microsecond', 'run_maintenance', $1, 'success', '{}', '2026-09-25T12:00:00.123456Z')`,
-      ["d".repeat(64)]);
-      await assert.rejects(withTransferTransaction(handle, "primary", client => assertInstantRoundTrip(client,
-        { schema: PRIMARY_SCHEMA, table: "admin_action_audit", columns: ["created_at"] }), { readOnly: true }),
-      (error) => {
+      const where = { schema: PRIMARY_SCHEMA, table: "daily_rebuilds", columns: ["requested_at"] };
+      await withTransferTransaction(handle, "primary", client => assertInstantRoundTrip(client, where), { readOnly: true });
+      await insertProbeRow(ownerPrimary, { day: "2026-09-26", requestedAt: "2026-09-25T12:00:00.123456Z" });
+      await assert.rejects(withTransferTransaction(handle, "primary", client => assertInstantRoundTrip(client, where),
+        { readOnly: true }), (error) => {
         assert.equal(error.code, "CUTOVER_INSTANT_FORMAT_INVALID");
-        assert.equal(error.message, "CUTOVER_INSTANT_FORMAT_INVALID [table=admin_action_audit column=created_at]");
+        assert.equal(error.message, "CUTOVER_INSTANT_FORMAT_INVALID [table=daily_rebuilds column=requested_at]");
         return true;
       });
-      await ownerPrimary.query(`DELETE FROM "${PRIMARY_SCHEMA}".admin_action_audit WHERE operation_id = 'synthetic-microsecond'`);
+      await ownerPrimary.query(`DELETE FROM "${PRIMARY_SCHEMA}".daily_rebuilds WHERE day = '2026-09-26'`);
     });
 
     await t.test("tool relations are owned by the schema owner; objects made without SET ROLE are refused", async () => {
@@ -740,10 +1013,9 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
       await withTransferTransaction(handle, "ledger", client => assertNoTransferUserOwnership(client, handle));
     });
 
-    await t.test("checkpoint cursors are scrubbed and staging relations drop with receipts before verification", async () => {
+    await t.test("no checkpoint cursor of any run reaches 'verified'; staging relations drop with receipts", async () => {
       await withTransferTransaction(handle, "primary", async (client) => {
-        await recordCheckpoint(client, handle, { stage: "typed-legacy", name: "typed_v1_rows", state: "pending",
-          lastKey: ["synthetic-key", 3], rowCount: 3, prefixChainSha256: EMPTY_PREFIX_CHAIN });
+        await recordCheckpoint(client, handle, checkpointWithCursor);
         assert.deepEqual((await readCheckpoint(client, handle, { stage: "typed-legacy", name: "typed_v1_rows" })).lastKey,
           ["synthetic-key", 3]);
         await recordCheckpoint(client, handle, { stage: "typed-legacy", name: "typed_v11_rows", state: "complete",
@@ -754,15 +1026,11 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
       });
       await assert.rejects(adminPrimary.query(`UPDATE tibotattle_transfer.transfer_checkpoints SET last_key = '["x"]'
         WHERE checkpoint_name = 'typed_v11_rows'`), isSqlState("P1005", "TRANSFER_CHECKPOINT_IMMUTABLE"));
+
+      // 'verifying' needs every stage complete and names the first missing one.
+      await assert.rejects(advanceRun(handle, "verifying"),
+        error => isCode("CUTOVER_STAGE_INCOMPLETE")(error) && error.stage === "analytics-expectation");
       const staging = [{ schema: "tibotattle_transfer", table: "pt1_probe_mirror", requiresStageComplete: "header-promotion" }];
-      await withTransferTransaction(handle, "primary", async (client) => {
-        const scrubbed = await scrubCheckpointCursors(client, handle,
-          [{ table: "pt1_probe_mirror", cursorColumns: ["probe_cursor"] }]);
-        assert.deepEqual(scrubbed.map(row => ({ ...row })),
-          [{ relation: "transfer_checkpoints", rows: 1 }, { relation: "pt1_probe_mirror", rows: 1 }]);
-        await assert.rejects(scrubCheckpointCursors(client, handle,
-          [{ table: "pt1_probe_mirror", cursorColumns: ["probe_digest"] }]), isCode("CUTOVER_STAGING_REGISTRY_INVALID"));
-      });
       await withTransferTransaction(handle, "primary", async (client) => {
         await assert.rejects(dropTransferStagingRelations(client, handle, staging),
           error => isCode("CUTOVER_STAGE_INCOMPLETE")(error) && error.stage === "header-promotion");
@@ -774,6 +1042,43 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
             receiptSha256: stage === "identity-authority" ? "a".repeat(64) : createRowsDigest().digest() });
         }
       });
+      await advanceRun(handle, "verifying");
+
+      // Neither the current run's cursor nor an abandoned run's residual
+      // cursor may reach 'verified'.
+      await assert.rejects(advanceRun(handle, "verified"), isCode("CUTOVER_CHECKPOINT_INVALID"));
+      await adminPrimary.query(`UPDATE tibotattle_transfer.transfer_checkpoints SET last_key = NULL
+        WHERE run_id = $1 AND last_key IS NOT NULL`, [runId]);
+      const residual = await adminPrimary.query(`SELECT run_id FROM tibotattle_transfer.transfer_checkpoints
+        WHERE last_key IS NOT NULL`);
+      assert.deepEqual(residual.rows, [{ run_id: residualRunId }]);
+      await assert.rejects(advanceRun(handle, "verified"), isCode("CUTOVER_CHECKPOINT_INVALID"));
+      await withTransferTransaction(handle, "primary", client => recordCheckpoint(client, handle, checkpointWithCursor));
+      await withTransferTransaction(handle, "primary", async (client) => {
+        const scrubbed = await scrubCheckpointCursors(client, handle,
+          [{ table: "pt1_probe_mirror", cursorColumns: ["probe_cursor"] }]);
+        assert.deepEqual(scrubbed.map(row => ({ ...row })),
+          [{ relation: "transfer_checkpoints", rows: 2 }, { relation: "pt1_probe_mirror", rows: 1 }]);
+        await assert.rejects(scrubCheckpointCursors(client, handle,
+          [{ table: "pt1_probe_mirror", cursorColumns: ["probe_digest"] }]), isCode("CUTOVER_STAGING_REGISTRY_INVALID"));
+      });
+      const cursorsLeft = await adminPrimary.query(`SELECT count(*)::int AS n FROM tibotattle_transfer.transfer_checkpoints
+        WHERE last_key IS NOT NULL`);
+      assert.deepEqual(cursorsLeft.rows, [{ n: 0 }]);
+
+      // A staging relation the transfer login created without SET ROLE is refused.
+      const rogue = new pg.Client({ ...base, user: roles.transfer, database: databases.primary });
+      await rogue.connect();
+      try {
+        await rogue.query("CREATE TABLE tibotattle_transfer.pt1_rogue_mirror (probe integer)");
+        await assert.rejects(withTransferTransaction(handle, "primary", client => dropTransferStagingRelations(client, handle,
+          [{ schema: "tibotattle_transfer", table: "pt1_rogue_mirror", requiresStageComplete: "header-promotion" }])),
+        error => isCode("CUTOVER_STAGING_REGISTRY_INVALID")(error) && error.relation === "pt1_rogue_mirror");
+        await rogue.query("DROP TABLE tibotattle_transfer.pt1_rogue_mirror");
+      } finally {
+        await rogue.end();
+      }
+
       const receipts = await withTransferTransaction(handle, "primary",
         client => dropTransferStagingRelations(client, handle, staging));
       const expected = createRowsDigest();
@@ -788,14 +1093,26 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
       assert.deepEqual((await withTransferTransaction(handle, "primary",
         client => dropTransferStagingRelations(client, handle, staging))).map(row => row.rowCount), [2]);
 
+      // A leftover relation in either database's control schema blocks 'verified'.
       await withTransferTransaction(handle, "primary",
         client => client.query("CREATE TABLE tibotattle_transfer.pt1_leftover (probe integer)"));
       await assert.rejects(withTransferTransaction(handle, "primary", client => dropTransferStagingRelations(client, handle, [])),
         error => isCode("CUTOVER_CONTROL_SCHEMA_NOT_ALLOWLISTED")(error) && error.relation === "pt1_leftover");
-      await advanceRun(handle, "verifying");
       await assert.rejects(advanceRun(handle, "verified"),
         error => isCode("CUTOVER_CONTROL_SCHEMA_NOT_ALLOWLISTED")(error) && error.relation === "pt1_leftover");
       await ownerPrimary.query("DROP TABLE tibotattle_transfer.pt1_leftover");
+      await withTransferTransaction(handle, "ledger",
+        client => client.query("CREATE TABLE tibotattle_transfer.pt1_ledger_leftover (probe integer)"));
+      await assert.rejects(advanceRun(handle, "verified"),
+        error => isCode("CUTOVER_CONTROL_SCHEMA_NOT_ALLOWLISTED")(error) && error.relation === "pt1_ledger_leftover");
+      await ownerLedger.query("DROP TABLE tibotattle_transfer.pt1_ledger_leftover");
+
+      // 'verified' re-checks every stage receipt itself.
+      const hiding = await openProductionTransferTarget({ ...target, primaryPool: stageHidingPool(transferPrimary, "objects"),
+        ...openArgs, sealManifestSha256: SEAL_A });
+      await assert.rejects(advanceRun(hiding, "verified"),
+        error => isCode("CUTOVER_STAGE_INCOMPLETE")(error) && error.stage === "objects");
+
       const verified = await advanceRun(handle, "verified");
       assert.deepEqual({ ...verified }, { runId, state: "verified", ledgerState: "verified" });
       await assert.rejects(ownerPrimary.query(`INSERT INTO tibotattle_transfer.transfer_dropped_relations
@@ -854,33 +1171,109 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
       }
     });
 
-    await t.test("flip readiness refuses extra role members, runtime grants and disabled triggers", async () => {
+    await t.test("flip readiness and markLive refuse every unready target and leave the run verified", async () => {
       const flip = { flipEvidenceSha256: FLIP };
-      const ready = () => withTransferTransaction(handle, "primary", client => assertFlipReady(client, handle, flip),
-        { readOnly: true });
+      const ready = (options = flip, flipHandle = handle) => withTransferTransaction(flipHandle, "primary",
+        client => assertFlipReady(client, flipHandle, options), { readOnly: true });
+      const stillVerified = async () => {
+        const states = await Promise.all([
+          adminPrimary.query("SELECT state FROM tibotattle_transfer.transfer_runs WHERE run_id = $1", [runId]),
+          adminLedger.query("SELECT state FROM tibotattle_transfer.ledger_transfer_runs WHERE run_id = $1", [runId]),
+        ]);
+        for (const result of states) assert.deepEqual(result.rows, [{ state: "verified" }]);
+        const locks = await adminPrimary.query(`SELECT count(*)::int AS n FROM pg_trigger
+          WHERE tgname = 'transfer_target_live_lock'`);
+        assert.deepEqual(locks.rows, [{ n: 0 }]);
+      };
+
+      // Role members: `other` may SET ROLE to, and inherits from, the owner.
       await assert.rejects(ready(), isCode("CUTOVER_FLIP_ROLE_MEMBERS_UNEXPECTED"));
+      await assert.rejects(markLive(handle, flip), isCode("CUTOVER_FLIP_ROLE_MEMBERS_UNEXPECTED"));
+      await stillVerified();
+      // Naming a member waives only an administrative membership (no SET, no
+      // INHERIT) of a role with no grant of its own on either schema.
+      const waiveOther = { ...flip, allowedRoleMembers: [roles.other] };
+      await assert.rejects(ready(waiveOther), isCode("CUTOVER_FLIP_ROLE_MEMBERS_UNEXPECTED"));
       await admin.query(`REVOKE "${roles.owner}" FROM "${roles.other}"`);
-      await ownerPrimary.query(`GRANT SELECT ON tibotattle_transfer.transfer_runs TO "${roles.runtime}"`);
-      await assert.rejects(ready(), isCode("CUTOVER_FLIP_RUNTIME_PRIVILEGE"));
-      await ownerPrimary.query(`REVOKE SELECT ON tibotattle_transfer.transfer_runs FROM "${roles.runtime}"`);
-      await ownerLedger.query(`GRANT USAGE ON SCHEMA tibotattle_transfer TO "${roles.runtime}"`);
-      await assert.rejects(ready(), isCode("CUTOVER_FLIP_RUNTIME_PRIVILEGE"));
-      await ownerLedger.query(`REVOKE USAGE ON SCHEMA tibotattle_transfer FROM "${roles.runtime}"`);
+      await admin.query(`GRANT "${roles.owner}" TO "${roles.other}" WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`);
+      await assert.rejects(ready(), isCode("CUTOVER_FLIP_ROLE_MEMBERS_UNEXPECTED"));
+      assert.deepEqual([...(await ready(waiveOther)).waivedRoleMembers], [roles.other]);
+      await admin.query(`GRANT "${roles.owner}" TO "${roles.runtime}" WITH INHERIT FALSE, SET FALSE`);
+      await assert.rejects(ready({ ...flip, allowedRoleMembers: [roles.other, roles.runtime] }),
+        isCode("CUTOVER_FLIP_ROLE_MEMBERS_UNEXPECTED"));
+      await admin.query(`REVOKE "${roles.owner}" FROM "${roles.runtime}"`);
+      await admin.query(`REVOKE "${roles.owner}" FROM "${roles.other}"`);
+      await assert.rejects(ready({ ...flip, allowedRoleMembers: [roles.other, roles.other] }),
+        isCode("CUTOVER_TARGET_ARGUMENT_INVALID"));
+
+      // Any runtime privilege on the control schema: table, column, function, schema.
+      for (const [grant, revoke, grantPool] of [
+        [`GRANT SELECT ON tibotattle_transfer.transfer_runs TO "${roles.runtime}"`,
+          `REVOKE SELECT ON tibotattle_transfer.transfer_runs FROM "${roles.runtime}"`, ownerPrimary],
+        [`GRANT SELECT (state) ON tibotattle_transfer.transfer_runs TO "${roles.runtime}"`,
+          `REVOKE SELECT (state) ON tibotattle_transfer.transfer_runs FROM "${roles.runtime}"`, ownerPrimary],
+        [`GRANT EXECUTE ON FUNCTION tibotattle_transfer.transfer_write_allowed(text) TO "${roles.runtime}"`,
+          `REVOKE EXECUTE ON FUNCTION tibotattle_transfer.transfer_write_allowed(text) FROM "${roles.runtime}"`, ownerPrimary],
+        [`GRANT USAGE ON SCHEMA tibotattle_transfer TO "${roles.runtime}"`,
+          `REVOKE USAGE ON SCHEMA tibotattle_transfer FROM "${roles.runtime}"`, ownerLedger],
+      ]) {
+        await grantPool.query(grant);
+        await assert.rejects(ready(), isCode("CUTOVER_FLIP_RUNTIME_PRIVILEGE"), grant);
+        await grantPool.query(revoke);
+      }
+
       await ownerPrimary.query(`ALTER TABLE "${PRIMARY_SCHEMA}".telemetry_v12_domain_days DISABLE TRIGGER ${GUARD}`);
       await assert.rejects(ready(), error => isCode("CUTOVER_FLIP_TRIGGER_DISABLED")(error) && error.trigger === GUARD);
       await ownerPrimary.query(`ALTER TABLE "${PRIMARY_SCHEMA}".telemetry_v12_domain_days ENABLE TRIGGER ${GUARD}`);
+
+      // collection_controls must equal the sealed row.
+      await ownerPrimary.query(`UPDATE "${PRIMARY_SCHEMA}".collection_controls
+        SET updated_at = updated_at + interval '1 millisecond'`);
+      await assert.rejects(ready(), isCode("CUTOVER_CONTROLS_DIGEST_MISMATCH"));
+      await assert.rejects(markLive(handle, flip), isCode("CUTOVER_CONTROLS_DIGEST_MISMATCH"));
+      await stillVerified();
+      await withTransferTransaction(handle, "primary", client => restoreSealedCollectionControls(client, handle));
+
+      // Every stage receipt is re-checked at the flip.
+      const hiding = await openProductionTransferTarget({ ...target, primaryPool: stageHidingPool(transferPrimary, "objects"),
+        ...openArgs, sealManifestSha256: SEAL_A });
+      await assert.rejects(ready(flip, hiding), error => isCode("CUTOVER_STAGE_INCOMPLETE")(error) && error.stage === "objects");
+      await assert.rejects(markLive(hiding, flip), error => isCode("CUTOVER_STAGE_INCOMPLETE")(error) && error.stage === "objects");
+      await stillVerified();
+
+      // A cursor planted past the guards (superuser) is still caught at the flip.
+      const plantCursor = async (value) => {
+        const bypass = await adminPrimary.connect();
+        try {
+          await bypass.query("BEGIN");
+          await bypass.query("ALTER TABLE tibotattle_transfer.transfer_checkpoints DISABLE TRIGGER transfer_checkpoints_guard");
+          await bypass.query(`UPDATE tibotattle_transfer.transfer_checkpoints SET last_key = $2
+            WHERE run_id = $1 AND state = 'pending'`, [runId, value]);
+          await bypass.query("ALTER TABLE tibotattle_transfer.transfer_checkpoints ENABLE TRIGGER transfer_checkpoints_guard");
+          await bypass.query("COMMIT");
+        } finally {
+          bypass.release();
+        }
+      };
+      await plantCursor("[\"synthetic-late-key\"]");
+      await assert.rejects(ready(), isCode("CUTOVER_CHECKPOINT_INVALID"));
+      await plantCursor(null);
+
       await assert.rejects(withTransferTransaction(handle, "primary",
         client => assertFlipReady(client, handle, { flipEvidenceSha256: "not-a-digest" })), isCode("CUTOVER_FLIP_EVIDENCE_INVALID"));
       const report = await ready();
-      assert.deepEqual({ ...report }, { runId, flipEvidenceSha256: FLIP, ready: true });
+      assert.deepEqual({ ...report, waivedRoleMembers: [...report.waivedRoleMembers] },
+        { runId, flipEvidenceSha256: FLIP, ready: true, waivedRoleMembers: [] });
+      await stillVerified();
     });
 
-    await t.test("markLive locks every relation of tibotattle_transfer in both databases and refuses new runs", async () => {
-      const live = await markLive(handle, { flipEvidenceSha256: FLIP });
+    await t.test("markLive locks every relation of tibotattle_transfer in both databases; the target is then read-only", async () => {
+      const flip = { flipEvidenceSha256: FLIP };
+      const live = await markLive(handle, flip);
       assert.equal(live.state, "live");
       assert.equal(live.primaryLocked, CONTROL_SCHEMA_RELATIONS.length - 1);
       assert.equal(live.ledgerLocked, 2);
-      const again = await markLive(handle, { flipEvidenceSha256: FLIP });
+      const again = await markLive(handle, flip);
       assert.deepEqual({ ...again }, { ...live });
       await assert.rejects(markLive(handle, { flipEvidenceSha256: SEAL_B }), isCode("CUTOVER_FLIP_EVIDENCE_INVALID"));
       for (const [adminPool, databaseRole] of [[adminPrimary, "primary"], [adminLedger, "ledger"]]) {
@@ -897,18 +1290,47 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
       await assert.rejects(adminLedger.query(`DELETE FROM tibotattle_transfer.ledger_transfer_runs`),
         isSqlState("P1005", "TRANSFER_TARGET_LIVE"));
       const states = await Promise.all([
-        adminPrimary.query("SELECT state, flip_evidence_sha256 FROM tibotattle_transfer.transfer_runs"),
-        adminLedger.query("SELECT state, flip_evidence_sha256 FROM tibotattle_transfer.ledger_transfer_runs"),
+        adminPrimary.query("SELECT state, flip_evidence_sha256 FROM tibotattle_transfer.transfer_runs WHERE state <> 'abandoned'"),
+        adminLedger.query(`SELECT state, flip_evidence_sha256 FROM tibotattle_transfer.ledger_transfer_runs
+          WHERE state <> 'abandoned'`),
       ]);
       for (const result of states) assert.deepEqual(result.rows, [{ state: "live", flip_evidence_sha256: FLIP }]);
+
+      // A handle on the live target reads but never writes.
       const resumed = await openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_A });
       assert.equal(resumed.openedRunState, "live");
       await assert.rejects(beginRun(resumed, { sealedAt: "2026-09-25T12:00:00.000Z" }), isCode("CUTOVER_RUN_EXISTS"));
       await assert.rejects(abandonRun(resumed), isCode("CUTOVER_RUN_TRANSITION_REFUSED"));
       await assert.rejects(openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_B }),
         isCode("CUTOVER_TARGET_SEAL_MISMATCH"));
+      for (const role of ["primary", "ledger"]) {
+        await assert.rejects(withTransferTransaction(resumed, role, async () => "wrote"), isCode("CUTOVER_TARGET_LIVE"));
+      }
+      await assert.rejects(withTransferTransaction(resumed, "primary", client => insertProbeRow(client, { day: "2026-09-27" })),
+        isCode("CUTOVER_TARGET_LIVE"));
       await assert.rejects(withTransferTransaction(resumed, "primary", client => stageReceipt(client, resumed,
-        { stage: "objects", state: "started" })), isCode("CUTOVER_RUN_STATE_INVALID"));
+        { stage: "objects", state: "started" })), isCode("CUTOVER_TARGET_LIVE"));
+      await assert.rejects(withTransferTransaction(resumed, "primary", client => withTriggerPolicy(client, domainDays,
+        page => insertDay(page, fixture, "2026-09-22"))), isCode("CUTOVER_TARGET_LIVE"));
+      assert.equal(await guardEnabled(ownerPrimary), "O");
+      const read = await withTransferTransaction(resumed, "primary",
+        client => client.query("SELECT count(*)::int AS n FROM tibotattle_transfer.transfer_runs"), { readOnly: true });
+      assert.equal(read.rows[0].n, 4);
+
+      // No relation can be added to the locked schema, and one that a
+      // superuser forces in fails the markLive readback instead of being adopted.
+      for (const ownerPool of [ownerPrimary, ownerLedger]) {
+        await assert.rejects(ownerPool.query("CREATE TABLE tibotattle_transfer.pt1_after_live (probe integer)"),
+          isSqlState("42501"));
+      }
+      await adminPrimary.query("CREATE TABLE tibotattle_transfer.pt1_after_live (probe integer)");
+      await assert.rejects(markLive(handle, flip),
+        error => isCode("CUTOVER_CONTROL_SCHEMA_NOT_ALLOWLISTED")(error) && error.relation === "pt1_after_live");
+      await adminPrimary.query("DROP TABLE tibotattle_transfer.pt1_after_live");
+      await adminLedger.query(`GRANT CREATE ON SCHEMA tibotattle_transfer TO "${roles.owner}"`);
+      await assert.rejects(markLive(handle, flip), isCode("CUTOVER_LIVE_LOCK_INCOMPLETE"));
+      await adminLedger.query(`REVOKE CREATE ON SCHEMA tibotattle_transfer FROM "${roles.owner}"`);
+      assert.deepEqual({ ...await markLive(handle, flip) }, { ...live });
     });
   } finally {
     await Promise.allSettled(pools.map(entry => entry.end()));

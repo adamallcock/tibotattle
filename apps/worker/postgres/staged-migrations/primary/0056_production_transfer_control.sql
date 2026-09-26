@@ -68,8 +68,9 @@ BEGIN
   END IF;
   IF to_regprocedure('tibotattle_transfer.install_transfer_live_lock()') IS NULL THEN
     -- Attach the statement-level live lock to every table in the schema,
-    -- including tool-created relations, once a run is live. Refuses any
-    -- relation kind that a statement trigger cannot lock.
+    -- including tool-created relations, once a run is live, and revoke CREATE
+    -- on the schema from its owner so no unlocked relation can follow. Refuses
+    -- any relation kind that a statement trigger cannot lock.
     CREATE FUNCTION tibotattle_transfer.install_transfer_live_lock()
     RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $fn$
     DECLARE
@@ -112,6 +113,8 @@ BEGIN
           installed := installed + 1;
         END IF;
       END LOOP;
+      EXECUTE format('REVOKE CREATE ON SCHEMA tibotattle_transfer FROM %I',
+        (SELECT pg_get_userbyid(n.nspowner) FROM pg_namespace n WHERE n.oid = control_namespace));
       IF EXISTS (
         SELECT 1 FROM pg_class c
          WHERE c.relnamespace = control_namespace AND c.relkind IN ('r', 'p')
@@ -123,6 +126,10 @@ BEGIN
                 AND t.tgenabled = 'A'
                 AND t.tgtype = 62
                 AND NOT t.tgisinternal)
+      ) OR EXISTS (
+        SELECT 1 FROM pg_namespace n
+         CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) acl
+         WHERE n.oid = control_namespace AND acl.privilege_type = 'CREATE'
       ) THEN
         RAISE EXCEPTION 'TRANSFER_LIVE_LOCK_INCOMPLETE' USING ERRCODE = 'P1005';
       END IF;
@@ -341,7 +348,9 @@ BEGIN
     FOR EACH STATEMENT EXECUTE FUNCTION tibotattle_transfer.transfer_control_row_immutable();
 
   -- Keyset checkpoints. A cursor is transient: a complete checkpoint holds
-  -- no key, and finalization NULLs every remaining cursor.
+  -- no key, and finalization NULLs every remaining cursor. An abandoned
+  -- run's checkpoint admits exactly one change, NULLing its cursor, so a
+  -- run abandoned mid-import never keeps a source key.
   CREATE TABLE tibotattle_transfer.transfer_checkpoints (
     run_id text NOT NULL REFERENCES tibotattle_transfer.transfer_runs(run_id),
     stage text NOT NULL CHECK (stage ~ '^[a-z][a-z0-9]*(-[a-z0-9]+)*$' AND length(stage) <= 63),
@@ -365,6 +374,16 @@ BEGIN
        OR NEW.stage IS DISTINCT FROM OLD.stage
        OR NEW.checkpoint_name IS DISTINCT FROM OLD.checkpoint_name) THEN
       RAISE EXCEPTION 'TRANSFER_CHECKPOINT_IMMUTABLE' USING ERRCODE = 'P1005';
+    END IF;
+    IF TG_OP = 'UPDATE' AND OLD.last_key IS NOT NULL AND NEW.last_key IS NULL
+       AND NEW.state IS NOT DISTINCT FROM OLD.state
+       AND NEW.row_count IS NOT DISTINCT FROM OLD.row_count
+       AND NEW.prefix_chain_sha256 IS NOT DISTINCT FROM OLD.prefix_chain_sha256
+       AND EXISTS (SELECT 1 FROM tibotattle_transfer.transfer_runs run
+                    WHERE run.run_id = OLD.run_id AND run.state = 'abandoned')
+       AND NOT EXISTS (SELECT 1 FROM tibotattle_transfer.transfer_runs run WHERE run.state = 'live') THEN
+      NEW.updated_at := clock_timestamp();
+      RETURN NEW;
     END IF;
     IF tibotattle_transfer.transfer_write_allowed(NEW.run_id) IS NOT TRUE THEN
       RAISE EXCEPTION 'TRANSFER_WRITE_REFUSED' USING ERRCODE = 'P1005';

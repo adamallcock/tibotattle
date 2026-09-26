@@ -13,7 +13,8 @@ import {
 // the databases, the IAM login and the schema-owner role. Each transaction
 // re-asserts PostgreSQL 17, the database, session_user and SET LOCAL ROLE to
 // the schema owner, so every object a tool creates is owned by the schema
-// owner and never by the transfer login. Errors are closed codes; no value
+// owner and never by the transfer login. Once a run is live (or the handle's
+// run is abandoned) the handle only reads. Errors are closed codes; no value
 // read from a source or target is ever placed in an error, log or receipt.
 
 export const POSTGRES_TRANSFER_TARGET_SCHEMA_VERSION = "tibotattle-production-transfer-target-v1";
@@ -140,6 +141,7 @@ export const POSTGRES_TRANSFER_TARGET_ERROR_CODES = Object.freeze([
   ...DATABASE_GUARD_CODES,
   "CUTOVER_CHECKPOINT_INVALID",
   "CUTOVER_CONTROL_SCHEMA_NOT_ALLOWLISTED",
+  "CUTOVER_CONTROLS_DEGRADE_IMPOSSIBLE",
   "CUTOVER_CONTROLS_DIGEST_MISMATCH",
   "CUTOVER_CONTROLS_MISSING",
   "CUTOVER_CONTROLS_NOT_DEGRADED",
@@ -175,6 +177,7 @@ export const POSTGRES_TRANSFER_TARGET_ERROR_CODES = Object.freeze([
   "CUTOVER_TARGET_DATABASE_MISMATCH",
   "CUTOVER_TARGET_HANDLE_INVALID",
   "CUTOVER_TARGET_IAM_USER_MISSING",
+  "CUTOVER_TARGET_LIVE",
   "CUTOVER_TARGET_MIGRATION_RECEIPTS_MISMATCH",
   "CUTOVER_TARGET_NOT_EMPTY",
   "CUTOVER_TARGET_POSTGRES_VERSION_UNSUPPORTED",
@@ -257,6 +260,12 @@ const LIVE_LOCK_TRIGGER = "transfer_target_live_lock";
 const HASH = value => createHash("sha256").update(value).digest("hex");
 const HANDLES = new WeakMap();
 const TRANSACTION_CLIENTS = new WeakMap();
+// Module-private option: the run-state transitions (advance, abandon, ledger
+// mirror convergence, mark-live) enforce their own state rules under a FOR
+// UPDATE run lock, so they skip the live/abandoned write gate (and its FOR
+// SHARE lock) that every other write transaction meets.
+const RUN_CONTROL = Symbol("tibotattle-transfer-run-control");
+const MAX_WAIVED_ROLE_MEMBERS = 8;
 
 export class PostgresTransferTargetError extends Error {
   constructor(code, details = undefined) {
@@ -729,22 +738,56 @@ function roleTarget(handle, role) {
   return fail("CUTOVER_TARGET_ARGUMENT_INVALID");
 }
 
+async function liveRunPresent(client, table) {
+  const [present] = rows(await q(client, "SELECT to_regclass($1) IS NOT NULL AS present",
+    [`${TRANSFER_CONTROL_SCHEMA}.${table}`]));
+  if (present?.present !== true) return false;
+  const [row] = rows(await q(client, `SELECT EXISTS (SELECT 1 FROM ${control(table)}
+    WHERE state = 'live') AS live`));
+  return row?.live === true;
+}
+
+// A write transaction is refused once any run in this database is live (the
+// target then belongs to the runtime) and once the handle's own run is
+// abandoned. The primary run row is share-locked first, so a concurrent
+// markLive either waits for this transaction or is seen by it.
+async function assertWritableTarget(client, role, runId) {
+  const runs = role === "primary" ? "transfer_runs" : "ledger_transfer_runs";
+  const own = runId === null ? undefined
+    : await readRunById(client, runs, runId, role === "primary" ? "FOR SHARE" : "");
+  if (await liveRunPresent(client, "transfer_runs") || await liveRunPresent(client, "ledger_transfer_runs")) {
+    fail("CUTOVER_TARGET_LIVE");
+  }
+  if (own?.state === "abandoned") fail("CUTOVER_RUN_STATE_INVALID");
+}
+
 /**
  * Run fn(client) in one transaction on the named target, re-asserting
  * PostgreSQL 17, the contract database and IAM login, and SET LOCAL ROLE to
- * the schema owner. Objects fn creates are owned by the schema owner.
+ * the schema owner. Objects fn creates are owned by the schema owner. A
+ * write transaction is refused once any run is live or the handle's run is
+ * abandoned; read-only transactions stay available for readbacks.
  */
 export async function withTransferTransaction(handle, role, fn, options = {}) {
   const state = handleState(handle);
   const target = roleTarget(handle, role);
-  if (typeof fn !== "function") fail("CUTOVER_TARGET_ARGUMENT_INVALID");
+  if (typeof fn !== "function" || options === null || typeof options !== "object") {
+    fail("CUTOVER_TARGET_ARGUMENT_INVALID");
+  }
   const pool = role === "primary" ? state.primaryPool : state.ledgerPool;
-  return inTransaction(pool, { ...options, readOnly: options.readOnly === true }, async (client) => {
+  const readOnly = options.readOnly === true;
+  const runControl = options[RUN_CONTROL] === true;
+  return inTransaction(pool, {
+    statementTimeoutMilliseconds: options.statementTimeoutMilliseconds,
+    lockTimeoutMilliseconds: options.lockTimeoutMilliseconds,
+    readOnly,
+  }, async (client) => {
     const facts = await sessionFacts(client);
     if (facts.databaseName !== target.database) fail("CUTOVER_TARGET_DATABASE_MISMATCH");
     if (facts.loginRole !== handle.iamDatabaseUser) fail("CUTOVER_TARGET_SESSION_USER_MISMATCH");
     await assumeOwnerRole(client, handle.schemaOwnerRole);
     await q(client, renderPostgresSearchPath(target.schema));
+    if (!readOnly && !runControl) await assertWritableTarget(client, role, state.runId);
     TRANSACTION_CLIENTS.set(client, Object.freeze({ handle, role }));
     try {
       return await fn(client);
@@ -792,20 +835,51 @@ async function inspectLedger(client, contract, { sealManifestSha256, rootDirecto
   await assertComponentInstalled(client, "ledger");
   await assertMigrationReceipts(client, "ledger", contract.ledger_schema_name, rootDirectory);
   const mirror = await readOpenRun(client, "ledger_transfer_runs");
+  let strandedMirror;
   if (mirror !== undefined) {
-    if (mirror.sealManifestSha256 !== sealManifestSha256) fail("CUTOVER_TARGET_SEAL_MISMATCH");
-    if (primaryRun === undefined || mirror.runId !== primaryRun.runId
-        || RUN_ORDER.get(mirror.state) > RUN_ORDER.get(primaryRun.state)) {
+    if (primaryRun === undefined || mirror.runId !== primaryRun.runId) {
+      // Either an abandon that committed in the primary but not yet in the
+      // ledger, which the open converges, or a divergent mirror (refused).
+      strandedMirror = mirror;
+    } else if (mirror.sealManifestSha256 !== sealManifestSha256) {
+      fail("CUTOVER_TARGET_SEAL_MISMATCH");
+    } else if (RUN_ORDER.get(mirror.state) > RUN_ORDER.get(primaryRun.state)) {
       fail("CUTOVER_RUN_STATE_DIVERGED");
     }
   }
   if (primaryRun === undefined) await assertApplicationTablesEmpty(client, "ledger", contract.ledger_schema_name);
+  return { strandedMirror };
+}
+
+async function assumeContractSession(client, contract, component) {
+  const facts = await sessionFacts(client);
+  const database = component === "primary" ? contract.database_name : contract.ledger_database_name;
+  if (facts.databaseName !== database) fail("CUTOVER_TARGET_DATABASE_MISMATCH");
+  if (facts.loginRole !== contract.iam_database_user) fail("CUTOVER_TARGET_SESSION_USER_MISMATCH");
+  await assumeOwnerRole(client, contract.schema_owner_role);
+}
+
+// A ledger mirror left open by a torn abandonRun (primary committed, ledger
+// not) converges to 'abandoned' only when the primary holds the same run,
+// with the same contract, seal and seal time, in state 'abandoned'. Any
+// other open mirror without its primary run is divergent.
+async function convergeStrandedMirror(primaryPool, ledgerPool, contract, stranded) {
+  const primaryRun = await inTransaction(primaryPool, { readOnly: true }, async (client) => {
+    await assumeContractSession(client, contract, "primary");
+    return readRunById(client, "transfer_runs", stranded.runId);
+  });
+  if (primaryRun?.state !== "abandoned") fail("CUTOVER_RUN_STATE_DIVERGED");
+  await inTransaction(ledgerPool, {}, async (client) => {
+    await assumeContractSession(client, contract, "ledger");
+    await advanceMirror(client, primaryRun);
+  });
 }
 
 /**
  * Open the registered production target. A fresh open requires empty
  * application tables (seeded singletons excepted); an open whose seal id
  * equals the existing non-abandoned run resumes it and skips that check.
+ * A ledger mirror stranded by a torn abandon is converged first.
  */
 export async function openProductionTransferTarget({
   primaryPool,
@@ -821,9 +895,12 @@ export async function openProductionTransferTarget({
   const primary = await inTransaction(primaryPool, { readOnly: true }, client => inspectPrimary(client, {
     expectedContractId, sealManifestSha256, rootDirectory,
   }));
-  await inTransaction(ledgerPool, { readOnly: true }, client => inspectLedger(client, primary.contract, {
+  const ledger = await inTransaction(ledgerPool, { readOnly: true }, client => inspectLedger(client, primary.contract, {
     sealManifestSha256, rootDirectory, primaryRun: primary.run,
   }));
+  if (ledger.strandedMirror !== undefined) {
+    await convergeStrandedMirror(primaryPool, ledgerPool, primary.contract, ledger.strandedMirror);
+  }
   const { contract, run } = primary;
   const handle = Object.freeze({
     schemaVersion: POSTGRES_TRANSFER_TARGET_SCHEMA_VERSION,
@@ -927,8 +1004,10 @@ async function advanceMirror(client, primaryRun) {
 export async function reconcileLedgerRunMirror(handle) {
   const state = handleState(handle);
   if (state.runId === null) fail("CUTOVER_RUN_MISSING");
-  const primaryRun = await withTransferTransaction(handle, "primary", client => currentRun(client, handle));
-  const mirror = await withTransferTransaction(handle, "ledger", client => advanceMirror(client, primaryRun));
+  const primaryRun = await withTransferTransaction(handle, "primary", client => currentRun(client, handle),
+    { readOnly: true });
+  const mirror = await withTransferTransaction(handle, "ledger", client => advanceMirror(client, primaryRun),
+    { [RUN_CONTROL]: true });
   return Object.freeze({ runId: primaryRun.runId, state: primaryRun.state, ledgerState: mirror?.state ?? null });
 }
 
@@ -963,18 +1042,42 @@ async function assertAllStagesComplete(client, run) {
   if (missing !== undefined) fail("CUTOVER_STAGE_INCOMPLETE", { stage: missing });
 }
 
+// No checkpoint cursor survives in any run: the current run's and those of
+// abandoned runs, which the live lock would otherwise freeze for good.
+async function assertNoCheckpointCursors(client) {
+  const [cursors] = rows(await q(client, `SELECT count(*)::text AS n FROM ${control("transfer_checkpoints")}
+    WHERE last_key IS NOT NULL`));
+  if (databaseCount(cursors?.n) !== 0n) fail("CUTOVER_CHECKPOINT_INVALID");
+}
+
+// NULL the cursors of every abandoned run (0056 admits only that UPDATE for
+// an abandoned run). Returns the number of checkpoints scrubbed. Issues no
+// UPDATE when nothing is left, so it never meets a statement-level lock.
+async function scrubAbandonedRunCursors(client) {
+  const abandonedCursor = `checkpoint.last_key IS NOT NULL AND EXISTS (SELECT 1 FROM ${control("transfer_runs")} run
+      WHERE run.run_id = checkpoint.run_id AND run.state = 'abandoned')`;
+  const [pending] = rows(await q(client, `SELECT count(*)::text AS n
+    FROM ${control("transfer_checkpoints")} AS checkpoint WHERE ${abandonedCursor}`));
+  if (databaseCount(pending?.n) === 0n) return 0;
+  const result = await q(client, `UPDATE ${control("transfer_checkpoints")} AS checkpoint SET last_key = NULL
+    WHERE ${abandonedCursor}`);
+  return result.rowCount ?? 0;
+}
+
 async function assertVerifiedPreconditions(client, handle, role, run) {
   if (role === "primary") {
     await assertAllStagesComplete(client, run);
-    const [cursors] = rows(await q(client, `SELECT count(*)::text AS n FROM ${control("transfer_checkpoints")}
-      WHERE run_id = $1 AND last_key IS NOT NULL`, [run.runId]));
-    if (databaseCount(cursors?.n) !== 0n) fail("CUTOVER_CHECKPOINT_INVALID");
+    await assertNoCheckpointCursors(client);
   }
   await assertControlSchemaAllowlist(client);
   await assertNoTransferUserOwnership(client, handle);
 }
 
-/** Move the run forward: preflight -> importing -> verifying -> verified. */
+/**
+ * Move the run forward: preflight -> importing -> verifying -> verified.
+ * The transition refuses a live or abandoned run itself, so it takes the
+ * run row FOR UPDATE directly rather than through the shared write gate.
+ */
 export async function advanceRun(handle, to) {
   if (!["importing", "verifying", "verified"].includes(to)) fail("CUTOVER_RUN_TRANSITION_REFUSED");
   const state = handleState(handle);
@@ -993,21 +1096,31 @@ export async function advanceRun(handle, to) {
     await q(client, `UPDATE ${control("transfer_runs")} SET state = $2,
         verified_at = CASE WHEN $2 = 'verified' THEN clock_timestamp() ELSE verified_at END
       WHERE run_id = $1`, [run.runId, to]);
-  });
+  }, { [RUN_CONTROL]: true });
   return reconcileLedgerRunMirror(handle);
 }
 
-/** Abandon the run in both databases. There is no reopen. */
+/**
+ * Abandon the run in both databases. There is no reopen. The run's
+ * checkpoint cursors are NULLed in the same primary transaction, so an
+ * abandoned run never keeps a cursor. If the ledger step is lost, the next
+ * openProductionTransferTarget converges the mirror.
+ */
 export async function abandonRun(handle) {
   const state = handleState(handle);
   if (state.runId === null) fail("CUTOVER_RUN_MISSING");
   await withTransferTransaction(handle, "primary", async (client) => {
     const run = await currentRun(client, handle, "FOR UPDATE");
-    if (run.state === "abandoned") return;
     if (run.state === "live") fail("CUTOVER_RUN_TRANSITION_REFUSED");
-    await q(client, `UPDATE ${control("transfer_runs")} SET state = 'abandoned',
-      abandoned_at = clock_timestamp() WHERE run_id = $1`, [run.runId]);
-  });
+    if (run.state !== "abandoned") {
+      await q(client, `UPDATE ${control("transfer_runs")} SET state = 'abandoned',
+        abandoned_at = clock_timestamp() WHERE run_id = $1`, [run.runId]);
+    }
+    await scrubAbandonedRunCursors(client);
+    const [left] = rows(await q(client, `SELECT count(*)::text AS n FROM ${control("transfer_checkpoints")}
+      WHERE run_id = $1 AND last_key IS NOT NULL`, [run.runId]));
+    if (databaseCount(left?.n) !== 0n) fail("CUTOVER_CHECKPOINT_INVALID");
+  }, { [RUN_CONTROL]: true });
   return reconcileLedgerRunMirror(handle);
 }
 
@@ -1258,10 +1371,13 @@ async function restoreTriggerPolicy(client, oid, names) {
  * triggers are re-enabled and asserted 'O'. On any error the savepoint is
  * rolled back, which restores the triggers. Foreign-key, internal and
  * constraint triggers are never disabled, and neither is ALL or USER.
- * Must be the last write group of the page transaction.
+ * The control schema (whose guards and live lock are never suppressed) and
+ * the reserved schemas are refused. Must be the last write group of the
+ * page transaction.
  */
 export async function withTriggerPolicy(client, { schema, table, suppress } = {}, fn) {
   identifier(schema, "CUTOVER_TRIGGER_POLICY_INVALID");
+  if (RESERVED_SCHEMAS.has(schema)) fail("CUTOVER_TRIGGER_POLICY_INVALID");
   identifier(table, "CUTOVER_TRIGGER_POLICY_INVALID");
   if (!Array.isArray(suppress) || typeof fn !== "function"
       || new Set(suppress).size !== suppress.length
@@ -1403,9 +1519,12 @@ export async function assertTriggerPolicyCoverage(client, schema, policyMap) {
 /**
  * Raise every identity or serial sequence of the target schema to
  * GREATEST(max(column), the sealed sqlite_sequence value, its current
- * value). Never lowers a sequence.
+ * value). Never lowers a sequence. sealedSequences must name every table of
+ * the schema that has an identity or serial column, and nothing else: a
+ * sealed sqlite_sequence value, or null when the sealed source has no
+ * sqlite_sequence row for it. A missing entry is missing evidence and fails.
  */
-export async function applyIdentityHighWater(client, handle, { sealedSequences = {} } = {}) {
+export async function applyIdentityHighWater(client, handle, { sealedSequences } = {}) {
   const role = transactionRole(client, handle);
   const schema = roleTarget(handle, role).schema;
   if (sealedSequences === null || typeof sealedSequences !== "object" || Array.isArray(sealedSequences)) {
@@ -1414,7 +1533,7 @@ export async function applyIdentityHighWater(client, handle, { sealedSequences =
   const sealed = new Map();
   for (const [table, value] of Object.entries(sealedSequences)) {
     if (!IDENTIFIER.test(table)) fail("CUTOVER_IDENTITY_HIGH_WATER_INVALID");
-    sealed.set(table, BigInt(safeCount(value, "CUTOVER_IDENTITY_HIGH_WATER_INVALID")));
+    sealed.set(table, value === null ? null : BigInt(safeCount(value, "CUTOVER_IDENTITY_HIGH_WATER_INVALID")));
   }
   const columns = rows(await q(client, `SELECT c.relname::text AS table_name, a.attname::text AS column_name,
       pg_get_serial_sequence(format('%I.%I', n.nspname, c.relname), a.attname)::regclass::oid::text AS sequence_oid
@@ -1424,8 +1543,13 @@ export async function applyIdentityHighWater(client, handle, { sealedSequences =
      WHERE n.nspname = $1 AND c.relkind IN ('r', 'p')
        AND pg_get_serial_sequence(format('%I.%I', n.nspname, c.relname), a.attname) IS NOT NULL
      ORDER BY 1, 2`, [schema]));
-  for (const table of sealed.keys()) {
-    if (columns.filter(row => row.table_name === table).length !== 1) fail("CUTOVER_IDENTITY_HIGH_WATER_INVALID");
+  const sequenced = new Set(columns.map(row => row.table_name));
+  for (const [table, value] of sealed) {
+    const count = columns.filter(row => row.table_name === table).length;
+    if (count === 0 || (value !== null && count !== 1)) fail("CUTOVER_IDENTITY_HIGH_WATER_INVALID");
+  }
+  for (const table of sequenced) {
+    if (!sealed.has(table)) fail("CUTOVER_IDENTITY_HIGH_WATER_INVALID", { table });
   }
   const applied = [];
   for (const row of columns) {
@@ -1490,12 +1614,10 @@ function normalizeSealedControls(sealedRow) {
       || Object.keys(sealedRow).some(key => !SEALED_CONTROL_KEYS.has(key))) {
     fail("CUTOVER_SEALED_CONTROLS_INVALID");
   }
-  if (sealedRow.singleton !== undefined && sealedRow.singleton !== 1 && sealedRow.singleton !== 1n) {
-    fail("CUTOVER_SEALED_CONTROLS_INVALID");
-  }
-  if (sealedRow.schema_version !== undefined && sealedRow.schema_version !== D1_COLLECTION_CONTROLS_SCHEMA_VERSION) {
-    fail("CUTOVER_SEALED_CONTROLS_INVALID");
-  }
+  // The sealed D1 row carries both markers; schema_version is asserted
+  // constant and then dropped. An absent marker is missing evidence.
+  if (sealedRow.singleton !== 1 && sealedRow.singleton !== 1n) fail("CUTOVER_SEALED_CONTROLS_INVALID");
+  if (sealedRow.schema_version !== D1_COLLECTION_CONTROLS_SCHEMA_VERSION) fail("CUTOVER_SEALED_CONTROLS_INVALID");
   const revision = typeof sealedRow.revision === "bigint" ? sealedRow.revision : BigInt(
     Number.isSafeInteger(sealedRow.revision) ? sealedRow.revision : -1);
   if (revision < 1n || revision > BigInt(Number.MAX_SAFE_INTEGER)) fail("CUTOVER_SEALED_CONTROLS_INVALID");
@@ -1586,11 +1708,19 @@ export async function assertCollectionControlsDegradedForImport(client, handle) 
  * Degrade the application collection_controls row for the import with an
  * ordinary UPDATE (no trigger suppression): control_state 'degraded',
  * enrollment and publication off, upload registration, processing, reason
- * and revision at their sealed values.
+ * and revision at their sealed values. A sealed row with neither upload
+ * registration nor processing on (for example 'contained') has no
+ * consistent degraded form: 'degraded' with every flag off is a defect to
+ * the Worker reader and the state/flag CHECK, and the import lane admits
+ * only 'degraded'. That case is refused before any write
+ * (CUTOVER_CONTROLS_DEGRADE_IMPOSSIBLE); the owner re-seals instead.
  */
 export async function degradeCollectionControlsForImport(client, handle) {
   const run = await importingRun(client, handle, "FOR SHARE");
   const sealed = await readSealedControls(client, run.runId);
+  if (sealed.upload_registration_enabled !== true && sealed.processing_enabled !== true) {
+    fail("CUTOVER_CONTROLS_DEGRADE_IMPOSSIBLE");
+  }
   const updated = await q(client, `UPDATE ${quote(handle.primarySchema)}.collection_controls
       SET control_state = 'degraded', enrollment_enabled = false, publication_enabled = false,
           upload_registration_enabled = $1, processing_enabled = $2, revision = $3, reason_code = $4,
@@ -1654,7 +1784,10 @@ function controlRelationName(value) {
   return value;
 }
 
-/** NULL every checkpoint cursor: transfer_checkpoints plus registered tool cursor columns. */
+/**
+ * NULL every checkpoint cursor: transfer_checkpoints of the current run and
+ * of every abandoned run, plus registered tool cursor columns.
+ */
 export async function scrubCheckpointCursors(client, handle, registry = []) {
   const run = await writableRun(client, handle);
   if (!Array.isArray(registry)) fail("CUTOVER_STAGING_REGISTRY_INVALID");
@@ -1671,7 +1804,8 @@ export async function scrubCheckpointCursors(client, handle, registry = []) {
   const scrubbed = [];
   const builtIn = await q(client, `UPDATE ${control("transfer_checkpoints")} SET last_key = NULL
     WHERE run_id = $1 AND last_key IS NOT NULL`, [run.runId]);
-  scrubbed.push(Object.freeze({ relation: "transfer_checkpoints", rows: builtIn.rowCount ?? 0 }));
+  const abandoned = await scrubAbandonedRunCursors(client);
+  scrubbed.push(Object.freeze({ relation: "transfer_checkpoints", rows: (builtIn.rowCount ?? 0) + abandoned }));
   for (const entry of entries) {
     const nullable = rows(await q(client, `SELECT a.attname::text AS name FROM pg_catalog.pg_attribute a
         JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
@@ -1686,9 +1820,7 @@ export async function scrubCheckpointCursors(client, handle, registry = []) {
     if (databaseCount(left?.n) !== 0n) fail("CUTOVER_CHECKPOINT_INVALID", { relation: entry.table });
     scrubbed.push(Object.freeze({ relation: entry.table, rows: result.rowCount ?? 0 }));
   }
-  const [left] = rows(await q(client, `SELECT count(*)::text AS n FROM ${control("transfer_checkpoints")}
-    WHERE run_id = $1 AND last_key IS NOT NULL`, [run.runId]));
-  if (databaseCount(left?.n) !== 0n) fail("CUTOVER_CHECKPOINT_INVALID");
+  await assertNoCheckpointCursors(client);
   return Object.freeze(scrubbed);
 }
 
@@ -1831,14 +1963,33 @@ export async function assertNoTransferUserOwnership(client, handle) {
 // ---------------------------------------------------------------------------
 // Flip readiness and the live lock.
 
-async function assertRoleMembers(client, handle, allowedRoleMembers) {
-  const allowed = new Set([handle.iamDatabaseUser, ...allowedRoleMembers]);
-  const members = rows(await q(client, `SELECT m.rolname::text AS member
+// Besides the transfer login, a member of the schema-owner role or of
+// tibotattle_source_transfer is accepted only when the owner names it
+// (allowedRoleMembers, for example the migration owner that PostgreSQL 16+
+// records as the creator of a role) and its membership is administrative
+// only: it can neither SET ROLE to the role nor inherit its privileges, and
+// it holds no direct grant on the application or control schema.
+async function assertRoleMembers(client, handle, allowedRoleMembers, schema) {
+  const waived = new Set(allowedRoleMembers);
+  const members = rows(await q(client, `SELECT m.rolname::text AS member, am.inherit_option, am.set_option
       FROM pg_catalog.pg_auth_members am
       JOIN pg_catalog.pg_roles r ON r.oid = am.roleid
       JOIN pg_catalog.pg_roles m ON m.oid = am.member
      WHERE r.rolname = ANY($1::text[])`, [[handle.schemaOwnerRole, "tibotattle_source_transfer"]]));
-  if (members.some(row => !allowed.has(row.member))) fail("CUTOVER_FLIP_ROLE_MEMBERS_UNEXPECTED");
+  for (const row of members) {
+    if (row.member === handle.iamDatabaseUser) continue;
+    if (!waived.has(row.member) || row.inherit_option !== false || row.set_option !== false) {
+      fail("CUTOVER_FLIP_ROLE_MEMBERS_UNEXPECTED");
+    }
+  }
+  if (waived.size === 0) return;
+  const [granted] = rows(await q(client, `SELECT count(*)::text AS n
+      FROM pg_catalog.pg_namespace n
+      CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) acl
+      JOIN pg_catalog.pg_roles grantee ON grantee.oid = acl.grantee
+     WHERE n.nspname = ANY($1::text[]) AND grantee.rolname = ANY($2::text[])`,
+  [[schema, TRANSFER_CONTROL_SCHEMA], [...waived]]));
+  if (databaseCount(granted?.n) !== 0n) fail("CUTOVER_FLIP_ROLE_MEMBERS_UNEXPECTED");
 }
 
 async function assertNoRuntimePrivilege(client) {
@@ -1877,27 +2028,35 @@ async function assertUserTriggersEnabled(client, schemas) {
 }
 
 async function assertDatabaseFlipReady(client, handle, allowedRoleMembers, schema) {
-  await assertRoleMembers(client, handle, allowedRoleMembers);
+  await assertRoleMembers(client, handle, allowedRoleMembers, schema);
   await assertNoRuntimePrivilege(client);
   await assertUserTriggersEnabled(client, [schema, TRANSFER_CONTROL_SCHEMA]);
   await assertNoTransferUserOwnership(client, handle);
   await assertControlSchemaAllowlist(client);
 }
 
-function flipOptions({ flipEvidenceSha256, allowedRoleMembers = [] } = {}) {
-  sha256Hex(flipEvidenceSha256, "CUTOVER_FLIP_EVIDENCE_INVALID");
-  if (!Array.isArray(allowedRoleMembers) || allowedRoleMembers.some(member => !ROLE_NAME.test(member))) {
+function flipOptions(options) {
+  if (options === null || typeof options !== "object"
+      || Object.keys(options).some(key => key !== "flipEvidenceSha256" && key !== "allowedRoleMembers")) {
     fail("CUTOVER_TARGET_ARGUMENT_INVALID");
   }
-  return { flipEvidenceSha256, allowedRoleMembers: [...allowedRoleMembers] };
+  const { flipEvidenceSha256, allowedRoleMembers = [] } = options;
+  sha256Hex(flipEvidenceSha256, "CUTOVER_FLIP_EVIDENCE_INVALID");
+  if (!Array.isArray(allowedRoleMembers) || allowedRoleMembers.length > MAX_WAIVED_ROLE_MEMBERS
+      || new Set(allowedRoleMembers).size !== allowedRoleMembers.length
+      || allowedRoleMembers.some(member => typeof member !== "string" || !ROLE_NAME.test(member))) {
+    fail("CUTOVER_TARGET_ARGUMENT_INVALID");
+  }
+  return { flipEvidenceSha256, allowedRoleMembers: Object.freeze([...allowedRoleMembers].sort()) };
 }
 
 /**
- * Flip readiness: a verified run, collection_controls equal to the sealed
- * row, no role member beyond the transfer login and owner-listed members,
- * no privilege on tibotattle_transfer for any other role, every user
- * trigger enabled, nothing owned by the transfer login, and the control
- * schema allowlist, in both databases.
+ * Flip readiness: a verified run with every stage complete, no checkpoint
+ * cursor in any run, collection_controls equal to the sealed row, no role
+ * member beyond the transfer login and owner-named administrative members,
+ * no privilege on tibotattle_transfer for any other role, every user trigger
+ * enabled, nothing owned by the transfer login, and the control schema
+ * allowlist, in both databases. The report names the waived members.
  */
 export async function assertFlipReady(client, handle, options = {}) {
   transactionRole(client, handle, "primary");
@@ -1905,6 +2064,7 @@ export async function assertFlipReady(client, handle, options = {}) {
   const run = await currentRun(client, handle);
   if (run.state !== "verified") fail("CUTOVER_RUN_NOT_VERIFIED");
   await assertAllStagesComplete(client, run);
+  await assertNoCheckpointCursors(client);
   await assertControlsEqualSealed(client, handle, run.runId);
   await assertDatabaseFlipReady(client, handle, allowedRoleMembers, handle.primarySchema);
   await withTransferTransaction(handle, "ledger", async (ledgerClient) => {
@@ -1914,9 +2074,12 @@ export async function assertFlipReady(client, handle, options = {}) {
     }
     await assertDatabaseFlipReady(ledgerClient, handle, allowedRoleMembers, handle.ledgerSchema);
   }, { readOnly: true });
-  return Object.freeze({ runId: run.runId, flipEvidenceSha256, ready: true });
+  return Object.freeze({ runId: run.runId, flipEvidenceSha256, ready: true, waivedRoleMembers: allowedRoleMembers });
 }
 
+// Every table of the control schema carries the enabled-always statement
+// lock, no other relation kind exists, and no role (the owner included)
+// holds CREATE on the schema, so no unlocked relation can be added.
 async function verifyLiveLock(client) {
   const [missing] = rows(await q(client, `SELECT count(*)::text AS n FROM pg_catalog.pg_class c
      WHERE c.relnamespace = $1::regnamespace
@@ -1928,15 +2091,27 @@ async function verifyLiveLock(client) {
               AND t.tgfoid = 'tibotattle_transfer.transfer_target_live_lock_guard()'::regprocedure)))`,
   [TRANSFER_CONTROL_SCHEMA, LIVE_LOCK_TRIGGER]));
   if (databaseCount(missing?.n) !== 0n) fail("CUTOVER_LIVE_LOCK_INCOMPLETE");
+  const [creatable] = rows(await q(client, `SELECT count(*)::text AS n FROM pg_catalog.pg_namespace n
+      CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) acl
+     WHERE n.nspname = $1 AND acl.privilege_type = 'CREATE'`, [TRANSFER_CONTROL_SCHEMA]));
+  if (databaseCount(creatable?.n) !== 0n) fail("CUTOVER_LIVE_LOCK_INCOMPLETE");
   const [locked] = rows(await q(client, `SELECT count(*)::text AS n FROM pg_catalog.pg_class c
     WHERE c.relnamespace = $1::regnamespace AND c.relkind IN ('r', 'p')`, [TRANSFER_CONTROL_SCHEMA]));
   return Number(databaseCount(locked?.n));
 }
 
+// An already-live database is only read back: a relation added after live
+// fails the allowlist or the lock check instead of being adopted.
+async function readBackLiveLock(client) {
+  await assertControlSchemaAllowlist(client);
+  return verifyLiveLock(client);
+}
+
 /**
  * Mark the verified run live after assertFlipReady, then install and verify
  * the whole-schema TRANSFER_TARGET_LIVE lock in both databases. Idempotent
- * for the same flip evidence.
+ * for the same flip evidence: a repeated call on a live database is a
+ * readback that fails closed on any relation added after live.
  */
 export async function markLive(handle, options = {}) {
   const { flipEvidenceSha256, allowedRoleMembers } = flipOptions(options);
@@ -1946,26 +2121,35 @@ export async function markLive(handle, options = {}) {
     const run = await currentRun(client, handle, "FOR UPDATE");
     if (run.state === "live") {
       if (run.flipEvidenceSha256 !== flipEvidenceSha256) fail("CUTOVER_FLIP_EVIDENCE_INVALID");
-    } else {
-      await assertFlipReady(client, handle, { flipEvidenceSha256, allowedRoleMembers });
-      await q(client, `UPDATE ${control("transfer_runs")} SET state = 'live', live_at = clock_timestamp(),
-        flip_evidence_sha256 = $2 WHERE run_id = $1`, [run.runId, flipEvidenceSha256]);
-      const [shared] = rows(await q(client, `SELECT current_database()::text = $1
-          AND to_regclass('tibotattle_transfer.ledger_transfer_runs') IS NOT NULL AS shared`,
-      [handle.ledgerDatabase]));
-      if (shared?.shared === true) {
-        await advanceMirror(client, await currentRun(client, handle));
-      }
+      return readBackLiveLock(client);
+    }
+    await assertFlipReady(client, handle, { flipEvidenceSha256, allowedRoleMembers });
+    await q(client, `UPDATE ${control("transfer_runs")} SET state = 'live', live_at = clock_timestamp(),
+      flip_evidence_sha256 = $2 WHERE run_id = $1`, [run.runId, flipEvidenceSha256]);
+    const [shared] = rows(await q(client, `SELECT current_database()::text = $1
+        AND to_regclass('tibotattle_transfer.ledger_transfer_runs') IS NOT NULL AS shared`,
+    [handle.ledgerDatabase]));
+    if (shared?.shared === true) {
+      await advanceMirror(client, await currentRun(client, handle));
     }
     await q(client, "SELECT tibotattle_transfer.install_transfer_live_lock()");
     return verifyLiveLock(client);
-  });
+  }, { [RUN_CONTROL]: true });
   const liveRun = await withTransferTransaction(handle, "primary", client => currentRun(client, handle),
     { readOnly: true });
+  if (liveRun.state !== "live" || liveRun.flipEvidenceSha256 !== flipEvidenceSha256) {
+    fail("CUTOVER_RUN_STATE_DIVERGED");
+  }
   const ledgerLocked = await withTransferTransaction(handle, "ledger", async (client) => {
+    const mirror = await readRunById(client, "ledger_transfer_runs", liveRun.runId, "FOR UPDATE");
+    if (mirror?.state === "live") {
+      if (mirror.flipEvidenceSha256 !== flipEvidenceSha256) fail("CUTOVER_RUN_STATE_DIVERGED");
+      return readBackLiveLock(client);
+    }
     await advanceMirror(client, liveRun);
+    await assertControlSchemaAllowlist(client);
     await q(client, "SELECT tibotattle_transfer.install_transfer_live_lock()");
     return verifyLiveLock(client);
-  });
+  }, { [RUN_CONTROL]: true });
   return Object.freeze({ runId: liveRun.runId, state: "live", primaryLocked, ledgerLocked });
 }
