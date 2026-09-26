@@ -1,6 +1,12 @@
 {
   "schemaVersion": "tibotattle-production-live-settings-v1",
+  "recordedOn": "2026-09-24",
+  "workerVersion": 152,
+  "workerVersionId": "a2c8a0c4-bedc-48fd-8b01-345b316c02a2",
   "overrides": {
-    "TELEMETRY_STORAGE_MODE": "typed"
+    "TELEMETRY_STORAGE_MODE": {
+      "checkedIn": "json",
+      "live": "typed"
+    }
   }
 }

@@ -16,7 +16,18 @@
  * 'production' service and the 'maintenance-job' and 'analytics-job' jobs;
  * the staging plane mirrors them as 'staging', 'staging-maintenance-job' and
  * 'staging-analytics-job'. Each profile requires only the secrets it consumes
- * (PRODUCTION_PROFILE_SECRET_NAMES) and refuses the others.
+ * (PRODUCTION_PROFILE_SECRET_NAMES) and refuses the others, even when empty.
+ * Job templates and secret mounts therefore render
+ * PRODUCTION_PROFILE_SECRET_NAMES[profile]; REQUIRED_SECRET_NAMES and
+ * OPTIONAL_SECRET_NAMES are the service set (and the Secret Manager
+ * containers), not what every workload mounts.
+ *
+ * Test-target refusal compares resource identities, not name coincidences: a
+ * deployment value equal to the IAM test deployment's service, origin or host,
+ * Cloud SQL instance, schema, runtime identity or bucket is refused in any
+ * setting (testTargetIdentities). The repository's conventional database
+ * names and the test project and region are not identities and are accepted;
+ * the test instances themselves are still refused by name.
  *
  * Staging is synthetic-only by default: it runs the closed admission posture
  * of the checked-in staging Worker (STAGING_CONTAINMENT_VARS and
@@ -44,13 +55,17 @@
  * lives in Worker TypeScript are mirrored here and cross-checked against that
  * source in postgres-production-configuration.check.mjs.
  *
- * Live settings: production (Worker version 152, observed 2026-09-23 and
- * recorded in docs/plans/2026-09-24-gcp-source-integration.md, "Observed
- * production boundary") runs typed telemetry although the checked-in
- * wrangler.jsonc still says json. PRODUCTION_VARS pins 'typed', and
- * production-live-settings.receipt.json records that override so the repo
- * drift check (scripts/cloud-run-production-configuration.check.mjs) can
- * compare everything else with wrangler.jsonc env.production.
+ * Live settings: production (Worker version 152, recorded on 2026-09-24 in
+ * docs/plans/2026-09-24-gcp-source-integration.md, "Observed production
+ * boundary") runs typed telemetry although the checked-in wrangler.jsonc
+ * still says json. PRODUCTION_VARS pins 'typed', and
+ * production-live-settings.receipt.json records that override, the
+ * checked-in value it replaces and the observation's provenance (recording
+ * date, Worker version and version id), so the repo drift check
+ * (scripts/cloud-run-production-configuration.check.mjs) can compare
+ * everything else with wrangler.jsonc env.production. The receipt is
+ * point-in-time evidence: re-observing live production is a deliberate
+ * receipt change.
  */
 
 import {
@@ -305,7 +320,9 @@ export const PRODUCTION_RESOURCE_FINGERPRINT = Object.freeze({
   ]),
   accessAud: PRODUCTION_VARS.ACCESS_AUD,
   identityLinkSecretVersion: PRODUCTION_VARS.IDENTITY_LINK_SECRET_VERSION,
+  // Both OAuth clients: each is the audience its id_tokens are verified against.
   googleOidcClientId: PRODUCTION_VARS.GOOGLE_OIDC_CLIENT_ID,
+  appleServicesId: PRODUCTION_VARS.APPLE_SERVICES_ID,
   appleKeyId: PRODUCTION_VARS.APPLE_KEY_ID,
   // The Cloudflare production Worker, its D1 databases and R2 buckets.
   cloudflareResourceNames: Object.freeze([
@@ -793,16 +810,18 @@ function readSecrets(environment, profile) {
  *   off, 'enabled' is on, and anything else, an empty value included, is a
  *   configuration error.
  * - the publication lane switches (PUBLICATION_LANE, PUBLICATION_LANE_EXTERNAL):
- *   unset, empty or 'disabled' is off and 'enabled' is on. Any other value is
- *   refused, deliberately stricter than the Worker (which treats it as off):
- *   these job-scoped names have no deployed values to stay compatible with,
- *   and a misspelt switch that silently leaves the publication lane off, or
- *   the delivery lane still publishing, is the failure worth stopping.
+ *   exactly 'enabled' is on and every other value, unset included, is off, as
+ *   the Worker's `=== 'enabled'` reads them. A value such as 'true' is never
+ *   a configuration error: it leaves the lane as unset would and never stops
+ *   the job's other lanes (delivery and its erasure step among them).
+ * The configuration and env carry the normalized 'enabled' or 'disabled'.
  */
 function analyticsSwitch(environment, name) {
+  if (name !== "POSTGRES_ANALYTICS_MODE") {
+    return environment.raw(name) === "enabled" ? "enabled" : "disabled";
+  }
   if (!environment.has(name)) return "disabled";
   const value = environment.raw(name);
-  if (value === "" && name !== "POSTGRES_ANALYTICS_MODE") return "disabled";
   if (!SWITCH_VALUES.has(value)) configurationError(`${name}_INVALID`);
   return value;
 }
@@ -1121,6 +1140,8 @@ function readBindings(configuration, options) {
   if (Object.keys(bindings).some((name) => !PRODUCTION_WORKER_BINDING_NAMES.includes(name))) {
     configurationError("PRODUCTION_BINDING_UNEXPECTED");
   }
+  const originTier = new Map(Object.values(configuration.rateLimits.originTier)
+    .map((limits) => [limits.binding, limits]));
   return PRODUCTION_WORKER_BINDING_NAMES.map((name) => {
     if (!Object.prototype.hasOwnProperty.call(bindings, name) || bindings[name] === undefined) {
       configurationError(`${name}_BINDING_MISSING`);
@@ -1132,6 +1153,13 @@ function readBindings(configuration, options) {
     }
     if (EDGE_TIER_RATE_LIMIT_BINDINGS.includes(name) && !isEdgeReplayBinding(binding)) {
       configurationError(`${name}_BINDING_NOT_EDGE_REPLAY`);
+    }
+    // An origin-tier limiter carries its plane's frozen limit and period, as
+    // PostgresRateLimiter exposes them (limitValue, periodSeconds).
+    const limits = originTier.get(name);
+    if (limits !== undefined && (binding.limitValue !== limits.limit
+        || binding.periodSeconds !== limits.periodSeconds)) {
+      configurationError(`${name}_BINDING_LIMIT_MISMATCH`);
     }
     return [name, binding];
   });
@@ -1156,10 +1184,13 @@ function isEdgeReplayBinding(binding) {
 /**
  * Builds the frozen Worker-shaped env from a configuration returned by
  * readProductionConfiguration. Service profiles must inject exactly the six
- * edge-tier replay bindings, the two origin-tier limiters (built with
- * configuration.rateLimits.originTier) and UPLOAD_INGRESS_BUDGET; job
- * profiles take no bindings. The env holds only named keys
- * (configuration.workerEnvKeys) and has a null prototype.
+ * edge-tier replay bindings, the two origin-tier limiters and
+ * UPLOAD_INGRESS_BUDGET; job profiles take no bindings. Each origin-tier
+ * limiter must be built with configuration.rateLimits.originTier (production
+ * or staging, by plane): its limitValue and periodSeconds are compared with
+ * them, and a mismatch is refused with <NAME>_BINDING_LIMIT_MISMATCH. The env
+ * holds only named keys (configuration.workerEnvKeys) and has a null
+ * prototype.
  */
 export function createProductionWorkerEnv(configuration, options = {}) {
   if (!CONFIGURATIONS.has(configuration)) configurationError("PRODUCTION_CONFIGURATION_INVALID");

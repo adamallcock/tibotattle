@@ -7,7 +7,10 @@
  *
  *   - a var equals PRODUCTION_VARS, unless production-live-settings.receipt.json
  *     records a live override, in which case PRODUCTION_VARS carries the live
- *     value and the checked-in value must still differ from it;
+ *     value and the checked-in value must still be the one the receipt
+ *     recorded it replacing (equal to the live value it is stale; anything
+ *     else is base drift). The receipt also records when, and from which
+ *     Worker version, the live value was observed;
  *   - a var may instead be edge-only (it stays with the Cloudflare edge) or
  *     deployment-provided (each deployment supplies and validates it);
  *   - every PRODUCTION_VARS key is in wrangler.jsonc or declared origin-only;
@@ -42,9 +45,14 @@ const TEST_BUILD_PATH = resolve(WORKER_ROOT, "cloud-run/cloudbuild.yaml");
 const PRODUCTION_BUILD_PATH = resolve(WORKER_ROOT, "cloud-run/cloudbuild.production.yaml");
 
 const RECEIPT_SCHEMA = "tibotattle-production-live-settings-v1";
-// The receipt is content-free: setting names and these values only. Widening
-// this set is a deliberate review, not a drift fix.
-const RECEIPT_VALUES = new Set(["typed"]);
+// The receipt is content-free: setting names, these values and the
+// observation's provenance (the date it was recorded, the Worker version and
+// its version id) only. Widening a set is a deliberate review, not a drift fix.
+const RECEIPT_KEYS = "overrides,recordedOn,schemaVersion,workerVersion,workerVersionId";
+const RECEIPT_OVERRIDE_KEYS = "checkedIn,live";
+const RECEIPT_VALUES = new Set(["json", "typed"]);
+const RECEIPT_DATE_PATTERN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/u;
+const RECEIPT_VERSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const PRODUCTION_BUILD_SERVICE_ACCOUNT = "serviceAccount: projects/${PROJECT}/serviceAccounts/${BUILDER_SA}";
 const PRODUCTION_BUILD_IMAGE = "  _IMAGE: ${IMAGE_REPOSITORY}:source-${SOURCE_COMMIT}";
 
@@ -66,19 +74,45 @@ function edgeOnlyVar(name) {
     || configuration.EDGE_ONLY_VAR_PREFIXES.some((prefix) => name.startsWith(prefix));
 }
 
+function calendarDate(value) {
+  if (typeof value !== "string" || !RECEIPT_DATE_PATTERN.test(value)) return false;
+  const date = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
+function receiptOverride(entry) {
+  return isObject(entry) && Object.keys(entry).sort().join() === RECEIPT_OVERRIDE_KEYS
+    && RECEIPT_VALUES.has(entry.checkedIn) && RECEIPT_VALUES.has(entry.live)
+    && entry.checkedIn !== entry.live;
+}
+
+/**
+ * The receipt names each overridden var with the checked-in value it
+ * replaces and the live value, plus when and from which Worker version the
+ * live values were recorded. A malformed override is reported and ignored.
+ */
 function receiptFindings(receipt) {
-  if (!isObject(receipt) || Object.keys(receipt).sort().join() !== "overrides,schemaVersion"
-      || receipt.schemaVersion !== RECEIPT_SCHEMA || !isObject(receipt.overrides)) {
+  if (!isObject(receipt) || Object.keys(receipt).sort().join() !== RECEIPT_KEYS
+      || receipt.schemaVersion !== RECEIPT_SCHEMA || !calendarDate(receipt.recordedOn)
+      || !Number.isSafeInteger(receipt.workerVersion) || receipt.workerVersion < 1
+      || typeof receipt.workerVersionId !== "string"
+      || !RECEIPT_VERSION_ID_PATTERN.test(receipt.workerVersionId)
+      || !isObject(receipt.overrides)) {
     return { findings: ["RECEIPT_INVALID"], overrides: {} };
   }
   const findings = [];
-  for (const [name, value] of Object.entries(receipt.overrides)) {
-    if (!RECEIPT_VALUES.has(value)) findings.push(`RECEIPT_VALUE_INVALID:${name}`);
+  const overrides = {};
+  for (const [name, entry] of Object.entries(receipt.overrides)) {
     if (!Object.hasOwn(configuration.PRODUCTION_VARS, name)) {
       findings.push(`RECEIPT_OVERRIDE_UNKNOWN:${name}`);
     }
+    if (!receiptOverride(entry)) {
+      findings.push(`RECEIPT_VALUE_INVALID:${name}`);
+      continue;
+    }
+    overrides[name] = entry;
   }
-  return { findings, overrides: receipt.overrides };
+  return { findings, overrides };
 }
 
 function varFindings(wranglerVars, overrides) {
@@ -103,8 +137,12 @@ function varFindings(wranglerVars, overrides) {
       continue;
     }
     if (Object.hasOwn(overrides, name)) {
-      if (pinned[name] !== overrides[name]) findings.push(`LIVE_OVERRIDE_MISMATCH:${name}`);
-      if (value === overrides[name]) findings.push(`LIVE_OVERRIDE_STALE:${name}`);
+      const { checkedIn, live } = overrides[name];
+      if (pinned[name] !== live) findings.push(`LIVE_OVERRIDE_MISMATCH:${name}`);
+      // wrangler.jsonc caught up with production: the override must go.
+      if (value === live) findings.push(`LIVE_OVERRIDE_STALE:${name}`);
+      // wrangler.jsonc moved elsewhere: the receipt no longer describes it.
+      else if (value !== checkedIn) findings.push(`LIVE_OVERRIDE_BASE_DRIFT:${name}`);
       continue;
     }
     if (value !== pinned[name]) findings.push(`VAR_DRIFT:${name}`);
@@ -341,10 +379,14 @@ test("the checked-in wrangler.jsonc, receipt and production build pass", async (
   }), []);
 });
 
-test("the receipt records only the live typed-storage override, content-free", () => {
+test("the receipt records only the live typed-storage override and its provenance, content-free", () => {
+  // Re-observing live production is a deliberate change to this pin.
   assert.deepEqual(JSON.parse(RECEIPT_TEXT), {
     schemaVersion: RECEIPT_SCHEMA,
-    overrides: { TELEMETRY_STORAGE_MODE: "typed" },
+    recordedOn: "2026-09-24",
+    workerVersion: 152,
+    workerVersionId: "a2c8a0c4-bedc-48fd-8b01-345b316c02a2",
+    overrides: { TELEMETRY_STORAGE_MODE: { checkedIn: "json", live: "typed" } },
   });
   assert.equal(configuration.PRODUCTION_VARS.TELEMETRY_STORAGE_MODE, "typed");
 });
@@ -498,28 +540,65 @@ test("live overrides come only from the receipt, and a stale or mismatched one f
     wranglerText: doctorProduction(WRANGLER_TEXT,
       "\"TELEMETRY_STORAGE_MODE\": \"json\"", "\"TELEMETRY_STORAGE_MODE\": \"typed\""),
   }), ["LIVE_OVERRIDE_STALE:TELEMETRY_STORAGE_MODE"]);
+  // Any other checked-in change to an overridden var is drift from the receipt.
+  for (const mode of ["synthetic-future-mode", "", "JSON"]) {
+    assert.deepEqual(await driftOfTempCopy({
+      wranglerText: doctorProduction(WRANGLER_TEXT,
+        "\"TELEMETRY_STORAGE_MODE\": \"json\"", `"TELEMETRY_STORAGE_MODE": ${JSON.stringify(mode)}`),
+    }), ["LIVE_OVERRIDE_BASE_DRIFT:TELEMETRY_STORAGE_MODE"], mode);
+  }
   assert.deepEqual(await driftOfTempCopy({
-    receiptText: doctorReceipt((receipt) => { receipt.overrides.ENROLLMENT_MODE = "typed"; }),
-  }), ["LIVE_OVERRIDE_MISMATCH:ENROLLMENT_MODE"]);
+    receiptText: doctorReceipt((receipt) => {
+      receipt.overrides.ENROLLMENT_MODE = { checkedIn: "json", live: "typed" };
+    }),
+  }), ["LIVE_OVERRIDE_BASE_DRIFT:ENROLLMENT_MODE", "LIVE_OVERRIDE_MISMATCH:ENROLLMENT_MODE"]);
   assert.deepEqual(await driftOfTempCopy({
-    receiptText: doctorReceipt((receipt) => { receipt.overrides.TELEMETRY_STORAGE_MODE = "json"; }),
-  }), [
-    "LIVE_OVERRIDE_MISMATCH:TELEMETRY_STORAGE_MODE",
-    "LIVE_OVERRIDE_STALE:TELEMETRY_STORAGE_MODE",
-    "RECEIPT_VALUE_INVALID:TELEMETRY_STORAGE_MODE",
-  ]);
+    receiptText: doctorReceipt((receipt) => {
+      receipt.overrides.TELEMETRY_STORAGE_MODE = { checkedIn: "typed", live: "json" };
+    }),
+  }), ["LIVE_OVERRIDE_MISMATCH:TELEMETRY_STORAGE_MODE", "LIVE_OVERRIDE_STALE:TELEMETRY_STORAGE_MODE"]);
   assert.deepEqual(await driftOfTempCopy({
-    receiptText: doctorReceipt((receipt) => { receipt.overrides.SYNTHETIC_SETTING = "typed"; }),
+    receiptText: doctorReceipt((receipt) => {
+      receipt.overrides.SYNTHETIC_SETTING = { checkedIn: "json", live: "typed" };
+    }),
   }), ["LIVE_OVERRIDE_UNUSED:SYNTHETIC_SETTING", "RECEIPT_OVERRIDE_UNKNOWN:SYNTHETIC_SETTING"]);
+  // A malformed override is reported and ignored, so the pinned typed value drifts.
+  for (const entry of [
+    "typed",
+    { checkedIn: "json", live: "enabled" },
+    { checkedIn: "typed", live: "typed" },
+    { checkedIn: "json" },
+    { checkedIn: "json", live: "typed", note: "synthetic" },
+    null,
+  ]) {
+    assert.deepEqual(await driftOfTempCopy({
+      receiptText: doctorReceipt((receipt) => { receipt.overrides.TELEMETRY_STORAGE_MODE = entry; }),
+    }), [
+      "RECEIPT_VALUE_INVALID:TELEMETRY_STORAGE_MODE",
+      "VAR_DRIFT:TELEMETRY_STORAGE_MODE",
+    ], JSON.stringify(entry));
+  }
+  // Provenance is required and closed.
   for (const receiptText of [
     doctorReceipt((receipt) => { receipt.observedAt = "2026-09-23"; }),
+    doctorReceipt((receipt) => { delete receipt.recordedOn; }),
+    doctorReceipt((receipt) => { receipt.recordedOn = "2026-02-30"; }),
+    doctorReceipt((receipt) => { receipt.recordedOn = "2026-09-24T00:00:00Z"; }),
+    doctorReceipt((receipt) => { delete receipt.workerVersion; }),
+    doctorReceipt((receipt) => { receipt.workerVersion = "152"; }),
+    doctorReceipt((receipt) => { receipt.workerVersion = 0; }),
+    doctorReceipt((receipt) => { receipt.workerVersion = 152.5; }),
+    doctorReceipt((receipt) => { delete receipt.workerVersionId; }),
+    doctorReceipt((receipt) => { receipt.workerVersionId = receipt.workerVersionId.toUpperCase(); }),
+    doctorReceipt((receipt) => { receipt.workerVersionId = "version-152"; }),
     doctorReceipt((receipt) => { receipt.schemaVersion = "v0"; }),
+    doctorReceipt((receipt) => { receipt.overrides = []; }),
     "not json",
   ]) {
     assert.deepEqual(await driftOfTempCopy({ receiptText }), [
       "RECEIPT_INVALID",
       "VAR_DRIFT:TELEMETRY_STORAGE_MODE",
-    ]);
+    ], receiptText);
   }
 });
 
