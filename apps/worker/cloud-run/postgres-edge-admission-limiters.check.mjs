@@ -388,6 +388,54 @@ test("each binding accepts only the key shape and purposes the Worker helpers gi
   await refusedFirstCall("device_sync", "UPLOAD_INGRESS_REQUEST_RATE_LIMIT", global("device_sync"), mismatch);
   await refusedFirstCall("upload_ingress", "ENROLLMENT_RATE_LIMIT", global("upload_ingress"), mismatch);
   await refusedFirstCall("public_aggregate_read", "RECOVERY_RATE_LIMIT", global("public_aggregate_read"), mismatch);
+  // The client-stage attempt and upload bindings are pinned to their own
+  // purposes too. A public read reaches its first call at the client stage, so
+  // only these pins refuse a public read wired to the wrong client binding.
+  await refusedFirstCall("public_aggregate_read", "CLIENT_ATTEMPT_RATE_LIMIT", client("public_aggregate_read"), mismatch);
+  await refusedFirstCall("public_aggregate_read", "UPLOAD_INGRESS_CLIENT_RATE_LIMIT", client("public_aggregate_read"), mismatch);
+  // After an allowed coarse call, the client binding of the other helper
+  // family is refused: an attempt key on the upload client binding and an
+  // upload key on the attempt client binding.
+  async function refusedAfterCoarse(purpose, coarseName, clientName) {
+    const error = await run({ purpose, outcome: "allowed" }, async () => {
+      assert.deepEqual(await bindings[coarseName].limit(global(purpose)), { success: true });
+      return directRefusal(bindings[clientName], client(purpose));
+    });
+    assertReplayRefusal(error, mismatch);
+  }
+  await refusedAfterCoarse("device_sync", "RECOVERY_RATE_LIMIT", "UPLOAD_INGRESS_CLIENT_RATE_LIMIT");
+  await refusedAfterCoarse("enrollment", "ENROLLMENT_RATE_LIMIT", "UPLOAD_INGRESS_CLIENT_RATE_LIMIT");
+  await refusedAfterCoarse("upload_ingress", "UPLOAD_INGRESS_REQUEST_RATE_LIMIT", "CLIENT_ATTEMPT_RATE_LIMIT");
+  // Through the real helpers, a mis-wired client binding answers the 503.
+  const request = originRequest();
+  for (const wrongBinding of ["CLIENT_ATTEMPT_RATE_LIMIT", "UPLOAD_INGRESS_CLIENT_RATE_LIMIT"]) {
+    const outcome = await run(
+      { purpose: "public_aggregate_read", outcome: "allowed" },
+      () => settle(admissionHelpers.assertPublicAggregateReadAllowed(bindings[wrongBinding], request, ORIGIN_ENV)),
+    );
+    await assertWorkerError(outcome.error, 503, "ADMISSION_RATE_LIMIT_UNAVAILABLE");
+  }
+  const attemptOnUploadClient = await run(
+    { purpose: "device_sync", outcome: "allowed" },
+    () => settle(admissionHelpers.assertAttemptAllowed(
+      bindings.RECOVERY_RATE_LIMIT,
+      bindings.UPLOAD_INGRESS_CLIENT_RATE_LIMIT,
+      request,
+      ORIGIN_ENV,
+      "device_sync",
+    )),
+  );
+  await assertWorkerError(attemptOnUploadClient.error, 503, "ADMISSION_RATE_LIMIT_UNAVAILABLE");
+  const uploadOnAttemptClient = await run(
+    { purpose: "upload_ingress", outcome: "allowed" },
+    () => settle(admissionHelpers.assertUploadIngressRequestAllowed(
+      bindings.UPLOAD_INGRESS_REQUEST_RATE_LIMIT,
+      bindings.CLIENT_ATTEMPT_RATE_LIMIT,
+      request,
+      ORIGIN_ENV,
+    )),
+  );
+  await assertWorkerError(uploadOnAttemptClient.error, 503, "UPLOAD_INGRESS_UNAVAILABLE");
   // Purposes outside the contract, including the origin-tier upload
   // authorization, never match any binding.
   await refusedFirstCall("enrollment", "ENROLLMENT_RATE_LIMIT", global("upload_authorization"), mismatch);
@@ -573,9 +621,29 @@ async function edgePolicyAvailable() {
   }
 }
 
+// EP-1's src/edge-admission-policy.ts is required: a missing, renamed or moved
+// module FAILS this test rather than switching it off. The only skip is an
+// explicit pre-integration opt-out for a tree cut before EP-1 merged, which the
+// registered cloud-run `check` script never sets. Setting it in a tree that
+// holds the module also fails, so the opt-out cannot outlive the integration.
+// Remove the opt-out once EP-1 is integrated.
+const EDGE_POLICY_PENDING_FLAG = "TIBOTATTLE_EDGE_ADMISSION_POLICY_PENDING";
+const edgePolicyPresent = await edgePolicyAvailable();
+const edgePolicyPendingOptOut = process.env[EDGE_POLICY_PENDING_FLAG] === "1";
+
 test("replays every EP-1 edge admission policy entry through its own bindings", {
-  skip: !(await edgePolicyAvailable()) && "src/edge-admission-policy.ts (EP-1) is not in this tree",
+  skip: !edgePolicyPresent && edgePolicyPendingOptOut
+    && `${EDGE_POLICY_PENDING_FLAG}=1: src/edge-admission-policy.ts (EP-1) is not integrated yet`,
 }, async () => {
+  assert.ok(
+    edgePolicyPresent,
+    "src/edge-admission-policy.ts (EP-1 EDGE_ADMISSION_BINDINGS and EDGE_ADMISSION_POLICY) is required",
+  );
+  assert.equal(
+    edgePolicyPendingOptOut,
+    false,
+    `${EDGE_POLICY_PENDING_FLAG} is set but EP-1's policy module is present: remove the opt-out`,
+  );
   const policy = await vite.ssrLoadModule("/src/edge-admission-policy.ts");
   assert.deepEqual([...policy.EDGE_ADMISSION_BINDINGS], BINDING_NAMES);
   const { bindings, run } = limiters.createEdgeAdmissionLimiters();

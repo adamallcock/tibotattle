@@ -496,14 +496,16 @@ test("a throw or a non-Response from inner answers a marked Worker 500", async (
 });
 
 test("the verifier reads /api/health and /api/ready on the apex, with no admission", async () => {
+  // The dispatch's own replay instance: its scope is null for the verifier,
+  // so any limiter call inside inner is refused as having no edge outcome.
+  const admission = limiters.createEdgeAdmissionLimiters();
   const { inner, calls } = recordingInner(async (request) => {
-    // The admission scope is null: any limiter call is refused.
-    const limited = await limiters.createEdgeAdmissionLimiters().bindings.ENROLLMENT_RATE_LIMIT
+    const limited = await admission.bindings.ENROLLMENT_RATE_LIMIT
       .limit({ key: "usage-monitor:enrollment:global" })
       .then(() => "resolved", (error) => error.code);
     return Response.json({ path: new URL(request.url).pathname, limited });
   });
-  const dispatch = createDispatch({ inner, verifierServiceAccounts: [VERIFIER, OTHER_ACCOUNT] });
+  const dispatch = createDispatch({ admission, inner, verifierServiceAccounts: [VERIFIER, OTHER_ACCOUNT] });
   for (const [path, email] of [["/api/health", VERIFIER], ["/api/ready", OTHER_ACCOUNT]]) {
     const response = await dispatch(rawRequest({
       method: "GET",
@@ -517,11 +519,11 @@ test("the verifier reads /api/health and /api/ready on the apex, with no admissi
     assert.equal(calls.at(-1).url, `${PUBLIC_ORIGIN}${path}`);
     assert.equal(calls.at(-1).context, undefined, "a verifier carries no edge request id");
     assert.deepEqual(calls.at(-1).headers, [["cookie", "a=b"]]);
+    assert.deepEqual(await response.json(), { path, limited: "EDGE_ADMISSION_REPLAY_NO_OUTCOME" }, path);
   }
   assert.equal(calls[1].url, "https://tibotattle.com/api/ready");
 
-  // The dispatch's own admission scope is null for the verifier.
-  const admission = limiters.createEdgeAdmissionLimiters();
+  // The same holds for a verifier accepted under the default verifier list.
   const scoped = await createDispatch({
     admission,
     inner: async () => {
