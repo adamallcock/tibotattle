@@ -18,7 +18,7 @@ const TIMEOUTS = Object.freeze({
 });
 
 /** Closed inventory of every PostgreSQL primary relation carrying owner_digest
- * at migration 0045. New owner-bearing relations block retirement until they
+ * at migration 0046. New owner-bearing relations block retirement until they
  * receive an explicit deletion or retained-proof decision here.
  */
 const OWNER_DIGEST_TABLES = Object.freeze([
@@ -37,8 +37,14 @@ const OWNER_DIGEST_TABLES = Object.freeze([
   "analytics_scheduler_delivery_cursors",
   "storage_ingestion_changes",
   "storage_owner_erasure_receipts",
+  // Retained tombstone: the owner's journal revision head (see
+  // RETAINED_OWNER_TABLES).
+  "storage_owner_revisions",
   "storage_v11_event_sources",
   "storage_v11_owner_links",
+  // v1.2 publication receipts cascade with the participant; retirement
+  // requires them gone (assertNoResidualOwnerFamilyRows).
+  "storage_v12_event_sources",
   "telemetry_usage_correction_history",
   "typed_v1_event_sources",
 ] as const);
@@ -58,6 +64,7 @@ const SOURCE_OWNER_TABLES = Object.freeze([
   "analytics_publication_owner_members",
   "analytics_scheduler_delivery_cursors",
   "storage_ingestion_changes",
+  "storage_owner_revisions",
 ] as const);
 
 /** Owner-bearing relations that retirement keeps as proof or marks in place. */
@@ -66,6 +73,9 @@ const RETAINED_OWNER_TABLES: ReadonlySet<string> = new Set([
   "analytics_owner_state",
   "analytics_publication_invalidations",
   "storage_ingestion_changes",
+  // The revision head is a retained tombstone derived from the retained
+  // journal; it is never deleted, so it is never residue.
+  "storage_owner_revisions",
 ]);
 
 export type PostgresAnalyticsOwnerRetirementCode =
@@ -395,6 +405,7 @@ async function assertNoResidualOwnerFamilyRows(
   const residuals = parseRows<{ readonly count: string | number }>(await client.query(
     `SELECT
        (SELECT count(*) FROM ${table(schema, "storage_v11_event_sources")} WHERE owner_digest=$1)
+       + (SELECT count(*) FROM ${table(schema, "storage_v12_event_sources")} WHERE owner_digest=$1)
        + (SELECT count(*) FROM ${table(schema, "typed_v1_event_sources")} WHERE owner_digest=$1)
        + (SELECT count(*) FROM ${table(schema, "telemetry_usage_correction_history")}
            WHERE encode(owner_digest,'hex')=$1) AS count`,
