@@ -10,6 +10,8 @@ import { userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { connectCdp, selectMacDashboardTarget, selectMacSettingsTarget, waitFor } from './smoke-electron-macos.mjs';
 import { desktopFirstRunDialogCopy, validateDesktopFirstRunReceipt } from '../apps/electron/desktop-first-run.js';
+import { DESKTOP_SECURE_STORAGE_FAILURE_REASONS, createDesktopSecureStorageDialog } from '../apps/electron/desktop-secure-storage-readiness.js';
+import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC } from '../apps/electron/errors.js';
 import { classifyDesktopSharingInstallation } from '../apps/electron/desktop-sharing-installation.js';
 import { verifySignedStagingLaunchInputs, prepareSignedStagingDisposableProfile, parseSignedStagingConsumerArguments } from './consume-signed-electron-staging.mjs';
 import { macOSLoopbackLaunch, MACOS_LOOPBACK_MODE } from './lib/macos-loopback-qualification.mjs';
@@ -134,8 +136,111 @@ export function interpretSignedStagingNativeIntroResult(value) {
   fail(value === 'unavailable' ? 'native_intro_automation_unavailable' : 'native_intro_unexpected');
 }
 
+// Unlike the general smoke waiter, native-intro failures are terminal. Do not
+// turn an ownership/AX/dialog refusal into a generic timeout with no stage.
+export async function waitForSignedStagingNativeIntro(poll, { now = Date.now, wait = delay } = {}) {
+  const started = now();
+  while (now() - started < STARTUP) {
+    if (interpretSignedStagingNativeIntroResult(await poll())) return;
+    await wait(100);
+  }
+  fail('native_intro_timeout');
+}
+
+const INTRO_COUNT_KEYS = ['windowCount', 'staticTextCount', 'buttonCount', 'checkboxCount'];
+const INTRO_FLAG_KEYS = ['introMessage', 'continueButton', 'quitButton', 'loginCheckbox',
+  'secureStorageRefusal', 'handoverRefusal', 'privacyRefusal'];
+const INTRO_DIAGNOSTIC_KEYS = ['status', ...INTRO_COUNT_KEYS, ...INTRO_FLAG_KEYS];
+function unavailableIntroDiagnostic(status) {
+  return Object.fromEntries([['status', status], ...INTRO_DIAGNOSTIC_KEYS.slice(1).map(key => [key, null])]);
+}
+
+// A closed receipt boundary: never retain arbitrary AX fields or exception data.
+export function sanitizeSignedStagingNativeIntroDiagnostic(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).sort().join() !== [...INTRO_DIAGNOSTIC_KEYS].sort().join()
+    || !['observed', 'automation_unavailable', 'owner_unavailable', 'overflow', 'inspection_failed'].includes(value.status)) return null;
+  if (value.status !== 'observed') {
+    return INTRO_DIAGNOSTIC_KEYS.slice(1).every(key => value[key] === null)
+      ? unavailableIntroDiagnostic(value.status) : null;
+  }
+  if (!INTRO_COUNT_KEYS.every(key => Number.isSafeInteger(value[key]) && value[key] >= 0
+      && value[key] <= (key === 'windowCount' ? 3 : 1500))
+    || !INTRO_FLAG_KEYS.every(key => typeof value[key] === 'boolean')) return null;
+  return Object.fromEntries(INTRO_DIAGNOSTIC_KEYS.map(key => [key, value[key]]));
+}
+
+export function signedStagingNativeIntroDiagnosticScript(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) fail('native_intro_identity');
+  const copies = ['en-US', 'zh-Hans', 'es'].map(locale => {
+    const copy = desktopFirstRunDialogCopy({ production: true, locale });
+    return { message: copy.message, buttons: copy.buttons, checkbox: copy.checkboxLabel,
+      privacyFailure: copy.failureMessage };
+  });
+  const secureStorageMessages = DESKTOP_SECURE_STORAGE_FAILURE_REASONS.map(reason => createDesktopSecureStorageDialog(reason).message);
+  // Exact published 0.1.20 predecessor (ASAR 2b98b1d1...) predates the reason-
+  // specific dialog API. This is diagnosis only, never a dialog action/approval.
+  secureStorageMessages.push('TiboTattle could not complete its secure startup checks.');
+  return `function run() {
+    var countKeys = ${JSON.stringify(INTRO_COUNT_KEYS)};
+    var flagKeys = ${JSON.stringify(INTRO_FLAG_KEYS)};
+    function unavailable(status) {
+      var result = { status: status };
+      countKeys.concat(flagKeys).forEach(function(key) { result[key] = null; });
+      return JSON.stringify(result);
+    }
+    var events = Application('System Events');
+    if (!events.uiElementsEnabled()) return unavailable('automation_unavailable');
+    var matches = events.applicationProcesses.whose({ unixId: ${pid} })();
+    if (matches.length !== 1) return unavailable('owner_unavailable');
+    var windows = matches[0].windows();
+    if (windows.length > 3) return unavailable('overflow');
+    var result = { status: 'observed', windowCount: windows.length };
+    countKeys.slice(1).forEach(function(key) { result[key] = 0; });
+    flagKeys.forEach(function(key) { result[key] = false; });
+    var copies = ${JSON.stringify(copies)};
+    var secureStorageMessages = ${JSON.stringify(secureStorageMessages)};
+    for (var w = 0; w < windows.length; w++) {
+      var elements = windows[w].entireContents();
+      if (elements.length > 500) return unavailable('overflow');
+      var texts = elements.filter(function(e) { return e.role() === 'AXStaticText'; });
+      var buttons = elements.filter(function(e) { return e.role() === 'AXButton'; });
+      var checks = elements.filter(function(e) { return e.role() === 'AXCheckBox'; });
+      result.staticTextCount += texts.length; result.buttonCount += buttons.length;
+      result.checkboxCount += checks.length;
+      function hasText(value) { return texts.some(function(e) { return e.value() === value; }); }
+      result.secureStorageRefusal = result.secureStorageRefusal
+        || secureStorageMessages.some(hasText);
+      result.handoverRefusal = result.handoverRefusal
+        || hasText('TiboTattle could not finish transferring your existing data.');
+      for (var c = 0; c < copies.length; c++) {
+        var copy = copies[c];
+        result.introMessage = result.introMessage || hasText(copy.message);
+        result.privacyRefusal = result.privacyRefusal || hasText(copy.privacyFailure);
+        result.continueButton = result.continueButton || buttons.some(function(e) { return e.name() === copy.buttons[0]; });
+        result.quitButton = result.quitButton || buttons.some(function(e) { return e.name() === copy.buttons[1]; });
+        result.loginCheckbox = result.loginCheckbox || checks.some(function(e) { return e.name() === copy.checkbox; });
+      }
+    }
+    return JSON.stringify(result);
+  }`;
+}
+
+function nativeIntroFailureDiagnostic(state, verified) {
+  const owned = () => !state.stopped() && processTable().some(row => row.pid === state.pid
+    && row.group === state.pid && row.command === verified.executable);
+  try {
+    if (!owned()) return unavailableIntroDiagnostic('owner_unavailable');
+    const result = execFileSync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', signedStagingNativeIntroDiagnosticScript(state.pid)],
+      { encoding: 'utf8', timeout: OPERATION, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] });
+    if (!owned()) return unavailableIntroDiagnostic('owner_unavailable');
+    return sanitizeSignedStagingNativeIntroDiagnostic(JSON.parse(result))
+      ?? unavailableIntroDiagnostic('inspection_failed');
+  } catch { return unavailableIntroDiagnostic('inspection_failed'); }
+}
+
 async function continueNativeIntro(state, verified) {
-  await waitFor(() => {
+  await waitForSignedStagingNativeIntro(() => {
     if (state.stopped()) fail('native_intro_closed');
     const row = processTable().find((entry) => entry.pid === state.pid);
     if (row?.group !== state.pid || row.command !== verified.executable) fail('native_intro_identity');
@@ -144,8 +249,8 @@ async function continueNativeIntro(state, verified) {
       result = execFileSync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', signedStagingNativeIntroScript(state.pid)],
         { encoding: 'utf8', timeout: OPERATION, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
     } catch { fail('native_intro_automation_unavailable'); }
-    return interpretSignedStagingNativeIntroResult(result);
-  }, STARTUP, 'native introduction');
+    return result;
+  });
   state.nativeIntroContinued = true;
 }
 
@@ -153,6 +258,159 @@ export function assertSignedStagingFreshProjection(sharing, receipt) {
   validateDesktopFirstRunReceipt(receipt);
   if (sharing?.enabled !== true || sharing.basis !== 'default_on') fail('fresh_classification');
   return true;
+}
+
+// Direct-child diagnostic only: closed observations, never raw stderr or paths.
+// Message flags identify observed fixed literals, not a proven failure cause.
+const STDERR_SCAN_LIMIT = 64 * 1024;
+const STDERR_MARKERS = Object.freeze({ electronEntryFailure: [ELECTRON_ENTRY_FAILURE_DIAGNOSTIC], sandboxApplyMessage: ['sandbox_apply:'],
+  sandboxInitializationMessage: ['sandbox_init() failed', 'InitializeSandbox() failed'],
+  seatbeltMessage: ['SeatbeltExec:'], operationNotPermitted: ['Operation not permitted'],
+  dynamicLibraryMissing: ['Library not loaded:'],
+  sandboxPolicyDeserializeFailure: ['SandboxSerializer: Failed to deserialize policy:'],
+  sandboxCompiledPolicyFailure: ['SandboxSerializer: Failed to apply compiled policy:'],
+  sandboxSourcePolicyFailure: ['SandboxSerializer: Failed to initialize sandbox with source mode policy:'],
+  machBootstrapCheck: ['bootstrap_check_in '],
+  gpuProcessUnusable: ["GPU process isn't usable. Goodbye."],
+  chromiumFatal: [':FATAL:'], chromiumCheckFailure: ['Check failed:'] });
+const STDERR_NUMBERS = [
+  { key: 'gpuLaunchFailureCodes', prefix: 'GPU process launch failed: error_code=', min: 0, max: 65535 },
+  { key: 'gpuExitCodes', prefix: 'GPU process exited unexpectedly: exit_code=', min: -2147483648, max: 2147483647 },
+  { key: 'posixSpawnErrnos', prefix: 'posix_spawnp(', min: 1, max: 255, path: true },
+];
+const NUMBER_FLAGS = ['Overflow', 'OutOfRange', 'Malformed', 'Partial'];
+// Only fixed-prefix match positions survive between bytes, never path contents.
+function literalMatcher(literal) {
+  const fallback = [0];
+  for (let i = 1, j = 0; i < literal.length; i++) {
+    while (j > 0 && literal[i] !== literal[j]) j = fallback[j - 1];
+    if (literal[i] === literal[j]) j++;
+    fallback[i] = j;
+  }
+  let matched = 0;
+  return {
+    reset: () => { matched = 0; },
+    push(byte) {
+      while (matched > 0 && byte !== literal.charCodeAt(matched)) matched = fallback[matched - 1];
+      if (byte === literal.charCodeAt(matched)) matched++;
+      if (matched !== literal.length) return false;
+      matched = 0;
+      return true;
+    },
+  };
+}
+function observeNumericStderr(observation) {
+  const parsers = STDERR_NUMBERS.map(spec => {
+    const prefix = literalMatcher(spec.prefix), suffix = literalMatcher('): -');
+    let phase = 'prefix', digits = 0, magnitude = 0, negative = false, tooLarge = false;
+    const flag = name => { observation[spec.key + name] = true; };
+    const reset = () => { phase = 'prefix'; prefix.reset(); suffix.reset(); };
+    const startNumber = () => { phase = 'number'; digits = 0; magnitude = 0; negative = false; tooLarge = false; };
+    return {
+      finish: () => { if (phase === 'number' || phase === 'path') flag('Partial'); reset(); },
+      push(byte) {
+        const newline = byte === 10 || byte === 13;
+        if (phase === 'prefix') {
+          if (prefix.push(byte)) { if (spec.path) phase = 'path'; else startNumber(); }
+        } else if (phase === 'path') {
+          // Discard every path byte. A suffix on a different line cannot match.
+          if (newline) { flag('Malformed'); reset(); }
+          else if (suffix.push(byte)) startNumber();
+        } else if (phase === 'skip') {
+          if (newline) reset();
+        } else if (byte >= 48 && byte <= 57) {
+          digits = Math.min(digits + 1, 11);
+          if (digits > 10) tooLarge = true;
+          if (!tooLarge) {
+            magnitude = magnitude * 10 + byte - 48;
+            tooLarge = magnitude > Math.max(Math.abs(spec.min), Math.abs(spec.max));
+          }
+        } else if (byte === 45 && spec.min < 0 && digits === 0 && !negative) {
+          negative = true;
+        } else if (newline || byte === 9 || byte === 32) {
+          const value = negative ? -magnitude : magnitude;
+          if (digits === 0) flag('Malformed');
+          else if (tooLarge || value < spec.min || value > spec.max) flag('OutOfRange');
+          else if (!observation[spec.key].includes(value)) {
+            if (observation[spec.key].length === 8) flag('Overflow');
+            else observation[spec.key].push(value === 0 ? 0 : value);
+          }
+          reset();
+        } else {
+          // A number must end at whitespace, not in a longer arbitrary token.
+          flag('Malformed'); phase = 'skip';
+        }
+      },
+    };
+  });
+  return { push: bytes => { for (const byte of bytes) for (const parser of parsers) parser.push(byte); },
+    finish: () => { for (const parser of parsers) parser.finish(); } };
+}
+const EXIT_SIGNALS = ['SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGILL', 'SIGTRAP', 'SIGABRT', 'SIGBUS',
+  'SIGFPE', 'SIGKILL', 'SIGSEGV', 'SIGPIPE', 'SIGALRM', 'SIGTERM', 'SIGXCPU', 'SIGXFSZ', 'SIGSYS'];
+const EXIT_BOOLEANS = ['exited', 'spawnFailed', 'unknownExitSignal', 'stderrTruncated', 'stderrComplete',
+  ...Object.keys(STDERR_MARKERS), ...STDERR_NUMBERS.flatMap(({ key }) => NUMBER_FLAGS.map(flag => key + flag))];
+export function sanitizeSignedStagingProcessDiagnostic(value) {
+  const keys = ['exitCode', 'exitSignal', 'stderrBytesScanned', ...EXIT_BOOLEANS, ...STDERR_NUMBERS.map(({ key }) => key)];
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype
+    || Reflect.ownKeys(value).some(key => typeof key !== 'string')
+    || Reflect.ownKeys(value).sort().join() !== keys.sort().join()
+    || EXIT_BOOLEANS.some(k => typeof value[k] !== 'boolean')
+    || STDERR_NUMBERS.some(({ key, min, max }) => !Array.isArray(value[key]) || value[key].length > 8
+      || Reflect.ownKeys(value[key]).some(k => typeof k !== 'string')
+      || Reflect.ownKeys(value[key]).sort().join() !== ['length', ...Array.from({ length: value[key].length }, (_, i) => String(i))].sort().join()
+      || value[key].some(n => !Number.isInteger(n) || n < min || n > max)
+      || new Set(value[key]).size !== value[key].length
+      || (value[key + 'Overflow'] && value[key].length !== 8))
+    || !(value.exitCode === null || (Number.isInteger(value.exitCode) && value.exitCode >= 0 && value.exitCode <= 255))
+    || !(value.exitSignal === null || EXIT_SIGNALS.includes(value.exitSignal))
+    || !Number.isInteger(value.stderrBytesScanned) || value.stderrBytesScanned < 0 || value.stderrBytesScanned > STDERR_SCAN_LIMIT
+    || (!value.exited && (value.exitCode !== null || value.exitSignal !== null || value.unknownExitSignal))
+    || (value.exitSignal !== null && value.unknownExitSignal)
+    || (value.stderrTruncated && value.stderrBytesScanned !== STDERR_SCAN_LIMIT)
+    || (value.exitCode !== null && (value.exitSignal !== null || value.unknownExitSignal))) return null;
+  return Object.fromEntries(keys.map(k => [k, Array.isArray(value[k]) ? [...value[k]] : value[k]]));
+}
+export function observeSignedStagingProcess(child) {
+  const observation = { exitCode: null, exitSignal: null, stderrBytesScanned: 0,
+    ...Object.fromEntries(EXIT_BOOLEANS.map(k => [k, false])),
+    ...Object.fromEntries(STDERR_NUMBERS.map(({ key }) => [key, []])) };
+  const numbers = observeNumericStderr(observation);
+  // Only the suffix needed to recognize fixed ASCII literals split across chunks.
+  const overlapBytes = Math.max(...Object.values(STDERR_MARKERS).flat().map(s => s.length)) - 1;
+  let overlap = Buffer.alloc(0), frozen = null;
+  child.once('exit', (code, signal) => {
+    if (frozen) return;
+    observation.exited = true;
+    observation.exitCode = Number.isInteger(code) && code >= 0 && code <= 255 ? code : null;
+    observation.exitSignal = EXIT_SIGNALS.includes(signal) ? signal : null;
+    observation.unknownExitSignal = signal !== null && signal !== undefined && !EXIT_SIGNALS.includes(signal);
+  });
+  child.once('error', () => { if (!frozen) observation.spawnFailed = true; });
+  child.stderr.on('data', chunk => {
+    // Keep draining after the scan bound/failure snapshot without retaining bytes.
+    if (frozen) return;
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const size = Math.min(bytes.length, STDERR_SCAN_LIMIT - observation.stderrBytesScanned);
+    observation.stderrTruncated ||= size < bytes.length;
+    if (size === 0) { overlap = Buffer.alloc(0); return; }
+    numbers.push(bytes.subarray(0, size));
+    const scanned = Buffer.concat([overlap, bytes.subarray(0, size)]);
+    for (const [key, literals] of Object.entries(STDERR_MARKERS)) {
+      observation[key] ||= literals.some(literal => scanned.includes(literal));
+    }
+    observation.stderrBytesScanned += size;
+    overlap = observation.stderrBytesScanned === STDERR_SCAN_LIMIT ? Buffer.alloc(0)
+      : Buffer.from(scanned.subarray(Math.max(0, scanned.length - overlapBytes)));
+  });
+  child.stderr.once('end', () => { if (!frozen) observation.stderrComplete = true; overlap = Buffer.alloc(0); });
+  child.stderr.once('error', () => { overlap = Buffer.alloc(0); });
+  return () => {
+    // Freeze before cleanup; harness SIGTERM/SIGKILL cannot become launch evidence.
+    if (!frozen) { numbers.finish(); frozen = sanitizeSignedStagingProcessDiagnostic(observation); }
+    overlap = Buffer.alloc(0);
+    return frozen === null ? null : sanitizeSignedStagingProcessDiagnostic(frozen);
+  };
 }
 
 async function launch(verified, environment, { untouched = false, onFailure, launchServices = false,
@@ -171,7 +429,8 @@ async function launch(verified, environment, { untouched = false, onFailure, lau
     ? spawn('/usr/bin/open', ['-W', '-n', verified.appPath, '--args', ...argumentsList],
       { cwd: verified.appPath, env: environment, detached: true, stdio: 'ignore' })
     : spawn(direct.executable, direct.args,
-      { cwd: verified.appPath, env: environment, detached: true, stdio: 'ignore' });
+      { cwd: verified.appPath, env: environment, detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
+  const processDiagnostic = launchServices ? null : observeSignedStagingProcess(child);
   let exited = false;
   let spawnFailed = false;
   child.once('exit', () => { exited = true; });
@@ -225,6 +484,8 @@ async function launch(verified, environment, { untouched = false, onFailure, lau
     return state;
   } catch (error) {
     error.signedLaunchStage = launchStage;
+    error.signedProcessDiagnostic = processDiagnostic?.() ?? null;
+    if (launchStage === 'native_intro') error.signedNativeIntroDiagnostic = nativeIntroFailureDiagnostic(state, verified);
     if (onFailure) { try { await onFailure({ pid: state.pid, stage: launchStage }); } catch {} }
     const stopped = await stop(state);
     error.ownedMacProcessesStopped = stopped === true;
