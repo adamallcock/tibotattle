@@ -16,6 +16,7 @@ import {
   projectAdminOverview,
   projectAdminDatabaseHealth,
   projectAdminReconstructionProgress,
+  projectV11EvidenceAdoption,
 } from "../public/admin-client.js";
 
 const fixture = async (name) => JSON.parse(await readFile(
@@ -1287,6 +1288,68 @@ test("admin action projection rejects malformed successful responses", () => {
     (error) => error instanceof AdminResponseError
       && error.code === "ADMIN_ACTION_INVALID",
   );
+});
+
+function v11AdoptionPage(result = {}) {
+  return {
+    schemaVersion: "admin-action-v0.1",
+    action: "run_maintenance",
+    result: {
+      task: "v11_evidence_adoption",
+      method: "v11-uploaded-evidence-adoption-1",
+      dryRun: true,
+      examined: 3,
+      outcomes: {
+        adopted: 0, adoptable: 2, unchanged: 0, authority_unavailable: 0, client_syncing: 1,
+        successor_active: 0, unsupported_history: 0, no_contiguous_days: 0, refused: 0,
+      },
+      refusals: {},
+      daysCovered: 9,
+      newDays: 7,
+      keptAcceptedDays: 1,
+      nextAfterParticipantId: null,
+      operationId: "00000000-0000-4000-8000-000000000000",
+      ...result,
+    },
+  };
+}
+
+test("stranded upload adoption pages project closed counts and a paging cursor only", () => {
+  const page = projectV11EvidenceAdoption(v11AdoptionPage({
+    nextAfterParticipantId: "participant:00000000-0000-4000-8000-000000000001",
+    refusals: { TELEMETRY_COMPATIBILITY_PROOF_UNAVAILABLE: 1 },
+  }), true);
+  assert.deepEqual({ ...page, outcomes: { ...page.outcomes }, refusals: { ...page.refusals } }, {
+    dryRun: true, examined: 3,
+    outcomes: {
+      adopted: 0, adoptable: 2, unchanged: 0, authority_unavailable: 0, client_syncing: 1,
+      successor_active: 0, unsupported_history: 0, no_contiguous_days: 0, refused: 0,
+    },
+    refusals: { TELEMETRY_COMPATIBILITY_PROOF_UNAVAILABLE: 1 },
+    daysCovered: 9, newDays: 7, keptAcceptedDays: 1,
+    nextAfterParticipantId: "participant:00000000-0000-4000-8000-000000000001",
+  });
+  assert.equal(Object.hasOwn(page, "operationId"), false);
+  const outcomes = v11AdoptionPage().result.outcomes;
+  const { refused: _omitted, ...missingOutcome } = outcomes;
+  for (const [change, dryRun] of [
+    [{}, false],
+    [{ task: "participant_erasure" }, true],
+    [{ method: "v11-uploaded-evidence-adoption-2" }, true],
+    [{ examined: -1 }, true],
+    [{ newDays: 1.5 }, true],
+    [{ outcomes: missingOutcome }, true],
+    [{ outcomes: { ...outcomes, invented: 0 } }, true],
+    [{ refusals: { "not a code": 1 } }, true],
+    [{ refusals: { TELEMETRY_MANIFEST_CONFLICT: 0 } }, true],
+    [{ nextAfterParticipantId: "participant with spaces" }, true],
+    [{ nextAfterParticipantId: 7 }, true],
+  ]) {
+    assert.throws(() => projectV11EvidenceAdoption(v11AdoptionPage(change), dryRun),
+      (error) => error instanceof AdminResponseError && error.code === "ADMIN_ACTION_INVALID", JSON.stringify(change));
+  }
+  assert.throws(() => projectV11EvidenceAdoption({ ...v11AdoptionPage(), action: "sync_distribution" }, true),
+    /ADMIN_ACTION_INVALID/u);
 });
 
 test("admin action conflicts explain that the displayed revision is stale", async () => {

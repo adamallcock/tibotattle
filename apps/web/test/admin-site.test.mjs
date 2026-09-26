@@ -1875,6 +1875,177 @@ test("maintenance incomplete and already-running responses do not claim completi
   });
 });
 
+function adoptionPage(dryRun, outcomes, nextAfterParticipantId = null, extra = {}) {
+  return {
+    schemaVersion: "admin-action-v0.1",
+    action: "run_maintenance",
+    result: {
+      task: "v11_evidence_adoption",
+      method: "v11-uploaded-evidence-adoption-1",
+      dryRun,
+      examined: Object.values(outcomes).reduce((sum, value) => sum + value, 0),
+      outcomes: {
+        adopted: 0, adoptable: 0, unchanged: 0, authority_unavailable: 0, client_syncing: 0,
+        successor_active: 0, unsupported_history: 0, no_contiguous_days: 0, refused: 0, ...outcomes,
+      },
+      refusals: {},
+      daysCovered: 0,
+      newDays: 0,
+      keptAcceptedDays: 0,
+      nextAfterParticipantId,
+      operationId: "00000000-0000-4000-8000-000000000000",
+      ...extra,
+    },
+  };
+}
+
+function pageMentions(documentRef, value) {
+  return [...documentRef.byId.values()].flatMap(descendantNodes).some((node) =>
+    node.textContent.includes(value) || [...node.attributes.values()].some((attribute) => attribute.includes(value)));
+}
+
+test("stranded upload preview pages every device, keeps the cursor off the page and gates activation", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const cursor = "participant:00000000-0000-4000-8000-00000000000a";
+  const bodies = [];
+  await withAdminPage(async (path, init) => {
+    if (init.method !== "POST") return healthyAdminRead(path, overview);
+    assert.equal(path, "/api/v1/admin/action");
+    const body = JSON.parse(init.body);
+    bodies.push(body);
+    const { dryRun, afterParticipantId } = body.v11EvidenceAdoption;
+    return response(afterParticipantId === null
+      ? adoptionPage(dryRun, { [dryRun ? "adoptable" : "adopted"]: 2, client_syncing: 1 }, cursor, { daysCovered: 6, newDays: 5 })
+      : adoptionPage(dryRun, { [dryRun ? "adoptable" : "adopted"]: 1, successor_active: 1 }, null,
+        { daysCovered: 2, newDays: 2, keptAcceptedDays: 1 }));
+  }, async documentRef => {
+    await waitFor(() => documentRef.byId.get("preview-v11-adoption").disabled === false);
+    const apply = documentRef.byId.get("apply-v11-adoption");
+    assert.equal(apply.disabled, true);
+    await apply.listeners.get("click")();
+    assert.deepEqual(bodies, []);
+
+    await documentRef.byId.get("preview-v11-adoption").listeners.get("click")();
+    assert.deepEqual(bodies.map((body) => body.v11EvidenceAdoption), [
+      { dryRun: true, maxDevices: 25, afterParticipantId: null },
+      { dryRun: true, maxDevices: 25, afterParticipantId: cursor },
+    ]);
+    assert.deepEqual(bodies.map((body) => body.action), ["run_maintenance", "run_maintenance"]);
+    assert.equal(documentRef.byId.get("v11-adoption-status").textContent,
+      "Preview: 3 devices can be activated, adding 7 new days. Nothing was changed.");
+    assert.deepEqual(tableTexts(documentRef, "v11-adoption-rows"), [
+      ["Devices examined", "5"], ["Can be activated", "3"], ["Syncing now, left to the app", "1"],
+      ["On v1.2, left to the app", "1"], ["Days covered", "8"], ["New days", "7"], ["Accepted days kept", "1"],
+    ]);
+    assert.equal(documentRef.byId.get("v11-adoption-summary").hidden, false);
+    assert.equal(apply.disabled, false);
+    assert.equal(apply.textContent, "Activate 3 devices");
+    assert.equal(pageMentions(documentRef, cursor), false);
+
+    await apply.listeners.get("click")();
+    assert.deepEqual(bodies.slice(2).map((body) => body.v11EvidenceAdoption), [
+      { dryRun: false, maxDevices: 25, afterParticipantId: null },
+      { dryRun: false, maxDevices: 25, afterParticipantId: cursor },
+    ]);
+    assert.equal(documentRef.byId.get("v11-adoption-status").textContent,
+      "Activated 3 devices, adding 7 new days. 2 examined devices left unchanged; see the table.");
+    assert.deepEqual(tableTexts(documentRef, "v11-adoption-rows").slice(0, 2), [["Devices examined", "5"], ["Activated", "3"]]);
+    assert.equal(apply.disabled, true);
+    assert.equal(apply.textContent, "Activate previewed devices");
+    assert.equal(pageMentions(documentRef, cursor), false);
+    // One preview authorizes one activation.
+    await apply.listeners.get("click")();
+    assert.equal(bodies.length, 4);
+  });
+});
+
+test("a failed stranded-upload activation reports what completed and needs a new preview", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  let refuse = false;
+  await withAdminPage(async (path, init) => {
+    if (init.method !== "POST") return healthyAdminRead(path, overview);
+    if (refuse) return { ok: false, status: 403, async json() { return { error: { code: "ADMIN_FORBIDDEN" } }; } };
+    const { dryRun, afterParticipantId } = JSON.parse(init.body).v11EvidenceAdoption;
+    if (dryRun) return response(adoptionPage(true, { adoptable: 4 }, null, { newDays: 4, daysCovered: 4 }));
+    return afterParticipantId === null
+      ? response(adoptionPage(false, { adopted: 2 }, "participant:00000000-0000-4000-8000-00000000000b", { newDays: 2, daysCovered: 2 }))
+      : unavailableResponse();
+  }, async documentRef => {
+    await waitFor(() => documentRef.byId.get("preview-v11-adoption").disabled === false);
+    const status = documentRef.byId.get("v11-adoption-status");
+    const apply = documentRef.byId.get("apply-v11-adoption");
+    await documentRef.byId.get("preview-v11-adoption").listeners.get("click")();
+    assert.equal(apply.textContent, "Activate 4 devices");
+    await apply.listeners.get("click")();
+    assert.equal(status.textContent,
+      "Activation stopped after 1 page: INTERNAL_ERROR. Activated 2 devices, adding 2 new days. Running it again is safe.");
+    assert.deepEqual(tableTexts(documentRef, "v11-adoption-rows").slice(0, 2), [["Devices examined", "2"], ["Activated", "2"]]);
+    assert.equal(apply.disabled, true);
+
+    refuse = true;
+    await documentRef.byId.get("preview-v11-adoption").listeners.get("click")();
+    assert.equal(status.textContent, "Owner access is unavailable. Sign in again before previewing.");
+    assert.equal(documentRef.byId.get("v11-adoption-summary").hidden, true);
+    assert.deepEqual(tableTexts(documentRef, "v11-adoption-rows"), []);
+    assert.equal(documentRef.byId.get("preview-v11-adoption").disabled, true);
+  });
+});
+
+test("a stranded-upload preview older than fifteen minutes cannot authorize activation", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const writes = [];
+  const realNow = Date.now;
+  let now = realNow();
+  Date.now = () => now;
+  try {
+    await withAdminPage(async (path, init) => {
+      if (init.method !== "POST") return healthyAdminRead(path, overview);
+      const { dryRun } = JSON.parse(init.body).v11EvidenceAdoption;
+      writes.push(dryRun);
+      return response(adoptionPage(dryRun, { [dryRun ? "adoptable" : "adopted"]: 1 }));
+    }, async documentRef => {
+      await waitFor(() => documentRef.byId.get("preview-v11-adoption").disabled === false);
+      await documentRef.byId.get("preview-v11-adoption").listeners.get("click")();
+      const apply = documentRef.byId.get("apply-v11-adoption");
+      assert.equal(apply.disabled, false);
+      now += 15 * 60 * 1_000 + 1;
+      await apply.listeners.get("click")();
+      assert.deepEqual(writes, [true]);
+      assert.equal(documentRef.byId.get("v11-adoption-status").textContent,
+        "The preview is more than 15 minutes old. Preview again before activating.");
+      assert.equal(apply.disabled, true);
+      assert.equal(documentRef.byId.get("v11-adoption-summary").hidden, true);
+    });
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+test("stranded-upload audit entries say what ran instead of a maintenance pass", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const details = (dryRun, outcomes) => ({
+    task: "v11_evidence_adoption", method: "v11-uploaded-evidence-adoption-1", dryRun, maxDevices: 25, examined: 4,
+    outcomes: { ...adoptionPage(dryRun, outcomes).result.outcomes }, refusals: {}, daysCovered: 9, newDays: 7, keptAcceptedDays: 1,
+  });
+  overview.audit = [
+    { action: "run_maintenance", outcome: "success", details: details(false, { adopted: 3, unchanged: 1 }), createdAt: "2026-08-02T11:02:00.000Z" },
+    { action: "run_maintenance", outcome: "success", details: details(true, { adoptable: 3, unchanged: 1 }), createdAt: "2026-08-02T11:01:00.000Z" },
+    { action: "run_maintenance", outcome: "failure", details: { task: "v11_evidence_adoption", code: "BACKEND_STORAGE_UNAVAILABLE" }, createdAt: "2026-08-02T11:00:00.000Z" },
+  ];
+  await withAdminPage(async (path) => healthyAdminRead(path, overview), async documentRef => {
+    await waitFor(() => documentRef.byId.get("audit-rows").children.length === 3);
+    const rows = documentRef.byId.get("audit-rows").children;
+    assertInfoHint(rows[0].children[0].children[0], "Stranded upload activation");
+    assert.deepEqual(rows.map((row) => [
+      row.children[1].children[0].children[0].textContent, row.children[2].children[0].textContent,
+    ]), [
+      ["Completed", "Activated 3 of 4 examined devices, adding 7 new days."],
+      ["Previewed", "Previewed 4 examined devices; 3 could be activated."],
+      ["Failed", "The pass failed with result code BACKEND_STORAGE_UNAVAILABLE."],
+    ]);
+  });
+});
+
 test("unavailable overview prevents actions and transient history failures are visibly stale", async () => {
   const overview = await fixture("admin-overview-valid.json");
   let unavailable = false;
@@ -1889,7 +2060,7 @@ test("unavailable overview prevents actions and transient history failures are v
     await documentRef.byId.get("refresh").listeners.get("click")();
     assert.equal(documentRef.byId.get("growth-cards").children[0], graph);
     assert.match(documentRef.byId.get("growth-status").textContent, /Refresh failed · history through/u);
-    for (const id of ["controls-fields", "save-controls", "run-maintenance", "sync-distribution"]) assert.equal(documentRef.byId.get(id).disabled, true, id);
+    for (const id of ["controls-fields", "save-controls", "run-maintenance", "sync-distribution", "preview-v11-adoption", "apply-v11-adoption"]) assert.equal(documentRef.byId.get(id).disabled, true, id);
     await documentRef.byId.get("run-maintenance").listeners.get("click")();
     assert.deepEqual(writes, []);
     assert.equal(documentRef.byId.get("operator-attention-badge").textContent, "Stale · refresh unavailable");
