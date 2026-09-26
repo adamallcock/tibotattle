@@ -47,8 +47,14 @@ ALTER TABLE retention_state
     CONSTRAINT retention_state_schema_version_check
       CHECK (schema_version = 'backend-retention-v0.1'),
   -- (6) The maintenance-cycle marker shared with the reconciliation row, and
-  -- the quarantine cutoff of the last completed pass.
-  ADD COLUMN maintenance_run_at timestamptz,
+  -- the quarantine cutoff of the last completed pass. Readiness compares the
+  -- two markers as canonical ISO millisecond strings (Worker handleReady), so
+  -- a marker holds whole milliseconds: rendering it is then lossless and two
+  -- different cycles can never render as the same instant. Writers stamp
+  -- ISO(scheduledTime); a sub-millisecond SQL clock value is refused.
+  ADD COLUMN maintenance_run_at timestamptz
+    CONSTRAINT retention_state_maintenance_run_at_ms_check
+      CHECK (maintenance_run_at = date_trunc('milliseconds', maintenance_run_at, 'UTC')),
   ADD COLUMN quarantine_cutoff_at timestamptz,
   -- (7) The only lifecycle failure code.
   ADD CONSTRAINT retention_state_failure_code_check
@@ -86,7 +92,10 @@ CREATE TABLE quarantine_reconciliation_state (
       CHECK (state IN ('never_run', 'running', 'completed', 'failed')),
   last_started_at timestamptz,
   last_completed_at timestamptz,
-  maintenance_run_at timestamptz,
+  -- The cycle marker holds whole milliseconds, as retention_state's does.
+  maintenance_run_at timestamptz
+    CONSTRAINT quarantine_reconciliation_state_maintenance_run_at_ms_check
+      CHECK (maintenance_run_at = date_trunc('milliseconds', maintenance_run_at, 'UTC')),
   cutoff_at timestamptz,
   lease_id text,
   registrations_examined bigint NOT NULL DEFAULT 0

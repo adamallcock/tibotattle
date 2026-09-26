@@ -40,6 +40,17 @@ const RECONCILIATION_KEYS = Object.freeze([
   "registrationsExamined", "orphanObjectsDeleted", "referencedObjectsPreserved",
   "reconciliationComplete", "failureCode",
 ]);
+/** What the readers return for the fresh-deploy (default) singleton rows. */
+const FRESH_RETENTION = Object.freeze({
+  state: "never_run", lastStartedAt: null, lastCompletedAtMs: null, maintenanceRunAtIso: null,
+  quarantineCutoffAt: null, quarantineObjectsDeleted: 0, quarantineRetentionComplete: true,
+  restoredParticipantsSuppressed: 0, restoreReplayComplete: true, failureCode: null,
+});
+const FRESH_RECONCILIATION = Object.freeze({
+  state: "never_run", lastStartedAt: null, lastCompletedAt: null, maintenanceRunAtIso: null,
+  cutoffAt: null, registrationsExamined: 0, orphanObjectsDeleted: 0, referencedObjectsPreserved: 0,
+  reconciliationComplete: false, failureCode: null,
+});
 
 const SOCKET_DIRECTORY = /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u;
 
@@ -311,6 +322,13 @@ test("retention_state enforces the Worker failure, cycle, lease, counter and ver
   // No completed-has-time constraint: readiness reports such a row as stale.
   await update("state='completed', failure_code=NULL, last_completed_at=NULL, maintenance_run_at='2026-09-24T10:05:00Z'");
 
+  // Two instants inside one millisecond would render as the same cycle
+  // marker, so the marker holds whole milliseconds.
+  for (const value of ["2026-09-24T23:59:59.123001Z", "2026-09-24T23:59:59.123999Z"]) {
+    await refuses(update(`maintenance_run_at='${value}'`), "23514", "retention_state_maintenance_run_at_ms_check");
+  }
+  await update("maintenance_run_at='2026-09-24T23:59:59.123Z'");
+
   await refuses(update("lease_id='synthetic-maintenance-lease'"), "23514", "retention_state_lease_pair_check");
   await refuses(update("lease_expires_at='2026-09-24T10:20:00Z'"), "23514", "retention_state_lease_pair_check");
   await update("lease_id='synthetic-maintenance-lease', lease_expires_at='2026-09-24T10:20:00Z'");
@@ -340,20 +358,23 @@ test("quarantine_reconciliation_state is one never_run singleton with a running-
       ORDER BY ordinal_position`,
     [schema],
   );
-  assert.deepEqual(columns.rows.map(({ column_name, data_type, is_nullable }) => [column_name, data_type, is_nullable]), [
-    ["singleton", "integer", "NO"],
-    ["schema_version", "text", "NO"],
-    ["state", "text", "NO"],
-    ["last_started_at", "timestamp with time zone", "YES"],
-    ["last_completed_at", "timestamp with time zone", "YES"],
-    ["maintenance_run_at", "timestamp with time zone", "YES"],
-    ["cutoff_at", "timestamp with time zone", "YES"],
-    ["lease_id", "text", "YES"],
-    ["registrations_examined", "bigint", "NO"],
-    ["orphan_objects_deleted", "bigint", "NO"],
-    ["referenced_objects_preserved", "bigint", "NO"],
-    ["reconciliation_complete", "boolean", "NO"],
-    ["failure_code", "text", "YES"],
+  // D1 0013 defaults: never_run, zero counters and an incomplete
+  // reconciliation, so a row rebuilt without a column never reads as done.
+  assert.deepEqual(columns.rows.map(({ column_name, data_type, is_nullable, column_default }) =>
+    [column_name, data_type, is_nullable, column_default]), [
+    ["singleton", "integer", "NO", null],
+    ["schema_version", "text", "NO", null],
+    ["state", "text", "NO", "'never_run'::text"],
+    ["last_started_at", "timestamp with time zone", "YES", null],
+    ["last_completed_at", "timestamp with time zone", "YES", null],
+    ["maintenance_run_at", "timestamp with time zone", "YES", null],
+    ["cutoff_at", "timestamp with time zone", "YES", null],
+    ["lease_id", "text", "YES", null],
+    ["registrations_examined", "bigint", "NO", "0"],
+    ["orphan_objects_deleted", "bigint", "NO", "0"],
+    ["referenced_objects_preserved", "bigint", "NO", "0"],
+    ["reconciliation_complete", "boolean", "NO", "false"],
+    ["failure_code", "text", "YES", null],
   ], "D1 cursor columns are omitted");
 
   const seeded = await pool.query(
@@ -401,6 +422,11 @@ test("quarantine_reconciliation_state is one never_run singleton with a running-
   }
   await refuses(update("schema_version='quarantine-reconciliation-v0.2'"), "23514",
     "quarantine_reconciliation_state_schema_version_check");
+  for (const value of ["2026-09-24T23:59:59.123001Z", "2026-09-24T23:59:59.123999Z"]) {
+    await refuses(update(`maintenance_run_at='${value}'`), "23514",
+      "quarantine_reconciliation_state_maintenance_run_at_ms_check");
+  }
+  await update("maintenance_run_at='2026-09-24T23:59:59.123Z'");
 }));
 
 test("readers render ms-Z instants under a hostile session and return null for absent rows", {
@@ -409,42 +435,41 @@ test("readers render ms-Z instants under a hostile session and return null for a
   const lifecycle = await workerModule(MODULE);
   const { withPostgresRead } = await workerModule(CLIENT_MODULE);
   const options = { primarySchema: schema, ledgerSchema: `${schema}_ledger` };
-
-  // The fresh-deploy rows.
-  const fresh = await inHostileTransaction(pool, async (client) => ({
+  const readBoth = () => inHostileTransaction(pool, async (client) => ({
     retention: await lifecycle.readPostgresRetentionState(client, options),
     reconciliation: await lifecycle.readPostgresQuarantineReconciliationState(client, options),
   }));
+
+  // The fresh-deploy rows.
+  const fresh = await readBoth();
   assert.deepEqual(Object.keys(fresh.retention), RETENTION_KEYS);
-  assert.deepEqual(fresh.retention, {
-    state: "never_run", lastStartedAt: null, lastCompletedAtMs: null, maintenanceRunAtIso: null,
-    quarantineCutoffAt: null, quarantineObjectsDeleted: 0, quarantineRetentionComplete: true,
-    restoredParticipantsSuppressed: 0, restoreReplayComplete: true, failureCode: null,
-  });
+  assert.deepEqual(fresh.retention, FRESH_RETENTION);
   assert.deepEqual(Object.keys(fresh.reconciliation), RECONCILIATION_KEYS);
-  assert.deepEqual(fresh.reconciliation, {
-    state: "never_run", lastStartedAt: null, lastCompletedAt: null, maintenanceRunAtIso: null,
-    cutoffAt: null, registrationsExamined: 0, orphanObjectsDeleted: 0, referencedObjectsPreserved: 0,
-    reconciliationComplete: false, failureCode: null,
-  });
+  assert.deepEqual(fresh.reconciliation, FRESH_RECONCILIATION);
   assert.ok(Object.isFrozen(fresh.retention) && Object.isFrozen(fresh.reconciliation));
   assert.equal(lifecycle.maintenanceCyclesMatch(fresh.retention.maintenanceRunAtIso,
     fresh.reconciliation.maintenanceRunAtIso), false, "two absent markers never match");
 
-  // Microsecond instants near a UTC day boundary; Kiritimati is UTC+14.
+  // Microsecond instants near a UTC day boundary; Kiritimati is UTC+14. The
+  // shared cycle marker is a whole-millisecond run start that differs from
+  // every other instant in either row (the Worker also stamps last_started_at
+  // with it), so a reader that returns the wrong column fails.
+  const cycle = "2026-09-24T23:58:00.456Z";
   await pool.query(
     `UPDATE ${table("retention_state")}
         SET state='completed', last_started_at='2026-09-24T23:50:00.000001Z',
-            last_completed_at='2026-09-24T23:59:59.123456Z', maintenance_run_at='2026-09-24T23:59:59.123456Z',
+            last_completed_at='2026-09-24T23:59:59.123456Z', maintenance_run_at=$1,
             quarantine_cutoff_at='2026-09-23T23:59:59.999999Z', quarantine_objects_deleted=9007199254740991,
             restored_participants_suppressed=4, quarantine_retention_complete=false, restore_replay_complete=true`,
+    [cycle],
   );
   await pool.query(
     `UPDATE ${table("quarantine_reconciliation_state")}
         SET state='completed', last_started_at='2026-09-24T23:55:00.5Z', last_completed_at='2026-09-24T23:59:59.9999Z',
-            maintenance_run_at='2026-09-24T23:59:59.123456Z', cutoff_at='2026-09-24T22:59:59.123456Z',
+            maintenance_run_at=$1, cutoff_at='2026-09-24T22:59:59.123456Z',
             registrations_examined=12, orphan_objects_deleted=5, referenced_objects_preserved=7,
             reconciliation_complete=true`,
+    [cycle],
   );
   const hostile = await inHostileTransaction(pool, async (client) => {
     const control = await client.query(`SELECT last_completed_at::text AS text FROM ${table("retention_state")}`);
@@ -459,7 +484,7 @@ test("readers render ms-Z instants under a hostile session and return null for a
     state: "completed",
     lastStartedAt: "2026-09-24T23:50:00.000Z",
     lastCompletedAtMs: Date.parse("2026-09-24T23:59:59.123Z"),
-    maintenanceRunAtIso: "2026-09-24T23:59:59.123Z",
+    maintenanceRunAtIso: cycle,
     quarantineCutoffAt: "2026-09-23T23:59:59.999Z",
     quarantineObjectsDeleted: Number.MAX_SAFE_INTEGER,
     quarantineRetentionComplete: false,
@@ -471,7 +496,7 @@ test("readers render ms-Z instants under a hostile session and return null for a
     state: "completed",
     lastStartedAt: "2026-09-24T23:55:00.500Z",
     lastCompletedAt: "2026-09-24T23:59:59.999Z",
-    maintenanceRunAtIso: "2026-09-24T23:59:59.123Z",
+    maintenanceRunAtIso: cycle,
     cutoffAt: "2026-09-24T22:59:59.123Z",
     registrationsExamined: 12,
     orphanObjectsDeleted: 5,
@@ -490,20 +515,53 @@ test("readers render ms-Z instants under a hostile session and return null for a
   assert.deepEqual(bounded, hostile);
 
   // A one-millisecond cycle difference does not match.
-  await pool.query(`UPDATE ${table("quarantine_reconciliation_state")} SET maintenance_run_at='2026-09-24T23:59:59.124Z'`);
+  await pool.query(`UPDATE ${table("quarantine_reconciliation_state")} SET maintenance_run_at='2026-09-24T23:58:00.457Z'`);
   const shifted = await withPostgresRead(pool, (client) =>
     lifecycle.readPostgresQuarantineReconciliationState(client, options));
-  assert.equal(shifted.maintenanceRunAtIso, "2026-09-24T23:59:59.124Z");
+  assert.equal(shifted.maintenanceRunAtIso, "2026-09-24T23:58:00.457Z");
   assert.equal(lifecycle.maintenanceCyclesMatch(hostile.retention.maintenanceRunAtIso, shifted.maintenanceRunAtIso), false);
+
+  // Every Worker run state reads back with its failure code. A running pass
+  // holds its lease and keeps the prior marker; a failed lifecycle pass has
+  // cleared its marker (retention.ts), a failed reconciliation keeps its own.
+  await pool.query(
+    `UPDATE ${table("retention_state")}
+        SET state='running', lease_id='synthetic-maintenance-lease', lease_expires_at='2026-09-25T00:13:00Z'`,
+  );
+  await pool.query(
+    `UPDATE ${table("quarantine_reconciliation_state")}
+        SET state='running', lease_id='synthetic-reconciliation-lease', maintenance_run_at=$1,
+            reconciliation_complete=false`,
+    [cycle],
+  );
+  const running = await readBoth();
+  assert.deepEqual(running.retention, { ...hostile.retention, state: "running" });
+  assert.deepEqual(running.reconciliation, { ...hostile.reconciliation, state: "running", reconciliationComplete: false });
+
+  await pool.query(
+    `UPDATE ${table("retention_state")}
+        SET state='failed', maintenance_run_at=NULL, failure_code='LIFECYCLE_PASS_FAILED',
+            lease_id=NULL, lease_expires_at=NULL`,
+  );
+  await pool.query(
+    `UPDATE ${table("quarantine_reconciliation_state")}
+        SET state='failed', lease_id=NULL, failure_code='QUARANTINE_RECONCILIATION_FAILED'`,
+  );
+  const failed = await readBoth();
+  assert.deepEqual(failed.retention, {
+    ...hostile.retention, state: "failed", maintenanceRunAtIso: null, failureCode: "LIFECYCLE_PASS_FAILED",
+  });
+  assert.deepEqual(failed.reconciliation, {
+    ...hostile.reconciliation, state: "failed", reconciliationComplete: false,
+    failureCode: "QUARANTINE_RECONCILIATION_FAILED",
+  });
+  assert.equal(lifecycle.maintenanceCyclesMatch(failed.retention.maintenanceRunAtIso,
+    failed.reconciliation.maintenanceRunAtIso), false, "a failed lifecycle pass never matches a cycle");
 
   // Absent rows read as null, never as a defaulted state.
   await pool.query(`DELETE FROM ${table("retention_state")}`);
   await pool.query(`DELETE FROM ${table("quarantine_reconciliation_state")}`);
-  const absent = await inHostileTransaction(pool, async (client) => ({
-    retention: await lifecycle.readPostgresRetentionState(client, options),
-    reconciliation: await lifecycle.readPostgresQuarantineReconciliationState(client, options),
-  }));
-  assert.deepEqual(absent, { retention: null, reconciliation: null });
+  assert.deepEqual(await readBoth(), { retention: null, reconciliation: null });
 }));
 
 test("readers throw StateShapeError for values outside the contract, including out-of-enum rows in an unchecked scratch copy", {
@@ -559,10 +617,13 @@ test("readers throw StateShapeError for values outside the contract, including o
   );
   await seedRetention();
   await seedReconciliation();
-  const baseline = await read("readPostgresRetentionState", scratchOptions);
-  assert.equal(baseline.state, "never_run", "the unchecked copy reads normally before tampering");
-  assert.equal((await read("readPostgresQuarantineReconciliationState", scratchOptions)).state, "never_run");
+  // Rows built from the column defaults alone are the fresh-deploy rows.
+  assert.deepEqual(await read("readPostgresRetentionState", scratchOptions), FRESH_RETENTION,
+    "the unchecked copy reads normally before tampering");
+  assert.deepEqual(await read("readPostgresQuarantineReconciliationState", scratchOptions), FRESH_RECONCILIATION);
 
+  // A sub-millisecond cycle marker is refused, never truncated into a match.
+  const subMillisecondMarker = "maintenance_run_at='2026-09-24T23:59:59.123001Z'";
   const retentionCases = [
     ["state='idle'", "state"],
     ["state='NEVER_RUN'", "state"],
@@ -570,6 +631,7 @@ test("readers throw StateShapeError for values outside the contract, including o
     ["failure_code='SYNTHETIC_OTHER_FAILURE'", "failure_code"],
     ["failure_code='QUARANTINE_RECONCILIATION_FAILED'", "failure_code"],
     ["restored_participants_suppressed=-1", "restored_participants_suppressed"],
+    [subMillisecondMarker, "maintenance_run_at"],
   ];
   for (const [assignment, field] of retentionCases) {
     await pool.query(`DELETE FROM ${table("retention_state", copy)}`);
@@ -582,6 +644,7 @@ test("readers throw StateShapeError for values outside the contract, including o
     ["schema_version='quarantine-reconciliation-v0.2'", "schema_version"],
     ["failure_code='LIFECYCLE_PASS_FAILED'", "failure_code"],
     ["orphan_objects_deleted=-1", "orphan_objects_deleted"],
+    [subMillisecondMarker, "maintenance_run_at"],
   ];
   for (const [assignment, field] of reconciliationCases) {
     await pool.query(`DELETE FROM ${table("quarantine_reconciliation_state", copy)}`);
@@ -601,7 +664,13 @@ test("readers throw StateShapeError for values outside the contract, including o
 test("maintenanceCyclesMatch requires two present, canonical and identical instants", {
   timeout: 60_000,
 }, async () => {
-  const { maintenanceCyclesMatch, readPostgresRetentionState, StateShapeError } = await workerModule(MODULE);
+  const {
+    maintenanceCyclesMatch, readPostgresRetentionState, readPostgresQuarantineReconciliationState, StateShapeError,
+    POSTGRES_LIFECYCLE_RUN_STATES,
+  } = await workerModule(MODULE);
+  assert.deepEqual(POSTGRES_LIFECYCLE_RUN_STATES, ["never_run", "running", "completed", "failed"],
+    "the Worker retention and reconciliation vocabulary");
+  assert.ok(Object.isFrozen(POSTGRES_LIFECYCLE_RUN_STATES));
   const instant = "2026-09-24T23:59:59.123Z";
   assert.equal(maintenanceCyclesMatch(instant, instant), true);
   assert.equal(maintenanceCyclesMatch(instant, "2026-09-24T23:59:59.124Z"), false);
@@ -624,6 +693,23 @@ test("maintenanceCyclesMatch requires two present, canonical and identical insta
   };
   assert.equal((await readPostgresRetentionState(fake([good]))).state, "never_run");
   assert.equal(await readPostgresRetentionState(fake([])), null);
+  const goodReconciliation = {
+    schema_version: "quarantine-reconciliation-v0.1", state: "never_run", last_started_at: null,
+    last_completed_at: null, maintenance_run_at: null, cutoff_at: null, registrations_examined: "0",
+    orphan_objects_deleted: "0", referenced_objects_preserved: "0", reconciliation_complete: false,
+    failure_code: null,
+  };
+  for (const state of POSTGRES_LIFECYCLE_RUN_STATES) {
+    assert.equal((await readPostgresRetentionState(fake([{ ...good, state }]))).state, state);
+    assert.equal((await readPostgresQuarantineReconciliationState(fake([{ ...goodReconciliation, state }]))).state,
+      state);
+  }
+  const failedRetention = await readPostgresRetentionState(
+    fake([{ ...good, state: "failed", failure_code: "LIFECYCLE_PASS_FAILED" }]));
+  assert.equal(failedRetention.failureCode, "LIFECYCLE_PASS_FAILED");
+  const failedReconciliation = await readPostgresQuarantineReconciliationState(
+    fake([{ ...goodReconciliation, state: "failed", failure_code: "QUARANTINE_RECONCILIATION_FAILED" }]));
+  assert.equal(failedReconciliation.failureCode, "QUARANTINE_RECONCILIATION_FAILED");
   const defects = [
     [{ ...good, quarantine_retention_complete: "t" }, "quarantine_retention_complete"],
     [{ ...good, quarantine_objects_deleted: 0 }, "quarantine_objects_deleted"],

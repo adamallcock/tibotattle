@@ -87,13 +87,19 @@ type Column = string;
  * Render one timestamptz column as a canonical UTC millisecond instant. A
  * value that has no four-digit ISO form (infinite, BC or beyond year 9999)
  * becomes a marker that fails validation instead of NULL, so it can never
- * read as an absent timestamp.
+ * read as an absent timestamp. An `exact` column is an identity that callers
+ * compare, so a sub-millisecond value is refused rather than truncated: two
+ * different instants can then never read as the same string.
  */
-function instantColumn(column: Column): string {
+function instantColumn(column: Column, exact = false): string {
+  const wholeMilliseconds = exact
+    ? `
+             AND ${column} = date_trunc('milliseconds', ${column}, 'UTC')`
+    : "";
   return `CASE
             WHEN ${column} IS NULL THEN NULL
             WHEN isfinite(${column})
-             AND extract(year FROM ${column} AT TIME ZONE 'UTC') BETWEEN 1 AND 9999
+             AND extract(year FROM ${column} AT TIME ZONE 'UTC') BETWEEN 1 AND 9999${wholeMilliseconds}
               THEN to_char(${column} AT TIME ZONE 'UTC', '${UTC_MILLISECOND_INSTANT}')
             ELSE 'out-of-range'
           END AS ${column}`;
@@ -216,7 +222,7 @@ export async function readPostgresRetentionState(
             state,
             ${instantColumn("last_started_at")},
             ${instantColumn("last_completed_at")},
-            ${instantColumn("maintenance_run_at")},
+            ${instantColumn("maintenance_run_at", true)},
             ${instantColumn("quarantine_cutoff_at")},
             ${counterColumn("quarantine_objects_deleted")},
             quarantine_retention_complete,
@@ -253,7 +259,7 @@ export async function readPostgresQuarantineReconciliationState(
             state,
             ${instantColumn("last_started_at")},
             ${instantColumn("last_completed_at")},
-            ${instantColumn("maintenance_run_at")},
+            ${instantColumn("maintenance_run_at", true)},
             ${instantColumn("cutoff_at")},
             ${counterColumn("registrations_examined")},
             ${counterColumn("orphan_objects_deleted")},
@@ -281,7 +287,9 @@ export async function readPostgresQuarantineReconciliationState(
 /**
  * The lifecycle and reconciliation rows record the same maintenance cycle
  * only when both markers are present, canonical and identical (Worker
- * handleReady parity). Two absent markers never match.
+ * handleReady parity). Two absent markers never match. The readers return a
+ * marker only when it holds whole milliseconds, so string identity is
+ * instant identity.
  */
 export function maintenanceCyclesMatch(
   a: string | null | undefined,
