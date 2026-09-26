@@ -97,7 +97,7 @@ const RETRY_FENCE = Object.freeze({
   cursor_sequence: "0",
   cursor_epoch: "0",
   policy_singleton: 1,
-  publication_state: "updating",
+  publication_state: "ready",
   policy_revision: "1",
   latest_sequence: "0",
   terminal_sequence: "0",
@@ -184,7 +184,7 @@ function harness({
   retainedPublication = RETAINED_PUBLICATION,
   retryFence = RETRY_FENCE,
   selectedDay = { v1_selected_records_present: false, v11_selected_records_present: false },
-  policy = { singleton: 1, publication_state: "updating", policy_revision: 1 },
+  policy = { singleton: 1, publication_state: "ready", policy_revision: 1 },
 } = {}) {
   const state = {
     controls: structuredClone(controls),
@@ -505,9 +505,9 @@ test("retry prepare refuses any changed retained event before enabling controls"
   assert.equal(h.events.filter(({ sql }) => sql === "ROLLBACK").length, 1);
 });
 
-test("prepare accepts ready policy at the exact singleton and revision", async () => {
+test("prepare still accepts a pre-retirement updating policy row at the exact singleton and revision", async () => {
   const h = harness({
-    policy: { singleton: 1, publication_state: "ready", policy_revision: 1 },
+    policy: { singleton: 1, publication_state: "updating", policy_revision: 1 },
   });
   const receipt = await preparePostgresCommunityDailyTestActivation({
     env: validEnv("prepare"), dependencies: h.dependencies,
@@ -521,11 +521,11 @@ test("prepare refuses missing or invalid publication policy before fixture inser
   const cases = [
     { policy: null, code: "POLICY_READ_FAILED" },
     {
-      policy: { singleton: 2, publication_state: "updating", policy_revision: 1 },
+      policy: { singleton: 2, publication_state: "ready", policy_revision: 1 },
       code: "POLICY_INVALID",
     },
     {
-      policy: { singleton: 1, publication_state: "updating", policy_revision: 2 },
+      policy: { singleton: 1, publication_state: "ready", policy_revision: 2 },
       code: "POLICY_INVALID",
     },
     {
@@ -701,20 +701,15 @@ async function createDisposableSchema(pool, migrationRoot) {
       RETURNING singleton`);
     assert.equal(seedControls.rowCount, 1, "fresh migrations must match the exact contained baseline");
     assert.deepEqual(seedControls.rows, [{ singleton: 1 }]);
-    // Graph analytical mutation can leave the shared row `updating`; daily
-    // activation follows the publisher's exact policy revision, control, and
-    // caught-up cursor fences instead of requiring graph publication to be ready.
-    const seedPolicy = await pool.query(`UPDATE ${quoted}.publication_state
-      SET publication_state='updating',policy_revision=1 WHERE singleton=1
-      RETURNING singleton,publication_state,policy_revision`);
-    assert.equal(
-      seedPolicy.rowCount,
-      1,
-      "fresh migrations must have the singleton publication policy",
-    );
-    assert.equal(Number(seedPolicy.rows[0]?.singleton), 1);
-    assert.equal(seedPolicy.rows[0]?.publication_state, "updating");
-    assert.equal(Number(seedPolicy.rows[0]?.policy_revision), 1);
+    // publication_state is only the policy row: daily activation follows the
+    // publisher's exact policy revision, control, and caught-up cursor fences
+    // and never writes it. Read it back without changing it.
+    const policy = await pool.query(`SELECT singleton,publication_state,policy_revision
+      FROM ${quoted}.publication_state`);
+    assert.equal(policy.rowCount, 1, "fresh migrations must have the singleton publication policy");
+    assert.equal(Number(policy.rows[0]?.singleton), 1);
+    assert.equal(policy.rows[0]?.publication_state, "ready");
+    assert.equal(Number(policy.rows[0]?.policy_revision), 1);
     const privileges = await pool.query(`SELECT
       has_table_privilege($1,$2::regclass,'SELECT') AS migration_select,
       has_table_privilege($1,$2::regclass,'UPDATE') AS migration_update,
