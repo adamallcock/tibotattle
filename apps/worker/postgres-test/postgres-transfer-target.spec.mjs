@@ -136,12 +136,17 @@ function stubPool(pool, rewrite) {
 }
 
 // A pool whose connections can be made to fail after the handle is open,
-// to tear a two-database step between its primary and ledger commits.
+// to tear a two-database step between its primary and ledger commits. Once
+// `fail` is set, `admit` more connections still succeed before the loss.
 function flakyPool(pool) {
   const switchable = {
     fail: false,
+    admit: 0,
     async connect() {
-      if (switchable.fail) throw new Error("synthetic connection loss");
+      if (switchable.fail) {
+        if (switchable.admit <= 0) throw new Error("synthetic connection loss");
+        switchable.admit -= 1;
+      }
       return pool.connect();
     },
   };
@@ -1269,12 +1274,44 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
 
     await t.test("markLive locks every relation of tibotattle_transfer in both databases; the target is then read-only", async () => {
       const flip = { flipEvidenceSha256: FLIP };
-      const live = await markLive(handle, flip);
+      const lockTriggers = async adminPool => (await adminPool.query(`SELECT count(*)::int AS n FROM pg_trigger
+        WHERE tgname = 'transfer_target_live_lock'`)).rows[0].n;
+      const runStates = async () => Promise.all([
+        adminPrimary.query("SELECT state FROM tibotattle_transfer.transfer_runs WHERE run_id = $1", [runId]),
+        adminLedger.query("SELECT state FROM tibotattle_transfer.ledger_transfer_runs WHERE run_id = $1", [runId]),
+      ]).then(results => results.map(result => result.rows[0]?.state));
+
+      // A torn markLive: the primary commits live and locked, then the ledger
+      // connection is lost after the flip check's ledger read.
+      const tearing = flakyPool(transferLedger);
+      const torn = await openProductionTransferTarget({ primaryPool: transferPrimary, ledgerPool: tearing, ...openArgs,
+        sealManifestSha256: SEAL_A });
+      tearing.fail = true;
+      tearing.admit = 1;
+      await assert.rejects(markLive(torn, flip), isCode("CUTOVER_TARGET_CONNECT_FAILED"));
+      tearing.fail = false;
+      assert.deepEqual(await runStates(), ["live", "verified"]);
+      assert.equal(await lockTriggers(adminPrimary), CONTROL_SCHEMA_RELATIONS.length - 1);
+      assert.equal(await lockTriggers(adminLedger), 0);
+      // Re-invoking after the loss resumes the live run and leaves the mirror
+      // verified: only markLive takes a mirror live, together with its lock.
+      const reopened = await openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_A });
+      assert.equal(reopened.openedRunState, "live");
+      assert.deepEqual(await runStates(), ["live", "verified"]);
+      assert.equal(await lockTriggers(adminLedger), 0);
+      // The ledger's flip readiness is proved again in its lock transaction.
+      await ownerLedger.query(`GRANT USAGE ON SCHEMA tibotattle_transfer TO "${roles.runtime}"`);
+      await assert.rejects(markLive(reopened, flip), isCode("CUTOVER_FLIP_RUNTIME_PRIVILEGE"));
+      await ownerLedger.query(`REVOKE USAGE ON SCHEMA tibotattle_transfer FROM "${roles.runtime}"`);
+      assert.deepEqual(await runStates(), ["live", "verified"]);
+      assert.equal(await lockTriggers(adminLedger), 0);
+      // Rerunning markLive completes the ledger step.
+      const live = await markLive(reopened, flip);
       assert.equal(live.state, "live");
       assert.equal(live.primaryLocked, CONTROL_SCHEMA_RELATIONS.length - 1);
       assert.equal(live.ledgerLocked, 2);
-      const again = await markLive(handle, flip);
-      assert.deepEqual({ ...again }, { ...live });
+      assert.equal(await lockTriggers(adminLedger), 2);
+      for (const retry of [torn, handle]) assert.deepEqual({ ...await markLive(retry, flip) }, { ...live });
       await assert.rejects(markLive(handle, { flipEvidenceSha256: SEAL_B }), isCode("CUTOVER_FLIP_EVIDENCE_INVALID"));
       for (const [adminPool, databaseRole] of [[adminPrimary, "primary"], [adminLedger, "ledger"]]) {
         const relations = await adminPool.query(`SELECT relname FROM pg_class

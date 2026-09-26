@@ -966,7 +966,12 @@ function nextStateToward(from, to) {
   return order[order.indexOf(from) + 1];
 }
 
-async function advanceMirror(client, primaryRun) {
+// Walk the ledger mirror forward to the primary run's state. Only markLive
+// takes a mirror to 'live' (allowLive), in the transaction that installs that
+// database's live lock; every other caller stops a live run's mirror at
+// 'verified'. A 'live' mirror therefore always carries its lock, and a
+// markLive torn after the primary commit is completed by rerunning markLive.
+async function advanceMirror(client, primaryRun, { allowLive = false } = {}) {
   let mirror = await readRunById(client, "ledger_transfer_runs", primaryRun.runId, "FOR UPDATE");
   if (mirror === undefined) {
     if (primaryRun.state === "abandoned") return undefined;
@@ -982,13 +987,14 @@ async function advanceMirror(client, primaryRun) {
       || mirror.sealedAt !== primaryRun.sealedAt) {
     fail("CUTOVER_RUN_STATE_DIVERGED");
   }
-  while (mirror.state !== primaryRun.state) {
+  const target = primaryRun.state === "live" && mirror.state !== "live" && !allowLive ? "verified" : primaryRun.state;
+  while (mirror.state !== target) {
     if (mirror.state === "abandoned" || mirror.state === "live"
         || (primaryRun.state !== "abandoned"
           && RUN_ORDER.get(mirror.state) > RUN_ORDER.get(primaryRun.state))) {
       fail("CUTOVER_RUN_STATE_DIVERGED");
     }
-    const next = nextStateToward(mirror.state, primaryRun.state);
+    const next = nextStateToward(mirror.state, target);
     await q(client, `UPDATE ${control("ledger_transfer_runs")} SET state = $2,
         verified_at = CASE WHEN $2 = 'verified' THEN clock_timestamp() ELSE verified_at END,
         live_at = CASE WHEN $2 = 'live' THEN clock_timestamp() ELSE live_at END,
@@ -1000,7 +1006,11 @@ async function advanceMirror(client, primaryRun) {
   return mirror;
 }
 
-/** Converge the ledger mirror forward to the primary run's state. */
+/**
+ * Converge the ledger mirror forward to the primary run's state. A live
+ * run's mirror stops at 'verified' (ledgerState reports it) until markLive
+ * takes it live together with the ledger's live lock.
+ */
 export async function reconcileLedgerRunMirror(handle) {
   const state = handleState(handle);
   if (state.runId === null) fail("CUTOVER_RUN_MISSING");
@@ -2109,9 +2119,12 @@ async function readBackLiveLock(client) {
 
 /**
  * Mark the verified run live after assertFlipReady, then install and verify
- * the whole-schema TRANSFER_TARGET_LIVE lock in both databases. Idempotent
- * for the same flip evidence: a repeated call on a live database is a
- * readback that fails closed on any relation added after live.
+ * the whole-schema TRANSFER_TARGET_LIVE lock in both databases. Each
+ * database goes live in the transaction that locks it, so a run or mirror in
+ * state 'live' always carries its lock. Rerunning after a loss between the
+ * two commits completes the ledger, re-proving its flip readiness first.
+ * Idempotent for the same flip evidence: a repeated call on a live database
+ * is a readback that fails closed on any relation added after live.
  */
 export async function markLive(handle, options = {}) {
   const { flipEvidenceSha256, allowedRoleMembers } = flipOptions(options);
@@ -2130,7 +2143,7 @@ export async function markLive(handle, options = {}) {
         AND to_regclass('tibotattle_transfer.ledger_transfer_runs') IS NOT NULL AS shared`,
     [handle.ledgerDatabase]));
     if (shared?.shared === true) {
-      await advanceMirror(client, await currentRun(client, handle));
+      await advanceMirror(client, await currentRun(client, handle), { allowLive: true });
     }
     await q(client, "SELECT tibotattle_transfer.install_transfer_live_lock()");
     return verifyLiveLock(client);
@@ -2146,8 +2159,10 @@ export async function markLive(handle, options = {}) {
       if (mirror.flipEvidenceSha256 !== flipEvidenceSha256) fail("CUTOVER_RUN_STATE_DIVERGED");
       return readBackLiveLock(client);
     }
-    await advanceMirror(client, liveRun);
-    await assertControlSchemaAllowlist(client);
+    await advanceMirror(client, liveRun, { allowLive: true });
+    // A rerun after a torn markLive finds the primary live and skips
+    // assertFlipReady, so the ledger half is proved again where it locks.
+    await assertDatabaseFlipReady(client, handle, allowedRoleMembers, handle.ledgerSchema);
     await q(client, "SELECT tibotattle_transfer.install_transfer_live_lock()");
     return verifyLiveLock(client);
   }, { [RUN_CONTROL]: true });
