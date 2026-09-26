@@ -40,9 +40,12 @@
  * FC-7  Rate limits. Address-keyed limits call exactly the Worker's
  *       src/admission.ts helper, with the same purpose and at the same point
  *       in the route order (the EP-1 edge admission policy). At the origin
- *       they run against edge-admission replay bindings, so an extra, missing
- *       or different limiter call answers 503. Identity-keyed upload limits
- *       (upload_authorization) are origin-tier PostgreSQL limiters.
+ *       they run against edge-admission replay bindings, so an extra or
+ *       different limiter call answers 503. A missing call is not detected:
+ *       the edge outcome is silently discarded and the route serves as if
+ *       admitted, so the call is mandatory and only the EP-12 parity rows
+ *       catch its absence. Identity-keyed upload limits (upload_authorization)
+ *       are origin-tier PostgreSQL limiters.
  * FC-8  No host checks and no retries. The edge and the root own host
  *       routing; a family never retries a transaction, a fetch or an object
  *       write.
@@ -53,13 +56,27 @@
  *       the plan-assigned number; the integrator promotes it. PG17 specs
  *       apply it through postgres-test/staged-migrations-harness.mjs and skip
  *       cleanly when PG_TEST_SOCKET and PG_TEST_HOST are both unset.
- * FC-11 Erasure inventories. In the same item, a new primary relation with
- *       an owner_digest column joins the closed retirement inventory
- *       (OWNER_DIGEST_TABLES in src/postgres-analytics-owner-retirement.ts),
- *       and a relation with a participant_id column or a participants
- *       foreign key joins both erasers' participant allowlists
- *       (src/postgres-social-owner-erasure-preflight.ts and
- *       src/postgres-accountless-owner-erasure.ts).
+ * FC-11 Erasure inventories, in the same item that adds the relation.
+ *       (a) A primary relation with an owner_digest column joins
+ *       OWNER_DIGEST_TABLES in src/postgres-analytics-owner-retirement.ts
+ *       together with an explicit decision in that module: DELETE (a delete
+ *       step in the retirement transaction plus residue readback coverage,
+ *       via SOURCE_OWNER_TABLES or a query in assertNoResidualOwnerFamilyRows)
+ *       or RETAIN (RETAINED_OWNER_TABLES, with the retained-proof
+ *       justification), plus a retirement spec assertion. Membership alone
+ *       only satisfies the fail-closed gate and leaves a retired owner's rows
+ *       in place.
+ *       (b) A relation with a participant_id column or a participants
+ *       foreign key joins KNOWN_PARTICIPANT_TABLES in
+ *       src/postgres-social-owner-erasure-preflight.ts and
+ *       ACCOUNTLESS_PARTICIPANT_TABLES in
+ *       src/postgres-accountless-owner-erasure.ts, as cascade-covered or
+ *       explicitly erased; the preflight's own accountless-only
+ *       ACCOUNTLESS_PARTICIPANT_TABLES list when its rows are accountless
+ *       authority; and the synthetic ALLOWED_PARTICIPANT_TABLES bounds in
+ *       src/postgres-owner-erasure.ts and cloud-run/synthetic-v12-discovery.mjs
+ *       when synthetic fixtures create rows. Both erasers' existing specs
+ *       join that item's gate.
  * FC-12 Uploads. Post-claim contribution handlers follow
  *       POST_CLAIM_HANDLER_CONTRACT. There is deliberately no
  *       upload-authorization format contract: the upload pipeline owns every
@@ -352,7 +369,15 @@ export async function readBoundedJsonRequest(request, {
   }
   let value;
   if (strict) {
-    value = parseStrictJson(raw, "BODY_INVALID");
+    // Like every Worker strict reader: jsonc-parser's recursive tree parse
+    // throws RangeError on deeply nested input, and only an ApiError keeps
+    // its own code; anything else is the client's malformed body.
+    try {
+      value = parseStrictJson(raw, "BODY_INVALID");
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(400, "BODY_INVALID");
+    }
   } else {
     try {
       value = JSON.parse(raw);

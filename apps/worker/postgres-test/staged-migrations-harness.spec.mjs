@@ -64,6 +64,7 @@ function fakePool(schema, { failOn } = {}) {
   const transcript = [];
   const releases = [];
   const history = [];
+  const lockKeys = [];
   let historyTable = false;
   let connects = 0;
   const client = {
@@ -72,8 +73,27 @@ function fakePool(schema, { failOn } = {}) {
       if (failOn !== undefined && text.includes(failOn)) {
         throw Object.assign(new Error("synthetic driver failure"), { code: "22012" });
       }
-      if (text.includes("pg_try_advisory_lock")) return rows([{ acquired: true }]);
-      if (text.includes("pg_advisory_unlock")) return rows([{ released: true }]);
+      if (text.includes("pg_try_advisory_lock")) {
+        lockKeys.push(["lock", values[0]]);
+        return rows([{ acquired: true }]);
+      }
+      if (text.includes("pg_advisory_unlock")) {
+        lockKeys.push(["unlock", values[0]]);
+        return rows([{ released: true }]);
+      }
+      const deleted = /^DELETE FROM _tibotattle_migration_history WHERE version = (\d+);\n$/u.exec(text);
+      if (deleted) {
+        const index = history.findIndex((row) => row.version === Number(deleted[1]));
+        if (index >= 0) history.splice(index, 1);
+        return { rows: [], rowCount: index >= 0 ? 1 : 0 };
+      }
+      const rewritten = /^UPDATE _tibotattle_migration_history SET checksum_sha256 = '([0-9a-f]{64})' WHERE version = (\d+);\n$/u
+        .exec(text);
+      if (rewritten) {
+        const row = history.find((candidate) => candidate.version === Number(rewritten[2]));
+        if (row !== undefined) row.checksum_sha256 = rewritten[1];
+        return { rows: [], rowCount: row === undefined ? 0 : 1 };
+      }
       if (text.includes("to_regnamespace")) {
         return rows([{ namespace: schema, history_table: historyTable ? "history" : null }]);
       }
@@ -82,7 +102,12 @@ function fakePool(schema, { failOn } = {}) {
       if (text.includes("information_schema.tables")) return rows([]);
       if (text.includes("SELECT version, name, checksum_sha256")) return rows(history.map((row) => ({ ...row })));
       if (/INSERT INTO\s+"[^"]+"\."_tibotattle_migration_history"/u.test(text)) {
-        history.push({ version: values[0], name: values[1], checksum_sha256: values[2] });
+        history.push({
+          version: values[0],
+          name: values[1],
+          checksum_sha256: values[2],
+          applied_at_epoch: String(1_790_000_000 + values[0]),
+        });
         return { rows: [], rowCount: 1 };
       }
       if (text.includes("CREATE TABLE IF NOT EXISTS _tibotattle_migration_history")) historyTable = true;
@@ -102,6 +127,7 @@ function fakePool(schema, { failOn } = {}) {
     transcript,
     releases,
     history,
+    lockKeys,
     connects: () => connects,
   };
 }
@@ -223,8 +249,24 @@ test("staged files run with exactly the stock runner's timeouts and search_path,
   assert.equal(STAGED_MIGRATION_STATEMENT_TIMEOUT_MILLISECONDS, 30_000);
   assert.equal(STAGED_MIGRATION_LOCK_TIMEOUT_MILLISECONDS, 5_000);
   assert.deepEqual(harness.history.map((row) => row.version), [1, 2], "staged SQL writes no receipt");
-  assert.deepEqual(harness.releases, [false, false, false],
-    "stock run, staged run and receipt re-verification each release cleanly");
+  assert.deepEqual(harness.releases, [false, false], "stock run and staged run each release cleanly");
+  assert.equal(harness.transcript.filter((text) => text === "CREATE TABLE stock_fixture (id integer);\n").length, 1,
+    "the stock DDL runs once; the receipt check never re-applies it");
+  const expectedKey = `tibotattle:primary:${schema}`;
+  assert.deepEqual(stockOnly.lockKeys, [["lock", expectedKey], ["unlock", expectedKey]]);
+  assert.deepEqual(harness.lockKeys, [
+    ["lock", expectedKey], ["unlock", expectedKey],
+    ["lock", expectedKey], ["unlock", expectedKey],
+  ], "the staged phase takes and releases the stock runner's own advisory lock key");
+  const snapshots = harness.transcript
+    .map((text, index) => (text.includes("extract(epoch FROM applied_at)") ? index : -1))
+    .filter((index) => index >= 0);
+  assert.equal(snapshots.length, 2, "one receipt snapshot before and one after the staged files");
+  for (const index of snapshots) {
+    assert.equal(harness.transcript[index - 3], "BEGIN READ ONLY", "each snapshot is a read-only transaction");
+  }
+  assert.ok(snapshots[0] < harness.transcript.indexOf(stagedSql)
+    && harness.transcript.indexOf(stagedSql) < snapshots[1]);
   assert.deepEqual(result, {
     role: "primary",
     schema,
@@ -336,6 +378,31 @@ test("a failing staged file rolls back, discards its connection and names the fi
   assert.deepEqual(failing.releases, [false, true], "the staged connection is discarded");
 });
 
+test("a staged file that deletes or rewrites a stock receipt is refused without re-applying stock DDL", async () => {
+  const schema = "harness_fake_receipts";
+  const stockRoot = await fakeStockRoot();
+  const stagedRoot = await temporaryRoot("receipts");
+  await writeMigration(stagedRoot, "primary", "0098_delete_receipt.sql",
+    "DELETE FROM _tibotattle_migration_history WHERE version = 2;\n");
+  await writeMigration(stagedRoot, "primary", "0099_rewrite_receipt.sql",
+    `UPDATE _tibotattle_migration_history SET checksum_sha256 = '${"0".repeat(64)}' WHERE version = 1;\n`);
+  for (const stagedFile of ["0098_delete_receipt.sql", "0099_rewrite_receipt.sql"]) {
+    const tampering = fakePool(schema);
+    await assert.rejects(applyStockAndStagedMigrations({
+      role: "primary",
+      schema,
+      pool: tampering.pool,
+      stagedFiles: [stagedFile],
+      rootDirectory: stockRoot,
+      stagedRootDirectory: stagedRoot,
+    }), { code: "STAGED_MIGRATION_STOCK_RECEIPTS_CHANGED" });
+    assert.equal(tampering.transcript.filter((text) => text === "CREATE TABLE stock_fixture (id integer);\n").length, 1,
+      `${stagedFile}: the stock DDL is not re-run to paper over the change`);
+    assert.equal(tampering.connects(), 2, `${stagedFile}: no further runner connection after the staged phase`);
+    assert.deepEqual(tampering.releases, [false, true], `${stagedFile}: the staged connection is discarded`);
+  }
+});
+
 test("postgresTestEndpoint skips without PG_TEST_* and refuses non-local targets", async () => {
   assert.equal(await postgresTestEndpoint({}), null);
   assert.equal(await postgresTestEndpoint({ PG_TEST_PORT: "55433" }), null);
@@ -358,18 +425,51 @@ test("postgresTestEndpoint skips without PG_TEST_* and refuses non-local targets
     { code: "POSTGRES_TEST_PORT_INVALID" });
 });
 
+/** Every relation name the PG17 cases' synthetic staged files can create. */
+const SPEC_RELATION_NAMES = Object.freeze([
+  "staged_harness_probe",
+  "staged_first",
+  "staged_first_pkey",
+  "staged_second",
+  "staged_tombstone_probe",
+  "staged_partial",
+  "staged_symlink_target",
+  "staged_lock_probe",
+  "staged_receipt_probe",
+]);
+
+async function publicSpecRelations(pool) {
+  const result = await pool.query(
+    `SELECT relation.relname::text AS name
+       FROM pg_catalog.pg_class relation
+       JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+      WHERE namespace.nspname = 'public' AND relation.relname = ANY($1::text[])
+      ORDER BY 1`,
+    [SPEC_RELATION_NAMES],
+  );
+  return result.rows.map(({ name }) => name);
+}
+
 async function withPostgres(label, callback) {
+  // The session search_path is pg_catalog alone, so unqualified DDL that
+  // escapes the harness's SET LOCAL search_path fails (system catalog
+  // modifications are refused) instead of landing in the shared cluster's
+  // public schema, where this spec could not clean it up.
   const pool = new pg.Pool({
     ...ENDPOINT,
     ssl: false,
     max: 4,
     connectionTimeoutMillis: 5_000,
     application_name: `staged-harness-${label}`,
+    options: "-c search_path=pg_catalog",
   });
   const created = [];
   try {
     const server = await pool.query("SELECT current_setting('server_version_num')::integer AS version");
     assert.equal(Math.floor(server.rows[0].version / 10_000), 17, "the harness is qualified on PostgreSQL 17");
+    const sessionPath = await pool.query("SELECT current_setting('search_path') AS search_path");
+    assert.equal(sessionPath.rows[0].search_path, "pg_catalog");
+    const publicBefore = await publicSpecRelations(pool);
     const createSchema = async (prefix) => {
       const schema = `${prefix}_${randomBytes(5).toString("hex")}`;
       await pool.query(`CREATE SCHEMA "${schema}"`);
@@ -377,6 +477,8 @@ async function withPostgres(label, callback) {
       return schema;
     };
     await callback({ pool, createSchema });
+    assert.deepEqual(await publicSpecRelations(pool), publicBefore,
+      "no staged relation escaped into the public schema");
   } finally {
     for (const schema of created.reverse()) {
       await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
@@ -499,5 +601,104 @@ test("PG17: staged files apply in version order, fail atomically, and a symlink 
       [refused],
     );
     assert.equal(untouched.rows[0].count, 0, "a refused selection leaves the schema empty");
+  });
+});
+
+test("PG17: the staged phase holds the stock runner's advisory lock and refuses a concurrent holder", {
+  skip: PG_SKIP,
+  timeout: 180_000,
+}, async () => {
+  const stagedRoot = await temporaryRoot("pg-lock");
+  await writeMigration(stagedRoot, "ledger", "0099_staged_lock_probe.sql",
+    "CREATE TABLE staged_lock_probe (id integer);\n");
+  await withPostgres("lock", async ({ pool, createSchema }) => {
+    const holder = await pool.connect();
+    const held = [];
+    const take = async (lockKey) => {
+      const result = await holder.query(
+        "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired", [lockKey]);
+      assert.equal(result.rows[0].acquired, true);
+      held.push(lockKey);
+    };
+    try {
+      // A holder of the runner's key blocks the stock phase first.
+      const before = await createSchema("staged_lock_before");
+      await take(`tibotattle:ledger:${before}`);
+      await assert.rejects(applyStockAndStagedMigrations({
+        role: "ledger",
+        schema: before,
+        pool,
+        stagedFiles: ["0099_staged_lock_probe.sql"],
+        stagedRootDirectory: stagedRoot,
+      }), { code: "POSTGRES_MIGRATION_CONFLICT" });
+
+      // The same key taken between the stock and staged phases blocks the
+      // staged phase alone: the harness uses the runner's key, not its own.
+      const between = await createSchema("staged_lock_between");
+      let connects = 0;
+      const contended = {
+        async connect() {
+          connects += 1;
+          if (connects === 2) await take(`tibotattle:ledger:${between}`);
+          return pool.connect();
+        },
+      };
+      await assert.rejects(applyStockAndStagedMigrations({
+        role: "ledger",
+        schema: between,
+        pool: contended,
+        stagedFiles: ["0099_staged_lock_probe.sql"],
+        stagedRootDirectory: stagedRoot,
+      }), { code: "STAGED_MIGRATION_CONFLICT" });
+      assert.equal(connects, 2, "the stock runner and the staged phase each connected once");
+      const probe = await pool.query("SELECT to_regclass($1) AS relation", [`"${between}".staged_lock_probe`]);
+      assert.equal(probe.rows[0].relation, null, "no staged DDL ran without the lock");
+      const stock = await readPostgresMigrations({ role: "ledger" });
+      const receipts = await pool.query(
+        `SELECT count(*)::integer AS count FROM "${between}"._tibotattle_migration_history`);
+      assert.equal(receipts.rows[0].count, stock.length, "the stock phase completed before the refusal");
+    } finally {
+      for (const lockKey of held) {
+        await holder.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [lockKey]);
+      }
+      holder.release();
+    }
+  });
+});
+
+test("PG17: a staged file that changes a stock receipt is refused and stock DDL is not re-run", {
+  skip: PG_SKIP,
+  timeout: 180_000,
+}, async () => {
+  const stock = await readPostgresMigrations({ role: "primary" });
+  const stagedRoot = await temporaryRoot("pg-receipts");
+  await writeMigration(stagedRoot, "primary", "0098_staged_receipt_delete.sql",
+    "CREATE TABLE staged_receipt_probe (id integer);\n"
+    + "DELETE FROM _tibotattle_migration_history\n"
+    + " WHERE version = (SELECT max(version) FROM _tibotattle_migration_history);\n");
+  await writeMigration(stagedRoot, "primary", "0099_staged_receipt_touch.sql",
+    "UPDATE _tibotattle_migration_history SET applied_at = applied_at + interval '1 second' WHERE version = 1;\n");
+  await withPostgres("receipts", async ({ pool, createSchema }) => {
+    const deleted = await createSchema("staged_receipt_delete");
+    await assert.rejects(applyStockAndStagedMigrations({
+      role: "primary",
+      schema: deleted,
+      pool,
+      stagedFiles: ["0098_staged_receipt_delete.sql"],
+      stagedRootDirectory: stagedRoot,
+    }), { code: "STAGED_MIGRATION_STOCK_RECEIPTS_CHANGED" });
+    const remaining = await pool.query(
+      `SELECT count(*)::integer AS count, max(version) AS tail FROM "${deleted}"._tibotattle_migration_history`);
+    assert.deepEqual(remaining.rows[0], { count: stock.length - 1, tail: stock.length - 1 },
+      "the harness neither re-applied the stock tail nor restored its receipt");
+
+    const touched = await createSchema("staged_receipt_touch");
+    await assert.rejects(applyStockAndStagedMigrations({
+      role: "primary",
+      schema: touched,
+      pool,
+      stagedFiles: ["0099_staged_receipt_touch.sql"],
+      stagedRootDirectory: stagedRoot,
+    }), { code: "STAGED_MIGRATION_STOCK_RECEIPTS_CHANGED" });
   });
 });

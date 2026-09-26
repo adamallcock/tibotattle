@@ -7,9 +7,11 @@
  * postgres/migrations/<role>/. Until then a PG17 spec applies the stock
  * migrations through the production runner and the staged files through this
  * harness, each in one bounded transaction with the runner's statement and
- * lock timeouts and its per-transaction search_path. Staged SQL is not
- * recorded in the migration history, so the stock receipts stay exactly what
- * the runtime storage gates expect. A spec names the staged files it needs;
+ * lock timeouts and its per-transaction search_path, under the runner's
+ * advisory lock. Staged SQL is not recorded in the migration history, and a
+ * read-only before/after snapshot refuses any staged file that changes the
+ * stock receipts, so they stay exactly what the runtime storage gates
+ * expect. A spec names the staged files it needs;
  * once a named file has been promoted unchanged, it is already part of the
  * stock set and is skipped, so specs survive promotion without edits.
  *
@@ -24,6 +26,7 @@ import { fileURLToPath } from "node:url";
 import {
   POSTGRES_MIGRATION_ROLES,
   applyPostgresMigrations,
+  migrationHistoryTable,
   readPostgresMigrations,
   renderPostgresSearchPath,
 } from "../cloud-run/postgres-migrations.mjs";
@@ -176,6 +179,69 @@ async function stagedQuery(client, text, values, failureCode, migration) {
   }
 }
 
+function receiptKey(row, withAppliedAt) {
+  return JSON.stringify([
+    row?.version,
+    row?.name,
+    row?.checksum_sha256,
+    ...(withAppliedAt ? [row?.applied_at_epoch] : []),
+  ]);
+}
+
+function sameReceipts(left, right) {
+  return left.length === right.length && left.every((row, index) => row === right[index]);
+}
+
+/**
+ * Read the stock receipts in a bounded read-only transaction. It never
+ * applies or repairs anything; applied_at is compared as its epoch text so
+ * the snapshot does not depend on session TimeZone or DateStyle.
+ */
+async function readStockReceipts(client, schema) {
+  let transactionStarted = false;
+  try {
+    await stagedQuery(client, "BEGIN READ ONLY", undefined, "STAGED_MIGRATION_RECEIPTS_READ_FAILED");
+    transactionStarted = true;
+    await stagedQuery(
+      client,
+      `SET LOCAL statement_timeout='${STAGED_MIGRATION_STATEMENT_TIMEOUT_MILLISECONDS}ms'`,
+      undefined,
+      "STAGED_MIGRATION_RECEIPTS_READ_FAILED",
+    );
+    await stagedQuery(
+      client,
+      `SET LOCAL lock_timeout='${STAGED_MIGRATION_LOCK_TIMEOUT_MILLISECONDS}ms'`,
+      undefined,
+      "STAGED_MIGRATION_RECEIPTS_READ_FAILED",
+    );
+    // renderPostgresSearchPath has already validated schema as a plain
+    // lower-case identifier, so quoting it here is exact.
+    const result = await stagedQuery(
+      client,
+      `SELECT version, name, checksum_sha256,
+              extract(epoch FROM applied_at)::text AS applied_at_epoch
+         FROM "${schema}".${migrationHistoryTable()} ORDER BY version`,
+      undefined,
+      "STAGED_MIGRATION_RECEIPTS_READ_FAILED",
+    );
+    await stagedQuery(client, "COMMIT", undefined, "STAGED_MIGRATION_RECEIPTS_READ_FAILED");
+    transactionStarted = false;
+    if (result === null || typeof result !== "object" || !Array.isArray(result.rows)) {
+      fail("STAGED_MIGRATION_RECEIPTS_READ_FAILED");
+    }
+    return Object.freeze([...result.rows]);
+  } catch (error) {
+    if (transactionStarted) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        // The connection is discarded by the caller either way.
+      }
+    }
+    throw error;
+  }
+}
+
 async function releaseClient(client, discard, state) {
   if (state.released) return;
   state.released = true;
@@ -192,11 +258,15 @@ async function releaseClient(client, discard, state) {
  * its own transaction:
  *   BEGIN; SET LOCAL statement_timeout; SET LOCAL lock_timeout;
  *   renderPostgresSearchPath(schema); <sql>; COMMIT
- * under the runner's advisory lock for this role and schema. A failed staged
- * file is rolled back, its connection discarded, and the error carries the
- * file name and the driver error as `cause` for the test author. Staged SQL
- * is not recorded as a migration receipt; after the last file the stock
- * receipts are re-verified. Use a fresh schema per call: staged SQL is not
+ * under the runner's advisory lock for this role and schema (the same key,
+ * so a concurrent runner on that schema is refused rather than interleaved).
+ * A failed staged file is rolled back, its connection discarded, and the
+ * error carries the file name and the driver error as `cause` for the test
+ * author. Staged SQL is not recorded as a migration receipt. The stock
+ * receipts are snapshotted read-only once the lock is held (they must match
+ * the stock set the runner just verified) and again after the last staged
+ * file; any difference is STAGED_MIGRATION_STOCK_RECEIPTS_CHANGED. Nothing
+ * is re-applied or repaired. Use a fresh schema per call: staged SQL is not
  * idempotent unless its author made it so.
  */
 export async function applyStockAndStagedMigrations({
@@ -218,13 +288,12 @@ export async function applyStockAndStagedMigrations({
     rootDirectory,
     stagedRootDirectory,
   });
-  const stockOptions = {
+  const stock = await applyPostgresMigrations({
     role,
     schema,
     pool,
     ...(rootDirectory === undefined ? {} : { rootDirectory }),
-  };
-  const stock = await applyPostgresMigrations(stockOptions);
+  });
   if (apply.length > 0) {
     let client;
     try {
@@ -242,6 +311,14 @@ export async function applyStockAndStagedMigrations({
         "STAGED_MIGRATION_LOCK_FAILED",
       );
       if (lock?.rows?.[0]?.acquired !== true) fail("STAGED_MIGRATION_CONFLICT");
+      const receiptsBefore = await readStockReceipts(client, schema);
+      if (!sameReceipts(
+        receiptsBefore.map((row) => receiptKey(row, false)),
+        stock.migrations.map(({ version, name, sha256 }) =>
+          receiptKey({ version, name, checksum_sha256: sha256 }, false)),
+      )) {
+        fail("STAGED_MIGRATION_STOCK_RECEIPTS_CHANGED");
+      }
       for (const migration of apply) {
         let transactionStarted = false;
         let commitAttempted = false;
@@ -282,6 +359,13 @@ export async function applyStockAndStagedMigrations({
           throw error;
         }
       }
+      const receiptsAfter = await readStockReceipts(client, schema);
+      if (!sameReceipts(
+        receiptsBefore.map((row) => receiptKey(row, true)),
+        receiptsAfter.map((row) => receiptKey(row, true)),
+      )) {
+        fail("STAGED_MIGRATION_STOCK_RECEIPTS_CHANGED");
+      }
       const unlock = await stagedQuery(
         client,
         "SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS released",
@@ -300,10 +384,6 @@ export async function applyStockAndStagedMigrations({
       }
       throw error;
     }
-    // Staged SQL must leave the stock receipts exactly as the runner wrote
-    // them; this re-reads and re-verifies every checksum and applies nothing.
-    const verified = await applyPostgresMigrations(stockOptions);
-    if (verified.applied !== stock.applied) fail("STAGED_MIGRATION_STOCK_RECEIPTS_CHANGED");
   }
   return Object.freeze({
     role,
