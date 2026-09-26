@@ -21,9 +21,16 @@ import {
   type PostgresTypedV12Principal,
 } from "./postgres-typed-v12-admission";
 import type {
-  TelemetryV12DomainActivation,
+  TelemetryV12DomainActivation as TelemetryV12DomainActivationBase,
   TelemetryV12DomainPredecessor,
 } from "./telemetry-v12-domain";
+
+/** The v1.1-style activation receipt, including the optional 'unchanged'
+ * acknowledgement the shipped client already accepts for v1.2. */
+export interface TelemetryV12DomainActivation extends TelemetryV12DomainActivationBase {
+  unchanged?: true;
+  requestedManifestDigest?: string;
+}
 
 const DAY_MS = 86_400_000;
 const PREDECESSOR_TTL_MS = 24 * 60 * 60 * 1_000;
@@ -284,10 +291,23 @@ export function createPostgresTypedV12Domain(
           manifestId: item.id,
           manifestDigest: item.manifest_digest,
         })));
+        // D1's rule (telemetry-v12-domain.ts): drop this device's unconsumed
+        // predecessors that are expired or beyond the newest seven, unless a
+        // domain references them. An 'unchanged' receipt consumes none, and
+        // the client asks for two per pass, so without the newest-seven bound
+        // repeated unchanged passes would reach the outstanding cap below.
         await client.query(
           `DELETE FROM ${table(schema, "telemetry_v12_domain_predecessors")} p
             WHERE p.participant_id = $1 AND p.device_id = $2
-              AND p.consumed_at IS NULL AND p.expires_at <= $3::timestamptz
+              AND p.consumed_at IS NULL
+              AND (p.expires_at <= $3::timestamptz OR p.token_hash IN (
+                SELECT x.token_hash
+                  FROM ${table(schema, "telemetry_v12_domain_predecessors")} x
+                 WHERE x.participant_id = $1 AND x.device_id = $2
+                   AND x.consumed_at IS NULL
+                 ORDER BY x.created_at DESC, x.token_hash
+                 OFFSET 7
+              ))
               AND NOT EXISTS (
                 SELECT 1 FROM ${table(schema, "telemetry_v12_domains")} d
                  WHERE d.predecessor_token_hash = p.token_hash
@@ -366,6 +386,38 @@ export function createPostgresTypedV12Domain(
             || manifest.throughDay < predecessor.through_day) {
           throw conflict();
         }
+        const daysJson = canonicalTelemetryV12Json(manifest.days);
+        // A fresh predecessor token does not make an unchanged day vector new
+        // data. The admission, head and input-revision checks above already
+        // passed under their locks; acknowledge only when this device's current
+        // head has exactly the requested range and days at that revision, and
+        // write nothing: no generation, head move or predecessor consumption.
+        // The head is per participant, so a second device never matches here.
+        if (predecessor.previous_generation_id !== null) {
+          const unchanged = await client.query<ActiveDomainRow>(
+            `SELECT d.id, d.manifest_digest,
+                    to_char(d.from_day, 'YYYY-MM-DD') AS from_day,
+                    to_char(d.through_day, 'YYYY-MM-DD') AS through_day
+               FROM ${table(schema, "telemetry_v12_domain_heads")} h
+               JOIN ${table(schema, "telemetry_v12_domains")} d
+                 ON d.id = h.generation_id AND d.participant_id = h.participant_id
+              WHERE h.participant_id = $1 AND h.generation_id = $2 AND d.device_id = $3
+                AND d.input_revision = $4 AND d.from_day = $5::date AND d.through_day = $6::date
+                AND d.days_json = $7
+              FOR SHARE OF h, d`,
+            [principal.participantId, predecessor.previous_generation_id, principal.deviceId,
+              revision(predecessor.input_revision), manifest.fromDay, manifest.throughDay,
+              daysJson],
+          );
+          const current = unchanged.rows[0];
+          if (current) {
+            return {
+              ...activationResult(current, true),
+              unchanged: true as const,
+              requestedManifestDigest: manifest.manifestDigest,
+            };
+          }
+        }
         const existingDays = JSON.parse(predecessor.days_json) as unknown;
         if (!Array.isArray(existingDays) || existingDays.some((item) =>
           !item || typeof item !== "object" || typeof item.day !== "string"
@@ -406,8 +458,7 @@ export function createPostgresTypedV12Domain(
           [generationId, principal.participantId, principal.deviceId, tokenHash,
             manifest.predecessor.previousGenerationId, manifest.manifestDigest,
             manifest.predecessor.legacyFingerprint, revision(predecessor.input_revision),
-            manifest.fromDay, manifest.throughDay,
-            canonicalTelemetryV12Json(manifest.days), committedAt],
+            manifest.fromDay, manifest.throughDay, daysJson, committedAt],
         );
         await client.query(
           `INSERT INTO ${table(schema, "telemetry_v12_domain_days")} (
