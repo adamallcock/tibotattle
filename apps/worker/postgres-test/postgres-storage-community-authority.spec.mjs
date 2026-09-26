@@ -19,7 +19,10 @@ import { applyPostgresMigrations, renderPostgresSearchPath } from "../scripts/po
  * staged-migrations/ or, once promoted, from migrations/, so the tests are
  * unchanged by promotion and by later waves. Tests that need data from
  * before 0053 (the bootstrap seed and the head backfill) write it at the
- * baseline. Every row is synthetic and content-free.
+ * baseline. The analytics retirement test runs on the repository's whole
+ * primary chain instead, because the retirement inventory is closed over the
+ * current chain and later waves add owner-bearing relations above 0053. Every
+ * row is synthetic and content-free.
  *
  * Connection profile: the private Unix socket (PG_TEST_SOCKET) or loopback
  * TCP (PG_TEST_HOST). Without either, every database test skips; a skip is
@@ -158,8 +161,16 @@ async function applyAuthority(pool, schema) {
   }
 }
 
-/** Run `body` on a fresh schema at the baseline, `before` data, then 0053. */
-async function withSchema(body, { before } = {}) {
+/**
+ * Run `body` on a fresh schema at the baseline, `before` data, then 0053. The
+ * "repository" chain instead applies the repository's whole primary chain
+ * through the runner (plus 0053 while it is still staged): the analytics
+ * retirement inventory is closed over the current chain, so a test that
+ * retires an owner must see every later owner-bearing relation too.
+ */
+async function withSchema(body, { before, chain = "baseline" } = {}) {
+  assert.ok(chain === "baseline" || chain === "repository");
+  assert.ok(chain === "baseline" || before === undefined, "only the baseline chain writes data before 0053");
   const pool = await connection();
   const schema = `community_authority_${randomBytes(6).toString("hex")}`;
   const quoted = `"${schema}"`;
@@ -170,11 +181,19 @@ async function withSchema(body, { before } = {}) {
   const context = { pool, schema, quoted, table };
   await pool.query(`CREATE SCHEMA ${quoted}`);
   try {
-    const baseline = await baselineMigrationsRoot();
-    const applied = await applyPostgresMigrations({ role: "primary", schema, pool, rootDirectory: baseline.directory });
-    assert.equal(applied.migrations.length, baseline.count);
-    if (before) await before(context);
-    await applyAuthority(pool, schema);
+    if (chain === "repository") {
+      await applyPostgresMigrations({ role: "primary", schema, pool });
+      if ((await readAuthority()).staged) await applyAuthority(pool, schema);
+      const present = await pool.query("SELECT to_regclass($1) IS NOT NULL AS present",
+        [`${quoted}.community_public_source_bootstrap`]);
+      assert.equal(present.rows[0].present, true, "the repository chain carries the community publication authority");
+    } else {
+      const baseline = await baselineMigrationsRoot();
+      const applied = await applyPostgresMigrations({ role: "primary", schema, pool, rootDirectory: baseline.directory });
+      assert.equal(applied.migrations.length, baseline.count);
+      if (before) await before(context);
+      await applyAuthority(pool, schema);
+    }
     await body(context);
   } finally {
     await pool.query(`DROP SCHEMA IF EXISTS ${quoted} CASCADE`);
@@ -1479,4 +1498,4 @@ test("PG17 analytics owner retirement keeps erasure fences and receipts as retai
         (SELECT count(*)::int FROM ${table("analytics_storage_erasure_receipts")} WHERE owner_digest=$1) AS receipts`, [owner]);
     assert.deepEqual(retained.rows[0], { fences: 1, receipts: 1 });
     assert.equal((await retirePostgresAnalyticsOwner(options)).status, "complete", "retirement stays replay-safe");
-  }));
+  }, { chain: "repository" }));
