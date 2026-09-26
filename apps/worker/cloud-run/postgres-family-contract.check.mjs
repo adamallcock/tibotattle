@@ -9,6 +9,7 @@ import { createServer } from "vite";
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const WORKER_ROOT = resolve(ROOT, "..");
 const CONTRACT_PATH = resolve(ROOT, "postgres-family-contract.mjs");
+const WORKER_INDEX_PATH = resolve(WORKER_ROOT, "src", "index.ts");
 const REQUEST_ID = "4f2c8a7e-1b3d-4e5f-9a6b-7c8d9e0f1a2b";
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const MIB = 1024 * 1024;
@@ -136,16 +137,80 @@ test("the header block states every family convention later briefs cite as FC", 
     /Never log bodies,\s+\*\s+ids, tokens, cookies, IP addresses, SQL or driver error text/u,
     /src\/admission\.ts helper/u,
     /edge-admission replay bindings/u,
-    /answers 503/u,
+    /an extra or\s+\*\s+different limiter call answers 503/u,
+    /A missing call is not detected/u,
+    /the call is mandatory and only the EP-12 parity rows/u,
     /origin-tier PostgreSQL limiters/u,
     /No host checks and no retries/u,
     /staged-migrations\/<role>\/<NNNN>_<name>\.sql/u,
     /skip\s+\*\s+cleanly when PG_TEST_SOCKET and PG_TEST_HOST/u,
-    /owner_digest/u,
-    /participant_id column or a participants\s+\*\s+foreign key/u,
+    /owner_digest column joins\s+\*\s+OWNER_DIGEST_TABLES/u,
+    /explicit decision in that module: DELETE/u,
+    /SOURCE_OWNER_TABLES or a query in assertNoResidualOwnerFamilyRows/u,
+    /or RETAIN \(RETAINED_OWNER_TABLES, with the retained-proof\s+\*\s+justification\), plus a retirement spec assertion/u,
+    /Membership alone\s+\*\s+only satisfies the fail-closed gate/u,
+    /participant_id column or a participants\s+\*\s+foreign key joins KNOWN_PARTICIPANT_TABLES/u,
+    /ACCOUNTLESS_PARTICIPANT_TABLES in\s+\*\s+src\/postgres-accountless-owner-erasure\.ts/u,
+    /accountless-only\s+\*\s+ACCOUNTLESS_PARTICIPANT_TABLES list when its rows are accountless\s+\*\s+authority/u,
+    /synthetic ALLOWED_PARTICIPANT_TABLES bounds in\s+\*\s+src\/postgres-owner-erasure\.ts and cloud-run\/synthetic-v12-discovery\.mjs/u,
     /no\s+\*\s+upload-authorization format contract/u,
   ]) {
     assert.match(header, phrase);
+  }
+  assert.doesNotMatch(header, /missing\s+(?:\*\s+)?or different limiter call answers 503/u,
+    "a missing limiter call is not detected at the origin, so FC-7 must not promise a 503");
+});
+
+test("FC-11 names inventory constants that exist in the modules it cites", async () => {
+  for (const [path, names] of [
+    ["src/postgres-analytics-owner-retirement.ts", [
+      "const OWNER_DIGEST_TABLES",
+      "const SOURCE_OWNER_TABLES",
+      "const RETAINED_OWNER_TABLES",
+      "async function assertNoResidualOwnerFamilyRows",
+    ]],
+    ["src/postgres-social-owner-erasure-preflight.ts", [
+      "const KNOWN_PARTICIPANT_TABLES",
+      "const ACCOUNTLESS_PARTICIPANT_TABLES",
+    ]],
+    ["src/postgres-accountless-owner-erasure.ts", ["const ACCOUNTLESS_PARTICIPANT_TABLES"]],
+    ["src/postgres-owner-erasure.ts", ["const ALLOWED_PARTICIPANT_TABLES"]],
+    ["cloud-run/synthetic-v12-discovery.mjs", ["const ALLOWED_PARTICIPANT_TABLES"]],
+  ]) {
+    const source = await readFile(resolve(WORKER_ROOT, path), "utf8");
+    for (const name of names) {
+      assert.ok(source.includes(`${name}`), `${path} still declares ${name.split(" ").at(-1)}`);
+    }
+  }
+});
+
+test("the control read policy and readBoundedJson rules match the Worker source (src/index.ts)", async () => {
+  const source = await readFile(WORKER_INDEX_PATH, "utf8");
+  const policy = /\nconst CONTROL_BODY_READ_POLICY = Object\.freeze\(\{([^}]*)\}/u.exec(source);
+  assert.ok(policy, "src/index.ts declares CONTROL_BODY_READ_POLICY as a frozen literal");
+  const entries = [...policy[1].matchAll(/^\s*([A-Za-z]+):\s*([0-9_]+),?\s*$/gmu)]
+    .map(([, name, value]) => [name, Number(value.replaceAll("_", ""))]);
+  assert.equal(entries.length, policy[1].trim().split("\n").length,
+    "every policy entry is a plain integer literal");
+  assert.deepEqual(Object.fromEntries(entries), { ...contract.CONTROL_BODY_READ_POLICY });
+
+  const start = source.indexOf("\nasync function readBoundedJson(");
+  assert.ok(start >= 0, "src/index.ts declares readBoundedJson");
+  const body = source.slice(start, source.indexOf("\n}\n", start));
+  for (const rule of [
+    "policy: BoundedBodyReadPolicy = CONTROL_BODY_READ_POLICY",
+    'request.headers.get("content-type")?.split(";", 1)[0]?.trim()',
+    'if (contentType !== "application/json") throw new ApiError(415, "CONTENT_TYPE_INVALID");',
+    'const declared = request.headers.get("content-length");',
+    "const length = Number(declared);",
+    'if (!Number.isSafeInteger(length) || length < 0) throw new ApiError(400, "BODY_INVALID");',
+    'if (length > MAX_REQUEST_BYTES) throw new ApiError(413, "BODY_TOO_LARGE");',
+    "readBoundedRequestBody(request, MAX_REQUEST_BYTES, policy)",
+    'new TextDecoder("utf-8", { fatal: true, ignoreBOM: false })',
+    "JSON.parse(raw)",
+    'throw new ApiError(400, "BODY_INVALID");',
+  ]) {
+    assert.ok(body.includes(rule), `Worker readBoundedJson still has: ${rule}; review the contract if it changed`);
   }
 });
 
@@ -382,6 +447,19 @@ test("strict mode rejects duplicate keys that lenient mode resolves to the last 
   assert.deepEqual(strict.value, { a: { b: [1, 2] }, c: null });
 });
 
+test("strict mode answers 400 BODY_INVALID, never 500, for input too deep for the tree parser", async () => {
+  const strictJson = await vite.ssrLoadModule("/src/strict-json.ts");
+  const depth = 100_000;
+  const deep = `${"[".repeat(depth)}${"]".repeat(depth)}`;
+  assert.throws(() => strictJson.parseStrictJson(deep, "BODY_INVALID"),
+    (error) => !(error instanceof errors.ApiError),
+    "precondition: the recursive tree parse throws a non-ApiError at this depth");
+  await rejectsWith(contract.readBoundedJsonRequest(jsonRequest(deep), { strict: true }),
+    400, "BODY_INVALID");
+  const lenient = await contract.readBoundedJsonRequest(jsonRequest(deep));
+  assert.ok(Array.isArray(lenient.value), "lenient mode keeps the Worker JSON.parse behaviour");
+});
+
 test("readBoundedJsonRequest refuses invalid options before touching the body", async () => {
   for (const [options, code] of [
     [{ maxBytes: 0 }, "FAMILY_BODY_LIMIT_INVALID"],
@@ -448,6 +526,60 @@ test("a dribbled stream times out at the Worker's 15 s total limit (fake timers)
     mock.timers.tick(1);
     await flushMicrotasks();
     assert.equal(settled, true, "the total deadline fires at exactly 15 s");
+    await rejectsWith(dribbled, 408, "BODY_TIMEOUT");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+const INGRESS_STYLE_POLICY = Object.freeze({ maximumTotalMilliseconds: 60_000, maximumIdleMilliseconds: 15_000 });
+
+test("a route's own read policy replaces the control policy: 15 s idle (fake timers)", async () => {
+  mock.timers.enable({ apis: ["setTimeout", "Date"], now: 3_000_000 });
+  try {
+    const stalled = contract.readBoundedJsonRequest(jsonRequest(new ReadableStream({ pull() {
+      return new Promise(() => {});
+    } })), { policy: INGRESS_STYLE_POLICY });
+    let settled = false;
+    stalled.then(() => { settled = true; }, () => { settled = true; });
+    await flushMicrotasks();
+    mock.timers.tick(14_999);
+    await flushMicrotasks();
+    assert.equal(settled, false, "the control policy's 5 s idle limit does not apply");
+    mock.timers.tick(1);
+    await flushMicrotasks();
+    assert.equal(settled, true, "the route's idle deadline fires at exactly 15 s");
+    await rejectsWith(stalled, 408, "BODY_TIMEOUT");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("a route's own read policy replaces the control policy: 60 s total (fake timers)", async () => {
+  mock.timers.enable({ apis: ["setTimeout", "Date"], now: 4_000_000 });
+  try {
+    const dribbled = contract.readBoundedJsonRequest(jsonRequest(new ReadableStream({
+      pull(controller) {
+        return new Promise((resolvePull) => {
+          setTimeout(() => {
+            controller.enqueue(new TextEncoder().encode(" "));
+            resolvePull();
+          }, 9_000);
+        });
+      },
+    })), { policy: INGRESS_STYLE_POLICY });
+    let settled = false;
+    dribbled.then(() => { settled = true; }, () => { settled = true; });
+    await flushMicrotasks();
+    for (let elapsed = 0; elapsed < 59_999; elapsed += 1) {
+      mock.timers.tick(1);
+      if (elapsed % 1_000 === 999) await flushMicrotasks();
+    }
+    await flushMicrotasks();
+    assert.equal(settled, false, "9 s gaps pass the route's 15 s idle window and outlive the control 15 s total");
+    mock.timers.tick(1);
+    await flushMicrotasks();
+    assert.equal(settled, true, "the route's total deadline fires at exactly 60 s");
     await rejectsWith(dribbled, 408, "BODY_TIMEOUT");
   } finally {
     mock.timers.reset();
