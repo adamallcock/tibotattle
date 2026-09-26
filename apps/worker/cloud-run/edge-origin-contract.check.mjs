@@ -17,8 +17,6 @@ const REQUEST_BOUNDARY_PATH = resolve(ROOT, "request-boundary.mjs");
 const PRIVATE_ORIGIN = "https://edge-origin-abc123-uc.a.run.app";
 const PRIVATE_HOST = new URL(PRIVATE_ORIGIN).host;
 const PUBLIC_ORIGIN = "https://public.synthetic.example";
-// Written with String.raw so the comparison is against the exact source text.
-const CALLBACK_QUERY_PATTERN_SOURCE = String.raw`/[\u0000-\u0020\u007f#\\]/u`;
 
 const vite = await createServer({
   root: WORKER_ROOT,
@@ -113,45 +111,10 @@ test("request-boundary.mjs treats the contract's callback and invoker header nam
   assert.deepEqual([...sanitized.keys()], ["content-type"]);
 });
 
-function stripComments(source) {
-  return source
-    .replace(/\/\*[\s\S]*?\*\//gu, "")
-    .split("\n")
-    .filter((line) => !/^\s*\/\//u.test(line))
-    .join("\n");
-}
-
 test("the contract source is self-contained and runtime-neutral", async () => {
   const [contractSource, boundarySource] = await Promise.all([
     readFile(CONTRACT_PATH, "utf8"),
     readFile(REQUEST_BOUNDARY_PATH, "utf8"),
   ]);
-  const code = stripComments(contractSource);
-  assert.ok(code.includes("export function parseCloudRunInvokerClaims"));
-  for (const [label, pattern] of [
-    ["static import", /^\s*import\b/mu],
-    ["dynamic import", /\bimport\s*\(/u],
-    ["re-export", /\bexport\s+(?:\*|\{[^}]*\})\s*from\b/u],
-    ["require", /\brequire\s*\(/u],
-    ["node: specifier", /["']node:/u],
-    ["Buffer", /\bBuffer\b/u],
-    ["process", /\bprocess\b/u],
-    ["globalThis", /\bglobalThis\b/u],
-    ["Workers cache", /\bcaches\b/u],
-    ["Workers HTMLRewriter", /\bHTMLRewriter\b/u],
-    ["Workers WebSocketPair", /\bWebSocketPair\b/u],
-    ["navigator", /\bnavigator\b/u],
-    ["scheduler", /\bscheduler\b/u],
-    ["console", /\bconsole\b/u],
-  ]) {
-    assert.equal(pattern.test(code), false, label);
-  }
-  // No per-address header, derivation or pattern: the edge-only secret's
-  // minimum length is the only identifier that names a client.
-  const clientIdentifiers = new Set(code.match(/\w*client\w*/giu) ?? []);
-  assert.deepEqual([...clientIdentifiers], ["EDGE_MIN_CLIENT_KEY_SECRET_LENGTH"]);
-  // The behavioural table above is authoritative; this pins the mirrored rule
-  // textually so a reformatted copy cannot drift unnoticed.
-  assert.ok(code.includes(CALLBACK_QUERY_PATTERN_SOURCE), "contract callback pattern");
-  assert.ok(boundarySource.includes(CALLBACK_QUERY_PATTERN_SOURCE), "request-boundary callback pattern");
+  vectors.checkContractSources({ contract: contractSource, requestBoundary: boundarySource }, nodeAssert);
 });

@@ -14,6 +14,21 @@
  */
 
 // ---------------------------------------------------------------------------
+// Validated strings
+
+/**
+ * A string one of this module's validators accepted. The brand lets `true`
+ * narrow an unknown or nullable input to a string, while `false` leaves a
+ * plain string input typed as a string (a bare `value is string` would narrow
+ * it to never).
+ */
+type Validated<Kind extends string> = string & { readonly __edgeOriginContract: Kind };
+export type EdgeRequestId = Validated<"EdgeRequestId">;
+export type GoogleCallbackQuery = Validated<"GoogleCallbackQuery">;
+export type EdgeOriginAudience = Validated<"EdgeOriginAudience">;
+export type EdgeServiceAccountEmail = Validated<"EdgeServiceAccountEmail">;
+
+// ---------------------------------------------------------------------------
 // Modes and hosts
 
 export const EDGE_UPSTREAM_MODES = Object.freeze(["worker", "fenced", "gcp"] as const);
@@ -155,7 +170,7 @@ export function decodeEdgeAdmission(value: unknown): EdgeAdmission | null {
 const EDGE_REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 /** A lowercase RFC 9562 version 4 UUID, as crypto.randomUUID() produces. */
-export function isEdgeRequestId(value: unknown): value is string {
+export function isEdgeRequestId(value: unknown): value is EdgeRequestId {
   return typeof value === "string" && EDGE_REQUEST_ID_PATTERN.test(value);
 }
 
@@ -171,7 +186,7 @@ export const MAX_GOOGLE_CALLBACK_URL_LENGTH = 8_192;
  * acceptance of a bare '?'. The edge sends the header only when this holds, so
  * the origin never receives a query it would refuse.
  */
-export function validGoogleCallbackQuery(value: unknown): value is string {
+export function validGoogleCallbackQuery(value: unknown): value is GoogleCallbackQuery {
   return typeof value === "string"
     && value.length >= 1
     && value.length <= MAX_GOOGLE_CALLBACK_URL_LENGTH
@@ -192,7 +207,7 @@ export interface CloudRunInvokerClaims {
 /**
  * Allowed clock difference between the token issuer and the reader, in
  * seconds. A token is accepted while expiresAt > now - skew and its issue
- * time is not later than now + skew.
+ * time, when present, is not later than now + skew.
  */
 export const EDGE_INVOKER_CLOCK_SKEW_SECONDS = 60;
 
@@ -260,11 +275,18 @@ function parseInvokerClaims(value: unknown, nowSeconds: unknown): CloudRunInvoke
   const audiences = readInvokerAudiences(payload.aud);
   if (audiences === null) return null;
   const expiresAt = payload.exp;
-  const issuedAt = payload.iat;
-  if (!isNonNegativeSafeInteger(expiresAt) || !isNonNegativeSafeInteger(issuedAt)
-      || expiresAt <= issuedAt
-      || issuedAt > nowSeconds + EDGE_INVOKER_CLOCK_SKEW_SECONDS
+  if (!isNonNegativeSafeInteger(expiresAt)
       || expiresAt <= nowSeconds - EDGE_INVOKER_CLOCK_SKEW_SECONDS) {
+    return null;
+  }
+  // Google-issued ID tokens carry `iat` and Cloud Run's front end verifies
+  // the token before delivery, so `iat` is validated when present but not
+  // required.
+  const issuedAt = payload.iat;
+  if (issuedAt !== undefined
+      && (!isNonNegativeSafeInteger(issuedAt)
+        || issuedAt >= expiresAt
+        || issuedAt > nowSeconds + EDGE_INVOKER_CLOCK_SKEW_SECONDS)) {
     return null;
   }
   return Object.freeze({ email, emailVerified: verified === true, audiences, expiresAt });
@@ -274,10 +296,11 @@ function parseInvokerClaims(value: unknown, nowSeconds: unknown): CloudRunInvoke
  * Decodes the claims Cloud Run delivers in x-serverless-authorization after
  * its IAM front end has verified the token: 'Bearer ' plus three base64url
  * segments, at most 8192 characters. The payload must carry `email`, `aud`
- * (a string or 1-16 strings), and integer `iat` < `exp`; `email_verified`,
- * when present, must be a boolean. Returns null for anything malformed or
- * outside the clock-skew window; never throws and never retains the value.
- * Audience, verification and identity decisions belong to the caller.
+ * (a string or 1-16 strings) and integer `exp`. When present,
+ * `email_verified` must be a boolean and `iat` an integer before `exp`.
+ * Returns null for anything malformed or outside the clock-skew window;
+ * never throws and never retains the value. Audience, verification and
+ * identity decisions belong to the caller.
  */
 export function parseCloudRunInvokerClaims(
   value: unknown,
@@ -307,7 +330,13 @@ const MIN_UPSTREAM_HEADERS_TIMEOUT_SECONDS = 5;
 const MAX_UPSTREAM_HEADERS_TIMEOUT_SECONDS = 300;
 const DEFAULT_UPSTREAM_HEADERS_TIMEOUT_SECONDS = 100;
 
-function canonicalRunAppOrigin(value: unknown): string | null {
+/**
+ * Returns `value` when it is a canonical https origin (no credentials, port,
+ * path, query or fragment) whose host is a lowercase DNS name under run.app,
+ * else null; never throws. Use it for every setting that names a Cloud Run
+ * service origin.
+ */
+export function canonicalRunAppOrigin(value: unknown): string | null {
   if (typeof value !== "string" || value.length > 512) return null;
   let url: URL;
   try { url = new URL(value); } catch { return null; }
@@ -318,6 +347,19 @@ function canonicalRunAppOrigin(value: unknown): string | null {
     return null;
   }
   return url.origin;
+}
+
+/** An ID-token audience: 1-256 printable ASCII characters, no outer spaces. */
+export function isEdgeOriginAudience(value: unknown): value is EdgeOriginAudience {
+  return typeof value === "string" && AUDIENCE_PATTERN.test(value);
+}
+
+/**
+ * A user-managed service account email (6-30 character account id and
+ * project id), as used for the edge invoker and any origin verifier.
+ */
+export function isEdgeServiceAccountEmail(value: unknown): value is EdgeServiceAccountEmail {
+  return typeof value === "string" && SERVICE_ACCOUNT_EMAIL_PATTERN.test(value);
 }
 
 function upstreamHeadersTimeoutSeconds(value: unknown): number | null {
@@ -341,9 +383,8 @@ function readEdgeOriginConfiguration(get: (name: string) => unknown): EdgeOrigin
   const invokerServiceAccount = get("EDGE_INVOKER_SERVICE_ACCOUNT");
   const timeoutSeconds = upstreamHeadersTimeoutSeconds(get("EDGE_UPSTREAM_HEADERS_TIMEOUT_SECONDS"));
   if (upstreamOrigin === null
-      || typeof audience !== "string" || !AUDIENCE_PATTERN.test(audience)
-      || typeof invokerServiceAccount !== "string"
-      || !SERVICE_ACCOUNT_EMAIL_PATTERN.test(invokerServiceAccount)
+      || !isEdgeOriginAudience(audience)
+      || !isEdgeServiceAccountEmail(invokerServiceAccount)
       || timeoutSeconds === null) {
     return null;
   }

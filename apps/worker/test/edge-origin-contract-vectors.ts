@@ -45,9 +45,12 @@ const EXPECTED_EXPORT_NAMES = Object.freeze([
   "GOOGLE_CALLBACK_PATH",
   "MAX_GOOGLE_CALLBACK_URL_LENGTH",
   "ORIGIN_BOUNDARY_ERROR_BODY",
+  "canonicalRunAppOrigin",
   "decodeEdgeAdmission",
   "encodeEdgeAdmission",
+  "isEdgeOriginAudience",
   "isEdgeRequestId",
+  "isEdgeServiceAccountEmail",
   "parseCloudRunInvokerClaims",
   "parseEdgeOriginConfiguration",
   "parseEdgeUpstreamMode",
@@ -290,6 +293,21 @@ function withPayload(overrides: Record<string, unknown>, omit: readonly string[]
   return invokerToken({ payload });
 }
 
+/**
+ * The delivered payload with one invalid UTF-8 byte inside an unrelated string
+ * claim, so only a strict UTF-8 decode (not JSON.parse) can refuse it.
+ */
+function payloadSegmentWithInvalidUtf8(): string {
+  const bytes = new TextEncoder().encode(JSON.stringify({ ...INVOKER_PAYLOAD, name: "x\u00ffx" }));
+  // U+00FF encodes as C3 BF, the payload's only non-ASCII bytes; a lone FF
+  // byte is never valid UTF-8.
+  const index = bytes.indexOf(0xc3);
+  if (index < 0 || bytes[index + 1] !== 0xbf || bytes.indexOf(0xc3, index + 1) !== -1) {
+    throw new Error("SYNTHETIC_UTF8_MARKER_UNREACHABLE");
+  }
+  return base64UrlBytes(Uint8Array.of(...bytes.subarray(0, index), 0xff, ...bytes.subarray(index + 2)));
+}
+
 /** A valid token padded with an unrelated claim to exactly `length` characters. */
 function invokerTokenOfLength(length: number): string {
   for (let kidPadding = 0; kidPadding < 4; kidPadding += 1) {
@@ -304,6 +322,10 @@ function invokerTokenOfLength(length: number): string {
   }
   throw new Error("SYNTHETIC_TOKEN_LENGTH_UNREACHABLE");
 }
+
+const SIXTEEN_AUDIENCES = Object.freeze(Array.from({ length: 16 }, (_, index) => `aud-${index}`));
+/** Valid at a zero clock and inside the skew at -1, so only the clock guard refuses -1. */
+const EARLY_TOKEN_TIMES = Object.freeze({ iat: 0, exp: 10_000 });
 
 const EXPECTED_CLAIMS = Object.freeze({
   email: INVOKER_SERVICE_ACCOUNT,
@@ -345,9 +367,32 @@ function validClaimsCases(): readonly ValidClaimsCase[] {
       expected: { ...EXPECTED_CLAIMS, emailVerified: false },
     },
     {
+      label: "issue time absent",
+      value: withPayload({}, ["iat"]),
+      expected: EXPECTED_CLAIMS,
+    },
+    {
+      label: "only the required claims",
+      value: invokerToken({
+        payload: { aud: INVOKER_AUDIENCE, email: INVOKER_SERVICE_ACCOUNT, exp: INVOKER_NOW_SECONDS + 3_000 },
+      }),
+      expected: { ...EXPECTED_CLAIMS, emailVerified: false },
+    },
+    {
       label: "audience list",
       value: withPayload({ aud: [INVOKER_AUDIENCE, "https://edge-origin-abc123-uc.a.run.app"] }),
       expected: { ...EXPECTED_CLAIMS, audiences: [INVOKER_AUDIENCE, "https://edge-origin-abc123-uc.a.run.app"] },
+    },
+    {
+      label: "sixteen audiences",
+      value: withPayload({ aud: SIXTEEN_AUDIENCES }),
+      expected: { ...EXPECTED_CLAIMS, audiences: SIXTEEN_AUDIENCES },
+    },
+    {
+      label: "zero clock",
+      value: withPayload(EARLY_TOKEN_TIMES),
+      now: 0,
+      expected: { ...EXPECTED_CLAIMS, expiresAt: EARLY_TOKEN_TIMES.exp },
     },
     {
       label: "expiry inside the clock skew",
@@ -419,6 +464,10 @@ function invalidClaimsCases(): readonly InvalidClaimsCase[] {
       label: "payload invalid UTF-8",
       value: invokerToken({ payloadSegment: base64UrlBytes(Uint8Array.of(0x7b, 0xff, 0x7d)) }),
     },
+    {
+      label: "payload invalid UTF-8 inside a string claim",
+      value: invokerToken({ payloadSegment: payloadSegmentWithInvalidUtf8() }),
+    },
     { label: "email missing", value: withPayload({}, ["email"]) },
     { label: "email number", value: withPayload({ email: 7 }) },
     { label: "email empty", value: withPayload({ email: "" }) },
@@ -445,8 +494,11 @@ function invalidClaimsCases(): readonly InvalidClaimsCase[] {
     { label: "expiry fractional", value: withPayload({ exp: INVOKER_NOW_SECONDS + 3_000.5 }) },
     { label: "expiry negative", value: withPayload({ exp: -1 }) },
     { label: "expiry not after issue", value: withPayload({ exp: INVOKER_NOW_SECONDS, iat: INVOKER_NOW_SECONDS }) },
-    { label: "issue time missing", value: withPayload({}, ["iat"]) },
+    { label: "issue time null", value: withPayload({ iat: null }) },
     { label: "issue time string", value: withPayload({ iat: String(INVOKER_NOW_SECONDS) }) },
+    { label: "issue time negative", value: withPayload({ iat: -1 }) },
+    { label: "issue time fractional", value: withPayload({ iat: INVOKER_NOW_SECONDS - 600.5 }) },
+    { label: "issue time after expiry", value: withPayload({ iat: INVOKER_NOW_SECONDS + 3_001 }) },
     {
       label: "issued beyond the clock skew",
       value: withPayload({ iat: INVOKER_NOW_SECONDS + 61, exp: INVOKER_NOW_SECONDS + 3_661 }),
@@ -457,6 +509,7 @@ function invalidClaimsCases(): readonly InvalidClaimsCase[] {
     },
     { label: "clock NaN", value: token, clock: Number.NaN },
     { label: "clock negative", value: token, clock: -1 },
+    { label: "clock negative for a token valid at a zero clock", value: withPayload(EARLY_TOKEN_TIMES), clock: -1 },
     { label: "clock infinite", value: token, clock: Number.POSITIVE_INFINITY },
     { label: "clock string", value: token, clock: String(INVOKER_NOW_SECONDS) },
     { label: "clock missing", value: token, clock: undefined },
@@ -472,6 +525,7 @@ function invalidClaimsCases(): readonly InvalidClaimsCase[] {
 const ORIGIN = "https://edge-origin-abc123-uc.a.run.app";
 const AUDIENCE = INVOKER_AUDIENCE;
 const SERVICE_ACCOUNT = INVOKER_SERVICE_ACCOUNT;
+const LONGEST_SERVICE_ACCOUNT = `a${"b".repeat(28)}c@d${"e".repeat(28)}f.iam.gserviceaccount.com`;
 const BASE_CONFIGURATION: Readonly<Record<string, unknown>> = Object.freeze({
   EDGE_UPSTREAM_ORIGIN: ORIGIN,
   EDGE_ORIGIN_AUDIENCE: AUDIENCE,
@@ -514,89 +568,125 @@ const VALID_CONFIGURATION_CASES: readonly {
   },
   {
     label: "longest service account",
-    overrides: { EDGE_INVOKER_SERVICE_ACCOUNT: `a${"b".repeat(28)}c@d${"e".repeat(28)}f.iam.gserviceaccount.com` },
-    expected: { invokerServiceAccount: `a${"b".repeat(28)}c@d${"e".repeat(28)}f.iam.gserviceaccount.com` },
+    overrides: { EDGE_INVOKER_SERVICE_ACCOUNT: LONGEST_SERVICE_ACCOUNT },
+    expected: { invokerServiceAccount: LONGEST_SERVICE_ACCOUNT },
   },
 ];
 
+type FieldCase = readonly [value: unknown, label: string];
+
+// Single-field tables: each value is checked through its exported validator
+// and, with the other settings valid, through parseEdgeOriginConfiguration.
+const VALID_UPSTREAM_ORIGINS: readonly string[] = [
+  ORIGIN,
+  "https://edge-origin-123456789012.europe-west1.run.app",
+  "https://a.run.app",
+];
+
+const INVALID_UPSTREAM_ORIGINS: readonly FieldCase[] = [
+  [undefined, "absent"],
+  ["", "empty"],
+  ["http://edge-origin-abc123-uc.a.run.app", "http"],
+  [`${ORIGIN}/`, "trailing slash path"],
+  [`${ORIGIN}/api`, "path"],
+  [`${ORIGIN}?region=us`, "query"],
+  [`${ORIGIN}#fragment`, "fragment"],
+  ["https://origin.synthetic.example", "non-run.app host"],
+  ["https://run.app", "bare run.app"],
+  ["https://evilrun.app", "host ending in run.app without a dot"],
+  ["https://x.evilrun.app", "subdomain of a host ending in run.app without a dot"],
+  ["https://edge.run.app.synthetic.example", "run.app prefix of another host"],
+  ["https://edge.a.run.app.", "trailing dot"],
+  ["https://user@edge-origin-abc123-uc.a.run.app", "username"],
+  ["https://user:secret@edge-origin-abc123-uc.a.run.app", "credentials"],
+  [`${ORIGIN}:443`, "default port"],
+  [`${ORIGIN}:8443`, "explicit port"],
+  ["HTTPS://EDGE-ORIGIN-ABC123-UC.A.RUN.APP", "non-canonical case"],
+  [` ${ORIGIN}`, "leading space"],
+  [`${ORIGIN} `, "trailing space"],
+  ["https://edge_origin.a.run.app", "underscore host"],
+  ["https://-edge.a.run.app", "leading hyphen label"],
+  ["https://\u00fc.run.app", "non-ASCII host"],
+  ["https://127.0.0.1", "IPv4 host"],
+  ["https://[::1]", "IPv6 host"],
+  ["wss://edge-origin-abc123-uc.a.run.app", "other scheme"],
+  [42, "number"],
+];
+
+const VALID_AUDIENCES: readonly string[] = [AUDIENCE, "a", "a".repeat(256), "edge origin"];
+
+const INVALID_AUDIENCES: readonly FieldCase[] = [
+  [undefined, "absent"],
+  ["", "empty"],
+  [" aud", "leading space"],
+  ["aud ", "trailing space"],
+  ["a".repeat(257), "257 characters"],
+  ["a\u0000b", "NUL"],
+  ["a\nb", "line feed"],
+  ["a\u007fb", "delete"],
+  ["\u00e9", "non-ASCII"],
+  [42, "number"],
+];
+
+const VALID_SERVICE_ACCOUNTS: readonly string[] = [
+  SERVICE_ACCOUNT,
+  "abcdef@ghijkl.iam.gserviceaccount.com",
+  LONGEST_SERVICE_ACCOUNT,
+];
+
+const INVALID_SERVICE_ACCOUNTS: readonly FieldCase[] = [
+  [undefined, "absent"],
+  ["", "empty"],
+  ["Edge-invoker@synthetic-edge-0.iam.gserviceaccount.com", "uppercase"],
+  ["edge@synthetic-edge-0.iam.gserviceaccount.com", "local part too short"],
+  ["abcde@synthetic-edge-0.iam.gserviceaccount.com", "five-character local part"],
+  [`a${"b".repeat(29)}c@synthetic-edge-0.iam.gserviceaccount.com`, "local part too long"],
+  ["edge-invoker-@synthetic-edge-0.iam.gserviceaccount.com", "local part ends in hyphen"],
+  ["1edge-invoker@synthetic-edge-0.iam.gserviceaccount.com", "local part starts with a digit"],
+  ["edge-invoker@edge.iam.gserviceaccount.com", "project too short"],
+  ["edge-invoker@abcde.iam.gserviceaccount.com", "five-character project"],
+  [`edge-invoker@a${"b".repeat(29)}c.iam.gserviceaccount.com`, "project too long"],
+  ["edge-invoker@synthetic-edge-0.iam.gserviceaccount.com.synthetic.example", "suffix"],
+  ["123456789012-compute@developer.gserviceaccount.com", "default compute account"],
+  ["edge-invoker@synthetic-edge-0.iam.gserviceaccount.co", "wrong domain"],
+  [`${SERVICE_ACCOUNT} `, "trailing space"],
+  [42, "number"],
+];
+
+const INVALID_TIMEOUTS: readonly FieldCase[] = [
+  ["4", "4"],
+  ["301", "301"],
+  ["0", "0"],
+  ["-5", "negative"],
+  ["5.5", "fractional string"],
+  ["05", "leading zero"],
+  ["1e2", "exponent"],
+  ["0x64", "hex"],
+  ["1000", "1000"],
+  ["", "empty"],
+  [" 100", "leading space"],
+  ["100 ", "trailing space"],
+  [4, "number 4"],
+  [301, "number 301"],
+  [5.5, "fractional number"],
+  [Number.NaN, "NaN"],
+  [null, "null"],
+  [true, "boolean"],
+];
+
+function invalidSettingCases(
+  name: string,
+  prefix: string,
+  cases: readonly FieldCase[],
+): { readonly label: string; readonly overrides: Record<string, unknown> }[] {
+  return cases.map(([value, label]) => ({ label: `${prefix} ${label}`, overrides: { [name]: value } }));
+}
+
 const INVALID_CONFIGURATION_CASES: readonly { readonly label: string; readonly overrides: Record<string, unknown> }[] = [
-  ...[
-    [undefined, "absent"],
-    ["", "empty"],
-    ["http://edge-origin-abc123-uc.a.run.app", "http"],
-    [`${ORIGIN}/`, "trailing slash path"],
-    [`${ORIGIN}/api`, "path"],
-    [`${ORIGIN}?region=us`, "query"],
-    [`${ORIGIN}#fragment`, "fragment"],
-    ["https://origin.synthetic.example", "non-run.app host"],
-    ["https://run.app", "bare run.app"],
-    ["https://edge.run.app.synthetic.example", "run.app prefix of another host"],
-    ["https://edge.a.run.app.", "trailing dot"],
-    ["https://user@edge-origin-abc123-uc.a.run.app", "username"],
-    ["https://user:secret@edge-origin-abc123-uc.a.run.app", "credentials"],
-    [`${ORIGIN}:443`, "default port"],
-    [`${ORIGIN}:8443`, "explicit port"],
-    ["HTTPS://EDGE-ORIGIN-ABC123-UC.A.RUN.APP", "non-canonical case"],
-    [` ${ORIGIN}`, "leading space"],
-    [`${ORIGIN} `, "trailing space"],
-    ["https://edge_origin.a.run.app", "underscore host"],
-    ["https://-edge.a.run.app", "leading hyphen label"],
-    ["https://\u00fc.run.app", "non-ASCII host"],
-    ["https://127.0.0.1", "IPv4 host"],
-    ["https://[::1]", "IPv6 host"],
-    ["wss://edge-origin-abc123-uc.a.run.app", "other scheme"],
-    [42, "number"],
-  ].map(([value, label]) => ({ label: `origin ${String(label)}`, overrides: { EDGE_UPSTREAM_ORIGIN: value } })),
-  ...[
-    [undefined, "absent"],
-    ["", "empty"],
-    [" aud", "leading space"],
-    ["aud ", "trailing space"],
-    ["a".repeat(257), "257 characters"],
-    ["a\u0000b", "NUL"],
-    ["a\nb", "line feed"],
-    ["a\u007fb", "delete"],
-    ["\u00e9", "non-ASCII"],
-    [42, "number"],
-  ].map(([value, label]) => ({ label: `audience ${String(label)}`, overrides: { EDGE_ORIGIN_AUDIENCE: value } })),
-  ...[
-    [undefined, "absent"],
-    ["", "empty"],
-    ["Edge-invoker@synthetic-edge-0.iam.gserviceaccount.com", "uppercase"],
-    ["edge@synthetic-edge-0.iam.gserviceaccount.com", "local part too short"],
-    [`a${"b".repeat(29)}c@synthetic-edge-0.iam.gserviceaccount.com`, "local part too long"],
-    ["edge-invoker-@synthetic-edge-0.iam.gserviceaccount.com", "local part ends in hyphen"],
-    ["1edge-invoker@synthetic-edge-0.iam.gserviceaccount.com", "local part starts with a digit"],
-    ["edge-invoker@edge.iam.gserviceaccount.com", "project too short"],
-    ["edge-invoker@synthetic-edge-0.iam.gserviceaccount.com.synthetic.example", "suffix"],
-    ["123456789012-compute@developer.gserviceaccount.com", "default compute account"],
-    ["edge-invoker@synthetic-edge-0.iam.gserviceaccount.co", "wrong domain"],
-    [`${SERVICE_ACCOUNT} `, "trailing space"],
-    [42, "number"],
-  ].map(([value, label]) => ({ label: `service account ${String(label)}`, overrides: { EDGE_INVOKER_SERVICE_ACCOUNT: value } })),
-  ...[
-    ["4", "4"],
-    ["301", "301"],
-    ["0", "0"],
-    ["-5", "negative"],
-    ["5.5", "fractional string"],
-    ["05", "leading zero"],
-    ["1e2", "exponent"],
-    ["0x64", "hex"],
-    ["1000", "1000"],
-    ["", "empty"],
-    [" 100", "leading space"],
-    ["100 ", "trailing space"],
-    [4, "number 4"],
-    [301, "number 301"],
-    [5.5, "fractional number"],
-    [Number.NaN, "NaN"],
-    [null, "null"],
-    [true, "boolean"],
-  ].map(([value, label]) => ({
-    label: `timeout ${String(label)}`,
-    overrides: { EDGE_UPSTREAM_HEADERS_TIMEOUT_SECONDS: value },
-  })),
+  ...invalidSettingCases("EDGE_UPSTREAM_ORIGIN", "origin", INVALID_UPSTREAM_ORIGINS),
+  ...invalidSettingCases("EDGE_ORIGIN_AUDIENCE", "audience", INVALID_AUDIENCES),
+  ...invalidSettingCases("EDGE_INVOKER_SERVICE_ACCOUNT", "service account", INVALID_SERVICE_ACCOUNTS),
+  ...invalidSettingCases("EDGE_UPSTREAM_HEADERS_TIMEOUT_SECONDS", "timeout", INVALID_TIMEOUTS),
 ];
 
 // ---------------------------------------------------------------------------
@@ -853,6 +943,43 @@ export const EDGE_ORIGIN_CONTRACT_CHECKS: readonly EdgeOriginContractCheck[] = O
     },
   },
   {
+    name: "validates each Cloud Run origin, audience and service account on its own",
+    run(contract, assert) {
+      const accepted = (value: string, overrides: Record<string, unknown>, expected: Record<string, unknown>) => {
+        const label = JSON.stringify(value).slice(0, 80);
+        assert.deepEqual(
+          contract.parseEdgeOriginConfiguration(getter(overrides)),
+          { ...EXPECTED_CONFIGURATION, ...expected },
+          label,
+        );
+      };
+      for (const origin of VALID_UPSTREAM_ORIGINS) {
+        assert.equal(contract.canonicalRunAppOrigin(origin), origin, origin);
+        accepted(origin, { EDGE_UPSTREAM_ORIGIN: origin }, { upstreamOrigin: origin });
+      }
+      for (const audience of VALID_AUDIENCES) {
+        assert.equal(contract.isEdgeOriginAudience(audience), true, audience.slice(0, 80));
+        accepted(audience, { EDGE_ORIGIN_AUDIENCE: audience }, { audience });
+      }
+      for (const account of VALID_SERVICE_ACCOUNTS) {
+        assert.equal(contract.isEdgeServiceAccountEmail(account), true, account);
+        accepted(account, { EDGE_INVOKER_SERVICE_ACCOUNT: account }, { invokerServiceAccount: account });
+      }
+      for (const [value, label] of INVALID_UPSTREAM_ORIGINS) {
+        const origin = neverThrows(() => contract.canonicalRunAppOrigin(value), assert, `origin ${label}`);
+        assert.equal(origin, null, `origin ${label}`);
+      }
+      for (const [value, label] of INVALID_AUDIENCES) {
+        const valid = neverThrows(() => contract.isEdgeOriginAudience(value), assert, `audience ${label}`);
+        assert.equal(valid, false, `audience ${label}`);
+      }
+      for (const [value, label] of INVALID_SERVICE_ACCOUNTS) {
+        const valid = neverThrows(() => contract.isEdgeServiceAccountEmail(value), assert, `service account ${label}`);
+        assert.equal(valid, false, `service account ${label}`);
+      }
+    },
+  },
+  {
     name: "pins the transport constants",
     run(contract, assert) {
       assert.equal(contract.EDGE_FENCE_RETRY_AFTER_SECONDS, 300);
@@ -867,3 +994,76 @@ export const EDGE_ORIGIN_CONTRACT_CHECKS: readonly EdgeOriginContractCheck[] = O
     },
   },
 ]);
+
+// ---------------------------------------------------------------------------
+// Source checks (both runtimes pass the raw text of the two files)
+
+export interface ContractSources {
+  /** src/edge-origin-contract.ts */
+  readonly contract: string;
+  /** cloud-run/request-boundary.mjs */
+  readonly requestBoundary: string;
+}
+
+// Written with String.raw so the comparison is against the exact source text.
+const CALLBACK_QUERY_PATTERN_SOURCE = String.raw`/[\u0000-\u0020\u007f#\\]/u`;
+
+/** request-boundary.mjs's callback-query rule, whitespace-normalized. */
+const REQUEST_BOUNDARY_CALLBACK_RULE = Object.freeze([
+  'const OAUTH_CALLBACK_QUERY_HEADER = "x-tibotattle-google-callback-query";',
+  "const MAX_OAUTH_CALLBACK_QUERY_LENGTH = 8_192;",
+  [
+    'if (typeof callbackQuery !== "string" || callbackQuery.length === 0',
+    "|| callbackQuery.length > MAX_OAUTH_CALLBACK_QUERY_LENGTH",
+    String.raw`|| !callbackQuery.startsWith("?") || /[\u0000-\u0020\u007f#\\]/u.test(callbackQuery)) {`,
+    'throw Object.assign(new Error("OAUTH_CALLBACK_QUERY_INVALID"), { status: 400 });',
+  ].join(" "),
+]);
+
+const RUNTIME_SPECIFIC_SOURCE_PATTERNS: readonly (readonly [label: string, pattern: RegExp])[] = [
+  ["static import", /^\s*import\b/mu],
+  ["dynamic import", /\bimport\s*\(/u],
+  ["re-export", /\bexport\s+(?:\*|\{[^}]*\})\s*from\b/u],
+  ["require", /\brequire\s*\(/u],
+  ["node: specifier", /["']node:/u],
+  ["Buffer", /\bBuffer\b/u],
+  ["process", /\bprocess\b/u],
+  ["globalThis", /\bglobalThis\b/u],
+  ["Workers cache", /\bcaches\b/u],
+  ["Workers HTMLRewriter", /\bHTMLRewriter\b/u],
+  ["Workers WebSocketPair", /\bWebSocketPair\b/u],
+  ["navigator", /\bnavigator\b/u],
+  ["scheduler", /\bscheduler\b/u],
+  ["console", /\bconsole\b/u],
+];
+
+function stripComments(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//gu, "")
+    .split("\n")
+    .filter((line) => !/^\s*\/\//u.test(line))
+    .join("\n");
+}
+
+/**
+ * The contract has no imports or runtime-specific globals, names no client
+ * value, and carries the same callback-query rule as request-boundary.mjs.
+ * The Node check's behavioural comparison with request-boundary.mjs is
+ * authoritative; these textual pins let the Workers lane catch drift too.
+ */
+export function checkContractSources(sources: ContractSources, assert: ContractAssert): void {
+  const code = stripComments(sources.contract);
+  assert.ok(code.includes("export function parseCloudRunInvokerClaims"), "contract source loaded");
+  for (const [label, pattern] of RUNTIME_SPECIFIC_SOURCE_PATTERNS) {
+    assert.equal(pattern.test(code), false, label);
+  }
+  // No per-address header, derivation or pattern: the edge-only secret's
+  // minimum length is the only identifier that names a client.
+  assert.deepEqual([...new Set(code.match(/\w*client\w*/giu) ?? [])], ["EDGE_MIN_CLIENT_KEY_SECRET_LENGTH"]);
+  assert.ok(code.includes(CALLBACK_QUERY_PATTERN_SOURCE), "contract callback pattern");
+  const boundary = sources.requestBoundary.replace(/\s+/gu, " ");
+  assert.ok(boundary.includes("export function buildPublicGoogleRequestUrl"), "request-boundary source loaded");
+  for (const rule of REQUEST_BOUNDARY_CALLBACK_RULE) {
+    assert.ok(boundary.includes(rule), `request-boundary callback rule: ${rule.slice(0, 60)}`);
+  }
+}

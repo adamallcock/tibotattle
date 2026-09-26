@@ -1,10 +1,26 @@
 import { describe, expect, it } from "vitest";
 
 import * as contract from "../src/edge-origin-contract";
-import { EDGE_ORIGIN_CONTRACT_CHECKS, type ContractAssert } from "./edge-origin-contract-vectors";
+import {
+  checkContractSources,
+  EDGE_ORIGIN_CONTRACT_CHECKS,
+  type ContractAssert,
+} from "./edge-origin-contract-vectors";
 
 // The same checks run under Node in cloud-run/edge-origin-contract.check.mjs,
 // which also compares the callback-query rule with the Cloud Run boundary.
+
+// Vite's ?raw query returns a file's text; the specifiers are variables so
+// the type checker does not need a module declaration for them.
+const CONTRACT_SOURCE_SPECIFIER = "../src/edge-origin-contract.ts?raw";
+const REQUEST_BOUNDARY_SOURCE_SPECIFIER = "../cloud-run/request-boundary.mjs?raw";
+
+async function rawSource(specifier: string): Promise<string> {
+  const module: { readonly default?: unknown } = await import(/* @vite-ignore */ specifier);
+  if (typeof module.default !== "string") throw new Error("RAW_SOURCE_UNAVAILABLE");
+  return module.default;
+}
+
 const assert: ContractAssert = {
   equal(actual, expected, message) {
     expect(actual, message).toBe(expected);
@@ -29,6 +45,14 @@ describe("edge/origin transport contract (workerd)", () => {
       check.run(contract, assert);
     });
   }
+
+  it("keeps the contract source self-contained and runtime-neutral", async () => {
+    const [contractSource, requestBoundarySource] = await Promise.all([
+      rawSource(CONTRACT_SOURCE_SPECIFIER),
+      rawSource(REQUEST_BOUNDARY_SOURCE_SPECIFIER),
+    ]);
+    checkContractSources({ contract: contractSource, requestBoundary: requestBoundarySource }, assert);
+  });
 
   it("never writes rejected input to the console", () => {
     const calls: unknown[] = [];
