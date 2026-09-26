@@ -12,6 +12,20 @@
  *   readProductionConfiguration(processEnv, profile) -> frozen configuration
  *   createProductionWorkerEnv(configuration, { bindings }) -> frozen env
  *
+ * Profiles belong to one of two planes. The production plane has the
+ * 'production' service and the 'maintenance-job' and 'analytics-job' jobs;
+ * the staging plane mirrors them as 'staging', 'staging-maintenance-job' and
+ * 'staging-analytics-job'. Each profile requires only the secrets it consumes
+ * (PRODUCTION_PROFILE_SECRET_NAMES) and refuses the others.
+ *
+ * Staging is synthetic-only by default: it runs the closed admission posture
+ * of the checked-in staging Worker (STAGING_CONTAINMENT_VARS and
+ * STAGING_ORIGIN_TIER_RATE_LIMITS, pinned to wrangler.jsonc env.staging by the
+ * repo drift check) and never declares external participants authorized.
+ * STAGING_ADMISSION_MODE='synthetic-rehearsal' opens only accountless
+ * admission, as the owner-reviewed staging rehearsal override does. No
+ * setting admits real clients to staging; that needs an owner decision first.
+ *
  * The env is built from named keys only. It never spreads or copies the
  * process environment, so test seams the Worker reads with Reflect.get
  * (ACCESS_TEST_JWKS_JSON, IDENTITY_TEST_JWKS_JSON, ...), D1/R2/asset bindings
@@ -54,13 +68,38 @@ export const PRODUCTION_PUBLIC_ORIGIN = "https://tibotattle.com";
 export const PRODUCTION_ADMIN_ORIGIN = "https://admin.tibotattle.com";
 export const PRODUCTION_WWW_HOST = "www.tibotattle.com";
 
-/** Per-instance PostgreSQL pool sizes for the production service. */
+/**
+ * PostgreSQL pool sizes for one service instance. `readiness` is the size of
+ * each dedicated readiness pool; there is one on each Cloud SQL instance.
+ */
 export const PRODUCTION_POOL_SIZES = Object.freeze({
   data: 3,
   ledger: 2,
   admission: 4,
   readiness: 1,
 });
+
+/** The Cloud SQL instances each service pool opens, one pool per entry. */
+export const PRODUCTION_POOL_INSTANCES = Object.freeze({
+  data: Object.freeze(["primary"]),
+  ledger: Object.freeze(["ledger"]),
+  admission: Object.freeze(["primary"]),
+  readiness: Object.freeze(["primary", "ledger"]),
+});
+
+/**
+ * The most connections one service instance holds on each Cloud SQL instance
+ * (primary: data + admission + readiness; ledger: ledger + readiness). The
+ * infrastructure connection budget multiplies these by the instance count.
+ */
+export const PRODUCTION_POOL_CONNECTIONS_PER_INSTANCE = Object.freeze(
+  Object.entries(PRODUCTION_POOL_INSTANCES).reduce((budget, [pool, instances]) => {
+    for (const instance of instances) {
+      budget[instance] = (budget[instance] ?? 0) + PRODUCTION_POOL_SIZES[pool];
+    }
+    return budget;
+  }, {}),
+);
 
 /**
  * Transaction bounds for the origin-tier limiters and the ingress budget on
@@ -75,7 +114,9 @@ export const PRODUCTION_ADMISSION_TIMEOUTS = Object.freeze({
 /**
  * Address-keyed limits enforced at the Cloudflare edge. The origin receives
  * only the edge's outcome and replays it through these binding names; they
- * are never instantiated as PostgreSQL limiters.
+ * are never instantiated as PostgreSQL limiters. createProductionWorkerEnv
+ * accepts only edge replay bindings for them: frozen plain objects whose one
+ * own property is the limit() method (EP-6 createEdgeAdmissionLimiters).
  */
 export const EDGE_TIER_RATE_LIMIT_NAMES = Object.freeze([
   "ENROLLMENT",
@@ -103,6 +144,23 @@ export const ORIGIN_TIER_RATE_LIMITS = Object.freeze({
   }),
 });
 
+/**
+ * The staging plane's origin-tier limits: the checked-in staging Worker's
+ * values (wrangler.jsonc env.staging, pinned by the repo drift check).
+ */
+export const STAGING_ORIGIN_TIER_RATE_LIMITS = Object.freeze({
+  UPLOAD_AUTHORIZATION: Object.freeze({
+    binding: "UPLOAD_AUTHORIZATION_RATE_LIMIT",
+    limit: 300,
+    periodSeconds: 60,
+  }),
+  UPLOAD_PRINCIPAL: Object.freeze({
+    binding: "UPLOAD_PRINCIPAL_RATE_LIMIT",
+    limit: 6,
+    periodSeconds: 60,
+  }),
+});
+
 export const UPLOAD_INGRESS_BUDGET_BINDING = "UPLOAD_INGRESS_BUDGET";
 
 /** The injected bindings a service env carries, and nothing else. */
@@ -121,6 +179,34 @@ export const REQUIRED_SECRET_NAMES = Object.freeze([
   "APPLE_PRIVATE_KEY",
 ]);
 export const OPTIONAL_SECRET_NAMES = Object.freeze(["DISTRIBUTION_GITHUB_API_TOKEN"]);
+
+const SERVICE_SECRETS = Object.freeze({
+  required: REQUIRED_SECRET_NAMES,
+  optional: OPTIONAL_SECRET_NAMES,
+});
+const NO_SECRETS = Object.freeze({ required: Object.freeze([]), optional: Object.freeze([]) });
+
+/**
+ * The secrets each profile consumes; any other REQUIRED/OPTIONAL secret
+ * present in a profile's environment is refused. The service reads all of
+ * them. Scheduled maintenance reads IDENTITY_LINK_SECRET (backend lifecycle
+ * and restore replay) and, in production only, the GitHub distribution sync
+ * token. The analytics lanes read none.
+ */
+export const PRODUCTION_PROFILE_SECRET_NAMES = Object.freeze({
+  production: SERVICE_SECRETS,
+  staging: SERVICE_SECRETS,
+  "maintenance-job": Object.freeze({
+    required: Object.freeze(["IDENTITY_LINK_SECRET"]),
+    optional: Object.freeze(["DISTRIBUTION_GITHUB_API_TOKEN"]),
+  }),
+  "analytics-job": NO_SECRETS,
+  "staging-maintenance-job": Object.freeze({
+    required: Object.freeze(["IDENTITY_LINK_SECRET"]),
+    optional: Object.freeze([]),
+  }),
+  "staging-analytics-job": NO_SECRETS,
+});
 
 /** Origin secrets the Cloudflare Worker never had. */
 export const ORIGIN_ONLY_SECRET_NAMES = Object.freeze(["POSTGRES_RATE_LIMIT_SECRET"]);
@@ -293,19 +379,79 @@ export const PRODUCTION_CONFIGURATION_PROFILES = Object.freeze([
   "staging",
   "maintenance-job",
   "analytics-job",
+  "staging-maintenance-job",
+  "staging-analytics-job",
 ]);
 
-/** Job switches, by profile, with the Worker's semantics (unset is off). */
-export const PRODUCTION_JOB_SWITCH_NAMES = Object.freeze({
-  "maintenance-job": Object.freeze(["POSTGRES_SCHEDULED_MAINTENANCE_ENABLED"]),
-  "analytics-job": Object.freeze([
-    "POSTGRES_ANALYTICS_MODE",
-    "POSTGRES_ANALYTICS_PUBLICATION_LANE",
-    "POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL",
-  ]),
+/** Each profile's plane, workload kind and job. */
+const PROFILE_SHAPES = Object.freeze({
+  production: Object.freeze({ plane: "production", workload: "service", job: null }),
+  staging: Object.freeze({ plane: "staging", workload: "service", job: null }),
+  "maintenance-job": Object.freeze({ plane: "production", workload: "job", job: "maintenance" }),
+  "analytics-job": Object.freeze({ plane: "production", workload: "job", job: "analytics" }),
+  "staging-maintenance-job": Object.freeze({ plane: "staging", workload: "job", job: "maintenance" }),
+  "staging-analytics-job": Object.freeze({ plane: "staging", workload: "job", job: "analytics" }),
 });
 
-/** Staging supplies its own identity-bound vars; the rest are production's. */
+const MAINTENANCE_SWITCH_NAMES = Object.freeze(["POSTGRES_SCHEDULED_MAINTENANCE_ENABLED"]);
+const ANALYTICS_SWITCH_NAMES = Object.freeze([
+  "POSTGRES_ANALYTICS_MODE",
+  "POSTGRES_ANALYTICS_PUBLICATION_LANE",
+  "POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL",
+]);
+
+/** Job switches, by profile (see readJobSwitches for their semantics). */
+export const PRODUCTION_JOB_SWITCH_NAMES = Object.freeze({
+  "maintenance-job": MAINTENANCE_SWITCH_NAMES,
+  "analytics-job": ANALYTICS_SWITCH_NAMES,
+  "staging-maintenance-job": MAINTENANCE_SWITCH_NAMES,
+  "staging-analytics-job": ANALYTICS_SWITCH_NAMES,
+});
+
+/**
+ * The staging plane's admission posture, overriding PRODUCTION_VARS: the
+ * checked-in staging Worker's closed values (wrangler.jsonc env.staging,
+ * pinned by the repo drift check). Staging also never carries
+ * STAGING_ABSENT_VAR_NAMES, so its health surface declares no external
+ * participants.
+ */
+export const STAGING_CONTAINMENT_VARS = Object.freeze({
+  ENROLLMENT_MODE: "disabled",
+  ACCOUNTLESS_ENROLLMENT_MODE: "disabled",
+  ACCOUNTLESS_OWNERSHIP_MODE: "disabled",
+  ACCOUNT_SCOPED_INGEST_MODE: "disabled",
+  UPLOAD_INGRESS_QUEUE_MODE: "disabled",
+  UPLOAD_INGRESS_MAX_CONCURRENT: "8",
+  UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE: "120",
+  UPLOAD_INGRESS_BURST: "16",
+  UPLOAD_INGRESS_LEASE_SECONDS: "90",
+  UPLOAD_INGRESS_BODY_TOTAL_SECONDS: "60",
+  UPLOAD_INGRESS_BODY_IDLE_SECONDS: "15",
+  SIGN_IN_START_MAX_PER_MINUTE: "5",
+});
+export const STAGING_ABSENT_VAR_NAMES = Object.freeze(["INCREMENTAL_EXTERNAL_PARTICIPANTS"]);
+
+/**
+ * The staging service's STAGING_ADMISSION_MODE values and the vars each one
+ * sets over the closed posture. Unset means 'closed'. 'synthetic-rehearsal'
+ * is the owner-reviewed staging rehearsal override
+ * (scripts/accountless-staging-rehearsal-plan.mjs): accountless admission
+ * only, public enrollment stays disabled. Every other profile refuses the
+ * setting.
+ */
+export const STAGING_ADMISSION_MODES = Object.freeze({
+  closed: Object.freeze({}),
+  "synthetic-rehearsal": Object.freeze({
+    ACCOUNTLESS_ENROLLMENT_MODE: "enabled",
+    ACCOUNTLESS_OWNERSHIP_MODE: "enabled",
+  }),
+});
+
+/**
+ * The staging plane (service and jobs) supplies its own identity-bound vars,
+ * with ADMIN_HOST_ORIGIN = admin.<PUBLIC_ORIGIN hostname>; its admission
+ * posture is STAGING_CONTAINMENT_VARS; every other var is production's.
+ */
 export const STAGING_PROVIDED_VAR_NAMES = Object.freeze([
   "PUBLIC_ORIGIN",
   "ACCESS_TEAM_DOMAIN",
@@ -321,7 +467,8 @@ export const STAGING_PROVIDED_VAR_NAMES = Object.freeze([
 // ---------------------------------------------------------------------------
 // Validation grammars
 
-const SERVICE_PROFILES = new Set(["production", "staging"]);
+const ALL_SECRET_NAMES = Object.freeze([...REQUIRED_SECRET_NAMES, ...OPTIONAL_SECRET_NAMES]);
+const ADMIN_HOST_PREFIX = "admin.";
 const SOURCE_COMMIT_PATTERN = /^[a-f0-9]{40}$/u;
 // Cloud Run service and job names: a DNS label that starts with a letter.
 const CLOUD_RUN_NAME_PATTERN = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
@@ -363,6 +510,7 @@ const APPLE_ID_PATTERN = /^[A-Z0-9]{10}$/u;
 const APPLE_SERVICES_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,254}[A-Za-z0-9])?$/u;
 const ACCESS_AUD_PATTERN = /^[a-f0-9]{64}$/u;
 const ACCESS_TEAM_DOMAIN_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.cloudflareaccess\.com$/u;
+// At most 64 + 1 + 189 = 254 characters, the longest usable address.
 const EMAIL_PATTERN = /^[!-?A-~]{1,64}@[a-z0-9](?:[a-z0-9.-]{0,187}[a-z0-9])?$/u;
 const GOOGLE_OIDC_CLIENT_ID_PATTERN = /^[0-9]{1,32}-[a-z0-9]{1,64}\.apps\.googleusercontent\.com$/u;
 const DNS_HOSTNAME_PATTERN =
@@ -386,6 +534,8 @@ function readEnvironment(processEnv) {
   const has = (name) => Object.prototype.hasOwnProperty.call(processEnv, name);
   return Object.freeze({
     has,
+    /** A present value exactly as given (an empty string included), else undefined. */
+    raw: (name) => (has(name) ? processEnv[name] : undefined),
     /** A present, non-empty string value, else undefined. */
     value(name) {
       if (!has(name)) return undefined;
@@ -516,18 +666,37 @@ function verifierServiceAccounts(environment, invoker) {
   return Object.freeze(accounts);
 }
 
-function testTargetValues() {
-  const values = new Set();
-  const visit = (value) => {
-    if (typeof value === "string") values.add(value);
-    else if (value !== null && typeof value === "object") Object.values(value).forEach(visit);
-  };
-  visit(CLOUD_RUN_IAM_TEST_TARGET);
-  values.add(new URL(CLOUD_RUN_IAM_TEST_TARGET.origin).host);
-  values.add(`${CLOUD_RUN_IAM_TEST_TARGET.postgres.iamUser}.gserviceaccount.com`);
-  return values;
+/**
+ * The IAM test deployment's resource identities: its service, origin, Cloud
+ * SQL instances, schemas, runtime identity and bucket. Each is a distinctive
+ * name, so a deployment value equal to any of them, in any setting, reuses
+ * the test deployment. Two kinds of CLOUD_RUN_IAM_TEST_TARGET value are
+ * deliberately not identities:
+ * - database names ('tibotattle', 'tibotattle_ledger') are scoped to their
+ *   instance, and the test instances are refused by name; the same names on
+ *   another instance are the repository's conventional names;
+ * - the project and region (and the listen address) are shared locations. A
+ *   new resource in the test project is a distinct resource; whether
+ *   production shares that project is an owner layout decision (the
+ *   infrastructure plan recommends separate projects).
+ */
+function testTargetIdentities() {
+  const target = CLOUD_RUN_IAM_TEST_TARGET;
+  const { primary, ledger, iamUser } = target.postgres;
+  return new Set([
+    target.service,
+    target.origin,
+    new URL(target.origin).host,
+    primary.instanceConnectionName,
+    ledger.instanceConnectionName,
+    primary.schema,
+    ledger.schema,
+    iamUser,
+    `${iamUser}.gserviceaccount.com`,
+    target.gcsBucket,
+  ]);
 }
-const TEST_TARGET_VALUES = testTargetValues();
+const TEST_TARGET_VALUES = testTargetIdentities();
 
 function fingerprintValues() {
   const values = new Set();
@@ -566,30 +735,47 @@ function parseJwk(raw, code) {
   return jwk;
 }
 
-/** Validates every secret by name; values never leave through an error. */
-function readSecrets(environment) {
+/**
+ * Validates the profile's secrets by name and refuses every other secret the
+ * profile does not consume; values never leave through an error.
+ */
+function readSecrets(environment, profile) {
+  const { required, optional } = PRODUCTION_PROFILE_SECRET_NAMES[profile];
+  for (const name of ALL_SECRET_NAMES) {
+    if (!required.includes(name) && !optional.includes(name) && environment.has(name)) {
+      configurationError(`${name}_PROFILE_FORBIDDEN`);
+    }
+  }
   const values = new Map();
-  for (const name of REQUIRED_SECRET_NAMES) {
+  for (const name of required) {
     const value = environment.required(name);
     if (secretBytes(value) > MAX_SECRET_BYTES) configurationError(`${name}_INVALID`);
     values.set(name, value);
   }
-  if (values.get("IDENTITY_LINK_SECRET").length < MIN_IDENTITY_LINK_SECRET_LENGTH) {
+  if (values.has("IDENTITY_LINK_SECRET")
+      && values.get("IDENTITY_LINK_SECRET").length < MIN_IDENTITY_LINK_SECRET_LENGTH) {
     configurationError("IDENTITY_LINK_SECRET_INVALID");
   }
-  if (secretBytes(values.get("POSTGRES_RATE_LIMIT_SECRET")) < MIN_RATE_LIMIT_SECRET_BYTES) {
+  if (values.has("POSTGRES_RATE_LIMIT_SECRET")
+      && secretBytes(values.get("POSTGRES_RATE_LIMIT_SECRET")) < MIN_RATE_LIMIT_SECRET_BYTES) {
     configurationError("POSTGRES_RATE_LIMIT_SECRET_INVALID");
   }
-  const publicJwk = parseJwk(values.get("ENVELOPE_PUBLIC_JWK"), "ENVELOPE_PUBLIC_JWK_INVALID");
-  if (publicJwk.d !== undefined) configurationError("ENVELOPE_PUBLIC_JWK_INVALID");
-  const privateJwk = parseJwk(values.get("ENVELOPE_PRIVATE_JWK"), "ENVELOPE_PRIVATE_JWK_INVALID");
-  if (typeof privateJwk.d !== "string") configurationError("ENVELOPE_PRIVATE_JWK_INVALID");
-  if (privateJwk.kid !== publicJwk.kid) configurationError("ENVELOPE_KEY_ID_MISMATCH");
+  // The envelope pair and the Apple key are service secrets, always together.
+  let envelopeKeyId = null;
+  if (values.has("ENVELOPE_PUBLIC_JWK")) {
+    const publicJwk = parseJwk(values.get("ENVELOPE_PUBLIC_JWK"), "ENVELOPE_PUBLIC_JWK_INVALID");
+    if (publicJwk.d !== undefined) configurationError("ENVELOPE_PUBLIC_JWK_INVALID");
+    const privateJwk = parseJwk(values.get("ENVELOPE_PRIVATE_JWK"), "ENVELOPE_PRIVATE_JWK_INVALID");
+    if (typeof privateJwk.d !== "string") configurationError("ENVELOPE_PRIVATE_JWK_INVALID");
+    if (privateJwk.kid !== publicJwk.kid) configurationError("ENVELOPE_KEY_ID_MISMATCH");
+    envelopeKeyId = publicJwk.kid;
+  }
   // Secret stores commonly flatten the .p8 newlines to backslash-n.
-  if (!PKCS8_PEM_PATTERN.test(values.get("APPLE_PRIVATE_KEY").replaceAll("\\n", "\n"))) {
+  if (values.has("APPLE_PRIVATE_KEY")
+      && !PKCS8_PEM_PATTERN.test(values.get("APPLE_PRIVATE_KEY").replaceAll("\\n", "\n"))) {
     configurationError("APPLE_PRIVATE_KEY_INVALID");
   }
-  for (const name of OPTIONAL_SECRET_NAMES) {
+  for (const name of optional) {
     const value = environment.value(name);
     if (value === undefined) continue;
     if (secretBytes(value) > MAX_SECRET_BYTES) configurationError(`${name}_INVALID`);
@@ -597,18 +783,32 @@ function readSecrets(environment) {
   }
   const handles = {};
   for (const [name, value] of values) handles[name] = secretHandle(name, value);
-  return { handles: Object.freeze(handles), envelopeKeyId: publicJwk.kid };
+  return { handles: Object.freeze(handles), envelopeKeyId };
 }
 
-function switchValue(environment, name) {
+/**
+ * An analytics job switch, read as the Worker reads its counterpart
+ * (storage-analytics-worker.ts, storage-publication-worker.ts):
+ * - POSTGRES_ANALYTICS_MODE (STORAGE_ANALYTICS_MODE): unset or 'disabled' is
+ *   off, 'enabled' is on, and anything else, an empty value included, is a
+ *   configuration error.
+ * - the publication lane switches (PUBLICATION_LANE, PUBLICATION_LANE_EXTERNAL):
+ *   unset, empty or 'disabled' is off and 'enabled' is on. Any other value is
+ *   refused, deliberately stricter than the Worker (which treats it as off):
+ *   these job-scoped names have no deployed values to stay compatible with,
+ *   and a misspelt switch that silently leaves the publication lane off, or
+ *   the delivery lane still publishing, is the failure worth stopping.
+ */
+function analyticsSwitch(environment, name) {
   if (!environment.has(name)) return "disabled";
-  const value = environment.value(name) ?? "disabled";
+  const value = environment.raw(name);
+  if (value === "" && name !== "POSTGRES_ANALYTICS_MODE") return "disabled";
   if (!SWITCH_VALUES.has(value)) configurationError(`${name}_INVALID`);
   return value;
 }
 
-function readJobSwitches(environment, profile) {
-  if (profile === "maintenance-job") {
+function readJobSwitches(environment, job) {
+  if (job === "maintenance") {
     // The existing gate: anything but 'enabled' keeps the writer dormant.
     const probe = Object.freeze({
       POSTGRES_SCHEDULED_MAINTENANCE_ENABLED:
@@ -617,12 +817,42 @@ function readJobSwitches(environment, profile) {
     assertPostgresScheduledMaintenanceEnabled(probe);
     return Object.freeze({ POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: "enabled" });
   }
-  if (profile === "analytics-job") {
-    // Worker semantics: unset or 'disabled' is off; only 'enabled' is on.
-    return Object.freeze(Object.fromEntries(PRODUCTION_JOB_SWITCH_NAMES["analytics-job"]
-      .map((name) => [name, switchValue(environment, name)])));
+  if (job === "analytics") {
+    return Object.freeze(Object.fromEntries(ANALYTICS_SWITCH_NAMES
+      .map((name) => [name, analyticsSwitch(environment, name)])));
   }
   return Object.freeze({});
+}
+
+/** The staging service's admission mode; null for every other profile. */
+function readStagingAdmissionMode(environment, profile) {
+  if (profile !== "staging") {
+    if (environment.has("STAGING_ADMISSION_MODE")) {
+      configurationError("STAGING_ADMISSION_MODE_FORBIDDEN");
+    }
+    return null;
+  }
+  if (!environment.has("STAGING_ADMISSION_MODE")) return "closed";
+  const value = environment.raw("STAGING_ADMISSION_MODE");
+  if (typeof value !== "string" || !Object.hasOwn(STAGING_ADMISSION_MODES, value)) {
+    configurationError("STAGING_ADMISSION_MODE_INVALID");
+  }
+  return value;
+}
+
+/** Production's pinned vars, or the staging plane's closed variant of them. */
+function planeVars(plane, stagingVars, origins, admissionMode) {
+  if (plane === "production") return PRODUCTION_VARS;
+  const vars = { ...PRODUCTION_VARS };
+  for (const name of STAGING_ABSENT_VAR_NAMES) delete vars[name];
+  return {
+    ...vars,
+    ...STAGING_CONTAINMENT_VARS,
+    ...STAGING_ADMISSION_MODES[admissionMode ?? "closed"],
+    ...stagingVars,
+    ENVIRONMENT: "staging",
+    PUBLIC_ORIGIN: origins.public,
+  };
 }
 
 function readStagingVars(environment) {
@@ -640,28 +870,31 @@ function readStagingVars(environment) {
   for (const [name, pattern] of Object.entries(patterns)) {
     vars[name] = matching(environment, name, pattern);
   }
-  if (vars.ACCESS_ADMIN_EMAIL.length > 254) configurationError("ACCESS_ADMIN_EMAIL_INVALID");
   return vars;
 }
 
-function readOrigins(environment, profile) {
-  if (!SERVICE_PROFILES.has(profile)) {
-    return Object.freeze({
-      public: PRODUCTION_PUBLIC_ORIGIN,
-      admin: PRODUCTION_ADMIN_ORIGIN,
-      wwwHost: PRODUCTION_WWW_HOST,
-      host: null,
-    });
+/**
+ * Production origins are constants; a production job takes them as given.
+ * The staging plane (service and jobs) supplies its public origin and the
+ * admin origin, which must be admin.<public hostname>: the host the Worker
+ * (adminHostname) and the edge dispatcher derive from PUBLIC_ORIGIN. Only a
+ * service has a HOST_ORIGIN.
+ */
+function readOrigins(environment, shape) {
+  let host = null;
+  if (shape.workload === "service") {
+    host = canonicalRunAppOrigin(environment.required("HOST_ORIGIN"));
+    if (host === null) configurationError("HOST_ORIGIN_INVALID");
   }
-  const host = canonicalRunAppOrigin(environment.required("HOST_ORIGIN"));
-  if (host === null) configurationError("HOST_ORIGIN_INVALID");
-  if (profile === "production") {
-    if (environment.required("PUBLIC_ORIGIN") !== PRODUCTION_PUBLIC_ORIGIN) {
-      configurationError("PUBLIC_ORIGIN_INVALID");
-    }
-    if (environment.has("ADMIN_HOST_ORIGIN")
-        && environment.value("ADMIN_HOST_ORIGIN") !== PRODUCTION_ADMIN_ORIGIN) {
-      configurationError("ADMIN_HOST_ORIGIN_INVALID");
+  if (shape.plane === "production") {
+    if (shape.workload === "service") {
+      if (environment.required("PUBLIC_ORIGIN") !== PRODUCTION_PUBLIC_ORIGIN) {
+        configurationError("PUBLIC_ORIGIN_INVALID");
+      }
+      if (environment.has("ADMIN_HOST_ORIGIN")
+          && environment.value("ADMIN_HOST_ORIGIN") !== PRODUCTION_ADMIN_ORIGIN) {
+        configurationError("ADMIN_HOST_ORIGIN_INVALID");
+      }
     }
     return Object.freeze({
       public: PRODUCTION_PUBLIC_ORIGIN,
@@ -671,9 +904,13 @@ function readOrigins(environment, profile) {
     });
   }
   const publicOrigin = canonicalHttpsOrigin(environment.required("PUBLIC_ORIGIN"));
-  if (publicOrigin === null || publicOrigin === host) configurationError("PUBLIC_ORIGIN_INVALID");
+  if (publicOrigin === null || publicOrigin === host
+      || new URL(publicOrigin).hostname.startsWith(ADMIN_HOST_PREFIX)) {
+    configurationError("PUBLIC_ORIGIN_INVALID");
+  }
   const adminOrigin = canonicalHttpsOrigin(environment.required("ADMIN_HOST_ORIGIN"));
-  if (adminOrigin === null || adminOrigin === host || adminOrigin === publicOrigin) {
+  if (adminOrigin === null
+      || adminOrigin !== `https://${ADMIN_HOST_PREFIX}${new URL(publicOrigin).hostname}`) {
     configurationError("ADMIN_HOST_ORIGIN_INVALID");
   }
   return Object.freeze({ public: publicOrigin, admin: adminOrigin, wwwHost: null, host });
@@ -698,8 +935,8 @@ function readEdge(environment) {
 }
 
 /** Keeps staging and production apart without knowing production's GCP names. */
-function assertPlaneSeparation(profile, planeNames, stagingValues) {
-  if (profile === "staging") {
+function assertPlaneSeparation(plane, planeNames, stagingValues) {
+  if (plane === "staging") {
     for (const [name, value] of stagingValues) {
       if (PRODUCTION_FINGERPRINT_VALUES.has(value)) {
         configurationError(`${name}_PRODUCTION_VALUE_FORBIDDEN`);
@@ -721,24 +958,29 @@ function assertPlaneSeparation(profile, planeNames, stagingValues) {
 
 /**
  * Validates a process environment for one profile and returns a frozen
- * configuration. `profile` is 'production' or 'staging' for the service, or
- * 'maintenance-job' / 'analytics-job' for the production jobs. Throws an
- * Error whose message and `code` name the first refused setting.
+ * configuration. `profile` is one of PRODUCTION_CONFIGURATION_PROFILES:
+ * 'production' or 'staging' for the service, 'maintenance-job' /
+ * 'analytics-job' for the production jobs and 'staging-maintenance-job' /
+ * 'staging-analytics-job' for the staging plane's jobs. Throws an Error whose
+ * message and `code` name the first refused setting.
  */
 export function readProductionConfiguration(processEnv, profile) {
   if (!PRODUCTION_CONFIGURATION_PROFILES.includes(profile)) {
     configurationError("PRODUCTION_PROFILE_INVALID");
   }
+  const shape = PROFILE_SHAPES[profile];
   const environment = readEnvironment(processEnv);
   assertNoForbiddenVariables(environment);
-  const service = SERVICE_PROFILES.has(profile);
+  const service = shape.workload === "service";
+  const admissionMode = readStagingAdmissionMode(environment, profile);
 
   const sourceCommit = matching(environment, "DEPLOYMENT_SOURCE_COMMIT", SOURCE_COMMIT_PATTERN);
-  const workload = service
-    ? Object.freeze({ kind: "service", name: matching(environment, "K_SERVICE", CLOUD_RUN_NAME_PATTERN) })
-    : Object.freeze({ kind: "job", name: matching(environment, "CLOUD_RUN_JOB", CLOUD_RUN_NAME_PATTERN) });
   const workloadVariable = service ? "K_SERVICE" : "CLOUD_RUN_JOB";
-  const origins = readOrigins(environment, profile);
+  const workload = Object.freeze({
+    kind: shape.workload,
+    name: matching(environment, workloadVariable, CLOUD_RUN_NAME_PATTERN),
+  });
+  const origins = readOrigins(environment, shape);
   const edge = service ? readEdge(environment) : null;
   const namespace = matching(
     environment, "TELEMETRY_STORAGE_NAMESPACE", TELEMETRY_STORAGE_NAMESPACE_PATTERN,
@@ -755,14 +997,13 @@ export function readProductionConfiguration(processEnv, profile) {
   const bucket = matching(environment, "GCS_BUCKET_NAME", BUCKET_PATTERN);
   const historyProof = bucketHistoryProof(environment, bucket);
 
+  // Database names are scoped to their instance, so they are not listed.
   const deploymentValues = [
     [workloadVariable, workload.name],
     ["TELEMETRY_STORAGE_NAMESPACE", namespace],
     ["PRIMARY_INSTANCE_CONNECTION_NAME", primary.instanceConnectionName],
-    ["PRIMARY_DATABASE", primary.database],
     ["PRIMARY_SCHEMA", primary.schema],
     ["LEDGER_INSTANCE_CONNECTION_NAME", ledger.instanceConnectionName],
-    ["LEDGER_DATABASE", ledger.database],
     ["LEDGER_SCHEMA", ledger.schema],
     ["POSTGRES_IAM_USER", rawIamUser],
     ["POSTGRES_IAM_USER", iamUser],
@@ -779,7 +1020,7 @@ export function readProductionConfiguration(processEnv, profile) {
         ["EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS", account]),
     );
   }
-  if (profile === "staging") {
+  if (shape.plane === "staging") {
     deploymentValues.push(
       ["PUBLIC_ORIGIN", origins.public],
       ["PUBLIC_ORIGIN", new URL(origins.public).host],
@@ -789,30 +1030,28 @@ export function readProductionConfiguration(processEnv, profile) {
   }
   assertNotTestTarget(deploymentValues);
 
-  const stagingVars = profile === "staging" ? readStagingVars(environment) : null;
-  const secrets = readSecrets(environment);
+  const stagingVars = shape.plane === "staging" ? readStagingVars(environment) : null;
+  const secrets = readSecrets(environment, profile);
+  const envelopeKeyId = secrets.envelopeKeyId === null
+    ? []
+    : [["ENVELOPE_KEY_ID", secrets.envelopeKeyId]];
   const planeNames = [
     [workloadVariable, workload.name],
     ["PRIMARY_INSTANCE_CONNECTION_NAME", primary.instanceConnectionName],
     ["LEDGER_INSTANCE_CONNECTION_NAME", ledger.instanceConnectionName],
     ["GCS_BUCKET_NAME", bucket],
-    ["ENVELOPE_KEY_ID", secrets.envelopeKeyId],
+    ...envelopeKeyId,
   ];
   const stagingValues = stagingVars === null ? [] : [
     ...deploymentValues,
     ...Object.entries(stagingVars),
-    ["ENVELOPE_KEY_ID", secrets.envelopeKeyId],
+    ...envelopeKeyId,
   ];
-  assertPlaneSeparation(profile, planeNames, stagingValues);
+  assertPlaneSeparation(shape.plane, planeNames, stagingValues);
 
-  const jobSwitches = readJobSwitches(environment, profile);
+  const jobSwitches = readJobSwitches(environment, shape.job);
   const vars = Object.freeze({
-    ...PRODUCTION_VARS,
-    ...(stagingVars === null ? {} : {
-      ...stagingVars,
-      ENVIRONMENT: "staging",
-      PUBLIC_ORIGIN: origins.public,
-    }),
+    ...planeVars(shape.plane, stagingVars, origins, admissionMode),
     TELEMETRY_STORAGE_NAMESPACE: namespace,
     DEPLOYMENT_SOURCE_COMMIT: sourceCommit,
     ...jobSwitches,
@@ -825,7 +1064,9 @@ export function readProductionConfiguration(processEnv, profile) {
 
   const configuration = Object.freeze({
     profile,
+    plane: shape.plane,
     environment: vars.ENVIRONMENT,
+    stagingAdmissionMode: admissionMode,
     deployment: Object.freeze({ sourceCommit, workload }),
     origins,
     edge,
@@ -843,7 +1084,9 @@ export function readProductionConfiguration(processEnv, profile) {
     admissionTimeouts: PRODUCTION_ADMISSION_TIMEOUTS,
     rateLimits: Object.freeze({
       edgeTier: EDGE_TIER_RATE_LIMIT_NAMES,
-      originTier: ORIGIN_TIER_RATE_LIMITS,
+      originTier: shape.plane === "staging"
+        ? STAGING_ORIGIN_TIER_RATE_LIMITS
+        : ORIGIN_TIER_RATE_LIMITS,
     }),
     workerEnvKeys,
   });
@@ -887,16 +1130,36 @@ function readBindings(configuration, options) {
     if (binding === null || typeof binding !== "object" || typeof binding[method] !== "function") {
       configurationError(`${name}_BINDING_INVALID`);
     }
+    if (EDGE_TIER_RATE_LIMIT_BINDINGS.includes(name) && !isEdgeReplayBinding(binding)) {
+      configurationError(`${name}_BINDING_NOT_EDGE_REPLAY`);
+    }
     return [name, binding];
   });
 }
 
 /**
+ * An edge-tier binding replays the edge's outcome; it is never a PostgreSQL
+ * limiter. The replay bindings (EP-6 createEdgeAdmissionLimiters) are frozen
+ * plain objects whose only own property is a limit() data method. A class
+ * instance such as PostgresRateLimiter (limit() on its prototype, its pool,
+ * name and limits as own fields) or any other object is refused.
+ */
+function isEdgeReplayBinding(binding) {
+  if (!Object.isFrozen(binding)) return false;
+  const prototype = Object.getPrototypeOf(binding);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  const keys = Reflect.ownKeys(binding);
+  if (keys.length !== 1 || keys[0] !== "limit") return false;
+  return typeof Reflect.getOwnPropertyDescriptor(binding, "limit").value === "function";
+}
+
+/**
  * Builds the frozen Worker-shaped env from a configuration returned by
  * readProductionConfiguration. Service profiles must inject exactly the six
- * edge-tier replay bindings, the two origin-tier limiters and
- * UPLOAD_INGRESS_BUDGET; job profiles take no bindings. The env holds only
- * named keys (configuration.workerEnvKeys) and has a null prototype.
+ * edge-tier replay bindings, the two origin-tier limiters (built with
+ * configuration.rateLimits.originTier) and UPLOAD_INGRESS_BUDGET; job
+ * profiles take no bindings. The env holds only named keys
+ * (configuration.workerEnvKeys) and has a null prototype.
  */
 export function createProductionWorkerEnv(configuration, options = {}) {
   if (!CONFIGURATIONS.has(configuration)) configurationError("PRODUCTION_CONFIGURATION_INVALID");
