@@ -417,6 +417,9 @@ export async function readPostgresCommunityOwnerPage(
  * predicate while incomplete and sets completed only from 0 to 1; once
  * complete it is a single read and never reverts. Only counts are returned.
  * A transfer session is refused: production imports the sealed D1 row.
+ * The function keeps PostgreSQL's default EXECUTE grant and runs with the
+ * caller's table privileges, so the runtime login needs no function grant; a
+ * role without UPDATE on the singleton fails with the driver's 42501.
  */
 export async function advancePostgresPublicSourceBootstrap(
   client: PostgresClient,

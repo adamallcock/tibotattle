@@ -15,6 +15,8 @@
           "secretHash": "000000000000000000000000617574686f726974792d7365637265742d312d61",
           "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d312d61",
           "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
           "capability": "accepted",
           "accountless": null,
           "v11GenerationId": null,
@@ -39,6 +41,8 @@
           "secretHash": "000000000000000000000000617574686f726974792d7365637265742d322d61",
           "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d322d61",
           "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
           "capability": "revoked",
           "accountless": null,
           "v11GenerationId": null,
@@ -63,6 +67,8 @@
           "secretHash": "000000000000000000000000617574686f726974792d7365637265742d332d61",
           "ownerDigest": null,
           "ownerRevision": null,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
           "capability": "accepted",
           "accountless": null,
           "v11GenerationId": null,
@@ -87,6 +93,8 @@
           "secretHash": "000000000000000000000000617574686f726974792d7365637265742d342d61",
           "ownerDigest": null,
           "ownerRevision": null,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
           "capability": "revoked",
           "accountless": null,
           "v11GenerationId": null,
@@ -111,6 +119,8 @@
           "secretHash": "000000000000000000000000617574686f726974792d7365637265742d352d61",
           "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d352d61",
           "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
           "capability": "accepted",
           "accountless": null,
           "v11GenerationId": null,
@@ -135,6 +145,8 @@
           "secretHash": "000000000000000000000000617574686f726974792d7365637265742d362d61",
           "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d362d61",
           "ownerRevision": 2,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
           "capability": null,
           "accountless": null,
           "v11GenerationId": "0a110000-0000-4000-8000-000000000661",
@@ -170,6 +182,8 @@
           "secretHash": "000000000000000000000000617574686f726974792d7365637265742d372d61",
           "ownerDigest": null,
           "ownerRevision": null,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
           "capability": null,
           "accountless": null,
           "v11GenerationId": null,
@@ -205,6 +219,8 @@
           "secretHash": "000000000000000000000000617574686f726974792d7365637265742d382d61",
           "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d382d61",
           "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
           "capability": "accepted",
           "accountless": null,
           "v11GenerationId": null,
@@ -229,6 +245,8 @@
           "secretHash": "000000000000000000000000617574686f726974792d7365637265742d392d61",
           "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d392d61",
           "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
           "capability": null,
           "accountless": {
             "ledger": {
@@ -284,6 +302,8 @@
           "secretHash": "0000000000000000000000617574686f726974792d7365637265742d31302d61",
           "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31302d61",
           "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
           "capability": null,
           "accountless": {
             "ledger": {
@@ -339,6 +359,8 @@
           "secretHash": "0000000000000000000000617574686f726974792d7365637265742d31312d61",
           "ownerDigest": null,
           "ownerRevision": null,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
           "capability": null,
           "accountless": {
             "ledger": {
@@ -394,6 +416,8 @@
           "secretHash": "0000000000000000000000617574686f726974792d7365637265742d31322d61",
           "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31322d61",
           "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
           "capability": null,
           "accountless": {
             "ledger": {
@@ -449,6 +473,8 @@
           "secretHash": "0000000000000000000000617574686f726974792d7365637265742d31332d61",
           "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31332d61",
           "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
           "capability": null,
           "accountless": {
             "ledger": {
@@ -504,6 +530,8 @@
           "secretHash": "0000000000000000000000617574686f726974792d7365637265742d31342d61",
           "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31342d61",
           "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
           "capability": null,
           "accountless": {
             "ledger": {
@@ -538,6 +566,67 @@
             "markerRetainedAt": null
           },
           "v11GenerationId": "0a110000-0000-4000-8000-000000000e61",
+          "v12Domain": null,
+          "v1Chunks": []
+        }
+      ]
+    },
+    {
+      "name": "social-owner-head-withdrawn",
+      "participants": [
+        {
+          "id": "authority-15a",
+          "ownerKind": "social",
+          "state": "active",
+          "inputRevision": 15,
+          "deviceId": "0d000000-0000-4000-8000-000000000f61",
+          "secretHash": "0000000000000000000000617574686f726974792d7365637265742d31352d61",
+          "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31352d61",
+          "ownerRevision": 2,
+          "ownerHeadState": "withdrawn",
+          "legacyContribution": null,
+          "capability": null,
+          "accountless": null,
+          "v11GenerationId": null,
+          "v12Domain": null,
+          "v1Chunks": []
+        }
+      ]
+    },
+    {
+      "name": "social-legacy-contributions",
+      "participants": [
+        {
+          "id": "authority-16a",
+          "ownerKind": "social",
+          "state": "active",
+          "inputRevision": 16,
+          "deviceId": "0d000000-0000-4000-8000-000000001061",
+          "secretHash": "0000000000000000000000617574686f726974792d7365637265742d31362d61",
+          "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31362d61",
+          "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": "v0.2",
+          "capability": null,
+          "accountless": null,
+          "v11GenerationId": null,
+          "v12Domain": null,
+          "v1Chunks": []
+        },
+        {
+          "id": "authority-16b",
+          "ownerKind": "social",
+          "state": "active",
+          "inputRevision": 16,
+          "deviceId": "0d000000-0000-4000-8000-000000001062",
+          "secretHash": "0000000000000000000000617574686f726974792d7365637265742d31362d62",
+          "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31362d62",
+          "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": "v0.1",
+          "capability": null,
+          "accountless": null,
+          "v11GenerationId": null,
           "v12Domain": null,
           "v1Chunks": []
         }
@@ -715,6 +804,42 @@
       "authorityEpoch": 1,
       "hasV1": false,
       "hasV11": true,
+      "hasV12": false,
+      "hasEffective": false,
+      "hasLegacy": false
+    },
+    {
+      "participantId": "authority-15a",
+      "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31352d61",
+      "inputRevision": 15,
+      "ownerRevision": 0,
+      "authorityEpoch": 0,
+      "hasV1": false,
+      "hasV11": false,
+      "hasV12": false,
+      "hasEffective": false,
+      "hasLegacy": false
+    },
+    {
+      "participantId": "authority-16a",
+      "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31362d61",
+      "inputRevision": 16,
+      "ownerRevision": 1,
+      "authorityEpoch": 1,
+      "hasV1": false,
+      "hasV11": false,
+      "hasV12": false,
+      "hasEffective": false,
+      "hasLegacy": true
+    },
+    {
+      "participantId": "authority-16b",
+      "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31362d62",
+      "inputRevision": 16,
+      "ownerRevision": 1,
+      "authorityEpoch": 1,
+      "hasV1": false,
+      "hasV11": false,
       "hasV12": false,
       "hasEffective": false,
       "hasLegacy": false

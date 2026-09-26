@@ -416,12 +416,36 @@ async function insertOracleParticipant(pool, table, quoted, owner) {
     await revokeAccountlessGraph(pool, table, owner, graph);
   }
   for (const chunk of owner.v1Chunks) await insertV1Chunk(pool, table, owner.id, owner.deviceId, chunk);
+  if (owner.legacyContribution !== null) {
+    const contributionId = `authority-contribution-${owner.id}`;
+    // Legacy telemetry triggers resolve their relations through the runtime
+    // search path, as the Cloud Run host sets it.
+    const client = await pool.connect();
+    try {
+      await client.query(`SET search_path TO ${quoted}, pg_catalog`);
+      await client.query(`INSERT INTO ${table("telemetry_contributions")} (
+          id,participant_id,plaintext_digest,envelope_digest,r2_key,schema_version,transport_schema_version,range_start,
+          range_end,client_platform,provider_policy_epoch,priced_event_coverage_percent,unknown_model_event_count,
+          unknown_billable_units,price_basis,declared_record_count,created_at
+        ) VALUES ($1,$2,$3,$4,$5,'telemetry-contribution-v0.1',$6,$7,$7,'synthetic','synthetic',100,0,0,'synthetic',0,$7)`,
+      [contributionId, owner.id, digest(`plain-${contributionId}`), digest(`envelope-${contributionId}`),
+        `synthetic/authority/${contributionId}`, `telemetry-contribution-${owner.legacyContribution}`, T.issued]);
+    } finally {
+      await client.query("RESET search_path").catch(() => {});
+      client.release();
+    }
+  }
   if (owner.ownerDigest !== null) {
     await pool.query(`INSERT INTO ${table("storage_v11_owner_links")} (participant_id,owner_digest,state)
       VALUES ($1,$2,'active')`, [owner.id, owner.ownerDigest]);
     if (owner.ownerRevision !== null) {
+      // Through the single journal producer, so the head is the one 0046
+      // derives: owner-active, then source-updated (active) or owner-withdrawn.
       await append(pool, quoted, "owner-active", owner.ownerDigest);
-      if (owner.ownerRevision === 2) await append(pool, quoted, "source-updated", owner.ownerDigest);
+      if (owner.ownerRevision === 2) {
+        await append(pool, quoted, owner.ownerHeadState === "withdrawn" ? "owner-withdrawn" : "source-updated",
+          owner.ownerDigest);
+      }
     }
   }
 }
@@ -456,7 +480,7 @@ test("PG17 retained v1.2 scope and community owner page equal the D1 oracle", { 
     const oracle = JSON.parse(await readFile(ORACLE, "utf8"));
     assert.equal(oracle.schemaVersion, "community-authority-owner-page-oracle-v1");
     assert.equal(oracle.day, DAY);
-    assert.equal(oracle.cases.length, 14);
+    assert.equal(oracle.cases.length, 16);
     await initializeAuthority(pool, table);
     await pool.query(`UPDATE ${table("telemetry_v12_runtime")} SET state='active',changed_at=$1 WHERE id=1`, [T.issued]);
     await pool.query(`UPDATE ${table("telemetry_v12_typed_runtime")} SET state='active',changed_at=$1 WHERE id=1`, [T.issued]);
@@ -655,7 +679,14 @@ test("PG17 terminal epochs: exact maximum, legacy floor or 503, and a monotonic 
       [SOURCE_ID, digest("fenced-owner"), digest("fenced-event")]);
       assert.deepEqual(await watermark(), { epoch: 17, sequence: 7, floor: 20 });
       assert.equal(await delivered(client, schema, SOURCE_ID), 17);
-      const receipt = (sequence, kind, publicEpoch, tupleVersion = 1) => pool.query(`INSERT INTO ${table("analytics_applied_events")} (
+      // Owners are fenced out of epoch order: a later, lower fence neither
+      // lowers the watermark nor is refused by its monotonic guard.
+      await pool.query(`INSERT INTO ${table("analytics_storage_erasure_fences")} (source_id,owner_digest,terminal_event_digest,
+          terminal_sequence,terminal_revision,authority_epoch,public_authority_epoch) VALUES ($1,$2,$3,3,2,2,12)`,
+      [SOURCE_ID, digest("fenced-owner-lower"), digest("fenced-event-lower")]);
+      assert.deepEqual(await watermark(), { epoch: 17, sequence: 7, floor: 20 });
+      assert.equal(await delivered(client, schema, SOURCE_ID), 17);
+      const receipt =(sequence, kind, publicEpoch, tupleVersion = 1) => pool.query(`INSERT INTO ${table("analytics_applied_events")} (
           source_id,sequence,event_digest,owner_digest,authority_epoch,projection_json,event_tuple_version,revision,kind,
           object_digest,content_digest,public_authority_epoch,recorded_ms
         ) VALUES ($1,$2,$3,$4,1,'{}',$5,$6,$7,$8,$9,$10,$11)`,
@@ -732,7 +763,7 @@ async function eligibleAccountlessV11(pool, table, id, { journaled = false, owne
 }
 
 /** The v1.1 publication receipt for the participant's current head. */
-async function journalV11Head(pool, table, participantId, ownerDigest) {
+async function journalV11Head(pool, table, participantId, ownerDigest, eventSeed = participantId) {
   await pool.query(`INSERT INTO ${table("storage_v11_owner_links")} (participant_id,owner_digest,state)
     VALUES ($1,$2,'active') ON CONFLICT (participant_id) DO NOTHING`, [participantId, ownerDigest]);
   await pool.query(`INSERT INTO ${table("storage_v11_event_sources")} (
@@ -742,7 +773,24 @@ async function journalV11Head(pool, table, participantId, ownerDigest) {
       domain.through_day,head.revision,domain.input_revision,1
       FROM ${table("telemetry_v11_domain_heads")} head
       JOIN ${table("telemetry_v11_domains")} domain ON domain.id=head.generation_id
-     WHERE head.participant_id=$3`, [digest(`v11-event-${participantId}`), ownerDigest, participantId]);
+     WHERE head.participant_id=$3`, [digest(`v11-event-${eventSeed}`), ownerDigest, participantId]);
+}
+
+/** A successor v1.1 generation (0029's chain shape) that the head can move to. */
+async function insertV11Successor(pool, table, participantId, deviceId, generationId, previousGenerationId) {
+  const token = digest(`token-v11-${generationId}`);
+  const fingerprint = digest(`legacy-v11-${generationId}`);
+  await pool.query(`INSERT INTO ${table("telemetry_v11_domain_predecessors")} (
+      token_hash,participant_id,device_id,previous_generation_id,legacy_fingerprint,input_revision,
+      from_day,through_day,winners_json,created_at,expires_at
+    ) VALUES ($1,$2,$3,$4,$5,0,$6::date,$6::date,'[]',$7,'2099-01-01T00:00:00.000Z')`,
+  [token, participantId, deviceId, previousGenerationId, fingerprint, DAY, T.issued]);
+  await pool.query(`INSERT INTO ${table("telemetry_v11_domains")} (
+      id,participant_id,device_id,predecessor_token_hash,previous_generation_id,manifest_digest,legacy_fingerprint,
+      input_revision,from_day,through_day,days_json,created_at
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,0,$8::date,$8::date,'[]',$9)`,
+  [generationId, participantId, deviceId, token, previousGenerationId, digest(`manifest-v11-${generationId}`), fingerprint,
+    DAY, T.issued]);
 }
 
 async function pending(pool, quoted) {
@@ -760,7 +808,16 @@ test("PG17 an empty schema seeds the public-source bootstrap complete", { skip: 
       assert.deepEqual(result, { completed: true, pending: 0 });
       assert.deepEqual(Object.keys(result), ["completed", "pending"], "only content-free counts are returned");
       assert.equal(await pending(pool, quoted), 0);
+      // PostgreSQL ports no walk: a D1 walk cursor (a raw participant id or a
+      // source day) is never stored, whether written or imported.
+      const cursors = "community_public_source_bootstrap_cursors_empty";
+      await violates(pool.query(`UPDATE ${table("community_public_source_bootstrap")} SET participant_cursor='synthetic-participant'`),
+        cursors);
+      await violates(pool.query(`UPDATE ${table("community_public_source_bootstrap")} SET source_day_cursor='2026-09-20'`), cursors);
       await pool.query(`DELETE FROM ${table("community_public_source_bootstrap")}`);
+      await violates(pool.query(`INSERT INTO ${table("community_public_source_bootstrap")}
+          (singleton,policy_version,participant_cursor,source_day_cursor,completed)
+        VALUES (1,'community-public-sources-v1','synthetic-participant','',1)`), cursors);
       await assert.rejects(advancePostgresPublicSourceBootstrap(client, schema), unavailable,
         "a missing singleton is not a completed bootstrap");
     } finally {
@@ -874,13 +931,83 @@ test("PG17 the bootstrap predicate follows D1's v1, v1.1 and v1.2 journal produc
     },
   }));
 
-test("PG17 the bootstrap step is refused in a transfer session and not granted to PUBLIC", { skip: SKIP, timeout: 180_000 },
-  async () => withSchema(async ({ pool, schema, quoted }) => {
+test("PG17 the bootstrap predicate keys accountless v1.2 heads on the eligible device and v1.1 heads on their generation",
+  { skip: SKIP, timeout: 180_000 }, async () => withSchema(async ({ pool, quoted, table }) => {
+    const current = { issuedAt: "2098-12-02T00:00:00.000Z", expiresAt: "2099-01-01T00:00:00.000Z", state: "active",
+      revokedAt: null, revocationReason: null };
+    const eligible = async (participantId) => (await pool.query(`SELECT owner_kind,device_id
+      FROM ${table("community_public_source_owners")} WHERE participant_id=$1 ORDER BY device_id`, [participantId])).rows;
+    const receiptV12 = async (participantId, deviceId, generationId, ownerDigest) => {
+      await pool.query(`INSERT INTO ${table("storage_v11_owner_links")} (participant_id,owner_digest,state)
+        VALUES ($1,$2,'active') ON CONFLICT (participant_id) DO NOTHING`, [participantId, ownerDigest]);
+      await pool.query(`INSERT INTO ${table("storage_v12_event_sources")} (
+          event_digest,owner_digest,participant_id,device_id,generation_id,previous_generation_id,manifest_digest,
+          head_revision,recorded_ms
+        ) VALUES ($1,$2,$3,$4,$5,NULL,$6,1,1)`,
+      [digest(`v12-event-${participantId}`), ownerDigest, participantId, deviceId, generationId,
+        digest(`manifest-v12-${generationId}`)]);
+    };
+    assert.equal(await pending(pool, quoted), 0);
+
+    // An eligible accountless v1.2 successor install: its ready head on the
+    // eligible device is pending until the receipt at (generation, revision).
+    const successor = { id: "bootstrap-v12-accountless", deviceId: "0d000000-0000-4000-8000-0000000012ac",
+      secretHash: digest("secret-v12-accountless") };
+    const successorDomain = { generationId: "0a120000-0000-4000-8000-0000000012ac",
+      manifestId: "0e120000-0000-4000-8000-0000000012ac", manifestState: "ready" };
+    await pool.query(`INSERT INTO ${table("participants")} (id,owner_kind,state,created_at) VALUES ($1,'accountless','active',$2)`,
+      [successor.id, T.issued]);
+    await insertAccountlessGraph(pool, table, successor, { ledger: current, owner: current, device: current, v11Grant: null,
+      v12Grant: current, markerRetainedAt: null });
+    await insertV12Head(pool, table, successor.id, successor.deviceId, successorDomain);
+    assert.deepEqual(await eligible(successor.id), [{ owner_kind: "accountless", device_id: successor.deviceId }]);
+    assert.equal(await pending(pool, quoted), 1, "an eligible accountless v1.2 head without its receipt is pending");
+    await receiptV12(successor.id, successor.deviceId, successorDomain.generationId, digest("owner-v12-accountless"));
+    assert.equal(await pending(pool, quoted), 0, "the receipt at the head revision journals it");
+
+    // An accountless owner eligible only through its v1.1 device, whose v1.2
+    // head is on another, ineligible device: that head is not evidence of an
+    // eligible public source.
+    const legacy = await eligibleAccountlessV11(pool, table, "bootstrap-v11-device-only", { journaled: true });
+    const otherDevice = "0d000000-0000-4000-8000-0000000012ad";
+    await pool.query(`INSERT INTO ${table("accountless_enrollment_ledger")} (
+        device_id,device_secret_hash,installation_principal_id,schema_version,policy_version,authorization_basis,
+        state,issued_at,expires_at,revoked_at,revocation_reason,renewal_generation,renewed_at
+      ) VALUES ($1,$2,$3,'accountless-enrollment-v0.1','accountless-opt-out-v1','accountless-policy-v1',
+        'active',$4,$5,NULL,NULL,0,NULL)`,
+    [otherDevice, Buffer.from(digest("secret-other-device"), "hex"), `authority-installation-${otherDevice}`,
+      current.issuedAt, current.expiresAt]);
+    await pool.query(`INSERT INTO ${table("device_credentials")} (
+        id,participant_id,authority_kind,accountless_enrollment_device_id,secret_hash,state,
+        issued_at,expires_at,last_used_at,revoked_at,social_verified_at
+      ) VALUES ($1,$2,'accountless',$1,$3,'active',$4,$5,$4,NULL,NULL)`,
+    [otherDevice, legacy.id, Buffer.from(digest("secret-other-device"), "hex"), current.issuedAt, current.expiresAt]);
+    await insertV12Head(pool, table, legacy.id, otherDevice, { generationId: "0a120000-0000-4000-8000-0000000012ad",
+      manifestId: "0e120000-0000-4000-8000-0000000012ad", manifestState: "ready" });
+    assert.deepEqual(await eligible(legacy.id), [{ owner_kind: "accountless", device_id: legacy.deviceId }]);
+    assert.equal(await pending(pool, quoted), 0, "a v1.2 head on a device that is not eligible is not pending");
+
+    // v1.1: a receipt for an earlier generation does not journal the head
+    // after it moves to a successor generation.
+    const moved = await eligibleAccountlessV11(pool, table, "bootstrap-v11-moved", { journaled: true });
+    assert.equal(await pending(pool, quoted), 0);
+    const successorGeneration = "0a110000-0000-4000-8000-0000000011a2";
+    await insertV11Successor(pool, table, moved.id, moved.deviceId, successorGeneration, moved.generationId);
+    await pool.query(`UPDATE ${table("telemetry_v11_domain_heads")} SET generation_id=$2,revision=2 WHERE participant_id=$1`,
+      [moved.id, successorGeneration]);
+    assert.equal(await pending(pool, quoted), 1, "the head's new generation has no receipt yet");
+    await journalV11Head(pool, table, moved.id, moved.ownerDigest, `${moved.id}-successor`);
+    assert.equal(await pending(pool, quoted), 0, "the receipt for the head's generation journals it");
+  }));
+
+test("PG17 the bootstrap step runs with the runtime's table grants alone and is refused in a transfer session",
+  { skip: SKIP, timeout: 180_000 }, async () => withSchema(async ({ pool, schema, quoted, table }) => {
     const { advancePostgresPublicSourceBootstrap } = await authorityModule();
     const local = await endpoint();
     const suffix = randomBytes(4).toString("hex");
     const member = `synthetic_an_member_${suffix}`;
     const runtime = `synthetic_an_runtime_${suffix}`;
+    const bare = `synthetic_an_bare_${suffix}`;
     const asLogin = async (role, body) => {
       const session = new pg.Client({ ...local, user: role, password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, ssl: false,
         application_name: "pg-community-authority-test" });
@@ -900,18 +1027,31 @@ test("PG17 the bootstrap step is refused in a transfer session and not granted t
       locked = true;
       await pool.query(`CREATE ROLE ${member} LOGIN NOSUPERUSER NOCREATEROLE`);
       await pool.query(`CREATE ROLE ${runtime} LOGIN NOSUPERUSER NOCREATEROLE`);
+      await pool.query(`CREATE ROLE ${bare} LOGIN NOSUPERUSER NOCREATEROLE`);
       rolesCreated = true;
-      await pool.query(`GRANT USAGE ON SCHEMA ${quoted} TO ${member}, ${runtime}`);
+      await pool.query(`GRANT USAGE ON SCHEMA ${quoted} TO ${member}, ${runtime}, ${bare}`);
+      // The Cloud Run runtime grant (cloud-run/test-migrations.mjs): table DML
+      // on every relation, and no grant on this function.
+      await pool.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ${quoted} TO ${member}, ${runtime}`);
       roleCreated = (await pool.query("SELECT 1 FROM pg_roles WHERE rolname=$1", [TRANSFER_ROLE])).rowCount === 0;
       if (roleCreated) await pool.query(`CREATE ROLE ${TRANSFER_ROLE} NOLOGIN`);
       await pool.query(`GRANT ${TRANSFER_ROLE} TO ${member}`);
-      for (const role of [member, runtime]) {
-        await asLogin(role, async (session) => {
-          await assert.rejects(advancePostgresPublicSourceBootstrap(session, schema), (error) => error?.code === "42501",
-            "the completion step is not granted to PUBLIC");
-        });
-      }
-      await pool.query(`GRANT EXECUTE ON FUNCTION ${quoted}.community_public_source_bootstrap_advance() TO ${member}, ${runtime}`);
+      const privileges = await pool.query(`SELECT has_function_privilege($1, $3, 'EXECUTE') AS runtime,
+          has_function_privilege($2, $3, 'EXECUTE') AS bare`,
+      [runtime, bare, `${quoted}.community_public_source_bootstrap_advance()`]);
+      assert.deepEqual(privileges.rows[0], { runtime: true, bare: true }, "EXECUTE is the default PUBLIC grant");
+
+      // A login without table privileges is refused by the tables, not by a
+      // function grant, and the bootstrap row is unchanged.
+      await pool.query(`UPDATE ${table("community_public_source_bootstrap")} SET completed=0`);
+      await asLogin(bare, async (session) => {
+        await assert.rejects(advancePostgresPublicSourceBootstrap(session, schema), (error) => error?.code === "42501"
+          && /community_public_source_bootstrap/u.test(error.message));
+      });
+      assert.equal((await bootstrapRow(pool, table))[0].completed, 0);
+
+      // A transfer session is refused before it reads anything, whatever it
+      // may write.
       await asLogin(member, async (session) => {
         assert.equal((await session.query(`SELECT ${quoted}.storage_journal_transfer_session() AS transfer`)).rows[0].transfer, true);
         await refuses(session.query(`SELECT * FROM ${quoted}.community_public_source_bootstrap_advance()`),
@@ -919,21 +1059,25 @@ test("PG17 the bootstrap step is refused in a transfer session and not granted t
         await assert.rejects(advancePostgresPublicSourceBootstrap(session, schema), (error) => error instanceof Error
           && error.message === "COMMUNITY_PUBLIC_SOURCE_BOOTSTRAP_TRANSFER_SESSION");
       });
+      assert.equal((await bootstrapRow(pool, table))[0].completed, 0);
+
+      // The runtime login completes it with its table grants alone.
       await asLogin(runtime, async (session) => {
-        // Not a transfer session: it reaches the singleton, which it may not read.
-        await assert.rejects(advancePostgresPublicSourceBootstrap(session, schema), (error) => error?.code === "42501");
+        assert.equal((await session.query(`SELECT ${quoted}.storage_journal_transfer_session() AS transfer`)).rows[0].transfer, false);
+        assert.deepEqual(await advancePostgresPublicSourceBootstrap(session, schema), { completed: true, pending: 0 });
+        assert.deepEqual(await advancePostgresPublicSourceBootstrap(session, schema), { completed: true, pending: 0 });
       });
+      assert.equal((await bootstrapRow(pool, table))[0].completed, 1);
     } finally {
       if (rolesCreated) {
-        await pool.query(`REVOKE ALL ON SCHEMA ${quoted} FROM ${member}, ${runtime}`).catch(() => {});
-        await pool.query(`REVOKE ALL ON FUNCTION ${quoted}.community_public_source_bootstrap_advance() FROM ${member}, ${runtime}`)
-          .catch(() => {});
+        await pool.query(`REVOKE ALL ON ALL TABLES IN SCHEMA ${quoted} FROM ${member}, ${runtime}`).catch(() => {});
+        await pool.query(`REVOKE ALL ON SCHEMA ${quoted} FROM ${member}, ${runtime}, ${bare}`).catch(() => {});
         if (roleCreated) {
           await pool.query(`DROP ROLE IF EXISTS ${TRANSFER_ROLE}`);
         } else {
           await pool.query(`REVOKE ${TRANSFER_ROLE} FROM ${member}`).catch(() => {});
         }
-        for (const role of [member, runtime]) await pool.query(`DROP ROLE IF EXISTS ${role}`);
+        for (const role of [member, runtime, bare]) await pool.query(`DROP ROLE IF EXISTS ${role}`);
       }
       if (locked) await lock.query("SELECT pg_advisory_unlock($1)", [TRANSFER_ROLE_LOCK]).catch(() => {});
       lock.release();
@@ -978,6 +1122,30 @@ async function insertAuthorityDaily(pool, table, day, revision, {
   [SOURCE_ID, SOURCE_NAMESPACE, day, revision, payload, digest(payload), authority.publicAuthorityEpoch,
     authority.sequence, authority.policyRevision, authority.collectionRevision, releasedAt, authority.sourceEpoch,
     authority.graphInvalidationEpoch, cohortDigest, provenance, importReceiptId, releasedAtIso, authorityJson, deviceMethod]);
+}
+
+const PREVIEW_PAYLOAD = JSON.stringify({ generatedAt: "2026-09-21T00:00:00.000Z", models: [] });
+
+/** Insert or replace the source's graph preview, through the fence on both paths. */
+function upsertPreview(queryable, table, authority, overrides = {}) {
+  const row = {
+    revision: 1, method: "synthetic-graph-method", cohort: digest("preview-cohort"), json: JSON.stringify(authority),
+    payload: PREVIEW_PAYLOAD, hash: digest(PREVIEW_PAYLOAD), generatedAt: "2026-09-21T00:00:00.000Z", oldest: 1, newest: 2,
+    provenance: "gcp", receipt: null, ...overrides,
+  };
+  return queryable.query(`INSERT INTO ${table("community_graph_previews")} (
+      source_id,source_namespace,revision,method,cohort_digest,authority_json,public_authority_epoch,policy_revision,
+      collection_revision,source_mutation_epoch,journal_sequence,graph_invalidation_epoch,model_revision,payload_json,
+      payload_sha256,generated_at,snapshot_source_epoch,inputs_current,oldest_computed_ms,newest_computed_ms,provenance,
+      import_receipt_id
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,0,$13,$14,$15,$10,1,$16,$17,$18,$19)
+    ON CONFLICT (source_id) DO UPDATE SET revision=EXCLUDED.revision,authority_json=EXCLUDED.authority_json,
+      public_authority_epoch=EXCLUDED.public_authority_epoch,source_mutation_epoch=EXCLUDED.source_mutation_epoch,
+      journal_sequence=EXCLUDED.journal_sequence,snapshot_source_epoch=EXCLUDED.snapshot_source_epoch`,
+  [SOURCE_ID, SOURCE_NAMESPACE, row.revision, row.method, row.cohort, row.json, authority.publicAuthorityEpoch,
+    authority.policyRevision, authority.collectionRevision, authority.sourceEpoch, authority.sequence,
+    authority.graphInvalidationEpoch, row.payload, row.hash, row.generatedAt, row.oldest, row.newest, row.provenance,
+    row.receipt]);
 }
 
 test("PG17 daily heads refuse revision gaps, seed from existing revisions and are never deleted",
@@ -1128,27 +1296,7 @@ test("PG17 graph previews carry the full pin and are fenced on insert and update
   async () => withSchema(async ({ pool, table }) => {
     await pool.query(`INSERT INTO ${table("analytics_source_cursors")}(source_id,sequence,authority_epoch) VALUES ($1,4,5)`,
       [SOURCE_ID]);
-    const payload = JSON.stringify({ generatedAt: "2026-09-21T00:00:00.000Z", models: [] });
-    const preview = (authority, overrides = {}) => {
-      const row = {
-        revision: 1, method: "synthetic-graph-method", cohort: digest("preview-cohort"), json: JSON.stringify(authority),
-        payload, hash: digest(payload), generatedAt: "2026-09-21T00:00:00.000Z", oldest: 1, newest: 2,
-        provenance: "gcp", receipt: null, ...overrides,
-      };
-      return pool.query(`INSERT INTO ${table("community_graph_previews")} (
-          source_id,source_namespace,revision,method,cohort_digest,authority_json,public_authority_epoch,policy_revision,
-          collection_revision,source_mutation_epoch,journal_sequence,graph_invalidation_epoch,model_revision,payload_json,
-          payload_sha256,generated_at,snapshot_source_epoch,inputs_current,oldest_computed_ms,newest_computed_ms,provenance,
-          import_receipt_id
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,0,$13,$14,$15,$10,1,$16,$17,$18,$19)
-        ON CONFLICT (source_id) DO UPDATE SET revision=EXCLUDED.revision,authority_json=EXCLUDED.authority_json,
-          public_authority_epoch=EXCLUDED.public_authority_epoch,source_mutation_epoch=EXCLUDED.source_mutation_epoch,
-          journal_sequence=EXCLUDED.journal_sequence,snapshot_source_epoch=EXCLUDED.snapshot_source_epoch`,
-      [SOURCE_ID, SOURCE_NAMESPACE, row.revision, row.method, row.cohort, row.json, authority.publicAuthorityEpoch,
-        authority.policyRevision, authority.collectionRevision, authority.sourceEpoch, authority.sequence,
-        authority.graphInvalidationEpoch, row.payload, row.hash, row.generatedAt, row.oldest, row.newest, row.provenance,
-        row.receipt]);
-    };
+    const preview = (authority, overrides = {}) => upsertPreview(pool, table, authority, overrides);
     await refuses(preview(pin({ publicAuthorityEpoch: 4 })), "analytics_publication_authority_stale");
     await refuses(preview(pin(), { json: JSON.stringify({ ...pin(), sequence: 10 }) }), "community_publication_authority_mismatch");
     await refuses(preview(pin(), { json: JSON.stringify({ ...pin(), dailyDeviceMethod: "contributing-devices-by-reader-v1" }) }),
@@ -1171,6 +1319,137 @@ test("PG17 graph previews carry the full pin and are fenced on insert and update
     const stored = await pool.query(`SELECT revision::int AS revision,public_authority_epoch::int AS epoch,provenance
       FROM ${table("community_graph_previews")}`);
     assert.deepEqual(stored.rows, [{ revision: 3, epoch: 9, provenance: "gcp" }]);
+  }));
+
+/** A dedicated connection, so one transaction can stay open across awaits. */
+async function openSession() {
+  const session = new pg.Client({ ...await endpoint(), user: PG_TEST_USER, password: PG_TEST_PASSWORD,
+    database: PG_TEST_DATABASE, ssl: false, application_name: "pg-community-authority-test" });
+  await session.connect();
+  await session.query("SET lock_timeout='20s'");
+  const pid = (await session.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+  return Object.assign(session, { pid });
+}
+
+/** Resolve once `session` is blocked on a heavyweight lock. */
+async function waitsOnLock(pool, session) {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const row = (await pool.query("SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1", [session.pid])).rows[0];
+    if (row?.wait_event_type === "Lock") return;
+    await new Promise((resolve) => { setTimeout(resolve, 25); });
+  }
+  assert.fail("the session never waited on a row lock");
+}
+
+/** Settle a promise into its error (or null) so a pending rejection is never unhandled. */
+const outcome = (promise) => promise.then(() => null, (error) => error);
+const serializationFailure = (error) => error?.code === "40001";
+
+test("PG17 the write-side fence is linearizable with concurrent erasure fences and cursor advances",
+  { skip: SKIP, timeout: 240_000 }, async () => withSchema(async ({ pool, table }) => {
+    await pool.query(`INSERT INTO ${table("analytics_source_cursors")}(source_id,sequence,authority_epoch) VALUES ($1,4,5)`,
+      [SOURCE_ID]);
+    let fenced = 0;
+    const fence = (queryable, publicEpoch) => {
+      fenced += 1;
+      return queryable.query(`INSERT INTO ${table("analytics_storage_erasure_fences")} (source_id,owner_digest,
+          terminal_event_digest,terminal_sequence,terminal_revision,authority_epoch,public_authority_epoch)
+        VALUES ($1,$2,$3,$4,2,2,$5)`,
+      [SOURCE_ID, digest(`race-owner-${fenced}`), digest(`race-event-${fenced}`), fenced, publicEpoch]);
+    };
+    const daily = (queryable, day, publicAuthorityEpoch) => insertAuthorityDaily(queryable, table, day, 1,
+      { authority: pin({ publicAuthorityEpoch }) });
+    const watermarks = async () => Number((await pool.query(`SELECT count(*) AS count
+      FROM ${table("community_terminal_watermarks")}`)).rows[0].count);
+    const writer = await openSession();
+    const other = await openSession();
+    try {
+      // REPEATABLE READ, the daily publisher's level. The source's first fence
+      // commits after the writer's snapshot; its snapshot still shows no
+      // fence, and the watermark row the fence created makes the write fail
+      // rather than commit a pin below the erasure.
+      assert.equal(await watermarks(), 0);
+      await writer.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+      await writer.query(`SELECT count(*) FROM ${table("community_daily_aggregates")}`);
+      await fence(pool, 10);
+      assert.ok(serializationFailure(await outcome(daily(writer, "2026-09-10", 5))),
+        "a writer whose snapshot predates the source's first fence cannot commit below it");
+      await writer.query("ROLLBACK");
+      await refuses(daily(pool, "2026-09-10", 5), "analytics_publication_authority_stale");
+
+      // The same once the watermark row exists: a later fence updates it.
+      await writer.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+      await writer.query(`SELECT count(*) FROM ${table("community_daily_aggregates")}`);
+      await fence(pool, 12);
+      assert.ok(serializationFailure(await outcome(daily(writer, "2026-09-11", 11))),
+        "a writer whose snapshot predates a fence cannot commit below it");
+      await writer.query("ROLLBACK");
+
+      // READ COMMITTED: a fence still in flight holds the watermark row; the
+      // writer waits for it and then reads the committed fence.
+      await other.query("BEGIN");
+      await fence(other, 20);
+      await writer.query("BEGIN");
+      const waiting = outcome(daily(writer, "2026-09-12", 14));
+      await waitsOnLock(pool, writer);
+      await other.query("COMMIT");
+      const refused = await waiting;
+      assert.equal(refused?.code, "P1005");
+      assert.equal(refused?.message, "analytics_publication_authority_stale");
+      await writer.query("ROLLBACK");
+
+      // A writer that locks first orders before a later fence: the fence
+      // waits for its commit, so the publication is that erasure's to contain.
+      await writer.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+      await daily(writer, "2026-09-13", 20);
+      await other.query("BEGIN");
+      const fencing = outcome(fence(other, 30));
+      await waitsOnLock(pool, other);
+      await writer.query("COMMIT");
+      assert.equal(await fencing, null);
+      await other.query("COMMIT");
+      const committed = await pool.query(`SELECT public_authority_epoch::int AS epoch FROM ${table("community_daily_aggregates")}
+        WHERE day='2026-09-13'`);
+      assert.deepEqual(committed.rows, [{ epoch: 20 }]);
+      await refuses(daily(pool, "2026-09-14", 20), "analytics_publication_authority_stale");
+
+      // Graph previews are replaced in place: a stale writer cannot overwrite
+      // a good preview either.
+      await upsertPreview(pool, table, pin({ publicAuthorityEpoch: 30 }));
+      await writer.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+      await writer.query(`SELECT count(*) FROM ${table("community_graph_previews")}`);
+      await fence(pool, 40);
+      assert.ok(serializationFailure(await outcome(upsertPreview(writer, table, pin({ publicAuthorityEpoch: 35 }),
+        { revision: 2 }))), "a stale preview writer cannot replace the preview after a fence");
+      await writer.query("ROLLBACK");
+      const preview = await pool.query(`SELECT revision::int AS revision,public_authority_epoch::int AS epoch
+        FROM ${table("community_graph_previews")}`);
+      assert.deepEqual(preview.rows, [{ revision: 1, epoch: 30 }]);
+
+      // The delivered cursor half of the floor, under both levels.
+      await writer.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+      await writer.query(`SELECT count(*) FROM ${table("community_daily_aggregates")}`);
+      await pool.query(`UPDATE ${table("analytics_source_cursors")} SET sequence=9,authority_epoch=45 WHERE source_id=$1`,
+        [SOURCE_ID]);
+      assert.ok(serializationFailure(await outcome(daily(writer, "2026-09-15", 40))),
+        "a writer whose snapshot predates a cursor advance cannot commit below it");
+      await writer.query("ROLLBACK");
+      await other.query("BEGIN");
+      await other.query(`UPDATE ${table("analytics_source_cursors")} SET sequence=10,authority_epoch=50 WHERE source_id=$1`,
+        [SOURCE_ID]);
+      await writer.query("BEGIN");
+      const behind = outcome(daily(writer, "2026-09-15", 46));
+      await waitsOnLock(pool, writer);
+      await other.query("COMMIT");
+      assert.equal((await behind)?.message, "analytics_publication_authority_stale");
+      await writer.query("ROLLBACK");
+      await daily(pool, "2026-09-15", 50);
+    } finally {
+      for (const session of [writer, other]) {
+        await session.query("ROLLBACK").catch(() => {});
+        await session.end().catch(() => {});
+      }
+    }
   }));
 
 // ---------------------------------------------------------------------------

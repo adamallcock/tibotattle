@@ -80,8 +80,15 @@ interface OracleParticipant {
   readonly secretHash: string;
   /** Active owner link; its digest is a constant. */
   readonly ownerDigest: string | null;
-  /** Active owner revision head: revision 1 (owner-active) or 2 (then source-updated), epoch 1. */
+  /**
+   * Owner revision head. Active: revision 1 (owner-active) or 2 (then
+   * source-updated), epoch 1. Withdrawn: revision 2 and epoch 2 (owner-active
+   * then owner-withdrawn), which the owner page reads as no revision.
+   */
   readonly ownerRevision: 1 | 2 | null;
+  readonly ownerHeadState: "active" | "withdrawn";
+  /** One accepted contribution of this transport version, or none. */
+  readonly legacyContribution: "v0.1" | "v0.2" | null;
   readonly capability: "accepted" | "revoked" | null;
   readonly accountless: OracleAccountless | null;
   readonly v11GenerationId: string | null;
@@ -149,6 +156,8 @@ function participant(caseNumber: number, member: string, shape: {
   readonly state?: "active" | "deleting";
   readonly linked?: boolean;
   readonly ownerRevision?: 1 | 2 | null;
+  readonly ownerHeadState?: "active" | "withdrawn";
+  readonly legacyContribution?: "v0.1" | "v0.2" | null;
   readonly capability?: "accepted" | "revoked" | null;
   readonly accountless?: "current" | "lapsed" | RevocationReason;
   readonly v11Grant?: boolean;
@@ -171,6 +180,8 @@ function participant(caseNumber: number, member: string, shape: {
     secretHash: hex64(`authority-secret-${caseNumber}-${member}`),
     ownerDigest: linked ? hex64(`authority-owner-${caseNumber}-${member}`) : null,
     ownerRevision: linked ? (shape.ownerRevision === undefined ? 1 : shape.ownerRevision) : null,
+    ownerHeadState: shape.ownerHeadState ?? "active",
+    legacyContribution: shape.legacyContribution ?? null,
     capability: shape.capability ?? null,
     accountless: accountlessLease === null ? null : {
       ledger: accountlessLease,
@@ -249,6 +260,16 @@ const CASES: readonly OracleCase[] = [
     name: "accountless-v11-exact",
     participants: [participant(14, "a", { ownerKind: "accountless", accountless: "current", v11Grant: true,
       v11Domain: true })],
+  },
+  {
+    // A withdrawn owner revision head is not an active owner revision.
+    name: "social-owner-head-withdrawn",
+    participants: [participant(15, "a", { ownerRevision: 2, ownerHeadState: "withdrawn" })],
+  },
+  {
+    // Only an accepted v0.2 contribution is legacy evidence.
+    name: "social-legacy-contributions",
+    participants: [participant(16, "a", { legacyContribution: "v0.2" }), participant(16, "b", { legacyContribution: "v0.1" })],
   },
 ];
 
@@ -391,12 +412,24 @@ async function insertParticipant(owner: OracleParticipant): Promise<void> {
     chunk.chunkSeq, hex64(`chunk-${chunk.id}`), envelope, chunk.acceptedRecordCount, `synthetic/authority/${chunk.id}`,
     chunk.authorizationId, chunk.superseded ? T.superseded : null, T.issued);
   }
+  if (owner.legacyContribution !== null) {
+    const contributionId = `authority-contribution-${owner.id}`;
+    await run(`INSERT INTO telemetry_contributions(id,participant_id,plaintext_digest,envelope_digest,r2_key,status,
+        schema_version,range_start,range_end,client_platform,provider_policy_epoch,estimated_api_cost_usd,
+        priced_event_coverage_percent,unknown_model_event_count,unknown_billable_units,price_basis,declared_record_count,
+        created_at,transport_schema_version)
+      VALUES(?,?,?,?,?,'accepted','telemetry-contribution-v0.1',?,?,'synthetic','synthetic',NULL,100,0,0,'synthetic',0,?,?)`,
+    contributionId, owner.id, hex64(`plain-${contributionId}`), hex64(`envelope-${contributionId}`),
+    `synthetic/authority/${contributionId}`, T.issued, T.issued, T.issued,
+    `telemetry-contribution-${owner.legacyContribution}`);
+  }
   if (owner.ownerDigest !== null) {
     await run("INSERT INTO storage_v11_owner_links(participant_id,owner_digest,state) VALUES(?,?,'active')",
       owner.id, owner.ownerDigest);
     if (owner.ownerRevision !== null) {
-      await run("INSERT INTO storage_owner_revisions(owner_digest,revision,authority_epoch,state) VALUES(?,?,1,'active')",
-        owner.ownerDigest, owner.ownerRevision);
+      const withdrawn = owner.ownerHeadState === "withdrawn";
+      await run("INSERT INTO storage_owner_revisions(owner_digest,revision,authority_epoch,state) VALUES(?,?,?,?)",
+        owner.ownerDigest, owner.ownerRevision, withdrawn ? 2 : 1, owner.ownerHeadState);
     }
   }
 }
@@ -457,12 +490,17 @@ it("D1's retained v1.2 scope and community owner page match the committed oracle
   // D1 predicate; the fixture comparison below then pins the exact rows.
   const id = (caseNumber: number) => `${PREFIX}${caseNumber.toString().padStart(2, "0")}a`;
   expect(retainedScope.map((row) => row.participant_id)).toEqual([1, 2, 3, 5, 9, 10, 12].map(id));
-  expect(ownerPage.map((owner) => owner.participantId)).toEqual([1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 14].map(id));
+  expect(ownerPage.map((owner) => owner.participantId))
+    .toEqual([...[1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15].map(id), `${PREFIX}16a`, `${PREFIX}16b`]);
   expect(ownerPage.filter((owner) => owner.hasV12).map((owner) => owner.participantId))
     .toEqual([1, 2, 3, 9, 10, 12].map(id));
   expect(ownerPage.every((owner) => owner.hasEffective === owner.hasV12)).toBe(true);
   expect(ownerPage.filter((owner) => owner.hasV1).map((owner) => owner.participantId)).toEqual([id(6)]);
   expect(ownerPage.filter((owner) => owner.hasV11).map((owner) => owner.participantId)).toEqual([id(6), id(14)]);
+  expect(ownerPage.filter((owner) => owner.hasLegacy).map((owner) => owner.participantId)).toEqual([`${PREFIX}16a`]);
+  const withdrawnHead = ownerPage.find((owner) => owner.participantId === id(15));
+  expect(withdrawnHead?.ownerDigest).not.toBeNull();
+  expect([withdrawnHead?.ownerRevision, withdrawnHead?.authorityEpoch]).toEqual([0, 0]);
   if (REGENERATE) {
     await expect(`${JSON.stringify(oracle, null, 2)}\n`)
       .toMatchFileSnapshot("../postgres-test/fixtures/community-authority-owner-page-oracle.json");

@@ -25,13 +25,21 @@
 
 -- (1) Public contribution-source bootstrap. D1 0060:1066-1078 shape: a plain
 -- singleton. Authority capture requires completed = 1 (D1
--- storage-community-authority.ts:41,127).
+-- storage-community-authority.ts:41,127). PostgreSQL ports no walk, so both
+-- cursors are always empty: D1's JSON-mode walk leaves the last participant
+-- id in participant_cursor when it completes, and no participant inventory or
+-- eraser scans this table. An importer writes '' for both cursors of a
+-- completed D1 row; a row that carries a cursor is refused here instead of
+-- being stored (the violation names the constraint, so a caller can map it
+-- to a constant code without echoing the row).
 CREATE TABLE community_public_source_bootstrap (
   singleton integer PRIMARY KEY CHECK (singleton = 1),
   policy_version text NOT NULL CHECK (policy_version = 'community-public-sources-v1'),
   participant_cursor text NOT NULL DEFAULT '',
   source_day_cursor text NOT NULL DEFAULT '',
-  completed integer NOT NULL DEFAULT 0 CHECK (completed IN (0, 1))
+  completed integer NOT NULL DEFAULT 0 CHECK (completed IN (0, 1)),
+  CONSTRAINT community_public_source_bootstrap_cursors_empty
+    CHECK (participant_cursor = '' AND source_day_cursor = '')
 );
 
 -- Journal-producing evidence of an eligible public source that has no
@@ -97,6 +105,17 @@ SELECT 1, 'community-public-sources-v1', '', '',
 -- the predicate while incomplete and set completed only from 0 to 1. Once
 -- complete it is a single locked read and never reverts. A transfer session
 -- imports the sealed row instead and may not run it.
+--
+-- Invoker rights, default PUBLIC EXECUTE and no function grant: scheduled
+-- maintenance runs it as the non-owner runtime login (POSTGRES_IAM_USER),
+-- which holds table DML and no function grants beyond the ingest producers.
+-- Every step is checked against the caller's own table privileges (UPDATE on
+-- the singleton for the row lock, SELECT on the evidence and the eligibility
+-- view), so a role without them is refused by the tables with 42501, and a
+-- role with them could already set the flag directly. Unlike the producer
+-- functions (insert_telemetry_v1_contribution, storage_journal_append,
+-- storage_owner_link_ensure), revoking EXECUTE here would protect nothing and
+-- would add a runtime grant to every environment.
 CREATE FUNCTION community_public_source_bootstrap_advance()
 RETURNS TABLE (completed integer, pending bigint)
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
@@ -130,7 +149,6 @@ BEGIN
   RETURN QUERY SELECT 0, pending_count;
 END;
 $$;
-REVOKE ALL ON FUNCTION community_public_source_bootstrap_advance() FROM PUBLIC;
 
 -- (2) Retained v1.2 authorization scope: D1 V12_RETAINED_AUTHORIZATION_SCOPE
 -- (storage-community-authority.ts:171-189). The first branch is the write
@@ -235,7 +253,10 @@ CREATE TRIGGER analytics_storage_erasure_receipt_no_truncate
 -- watermark. Version-0 journal terminals carry no public epoch;
 -- legacy_terminal_floor_epoch is the explicit bound readers use for them,
 -- and without it they fail closed. Every value is monotonic; a floor is set
--- once and only raised.
+-- once and only raised. The row is also the per-source lock of the write-side
+-- erasure fence (6): the first authority write of a source may create it at
+-- zero, so an import raises an existing row monotonically and never assumes
+-- the table is empty.
 CREATE TABLE community_terminal_watermarks (
   source_id text PRIMARY KEY CHECK (length(source_id) BETWEEN 1 AND 200 AND source_id !~ '[[:cntrl:]]'),
   terminal_public_authority_epoch bigint NOT NULL CHECK (terminal_public_authority_epoch >= 0),
@@ -411,6 +432,23 @@ CREATE TRIGGER community_daily_head_advance
 -- agree with the pin columns; the pinned public epoch must not be below the
 -- delivered cursor epoch or any erasure fence of the source, so a writer
 -- captured before an erasure cannot recreate an aggregate after it.
+--
+-- D1 gets that ordering from its single writer. PostgreSQL writers run
+-- concurrently (the daily publisher at REPEATABLE READ), so the floor is read
+-- under row locks that every advance of it must also take:
+--   * the source cursor row, FOR SHARE: a cursor advance updates that row;
+--   * the source's terminal watermark row, FOR SHARE: every fence insert
+--     upserts it in the fence's own transaction (the trigger below), and the
+--     writer creates a zero row first when the source has none, so the lock
+--     always has a row to hold.
+-- A fence or cursor advance that commits after the writer's snapshot then
+-- fails the writer with 40001 under REPEATABLE READ (the locked row, or the
+-- zero row's conflict, is newer than the snapshot), or is waited for and
+-- re-read under READ COMMITTED. One that starts later waits for the writer
+-- to commit, so the publication orders before it and stays that erasure's
+-- to contain. A zero watermark row reads exactly like no row, and a source
+-- without a cursor row reads 0 as in D1 (activation creates cursors at 0;
+-- only the fenced transfer imports them).
 CREATE FUNCTION community_authority_integer_matches(document jsonb, key text, expected bigint)
 RETURNS boolean
 LANGUAGE sql IMMUTABLE SET search_path FROM CURRENT AS $$
@@ -459,12 +497,28 @@ $$;
 
 CREATE FUNCTION community_publication_erasure_floor(source_id_value text)
 RETURNS bigint
-LANGUAGE sql STABLE SET search_path FROM CURRENT AS $$
-  SELECT GREATEST(
-    COALESCE((SELECT cursor.authority_epoch FROM analytics_source_cursors cursor
-               WHERE cursor.source_id = source_id_value), 0),
-    COALESCE((SELECT max(fence.public_authority_epoch) FROM analytics_storage_erasure_fences fence
-               WHERE fence.source_id = source_id_value), 0))
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE
+  cursor_epoch bigint;
+  fence_epoch bigint;
+BEGIN
+  SELECT source_cursor.authority_epoch INTO cursor_epoch
+    FROM analytics_source_cursors source_cursor
+   WHERE source_cursor.source_id = source_id_value
+   FOR SHARE;
+  INSERT INTO community_terminal_watermarks (source_id, terminal_public_authority_epoch, terminal_sequence)
+  VALUES (source_id_value, 0, 0)
+  ON CONFLICT (source_id) DO NOTHING;
+  PERFORM 1 FROM community_terminal_watermarks watermark
+    WHERE watermark.source_id = source_id_value
+    FOR SHARE;
+  -- A new statement: under READ COMMITTED it sees every fence committed
+  -- before the locks were granted.
+  SELECT max(fence.public_authority_epoch) INTO fence_epoch
+    FROM analytics_storage_erasure_fences fence
+   WHERE fence.source_id = source_id_value;
+  RETURN GREATEST(COALESCE(cursor_epoch, 0), COALESCE(fence_epoch, 0));
+END;
 $$;
 
 CREATE FUNCTION community_daily_authority_fence()
