@@ -727,9 +727,12 @@ It skips a device when any of these hold:
 - it has v1 or v0.2 history, or a head from another device;
 - it has no contiguous complete day.
 
-The result and the `run_maintenance` audit (`task: "v11_evidence_adoption"`)
-hold outcome counts, refusal codes, days covered, new days and accepted days
-kept. They never hold identifiers. A rerun with nothing new returns `unchanged`.
+The `run_maintenance` audit (`task: "v11_evidence_adoption"`) holds only
+outcome counts, refusal codes, days covered, new days and accepted days kept.
+The owner's response adds one identifier: when more devices remain,
+`nextAfterParticipantId` is the last examined pseudonymous participant, used as
+the paging cursor. Keep it out of notes, issues and receipts. A rerun with
+nothing new returns `unchanged`.
 
 Adoption does not unblock the client. A device whose build dropped an accepted
 record keeps being refused, so later runs extend its head over newer complete
