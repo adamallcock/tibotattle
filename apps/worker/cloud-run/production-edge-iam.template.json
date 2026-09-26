@@ -1,0 +1,27 @@
+{
+  "comment": "Invoker IAM for the IAM-private production Cloud Run service in production-service.template.yaml. The infrastructure tooling renders the placeholders by text substitution and applies the policy; nothing in the repository applies it. The service policy holds exactly one binding: roles/run.invoker for the edge invoker service account and, only when VERIFIER_SA renders non-empty, the verifier service account. Neither account holds any project role. production-edge-infra.check.mjs validates this file.",
+  "schema": "tibotattle-production-edge-iam-template-v1",
+  "resource": {
+    "type": "run.googleapis.com/Service",
+    "project": "${PROJECT}",
+    "region": "${REGION}",
+    "service": "${SERVICE}"
+  },
+  "servicePolicy": {
+    "bindings": [
+      {
+        "role": "roles/run.invoker",
+        "members": [
+          "serviceAccount:${EDGE_INVOKER_SA}"
+        ],
+        "optionalMembers": [
+          "serviceAccount:${VERIFIER_SA}"
+        ]
+      }
+    ]
+  },
+  "projectRoles": {
+    "serviceAccount:${EDGE_INVOKER_SA}": [],
+    "serviceAccount:${VERIFIER_SA}": []
+  }
+}
