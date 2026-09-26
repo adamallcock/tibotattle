@@ -1,5 +1,5 @@
 import { applyD1Migrations, env, reset, type D1Migration } from "cloudflare:test";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { parse } from "jsonc-parser";
 import { MAX_TELEMETRY_V12_DOMAIN_DAYS } from "@app-usagemonitor/telemetry-contract";
 import wranglerSource from "../wrangler.jsonc?raw";
@@ -38,7 +38,9 @@ import {
 // paced refusal of a schema without ingestion-isolation 0012, and the opt-out,
 // eligibility and erasure paths of a domain that includes empty days. The GCP
 // line adds the retained-history transfer source for a v1.2-only opt-out,
-// which needs ingestion-isolation 0014.
+// which needs ingestion-isolation 0014, and keeps two journeys its own earlier
+// cases drove: a v1.2 pass after an accountless renewal, and a pass without a
+// progress journal.
 
 interface Bindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -302,15 +304,16 @@ async function negotiate(install: Install, net: Transport): Promise<void> {
   }
 }
 
-/** One accountless desktop pass with the v1.2 successor negotiated. */
-async function accountlessPass(install: Install, local: LocalIndex, progress: Journal, net: Transport,
+/** One accountless desktop pass with the v1.2 successor negotiated; a null
+ * journal runs it as a desktop without a progress store. */
+async function accountlessPass(install: Install, local: LocalIndex, progress: Journal | null, net: Transport,
   options: { maxChunks?: number } = {}): Promise<TelemetryV12SyncRun> {
   await negotiate(install, net);
   let key: { publicJwk: JsonWebKey; keyId: string } | null = null;
   return runTelemetryV12Sync({
     serverBaseUrl: origin, deviceAuthorization: install.authorization, authorization: V12_AUTHORIZATION,
     laboratory: true, days: local.days(), readDay: local.readDay, fetchImpl: net.fetch, clock: Date.now,
-    progressStore: progress.store,
+    ...(progress === null ? {} : { progressStore: progress.store }),
     preparePublication: async () => ({ fingerprint: local.fingerprint(), parserVersion }),
     createEnvelope: async (chunk) => {
       if (key === null) {
@@ -923,5 +926,82 @@ describe("retained-history transfer source for a v1.2-only opt-out", () => {
       .bind(retained.participantId).run();
     await expect(assertAccountlessRetentionSourceSnapshotCurrent(db(), snapshot.runId))
       .rejects.toMatchObject({ code: "SOURCE_AUTHORITY_MUTATED" });
+  });
+});
+
+const renewalRequest = Object.freeze({
+  schemaVersion: "accountless-renewal-v0.1", policyVersion: "accountless-opt-out-v1",
+  authorizationBasis: "accountless-policy-v1", telemetrySchemaVersion: "telemetry-contribution-v1.1",
+});
+const grantRequests = (net: Transport) => net.exchanges
+  .filter((exchange) => exchange.path === "/api/v1/accountless/telemetry-v1.2-authorization");
+
+describe("real v1.2 client across an accountless renewal and without a progress journal", () => {
+  it("uploads, renews and uploads again with the desktop's progress journal", async () => {
+    const install = await newInstall();
+    // Enrolled, owned and granted 25 days ago: 5 days of the 30-day lease
+    // remain, so the renewal between the two passes falls inside its
+    // seven-day window instead of answering "existing".
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() - 25 * DAY_MS);
+    try { await negotiate(install, transport()); } finally { clock.mockRestore(); }
+    const participantId = await participantOf(install);
+    const local = localIndex({ [dayOf(-1)]: 2, [dayOf(0)]: 3 });
+    const progress = journal();
+    const net = transport();
+    const first = await accountlessPass(install, local, progress, net);
+    expect({ first, failures: failures(net) }).toMatchObject({
+      first: { status: "complete", failure: null, chunksUploaded: 2, recordsUploaded: 5 }, failures: [],
+    });
+    expect(grantRequests(net)).toHaveLength(0);
+    expect(progress.current()).toBeNull();
+    // A v1.2-only install never opens a v1.1 domain for the same source.
+    expect(await count("SELECT count(*) n FROM telemetry_v11_domains WHERE device_id = ?", install.deviceId)).toBe(0);
+    expect(await count("SELECT count(*) n FROM telemetry_v12_chunks WHERE device_id = ?", install.deviceId)).toBe(2);
+    expect(await db().prepare("SELECT revision FROM telemetry_v12_domain_heads WHERE participant_id = ?")
+      .bind(participantId).first("revision")).toBe(1);
+    expect(await count("SELECT count(*) n FROM community_public_source_owners WHERE device_id = ?", install.deviceId)).toBe(1);
+
+    const renewal = await transport().fetch(`${origin}/api/v1/accountless/renewal`, {
+      method: "POST", headers: { ...JSON_HEADERS, authorization: install.authorization },
+      body: JSON.stringify(renewalRequest),
+    });
+    expect(renewal.status, await renewal.clone().text()).toBe(200);
+    expect(await renewal.json()).toMatchObject({ state: "renewed", renewalGeneration: 1 });
+    // The v1.1 lease renewal carries the v1.2 grant forward with it.
+    expect(await db().prepare(`SELECT grant_row.state, grant_row.expires_at = ledger.expires_at AS current
+        FROM accountless_v12_device_authorizations grant_row
+        JOIN accountless_enrollment_ledger ledger ON ledger.device_id = grant_row.enrollment_device_id
+       WHERE grant_row.enrollment_device_id = ?`).bind(install.deviceId).first())
+      .toEqual({ state: "active", current: 1 });
+
+    local.set(dayOf(0), 4);
+    const again = transport();
+    const second = await accountlessPass(install, local, progress, again);
+    expect({ second, failures: failures(again) }).toMatchObject({
+      second: { status: "complete", failure: null, chunksUploaded: 1, chunksSkipped: 1, recordsUploaded: 4 },
+      failures: [],
+    });
+    // The renewed grant is current, so negotiation does not request another.
+    expect(grantRequests(again)).toHaveLength(0);
+    expect(await count("SELECT count(*) n FROM telemetry_v12_chunks WHERE device_id = ?", install.deviceId)).toBe(3);
+    expect(await db().prepare("SELECT revision FROM telemetry_v12_domain_heads WHERE participant_id = ?")
+      .bind(participantId).first("revision")).toBe(2);
+    expect(await count("SELECT count(*) n FROM telemetry_v11_domains WHERE device_id = ?", install.deviceId)).toBe(0);
+    expect(await count("SELECT count(*) n FROM community_public_source_owners WHERE device_id = ?", install.deviceId)).toBe(1);
+  });
+
+  it("uploads a never-uploaded install without a journal", async () => {
+    const install = await newInstall();
+    const net = transport();
+    const result = await accountlessPass(install, localIndex({ [dayOf(0)]: 2 }), null, net);
+    expect({ result, failures: failures(net) }).toMatchObject({
+      result: { status: "complete", failure: null, chunksUploaded: 1, recordsUploaded: 2, acknowledgedThroughDay: today() },
+      failures: [],
+    });
+    // Without a journal the pass pins one predecessor and does not re-read it.
+    expect(predecessors(net)).toHaveLength(1);
+    const participantId = await participantOf(install);
+    expect(await count("SELECT count(*) n FROM telemetry_v12_domain_heads WHERE participant_id = ?", participantId)).toBe(1);
+    expect(await count("SELECT count(*) n FROM telemetry_v11_domains WHERE device_id = ?", install.deviceId)).toBe(0);
   });
 });
