@@ -24,6 +24,14 @@ import {
  * baselines (backfill, tampered chains, emitter parity) and the 0046 schema
  * stay exactly 0045 and 0045+0046 before and after promotion and after later
  * waves append 0047+. Every row is synthetic and content-free.
+ *
+ * Connection profiles: the private Unix socket (PG_TEST_SOCKET, PG_TEST_HOST
+ * unset) is the qualifying profile and runs every test. Loopback TCP
+ * (PG_TEST_HOST=127.0.0.1, ::1 or localhost, PG_TEST_SOCKET unset) runs every
+ * test except the journal transfer, which fails on an explicit profile
+ * assertion: scripts/postgres-ingestion-journal-transfer.mjs accepts only a
+ * local PostgreSQL 17 target reached over a Unix socket (inet_server_addr() IS
+ * NULL) and refuses TCP by design.
  */
 
 const PG_TEST_HOST = process.env.PG_TEST_HOST;
@@ -765,6 +773,9 @@ const D1_TRANSFER_HEADS = [
 
 test("PG17 journal transfer through 0046 derives the D1 heads, rolls back with a failed page, and continues live",
   { skip: SKIP, timeout: 180_000 }, async () => withSchema(async ({ pool, schema, quoted, table }) => {
+    const locality = await pool.query("SELECT inet_server_addr() IS NULL AS socket");
+    assert.equal(locality.rows[0].socket, true,
+      "the journal transfer runs only over the private Unix socket (PG_TEST_SOCKET); the transfer tool refuses TCP targets");
     const fixture = await makeSealedJournal();
     const transferId = "synthetic-ingestion-journal-owner-authority";
     try {
