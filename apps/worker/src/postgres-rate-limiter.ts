@@ -12,7 +12,25 @@ const KEY_MAX_BYTES = 1_024;
 const KEY_DIGEST_BYTES = 32;
 const MAX_LIMIT = 10_000;
 const MAX_PERIOD_SECONDS = 86_400;
+const MAX_TRANSACTION_TIMEOUT_MILLISECONDS = 600_000;
+const MAX_PURGE_ROWS = 10_000;
+const MAX_EPOCH_MILLISECONDS = 9_999_999_999_999;
 const encoder = new TextEncoder();
+
+/** Default page size for the maintenance-driven global bucket purge. */
+export const POSTGRES_RATE_LIMIT_PURGE_DEFAULT_MAX_ROWS = 5_000;
+
+/**
+ * Transaction bounds for limiters on the production admission pool. A lock or
+ * statement timeout fails the limiter call, which src/admission.ts already
+ * maps to its retry-after-60 503 outcome instead of queueing behind a hot
+ * global bucket.
+ */
+export const POSTGRES_ADMISSION_LIMITER_TRANSACTION_OPTIONS: PostgresRateLimiterTransactionOptions =
+  Object.freeze({
+    statementTimeoutMilliseconds: 2_000,
+    lockTimeoutMilliseconds: 1_000,
+  });
 
 interface RateLimitBucketRow {
   readonly window_started_at_ms: string;
@@ -31,6 +49,28 @@ export interface PostgresRateLimitResult {
   readonly success: boolean;
 }
 
+/**
+ * Optional per-limiter transaction bounds. Omitting the object, or either
+ * field, keeps the shared withPostgresMutation defaults.
+ */
+export interface PostgresRateLimiterTransactionOptions {
+  readonly statementTimeoutMilliseconds?: number;
+  readonly lockTimeoutMilliseconds?: number;
+}
+
+export interface PostgresRateLimitPurgeOptions {
+  /** Epoch milliseconds used as "now" for the expiry cutoff. */
+  readonly nowEpoch?: number;
+  /** Upper bound on rows deleted by one call. */
+  readonly maxRows?: number;
+  /**
+   * Window length of each configured limiter. The bucket table stores no
+   * period, so rows of a limiter absent from this map fall back to the largest
+   * period any limiter may have, which can only delay, never hasten, a purge.
+   */
+  readonly periodSecondsByLimiterName: Readonly<Record<string, number>>;
+}
+
 function invalid(): never {
   throw new TypeError("Invalid PostgreSQL rate limiter configuration");
 }
@@ -38,6 +78,25 @@ function invalid(): never {
 function safePositiveInteger(value: unknown, maximum: number): number {
   if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > maximum) invalid();
   return value as number;
+}
+
+function optionalTimeout(value: unknown): number | undefined {
+  return value === undefined
+    ? undefined
+    : safePositiveInteger(value, MAX_TRANSACTION_TIMEOUT_MILLISECONDS);
+}
+
+function transactionBounds(
+  value: PostgresRateLimiterTransactionOptions | undefined,
+): Readonly<PostgresRateLimiterTransactionOptions> | null {
+  if (value === undefined) return null;
+  if (value === null || typeof value !== "object") invalid();
+  const statementTimeoutMilliseconds = optionalTimeout(value.statementTimeoutMilliseconds);
+  const lockTimeoutMilliseconds = optionalTimeout(value.lockTimeoutMilliseconds);
+  return Object.freeze({
+    ...(statementTimeoutMilliseconds === undefined ? {} : { statementTimeoutMilliseconds }),
+    ...(lockTimeoutMilliseconds === undefined ? {} : { lockTimeoutMilliseconds }),
+  });
 }
 
 function safeName(value: unknown): string {
@@ -84,14 +143,20 @@ export class PostgresRateLimiter {
   private readonly pool: PostgresPool;
   private readonly schema: string;
   private readonly keyHashSecret: Uint8Array;
+  private readonly transaction: Readonly<PostgresRateLimiterTransactionOptions> | null;
 
-  constructor(pool: PostgresPool, options: PostgresRateLimiterOptions) {
+  constructor(
+    pool: PostgresPool,
+    options: PostgresRateLimiterOptions,
+    transactionOptions?: PostgresRateLimiterTransactionOptions,
+  ) {
     if (!pool || typeof pool.connect !== "function") invalid();
     const config = createPostgresSchemaConfig(options);
     this.name = safeName(options.name);
     this.limitValue = safePositiveInteger(options.limit, MAX_LIMIT);
     this.periodSeconds = safePositiveInteger(options.periodSeconds, MAX_PERIOD_SECONDS);
     this.keyHashSecret = secretBytes(options.keyHashSecret);
+    this.transaction = transactionBounds(transactionOptions);
     this.pool = pool;
     this.schema = config.primarySchema;
   }
@@ -175,13 +240,88 @@ export class PostgresRateLimiter {
       }
       await this.cleanup(client);
       return { success };
-    }, { operation: "rate_limit.limit" });
+    }, this.transaction === null
+      ? { operation: "rate_limit.limit" }
+      : { ...this.transaction, operation: "rate_limit.limit" });
   }
 }
 
 export function createPostgresRateLimiter(
   pool: PostgresPool,
   options: PostgresRateLimiterOptions,
+  transactionOptions?: PostgresRateLimiterTransactionOptions,
 ): PostgresRateLimiter {
-  return new PostgresRateLimiter(pool, options);
+  return new PostgresRateLimiter(pool, options, transactionOptions);
+}
+
+function safeEpoch(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0
+      || (value as number) > MAX_EPOCH_MILLISECONDS) invalid();
+  return value as number;
+}
+
+function purgePeriods(value: unknown): { readonly names: string[]; readonly periods: number[] } {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) invalid();
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length === 0) invalid();
+  return {
+    names: entries.map(([name]) => safeName(name)),
+    periods: entries.map(([, period]) => safePositiveInteger(period, MAX_PERIOD_SECONDS)),
+  };
+}
+
+/**
+ * Bounded global purge of limiter buckets whose window started more than two
+ * periods before nowEpoch. The per-call lazy cleanup only reaches the calling
+ * limiter's own rows; this backstop runs from scheduled maintenance so keyed
+ * digests of retired or idle limiters do not linger. SKIP LOCKED leaves a
+ * bucket being admitted right now for a later pass, and repeating a call only
+ * deletes rows that are still expired, so the purge is idempotent.
+ */
+export async function purgeExpiredPostgresRateLimitBuckets(
+  pool: PostgresPool,
+  schema: PostgresSchemaOptions | undefined,
+  options: PostgresRateLimitPurgeOptions,
+): Promise<number> {
+  if (!pool || typeof pool.connect !== "function") invalid();
+  if (options === null || typeof options !== "object") invalid();
+  const table = `${quotePostgresIdentifier(createPostgresSchemaConfig(schema ?? {}).primarySchema)}."postgres_rate_limit_buckets"`;
+  const nowEpoch = safeEpoch(options.nowEpoch ?? Date.now());
+  const maxRows = safePositiveInteger(
+    options.maxRows ?? POSTGRES_RATE_LIMIT_PURGE_DEFAULT_MAX_ROWS,
+    MAX_PURGE_ROWS,
+  );
+  const { names, periods } = purgePeriods(options.periodSecondsByLimiterName);
+  return withPostgresMutation(pool, async (client) => {
+    const result = await client.query<{ readonly purged: number | string }>(`
+      WITH periods AS (
+        SELECT configured.limiter_name, configured.period_seconds
+          FROM unnest($1::text[], $2::integer[])
+            AS configured(limiter_name, period_seconds)
+      ),
+      expired AS (
+        SELECT bucket.limiter_name, bucket.key_digest
+          FROM ${table} bucket
+          LEFT JOIN periods ON periods.limiter_name=bucket.limiter_name
+         WHERE bucket.window_started_at < to_timestamp($3::double precision/1000.0)
+           - (2 * COALESCE(periods.period_seconds, $4::integer))::double precision
+             * interval '1 second'
+         LIMIT $5
+         FOR UPDATE OF bucket SKIP LOCKED
+      ),
+      purged AS (
+        DELETE FROM ${table} bucket
+         USING expired
+         WHERE bucket.limiter_name=expired.limiter_name
+           AND bucket.key_digest=expired.key_digest
+        RETURNING 1
+      )
+      SELECT count(*)::integer AS purged FROM purged`,
+    [names, periods, nowEpoch, MAX_PERIOD_SECONDS, maxRows]);
+    const purged = Number(result.rows[0]?.purged);
+    if (!Number.isSafeInteger(purged) || purged < 0 || purged > maxRows) {
+      throw new Error("invalid rate bucket purge result");
+    }
+    return purged;
+  }, { operation: "rate_limit.purge" });
 }
