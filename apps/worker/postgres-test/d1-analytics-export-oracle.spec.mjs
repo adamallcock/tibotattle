@@ -12,15 +12,29 @@ import { runD1AnalyticsExportOracleCli } from "../cloud-run/d1-analytics-export-
 import { canonicalJson } from "../src/canonical-json.ts";
 import { sha256Hex } from "../src/crypto.ts";
 import {
+  ANALYTICS_HISTORY_CANONICAL_TABLES,
   ANALYTICS_HISTORY_ORACLE_SCHEMA,
+  CanonicalTableHasher,
+  analyticsHistoryGraphWindow,
+  canonicalColumnValue,
+  canonicalRowLine,
   classifyDailyReproduction,
   classifyGraphReproduction,
+  liveCohortMemberLine,
   normalizedDailyPayloadSha256,
   normalizedModelDaySha256,
   normalizedPreviewSha256,
   validateAnalyticsHistoryOracle,
 } from "../src/analytics-history-proof.ts";
-import { readD1AnalyticsImportSelection, runD1AnalyticsExportOracle } from "../src/d1-analytics-export-oracle.ts";
+import {
+  canonicalD1TableDigest,
+  iterateOracleUntilDone,
+  readD1AnalyticsImportSelection,
+  readD1AnalyticsLiveCohort,
+  runD1AnalyticsExportOracle,
+} from "../src/d1-analytics-export-oracle.ts";
+import { readCacheRetentionCommunitySeries } from "../src/cache-retention-day.ts";
+import { readStorageCommunityOwnerPage } from "../src/storage-community-authority.ts";
 import { advanceStorageCommunityGraphWork } from "../src/storage-community-graph-work.ts";
 import { retireStorageCommunityGraphPublications } from "../src/storage-community-graph-publication.ts";
 
@@ -55,16 +69,19 @@ async function scratch(tag, doctor) {
   return paths;
 }
 
-function open(paths) {
-  const handles = Object.fromEntries(Object.entries(paths).map(([name, path]) => [name, openSealedSqliteD1(path)]));
+/** Adapter bindings over a scratch set. They read SQLite's 'now' at the
+ * pinned instant unless `pinnedNowMs` is null (the wall clock). */
+function open(paths, { pinnedNowMs = fixture.pinnedNowMs, readOnly = false } = {}) {
+  const handles = Object.fromEntries(Object.entries(paths).map(([name, path]) =>
+    [name, openSealedSqliteD1(path, { pinnedNowMs, readOnly })]));
   return {
     ...Object.fromEntries(Object.entries(handles).map(([name, handle]) => [name, handle.database])),
     close() { for (const handle of Object.values(handles)) handle.close(); },
   };
 }
 
-async function runOracle(paths, overrides = {}) {
-  const db = open(paths);
+async function runOracle(paths, overrides = {}, openOptions = {}) {
+  const db = open(paths, openOptions);
   try {
     return await runD1AnalyticsExportOracle({ ingestion: db.ingestion, analytics: db.analytics, ledger: db.ledger,
       pinnedNowMs: fixture.pinnedNowMs, sourceId: fixture.sourceId, sourceNamespace: fixture.sourceNamespace,
@@ -74,13 +91,43 @@ async function runOracle(paths, overrides = {}) {
   }
 }
 
-async function refusal(paths) {
+async function refusal(paths, overrides = {}, openOptions = {}) {
   try {
-    await runOracle(paths);
+    await runOracle(paths, overrides, openOptions);
   } catch (error) {
     return error;
   }
-  assert.fail("the oracle accepted a non-quiescent export");
+  assert.fail("the oracle accepted an export it must refuse");
+}
+
+async function fileSha256(path) {
+  return createHash("sha256").update(await readFile(path)).digest("hex");
+}
+
+function cliArgv(paths, inventory, out) {
+  return ["--ingestion", paths.ingestion, "--analytics", paths.analytics, "--ledger", paths.ledger,
+    "--pinned-now-ms", String(fixture.pinnedNowMs), "--inventory", inventory, "--out", out];
+}
+
+/** Remove one cache-retention day completely (mark, values, bands, carry). */
+function removeCacheRetentionDay(analytics, day) {
+  const marks = analytics.prepare("SELECT mark_key FROM analytics_cache_retention_day_marks WHERE day=?").all(day)
+    .map((row) => row.mark_key);
+  assert.ok(marks.length > 0, `the fixture retains ${day}`);
+  for (const markKey of marks) {
+    const values = analytics.prepare("SELECT value_key FROM analytics_cache_retention_day_values WHERE mark_key=?")
+      .all(markKey).map((row) => row.value_key);
+    analytics.prepare("DELETE FROM analytics_cache_retention_day_marks WHERE mark_key=?").run(markKey);
+    analytics.prepare("DELETE FROM analytics_cache_retention_day_values WHERE mark_key=?").run(markKey);
+    for (const value of values) analytics.prepare("DELETE FROM analytics_cache_retention_day_bands WHERE value_key=?").run(value);
+    analytics.prepare("DELETE FROM analytics_cache_retention_day_carry WHERE mark_key=?").run(markKey);
+  }
+}
+
+function dropTriggers(database, table) {
+  for (const { name } of database.prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND tbl_name=?").all(table)) {
+    database.exec(`DROP TRIGGER "${name}"`);
+  }
 }
 
 /** Synthetic corruption of a scratch copy only: publications are immutable
@@ -102,16 +149,18 @@ beforeAll(async () => {
   // Run A goes through the operator CLI with the real oracle.
   const paths = await scratch("cli");
   const inventory = join(root, "inventory.json");
+  const d1 = {};
+  for (const [name, sealed] of Object.entries(fixture.paths)) {
+    d1[name] = { timeTravelBookmark: `synthetic-bookmark-${name}`, sealedSha256: await fileSha256(sealed) };
+  }
   await writeFile(inventory, JSON.stringify({ schema: "analytics-cutover-inventory-v2",
     drain: { fencedAtMs: fixture.pinnedNowMs - 60_000, quiescentAtMs: fixture.pinnedNowMs },
-    cacheRetention: { fromDay: null }, foldHistory: FOLD_HISTORY }));
+    cacheRetention: { fromDay: null }, foldHistory: FOLD_HISTORY, d1 }));
   const out = join(root, "oracle.json");
   const logs = [];
-  const code = await runD1AnalyticsExportOracleCli({ argv: ["--ingestion", paths.ingestion, "--analytics", paths.analytics,
-    "--ledger", paths.ledger, "--pinned-now-ms", String(fixture.pinnedNowMs), "--inventory", inventory, "--out", out],
-  log: (entry) => logs.push(entry) });
+  const code = await runD1AnalyticsExportOracleCli({ argv: cliArgv(paths, inventory, out), log: (entry) => logs.push(entry) });
   const bytes = code === 0 ? await readFile(out) : null;
-  cliRun = { code, logs, out, paths, bytes, oracle: bytes === null ? null : JSON.parse(bytes) };
+  cliRun = { code, logs, out, paths, inventory, bytes, oracle: bytes === null ? null : JSON.parse(bytes) };
 }, RUN_TIMEOUT_MS);
 
 afterAll(async () => {
@@ -170,6 +219,194 @@ describe("normalization and the closed oracle contract", () => {
       const copy = structuredClone(valid);
       mutate(copy);
       assert.throws(() => validateAnalyticsHistoryOracle(copy), { code: "ANALYTICS_HISTORY_ORACLE_INVALID" });
+    }
+  });
+
+  // Known answers for the canonical hash contract HX-2 and HX-5 reproduce
+  // without importing this module. The expected hex values were computed
+  // independently (node:crypto over the documented framing).
+  it("canonical row lines, table digests and cohort lines match their known answers", async () => {
+    const journal = ANALYTICS_HISTORY_CANONICAL_TABLES.storage_ingestion_changes;
+    const row = { sequence: 7, event_digest: "a".repeat(64), owner_digest: "b".repeat(64), revision: 2,
+      kind: "owner-upload", object_digest: "c".repeat(64), content_digest: null, authority_epoch: 3,
+      public_authority_epoch: 4, recorded_ms: 1_700_000_000_000 };
+    const line = `["7","${"a".repeat(64)}","${"b".repeat(64)}","2","owner-upload","${"c".repeat(64)}",null,"3","4","1700000000000"]`;
+    assert.equal(canonicalRowLine(journal, row), line, "i64 renders a decimal string, NULL stays null, columns in projection order");
+    assert.equal(canonicalRowLine(journal, { ...row, sequence: 7n, recorded_ms: 1_700_000_000_000n }), line, "bigint i64");
+    assert.equal(canonicalRowLine(journal, Object.fromEntries(Object.entries(row).reverse())), line, "row key order is irrelevant");
+    assert.throws(() => canonicalRowLine(journal, { ...row, extra: 1, sequence: undefined }), { code: "ANALYTICS_HISTORY_ORACLE_INVALID" });
+    const { recorded_ms: _omitted, ...missing } = row;
+    assert.throws(() => canonicalRowLine(journal, missing), { code: "ANALYTICS_HISTORY_ORACLE_INVALID" });
+    const one = new CanonicalTableHasher();
+    await one.add([line]);
+    assert.equal(one.rows, 1);
+    assert.equal(await one.digest(), "d98ee984c329454c739464f5fe67b407f8186e3b241df86f44fbdbc1a0bfd79d");
+    // Framing: sha256 over sha256(line) + "\n" per row; paging-independent.
+    const paged = new CanonicalTableHasher();
+    await paged.add(["x"]);
+    await paged.add([]);
+    await paged.add(["y"]);
+    assert.equal(await paged.digest(), "7f395d7422a497f623b6a5a8a18c49049e24eefa8542ba9a39ed36cff8a5d485");
+    assert.equal(await new CanonicalTableHasher().digest(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    // Column types, including json_bytes (byte for byte) and NULL for each.
+    for (const type of ["text", "i64", "f64", "json_bytes", "json_canonical"]) assert.equal(canonicalColumnValue(type, null), null);
+    assert.equal(canonicalColumnValue("json_bytes", '{"b":1, "a":[2,3]}'), '{"b":1, "a":[2,3]}');
+    assert.equal(canonicalColumnValue("json_canonical", '{"b":1, "a":[2,3]}'), '{"a":[2,3],"b":1}');
+    assert.equal(canonicalColumnValue("f64", 0.1 + 0.2), "0.30000000000000004");
+    assert.equal(canonicalColumnValue("i64", -9_007_199_254_740_991), "-9007199254740991");
+    assert.equal(canonicalColumnValue("i64", 2n ** 63n - 1n), "9223372036854775807");
+    for (const [type, value] of [["i64", 2 ** 53], ["i64", 1.5], ["i64", "7"], ["text", 7], ["json_bytes", 7],
+      ["f64", Number.NaN], ["json_canonical", "{"]]) {
+      assert.throws(() => canonicalColumnValue(type, value), { code: "ANALYTICS_HISTORY_ORACLE_INVALID" }, `${type} ${value}`);
+    }
+    const progress = ANALYTICS_HISTORY_CANONICAL_TABLES.analytics_cache_retention_day_progress;
+    assert.equal(progress.columns.find(([name]) => name === "state_json")[1], "json_bytes");
+    // One live-cohort member: the complete owner-page row, keys sorted.
+    const owner = { participantId: "participant-synthetic-1", ownerDigest: "d".repeat(64), inputRevision: 2,
+      ownerRevision: 1, authorityEpoch: 3, hasV1: true, hasV11: false, hasV12: true, hasLegacy: false, hasEffective: true };
+    const memberLine = `{"authorityEpoch":3,"hasEffective":true,"hasLegacy":false,"hasV1":true,"hasV11":false,"hasV12":true,`
+      + `"inputRevision":2,"ownerDigest":"${"d".repeat(64)}","ownerRevision":1,"participantId":"participant-synthetic-1"}`;
+    assert.equal(liveCohortMemberLine(owner), memberLine);
+    const { hasEffective: _absent, ...legacyShape } = owner;
+    assert.equal(liveCohortMemberLine(legacyShape), memberLine.replace('"hasEffective":true', '"hasEffective":false'));
+    assert.equal(liveCohortMemberLine({ ...owner, ownerDigest: null }), memberLine.replace(`"${"d".repeat(64)}"`, "null"));
+    const cohort = new CanonicalTableHasher();
+    await cohort.add([liveCohortMemberLine(owner)]);
+    assert.equal(await cohort.digest(), "e2d50808fabe42659249a61ab707811da2ca864e0a2c804e2f6a080e67272558");
+  });
+
+  it("the keyset-paged table digest equals one unpaged read across page boundaries", async () => {
+    const path = join(root, "paging.sqlite");
+    const seed = new DatabaseSync(path);
+    seed.exec(`CREATE TABLE storage_ingestion_changes(sequence INTEGER PRIMARY KEY,event_digest TEXT,owner_digest TEXT,
+        revision INTEGER,kind TEXT,object_digest TEXT,content_digest TEXT,authority_epoch INTEGER,
+        public_authority_epoch INTEGER,recorded_ms INTEGER);
+      CREATE TABLE analytics_cache_retention_day_carry(mark_key TEXT NOT NULL,day TEXT NOT NULL,source_id TEXT,
+        owner_digest TEXT,device_id TEXT,manifest_digest TEXT,PRIMARY KEY(mark_key,day)) WITHOUT ROWID;
+      CREATE TABLE analytics_cache_retention_day_progress(progress_key TEXT PRIMARY KEY,source_id TEXT,source_layout TEXT,
+        source_namespace TEXT,owner_digest TEXT,device_id TEXT,manifest_id TEXT,manifest_digest TEXT,day TEXT,
+        method_version TEXT,carry_digest TEXT,progress_revision INTEGER,state_json TEXT,state_digest TEXT);`);
+    const hex = (n, width = 64) => n.toString(16).padStart(width, "0");
+    seed.exec("BEGIN");
+    const journal = seed.prepare("INSERT INTO storage_ingestion_changes VALUES(?,?,?,?,?,?,?,?,?,?)");
+    // Exactly two full pages (the last page read is empty), inserted out of order.
+    for (let n = 1_000; n >= 1; n -= 1) {
+      journal.run(n, hex(n), hex(n % 7), n % 5, n % 2 ? "owner-upload" : "owner-erased", hex(n + 1), n % 3 ? null : hex(n + 2),
+        1, n % 11, 1_700_000_000_000 + n);
+    }
+    // A composite key whose page boundaries fall inside one mark's days.
+    const carry = seed.prepare("INSERT INTO analytics_cache_retention_day_carry VALUES(?,?,?,?,?,?)");
+    for (let n = 0; n < 1_201; n += 1) {
+      const mark = Math.floor(n / 12), day = n % 12;
+      carry.run(hex(mark), `2026-09-${String(day + 10).padStart(2, "0")}`, "synthetic-source", hex(mark % 3), `device-${mark % 4}`,
+        day % 5 ? hex(day) : "");
+    }
+    const progress = seed.prepare("INSERT INTO analytics_cache_retention_day_progress VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+    for (let n = 0; n < 501; n += 1) {
+      progress.run(hex(n * 7919 % 100_003), "synthetic-source", "typed-v11", "synthetic-namespace", hex(n % 5), `device-${n}`,
+        `manifest-${n}`, hex(n), "2026-09-25", "cache-retention-v3", hex(n + 9), n + 1, `{"z":${n}, "a":"\u00e9"}`, hex(n + 3));
+    }
+    seed.exec("COMMIT");
+    const expected = (table) => {
+      const projection = ANALYTICS_HISTORY_CANONICAL_TABLES[table];
+      const rows = seed.prepare(`SELECT ${projection.columns.map(([name]) => name).join(",")} FROM ${table}
+        ORDER BY ${projection.orderBy.join(",")}`).all();
+      const digests = rows.map((value) => createHash("sha256").update(JSON.stringify(projection.columns.map(([name, type]) =>
+        value[name] === null ? null : type === "i64" ? String(value[name]) : value[name]))).digest("hex") + "\n");
+      return { rows: rows.length, sha256: createHash("sha256").update(digests.join("")).digest("hex") };
+    };
+    const want = Object.fromEntries(["storage_ingestion_changes", "analytics_cache_retention_day_carry",
+      "analytics_cache_retention_day_progress"].map((table) => [table, expected(table)]));
+    seed.close();
+    await chmod(path, 0o600);
+    const handle = openSealedSqliteD1(path, { readOnly: true });
+    try {
+      for (const [table, digest] of Object.entries(want)) {
+        assert.deepEqual(await canonicalD1TableDigest(handle.database, table), digest, table);
+      }
+      assert.deepEqual(Object.values(want).map((digest) => digest.rows), [1_000, 1_201, 501]);
+      await assert.rejects(canonicalD1TableDigest(handle.database, "participants"), { code: "ANALYTICS_EXPORT_INPUT_INVALID" });
+      await assert.rejects(canonicalD1TableDigest(handle.database, "storage_owner_revisions"),
+        { code: "ANALYTICS_EXPORT_SCHEMA_INVALID" });
+    } finally {
+      handle.close();
+    }
+  }, RUN_TIMEOUT_MS);
+
+  it("the daily and graph reproduction classifiers count every kind of mismatch", async () => {
+    const sha = (seed) => createHash("sha256").update(seed).digest("hex");
+    const days = ["2026-09-23", "2026-09-24", "2026-09-25"];
+    const oracle = { dailyForced: days.map((day, index) => ({ day, cohortDigest: sha(`cohort-${day}`),
+      recomputedSha256: sha(`daily-${day}`), importedSha256: index === 2 ? sha(`d1-served-${day}`) : sha(`daily-${day}`),
+      d1Drift: index === 2 })) };
+    const faithful = () => oracle.dailyForced.map(({ d1Drift: _drift, ...head }) => ({ ...head }));
+    const daily = (heads, folds = {}) => classifyDailyReproduction(oracle, { heads, foldRowsMismatch: folds.mismatch ?? 0,
+      foldRowsNotComparable: folds.notComparable ?? 0 });
+    const clean = { heads: 3, oracleMismatch: 0, cohortDigestMismatch: 0, unexplained: 0, d1RecomputeDrift: 1,
+      foldRowsMismatch: 0, foldRowsNotComparable: 0 };
+    assert.deepEqual(daily(faithful()), clean);
+    const cases = [
+      ["recompute differs", (heads) => { heads[0].recomputedSha256 = sha("other"); heads[0].importedSha256 = null; },
+        { oracleMismatch: 1 }],
+      ["cohort digest differs", (heads) => { heads[1].cohortDigest = sha("other"); }, { cohortDigestMismatch: 1 }],
+      ["head missing on GCP", (heads) => { heads.splice(1, 1); }, { oracleMismatch: 1, cohortDigestMismatch: 1 }],
+      ["extra head on GCP", (heads) => { heads.push({ day: "2026-09-26", cohortDigest: sha("c"), recomputedSha256: sha("r"),
+        importedSha256: null }); }, { oracleMismatch: 1, cohortDigestMismatch: 1 }],
+      ["GCP import differs from its recompute without D1 drift",
+        (heads) => { heads[0].importedSha256 = sha("imported-other"); }, { unexplained: 1 }],
+      ["GCP import differs where D1 recorded the same drift", (heads) => { heads[2].importedSha256 = sha("imported-other"); }, {}],
+      ["extra head that also drifts", (heads) => { heads.push({ day: "2026-09-26", cohortDigest: sha("c"), recomputedSha256: sha("r"),
+        importedSha256: sha("i") }); }, { oracleMismatch: 1, cohortDigestMismatch: 1, unexplained: 1 }],
+    ];
+    for (const [label, mutate, delta] of cases) {
+      const heads = faithful();
+      mutate(heads);
+      assert.deepEqual(daily(heads), { ...clean, ...delta }, label);
+    }
+    assert.deepEqual(daily(faithful(), { mismatch: 2, notComparable: 3 }), { ...clean, foldRowsMismatch: 2, foldRowsNotComparable: 3 });
+    assert.throws(() => daily([...faithful(), faithful()[0]]), { code: "ANALYTICS_HISTORY_ORACLE_INVALID" }, "duplicate day");
+    assert.throws(() => daily(faithful(), { mismatch: -1 }), { code: "ANALYTICS_HISTORY_ORACLE_INVALID" });
+
+    const window = analyticsHistoryGraphWindow(Date.parse("2026-09-26T06:00:00.000Z"));
+    const graphOracle = { graphForced: { modelDays: window.map((day, index) => ({ day,
+      recomputedSha256: index < 60 ? null : sha(`model-${day}`) })), previewSha256: sha("preview") },
+    importSelection: { daily: [], preview: { sha256: sha("preview") }, modelDays: [
+      { day: window[65], sha256: sha(`model-${window[65]}`) }, { day: window[66], sha256: sha("d1-served") }] } };
+    const graphFaithful = () => ({ modelDays: graphOracle.graphForced.modelDays.map((entry) => ({ ...entry })),
+      previewSha256: graphOracle.graphForced.previewSha256 });
+    const graphClean = { modelDays: 70, oracleMismatch: 0, modelDayPresenceMismatch: 0, previewMismatch: 0, d1RecomputeDrift: 1 };
+    assert.deepEqual(classifyGraphReproduction(graphOracle, graphFaithful()), graphClean);
+    const graphCases = [
+      ["model day differs", (gcp) => { gcp.modelDays[65].recomputedSha256 = sha("other"); }, { oracleMismatch: 1 }],
+      ["model day absent on GCP", (gcp) => { gcp.modelDays[61].recomputedSha256 = null; }, { modelDayPresenceMismatch: 1 }],
+      ["model day only on GCP", (gcp) => { gcp.modelDays[10].recomputedSha256 = sha("extra"); }, { modelDayPresenceMismatch: 1 }],
+      ["window day missing from GCP", (gcp) => { gcp.modelDays.splice(69, 1); }, { modelDayPresenceMismatch: 1 }],
+      ["day outside the window on GCP", (gcp) => { gcp.modelDays.push({ day: "2026-09-27", recomputedSha256: sha("x") }); },
+        { modelDayPresenceMismatch: 1 }],
+      ["preview differs", (gcp) => { gcp.previewSha256 = sha("other-preview"); }, { previewMismatch: 1 }],
+      ["preview absent on GCP", (gcp) => { gcp.previewSha256 = null; }, { previewMismatch: 1 }],
+    ];
+    for (const [label, mutate, delta] of graphCases) {
+      const gcp = graphFaithful();
+      mutate(gcp);
+      assert.deepEqual(classifyGraphReproduction(graphOracle, gcp), { ...graphClean, ...delta }, label);
+    }
+    const noPreview = { ...graphOracle, graphForced: { ...graphOracle.graphForced, previewSha256: null } };
+    assert.equal(classifyGraphReproduction(noPreview, { ...graphFaithful(), previewSha256: sha("preview") }).previewMismatch, 1);
+    assert.equal(classifyGraphReproduction(noPreview, { ...graphFaithful(), previewSha256: null }).previewMismatch, 0);
+    assert.throws(() => classifyGraphReproduction(graphOracle, { ...graphFaithful(),
+      modelDays: [...graphFaithful().modelDays, graphFaithful().modelDays[0]] }), { code: "ANALYTICS_HISTORY_ORACLE_INVALID" });
+  });
+
+  it("every oracle loop is bounded: a lane that never becomes idle is ORACLE_NOT_CONVERGED", async () => {
+    let calls = 0;
+    await assert.rejects(iterateOracleUntilDone(5, async () => { calls += 1; return false; }), { code: "ORACLE_NOT_CONVERGED" });
+    assert.equal(calls, 5, "exactly the bound, never more");
+    calls = 0;
+    assert.equal(await iterateOracleUntilDone(5, async () => { calls += 1; return calls === 5; }), 5, "done on the last step");
+    assert.equal(await iterateOracleUntilDone(64, async () => true), 1);
+    for (const bound of [0, -1, 1.5, Number.POSITIVE_INFINITY]) {
+      await assert.rejects(iterateOracleUntilDone(bound, async () => true), { code: "ANALYTICS_EXPORT_INPUT_INVALID" });
     }
   });
 });
@@ -364,13 +601,15 @@ describe("D1 export oracle over synthetic sealed exports", () => {
       analytics.prepare("INSERT INTO analytics_community_daily_queue VALUES(?,?,1)").run(fixture.sourceId, fixture.days.today);
     });
     const inventory = join(root, "inventory-refused.json");
+    // The inventory seals the doctored copies, so the refusal is the oracle's own.
+    const d1 = {};
+    for (const [name, path] of Object.entries(paths)) d1[name] = { sealedSha256: await fileSha256(path) };
     await writeFile(inventory, JSON.stringify({ schema: "analytics-cutover-inventory-v2",
-      drain: { quiescentAtMs: fixture.pinnedNowMs }, cacheRetention: { fromDay: null }, foldHistory: [] }));
+      drain: { quiescentAtMs: fixture.pinnedNowMs }, cacheRetention: { fromDay: null }, foldHistory: [], d1 }));
     const out = join(root, "oracle-refused.json");
     const logs = [];
-    assert.equal(await runD1AnalyticsExportOracleCli({ argv: ["--ingestion", paths.ingestion, "--analytics", paths.analytics,
-      "--ledger", paths.ledger, "--pinned-now-ms", String(fixture.pinnedNowMs), "--inventory", inventory, "--out", out],
-    log: (entry) => logs.push(entry) }), 1);
+    assert.equal(await runD1AnalyticsExportOracleCli({ argv: cliArgv(paths, inventory, out),
+      log: (entry) => logs.push(entry) }), 1);
     assert.deepEqual(logs.at(-1), { event: "d1_analytics_export_oracle", status: "refused",
       code: "ANALYTICS_EXPORT_NOT_QUIESCENT", reasons: ["queue_rows"] });
     assert.equal(await lstat(out).catch(() => null), null);
@@ -448,5 +687,208 @@ describe("D1 export oracle over synthetic sealed exports", () => {
     assert.notEqual(fromToday.cacheRetention.rebuildTableSha256.analytics_cache_retention_day_marks,
       cliRun.oracle.cacheRetention.rebuildTableSha256.analytics_cache_retention_day_marks);
     assert.deepEqual(fromToday.dailyForced, cliRun.oracle.dailyForced);
+  }, RUN_TIMEOUT_MS);
+
+  it("the resume pass and the quiescence probe honour fromDay: days before it are never built", async () => {
+    const fromDay = fixture.days.yesterday;
+    const removed = fixture.days.twoDaysAgo;
+    assert.ok(removed < fromDay);
+    const paths = await scratch("from-day-gap", ({ analytics }) => removeCacheRetentionDay(analytics, removed));
+    // The doctored copy's own series at the pinned instant, before any lane runs.
+    const db = open(paths, { readOnly: true });
+    let ownSeries;
+    try {
+      ownSeries = await sha256Hex(canonicalJson(await readCacheRetentionCommunitySeries({ target: db.analytics,
+        sourceId: fixture.sourceId, nowMs: fixture.pinnedNowMs })));
+    } finally {
+      db.close();
+    }
+    assert.notEqual(ownSeries, cliRun.oracle.cacheRetention.resumeSeriesSha256, "the removed day is part of the series");
+    const oracle = await runOracle(paths, { cacheRetentionFromDay: fromDay });
+    assert.equal(oracle.quiescence.cacheRetentionIncompleteDays, 0, "the probe ignores days before fromDay");
+    assert.equal(oracle.cacheRetention.resumeSeriesSha256, ownSeries, "the resume pass built nothing before fromDay");
+    assert.equal(oracle.cacheRetention.fromDay, fromDay);
+    // Without fromDay the same gap is an incomplete day.
+    const error = await refusal(await scratch("from-day-gap-null", ({ analytics }) => removeCacheRetentionDay(analytics, removed)));
+    assert.equal(error.code, "ANALYTICS_EXPORT_NOT_QUIESCENT");
+    assert.deepEqual(error.reasons, ["cache_retention_incomplete"]);
+  }, RUN_TIMEOUT_MS);
+
+  it("import selection omits a model day D1 withholds, and the forced graph recompute replaces it", async () => {
+    const day = fixture.days.threeDaysAgo;
+    const baseline = cliRun.oracle;
+    assert.ok(baseline.importSelection.modelDays.some((entry) => entry.day === day));
+    const terminal = Math.max(baseline.fenceCounters.sourceTerminalEpoch, baseline.fenceCounters.deliveredTerminalEpoch);
+    const paths = await scratch("model-withheld", ({ analytics }) => {
+      // Containment newer than the model day's pin: D1 no longer serves it,
+      // and retirement (at most four rows a call) has not removed it yet.
+      analytics.exec("DROP TRIGGER analytics_model_authority_update");
+      const row = analytics.prepare("SELECT authority_json FROM analytics_community_model_publications WHERE source_id=? AND day=?")
+        .get(fixture.sourceId, day);
+      const pin = JSON.parse(row.authority_json);
+      assert.ok(pin.publicAuthorityEpoch >= terminal && terminal >= 1);
+      assert.equal(analytics.prepare("UPDATE analytics_community_model_publications SET authority_json=? WHERE source_id=? AND day=?")
+        .run(canonicalJson({ ...pin, publicAuthorityEpoch: terminal - 1 }), fixture.sourceId, day).changes, 1);
+    });
+    const expectedModelDays = baseline.importSelection.modelDays.filter((entry) => entry.day !== day);
+    const db = open(paths, { readOnly: true });
+    try {
+      const selection = await readD1AnalyticsImportSelection({ source: db.ingestion, target: db.analytics,
+        sourceId: fixture.sourceId, sourceNamespace: fixture.sourceNamespace, pinnedNowMs: fixture.pinnedNowMs });
+      assert.deepEqual(selection.modelDays, expectedModelDays);
+    } finally {
+      db.close();
+    }
+    const oracle = await runOracle(paths);
+    assert.deepEqual(oracle.importSelection.modelDays, expectedModelDays);
+    assert.deepEqual(oracle.graphForced, baseline.graphForced, "the withheld row never reaches graphForced");
+    assert.deepEqual(oracle.dailyForced, baseline.dailyForced);
+  }, RUN_TIMEOUT_MS);
+
+  it("the forced daily recompute deletes the exported folds instead of reusing them", async () => {
+    const day = fixture.days.yesterday;
+    const paths = await scratch("fold-edited", ({ analytics }) => {
+      const fold = analytics.prepare(`SELECT owner_digest,values_json FROM analytics_community_daily_owners
+        WHERE source_id=? AND day=? AND complete=1 AND json_array_length(values_json,'$.cells')>0
+        ORDER BY owner_digest LIMIT 1`).get(fixture.sourceId, day);
+      const values = JSON.parse(fold.values_json);
+      const tokens = values.cells[0].tokens.inputCacheReadTokens;
+      tokens.knownSum = String(BigInt(tokens.knownSum) + 1_000_000n);
+      // Revisions, method and completeness stay current: only a recompute
+      // from the ingestion source can tell the fold is wrong.
+      assert.equal(analytics.prepare("UPDATE analytics_community_daily_owners SET values_json=? WHERE source_id=? AND day=? AND owner_digest=?")
+        .run(JSON.stringify(values), fixture.sourceId, day, fold.owner_digest).changes, 1);
+    });
+    const edited = await runOracle(paths);
+    assert.deepEqual(edited.dailyForced, cliRun.oracle.dailyForced);
+  }, RUN_TIMEOUT_MS);
+
+  it("the live cohort digest does not depend on the owner page size", async () => {
+    const db = open(await scratch("cohort-pages"), { readOnly: true });
+    try {
+      for (const pageSize of [1, 2, 3, 4, 5, 64]) {
+        assert.deepEqual(await readD1AnalyticsLiveCohort(db.ingestion, pageSize), cliRun.oracle.liveCohort, `page ${pageSize}`);
+      }
+      for (const pageSize of [0, 65, 1.5]) {
+        await assert.rejects(readD1AnalyticsLiveCohort(db.ingestion, pageSize), { code: "ANALYTICS_EXPORT_INPUT_INVALID" });
+      }
+    } finally {
+      db.close();
+    }
+  }, RUN_TIMEOUT_MS);
+
+  it("SQLite's own clock is pinned: v1.2 authority is judged at pinnedNowMs, never when the oracle runs", async () => {
+    // The Worker's owner page scopes v1.2 authority with SQLite's 'now': a
+    // live lease counts only through the active-authorization view (which a
+    // staged runtime empties), an expired one through the retained branch.
+    // Synthetic scratch state: a staged v1.2 runtime and an eligible v1.2
+    // owner whose whole lease (ledger, owner, credential and grants) expires
+    // one millisecond after the drain instant. At the pinned instant the
+    // lease is live, so the owner holds no v1.2 authority; by the wall clock
+    // it has expired and would be retained, flipping hasV12 and the cohort.
+    const expiresAt = new Date(fixture.pinnedNowMs + 1).toISOString();
+    const paths = await scratch("clock-lease", ({ ingestion }) => {
+      ingestion.exec("PRAGMA ignore_check_constraints=ON");
+      const lease = ingestion.prepare(`SELECT enrollment_device_id AS enrollment,device_credential_id AS credential
+        FROM accountless_v12_device_authorizations`).all();
+      assert.equal(lease.length, 1);
+      const [{ enrollment, credential }] = lease;
+      for (const table of ["accountless_v12_device_authorizations", "accountless_v11_device_authorizations",
+        "accountless_enrollment_ledger", "accountless_upload_owners", "device_credentials"]) dropTriggers(ingestion, table);
+      assert.equal(ingestion.prepare("UPDATE telemetry_v12_runtime SET state='staged' WHERE id=1").run().changes, 1);
+      assert.equal(ingestion.prepare(`UPDATE accountless_v12_device_authorizations SET authorized_at=?,expires_at=?
+        WHERE enrollment_device_id=?`).run(new Date(fixture.pinnedNowMs - DAY_MS).toISOString(), expiresAt, enrollment).changes, 1);
+      ingestion.prepare("UPDATE accountless_v11_device_authorizations SET expires_at=? WHERE enrollment_device_id=?")
+        .run(expiresAt, enrollment);
+      assert.equal(ingestion.prepare("UPDATE accountless_enrollment_ledger SET expires_at=? WHERE device_id=?")
+        .run(expiresAt, enrollment).changes, 1);
+      assert.equal(ingestion.prepare("UPDATE accountless_upload_owners SET expires_at=? WHERE enrollment_device_id=?")
+        .run(expiresAt, enrollment).changes, 1);
+      assert.equal(ingestion.prepare("UPDATE device_credentials SET expires_at=? WHERE id=?").run(expiresAt, credential).changes, 1);
+    });
+    assert.ok(Date.now() > fixture.pinnedNowMs + 1);
+    const v12Owners = async (pinnedNowMs) => {
+      const db = open(paths, { pinnedNowMs, readOnly: true });
+      try {
+        const page = await readStorageCommunityOwnerPage(db.ingestion);
+        return { members: page.length, hasV12: page.filter((owner) => owner.hasV12).length,
+          cohort: await readD1AnalyticsLiveCohort(db.ingestion) };
+      } finally {
+        db.close();
+      }
+    };
+    const pinned = await v12Owners(fixture.pinnedNowMs);
+    const wallClock = await v12Owners(null);
+    assert.equal(pinned.members, 4, "the owner stays eligible: eligibility reads no clock");
+    assert.equal(wallClock.members, 4);
+    assert.equal(pinned.hasV12, 0, "a live lease under a staged runtime grants nothing");
+    assert.equal(wallClock.hasV12, 1, "the wall clock would retain the expired lease");
+    assert.notDeepEqual(pinned.cohort, wallClock.cohort);
+    // The pristine export at the pinned instant: the active runtime authorizes the owner.
+    const pristine = open(await scratch("clock-pristine"), { readOnly: true });
+    try {
+      assert.equal((await readStorageCommunityOwnerPage(pristine.ingestion)).filter((owner) => owner.hasV12).length, 1);
+    } finally {
+      pristine.close();
+    }
+    // The oracle itself refuses bindings whose SQLite clock is not pinned to it.
+    const unpinnedPaths = await scratch("clock-unpinned");
+    for (const openOptions of [{ pinnedNowMs: null }, { pinnedNowMs: fixture.pinnedNowMs + 1 }]) {
+      const error = await refusal(unpinnedPaths, {}, openOptions);
+      assert.equal(error.code, "ANALYTICS_EXPORT_CLOCK_UNPINNED");
+    }
+  }, RUN_TIMEOUT_MS);
+
+  it("the CLI refuses scratch copies an earlier run already consumed", async () => {
+    // Run A's copies now hold the oracle's own bump, recomputes and rebuilds.
+    const out = join(root, "oracle-rerun.json");
+    const logs = [];
+    assert.equal(await runD1AnalyticsExportOracleCli({ argv: cliArgv(cliRun.paths, cliRun.inventory, out),
+      log: (entry) => logs.push(entry) }), 1);
+    assert.deepEqual(logs.at(-1), { event: "d1_analytics_export_oracle", status: "failed", code: "ORACLE_INPUT_SEAL_MISMATCH" });
+    assert.equal(await lstat(out).catch(() => null), null);
+    assert.notEqual(await fileSha256(cliRun.paths.ingestion), await fileSha256(fixture.paths.ingestion));
+    assert.equal(await fileSha256(cliRun.paths.ledger), await fileSha256(fixture.paths.ledger), "the ledger is only read");
+  }, RUN_TIMEOUT_MS);
+
+  it("refuses a second source, a foreign namespace, an inconsistent head and a concurrent run", async () => {
+    const twoSources = await scratch("two-sources", ({ analytics }) => {
+      analytics.prepare("INSERT INTO analytics_runtime_sources(source_id,source_namespace,contract_version) VALUES(?,?,1)")
+        .run("synthetic-second-source", fixture.sourceNamespace);
+    });
+    assert.equal((await refusal(twoSources)).code, "ANALYTICS_EXPORT_SCHEMA_INVALID");
+    const pristine = await scratch("foreign-namespace");
+    assert.equal((await refusal(pristine, { sourceNamespace: "synthetic-other-namespace" })).code,
+      "ANALYTICS_EXPORT_IDENTITY_MISMATCH");
+    assert.equal(await fileSha256(pristine.analytics), await fileSha256(fixture.paths.analytics), "refused before any write");
+    // A head behind its day's MAX publication revision is an integrity failure.
+    const behind = await scratch("head-behind", ({ analytics }) => {
+      dropTriggers(analytics, "analytics_community_daily_publications");
+      const head = headRow(analytics, fixture.days.today);
+      const current = analytics.prepare("SELECT * FROM analytics_community_daily_publications WHERE day=? AND revision=?")
+        .get(fixture.days.today, head.revision);
+      analytics.prepare(`INSERT INTO analytics_community_daily_publications
+        (source_id,day,revision,cohort_digest,authority_json,payload_json,payload_sha256,released_at) VALUES(?,?,?,?,?,?,?,?)`)
+        .run(current.source_id, current.day, head.revision + 1, current.cohort_digest, current.authority_json,
+          current.payload_json, current.payload_sha256, current.released_at);
+    });
+    const db = open(behind, { readOnly: true });
+    try {
+      await assert.rejects(readD1AnalyticsImportSelection({ source: db.ingestion, target: db.analytics,
+        sourceId: fixture.sourceId, sourceNamespace: fixture.sourceNamespace, pinnedNowMs: fixture.pinnedNowMs }),
+      { code: "ANALYTICS_EXPORT_INTEGRITY_FAILED" });
+    } finally {
+      db.close();
+    }
+    // One oracle per process: the pinned JavaScript clock is process-wide.
+    const first = await scratch("busy-first", ({ analytics }) => {
+      analytics.prepare("INSERT INTO analytics_community_daily_queue VALUES(?,?,1)").run(fixture.sourceId, fixture.days.today);
+    });
+    const second = await scratch("busy-second");
+    const running = runOracle(first);
+    await assert.rejects(runOracle(second), { code: "ORACLE_BUSY" });
+    await assert.rejects(running, { code: "ANALYTICS_EXPORT_NOT_QUIESCENT" });
+    assert.ok(Math.abs(Date.now() - fixture.pinnedNowMs) > 0 && Date.now() > fixture.pinnedNowMs, "the clock is restored");
+    assert.equal((await runOracle(second)).pinnedNowMs, fixture.pinnedNowMs, "the next run proceeds");
   }, RUN_TIMEOUT_MS);
 });

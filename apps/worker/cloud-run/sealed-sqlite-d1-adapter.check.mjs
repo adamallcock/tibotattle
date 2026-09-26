@@ -4,9 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { countSqlParameters, openSealedSqliteD1 } from "./sealed-sqlite-d1-adapter.mjs";
+import { countSqlParameters, openSealedSqliteD1, sealedSqliteD1RuntimeSupported } from "./sealed-sqlite-d1-adapter.mjs";
 
-async function withDatabase(run, { setup = "", readOnly = false } = {}) {
+// The adapter needs Node.js 24.10+ (DatabaseSync#setAuthorizer). An older
+// runtime fails this check honestly rather than skipping it.
+test("the runtime provides the node:sqlite surface the adapter needs (Node.js 24.10+)", () => {
+  assert.equal(sealedSqliteD1RuntimeSupported(), true, `node:sqlite on ${process.version} lacks setAuthorizer; use Node.js 24.10+`);
+});
+
+async function withDatabase(run, { setup = "", readOnly = false, pinnedNowMs = null } = {}) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "tibotattle-sealed-d1-adapter-")));
   const path = join(directory, "scratch.sqlite");
   try {
@@ -16,7 +22,7 @@ async function withDatabase(run, { setup = "", readOnly = false } = {}) {
       CREATE TRIGGER items_audit AFTER INSERT ON items BEGIN INSERT INTO audit VALUES(NEW.id); INSERT INTO audit VALUES(NEW.id); END;
       ${setup}`);
     seed.close();
-    const handle = openSealedSqliteD1(path, { readOnly });
+    const handle = openSealedSqliteD1(path, { readOnly, pinnedNowMs });
     try {
       await run(handle.database, { path, directory });
     } finally {
@@ -205,5 +211,83 @@ test("a closed binding refuses further work and statements survive Proxy wrappin
     const handle = openSealedSqliteD1(path);
     handle.close();
     assert.throws(() => handle.database.prepare("SELECT 1"), { code: "ADAPTER_CLOSED" });
+  });
+});
+
+test("an older node:sqlite is refused before any file is opened, with a closed code", async () => {
+  await withDatabase(async (db, { path }) => {
+    const original = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "setAuthorizer");
+    delete DatabaseSync.prototype.setAuthorizer;
+    try {
+      assert.equal(sealedSqliteD1RuntimeSupported(), false);
+      assert.throws(() => openSealedSqliteD1(path), { code: "ADAPTER_RUNTIME_UNSUPPORTED" });
+      assert.throws(() => openSealedSqliteD1(path, { readOnly: true }), { code: "ADAPTER_RUNTIME_UNSUPPORTED" });
+    } finally {
+      Object.defineProperty(DatabaseSync.prototype, "setAuthorizer", original);
+    }
+    assert.equal(sealedSqliteD1RuntimeSupported(), true);
+    // The binding opened before the refusal still works.
+    assert.deepEqual(await db.prepare("SELECT 1 AS one").first(), { one: 1 });
+  });
+});
+
+const PINNED_NOW_MS = Date.parse("2026-09-26T06:07:08.901Z");
+const PINNED_ISO = "2026-09-26T06:07:08.901Z";
+
+test("pinnedNowMs pins SQLite's own clock for 'now', omitted time values and CURRENT_*", async () => {
+  await withDatabase(async (db) => {
+    const now = await db.prepare(`SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now') AS iso,strftime('%Y-%m-%dT%H:%M:%fZ','NOW') AS upper,
+      strftime('%Y-%m-%dT%H:%M:%fZ') AS omitted,CAST(strftime('%s','now') AS INTEGER)*1000 AS ms,
+      unixepoch() AS epoch,unixepoch('now','subsec') AS subsec,date() AS d,time('now') AS t,datetime('now') AS dt,
+      julianday('now') AS jd,julianday(?1) AS jdExpected,date('now','+1 day') AS tomorrow,
+      datetime('now','utc') AS utc,CURRENT_TIMESTAMP AS ts,CURRENT_DATE AS cd,CURRENT_TIME AS ct,strftime() AS none`)
+      .bind(PINNED_ISO).first();
+    const epoch = Math.floor(PINNED_NOW_MS / 1000);
+    assert.deepEqual(now, { iso: PINNED_ISO, upper: PINNED_ISO, omitted: PINNED_ISO, ms: epoch * 1000,
+      epoch, subsec: PINNED_NOW_MS / 1000, d: "2026-09-26", t: "06:07:08", dt: "2026-09-26 06:07:08",
+      jd: now.jdExpected, jdExpected: now.jdExpected, tomorrow: "2026-09-27", utc: "2026-09-26 06:07:08",
+      ts: "2026-09-26 06:07:08", cd: "2026-09-26", ct: "06:07:08", none: null });
+    assert.equal(Date.parse(now.iso), PINNED_NOW_MS);
+    if (await db.prepare("SELECT 1 AS present FROM pragma_function_list WHERE name='timediff'").first()) {
+      assert.deepEqual(await db.prepare("SELECT timediff('now',?) AS a,timediff(?,'now') AS b").bind(PINNED_ISO, PINNED_ISO).first(),
+        { a: "+0000-00-00 00:00:00.000", b: "+0000-00-00 00:00:00.000" });
+    }
+    // Explicit time values are the built-in's own results, byte for byte.
+    const explicit = `SELECT strftime('%Y-%m-%dT%H:%M:%fZ','2020-02-29 12:34:56.789','+1 day') AS a,
+      datetime(1700000000,'unixepoch') AS b,julianday('2000-01-01') AS c,date('2024-01-31','+1 month') AS d,
+      unixepoch('2026-01-01T00:00:00Z') AS e,strftime('%j %W %w','2026-09-26') AS f,datetime('bogus') AS g`;
+    const reference = new DatabaseSync(":memory:");
+    try {
+      assert.deepEqual(await db.prepare(explicit).first(), { ...reference.prepare(explicit).get() });
+    } finally {
+      reference.close();
+    }
+    // Views and triggers stored in the file read the pinned clock too, and a
+    // CHECK constraint using a date function still evaluates.
+    assert.deepEqual(await db.prepare("SELECT now FROM clock_view").first(), { now: PINNED_ISO });
+    await db.prepare("INSERT INTO items(id,label) VALUES(?,?)").bind(1, "stamped").run();
+    assert.deepEqual((await db.prepare("SELECT at FROM stamps").all()).results, [{ at: PINNED_ISO }]);
+    await db.prepare("INSERT INTO dated(day) VALUES(?)").bind("2026-09-26").run();
+    await assert.rejects(db.prepare("INSERT INTO dated(day) VALUES(?)").bind("not-a-day").run(), /CHECK constraint failed/u);
+  }, { pinnedNowMs: PINNED_NOW_MS, setup: `CREATE VIEW clock_view AS SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now') AS now;
+    CREATE TABLE stamps(at TEXT NOT NULL) STRICT;
+    CREATE TRIGGER items_stamp AFTER INSERT ON items BEGIN INSERT INTO stamps VALUES(strftime('%Y-%m-%dT%H:%M:%fZ','now')); END;
+    CREATE TABLE dated(day TEXT NOT NULL CHECK(date(day) IS NOT NULL)) STRICT;` });
+});
+
+test("without pinnedNowMs SQLite reads the wall clock, and an invalid pin is refused", async () => {
+  await withDatabase(async (db, { path }) => {
+    const before = Date.now();
+    const iso = await db.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now') AS now").first("now");
+    assert.ok(Date.parse(iso) >= before - 1_000 && Date.parse(iso) <= Date.now() + 1_000);
+    for (const pinnedNowMs of [0, -1, 1.5, 2 ** 53, String(PINNED_NOW_MS), Number.NaN]) {
+      assert.throws(() => openSealedSqliteD1(path, { pinnedNowMs }), { code: "ADAPTER_CLOCK_INVALID" });
+    }
+    const pinned = openSealedSqliteD1(path, { readOnly: true, pinnedNowMs: PINNED_NOW_MS });
+    try {
+      assert.equal(await pinned.database.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now') AS now").first("now"), PINNED_ISO);
+    } finally {
+      pinned.close();
+    }
   });
 });

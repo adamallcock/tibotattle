@@ -22,6 +22,16 @@
  * - `readOnly` opens the file read-only and refuses every write before it runs.
  * - The adapter opens only the path it is given: ATTACH, DETACH and extension
  *   loading are refused, so SQL can never reach another file.
+ * - `pinnedNowMs` pins SQLite's own clock: every date function reading 'now'
+ *   (or an omitted time value) and the CURRENT_* keywords read that instant
+ *   instead of the wall clock. Worker SQL compares leases and authorization
+ *   expiry with `strftime(...,'now')`, so without it a result would depend on
+ *   when the tool ran. Every other input is evaluated by SQLite's own built-in
+ *   on a private in-memory connection, so the results are the built-in's.
+ *
+ * It needs Node.js 24.10 or newer (`DatabaseSync#setAuthorizer` and the
+ * authorizer constants). An older runtime is refused with
+ * `ADAPTER_RUNTIME_UNSUPPORTED` before any file is opened.
  *
  * Errors carry closed `ADAPTER_*` codes for adapter refusals. SQLite errors keep
  * the D1 shape (`D1_ERROR: <sqlite message>`) because the Worker matches a few
@@ -30,7 +40,7 @@
 
 import { lstatSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
-import { DatabaseSync, constants } from "node:sqlite";
+import { DatabaseSync, StatementSync, constants } from "node:sqlite";
 
 export const SEALED_SQLITE_D1_ADAPTER_ERRORS = Object.freeze([
   "ADAPTER_PATH_INVALID",
@@ -44,7 +54,20 @@ export const SEALED_SQLITE_D1_ADAPTER_ERRORS = Object.freeze([
   "ADAPTER_COLUMN_NOT_FOUND",
   "ADAPTER_FOREIGN_STATEMENT",
   "ADAPTER_BATCH_EMPTY",
+  "ADAPTER_RUNTIME_UNSUPPORTED",
+  "ADAPTER_CLOCK_INVALID",
 ]);
+
+/** The node:sqlite surface this adapter relies on (Node.js 24.10+). */
+export function sealedSqliteD1RuntimeSupported() {
+  return typeof DatabaseSync?.prototype?.setAuthorizer === "function"
+    && typeof DatabaseSync.prototype.function === "function"
+    && typeof StatementSync?.prototype?.setReturnArrays === "function"
+    && typeof StatementSync.prototype.columns === "function"
+    && typeof StatementSync.prototype.setReadBigInts === "function"
+    && ["SQLITE_OK", "SQLITE_DENY", "SQLITE_ATTACH", "SQLITE_DETACH", "SQLITE_INSERT", "SQLITE_UPDATE",
+      "SQLITE_DELETE", "SQLITE_SAVEPOINT"].every((name) => Number.isInteger(constants?.[name]));
+}
 
 function adapterError(code) {
   return Object.assign(new Error(code), { code });
@@ -198,6 +221,66 @@ function assertOpenablePath(path, { create }) {
   if (create || !stat.isFile() || stat.isSymbolicLink() || realPathOrNull(path) !== path) {
     throw adapterError("ADAPTER_PATH_INVALID");
   }
+}
+
+/**
+ * SQLite's date functions and where each takes its time value. A 'now' there
+ * (case-insensitive, as SQLite matches it) or an omitted time value reads the
+ * pinned instant; the call is otherwise passed through unchanged. The CURRENT_*
+ * keywords are calls of the zero-argument functions of the same name.
+ */
+const PINNED_CLOCK_VARARGS = Object.freeze([
+  ["date", 0], ["time", 0], ["datetime", 0], ["julianday", 0], ["unixepoch", 0], ["strftime", 1],
+]);
+const PINNED_CLOCK_CURRENT = Object.freeze([
+  ["current_date", "date"], ["current_time", "time"], ["current_timestamp", "datetime"],
+]);
+
+function isNow(value) {
+  return typeof value === "string" && value.length === 3 && value.toLowerCase() === "now";
+}
+
+/**
+ * Register the pinned clock on `database`. The replacements are deterministic
+ * (the instant is fixed), so they remain usable wherever SQLite allows the
+ * built-ins, including views, triggers and CHECK constraints.
+ */
+function installPinnedClock(database, pinnedNowMs) {
+  // A UTC instant with millisecond precision, which is exactly what SQLite's
+  // 'now' carries; the Z suffix keeps it UTC for the utc/localtime modifiers.
+  const instant = new Date(pinnedNowMs).toISOString();
+  const builtins = new DatabaseSync(":memory:", { allowExtension: false });
+  const compiled = new Map();
+  const evaluate = (name, args) => {
+    const key = `${name}/${args.length}`;
+    let statement = compiled.get(key);
+    if (statement === undefined) {
+      statement = builtins.prepare(`SELECT ${name}(${args.map(() => "?").join(",")}) AS value`);
+      statement.setReadBigInts(true);
+      compiled.set(key, statement);
+    }
+    return statement.get(...args).value;
+  };
+  const options = { deterministic: true, useBigIntArguments: true };
+  for (const [name, timeIndex] of PINNED_CLOCK_VARARGS) {
+    database.function(name, { ...options, varargs: true }, (...args) => {
+      const values = [...args];
+      // strftime() without a format is NULL in SQLite; leave that to it.
+      if (values.length === timeIndex && !(name === "strftime" && values.length === 0)) values.push(instant);
+      else if (isNow(values[timeIndex])) values[timeIndex] = instant;
+      return evaluate(name, values);
+    });
+  }
+  let hasTimediff = true;
+  try { evaluate("timediff", ["2000-01-01", "2000-01-01"]); } catch { hasTimediff = false; }
+  if (hasTimediff) {
+    database.function("timediff", options, (left, right) =>
+      evaluate("timediff", [isNow(left) ? instant : left, isNow(right) ? instant : right]));
+  }
+  for (const [name, builtin] of PINNED_CLOCK_CURRENT) {
+    database.function(name, options, () => evaluate(builtin, [instant]));
+  }
+  return builtins;
 }
 
 class AdapterState {
@@ -416,15 +499,24 @@ function batchStatements(owner, statements) {
 
 /**
  * Open one SQLite file as a D1 binding. `readOnly` refuses every write;
- * `create` is only for building synthetic fixtures and refuses an existing file.
+ * `create` is only for building synthetic fixtures and refuses an existing
+ * file; `pinnedNowMs` (a positive safe integer of epoch milliseconds) pins
+ * SQLite's own clock to that instant.
  */
-export function openSealedSqliteD1(path, { readOnly = false, create = false } = {}) {
+export function openSealedSqliteD1(path, { readOnly = false, create = false, pinnedNowMs = null } = {}) {
   if (typeof readOnly !== "boolean" || typeof create !== "boolean" || (readOnly && create)) {
     throw adapterError("ADAPTER_PATH_INVALID");
   }
+  if (pinnedNowMs !== null && (!Number.isSafeInteger(pinnedNowMs) || pinnedNowMs <= 0)) {
+    throw adapterError("ADAPTER_CLOCK_INVALID");
+  }
+  if (!sealedSqliteD1RuntimeSupported()) throw adapterError("ADAPTER_RUNTIME_UNSUPPORTED");
   assertOpenablePath(path, { create });
   let database;
+  let clock = null;
   let state;
+  // Statements carry this token; `batch` refuses statements of any other binding.
+  const owner = Object.freeze({});
   try {
     database = new DatabaseSync(path, {
       readOnly,
@@ -432,24 +524,26 @@ export function openSealedSqliteD1(path, { readOnly = false, create = false } = 
       enableDoubleQuotedStringLiterals: false,
       allowExtension: false,
     });
+    // The clock and the authorizer are in place before any caller SQL is
+    // compiled; the adapter's own two bookkeeping statements are fixed reads.
+    if (pinnedNowMs !== null) clock = installPinnedClock(database, pinnedNowMs);
     state = new AdapterState(database, readOnly);
+    database.setAuthorizer((action) => {
+      if (action === constants.SQLITE_ATTACH || action === constants.SQLITE_DETACH) {
+        state.denied = "ADAPTER_ATTACH_REFUSED";
+        return constants.SQLITE_DENY;
+      }
+      if (readOnly && WRITE_ACTIONS.has(action)) {
+        state.denied = "ADAPTER_READ_ONLY";
+        return constants.SQLITE_DENY;
+      }
+      return constants.SQLITE_OK;
+    });
   } catch {
     try { database?.close(); } catch { /* Already closed or never opened. */ }
+    try { clock?.close(); } catch { /* Already closed. */ }
     throw adapterError("ADAPTER_DATABASE_INVALID");
   }
-  // Statements carry this token; `batch` refuses statements of any other binding.
-  const owner = Object.freeze({});
-  database.setAuthorizer((action) => {
-    if (action === constants.SQLITE_ATTACH || action === constants.SQLITE_DETACH) {
-      state.denied = "ADAPTER_ATTACH_REFUSED";
-      return constants.SQLITE_DENY;
-    }
-    if (readOnly && WRITE_ACTIONS.has(action)) {
-      state.denied = "ADAPTER_READ_ONLY";
-      return constants.SQLITE_DENY;
-    }
-    return constants.SQLITE_OK;
-  });
   STATE.set(owner, state);
   const binding = new SealedSqliteD1Database(owner);
   return Object.freeze({
@@ -459,6 +553,7 @@ export function openSealedSqliteD1(path, { readOnly = false, create = false } = 
       state.closed = true;
       state.statements.clear();
       database.close();
+      clock?.close();
     },
   });
 }

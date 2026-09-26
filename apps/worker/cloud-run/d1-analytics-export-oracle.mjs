@@ -2,16 +2,27 @@
 
 /**
  * Operator-local D1 export oracle CLI (HX-4). Never part of the Cloud Run
- * image or its build context; the operator runs the bundled
- * `dist/d1-analytics-export-oracle.mjs` through the HX-3 `oracle` subcommand.
+ * image or its build context. It imports the Worker's TypeScript modules, so
+ * it runs as a bundle: `node ./d1-analytics-export-oracle.build.mjs` writes the
+ * ignored `dist/d1-analytics-export-oracle.mjs` from a full checkout, and the
+ * operator runs that through the HX-3 `oracle` subcommand. The image build
+ * (`npm run build`, i.e. build.mjs over the audited context) never builds it:
+ * neither this file nor the sealed SQLite adapter is in that context.
  *
  *   --ingestion <scratch copy> --analytics <scratch copy> --ledger <scratch copy>
  *   --pinned-now-ms <drain quiescentAtMs> --inventory <HX-6 inventory> --out <new file>
  *
  * The three database arguments must be the operator's 0600 SCRATCH COPIES of
- * the sealed exports (the oracle writes to them); a sealed 0400 export is
- * refused. The inventory supplies the cache-retention fromDay and the
- * informational FOLD history, and must name the same drain instant.
+ * the sealed exports; a sealed 0400 export is refused. Each copy must still be
+ * byte-identical to its sealed export (the inventory's `d1.<role>.sealedSha256`):
+ * the oracle writes to the ingestion and analytics copies, so a copy that an
+ * earlier run (complete or refused) already touched is refused with
+ * ORACLE_INPUT_SEAL_MISMATCH instead of yielding a document about the oracle's
+ * own writes. The ledger copy is opened read-only. Every binding reads SQLite's
+ * 'now' as the pinned instant. The inventory also supplies the cache-retention
+ * fromDay and the informational FOLD history, and must name the same drain
+ * instant. Requires Node.js 24.10+ (the adapter refuses older runtimes with
+ * ADAPTER_RUNTIME_UNSUPPORTED).
  *
  * The output is the closed `analytics-history-oracle-v2` document, written at
  * mode 0600 with a sibling `<out>.sha256`, both created atomically and never
@@ -20,6 +31,7 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { chmod, link, lstat, open, readFile, realpath, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,6 +52,7 @@ export const D1_ANALYTICS_EXPORT_ORACLE_EVENT = "d1_analytics_export_oracle";
 export const D1_ANALYTICS_EXPORT_ORACLE_CLI_ERRORS = Object.freeze([
   "ORACLE_ARGUMENT_INVALID",
   "ORACLE_INPUT_NOT_SCRATCH",
+  "ORACLE_INPUT_SEAL_MISMATCH",
   "ORACLE_INVENTORY_INVALID",
   "ORACLE_OUTPUT_EXISTS",
   "ORACLE_OUTPUT_UNSAFE",
@@ -47,6 +60,8 @@ export const D1_ANALYTICS_EXPORT_ORACLE_CLI_ERRORS = Object.freeze([
   "ORACLE_FAILED",
 ]);
 const INVENTORY_SCHEMA = "analytics-cutover-inventory-v2";
+const DATABASE_ROLES = Object.freeze(["ingestion", "analytics", "ledger"]);
+const SHA256 = /^[0-9a-f]{64}$/u;
 const INVENTORY_MAX_BYTES = 1024 * 1024;
 const FLAGS = Object.freeze({
   "--ingestion": "ingestion",
@@ -121,7 +136,32 @@ export async function readD1AnalyticsExportInventory(path, pinnedNowMs) {
   } catch {
     throw cliError("ORACLE_INVENTORY_INVALID");
   }
-  return Object.freeze({ cacheRetentionFromDay: fromDay, foldHistory });
+  const sealedSha256 = {};
+  for (const role of DATABASE_ROLES) {
+    const value = inventory.d1?.[role]?.sealedSha256;
+    if (typeof value !== "string" || !SHA256.test(value)) throw cliError("ORACLE_INVENTORY_INVALID");
+    sealedSha256[role] = value;
+  }
+  return Object.freeze({ cacheRetentionFromDay: fromDay, foldHistory, sealedSha256: Object.freeze(sealedSha256) });
+}
+
+async function fileSha256(path) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+/** Each scratch copy is still byte-identical to its sealed export. */
+async function assertPristineCopies(args, inventory) {
+  for (const role of DATABASE_ROLES) {
+    let digest;
+    try {
+      digest = await fileSha256(args[role]);
+    } catch {
+      throw cliError("ORACLE_INPUT_NOT_SCRATCH");
+    }
+    if (digest !== inventory.sealedSha256[role]) throw cliError("ORACLE_INPUT_SEAL_MISMATCH");
+  }
 }
 
 async function readSourceIdentity(analytics) {
@@ -194,11 +234,15 @@ export async function runD1AnalyticsExportOracleCli({ argv, log = defaultLog, ru
   const created = [];
   try {
     const args = parseD1AnalyticsExportOracleArguments(argv);
-    for (const path of [args.ingestion, args.analytics, args.ledger]) await assertScratchInput(path);
+    for (const role of DATABASE_ROLES) await assertScratchInput(args[role]);
     const inventory = await readD1AnalyticsExportInventory(args.inventory, args.pinnedNowMs);
     await assertOutputAvailable(args.out);
+    await assertPristineCopies(args, inventory);
     const moduleDigest = await computeD1AnalyticsExportOracleModuleDigest(moduleUrl);
-    for (const path of [args.ingestion, args.analytics, args.ledger]) handles.push(openDatabase(path));
+    // The oracle only reads the ledger; SQLite's clock reads the drain instant.
+    for (const role of DATABASE_ROLES) {
+      handles.push(openDatabase(args[role], { readOnly: role === "ledger", pinnedNowMs: args.pinnedNowMs }));
+    }
     const [ingestion, analytics, ledger] = handles.map((handle) => handle.database);
     const identity = await readSourceIdentity(analytics);
     log({ event: D1_ANALYTICS_EXPORT_ORACLE_EVENT, status: "started" });

@@ -9,13 +9,24 @@
  * stale-head selector may publish, the forced recomputes bump the collection
  * revision and rebuild caches), so the caller must hand it disposable copies
  * and discard them afterwards, whatever the outcome. It is never bundled into
- * the Cloud Run image and never touches a live binding.
+ * the Cloud Run image and never touches a live binding (a live D1 binding
+ * reads the wall clock and is refused by the clock proof below).
  *
- * Every step runs at the pinned instant (H10). Several Worker kernels stamp
- * `Date.now()` directly (graph results' computed_ms, for one, which gates the
- * preview's freshness), so for the duration of a run `Date.now()` reads
- * `pinnedNowMs` process-wide. One oracle runs per process at a time; a
- * concurrent call is refused with ORACLE_BUSY.
+ * Every step runs at the pinned instant (H10), on both clocks the Worker code
+ * reads:
+ * - JavaScript: several kernels stamp `Date.now()` directly (graph results'
+ *   computed_ms, for one, which gates the preview's freshness), so for the
+ *   duration of a run `Date.now()` reads `pinnedNowMs` process-wide. One
+ *   oracle runs per process at a time; a concurrent call is refused with
+ *   ORACLE_BUSY.
+ * - SQLite: Worker SQL compares authorization expiry and leases with
+ *   `strftime(...,'now')` (the v1.2 retained-authorization scope of the owner
+ *   page, for one), so the three bindings must read SQLite's 'now' as
+ *   `pinnedNowMs` too (the sealed SQLite adapter's `pinnedNowMs` option). The
+ *   oracle proves this on every binding before it reads anything and refuses
+ *   with ANALYTICS_EXPORT_CLOCK_UNPINNED otherwise, so no result depends on
+ *   when the oracle ran. The PostgreSQL port must evaluate the same
+ *   predicates at pinnedNowMs rather than at now().
  *
  * The result is the closed, content-free `analytics-history-oracle-v2`
  * document (see analytics-history-proof.ts). Refusals are closed codes:
@@ -26,6 +37,7 @@
  *   ANALYTICS_EXPORT_IDENTITY_MISMATCH  source identity differs across exports
  *   ANALYTICS_EXPORT_INTEGRITY_FAILED   a stored hash or head is inconsistent
  *   ORACLE_BUSY                      another oracle run holds the pinned clock
+ *   ANALYTICS_EXPORT_CLOCK_UNPINNED  a binding's SQLite clock is not pinnedNowMs
  */
 import { ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS } from './admin-community-allowance';
 import { setCollectionControls } from './admin-operations';
@@ -62,7 +74,7 @@ import type { StorageAnalyticsBindings } from './analytics-delivery';
 export const D1_ANALYTICS_EXPORT_ORACLE_ERRORS = Object.freeze([
   'ANALYTICS_EXPORT_NOT_QUIESCENT', 'ORACLE_NOT_CONVERGED', 'ANALYTICS_EXPORT_INPUT_INVALID',
   'ANALYTICS_EXPORT_SCHEMA_INVALID', 'ANALYTICS_EXPORT_IDENTITY_MISMATCH', 'ANALYTICS_EXPORT_INTEGRITY_FAILED',
-  'ORACLE_BUSY',
+  'ORACLE_BUSY', 'ANALYTICS_EXPORT_CLOCK_UNPINNED',
 ] as const);
 export type D1AnalyticsExportOracleErrorCode = typeof D1_ANALYTICS_EXPORT_ORACLE_ERRORS[number];
 
@@ -103,6 +115,8 @@ export type D1AnalyticsExportOracleStep = 'fence' | 'quiescence' | 'cohort' | 's
   | 'cache_retention_resume' | 'daily_forced' | 'graph_forced' | 'cache_retention_rebuild';
 
 export interface D1AnalyticsExportOracleInput {
+  /** Scratch-copy bindings whose SQLite 'now' reads `pinnedNowMs` (the sealed
+   * SQLite adapter's `pinnedNowMs` option). The ledger is only read. */
   ingestion: D1Database; analytics: D1Database; ledger: D1Database;
   /** The drain's quiescent instant. Every time the oracle computes with. */
   pinnedNowMs: number;
@@ -125,6 +139,19 @@ function bindings(input: D1AnalyticsExportOracleInput): StorageAnalyticsBindings
 function count(value: unknown, code: D1AnalyticsExportOracleErrorCode = 'ANALYTICS_EXPORT_SCHEMA_INVALID'): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw refuse(code);
   return value;
+}
+
+/**
+ * Every oracle loop: run `step` until it reports done, at most `bound` times.
+ * A lane that is still not done after `bound` steps is refused with
+ * ORACLE_NOT_CONVERGED rather than run without limit. Returns the steps taken.
+ */
+export async function iterateOracleUntilDone(bound: number, step: () => Promise<boolean>): Promise<number> {
+  if (!Number.isSafeInteger(bound) || bound < 1 || typeof step !== 'function') throw refuse('ANALYTICS_EXPORT_INPUT_INVALID');
+  for (let iteration = 1; iteration <= bound; iteration += 1) {
+    if (await step()) return iteration;
+  }
+  throw refuse('ORACLE_NOT_CONVERGED');
 }
 
 async function tableExists(database: D1Database, table: string): Promise<boolean> {
@@ -178,12 +205,12 @@ function cacheRetentionPass(input: D1AnalyticsExportOracleInput, maxDays: number
 
 async function runCacheRetentionToCompletion(input: D1AnalyticsExportOracleInput): Promise<number> {
   let built = 0;
-  for (let pass = 0; pass < CACHE_RETENTION_LANE_PASSES; pass += 1) {
+  await iterateOracleUntilDone(CACHE_RETENTION_LANE_PASSES, async () => {
     const lane = await cacheRetentionPass(input, 64);
     built += lane.built;
-    if (lane.state === 'idle') return built;
-  }
-  throw refuse('ORACLE_NOT_CONVERGED');
+    return lane.state === 'idle';
+  });
+  return built;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,13 +323,17 @@ async function proveQuiescence(input: D1AnalyticsExportOracleInput,
 // (c) live cohort
 // ---------------------------------------------------------------------------
 
-async function readLiveCohort(source: D1Database): Promise<{ members: number; sha256: string }> {
+/** The Worker's own owner pages, in participant order; the digest does not
+ * depend on the page size (1-64). */
+export async function readD1AnalyticsLiveCohort(source: D1Database, pageSize = 64):
+  Promise<{ members: number; sha256: string }> {
+  if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 64) throw refuse('ANALYTICS_EXPORT_INPUT_INVALID');
   const hasher = new CanonicalTableHasher();
   let after = '';
   for (;;) {
-    const page = await readStorageCommunityOwnerPage(source, { afterParticipantId: after, limit: 64 });
+    const page = await readStorageCommunityOwnerPage(source, { afterParticipantId: after, limit: pageSize });
     await hasher.add(page.map(owner => liveCohortMemberLine(owner)));
-    if (page.length < 64) break;
+    if (page.length < pageSize) break;
     after = page.at(-1)!.participantId;
   }
   return { members: hasher.rows, sha256: await hasher.digest() };
@@ -411,15 +442,9 @@ async function forceDailyRecompute(input: D1AnalyticsExportOracleInput,
     .bind(input.sourceId).run();
   const heads = count(await input.analytics.prepare(
     'SELECT count(*) AS n FROM analytics_community_daily_heads WHERE source_id=?').bind(input.sourceId).first('n'));
-  const bound = Math.max(1, heads) * 64;
-  let iterations = 0;
-  for (;;) {
-    if (iterations >= bound) throw refuse('ORACLE_NOT_CONVERGED');
-    iterations += 1;
-    const step = await advanceNextStorageCommunityDaily({ ...bindings(input), preferStaleHead: true,
-      nowMs: input.pinnedNowMs });
-    if (step.state === 'idle') break;
-  }
+  const iterations = await iterateOracleUntilDone(Math.max(1, heads) * 64, async () =>
+    (await advanceNextStorageCommunityDaily({ ...bindings(input), preferStaleHead: true,
+      nowMs: input.pinnedNowMs })).state === 'idle');
   const rows = (await input.analytics.prepare(`SELECT h.day,h.cohort_digest,p.payload_json,p.payload_sha256
     FROM analytics_community_daily_heads h JOIN analytics_community_daily_publications p
       ON p.source_id=h.source_id AND p.day=h.day AND p.revision=h.revision
@@ -463,12 +488,9 @@ async function forceGraphRecompute(input: D1AnalyticsExportOracleInput, cohortMe
   await clearGraphCaches(input.analytics);
   const b = bindings(input);
   const members = Math.max(1, cohortMembers);
-  const bound = ANALYTICS_HISTORY_GRAPH_WINDOW_DAYS * members * 64;
   const rotation = 6 * members + 6;
-  let quiet = 0, iterations = 0;
-  while (quiet < rotation) {
-    if (iterations >= bound) throw refuse('ORACLE_NOT_CONVERGED');
-    iterations += 1;
+  let quiet = 0;
+  const iterations = await iterateOracleUntilDone(ANALYTICS_HISTORY_GRAPH_WINDOW_DAYS * members * 64, async () => {
     const graph = await advanceStorageCommunityGraphWork({ ...b, nowMs: input.pinnedNowMs, preparedFold: false });
     let changed = graph.state !== 'reused' && graph.state !== 'idle';
     if (graph.state === 'complete' || graph.state === 'reused') {
@@ -481,7 +503,8 @@ async function forceGraphRecompute(input: D1AnalyticsExportOracleInput, cohortMe
     }
     if (await retireStorageCommunityGraphPublications(b, input.pinnedNowMs) > 0) changed = true;
     quiet = changed ? 0 : quiet + 1;
-  }
+    return quiet >= rotation;
+  });
   const window = analyticsHistoryGraphWindow(input.pinnedNowMs);
   const visible = await visibleModelDays(b, input.pinnedNowMs);
   const preview = await readPublishedStorageCommunityGraph(b, input.pinnedNowMs);
@@ -537,6 +560,20 @@ async function assertSingleSource(input: D1AnalyticsExportOracleInput): Promise<
     || rows[0]!.contract_version !== 1) throw refuse('ANALYTICS_EXPORT_IDENTITY_MISMATCH');
 }
 
+/** SQLite's own 'now' on every binding must be the pinned instant. */
+async function assertPinnedSqliteClocks(input: D1AnalyticsExportOracleInput): Promise<void> {
+  const expected = new Date(input.pinnedNowMs).toISOString();
+  for (const database of [input.ingestion, input.analytics, input.ledger]) {
+    let now: unknown;
+    try {
+      now = await database.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now') AS now").first('now');
+    } catch {
+      throw refuse('ANALYTICS_EXPORT_CLOCK_UNPINNED');
+    }
+    if (now !== expected) throw refuse('ANALYTICS_EXPORT_CLOCK_UNPINNED');
+  }
+}
+
 let pinnedClockHeld = false;
 
 /** Run `operation` with `Date.now()` reading `nowMs`, then restore the clock. */
@@ -566,6 +603,7 @@ async function runPinnedOracle(input: D1AnalyticsExportOracleInput): Promise<Ana
   const step = (name: D1AnalyticsExportOracleStep, counts: Record<string, number>): void => {
     input.onStep?.(name, Object.freeze({ ...counts }));
   };
+  await assertPinnedSqliteClocks(input);
   await assertSingleSource(input);
 
   // (a) Fence authority and counters.
@@ -585,7 +623,7 @@ async function runPinnedOracle(input: D1AnalyticsExportOracleInput): Promise<Ana
   step('quiescence', { queueRows: quiescence.queueRows, pendingErasureJobs: quiescence.pendingErasureJobs });
 
   // (c) Live cohort.
-  const liveCohort = await readLiveCohort(input.ingestion);
+  const liveCohort = await readD1AnalyticsLiveCohort(input.ingestion);
   step('cohort', { members: liveCohort.members });
 
   // (d) Import selection, before anything is recomputed.
