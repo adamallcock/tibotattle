@@ -53,6 +53,7 @@ without applying them; never substitute its health receipt for migration proof.
 | Deletion ledger | Separate `DELETION_LEDGER` D1 binding and migration ledger |
 | Encrypted/quarantined objects | Production `QUARANTINE` R2 binding with explicit deletion/reconciliation and deletion-safe restore rules; automatic age-based deletion is disabled in this source snapshot |
 | Upload admission | `UPLOAD_INGRESS_BUDGET` Durable Object plus explicit rate-limit bindings |
+| Device-sync admission | Every well-formed device bearer is charged to `DEVICE_SYNC_CLIENT_RATE_LIMIT` (per client address) and then `DEVICE_SYNC_RATE_LIMIT` (per location) before credential verification, and an authenticated request to `DEVICE_SYNC_PRINCIPAL_RATE_LIMIT` (per participant). A missing or malformed bearer is charged only to `CLIENT_ATTEMPT_RATE_LIMIT` and `RECOVERY_RATE_LIMIT`, and a bearer that fails verification is charged to them as well; they answer repeated failures from one address with 429 |
 | Updates | Separate `SPARKLE_RELEASES` R2 binding and `updates.tibotattle.com`; the owner-only atomic guard is the only appcast writer |
 | Scheduled work | Production cron each minute; code must keep work replay-safe and bounded |
 
@@ -877,7 +878,8 @@ npm run production:deploy -- --confirm DEPLOY_PRODUCTION \
   --expected-live-manifest-sha256 <reviewed-live-manifest-sha256>
 ```
 
-The typed path preserves the live bindings, settings and ingress, and rechecks
+The typed path preserves the live bindings, settings and ingress (its only
+permitted addition is described below), and rechecks
 all three database contracts at the deployment boundary. It refuses migration
 confirmations and never applies database migrations. Schema differences require
 independent diagnosis and, if needed, an explicitly authorized forward repair.
@@ -887,6 +889,22 @@ role. These exact source-derived variants require the complete, unchanged
 restore metadata group; arbitrary SQL normalization is not accepted.
 `production-trigger-repair-rehearsal.mjs` locally exercises migration-order guard
 preservation; it is not a remote repair command.
+
+The typed path's only configuration addition is a Rate Limit binding pinned in
+`PRODUCTION_RATE_LIMIT_ADDITIONS` (`apps/worker/scripts/production-live-config.mjs`)
+by name, namespace, limit and period, and only when `wrangler.jsonc` declares
+it identically and the live Worker has neither its name nor its namespace. Any
+other tracked Rate Limit binding that live lacks fails closed, and a binding
+live already has keeps its live values. The reconciliation report lists the
+additions (`rateLimitAdditions`), and after Wrangler the wrapper requires the
+live configuration to equal the baseline plus exactly those bindings. An
+addition changes the live configuration fingerprint, so prepare any
+maintenance or typed-forward plan pinned to the previous fingerprint again.
+The device-sync bindings `DEVICE_SYNC_RATE_LIMIT`,
+`DEVICE_SYNC_PRINCIPAL_RATE_LIMIT` and `DEVICE_SYNC_CLIENT_RATE_LIMIT`
+(namespaces 3009, 3010 and 3011) reach production this way. Source that
+requires them answers 503 on every device-sync route and on health until they
+exist, so never deploy it through a path that cannot add them.
 
 Only after explicit authorization and green preflight, use the wrapper from
 `apps/worker`:

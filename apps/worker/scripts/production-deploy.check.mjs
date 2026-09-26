@@ -1802,7 +1802,7 @@ test("typed deployment preparation binds the pinned predecessor, candidate confi
         },
       },
     }),
-    verify: () => ({ ok: true, code: null }),
+    verify: () => ({ ok: true, code: null, expectedFingerprint: "e".repeat(64) }),
   };
   const prepared = await prepareTypedProductionDeployment({
     inventory,
@@ -1822,6 +1822,20 @@ test("typed deployment preparation binds the pinned predecessor, candidate confi
   assert.equal(captures, 1);
   assert.equal(prepared.configSha256.length, 64);
   assert.equal(prepared.baseline.sourceCommit, previous);
+  // The post-deploy boundary requires the configuration the verified
+  // candidate produces, which differs from the baseline when it adds bindings.
+  assert.equal(prepared.expectedLiveFingerprint, "e".repeat(64));
+  const unpinned = await prepareTypedProductionDeployment({
+    inventory,
+    provider,
+    workerDirectory: root,
+    sourceCommit: source,
+    expectedPreviousSourceCommit: previous,
+    configTools: { ...configTools, verify: () => ({ ok: true, code: null }) },
+    buildSchemas: async () => assert.fail("an unpinned post-deploy configuration must stop before schema reads"),
+    inspectTyped: async () => assert.fail("an unpinned post-deploy configuration must stop before schema reads"),
+  });
+  assert.deepEqual(unpinned, { ok: false, code: "PRODUCTION_TYPED_CONFIG_UNVERIFIED" });
 });
 
 test("typed operation identity pins live config, schema inputs, and retained public release", async () => {
@@ -1903,6 +1917,7 @@ test("typed deployment revalidation allows only the intended source movement aft
   };
   const typedDeployment = {
     baseline,
+    expectedLiveFingerprint: baseline.fingerprint,
     currentInventory: { snapshot: baseline },
     configSha256: createHash("sha256").update(configBytes).digest("hex"),
     expectedSchemas: { primary: {}, analytics: {}, ledger: {} },
@@ -1938,6 +1953,65 @@ test("typed deployment revalidation allows only the intended source movement aft
   }), { ok: false, code: "PRODUCTION_TYPED_POST_DEPLOY_LIVE_MISMATCH" });
 });
 
+test("typed deployment revalidation requires the prepared Rate Limit additions after Wrangler", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "production-typed-revalidate-additions-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const configPath = join(root, "wrangler.jsonc");
+  const configBytes = Buffer.from('{"env":{"production":{"vars":{"TELEMETRY_STORAGE_MODE":"typed","TELEMETRY_STORAGE_NAMESPACE":"synthetic"}}}}\n');
+  await writeFile(configPath, configBytes);
+  await chmod(configPath, 0o600);
+  const previous = FIXTURE_PREVIOUS_COMMIT;
+  const source = FIXTURE_SOURCE_COMMIT;
+  const baseline = {
+    sourceCommit: previous,
+    versionId: "11111111-1111-4111-8111-111111111111",
+    fingerprint: "f".repeat(64),
+  };
+  // The candidate adds pinned bindings: the configuration it produces once
+  // deployed has a different fingerprint from the baseline.
+  const withAdditions = "a".repeat(64);
+  let current = baseline;
+  const typedDeployment = {
+    baseline,
+    expectedLiveFingerprint: withAdditions,
+    currentInventory: { snapshot: baseline },
+    configSha256: createHash("sha256").update(configBytes).digest("hex"),
+    expectedSchemas: { primary: {}, analytics: {}, ledger: {} },
+    provider: {
+      capture: async () => ({ snapshot: current }),
+      query: async () => ({ success: true, results: [] }),
+    },
+    inspectTyped: async () => ({ ok: true, code: "TYPED_PRODUCTION_PREFLIGHT_PASSED" }),
+    configTools: {
+      createSnapshot: (value) => value.snapshot,
+      verify: () => ({ ok: true, code: null }),
+    },
+  };
+  const revalidate = (phase) => revalidateTypedProductionDeployment({
+    typedDeployment,
+    configPath,
+    sourceCommit: source,
+    expectedPreviousSourceCommit: previous,
+    phase,
+  });
+  // Before Wrangler the live Worker is still exactly the baseline.
+  assert.deepEqual(await revalidate("before"), { ok: true, code: null, phase: "before" });
+  // A deployment that moved the source but did not create the bindings is not
+  // the prepared configuration.
+  current = { ...baseline, sourceCommit: source, versionId: "22222222-2222-4222-8222-222222222222" };
+  assert.deepEqual(await revalidate("after"), { ok: false, code: "PRODUCTION_TYPED_POST_DEPLOY_LIVE_MISMATCH" });
+  current = { ...current, fingerprint: withAdditions };
+  assert.deepEqual(await revalidate("after"), { ok: true, code: null, phase: "after" });
+  // A prepared deployment without a pinned post-deploy configuration is refused.
+  assert.deepEqual(await revalidateTypedProductionDeployment({
+    typedDeployment: { ...typedDeployment, expectedLiveFingerprint: undefined },
+    configPath,
+    sourceCommit: source,
+    expectedPreviousSourceCommit: previous,
+    phase: "after",
+  }), { ok: false, code: "PRODUCTION_TYPED_INPUT_INVALID" });
+});
+
 test("typed pre-deploy revalidation refuses live drift during schema queries", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "production-typed-revalidate-drift-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -1970,6 +2044,7 @@ test("typed pre-deploy revalidation refuses live drift during schema queries", a
   };
   const typedDeployment = {
     baseline,
+    expectedLiveFingerprint: baseline.fingerprint,
     currentInventory: { snapshot: baseline },
     configSha256: createHash("sha256").update(configBytes).digest("hex"),
     expectedSchemas: { primary: {}, analytics: {}, ledger: {} },
@@ -2129,7 +2204,7 @@ for (const mode of ["retained", "candidate", "bad-preimage", "bad-postimage", "m
         },
       },
     }),
-    verify: () => ({ ok: true, code: null }),
+    verify: () => ({ ok: true, code: null, expectedFingerprint: baseline.fingerprint }),
   };
   const healthRecheck = async () => ({
     ok: true,

@@ -192,6 +192,90 @@ export async function assertPublicAggregateReadAllowed(
   }
 }
 
+function deviceSyncLimitReached(): ApiError {
+  return new ApiError(429, "DEVICE_SYNC_LIMIT_REACHED", {
+    // Every device-sync binding uses a one-minute window; Rate Limit exposes
+    // no reset time, so clients receive the same conservative fixed floor.
+    responseHeaders: { "retry-after": "60" },
+  });
+}
+
+/**
+ * Device synchronization is authenticated by the device bearer alone: the
+ * capability reads, day-manifest registration, domain predecessor and
+ * activation, performance reports and the v1.0 cursor reads. One shipped v1.2
+ * pass issues a negotiation capability read, a capability read, a predecessor,
+ * one day-manifest registration per day of its domain, a closing capability
+ * read and predecessor, and the activation: N + 6 requests for an N-day
+ * domain. The per-client attempt budget (5 per minute per address in
+ * production) and the coarse attempt budget (20 per minute per location) exist
+ * to slow unauthenticated attempts and can never admit that pass, so a
+ * well-formed device bearer is admitted by the device-sync budgets instead.
+ *
+ * Every well-formed device bearer is charged here before credential
+ * verification: first to its client address, then to the per-location cap.
+ * The address key is sized like the participant key, for one full pass of the
+ * largest supported domain, and stays below the location cap. One address can
+ * therefore drive no more verification work than one installation's pass, and
+ * can never use up its location's budget, whether its bearers are valid or
+ * not. It is charged first so an address over its budget no longer consumes
+ * the location's. deviceSyncPrincipal still charges a request without a
+ * well-formed bearer, and a bearer that fails verification, to the attempt
+ * budgets, whose 429 answers repeated failures from one address.
+ */
+export async function assertDeviceSyncCredentialAllowed(
+  clientLimiter: RateLimit | undefined,
+  coarseLimiter: RateLimit | undefined,
+  request: Request,
+  env: Env,
+): Promise<void> {
+  assertLimiterConfigured(clientLimiter);
+  assertLimiterConfigured(coarseLimiter);
+  try {
+    const client = await clientLimiter.limit({
+      key: `usage-monitor:device_sync:credential:client:${await clientRateLimitKey(
+        request,
+        env,
+        "device_sync",
+      )}`,
+    });
+    if (!client.success) throw deviceSyncLimitReached();
+    const coarse = await coarseLimiter.limit({ key: "usage-monitor:device_sync:credential:global" });
+    if (!coarse.success) throw deviceSyncLimitReached();
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw admissionRateLimitUnavailable();
+  }
+}
+
+/**
+ * The participant key is charged after verification and is sized for a full
+ * pass of the largest supported domain. Participant keying, as for upload
+ * registration, avoids punishing a shared address, and minting device
+ * credentials does not multiply one person's budget.
+ */
+export async function assertDeviceSyncPrincipalAllowed(
+  principalLimiter: RateLimit | undefined,
+  participantId: string,
+  env: Env,
+): Promise<void> {
+  assertLimiterConfigured(principalLimiter);
+  let result: { success: boolean };
+  try {
+    result = await principalLimiter.limit({
+      key: `usage-monitor:device_sync:participant:${await rateLimitSubjectKey(
+        env,
+        "device_sync",
+        `participant\0${participantId}`,
+      )}`,
+    });
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw admissionRateLimitUnavailable();
+  }
+  if (!result.success) throw deviceSyncLimitReached();
+}
+
 /**
  * Upload registration is authenticated, so participant-keyed limiting avoids
  * punishing a NAT while a person cannot evade the limit by minting more device
@@ -273,6 +357,16 @@ export function assertUploadIngressRateLimitBindings(env: Env): void {
   for (const name of [
     "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
     "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
+  ] as const) {
+    assertLimiterConfigured(Reflect.get(env, name) as RateLimit | undefined);
+  }
+}
+
+export function assertDeviceSyncBindings(env: Env): void {
+  for (const name of [
+    "DEVICE_SYNC_CLIENT_RATE_LIMIT",
+    "DEVICE_SYNC_RATE_LIMIT",
+    "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT",
   ] as const) {
     assertLimiterConfigured(Reflect.get(env, name) as RateLimit | undefined);
   }

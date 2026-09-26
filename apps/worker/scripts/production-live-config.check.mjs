@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { parse } from "jsonc-parser";
 import {
   createProductionLiveConfigSnapshot,
+  PRODUCTION_RATE_LIMIT_ADDITIONS,
   productionLiveConfigFingerprint,
   renderProductionLiveConfig,
   verifyProductionLiveConfig,
@@ -156,6 +159,7 @@ test("snapshot and effective config preserve typed bindings, runtime, routes and
     code: null,
     expectedFingerprint: snapshot.fingerprint,
     actualFingerprint: snapshot.fingerprint,
+    rateLimitAdditions: [],
   });
   assert.equal(candidate.env.staging.name, "synthetic-staging");
 });
@@ -267,4 +271,185 @@ test("alias and resource-shape changes are rejected before rendering", () => {
     unsupported.env.production[key] = key === "tags" ? [] : key === "annotations" ? {} : "standard";
     assert.throws(() => renderProductionLiveConfig({ trackedConfig: unsupported, snapshot: baseline(), sourceCommit: NEXT_SOURCE }), { code: "PRODUCTION_LIVE_CONFIG_CONFIG_SETTING_UNSUPPORTED" });
   }
+});
+
+const PUBLIC_READ = Object.freeze({ name: "PUBLIC_READ_RATE_LIMIT", namespace_id: "3004", simple: { limit: 120, period: 60 } });
+const pinnedDeclarations = () => PRODUCTION_RATE_LIMIT_ADDITIONS
+  .map(({ name, namespace_id, simple }) => ({ name, namespace_id, simple: { ...simple } }));
+const byName = (bindings) => new Map(bindings.map((binding) => [binding.name, binding]));
+
+function trackedWithRateLimits(ratelimits) {
+  const config = trackedConfig();
+  config.env.production.ratelimits = ratelimits;
+  return config;
+}
+
+function inventoryWithBindings(extra, source = SOURCE) {
+  const value = inventory(source);
+  value.version.resources.bindings.push(...extra);
+  value.settings.bindings = value.version.resources.bindings;
+  return value;
+}
+
+test("pinned Rate Limit bindings the tracked config declares and live lacks are added, and the deployed result is expected", () => {
+  const snapshot = baseline();
+  const candidate = renderProductionLiveConfig({
+    trackedConfig: trackedWithRateLimits([PUBLIC_READ, ...pinnedDeclarations()]),
+    snapshot,
+    sourceCommit: NEXT_SOURCE,
+  });
+  const rendered = byName(candidate.env.production.ratelimits);
+  assert.deepEqual(rendered.get("PUBLIC_READ_RATE_LIMIT"), PUBLIC_READ);
+  for (const declaration of pinnedDeclarations()) assert.deepEqual(rendered.get(declaration.name), declaration);
+  assert.equal(rendered.size, 1 + PRODUCTION_RATE_LIMIT_ADDITIONS.length);
+
+  const verified = verifyProductionLiveConfig({ snapshot, candidateConfig: candidate, sourceCommit: NEXT_SOURCE });
+  assert.equal(verified.ok, true);
+  assert.deepEqual(verified.rateLimitAdditions, PRODUCTION_RATE_LIMIT_ADDITIONS.map((binding) => binding.name).sort());
+  assert.notEqual(verified.expectedFingerprint, snapshot.fingerprint);
+  assert.equal(verified.actualFingerprint, verified.expectedFingerprint);
+
+  // Once deployed, live holds exactly those bindings: that snapshot has the
+  // expected fingerprint and the same candidate has nothing left to add.
+  const deployed = createProductionLiveConfigSnapshot(inventoryWithBindings(
+    pinnedDeclarations().map((binding) => ({ ...binding, type: "ratelimit" })),
+    NEXT_SOURCE,
+  ));
+  assert.equal(deployed.fingerprint, verified.expectedFingerprint);
+  assert.deepEqual(verifyProductionLiveConfig({ snapshot: deployed, candidateConfig: candidate, sourceCommit: NEXT_SOURCE }), {
+    ok: true,
+    code: null,
+    expectedFingerprint: deployed.fingerprint,
+    actualFingerprint: deployed.fingerprint,
+    rateLimitAdditions: [],
+  });
+  // Without a tracked declaration nothing is added, exactly as before.
+  const unchanged = renderProductionLiveConfig({ trackedConfig: trackedConfig(), snapshot, sourceCommit: NEXT_SOURCE });
+  assert.deepEqual(unchanged.env.production.ratelimits, [PUBLIC_READ]);
+});
+
+test("unreviewed, altered or namespace-sharing Rate Limit additions fail closed", () => {
+  const snapshot = baseline();
+  const [first] = pinnedDeclarations();
+  const unreviewed = "PRODUCTION_LIVE_CONFIG_CONFIG_RATELIMIT_ADDITION_UNREVIEWED";
+  for (const [label, declaration] of [
+    ["unpinned name", { name: "SYNTHETIC_EXTRA_RATE_LIMIT", namespace_id: "3099", simple: { limit: 10, period: 60 } }],
+    ["altered limit", { ...first, simple: { ...first.simple, limit: first.simple.limit + 1 } }],
+    ["altered period", { ...first, simple: { ...first.simple, period: 10 } }],
+    ["altered namespace", { ...first, namespace_id: "3099" }],
+  ]) {
+    assert.throws(() => renderProductionLiveConfig({
+      trackedConfig: trackedWithRateLimits([PUBLIC_READ, declaration]), snapshot, sourceCommit: NEXT_SOURCE,
+    }), { code: unreviewed }, label);
+  }
+
+  const sharing = createProductionLiveConfigSnapshot(inventoryWithBindings([
+    { name: "SYNTHETIC_SHARED_RATE_LIMIT", type: "ratelimit", namespace_id: first.namespace_id, simple: { limit: 1, period: 60 } },
+  ]));
+  assert.throws(() => renderProductionLiveConfig({
+    trackedConfig: trackedWithRateLimits([PUBLIC_READ, first]), snapshot: sharing, sourceCommit: NEXT_SOURCE,
+  }), { code: "PRODUCTION_LIVE_CONFIG_CONFIG_RATELIMIT_NAMESPACE_CONFLICT" });
+
+  const candidate = renderProductionLiveConfig({ trackedConfig: trackedConfig(), snapshot, sourceCommit: NEXT_SOURCE });
+  candidate.env.production.ratelimits.push({ name: "SYNTHETIC_EXTRA_RATE_LIMIT", namespace_id: "3099", simple: { limit: 10, period: 60 } });
+  assert.deepEqual(verifyProductionLiveConfig({ snapshot, candidateConfig: candidate, sourceCommit: NEXT_SOURCE }), {
+    ok: false,
+    code: unreviewed,
+  });
+});
+
+test("a pinned binding that is already live keeps its live values and adds nothing", () => {
+  const [first] = pinnedDeclarations();
+  const live = createProductionLiveConfigSnapshot(inventoryWithBindings([
+    { ...first, type: "ratelimit", simple: { ...first.simple, limit: first.simple.limit * 2 } },
+  ]));
+  const candidate = renderProductionLiveConfig({
+    trackedConfig: trackedWithRateLimits([PUBLIC_READ, ...pinnedDeclarations()]), snapshot: live, sourceCommit: NEXT_SOURCE,
+  });
+  const rendered = byName(candidate.env.production.ratelimits);
+  assert.deepEqual(rendered.get(first.name).simple, { ...first.simple, limit: first.simple.limit * 2 });
+  const verified = verifyProductionLiveConfig({ snapshot: live, candidateConfig: candidate, sourceCommit: NEXT_SOURCE });
+  assert.equal(verified.ok, true);
+  assert.deepEqual(verified.rateLimitAdditions, PRODUCTION_RATE_LIMIT_ADDITIONS.slice(1).map((binding) => binding.name).sort());
+});
+
+// A synthetic live Worker shaped by the checked-in production environment,
+// holding every tracked binding except the pinned additions. Resource
+// identifiers and variable values are synthetic; the renderer takes them from
+// live, and only names and Rate Limit values are compared.
+function liveInventoryFromTracked(tracked, omit) {
+  const production = tracked.env.production;
+  const bindings = [
+    ...production.d1_databases.map((entry, index) => {
+      const id = `${String(index + 1).repeat(8)}-0000-4000-8000-${String(index + 1).repeat(12)}`;
+      return { name: entry.binding, type: "d1", id, database_id: id };
+    }),
+    ...production.r2_buckets.map((entry) => ({ name: entry.binding, type: "r2_bucket", bucket_name: `synthetic-${entry.binding.toLowerCase()}` })),
+    ...production.durable_objects.bindings.map((entry) => ({
+      name: entry.name, type: "durable_object_namespace", namespace_id: DO_NAMESPACE, class_name: entry.class_name,
+    })),
+    ...production.ratelimits.filter((entry) => !omit.has(entry.name)).map((entry) => ({ ...entry, type: "ratelimit" })),
+    { name: production.assets.binding, type: "assets" },
+    ...Object.keys(production.vars).map((name) => ({ name, type: "plain_text", text: `synthetic-${name.toLowerCase()}` })),
+    { name: "DEPLOYMENT_SOURCE_COMMIT", type: "plain_text", text: SOURCE },
+    ...production.secrets.required.map((name) => ({ name, type: "secret_text" })),
+  ];
+  const script = {
+    migration_tag: tracked.migrations.at(-1).tag,
+    assets: { not_found_handling: production.assets.not_found_handling, raw_run_worker_first: production.assets.run_worker_first, serve_directly: false },
+    compatibility_date: production.compatibility_date ?? tracked.compatibility_date,
+    compatibility_flags: production.compatibility_flags ?? tracked.compatibility_flags,
+    usage_model: "standard",
+    limits: production.limits,
+    cache_options: production.cache,
+  };
+  return {
+    accountId: ACCOUNT,
+    workerName: production.name,
+    version: { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", resources: { script_runtime: script, bindings } },
+    settings: {
+      placement: {}, compatibility_date: script.compatibility_date, compatibility_flags: script.compatibility_flags,
+      usage_model: script.usage_model, tags: [], tail_consumers: [], logpush: false, limits: script.limits,
+      observability: production.observability, annotations: {}, cache_options: script.cache_options, bindings,
+    },
+    schedules: { schedules: production.triggers.crons.map((cron) => ({ cron })) },
+    subdomain: { enabled: production.workers_dev, previews_enabled: production.preview_urls },
+    routes: [],
+    domains: production.routes.filter((route) => route.custom_domain).map((route) => ({
+      hostname: route.pattern, service: production.name, environment: "production", enabled: true, previews_enabled: false,
+    })),
+    namespaces: production.durable_objects.bindings.map((entry) => ({
+      id: DO_NAMESPACE, name: `${production.name}_${entry.class_name}`, script: production.name, class: entry.class_name, use_sqlite: true,
+    })),
+  };
+}
+
+test("the checked-in production config adds exactly the pinned device-sync bindings to a live Worker without them", () => {
+  const tracked = parse(readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8"));
+  const declared = byName(tracked.env.production.ratelimits);
+  for (const pinned of PRODUCTION_RATE_LIMIT_ADDITIONS) {
+    assert.deepEqual({ ...declared.get(pinned.name), type: "ratelimit" }, { ...pinned, simple: { ...pinned.simple } }, pinned.name);
+  }
+  const pinnedNames = new Set(PRODUCTION_RATE_LIMIT_ADDITIONS.map((binding) => binding.name));
+  const existing = tracked.env.production.ratelimits.filter((binding) => !pinnedNames.has(binding.name));
+  assert.equal(existing.length, 8);
+
+  const snapshot = createProductionLiveConfigSnapshot(liveInventoryFromTracked(tracked, pinnedNames));
+  assert.equal(snapshot.bindings.filter((binding) => binding.type === "ratelimit").length, 8);
+  const candidate = renderProductionLiveConfig({ trackedConfig: tracked, snapshot, sourceCommit: NEXT_SOURCE });
+  const rendered = byName(candidate.env.production.ratelimits);
+  assert.equal(rendered.size, 11);
+  for (const binding of existing) assert.deepEqual(rendered.get(binding.name), binding, binding.name);
+  assert.deepEqual(rendered.get("DEVICE_SYNC_RATE_LIMIT"), { name: "DEVICE_SYNC_RATE_LIMIT", namespace_id: "3009", simple: { limit: 6000, period: 60 } });
+  assert.deepEqual(rendered.get("DEVICE_SYNC_PRINCIPAL_RATE_LIMIT"), { name: "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT", namespace_id: "3010", simple: { limit: 4200, period: 60 } });
+  assert.deepEqual(rendered.get("DEVICE_SYNC_CLIENT_RATE_LIMIT"), { name: "DEVICE_SYNC_CLIENT_RATE_LIMIT", namespace_id: "3011", simple: { limit: 4200, period: 60 } });
+  const verified = verifyProductionLiveConfig({ snapshot, candidateConfig: candidate, sourceCommit: NEXT_SOURCE });
+  assert.equal(verified.ok, true);
+  assert.deepEqual(verified.rateLimitAdditions, [...pinnedNames].sort());
+  // A live Worker that already has them renders the same bindings, adds nothing.
+  const after = createProductionLiveConfigSnapshot(liveInventoryFromTracked(tracked, new Set()));
+  assert.equal(after.fingerprint, verified.expectedFingerprint);
+  const next = renderProductionLiveConfig({ trackedConfig: tracked, snapshot: after, sourceCommit: NEXT_SOURCE });
+  assert.deepEqual(byName(next.env.production.ratelimits), rendered);
+  assert.deepEqual(verifyProductionLiveConfig({ snapshot: after, candidateConfig: next, sourceCommit: NEXT_SOURCE }).rateLimitAdditions, []);
 });

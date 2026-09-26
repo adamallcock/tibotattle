@@ -47,7 +47,7 @@ Those remain separate verification gates in the relevant runbooks.
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 4 message handlers, 4 DOM events, 1 fixed URL scheme |
 | Process protocols | Native shell, Codex plugin, companion, analysis owners ↔ child/worker | 11 explicit runtime protocol families |
-| Cloudflare service bindings | Worker → platform-managed resources | 3 D1 bindings, 3 production R2 bindings, 1 Durable Object, 8 rate limiters, 1 assets binding, 1 cron schedule |
+| Cloudflare service bindings | Worker → platform-managed resources | 3 D1 bindings, 3 production R2 bindings, 1 Durable Object, 11 rate limiters, 1 assets binding, 1 cron schedule |
 | Reviewed code APIs | App/source owners → reusable modules | 5 workspace packages and 24 reviewed source-owner entrypoints |
 | JSON/wire contracts | Collectors, exports, release tooling, hosted intake | Closed versioned families, including generated staged v1.1 and frozen code-defined telemetry v1.0; see schema lifecycle inventory |
 | Storage schema APIs | Hosted and local persistence owners | Ordered hosted SQL migrations, local SQLite schemas, and object/Keychain contracts; attribution adds hosted 0043–0045 without relabeling local schema 11 |
@@ -383,7 +383,7 @@ Authority vocabulary:
 | `POST` | `/api/v1/me/device-telemetry-v12-consents` | Session | Grant the exact v1.2 contract for one reviewed device |
 | `GET`, `POST` | `/api/v1/device/telemetry/v1.2/day-manifests` | Device | Read or register bounded immutable successor manifests and staged chunk receipts |
 | `POST` | `/api/v1/me/telemetry-v12/domain-predecessor` | Device | Pin a complete mixed-client predecessor for successor activation |
-| `POST` | `/api/v1/me/telemetry-v12/domain-activate` | Device | Activate a complete proven successor domain under the pinned predecessor |
+| `POST` | `/api/v1/me/telemetry-v12/domain-activate` | Device | Activate a complete proven successor domain under the pinned predecessor, or acknowledge an unchanged vector without a new generation |
 | `POST` | `/api/v1/accountless/telemetry-v1.2-authorization` | Device | Record the independent accountless successor policy for the current enrollment and device |
 | `POST` | `/api/v1/accountless/telemetry-performance-authorization` | Device | Record the independent accountless performance policy for the current enrollment and device |
 | `GET` | `/api/v1/device/telemetry/performance/capabilities` | Device | Read the separate daily-performance capability and authorization |
@@ -505,7 +505,7 @@ no Cloudflare resource credential is exposed to the Worker for these calls.
 | `QUARANTINE` (R2) | Encrypted contribution object quarantine and reconciliation | Payload objects; production and non-production buckets are distinct |
 | `SPARKLE_RELEASES` (R2, production) | Exact appcast and signed update artifacts | Release objects; guarded writer only |
 | `UPLOAD_INGRESS_BUDGET` (Durable Object) | Global token-bucket and concurrent-upload leases | Stores opaque short-lived lease IDs and content-free denial counters |
-| Eight rate-limit bindings | Enrollment, recovery, per-client, public reads, upload authorization/principal/request/client | Route-class abuse controls |
+| Eleven rate-limit bindings | Enrollment, recovery, per-client, public reads, upload authorization/principal/request/client, device sync (per address, per location and per participant) | Route-class abuse controls |
 | `ASSETS` via `ASSETS.fetch(request)` | Manifest-verified public/admin static output | Non-API fallback after exact route classification |
 | `scheduled(controller, env, ctx)` | Minute cron for optional GitHub release snapshots, hourly admin metrics, identity/device/deletion purges, retention, object reconciliation, and community aggregate rebuilds | Background runtime entrypoint, not an HTTP route |
 
@@ -517,6 +517,26 @@ The exact production rate-limit binding names are:
 - Upload issuance and ingress: `UPLOAD_AUTHORIZATION_RATE_LIMIT`,
   `UPLOAD_PRINCIPAL_RATE_LIMIT`, `UPLOAD_INGRESS_REQUEST_RATE_LIMIT`, and
   `UPLOAD_INGRESS_CLIENT_RATE_LIMIT`.
+- Device sync: `DEVICE_SYNC_CLIENT_RATE_LIMIT`, `DEVICE_SYNC_RATE_LIMIT` and
+  `DEVICE_SYNC_PRINCIPAL_RATE_LIMIT`.
+
+Device-sync routes (capabilities, v1.1/v1.2 day manifests and domains,
+performance reports and the v1.0 cursor reads) authenticate by device bearer.
+A request without a well-formed bearer is charged to the
+`CLIENT_ATTEMPT_RATE_LIMIT` and `RECOVERY_RATE_LIMIT` attempt budgets before any
+D1 work. Every well-formed bearer, valid or not, is charged before credential
+verification to its client address (`DEVICE_SYNC_CLIENT_RATE_LIMIT`) and then
+to its location (`DEVICE_SYNC_RATE_LIMIT`). A bearer that fails verification is
+also charged to the attempt budgets, which answer repeated failures from one
+address with 429; an authenticated request is charged to
+`DEVICE_SYNC_PRINCIPAL_RATE_LIMIT` by participant. One v1.2 pass needs N + 6
+device-sync requests for an N-day domain, so the participant and address
+budgets (4,200 per minute in staging and production) cover the 4,096-day
+maximum, which the 5-per-minute attempt budget never could. The address budget
+stays below the 6,000-per-minute location cap, so one address can neither
+drive more credential checks than one pass nor use up its location's budget.
+A device-sync budget answers a refusal with a retryable
+`429 DEVICE_SYNC_LIMIT_REACHED` and `Retry-After: 60`.
 
 Across the primary production Worker and the separate dogfood release guard,
 the configuration declares three D1 binding instances and three R2 binding

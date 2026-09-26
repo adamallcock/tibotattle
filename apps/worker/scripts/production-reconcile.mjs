@@ -56,6 +56,9 @@ export async function reconcileProductionCandidate({
     liveConfigurationFingerprint: current.fingerprint,
     candidateConfigSha256: sha256(JSON.stringify(candidateConfig)),
     configurationPreserved: true,
+    // Every live binding is preserved; these are the only additions, the
+    // pinned Rate Limit bindings the tracked config declares and live lacks.
+    rateLimitAdditions: Array.isArray(preservation.rateLimitAdditions) ? [...preservation.rateLimitAdditions] : [],
     publicAssetsVerified: false,
     typed,
     schemaInputSha256: expected.inputSha256,

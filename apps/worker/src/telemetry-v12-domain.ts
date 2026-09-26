@@ -12,6 +12,7 @@ import {
   assertTelemetryV12WriteAllowed,
   type TelemetryTransportPrincipal,
 } from "./telemetry-transport-policy";
+import { telemetryV12StorageConstraintRefusal } from "./telemetry-v12-repository";
 
 export const V12_DOMAIN_METHOD_VERSION = "v12-complete-domain-2";
 const DAY_MS = 86_400_000;
@@ -46,6 +47,8 @@ export interface TelemetryV12DomainActivation {
   fromDay: string;
   throughDay: string;
   replay: boolean;
+  unchanged?: true;
+  requestedManifestDigest?: string;
 }
 
 function utcDay(value: string): boolean {
@@ -77,7 +80,7 @@ function domainError(error: unknown): ApiError {
   if (message.includes("telemetry_v12_manifest_incomplete")) return new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
   if (message.includes("telemetry_v12_domain_revision_conflict")) return new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
   if (message.includes("UNIQUE constraint failed: telemetry_v12_domains")) return new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
-  return new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  return telemetryV12StorageConstraintRefusal(error) ?? new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
 }
 
 export async function createTelemetryV12DomainPredecessor(
@@ -88,11 +91,20 @@ export async function createTelemetryV12DomainPredecessor(
   await assertTelemetryV12WriteAllowed(db, principal);
   const result = await db.batch<SourceState | ReadyManifest>([
     stateStatement(db, principal.participantId),
+    // One row per ready day: its first ready manifest. A device keeps every
+    // earlier manifest of a day (the unique key includes the digest, and new
+    // records or a parser release re-digest the day), so its ready rows keep
+    // growing while its days do not. The limit below is about days; counting
+    // rows would eventually refuse a small domain with a 400 the client treats
+    // as final, and the install would pause for good.
     db.prepare(
-      `SELECT id, chunk_day, manifest_digest
-         FROM telemetry_v12_day_manifests
-        WHERE participant_id = ? AND device_id = ? AND state = 'ready'
-        ORDER BY chunk_day, created_at, id LIMIT ?`,
+      `SELECT id, chunk_day, manifest_digest FROM (
+         SELECT id, chunk_day, manifest_digest,
+                row_number() OVER (PARTITION BY chunk_day ORDER BY created_at, id) AS version
+           FROM telemetry_v12_day_manifests
+          WHERE participant_id = ? AND device_id = ? AND state = 'ready'
+       ) WHERE version = 1
+       ORDER BY chunk_day LIMIT ?`,
     ).bind(principal.participantId, principal.deviceId, MAX_TELEMETRY_V12_DOMAIN_DAYS + 1),
   ]);
   const state = result[0]?.results[0] as SourceState | undefined;
@@ -255,6 +267,35 @@ export async function activateTelemetryV12Domain(
     throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
   }
   const daysJson = canonicalTelemetryV12Json(manifest.days);
+  // A new predecessor token does not make an unchanged day vector new data
+  // (v1.1 parity). The client activates at the end of every pass and its
+  // domain digest covers the predecessor pins, so without this every idle
+  // pass would write a generation of every domain day and, for an eligible
+  // owner, publish an owner change. Acknowledge the active generation only
+  // when nothing moved since it was activated: this device's head with the
+  // same range and days, a current predecessor pinned to that head, and the
+  // participant's analytical input still at the revision the head was
+  // activated under (a v1.2 activation does not advance it). One statement
+  // repeats those checks, so the acknowledgement cannot skip a raced change.
+  const unchanged = await db.prepare(
+    `SELECT d.id, d.manifest_digest, d.from_day, d.through_day
+       FROM telemetry_v12_domain_heads h
+       JOIN telemetry_v12_domains d ON d.id = h.generation_id AND d.participant_id = h.participant_id
+       JOIN participants p ON p.id = h.participant_id AND p.state = 'active'
+       JOIN community_analytical_input_versions v
+         ON v.participant_id = h.participant_id AND v.revision = d.input_revision
+       JOIN telemetry_v12_domain_predecessors x
+         ON x.token_hash = ? AND x.participant_id = h.participant_id AND x.device_id = d.device_id
+        AND x.previous_generation_id = h.generation_id AND x.input_revision = d.input_revision
+        AND x.legacy_fingerprint = ? AND x.consumed_at IS NULL AND x.expires_at > ?
+      WHERE h.participant_id = ? AND d.device_id = ?
+        AND d.from_day = ? AND d.through_day = ? AND d.days_json = ?`,
+  ).bind(tokenHash, manifest.predecessor.legacyFingerprint, now, principal.participantId,
+    principal.deviceId, manifest.fromDay, manifest.throughDay, daysJson).first<ActiveDomainRow>();
+  if (unchanged) {
+    return { ...activationResult(unchanged, true), unchanged: true,
+      requestedManifestDigest: manifest.manifestDigest };
+  }
   const days = JSON.stringify(manifest.days);
   const count = await db.prepare(
     `SELECT count(*) AS total

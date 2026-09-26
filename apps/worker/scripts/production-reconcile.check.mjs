@@ -12,7 +12,8 @@ const candidate = 'b'.repeat(40);
 const fingerprint = 'c'.repeat(64);
 const inventory = { versionId: 'synthetic-version', sourceCommit: previous, fingerprint };
 
-function fixture({ driftBefore = false, driftAfter = false, typedOk = true, sourceClean = true, preserved = true } = {}) {
+function fixture({ driftBefore = false, driftAfter = false, typedOk = true, sourceClean = true, preserved = true,
+  rateLimitAdditions = undefined } = {}) {
   let captures = 0;
   let probes = 0;
   const options = { inventory, trackedConfig: {}, sourceCommit: candidate,
@@ -29,7 +30,7 @@ function fixture({ driftBefore = false, driftAfter = false, typedOk = true, sour
     },
     configTools: { createSnapshot: value => value,
       render: () => ({ env: { production: { vars: { TELEMETRY_STORAGE_MODE: 'typed', TELEMETRY_STORAGE_NAMESPACE: 'synthetic.namespace' } } } }),
-      verify: () => ({ ok: preserved }) },
+      verify: () => ({ ok: preserved, ...(rateLimitAdditions === undefined ? {} : { rateLimitAdditions }) }) },
   };
   return { options, probes: () => probes, captures: () => captures };
 }
@@ -44,6 +45,15 @@ test('inspection requires fresh configuration before and after schema reads and 
   assert.equal(report.deploymentPerformed, false);
   assert.equal(f.captures(), 2);
   assert.equal(f.probes(), 1);
+});
+
+test('inspection names the pinned Rate Limit bindings the candidate adds', async () => {
+  assert.deepEqual((await reconcileProductionCandidate(fixture().options)).report.rateLimitAdditions, []);
+  const names = ['DEVICE_SYNC_CLIENT_RATE_LIMIT', 'DEVICE_SYNC_RATE_LIMIT'];
+  const { report } = await reconcileProductionCandidate(fixture({ rateLimitAdditions: names }).options);
+  assert.deepEqual(report.rateLimitAdditions, names);
+  assert.equal(report.configurationPreserved, true);
+  assert.equal(report.deploymentQualified, false);
 });
 
 test('private outputs require a new owner-only directory under a safe parent', async t => {

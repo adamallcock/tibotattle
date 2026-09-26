@@ -9,6 +9,9 @@ import { backfillV1QuotaFitProjection } from "./quota-fit-projection";
 import {
   assertAdmissionBindings,
   assertAttemptAllowed,
+  assertDeviceSyncBindings,
+  assertDeviceSyncCredentialAllowed,
+  assertDeviceSyncPrincipalAllowed,
   assertPublicAggregateReadAllowed,
   assertUploadAuthorizationBindings,
   assertUploadAuthorizationAllowed,
@@ -126,6 +129,7 @@ import {
   createDeviceUploadAuthorization,
   disconnectAuthenticatedDevice,
   listParticipantDevices,
+  parseDeviceAuthorization,
   purgeStaleDeviceLifecycleRows,
   recordDeviceUploadReceipt,
   revokeParticipantDevice,
@@ -3009,10 +3013,29 @@ async function handleTelemetryV1Contribution(
 const SYNC_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1000;
 
+function presentsDeviceBearer(header: string | null): header is string {
+  try {
+    parseDeviceAuthorization(header);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Shared admission and authentication for the v1.0 cursor read endpoints.
- * The device bearer is the sole authority, exactly as for upload
- * registration; a browser cookie on these endpoints is always a mistake.
+ * Shared admission and authentication for every device-sync route: the v1.0
+ * cursor reads, capabilities, v1.1/v1.2 day manifests and domains, and
+ * performance reports. The device bearer is the sole authority, exactly as for
+ * upload registration; a browser cookie on these endpoints is always a mistake.
+ *
+ * A request without a well-formed device bearer is charged to the per-client
+ * and coarse attempt budgets before any D1 work. Every well-formed bearer is
+ * charged to the per-address and per-location device-sync budgets before
+ * verification, so no address can drive more credential checks than one
+ * installation's pass (see assertDeviceSyncCredentialAllowed). A bearer that
+ * then fails verification is also charged to the attempt budgets, so repeated
+ * failures from an address end in 429. An authenticated request is finally
+ * charged to its participant's budget (assertDeviceSyncPrincipalAllowed).
  */
 async function deviceSyncPrincipal(
   request: Request,
@@ -3021,23 +3044,42 @@ async function deviceSyncPrincipal(
 ): Promise<DevicePrincipal> {
   if (request.method !== method) methodNotAllowed([method]);
   assertAdmissionBindings(env);
-  await assertAttemptAllowed(
+  assertDeviceSyncBindings(env);
+  const authorization = request.headers.get("authorization");
+  const unauthenticatedAttempt = () => assertAttemptAllowed(
     env.RECOVERY_RATE_LIMIT,
     env.CLIENT_ATTEMPT_RATE_LIMIT,
     request,
     env,
     "device_sync",
   );
-  if (request.headers.has("cookie")) {
+  if (request.headers.has("cookie") || !presentsDeviceBearer(authorization)) {
+    await unauthenticatedAttempt();
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
-  const device = await authenticateDevice(
-    env.USAGE_MONITOR_DB,
-    request.headers.get("authorization"),
+  await assertDeviceSyncCredentialAllowed(
+    env.DEVICE_SYNC_CLIENT_RATE_LIMIT,
+    env.DEVICE_SYNC_RATE_LIMIT,
+    request,
+    env,
   );
-  if (await hasDeletionTombstone(env.DELETION_LEDGER, device.participantId)) {
-    throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  let device: DevicePrincipal;
+  try {
+    device = await authenticateDevice(env.USAGE_MONITOR_DB, authorization);
+    if (await hasDeletionTombstone(env.DELETION_LEDGER, device.participantId)) {
+      throw new ApiError(401, "DEVICE_AUTH_INVALID");
+    }
+  } catch (error) {
+    if (error instanceof ApiError && error.code === "DEVICE_AUTH_INVALID") {
+      await unauthenticatedAttempt();
+    }
+    throw error;
   }
+  await assertDeviceSyncPrincipalAllowed(
+    env.DEVICE_SYNC_PRINCIPAL_RATE_LIMIT,
+    device.participantId,
+    env,
+  );
   return device;
 }
 
@@ -4173,6 +4215,7 @@ async function handleReady(
 ): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
   assertAdmissionBindings(env);
+  assertDeviceSyncBindings(env);
   assertUploadAuthorizationBindings(env);
   assertUploadIngressRateLimitBindings(env);
   assertUploadIngressConfiguration(env);
@@ -4470,6 +4513,7 @@ export async function handleRequest(
       if (request.method !== "GET") methodNotAllowed(["GET"]);
       const enrollmentMode = configuredEnrollmentMode(env);
       assertAdmissionBindings(env);
+      assertDeviceSyncBindings(env);
       assertUploadAuthorizationBindings(env);
       assertUploadIngressRateLimitBindings(env);
       assertUploadIngressConfiguration(env);
