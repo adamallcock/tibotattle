@@ -6,26 +6,41 @@
  * Nothing here reads or writes a live resource. The templates are validated
  * as checked in, then as doctored copies, so each guarded property is shown
  * to fail. The YAML reader below is a strict subset parser with no
- * dependency: it refuses anything the service template does not need
- * (anchors, aliases, tags, flow collections, block scalars, double quotes,
- * YAML 1.1 ambiguous plain scalars, duplicate keys and multi-document
- * streams), so a template that parses here reads the same under a YAML 1.1
- * or 1.2 loader.
+ * dependency: it accepts printable ASCII and line feeds only (so no character
+ * a YAML 1.1 loader treats as a line break can hide in a comment) and refuses
+ * anything the service template does not need (anchors, aliases, tags, flow
+ * collections, block scalars, double quotes, YAML 1.1 ambiguous plain
+ * scalars and keys, duplicate keys and multi-document streams), so a template
+ * that parses here reads the same under a YAML 1.1 or 1.2 loader. The IAM
+ * template must be canonical JSON (two-space JSON.stringify output), which
+ * also refuses duplicate keys. Both templates are scanned as raw text as well
+ * as parsed values, so comments and shadowed keys hold no public principal,
+ * edge-only secret or concrete identifier.
+ *
+ * The rendering contract at the end is the reference behaviour the
+ * infrastructure tooling's renderer must match. Its sibling-module
+ * cross-checks (CR-3's secret sets, EP-0's grammars) fail when the module is
+ * absent; PRODUCTION_EDGE_INFRA_PRE_INTEGRATION=1 skips them explicitly and
+ * only before those items are integrated.
  */
 
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
+import { isDeepStrictEqual } from "node:util";
 import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
 
 const SERVICE_TEMPLATE_URL = new URL("./production-service.template.yaml", import.meta.url);
 const IAM_TEMPLATE_URL = new URL("./production-edge-iam.template.json", import.meta.url);
 const PRODUCTION_CONFIGURATION_URL =
   new URL("./postgres-production-configuration.mjs", import.meta.url);
+const EDGE_ORIGIN_CONTRACT_URL = new URL("../src/edge-origin-contract.ts", import.meta.url);
+const PRE_INTEGRATION = process.env.PRODUCTION_EDGE_INFRA_PRE_INTEGRATION === "1";
 
-// Mirrors CR-3's REQUIRED_SECRET_NAMES and OPTIONAL_SECRET_NAMES. The
-// cross-check test below compares them with CR-3's exports once that module
-// is in the checkout.
+// Mirrors CR-3's REQUIRED_SECRET_NAMES and OPTIONAL_SECRET_NAMES; a test
+// below compares them with CR-3's exports. The template carries every name:
+// an optional secret is omitted only at render time, when its version
+// renders empty.
 const REQUIRED_SECRET_NAMES = Object.freeze([
   "IDENTITY_LINK_SECRET",
   "POSTGRES_RATE_LIMIT_SECRET",
@@ -141,6 +156,11 @@ const PLAIN_INTEGER = /^(?:0|[1-9][0-9]{0,8})$/u;
 // Plain words that a YAML 1.1 loader resolves to a boolean or null.
 const YAML11_AMBIGUOUS =
   /^(?:y|Y|yes|Yes|YES|n|N|no|No|NO|on|On|ON|off|Off|OFF|null|Null|NULL|True|TRUE|False|FALSE)$/u;
+// A key that any loader resolves to something other than its own text.
+const NON_STRING_KEY = /^(?:true|false)$/u;
+// Anything but printable ASCII and a line feed, including the characters a
+// YAML 1.1 loader treats as line breaks (CR, U+0085, U+2028, U+2029).
+const UNSUPPORTED_CHARACTER = /[^\n -~]/u;
 const INLINE_MAPPING_ENTRY = /^[^\s:'"]+:(?: |$)/u;
 
 function yamlError(code, lineNumber) {
@@ -152,7 +172,7 @@ function isSequenceItem(content) {
 }
 
 function parseStrictYaml(text) {
-  const unsupported = /[\u0000-\u0009\u000b-\u001f\u007f\ufeff]/u.exec(text);
+  const unsupported = UNSUPPORTED_CHARACTER.exec(text);
   if (unsupported !== null) {
     yamlError("YAML_UNSUPPORTED_CHARACTER", text.slice(0, unsupported.index).split("\n").length);
   }
@@ -169,7 +189,6 @@ function parseStrictYaml(text) {
     lines.push({ indent, content, lineNumber: index + 1 });
   });
   if (lines.length === 0) yamlError("YAML_EMPTY", 1);
-  if (lines[0].indent !== 0) yamlError("YAML_UNEXPECTED_INDENT", lines[0].lineNumber);
   const state = { lines, index: 0, scalars: [] };
   const value = parseNode(state, 0);
   if (state.index !== lines.length) {
@@ -209,6 +228,9 @@ function parseMapping(state, indent) {
       yamlError("YAML_UNSUPPORTED_KEY", line.lineNumber);
     }
     const key = match[1];
+    if (YAML11_AMBIGUOUS.test(key) || NON_STRING_KEY.test(key)) {
+      yamlError("YAML_AMBIGUOUS_KEY", line.lineNumber);
+    }
     if (Object.hasOwn(result, key)) yamlError("YAML_DUPLICATE_KEY", line.lineNumber);
     const rest = match[2] ?? "";
     state.index += 1;
@@ -324,6 +346,8 @@ function placeholderFindings(text, expected, findings) {
   }
 }
 
+// Scans every string in a parsed document, or a whole raw text when given a
+// string, so comments, keys and shadowed duplicates are covered too.
 function documentFindings(document, findings) {
   for (const value of strings(document)) {
     if (PUBLIC_PRINCIPAL.test(value)) findings.add("PUBLIC_PRINCIPAL_PRESENT");
@@ -354,6 +378,7 @@ function serviceTemplateFindings(text) {
   }
   const service = parsed.value;
   documentFindings(service, findings);
+  documentFindings(text, findings);
 
   // Rendering substitutes raw text, so every placeholder must sit inside a
   // single-quoted scalar, never in a comment, key or plain scalar.
@@ -492,6 +517,9 @@ function serviceTemplateFindings(text) {
   for (const name of REQUIRED_SECRET_NAMES) {
     if (!seen.has(name)) findings.add(`REQUIRED_SECRET_MISSING:${name}`);
   }
+  for (const name of OPTIONAL_SECRET_NAMES) {
+    if (!seen.has(name)) findings.add(`OPTIONAL_SECRET_MISSING:${name}`);
+  }
   for (const name of Object.keys(EXPECTED_PLAIN_ENV)) {
     if (!seen.has(name)) findings.add(`ENV_MISSING:${name}`);
   }
@@ -516,7 +544,13 @@ function iamTemplateFindings(text) {
   } catch {
     return ["IAM_TEMPLATE_JSON_INVALID"];
   }
+  if (UNSUPPORTED_CHARACTER.test(text)) findings.add("IAM_TEMPLATE_UNSUPPORTED_CHARACTER");
+  // Canonical form refuses duplicate keys (JSON.parse keeps only the last),
+  // escapes and layout that would let the raw text differ from the parsed
+  // policy.
+  if (text !== `${JSON.stringify(iam, null, 2)}\n`) findings.add("IAM_TEMPLATE_NOT_CANONICAL");
   documentFindings(iam, findings);
+  documentFindings(text, findings);
   placeholderFindings(text, new Set(IAM_PLACEHOLDERS), findings);
   if (!isRecord(iam)) return [...findings, "IAM_TEMPLATE_SHAPE_INVALID"].sort();
 
@@ -596,19 +630,100 @@ function iamTemplateFindings(text) {
 // ---------------------------------------------------------------------------
 // Rendering contract. The infrastructure tooling owns rendering; this is the
 // reference behaviour its renderer must match, exercised with synthetic
-// values only.
+// values only. A render refuses a template that fails its check, any
+// unresolved or unused value, and any value outside its placeholder's
+// grammar. It then refuses a result whose parsed structure differs from the
+// template's apart from the substituted strings, and a custom audience that
+// is not exactly EDGE_ORIGIN_AUDIENCE. The last two are independent of the
+// grammars, so a looser grammar still cannot change the structure.
+
+// Mirrors of EP-0's SERVICE_ACCOUNT_EMAIL_PATTERN, AUDIENCE_PATTERN and
+// RUN_APP_HOSTNAME_PATTERN (apps/worker/src/edge-origin-contract.ts); a test
+// below compares their sources.
+const SERVICE_ACCOUNT_EMAIL =
+  /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/u;
+const EDGE_AUDIENCE = /^[!-~](?:[ -~]{0,254}[!-~])?$/u;
+const RUN_APP_HOSTNAME = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+run\.app$/u;
+const SERVICE_ACCOUNT_DOMAIN_SUFFIX = ".gserviceaccount.com";
+const GCP_PROJECT_ID = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/u;
+const GCP_REGION = /^[a-z]+-[a-z]+[0-9]+$/u;
+const GCP_RESOURCE_NAME = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
+const CLOUD_SQL_INSTANCE_ID = /^[a-z](?:[a-z0-9-]{0,96}[a-z0-9])?$/u;
+// LOCATION-docker.pkg.dev/PROJECT/REPOSITORY/IMAGE[/...], no tag or digest.
+const ARTIFACT_REGISTRY_IMAGE = new RegExp("^[a-z]+(?:-[a-z]+[0-9]+)?-docker\\.pkg\\.dev"
+  + "/[a-z][a-z0-9-]{4,28}[a-z0-9]/[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?"
+  + "(?:/[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?)+$", "u");
+// cloud-sql.mjs DATABASE_PATTERN, used for databases and schemas alike.
+const POSTGRES_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/u;
+// typed-telemetry-codec.ts ID_TOKEN: the namespace must be non-empty.
+const STORAGE_NAMESPACE = /^[A-Za-z0-9._:-]{1,256}$/u;
+const SECRET_VERSION = /^[1-9][0-9]{0,9}$/u;
+
+const matches = (pattern) => (value) => pattern.test(value);
+const serviceAccountEmail = matches(SERVICE_ACCOUNT_EMAIL);
+const instanceConnectionName = (value) => {
+  const parts = value.split(":");
+  return parts.length === 3 && GCP_PROJECT_ID.test(parts[0]) && GCP_REGION.test(parts[1])
+    && CLOUD_SQL_INSTANCE_ID.test(parts[2]);
+};
+const jsonObject = (value) => {
+  try {
+    return !value.includes("'") && isRecord(JSON.parse(value));
+  } catch {
+    return false;
+  }
+};
+
+const IAM_VALUE_GRAMMARS = Object.freeze({
+  PROJECT: matches(GCP_PROJECT_ID),
+  REGION: matches(GCP_REGION),
+  SERVICE: matches(GCP_RESOURCE_NAME),
+  EDGE_INVOKER_SA: serviceAccountEmail,
+  VERIFIER_SA: (value) => value === "" || serviceAccountEmail(value),
+});
+const SERVICE_VALUE_GRAMMARS = Object.freeze({
+  ...IAM_VALUE_GRAMMARS,
+  RUNTIME_SA: serviceAccountEmail,
+  IMAGE_REPOSITORY: matches(ARTIFACT_REGISTRY_IMAGE),
+  IMAGE_DIGEST: matches(/^[0-9a-f]{64}$/u),
+  SOURCE_COMMIT: matches(/^[0-9a-f]{40}$/u),
+  SERVICE_HOST: (value) => value.length <= 253 && RUN_APP_HOSTNAME.test(value),
+  // The audience sits in single-quoted YAML and inside the custom-audiences
+  // JSON string, whose decoded value must stay byte-equal to
+  // EDGE_ORIGIN_AUDIENCE.
+  AUDIENCE: (value) => EDGE_AUDIENCE.test(value) && !/["'\\]/u.test(value),
+  MAX_INSTANCES: matches(/^[1-9][0-9]{0,3}$/u),
+  TELEMETRY_STORAGE_NAMESPACE: matches(STORAGE_NAMESPACE),
+  PRIMARY_INSTANCE_CONNECTION_NAME: instanceConnectionName,
+  PRIMARY_DATABASE: matches(POSTGRES_IDENTIFIER),
+  PRIMARY_SCHEMA: matches(POSTGRES_IDENTIFIER),
+  LEDGER_INSTANCE_CONNECTION_NAME: instanceConnectionName,
+  LEDGER_DATABASE: matches(POSTGRES_IDENTIFIER),
+  LEDGER_SCHEMA: matches(POSTGRES_IDENTIFIER),
+  POSTGRES_IAM_USER: (value) => serviceAccountEmail(`${value}${SERVICE_ACCOUNT_DOMAIN_SUFFIX}`),
+  GCS_BUCKET_NAME: matches(/^[a-z0-9][a-z0-9_-]{1,61}[a-z0-9]$/u),
+  GCS_ERASURE_BUCKET_HISTORY_PROOF: jsonObject,
+  ...Object.fromEntries(REQUIRED_SECRET_NAMES.map((name) =>
+    [`SECRET_VERSION_${name}`, matches(SECRET_VERSION)])),
+  // An empty optional version omits that secret's entry.
+  ...Object.fromEntries(OPTIONAL_SECRET_NAMES.map((name) =>
+    [`SECRET_VERSION_${name}`, (value) => value === "" || SECRET_VERSION.test(value)])),
+});
 
 function renderError(code) {
   throw Object.assign(new Error(code), { code });
 }
 
-function substitute(text, values, unsafe) {
+function substitute(text, values, grammars) {
   const used = new Set();
   const rendered = text.replace(PLACEHOLDER, (_, name) => {
     if (!Object.hasOwn(values, name)) renderError(`RENDER_PLACEHOLDER_UNRESOLVED:${name}`);
     const value = values[name];
-    if (typeof value !== "string" || /[\u0000-\u001f\u007f$]/u.test(value) || unsafe.test(value)) {
+    if (typeof value !== "string" || /[^ -~]|\$/u.test(value)) {
       renderError(`RENDER_VALUE_UNSAFE:${name}`);
+    }
+    if (!Object.hasOwn(grammars, name) || !grammars[name](value)) {
+      renderError(`RENDER_VALUE_INVALID:${name}`);
     }
     used.add(name);
     return value;
@@ -619,18 +734,77 @@ function substitute(text, values, unsafe) {
   return rendered;
 }
 
-function renderServiceTemplate(text, values) {
-  return parseStrictYaml(substitute(text, values, /'/u)).value;
+function substituteStrings(value, values) {
+  const fill = (text) => text.replace(PLACEHOLDER, (_, name) => values[name]);
+  if (typeof value === "string") return fill(value);
+  if (Array.isArray(value)) return value.map((item) => substituteStrings(item, values));
+  if (isRecord(value)) {
+    return Object.fromEntries(Object.entries(value)
+      .map(([key, child]) => [fill(key), substituteStrings(child, values)]));
+  }
+  return value;
 }
 
-function renderEdgeIamPolicy(text, values) {
-  const rendered = JSON.parse(substitute(text, values, /["\\]/u));
-  const binding = rendered.servicePolicy.bindings[0];
+function requireSameStructure(template, rendered, values) {
+  if (!isDeepStrictEqual(rendered, substituteStrings(template, values))) {
+    renderError("RENDER_STRUCTURE_CHANGED");
+  }
+}
+
+function requireDistinctAccounts(...accounts) {
+  const present = accounts.filter((account) => account !== "");
+  if (new Set(present).size !== present.length) renderError("RENDER_SERVICE_ACCOUNTS_NOT_DISTINCT");
+}
+
+function renderServiceTemplate(text, values, grammars = SERVICE_VALUE_GRAMMARS) {
+  if (serviceTemplateFindings(text).length !== 0) renderError("RENDER_TEMPLATE_INVALID");
+  const rendered = substitute(text, values, grammars);
+  requireDistinctAccounts(values.RUNTIME_SA, values.EDGE_INVOKER_SA, values.VERIFIER_SA);
+  // Cloud SQL IAM authentication signs in as the runtime service account.
+  if (`${values.POSTGRES_IAM_USER}${SERVICE_ACCOUNT_DOMAIN_SUFFIX}` !== values.RUNTIME_SA) {
+    renderError("RENDER_IAM_USER_NOT_RUNTIME");
+  }
+  let service;
+  try {
+    service = parseStrictYaml(rendered).value;
+  } catch (error) {
+    if (typeof error?.code !== "string" || !error.code.startsWith("YAML_")) throw error;
+    renderError("RENDER_STRUCTURE_CHANGED");
+  }
+  requireSameStructure(parseStrictYaml(text).value, service, values);
+  const container = service.spec.template.spec.containers[0];
+  const audience = container.env.find((entry) => entry.name === "EDGE_ORIGIN_AUDIENCE").value;
+  let audiences = null;
+  try {
+    audiences = JSON.parse(service.metadata.annotations["run.googleapis.com/custom-audiences"]);
+  } catch {
+    audiences = null;
+  }
+  if (!Array.isArray(audiences) || audiences.length !== 1 || audiences[0] !== audience) {
+    renderError("RENDER_CUSTOM_AUDIENCE_MISMATCH");
+  }
+  container.env = container.env.filter((entry) => !OPTIONAL_SECRET_NAMES.includes(entry.name)
+    || entry.valueFrom.secretKeyRef.key !== "");
+  return service;
+}
+
+function renderEdgeIamPolicy(text, values, grammars = IAM_VALUE_GRAMMARS) {
+  if (iamTemplateFindings(text).length !== 0) renderError("RENDER_TEMPLATE_INVALID");
+  const rendered = substitute(text, values, grammars);
+  requireDistinctAccounts(values.EDGE_INVOKER_SA, values.VERIFIER_SA);
+  let policy;
+  try {
+    policy = JSON.parse(rendered);
+  } catch {
+    renderError("RENDER_STRUCTURE_CHANGED");
+  }
+  requireSameStructure(JSON.parse(text), policy, values);
+  const binding = policy.servicePolicy.bindings[0];
   // An optional member whose placeholder renders empty is omitted.
   const optional = binding.optionalMembers.filter((member) => member !== "serviceAccount:");
   return {
     bindings: [{ role: binding.role, members: [...binding.members, ...optional] }],
-    projectRoles: Object.fromEntries(Object.entries(rendered.projectRoles)
+    projectRoles: Object.fromEntries(Object.entries(policy.projectRoles)
       .filter(([member]) => member !== "serviceAccount:")),
   };
 }
@@ -662,7 +836,7 @@ const SYNTHETIC_SERVICE_VALUES = Object.freeze({
   POSTGRES_IAM_USER: `example-runtime@${SYNTHETIC_PROJECT}.iam`,
   GCS_BUCKET_NAME: "example-origin-bucket",
   GCS_ERASURE_BUCKET_HISTORY_PROOF: JSON.stringify({ bucket: "example-origin-bucket" }),
-  ...Object.fromEntries(REQUIRED_SECRET_NAMES.map((name, index) =>
+  ...Object.fromEntries([...REQUIRED_SECRET_NAMES, ...OPTIONAL_SECRET_NAMES].map((name, index) =>
     [`SECRET_VERSION_${name}`, String(index + 1)])),
 });
 const SYNTHETIC_IAM_VALUES = Object.freeze({
@@ -709,25 +883,53 @@ test("the checked-in service and IAM templates pass", () => {
   assert.deepEqual(iamTemplateFindings(IAM_TEXT), []);
 });
 
-test("the service template carries every required secret by secretKeyRef and no optional secret", () => {
+test("the service template carries every required and optional secret by secretKeyRef", () => {
   const service = parseStrictYaml(SERVICE_TEXT).value;
   const env = service.spec.template.spec.containers[0].env;
   const secrets = env.filter((entry) => entry.valueFrom !== undefined).map((entry) => entry.name);
-  assert.deepEqual([...secrets].sort(), [...REQUIRED_SECRET_NAMES].sort());
+  assert.deepEqual([...secrets].sort(), [...REQUIRED_SECRET_NAMES, ...OPTIONAL_SECRET_NAMES].sort());
   assert.deepEqual(
     env.filter((entry) => entry.valueFrom === undefined).map((entry) => entry.name).sort(),
     Object.keys(EXPECTED_PLAIN_ENV).sort(),
   );
 });
 
+// A sibling module that is absent fails its cross-check; only the explicit
+// pre-integration flag turns that into a skip.
+function siblingSkip(url, item) {
+  return !existsSync(url) && PRE_INTEGRATION
+    ? `${item} is not in this checkout (PRODUCTION_EDGE_INFRA_PRE_INTEGRATION=1)`
+    : false;
+}
+
+function requireSibling(url, item) {
+  assert.ok(existsSync(url), `${item} (${url.pathname.split("/").slice(-2).join("/")}) is missing; `
+    + "set PRODUCTION_EDGE_INFRA_PRE_INTEGRATION=1 only before it is integrated");
+}
+
 test("secret name sets match CR-3's exported REQUIRED and OPTIONAL sets", {
-  skip: existsSync(PRODUCTION_CONFIGURATION_URL)
-    ? false
-    : "CR-3 postgres-production-configuration.mjs is not in this checkout",
+  skip: siblingSkip(PRODUCTION_CONFIGURATION_URL, "CR-3"),
 }, async () => {
+  requireSibling(PRODUCTION_CONFIGURATION_URL, "CR-3");
   const configuration = await import(PRODUCTION_CONFIGURATION_URL.href);
   assert.deepEqual([...configuration.REQUIRED_SECRET_NAMES].sort(), [...REQUIRED_SECRET_NAMES].sort());
   assert.deepEqual([...configuration.OPTIONAL_SECRET_NAMES].sort(), [...OPTIONAL_SECRET_NAMES].sort());
+});
+
+test("account, audience and run.app grammars match EP-0's edge/origin contract", {
+  skip: siblingSkip(EDGE_ORIGIN_CONTRACT_URL, "EP-0"),
+}, () => {
+  requireSibling(EDGE_ORIGIN_CONTRACT_URL, "EP-0");
+  const source = readFileSync(EDGE_ORIGIN_CONTRACT_URL, "utf8");
+  for (const [name, mirror] of [
+    ["SERVICE_ACCOUNT_EMAIL_PATTERN", SERVICE_ACCOUNT_EMAIL],
+    ["AUDIENCE_PATTERN", EDGE_AUDIENCE],
+    ["RUN_APP_HOSTNAME_PATTERN", RUN_APP_HOSTNAME],
+  ]) {
+    const declaration = new RegExp(`\\bconst ${name}\\s*=\\s*/(.+)/u;`, "u").exec(source);
+    assert.ok(declaration !== null, `EP-0 no longer declares ${name}`);
+    assert.equal(declaration[1], mirror.source, name);
+  }
 });
 
 test("ingress other than 'all' fails", () => {
@@ -796,6 +998,12 @@ test("a request timeout other than 300 seconds fails", () => {
   ]) {
     assert.deepEqual(serviceTemplateFindings(doctor(SERVICE_TEXT, line, replacement)),
       ["TIMEOUT_INVALID"]);
+  }
+  // A YAML 1.1 loader reads 0300 as octal 192, so it is refused outright.
+  const timeoutLine = SERVICE_TEXT.slice(0, SERVICE_TEXT.indexOf(line)).split("\n").length;
+  for (const replacement of ["      timeoutSeconds: 0300\n", "      timeoutSeconds: 0x12C\n"]) {
+    assert.deepEqual(serviceTemplateFindings(doctor(SERVICE_TEXT, line, replacement)),
+      [`YAML_UNSUPPORTED_SCALAR:${timeoutLine}`]);
   }
 });
 
@@ -868,12 +1076,16 @@ test("a missing IDENTITY_LINK_SECRET or a secret outside Secret Manager fails", 
   }
 });
 
-test("the optional secret may be added only in the pinned secretKeyRef form", () => {
+test("the optional secret stays in the template, pinned, so it can reach the origin", () => {
   const name = "DISTRIBUTION_GITHUB_API_TOKEN";
-  assert.deepEqual(serviceTemplateFindings(withEnvEntry(
-    SECRET_ENTRY(name, `\${SECRET_VERSION_${name}}`))), []);
-  assert.deepEqual(serviceTemplateFindings(withEnvEntry(SECRET_ENTRY(name, "latest"))),
+  const entry = SECRET_ENTRY(name, `\${SECRET_VERSION_${name}}`);
+  assert.deepEqual(serviceTemplateFindings(doctor(SERVICE_TEXT, `${entry}\n`, "")),
+    [`OPTIONAL_SECRET_MISSING:${name}`]);
+  assert.deepEqual(serviceTemplateFindings(doctor(SERVICE_TEXT, entry, SECRET_ENTRY(name, "latest"))),
     [`PLACEHOLDER_MISSING:SECRET_VERSION_${name}`, `SECRET_VERSION_NOT_PINNED:${name}`]);
+  assert.deepEqual(serviceTemplateFindings(doctor(SERVICE_TEXT, entry,
+    `            - name: ${name}\n              value: '\${SECRET_VERSION_${name}}'`)),
+  [`SECRET_NOT_FROM_SECRET_MANAGER:${name}`]);
 });
 
 test("the fixed service settings are pinned", () => {
@@ -937,6 +1149,35 @@ test("environment and container shape are closed", () => {
   ["KEY_UNEXPECTED:metadata.annotations.run.googleapis.com/launch-stage"]);
 });
 
+test("the service kind, containers, traffic, ports and secret references are closed", () => {
+  const env = parseStrictYaml(SERVICE_TEXT).value.spec.template.spec.containers[0].env;
+  const index = (name) => env.findIndex((entry) => entry.name === name);
+  const secretPath = `spec.template.spec.containers[0].env[${index("IDENTITY_LINK_SECRET")}].valueFrom`;
+  const identityEntry = SECRET_ENTRY("IDENTITY_LINK_SECRET", "${SECRET_VERSION_IDENTITY_LINK_SECRET}");
+  const cases = [
+    ["kind: Service\n", "kind: Job\n", ["KNATIVE_SERVICE_KIND_INVALID"]],
+    ["apiVersion: serving.knative.dev/v1\n", "apiVersion: v1\n", ["KNATIVE_SERVICE_KIND_INVALID"]],
+    ["  traffic:\n", "        - image: 'example/sidecar:latest'\n  traffic:\n", ["CONTAINER_COUNT_INVALID"]],
+    ["      latestRevision: true\n", "      latestRevision: true\n      tag: example\n",
+      ["TRAFFIC_NOT_LATEST_ONLY"]],
+    ["              containerPort: 8080\n", "              containerPort: 8080\n              protocol: TCP\n",
+      ["CONTAINER_PORT_INVALID"]],
+    ["                  key: '${SECRET_VERSION_IDENTITY_LINK_SECRET}'\n",
+      "                  key: '${SECRET_VERSION_IDENTITY_LINK_SECRET}'\n                  optional: true\n",
+      [`KEY_UNEXPECTED:${secretPath}.secretKeyRef.optional`]],
+    [identityEntry, identityEntry.replace("              valueFrom:\n",
+      "              valueFrom:\n                configMapKeyRef:\n                  name: example\n"
+      + "                  key: example\n"),
+    [`KEY_UNEXPECTED:${secretPath}.configMapKeyRef`]],
+    [ENV_ANCHOR, `            - name: host_mode\n              value: production\n${ENV_ANCHOR}`,
+      [`ENV_NAME_INVALID:${index("HOST_MODE")}`]],
+  ];
+  for (const [search, replacement, expected] of cases) {
+    assert.deepEqual(serviceTemplateFindings(doctor(SERVICE_TEXT, search, replacement)), expected,
+      replacement);
+  }
+});
+
 test("the service template holds placeholders only", () => {
   const cases = [
     ["      serviceAccountName: '${RUNTIME_SA}'\n",
@@ -978,6 +1219,45 @@ test("the service template holds placeholders only", () => {
     .split("\n").length;
   assert.deepEqual(serviceTemplateFindings(doctor(SERVICE_TEXT,
     "  name: '${SERVICE}'\n", "  name: ${SERVICE}\n")), [`YAML_UNSUPPORTED_SCALAR:${nameLine}`]);
+});
+
+test("comments are scanned like values", () => {
+  const cases = [
+    [`runtime example-runtime@example-project.iam.gserviceaccount.com at https://example-abc-uc.a.run.app sha256:${
+      "e".repeat(64)}`,
+    ["CONCRETE_IDENTIFIER_PRESENT:image-digest", "CONCRETE_IDENTIFIER_PRESENT:run-app-host",
+      "CONCRETE_IDENTIFIER_PRESENT:service-account-email"]],
+    ["grant allUsers", ["PUBLIC_PRINCIPAL_PRESENT"]],
+    [`origin ${CLOUD_RUN_IAM_TEST_TARGET.origin}`,
+      ["CONCRETE_IDENTIFIER_PRESENT:run-app-host", "CONCRETE_IDENTIFIER_PRESENT:test-target"]],
+    [`bucket ${CLOUD_RUN_IAM_TEST_TARGET.gcsBucket}`, ["CONCRETE_IDENTIFIER_PRESENT:test-target"]],
+    [`region ${CLOUD_RUN_IAM_TEST_TARGET.region}`,
+      ["CONCRETE_IDENTIFIER_PRESENT:region", "CONCRETE_IDENTIFIER_PRESENT:test-target"]],
+    [`commit ${"d".repeat(40)}`, ["CONCRETE_IDENTIFIER_PRESENT:source-commit"]],
+    ["project 123456789012", ["CONCRETE_IDENTIFIER_PRESENT:project-number"]],
+    ["the edge key lives in EDGE_INVOKER_KEY_JSON", ["EDGE_ONLY_SECRET_PRESENT:EDGE_INVOKER_KEY_JSON"]],
+  ];
+  for (const [comment, expected] of cases) {
+    assert.deepEqual(serviceTemplateFindings(doctor(SERVICE_TEXT, "apiVersion:", `# ${comment}\napiVersion:`)),
+      expected, comment);
+    // A trailing comment on a value line is scanned too.
+    assert.deepEqual(serviceTemplateFindings(doctor(SERVICE_TEXT, "      containerConcurrency: 40\n",
+      `      containerConcurrency: 40 # ${comment}\n`)), expected, comment);
+  }
+});
+
+test("characters a YAML 1.1 loader reads as line breaks are refused, even in comments", () => {
+  const anchorLine = SERVICE_TEXT.slice(0, SERVICE_TEXT.indexOf(ENV_ANCHOR)).split("\n").length;
+  for (const separator of ["\u2028", "\u2029", "\u0085", "\r"]) {
+    // In gcloud's YAML 1.1 loader this comment line would declare a test seam.
+    const hidden = withEnvEntry(`            #${separator}            - name: POSTGRES_TEST_HTTP_MODE${
+      separator}              value: cloud-run-iam`);
+    assert.deepEqual(serviceTemplateFindings(hidden), [`YAML_UNSUPPORTED_CHARACTER:${anchorLine}`],
+      JSON.stringify(separator));
+  }
+  assert.deepEqual(serviceTemplateFindings(`\ufeff${SERVICE_TEXT}`), ["YAML_UNSUPPORTED_CHARACTER:1"]);
+  assert.deepEqual(serviceTemplateFindings(SERVICE_TEXT.replaceAll("\n", "\r\n")),
+    ["YAML_UNSUPPORTED_CHARACTER:1"]);
 });
 
 test("any role other than run.invoker fails", () => {
@@ -1061,6 +1341,46 @@ test("the IAM template holds placeholders only", () => {
   assert.deepEqual(iamTemplateFindings("{"), ["IAM_TEMPLATE_JSON_INVALID"]);
 });
 
+test("the IAM template is canonical ASCII JSON, so no key can shadow another", () => {
+  const shadowed = doctor(IAM_TEXT, '  "servicePolicy": {\n', [
+    '  "servicePolicy": {',
+    '    "bindings": [{ "role": "roles/run.invoker", "members": ["allUsers"] }]',
+    "  },",
+    '  "servicePolicy": {',
+    "",
+  ].join("\n"));
+  // JSON.parse keeps the last duplicate, so the parsed policy hides the grant.
+  assert.deepEqual(JSON.parse(shadowed), JSON.parse(IAM_TEXT));
+  assert.deepEqual(iamTemplateFindings(shadowed), ["IAM_TEMPLATE_NOT_CANONICAL", "PUBLIC_PRINCIPAL_PRESENT"]);
+  assert.deepEqual(iamTemplateFindings(`${JSON.stringify(JSON.parse(IAM_TEXT))}\n`),
+    ["IAM_TEMPLATE_NOT_CANONICAL"]);
+  assert.deepEqual(iamTemplateFindings(doctor(IAM_TEXT, '"role": "roles/run.invoker"',
+    '"role": "roles/run.\\u0069nvoker"')), ["IAM_TEMPLATE_NOT_CANONICAL"]);
+  assert.deepEqual(iamTemplateFindings(doctor(IAM_TEXT, "Invoker IAM for", "Invoker\u2028IAM for")),
+    ["IAM_TEMPLATE_UNSUPPORTED_CHARACTER"]);
+});
+
+test("the IAM binding role, members and resource are closed", () => {
+  assert.deepEqual(iamTemplateFindings(doctorIam((iam) => {
+    delete iam.servicePolicy.bindings[0].role;
+  })), ["IAM_ROLE_NOT_RUN_INVOKER"]);
+  assert.deepEqual(iamTemplateFindings(doctorIam((iam) => {
+    iam.servicePolicy.bindings[0].role = "run.admin";
+  })), ["IAM_ROLE_NOT_RUN_INVOKER"]);
+  assert.deepEqual(iamTemplateFindings(doctorIam((iam) => {
+    iam.servicePolicy.bindings[0].members.push(EDGE_INVOKER_MEMBER);
+  })), ["IAM_MEMBER_UNEXPECTED"]);
+  assert.deepEqual(iamTemplateFindings(doctorIam((iam) => {
+    iam.servicePolicy.bindings[0].members = EDGE_INVOKER_MEMBER;
+  })), ["IAM_EDGE_INVOKER_MISSING", "IAM_MEMBER_UNEXPECTED"]);
+  assert.deepEqual(iamTemplateFindings(doctorIam((iam) => {
+    iam.servicePolicy.bindings[0].optionalMembers = VERIFIER_MEMBER;
+  })), ["IAM_MEMBER_UNEXPECTED"]);
+  assert.deepEqual(iamTemplateFindings(doctorIam((iam) => {
+    iam.resource.type = "run.googleapis.com/Job";
+  })), ["IAM_RESOURCE_INVALID"]);
+});
+
 test("the YAML reader refuses syntax outside the reviewed subset", () => {
   const cases = [
     ["a: 1\na: 2\n", "YAML_DUPLICATE_KEY"],
@@ -1082,6 +1402,26 @@ test("the YAML reader refuses syntax outside the reviewed subset", () => {
     ["a:\n  b: 1\n c: 2\n", "YAML_UNEXPECTED_INDENT"],
     ["a: 1\n  b: 2\n", "YAML_UNEXPECTED_INDENT"],
     ["a:\n  - - 1\n", "YAML_UNSUPPORTED_NESTED_SEQUENCE"],
+    // Leading zeros, hex and separators read differently under YAML 1.1.
+    ["a: 0300\n", "YAML_UNSUPPORTED_SCALAR"],
+    ["a: 0x12C\n", "YAML_UNSUPPORTED_SCALAR"],
+    ["a: 1_000\n", "YAML_UNSUPPORTED_SCALAR"],
+    ["a: 1234567890\n", "YAML_UNSUPPORTED_SCALAR"],
+    [" a: 1\n", "YAML_UNEXPECTED_INDENT"],
+    [" - 1\n", "YAML_UNEXPECTED_INDENT"],
+    ["a:\n  -  b: 1\n", "YAML_UNEXPECTED_INDENT"],
+    ["y: 1\n", "YAML_AMBIGUOUS_KEY"],
+    ["on: 1\n", "YAML_AMBIGUOUS_KEY"],
+    ["true: 1\n", "YAML_AMBIGUOUS_KEY"],
+    ["Null: 1\n", "YAML_AMBIGUOUS_KEY"],
+    ["a: 1\r\n", "YAML_UNSUPPORTED_CHARACTER"],
+    ["\ufeffa: 1\n", "YAML_UNSUPPORTED_CHARACTER"],
+    ["# \u2028\na: 1\n", "YAML_UNSUPPORTED_CHARACTER"],
+    ["a: 'x\u0085'\n", "YAML_UNSUPPORTED_CHARACTER"],
+    ["a: 1\u2029\n", "YAML_UNSUPPORTED_CHARACTER"],
+    ["a: '\u0001'\n", "YAML_UNSUPPORTED_CHARACTER"],
+    ["a: '\u007f'\n", "YAML_UNSUPPORTED_CHARACTER"],
+    ["a: 'caf\u00e9'\n", "YAML_UNSUPPORTED_CHARACTER"],
   ];
   for (const [text, code] of cases) {
     assert.throws(() => parseStrictYaml(text), { code }, JSON.stringify(text));
@@ -1094,6 +1434,15 @@ test("the YAML reader refuses syntax outside the reviewed subset", () => {
     "  - 7",
     "b: true",
   ].join("\n")).value, { a: [{ name: "x", value: "it's" }, 7], b: true });
+});
+
+test("every template placeholder has exactly one render grammar", () => {
+  const servicePlaceholders = new Set(placeholderNames(SERVICE_TEXT));
+  assert.deepEqual(Object.keys(SERVICE_VALUE_GRAMMARS).sort(), [...servicePlaceholders].sort());
+  assert.deepEqual(Object.keys(SYNTHETIC_SERVICE_VALUES).sort(), [...servicePlaceholders].sort());
+  const iamPlaceholders = new Set(placeholderNames(IAM_TEXT));
+  assert.deepEqual(Object.keys(IAM_VALUE_GRAMMARS).sort(), [...iamPlaceholders].sort());
+  assert.deepEqual(Object.keys(SYNTHETIC_IAM_VALUES).sort(), [...iamPlaceholders].sort());
 });
 
 test("rendering fills every placeholder into a digest-pinned, audience-bound spec", () => {
@@ -1113,12 +1462,36 @@ test("rendering fills every placeholder into a digest-pinned, audience-bound spe
     SYNTHETIC_SERVICE_VALUES.GCS_ERASURE_BUCKET_HISTORY_PROOF);
   assert.deepEqual(env.get("IDENTITY_LINK_SECRET").valueFrom.secretKeyRef,
     { name: "IDENTITY_LINK_SECRET", key: "1" });
+  assert.deepEqual(env.get("DISTRIBUTION_GITHUB_API_TOKEN").valueFrom.secretKeyRef, {
+    name: "DISTRIBUTION_GITHUB_API_TOKEN",
+    key: SYNTHETIC_SERVICE_VALUES.SECRET_VERSION_DISTRIBUTION_GITHUB_API_TOKEN,
+  });
+  for (const entry of container.env.filter((item) => item.valueFrom !== undefined)) {
+    assert.match(entry.valueFrom.secretKeyRef.key, /^[1-9][0-9]*$/u, entry.name);
+  }
   assert.equal(service.spec.template.metadata.annotations["autoscaling.knative.dev/maxScale"], "4");
   assert.doesNotMatch(JSON.stringify(service), /\$\{/u);
 
   const noVerifier = renderServiceTemplate(SERVICE_TEXT, { ...SYNTHETIC_SERVICE_VALUES, VERIFIER_SA: "" });
   assert.equal(noVerifier.spec.template.spec.containers[0].env
     .find((entry) => entry.name === "EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS").value, "");
+});
+
+test("an optional secret is omitted only when its version renders empty", () => {
+  const name = "DISTRIBUTION_GITHUB_API_TOKEN";
+  const service = renderServiceTemplate(SERVICE_TEXT,
+    { ...SYNTHETIC_SERVICE_VALUES, [`SECRET_VERSION_${name}`]: "" });
+  const names = service.spec.template.spec.containers[0].env.map((entry) => entry.name);
+  assert.equal(names.includes(name), false);
+  for (const required of REQUIRED_SECRET_NAMES) assert.equal(names.includes(required), true, required);
+  // A required secret never renders empty, so it can never be omitted.
+  assert.throws(() => renderServiceTemplate(SERVICE_TEXT,
+    { ...SYNTHETIC_SERVICE_VALUES, SECRET_VERSION_IDENTITY_LINK_SECRET: "" }),
+  { code: "RENDER_VALUE_INVALID:SECRET_VERSION_IDENTITY_LINK_SECRET" });
+  // The optional version must still be supplied: silence is not a choice.
+  const { [`SECRET_VERSION_${name}`]: _version, ...unset } = SYNTHETIC_SERVICE_VALUES;
+  assert.throws(() => renderServiceTemplate(SERVICE_TEXT, unset),
+    { code: `RENDER_PLACEHOLDER_UNRESOLVED:SECRET_VERSION_${name}` });
 });
 
 test("rendering binds only the invoker and, when present, the verifier", () => {
@@ -1138,18 +1511,101 @@ test("rendering binds only the invoker and, when present, the verifier", () => {
   });
 });
 
-test("rendering refuses unresolved, unused and structure-changing values", () => {
+test("rendering refuses unresolved, unused and unsafe values", () => {
   const { AUDIENCE: _audience, ...missing } = SYNTHETIC_SERVICE_VALUES;
   assert.throws(() => renderServiceTemplate(SERVICE_TEXT, missing),
     { code: "RENDER_PLACEHOLDER_UNRESOLVED:AUDIENCE" });
   assert.throws(() => renderServiceTemplate(SERVICE_TEXT, { ...SYNTHETIC_SERVICE_VALUES, EXTRA: "x" }),
     { code: "RENDER_VALUE_UNUSED:EXTRA" });
-  for (const value of ["x'\n  injected: 'y", "line\nbreak", "${PROJECT}"]) {
+  for (const value of ["x'\n  injected: 'y", "line\nbreak", "${PROJECT}", "tab\there",
+    "caf\u00e9", "line\u2028break", 42]) {
     assert.throws(() => renderServiceTemplate(SERVICE_TEXT, { ...SYNTHETIC_SERVICE_VALUES, AUDIENCE: value }),
-      { code: "RENDER_VALUE_UNSAFE:AUDIENCE" });
+      { code: "RENDER_VALUE_UNSAFE:AUDIENCE" }, JSON.stringify(value));
   }
-  assert.throws(() => renderEdgeIamPolicy(IAM_TEXT, {
-    ...SYNTHETIC_IAM_VALUES,
-    EDGE_INVOKER_SA: "x\", \"allUsers",
-  }), { code: "RENDER_VALUE_UNSAFE:EDGE_INVOKER_SA" });
+  assert.throws(() => renderEdgeIamPolicy(IAM_TEXT, { ...SYNTHETIC_IAM_VALUES, EXTRA: "x" }),
+    { code: "RENDER_VALUE_UNUSED:EXTRA" });
+  assert.throws(() => renderServiceTemplate(doctor(SERVICE_TEXT, "      timeoutSeconds: 300\n",
+    "      timeoutSeconds: 60\n"), SYNTHETIC_SERVICE_VALUES), { code: "RENDER_TEMPLATE_INVALID" });
+  assert.throws(() => renderEdgeIamPolicy(doctorIam((iam) => {
+    iam.servicePolicy.bindings[0].role = "roles/run.admin";
+  }), SYNTHETIC_IAM_VALUES), { code: "RENDER_TEMPLATE_INVALID" });
+});
+
+test("each placeholder value must match its own grammar", () => {
+  const invalid = {
+    PROJECT: ["", "Example-Project", "x", "example_project"],
+    REGION: ["", "us", "US-EAST1", "us-east"],
+    SERVICE: ["", "Example", "-example", "example-"],
+    RUNTIME_SA: ["", "example@example.com", "123456789012-compute@developer.gserviceaccount.com"],
+    IMAGE_REPOSITORY: ["", "example/image", "gcr.io/example-project/image",
+      "us-docker.pkg.dev/example-project/repository/image:latest"],
+    IMAGE_DIGEST: ["", "latest", "not-a-digest", "A".repeat(64), "a".repeat(63)],
+    SOURCE_COMMIT: ["", "main", "unknown", "b".repeat(39), "B".repeat(40)],
+    SERVICE_HOST: ["", "example.com", "https://example-origin.a.run.app", "Example.a.run.app"],
+    AUDIENCE: ["", " padded", "padded ", "example-aud\", \"https://other-audience.example",
+      "aud\"x", "aud\\x", "a\\u0041b", "aud'x", "x".repeat(257)],
+    EDGE_INVOKER_SA: ["", "example-invoker@example-project.iam.gserviceaccount.com.evil"],
+    VERIFIER_SA: ["serviceAccount:example-verifier@example-origin-project.iam.gserviceaccount.com"],
+    MAX_INSTANCES: ["", "0", "04", "-1", "1.5", "10000"],
+    TELEMETRY_STORAGE_NAMESPACE: ["", "has space", "slash/namespace"],
+    PRIMARY_INSTANCE_CONNECTION_NAME: ["", "example-primary", "example-origin-project:example-primary"],
+    PRIMARY_DATABASE: ["", "1database", "data-base"],
+    LEDGER_SCHEMA: ["", "schema.name", "x".repeat(64)],
+    POSTGRES_IAM_USER: ["", "example-runtime", "example-runtime@example-origin-project"],
+    GCS_BUCKET_NAME: ["", "Example-Bucket", "example.bucket", "-bucket"],
+    GCS_ERASURE_BUCKET_HISTORY_PROOF: ["", "[]", "null", "{", "{\"bucket\":\"it's\"}"],
+    SECRET_VERSION_IDENTITY_LINK_SECRET: ["", "latest", "0", "01", "1.0"],
+    SECRET_VERSION_DISTRIBUTION_GITHUB_API_TOKEN: ["latest", "0"],
+  };
+  for (const [name, values] of Object.entries(invalid)) {
+    for (const value of values) {
+      assert.throws(() => renderServiceTemplate(SERVICE_TEXT, { ...SYNTHETIC_SERVICE_VALUES, [name]: value }),
+        { code: `RENDER_VALUE_INVALID:${name}` }, `${name}=${JSON.stringify(value)}`);
+    }
+  }
+  for (const [name, value] of [["EDGE_INVOKER_SA", ""], ["PROJECT", "Example"],
+    ["VERIFIER_SA", "allUsers"], ["SERVICE", "example\", \"other"]]) {
+    assert.throws(() => renderEdgeIamPolicy(IAM_TEXT, { ...SYNTHETIC_IAM_VALUES, [name]: value }),
+      { code: `RENDER_VALUE_INVALID:${name}` }, `${name}=${JSON.stringify(value)}`);
+  }
+});
+
+test("rendering refuses shared identities and an IAM user other than the runtime", () => {
+  for (const values of [
+    { RUNTIME_SA: SYNTHETIC_INVOKER },
+    { RUNTIME_SA: SYNTHETIC_VERIFIER },
+    { VERIFIER_SA: SYNTHETIC_INVOKER },
+  ]) {
+    const merged = { ...SYNTHETIC_SERVICE_VALUES, ...values };
+    merged.POSTGRES_IAM_USER = merged.RUNTIME_SA.slice(0, -SERVICE_ACCOUNT_DOMAIN_SUFFIX.length);
+    assert.throws(() => renderServiceTemplate(SERVICE_TEXT, merged),
+      { code: "RENDER_SERVICE_ACCOUNTS_NOT_DISTINCT" }, JSON.stringify(values));
+  }
+  assert.throws(() => renderEdgeIamPolicy(IAM_TEXT,
+    { ...SYNTHETIC_IAM_VALUES, VERIFIER_SA: SYNTHETIC_INVOKER }),
+  { code: "RENDER_SERVICE_ACCOUNTS_NOT_DISTINCT" });
+  assert.throws(() => renderServiceTemplate(SERVICE_TEXT, {
+    ...SYNTHETIC_SERVICE_VALUES,
+    POSTGRES_IAM_USER: `example-other@${SYNTHETIC_PROJECT}.iam`,
+  }), { code: "RENDER_IAM_USER_NOT_RUNTIME" });
+});
+
+test("structure and audience checks hold even under a permissive grammar", () => {
+  const permissive = (grammars) => Object.fromEntries(Object.keys(grammars).map((name) => [name, () => true]));
+  const service = (overrides) => renderServiceTemplate(SERVICE_TEXT,
+    { ...SYNTHETIC_SERVICE_VALUES, ...overrides }, permissive(SERVICE_VALUE_GRAMMARS));
+  // A single quote ends the YAML scalar.
+  assert.throws(() => service({ SERVICE: "x'" }), { code: "RENDER_STRUCTURE_CHANGED" });
+  assert.throws(() => service({ PRIMARY_SCHEMA: "x' # hidden" }), { code: "RENDER_STRUCTURE_CHANGED" });
+  // A double quote or backslash rewrites the custom-audiences JSON.
+  for (const audience of ["aud-one\", \"aud-two", "aud\"x", "a\\b", "a\\u0041b"]) {
+    assert.throws(() => service({ AUDIENCE: audience }), { code: "RENDER_CUSTOM_AUDIENCE_MISMATCH" },
+      audience);
+  }
+  const iam = (overrides) => renderEdgeIamPolicy(IAM_TEXT,
+    { ...SYNTHETIC_IAM_VALUES, ...overrides }, permissive(IAM_VALUE_GRAMMARS));
+  assert.throws(() => iam({ SERVICE: "x\", \"extra\": \"y" }), { code: "RENDER_STRUCTURE_CHANGED" });
+  assert.throws(() => iam({ SERVICE: "a\\u0041" }), { code: "RENDER_STRUCTURE_CHANGED" });
+  // The unsafe-character screen does not depend on the grammar.
+  assert.throws(() => service({ AUDIENCE: "line\nbreak" }), { code: "RENDER_VALUE_UNSAFE:AUDIENCE" });
 });

@@ -2,17 +2,28 @@
 # serving.knative.dev/v1).
 #
 # This file is the single source of truth for the production service spec.
-# The GCP infrastructure tooling renders it by plain text substitution and
-# applies it; nothing in the repository applies it on its own. The companion
+# The GCP infrastructure tooling renders it and applies the result; nothing
+# in the repository applies it on its own. The companion
 # production-edge-iam.template.json grants run.invoker on this service, and
-# production-edge-infra.check.mjs validates both files without a YAML
-# dependency.
+# production-edge-infra.check.mjs validates both files and pins the rendering
+# contract without a YAML dependency.
 #
-# Syntax: keep to the strict subset the check parses. Use block mappings and
-# block sequences, plain identifier or integer scalars, true, and
-# single-quoted strings. Every placeholder sits inside a single-quoted
-# scalar. Rendered values never contain a quote, a newline or a control
-# character, so rendering cannot change the document structure.
+# Syntax: keep to the strict subset the check parses. Use printable ASCII and
+# line feeds only; block mappings and block sequences; plain identifier or
+# integer scalars, true, and single-quoted strings. Every placeholder sits
+# inside a single-quoted scalar. Comments are scanned like values, so they
+# must not hold a concrete identifier either.
+#
+# Rendering substitutes text, and the check's reference renderer defines the
+# contract. Every placeholder is required and each value must match its own
+# grammar: a digest is 64 lowercase hex, a commit 40, a secret version a
+# positive integer, an account a user-managed service account email. No
+# value holds a single quote, a dollar sign, a control or a non-ASCII
+# character, and the audience holds no double quote or backslash. A render
+# whose parsed structure differs from this template's, apart from the
+# substituted strings, is refused. An optional secret whose version renders
+# empty is omitted from the rendered spec, so the tooling applies the
+# rendered object, not the text.
 #
 # Placeholders, all required:
 #   PROJECT                            GCP project id
@@ -38,7 +49,9 @@
 #   GCS_BUCKET_NAME                    the quarantine object bucket
 #   GCS_ERASURE_BUCKET_HISTORY_PROOF   the bucket-birth history proof JSON
 #   SECRET_VERSION_<NAME>              the pinned Secret Manager version of
-#                                      each secret NAME below
+#                                      each secret NAME below; for the
+#                                      optional GitHub distribution token,
+#                                      empty when no token is configured
 #
 # The origin boundary accepts only ID tokens whose audience equals AUDIENCE
 # and whose email is the edge invoker (or, for plain health and readiness
@@ -154,6 +167,14 @@ spec:
                 secretKeyRef:
                   name: APPLE_PRIVATE_KEY
                   key: '${SECRET_VERSION_APPLE_PRIVATE_KEY}'
+            # Optional. When no GitHub token is configured its version renders
+            # empty and the entry is omitted; the admin distribution view then
+            # falls back to anonymous GitHub release reads.
+            - name: DISTRIBUTION_GITHUB_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: DISTRIBUTION_GITHUB_API_TOKEN
+                  key: '${SECRET_VERSION_DISTRIBUTION_GITHUB_API_TOKEN}'
   traffic:
     - percent: 100
       latestRevision: true
