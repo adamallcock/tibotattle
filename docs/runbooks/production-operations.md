@@ -703,20 +703,15 @@ The owner can activate such uploads from the admin console's **Activate
 stranded v1.1 uploads** card. **Preview** pages through every device without
 changing anything and shows the counts. **Activate N devices** is enabled only
 by a successful preview from the last 15 minutes, runs once per preview, and
-reports what it activated, including after a partial failure. Activation is a production write and needs
-explicit authorization.
+reports what it activated, including after a partial failure. Activation is a
+production write and needs explicit authorization.
 
-Both buttons send the existing admin action with one closed object, which can
-also be sent directly:
-
-```json
-{ "action": "run_maintenance",
-  "v11EvidenceAdoption": { "dryRun": true, "maxDevices": 10, "afterParticipantId": null } }
-```
-
-Send it from the admin origin with the Access owner identity and
-`x-usage-monitor-admin: 1`. Always run the dry run first. Page with the returned
-`nextAfterParticipantId` until it is `null` (`maxDevices` is 1–25).
+Both buttons use the existing `POST /api/v1/admin/action` with
+`action: "run_maintenance"` and one closed `v11EvidenceAdoption` object
+containing `dryRun` (boolean), `maxDevices` (1–25, default 10) and
+`afterParticipantId` (`null`, then each returned `nextAfterParticipantId` until
+it is `null`). The Access owner and admin CSRF gates still apply. Always run the
+dry run first.
 
 For each device, the action uses only that device's own complete uploads. With
 no head, it takes the longest contiguous run of ready days (the latest run on a

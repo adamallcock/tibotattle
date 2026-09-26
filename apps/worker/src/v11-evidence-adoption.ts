@@ -214,7 +214,10 @@ function unchanged(state: HeadState, head: Map<string, DayManifest>, proposal: P
 
 /** Issue a predecessor for exactly the adopted range, with the same fingerprint
  * construction as the device's own predecessor for a source without v1 or
- * legacy history, under the same current-revision and head guards. */
+ * legacy history, under the same current-revision and head guards. Like the
+ * client's own request, it first prunes expired open predecessors and all but
+ * the newest seven: a stuck client leaves one per failed pass, so the eight-row
+ * cap would otherwise refuse exactly the devices this exists for. */
 async function adoptionPredecessor(db: D1Database, principal: TelemetryTransportPrincipal, state: HeadState,
   fromDay: string, throughDay: string, nowEpoch: number) {
   const legacyFingerprint = await sha256Hex(canonicalJson({ method: V11_DOMAIN_METHOD_VERSION,
@@ -223,7 +226,15 @@ async function adoptionPredecessor(db: D1Database, principal: TelemetryTransport
     chunks: [], winners: [], legacyRange: { from_day: null, through_day: null } }));
   const token = crypto.randomUUID();
   const now = new Date(nowEpoch).toISOString();
-  const rows = await db.prepare(`INSERT INTO telemetry_v11_domain_predecessors (
+  const rows = await db.batch([
+    db.prepare(`DELETE FROM telemetry_v11_domain_predecessors
+      WHERE participant_id = ? AND device_id = ? AND consumed_at IS NULL
+        AND (expires_at <= ? OR token_hash IN (SELECT x.token_hash FROM telemetry_v11_domain_predecessors x
+          WHERE x.participant_id = ? AND x.device_id = ? AND x.consumed_at IS NULL
+          ORDER BY x.created_at DESC, x.token_hash LIMIT -1 OFFSET 7))
+        AND NOT EXISTS (SELECT 1 FROM telemetry_v11_domains d WHERE d.predecessor_token_hash = token_hash)`)
+      .bind(principal.participantId, principal.deviceId, now, principal.participantId, principal.deviceId),
+    db.prepare(`INSERT INTO telemetry_v11_domain_predecessors (
       token_hash, participant_id, device_id, previous_generation_id, legacy_fingerprint,
       input_revision, from_day, through_day, winners_json, created_at, expires_at
     ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?
@@ -236,8 +247,9 @@ async function adoptionPredecessor(db: D1Database, principal: TelemetryTransport
     RETURNING token_hash`).bind(await sha256Hex(token), principal.participantId, principal.deviceId,
       state.generation_id, legacyFingerprint, state.input_revision, fromDay, throughDay, now,
       new Date(nowEpoch + PREDECESSOR_TTL_MS).toISOString(), principal.participantId, state.input_revision,
-      principal.participantId, state.generation_id, principal.participantId, principal.deviceId, now).all();
-  if (rows.results.length !== 1) throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
+      principal.participantId, state.generation_id, principal.participantId, principal.deviceId, now),
+  ]);
+  if (rows[1]?.results.length !== 1) throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
   return { token, legacyFingerprint };
 }
 
