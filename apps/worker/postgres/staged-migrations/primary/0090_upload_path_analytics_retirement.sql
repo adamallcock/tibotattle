@@ -115,12 +115,13 @@ DROP FUNCTION preparation_progress_changed();
 -- and cascade with their participant. The seeded singletons
 -- (current_queue_state, preparation_counters) are already unique.
 -- preview_cache and community_model_composition_days (D1 isolation 0001
--- refuses the latter) are NOT refused yet, and that refusal is owed: the
--- owner-retirement residue sweep still deletes and counts both caches, and
--- its specs (analytics owner retirement, social owner erasure) insert cache
--- rows after migrating. Add the same refusal to both tables together with
--- the removal of that sweep, before any writer could leave derived rows that
--- an owner erasure no longer clears. No upload-path writer remains here.
+-- refuses the latter) are NOT refused here: the owner-retirement residue
+-- sweep still deletes and counts both caches, and its specs (analytics owner
+-- retirement, social owner erasure) insert cache rows after migrating. The
+-- plan assigns that refusal to AN-2's primary 0064, which adds this same
+-- trigger to both tables, reusing refuse_retired_analytics_write(), in the
+-- change that removes the sweep, so no writer can leave derived rows that an
+-- owner erasure no longer clears. No upload-path writer remains here.
 CREATE FUNCTION refuse_retired_analytics_write() RETURNS trigger
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
