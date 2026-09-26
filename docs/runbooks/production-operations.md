@@ -521,16 +521,45 @@ is applied.
 
 The GCP line carried `0013` and `0014` under earlier numbers until they were
 renamed, byte-identically, to follow `0012`. The D1 ledgers record bare file
-names, so before applying `0013` or `0014` to any role, read back only the
-migration names in `d1_storage_migrations` and `d1_migrations` and confirm
-that none is one of the retired names listed as
-`RETIRED_ISOLATION_NAMES` in
+names. Before applying `0013` or `0014` anywhere, read back only the migration
+names in `d1_storage_migrations` and `d1_migrations` of every Cloudflare D1
+database, in every environment and role, and confirm that none is one of the
+retired names listed as `RETIRED_ISOLATION_NAMES` in
 `apps/worker/scripts/ingestion-isolation-sequence.check.mjs`. If one is
 present, stop and re-plan: never relabel or re-apply an applied migration.
-Apply `0013`, then `0014`, each with its bare-name `d1_storage_migrations`
-row in the same submission through the reviewed storage-migration path, and
-read the bare names back afterwards. That check also pins every isolation
-file's bytes and name.
+That check also pins every isolation file's bytes and name, and models the
+ledger rows from the storage operator's own submission.
+
+`0014` also needs baseline `0063_accountless_history_transfer_source.sql` in
+the role's `d1_migrations`. GitHub `main`'s baseline ends at `0062`, so the
+production ingestion D1 lacks it unless it was applied separately. `0063` is a
+baseline (Wrangler `d1_migrations`) migration, not a storage-migration
+submission: it needs its own authorization,
+[admission and rehearsal](./release-migration-rehearsal.md) and receipt. If the
+readback does not show `0063` and it is not applied first, do not apply
+`0014`; record the owner's decision to defer it, which also defers every
+deploy of a tree that contains it.
+
+Applying any of these files also decides which source tree can deploy. The
+guarded typed deploy refuses any object that is extra to, or missing from, the
+schema derived from the deploying tree. Once `0063`, `0013` or `0014` is
+applied, a tree without them (GitHub `main` today) is refused with
+`TYPED_PREFLIGHT_SCHEMA_MISMATCH`; a tree that contains all three is refused
+with `TYPED_PREFLIGHT_SCHEMA_OBJECT_MISSING` until all three are applied. No
+guarded Worker deploy passes between the first application and the last.
+Choose one order before applying anything:
+
+- Deploy every pending `main`-line Worker change first, then apply the files
+  in one window. Every later production deploy, a `main` hotfix included, must
+  come from a tree that carries all three files byte-identically under these
+  names.
+- Or first land `0063`, `0013` and `0014` byte-identically, under the same
+  names, on GitHub `main`. `main` then cannot deploy until they are applied.
+
+Then apply `0063` through the baseline path when the readback lacks it, then
+`0013`, then `0014`, each storage file with its bare-name
+`d1_storage_migrations` row in the same submission through the reviewed
+storage-migration path, and read both ledgers' bare names back afterwards.
 
 Run the local populated rehearsal from the repository root. It uses
 synthetic content-free rows, enables foreign-key checks, verifies every mapped

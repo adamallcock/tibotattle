@@ -2,7 +2,9 @@
 // version into the predecessor fingerprint, so a pass that starts on one and
 // finishes on the other only verifies when both name the same method. The
 // Workers test pool cannot read host files and the PostgreSQL constant is not
-// exported, so this Node check compares the two declarations as source text.
+// exported, so this Node check compares the two declarations as source text,
+// and requires each file's fingerprint to hash its constant with no other
+// method-version literal in the file.
 import assert from "node:assert/strict";
 import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -16,6 +18,8 @@ export const V12_DOMAIN_METHOD_SOURCES = Object.freeze({
   postgres: Object.freeze({ file: "src/postgres-typed-v12-domain.ts", identifier: "DOMAIN_METHOD_VERSION", exported: false }),
 });
 const METHOD_VALUE = /^v12-complete-domain-[1-9][0-9]*$/u;
+const METHOD_LITERAL = /["'`]v12-complete-domain-[^"'`\n]*["'`]/gu;
+const METHOD_KEY = /\bmethod\s*:\s*([^,\n}]+?)\s*(?=[,\n}])/gu;
 
 function methodLiteral(source, { file, identifier, exported }) {
   const declarations = [...source.matchAll(new RegExp(`\\b(?:const|let|var)\\s+${identifier}\\b`, "gu"))];
@@ -26,6 +30,14 @@ function methodLiteral(source, { file, identifier, exported }) {
   assert.match(value, METHOD_VALUE, `${file} ${identifier} is not a v1.2 domain method version`);
   // A second copy of the value would let a code path bypass the constant.
   assert.equal(source.split(`"${value}"`).length - 1, 1, `${file} repeats the ${value} literal outside ${identifier}`);
+  // So would a literal naming any other method version.
+  const methodLiterals = source.match(METHOD_LITERAL) ?? [];
+  assert.equal(methodLiterals.length, 1,
+    `${file} has ${methodLiterals.length} v1.2 domain method literals (${methodLiterals.join(", ")}); only ${identifier} may name one`);
+  // The fingerprint must hash the constant, not an inline or derived value.
+  const methodKeys = [...source.matchAll(METHOD_KEY)].map((match) => match[1]);
+  assert.ok(methodKeys.length >= 1 && methodKeys.every((key) => key === identifier),
+    `${file} fingerprint must hash method: ${identifier} (found ${methodKeys.map((key) => `method: ${key}`).join(", ") || "none"})`);
   return value;
 }
 
@@ -79,4 +91,22 @@ test("a doctored copy with a duplicated declaration or literal fails", async (t)
     return `${source}\nconst SHADOW_METHOD = "${value}";\n`;
   });
   await assert.rejects(assertV12DomainMethodParity(repeated), /repeats the v12-complete-domain-\d+ literal/u);
+});
+
+test("a doctored copy whose fingerprint hashes an inline method literal fails", async (t) => {
+  for (const declaration of Object.values(V12_DOMAIN_METHOD_SOURCES)) {
+    const root = await doctoredCopy(t, declaration.file, (source) =>
+      source.replace(`method: ${declaration.identifier},`, 'method: "v12-complete-domain-1",'));
+    await assert.rejects(assertV12DomainMethodParity(root),
+      new RegExp(`${declaration.file.replaceAll(".", "\\.")} has 2 v1\\.2 domain method literals`, "u"));
+  }
+});
+
+test("a doctored copy whose fingerprint no longer uses the declared constant fails", async (t) => {
+  for (const declaration of Object.values(V12_DOMAIN_METHOD_SOURCES)) {
+    const root = await doctoredCopy(t, declaration.file, (source) =>
+      source.replace(`method: ${declaration.identifier},`, `method: LEGACY_${declaration.identifier},`));
+    await assert.rejects(assertV12DomainMethodParity(root),
+      new RegExp(`fingerprint must hash method: ${declaration.identifier} \\(found method: LEGACY_`, "u"));
+  }
 });

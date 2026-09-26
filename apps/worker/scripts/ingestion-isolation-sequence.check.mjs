@@ -3,10 +3,11 @@
 // `INSERT INTO d1_storage_migrations(name,sha256)` row in one submission).
 // A renumbered, relabelled or edited file would therefore let a ledger row name
 // SQL it never ran. This check pins the applied and authorized sequence, models
-// the bare-name ledger rows the operator writes, and proves on the synthetic
-// canonical D1 that main's empty-day rebuild (0012) runs before the GCP-line
-// quarantine fence (0013) and v1.2 retained-history transfer (0014), whose
-// triggers must survive it, and that participant erasure still cascades.
+// the ledger rows by rendering the operator's own submission template, and
+// proves on the synthetic canonical D1 that main's empty-day rebuild (0012) runs
+// before the GCP-line quarantine fence (0013) and v1.2 retained-history
+// transfer (0014), whose triggers must survive it, and that participant erasure
+// still cascades. 0014 also needs baseline 0063, which GitHub main lacks.
 import assert from "node:assert/strict";
 import { cp, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
@@ -21,9 +22,12 @@ import { TYPED_FORWARD_MIGRATIONS } from "./typed-forward-migration.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ISOLATION = "ingestion-isolation-migrations";
+const STORAGE_OPERATOR = "scripts/d1-storage-wrangler.mjs";
 // d1-storage-wrangler.mjs refuses any other migration name.
 const STORAGE_MIGRATION_NAME = /^\d{4}_[a-z0-9_-]+\.sql$/u;
-const LEDGER_SCHEMA_SQL = "CREATE TABLE d1_storage_migrations (name TEXT PRIMARY KEY NOT NULL, sha256 TEXT NOT NULL CHECK(length(sha256)=64)) STRICT";
+const OPERATOR_NAME_GUARD = String.raw`!/^\d{4}_[a-z0-9_-]+\.sql$/.test(migration.name)`;
+const OPERATOR_LEDGER_LINE = "const LEDGER = `${LEDGER_SCHEMA_SQL.replace('CREATE TABLE ', 'CREATE TABLE IF NOT EXISTS ')};`;";
+const OPERATOR_INTERPOLATIONS = Object.freeze(["LEDGER", "migration.sql", "migration.name", "migration.sha256"]);
 
 // 0001-0012 are GitHub main's files (0012 is the production empty-day hotfix,
 // 906dea97); 0013 and 0014 are the GCP line's quarantine fence and v1.2
@@ -57,6 +61,14 @@ export const RETIRED_ISOLATION_NAMES = Object.freeze([
   ["0012", "v12_quarantine_admission"],
   ["0013", "accountless_history_transfer_v12"],
 ].map(([number, stem]) => `${number}_${stem}.sql`));
+
+// Isolation files that need a baseline (Wrangler d1_migrations) file first.
+// 0014 re-creates the retained-history transfer view that baseline 0063
+// creates, and GitHub main's baseline ends at 0062, so the production ledger's
+// d1_migrations must be read back for 0063 before 0014 is applied.
+export const ISOLATION_BASELINE_PREREQUISITES = Object.freeze({
+  "0014_accountless_history_transfer_v12.sql": Object.freeze(["0063_accountless_history_transfer_source.sql"]),
+});
 
 const QUARANTINE_TRIGGER = Object.freeze({ table: "telemetry_v12_chunks", name: "telemetry_v12_chunk_quarantine_admission" });
 const TRANSFER_TRIGGERS = Object.freeze(["grant", "head", "domain"].flatMap((kind) =>
@@ -122,23 +134,58 @@ export async function readActivationPrimaryPins(workerRoot = WORKER_ROOT) {
 }
 
 /**
+ * The exact SQL submission d1-storage-wrangler.mjs migrate() sends for one
+ * storage file, read from the operator's source rather than restated here, so
+ * a change to how the operator names its ledger rows reaches this model.
+ */
+export async function readOperatorLedgerSubmission(workerRoot = WORKER_ROOT) {
+  const source = await readFile(join(workerRoot, STORAGE_OPERATOR), "utf8");
+  const ddl = [...source.matchAll(/^const LEDGER_SCHEMA_SQL = '([^'\n]+)';$/gmu)];
+  assert.equal(ddl.length, 1, `${STORAGE_OPERATOR} must declare LEDGER_SCHEMA_SQL once`);
+  assert.equal(source.split(OPERATOR_LEDGER_LINE).length - 1, 1, `${STORAGE_OPERATOR} LEDGER is not the IF NOT EXISTS ledger DDL`);
+  const migrate = [...source.matchAll(/^ {4}async migrate\(target, migration\) \{\n([\s\S]*?)\n {4}\},$/gmu)];
+  assert.equal(migrate.length, 1, `${STORAGE_OPERATOR} migrate() not found`);
+  assert.ok(migrate[0][1].includes(OPERATOR_NAME_GUARD), `${STORAGE_OPERATOR} migrate() no longer refuses a non-bare migration name`);
+  const submissions = [...migrate[0][1].matchAll(/\bimportFile\(target, `([^`]*)`\);/gu)];
+  assert.equal(submissions.length, 1, `${STORAGE_OPERATOR} migrate() must send exactly one file submission`);
+  const template = submissions[0][1];
+  const parts = template.split(/\$\{([^}]*)\}/u);
+  const literals = parts.filter((_, index) => index % 2 === 0);
+  const expressions = parts.filter((_, index) => index % 2 === 1);
+  for (const expression of expressions) {
+    assert.ok(OPERATOR_INTERPOLATIONS.includes(expression),
+      `${STORAGE_OPERATOR} migrate() interpolates \${${expression}}, which the bare-name ledger model does not know`);
+  }
+  for (const literal of literals) {
+    assert.ok(!/\\(?!n)/u.test(literal), `${STORAGE_OPERATOR} migrate() uses an escape other than \\n`);
+  }
+  const ledger = `${ddl[0][1].replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")};`;
+  return (migration) => parts.map((part, index) => {
+    if (index % 2 === 0) return part.replaceAll("\\n", "\n");
+    return part === "LEDGER" ? ledger : migration[part.slice("migration.".length)];
+  }).join("");
+}
+
+/**
  * A D1 primary role rebuilt as production applies it: the Wrangler baseline
- * into d1_migrations, then each storage file together with its bare-name
- * d1_storage_migrations row in one submission.
+ * into d1_migrations, then each storage file as the operator's one submission
+ * (the file and its d1_storage_migrations row). A refused step names its file.
  */
 export async function buildBareNameLedgerModel(workerRoot = WORKER_ROOT) {
   const rows = await assertIngestionIsolationSequence(workerRoot);
+  const submission = await readOperatorLedgerSubmission(workerRoot);
   const database = new DatabaseSync(":memory:");
+  let current;
   try {
     database.exec("PRAGMA foreign_keys=ON; CREATE TABLE d1_migrations(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)");
     for (const row of rows) {
+      current = row;
       database.exec("BEGIN");
       if (row.directory === "migrations") {
         database.exec(row.sql);
         database.prepare("INSERT INTO d1_migrations(name) VALUES (?)").run(row.name);
       } else {
-        database.exec(`${LEDGER_SCHEMA_SQL.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")};\n${row.sql}\n`
-          + `INSERT INTO d1_storage_migrations(name,sha256) VALUES('${row.name}','${row.sha256}');`);
+        database.exec(submission({ name: row.name, sha256: row.sha256, sql: row.sql }));
       }
       database.exec("COMMIT");
     }
@@ -146,7 +193,8 @@ export async function buildBareNameLedgerModel(workerRoot = WORKER_ROOT) {
   } catch (error) {
     if (database.isTransaction) database.exec("ROLLBACK");
     database.close();
-    throw error;
+    if (error?.code === "ERR_ASSERTION" || !current) throw error;
+    throw new Error(`${current.directory}/${current.name} was refused: ${error.message}`, { cause: error });
   }
 }
 
@@ -166,6 +214,13 @@ export async function assertLedgerPinsResolve(database, workerRoot = WORKER_ROOT
   }
   for (const pin of TYPED_FORWARD_MIGRATIONS.filter((migration) => migration.role === "primary")) {
     assert.equal(ledger.get(pin.name), pin.sha256, `forward-operator pin ${pin.name} does not match its ledger row`);
+  }
+  for (const [name, baselines] of Object.entries(ISOLATION_BASELINE_PREREQUISITES)) {
+    if (!ledger.has(name)) continue;
+    for (const baseline of baselines) {
+      assert.equal(database.prepare("SELECT count(*) AS n FROM d1_migrations WHERE name = ?").get(baseline).n, 1,
+        `ledger row ${name} is present without its baseline prerequisite ${baseline}`);
+    }
   }
   return [...ledger.keys()];
 }
@@ -204,7 +259,9 @@ async function withDoctoredCopy(t, doctor) {
   for (const directory of TYPED_SCHEMA_INPUT_DIRECTORIES.primary) {
     await cp(join(WORKER_ROOT, directory), join(root, directory), { recursive: true });
   }
-  await cp(join(WORKER_ROOT, "src/telemetry-runtime-activation.ts"), join(root, "src/telemetry-runtime-activation.ts"));
+  for (const file of ["src/telemetry-runtime-activation.ts", STORAGE_OPERATOR]) {
+    await cp(join(WORKER_ROOT, file), join(root, file));
+  }
   await doctor(root);
   return root;
 }
@@ -228,8 +285,41 @@ test("bare-name ledger rows resolve every activation and forward-operator pin", 
   assert.equal(ordered.indexOf("0013_v12_quarantine_admission.sql"), hotfix + 1);
   assert.equal(ordered.indexOf("0014_accountless_history_transfer_v12.sql"), hotfix + 2);
   assert.ok((await readActivationPrimaryPins()).some((pin) => pin.name === "0013_v12_quarantine_admission.sql"));
+  assert.ok(ordered.every((name) => STORAGE_MIGRATION_NAME.test(name)), "a d1_storage_migrations row is not a bare name");
   assertIsolationTriggersPresent(database, await readPrimaryLedgerRows());
   assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+});
+
+test("the ledger model follows the operator's submission, not a copy of it", async (t) => {
+  const qualified = await withDoctoredCopy(t, async (copy) => {
+    const file = join(copy, STORAGE_OPERATOR);
+    const source = await readFile(file, "utf8");
+    assert.ok(source.includes("VALUES('${migration.name}',"));
+    await writeFile(file, source.replace("VALUES('${migration.name}',", "VALUES('${migration.directory}/${migration.name}',"));
+  });
+  await assert.rejects(buildBareNameLedgerModel(qualified), /interpolates \$\{migration\.directory\}/u);
+  const prefixed = await withDoctoredCopy(t, async (copy) => {
+    const file = join(copy, STORAGE_OPERATOR);
+    const source = await readFile(file, "utf8");
+    await writeFile(file, source.replace("VALUES('${migration.name}',", `VALUES('${ISOLATION}/\${migration.name}',`));
+  });
+  const database = await buildBareNameLedgerModel(prefixed);
+  t.after(() => database.close());
+  await assert.rejects(assertLedgerPinsResolve(database, prefixed), /activation pin \S+ does not match its ledger row/u);
+});
+
+test("0014 needs baseline 0063, which GitHub main's baseline (0001-0062) lacks", async (t) => {
+  const [[name, [baseline]]] = Object.entries(ISOLATION_BASELINE_PREREQUISITES);
+  const mainBaseline = await withDoctoredCopy(t, (copy) => rm(join(copy, "migrations", baseline)));
+  // Every earlier file, 0013 included, applies on main's baseline; 0014's first
+  // statement is refused, so its submission changes nothing.
+  await assert.rejects(buildBareNameLedgerModel(mainBaseline),
+    new RegExp(`^Error: ${ISOLATION}/${name.replace(".", "\\.")} was refused: no such view: accountless_history_transfer_candidates`, "u"));
+  const database = await buildBareNameLedgerModel();
+  t.after(() => database.close());
+  database.prepare("DELETE FROM d1_migrations WHERE name = ?").run(baseline);
+  await assert.rejects(assertLedgerPinsResolve(database),
+    new RegExp(`ledger row ${name.replace(".", "\\.")} is present without its baseline prerequisite`, "u"));
 });
 
 test("the synthetic canonical D1 runs 0012, 0013, 0014 in order and keeps every trigger", async (t) => {

@@ -479,7 +479,8 @@ policy-blocked, and none of those formats has a qualified hosted route.
 The v1.2 parity audit found that PostgreSQL had rejected an exact chunk retry
 after the manifest became ready, while D1 returned a replay receipt. The
 admission adapter now accepts that exact replay and still refuses changed or
-undeclared chunks. It used to reject empty manifests as D1 does; it now
+undeclared chunks. It used to reject empty manifests, as D1 did before
+isolation `0012`; it now
 registers an empty day as ready, because a complete v1.2 domain includes days
 without records (see the v1.2-only follow-up below). A PostgreSQL
 17 regression test passes for those cases. The PostgreSQL effective reader now
@@ -601,7 +602,11 @@ admission, missing/mismatched/deleting registrations and transaction rollback.
 Usage activation pins the migration ledger hash and trigger. The historical
 source-pinned migration operator ends at `0009`; `0013` needs a separately
 reviewed forward application and receipt after `0009`–`0012` in the ordered D1
-stream. This line has not changed the production D1 schema.
+stream. `0014` also needs baseline `0063`, which GitHub `main` does not carry.
+Once any of `0063`, `0013` or `0014` is applied, `main`'s guarded typed deploy
+refuses the schema; the
+[production operations runbook](../runbooks/production-operations.md) sets the
+order. This line has not changed the production D1 schema.
 
 The v1.2-only follow-up to that merge (local source and tests, 2026-09-25)
 drove the shipped client over the real D1 routes and the PostgreSQL dispatch
