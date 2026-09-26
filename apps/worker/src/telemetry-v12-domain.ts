@@ -13,7 +13,9 @@ import {
   type TelemetryTransportPrincipal,
 } from "./telemetry-transport-policy";
 
-export const V12_DOMAIN_METHOD_VERSION = "v12-complete-domain-1";
+// Version 2 pins only the predecessor state, not the device's ready manifests;
+// see createTelemetryV12DomainPredecessor.
+export const V12_DOMAIN_METHOD_VERSION = "v12-complete-domain-2";
 const DAY_MS = 86_400_000;
 const PREDECESSOR_TTL_MS = 24 * 60 * 60 * 1_000;
 
@@ -105,19 +107,27 @@ export async function createTelemetryV12DomainPredecessor(
     if (!byDay.has(manifest.chunk_day)) byDay.set(manifest.chunk_day, manifest);
   }
   const days = [...byDay.values()].sort((left, right) => left.chunk_day.localeCompare(right.chunk_day));
-  if (days.length < 1) throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
-  const fromDay = days[0]!.chunk_day;
-  const throughDay = days.at(-1)!.chunk_day;
+  // The shipped client asks for this predecessor before it registers any day,
+  // so a device's first closure has no ready manifest yet. Seed that range
+  // with the current UTC day, as the v1.1 predecessor does, instead of
+  // refusing; activation still requires at least one ready day. Once any
+  // manifest is ready the range is exactly its ready days, as before.
+  const fromDay = days[0]?.chunk_day ?? new Date(nowEpoch).toISOString().slice(0, 10);
+  const throughDay = days.at(-1)?.chunk_day ?? fromDay;
   if ((Date.parse(throughDay) - Date.parse(fromDay)) / DAY_MS + 1 > MAX_TELEMETRY_V12_DOMAIN_DAYS) {
     throw new ApiError(400, "SYNC_RANGE_TOO_LARGE");
   }
+  // The fingerprint pins the predecessor state only. The client re-reads this
+  // predecessor after staging its own days (always when it keeps a progress
+  // journal) and stops if the fingerprint changed, so it must not move just
+  // because this run's own manifests became ready. Coverage of every ready day
+  // is still enforced by the range checked at activation.
   const legacyFingerprint = await sha256Hex(canonicalJson({
     method: V12_DOMAIN_METHOD_VERSION,
     participantId: principal.participantId,
     inputRevision: state.input_revision,
     previousGenerationId: state.generation_id,
     previousManifestDigest: state.manifest_digest,
-    manifests: days,
   }));
   const token = crypto.randomUUID();
   const tokenHash = await sha256Hex(token);

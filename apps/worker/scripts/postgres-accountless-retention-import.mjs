@@ -458,6 +458,13 @@ function normalizeSourceRow(value) {
   same(grant.deviceCredentialId, normalizedMarker.deviceCredentialId);
   same(grant.state, "revoked");
   same(grant.revocationReason, "user_opt_out");
+  // D1 isolation 0013 captures a v1.2-only opt-out marker with its successor
+  // grant in these fields. No PostgreSQL import path proves that lineage yet,
+  // so refuse it by name instead of reporting a damaged v1.1 proof. The whole
+  // run stops; a retained marker is never skipped.
+  if (grant.telemetrySchemaVersion === "telemetry-contribution-v1.2") {
+    fail("ACCOUNTLESS_RETENTION_SUCCESSOR_MARKER_UNSUPPORTED");
+  }
   same(grant.telemetrySchemaVersion, "telemetry-contribution-v1.1");
   same(grant.fieldDictionaryVersion, "telemetry-v1.1-registry-2026-08-31.1");
   same(grant.privacyContractVersion, "ongoing-privacy-safe-telemetry-v1.1");

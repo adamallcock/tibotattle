@@ -317,6 +317,11 @@ async function readCapabilitiesRow(
         AND accountless.device_credential_id = device.id
         AND accountless.enrollment_device_id = owner.enrollment_device_id
         AND ledger.device_id IS NOT NULL
+        -- The write gate and active-authorization view require the grant to
+        -- share the lease expiry, so a grant left behind by the lease is not
+        -- reported as current either; the client then asks for it again and
+        -- the grant request catches it up (D1 parity).
+        AND accountless.expires_at = ledger.expires_at
       WHERE participant.id = $1 AND participant.state = 'active'
         AND device.id = $2 AND device.state = 'active' AND device.expires_at > $3::timestamptz`,
     [participantId, deviceId, now],

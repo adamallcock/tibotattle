@@ -407,13 +407,22 @@ test("PostgreSQL normalized telemetry v1.2 migrates forward from primary version
       manifestDigest: "0".repeat(64),
     };
     emptyManifest.manifestDigest = await modules.sha256Hex(telemetryV12DayManifestDigestInput(emptyManifest));
-    await assert.rejects(
-      admission.registerPostgresTypedV12DayManifest(
-        pool, admitted.principal, emptyManifest, nowEpoch, options,
-      ),
-      (error) => error?.code === "TELEMETRY_MANIFEST_INVALID",
-      "empty manifests must be rejected before PostgreSQL admission",
+    // A complete domain includes days with no admitted records; the shipped
+    // client registers one for every day in its range. Register it after the
+    // admitted day so the earliest ready manifest for this day is unchanged.
+    const emptyCandidate = await admission.registerPostgresTypedV12DayManifest(
+      pool, admitted.principal, emptyManifest, nowEpoch + 1_000, options,
     );
+    assert.deepEqual({ state: emptyCandidate.state, expectedChunks: emptyCandidate.expectedChunks },
+      { state: "ready", expectedChunks: 0 }, "an empty day is complete, and ready, at registration");
+    assert.equal((await admission.registerPostgresTypedV12DayManifest(
+      pool, admitted.principal, emptyManifest, nowEpoch + 2_000, options,
+    )).manifestId, emptyCandidate.manifestId, "an empty day replays its exact registration");
+    const emptyChunks = await pool.query(
+      `SELECT count(*)::integer AS count FROM "${schema}"."telemetry_v12_chunks" WHERE manifest_id=$1`,
+      [emptyCandidate.manifestId],
+    );
+    assert.equal(emptyChunks.rows[0]?.count, 0);
 
     const domainStore = createPostgresTypedV12Domain(pool, options);
     const predecessor = await domainStore.createPredecessor(admitted.principal, nowEpoch);

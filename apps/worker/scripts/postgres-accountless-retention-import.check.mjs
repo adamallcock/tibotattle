@@ -505,7 +505,7 @@ test("source mapping is one-to-one and rejects any v1.2 or terminal/partial auth
   const v12 = structuredClone(one);
   v12.source.grant.telemetrySchemaVersion = "telemetry-contribution-v1.2";
   assert.throws(() => createSyntheticAccountlessRetentionSource({ rows: [v12] }), {
-    code: "ACCOUNTLESS_RETENTION_SOURCE_AUTHORITY_MISMATCH",
+    code: "ACCOUNTLESS_RETENTION_SUCCESSOR_MARKER_UNSUPPORTED",
   });
   const terminal = structuredClone(one);
   terminal.source.owner.revocationReason = "security_reset";

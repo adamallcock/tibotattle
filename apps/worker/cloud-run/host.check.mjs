@@ -40,6 +40,9 @@ import {
 } from "./request-boundary.mjs";
 import { createFilesystemAssets } from "./assets.mjs";
 import { nodeTimingSafeEqual } from "./node-crypto-adapter.mjs";
+// The shipped desktop client itself, so the dispatch is exercised in the
+// client's request order rather than a hand-assembled sequence.
+import { runTelemetryV12Sync } from "../../../src/contribution/telemetry-v12-sync.js";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PG_TEST_HOST = process.env.PG_TEST_HOST;
@@ -105,6 +108,40 @@ function hostV12UsageRecord(eventId, eventTime) {
     tieOrder: null,
     cacheWriteTtl: null,
   };
+}
+
+/** One deterministic local v1.2 day as the desktop reader returns it. A day
+ * without records is a complete manifest with no chunks. */
+function hostV12ClientDay(day, count, parserVersion) {
+  const consent = telemetryV12RequiredConsent();
+  const records = Array.from({ length: count }, (_, index) => hostV12UsageRecord(
+    `event:v2:${sha256Hex(`host-v12-client:${day}:${index}`)}`,
+    `${day}T12:${String(10 + index).padStart(2, "0")}:00.000Z`,
+  ));
+  const chunks = count === 0 ? [] : [{
+    schemaVersion: TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+    manifestDigest: "0".repeat(64),
+    chunkId: `usage:${day}:0`,
+    chunkRevision: 1,
+    chunkDigest: sha256Hex(Buffer.from(canonicalTelemetryV12Json(records))),
+    parserVersion,
+    consent,
+    records,
+  }];
+  const manifest = {
+    schemaVersion: "telemetry-day-manifest-v1.2",
+    day,
+    parserVersion,
+    consent,
+    chunks: chunks.map((chunk) => ({
+      chunkId: chunk.chunkId, chunkDigest: chunk.chunkDigest, recordCount: chunk.records.length,
+    })),
+    excluded: { quota: 0, session: 0, usage: 0 },
+    manifestDigest: "0".repeat(64),
+  };
+  manifest.manifestDigest = sha256Hex(Buffer.from(telemetryV12DayManifestDigestInput(manifest)));
+  for (const chunk of chunks) chunk.manifestDigest = manifest.manifestDigest;
+  return { manifest, chunks };
 }
 
 async function encryptHostV12(value, publicJwk, keyId) {
@@ -2927,9 +2964,16 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     await assertApiError(await dispatch(request({ url: chunkUploadUrl, body: " ".repeat(constants.MAX_REQUEST_BYTES + 1) })), 413, "BODY_TOO_LARGE");
     await assertApiError(await dispatch(request({ url: chunkUploadUrl, headers: { cookie: "session=not-used" } })), 401, "DEVICE_AUTH_INVALID");
     await assertApiError(await dispatch(request({ body: "{}" })), 400, "TELEMETRY_MANIFEST_INVALID");
-    await assertApiError(await dispatch(request({
+    // The shipped client asks for its predecessor before it registers any
+    // day. With nothing ready yet the range is seeded with the current day.
+    const bootstrapPredecessorResponse = await dispatch(request({
       url: domainPredecessorUrl, body: "{}",
-    })), 409, "TELEMETRY_MANIFEST_INCOMPLETE");
+    }));
+    assert.equal(bootstrapPredecessorResponse.status, 201);
+    const bootstrapPredecessor = await bootstrapPredecessorResponse.json();
+    assert.equal(bootstrapPredecessor.previousGenerationId, null);
+    assert.equal(bootstrapPredecessor.fromDay, new Date().toISOString().slice(0, 10));
+    assert.equal(bootstrapPredecessor.throughDay, bootstrapPredecessor.fromDay);
 
     await primaryPool.query(
       `UPDATE ${primaryTable("collection_controls")}
@@ -3357,6 +3401,8 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     assert.match(predecessor.token, /^[0-9a-f-]{36}$/u);
     assert.equal(predecessor.previousGenerationId, null);
     assert.match(predecessor.legacyFingerprint, /^[0-9a-f]{64}$/u);
+    assert.equal(predecessor.legacyFingerprint, bootstrapPredecessor.legacyFingerprint,
+      "the pin does not move because this device's own day became ready");
     assert.equal(predecessor.fromDay, uploadDay);
     assert.equal(predecessor.throughDay, uploadDay);
     assert.ok(Date.parse(predecessor.expiresAt) > Date.now());
@@ -3482,9 +3528,11 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       revision: "1",
       manifest_digest: domainManifest.manifestDigest,
     }]);
+    // The earlier bootstrap predecessor stays outstanding until it expires;
+    // only the token the activation presented is consumed.
     const consumedPredecessor = await primaryPool.query(
       `SELECT token_hash, consumed_at FROM ${primaryTable("telemetry_v12_domain_predecessors")}
-        WHERE participant_id=$1 AND device_id=$2`,
+        WHERE participant_id=$1 AND device_id=$2 AND consumed_at IS NOT NULL`,
       [participantId, deviceId],
     );
     assert.equal(consumedPredecessor.rowCount, 1);
@@ -3801,11 +3849,21 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     ]);
     assert.equal(accountlessCapabilities.formats.length, 4,
       "the legacy accountless response must not expose the separate v1.2 format");
-    await assertApiError(await dispatch(request({
+    // Before it holds a v1.2 grant the install can still read the successor
+    // capability; that is how the shipped client learns to request the grant
+    // (D1 parity). It reports the grant as not current.
+    const ungrantedV12Response = await dispatch(request({
       url: syncCapabilitiesV12Url,
       method: "GET",
       headers: { authorization: accountlessAuth },
-    })), 401, "DEVICE_AUTH_INVALID");
+    }));
+    assert.equal(ungrantedV12Response.status, 200,
+      JSON.stringify(await ungrantedV12Response.clone().json()));
+    const ungrantedV12 = await ungrantedV12Response.json();
+    assert.equal(ungrantedV12.authorityKind, "accountless");
+    assert.equal(ungrantedV12.successor.consentCurrent, false);
+    assert.equal(ungrantedV12.successor.authorizationCurrent, false);
+    assert.equal(ungrantedV12.successor.activationTime, null);
     await primaryPool.query(
       `UPDATE ${primaryTable("accountless_v11_device_authorizations")}
           SET state='revoked', revoked_at=$2, revocation_reason='synthetic-test'
@@ -3962,6 +4020,71 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     assert.equal(uploadAuthorizationReceipt.status, 201,
       "an active accountless v1.2 grant admits upload authorization in PostgreSQL");
 
+    // The shipped client on this v1.2-only install, which has never uploaded:
+    // predecessor first, then every day in its range, including a day with no
+    // records, then activation. It keeps a progress journal like the desktop.
+    const clientParser = "synthetic-host-v12-accountless-client";
+    const clientDay = (offset) => new Date(Date.now() + offset * 86_400_000).toISOString().slice(0, 10);
+    const clientRecords = new Map([[clientDay(-2), 1], [clientDay(0), 2]]);
+    let clientJournal = null;
+    const runAccountlessClient = async (label) => {
+      const exchanges = [];
+      const result = await runTelemetryV12Sync({
+        serverBaseUrl: "http://127.0.0.1:43817",
+        deviceAuthorization: accountlessAuth,
+        laboratory: true,
+        authorization: accountlessV12Body,
+        days: [...clientRecords.keys()].sort(),
+        readDay: (day) => hostV12ClientDay(day, clientRecords.get(day) ?? 0, clientParser),
+        createEnvelope: (chunk) => encryptHostV12(chunk, envelopePublicJwk, envelopePublicJwk.kid),
+        progressStore: {
+          read: async () => clientJournal,
+          write: async (value) => { clientJournal = value; },
+        },
+        sourcePublication: { fingerprint: `host-v12-client-${label}`, parserVersion: clientParser },
+        fetchImpl: async (url, init) => {
+          const response = await dispatch(new Request(url, init));
+          exchanges.push({ path: new URL(url).pathname, status: response.status,
+            body: await response.clone().json() });
+          return response;
+        },
+      });
+      return { result, exchanges };
+    };
+    const firstClientRun = await runAccountlessClient("first");
+    assert.deepEqual(firstClientRun.exchanges.filter((exchange) => exchange.status >= 400), []);
+    assert.equal(firstClientRun.result.status, "complete", JSON.stringify(firstClientRun.result));
+    assert.equal(firstClientRun.result.failure, null);
+    assert.equal(firstClientRun.result.daysSynced, 3);
+    assert.equal(firstClientRun.result.chunksUploaded, 2);
+    assert.equal(firstClientRun.result.acknowledgedThroughDay, clientDay(0));
+    assert.equal(clientJournal, null);
+    const firstClientPins = firstClientRun.exchanges
+      .filter((exchange) => exchange.path === "/api/v1/me/telemetry-v12/domain-predecessor")
+      .map((exchange) => exchange.body);
+    assert.equal(firstClientPins.length, 2);
+    assert.deepEqual([firstClientPins[0].fromDay, firstClientPins[0].throughDay], [clientDay(0), clientDay(0)]);
+    assert.equal(firstClientPins[1].legacyFingerprint, firstClientPins[0].legacyFingerprint);
+    const clientDomain = await primaryPool.query(
+      `SELECT head.revision::integer AS revision, domain.device_id,
+              to_char(domain.from_day, 'YYYY-MM-DD') AS from_day,
+              to_char(domain.through_day, 'YYYY-MM-DD') AS through_day,
+              (SELECT count(*)::integer FROM ${primaryTable("telemetry_v12_domain_days")} day_row
+                JOIN ${primaryTable("telemetry_v12_day_manifests")} manifest ON manifest.id = day_row.manifest_id
+               WHERE day_row.generation_id = domain.id AND manifest.state = 'ready'
+                 AND manifest.expected_chunk_count = 0) AS empty_days,
+              (SELECT count(*)::integer FROM ${primaryTable("telemetry_v11_domains")} legacy
+                WHERE legacy.participant_id = head.participant_id) AS v11_domains
+         FROM ${primaryTable("telemetry_v12_domain_heads")} head
+         JOIN ${primaryTable("telemetry_v12_domains")} domain ON domain.id = head.generation_id
+        WHERE head.participant_id = $1`,
+      [accountlessParticipantId],
+    );
+    assert.deepEqual(clientDomain.rows, [{
+      revision: 1, device_id: accountlessDeviceId, from_day: clientDay(-2), through_day: clientDay(0),
+      empty_days: 1, v11_domains: 0,
+    }]);
+
     const renewalNow = Date.now();
     const dueIssuedAt = new Date(renewalNow - 29 * 24 * 60 * 60_000).toISOString();
     const dueExpiresAt = new Date(renewalNow + 24 * 60 * 60_000).toISOString();
@@ -4035,6 +4158,45 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     }));
     assert.equal(renewedUploadAuthorization.status, 201,
       "the exact active v1.2 authority remains usable after renewal");
+
+    // The shipped client uploads again under the renewed lease: the v1.2 grant
+    // moved with the lease, so it does not have to be requested again.
+    clientRecords.set(clientDay(0), 3);
+    const renewedClientRun = await runAccountlessClient("renewed");
+    assert.deepEqual(renewedClientRun.exchanges.filter((exchange) => exchange.status >= 400), []);
+    assert.equal(renewedClientRun.result.status, "complete", JSON.stringify(renewedClientRun.result));
+    assert.equal(renewedClientRun.result.chunksUploaded, 1);
+
+    // A grant left behind by the lease (as D1 grants were before isolation
+    // 0010) is reported as not current, and the next grant request catches it
+    // up to the lease instead of refusing it.
+    const readV12Capability = async () => {
+      const response = await dispatch(request({
+        url: syncCapabilitiesV12Url, method: "GET", headers: { authorization: accountlessAuth },
+      }));
+      assert.equal(response.status, 200);
+      return (await response.json()).successor.authorizationCurrent;
+    };
+    assert.equal(await readV12Capability(), true);
+    await primaryPool.query(
+      "UPDATE " + primaryTable("accountless_v12_device_authorizations")
+        + " SET expires_at = expires_at - interval '1 day' WHERE enrollment_device_id=$1",
+      [accountlessDeviceId],
+    );
+    assert.equal(await readV12Capability(), false,
+      "a stale v1.2 grant is not reported as current authority");
+    const caughtUpGrant = await dispatch(authorizationHttp(JSON.stringify(accountlessV12Body)));
+    assert.equal(caughtUpGrant.status, 201, JSON.stringify(await caughtUpGrant.clone().json()));
+    const caughtUpState = await primaryPool.query(
+      "SELECT grant_row.state, grant_row.expires_at = ledger.expires_at AS current FROM "
+        + primaryTable("accountless_v12_device_authorizations") + " grant_row JOIN "
+        + primaryTable("accountless_enrollment_ledger")
+        + " ledger ON ledger.device_id = grant_row.enrollment_device_id "
+        + "WHERE grant_row.enrollment_device_id=$1",
+      [accountlessDeviceId],
+    );
+    assert.deepEqual(caughtUpState.rows, [{ state: "active", current: true }]);
+    assert.equal(await readV12Capability(), true);
 
     const noV12DeviceId = randomUUID();
     const noV12Secret = randomBytes(32).toString("base64url");
@@ -4432,42 +4594,66 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
         priorControls.publication_enabled, priorControls.reason_code],
     );
 
-    // Simulate a persisted opt-out only after the explicit fail-closed route
-    // assertion. PostgreSQL still needs publication-withdrawal parity before
-    // accountless disconnect can be implemented as a write.
-    const optedOutAt = new Date().toISOString();
-    await primaryPool.query("BEGIN");
-    try {
-      const revocableTables = [
-        ["accountless_enrollment_ledger", "device_id"],
-        ["accountless_upload_owners", "enrollment_device_id"],
-        ["accountless_v11_device_authorizations", "enrollment_device_id"],
-        ["accountless_v12_device_authorizations", "enrollment_device_id"],
-      ];
-      for (const [name, idColumn] of revocableTables) {
-        await primaryPool.query(
-          "UPDATE " + primaryTable(name)
-            + " SET state='revoked', revoked_at=$2::timestamptz, revocation_reason='user_opt_out' "
-            + "WHERE " + idColumn + "=$1",
-          [accountlessDeviceId, optedOutAt],
-        );
-      }
-      await primaryPool.query(
-        "UPDATE " + primaryTable("device_credentials")
-          + " SET state='revoked', revoked_at=$2::timestamptz WHERE id=$1",
-        [accountlessDeviceId, optedOutAt],
-      );
-      await primaryPool.query(
-        "UPDATE " + primaryTable("device_upload_authorizations")
-          + " SET state='revoked', revoked_at=$2::timestamptz, consume_lease_expires_at=NULL "
-          + "WHERE issued_by_device_id=$1 AND state IN ('unused','consuming')",
-        [accountlessDeviceId, optedOutAt],
-      );
-      await primaryPool.query("COMMIT");
-    } catch (error) {
-      await primaryPool.query("ROLLBACK");
-      throw error;
-    }
+    // The v1.2-only install above (no v1.1 domain) opts out through the real
+    // route. Its eligible accepted v1.2 head is retained (D1 isolation 0011,
+    // PostgreSQL 0045) and the successor grant is revoked with the whole
+    // lease graph at the marker's instant.
+    const v12OnlyHead = await primaryPool.query(
+      "SELECT generation_id, revision::integer AS revision FROM "
+        + primaryTable("telemetry_v12_domain_heads") + " WHERE participant_id=$1",
+      [accountlessParticipantId],
+    );
+    assert.equal(v12OnlyHead.rowCount, 1);
+    // The guard pins the exact accepted head: any other revision is refused.
+    await assert.rejects(primaryPool.query(
+      "INSERT INTO " + primaryTable("accountless_public_history_retention")
+        + " (participant_id, enrollment_device_id, device_credential_id, generation_id,"
+        + " head_revision, retained_at) VALUES ($1,$2,$2,$3,$4,clock_timestamp())",
+      [accountlessParticipantId, accountlessDeviceId, v12OnlyHead.rows[0].generation_id,
+        v12OnlyHead.rows[0].revision + 1],
+    ), /accountless_history_retention_unavailable/u);
+    const v12OnlyOptOut = await dispatch(disconnectRequest({ authorization: accountlessAuth }));
+    assert.equal(v12OnlyOptOut.status, 200, JSON.stringify(await v12OnlyOptOut.clone().json()));
+    const v12OnlyMarker = await primaryPool.query(
+      "SELECT generation_id, head_revision::integer AS head_revision, retained_at::text AS retained_at FROM "
+        + primaryTable("accountless_public_history_retention") + " WHERE enrollment_device_id=$1",
+      [accountlessDeviceId],
+    );
+    assert.deepEqual(v12OnlyMarker.rows.map(({ generation_id: generationId, head_revision: headRevision }) =>
+      ({ generationId, headRevision })), [{
+      generationId: v12OnlyHead.rows[0].generation_id, headRevision: v12OnlyHead.rows[0].revision,
+    }]);
+    const optedOutAt = v12OnlyMarker.rows[0].retained_at;
+    const readOptOutInstants = async () => (await primaryPool.query(
+      "SELECT ledger.revoked_at::text AS ledger, owner.revoked_at::text AS owner, "
+        + "v11.revoked_at::text AS v11, v12.revoked_at::text AS v12, "
+        + "v12.revocation_reason AS v12_reason, device.revoked_at::text AS device FROM "
+        + primaryTable("accountless_enrollment_ledger") + " ledger JOIN "
+        + primaryTable("accountless_upload_owners") + " owner ON owner.enrollment_device_id=ledger.device_id JOIN "
+        + primaryTable("accountless_v11_device_authorizations") + " v11 ON v11.enrollment_device_id=ledger.device_id JOIN "
+        + primaryTable("accountless_v12_device_authorizations") + " v12 ON v12.enrollment_device_id=ledger.device_id JOIN "
+        + primaryTable("device_credentials") + " device ON device.id=ledger.device_id WHERE ledger.device_id=$1",
+      [accountlessDeviceId],
+    )).rows;
+    assert.deepEqual(await readOptOutInstants(), [{
+      ledger: optedOutAt, owner: optedOutAt, v11: optedOutAt, v12: optedOutAt,
+      v12_reason: "user_opt_out", device: optedOutAt,
+    }]);
+    const v12OnlyReplay = await dispatch(disconnectRequest({ authorization: accountlessAuth }));
+    assert.equal(v12OnlyReplay.status, 200, "an exact retained v1.2 opt-out replays");
+    // An opt-out committed before the successor grant joined this transaction
+    // left it active. A replay revokes it at the ledger's own instant.
+    await primaryPool.query(
+      "UPDATE " + primaryTable("accountless_v12_device_authorizations")
+        + " SET state='active', revoked_at=NULL, revocation_reason=NULL WHERE enrollment_device_id=$1",
+      [accountlessDeviceId],
+    );
+    const repairedReplay = await dispatch(disconnectRequest({ authorization: accountlessAuth }));
+    assert.equal(repairedReplay.status, 200, JSON.stringify(await repairedReplay.clone().json()));
+    assert.deepEqual(await readOptOutInstants(), [{
+      ledger: optedOutAt, owner: optedOutAt, v11: optedOutAt, v12: optedOutAt,
+      v12_reason: "user_opt_out", device: optedOutAt,
+    }]);
     await assertApiError(await dispatch(enrollmentHttp()), 401, "ACCOUNTLESS_ENROLLMENT_REVOKED");
     await assertApiError(await dispatch(ownershipHttp(JSON.stringify(ownershipBody))),
       401, "ACCOUNTLESS_OWNERSHIP_REVOKED");

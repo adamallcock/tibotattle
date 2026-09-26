@@ -354,7 +354,7 @@ test("PG17 imports the verified D1 artifact through explicit mappings under migr
     assert.ok(String(locality.rows[0]?.version ?? "").startsWith("PostgreSQL 17."));
     await pool.query(`CREATE SCHEMA ${quoted}`); schemaCreated = true;
     const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
-    assert.equal(applied.applied, 44);
+    assert.equal(applied.applied, 45);
     await pool.query(`UPDATE ${quoted}.collection_controls SET revision=revision+1,
       control_state='degraded', enrollment_enabled=false, upload_registration_enabled=false,
       processing_enabled=false, publication_enabled=false, reason_code='synthetic-d1-import-test',
@@ -479,7 +479,7 @@ test("PG17 synthetic permit imports exact v1.1 retained markers in bounded repla
     await pool.query(`CREATE SCHEMA ${quoted}`);
     schemaCreated = true;
     const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
-    assert.equal(applied.applied, 44);
+    assert.equal(applied.applied, 45);
     await pool.query(`UPDATE ${quoted}.collection_controls SET revision=revision+1,
       control_state='degraded', enrollment_enabled=false, upload_registration_enabled=false,
       processing_enabled=false, publication_enabled=false, reason_code='synthetic-import-test',

@@ -130,7 +130,7 @@ function validEnv(mode, overrides = {}) {
 }
 
 function migrationFixtures() {
-  return Array.from({ length: 44 }, (_, index) => ({
+  return Array.from({ length: 45 }, (_, index) => ({
     role: "primary",
     version: index + 1,
     name: `${String(index + 1).padStart(4, "0")}_${index === 38
@@ -139,7 +139,8 @@ function migrationFixtures() {
           ? "accountless_history_retention" : index === 41
             ? "accountless_history_retention_import" : index === 42
               ? "accountless_history_d1_import" : index === 43
-                ? "accountless_import_claim_erasure" : `synthetic_migration_${index + 1}`}.sql`,
+                ? "accountless_import_claim_erasure" : index === 44
+                  ? "accountless_v12_history_retention" : `synthetic_migration_${index + 1}`}.sql`,
     sql: `-- migration ${index + 1}\n`,
     bytes: Buffer.byteLength(`-- migration ${index + 1}\n`),
     sha256: String(index + 1).padStart(64, "0"),
@@ -736,9 +737,9 @@ async function createDisposableSchema(pool, migrationRoot) {
 
 async function createPinnedMigrationRoot() {
   const current = await readPostgresMigrations({ role: "primary" });
-  const pinned = current.filter(migration => migration.version <= 44);
-  assert.equal(pinned.length, 44, "the A2 integration targets the current 44-migration manifest");
-  assert.equal(pinned.at(-1)?.name, "0044_accountless_import_claim_erasure.sql");
+  const pinned = current.filter(migration => migration.version <= 45);
+  assert.equal(pinned.length, 45, "the A2 integration targets the current 45-migration manifest");
+  assert.equal(pinned.at(-1)?.name, "0045_accountless_v12_history_retention.sql");
   const root = await mkdtemp(join(tmpdir(), `a2-daily-activation-${randomBytes(6).toString("hex")}-`));
   try {
     const directory = join(root, "primary");

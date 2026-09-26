@@ -27,7 +27,8 @@ import type {
 
 const DAY_MS = 86_400_000;
 const PREDECESSOR_TTL_MS = 24 * 60 * 60 * 1_000;
-const DOMAIN_METHOD_VERSION = "v12-complete-domain-1";
+// Must match the D1 V12_DOMAIN_METHOD_VERSION: both pin predecessor state only.
+const DOMAIN_METHOD_VERSION = "v12-complete-domain-2";
 const SHA256 = /^[0-9a-f]{64}$/u;
 const DAY = /^\d{4}-\d{2}-\d{2}$/u;
 
@@ -255,20 +256,26 @@ export function createPostgresTypedV12Domain(
           if (!byDay.has(row.chunk_day)) byDay.set(row.chunk_day, row);
         }
         const days = [...byDay.values()].sort((a, b) => a.chunk_day.localeCompare(b.chunk_day));
-        if (!days.length) throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
-        const fromDay = days[0]!.chunk_day;
-        const throughDay = days.at(-1)!.chunk_day;
+        // Same contract as the D1 predecessor: the shipped client asks for
+        // this before it registers any day, so a device's first closure is
+        // seeded with the current UTC day (v1.1 parity) instead of refused.
+        // With ready manifests the range is exactly their days, as before.
+        const fromDay = days[0]?.chunk_day ?? now.slice(0, 10);
+        const throughDay = days.at(-1)?.chunk_day ?? fromDay;
         if ((Date.parse(throughDay) - Date.parse(fromDay)) / DAY_MS + 1
             > MAX_TELEMETRY_V12_DOMAIN_DAYS) {
           throw new ApiError(400, "SYNC_RANGE_TOO_LARGE");
         }
+        // Pin predecessor state only. The client re-reads the predecessor
+        // after staging its own days and stops on a changed fingerprint, so
+        // this run's newly ready manifests must not move it. days_json still
+        // records the ready days for activation's same-day closure proof.
         const legacyFingerprint = await sha256Hex(canonicalJson({
           method: DOMAIN_METHOD_VERSION,
           participantId: principal.participantId,
           inputRevision: revision(state.input_revision),
           previousGenerationId: state.generation_id,
           previousManifestDigest: state.manifest_digest,
-          manifests: days,
         }));
         const token = crypto.randomUUID();
         const tokenHash = await sha256Hex(token);

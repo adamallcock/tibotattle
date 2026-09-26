@@ -377,7 +377,10 @@ export async function registerPostgresTypedV12DayManifest(
   } catch {
     throw new ApiError(400, "TELEMETRY_MANIFEST_INVALID");
   }
-  if (manifest.chunks.length < 1) throw new ApiError(400, "TELEMETRY_MANIFEST_INVALID");
+  // A complete v1.2 domain includes days without admitted records, and the
+  // shipped client registers every day in its range. The contract allows
+  // `chunks: []`; such a manifest is already complete, so it becomes ready at
+  // registration (as v1.1 does) and the ready-integrity trigger accepts it.
   if (!isTelemetryV12ConsentCurrent(manifest.consent)) throw new ApiError(403, "TELEMETRY_CONSENT_INVALID");
   const canonical = canonicalTelemetryV12Json(manifest);
   if (new TextEncoder().encode(canonical).byteLength > MAX_MANIFEST_BYTES
@@ -409,6 +412,12 @@ export async function registerPostgresTypedV12DayManifest(
          ON CONFLICT (participant_id, device_id, chunk_day, manifest_digest) DO NOTHING`,
         [id, principal.participantId, principal.deviceId, manifest.day, manifest.manifestDigest,
           manifest.parserVersion, canonical, manifest.chunks.length, now],
+      );
+      await client.query(
+        `UPDATE ${table(schema, "telemetry_v12_day_manifests")}
+            SET state = 'ready', ready_at = $2
+          WHERE id = $1 AND state = 'staged' AND expected_chunk_count = 0`,
+        [id, now],
       );
       const stored = await client.query<ManifestRow>(
         `SELECT id, chunk_day, manifest_digest, expected_chunk_count, parser_version, state, manifest_json, ready_at

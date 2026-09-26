@@ -142,11 +142,15 @@ export interface ReadPostgresCommunityDailyDaySourceEligibilityOptions {
 }
 
 function publicDailySourceCtes(schema: string): string {
-  // This mirrors the final D1 community_public_source_owners projection:
-  // active social/accountless authority, plus accountless v1.1 history that
-  // was pinned before an exact user opt-out. Opt-out retains the accepted
-  // current head but does not retain upload authority or create a terminal
-  // source event.
+  // This mirrors the social and accountless v1.1 branches of the D1
+  // community_public_source_owners projection: active social/accountless
+  // authority, plus accountless v1.1 history that was pinned before an exact
+  // user opt-out. Opt-out retains the accepted current head but does not
+  // retain upload authority or create a terminal source event. D1 isolation
+  // 0011 also admits accountless v1.2 owners (active and retained). Those
+  // branches are deliberately absent: this publisher reads only v1 and v1.1
+  // records, which a v1.2-only install does not have, so they would select
+  // nothing. Counting v1.2 evidence here, with those branches, is separate.
   return `WITH public_owners AS (
       SELECT participant.id AS participant_id, NULL::text AS device_id
         FROM ${schema}.participants participant

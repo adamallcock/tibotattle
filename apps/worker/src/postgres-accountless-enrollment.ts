@@ -759,15 +759,25 @@ export async function grantPostgresTelemetryV12AccountlessAuthorization(
         throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
       }
       const now = new Date(nowEpoch).toISOString();
+      // A repeated request catches an active grant up to the current lease,
+      // as the D1 grant does: forward only, for the same participant and
+      // credential, never for a revoked grant. The capability read reports a
+      // grant left behind by the lease as not current, which is what makes a
+      // client ask again.
+      const grantTable = table(schema, "accountless_v12_device_authorizations");
       const inserted = await client.query(
-        `INSERT INTO ${table(schema, "accountless_v12_device_authorizations")} (
+        `INSERT INTO ${grantTable} AS existing_grant (
            enrollment_device_id, participant_id, device_credential_id,
            schema_version, policy_version, authorization_basis,
            telemetry_schema_version, field_dictionary_version,
            privacy_contract_version, authorized_at, expires_at, state
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
                    $10::timestamptz, $11::timestamptz, 'active')
-         ON CONFLICT (enrollment_device_id) DO NOTHING
+         ON CONFLICT (enrollment_device_id) DO UPDATE SET expires_at = EXCLUDED.expires_at
+          WHERE existing_grant.state = 'active'
+            AND existing_grant.participant_id = EXCLUDED.participant_id
+            AND existing_grant.device_credential_id = EXCLUDED.device_credential_id
+            AND existing_grant.expires_at < EXCLUDED.expires_at
          RETURNING enrollment_device_id`,
         [owner.enrollment_device_id, owner.participant_id, owner.device_credential_id,
           parsed.schemaVersion, parsed.policyVersion, parsed.authorizationBasis,

@@ -2326,12 +2326,18 @@ export function createPostgresTestV12DayManifestDispatch({
           envelopePrivateJwk,
         });
       }
+      // The v1.2 capability read is how an accountless install learns that
+      // it has no current v1.2 grant and must request one, so, like the D1
+      // route, it authenticates the base accountless lease graph rather than
+      // requiring the v1.2 grant it reports on. Every v1.2 write still
+      // authenticates against the v1.2 grant.
       const device = await authenticatePostgresDevice(
         primaryPool,
         request.headers.get("authorization"),
         {
           schema,
-          ...(syncCapabilitiesRoute ? { accountlessAuthorizationVersion: "v1.1" } : {}),
+          ...(syncCapabilitiesRoute || syncCapabilitiesV12Route
+            ? { accountlessAuthorizationVersion: "v1.1" } : {}),
         },
       );
       if (await hasPostgresDeletionTombstone(ledgerPool, device.participantId, Date.now(), { schema })) {

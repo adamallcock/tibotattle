@@ -464,7 +464,9 @@ policy-blocked, and none of those formats has a qualified hosted route.
 The v1.2 parity audit found that PostgreSQL had rejected an exact chunk retry
 after the manifest became ready, while D1 returned a replay receipt. The
 admission adapter now accepts that exact replay and still refuses changed or
-undeclared chunks; it also rejects empty manifests as D1 does. A PostgreSQL
+undeclared chunks. It used to reject empty manifests as D1 does; it now
+registers an empty day as ready, because a complete v1.2 domain includes days
+without records (see the v1.2-only follow-up below). A PostgreSQL
 17 regression test passes for those cases. The PostgreSQL effective reader now
 also exposes bounded candidate paging, occurrence expansion and active-head
 day enumeration. A PG17 test scans 2,049 records with repeated timestamps and
@@ -581,6 +583,33 @@ Usage activation pins the migration ledger hash and trigger. The historical
 source-pinned migration operator ends at `0009`; `0012` needs a separately
 reviewed forward application and receipt after `0009`–`0011` in the ordered D1
 stream. This line has not changed the production D1 schema.
+
+The v1.2-only follow-up to that merge (local source and tests, 2026-09-25)
+drove the shipped client over the real D1 routes and the PostgreSQL dispatch
+for a never-uploaded accountless install:
+
+- The domain predecessor refused a device with no ready day, and its
+  fingerprint moved when the client's own days became ready, so such an
+  install never staged anything. Both D1 and PostgreSQL now seed the first
+  range with the current UTC day and pin only the prior head and input
+  revision. PostgreSQL also registers an empty day as ready; D1 still refuses
+  one through its `0008` schema, which remains a Cloudflare upload blocker for
+  any install whose range has a day without records.
+- The PostgreSQL v1.2 capability read required the v1.2 grant it reports on,
+  so an ungranted accountless install got `401 DEVICE_AUTH_INVALID` and the
+  desktop never requested the grant. It now authenticates the base lease graph
+  and reports the grant as not current, as D1 does. A grant behind the lease is
+  reported as not current and a repeated grant request catches it up.
+- PostgreSQL opt-out now revokes the v1.2 grant with the lease graph and, with
+  primary migration `0045`, retains an eligible v1.2-only head. The daily
+  publisher still reads only v1/v1.1 records, so it counts no v1.2 evidence.
+- D1 isolation migration `0013` lets the retained-history transfer capture a
+  v1.2-only opt-out marker instead of refusing every capture; the PostgreSQL
+  importer refuses that lineage by name until a reviewed import path exists.
+
+PostgreSQL still mints no analytics owner link for a new participant, so a
+v1.2-only install that first uploads to PostgreSQL does not become an
+effective or graph owner. None of this has been applied to GCP or Cloudflare.
 The PostgreSQL pending-object journal now has a separate, source-only
 reconciler. A focused PostgreSQL 17 test passes for committed-reference
 preservation, exact journal cleanup, late object creation, a lost delete

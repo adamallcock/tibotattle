@@ -264,8 +264,13 @@ scoped-primary account billing claim is introduced by the new transport.
 
 The v1.2 source path adds independent successor capability and authorization,
 an exact local field review, a separate progress journal, encrypted transport,
-typed admission and complete-domain activation. Its three usage extensions are
-continuity bits, same-time order and non-additive cache-write TTL detail. They
+typed admission and complete-domain activation. The client pins its domain
+predecessor before staging any day: a device with no ready day yet is seeded
+with the current UTC day, and the predecessor fingerprint pins only the prior
+head and input revision, so the client's own newly ready days never
+invalidate its journal. A complete domain includes days without records.
+Its three usage extensions are continuity bits, same-time order and
+non-additive cache-write TTL detail. They
 are excluded from current cache arithmetic. Exact-total corrections preserve
 immutable source variants so later older-client uploads cannot erase known
 totals or their own unique occurrences. Every analytical pathway must use the

@@ -17,7 +17,7 @@ const TIMEOUTS = Object.freeze({
 });
 
 /** Closed inventory of every PostgreSQL primary relation carrying owner_digest
- * at migration 0044. New owner-bearing relations block retirement until they
+ * at migration 0045. New owner-bearing relations block retirement until they
  * receive an explicit deletion or retained-proof decision here.
  */
 const OWNER_DIGEST_TABLES = Object.freeze([

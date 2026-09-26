@@ -109,8 +109,8 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL 17 sealed ingestion journal transfe
       await pool.query(`CREATE SCHEMA ${quoted}`);
       schemaCreated = true;
       const migration = await applyPostgresMigrations({ role: "primary", schema, pool });
-      expect(migration.applied).toBe(44);
-      expect(migration.migrations.at(-1)?.name).toBe("0044_accountless_import_claim_erasure.sql");
+      expect(migration.applied).toBe(45);
+      expect(migration.migrations.at(-1)?.name).toBe("0045_accountless_v12_history_retention.sql");
       fixture = await makeSealedSource();
 
       await pool.query(`ALTER TABLE ${table("storage_ingestion_changes")}

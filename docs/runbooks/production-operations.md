@@ -504,6 +504,16 @@ source tree that contains `0012` cannot deploy until `0012` is applied. The
 protected usage activation gate requires that exact migration and trigger; its
 ordered D1 prefix also requires `0009`, `0010` and `0011` to have been applied
 first.
+`ingestion-isolation-migrations/0013_accountless_history_transfer_v12.sql`
+re-creates the retained-history transfer view from baseline migration `0063`
+with a separate v1.2 lineage and adds the matching v1.2 invalidation triggers.
+Without it, one v1.2-only opt-out marker (allowed by `0011`) makes every
+transfer capture refuse. It changes no row, needs the baseline `0063` view
+and the `0008` v1.2 tables, and follows `0012` in the ordered stream; applied
+before `0063`, its `DROP VIEW` fails and nothing changes. It needs
+the same separate authorization, rehearsal and receipt, and the same deploy
+gating applies: a source tree that contains `0013` cannot deploy until `0013`
+is applied.
 
 Run the local populated rehearsal from the repository root. It uses
 synthetic content-free rows, enables foreign-key checks, verifies every mapped

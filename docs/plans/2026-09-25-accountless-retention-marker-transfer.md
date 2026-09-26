@@ -32,7 +32,23 @@ current PostgreSQL head.
 
 This lane transfers retention metadata only. It does not copy telemetry,
 create enrollment or owner authority, restore upload permission, or carry v1.2
-data. Public historical eligibility here is v1.1 only.
+data.
+
+Since D1 isolation migration 0011 an ordinary opt-out may pin an accepted
+v1.2 head for a device with no v1.1 domain. Migration 0063 alone proved every
+marker through the v1.1 grant, head and domain, so one such marker made every
+capture refuse with `SOURCE_MARKER_INELIGIBLE`. Isolation migration 0013 now
+re-creates the candidate view with a separate v1.2 lineage, proved like 0011's
+retained v1.2 public-source branch (revoked successor grant, the device's v1.2
+head and domain, no v1.1 domain), and adds v1.2 invalidation triggers. A v1.2
+row keeps the same columns; its `grant_*` fields carry the successor grant, so
+`grant_telemetry_schema_version` names the lineage. The PostgreSQL importer
+does not yet prove that lineage and refuses such a row by name
+(`ACCOUNTLESS_RETENTION_SUCCESSOR_MARKER_UNSUPPORTED`), stopping the whole run.
+Until a reviewed successor import path exists, any D1 v1.2-only opt-out
+therefore blocks the import and cutover. PostgreSQL migration 0045 separately
+lets a PostgreSQL opt-out retain an eligible v1.2 head prospectively; it does
+not admit imported v1.2 markers.
 
 ## Source contract to preserve
 
@@ -59,7 +75,8 @@ Retain the existing exact D1 rules:
   `head_revision`; the domain belongs to that participant and device.
 - Version, expiry, device, enrollment, and secret-hash relations match exactly.
   Compare hashes as bytes and never place their values in receipts or logs.
-- No v1.2 retained-history eligibility is implied or imported.
+- A v1.2 marker is captured with its own successor proof (isolation 0013) and
+  is never relabelled as, or imported into, v1.1 retained history.
 
 Map source identities to PostgreSQL identities with an explicit one-to-one
 mapping manifest. Do not infer an ID, head, revision, version, expiry, or hash
