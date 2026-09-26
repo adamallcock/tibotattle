@@ -14,7 +14,7 @@ import { authenticateDevice, claimDeviceUploadAuthorization, createDeviceUploadA
 import { grantTelemetryV12AccountlessAuthorization, grantTelemetryV12Consent } from "../src/telemetry-transport-policy";
 import { persistTelemetryV12StagedChunk, registerTelemetryV12DayManifest } from "../src/telemetry-v12-repository";
 import { activateTelemetryV12Domain, createTelemetryV12DomainPredecessor } from "../src/telemetry-v12-domain";
-import { advanceStorageCommunityDaily, readPublishedStorageCommunityDaily } from "../src/storage-community-daily";
+import { advanceNextStorageCommunityDaily, advanceStorageCommunityDaily, readPublishedStorageCommunityDaily } from "../src/storage-community-daily";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
 import { initializeStorageSource } from "../src/analytics-delivery";
 import { initializeTypedV11Admission } from "../src/typed-v11-admission";
@@ -36,7 +36,6 @@ const sourceId = "synthetic-typed-source", namespace = "synthetic-original-typed
 const today = () => new Date().toISOString().slice(0, 10);
 const runtime = () => ({ ...b, ENVIRONMENT: "synthetic-development", ACCOUNT_SCOPED_INGEST_MODE: "disabled",
   ACCOUNTLESS_ENROLLMENT_MODE: "enabled", ACCOUNTLESS_OWNERSHIP_MODE: "enabled" } as Env);
-const BRIDGE = "0011_v12_public_eligibility.sql";
 const options = () => ({ source: source(), target: target(), sourceId, sourceNamespace: namespace, day: today() });
 
 beforeEach(async () => {
@@ -51,8 +50,7 @@ beforeEach(async () => {
   await applyD1Migrations(source(), b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
   await initializeTypedV11Admission(source(), namespace);
   await initializeTypedV1Admission(source(), namespace);
-  // The deployed predecessor: every isolation migration before the bridge.
-  await applyD1Migrations(source(), b.TEST_INGESTION_ISOLATION_MIGRATIONS.filter((migration) => migration.name < BRIDGE));
+  await applyD1Migrations(source(), b.TEST_INGESTION_ISOLATION_MIGRATIONS);
   await initializeStorageAnalyticsRuntime({ source: source(), target: target(), sourceId, sourceNamespace: namespace });
   await source().prepare("UPDATE telemetry_transport_formats SET lifecycle='accepted' WHERE schema_version='telemetry-contribution-v1.1'").run();
   await source().prepare("UPDATE telemetry_v12_runtime SET state='active',changed_at=? WHERE id=1")
@@ -102,88 +100,75 @@ function usageRecord(n: number): TelemetryV12UsageEvent {
   };
 }
 
-/** Upload one complete v1.2 day and activate a domain that carries it. */
-async function uploadV12Day(principal: Principal, eventNumbers: readonly number[], revision = 1): Promise<void> {
-  const day = today(), consent = telemetryV12RequiredConsent(), parserVersion = `synthetic-v12-daily-${revision}`;
-  const records = eventNumbers.map(usageRecord);
-  const chunk: TelemetryV12Chunk = { schemaVersion: "telemetry-contribution-v1.2", manifestDigest: "0".repeat(64),
-    chunkId: `usage:${day}:0`, chunkRevision: 1, parserVersion, consent, records: [...records],
-    chunkDigest: await sha256Hex(canonicalTelemetryV12Json(records)) };
+
+const dayOffset = (days: number) => new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
+
+function usageOn(day: string, n: number): TelemetryV12UsageEvent {
+  return { ...usageRecord(n), eventId: `event:v2:${day.replaceAll("-", "")}${n.toString(16).padStart(56, "0")}`,
+    eventTime: `${day}T00:05:${String(n % 60).padStart(2, "0")}.000Z` };
+}
+
+/** The desktop client's day preparation: one manifest per day, empty days included. */
+async function prepareDay(day: string, records: readonly TelemetryV12UsageEvent[], revision = 1) {
+  const consent = telemetryV12RequiredConsent(), parserVersion = `synthetic-v12-first-sync-${revision}`;
+  const chunks: TelemetryV12Chunk[] = records.length ? [{ schemaVersion: "telemetry-contribution-v1.2",
+    manifestDigest: "0".repeat(64), chunkId: `usage:${day}:0`, chunkRevision: 1, parserVersion, consent,
+    records: [...records], chunkDigest: await sha256Hex(canonicalTelemetryV12Json(records)) }] : [];
   const manifest: TelemetryV12DayManifest = { schemaVersion: "telemetry-day-manifest-v1.2", day, parserVersion, consent,
-    chunks: [{ chunkId: chunk.chunkId, chunkDigest: chunk.chunkDigest, recordCount: records.length }],
+    chunks: chunks.map(chunk => ({ chunkId: chunk.chunkId, chunkDigest: chunk.chunkDigest, recordCount: chunk.records.length })),
     excluded: { quota: 0, session: 0, usage: 0 }, manifestDigest: "0".repeat(64) };
   manifest.manifestDigest = await sha256Hex(telemetryV12DayManifestDigestInput(manifest));
-  const registered = await registerTelemetryV12DayManifest(source(), principal, manifest);
-  chunk.manifestDigest = manifest.manifestDigest;
-  const device = await authenticateDevice(source(), principal.authorization);
-  const envelopeDigest = await sha256Hex(`synthetic-v12-daily-${crypto.randomUUID()}`);
-  const upload = await createDeviceUploadAuthorization(source(), device, envelopeDigest, 4096);
-  const claimed = await claimDeviceUploadAuthorization(source(), `Upload ${upload.uploadAuthorization}`,
-    { envelopeDigest, bodyBytes: 4096, contentType: "application/json" });
-  await persistTelemetryV12StagedChunk(source(), principal, chunk, { chunkRowId: `chunk:${crypto.randomUUID()}`,
-    r2Key: `synthetic/v12-daily/${crypto.randomUUID()}`, envelopeDigest, deviceUploadAuthorizationId: claimed.authorizationId });
-  const predecessor = await createTelemetryV12DomainPredecessor(source(), principal);
-  const domain = { schemaVersion: "telemetry-domain-manifest-v1.2" as const, fromDay: day, throughDay: day,
-    predecessor: { token: predecessor.token, previousGenerationId: predecessor.previousGenerationId,
-      legacyFingerprint: predecessor.legacyFingerprint },
-    days: [{ day, manifestId: registered.manifestId, manifestDigest: manifest.manifestDigest }], manifestDigest: "0".repeat(64) };
+  for (const chunk of chunks) chunk.manifestDigest = manifest.manifestDigest;
+  return { manifest, chunks };
+}
+
+/** Exactly the order runSync uses: predecessor, every day in the planned range
+ * (register, then upload each chunk), a renewed predecessor checked against the
+ * plan, then activation. Throws with the server code on the first refusal. */
+async function clientPass(principal: Principal, localDays: Map<string, TelemetryV12UsageEvent[]>, revision = 1) {
+  const before = await createTelemetryV12DomainPredecessor(source(), principal);
+  const local = [...localDays.keys()].sort();
+  const fromDay = [before.fromDay, local[0]!].sort()[0]!;
+  const throughDay = [before.throughDay, local.at(-1)!].sort().at(-1)!;
+  const vector: Array<{ day: string; manifestId: string; manifestDigest: string }> = [];
+  for (let time = Date.parse(`${fromDay}T00:00:00.000Z`); time <= Date.parse(`${throughDay}T00:00:00.000Z`); time += 86_400_000) {
+    const day = new Date(time).toISOString().slice(0, 10);
+    const prepared = await prepareDay(day, localDays.get(day) ?? [], revision);
+    const candidate = await registerTelemetryV12DayManifest(source(), principal, prepared.manifest);
+    for (const chunk of prepared.chunks) {
+      const device = await authenticateDevice(source(), principal.authorization);
+      const envelopeDigest = await sha256Hex(`synthetic-v12-first-sync-${crypto.randomUUID()}`);
+      const upload = await createDeviceUploadAuthorization(source(), device, envelopeDigest, 4096);
+      const claimed = await claimDeviceUploadAuthorization(source(), `Upload ${upload.uploadAuthorization}`,
+        { envelopeDigest, bodyBytes: 4096, contentType: "application/json" });
+      await persistTelemetryV12StagedChunk(source(), principal, chunk, { chunkRowId: `chunk:${crypto.randomUUID()}`,
+        r2Key: `synthetic/v12-first-sync/${crypto.randomUUID()}`, envelopeDigest, deviceUploadAuthorizationId: claimed.authorizationId });
+    }
+    vector.push({ day, manifestId: candidate.manifestId, manifestDigest: prepared.manifest.manifestDigest });
+  }
+  const renewed = await createTelemetryV12DomainPredecessor(source(), principal);
+  // The client's own revision_conflict guard.
+  expect(renewed.previousGenerationId).toBe(before.previousGenerationId);
+  expect(renewed.legacyFingerprint).toBe(before.legacyFingerprint);
+  expect(renewed.fromDay >= fromDay && renewed.throughDay <= throughDay).toBe(true);
+  const domain = { schemaVersion: "telemetry-domain-manifest-v1.2" as const, fromDay, throughDay,
+    predecessor: { token: renewed.token, previousGenerationId: renewed.previousGenerationId,
+      legacyFingerprint: renewed.legacyFingerprint }, days: vector, manifestDigest: "0".repeat(64) };
   domain.manifestDigest = await sha256Hex(telemetryV12DomainManifestDigestInput(domain));
-  await activateTelemetryV12Domain(source(), principal, domain);
+  return activateTelemetryV12Domain(source(), principal, domain);
 }
 
-async function deliverAndPublish(): Promise<void> {
-  for (let n = 0; n < 64; n++) if ((await drainCommunityPublicSourceBootstrap(source())).completed) break;
-  for (let n = 0; n < 256; n++) {
-    if ((await advanceStorageAnalytics(options())).state === "idle") break;
-  }
-  for (let n = 0; n < 16; n++) {
-    const result = await advanceStorageCommunityDaily(options());
-    if (result.state === "published" || result.state === "unchanged") return;
-  }
-}
-
-async function publishedTotals(): Promise<{ contributingParticipants: number; usageEvents: number } | null> {
-  const rows = (await readPublishedStorageCommunityDaily({ ...options(), fromDay: today(), throughDay: today() })).rows;
-  return rows.length === 0 ? null : JSON.parse(rows.at(-1)!.payload_json).totals;
-}
-
-describe("isolation 0011 v1.2 public eligibility bridge", () => {
-  it("bridges v1.2 heads accepted before the migration exactly once", async () => {
-    const accountless = await accountlessV12Device();
-    await uploadV12Day(accountless, [1, 2]);
-    const social = await createV11DeviceFixture(source());
-    await grantTelemetryV12Consent(source(), social, telemetryV12RequiredConsent());
-    await uploadV12Day(social, [3]);
-    // Before the bridge the accountless device is not public, and the social
-    // owner has no analytics identity at all.
-    expect(await source().prepare(`SELECT count(*) AS n FROM community_public_source_owners
-      WHERE participant_id=?`).bind(accountless.participantId).first("n")).toBe(0);
-    expect(await source().prepare("SELECT count(*) AS n FROM storage_v11_owner_links WHERE participant_id IN (?,?)")
-      .bind(accountless.participantId, social.participantId).first("n")).toBe(0);
-
-    // Through the bridge only: 0012 rebuilds the v1.2 manifest table and, by
-    // design, refuses a role that already holds v1.2 manifests like this one.
-    await applyD1Migrations(source(), b.TEST_INGESTION_ISOLATION_MIGRATIONS.filter((migration) => migration.name <= BRIDGE));
-    expect(await source().prepare("SELECT count(*) AS n FROM storage_v12_event_sources").first("n")).toBe(2);
-    await deliverAndPublish();
-    expect(await publishedTotals()).toMatchObject({ contributingParticipants: 2, usageEvents: 3 });
-
-    // Re-requesting an already bridged head journals nothing new.
-    const journal = async () => await source().prepare("SELECT count(*) AS n FROM storage_ingestion_changes").first<number>("n");
-    const before = await journal();
-    await source().prepare(`INSERT INTO storage_v12_head_requests(participant_id,generation_id,head_revision)
-      SELECT participant_id,generation_id,revision FROM telemetry_v12_domain_heads WHERE participant_id=?`)
-      .bind(accountless.participantId).run();
-    expect(await journal()).toBe(before);
-    expect(await source().prepare("SELECT count(*) AS n FROM storage_v12_event_sources").first("n")).toBe(2);
-  });
-
-  it("keeps the pre-bridge analytics journal on its existing formats", async () => {
-    const social = await createV11DeviceFixture(source());
-    await grantTelemetryV12Consent(source(), social, telemetryV12RequiredConsent());
-    await uploadV12Day(social, [1]);
-    // No v1.2 bridge exists yet: delivery stays idle and nothing is published.
-    for (let n = 0; n < 8; n++) if ((await advanceStorageAnalytics(options())).state === "idle") break;
-    expect(await source().prepare("SELECT count(*) AS n FROM sqlite_schema WHERE name='storage_v12_event_sources'").first("n")).toBe(0);
+describe("first and later v1.2 syncs from the shipped client sequence", () => {
+  it("starts a device with no v1.2 history, crosses an idle day and appends later", async () => {
+    const device = await accountlessV12Device();
+    const local = new Map([[dayOffset(2), [usageOn(dayOffset(2), 1), usageOn(dayOffset(2), 2)]],
+      [dayOffset(0), [usageOn(dayOffset(0), 3)]]]);
+    const first = await clientPass(device, local);
+    expect(first).toMatchObject({ fromDay: dayOffset(2), throughDay: dayOffset(0), replay: false });
+    local.set(dayOffset(0), [usageOn(dayOffset(0), 3), usageOn(dayOffset(0), 4)]);
+    const second = await clientPass(device, local, 2);
+    expect(second).toMatchObject({ fromDay: dayOffset(2), throughDay: dayOffset(0), replay: false });
+    expect(await source().prepare("SELECT revision FROM telemetry_v12_domain_heads WHERE participant_id=?")
+      .bind(device.participantId).first("revision")).toBe(2);
   });
 });

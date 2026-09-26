@@ -91,15 +91,43 @@ documentation preflight and the architecture check.
   device. Publications carry a private `dailyDeviceMethod` marker; the stale-head
   pass recounts each day published under an older method exactly once.
 
-## Live findings outside this change (2026-09-25, read-only)
+## v1.2 first-sync defects (found live 2026-09-25, fixed by isolation 0012)
 
-- Production had zero v1.2 manifests, chunks or domains while seven accountless
-  installs held a v1.2 grant; none of those installs has uploaded anything since
-  receiving it. The desktop v1.2 run fails before recording progress.
+Production held zero v1.2 manifests, chunks, predecessors, upload
+authorizations or domains while seven accountless installs held a v1.2 grant;
+none had uploaded anything since receiving it. Replaying the shipped 0.1.24
+client's server sequence reproduced three independent refusals:
+
+1. The client asks for a domain predecessor before uploading any day. The v1.2
+   predecessor was built only from already-ready v1.2 manifests and refused a
+   device that had none with `409 TELEMETRY_MANIFEST_INCOMPLETE`. With no ready
+   day, its planned range is now the current UTC day, as a v1.1 predecessor
+   always includes it.
+2. The client registers a manifest for every day in its contiguous plan, idle
+   days included. The v1.2 table required at least one chunk (v1.1 allows
+   zero), so an idle day failed as a retryable `503`. Isolation 0012 recreates
+   the empty table with the v1.1 bound, then the domain, domain-day and head
+   tables in 0008's order so cascading participant and device deletes keep
+   their sequence; registration marks an idle day ready exactly as v1.1 does.
+3. The predecessor fingerprint included the device's own ready manifests, so
+   the client's renewed-predecessor check failed whenever its pass uploaded
+   anything new. The fingerprint now names only the prior accepted state (head,
+   manifest digest and input revision), as in v1.1; the method version is now
+   `v12-complete-domain-2`.
+
+0012 also re-issues the eligibility view and two v1.2 bridge triggers from
+0011 in canonical text. 0011 was applied from its raw file, which kept comments
+inside those statements, so the live schema differed from the one the migration
+chain derives and the guarded typed deployment refused. A local model of that
+history shows the three differences before 0012 and none after it. Apply 0012
+through the same atomic import, then deploy the main Worker.
+
+## Live findings (2026-09-25, read-only)
+
+- The public daily count is accurate to accepted data; the gap is upstream.
 - Most v1.1 domain activations have failed since about 2026-09-16; the last
-  succeeded at 2026-09-23T23:56Z. Only activated days are public, so the public
-  daily count is accurate to accepted data but far below uploads.
-- Both are separate defects and need the exact server rejection codes.
+  succeeded at 2026-09-23T23:56Z. That cause is still being established from
+  the server's rejection codes.
 
 ## Open follow-ups
 
