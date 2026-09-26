@@ -32,6 +32,8 @@ import type { GithubDistributionAnalytics } from "../src/github-distribution-his
 
 const NOW = Date.parse("2026-09-20T06:00:00.000Z");
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
+/** The seven 24-hour analytics windows the Cloudflare aggregate reads. */
+const LOOKBACK_WINDOWS = 7;
 const ANALYTICS_ENDPOINT = "https://api.cloudflare.com/client/v4/graphql";
 const GITHUB_RELEASES_PAGE_ONE =
   "https://api.github.com/repos/adamallcock/tibotattle/releases?per_page=100&page=1";
@@ -1292,4 +1294,144 @@ describe("readCloudflareDistributionSegments + cloudflareDistributionFromSegment
       }
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// Concurrency: all seven window reads start together (and alongside the GitHub
+// read in the overview), so the Cloudflare half costs one GraphQL round trip,
+// not seven. The edge relies on this to overlap the reads with its forward.
+// ---------------------------------------------------------------------------
+
+/**
+ * Below the 5 s Vitest test timeout and the 8 s per-request fetch timeout, so a
+ * sequential reader fails as an assertion rather than as a hung test.
+ */
+const BARRIER_DEADLINE_MILLISECONDS = 2_000;
+
+interface BarrierFetcher {
+  readonly fetcher: typeof fetch;
+  readonly calls: string[];
+  /** The most requests that were held at the barrier at one time. */
+  readonly maxWaiting: () => number;
+  readonly dispose: () => void;
+}
+
+/**
+ * Holds every request until `expected` requests have all been issued, then
+ * releases them together to fakeFetcher. A reader that awaits one request
+ * before issuing the next can never fill the barrier: its held request fails at
+ * the deadline, or when the reader's own abort signal fires, and the readers
+ * then report the source as unavailable.
+ */
+function barrierFetcher(
+  current: Pick<Scenario, "analytics" | "github">,
+  expected: number,
+  deadlineMilliseconds = BARRIER_DEADLINE_MILLISECONDS,
+): BarrierFetcher {
+  const inner = fakeFetcher(current);
+  let arrived = 0;
+  let waiting = 0;
+  let maxWaiting = 0;
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let expire!: (error: Error) => void;
+  const expired = new Promise<never>((_, reject) => {
+    expire = reject;
+  });
+  // Handled here as well, so an expiry with no held request is not reported
+  // as an unhandled rejection.
+  expired.catch(() => undefined);
+  const deadline = setTimeout(
+    () => expire(new Error("barrier not filled: requests were issued one after another")),
+    deadlineMilliseconds,
+  );
+  const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    arrived += 1;
+    waiting += 1;
+    maxWaiting = Math.max(maxWaiting, waiting);
+    if (arrived === expected) release();
+    const aborted = new Promise<never>((_, reject) => {
+      init?.signal?.addEventListener(
+        "abort",
+        () => reject(new Error("fixture request aborted")),
+        { once: true },
+      );
+    });
+    try {
+      await Promise.race([released, expired, aborted]);
+    } finally {
+      waiting -= 1;
+    }
+    return inner.fetcher(input, init);
+  }) as typeof fetch;
+  return {
+    fetcher,
+    calls: inner.calls,
+    maxWaiting: () => maxWaiting,
+    dispose: () => clearTimeout(deadline),
+  };
+}
+
+describe("the distribution reads run concurrently", () => {
+  it("the barrier fetcher fails a reader that waits for each request before the next", async () => {
+    const barrier = barrierFetcher(scenario("enabled"), LOOKBACK_WINDOWS, 50);
+    try {
+      await expect(barrier.fetcher(ANALYTICS_ENDPOINT, { method: "POST" }))
+        .rejects.toThrow("barrier not filled");
+      expect(barrier.maxWaiting()).toBe(1);
+      expect(barrier.calls).toStrictEqual([]);
+    } finally {
+      barrier.dispose();
+    }
+  });
+
+  it("readCloudflareDistributionSegments issues all seven window reads before any completes", async () => {
+    const current = scenario("enabled");
+    const barrier = barrierFetcher(current, LOOKBACK_WINDOWS);
+    try {
+      const segments = await readCloudflareDistributionSegments(
+        ZONE_ID,
+        API_TOKEN,
+        NOW,
+        barrier.fetcher,
+      );
+      expect(barrier.maxWaiting()).toBe(LOOKBACK_WINDOWS);
+      expect(barrier.calls).toHaveLength(LOOKBACK_WINDOWS);
+      expect(segments).toHaveLength(LOOKBACK_WINDOWS);
+      expect(segments).toStrictEqual(await readSegments(current));
+    } finally {
+      barrier.dispose();
+    }
+  });
+
+  const overviewCases: readonly (readonly [string, number])[] = [
+    // Seven GraphQL windows plus the first GitHub releases page.
+    ["enabled", LOOKBACK_WINDOWS + 1],
+    // A supplied GitHub snapshot makes no GitHub request.
+    ["enabled with a GitHub snapshot that has no release", LOOKBACK_WINDOWS],
+  ];
+  for (const [name, expected] of overviewCases) {
+    it(`readDistributionAnalytics issues the GitHub and window reads together: ${name}`, async () => {
+      const current = scenario(name);
+      const recorded = preSplitFixture(name);
+      expect(recorded.calls).toHaveLength(expected);
+      const barrier = barrierFetcher(current, expected);
+      try {
+        const overview = await readDistributionAnalytics(
+          current.configuration,
+          NOW,
+          barrier.fetcher,
+        );
+        expect(barrier.maxWaiting()).toBe(expected);
+        // Call order is pinned by the pre-split fixture test; this one checks
+        // only that the same requests were all outstanding at once.
+        expect([...barrier.calls].sort()).toStrictEqual([...recorded.calls].sort());
+        expect(overview).toStrictEqual(recorded.overview);
+      } finally {
+        barrier.dispose();
+      }
+    });
+  }
 });
