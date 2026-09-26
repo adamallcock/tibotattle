@@ -521,15 +521,59 @@ test("PostgreSQL device-bearer authentication matches the Worker and commits reu
           `UPDATE ${q(schema, "accountless_v11_device_authorizations")}
               SET expires_at = $2::timestamptz WHERE enrollment_device_id = $1`,
           [device.deviceId, iso(expiresAt - DAY)])],
+        ["owner expiry differs from the lease", async (device) => pool.query(
+          `UPDATE ${q(schema, "accountless_upload_owners")}
+              SET expires_at = $2::timestamptz WHERE enrollment_device_id = $1`,
+          [device.deviceId, iso(expiresAt - DAY)])],
+        ["device expiry differs from the ledger, owner and grants", async (device) => pool.query(
+          `UPDATE ${q(schema, "device_credentials")} SET expires_at = $2::timestamptz WHERE id = $1`,
+          [device.deviceId, iso(expiresAt + DAY)])],
+        // The schema allows these corrupted states; D1 refuses the first by
+        // trigger and the Worker's authenticateDevice refuses the other two.
+        ["accountless participant carries a consent version", async (device) => pool.query(
+          `UPDATE ${q(schema, "participants")} SET consent_version = $2 WHERE id = $1`,
+          [device.participantId, constants.TELEMETRY_CONSENT_VERSION])],
+        ["accountless device carries social_verified_at", async (device) => pool.query(
+          `UPDATE ${q(schema, "device_credentials")} SET social_verified_at = $2::timestamptz WHERE id = $1`,
+          [device.deviceId, iso(T0 - HOUR)])],
+        ["participant owner kind differs from the device authority", async (device) => pool.query(
+          `UPDATE ${q(schema, "participants")} SET owner_kind = 'social' WHERE id = $1`,
+          [device.participantId])],
       ];
       for (const [label, damage] of failures) {
         const device = await seedAccountless({ expiresAt, withV12: true });
-        await damage(device);
+        const damaged = await damage(device);
+        assert.equal(damaged.rowCount, 1, `${label}: exactly one row damaged`);
         for (const [name, authenticate] of authenticators) {
           await assertNeutral401(authenticate(device.authorization, { nowEpoch: T0 + MINUTE }), `${name}: ${label}`);
         }
         assert.equal((await deviceRow(device.deviceId)).lastUsedAt, iso(T0 - HOUR), `${label}: no write`);
       }
+
+      // The v1.2 grant must share the lease expiry, but it is read only when
+      // v1.2 is requested: the Worker's v1.1 gate and the grant route ignore it.
+      const typedMismatch = await seedAccountless({ expiresAt, withV12: true });
+      const typedDamage = await pool.query(
+        `UPDATE ${q(schema, "accountless_v12_device_authorizations")}
+            SET expires_at = $2::timestamptz WHERE enrollment_device_id = $1`,
+        [typedMismatch.deviceId, iso(expiresAt - DAY)],
+      );
+      assert.equal(typedDamage.rowCount, 1);
+      await assertNeutral401(
+        bearer.authenticatePostgresDeviceBearer(pool, typedMismatch.authorization,
+          { ...options, nowEpoch: T0 + MINUTE, accountlessAuthorizationVersion: "v1.2" }),
+        "v1.2 grant expiry differs from the lease under 'v1.2'",
+      );
+      await assertNeutral401(
+        transport.authenticatePostgresDevice(pool, typedMismatch.authorization, { ...options, nowEpoch: T0 + MINUTE }),
+        "v1.2 grant expiry differs from the lease under the wrapper default",
+      );
+      assert.equal((await deviceRow(typedMismatch.deviceId)).lastUsedAt, iso(T0 - HOUR),
+        "v1.2 grant expiry mismatch: no write");
+      assert.equal((await bearer.authenticatePostgresDeviceBearer(pool, typedMismatch.authorization,
+        { ...options, nowEpoch: T0 + 2 * MINUTE })).deviceId, typedMismatch.deviceId);
+      assert.equal((await bearer.authenticatePostgresAccountlessForV12Grant(pool, typedMismatch.authorization,
+        { ...options, nowEpoch: T0 + 3 * MINUTE })).deviceId, typedMismatch.deviceId);
 
       const expired = await seedAccountless({ expiresAt, withV12: true });
       for (const [name, authenticate] of authenticators) {
@@ -629,6 +673,25 @@ test("PostgreSQL device-bearer authentication matches the Worker and commits reu
         { ...options, nowEpoch: now });
       assert.deepEqual([legacyPrincipal.socialVerifiedAt, legacyPrincipal.expiresAt],
         [iso(now - 179 * DAY), iso(now + DAY)]);
+      // social_verified_at takes precedence over issued_at: a continuity re-pair
+      // refreshes social_verified_at and keeps the original issued_at, so a
+      // re-verified device is capped by its re-verification, not its issue.
+      const repaired = await seedSocial({
+        issuedAt: now - 200 * DAY, socialVerifiedAt: now - 160 * DAY, lastUsedAt: now - HOUR, expiresAt: now + DAY,
+      });
+      const repairedPrincipal = await bearer.authenticatePostgresDeviceBearer(pool, repaired.authorization,
+        { ...options, nowEpoch: now });
+      assert.deepEqual([repairedPrincipal.socialVerifiedAt, repairedPrincipal.expiresAt],
+        [iso(now - 160 * DAY), iso(now + 20 * DAY)], "issued_at past the cap does not refuse a re-verified device");
+      assert.equal((await deviceRow(repaired.deviceId)).expiresAt, iso(now + 20 * DAY));
+      const staleVerification = await seedSocial({
+        issuedAt: now - DAY, socialVerifiedAt: now - 180 * DAY, lastUsedAt: now - HOUR, expiresAt: now + DAY,
+      });
+      await assertNeutral401(
+        bearer.authenticatePostgresDeviceBearer(pool, staleVerification.authorization, { ...options, nowEpoch: now }),
+        "a recent issued_at does not rescue a stale social_verified_at",
+      );
+      assert.equal((await deviceRow(staleVerification.deviceId)).lastUsedAt, iso(now - HOUR));
 
       // Expiry, consent and participant state.
       const expiring = await seedSocial({ expiresAt: now + 1 });
@@ -651,6 +714,40 @@ test("PostgreSQL device-bearer authentication matches the Worker and commits reu
         bearer.authenticatePostgresDeviceBearer(pool, deleting.authorization, { ...options, nowEpoch: now }),
         "deleting participant",
       );
+    });
+
+    await t.test("the accountless write fence requires an exact authorization version", async () => {
+      const leaseExpiresAt = T0 + 10 * DAY;
+      const device = await seedAccountless({ expiresAt: leaseExpiresAt });
+      // No authorizationVersion key: an omitted fence argument must not mean v1.1.
+      const request = {
+        schema: options.schema,
+        participantId: device.participantId,
+        deviceId: device.deviceId,
+        enrollmentDeviceId: device.deviceId,
+        deviceExpiresAt: iso(leaseExpiresAt),
+        nowEpoch: T0,
+      };
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        assert.equal(await bearer.readPostgresAccountlessDeviceAuthority(client,
+          { ...request, authorizationVersion: "v1.1" }), true, "v1.1-only device holds the v1.1 graph");
+        assert.equal(await bearer.readPostgresAccountlessDeviceAuthority(client,
+          { ...request, authorizationVersion: "v1.2" }), false, "v1.1-only device lacks the v1.2 grant");
+        await assert.rejects(bearer.readPostgresAccountlessDeviceAuthority(client, request), TypeError,
+          "omitted authorizationVersion");
+        for (const authorizationVersion of [undefined, null, "", "v1.3", "V1.1"]) {
+          await assert.rejects(
+            bearer.readPostgresAccountlessDeviceAuthority(client, { ...request, authorizationVersion }),
+            TypeError,
+            `authorizationVersion ${JSON.stringify(authorizationVersion)}`,
+          );
+        }
+      } finally {
+        await client.query("ROLLBACK");
+        client.release();
+      }
     });
 
     await t.test("malformed headers, unknown devices and wrong secrets give the identical 401", async () => {

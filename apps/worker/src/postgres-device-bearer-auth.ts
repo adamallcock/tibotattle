@@ -1,9 +1,21 @@
 /**
  * Shared PostgreSQL device-bearer authentication.
  *
- * This is the single reviewed PostgreSQL counterpart of the Worker's
- * `authenticateDevice` (device-auth.ts). Every GCP device-bearer route
- * authenticates through it so the following Worker semantics hold everywhere:
+ * This is the reviewed PostgreSQL counterpart of the Worker's generic
+ * `authenticateDevice` (device-auth.ts). GCP device-bearer routes are meant
+ * to authenticate through it. Current adopters: the legacy private-host
+ * wrapper `authenticatePostgresDevice` (postgres-typed-v12-transport.ts)
+ * delegates here, and the upload-claim fence uses
+ * `readPostgresAccountlessDeviceAuthority`. Not yet adopted: the Cloud Run
+ * v1.2 grant route still uses `authenticatePostgresAccountlessOwnerForV12Grant`
+ * (postgres-accountless-enrollment.ts), which returns ownership-specific codes
+ * and does not bump `last_used_at`; it moves to
+ * `authenticatePostgresAccountlessForV12Grant` in AD-1. The disconnect,
+ * credential-renewal, pairing-claim, accountless-enrollment and
+ * accountless-renewal modules still parse bearers and check the accountless
+ * graph themselves; the plan's route items (AD-1, AD-2, LF-1) compose their
+ * routes over this module. Only where it is used does it give these Worker
+ * semantics:
  *
  * - The header grammar is exactly `Device um_device_<uuidv4>.<43 base64url>`,
  *   parsed by the Worker's own parser; every deviation is the neutral
@@ -50,9 +62,12 @@ export type PostgresAccountlessAuthorizationVersion = "v1.1" | "v1.2";
 export interface PostgresDeviceBearerAuthenticationOptions extends DeviceLifecycleOptions {
   readonly schema?: PostgresSchemaConfig;
   /**
-   * Accountless authority required in addition to the bearer. `'v1.1'` (the
-   * default) is the Worker's generic bearer gate: the base v1.1 lease graph.
-   * `'v1.2'` additionally requires the current typed-v1.2 schema grant.
+   * Accountless authority required in addition to the bearer. `'v1.1'` is the
+   * Worker's generic bearer gate: the base v1.1 lease graph. `'v1.2'`
+   * additionally requires the current typed-v1.2 schema grant. When omitted,
+   * `authenticatePostgresDeviceBearer` uses `'v1.1'`; the legacy wrapper
+   * `authenticatePostgresDevice` declares its own option and defaults to
+   * `'v1.2'`.
    */
   readonly accountlessAuthorizationVersion?: PostgresAccountlessAuthorizationVersion;
 }
@@ -171,10 +186,15 @@ function lifecyclePolicy(options: DeviceLifecycleOptions): {
   return { idleMilliseconds, socialRecheckMaxAgeMilliseconds };
 }
 
-function accountlessAuthorizationVersion(value: unknown): PostgresAccountlessAuthorizationVersion {
-  if (value === undefined) return "v1.1";
+/** Exact version, no default: a missing fence argument is an error, never v1.1. */
+function requiredAccountlessAuthorizationVersion(value: unknown): PostgresAccountlessAuthorizationVersion {
   if (value === "v1.1" || value === "v1.2") return value;
   throw new TypeError("invalid accountless authorization version");
+}
+
+/** The bearer option alone defaults an omitted version to the Worker's v1.1 gate. */
+function accountlessAuthorizationVersion(value: unknown): PostgresAccountlessAuthorizationVersion {
+  return value === undefined ? "v1.1" : requiredAccountlessAuthorizationVersion(value);
 }
 
 function safeError(error: unknown): Error | null {
@@ -263,18 +283,22 @@ async function accountlessAuthorityHolds(
  * Check the accountless owner graph for a device inside the caller's mutation
  * transaction. It takes FOR SHARE locks on the ledger, owner and grant rows, so
  * it must run in the same transaction as the write it fences.
+ * `authorizationVersion` is required and exact: an omitted or unknown value
+ * rejects with a TypeError rather than falling back to the weaker v1.1 graph,
+ * because JavaScript composition roots are not type-checked.
  */
-export function readPostgresAccountlessDeviceAuthority(
+export async function readPostgresAccountlessDeviceAuthority(
   client: PostgresClient,
   request: PostgresAccountlessDeviceAuthorityRequest,
 ): Promise<boolean> {
+  const authorizationVersion = requiredAccountlessAuthorizationVersion(request.authorizationVersion);
   return accountlessAuthorityHolds(client, primarySchema(request.schema), {
     participantId: request.participantId,
     deviceId: request.deviceId,
     enrollmentDeviceId: request.enrollmentDeviceId,
     deviceExpiresAt: request.deviceExpiresAt,
     nowEpoch: request.nowEpoch,
-    authorizationVersion: accountlessAuthorizationVersion(request.authorizationVersion),
+    authorizationVersion,
   });
 }
 
