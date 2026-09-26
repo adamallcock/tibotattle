@@ -31,6 +31,7 @@ const PG_FLAG_COLUMNS = {
   processing: "processing_enabled",
   publication: "publication_enabled",
 };
+const PG_FLAG_COLUMNS_LIST = CONTROL_NAMES.map((name) => PG_FLAG_COLUMNS[name]);
 const WORKER_DISABLED_CODES = {
   enrollment: "COLLECTION_ENROLLMENT_DISABLED",
   uploadRegistration: "UPLOAD_REGISTRATION_DISABLED",
@@ -303,6 +304,11 @@ test("0050 closes collection_controls; the PostgreSQL reader serves the bootstra
   const legacy = `aa0_controls_legacy_${suffix}`;
   const rejected = `aa0_controls_rejected_${suffix}`;
   const inconsistent = `aa0_controls_inconsistent_${suffix}`;
+  const unrecordedChanged = `aa0_controls_unrecorded_${suffix}`;
+  const unrecordedRevision = `aa0_controls_unrecorded_rev_${suffix}`;
+  const unrecordedOperational = `aa0_controls_unrecorded_op_${suffix}`;
+  const unrecordedFlag = `aa0_controls_unrecorded_flag_${suffix}`;
+  const unrecordedState = `aa0_controls_unrecorded_state_${suffix}`;
   const absent = `aa0_controls_absent_${suffix}`;
   const created = [];
   try {
@@ -310,7 +316,8 @@ test("0050 closes collection_controls; the PostgreSQL reader serves the bootstra
       await createSchema(pool, schema, created);
       const table = q(schema, "collection_controls");
 
-      // (1) The 0007/0016 bootstrap row, reason backfilled to 'initial'.
+      // (1) The untouched 0007/0016 bootstrap row, reason backfilled to
+      // 'initial'.
       const bootstrap = await pool.query(
         `SELECT revision::text AS revision, control_state, reason_code,
                 enrollment_enabled, upload_registration_enabled,
@@ -499,37 +506,60 @@ test("0050 closes collection_controls; the PostgreSQL reader serves the bootstra
         failedClient.release();
       }
 
-      // (7) Backfill scope: only a NULL reason becomes 'initial'; the
-      // revision, state and updated_at of an existing row are untouched.
+      // (7) Backfill scope: only the untouched bootstrap row's NULL reason
+      // becomes 'initial' (section 1). A changed row that already carries a
+      // closed-set reason keeps it, and its revision, state and updated_at
+      // are untouched.
       let legacyBefore;
       await createSchema(pool, legacy, created, {
         beforeStaged: async (target) => {
           await pool.query(
             `UPDATE ${q(target, "collection_controls")}
                 SET revision=4, control_state='degraded', upload_registration_enabled=true,
-                    processing_enabled=true, updated_at='2026-09-01T00:00:00.000Z'
+                    processing_enabled=true, reason_code='maintenance',
+                    updated_at='2026-09-01T00:00:00.000Z'
               WHERE singleton=1 AND reason_code IS NULL`,
           );
           legacyBefore = (await pool.query(
-            `SELECT revision::text AS revision, control_state, updated_at FROM ${q(target, "collection_controls")}`,
+            `SELECT revision::text AS revision, control_state, updated_at, reason_code
+               FROM ${q(target, "collection_controls")}`,
           )).rows;
         },
       });
+      assert.equal(legacyBefore[0].reason_code, "maintenance");
       const legacyAfter = await pool.query(
         `SELECT revision::text AS revision, control_state, updated_at, reason_code
            FROM ${q(legacy, "collection_controls")}`,
       );
-      assert.deepEqual(legacyAfter.rows, [{ ...legacyBefore[0], reason_code: "initial" }]);
+      assert.deepEqual(legacyAfter.rows, legacyBefore);
 
-      // (8) Fail closed: an out-of-vocabulary reason or an inconsistent row
-      // aborts the whole migration; nothing is rewritten.
-      for (const [target, update] of [
-        [rejected, "reason_code='synthetic-import-test'"],
-        [inconsistent, "control_state='operational', publication_enabled=true, revision=2"],
+      // (8) Fail closed: an out-of-vocabulary reason, an inconsistent row, or
+      // a NULL reason on any row other than the untouched bootstrap row (a
+      // change whose reason was never recorded; 'initial' would claim it was
+      // never changed) aborts the whole migration; nothing is rewritten.
+      for (const [target, update, sqlState] of [
+        [rejected, "reason_code='synthetic-import-test'", "23514"],
+        [inconsistent,
+          "control_state='operational', publication_enabled=true, revision=2, reason_code='maintenance'", "23514"],
+        [unrecordedChanged,
+          "revision=4, control_state='degraded', upload_registration_enabled=true, processing_enabled=true",
+          "23502"],
+        [unrecordedRevision, "revision=2", "23502"],
+        [unrecordedOperational,
+          `control_state='operational', enrollment_enabled=true, upload_registration_enabled=true,
+           processing_enabled=true, publication_enabled=true`,
+          "23502"],
+        // Revision 1 with every flag off, but not contained; and revision 1
+        // and contained, but one flag on: neither is the bootstrap shape.
+        [unrecordedState, "control_state='degraded'", "23502"],
+        ...PG_FLAG_COLUMNS_LIST.map((column) => [`${unrecordedFlag}_${column.slice(0, 3)}`, `${column}=true`, "23502"]),
       ]) {
         await createSchema(pool, target, created, { staged: false });
         await pool.query(`UPDATE ${q(target, "collection_controls")} SET ${update} WHERE singleton=1`);
-        await rejectsConstraint(applyStagedMigration(pool, target), "23514");
+        const before = (await pool.query(`SELECT * FROM ${q(target, "collection_controls")}`)).rows;
+        await rejectsConstraint(applyStagedMigration(pool, target), sqlState);
+        assert.deepEqual((await pool.query(`SELECT * FROM ${q(target, "collection_controls")}`)).rows, before,
+          "a failed 0050 must leave the controls row unchanged");
         const columns = await pool.query(
           `SELECT column_name FROM information_schema.columns
             WHERE table_schema=$1 AND table_name='admin_action_audit' AND column_name='id'`,

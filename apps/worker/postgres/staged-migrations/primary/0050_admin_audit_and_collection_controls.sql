@@ -19,13 +19,23 @@
 --     (src/collection-controls.ts) already refuses an inconsistent row, so the
 --     database now refuses to store one.
 --
--- Fail-closed backfill: only a NULL reason_code is normalized (to 'initial',
--- the D1 bootstrap reason).  Any other out-of-vocabulary reason, inconsistent
--- state/flag row, unknown audit action, over-long details or malformed
--- operation_id makes the ADD CONSTRAINT validation fail, so the migration
--- aborts and the schema stays at its previous version rather than silently
--- rewriting owner state.  No participant column is added; neither table
--- carries owner_digest.  Every RAISE carries a constant message and ERRCODE.
+-- Fail-closed backfill: only the untouched 0016 bootstrap row (revision 1,
+-- contained, all four flags off, NULL reason) is normalized, to 'initial',
+-- the D1 bootstrap reason.  A NULL reason on any other row records a change
+-- whose reason was never captured; labelling it 'initial' would claim the
+-- row was never changed, so SET NOT NULL refuses it instead.  Likewise any
+-- out-of-vocabulary reason, inconsistent state/flag row, unknown audit
+-- action, over-long details or malformed operation_id makes a constraint
+-- validation fail, so the migration aborts and the schema stays at its
+-- previous version rather than silently rewriting owner state.  No
+-- participant column is added; neither table carries owner_digest.  Every
+-- RAISE carries a constant message and ERRCODE.
+--
+-- The participantDigest index casts details_json to jsonb, which refuses a
+-- \u0000 escape or an unpaired UTF-16 surrogate escape.  A started
+-- run_maintenance row with such details therefore cannot be stored (a D1
+-- import of one must be refused explicitly); the PostgreSQL audit helpers
+-- refuse such details for every action with 400 BODY_INVALID.
 
 -- (1) admin_action_audit: identity id, backfilled in creation order.
 ALTER TABLE admin_action_audit ADD COLUMN id bigint;
@@ -114,10 +124,17 @@ CREATE TRIGGER admin_action_audit_no_truncate
 -- is written, so the 0042/0043 import-fence guards (BEFORE UPDATE OF
 -- control_state, enrollment_enabled, publication_enabled) do not fire and the
 -- revision is not advanced: this is a representation fix, not a control
--- change.
+-- change.  Only the bootstrap shape is backfilled; any other NULL reason
+-- fails SET NOT NULL (23502) and aborts the migration.
 UPDATE collection_controls
    SET reason_code = 'initial'
- WHERE reason_code IS NULL;
+ WHERE reason_code IS NULL
+   AND revision = 1
+   AND control_state = 'contained'
+   AND NOT enrollment_enabled
+   AND NOT upload_registration_enabled
+   AND NOT processing_enabled
+   AND NOT publication_enabled;
 ALTER TABLE collection_controls ALTER COLUMN reason_code SET NOT NULL;
 
 -- (6) collection_controls: state follows the flags exactly as D1 0009 and the

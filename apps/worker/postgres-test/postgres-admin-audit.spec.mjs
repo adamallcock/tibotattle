@@ -117,6 +117,24 @@ function refusingPool() {
   return { async connect() { throw new Error("a refused request must not reach the database"); } };
 }
 
+function refusingClient() {
+  return { async query() { throw new Error("a refused request must not reach the database"); } };
+}
+
+/** A plain TypeError with this exact message (never an ApiError). */
+function typeErrorWith(message) {
+  return (error) => {
+    assert.equal(error?.name, "TypeError");
+    assert.equal(error.message, message);
+    assert.equal(error.status, undefined);
+    return true;
+  };
+}
+
+function isBodyInvalid(error) {
+  return error?.name === "ApiError" && error.status === 400 && error.code === "BODY_INVALID";
+}
+
 test("PostgreSQL admin actor digest and bounded details are byte-identical to the Worker", async () => {
   await withWorkerModules(async ({ worker, audit }) => {
     assert.equal(audit.ADMIN_ACTOR_DOMAIN, "app-usagemonitor/admin-actor/v1\0");
@@ -165,6 +183,86 @@ test("PostgreSQL admin actor digest and bounded details are byte-identical to th
     // The Worker's finish reports an unchanged row as storage unavailable.
     assert.deepEqual(await apiError(worker.finishAdminOperation(recordingD1(0), randomUUID(), "success", {})),
       { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE" });
+
+    // Details that jsonb cannot represent (U+0000, an unpaired surrogate):
+    // the Worker stores them, but 0050's participantDigest index cannot cast
+    // them, so the PostgreSQL helpers refuse them for every action, in begin
+    // and finish, before any database work. Escaped backslashes that only
+    // look like such an escape, paired surrogates and other control
+    // characters are ordinary details.
+    for (const details of [
+      { note: "a\u0000b" },
+      { ["k\u0000"]: 1 },
+      { note: "a\ud800b" },
+      { note: "a\udbff" },
+      { note: "\udc00a" },
+      { note: "\\\u0000" },
+      { nested: [{ note: "\\\\\ud800" }] },
+    ]) {
+      const d1 = recordingD1();
+      await worker.beginAdminOperationWithId(d1, randomUUID(), "owner@example.invalid",
+        "sync_distribution", details, 0);
+      assert.equal(d1.statements[0].values[3], JSON.stringify(details), "the Worker stores these details");
+      assert.throws(() => audit.boundedAuditDetails(details), isBodyInvalid);
+      for (const action of audit.POSTGRES_ADMIN_ACTIONS) {
+        assert.deepEqual(await apiError(audit.beginPostgresAdminOperation(refusingPool(), "synthetic_schema", {
+          action, identityKey: "owner@example.invalid", details,
+        })), { status: 400, code: "BODY_INVALID" });
+        assert.deepEqual(await apiError(audit.beginPostgresAdminOperationInTransaction(refusingClient(),
+          "synthetic_schema", { action, identityKey: "owner@example.invalid", details })),
+        { status: 400, code: "BODY_INVALID" });
+      }
+      assert.deepEqual(await apiError(audit.finishPostgresAdminOperation(refusingPool(), "synthetic_schema", {
+        operationId: randomUUID(), outcome: "success", details,
+      })), { status: 400, code: "BODY_INVALID" });
+      assert.deepEqual(await apiError(audit.finishPostgresAdminOperationInTransaction(refusingClient(),
+        "synthetic_schema", { operationId: randomUUID(), outcome: "failure", details })),
+      { status: 400, code: "BODY_INVALID" });
+    }
+    for (const details of [
+      { note: "\\u0000" },
+      { note: "\\\\u0000" },
+      { note: "\\ud800" },
+      { note: "😀" },
+      { note: "\u0001\u001f\b\t" },
+      { participantDigest: "d".repeat(64) },
+    ]) {
+      assert.equal(audit.boundedAuditDetails(details), JSON.stringify(details));
+    }
+
+    // Invalid inputs are refused before any database work with a plain
+    // TypeError, from the pool and in-transaction variants alike: an action
+    // outside the closed set, a non-string identity key, a non-canonical
+    // instant, a non-object input, and a finish outcome that is not terminal.
+    const validBegin = { action: "run_maintenance", identityKey: "owner@example.invalid", details: {} };
+    for (const [input, message] of [
+      [{ ...validBegin, action: "erase_everything" }, "invalid admin action"],
+      [{ ...validBegin, action: undefined }, "invalid admin action"],
+      [{ ...validBegin, identityKey: 42 }, "invalid admin identity key"],
+      [{ ...validBegin, identityKey: undefined }, "invalid admin identity key"],
+      [{ ...validBegin, nowIso: "2026-09-26T12:00:00Z" }, "invalid admin operation time"],
+      [{ ...validBegin, nowIso: "2026-09-26" }, "invalid admin operation time"],
+      [{ ...validBegin, nowIso: "2026-09-26T12:00:00.000+00:00" }, "invalid admin operation time"],
+      [{ ...validBegin, nowIso: "not-a-time" }, "invalid admin operation time"],
+      [{ ...validBegin, nowIso: Date.parse("2026-09-26T12:00:00.000Z") }, "invalid admin operation time"],
+      [null, "invalid admin operation"],
+    ]) {
+      await assert.rejects(audit.beginPostgresAdminOperation(refusingPool(), "synthetic_schema", input),
+        typeErrorWith(message));
+      await assert.rejects(audit.beginPostgresAdminOperationInTransaction(refusingClient(), "synthetic_schema",
+        input), typeErrorWith(message));
+    }
+    for (const [input, message] of [
+      [{ operationId: randomUUID(), outcome: "started", details: {} }, "invalid admin operation outcome"],
+      [{ operationId: randomUUID(), outcome: "SUCCESS", details: {} }, "invalid admin operation outcome"],
+      [{ operationId: randomUUID(), outcome: undefined, details: {} }, "invalid admin operation outcome"],
+      [null, "invalid admin operation"],
+    ]) {
+      await assert.rejects(audit.finishPostgresAdminOperation(refusingPool(), "synthetic_schema", input),
+        typeErrorWith(message));
+      await assert.rejects(audit.finishPostgresAdminOperationInTransaction(refusingClient(), "synthetic_schema",
+        input), typeErrorWith(message));
+    }
   });
 });
 
@@ -234,6 +332,7 @@ test("0050 re-keys admin_action_audit as an append-only identity table and the a
   const pool = await connectPool(endpoint);
   const suffix = randomBytes(6).toString("hex");
   const schema = `aa0_audit_${suffix}`;
+  const planSchema = `aa0_audit_plan_${suffix}`;
   const created = [];
   const digest = WORKER_ACTOR_DIGEST_VECTORS[0].digest;
   const legacyIds = [
@@ -338,6 +437,16 @@ test("0050 re-keys admin_action_audit as an append-only identity table and the a
       );
       assert.equal(imported.rows[0].id, "100");
 
+      // The participantDigest index casts started run_maintenance details to
+      // jsonb, so details jsonb refuses cannot be stored in that shape (the
+      // reason the helpers refuse them); other rows store them as text.
+      const nulDetails = JSON.stringify({ note: "a\u0000b" });
+      const surrogateDetails = JSON.stringify({ note: "a\ud800b" });
+      await rejectsWith(insert([randomUUID(), "run_maintenance", digest, "started", nulDetails]), "22P05");
+      await rejectsWith(insert([randomUUID(), "run_maintenance", digest, "started", surrogateDetails]), "22P02");
+      assert.equal((await insert([randomUUID(), "run_maintenance", digest, "success", nulDetails])).rowCount, 1);
+      assert.equal((await insert([randomUUID(), "sync_distribution", digest, "started", surrogateDetails])).rowCount, 1);
+
       // begin (pool): a durable 'started' row with the Worker's bound values.
       const nowIso = "2026-09-26T12:00:00.000Z";
       const d1 = recordingD1();
@@ -386,14 +495,26 @@ test("0050 re-keys admin_action_audit as an append-only identity table and the a
         action: "run_maintenance", identityKey: "owner@example.invalid", details: {},
       })), { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE" });
 
-      // The participant-erasure lease probe can use the partial index.
+      // The participant-erasure lease probe and the recent-actions list can
+      // use their indexes. The id backfill above leaves HOT chains, so the
+      // indexes 0050 builds on a populated table carry indcheckxmin and stay
+      // unusable while any older snapshot is open on this shared cluster.
+      // The planner proof therefore runs on a schema migrated with an empty
+      // table, where the indexes are usable at once.
+      await createSchema(pool, planSchema, created);
+      const planTable = q(planSchema, "admin_action_audit");
+      const checkXmin = await pool.query(
+        "SELECT bool_or(indcheckxmin) AS pending FROM pg_index WHERE indrelid = to_regclass($1)",
+        [planTable],
+      );
+      assert.equal(checkXmin.rows[0].pending, false);
       const leaseClient = await pool.connect();
       try {
         await leaseClient.query("BEGIN");
         await leaseClient.query("SET LOCAL enable_seqscan = off");
         const plan = await leaseClient.query(
           `EXPLAIN (FORMAT JSON)
-           SELECT 1 FROM ${table}
+           SELECT 1 FROM ${planTable}
             WHERE outcome = 'started' AND action = 'run_maintenance'
               AND (details_json::jsonb) ->> 'participantDigest' = $1
               AND created_at > $2::timestamptz`,
@@ -402,7 +523,7 @@ test("0050 re-keys admin_action_audit as an append-only identity table and the a
         assert.match(JSON.stringify(plan.rows), /admin_action_audit_started_participant/u);
         const recent = await leaseClient.query(
           `EXPLAIN (FORMAT JSON)
-           SELECT action, outcome FROM ${table} ORDER BY created_at DESC, id DESC LIMIT 20`,
+           SELECT action, outcome FROM ${planTable} ORDER BY created_at DESC, id DESC LIMIT 20`,
         );
         assert.match(JSON.stringify(recent.rows), /admin_action_audit_recent/u);
       } finally {
@@ -449,6 +570,7 @@ test("0050 re-keys admin_action_audit as an append-only identity table and the a
       for (const commit of [false, true]) {
         const client = await pool.connect();
         let inTransaction;
+        let settled = false;
         try {
           await client.query("BEGIN");
           inTransaction = await audit.beginPostgresAdminOperationInTransaction(client, schema, {
@@ -466,8 +588,12 @@ test("0050 re-keys admin_action_audit as an append-only identity table and the a
           assert.equal((await pool.query(`SELECT 1 FROM ${table} WHERE operation_id=$1`,
             [inTransaction])).rowCount, 0);
           await client.query(commit ? "COMMIT" : "ROLLBACK");
+          settled = true;
         } finally {
-          client.release();
+          // A failed assertion must not return an open transaction to the
+          // pool, where the schema cleanup could reuse it and be rolled back.
+          if (!settled) await client.query("ROLLBACK").catch(() => undefined);
+          client.release(!settled);
         }
         assert.equal((await pool.query(`SELECT 1 FROM ${table} WHERE operation_id=$1 AND outcome='success'`,
           [inTransaction])).rowCount, commit ? 1 : 0);

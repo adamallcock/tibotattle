@@ -58,7 +58,10 @@ export interface PostgresAdminOperationBegin {
   readonly action: AdminAction;
   /** Owner identity key; only its domain-separated digest is stored. */
   readonly identityKey: string;
-  /** JSON-serializable, content-free details; at most 2000 characters. */
+  /**
+   * JSON-serializable, content-free details; at most 2000 characters and
+   * representable as jsonb (see boundedAuditDetails).
+   */
   readonly details: unknown;
   /** Canonical ISO-8601 UTC instant; defaults to the current time. */
   readonly nowIso?: string;
@@ -98,13 +101,29 @@ export async function postgresAdminActorDigest(identityKey: string): Promise<str
 }
 
 /**
+ * A \u0000 escape or an unpaired-surrogate escape that begins an escape
+ * sequence (preceded by an even run of backslashes). JSON.stringify writes
+ * U+0000 and an unpaired surrogate only in these forms (lowercase hex) and
+ * writes paired surrogates as raw characters; PostgreSQL jsonb refuses both
+ * escapes (22P05, 22P02).
+ */
+const JSONB_UNREPRESENTABLE_ESCAPE = /(?:^|[^\\])(?:\\\\)*\\u(?:0000|d[89a-f][0-9a-f]{2})/u;
+
+/**
  * The Worker's safeJson: JSON.stringify, refusing anything that does not
  * serialize to a string of at most 2000 UTF-16 code units with 400
  * BODY_INVALID. The database bound counts characters, which is never more.
+ *
+ * One deliberate, fail-closed addition for every action: details that
+ * PostgreSQL jsonb cannot represent (U+0000 or an unpaired surrogate, which
+ * the Worker would store) are also 400 BODY_INVALID. 0050's participantDigest
+ * index casts started run_maintenance details to jsonb, so such a begin would
+ * otherwise fail inside the database as 503 storage unavailability.
  */
 export function boundedAuditDetails(details: unknown): string {
   const json = JSON.stringify(details);
-  if (typeof json !== "string" || json.length > ADMIN_AUDIT_DETAILS_MAX_LENGTH) {
+  if (typeof json !== "string" || json.length > ADMIN_AUDIT_DETAILS_MAX_LENGTH
+      || JSONB_UNREPRESENTABLE_ESCAPE.test(json)) {
     throw new ApiError(400, "BODY_INVALID");
   }
   return json;
