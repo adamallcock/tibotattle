@@ -13,6 +13,8 @@ vi.mock('../src/storage-analytics-runtime',()=>({runStorageAnalyticsPass:vi.fn()
 const pass=vi.mocked(runStorageAnalyticsPass);
 const log=vi.fn(),errorLog=vi.fn();
 const result={state:'progress' as const,reason:'step_limit' as const,steps:1,recordsRead:0,queriesUsed:0,dailyPublications:0,graphCalculations:0};
+/** Delivery that finished its journal inside the first slice. */
+const caughtUp={...result,state:'idle' as const,reason:'complete' as const};
 function database():D1Database {
  const statement={bind(){return this;},async run(){return {success:true,results:[],meta:{}};}};
  return {prepare(){return statement;}} as unknown as D1Database;
@@ -31,7 +33,7 @@ describe('ordered ingestion before public analytics',()=>{
   pass.mockImplementationOnce(async options=>{
    expect(options).toMatchObject({publishCommunity:false,maxSteps:32,maxQueries:175,deadlineMs:NOW+10_000});
    for(let i=0;i<175;i++)await options.source.prepare('SELECT 1').run();
-   return {...result,steps:16,recordsRead:3200,queriesUsed:175};
+   return {...caughtUp,steps:16,recordsRead:3200,queriesUsed:175};
   }).mockImplementationOnce(async options=>{
    expect(options).toMatchObject({publishCommunity:true,publicOnly:true,maxSteps:32,maxQueries:725,deadlineMs:NOW+55_000});
    await options.target.prepare('SELECT 1').run();
@@ -40,8 +42,43 @@ describe('ordered ingestion before public analytics',()=>{
   await runStorageAnalyticsSchedule(environment());
   expect(pass).toHaveBeenCalledTimes(2);
   expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({steps:18,recordsRead:3200,queriesUsed:176,
-   deliverySteps:16,deliveryRecordsRead:3200,deliveryQueriesUsed:175,
+   deliverySteps:16,deliveryRecordsRead:3200,deliveryQueriesUsed:175,deliveryCatchUp:false,
    publicIterations:2,publicRecordsRead:0,publicQueriesUsed:1,graphCalculations:1});
+ });
+ it('gives a delivery backlog a second, larger slice of the same invocation before graph work',async()=>{
+  pass.mockImplementationOnce(async options=>{
+   for(let i=0;i<175;i++)await options.source.prepare('SELECT 1').run();
+   return {...result,state:'deferred',reason:'query_budget',steps:1,recordsRead:1000,queriesUsed:175};
+  }).mockImplementationOnce(async options=>{
+   expect(options).toMatchObject({publishCommunity:false,maxSteps:32,maxQueries:600,deadlineMs:NOW+45_000});
+   expect(options).not.toHaveProperty('publicOnly');
+   for(let i=0;i<500;i++)await options.target.prepare('SELECT 1').run();
+   return {...result,state:'deferred',reason:'deadline',steps:5,recordsRead:5000,queriesUsed:500};
+  }).mockImplementationOnce(async options=>{
+   // The rest of the same meter and window, never a fresh allowance.
+   expect(options).toMatchObject({publishCommunity:true,publicOnly:true,maxQueries:225,deadlineMs:NOW+55_000});
+   return {...caughtUp,steps:1};
+  });
+  await runStorageAnalyticsSchedule(environment());
+  expect(pass).toHaveBeenCalledTimes(3);
+  expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({event:'storage_analytics_schedule',
+   deliverySteps:6,deliveryRecordsRead:6000,deliveryQueriesUsed:675,deliveryCatchUp:true,queriesUsed:675});
+ });
+ it('never catches up after a capacity refusal, without a full slice left, or when switched off',async()=>{
+  const pending={...result,state:'deferred' as const,reason:'query_budget' as const};
+  for(const [first,env,elapsed] of [
+   [{...result,state:'deferred' as const,reason:'capacity' as const},environment(),0],
+   [{...result,state:'deferred' as const,reason:'format_boundary' as const},environment(),0],
+   [pending,environment(),36_000],
+   [pending,{...environment(),STORAGE_DELIVERY_CATCH_UP:'disabled' as const},0],
+  ] as const) {
+   pass.mockReset();log.mockReset();vi.setSystemTime(NOW);
+   pass.mockImplementationOnce(async()=>{vi.setSystemTime(NOW+elapsed);return first;}).mockResolvedValueOnce(caughtUp);
+   await runStorageAnalyticsSchedule(env);
+   expect(pass).toHaveBeenCalledTimes(2);
+   expect(pass.mock.calls[1]![0]).toMatchObject({publishCommunity:true,publicOnly:true});
+   expect(JSON.parse(log.mock.calls[0]![0] as string).deliveryCatchUp).toBe(false);
+  }
  });
  it('stops instead of starting graph work after delivery fails',async()=>{
   pass.mockRejectedValueOnce(new Error('synthetic failure'));
@@ -116,7 +153,7 @@ describe('long graph-only pass on the single minute schedule',()=>{
  });
  it('keeps every other minute on the two-phase pass',async()=>{
   for(const minute of [1,7,9,11,59]) {
-   pass.mockReset();log.mockReset();vi.setSystemTime(at(minute));pass.mockResolvedValue(result);
+   pass.mockReset();log.mockReset();vi.setSystemTime(at(minute));pass.mockResolvedValue(caughtUp);
    await runStorageAnalyticsSchedule(environment(),{cron:STORAGE_ANALYTICS_MINUTE_CRON,nowMs:at(minute)});
    expect(pass).toHaveBeenCalledTimes(2);
    expect(pass.mock.calls[1]![0]).toMatchObject({publishCommunity:true,publicOnly:true,deadlineMs:at(minute)+55_000});
@@ -142,6 +179,16 @@ describe('long graph-only pass on the single minute schedule',()=>{
   await runStorageAnalyticsSchedule(environment());
   expect(pass.mock.calls[1]![0]).toMatchObject({graphOnly:true});
   expect(STORAGE_ANALYTICS_LONG_PASS_MINUTES).toBe(10);
+ });
+ it('keeps the long graph window during a delivery backlog',async()=>{
+  vi.setSystemTime(at(40));
+  pass.mockImplementationOnce(async()=>({...result,state:'deferred',reason:'query_budget'}))
+   .mockResolvedValueOnce(result);
+  await runStorageAnalyticsSchedule(environment(),{nowMs:at(40)});
+  expect(pass).toHaveBeenCalledTimes(2);
+  expect(pass.mock.calls[1]![0]).toMatchObject({graphOnly:true,graphLeaseMs:570_000});
+  expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({event:'storage_analytics_long_schedule',
+   deliveryCatchUp:false});
  });
  it('stays on the bounded pass at a tenth minute when publication is deployed off',async()=>{
   vi.setSystemTime(at(30));pass.mockResolvedValue(result);
