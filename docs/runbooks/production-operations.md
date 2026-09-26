@@ -699,8 +699,15 @@ A v1.1 day is public only once a domain generation covers it. Some accountless
 devices upload complete days but never activate one: a first sync is cut off by
 the client's pass budget, or a newer build re-emits an accepted day without one
 of its records, so the device's own activation fails the preservation proof.
-The owner can activate such uploads with the existing admin action and one
-closed object:
+The owner can activate such uploads from the admin console's **Activate
+stranded v1.1 uploads** card. **Preview** pages through every device without
+changing anything and shows the counts. **Activate N devices** is enabled only
+by a successful preview from the last 15 minutes, runs once per preview, and
+reports what it activated, including after a partial failure. Activation is a production write and needs
+explicit authorization.
+
+Both buttons send the existing admin action with one closed object, which can
+also be sent directly:
 
 ```json
 { "action": "run_maintenance",
@@ -709,8 +716,7 @@ closed object:
 
 Send it from the admin origin with the Access owner identity and
 `x-usage-monitor-admin: 1`. Always run the dry run first. Page with the returned
-`nextAfterParticipantId` until it is `null` (`maxDevices` is 1–25). Applying it
-(`dryRun: false`) is a production write and needs explicit authorization.
+`nextAfterParticipantId` until it is `null` (`maxDevices` is 1–25).
 
 For each device, the action uses only that device's own complete uploads. With
 no head, it takes the longest contiguous run of ready days (the latest run on a
@@ -727,9 +733,12 @@ It skips a device when any of these hold:
 - it has v1 or v0.2 history, or a head from another device;
 - it has no contiguous complete day.
 
-The result and the `run_maintenance` audit (`task: "v11_evidence_adoption"`)
-hold outcome counts, refusal codes, days covered, new days and accepted days
-kept. They never hold identifiers. A rerun with nothing new returns `unchanged`.
+The `run_maintenance` audit (`task: "v11_evidence_adoption"`) holds only
+outcome counts, refusal codes, days covered, new days and accepted days kept.
+The owner's response adds one identifier: when more devices remain,
+`nextAfterParticipantId` is the last examined pseudonymous participant, used as
+the paging cursor. Keep it out of notes, issues and receipts. A rerun with
+nothing new returns `unchanged`.
 
 Adoption does not unblock the client. A device whose build dropped an accepted
 record keeps being refused, so later runs extend its head over newer complete

@@ -23,7 +23,8 @@ import { activateTelemetryV11Domain, V11_DOMAIN_METHOD_VERSION } from "./telemet
  * activation path: every database proof still applies and refuses anything a
  * client could not activate itself. Only a device whose own v1.1 upload
  * authority is currently valid is considered; a device that may be mid-pass or
- * has moved to v1.2 is left to its client. Results are counts only.
+ * has moved to v1.2 is left to its client. The audit holds counts only; the
+ * owner's result adds just the pseudonymous participant paging cursor.
  */
 export const V11_EVIDENCE_ADOPTION_METHOD = "v11-uploaded-evidence-adoption-1";
 export const V11_EVIDENCE_ADOPTION_MAX_DEVICES = 25;
