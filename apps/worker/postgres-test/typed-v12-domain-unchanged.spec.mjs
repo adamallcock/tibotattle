@@ -595,16 +595,119 @@ test("an empty-day-only domain is unchanged on the second pass", {
   });
 });
 
-/** An exact model of the D1 pruning rule, used as the oracle: unconsumed rows
- * that are expired or ranked beyond the newest seven by (created_at DESC,
- * token_hash) are deleted. No unconsumed row in this scenario is referenced by
- * a domain; the separate test below covers that guard. */
-function expectedAfterIssue(model, nowEpoch) {
-  const ranked = model.filter((row) => !row.consumed).sort((a, b) => b.createdAt - a.createdAt
+test("the unchanged receipt stays behind the v1.2 write gate and the active-participant check", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12gate", async (context) => {
+    const participant = await seedParticipant(context, "gated");
+    const principal = await seedDevice(context, participant, "gated");
+    const vector = [await registerEmptyDay(context, principal, DAY_ONE)];
+    const first = newGeneration((await clientPass(context, principal, vector)).result, null);
+
+    // A fresh predecessor with the head's exact vector, issued while the
+    // device is still admitted: only the admission state below differs from
+    // an unchanged receipt.
+    const fresh = await context.domain.createPredecessor(principal);
+    const manifest = domainManifest(fresh, vector);
+    const expectedReceipt = {
+      ...first,
+      replay: true,
+      unchanged: true,
+      requestedManifestDigest: manifest.manifestDigest,
+    };
+    const quiet = await snapshot(context);
+    const refusedWithoutWrites = async (expected, message) => {
+      await assert.rejects(context.domain.activate(principal, manifest), expected, message);
+      assert.deepEqual(await snapshot(context), quiet, `${message}: nothing is written`);
+      assert.equal((await predecessorRow(context, fresh.token)).consumed_at, null);
+    };
+
+    // A revoked v1.2 capability (opt-out or security reset) blocks transport.
+    await pool.query(`UPDATE ${context.table("telemetry_v12_device_capabilities")}
+      SET state='revoked', revoked_at=$3 WHERE participant_id=$1 AND device_id=$2`,
+    [principal.participantId, principal.deviceId, new Date().toISOString()]);
+    await refusedWithoutWrites({ status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED" },
+      "a revoked device is blocked, not acknowledged as current");
+    await pool.query(`UPDATE ${context.table("telemetry_v12_device_capabilities")}
+      SET state='accepted', revoked_at=NULL WHERE participant_id=$1 AND device_id=$2`,
+    [principal.participantId, principal.deviceId]);
+
+    // A blocked v1.2 runtime blocks transport for every device.
+    await pool.query(`UPDATE ${context.table("telemetry_v12_runtime")} SET state='blocked' WHERE id=1`);
+    await refusedWithoutWrites({ status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED" },
+      "a blocked runtime is not acknowledged");
+    await pool.query(`UPDATE ${context.table("telemetry_v12_runtime")} SET state='active' WHERE id=1`);
+
+    // Control: once admitted again, the same predecessor and manifest reach
+    // the receipt, so both refusals above came from admission alone.
+    assert.deepEqual(await context.domain.activate(principal, manifest), expectedReceipt);
+    assert.deepEqual(await snapshot(context), quiet);
+
+    // A participant that has left 'active' fails the write gate's identity
+    // check (401) before the state check. The state change itself advances
+    // the input revisions, so the no-write baseline is taken after it; the
+    // head and the predecessor's revision still match, so only the ordering
+    // keeps this from becoming a receipt.
+    await pool.query(`UPDATE ${context.table("participants")} SET state='deleting' WHERE id=$1`,
+      [principal.participantId]);
+    const deletingQuiet = await snapshot(context);
+    await assert.rejects(context.domain.activate(principal, manifest),
+      { status: 401, code: "DEVICE_AUTH_INVALID" });
+    assert.deepEqual(await snapshot(context), deletingQuiet,
+      "a non-active participant receives no receipt and nothing is written");
+    assert.equal((await predecessorRow(context, fresh.token)).consumed_at, null);
+    assert.deepEqual(await head(context, principal.participantId),
+      { generation_id: first.generationId, revision: 1 });
+  });
+});
+
+/** An exact model of the D1 pruning rule, used as the oracle: this device's
+ * unconsumed rows that are expired or ranked beyond the newest seven by
+ * (created_at DESC, token_hash) are deleted. No unconsumed row in these
+ * scenarios is referenced by a domain; a separate test covers that guard.
+ * `rankable` is the set the newest-seven rank is taken over. The rule ranks
+ * only this device's unconsumed rows; the tests pass wider sets only to prove
+ * that a scenario would expose a mis-scoped rank. */
+function expectedAfterIssue(model, nowEpoch, rankable = model.filter((row) => !row.consumed)) {
+  const ranked = [...rankable].sort((a, b) => b.createdAt - a.createdAt
     || (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0));
   const beyondNewest = new Set(ranked.slice(NEWEST_KEPT).map((row) => row.hash));
   return model.filter((row) => row.consumed
     || !(row.expiresAt <= nowEpoch || beyondNewest.has(row.hash)));
+}
+
+function survivingHashes(model) {
+  return model.filter((row) => !row.consumed).map((row) => row.hash).sort();
+}
+
+/** Issue one predecessor for `principal` at `nowEpoch` against a per-device
+ * oracle ledger, then assert every tracked device's unconsumed set exactly.
+ * `mutants` maps a name to a function that returns the wider `rankable` set
+ * a mis-scoped rank would use; the result records whether that mutant would
+ * have left a different set for the issuing device on this issue. */
+async function issueChecked(context, ledger, principal, nowEpoch, mutants = {}) {
+  const entry = ledger.get(principal.deviceId);
+  const expected = expectedAfterIssue(entry.rows, nowEpoch);
+  const diverged = {};
+  for (const [name, rankable] of Object.entries(mutants)) {
+    diverged[name] = JSON.stringify(survivingHashes(expectedAfterIssue(entry.rows, nowEpoch, rankable(ledger))))
+      !== JSON.stringify(survivingHashes(expected));
+  }
+  entry.rows = expected;
+  const predecessor = await context.domain.createPredecessor(principal, nowEpoch);
+  entry.rows.push({
+    hash: sha256Hex(predecessor.token),
+    createdAt: nowEpoch,
+    expiresAt: nowEpoch + PREDECESSOR_TTL_MS,
+    consumed: false,
+  });
+  for (const tracked of ledger.values()) {
+    assert.deepEqual(await unconsumedFor(context, tracked.principal), survivingHashes(tracked.rows),
+      `device ${tracked.label}: exactly the oracle's unconsumed predecessors survive`);
+    assert.ok(survivingHashes(tracked.rows).length <= OUTSTANDING_CAP);
+  }
+  return { predecessor, diverged };
 }
 
 test("predecessor pruning keeps the newest seven across twelve unchanged passes", {
@@ -745,6 +848,154 @@ test("pruning removes expired predecessors but never one a domain references", {
       FROM ${context.table("telemetry_v12_domain_predecessors")} WHERE token_hash=$1`, [referencedHash]);
     assert.equal(remaining.rows[0].n, 1);
     // The last fresh predecessor still activates to an unchanged receipt.
+    const receipt = await context.domain.activate(principal, domainManifest(fresh.at(-1), vector));
+    assert.equal(receipt.unchanged, true);
+    assert.equal(receipt.generationId, first.generationId);
+  });
+});
+
+test("pruning ranks each device's own predecessors when another device's are newer", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12devrank", async (context) => {
+    const participant = await seedParticipant(context, "device-rank");
+    const deviceA = await seedDevice(context, participant, "rank-a");
+    const deviceB = await seedDevice(context, participant, "rank-b");
+    const ledger = new Map([
+      [deviceA.deviceId, { label: "A", principal: deviceA, rows: [] }],
+      [deviceB.deviceId, { label: "B", principal: deviceB, rows: [] }],
+    ]);
+    // A participant-wide rank would take the newest seven across both devices.
+    const mutants = {
+      participantWide: (all) => [...all.values()].flatMap((entry) => entry.rows.filter((row) => !row.consumed)),
+    };
+    const startEpoch = Date.now();
+    let tick = 0;
+    let participantWideDivergences = 0;
+    const issue = async (principal) => {
+      tick += 1;
+      const { diverged } = await issueChecked(context, ledger, principal, startEpoch + tick * 1_000, mutants);
+      if (diverged.participantWide) participantWideDivergences += 1;
+    };
+    // A's rows are older than all of B's, which then fill a participant-wide
+    // newest seven on their own, before A and B keep issuing in turn.
+    for (let index = 0; index < 3; index += 1) await issue(deviceA);
+    for (let index = 0; index < 7; index += 1) await issue(deviceB);
+    await issue(deviceA);
+    assert.equal(ledger.get(deviceA.deviceId).rows.length, 4,
+      "A keeps all four of its own predecessors although B holds seven newer ones");
+    for (let index = 0; index < 2; index += 1) await issue(deviceB);
+    for (let index = 0; index < 6; index += 1) await issue(deviceA);
+    assert.ok(participantWideDivergences > 0,
+      "the scenario is discriminating: a participant-wide rank would have deleted A's rows");
+    assert.equal(survivingHashes(ledger.get(deviceA.deviceId).rows).length, OUTSTANDING_CAP);
+    assert.equal(survivingHashes(ledger.get(deviceB.deviceId).rows).length, OUTSTANDING_CAP);
+  });
+});
+
+test("pruning ranks only unconsumed predecessors when changed and unchanged passes interleave", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12consumed", async (context) => {
+    const participant = await seedParticipant(context, "consumed-rank");
+    const principal = await seedDevice(context, participant, "consumed-rank");
+    const ledger = new Map([[principal.deviceId, { label: "principal", principal, rows: [] }]]);
+    // A rank that also counted consumed rows would let them take slots.
+    const mutants = { withConsumed: (all) => all.get(principal.deviceId).rows };
+    let current = await registerEmptyDay(context, principal, DAY_ONE);
+    const startEpoch = Date.now();
+    let generationId = null;
+    let consumedDivergences = 0;
+    const passes = 9;
+    for (let pass = 1; pass <= passes; pass += 1) {
+      // Odd passes carry a replaced same-day manifest and consume their
+      // renewed predecessor; even passes are unchanged and consume nothing,
+      // so consumed and unconsumed rows interleave in creation order. The
+      // passes are a minute apart, so no row expires and only rank prunes.
+      const changed = pass % 2 === 1;
+      if (changed && pass > 1) {
+        current = await registerEmptyDay(context, principal, DAY_ONE, `synthetic-empty-day-pass-${pass}`);
+      }
+      const nowEpoch = startEpoch + (pass - 1) * 60_000;
+      const issued = [];
+      for (let index = 0; index < 2; index += 1) {
+        const { predecessor, diverged } = await issueChecked(context, ledger, principal, nowEpoch, mutants);
+        if (diverged.withConsumed) consumedDivergences += 1;
+        issued.push(predecessor);
+      }
+      const [before, renewed] = issued;
+      assert.equal(renewed.legacyFingerprint, before.legacyFingerprint);
+      const result = await context.domain.activate(principal, domainManifest(renewed, [current]));
+      if (changed) {
+        newGeneration(result, generationId);
+        generationId = result.generationId;
+        ledger.get(principal.deviceId).rows.find((row) => row.hash === sha256Hex(renewed.token)).consumed = true;
+        assert.notEqual((await predecessorRow(context, renewed.token)).consumed_at, null);
+      } else {
+        assert.equal(result.unchanged, true, `pass ${pass} is an unchanged receipt`);
+        assert.equal(result.generationId, generationId);
+        assert.equal((await predecessorRow(context, renewed.token)).consumed_at, null);
+      }
+      assert.deepEqual(await unconsumedFor(context, principal), survivingHashes(ledger.get(principal.deviceId).rows),
+        `pass ${pass}: activation changes only the consumed marker of its own predecessor`);
+    }
+    const consumed = ledger.get(principal.deviceId).rows.filter((row) => row.consumed);
+    assert.equal(consumed.length, Math.ceil(passes / 2));
+    assert.ok(consumedDivergences > 0,
+      "the scenario is discriminating: counting consumed rows in the rank would have deleted unconsumed ones");
+    // Consumed rows are never pruned, whatever their age.
+    const consumedRows = await pool.query(`SELECT token_hash
+      FROM ${context.table("telemetry_v12_domain_predecessors")}
+      WHERE participant_id=$1 AND device_id=$2 AND consumed_at IS NOT NULL ORDER BY token_hash`,
+    [principal.participantId, principal.deviceId]);
+    assert.deepEqual(consumedRows.rows.map((row) => row.token_hash), consumed.map((row) => row.hash).sort());
+  });
+});
+
+test("the eight-outstanding refusal still holds when referenced predecessors survive pruning", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12cap", async (context) => {
+    const participant = await seedParticipant(context, "cap");
+    const principal = await seedDevice(context, participant, "cap");
+    const vector = [await registerEmptyDay(context, principal, DAY_ONE)];
+    const first = newGeneration((await clientPass(context, principal, vector)).result, null);
+
+    // An unexpired, unconsumed predecessor that a (synthetic, non-head)
+    // domain references: pruning must keep it and it counts toward the cap.
+    const nowEpoch = Date.now();
+    const referenced = await context.domain.createPredecessor(principal, nowEpoch);
+    const referencedHash = sha256Hex(referenced.token);
+    await pool.query(`INSERT INTO ${context.table("telemetry_v12_domains")}(
+      id, participant_id, device_id, predecessor_token_hash, previous_generation_id,
+      manifest_digest, legacy_fingerprint, input_revision, from_day, through_day,
+      days_json, created_at
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::date,$9::date,'[]',$10)`, [
+      randomUUID(), principal.participantId, principal.deviceId, referencedHash,
+      first.generationId, randomBytes(32).toString("hex"), referenced.legacyFingerprint,
+      await inputRevision(context, principal.participantId), DAY_ONE,
+      new Date(nowEpoch).toISOString(),
+    ]);
+
+    // Seven newer predecessors: the referenced row falls beyond the newest
+    // seven but stays, and the first pass's 'before' row is pruned.
+    const fresh = [];
+    for (let index = 1; index <= NEWEST_KEPT; index += 1) {
+      fresh.push(await context.domain.createPredecessor(principal, nowEpoch + index * 1_000));
+    }
+    const outstanding = [...fresh.map((item) => sha256Hex(item.token)), referencedHash].sort();
+    assert.equal(outstanding.length, OUTSTANDING_CAP);
+    assert.deepEqual(await unconsumedFor(context, principal), outstanding);
+    const quiet = await snapshot(context);
+    await assert.rejects(context.domain.createPredecessor(principal, nowEpoch + (NEWEST_KEPT + 1) * 1_000),
+      { status: 409, code: "TELEMETRY_MANIFEST_CONFLICT" });
+    assert.deepEqual(await snapshot(context), quiet, "the refused issue writes and deletes nothing");
+    assert.deepEqual(await unconsumedFor(context, principal), outstanding);
+
+    // The newest outstanding predecessor still activates to the receipt.
     const receipt = await context.domain.activate(principal, domainManifest(fresh.at(-1), vector));
     assert.equal(receipt.unchanged, true);
     assert.equal(receipt.generationId, first.generationId);
