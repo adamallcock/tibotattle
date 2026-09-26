@@ -1,12 +1,15 @@
-/// <reference types="vite/client" />
 import { applyD1Migrations, env, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import indexSource from "../src/index.ts?raw";
+// Vite's ?raw query hands the ratchet the unchanged index.ts text. It is left
+// untyped here on purpose: a program-wide `vite/client` reference would give
+// src/** Vite-only ambient types (import.meta.env, import.meta.glob, asset
+// modules) that the deployed Worker bundle does not provide.
+// @ts-expect-error -- test-only Vite ?raw import, checked by rawText below.
+import rawIndexSource from "../src/index.ts?raw";
 import {
   EDGE_ADMISSION_BINDINGS,
-  EDGE_ADMISSION_OUTCOMES,
   EDGE_ADMISSION_POLICY,
   edgeAdmissionPolicyFor,
   evaluateEdgeAdmission,
@@ -25,6 +28,13 @@ interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
   TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[];
 }
+
+function rawText(value: unknown): string {
+  if (typeof value !== "string") throw new TypeError("expected the Vite ?raw text of index.ts");
+  return value;
+}
+
+const indexSource = rawText(rawIndexSource);
 
 // Synthetic, content-free fixtures: a documentation-range address and a
 // throwaway key that only ever exists in this spec.
@@ -182,18 +192,26 @@ interface ProbeObservation {
 }
 
 /**
- * Drives the unchanged Worker handleRequest with spy limiters. The spies
- * succeed until the last call the policy predicts and fail that one, so both
- * the coarse and the client binding are observed and the request ends at the
- * limiter instead of reaching storage or authentication.
+ * Drives the unchanged Worker handleRequest with spy limiters.
+ *
+ * "limit-last": the spies succeed until the last call the policy predicts and
+ * fail that one, so both the coarse and the client binding are observed and
+ * the request ends at the limiter instead of reaching storage or
+ * authentication.
+ *
+ * "admit-all": every spy succeeds, so the request continues past admission
+ * until a later guard refuses it, and any further address-keyed call the
+ * route makes after the predicted ones (deviceSyncPrincipal admits before it
+ * authenticates) is observed too.
  */
 async function observeRoute(
   policy: EdgeAdmissionPolicy,
   definition: Readonly<WorkerRouteDefinition>,
   method: string,
+  mode: "limit-last" | "admit-all" = "limit-last",
 ): Promise<ProbeObservation> {
   const entry = lookup(policy, definition.id);
-  const failingCall = entry === null
+  const failingCall = entry === null || mode === "admit-all"
     ? Number.POSITIVE_INFINITY
     : entry.coarseBinding === null ? 1 : 2;
   const { calls, limiters } = recordingLimiters(
@@ -224,6 +242,11 @@ async function observeRoute(
   };
 }
 
+function edgeTierCalls(calls: readonly LimiterCall[]): LimiterCall[] {
+  return calls.filter((call) =>
+    (EDGE_ADMISSION_BINDINGS as readonly string[]).includes(call.binding));
+}
+
 function helperForPurpose(purpose: string): EdgeAdmissionHelper {
   if (purpose === "upload_ingress") return "upload_ingress";
   if (purpose === "public_aggregate_read") return "public_read";
@@ -237,8 +260,7 @@ function probeMismatches(
 ): string[] {
   const label = `${observation.method} ${observation.routeId}`;
   const entry = lookup(policy, observation.routeId);
-  const edgeCalls = observation.calls.filter((call) =>
-    (EDGE_ADMISSION_BINDINGS as readonly string[]).includes(call.binding));
+  const edgeCalls = edgeTierCalls(observation.calls);
   if (entry === null) {
     return edgeCalls.length === 0
       ? []
@@ -299,29 +321,175 @@ const HELPER_NAMES = [
 ] as const;
 const HELPER_CALL = /\b(?:assertAttemptAllowed|assertPublicAggregateReadAllowed|assertUploadIngressRequestAllowed)\s*\(/gu;
 const HELPER_REFERENCE = /\b(?:assertAttemptAllowed|assertPublicAggregateReadAllowed|assertUploadIngressRequestAllowed)\b/gu;
-const ATTEMPT_CALL = /\bassertAttemptAllowed\(\s*env\.([A-Z_]+),\s*env\.([A-Z_]+),\s*request,\s*env,\s*"([a-z_]+)",?\s*\)/gu;
-const UPLOAD_INGRESS_CALL = /\bassertUploadIngressRequestAllowed\(\s*env\.([A-Z_]+),\s*env\.([A-Z_]+),\s*request,\s*env,?\s*\)/gu;
-const PUBLIC_READ_CALL = /\bassertPublicAggregateReadAllowed\(\s*env\.([A-Z_]+),\s*request,\s*env,?\s*\)/gu;
+// The reviewed argument shapes, matched at each call site (sticky).
+const CALL_SHAPES: readonly (readonly [RegExp, (match: RegExpExecArray) => string])[] = [
+  [
+    /assertAttemptAllowed\(\s*env\.([A-Z_]+),\s*env\.([A-Z_]+),\s*request,\s*env,\s*"([a-z_]+)",?\s*\)/uy,
+    (match) => `attempt ${match[3]} ${match[1]} ${match[2]}`,
+  ],
+  [
+    /assertUploadIngressRequestAllowed\(\s*env\.([A-Z_]+),\s*env\.([A-Z_]+),\s*request,\s*env,?\s*\)/uy,
+    (match) => `upload_ingress upload_ingress ${match[1]} ${match[2]}`,
+  ],
+  [
+    /assertPublicAggregateReadAllowed\(\s*env\.([A-Z_]+),\s*request,\s*env,?\s*\)/uy,
+    (match) => `public_read public_aggregate_read null ${match[1]}`,
+  ],
+];
 // Thirteen today: eleven attempt calls (deviceSyncPrincipal counted once for
 // its twelve routes), one upload ingress call and one public read call.
 const EXPECTED_CALL_SITES = 13;
+// Ten today: the handlers that reach assertAttemptAllowed through
+// deviceSyncPrincipal (the two domain handlers serve two route ids each).
+const EXPECTED_WRAPPER_CALL_SITES = 10;
+// Column-0 declarations bound the top-level scopes of index.ts.
+const TOP_LEVEL_BOUNDARY = /^(?:export\b|import\b|(?:async\s+)?function\b|const\b|let\b|var\b|class\b|type\b|interface\b|enum\b|declare\b)/gmu;
+const FUNCTION_DECLARATION = /^(?:export\s+)?(?:async\s+)?function\*?\s+([A-Za-z_$][\w$]*)\s*[<(]/u;
+const ROUTE_API_DECLARATION = /^async function routeApi\(/mu;
+const ROUTE_API_CASE = /\bcase\s/gu;
+const ROUTE_API_DISPATCH = /\bcase\s+"([a-z0-9_]+)":\s*return\s+([A-Za-z_$][\w$]*)\(/gu;
 
 function signature(entry: EdgeAdmissionPolicyEntry): string {
   return `${entry.helper} ${entry.purpose} ${entry.coarseBinding ?? "null"} ${entry.clientBinding}`;
+}
+
+const DEVICE_SYNC_SIGNATURE = "attempt device_sync RECOVERY_RATE_LIMIT CLIENT_ATTEMPT_RATE_LIMIT";
+
+/** Inserts `text` after the first `anchor` that follows `declaration`. */
+function insertAfter(source: string, declaration: string, anchor: string, text: string): string {
+  const start = source.indexOf(declaration);
+  const at = start < 0 ? -1 : source.indexOf(anchor, start);
+  if (at < 0) throw new Error(`doctoring anchor not found after ${declaration}`);
+  const end = at + anchor.length;
+  return `${source.slice(0, end)}${text}${source.slice(end)}`;
+}
+
+function callSignature(source: string, index: number): string | null {
+  for (const [shape, describe] of CALL_SHAPES) {
+    shape.lastIndex = index;
+    const match = shape.exec(source);
+    if (match) return describe(match);
+  }
+  return null;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+interface AdmissionGraph {
+  readonly violations: readonly string[];
+  /** Route id -> sorted signatures of every helper call its handler reaches. */
+  readonly routeSignatures: ReadonlyMap<string, readonly string[]>;
+  /** Calls to admitting functions other than routeApi's dispatch. */
+  readonly wrapperCallSites: number;
+}
+
+/**
+ * Follows every address-keyed helper call site in index.ts up through its
+ * callers (a wrapper such as deviceSyncPrincipal, then its handlers) to the
+ * route ids routeApi dispatches to them. Anything the walk cannot attribute
+ * to a top-level function declaration is reported, never skipped.
+ */
+function admissionGraph(source: string): AdmissionGraph {
+  const violations: string[] = [];
+  const boundaries = [...source.matchAll(TOP_LEVEL_BOUNDARY)].map((match) => match.index);
+  const enclosingFunction = (index: number): string | null => {
+    let start = -1;
+    for (const boundary of boundaries) {
+      if (boundary >= index) break;
+      start = boundary;
+    }
+    if (start < 0) return null;
+    return FUNCTION_DECLARATION.exec(source.slice(start, start + 200))?.[1] ?? null;
+  };
+  const lineOf = (index: number): number => source.slice(0, index).split("\n").length;
+
+  // Direct helper call sites, by enclosing function.
+  const signatures = new Map<string, Set<string>>();
+  const addSignatures = (name: string, added: Iterable<string>): boolean => {
+    let set = signatures.get(name);
+    if (!set) signatures.set(name, set = new Set());
+    const before = set.size;
+    for (const value of added) set.add(value);
+    return set.size !== before;
+  };
+  for (const match of source.matchAll(HELPER_CALL)) {
+    const enclosing = enclosingFunction(match.index);
+    if (enclosing === null) {
+      violations.push(`helper call on line ${lineOf(match.index)} is outside a top-level function declaration`);
+      continue;
+    }
+    addSignatures(enclosing, [callSignature(source, match.index) ?? "unreviewed-shape"]);
+  }
+
+  // Propagate to callers until nothing changes; routeApi is the dispatch
+  // boundary and is read separately below.
+  const callSites = new Map<string, number[]>();
+  const callSitesOf = (name: string): number[] => {
+    let sites = callSites.get(name);
+    if (sites) return sites;
+    sites = [];
+    for (const match of source.matchAll(new RegExp(String.raw`\b${escapeRegExp(name)}\s*\(`, "gu"))) {
+      if (/\bfunction\*?\s+$/u.test(source.slice(Math.max(0, match.index - 24), match.index))) continue;
+      sites.push(match.index);
+    }
+    callSites.set(name, sites);
+    const references = [...source.matchAll(new RegExp(String.raw`\b${escapeRegExp(name)}\b`, "gu"))].length;
+    if (references !== sites.length + 1) {
+      violations.push(`admitting function ${name} is referenced outside its declaration and call sites`);
+    }
+    if (sites.length === 0) violations.push(`admitting function ${name} is never called`);
+    for (const site of sites) {
+      if (enclosingFunction(site) === null) {
+        violations.push(`call to admitting function ${name} on line ${lineOf(site)} is outside a top-level function declaration`);
+      }
+    }
+    return sites;
+  };
+  const pending = [...signatures.keys()];
+  while (pending.length > 0) {
+    const name = pending.pop() as string;
+    const reached = signatures.get(name) ?? new Set<string>();
+    for (const site of callSitesOf(name)) {
+      const caller = enclosingFunction(site);
+      if (caller === null || caller === "routeApi") continue;
+      if (addSignatures(caller, reached)) pending.push(caller);
+    }
+  }
+  let wrapperCallSites = 0;
+  for (const name of signatures.keys()) {
+    wrapperCallSites += callSitesOf(name)
+      .filter((site) => enclosingFunction(site) !== "routeApi").length;
+  }
+
+  // routeApi's route id -> handler dispatch.
+  const routeSignatures = new Map<string, readonly string[]>();
+  const routeApiStart = source.search(ROUTE_API_DECLARATION);
+  if (routeApiStart < 0) {
+    violations.push("routeApi dispatch was not found");
+  } else {
+    const routeApiEnd = boundaries.find((boundary) => boundary > routeApiStart) ?? source.length;
+    const body = source.slice(routeApiStart, routeApiEnd);
+    const dispatches = [...body.matchAll(ROUTE_API_DISPATCH)];
+    if (dispatches.length !== [...body.matchAll(ROUTE_API_CASE)].length) {
+      violations.push("routeApi has a case that is not a direct `return handler(` dispatch");
+    }
+    for (const [, routeId, handler] of dispatches) {
+      const reached = signatures.get(handler as string);
+      if (reached) routeSignatures.set(routeId as string, [...reached].sort());
+    }
+  }
+  return { violations, routeSignatures, wrapperCallSites };
 }
 
 /** Violations of the index.ts call-site ratchet for a (possibly doctored) source. */
 function ratchetViolations(source: string): string[] {
   const calls = [...source.matchAll(HELPER_CALL)].length;
   const references = [...source.matchAll(HELPER_REFERENCE)].length;
-  const signatures = [
-    ...[...source.matchAll(ATTEMPT_CALL)].map((match) =>
-      `attempt ${match[3]} ${match[1]} ${match[2]}`),
-    ...[...source.matchAll(UPLOAD_INGRESS_CALL)].map((match) =>
-      `upload_ingress upload_ingress ${match[1]} ${match[2]}`),
-    ...[...source.matchAll(PUBLIC_READ_CALL)].map((match) =>
-      `public_read public_aggregate_read null ${match[1]}`),
-  ];
+  const siteSignatures = [...source.matchAll(HELPER_CALL)]
+    .map((match) => callSignature(source, match.index));
+  const signatures = siteSignatures.filter((value): value is string => value !== null);
   const violations: string[] = [];
   if (calls !== EXPECTED_CALL_SITES) {
     violations.push(`expected ${EXPECTED_CALL_SITES} address-keyed helper call sites, found ${calls}`);
@@ -338,6 +506,34 @@ function ratchetViolations(source: string): string[] {
   const fromPolicy = [...new Set(Object.values(EDGE_ADMISSION_POLICY).map(signature))].sort();
   if (fromSource.join("\n") !== fromPolicy.join("\n")) {
     violations.push(`call-site signatures ${fromSource.join("; ")} != policy ${fromPolicy.join("; ")}`);
+  }
+
+  // Indirect reach: every route whose handler reaches a helper, directly or
+  // through a wrapper, is exactly a policy route with exactly its signature.
+  const graph = admissionGraph(source);
+  violations.push(...graph.violations);
+  if (graph.wrapperCallSites !== EXPECTED_WRAPPER_CALL_SITES) {
+    violations.push(
+      `expected ${EXPECTED_WRAPPER_CALL_SITES} admission wrapper call sites, found ${graph.wrapperCallSites}`,
+    );
+  }
+  const outsidePolicy = [...graph.routeSignatures.keys()]
+    .filter((routeId) => lookup(EDGE_ADMISSION_POLICY, routeId) === null)
+    .sort();
+  if (outsidePolicy.length > 0) {
+    violations.push(`routes reaching an address-keyed helper outside the policy: ${outsidePolicy.join(",")}`);
+  }
+  const unreached = Object.keys(EDGE_ADMISSION_POLICY)
+    .filter((routeId) => !graph.routeSignatures.has(routeId))
+    .sort();
+  if (unreached.length > 0) {
+    violations.push(`policy routes whose handler reaches no address-keyed helper: ${unreached.join(",")}`);
+  }
+  for (const [routeId, reached] of graph.routeSignatures) {
+    const entry = lookup(EDGE_ADMISSION_POLICY, routeId);
+    if (entry !== null && reached.join("; ") !== signature(entry)) {
+      violations.push(`${routeId} reaches ${reached.join("; ")} != policy ${signature(entry)}`);
+    }
   }
   return violations;
 }
@@ -369,7 +565,6 @@ describe("edge admission policy shape", () => {
       "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
     ]);
     expect(Object.isFrozen(EDGE_ADMISSION_BINDINGS)).toBe(true);
-    expect(EDGE_ADMISSION_OUTCOMES).toEqual(["allowed", "limited", "unavailable"]);
     for (const name of EDGE_ADMISSION_BINDINGS) {
       // Each is an existing Worker binding, not a new namespace.
       expect(typeof Reflect.get(Reflect.get(env, name) as object, "limit"), name).toBe("function");
@@ -462,6 +657,14 @@ describe("edge admission derivation probe through handleRequest", () => {
         // Exact keys: the coarse key is global and the client key is the
         // admission.ts HMAC of the address under the (edge) secret.
         expect(observation.calls, `${method} ${definition.id}`)
+          .toEqual(await expectedKeys(entry));
+        // With every limiter admitting, the route makes no edge-tier call
+        // beyond the predicted ones before a later guard refuses it (for
+        // example a deviceSyncPrincipal call added after the upload ingress
+        // helper, which admits before it authenticates).
+        const admitted = await observeRoute(EDGE_ADMISSION_POLICY, definition, method, "admit-all");
+        expect(admitted.status, `${method} ${definition.id} admitted`).not.toBe(429);
+        expect(edgeTierCalls(admitted.calls), `${method} ${definition.id} admitted`)
           .toEqual(await expectedKeys(entry));
         // The edge evaluation reproduces the Worker's calls byte for byte.
         const edge = recordingLimiters();
@@ -561,6 +764,91 @@ async function doctoredExtraAdmission(request: Request, env: Env): Promise<void>
     const aliased = `${indexSource}\nconst doctoredAlias = assertPublicAggregateReadAllowed;\n`;
     expect(ratchetViolations(aliased).join("\n"))
       .toContain("helpers referenced outside their import and call sites");
+  });
+
+  it("derives every policy route and signature through deviceSyncPrincipal and routeApi", () => {
+    const graph = admissionGraph(indexSource);
+    expect(graph.violations).toEqual([]);
+    expect(graph.wrapperCallSites).toBe(EXPECTED_WRAPPER_CALL_SITES);
+    expect(Object.fromEntries(graph.routeSignatures)).toEqual(Object.fromEntries(
+      Object.entries(EDGE_ADMISSION_POLICY).map(([routeId, entry]) => [routeId, [signature(entry)]]),
+    ));
+  });
+
+  it("fails when an admitted handler also reaches deviceSyncPrincipal after its own helper", () => {
+    const doctored = insertAfter(
+      indexSource,
+      "async function handleContribution(",
+      "    env.UPLOAD_INGRESS_CLIENT_RATE_LIMIT,\n    request,\n    env,\n  );\n",
+      '  await deviceSyncPrincipal(request, env, "POST");\n',
+    );
+    expect(admissionGraph(doctored).routeSignatures.get("contributions"))
+      .toEqual([DEVICE_SYNC_SIGNATURE, signature(EDGE_ADMISSION_POLICY.contributions!)].sort());
+    const violations = ratchetViolations(doctored).join("\n");
+    expect(violations).toContain("contributions reaches");
+    expect(violations).toContain(
+      `expected ${EXPECTED_WRAPPER_CALL_SITES} admission wrapper call sites, found ${EXPECTED_WRAPPER_CALL_SITES + 1}`,
+    );
+  });
+
+  it("fails when a route outside the policy reaches deviceSyncPrincipal behind its own guards", () => {
+    const doctored = insertAfter(
+      indexSource,
+      "async function handleTelemetryV11Consent(",
+      "  assertCsrf(request, session);\n",
+      '  await deviceSyncPrincipal(request, env, "POST");\n',
+    );
+    expect(admissionGraph(doctored).routeSignatures.get("telemetry_v11_consent"))
+      .toEqual([DEVICE_SYNC_SIGNATURE]);
+    expect(ratchetViolations(doctored).join("\n"))
+      .toContain("routes reaching an address-keyed helper outside the policy: telemetry_v11_consent");
+  });
+
+  it("fails on a new wrapper that a route outside the policy reaches", () => {
+    const doctored = `${insertAfter(
+      indexSource,
+      "async function handleSession(",
+      "  const session = await personalSession(request, env);\n",
+      "  await doctoredSessionAdmission(request, env);\n",
+    )}
+async function doctoredSessionAdmission(request: Request, env: Env): Promise<void> {
+  await assertAttemptAllowed(
+    env.RECOVERY_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "device_sync",
+  );
+}
+`;
+    expect(admissionGraph(doctored).routeSignatures.get("session")).toEqual([DEVICE_SYNC_SIGNATURE]);
+    const violations = ratchetViolations(doctored).join("\n");
+    expect(violations).toContain("routes reaching an address-keyed helper outside the policy: session");
+    expect(violations).toContain(
+      `expected ${EXPECTED_WRAPPER_CALL_SITES} admission wrapper call sites, found ${EXPECTED_WRAPPER_CALL_SITES + 1}`,
+    );
+  });
+
+  it("fails when a wrapper escapes the walk by alias, by an unattributable call or by an indirect dispatch", () => {
+    const aliased = `${indexSource}\nconst doctoredWrapperAlias = deviceSyncPrincipal;\n`;
+    expect(ratchetViolations(aliased).join("\n"))
+      .toContain("admitting function deviceSyncPrincipal is referenced outside its declaration and call sites");
+
+    const arrow = `${indexSource}
+export const doctoredArrowAdmission = async (request: Request, env: Env) =>
+  deviceSyncPrincipal(request, env);
+`;
+    expect(ratchetViolations(arrow).join("\n"))
+      .toMatch(/call to admitting function deviceSyncPrincipal on line \d+ is outside a top-level function declaration/u);
+
+    const dispatch = indexSource.replace(
+      'case "contributions":\n      return handleContribution(request, env);',
+      'case "contributions": {\n      const response = handleContribution(request, env);\n      return response;\n    }',
+    );
+    expect(dispatch).not.toBe(indexSource);
+    const violations = ratchetViolations(dispatch).join("\n");
+    expect(violations).toContain("routeApi has a case that is not a direct `return handler(` dispatch");
+    expect(violations).toContain("policy routes whose handler reaches no address-keyed helper: contributions");
   });
 });
 
