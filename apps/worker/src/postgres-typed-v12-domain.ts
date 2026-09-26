@@ -245,22 +245,37 @@ export function createPostgresTypedV12Domain(
       return withPostgresMutation(pool, async (client) => {
         await assertPostgresTypedV12WriteAllowed(client, principal, nowEpoch, authorityOptions);
         const state = await stateRow(client, schema, principal.participantId);
+        // One row per ready day: its earliest ready manifest, as D1 reads it.
+        // A device keeps every earlier ready manifest of a day (new records or
+        // a parser release re-digest the day, and 0035 retains ready rows), so
+        // its ready rows grow while its days do not. The bound is on days; a
+        // row bound would refuse a small domain with a 400 the client treats
+        // as final. COLLATE "C" keeps SQLite's BINARY tie-break on id.
         const result = await client.query<ReadyManifestRow>(
           `SELECT id, to_char(chunk_day, 'YYYY-MM-DD') AS chunk_day, manifest_digest
-             FROM ${table(schema, "telemetry_v12_day_manifests")}
-            WHERE participant_id = $1 AND device_id = $2 AND state = 'ready'
-            ORDER BY chunk_day, created_at, id LIMIT $3`,
+             FROM (
+               SELECT id, chunk_day, manifest_digest,
+                      row_number() OVER (
+                        PARTITION BY chunk_day ORDER BY created_at, id COLLATE "C"
+                      ) AS version
+                 FROM ${table(schema, "telemetry_v12_day_manifests")}
+                WHERE participant_id = $1 AND device_id = $2 AND state = 'ready'
+             ) m
+            WHERE version = 1
+            ORDER BY m.chunk_day LIMIT $3`,
           [principal.participantId, principal.deviceId, MAX_TELEMETRY_V12_DOMAIN_DAYS + 1],
         );
         if (result.rows.length > MAX_TELEMETRY_V12_DOMAIN_DAYS) {
           throw new ApiError(400, "SYNC_RANGE_TOO_LARGE");
         }
+        // The query yields each day once; a repeated day is storage failure.
         const byDay = new Map<string, ReadyManifestRow>();
         for (const row of result.rows) {
-          if (!utcDay(row.chunk_day) || !SHA256.test(row.manifest_digest)) {
+          if (!utcDay(row.chunk_day) || !SHA256.test(row.manifest_digest)
+              || byDay.has(row.chunk_day)) {
             throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
           }
-          if (!byDay.has(row.chunk_day)) byDay.set(row.chunk_day, row);
+          byDay.set(row.chunk_day, row);
         }
         const days = [...byDay.values()].sort((a, b) => a.chunk_day.localeCompare(b.chunk_day));
         // Same contract as the D1 predecessor: the shipped client asks for
