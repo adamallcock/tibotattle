@@ -25,16 +25,61 @@
 --
 -- Every exact journal row still comes from storage_journal_append (0046).
 -- Every RAISE carries a constant message and ERRCODE; no value, digest or
--- identifier is interpolated. Lock order: v1.2 head (held by the statement
--- that changed it), participant, owner link, storage_source_state and owner
--- revision head (inside the append). The backfill takes the participant share
--- lock before the head, as the activation path does, so it never inverts
--- against an eraser that holds the participant.
+-- identifier is interpolated.
+--
+-- Lock order. 0046 states participant, owner link, v1.2 head,
+-- storage_source_state, owner revision head. The bridge keeps the participant
+-- first and storage_source_state and the owner revision head last (both inside
+-- storage_journal_append), but takes the v1.2 head before the owner link:
+--   activation: participant (FOR SHARE, with its device, grant, upload owner
+--     and ledger, in assertPostgresTypedV12WriteAllowed), v1.2 head (the
+--     statement that fires the trigger), retention marker, owner link, source;
+--   backfill: participant, v1.2 head, device, retention marker, owner link,
+--     each with SKIP LOCKED, then source.
+-- A head trigger cannot lock the link before the head its statement already
+-- holds. The inversion cannot deadlock: the other paths that lock a v1.2
+-- owner's link and then its head hold that participant first, erasure FOR
+-- UPDATE (so it serializes with the bridge's FOR SHARE at the participant)
+-- and the receipt membership guard only inside this bridge, after both rows
+-- are held; and the backfill never waits on any of its SKIP LOCKED rows.
+-- storage_source_state is a singleton every journal producer takes last, so
+-- no transaction may wait on another owner's rows while it holds it: the
+-- maintenance backfill bridges at most one head per call (its caller commits
+-- after each call), and the one-time backfill takes every candidate's rows
+-- before its first append.
+--
+-- Eligibility (community_public_source_owners) depends on rows the bridge
+-- does not write. It cannot change under the bridge because:
+--   * the activation path already holds the participant, device, grant,
+--     upload-owner and ledger rows FOR SHARE when its head change fires the
+--     trigger, and the backfill takes the participant and the head's device
+--     FOR SHARE (every PostgreSQL revocation updates that device row);
+--   * the bridge takes the owner's retention marker FOR SHARE before it reads
+--     eligibility, and a marker retirement (0041) locks the marker before it
+--     withdraws the link, so the retirement either committed before the read
+--     or waits for the bridge;
+--   * eligibility is read again under the link lock, so a withdrawal that
+--     committed while the bridge waited on the link is never reversed;
+--   * a link the bridge mints starts 'withdrawn' and turns 'active' only with
+--     its owner-active row, so no refusal leaves a new link active.
 
 -- (1) Retire the 0014 head trigger. Every other trigger on the table stays.
 DROP TRIGGER telemetry_v12_domain_head_source_revision ON telemetry_v12_domain_heads;
 
--- (2) Bridge one accepted head, D1 0011 storage_v12_head_request_apply and
+-- (2) D1 0011 head eligibility: a community_public_source_owners row for the
+-- participant whose device is NULL (social) or the head's domain device. The
+-- function reads the calling statement's snapshot, so a call made after a
+-- lock wait sees what committed during the wait.
+CREATE FUNCTION storage_v12_bridge_eligible(participant_id_value text, device_id_value text)
+RETURNS boolean
+LANGUAGE sql STABLE SET search_path FROM CURRENT AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM community_public_source_owners public_owner
+     WHERE public_owner.participant_id = participant_id_value
+       AND (public_owner.device_id IS NULL OR public_owner.device_id = device_id_value))
+$$;
+
+-- (3) Bridge one accepted head, D1 0011 storage_v12_head_request_apply and
 -- storage_v12_event_publish. Returns true only when this call recorded a new
 -- receipt and its owner-active row. It does nothing (and raises nothing) in a
 -- transfer session, without storage_source_state, for an inactive or
@@ -77,15 +122,17 @@ BEGIN
   IF NOT FOUND THEN
     RETURN false;
   END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM community_public_source_owners public_owner
-     WHERE public_owner.participant_id = participant_id_value
-       AND (public_owner.device_id IS NULL OR public_owner.device_id = domain_row.device_id)
-  ) THEN
+  -- A retained owner's marker cannot be retired between this lock and the end
+  -- of the transaction; a retirement already under way is waited for.
+  PERFORM 1 FROM accountless_public_history_retention marker
+   WHERE marker.participant_id = participant_id_value
+   FOR SHARE;
+  IF NOT storage_v12_bridge_eligible(participant_id_value, domain_row.device_id) THEN
     RETURN false;
   END IF;
 
-  owner_digest_value := storage_owner_link_ensure(participant_id_value, 'active');
+  -- A new link starts withdrawn; the owner-active row below activates it.
+  owner_digest_value := storage_owner_link_ensure(participant_id_value, 'withdrawn');
   SELECT owner_link.state INTO link_state
     FROM storage_v11_owner_links owner_link
    WHERE owner_link.participant_id = participant_id_value
@@ -100,6 +147,10 @@ BEGIN
     SELECT 1 FROM storage_owner_revisions head
      WHERE head.owner_digest = owner_digest_value AND head.state = 'erased'
   ) THEN
+    RETURN false;
+  END IF;
+  -- A fresh read under the link lock; the read above may predate the wait.
+  IF NOT storage_v12_bridge_eligible(participant_id_value, domain_row.device_id) THEN
     RETURN false;
   END IF;
 
@@ -127,7 +178,8 @@ BEGIN
   UPDATE storage_v11_owner_links
      SET object_digest = event_digest_value, manifest_digest = domain_row.manifest_digest
    WHERE participant_id = participant_id_value AND generation_id IS NULL;
-  -- A later eligible head re-activates a withdrawn (never an erased) owner.
+  -- A new link, or a later eligible head of a withdrawn (never an erased)
+  -- owner, becomes active with its owner-active row.
   UPDATE storage_v11_owner_links
      SET state = 'active'
    WHERE participant_id = participant_id_value AND state = 'withdrawn';
@@ -135,7 +187,7 @@ BEGIN
 END;
 $$;
 
--- (3) The head trigger. (a) is the 0014 telemetry_legacy_source_revision body
+-- (4) The head trigger. (a) is the 0014 telemetry_legacy_source_revision body
 -- for this table without its telemetry_emit_source_event calls: the same
 -- event keys (the table has no id column, so its coalesce reduces to the
 -- generation), the same active-participant conditions and the same
@@ -189,10 +241,10 @@ CREATE TRIGGER storage_v12_head_publication
   AFTER INSERT OR UPDATE OR DELETE ON telemetry_v12_domain_heads
   FOR EACH ROW EXECUTE FUNCTION storage_v12_head_publication();
 
--- (4) Heads the bridge still owes: an eligible current head of an owner that
+-- (5) Heads the bridge still owes: an eligible current head of an owner that
 -- is not erased, with no receipt for its (participant, generation, revision).
--- The same predicate drives the count and the backfill, so everything the
--- count reports is something the backfill can bridge.
+-- The eligibility predicate is storage_v12_bridge_eligible's, set-based, so
+-- everything the count reports is something the backfill can bridge.
 CREATE FUNCTION storage_v12_bridge_pending_heads()
 RETURNS TABLE (participant_id text, generation_id text, head_revision bigint)
 LANGUAGE sql STABLE SET search_path FROM CURRENT AS $$
@@ -225,11 +277,74 @@ LANGUAGE sql STABLE SET search_path FROM CURRENT AS $$
   SELECT count(*)::bigint FROM storage_v12_bridge_pending_heads()
 $$;
 
--- (5) Bounded, idempotent repair. Refused in transfer sessions, where the
+-- (6) Take every row the bridge needs for one pending head without waiting
+-- on another transaction's row lock: the participant (share), the v1.2 head,
+-- the head's device (share), the retention marker if there is one (share) and
+-- the owner link. A candidate any of whose rows another transaction holds (an
+-- activation bridging its own new head, an eraser, a revocation, a marker
+-- retirement, another backfill) is skipped and stays pending for a later
+-- run. Eligibility is read once those rows are held, and only an eligible
+-- owner without a link has one minted ('withdrawn', as storage_v12_bridge_head
+-- would); that insert can wait only on a concurrent first mint, before any
+-- append. Returns true when every row is held.
+CREATE FUNCTION storage_v12_bridge_lock_pending(participant_id_value text)
+RETURNS boolean
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE
+  device_id_value text;
+BEGIN
+  PERFORM 1 FROM participants participant
+   WHERE participant.id = participant_id_value AND participant.state = 'active'
+   FOR SHARE SKIP LOCKED;
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+  SELECT domain.device_id INTO device_id_value
+    FROM telemetry_v12_domain_heads head
+    JOIN telemetry_v12_domains domain
+      ON domain.id = head.generation_id AND domain.participant_id = head.participant_id
+   WHERE head.participant_id = participant_id_value
+   FOR UPDATE OF head SKIP LOCKED;
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+  PERFORM 1 FROM device_credentials device
+   WHERE device.id = device_id_value
+   FOR SHARE SKIP LOCKED;
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+  IF EXISTS (SELECT 1 FROM accountless_public_history_retention marker
+              WHERE marker.participant_id = participant_id_value) THEN
+    PERFORM 1 FROM accountless_public_history_retention marker
+     WHERE marker.participant_id = participant_id_value
+     FOR SHARE SKIP LOCKED;
+    IF NOT FOUND THEN
+      RETURN false;
+    END IF;
+  END IF;
+  IF NOT storage_v12_bridge_eligible(participant_id_value, device_id_value) THEN
+    RETURN false;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM storage_v11_owner_links owner_link
+                  WHERE owner_link.participant_id = participant_id_value) THEN
+    PERFORM storage_owner_link_ensure(participant_id_value, 'withdrawn');
+  END IF;
+  PERFORM 1 FROM storage_v11_owner_links owner_link
+   WHERE owner_link.participant_id = participant_id_value
+   FOR UPDATE SKIP LOCKED;
+  RETURN FOUND;
+END;
+$$;
+
+-- (7) Bounded, idempotent repair. Refused in transfer sessions, where the
 -- bridge is bypassed by design; without storage_source_state it bridges
--- nothing. Heads are visited in participant_id COLLATE "C" order; each takes
--- the participant share lock, then the head lock, then bridges the head as it
--- is now, so a concurrent activation that already bridged it adds nothing.
+-- nothing. It inspects at most limit_value pending heads in participant_id
+-- COLLATE "C" order and bridges at most one: the append takes
+-- storage_source_state, so the call returns (and its caller commits) before
+-- it touches another owner. It returns 1 when it bridged a head, else 0.
+-- Each candidate is taken through storage_v12_bridge_lock_pending and bridged
+-- as it is now, so a head that an activation already bridged adds nothing.
 CREATE FUNCTION storage_v12_bridge_backfill(limit_value integer)
 RETURNS integer
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
@@ -237,7 +352,6 @@ DECLARE
   candidate record;
   current_generation text;
   current_revision bigint;
-  bridged integer := 0;
 BEGIN
   IF limit_value IS NULL OR limit_value < 1 OR limit_value > 500 THEN
     RAISE EXCEPTION 'storage_v12_bridge_limit_invalid' USING ERRCODE = 'P1005';
@@ -254,41 +368,56 @@ BEGIN
      ORDER BY pending.participant_id COLLATE "C"
      LIMIT limit_value
   LOOP
-    PERFORM 1 FROM participants participant
-     WHERE participant.id = candidate.participant_id AND participant.state = 'active'
-     FOR SHARE;
-    CONTINUE WHEN NOT FOUND;
+    CONTINUE WHEN NOT storage_v12_bridge_lock_pending(candidate.participant_id);
     SELECT head.generation_id, head.revision::bigint
       INTO current_generation, current_revision
       FROM telemetry_v12_domain_heads head
-     WHERE head.participant_id = candidate.participant_id
-     FOR UPDATE;
-    CONTINUE WHEN NOT FOUND;
+     WHERE head.participant_id = candidate.participant_id;
     IF storage_v12_bridge_head(candidate.participant_id, current_generation, current_revision) THEN
-      bridged := bridged + 1;
+      RETURN 1;
     END IF;
   END LOOP;
-  RETURN bridged;
+  RETURN 0;
 END;
 $$;
 -- A maintenance entrypoint, granted deliberately like storage_journal_append.
 REVOKE ALL ON FUNCTION storage_v12_bridge_backfill(integer) FROM PUBLIC;
 
--- (6) One-time backfill of every head that is eligible now. It is a no-op
+-- (8) One-time backfill of every head that is eligible now. It is a no-op
 -- without storage_source_state (the pending count then reports the heads)
 -- and in a transfer session, and bridges each head at most once: a second
--- run finds nothing pending.
+-- run finds nothing pending. It runs in the migration's transaction, so it
+-- first takes every candidate's rows through storage_v12_bridge_lock_pending,
+-- skipping any that another transaction holds (those stay pending for the
+-- maintenance backfill), and only then appends, so it never waits on another
+-- owner's rows while it holds storage_source_state.
 DO $$
 DECLARE
-  bridged integer;
+  candidate record;
+  held text[] := ARRAY[]::text[];
+  participant_value text;
+  current_generation text;
+  current_revision bigint;
 BEGIN
   IF storage_journal_transfer_session()
      OR NOT EXISTS (SELECT 1 FROM storage_source_state source WHERE source.singleton = 1) THEN
     RETURN;
   END IF;
+  FOR candidate IN
+    SELECT pending.participant_id
+      FROM storage_v12_bridge_pending_heads() pending
+     ORDER BY pending.participant_id COLLATE "C"
   LOOP
-    bridged := storage_v12_bridge_backfill(500);
-    EXIT WHEN bridged = 0;
+    IF storage_v12_bridge_lock_pending(candidate.participant_id) THEN
+      held := held || candidate.participant_id;
+    END IF;
+  END LOOP;
+  FOREACH participant_value IN ARRAY held LOOP
+    SELECT head.generation_id, head.revision::bigint
+      INTO current_generation, current_revision
+      FROM telemetry_v12_domain_heads head
+     WHERE head.participant_id = participant_value;
+    PERFORM storage_v12_bridge_head(participant_value, current_generation, current_revision);
   END LOOP;
 END;
 $$;

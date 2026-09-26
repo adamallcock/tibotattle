@@ -179,6 +179,11 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL persisted allowance-fit boundary", 
     // advances the source epoch; a caught-up cursor carries it with the sequence.
     const sourceEpoch = Number((await pool.query(`SELECT authority_epoch::text AS epoch
       FROM ${sqlSchema}.storage_source_state WHERE singleton=1`)).rows[0].epoch);
+    const exactOwnerRows = await pool.query(`SELECT count(*)::int AS count
+      FROM ${sqlSchema}.storage_ingestion_changes WHERE source_id=$1 AND event_tuple_version=1 AND kind='owner-active'`,
+    [SOURCE_ID]);
+    assert.equal(sourceEpoch, exactOwnerRows.rows[0].count,
+      "each bridged owner-active advanced the source epoch once and nothing else moved it");
     await pool.query(`UPDATE ${sqlSchema}.analytics_source_cursors SET sequence=$2, authority_epoch=$3 WHERE source_id=$1`,
       [SOURCE_ID, sequence, sourceEpoch]);
     const control = await pool.query(`SELECT policy.policy_revision, controls.revision AS collection_revision,
