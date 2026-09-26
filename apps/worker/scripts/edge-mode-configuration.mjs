@@ -94,6 +94,12 @@ export const EDGE_MODE_RETIRED_SECRETS = Object.freeze([
 ]);
 
 export const EDGE_MODE_PRODUCTION_WORKER_NAME = "app-usagemonitor";
+/**
+ * The production release guard D1's name, fixed by the cutover plan (the
+ * owner creates it before the gcp switch, long before production binds it). A
+ * staging plan never names it, whatever production evidence is supplied.
+ */
+export const EDGE_MODE_PRODUCTION_RELEASE_GUARD_DATABASE_NAME = "tibotattle-release-guard";
 /** The production Worker's custom domains; no edge mode changes them. */
 export const EDGE_MODE_PRODUCTION_DOMAINS = Object.freeze([
   "admin.tibotattle.com",
@@ -118,6 +124,12 @@ export const EDGE_MODE_PRODUCTION_HOSTNAMES = Object.freeze([
  * worker mode, which is allowed only while no gcp-mode version has been
  * deployed since the fence began. Every other pair is forbidden, including
  * null -> fenced, worker -> gcp and gcp -> worker.
+ *
+ * Callers run assertEdgeModeTransition before building a deploy. The overlay
+ * and the snapshot delta enforce the history-free part of this matrix again,
+ * on the live state they are given (the render's or snapshot's
+ * EDGE_UPSTREAM_MODE): a target is refused from any live mode the matrix does
+ * not list for it, and worker mode is refused on any state a gcp deploy left.
  */
 export const EDGE_MODE_TRANSITIONS = Object.freeze([
   Object.freeze({ from: null, to: "worker", requiresNoGcpSinceFence: false }),
@@ -258,7 +270,9 @@ function knownStorage({ name, type }, allowed) {
  * RELEASE_GUARD_DB, at its root and in every environment: the unbound legacy
  * primary and ledger in env.production, the staging and local databases. The
  * typed render never carries them, so the gcp plan is checked against them
- * here. A missing or malformed tracked config is refused.
+ * here. A missing or malformed tracked config is refused in every mode, so a
+ * caller that never passes it fails on its first worker deploy or rehearsal,
+ * not at the gcp switch.
  */
 function trackedDataDatabases(trackedConfig, code = "INPUT_INVALID") {
   if (!object(trackedConfig) || !object(trackedConfig.env) || !object(trackedConfig.env.production)) fail(code);
@@ -278,9 +292,34 @@ function trackedDataDatabases(trackedConfig, code = "INPUT_INVALID") {
   return { ids, names };
 }
 
-/** Required for gcp; validated whenever it is passed. */
-function trackedDatabasesFor(mode, trackedConfig, code) {
-  return mode === "gcp" || trackedConfig !== undefined ? trackedDataDatabases(trackedConfig, code) : null;
+/**
+ * The live mode of a version from its EDGE_UPSTREAM_MODE var: null when it is
+ * absent (every pre-edge version), else the mode. A present but unknown value,
+ * or an absent one next to a gcp-only binding or var, is refused rather than
+ * read as absent. `names` are every binding, var and secret name the version
+ * carries.
+ */
+function modeFromVar({ present, value, names }) {
+  if (!present) {
+    if (names.some((name) => GCP_MARKER_NAMES.includes(name))) fail("LIVE_INVALID");
+    return null;
+  }
+  const mode = parseEdgeUpstreamMode(value);
+  if (mode === null) fail("LIVE_INVALID");
+  return mode;
+}
+
+/**
+ * The history-free half of EDGE_MODE_TRANSITIONS, enforced on the live state
+ * itself: gcp only from fenced or gcp (the fence and its quiescence proof come
+ * first, or writes accepted after the export are stranded in D1), fenced never
+ * from a pre-edge version, worker never from gcp. A caller that skips or
+ * misroutes assertEdgeModeTransition still cannot build such a deploy.
+ */
+function assertReachableFrom(liveMode, targetMode) {
+  if (!EDGE_MODE_TRANSITIONS.some((entry) => entry.from === liveMode && entry.to === targetMode)) {
+    fail("TRANSITION_FORBIDDEN");
+  }
 }
 
 /**
@@ -350,12 +389,12 @@ function overlayEnvironment(environment, mode, plan, trackedDatabases) {
     ...result.d1_databases.map((entry) => ({ name: entry.binding, type: "d1", id: entry.database_id })),
     ...result.r2_buckets.map((entry) => ({ name: entry.binding, type: "r2_bucket" })),
   ];
-  if (mode === "worker") {
-    assertWorkerCapable({
-      storage,
-      names: [...storage.map((binding) => binding.name), ...Object.keys(result.vars), ...result.secrets.required],
-    });
-  }
+  const names = [...storage.map((binding) => binding.name), ...Object.keys(result.vars), ...result.secrets.required];
+  // The typed render carries the live vars, so its mode var is the live mode.
+  assertReachableFrom(modeFromVar({
+    present: own(result.vars, EDGE_MODE_VAR), value: result.vars[EDGE_MODE_VAR], names,
+  }), mode);
+  if (mode === "worker") assertWorkerCapable({ storage, names });
   result.main = EDGE_MODE_ENTRY_MAIN;
   if (mode === "gcp") {
     assertGcpPreconditions({ storage, secrets: result.secrets.required, plan, trackedDatabases });
@@ -378,15 +417,22 @@ function overlayEnvironment(environment, mode, plan, trackedDatabases) {
  * changes: every mode sets main and EDGE_UPSTREAM_MODE; gcp also sets the
  * origin vars and reduces storage to RELEASE_GUARD_DB and SPARKLE_RELEASES
  * with no crons, keeping assets, rate limits, the Durable Object binding and
- * its migrations, routes, vars and secrets. `trackedConfig` is the checked-in
- * config the render was built from; gcp requires it, so the guard D1 is never
- * one of its other databases (the unbound legacy primary included). Worker
- * mode is refused on a render that only a gcp deploy produces.
+ * its migrations, routes, vars and secrets.
+ *
+ * `trackedConfig` is REQUIRED in every mode (EDGE_MODE_INPUT_INVALID
+ * otherwise): the parsed checked-in wrangler.jsonc, the same object passed to
+ * renderProductionLiveConfig. It keeps the gcp guard D1 from being one of its
+ * other databases (the unbound legacy primary included).
+ *
+ * The render's live mode must reach `mode` in EDGE_MODE_TRANSITIONS
+ * (EDGE_MODE_TRANSITION_FORBIDDEN otherwise), and worker mode is refused on a
+ * render that only a gcp deploy produces. The caller still runs
+ * assertEdgeModeTransition for the fenced -> worker history flag.
  */
 export function applyEdgeModeOverlay({ renderedConfig, mode, plan, trackedConfig } = {}) {
   const edgeMode = requiredMode(mode);
   const normalizedPlan = normalizeEdgeModePlan({ mode: edgeMode, plan });
-  const trackedDatabases = trackedDatabasesFor(edgeMode, trackedConfig);
+  const trackedDatabases = trackedDataDatabases(trackedConfig);
   if (!object(renderedConfig) || !object(renderedConfig.env) || !object(renderedConfig.env.production)) {
     fail("CONFIG_INVALID");
   }
@@ -455,6 +501,7 @@ function deltaSnapshot(live, mode, plan, trackedDatabases) {
   if (live.bindings.some((binding) => declaredVars.includes(binding.name) && binding.type !== "plain_text")) {
     fail("SNAPSHOT_INVALID");
   }
+  assertReachableFrom(snapshotMode(live), mode);
   if (mode === "worker") {
     assertWorkerCapable({ storage: storageBindings(live), names: live.bindings.map((binding) => binding.name) });
   }
@@ -486,33 +533,37 @@ function deltaSnapshot(live, mode, plan, trackedDatabases) {
  * The expected post-deploy snapshot for `mode`: the live snapshot plus exactly
  * the overlay's binding and cron changes, with its fingerprint recomputed, so
  * verifyProductionLiveConfig({snapshot: expected, candidateConfig: overlaid})
- * accepts the declared delta and nothing else. It takes the same
- * `trackedConfig` as applyEdgeModeOverlay and applies the same refusals.
+ * accepts the declared delta and nothing else. It takes the same required
+ * `trackedConfig` as applyEdgeModeOverlay and applies the same refusals,
+ * including EDGE_MODE_TRANSITION_FORBIDDEN when the snapshot's live mode
+ * cannot reach `mode` (gcp from a pre-edge or worker version, among others).
  */
 export function applyEdgeModeSnapshotDelta({ snapshot, mode, plan, trackedConfig } = {}) {
   const edgeMode = requiredMode(mode);
   const normalizedPlan = normalizeEdgeModePlan({ mode: edgeMode, plan });
-  const trackedDatabases = trackedDatabasesFor(edgeMode, trackedConfig);
+  const trackedDatabases = trackedDataDatabases(trackedConfig);
   return deltaSnapshot(canonicalSnapshot(snapshot), edgeMode, normalizedPlan, trackedDatabases);
+}
+
+function snapshotMode(live) {
+  const binding = live.bindings.find((entry) => entry.name === EDGE_MODE_VAR);
+  if (binding !== undefined && binding.type !== "plain_text") fail("LIVE_INVALID");
+  return modeFromVar({
+    present: binding !== undefined,
+    value: binding?.text,
+    names: live.bindings.map((entry) => entry.name),
+  });
 }
 
 /**
  * The live mode of a typed snapshot: null when EDGE_UPSTREAM_MODE is absent
  * (every pre-edge version), else the mode. A present but unknown value, or an
  * absent one on a version carrying a gcp-only binding or var, is refused
- * rather than read as absent.
+ * rather than read as absent. This, not verifyEdgeModeLiveSnapshot(...).ok, is
+ * how a caller learns which mode is live.
  */
 export function liveEdgeMode(snapshot) {
-  const live = canonicalSnapshot(snapshot);
-  const binding = live.bindings.find((entry) => entry.name === EDGE_MODE_VAR);
-  if (binding === undefined) {
-    if (live.bindings.some((entry) => GCP_MARKER_NAMES.includes(entry.name))) fail("LIVE_INVALID");
-    return null;
-  }
-  if (binding.type !== "plain_text") fail("LIVE_INVALID");
-  const mode = parseEdgeUpstreamMode(binding.text);
-  if (mode === null) fail("LIVE_INVALID");
-  return mode;
+  return snapshotMode(canonicalSnapshot(snapshot));
 }
 
 export function assertEdgeModeTransition({ liveMode, targetMode, gcpEverDeployedSinceFence } = {}) {
@@ -549,9 +600,16 @@ function expectedHostnames(value) {
  * Post-deploy check of a captured live snapshot. The caller supplies the
  * Cloudflare deployment ({versions: [{version_id, percentage}]}), the expected
  * source commit and, off production, the expected custom domains ([] for a
- * Worker served only on workers.dev). Returns
- * {ok, code, warnings}; retired storage secrets still present in gcp mode are
- * a RETIRED_SECRET_PRESENT warning, never a failure.
+ * Worker served only on workers.dev); deployment and sourceCommit are
+ * required, and a call without them returns EDGE_MODE_INPUT_INVALID or
+ * EDGE_MODE_DEPLOYMENT_NOT_SINGLE. Returns {ok, code, warnings}; retired
+ * storage secrets still present in gcp mode are a RETIRED_SECRET_PRESENT
+ * warning, never a failure.
+ *
+ * ok:false means "not verified as `mode`", never "the live mode is not
+ * `mode`": a gcp edge with a leftover cron or a split deployment also fails.
+ * A caller that needs the live mode (to choose a gcp-only check, for example)
+ * reads liveEdgeMode(snapshot).
  */
 export function verifyEdgeModeLiveSnapshot({
   snapshot,
@@ -646,17 +704,47 @@ function productionSnapshots({ productionSnapshot, productionBaselineSnapshot })
   return snapshots;
 }
 
-function stagingReferences({ productionSnapshot, productionBaselineSnapshot, trackedConfig }) {
+/**
+ * The production gcp plan, which the staging variant needs in every mode:
+ * the plan itself once the owner has provisioned the production origin and
+ * created the production release guard D1, or an explicit null before then.
+ * Production only binds those values at the gcp switch, so between creating
+ * them and that switch the plan is their only evidence. A null is refused once
+ * a production snapshot carries a gcp-only binding or var.
+ */
+function productionGcpPlan(productionPlan, snapshots) {
+  if (productionPlan === null) {
+    if (snapshots.some((snapshot) => snapshot.bindings.some((binding) => GCP_MARKER_NAMES.includes(binding.name)))) {
+      fail("STAGING_INPUT_INVALID");
+    }
+    return null;
+  }
+  if (productionPlan === undefined) fail("STAGING_INPUT_INVALID");
+  try {
+    return normalizeEdgeModePlan({ mode: "gcp", plan: productionPlan });
+  } catch {
+    return fail("STAGING_INPUT_INVALID");
+  }
+}
+
+function stagingReferences({ productionSnapshot, productionBaselineSnapshot, productionPlan, trackedConfig }) {
   const references = {
     workerNames: new Set([EDGE_MODE_PRODUCTION_WORKER_NAME]),
     databaseIds: new Set(),
-    databaseNames: new Set(),
+    databaseNames: new Set([EDGE_MODE_PRODUCTION_RELEASE_GUARD_DATABASE_NAME]),
     bucketNames: new Set(),
     values: new Set(),
     hosts: new Set(EDGE_MODE_PRODUCTION_HOSTNAMES),
     rateLimitNamespaces: new Set(),
   };
-  for (const production of productionSnapshots({ productionSnapshot, productionBaselineSnapshot })) {
+  const snapshots = productionSnapshots({ productionSnapshot, productionBaselineSnapshot });
+  const plan = productionGcpPlan(productionPlan, snapshots);
+  if (plan !== null) {
+    references.databaseIds.add(plan.releaseGuardDatabase.id);
+    references.databaseNames.add(plan.releaseGuardDatabase.name);
+    for (const value of [plan.upstreamOrigin, plan.originAudience, plan.invokerServiceAccount]) references.values.add(value);
+  }
+  for (const production of snapshots) {
     references.workerNames.add(production.workerName);
     for (const binding of production.bindings) {
       if (binding.type === "d1") {
@@ -763,8 +851,14 @@ function assertStagingIsolation({ snapshot, environment, plan, references }) {
  * EDGE_MODE_PRODUCTION_HOSTNAMES plus the production domains and routes);
  * other names under the production zone are allowed. The refused set comes
  * from productionSnapshot, the optional productionBaselineSnapshot (a pre-gcp
- * production capture, required once production is in gcp mode) and the
- * required trackedConfig's env.production.
+ * production capture, required once production is in gcp mode), the required
+ * trackedConfig's env.production, the fixed production guard D1 name, and the
+ * required productionPlan: the production gcp plan (its guard D1 id and name,
+ * origin, audience and invoker service account) from the moment the owner
+ * creates those resources, or an explicit null before then. Production binds
+ * them only at its gcp switch, so between creation and that switch the plan is
+ * the only evidence of them; pass it for every rehearsal in that window. A
+ * null is refused once a production snapshot carries gcp values.
  *
  * A staging gcp rehearsal has the production gcp prerequisites: the staging
  * Worker must bind its own SPARKLE_RELEASES bucket and hold the four
@@ -774,12 +868,14 @@ function assertStagingIsolation({ snapshot, environment, plan, references }) {
  * verifyEdgeModeLiveSnapshot({expectedDomains: []}).
  */
 export function applyEdgeModeStagingOverlay({
-  renderedConfig, snapshot, mode, plan, productionSnapshot, productionBaselineSnapshot, trackedConfig,
+  renderedConfig, snapshot, mode, plan, productionSnapshot, productionBaselineSnapshot, productionPlan, trackedConfig,
 } = {}) {
   const edgeMode = requiredMode(mode);
   const normalizedPlan = normalizeEdgeModePlan({ mode: edgeMode, plan });
   const trackedDatabases = trackedDataDatabases(trackedConfig, "STAGING_INPUT_INVALID");
-  const references = stagingReferences({ productionSnapshot, productionBaselineSnapshot, trackedConfig });
+  const references = stagingReferences({
+    productionSnapshot, productionBaselineSnapshot, productionPlan, trackedConfig,
+  });
   const staging = canonicalSnapshot(snapshot, "STAGING_INPUT_INVALID");
   if (!object(renderedConfig)) fail("CONFIG_INVALID");
   const config = cloneJson(renderedConfig, "CONFIG_INVALID");
@@ -796,12 +892,14 @@ export function applyEdgeModeStagingOverlay({
 
 /** The staging counterpart of applyEdgeModeSnapshotDelta, with the same refusals. */
 export function applyEdgeModeStagingSnapshotDelta({
-  snapshot, mode, plan, productionSnapshot, productionBaselineSnapshot, trackedConfig,
+  snapshot, mode, plan, productionSnapshot, productionBaselineSnapshot, productionPlan, trackedConfig,
 } = {}) {
   const edgeMode = requiredMode(mode);
   const normalizedPlan = normalizeEdgeModePlan({ mode: edgeMode, plan });
   const trackedDatabases = trackedDataDatabases(trackedConfig, "STAGING_INPUT_INVALID");
-  const references = stagingReferences({ productionSnapshot, productionBaselineSnapshot, trackedConfig });
+  const references = stagingReferences({
+    productionSnapshot, productionBaselineSnapshot, productionPlan, trackedConfig,
+  });
   const staging = canonicalSnapshot(snapshot, "STAGING_INPUT_INVALID");
   assertStagingIsolation({ snapshot: staging, environment: undefined, plan: normalizedPlan, references });
   return deltaSnapshot(staging, edgeMode, normalizedPlan, trackedDatabases);

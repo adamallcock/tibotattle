@@ -8,6 +8,7 @@ import {
   EDGE_MODE_GCP_REQUIRED_SECRETS,
   EDGE_MODE_OVERLAY_SCHEMA,
   EDGE_MODE_PRODUCTION_HOSTNAMES,
+  EDGE_MODE_PRODUCTION_RELEASE_GUARD_DATABASE_NAME,
   EDGE_MODE_RELEASE_GUARD_MIGRATIONS_DIR,
   EDGE_MODE_RETIRED_SECRETS,
   EDGE_MODE_TRANSITIONS,
@@ -157,10 +158,11 @@ function reverseKeys(value) {
   return value;
 }
 
-/** A fenced live state with the edge secrets put, built directly as a starting
- * point; the transition path to it is covered by the roll-forward chain. */
+/** A fenced live state with the edge secrets put: the pre-edge fixture rolled
+ * through worker mode to fenced by the deltas themselves. */
 function fencedWithEdgeSecrets() {
-  return applyEdgeModeSnapshotDelta({ snapshot: addBindings(fixture(), EDGE_SECRETS), mode: "fenced" });
+  const worker = delta({ snapshot: addBindings(fixture(), EDGE_SECRETS), mode: "worker" });
+  return delta({ snapshot: worker, mode: "fenced" });
 }
 
 test("the synthetic fixture is a canonical, version-152-shaped typed snapshot with fake ids", () => {
@@ -191,7 +193,7 @@ test("the worker overlay on the real wrangler.jsonc binds only snapshot ids and 
 
   const snapshot = fixture();
   const plain = render(snapshot, sha("c"), trackedConfig);
-  const { config, overlaySha256 } = applyEdgeModeOverlay({ renderedConfig: plain, mode: "worker" });
+  const { config, overlaySha256 } = applyEdgeModeOverlay({ renderedConfig: plain, mode: "worker", trackedConfig });
   const production = config.env.production;
   assert.equal(production.main, EDGE_MODE_ENTRY_MAIN);
   assert.equal(production.vars.EDGE_UPSTREAM_MODE, "worker");
@@ -210,9 +212,9 @@ test("the worker overlay on the real wrangler.jsonc binds only snapshot ids and 
   assert.deepEqual(withoutDeclaredChange(config, plain), plain);
   assert.equal(overlaySha256, edgeModeOverlaySha256({ mode: "worker" }));
 
-  const workerLive = deployed(applyEdgeModeSnapshotDelta({ snapshot, mode: "worker" }), sha("d"), versionId(153));
+  const workerLive = deployed(applyEdgeModeSnapshotDelta({ snapshot, mode: "worker", trackedConfig }), sha("d"), versionId(153));
   const workerPlain = render(workerLive, sha("e"), trackedConfig);
-  const fenced = applyEdgeModeOverlay({ renderedConfig: workerPlain, mode: "fenced" }).config;
+  const fenced = applyEdgeModeOverlay({ renderedConfig: workerPlain, mode: "fenced", trackedConfig }).config;
   assert.equal(workerPlain.env.production.vars.EDGE_UPSTREAM_MODE, "worker");
   assert.equal(fenced.env.production.vars.EDGE_UPSTREAM_MODE, "fenced");
   assert.equal(fenced.env.production.main, EDGE_MODE_ENTRY_MAIN);
@@ -326,9 +328,9 @@ test("gcp output drops every data binding, keeps the declared surface, and fails
   assert.deepEqual(overlaidRoot, plainRoot);
   assert.deepEqual(overlaidEnv.staging, plainEnv.staging);
   assert.equal(verifyProductionLiveConfig({ snapshot: expected, candidateConfig: config, sourceCommit }).ok, true);
-  const fencedExpected = applyEdgeModeSnapshotDelta({ snapshot: live, mode: "fenced" });
+  const fencedExpected = delta({ snapshot: live, mode: "fenced" });
   assert.equal(verifyProductionLiveConfig({ snapshot: fencedExpected, candidateConfig: config, sourceCommit }).ok, false);
-  const fencedConfig = applyEdgeModeOverlay({ renderedConfig: plain, mode: "fenced" }).config;
+  const fencedConfig = overlay({ renderedConfig: plain, mode: "fenced" }).config;
   assert.equal(verifyProductionLiveConfig({ snapshot: expected, candidateConfig: fencedConfig, sourceCommit }).ok, false);
 
   const both = (snapshot, code, plan = GCP_PLAN) => {
@@ -356,6 +358,8 @@ test("gcp output drops every data binding, keeps the declared surface, and fails
   throwsCode(() => delta({ snapshot: originSecret, mode: "gcp", plan: GCP_PLAN }), "EDGE_MODE_SNAPSHOT_INVALID");
   throwsCode(() => delta({ snapshot: addBindings(fixture(), [{ name: "EDGE_UPSTREAM_MODE", type: "secret_text" }]), mode: "fenced" }),
     "EDGE_MODE_SNAPSHOT_INVALID");
+  throwsCode(() => liveEdgeMode(addBindings(fixture(), [{ name: "EDGE_UPSTREAM_MODE", type: "secret_text" }])),
+    "EDGE_MODE_LIVE_INVALID");
 });
 
 test("the release guard D1 is never a tracked or retired data D1 and stays pinned once bound", () => {
@@ -387,10 +391,17 @@ test("the release guard D1 is never a tracked or retired data D1 and stays pinne
   refusedBoth(fenced, withGuard(stagingPrimary.database_id));
   refusedBoth(fenced, withGuard(GUARD_ID, stagingPrimary.database_name));
   refusedBoth(fenced, withGuard(LEDGER_ID));
-  // gcp needs the tracked production config; worker and fenced do not.
+  // Every mode needs the tracked production config, so a caller wired without
+  // it fails on its first worker deploy rather than at the gcp switch.
   refusedBoth(fenced, GCP_PLAN, "EDGE_MODE_INPUT_INVALID", { trackedConfig: undefined });
   refusedBoth(fenced, GCP_PLAN, "EDGE_MODE_INPUT_INVALID", { trackedConfig: stagingTracked() });
-  throwsCode(() => applyEdgeModeSnapshotDelta({ snapshot: fenced, mode: "fenced", trackedConfig: [] }), "EDGE_MODE_INPUT_INVALID");
+  for (const mode of ["worker", "fenced"]) {
+    for (const input of [{}, { trackedConfig: undefined }, { trackedConfig: [] }, { trackedConfig: stagingTracked() }]) {
+      throwsCode(() => applyEdgeModeOverlay({ renderedConfig: render(fenced, sourceCommit), mode, ...input }),
+        "EDGE_MODE_INPUT_INVALID");
+      throwsCode(() => applyEdgeModeSnapshotDelta({ snapshot: fenced, mode, ...input }), "EDGE_MODE_INPUT_INVALID");
+    }
+  }
   // A tracked RELEASE_GUARD_DB entry (a later checked-in config) names the guard itself.
   const trackedWithGuard = structuredClone(trackedConfig);
   trackedWithGuard.env.production.d1_databases.push({
@@ -400,7 +411,7 @@ test("the release guard D1 is never a tracked or retired data D1 and stays pinne
   acceptedBoth(fenced, GCP_PLAN, { trackedConfig: trackedWithGuard });
 
   const gcpLive = deployed(acceptedBoth(fenced, GCP_PLAN), sourceCommit, versionId(500));
-  const braked = deployed(applyEdgeModeSnapshotDelta({ snapshot: gcpLive, mode: "fenced" }), sourceCommit, versionId(501));
+  const braked = deployed(applyEdgeModeSnapshotDelta({ snapshot: gcpLive, mode: "fenced", trackedConfig }), sourceCommit, versionId(501));
   assert.equal(liveEdgeMode(braked), "fenced");
   for (const live of [gcpLive, braked]) {
     // The data D1s are no longer bound, but the bound guard pins the plan.
@@ -444,6 +455,43 @@ test("worker mode is refused on any live state only a gcp deploy produces", () =
   assert.equal(verifyProductionLiveConfig({ snapshot: aborted, candidateConfig: config, sourceCommit }).ok, true);
 });
 
+test("the overlay and delta refuse any target the live mode cannot reach, whatever the caller's transition check", () => {
+  const sourceCommit = sha("5");
+  const preEdge = addBindings(fixture(), EDGE_SECRETS);
+  const worker = deployed(delta({ snapshot: preEdge, mode: "worker" }), sourceCommit, versionId(520));
+  const fenced = deployed(delta({ snapshot: worker, mode: "fenced" }), sourceCommit, versionId(521));
+  const gcpLive = deployed(delta({ snapshot: fenced, mode: "gcp", plan: GCP_PLAN }), sourceCommit, versionId(522));
+  const states = { null: preEdge, worker, fenced, gcp: gcpLive };
+  assert.deepEqual(Object.entries(states).map(([, live]) => liveEdgeMode(live)), [null, "worker", "fenced", "gcp"]);
+  const reachable = new Set(EDGE_MODE_TRANSITIONS.map((entry) => `${entry.from}->${entry.to}`));
+  for (const [liveMode, live] of Object.entries(states)) {
+    for (const [mode, plan] of [["worker"], ["fenced"], ["gcp", GCP_PLAN]]) {
+      const pair = `${liveMode}->${mode}`;
+      const attempts = [
+        () => overlay({ renderedConfig: render(live, sourceCommit), mode, plan }),
+        () => delta({ snapshot: live, mode, plan }),
+      ];
+      if (reachable.has(pair)) {
+        const { config } = attempts[0]();
+        assert.equal(verifyProductionLiveConfig({ snapshot: attempts[1](), candidateConfig: config, sourceCommit }).ok, true, pair);
+      } else {
+        // null -> fenced, null -> gcp, worker -> gcp and gcp -> worker. A gcp
+        // switch without the fence would strand post-export writes in D1.
+        for (const attempt of attempts) throwsCode(attempt, "EDGE_MODE_TRANSITION_FORBIDDEN");
+      }
+    }
+  }
+  assert.deepEqual([...reachable].filter((pair) => pair.endsWith("->gcp")).sort(), ["fenced->gcp", "gcp->gcp"]);
+  // A render or snapshot whose live mode var is unreadable is refused, not read as pre-edge.
+  const unreadable = setText(worker, "EDGE_UPSTREAM_MODE", "Fenced");
+  throwsCode(() => overlay({ renderedConfig: render(unreadable, sourceCommit), mode: "fenced" }), "EDGE_MODE_LIVE_INVALID");
+  throwsCode(() => delta({ snapshot: unreadable, mode: "fenced" }), "EDGE_MODE_LIVE_INVALID");
+  const unmarked = render(dropBindings(gcpLive, ["EDGE_UPSTREAM_MODE"]), sourceCommit);
+  throwsCode(() => overlay({ renderedConfig: unmarked, mode: "gcp", plan: GCP_PLAN }), "EDGE_MODE_LIVE_INVALID");
+  throwsCode(() => delta({ snapshot: dropBindings(gcpLive, ["EDGE_UPSTREAM_MODE"]), mode: "gcp", plan: GCP_PLAN }),
+    "EDGE_MODE_LIVE_INVALID");
+});
+
 test("plans, modes and inputs are closed and fail with content-free codes", () => {
   const snapshot = fixture();
   const plain = render(snapshot, sha("c"));
@@ -471,12 +519,12 @@ test("plans, modes and inputs are closed and fail with content-free codes", () =
   ];
   for (const [mode, plan] of invalidPlans) {
     throwsCode(() => normalizeEdgeModePlan({ mode, plan }), "EDGE_MODE_PLAN_INVALID");
-    throwsCode(() => applyEdgeModeOverlay({ renderedConfig: plain, mode, plan }), "EDGE_MODE_PLAN_INVALID");
-    throwsCode(() => applyEdgeModeSnapshotDelta({ snapshot, mode, plan }), "EDGE_MODE_PLAN_INVALID");
+    throwsCode(() => overlay({ renderedConfig: plain, mode, plan }), "EDGE_MODE_PLAN_INVALID");
+    throwsCode(() => delta({ snapshot, mode, plan }), "EDGE_MODE_PLAN_INVALID");
   }
   for (const mode of [undefined, null, "", "Worker", "gcp ", "json"]) {
-    throwsCode(() => applyEdgeModeOverlay({ renderedConfig: plain, mode }), "EDGE_MODE_INVALID");
-    throwsCode(() => applyEdgeModeSnapshotDelta({ snapshot, mode }), "EDGE_MODE_INVALID");
+    throwsCode(() => overlay({ renderedConfig: plain, mode }), "EDGE_MODE_INVALID");
+    throwsCode(() => delta({ snapshot, mode }), "EDGE_MODE_INVALID");
   }
   for (const mode of ["worker", "fenced"]) {
     for (const plan of [undefined, null, {}]) assert.equal(normalizeEdgeModePlan({ mode, plan }), null);
@@ -484,16 +532,16 @@ test("plans, modes and inputs are closed and fail with content-free codes", () =
   assert.deepEqual(normalizeEdgeModePlan({ mode: "gcp", plan: GCP_PLAN }), { ...GCP_PLAN, upstreamHeadersTimeoutSeconds: 100 });
 
   const flat = structuredClone(plain.env.production);
-  throwsCode(() => applyEdgeModeOverlay({ renderedConfig: flat, mode: "worker" }), "EDGE_MODE_CONFIG_INVALID");
+  throwsCode(() => overlay({ renderedConfig: flat, mode: "worker" }), "EDGE_MODE_CONFIG_INVALID");
   const secretClash = structuredClone(plain);
   secretClash.env.production.secrets.required.push("EDGE_UPSTREAM_MODE");
-  throwsCode(() => applyEdgeModeOverlay({ renderedConfig: secretClash, mode: "worker" }), "EDGE_MODE_CONFIG_INVALID");
+  throwsCode(() => overlay({ renderedConfig: secretClash, mode: "worker" }), "EDGE_MODE_CONFIG_INVALID");
 
   const tampered = structuredClone(snapshot);
   tampered.bindings.find((binding) => binding.name === "TELEMETRY_STORAGE_MODE").text = "json";
-  throwsCode(() => applyEdgeModeSnapshotDelta({ snapshot: tampered, mode: "worker" }), "EDGE_MODE_SNAPSHOT_INVALID");
-  throwsCode(() => applyEdgeModeSnapshotDelta({ snapshot: inventoryOf(snapshot), mode: "worker" }), "EDGE_MODE_SNAPSHOT_INVALID");
-  throwsCode(() => liveEdgeMode(setText(applyEdgeModeSnapshotDelta({ snapshot, mode: "worker" }), "EDGE_UPSTREAM_MODE", "Worker")),
+  throwsCode(() => delta({ snapshot: tampered, mode: "worker" }), "EDGE_MODE_SNAPSHOT_INVALID");
+  throwsCode(() => delta({ snapshot: inventoryOf(snapshot), mode: "worker" }), "EDGE_MODE_SNAPSHOT_INVALID");
+  throwsCode(() => liveEdgeMode(setText(delta({ snapshot, mode: "worker" }), "EDGE_UPSTREAM_MODE", "Worker")),
     "EDGE_MODE_LIVE_INVALID");
 });
 
@@ -549,6 +597,20 @@ test("verifyEdgeModeLiveSnapshot checks the active version, mode, domains and th
   assert.equal(check(gcpLive, { deployment: { versions: [{ version_id: id, percentage: 99.9 }] } }).code,
     "EDGE_MODE_DEPLOYMENT_NOT_SINGLE");
   assert.equal(check(gcpLive, { deployment: undefined }).code, "EDGE_MODE_DEPLOYMENT_NOT_SINGLE");
+  // The live version at 100% is not enough: it must be the only version listed.
+  for (const versions of [
+    [{ version_id: id, percentage: 100 }, { version_id: versionId(199), percentage: 0 }],
+    [{ version_id: id, percentage: 100 }, { version_id: id, percentage: 100 }],
+    [{ version_id: id, percentage: 100 }, { version_id: id, percentage: 0 }],
+    [],
+  ]) {
+    assert.equal(check(gcpLive, { deployment: { versions } }).code, "EDGE_MODE_DEPLOYMENT_NOT_SINGLE");
+  }
+  // The brief's bare {snapshot, mode} call is unverified, not a mode reading.
+  assert.equal(verifyEdgeModeLiveSnapshot({ snapshot: gcpLive, mode: "gcp" }).code, "EDGE_MODE_INPUT_INVALID");
+  assert.equal(verifyEdgeModeLiveSnapshot({ snapshot: gcpLive, mode: "gcp", sourceCommit }).code,
+    "EDGE_MODE_DEPLOYMENT_NOT_SINGLE");
+  assert.equal(liveEdgeMode(gcpLive), "gcp");
   assert.equal(check(gcpLive, { sourceCommit: sha("b") }).code, "EDGE_MODE_SOURCE_MISMATCH");
   assert.equal(check(gcpLive, { sourceCommit: "HEAD" }).code, "EDGE_MODE_INPUT_INVALID");
   assert.equal(check(gcpLive, { mode: "GCP" }).code, "EDGE_MODE_INVALID");
@@ -556,7 +618,7 @@ test("verifyEdgeModeLiveSnapshot checks the active version, mode, domains and th
     assert.equal(check(gcpLive, { expectedDomains }).code, "EDGE_MODE_INPUT_INVALID");
   }
 
-  const workerLive = deployed(applyEdgeModeSnapshotDelta({ snapshot: fixture(), mode: "worker" }), sourceCommit, id);
+  const workerLive = deployed(delta({ snapshot: fixture(), mode: "worker" }), sourceCommit, id);
   const worker = (snapshot) => check(snapshot, { mode: "worker" });
   assert.deepEqual(worker(workerLive), { ok: true, code: null, warnings: [] });
   assert.equal(check(deployed(fixture(), sourceCommit, id), { mode: "worker" }).code, "EDGE_MODE_MISMATCH");
@@ -678,6 +740,11 @@ function stagingRename(snapshot, workerName) {
   });
 }
 
+/** The staging Worker after its worker and fenced rehearsal steps, where its gcp step starts. */
+function fencedStaging(snapshot = stagingSnapshot()) {
+  return addBindings(snapshot, [{ name: "EDGE_UPSTREAM_MODE", type: "plain_text", text: "fenced" }]);
+}
+
 test("the staging variant rehearses every mode on a workers.dev-only staging Worker", () => {
   const production = fixture();
   const trackedConfig = tracked();
@@ -687,47 +754,74 @@ test("the staging variant rehearses every mode on a workers.dev-only staging Wor
   assert.equal(staging.bindings.some((binding) => binding.type === "ratelimit"
     && productionRateLimits.includes(binding.namespace_id)), false);
   const sourceCommit = sha("9");
-  const common = { productionSnapshot: production, trackedConfig };
-  let live = staging;
-  let index = 300;
-  for (const [mode, modePlan] of [["worker"], ["worker"], ["fenced"], ["gcp", STAGING_PLAN], ["gcp", STAGING_PLAN],
-    ["fenced"], ["gcp", STAGING_PLAN]]) {
-    const plain = render(live, sourceCommit, stagingTracked());
-    assert.equal(plain.env, undefined);
-    const { config } = applyEdgeModeStagingOverlay({ renderedConfig: plain, snapshot: live, mode, plan: modePlan, ...common });
-    const expected = applyEdgeModeStagingSnapshotDelta({ snapshot: live, mode, plan: modePlan, ...common });
-    assert.equal(config.main, EDGE_MODE_ENTRY_MAIN);
-    assert.equal(verifyProductionLiveConfig({ snapshot: expected, candidateConfig: config, sourceCommit }).ok, true, mode);
-    const id = versionId(index);
-    index += 1;
-    live = deployed(expected, sourceCommit, id);
-    const verify = (overrides) => verifyEdgeModeLiveSnapshot({ snapshot: live, mode, deployment: single(id), sourceCommit, ...overrides });
-    assert.equal(verify({ expectedDomains: [] }).ok, true, mode);
-    assert.equal(verify({}).code, "EDGE_MODE_DOMAINS_CHANGED", mode);
-    assert.equal(verify({ expectedDomains: ["staging.synthetic.example"] }).code, "EDGE_MODE_DOMAINS_CHANGED", mode);
+  // Before the owner creates the production origin and guard D1 there is no
+  // production gcp plan (P0); from then on the rehearsal passes it.
+  for (const productionPlan of [null, GCP_PLAN]) {
+    const common = { productionSnapshot: production, trackedConfig, productionPlan };
+    let live = staging;
+    let index = 300;
+    for (const [mode, modePlan] of [["worker"], ["worker"], ["fenced"], ["gcp", STAGING_PLAN], ["gcp", STAGING_PLAN],
+      ["fenced"], ["gcp", STAGING_PLAN]]) {
+      const plain = render(live, sourceCommit, stagingTracked());
+      assert.equal(plain.env, undefined);
+      const { config } = applyEdgeModeStagingOverlay({ renderedConfig: plain, snapshot: live, mode, plan: modePlan, ...common });
+      const expected = applyEdgeModeStagingSnapshotDelta({ snapshot: live, mode, plan: modePlan, ...common });
+      assert.equal(config.main, EDGE_MODE_ENTRY_MAIN);
+      assert.equal(verifyProductionLiveConfig({ snapshot: expected, candidateConfig: config, sourceCommit }).ok, true, mode);
+      const id = versionId(index);
+      index += 1;
+      live = deployed(expected, sourceCommit, id);
+      const verify = (overrides) => verifyEdgeModeLiveSnapshot({ snapshot: live, mode, deployment: single(id), sourceCommit, ...overrides });
+      assert.equal(verify({ expectedDomains: [] }).ok, true, mode);
+      assert.equal(verify({}).code, "EDGE_MODE_DOMAINS_CHANGED", mode);
+      assert.equal(verify({ expectedDomains: ["staging.synthetic.example"] }).code, "EDGE_MODE_DOMAINS_CHANGED", mode);
+    }
   }
+  const common = { productionSnapshot: production, trackedConfig, productionPlan: null };
 
   // Staging may use its own names under the production zone.
   const zoned = resnapshot(setText(staging, "PUBLIC_ORIGIN", "https://staging.tibotattle.com"), {
     domains: [{ hostname: "staging.tibotattle.com" }],
   });
-  for (const [mode, modePlan] of [["worker"], ["fenced"]]) {
+  let zonedLive = zoned;
+  let index = 400;
+  for (const mode of ["worker", "fenced"]) {
     const { config } = applyEdgeModeStagingOverlay({
-      renderedConfig: render(zoned, sourceCommit, stagingTracked()), snapshot: zoned, mode, plan: modePlan, ...common,
+      renderedConfig: render(zonedLive, sourceCommit, stagingTracked()), snapshot: zonedLive, mode, ...common,
     });
-    const expected = applyEdgeModeStagingSnapshotDelta({ snapshot: zoned, mode, plan: modePlan, ...common });
+    const expected = applyEdgeModeStagingSnapshotDelta({ snapshot: zonedLive, mode, ...common });
     assert.equal(verifyProductionLiveConfig({ snapshot: expected, candidateConfig: config, sourceCommit }).ok, true, mode);
     const id = versionId(index);
     index += 1;
+    zonedLive = deployed(expected, sourceCommit, id);
     assert.equal(verifyEdgeModeLiveSnapshot({
-      snapshot: deployed(expected, sourceCommit, id), mode, deployment: single(id), sourceCommit,
-      expectedDomains: ["staging.tibotattle.com"],
+      snapshot: zonedLive, mode, deployment: single(id), sourceCommit, expectedDomains: ["staging.tibotattle.com"],
     }).ok, true, mode);
   }
   applyEdgeModeStagingSnapshotDelta({
-    snapshot: staging, mode: "gcp", ...common,
+    snapshot: zonedLive, mode: "gcp", ...common,
     plan: { ...STAGING_PLAN, upstreamOrigin: "https://staging-origin.a.run.app", originAudience: "https://staging.tibotattle.com" },
   });
+
+  // A nested render (the staging Worker as its config's env.production)
+  // changes only env.production; its root and other environments come back as rendered.
+  const { env: trackedEnv, ...trackedRoot } = tracked();
+  const nestedTracked = { ...trackedRoot, env: { production: structuredClone(trackedEnv.staging), staging: trackedEnv.staging } };
+  const nestedPlain = render(staging, sourceCommit, nestedTracked);
+  assert.equal(nestedPlain.env.production.name, staging.workerName);
+  const nested = applyEdgeModeStagingOverlay({ renderedConfig: nestedPlain, snapshot: staging, mode: "worker", ...common });
+  const { env: nestedEnv, ...nestedRoot } = nested.config;
+  const { env: nestedPlainEnv, ...nestedPlainRoot } = nestedPlain;
+  assert.deepEqual(nestedRoot, nestedPlainRoot);
+  assert.deepEqual(Object.keys(nestedEnv).sort(), ["production", "staging"]);
+  assert.deepEqual(nestedEnv.staging, nestedPlainEnv.staging);
+  assert.equal(nestedEnv.production.main, EDGE_MODE_ENTRY_MAIN);
+  assert.deepEqual(withoutDeclaredChange(nested.config, nestedPlain), nestedPlain);
+  assert.equal(verifyProductionLiveConfig({
+    snapshot: applyEdgeModeStagingSnapshotDelta({ snapshot: staging, mode: "worker", ...common }),
+    candidateConfig: nested.config,
+    sourceCommit,
+  }).ok, true);
 });
 
 test("the staging variant refuses every production reference and no other", () => {
@@ -735,9 +829,9 @@ test("the staging variant refuses every production reference and no other", () =
   const trackedConfig = tracked();
   const trackedProduction = trackedConfig.env.production;
   const legacyPrimary = trackedProduction.d1_databases[0].database_id;
-  const staging = stagingSnapshot();
+  const staging = fencedStaging();
   const sourceCommit = sha("9");
-  const common = { productionSnapshot: production, trackedConfig };
+  const common = { productionSnapshot: production, trackedConfig, productionPlan: null };
   const refused = (snapshot, overrides = {}) => {
     const input = { snapshot, mode: "gcp", plan: STAGING_PLAN, ...common, ...overrides };
     throwsCode(() => applyEdgeModeStagingSnapshotDelta(input), "EDGE_MODE_STAGING_PRODUCTION_REFERENCE");
@@ -772,10 +866,18 @@ test("the staging variant refuses every production reference and no other", () =
   refused(replace("TELEMETRY_STORAGE_NAMESPACE", "text", INGESTION_ID));
   refusedRender((config) => { config.d1_databases[0].database_id = INGESTION_ID; });
   refused(staging, { plan: { ...STAGING_PLAN, releaseGuardDatabase: { id: INGESTION_ID, name: "synthetic-staging-release-guard" } } });
-  // R2 buckets, as bindings and as var text.
+  // The production guard D1's fixed name, whatever production evidence exists.
+  refused(staging, { plan: { ...STAGING_PLAN, releaseGuardDatabase: {
+    id: STAGING_PLAN.releaseGuardDatabase.id, name: EDGE_MODE_PRODUCTION_RELEASE_GUARD_DATABASE_NAME,
+  } } });
+  assert.equal(EDGE_MODE_PRODUCTION_RELEASE_GUARD_DATABASE_NAME, "tibotattle-release-guard");
+  // R2 buckets, as bindings, in the rendered environment and as var text.
   refused(replace("SPARKLE_RELEASES", "bucket_name", "synthetic-production-updates"));
   refused(replace("QUARANTINE", "bucket_name", trackedProduction.r2_buckets[0].bucket_name));
   refused(replace("SPARKLE_APPCAST_GUARD_BUCKET", "text", "synthetic-production-updates"));
+  refusedRender((config) => {
+    config.r2_buckets.find((entry) => entry.binding === "QUARANTINE").bucket_name = "synthetic-production-quarantine";
+  });
   // Rate-limit namespaces, from the production snapshot and the tracked config.
   refused(replace("PUBLIC_READ_RATE_LIMIT", "namespace_id", "9004"));
   refused(replace("CLIENT_ATTEMPT_RATE_LIMIT", "namespace_id",
@@ -785,8 +887,9 @@ test("the staging variant refuses every production reference and no other", () =
   const numericTracked = structuredClone(trackedConfig);
   numericTracked.env.production.ratelimits[0].namespace_id = 3999;
   refused(replace("ENROLLMENT_RATE_LIMIT", "namespace_id", "3999"), { trackedConfig: numericTracked });
-  // Production hostnames, as custom domains, routes and var text; other names
-  // under the zone are accepted by the rehearsal test above.
+  // Production hostnames, as custom domains, routes and var text (in the
+  // snapshot or only in the rendered environment); other names under the zone
+  // are accepted by the rehearsal test above.
   for (const hostname of EDGE_MODE_PRODUCTION_HOSTNAMES) {
     refused(resnapshot(staging, { domains: [{ hostname }] }));
     refused(setText(staging, "PUBLIC_ORIGIN", `https://${hostname}/path`));
@@ -795,6 +898,7 @@ test("the staging variant refuses every production reference and no other", () =
   refused(resnapshot(staging, { routes: [{ pattern: "*.tibotattle.com/*" }] }));
   refused(staging, { plan: { ...STAGING_PLAN, originAudience: "https://tibotattle.com" } });
   refusedRender((config) => { config.routes = [{ pattern: "www.tibotattle.com", custom_domain: true }]; });
+  refusedRender((config) => { config.vars.PUBLIC_ORIGIN = "https://tibotattle.com"; });
   // The live production domains and routes join the refused hostnames.
   const productionWithHosts = resnapshot(production, {
     domains: [...production.domains, { hostname: "status.synthetic-production.example" }],
@@ -809,10 +913,20 @@ test("the staging variant refuses every production reference and no other", () =
     { productionSnapshot: productionWithHosts });
   refused(setText(staging, "PUBLIC_ORIGIN", "https://api.synthetic-production.example"),
     { productionSnapshot: productionWithHosts });
-  // Worker names: the snapshot, a Durable Object script, the rendered environment, and a tracked name.
+  // So do the tracked production routes, which no live snapshot need carry.
+  const trackedHosted = resnapshot(staging, { domains: [{ hostname: "legacy.synthetic-tracked.example" }] });
+  applyEdgeModeStagingSnapshotDelta({ snapshot: trackedHosted, mode: "gcp", plan: STAGING_PLAN, ...common });
+  for (const route of [{ pattern: "legacy.synthetic-tracked.example", custom_domain: true }, "legacy.synthetic-tracked.example/*"]) {
+    const routedTracked = structuredClone(trackedConfig);
+    routedTracked.env.production.routes.push(route);
+    refused(trackedHosted, { trackedConfig: routedTracked });
+  }
+  // Worker names: the snapshot, a Durable Object script, the rendered
+  // environment, var text, and a tracked name.
   const asProduction = stagingRename(staging, "app-usagemonitor");
   refused(asProduction, { renderedConfig: render(asProduction, sourceCommit, { ...stagingTracked(), name: "app-usagemonitor" }) });
   refused(replace("UPLOAD_INGRESS_BUDGET", "script_name", "app-usagemonitor"));
+  refused(setText(staging, "ENVIRONMENT", "app-usagemonitor"));
   refusedRender((config) => { config.durable_objects.bindings[0].script_name = "app-usagemonitor"; });
   refusedRender((config) => { config.name = "app-usagemonitor"; });
   const alias = "app-usagemonitor-tracked-alias";
@@ -830,11 +944,57 @@ test("the staging variant refuses every production reference and no other", () =
   }), "EDGE_MODE_STAGING_PRODUCTION_REFERENCE");
 });
 
+test("before production binds its gcp values, the production plan is what the staging variant refuses", () => {
+  const production = fixture();
+  const trackedConfig = tracked();
+  const staging = fencedStaging();
+  const sourceCommit = sha("9");
+  const common = { productionSnapshot: production, trackedConfig };
+  const planned = { ...common, productionPlan: GCP_PLAN };
+  const refused = (snapshot, plan, input = planned) => {
+    throwsCode(() => applyEdgeModeStagingSnapshotDelta({ snapshot, mode: "gcp", plan, ...input }),
+      "EDGE_MODE_STAGING_PRODUCTION_REFERENCE");
+    throwsCode(() => applyEdgeModeStagingOverlay({
+      renderedConfig: render(snapshot, sourceCommit, stagingTracked()), snapshot, mode: "gcp", plan, ...input,
+    }), "EDGE_MODE_STAGING_PRODUCTION_REFERENCE");
+  };
+  // Between P1 and the production gcp switch the production guard D1 and
+  // origin exist, but the production snapshot (worker or fenced) binds neither.
+  assert.equal(production.bindings.some((binding) => binding.name === "RELEASE_GUARD_DB"), false);
+  // Declared as absent, a copy of the production plan has nothing to be refused against ...
+  applyEdgeModeStagingSnapshotDelta({ snapshot: staging, mode: "gcp", plan: GCP_PLAN, ...common, productionPlan: null });
+  // ... and with the production plan supplied it is refused, value by value.
+  refused(staging, GCP_PLAN);
+  refused(staging, { ...STAGING_PLAN, releaseGuardDatabase: { id: GUARD_ID, name: STAGING_PLAN.releaseGuardDatabase.name } });
+  refused(staging, { ...STAGING_PLAN, releaseGuardDatabase: {
+    id: STAGING_PLAN.releaseGuardDatabase.id, name: GCP_PLAN.releaseGuardDatabase.name,
+  } });
+  for (const key of ["upstreamOrigin", "originAudience", "invokerServiceAccount"]) {
+    refused(staging, { ...STAGING_PLAN, [key]: GCP_PLAN[key] });
+  }
+  // A staging binding or var naming the production guard or origin, in any mode.
+  const guardBound = resnapshot(staging, {
+    bindings: staging.bindings.map((binding) => binding.name === "USAGE_MONITOR_DB" ? { ...binding, database_id: GUARD_ID } : binding),
+  });
+  refused(guardBound, STAGING_PLAN);
+  throwsCode(() => applyEdgeModeStagingSnapshotDelta({ snapshot: guardBound, mode: "worker", ...planned }),
+    "EDGE_MODE_STAGING_PRODUCTION_REFERENCE");
+  throwsCode(() => applyEdgeModeStagingSnapshotDelta({
+    snapshot: setText(staging, "PUBLIC_ORIGIN", GCP_PLAN.upstreamOrigin), mode: "fenced", ...planned,
+  }), "EDGE_MODE_STAGING_PRODUCTION_REFERENCE");
+  // The rehearsal's own plan is accepted beside it.
+  const { config } = applyEdgeModeStagingOverlay({
+    renderedConfig: render(staging, sourceCommit, stagingTracked()), snapshot: staging, mode: "gcp", plan: STAGING_PLAN, ...planned,
+  });
+  const expected = applyEdgeModeStagingSnapshotDelta({ snapshot: staging, mode: "gcp", plan: STAGING_PLAN, ...planned });
+  assert.equal(verifyProductionLiveConfig({ snapshot: expected, candidateConfig: config, sourceCommit }).ok, true);
+});
+
 test("the staging variant needs its inputs, a pre-gcp production baseline after the switch, and the gcp prerequisites", () => {
   const production = fixture();
   const trackedConfig = tracked();
-  const staging = stagingSnapshot();
-  const common = { productionSnapshot: production, trackedConfig };
+  const staging = fencedStaging();
+  const common = { productionSnapshot: production, trackedConfig, productionPlan: null };
   const invalid = (input) => {
     throwsCode(() => applyEdgeModeStagingSnapshotDelta({ snapshot: staging, mode: "worker", ...input }),
       "EDGE_MODE_STAGING_INPUT_INVALID");
@@ -842,16 +1002,26 @@ test("the staging variant needs its inputs, a pre-gcp production baseline after 
       renderedConfig: render(staging, sha("9"), stagingTracked()), snapshot: staging, mode: "worker", ...input,
     }), "EDGE_MODE_STAGING_INPUT_INVALID");
   };
-  invalid({ trackedConfig });
-  invalid({ productionSnapshot: production });
-  invalid({ productionSnapshot: production, trackedConfig: stagingTracked() });
+  invalid({ trackedConfig, productionPlan: null });
+  invalid({ productionSnapshot: production, productionPlan: null });
+  invalid({ productionSnapshot: production, trackedConfig: stagingTracked(), productionPlan: null });
+  // The production plan is required in every mode: a gcp plan, or null before
+  // the production gcp resources exist. A malformed plan is refused.
+  invalid({ productionSnapshot: production, trackedConfig });
+  invalid({ ...common, productionPlan: undefined });
+  for (const productionPlan of [{}, [], "gcp", { ...GCP_PLAN, upstreamOrigin: "https://origin.example.com" },
+    { ...GCP_PLAN, releaseGuardDatabase: { id: GUARD_ID } }]) {
+    invalid({ ...common, productionPlan });
+  }
 
   // After the gcp switch the live production snapshot no longer names the data
   // D1s and buckets, so a pre-gcp baseline must supply them.
   const productionGcp = deployed(delta({ snapshot: fencedWithEdgeSecrets(), mode: "gcp", plan: GCP_PLAN }), sha("8"), versionId(400));
-  invalid({ ...common, productionSnapshot: productionGcp });
-  invalid({ ...common, productionBaselineSnapshot: staging });
-  const afterSwitch = { ...common, productionSnapshot: productionGcp, productionBaselineSnapshot: production };
+  invalid({ ...common, productionPlan: GCP_PLAN, productionSnapshot: productionGcp });
+  invalid({ ...common, productionPlan: GCP_PLAN, productionBaselineSnapshot: staging });
+  const afterSwitch = { ...common, productionSnapshot: productionGcp, productionBaselineSnapshot: production, productionPlan: GCP_PLAN };
+  // A production snapshot that binds gcp values contradicts "no production plan".
+  invalid({ ...afterSwitch, productionPlan: null });
   applyEdgeModeStagingSnapshotDelta({ snapshot: staging, mode: "gcp", plan: STAGING_PLAN, ...afterSwitch });
   const refused = (snapshot, overrides) => throwsCode(() => applyEdgeModeStagingSnapshotDelta({
     snapshot, mode: "gcp", plan: STAGING_PLAN, ...afterSwitch, ...overrides,
@@ -861,6 +1031,15 @@ test("the staging variant needs its inputs, a pre-gcp production baseline after 
   }));
   refused(staging, { plan: { ...STAGING_PLAN, upstreamOrigin: GCP_PLAN.upstreamOrigin } });
   refused(staging, { plan: { ...STAGING_PLAN, releaseGuardDatabase: GCP_PLAN.releaseGuardDatabase } });
+  // The live production values are refused even when the supplied plan has moved on.
+  const nextProductionPlan = { ...GCP_PLAN, upstreamOrigin: "https://tibotattle-origin-next.a.run.app", originAudience: "https://next.example" };
+  for (const key of ["upstreamOrigin", "originAudience"]) {
+    refused(staging, { productionPlan: nextProductionPlan, plan: { ...STAGING_PLAN, [key]: GCP_PLAN[key] } });
+    refused(staging, { productionPlan: nextProductionPlan, plan: { ...STAGING_PLAN, [key]: nextProductionPlan[key] } });
+  }
+  refused(staging, { productionPlan: nextProductionPlan, plan: { ...STAGING_PLAN, releaseGuardDatabase: {
+    id: STAGING_PLAN.releaseGuardDatabase.id, name: GCP_PLAN.releaseGuardDatabase.name,
+  } } });
 
   // The checked-in staging Worker has no Sparkle bucket, guard token or
   // distribution token: worker and fenced rehearse, gcp refuses until the owner
@@ -877,6 +1056,11 @@ test("the staging variant needs its inputs, a pre-gcp production baseline after 
     snapshot: staging, mode: "gcp", ...common,
     plan: { ...STAGING_PLAN, releaseGuardDatabase: { id: trackedConfig.env.staging.d1_databases[0].database_id, name: "synthetic-staging-release-guard" } },
   }), "EDGE_MODE_PLAN_INVALID");
+  // The staging variant enforces the same live-mode sources as production.
+  throwsCode(() => applyEdgeModeStagingSnapshotDelta({ snapshot: stagingSnapshot(), mode: "gcp", plan: STAGING_PLAN, ...common }),
+    "EDGE_MODE_TRANSITION_FORBIDDEN");
+  throwsCode(() => applyEdgeModeStagingSnapshotDelta({ snapshot: stagingSnapshot(), mode: "fenced", ...common }),
+    "EDGE_MODE_TRANSITION_FORBIDDEN");
 });
 
 test("the module never writes the tracked configuration or local secret templates", () => {
