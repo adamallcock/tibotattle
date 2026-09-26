@@ -1,0 +1,24 @@
+{
+  "schema": "cloudflare-writer-fence-plan-v1",
+  "accountId": "00000000000000000000000000000000",
+  "productionWorker": "app-usagemonitor",
+  "fencedScripts": [
+    { "name": "example-storage-analytics", "kind": "cron", "expectedCrons": ["* * * * *"] },
+    { "name": "example-storage-publication", "kind": "cron", "expectedCrons": ["*/5 * * * *"] },
+    { "name": "example-cache-retention-day", "kind": "cron", "expectedCrons": ["17 * * * *"] },
+    { "name": "example-graph-day-projection", "kind": "cron", "expectedCrons": ["*/10 * * * *"] },
+    { "name": "example-analytics-recovery", "kind": "cron", "expectedCrons": ["*/2 * * * *"] },
+    { "name": "example-storage-analytics-catchup", "kind": "queue-consumer", "expectedCrons": [], "queueId": "11111111111111111111111111111111" }
+  ],
+  "dataResources": [
+    { "kind": "d1", "label": "ingestion", "id": "00000000-0000-4000-8000-000000000001" },
+    { "kind": "d1", "label": "analytics", "id": "00000000-0000-4000-8000-000000000002" },
+    { "kind": "d1", "label": "deletion-ledger", "id": "00000000-0000-4000-8000-000000000003" },
+    { "kind": "d1", "label": "catchup-control", "id": "00000000-0000-4000-8000-000000000004" },
+    { "kind": "r2", "bucket": "example-production-quarantine" }
+  ],
+  "outOfScopeScripts": [
+    { "name": "tibotattle-dogfood-release-guard", "reason": "Dogfood appcast guard; binds only its own release-guard D1 and dogfood release bucket." }
+  ],
+  "quietWindowMinutes": 15
+}
