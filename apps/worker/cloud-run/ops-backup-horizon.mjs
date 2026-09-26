@@ -12,7 +12,13 @@
  * Cloud SQL copy under a 365-day ceiling, 35 days inside that horizon, with a
  * 7-day restore slack on top of each operational horizon.
  *
- * Scope: the Cloud SQL primary and ledger instances only.
+ * Scope: the Cloud SQL primary and ledger instances only, and within them only
+ * the per-instance backup runs (`sql backups list --instance`, the Admin API
+ * backupRuns collection). Project-level backups that outlive an instance
+ * (final backups of deleted instances, backups retained after deletion) are
+ * not listed there, so every receipt states BACKUP_HORIZON_COVERAGE and must
+ * never be read as proof about the whole project. retainBackupsOnDelete=true
+ * on an audited instance is itself a breach.
  *
  * Runtime-neutral: no process, filesystem, network or child-process access.
  * Callers pass Cloud SQL Admin API resources (the same objects
@@ -27,12 +33,22 @@
  *   true), so an absent `enabled` is BACKUP_DISABLED and an absent
  *   `retainBackupsOnDelete` is off. An absent number proves nothing, so an
  *   absent retention count or PITR log retention is unrecognized.
+ * - When any backup run of a role cannot be read, that role's run evidence is
+ *   unavailable: its counts, ages and on-demand list are null (never 0 or
+ *   empty) and AUTOMATED_BACKUP_STALE, an inference from absence, is not
+ *   raised. Codes proven by the runs that were read still stand.
+ * - With a manifest region, every restorable copy must be stored in exactly
+ *   that region; a copy with no stated location is unrecognized.
+ * - A labelled on-demand backup is due only once its expires-on UTC date has
+ *   fully passed, so it is kept for at least the requested number of days.
  */
 
 import { createHash } from "node:crypto";
 import { canonicalJson } from "../src/canonical-json.ts";
 
 export const BACKUP_HORIZON_AUDIT_SCHEMA = "tibotattle-backup-horizon-audit-v1";
+/** What an audit receipt covers: per-instance backup runs only, never project-level backups. */
+export const BACKUP_HORIZON_COVERAGE = "instance-backup-runs-only";
 
 export const RESTORE_SUPPRESSION_TOMBSTONE_DAYS = 400;
 export const BACKUP_HORIZON_MAX_DAYS = 365;
@@ -348,10 +364,16 @@ export function normalizeBackupRunId(value) {
   return null;
 }
 
+/**
+ * Critical past ON_DEMAND_CRITICAL_DAYS, overdue past ON_DEMAND_MAX_DAYS (both
+ * strictly greater), then due from the UTC midnight that ends the expires-on
+ * date. onDemandExpiresOn drops the time of day, so ending the date (rather
+ * than starting it) keeps every labelled backup for at least the days asked.
+ */
 function onDemandStatusFor({ ageMs, label, nowMs }) {
   if (ageMs > ON_DEMAND_CRITICAL_DAYS * DAY_MS) return "critical";
   if (ageMs > ON_DEMAND_MAX_DAYS * DAY_MS) return "overdue";
-  if (label !== null && nowMs >= parseCalendarDate(label.expiresOn)) return "due";
+  if (label !== null && nowMs >= parseCalendarDate(label.expiresOn) + DAY_MS) return "due";
   return label === null ? "unlabelled" : "ok";
 }
 
@@ -367,6 +389,9 @@ export function classifyBackupRun(run, { instance, nowMs }) {
   if (run.kind !== undefined && run.kind !== "sql#backupRun") return unrecognized;
   if (run.instance !== undefined && run.instance !== instance) return unrecognized;
   if (run.description !== undefined && typeof run.description !== "string") return unrecognized;
+  if (run.location !== undefined && (typeof run.location !== "string" || !LOCATION.test(run.location))) {
+    return unrecognized;
+  }
   const id = normalizeBackupRunId(run.id);
   if (id === null || !BACKUP_RUN_TYPES.has(run.type) || !BACKUP_RUN_STATUSES.has(run.status)) {
     return unrecognized;
@@ -386,6 +411,7 @@ export function classifyBackupRun(run, { instance, nowMs }) {
     type: run.type,
     status: run.status,
     restorable,
+    location: run.location ?? null,
     windowStartTime: windowStartMs === null ? null : new Date(windowStartMs).toISOString(),
     ageMs,
     label,
@@ -529,26 +555,42 @@ export function compareOnDemandEntries(left, right) {
   return compareDecimalIds(left.id, right.id);
 }
 
+/**
+ * `settings.recognized` is false whenever any backup evidence for the role
+ * (describe or run list) could not be read. When the run list itself cannot
+ * be read completely, the run-derived fields are null: unavailable, not zero.
+ */
 function assessRole({ instance, settings, backupRuns }, { nowMs, region }) {
   const { flags, codes } = assessSettings(settings, { instance, region });
+  const unrecognized = () => {
+    flags.recognized = false;
+    codes.push("BACKUP_SETTINGS_UNRECOGNIZED");
+  };
+  let runsReadable = Array.isArray(backupRuns);
   let automatedCount = 0;
   let oldestAutomatedAgeMs = null;
   let newestAutomatedAgeMs = null;
   const onDemand = [];
-  if (!Array.isArray(backupRuns)) {
-    codes.push("BACKUP_SETTINGS_UNRECOGNIZED");
-    flags.recognized = false;
+  if (!runsReadable) {
+    unrecognized();
   } else {
     const seen = new Set();
     for (const run of backupRuns) {
       const classified = classifyBackupRun(run, { instance, nowMs });
       if (!classified.recognized || seen.has(classified.id)) {
-        codes.push("BACKUP_SETTINGS_UNRECOGNIZED");
+        runsReadable = false;
+        unrecognized();
         continue;
       }
       seen.add(classified.id);
       if (classified.restorable && classified.ageMs > BACKUP_HORIZON_MAX_DAYS * DAY_MS) {
         codes.push("BACKUP_OLDER_THAN_HORIZON");
+      }
+      if (classified.restorable && region !== null && classified.location !== region) {
+        flags.locationCompliant = false;
+        // A copy with no stated location cannot be shown to be in the region.
+        if (classified.location === null) unrecognized();
+        else codes.push("BACKUP_LOCATION_MISMATCH");
       }
       if (classified.type === "FINAL" && classified.restorable
           && classified.ageMs > FINAL_BACKUP_MAX_DAYS * DAY_MS) {
@@ -574,6 +616,17 @@ function assessRole({ instance, settings, backupRuns }, { nowMs, region }) {
         });
       }
     }
+  }
+  if (!runsReadable) {
+    return {
+      instance,
+      settings: flags,
+      automatedCount: null,
+      oldestAutomatedAgeDays: null,
+      lastSuccessfulAutomatedAgeHours: null,
+      onDemand: null,
+      codes: sortCodes(codes),
+    };
   }
   if (newestAutomatedAgeMs === null || newestAutomatedAgeMs > LAST_AUTOMATED_SUCCESS_MAX_HOURS * HOUR_MS) {
     codes.push("AUTOMATED_BACKUP_STALE");
@@ -626,12 +679,14 @@ export function backupHorizonReceiptDigest(body) {
  * @param {number} input.nowMs epoch milliseconds
  * @param {string} input.project GCP project id the instances live in
  * @param {string|null} [input.region] manifest region; when supplied the
- *   automated backup location must equal it
+ *   configured backup location and every restorable copy's location must equal it
  * @param {Array<{role:"primary"|"ledger", instance:string, settings:object, backupRuns:unknown}>} input.instances
  *   `settings` is the `gcloud sql instances describe --format=json` object
  *   (Admin API DatabaseInstance); `backupRuns` the `gcloud sql backups list
  *   --instance=<name> --format=json` array (Admin API BackupRun items).
- * @returns a deep-frozen 'tibotattle-backup-horizon-audit-v1' receipt.
+ * @returns a deep-frozen 'tibotattle-backup-horizon-audit-v1' receipt whose
+ *   `coverage` is BACKUP_HORIZON_COVERAGE: an ok verdict speaks for the
+ *   instances' listed backup runs, not for project-level backups.
  */
 export function assessBackupRuns({ environment, nowMs, project, region = null, instances } = {}) {
   const byRole = validateAssessmentInput({ environment, nowMs, project, region, instances });
@@ -640,6 +695,7 @@ export function assessBackupRuns({ environment, nowMs, project, region = null, i
   const codes = sortCodes([...roles.primary.codes, ...roles.ledger.codes]);
   const body = {
     schema: BACKUP_HORIZON_AUDIT_SCHEMA,
+    coverage: BACKUP_HORIZON_COVERAGE,
     environment,
     project,
     region,
@@ -651,7 +707,18 @@ export function assessBackupRuns({ environment, nowMs, project, region = null, i
   return deepFreeze({ ...body, digest: backupHorizonReceiptDigest(body) });
 }
 
-const RECEIPT_KEYS = ["schema", "environment", "project", "region", "generatedAt", "roles", "verdict", "codes", "digest"];
+const RECEIPT_KEYS = [
+  "schema",
+  "coverage",
+  "environment",
+  "project",
+  "region",
+  "generatedAt",
+  "roles",
+  "verdict",
+  "codes",
+  "digest",
+];
 const ROLE_KEYS = [
   "instance",
   "settings",
@@ -684,21 +751,37 @@ function validCodeList(codes) {
     && canonicalJson(sortCodes(codes)) === canonicalJson(codes);
 }
 
+const ON_DEMAND_STATUS_CODES = Object.freeze({
+  due: "ON_DEMAND_DUE",
+  overdue: "ON_DEMAND_OVERDUE",
+  critical: "ON_DEMAND_CRITICAL",
+});
+const ON_DEMAND_CODES = new Set(["ON_DEMAND_UNLABELLED", ...Object.values(ON_DEMAND_STATUS_CODES)]);
+
 function validRole(role) {
   if (!hasExactKeys(role, ROLE_KEYS)
       || typeof role.instance !== "string" || !CLOUD_SQL_INSTANCE_ID_PATTERN.test(role.instance)
       || !hasExactKeys(role.settings, [...SETTINGS_BOOLEAN_KEYS, "locationCompliant"])
       || !SETTINGS_BOOLEAN_KEYS.every((key) => typeof role.settings[key] === "boolean")
       || !(role.settings.locationCompliant === null || typeof role.settings.locationCompliant === "boolean")
-      || !isNonNegativeSafeInteger(role.automatedCount)
       || !(role.oldestAutomatedAgeDays === null || isNonNegativeSafeInteger(role.oldestAutomatedAgeDays))
       || !(role.lastSuccessfulAutomatedAgeHours === null
         || isNonNegativeSafeInteger(role.lastSuccessfulAutomatedAgeHours))
-      || !Array.isArray(role.onDemand)
       || !validCodeList(role.codes)) {
     return false;
   }
+  if (role.onDemand === null) {
+    // Run evidence unavailable: every run-derived value is null and the role says why.
+    return role.automatedCount === null
+      && role.oldestAutomatedAgeDays === null
+      && role.lastSuccessfulAutomatedAgeHours === null
+      && role.settings.recognized === false
+      && role.codes.includes("BACKUP_SETTINGS_UNRECOGNIZED")
+      && !role.codes.includes("AUTOMATED_BACKUP_STALE");
+  }
+  if (!Array.isArray(role.onDemand) || !isNonNegativeSafeInteger(role.automatedCount)) return false;
   const ids = new Set();
+  const impliedCodes = new Set();
   for (const entry of role.onDemand) {
     if (!hasExactKeys(entry, ON_DEMAND_KEYS)
         || typeof entry.id !== "string" || !BACKUP_RUN_ID_PATTERN.test(entry.id) || ids.has(entry.id)
@@ -712,8 +795,12 @@ function validRole(role) {
       return false;
     }
     ids.add(entry.id);
+    if (entry.purpose === null) impliedCodes.add("ON_DEMAND_UNLABELLED");
+    if (Object.hasOwn(ON_DEMAND_STATUS_CODES, entry.status)) impliedCodes.add(ON_DEMAND_STATUS_CODES[entry.status]);
   }
-  return true;
+  // Listed entries and on-demand codes must describe the same backups.
+  const onDemandCodes = role.codes.filter((code) => ON_DEMAND_CODES.has(code));
+  return onDemandCodes.length === impliedCodes.size && onDemandCodes.every((code) => impliedCodes.has(code));
 }
 
 /**
@@ -724,6 +811,7 @@ function validRole(role) {
 export function verifyBackupHorizonReceipt(receipt) {
   if (!hasExactKeys(receipt, RECEIPT_KEYS)
       || receipt.schema !== BACKUP_HORIZON_AUDIT_SCHEMA
+      || receipt.coverage !== BACKUP_HORIZON_COVERAGE
       || !BACKUP_HORIZON_ENVIRONMENTS.includes(receipt.environment)
       || typeof receipt.project !== "string" || !GCP_PROJECT_ID_PATTERN.test(receipt.project)
       || !(receipt.region === null

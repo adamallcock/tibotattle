@@ -4,12 +4,13 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   AUTOMATED_RETAINED_BACKUPS,
   BACKUP_HORIZON_AUDIT_SCHEMA,
   BACKUP_HORIZON_CODES,
   BACKUP_HORIZON_CONSTANTS,
+  BACKUP_HORIZON_COVERAGE,
   BACKUP_HORIZON_MAX_DAYS,
   DESCRIPTION_PATTERN,
   FINAL_BACKUP_MAX_DAYS,
@@ -310,8 +311,12 @@ test("a compliant estate is ok with a closed, content-free receipt", () => {
   }));
   assertVerdict(receipt, "ok", []);
   assert.equal(receipt.schema, BACKUP_HORIZON_AUDIT_SCHEMA);
-  assert.deepEqual(Object.keys(receipt).sort(),
-    ["codes", "digest", "environment", "generatedAt", "project", "region", "roles", "schema", "verdict"]);
+  assert.deepEqual(Object.keys(receipt).sort(), [
+    "codes", "coverage", "digest", "environment", "generatedAt", "project", "region", "roles", "schema", "verdict",
+  ]);
+  // An ok receipt speaks only for the instances' listed backup runs.
+  assert.equal(BACKUP_HORIZON_COVERAGE, "instance-backup-runs-only");
+  assert.equal(receipt.coverage, BACKUP_HORIZON_COVERAGE);
   assert.equal(receipt.generatedAt, "2026-09-26T12:00:00.000Z");
   assert.deepEqual(receipt.roles.primary.settings, {
     recognized: true,
@@ -591,10 +596,209 @@ test("the verdict matrix is exact", () => {
       codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
     },
     {
+      // Staleness is an inference from absence, so it is not raised when the list is unreadable.
       name: "backup list is not an array",
       ledger: { backupRuns: { items: [] } },
       verdict: "breach",
-      codes: ["AUTOMATED_BACKUP_STALE", "BACKUP_SETTINGS_UNRECOGNIZED"],
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    // Every fail-closed branch of the describe reader.
+    {
+      name: "unknown retention settings field",
+      primary: { settings: describeInstance(PRIMARY, { config: {
+        backupRetentionSettings: { retentionUnit: "COUNT", retainedBackups: 30, retentionDays: 7 },
+      } }) },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    {
+      name: "final backups enabled with no retention days",
+      primary: { settings: describeInstance(PRIMARY, { settings: { finalBackupConfig: { enabled: true } } }) },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    {
+      name: "string final-backup flag",
+      primary: { settings: describeInstance(PRIMARY, { settings: {
+        finalBackupConfig: { enabled: "true", retentionDays: 30 },
+      } }) },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    {
+      name: "string retain-on-delete flag",
+      primary: { settings: describeInstance(PRIMARY, { settings: { retainBackupsOnDelete: "false" } }) },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    {
+      name: "string PITR flag is unrecognized, not a PITR_DISABLED warning",
+      primary: { settings: describeInstance(PRIMARY, { config: { pointInTimeRecoveryEnabled: "true" } }) },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    {
+      name: "string backups-enabled flag",
+      primary: { settings: describeInstance(PRIMARY, { config: { enabled: "true" } }) },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    {
+      name: "unknown backup configuration kind",
+      primary: { settings: describeInstance(PRIMARY, { config: { kind: "sql#backupPolicy" } }) },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    {
+      name: "unparseable configured backup location",
+      primary: { settings: describeInstance(PRIMARY, { config: { location: "US East" } }) },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    {
+      name: "unparseable backup start time",
+      primary: { settings: describeInstance(PRIMARY, { config: { startTime: "7:00" } }) },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    {
+      name: "unknown transaction log storage state",
+      primary: { settings: describeInstance(PRIMARY, { config: { transactionalLogStorageState: "TAPE" } }) },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    // Every fail-closed branch of the run reader.
+    {
+      name: "a run listed for another instance",
+      primary: { backupRuns: [...automatedSeries(PRIMARY), backupRun("synthetic-other", { ageMs: DAY })] },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    {
+      name: "a run of another resource kind",
+      primary: { backupRuns: [
+        ...automatedSeries(PRIMARY),
+        backupRun(PRIMARY, { ageMs: DAY, extra: { kind: "sql#backup" } }),
+      ] },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    {
+      name: "a duplicated run id",
+      primary: { backupRuns: (() => {
+        const series = automatedSeries(PRIMARY);
+        return [...series, { ...series[3] }];
+      })() },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    {
+      // Counted as fresh, a future window would hide the stale automated series.
+      name: "a window more than an hour in the future",
+      primary: { backupRuns: [
+        ...automatedSeries(PRIMARY, { newestAgeMs: 40 * HOUR }),
+        backupRun(PRIMARY, { ageMs: -(HOUR + 60_000) }),
+      ] },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    {
+      name: "a window within the clock tolerance counts as fresh",
+      primary: { backupRuns: [
+        ...automatedSeries(PRIMARY, { newestAgeMs: 40 * HOUR }),
+        backupRun(PRIMARY, { ageMs: -30 * 60_000 }),
+      ] },
+      verdict: "ok",
+      codes: [],
+    },
+    {
+      name: "an out-of-range timezone offset",
+      primary: { backupRuns: [
+        ...automatedSeries(PRIMARY),
+        { ...backupRun(PRIMARY, { ageMs: DAY }), windowStartTime: "2026-09-25T12:00:00+24:00" },
+      ] },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    {
+      name: "an unparseable run location",
+      primary: { backupRuns: [
+        ...automatedSeries(PRIMARY),
+        backupRun(PRIMARY, { ageMs: DAY, extra: { location: "US East" } }),
+      ] },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    // Where each restorable copy is stored, when a region is supplied.
+    {
+      name: "an on-demand copy in the default multi-region",
+      primary: { backupRuns: [
+        ...automatedSeries(PRIMARY),
+        backupRun(PRIMARY, { type: "ON_DEMAND", ageMs: 2 * DAY, description: labelFor(2 * DAY, 30),
+          extra: { location: "us" } }),
+      ] },
+      verdict: "breach",
+      codes: ["BACKUP_LOCATION_MISMATCH"],
+    },
+    {
+      name: "an automated copy left in an earlier location",
+      ledger: { backupRuns: [
+        ...automatedSeries(LEDGER),
+        backupRun(LEDGER, { ageMs: 20 * DAY, extra: { location: "asia" } }),
+      ] },
+      verdict: "breach",
+      codes: ["BACKUP_LOCATION_MISMATCH"],
+    },
+    {
+      name: "a copy whose deletion failed still has to be in the region",
+      ledger: { backupRuns: [
+        ...automatedSeries(LEDGER),
+        backupRun(LEDGER, { ageMs: 20 * DAY, status: "DELETION_FAILED", extra: { location: "asia" } }),
+      ] },
+      verdict: "breach",
+      codes: ["BACKUP_LOCATION_MISMATCH"],
+    },
+    {
+      name: "a failed run elsewhere holds no copy",
+      ledger: { backupRuns: [
+        ...automatedSeries(LEDGER),
+        backupRun(LEDGER, { ageMs: 20 * DAY, status: "FAILED", extra: { location: "asia" } }),
+      ] },
+      verdict: "ok",
+      codes: [],
+    },
+    {
+      name: "a restorable copy with no stated location",
+      ledger: { backupRuns: [
+        ...automatedSeries(LEDGER),
+        (() => {
+          const run = backupRun(LEDGER, { ageMs: 20 * DAY });
+          delete run.location;
+          return run;
+        })(),
+      ] },
+      verdict: "breach",
+      codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
+    },
+    // Retry path: a labelled copy whose deletion failed stays listed and prunable.
+    {
+      name: "an overdue on-demand copy whose deletion failed",
+      primary: { backupRuns: [
+        ...automatedSeries(PRIMARY),
+        backupRun(PRIMARY, { type: "ON_DEMAND", status: "DELETION_FAILED", ageMs: 95 * DAY,
+          description: labelFor(95 * DAY, 90) }),
+      ] },
+      verdict: "warn",
+      codes: ["ON_DEMAND_OVERDUE"],
+    },
+    {
+      name: "a copy pending deletion still counts toward the horizon",
+      primary: { backupRuns: [
+        ...automatedSeries(PRIMARY),
+        backupRun(PRIMARY, { ageMs: 366 * DAY, status: "DELETION_PENDING" }),
+      ] },
+      verdict: "breach",
+      codes: ["BACKUP_OLDER_THAN_HORIZON"],
     },
   ];
   for (const testCase of cases) {
@@ -647,6 +851,157 @@ test("unit and status details of the matrix", () => {
   ] } }));
   assertVerdict(pending, "ok", []);
   assert.equal(pending.roles.primary.onDemand.length, 0);
+
+  const deletionFailed = assessBackupRuns(input({ primary: { backupRuns: [
+    ...automatedSeries(PRIMARY),
+    backupRun(PRIMARY, { type: "ON_DEMAND", status: "DELETION_FAILED", ageMs: 95 * DAY,
+      description: labelFor(95 * DAY, 90) }),
+  ] } }));
+  assert.deepEqual(deletionFailed.roles.primary.onDemand.map(({ status, ageDays }) => [status, ageDays]),
+    [["overdue", 95]]);
+
+  const elsewhereNoRegion = assessBackupRuns(input({
+    region: null,
+    primary: { backupRuns: [
+      ...automatedSeries(PRIMARY),
+      backupRun(PRIMARY, { type: "ON_DEMAND", ageMs: 2 * DAY, description: labelFor(2 * DAY, 30),
+        extra: { location: "us" } }),
+    ] },
+  }));
+  assertVerdict(elsewhereNoRegion, "ok", []);
+
+  const elsewhere = assessBackupRuns(input({ ledger: { backupRuns: [
+    ...automatedSeries(LEDGER),
+    backupRun(LEDGER, { ageMs: 20 * DAY, extra: { location: "asia" } }),
+  ] } }));
+  assert.equal(elsewhere.roles.ledger.settings.locationCompliant, false);
+  assert.equal(elsewhere.roles.primary.settings.locationCompliant, true);
+});
+
+test("offset timestamps are read as the instant they name", () => {
+  const offsetRun = (windowStartTime) => ({ ...backupRun(PRIMARY, { ageMs: DAY }), windowStartTime });
+  // 12:00Z less 3 h, written in +02:00 and -05:30.
+  for (const windowStartTime of ["2026-09-26T11:00:00+02:00", "2026-09-26T03:30:00.000-05:30"]) {
+    const receipt = assessBackupRuns(input({ primary: { backupRuns: [
+      ...automatedSeries(PRIMARY),
+      offsetRun(windowStartTime),
+    ] } }));
+    assertVerdict(receipt, "ok", []);
+    assert.equal(receipt.roles.primary.lastSuccessfulAutomatedAgeHours, 3, windowStartTime);
+  }
+  const onDemand = classifyBackupRun({
+    ...backupRun(PRIMARY, { type: "ON_DEMAND", ageMs: DAY, description: labelFor(DAY, 30) }),
+    windowStartTime: "2026-09-26T13:00:00.5+01:00",
+  }, { instance: PRIMARY, nowMs: NOW });
+  assert.equal(onDemand.windowStartTime, "2026-09-26T12:00:00.500Z");
+  assert.equal(onDemand.ageMs, 0);
+});
+
+test("unreadable run evidence is reported unavailable, never as zero", () => {
+  const unknownField = automatedSeries(PRIMARY).map((run) => ({ ...run, expiryTime: "2027-01-01T00:00:00Z" }));
+  const perRun = assessBackupRuns(input({ primary: { backupRuns: unknownField } }));
+  const notArray = assessBackupRuns(input({ ledger: { backupRuns: "nope" } }));
+  for (const [receipt, role] of [[perRun, "primary"], [notArray, "ledger"]]) {
+    assertVerdict(receipt, "breach", ["BACKUP_SETTINGS_UNRECOGNIZED"]);
+    const assessed = receipt.roles[role];
+    assert.equal(assessed.settings.recognized, false, role);
+    assert.equal(assessed.automatedCount, null, role);
+    assert.equal(assessed.oldestAutomatedAgeDays, null, role);
+    assert.equal(assessed.lastSuccessfulAutomatedAgeHours, null, role);
+    assert.equal(assessed.onDemand, null, role);
+    assert.deepEqual(verifyBackupHorizonReceipt(JSON.parse(JSON.stringify(receipt))), receipt);
+  }
+  assert.equal(perRun.roles.ledger.automatedCount, 30);
+
+  // Codes proven by the runs that were read still stand beside the unavailable evidence.
+  const partial = assessBackupRuns(input({ primary: { backupRuns: [
+    ...automatedSeries(PRIMARY),
+    backupRun(PRIMARY, { ageMs: 366 * DAY }),
+    backupRun(PRIMARY, { ageMs: DAY, status: "ARCHIVED" }),
+  ] } }));
+  assertVerdict(partial, "breach", ["BACKUP_OLDER_THAN_HORIZON", "BACKUP_SETTINGS_UNRECOGNIZED"]);
+  assert.equal(partial.roles.primary.onDemand, null);
+
+  // A describe-only problem leaves the run evidence available.
+  const describeOnly = assessBackupRuns(input({ primary: { settings: describeInstance(PRIMARY, { config: {
+    backupTier: "ENHANCED",
+  } }) } }));
+  assert.equal(describeOnly.roles.primary.settings.recognized, false);
+  assert.equal(describeOnly.roles.primary.automatedCount, 30);
+  assert.deepEqual([...describeOnly.roles.primary.onDemand], []);
+});
+
+test("every threshold is pinned on both sides of its boundary", () => {
+  const MS = 1;
+  const onDemandAt = (ageMs, days) => [
+    ...automatedSeries(PRIMARY),
+    backupRun(PRIMARY, { type: "ON_DEMAND", ageMs, description: labelFor(ageMs, days) }),
+  ];
+  const cases = [
+    { name: "90-day label just under 90 days", runs: onDemandAt(90 * DAY - MS, 90), status: "ok", codes: [] },
+    { name: "90-day label at exactly 90 days", runs: onDemandAt(90 * DAY, 90), status: "ok", codes: [] },
+    { name: "90-day label just over 90 days", runs: onDemandAt(90 * DAY + MS, 90), status: "overdue",
+      codes: ["ON_DEMAND_OVERDUE"] },
+    { name: "90-day label at 60 days", runs: onDemandAt(60 * DAY, 90), status: "ok", codes: [] },
+    { name: "30-day label a day before it expires", runs: onDemandAt(29 * DAY, 30), status: "ok", codes: [] },
+    { name: "at exactly 300 days", runs: onDemandAt(300 * DAY, 90), status: "overdue",
+      codes: ["ON_DEMAND_OVERDUE"] },
+    { name: "just over 300 days", runs: onDemandAt(300 * DAY + MS, 90), status: "critical",
+      codes: ["ON_DEMAND_CRITICAL"] },
+    { name: "at exactly 365 days", runs: onDemandAt(365 * DAY, 90), status: "critical",
+      codes: ["ON_DEMAND_CRITICAL"] },
+    { name: "just over 365 days", runs: onDemandAt(365 * DAY + MS, 90), status: "critical",
+      codes: ["ON_DEMAND_CRITICAL", "BACKUP_OLDER_THAN_HORIZON"] },
+  ];
+  for (const testCase of cases) {
+    const receipt = assessBackupRuns(input({ primary: { backupRuns: testCase.runs } }));
+    assert.deepEqual([...receipt.codes], testCase.codes, testCase.name);
+    assert.equal(receipt.roles.primary.onDemand[0].status, testCase.status, testCase.name);
+  }
+
+  const codesFor = (primary) => [...assessBackupRuns(input({ primary })).codes];
+  assert.deepEqual(codesFor({ backupRuns: [...automatedSeries(PRIMARY), backupRun(PRIMARY, { ageMs: 365 * DAY })] }), []);
+  assert.deepEqual(codesFor({ backupRuns: [...automatedSeries(PRIMARY), backupRun(PRIMARY, { ageMs: 365 * DAY + MS })] }),
+    ["BACKUP_OLDER_THAN_HORIZON"]);
+  assert.deepEqual(codesFor({ backupRuns: automatedSeries(PRIMARY, { newestAgeMs: 36 * HOUR }) }), []);
+  assert.deepEqual(codesFor({ backupRuns: automatedSeries(PRIMARY, { newestAgeMs: 36 * HOUR + MS }) }),
+    ["AUTOMATED_BACKUP_STALE"]);
+  assert.deepEqual(codesFor({ backupRuns: [
+    ...automatedSeries(PRIMARY),
+    backupRun(PRIMARY, { type: "FINAL", ageMs: 30 * DAY }),
+  ] }), []);
+  assert.deepEqual(codesFor({ backupRuns: [
+    ...automatedSeries(PRIMARY),
+    backupRun(PRIMARY, { type: "FINAL", ageMs: 30 * DAY + MS }),
+  ] }), ["FINAL_BACKUP_RETENTION_EXCEEDED"]);
+});
+
+test("a labelled backup is due only after its expires-on date has fully passed", () => {
+  const statusAt = (createdMs, days, nowMs) => {
+    const run = {
+      ...backupRun(PRIMARY, { type: "ON_DEMAND", ageMs: 0 }),
+      windowStartTime: new Date(createdMs).toISOString(),
+      description: formatOnDemandDescription({ expiresOn: onDemandExpiresOn(createdMs, days), purpose: "pre-migration" }),
+    };
+    return classifyBackupRun(run, { instance: PRIMARY, nowMs }).onDemandStatus;
+  };
+  // Created 30 minutes before UTC midnight with one day asked.
+  const lateEvening = Date.parse("2026-09-26T23:30:00.000Z");
+  assert.equal(onDemandExpiresOn(lateEvening, 1), "2026-09-27");
+  assert.equal(statusAt(lateEvening, 1, lateEvening + 10 * 60_000), "ok");
+  assert.equal(statusAt(lateEvening, 1, lateEvening + 31 * 60_000), "ok");
+  assert.equal(statusAt(lateEvening, 1, lateEvening + DAY), "ok");
+  assert.equal(statusAt(lateEvening, 1, Date.parse("2026-09-28T00:00:00.000Z") - 1), "ok");
+  assert.equal(statusAt(lateEvening, 1, Date.parse("2026-09-28T00:00:00.000Z")), "due");
+
+  // For every allowed length and any time of day: kept at least N days, due by N + 1.
+  for (const days of [1, 7, 30, 89, 90]) {
+    for (const time of ["00:00:00.000", "00:00:00.001", "11:59:59.999", "23:59:59.999"]) {
+      const createdMs = Date.parse(`2026-09-26T${time}Z`);
+      assert.equal(statusAt(createdMs, days, createdMs + days * DAY), "ok", `${days} days from ${time}`);
+      assert.notEqual(statusAt(createdMs, days, createdMs + (days + 1) * DAY), "ok", `${days} days from ${time}`);
+    }
+  }
 });
 
 test("receipts carry no description text beyond the parsed purpose and expiry", () => {
@@ -714,10 +1069,73 @@ test("receipt verification is closed and recomputes the digest", () => {
       onDemand: [{ ...receipt.roles.primary.onDemand[0], status: "ok", purpose: null, expiresOn: null }],
     } } }),
     redigest({ ...receipt, roles: { ...receipt.roles, ledger: { ...receipt.roles.ledger, instance: PRIMARY } } }),
+    // Coverage is fixed: a receipt cannot claim project-wide scope.
+    redigest({ ...receipt, coverage: "project-backups" }),
+    redigest((({ coverage: _dropped, ...rest }) => rest)(receipt)),
+    // Top-level codes must be exactly the roles' codes, even when the verdict agrees.
+    redigest({ ...receipt, codes: [], verdict: "ok" }),
+    // A listed due entry needs its code, and a code needs a listed entry.
+    redigest({
+      ...receipt,
+      codes: [],
+      verdict: "ok",
+      roles: { ...receipt.roles, primary: { ...receipt.roles.primary, codes: [] } },
+    }),
+    redigest({ ...receipt, roles: { ...receipt.roles, primary: { ...receipt.roles.primary, onDemand: [] } } }),
+    // Unavailable run evidence is all-null, unrecognized and never stale.
+    redigest({ ...receipt, roles: { ...receipt.roles, ledger: { ...receipt.roles.ledger, onDemand: null } } }),
+    redigest({ ...receipt, roles: { ...receipt.roles, ledger: {
+      ...receipt.roles.ledger,
+      onDemand: [],
+      automatedCount: null,
+    } } }),
   ];
   for (const value of doctored) {
     assert.throws(() => verifyBackupHorizonReceipt(value),
       (error) => error.code === "BACKUP_HORIZON_RECEIPT_INVALID");
+  }
+
+  const unavailable = JSON.parse(JSON.stringify(assessBackupRuns(input({ ledger: { backupRuns: "nope" } }))));
+  assert.equal(verifyBackupHorizonReceipt(structuredClone(unavailable)).digest, unavailable.digest);
+  for (const value of [
+    redigest({ ...unavailable, roles: { ...unavailable.roles, ledger: {
+      ...unavailable.roles.ledger, automatedCount: 0,
+    } } }),
+    redigest({ ...unavailable, roles: { ...unavailable.roles, ledger: {
+      ...unavailable.roles.ledger, settings: { ...unavailable.roles.ledger.settings, recognized: true },
+    } } }),
+    redigest({
+      ...unavailable,
+      codes: ["AUTOMATED_BACKUP_STALE", "BACKUP_SETTINGS_UNRECOGNIZED"],
+      roles: { ...unavailable.roles, ledger: {
+        ...unavailable.roles.ledger, codes: ["AUTOMATED_BACKUP_STALE", "BACKUP_SETTINGS_UNRECOGNIZED"],
+      } },
+    }),
+  ]) {
+    assert.throws(() => verifyBackupHorizonReceipt(value),
+      (error) => error.code === "BACKUP_HORIZON_RECEIPT_INVALID");
+  }
+});
+
+test("the invariant runs when the module loads", async () => {
+  const source = await readFile(join(CLOUD_RUN_ROOT, "ops-backup-horizon.mjs"), "utf8");
+  const canonicalJsonUrl = pathToFileURL(join(WORKER_ROOT, "src", "canonical-json.ts")).href;
+  const relocated = source.replace('from "../src/canonical-json.ts";', `from ${JSON.stringify(canonicalJsonUrl)};`);
+  assert.notEqual(relocated, source);
+  const doctored = relocated.replace("export const ON_DEMAND_MAX_DAYS = 90;", "export const ON_DEMAND_MAX_DAYS = 360;");
+  assert.notEqual(doctored, relocated);
+  const directory = await mkdtemp(join(tmpdir(), "ops-backup-horizon-load-"));
+  try {
+    const intactPath = join(directory, "intact.mjs");
+    const doctoredPath = join(directory, "doctored.mjs");
+    await writeFile(intactPath, relocated);
+    await writeFile(doctoredPath, doctored);
+    const intact = await import(pathToFileURL(intactPath).href);
+    assert.equal(intact.ON_DEMAND_MAX_DAYS, 90);
+    await assert.rejects(import(pathToFileURL(doctoredPath).href),
+      (error) => error.code === "BACKUP_HORIZON_INVARIANT_BROKEN");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 });
 

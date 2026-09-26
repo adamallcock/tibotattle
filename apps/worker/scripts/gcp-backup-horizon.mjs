@@ -7,14 +7,17 @@
  *         --primary-instance=<name> --ledger-instance=<name> [--region=<r>]
  *     Read-only: `gcloud sql instances describe` and `gcloud sql backups list`
  *     for both instances. Prints the 'tibotattle-backup-horizon-audit-v1'
- *     receipt; exits 0 ok, 2 warn, 3 breach, 1 error.
+ *     receipt; exits 0 ok, 2 warn, 3 breach, 1 error. The receipt covers the
+ *     instances' backup runs only (its `coverage` field), not project-level
+ *     backups that outlive a deleted instance.
  *
  *   create-on-demand --environment --project --instance=<name>
  *         --instance-role=primary|ledger --purpose=<enum> --expires-in-days=<1..90>
- *         --authorize=create-on-demand:<environment>:<role> [--region=<r>]
+ *         --region=<r> --authorize=create-on-demand:<environment>:<role>
  *     The only sanctioned way to take an on-demand backup: labelled
- *     'tibotattle-expires-on=YYYY-MM-DD;purpose=<enum>', synchronous (never
- *     --async), then read back from the backup list.
+ *     'tibotattle-expires-on=YYYY-MM-DD;purpose=<enum>', stored in exactly
+ *     --region (never the default multi-region), synchronous (never --async),
+ *     then read back from the backup list.
  *
  *   prune --environment --receipt=<absolute path> --authorize=<receipt digest>
  *     Deletes at most 10 ON_DEMAND backups that an audit receipt younger than
@@ -28,10 +31,10 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, realpathSync } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import {
   BACKUP_HORIZON_ENVIRONMENTS,
   BACKUP_HORIZON_ROLES,
@@ -85,9 +88,10 @@ const COMMANDS = Object.freeze({
       "--instance-role",
       "--purpose",
       "--expires-in-days",
+      "--region",
       "--authorize",
     ],
-    optional: ["--region"],
+    optional: [],
   }),
   prune: Object.freeze({
     required: ["--environment", "--receipt", "--authorize"],
@@ -140,6 +144,10 @@ function validateInstance(value) {
 
 function validateRegion(value) {
   if (value === null) return null;
+  return validateRequiredRegion(value);
+}
+
+function validateRequiredRegion(value) {
   if (typeof value !== "string" || !GCP_REGION_PATTERN.test(value)) fail("BACKUP_HORIZON_REGION_INVALID");
   return value;
 }
@@ -177,7 +185,12 @@ function readFlags(argv, { required, optional }) {
   return values;
 }
 
-/** Validate a create-on-demand request (CLI or OPS-10 reuse) without the CLI authorization token. */
+/**
+ * Validate a create-on-demand request (CLI or OPS-10 reuse) without the CLI
+ * authorization token. The region is required: without --location gcloud
+ * stores the copy in the closest multi-region, which the audit reports as
+ * BACKUP_LOCATION_MISMATCH.
+ */
 export function validateCreateOnDemandRequest(request = {}) {
   return Object.freeze({
     environment: validateEnvironment(request.environment),
@@ -186,7 +199,7 @@ export function validateCreateOnDemandRequest(request = {}) {
     instanceRole: validateRole(request.instanceRole),
     purpose: validatePurpose(request.purpose),
     expiresInDays: validateExpiresInDays(request.expiresInDays),
-    region: validateRegion(request.region ?? null),
+    region: validateRequiredRegion(request.region),
   });
 }
 
@@ -216,7 +229,7 @@ export function parseBackupHorizonArgs(argv) {
       instanceRole: values.get("--instance-role"),
       purpose: values.get("--purpose"),
       expiresInDays: values.get("--expires-in-days"),
-      region: values.get("--region") ?? null,
+      region: values.get("--region"),
     });
     if (values.get("--authorize") !== `create-on-demand:${environment}:${request.instanceRole}`) {
       fail("BACKUP_ON_DEMAND_AUTHORIZATION_MISMATCH");
@@ -311,7 +324,7 @@ export function createOnDemandBackup({ spawn = spawnSync, now = Date.now } = {},
     `--instance=${instance}`,
     `--project=${project}`,
     `--description=${description}`,
-    ...(request.region === null ? [] : [`--location=${request.region}`]),
+    `--location=${request.region}`,
   ], "BACKUP_ON_DEMAND_CREATE_FAILED");
   const created = listBackupRuns(spawn, project, instance).filter((run) => run !== null
     && typeof run === "object"
@@ -322,6 +335,7 @@ export function createOnDemandBackup({ spawn = spawnSync, now = Date.now } = {},
   if (created.length > 1) fail("BACKUP_ON_DEMAND_READBACK_AMBIGUOUS");
   const readback = classifyBackupRun(created[0], { instance, nowMs: now() });
   if (!readback.recognized || readback.status !== "SUCCESSFUL"
+      || readback.location !== request.region
       || readback.label?.expiresOn !== expiresOn || readback.label?.purpose !== request.purpose) {
     fail("BACKUP_ON_DEMAND_READBACK_INVALID");
   }
@@ -406,7 +420,8 @@ export async function pruneOnDemandBackups(config, {
   const candidates = [];
   for (const role of BACKUP_HORIZON_ROLES) {
     const instance = validateInstance(receipt.roles[role].instance);
-    for (const entry of receipt.roles[role].onDemand) {
+    // A role whose run evidence was unavailable (null) has nothing the receipt can authorize.
+    for (const entry of receipt.roles[role].onDemand ?? []) {
       if (PRUNABLE_ON_DEMAND_STATUSES.includes(entry.status)) candidates.push({ role, instance, entry });
     }
   }
@@ -507,7 +522,20 @@ export async function main(argv = process.argv.slice(2), {
   }
 }
 
-if (process.argv[1]
-    && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+/**
+ * Node resolves symlinks in the entry module's URL but not in argv[1], so both
+ * sides are compared by real path; otherwise a run through a symlinked path
+ * (for example /tmp on macOS) would skip main() and exit 0, the audit's "ok".
+ */
+export function isCliEntry(argvPath, moduleUrl = import.meta.url) {
+  if (typeof argvPath !== "string" || argvPath.length === 0) return false;
+  try {
+    return realpathSync(resolve(argvPath)) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
+if (isCliEntry(process.argv[1])) {
   process.exitCode = await main();
 }

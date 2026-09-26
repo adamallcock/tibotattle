@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
@@ -63,7 +64,14 @@ function describeInstance(name, config = {}) {
 
 let nextId = 1_790_100_000_000;
 
-function backupRun(instance, { ageMs, type = "AUTOMATED", status = "SUCCESSFUL", description, nowMs = NOW }) {
+function backupRun(instance, {
+  ageMs,
+  type = "AUTOMATED",
+  status = "SUCCESSFUL",
+  description,
+  location = REGION,
+  nowMs = NOW,
+}) {
   nextId += 1;
   const start = new Date(nowMs - ageMs).toISOString();
   return {
@@ -72,10 +80,21 @@ function backupRun(instance, { ageMs, type = "AUTOMATED", status = "SUCCESSFUL",
     instance,
     type,
     status,
+    location,
     windowStartTime: start,
     enqueuedTime: start,
     ...(description === undefined ? {} : { description }),
   };
+}
+
+function labelledOnDemand(instance, { ageDays, expiresInDays, purpose = "pre-migration", status }) {
+  const ageMs = ageDays * DAY;
+  return backupRun(instance, {
+    type: "ON_DEMAND",
+    ageMs,
+    status,
+    description: formatOnDemandDescription({ expiresOn: onDemandExpiresOn(NOW - ageMs, expiresInDays), purpose }),
+  });
 }
 
 function automatedSeries(instance, newestAgeMs = 10 * HOUR) {
@@ -116,9 +135,11 @@ function fakeGcloud({ describes = {}, lists = {}, failWhen = () => false, onCrea
     }
     if (verb === "sql backups create") {
       const instance = flag("--instance");
+      // Without --location gcloud stores the copy in the closest multi-region.
+      const request = { instance, description: flag("--description"), location: flag("--location") ?? "us" };
       const created = onCreate
-        ? onCreate({ instance, description: flag("--description") })
-        : [backupRun(instance, { type: "ON_DEMAND", ageMs: 0, description: flag("--description") })];
+        ? onCreate(request)
+        : [backupRun(instance, { type: "ON_DEMAND", ageMs: 0, ...request })];
       state.set(instance, [...(state.get(instance) ?? []), ...created]);
       return { status: 0, stdout: "", stderr: "Backing up Cloud SQL instance...done." };
     }
@@ -165,9 +186,23 @@ function createArgv({ days = "30", purpose = "pre-migration", role = "primary", 
     `--instance-role=${role}`,
     `--purpose=${purpose}`,
     `--expires-in-days=${days}`,
+    `--region=${REGION}`,
     `--authorize=${authorize ?? `create-on-demand:production:${role}`}`,
     ...extra,
   ];
+}
+
+function createRequest(overrides = {}) {
+  return {
+    environment: "production",
+    project: PROJECT,
+    instance: PRIMARY,
+    instanceRole: "primary",
+    purpose: "pre-migration",
+    expiresInDays: 30,
+    region: REGION,
+    ...overrides,
+  };
 }
 
 function sortedJson(value) {
@@ -183,15 +218,22 @@ function redigest(receipt) {
   return { ...receipt, digest: createHash("sha256").update(sortedJson(body)).digest("hex") };
 }
 
-function auditReceipt({ primaryRuns, ledgerRuns = automatedSeries(LEDGER), nowMs = NOW }) {
+function auditReceipt({
+  primaryRuns,
+  ledgerRuns = automatedSeries(LEDGER),
+  nowMs = NOW,
+  project = PROJECT,
+  primary = PRIMARY,
+  ledger = LEDGER,
+}) {
   return JSON.parse(JSON.stringify(assessBackupRuns({
     environment: "production",
     nowMs,
-    project: PROJECT,
+    project,
     region: REGION,
     instances: [
-      { role: "primary", instance: PRIMARY, settings: describeInstance(PRIMARY), backupRuns: primaryRuns },
-      { role: "ledger", instance: LEDGER, settings: describeInstance(LEDGER), backupRuns: ledgerRuns },
+      { role: "primary", instance: primary, settings: describeInstance(primary), backupRuns: primaryRuns },
+      { role: "ledger", instance: ledger, settings: describeInstance(ledger), backupRuns: ledgerRuns },
     ],
   })));
 }
@@ -383,6 +425,11 @@ test("create-on-demand refuses bad requests before any gcloud call", async () =>
     [createArgv({ extra: ["--async=true"] }), "BACKUP_HORIZON_ARGUMENT_INVALID"],
     [createArgv().map((arg) => (arg.startsWith("--instance=") ? `--instance=${TEST_PRIMARY}` : arg)),
       "BACKUP_HORIZON_TEST_TARGET_REFUSED"],
+    [createArgv().map((arg) => (arg.startsWith("--project=") ? `--project=${GCP_PRIVATE_TEST_TARGET.project}` : arg)),
+      "BACKUP_HORIZON_TEST_TARGET_REFUSED"],
+    // Without a region the copy would land in the default multi-region.
+    [createArgv().filter((arg) => !arg.startsWith("--region=")), "BACKUP_HORIZON_ARGUMENT_MISSING"],
+    [createArgv().map((arg) => (arg.startsWith("--region=") ? "--region=us" : arg)), "BACKUP_HORIZON_REGION_INVALID"],
   ]) {
     const gcloud = fakeGcloud();
     const io = capture();
@@ -390,14 +437,16 @@ test("create-on-demand refuses bad requests before any gcloud call", async () =>
     assert.equal(errorCode(io.err), code, argv.join(" "));
     assert.equal(gcloud.calls.length, 0);
   }
-  assert.throws(() => createOnDemandBackup({ spawn: fakeGcloud().spawn, now: () => NOW }, {
-    environment: "production",
-    project: PROJECT,
-    instance: PRIMARY,
-    instanceRole: "primary",
-    purpose: "pre-migration",
-    expiresInDays: 91,
-  }), (error) => error.code === "BACKUP_ON_DEMAND_EXPIRY_INVALID");
+  for (const [overrides, code] of [
+    [{ expiresInDays: 91 }, "BACKUP_ON_DEMAND_EXPIRY_INVALID"],
+    [{ region: undefined }, "BACKUP_HORIZON_REGION_INVALID"],
+    [{ region: null }, "BACKUP_HORIZON_REGION_INVALID"],
+  ]) {
+    const gcloud = fakeGcloud();
+    assert.throws(() => createOnDemandBackup({ spawn: gcloud.spawn, now: () => NOW }, createRequest(overrides)),
+      (error) => error.code === code, JSON.stringify(overrides));
+    assert.equal(gcloud.calls.length, 0);
+  }
 });
 
 test("create-on-demand labels synchronously and reads the new backup back", async () => {
@@ -408,7 +457,8 @@ test("create-on-demand labels synchronously and reads the new backup back", asyn
   const description = "tibotattle-expires-on=2026-12-25;purpose=pre-migration";
   assert.deepEqual(gcloud.calls.map(({ args }) => args), [
     ["sql", "backups", "list", `--instance=${PRIMARY}`, `--project=${PROJECT}`, "--format=json"],
-    ["sql", "backups", "create", `--instance=${PRIMARY}`, `--project=${PROJECT}`, `--description=${description}`],
+    ["sql", "backups", "create", `--instance=${PRIMARY}`, `--project=${PROJECT}`, `--description=${description}`,
+      `--location=${REGION}`],
     ["sql", "backups", "list", `--instance=${PRIMARY}`, `--project=${PROJECT}`, "--format=json"],
   ]);
   assert.match(description, DESCRIPTION_PATTERN);
@@ -457,12 +507,35 @@ test("create-on-demand fails closed when the readback is missing, ambiguous or n
     [({ instance, description }) => [
       backupRun(instance, { type: "ON_DEMAND", ageMs: 0, description, status: "FAILED" }),
     ], "BACKUP_ON_DEMAND_READBACK_INVALID"],
+    [({ instance, description }) => [
+      backupRun(instance, { type: "ON_DEMAND", ageMs: 0, description, location: "us" }),
+    ], "BACKUP_ON_DEMAND_READBACK_INVALID"],
+    [({ instance, description }) => {
+      const { location: _dropped, ...run } = backupRun(instance, { type: "ON_DEMAND", ageMs: 0, description });
+      return [run];
+    }, "BACKUP_ON_DEMAND_READBACK_INVALID"],
   ]) {
     const gcloud = fakeGcloud({ lists: { [PRIMARY]: [] }, onCreate });
     const io = capture();
     assert.equal(await main(createArgv(), { spawn: gcloud.spawn, now: () => NOW, ...io }), 1);
     assert.equal(errorCode(io.err), code);
   }
+
+  // A same-day retry carries the same description as an earlier backup: only a new id is proof.
+  const description = "tibotattle-expires-on=2026-10-26;purpose=pre-migration";
+  const earlier = backupRun(PRIMARY, { type: "ON_DEMAND", ageMs: 3 * HOUR, description });
+  const retryNothing = fakeGcloud({ lists: { [PRIMARY]: [...automatedSeries(PRIMARY), earlier] }, onCreate: () => [] });
+  const nothing = capture();
+  assert.equal(await main(createArgv(), { spawn: retryNothing.spawn, now: () => NOW, ...nothing }), 1);
+  assert.equal(errorCode(nothing.err), "BACKUP_ON_DEMAND_READBACK_MISSING");
+  assert.equal(retryNothing.calls[1].args.includes(`--description=${description}`), true);
+  const retryAdded = fakeGcloud({ lists: { [PRIMARY]: [...automatedSeries(PRIMARY), earlier] } });
+  const added = capture();
+  assert.equal(await main(createArgv(), { spawn: retryAdded.spawn, now: () => NOW, ...added }), 0);
+  const fresh = retryAdded.state.get(PRIMARY).at(-1);
+  assert.notEqual(fresh.id, earlier.id);
+  assert.equal(JSON.parse(added.out.join("")).id, fresh.id);
+  assert.equal(JSON.parse(added.out.join("")).windowStartTime, new Date(NOW).toISOString());
   const failing = fakeGcloud({ failWhen: (args) => args[2] === "create" });
   const io = capture();
   assert.equal(await main(createArgv(), { spawn: failing.spawn, now: () => NOW, ...io }), 1);
@@ -648,6 +721,119 @@ test("prune with nothing due makes no gcloud call", async () => {
   assert.equal(JSON.parse(io.out.join("")).deleted, 0);
 });
 
+test("prune refuses a verified receipt that names the test estate, before any gcloud call", async () => {
+  const receipts = [
+    auditReceipt({
+      project: GCP_PRIVATE_TEST_TARGET.project,
+      primaryRuns: [...automatedSeries(PRIMARY), dueOnDemand(PRIMARY, 20)],
+    }),
+    auditReceipt({
+      primary: TEST_PRIMARY,
+      primaryRuns: [...automatedSeries(TEST_PRIMARY), dueOnDemand(TEST_PRIMARY, 20)],
+    }),
+    auditReceipt({
+      ledger: TEST_LEDGER,
+      primaryRuns: [...automatedSeries(PRIMARY), dueOnDemand(PRIMARY, 20)],
+      ledgerRuns: automatedSeries(TEST_LEDGER),
+    }),
+  ];
+  for (const receipt of receipts) {
+    // The receipt is well formed and digest-bound; only the test-target guard stops it.
+    assert.equal(receipt.roles.primary.onDemand.filter(({ status }) => status === "due").length, 1);
+    const gcloud = fakeGcloud({ lists: { [PRIMARY]: [], [TEST_PRIMARY]: [] } });
+    const io = capture();
+    assert.equal(await main(pruneArgv(receipt.digest), {
+      spawn: gcloud.spawn, now: () => NOW, readReceipt: async () => structuredClone(receipt), ...io,
+    }), 1);
+    assert.equal(errorCode(io.err), "BACKUP_HORIZON_TEST_TARGET_REFUSED");
+    assert.equal(gcloud.calls.length, 0);
+  }
+});
+
+test("prune refuses a live list with a duplicated id before any deletion", async () => {
+  const target = dueOnDemand(PRIMARY, 20);
+  const primaryRuns = [...automatedSeries(PRIMARY), target];
+  const receipt = auditReceipt({ primaryRuns });
+  const gcloud = fakeGcloud({ lists: { [PRIMARY]: [...primaryRuns, { ...target }] } });
+  const io = capture();
+  assert.equal(await main(pruneArgv(receipt.digest), {
+    spawn: gcloud.spawn, now: () => NOW, readReceipt: async () => structuredClone(receipt), ...io,
+  }), 1);
+  assert.equal(errorCode(io.err), "PRUNE_LIVE_LIST_UNRECOGNIZED");
+  assert.equal(deleteCalls(gcloud.calls).length, 0);
+});
+
+test("prune never deletes a labelled backup the policy still keeps", async () => {
+  const keep = [
+    labelledOnDemand(PRIMARY, { ageDays: 60, expiresInDays: 90, purpose: "pre-restore" }),
+    labelledOnDemand(PRIMARY, { ageDays: 29, expiresInDays: 30, purpose: "rehearsal" }),
+    labelledOnDemand(PRIMARY, { ageDays: 90, expiresInDays: 90, purpose: "pre-cutover" }),
+  ];
+  const due = dueOnDemand(PRIMARY, 20);
+  const primaryRuns = [...automatedSeries(PRIMARY), ...keep, due];
+  const receipt = auditReceipt({ primaryRuns });
+  assert.deepEqual(receipt.roles.primary.onDemand.map(({ status }) => status).sort(), ["due", "ok", "ok", "ok"]);
+  const gcloud = fakeGcloud({ lists: { [PRIMARY]: primaryRuns } });
+  const io = capture();
+  assert.equal(await main(pruneArgv(receipt.digest), {
+    spawn: gcloud.spawn, now: () => NOW, readReceipt: async () => structuredClone(receipt), ...io,
+  }), 0);
+  assert.deepEqual(deleteCalls(gcloud.calls).map(({ args }) => args[3]), [due.id]);
+  const remaining = new Set(gcloud.state.get(PRIMARY).map((run) => run.id));
+  for (const run of keep) assert.equal(remaining.has(run.id), true);
+});
+
+test("prune retries an overdue copy whose earlier deletion failed", async () => {
+  const failed = labelledOnDemand(LEDGER, { ageDays: 95, expiresInDays: 90, status: "DELETION_FAILED" });
+  const ledgerRuns = [...automatedSeries(LEDGER), failed];
+  const receipt = auditReceipt({ primaryRuns: automatedSeries(PRIMARY), ledgerRuns });
+  assert.deepEqual(receipt.roles.ledger.onDemand.map(({ id, status }) => [id, status]), [[failed.id, "overdue"]]);
+  const gcloud = fakeGcloud({ lists: { [LEDGER]: ledgerRuns } });
+  const io = capture();
+  assert.equal(await main(pruneArgv(receipt.digest), {
+    spawn: gcloud.spawn, now: () => NOW, readReceipt: async () => structuredClone(receipt), ...io,
+  }), 0);
+  assert.deepEqual(deleteCalls(gcloud.calls).map(({ args }) => args), [
+    ["sql", "backups", "delete", failed.id, `--instance=${LEDGER}`, `--project=${PROJECT}`, "--quiet"],
+  ]);
+});
+
+test("prune authorizes nothing for a role whose run evidence was unavailable", async () => {
+  const primaryRuns = [...automatedSeries(PRIMARY), dueOnDemand(PRIMARY, 20)];
+  const ledgerRuns = [...automatedSeries(LEDGER), { ...dueOnDemand(LEDGER, 20), expiryTime: "2027-01-01T00:00:00Z" }];
+  const receipt = auditReceipt({ primaryRuns, ledgerRuns });
+  assert.equal(receipt.roles.ledger.onDemand, null);
+  const gcloud = fakeGcloud({ lists: { [PRIMARY]: primaryRuns, [LEDGER]: ledgerRuns } });
+  const io = capture();
+  assert.equal(await main(pruneArgv(receipt.digest), {
+    spawn: gcloud.spawn, now: () => NOW, readReceipt: async () => structuredClone(receipt), ...io,
+  }), 0);
+  assert.deepEqual(deleteCalls(gcloud.calls).map(({ args }) => args[4]), [`--instance=${PRIMARY}`]);
+  assert.equal(gcloud.calls.some(({ args }) => args.includes(`--instance=${LEDGER}`)), false);
+});
+
+test("the CLI runs through a symlinked path and never exits 0 silently", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "gcp-backup-horizon-cli-"));
+  try {
+    const realPath = join(SCRIPTS_ROOT, "gcp-backup-horizon.mjs");
+    const linkedPath = join(directory, "gcp-backup-horizon.mjs");
+    await symlink(realPath, linkedPath);
+    for (const entry of [realPath, linkedPath]) {
+      // An invalid command fails in argument parsing, before any gcloud call.
+      const result = spawnSync(process.execPath, [entry, "verify"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { PATH: "/nonexistent" },
+      });
+      assert.equal(result.status, 1, entry);
+      assert.equal(result.stdout, "", entry);
+      assert.deepEqual(JSON.parse(result.stderr), { status: "error", code: "BACKUP_HORIZON_COMMAND_INVALID" }, entry);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("receipt files are read bounded, without following links", async () => {
   const directory = await mkdtemp(join(tmpdir(), "gcp-backup-horizon-"));
   try {
@@ -655,9 +841,24 @@ test("receipt files are read bounded, without following links", async () => {
     const path = join(directory, "receipt.json");
     await writeFile(path, `${JSON.stringify(receipt, null, 2)}\n`);
     assert.deepEqual(await readBackupHorizonReceiptFile(path), receipt);
-    const link = join(directory, "link.json");
-    await symlink(path, link);
-    await assert.rejects(readBackupHorizonReceiptFile(link), (error) => error.code === "PRUNE_RECEIPT_UNREADABLE");
+    const symlinked = join(directory, "link.json");
+    await symlink(path, symlinked);
+    await assert.rejects(readBackupHorizonReceiptFile(symlinked), (error) => error.code === "PRUNE_RECEIPT_UNREADABLE");
+    // A hard link makes both names unreadable: neither can be proven the only name.
+    const hardSource = join(directory, "hard-source.json");
+    const hardLinked = join(directory, "hard-link.json");
+    await writeFile(hardSource, `${JSON.stringify(receipt)}\n`);
+    await link(hardSource, hardLinked);
+    for (const name of [hardSource, hardLinked]) {
+      await assert.rejects(readBackupHorizonReceiptFile(name), (error) => error.code === "PRUNE_RECEIPT_UNREADABLE");
+    }
+    const oversized = join(directory, "oversized.json");
+    await writeFile(oversized, `${JSON.stringify(receipt)}${" ".repeat(1024 * 1024)}`);
+    await assert.rejects(readBackupHorizonReceiptFile(oversized), (error) => error.code === "PRUNE_RECEIPT_UNREADABLE");
+    const atLimit = join(directory, "at-limit.json");
+    const compact = JSON.stringify(receipt);
+    await writeFile(atLimit, `${compact}${" ".repeat(1024 * 1024 - Buffer.byteLength(compact))}`);
+    assert.deepEqual(await readBackupHorizonReceiptFile(atLimit), receipt);
     await assert.rejects(readBackupHorizonReceiptFile(join(directory, "absent.json")),
       (error) => error.code === "PRUNE_RECEIPT_UNREADABLE");
     const garbled = join(directory, "garbled.json");
