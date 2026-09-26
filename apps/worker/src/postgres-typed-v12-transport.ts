@@ -17,16 +17,22 @@ import {
 import {
   authenticatePostgresDeviceBearer,
   readPostgresAccountlessDeviceAuthority,
+  type PostgresAccountlessAuthorizationVersion,
   type PostgresDeviceBearerAuthenticationOptions,
 } from "./postgres-device-bearer-auth";
 
-/**
- * Options for the legacy private-host authenticator. Unlike the shared
- * bearer helper, an omitted `accountlessAuthorizationVersion` keeps the
- * stricter typed-v1.2 accountless fence; capability negotiation passes
- * `'v1.1'` explicitly.
- */
-export type PostgresDeviceAuthenticationOptions = PostgresDeviceBearerAuthenticationOptions;
+/** Options for the legacy private-host authenticator `authenticatePostgresDevice`. */
+export interface PostgresDeviceAuthenticationOptions
+  extends Omit<PostgresDeviceBearerAuthenticationOptions, "accountlessAuthorizationVersion"> {
+  /**
+   * Accountless authority required in addition to the bearer. Defaults to
+   * `'v1.2'` here, unlike the shared `authenticatePostgresDeviceBearer`:
+   * accountless devices must also hold the current typed-v1.2 schema grant.
+   * Pass `'v1.1'` for the Worker's generic bearer gate (the base v1.1 lease
+   * graph), as capability negotiation does.
+   */
+  readonly accountlessAuthorizationVersion?: PostgresAccountlessAuthorizationVersion;
+}
 
 export interface PostgresDeviceUploadClaimOptions {
   readonly nowEpoch?: number;
