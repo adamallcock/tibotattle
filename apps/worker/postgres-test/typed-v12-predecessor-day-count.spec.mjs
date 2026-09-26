@@ -161,15 +161,13 @@ async function withIcuDatabase(run) {
   }
 }
 
-async function seedDevice(context, label) {
+async function seedParticipant(context, label) {
   const { table } = context;
   const now = new Date().toISOString();
   const expires = new Date(Date.now() + 30 * 24 * HOUR_MS).toISOString();
   const participantId = `synthetic-day-count-${label}-${randomUUID()}`;
   const sessionId = `${participantId}-session`;
   const ownerDigest = randomBytes(32).toString("hex");
-  const deviceId = `synthetic-day-count-device-${label}-${randomUUID()}`;
-  const pairingId = `synthetic-day-count-pairing-${randomUUID()}`;
   await context.pool.query(`INSERT INTO ${table("participants")}(id, owner_kind, state, consent_version, created_at)
     VALUES ($1,'social','active','privacy-safe-telemetry-v0.1',$2)`, [participantId, now]);
   await context.pool.query(`INSERT INTO ${table("web_sessions")}(
@@ -180,6 +178,16 @@ async function seedDevice(context, label) {
   await context.pool.query(`INSERT INTO ${table("analytics_owner_state")}(
     source_id, owner_digest, revision, authority_epoch, state
   ) VALUES ($1,$2,1,0,'active')`, [SOURCE_ID, ownerDigest]);
+  return { participantId, sessionId, now, expires };
+}
+
+/** One paired, v1.2-consented device of the participant; a participant may
+ * own several. */
+async function seedDevice(context, participant, label) {
+  const { table } = context;
+  const { participantId, sessionId, now, expires } = participant;
+  const deviceId = `synthetic-day-count-device-${label}-${randomUUID()}`;
+  const pairingId = `synthetic-day-count-pairing-${randomUUID()}`;
   await context.pool.query(`INSERT INTO ${table("device_pairings")}(
     id, participant_id, issued_by_session_id, secret_hash, consent_version,
     transport_consent_version, state, issued_at, expires_at, consumed_at, claimed_device_id
@@ -242,6 +250,88 @@ async function registerEmptyDays(context, principal, plan) {
   return registered;
 }
 
+/** One synthetic quota observation admitted through the real register, stage
+ * and ready path: the manifest is created at createdEpoch and, because its only
+ * chunk lands at readyEpoch, becomes ready then. */
+async function admitOneChunkDay(context, principal, day, parserVersion, createdEpoch, readyEpoch) {
+  const { table } = context;
+  const quotaRecord = {
+    schemaVersion: "quota-observation-v1.2",
+    observationId: `quota:v12:${randomUUID()}`,
+    observedTime: `${day}T12:05:00.000Z`,
+    provider: "openai_codex",
+    planType: "pro",
+    planVariant: "unknown",
+    limitId: "codex",
+    slot: "primary",
+    usedPercent: 20,
+    windowDurationMinutes: 10080,
+    resetsAt: `${day}T13:05:00.000Z`,
+    accountPlanAttribution: {
+      accountBasis: "unavailable",
+      accountTrackId: null,
+      planBasis: "same_source_occurrence",
+      planType: "pro",
+      planEraId: null,
+    },
+  };
+  const consent = telemetryV12RequiredConsent();
+  const chunk = {
+    schemaVersion: "telemetry-contribution-v1.2",
+    manifestDigest: "0".repeat(64),
+    chunkId: `quota:${day}:0`,
+    chunkRevision: 1,
+    parserVersion,
+    consent,
+    records: [quotaRecord],
+    chunkDigest: sha256Hex(canonicalTelemetryV12Json([quotaRecord])),
+  };
+  const manifest = {
+    schemaVersion: "telemetry-day-manifest-v1.2",
+    day,
+    parserVersion,
+    consent,
+    chunks: [{ chunkId: chunk.chunkId, chunkDigest: chunk.chunkDigest, recordCount: 1 }],
+    excluded: { quota: 0, session: 0, usage: 0 },
+    manifestDigest: "0".repeat(64),
+  };
+  manifest.manifestDigest = sha256Hex(telemetryV12DayManifestDigestInput(manifest));
+  chunk.manifestDigest = manifest.manifestDigest;
+  const candidate = await modules.registerPostgresTypedV12DayManifest(
+    context.pool, principal, manifest, createdEpoch, context.options,
+  );
+  assert.equal(candidate.state, "staged");
+  const envelopeDigest = randomBytes(32).toString("hex");
+  const authorizationId = `synthetic-day-count-auth-${randomUUID()}`;
+  const chunkRowId = `chunk:${randomUUID()}`;
+  const r2Key = `synthetic/day-count/${randomUUID()}`;
+  const issued = new Date(readyEpoch).toISOString();
+  const expires = new Date(readyEpoch + 10 * 60_000).toISOString();
+  await context.pool.query(`INSERT INTO ${table("device_upload_authorizations")}(
+    id, participant_id, issued_by_device_id, secret_hash, envelope_digest,
+    body_bytes, content_type, state, issued_at, expires_at, consume_lease_expires_at
+  ) VALUES ($1,$2,$3,$4,$5,4096,'application/json','consuming',$6,$7,$7)`, [
+    authorizationId, principal.participantId, principal.deviceId, randomBytes(32), envelopeDigest, issued, expires,
+  ]);
+  await context.pool.query(`INSERT INTO ${table("pending_objects")}(contribution_id, object_key, object_kind)
+    VALUES ($1,$2,'telemetry_v12')`, [chunkRowId, r2Key]);
+  await modules.persistPostgresTypedV12StagedChunk(context.pool, principal, chunk, {
+    chunkRowId, r2Key, envelopeDigest, deviceUploadAuthorizationId: authorizationId,
+  }, readyEpoch, context.options);
+  return { day, manifestId: candidate.manifestId, manifestDigest: candidate.manifestDigest };
+}
+
+/** A manifest's stored lifecycle times, as epochs. */
+async function manifestTimes(context, manifestId) {
+  const result = await context.pool.query(`SELECT state,
+      (extract(epoch FROM created_at) * 1000)::bigint::text AS created,
+      (extract(epoch FROM ready_at) * 1000)::bigint::text AS ready
+    FROM ${context.table("telemetry_v12_day_manifests")} WHERE id=$1`, [manifestId]);
+  assert.equal(result.rows.length, 1);
+  const [row] = result.rows;
+  return { state: row.state, created: Number(row.created), ready: Number(row.ready) };
+}
+
 /** Independent oracle: the earliest (created_at, id) manifest of each day, as
  * the canonical days vector the predecessor must record. Ids tie-break in
  * UTF-16 order, which equals C byte order for these ASCII ids. */
@@ -301,7 +391,7 @@ test("3 days x 1,366 re-digested ready manifests give a 3-day predecessor naming
   timeout: 600_000,
 }, async () => {
   await withSchema("v12p2_rows", async (context) => {
-    const principal = await seedDevice(context, "rows");
+    const principal = await seedDevice(context, await seedParticipant(context, "rows"), "rows");
     const days = ["2026-09-19", "2026-09-20", "2026-09-21"];
     const versionsPerDay = 1_366;
     const base = Date.now() - 3 * HOUR_MS;
@@ -336,7 +426,7 @@ test("4,096 distinct ready days succeed and a 4,097th day gives 400 SYNC_RANGE_T
   timeout: 600_000,
 }, async () => {
   await withSchema("v12p2_days", async (context) => {
-    const principal = await seedDevice(context, "days");
+    const principal = await seedDevice(context, await seedParticipant(context, "days"), "days");
     const firstDay = "2015-01-01";
     const base = Date.now() - 3 * HOUR_MS;
     const plan = Array.from({ length: MAX_DAYS }, (_, index) => ({
@@ -379,7 +469,7 @@ test("equal created_at pins the lower id in C collation where the database defau
 }, async () => {
   await withIcuDatabase(async (icuPool) => {
     await withSchema("v12p2_collation", async (context) => {
-      const principal = await seedDevice(context, "collation");
+      const principal = await seedDevice(context, await seedParticipant(context, "collation"), "collation");
       const day = "2026-09-20";
       // A registered id is a lowercase UUID, which C and en-US order alike, so
       // this pair is written with the registration's own statements. 'B' sorts
@@ -426,5 +516,66 @@ test("equal created_at pins the lower id in C collation where the database defau
         { day, manifestId: cFirst, manifestDigest: digests.get(cFirst) },
       ]);
     }, icuPool);
+  });
+});
+
+test("a day pins its earliest-created manifest, not the one that became ready first", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 120_000,
+}, async () => {
+  await withSchema("v12p2_ready_order", async (context) => {
+    const principal = await seedDevice(context, await seedParticipant(context, "ready-order"), "ready-order");
+    const day = "2026-09-20";
+    const base = Date.now() - 3 * HOUR_MS;
+    // The one-chunk manifest is created first and becomes ready last, when its
+    // chunk lands; the zero-chunk re-digest is created and ready in between.
+    const createdFirst = await admitOneChunkDay(context, principal, day, "synthetic-parser-chunked",
+      base, base + 60_000);
+    const [readyFirst] = await registerEmptyDays(context, principal, [{
+      day, parserVersion: "synthetic-parser-empty", createdEpoch: base + 30_000,
+    }]);
+    const chunked = await manifestTimes(context, createdFirst.manifestId);
+    const empty = await manifestTimes(context, readyFirst.manifestId);
+    assert.deepEqual(chunked, { state: "ready", created: base, ready: base + 60_000 });
+    assert.deepEqual(empty, { state: "ready", created: base + 30_000, ready: base + 30_000 });
+    assert.deepEqual(await readyShape(context, principal), { rows: 2, days: 1 });
+
+    const predecessor = await context.domain.createPredecessor(principal);
+    await assertPinnedDays(context, predecessor, [createdFirst]);
+  });
+});
+
+test("another device of the same participant never enters the predecessor's range or days", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 120_000,
+}, async () => {
+  await withSchema("v12p2_devices", async (context) => {
+    const participant = await seedParticipant(context, "devices");
+    const principal = await seedDevice(context, participant, "this");
+    const other = await seedDevice(context, participant, "other");
+    const base = Date.now() - 3 * HOUR_MS;
+    // The other device is ready earlier on the shared day and on days before
+    // and after this device's range, so dropping the device scope would widen
+    // the range and pin the other device's manifest for the shared day.
+    const otherDays = await registerEmptyDays(context, other, [
+      { day: "2026-09-18", parserVersion: "synthetic-parser-other", createdEpoch: base },
+      { day: "2026-09-20", parserVersion: "synthetic-parser-other", createdEpoch: base + 1_000 },
+      { day: "2026-09-23", parserVersion: "synthetic-parser-other", createdEpoch: base + 2_000 },
+    ]);
+    const ownDays = await registerEmptyDays(context, principal, [
+      { day: "2026-09-20", parserVersion: "synthetic-parser-this", createdEpoch: base + 10_000 },
+      { day: "2026-09-21", parserVersion: "synthetic-parser-this", createdEpoch: base + 11_000 },
+    ]);
+    assert.deepEqual(await readyShape(context, principal), { rows: 2, days: 2 });
+    assert.deepEqual(await readyShape(context, other), { rows: 3, days: 3 });
+    const shared = await context.pool.query(`SELECT count(*)::integer AS rows
+      FROM ${context.table("telemetry_v12_day_manifests")}
+      WHERE participant_id=$1 AND chunk_day='2026-09-20' AND state='ready'`, [participant.participantId]);
+    assert.equal(shared.rows[0].rows, 2);
+
+    const own = await context.domain.createPredecessor(principal);
+    await assertPinnedDays(context, own, earliestPerDay(ownDays));
+    const others = await context.domain.createPredecessor(other);
+    await assertPinnedDays(context, others, earliestPerDay(otherDays));
   });
 });
