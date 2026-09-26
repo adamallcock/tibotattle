@@ -263,10 +263,14 @@ export function projectAdminReconstructionProgress(value) {
   // there, so a v2 payload relabelled as v3 still fails the closed-key check.
   const optionalPreparation = candidate.schemaVersion === 3
     && Object.hasOwn(candidate, "preparation");
+  // v3 Workers since the pipeline view add `pipeline` (null when that block
+  // alone was unreadable); older v3 payloads simply omit it.
+  const hasPipeline = candidate.schemaVersion === 3 && Object.hasOwn(candidate, "pipeline");
   const progress = closed(candidate, [
     "schemaVersion", "generatedAt", "publication", "work", "history",
     ...(candidate.schemaVersion === 2 || optionalPreparation ? ["preparation"] : []),
     ...(candidate.schemaVersion === 3 ? ["graph"] : []),
+    ...(hasPipeline ? ["pipeline"] : []),
   ]);
   const publication = closed(progress.publication, [
     "state", "requestedGeneration", "preparedGeneration", "publishedGeneration", "publishedAt",
@@ -331,7 +335,59 @@ export function projectAdminReconstructionProgress(value) {
     ...(progress.schemaVersion === 3
       ? { graph: projectGraphRebuild(progress.graph, code, closed, nullableTime) }
       : {}),
+    ...(hasPipeline ? { pipeline: projectPipeline(progress.pipeline, code, closed, nullableTime) } : {}),
   });
+}
+
+/** Where analytics processing stands, as counts, UTC days and instants only.
+ * A contradiction between the counts is a broken read, never something to
+ * clamp: the view then reports the pipeline as unreadable. */
+function projectPipeline(value, code, closed, nullableTime) {
+  if (value === null) return null;
+  const pipeline = closed(value, ["ingestion", "delivery", "daily"]);
+  const ingestion = closed(pipeline.ingestion, ["journalHead", "latestRecordedAt"]);
+  const delivery = closed(pipeline.delivery, ["appliedSequence", "pendingChanges", "pendingActivations", "current"]);
+  const daily = closed(pipeline.daily, [
+    "queuedDays", "oldestQueuedDay", "newestQueuedDay", "lastReleasedAt", "releasedLastHour",
+  ]);
+  const nullableDay = (day) => day === null ? null : calendarDay(day, code);
+  let current = null;
+  if (delivery.current !== null) {
+    const position = closed(delivery.current, ["fromDay", "throughDay", "nextDay", "daysDone", "daysTotal"]);
+    current = Object.freeze({
+      fromDay: calendarDay(position.fromDay, code),
+      throughDay: calendarDay(position.throughDay, code),
+      nextDay: calendarDay(position.nextDay, code),
+      daysDone: count(position.daysDone, code),
+      daysTotal: positiveInteger(position.daysTotal, code),
+    });
+    if (current.fromDay > current.throughDay || current.daysDone > current.daysTotal) invalid(code);
+  }
+  const projected = Object.freeze({
+    ingestion: Object.freeze({
+      journalHead: count(ingestion.journalHead, code),
+      latestRecordedAt: nullableTime(ingestion.latestRecordedAt),
+    }),
+    delivery: Object.freeze({
+      appliedSequence: count(delivery.appliedSequence, code),
+      pendingChanges: count(delivery.pendingChanges, code),
+      pendingActivations: count(delivery.pendingActivations, code),
+      current,
+    }),
+    daily: Object.freeze({
+      queuedDays: count(daily.queuedDays, code),
+      oldestQueuedDay: nullableDay(daily.oldestQueuedDay),
+      newestQueuedDay: nullableDay(daily.newestQueuedDay),
+      lastReleasedAt: nullableTime(daily.lastReleasedAt),
+      releasedLastHour: count(daily.releasedLastHour, code),
+    }),
+  });
+  const { delivery: sent, daily: queue } = projected;
+  if (sent.appliedSequence > projected.ingestion.journalHead || sent.pendingActivations > sent.pendingChanges
+      || (queue.queuedDays === 0) !== (queue.oldestQueuedDay === null)
+      || (queue.oldestQueuedDay === null) !== (queue.newestQueuedDay === null)
+      || (queue.oldestQueuedDay !== null && queue.oldestQueuedDay > queue.newestQueuedDay)) invalid(code);
+  return projected;
 }
 
 /** The typed-storage rebuild view: a closed, aggregate-only description of the
