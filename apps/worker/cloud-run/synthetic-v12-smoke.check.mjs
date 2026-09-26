@@ -569,6 +569,14 @@ test("fixture seed writes only uniquely tagged authority rows in one transaction
   assert.equal(statements.some(({ sql }) => /UPDATE .*collection_controls|DELETE FROM/u.test(sql)), false);
   assert.equal(statements.filter(({ sql }) => /INSERT INTO/u.test(sql)).length, 7);
   assert.ok(statements.every(({ sql }) => !/POSTGRES_RATE_LIMIT_SECRET/u.test(sql)));
+  // The seed keeps its own active owner link. On a journal-enabled target the
+  // v1.2 owner bridge (primary 0055) reuses this digest for the smoke head's
+  // receipt and owner-active row instead of minting another link; the bridged
+  // smoke owner still erases (synthetic-v12-cleanup.check.mjs).
+  const links = statements.filter(({ sql }) => sql.includes('"storage_v11_owner_links"'));
+  assert.equal(links.length, 1);
+  assert.match(links[0].sql, /\(participant_id, owner_digest, state\)\s+VALUES \(\$1, \$2, 'active'\)/u);
+  assert.deepEqual(links[0].params, [fixture.participantId, fixture.ownerDigest]);
 });
 
 test("synthetic encrypted chunk round-trips using only the public envelope key", async () => {

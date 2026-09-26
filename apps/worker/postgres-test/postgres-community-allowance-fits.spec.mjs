@@ -175,8 +175,12 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL persisted allowance-fit boundary", 
     const latest = await pool.query(`SELECT COALESCE(max(sequence),0)::text AS sequence
       FROM ${sqlSchema}.storage_ingestion_changes WHERE source_id=$1`, [SOURCE_ID]);
     const sequence = Number(latest.rows[0].sequence);
-    await pool.query(`UPDATE ${sqlSchema}.analytics_source_cursors SET sequence=$2 WHERE source_id=$1`,
-      [SOURCE_ID, sequence]);
+    // The v1.2 owner bridge journals the accepted head as owner-active, which
+    // advances the source epoch; a caught-up cursor carries it with the sequence.
+    const sourceEpoch = Number((await pool.query(`SELECT authority_epoch::text AS epoch
+      FROM ${sqlSchema}.storage_source_state WHERE singleton=1`)).rows[0].epoch);
+    await pool.query(`UPDATE ${sqlSchema}.analytics_source_cursors SET sequence=$2, authority_epoch=$3 WHERE source_id=$1`,
+      [SOURCE_ID, sequence, sourceEpoch]);
     const control = await pool.query(`SELECT policy.policy_revision, controls.revision AS collection_revision,
         v12.revision AS runtime_revision, typed.policy_revision AS typed_policy_revision
       FROM ${sqlSchema}.publication_state policy
@@ -188,9 +192,9 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL persisted allowance-fit boundary", 
     const effectiveSourcePin = {
       sourceId: SOURCE_ID,
       sourceNamespace: SOURCE_NAMESPACE,
-      storageAuthorityEpoch: 0,
+      storageAuthorityEpoch: sourceEpoch,
       sourceCursorSequence: sequence,
-      sourceCursorAuthorityEpoch: 0,
+      sourceCursorAuthorityEpoch: sourceEpoch,
       v1ImportGeneration: 1,
       v1ImportDigest: "a".repeat(64),
       v11ImportGeneration: 1,
@@ -210,8 +214,8 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL persisted allowance-fit boundary", 
       sourcePin: {
         sourceId: SOURCE_ID,
         sourceNamespace: SOURCE_NAMESPACE,
-        sourceAuthorityEpoch: 0,
-        analyticsAuthorityEpoch: 0,
+        sourceAuthorityEpoch: sourceEpoch,
+        analyticsAuthorityEpoch: sourceEpoch,
         sequence,
         telemetryV12RuntimeState: "active",
         telemetryV12RuntimeRevision: numeric(control.rows[0].runtime_revision),
