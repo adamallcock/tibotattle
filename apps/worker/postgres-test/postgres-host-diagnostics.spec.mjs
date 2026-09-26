@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import pg from "pg";
@@ -28,6 +29,8 @@ const STAGED_PRIMARY_MIGRATIONS = Object.freeze([
   "0047_host_diagnostic_errors.sql",
 ]);
 const DAY = 24 * 60 * 60 * 1_000;
+// Written out rather than imported so a re-keyed writer lock fails the spec.
+const DIAGNOSTIC_LOCK_DOMAIN = "tibotattle/diagnostic-error-events/v1";
 
 let vite;
 let diagnostics;
@@ -346,6 +349,63 @@ test("PostgreSQL 17 concurrent sampled writers stop at exactly 256 rows and neve
   });
 });
 
+test("PostgreSQL 17 a sampled writer waits for the diagnostic cap lock another transaction holds", {
+  skip: SKIP_POSTGRES,
+  timeout: 120_000,
+}, async () => {
+  await withDiagnosticsSchema(async ({ pool, schema, table }) => {
+    assert.equal(diagnostics.POSTGRES_DIAGNOSTIC_LOCK_DOMAIN, DIAGNOSTIC_LOCK_DOMAIN);
+    const holder = await pool.connect();
+    let held = true;
+    let settled = false;
+    let pending;
+    const release = async () => {
+      if (!held) return;
+      held = false;
+      try {
+        await holder.query("ROLLBACK");
+      } finally {
+        holder.release();
+      }
+    };
+    try {
+      await holder.query("BEGIN");
+      await holder.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [DIAGNOSTIC_LOCK_DOMAIN]);
+      pending = diagnostics.recordPostgresDiagnosticError(pool, schema, {
+        requestId: sampledRequestId(),
+        routeClass: "serialized",
+        code: "INTERNAL_ERROR",
+        status: 500,
+        occurredAt: Date.UTC(2026, 8, 20, 12),
+      }).finally(() => {
+        settled = true;
+      });
+      // Observe the writer queued on exactly this advisory key, rather than
+      // relying on a race to overshoot the cap. The loop ends as soon as the
+      // waiter appears, well inside the writer's own 5000 ms lock timeout.
+      let waiting = 0;
+      for (let attempt = 0; attempt < 200 && waiting === 0 && !settled; attempt += 1) {
+        await delay(50);
+        waiting = (await pool.query(
+          `SELECT count(*)::integer AS waiting
+             FROM pg_locks
+            WHERE locktype='advisory' AND NOT granted
+              AND database=(SELECT oid FROM pg_database WHERE datname=current_database())
+              AND ((classid::bigint << 32) | objid::bigint)=hashtextextended($1, 0)`,
+          [DIAGNOSTIC_LOCK_DOMAIN],
+        )).rows[0].waiting;
+      }
+      assert.equal(settled, false, "the writer does not insert while another transaction holds the cap lock");
+      assert.ok(waiting >= 1, "the writer is queued on the diagnostic advisory lock");
+      assert.equal(await rowCount(pool, table), 0);
+    } finally {
+      await release();
+    }
+    assert.equal(await pending, true, "the writer inserts once the lock is released");
+    assert.equal(await rowCount(pool, table), 1);
+  });
+});
+
 test("PostgreSQL 17 recorder failure returns false and the prune is bounded to rows past 30 days", {
   skip: SKIP_POSTGRES,
   timeout: 120_000,
@@ -368,10 +428,48 @@ test("PostgreSQL 17 recorder failure returns false and the prune is bounded to r
       [sampledRequestId(), cutoff, nowEpoch - DAY],
     );
     assert.equal(await rowCount(pool, table), 1_007);
+    const expiredOffsets = async () => (await pool.query(
+      `SELECT ($1::bigint - floor(extract(epoch FROM occurred_at) * 1000)::bigint)::integer AS offset_ms
+         FROM ${table} WHERE route_class='old' ORDER BY occurred_at DESC`,
+      [old],
+    )).rows.map((row) => row.offset_ms);
 
-    assert.equal(await diagnostics.prunePostgresDiagnosticErrors(pool, schema, nowEpoch), 1_000,
-      "one call deletes at most 1000 rows");
-    assert.equal(await diagnostics.prunePostgresDiagnosticErrors(pool, schema, nowEpoch), 5);
+    // Hold the oldest expired row as a concurrent writer would.
+    const holder = await pool.connect();
+    let held = true;
+    const release = async () => {
+      if (!held) return;
+      held = false;
+      try {
+        await holder.query("ROLLBACK");
+      } finally {
+        holder.release();
+      }
+    };
+    try {
+      await holder.query("BEGIN");
+      const locked = await holder.query(
+        `SELECT id FROM ${table}
+          WHERE occurred_at=to_timestamp($1::double precision / 1000.0) FOR UPDATE`,
+        [old - 1_004],
+      );
+      assert.equal(locked.rowCount, 1);
+
+      // Without SKIP LOCKED these calls would queue behind the holder and
+      // fail at the shared 5000 ms lock timeout.
+      assert.equal(await diagnostics.prunePostgresDiagnosticErrors(pool, schema, nowEpoch), 1_000,
+        "one call deletes at most 1000 rows");
+      assert.deepEqual(await expiredOffsets(), [0, 1, 2, 3, 1_004],
+        "oldest first: the four newest expired rows and the skipped locked row remain");
+      assert.equal(await diagnostics.prunePostgresDiagnosticErrors(pool, schema, nowEpoch), 4);
+      assert.equal(await diagnostics.prunePostgresDiagnosticErrors(pool, schema, nowEpoch), 0,
+        "a locked expired row is skipped, not waited for");
+      assert.deepEqual(await expiredOffsets(), [1_004]);
+    } finally {
+      await release();
+    }
+    assert.equal(await diagnostics.prunePostgresDiagnosticErrors(pool, schema, nowEpoch), 1,
+      "the skipped row is pruned by a later pass");
     assert.equal(await diagnostics.prunePostgresDiagnosticErrors(pool, schema, nowEpoch), 0,
       "a repeated prune is a no-op");
     const kept = await pool.query(`SELECT route_class FROM ${table} ORDER BY route_class`);

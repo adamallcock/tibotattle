@@ -197,6 +197,44 @@ async function holdLimiterRows(pool, table, limiterName) {
   };
 }
 
+/**
+ * Wrap a pool so a scheduled callback runs right after a limiter's
+ * INSERT ... DO NOTHING and before its FOR UPDATE read, the gap in which an
+ * existing bucket is unlocked. Records each insert and lock row count.
+ */
+function interleavingPool(inner) {
+  const events = [];
+  let scheduled = null;
+  return {
+    events,
+    schedule(callback) {
+      scheduled = callback;
+    },
+    async connect() {
+      const client = await inner.connect();
+      return {
+        async query(text, values) {
+          const result = await client.query(text, values);
+          if (/ON CONFLICT \(limiter_name,key_digest\) DO NOTHING$/u.test(text.trim())) {
+            events.push(`insert:${result.rowCount}`);
+            if (scheduled !== null) {
+              const callback = scheduled;
+              scheduled = null;
+              events.push(`interleaved:${await callback()}`);
+            }
+          } else if (/FOR UPDATE$/u.test(text.trim())) {
+            events.push(`lock:${result.rowCount}`);
+          }
+          return result;
+        },
+        release(discard) {
+          return client.release(discard);
+        },
+      };
+    },
+  };
+}
+
 function assertApiError(error, status, code) {
   assert.equal(error?.name, "ApiError");
   assert.equal(error.status, status);
@@ -208,9 +246,14 @@ function assertApiError(error, status, code) {
   return true;
 }
 
-/** Scripted structural pool that records the exact statements a limiter issues. */
-function recordingPool() {
+/**
+ * Scripted structural pool that records the exact statements a limiter
+ * issues. The first `missingLocks` FOR UPDATE reads find no bucket, as when a
+ * concurrent deleter removes it between the limiter's insert and its lock.
+ */
+function recordingPool({ missingLocks = 0 } = {}) {
   const statements = [];
+  let missing = missingLocks;
   const pool = {
     statements,
     releases: [],
@@ -219,6 +262,10 @@ function recordingPool() {
         async query(text, values) {
           statements.push(values === undefined ? { text } : { text, values: [...values] });
           if (/FOR UPDATE$/u.test(text.trim())) {
+            if (missing > 0) {
+              missing -= 1;
+              return { rows: [], rowCount: 0 };
+            }
             return { rows: [{ window_started_at_ms: "1000", used_count: 0 }], rowCount: 1 };
           }
           if (/AS now_ms/u.test(text)) return { rows: [{ now_ms: "2000" }], rowCount: 1 };
@@ -287,34 +334,116 @@ test("limiter transaction bounds default to the shared helper and pass through w
   for (const invalid of [
     null,
     "1000",
+    [],
+    new Map([["lockTimeoutMilliseconds", 1_000]]),
     { lockTimeoutMilliseconds: 0 },
     { lockTimeoutMilliseconds: 600_001 },
     { lockTimeoutMilliseconds: 1.5 },
     { lockTimeoutMilliseconds: "1000" },
     { statementTimeoutMilliseconds: -1 },
     { statementTimeoutMilliseconds: Number.NaN },
+    // A misspelt bound must not silently fall back to the shared defaults.
+    { lockTimeoutMs: 1_000 },
+    { statementTimeout: 2_000 },
+    { lockTimeoutMilliseconds: 1_000, statementTimeoutMs: 2_000 },
+    { lockTimeoutMilliseconds: 1_000, [Symbol("bound")]: 2_000 },
   ]) {
-    assert.throws(() => rateLimit.createPostgresRateLimiter(recordingPool(), options, invalid),
+    const pool = recordingPool();
+    assert.throws(() => rateLimit.createPostgresRateLimiter(pool, options, invalid),
       /Invalid PostgreSQL rate limiter configuration/u);
+    assert.equal(pool.statements.length, 0);
   }
+
+  // Bounds belong in the third argument; inside the limiter options they
+  // would otherwise be ignored, so construction refuses them.
+  for (const misplaced of [
+    { ...options, ...rateLimit.POSTGRES_ADMISSION_LIMITER_TRANSACTION_OPTIONS },
+    { ...options, lockTimeoutMilliseconds: 1_000 },
+    { ...options, statementTimeoutMilliseconds: 2_000 },
+    { ...options, lockTimeoutMilliseconds: undefined },
+  ]) {
+    assert.throws(() => rateLimit.createPostgresRateLimiter(recordingPool(), misplaced),
+      /Invalid PostgreSQL rate limiter configuration/u);
+    assert.throws(() => new rateLimit.PostgresRateLimiter(
+      recordingPool(), misplaced, rateLimit.POSTGRES_ADMISSION_LIMITER_TRANSACTION_OPTIONS),
+    /Invalid PostgreSQL rate limiter configuration/u);
+  }
+});
+
+test("a bucket deleted between the limiter's insert and its lock is created once more, then fails closed", async () => {
+  const schema = { primarySchema: "synthetic_primary", ledgerSchema: "synthetic_ledger" };
+  const options = {
+    ...schema, name: "UPLOAD_PRINCIPAL", limit: 3, periodSeconds: 60, keyHashSecret: randomBytes(32),
+  };
+  const isInsert = (statement) => /ON CONFLICT \(limiter_name,key_digest\) DO NOTHING$/u.test(statement.text);
+  const isLock = (statement) => /FOR UPDATE$/u.test(statement.text.trim());
+
+  const steadyPool = recordingPool();
+  await new rateLimit.PostgresRateLimiter(steadyPool, options).limit({ key: "synthetic-key" });
+  assert.equal(steadyPool.statements.filter(isInsert).length, 1, "the ordinary path makes one attempt");
+
+  const recreatedPool = recordingPool({ missingLocks: 1 });
+  assert.deepEqual(
+    await new rateLimit.PostgresRateLimiter(recreatedPool, options).limit({ key: "synthetic-key" }),
+    { success: true },
+  );
+  const [insert, lock] = steadyPool.statements.filter((statement) => isInsert(statement) || isLock(statement));
+  assert.deepEqual(recreatedPool.statements.slice(3, 7), [insert, lock, insert, lock],
+    "the identical insert and lock are issued once more");
+  assert.deepEqual(recreatedPool.statements.slice(7), steadyPool.statements.slice(5));
+  assert.deepEqual(recreatedPool.releases, [false]);
+
+  const vanishedPool = recordingPool({ missingLocks: 2 });
+  await assert.rejects(
+    new rateLimit.PostgresRateLimiter(vanishedPool, options).limit({ key: "synthetic-key" }),
+    (error) => error?.name === "PostgresStorageError" && error.code === "unavailable"
+      && error.message === "POSTGRES_UNAVAILABLE:rate_limit.limit",
+  );
+  assert.deepEqual(vanishedPool.statements.slice(3).map((statement) => statement.text),
+    [insert.text, lock.text, insert.text, lock.text, "ROLLBACK"],
+    "a second miss is not retried again and rolls back");
+  await assert.rejects(
+    admission.assertUploadAuthorizationAllowed(
+      new rateLimit.PostgresRateLimiter(recordingPool({ missingLocks: 2 }), { ...options, name: "UPLOAD_AUTHORIZATION" }),
+      new rateLimit.PostgresRateLimiter(recordingPool(), options),
+      "synthetic-principal",
+      SYNTHETIC_ENV,
+    ),
+    (error) => assertApiError(error, 503, "UPLOAD_INGRESS_UNAVAILABLE"),
+  );
 });
 
 test("bucket purge validates its bounds before any database work and binds only closed values", async () => {
   const pool = recordingPool();
   const schema = { primarySchema: "synthetic_primary", ledgerSchema: "synthetic_ledger" };
-  const periods = { UPLOAD_AUTHORIZATION: 60, UPLOAD_PRINCIPAL: 60 };
+  const limiter = (name, periodSeconds, limiterSchema = schema) => rateLimit.createPostgresRateLimiter(
+    recordingPool(),
+    { ...limiterSchema, name, limit: 3_000, periodSeconds, keyHashSecret: randomBytes(32) },
+  );
+  const limiters = [limiter("UPLOAD_AUTHORIZATION", 60), limiter("UPLOAD_PRINCIPAL", 60)];
+  // A look-alike carries a period nothing enforces; it could understate one.
+  const lookAlike = Object.assign(Object.create(rateLimit.PostgresRateLimiter.prototype), {
+    name: "UPLOAD_PRINCIPAL",
+    periodSeconds: 60,
+  });
   for (const options of [
     null,
-    { periodSecondsByLimiterName: {} },
-    { periodSecondsByLimiterName: null },
-    { periodSecondsByLimiterName: { lowercase: 60 } },
-    { periodSecondsByLimiterName: { UPLOAD_AUTHORIZATION: 0 } },
-    { periodSecondsByLimiterName: { UPLOAD_AUTHORIZATION: 86_401 } },
-    { periodSecondsByLimiterName: periods, maxRows: 0 },
-    { periodSecondsByLimiterName: periods, maxRows: 10_001 },
-    { periodSecondsByLimiterName: periods, maxRows: 2.5 },
-    { periodSecondsByLimiterName: periods, nowEpoch: -1 },
-    { periodSecondsByLimiterName: periods, nowEpoch: Number.NaN },
+    {},
+    { limiters: [] },
+    { limiters: null },
+    { limiters: limiters[0] },
+    { periodSecondsByLimiterName: { UPLOAD_AUTHORIZATION: 60, UPLOAD_PRINCIPAL: 60 } },
+    { limiters: { UPLOAD_AUTHORIZATION: 60, UPLOAD_PRINCIPAL: 60 } },
+    { limiters: [{ name: "UPLOAD_PRINCIPAL", periodSeconds: 60 }] },
+    { limiters: [...limiters, lookAlike] },
+    { limiters: [...limiters, "UPLOAD_PRINCIPAL"] },
+    { limiters: [limiter("UPLOAD_PRINCIPAL", 60, { primarySchema: "other_primary", ledgerSchema: "other_ledger" })] },
+    { limiters: Array.from({ length: 65 }, () => limiters[0]) },
+    { limiters, maxRows: 0 },
+    { limiters, maxRows: 10_001 },
+    { limiters, maxRows: 2.5 },
+    { limiters, nowEpoch: -1 },
+    { limiters, nowEpoch: Number.NaN },
   ]) {
     await assert.rejects(
       rateLimit.purgeExpiredPostgresRateLimitBuckets(pool, schema, options),
@@ -322,16 +451,14 @@ test("bucket purge validates its bounds before any database work and binds only 
     );
   }
   await assert.rejects(
-    rateLimit.purgeExpiredPostgresRateLimitBuckets(pool, { primarySchema: "pg_catalog" }, {
-      periodSecondsByLimiterName: periods,
-    }),
+    rateLimit.purgeExpiredPostgresRateLimitBuckets(pool, { primarySchema: "pg_catalog" }, { limiters }),
     TypeError,
   );
   assert.equal(pool.statements.length, 0);
 
   assert.equal(await rateLimit.purgeExpiredPostgresRateLimitBuckets(pool, schema, {
     nowEpoch: 1_800_000_000_000,
-    periodSecondsByLimiterName: periods,
+    limiters,
   }), 3);
   const purge = pool.statements.find((statement) => /AS purged/u.test(statement.text));
   assert.match(purge.text, /"synthetic_primary"\."postgres_rate_limit_buckets"/u);
@@ -344,6 +471,15 @@ test("bucket purge validates its bounds before any database work and binds only 
     rateLimit.POSTGRES_RATE_LIMIT_PURGE_DEFAULT_MAX_ROWS,
   ]);
   assert.equal(rateLimit.POSTGRES_RATE_LIMIT_PURGE_DEFAULT_MAX_ROWS, 5_000);
+
+  // Limiters sharing a name share buckets, so the longest window governs.
+  const shared = recordingPool();
+  await rateLimit.purgeExpiredPostgresRateLimitBuckets(shared, schema, {
+    nowEpoch: 1_800_000_000_000,
+    limiters: [limiter("UPLOAD_PRINCIPAL", 3_600), ...limiters, limiter("UPLOAD_PRINCIPAL", 120)],
+  });
+  const sharedPurge = shared.statements.find((statement) => /AS purged/u.test(statement.text));
+  assert.deepEqual(sharedPurge.values.slice(0, 2), [["UPLOAD_PRINCIPAL", "UPLOAD_AUTHORIZATION"], [3_600, 60]]);
 });
 
 test("PostgreSQL 17 migration 0048 makes the limiter buckets unlogged without changing limiter outcomes", {
@@ -530,10 +666,14 @@ test("PostgreSQL 17 bucket purge removes rows past twice their window, is bounde
         [key, seconds(3_600)],
       );
     }
-    const periodSecondsByLimiterName = { UPLOAD_AUTHORIZATION: 60, UPLOAD_PRINCIPAL: 3_600 };
+    // Each window comes from the limiter instance that enforces it.
+    const limiters = [
+      rateLimit.createPostgresRateLimiter(pool, limiterOptions(schema, "UPLOAD_AUTHORIZATION")),
+      rateLimit.createPostgresRateLimiter(pool, { ...limiterOptions(schema, "UPLOAD_PRINCIPAL"), periodSeconds: 3_600 }),
+    ];
     const purge = (options = {}) => rateLimit.purgeExpiredPostgresRateLimitBuckets(pool, schema, {
       nowEpoch,
-      periodSecondsByLimiterName,
+      limiters,
       ...options,
     });
 
@@ -573,5 +713,68 @@ test("PostgreSQL 17 bucket purge removes rows past twice their window, is bounde
     }
     for (const key of extraExpired) assert.equal(remaining.has(key), false);
     assert.equal(remaining.size, 6);
+  });
+});
+
+test("PostgreSQL 17 a bucket purged between the limiter's insert and lock is recreated instead of failing admission", {
+  skip: SKIP_POSTGRES,
+  timeout: 120_000,
+}, async () => {
+  await withLimiterSchema(async ({ pool, admissionPool, schema, table }) => {
+    const interleaving = interleavingPool(admissionPool);
+    const bounds = rateLimit.POSTGRES_ADMISSION_LIMITER_TRANSACTION_OPTIONS;
+    const coarse = rateLimit.createPostgresRateLimiter(
+      interleaving, limiterOptions(schema, "UPLOAD_AUTHORIZATION"), bounds);
+    const principal = rateLimit.createPostgresRateLimiter(
+      interleaving, limiterOptions(schema, "UPLOAD_PRINCIPAL"), bounds);
+    await admission.assertUploadAuthorizationAllowed(coarse, principal, "synthetic-principal", SYNTHETIC_ENV);
+    // Ten idle minutes put both buckets past twice their 60 s window.
+    await pool.query(`UPDATE ${table} SET window_started_at=window_started_at - interval '10 minutes'`);
+
+    interleaving.events.length = 0;
+    interleaving.schedule(() => rateLimit.purgeExpiredPostgresRateLimitBuckets(pool, schema, {
+      limiters: [coarse, principal],
+    }));
+    await admission.assertUploadAuthorizationAllowed(coarse, principal, "synthetic-principal", SYNTHETIC_ENV);
+    assert.deepEqual(interleaving.events, [
+      "insert:0", // the idle coarse bucket exists, and DO NOTHING leaves it unlocked
+      "interleaved:2", // maintenance deletes both idle buckets and commits
+      "lock:0", // the FOR UPDATE read finds the coarse bucket gone
+      "insert:1", // so the limiter creates it once more
+      "lock:1",
+      "insert:1", // the purged principal bucket is created by the ordinary path
+      "lock:1",
+    ]);
+    const counts = await pool.query(`SELECT limiter_name, used_count FROM ${table} ORDER BY limiter_name`);
+    assert.deepEqual(counts.rows.map((row) => `${row.limiter_name}:${row.used_count}`), [
+      "UPLOAD_AUTHORIZATION:1",
+      "UPLOAD_PRINCIPAL:1",
+    ], "each recreated bucket opens a fresh window counting this admission once");
+  });
+});
+
+test("PostgreSQL 17 the purge reads each window from its limiter, so an enforced window is never cut short", {
+  skip: SKIP_POSTGRES,
+  timeout: 120_000,
+}, async () => {
+  await withLimiterSchema(async ({ pool, admissionPool, schema, table }) => {
+    const principal = rateLimit.createPostgresRateLimiter(
+      admissionPool, { ...limiterOptions(schema, "UPLOAD_PRINCIPAL", 1), periodSeconds: 3_600 });
+    assert.deepEqual(await principal.limit({ key: "synthetic-principal" }), { success: true });
+    assert.deepEqual(await principal.limit({ key: "synthetic-principal" }), { success: false });
+    await pool.query(`UPDATE ${table} SET window_started_at=window_started_at - interval '3 minutes'`);
+
+    await assert.rejects(
+      rateLimit.purgeExpiredPostgresRateLimitBuckets(pool, schema, {
+        limiters: [{ name: "UPLOAD_PRINCIPAL", periodSeconds: 60 }],
+      }),
+      /Invalid PostgreSQL rate limiter configuration/u,
+      "an understated period cannot be supplied",
+    );
+    assert.equal(await rateLimit.purgeExpiredPostgresRateLimitBuckets(pool, schema, {
+      limiters: [principal],
+    }), 0);
+    assert.deepEqual(await principal.limit({ key: "synthetic-principal" }), { success: false },
+      "the running 3600 s window still holds after maintenance");
   });
 });
