@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  PRODUCTION_LIVE_CONFIG_D1_MIGRATIONS_DIRS,
   createProductionLiveConfigSnapshot,
   productionLiveConfigFingerprint,
   renderProductionLiveConfig,
@@ -266,5 +267,37 @@ test("alias and resource-shape changes are rejected before rendering", () => {
     const unsupported = trackedConfig();
     unsupported.env.production[key] = key === "tags" ? [] : key === "annotations" ? {} : "standard";
     assert.throws(() => renderProductionLiveConfig({ trackedConfig: unsupported, snapshot: baseline(), sourceCommit: NEXT_SOURCE }), { code: "PRODUCTION_LIVE_CONFIG_CONFIG_SETTING_UNSUPPORTED" });
+  }
+});
+
+test("a candidate D1 migrations_dir is accepted only as the release guard's own directory", () => {
+  assert.deepEqual(PRODUCTION_LIVE_CONFIG_D1_MIGRATIONS_DIRS, { RELEASE_GUARD_DB: "release-guard-migrations" });
+  assert.equal(Object.isFrozen(PRODUCTION_LIVE_CONFIG_D1_MIGRATIONS_DIRS), true);
+  const guard = "55555555-5555-4555-8555-555555555555";
+  const value = inventory();
+  value.version.resources.bindings.push({ name: "RELEASE_GUARD_DB", type: "d1", id: guard, database_id: guard });
+  value.settings.bindings = value.version.resources.bindings;
+  const snapshot = createProductionLiveConfigSnapshot(value);
+  const verify = (binding, directory) => {
+    const candidate = renderProductionLiveConfig({ trackedConfig: trackedConfig(), snapshot, sourceCommit: NEXT_SOURCE });
+    if (binding !== undefined) {
+      candidate.env.production.d1_databases.find((entry) => entry.binding === binding).migrations_dir = directory;
+    }
+    return verifyProductionLiveConfig({ snapshot, candidateConfig: candidate, sourceCommit: NEXT_SOURCE });
+  };
+  assert.equal(verify().ok, true);
+  // Config-only: Wrangler reads it for `d1 migrations`, the live inventory never reports it.
+  assert.equal(verify("RELEASE_GUARD_DB", "release-guard-migrations").ok, true);
+  for (const [binding, directory] of [
+    ["RELEASE_GUARD_DB", "migrations"],
+    ["RELEASE_GUARD_DB", "./release-guard-migrations"],
+    ["USAGE_MONITOR_DB", "migrations"],
+    ["USAGE_MONITOR_DB", "release-guard-migrations"],
+    ["ANALYTICS_DB", "release-guard-migrations"],
+    ["DELETION_LEDGER", "deletion-ledger-migrations"],
+  ]) {
+    const result = verify(binding, directory);
+    assert.equal(result.code, "PRODUCTION_LIVE_CONFIG_BINDING_INVALID", `${binding} ${directory}`);
+    assert.deepEqual(Object.keys(result).sort(), ["code", "ok"]);
   }
 });
