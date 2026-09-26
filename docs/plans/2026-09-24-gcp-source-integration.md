@@ -104,10 +104,10 @@ Worker route, admin action, or Job invokes them; participants holding a
 redeemed community grant are refused pending a grant-retention decision; and
 retirement's owner-digest discovery and residual scans still need
 qualification against a real transferred snapshot on the test primary. In
-both erasers, a retirement refused while re-erasing a restored primary is not
-yet resumable: the terminal ledger receipt cannot record the refusal, so a
-later retry reports `already_complete` while the restored owner's derived
-analytics remain.
+both erasers, a retirement refused while re-erasing a restored primary cannot
+be recorded in the terminal ledger receipt, so a later retry for the absent
+participant checks for remaining owner-scoped analytics and completes
+retirement before reporting `already_complete`.
 
 The test project's live cleanup Job, `tibotattle-v12-synthetic-cleanup`, is
 built from `apps/worker/cloud-run/synthetic-v12-cleanup.mjs`, which calls the

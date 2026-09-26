@@ -369,6 +369,48 @@ test("PG17 social owner erasure keeps the participant erased when analytics reti
   assert.equal(done.outcome, "completed");
 }));
 
+test("PG17 social owner erasure completes a retirement refused while re-erasing a restored primary", {
+  skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => withHarness(async ({
+  primaryPool, ledgerPool, primarySchema, ledgerSchema, restoredSchema, erasePostgresSocialOwner,
+}) => {
+  const owner = await seedSocialOwner(primaryPool, primarySchema);
+  const provider = recordingStore();
+  const options = {
+    primaryPool, ledgerPool, objectStore: provider.store, participantId: owner.participantId,
+    identityLinkSecret: IDENTITY_SECRET, identityLinkSecretVersion: IDENTITY_VERSION,
+    schema: { primarySchema, ledgerSchema },
+  };
+  const restored = { ...options, schema: { primarySchema: restoredSchema, ledgerSchema } };
+  assert.deepEqual(await erasePostgresSocialOwner(options), { status: "complete", objectsDeleted: 1 });
+
+  // A pre-erasure backup restores the participant and its derived analytics.
+  await seedSocialOwner(primaryPool, restoredSchema, owner);
+  const unreviewed = `future_owner_family_${randomBytes(3).toString("hex")}`;
+  await primaryPool.query(`CREATE TABLE ${q(restoredSchema, unreviewed)} (owner_digest text NOT NULL)`);
+  assert.deepEqual(await erasePostgresSocialOwner(restored),
+    { status: "incomplete", code: "SOCIAL_OWNER_ERASURE_ANALYTICS_RETIREMENT_FAILED" });
+  assert.equal(await count(primaryPool, restoredSchema, "participants", "id=$1", [owner.participantId]), 0);
+  assert.equal(await count(primaryPool, restoredSchema, "analytics_owner_results", "owner_digest=$1", [owner.ownerDigest]), 1);
+  const receipt = async () => (await ledgerPool.query(
+    `SELECT outcome FROM ${q(ledgerSchema, "participant_erasure_receipts")}`)).rows[0].outcome;
+  assert.equal(await receipt(), "completed", "the terminal receipt is never downgraded");
+
+  await primaryPool.query(`DROP TABLE ${q(restoredSchema, unreviewed)}`);
+  assert.deepEqual(await erasePostgresSocialOwner(restored), { status: "already_complete", objectsDeleted: 1 });
+  assert.equal(await count(primaryPool, restoredSchema, "analytics_owner_results", "owner_digest=$1", [owner.ownerDigest]), 0,
+    "the retry retires analytics the terminal receipt could not track");
+  assert.equal(await count(primaryPool, restoredSchema, "analytics_owner_state",
+    "owner_digest=$1 AND state='erased'", [owner.ownerDigest]), 1);
+
+  // With no residue, a replay performs no retirement and leaves shared caches alone.
+  await primaryPool.query(`INSERT INTO ${q(restoredSchema, "preview_cache")} (id,payload) VALUES ('replay-cache','{}'::jsonb)`);
+  assert.deepEqual(await erasePostgresSocialOwner(restored), { status: "already_complete", objectsDeleted: 1 });
+  assert.equal(await count(primaryPool, restoredSchema, "preview_cache", "id='replay-cache'", []), 1);
+  assert.equal(await receipt(), "completed");
+}, { restored: true }));
+
 test("PG17 social owner erasure refuses to orphan an object registered after provider deletion", {
   skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
   timeout: 180_000,

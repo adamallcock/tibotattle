@@ -712,6 +712,36 @@ test("PG17 accountless erasure removes opt-out history markers across v1/v1.1/v1
     );
     assert.equal(stillCompleted.rows[0]?.outcome, "completed",
       "restore replay does not downgrade terminal ledger receipt authority");
+
+    // Re-erasing another restored copy while retirement refuses cannot record
+    // the refusal in the terminal receipt; the retry must still retire.
+    const restoredAgainSchema = `${restoredSchema}_again`;
+    assert.equal(await createSchema(restoredPool, restoredAgainSchema), primaryMigrationVersion);
+    schemas.push(restoredAgainSchema);
+    await seedAccountlessOwner(restoredPool, restoredAgainSchema, fixture);
+    const unreviewed = `future_owner_family_${randomBytes(3).toString("hex")}`;
+    await restoredPool.query(`CREATE TABLE ${q(restoredAgainSchema, unreviewed)} (owner_digest text NOT NULL)`);
+    const againOptions = {
+      ...options,
+      primaryPool: restoredPool,
+      schema: { primarySchema: restoredAgainSchema, ledgerSchema },
+    };
+    assert.deepEqual(await erasePostgresAccountlessOwner(againOptions), {
+      status: "incomplete", code: "ACCOUNTLESS_OWNER_ERASURE_ANALYTICS_RETIREMENT_FAILED",
+    });
+    assert.equal(await count(restoredPool, restoredAgainSchema, "participants", "id", fixture.participantId), 0);
+    assert.equal(await count(restoredPool, restoredAgainSchema, "analytics_owner_results", "owner_digest",
+      fixture.ownerDigest), 1);
+    await restoredPool.query(`DROP TABLE ${q(restoredAgainSchema, unreviewed)}`);
+    assert.deepEqual(await erasePostgresAccountlessOwner(againOptions),
+      { status: "already_complete", objectsDeleted: 6 });
+    assert.equal(await count(restoredPool, restoredAgainSchema, "analytics_owner_results", "owner_digest",
+      fixture.ownerDigest), 0, "the retry retires analytics the terminal receipt could not track");
+    assert.deepEqual(await analyticsStates(restoredPool, restoredAgainSchema, fixture.ownerDigest), ["erased"]);
+    const afterAgain = await ledgerPool.query(
+      `SELECT outcome FROM ${q(ledgerSchema, "participant_erasure_receipts")}`,
+    );
+    assert.equal(afterAgain.rows[0]?.outcome, "completed");
   } finally {
     if (vite) await vite.close();
     for (const schema of schemas.reverse()) {

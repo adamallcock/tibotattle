@@ -3,6 +3,7 @@ import {
   PostgresStorageError,
   quotePostgresIdentifier,
   withPostgresMutation,
+  withPostgresRead,
   type PostgresClient,
   type PostgresPool,
   type PostgresSchemaOptions,
@@ -58,6 +59,14 @@ const SOURCE_OWNER_TABLES = Object.freeze([
   "analytics_scheduler_delivery_cursors",
   "storage_ingestion_changes",
 ] as const);
+
+/** Owner-bearing relations that retirement keeps as proof or marks in place. */
+const RETAINED_OWNER_TABLES: ReadonlySet<string> = new Set([
+  "analytics_applied_events",
+  "analytics_owner_state",
+  "analytics_publication_invalidations",
+  "storage_ingestion_changes",
+]);
 
 export type PostgresAnalyticsOwnerRetirementCode =
   | "ANALYTICS_OWNER_RETIREMENT_TARGET_INVALID"
@@ -407,6 +416,52 @@ async function retainedCount(
 ): Promise<number> {
   const rows = parseRows<CountRow>(await client.query(sql, values));
   return parseCount(rows[0]?.count);
+}
+
+/**
+ * Read-only check for owner-scoped analytics that retirement would remove, or
+ * an owner state it would mark erased. Erasers use it where a terminal ledger
+ * receipt cannot record a later refusal, such as re-erasing a restored primary.
+ */
+export async function hasPostgresAnalyticsOwnerResidue(
+  options: RetirePostgresAnalyticsOwnerOptions,
+): Promise<boolean> {
+  if (options === null || typeof options !== "object"
+      || typeof options.ownerDigest !== "string" || !OWNER_DIGEST.test(options.ownerDigest)
+      || options.primaryPool === null || typeof options.primaryPool !== "object"
+      || typeof options.primaryPool.connect !== "function") {
+    fail("ANALYTICS_OWNER_RETIREMENT_TARGET_INVALID");
+  }
+  let config;
+  try {
+    config = createPostgresSchemaConfig(options.schema);
+  } catch {
+    fail("ANALYTICS_OWNER_RETIREMENT_TARGET_INVALID");
+  }
+  const schema = config.primarySchema;
+  const ownerDigest = options.ownerDigest;
+  const residueTables = SOURCE_OWNER_TABLES.filter((name) =>
+    !RETAINED_OWNER_TABLES.has(name));
+  try {
+    return await withPostgresRead(options.primaryPool, async (client) => {
+      const rows = parseRows<{ readonly residue: boolean }>(await client.query(
+        `SELECT EXISTS (SELECT 1 FROM ${table(schema, "analytics_owner_state")}
+                         WHERE owner_digest=$1 AND state <> 'erased')
+                ${residueTables.map((name) =>
+                  `OR EXISTS (SELECT 1 FROM ${table(schema, name)} WHERE owner_digest=$1)`).join("\n")}
+                AS residue`,
+        [ownerDigest],
+      ));
+      if (rows.length !== 1 || typeof rows[0]?.residue !== "boolean") {
+        fail("ANALYTICS_OWNER_RETIREMENT_READBACK_FAILED");
+      }
+      return rows[0].residue;
+    }, { ...TIMEOUTS, operation: "postgres.analytics_owner_retirement.residue" });
+  } catch (error) {
+    if (error instanceof PostgresAnalyticsOwnerRetirementError) throw error;
+    if (error instanceof PostgresStorageError) throw error;
+    fail("ANALYTICS_OWNER_RETIREMENT_READBACK_FAILED");
+  }
 }
 
 /**

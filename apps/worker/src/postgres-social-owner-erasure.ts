@@ -29,7 +29,10 @@ import {
   readPostgresSocialOwnerErasureObjectPage,
   type PostgresSocialOwnerErasureObjectCursor,
 } from "./postgres-social-owner-erasure-preflight";
-import { retirePostgresAnalyticsOwner } from "./postgres-analytics-owner-retirement";
+import {
+  hasPostgresAnalyticsOwnerResidue,
+  retirePostgresAnalyticsOwner,
+} from "./postgres-analytics-owner-retirement";
 
 const SOCIAL_PARTICIPANT = /^participant:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const DIGEST = /^[0-9a-f]{64}$/u;
@@ -603,6 +606,23 @@ async function verifyPrimaryCompletion(
   }
 }
 
+/** Residue left by a refused retirement that a terminal receipt could not record. */
+async function analyticsResidueRemains(
+  primaryPool: PostgresPool,
+  schema: PostgresSchemaConfig,
+  ownerDigest: string,
+): Promise<boolean> {
+  try {
+    return await hasPostgresAnalyticsOwnerResidue({
+      primaryPool,
+      ownerDigest,
+      schema: { primarySchema: schema.primarySchema, ledgerSchema: schema.ledgerSchema },
+    });
+  } catch {
+    fail("SOCIAL_OWNER_ERASURE_READBACK_FAILED");
+  }
+}
+
 /** Retirement is idempotent; a refusal leaves the eraser resumable. */
 async function retireOwnerAnalytics(
   primaryPool: PostgresPool,
@@ -704,6 +724,13 @@ export async function erasePostgresSocialOwner(
       await writeReceipt(options.ledgerPool, schemas.ledgerSchema, operationId, participantDigest,
         "completed", details(priorDetails.ownerDigest, "completed", priorDetails.objectCount,
           priorDetails.identityCooldownRecorded));
+    } else if (priorDetails.ownerDigest !== null
+        && await analyticsResidueRemains(options.primaryPool, schemas, priorDetails.ownerDigest)) {
+      // Re-erasing a restored primary cannot downgrade the terminal receipt,
+      // so a retirement refused then is completed on this retry instead.
+      if (!await retireOwnerAnalytics(options.primaryPool, schemas, priorDetails.ownerDigest)) {
+        return Object.freeze({ status: "incomplete", code: "SOCIAL_OWNER_ERASURE_ANALYTICS_RETIREMENT_FAILED" });
+      }
     }
     return Object.freeze({ status: "already_complete", objectsDeleted: priorDetails.objectCount });
   }
