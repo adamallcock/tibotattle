@@ -10,9 +10,12 @@ import test from "node:test";
  * proves no PostgreSQL module reads them either, so no read path can recreate
  * the treadmill. The tables themselves are kept: the erasure fences and
  * cleanup bounds still name them, and the legacy owner-retirement residue
- * sweep still clears two caches. Each remaining mention is listed below
- * exactly; an unlisted mention, a SQL reference where only an inventory entry
- * is allowed, or a stale entry fails.
+ * sweep still clears two caches. Each remaining mention is listed below with
+ * a ceiling. An unlisted mention, a SQL reference where only an inventory
+ * entry is allowed, or more mentions than the ceiling fails. The list only
+ * shrinks: fewer mentions (a later change retiring the residue sweep or an
+ * inventory entry) pass without editing this file and are reported as slack
+ * to trim.
  */
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -34,10 +37,11 @@ export const RETIRED_SHARED_NAMES = Object.freeze(["community_model_composition_
 const RETIRED_SEEDED_SINGLETONS = new Set(["current_queue_state", "preparation_counters"]);
 
 /**
- * Every remaining mention. An "inventory" entry names a table in an erasure
- * fence, a cleanup count bound or a transfer emptiness list. The only allowed
- * "reference" is the legacy owner-retirement residue sweep, which deletes and
- * counts the two shared caches; no queue may ever be referenced.
+ * Every remaining mention, with the most allowed. An "inventory" entry names a
+ * table in an erasure fence, a cleanup count bound or a transfer emptiness
+ * list. The only allowed "reference" is the legacy owner-retirement residue
+ * sweep, which deletes and counts the two shared caches; no queue may ever be
+ * referenced.
  */
 export const ALLOWED_MENTIONS = Object.freeze([
   ["src/postgres-accountless-owner-erasure.ts", "current_queue", "inventory", 1],
@@ -54,7 +58,7 @@ export const ALLOWED_MENTIONS = Object.freeze([
   ["scripts/postgres-analytics-applied-main-transfer.mjs", "community_model_composition_days", "inventory", 1],
   ["src/postgres-analytics-owner-retirement.ts", "preview_cache", "reference", 2],
   ["src/postgres-analytics-owner-retirement.ts", "community_model_composition_days", "reference", 2],
-].map(([file, table, kind, count]) => Object.freeze({ file, table, kind, count })));
+].map(([file, table, kind, max]) => Object.freeze({ file, table, kind, max })));
 
 const IDENTIFIER_LIST_LINE = /^\s*[a-z0-9_]+(?:\s+[a-z0-9_]+)*\s*$/u;
 const COUNT_BOUND_LINE = (table) => new RegExp(`^\\s*${table}:\\s*\\[\\d+,\\s*\\d+\\],?\\s*$`, "u");
@@ -99,9 +103,7 @@ export function findRetiredMentions(file, source) {
   return mentions;
 }
 
-/** Compare every mention with the allowlist; return human-readable violations. */
-export function retiredMentionViolations(sources, allowed = ALLOWED_MENTIONS) {
-  const violations = [];
+function countMentions(sources) {
   const actual = new Map();
   for (const [file, source] of sources) {
     for (const mention of findRetiredMentions(file, source)) {
@@ -109,23 +111,32 @@ export function retiredMentionViolations(sources, allowed = ALLOWED_MENTIONS) {
       actual.set(key, [...(actual.get(key) ?? []), mention.line]);
     }
   }
-  const expected = new Map(allowed.map(({ file, table, kind, count }) => [`${file}|${table}|${kind}`, count]));
-  for (const [key, lines] of actual) {
+  return actual;
+}
+
+/** Compare every mention with the allowlist ceilings; return human-readable violations. */
+export function retiredMentionViolations(sources, allowed = ALLOWED_MENTIONS) {
+  const violations = [];
+  const ceilings = new Map(allowed.map(({ file, table, kind, max }) => [`${file}|${table}|${kind}`, max]));
+  for (const [key, lines] of countMentions(sources)) {
     const [file, table, kind] = key.split("|");
-    const count = expected.get(key);
-    if (count === undefined) {
+    const max = ceilings.get(key);
+    if (max === undefined) {
       violations.push(`${file}:${lines.join(",")} ${kind} of retired ${table} is not allowed`);
-    } else if (count !== lines.length) {
-      violations.push(`${file}:${lines.join(",")} has ${lines.length} ${kind} mention(s) of ${table}, expected ${count}`);
-    }
-  }
-  for (const [key, count] of expected) {
-    if (!actual.has(key)) {
-      const [file, table, kind] = key.split("|");
-      violations.push(`stale allowlist entry: ${file} no longer has ${count} ${kind} mention(s) of ${table}`);
+    } else if (lines.length > max) {
+      violations.push(`${file}:${lines.join(",")} has ${lines.length} ${kind} mention(s) of ${table}, at most ${max} allowed`);
     }
   }
   return violations;
+}
+
+/** Allowlist entries above their current use: not failures, but room to trim. */
+export function retiredMentionSlack(sources, allowed = ALLOWED_MENTIONS) {
+  const actual = countMentions(sources);
+  return allowed.flatMap(({ file, table, kind, max }) => {
+    const used = actual.get(`${file}|${table}|${kind}`)?.length ?? 0;
+    return used < max ? [`${file} now has ${used} of ${max} allowed ${kind} mention(s) of ${table}; lower the ceiling`] : [];
+  });
 }
 
 async function collectSources() {
@@ -162,11 +173,15 @@ async function readRetirementMigration() {
   return found[0];
 }
 
-test("no PostgreSQL module reads the retired analytics queues, and only the residue sweep references the retired caches", async () => {
+test("no PostgreSQL module reads the retired analytics queues, and only the residue sweep references the retired caches", async (t) => {
   const sources = await collectSources();
   assert.ok(sources.size > 100, "the scan covers the Worker's source, script and Cloud Run modules");
-  for (const { file } of ALLOWED_MENTIONS) assert.ok(sources.has(file), `${file} is scanned`);
+  for (const directory of SCANNED_DIRECTORIES) {
+    assert.ok([...sources.keys()].filter((file) => file.startsWith(`${directory}/`)).length > 10,
+      `the scan walks ${directory}/`);
+  }
   assert.deepEqual(retiredMentionViolations(sources), []);
+  for (const slack of retiredMentionSlack(sources)) t.diagnostic(slack);
   for (const table of RETIRED_QUEUES) {
     assert.equal(ALLOWED_MENTIONS.some((entry) => entry.table === table && entry.kind !== "inventory"), false,
       `${table} may only be named by an inventory`);
@@ -190,11 +205,12 @@ test("the retired tables are the 0010 tables the retirement migration stops feed
   }
 });
 
-test("the scanner flags doctored sources: a SQL read, an unlisted inventory, a wrong count and a stale entry", () => {
+test("the scanner flags doctored sources: a SQL read, an unlisted inventory and a count above its ceiling; shrinkage is only slack", () => {
   const clean = new Map([
     ["src/postgres-owner-erasure.ts", "const ALLOWED = {\n  current_queue: [0, 1],\n};\n"],
   ]);
-  const allowed = [{ file: "src/postgres-owner-erasure.ts", table: "current_queue", kind: "inventory", count: 1 }];
+  const allowed = [{ file: "src/postgres-owner-erasure.ts", table: "current_queue", kind: "inventory", max: 1 }];
+  assert.deepEqual(retiredMentionSlack(clean, allowed), []);
   assert.deepEqual(retiredMentionViolations(clean, allowed), []);
 
   const read = new Map([...clean, ["src/postgres-community-reader.ts",
@@ -217,9 +233,21 @@ test("the scanner flags doctored sources: a SQL read, an unlisted inventory, a w
 
   const doubled = new Map([["src/postgres-owner-erasure.ts",
     "const A = {\n  current_queue: [0, 1],\n};\nconst B = {\n  current_queue: [0, 1],\n};\n"]]);
-  assert.match(retiredMentionViolations(doubled, allowed).join("\n"), /has 2 inventory mention\(s\) of current_queue, expected 1/u);
+  assert.match(retiredMentionViolations(doubled, allowed).join("\n"),
+    /has 2 inventory mention\(s\) of current_queue, at most 1 allowed/u);
 
-  assert.match(retiredMentionViolations(new Map(), allowed).join("\n"), /stale allowlist entry/u);
+  // A later change that removes the mention (or the whole file) passes and is reported as slack.
+  assert.deepEqual(retiredMentionViolations(new Map(), allowed), []);
+  assert.deepEqual(retiredMentionSlack(new Map(), allowed),
+    ["src/postgres-owner-erasure.ts now has 0 of 1 allowed inventory mention(s) of current_queue; lower the ceiling"]);
+  const sweep = [{ file: "src/postgres-analytics-owner-retirement.ts", table: "preview_cache", kind: "reference", max: 2 }];
+  const shrunkSweep = new Map([["src/postgres-analytics-owner-retirement.ts",
+    "const residue = await client.query(`SELECT count(*) FROM ${table(schema, \"preview_cache\")}`);\n"]]);
+  assert.deepEqual(retiredMentionViolations(shrunkSweep, sweep), []);
+  assert.equal(retiredMentionSlack(shrunkSweep, sweep).length, 1);
+  // Shrinking one kind never licenses another: a sweep reference is not an inventory entry.
+  assert.match(retiredMentionViolations(new Map([["src/postgres-analytics-owner-retirement.ts",
+    "const KEEP = new Set([\n  \"preview_cache\",\n]);\n"]]), sweep).join("\n"), /inventory of retired preview_cache is not allowed/u);
 
   // D1 modules share two projection names and are not PostgreSQL modules.
   const d1 = new Map([["src/community-model-history.ts",

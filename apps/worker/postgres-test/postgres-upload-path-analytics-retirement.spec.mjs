@@ -20,8 +20,9 @@ import {
  *
  * Seeds run on the chain before the retirement, as pre-existing state. The
  * write and lifecycle scenarios also run on that chain alone (the control,
- * which proves each fixture really drives the retired 0010 side effect, so
- * the retired assertions fail without the migration). Until the
+ * which proves the fixtures really drive every retired 0010 side effect the
+ * retired run asserts absent: the flag flip, each queue, the composition-day,
+ * dependency and preview-cache invalidations). Until the
  * staged-migration harness lands, the retirement SQL is applied after the
  * stock primary chain in one transaction under the runner's search path; once
  * the integrator promotes it under its assigned number the runner applies it
@@ -64,6 +65,14 @@ const RETIRED_FUNCTIONS = Object.freeze([
   "invalidate_model_history_v1_insert", "invalidate_model_history_v1_update",
   "invalidate_model_history_v1_delete", "prepared_source_discard", "preparation_progress_changed",
 ]);
+/** Everything the retirement adds to the catalog, and the only functions it replaces. */
+const ADDED_TRIGGERS = Object.freeze([
+  ...REFUSED_TABLES.map((table) => [table, "retired_analytics_refusal"]),
+  ["publication_state", "publication_policy_row_guard"],
+  ["publication_state", "publication_policy_row_no_truncate"],
+]);
+const ADDED_FUNCTIONS = Object.freeze(["refuse_retired_analytics_write", "publication_policy_row_guard"]);
+const REPLACED_FUNCTIONS = Object.freeze(["publication_mutated", "participant_input_state", "participant_projection_delete"]);
 const KEPT_TRIGGERS = Object.freeze([
   ["mutation_control", "publication_mutated"],
   ["telemetry_v1_chunks", "aa_analytical_insert"],
@@ -437,6 +446,10 @@ async function retiredState(pool, t) {
       FROM ${t("preparation_counters")} counter`),
     compositionDays: await rows(pool, `SELECT day::text AS day,payload_json,computed_at::text AS computed_at,
       history_method_version FROM ${t("community_model_composition_days")} ORDER BY day`),
+    historyDependencies: await rows(pool, `SELECT participant_id,day::text AS day,
+      dependency_revision::int AS dependency_revision,input_fingerprint,
+      verified_input_revision::text AS verified_input_revision
+      FROM ${t("community_model_history_dependencies")} ORDER BY participant_id,day`),
   };
 }
 
@@ -466,7 +479,10 @@ async function queueRow(pool, t, participantId) {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 1: the four upload-path writes named by the acceptance test.
+// Scenario 1: the four upload-path writes named by the acceptance test, with
+// the social v1 upload taken both ways 0010 distinguishes: an accepted append
+// (which 0010 treated as preserving) and a second device's upload to a day
+// the owner already has accepted records for (which 0010 did not).
 
 const OWNERS = Object.freeze({
   v1: "synthetic-iso1-v1-owner",
@@ -475,18 +491,24 @@ const OWNERS = Object.freeze({
   v02: "synthetic-iso1-v02-owner",
 });
 const V12_DEVICE = "synthetic-iso1-v12-owner-device";
+/** Method-bound composition days before, inside and next to the v1 upload's 100-day window. */
+const COMPOSITION_DAYS = Object.freeze([
+  ["2026-09-23", "synthetic-method"],
+  ["2026-09-24", "synthetic-method"],
+  ["2026-09-25", null],
+]);
 
 /**
  * Pre-existing state, created before the retirement migration: the four
- * owners, one idle queue row each, both refresh lanes complete, an unrelated
- * daily rebuild request and one preview cache row.
+ * owners (the v1 owner with two devices), one idle queue row each, both
+ * refresh lanes complete, an unrelated daily rebuild request, one preview
+ * cache row, composition days around the upload day and a verified history
+ * dependency of the v1 owner on the upload day.
  */
 async function seedUploadOwners({ pool, t }) {
-  const devices = {
-    v1: (await createSocialOwner(pool, t, OWNERS.v1))[0],
-    v11: (await createSocialOwner(pool, t, OWNERS.v11))[0],
-    v02: (await createSocialOwner(pool, t, OWNERS.v02))[0],
-  };
+  await createSocialOwner(pool, t, OWNERS.v1, 2);
+  await createSocialOwner(pool, t, OWNERS.v11);
+  await createSocialOwner(pool, t, OWNERS.v02);
   await createV12Owner(pool, t, OWNERS.v12, V12_DEVICE);
   for (const participantId of Object.values(OWNERS)) {
     await pool.query(`INSERT INTO ${t("current_queue")} (participant_id,dirty_generation,window_generation,pending,
@@ -497,16 +519,24 @@ async function seedUploadOwners({ pool, t }) {
   await pool.query(`INSERT INTO ${t("daily_rebuilds")} (day,requested_epoch,requested_at)
     VALUES ('2026-09-01',0,'2026-09-20T00:00:00Z')`);
   await pool.query(`INSERT INTO ${t("preview_cache")} (id,payload) VALUES ('synthetic-iso1-preview','{"synthetic":true}'::jsonb)`);
-  return devices;
+  for (const [day, method] of COMPOSITION_DAYS) {
+    await pool.query(`INSERT INTO ${t("community_model_composition_days")} (day,payload_json,computed_at,history_method_version)
+      VALUES ($1::date,'{}','2026-09-20T00:00:00Z',$2)`, [day, method]);
+  }
+  await pool.query(`INSERT INTO ${t("community_model_history_dependencies")} (
+      participant_id,day,from_day,dependency_revision,input_fingerprint,verified_input_revision
+    ) VALUES ($1,$2::date,$2::date - 100,0,$3,0)`, [OWNERS.v1, DAY, digest("synthetic-iso1-dependency")]);
 }
 
 const V1_DEVICE = `${OWNERS.v1}-device-0`;
+const V1_SECOND_DEVICE = `${OWNERS.v1}-device-1`;
 const V11_DEVICE = `${OWNERS.v11}-device-0`;
 
-/** Run the four writes, returning each write's state before and after. */
+/** Run the writes in order, returning each write's state before and after. */
 async function runUploadFlows({ pool, schema, t, modules }) {
   const flows = [
     ["social v1 upload", OWNERS.v1, () => socialV1Upload(pool, schema, t, OWNERS.v1, V1_DEVICE)],
+    ["second-device social v1 upload", OWNERS.v1, () => socialV1Upload(pool, schema, t, OWNERS.v1, V1_SECOND_DEVICE)],
     ["v1.1 head change", OWNERS.v11, () => v11HeadChange(pool, t, OWNERS.v11, V11_DEVICE)],
     ["v1.2 activation", OWNERS.v12, () => v12Activation(pool, schema, t, modules, OWNERS.v12, V12_DEVICE)],
     ["v0.2 contribution", OWNERS.v02, () => v02Contribution(pool, t, OWNERS.v02)],
@@ -533,10 +563,11 @@ async function runUploadFlows({ pool, schema, t, modules }) {
   return observations;
 }
 
-test("PG17 control: before the retirement the four upload-path writes flip publication_state and feed the retired queues", {
+test("PG17 control: before the retirement every write feeds current_queue, and the social v1 uploads flip publication_state, queue rebuild work, invalidate history and composition days, and wipe preview_cache", {
   skip: SKIP, timeout: 240_000,
 }, async () => withSchema({ retire: false, seed: seedUploadOwners, domain: true }, async (context) => {
-  const [v1, v11, v12, v02] = await runUploadFlows(context);
+  const [v1, v1Second, v11, v12, v02] = await runUploadFlows(context);
+  // The accepted append.
   assert.equal(v1.before.retired.publicationState[0].publication_state, "ready");
   assert.equal(v1.after.retired.publicationState[0].publication_state, "updating",
     "0010 flips the shared publication flag on a social v1 upload");
@@ -544,7 +575,30 @@ test("PG17 control: before the retirement the four upload-path writes flip publi
     "0010 queues a daily rebuild for the uploaded day");
   assert.deepEqual(v1.after.retired.refreshLanes.find(({ lane }) => lane === "current"),
     { lane: "current", state: "queued", completed_at: null, restart_reason: "input_changed" });
-  for (const observation of [v1, v11, v12, v02]) {
+  assert.deepEqual(v1.before.retired.compositionDays.map(({ day }) => day), COMPOSITION_DAYS.map(([day]) => day));
+  assert.deepEqual(v1.after.retired.compositionDays.map(({ day }) => day), ["2026-09-23", "2026-09-25"],
+    "0010 deletes the method-bound composition days in the upload's window");
+  assert.deepEqual(v1.after.retired.historyDependencies, [{
+    participant_id: OWNERS.v1, day: DAY, dependency_revision: 1, input_fingerprint: null, verified_input_revision: null,
+  }], "0010 invalidates the owner's history dependency on the uploaded day");
+  assert.deepEqual(v1.after.retired.previewCache, v1.before.retired.previewCache,
+    "an accepted append kept the preview cache even under 0010");
+  assert.equal(v1.after.control.graph_append_epoch, v1.after.control.mutation_epoch);
+  // The second device's upload to the same day is not an accepted append.
+  assert.equal(v1Second.after.control.graph_append_epoch, -1);
+  assert.equal(v1Second.after.control.graph_invalidation_epoch, v1Second.after.control.mutation_epoch);
+  assert.equal(v1Second.before.retired.previewCache.length, 1);
+  assert.deepEqual(v1Second.after.retired.previewCache, [],
+    "0010 wipes the shared preview cache on an upload that is not an accepted append");
+  assert.ok(v1Second.after.retired.historyDependencies[0].dependency_revision
+    > v1Second.before.retired.historyDependencies[0].dependency_revision);
+  // 0010 moved mutation_epoch (and so the flag and the cache) only for v1
+  // chunks; the other three writes' retired effect was the queue.
+  for (const observation of [v11, v12, v02]) {
+    assert.deepEqual(observation.after.control, observation.before.control,
+      `0010 left the publication flag and caches alone on a ${observation.label}`);
+  }
+  for (const observation of [v1, v1Second, v11, v12, v02]) {
     assert.ok(observation.after.queue.dirty_generation > observation.before.queue.dirty_generation,
       `0010 marks the ${observation.label} owner dirty in current_queue`);
     assert.equal(observation.after.queue.pending, true);
@@ -552,7 +606,7 @@ test("PG17 control: before the retirement the four upload-path writes flip publi
   }
 }));
 
-test("PG17 once retired, a social v1 upload, a v1.1 head change, a v1.2 activation and a v0.2 contribution leave publication_state, preview_cache, current_queue, refresh_lanes and daily_rebuilds untouched", {
+test("PG17 once retired, social v1 uploads, a v1.1 head change, a v1.2 activation and a v0.2 contribution leave publication_state, preview_cache, current_queue, refresh_lanes and daily_rebuilds untouched", {
   skip: SKIP, timeout: 240_000,
 }, async () => withSchema({ retire: "head", seed: seedUploadOwners, domain: true }, async (context) => {
   const { pool, t } = context;
@@ -562,14 +616,17 @@ test("PG17 once retired, a social v1 upload, a v1.1 head change, a v1.2 activati
     assert.ok(after.revision > before.revision, `${label} still advances the owner's input revision`);
     assert.notEqual(after.digest, before.digest, `${label} still extends the owner's source digest chain`);
   }
-  const [v1] = observations;
+  const [v1, v1Second] = observations;
   assert.equal(v1.before.retired.publicationState[0].publication_state, "ready");
   assert.deepEqual(v1.before.retired.previewCache, [{ id: "synthetic-iso1-preview", payload: '{"synthetic": true}' }]);
   assert.equal(v1.before.retired.currentQueue.length, 4);
   assert.equal(v1.before.retired.refreshLanes.length, 2);
   assert.equal(v1.before.retired.dailyRebuilds.length, 1);
-  // The kept authority counters: an accepted append advances mutation_epoch
-  // and graph_append_epoch and preserves the invalidation epoch.
+  assert.equal(v1.before.retired.compositionDays.length, COMPOSITION_DAYS.length);
+  assert.equal(v1.before.retired.historyDependencies.length, 1);
+  // The kept mutation_control counters: an accepted append advances
+  // mutation_epoch and graph_append_epoch and preserves the invalidation
+  // epoch; any other upload advances the invalidation epoch as well.
   assert.deepEqual(v1.after.control, {
     mutation_epoch: v1.before.control.mutation_epoch + 1,
     graph_append_epoch: v1.before.control.mutation_epoch + 1,
@@ -578,12 +635,23 @@ test("PG17 once retired, a social v1 upload, a v1.1 head change, a v1.2 activati
     graph_last_change_reason: "accepted-append",
     changed: true,
   });
-  const fitRows = await rows(pool, `SELECT participant_id,resets_at::text AS resets_at FROM ${t("telemetry_v1_quota_fit_rows")}`);
-  assert.deepEqual(fitRows, [{ participant_id: OWNERS.v1, resets_at: "2026-09-30 00:00:00+00" }],
-    "the quota-fit index still follows the upload");
+  assert.deepEqual(v1Second.after.control, {
+    mutation_epoch: v1Second.before.control.mutation_epoch + 1,
+    graph_append_epoch: -1,
+    graph_invalidation_epoch: v1Second.before.control.mutation_epoch + 1,
+    graph_append_reason: "accepted-append",
+    graph_last_change_reason: "authority-or-unrecognized-change",
+    changed: true,
+  });
+  const fitRows = await rows(pool, `SELECT participant_id,resets_at::text AS resets_at
+    FROM ${t("telemetry_v1_quota_fit_rows")} ORDER BY record_id`);
+  assert.deepEqual(fitRows, [
+    { participant_id: OWNERS.v1, resets_at: "2026-09-30 00:00:00+00" },
+    { participant_id: OWNERS.v1, resets_at: "2026-09-30 00:00:00+00" },
+  ], "the quota-fit index still follows both uploads");
 }));
 
-test("PG17 the four writes move the kept authority counters identically with and without the retirement", {
+test("PG17 the writes move the kept mutation_control counters identically with and without the retirement", {
   skip: SKIP, timeout: 300_000,
 }, async () => {
   const deltas = async (retire) => withSchema({ retire, seed: seedUploadOwners, domain: true }, async (context) => {
@@ -598,7 +666,16 @@ test("PG17 the four writes move the kept authority counters identically with and
       changeReason: after.control.graph_last_change_reason,
     }));
   });
-  assert.deepEqual(await deltas("isolated"), await deltas(false));
+  const retired = await deltas("isolated");
+  assert.deepEqual(retired.map(({ label, appendEpochFollows }) => [label, appendEpochFollows]), [
+    ["social v1 upload", true],
+    ["second-device social v1 upload", false],
+    ["v1.1 head change", false],
+    ["v1.2 activation", false],
+    ["v0.2 contribution", false],
+  ]);
+  assert.ok(retired[1].invalidationEpoch > 0, "the second-device upload advances the invalidation epoch");
+  assert.deepEqual(retired, await deltas(false));
 });
 
 // ---------------------------------------------------------------------------
@@ -675,7 +752,11 @@ test("PG17 once retired, participant withdrawal and deletion keep owner-scoped e
   assert.deepEqual(deleted.retired.currentQueue.map(({ participant_id: id }) => id), [BYSTANDER],
     "the owner's retired queue row cascades with the participant");
   assert.deepEqual(deleted.retired.preparedSourceDays, [], "the owner's prepared-source rows are removed");
-  // Authority changes still advance mutation_epoch and the invalidation epoch.
+  // The kept mutation_control counters still advance and invalidate. No
+  // PostgreSQL module reads them, and with the policy flag retired the claim
+  // no longer hides published days: withdrawal reaches readers only through
+  // the owner journal's terminal events.
+  assert.equal(withdrawn.retired.publicationState[0].publication_state, "ready");
   for (const [previous, next] of [[start, withdrawn], [withdrawn, deleted]]) {
     assert.equal(next.control.mutation_epoch, previous.control.mutation_epoch + 1);
     assert.equal(next.control.graph_invalidation_epoch, next.control.mutation_epoch);
@@ -701,7 +782,7 @@ test("PG17 the retirement sets the policy row ready once, pins it, and refuses r
       "the migration sets ready once and keeps policy_revision");
 
     const refused = async (sql, values = []) => assert.rejects(pool.query(sql, values),
-      (error) => error?.code === "P1005" && /^(retired_analytics_write_refused|publication_policy_row_immutable)$/u.test(error.message));
+      (error) => error?.code === "P1005" && error.message === "publication_policy_row_immutable");
     const refusal = "retired_analytics_write_refused";
     const refusals = [
       ["current_queue", `INSERT INTO ${t("current_queue")} VALUES ($1,1,1,true,0)`, ["synthetic-iso1-refusal-owner"]],
@@ -719,8 +800,11 @@ test("PG17 the retirement sets the policy row ready once, pins it, and refuses r
     await refused(`UPDATE ${t("publication_state")} SET publication_state='updating' WHERE singleton=1`);
     await refused(`UPDATE ${t("publication_state")} SET policy_revision=2 WHERE singleton=1`);
     await refused(`DELETE FROM ${t("publication_state")} WHERE singleton=1`);
+    await refused(`TRUNCATE ${t("publication_state")}`);
     await refused(`INSERT INTO ${t("publication_state")} (singleton,publication_state,changed_at,policy_revision)
       VALUES (1,'ready',clock_timestamp(),9) ON CONFLICT (singleton) DO NOTHING`);
+    assert.deepEqual(await rows(pool, `SELECT singleton FROM ${t("publication_state")}`), [{ singleton: 1 }],
+      "the policy singleton survives every refused removal");
     // The policy revision may still advance, and a ready no-op stays valid.
     await pool.query(`UPDATE ${t("publication_state")} SET policy_revision=4,changed_at=clock_timestamp() WHERE singleton=1`);
     await pool.query(`UPDATE ${t("publication_state")} SET publication_state='ready',policy_revision=4 WHERE singleton=1`);
@@ -815,42 +899,85 @@ test("PG17 the retirement keeps the quota-fit, transport-floor and reconciliatio
 // ---------------------------------------------------------------------------
 // Scenario 5: the catalog.
 
-test("PG17 the retirement drops exactly the retired triggers and functions and keeps the rest", {
-  skip: SKIP, timeout: 120_000,
-}, async () => withSchema({ retire: "head" }, async ({ pool, schema }) => {
-  const triggers = new Set((await rows(pool, `SELECT relation.relname || '/' || trigger_row.tgname AS name
+/** Every non-internal trigger, function and table in the schema, with definitions. */
+async function catalog(pool, schema) {
+  const triggers = new Map((await rows(pool, `SELECT relation.relname || '/' || trigger_row.tgname AS name,
+      pg_get_triggerdef(trigger_row.oid) AS definition
       FROM pg_trigger trigger_row
       JOIN pg_class relation ON relation.oid=trigger_row.tgrelid
       JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
-     WHERE namespace.nspname=$1 AND NOT trigger_row.tgisinternal`, [schema])).map(({ name }) => name));
-  for (const [table, name] of RETIRED_TRIGGERS) assert.equal(triggers.has(`${table}/${name}`), false, `${name} is dropped`);
-  for (const [table, name] of KEPT_TRIGGERS) assert.equal(triggers.has(`${table}/${name}`), true, `${name} is kept`);
-  for (const table of REFUSED_TABLES) {
-    assert.equal(triggers.has(`${table}/retired_analytics_refusal`), true, `${table} refuses inserts`);
-  }
-  assert.equal(triggers.has("publication_state/publication_policy_row_guard"), true);
-  for (const table of ["preview_cache", "community_model_composition_days", "current_queue_state", "preparation_counters"]) {
-    assert.equal([...triggers].some((name) => name.startsWith(`${table}/`)), false,
-      `${table} keeps no trigger (retirement residue and seeded singletons)`);
-  }
-  const functions = await rows(pool, `SELECT proc.proname AS name, pg_get_functiondef(proc.oid) AS definition
+     WHERE namespace.nspname=$1 AND NOT trigger_row.tgisinternal`, [schema]))
+    .map(({ name, definition }) => [name, definition]));
+  const functions = new Map((await rows(pool, `SELECT proc.proname || '(' || pg_get_function_identity_arguments(proc.oid) || ')' AS name,
+      CASE WHEN proc.prokind IN ('f','p') THEN pg_get_functiondef(proc.oid) ELSE proc.prokind::text END AS definition
       FROM pg_proc proc JOIN pg_namespace namespace ON namespace.oid=proc.pronamespace
-     WHERE namespace.nspname=$1`, [schema]);
-  const byName = new Map(functions.map(({ name, definition }) => [name, definition]));
-  for (const name of RETIRED_FUNCTIONS) assert.equal(byName.has(name), false, `${name}() is dropped`);
-  for (const name of ["publication_mutated", "participant_input_state", "participant_projection_delete"]) {
-    const body = byName.get(name);
-    assert.ok(body, `${name}() is kept`);
+     WHERE namespace.nspname=$1`, [schema]))
+    .map(({ name, definition }) => [name, definition]));
+  const tables = (await rows(pool, `SELECT tablename FROM pg_tables WHERE schemaname=$1 ORDER BY tablename`, [schema]))
+    .map(({ tablename }) => tablename);
+  return { triggers, functions, tables };
+}
+
+const sorted = (values) => [...values].sort();
+const triggerName = ([table, name]) => `${table}/${name}`;
+const functionName = (name) => `${name}()`;
+
+test("PG17 the retirement alone drops exactly the retired triggers and functions, adds only its refusals and policy guard, and rewrites only three functions", {
+  skip: SKIP, timeout: 120_000,
+}, async () => {
+  let before;
+  await withSchema({
+    retire: "isolated",
+    seed: async ({ pool, schema }) => { before = await catalog(pool, schema); },
+  }, async ({ pool, schema }) => {
+    const after = await catalog(pool, schema);
+    const retiredTriggers = new Set(RETIRED_TRIGGERS.map(triggerName));
+    for (const name of retiredTriggers) assert.equal(before.triggers.has(name), true, `${name} exists before the retirement`);
+    assert.deepEqual(sorted(after.triggers.keys()), sorted([
+      ...[...before.triggers.keys()].filter((name) => !retiredTriggers.has(name)),
+      ...ADDED_TRIGGERS.map(triggerName),
+    ]), "the retirement drops exactly the retired triggers and adds only its own");
+    for (const [name, definition] of before.triggers) {
+      if (!retiredTriggers.has(name)) assert.equal(after.triggers.get(name), definition, `${name} is kept unchanged`);
+    }
+    for (const trigger of KEPT_TRIGGERS) assert.equal(after.triggers.has(triggerName(trigger)), true);
+
+    const retiredFunctions = new Set(RETIRED_FUNCTIONS.map(functionName));
+    for (const name of retiredFunctions) assert.equal(before.functions.has(name), true, `${name} exists before the retirement`);
+    assert.deepEqual(sorted(after.functions.keys()), sorted([
+      ...[...before.functions.keys()].filter((name) => !retiredFunctions.has(name)),
+      ...ADDED_FUNCTIONS.map(functionName),
+    ]), "the retirement drops exactly the retired functions and adds only its own");
+    const replaced = new Set(REPLACED_FUNCTIONS.map(functionName));
+    for (const [name, definition] of before.functions) {
+      if (retiredFunctions.has(name)) continue;
+      if (replaced.has(name)) {
+        assert.notEqual(after.functions.get(name), definition, `${name} is replaced`);
+      } else {
+        assert.equal(after.functions.get(name), definition, `${name} is kept unchanged`);
+      }
+    }
+    assert.deepEqual(after.tables, before.tables, "every table is kept: the erasure inventories still list them");
+  });
+});
+
+test("PG17 at the head of the chain the retired triggers and functions stay dropped, the refusals and policy guard stay, and no kept function writes retired state", {
+  skip: SKIP, timeout: 120_000,
+}, async () => withSchema({ retire: "head" }, async ({ pool, schema }) => {
+  const { triggers, functions } = await catalog(pool, schema);
+  for (const trigger of RETIRED_TRIGGERS) {
+    assert.equal(triggers.has(triggerName(trigger)), false, `${triggerName(trigger)} stays dropped`);
+  }
+  for (const name of RETIRED_FUNCTIONS) assert.equal(functions.has(functionName(name)), false, `${name}() stays dropped`);
+  for (const trigger of ADDED_TRIGGERS) {
+    assert.equal(triggers.has(triggerName(trigger)), true, `${triggerName(trigger)} is in place`);
+  }
+  for (const name of REPLACED_FUNCTIONS) {
+    const body = functions.get(functionName(name));
+    if (body === undefined) continue;
     assert.doesNotMatch(body, /\b(?:publication_state|preview_cache|community_model_composition_days|current_queue|refresh_lanes|daily_rebuilds)\b/u,
       `${name}() writes no retired publication, cache or queue state`);
   }
-  assert.match(byName.get("publication_mutated"), /graph_invalidation_epoch/u);
-  // Every table is kept: the erasure inventories still list them.
-  const tables = new Set((await rows(pool, `SELECT tablename FROM pg_tables WHERE schemaname=$1`, [schema]))
-    .map(({ tablename }) => tablename));
-  for (const table of ["publication_state", "preview_cache", "current_queue", "current_queue_state", "refresh_lanes",
-    "daily_rebuilds", "prepared_source_days", "preparation_counters", "community_model_composition_days",
-    "community_model_history_dependencies", "graph_scope", "mutation_control", "input_versions"]) {
-    assert.equal(tables.has(table), true, `${table} is kept`);
-  }
+  const publicationMutated = functions.get(functionName("publication_mutated"));
+  if (publicationMutated !== undefined) assert.match(publicationMutated, /graph_invalidation_epoch/u);
 }));

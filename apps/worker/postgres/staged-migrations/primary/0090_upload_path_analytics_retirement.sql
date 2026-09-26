@@ -25,14 +25,23 @@
 --     state and delete triggers.
 --
 -- Kept unchanged: aa_analytical_* and begin_graph_scope (the mutation_epoch
--- and graph_append_epoch bumps that community publication authority pins),
--- the graph_last_change_* and graph_invalidation_epoch metadata, the
+-- and graph_append_epoch counters, D1's analytical epochs), the
+-- graph_last_change_* and graph_invalidation_epoch metadata, the
 -- input_versions and input_source_digests revision chain and its journal
 -- emitter, participant_input_created, participant_withdrawal, the quota-fit
 -- index triggers, the v1 transport-floor guard and the reconciliation guard.
+-- No PostgreSQL module reads the mutation_control counters today; they are
+-- kept so the epochs stay continuous for a later reader.
 --
 -- publication_state is set to 'ready' once and from then on is only the
 -- policy row carrying policy_revision; nothing on the upload path writes it.
+-- Consequence for withdrawal: participant_withdrawal still advances
+-- mutation_epoch when a social owner is claimed for erasure, but that no
+-- longer changes the policy flag, so nothing on PostgreSQL hides an already
+-- published graph or cohort at claim time. Readers see a withdrawal only
+-- through the owner journal's terminal events (owner-withdrawn, owner-erased)
+-- and publication invalidations, so any public read of those publications
+-- must not ship before the participant-to-journal withdrawal trigger does.
 --
 -- Every RAISE carries a constant message and ERRCODE; no value is
 -- interpolated. The migration drops triggers and functions only; no row of
@@ -105,9 +114,13 @@ DROP FUNCTION preparation_progress_changed();
 -- source progress rows. Existing rows are kept for the erasure inventories
 -- and cascade with their participant. The seeded singletons
 -- (current_queue_state, preparation_counters) are already unique.
--- preview_cache and community_model_composition_days are not refused here:
--- the owner-retirement residue sweep and its PostgreSQL specs still own
--- them, and no upload-path writer remains (the grep check covers readers).
+-- preview_cache and community_model_composition_days (D1 isolation 0001
+-- refuses the latter) are NOT refused yet, and that refusal is owed: the
+-- owner-retirement residue sweep still deletes and counts both caches, and
+-- its specs (analytics owner retirement, social owner erasure) insert cache
+-- rows after migrating. Add the same refusal to both tables together with
+-- the removal of that sweep, before any writer could leave derived rows that
+-- an owner erasure no longer clears. No upload-path writer remains here.
 CREATE FUNCTION refuse_retired_analytics_write() RETURNS trigger
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
@@ -125,8 +138,9 @@ CREATE TRIGGER retired_analytics_refusal BEFORE INSERT ON prepared_source_days
 FOR EACH ROW EXECUTE FUNCTION refuse_retired_analytics_write();
 
 -- (5) publication_state becomes the policy row. Set it to 'ready' once; from
--- here on the flag stays 'ready', the row stays the singleton and
--- policy_revision never decreases. A missing row fails the migration.
+-- here on the flag stays 'ready', the row stays the singleton (no INSERT,
+-- DELETE or TRUNCATE) and policy_revision never decreases. A missing row
+-- fails the migration.
 DO $$
 BEGIN
   IF (SELECT count(*) FROM publication_state WHERE singleton = 1) <> 1 THEN
@@ -142,8 +156,12 @@ UPDATE publication_state
 CREATE FUNCTION publication_policy_row_guard() RETURNS trigger
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
-  IF TG_OP <> 'UPDATE'
-      OR NEW.singleton IS DISTINCT FROM OLD.singleton
+  -- INSERT, DELETE (row level) and TRUNCATE (statement level) never reach
+  -- the row comparison below.
+  IF TG_OP <> 'UPDATE' THEN
+    RAISE EXCEPTION 'publication_policy_row_immutable' USING ERRCODE = 'P1005';
+  END IF;
+  IF NEW.singleton IS DISTINCT FROM OLD.singleton
       OR NEW.publication_state IS DISTINCT FROM 'ready'
       OR NEW.policy_revision < OLD.policy_revision THEN
     RAISE EXCEPTION 'publication_policy_row_immutable' USING ERRCODE = 'P1005';
@@ -155,3 +173,9 @@ $$;
 CREATE TRIGGER publication_policy_row_guard
 BEFORE INSERT OR UPDATE OR DELETE ON publication_state
 FOR EACH ROW EXECUTE FUNCTION publication_policy_row_guard();
+
+-- Row triggers do not fire on TRUNCATE; without this the singleton could be
+-- emptied and never restored, since the row guard refuses every INSERT.
+CREATE TRIGGER publication_policy_row_no_truncate
+BEFORE TRUNCATE ON publication_state
+FOR EACH STATEMENT EXECUTE FUNCTION publication_policy_row_guard();
