@@ -36,7 +36,7 @@ const vite = await createServer({
 });
 let canonical;
 try {
-  const [storage, crypto, identityLink, gcs, postgresClient, apple, rateLimiter] = await Promise.all([
+  const [storage, crypto, identityLink, gcs, postgresClient, apple, rateLimiter, publication] = await Promise.all([
     vite.ssrLoadModule("/src/telemetry-storage-mode.ts"),
     vite.ssrLoadModule("/src/crypto.ts"),
     vite.ssrLoadModule("/src/identity-link-configuration.ts"),
@@ -44,8 +44,9 @@ try {
     vite.ssrLoadModule("/src/postgres-client.ts"),
     vite.ssrLoadModule("/src/identity-apple.ts"),
     vite.ssrLoadModule("/src/postgres-rate-limiter.ts"),
+    vite.ssrLoadModule("/src/storage-publication-worker.ts"),
   ]);
-  canonical = { storage, crypto, identityLink, gcs, postgresClient, apple, rateLimiter };
+  canonical = { storage, crypto, identityLink, gcs, postgresClient, apple, rateLimiter, publication };
 } finally {
   await vite.close();
 }
@@ -205,14 +206,31 @@ function limiter() {
   return Object.freeze({ async limit() { return { success: true }; } });
 }
 
-function serviceBindings() {
-  return Object.fromEntries(configuration.PRODUCTION_WORKER_BINDING_NAMES.map((name) => [
-    name,
-    name === "UPLOAD_INGRESS_BUDGET" ? Object.freeze({ getByName() { return {}; } }) : limiter(),
-  ]));
+/** An origin-tier limiter exposing its limits as PostgresRateLimiter does. */
+function originLimiter(limitValue, periodSeconds) {
+  return Object.freeze({ limitValue, periodSeconds, async limit() { return { success: true }; } });
+}
+
+/** The nine service bindings, origin-tier limiters built with the given plane's limits. */
+function serviceBindings(originTier = configuration.ORIGIN_TIER_RATE_LIMITS) {
+  const origin = new Map(Object.values(originTier).map((limits) => [limits.binding, limits]));
+  return Object.fromEntries(configuration.PRODUCTION_WORKER_BINDING_NAMES.map((name) => {
+    if (name === "UPLOAD_INGRESS_BUDGET") return [name, Object.freeze({ getByName() { return {}; } })];
+    const limits = origin.get(name);
+    return [name, limits === undefined ? limiter() : originLimiter(limits.limit, limits.periodSeconds)];
+  }));
 }
 
 const LEAK_MARKERS = Object.freeze([...Object.values(SECRET_VALUES), PRIVATE_EXPONENT]);
+
+// The refused variables, listed here independently of the module. Each one's
+// code is `${name}_FORBIDDEN`.
+const FORBIDDEN_VARIABLE_NAMES = Object.freeze([
+  "ACCESS_TEST_JWKS_JSON", "ADMIN_OWNER_FIXTURE_JSON", "ADMIN_OWNER_PREVIOUS_FIXTURE_JSON",
+  "DISTRIBUTION_ANALYTICS_API_TOKEN",
+  "EDGE_CLIENT_KEY_SECRET", "EDGE_INVOKER_KEY_JSON", "EDGE_PROOF_SECRET", "EDGE_PROOF_SHA256",
+  "IDENTITY_TEST_JWKS_JSON", "POSTGRES_TEST_HTTP_MODE", "SPARKLE_APPCAST_GUARD_TOKEN",
+]);
 
 // Every D1, R2 and asset binding and every test or development seam the
 // Worker reads, listed here independently of the module under test.
@@ -385,13 +403,10 @@ test("exports the frozen production constants", () => {
     const { required, optional } = configuration.PRODUCTION_PROFILE_SECRET_NAMES[profile];
     assert.deepEqual([...required, ...optional], JOB_SECRET_NAMES[profile], profile);
   }
-  // Pinned independently of the module, so dropping an entry fails here.
-  assert.deepEqual(Object.keys(configuration.PRODUCTION_FORBIDDEN_VARIABLES).sort(), [
-    "ACCESS_TEST_JWKS_JSON", "ADMIN_OWNER_FIXTURE_JSON", "ADMIN_OWNER_PREVIOUS_FIXTURE_JSON",
-    "DISTRIBUTION_ANALYTICS_API_TOKEN",
-    "EDGE_CLIENT_KEY_SECRET", "EDGE_INVOKER_KEY_JSON", "EDGE_PROOF_SECRET", "EDGE_PROOF_SHA256",
-    "IDENTITY_TEST_JWKS_JSON", "POSTGRES_TEST_HTTP_MODE", "SPARKLE_APPCAST_GUARD_TOKEN",
-  ]);
+  // Pinned independently of the module, so dropping or relabelling an entry fails here.
+  assert.deepEqual(configuration.PRODUCTION_FORBIDDEN_VARIABLES, Object.fromEntries(
+    FORBIDDEN_VARIABLE_NAMES.map((name) => [name, `${name}_FORBIDDEN`]),
+  ));
   assert.deepEqual(configuration.PRODUCTION_FORBIDDEN_VARIABLE_PREFIXES, {
     HOST_RATE_LIMIT_: "HOST_RATE_LIMIT_OVERRIDE_FORBIDDEN",
   });
@@ -416,6 +431,23 @@ test("exports the frozen production constants", () => {
   assert.equal(vars.PUBLIC_ORIGIN, configuration.PRODUCTION_PUBLIC_ORIGIN);
   assert.equal(vars.ENVIRONMENT, "production");
   assert.equal(vars.IDENTITY_LINK_SECRET_VERSION, "production-v1");
+  // Staging refuses each of these; both OAuth client identities are included.
+  assert.deepEqual(configuration.PRODUCTION_RESOURCE_FINGERPRINT, {
+    origins: ["https://tibotattle.com", "https://admin.tibotattle.com", "https://www.tibotattle.com"],
+    hosts: ["tibotattle.com", "admin.tibotattle.com", "www.tibotattle.com"],
+    accessAud: vars.ACCESS_AUD,
+    identityLinkSecretVersion: "production-v1",
+    googleOidcClientId: vars.GOOGLE_OIDC_CLIENT_ID,
+    appleServicesId: "com.usagemonitor.web",
+    appleKeyId: vars.APPLE_KEY_ID,
+    cloudflareResourceNames: [
+      "app-usagemonitor",
+      "app-usagemonitor-production",
+      "app-usagemonitor-production-deletion-ledger",
+      "app-usagemonitor-production-quarantine",
+      "tibotattle-updates",
+    ],
+  });
   for (const name of Object.keys(vars)) {
     assert.equal(configuration.EDGE_ONLY_VAR_NAMES.includes(name), false, name);
     assert.equal(configuration.EDGE_ONLY_VAR_PREFIXES.some((prefix) => name.startsWith(prefix)), false, name);
@@ -529,7 +561,7 @@ test("an optional secret may be absent", () => {
 
 test("each forbidden variable aborts with its own code in every profile, even when empty", () => {
   const cases = [
-    ...Object.entries(configuration.PRODUCTION_FORBIDDEN_VARIABLES),
+    ...FORBIDDEN_VARIABLE_NAMES.map((name) => [name, `${name}_FORBIDDEN`]),
     ["HOST_RATE_LIMIT_ENROLLMENT_RATE_LIMIT_LIMIT", "HOST_RATE_LIMIT_OVERRIDE_FORBIDDEN"],
     ["HOST_RATE_LIMIT_CLIENT_ATTEMPT_RATE_LIMIT_PERIOD_SECONDS", "HOST_RATE_LIMIT_OVERRIDE_FORBIDDEN"],
   ];
@@ -748,6 +780,23 @@ test("deployment identity, origins and edge settings are validated", () => {
 test("Cloud SQL and bucket resources are validated", () => {
   const cases = [
     [{ PRIMARY_INSTANCE_CONNECTION_NAME: "origin-primary" }, "PRIMARY_INSTANCE_CONNECTION_NAME_INVALID"],
+    // project:region:instance, each part in its own grammar.
+    [{ PRIMARY_INSTANCE_CONNECTION_NAME: "Synthetic-project:us-east1:origin-primary" },
+      "PRIMARY_INSTANCE_CONNECTION_NAME_INVALID"],
+    [{ PRIMARY_INSTANCE_CONNECTION_NAME: "short:us-east1:origin-primary" },
+      "PRIMARY_INSTANCE_CONNECTION_NAME_INVALID"],
+    [{ PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:useast1:origin-primary" },
+      "PRIMARY_INSTANCE_CONNECTION_NAME_INVALID"],
+    [{ PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east:origin-primary" },
+      "PRIMARY_INSTANCE_CONNECTION_NAME_INVALID"],
+    [{ PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:Origin-primary" },
+      "PRIMARY_INSTANCE_CONNECTION_NAME_INVALID"],
+    [{ PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-primary-" },
+      "PRIMARY_INSTANCE_CONNECTION_NAME_INVALID"],
+    [{ PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-primary:extra" },
+      "PRIMARY_INSTANCE_CONNECTION_NAME_INVALID"],
+    [{ LEDGER_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-ledger/1" },
+      "LEDGER_INSTANCE_CONNECTION_NAME_INVALID"],
     [{ LEDGER_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-primary" },
       "LEDGER_INSTANCE_CONNECTION_NAME_NOT_INDEPENDENT"],
     [{ PRIMARY_DATABASE: "origin-primary" }, "PRIMARY_DATABASE_INVALID"],
@@ -818,6 +867,8 @@ test("staging requires its own plane and aborts on any production value", () => 
     [{ ACCESS_AUD: production.ACCESS_AUD }, "ACCESS_AUD_PRODUCTION_VALUE_FORBIDDEN"],
     [{ IDENTITY_LINK_SECRET_VERSION: "production-v1" }, "IDENTITY_LINK_SECRET_VERSION_PRODUCTION_VALUE_FORBIDDEN"],
     [{ GOOGLE_OIDC_CLIENT_ID: production.GOOGLE_OIDC_CLIENT_ID }, "GOOGLE_OIDC_CLIENT_ID_PRODUCTION_VALUE_FORBIDDEN"],
+    // Apple's OAuth client (the id_token audience) is separated like Google's.
+    [{ APPLE_SERVICES_ID: production.APPLE_SERVICES_ID }, "APPLE_SERVICES_ID_PRODUCTION_VALUE_FORBIDDEN"],
     [{ APPLE_KEY_ID: production.APPLE_KEY_ID }, "APPLE_KEY_ID_PRODUCTION_VALUE_FORBIDDEN"],
     [{ GCS_BUCKET_NAME: "app-usagemonitor-production-quarantine",
       GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("app-usagemonitor-production-quarantine") },
@@ -866,13 +917,12 @@ test("staging requires its own plane and aborts on any production value", () => 
     const env = "HOST_MODE" in overrides ? overrides : stagingEnv(overrides);
     expectCode(() => readProductionConfiguration(env, "staging"), code);
   }
-  // Staging may share the owner's Access team, admin email, Apple team and
-  // services id; those identify no production secret or data plane.
+  // Staging may share the owner's Access team, admin email and Apple team;
+  // those identify no production secret, data plane or OAuth client.
   expectAccepted(stagingEnv({
     ACCESS_TEAM_DOMAIN: production.ACCESS_TEAM_DOMAIN,
     ACCESS_ADMIN_EMAIL: production.ACCESS_ADMIN_EMAIL,
     APPLE_TEAM_ID: production.APPLE_TEAM_ID,
-    APPLE_SERVICES_ID: production.APPLE_SERVICES_ID,
   }), "staging");
   assert.equal(expectAccepted(stagingEnv({ ACCESS_ADMIN_EMAIL: email254 }), "staging")
     .vars.ACCESS_ADMIN_EMAIL, email254);
@@ -897,7 +947,9 @@ test("staging is synthetic-only by default: a closed posture no setting can open
     const config = expectAccepted(env, "staging");
     assert.equal(config.stagingAdmissionMode, "closed");
     assert.equal(config.rateLimits.originTier, configuration.STAGING_ORIGIN_TIER_RATE_LIMITS);
-    const workerEnv = createProductionWorkerEnv(config, { bindings: serviceBindings() });
+    const workerEnv = createProductionWorkerEnv(config, {
+      bindings: serviceBindings(configuration.STAGING_ORIGIN_TIER_RATE_LIMITS),
+    });
     for (const [name, value] of Object.entries(configuration.STAGING_CONTAINMENT_VARS)) {
       assert.equal(workerEnv[name], value, name);
     }
@@ -981,6 +1033,8 @@ test("staging jobs run on the staging plane with its identity, origins and marke
       [{ ACCESS_AUD: configuration.PRODUCTION_VARS.ACCESS_AUD }, "ACCESS_AUD_PRODUCTION_VALUE_FORBIDDEN"],
       [{ IDENTITY_LINK_SECRET_VERSION: "production-v1" },
         "IDENTITY_LINK_SECRET_VERSION_PRODUCTION_VALUE_FORBIDDEN"],
+      [{ APPLE_SERVICES_ID: configuration.PRODUCTION_VARS.APPLE_SERVICES_ID },
+        "APPLE_SERVICES_ID_PRODUCTION_VALUE_FORBIDDEN"],
       [{ PUBLIC_ORIGIN: "https://tibotattle.com", ADMIN_HOST_ORIGIN: "https://admin.tibotattle.com" },
         "PUBLIC_ORIGIN_PRODUCTION_VALUE_FORBIDDEN"],
       [{ ADMIN_HOST_ORIGIN: "https://ops.other.example" }, "ADMIN_HOST_ORIGIN_INVALID"],
@@ -1114,7 +1168,7 @@ test("processEnv TELEMETRY_STORAGE_MODE=json keeps the pinned 'typed' in every p
   ]) {
     const config = expectAccepted(env, profile);
     const workerEnv = createProductionWorkerEnv(config, profile.endsWith("-job") ? {} : {
-      bindings: serviceBindings(),
+      bindings: serviceBindings(config.rateLimits.originTier),
     });
     assert.equal(workerEnv.TELEMETRY_STORAGE_MODE, "typed", profile);
     assert.equal(workerEnv.PERFORMANCE_TELEMETRY_STORAGE_MODE, "enabled", profile);
@@ -1139,26 +1193,64 @@ test("service envs require exactly the nine injected bindings", () => {
   expectCode(() => createProductionWorkerEnv(config, {}), "PRODUCTION_BINDINGS_INVALID");
   expectCode(() => createProductionWorkerEnv(config), "PRODUCTION_BINDINGS_INVALID");
   // Origin-tier limiters are PostgreSQL limiters; class instances are accepted there.
-  const originTier = Object.values(configuration.ORIGIN_TIER_RATE_LIMITS);
-  const postgresLimiter = (name) => canonical.rateLimiter.createPostgresRateLimiter(
-    { connect() { throw new Error("SYNTHETIC_POOL_UNUSED"); } },
-    {
-      name,
-      limit: 3_000,
-      periodSeconds: 60,
-      keyHashSecret: SECRET_VALUES.POSTGRES_RATE_LIMIT_SECRET,
-    },
-  );
-  const withOriginLimiters = createProductionWorkerEnv(config, { bindings: {
-    ...serviceBindings(),
-    ...Object.fromEntries(originTier.map(({ binding }) => [binding, postgresLimiter(binding)])),
-  } });
-  for (const { binding } of originTier) {
-    assert.ok(withOriginLimiters[binding] instanceof canonical.rateLimiter.PostgresRateLimiter, binding);
+  const postgresLimiter = (name, limit = 3_000, periodSeconds = 60) =>
+    canonical.rateLimiter.createPostgresRateLimiter(
+      { connect() { throw new Error("SYNTHETIC_POOL_UNUSED"); } },
+      { name, limit, periodSeconds, keyHashSecret: SECRET_VALUES.POSTGRES_RATE_LIMIT_SECRET },
+    );
+  const postgresOriginLimiters = (originTier) => Object.fromEntries(Object.values(originTier)
+    .map(({ binding, limit, periodSeconds }) => [binding, postgresLimiter(binding, limit, periodSeconds)]));
+  const staging = expectAccepted(stagingEnv(), "staging");
+  for (const [plane, originTier] of [
+    [config, configuration.ORIGIN_TIER_RATE_LIMITS],
+    [staging, configuration.STAGING_ORIGIN_TIER_RATE_LIMITS],
+  ]) {
+    const env = createProductionWorkerEnv(plane, {
+      bindings: { ...serviceBindings(originTier), ...postgresOriginLimiters(originTier) },
+    });
+    for (const { binding } of Object.values(originTier)) {
+      assert.ok(env[binding] instanceof canonical.rateLimiter.PostgresRateLimiter, binding);
+    }
+  }
+  // Each origin-tier limiter carries exactly its plane's frozen limit and period.
+  const productionTier = configuration.ORIGIN_TIER_RATE_LIMITS;
+  const stagingTier = configuration.STAGING_ORIGIN_TIER_RATE_LIMITS;
+  const mismatches = [
+    // Staging built with production's limits, and production with a test-host-like 1000/60.
+    [staging, { ...serviceBindings(stagingTier), ...postgresOriginLimiters(productionTier) }],
+    [config, { ...serviceBindings(), UPLOAD_AUTHORIZATION_RATE_LIMIT:
+      postgresLimiter("UPLOAD_AUTHORIZATION_RATE_LIMIT", 1_000, 60) }],
+  ];
+  for (const [plane, bindings] of mismatches) {
+    expectCode(() => createProductionWorkerEnv(plane, { bindings }),
+      "UPLOAD_AUTHORIZATION_RATE_LIMIT_BINDING_LIMIT_MISMATCH");
+  }
+  for (const { binding: name, limit, periodSeconds } of Object.values(productionTier)) {
+    for (const binding of [
+      originLimiter(limit + 1, periodSeconds),
+      originLimiter(limit, periodSeconds + 1),
+      originLimiter(String(limit), periodSeconds),
+      originLimiter(limit, undefined),
+      postgresLimiter(name, limit, 30),
+      limiter(),
+    ]) {
+      expectCode(() => createProductionWorkerEnv(config, { bindings: { ...serviceBindings(), [name]: binding } }),
+        `${name}_BINDING_LIMIT_MISMATCH`);
+    }
+    const stagingLimits = Object.values(stagingTier).find((limits) => limits.binding === name);
+    expectCode(() => createProductionWorkerEnv(staging, { bindings: {
+      ...serviceBindings(stagingTier),
+      [name]: originLimiter(limit, periodSeconds),
+    } }), `${name}_BINDING_LIMIT_MISMATCH`);
+    assert.notEqual(stagingLimits.limit, limit, name);
   }
   // Edge-tier names take only edge replay bindings, never a PostgreSQL limiter.
   class SyntheticReplay {
     async limit() { return { success: true }; }
+  }
+  // One own data property, frozen, but a class instance all the same.
+  class SyntheticOwnFieldReplay {
+    limit = async () => ({ success: true });
   }
   const getterLimit = Object.freeze(Object.defineProperty({}, "limit", {
     get() { return async () => ({ success: true }); },
@@ -1169,6 +1261,7 @@ test("service envs require exactly the nine injected bindings", () => {
       postgresLimiter(name),
       Object.freeze(postgresLimiter(name)),
       Object.freeze(new SyntheticReplay()),
+      Object.freeze(new SyntheticOwnFieldReplay()),
       { async limit() { return { success: true }; } },
       Object.freeze({ async limit() { return { success: true }; }, name }),
       Object.freeze({ limit: limiter().limit, [Symbol("synthetic")]: true }),
@@ -1251,17 +1344,35 @@ test("the analytics-job profiles carry their switches with Worker semantics", ()
       POSTGRES_ANALYTICS_PUBLICATION_LANE: "disabled",
       POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL: "",
     }), profile).jobSwitches, defaults.jobSwitches);
-    // As STORAGE_ANALYTICS_MODE: only unset or 'disabled' is off; an empty
-    // value is a configuration error, never a silent no-op.
-    expectCode(() => readProductionConfiguration(jobEnv(profile, { POSTGRES_ANALYTICS_MODE: "" }), profile),
-      "POSTGRES_ANALYTICS_MODE_INVALID");
-    // The lane switches refuse what the Worker would read as off (documented
-    // as deliberately stricter in the module).
-    for (const name of configuration.PRODUCTION_JOB_SWITCH_NAMES[profile]) {
-      for (const value of ["Enabled", "true", "on", " enabled"]) {
-        expectCode(() => readProductionConfiguration(jobEnv(profile, { [name]: value }), profile),
-          `${name}_INVALID`);
+    // As STORAGE_ANALYTICS_MODE (storage-analytics-worker.ts): only unset or
+    // 'disabled' is off, 'enabled' is on, and anything else, an empty value
+    // included, is a configuration error, never a silent no-op.
+    for (const value of ["", "Enabled", "true", "on", " enabled"]) {
+      expectCode(() => readProductionConfiguration(jobEnv(profile, { POSTGRES_ANALYTICS_MODE: value }), profile),
+        "POSTGRES_ANALYTICS_MODE_INVALID");
+    }
+    // As PUBLICATION_LANE and PUBLICATION_LANE_EXTERNAL (`=== 'enabled'`):
+    // every other value is off, and it never stops the job's other lanes.
+    for (const name of ["POSTGRES_ANALYTICS_PUBLICATION_LANE", "POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL"]) {
+      for (const value of ["Enabled", "true", "on", " enabled", "enabled ", "1"]) {
+        const config = expectAccepted(jobEnv(profile, { POSTGRES_ANALYTICS_MODE: "enabled", [name]: value }),
+          profile);
+        assert.equal(config.jobSwitches[name], "disabled", `${name}=${JSON.stringify(value)}`);
+        assert.equal(config.jobSwitches.POSTGRES_ANALYTICS_MODE, "enabled");
+        assert.equal(createProductionWorkerEnv(config)[name], "disabled");
       }
+      assert.equal(expectAccepted(jobEnv(profile, { [name]: "enabled" }), profile).jobSwitches[name], "enabled");
+    }
+    // Cross-checked against the Worker's own lane predicate
+    // (storagePublicationLaneEnabled; PUBLICATION_LANE_EXTERNAL is read the
+    // same way inline in storage-analytics-worker.ts).
+    for (const value of [undefined, "", "enabled", "disabled", "Enabled", "true", " enabled", "enabled "]) {
+      const overrides = value === undefined ? {} : { POSTGRES_ANALYTICS_PUBLICATION_LANE: value };
+      assert.equal(
+        expectAccepted(jobEnv(profile, overrides), profile).jobSwitches.POSTGRES_ANALYTICS_PUBLICATION_LANE === "enabled",
+        canonical.publication.storagePublicationLaneEnabled(value === undefined ? {} : { PUBLICATION_LANE: value }),
+        JSON.stringify(value),
+      );
     }
   }
   const service = createProductionWorkerEnv(
