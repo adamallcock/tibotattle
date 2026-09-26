@@ -1352,6 +1352,48 @@ test("stranded upload adoption pages project closed counts and a paging cursor o
     /ADMIN_ACTION_INVALID/u);
 });
 
+function pipelineBlock(change = {}) {
+  return {
+    ingestion: { journalHead: 27650, latestRecordedAt: "2026-09-26T08:03:00.000Z" },
+    delivery: { appliedSequence: 27636, pendingChanges: 14, pendingActivations: 13,
+      current: { fromDay: "2026-05-27", throughDay: "2026-08-28", nextDay: "2026-06-09", daysDone: 13, daysTotal: 94 } },
+    daily: { queuedDays: 229, oldestQueuedDay: "2026-05-04", newestQueuedDay: "2026-09-25",
+      lastReleasedAt: "2026-09-26T02:36:40.842Z", releasedLastHour: 0 },
+    ...change,
+  };
+}
+
+test("reconstruction progress projects an optional, closed processing-pipeline block", async () => {
+  const graph = await fixture("admin-reconstruction-graph-valid.json");
+  assert.equal(Object.hasOwn(projectAdminReconstructionProgress(graph), "pipeline"), false);
+  assert.equal(projectAdminReconstructionProgress({ ...graph, pipeline: null }).pipeline, null);
+  const projected = projectAdminReconstructionProgress({ ...graph, pipeline: pipelineBlock() }).pipeline;
+  assert.deepEqual(JSON.parse(JSON.stringify(projected)), pipelineBlock());
+  const idle = pipelineBlock({
+    delivery: { appliedSequence: 27650, pendingChanges: 0, pendingActivations: 0, current: null },
+    daily: { queuedDays: 0, oldestQueuedDay: null, newestQueuedDay: null, lastReleasedAt: null, releasedLastHour: 0 },
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(projectAdminReconstructionProgress({ ...graph, pipeline: idle }).pipeline)), idle);
+  const base = pipelineBlock();
+  for (const broken of [
+    { ...base, extra: 1 },
+    { ...base, delivery: { ...base.delivery, appliedSequence: 27651 } },
+    { ...base, delivery: { ...base.delivery, pendingActivations: 15 } },
+    { ...base, delivery: { ...base.delivery, current: { ...base.delivery.current, daysDone: 95 } } },
+    { ...base, delivery: { ...base.delivery, current: { ...base.delivery.current, throughDay: "2026-05-26" } } },
+    { ...base, delivery: { ...base.delivery, current: { ...base.delivery.current, ownerDigest: "0".repeat(64) } } },
+    { ...base, daily: { ...base.daily, queuedDays: 0 } },
+    { ...base, daily: { ...base.daily, oldestQueuedDay: "2026-09-26" } },
+    { ...base, ingestion: { ...base.ingestion, latestRecordedAt: "yesterday" } },
+  ]) {
+    assert.throws(() => projectAdminReconstructionProgress({ ...graph, pipeline: broken }),
+      /ADMIN_RECONSTRUCTION_PROGRESS_INVALID/u, JSON.stringify(broken).slice(0, 120));
+  }
+  const legacy = await fixture("admin-reconstruction-preparation-valid.json");
+  assert.throws(() => projectAdminReconstructionProgress({ ...legacy, pipeline: pipelineBlock() }),
+    /ADMIN_RECONSTRUCTION_PROGRESS_INVALID/u);
+});
+
 test("admin action conflicts explain that the displayed revision is stale", async () => {
   const error = adminResponseError(409, await fixture("admin-action-stale-revision.json"));
   assert.equal(error.code, "ADMIN_ACTION_CONFLICT");

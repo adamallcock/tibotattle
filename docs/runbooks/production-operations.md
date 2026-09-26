@@ -741,6 +741,13 @@ days until it moves to v1.2. Adoption never fills gaps, invents days or changes
 consent. Read back public eligibility and analytics delivery independently; the
 action result alone does not prove publication.
 
+Follow the catch-up on the admin console's **Processing pipeline** panel. It
+shows the ingestion journal, the delivery backlog with the device currently
+being folded, the daily queue and the allowance graph. Delivery folds about one
+bounded step a minute. A day republishes only after every public owner's latest
+change has been delivered, so a large activation holds the whole daily queue
+until delivery catches up.
+
 ### Guarded deployment wrapper
 
 Without inventory flags, the routine wrapper below uses the checked-in JSON

@@ -51,6 +51,7 @@ const state = {
   diagnosticLookupGeneration: 0,
   loadGeneration: 0,
   v11AdoptionPreview: null,
+  pipelineObservation: null,
 };
 const $ = (selector) => document.querySelector(selector);
 const ADMIN_PAGE_CLASS = "admin-operator-page";
@@ -95,6 +96,10 @@ const isAdminPage = document.body?.classList?.contains(ADMIN_PAGE_CLASS) === tru
 let infoHintSequence = 0;
 
 const INFO_HINTS = Object.freeze({
+  "Ingestion journal": "Every accepted change (an upload that changes a contributor's evidence, an activation, an opt-out or an erasure) is recorded here in order. The value is the latest change's position in that order.",
+  "Delivery into analytics": "The analytics Worker applies journal changes in order, one bounded step a minute. A device activation is folded in day by day, so a large backlog of activations takes hours. The movement line is what this page saw between two refreshes.",
+  "Daily publication": "Days waiting to have their public daily figures rebuilt. A day republishes only after every public owner's latest change has been delivered, so a delivery backlog holds the whole queue.",
+  "Allowance graph": "The allowance and model graph is rebuilt separately from daily figures. Its full breakdown is under Allowance diagnostics.",
   "Active contributor identities": "Active pseudonymous contributor identities, including accountless installations. These are not verified people or a device census and may include identities without accepted data.",
   "Identities with accepted data": "Distinct contributor identities with retained accepted uploads in the active storage mode. The exact value as of the displayed snapshot and recent history come from the scheduled aggregate cache, independently of the overview's bounded newest-row sample.",
   "Identities added last 24h": "Contributor identities created during the trailing 24 hours. The caption gives the corresponding trailing seven-day count.",
@@ -3617,6 +3622,111 @@ function renderGraphRebuild(progress, panel, badge, details) {
     freshness);
 }
 
+// Two progress reads closer together than this say too little to show as movement.
+const PIPELINE_OBSERVATION_MIN_MILLISECONDS = 20_000;
+const PIPELINE_DAY = new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "short", day: "numeric" });
+
+function pipelineDay(day) {
+  return PIPELINE_DAY.format(new Date(`${day}T00:00:00.000Z`));
+}
+
+function pipelineAge(instant, nowMs) {
+  const minutes = Math.max(0, Math.round((nowMs - Date.parse(instant)) / 60_000));
+  if (minutes < 1) return "just now";
+  if (minutes < 90) return `${formatNumber(minutes)} min ago`;
+  const hours = Math.round(minutes / 60);
+  return hours < 48 ? `${formatNumber(hours)} h ago` : `${formatNumber(Math.round(hours / 24))} days ago`;
+}
+
+function pipelineCard(label, value, lines, tone) {
+  const card = document.createElement("div");
+  card.className = `admin-card admin-metric admin-pipeline-stage admin-pipeline-${tone}`;
+  const number = document.createElement("strong");
+  number.textContent = value;
+  card.append(labelWithInfo(label), number, ...lines.filter(Boolean).map((line) => {
+    const caption = document.createElement("small");
+    caption.textContent = line;
+    return caption;
+  }));
+  return card;
+}
+
+/** Four stages from one progress read. Movement is only what this page saw
+ * between two reads of the same service, measured on the service's clock. */
+function renderPipeline(progress, { stale = false } = {}) {
+  if (!isAdminPage) return;
+  const stages = $("#pipeline-stages");
+  const badge = $("#pipeline-badge");
+  if (!stages || !badge) return;
+  const pipeline = progress?.schemaVersion === 3 ? progress.pipeline : undefined;
+  if (!pipeline) {
+    stages.replaceChildren();
+    state.pipelineObservation = null;
+    badge.textContent = progress && pipeline === null ? "Unavailable · the pipeline read failed"
+      : progress ? "Not reported by this service" : "Unavailable";
+    return;
+  }
+  const { ingestion, delivery, daily } = pipeline;
+  const nowMs = Date.parse(progress.generatedAt);
+  const current = delivery.current;
+  const currentKey = current ? `${current.fromDay}/${current.throughDay}` : null;
+  const previous = state.pipelineObservation;
+  let movement = null;
+  if (!stale && previous && nowMs - previous.atMs >= PIPELINE_OBSERVATION_MIN_MILLISECONDS
+      && delivery.appliedSequence >= previous.appliedSequence) {
+    const changes = delivery.appliedSequence - previous.appliedSequence;
+    const days = current && previous.currentKey === currentKey ? current.daysDone - previous.daysDone : null;
+    movement = `Since the read ${pipelineAge(new Date(previous.atMs).toISOString(), nowMs)}: +${countWith(changes, "change")}`
+      + (days !== null && days >= 0 ? `, +${countWith(days, "day")} folded` : "") + ".";
+  }
+  const waiting = daily.queuedDays > 0 && delivery.pendingChanges > 0 && daily.releasedLastHour === 0;
+  const cards = [
+    pipelineCard("Ingestion journal", formatNumber(ingestion.journalHead), [
+      "changes recorded",
+      ingestion.latestRecordedAt
+        ? `Latest ${formatReportingTime(ingestion.latestRecordedAt)} (${pipelineAge(ingestion.latestRecordedAt, nowMs)})`
+        : "No change recorded yet",
+    ], "clear"),
+    pipelineCard("Delivery into analytics",
+      delivery.pendingChanges === 0 ? "Caught up" : formatNumber(delivery.pendingChanges), [
+        delivery.pendingChanges === 0 ? `Applied through change ${formatNumber(delivery.appliedSequence)}`
+          : `${delivery.pendingChanges === 1 ? "change" : "changes"} behind · `
+            + `${countWith(delivery.pendingActivations, "device activation")}`,
+        current ? `Current device: ${formatNumber(current.daysDone)} of ${countWith(current.daysTotal, "day")} folded`
+          + ` (${pipelineDay(current.fromDay)} – ${pipelineDay(current.throughDay)})` : null,
+        movement,
+      ], delivery.pendingChanges === 0 ? "clear" : "busy"),
+    pipelineCard("Daily publication",
+      daily.queuedDays === 0 ? "Up to date" : formatNumber(daily.queuedDays), [
+        daily.queuedDays > 0 ? `${daily.queuedDays === 1 ? "day" : "days"} queued · `
+          + `${pipelineDay(daily.oldestQueuedDay)} – ${pipelineDay(daily.newestQueuedDay)}` : null,
+        daily.lastReleasedAt
+          ? `Last published ${formatReportingTime(daily.lastReleasedAt)} (${pipelineAge(daily.lastReleasedAt, nowMs)})`
+            + ` · ${formatNumber(daily.releasedLastHour)} in the last hour`
+          : "Nothing published yet",
+        waiting ? "Waiting for delivery: each day waits until every public owner's latest change is delivered." : null,
+      ], waiting ? "waiting" : daily.queuedDays === 0 ? "clear" : "busy"),
+  ];
+  const throughput = progress.graph?.throughput;
+  if (throughput) {
+    const count = (value) => value === null ? "not counted" : formatNumber(value);
+    cards.push(pipelineCard("Allowance graph",
+      throughput.remainingResults === 0 ? "Up to date" : formatNumber(throughput.remainingResults), [
+        `${throughput.remainingResults === 1 ? "result" : "results"} remaining · `
+          + `${count(throughput.resultsLastHour)} in the last hour · ${count(throughput.resultsLast6Hours)} in 6 h`,
+        "Full breakdown under Allowance diagnostics",
+      ], throughput.remainingResults === 0 ? "clear" : "busy"));
+  }
+  stages.replaceChildren(...cards);
+  badge.textContent = stale ? "Stale · the latest refresh failed"
+    : delivery.pendingChanges > 0 ? `Delivering · ${countWith(delivery.pendingChanges, "change")} behind`
+      : daily.queuedDays > 0 ? `Publishing · ${countWith(daily.queuedDays, "day")} queued` : "Caught up";
+  if (!stale) {
+    state.pipelineObservation = { atMs: nowMs, appliedSequence: delivery.appliedSequence, currentKey,
+      daysDone: current ? current.daysDone : 0 };
+  }
+}
+
 function renderCurrentReconstructionProgress() {
   const progress = state.reconstructionProgress;
   if (progress === null) {
@@ -3780,7 +3890,10 @@ function refuseAdminAccess(error) {
   state.diagnosticLookup = null;
   state.diagnosticLookupGeneration += 1;
   state.auditRows = [];
-  if (isAdminPage) resetV11Adoption("Owner access is unavailable. Sign in again before previewing.");
+  if (isAdminPage) {
+    resetV11Adoption("Owner access is unavailable. Sign in again before previewing.");
+    renderPipeline(null);
+  }
   for (const id of [
     "counts", "quarantine-counts", "quarantine-status", "distribution-counts",
     "distribution-version-rows", "distribution-total-rows", "distribution-source-status",
@@ -3884,6 +3997,7 @@ const adminReadLanes = {
         updateSourceHealth("allowance", "unavailable");
       }
       renderCurrentReconstructionProgress();
+      renderPipeline(progress);
     },
     failed: error => {
       if (refuseAdminAccess(error)) return;
@@ -3892,6 +4006,7 @@ const adminReadLanes = {
       // A failed progress read is not authority to remove a graph. Retain its
       // recorded timestamp; old Workers can still supply overview progress.
       if (state.reconstructionProgress !== null) renderCurrentReconstructionProgress();
+      renderPipeline(state.reconstructionProgress, { stale: true });
     },
   }),
 };
