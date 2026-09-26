@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmod, lstat, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -15,11 +15,15 @@ import {
 } from "../scripts/postgres-ingestion-journal-transfer.mjs";
 
 /*
- * PostgreSQL 17 qualification for the staged owner-journal authority
- * (postgres/staged-migrations/primary/0046_owner_journal_authority.sql).
- * Until the staged-migration harness exists, each schema receives the stock
- * primary migrations and then the staged file in one transaction under the
- * migration runner's search path. Every row is synthetic and content-free.
+ * PostgreSQL 17 qualification for the owner-journal authority, primary
+ * migration 0046_owner_journal_authority.sql. Until the staged-migration
+ * harness exists, each schema receives primary 0001-0045 through the migration
+ * runner and then 0046 in one transaction under the runner's search path. The
+ * 0001-0045 chain is copied into a private migrations root, and 0046 is read
+ * from staged-migrations/ or, once promoted, from migrations/, so the 0045
+ * baselines (backfill, tampered chains, emitter parity) and the 0046 schema
+ * stay exactly 0045 and 0045+0046 before and after promotion and after later
+ * waves append 0047+. Every row is synthetic and content-free.
  */
 
 const PG_TEST_HOST = process.env.PG_TEST_HOST;
@@ -30,11 +34,57 @@ const PG_TEST_PASSWORD = process.env.PG_TEST_PASSWORD || "synthetic-local-only";
 const PG_TEST_DATABASE = process.env.PG_TEST_DATABASE || "postgres";
 const SKIP = !PG_TEST_HOST && !PG_TEST_SOCKET;
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const STAGED_0046 = join(WORKER_ROOT, "postgres", "staged-migrations", "primary", "0046_owner_journal_authority.sql");
+const MIGRATIONS_ROOT = join(WORKER_ROOT, "postgres", "migrations");
+const AUTHORITY_MIGRATION = "0046_owner_journal_authority.sql";
+const AUTHORITY_LOCATIONS = Object.freeze([
+  join(WORKER_ROOT, "postgres", "staged-migrations", "primary", AUTHORITY_MIGRATION),
+  join(MIGRATIONS_ROOT, "primary", AUTHORITY_MIGRATION),
+]);
+const BASELINE_VERSION = 45;
+const BASELINE_HEAD = "0045_accountless_v12_history_retention.sql";
 const ORACLE = join(WORKER_ROOT, "postgres-test", "fixtures", "community-public-source-owners-oracle.json");
 const SOURCE_ID = "synthetic-owner-journal-source";
 const TRANSFER_ROLE = "tibotattle_source_transfer";
+// Cluster-wide advisory lock held by every test that creates, grants or drops
+// the cluster-global transfer role, so concurrent runs never race on it.
+const TRANSFER_ROLE_LOCK = 460_046;
 const CONSTANT_MESSAGE = /^[a-z][a-z0-9_]{2,80}$/u;
+
+let authority;
+/** 0046 from staged-migrations/ or, after promotion, migrations/: exactly one. */
+async function readAuthority() {
+  if (authority === undefined) {
+    const found = [];
+    for (const [index, path] of AUTHORITY_LOCATIONS.entries()) {
+      try {
+        found.push({ sql: await readFile(path, "utf8"), staged: index === 0 });
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }
+    assert.equal(found.length, 1, "0046 is either staged or promoted, never both or neither");
+    authority = found[0];
+  }
+  return authority;
+}
+const readAuthoritySql = async () => (await readAuthority()).sql;
+
+let baselineRoot;
+/** A private migrations root holding primary 0001-0045 only (runner-safe copies). */
+function baselineMigrationsRoot() {
+  baselineRoot ??= (async () => {
+    const directory = await realpath(await mkdtemp(join(tmpdir(), "tibotattle-owner-journal-0045-")));
+    await mkdir(join(directory, "primary"), { mode: 0o700 });
+    const names = (await readdir(join(MIGRATIONS_ROOT, "primary")))
+      .filter((name) => /^\d{4}_[a-z0-9_-]+\.sql$/u.test(name) && Number(name.slice(0, 4)) <= BASELINE_VERSION)
+      .sort();
+    assert.equal(names.length, BASELINE_VERSION);
+    assert.equal(names.at(-1), BASELINE_HEAD);
+    for (const name of names) await copyFile(join(MIGRATIONS_ROOT, "primary", name), join(directory, "primary", name));
+    return directory;
+  })();
+  return baselineRoot;
+}
 
 const digest = (seed) => createHash("sha256").update(String(seed)).digest("hex");
 
@@ -84,10 +134,12 @@ async function workerModule(path) {
 after(async () => {
   if (sharedVite) await sharedVite.close();
   if (sharedPool) await sharedPool.end();
+  const directory = await baselineRoot?.catch(() => null);
+  if (directory) await rm(directory, { recursive: true, force: true });
 });
 
 async function applyStaged(pool, schema) {
-  const sql = await readFile(STAGED_0046, "utf8");
+  const sql = await readAuthoritySql();
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -104,8 +156,13 @@ async function applyStaged(pool, schema) {
   }
 }
 
-/** Run `body` against a fresh schema at primary 0045, plus 0046 unless told not to. */
-async function withSchema(body, { staged = true, prefix = "owner_journal_" } = {}) {
+/**
+ * Run `body` against a fresh schema at primary 0045, plus 0046 unless told
+ * not to. The "repository" chain instead applies the repository's primary
+ * migrations through the runner (plus 0046 while it is still staged), because
+ * the journal transfer requires the target history to equal that chain.
+ */
+async function withSchema(body, { staged = true, prefix = "owner_journal_", chain = "baseline" } = {}) {
   const pool = await connection();
   const schema = `${prefix}${randomBytes(6).toString("hex")}`;
   const quoted = `"${schema}"`;
@@ -115,10 +172,19 @@ async function withSchema(body, { staged = true, prefix = "owner_journal_" } = {
   };
   await pool.query(`CREATE SCHEMA ${quoted}`);
   try {
-    const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
-    assert.equal(applied.migrations.at(-1)?.name, "0045_accountless_v12_history_retention.sql",
-      "the staged authority applies directly after the stock primary head");
-    if (staged) await applyStaged(pool, schema);
+    if (chain === "repository") {
+      assert.equal(staged, true);
+      await applyPostgresMigrations({ role: "primary", schema, pool });
+      if ((await readAuthority()).staged) await applyStaged(pool, schema);
+      const present = await pool.query("SELECT to_regclass($1) IS NOT NULL AS present", [`${quoted}.storage_owner_revisions`]);
+      assert.equal(present.rows[0].present, true, "the repository chain carries the owner-journal authority");
+    } else {
+      const applied = await applyPostgresMigrations({ role: "primary", schema, pool,
+        rootDirectory: await baselineMigrationsRoot() });
+      assert.equal(applied.migrations.at(-1)?.name, BASELINE_HEAD,
+        "the owner-journal authority applies directly after primary 0045");
+      if (staged) await applyStaged(pool, schema);
+    }
     await body({ pool, schema, quoted, table });
   } finally {
     await pool.query(`DROP SCHEMA IF EXISTS ${quoted} CASCADE`);
@@ -288,6 +354,37 @@ test("PG17 community_public_source_owners equals the D1 oracle in all twelve cas
     assert.equal(all.length, oracle.cases.reduce((total, oracleCase) => total + oracleCase.rows.length, 0));
   }));
 
+/** The last community_public_source_owners definition in `sql`, comments and layout removed. */
+function viewDefinition(sql) {
+  const code = sql.replace(/--[^\n]*/gu, " ");
+  const starts = [...code.matchAll(/\bCREATE\s+VIEW\s+community_public_source_owners\b/gu)];
+  if (starts.length === 0) return null;
+  const start = starts.at(-1).index;
+  const end = code.indexOf(";", start);
+  assert.ok(end > start, "the view definition is terminated");
+  return code.slice(start, end).replace(/\s+/gu, " ").replace(/\s*([(),=])\s*/gu, "$1").trim();
+}
+
+// The oracle cases prove behaviour on twelve shapes; this pins every
+// predicate of all five branches, including ones no case reaches (for
+// example social_verified_at on each accountless branch and the v1.2
+// retained legacy-domain exclusion). It needs no database.
+test("0046 community_public_source_owners is the effective D1 view text, differing only by one NULL cast", async () => {
+  let d1View = null;
+  for (const directory of ["migrations", "ingestion-isolation-migrations"]) {
+    const names = (await readdir(join(WORKER_ROOT, directory))).filter((name) => name.endsWith(".sql")).sort();
+    for (const name of names) {
+      const definition = viewDefinition(await readFile(join(WORKER_ROOT, directory, name), "utf8"));
+      if (definition !== null) d1View = definition;
+    }
+  }
+  assert.ok(d1View?.includes("accountless_v12_device_authorizations successor"), "the effective D1 view is the five-branch definition");
+  assert.equal(d1View.match(/\bUNION ALL\b/gu)?.length, 4);
+  const pgView = viewDefinition(await readAuthoritySql());
+  assert.equal(pgView.match(/NULL::text/gu)?.length, 1, "PostgreSQL types the social branch's device column once");
+  assert.equal(pgView.replace("NULL::text", "NULL"), d1View);
+});
+
 // ---------------------------------------------------------------------------
 
 test("PG17 storage_journal_append follows every D1 journal rule with constant codes", { skip: SKIP, timeout: 180_000 },
@@ -314,8 +411,10 @@ test("PG17 storage_journal_append follows every D1 journal rule with constant co
     const raw = (kind, ownerDigest, eventDigest = digest(`raw-${randomUUID()}`), objectDigest = digest("o")) =>
       pool.query(`SELECT ${quoted}.storage_journal_append($1,$2,$3,$4,$5)`,
         [kind, ownerDigest, eventDigest, objectDigest, digest("c")]);
+    const typed = (code) => (error) => error instanceof PostgresOwnerJournalError && error.code === code;
     try {
       await refuses(raw("owner-active", ownerA), "storage_source_uninitialized");
+      await assert.rejects(append("owner-active", ownerA), typed("OWNER_JOURNAL_SOURCE_UNINITIALIZED"));
       await initializeSource(pool, table, 5);
 
       const startedMs = Date.now();
@@ -345,6 +444,10 @@ test("PG17 storage_journal_append follows every D1 journal rule with constant co
       await assert.rejects(append("owner-active", ownerA), (error) =>
         error instanceof PostgresOwnerJournalError && error.code === "OWNER_JOURNAL_OWNER_ERASED");
       await refuses(raw("owner-active", ownerB, digest(`event-${accepted[2]}`)), "storage_journal_event_conflict");
+      await assert.rejects(appendPostgresOwnerJournal(client, schema, {
+        kind: "owner-active", ownerDigest: ownerB, eventDigest: digest(`event-${accepted[2]}`),
+        objectDigest: digest("replay-object"), contentDigest: digest("replay-content"),
+      }), typed("OWNER_JOURNAL_EVENT_CONFLICT"), "a replayed event digest is a typed conflict, not a driver error");
       await refuses(raw("owner-archived", ownerB), "storage_journal_kind_invalid");
       await refuses(raw("owner-active", "A".repeat(64)), "storage_journal_digest_invalid");
       await refuses(raw("owner-active", ownerB, "short"), "storage_journal_digest_invalid");
@@ -378,6 +481,110 @@ test("PG17 storage_journal_append follows every D1 journal rule with constant co
     } finally {
       client.release();
     }
+  }));
+
+// The wrapper validates its inputs before the database does, so some constant
+// refusals are only reachable if that validation is bypassed. A stub client
+// pins every mapping and checks that anything else is rethrown unchanged.
+test("the owner-journal wrapper maps every constant database refusal and rethrows anything else", async () => {
+  const { appendPostgresOwnerJournal, ensurePostgresOwnerLink, PostgresOwnerJournalError } =
+    await workerModule("/src/postgres-owner-journal.ts");
+  const mappings = {
+    storage_source_uninitialized: "OWNER_JOURNAL_SOURCE_UNINITIALIZED",
+    storage_owner_erased: "OWNER_JOURNAL_OWNER_ERASED",
+    storage_owner_uninitialized: "OWNER_JOURNAL_OWNER_UNINITIALIZED",
+    storage_owner_ineligible: "OWNER_JOURNAL_OWNER_INELIGIBLE",
+    storage_journal_event_conflict: "OWNER_JOURNAL_EVENT_CONFLICT",
+    storage_owner_link_participant_unavailable: "OWNER_JOURNAL_PARTICIPANT_UNAVAILABLE",
+    storage_journal_kind_invalid: "OWNER_JOURNAL_INPUT_INVALID",
+    storage_journal_digest_invalid: "OWNER_JOURNAL_INPUT_INVALID",
+    storage_owner_link_state_invalid: "OWNER_JOURNAL_INPUT_INVALID",
+  };
+  const failing = (error) => ({ query: async () => { throw error; } });
+  const calls = [
+    (client) => appendPostgresOwnerJournal(client, "synthetic_schema", {
+      kind: "owner-active", ownerDigest: digest("o"), eventDigest: digest("e"), objectDigest: digest("b"), contentDigest: digest("c"),
+    }),
+    (client) => ensurePostgresOwnerLink(client, "synthetic_schema", "synthetic-participant", "active"),
+  ];
+  for (const call of calls) {
+    for (const [message, code] of Object.entries(mappings)) {
+      await assert.rejects(call(failing(Object.assign(new Error(message), { code: "P1005" }))), (error) =>
+        error instanceof PostgresOwnerJournalError && error.code === code && error.message === code, message);
+    }
+    for (const unmapped of [
+      Object.assign(new Error("storage_owner_erased"), { code: "23505" }),
+      Object.assign(new Error("storage_owner_revision_conflict"), { code: "P1005" }),
+      new Error("synthetic driver failure"),
+    ]) {
+      await assert.rejects(call(failing(unmapped)), (error) => error === unmapped, "anything else is rethrown unchanged");
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+
+test("PG17 concurrent storage_journal_append calls serialize without driver conflicts", { skip: SKIP, timeout: 180_000 },
+  async () => withSchema(async ({ pool, schema, table }) => {
+    const { appendPostgresOwnerJournal } = await workerModule("/src/postgres-owner-journal.ts");
+    await initializeSource(pool, table, 1);
+    const shared = digest("concurrent-shared-owner");
+    const distinct = Array.from({ length: 7 }, (_, index) => digest(`concurrent-owner-${index}`));
+    const append = (client, kind, ownerDigest, label) => appendPostgresOwnerJournal(client, schema, {
+      kind, ownerDigest, eventDigest: digest(`concurrent-event-${label}`), objectDigest: digest(`concurrent-object-${label}`),
+      contentDigest: digest(`concurrent-content-${label}`),
+    });
+    const seed = await pool.connect();
+    try {
+      await append(seed, "owner-active", shared, "seed");
+    } finally {
+      seed.release();
+    }
+    // Every transaction opens and waits at a barrier before appending, then
+    // holds its locks briefly, so all of them contend at once.
+    const jobs = [
+      ...distinct.map((owner, index) => ["owner-active", owner, `distinct-${index}`]),
+      ...Array.from({ length: 3 }, (_, index) => ["source-updated", shared, `shared-${index}`]),
+    ];
+    let arrived = 0;
+    let release;
+    const barrier = new Promise((resolve) => { release = resolve; });
+    const settled = await Promise.allSettled(jobs.map(async ([kind, owner, label]) => {
+      const client = await pool.connect().catch((error) => { release(); throw error; });
+      try {
+        await client.query("BEGIN");
+        arrived += 1;
+        if (arrived === jobs.length) release();
+        await barrier;
+        const result = await append(client, kind, owner, label);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        await client.query("COMMIT");
+        return result.sequence;
+      } catch (error) {
+        release();
+        await client.query("ROLLBACK").catch(() => {});
+        throw error;
+      } finally {
+        client.release();
+      }
+    }));
+    assert.deepEqual(settled.filter((result) => result.status === "rejected").map((result) => result.reason?.code ?? "unknown"), [],
+      "no append fails, and none surfaces a driver uniqueness error");
+    const rows = await journal(pool, table);
+    assert.deepEqual(rows.map((row) => row.sequence), Array.from({ length: jobs.length + 1 }, (_, index) => index + 1),
+      "sequences are contiguous");
+    assert.deepEqual(settled.map((result) => result.value).sort((left, right) => left - right), rows.slice(1).map((row) => row.sequence));
+    for (const owner of [shared, ...distinct]) {
+      const chain = rows.filter((row) => row.owner_digest === owner);
+      assert.deepEqual(chain.map((row) => row.revision), chain.map((_, index) => index + 1), "each owner's revisions are contiguous");
+      assert.ok(chain.every((row) => row.epoch === 1), "owner-active then source-updated keep owner epoch 1");
+    }
+    for (let index = 1; index < rows.length; index += 1) {
+      const delta = rows[index].kind === "source-updated" ? 0 : 1;
+      assert.equal(rows[index].public_epoch, rows[index - 1].public_epoch + delta, "each public epoch continues the previous row");
+    }
+    assert.equal(await sourceEpoch(pool, table), rows.at(-1).public_epoch);
+    assert.equal((await heads(pool, table)).find((head) => head.owner_digest === shared).revision, 4);
   }));
 
 // ---------------------------------------------------------------------------
@@ -436,6 +643,17 @@ test("PG17 derivation trigger refuses discontinuous raw rows and seeds partial h
     await refuses(rawExact(pool, table, { sequence: 25, owner: lateOwner, kind: "source-updated", revision: 2, epoch: 1,
       publicEpoch: 4 }), "storage_owner_revision_conflict");
 
+    // A first owner-active that is not revision 1 epoch 1 starts mid-history:
+    // its head is seeded but flagged partial.
+    const midRevisionOwner = digest("mid-revision-owner");
+    const midEpochOwner = digest("mid-epoch-owner");
+    await rawExact(pool, table, { sequence: 40, owner: midRevisionOwner, kind: "owner-active", revision: 2, epoch: 2, publicEpoch: 4 });
+    await rawExact(pool, table, { sequence: 41, owner: midEpochOwner, kind: "owner-active", revision: 1, epoch: 2, publicEpoch: 4 });
+    // A back-filled row may not carry a higher public epoch than the next
+    // exact row either (the preceding row, sequence 30, allows it).
+    await refuses(rawExact(pool, table, { sequence: 35, owner: digest("backfilled-owner"), kind: "owner-active", revision: 1,
+      epoch: 1, publicEpoch: 5 }), "storage_public_authority_regressed");
+
     // Exact rows and heads are retained evidence.
     await refuses(pool.query(`UPDATE ${table("storage_ingestion_changes")} SET recorded_ms=0 WHERE sequence=2`),
       "storage_event_immutable");
@@ -457,7 +675,8 @@ test("PG17 derivation trigger refuses discontinuous raw rows and seeds partial h
       ) VALUES ($1,$2,1,1,'active',2,$3,$3,false)`, [SOURCE_ID, digest("invented"), digest("object-2")]),
     "storage_owner_revision_unproven");
     assert.deepEqual((await heads(pool, table)).map((head) => [head.owner_digest, head.revision, head.state, head.seeded_partial]).sort(),
-      [[erasedFirst, 1, "erased", true], [owner, 2, "withdrawn", false], [lateOwner, 1, "active", false]].sort());
+      [[erasedFirst, 1, "erased", true], [owner, 2, "withdrawn", false], [lateOwner, 1, "active", false],
+        [midRevisionOwner, 2, "active", true], [midEpochOwner, 1, "active", true]].sort());
 
     // Without a singleton source nothing exact can be derived.
     const unsourced = await pool.connect();
@@ -487,6 +706,13 @@ const TRANSFER_ROWS = [
   [6, "b", 3, "owner-erased", 2, 4],
 ];
 const transferDigest = (n) => BigInt(n).toString(16).padStart(64, "0");
+/** The journal rows scripts/postgres-ingestion-journal-transfer.mjs writes for the sealed fixture. */
+const TRANSFERRED_JOURNAL = Object.freeze(TRANSFER_ROWS.map(([sequence, owner, revision, kind, authorityEpoch, publicEpoch]) => ({
+  sequence, event_digest: transferDigest(sequence), owner_digest: owner.repeat(64), owner_revision: 0, epoch: authorityEpoch, kind,
+  version: 1, revision, object_digest: transferDigest(sequence + 20), content_digest: transferDigest(sequence + 40),
+  public_epoch: publicEpoch, recorded_ms: String(1_790_000_000_000 + sequence),
+})));
+const TRANSFER_SOURCE_EPOCH = 4;
 
 async function makeSealedJournal() {
   const directory = await mkdtemp(join(tmpdir(), "tibotattle-owner-journal-pg17-"));
@@ -509,7 +735,8 @@ async function makeSealedJournal() {
       ) STRICT;
       CREATE INDEX storage_ingestion_owner_cursor ON storage_ingestion_changes(owner_digest,sequence);
     `);
-    database.prepare("INSERT INTO storage_source_state(singleton,source_id,authority_epoch) VALUES(1,?,4)").run(TRANSFER_SOURCE_ID);
+    database.prepare("INSERT INTO storage_source_state(singleton,source_id,authority_epoch) VALUES(1,?,?)")
+      .run(TRANSFER_SOURCE_ID, TRANSFER_SOURCE_EPOCH);
     const insert = database.prepare(`INSERT INTO storage_ingestion_changes(
       sequence,event_digest,owner_digest,revision,kind,object_digest,content_digest,
       authority_epoch,public_authority_epoch,recorded_ms) VALUES(?,?,?,?,?,?,?,?,?,?)`);
@@ -552,8 +779,9 @@ test("PG17 journal transfer through 0046 derives the D1 heads, rolls back with a
         targetSchema: schema, transferId, pageSize: 2 });
       assert.equal(result.status, "synthetic_storage_ingestion_journal_transfer_complete");
       assert.equal(result.targetRows, "6");
+      assert.deepEqual(await journal(pool, table), TRANSFERRED_JOURNAL, "the transfer writes the exact D1 rows");
       assert.deepEqual(await heads(pool, table), D1_TRANSFER_HEADS);
-      assert.equal(await sourceEpoch(pool, table), 4, "the preset source epoch is unchanged");
+      assert.equal(await sourceEpoch(pool, table), TRANSFER_SOURCE_EPOCH, "the preset source epoch is unchanged");
       const replay = await transferPostgresIngestionJournal({ source: fixture.source, destinationPool: pool,
         targetSchema: schema, transferId, pageSize: 2 });
       assert.equal(replay.status, "already_complete");
@@ -570,32 +798,37 @@ test("PG17 journal transfer through 0046 derives the D1 heads, rolls back with a
       fixture.source.close();
       await rm(fixture.directory, { recursive: true, force: true });
     }
-  }, { prefix: TRANSFER_SCHEMA_PREFIX }));
+  }, { prefix: TRANSFER_SCHEMA_PREFIX, chain: "repository" }));
 
 // ---------------------------------------------------------------------------
 
 test("PG17 0046 backfills heads from an imported journal and aborts on a tampered chain", { skip: SKIP, timeout: 240_000 },
   async () => {
+    // A 0045 database that already holds the transferred D1 journal. The
+    // transfer script only targets the repository's current chain, so the
+    // rows are written in exactly the shape the transfer test pins.
     await withSchema(async ({ pool, schema, quoted, table }) => {
-      const fixture = await makeSealedJournal();
-      try {
-        const result = await transferPostgresIngestionJournal({ source: fixture.source, destinationPool: pool,
-          targetSchema: schema, transferId: "synthetic-ingestion-journal-owner-backfill", pageSize: 4 });
-        assert.equal(result.targetRows, "6");
-      } finally {
-        fixture.source.close();
-        await rm(fixture.directory, { recursive: true, force: true });
+      await pool.query(`INSERT INTO ${table("storage_source_state")} (singleton,source_id,authority_epoch) VALUES (1,$1,$2)`,
+        [TRANSFER_SOURCE_ID, TRANSFER_SOURCE_EPOCH]);
+      for (const row of TRANSFERRED_JOURNAL) {
+        await pool.query(`INSERT INTO ${table("storage_ingestion_changes")} (
+            source_id,sequence,event_digest,owner_digest,owner_revision,authority_epoch,kind,recorded_ms,
+            event_tuple_version,revision,object_digest,content_digest,public_authority_epoch
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+        [TRANSFER_SOURCE_ID, row.sequence, row.event_digest, row.owner_digest, row.owner_revision, row.epoch, row.kind,
+          row.recorded_ms, row.version, row.revision, row.object_digest, row.content_digest, row.public_epoch]);
       }
+      assert.deepEqual(await journal(pool, table), TRANSFERRED_JOURNAL);
       await applyStaged(pool, schema);
       assert.deepEqual(await heads(pool, table), D1_TRANSFER_HEADS, "backfilled heads equal the derived D1 state");
-      assert.equal(await sourceEpoch(pool, table), 4);
+      assert.equal(await sourceEpoch(pool, table), TRANSFER_SOURCE_EPOCH);
       const appended = await pool.query(`SELECT ${quoted}.storage_journal_append('owner-active',$1,$2,$3,$4)::int AS sequence`,
         ["a".repeat(64), digest("backfill-live"), digest("o"), digest("c")]);
       assert.equal(appended.rows[0].sequence, 7, "a later append continues at head+1 without a uniqueness conflict");
       assert.equal((await heads(pool, table))[0].revision, 4);
-    }, { staged: false, prefix: TRANSFER_SCHEMA_PREFIX });
+    }, { staged: false });
 
-    await withSchema(async ({ pool, schema, table }) => {
+    await withSchema(async ({ pool, schema, quoted, table }) => {
       await pool.query(`INSERT INTO ${table("storage_source_state")} (singleton,source_id,authority_epoch) VALUES (1,$1,1)`,
         [SOURCE_ID]);
       const owner = digest("tampered-owner");
@@ -627,7 +860,35 @@ test("PG17 0046 backfills heads from an imported journal and aborts on a tampere
       const emitter = await pool.query(`SELECT prosrc FROM pg_proc JOIN pg_namespace ns ON ns.oid=pronamespace
         WHERE nspname=$1 AND proname='telemetry_emit_source_event'`, [schema]);
       assert.equal(emitter.rows[0].prosrc.includes("storage_owner_revisions"), false, "the 0014 emitter is untouched");
+
+      // A valid history whose public epoch has run ahead of the source epoch
+      // (still 1): one complete chain and one imported mid-history.
+      const complete = digest("backfill-complete-owner");
+      const partial = digest("backfill-partial-owner");
+      const history = [
+        [complete, "owner-active", 1, 1, 2],
+        [complete, "source-updated", 2, 1, 2],
+        [complete, "owner-withdrawn", 3, 2, 3],
+        [partial, "owner-active", 2, 2, 4],
+        [partial, "source-updated", 3, 2, 5],
+      ];
+      for (const [index, [rowOwner, kind, revision, epoch, publicEpoch]] of history.entries()) {
+        await rawExact(pool, table, { sequence: index + 1, owner: rowOwner, kind, revision, epoch, publicEpoch });
+      }
+      assert.equal(await sourceEpoch(pool, table), 1);
       await applyStaged(pool, schema);
+      assert.deepEqual((await heads(pool, table)).map(({ owner_digest, revision, epoch, state, last_sequence, seeded_partial }) =>
+        [owner_digest, revision, epoch, state, last_sequence, seeded_partial]).sort(), [
+        [complete, 3, 2, "withdrawn", 3, false],
+        [partial, 3, 2, "active", 5, true],
+      ].sort(), "a chain that does not start at owner-active revision 1 epoch 1 is seeded partial");
+      assert.equal(await sourceEpoch(pool, table), 5, "the backfill raises the source epoch to the highest public epoch");
+      const next = (kind, rowOwner, label) => pool.query(`SELECT ${quoted}.storage_journal_append($1,$2,$3,$4,$5)::int AS sequence`,
+        [kind, rowOwner, digest(`backfill-${label}`), digest(`backfill-object-${label}`), digest(`backfill-content-${label}`)]);
+      assert.equal((await next("owner-active", complete, "reactivate")).rows[0].sequence, 6);
+      assert.equal((await next("source-updated", partial, "update")).rows[0].sequence, 7);
+      assert.deepEqual((await journal(pool, table)).slice(5).map(({ revision, epoch, public_epoch }) => [revision, epoch, public_epoch]),
+        [[4, 3, 6], [4, 2, 6]], "live appends continue both chains above the backfilled public epoch");
     }, { staged: false });
   });
 
@@ -712,9 +973,13 @@ test("PG17 headed owners receive no emitter rows while input revisions and sourc
   { skip: SKIP, timeout: 240_000 }, async () => {
     const headed = { participantId: "synthetic-emitter-headed", deviceId: "synthetic-emitter-headed-device", owner: digest("emitter-headed") };
     const unheaded = { participantId: "synthetic-emitter-unheaded", deviceId: "synthetic-emitter-unheaded-device", owner: digest("emitter-unheaded") };
+    // Withdrawn head, but the link and analytics state are still active: the
+    // window before analytics applies the withdrawal.
+    const withdrawn = { participantId: "synthetic-emitter-withdrawn", deviceId: "synthetic-emitter-withdrawn-device", owner: digest("emitter-withdrawn") };
+    const participants = [headed, unheaded, withdrawn];
     const run = async ({ pool, table, quoted }, staged) => {
       await initializeSource(pool, table, 1);
-      for (const participant of [headed, unheaded]) {
+      for (const participant of participants) {
         await createSocialDevice(pool, table, participant.participantId, participant.deviceId);
         await pool.query(`INSERT INTO ${table("storage_v11_owner_links")} (participant_id,owner_digest,state) VALUES ($1,$2,'active')`,
           [participant.participantId, participant.owner]);
@@ -722,10 +987,13 @@ test("PG17 headed owners receive no emitter rows while input revisions and sourc
           VALUES ($1,$2,1,1,'active')`, [SOURCE_ID, participant.owner]);
       }
       if (staged) {
-        await pool.query(`SELECT ${quoted}.storage_journal_append('owner-active',$1,$2,$3,$4)`,
-          [headed.owner, digest("emitter-event"), digest("emitter-object"), digest("emitter-content")]);
+        for (const [kind, owner, label] of [["owner-active", headed.owner, "headed"], ["owner-active", withdrawn.owner, "withdrawn-active"],
+          ["owner-withdrawn", withdrawn.owner, "withdrawn"]]) {
+          await pool.query(`SELECT ${quoted}.storage_journal_append($1,$2,$3,$4,$5)`,
+            [kind, owner, digest(`emitter-event-${label}`), digest(`emitter-object-${label}`), digest(`emitter-content-${label}`)]);
+        }
       }
-      for (const [index, participant] of [headed, unheaded].entries()) {
+      for (const [index, participant] of participants.entries()) {
         await rawTelemetryChanges(pool, table, participant.participantId, participant.deviceId, index + 1);
       }
       const inputs = await pool.query(`SELECT participant.id AS participant_id, versions.revision::int AS revision, digests.digest
@@ -763,6 +1031,11 @@ test("PG17 headed owners receive no emitter rows while input revisions and sourc
     assert.deepEqual(legacy(staged.rows, headed.owner), [], "a headed owner receives no version-0 row");
     assert.deepEqual(staged.rows.filter((row) => row.owner_digest === headed.owner).map((row) => [row.version, row.kind]),
       [[1, "owner-active"]]);
+    assert.ok(legacy(baseline.rows, withdrawn.owner).length >= 5);
+    assert.deepEqual(staged.rows.filter((row) => row.owner_digest === withdrawn.owner).map((row) => [row.version, row.kind]),
+      [[1, "owner-active"], [1, "owner-withdrawn"]],
+      "an owner with a withdrawn head writes nothing and is not refused while its link and analytics state are still active");
+    assert.equal(staged.inputs.length, 3);
     assert.deepEqual(legacy(staged.rows, unheaded.owner), legacy(baseline.rows, unheaded.owner),
       "an unheaded owner keeps the version-0 body verbatim");
     assert.ok(legacy(staged.rows, unheaded.owner).length >= 5);
@@ -863,7 +1136,7 @@ test("PG17 storage_v12_event_sources admits exactly the published v1.2 chain", {
 
 // ---------------------------------------------------------------------------
 
-test("PG17 owner-link ensure is idempotent under concurrency and the transfer predicate excludes superusers",
+test("PG17 owner-link ensure is idempotent under concurrency and never mints an erased link",
   { skip: SKIP, timeout: 180_000 }, async () => withSchema(async ({ pool, schema, quoted, table }) => {
     const { ensurePostgresOwnerLink, PostgresOwnerJournalError } = await workerModule("/src/postgres-owner-journal.ts");
     for (const id of ["synthetic-link-01", "synthetic-link-02", "synthetic-link-03"]) {
@@ -884,6 +1157,8 @@ test("PG17 owner-link ensure is idempotent under concurrency and the transfer pr
         "storage_owner_link_state_invalid");
       await refuses(pool.query(`SELECT ${quoted}.storage_owner_link_ensure('synthetic-link-missing','active')`),
         "storage_owner_link_participant_unavailable");
+      await assert.rejects(ensurePostgresOwnerLink(client, schema, "synthetic-link-missing", "active"), (error) =>
+        error instanceof PostgresOwnerJournalError && error.code === "OWNER_JOURNAL_PARTICIPANT_UNAVAILABLE");
     } finally {
       client.release();
     }
@@ -936,42 +1211,115 @@ test("PG17 owner-link ensure is idempotent under concurrency and the transfer pr
     const raced = await pool.query(`SELECT owner_digest FROM ${table("storage_v11_owner_links")}
       WHERE participant_id='synthetic-link-race'`);
     assert.deepEqual(raced.rows, [{ owner_digest: racers[0] }]);
+  }));
 
-    // Transfer-session predicate.
+// ---------------------------------------------------------------------------
+// storage_journal_transfer_session(). The transfer role is cluster-global, so
+// this section holds TRANSFER_ROLE_LOCK, creates the role only when absent and
+// drops only what it created. Since PostgreSQL 16 a CREATEROLE role that
+// creates a role receives an implicit ADMIN-only membership in it (SET and
+// INHERIT false), which pg_has_role(..., 'MEMBER') counts, and can then grant
+// itself SET. Neither it, nor a login that can SET ROLE to a CREATEROLE role
+// (a Cloud SQL administrator in cloudsqlsuperuser), may be a transfer session.
+
+test("PG17 storage_journal_transfer_session() admits only a deliberate member that cannot escalate",
+  { skip: SKIP, timeout: 180_000 }, async () => withSchema(async ({ pool, quoted }) => {
+    const local = await endpoint();
+    const suffix = randomBytes(4).toString("hex");
+    const logins = {
+      member: `synthetic_oj_member_${suffix}`,
+      runtime: `synthetic_oj_runtime_${suffix}`,
+      creator: `synthetic_oj_creator_${suffix}`,
+      grouped: `synthetic_oj_grouped_${suffix}`,
+      administrator: `synthetic_oj_administrator_${suffix}`,
+    };
+    const adminGroup = `synthetic_oj_admin_group_${suffix}`;
+    const loginNames = Object.values(logins).join(", ");
     const predicate = async (runner) =>
       (await runner.query(`SELECT ${quoted}.storage_journal_transfer_session() AS transfer`)).rows[0].transfer;
-    const roleExisted = (await pool.query("SELECT 1 FROM pg_roles WHERE rolname=$1", [TRANSFER_ROLE])).rowCount === 1;
-    if (!roleExisted) assert.equal(await predicate(pool), false, "no transfer session without the role");
-    const suffix = randomBytes(4).toString("hex");
-    const member = `synthetic_owner_journal_member_${suffix}`;
-    const runtime = `synthetic_owner_journal_runtime_${suffix}`;
+    const asLogin = async (role, body) => {
+      const session = new pg.Client({ ...local, user: role, password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, ssl: false,
+        application_name: "pg-owner-journal-authority-test" });
+      await session.connect();
+      try {
+        return await body(session);
+      } finally {
+        await session.end();
+      }
+    };
+    const membership = async (member) => (await pool.query(`SELECT a.admin_option,a.inherit_option,a.set_option
+        FROM pg_auth_members a JOIN pg_roles r ON r.oid=a.roleid JOIN pg_roles m ON m.oid=a.member
+       WHERE r.rolname=$1 AND m.rolname=$2 ORDER BY a.admin_option DESC`, [TRANSFER_ROLE, member])).rows;
+    const lock = await pool.connect();
+    let locked = false;
+    let rolesCreated = false;
     let roleCreated = false;
     try {
+      await lock.query("SELECT pg_advisory_lock($1)", [TRANSFER_ROLE_LOCK]);
+      locked = true;
+      await pool.query(`CREATE ROLE ${adminGroup} NOLOGIN NOSUPERUSER CREATEROLE`);
+      rolesCreated = true;
+      await pool.query(`CREATE ROLE ${logins.member} LOGIN NOSUPERUSER NOCREATEROLE`);
+      await pool.query(`CREATE ROLE ${logins.runtime} LOGIN NOSUPERUSER NOCREATEROLE`);
+      await pool.query(`CREATE ROLE ${logins.creator} LOGIN NOSUPERUSER CREATEROLE`);
+      await pool.query(`CREATE ROLE ${logins.grouped} LOGIN NOSUPERUSER NOCREATEROLE IN ROLE ${adminGroup}`);
+      await pool.query(`CREATE ROLE ${logins.administrator} LOGIN NOSUPERUSER NOCREATEROLE`);
+      await pool.query(`GRANT USAGE ON SCHEMA ${quoted} TO ${loginNames}`);
+
+      const roleExisted = (await pool.query("SELECT 1 FROM pg_roles WHERE rolname=$1", [TRANSFER_ROLE])).rowCount === 1;
       if (!roleExisted) {
-        await pool.query(`CREATE ROLE ${TRANSFER_ROLE} NOLOGIN`);
+        assert.equal(await predicate(pool), false, "no transfer session without the role");
+        assert.equal(await asLogin(logins.runtime, predicate), false,
+          "a non-superuser session is not a transfer session while the role is absent, and the predicate does not raise");
+        // The operator path: a non-superuser CREATEROLE administrator creates it.
+        await asLogin(logins.creator, (session) => session.query(`CREATE ROLE ${TRANSFER_ROLE} NOLOGIN`));
         roleCreated = true;
+        assert.deepEqual(await membership(logins.creator), [{ admin_option: true, inherit_option: false, set_option: false }],
+          "PostgreSQL gives the creating CREATEROLE role an implicit ADMIN-only membership");
+      } else {
+        await pool.query(`GRANT ${TRANSFER_ROLE} TO ${logins.creator} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`);
       }
-      await pool.query(`CREATE ROLE ${member} LOGIN NOSUPERUSER IN ROLE ${TRANSFER_ROLE}`);
-      await pool.query(`CREATE ROLE ${runtime} LOGIN NOSUPERUSER`);
-      await pool.query(`GRANT USAGE ON SCHEMA ${quoted} TO ${member}, ${runtime}`);
+      assert.equal((await pool.query("SELECT pg_has_role($1,$2,'MEMBER') AS member", [logins.creator, TRANSFER_ROLE])).rows[0].member,
+        true, "'MEMBER' counts the ADMIN-only grant");
+      assert.equal(await asLogin(logins.creator, predicate), false, "an ADMIN-only creator membership is not a transfer session");
+      if (roleCreated) {
+        // Its ADMIN option lets the administrator grant itself SET.
+        await asLogin(logins.creator, (session) => session.query(`GRANT ${TRANSFER_ROLE} TO ${logins.creator} WITH SET TRUE`));
+      } else {
+        await pool.query(`GRANT ${TRANSFER_ROLE} TO ${logins.creator} WITH SET TRUE`);
+      }
+      assert.equal((await pool.query("SELECT pg_has_role($1,$2,'SET') AS can_set", [logins.creator, TRANSFER_ROLE])).rows[0].can_set,
+        true);
+      assert.equal(await asLogin(logins.creator, predicate), false,
+        "a CREATEROLE session is never a transfer session, even with a SET membership");
+
+      await pool.query(`GRANT ${TRANSFER_ROLE} TO ${logins.member}, ${logins.grouped}`);
+      await pool.query(`GRANT ${TRANSFER_ROLE} TO ${logins.administrator} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`);
       assert.equal(await predicate(pool), false, "a superuser session is never a transfer session");
-      const local = await endpoint();
-      for (const [role, expected] of [[member, true], [runtime, false]]) {
-        const session = new pg.Client({ ...local, user: role, password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, ssl: false });
-        await session.connect();
-        try {
-          assert.equal(await predicate(session), expected, `${expected ? "a" : "no"} transfer session for the ${role === member ? "member" : "runtime"} login`);
+      for (const [role, expected, label] of [
+        [logins.member, true, "a deliberately granted, non-escalating login is a transfer session"],
+        [logins.runtime, false, "the runtime role is not a transfer session"],
+        [logins.grouped, false, "a login that can SET ROLE to a CREATEROLE role is not a transfer session"],
+        [logins.administrator, false, "an ADMIN-only membership that cannot SET ROLE is not a transfer session"],
+      ]) {
+        await asLogin(role, async (session) => {
+          assert.equal(await predicate(session), expected, label);
           await assert.rejects(session.query(`SELECT ${quoted}.storage_journal_append('owner-active',$1,$1,$1,$1)`, [digest("x")]),
             (error) => error?.code === "42501", "append is not granted to PUBLIC");
-        } finally {
-          await session.end();
-        }
+        });
       }
     } finally {
-      await pool.query(`REVOKE ALL ON SCHEMA ${quoted} FROM ${member}, ${runtime}`).catch(() => {});
-      await pool.query(`DROP ROLE IF EXISTS ${member}`);
-      await pool.query(`DROP ROLE IF EXISTS ${runtime}`);
-      if (roleCreated) await pool.query(`DROP ROLE IF EXISTS ${TRANSFER_ROLE}`);
+      if (rolesCreated) {
+        await pool.query(`REVOKE ALL ON SCHEMA ${quoted} FROM ${loginNames}`).catch(() => {});
+        if (roleCreated) {
+          await pool.query(`DROP ROLE IF EXISTS ${TRANSFER_ROLE}`);
+        } else {
+          await pool.query(`REVOKE ${TRANSFER_ROLE} FROM ${loginNames}`).catch(() => {});
+        }
+        for (const role of [...Object.values(logins), adminGroup]) await pool.query(`DROP ROLE IF EXISTS ${role}`);
+      }
+      if (locked) await lock.query("SELECT pg_advisory_unlock($1)", [TRANSFER_ROLE_LOCK]).catch(() => {});
+      lock.release();
     }
   }));
 
@@ -1038,6 +1386,30 @@ test("PG17 owner-journal health is content-free and analytics retirement retains
           FROM ${table("storage_ingestion_changes")} WHERE source_id=$1 AND sequence=$2`, [SOURCE_ID, latest.sequence]);
     const erasedHead = (await heads(pool, table)).find((head) => head.state === "erased" && !head.seeded_partial);
     const options = { primaryPool: pool, ownerDigest: erasedHead.owner_digest, schema: { primarySchema: schema } };
+    // v1.2 receipts cascade with their participant, so a leftover one (for
+    // example from a restore) is fabricated with triggers and foreign keys
+    // suspended. Retirement must refuse while it remains.
+    const residue = async (sql, values) => {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("SET LOCAL session_replication_role = replica");
+        await client.query(sql, values);
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw error;
+      } finally {
+        client.release();
+      }
+    };
+    await residue(`INSERT INTO ${table("storage_v12_event_sources")} (
+        event_digest,owner_digest,participant_id,device_id,generation_id,previous_generation_id,manifest_digest,head_revision,recorded_ms
+      ) VALUES ($1,$2,'synthetic-health-erased','synthetic-health-device','0f000000-0000-4000-8000-000000000001',NULL,$3,1,1)`,
+    [digest("residual-v12-event"), erasedHead.owner_digest, digest("residual-v12-manifest")]);
+    await assert.rejects(retirePostgresAnalyticsOwner(options), (error) => error?.code === "ANALYTICS_OWNER_RETIREMENT_RESIDUAL_OWNER_ROWS",
+      "a remaining v1.2 publication receipt blocks retirement");
+    await residue(`DELETE FROM ${table("storage_v12_event_sources")} WHERE event_digest=$1`, [digest("residual-v12-event")]);
     const retired = await retirePostgresAnalyticsOwner(options);
     assert.equal(retired.status, "complete");
     assert.equal(retired.sourceCount, 1);

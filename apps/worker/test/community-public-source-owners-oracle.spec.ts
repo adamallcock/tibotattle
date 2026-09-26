@@ -23,12 +23,13 @@ import { initializeTypedV1Admission } from "../src/typed-v1-admission";
  *
  * The committed fixture holds both the case inputs and D1's rows. The
  * PostgreSQL spec (postgres-test/postgres-owner-journal-authority.spec.mjs)
- * rebuilds the same inputs against the staged 0046 view and must return the
- * same rows. A normal or CI run never writes the fixture: it is imported
- * below, so a missing file fails the run, and a changed result fails the
- * file comparison. The Workers test pool cannot read host environment
- * variables, so regeneration uses Vitest's explicit update flag instead:
- *   npx vitest run test/community-public-source-owners-oracle.spec.ts -u
+ * rebuilds the same inputs against the 0046 view and must return the same
+ * rows. A normal run, with or without Vitest's suite-wide -u, only compares
+ * D1's result with the imported fixture and never writes it. Regeneration
+ * needs an explicit environment flag (Vite passes VITE_-prefixed variables
+ * into the Workers pool) together with the update flag:
+ *   VITE_TIBOTATTLE_REGENERATE_PUBLIC_SOURCE_ORACLE=1 \
+ *     npx vitest run test/community-public-source-owners-oracle.spec.ts -u
  */
 
 interface Bindings extends Env {
@@ -90,6 +91,9 @@ interface OracleCase {
   readonly participants: readonly OracleParticipant[];
   readonly rows: readonly OracleRow[];
 }
+
+const REGENERATE = (import.meta as unknown as { readonly env: Readonly<Record<string, unknown>> }).env
+  .VITE_TIBOTATTLE_REGENERATE_PUBLIC_SOURCE_ORACLE === "1";
 
 const b = env as Bindings;
 const db = () => b.USAGE_MONITOR_DB;
@@ -379,7 +383,7 @@ it("D1's community_public_source_owners matches the committed twelve-case oracle
   };
 
   // Fixed expectations keep a regeneration from silently accepting a changed
-  // D1 predicate; the file comparison below then pins the exact rows.
+  // D1 predicate; the fixture comparison below then pins the exact rows.
   expect(Object.fromEntries(cases.map((oracleCase) => [oracleCase.name, oracleCase.rows.length]))).toEqual({
     "social-active": 1,
     "social-deleting": 0,
@@ -394,7 +398,10 @@ it("D1's community_public_source_owners matches the committed twelve-case oracle
     "accountless-v12-mismatched-constant": 0,
     "accountless-paired-device": 0,
   });
-  expect(committedOracle.schemaVersion).toBe(oracle.schemaVersion);
-  await expect(`${JSON.stringify(oracle, null, 2)}\n`)
-    .toMatchFileSnapshot("../postgres-test/fixtures/community-public-source-owners-oracle.json");
+  if (REGENERATE) {
+    await expect(`${JSON.stringify(oracle, null, 2)}\n`)
+      .toMatchFileSnapshot("../postgres-test/fixtures/community-public-source-owners-oracle.json");
+  } else {
+    expect(oracle).toEqual(committedOracle);
+  }
 }, 120_000);

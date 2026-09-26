@@ -456,19 +456,30 @@ $$;
 REVOKE ALL ON FUNCTION storage_owner_link_ensure(text, text) FROM PUBLIC;
 
 -- (10) Transfer-session predicate shared by every producer bypass. The role
--- is created by the transfer operator, never by a migration. pg_has_role is
--- true for superusers, so a superuser session is explicitly excluded.
+-- is created by the transfer operator, never by a migration. Only a
+-- deliberate grant counts: the session user must be able to SET ROLE to it.
+-- 'MEMBER' is not enough, because since PostgreSQL 16 a CREATEROLE role that
+-- creates the role receives an implicit ADMIN-only membership (SET and
+-- INHERIT false) and can then grant itself SET. So a session that is, or can
+-- SET ROLE to, a superuser or a CREATEROLE role (for example a Cloud SQL
+-- administrator in cloudsqlsuperuser) is never a transfer session: pg_has_role
+-- is true for superusers, and such a session could mint its own membership.
 CREATE FUNCTION storage_journal_transfer_session()
 RETURNS boolean
 LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'tibotattle_source_transfer') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'tibotattle_source_transfer')
+     OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = session_user) THEN
     RETURN false;
   END IF;
-  IF COALESCE((SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = session_user), true) THEN
+  IF EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles escalation
+     WHERE (escalation.rolsuper OR escalation.rolcreaterole)
+       AND pg_catalog.pg_has_role(session_user, escalation.oid, 'SET')
+  ) THEN
     RETURN false;
   END IF;
-  RETURN pg_catalog.pg_has_role(session_user, 'tibotattle_source_transfer', 'MEMBER');
+  RETURN pg_catalog.pg_has_role(session_user, 'tibotattle_source_transfer', 'SET');
 END;
 $$;
 
