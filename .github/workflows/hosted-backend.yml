@@ -1,0 +1,242 @@
+name: Hosted backend
+
+# Source-level CI for the hosted backend: the Worker gate, the Cloud Run host
+# check and every PostgreSQL 17 spec in its routed environment profile.
+#
+# PostgreSQL 17 is the official postgres image pinned by digest in
+# apps/worker/scripts/ci-postgres-container.mjs, run as the runner uid with a
+# private 0700 socket directory. The PGDG apt fallback documented there is not
+# in use.
+#
+# Read-only by construction: no secrets, no environments, no deployment, no
+# remote database or Cloudflare writes. A green run proves these source gates on
+# this commit only; it is not deployment, migration or release evidence.
+#
+# The path filters are the root inputs the gates import (checked by
+# test/hosted-backend-workflow.test.js from a static import closure).
+
+on:
+  pull_request:
+    paths:
+      - "apps/worker/**"
+      - "apps/web/public/**"
+      - "apps/electron/**"
+      - "config/**"
+      - "native/**"
+      - "packages/**"
+      - "schemas/**"
+      - "scripts/**"
+      - "src/**"
+      - "test/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - ".github/workflows/hosted-backend.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/worker/**"
+      - "apps/web/public/**"
+      - "apps/electron/**"
+      - "config/**"
+      - "native/**"
+      - "packages/**"
+      - "schemas/**"
+      - "scripts/**"
+      - "src/**"
+      - "test/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - ".github/workflows/hosted-backend.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-backend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  worker-gate:
+    name: Worker gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - name: Check out the selected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Install locked root and Worker dependencies
+        run: |
+          set -euo pipefail
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          test "$(node --version)" = "v26.2.0"
+          test "$(pnpm --version)" = "11.9.0"
+          pnpm install --frozen-lockfile --ignore-scripts
+          npm --prefix apps/worker ci
+
+      - name: Create the private PostgreSQL socket root
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /private/tmp
+          sudo chmod 1777 /private/tmp
+
+      - name: Start PostgreSQL 17 and export the SOCKET profile
+        run: node apps/worker/scripts/ci-postgres-container.mjs --export-socket-profile
+
+      - name: Check migration numbering and PostgreSQL suite routing
+        run: node --test apps/worker/scripts/migration-numbering.check.mjs apps/worker/scripts/ci-postgres-suite.check.mjs
+
+      # deploy:dry and staging:check stage production assets from a generated
+      # public release site. Build one locally from the checked-out source with a
+      # synthetic 1200x630 card; it is bundled by the dry run and never published.
+      - name: Build a synthetic public release site for the dry-run asset stage
+        run: |
+          set -euo pipefail
+          social_card="$RUNNER_TEMP/hosted-backend-social-card.png"
+          node --input-type=module --eval '
+            import { crc32, deflateSync } from "node:zlib";
+            import { writeFileSync } from "node:fs";
+            function chunk(type, data) {
+              const length = Buffer.alloc(4);
+              length.writeUInt32BE(data.length);
+              const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+              const crc = Buffer.alloc(4);
+              crc.writeUInt32BE(crc32(body) >>> 0);
+              return Buffer.concat([length, body, crc]);
+            }
+            const width = 1200;
+            const height = 630;
+            const header = Buffer.alloc(13);
+            header.writeUInt32BE(width, 0);
+            header.writeUInt32BE(height, 4);
+            header[8] = 8;
+            writeFileSync(process.argv[1], Buffer.concat([
+              Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+              chunk("IHDR", header),
+              chunk("IDAT", deflateSync(Buffer.alloc((width + 1) * height))),
+              chunk("IEND", Buffer.alloc(0)),
+            ]));
+          ' "$social_card"
+          node scripts/build-public-release-site.js \
+            --output "$GITHUB_WORKSPACE/.release-build/public-release-site" \
+            --site-url https://tibotattle.com/ \
+            --release-notes-url https://tibotattle.com/docs.html \
+            --privacy-url https://tibotattle.com/privacy.html \
+            --security-url https://tibotattle.com/docs.html \
+            --support-url https://tibotattle.com/docs.html \
+            --social-image "$social_card" > /dev/null
+
+      - name: Run the Worker gate
+        run: npm --prefix apps/worker run check
+
+      - name: Stop PostgreSQL 17
+        if: always()
+        run: node apps/worker/scripts/ci-postgres-container.mjs --stop
+
+  cloud-run-check:
+    name: Cloud Run check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the selected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Install locked root, Worker and Cloud Run dependencies
+        run: |
+          set -euo pipefail
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          test "$(node --version)" = "v26.2.0"
+          test "$(pnpm --version)" = "11.9.0"
+          pnpm install --frozen-lockfile --ignore-scripts
+          npm --prefix apps/worker ci
+          npm --prefix apps/worker/cloud-run ci
+
+      - name: Create the private PostgreSQL socket root
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /private/tmp
+          sudo chmod 1777 /private/tmp
+
+      - name: Start PostgreSQL 17 and export the SOCKET profile
+        run: node apps/worker/scripts/ci-postgres-container.mjs --export-socket-profile
+
+      - name: Run the Cloud Run check
+        run: npm --prefix apps/worker/cloud-run run check
+
+      - name: Stop PostgreSQL 17
+        if: always()
+        run: node apps/worker/scripts/ci-postgres-container.mjs --stop
+
+  postgres-17-suite:
+    name: PostgreSQL 17 suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the selected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          check-latest: false
+          package-manager-cache: false
+
+      # Two specs import Cloud Run host modules, so this job needs its lockfile too.
+      - name: Install locked root, Worker and Cloud Run dependencies
+        run: |
+          set -euo pipefail
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          test "$(node --version)" = "v26.2.0"
+          test "$(pnpm --version)" = "11.9.0"
+          pnpm install --frozen-lockfile --ignore-scripts
+          npm --prefix apps/worker ci
+          npm --prefix apps/worker/cloud-run ci
+
+      - name: Create the private PostgreSQL socket root
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /private/tmp
+          sudo chmod 1777 /private/tmp
+
+      - name: Start PostgreSQL 17 and export the SOCKET profile
+        run: node apps/worker/scripts/ci-postgres-container.mjs --export-socket-profile
+
+      - name: Run every PostgreSQL spec in its routed profile with zero skips
+        run: node apps/worker/scripts/ci-postgres-suite.mjs
+
+      - name: Stop PostgreSQL 17
+        if: always()
+        run: node apps/worker/scripts/ci-postgres-container.mjs --stop
