@@ -41,16 +41,42 @@
 -- Also ported for parity: attribution enrollments and transport format
 -- identities are immutable, and a device has at most one floor row.
 --
+-- Existing rows: D1 gave every participant and device that predates each
+-- trigger its rows in the same migration (0044:23-24,56-57; isolation
+-- 0008:47-63), and D1 0058 creates them for every participant. PostgreSQL
+-- participants and devices written before this file have none (only the
+-- accountless enrollment writer inserts an enrollment and a floor), so the
+-- same set-based backfill runs here, before any trigger exists: every
+-- participant without an enrollment gets a random namespace; every
+-- participant without a floor gets D1's creation floor (social 1, accountless
+-- 11), revision 0; every device without a floor gets D1 isolation 0008's
+-- backfill value. A participant that holds a v1.1 consent but no floor
+-- cannot be backfilled faithfully (the floor and revision its consents
+-- implied are unknown): the migration refuses before writing anything, and
+-- the store is repaired against a copy first. An imported store already
+-- carries D1's rows, so nothing is backfilled there.
+--
 -- Not ported here: D1's telemetry_transport_legacy_insert on
 -- telemetry_contributions (the v0.x legacy floor belongs to the legacy
--- contribution family), and D1's auto-creation for accountless participants
--- (see (a)).
+-- contribution family), D1's auto-creation for accountless participants
+-- (see (a)), and D1's v1.1 manifest, chunk and predecessor admission
+-- triggers, which read these floors (V11-A's 0059 and V11-C's 0066).
 --
 -- Every RAISE carries a constant message and an explicit ERRCODE: P1007 for
 -- a transport refusal ('telemetry_transport_blocked'), P1005 for every other
 -- invariant. No NEW or OLD value is ever interpolated into a message.
 -- Constraint additions validate existing rows, so a store that already
 -- violates a D1 rule refuses this migration instead of being rewritten.
+
+-- A SQLite migration runs alone; here writers keep running. The backfill's
+-- source tables are locked against writes until this transaction commits
+-- (the level CREATE TRIGGER takes anyway, taken before the backfill reads),
+-- so no participant, device or consent arrives after the backfill and
+-- before the trigger that covers it. They are locked first, before any floor
+-- table, in the order writers take them (participant, device, consent, then
+-- the floors), so a concurrent writer waits instead of deadlocking.
+LOCK TABLE participants, device_credentials, telemetry_v11_device_consents
+  IN SHARE ROW EXCLUSIVE MODE;
 
 -- (g) Rollback records: D1 0044:64-73. The foreign key uses whichever key
 -- holds admin_action_audit.operation_id when this file runs: the primary key
@@ -65,10 +91,82 @@ ALTER TABLE telemetry_transport_floor_rollbacks
   ADD CONSTRAINT telemetry_transport_floor_rollbacks_to_rank_check
     CHECK (to_rank IN (1, 2, 10, 11) AND to_rank < from_rank);
 
+-- D1 0044:52 and isolation 0008:41: a floor names one of the four ranked
+-- formats. Primary 0005 also admits 12 (its format table carries v1.2 at
+-- rank 12), but v1.2 never reads or writes a floor, and a floor at 12 could
+-- never be rolled back and would be copied onto every new social device.
+-- 0005's wider checks stay; these validated ones close the domain, so a store
+-- already holding a rank-12 floor refuses this migration.
+ALTER TABLE telemetry_transport_participant_floors
+  ADD CONSTRAINT telemetry_transport_participant_floors_ranked_check
+    CHECK (minimum_rank IN (1, 2, 10, 11));
+ALTER TABLE telemetry_transport_device_floors
+  ADD CONSTRAINT telemetry_transport_device_floors_ranked_check
+    CHECK (minimum_rank IN (1, 2, 10, 11));
+
 -- D1 isolation 0008:45: UNIQUE (device_id). It also serves the device FK's
 -- cascade lookup, which the (participant_id, device_id) key cannot.
 CREATE UNIQUE INDEX telemetry_transport_device_floors_device
   ON telemetry_transport_device_floors(device_id);
+
+-- Existing rows (see the header; their tables are locked above). Refuse
+-- first: a consent without a floor.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM telemetry_v11_device_consents consent
+     WHERE NOT EXISTS (
+       SELECT 1 FROM telemetry_transport_participant_floors floor_row
+        WHERE floor_row.participant_id = consent.participant_id
+     )
+  ) THEN
+    RAISE EXCEPTION 'telemetry_transport_floor_backfill_unavailable' USING ERRCODE = 'P1005';
+  END IF;
+END;
+$$;
+
+-- D1 0044:23-24 and 0058:539-543: a fresh random namespace per enrollment.
+INSERT INTO attribution_enrollments (participant_id, namespace, created_at)
+SELECT participant.id,
+       encode(sha256(convert_to(gen_random_uuid()::text || gen_random_uuid()::text, 'UTF8')), 'hex'),
+       clock_timestamp()
+  FROM participants participant
+ WHERE NOT EXISTS (
+   SELECT 1 FROM attribution_enrollments enrollment
+    WHERE enrollment.participant_id = participant.id
+ );
+
+-- D1 0044:56-57 and 0058:1711-1720: the creation floor, revision 0.
+INSERT INTO telemetry_transport_participant_floors (participant_id, minimum_rank, revision, changed_at)
+SELECT participant.id,
+       CASE WHEN participant.owner_kind = 'accountless' THEN 11 ELSE 1 END,
+       0, clock_timestamp()
+  FROM participants participant
+ WHERE NOT EXISTS (
+   SELECT 1 FROM telemetry_transport_participant_floors floor_row
+    WHERE floor_row.participant_id = participant.id
+ );
+
+-- D1 isolation 0008:47-63, including its consented-device branch.
+INSERT INTO telemetry_transport_device_floors (participant_id, device_id, minimum_rank, revision, changed_at)
+SELECT device.participant_id, device.id,
+       CASE
+         WHEN participant.owner_kind = 'accountless' THEN floor_row.minimum_rank
+         WHEN floor_row.minimum_rank = 11 AND EXISTS (
+           SELECT 1 FROM telemetry_v11_device_consents consent
+            WHERE consent.participant_id = device.participant_id AND consent.device_id = device.id
+         ) THEN 11
+         WHEN floor_row.minimum_rank = 11 THEN 10
+         ELSE floor_row.minimum_rank
+       END,
+       0, floor_row.changed_at
+  FROM device_credentials device
+  JOIN participants participant ON participant.id = device.participant_id
+  JOIN telemetry_transport_participant_floors floor_row ON floor_row.participant_id = device.participant_id
+ WHERE NOT EXISTS (
+   SELECT 1 FROM telemetry_transport_device_floors existing
+    WHERE existing.device_id = device.id
+ );
 
 -- D1 0044:30-31 / 0058:544-545.
 CREATE FUNCTION attribution_enrollment_immutable()

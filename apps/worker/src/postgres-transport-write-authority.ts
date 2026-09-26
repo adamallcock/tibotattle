@@ -56,10 +56,13 @@ export interface PostgresTransportWriteAuthorityOptions {
   /** Request time; defaults to Date.now(). Replaces D1's strftime('now'). */
   readonly nowEpoch?: number;
   /**
-   * Take FOR SHARE locks on the participant, device, both floors and the
-   * v1.1 grant rows before reading, so the decision holds until the caller's
-   * transaction ends. Requires a client inside that transaction; a pool is
-   * refused, because its read transaction would release the locks at once.
+   * Legacy formats (v0.1 to v1.1): take FOR SHARE locks on the participant,
+   * device, both floors, the format row and the v1.1 grant rows before
+   * reading, so the decision holds until the caller's transaction ends.
+   * Requires a client inside that transaction; a pool is refused, because
+   * its read transaction would release the locks at once. v1.2 is decided by
+   * the delegated PostgreSQL v1.2 authority, which takes its own FOR SHARE
+   * locks on a client whether or not this is set.
    */
   readonly lock?: boolean;
 }
@@ -123,6 +126,15 @@ function storageUnavailable(error: unknown): ApiError {
  * distinguishes some of them (401 DEVICE_AUTH_INVALID, 400
  * TELEMETRY_REQUIRED); each such refusal is the Worker's 403 here. Storage
  * failures stay 503.
+ *
+ * Delegating keeps one PostgreSQL v1.2 authority: the typed v1.2 staging and
+ * activation paths call the same check, as the Worker's upload
+ * authorization and v1.2 repository share assertTelemetryV12WriteAllowed.
+ * Where that authority is stricter than the Worker it refuses here too
+ * (known: a social participant whose consent_version is the account-scoped
+ * ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION; the Worker admits it). That is
+ * fixed in src/postgres-typed-v12-admission.ts, not by a second v1.2
+ * decision here that staging would contradict.
  */
 function workerV12Refusal(error: unknown): ApiError {
   if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
@@ -155,15 +167,17 @@ async function assertV12WriteAllowed(
 }
 
 /**
- * Lock order: participant, device, participant floor, device floor, v1.1
- * consent, accountless ledger, owner and v1.1 grant. It matches the floor
- * writers (participant floor before device floor). Absent rows cannot be
- * locked; the following read decides on what exists.
+ * Lock order: participant, device, participant floor, device floor, format
+ * row, v1.1 consent, accountless ledger, owner and v1.1 grant. It matches the
+ * floor writers (participant floor before device floor) and the v1 writer
+ * guard reject_v1_transport_floor (device floor before format row). Absent
+ * rows cannot be locked; the following read decides on what exists.
  */
 async function lockAuthorityRows(
   client: PostgresClient,
   schema: string,
   principal: TelemetryTransportPrincipal,
+  version: TelemetryTransportSchemaVersion,
 ): Promise<void> {
   const participant = principal.participantId;
   const device = principal.deviceId;
@@ -178,6 +192,11 @@ async function lockAuthorityRows(
   await client.query(
     `SELECT 1 FROM ${table(schema, "telemetry_transport_device_floors")}
       WHERE participant_id = $1 AND device_id = $2 FOR SHARE`, [participant, device]);
+  // The decision reads the lifecycle and rank; an owner lifecycle change
+  // waits for the caller's transaction instead of slipping under it.
+  await client.query(
+    `SELECT 1 FROM ${table(schema, "telemetry_transport_formats")}
+      WHERE schema_version = $1 FOR SHARE`, [version]);
   await client.query(
     `SELECT 1 FROM ${table(schema, "telemetry_v11_device_consents")}
       WHERE participant_id = $1 AND device_id = $2 FOR SHARE`, [participant, device]);
@@ -281,7 +300,8 @@ function decide(row: TransportAuthorityRow | undefined, version: TelemetryTransp
  * Shared by upload authorization, contribution claims, staging and
  * activation, for all five formats. A pool call reads in its own bounded
  * read-only transaction; a client call runs inside the caller's transaction
- * and, with `lock`, holds FOR SHARE locks on the rows it decided on.
+ * and, with `lock`, holds FOR SHARE locks on the rows it decided on (see
+ * PostgresTransportWriteAuthorityOptions.lock for v1.2).
  *
  * Codes are the Worker's: an unknown or non-string schema is 403
  * TELEMETRY_TRANSPORT_BLOCKED; no joined row or an owner/authority mismatch
@@ -323,7 +343,7 @@ export async function assertPostgresTelemetryTransportWriteAllowed(
         { operation: OPERATION, preserveSafeError: (error) => (error instanceof ApiError ? error : null) },
       );
     } else {
-      if (lock) await lockAuthorityRows(connection.client, schema, principal);
+      if (lock) await lockAuthorityRows(connection.client, schema, principal, version);
       row = await readAuthorityRow(connection.client, schema, principal, version, nowIso);
     }
   } catch (error) {
