@@ -267,7 +267,7 @@ describe("typed accountless upload to isolated projection", () => {
     expect(await target().prepare(`SELECT COUNT(*) AS n
       FROM analytics_admin_metric_snapshots WHERE source_id=?`).bind(sourceId).first<number>("n")).toBe(1);
     expect(await target().prepare(`SELECT COUNT(*) AS n
-      FROM analytics_admin_metrics_history_cache WHERE source_id=?`).bind(sourceId).first<number>("n")).toBe(1);
+      FROM analytics_admin_metrics_history_publications WHERE source_id=?`).bind(sourceId).first<number>("n")).toBe(1);
     const snapshotJson = await target().prepare(`SELECT metrics_json
       FROM analytics_admin_metric_snapshots WHERE source_id=?`).bind(sourceId)
       .first<string>("metrics_json");
@@ -278,7 +278,7 @@ describe("typed accountless upload to isolated projection", () => {
       contributingAccountsTotal: 1,
     });
     const historyJson = await target().prepare(`SELECT payload_json
-      FROM analytics_admin_metrics_history_cache WHERE source_id=?`).bind(sourceId)
+      FROM analytics_admin_metrics_history_publications WHERE source_id=?`).bind(sourceId)
       .first<string>("payload_json");
     expect(JSON.parse(historyJson!).events).toMatchObject({
       uploadedChunks: { total: 2 },
