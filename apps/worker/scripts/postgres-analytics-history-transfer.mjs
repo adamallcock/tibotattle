@@ -1219,6 +1219,8 @@ export async function transferPostgresAnalyticsHistoryState({
         appliedEventJournalTransferred: Boolean(appliedEventTransfer),
         historicalPublicationRowsTransferred: false,
         sourceNamespaceRegistryTransferred: false,
+        runtimeSourceRegistryTargetDdlOwned: false,
+        erasureFenceHistoryTransferred: false,
         analyticsContinuityQualified: false,
         readerEnabled: false,
         publicationEnabled: false,

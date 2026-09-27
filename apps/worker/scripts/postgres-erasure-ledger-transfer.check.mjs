@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import {
   createSealedSqliteErasureLedgerSource,
+  POSTGRES_ERASURE_LEDGER_GCP_TEST_TARGET,
   POSTGRES_ERASURE_LEDGER_SOURCE_COLUMNS,
   runPostgresErasureLedgerTransfer,
 } from "./postgres-erasure-ledger-transfer.mjs";
@@ -137,4 +138,20 @@ test("transfer entrypoint rejects caller-built sources, broad schemas, and unbou
     source, destinationPool: {}, targetSchema: "erasure_ledger_transfer_target_synthetic",
     transferId: "synthetic-run",
   }), { code: "ERASURE_LEDGER_SEALED_SOURCE_REQUIRED" });
+});
+
+test("production ledger target is refused before the disposable importer touches PostgreSQL", async () => {
+  let targetCalls = 0;
+  const destinationPool = {
+    async query() { targetCalls += 1; throw new Error("unexpected target query"); },
+    async connect() { targetCalls += 1; throw new Error("unexpected target connection"); },
+  };
+  assert.equal(POSTGRES_ERASURE_LEDGER_GCP_TEST_TARGET.mode, "gcp_named_test");
+  await assert.rejects(runPostgresErasureLedgerTransfer({
+    source: {},
+    destinationPool,
+    targetSchema: POSTGRES_ERASURE_LEDGER_GCP_TEST_TARGET.schema,
+    transferId: "production-ledger-attempt",
+  }), { code: "ERASURE_LEDGER_TARGET_SCHEMA_REQUIRED" });
+  assert.equal(targetCalls, 0, "the named GCP test target cannot be reached through the disposable entrypoint");
 });

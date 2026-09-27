@@ -178,6 +178,9 @@ test("PG17 stages only exact analytics state/cursors behind contained controls",
     assert.equal(result.fullAnalyticsTransfer, false);
     assert.equal(result.limitations.appliedEventJournalTransferred, false);
     assert.equal(result.limitations.historicalPublicationRowsTransferred, false);
+    assert.equal(result.limitations.sourceNamespaceRegistryTransferred, false);
+    assert.equal(result.limitations.runtimeSourceRegistryTargetDdlOwned, false);
+    assert.equal(result.limitations.erasureFenceHistoryTransferred, false);
     assert.equal(result.limitations.analyticsContinuityQualified, false);
     assert.equal(result.limitations.readerEnabled, false);
     assert.equal(result.limitations.publicationEnabled, false);
@@ -289,6 +292,9 @@ test("PG17 combined sealed analytics bootstrap resumes both event and owner-stat
     assert.equal(result.publicationEnabled, false);
     assert.equal(result.productionCutoverAuthorized, false);
     assert.equal(result.limitations.appliedEventJournalTransferred, true);
+    assert.equal(result.limitations.sourceNamespaceRegistryTransferred, false);
+    assert.equal(result.limitations.runtimeSourceRegistryTargetDdlOwned, false);
+    assert.equal(result.limitations.erasureFenceHistoryTransferred, false);
     assert.equal(result.tables.analytics_owner_state.sourceRows, "3");
     assert.equal(result.tables.analytics_source_cursors.sourceRows, "1");
 

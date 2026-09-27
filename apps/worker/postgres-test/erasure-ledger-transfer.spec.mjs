@@ -187,6 +187,8 @@ test("PG17 reconciles a sealed D1 erasure ledger with resumable, fail-closed par
     assert.equal(result.operationalRowsPromoted, true);
     assert.equal(result.capabilities.applicationLedgerRoutingChanged, false);
     assert.equal(result.capabilities.erasureRuntimeActivated, false);
+    assert.equal(result.capabilities.productionStageRegistered, false);
+    assert.equal(result.capabilities.analyticsErasureHistoryTransferred, false);
     assert.equal(result.capabilities.productionCutoverAuthorized, false);
     assert.equal(result.tables.deletion_tombstones.sourceRows, 2);
     assert.equal(result.tables.identity_reenrollment_cooldowns.sourceRows, 1);

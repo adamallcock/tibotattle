@@ -1062,6 +1062,7 @@ async function executeTransfer({
       operationalRowsPromoted: promoted,
       capabilities: Object.freeze({ historicalRowsReconciled: true, transferReceiptsWritten: true,
         namedTestTarget: targetMode === POSTGRES_ERASURE_LEDGER_GCP_TEST_TARGET.mode,
+        productionStageRegistered: false, analyticsErasureHistoryTransferred: false,
         applicationLedgerRoutingChanged: false, erasureRuntimeActivated: false, productionCutoverAuthorized: false }),
     });
   } finally {
