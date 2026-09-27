@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import {
   canonicalTelemetryV12Json,
 } from "@app-usagemonitor/telemetry-contract";
-import { createTelemetryV12RealClientHarness } from "./telemetry-v12-real-client-harness.mjs";
+import { createTelemetryV12RealClientHarness } from "./telemetry-v12-real-client-harness.setup.mjs";
 
 const hasLocalPostgres = Boolean(process.env.PG_TEST_SOCKET || process.env.PG_TEST_HOST);
 

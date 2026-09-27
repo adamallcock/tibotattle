@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
-import { createTelemetryV12RealClientHarness } from "./telemetry-v12-real-client-harness.mjs";
+import { createTelemetryV12RealClientHarness } from "./telemetry-v12-real-client-harness.setup.mjs";
 
 const CAPABILITIES_PATH = "/api/v1/device/sync-capabilities-v1.2";
 const ACTIVATION_PATH = "/api/v1/me/telemetry-v12/domain-activate";
