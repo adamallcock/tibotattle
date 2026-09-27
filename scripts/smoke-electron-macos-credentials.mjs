@@ -376,6 +376,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
   const proof = { schemaVersion: SCHEMA, status: 'planned', credentialContinuityQualified: false,
     enforcedLoopbackOnly: false, networkGuardReleased: false, fixtureCleaned: false, ownedProcessesStopped: false,
     predecessorFirstRunCompleted: false,
+    predecessorKeychainIdentity: null,
     applicationBytesUnchanged: false, cases: [], fixtureScopes: [], failureStage: null, failurePhase: null, failureDiagnostics: null, fixtureFailure: null,
     nativeLegacyMigrationQualified: false, hostedUploadQualified: false, timeoutQualified: false,
     lockedStoreQualified: false, deniedStoreQualified: false, legacyOnlyQualified: false,
@@ -451,6 +452,16 @@ export async function runMacCredentialQualification({ intake, execute = false })
     await fixture.request('seed'); const before = validateCredentialSnapshot(await fixture.request('snapshot'), 'modern');
     proof.fixtureScopes.push({ scenario: 'modern', ...((await fixture.request('select')).scope) });
     await fixture.request('scope');
+    const keychainFile = join(input.fixtureRoot, 'modern', 'synthetic.keychain-db');
+    const keychainBefore = await lstat(keychainFile, { bigint: true });
+    if (!keychainBefore.isFile() || keychainBefore.nlink !== 1n
+      || keychainBefore.uid !== BigInt(process.getuid())) fail('fixture_identity');
+    const sameKeychain = async () => {
+      try { const current = await lstat(keychainFile, { bigint: true });
+        return current.isFile() && current.dev === keychainBefore.dev && current.ino === keychainBefore.ino; }
+      catch { return false; }
+    };
+    proof.predecessorKeychainIdentity = {};
     stage = 'predecessor_launch'; active = await launchCredential(verified, {
       ...launchOptions,
       onFailure: ({ pid, stage: launchStage, fixedEntryFailureObserved, debuggerListening, exitCode, exitSignal }) => {
@@ -463,10 +474,14 @@ export async function runMacCredentialQualification({ intake, execute = false })
         }
       },
     });
+    proof.predecessorKeychainIdentity.afterLaunch = await sameKeychain();
     stage = 'predecessor_settings'; await exerciseEmptyProfileSettings(active.settings);
+    proof.predecessorKeychainIdentity.afterSettings = await sameKeychain();
     stage = 'predecessor_opt_out'; await active.settings.evaluate('globalThis.tibotattleDesktop.setSharingEnabled(false)');
     await until(async () => (await active.readSharing())?.enabled === false, 'predecessor_opt_out');
+    proof.predecessorKeychainIdentity.afterOptOut = await sameKeychain();
     await stopOwnedMacSharingApp(active); active = null;
+    proof.predecessorKeychainIdentity.afterStop = await sameKeychain();
     if (JSON.stringify(validateCredentialSnapshot(await fixture.request('snapshot'), 'modern')) !== JSON.stringify(before)) fail('predecessor_credential_changed');
     stage = 'installed_replacement';
     // Preserve the old signed app, never recursively delete or overwrite it.

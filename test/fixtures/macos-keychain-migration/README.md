@@ -101,6 +101,9 @@ only its fixed allowlisted code, scenario and protocol command. Unknown codes,
 extra fields, raw stderr, error text and credential values are never copied into
 the result. A failed fixture operation is not classified as an app defect until
 its specific cause is established.
+The predecessor also records only whether the journal-owned synthetic Keychain
+keeps the same device and inode after launch, settings, opt-out and stop. A
+changed identity remains a failed fixture receipt, never an adoption authority.
 
 ## Original native migration fixture
 
