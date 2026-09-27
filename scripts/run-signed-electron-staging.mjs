@@ -13,6 +13,7 @@ import { desktopFirstRunDialogCopy, validateDesktopFirstRunReceipt } from '../ap
 import { classifyDesktopSharingInstallation } from '../apps/electron/desktop-sharing-installation.js';
 import { verifySignedStagingLaunchInputs, prepareSignedStagingDisposableProfile, parseSignedStagingConsumerArguments } from './consume-signed-electron-staging.mjs';
 import { macOSLoopbackLaunch, MACOS_LOOPBACK_MODE } from './lib/macos-loopback-qualification.mjs';
+import { MACOS_PF_CREDENTIAL_MODE } from './lib/macos-pf-credential-qualification.mjs';
 
 export const SIGNED_STAGING_EXECUTION_SCHEMA = 'tibotattle-signed-staging-execution-v1';
 const OPERATION = 10_000;
@@ -179,17 +180,17 @@ export function assertSignedStagingFreshProjection(sharing, receipt) {
 
 async function launch(verified, environment, { untouched = false, onFailure, launchServices = false,
   networkMode = null, observeBeforeDashboard, observeFixedEntryFailure = false } = {}) {
-  if (networkMode !== null && networkMode !== MACOS_LOOPBACK_MODE) fail('network_policy');
+  if (networkMode !== null && ![MACOS_LOOPBACK_MODE, MACOS_PF_CREDENTIAL_MODE].includes(networkMode)) fail('network_policy');
   if (networkMode !== null && launchServices) fail('network_policy');
   if (observeFixedEntryFailure !== false
-      && (observeFixedEntryFailure !== true || !untouched || networkMode !== MACOS_LOOPBACK_MODE)) fail('diagnostic_policy');
-  if (observeBeforeDashboard !== undefined && (networkMode !== MACOS_LOOPBACK_MODE
+      && (observeFixedEntryFailure !== true || !untouched || networkMode === null)) fail('diagnostic_policy');
+  if (observeBeforeDashboard !== undefined && (networkMode === null
     || typeof observeBeforeDashboard !== 'function')) fail('startup_observer');
   // Same-identity handover/SingleInstanceLock must never attach to a pre-existing app.
   if (processTable().some((row) => /\/TiboTattle(?: Dev)?\.app\/Contents\/MacOS\/TiboTattle(?: Dev)?$/u.test(row.command))) fail('preexisting_app');
   const port = await freePort();
   const argumentsList = ['--remote-debugging-port=' + port, '--remote-debugging-address=127.0.0.1'];
-  const direct = networkMode === null ? { executable: verified.executable, args: argumentsList }
+  const direct = networkMode !== MACOS_LOOPBACK_MODE ? { executable: verified.executable, args: argumentsList }
     : macOSLoopbackLaunch(verified.executable, argumentsList, networkMode);
   const entryFailure = observeFixedEntryFailure ? fixedEntryFailureObserver() : null;
   const child = launchServices

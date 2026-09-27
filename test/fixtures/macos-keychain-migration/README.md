@@ -67,11 +67,14 @@ The only fixture transport is the immutable
 namespace on the existing updates host. The workflow does not upload it.
 
 The default workflow mode plans only. Explicit execution requires
-`RUN_DISPOSABLE_SIGNED_MAC_CREDENTIALS`. Before launching either signed app,
-the harness checks actual kernel denial of external IPv4/IPv6 TCP/UDP and a
-descendant process, plus an actual loopback connection. A fixed inherited
-sandbox permits loopback, retains normal OS credential protection, and blocks
-external app traffic; no endpoint, proxy, app bytes or ACL is weakened.
+`RUN_DISPOSABLE_SIGNED_MAC_CREDENTIALS`. The hosted runner downloads and
+verifies both signed apps and the fixture before installing a temporary PF
+anchor that blocks outbound TCP and UDP outside `lo0` for the runner UID. It
+checks the installed rules, PF enabled state, a reachable external connection
+before activation, its denial after activation, and working loopback. The
+guard is rechecked before every ordinary signed-app launch and released after
+all owned app processes stop. A missing or ineffective guard fails before app
+launch. No endpoint, proxy, app bytes or Keychain ACL is changed.
 
 Each journey first completes the signed predecessor's ordinary first run with
 external traffic blocked and before selecting the synthetic Keychain or placing

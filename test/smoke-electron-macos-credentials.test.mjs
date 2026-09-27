@@ -17,6 +17,8 @@ import { CREDENTIAL_FIXTURE_CASES, credentialFixtureRoot, credentialFixtureConfi
   parseCredentialFixtureArguments, compileCredentialFixture } from '../scripts/prepare-electron-macos-credential-fixture.mjs';
 import { MACOS_LOOPBACK_POLICY, MACOS_LOOPBACK_MODE, macOSLoopbackLaunch,
   macOSLoopbackProbeSource, inspectMacOSLoopbackEnforcement } from '../scripts/lib/macos-loopback-qualification.mjs';
+import { MACOS_PF_CREDENTIAL_MODE, macOSCredentialPfRule, macOSPfRuleInstalled,
+  parseMacOSPfEnableToken } from '../scripts/lib/macos-pf-credential-qualification.mjs';
 import { fixedEntryFailureObserver, launchVerifiedMacSharingApp } from '../scripts/run-signed-electron-staging.mjs';
 import { MAC_CREDENTIAL_CURRENT_STABLE_SCHEMA, preflightMacCredentialEnvironment } from '../scripts/lib/macos-credential-qualification-intake.mjs';
 import { validateEmptyProfileIntake } from '../scripts/smoke-electron-macos-empty-profile.mjs';
@@ -278,6 +280,22 @@ test('fixed network launch cannot accept a policy, environment or command overri
   await assert.rejects(launchVerifiedMacSharingApp({}, {}, { networkMode: MACOS_LOOPBACK_MODE, launchServices: true }));
   await assert.rejects(launchVerifiedMacSharingApp({}, {}, { observeBeforeDashboard: () => null }));
   await assert.rejects(launchVerifiedMacSharingApp({}, {}, { observeFixedEntryFailure: true }));
+});
+
+test('temporary PF guard is runner-UID scoped and requires both installed transport rules', () => {
+  assert.equal(MACOS_PF_CREDENTIAL_MODE, 'credential-qualification-pf-uid-v1');
+  assert.equal(macOSCredentialPfRule(501),
+    'block drop out quick on ! lo0 proto { tcp, udp } all user 501\n');
+  for (const uid of [0, -1, 65536, '501']) assert.throws(() => macOSCredentialPfRule(uid));
+  assert.equal(parseMacOSPfEnableToken('PF enabled\nToken : 12345\n'), '12345');
+  for (const value of ['PF enabled', 'Token : 0\n', 'Token : /private/SECRET\n'])
+    assert.throws(() => parseMacOSPfEnableToken(value));
+  const installed = 'block drop out quick on ! lo0 proto tcp from any to any user = 501\n'
+    + 'block drop out quick on ! lo0 proto udp from any to any user = 501\n';
+  assert.equal(macOSPfRuleInstalled(installed, 501), true);
+  assert.equal(macOSPfRuleInstalled(installed, 502), false);
+  assert.equal(macOSPfRuleInstalled(installed.replace('proto udp', 'proto tcp'), 501), false);
+  assert.equal(macOSPfRuleInstalled(installed + 'pass out quick all\n', 501), false);
 });
 
 const networkProof = { loopback: true, ipv4Denied: true, ipv6Denied: true, udp4Denied: true, udp6Denied: true, descendantDenied: true };

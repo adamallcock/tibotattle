@@ -13,7 +13,7 @@ import { validateSparkleTransitionHost, signedMacTransitionEnvironment,
 import { verifyPredecessor, refreshProductionUpdateArchiveIndex } from './smoke-electron-macos-production-update.mjs';
 import { launchVerifiedMacSharingApp, stopOwnedMacSharingApp, signedStagingFixture } from './run-signed-electron-staging.mjs';
 import { CREDENTIAL_FIXTURE_CASES, CREDENTIAL_FIXTURE_REQUIREMENT } from './prepare-electron-macos-credential-fixture.mjs';
-import { inspectMacOSLoopbackEnforcement, MACOS_LOOPBACK_MODE } from './lib/macos-loopback-qualification.mjs';
+import { activateMacOSCredentialPfGuard, MACOS_PF_CREDENTIAL_MODE } from './lib/macos-pf-credential-qualification.mjs';
 import { desktopFirstRunDialogCopy } from '../apps/electron/desktop-first-run.js';
 
 export { MAC_CREDENTIAL_CONFIRMATION, validateMacCredentialIntake, parseMacCredentialArguments } from './lib/macos-credential-qualification-intake.mjs';
@@ -371,14 +371,14 @@ export function macCredentialFailureDiagnostics(error, predecessorUi = null, pre
 
 export async function runMacCredentialQualification({ intake, execute = false }) {
   const proof = { schemaVersion: SCHEMA, status: 'planned', credentialContinuityQualified: false,
-    enforcedLoopbackOnly: false, fixtureCleaned: false, ownedProcessesStopped: false,
+    enforcedLoopbackOnly: false, networkGuardReleased: false, fixtureCleaned: false, ownedProcessesStopped: false,
     predecessorFirstRunCompleted: false,
     applicationBytesUnchanged: false, cases: [], fixtureScopes: [], failureStage: null, failurePhase: null, failureDiagnostics: null, fixtureFailure: null,
     nativeLegacyMigrationQualified: false, hostedUploadQualified: false, timeoutQualified: false,
     lockedStoreQualified: false, deniedStoreQualified: false, legacyOnlyQualified: false,
     nativeCleanQuitQualified: false, partialMigrationQualified: false,
     completeCredentialFailureMatrixQualified: false };
-  let active = null, fixture = null, stage = 'intake', predecessorUi = null;
+  let active = null, fixture = null, networkGuard = null, stage = 'intake', predecessorUi = null;
   let predecessorEntryFailure = null, predecessorDebuggerListening = null, predecessorProcess = null, predecessorExit = null;
   try {
     const input = validateMacCredentialIntake(intake);
@@ -404,7 +404,6 @@ export async function runMacCredentialQualification({ intake, execute = false })
     await mkdir(directory, { mode: 0o700 }); await safePath(directory);
     await mkdir(input.fixtureRoot, { mode: 0o700 }); await safePath(input.fixtureRoot);
     const environment = signedMacTransitionEnvironment({ target: input.target, home, temporaryDirectory: directory });
-    stage = 'network_enforcement'; proof.networkChecks = await inspectMacOSLoopbackEnforcement(); proof.enforcedLoopbackOnly = true;
     stage = 'artifact_intake';
     const dmg = join(directory, 'candidate.dmg'), predecessor = join(directory, 'predecessor.dmg');
     await download(input.candidate.url, dmg, input.dmgSha256, 1024 ** 3);
@@ -416,9 +415,17 @@ export async function runMacCredentialQualification({ intake, execute = false })
       ? await verifyPredecessor({ ...input, architecture: 'arm64' }, installed)
       : await verifySparkleTransitionCandidate({ ...input.predecessor, target: input.target,
         architecture: 'arm64' }, installed);
-    const launchOptions = { networkMode: MACOS_LOOPBACK_MODE };
+    stage = 'network_enforcement';
+    networkGuard = await activateMacOSCredentialPfGuard({ temporaryRoot: process.env.RUNNER_TEMP,
+      runId: process.env.GITHUB_RUN_ID });
+    proof.networkChecks = networkGuard.proof; proof.enforcedLoopbackOnly = true;
+    const launchOptions = { networkMode: MACOS_PF_CREDENTIAL_MODE };
+    const launchCredential = async (app, options) => {
+      await networkGuard.assertEffective();
+      return launchVerifiedMacSharingApp(app, environment, options);
+    };
     stage = 'predecessor_first_run';
-    active = await launchVerifiedMacSharingApp(verified, environment, {
+    active = await launchCredential(verified, {
       ...launchOptions, untouched: true, observeFixedEntryFailure: true,
       onFailure: ({ pid, stage: launchStage, fixedEntryFailureObserved, debuggerListening, exitCode, exitSignal }) => {
         if (launchStage === 'native_intro') {
@@ -441,7 +448,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
     await fixture.request('seed'); const before = validateCredentialSnapshot(await fixture.request('snapshot'), 'modern');
     proof.fixtureScopes.push({ scenario: 'modern', ...((await fixture.request('select')).scope) });
     await fixture.request('scope');
-    stage = 'predecessor_launch'; active = await launchVerifiedMacSharingApp(verified, environment, {
+    stage = 'predecessor_launch'; active = await launchCredential(verified, {
       ...launchOptions,
       onFailure: ({ pid, stage: launchStage, fixedEntryFailureObserved, debuggerListening, exitCode, exitSignal }) => {
         if (launchStage === 'native_intro') {
@@ -467,7 +474,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
     for (let pass = 0; pass < 3; pass++) {
       stage = 'candidate_launch_' + pass;
       await fixture.request('scope');
-      active = await launchVerifiedMacSharingApp(verified, environment, launchOptions);
+      active = await launchCredential(verified, launchOptions);
       if (dialog(active.pid, 'inspect') !== 'no_secure_storage_dialog') fail('unexpected_security_ui');
       await exerciseEmptyProfileSettings(active.settings);
       if (pass === 0) await exerciseCredentialRefresh(active.dashboard);
@@ -488,7 +495,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
       proof.fixtureScopes.push({ scenario, ...((await fixture.request('select')).scope) });
       if (scenario === 'locked') await fixture.request('lock');
       await fixture.request('scope');
-      active = await launchVerifiedMacSharingApp(verified, environment, { ...launchOptions,
+      active = await launchCredential(verified, { ...launchOptions,
         observeBeforeDashboard: pid => observeRefusal(pid, scenario) });
       const observation = active.startupObservation;
       await stopOwnedMacSharingApp(active); active = null;
@@ -512,6 +519,10 @@ export async function runMacCredentialQualification({ intake, execute = false })
   finally {
     if (active) { try { await stopOwnedMacSharingApp(active); proof.ownedProcessesStopped = true; } catch { proof.ownedProcessesStopped = false; } }
     if (fixture) { try { await fixture.close(); } catch { /* Uncertain fixture scope/journal stays failed; hosted machine is disposable. */ } }
+    if (networkGuard) {
+      try { await networkGuard.close(); proof.networkGuardReleased = true; }
+      catch { proof.status = 'failed'; proof.networkGuardReleased = false; }
+    }
   }
   return proof;
 }
