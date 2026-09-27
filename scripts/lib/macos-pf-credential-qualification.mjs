@@ -1,6 +1,6 @@
 // Disposable hosted-Mac credential qualification only. Preserve the signed
 // app's ordinary launch while blocking new external sockets for the runner UID.
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { lookup } from 'node:dns/promises';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer, connect } from 'node:net';
@@ -18,7 +18,7 @@ export function macOSCredentialPfRule(uid) {
 }
 
 export function parseMacOSPfEnableToken(value) {
-  const match = /(?:^|\n)Token\s*:\s*(\d+)(?:\n|$)/iu.exec(value);
+  const match = /(?:^|\n)[ \t]*Token\s*:\s*(\d+)(?:\r?\n|$)/iu.exec(value);
   if (!match || !/^[1-9]\d{0,19}$/u.test(match[1])) fail();
   return match[1];
 }
@@ -37,6 +37,17 @@ function pf(args) {
     encoding: 'utf8', timeout: 10000, maxBuffer: 65536,
     stdio: ['ignore', 'pipe', 'ignore'],
   }); } catch { fail(); }
+}
+
+function enablePf() {
+  const result = spawnSync(SUDO, ['-n', PF, '-E'], {
+    encoding: 'utf8', timeout: 10000, maxBuffer: 65536,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (result.status !== 0 || result.error) fail();
+  // pfctl may write its reference token to stderr. Keep both streams in memory;
+  // only the validated numeric token is used, and neither stream is emitted.
+  return `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
 }
 
 function tcp(host, port) {
@@ -67,7 +78,7 @@ export async function activateMacOSCredentialPfGuard({ temporaryRoot, runId, uid
     stage = 'anchor_load';
     pf(['-a', anchor, '-f', file]); loaded = true;
     stage = 'enable_command';
-    const enabled = pf(['-E']);
+    const enabled = enablePf();
     stage = 'enable_token';
     token = parseMacOSPfEnableToken(enabled);
     const check = async () => {
