@@ -104,6 +104,11 @@ its specific cause is established.
 The predecessor also records only whether the journal-owned synthetic Keychain
 keeps the same device and inode after launch, settings, opt-out and stop. A
 changed identity remains a failed fixture receipt, never an adoption authority.
+The separate `audit` command can compare the three seeded synthetic values,
+item references and ACLs on a replacement inode. It reports only four booleans,
+does not advance the ownership journal, and cannot authorize mutation,
+restoration or cleanup. This diagnoses an observed macOS database rewrite but
+does not itself qualify credential continuity.
 
 ## Original native migration fixture
 

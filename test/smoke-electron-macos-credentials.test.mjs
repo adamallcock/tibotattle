@@ -164,7 +164,7 @@ with zipfile.ZipFile(sys.argv[1],'w') as z:
 const snapshot = () => ({ ok: true, items: ['account-observation', 'contribution-device', 'accountless-installation'].map(capability =>
   ({ capability, readable: true, itemDigest: 'a'.repeat(64), aclDigest: 'b'.repeat(64), valueDigest: 'c'.repeat(64) })) });
 test('helper failures retain only a known fixed code, closed scenario and actual protocol command', () => {
-  for (const operation of [null, 'seed', 'snapshot', 'select', 'scope', 'lock', 'unlock', 'restore', 'cleanup']) {
+  for (const operation of [null, 'seed', 'snapshot', 'audit', 'select', 'scope', 'lock', 'unlock', 'restore', 'cleanup']) {
     for (const code of MAC_CREDENTIAL_FIXTURE_FAILURE_CODES) {
       assert.throws(() => validateCredentialFixtureReply({ ok: false, code }, { scenario: 'modern', operation }), error => {
         assert.equal(error.credentialStage, 'fixture_operation');
@@ -189,6 +189,12 @@ test('helper failures retain only a known fixed code, closed scenario and actual
   assert.deepEqual(validateCredentialFixtureReply({ ok: true, ready: true }, { scenario: 'modern', operation: null }), { ok: true, ready: true });
   assert.deepEqual(validateCredentialFixtureReply({ ok: true, operation: 'seed' }, { scenario: 'modern', operation: 'seed' }), { ok: true, operation: 'seed' });
   assert.deepEqual(validateCredentialFixtureReply(snapshot(), { scenario: 'modern', operation: 'snapshot' }), snapshot());
+  const audit = { ok: true, audit: { pinUnchanged: false, valuesMatch: true, itemsMatch: true, aclsMatch: true } };
+  assert.deepEqual(validateCredentialFixtureReply(audit, { scenario: 'modern', operation: 'audit' }), audit);
+  for (const bad of [{ ...audit, privatePath: '/private' }, { ok: true, audit: { ...audit.audit, value: 'PRIVATE_SENTINEL' } },
+    { ok: true, audit: { ...audit.audit, itemsMatch: 'true' } }, { ok: true, audit: null }]) {
+    assert.throws(() => validateCredentialFixtureReply(bad, { scenario: 'modern', operation: 'audit' }));
+  }
 });
 test('scope proof admits only a fixture-only user/default with empty dynamic and verified fixed common scope', () => {
   const proof = commonDomain => ({ schemaVersion: 'mac-credential-isolated-scope-v1',

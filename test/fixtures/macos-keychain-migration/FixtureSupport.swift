@@ -242,6 +242,34 @@ enum MigrationProbeFixture {
         return keychain
     }
 
+    // A signed app may cause Security.framework to replace its Keychain DB
+    // while reading it. This diagnostic opens the observed file for a bounded,
+    // read-only comparison; it does not advance the ownership journal and can
+    // never authorize restore, mutation or cleanup of a replacement inode.
+    static func observedKeychainForAudit() throws -> (SecKeychain, MigrationProbeOwnership.Identity) {
+        try validateRoot()
+        let expected = try pinnedIdentity()
+        let before = try keychainMetadata()
+        try require(before.st_dev == expected.device, "KEYCHAIN_AUDIT_DEVICE_CHANGED")
+        let descriptor = open(keychainURL.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { throw Failure("KEYCHAIN_AUDIT_OPEN_FAILED") }
+        defer { close(descriptor) }
+        var opened = stat()
+        try require(fstat(descriptor, &opened) == 0
+            && opened.st_dev == before.st_dev && opened.st_ino == before.st_ino
+            && opened.st_uid == before.st_uid && opened.st_nlink == 1
+            && opened.st_mode & S_IFMT == S_IFREG && opened.st_mode & 0o777 == 0o600,
+                    "KEYCHAIN_AUDIT_TARGET_CHANGED")
+        var keychain: SecKeychain?
+        try require(SecKeychainOpen(keychainURL.path, &keychain) == errSecSuccess,
+                    "KEYCHAIN_AUDIT_KEYCHAIN_OPEN_FAILED")
+        guard let keychain else { throw Failure("KEYCHAIN_AUDIT_KEYCHAIN_OPEN_FAILED") }
+        try validateReference(keychain)
+        try require(try identity(keychainMetadata()) == identity(opened)
+            && pinnedIdentity() == expected, "KEYCHAIN_AUDIT_TARGET_CHANGED")
+        return (keychain, identity(opened))
+    }
+
     static func validateReference(_ keychain: SecKeychain) throws {
         var length: UInt32 = 4096
         var path = [CChar](repeating: 0, count: Int(length))

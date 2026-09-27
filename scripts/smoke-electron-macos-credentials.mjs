@@ -132,6 +132,8 @@ export const MAC_CREDENTIAL_FIXTURE_FAILURE_CODES = Object.freeze([
   'FIXTURE_SYSTEM_METADATA_REFUSED', 'FIXTURE_SYSTEM_NAMESPACE_NOT_ABSENT', 'FIXTURE_SYSTEM_NOT_READABLE',
   'FIXTURE_SYSTEM_PATH_REFUSED', 'FIXTURE_USER_DEFAULT_CHANGED', 'FIXTURE_USER_DOMAIN_CHANGED',
   'INTERACTION_NOT_DISABLED', 'KEYCHAIN_JOURNAL_INCOMPLETE_OR_INVALID', 'KEYCHAIN_JOURNAL_INVALID',
+  'KEYCHAIN_AUDIT_DEVICE_CHANGED', 'KEYCHAIN_AUDIT_INCOMPLETE', 'KEYCHAIN_AUDIT_KEYCHAIN_OPEN_FAILED',
+  'KEYCHAIN_AUDIT_NOT_READY', 'KEYCHAIN_AUDIT_OPEN_FAILED', 'KEYCHAIN_AUDIT_TARGET_CHANGED',
   'KEYCHAIN_OPEN_FAILED', 'KEYCHAIN_OPEN_TARGET_CHANGED', 'KEYCHAIN_OWNERSHIP_INVALID',
   'KEYCHAIN_RECEIPT_MISMATCH', 'KEYCHAIN_REFERENCE_MISMATCH', 'KEYCHAIN_WRITE_INTENT_CHANGED',
   'KEYCHAIN_WRITE_LIMIT', 'KEYCHAIN_WRITE_PROOF_INVALID', 'KEYCHAIN_WRITE_TARGET_CHANGED', 'OWNER_MARKER_INVALID',
@@ -139,7 +141,7 @@ export const MAC_CREDENTIAL_FIXTURE_FAILURE_CODES = Object.freeze([
   'SYNTHETIC_LEGACY_CREATE_FAILED', 'SYNTHETIC_RANDOM_FAILED',
 ]);
 const fixtureFailureCodes = new Set(MAC_CREDENTIAL_FIXTURE_FAILURE_CODES);
-const fixtureCommands = new Set(['seed', 'snapshot', 'select', 'scope', 'lock', 'unlock', 'restore', 'cleanup']);
+const fixtureCommands = new Set(['seed', 'snapshot', 'audit', 'select', 'scope', 'lock', 'unlock', 'restore', 'cleanup']);
 export function validateCredentialScope(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || Object.keys(value).sort().join() !== 'aggregateMatchesDomains,commonDomain,defaultFixture,dynamicDomainEmpty,schemaVersion,systemNamespacesAbsent,userDomainFixtureOnly'
@@ -158,10 +160,14 @@ export function validateCredentialFixtureReply(value, { scenario, operation }) {
       fixtureFailure: Object.freeze({ scenario, command: operation ?? 'startup', code: value.code }) });
   }
   const scoped = operation === 'select' || operation === 'scope';
-  const keys = operation === 'snapshot' ? 'items,ok' : operation === null ? 'ok,ready' : scoped ? 'ok,operation,scope' : 'ok,operation';
+  const keys = operation === 'snapshot' ? 'items,ok' : operation === 'audit' ? 'audit,ok'
+    : operation === null ? 'ok,ready' : scoped ? 'ok,operation,scope' : 'ok,operation';
   if (value.ok !== true || Object.keys(value).sort().join() !== keys
-    || (operation === null ? value.ready !== true : operation !== 'snapshot' && value.operation !== operation)) fail('fixture_response');
+    || (operation === null ? value.ready !== true : !['snapshot', 'audit'].includes(operation) && value.operation !== operation)) fail('fixture_response');
   if (operation === 'snapshot') validateCredentialSnapshot(value, scenario);
+  if (operation === 'audit' && (!value.audit || typeof value.audit !== 'object' || Array.isArray(value.audit)
+    || Object.keys(value.audit).sort().join() !== 'aclsMatch,itemsMatch,pinUnchanged,valuesMatch'
+    || Object.values(value.audit).some(item => typeof item !== 'boolean'))) fail('fixture_audit');
   if (scoped) validateCredentialScope(value.scope);
   return value;
 }
@@ -377,6 +383,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
     enforcedLoopbackOnly: false, networkGuardReleased: false, fixtureCleaned: false, ownedProcessesStopped: false,
     predecessorFirstRunCompleted: false,
     predecessorKeychainIdentity: null,
+    predecessorCredentialAudit: null,
     applicationBytesUnchanged: false, cases: [], fixtureScopes: [], failureStage: null, failurePhase: null, failureDiagnostics: null, fixtureFailure: null,
     nativeLegacyMigrationQualified: false, hostedUploadQualified: false, timeoutQualified: false,
     lockedStoreQualified: false, deniedStoreQualified: false, legacyOnlyQualified: false,
@@ -475,6 +482,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
       },
     });
     proof.predecessorKeychainIdentity.afterLaunch = await sameKeychain();
+    proof.predecessorCredentialAudit = { afterLaunch: (await fixture.request('audit')).audit };
     stage = 'predecessor_settings'; await exerciseEmptyProfileSettings(active.settings);
     proof.predecessorKeychainIdentity.afterSettings = await sameKeychain();
     stage = 'predecessor_opt_out'; await active.settings.evaluate('globalThis.tibotattleDesktop.setSharingEnabled(false)');
@@ -482,6 +490,11 @@ export async function runMacCredentialQualification({ intake, execute = false })
     proof.predecessorKeychainIdentity.afterOptOut = await sameKeychain();
     await stopOwnedMacSharingApp(active); active = null;
     proof.predecessorKeychainIdentity.afterStop = await sameKeychain();
+    proof.predecessorCredentialAudit.afterStop = (await fixture.request('audit')).audit;
+    if (Object.values(proof.predecessorCredentialAudit).some(value => !value.valuesMatch || !value.itemsMatch || !value.aclsMatch)) {
+      fail('predecessor_credential_changed');
+    }
+    if (!proof.predecessorCredentialAudit.afterStop.pinUnchanged) fail('fixture_inode_rotated');
     if (JSON.stringify(validateCredentialSnapshot(await fixture.request('snapshot'), 'modern')) !== JSON.stringify(before)) fail('predecessor_credential_changed');
     stage = 'installed_replacement';
     // Preserve the old signed app, never recursively delete or overwrite it.
