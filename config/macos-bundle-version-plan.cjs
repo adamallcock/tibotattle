@@ -38,6 +38,9 @@ const SIGNED_MACOS_BUNDLE_VERSION_PLAN = Object.freeze({
   // The 0.1.25 successor advances both signed Mac architectures together.
   // Source, artifact, installed-upgrade and publication proof remain distinct.
   "0.1.25": Object.freeze({ stable: "1033" }),
+  // Owner-selected successor after the held 0.1.25 candidate. Allocation is
+  // not signed, installed, or published release evidence.
+  "0.1.26": Object.freeze({ stable: "1034" }),
 });
 
 module.exports = { SIGNED_MACOS_BUNDLE_VERSION_PLAN };

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Exact signed ARM artifact, disposable hosted account, synthetic credentials.
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { lstat, mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
 import { userInfo } from 'node:os';
@@ -10,10 +10,11 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { exerciseEmptyProfileSettings } from './smoke-electron-macos-empty-profile.mjs';
 import { validateSparkleTransitionHost, signedMacTransitionEnvironment,
   assertExtractedSignedMacBundle, verifySparkleTransitionCandidate } from './smoke-electron-macos-sparkle-transition.mjs';
-import { ELECTRON_020_DMG, verifyPredecessor, refreshProductionUpdateArchiveIndex } from './smoke-electron-macos-production-update.mjs';
+import { verifyPredecessor, refreshProductionUpdateArchiveIndex } from './smoke-electron-macos-production-update.mjs';
 import { launchVerifiedMacSharingApp, stopOwnedMacSharingApp, signedStagingFixture } from './run-signed-electron-staging.mjs';
 import { CREDENTIAL_FIXTURE_CASES, CREDENTIAL_FIXTURE_REQUIREMENT } from './prepare-electron-macos-credential-fixture.mjs';
-import { inspectMacOSLoopbackEnforcement, MACOS_LOOPBACK_MODE } from './lib/macos-loopback-qualification.mjs';
+import { activateMacOSCredentialPfGuard, MACOS_PF_CREDENTIAL_MODE } from './lib/macos-pf-credential-qualification.mjs';
+import { desktopFirstRunDialogCopy } from '../apps/electron/desktop-first-run.js';
 
 export { MAC_CREDENTIAL_CONFIRMATION, validateMacCredentialIntake, parseMacCredentialArguments } from './lib/macos-credential-qualification-intake.mjs';
 import { MAC_CREDENTIAL_SCHEMA as SCHEMA, validateMacCredentialIntake, parseMacCredentialArguments } from './lib/macos-credential-qualification-intake.mjs';
@@ -131,6 +132,11 @@ export const MAC_CREDENTIAL_FIXTURE_FAILURE_CODES = Object.freeze([
   'FIXTURE_SYSTEM_METADATA_REFUSED', 'FIXTURE_SYSTEM_NAMESPACE_NOT_ABSENT', 'FIXTURE_SYSTEM_NOT_READABLE',
   'FIXTURE_SYSTEM_PATH_REFUSED', 'FIXTURE_USER_DEFAULT_CHANGED', 'FIXTURE_USER_DOMAIN_CHANGED',
   'INTERACTION_NOT_DISABLED', 'KEYCHAIN_JOURNAL_INCOMPLETE_OR_INVALID', 'KEYCHAIN_JOURNAL_INVALID',
+  'KEYCHAIN_AUDIT_DEVICE_CHANGED', 'KEYCHAIN_AUDIT_INCOMPLETE', 'KEYCHAIN_AUDIT_KEYCHAIN_OPEN_FAILED',
+  'KEYCHAIN_AUDIT_NOT_READY', 'KEYCHAIN_AUDIT_OPEN_FAILED', 'KEYCHAIN_AUDIT_TARGET_CHANGED',
+  'KEYCHAIN_OBSERVATION_ALREADY_PENDING', 'KEYCHAIN_OBSERVATION_BASELINE_CHANGED',
+  'KEYCHAIN_OBSERVATION_CHANGED', 'KEYCHAIN_OBSERVATION_CONTENT_CHANGED',
+  'KEYCHAIN_OBSERVATION_NOT_PENDING',
   'KEYCHAIN_OPEN_FAILED', 'KEYCHAIN_OPEN_TARGET_CHANGED', 'KEYCHAIN_OWNERSHIP_INVALID',
   'KEYCHAIN_RECEIPT_MISMATCH', 'KEYCHAIN_REFERENCE_MISMATCH', 'KEYCHAIN_WRITE_INTENT_CHANGED',
   'KEYCHAIN_WRITE_LIMIT', 'KEYCHAIN_WRITE_PROOF_INVALID', 'KEYCHAIN_WRITE_TARGET_CHANGED', 'OWNER_MARKER_INVALID',
@@ -138,7 +144,7 @@ export const MAC_CREDENTIAL_FIXTURE_FAILURE_CODES = Object.freeze([
   'SYNTHETIC_LEGACY_CREATE_FAILED', 'SYNTHETIC_RANDOM_FAILED',
 ]);
 const fixtureFailureCodes = new Set(MAC_CREDENTIAL_FIXTURE_FAILURE_CODES);
-const fixtureCommands = new Set(['seed', 'snapshot', 'select', 'scope', 'lock', 'unlock', 'restore', 'cleanup']);
+const fixtureCommands = new Set(['seed', 'snapshot', 'audit', 'begin', 'attest', 'select', 'scope', 'lock', 'unlock', 'restore', 'cleanup']);
 export function validateCredentialScope(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || Object.keys(value).sort().join() !== 'aggregateMatchesDomains,commonDomain,defaultFixture,dynamicDomainEmpty,schemaVersion,systemNamespacesAbsent,userDomainFixtureOnly'
@@ -157,10 +163,14 @@ export function validateCredentialFixtureReply(value, { scenario, operation }) {
       fixtureFailure: Object.freeze({ scenario, command: operation ?? 'startup', code: value.code }) });
   }
   const scoped = operation === 'select' || operation === 'scope';
-  const keys = operation === 'snapshot' ? 'items,ok' : operation === null ? 'ok,ready' : scoped ? 'ok,operation,scope' : 'ok,operation';
+  const keys = operation === 'snapshot' ? 'items,ok' : operation === 'audit' ? 'audit,ok'
+    : operation === null ? 'ok,ready' : scoped ? 'ok,operation,scope' : 'ok,operation';
   if (value.ok !== true || Object.keys(value).sort().join() !== keys
-    || (operation === null ? value.ready !== true : operation !== 'snapshot' && value.operation !== operation)) fail('fixture_response');
+    || (operation === null ? value.ready !== true : !['snapshot', 'audit'].includes(operation) && value.operation !== operation)) fail('fixture_response');
   if (operation === 'snapshot') validateCredentialSnapshot(value, scenario);
+  if (operation === 'audit' && (!value.audit || typeof value.audit !== 'object' || Array.isArray(value.audit)
+    || Object.keys(value.audit).sort().join() !== 'aclsMatch,itemsMatch,pinUnchanged,valuesMatch'
+    || Object.values(value.audit).some(item => typeof item !== 'boolean'))) fail('fixture_audit');
   if (scoped) validateCredentialScope(value.scope);
   return value;
 }
@@ -197,6 +207,96 @@ async function fixtureSession(input, executable, scenario, environment) {
     if (!ended) { child.kill('SIGKILL'); fail('fixture_not_stopped'); } if (protocolError) fail('fixture_protocol'); } };
 }
 
+// On a failed predecessor launch, classify only known native UI states for the
+// already verified owned PID. Never return accessibility text or window names.
+export function macCredentialPredecessorUiScript(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 2) fail('dialog_input');
+  const firstRun = ['en-US', 'zh-Hans', 'es'].map(locale => {
+    const copy = desktopFirstRunDialogCopy({ production: true, locale });
+    return [copy.title, copy.message];
+  });
+  return `function run(){var e=Application('System Events');
+if(!e.uiElementsEnabled())return 'accessibility_unavailable';
+var agents=e.applicationProcesses().filter(function(p){return ['SecurityAgent','SecurityUIAgent','CoreServicesUIAgent'].indexOf(p.name())!==-1;});
+if(agents.some(function(p){return p.windows().length>0;}))return 'security_agent_window';
+var p=e.applicationProcesses.whose({unixId:${pid}})();if(p.length!==1)return 'owned_process_absent';
+var windows=p[0].windows();if(windows.length===0)return 'no_owned_window';
+if(windows.length>3)return 'window_limit';var texts=[];
+for(var w=0;w<windows.length;w++){var elements=windows[w].entireContents();if(elements.length>500)return 'window_limit';
+for(var x=0;x<elements.length;x++){if(elements[x].role()==='AXStaticText')texts.push(String(elements[x].value()));}}
+var known=${JSON.stringify(firstRun)};
+for(var c=0;c<known.length;c++){if(texts.indexOf(known[c][0])!==-1||texts.indexOf(known[c][1])!==-1)return 'first_run_visible';}
+if(texts.indexOf('Unable to prepare secure storage')!==-1||texts.indexOf('TiboTattle could not complete its secure startup checks.')!==-1)return 'secure_storage_warning';
+if(texts.indexOf('Unable to finish updating TiboTattle')!==-1||texts.indexOf('TiboTattle could not finish transferring your existing data.')!==-1)return 'native_handover_warning';
+return 'other_owned_window';}`;
+}
+
+const PREDECESSOR_UI_STATES = new Set(['accessibility_unavailable', 'security_agent_window',
+  'owned_process_absent', 'no_owned_window', 'window_limit', 'first_run_visible',
+  'secure_storage_warning', 'native_handover_warning', 'other_owned_window',
+  'diagnostic_unavailable']);
+function observePredecessorUi(pid) {
+  try {
+    const value = command('/usr/bin/osascript', ['-l', 'JavaScript', '-e', macCredentialPredecessorUiScript(pid)], 10000);
+    return PREDECESSOR_UI_STATES.has(value) ? value : 'diagnostic_unavailable';
+  } catch { return 'diagnostic_unavailable'; }
+}
+
+// Inspect only the verified predecessor PID. OS output stays in memory and the
+// receipt exposes fixed categories, never a stack frame, log line, or path.
+export function classifyPredecessorProcessEvidence({ sampleStatus, sample = '', logStatus, log = '', ps = '' }) {
+  const status = value => value === 0 ? 'available' : value === 'timeout' ? 'timeout' : 'unavailable';
+  const state = /^\s*([RSUITZ])/u.exec(ps)?.[1] ?? null;
+  const signals = (source, patterns) => Object.fromEntries(Object.entries(patterns)
+    .map(([name, pattern]) => [name, pattern.test(source)]));
+  return {
+    processState: state,
+    sampleStatus: status(sampleStatus),
+    sampleSignals: sampleStatus === 0 ? signals(sample, {
+      keychain: /SecItem|SecKeychain|securityd|Security\.framework/iu,
+      appkit: /NSApplication|AppKit\.framework/iu,
+      network: /CFNetwork|Network\.framework|nw_connection/iu,
+      filesystem: /openat|stat64|readlink|FileManager/iu,
+    }) : null,
+    logStatus: status(logStatus),
+    logSignals: logStatus === 0 ? signals(log, {
+      sandboxDenial: /Sandbox:.*deny|sandbox-exec:.*deny/iu,
+      tccDenial: /TCC.*deny|not authorized for Accessibility/iu,
+      codeSignRejection: /code.?sign.*reject|signature.*invalid/iu,
+    }) : null,
+  };
+}
+
+function closedPredecessorProcess(value) {
+  const statuses = ['available', 'timeout', 'unavailable'];
+  const shape = (object, keys) => object !== null && typeof object === 'object'
+    && !Array.isArray(object) && Object.keys(object).sort().join() === keys.slice().sort().join()
+    && keys.every(key => typeof object[key] === 'boolean');
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).sort().join() !== 'logSignals,logStatus,processState,sampleSignals,sampleStatus'
+    || ![null, 'R', 'S', 'U', 'I', 'T', 'Z'].includes(value.processState)
+    || !statuses.includes(value.sampleStatus) || !statuses.includes(value.logStatus)
+    || (value.sampleStatus === 'available'
+      ? !shape(value.sampleSignals, ['keychain', 'appkit', 'network', 'filesystem']) : value.sampleSignals !== null)
+    || (value.logStatus === 'available'
+      ? !shape(value.logSignals, ['sandboxDenial', 'tccDenial', 'codeSignRejection']) : value.logSignals !== null))
+    return null;
+  return value;
+}
+
+function observePredecessorProcess(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 2) fail('diagnostic_input');
+  const run = (file, args, timeout) => spawnSync(file, args,
+    { encoding: 'utf8', timeout, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+  const status = result => result.error?.code === 'ETIMEDOUT' ? 'timeout' : result.status;
+  const sample = run('/usr/bin/sample', [String(pid), '1', '10'], 12000);
+  const log = run('/usr/bin/log', ['show', '--style', 'compact', '--last', '2m',
+    '--predicate', 'processID == ' + pid], 15000);
+  const ps = run('/bin/ps', ['-p', String(pid), '-o', 'stat='], 5000);
+  return classifyPredecessorProcessEvidence({ sampleStatus: status(sample), sample: sample.stdout,
+    logStatus: status(log), log: log.stdout, ps: ps.status === 0 ? ps.stdout : '' });
+}
+
 export function macCredentialDialogScript(pid, action = 'inspect') {
   if (!Number.isSafeInteger(pid) || pid < 2 || !['inspect', 'retry', 'quit'].includes(action)) fail('dialog_input');
   return `function run(){var e=Application('System Events');if(!e.uiElementsEnabled())return 'ui_unavailable';
@@ -212,6 +312,11 @@ if(${JSON.stringify(action)}==='inspect')return codes[0];var name=${JSON.stringi
 var matches=buttons.filter(b=>b.name()===name&&b.enabled());if(matches.length!==1)return 'action_unavailable';matches[0].click();return 'clicked';}`;
 }
 function dialog(pid, action) { return command('/usr/bin/osascript', ['-l', 'JavaScript', '-e', macCredentialDialogScript(pid, action)], 10000); }
+const DIALOG_STATES = new Set(['ui_unavailable', 'unexpected_security_ui', 'process_absent', 'ui_limit',
+  'ambiguous_dialog', 'action_unavailable', 'no_secure_storage_dialog',
+  'SECURE_STORAGE_LOCKED', 'SECURE_STORAGE_DENIED', 'SECURE_STORAGE_MIGRATION_REQUIRED',
+  'SECURE_STORAGE_CREDENTIAL_INVALID', 'SECURE_STORAGE_TIMEOUT', 'SECURE_STORAGE_UNAVAILABLE',
+  'SECURE_STORAGE_ADAPTER_INTEGRITY_FAILED']);
 async function until(check, stage, timeout = 30000, { now = Date.now, wait = delay } = {}) {
   const deadline = now() + timeout;
   do { const value = await check(); if (value) return value; await wait(200); } while (now() < deadline);
@@ -223,7 +328,9 @@ export function expectedCredentialReason(scenario, observed) {
 }
 async function observeRefusal(pid, scenario) {
   const inspect = () => { const value = dialog(pid, 'inspect'); if (value === 'no_secure_storage_dialog') return null;
-    if (!expectedCredentialReason(scenario, value)) fail('unexpected_startup_dialog'); return value; };
+    if (!expectedCredentialReason(scenario, value)) throw Object.assign(new Error('MAC_CREDENTIAL_QUALIFICATION_REFUSED'), {
+      credentialStage: 'unexpected_startup_dialog', refusalDialogState: DIALOG_STATES.has(value) ? value : null,
+    }); return value; };
   const initial = await until(inspect, 'secure_storage_dialog');
   if (dialog(pid, 'retry') !== 'clicked') fail('retry_action');
   await delay(500);
@@ -250,38 +357,61 @@ export async function exerciseCredentialRefresh(dashboard, clock) {
 }
 
 // Retain fixed failure families only; exception messages, URLs and paths stay private.
-export function macCredentialFailureDiagnostics(error) {
+export function macCredentialFailureDiagnostics(error, predecessorUi = null, predecessorEntryFailure = null,
+  predecessorDebuggerListening = null, predecessorProcess = null, predecessorExit = null) {
   const launchStages = ['process_group', 'native_intro', 'owned_debugger', 'dashboard_target',
     'dashboard_ready', 'settings_target', 'settings_ready'];
   const launchCodes = ['startup', 'process_inventory', 'preexisting_app', 'local_response',
     'native_intro_identity', 'native_intro_closed', 'native_intro_unexpected',
     'native_intro_automation_unavailable'];
   const settingsCodes = ['settings_tab', 'settings_ready', 'settings_click', 'settings_effect'];
+  const pfStages = ['main_anchor', 'baseline_connectivity', 'syntax', 'anchor_load', 'enable_command', 'enable_token',
+    'active_rules', 'loopback', 'external_denial'];
   return {
+    refusalDialogState: DIALOG_STATES.has(error?.refusalDialogState) ? error.refusalDialogState : null,
+    networkGuardStage: pfStages.includes(error?.pfStage) ? error.pfStage : null,
     launchStage: launchStages.includes(error?.signedLaunchStage) ? error.signedLaunchStage : null,
     launchCode: launchCodes.includes(error?.stage) ? error.stage : null,
     settingsStage: settingsCodes.includes(error?.emptyProfileStage) ? error.emptyProfileStage : null,
     launchOwnedProcessesStopped: typeof error?.ownedMacProcessesStopped === 'boolean'
       ? error.ownedMacProcessesStopped : null,
+    predecessorUi: PREDECESSOR_UI_STATES.has(predecessorUi) ? predecessorUi : null,
+    predecessorEntryFailure: typeof predecessorEntryFailure === 'boolean' ? predecessorEntryFailure : null,
+    predecessorDebuggerListening: typeof predecessorDebuggerListening === 'boolean'
+      ? predecessorDebuggerListening : null,
+    predecessorProcess: closedPredecessorProcess(predecessorProcess),
+    predecessorExit: predecessorExit && typeof predecessorExit === 'object'
+      && Object.keys(predecessorExit).sort().join() === 'code,signal'
+      && (predecessorExit.code === null || (Number.isInteger(predecessorExit.code)
+        && predecessorExit.code >= 0 && predecessorExit.code <= 255))
+      && (predecessorExit.signal === null || ['SIGABRT', 'SIGBUS', 'SIGILL', 'SIGKILL', 'SIGSEGV', 'SIGTERM', 'SIGTRAP'].includes(predecessorExit.signal))
+      ? predecessorExit : null,
   };
 }
 
 export async function runMacCredentialQualification({ intake, execute = false }) {
   const proof = { schemaVersion: SCHEMA, status: 'planned', credentialContinuityQualified: false,
-    enforcedLoopbackOnly: false, fixtureCleaned: false, ownedProcessesStopped: false,
+    enforcedLoopbackOnly: false, networkGuardReleased: false, fixtureCleaned: false, ownedProcessesStopped: false,
+    predecessorFirstRunCompleted: false,
+    predecessorKeychainIdentity: null,
+    predecessorCredentialAudit: null,
     applicationBytesUnchanged: false, cases: [], fixtureScopes: [], failureStage: null, failurePhase: null, failureDiagnostics: null, fixtureFailure: null,
     nativeLegacyMigrationQualified: false, hostedUploadQualified: false, timeoutQualified: false,
     lockedStoreQualified: false, deniedStoreQualified: false, legacyOnlyQualified: false,
     nativeCleanQuitQualified: false, partialMigrationQualified: false,
     completeCredentialFailureMatrixQualified: false };
-  let active = null, fixture = null, stage = 'intake';
+  let active = null, fixture = null, networkGuard = null, stage = 'intake', predecessorUi = null;
+  let predecessorEntryFailure = null, predecessorDebuggerListening = null, predecessorProcess = null, predecessorExit = null;
   try {
     const input = validateMacCredentialIntake(intake);
     Object.assign(proof, { runnerRevision: input.runnerRevision, sourceRevision: input.sourceRevision,
       target: input.target, version: input.version, bundleVersion: input.bundleVersion, buildNumber: input.buildNumber,
       dmgSha256: input.dmgSha256, asarSha256: input.asarSha256, fixtureExecutableSha256: input.fixtureExecutableSha256,
-      fixtureArchiveSha256: input.fixtureArchiveSha256, operationId: input.operationId, predecessorVersion: '0.1.20',
-      predecessorAsarSha256: input.predecessorAsarSha256 });
+      fixtureArchiveSha256: input.fixtureArchiveSha256, operationId: input.operationId,
+      predecessorVersion: input.predecessor.version,
+      predecessorAsarSha256: input.predecessorAsarSha256,
+      predecessorDmgSha256: input.predecessor.dmgSha256,
+      predecessorSourceRevision: input.predecessor.sourceRevision ?? null });
     if (!execute) return proof;
     proof.status = 'failed'; stage = 'disposable_host';
     const home = validateSparkleTransitionHost({ target: input.target, platform: process.platform, architecture: process.arch,
@@ -296,27 +426,87 @@ export async function runMacCredentialQualification({ intake, execute = false })
     await mkdir(directory, { mode: 0o700 }); await safePath(directory);
     await mkdir(input.fixtureRoot, { mode: 0o700 }); await safePath(input.fixtureRoot);
     const environment = signedMacTransitionEnvironment({ target: input.target, home, temporaryDirectory: directory });
-    stage = 'network_enforcement'; proof.networkChecks = await inspectMacOSLoopbackEnforcement(); proof.enforcedLoopbackOnly = true;
     stage = 'artifact_intake';
     const dmg = join(directory, 'candidate.dmg'), predecessor = join(directory, 'predecessor.dmg');
     await download(input.candidate.url, dmg, input.dmgSha256, 1024 ** 3);
-    await download(input.predecessorUrl, predecessor, ELECTRON_020_DMG[input.target], 1024 ** 3, true);
+    await download(input.predecessorUrl, predecessor, input.predecessor.dmgSha256, 1024 ** 3, true);
     const helper = await prepareFixture(input, directory);
     await mkdir(dirname(installed), { recursive: true, mode: 0o700 }); await safePath(dirname(installed));
     await install(predecessor, installed, join(directory, 'old-mount'));
-    let verified = await verifyPredecessor({ ...input, architecture: 'arm64' }, installed);
+    let verified = input.predecessor.version === '0.1.20'
+      ? await verifyPredecessor({ ...input, architecture: 'arm64' }, installed)
+      : await verifySparkleTransitionCandidate({ ...input.predecessor, target: input.target,
+        architecture: 'arm64' }, installed);
+    stage = 'network_enforcement';
+    networkGuard = await activateMacOSCredentialPfGuard({ temporaryRoot: process.env.RUNNER_TEMP,
+      runId: process.env.GITHUB_RUN_ID });
+    proof.networkChecks = networkGuard.proof; proof.enforcedLoopbackOnly = true;
+    const launchOptions = { networkMode: MACOS_PF_CREDENTIAL_MODE };
+    const launchCredential = async (app, options) => {
+      await networkGuard.assertEffective();
+      return launchVerifiedMacSharingApp(app, environment, options);
+    };
+    stage = 'predecessor_first_run';
+    active = await launchCredential(verified, {
+      ...launchOptions, untouched: true, observeFixedEntryFailure: true,
+      onFailure: ({ pid, stage: launchStage, fixedEntryFailureObserved, debuggerListening, exitCode, exitSignal }) => {
+        if (launchStage === 'native_intro') {
+          predecessorExit = { code: exitCode, signal: exitSignal };
+          predecessorUi = observePredecessorUi(pid);
+          predecessorEntryFailure = fixedEntryFailureObserved;
+          predecessorDebuggerListening = debuggerListening;
+          predecessorProcess = observePredecessorProcess(pid);
+        }
+      },
+    });
+    if (active.nativeIntroContinued !== true) fail('predecessor_first_run');
+    await exerciseEmptyProfileSettings(active.settings);
+    await stopOwnedMacSharingApp(active); active = null;
+    await absent(codex);
+    proof.predecessorFirstRunCompleted = true;
     await mkdir(codex, { mode: 0o700 }); await mkdir(join(codex, 'sessions'), { mode: 0o700 });
     await writeFile(join(codex, 'sessions', 'rollout-credential-synthetic.jsonl'), signedStagingFixture(), { mode: 0o600, flag: 'wx' });
-    const launchOptions = { networkMode: MACOS_LOOPBACK_MODE };
     stage = 'modern_fixture'; fixture = await fixtureSession(input, helper, 'modern', environment);
     await fixture.request('seed'); const before = validateCredentialSnapshot(await fixture.request('snapshot'), 'modern');
     proof.fixtureScopes.push({ scenario: 'modern', ...((await fixture.request('select')).scope) });
     await fixture.request('scope');
-    stage = 'predecessor_launch'; active = await launchVerifiedMacSharingApp(verified, environment, { ...launchOptions, untouched: true });
+    const keychainFile = join(input.fixtureRoot, 'modern', 'synthetic.keychain-db');
+    const keychainBefore = await lstat(keychainFile, { bigint: true });
+    if (!keychainBefore.isFile() || keychainBefore.nlink !== 1n
+      || keychainBefore.uid !== BigInt(process.getuid())) fail('fixture_identity');
+    const sameKeychain = async () => {
+      try { const current = await lstat(keychainFile, { bigint: true });
+        return current.isFile() && current.dev === keychainBefore.dev && current.ino === keychainBefore.ino; }
+      catch { return false; }
+    };
+    proof.predecessorKeychainIdentity = {};
+    await fixture.request('begin');
+    stage = 'predecessor_launch'; active = await launchCredential(verified, {
+      ...launchOptions,
+      onFailure: ({ pid, stage: launchStage, fixedEntryFailureObserved, debuggerListening, exitCode, exitSignal }) => {
+        if (launchStage === 'native_intro') {
+          predecessorExit = { code: exitCode, signal: exitSignal };
+          predecessorUi = observePredecessorUi(pid);
+          predecessorEntryFailure = fixedEntryFailureObserved;
+          predecessorDebuggerListening = debuggerListening;
+          predecessorProcess = observePredecessorProcess(pid);
+        }
+      },
+    });
+    proof.predecessorKeychainIdentity.afterLaunch = await sameKeychain();
+    proof.predecessorCredentialAudit = { afterLaunch: (await fixture.request('audit')).audit };
     stage = 'predecessor_settings'; await exerciseEmptyProfileSettings(active.settings);
+    proof.predecessorKeychainIdentity.afterSettings = await sameKeychain();
     stage = 'predecessor_opt_out'; await active.settings.evaluate('globalThis.tibotattleDesktop.setSharingEnabled(false)');
     await until(async () => (await active.readSharing())?.enabled === false, 'predecessor_opt_out');
+    proof.predecessorKeychainIdentity.afterOptOut = await sameKeychain();
     await stopOwnedMacSharingApp(active); active = null;
+    proof.predecessorKeychainIdentity.afterStop = await sameKeychain();
+    proof.predecessorCredentialAudit.afterStop = (await fixture.request('audit')).audit;
+    if (Object.values(proof.predecessorCredentialAudit).some(value => !value.valuesMatch || !value.itemsMatch || !value.aclsMatch)) {
+      fail('predecessor_credential_changed');
+    }
+    await fixture.request('attest');
     if (JSON.stringify(validateCredentialSnapshot(await fixture.request('snapshot'), 'modern')) !== JSON.stringify(before)) fail('predecessor_credential_changed');
     stage = 'installed_replacement';
     // Preserve the old signed app, never recursively delete or overwrite it.
@@ -327,7 +517,8 @@ export async function runMacCredentialQualification({ intake, execute = false })
     for (let pass = 0; pass < 3; pass++) {
       stage = 'candidate_launch_' + pass;
       await fixture.request('scope');
-      active = await launchVerifiedMacSharingApp(verified, environment, launchOptions);
+      await fixture.request('begin');
+      active = await launchCredential(verified, launchOptions);
       if (dialog(active.pid, 'inspect') !== 'no_secure_storage_dialog') fail('unexpected_security_ui');
       await exerciseEmptyProfileSettings(active.settings);
       if (pass === 0) await exerciseCredentialRefresh(active.dashboard);
@@ -336,6 +527,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
       if (pass === 1) await active.settings.evaluate('globalThis.tibotattleDesktop.setSharingEnabled(false)');
       await until(async () => (await active.readSharing())?.enabled === (pass === 0), 'sharing_preference_applied');
       await stopOwnedMacSharingApp(active); active = null;
+      await fixture.request('attest');
       if (JSON.stringify(validateCredentialSnapshot(await fixture.request('snapshot'), 'modern')) !== JSON.stringify(before)) fail('credential_changed');
     }
     proof.cases.push({ scenario: 'modern', status: 'passed', sameIdentityInstalledUpgrade: true,
@@ -348,7 +540,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
       proof.fixtureScopes.push({ scenario, ...((await fixture.request('select')).scope) });
       if (scenario === 'locked') await fixture.request('lock');
       await fixture.request('scope');
-      active = await launchVerifiedMacSharingApp(verified, environment, { ...launchOptions,
+      active = await launchCredential(verified, { ...launchOptions,
         observeBeforeDashboard: pid => observeRefusal(pid, scenario) });
       const observation = active.startupObservation;
       await stopOwnedMacSharingApp(active); active = null;
@@ -365,12 +557,17 @@ export async function runMacCredentialQualification({ intake, execute = false })
     proof.credentialContinuityQualified = true; proof.status = 'passed';
   } catch (error) {
     proof.status = 'failed'; proof.failureStage = error.credentialStage ?? stage; proof.failurePhase = stage;
-    proof.failureDiagnostics = macCredentialFailureDiagnostics(error);
+    proof.failureDiagnostics = macCredentialFailureDiagnostics(error, predecessorUi,
+      predecessorEntryFailure, predecessorDebuggerListening, predecessorProcess, predecessorExit);
     if (error.fixtureFailure) proof.fixtureFailure = error.fixtureFailure;
   }
   finally {
     if (active) { try { await stopOwnedMacSharingApp(active); proof.ownedProcessesStopped = true; } catch { proof.ownedProcessesStopped = false; } }
     if (fixture) { try { await fixture.close(); } catch { /* Uncertain fixture scope/journal stays failed; hosted machine is disposable. */ } }
+    if (networkGuard) {
+      try { await networkGuard.close(); proof.networkGuardReleased = true; }
+      catch { proof.status = 'failed'; proof.networkGuardReleased = false; }
+    }
   }
   return proof;
 }

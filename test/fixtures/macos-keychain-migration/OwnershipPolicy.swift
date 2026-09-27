@@ -1,11 +1,12 @@
 // Pure fixture bookkeeping. No filesystem, Security, signing, or process APIs.
-// Only a completed, verified owned-write transition can advance an inode pin.
+// Only a completed, verified fixture write or observed signed-app transition
+// can advance an inode pin. An incomplete observation is never authority.
 enum MigrationProbeOwnership {
     static let maximumWrites = 8
 
     enum Failure: Error { case invalid, incomplete }
-    enum Operation: String, Codable { case legacySeed, modernAdoption, credentialFixtureSeed, credentialFixtureLock, credentialFixtureUnlock }
-    enum Outcome: String, Codable { case committed, unchanged, rolledBack }
+    enum Operation: String, Codable { case legacySeed, modernAdoption, credentialFixtureSeed, credentialFixtureLock, credentialFixtureUnlock, credentialAppStableRewrite }
+    enum Outcome: String, Codable { case committed, unchanged, rolledBack, observedStable }
 
     struct Identity: Codable, Equatable {
         let device: Int32
@@ -65,11 +66,15 @@ enum MigrationProbeOwnership {
             guard completion.intent == intent, completion.after.inode > 0,
                   completion.after.device == current.device else { throw Failure.invalid }
             switch completion.outcome {
-            case .committed: break
+            case .committed:
+                guard intent.operation != .credentialAppStableRewrite else { throw Failure.invalid }
             case .unchanged:
-                guard completion.after == current else { throw Failure.invalid }
+                guard completion.after == current
+                    && intent.operation != .credentialAppStableRewrite else { throw Failure.invalid }
             case .rolledBack:
                 guard intent.operation == .modernAdoption else { throw Failure.invalid }
+            case .observedStable:
+                guard intent.operation == .credentialAppStableRewrite else { throw Failure.invalid }
             }
             current = completion.after
         }
