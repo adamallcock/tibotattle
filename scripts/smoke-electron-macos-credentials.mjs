@@ -312,6 +312,11 @@ if(${JSON.stringify(action)}==='inspect')return codes[0];var name=${JSON.stringi
 var matches=buttons.filter(b=>b.name()===name&&b.enabled());if(matches.length!==1)return 'action_unavailable';matches[0].click();return 'clicked';}`;
 }
 function dialog(pid, action) { return command('/usr/bin/osascript', ['-l', 'JavaScript', '-e', macCredentialDialogScript(pid, action)], 10000); }
+const DIALOG_STATES = new Set(['ui_unavailable', 'unexpected_security_ui', 'process_absent', 'ui_limit',
+  'ambiguous_dialog', 'action_unavailable', 'no_secure_storage_dialog',
+  'SECURE_STORAGE_LOCKED', 'SECURE_STORAGE_DENIED', 'SECURE_STORAGE_MIGRATION_REQUIRED',
+  'SECURE_STORAGE_CREDENTIAL_INVALID', 'SECURE_STORAGE_TIMEOUT', 'SECURE_STORAGE_UNAVAILABLE',
+  'SECURE_STORAGE_ADAPTER_INTEGRITY_FAILED']);
 async function until(check, stage, timeout = 30000, { now = Date.now, wait = delay } = {}) {
   const deadline = now() + timeout;
   do { const value = await check(); if (value) return value; await wait(200); } while (now() < deadline);
@@ -323,7 +328,9 @@ export function expectedCredentialReason(scenario, observed) {
 }
 async function observeRefusal(pid, scenario) {
   const inspect = () => { const value = dialog(pid, 'inspect'); if (value === 'no_secure_storage_dialog') return null;
-    if (!expectedCredentialReason(scenario, value)) fail('unexpected_startup_dialog'); return value; };
+    if (!expectedCredentialReason(scenario, value)) throw Object.assign(new Error('MAC_CREDENTIAL_QUALIFICATION_REFUSED'), {
+      credentialStage: 'unexpected_startup_dialog', refusalDialogState: DIALOG_STATES.has(value) ? value : null,
+    }); return value; };
   const initial = await until(inspect, 'secure_storage_dialog');
   if (dialog(pid, 'retry') !== 'clicked') fail('retry_action');
   await delay(500);
@@ -361,6 +368,7 @@ export function macCredentialFailureDiagnostics(error, predecessorUi = null, pre
   const pfStages = ['main_anchor', 'baseline_connectivity', 'syntax', 'anchor_load', 'enable_command', 'enable_token',
     'active_rules', 'loopback', 'external_denial'];
   return {
+    refusalDialogState: DIALOG_STATES.has(error?.refusalDialogState) ? error.refusalDialogState : null,
     networkGuardStage: pfStages.includes(error?.pfStage) ? error.pfStage : null,
     launchStage: launchStages.includes(error?.signedLaunchStage) ? error.signedLaunchStage : null,
     launchCode: launchCodes.includes(error?.stage) ? error.stage : null,

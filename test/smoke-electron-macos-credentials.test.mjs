@@ -435,6 +435,7 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
   assert.deepEqual(macCredentialFailureDiagnostics({ signedLaunchStage: 'native_intro',
     stage: 'native_intro_unexpected', ownedMacProcessesStopped: true,
     message: '/Users/PRIVATE_SENTINEL', stderr: 'SECRET' }), {
+    refusalDialogState: null,
     networkGuardStage: null,
     launchStage: 'native_intro', launchCode: 'native_intro_unexpected', settingsStage: null,
     launchOwnedProcessesStopped: true, predecessorUi: null,
@@ -443,6 +444,7 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
   });
   assert.deepEqual(macCredentialFailureDiagnostics({ emptyProfileStage: 'settings_effect',
     ownedMacProcessesStopped: false }), {
+    refusalDialogState: null,
     networkGuardStage: null,
     launchStage: null, launchCode: null, settingsStage: 'settings_effect', launchOwnedProcessesStopped: false,
     predecessorUi: null, predecessorEntryFailure: null, predecessorDebuggerListening: null,
@@ -452,6 +454,7 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
   for (const error of [null, {}, { signedLaunchStage: 'PRIVATE_SENTINEL', stage: 'PRIVATE_SENTINEL',
     emptyProfileStage: 'PRIVATE_SENTINEL', ownedMacProcessesStopped: 'true' }]) {
     assert.deepEqual(macCredentialFailureDiagnostics(error), {
+      refusalDialogState: null,
       networkGuardStage: null,
       launchStage: null, launchCode: null, settingsStage: null, launchOwnedProcessesStopped: null,
       predecessorUi: null, predecessorEntryFailure: null, predecessorDebuggerListening: null,
@@ -462,6 +465,7 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
   assert.equal(macCredentialFailureDiagnostics({}, 'secure_storage_warning').predecessorUi, 'secure_storage_warning');
   assert.equal(macCredentialFailureDiagnostics({}, '/Users/PRIVATE_SENTINEL').predecessorUi, null);
   assert.deepEqual(macCredentialFailureDiagnostics({}, null, true, false), {
+    refusalDialogState: null,
     networkGuardStage: null,
     launchStage: null, launchCode: null, settingsStage: null, launchOwnedProcessesStopped: null,
     predecessorUi: null, predecessorEntryFailure: true, predecessorDebuggerListening: false,
@@ -474,4 +478,9 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
     { code: 1, signal: '/Users/PRIVATE_SENTINEL' }).predecessorExit, null);
   assert.equal(macCredentialFailureDiagnostics({ pfStage: 'anchor_load' }).networkGuardStage, 'anchor_load');
   assert.equal(macCredentialFailureDiagnostics({ pfStage: '/Users/PRIVATE_SENTINEL' }).networkGuardStage, null);
+  assert.equal(macCredentialFailureDiagnostics({ refusalDialogState: 'unexpected_security_ui' }).refusalDialogState,
+    'unexpected_security_ui');
+  assert.equal(macCredentialFailureDiagnostics({ refusalDialogState: 'SECURE_STORAGE_DENIED' }).refusalDialogState,
+    'SECURE_STORAGE_DENIED');
+  assert.equal(macCredentialFailureDiagnostics({ refusalDialogState: '/Users/PRIVATE_SENTINEL' }).refusalDialogState, null);
 });
