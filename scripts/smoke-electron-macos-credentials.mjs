@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Exact signed ARM artifact, disposable hosted account, synthetic credentials.
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { lstat, mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
 import { userInfo } from 'node:os';
@@ -233,6 +233,61 @@ function observePredecessorUi(pid) {
   } catch { return 'diagnostic_unavailable'; }
 }
 
+// Inspect only the verified predecessor PID. OS output stays in memory and the
+// receipt exposes fixed categories, never a stack frame, log line, or path.
+export function classifyPredecessorProcessEvidence({ sampleStatus, sample = '', logStatus, log = '', ps = '' }) {
+  const status = value => value === 0 ? 'available' : value === 'timeout' ? 'timeout' : 'unavailable';
+  const state = /^\s*([RSUITZ])/u.exec(ps)?.[1] ?? null;
+  const signals = (source, patterns) => Object.fromEntries(Object.entries(patterns)
+    .map(([name, pattern]) => [name, pattern.test(source)]));
+  return {
+    processState: state,
+    sampleStatus: status(sampleStatus),
+    sampleSignals: sampleStatus === 0 ? signals(sample, {
+      keychain: /SecItem|SecKeychain|securityd|Security\.framework/iu,
+      appkit: /NSApplication|AppKit\.framework/iu,
+      network: /CFNetwork|Network\.framework|nw_connection/iu,
+      filesystem: /openat|stat64|readlink|FileManager/iu,
+    }) : null,
+    logStatus: status(logStatus),
+    logSignals: logStatus === 0 ? signals(log, {
+      sandboxDenial: /Sandbox:.*deny|sandbox-exec:.*deny/iu,
+      tccDenial: /TCC.*deny|not authorized for Accessibility/iu,
+      codeSignRejection: /code.?sign.*reject|signature.*invalid/iu,
+    }) : null,
+  };
+}
+
+function closedPredecessorProcess(value) {
+  const statuses = ['available', 'timeout', 'unavailable'];
+  const shape = (object, keys) => object !== null && typeof object === 'object'
+    && !Array.isArray(object) && Object.keys(object).sort().join() === keys.slice().sort().join()
+    && keys.every(key => typeof object[key] === 'boolean');
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).sort().join() !== 'logSignals,logStatus,processState,sampleSignals,sampleStatus'
+    || ![null, 'R', 'S', 'U', 'I', 'T', 'Z'].includes(value.processState)
+    || !statuses.includes(value.sampleStatus) || !statuses.includes(value.logStatus)
+    || (value.sampleStatus === 'available'
+      ? !shape(value.sampleSignals, ['keychain', 'appkit', 'network', 'filesystem']) : value.sampleSignals !== null)
+    || (value.logStatus === 'available'
+      ? !shape(value.logSignals, ['sandboxDenial', 'tccDenial', 'codeSignRejection']) : value.logSignals !== null))
+    return null;
+  return value;
+}
+
+function observePredecessorProcess(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 2) fail('diagnostic_input');
+  const run = (file, args, timeout) => spawnSync(file, args,
+    { encoding: 'utf8', timeout, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+  const status = result => result.error?.code === 'ETIMEDOUT' ? 'timeout' : result.status;
+  const sample = run('/usr/bin/sample', [String(pid), '1', '10'], 12000);
+  const log = run('/usr/bin/log', ['show', '--style', 'compact', '--last', '2m',
+    '--predicate', 'processID == ' + pid], 15000);
+  const ps = run('/bin/ps', ['-p', String(pid), '-o', 'stat='], 5000);
+  return classifyPredecessorProcessEvidence({ sampleStatus: status(sample), sample: sample.stdout,
+    logStatus: status(log), log: log.stdout, ps: ps.status === 0 ? ps.stdout : '' });
+}
+
 export function macCredentialDialogScript(pid, action = 'inspect') {
   if (!Number.isSafeInteger(pid) || pid < 2 || !['inspect', 'retry', 'quit'].includes(action)) fail('dialog_input');
   return `function run(){var e=Application('System Events');if(!e.uiElementsEnabled())return 'ui_unavailable';
@@ -287,7 +342,7 @@ export async function exerciseCredentialRefresh(dashboard, clock) {
 
 // Retain fixed failure families only; exception messages, URLs and paths stay private.
 export function macCredentialFailureDiagnostics(error, predecessorUi = null, predecessorEntryFailure = null,
-  predecessorDebuggerListening = null) {
+  predecessorDebuggerListening = null, predecessorProcess = null) {
   const launchStages = ['process_group', 'native_intro', 'owned_debugger', 'dashboard_target',
     'dashboard_ready', 'settings_target', 'settings_ready'];
   const launchCodes = ['startup', 'process_inventory', 'preexisting_app', 'local_response',
@@ -304,6 +359,7 @@ export function macCredentialFailureDiagnostics(error, predecessorUi = null, pre
     predecessorEntryFailure: typeof predecessorEntryFailure === 'boolean' ? predecessorEntryFailure : null,
     predecessorDebuggerListening: typeof predecessorDebuggerListening === 'boolean'
       ? predecessorDebuggerListening : null,
+    predecessorProcess: closedPredecessorProcess(predecessorProcess),
   };
 }
 
@@ -316,7 +372,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
     nativeCleanQuitQualified: false, partialMigrationQualified: false,
     completeCredentialFailureMatrixQualified: false };
   let active = null, fixture = null, stage = 'intake', predecessorUi = null;
-  let predecessorEntryFailure = null, predecessorDebuggerListening = null;
+  let predecessorEntryFailure = null, predecessorDebuggerListening = null, predecessorProcess = null;
   try {
     const input = validateMacCredentialIntake(intake);
     Object.assign(proof, { runnerRevision: input.runnerRevision, sourceRevision: input.sourceRevision,
@@ -361,6 +417,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
           predecessorUi = observePredecessorUi(pid);
           predecessorEntryFailure = fixedEntryFailureObserved;
           predecessorDebuggerListening = debuggerListening;
+          predecessorProcess = observePredecessorProcess(pid);
         }
       },
     });
@@ -417,7 +474,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
   } catch (error) {
     proof.status = 'failed'; proof.failureStage = error.credentialStage ?? stage; proof.failurePhase = stage;
     proof.failureDiagnostics = macCredentialFailureDiagnostics(error, predecessorUi,
-      predecessorEntryFailure, predecessorDebuggerListening);
+      predecessorEntryFailure, predecessorDebuggerListening, predecessorProcess);
     if (error.fixtureFailure) proof.fixtureFailure = error.fixtureFailure;
   }
   finally {

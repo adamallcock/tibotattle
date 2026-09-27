@@ -11,7 +11,7 @@ import vm from 'node:vm';
 import { validateMacCredentialIntake, parseMacCredentialArguments, runMacCredentialQualification,
   MAC_CREDENTIAL_CONFIRMATION, credentialFixtureArchiveInspectionScript, validateCredentialSnapshot,
   expectedCredentialReason, macCredentialDialogScript, macCredentialPredecessorUiScript,
-  exerciseCredentialRefresh, macCredentialFailureDiagnostics,
+  exerciseCredentialRefresh, macCredentialFailureDiagnostics, classifyPredecessorProcessEvidence,
   validateCredentialFixtureReply, validateCredentialScope, MAC_CREDENTIAL_FIXTURE_FAILURE_CODES } from '../scripts/smoke-electron-macos-credentials.mjs';
 import { CREDENTIAL_FIXTURE_CASES, credentialFixtureRoot, credentialFixtureConfiguration,
   parseCredentialFixtureArguments, compileCredentialFixture } from '../scripts/prepare-electron-macos-credential-fixture.mjs';
@@ -340,6 +340,25 @@ test('predecessor stderr diagnostic recognizes only its fixed token across chunk
   assert.equal(unrelated.observed(), false);
 });
 
+test('predecessor process diagnosis discards raw stack and log text', () => {
+  const classified = classifyPredecessorProcessEvidence({
+    sampleStatus: 0, sample: 'SecItemCopyMatching NSApplication /Users/PRIVATE_SENTINEL',
+    logStatus: 0, log: 'Sandbox: deny file-read /Users/PRIVATE_SENTINEL',
+    ps: 'S+\n',
+  });
+  assert.deepEqual(classified, {
+    processState: 'S', sampleStatus: 'available',
+    sampleSignals: { keychain: true, appkit: true, network: false, filesystem: false },
+    logStatus: 'available',
+    logSignals: { sandboxDenial: true, tccDenial: false, codeSignRejection: false },
+  });
+  assert.doesNotMatch(JSON.stringify(classified), /PRIVATE_SENTINEL/u);
+  assert.equal(classifyPredecessorProcessEvidence({ sampleStatus: 'timeout', logStatus: null }).sampleSignals, null);
+  assert.equal(macCredentialFailureDiagnostics({}, null, null, null, { raw: '/Users/PRIVATE_SENTINEL' })
+    .predecessorProcess, null);
+  assert.deepEqual(macCredentialFailureDiagnostics({}, null, null, null, classified).predecessorProcess, classified);
+});
+
 test('refresh requires a new successful refresh ID and clicks once; stale success and failure cannot pass', async () => {
   for (const scenario of ['success', 'old-success', 'failed', 'unready']) {
     let time = 0, clicks = 0;
@@ -374,18 +393,20 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
     message: '/Users/PRIVATE_SENTINEL', stderr: 'SECRET' }), {
     launchStage: 'native_intro', launchCode: 'native_intro_unexpected', settingsStage: null,
     launchOwnedProcessesStopped: true, predecessorUi: null,
-    predecessorEntryFailure: null, predecessorDebuggerListening: null,
+    predecessorEntryFailure: null, predecessorDebuggerListening: null, predecessorProcess: null,
   });
   assert.deepEqual(macCredentialFailureDiagnostics({ emptyProfileStage: 'settings_effect',
     ownedMacProcessesStopped: false }), {
     launchStage: null, launchCode: null, settingsStage: 'settings_effect', launchOwnedProcessesStopped: false,
     predecessorUi: null, predecessorEntryFailure: null, predecessorDebuggerListening: null,
+    predecessorProcess: null,
   });
   for (const error of [null, {}, { signedLaunchStage: 'PRIVATE_SENTINEL', stage: 'PRIVATE_SENTINEL',
     emptyProfileStage: 'PRIVATE_SENTINEL', ownedMacProcessesStopped: 'true' }]) {
     assert.deepEqual(macCredentialFailureDiagnostics(error), {
       launchStage: null, launchCode: null, settingsStage: null, launchOwnedProcessesStopped: null,
       predecessorUi: null, predecessorEntryFailure: null, predecessorDebuggerListening: null,
+      predecessorProcess: null,
     });
   }
   assert.equal(macCredentialFailureDiagnostics({}, 'secure_storage_warning').predecessorUi, 'secure_storage_warning');
@@ -393,5 +414,6 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
   assert.deepEqual(macCredentialFailureDiagnostics({}, null, true, false), {
     launchStage: null, launchCode: null, settingsStage: null, launchOwnedProcessesStopped: null,
     predecessorUi: null, predecessorEntryFailure: true, predecessorDebuggerListening: false,
+    predecessorProcess: null,
   });
 });
