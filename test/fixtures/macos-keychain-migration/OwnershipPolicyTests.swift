@@ -68,6 +68,28 @@ struct SyntheticOwnershipPolicyTests {
             let rolledBack = Policy.Entry(intent: add,
                 completion: Policy.Completion(intent: add, after: adopted, outcome: .rolledBack), failed: false)
             try require(Policy.current(baseline, entries: [seedEntry, rolledBack], nonce: "synthetic") == adopted)
+            let observed = Policy.Identity(device: 7, inode: 103)
+            let observedIntent = Policy.Intent(sequence: 4, nonce: "synthetic",
+                operation: .credentialAppStableRewrite, before: adopted)
+            let observedEntry = Policy.Entry(intent: observedIntent,
+                completion: Policy.Completion(intent: observedIntent, after: observed,
+                    outcome: .observedStable), failed: false)
+            try require(Policy.current(baseline, entries: chain + [observedEntry], nonce: "synthetic") == observed)
+            try require(Policy.current(baseline, entries: chain + [
+                Policy.Entry(intent: observedIntent, completion: nil, failed: false)],
+                nonce: "synthetic", pending: observedIntent) == adopted)
+            try refuses { _ = try Policy.current(baseline, entries: chain + [
+                Policy.Entry(intent: observedIntent, completion: nil, failed: false)], nonce: "synthetic") }
+            for bad in [Policy.Outcome.committed, .unchanged, .rolledBack] {
+                let entry = Policy.Entry(intent: observedIntent,
+                    completion: Policy.Completion(intent: observedIntent, after: observed,
+                        outcome: bad), failed: false)
+                try refuses { _ = try Policy.current(baseline, entries: chain + [entry], nonce: "synthetic") }
+            }
+            let forgedObserved = Policy.Entry(intent: add,
+                completion: Policy.Completion(intent: add, after: observed,
+                    outcome: .observedStable), failed: false)
+            try refuses { _ = try Policy.current(baseline, entries: [seedEntry, forgedObserved], nonce: "synthetic") }
             let wrongIntent = Policy.Intent(sequence: 1, nonce: "wrong", operation: .legacySeed, before: first)
             let forged = Policy.Entry(intent: seed,
                 completion: Policy.Completion(intent: wrongIntent, after: seeded, outcome: .committed), failed: false)

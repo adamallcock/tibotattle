@@ -13,6 +13,7 @@ import { desktopFirstRunDialogCopy, validateDesktopFirstRunReceipt } from '../ap
 import { classifyDesktopSharingInstallation } from '../apps/electron/desktop-sharing-installation.js';
 import { verifySignedStagingLaunchInputs, prepareSignedStagingDisposableProfile, parseSignedStagingConsumerArguments } from './consume-signed-electron-staging.mjs';
 import { macOSLoopbackLaunch, MACOS_LOOPBACK_MODE } from './lib/macos-loopback-qualification.mjs';
+import { MACOS_PF_CREDENTIAL_MODE } from './lib/macos-pf-credential-qualification.mjs';
 
 export const SIGNED_STAGING_EXECUTION_SCHEMA = 'tibotattle-signed-staging-execution-v1';
 const OPERATION = 10_000;
@@ -20,6 +21,22 @@ const STARTUP = 60_000;
 const SYNC = 6 * 60_000;
 function fail(stage) { throw Object.assign(new Error('SIGNED_STAGING_EXECUTION_FAILED'), { stage }); }
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
+
+// Recognize one fixed diagnostic from the signed predecessor without retaining
+// stderr, which may contain private paths or OS error text.
+export function fixedEntryFailureObserver() {
+  const marker = Buffer.from('electron_shell_entry_failed');
+  let matched = 0, observed = false;
+  return Object.freeze({
+    consume(chunk) {
+      for (const byte of chunk) {
+        matched = byte === marker[matched] ? matched + 1 : (byte === marker[0] ? 1 : 0);
+        if (matched === marker.length) { observed = true; matched = 0; }
+      }
+    },
+    observed: () => observed,
+  });
+}
 
 export function parseSignedStagingExecutionArguments(argv) {
   if (!Array.isArray(argv) || !['--execute-staging', '--execute-fresh-install'].includes(argv[0])) fail('arguments');
@@ -135,7 +152,7 @@ export function interpretSignedStagingNativeIntroResult(value) {
 }
 
 async function continueNativeIntro(state, verified) {
-  await waitFor(() => {
+  try { await waitFor(() => {
     if (state.stopped()) fail('native_intro_closed');
     const row = processTable().find((entry) => entry.pid === state.pid);
     if (row?.group !== state.pid || row.command !== verified.executable) fail('native_intro_identity');
@@ -145,7 +162,13 @@ async function continueNativeIntro(state, verified) {
         { encoding: 'utf8', timeout: OPERATION, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
     } catch { fail('native_intro_automation_unavailable'); }
     return interpretSignedStagingNativeIntroResult(result);
-  }, STARTUP, 'native introduction');
+  }, STARTUP, 'native introduction'); }
+  catch (error) {
+    // waitFor retries ordinary errors, including our fixed closed-process
+    // result. Preserve that result when the owned executable has exited.
+    if (state.stopped()) fail('native_intro_closed');
+    throw error;
+  }
   state.nativeIntroContinued = true;
 }
 
@@ -156,25 +179,31 @@ export function assertSignedStagingFreshProjection(sharing, receipt) {
 }
 
 async function launch(verified, environment, { untouched = false, onFailure, launchServices = false,
-  networkMode = null, observeBeforeDashboard } = {}) {
-  if (networkMode !== null && networkMode !== MACOS_LOOPBACK_MODE) fail('network_policy');
+  networkMode = null, observeBeforeDashboard, observeFixedEntryFailure = false } = {}) {
+  if (networkMode !== null && ![MACOS_LOOPBACK_MODE, MACOS_PF_CREDENTIAL_MODE].includes(networkMode)) fail('network_policy');
   if (networkMode !== null && launchServices) fail('network_policy');
-  if (observeBeforeDashboard !== undefined && (networkMode !== MACOS_LOOPBACK_MODE
+  if (observeFixedEntryFailure !== false
+      && (observeFixedEntryFailure !== true || !untouched || networkMode === null)) fail('diagnostic_policy');
+  if (observeBeforeDashboard !== undefined && (networkMode === null
     || typeof observeBeforeDashboard !== 'function')) fail('startup_observer');
   // Same-identity handover/SingleInstanceLock must never attach to a pre-existing app.
   if (processTable().some((row) => /\/TiboTattle(?: Dev)?\.app\/Contents\/MacOS\/TiboTattle(?: Dev)?$/u.test(row.command))) fail('preexisting_app');
   const port = await freePort();
   const argumentsList = ['--remote-debugging-port=' + port, '--remote-debugging-address=127.0.0.1'];
-  const direct = networkMode === null ? { executable: verified.executable, args: argumentsList }
+  const direct = networkMode !== MACOS_LOOPBACK_MODE ? { executable: verified.executable, args: argumentsList }
     : macOSLoopbackLaunch(verified.executable, argumentsList, networkMode);
+  const entryFailure = observeFixedEntryFailure ? fixedEntryFailureObserver() : null;
   const child = launchServices
     ? spawn('/usr/bin/open', ['-W', '-n', verified.appPath, '--args', ...argumentsList],
       { cwd: verified.appPath, env: environment, detached: true, stdio: 'ignore' })
     : spawn(direct.executable, direct.args,
-      { cwd: verified.appPath, env: environment, detached: true, stdio: 'ignore' });
+      { cwd: verified.appPath, env: environment, detached: true,
+        stdio: entryFailure ? ['ignore', 'ignore', 'pipe'] : 'ignore' });
+  if (entryFailure) child.stderr.on('data', chunk => entryFailure.consume(chunk));
   let exited = false;
   let spawnFailed = false;
-  child.once('exit', () => { exited = true; });
+  let exitCode = null, exitSignal = null;
+  child.once('exit', (code, signal) => { exited = true; exitCode = code; exitSignal = signal; });
   child.once('error', () => { spawnFailed = true; });
   const state = { child, pid: child.pid, sessions: [], groupVerified: false,
     stopped: () => exited || spawnFailed };
@@ -225,7 +254,10 @@ async function launch(verified, environment, { untouched = false, onFailure, lau
     return state;
   } catch (error) {
     error.signedLaunchStage = launchStage;
-    if (onFailure) { try { await onFailure({ pid: state.pid, stage: launchStage }); } catch {} }
+    if (onFailure) { try { await onFailure({ pid: state.pid, stage: launchStage,
+      fixedEntryFailureObserved: entryFailure?.observed() ?? null,
+      debuggerListening: launchStage === 'native_intro' ? listenerOwned(state.pid, port) : null,
+      exitCode, exitSignal }); } catch {} }
     const stopped = await stop(state);
     error.ownedMacProcessesStopped = stopped === true;
     throw error;
