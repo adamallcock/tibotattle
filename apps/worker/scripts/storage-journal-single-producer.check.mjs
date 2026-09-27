@@ -18,6 +18,8 @@
 //   * the 0046 telemetry_emit_source_event replacement, which keeps the
 //     pre-0046 version-0 body verbatim for owners without a head and may not
 //     name the exact tuple columns;
+//   * the staged 0058 telemetry_emit_source_event replacement, only while its
+//     exact body hash remains pinned to the reviewed version-0 implementation;
 //   * primary migrations numbered before 0046 (legacy history);
 //   * scripts/postgres-ingestion-journal-transfer.mjs, the sealed D1 import;
 //   * D1 prepared statements in src/analytics-delivery.ts, the D1 Worker
@@ -29,6 +31,7 @@
 // applies.
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
@@ -47,6 +50,8 @@ const JOURNAL_TRANSFER = "scripts/postgres-ingestion-journal-transfer.mjs";
 const D1_PRODUCERS = new Set(["src/analytics-delivery.ts"]);
 const APPEND_FUNCTION = "storage_journal_append";
 const LEGACY_EMITTER = "telemetry_emit_source_event";
+const STAGED_0058_EMITTER_MIGRATION = "postgres/staged-migrations/primary/0058_owner_journal_emitter_head_precheck.sql";
+const STAGED_0058_EMITTER_BODY_SHA256 = "d221979f7a0b86ca106c9f4633c4c0989e3a7491fbbf9777803414d4034eb631";
 const EXACT_TUPLE_COLUMNS = /\b(?:event_tuple_version|object_digest|content_digest|public_authority_epoch)\b/iu;
 const WRITE = /\b(?:INSERT\s+INTO|MERGE\s+INTO)\s+|\bCOPY\s+(?=[^\s;]+\s*(?:\(|FROM\b|TO\b))/giu;
 const STATIC_TARGET = /^(?:(?:\$\{[A-Za-z_$][\w$]*\}|"?[A-Za-z_][A-Za-z0-9_$]*"?)\.)?"?[A-Za-z_][A-Za-z0-9_]*"?$/u;
@@ -271,6 +276,14 @@ function scanSql(path, text) {
   const version = migration ? Number(migration[1]) : null;
   if (version !== null && version < AUTHORITY_VERSION) return { violation: false, appendDefinitions: 0 };
   const bodies = functionBodies(sql);
+  const legacyEmitterBodies = bodies.filter(([name]) => name === LEGACY_EMITTER);
+  const staged0058EmitterBody = path === STAGED_0058_EMITTER_MIGRATION && version === 58
+      && legacyEmitterBodies.length === 1
+    ? legacyEmitterBodies[0]
+    : undefined;
+  const staged0058EmitterBodyIsPinned = staged0058EmitterBody !== undefined
+    && createHash("sha256").update(text.slice(staged0058EmitterBody[1], staged0058EmitterBody[2])).digest("hex")
+      === STAGED_0058_EMITTER_BODY_SHA256;
   let appendDefinitions = 0;
   let violation = false;
   for (const { offset, kind } of writes(sql, new Set(), { sql: true })) {
@@ -284,9 +297,11 @@ function scanSql(path, text) {
     const enclosing = body?.[0];
     if (enclosing === APPEND_FUNCTION && version === AUTHORITY_VERSION) {
       appendDefinitions += 1;
-    } else if (enclosing === LEGACY_EMITTER && version === AUTHORITY_VERSION
-        && !EXACT_TUPLE_COLUMNS.test(statementAt(sql, offset))) {
-      // The verbatim version-0 emitter body for owners without a head.
+    } else if (enclosing === LEGACY_EMITTER
+        && !EXACT_TUPLE_COLUMNS.test(statementAt(sql, offset))
+        && (version === AUTHORITY_VERSION || (staged0058EmitterBodyIsPinned
+          && body?.[1] === staged0058EmitterBody[1] && body?.[2] === staged0058EmitterBody[2]))) {
+      // The 0046 version-0 emitter, or the exact body-pinned staged 0058 copy.
     } else {
       violation = true;
     }
@@ -392,6 +407,8 @@ BEGIN PERFORM 1 FROM storage_ingestion_changes; INSERT INTO storage_owner_revisi
 INSERT INTO storage_owner_revisions (source_id) SELECT source_id FROM storage_ingestion_changes;
 `;
     await write("postgres/staged-migrations/primary/0046_owner_journal_authority.sql", appendDefinition);
+    const staged0058Emitter = await readFile(join(WORKER_ROOT, STAGED_0058_EMITTER_MIGRATION), "utf8");
+    await write(STAGED_0058_EMITTER_MIGRATION, staged0058Emitter);
     await write("postgres/migrations/primary/0014_effective_source_revision.sql",
       "CREATE FUNCTION f() RETURNS void AS $$ BEGIN INSERT INTO storage_ingestion_changes VALUES (1); END; $$;");
     await write(JOURNAL_TRANSFER, "await client.query(`INSERT INTO ${relation(schema, \"storage_ingestion_changes\")} VALUES ($1)`);");
@@ -460,6 +477,30 @@ CREATE FUNCTION rogue() RETURNS void AS $$ BEGIN INSERT INTO storage_ingestion_c
       "(source_id,kind) VALUES ('s','source-updated')", "(source_id,event_tuple_version) VALUES ('s',1)"));
     assert.ok((await checkJournalSingleProducer(root)).violations
       .includes("postgres/staged-migrations/primary/0046_owner_journal_authority.sql"));
+
+    // The staged 0058 exemption is bound to the exact reviewed body, not its
+    // migration number or function name. A separate raw write is still denied.
+    await write(STAGED_0058_EMITTER_MIGRATION,
+      `${staged0058Emitter}\nINSERT INTO storage_ingestion_changes (source_id) VALUES ('raw');\n`);
+    assert.ok((await checkJournalSingleProducer(root)).violations.includes(STAGED_0058_EMITTER_MIGRATION));
+
+    // Adding an exact-tuple column to the pinned emitter is forbidden even
+    // though the function name and migration path still match.
+    const exactTupleEmitter = staged0058Emitter
+      .replace("authority_epoch,kind,recorded_ms)", "authority_epoch,event_tuple_version,kind,recorded_ms)")
+      .replace("event_owner_epoch,'source-updated'", "event_owner_epoch,1,'source-updated'");
+    assert.ok(exactTupleEmitter.includes("event_tuple_version"));
+    await write(STAGED_0058_EMITTER_MIGRATION, exactTupleEmitter);
+    assert.ok((await checkJournalSingleProducer(root)).violations.includes(STAGED_0058_EMITTER_MIGRATION));
+
+    // Even a version-0 body that does not name exact-tuple columns must keep
+    // the reviewed implementation byte-for-byte pinned.
+    const driftedEmitter = staged0058Emitter.replace(
+      "-- A retained head behind an immutable owner link is a stable answer, so a",
+      "-- A modified retained-head pre-check comment changes the pinned body, so a");
+    assert.notEqual(driftedEmitter, staged0058Emitter);
+    await write(STAGED_0058_EMITTER_MIGRATION, driftedEmitter);
+    assert.ok((await checkJournalSingleProducer(root)).violations.includes(STAGED_0058_EMITTER_MIGRATION));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
