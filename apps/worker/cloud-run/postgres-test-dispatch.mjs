@@ -2330,8 +2330,9 @@ export function createPostgresTestV12DayManifestDispatch({
           request.headers.get("authorization"),
           { schema },
         );
-      if (!deviceSyncRoute
-          && await hasPostgresDeletionTombstone(ledgerPool, device.participantId, Date.now(), { schema })) {
+      if (await hasPostgresDeletionTombstone(
+        ledgerPool, device.participantId, Date.now(), { schema },
+      )) {
         throw Object.assign(new Error("DEVICE_AUTH_INVALID"), {
           code: "DEVICE_AUTH_INVALID", status: 401,
         });

@@ -3629,9 +3629,47 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     assert.equal(consumedPredecessor.rows[0].token_hash, sha256Hex(predecessor.token));
     assert.ok(consumedPredecessor.rows[0].consumed_at);
 
+    const activeV12Replay = await dispatch(request({ body: JSON.stringify(manifest) }));
+    assert.equal(activeV12Replay.status, 201,
+      "the active participant can replay its v1.2 manifest before the tombstone");
+    assert.equal((await activeV12Replay.json()).manifestId, accepted.manifestId);
+    const activeDeviceState = await primaryPool.query(
+      `SELECT participant.state AS participant_state, credential.state AS device_state,
+              credential.expires_at > clock_timestamp() AS credential_current
+         FROM ${primaryTable("participants")} participant
+         JOIN ${primaryTable("device_credentials")} credential
+           ON credential.participant_id=participant.id
+        WHERE participant.id=$1 AND credential.id=$2`,
+      [participantId, deviceId],
+    );
+    assert.deepEqual(activeDeviceState.rows, [{
+      participant_state: "active", device_state: "active", credential_current: true,
+    }], "the same v1.2 device is valid immediately before tombstoning");
+    await primaryPool.query(
+      `UPDATE ${primaryTable("participants")} SET state='deleting' WHERE id=$1`,
+      [participantId],
+    );
     await ledgerAuthority.recordPostgresDeletionTombstone(
       ledgerPool, participantId, Date.now(), { schema: schemaOptions },
     );
+    // Model a restore that reactivates primary state while the independent
+    // ledger tombstone remains live and authoritative.
+    await primaryPool.query(
+      `UPDATE ${primaryTable("participants")} SET state='active' WHERE id=$1`,
+      [participantId],
+    );
+    assert.deepEqual((await primaryPool.query(
+      `SELECT participant.state AS participant_state, credential.state AS device_state
+         FROM ${primaryTable("participants")} participant
+         JOIN ${primaryTable("device_credentials")} credential
+           ON credential.participant_id=participant.id
+        WHERE participant.id=$1 AND credential.id=$2`,
+      [participantId, deviceId],
+    )).rows, [{ participant_state: "active", device_state: "active" }],
+    "the primary participant and bearer are restored to active state");
+    assert.equal(await ledgerAuthority.hasPostgresDeletionTombstone(
+      ledgerPool, participantId, Date.now(), { schema: schemaOptions },
+    ), true);
     await assertApiError(await dispatch(request({ body: JSON.stringify(manifest) })), 401, "DEVICE_AUTH_INVALID");
     await assertApiError(await dispatch(request({
       url: domainPredecessorUrl, body: "{}",
