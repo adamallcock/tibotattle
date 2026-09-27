@@ -164,7 +164,7 @@ with zipfile.ZipFile(sys.argv[1],'w') as z:
 const snapshot = () => ({ ok: true, items: ['account-observation', 'contribution-device', 'accountless-installation'].map(capability =>
   ({ capability, readable: true, itemDigest: 'a'.repeat(64), aclDigest: 'b'.repeat(64), valueDigest: 'c'.repeat(64) })) });
 test('helper failures retain only a known fixed code, closed scenario and actual protocol command', () => {
-  for (const operation of [null, 'seed', 'snapshot', 'audit', 'select', 'scope', 'lock', 'unlock', 'restore', 'cleanup']) {
+  for (const operation of [null, 'seed', 'snapshot', 'audit', 'begin', 'attest', 'select', 'scope', 'lock', 'unlock', 'restore', 'cleanup']) {
     for (const code of MAC_CREDENTIAL_FIXTURE_FAILURE_CODES) {
       assert.throws(() => validateCredentialFixtureReply({ ok: false, code }, { scenario: 'modern', operation }), error => {
         assert.equal(error.credentialStage, 'fixture_operation');

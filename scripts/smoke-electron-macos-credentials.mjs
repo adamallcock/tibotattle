@@ -134,6 +134,9 @@ export const MAC_CREDENTIAL_FIXTURE_FAILURE_CODES = Object.freeze([
   'INTERACTION_NOT_DISABLED', 'KEYCHAIN_JOURNAL_INCOMPLETE_OR_INVALID', 'KEYCHAIN_JOURNAL_INVALID',
   'KEYCHAIN_AUDIT_DEVICE_CHANGED', 'KEYCHAIN_AUDIT_INCOMPLETE', 'KEYCHAIN_AUDIT_KEYCHAIN_OPEN_FAILED',
   'KEYCHAIN_AUDIT_NOT_READY', 'KEYCHAIN_AUDIT_OPEN_FAILED', 'KEYCHAIN_AUDIT_TARGET_CHANGED',
+  'KEYCHAIN_OBSERVATION_ALREADY_PENDING', 'KEYCHAIN_OBSERVATION_BASELINE_CHANGED',
+  'KEYCHAIN_OBSERVATION_CHANGED', 'KEYCHAIN_OBSERVATION_CONTENT_CHANGED',
+  'KEYCHAIN_OBSERVATION_NOT_PENDING',
   'KEYCHAIN_OPEN_FAILED', 'KEYCHAIN_OPEN_TARGET_CHANGED', 'KEYCHAIN_OWNERSHIP_INVALID',
   'KEYCHAIN_RECEIPT_MISMATCH', 'KEYCHAIN_REFERENCE_MISMATCH', 'KEYCHAIN_WRITE_INTENT_CHANGED',
   'KEYCHAIN_WRITE_LIMIT', 'KEYCHAIN_WRITE_PROOF_INVALID', 'KEYCHAIN_WRITE_TARGET_CHANGED', 'OWNER_MARKER_INVALID',
@@ -141,7 +144,7 @@ export const MAC_CREDENTIAL_FIXTURE_FAILURE_CODES = Object.freeze([
   'SYNTHETIC_LEGACY_CREATE_FAILED', 'SYNTHETIC_RANDOM_FAILED',
 ]);
 const fixtureFailureCodes = new Set(MAC_CREDENTIAL_FIXTURE_FAILURE_CODES);
-const fixtureCommands = new Set(['seed', 'snapshot', 'audit', 'select', 'scope', 'lock', 'unlock', 'restore', 'cleanup']);
+const fixtureCommands = new Set(['seed', 'snapshot', 'audit', 'begin', 'attest', 'select', 'scope', 'lock', 'unlock', 'restore', 'cleanup']);
 export function validateCredentialScope(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || Object.keys(value).sort().join() !== 'aggregateMatchesDomains,commonDomain,defaultFixture,dynamicDomainEmpty,schemaVersion,systemNamespacesAbsent,userDomainFixtureOnly'
@@ -469,6 +472,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
       catch { return false; }
     };
     proof.predecessorKeychainIdentity = {};
+    await fixture.request('begin');
     stage = 'predecessor_launch'; active = await launchCredential(verified, {
       ...launchOptions,
       onFailure: ({ pid, stage: launchStage, fixedEntryFailureObserved, debuggerListening, exitCode, exitSignal }) => {
@@ -494,7 +498,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
     if (Object.values(proof.predecessorCredentialAudit).some(value => !value.valuesMatch || !value.itemsMatch || !value.aclsMatch)) {
       fail('predecessor_credential_changed');
     }
-    if (!proof.predecessorCredentialAudit.afterStop.pinUnchanged) fail('fixture_inode_rotated');
+    await fixture.request('attest');
     if (JSON.stringify(validateCredentialSnapshot(await fixture.request('snapshot'), 'modern')) !== JSON.stringify(before)) fail('predecessor_credential_changed');
     stage = 'installed_replacement';
     // Preserve the old signed app, never recursively delete or overwrite it.
@@ -505,6 +509,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
     for (let pass = 0; pass < 3; pass++) {
       stage = 'candidate_launch_' + pass;
       await fixture.request('scope');
+      await fixture.request('begin');
       active = await launchCredential(verified, launchOptions);
       if (dialog(active.pid, 'inspect') !== 'no_secure_storage_dialog') fail('unexpected_security_ui');
       await exerciseEmptyProfileSettings(active.settings);
@@ -514,6 +519,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
       if (pass === 1) await active.settings.evaluate('globalThis.tibotattleDesktop.setSharingEnabled(false)');
       await until(async () => (await active.readSharing())?.enabled === (pass === 0), 'sharing_preference_applied');
       await stopOwnedMacSharingApp(active); active = null;
+      await fixture.request('attest');
       if (JSON.stringify(validateCredentialSnapshot(await fixture.request('snapshot'), 'modern')) !== JSON.stringify(before)) fail('credential_changed');
     }
     proof.cases.push({ scenario: 'modern', status: 'passed', sameIdentityInstalledUpgrade: true,

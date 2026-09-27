@@ -107,8 +107,11 @@ changed identity remains a failed fixture receipt, never an adoption authority.
 The separate `audit` command can compare the three seeded synthetic values,
 item references and ACLs on a replacement inode. It reports only four booleans,
 does not advance the ownership journal, and cannot authorize mutation,
-restoration or cleanup. This diagnoses an observed macOS database rewrite but
-does not itself qualify credential continuity.
+restoration or cleanup. The fixture records an immutable observation intent
+before each ordinary signed app launch. Only after that app stops and the
+fixture rechecks its exact synthetic values, item references, ACLs, isolated
+scope and database metadata does `attest` complete the journal transition.
+A failed or incomplete transition remains closed and cannot authorize cleanup.
 
 ## Original native migration fixture
 

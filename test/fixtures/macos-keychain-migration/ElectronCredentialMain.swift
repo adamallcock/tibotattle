@@ -38,6 +38,7 @@ struct ElectronCredentialFixture {
     static var defaultSelected = false
     static var locked = false
     static var seededSnapshot: [[String: Any]]?
+    static var pendingAppObservation: MigrationProbeOwnership.Intent?
 
     static func host() throws {
         guard geteuid() == 501, let account = getpwuid(geteuid()),
@@ -154,12 +155,12 @@ struct ElectronCredentialFixture {
         return result
     }
 
-    static func audit() throws -> [String: Any] {
+    static func auditState() throws -> ([String: Any], MigrationProbeOwnership.Identity) {
         try F.require(selected && !locked, "KEYCHAIN_AUDIT_NOT_READY")
         guard let original = seededSnapshot, original.count == capabilities.count else {
             throw F.Failure("KEYCHAIN_AUDIT_NOT_READY")
         }
-        let (keychain, observed) = try F.observedKeychainForAudit()
+        let (keychain, observed) = try F.observedKeychainForAudit(pending: pendingAppObservation)
         let current = try snapshot(using: keychain)
         try F.validateRoot()
         try F.require(try F.identity(F.keychainMetadata()) == observed,
@@ -174,10 +175,34 @@ struct ElectronCredentialFixture {
                     && $0[key] as? String == $1[key] as? String
             }
         }
-        return ["pinUnchanged": observed == (try F.pinnedIdentity()),
-                "valuesMatch": compared["valuesMatch"] == true,
-                "itemsMatch": compared["itemsMatch"] == true,
-                "aclsMatch": compared["aclsMatch"] == true]
+        return (["pinUnchanged": observed == (try F.pinnedIdentity(pending: pendingAppObservation)),
+                 "valuesMatch": compared["valuesMatch"] == true,
+                 "itemsMatch": compared["itemsMatch"] == true,
+                 "aclsMatch": compared["aclsMatch"] == true], observed)
+    }
+
+    static func audit() throws -> [String: Any] {
+        try auditState().0
+    }
+
+    static func beginAppObservation() throws {
+        try F.require(pendingAppObservation == nil, "KEYCHAIN_OBSERVATION_ALREADY_PENDING")
+        let report = try audit()
+        try F.require(report.values.allSatisfy { $0 as? Bool == true }, "KEYCHAIN_OBSERVATION_BASELINE_CHANGED")
+        pendingAppObservation = try F.beginObservedAppRewrite()
+    }
+
+    static func attestAppObservation() throws {
+        guard let intent = pendingAppObservation else {
+            throw F.Failure("KEYCHAIN_OBSERVATION_NOT_PENDING")
+        }
+        let (report, observed) = try auditState()
+        try F.require(report["valuesMatch"] as? Bool == true && report["itemsMatch"] as? Bool == true
+            && report["aclsMatch"] as? Bool == true, "KEYCHAIN_OBSERVATION_CONTENT_CHANGED")
+        try F.finishObservedAppRewrite(intent, observed: observed)
+        pendingAppObservation = nil
+        try F.require(try F.identity(F.keychainMetadata()) == F.pinnedIdentity(),
+                      "KEYCHAIN_OBSERVATION_CHANGED")
     }
 
     static func domainList(_ domain: SecPreferencesDomain) throws -> [SecKeychain] {
@@ -342,13 +367,15 @@ struct ElectronCredentialFixture {
             var commands = 0, seeded = false, cleaned = false
             while let line = try nextCommand() {
                 commands += 1
-                try F.require(line.utf8.count < 64 && commands <= 16, "FIXTURE_PROTOCOL_LIMIT")
+                try F.require(line.utf8.count < 64 && commands <= 32, "FIXTURE_PROTOCOL_LIMIT")
                 switch line {
                 case "seed": try F.require(!seeded, "FIXTURE_ALREADY_SEEDED"); try seed(); seeded = true
                 case "snapshot": try F.require(seeded && !locked, "FIXTURE_NOT_READABLE")
                     F.report(["ok": true, "items": try snapshot()]); continue
                 case "audit": try F.require(seeded, "FIXTURE_NOT_SEEDED")
                     F.report(["ok": true, "audit": try audit()]); continue
+                case "begin": try F.require(seeded, "FIXTURE_NOT_SEEDED"); try beginAppObservation()
+                case "attest": try F.require(seeded, "FIXTURE_NOT_SEEDED"); try attestAppObservation()
                 case "select": try F.require(seeded, "FIXTURE_NOT_SEEDED"); try select()
                     F.report(["ok": true, "operation": line, "scope": try scopeProof()]); continue
                 case "scope": F.report(["ok": true, "operation": line, "scope": try scopeProof()]); continue
