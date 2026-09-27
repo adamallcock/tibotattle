@@ -282,6 +282,9 @@ test("PostgreSQL device-sync principal enforces the ordered budgets", {
     }
 
     const validAuthorization = authorization(deviceId, bearerSecret);
+    // Keep a second active principal available after the social bearer below
+    // is deliberately rotated and revoked.
+    const validAccountlessAuthorization = authorization(accountlessDeviceId, accountlessSecret);
 
     {
       const { env, trace } = admissionEnv();
@@ -334,7 +337,7 @@ test("PostgreSQL device-sync principal enforces the ordered budgets", {
     {
       const { env, trace } = admissionEnv();
       const result = await principalFor(env)(request({
-        authorization: authorization(accountlessDeviceId, accountlessSecret),
+        authorization: validAccountlessAuthorization,
       }));
       assert.equal(result.participantId, accountlessParticipantId);
       assert.equal(result.deviceId, accountlessDeviceId);
@@ -388,7 +391,9 @@ test("PostgreSQL device-sync principal enforces the ordered budgets", {
         binding: "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT",
         run: async () => ({ success: false }),
       } });
-      const error = await capture(principalFor(env)(request({ authorization: validAuthorization })));
+      const error = await capture(principalFor(env)(request({
+        authorization: validAccountlessAuthorization,
+      })));
       assertApiError(error, 429, "DEVICE_SYNC_LIMIT_REACHED");
       assert.deepEqual(trace, [
         "DEVICE_SYNC_CLIENT_RATE_LIMIT", "DEVICE_SYNC_RATE_LIMIT",

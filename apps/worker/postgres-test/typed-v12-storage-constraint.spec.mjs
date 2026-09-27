@@ -68,7 +68,7 @@ async function loadModules() {
   });
   const load = (path) => vite.ssrLoadModule(path);
   const [refusal, errors, client, runtimeSchema, transport, admission, domain, ledgerAuthority,
-    workerAdmission, bodyReader, constants, workerCrypto] = await Promise.all([
+    workerAdmission, deviceSyncPrincipal, bodyReader, constants, workerCrypto] = await Promise.all([
     load("/src/postgres-telemetry-v12-storage-refusal.ts"),
     load("/src/errors.ts"),
     load("/src/postgres-client.ts"),
@@ -78,13 +78,14 @@ async function loadModules() {
     load("/src/postgres-typed-v12-domain.ts"),
     load("/src/postgres-ledger-authority.ts"),
     load("/src/admission.ts"),
+    load("/src/postgres-device-sync-principal.ts"),
     load("/src/bounded-body.ts"),
     load("/src/constants.ts"),
     load("/src/crypto.ts"),
   ]);
   modules = {
     refusal, errors, client, runtimeSchema, transport, admission, domain, ledgerAuthority,
-    workerAdmission, bodyReader, constants, workerCrypto,
+    workerAdmission, deviceSyncPrincipal, bodyReader, constants, workerCrypto,
   };
   return modules;
 }
@@ -433,6 +434,9 @@ async function withHarness(prefix, run) {
       RECOVERY_RATE_LIMIT: allowAll(),
       CLIENT_ATTEMPT_RATE_LIMIT: allowAll(),
       PUBLIC_READ_RATE_LIMIT: allowAll(),
+      DEVICE_SYNC_CLIENT_RATE_LIMIT: allowAll(),
+      DEVICE_SYNC_RATE_LIMIT: allowAll(),
+      DEVICE_SYNC_PRINCIPAL_RATE_LIMIT: allowAll(),
       UPLOAD_AUTHORIZATION_RATE_LIMIT: allowAll(),
       UPLOAD_PRINCIPAL_RATE_LIMIT: allowAll(),
     });
@@ -446,6 +450,8 @@ async function withHarness(prefix, run) {
       admissionEnv,
       assertAdmissionBindings: m.workerAdmission.assertAdmissionBindings,
       assertAttemptAllowed: m.workerAdmission.assertAttemptAllowed,
+      createPostgresDeviceSyncPrincipal:
+        m.deviceSyncPrincipal.createPostgresDeviceSyncPrincipal,
       assertUploadAuthorizationBindings: m.workerAdmission.assertUploadAuthorizationBindings,
       assertUploadAuthorizationAllowed: m.workerAdmission.assertUploadAuthorizationAllowed,
       authenticatePostgresDevice: m.transport.authenticatePostgresDevice,
