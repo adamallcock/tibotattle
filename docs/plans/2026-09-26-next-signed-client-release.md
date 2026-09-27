@@ -31,11 +31,13 @@ the release trust suite passed. The Worker product lane passed 160 test files
 and 2,002 tests; its final deployment dry run refused the still-dirty source
 tree as designed. The first full root suite found stale model/catalog inventory
 assertions, which are repaired in this candidate; native sandbox and process
-tests passed when rerun with host permissions. Retained R7 receipts are stale
-because their workload closure includes the changed source and package files.
-The maintained R7 runbook requires separate owner authorization before its
-private-history, dual-runtime regeneration. No artifact should be treated as
-release-qualified while that evidence gate remains open.
+tests passed when rerun with host permissions. On 2026-09-27 the owner authorized
+the protected, local-only R7 regeneration. It produced ten validated receipts
+over 449 workload source files. Both decision receipts retain `release_open`,
+and the generated-evidence tests pass. The full root suite before regeneration
+passed 6,008 tests and failed twelve: four stale-receipt dependents and eight
+native host/sandbox tests. All eight passed when rerun with host access. The
+root suite must still pass against the final release commit and native host.
 
 The unsigned 0.1.25 Apple silicon development package from source
 `8facd001ac2bab274caa3eb546e226cd368a9910` was verified and run in an
