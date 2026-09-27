@@ -21,6 +21,22 @@ const SYNC = 6 * 60_000;
 function fail(stage) { throw Object.assign(new Error('SIGNED_STAGING_EXECUTION_FAILED'), { stage }); }
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
 
+// Recognize one fixed diagnostic from the signed predecessor without retaining
+// stderr, which may contain private paths or OS error text.
+export function fixedEntryFailureObserver() {
+  const marker = Buffer.from('electron_shell_entry_failed');
+  let matched = 0, observed = false;
+  return Object.freeze({
+    consume(chunk) {
+      for (const byte of chunk) {
+        matched = byte === marker[matched] ? matched + 1 : (byte === marker[0] ? 1 : 0);
+        if (matched === marker.length) { observed = true; matched = 0; }
+      }
+    },
+    observed: () => observed,
+  });
+}
+
 export function parseSignedStagingExecutionArguments(argv) {
   if (!Array.isArray(argv) || !['--execute-staging', '--execute-fresh-install'].includes(argv[0])) fail('arguments');
   return { ...parseSignedStagingConsumerArguments(argv.slice(1)),
@@ -156,9 +172,11 @@ export function assertSignedStagingFreshProjection(sharing, receipt) {
 }
 
 async function launch(verified, environment, { untouched = false, onFailure, launchServices = false,
-  networkMode = null, observeBeforeDashboard } = {}) {
+  networkMode = null, observeBeforeDashboard, observeFixedEntryFailure = false } = {}) {
   if (networkMode !== null && networkMode !== MACOS_LOOPBACK_MODE) fail('network_policy');
   if (networkMode !== null && launchServices) fail('network_policy');
+  if (observeFixedEntryFailure !== false
+      && (observeFixedEntryFailure !== true || !untouched || networkMode !== MACOS_LOOPBACK_MODE)) fail('diagnostic_policy');
   if (observeBeforeDashboard !== undefined && (networkMode !== MACOS_LOOPBACK_MODE
     || typeof observeBeforeDashboard !== 'function')) fail('startup_observer');
   // Same-identity handover/SingleInstanceLock must never attach to a pre-existing app.
@@ -167,11 +185,14 @@ async function launch(verified, environment, { untouched = false, onFailure, lau
   const argumentsList = ['--remote-debugging-port=' + port, '--remote-debugging-address=127.0.0.1'];
   const direct = networkMode === null ? { executable: verified.executable, args: argumentsList }
     : macOSLoopbackLaunch(verified.executable, argumentsList, networkMode);
+  const entryFailure = observeFixedEntryFailure ? fixedEntryFailureObserver() : null;
   const child = launchServices
     ? spawn('/usr/bin/open', ['-W', '-n', verified.appPath, '--args', ...argumentsList],
       { cwd: verified.appPath, env: environment, detached: true, stdio: 'ignore' })
     : spawn(direct.executable, direct.args,
-      { cwd: verified.appPath, env: environment, detached: true, stdio: 'ignore' });
+      { cwd: verified.appPath, env: environment, detached: true,
+        stdio: entryFailure ? ['ignore', 'ignore', 'pipe'] : 'ignore' });
+  if (entryFailure) child.stderr.on('data', chunk => entryFailure.consume(chunk));
   let exited = false;
   let spawnFailed = false;
   child.once('exit', () => { exited = true; });
@@ -225,7 +246,9 @@ async function launch(verified, environment, { untouched = false, onFailure, lau
     return state;
   } catch (error) {
     error.signedLaunchStage = launchStage;
-    if (onFailure) { try { await onFailure({ pid: state.pid, stage: launchStage }); } catch {} }
+    if (onFailure) { try { await onFailure({ pid: state.pid, stage: launchStage,
+      fixedEntryFailureObserved: entryFailure?.observed() ?? null,
+      debuggerListening: launchStage === 'native_intro' ? listenerOwned(state.pid, port) : null }); } catch {} }
     const stopped = await stop(state);
     error.ownedMacProcessesStopped = stopped === true;
     throw error;

@@ -286,7 +286,8 @@ export async function exerciseCredentialRefresh(dashboard, clock) {
 }
 
 // Retain fixed failure families only; exception messages, URLs and paths stay private.
-export function macCredentialFailureDiagnostics(error, predecessorUi = null) {
+export function macCredentialFailureDiagnostics(error, predecessorUi = null, predecessorEntryFailure = null,
+  predecessorDebuggerListening = null) {
   const launchStages = ['process_group', 'native_intro', 'owned_debugger', 'dashboard_target',
     'dashboard_ready', 'settings_target', 'settings_ready'];
   const launchCodes = ['startup', 'process_inventory', 'preexisting_app', 'local_response',
@@ -300,6 +301,9 @@ export function macCredentialFailureDiagnostics(error, predecessorUi = null) {
     launchOwnedProcessesStopped: typeof error?.ownedMacProcessesStopped === 'boolean'
       ? error.ownedMacProcessesStopped : null,
     predecessorUi: PREDECESSOR_UI_STATES.has(predecessorUi) ? predecessorUi : null,
+    predecessorEntryFailure: typeof predecessorEntryFailure === 'boolean' ? predecessorEntryFailure : null,
+    predecessorDebuggerListening: typeof predecessorDebuggerListening === 'boolean'
+      ? predecessorDebuggerListening : null,
   };
 }
 
@@ -312,6 +316,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
     nativeCleanQuitQualified: false, partialMigrationQualified: false,
     completeCredentialFailureMatrixQualified: false };
   let active = null, fixture = null, stage = 'intake', predecessorUi = null;
+  let predecessorEntryFailure = null, predecessorDebuggerListening = null;
   try {
     const input = validateMacCredentialIntake(intake);
     Object.assign(proof, { runnerRevision: input.runnerRevision, sourceRevision: input.sourceRevision,
@@ -350,9 +355,13 @@ export async function runMacCredentialQualification({ intake, execute = false })
     proof.fixtureScopes.push({ scenario: 'modern', ...((await fixture.request('select')).scope) });
     await fixture.request('scope');
     stage = 'predecessor_launch'; active = await launchVerifiedMacSharingApp(verified, environment, {
-      ...launchOptions, untouched: true,
-      onFailure: ({ pid, stage: launchStage }) => {
-        if (launchStage === 'native_intro') predecessorUi = observePredecessorUi(pid);
+      ...launchOptions, untouched: true, observeFixedEntryFailure: true,
+      onFailure: ({ pid, stage: launchStage, fixedEntryFailureObserved, debuggerListening }) => {
+        if (launchStage === 'native_intro') {
+          predecessorUi = observePredecessorUi(pid);
+          predecessorEntryFailure = fixedEntryFailureObserved;
+          predecessorDebuggerListening = debuggerListening;
+        }
       },
     });
     stage = 'predecessor_settings'; await exerciseEmptyProfileSettings(active.settings);
@@ -407,7 +416,8 @@ export async function runMacCredentialQualification({ intake, execute = false })
     proof.credentialContinuityQualified = true; proof.status = 'passed';
   } catch (error) {
     proof.status = 'failed'; proof.failureStage = error.credentialStage ?? stage; proof.failurePhase = stage;
-    proof.failureDiagnostics = macCredentialFailureDiagnostics(error, predecessorUi);
+    proof.failureDiagnostics = macCredentialFailureDiagnostics(error, predecessorUi,
+      predecessorEntryFailure, predecessorDebuggerListening);
     if (error.fixtureFailure) proof.fixtureFailure = error.fixtureFailure;
   }
   finally {

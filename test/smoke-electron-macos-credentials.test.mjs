@@ -17,7 +17,7 @@ import { CREDENTIAL_FIXTURE_CASES, credentialFixtureRoot, credentialFixtureConfi
   parseCredentialFixtureArguments, compileCredentialFixture } from '../scripts/prepare-electron-macos-credential-fixture.mjs';
 import { MACOS_LOOPBACK_POLICY, MACOS_LOOPBACK_MODE, macOSLoopbackLaunch,
   macOSLoopbackProbeSource, inspectMacOSLoopbackEnforcement } from '../scripts/lib/macos-loopback-qualification.mjs';
-import { launchVerifiedMacSharingApp } from '../scripts/run-signed-electron-staging.mjs';
+import { fixedEntryFailureObserver, launchVerifiedMacSharingApp } from '../scripts/run-signed-electron-staging.mjs';
 import { preflightMacCredentialEnvironment } from '../scripts/lib/macos-credential-qualification-intake.mjs';
 import { validateEmptyProfileIntake } from '../scripts/smoke-electron-macos-empty-profile.mjs';
 import { desktopFirstRunDialogCopy } from '../apps/electron/desktop-first-run.js';
@@ -257,6 +257,7 @@ test('fixed network launch cannot accept a policy, environment or command overri
   await assert.rejects(launchVerifiedMacSharingApp({}, {}, { networkMode: 'allow-all' }));
   await assert.rejects(launchVerifiedMacSharingApp({}, {}, { networkMode: MACOS_LOOPBACK_MODE, launchServices: true }));
   await assert.rejects(launchVerifiedMacSharingApp({}, {}, { observeBeforeDashboard: () => null }));
+  await assert.rejects(launchVerifiedMacSharingApp({}, {}, { observeFixedEntryFailure: true }));
 });
 
 const networkProof = { loopback: true, ipv4Denied: true, ipv6Denied: true, udp4Denied: true, udp6Denied: true, descendantDenied: true };
@@ -328,6 +329,17 @@ test('predecessor UI diagnosis returns only bounded states from the verified PID
   assert.throws(() => macCredentialPredecessorUiScript('123;injection'));
 });
 
+test('predecessor stderr diagnostic recognizes only its fixed token across chunks', () => {
+  const observer = fixedEntryFailureObserver();
+  observer.consume(Buffer.from('/Users/PRIVATE_SENTINEL\nelectron_shell_entry_'));
+  assert.equal(observer.observed(), false);
+  observer.consume(Buffer.from('failed\nSECRET'));
+  assert.equal(observer.observed(), true);
+  const unrelated = fixedEntryFailureObserver();
+  unrelated.consume(Buffer.from('/Users/PRIVATE_SENTINEL\nSECRET\n'));
+  assert.equal(unrelated.observed(), false);
+});
+
 test('refresh requires a new successful refresh ID and clicks once; stale success and failure cannot pass', async () => {
   for (const scenario of ['success', 'old-success', 'failed', 'unready']) {
     let time = 0, clicks = 0;
@@ -362,19 +374,24 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
     message: '/Users/PRIVATE_SENTINEL', stderr: 'SECRET' }), {
     launchStage: 'native_intro', launchCode: 'native_intro_unexpected', settingsStage: null,
     launchOwnedProcessesStopped: true, predecessorUi: null,
+    predecessorEntryFailure: null, predecessorDebuggerListening: null,
   });
   assert.deepEqual(macCredentialFailureDiagnostics({ emptyProfileStage: 'settings_effect',
     ownedMacProcessesStopped: false }), {
     launchStage: null, launchCode: null, settingsStage: 'settings_effect', launchOwnedProcessesStopped: false,
-    predecessorUi: null,
+    predecessorUi: null, predecessorEntryFailure: null, predecessorDebuggerListening: null,
   });
   for (const error of [null, {}, { signedLaunchStage: 'PRIVATE_SENTINEL', stage: 'PRIVATE_SENTINEL',
     emptyProfileStage: 'PRIVATE_SENTINEL', ownedMacProcessesStopped: 'true' }]) {
     assert.deepEqual(macCredentialFailureDiagnostics(error), {
       launchStage: null, launchCode: null, settingsStage: null, launchOwnedProcessesStopped: null,
-      predecessorUi: null,
+      predecessorUi: null, predecessorEntryFailure: null, predecessorDebuggerListening: null,
     });
   }
   assert.equal(macCredentialFailureDiagnostics({}, 'secure_storage_warning').predecessorUi, 'secure_storage_warning');
   assert.equal(macCredentialFailureDiagnostics({}, '/Users/PRIVATE_SENTINEL').predecessorUi, null);
+  assert.deepEqual(macCredentialFailureDiagnostics({}, null, true, false), {
+    launchStage: null, launchCode: null, settingsStage: null, launchOwnedProcessesStopped: null,
+    predecessorUi: null, predecessorEntryFailure: true, predecessorDebuggerListening: false,
+  });
 });
