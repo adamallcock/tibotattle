@@ -1500,9 +1500,7 @@ async function handlePostgresTestV12ChunkUpload({
   primaryPool,
   ledgerPool,
   schema,
-  admissionEnv,
   objectStore,
-  assertAttemptAllowed,
   hasPostgresDeletionTombstone,
   assertPostgresV12UploadAllowed,
   claimPostgresDeviceUploadAuthorization,
@@ -1569,13 +1567,6 @@ async function handlePostgresTestV12ChunkUpload({
     );
     principal = await readClaimedDevicePrincipal(
       primaryPool, schema.primarySchema, claim, envelopeDigest, bodyBytes,
-    );
-    await assertAttemptAllowed(
-      admissionEnv.RECOVERY_RATE_LIMIT,
-      admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
-      request,
-      admissionEnv,
-      "device_sync",
     );
     await assertPostgresProcessingEnabled(primaryPool, schema.primarySchema);
     if (await hasPostgresDeletionTombstone(
@@ -1868,6 +1859,7 @@ export function createPostgresTestV12DayManifestDispatch({
   admissionEnv,
   assertAdmissionBindings,
   assertAttemptAllowed,
+  createPostgresDeviceSyncPrincipal,
   assertUploadAuthorizationBindings,
   assertUploadAuthorizationAllowed,
   authenticatePostgresDevice,
@@ -1906,6 +1898,7 @@ export function createPostgresTestV12DayManifestDispatch({
       || typeof healthDispatch !== "function"
       || typeof assertAdmissionBindings !== "function"
       || typeof assertAttemptAllowed !== "function"
+      || typeof createPostgresDeviceSyncPrincipal !== "function"
       || typeof assertUploadAuthorizationBindings !== "function"
       || typeof assertUploadAuthorizationAllowed !== "function"
       || typeof authenticatePostgresDevice !== "function"
@@ -2015,6 +2008,13 @@ export function createPostgresTestV12DayManifestDispatch({
     const v12DomainPredecessorRoute = v12DomainPredecessorPath && request.method === "POST";
     const v12DomainActivateRoute = v12DomainActivatePath && request.method === "POST";
     const v12EffectivePageRoute = v12EffectivePagePath && request.method === "GET";
+    const deviceSyncRoute = syncStateRoute || syncManifestRoute
+      || syncCapabilitiesRoute || syncCapabilitiesV12Route
+      || manifestRoute || manifestReadRoute
+      || v12DomainPredecessorRoute || v12DomainActivateRoute
+      || v12EffectivePageRoute;
+    const deviceSyncMethod = manifestRoute || v12DomainPredecessorRoute || v12DomainActivateRoute
+      ? "POST" : "GET";
     if (envelopeKeyPath && request.method !== "GET") {
       return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET" },
@@ -2269,17 +2269,7 @@ export function createPostgresTestV12DayManifestDispatch({
           "device_disconnect",
         );
       }
-      if (syncStateRoute || syncManifestRoute || syncCapabilitiesRoute || syncCapabilitiesV12Route
-          || manifestReadRoute || v12EffectivePageRoute) {
-        await assertAttemptAllowed(
-          admissionEnv.RECOVERY_RATE_LIMIT,
-          admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
-          request,
-          admissionEnv,
-          "device_sync",
-        );
-      }
-      if (request.headers.has("cookie")) {
+      if (!deviceSyncRoute && request.headers.has("cookie")) {
         throw Object.assign(new Error("DEVICE_AUTH_INVALID"), {
           code: "DEVICE_AUTH_INVALID", status: 401,
         });
@@ -2308,9 +2298,7 @@ export function createPostgresTestV12DayManifestDispatch({
           primaryPool,
           ledgerPool,
           schema,
-          admissionEnv,
           objectStore,
-          assertAttemptAllowed,
           hasPostgresDeletionTombstone,
           assertPostgresV12UploadAllowed,
           claimPostgresDeviceUploadAuthorization,
@@ -2331,16 +2319,19 @@ export function createPostgresTestV12DayManifestDispatch({
       // route, it authenticates the base accountless lease graph rather than
       // requiring the v1.2 grant it reports on. Every v1.2 write still
       // authenticates against the v1.2 grant.
-      const device = await authenticatePostgresDevice(
-        primaryPool,
-        request.headers.get("authorization"),
-        {
+      const device = deviceSyncRoute
+        ? await createPostgresDeviceSyncPrincipal({
+          pool: primaryPool,
           schema,
-          ...(syncCapabilitiesRoute || syncCapabilitiesV12Route
-            ? { accountlessAuthorizationVersion: "v1.1" } : {}),
-        },
-      );
-      if (await hasPostgresDeletionTombstone(ledgerPool, device.participantId, Date.now(), { schema })) {
+          env: admissionEnv,
+        })(request, deviceSyncMethod)
+        : await authenticatePostgresDevice(
+          primaryPool,
+          request.headers.get("authorization"),
+          { schema },
+        );
+      if (!deviceSyncRoute
+          && await hasPostgresDeletionTombstone(ledgerPool, device.participantId, Date.now(), { schema })) {
         throw Object.assign(new Error("DEVICE_AUTH_INVALID"), {
           code: "DEVICE_AUTH_INVALID", status: 401,
         });
@@ -2462,13 +2453,6 @@ export function createPostgresTestV12DayManifestDispatch({
           admissionEnv,
         );
       } else {
-        await assertAttemptAllowed(
-          admissionEnv.RECOVERY_RATE_LIMIT,
-          admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
-          request,
-          admissionEnv,
-          "device_sync",
-        );
         await assertPostgresProcessingEnabled(primaryPool, schemas.primary);
       }
 
