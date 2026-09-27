@@ -1019,6 +1019,7 @@ test("local companion relays bounded durations and selects a deterministic prima
     );
     assert.equal(new Set(windows.map((window) => window.limitId)).has("unknown"), false);
     assert.equal(snapshot.overview.quotaWindows[0].durationMinutes, 43_200);
+    assert.equal(snapshot.overview.quotaWindows[0].status, "live");
     assert.equal(
       JSON.stringify(snapshot).includes("monthly"),
       false,
@@ -1028,6 +1029,42 @@ test("local companion relays bounded durations and selects a deterministic prima
       true,
     );
     assert.equal(snapshot.overview.quota.windows[0].planType, "unknown");
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("fresh local usage does not relabel an old Codex quota observation as live", async () => {
+  const root = await fixtureRoot();
+  try {
+    await writeFile(join(root, ".usage-monitor", "collector-events.jsonl"), [
+      JSON.stringify({
+        kind: "codex_quota_snapshot",
+        observedAt: "2026-07-25T10:00:00.000Z",
+        windows: [{
+          limitId: "codex",
+          slot: "primary",
+          usedPercent: 70,
+          windowDurationMins: 10_080,
+          resetsAt: 1_785_376_800,
+        }],
+      }),
+      JSON.stringify({
+        schemaVersion: "0.3",
+        kind: "codex_rollout_usage_snapshot",
+        observedAt: "2026-07-25T11:59:00.000Z",
+        model: "gpt-5.6-sol",
+        components: { input_uncached_tokens: 100 },
+      }),
+    ].map((line) => `${line}\n`).join(""), { mode: 0o600 });
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(snapshot.overview.freshness.status, "live");
+    assert.equal(snapshot.overview.quotaWindows.length, 1);
+    assert.equal(snapshot.overview.quotaWindows[0].status, "stale");
+    assert.equal(snapshot.overview.quotaWindows[0].observedAt, "2026-07-25T10:00:00.000Z");
   } finally {
     await rm(root, { recursive: true });
   }

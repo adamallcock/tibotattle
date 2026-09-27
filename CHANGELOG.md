@@ -35,6 +35,19 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
+**0.1.25 candidate notes:** [release-notes/0.1.25.md](./release-notes/0.1.25.md).
+
+- Restore direct Codex allowance refresh when a current ChatGPT or Codex app
+  bundles its CLI under `codex-cli/bin/codex`; retain legacy bundle and explicit
+  CLI locations, with path-free selection diagnostics. Keep quota freshness
+  independent of newer usage and bound the UI wait after a terminal timeout.
+- Improve Mac update visibility and prevent a tray cleanup crash during updater
+  shutdown. Persist startup checkpoints before early quits, warm cached dashboard
+  reports across periods and speed modes, and correct the Trends header range
+  for cached plan views.
+- Keep the forecast-only GPT-6.1 Astra identity explicitly unpriced in local
+  Codex usage reports.
+
 ## [0.1.24](./release-notes/0.1.24.md) - 2026-09-23
 
 **Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.24) ·

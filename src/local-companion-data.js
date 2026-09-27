@@ -2790,6 +2790,12 @@ export async function buildLocalCompanionSnapshot({
     ? fastModeProjection(undefined, fastModeContext)
     : periodFastMode.get(displayUsage.id);
   const quota = collector.quota;
+  const quotaObservedAtMs = Date.parse(quota.observedAt ?? "");
+  // A recent usage record cannot refresh an older provider allowance read.
+  // Keep each quota window tied to the age of its own observation.
+  const quotaFreshnessStatus = Number.isSafeInteger(quotaObservedAtMs)
+    && Math.max(0, nowMs - quotaObservedAtMs) <= MAX_COLLECTOR_LIVE_AGE_MS
+    ? "live" : "stale";
   const quotaTimeline = unifiedAvailable
     ? unified.timeline.quota
     : Array.isArray(replaySafeCache?.quotaTimeline)
@@ -3127,7 +3133,7 @@ export async function buildLocalCompanionSnapshot({
       quotaWindows: quota.windows.map((window) => ({
         ...window,
         observedAt: quota.observedAt,
-        status: freshnessStatus,
+        status: quotaFreshnessStatus,
       })),
       usage,
       tools,
