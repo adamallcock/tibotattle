@@ -18,7 +18,7 @@ import { CREDENTIAL_FIXTURE_CASES, credentialFixtureRoot, credentialFixtureConfi
 import { MACOS_LOOPBACK_POLICY, MACOS_LOOPBACK_MODE, macOSLoopbackLaunch,
   macOSLoopbackProbeSource, inspectMacOSLoopbackEnforcement } from '../scripts/lib/macos-loopback-qualification.mjs';
 import { fixedEntryFailureObserver, launchVerifiedMacSharingApp } from '../scripts/run-signed-electron-staging.mjs';
-import { preflightMacCredentialEnvironment } from '../scripts/lib/macos-credential-qualification-intake.mjs';
+import { MAC_CREDENTIAL_CURRENT_STABLE_SCHEMA, preflightMacCredentialEnvironment } from '../scripts/lib/macos-credential-qualification-intake.mjs';
 import { validateEmptyProfileIntake } from '../scripts/smoke-electron-macos-empty-profile.mjs';
 import { desktopFirstRunDialogCopy } from '../apps/electron/desktop-first-run.js';
 
@@ -50,6 +50,26 @@ test('credential intake binds a separate reviewed runner, exact app, signed fixt
       assert.throws(() => validateMacCredentialIntake({ ...intake, [field]: value }));
     }
   }
+});
+
+test('current-stable credential journey pins both public 0.1.24 and unchanged signed 0.1.25 bytes', () => {
+  const selected = { ...intake, schemaVersion: MAC_CREDENTIAL_CURRENT_STABLE_SCHEMA,
+    sourceRevision: 'fec5b6039ea9efbc7948f0785bb40240cd0748ea',
+    version: '0.1.25', bundleVersion: '1033', buildNumber: '2026092601',
+    dmgSha256: '6b09cbc3e97864d67ed6f7b24c99b5847c1cb91c525e5a22de73164263ec72b2',
+    asarSha256: '654a351a5ba08eb749b5b53fc98bdafc4123b2fe2485385400dccfe2c561bdc5',
+    predecessorAsarSha256: 'c061f3af2b54ffacedc9a4c0a3561d82cd25873fac0c11eecb6cd46f6f704833' };
+  const result = validateMacCredentialIntake(selected);
+  assert.equal(result.predecessorUrl,
+    'https://github.com/adamallcock/tibotattle/releases/download/v0.1.24/TiboTattle-0.1.24-mac-arm64.dmg');
+  assert.deepEqual(result.predecessor, {
+    version: '0.1.24', sourceRevision: 'b6fe68e4912bebbe6dcf7dc9fd43e877451dd133',
+    buildNumber: '2026092202', bundleVersion: '1032',
+    dmgSha256: 'f77f4e466c3be68209205a01866bbaf66650012cb40d2233d4fde53b9e767969',
+    asarSha256: selected.predecessorAsarSha256 });
+  for (const change of [{ predecessorAsarSha256: 'a'.repeat(64) }, { dmgSha256: 'b'.repeat(64) },
+    { sourceRevision: 'a'.repeat(40) }, { version: '0.1.26' }, { buildNumber: '2026092602' }])
+    assert.throws(() => validateMacCredentialIntake({ ...selected, ...change }));
 });
 
 test('early admission checks source receipt, source ancestry, exact package and mode in a clean synthetic repository', async t => {

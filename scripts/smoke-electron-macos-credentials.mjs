@@ -10,7 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { exerciseEmptyProfileSettings } from './smoke-electron-macos-empty-profile.mjs';
 import { validateSparkleTransitionHost, signedMacTransitionEnvironment,
   assertExtractedSignedMacBundle, verifySparkleTransitionCandidate } from './smoke-electron-macos-sparkle-transition.mjs';
-import { ELECTRON_020_DMG, verifyPredecessor, refreshProductionUpdateArchiveIndex } from './smoke-electron-macos-production-update.mjs';
+import { verifyPredecessor, refreshProductionUpdateArchiveIndex } from './smoke-electron-macos-production-update.mjs';
 import { launchVerifiedMacSharingApp, stopOwnedMacSharingApp, signedStagingFixture } from './run-signed-electron-staging.mjs';
 import { CREDENTIAL_FIXTURE_CASES, CREDENTIAL_FIXTURE_REQUIREMENT } from './prepare-electron-macos-credential-fixture.mjs';
 import { inspectMacOSLoopbackEnforcement, MACOS_LOOPBACK_MODE } from './lib/macos-loopback-qualification.mjs';
@@ -378,8 +378,11 @@ export async function runMacCredentialQualification({ intake, execute = false })
     Object.assign(proof, { runnerRevision: input.runnerRevision, sourceRevision: input.sourceRevision,
       target: input.target, version: input.version, bundleVersion: input.bundleVersion, buildNumber: input.buildNumber,
       dmgSha256: input.dmgSha256, asarSha256: input.asarSha256, fixtureExecutableSha256: input.fixtureExecutableSha256,
-      fixtureArchiveSha256: input.fixtureArchiveSha256, operationId: input.operationId, predecessorVersion: '0.1.20',
-      predecessorAsarSha256: input.predecessorAsarSha256 });
+      fixtureArchiveSha256: input.fixtureArchiveSha256, operationId: input.operationId,
+      predecessorVersion: input.predecessor.version,
+      predecessorAsarSha256: input.predecessorAsarSha256,
+      predecessorDmgSha256: input.predecessor.dmgSha256,
+      predecessorSourceRevision: input.predecessor.sourceRevision ?? null });
     if (!execute) return proof;
     proof.status = 'failed'; stage = 'disposable_host';
     const home = validateSparkleTransitionHost({ target: input.target, platform: process.platform, architecture: process.arch,
@@ -398,11 +401,14 @@ export async function runMacCredentialQualification({ intake, execute = false })
     stage = 'artifact_intake';
     const dmg = join(directory, 'candidate.dmg'), predecessor = join(directory, 'predecessor.dmg');
     await download(input.candidate.url, dmg, input.dmgSha256, 1024 ** 3);
-    await download(input.predecessorUrl, predecessor, ELECTRON_020_DMG[input.target], 1024 ** 3, true);
+    await download(input.predecessorUrl, predecessor, input.predecessor.dmgSha256, 1024 ** 3, true);
     const helper = await prepareFixture(input, directory);
     await mkdir(dirname(installed), { recursive: true, mode: 0o700 }); await safePath(dirname(installed));
     await install(predecessor, installed, join(directory, 'old-mount'));
-    let verified = await verifyPredecessor({ ...input, architecture: 'arm64' }, installed);
+    let verified = input.predecessor.version === '0.1.20'
+      ? await verifyPredecessor({ ...input, architecture: 'arm64' }, installed)
+      : await verifySparkleTransitionCandidate({ ...input.predecessor, target: input.target,
+        architecture: 'arm64' }, installed);
     await mkdir(codex, { mode: 0o700 }); await mkdir(join(codex, 'sessions'), { mode: 0o700 });
     await writeFile(join(codex, 'sessions', 'rollout-credential-synthetic.jsonl'), signedStagingFixture(), { mode: 0o600, flag: 'wx' });
     const launchOptions = { networkMode: MACOS_LOOPBACK_MODE };

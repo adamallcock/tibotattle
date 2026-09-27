@@ -73,10 +73,14 @@ descendant process, plus an actual loopback connection. A fixed inherited
 sandbox permits loopback, retains normal OS credential protection, and blocks
 external app traffic; no endpoint, proxy, app bytes or ACL is weakened.
 
-The first journey verifies existing modern values through the exact signed
+The v1 first journey verifies existing modern values through the exact signed
 Electron 0.1.20 predecessor and installed candidate replacement, a completed
 local refresh, three controlled candidate restarts, and persistent sharing
 preferences. Every readback must retain the item identity, bytes and ACL.
+The separately pinned v2 current-stable journey selects the published 0.1.24
+ARM DMG and the unchanged signed 0.1.25 candidate. Its intake admits only
+those exact source, build and artifact identities; it does not turn a v1
+0.1.20 startup failure into a passing legacy upgrade result.
 Malformed and locked cases inspect the actual candidate's reason, explicit
 silent Retry and native Quit completion; the locked fixture is unlocked only
 with its in-memory password for unchanged-value verification. Only the closed
