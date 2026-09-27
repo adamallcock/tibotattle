@@ -33,7 +33,7 @@ describe('ordered ingestion before public analytics',()=>{
    for(let i=0;i<175;i++)await options.source.prepare('SELECT 1').run();
    return {...result,steps:16,recordsRead:3200,queriesUsed:175};
   }).mockImplementationOnce(async options=>{
-   expect(options).toMatchObject({publishCommunity:true,publicOnly:true,maxSteps:32,maxQueries:725,deadlineMs:NOW+55_000});
+   expect(options).toMatchObject({publishCommunity:true,publicOnly:true,maxSteps:32,maxQueries:775,deadlineMs:NOW+55_000});
    await options.target.prepare('SELECT 1').run();
    return {...result,steps:2,recordsRead:0,queriesUsed:1,graphCalculations:1};
   });
@@ -70,7 +70,7 @@ describe('ordered ingestion before public analytics',()=>{
   pass.mockResolvedValue(result);
   await runStorageAnalyticsSchedule({...environment(),PUBLIC_ANALYTICS_MODE:'disabled'});
   expect(pass).toHaveBeenCalledTimes(1);
-  expect(pass.mock.calls[0]![0]).toMatchObject({publishCommunity:false,maxQueries:900,deadlineMs:NOW+20_000});
+  expect(pass.mock.calls[0]![0]).toMatchObject({publishCommunity:false,maxQueries:950,deadlineMs:NOW+20_000});
   expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({deliverySteps:1,deliveryRecordsRead:0,
    deliveryQueriesUsed:0,publicIterations:0,publicRecordsRead:0,publicQueriesUsed:0});
  });
@@ -102,7 +102,7 @@ describe('long graph-only pass on the single minute schedule',()=>{
    pass.mockReset();log.mockReset();vi.setSystemTime(at(minute));
    pass.mockImplementationOnce(deliveryPhase(5)).mockImplementationOnce(async options=>{
     expect(options).toMatchObject({publishCommunity:true,publicOnly:true,graphOnly:true,maxSteps:32,
-     maxQueries:895,deadlineMs:at(minute)+8*60_000,graphLeaseMs:570_000});
+     maxQueries:945,deadlineMs:at(minute)+8*60_000,graphLeaseMs:570_000});
     await options.target.prepare('SELECT 1').run();
     return {...result,steps:3,queriesUsed:99,graphCalculations:1};
    });
@@ -148,7 +148,7 @@ describe('long graph-only pass on the single minute schedule',()=>{
   await runStorageAnalyticsSchedule({...environment(),PUBLIC_ANALYTICS_MODE:'disabled'},
    {cron:STORAGE_ANALYTICS_MINUTE_CRON,nowMs:at(30)});
   expect(pass).toHaveBeenCalledTimes(1);
-  expect(pass.mock.calls[0]![0]).toMatchObject({publishCommunity:false,maxQueries:900,deadlineMs:at(30)+20_000});
+  expect(pass.mock.calls[0]![0]).toMatchObject({publishCommunity:false,maxQueries:950,deadlineMs:at(30)+20_000});
   expect(pass.mock.calls[0]![0]!.graphOnly).toBeUndefined();
   expect(JSON.parse(log.mock.calls[0]![0] as string).event).toBe('storage_analytics_schedule');
  });

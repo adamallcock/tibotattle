@@ -80,7 +80,8 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
   &&new Date(options?.nowMs??Date.now()).getUTCMinutes()%STORAGE_ANALYTICS_LONG_PASS_MINUTES===0;
  const event=longPass?'storage_analytics_long_schedule':'storage_analytics_schedule';
  try {
-  const meter=createD1InvocationBudget(900);
+  // Leave 50 of the paid D1 invocation's 1,000-query ceiling unused.
+  const meter=createD1InvocationBudget(950);
   const bindings={source:meter.wrap(env.STORAGE_INGESTION_DB),target:meter.wrap(env.STORAGE_ANALYTICS_DB),
    sourceId:env.STORAGE_SOURCE_ID,sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE,ledger:meter.wrap(env.DELETION_LEDGER)};
   // Give ordered delivery its own bounded opportunity before expensive graph
