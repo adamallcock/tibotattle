@@ -67,6 +67,14 @@ every member is unlocked and readable. A successful modern read remains usable
 if another listed keychain is locked. A new item goes explicitly into an
 unlocked default keychain from the captured list.
 
+macOS can return `errSecAuthFailed` for both a locked Keychain and an item ACL
+denial. On that result for a modern item, the adapter makes a prompt-free,
+metadata-only lookup of the fixed service and account in the captured search
+list. It reports `locked` only when exactly one matching item is found and its
+owning Keychain is locked; otherwise the authorization failure stays `denied`.
+This check does not read secret bytes or change the item, its ACL, or the
+Keychain search list.
+
 When a modern lookup is absent, the adapter makes a fixed **attribute-only**
 probe for the corresponding legacy `.v1` pair. A present or indeterminate legacy
 probe returns `migration_required`; a proven absent legacy item returns
