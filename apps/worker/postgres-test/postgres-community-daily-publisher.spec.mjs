@@ -3,7 +3,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { lstat, realpath, stat } from "node:fs/promises";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import pg from "pg";
-import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { applyStockAndStagedMigrations } from "./staged-migrations-harness.mjs";
 import { deviceHash } from "../src/device-auth.ts";
 import { encodeBase64Url } from "../src/crypto.ts";
 import { disconnectPostgresAuthenticatedDevice } from "../src/postgres-device-disconnect.ts";
@@ -105,7 +105,10 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
     schema = `pcdp_${randomBytes(6).toString("hex")}`;
     sqlSchema = `"${schema}"`;
     await pool.query(`CREATE SCHEMA ${sqlSchema}`);
-    await applyPostgresMigrations({ role: "primary", schema, pool });
+    await applyStockAndStagedMigrations({
+      role: "primary", schema, pool,
+      stagedFiles: ["0093_community_daily_v12_authority_pin.sql"],
+    });
     await pool.query(`INSERT INTO ${sqlSchema}.typed_telemetry_namespaces(id,original_id)
       VALUES (1,decode('0102','hex'))`);
     await pool.query(`INSERT INTO ${sqlSchema}.typed_v1_admission_state(
@@ -836,6 +839,64 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
       day: DAY, schema: { primarySchema: schema },
     })).toEqual(expectedEligibility);
     expect(observed.stats).toMatchObject({ checkouts: 1, releases: 1, active: 0, maxActive: 1, fetches: pages });
+  });
+
+  it("pins v1.2 runtime and accountless expiry inputs into immutable daily revisions", async () => {
+    const fixture = await addAccountlessRetainedV11Day();
+    const first = await publish();
+    expect(first).toEqual({ state: "published", day: DAY, revision: 2 });
+
+    const readPin = async () => (await pool.query(`SELECT
+      telemetry_v12_runtime_state,telemetry_v12_runtime_revision,
+      telemetry_v12_typed_runtime_state,telemetry_v12_typed_runtime_policy_revision,
+      telemetry_v12_accountless_authorization_count,
+      telemetry_v12_next_accountless_authorization_expiry
+      FROM ${sqlSchema}.community_daily_aggregates
+      WHERE source_id=$1 AND day=$2::date ORDER BY revision DESC LIMIT 1`, [SOURCE_ID, DAY])).rows[0];
+    expect(await readPin()).toMatchObject({
+      telemetry_v12_runtime_state: "staged",
+      telemetry_v12_runtime_revision: "0",
+      telemetry_v12_typed_runtime_state: "staged",
+      telemetry_v12_typed_runtime_policy_revision: "1",
+      telemetry_v12_accountless_authorization_count: "0",
+      telemetry_v12_next_accountless_authorization_expiry: null,
+    });
+    expect(await publish()).toEqual({ state: "unchanged", day: DAY, revision: 2 });
+
+    await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_runtime
+      SET state='blocked',revision=revision+1 WHERE id=1`);
+    expect(await publish()).toEqual({ state: "published", day: DAY, revision: 3 });
+
+    const expiry = "2027-09-23T00:00:00.000Z";
+    await pool.query(`INSERT INTO ${sqlSchema}.accountless_v12_device_authorizations(
+      enrollment_device_id,participant_id,device_credential_id,
+      telemetry_schema_version,field_dictionary_version,privacy_contract_version,
+      authorized_at,expires_at,state)
+      VALUES ($1,$2,$1,'telemetry-contribution-v1.2',
+        'telemetry-v1.2-registry-2026-09-20.1','ongoing-privacy-safe-telemetry-v1.2',
+        $3::timestamptz,$4::timestamptz,'active')`,
+    [fixture.deviceId, fixture.participantId, "2026-09-24T00:00:00.000Z", expiry]);
+    expect(await publish()).toEqual({ state: "published", day: DAY, revision: 4 });
+    expect(await readPin()).toMatchObject({
+      telemetry_v12_runtime_state: "blocked",
+      telemetry_v12_runtime_revision: "1",
+      telemetry_v12_accountless_authorization_count: "1",
+      telemetry_v12_next_accountless_authorization_expiry: new Date(expiry),
+    });
+
+    // Moving the earliest unexpired boundary must invalidate `unchanged` even
+    // when the stored source cursor and authorization count are constant.
+    const earlierExpiry = "2027-09-22T00:00:00.000Z";
+    await pool.query(`UPDATE ${sqlSchema}.accountless_v12_device_authorizations
+      SET expires_at=$2::timestamptz WHERE enrollment_device_id=$1`,
+    [fixture.deviceId, earlierExpiry]);
+    expect(await publish()).toEqual({ state: "published", day: DAY, revision: 5 });
+    expect(await readPin()).toMatchObject({
+      telemetry_v12_accountless_authorization_count: "1",
+      telemetry_v12_next_accountless_authorization_expiry: new Date(earlierExpiry),
+    });
+    expect((await pool.query(`SELECT sequence FROM ${sqlSchema}.analytics_source_cursors
+      WHERE source_id=$1`, [SOURCE_ID])).rows).toEqual([{ sequence: "0" }]);
   });
 
   it("preserves exact mixed v1.0/v1.1 publication output", async () => {

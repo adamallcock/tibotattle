@@ -45,6 +45,12 @@ interface DailyFenceRow {
   readonly v11_runtime_contract_version: string | number;
   readonly policy_revision: string | number;
   readonly collection_revision: string | number;
+  readonly telemetry_v12_runtime_state: string;
+  readonly telemetry_v12_runtime_revision: string | number;
+  readonly telemetry_v12_typed_runtime_state: string;
+  readonly telemetry_v12_typed_runtime_policy_revision: string | number;
+  readonly telemetry_v12_accountless_authorization_count: string | number;
+  readonly telemetry_v12_next_accountless_authorization_expiry: string | Date | null;
   readonly control_state: string;
   readonly publication_enabled: boolean;
 }
@@ -63,6 +69,12 @@ interface RevisionRow {
   readonly source_cursor_sequence: string | number;
   readonly policy_revision: string | number;
   readonly collection_revision: string | number;
+  readonly telemetry_v12_runtime_state: string | null;
+  readonly telemetry_v12_runtime_revision: string | number | null;
+  readonly telemetry_v12_typed_runtime_state: string | null;
+  readonly telemetry_v12_typed_runtime_policy_revision: string | number | null;
+  readonly telemetry_v12_accountless_authorization_count: string | number | null;
+  readonly telemetry_v12_next_accountless_authorization_expiry: string | Date | null;
 }
 
 interface DailyTotalsQueryRow extends Record<string, unknown> {
@@ -118,6 +130,19 @@ function integer(value: unknown, minimum = 0): number {
   const parsed = typeof value === "string" && /^\d+$/u.test(value) ? Number(value) : value;
   if (typeof parsed !== "number" || !Number.isSafeInteger(parsed) || parsed < minimum) invalid();
   return parsed;
+}
+
+function timestamp(value: unknown): string | null {
+  if (value === null) return null;
+  const milliseconds = value instanceof Date
+    ? value.valueOf()
+    : typeof value === "string" ? Date.parse(value) : Number.NaN;
+  if (!Number.isFinite(milliseconds)) invalid();
+  return new Date(milliseconds).toISOString();
+}
+
+function nullableInteger(value: unknown, minimum = 0): number | null {
+  return value === null ? null : integer(value, minimum);
 }
 
 function dayValue(value: unknown): string {
@@ -562,6 +587,11 @@ async function captureFence(
   sourceId: string,
   sourceNamespace: string,
 ) {
+  // Requires staged primary 0093 to be deliberately promoted/applied before
+  // deploying this reader. The v1.2 values are a preparatory immutable pin
+  // only; the source CTE below still excludes typed v1.2. Before enabling that
+  // source, authorization writes and the expiry boundary also need a commit-time
+  // fence so eligibility cannot change after this statement's snapshot.
   const result = await client.query<DailyFenceRow>(
     `SELECT source.source_id,
             source.authority_epoch AS source_authority_epoch,
@@ -573,6 +603,18 @@ async function captureFence(
             v11.runtime_contract_version AS v11_runtime_contract_version,
             policy.policy_revision,
             controls.revision AS collection_revision,
+            telemetry_v12_runtime.state AS telemetry_v12_runtime_state,
+            telemetry_v12_runtime.revision AS telemetry_v12_runtime_revision,
+            telemetry_v12_typed_runtime.state AS telemetry_v12_typed_runtime_state,
+            telemetry_v12_typed_runtime.policy_revision AS telemetry_v12_typed_runtime_policy_revision,
+            (SELECT count(*) FROM ${schema}.accountless_v12_device_authorizations account_auth
+              WHERE account_auth.state='active'
+                AND account_auth.expires_at > statement_timestamp())
+              AS telemetry_v12_accountless_authorization_count,
+            (SELECT min(account_auth.expires_at) FROM ${schema}.accountless_v12_device_authorizations account_auth
+              WHERE account_auth.state='active'
+                AND account_auth.expires_at > statement_timestamp())
+              AS telemetry_v12_next_accountless_authorization_expiry,
             controls.control_state,
             controls.publication_enabled
        FROM ${schema}.storage_source_state source
@@ -581,8 +623,11 @@ async function captureFence(
        JOIN ${schema}.typed_v11_admission_state v11 ON v11.id=1
        JOIN ${schema}.publication_state policy ON policy.singleton=1
        JOIN ${schema}.collection_controls controls ON controls.singleton=1
+       JOIN ${schema}.telemetry_v12_runtime telemetry_v12_runtime ON telemetry_v12_runtime.id=1
+       JOIN ${schema}.telemetry_v12_typed_runtime telemetry_v12_typed_runtime ON telemetry_v12_typed_runtime.id=1
       WHERE source.singleton=1 AND source.source_id=$1
-      FOR SHARE OF source, cursor, v1, v11, policy, controls`,
+      FOR SHARE OF source, cursor, v1, v11, policy, controls,
+                     telemetry_v12_runtime, telemetry_v12_typed_runtime`,
     [sourceId],
   );
   const row = result.rows[0];
@@ -592,9 +637,16 @@ async function captureFence(
       || integer(row.v1_runtime_contract_version) !== 1
       || integer(row.v11_runtime_contract_version) !== 1
       || integer(row.policy_revision, 1) < 1 || integer(row.collection_revision, 1) < 1
+      || !["staged", "active", "blocked"].includes(row.telemetry_v12_runtime_state)
+      || integer(row.telemetry_v12_runtime_revision) < 0
+      || !["staged", "active"].includes(row.telemetry_v12_typed_runtime_state)
+      || integer(row.telemetry_v12_typed_runtime_policy_revision, 1) < 1
       || row.control_state !== "operational" || row.publication_enabled !== true) {
     unavailable();
   }
+  const v12AuthorizationCount = integer(row.telemetry_v12_accountless_authorization_count);
+  const v12NextAuthorizationExpiry = timestamp(row.telemetry_v12_next_accountless_authorization_expiry);
+  if ((v12AuthorizationCount === 0) !== (v12NextAuthorizationExpiry === null)) unavailable();
   const journal = await client.query<JournalFenceRow>(
     `SELECT COALESCE(max(change.sequence), 0)::text AS latest_sequence,
             COALESCE(max(change.sequence) FILTER (WHERE change.kind IN ('owner-withdrawn', 'owner-erased')), 0)::text AS terminal_sequence
@@ -614,7 +666,30 @@ async function captureFence(
     cursorSequence,
     policyRevision: integer(row.policy_revision, 1),
     collectionRevision: integer(row.collection_revision, 1),
+    telemetryV12RuntimeState: row.telemetry_v12_runtime_state,
+    telemetryV12RuntimeRevision: integer(row.telemetry_v12_runtime_revision),
+    telemetryV12TypedRuntimeState: row.telemetry_v12_typed_runtime_state,
+    telemetryV12TypedRuntimePolicyRevision: integer(row.telemetry_v12_typed_runtime_policy_revision, 1),
+    telemetryV12AccountlessAuthorizationCount: v12AuthorizationCount,
+    telemetryV12NextAccountlessAuthorizationExpiry: v12NextAuthorizationExpiry,
   });
+}
+
+function sameV12AuthorityPin(previous: RevisionRow, fence: Awaited<ReturnType<typeof captureFence>>): boolean {
+  if (previous.telemetry_v12_runtime_state === null
+      || previous.telemetry_v12_typed_runtime_state === null
+      || previous.telemetry_v12_runtime_revision === null
+      || previous.telemetry_v12_typed_runtime_policy_revision === null
+      || previous.telemetry_v12_accountless_authorization_count === null) return false;
+  return previous.telemetry_v12_runtime_state === fence.telemetryV12RuntimeState
+    && nullableInteger(previous.telemetry_v12_runtime_revision) === fence.telemetryV12RuntimeRevision
+    && previous.telemetry_v12_typed_runtime_state === fence.telemetryV12TypedRuntimeState
+    && nullableInteger(previous.telemetry_v12_typed_runtime_policy_revision, 1)
+      === fence.telemetryV12TypedRuntimePolicyRevision
+    && nullableInteger(previous.telemetry_v12_accountless_authorization_count)
+      === fence.telemetryV12AccountlessAuthorizationCount
+    && timestamp(previous.telemetry_v12_next_accountless_authorization_expiry)
+      === fence.telemetryV12NextAccountlessAuthorizationExpiry;
 }
 
 export interface PublishPostgresCommunityDailyOptions {
@@ -668,7 +743,11 @@ export async function publishPostgresCommunityDailyDay(
     const previousResult = await client.query<RevisionRow>(
       `SELECT revision, release_state, payload_json, payload_sha256,
               source_authority_epoch, source_cursor_sequence,
-              policy_revision, collection_revision
+              policy_revision, collection_revision,
+              telemetry_v12_runtime_state, telemetry_v12_runtime_revision,
+              telemetry_v12_typed_runtime_state, telemetry_v12_typed_runtime_policy_revision,
+              telemetry_v12_accountless_authorization_count,
+              telemetry_v12_next_accountless_authorization_expiry
          FROM ${schema}.community_daily_aggregates
         WHERE source_id=$1 AND source_namespace=$2 AND day=$3::date
         ORDER BY revision DESC LIMIT 1`,
@@ -680,6 +759,7 @@ export async function publishPostgresCommunityDailyDay(
         && integer(previous.source_cursor_sequence) === fence.cursorSequence
         && integer(previous.policy_revision, 1) === fence.policyRevision
         && integer(previous.collection_revision, 1) === fence.collectionRevision
+        && sameV12AuthorityPin(previous, fence)
         && await sha256Hex(previous.payload_json) === previous.payload_sha256) {
       return Object.freeze({ state: "unchanged", day: capturedDay, revision: integer(previous.revision, 1) });
     }
@@ -743,9 +823,14 @@ export async function publishPostgresCommunityDailyDay(
       `INSERT INTO ${schema}.community_daily_aggregates (
          source_id, source_namespace, day, revision, payload_json, payload_sha256,
          source_authority_epoch, source_cursor_sequence, policy_revision,
-         collection_revision, release_state, released_at
+         collection_revision, telemetry_v12_runtime_state, telemetry_v12_runtime_revision,
+         telemetry_v12_typed_runtime_state, telemetry_v12_typed_runtime_policy_revision,
+         telemetry_v12_accountless_authorization_count,
+         telemetry_v12_next_accountless_authorization_expiry,
+         release_state, released_at
        )
-       SELECT $1,$2,$3::date,$4,$5,$6,$7,$8,$9,$10,'published',$11::timestamptz
+       SELECT $1,$2,$3::date,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+              'published',$17::timestamptz
         WHERE NOT EXISTS (
           SELECT 1 FROM ${schema}.storage_ingestion_changes change
            WHERE change.source_id=$1
@@ -755,7 +840,10 @@ export async function publishPostgresCommunityDailyDay(
        RETURNING revision`,
       [identity.sourceId, identity.sourceNamespace, capturedDay, revision, payloadJson, payloadSha256,
         fence.sourceAuthorityEpoch, fence.cursorSequence, fence.policyRevision, fence.collectionRevision,
-        releasedAt],
+        fence.telemetryV12RuntimeState, fence.telemetryV12RuntimeRevision,
+        fence.telemetryV12TypedRuntimeState, fence.telemetryV12TypedRuntimePolicyRevision,
+        fence.telemetryV12AccountlessAuthorizationCount,
+        fence.telemetryV12NextAccountlessAuthorizationExpiry, releasedAt],
     );
     if (inserted.rowCount !== 1 || inserted.rows[0]?.revision === undefined) unavailable("community_daily.publish_fence");
     return Object.freeze({ state: "published", day: capturedDay, revision: integer(inserted.rows[0].revision, 1) });
