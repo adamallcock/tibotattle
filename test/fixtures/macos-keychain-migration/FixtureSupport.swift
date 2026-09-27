@@ -242,6 +242,70 @@ enum MigrationProbeFixture {
         return keychain
     }
 
+    static func beginObservedAppRewrite() throws -> MigrationProbeOwnership.Intent {
+        try validateRoot()
+        let before = try pinnedIdentity()
+        try require(identity(keychainMetadata()) == before, "KEYCHAIN_RECEIPT_MISMATCH")
+        let sequence = try ownershipEntries().count + 1
+        try require(sequence <= MigrationProbeOwnership.maximumWrites, "KEYCHAIN_WRITE_LIMIT")
+        let intent = MigrationProbeOwnership.Intent(sequence: sequence, nonce: ProbeConfiguration.nonce,
+            operation: .credentialAppStableRewrite, before: before)
+        try writeReceipt(writeName(sequence, "intent"), intent)
+        try require(try pinnedIdentity(pending: intent) == before,
+                    "KEYCHAIN_WRITE_INTENT_CHANGED")
+        return intent
+    }
+
+    static func finishObservedAppRewrite(_ intent: MigrationProbeOwnership.Intent,
+                                         observed: MigrationProbeOwnership.Identity) throws {
+        try validateRoot()
+        try require(intent.operation == .credentialAppStableRewrite
+            && pinnedIdentity(pending: intent) == intent.before
+            && observed.device == intent.before.device && observed.inode > 0
+            && identity(keychainMetadata()) == observed, "KEYCHAIN_OBSERVATION_CHANGED")
+        let completion = MigrationProbeOwnership.Completion(intent: intent, after: observed,
+            outcome: .observedStable)
+        let baseline = try readReceipt("keychain-owner.json", as: MigrationProbeOwnership.Baseline.self)
+        let entries = try ownershipEntries()
+        try require(entries.count == intent.sequence, "KEYCHAIN_OBSERVATION_CHANGED")
+        let completed = Array(entries.dropLast())
+            + [.init(intent: intent, completion: completion, failed: false)]
+        try require(try MigrationProbeOwnership.current(baseline, entries: completed,
+                    nonce: ProbeConfiguration.nonce) == observed, "KEYCHAIN_OBSERVATION_CHANGED")
+        try writeReceipt(writeName(intent.sequence, "complete"), completion)
+        try require(try pinnedIdentity() == observed
+            && identity(keychainMetadata()) == observed, "KEYCHAIN_OBSERVATION_CHANGED")
+    }
+
+    // A signed app may cause Security.framework to replace its Keychain DB
+    // while reading it. This diagnostic opens the observed file for a bounded,
+    // read-only comparison; it does not advance the ownership journal and can
+    // never authorize restore, mutation or cleanup of a replacement inode.
+    static func observedKeychainForAudit(pending: MigrationProbeOwnership.Intent? = nil)
+        throws -> (SecKeychain, MigrationProbeOwnership.Identity) {
+        try validateRoot()
+        let expected = try pinnedIdentity(pending: pending)
+        let before = try keychainMetadata()
+        try require(before.st_dev == expected.device, "KEYCHAIN_AUDIT_DEVICE_CHANGED")
+        let descriptor = open(keychainURL.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { throw Failure("KEYCHAIN_AUDIT_OPEN_FAILED") }
+        defer { close(descriptor) }
+        var opened = stat()
+        try require(fstat(descriptor, &opened) == 0
+            && opened.st_dev == before.st_dev && opened.st_ino == before.st_ino
+            && opened.st_uid == before.st_uid && opened.st_nlink == 1
+            && opened.st_mode & S_IFMT == S_IFREG && opened.st_mode & 0o777 == 0o600,
+                    "KEYCHAIN_AUDIT_TARGET_CHANGED")
+        var keychain: SecKeychain?
+        try require(SecKeychainOpen(keychainURL.path, &keychain) == errSecSuccess,
+                    "KEYCHAIN_AUDIT_KEYCHAIN_OPEN_FAILED")
+        guard let keychain else { throw Failure("KEYCHAIN_AUDIT_KEYCHAIN_OPEN_FAILED") }
+        try validateReference(keychain)
+        try require(try identity(keychainMetadata()) == identity(opened)
+            && pinnedIdentity(pending: pending) == expected, "KEYCHAIN_AUDIT_TARGET_CHANGED")
+        return (keychain, identity(opened))
+    }
+
     static func validateReference(_ keychain: SecKeychain) throws {
         var length: UInt32 = 4096
         var path = [CChar](repeating: 0, count: Int(length))

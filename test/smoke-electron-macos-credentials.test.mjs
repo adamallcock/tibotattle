@@ -10,15 +10,20 @@ import test from 'node:test';
 import vm from 'node:vm';
 import { validateMacCredentialIntake, parseMacCredentialArguments, runMacCredentialQualification,
   MAC_CREDENTIAL_CONFIRMATION, credentialFixtureArchiveInspectionScript, validateCredentialSnapshot,
-  expectedCredentialReason, macCredentialDialogScript, exerciseCredentialRefresh, macCredentialFailureDiagnostics,
+  expectedCredentialReason, macCredentialDialogScript, macCredentialPredecessorUiScript,
+  exerciseCredentialRefresh, macCredentialFailureDiagnostics, classifyPredecessorProcessEvidence,
   validateCredentialFixtureReply, validateCredentialScope, MAC_CREDENTIAL_FIXTURE_FAILURE_CODES } from '../scripts/smoke-electron-macos-credentials.mjs';
 import { CREDENTIAL_FIXTURE_CASES, credentialFixtureRoot, credentialFixtureConfiguration,
   parseCredentialFixtureArguments, compileCredentialFixture } from '../scripts/prepare-electron-macos-credential-fixture.mjs';
 import { MACOS_LOOPBACK_POLICY, MACOS_LOOPBACK_MODE, macOSLoopbackLaunch,
   macOSLoopbackProbeSource, inspectMacOSLoopbackEnforcement } from '../scripts/lib/macos-loopback-qualification.mjs';
-import { launchVerifiedMacSharingApp } from '../scripts/run-signed-electron-staging.mjs';
-import { preflightMacCredentialEnvironment } from '../scripts/lib/macos-credential-qualification-intake.mjs';
+import { MACOS_PF_CREDENTIAL_MODE, macOSCredentialPfRule, macOSPfRuleInstalled,
+  parseMacOSPfEnableToken } from '../scripts/lib/macos-pf-credential-qualification.mjs';
+import { fixedEntryFailureObserver, launchVerifiedMacSharingApp } from '../scripts/run-signed-electron-staging.mjs';
+import { MAC_CREDENTIAL_CURRENT_STABLE_SCHEMA, MAC_CREDENTIAL_SUCCESSOR_026_SCHEMA,
+  preflightMacCredentialEnvironment } from '../scripts/lib/macos-credential-qualification-intake.mjs';
 import { validateEmptyProfileIntake } from '../scripts/smoke-electron-macos-empty-profile.mjs';
+import { desktopFirstRunDialogCopy } from '../apps/electron/desktop-first-run.js';
 
 const operationId = '4a5361b7-dc54-49cc-92c5-a3e7d42b9a6f';
 const intake = { schemaVersion: 'signed-macos-credential-qualification-v1', runnerRevision: 'e'.repeat(40),
@@ -48,6 +53,44 @@ test('credential intake binds a separate reviewed runner, exact app, signed fixt
       assert.throws(() => validateMacCredentialIntake({ ...intake, [field]: value }));
     }
   }
+});
+
+test('current-stable credential journey pins both public 0.1.24 and unchanged signed 0.1.25 bytes', () => {
+  const selected = { ...intake, schemaVersion: MAC_CREDENTIAL_CURRENT_STABLE_SCHEMA,
+    sourceRevision: 'fec5b6039ea9efbc7948f0785bb40240cd0748ea',
+    version: '0.1.25', bundleVersion: '1033', buildNumber: '2026092601',
+    dmgSha256: '6b09cbc3e97864d67ed6f7b24c99b5847c1cb91c525e5a22de73164263ec72b2',
+    asarSha256: '654a351a5ba08eb749b5b53fc98bdafc4123b2fe2485385400dccfe2c561bdc5',
+    predecessorAsarSha256: 'c061f3af2b54ffacedc9a4c0a3561d82cd25873fac0c11eecb6cd46f6f704833' };
+  const result = validateMacCredentialIntake(selected);
+  assert.equal(result.predecessorUrl,
+    'https://github.com/adamallcock/tibotattle/releases/download/v0.1.24/TiboTattle-0.1.24-mac-arm64.dmg');
+  assert.deepEqual(result.predecessor, {
+    version: '0.1.24', sourceRevision: 'b6fe68e4912bebbe6dcf7dc9fd43e877451dd133',
+    buildNumber: '2026092202', bundleVersion: '1032',
+    dmgSha256: 'f77f4e466c3be68209205a01866bbaf66650012cb40d2233d4fde53b9e767969',
+    asarSha256: selected.predecessorAsarSha256 });
+  for (const change of [{ predecessorAsarSha256: 'a'.repeat(64) }, { dmgSha256: 'b'.repeat(64) },
+    { sourceRevision: 'a'.repeat(40) }, { version: '0.1.26' }, { buildNumber: '2026092602' }])
+    assert.throws(() => validateMacCredentialIntake({ ...selected, ...change }));
+});
+
+test('0.1.26 current-stable journey pins the published predecessor and exact signed successor bytes', () => {
+  const selected = { ...intake, schemaVersion: MAC_CREDENTIAL_SUCCESSOR_026_SCHEMA,
+    sourceRevision: 'acfc385c95b49b8e1040cedfa857659b49a61d8d',
+    version: '0.1.26', bundleVersion: '1034', buildNumber: '2026092701',
+    dmgSha256: '7b5f66d91c9f1b8c1537505da860c67177d2b489ee6fb90d445d97c7e46cc9ec',
+    asarSha256: '6d02d1acffbc4feaf8e91162a2fe67663815bdbd92ae431abef20fdbf2ffc81e',
+    predecessorAsarSha256: 'c061f3af2b54ffacedc9a4c0a3561d82cd25873fac0c11eecb6cd46f6f704833' };
+  const result = validateMacCredentialIntake(selected);
+  assert.equal(result.predecessor.version, '0.1.24');
+  assert.equal(result.candidate.url,
+    `https://updates.tibotattle.com/electron/test/native-sparkle/${selected.sourceRevision}/1034/${selected.dmgSha256}/TiboTattle-0.1.26-mac-arm64.dmg`);
+  for (const change of [{ predecessorAsarSha256: 'a'.repeat(64) }, { dmgSha256: 'b'.repeat(64) },
+    { asarSha256: 'c'.repeat(64) }, { sourceRevision: 'a'.repeat(40) },
+    { version: '0.1.25' }, { bundleVersion: '1033' }, { buildNumber: '2026092702' }])
+    assert.throws(() => validateMacCredentialIntake({ ...selected, ...change }));
+  assert.throws(() => validateMacCredentialIntake({ ...selected, schemaVersion: MAC_CREDENTIAL_CURRENT_STABLE_SCHEMA }));
 });
 
 test('early admission checks source receipt, source ancestry, exact package and mode in a clean synthetic repository', async t => {
@@ -140,7 +183,7 @@ with zipfile.ZipFile(sys.argv[1],'w') as z:
 const snapshot = () => ({ ok: true, items: ['account-observation', 'contribution-device', 'accountless-installation'].map(capability =>
   ({ capability, readable: true, itemDigest: 'a'.repeat(64), aclDigest: 'b'.repeat(64), valueDigest: 'c'.repeat(64) })) });
 test('helper failures retain only a known fixed code, closed scenario and actual protocol command', () => {
-  for (const operation of [null, 'seed', 'snapshot', 'select', 'scope', 'lock', 'unlock', 'restore', 'cleanup']) {
+  for (const operation of [null, 'seed', 'snapshot', 'audit', 'begin', 'attest', 'select', 'scope', 'lock', 'unlock', 'restore', 'cleanup']) {
     for (const code of MAC_CREDENTIAL_FIXTURE_FAILURE_CODES) {
       assert.throws(() => validateCredentialFixtureReply({ ok: false, code }, { scenario: 'modern', operation }), error => {
         assert.equal(error.credentialStage, 'fixture_operation');
@@ -165,6 +208,12 @@ test('helper failures retain only a known fixed code, closed scenario and actual
   assert.deepEqual(validateCredentialFixtureReply({ ok: true, ready: true }, { scenario: 'modern', operation: null }), { ok: true, ready: true });
   assert.deepEqual(validateCredentialFixtureReply({ ok: true, operation: 'seed' }, { scenario: 'modern', operation: 'seed' }), { ok: true, operation: 'seed' });
   assert.deepEqual(validateCredentialFixtureReply(snapshot(), { scenario: 'modern', operation: 'snapshot' }), snapshot());
+  const audit = { ok: true, audit: { pinUnchanged: false, valuesMatch: true, itemsMatch: true, aclsMatch: true } };
+  assert.deepEqual(validateCredentialFixtureReply(audit, { scenario: 'modern', operation: 'audit' }), audit);
+  for (const bad of [{ ...audit, privatePath: '/private' }, { ok: true, audit: { ...audit.audit, value: 'PRIVATE_SENTINEL' } },
+    { ok: true, audit: { ...audit.audit, itemsMatch: 'true' } }, { ok: true, audit: null }]) {
+    assert.throws(() => validateCredentialFixtureReply(bad, { scenario: 'modern', operation: 'audit' }));
+  }
 });
 test('scope proof admits only a fixture-only user/default with empty dynamic and verified fixed common scope', () => {
   const proof = commonDomain => ({ schemaVersion: 'mac-credential-isolated-scope-v1',
@@ -255,6 +304,23 @@ test('fixed network launch cannot accept a policy, environment or command overri
   await assert.rejects(launchVerifiedMacSharingApp({}, {}, { networkMode: 'allow-all' }));
   await assert.rejects(launchVerifiedMacSharingApp({}, {}, { networkMode: MACOS_LOOPBACK_MODE, launchServices: true }));
   await assert.rejects(launchVerifiedMacSharingApp({}, {}, { observeBeforeDashboard: () => null }));
+  await assert.rejects(launchVerifiedMacSharingApp({}, {}, { observeFixedEntryFailure: true }));
+});
+
+test('temporary PF guard is runner-UID scoped and requires both installed transport rules', () => {
+  assert.equal(MACOS_PF_CREDENTIAL_MODE, 'credential-qualification-pf-uid-v1');
+  assert.equal(macOSCredentialPfRule(501),
+    'block drop out quick on ! lo0 proto { tcp, udp } all user 501\n');
+  for (const uid of [0, -1, 65536, '501']) assert.throws(() => macOSCredentialPfRule(uid));
+  assert.equal(parseMacOSPfEnableToken('PF enabled\nToken : 12345\n'), '12345');
+  for (const value of ['PF enabled', 'Token : 0\n', 'Token : /private/SECRET\n'])
+    assert.throws(() => parseMacOSPfEnableToken(value));
+  const installed = 'block drop out quick on ! lo0 proto tcp from any to any user = 501\n'
+    + 'block drop out quick on ! lo0 proto udp from any to any user = 501\n';
+  assert.equal(macOSPfRuleInstalled(installed, 501), true);
+  assert.equal(macOSPfRuleInstalled(installed, 502), false);
+  assert.equal(macOSPfRuleInstalled(installed.replace('proto udp', 'proto tcp'), 501), false);
+  assert.equal(macOSPfRuleInstalled(installed + 'pass out quick all\n', 501), false);
 });
 
 const networkProof = { loopback: true, ipv4Denied: true, ipv6Denied: true, udp4Denied: true, udp6Denied: true, descendantDenied: true };
@@ -301,6 +367,61 @@ test('actual native dialog observer scopes actions to the verified PID and never
   assert.equal(expectedCredentialReason('locked', 'SECURE_STORAGE_LOCKED'), true);
 });
 
+test('predecessor UI diagnosis returns only bounded states from the verified PID', () => {
+  const firstRun = desktopFirstRunDialogCopy({ production: true, locale: 'en-US' });
+  let elements = [], securityPrompt = false, owned = true, accessible = true;
+  const windows = () => [{ entireContents: () => elements }];
+  const processes = () => securityPrompt ? [{ name: () => 'SecurityAgent', windows }] : [];
+  processes.whose = query => {
+    assert.deepEqual({ ...query }, { unixId: 123 });
+    return () => owned ? [{ windows }] : [];
+  };
+  const context = { Application: name => {
+    assert.equal(name, 'System Events');
+    return { uiElementsEnabled: () => accessible, applicationProcesses: processes };
+  } };
+  const observe = () => vm.runInNewContext(macCredentialPredecessorUiScript(123) + ';run()', context);
+  const text = value => ({ role: () => 'AXStaticText', value: () => value });
+  elements = [text(firstRun.message)]; assert.equal(observe(), 'first_run_visible');
+  elements = [text('Unable to prepare secure storage')]; assert.equal(observe(), 'secure_storage_warning');
+  elements = [text('Unable to finish updating TiboTattle')]; assert.equal(observe(), 'native_handover_warning');
+  elements = [text('/Users/PRIVATE_SENTINEL')]; assert.equal(observe(), 'other_owned_window');
+  owned = false; assert.equal(observe(), 'owned_process_absent'); owned = true;
+  securityPrompt = true; assert.equal(observe(), 'security_agent_window'); securityPrompt = false;
+  accessible = false; assert.equal(observe(), 'accessibility_unavailable');
+  assert.throws(() => macCredentialPredecessorUiScript('123;injection'));
+});
+
+test('predecessor stderr diagnostic recognizes only its fixed token across chunks', () => {
+  const observer = fixedEntryFailureObserver();
+  observer.consume(Buffer.from('/Users/PRIVATE_SENTINEL\nelectron_shell_entry_'));
+  assert.equal(observer.observed(), false);
+  observer.consume(Buffer.from('failed\nSECRET'));
+  assert.equal(observer.observed(), true);
+  const unrelated = fixedEntryFailureObserver();
+  unrelated.consume(Buffer.from('/Users/PRIVATE_SENTINEL\nSECRET\n'));
+  assert.equal(unrelated.observed(), false);
+});
+
+test('predecessor process diagnosis discards raw stack and log text', () => {
+  const classified = classifyPredecessorProcessEvidence({
+    sampleStatus: 0, sample: 'SecItemCopyMatching NSApplication /Users/PRIVATE_SENTINEL',
+    logStatus: 0, log: 'Sandbox: deny file-read /Users/PRIVATE_SENTINEL',
+    ps: 'S+\n',
+  });
+  assert.deepEqual(classified, {
+    processState: 'S', sampleStatus: 'available',
+    sampleSignals: { keychain: true, appkit: true, network: false, filesystem: false },
+    logStatus: 'available',
+    logSignals: { sandboxDenial: true, tccDenial: false, codeSignRejection: false },
+  });
+  assert.doesNotMatch(JSON.stringify(classified), /PRIVATE_SENTINEL/u);
+  assert.equal(classifyPredecessorProcessEvidence({ sampleStatus: 'timeout', logStatus: null }).sampleSignals, null);
+  assert.equal(macCredentialFailureDiagnostics({}, null, null, null, { raw: '/Users/PRIVATE_SENTINEL' })
+    .predecessorProcess, null);
+  assert.deepEqual(macCredentialFailureDiagnostics({}, null, null, null, classified).predecessorProcess, classified);
+});
+
 test('refresh requires a new successful refresh ID and clicks once; stale success and failure cannot pass', async () => {
   for (const scenario of ['success', 'old-success', 'failed', 'unready']) {
     let time = 0, clicks = 0;
@@ -333,17 +454,52 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
   assert.deepEqual(macCredentialFailureDiagnostics({ signedLaunchStage: 'native_intro',
     stage: 'native_intro_unexpected', ownedMacProcessesStopped: true,
     message: '/Users/PRIVATE_SENTINEL', stderr: 'SECRET' }), {
+    refusalDialogState: null,
+    networkGuardStage: null,
     launchStage: 'native_intro', launchCode: 'native_intro_unexpected', settingsStage: null,
-    launchOwnedProcessesStopped: true,
+    launchOwnedProcessesStopped: true, predecessorUi: null,
+    predecessorEntryFailure: null, predecessorDebuggerListening: null, predecessorProcess: null,
+    predecessorExit: null,
   });
   assert.deepEqual(macCredentialFailureDiagnostics({ emptyProfileStage: 'settings_effect',
     ownedMacProcessesStopped: false }), {
+    refusalDialogState: null,
+    networkGuardStage: null,
     launchStage: null, launchCode: null, settingsStage: 'settings_effect', launchOwnedProcessesStopped: false,
+    predecessorUi: null, predecessorEntryFailure: null, predecessorDebuggerListening: null,
+    predecessorProcess: null,
+    predecessorExit: null,
   });
   for (const error of [null, {}, { signedLaunchStage: 'PRIVATE_SENTINEL', stage: 'PRIVATE_SENTINEL',
     emptyProfileStage: 'PRIVATE_SENTINEL', ownedMacProcessesStopped: 'true' }]) {
     assert.deepEqual(macCredentialFailureDiagnostics(error), {
+      refusalDialogState: null,
+      networkGuardStage: null,
       launchStage: null, launchCode: null, settingsStage: null, launchOwnedProcessesStopped: null,
+      predecessorUi: null, predecessorEntryFailure: null, predecessorDebuggerListening: null,
+      predecessorProcess: null,
+      predecessorExit: null,
     });
   }
+  assert.equal(macCredentialFailureDiagnostics({}, 'secure_storage_warning').predecessorUi, 'secure_storage_warning');
+  assert.equal(macCredentialFailureDiagnostics({}, '/Users/PRIVATE_SENTINEL').predecessorUi, null);
+  assert.deepEqual(macCredentialFailureDiagnostics({}, null, true, false), {
+    refusalDialogState: null,
+    networkGuardStage: null,
+    launchStage: null, launchCode: null, settingsStage: null, launchOwnedProcessesStopped: null,
+    predecessorUi: null, predecessorEntryFailure: true, predecessorDebuggerListening: false,
+    predecessorProcess: null,
+    predecessorExit: null,
+  });
+  assert.deepEqual(macCredentialFailureDiagnostics({}, null, null, null, null,
+    { code: 1, signal: null }).predecessorExit, { code: 1, signal: null });
+  assert.equal(macCredentialFailureDiagnostics({}, null, null, null, null,
+    { code: 1, signal: '/Users/PRIVATE_SENTINEL' }).predecessorExit, null);
+  assert.equal(macCredentialFailureDiagnostics({ pfStage: 'anchor_load' }).networkGuardStage, 'anchor_load');
+  assert.equal(macCredentialFailureDiagnostics({ pfStage: '/Users/PRIVATE_SENTINEL' }).networkGuardStage, null);
+  assert.equal(macCredentialFailureDiagnostics({ refusalDialogState: 'unexpected_security_ui' }).refusalDialogState,
+    'unexpected_security_ui');
+  assert.equal(macCredentialFailureDiagnostics({ refusalDialogState: 'SECURE_STORAGE_DENIED' }).refusalDialogState,
+    'SECURE_STORAGE_DENIED');
+  assert.equal(macCredentialFailureDiagnostics({ refusalDialogState: '/Users/PRIVATE_SENTINEL' }).refusalDialogState, null);
 });

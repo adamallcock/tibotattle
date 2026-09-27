@@ -67,16 +67,30 @@ The only fixture transport is the immutable
 namespace on the existing updates host. The workflow does not upload it.
 
 The default workflow mode plans only. Explicit execution requires
-`RUN_DISPOSABLE_SIGNED_MAC_CREDENTIALS`. Before launching either signed app,
-the harness checks actual kernel denial of external IPv4/IPv6 TCP/UDP and a
-descendant process, plus an actual loopback connection. A fixed inherited
-sandbox permits loopback, retains normal OS credential protection, and blocks
-external app traffic; no endpoint, proxy, app bytes or ACL is weakened.
+`RUN_DISPOSABLE_SIGNED_MAC_CREDENTIALS`. The hosted runner downloads and
+verifies both signed apps and the fixture before installing a temporary PF
+anchor that blocks outbound TCP and UDP outside `lo0` for the runner UID. It
+checks the installed rules, PF enabled state, a reachable external connection
+before activation, its denial after activation, and working loopback. The
+guard is rechecked before every ordinary signed-app launch and released after
+all owned app processes stop. A missing or ineffective guard fails before app
+launch. No endpoint, proxy, app bytes or Keychain ACL is changed.
 
-The first journey verifies existing modern values through the exact signed
+Each journey first completes the signed predecessor's ordinary first run with
+external traffic blocked and before selecting the synthetic Keychain or placing
+synthetic Codex usage. It then seeds existing modern items, restarts that
+predecessor, and replaces the app.
+The v1 journey verifies those values through the exact signed
 Electron 0.1.20 predecessor and installed candidate replacement, a completed
 local refresh, three controlled candidate restarts, and persistent sharing
 preferences. Every readback must retain the item identity, bytes and ACL.
+The separately pinned v2 current-stable journey selects the published 0.1.24
+ARM DMG and the unchanged signed 0.1.25 candidate. Its intake admits only
+those exact source, build and artifact identities; it does not turn a v1
+0.1.20 startup failure into a passing legacy upgrade result.
+The v3 current-stable journey keeps the published 0.1.24 predecessor and pins
+the signed 0.1.26 ARM DMG, app payload, source revision and build number. The
+v2 0.1.25 intake remains historical and cannot admit the new candidate.
 Malformed and locked cases inspect the actual candidate's reason, explicit
 silent Retry and native Quit completion; the locked fixture is unlocked only
 with its in-memory password for unchanged-value verification. Only the closed
@@ -90,6 +104,17 @@ only its fixed allowlisted code, scenario and protocol command. Unknown codes,
 extra fields, raw stderr, error text and credential values are never copied into
 the result. A failed fixture operation is not classified as an app defect until
 its specific cause is established.
+The predecessor also records only whether the journal-owned synthetic Keychain
+keeps the same device and inode after launch, settings, opt-out and stop. A
+changed identity remains a failed fixture receipt, never an adoption authority.
+The separate `audit` command can compare the three seeded synthetic values,
+item references and ACLs on a replacement inode. It reports only four booleans,
+does not advance the ownership journal, and cannot authorize mutation,
+restoration or cleanup. The fixture records an immutable observation intent
+before each ordinary signed app launch. Only after that app stops and the
+fixture rechecks its exact synthetic values, item references, ACLs, isolated
+scope and database metadata does `attest` complete the journal transition.
+A failed or incomplete transition remains closed and cannot authorize cleanup.
 
 ## Original native migration fixture
 
