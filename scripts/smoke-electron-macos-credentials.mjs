@@ -342,7 +342,7 @@ export async function exerciseCredentialRefresh(dashboard, clock) {
 
 // Retain fixed failure families only; exception messages, URLs and paths stay private.
 export function macCredentialFailureDiagnostics(error, predecessorUi = null, predecessorEntryFailure = null,
-  predecessorDebuggerListening = null, predecessorProcess = null) {
+  predecessorDebuggerListening = null, predecessorProcess = null, predecessorExit = null) {
   const launchStages = ['process_group', 'native_intro', 'owned_debugger', 'dashboard_target',
     'dashboard_ready', 'settings_target', 'settings_ready'];
   const launchCodes = ['startup', 'process_inventory', 'preexisting_app', 'local_response',
@@ -360,6 +360,12 @@ export function macCredentialFailureDiagnostics(error, predecessorUi = null, pre
     predecessorDebuggerListening: typeof predecessorDebuggerListening === 'boolean'
       ? predecessorDebuggerListening : null,
     predecessorProcess: closedPredecessorProcess(predecessorProcess),
+    predecessorExit: predecessorExit && typeof predecessorExit === 'object'
+      && Object.keys(predecessorExit).sort().join() === 'code,signal'
+      && (predecessorExit.code === null || (Number.isInteger(predecessorExit.code)
+        && predecessorExit.code >= 0 && predecessorExit.code <= 255))
+      && (predecessorExit.signal === null || ['SIGABRT', 'SIGBUS', 'SIGILL', 'SIGKILL', 'SIGSEGV', 'SIGTERM', 'SIGTRAP'].includes(predecessorExit.signal))
+      ? predecessorExit : null,
   };
 }
 
@@ -373,7 +379,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
     nativeCleanQuitQualified: false, partialMigrationQualified: false,
     completeCredentialFailureMatrixQualified: false };
   let active = null, fixture = null, stage = 'intake', predecessorUi = null;
-  let predecessorEntryFailure = null, predecessorDebuggerListening = null, predecessorProcess = null;
+  let predecessorEntryFailure = null, predecessorDebuggerListening = null, predecessorProcess = null, predecessorExit = null;
   try {
     const input = validateMacCredentialIntake(intake);
     Object.assign(proof, { runnerRevision: input.runnerRevision, sourceRevision: input.sourceRevision,
@@ -414,8 +420,9 @@ export async function runMacCredentialQualification({ intake, execute = false })
     stage = 'predecessor_first_run';
     active = await launchVerifiedMacSharingApp(verified, environment, {
       ...launchOptions, untouched: true, observeFixedEntryFailure: true,
-      onFailure: ({ pid, stage: launchStage, fixedEntryFailureObserved, debuggerListening }) => {
+      onFailure: ({ pid, stage: launchStage, fixedEntryFailureObserved, debuggerListening, exitCode, exitSignal }) => {
         if (launchStage === 'native_intro') {
+          predecessorExit = { code: exitCode, signal: exitSignal };
           predecessorUi = observePredecessorUi(pid);
           predecessorEntryFailure = fixedEntryFailureObserved;
           predecessorDebuggerListening = debuggerListening;
@@ -436,8 +443,9 @@ export async function runMacCredentialQualification({ intake, execute = false })
     await fixture.request('scope');
     stage = 'predecessor_launch'; active = await launchVerifiedMacSharingApp(verified, environment, {
       ...launchOptions,
-      onFailure: ({ pid, stage: launchStage, fixedEntryFailureObserved, debuggerListening }) => {
+      onFailure: ({ pid, stage: launchStage, fixedEntryFailureObserved, debuggerListening, exitCode, exitSignal }) => {
         if (launchStage === 'native_intro') {
+          predecessorExit = { code: exitCode, signal: exitSignal };
           predecessorUi = observePredecessorUi(pid);
           predecessorEntryFailure = fixedEntryFailureObserved;
           predecessorDebuggerListening = debuggerListening;
@@ -498,7 +506,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
   } catch (error) {
     proof.status = 'failed'; proof.failureStage = error.credentialStage ?? stage; proof.failurePhase = stage;
     proof.failureDiagnostics = macCredentialFailureDiagnostics(error, predecessorUi,
-      predecessorEntryFailure, predecessorDebuggerListening, predecessorProcess);
+      predecessorEntryFailure, predecessorDebuggerListening, predecessorProcess, predecessorExit);
     if (error.fixtureFailure) proof.fixtureFailure = error.fixtureFailure;
   }
   finally {

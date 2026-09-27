@@ -201,7 +201,8 @@ async function launch(verified, environment, { untouched = false, onFailure, lau
   if (entryFailure) child.stderr.on('data', chunk => entryFailure.consume(chunk));
   let exited = false;
   let spawnFailed = false;
-  child.once('exit', () => { exited = true; });
+  let exitCode = null, exitSignal = null;
+  child.once('exit', (code, signal) => { exited = true; exitCode = code; exitSignal = signal; });
   child.once('error', () => { spawnFailed = true; });
   const state = { child, pid: child.pid, sessions: [], groupVerified: false,
     stopped: () => exited || spawnFailed };
@@ -254,7 +255,8 @@ async function launch(verified, environment, { untouched = false, onFailure, lau
     error.signedLaunchStage = launchStage;
     if (onFailure) { try { await onFailure({ pid: state.pid, stage: launchStage,
       fixedEntryFailureObserved: entryFailure?.observed() ?? null,
-      debuggerListening: launchStage === 'native_intro' ? listenerOwned(state.pid, port) : null }); } catch {} }
+      debuggerListening: launchStage === 'native_intro' ? listenerOwned(state.pid, port) : null,
+      exitCode, exitSignal }); } catch {} }
     const stopped = await stop(state);
     error.ownedMacProcessesStopped = stopped === true;
     throw error;

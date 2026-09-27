@@ -414,12 +414,14 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
     launchStage: 'native_intro', launchCode: 'native_intro_unexpected', settingsStage: null,
     launchOwnedProcessesStopped: true, predecessorUi: null,
     predecessorEntryFailure: null, predecessorDebuggerListening: null, predecessorProcess: null,
+    predecessorExit: null,
   });
   assert.deepEqual(macCredentialFailureDiagnostics({ emptyProfileStage: 'settings_effect',
     ownedMacProcessesStopped: false }), {
     launchStage: null, launchCode: null, settingsStage: 'settings_effect', launchOwnedProcessesStopped: false,
     predecessorUi: null, predecessorEntryFailure: null, predecessorDebuggerListening: null,
     predecessorProcess: null,
+    predecessorExit: null,
   });
   for (const error of [null, {}, { signedLaunchStage: 'PRIVATE_SENTINEL', stage: 'PRIVATE_SENTINEL',
     emptyProfileStage: 'PRIVATE_SENTINEL', ownedMacProcessesStopped: 'true' }]) {
@@ -427,6 +429,7 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
       launchStage: null, launchCode: null, settingsStage: null, launchOwnedProcessesStopped: null,
       predecessorUi: null, predecessorEntryFailure: null, predecessorDebuggerListening: null,
       predecessorProcess: null,
+      predecessorExit: null,
     });
   }
   assert.equal(macCredentialFailureDiagnostics({}, 'secure_storage_warning').predecessorUi, 'secure_storage_warning');
@@ -435,5 +438,10 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
     launchStage: null, launchCode: null, settingsStage: null, launchOwnedProcessesStopped: null,
     predecessorUi: null, predecessorEntryFailure: true, predecessorDebuggerListening: false,
     predecessorProcess: null,
+    predecessorExit: null,
   });
+  assert.deepEqual(macCredentialFailureDiagnostics({}, null, null, null, null,
+    { code: 1, signal: null }).predecessorExit, { code: 1, signal: null });
+  assert.equal(macCredentialFailureDiagnostics({}, null, null, null, null,
+    { code: 1, signal: '/Users/PRIVATE_SENTINEL' }).predecessorExit, null);
 });
