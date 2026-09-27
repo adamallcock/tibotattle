@@ -66,8 +66,10 @@ export async function activateMacOSCredentialPfGuard({ temporaryRoot, runId, uid
     pf(['-n', '-f', file]);
     stage = 'anchor_load';
     pf(['-a', anchor, '-f', file]); loaded = true;
-    stage = 'enable';
-    token = parseMacOSPfEnableToken(pf(['-E']));
+    stage = 'enable_command';
+    const enabled = pf(['-E']);
+    stage = 'enable_token';
+    token = parseMacOSPfEnableToken(enabled);
     const check = async () => {
       try {
         stage = 'active_rules';
