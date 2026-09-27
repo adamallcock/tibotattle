@@ -390,6 +390,176 @@ test("the v1.2 desktop edge forwards only its exact routes and never logs creden
   assert.match(serializedLogs, /"route":"telemetry_v12_consent"/u);
 });
 
+test("the public gateway exposes only the authenticated sync and v1.2 manifest GETs", async () => {
+  const routes = [
+    {
+      path: "/api/v1/device/sync/manifest?fromDay=2026-09-01&toDay=2026-09-02",
+      body: null,
+    },
+    {
+      path: "/api/v1/device/telemetry/v1.2/day-manifests?fromDay=2026-09-01&toDay=2026-09-02",
+      body: null,
+    },
+  ];
+  const { calls: metadataCalls, fetchImpl: metadata } = metadataFetch();
+  const backendCalls = [];
+  const logs = [];
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      backendCalls.push({ url: new URL(input), options });
+      return new Response(JSON.stringify({ candidates: [], bounded: false }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+    logger: (line) => logs.push(line),
+  });
+
+  for (const route of routes) {
+    const result = await invoke(handler, {
+      method: "GET",
+      url: route.path,
+      body: route.body,
+      headers: {
+        origin: undefined,
+        authorization: DEVICE_AUTHORIZATION,
+        "x-serverless-authorization": "Bearer caller-controlled",
+        "x-forwarded-host": "attacker.invalid",
+        "cf-connecting-ip": "203.0.113.9",
+      },
+    });
+    assert.equal(result.status, 200, route.path);
+  }
+
+  assert.equal(backendCalls.length, routes.length);
+  assert.equal(metadataCalls.length, routes.length);
+  for (let index = 0; index < routes.length; index += 1) {
+    const route = routes[index];
+    const { url, options } = backendCalls[index];
+    assert.equal(url.origin, BACKEND_ORIGIN);
+    assert.equal(url.pathname + url.search, route.path);
+    assert.equal(options.method, "GET");
+    assert.equal(options.headers.get("authorization"), DEVICE_AUTHORIZATION);
+    assert.equal(options.headers.get("x-serverless-authorization"), `Bearer ${TOKEN}`);
+    assert.equal(options.headers.has("origin"), false);
+    assert.equal(options.headers.has("cookie"), false);
+    assert.equal(options.headers.has("x-forwarded-host"), false);
+    assert.equal(options.headers.has("cf-connecting-ip"), false);
+    assert.equal(options.headers.has("content-type"), false);
+    assert.equal(options.body, undefined);
+  }
+  const serializedLogs = logs.join("\n");
+  assert.equal(serializedLogs.includes(DEVICE_AUTHORIZATION), false);
+  assert.equal(serializedLogs.includes("fromDay"), false);
+  assert.match(serializedLogs, /"route":"device_sync_manifest"/u);
+  assert.match(serializedLogs, /"route":"telemetry_v12_day_manifest_read"/u);
+});
+
+test("manifest GET routes reject bad authority, query shapes, methods, and unlisted APIs before forwarding", async () => {
+  let metadataCount = 0;
+  let backendCount = 0;
+  const { fetchImpl: metadata } = metadataFetch();
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") {
+        metadataCount += 1;
+        return metadata(input, options);
+      }
+      backendCount += 1;
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    },
+    logger: () => {},
+  });
+  const syncManifest = "/api/v1/device/sync/manifest?fromDay=2026-09-01&toDay=2026-09-02";
+  const dayManifest = "/api/v1/device/telemetry/v1.2/day-manifests";
+  const dayManifestQuery = `${dayManifest}?fromDay=2026-09-01&toDay=2026-09-02`;
+  const denied = [
+    { method: "GET", url: syncManifest, body: null, headers: { origin: undefined } },
+    { method: "GET", url: syncManifest, body: null, headers: { authorization: "Bearer malformed" } },
+    { method: "GET", url: syncManifest, body: null, headers: { authorization: DEVICE_AUTHORIZATION, cookie: SESSION_COOKIE } },
+    { method: "GET", url: syncManifest, body: null, headers: { authorization: DEVICE_AUTHORIZATION, origin: "https://attacker.invalid" } },
+    { method: "GET", url: dayManifestQuery, body: null, headers: { origin: undefined } },
+    { method: "GET", url: dayManifestQuery, body: null, headers: { authorization: "Bearer malformed" } },
+    { method: "GET", url: dayManifestQuery, body: null, headers: { authorization: DEVICE_AUTHORIZATION, cookie: SESSION_COOKIE } },
+    { method: "GET", url: dayManifestQuery, body: null, headers: { authorization: DEVICE_AUTHORIZATION, origin: "https://attacker.invalid" } },
+    { method: "GET", url: "/api/v1/device/sync/manifest", body: null, headers: { authorization: DEVICE_AUTHORIZATION } },
+    { method: "GET", url: "/api/v1/device/sync/manifest?", body: null, headers: { authorization: DEVICE_AUTHORIZATION } },
+    { method: "GET", url: dayManifest, body: null, headers: { authorization: DEVICE_AUTHORIZATION } },
+    { method: "GET", url: `${dayManifest}?`, body: null, headers: { authorization: DEVICE_AUTHORIZATION } },
+    { method: "GET", url: `${syncManifest}&fromDay=2026-09-03`, body: null, headers: { authorization: DEVICE_AUTHORIZATION } },
+    { method: "GET", url: "/api/v1/device/sync/manifest?fromDay=2026-09-01&toDay=2026-09-02&extra=1", body: null, headers: { authorization: DEVICE_AUTHORIZATION } },
+    { method: "GET", url: `${dayManifest}?fromDay=2026-09-01&fromDay=2026-09-02&toDay=2026-09-02`, body: null, headers: { authorization: DEVICE_AUTHORIZATION } },
+    { method: "GET", url: `${dayManifest}?fromDay=2026-09-01&toDay=2026-09-02&extra=1`, body: null, headers: { authorization: DEVICE_AUTHORIZATION } },
+    { method: "POST", url: syncManifest, body: "{}", headers: { authorization: DEVICE_AUTHORIZATION } },
+    { method: "HEAD", url: dayManifest, body: null, headers: { authorization: DEVICE_AUTHORIZATION } },
+    { method: "PUT", url: dayManifest, body: "{}", headers: { authorization: DEVICE_AUTHORIZATION } },
+    { method: "POST", url: `${dayManifest}?fromDay=2026-09-01&toDay=2026-09-02`, body: "{}", headers: { authorization: DEVICE_AUTHORIZATION } },
+    { method: "GET", url: "/api/v1/device/sync-capabilities-v1.2?extra=1", body: null, headers: { authorization: DEVICE_AUTHORIZATION } },
+    { method: "POST", url: "/api/v1/admin/action", body: "{}" },
+    { method: "GET", url: "/api/v1/admin/overview", body: null },
+    { method: "POST", url: "/api/v1/internal/release/appcast", body: "{}" },
+    { method: "GET", url: "/api/v1/not-implemented", body: null },
+  ];
+  const expectedStatuses = [401, 401, 400, 403, 401, 401, 400, 403, 404, 404, 404, 404, 404, 404, 404, 404, 405, 405, 405, 404, 404, 404, 404, 404, 404];
+  for (let index = 0; index < denied.length; index += 1) {
+    const result = await invoke(handler, denied[index]);
+    assert.equal(result.status, expectedStatuses[index], `${denied[index].method} ${denied[index].url}`);
+    if (denied[index].url === dayManifest && ["HEAD", "PUT"].includes(denied[index].method)) {
+      assert.equal(result.headers.allow, "GET, POST");
+    }
+    if (denied[index].url === syncManifest && denied[index].method === "POST") {
+      assert.equal(result.headers.allow, "GET");
+    }
+  }
+  assert.equal(metadataCount, 0);
+  assert.equal(backendCount, 0);
+});
+
+test("manifest gateway preserves private-backend refusal and fails closed on upstream loss", async () => {
+  let backendCalls = 0;
+  const { calls: metadataCalls, fetchImpl: metadata } = metadataFetch();
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      backendCalls += 1;
+      if (new URL(input).pathname.endsWith("sync/manifest")) {
+        return new Response(JSON.stringify({ status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error("synthetic upstream outage");
+    },
+    logger: () => {},
+  });
+
+  const unsupported = await invoke(handler, {
+    method: "GET",
+    url: "/api/v1/device/sync/manifest?fromDay=2026-09-01&toDay=2026-09-02",
+    body: null,
+    headers: { origin: undefined, authorization: DEVICE_AUTHORIZATION },
+  });
+  assert.equal(unsupported.status, 503);
+  assert.deepEqual(unsupported.json(), {
+    status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED",
+  });
+
+  const unavailable = await invoke(handler, {
+    method: "GET",
+    url: "/api/v1/device/telemetry/v1.2/day-manifests?fromDay=2026-09-01&toDay=2026-09-02",
+    body: null,
+    headers: { origin: undefined, authorization: DEVICE_AUTHORIZATION },
+  });
+  assert.equal(unavailable.status, 502);
+  assert.equal(unavailable.json().error.code, "UPSTREAM_UNAVAILABLE");
+  assert.equal(backendCalls, 2);
+  assert.equal(metadataCalls.length, 2);
+});
+
 test("the v1.2 edge rejects unlisted, cross-origin, cookie-bearing, or unauthenticated device requests before metadata access", async () => {
   let metadataCount = 0;
   let backendCount = 0;

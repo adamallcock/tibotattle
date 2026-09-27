@@ -22,6 +22,12 @@ const STATIC_ASSET_SECURITY_HEADERS = Object.freeze({
   "referrer-policy": "no-referrer",
   "x-content-type-options": "nosniff",
 });
+const V12_DAY_MANIFEST_READ_ROUTE = Object.freeze({
+  id: "telemetry_v12_day_manifest_read", method: "GET", body: "none", maxBodyBytes: 0,
+  responseTypes: ["application/json"], maxResponseBytes: 128 * 1_024,
+  requireDeviceAuthorization: true, allowMissingOrigin: true, rejectCookie: true,
+  queryContract: "day_range",
+});
 const ROUTES = new Map([
   ["/api/health", Object.freeze({
     id: "health", method: "GET", body: "none", maxBodyBytes: 0,
@@ -91,6 +97,12 @@ const ROUTES = new Map([
     responseTypes: ["application/json"], maxResponseBytes: 32 * 1_024,
     requireDeviceAuthorization: true, allowMissingOrigin: true, rejectCookie: true,
   })],
+  ["/api/v1/device/sync/manifest", Object.freeze({
+    id: "device_sync_manifest", method: "GET", body: "none", maxBodyBytes: 0,
+    responseTypes: ["application/json"], maxResponseBytes: 2 * 1_024 * 1_024,
+    requireDeviceAuthorization: true, allowMissingOrigin: true, rejectCookie: true,
+    queryContract: "day_range",
+  })],
   ["/api/v1/me/telemetry-v12/domain-predecessor", Object.freeze({
     id: "telemetry_v12_domain_predecessor", method: "POST", body: "json", maxBodyBytes: 4_096,
     responseTypes: ["application/json"], maxResponseBytes: 32 * 1_024,
@@ -101,6 +113,7 @@ const ROUTES = new Map([
     id: "telemetry_v12_day_manifest", method: "POST", body: "json", maxBodyBytes: 1_250_000,
     responseTypes: ["application/json"], maxResponseBytes: 1_250_000,
     requireDeviceAuthorization: true, allowMissingOrigin: true, rejectCookie: true,
+    allowedMethods: "GET, POST", getRoute: V12_DAY_MANIFEST_READ_ROUTE,
     originContract: "backend",
   })],
   ["/api/v1/device/upload-authorizations", Object.freeze({
@@ -188,7 +201,7 @@ function validHostHeader(value, origin) {
   return value.toLowerCase() === origin.host.toLowerCase();
 }
 
-function identifyRoute(requestTarget, publicOrigin) {
+function identifyRoute(requestTarget, publicOrigin, requestMethod) {
   if (typeof requestTarget !== "string" || requestTarget.length === 0
       || requestTarget.length > MAX_URL_LENGTH || !requestTarget.startsWith("/")
       || requestTarget.startsWith("//") || /[\u0000-\u0020\u007f#]/u.test(requestTarget)) {
@@ -200,10 +213,26 @@ function identifyRoute(requestTarget, publicOrigin) {
   let url;
   try { url = new URL(requestTarget, publicOrigin); } catch { return null; }
   if (url.origin !== publicOrigin || url.pathname !== rawPath || url.pathname.length > 512) return null;
-  const route = ROUTES.get(url.pathname);
+  const routeDefinition = ROUTES.get(url.pathname);
+  const route = requestMethod === "GET" && routeDefinition?.getRoute
+    ? routeDefinition.getRoute : routeDefinition;
   if (!route) return null;
-  if (route.id !== "google_callback" && queryStart !== -1) return null;
-  return Object.freeze({ route, url });
+  if (route.id !== "google_callback") {
+    if (route.queryContract !== "day_range") {
+      if (queryStart !== -1) return null;
+    } else {
+      const queryKeys = [...url.searchParams.keys()];
+      if (queryKeys.length !== 2
+          || queryKeys.some((key) => key !== "fromDay" && key !== "toDay")
+          || url.searchParams.getAll("fromDay").length !== 1
+          || url.searchParams.getAll("toDay").length !== 1) return null;
+    }
+  }
+  return Object.freeze({
+    route,
+    url,
+    allowedMethods: routeDefinition.allowedMethods ?? route.method,
+  });
 }
 
 function safeStaticPath(requestTarget, publicOrigin) {
@@ -616,7 +645,7 @@ export function createOauthGatewayHandler({
     activeRequests += 1;
     ownsConcurrencySlot = true;
 
-    const identified = identifyRoute(request.url, configuration.publicOrigin);
+    const identified = identifyRoute(request.url, configuration.publicOrigin, request.method);
     if (!identified) {
       const staticResult = await staticAssetResponse(request, configuration, assets);
       if (staticResult !== null) {
@@ -626,9 +655,9 @@ export function createOauthGatewayHandler({
       finish("unsupported", safeError(404, "NOT_FOUND"));
       return;
     }
-    const { route, url } = identified;
+    const { route, url, allowedMethods } = identified;
     if (request.method !== route.method) {
-      finish(route.id, safeError(405, "METHOD_NOT_ALLOWED", route.method));
+      finish(route.id, safeError(405, "METHOD_NOT_ALLOWED", allowedMethods));
       return;
     }
     if (!validHostHeader(request.headers.host, new URL(configuration.publicOrigin))) {
