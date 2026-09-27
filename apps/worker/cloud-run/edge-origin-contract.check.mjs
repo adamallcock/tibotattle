@@ -111,6 +111,25 @@ test("request-boundary.mjs treats the contract's callback and invoker header nam
   assert.deepEqual([...sanitized.keys()], ["content-type"]);
 });
 
+test("deferred device-sync admission is an origin-only response header", () => {
+  const header = contract.EDGE_HEADERS.deferredAdmission;
+  assert.equal(header, "x-tibotattle-edge-deferred-admission");
+  assert.ok(contract.DROPPED_RESPONSE_HEADERS.includes(header));
+  assert.ok(!contract.EDGE_CONTRACT_REQUEST_HEADERS.includes(header));
+  assert.ok(!contract.FORWARDED_REQUEST_HEADERS.includes(header));
+  assert.equal(contract.EDGE_DEFERRED_DEVICE_SYNC_ATTEMPT, "v1;device_sync");
+  for (const value of [
+    contract.EDGE_DEFERRED_DEVICE_SYNC_ATTEMPT,
+    "v1;device_sync;allowed",
+    "v1;device_sync_credential",
+  ]) {
+    assert.equal(
+      contract.isEdgeDeferredDeviceSyncAttempt(value),
+      value === contract.EDGE_DEFERRED_DEVICE_SYNC_ATTEMPT,
+    );
+  }
+});
+
 test("the contract source is self-contained and runtime-neutral", async () => {
   const [contractSource, boundarySource] = await Promise.all([
     readFile(CONTRACT_PATH, "utf8"),

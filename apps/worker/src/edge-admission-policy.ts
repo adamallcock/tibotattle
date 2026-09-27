@@ -30,17 +30,21 @@
  */
 import {
   assertAttemptAllowed,
+  assertDeviceSyncCredentialAllowed,
   assertPublicAggregateReadAllowed,
   assertUploadIngressRequestAllowed,
 } from "./admission";
+import { parseDeviceAuthorization } from "./device-auth";
 import { ApiError } from "./errors";
 import type { ExactWorkerRouteId } from "./route-registry";
 
-/** The six Workers Rate Limiting bindings that stay at the edge. */
+/** The eight Workers Rate Limiting bindings evaluated at the edge. */
 export const EDGE_ADMISSION_BINDINGS = Object.freeze([
   "ENROLLMENT_RATE_LIMIT",
   "RECOVERY_RATE_LIMIT",
   "CLIENT_ATTEMPT_RATE_LIMIT",
+  "DEVICE_SYNC_CLIENT_RATE_LIMIT",
+  "DEVICE_SYNC_RATE_LIMIT",
   "PUBLIC_READ_RATE_LIMIT",
   "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
   "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
@@ -48,7 +52,7 @@ export const EDGE_ADMISSION_BINDINGS = Object.freeze([
 
 export type EdgeAdmissionBinding = (typeof EDGE_ADMISSION_BINDINGS)[number];
 
-export type EdgeAdmissionHelper = "attempt" | "public_read" | "upload_ingress";
+export type EdgeAdmissionHelper = "attempt" | "device_sync" | "public_read" | "upload_ingress";
 
 export type EdgeAttemptPurpose =
   | "enrollment"
@@ -62,6 +66,7 @@ export type EdgeAttemptPurpose =
 /** The purposes this policy can report; a subset of the contract's purposes. */
 export type EdgePolicyPurpose =
   | EdgeAttemptPurpose
+  | "device_sync_credential"
   | "public_aggregate_read"
   | "upload_ingress";
 
@@ -69,6 +74,7 @@ export type EdgePolicyPurpose =
 export type EdgePolicyOutcome = "allowed" | "limited" | "unavailable";
 
 export type EdgeAdmissionPolicyEntry =
+  | DeviceSyncAdmissionPolicyEntry
   | Readonly<{
       helper: "attempt";
       purpose: EdgeAttemptPurpose;
@@ -88,6 +94,21 @@ export type EdgeAdmissionPolicyEntry =
       clientBinding: "PUBLIC_READ_RATE_LIMIT";
     }>;
 
+export type DeviceSyncAdmissionPolicyEntry = Readonly<{
+  helper: "device_sync";
+  attempt: Readonly<{
+    purpose: "device_sync";
+    coarseBinding: "RECOVERY_RATE_LIMIT";
+    clientBinding: "CLIENT_ATTEMPT_RATE_LIMIT";
+  }>;
+  credential: Readonly<{
+    purpose: "device_sync_credential";
+    clientBinding: "DEVICE_SYNC_CLIENT_RATE_LIMIT";
+    coarseBinding: "DEVICE_SYNC_RATE_LIMIT";
+  }>;
+  deferredAttemptOnAuthFailure: true;
+}>;
+
 export type EdgeAdmissionPolicy = Readonly<
   Partial<Record<ExactWorkerRouteId, EdgeAdmissionPolicyEntry>>
 >;
@@ -104,10 +125,23 @@ function attempt(
   });
 }
 
-function deviceSync(): EdgeAdmissionPolicyEntry {
-  // index.ts deviceSyncPrincipal: one helper call shared by every device
-  // bearer read/manifest/domain route below.
-  return attempt("device_sync", "RECOVERY_RATE_LIMIT");
+function deviceSync(): DeviceSyncAdmissionPolicyEntry {
+  // index.ts deviceSyncPrincipal: bearer-shaped attempt or credential admission
+  // shared by every device read/manifest/domain route below.
+  return Object.freeze({
+    helper: "device_sync",
+    attempt: Object.freeze({
+      purpose: "device_sync",
+      coarseBinding: "RECOVERY_RATE_LIMIT",
+      clientBinding: "CLIENT_ATTEMPT_RATE_LIMIT",
+    }),
+    credential: Object.freeze({
+      purpose: "device_sync_credential",
+      clientBinding: "DEVICE_SYNC_CLIENT_RATE_LIMIT",
+      coarseBinding: "DEVICE_SYNC_RATE_LIMIT",
+    }),
+    deferredAttemptOnAuthFailure: true,
+  });
 }
 
 const POLICY_ENTRIES = {
@@ -186,9 +220,15 @@ export interface EdgeAdmissionInput {
   readonly routeId: string;
   /** The original client request; the runtime CF-Connecting-IP is read from it. */
   readonly request: Request;
-  /** Only the six EDGE_ADMISSION_BINDINGS names are read from this object. */
+  /** Only the eight EDGE_ADMISSION_BINDINGS names are read from this object. */
   readonly limiters: EdgeAdmissionLimiters;
   /** Edge-only HMAC secret for client rate-limit keys. */
+  readonly clientKeySecret: string;
+}
+
+export interface EdgeDeferredDeviceSyncAttemptInput {
+  readonly request: Request;
+  readonly limiters: EdgeAdmissionLimiters;
   readonly clientKeySecret: string;
 }
 
@@ -214,6 +254,34 @@ function namedLimiters(
   return selected;
 }
 
+function admissionEnvironment(
+  limiters: EdgeAdmissionLimiters,
+  clientKeySecret: string,
+): { limiters: Partial<Record<EdgeAdmissionBinding, RateLimit>>; env: Env } {
+  const selected = namedLimiters(limiters);
+  return {
+    limiters: selected,
+    env: Object.freeze({
+      ...selected,
+      ENVIRONMENT: "production",
+      IDENTITY_LINK_SECRET: clientKeySecret,
+    }) as unknown as Env,
+  };
+}
+
+function hasWellFormedDeviceBearer(request: Request): boolean {
+  try {
+    parseDeviceAuthorization(request.headers.get("authorization"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function outcomeForError(error: unknown): EdgePolicyOutcome {
+  return error instanceof ApiError && error.status === 429 ? "limited" : "unavailable";
+}
+
 /**
  * Runs the Worker's own admission helper for `routeId` against the edge
  * bindings and reports only the purpose and outcome. The helper receives the
@@ -235,16 +303,16 @@ export async function evaluateEdgeAdmission(
       || clientKeySecret.length < MINIMUM_CLIENT_KEY_SECRET_LENGTH) {
     // The helper would spend the coarse budget before refusing an unkeyed
     // hosted environment; refuse first so no limiter is touched.
-    return evaluation(policy.purpose, "unavailable");
+    return evaluation(policy.helper === "device_sync"
+      ? (input.request.headers.has("cookie") || !hasWellFormedDeviceBearer(input.request)
+        ? policy.attempt.purpose
+        : policy.credential.purpose)
+      : policy.purpose, "unavailable");
   }
-  // Copy only the six named bindings, so a caller that hands over a whole
+  // Copy only the eight named bindings, so a caller that hands over a whole
   // Worker env can never replace ENVIRONMENT or the edge-only secret.
-  const limiters = namedLimiters(input.limiters);
-  const admissionEnv = Object.freeze({
-    ...limiters,
-    ENVIRONMENT: "production",
-    IDENTITY_LINK_SECRET: clientKeySecret,
-  }) as unknown as Env;
+  const { limiters, env: admissionEnv } = admissionEnvironment(input.limiters, clientKeySecret);
+  let purpose: EdgePolicyPurpose = policy.helper === "device_sync" ? "device_sync" : policy.purpose;
   try {
     switch (policy.helper) {
       case "attempt":
@@ -255,6 +323,26 @@ export async function evaluateEdgeAdmission(
           admissionEnv,
           policy.purpose,
         );
+        break;
+      case "device_sync":
+        if (input.request.headers.has("cookie") || !hasWellFormedDeviceBearer(input.request)) {
+          purpose = policy.attempt.purpose;
+          await assertAttemptAllowed(
+            limiters[policy.attempt.coarseBinding],
+            limiters[policy.attempt.clientBinding],
+            input.request,
+            admissionEnv,
+            policy.attempt.purpose,
+          );
+        } else {
+          purpose = policy.credential.purpose;
+          await assertDeviceSyncCredentialAllowed(
+            limiters[policy.credential.clientBinding],
+            limiters[policy.credential.coarseBinding],
+            input.request,
+            admissionEnv,
+          );
+        }
         break;
       case "upload_ingress":
         await assertUploadIngressRequestAllowed(
@@ -273,10 +361,32 @@ export async function evaluateEdgeAdmission(
         break;
     }
   } catch (error) {
-    return evaluation(
-      policy.purpose,
-      error instanceof ApiError && error.status === 429 ? "limited" : "unavailable",
-    );
+    return evaluation(purpose, outcomeForError(error));
   }
-  return evaluation(policy.purpose, "allowed");
+  return evaluation(purpose, "allowed");
+}
+
+/** Replays the Worker's attempt pair after an admitted credential fails authentication. */
+export async function evaluateDeferredDeviceSyncAttempt(
+  input: EdgeDeferredDeviceSyncAttemptInput,
+): Promise<EdgeAdmissionEvaluation> {
+  const purpose = "device_sync" as const;
+  const clientKeySecret = input.clientKeySecret;
+  if (typeof clientKeySecret !== "string"
+      || clientKeySecret.length < MINIMUM_CLIENT_KEY_SECRET_LENGTH) {
+    return evaluation(purpose, "unavailable");
+  }
+  const { limiters, env } = admissionEnvironment(input.limiters, clientKeySecret);
+  try {
+    await assertAttemptAllowed(
+      limiters.RECOVERY_RATE_LIMIT,
+      limiters.CLIENT_ATTEMPT_RATE_LIMIT,
+      input.request,
+      env,
+      purpose,
+    );
+    return evaluation(purpose, "allowed");
+  } catch (error) {
+    return evaluation(purpose, outcomeForError(error));
+  }
 }

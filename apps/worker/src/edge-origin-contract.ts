@@ -52,6 +52,7 @@ export const EDGE_HEADERS = Object.freeze({
   admission: "x-tibotattle-edge-admission",
   requestId: "x-tibotattle-edge-request-id",
   callbackQuery: "x-tibotattle-google-callback-query",
+  deferredAdmission: "x-tibotattle-edge-deferred-admission",
   invokerToken: "x-serverless-authorization",
   originMarker: "x-tibotattle-origin",
 } as const);
@@ -106,6 +107,7 @@ export const DROPPED_RESPONSE_HEADERS = Object.freeze([
   "x-cloud-trace-context",
   "traceparent",
   EDGE_HEADERS.originMarker,
+  EDGE_HEADERS.deferredAdmission,
 ] as const);
 
 // ---------------------------------------------------------------------------
@@ -118,6 +120,7 @@ export const EDGE_ADMISSION_PURPOSES = Object.freeze([
   "device_disconnect",
   "device_credential_renew",
   "device_sync",
+  "device_sync_credential",
   "accountless_ownership",
   "accountless_renewal",
   "public_aggregate_read",
@@ -135,6 +138,14 @@ export interface EdgeAdmission {
 
 const EDGE_ADMISSION_VERSION = "v1";
 const MAX_EDGE_ADMISSION_LENGTH = 96;
+
+/** The origin asks the edge to replay a failed device credential's attempt limits. */
+export const EDGE_DEFERRED_DEVICE_SYNC_ATTEMPT = "v1;device_sync";
+
+/** Accepts only the exact response token; the header is never client-authored. */
+export function isEdgeDeferredDeviceSyncAttempt(value: unknown): boolean {
+  return value === EDGE_DEFERRED_DEVICE_SYNC_ATTEMPT;
+}
 
 function isEdgeAdmissionPurpose(value: unknown): value is EdgeAdmissionPurpose {
   return typeof value === "string" && (EDGE_ADMISSION_PURPOSES as readonly string[]).includes(value);

@@ -30,6 +30,8 @@ const BINDING_NAMES = Object.freeze([
   "ENROLLMENT_RATE_LIMIT",
   "RECOVERY_RATE_LIMIT",
   "CLIENT_ATTEMPT_RATE_LIMIT",
+  "DEVICE_SYNC_CLIENT_RATE_LIMIT",
+  "DEVICE_SYNC_RATE_LIMIT",
   "PUBLIC_READ_RATE_LIMIT",
   "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
   "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
@@ -136,6 +138,32 @@ function uploadIngressCase() {
   };
 }
 
+function deviceSyncCredentialCase() {
+  const digest = originClientKey("device_sync").split(":").at(-1);
+  return {
+    label: "device_sync_credential",
+    purpose: "device_sync_credential",
+    limitedCode: "DEVICE_SYNC_LIMIT_REACHED",
+    unavailableCode: "ADMISSION_RATE_LIMIT_UNAVAILABLE",
+    expectedCalls: [
+      {
+        name: "DEVICE_SYNC_CLIENT_RATE_LIMIT",
+        key: `usage-monitor:device_sync:credential:client:${digest}`,
+      },
+      {
+        name: "DEVICE_SYNC_RATE_LIMIT",
+        key: "usage-monitor:device_sync:credential:global",
+      },
+    ],
+    call: (bindings, request) => admissionHelpers.assertDeviceSyncCredentialAllowed(
+      bindings.DEVICE_SYNC_CLIENT_RATE_LIMIT,
+      bindings.DEVICE_SYNC_RATE_LIMIT,
+      request,
+      ORIGIN_ENV,
+    ),
+  };
+}
+
 function publicReadCase() {
   return {
     label: "public_aggregate_read",
@@ -157,6 +185,7 @@ function helperCases() {
   return [
     ...ATTEMPT_PURPOSES.map((purpose) => attemptCase(purpose, "ENROLLMENT_RATE_LIMIT")),
     ...ATTEMPT_PURPOSES.map((purpose) => attemptCase(purpose, "RECOVERY_RATE_LIMIT")),
+    deviceSyncCredentialCase(),
     uploadIngressCase(),
     publicReadCase(),
   ];
@@ -198,7 +227,7 @@ async function directRefusal(binding, options) {
   return outcome.error;
 }
 
-test("exports exactly the replay factory and the six edge-tier binding names", () => {
+test("exports exactly the replay factory and the eight edge-tier binding names", () => {
   assert.deepEqual(Object.keys(limiters).sort(), [
     "EDGE_ADMISSION_REPLAY_BINDINGS",
     "createEdgeAdmissionLimiters",
@@ -207,7 +236,8 @@ test("exports exactly the replay factory and the six edge-tier binding names", (
   assert.ok(Object.isFrozen(limiters.EDGE_ADMISSION_REPLAY_BINDINGS));
   const instance = limiters.createEdgeAdmissionLimiters();
   assert.ok(Object.isFrozen(instance));
-  assert.deepEqual(Object.keys(instance), ["bindings", "run"]);
+  assert.deepEqual(Object.keys(instance), ["bindings", "run", "runWithReport"]);
+  assert.equal(typeof instance.runWithReport, "function");
   assert.ok(Object.isFrozen(instance.bindings));
   assert.deepEqual(Object.keys(instance.bindings), BINDING_NAMES);
   for (const name of BINDING_NAMES) {
@@ -218,7 +248,7 @@ test("exports exactly the replay factory and the six edge-tier binding names", (
   }
   // Every contract purpose is replayable by exactly the bindings above.
   assert.deepEqual(
-    [...ATTEMPT_PURPOSES, "public_aggregate_read", "upload_ingress"].sort(),
+    [...ATTEMPT_PURPOSES, "device_sync_credential", "public_aggregate_read", "upload_ingress"].sort(),
     [...contract.EDGE_ADMISSION_PURPOSES].sort(),
   );
 });
@@ -300,6 +330,91 @@ test("the client segment is shape-checked only: the outcome comes from the edge"
   assert.match(calls[1].key, /^usage-monitor:device_sync:client:[0-9a-f]{64}$/u);
 });
 
+test("device-sync credentials replay client then location; only allowed can defer one attempt pair", async () => {
+  const { bindings, runWithReport } = limiters.createEdgeAdmissionLimiters();
+  const request = originRequest();
+  const credential = deviceSyncCredentialCase();
+  const attemptGlobal = { key: "usage-monitor:device_sync:global" };
+  const attemptClient = { key: `usage-monitor:device_sync:client:${HEX64}` };
+
+  const allowed = await runWithReport(
+    { purpose: credential.purpose, outcome: "allowed" },
+    async () => {
+      const calls = [];
+      const spied = spyBindings(bindings, calls);
+      await admissionHelpers.assertDeviceSyncCredentialAllowed(
+        spied.DEVICE_SYNC_CLIENT_RATE_LIMIT,
+        spied.DEVICE_SYNC_RATE_LIMIT,
+        request,
+        ORIGIN_ENV,
+      );
+      await admissionHelpers.assertAttemptAllowed(
+        spied.RECOVERY_RATE_LIMIT,
+        spied.CLIENT_ATTEMPT_RATE_LIMIT,
+        request,
+        ORIGIN_ENV,
+        "device_sync",
+      );
+      return calls;
+    },
+  );
+  assert.equal(allowed.deferredAttempt, true);
+  assert.deepEqual(allowed.result, [
+    { name: "DEVICE_SYNC_CLIENT_RATE_LIMIT", key: credential.expectedCalls[0].key },
+    { name: "DEVICE_SYNC_RATE_LIMIT", key: credential.expectedCalls[1].key },
+    { name: "RECOVERY_RATE_LIMIT", key: "usage-monitor:device_sync:global" },
+    { name: "CLIENT_ATTEMPT_RATE_LIMIT", key: originClientKey("device_sync") },
+  ]);
+
+  const limited = await runWithReport(
+    { purpose: credential.purpose, outcome: "limited" },
+    () => settle(credential.call(bindings, request)),
+  );
+  await assertWorkerError(limited.result.error, 429, "DEVICE_SYNC_LIMIT_REACHED");
+  assert.equal(limited.deferredAttempt, false);
+
+  const limitedCredentialClient = await runWithReport(
+    { purpose: credential.purpose, outcome: "limited" },
+    async () => {
+      await bindings.DEVICE_SYNC_CLIENT_RATE_LIMIT.limit(credential.expectedCalls[0]);
+      return directRefusal(bindings.DEVICE_SYNC_RATE_LIMIT, credential.expectedCalls[1]);
+    },
+  );
+  assertReplayRefusal(limitedCredentialClient.result, "EDGE_ADMISSION_REPLAY_SEQUENCE_INVALID");
+  assert.equal(limitedCredentialClient.deferredAttempt, false);
+
+  const repeatDeferred = await runWithReport(
+    { purpose: credential.purpose, outcome: "allowed" },
+    async () => {
+      await bindings.DEVICE_SYNC_CLIENT_RATE_LIMIT.limit(credential.expectedCalls[0]);
+      await bindings.DEVICE_SYNC_RATE_LIMIT.limit(credential.expectedCalls[1]);
+      await bindings.RECOVERY_RATE_LIMIT.limit(attemptGlobal);
+      await bindings.CLIENT_ATTEMPT_RATE_LIMIT.limit(attemptClient);
+      return directRefusal(bindings.RECOVERY_RATE_LIMIT, attemptGlobal);
+    },
+  );
+  assertReplayRefusal(repeatDeferred.result, "EDGE_ADMISSION_REPLAY_SEQUENCE_INVALID");
+  assert.equal(repeatDeferred.deferredAttempt, true, "the first complete deferred pair remains reported");
+
+  const wrongOrder = await runWithReport(
+    { purpose: credential.purpose, outcome: "allowed" },
+    () => directRefusal(bindings.DEVICE_SYNC_RATE_LIMIT, credential.expectedCalls[1]),
+  );
+  assertReplayRefusal(wrongOrder.result, "EDGE_ADMISSION_REPLAY_SEQUENCE_INVALID");
+  assert.equal(wrongOrder.deferredAttempt, false);
+
+  const deferredWrongOrder = await runWithReport(
+    { purpose: credential.purpose, outcome: "allowed" },
+    async () => {
+      await bindings.DEVICE_SYNC_CLIENT_RATE_LIMIT.limit(credential.expectedCalls[0]);
+      await bindings.DEVICE_SYNC_RATE_LIMIT.limit(credential.expectedCalls[1]);
+      return directRefusal(bindings.CLIENT_ATTEMPT_RATE_LIMIT, attemptClient);
+    },
+  );
+  assertReplayRefusal(deferredWrongOrder.result, "EDGE_ADMISSION_REPLAY_SEQUENCE_INVALID");
+  assert.equal(deferredWrongOrder.deferredAttempt, false, "an incomplete deferred pair is not reported");
+});
+
 test("a missing store, a missing outcome and a purpose mismatch answer the helper's 503", async () => {
   const { bindings, run } = limiters.createEdgeAdmissionLimiters();
   const request = originRequest();
@@ -330,6 +445,23 @@ test("a missing store, a missing outcome and a purpose mismatch answer the helpe
     () => settle(upload.call(bindings, request)),
   );
   await assertWorkerError(uploadUnderDeviceSync.error, 503, "UPLOAD_INGRESS_UNAVAILABLE");
+  for (const purpose of ["upload_ingress", "device_sync"]) {
+    const credentialUnderOtherPurpose = await run(
+      { purpose, outcome: "allowed" },
+      () => settle(admissionHelpers.assertDeviceSyncCredentialAllowed(
+        bindings.DEVICE_SYNC_CLIENT_RATE_LIMIT,
+        bindings.DEVICE_SYNC_RATE_LIMIT,
+        request,
+        ORIGIN_ENV,
+      )),
+    );
+    await assertWorkerError(credentialUnderOtherPurpose.error, 503, "ADMISSION_RATE_LIMIT_UNAVAILABLE");
+  }
+  const deferredBeforeCredentials = await run(
+    { purpose: "device_sync_credential", outcome: "allowed" },
+    () => settle(attempt.call(bindings, request)),
+  );
+  await assertWorkerError(deferredBeforeCredentials.error, 503, "ADMISSION_RATE_LIMIT_UNAVAILABLE");
   const publicReadUnderEnrollment = await run(
     { purpose: "enrollment", outcome: "allowed" },
     () => settle(publicRead.call(bindings, request)),
@@ -385,6 +517,19 @@ test("each binding accepts only the key shape and purposes the Worker helpers gi
   // Coarse bindings take only ':global'; client bindings only ':client:'.
   await refusedFirstCall("enrollment", "ENROLLMENT_RATE_LIMIT", client("enrollment"), mismatch);
   await refusedFirstCall("device_sync", "RECOVERY_RATE_LIMIT", client("device_sync"), mismatch);
+  await refusedFirstCall(
+    "device_sync_credential",
+    "DEVICE_SYNC_CLIENT_RATE_LIMIT",
+    global("device_sync_credential"),
+    mismatch,
+  );
+  await refusedFirstCall(
+    "device_sync_credential",
+    "DEVICE_SYNC_RATE_LIMIT",
+    client("device_sync_credential"),
+    mismatch,
+  );
+  await refusedFirstCall("enrollment", "DEVICE_SYNC_CLIENT_RATE_LIMIT", global("enrollment"), mismatch);
   await refusedFirstCall("upload_ingress", "UPLOAD_INGRESS_REQUEST_RATE_LIMIT", client("upload_ingress"), mismatch);
   await refusedFirstCall("public_aggregate_read", "PUBLIC_READ_RATE_LIMIT", global("public_aggregate_read"), mismatch);
   // PUBLIC_READ only public_aggregate_read; UPLOAD_INGRESS_* only upload_ingress;
@@ -462,6 +607,8 @@ test("each binding accepts only the key shape and purposes the Worker helpers gi
     { key: `usage-monitor:enrollment:client:${HEX64.slice(1)}` },
     { key: `usage-monitor:enrollment:client:${HEX64}0` },
     { key: `usage-monitor:enrollment:client:${HEX64.toUpperCase()}` },
+    { key: "usage-monitor:device_sync:credential:client:ABCDEF" },
+    { key: "usage-monitor:device_sync:credential:global:extra" },
     { key: `usage-monitor:upload_authorization:participant:${HEX64}` },
     { key: `app-usagemonitor:enrollment:global` },
     { key: `usage-monitor:enrollment:global\n` },
@@ -642,7 +789,17 @@ test("replays every EP-1 edge admission policy entry through its own bindings", 
   assert.ok(entries.length > 0);
   for (const [routeId, entry] of entries) {
     const request = originRequest();
+    const purpose = entry.helper === "device_sync" ? entry.attempt.purpose : entry.purpose;
     const call = () => {
+      if (entry.helper === "device_sync") {
+        return admissionHelpers.assertAttemptAllowed(
+          bindings[entry.attempt.coarseBinding],
+          bindings[entry.attempt.clientBinding],
+          request,
+          ORIGIN_ENV,
+          entry.attempt.purpose,
+        );
+      }
       if (entry.helper === "attempt") {
         return admissionHelpers.assertAttemptAllowed(
           bindings[entry.coarseBinding],
@@ -668,11 +825,11 @@ test("replays every EP-1 edge admission policy entry through its own bindings", 
         ORIGIN_ENV,
       );
     };
-    const allowed = await run({ purpose: entry.purpose, outcome: "allowed" }, () => settle(call()));
+    const allowed = await run({ purpose, outcome: "allowed" }, () => settle(call()));
     assert.equal(allowed.error, null, `${routeId} allowed`);
-    const limited = await run({ purpose: entry.purpose, outcome: "limited" }, () => settle(call()));
+    const limited = await run({ purpose, outcome: "limited" }, () => settle(call()));
     assert.equal(limited.error?.status, 429, `${routeId} limited`);
-    const unavailable = await run({ purpose: entry.purpose, outcome: "unavailable" }, () => settle(call()));
+    const unavailable = await run({ purpose, outcome: "unavailable" }, () => settle(call()));
     assert.equal(unavailable.error?.status, 503, `${routeId} unavailable`);
   }
 });

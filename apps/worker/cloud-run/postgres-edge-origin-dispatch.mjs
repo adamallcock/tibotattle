@@ -25,8 +25,12 @@
  *    x-forwarded-*, the token and every x-tibotattle-* header stay here;
  * 6. records {requestId, hostKind} for the rebuilt Request
  *    (edgeRequestContext) and runs inner inside the admission replay scope
- *    (postgres-edge-admission-limiters.mjs);
- * 7. marks every response it returns with x-tibotattle-origin: 1, keeping each
+ *    (postgres-edge-admission-limiters.mjs), which reports a failed device
+ *    bearer that replayed the post-verification attempt pair;
+ * 7. when that report accompanies a 401, adds the response-only deferred
+ *    admission token for the edge to charge RECOVERY then CLIENT_ATTEMPT. A
+ *    deferred report with any other status becomes 500 INTERNAL_ERROR;
+ * 8. marks every response it returns with x-tibotattle-origin: 1, keeping each
  *    Set-Cookie separate; a throw from inner answers the Worker's
  *    500 INTERNAL_ERROR envelope.
  *
@@ -40,6 +44,7 @@ import { JSON_HEADERS } from "../src/constants.ts";
 import {
   ADMIN_ONLY_FORWARDED_REQUEST_HEADERS,
   EDGE_CONTRACT_REQUEST_HEADERS,
+  EDGE_DEFERRED_DEVICE_SYNC_ATTEMPT,
   EDGE_HEADERS,
   EDGE_HOST_KINDS,
   EDGE_INVOKER_CLOCK_SKEW_SECONDS,
@@ -270,13 +275,16 @@ function internalError(requestId) {
   return errorResponse(new ApiError(500, "INTERNAL_ERROR"), requestId ?? crypto.randomUUID());
 }
 
-function markedResponse(response) {
+function markedResponse(response, deferredAttempt = false) {
   const headers = new Headers();
   for (const [name, value] of response.headers) {
-    if (name !== "set-cookie") headers.append(name, value);
+    if (name !== "set-cookie" && name !== EDGE_HEADERS.deferredAdmission) headers.append(name, value);
   }
   for (const cookie of response.headers.getSetCookie()) headers.append("set-cookie", cookie);
   headers.set(EDGE_HEADERS.originMarker, ORIGIN_MARKER_VALUE);
+  if (deferredAttempt) {
+    headers.set(EDGE_HEADERS.deferredAdmission, EDGE_DEFERRED_DEVICE_SYNC_ATTEMPT);
+  }
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -331,7 +339,9 @@ export function createEdgeOriginDispatch({
   if (!isEdgeOriginAudience(audience)) throw configurationError("EDGE_ORIGIN_AUDIENCE_INVALID");
   const apexUrl = canonicalPublicOrigin(publicOrigin);
   if (apexUrl === null) throw configurationError("EDGE_ORIGIN_PUBLIC_ORIGIN_INVALID");
-  if (admission === null || typeof admission !== "object" || typeof admission.run !== "function") {
+  if (admission === null || typeof admission !== "object"
+      || typeof admission.run !== "function"
+      || typeof admission.runWithReport !== "function") {
     throw configurationError("EDGE_ORIGIN_ADMISSION_INVALID");
   }
   if (typeof inner !== "function") throw configurationError("EDGE_ORIGIN_INNER_INVALID");
@@ -356,9 +366,20 @@ export function createEdgeOriginDispatch({
     }
     let response;
     try {
-      response = await admission.run(admitted.admission, () => inner(admitted.request));
+      const replayed = await admission.runWithReport(
+        admitted.admission,
+        () => inner(admitted.request),
+      );
+      if (replayed === null || typeof replayed !== "object"
+          || typeof replayed.deferredAttempt !== "boolean") {
+        throw new TypeError("EDGE_ORIGIN_ADMISSION_REPORT_INVALID");
+      }
+      response = replayed.result;
       if (!(response instanceof Response)) throw new TypeError("EDGE_ORIGIN_RESPONSE_INVALID");
-      return markedResponse(response);
+      if (replayed.deferredAttempt && response.status !== 401) {
+        return markedResponse(internalError(admitted.requestId));
+      }
+      return markedResponse(response, replayed.deferredAttempt);
     } catch {
       return markedResponse(internalError(admitted.requestId));
     }

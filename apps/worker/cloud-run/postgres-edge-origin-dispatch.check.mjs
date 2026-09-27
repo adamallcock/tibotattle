@@ -244,6 +244,7 @@ const INVALID_CASES = Object.freeze([
   { label: "a legacy x-tibotattle-edge-client-key", request: { headers: [["x-tibotattle-edge-client-key", "0".repeat(64)]] } },
   { label: "an unknown x-tibotattle-* header", request: { headers: [["x-tibotattle-edge-proof", "synthetic"]] } },
   { label: "a client-sent origin marker", request: { headers: [["x-tibotattle-origin", "1"]] } },
+  { label: "a client-sent deferred admission response header", request: { headers: [["x-tibotattle-edge-deferred-admission", "v1;device_sync"]] } },
   { label: "an admission with a v2 prefix", request: { headers: [["x-tibotattle-edge-admission", "v2;enrollment;allowed"]] } },
   { label: "an admission for upload_authorization", request: { headers: [["x-tibotattle-edge-admission", "v1;upload_authorization;allowed"]] } },
   { label: "an empty admission", request: { headers: [["x-tibotattle-edge-admission", ""]] } },
@@ -637,6 +638,7 @@ test("construction refuses invalid configuration", () => {
     [{ publicOrigin: "https://admin.tibotattle.com" }, "EDGE_ORIGIN_PUBLIC_ORIGIN_INVALID"],
     [{ publicOrigin: undefined }, "EDGE_ORIGIN_PUBLIC_ORIGIN_INVALID"],
     [{ admission: {} }, "EDGE_ORIGIN_ADMISSION_INVALID"],
+    [{ admission: { run() {} } }, "EDGE_ORIGIN_ADMISSION_INVALID"],
     [{ admission: null }, "EDGE_ORIGIN_ADMISSION_INVALID"],
     [{ inner: undefined }, "EDGE_ORIGIN_INNER_INVALID"],
     [{ clock: 1_800_000_000_000 }, "EDGE_ORIGIN_CLOCK_INVALID"],
@@ -695,6 +697,8 @@ function routeStub(bindings, keys) {
       spied.ENROLLMENT_RATE_LIMIT, spied.CLIENT_ATTEMPT_RATE_LIMIT, request, ORIGIN_ENV, "enrollment"),
     device_sync_state: (request) => admissionHelpers.assertAttemptAllowed(
       spied.RECOVERY_RATE_LIMIT, spied.CLIENT_ATTEMPT_RATE_LIMIT, request, ORIGIN_ENV, "device_sync"),
+    device_sync_credential: (request) => admissionHelpers.assertDeviceSyncCredentialAllowed(
+      spied.DEVICE_SYNC_CLIENT_RATE_LIMIT, spied.DEVICE_SYNC_RATE_LIMIT, request, ORIGIN_ENV),
     contributions: (request) => admissionHelpers.assertUploadIngressRequestAllowed(
       spied.UPLOAD_INGRESS_REQUEST_RATE_LIMIT, spied.UPLOAD_INGRESS_CLIENT_RATE_LIMIT, request, ORIGIN_ENV),
     community_daily: (request) => admissionHelpers.assertPublicAggregateReadAllowed(
@@ -731,6 +735,9 @@ test("real helpers replay edge outcomes through the boundary", async () => {
     ["enroll", "v1;sign_in_start;allowed", 503, "ADMISSION_RATE_LIMIT_UNAVAILABLE"],
     ["device_sync_state", "v1;device_sync;allowed", 200, null],
     ["device_sync_state", "v1;device_sync;limited", 429, "ATTEMPT_LIMIT_REACHED"],
+    ["device_sync_credential", "v1;device_sync_credential;allowed", 200, null],
+    ["device_sync_credential", "v1;device_sync_credential;limited", 429, "DEVICE_SYNC_LIMIT_REACHED"],
+    ["device_sync_credential", "v1;device_sync_credential;unavailable", 503, "ADMISSION_RATE_LIMIT_UNAVAILABLE"],
     ["contributions", "v1;upload_ingress;allowed", 200, null],
     ["contributions", "v1;upload_ingress;limited", 429, "UPLOAD_INGRESS_LIMIT_REACHED"],
     ["contributions", "v1;upload_ingress;unavailable", 503, "UPLOAD_INGRESS_UNAVAILABLE"],
@@ -762,8 +769,117 @@ test("real helpers replay edge outcomes through the boundary", async () => {
   assert.ok(clientKeys.length > 0);
   for (const key of clientKeys) {
     const purpose = key.split(":")[1];
-    assert.equal(key, originClientKey(purpose));
+    if (key.includes(":credential:client:")) {
+      assert.equal(key, `usage-monitor:device_sync:credential:client:${originClientKey("device_sync").split(":").at(-1)}`);
+    } else {
+      assert.equal(key, originClientKey(purpose));
+    }
   }
+});
+
+test("deferred device-sync admission is reported only with a 401 response", async () => {
+  const admission = limiters.createEdgeAdmissionLimiters();
+  const calls = [];
+  const bindings = Object.fromEntries(Object.entries(admission.bindings).map(([name, binding]) => [name, {
+    async limit(options) {
+      calls.push({ name, key: options?.key });
+      return binding.limit(options);
+    },
+  }]));
+  let innerCalls = 0;
+  const dispatch = createDispatch({
+    admission,
+    inner: async (request) => {
+      innerCalls += 1;
+      await admissionHelpers.assertDeviceSyncCredentialAllowed(
+        bindings.DEVICE_SYNC_CLIENT_RATE_LIMIT,
+        bindings.DEVICE_SYNC_RATE_LIMIT,
+        request,
+        ORIGIN_ENV,
+      );
+      const mode = new URL(request.url).searchParams.get("mode");
+      if (mode !== "valid") {
+        await admissionHelpers.assertAttemptAllowed(
+          bindings.RECOVERY_RATE_LIMIT,
+          bindings.CLIENT_ATTEMPT_RATE_LIMIT,
+          request,
+          ORIGIN_ENV,
+          "device_sync",
+        );
+      }
+      if (mode === "valid") {
+        const response = Response.json({ ok: true });
+        response.headers.set(contract.EDGE_HEADERS.deferredAdmission, "v1;device_sync");
+        return response;
+      }
+      const response = errors.errorResponse(new errors.ApiError(401, "DEVICE_AUTH_INVALID"), REQUEST_ID);
+      response.headers.set(contract.EDGE_HEADERS.deferredAdmission, "spoofed");
+      return response;
+    },
+  });
+  const request = (mode) => rawRequest({
+    path: `/api/v1/device/sync?mode=${mode}`,
+    headers: [["x-tibotattle-edge-admission", "v1;device_sync_credential;allowed"]],
+  });
+
+  calls.length = 0;
+  const valid = await dispatch(request("valid"));
+  assert.equal(valid.status, 200);
+  assertMarked(valid);
+  assert.equal(valid.headers.get(contract.EDGE_HEADERS.deferredAdmission), null);
+  assert.deepEqual(calls.map(({ name }) => name), [
+    "DEVICE_SYNC_CLIENT_RATE_LIMIT",
+    "DEVICE_SYNC_RATE_LIMIT",
+  ]);
+
+  calls.length = 0;
+  const invalid = await dispatch(request("invalid"));
+  assert.equal(invalid.status, 401);
+  assertMarked(invalid);
+  assert.equal(invalid.headers.get(contract.EDGE_HEADERS.deferredAdmission), "v1;device_sync");
+  assert.deepEqual(await invalid.json(), {
+    error: { code: "DEVICE_AUTH_INVALID", requestId: REQUEST_ID },
+  });
+  assert.deepEqual(calls.map(({ name }) => name), [
+    "DEVICE_SYNC_CLIENT_RATE_LIMIT",
+    "DEVICE_SYNC_RATE_LIMIT",
+    "RECOVERY_RATE_LIMIT",
+    "CLIENT_ATTEMPT_RATE_LIMIT",
+  ]);
+
+  calls.length = 0;
+  const unexpected = await createDispatch({
+    admission,
+    inner: async (originRequest) => {
+      await admissionHelpers.assertDeviceSyncCredentialAllowed(
+        bindings.DEVICE_SYNC_CLIENT_RATE_LIMIT,
+        bindings.DEVICE_SYNC_RATE_LIMIT,
+        originRequest,
+        ORIGIN_ENV,
+      );
+      await admissionHelpers.assertAttemptAllowed(
+        bindings.RECOVERY_RATE_LIMIT,
+        bindings.CLIENT_ATTEMPT_RATE_LIMIT,
+        originRequest,
+        ORIGIN_ENV,
+        "device_sync",
+      );
+      return Response.json({ unexpected: true });
+    },
+  })(request("deferred-200"));
+  assert.equal(unexpected.status, 500);
+  assertMarked(unexpected);
+  assert.equal(unexpected.headers.get(contract.EDGE_HEADERS.deferredAdmission), null);
+  assert.deepEqual(await unexpected.json(), {
+    error: { code: "INTERNAL_ERROR", requestId: REQUEST_ID },
+  });
+
+  const beforeRefusal = innerCalls;
+  const inbound = rawRequest({
+    headers: [[contract.EDGE_HEADERS.deferredAdmission, "v1;device_sync"]],
+  });
+  await assertRefusal(await dispatch(inbound), "response-only deferred header on request");
+  assert.equal(innerCalls, beforeRefusal, "inner is not reached for a client-sent response header");
 });
 
 test("50 concurrent boundary requests keep their own outcomes", async () => {
@@ -773,6 +889,7 @@ test("50 concurrent boundary requests keep their own outcomes", async () => {
   const routes = [
     ["enroll", "enrollment"],
     ["device_sync_state", "device_sync"],
+    ["device_sync_credential", "device_sync_credential"],
     ["contributions", "upload_ingress"],
     ["community_daily", "public_aggregate_read"],
   ];

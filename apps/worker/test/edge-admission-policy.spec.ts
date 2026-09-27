@@ -8,17 +8,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // modules) that the deployed Worker bundle does not provide.
 // @ts-expect-error -- test-only Vite ?raw import, checked by rawText below.
 import rawIndexSource from "../src/index.ts?raw";
+// @ts-expect-error -- the ratchet classifies every helper imported from admission.ts.
+import rawAdmissionSource from "../src/admission.ts?raw";
+import { claimDevicePairing, createDevicePairing } from "../src/device-auth";
+import { encodeBase64Url, sha256Hex } from "../src/crypto";
+import { createSessionMaterial, sessionInsert } from "../src/session";
 import {
   EDGE_ADMISSION_BINDINGS,
   EDGE_ADMISSION_POLICY,
   edgeAdmissionPolicyFor,
   evaluateEdgeAdmission,
+  evaluateDeferredDeviceSyncAttempt,
 } from "../src/edge-admission-policy";
 import type {
   EdgeAdmissionHelper,
   EdgeAdmissionLimiters,
   EdgeAdmissionPolicy,
   EdgeAdmissionPolicyEntry,
+  EdgePolicyOutcome,
 } from "../src/edge-admission-policy";
 import { handleRequest } from "../src/index";
 import { WORKER_ROUTE_POLICY } from "../src/route-registry";
@@ -35,6 +42,7 @@ function rawText(value: unknown): string {
 }
 
 const indexSource = rawText(rawIndexSource);
+const admissionSource = rawText(rawAdmissionSource);
 
 // Synthetic, content-free fixtures: a documentation-range address and a
 // throwaway key that only ever exists in this spec.
@@ -43,17 +51,21 @@ const CLIENT_ADDRESS = "203.0.113.7";
 const EDGE_SECRET = "edge-admission-spec-synthetic-secret-00000000";
 const RATE_LIMIT_KEY_PREFIX = "app-usagemonitor/rate-limit/v1";
 const KEY_PATTERN = /^usage-monitor:([a-z_]+):(global|client:[0-9a-f]{64})$/u;
+const DEVICE_CREDENTIAL_KEY_PATTERN =
+  /^usage-monitor:device_sync:credential:(global|client:[0-9a-f]{64})$/u;
 
 // The edge-tier bindings plus the identity-keyed origin-tier pair, so a probe
 // also observes any call a route makes outside the edge tier.
 const ALL_RATE_LIMIT_BINDINGS = [
   ...EDGE_ADMISSION_BINDINGS,
+  "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT",
   "UPLOAD_AUTHORIZATION_RATE_LIMIT",
   "UPLOAD_PRINCIPAL_RATE_LIMIT",
 ] as const;
 
 const LIMITED_CODE: Readonly<Record<EdgeAdmissionHelper, string>> = {
   attempt: "ATTEMPT_LIMIT_REACHED",
+  device_sync: "ATTEMPT_LIMIT_REACHED",
   public_read: "ATTEMPT_LIMIT_REACHED",
   upload_ingress: "UPLOAD_INGRESS_LIMIT_REACHED",
 };
@@ -115,6 +127,16 @@ async function expectedKeys(
   entry: EdgeAdmissionPolicyEntry,
   subject = CLIENT_ADDRESS,
 ): Promise<LimiterCall[]> {
+  if (entry.helper === "device_sync") {
+    const purpose = entry.attempt.purpose;
+    return [
+      { binding: entry.attempt.coarseBinding, key: `usage-monitor:${purpose}:global` },
+      {
+        binding: entry.attempt.clientBinding,
+        key: await expectedClientKey(purpose, subject),
+      },
+    ];
+  }
   const client = {
     binding: entry.clientBinding,
     key: await expectedClientKey(entry.purpose, subject),
@@ -124,6 +146,26 @@ async function expectedKeys(
     : [{ binding: entry.coarseBinding, key: `usage-monitor:${entry.purpose}:global` }, client];
 }
 
+async function expectedCredentialKeys(subject = CLIENT_ADDRESS): Promise<LimiterCall[]> {
+  const clientKey = await expectedClientKey("device_sync", subject);
+  return [
+    {
+      binding: "DEVICE_SYNC_CLIENT_RATE_LIMIT",
+      key: `usage-monitor:device_sync:credential:client:${clientKey.split(":").at(-1)}`,
+    },
+    {
+      binding: "DEVICE_SYNC_RATE_LIMIT",
+      key: "usage-monitor:device_sync:credential:global",
+    },
+  ];
+}
+
+async function expectedPrincipalKey(participantId: string): Promise<string> {
+  const digest = (await expectedClientKey("device_sync", `participant\0${participantId}`))
+    .split(":").at(-1);
+  return `usage-monitor:device_sync:participant:${digest}`;
+}
+
 function lookup(
   policy: EdgeAdmissionPolicy,
   routeId: string,
@@ -131,6 +173,10 @@ function lookup(
   return Object.hasOwn(policy, routeId)
     ? (Reflect.get(policy, routeId) as EdgeAdmissionPolicyEntry | undefined) ?? null
     : null;
+}
+
+function edgePurpose(entry: EdgeAdmissionPolicyEntry): string {
+  return entry.helper === "device_sync" ? entry.attempt.purpose : entry.purpose;
 }
 
 function doctor(
@@ -146,19 +192,21 @@ function doctor(
 function probeRequest(
   pathname: string,
   method: string,
-  headers: Record<string, string> = { "cf-connecting-ip": CLIENT_ADDRESS },
+  headers: Record<string, string | null> = { "cf-connecting-ip": CLIENT_ADDRESS },
 ): Request {
+  const selectedHeaders: Record<string, string> = {
+    "cf-connecting-ip": CLIENT_ADDRESS,
+    origin: ORIGIN,
+    "content-type": "application/json",
+    authorization: `Upload um_device_upload_${crypto.randomUUID()}.${"A".repeat(43)}`,
+  };
+  for (const [name, value] of Object.entries(headers)) {
+    if (value === null) delete selectedHeaders[name];
+    else selectedHeaders[name] = value;
+  }
   return new Request(`${ORIGIN}${pathname}`, {
     method,
-    headers: {
-      // The union of what the pre-limiter guards need: same-origin for the
-      // browser-started routes, a JSON body, and a well-formed synthetic
-      // upload bearer for the contribution preflight.
-      origin: ORIGIN,
-      "content-type": "application/json",
-      authorization: `Upload um_device_upload_${crypto.randomUUID()}.${"A".repeat(43)}`,
-      ...headers,
-    },
+    headers: selectedHeaders,
     ...(method === "GET" ? {} : { body: "{}" }),
   });
 }
@@ -209,16 +257,18 @@ async function observeRoute(
   definition: Readonly<WorkerRouteDefinition>,
   method: string,
   mode: "limit-last" | "admit-all" = "limit-last",
+  headers: Record<string, string | null> = {},
 ): Promise<ProbeObservation> {
   const entry = lookup(policy, definition.id);
   const failingCall = entry === null || mode === "admit-all"
     ? Number.POSITIVE_INFINITY
-    : entry.coarseBinding === null ? 1 : 2;
+    : entry.helper === "device_sync" ? 2
+      : entry.coarseBinding === null ? 1 : 2;
   const { calls, limiters } = recordingLimiters(
     (_call, callNumber) => callNumber < failingCall,
   );
   const response = await handleRequest(
-    probeRequest(definition.pathname, method),
+    probeRequest(definition.pathname, method, headers),
     probeEnv(limiters),
   );
   let code: string | null = null;
@@ -250,6 +300,7 @@ function edgeTierCalls(calls: readonly LimiterCall[]): LimiterCall[] {
 function helperForPurpose(purpose: string): EdgeAdmissionHelper {
   if (purpose === "upload_ingress") return "upload_ingress";
   if (purpose === "public_aggregate_read") return "public_read";
+  if (purpose === "device_sync_credential") return "device_sync";
   return "attempt";
 }
 
@@ -267,9 +318,10 @@ function probeMismatches(
       : [`${label}: calls ${edgeCalls.map((call) => call.binding).join(",")} without a policy entry`];
   }
   const mismatches: string[] = [];
-  const expectedBindings = entry.coarseBinding === null
-    ? [entry.clientBinding]
-    : [entry.coarseBinding, entry.clientBinding];
+  const attemptEntry = entry.helper === "device_sync" ? entry.attempt : entry;
+  const expectedBindings = attemptEntry.coarseBinding === null
+    ? [attemptEntry.clientBinding]
+    : [attemptEntry.coarseBinding, attemptEntry.clientBinding];
   const observedBindings = observation.calls.map((call) => call.binding);
   if (observedBindings.join(",") !== expectedBindings.join(",")) {
     mismatches.push(`${label}: bindings ${observedBindings.join(",")} != ${expectedBindings.join(",")}`);
@@ -280,22 +332,25 @@ function probeMismatches(
       mismatches.push(`${label}: call ${index + 1} key is not a rate-limit key`);
       return;
     }
-    const scope = entry.coarseBinding !== null && index === 0 ? "global" : "client";
-    if (parsed[1] !== entry.purpose) {
-      mismatches.push(`${label}: call ${index + 1} purpose ${parsed[1]} != ${entry.purpose}`);
+    const expectedPurpose = entry.helper === "device_sync" ? entry.attempt.purpose : entry.purpose;
+    const expectedHelper = entry.helper === "device_sync" ? "attempt" : entry.helper;
+    const scope = attemptEntry.coarseBinding !== null && index === 0 ? "global" : "client";
+    if (parsed[1] !== expectedPurpose) {
+      mismatches.push(`${label}: call ${index + 1} purpose ${parsed[1]} != ${expectedPurpose}`);
     }
-    if (helperForPurpose(parsed[1]) !== entry.helper) {
-      mismatches.push(`${label}: call ${index + 1} helper ${helperForPurpose(parsed[1])} != ${entry.helper}`);
+    if (helperForPurpose(parsed[1]) !== expectedHelper) {
+      mismatches.push(`${label}: call ${index + 1} helper ${helperForPurpose(parsed[1])} != ${expectedHelper}`);
     }
     if ((scope === "global") !== (parsed[2] === "global")) {
       mismatches.push(`${label}: call ${index + 1} scope is not ${scope}`);
     }
   });
+  const helper = entry.helper === "device_sync" ? "attempt" : entry.helper;
   if (observation.status !== 429
-      || observation.code !== LIMITED_CODE[entry.helper]
+      || observation.code !== LIMITED_CODE[helper]
       || observation.retryAfter !== "60") {
     mismatches.push(
-      `${label}: limited response ${observation.status} ${observation.code} != 429 ${LIMITED_CODE[entry.helper]}`,
+      `${label}: limited response ${observation.status} ${observation.code} != 429 ${LIMITED_CODE[helper]}`,
     );
   }
   return mismatches;
@@ -314,18 +369,74 @@ async function migrate(): Promise<void> {
   await applyD1Migrations(bindings.DELETION_LEDGER, bindings.TEST_DELETION_LEDGER_MIGRATIONS);
 }
 
+const DEVICE_CONSENT = "privacy-safe-telemetry-v0.1";
+
+/** A synthetic active participant/device fixture for the unchanged auth path. */
+async function seedDeviceBearer(): Promise<{ authorization: string; participantId: string }> {
+  const db = (env as TestBindings).USAGE_MONITOR_DB;
+  const nowEpoch = Date.now();
+  const participantId = crypto.randomUUID();
+  const session = await createSessionMaterial(participantId, nowEpoch);
+  await db.prepare(
+    `INSERT INTO participants (
+      id, access_token_id, access_token_hash, recovery_token_id,
+      recovery_token_hash, state, consent_version, consented_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+  ).bind(
+    participantId,
+    crypto.randomUUID(), new Uint8Array(32),
+    crypto.randomUUID(), new Uint8Array(32),
+    DEVICE_CONSENT,
+    new Date(nowEpoch).toISOString(), new Date(nowEpoch).toISOString(),
+  ).run();
+  await sessionInsert(db, session).run();
+  const pairing = await createDevicePairing(
+    db, participantId, session.id, DEVICE_CONSENT, nowEpoch,
+  );
+  const deviceId = crypto.randomUUID();
+  const secret = crypto.getRandomValues(new Uint8Array(32));
+  const prefix = new TextEncoder().encode(`app-usagemonitor/device/v1\0${deviceId}\0`);
+  const hashInput = new Uint8Array(prefix.byteLength + secret.byteLength);
+  hashInput.set(prefix);
+  hashInput.set(secret, prefix.byteLength);
+  const credentialHash = await sha256Hex(hashInput);
+  hashInput.fill(0);
+  await claimDevicePairing(
+    db,
+    `Pairing ${pairing.pairingCode}`,
+    deviceId,
+    credentialHash,
+    nowEpoch,
+  );
+  const bearer = `Device um_device_${deviceId}.${encodeBase64Url(secret)}`;
+  secret.fill(0);
+  return { authorization: bearer, participantId };
+}
+
+function unmatchedDeviceBearer(): string {
+  const secret = crypto.getRandomValues(new Uint8Array(32));
+  const bearer = `Device um_device_${crypto.randomUUID()}.${encodeBase64Url(secret)}`;
+  secret.fill(0);
+  return bearer;
+}
+
 const HELPER_NAMES = [
   "assertAttemptAllowed",
+  "assertDeviceSyncCredentialAllowed",
   "assertPublicAggregateReadAllowed",
   "assertUploadIngressRequestAllowed",
 ] as const;
-const HELPER_CALL = /\b(?:assertAttemptAllowed|assertPublicAggregateReadAllowed|assertUploadIngressRequestAllowed)\s*\(/gu;
-const HELPER_REFERENCE = /\b(?:assertAttemptAllowed|assertPublicAggregateReadAllowed|assertUploadIngressRequestAllowed)\b/gu;
+const HELPER_CALL = /\b(?:assertAttemptAllowed|assertDeviceSyncCredentialAllowed|assertPublicAggregateReadAllowed|assertUploadIngressRequestAllowed)\s*\(/gu;
+const HELPER_REFERENCE = /\b(?:assertAttemptAllowed|assertDeviceSyncCredentialAllowed|assertPublicAggregateReadAllowed|assertUploadIngressRequestAllowed)\b/gu;
 // The reviewed argument shapes, matched at each call site (sticky).
 const CALL_SHAPES: readonly (readonly [RegExp, (match: RegExpExecArray) => string])[] = [
   [
     /assertAttemptAllowed\(\s*env\.([A-Z_]+),\s*env\.([A-Z_]+),\s*request,\s*env,\s*"([a-z_]+)",?\s*\)/uy,
     (match) => `attempt ${match[3]} ${match[1]} ${match[2]}`,
+  ],
+  [
+    /assertDeviceSyncCredentialAllowed\(\s*env\.([A-Z_]+),\s*env\.([A-Z_]+),\s*request,\s*env,?\s*\)/uy,
+    (match) => `device_sync device_sync_credential ${match[1]} ${match[2]}`,
   ],
   [
     /assertUploadIngressRequestAllowed\(\s*env\.([A-Z_]+),\s*env\.([A-Z_]+),\s*request,\s*env,?\s*\)/uy,
@@ -336,9 +447,10 @@ const CALL_SHAPES: readonly (readonly [RegExp, (match: RegExpExecArray) => strin
     (match) => `public_read public_aggregate_read null ${match[1]}`,
   ],
 ];
-// Thirteen today: eleven attempt calls (deviceSyncPrincipal counted once for
-// its twelve routes), one upload ingress call and one public read call.
-const EXPECTED_CALL_SITES = 13;
+// Fourteen today: eleven attempt calls (deviceSyncPrincipal counted once for
+// its twelve routes), one device credential call, one upload ingress call and
+// one public read call.
+const EXPECTED_CALL_SITES = 14;
 // Ten today: the handlers that reach assertAttemptAllowed through
 // deviceSyncPrincipal (the two domain handlers serve two route ids each).
 const EXPECTED_WRAPPER_CALL_SITES = 10;
@@ -349,11 +461,95 @@ const ROUTE_API_DECLARATION = /^async function routeApi\(/mu;
 const ROUTE_API_CASE = /\bcase\s/gu;
 const ROUTE_API_DISPATCH = /\bcase\s+"([a-z0-9_]+)":\s*return\s+([A-Za-z_$][\w$]*)\(/gu;
 
-function signature(entry: EdgeAdmissionPolicyEntry): string {
-  return `${entry.helper} ${entry.purpose} ${entry.coarseBinding ?? "null"} ${entry.clientBinding}`;
+function policySignatures(entry: EdgeAdmissionPolicyEntry): string[] {
+  if (entry.helper === "device_sync") {
+    return [
+      `attempt ${entry.attempt.purpose} ${entry.attempt.coarseBinding} ${entry.attempt.clientBinding}`,
+      `device_sync ${entry.credential.purpose} ${entry.credential.clientBinding} ${entry.credential.coarseBinding}`,
+    ].sort();
+  }
+  return [`${entry.helper} ${entry.purpose} ${entry.coarseBinding ?? "null"} ${entry.clientBinding}`];
 }
 
 const DEVICE_SYNC_SIGNATURE = "attempt device_sync RECOVERY_RATE_LIMIT CLIENT_ATTEMPT_RATE_LIMIT";
+const DEVICE_SYNC_CREDENTIAL_SIGNATURE = "device_sync device_sync_credential DEVICE_SYNC_CLIENT_RATE_LIMIT DEVICE_SYNC_RATE_LIMIT";
+
+// Every admission.ts import is classified. Identity-keyed limits and binding
+// guards remain origin-tier; only the four address-keyed helpers feed the
+// edge policy/route graph.
+const ADMISSION_IMPORT_CLASSES: Readonly<Record<string, "edge" | "origin" | "guard" | "utility">> = {
+  assertAdmissionBindings: "guard",
+  assertAttemptAllowed: "edge",
+  assertDeviceSyncBindings: "guard",
+  assertDeviceSyncCredentialAllowed: "edge",
+  assertDeviceSyncPrincipalAllowed: "origin",
+  assertPublicAggregateReadAllowed: "edge",
+  assertUploadAuthorizationBindings: "guard",
+  assertUploadAuthorizationAllowed: "origin",
+  assertUploadIngressRateLimitBindings: "guard",
+  assertUploadIngressRequestAllowed: "edge",
+  configuredEnrollmentMode: "utility",
+  parseInviteGrant: "utility",
+};
+const ADMISSION_CALL_COUNTS: Readonly<Record<string, number>> = {
+  assertAdmissionBindings: 14,
+  assertAttemptAllowed: 11,
+  assertDeviceSyncBindings: 3,
+  assertDeviceSyncCredentialAllowed: 1,
+  assertDeviceSyncPrincipalAllowed: 1,
+  assertPublicAggregateReadAllowed: 1,
+  assertUploadAuthorizationBindings: 3,
+  assertUploadAuthorizationAllowed: 1,
+  assertUploadIngressRateLimitBindings: 3,
+  assertUploadIngressRequestAllowed: 1,
+  configuredEnrollmentMode: 3,
+  parseInviteGrant: 1,
+};
+
+function importedAdmissionNames(source: string): string[] | null {
+  const imports = [...source.matchAll(/import\s+([\s\S]*?)\s+from\s*["']([^"']+)["']/gu)]
+    .filter((candidate) => candidate[2] === "./admission");
+  if (imports.length !== 1) return null;
+  const importedBlock = imports[0]?.[1]?.trim();
+  if (typeof importedBlock !== "string"
+      || !importedBlock.startsWith("{")
+      || !importedBlock.endsWith("}")) return null;
+  return importedBlock.slice(1, -1).split(",").map((part) => part.trim().split(/\s+as\s+/u)[0] ?? "")
+    .filter(Boolean).sort();
+}
+
+function unclassifiedAdmissionImports(source: string): string[] {
+  const imported = importedAdmissionNames(source);
+  if (imported === null) return ["admission.ts imports must stay one named import block"];
+  const violations: string[] = [];
+  const codeOnly = source.replace(/\/\*[\s\S]*?\*\/|(^|\s)\/\/.*$/gmu, "$1");
+  const exported = new Set([...admissionSource.matchAll(/\bexport\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/gu)]
+    .map((match) => match[1] as string));
+  for (const name of imported) {
+    if (!exported.has(name)) violations.push(`imported name ${name} is not an exported admission helper`);
+    if (!Object.hasOwn(ADMISSION_IMPORT_CLASSES, name)) {
+      violations.push(`unclassified admission.ts import ${name}`);
+      continue;
+    }
+    const calls = [...codeOnly.matchAll(new RegExp(String.raw`\b${escapeRegExp(name)}\s*\(`, "gu"))].length;
+    if (calls !== ADMISSION_CALL_COUNTS[name]) {
+      violations.push(`admission helper ${name} has ${calls} call sites; expected ${ADMISSION_CALL_COUNTS[name]}`);
+    }
+  }
+  for (const name of exported) {
+    const calls = [...codeOnly.matchAll(new RegExp(String.raw`\b${escapeRegExp(name)}\s*\(`, "gu"))].length;
+    if (calls > 0 && !imported.includes(name)) {
+      violations.push(`unclassified admission.ts helper call ${name}`);
+    }
+  }
+  for (const name of Object.keys(ADMISSION_IMPORT_CLASSES)) {
+    if (imported.includes(name) && ADMISSION_IMPORT_CLASSES[name] === "edge"
+        && !HELPER_NAMES.includes(name as (typeof HELPER_NAMES)[number])) {
+      violations.push(`edge admission helper ${name} is missing from the edge ratchet`);
+    }
+  }
+  return violations;
+}
 
 /** Inserts `text` after the first `anchor` that follows `declaration`. */
 function insertAfter(source: string, declaration: string, anchor: string, text: string): string {
@@ -486,11 +682,13 @@ function admissionGraph(source: string): AdmissionGraph {
 /** Violations of the index.ts call-site ratchet for a (possibly doctored) source. */
 function ratchetViolations(source: string): string[] {
   const calls = [...source.matchAll(HELPER_CALL)].length;
-  const references = [...source.matchAll(HELPER_REFERENCE)].length;
+  const withoutComments = source.replace(/\/\*[\s\S]*?\*\/|(^|\s)\/\/.*$/gmu, "$1");
+  const references = [...withoutComments.matchAll(HELPER_REFERENCE)].length;
   const siteSignatures = [...source.matchAll(HELPER_CALL)]
     .map((match) => callSignature(source, match.index));
   const signatures = siteSignatures.filter((value): value is string => value !== null);
   const violations: string[] = [];
+  violations.push(...unclassifiedAdmissionImports(source));
   if (calls !== EXPECTED_CALL_SITES) {
     violations.push(`expected ${EXPECTED_CALL_SITES} address-keyed helper call sites, found ${calls}`);
   }
@@ -503,7 +701,7 @@ function ratchetViolations(source: string): string[] {
     violations.push(`${calls - signatures.length} call sites use an unreviewed argument shape`);
   }
   const fromSource = [...new Set(signatures)].sort();
-  const fromPolicy = [...new Set(Object.values(EDGE_ADMISSION_POLICY).map(signature))].sort();
+  const fromPolicy = [...new Set(Object.values(EDGE_ADMISSION_POLICY).flatMap(policySignatures))].sort();
   if (fromSource.join("\n") !== fromPolicy.join("\n")) {
     violations.push(`call-site signatures ${fromSource.join("; ")} != policy ${fromPolicy.join("; ")}`);
   }
@@ -531,8 +729,8 @@ function ratchetViolations(source: string): string[] {
   }
   for (const [routeId, reached] of graph.routeSignatures) {
     const entry = lookup(EDGE_ADMISSION_POLICY, routeId);
-    if (entry !== null && reached.join("; ") !== signature(entry)) {
-      violations.push(`${routeId} reaches ${reached.join("; ")} != policy ${signature(entry)}`);
+    if (entry !== null && reached.join("\n") !== policySignatures(entry).join("\n")) {
+      violations.push(`${routeId} reaches ${reached.join("; ")} != policy ${policySignatures(entry).join("; ")}`);
     }
   }
   return violations;
@@ -555,11 +753,13 @@ afterEach(() => {
 });
 
 describe("edge admission policy shape", () => {
-  it("names exactly the six address-keyed Rate Limiting bindings", () => {
+  it("names exactly the eight address-keyed Rate Limiting bindings", () => {
     expect(EDGE_ADMISSION_BINDINGS).toEqual([
       "ENROLLMENT_RATE_LIMIT",
       "RECOVERY_RATE_LIMIT",
       "CLIENT_ATTEMPT_RATE_LIMIT",
+      "DEVICE_SYNC_CLIENT_RATE_LIMIT",
+      "DEVICE_SYNC_RATE_LIMIT",
       "PUBLIC_READ_RATE_LIMIT",
       "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
       "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
@@ -579,12 +779,25 @@ describe("edge admission policy shape", () => {
     for (const [routeId, entry] of Object.entries(EDGE_ADMISSION_POLICY)) {
       expect(registryIds.has(routeId), routeId).toBe(true);
       expect(Object.isFrozen(entry), routeId).toBe(true);
-      expect(Object.keys(entry).sort(), routeId)
-        .toEqual(["clientBinding", "coarseBinding", "helper", "purpose"]);
-      if (entry.coarseBinding !== null) used.add(entry.coarseBinding);
-      used.add(entry.clientBinding);
-      if (entry.helper === "attempt") {
-        expect(entry.clientBinding, routeId).toBe("CLIENT_ATTEMPT_RATE_LIMIT");
+      if (entry.helper === "device_sync") {
+        expect(Object.keys(entry).sort(), routeId).toEqual([
+          "attempt", "credential", "deferredAttemptOnAuthFailure", "helper",
+        ]);
+        expect(Object.isFrozen(entry.attempt), `${routeId} attempt`).toBe(true);
+        expect(Object.isFrozen(entry.credential), `${routeId} credential`).toBe(true);
+        expect(entry.deferredAttemptOnAuthFailure).toBe(true);
+        used.add(entry.attempt.coarseBinding);
+        used.add(entry.attempt.clientBinding);
+        used.add(entry.credential.clientBinding);
+        used.add(entry.credential.coarseBinding);
+      } else {
+        expect(Object.keys(entry).sort(), routeId)
+          .toEqual(["clientBinding", "coarseBinding", "helper", "purpose"]);
+        if (entry.coarseBinding !== null) used.add(entry.coarseBinding);
+        used.add(entry.clientBinding);
+        if (entry.helper === "attempt") {
+          expect(entry.clientBinding, routeId).toBe("CLIENT_ATTEMPT_RATE_LIMIT");
+        }
       }
     }
     expect([...used].sort()).toEqual([...EDGE_ADMISSION_BINDINGS].sort());
@@ -595,7 +808,9 @@ describe("edge admission policy shape", () => {
   it("pins the reviewed route contract that the origin replay and parity gates consume", () => {
     const byPurpose: Record<string, string[]> = {};
     for (const [routeId, entry] of Object.entries(EDGE_ADMISSION_POLICY)) {
-      const group = `${entry.helper}/${entry.purpose}/${entry.coarseBinding}/${entry.clientBinding}`;
+      const group = entry.helper === "device_sync"
+        ? "device_sync/attempt=device_sync/RECOVERY_RATE_LIMIT/CLIENT_ATTEMPT_RATE_LIMIT/credential=device_sync_credential/DEVICE_SYNC_CLIENT_RATE_LIMIT/DEVICE_SYNC_RATE_LIMIT"
+        : `${entry.helper}/${entry.purpose}/${entry.coarseBinding}/${entry.clientBinding}`;
       (byPurpose[group] ??= []).push(routeId);
     }
     for (const routes of Object.values(byPurpose)) routes.sort();
@@ -615,7 +830,7 @@ describe("edge admission policy shape", () => {
         ["device_disconnect"],
       "attempt/device_credential_renew/RECOVERY_RATE_LIMIT/CLIENT_ATTEMPT_RATE_LIMIT":
         ["device_credential_renew"],
-      "attempt/device_sync/RECOVERY_RATE_LIMIT/CLIENT_ATTEMPT_RATE_LIMIT": [
+      "device_sync/attempt=device_sync/RECOVERY_RATE_LIMIT/CLIENT_ATTEMPT_RATE_LIMIT/credential=device_sync_credential/DEVICE_SYNC_CLIENT_RATE_LIMIT/DEVICE_SYNC_RATE_LIMIT": [
         "device_sync_capabilities",
         "device_sync_capabilities_v12",
         "device_sync_manifest",
@@ -639,6 +854,187 @@ describe("edge admission policy shape", () => {
 
 describe("edge admission derivation probe through handleRequest", () => {
   beforeEach(migrate);
+
+  it("derives all three device-sync bearer paths for every route and allowed method", async () => {
+    const bearer = await seedDeviceBearer();
+    const unmatched = unmatchedDeviceBearer();
+    const routes = WORKER_ROUTE_POLICY.filter((definition) =>
+      lookup(EDGE_ADMISSION_POLICY, definition.id)?.helper === "device_sync");
+    expect(routes).toHaveLength(12);
+    for (const definition of routes) {
+      const entry = lookup(EDGE_ADMISSION_POLICY, definition.id)!;
+      if (entry.helper !== "device_sync") throw new Error("device-sync route policy changed");
+      for (const method of probeMethods(definition)) {
+        for (const headers of [
+          { authorization: null },
+          { authorization: "Device malformed" },
+        ]) {
+          const attempt = await observeRoute(EDGE_ADMISSION_POLICY, definition, method, "admit-all", headers);
+          expect(attempt.calls, `${method} ${definition.id} no/malformed bearer`)
+            .toEqual(await expectedKeys(entry));
+          expect(attempt.code, `${method} ${definition.id} no/malformed bearer`)
+            .toBe("DEVICE_AUTH_INVALID");
+        }
+
+        const seeded = await observeRoute(
+          EDGE_ADMISSION_POLICY,
+          definition,
+          method,
+          "admit-all",
+          { authorization: bearer.authorization },
+        );
+        expect(seeded.calls, `${method} ${definition.id} seeded bearer`).toEqual([
+          ...await expectedCredentialKeys(),
+          {
+            binding: "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT",
+            key: await expectedPrincipalKey(bearer.participantId),
+          },
+        ]);
+        expect(seeded.status, `${method} ${definition.id} seeded bearer`).not.toBe(429);
+
+        const unknown = await observeRoute(
+          EDGE_ADMISSION_POLICY,
+          definition,
+          method,
+          "admit-all",
+          { authorization: unmatched },
+        );
+        expect(unknown.calls, `${method} ${definition.id} unmatched bearer`).toEqual([
+          ...await expectedCredentialKeys(),
+          ...await expectedKeys(entry),
+        ]);
+        expect(unknown.code, `${method} ${definition.id} unmatched bearer`).toBe("DEVICE_AUTH_INVALID");
+
+        const cookieBearer = await observeRoute(
+          EDGE_ADMISSION_POLICY,
+          definition,
+          method,
+          "admit-all",
+          { authorization: bearer.authorization, cookie: "synthetic=session" },
+        );
+        expect(cookieBearer.calls, `${method} ${definition.id} cookie+bearer`)
+          .toEqual(await expectedKeys(entry));
+        expect(cookieBearer.code, `${method} ${definition.id} cookie+bearer`).toBe("DEVICE_AUTH_INVALID");
+      }
+    }
+  });
+
+  it("evaluates credential and deferred attempt pairs with the Worker helpers", async () => {
+    const definition = registryDefinition("device_sync_state");
+    const policyEntry = EDGE_ADMISSION_POLICY.device_sync_state;
+    if (policyEntry === undefined) throw new Error("device-sync policy entry missing");
+    const variants: { headers: Record<string, string | null>; purpose: string; keys: LimiterCall[] }[] = [
+      { headers: { authorization: null }, purpose: "device_sync", keys: await expectedKeys(policyEntry) },
+      { headers: { authorization: "Device malformed" }, purpose: "device_sync", keys: await expectedKeys(policyEntry) },
+      { headers: { authorization: unmatchedDeviceBearer() }, purpose: "device_sync_credential", keys: await expectedCredentialKeys() },
+      { headers: { authorization: unmatchedDeviceBearer(), cookie: "synthetic=session" }, purpose: "device_sync", keys: await expectedKeys(policyEntry) },
+    ];
+    for (const variant of variants) {
+      const edge = recordingLimiters();
+      const evaluation = await evaluateEdgeAdmission({
+        routeId: definition.id,
+        request: probeRequest(definition.pathname, "GET", variant.headers),
+        limiters: edge.limiters,
+        clientKeySecret: EDGE_SECRET,
+      });
+      expect(evaluation).toEqual({ purpose: variant.purpose, outcome: "allowed" });
+      expect(edge.calls).toEqual(variant.keys);
+    }
+
+    for (const [answer, outcome] of [
+      [() => true, "allowed"],
+      [(_call: LimiterCall, callNumber: number) => callNumber !== 1, "limited"],
+      [() => "throw" as const, "unavailable"],
+    ] as const) {
+      const recorded = recordingLimiters(answer);
+      const evaluation = await evaluateDeferredDeviceSyncAttempt({
+        request: probeRequest(definition.pathname, "GET", { authorization: unmatchedDeviceBearer() }),
+        limiters: recorded.limiters,
+        clientKeySecret: EDGE_SECRET,
+      });
+      expect(evaluation).toEqual({ purpose: "device_sync", outcome });
+      expect(recorded.calls.map(({ binding }) => binding)).toEqual(
+        outcome === "limited" || outcome === "unavailable"
+          ? ["RECOVERY_RATE_LIMIT"]
+          : ["RECOVERY_RATE_LIMIT", "CLIENT_ATTEMPT_RATE_LIMIT"],
+      );
+    }
+  });
+
+  it("honors the production device-sync budgets for long passes and shared locations", async () => {
+    const fixedLimiters = (): Record<string, RateLimit> => {
+      const counts = new Map<string, number>();
+      const limits: Record<string, number> = {
+        DEVICE_SYNC_CLIENT_RATE_LIMIT: 4_200,
+        DEVICE_SYNC_RATE_LIMIT: 6_000,
+        RECOVERY_RATE_LIMIT: 20,
+        CLIENT_ATTEMPT_RATE_LIMIT: 5,
+      };
+      return Object.fromEntries(EDGE_ADMISSION_BINDINGS.map((binding) => [binding, {
+        async limit({ key }: RateLimitOptions): Promise<RateLimitOutcome> {
+          const countKey = `${binding}\0${key}`;
+          const next = (counts.get(countKey) ?? 0) + 1;
+          counts.set(countKey, next);
+          return { success: next <= (limits[binding] ?? 100_000) };
+        },
+      }]));
+    };
+    const definition = registryDefinition("device_sync_state");
+    const bearer = unmatchedDeviceBearer();
+    const requestFor = (address: string) => probeRequest(
+      definition.pathname,
+      "GET",
+      { authorization: bearer, "cf-connecting-ip": address },
+    );
+    const passLimiters = fixedLimiters();
+    for (let index = 0; index < 46; index += 1) {
+      const result = await evaluateEdgeAdmission({
+        routeId: definition.id,
+        request: requestFor(CLIENT_ADDRESS),
+        limiters: passLimiters,
+        clientKeySecret: EDGE_SECRET,
+      });
+      expect(result, `40-day pass request ${index + 1}`).toEqual({
+        purpose: "device_sync_credential",
+        outcome: "allowed",
+      });
+    }
+
+    const addressLimiters = fixedLimiters();
+    let lastForAddress: EdgePolicyOutcome | null = null;
+    for (let index = 0; index < 4_201; index += 1) {
+      const result = await evaluateEdgeAdmission({
+        routeId: definition.id,
+        request: requestFor(CLIENT_ADDRESS),
+        limiters: addressLimiters,
+        clientKeySecret: EDGE_SECRET,
+      });
+      lastForAddress = result?.outcome ?? null;
+    }
+    expect(lastForAddress).toBe("limited");
+    expect(await evaluateEdgeAdmission({
+      routeId: definition.id,
+      request: requestFor("198.51.100.8"),
+      limiters: addressLimiters,
+      clientKeySecret: EDGE_SECRET,
+    })).toEqual({ purpose: "device_sync_credential", outcome: "allowed" });
+
+    const sharedLocationLimiters = fixedLimiters();
+    for (let installation = 0; installation < 5; installation += 1) {
+      for (let request = 0; request < 9; request += 1) {
+        const result = await evaluateEdgeAdmission({
+          routeId: definition.id,
+          request: requestFor(`198.51.100.${installation + 1}`),
+          limiters: sharedLocationLimiters,
+          clientKeySecret: EDGE_SECRET,
+        });
+        expect(result, `install ${installation + 1} request ${request + 1}`).toEqual({
+          purpose: "device_sync_credential",
+          outcome: "allowed",
+        });
+      }
+    }
+  });
 
   it("matches the policy for every registry route and every allowed method", async () => {
     const mismatches: string[] = [];
@@ -675,7 +1071,7 @@ describe("edge admission derivation probe through handleRequest", () => {
           clientKeySecret: EDGE_SECRET,
         });
         expect(evaluation, `${method} ${definition.id}`)
-          .toEqual({ purpose: entry.purpose, outcome: "allowed" });
+          .toEqual({ purpose: edgePurpose(entry), outcome: "allowed" });
         expect(edge.calls, `${method} ${definition.id}`).toEqual(observation.calls);
       }
     }
@@ -687,7 +1083,6 @@ describe("edge admission derivation probe through handleRequest", () => {
   it("fails on a wrong client binding for an upload ingress entry and an attempt entry", async () => {
     for (const [routeId, clientBinding] of [
       ["contributions", "CLIENT_ATTEMPT_RATE_LIMIT"],
-      ["device_sync_state", "PUBLIC_READ_RATE_LIMIT"],
       ["enroll", "UPLOAD_INGRESS_CLIENT_RATE_LIMIT"],
     ] as const) {
       const doctored = doctor(routeId, { clientBinding });
@@ -697,6 +1092,20 @@ describe("edge admission derivation probe through handleRequest", () => {
       expect(probeMismatches(doctored, observation).join("\n"), routeId)
         .toContain("bindings");
     }
+    const doctoredDevice = doctor("device_sync_state", {
+      attempt: {
+        purpose: "device_sync",
+        coarseBinding: "RECOVERY_RATE_LIMIT",
+        clientBinding: "PUBLIC_READ_RATE_LIMIT",
+      },
+    });
+    const deviceDefinition = registryDefinition("device_sync_state");
+    const deviceObservation = await observeRoute(
+      doctoredDevice,
+      deviceDefinition,
+      deviceDefinition.methods[0] as string,
+    );
+    expect(probeMismatches(doctoredDevice, deviceObservation).join("\n")).toContain("bindings");
   });
 
   it("fails on a wrong purpose, helper, coarse binding, extra entry or missing entry", async () => {
@@ -744,7 +1153,25 @@ async function doctoredExtraAdmission(request: Request, env: Env): Promise<void>
 }
 `;
     expect(ratchetViolations(doctored).join("\n"))
-      .toContain(`expected ${EXPECTED_CALL_SITES} address-keyed helper call sites, found 14`);
+      .toContain(`expected ${EXPECTED_CALL_SITES} address-keyed helper call sites, found 15`);
+  });
+
+  it("fails closed when index.ts imports an unclassified admission helper", () => {
+    const doctored = indexSource.replace(
+      "  parseInviteGrant,\n} from \"./admission\";",
+      "  parseInviteGrant,\n  unreviewedAdmissionHelper,\n} from \"./admission\";",
+    );
+    expect(doctored).not.toBe(indexSource);
+    expect(ratchetViolations(doctored).join("\n"))
+      .toContain("unclassified admission.ts import unreviewedAdmissionHelper");
+  });
+
+  it("fails closed when index.ts calls an admission helper without importing and classifying it", () => {
+    const doctored = `${indexSource}\nfunction doctoredAdmissionHelperUse(env: Env): boolean {
+  return isDevelopmentEnvironment(env);
+}\n`;
+    expect(ratchetViolations(doctored).join("\n"))
+      .toContain("unclassified admission.ts helper call isDevelopmentEnvironment");
   });
 
   it("fails on a doctored copy that changes a call-site purpose or binding", () => {
@@ -771,7 +1198,7 @@ async function doctoredExtraAdmission(request: Request, env: Env): Promise<void>
     expect(graph.violations).toEqual([]);
     expect(graph.wrapperCallSites).toBe(EXPECTED_WRAPPER_CALL_SITES);
     expect(Object.fromEntries(graph.routeSignatures)).toEqual(Object.fromEntries(
-      Object.entries(EDGE_ADMISSION_POLICY).map(([routeId, entry]) => [routeId, [signature(entry)]]),
+      Object.entries(EDGE_ADMISSION_POLICY).map(([routeId, entry]) => [routeId, policySignatures(entry)]),
     ));
   });
 
@@ -783,7 +1210,8 @@ async function doctoredExtraAdmission(request: Request, env: Env): Promise<void>
       '  await deviceSyncPrincipal(request, env, "POST");\n',
     );
     expect(admissionGraph(doctored).routeSignatures.get("contributions"))
-      .toEqual([DEVICE_SYNC_SIGNATURE, signature(EDGE_ADMISSION_POLICY.contributions!)].sort());
+      .toEqual([DEVICE_SYNC_SIGNATURE, DEVICE_SYNC_CREDENTIAL_SIGNATURE,
+        ...policySignatures(EDGE_ADMISSION_POLICY.contributions!)].sort());
     const violations = ratchetViolations(doctored).join("\n");
     expect(violations).toContain("contributions reaches");
     expect(violations).toContain(
@@ -799,7 +1227,7 @@ async function doctoredExtraAdmission(request: Request, env: Env): Promise<void>
       '  await deviceSyncPrincipal(request, env, "POST");\n',
     );
     expect(admissionGraph(doctored).routeSignatures.get("telemetry_v11_consent"))
-      .toEqual([DEVICE_SYNC_SIGNATURE]);
+      .toEqual([DEVICE_SYNC_SIGNATURE, DEVICE_SYNC_CREDENTIAL_SIGNATURE].sort());
     expect(ratchetViolations(doctored).join("\n"))
       .toContain("routes reaching an address-keyed helper outside the policy: telemetry_v11_consent");
   });
@@ -857,7 +1285,7 @@ describe("evaluateEdgeAdmission", () => {
     routeId: string,
     answer?: (call: LimiterCall, callNumber: number) => LimiterAnswer,
     options: {
-      headers?: Record<string, string>;
+      headers?: Record<string, string | null>;
       limiters?: (limiters: Record<string, RateLimit>) => Record<string, unknown>;
       clientKeySecret?: unknown;
     } = {},
@@ -882,7 +1310,7 @@ describe("evaluateEdgeAdmission", () => {
     for (const routeId of ["enroll", "device_sync_state", "contributions", "community_daily"]) {
       const entry = edgeAdmissionPolicyFor(routeId)!;
       const { result, calls } = await evaluate(routeId);
-      expect(result, routeId).toEqual({ purpose: entry.purpose, outcome: "allowed" });
+      expect(result, routeId).toEqual({ purpose: edgePurpose(entry), outcome: "allowed" });
       expect(Object.isFrozen(result), routeId).toBe(true);
       expect(calls, routeId).toEqual(await expectedKeys(entry));
     }
@@ -891,11 +1319,12 @@ describe("evaluateEdgeAdmission", () => {
   it("reports a coarse limit without ever calling the client limiter", async () => {
     for (const routeId of ["enroll", "accountless_renewal", "contributions"]) {
       const entry = edgeAdmissionPolicyFor(routeId)!;
+      if (entry.helper === "device_sync") throw new Error("expected simple attempt policy entry");
       const { result, calls } = await evaluate(
         routeId,
         (call) => call.binding !== entry.coarseBinding,
       );
-      expect(result, routeId).toEqual({ purpose: entry.purpose, outcome: "limited" });
+      expect(result, routeId).toEqual({ purpose: edgePurpose(entry), outcome: "limited" });
       expect(calls.map((call) => call.binding), routeId).toEqual([entry.coarseBinding]);
       expect(calls.filter((call) => call.binding === entry.clientBinding), routeId).toEqual([]);
     }
@@ -904,11 +1333,12 @@ describe("evaluateEdgeAdmission", () => {
   it("reports a client limit after the coarse limiter admits", async () => {
     for (const routeId of ["identity_apple_start", "device_credential_renew", "contributions", "community_daily"]) {
       const entry = edgeAdmissionPolicyFor(routeId)!;
+      const clientBinding = entry.helper === "device_sync" ? entry.attempt.clientBinding : entry.clientBinding;
       const { result, calls } = await evaluate(
         routeId,
-        (call) => call.binding !== entry.clientBinding,
+        (call) => call.binding !== clientBinding,
       );
-      expect(result, routeId).toEqual({ purpose: entry.purpose, outcome: "limited" });
+      expect(result, routeId).toEqual({ purpose: edgePurpose(entry), outcome: "limited" });
       expect(calls, routeId).toEqual(await expectedKeys(entry));
     }
   });
@@ -916,28 +1346,29 @@ describe("evaluateEdgeAdmission", () => {
   it("reports unavailable for a throwing limiter, a missing binding or an unusable secret", async () => {
     for (const routeId of ["enroll", "telemetry_v12_day_manifests", "contributions", "community_daily"]) {
       const entry = edgeAdmissionPolicyFor(routeId)!;
+      const clientBinding = entry.helper === "device_sync" ? entry.attempt.clientBinding : entry.clientBinding;
       const coarseThrows = await evaluate(routeId, (_call, callNumber) =>
         callNumber === 1 ? "throw" : true);
-      expect(coarseThrows.result, routeId).toEqual({ purpose: entry.purpose, outcome: "unavailable" });
+      expect(coarseThrows.result, routeId).toEqual({ purpose: edgePurpose(entry), outcome: "unavailable" });
       expect(coarseThrows.calls, routeId).toHaveLength(1);
 
       const clientThrows = await evaluate(routeId, (call) =>
-        call.binding === entry.clientBinding ? "throw" : true);
-      expect(clientThrows.result, routeId).toEqual({ purpose: entry.purpose, outcome: "unavailable" });
+        call.binding === clientBinding ? "throw" : true);
+      expect(clientThrows.result, routeId).toEqual({ purpose: edgePurpose(entry), outcome: "unavailable" });
 
       const missing = await evaluate(routeId, undefined, {
         limiters: (limiters) => {
           const copy: Record<string, unknown> = { ...limiters };
-          delete copy[entry.clientBinding];
+          delete copy[clientBinding];
           return copy;
         },
       });
-      expect(missing.result, routeId).toEqual({ purpose: entry.purpose, outcome: "unavailable" });
+      expect(missing.result, routeId).toEqual({ purpose: edgePurpose(entry), outcome: "unavailable" });
       expect(missing.calls, routeId).toEqual([]);
 
       for (const clientKeySecret of ["too-short-edge-secret", "", 42]) {
         const unusable = await evaluate(routeId, undefined, { clientKeySecret });
-        expect(unusable.result, routeId).toEqual({ purpose: entry.purpose, outcome: "unavailable" });
+        expect(unusable.result, routeId).toEqual({ purpose: edgePurpose(entry), outcome: "unavailable" });
         expect(unusable.calls, routeId).toEqual([]);
       }
     }
@@ -946,10 +1377,13 @@ describe("evaluateEdgeAdmission", () => {
   it("keys a missing or malformed CF-Connecting-IP as the 'unavailable' subject", async () => {
     for (const routeId of ["device_disconnect", "contributions", "community_daily"]) {
       const entry = edgeAdmissionPolicyFor(routeId)!;
-      const variants: Record<string, string>[] = [{}, { "cf-connecting-ip": "not an address" }];
+      const variants: Record<string, string | null>[] = [
+        { "cf-connecting-ip": null },
+        { "cf-connecting-ip": "not an address" },
+      ];
       for (const headers of variants) {
         const { result, calls } = await evaluate(routeId, undefined, { headers });
-        expect(result, routeId).toEqual({ purpose: entry.purpose, outcome: "allowed" });
+        expect(result, routeId).toEqual({ purpose: edgePurpose(entry), outcome: "allowed" });
         expect(calls, routeId).toEqual(await expectedKeys(entry, "unavailable"));
       }
     }
@@ -964,7 +1398,7 @@ describe("evaluateEdgeAdmission", () => {
         IDENTITY_LINK_SECRET: "a-worker-identity-secret-that-is-long-enough",
       }),
     });
-    expect(result).toEqual({ purpose: entry.purpose, outcome: "allowed" });
+    expect(result).toEqual({ purpose: edgePurpose(entry), outcome: "allowed" });
     expect(calls).toEqual(await expectedKeys(entry));
   });
 

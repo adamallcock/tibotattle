@@ -6,7 +6,7 @@
  * bindings, then sends only the outcome ('v1;<purpose>;allowed|limited|
  * unavailable', src/edge-origin-contract.ts) to the origin. The origin runs
  * the same unchanged helpers at the same point in each route (FC-7), against
- * the six replay bindings created here instead of real limiters, so the
+ * the eight replay bindings created here instead of real limiters, so the
  * Worker's ordering, status codes, envelopes and retry-after headers are kept
  * without the origin ever seeing a client address.
  *
@@ -36,11 +36,13 @@ import {
   EDGE_ADMISSION_PURPOSES,
 } from "../src/edge-origin-contract.ts";
 
-/** The six edge-tier binding names (EP-1 EDGE_ADMISSION_BINDINGS). */
+/** The eight edge-tier binding names (EP-1 EDGE_ADMISSION_BINDINGS). */
 export const EDGE_ADMISSION_REPLAY_BINDINGS = Object.freeze([
   "ENROLLMENT_RATE_LIMIT",
   "RECOVERY_RATE_LIMIT",
   "CLIENT_ATTEMPT_RATE_LIMIT",
+  "DEVICE_SYNC_CLIENT_RATE_LIMIT",
+  "DEVICE_SYNC_RATE_LIMIT",
   "PUBLIC_READ_RATE_LIMIT",
   "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
   "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
@@ -48,9 +50,12 @@ export const EDGE_ADMISSION_REPLAY_BINDINGS = Object.freeze([
 
 const PUBLIC_READ_PURPOSE = "public_aggregate_read";
 const UPLOAD_INGRESS_PURPOSE = "upload_ingress";
+const DEVICE_SYNC_CREDENTIAL_PURPOSE = "device_sync_credential";
 /** The src/admission.ts AttemptPurpose values: every other contract purpose. */
 const ATTEMPT_PURPOSES = Object.freeze(EDGE_ADMISSION_PURPOSES.filter(
-  (purpose) => purpose !== PUBLIC_READ_PURPOSE && purpose !== UPLOAD_INGRESS_PURPOSE,
+  (purpose) => purpose !== PUBLIC_READ_PURPOSE
+    && purpose !== UPLOAD_INGRESS_PURPOSE
+    && purpose !== DEVICE_SYNC_CREDENTIAL_PURPOSE,
 ));
 
 /**
@@ -63,6 +68,14 @@ const BINDING_RULES = Object.freeze({
   ENROLLMENT_RATE_LIMIT: Object.freeze({ stage: "coarse", purposes: ATTEMPT_PURPOSES }),
   RECOVERY_RATE_LIMIT: Object.freeze({ stage: "coarse", purposes: ATTEMPT_PURPOSES }),
   CLIENT_ATTEMPT_RATE_LIMIT: Object.freeze({ stage: "client", purposes: ATTEMPT_PURPOSES }),
+  DEVICE_SYNC_CLIENT_RATE_LIMIT: Object.freeze({
+    stage: "client",
+    purposes: Object.freeze([DEVICE_SYNC_CREDENTIAL_PURPOSE]),
+  }),
+  DEVICE_SYNC_RATE_LIMIT: Object.freeze({
+    stage: "coarse",
+    purposes: Object.freeze([DEVICE_SYNC_CREDENTIAL_PURPOSE]),
+  }),
   PUBLIC_READ_RATE_LIMIT: Object.freeze({
     stage: "client",
     purposes: Object.freeze([PUBLIC_READ_PURPOSE]),
@@ -77,6 +90,8 @@ const BINDING_RULES = Object.freeze({
   }),
 });
 
+const DEVICE_SYNC_CREDENTIAL_KEY_PATTERN =
+  /^usage-monitor:device_sync:credential:(global|client:[0-9a-f]{64})$/u;
 const REPLAY_KEY_PATTERN = /^usage-monitor:([a-z_]+):(global|client:[0-9a-f]{64})$/u;
 const MAX_REPLAY_KEY_LENGTH = 256;
 
@@ -106,6 +121,13 @@ function normalizedAdmission(admission) {
 function parseReplayKey(options) {
   const key = options !== null && typeof options === "object" ? options.key : undefined;
   if (typeof key !== "string" || key.length > MAX_REPLAY_KEY_LENGTH) return null;
+  const credentialMatch = DEVICE_SYNC_CREDENTIAL_KEY_PATTERN.exec(key);
+  if (credentialMatch !== null) {
+    return {
+      purpose: DEVICE_SYNC_CREDENTIAL_PURPOSE,
+      stage: credentialMatch[1] === "global" ? "coarse" : "client",
+    };
+  }
   const match = REPLAY_KEY_PATTERN.exec(key);
   if (match === null) return null;
   return { purpose: match[1], stage: match[2] === "global" ? "coarse" : "client" };
@@ -119,14 +141,59 @@ function parseReplayKey(options) {
 export function createEdgeAdmissionLimiters() {
   const storage = new AsyncLocalStorage();
 
+  function replayDeviceSyncCredential(store, name, parsed, rule) {
+    const { admission } = store;
+    if (admission.outcome === "unavailable") {
+      throw replayRefusal("EDGE_ADMISSION_REPLAY_UNAVAILABLE");
+    }
+    if (store.credentialCalls < 2) {
+      const expected = store.credentialCalls === 0
+        ? { name: "DEVICE_SYNC_CLIENT_RATE_LIMIT", stage: "client" }
+        : { name: "DEVICE_SYNC_RATE_LIMIT", stage: "coarse" };
+      if (name !== expected.name || parsed.stage !== expected.stage) {
+        throw replayRefusal("EDGE_ADMISSION_REPLAY_SEQUENCE_INVALID");
+      }
+      store.credentialCalls += 1;
+      if (admission.outcome === "limited") {
+        store.closed = true;
+        return { success: false };
+      }
+      // The origin authenticates only after the edge's client-then-location
+      // credential pair. Keep this run open for its optional attempt replay.
+      store.closed = false;
+      return { success: true };
+    }
+
+    const expected = store.deferredCalls === 0
+      ? { name: "RECOVERY_RATE_LIMIT", stage: "coarse" }
+      : { name: "CLIENT_ATTEMPT_RATE_LIMIT", stage: "client" };
+    if (store.deferredCalls >= 2 || name !== expected.name
+        || parsed.purpose !== "device_sync" || parsed.stage !== expected.stage
+        || !rule.purposes.includes(parsed.purpose)) {
+      throw replayRefusal("EDGE_ADMISSION_REPLAY_SEQUENCE_INVALID");
+    }
+    store.deferredCalls += 1;
+    if (store.deferredCalls === 2) {
+      store.deferredAttempt = true;
+      store.closed = true;
+    } else {
+      store.closed = false;
+    }
+    // The edge applies the actual attempt budget after this 401 response.
+    return { success: true };
+  }
+
   function admit(name, options) {
     const store = storage.getStore();
     if (store === undefined) throw replayRefusal("EDGE_ADMISSION_REPLAY_NO_CONTEXT");
     if (store.closed) throw replayRefusal("EDGE_ADMISSION_REPLAY_SEQUENCE_INVALID");
+    // Close before validating this call. Only an allowed, correctly ordered
+    // intermediate stage below reopens the run; a caught refusal cannot be
+    // used to retry a different binding inside the same request.
+    store.closed = true;
     // Any refusal, and any call after a limited outcome, closes the run: the
     // Worker helper stops at its first refusal, so a later call is a
     // divergence, never a second chance.
-    store.closed = true;
     const { admission } = store;
     if (admission === null) throw replayRefusal("EDGE_ADMISSION_REPLAY_NO_OUTCOME");
     const parsed = parseReplayKey(options);
@@ -135,9 +202,16 @@ export function createEdgeAdmissionLimiters() {
     if (parsed.stage !== rule.stage || !rule.purposes.includes(parsed.purpose)) {
       throw replayRefusal("EDGE_ADMISSION_REPLAY_BINDING_MISMATCH");
     }
-    if (parsed.purpose !== admission.purpose) {
+    const deferredAttemptPurpose = admission.purpose === DEVICE_SYNC_CREDENTIAL_PURPOSE
+      && store.credentialCalls === 2
+      && parsed.purpose === "device_sync";
+    if (parsed.purpose !== admission.purpose && !deferredAttemptPurpose) {
       throw replayRefusal("EDGE_ADMISSION_REPLAY_PURPOSE_MISMATCH");
     }
+    if (admission.purpose === DEVICE_SYNC_CREDENTIAL_PURPOSE) {
+      return replayDeviceSyncCredential(store, name, parsed, rule);
+    }
+    store.closed = true;
     // The helper sequence: coarse then client, or the client call alone for
     // the public read. An open run has made at most one (allowed coarse) call.
     const expectedStage = store.calls === 0 && hasCoarseStage(admission.purpose)
@@ -172,9 +246,31 @@ export function createEdgeAdmissionLimiters() {
    */
   function run(admission, fn) {
     if (typeof fn !== "function") throw contractError("EDGE_ADMISSION_REPLAY_FUNCTION_INVALID");
-    const store = { admission: normalizedAdmission(admission), calls: 0, closed: false };
+    const store = {
+      admission: normalizedAdmission(admission),
+      calls: 0,
+      closed: false,
+      credentialCalls: 0,
+      deferredCalls: 0,
+      deferredAttempt: false,
+    };
     return storage.run(store, fn);
   }
 
-  return Object.freeze({ bindings, run });
+  /** Run fn and report whether its failed device bearer deferred an edge charge. */
+  async function runWithReport(admission, fn) {
+    if (typeof fn !== "function") throw contractError("EDGE_ADMISSION_REPLAY_FUNCTION_INVALID");
+    const store = {
+      admission: normalizedAdmission(admission),
+      calls: 0,
+      closed: false,
+      credentialCalls: 0,
+      deferredCalls: 0,
+      deferredAttempt: false,
+    };
+    const result = await storage.run(store, fn);
+    return Object.freeze({ result, deferredAttempt: store.deferredAttempt });
+  }
+
+  return Object.freeze({ bindings, run, runWithReport });
 }
