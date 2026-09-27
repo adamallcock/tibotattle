@@ -410,8 +410,6 @@ export async function runMacCredentialQualification({ intake, execute = false })
       ? await verifyPredecessor({ ...input, architecture: 'arm64' }, installed)
       : await verifySparkleTransitionCandidate({ ...input.predecessor, target: input.target,
         architecture: 'arm64' }, installed);
-    await mkdir(codex, { mode: 0o700 }); await mkdir(join(codex, 'sessions'), { mode: 0o700 });
-    await writeFile(join(codex, 'sessions', 'rollout-credential-synthetic.jsonl'), signedStagingFixture(), { mode: 0o600, flag: 'wx' });
     const launchOptions = { networkMode: MACOS_LOOPBACK_MODE };
     stage = 'predecessor_first_run';
     active = await launchVerifiedMacSharingApp(verified, environment, {
@@ -428,7 +426,10 @@ export async function runMacCredentialQualification({ intake, execute = false })
     if (active.nativeIntroContinued !== true) fail('predecessor_first_run');
     await exerciseEmptyProfileSettings(active.settings);
     await stopOwnedMacSharingApp(active); active = null;
+    await absent(codex);
     proof.predecessorFirstRunCompleted = true;
+    await mkdir(codex, { mode: 0o700 }); await mkdir(join(codex, 'sessions'), { mode: 0o700 });
+    await writeFile(join(codex, 'sessions', 'rollout-credential-synthetic.jsonl'), signedStagingFixture(), { mode: 0o600, flag: 'wx' });
     stage = 'modern_fixture'; fixture = await fixtureSession(input, helper, 'modern', environment);
     await fixture.request('seed'); const before = validateCredentialSnapshot(await fixture.request('snapshot'), 'modern');
     proof.fixtureScopes.push({ scenario: 'modern', ...((await fixture.request('select')).scope) });
