@@ -7,7 +7,8 @@ version labels; it does not imply API stability before 1.0.
 ## Provenance and acknowledgements
 
 - A release heading links to its checked-in notes. The date is the UTC calendar
-  date on which the public GitHub Release was published.
+  date on which the public GitHub Release was published, except the explicitly
+  marked, unpublished 0.1.25 tagged candidate, whose date is its source freeze.
 - Every released entry links to the public GitHub Release, its exact source
   revision, and the comparison with the preceding release source. Stable tags
   are annotated except for the protected historical v0.1.10 anomaly recorded
@@ -35,9 +36,21 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
+**0.1.26 candidate notes:** [release-notes/0.1.26.md](./release-notes/0.1.26.md).
+
+The tagged 0.1.25 candidate remains unpublished. Its planned changes are
+carried into this successor.
+
+- Distinguish a locked Mac Keychain from an item access denial when macOS
+  returns the same authorization error for both. Keep credential reads silent
+  and leave existing items and access controls intact.
+
 ## [0.1.25](./release-notes/0.1.25.md) - 2026-09-27
 
-**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.25) ·
+**Status:** Tagged and signed candidate only. No public GitHub Release or
+stable update was published. The source and artifacts remain frozen on hold.
+
+**Provenance:** [GitHub release location (unpublished)](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.25) ·
 [annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.25) ·
 [changes since v0.1.24](https://github.com/adamallcock/tibotattle/compare/v0.1.24...v0.1.25)
 

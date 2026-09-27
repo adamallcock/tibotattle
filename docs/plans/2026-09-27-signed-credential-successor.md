@@ -37,8 +37,8 @@ artifacts and has no signed installed-app proof yet.
 
 ## Proposed release path
 
-Prepare a new 0.1.26 source and artifact set, with a separately reviewed Mac
-stable bundle allocation after 0.1.25's `1033`. This version choice and
+Prepare a new 0.1.26 source and artifact set, with proposed Mac stable bundle
+allocation `1034` after 0.1.25's `1033`. This version choice and
 allocation remain proposals until the owner responds. The local patch is
 committed; automatic approval review rejected a GitHub branch push because
 local file approval did not explicitly authorize a remote write. Remote push
