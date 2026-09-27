@@ -1095,11 +1095,26 @@ function historyFlagsSql(schema: string): string {
           ON chunk.manifest_id=manifest.id AND chunk.participant_id=generation.participant_id
          AND chunk.device_id=generation.device_id AND chunk.chunk_day=manifest.chunk_day
         JOIN ${table(schema, "telemetry_v12_typed_records")} record ON record.chunk_id=chunk.id
-        JOIN ${table(schema, "telemetry_v12_typed_active_authorizations")} auth
+        JOIN ${table(schema, "telemetry_v12_typed_retained_authorizations")} auth
           ON auth.participant_id=generation.participant_id AND auth.device_id=generation.device_id
         JOIN ${table(schema, "telemetry_v12_typed_runtime")} typed_runtime
           ON typed_runtime.id=1 AND typed_runtime.state='active'
         WHERE head.participant_id=participant.id
+          AND EXISTS (
+            SELECT 1 FROM ${table(schema, "community_public_source_owners")} public_source
+             WHERE public_source.participant_id=participant.id
+               AND ((participant.owner_kind='social' AND public_source.owner_kind='social'
+                     AND public_source.device_id IS NULL)
+                 OR (participant.owner_kind='accountless' AND public_source.owner_kind='accountless'
+                     AND public_source.device_id=generation.device_id))
+          )
+          -- 0046 exposes owner kind and device, not which UNION branch matched.
+          -- Keep its v1.1-first rule explicit for accountless typed-v1.2 candidates.
+          AND (participant.owner_kind<>'accountless' OR NOT EXISTS (
+            SELECT 1 FROM ${table(schema, "telemetry_v11_domains")} legacy_domain
+             WHERE legacy_domain.participant_id=participant.id
+               AND legacy_domain.device_id=generation.device_id
+          ))
       ) AS has_v12`;
 }
 
@@ -1117,8 +1132,9 @@ function ownerFromRow(row: OwnerListRow, sourcePin: PostgresEffectiveSourcePin):
   // D1 calls legacy v1/v1.1 effective only when its additive correction
   // authority is present. That family is not transferred into PostgreSQL yet,
   // so legacy-only sources remain readable for quota/session while effective
-  // usage and graph inputs stay unavailable. Typed v1.2 has its own complete
-  // active authorization lane.
+  // usage and graph inputs stay unavailable. Typed v1.2 uses its retained
+  // authorization and the 0046 public-source view to preserve accepted heads
+  // after ordinary opt-out.
   const hasEffective = row.has_v12;
   return Object.freeze({
     ownerDigest: pin.ownerDigest,

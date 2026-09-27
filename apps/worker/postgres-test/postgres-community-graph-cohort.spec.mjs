@@ -152,7 +152,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
     ]);
   }
 
-  async function seedEffectiveOwner(suffix) {
+  async function seedEffectiveOwner(suffix, { ownerKind = "social" } = {}) {
     const now = new Date().toISOString();
     const expires = new Date(Date.now() + 86_400_000).toISOString();
     const participantId = `synthetic-graph-owner-${suffix}`;
@@ -168,7 +168,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
     const chunkDigest = createHash("sha256").update(`chunk:${suffix}`).digest("hex");
     const manifestDigest = createHash("sha256").update(`manifest:${suffix}`).digest("hex");
     const envelopeDigest = createHash("sha256").update(`envelope:${suffix}`).digest("hex");
-    const occurrenceId = Buffer.from(`session:synthetic:${suffix}`);
+    const occurrenceId = Buffer.concat([Buffer.from([0]), Buffer.from(`session:synthetic:${suffix}`)]);
     const observedAtMs = Date.parse(`${DAY}T12:00:00.000Z`);
     await pool.query(`INSERT INTO ${sqlSchema}.typed_telemetry_dictionary(value)
       VALUES ('synthetic_provider') ON CONFLICT(value) DO NOTHING`);
@@ -179,31 +179,65 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
     const toolClass = await pool.query(`SELECT id FROM ${sqlSchema}.typed_telemetry_dictionary
       WHERE value='localShell'`);
 
-    await pool.query(`INSERT INTO ${sqlSchema}.participants(
-      id, owner_kind, state, consent_version, consented_at, created_at
-    ) VALUES ($1,'social','active','privacy-safe-telemetry-v0.1',$2,$2)`, [participantId, now]);
-    await pool.query(`INSERT INTO ${sqlSchema}.web_sessions(
-      id, participant_id, secret_hash, csrf_hash, issued_at, expires_at, last_used_at
-    ) VALUES ($1,$2,$3,$4,$5,$6,$5)`, [
-      sessionId, participantId, randomBytes(32), randomBytes(32), now, expires,
-    ]);
-    await pool.query(`INSERT INTO ${sqlSchema}.device_pairings(
-      id, participant_id, issued_by_session_id, secret_hash, consent_version,
-      transport_consent_version, state, issued_at, expires_at, consumed_at, claimed_device_id
-    ) VALUES ($1,$2,$3,$4,'synthetic-consent','synthetic-transport','consumed',$5,$6,$5,$7)`, [
-      pairingId, participantId, sessionId, randomBytes(32), now, expires, deviceId,
-    ]);
-    await pool.query(`INSERT INTO ${sqlSchema}.device_credentials(
-      id, participant_id, authority_kind, paired_via_pairing_id, secret_hash,
-      state, issued_at, expires_at, last_used_at
-    ) VALUES ($1,$2,'social',$3,$4,'active',$5,$6,$5)`, [
-      deviceId, participantId, pairingId, randomBytes(32), now, expires,
-    ]);
-    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v12_device_capabilities(
-      participant_id, device_id, telemetry_schema_version, field_dictionary_version,
-      privacy_contract_version, state, consented_at
-    ) VALUES ($1,$2,'telemetry-contribution-v1.2','telemetry-v1.2-registry-2026-09-20.1',
-      'ongoing-privacy-safe-telemetry-v1.2','accepted',$3)`, [participantId, deviceId, now]);
+    if (ownerKind === "social") {
+      await pool.query(`INSERT INTO ${sqlSchema}.participants(
+        id, owner_kind, state, consent_version, consented_at, created_at
+      ) VALUES ($1,'social','active','privacy-safe-telemetry-v0.1',$2,$2)`, [participantId, now]);
+      await pool.query(`INSERT INTO ${sqlSchema}.web_sessions(
+        id, participant_id, secret_hash, csrf_hash, issued_at, expires_at, last_used_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$5)`, [
+        sessionId, participantId, randomBytes(32), randomBytes(32), now, expires,
+      ]);
+      await pool.query(`INSERT INTO ${sqlSchema}.device_pairings(
+        id, participant_id, issued_by_session_id, secret_hash, consent_version,
+        transport_consent_version, state, issued_at, expires_at, consumed_at, claimed_device_id
+      ) VALUES ($1,$2,$3,$4,'synthetic-consent','synthetic-transport','consumed',$5,$6,$5,$7)`, [
+        pairingId, participantId, sessionId, randomBytes(32), now, expires, deviceId,
+      ]);
+      await pool.query(`INSERT INTO ${sqlSchema}.device_credentials(
+        id, participant_id, authority_kind, paired_via_pairing_id, secret_hash,
+        state, issued_at, expires_at, last_used_at
+      ) VALUES ($1,$2,'social',$3,$4,'active',$5,$6,$5)`, [
+        deviceId, participantId, pairingId, randomBytes(32), now, expires,
+      ]);
+      await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v12_device_capabilities(
+        participant_id, device_id, telemetry_schema_version, field_dictionary_version,
+        privacy_contract_version, state, consented_at
+      ) VALUES ($1,$2,'telemetry-contribution-v1.2','telemetry-v1.2-registry-2026-09-20.1',
+        'ongoing-privacy-safe-telemetry-v1.2','accepted',$3)`, [participantId, deviceId, now]);
+    } else {
+      const deviceSecret = randomBytes(32);
+      await pool.query(`INSERT INTO ${sqlSchema}.participants(id, owner_kind, state, created_at)
+        VALUES ($1,'accountless','active',$2)`, [participantId, now]);
+      await pool.query(`INSERT INTO ${sqlSchema}.accountless_enrollment_ledger(
+        device_id, device_secret_hash, installation_principal_id, schema_version, policy_version,
+        authorization_basis, state, issued_at, expires_at
+      ) VALUES ($1,$2,$3,'accountless-enrollment-v0.1','accountless-opt-out-v1',
+        'accountless-policy-v1','active',$4,$5)`, [
+        deviceId, deviceSecret, `synthetic-install-${suffix}`, now, expires,
+      ]);
+      await pool.query(`INSERT INTO ${sqlSchema}.device_credentials(
+        id, participant_id, authority_kind, accountless_enrollment_device_id, secret_hash,
+        state, issued_at, expires_at, last_used_at
+      ) VALUES ($1,$2,'accountless',$1,$3,'active',$4,$5,$4)`, [
+        deviceId, participantId, deviceSecret, now, expires,
+      ]);
+      await pool.query(`INSERT INTO ${sqlSchema}.accountless_upload_owners(
+        enrollment_device_id, participant_id, device_credential_id, policy_version,
+        authorization_basis, authorized_at, expires_at, state
+      ) VALUES ($1,$2,$1,'accountless-opt-out-v1','accountless-policy-v1',$3,$4,'active')`, [
+        deviceId, participantId, now, expires,
+      ]);
+      await pool.query(`INSERT INTO ${sqlSchema}.accountless_v12_device_authorizations(
+        enrollment_device_id, participant_id, device_credential_id, schema_version, policy_version,
+        authorization_basis, telemetry_schema_version, field_dictionary_version, privacy_contract_version,
+        authorized_at, expires_at, state
+      ) VALUES ($1,$2,$1,'accountless-upload-owner-v1.2','accountless-telemetry-v1.2-policy-v1',
+        'accountless-policy-v1.2','telemetry-contribution-v1.2','telemetry-v1.2-registry-2026-09-20.1',
+        'ongoing-privacy-safe-telemetry-v1.2',$3,$4,'active')`, [
+        deviceId, participantId, now, expires,
+      ]);
+    }
     await pool.query(`INSERT INTO ${sqlSchema}.storage_v11_owner_links(participant_id, owner_digest, state)
       VALUES ($1,$2,'active')`, [participantId, ownerDigest]);
     await pool.query(`INSERT INTO ${sqlSchema}.analytics_owner_state(
@@ -265,7 +299,62 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
     domainManifest.manifestDigest = createHash("sha256")
       .update(telemetryV12DomainManifestDigestInput(domainManifest)).digest("hex");
     const activated = await domain.activate(principal, domainManifest);
-    return { participantId, ownerDigest, generationId: activated.generationId };
+    return { participantId, deviceId, ownerDigest, generationId: activated.generationId, expiresAt: expires };
+  }
+
+  async function retainAccountlessV12(owner, { staleHead = false, wrongTimestamp = false } = {}) {
+    const head = (await pool.query(`SELECT generation_id, revision FROM ${sqlSchema}.telemetry_v12_domain_heads
+      WHERE participant_id=$1`, [owner.participantId])).rows[0];
+    const retainedAt = new Date(Date.now() - 60_000).toISOString();
+    const revokedAt = wrongTimestamp ? new Date(Date.parse(retainedAt) + 1_000).toISOString() : retainedAt;
+    await pool.query(`INSERT INTO ${sqlSchema}.accountless_public_history_retention(
+      participant_id, enrollment_device_id, device_credential_id, generation_id, head_revision, retained_at
+    ) VALUES ($1,$2,$2,$3,$4,$5)`, [
+      owner.participantId, owner.deviceId, head.generation_id, head.revision, retainedAt,
+    ]);
+    await pool.query(`UPDATE ${sqlSchema}.accountless_enrollment_ledger
+      SET state='revoked', revoked_at=$2, revocation_reason='user_opt_out' WHERE device_id=$1`, [owner.deviceId, revokedAt]);
+    await pool.query(`UPDATE ${sqlSchema}.accountless_upload_owners
+      SET state='revoked', revoked_at=$2, revocation_reason='user_opt_out' WHERE enrollment_device_id=$1`, [owner.deviceId, revokedAt]);
+    await pool.query(`UPDATE ${sqlSchema}.accountless_v12_device_authorizations
+      SET state='revoked', revoked_at=$2, revocation_reason='user_opt_out' WHERE enrollment_device_id=$1`, [owner.deviceId, revokedAt]);
+    await pool.query(`UPDATE ${sqlSchema}.device_credentials
+      SET state='revoked', revoked_at=$2 WHERE id=$1`, [owner.deviceId, revokedAt]);
+    if (staleHead) {
+      await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_domain_heads
+        SET revision=revision+1 WHERE participant_id=$1`, [owner.participantId]);
+    }
+    return retainedAt;
+  }
+
+  async function seedSameDeviceV11Domain(owner) {
+    const now = new Date().toISOString();
+    const expires = owner.expiresAt;
+    const tokenHash = randomBytes(32).toString("hex");
+    const generationId = randomUUID();
+    const legacyFingerprint = createHash("sha256").update(`v11:${owner.participantId}`).digest("hex");
+    const manifestDigest = createHash("sha256").update(`v11-manifest:${owner.participantId}`).digest("hex");
+    await pool.query(`INSERT INTO ${sqlSchema}.accountless_v11_device_authorizations(
+      enrollment_device_id, participant_id, device_credential_id, telemetry_schema_version,
+      field_dictionary_version, privacy_contract_version, authorized_at, expires_at, state
+    ) VALUES ($1,$2,$1,'telemetry-contribution-v1.1','telemetry-v1.1-registry-2026-08-31.1',
+      'ongoing-privacy-safe-telemetry-v1.1',$3,$4,'active')`, [
+      owner.deviceId, owner.participantId, now, expires,
+    ]);
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domain_predecessors(
+      token_hash, participant_id, device_id, previous_generation_id, legacy_fingerprint,
+      input_revision, from_day, through_day, winners_json, created_at, expires_at
+    ) VALUES ($1,$2,$3,NULL,$4,0,$5::date,$5::date,'[]',$6,$7)`, [
+      tokenHash, owner.participantId, owner.deviceId, legacyFingerprint, DAY, now, expires,
+    ]);
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domains(
+      id, participant_id, device_id, predecessor_token_hash, previous_generation_id,
+      manifest_digest, legacy_fingerprint, input_revision, from_day, through_day, days_json, created_at
+    ) VALUES ($1,$2,$3,$4,NULL,$5,$6,0,$7::date,$7::date,'[]',$8)`, [
+      generationId, owner.participantId, owner.deviceId, tokenHash, manifestDigest, legacyFingerprint, DAY, now,
+    ]);
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domain_heads(participant_id, generation_id, revision, updated_at)
+      VALUES ($1,$2,1,$3)`, [owner.participantId, generationId, now]);
   }
 
   async function seedAccountlessAuthorizationExpiryBoundary() {
@@ -540,6 +629,46 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
       after: first.next, limit: 1, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
     })).rejects.toMatchObject({ code: "POSTGRES_COMMUNITY_GRAPH_COHORT_SOURCE_CHANGED" });
+  }, 120_000);
+
+  it("uses the 0046 v1.2 source gate for active and retained owners", async () => {
+    const active = await seedEffectiveOwner("8", { ownerKind: "accountless" });
+    const retained = await seedEffectiveOwner("9", { ownerKind: "accountless" });
+    await retainAccountlessV12(retained);
+
+    const v11Wins = await seedEffectiveOwner("a", { ownerKind: "accountless" });
+    await seedSameDeviceV11Domain(v11Wins);
+
+    const wrongMarker = await seedEffectiveOwner("b", { ownerKind: "accountless" });
+    await retainAccountlessV12(wrongMarker, { wrongTimestamp: true });
+    const staleMarker = await seedEffectiveOwner("c", { ownerKind: "accountless" });
+    await retainAccountlessV12(staleMarker, { staleHead: true });
+
+    const erased = await seedEffectiveOwner("d", { ownerKind: "accountless" });
+    await pool.query(`UPDATE ${sqlSchema}.storage_v11_owner_links SET state='erased' WHERE participant_id=$1`,
+      [erased.participantId]);
+
+    const publicSourceFor = async (owner) => (await pool.query(`SELECT owner_kind,device_id
+      FROM ${sqlSchema}.community_public_source_owners WHERE participant_id=$1`, [owner.participantId])).rows;
+    expect(await publicSourceFor(v11Wins)).toEqual([{ owner_kind: "accountless", device_id: v11Wins.deviceId }],
+      "the source view assigns a mixed device to its active v1.1 branch");
+    expect(await publicSourceFor(wrongMarker)).toEqual([], "a retention marker with a different timestamp is not eligible");
+    expect(await publicSourceFor(staleMarker)).toEqual([], "a marker for an older head revision is not eligible");
+    expect((await pool.query(`SELECT owner_digest FROM ${sqlSchema}.storage_owner_erasure_receipts
+      WHERE owner_digest=$1`, [erased.ownerDigest])).rows).toEqual([{ owner_digest: erased.ownerDigest }]);
+
+    const latest = await pool.query(`SELECT COALESCE(max(sequence),0)::text AS sequence
+      FROM ${sqlSchema}.storage_ingestion_changes WHERE source_id=$1`, [SOURCE_ID]);
+    await catchUpCursor(latest.rows[0].sequence);
+    const page = await listPostgresCommunityGraphCohortPage(pool, {
+      sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
+      limit: 20, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+    });
+    expect(page.owners.map((owner) => owner.ownerDigest).sort()).toEqual(
+      [active.ownerDigest, retained.ownerDigest].sort(),
+      "only the active and exactly retained v1.2 heads enter the graph cohort",
+    );
+    expect(page.owners.every((owner) => owner.hasV12)).toBe(true);
   }, 120_000);
 
   it("pins accountless authorization expiry across pages and at publication", async () => {
