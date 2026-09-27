@@ -14,8 +14,8 @@
  *   - a var may instead be edge-only (it stays with the Cloudflare edge) or
  *     deployment-provided (each deployment supplies and validates it);
  *   - every PRODUCTION_VARS key is in wrangler.jsonc or declared origin-only;
- *   - the eight rate limits split into the six edge-tier names and the two
- *     origin-tier limits, whose values must match;
+ *   - rate limits are classified as edge-replayed or PostgreSQL-origin limits;
+ *     the origin-tier values must match;
  *   - the Worker's required secrets are a subset of the origin's, and the
  *     production hostnames and Cloudflare resource names match the frozen
  *     origins and fingerprint;
@@ -369,6 +369,16 @@ const UPLOAD_AUTHORIZATION_LIMIT = [
   "          \"namespace_id\": \"3005\",",
   "          \"simple\": { \"limit\": 3000, \"period\": 60 }",
 ].join("\n");
+const DEVICE_SYNC_PRINCIPAL_LIMIT = [
+  "\"name\": \"DEVICE_SYNC_PRINCIPAL_RATE_LIMIT\",",
+  "          \"namespace_id\": \"3010\",",
+  "          \"simple\": { \"limit\": 4200, \"period\": 60 }",
+].join("\n");
+const STAGING_DEVICE_SYNC_PRINCIPAL_LIMIT = [
+  "\"name\": \"DEVICE_SYNC_PRINCIPAL_RATE_LIMIT\",",
+  "          \"namespace_id\": \"2010\",",
+  "          \"simple\": { \"limit\": 4200, \"period\": 60 }",
+].join("\n");
 
 test("the checked-in wrangler.jsonc, receipt and production build pass", async () => {
   assert.deepEqual(productionConfigurationDrift({ wranglerText: WRANGLER_TEXT, receiptText: RECEIPT_TEXT }), []);
@@ -424,6 +434,21 @@ test("a changed origin-tier limit in a temp copy fails", async () => {
       "\"name\": \"UPLOAD_PRINCIPAL_RATE_LIMIT\",", "\"name\": \"UPLOAD_PRINCIPAL_RATE_LIMIT_V2\","),
   }), ["ORIGIN_TIER_RATE_LIMIT_MISSING:UPLOAD_PRINCIPAL_RATE_LIMIT",
     "RATE_LIMIT_UNCLASSIFIED:UPLOAD_PRINCIPAL_RATE_LIMIT_V2"]);
+  assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorProduction(WRANGLER_TEXT, DEVICE_SYNC_PRINCIPAL_LIMIT,
+      DEVICE_SYNC_PRINCIPAL_LIMIT.replace("\"limit\": 4200", "\"limit\": 4201")),
+  }), ["ORIGIN_TIER_LIMIT_DRIFT:DEVICE_SYNC_PRINCIPAL"]);
+  assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorStaging(WRANGLER_TEXT,
+      STAGING_DEVICE_SYNC_PRINCIPAL_LIMIT,
+      STAGING_DEVICE_SYNC_PRINCIPAL_LIMIT.replace("\"limit\": 4200", "\"limit\": 4201")),
+  }), ["STAGING_ORIGIN_TIER_LIMIT_DRIFT:DEVICE_SYNC_PRINCIPAL"]);
+  assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorProduction(WRANGLER_TEXT,
+      "\"name\": \"DEVICE_SYNC_RATE_LIMIT\",",
+      "\"name\": \"UNCLASSIFIED_SYNTHETIC_RATE_LIMIT\","),
+  }), ["EDGE_TIER_RATE_LIMIT_MISSING:DEVICE_SYNC_RATE_LIMIT",
+    "RATE_LIMIT_UNCLASSIFIED:UNCLASSIFIED_SYNTHETIC_RATE_LIMIT"]);
 });
 
 test("a malformed or repeated rate limit fails, even an edge-tier one", async () => {

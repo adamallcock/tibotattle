@@ -140,6 +140,8 @@ export const EDGE_TIER_RATE_LIMIT_NAMES = Object.freeze([
   "PUBLIC_READ",
   "UPLOAD_INGRESS_REQUEST",
   "UPLOAD_INGRESS_CLIENT",
+  "DEVICE_SYNC_CLIENT",
+  "DEVICE_SYNC",
 ]);
 export const EDGE_TIER_RATE_LIMIT_BINDINGS = Object.freeze(
   EDGE_TIER_RATE_LIMIT_NAMES.map((name) => `${name}_RATE_LIMIT`),
@@ -157,6 +159,11 @@ export const ORIGIN_TIER_RATE_LIMITS = Object.freeze({
     limit: 3_000,
     periodSeconds: 60,
   }),
+  DEVICE_SYNC_PRINCIPAL: Object.freeze({
+    binding: "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT",
+    limit: 4_200,
+    periodSeconds: 60,
+  }),
 });
 
 /**
@@ -172,6 +179,11 @@ export const STAGING_ORIGIN_TIER_RATE_LIMITS = Object.freeze({
   UPLOAD_PRINCIPAL: Object.freeze({
     binding: "UPLOAD_PRINCIPAL_RATE_LIMIT",
     limit: 6,
+    periodSeconds: 60,
+  }),
+  DEVICE_SYNC_PRINCIPAL: Object.freeze({
+    binding: "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT",
+    limit: 4_200,
     periodSeconds: 60,
   }),
 });
@@ -1183,8 +1195,8 @@ function isEdgeReplayBinding(binding) {
 
 /**
  * Builds the frozen Worker-shaped env from a configuration returned by
- * readProductionConfiguration. Service profiles must inject exactly the six
- * edge-tier replay bindings, the two origin-tier limiters and
+ * readProductionConfiguration. Service profiles must inject exactly the eight
+ * edge-tier replay bindings, the three origin-tier limiters and
  * UPLOAD_INGRESS_BUDGET; job profiles take no bindings. Each origin-tier
  * limiter must be built with configuration.rateLimits.originTier (production
  * or staging, by plane): its limitValue and periodSeconds are compared with

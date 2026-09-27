@@ -211,7 +211,7 @@ function originLimiter(limitValue, periodSeconds) {
   return Object.freeze({ limitValue, periodSeconds, async limit() { return { success: true }; } });
 }
 
-/** The nine service bindings, origin-tier limiters built with the given plane's limits. */
+/** The twelve service bindings, origin-tier limiters built with the given plane's limits. */
 function serviceBindings(originTier = configuration.ORIGIN_TIER_RATE_LIMITS) {
   const origin = new Map(Object.values(originTier).map((limits) => [limits.binding, limits]));
   return Object.fromEntries(configuration.PRODUCTION_WORKER_BINDING_NAMES.map((name) => {
@@ -332,15 +332,17 @@ test("exports the frozen production constants", () => {
   });
   assert.deepEqual(configuration.EDGE_TIER_RATE_LIMIT_NAMES, [
     "ENROLLMENT", "RECOVERY", "CLIENT_ATTEMPT", "PUBLIC_READ",
-    "UPLOAD_INGRESS_REQUEST", "UPLOAD_INGRESS_CLIENT",
+    "UPLOAD_INGRESS_REQUEST", "UPLOAD_INGRESS_CLIENT", "DEVICE_SYNC_CLIENT", "DEVICE_SYNC",
   ]);
   assert.deepEqual(configuration.ORIGIN_TIER_RATE_LIMITS, {
     UPLOAD_AUTHORIZATION: { binding: "UPLOAD_AUTHORIZATION_RATE_LIMIT", limit: 3_000, periodSeconds: 60 },
     UPLOAD_PRINCIPAL: { binding: "UPLOAD_PRINCIPAL_RATE_LIMIT", limit: 3_000, periodSeconds: 60 },
+    DEVICE_SYNC_PRINCIPAL: { binding: "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT", limit: 4_200, periodSeconds: 60 },
   });
   assert.deepEqual(configuration.STAGING_ORIGIN_TIER_RATE_LIMITS, {
     UPLOAD_AUTHORIZATION: { binding: "UPLOAD_AUTHORIZATION_RATE_LIMIT", limit: 300, periodSeconds: 60 },
     UPLOAD_PRINCIPAL: { binding: "UPLOAD_PRINCIPAL_RATE_LIMIT", limit: 6, periodSeconds: 60 },
+    DEVICE_SYNC_PRINCIPAL: { binding: "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT", limit: 4_200, periodSeconds: 60 },
   });
   assert.deepEqual(configuration.PRODUCTION_CONFIGURATION_PROFILES, [
     "production", "staging", "maintenance-job", "analytics-job",
@@ -379,8 +381,9 @@ test("exports the frozen production constants", () => {
   assert.deepEqual(configuration.PRODUCTION_WORKER_BINDING_NAMES, [
     "ENROLLMENT_RATE_LIMIT", "RECOVERY_RATE_LIMIT", "CLIENT_ATTEMPT_RATE_LIMIT",
     "PUBLIC_READ_RATE_LIMIT", "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
-    "UPLOAD_INGRESS_CLIENT_RATE_LIMIT", "UPLOAD_AUTHORIZATION_RATE_LIMIT",
-    "UPLOAD_PRINCIPAL_RATE_LIMIT", "UPLOAD_INGRESS_BUDGET",
+    "UPLOAD_INGRESS_CLIENT_RATE_LIMIT", "DEVICE_SYNC_CLIENT_RATE_LIMIT",
+    "DEVICE_SYNC_RATE_LIMIT", "UPLOAD_AUTHORIZATION_RATE_LIMIT",
+    "UPLOAD_PRINCIPAL_RATE_LIMIT", "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT", "UPLOAD_INGRESS_BUDGET",
   ]);
   assert.deepEqual(configuration.REQUIRED_SECRET_NAMES, [
     "IDENTITY_LINK_SECRET", "POSTGRES_RATE_LIMIT_SECRET", "ENVELOPE_PUBLIC_JWK",
@@ -1175,7 +1178,7 @@ test("processEnv TELEMETRY_STORAGE_MODE=json keeps the pinned 'typed' in every p
   }
 });
 
-test("service envs require exactly the nine injected bindings", () => {
+test("service envs require exactly the twelve injected bindings", () => {
   const config = expectAccepted(productionEnv(), "production");
   for (const name of configuration.PRODUCTION_WORKER_BINDING_NAMES) {
     expectCode(() => createProductionWorkerEnv(config, { bindings: without(serviceBindings(), name) }),
@@ -1274,6 +1277,31 @@ test("service envs require exactly the nine injected bindings", () => {
     assert.equal(createProductionWorkerEnv(config, {
       bindings: { ...serviceBindings(), [name]: nullPrototype },
     })[name], nullPrototype, name);
+  }
+  const deviceSyncClient = configuration.EDGE_TIER_RATE_LIMIT_BINDINGS
+    .find((name) => name === "DEVICE_SYNC_CLIENT_RATE_LIMIT");
+  const deviceSync = configuration.EDGE_TIER_RATE_LIMIT_BINDINGS
+    .find((name) => name === "DEVICE_SYNC_RATE_LIMIT");
+  const deviceSyncPrincipal = configuration.ORIGIN_TIER_RATE_LIMITS.DEVICE_SYNC_PRINCIPAL;
+  assert.ok(deviceSyncClient);
+  assert.ok(deviceSync);
+  assert.deepEqual(deviceSyncPrincipal, {
+    binding: "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT", limit: 4_200, periodSeconds: 60,
+  });
+  for (const name of [deviceSyncClient, deviceSync]) {
+    expectCode(() => createProductionWorkerEnv(config, {
+      bindings: { ...serviceBindings(), [name]: postgresLimiter(name, 4_200, 60) },
+    }), `${name}_BINDING_NOT_EDGE_REPLAY`);
+  }
+  expectCode(() => createProductionWorkerEnv(config, {
+    bindings: without(serviceBindings(), deviceSyncPrincipal.binding),
+  }), "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT_BINDING_MISSING");
+  expectCode(() => createProductionWorkerEnv(config, {
+    bindings: { ...serviceBindings(), [deviceSyncPrincipal.binding]: limiter() },
+  }), "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT_BINDING_LIMIT_MISMATCH");
+  const deviceSyncBindings = serviceBindings();
+  for (const name of [deviceSyncClient, deviceSync, deviceSyncPrincipal.binding]) {
+    assert.ok(createProductionWorkerEnv(config, { bindings: deviceSyncBindings })[name], name);
   }
   expectCode(() => createProductionWorkerEnv(config, { bindings: serviceBindings(), extra: true }),
     "PRODUCTION_ENV_OPTIONS_INVALID");
