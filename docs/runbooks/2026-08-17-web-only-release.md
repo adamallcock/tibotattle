@@ -235,6 +235,31 @@ npm run product:web-release:deploy -- \
   --confirm DEPLOY_PRODUCTION
 ```
 
+When production uses typed storage, use the same receipt entry point with an
+owner-private live inventory. First run the read-only `production:reconcile`
+procedure in [Production operations](production-operations.md#guarded-deployment-wrapper)
+against this clean candidate and require all database roles to qualify. Pin the
+current public manifest bytes and the full deployed source commit that produced
+them. The receipt supplies the candidate manifest SHA-256; the command verifies
+the live preimage and candidate postimage separately and preserves the live
+bindings, schedules, ingress, and secrets. Typed website publication never
+accepts `--confirm-migrations` and never applies a database migration.
+
+```bash
+npm run product:web-release:deploy -- \
+  --receipt "$PWD/.release-build/web-release-receipt.json" \
+  --confirm DEPLOY_PRODUCTION \
+  --inventory /absolute/private/live-inventory.json \
+  --inventory-sha256 <reviewed-inventory-sha256> \
+  --retained-public-source <full-deployed-public-source-sha> \
+  --expected-live-manifest-sha256 <reviewed-live-manifest-sha256>
+```
+
+If the candidate source changes after preparation, prepare a new receipt before
+deployment. A source whose typed schema differs from production cannot use this
+website-only lane; build a clean candidate from the live source and carry only
+the reviewed public-site closure.
+
 Never substitute a raw `wrangler deploy` command: it would bypass the
 web-only receipt and source-scope checks. Record the successful source commit,
 receipt digest, deploy time, and live smoke-check result as the next deployed
