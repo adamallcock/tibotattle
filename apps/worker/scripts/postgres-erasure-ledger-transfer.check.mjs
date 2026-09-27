@@ -140,7 +140,7 @@ test("transfer entrypoint rejects caller-built sources, broad schemas, and unbou
   }), { code: "ERASURE_LEDGER_SEALED_SOURCE_REQUIRED" });
 });
 
-test("production ledger target is refused before the disposable importer touches PostgreSQL", async () => {
+test("named test target is refused by the disposable importer before PostgreSQL access", async () => {
   let targetCalls = 0;
   const destinationPool = {
     async query() { targetCalls += 1; throw new Error("unexpected target query"); },
