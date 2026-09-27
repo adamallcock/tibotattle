@@ -30,6 +30,7 @@ import {
   parseRealHistoryArguments,
   pricingCoverageSnapshotValid,
   realHistoryDashboardReadySnapshotValid,
+  realHistoryDashboardObservationValid,
   realHistoryCancelPreQuickBoundaryReady,
   releaseRealHistoryRefreshGate,
   runLaunchGate,
@@ -391,6 +392,28 @@ test("real-history dashboard readiness retries truthy boot snapshots until the e
     { ...snapshots[3], location: "http://localhost:49299/" },
   ]) {
     assert.equal(realHistoryDashboardReadySnapshotValid(invalid, expectedOrigin), false);
+  }
+});
+
+test("real-history dashboard observation matches the current local timestamp contract", () => {
+  const observedAt = "2026-09-27T04:14:00.000Z";
+  const valid = {
+    latest: "2 minutes ago",
+    source: "Sep 27, 12:14 AM EDT",
+    mode: "real_local_evidence",
+    observedAt,
+    expectedSource: "Sep 27, 12:14 AM EDT",
+  };
+  assert.equal(realHistoryDashboardObservationValid(valid), true);
+  for (const invalid of [
+    { ...valid, latest: "Checking…" },
+    { ...valid, latest: "No timestamp" },
+    { ...valid, mode: "demo" },
+    { ...valid, observedAt: "invalid" },
+    { ...valid, source: "Local companion" },
+    { ...valid, source: "Sep 26, 12:14 AM EDT" },
+  ]) {
+    assert.equal(realHistoryDashboardObservationValid(invalid), false);
   }
 });
 

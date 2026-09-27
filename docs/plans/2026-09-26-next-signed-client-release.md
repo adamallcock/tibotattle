@@ -52,8 +52,14 @@ each completed promptly in isolated direct probes. During the delay, the
 packaged companion was reading the 3.2 GB unified index in a worker. Its
 shared projection reader serializes even the fixed deferred response behind
 a full-history job. A scoped source repair lets the deferred response bypass
-that queue, with a regression test for an occupied worker. The exact packaged
-QA must still prove that this removes the delay.
+that queue, with a regression test for an occupied worker. The rebuilt
+`c86b039dde03f57ab1858c137aa54e18da5df273` development package published
+its cold quick result in 2.8 seconds. Its first full QA attempt then reached
+parity but hit a stale QA assertion: the script still expected the former
+"local companion" source label, while the dashboard now displays the local
+observation time. The updated assertion matches the rendered time to the
+local API; the same package passed snapshot parity, cancellation, retry and
+clean quit. Full terminal QA on the final frozen source remains open.
 This development result does not qualify signed or installed bytes.
 
 CodexBar's [documented app default](https://github.com/steipete/CodexBar/blob/e0286a895055e60ddaefa6a5f176f246aa2f05e4/docs/codex.md#L199-L215)
