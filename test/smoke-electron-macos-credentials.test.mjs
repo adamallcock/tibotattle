@@ -429,6 +429,7 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
   assert.deepEqual(macCredentialFailureDiagnostics({ signedLaunchStage: 'native_intro',
     stage: 'native_intro_unexpected', ownedMacProcessesStopped: true,
     message: '/Users/PRIVATE_SENTINEL', stderr: 'SECRET' }), {
+    networkGuardStage: null,
     launchStage: 'native_intro', launchCode: 'native_intro_unexpected', settingsStage: null,
     launchOwnedProcessesStopped: true, predecessorUi: null,
     predecessorEntryFailure: null, predecessorDebuggerListening: null, predecessorProcess: null,
@@ -436,6 +437,7 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
   });
   assert.deepEqual(macCredentialFailureDiagnostics({ emptyProfileStage: 'settings_effect',
     ownedMacProcessesStopped: false }), {
+    networkGuardStage: null,
     launchStage: null, launchCode: null, settingsStage: 'settings_effect', launchOwnedProcessesStopped: false,
     predecessorUi: null, predecessorEntryFailure: null, predecessorDebuggerListening: null,
     predecessorProcess: null,
@@ -444,6 +446,7 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
   for (const error of [null, {}, { signedLaunchStage: 'PRIVATE_SENTINEL', stage: 'PRIVATE_SENTINEL',
     emptyProfileStage: 'PRIVATE_SENTINEL', ownedMacProcessesStopped: 'true' }]) {
     assert.deepEqual(macCredentialFailureDiagnostics(error), {
+      networkGuardStage: null,
       launchStage: null, launchCode: null, settingsStage: null, launchOwnedProcessesStopped: null,
       predecessorUi: null, predecessorEntryFailure: null, predecessorDebuggerListening: null,
       predecessorProcess: null,
@@ -453,6 +456,7 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
   assert.equal(macCredentialFailureDiagnostics({}, 'secure_storage_warning').predecessorUi, 'secure_storage_warning');
   assert.equal(macCredentialFailureDiagnostics({}, '/Users/PRIVATE_SENTINEL').predecessorUi, null);
   assert.deepEqual(macCredentialFailureDiagnostics({}, null, true, false), {
+    networkGuardStage: null,
     launchStage: null, launchCode: null, settingsStage: null, launchOwnedProcessesStopped: null,
     predecessorUi: null, predecessorEntryFailure: true, predecessorDebuggerListening: false,
     predecessorProcess: null,
@@ -462,4 +466,6 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
     { code: 1, signal: null }).predecessorExit, { code: 1, signal: null });
   assert.equal(macCredentialFailureDiagnostics({}, null, null, null, null,
     { code: 1, signal: '/Users/PRIVATE_SENTINEL' }).predecessorExit, null);
+  assert.equal(macCredentialFailureDiagnostics({ pfStage: 'anchor_load' }).networkGuardStage, 'anchor_load');
+  assert.equal(macCredentialFailureDiagnostics({ pfStage: '/Users/PRIVATE_SENTINEL' }).networkGuardStage, null);
 });

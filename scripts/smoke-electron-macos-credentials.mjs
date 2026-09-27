@@ -349,7 +349,10 @@ export function macCredentialFailureDiagnostics(error, predecessorUi = null, pre
     'native_intro_identity', 'native_intro_closed', 'native_intro_unexpected',
     'native_intro_automation_unavailable'];
   const settingsCodes = ['settings_tab', 'settings_ready', 'settings_click', 'settings_effect'];
+  const pfStages = ['main_anchor', 'baseline_connectivity', 'syntax', 'anchor_load', 'enable',
+    'active_rules', 'loopback', 'external_denial'];
   return {
+    networkGuardStage: pfStages.includes(error?.pfStage) ? error.pfStage : null,
     launchStage: launchStages.includes(error?.signedLaunchStage) ? error.signedLaunchStage : null,
     launchCode: launchCodes.includes(error?.stage) ? error.stage : null,
     settingsStage: settingsCodes.includes(error?.emptyProfileStage) ? error.emptyProfileStage : null,

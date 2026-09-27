@@ -55,25 +55,35 @@ export async function activateMacOSCredentialPfGuard({ temporaryRoot, runId, uid
   const anchor = `com.apple/tibotattle-credential-${runId}`;
   const base = await mkdtemp(join(temporaryRoot, 'credential-pf-'));
   const file = join(base, 'rules');
-  let token = null, loaded = false;
+  let token = null, loaded = false, stage = 'main_anchor';
   try {
     if (!/anchor\s+"com\.apple\/\*"/u.test(pf(['-sr'])) || pf(['-a', anchor, '-sr']).trim()) fail();
+    stage = 'baseline_connectivity';
     const { address } = await lookup(HOST, { family: 4 });
     if (!await tcp(address, 443)) fail();
     await writeFile(file, macOSCredentialPfRule(uid), { mode: 0o600, flag: 'wx' });
+    stage = 'syntax';
     pf(['-n', '-f', file]);
+    stage = 'anchor_load';
     pf(['-a', anchor, '-f', file]); loaded = true;
+    stage = 'enable';
     token = parseMacOSPfEnableToken(pf(['-E']));
     const check = async () => {
-      if (!/Status:\s*Enabled/iu.test(pf(['-s', 'info']))
-        || !macOSPfRuleInstalled(pf(['-a', anchor, '-sr']), uid)) fail();
-      const server = createServer(socket => socket.end());
-      await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
       try {
-        if (!await tcp('127.0.0.1', server.address().port) || await tcp(address, 443)) fail();
-      } finally { await new Promise(resolve => server.close(resolve)); }
-      return { mode: MACOS_PF_CREDENTIAL_MODE, loopback: true, externalTcpDenied: true,
-        tcpAndUdpRulesInstalled: true, runnerUidScoped: true };
+        stage = 'active_rules';
+        if (!/Status:\s*Enabled/iu.test(pf(['-s', 'info']))
+          || !macOSPfRuleInstalled(pf(['-a', anchor, '-sr']), uid)) fail();
+        const server = createServer(socket => socket.end());
+        await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+        try {
+          stage = 'loopback';
+          if (!await tcp('127.0.0.1', server.address().port)) fail();
+          stage = 'external_denial';
+          if (await tcp(address, 443)) fail();
+        } finally { await new Promise(resolve => server.close(resolve)); }
+        return { mode: MACOS_PF_CREDENTIAL_MODE, loopback: true, externalTcpDenied: true,
+          tcpAndUdpRulesInstalled: true, runnerUidScoped: true };
+      } catch { throw Object.assign(new Error('MAC_CREDENTIAL_PF_GUARD_FAILED'), { pfStage: stage }); }
     };
     const proof = await check();
     return { proof, assertEffective: check, async close() {
@@ -82,10 +92,11 @@ export async function activateMacOSCredentialPfGuard({ temporaryRoot, runId, uid
       pf(['-X', token]); token = null;
       await rm(base, { recursive: true });
     } };
-  } catch {
+  } catch (error) {
+    const failedStage = error?.pfStage ?? stage;
     if (loaded) { try { pf(['-a', anchor, '-F', 'rules']); } catch {} }
     if (token) { try { pf(['-X', token]); } catch {} }
     await rm(base, { recursive: true, force: true });
-    fail();
+    throw Object.assign(new Error('MAC_CREDENTIAL_PF_GUARD_FAILED'), { pfStage: failedStage });
   }
 }
