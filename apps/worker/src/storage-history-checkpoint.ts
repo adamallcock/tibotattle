@@ -256,15 +256,20 @@ export async function saveStorageHistoryCheckpoint(input:{target:D1Database;key:
   const head=await current(target,id);if(head?.retired)throw fail();
   if(head?.generation===generation)return {status:'saved' as const,headDigest:generation,totalParts:f.parts.length};
   if((head?.generation??null)!==expected)throw fail();
-  await target.prepare(`INSERT INTO analytics_history_checkpoint_stages
+ const inserted=await target.prepare(`INSERT INTO analytics_history_checkpoint_stages
   (key_digest,generation,source_id,owner_digest,day,dependency_digest,source_namespace,method,expected_head,owner_revision,authority_epoch,control_json,manifest_json,part_count)
   SELECT ?,?,?,?,?,?,?,?,?,o.revision,o.authority_epoch,?,?,? FROM analytics_owner_state o
   WHERE o.source_id=? AND o.owner_digest=? AND o.state='active' AND o.authority_epoch=?
   AND NOT EXISTS(SELECT 1 FROM analytics_history_checkpoint_heads h WHERE h.key_digest=? AND (h.retired=1 OR h.generation IS NOT ?))
   ON CONFLICT(key_digest,generation) DO NOTHING`).bind(id,generation,key.sourceId,key.ownerDigest,key.day,key.dependencyDigest,key.sourceNamespace,key.method,expected,
   f.control,manifest,f.parts.length,key.sourceId,key.ownerDigest,owner.authority_epoch,id,expected).run();
+ // A confirmed fresh insert contains exactly the bound immutable stage. A
+ // replay must still read and verify the retained stage before using its parts.
+ if(inserted.meta.changes!==1){
+  if(inserted.meta.changes!==0)throw fail();
   const stage=await target.prepare(`SELECT s.* FROM analytics_history_checkpoint_stages s WHERE s.key_digest=? AND s.generation=? AND ${ACTIVE}`).bind(id,generation).first<Stage>();
   if(!stage||stage.control_json!==f.control||stage.manifest_json!==manifest||stage.expected_head!==expected)throw fail();
+ }
   const retained=(await target.prepare('SELECT part_index,sha256,payload_bytes FROM analytics_history_checkpoint_parts WHERE key_digest=? AND generation=? ORDER BY part_index LIMIT 1025')
   .bind(id,generation).all<{part_index:number;sha256:string;payload_bytes:number}>()).results;
   for(const row of retained){const wanted=f.manifest[row.part_index];

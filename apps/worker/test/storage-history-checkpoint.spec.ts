@@ -11,6 +11,7 @@ import {validEffectiveDays,validEffectiveQuotaCursor,type StorageEffectiveHistor
 import {MODEL_HISTORY_METHOD_VERSION} from '../src/quota-analysis-v1';
 import type {V11UsageReductionCheckpoint} from '../src/quota-analysis-v11';
 import {retireStorageGraphPage} from '../src/storage-graph-retirement';
+import {createD1InvocationBudget} from '../src/d1-invocation-budget';
 import {STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,
  STORAGE_GRAPH_METHOD,STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD} from '../src/storage-community-graph';
 const bindings=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_ANALYTICS_MIGRATIONS:D1Migration[]};
@@ -222,6 +223,19 @@ describe('private paged historical checkpoint store',()=>{
   await expect(save({target:target(),key:{...key,day:'2026-09-04'},checkpoint:staged,expectedHead:result.headDigest,maxWrites:4,cursor:second.cursor}))
    .rejects.toThrow();
   expect(await read()).toMatchObject({status:'ready',headDigest:result.headDigest});
+ });
+ it('spends one fewer statement for a fresh stage while retaining replay verification',async()=>{
+  const large=checkpoint(18000);
+  expect(await storageHistoryCheckpointParts(key,large)).toBeGreaterThan(2);
+  const firstMeter=createD1InvocationBudget();
+  const first=await save({target:firstMeter.wrap(target()),key,checkpoint:large,expectedHead:null,maxWrites:4});
+  expect(first.status).toBe('staging');
+  const replayMeter=createD1InvocationBudget();
+  const replay=await save({target:replayMeter.wrap(target()),key,checkpoint:large,expectedHead:null,maxWrites:4});
+  expect(replay.status).toBe('staging');
+  expect(replayMeter.queriesUsed).toBe(firstMeter.queriesUsed+1);
+  const head=await drain(large);
+  expect(await read()).toMatchObject({status:'ready',headDigest:head,checkpoint:large});
  });
  it('loads a promoted generation with one read per resumed page and a final head fence',async()=>{
   const large=checkpoint(18000),head=await drain(large);
