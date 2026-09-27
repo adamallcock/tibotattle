@@ -14,6 +14,7 @@ import { ELECTRON_020_DMG, verifyPredecessor, refreshProductionUpdateArchiveInde
 import { launchVerifiedMacSharingApp, stopOwnedMacSharingApp, signedStagingFixture } from './run-signed-electron-staging.mjs';
 import { CREDENTIAL_FIXTURE_CASES, CREDENTIAL_FIXTURE_REQUIREMENT } from './prepare-electron-macos-credential-fixture.mjs';
 import { inspectMacOSLoopbackEnforcement, MACOS_LOOPBACK_MODE } from './lib/macos-loopback-qualification.mjs';
+import { desktopFirstRunDialogCopy } from '../apps/electron/desktop-first-run.js';
 
 export { MAC_CREDENTIAL_CONFIRMATION, validateMacCredentialIntake, parseMacCredentialArguments } from './lib/macos-credential-qualification-intake.mjs';
 import { MAC_CREDENTIAL_SCHEMA as SCHEMA, validateMacCredentialIntake, parseMacCredentialArguments } from './lib/macos-credential-qualification-intake.mjs';
@@ -197,6 +198,41 @@ async function fixtureSession(input, executable, scenario, environment) {
     if (!ended) { child.kill('SIGKILL'); fail('fixture_not_stopped'); } if (protocolError) fail('fixture_protocol'); } };
 }
 
+// On a failed predecessor launch, classify only known native UI states for the
+// already verified owned PID. Never return accessibility text or window names.
+export function macCredentialPredecessorUiScript(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 2) fail('dialog_input');
+  const firstRun = ['en-US', 'zh-Hans', 'es'].map(locale => {
+    const copy = desktopFirstRunDialogCopy({ production: true, locale });
+    return [copy.title, copy.message];
+  });
+  return `function run(){var e=Application('System Events');
+if(!e.uiElementsEnabled())return 'accessibility_unavailable';
+var agents=e.applicationProcesses().filter(function(p){return ['SecurityAgent','SecurityUIAgent','CoreServicesUIAgent'].indexOf(p.name())!==-1;});
+if(agents.some(function(p){return p.windows().length>0;}))return 'security_agent_window';
+var p=e.applicationProcesses.whose({unixId:${pid}})();if(p.length!==1)return 'owned_process_absent';
+var windows=p[0].windows();if(windows.length===0)return 'no_owned_window';
+if(windows.length>3)return 'window_limit';var texts=[];
+for(var w=0;w<windows.length;w++){var elements=windows[w].entireContents();if(elements.length>500)return 'window_limit';
+for(var x=0;x<elements.length;x++){if(elements[x].role()==='AXStaticText')texts.push(String(elements[x].value()));}}
+var known=${JSON.stringify(firstRun)};
+for(var c=0;c<known.length;c++){if(texts.indexOf(known[c][0])!==-1||texts.indexOf(known[c][1])!==-1)return 'first_run_visible';}
+if(texts.indexOf('Unable to prepare secure storage')!==-1||texts.indexOf('TiboTattle could not complete its secure startup checks.')!==-1)return 'secure_storage_warning';
+if(texts.indexOf('Unable to finish updating TiboTattle')!==-1||texts.indexOf('TiboTattle could not finish transferring your existing data.')!==-1)return 'native_handover_warning';
+return 'other_owned_window';}`;
+}
+
+const PREDECESSOR_UI_STATES = new Set(['accessibility_unavailable', 'security_agent_window',
+  'owned_process_absent', 'no_owned_window', 'window_limit', 'first_run_visible',
+  'secure_storage_warning', 'native_handover_warning', 'other_owned_window',
+  'diagnostic_unavailable']);
+function observePredecessorUi(pid) {
+  try {
+    const value = command('/usr/bin/osascript', ['-l', 'JavaScript', '-e', macCredentialPredecessorUiScript(pid)], 10000);
+    return PREDECESSOR_UI_STATES.has(value) ? value : 'diagnostic_unavailable';
+  } catch { return 'diagnostic_unavailable'; }
+}
+
 export function macCredentialDialogScript(pid, action = 'inspect') {
   if (!Number.isSafeInteger(pid) || pid < 2 || !['inspect', 'retry', 'quit'].includes(action)) fail('dialog_input');
   return `function run(){var e=Application('System Events');if(!e.uiElementsEnabled())return 'ui_unavailable';
@@ -250,7 +286,7 @@ export async function exerciseCredentialRefresh(dashboard, clock) {
 }
 
 // Retain fixed failure families only; exception messages, URLs and paths stay private.
-export function macCredentialFailureDiagnostics(error) {
+export function macCredentialFailureDiagnostics(error, predecessorUi = null) {
   const launchStages = ['process_group', 'native_intro', 'owned_debugger', 'dashboard_target',
     'dashboard_ready', 'settings_target', 'settings_ready'];
   const launchCodes = ['startup', 'process_inventory', 'preexisting_app', 'local_response',
@@ -263,6 +299,7 @@ export function macCredentialFailureDiagnostics(error) {
     settingsStage: settingsCodes.includes(error?.emptyProfileStage) ? error.emptyProfileStage : null,
     launchOwnedProcessesStopped: typeof error?.ownedMacProcessesStopped === 'boolean'
       ? error.ownedMacProcessesStopped : null,
+    predecessorUi: PREDECESSOR_UI_STATES.has(predecessorUi) ? predecessorUi : null,
   };
 }
 
@@ -274,7 +311,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
     lockedStoreQualified: false, deniedStoreQualified: false, legacyOnlyQualified: false,
     nativeCleanQuitQualified: false, partialMigrationQualified: false,
     completeCredentialFailureMatrixQualified: false };
-  let active = null, fixture = null, stage = 'intake';
+  let active = null, fixture = null, stage = 'intake', predecessorUi = null;
   try {
     const input = validateMacCredentialIntake(intake);
     Object.assign(proof, { runnerRevision: input.runnerRevision, sourceRevision: input.sourceRevision,
@@ -312,7 +349,12 @@ export async function runMacCredentialQualification({ intake, execute = false })
     await fixture.request('seed'); const before = validateCredentialSnapshot(await fixture.request('snapshot'), 'modern');
     proof.fixtureScopes.push({ scenario: 'modern', ...((await fixture.request('select')).scope) });
     await fixture.request('scope');
-    stage = 'predecessor_launch'; active = await launchVerifiedMacSharingApp(verified, environment, { ...launchOptions, untouched: true });
+    stage = 'predecessor_launch'; active = await launchVerifiedMacSharingApp(verified, environment, {
+      ...launchOptions, untouched: true,
+      onFailure: ({ pid, stage: launchStage }) => {
+        if (launchStage === 'native_intro') predecessorUi = observePredecessorUi(pid);
+      },
+    });
     stage = 'predecessor_settings'; await exerciseEmptyProfileSettings(active.settings);
     stage = 'predecessor_opt_out'; await active.settings.evaluate('globalThis.tibotattleDesktop.setSharingEnabled(false)');
     await until(async () => (await active.readSharing())?.enabled === false, 'predecessor_opt_out');
@@ -365,7 +407,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
     proof.credentialContinuityQualified = true; proof.status = 'passed';
   } catch (error) {
     proof.status = 'failed'; proof.failureStage = error.credentialStage ?? stage; proof.failurePhase = stage;
-    proof.failureDiagnostics = macCredentialFailureDiagnostics(error);
+    proof.failureDiagnostics = macCredentialFailureDiagnostics(error, predecessorUi);
     if (error.fixtureFailure) proof.fixtureFailure = error.fixtureFailure;
   }
   finally {

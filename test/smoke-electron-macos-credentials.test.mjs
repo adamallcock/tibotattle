@@ -10,7 +10,8 @@ import test from 'node:test';
 import vm from 'node:vm';
 import { validateMacCredentialIntake, parseMacCredentialArguments, runMacCredentialQualification,
   MAC_CREDENTIAL_CONFIRMATION, credentialFixtureArchiveInspectionScript, validateCredentialSnapshot,
-  expectedCredentialReason, macCredentialDialogScript, exerciseCredentialRefresh, macCredentialFailureDiagnostics,
+  expectedCredentialReason, macCredentialDialogScript, macCredentialPredecessorUiScript,
+  exerciseCredentialRefresh, macCredentialFailureDiagnostics,
   validateCredentialFixtureReply, validateCredentialScope, MAC_CREDENTIAL_FIXTURE_FAILURE_CODES } from '../scripts/smoke-electron-macos-credentials.mjs';
 import { CREDENTIAL_FIXTURE_CASES, credentialFixtureRoot, credentialFixtureConfiguration,
   parseCredentialFixtureArguments, compileCredentialFixture } from '../scripts/prepare-electron-macos-credential-fixture.mjs';
@@ -19,6 +20,7 @@ import { MACOS_LOOPBACK_POLICY, MACOS_LOOPBACK_MODE, macOSLoopbackLaunch,
 import { launchVerifiedMacSharingApp } from '../scripts/run-signed-electron-staging.mjs';
 import { preflightMacCredentialEnvironment } from '../scripts/lib/macos-credential-qualification-intake.mjs';
 import { validateEmptyProfileIntake } from '../scripts/smoke-electron-macos-empty-profile.mjs';
+import { desktopFirstRunDialogCopy } from '../apps/electron/desktop-first-run.js';
 
 const operationId = '4a5361b7-dc54-49cc-92c5-a3e7d42b9a6f';
 const intake = { schemaVersion: 'signed-macos-credential-qualification-v1', runnerRevision: 'e'.repeat(40),
@@ -301,6 +303,31 @@ test('actual native dialog observer scopes actions to the verified PID and never
   assert.equal(expectedCredentialReason('locked', 'SECURE_STORAGE_LOCKED'), true);
 });
 
+test('predecessor UI diagnosis returns only bounded states from the verified PID', () => {
+  const firstRun = desktopFirstRunDialogCopy({ production: true, locale: 'en-US' });
+  let elements = [], securityPrompt = false, owned = true, accessible = true;
+  const windows = () => [{ entireContents: () => elements }];
+  const processes = () => securityPrompt ? [{ name: () => 'SecurityAgent', windows }] : [];
+  processes.whose = query => {
+    assert.deepEqual({ ...query }, { unixId: 123 });
+    return () => owned ? [{ windows }] : [];
+  };
+  const context = { Application: name => {
+    assert.equal(name, 'System Events');
+    return { uiElementsEnabled: () => accessible, applicationProcesses: processes };
+  } };
+  const observe = () => vm.runInNewContext(macCredentialPredecessorUiScript(123) + ';run()', context);
+  const text = value => ({ role: () => 'AXStaticText', value: () => value });
+  elements = [text(firstRun.message)]; assert.equal(observe(), 'first_run_visible');
+  elements = [text('Unable to prepare secure storage')]; assert.equal(observe(), 'secure_storage_warning');
+  elements = [text('Unable to finish updating TiboTattle')]; assert.equal(observe(), 'native_handover_warning');
+  elements = [text('/Users/PRIVATE_SENTINEL')]; assert.equal(observe(), 'other_owned_window');
+  owned = false; assert.equal(observe(), 'owned_process_absent'); owned = true;
+  securityPrompt = true; assert.equal(observe(), 'security_agent_window'); securityPrompt = false;
+  accessible = false; assert.equal(observe(), 'accessibility_unavailable');
+  assert.throws(() => macCredentialPredecessorUiScript('123;injection'));
+});
+
 test('refresh requires a new successful refresh ID and clicks once; stale success and failure cannot pass', async () => {
   for (const scenario of ['success', 'old-success', 'failed', 'unready']) {
     let time = 0, clicks = 0;
@@ -334,16 +361,20 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
     stage: 'native_intro_unexpected', ownedMacProcessesStopped: true,
     message: '/Users/PRIVATE_SENTINEL', stderr: 'SECRET' }), {
     launchStage: 'native_intro', launchCode: 'native_intro_unexpected', settingsStage: null,
-    launchOwnedProcessesStopped: true,
+    launchOwnedProcessesStopped: true, predecessorUi: null,
   });
   assert.deepEqual(macCredentialFailureDiagnostics({ emptyProfileStage: 'settings_effect',
     ownedMacProcessesStopped: false }), {
     launchStage: null, launchCode: null, settingsStage: 'settings_effect', launchOwnedProcessesStopped: false,
+    predecessorUi: null,
   });
   for (const error of [null, {}, { signedLaunchStage: 'PRIVATE_SENTINEL', stage: 'PRIVATE_SENTINEL',
     emptyProfileStage: 'PRIVATE_SENTINEL', ownedMacProcessesStopped: 'true' }]) {
     assert.deepEqual(macCredentialFailureDiagnostics(error), {
       launchStage: null, launchCode: null, settingsStage: null, launchOwnedProcessesStopped: null,
+      predecessorUi: null,
     });
   }
+  assert.equal(macCredentialFailureDiagnostics({}, 'secure_storage_warning').predecessorUi, 'secure_storage_warning');
+  assert.equal(macCredentialFailureDiagnostics({}, '/Users/PRIVATE_SENTINEL').predecessorUi, null);
 });
