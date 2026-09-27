@@ -4716,14 +4716,23 @@ html.community-chart-modal-open body {
   .community-site .topbar {
     column-gap: 3px;
     padding-inline: 8px;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    row-gap: 2px;
   }
   .community-site .brand-icon {
     width: 26px;
     height: 26px;
   }
+  .community-site .primary-nav {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    justify-content: center;
+    flex-wrap: wrap;
+    overflow: visible;
+  }
   .community-site .primary-nav a {
-    padding-inline: .18rem;
-    font-size: .61rem;
+    padding-inline: .4rem;
+    font-size: .69rem;
   }
   .community-site .header-download {
     padding-inline: 0;
