@@ -296,6 +296,7 @@ export const EN_US_CATALOG = Object.freeze({
   "trends.quiet": "Quiet periods with no activity and no quota change are neutral, not errors.",
   "trends.evidence": "Exact windows and evidence",
 
+  "site.features.codex": "Codex",
   "site.features.forecast": "Codex · weekly forecast",
   "site.features.headline": "At this pace the weekly allowance runs out in {duration}",
   "site.features.forecastCopy": "Recent use is running about {ratio}× the pace this window can still sustain, which leaves roughly {gap} with none left before the reset.",
@@ -1179,6 +1180,7 @@ export const ZH_HANS_CATALOG = Object.freeze({
   "trends.quiet": "没有活动且额度没有变化的安静时段是中性的，并非错误。",
   "trends.evidence": "精确窗口与证据",
 
+  "site.features.codex": "Codex",
   "site.features.forecast": "Codex · 每周预测",
   "site.features.headline": "按此节奏，每周额度将在 {duration} 后耗尽",
   "site.features.forecastCopy": "近期使用速度约为此窗口可持续节奏的 {ratio} 倍，重置前约有 {gap} 无剩余额度。",
@@ -2062,6 +2064,7 @@ export const ES_CATALOG = Object.freeze({
   "trends.quiet": "Los períodos sin actividad ni cambios de cuota son neutros, no errores.",
   "trends.evidence": "Ventanas exactas y evidencia",
 
+  "site.features.codex": "Codex",
   "site.features.forecast": "Codex · previsión semanal",
   "site.features.headline": "A este ritmo la cuota semanal se agota en {duration}",
   "site.features.forecastCopy": "El uso reciente es aproximadamente {ratio}× el ritmo sostenible, lo que deja unos {gap} sin cuota antes del reinicio.",
