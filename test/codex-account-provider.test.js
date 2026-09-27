@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { constants as fsConstants } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
@@ -82,8 +85,13 @@ test("Codex binary diagnostics preserve selection precedence without exposing pa
   const privateOverride = "/private/codex-builds/review/codex";
   const diagnostic = await accountFacade.inspectCodexBinary({
     environment: { CODEX_BIN: privateOverride },
-    accessFile: async (candidate) => {
+    statFile: async (candidate) => {
       assert.equal(candidate, privateOverride);
+      return { isFile: () => true };
+    },
+    accessFile: async (candidate, mode) => {
+      assert.equal(candidate, privateOverride);
+      assert.equal(mode, fsConstants.X_OK);
     },
     readVersion: async (candidate) => {
       assert.equal(candidate, privateOverride);
@@ -92,8 +100,9 @@ test("Codex binary diagnostics preserve selection precedence without exposing pa
   });
 
   assert.deepEqual(diagnostic, {
-    schemaVersion: "codex-binary-diagnostic-v0.1",
+    schemaVersion: "codex-binary-diagnostic-v0.2",
     source: "environment_override",
+    location: "explicit_override",
     versionStatus: "available",
     version: "0.149.1",
   });
@@ -103,11 +112,7 @@ test("Codex binary diagnostics preserve selection precedence without exposing pa
 test("Codex binary diagnostics fail closed on malformed or unavailable versions", async () => {
   const diagnostic = await accountFacade.inspectCodexBinary({
     environment: {},
-    accessFile: async () => {
-      const error = new Error("missing");
-      error.code = "ENOENT";
-      throw error;
-    },
+    statFile: async () => ({ isFile: () => false }),
     readVersion: async (candidate) => {
       assert.equal(candidate, "codex");
       return "private warning with /Users/someone/project";
@@ -115,11 +120,80 @@ test("Codex binary diagnostics fail closed on malformed or unavailable versions"
   });
 
   assert.deepEqual(diagnostic, {
-    schemaVersion: "codex-binary-diagnostic-v0.1",
+    schemaVersion: "codex-binary-diagnostic-v0.2",
     source: "path",
+    location: "path",
     versionStatus: "unavailable",
     version: null,
   });
+});
+
+test("Codex binary discovery accepts modern and legacy bundles without selecting non-executable files", async () => {
+  const system = join(tmpdir(), "synthetic-system-apps");
+  const user = join(tmpdir(), "synthetic-user");
+  const chatgptModern = join(system, "ChatGPT.app/Contents/Resources/codex-cli/bin/codex");
+  const chatgptLegacy = join(system, "ChatGPT.app/Contents/Resources/codex");
+  const userModern = join(user, "Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex");
+  const userLegacy = join(user, "Applications/ChatGPT.app/Contents/Resources/codex");
+  const codexModern = join(system, "Codex.app/Contents/Resources/codex-cli/bin/codex");
+  const codexLegacy = join(system, "Codex.app/Contents/Resources/codex");
+  const override = join(system, "override/codex");
+  const available = new Set([
+    chatgptModern, chatgptLegacy, userModern, userLegacy, codexModern, codexLegacy, override,
+  ]);
+  const denied = new Set();
+  const options = {
+    platform: "darwin",
+    applicationsDir: system,
+    environment: { HOME: user },
+    statFile: async (candidate) => ({ isFile: () => available.has(candidate) }),
+    accessFile: async (candidate, mode) => {
+      assert.equal(mode, fsConstants.X_OK);
+      if (denied.has(candidate)) throw Object.assign(new Error("not executable"), { code: "EACCES" });
+    },
+  };
+
+  assert.equal(await accountFacade.findCodexBinary(options), chatgptModern);
+  assert.equal(await accountFacade.findCodexBinary({
+    ...options, environment: { ...options.environment, CODEX_BIN: override },
+  }), override);
+  denied.add(chatgptModern);
+  assert.equal(await accountFacade.findCodexBinary(options), chatgptLegacy);
+  available.delete(chatgptLegacy);
+  assert.equal(await accountFacade.findCodexBinary(options), userModern);
+  available.delete(userModern);
+  assert.equal(await accountFacade.findCodexBinary(options), userLegacy);
+  available.delete(userLegacy);
+  assert.equal(await accountFacade.findCodexBinary(options), codexModern);
+  available.delete(codexModern);
+  assert.equal(await accountFacade.findCodexBinary(options), codexLegacy);
+  available.delete(codexLegacy);
+  assert.equal(await accountFacade.findCodexBinary(options), "codex");
+  assert.equal(await accountFacade.findCodexBinary({ ...options, platform: "linux" }), "codex");
+});
+
+test("Codex binary diagnostic names the bundle layout without revealing the user directory", async () => {
+  const privateHome = join(tmpdir(), "synthetic-private-home");
+  const selected = join(privateHome, "Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex");
+  const diagnostic = await accountFacade.inspectCodexBinary({
+    platform: "darwin",
+    applicationsDir: join(tmpdir(), "synthetic-system-apps"),
+    environment: { HOME: privateHome },
+    statFile: async (candidate) => ({ isFile: () => candidate === selected }),
+    accessFile: async (_candidate, mode) => assert.equal(mode, fsConstants.X_OK),
+    readVersion: async (candidate) => {
+      assert.equal(candidate, selected);
+      return "codex-cli 0.158.0-alpha.2.1\n";
+    },
+  });
+  assert.deepEqual(diagnostic, {
+    schemaVersion: "codex-binary-diagnostic-v0.2",
+    source: "chatgpt_bundled",
+    location: "user_bundled_cli",
+    versionStatus: "available",
+    version: "0.158.0-alpha.2.1",
+  });
+  assert.equal(JSON.stringify(diagnostic).includes(privateHome), false);
 });
 
 test("rate-limit sanitation retains provider duration and fails closed on plan evidence", () => {

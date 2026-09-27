@@ -23,6 +23,8 @@ export const OPENAI_CODEX_UNPRICED_MODEL_IDS = Object.freeze([
   // merely unpriced - an API-equivalent figure for it is not comparable with
   // the primary pool at all.
   "gpt-5.3-codex-spark",
+  // Reviewed as a forecast identity, with no published API price card.
+  "gpt-6.1-astra",
 ]);
 
 export const OPENAI_CODEX_SPARK_MODEL_ID = "gpt-5.3-codex-spark";

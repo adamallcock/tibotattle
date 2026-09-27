@@ -1194,7 +1194,14 @@ export async function run(
       codex_bundled: "Codex bundled",
       path: "PATH",
     }[binary.source] ?? "unknown source";
-    console.log(`Codex binary: ${binarySource} (${binary.versionStatus === "available" ? binary.version : "version unavailable"})`);
+    const binaryLocation = {
+      system_bundled_cli: "system app CLI layout",
+      system_legacy_resource: "system app legacy layout",
+      user_bundled_cli: "user app CLI layout",
+      user_legacy_resource: "user app legacy layout",
+    }[binary.location];
+    const binaryDescription = binaryLocation ? `${binarySource}, ${binaryLocation}` : binarySource;
+    console.log(`Codex binary: ${binaryDescription} (${binary.versionStatus === "available" ? binary.version : "version unavailable"})`);
     const capturedAt = new Date().toISOString();
     const snapshot = await readSanitizedAccountSnapshot(capturedAt);
     console.log("Codex app-server: available");

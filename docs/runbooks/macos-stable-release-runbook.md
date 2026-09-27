@@ -126,8 +126,9 @@ YAML feeds alone does not update either native Sparkle feed.
 The final application remains the ordinary signed Electron build, with its own
 outgoing updater configuration. Follow the shared
 [Mac bundle-version allocation](../decisions/2026-09-11-electron-macos-bundle-version-allocation.md):
-0.1.24 is allocated bundle version 1031, following 0.1.23's 1030 and native
-0.1.18's 1026; older allocations remain unchanged. Allocation does not qualify
+0.1.24 is allocated bundle version 1032, following 0.1.23's 1030 and native
+0.1.18's 1026; the unpublished 1031 candidate was superseded. A successor
+stable version needs its own reviewed allocation. Allocation does not qualify
 an artifact. The provenance build number is a separate value. Retain the
 predecessor's exact public SUPublicEDKey
 in the signed Electron Info.plist: Sparkle refuses removal of that key even

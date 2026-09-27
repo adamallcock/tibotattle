@@ -1,7 +1,9 @@
-import { access } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { access, stat } from "node:fs/promises";
 import { execFile, spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import { deriveOpenAIAccountScope, sanitizeAccountScope } from "./account-scope.js";
@@ -16,7 +18,7 @@ import { RELEASE_VERSION } from "../../../config/release-manifest.js";
 const DEFAULT_TIMEOUT_MS = 20_000;
 const BINARY_VERSION_TIMEOUT_MS = 5_000;
 const BINARY_VERSION_MAXIMUM_BYTES = 4_096;
-const CODEX_BINARY_DIAGNOSTIC_SCHEMA_VERSION = "codex-binary-diagnostic-v0.1";
+const CODEX_BINARY_DIAGNOSTIC_SCHEMA_VERSION = "codex-binary-diagnostic-v0.2";
 const execFileAsync = promisify(execFile);
 const ACCOUNT_HMAC_ENV = "APP_USAGEMONITOR_ACCOUNT_HMAC_KEY";
 const VOLATILE_RESET_CREDIT_INVENTORY = Symbol(
@@ -41,9 +43,10 @@ export function codexAppServerChildEnv(environment = process.env) {
   return childEnvironment;
 }
 
-async function isExecutable(path, accessFile = access) {
+async function isExecutable(path, accessFile = access, statFile = stat) {
   try {
-    await accessFile(path);
+    if (!(await statFile(path)).isFile()) return false;
+    await accessFile(path, fsConstants.X_OK);
     return true;
   } catch {
     return false;
@@ -53,28 +56,44 @@ async function isExecutable(path, accessFile = access) {
 async function resolveCodexBinary({
   environment = process.env,
   accessFile = access,
+  statFile = stat,
+  platform = process.platform,
+  applicationsDir = "/Applications",
 } = {}) {
-  const candidates = [
-    {
-      binary: environment.CODEX_BIN,
-      source: "environment_override",
-    },
-    {
-      binary: "/Applications/ChatGPT.app/Contents/Resources/codex",
-      source: "chatgpt_bundled",
-    },
-    {
-      binary: "/Applications/Codex.app/Contents/Resources/codex",
-      source: "codex_bundled",
-    },
-  ].filter((candidate) => (
-    typeof candidate.binary === "string" && candidate.binary.length > 0
-  ));
-
-  for (const candidate of candidates) {
-    if (await isExecutable(candidate.binary, accessFile)) return candidate;
+  const candidates = [{
+    binary: environment.CODEX_BIN,
+    source: "environment_override",
+    location: "explicit_override",
+  }];
+  if (platform === "darwin") {
+    const installations = [{ directory: applicationsDir, location: "system" }];
+    if (typeof environment.HOME === "string" && isAbsolute(environment.HOME)) {
+      installations.push({ directory: join(environment.HOME, "Applications"), location: "user" });
+    }
+    for (const { app, source } of [
+      { app: "ChatGPT.app", source: "chatgpt_bundled" },
+      { app: "Codex.app", source: "codex_bundled" },
+    ]) {
+      for (const installation of installations) {
+        for (const { relativePath, layout } of [
+          { relativePath: "codex-cli/bin/codex", layout: "bundled_cli" },
+          { relativePath: "codex", layout: "legacy_resource" },
+        ]) {
+          candidates.push({
+            binary: join(installation.directory, app, "Contents", "Resources", relativePath),
+            source,
+            location: `${installation.location}_${layout}`,
+          });
+        }
+      }
+    }
   }
-  return { binary: "codex", source: "path" };
+  for (const candidate of candidates.filter((candidate) => (
+    typeof candidate.binary === "string" && candidate.binary.length > 0
+  ))) {
+    if (await isExecutable(candidate.binary, accessFile, statFile)) return candidate;
+  }
+  return { binary: "codex", source: "path", location: "path" };
 }
 
 export async function findCodexBinary(options = {}) {
@@ -115,9 +134,14 @@ function normalizedCodexBinaryVersion(value) {
 export async function inspectCodexBinary({
   environment = process.env,
   accessFile = access,
+  statFile = stat,
+  platform = process.platform,
+  applicationsDir = "/Applications",
   readVersion = readCodexBinaryVersion,
 } = {}) {
-  const selected = await resolveCodexBinary({ environment, accessFile });
+  const selected = await resolveCodexBinary({
+    environment, accessFile, statFile, platform, applicationsDir,
+  });
   let version = null;
   try {
     version = normalizedCodexBinaryVersion(await readVersion(selected.binary, {
@@ -130,6 +154,7 @@ export async function inspectCodexBinary({
   return {
     schemaVersion: CODEX_BINARY_DIAGNOSTIC_SCHEMA_VERSION,
     source: selected.source,
+    location: selected.location,
     versionStatus: version === null ? "unavailable" : "available",
     version,
   };
