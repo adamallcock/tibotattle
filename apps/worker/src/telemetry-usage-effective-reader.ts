@@ -378,14 +378,31 @@ async function assertOwnerScopeCurrent(
  * any totals are folded. Expansion later deliberately removes the day filter
  * so a conflicting/misaligned timestamp for the same occurrence cannot become
  * an independently priced row on another day. */
+// Completeness is an immutable chunk property. Materialize it once per owner,
+// before occurrence expansion, so a page never recounts a chunk for every row.
+const COMPLETE_CHUNKS_SQL = `owner_scope(participant_id) AS (SELECT ?),
+  complete_v1_chunks AS MATERIALIZED (
+    SELECT chunk.id FROM owner_scope owner
+      JOIN telemetry_v1_chunks chunk ON chunk.participant_id=owner.participant_id
+     WHERE chunk.superseded_at IS NULL AND chunk.accepted_record_count=chunk.record_count
+       AND chunk.record_count=(SELECT count(*) FROM typed_v1_record_admissions p WHERE p.chunk_id=chunk.id)
+  ), complete_v11_chunks AS MATERIALIZED (
+    SELECT chunk.id FROM owner_scope owner
+      JOIN telemetry_v11_chunks chunk ON chunk.participant_id=owner.participant_id
+     WHERE chunk.record_count=(SELECT count(*) FROM typed_v11_record_admissions p WHERE p.chunk_id=chunk.id)
+  )`;
+
+// Keep the owner lookup outside compatibility decoding. Namespace/format scans
+// expand unrelated owners before the LIMIT, including an owner with no rows.
 const CANDIDATE_SQL = `
-  WITH direct AS (
+  WITH ${COMPLETE_CHUNKS_SQL}, direct AS (
     SELECT r.occurrence_id,r.observed_at_ms
-      FROM typed_telemetry_compatibility_records r
+      FROM typed_v1_owner_memberships owner_membership
+      CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
+       ON scoped_record.owner_id=owner_membership.typed_owner_id AND scoped_record.format=10
+      CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
       JOIN typed_v1_admission_state v1
        ON v1.id=1 AND v1.runtime_contract_version=1 AND v1.source_namespace=?
-      JOIN typed_v1_owner_memberships owner_membership
-       ON owner_membership.participant_id=r.participant_id
       JOIN typed_telemetry_owners typed_owner
        ON typed_owner.id=owner_membership.typed_owner_id
       AND typed_owner.namespace_id=v1.namespace_id
@@ -396,17 +413,19 @@ const CANDIDATE_SQL = `
        AND chunk.accepted_record_count=chunk.record_count
       JOIN typed_v1_event_sources event ON event.chunk_id=chunk.id
        AND event.owner_digest=? AND event.source_namespace=v1.source_namespace
-      WHERE r.participant_id=? AND r.source_namespace=v1.source_namespace
+      WHERE owner_membership.participant_id=? AND r.participant_id=owner_membership.participant_id
+        AND r.source_namespace=v1.source_namespace
         AND r.namespace_id=v1.namespace_id AND r.owner_id=typed_owner.id AND r.format_code=10
         AND r.stream='usage' AND r.observed_day=?
-        AND chunk.record_count=(SELECT count(*) FROM typed_v1_record_admissions p WHERE p.chunk_id=chunk.id)
+        AND EXISTS(SELECT 1 FROM complete_v1_chunks complete WHERE complete.id=chunk.id)
     UNION ALL
     SELECT r.occurrence_id,r.observed_at_ms
-      FROM typed_telemetry_compatibility_records r
+      FROM typed_v11_owner_memberships owner_membership
+      CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
+       ON scoped_record.owner_id=owner_membership.typed_owner_id AND scoped_record.format=11
+      CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
       JOIN typed_v11_admission_state v11
        ON v11.id=1 AND v11.runtime_contract_version=1
-      JOIN typed_v11_owner_memberships owner_membership
-       ON owner_membership.participant_id=r.participant_id
       JOIN typed_telemetry_owners typed_owner
        ON typed_owner.id=owner_membership.typed_owner_id
       AND typed_owner.namespace_id=v11.namespace_id
@@ -428,10 +447,11 @@ const CANDIDATE_SQL = `
       JOIN device_credentials generation_device
        ON generation_device.id=generation.device_id
        AND generation_device.participant_id=generation.participant_id
-      WHERE v11.source_namespace=? AND r.participant_id=? AND r.source_namespace=v11.source_namespace
+      WHERE v11.source_namespace=? AND owner_membership.participant_id=?
+        AND r.participant_id=owner_membership.participant_id AND r.source_namespace=v11.source_namespace
         AND r.namespace_id=v11.namespace_id AND r.owner_id=typed_owner.id AND r.format_code=11
         AND r.stream='usage' AND r.observed_day=?
-        AND chunk.record_count=(SELECT count(*) FROM typed_v11_record_admissions p WHERE p.chunk_id=chunk.id)
+        AND EXISTS(SELECT 1 FROM complete_v11_chunks complete WHERE complete.id=chunk.id)
   ), grouped AS (
     SELECT occurrence_id,MIN(observed_at_ms) AS observed_at_ms FROM direct GROUP BY occurrence_id
   )
@@ -442,6 +462,7 @@ const CANDIDATE_SQL = `
 async function readDirectCandidates(db: D1Database, scope: OwnerScope, options: ReturnType<typeof normalizeOptions>): Promise<CandidateRow[]> {
   try {
     const rows = (await db.prepare(CANDIDATE_SQL).bind(
+      scope.participant_id,
       options.sourceNamespace, options.ownerDigest, scope.participant_id, options.day,
       options.ownerDigest, scope.participant_id, options.sourceNamespace, scope.participant_id, options.day,
       options.after.observedAtMs, options.after.observedAtMs, options.after.occurrenceId, options.limit + 1,
@@ -454,15 +475,16 @@ async function readDirectCandidates(db: D1Database, scope: OwnerScope, options: 
 }
 
 const DIRECT_SOURCE_SQL = `
-  WITH requested(occurrence_id) AS MATERIALIZED (SELECT value FROM json_each(?)),
+  WITH ${COMPLETE_CHUNKS_SQL}, requested(occurrence_id) AS MATERIALIZED (SELECT value FROM json_each(?)),
   direct AS (
     SELECT r.storage_row_id,r.source_namespace,r.participant_id,r.device_id,r.occurrence_id,
            r.observed_at_ms,r.canonical_sha256,r.format_code
-      FROM typed_telemetry_compatibility_records r
+      FROM typed_v1_owner_memberships owner_membership
+      CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
+       ON scoped_record.owner_id=owner_membership.typed_owner_id AND scoped_record.format=10
+      CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
       JOIN typed_v1_admission_state v1
        ON v1.id=1 AND v1.runtime_contract_version=1 AND v1.source_namespace=?
-      JOIN typed_v1_owner_memberships owner_membership
-       ON owner_membership.participant_id=r.participant_id
       JOIN typed_telemetry_owners typed_owner
        ON typed_owner.id=owner_membership.typed_owner_id
       AND typed_owner.namespace_id=v1.namespace_id
@@ -474,18 +496,20 @@ const DIRECT_SOURCE_SQL = `
        AND chunk.accepted_record_count=chunk.record_count
       JOIN typed_v1_event_sources event ON event.chunk_id=chunk.id
        AND event.owner_digest=? AND event.source_namespace=v1.source_namespace
-      WHERE r.participant_id=? AND r.source_namespace=v1.source_namespace
+      WHERE owner_membership.participant_id=? AND r.participant_id=owner_membership.participant_id
+        AND r.source_namespace=v1.source_namespace
         AND r.namespace_id=v1.namespace_id AND r.owner_id=typed_owner.id
         AND r.format_code=10 AND r.stream='usage'
-        AND chunk.record_count=(SELECT count(*) FROM typed_v1_record_admissions p WHERE p.chunk_id=chunk.id)
+        AND EXISTS(SELECT 1 FROM complete_v1_chunks complete WHERE complete.id=chunk.id)
     UNION
     SELECT r.storage_row_id,r.source_namespace,r.participant_id,r.device_id,r.occurrence_id,
            r.observed_at_ms,r.canonical_sha256,r.format_code
-      FROM typed_telemetry_compatibility_records r
+      FROM typed_v11_owner_memberships owner_membership
+      CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
+       ON scoped_record.owner_id=owner_membership.typed_owner_id AND scoped_record.format=11
+      CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
       JOIN typed_v11_admission_state v11
        ON v11.id=1 AND v11.runtime_contract_version=1
-      JOIN typed_v11_owner_memberships owner_membership
-       ON owner_membership.participant_id=r.participant_id
       JOIN typed_telemetry_owners typed_owner
        ON typed_owner.id=owner_membership.typed_owner_id
       AND typed_owner.namespace_id=v11.namespace_id
@@ -508,10 +532,11 @@ const DIRECT_SOURCE_SQL = `
       JOIN device_credentials generation_device
        ON generation_device.id=generation.device_id
        AND generation_device.participant_id=generation.participant_id
-      WHERE v11.source_namespace=? AND r.participant_id=? AND r.source_namespace=v11.source_namespace
+      WHERE v11.source_namespace=? AND owner_membership.participant_id=?
+        AND r.participant_id=owner_membership.participant_id AND r.source_namespace=v11.source_namespace
         AND r.namespace_id=v11.namespace_id AND r.owner_id=typed_owner.id
         AND r.format_code=11 AND r.stream='usage'
-        AND chunk.record_count=(SELECT count(*) FROM typed_v11_record_admissions p WHERE p.chunk_id=chunk.id)
+        AND EXISTS(SELECT 1 FROM complete_v11_chunks complete WHERE complete.id=chunk.id)
   ), grouped AS (
     /* Repeated retained revisions with identical canonical bytes are one
      * semantic source variant. Keep the earliest physical row for audit, but
@@ -529,6 +554,7 @@ async function readDirectSourceRows(db: D1Database, scope: OwnerScope, options: 
   if (occurrenceIds.length < 1 || occurrenceIds.length > MAX_EFFECTIVE_USAGE_PAGE) return [];
   try {
     const rows = (await db.prepare(DIRECT_SOURCE_SQL).bind(
+      scope.participant_id,
       JSON.stringify(occurrenceIds), options.sourceNamespace, options.ownerDigest, scope.participant_id,
       options.ownerDigest, scope.participant_id, options.sourceNamespace, scope.participant_id,
       MAX_EFFECTIVE_USAGE_SOURCE_ROWS + 1,
@@ -773,6 +799,7 @@ async function readGenericDirectCandidates(
 ): Promise<GenericCandidateRow[]> {
   try {
     const rows = (await db.prepare(GENERIC_CANDIDATE_SQL).bind(
+      scope.participant_id,
       options.sourceNamespace, options.stream, options.ownerDigest, scope.participant_id, options.stream, options.day,
       options.stream, options.ownerDigest, scope.participant_id, options.sourceNamespace, scope.participant_id,
       options.stream, options.day, options.after.observedAtMs, options.after.observedAtMs,
@@ -796,6 +823,7 @@ async function readGenericSourceRows(
   if (occurrenceIds.length < 1 || occurrenceIds.length > MAX_EFFECTIVE_USAGE_PAGE) return [];
   try {
     const rows = (await db.prepare(GENERIC_SOURCE_SQL).bind(
+      scope.participant_id,
       JSON.stringify(occurrenceIds), options.sourceNamespace, options.stream, options.ownerDigest,
       scope.participant_id, options.stream, options.stream, options.ownerDigest, scope.participant_id,
       options.sourceNamespace, scope.participant_id, options.stream, MAX_EFFECTIVE_USAGE_SOURCE_ROWS + 1,
@@ -1036,7 +1064,7 @@ export async function readEffectiveTelemetryOwnerDays(db:D1Database,input:Omit<E
     .replaceAll('SELECT r.occurrence_id,r.observed_at_ms','SELECT r.observed_day')
     .replaceAll('r.observed_day=?','r.observed_day>=? AND r.observed_day<=?');
   const rows=(await db.prepare(`${prefix}) SELECT DISTINCT observed_day FROM direct ORDER BY observed_day LIMIT 102`)
-    .bind(options.sourceNamespace,options.stream,options.ownerDigest,scope.participant_id,options.stream,fromDay,throughDay,
+    .bind(scope.participant_id,options.sourceNamespace,options.stream,options.ownerDigest,scope.participant_id,options.stream,fromDay,throughDay,
       options.stream,options.ownerDigest,scope.participant_id,options.sourceNamespace,scope.participant_id,
       options.stream,fromDay,throughDay).all<{observed_day:string}>()).results;
   const days=new Set(rows.map(row=>validDay(row.observed_day)));

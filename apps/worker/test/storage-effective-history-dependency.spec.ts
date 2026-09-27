@@ -18,6 +18,7 @@ import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../src/
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from "../src/telemetry-v11-domain";
 import { activateTelemetryV12Domain, createTelemetryV12DomainPredecessor } from "../src/telemetry-v12-domain";
 import { effectiveHistoryDependency, effectiveHistoryPin } from "../src/storage-effective-history";
+import { readEffectiveTelemetryOwnerDayPage, readEffectiveTelemetryOwnerDays } from "../src/telemetry-usage-effective-reader";
 import { readStorageCommunityOwnerPage } from "../src/storage-community-authority";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
 import { authenticateDevice, claimDeviceUploadAuthorization, createDeviceUploadAuthorization } from "../src/device-auth";
@@ -189,6 +190,73 @@ async function readDependency(options: { includeSessions?: boolean } = {}) {
 }
 
 describe("closed effective history dependency", () => {
+  it("keeps occurrence-link reads scoped to the owner while retaining outside-day conflicts", async () => {
+    const selectedDay = day(), outsideDay = dayAfter(selectedDay);
+    await db().prepare("UPDATE telemetry_v12_runtime SET state='active' WHERE id=1").run();
+    const fixture = await createV11DeviceFixture(db());
+    await grantTelemetryV12Consent(db(), fixture, telemetryV12RequiredConsent());
+    await prepareOwner(fixture.participantId);
+    const occurrence = `event:v2:${"a".repeat(64)}`;
+    const selected = await stageV12Day(fixture, selectedDay, [v12UsageRecord(selectedDay, occurrence)]);
+    const outside = await stageV12Day(fixture, outsideDay, [v12UsageRecord(outsideDay, occurrence)]);
+    await activateV12(fixture, [selected, outside]);
+
+    const measure = async () => {
+      let rowsRead = 0;
+      const source = new Proxy(db(), { get(target, key) {
+        if (key === "prepare") return (sql: string) => {
+          const wrap = (statement: D1PreparedStatement): D1PreparedStatement => new Proxy(statement, {
+            get(inner, member) {
+              if (member === "bind") return (...values: unknown[]) => wrap(inner.bind(...values));
+              if (member === "all") return async () => {
+                const result = await inner.all();
+                if (sql.includes("selected(occurrence_id)") || sql.includes("direct AS (")) {
+                  rowsRead += result.meta.rows_read;
+                }
+                return result;
+              };
+              const value = Reflect.get(inner, member);
+              return typeof value === "function" ? value.bind(inner) : value;
+            },
+          });
+          return wrap(target.prepare(sql));
+        };
+        const value = Reflect.get(target, key);
+        return typeof value === "function" ? value.bind(target) : value;
+      } });
+      const owner = (await readStorageCommunityOwnerPage(db()))
+        .find(value => value.participantId === fixture.participantId)!;
+      const dependency = await effectiveHistoryDependency(source, owner, namespace, selectedDay, selectedDay);
+      for (const stream of ["usage", "quota", "session"] as const) {
+        const scope = { sourceNamespace: namespace, ownerDigest: owner.ownerDigest!,
+          ownerRevision: owner.ownerRevision, authorityEpoch: owner.authorityEpoch, stream };
+        const page = await readEffectiveTelemetryOwnerDayPage(source, { ...scope, day: selectedDay, limit: 1 });
+        expect(page.rows).toHaveLength(stream === "usage" ? 1 : 0);
+        if (stream === "usage") expect(page.rows[0]).toMatchObject({ status: "conflict", eventTimeConflict: true });
+        const days = await readEffectiveTelemetryOwnerDays(source,
+          { ...scope, fromDay: selectedDay, throughDay: outsideDay });
+        expect(days).toEqual(stream === "usage" ? [selectedDay, outsideDay] : []);
+      }
+      expect(rowsRead).toBeGreaterThan(0);
+      return { dependency, rowsRead };
+    };
+    const before = await measure();
+    expect(before.dependency.occurrenceLinks).toEqual([
+      expect.objectContaining({ family: "v12", source_day: outsideDay, source_digest: outside.manifestDigest }),
+    ]);
+
+    const unrelated = await createV11DeviceFixture(db(), { grant: true });
+    const records = Array.from({ length: 600 }, (_, index) => v11UsageRecord(selectedDay, "b", {
+      eventId: `event:v2:${index.toString(16).padStart(64, "0")}`,
+    }));
+    await activate(unrelated, [await stage(unrelated, await makeV11Day(selectedDay, { usage: records }))]);
+    const after = await measure();
+    expect(after.dependency).toEqual(before.dependency);
+    // Native D1 read counts catch a namespace-wide SEARCH as well as a SCAN.
+    // Unrelated records must not be decoded or have their chunk proofs counted.
+    expect(after.rowsRead).toBeLessThanOrEqual(before.rowsRead + 200);
+  }, 60_000);
+
   it("reuses the selected-window identity across outside-day appends and changes it for late in-window evidence", async () => {
     const selectedDay = day();
     const outsideDay = dayAfter(selectedDay);
