@@ -2363,16 +2363,43 @@ function visibleInRenderer(element) {
     && rect.height > 0;
 }
 
+export function realHistoryDashboardObservationValid({
+  latest,
+  source,
+  mode,
+  observedAt,
+  expectedSource,
+} = {}) {
+  return mode === "real_local_evidence"
+    && typeof observedAt === "string"
+    && Number.isFinite(Date.parse(observedAt))
+    && typeof latest === "string"
+    && latest.length > 0
+    && latest !== "Checking…"
+    && latest !== "No timestamp"
+    && typeof source === "string"
+    && source.length > 0
+    && source === expectedSource;
+}
+
 async function assertDashboardData(session) {
   try {
     return await waitFor(async () => {
-      const snapshot = await session.cdp.evaluate(`(() => {
+      const snapshot = await session.cdp.evaluate(`(async () => {
         const latest = document.querySelector("#latest-observation")?.textContent?.trim() ?? "";
         const source = document.querySelector("#data-source")?.textContent?.trim() ?? "";
-        return latest.length > 0 && latest !== "Checking…"
-          && source.toLowerCase().includes("local companion")
-          ? { populated: true }
-          : null;
+        const response = await fetch('/api/local/overview', { cache: 'no-store' });
+        if (!response.ok) return null;
+        const overview = await response.json();
+        const observedAt = overview?.freshness?.latestObservedAt;
+        const { formatLocal } = await import('/ui-format.js');
+        return ${realHistoryDashboardObservationValid.toString()}({
+          latest,
+          source,
+          mode: overview?.mode,
+          observedAt,
+          expectedSource: formatLocal(observedAt),
+        }) ? { populated: true } : null;
       })()`);
       return snapshot?.populated === true ? snapshot : null;
     }, REAL_HISTORY_QA_TIMEOUTS.uiMs, "real-history dashboard data");

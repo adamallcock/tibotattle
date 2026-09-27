@@ -340,7 +340,10 @@ export function createRefreshPollingBudget({
       return now() < deadlineMs;
     },
     noteSettling() {
-      deadlineMs = Math.max(deadlineMs, now() + settlementGraceMs);
+      // A terminal timeout has already ended the accepted worker pass. Give
+      // its checkpoint a short settlement grace, even if the original cold
+      // scan budget still had hours remaining.
+      deadlineMs = now() + settlementGraceMs;
     },
     canContinue() {
       return continuations < maximumContinuations;

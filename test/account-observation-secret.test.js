@@ -885,8 +885,9 @@ test("doctor, register, capture, and collector CLI paths share the injected prod
   const dependencies = {
     selectAccountObservationSecret,
     inspectCodexBinaryDiagnostic: async () => ({
-      schemaVersion: "codex-binary-diagnostic-v0.1",
+      schemaVersion: "codex-binary-diagnostic-v0.2",
       source: "chatgpt_bundled",
+      location: "system_bundled_cli",
       versionStatus: "available",
       version: "0.149.1",
     }),
@@ -898,7 +899,7 @@ test("doctor, register, capture, and collector CLI paths share the injected prod
   console.log = (...values) => { lines.push(values.join(" ")); };
   try {
     await run(["doctor"], dependencies);
-    assert.match(lines.join("\n"), /Codex binary: ChatGPT bundled \(0\.149\.1\)/);
+    assert.match(lines.join("\n"), /Codex binary: ChatGPT bundled, system app CLI layout \(0\.149\.1\)/);
     assert.match(lines.join("\n"), /Account scope: available/);
     assert.equal(lines.join("\n").includes("private.owner"), false);
     assert.equal(lines.join("\n").includes(secret.toString("base64url")), false);
@@ -964,8 +965,9 @@ test("doctor reports credential recovery states as distinct content-free codes",
           },
         }),
         inspectCodexBinaryDiagnostic: async () => ({
-          schemaVersion: "codex-binary-diagnostic-v0.1",
+          schemaVersion: "codex-binary-diagnostic-v0.2",
           source: "path",
+          location: "path",
           versionStatus: "unavailable",
           version: null,
         }),

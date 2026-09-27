@@ -1069,6 +1069,22 @@ test("refresh polling budget gives each accepted continuation a fresh window", (
   assert.equal(budget.noteContinuation(), false);
 });
 
+test("terminal refresh timeout caps a still-open cold-scan polling window", () => {
+  let nowMs = 1_000;
+  const budget = createRefreshPollingBudget({
+    now: () => nowMs,
+    windowMs: 241 * 60 * 1_000,
+    settlementGraceMs: 30_000,
+  });
+  nowMs += 5 * 60 * 1_000;
+  assert.equal(budget.hasTime(), true);
+  budget.noteSettling();
+  nowMs += 29_999;
+  assert.equal(budget.hasTime(), true);
+  nowMs += 1;
+  assert.equal(budget.hasTime(), false);
+});
+
 test("default local analysis permits only two bounded continuations", () => {
   const budget = createRefreshPollingBudget();
   assert.equal(LOCAL_REFRESH_POLLING_WINDOW_MS, 241 * 60 * 1_000);

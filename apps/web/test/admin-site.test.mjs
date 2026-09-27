@@ -2046,6 +2046,53 @@ test("stranded-upload audit entries say what ran instead of a maintenance pass",
   });
 });
 
+test("the processing pipeline shows every stage, observed movement and a publication waiting on delivery", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const graph = await fixture("admin-reconstruction-graph-valid.json");
+  const read = (generatedAt, appliedSequence, daysDone) => ({
+    ...graph, generatedAt,
+    pipeline: {
+      ingestion: { journalHead: 27650, latestRecordedAt: "2026-09-17T11:55:00.000Z" },
+      delivery: { appliedSequence, pendingChanges: 27650 - appliedSequence, pendingActivations: 27650 - appliedSequence - 1,
+        current: { fromDay: "2026-05-27", throughDay: "2026-08-28", nextDay: "2026-06-09", daysDone, daysTotal: 94 } },
+      daily: { queuedDays: 229, oldestQueuedDay: "2026-05-04", newestQueuedDay: "2026-09-16",
+        lastReleasedAt: "2026-09-17T07:00:00.000Z", releasedLastHour: 0 },
+    },
+  });
+  const reads = [read("2026-09-17T12:00:00.000Z", 27636, 13), read("2026-09-17T12:05:00.000Z", 27636, 20)];
+  let progressReads = 0, failProgress = false;
+  await withAdminPage(async (path, init) => {
+    if (path === ADMIN_READ_PATHS[3] && init?.method !== "POST") {
+      if (failProgress) return unavailableResponse();
+      return response(reads[Math.min(progressReads++, reads.length - 1)]);
+    }
+    return healthyAdminRead(path, overview);
+  }, async documentRef => {
+    const stages = documentRef.byId.get("pipeline-stages");
+    const badge = documentRef.byId.get("pipeline-badge");
+    await waitFor(() => stages.children.length === 4);
+    const texts = () => stages.children.map((card) => allText(card));
+    assert.equal(badge.textContent, "Delivering · 14 changes behind");
+    const [ingestion, delivery, daily, allowance] = texts();
+    assert.match(ingestion, /Ingestion journal .*27,650 changes recorded Latest .*\(5 min ago\)/u);
+    assert.match(delivery, /Delivery into analytics .*14 changes behind · 13 device activations Current device: 13 of 94 days folded \(May 27 – Aug 28\)$/u);
+    assert.match(daily, /229 days queued · May 4 – Sep 16 Last published .*\(5 h ago\) · 0 in the last hour Waiting for delivery/u);
+    assert.match(allowance, /1,042 results remaining · 23 in the last hour · 208 in 6 h/u);
+    assert.deepEqual(stages.children.map((card) => card.className.split(" ").at(-1)),
+      ["admin-pipeline-clear", "admin-pipeline-busy", "admin-pipeline-waiting", "admin-pipeline-busy"]);
+
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => texts()[1].includes("Since the read"));
+    assert.match(texts()[1], /Current device: 20 of 94 days folded .* Since the read 5 min ago: \+0 changes, \+7 days folded\.$/u);
+
+    failProgress = true;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => badge.textContent === "Stale · the latest refresh failed");
+    assert.equal(stages.children.length, 4);
+    assert.equal(texts()[1].includes("Since the read"), false);
+  });
+});
+
 test("unavailable overview prevents actions and transient history failures are visibly stale", async () => {
   const overview = await fixture("admin-overview-valid.json");
   let unavailable = false;

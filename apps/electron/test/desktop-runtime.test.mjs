@@ -398,6 +398,8 @@ async function launchFixture({
   accountlessSignedStagingRehearsal,
   productionDistribution,
   prepareNativeHandover,
+  onStartupPhase,
+  onStartupStop,
   getuid,
   getUserInfo,
   loadProductionUpdater,
@@ -448,6 +450,8 @@ async function launchFixture({
     accountlessSignedStagingRehearsal,
     productionDistribution,
     prepareNativeHandover,
+    onStartupPhase,
+    onStartupStop,
     getuid,
     getUserInfo,
     loadProductionUpdater,
@@ -933,6 +937,11 @@ test("native handover blocks before settings writes and companion start when exi
   let settingsReads = 0;
   let settingsWrites = 0;
   const notices = [];
+  const startupEvents = [];
+  app.quit = () => {
+    startupEvents.push("quit");
+    app.quitCalls += 1;
+  };
   const fixture = await launchFixture({ app,
     load: async () => { settingsReads += 1; return null; },
     save: async () => { settingsWrites += 1; },
@@ -948,7 +957,14 @@ test("native handover blocks before settings writes and companion start when exi
       assert.equal(app.ready, true);
       assert.equal(app.lockCalls, 1);
       assert.equal(homeDirectory, profile);
+      assert.equal(startupEvents.at(-1), "phase:native_handover");
       return { status: "bridge_unavailable", supportCode: "TRANSFER_IDENTITY" };
+    },
+    onStartupPhase: async (phase) => {
+      startupEvents.push(`phase:${phase}`);
+    },
+    onStartupStop: async (code) => {
+      startupEvents.push(`stop:${code}`);
     },
   });
   assert.equal(fixture.desktop.status, "native_handover_blocked");
@@ -956,6 +972,7 @@ test("native handover blocks before settings writes and companion start when exi
   assert.equal(settingsReads, 0);
   assert.equal(settingsWrites, 0);
   assert.equal(app.quitCalls, 1);
+  assert.deepEqual(startupEvents.slice(-2), ["stop:native_handover_blocked", "quit"]);
   assert.match(notices[0].detail, /history and settings have been preserved/u);
   assert.match(notices[0].detail, /Support code: TRANSFER_IDENTITY/u);
 });
@@ -972,6 +989,11 @@ test("credential preflight blocks before settings writes without mislabeling it 
   let settingsReads = 0;
   let settingsWrites = 0;
   const notices = [];
+  const startupEvents = [];
+  app.quit = () => {
+    startupEvents.push("quit");
+    app.quitCalls += 1;
+  };
   const fixture = await launchFixture({ app,
     load: async () => { settingsReads += 1; return null; },
     save: async () => { settingsWrites += 1; },
@@ -987,6 +1009,9 @@ test("credential preflight blocks before settings writes without mislabeling it 
       status: "credential_preflight_blocked",
       reason: "locked",
     }),
+    onStartupStop: async (code) => {
+      startupEvents.push(`stop:${code}`);
+    },
   });
   assert.equal(fixture.desktop.status, "native_handover_blocked");
   assert.equal(fixture.desktop.secureStorageReason, "locked");
@@ -994,6 +1019,7 @@ test("credential preflight blocks before settings writes without mislabeling it 
   assert.equal(settingsReads, 0);
   assert.equal(settingsWrites, 0);
   assert.equal(app.quitCalls, 1);
+  assert.deepEqual(startupEvents, ["stop:secure_storage_locked", "quit"]);
   assert.deepEqual(notices[0], {
     type: "warning",
     title: "Unable to prepare secure storage",
@@ -1218,6 +1244,11 @@ test("active macOS sharing blocks before child startup when its credential is de
   app.getName = () => "TiboTattle";
   let reads = 0;
   const notices = [];
+  const startupEvents = [];
+  app.quit = () => {
+    startupEvents.push("quit");
+    app.quitCalls += 1;
+  };
   const fixture = await launchFixture({
     app,
     load: async () => null,
@@ -1250,12 +1281,16 @@ test("active macOS sharing blocks before child startup when its credential is de
         };
       },
     },
+    onStartupStop: async (code) => {
+      startupEvents.push(`stop:${code}`);
+    },
   });
   assert.equal(fixture.desktop.status, "secure_storage_blocked");
   assert.equal(fixture.desktop.secureStorageReason, "denied");
   assert.equal(reads, 1);
   assert.equal(fixture.children.length, 0);
   assert.equal(app.quitCalls, 1);
+  assert.deepEqual(startupEvents, ["stop:secure_storage_denied", "quit"]);
   assert.equal(notices.length, 1);
   assert.match(notices[0].detail, /SECURE_STORAGE_DENIED/u);
   assert.doesNotMatch(JSON.stringify(notices[0]), /private Keychain detail/u);
@@ -2197,6 +2232,11 @@ test("runtime awaits Electron readiness before the first-run native dialog", asy
   const app = new FakeApp();
   const dialogCalls = [];
   const children = [];
+  const startupEvents = [];
+  app.quit = () => {
+    startupEvents.push("quit");
+    app.quitCalls += 1;
+  };
   const launch = launchDesktopRuntime({
     runtime: {
       ...runtime(app),
@@ -2227,6 +2267,9 @@ test("runtime awaits Electron readiness before the first-run native dialog", asy
         return child;
       },
     },
+    onStartupStop: async (code) => {
+      startupEvents.push(`stop:${code}`);
+    },
   });
   const desktop = await launch;
   assert.equal(app.readyCalls, 1);
@@ -2234,6 +2277,7 @@ test("runtime awaits Electron readiness before the first-run native dialog", asy
   assert.equal(desktop.firstRun.status, "cancelled");
   assert.equal(children.length, 0);
   assert.equal(app.quitCalls, 1);
+  assert.deepEqual(startupEvents, ["stop:startup_stopped", "quit"]);
 });
 
 test("runtime uses Electron preferred system languages for first-run copy", async () => {
@@ -2535,14 +2579,25 @@ test("runtime accepts a macOS open-url and a late second-instance link, but reje
 
 test("a secondary Electron instance exits before first-run or companion startup", async () => {
   const app = new FakeApp({ lockResult: false });
+  const startupEvents = [];
+  app.quit = () => {
+    startupEvents.push("quit");
+    app.quitCalls += 1;
+  };
   const fixture = await launchFixture({
     app,
     platform: "linux",
     argv: ["usagemonitor://open"],
     load: async () => null,
+    onStartupStop: async (code) => {
+      assert.equal(app.quitCalls, 0);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      startupEvents.push(`stop:${code}`);
+    },
   });
   assert.equal(fixture.desktop.status, "secondary_instance");
   assert.equal(app.quitCalls, 1);
+  assert.deepEqual(startupEvents, ["stop:secondary_instance", "quit"]);
   assert.equal(app.readyCalls, 0);
   assert.equal(fixture.children.length, 0);
 });

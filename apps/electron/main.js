@@ -103,9 +103,13 @@ const WINDOWS_ELECTRON_SMOKE_CREDENTIAL_OPERATIONS = Object.freeze({
   "credential-delete-v1": "delete-v1",
 });
 
-function markStartupDiagnostics(startupDiagnostics, phase) {
+async function markStartupDiagnostics(startupDiagnostics, phase) {
   try {
-    startupDiagnostics?.mark?.(phase);
+    if (typeof startupDiagnostics?.checkpoint === "function") {
+      await startupDiagnostics.checkpoint(phase);
+    } else {
+      await startupDiagnostics?.mark?.(phase);
+    }
   } catch {
     // Startup diagnostics are observational and never control startup.
   }
@@ -1077,16 +1081,16 @@ async function prepareElectronShellBootstrap({
   if (!app || typeof app.on !== "function") {
     throw new TypeError("Electron app runtime is unavailable");
   }
-  const markStartupPhase = (phase) => {
+  const markStartupPhase = async (phase) => {
     try {
-      if (typeof onStartupPhase === "function") onStartupPhase(phase);
+      if (typeof onStartupPhase === "function") await onStartupPhase(phase);
     } catch {
       // Startup diagnostics are observational and never control startup.
     }
   };
   // Read and validate every package marker before constructing any companion
   // or platform service. This also preserves the existing mixed-marker gate.
-  markStartupPhase("package_metadata");
+  await markStartupPhase("package_metadata");
   const productionDistribution = await readProductionDistribution({ app, platform, architecture });
   const accountlessHostedRehearsal = await readAccountlessHostedRehearsal({ app, platform, architecture });
   const accountlessSignedStagingRehearsal = await readAccountlessSignedStagingRehearsal({
@@ -1109,7 +1113,7 @@ async function prepareElectronShellBootstrap({
     platform,
     architecture,
   });
-  markStartupPhase("profile_selection");
+  await markStartupPhase("profile_selection");
   const signedStagingProfile = await configureAccountlessSignedStagingProfile(
     app,
     accountlessSignedStagingRehearsal,
@@ -1122,7 +1126,7 @@ async function prepareElectronShellBootstrap({
   } catch {
     // Startup diagnostics are observational and never control startup.
   }
-  markStartupPhase("crash_capture");
+  await markStartupPhase("crash_capture");
   let crashCapture = null;
   if (platform === "darwin" && typeof runtime.crashReporter?.start === "function") {
     try {
@@ -1183,7 +1187,7 @@ export async function launchElectronShell({
     throw new TypeError("Electron app runtime is unavailable");
   }
   try {
-    markStartupDiagnostics(startupDiagnostics, "runtime_qualification");
+    await markStartupDiagnostics(startupDiagnostics, "runtime_qualification");
     const qualificationContext = await createWindowsElectronQualificationContext({
       app,
       environment,
@@ -1223,7 +1227,7 @@ export async function launchElectronShell({
       crashCapture,
       productionDistribution,
     } = preparation;
-    markStartupDiagnostics(startupDiagnostics, "platform_gate");
+    await markStartupDiagnostics(startupDiagnostics, "platform_gate");
     assertElectronPlatformGate({
       platform,
       architecture,
@@ -1231,7 +1235,7 @@ export async function launchElectronShell({
       qualificationContext: qualificationContext ?? linuxQualificationContext,
       productionDistribution,
     });
-    markStartupDiagnostics(startupDiagnostics, "runtime_paths");
+    await markStartupDiagnostics(startupDiagnostics, "runtime_paths");
     const paths = resolveCompanionLaunchPaths({
       app,
       companionScript,
@@ -1293,7 +1297,7 @@ export async function launchElectronShell({
       && architecture === "x64"
       && productionDistribution.target === "win32-x64"
       ? createWindowsNormalCandidateCredentialHandover() : null;
-    markStartupDiagnostics(startupDiagnostics, "credential_wiring");
+    await markStartupDiagnostics(startupDiagnostics, "credential_wiring");
     // Signed staging retains the verified native handover and its main-process
     // FD3 factory, but it never gives the companion the normal FD4 broker or
     // reads normal broker services during startup.
@@ -1361,6 +1365,7 @@ export async function launchElectronShell({
       productionDistribution: productionEnabled ? productionDistribution : undefined,
       prepareNativeHandover: macCredentialHandover?.prepareNativeHandover,
       onStartupPhase: (phase) => markStartupDiagnostics(startupDiagnostics, phase),
+      onStartupStop: (code) => writeStartupDiagnostics(startupDiagnostics, "stop", code),
       accountlessProduction: accountlessProductionEnabled ? {
         origin: DEPLOYMENT_ENDPOINTS.public.origin,
         policyVersion: productionDistribution.contributionPolicy,

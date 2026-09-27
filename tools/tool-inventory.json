@@ -63,9 +63,9 @@
       "additionalAliases": [],
       "callers": [
         "package.json#scripts.diagnose:desktop-crash",
+        "scripts/smoke-electron-macos-sparkle-transition.mjs",
         "test/offline-crash-doctor.test.js",
-        "docs/reference/cli-reference.md",
-        "scripts/smoke-electron-macos-sparkle-transition.mjs"
+        "docs/reference/cli-reference.md"
       ],
       "decision": "retain_as_explicit_read_only_support_entrypoint",
       "provenance": "docs/decisions/2026-09-21-opt-in-crash-doctor.md",

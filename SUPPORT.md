@@ -94,9 +94,13 @@ and macOS version fields, and up to 40 recent entries from the companion's
 owner-only diagnostics log. Those entries contain fixed codes and opaque
 support references, not raw session content; malformed or unknown fields are
 omitted. It also reads one owner-only, content-free startup result written by
-the Electron main process. That result identifies the last startup phase,
-outcome, and fixed failure code even when the companion never started. The
-doctor reports when either source is missing or could not be read.
+the Electron main process. Builds with phase checkpoints attempt to save each
+phase before its work begins and deliberate early quits before exiting. A
+writable journal gives the last recorded phase, outcome, and fixed failure code
+even when the companion never started. In the released v0.1.24 build,
+`in_progress at profile_selection` was the initial record and does not
+establish which later phase, if any, stopped the app. The doctor
+reports when either source is missing or could not be read.
 The verbose output still needs review before posting to a public issue.
 If deeper private review is needed, an affected user can explicitly create a
 local owner-only evidence directory at a new, absolute path outside the source

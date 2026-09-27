@@ -47,13 +47,13 @@ function price({ provider, model, tier = "standard", pricedAt = "2026-07-26", co
 test("registry validates and preserves exact decimal strings and provenance", () => {
   assert.equal(validateOfficialPriceRegistry(), APP_OFFICIAL_PRICE_CARDS);
   assert.equal(OPENAI_OFFICIAL_PRICE_CARDS.length, 159);
-  assert.equal(ANTHROPIC_OFFICIAL_PRICE_CARDS.length, 13);
+  assert.equal(ANTHROPIC_OFFICIAL_PRICE_CARDS.length, 17);
   const batch54 = OPENAI_OFFICIAL_PRICE_CARDS.find((card) => card.model === "gpt-5.4" && card.service_tier === "batch");
   assert.equal(batch54.components.find((item) => item.usage_component === "input_cache_read_tokens").price.amount, "0.13");
   assert.match(batch54.metadata.provenance.evidence_sha256, /^[a-f0-9]{64}$/);
   assert.match(APP_PRICE_REGISTRY_SHA256, /^[a-f0-9]{64}$/);
   assert.equal(APP_PRICE_REGISTRY_MANIFEST.sha256, APP_PRICE_REGISTRY_SHA256);
-  assert.equal(APP_PRICE_REGISTRY_MANIFEST.sources.length, 4);
+  assert.equal(APP_PRICE_REGISTRY_MANIFEST.sources.length, 5);
   assert.equal(batch54.metadata.provenance.vendor_effective_from, null);
   assert.equal(OPENAI_PRICE_EVIDENCE_START_DATE, "2026-07-26");
   assert.equal(batch54.effective.from, undefined);
@@ -74,9 +74,12 @@ test("registry validates and preserves exact decimal strings and provenance", ()
     sha256Json(NORMALIZED_PRICE_EVIDENCE_ROWS.openaiAstra),
     APP_PRICE_REGISTRY_MANIFEST.sources.find((source) => source.evidenceVersion === "openai-astra-api-pricing-reviewed-2026-09-03").evidenceSha256,
   );
-  // This addition must not change even the provenance bytes of legacy cards.
+  // Later model additions must not change the provenance bytes of legacy cards.
   assert.equal(
-    sha256Json(APP_OFFICIAL_PRICE_CARDS.filter((card) => !["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"].includes(card.model))),
+    sha256Json(APP_OFFICIAL_PRICE_CARDS.filter((card) => ![
+      "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "claude-fable-5-1",
+      "claude-mythos-5-1", "claude-opus-5", "claude-opus-5-5",
+    ].includes(card.model))),
     "0a5879e981f20f1d244ef193427cf198199bd5e7fd407eca4c0ae48f11d717ac",
   );
 });
@@ -163,8 +166,11 @@ test("Sol and Luna retain exact launch prices across every tier, component, and 
   }
   assert.equal(sha256Json(NORMALIZED_PRICE_EVIDENCE_ROWS.openaiSolLuna),
     APP_PRICE_REGISTRY_MANIFEST.sources.find((source) => source.evidenceVersion === "openai-sol-luna-api-pricing-reviewed-2026-09-22").evidenceSha256);
-  // Every prior price card, including Astra source timestamps and identifiers, is unchanged.
-  assert.equal(sha256Json(APP_OFFICIAL_PRICE_CARDS.filter((card) => !["gpt-6-sol", "gpt-6-luna"].includes(card.model))),
+  // Cards predating the Sol/Luna and latest Claude additions retain their exact bytes.
+  assert.equal(sha256Json(APP_OFFICIAL_PRICE_CARDS.filter((card) => ![
+    "gpt-6-sol", "gpt-6-luna", "claude-fable-5-1", "claude-mythos-5-1",
+    "claude-opus-5", "claude-opus-5-5",
+  ].includes(card.model))),
     "303374d522e7ef695beefe1fbf6f3d2b5c84b8b9c6130921a70bc5e8ec1d56e0");
 });
 

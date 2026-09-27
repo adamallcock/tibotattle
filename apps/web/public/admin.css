@@ -99,6 +99,11 @@
 .admin-table-wrap th, .admin-table-wrap td { padding: 11px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
 .admin-table-wrap td { white-space: nowrap; }
 .admin-table-wrap tr:last-child td { border-bottom: 0; }
+.admin-pipeline-stage { border-top: 3px solid var(--line-strong); }
+.admin-pipeline-stage small { display: block; margin-top: 4px; }
+.admin-pipeline-clear { border-top-color: var(--green); }
+.admin-pipeline-busy { border-top-color: var(--blue); }
+.admin-pipeline-waiting { border-top-color: var(--amber); }
 .admin-adoption-summary { margin-top: 10px; }
 .admin-adoption-summary table { width: auto; min-width: min(100%, 420px); }
 .admin-adoption-summary th { color: var(--ink); font-size: .74rem; font-weight: 500; letter-spacing: 0; text-transform: none; }

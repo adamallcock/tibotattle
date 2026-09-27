@@ -789,7 +789,13 @@ export async function readCachedAdminMetricsHistory(
 }
 
 /** Typed interactive route: one target SELECT, pinned to the exact registered
- * source. Source authority resolution happens before this helper is called. */
+ * source. Source authority resolution happens before this helper is called.
+ *
+ * The analytics scheduler writes this publication and the main Worker serves
+ * it, and they deploy separately. Each payload contract therefore has its own
+ * row, so an upgraded writer never replaces the one an older reader serves.
+ * The source-keyed 0016 row remains a fallback that validation accepts only
+ * when it carries this reader's contract; either Worker can deploy first. */
 export async function readCachedStorageAdminMetricsHistory(
   bindings: StorageAnalyticsBindings,
   nowEpoch: number,
@@ -797,14 +803,27 @@ export async function readCachedStorageAdminMetricsHistory(
   let row: { generated_at: string; payload_json: string } | null;
   try {
     row = await bindings.target.prepare(
-      `SELECT cache.generated_at,cache.payload_json
-         FROM analytics_admin_metrics_history_cache cache
-         JOIN analytics_runtime_sources source ON source.source_id=cache.source_id
-        WHERE cache.source_id=?1 AND source.source_namespace=?2
-          AND source.contract_version=1 AND length(cache.payload_json)<=?3
+      `SELECT candidate.generated_at,candidate.payload_json
+         FROM (
+           SELECT 0 AS preference,source_id,generated_at,payload_json
+             FROM analytics_admin_metrics_history_publications
+            WHERE source_id=?1 AND schema_version=?4
+           UNION ALL
+           SELECT 1 AS preference,source_id,generated_at,payload_json
+             FROM analytics_admin_metrics_history_cache
+            WHERE source_id=?1
+         ) candidate
+         JOIN analytics_runtime_sources source ON source.source_id=candidate.source_id
+        WHERE source.source_namespace=?2 AND source.contract_version=1
+          AND length(candidate.payload_json)<=?3
+        ORDER BY candidate.preference
         LIMIT 1`,
-    ).bind(bindings.sourceId, bindings.sourceNamespace, HISTORY_CACHE_JSON_LIMIT_BYTES)
-      .first<{ generated_at: string; payload_json: string }>();
+    ).bind(
+      bindings.sourceId,
+      bindings.sourceNamespace,
+      HISTORY_CACHE_JSON_LIMIT_BYTES,
+      ADMIN_METRICS_HISTORY_SCHEMA_VERSION,
+    ).first<{ generated_at: string; payload_json: string }>();
   } catch {
     throw new ApiError(503, "ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE");
   }
@@ -899,7 +918,9 @@ export async function warmAdminMetricsHistoryCache(
 }
 
 /** Typed scheduled cache refresh. Retained events come from ingestion while
- * the aggregate cache and its post-migration gauge history stay in analytics. */
+ * the aggregate cache and its post-migration gauge history stay in analytics.
+ * It reads and writes only this contract's publication, leaving rows that
+ * other contracts' readers serve untouched. */
 export async function warmStorageAdminMetricsHistoryCache(
   bindings: StorageAnalyticsBindings,
   nowEpoch: number,
@@ -910,16 +931,22 @@ export async function warmStorageAdminMetricsHistoryCache(
       return { code: "HISTORY_CACHE_UNAVAILABLE" };
     }
     const existing = await bindings.target.prepare(
-      `SELECT cache.generated_at,cache.payload_json
+      `SELECT publication.generated_at,publication.payload_json
          FROM analytics_runtime_sources source
-         LEFT JOIN analytics_admin_metrics_history_cache cache
-           ON cache.source_id=source.source_id
+         LEFT JOIN analytics_admin_metrics_history_publications publication
+           ON publication.source_id=source.source_id
+          AND publication.schema_version=?4
         WHERE source.source_id=?1 AND source.source_namespace=?2
           AND source.contract_version=1
-          AND (cache.payload_json IS NULL OR length(cache.payload_json)<=?3)
+          AND (publication.payload_json IS NULL
+            OR length(publication.payload_json)<=?3)
         LIMIT 1`,
-    ).bind(bindings.sourceId, bindings.sourceNamespace, HISTORY_CACHE_JSON_LIMIT_BYTES)
-      .first<{ generated_at: string | null; payload_json: string | null }>();
+    ).bind(
+      bindings.sourceId,
+      bindings.sourceNamespace,
+      HISTORY_CACHE_JSON_LIMIT_BYTES,
+      ADMIN_METRICS_HISTORY_SCHEMA_VERSION,
+    ).first<{ generated_at: string | null; payload_json: string | null }>();
     if (existing === null) return { code: "HISTORY_CACHE_UNAVAILABLE" };
     const existingEpoch = Date.parse(existing.generated_at ?? "");
     let existingPayload: unknown = null;
@@ -956,12 +983,17 @@ export async function warmStorageAdminMetricsHistoryCache(
       return { code: "HISTORY_CACHE_UNAVAILABLE" };
     }
     const write = await bindings.target.prepare(
-      `INSERT INTO analytics_admin_metrics_history_cache(
-         source_id,generated_at,payload_json
-       ) VALUES(?1,?2,?3)
-       ON CONFLICT(source_id) DO UPDATE SET
+      `INSERT INTO analytics_admin_metrics_history_publications(
+         source_id,schema_version,generated_at,payload_json
+       ) VALUES(?1,?2,?3,?4)
+       ON CONFLICT(source_id,schema_version) DO UPDATE SET
          generated_at=excluded.generated_at,payload_json=excluded.payload_json`,
-    ).bind(bindings.sourceId, history.generatedAt, payloadJson).run();
+    ).bind(
+      bindings.sourceId,
+      history.schemaVersion,
+      history.generatedAt,
+      payloadJson,
+    ).run();
     return write.meta.changes === 1
       ? { code: "HISTORY_CACHE_REFRESHED" }
       : { code: "HISTORY_CACHE_UNAVAILABLE" };

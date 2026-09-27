@@ -49,6 +49,13 @@ output and execution failures become `version unavailable`. Selection uses the
 same precedence as the app-server client, so installing a newer PATH CLI does
 not falsely imply that TiboTattle selected it ahead of an embedded binary.
 
+As of 2026-09-26, the diagnostic also reports a path-free bundle location:
+system or user Applications, and the bundled `codex-cli/bin/codex` or legacy
+`codex` layout. Discovery checks those two executable layouts in each official
+ChatGPT or Codex app bundle. An explicit `CODEX_BIN` override remains first;
+`PATH` remains the fallback for custom installations. This is source selection
+evidence, not proof that app-server initialization or a quota read succeeds.
+
 ## Review trigger
 
 Add a new mapping only when all of the following are available:

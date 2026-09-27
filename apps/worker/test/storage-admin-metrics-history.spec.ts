@@ -86,7 +86,7 @@ describe("typed-storage admin metrics history", () => {
     await expect(warmStorageAdminMetricsHistoryCache(storage(), now))
       .resolves.toEqual({ code: "HISTORY_CACHE_UNAVAILABLE" });
     expect(await target().prepare(
-      "SELECT COUNT(*) AS n FROM analytics_admin_metrics_history_cache",
+      "SELECT COUNT(*) AS n FROM analytics_admin_metrics_history_publications",
     ).first<number>("n")).toBe(0);
   });
 
@@ -133,7 +133,7 @@ describe("typed-storage admin metrics history", () => {
       now + 1_000,
     );
     expect(targetQueries).toHaveLength(1);
-    expect(targetQueries[0]).toContain("FROM analytics_admin_metrics_history_cache");
+    expect(targetQueries[0]).toContain("FROM analytics_admin_metrics_history_publications");
     expect(targetQueries[0]).not.toMatch(/\b(?:INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)\b/iu);
   });
 
@@ -170,23 +170,197 @@ describe("typed-storage admin metrics history", () => {
     });
   });
 
-  it("rebuilds a fresh v0.2 cache because it omits v1.2 uploads", async () => {
+  it("refuses fresh v0.2 totals because they omit v1.2 uploads", async () => {
     expect(await captureStorageAdminMetricSnapshot(storage(), now))
       .toEqual({ code: "SNAPSHOT_CAPTURED" });
     expect(await warmStorageAdminMetricsHistoryCache(storage(), now))
       .toEqual({ code: "HISTORY_CACHE_REFRESHED" });
-    const row = await target().prepare(
-      "SELECT payload_json FROM analytics_admin_metrics_history_cache WHERE source_id=?",
-    ).bind(sourceId).first<string>("payload_json");
-    const old = JSON.parse(row ?? "null") as { schemaVersion: string };
-    old.schemaVersion = "admin-metrics-history-v0.2";
+    const current = await readCachedStorageAdminMetricsHistory(storage(), now);
+    const older = JSON.stringify({
+      ...current,
+      schemaVersion: "admin-metrics-history-v0.2",
+    });
     await target().prepare(
-      "UPDATE analytics_admin_metrics_history_cache SET payload_json=? WHERE source_id=?",
-    ).bind(JSON.stringify(old), sourceId).run();
+      "DELETE FROM analytics_admin_metrics_history_publications WHERE source_id=?",
+    ).bind(sourceId).run();
+    await target().batch([
+      target().prepare(
+        `INSERT INTO analytics_admin_metrics_history_publications(
+           source_id,schema_version,generated_at,payload_json
+         ) VALUES(?1,?2,?3,?4)`,
+      ).bind(sourceId, "admin-metrics-history-v0.2", current.generatedAt, older),
+      target().prepare(
+        `INSERT INTO analytics_admin_metrics_history_cache(
+           source_id,generated_at,payload_json
+         ) VALUES(?1,?2,?3)`,
+      ).bind(sourceId, current.generatedAt, older),
+    ]);
     await expect(readCachedStorageAdminMetricsHistory(storage(), now + 1_000))
       .rejects.toMatchObject({ code: "ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE" });
     expect(await warmStorageAdminMetricsHistoryCache(storage(), now + 1_000))
       .toEqual({ code: "HISTORY_CACHE_REFRESHED" });
+    expect((await readCachedStorageAdminMetricsHistory(storage(), now + 1_000))
+      .schemaVersion).toBe("admin-metrics-history-v0.3");
+  });
+
+  it("keeps other contracts' publications and serves only its own", async () => {
+    expect(await captureStorageAdminMetricSnapshot(storage(), now))
+      .toEqual({ code: "SNAPSHOT_CAPTURED" });
+    expect(await warmStorageAdminMetricsHistoryCache(storage(), now))
+      .toEqual({ code: "HISTORY_CACHE_REFRESHED" });
+    const current = await readCachedStorageAdminMetricsHistory(storage(), now);
+    // Rows an older scheduler and a newer one (then rolled back) left behind.
+    for (const schemaVersion of [
+      "admin-metrics-history-v0.2",
+      "admin-metrics-history-v0.4",
+    ]) {
+      await target().prepare(
+        `INSERT INTO analytics_admin_metrics_history_publications(
+           source_id,schema_version,generated_at,payload_json
+         ) VALUES(?1,?2,?3,?4)`,
+      ).bind(
+        sourceId,
+        schemaVersion,
+        current.generatedAt,
+        JSON.stringify({ ...current, schemaVersion }),
+      ).run();
+    }
+    const otherContracts = async () => (await target().prepare(
+      `SELECT schema_version,generated_at,payload_json
+         FROM analytics_admin_metrics_history_publications
+        WHERE source_id=? AND schema_version<>'admin-metrics-history-v0.3'
+        ORDER BY schema_version`,
+    ).bind(sourceId).all()).results;
+    const before = await otherContracts();
+    expect(before).toHaveLength(2);
+
+    const due = now + 56 * 60 * 1_000;
+    expect(await warmStorageAdminMetricsHistoryCache(storage(), due))
+      .toEqual({ code: "HISTORY_CACHE_REFRESHED" });
+    expect(await otherContracts()).toEqual(before);
+    expect(await readCachedStorageAdminMetricsHistory(storage(), due))
+      .toMatchObject({
+        schemaVersion: "admin-metrics-history-v0.3",
+        generatedAt: new Date(due).toISOString(),
+      });
+
+    // Without its own publication the reader refuses the other contracts.
+    await target().prepare(
+      `DELETE FROM analytics_admin_metrics_history_publications
+        WHERE source_id=? AND schema_version='admin-metrics-history-v0.3'`,
+    ).bind(sourceId).run();
+    await expect(readCachedStorageAdminMetricsHistory(storage(), due))
+      .rejects.toMatchObject({
+        status: 503,
+        code: "ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE",
+      });
+  });
+
+  it("serves the 0016 row only while it carries this reader's contract", async () => {
+    expect(await captureStorageAdminMetricSnapshot(storage(), now))
+      .toEqual({ code: "SNAPSHOT_CAPTURED" });
+    expect(await warmStorageAdminMetricsHistoryCache(storage(), now))
+      .toEqual({ code: "HISTORY_CACHE_REFRESHED" });
+    const current = await readCachedStorageAdminMetricsHistory(storage(), now);
+    // A reader deployed before its writer finds only the source-keyed row.
+    await target().prepare(
+      "DELETE FROM analytics_admin_metrics_history_publications WHERE source_id=?",
+    ).bind(sourceId).run();
+    const writeSourceKeyedRow = (payload: object) => target().prepare(
+      `INSERT INTO analytics_admin_metrics_history_cache(
+         source_id,generated_at,payload_json
+       ) VALUES(?1,?2,?3)
+       ON CONFLICT(source_id) DO UPDATE SET
+         generated_at=excluded.generated_at,payload_json=excluded.payload_json`,
+    ).bind(sourceId, current.generatedAt, JSON.stringify(payload)).run();
+
+    await writeSourceKeyedRow(current);
+    expect(await readCachedStorageAdminMetricsHistory(storage(), now + 1_000))
+      .toEqual(current);
+    await writeSourceKeyedRow({
+      ...current,
+      schemaVersion: "admin-metrics-history-v0.2",
+    });
+    await expect(readCachedStorageAdminMetricsHistory(storage(), now + 1_000))
+      .rejects.toMatchObject({
+        status: 503,
+        code: "ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE",
+      });
+
+    // Once this contract's publication exists it wins over the fallback.
+    await writeSourceKeyedRow(current);
+    expect(await warmStorageAdminMetricsHistoryCache(storage(), now + 1_000))
+      .toEqual({ code: "HISTORY_CACHE_REFRESHED" });
+    expect((await readCachedStorageAdminMetricsHistory(storage(), now + 1_000))
+      .generatedAt).toBe(new Date(now + 1_000).toISOString());
+  });
+
+  it("binds each publication row to the contract and time its payload declares", async () => {
+    expect(await captureStorageAdminMetricSnapshot(storage(), now))
+      .toEqual({ code: "SNAPSHOT_CAPTURED" });
+    expect(await warmStorageAdminMetricsHistoryCache(storage(), now))
+      .toEqual({ code: "HISTORY_CACHE_REFRESHED" });
+    const current = await readCachedStorageAdminMetricsHistory(storage(), now);
+    const insert = (schemaVersion: string, generatedAt: string, payloadJson: string) =>
+      target().prepare(
+        `INSERT INTO analytics_admin_metrics_history_publications(
+           source_id,schema_version,generated_at,payload_json
+         ) VALUES(?1,?2,?3,?4)`,
+      ).bind(sourceId, schemaVersion, generatedAt, payloadJson).run();
+    const payload = JSON.stringify(current);
+    await expect(insert("admin-metrics-history-v0.2", current.generatedAt, payload))
+      .rejects.toThrow(/CHECK constraint failed/u);
+    await expect(insert("admin-metrics-history-v0.4", new Date(now + 1).toISOString(),
+      JSON.stringify({ ...current, schemaVersion: "admin-metrics-history-v0.4" })))
+      .rejects.toThrow(/CHECK constraint failed/u);
+    await expect(insert("admin-metrics-history-v0.4", current.generatedAt, "{"))
+      .rejects.toThrow(/CHECK constraint failed/u);
+    await expect(target().prepare(
+      `INSERT INTO analytics_admin_metrics_history_publications(
+         source_id,schema_version,generated_at,payload_json
+       ) VALUES('unregistered-source',?1,?2,?3)`,
+    ).bind(current.schemaVersion, current.generatedAt, payload).run())
+      .rejects.toThrow(/FOREIGN KEY constraint failed/u);
+  });
+
+  it("leaves the row an older reader serves untouched when the writer upgrades", async () => {
+    // Production, 2026-09-25: the scheduler began writing v0.3 while the main
+    // Worker still read only v0.2. Replacing the single source-keyed row left
+    // that reader with nothing it accepted until the main Worker was deployed.
+    expect(await captureStorageAdminMetricSnapshot(storage(), now))
+      .toEqual({ code: "SNAPSHOT_CAPTURED" });
+    expect(await warmStorageAdminMetricsHistoryCache(storage(), now))
+      .toEqual({ code: "HISTORY_CACHE_REFRESHED" });
+    const current = await readCachedStorageAdminMetricsHistory(storage(), now);
+    const olderReaderRow = {
+      generated_at: current.generatedAt,
+      payload_json: JSON.stringify({
+        ...current,
+        schemaVersion: "admin-metrics-history-v0.2",
+      }),
+    };
+    // The state an upgraded scheduler meets on its first pass: only the
+    // older contract's source-keyed row exists.
+    await target().prepare(
+      "DELETE FROM analytics_admin_metrics_history_publications WHERE source_id=?",
+    ).bind(sourceId).run();
+    await target().prepare(
+      `INSERT INTO analytics_admin_metrics_history_cache(
+         source_id,generated_at,payload_json
+       ) VALUES(?1,?2,?3)
+       ON CONFLICT(source_id) DO UPDATE SET
+         generated_at=excluded.generated_at,payload_json=excluded.payload_json`,
+    ).bind(sourceId, olderReaderRow.generated_at, olderReaderRow.payload_json).run();
+
+    expect(await warmStorageAdminMetricsHistoryCache(storage(), now + 1_000))
+      .toEqual({ code: "HISTORY_CACHE_REFRESHED" });
+
+    expect(await target().prepare(
+      "SELECT generated_at,payload_json FROM analytics_admin_metrics_history_cache WHERE source_id=?",
+    ).bind(sourceId).first()).toEqual(olderReaderRow);
+    const upgraded = await readCachedStorageAdminMetricsHistory(storage(), now + 1_000);
+    expect(upgraded.schemaVersion).toBe("admin-metrics-history-v0.3");
+    expect(upgraded.generatedAt).toBe(new Date(now + 1_000).toISOString());
   });
 
   it("keeps bounded source SQL and preserves an older cache on refresh failure", async () => {
@@ -221,17 +395,18 @@ describe("typed-storage admin metrics history", () => {
     expect(boundedStatements.length).toBeGreaterThan(0);
     expect(boundedStatements.every(sql => sql.includes("LIMIT 10001"))).toBe(true);
 
-    const before = await target().prepare(
-      "SELECT generated_at,payload_json FROM analytics_admin_metrics_history_cache WHERE source_id=?",
+    const publication = () => target().prepare(
+      `SELECT generated_at,payload_json FROM analytics_admin_metrics_history_publications
+        WHERE source_id=? AND schema_version='admin-metrics-history-v0.3'`,
     ).bind(sourceId).first<{ generated_at: string; payload_json: string }>();
+    const before = await publication();
+    expect(before).not.toBeNull();
     const failedSource = { prepare() { throw new Error("synthetic source failure"); } } as unknown as D1Database;
     expect(await warmStorageAdminMetricsHistoryCache(
       { ...storage(), source: failedSource },
       now + 56 * 60 * 1_000,
     )).toEqual({ code: "HISTORY_CACHE_UNAVAILABLE" });
-    await expect(target().prepare(
-      "SELECT generated_at,payload_json FROM analytics_admin_metrics_history_cache WHERE source_id=?",
-    ).bind(sourceId).first()).resolves.toEqual(before);
+    await expect(publication()).resolves.toEqual(before);
   });
 
   it("refuses an exact gauge when the operational source bound is exceeded", async () => {

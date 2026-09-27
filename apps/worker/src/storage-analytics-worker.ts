@@ -26,6 +26,9 @@ export interface StorageAnalyticsWorkerEnv {
  /** Let the builder take the bulk of the graph-only long pass while coverage is
   * incomplete. Revertible independently of the builder and the fold. */
  GRAPH_DAY_PROJECTION_LONG_PASS?:'disabled'|'enabled';
+ /** Delivery catch-up on the minute pass. Unset means on; `disabled` returns
+  * delivery to its fixed slice without a code change. */
+ STORAGE_DELIVERY_CATCH_UP?:'disabled'|'enabled';
 }
 /** One deployed trigger drives both passes. A second, ten-minute trigger does
  * not produce a second invocation: with both registered, the platform delivered
@@ -51,6 +54,23 @@ const LONG_PASS_WINDOW_MS=8*60_000;
  * pass and that owner-day is skipped once rather than twice. Both bounds are
  * validated by the pass against its own deadline. */
 const LONG_PASS_GRAPH_LEASE_MS=570_000;
+/** Ordered delivery's guaranteed first slice of every invocation. */
+const DELIVERY_QUERIES=175,DELIVERY_WINDOW_MS=10_000;
+/** A backlog, such as many device activations at once, is folded one bounded
+ * step at a time; a step is about 90 statements and 8 seconds. When the first
+ * slice ends with delivery work still pending, the minute pass gives delivery
+ * a second, larger slice from the same meter and the same invocation, so the
+ * cursor keeps a single writer. The long pass keeps its graph window: during a
+ * catch-up the graph lane advances every tenth minute instead of every minute.
+ * In steady state delivery finishes inside its first slice and this is inert.
+ * It starts only with a full first slice's window left, never to overrun. */
+const CATCH_UP_QUERIES=600,CATCH_UP_WINDOW_MS=45_000,CATCH_UP_RESERVED_QUERIES=100;
+/** Only an allowance or step limit means delivery stopped with work pending;
+ * a capacity refusal or format boundary is not helped by more time. */
+function deliveryPending(pass:{state:string;reason:string}|null):boolean {
+ return pass!==null&&((pass.state==='deferred'&&(pass.reason==='query_budget'||pass.reason==='deadline'))
+  ||(pass.state==='progress'&&pass.reason==='step_limit'));
+}
 /** Do not expose account identifiers, SQL, credentials or a stored record in
  * diagnostics. Retain the durable cursor and make scheduler failure visible.
  * Internal failure constants are closed uppercase identifiers; provider or
@@ -93,13 +113,20 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
   // overrun this cooperative deadline; subsequent work must still stop rather
   // than receive a fresh allowance.
   const started=Date.now(),deadlineMs=started+(longPass?LONG_PASS_WINDOW_MS:55_000);
-  const delivery=publishCommunity?await runStorageAnalyticsPass({...bindings,publishCommunity:false,
-   maxSteps:32,maxQueries:175,deadlineMs:started+10_000}):null;
+  const first=publishCommunity?await runStorageAnalyticsPass({...bindings,publishCommunity:false,
+   maxSteps:32,maxQueries:DELIVERY_QUERIES,deadlineMs:started+DELIVERY_WINDOW_MS}):null;
+  const catchUpAllowance=Math.min(CATCH_UP_QUERIES,meter.remainingQueries-CATCH_UP_RESERVED_QUERIES);
+  const catchUp=!longPass&&env.STORAGE_DELIVERY_CATCH_UP!=='disabled'&&deliveryPending(first)
+   &&catchUpAllowance>=DELIVERY_QUERIES&&Date.now()+DELIVERY_WINDOW_MS<=started+CATCH_UP_WINDOW_MS
+   ?await runStorageAnalyticsPass({...bindings,publishCommunity:false,maxSteps:32,
+    maxQueries:catchUpAllowance,deadlineMs:started+CATCH_UP_WINDOW_MS}):null;
+  const delivery=first&&{steps:first.steps+(catchUp?.steps??0),recordsRead:first.recordsRead+(catchUp?.recordsRead??0),
+   queriesUsed:first.queriesUsed+(catchUp?.queriesUsed??0)};
   if(Date.now()>=deadlineMs){
-   console.log(JSON.stringify({event,...delivery,state:'deferred',reason:'deadline',
+   console.log(JSON.stringify({event,...(catchUp??first),state:'deferred',reason:'deadline',
     deliverySteps:delivery?.steps??0,deliveryRecordsRead:delivery?.recordsRead??0,
-    deliveryQueriesUsed:delivery?.queriesUsed??0,publicIterations:0,publicRecordsRead:0,publicQueriesUsed:0,
-    queriesUsed:meter.queriesUsed}));return;
+    deliveryQueriesUsed:delivery?.queriesUsed??0,deliveryCatchUp:catchUp!==null,
+    publicIterations:0,publicRecordsRead:0,publicQueriesUsed:0,queriesUsed:meter.queriesUsed}));return;
   }
   // The builder lane opens only on this second pass: the delivery phase has
   // 175 statements and the long pass is graph-only. Both switches must be open,
@@ -137,6 +164,7 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
    deliverySteps:publishCommunity?delivery?.steps??0:result.steps,
    deliveryRecordsRead:publishCommunity?delivery?.recordsRead??0:result.recordsRead,
    deliveryQueriesUsed:publishCommunity?delivery?.queriesUsed??0:result.queriesUsed,
+   deliveryCatchUp:catchUp!==null,
    publicIterations:publishCommunity?result.steps:0,
    publicRecordsRead:publishCommunity?result.recordsRead:0,publicQueriesUsed:publishCommunity?result.queriesUsed:0,
    // Where the public phase's statements actually went. A high `publicQueriesUsed`

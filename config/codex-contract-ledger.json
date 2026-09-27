@@ -15,11 +15,11 @@
     },
     {
       "id": "chatgpt_bundled",
-      "locator": "/Applications/ChatGPT.app/Contents/Resources/codex"
+      "locator": "ChatGPT.app in /Applications or ~/Applications: Contents/Resources/codex-cli/bin/codex, then Contents/Resources/codex"
     },
     {
       "id": "codex_bundled",
-      "locator": "/Applications/Codex.app/Contents/Resources/codex"
+      "locator": "Codex.app in /Applications or ~/Applications: Contents/Resources/codex-cli/bin/codex, then Contents/Resources/codex"
     },
     {
       "id": "path",

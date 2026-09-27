@@ -12198,7 +12198,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       }
       if (outcome === "failed"
           && refresh.errorCode === "refresh_timed_out") {
-        refreshProgressClock.update("Finalizing bounded pause…");
+        refreshProgressClock.update("Stopping timed-out analysis…");
         if (!timeoutSettlementNoted) {
           pollingBudget.noteSettling();
           timeoutSettlementNoted = true;
