@@ -844,6 +844,9 @@ test("private-host envelope-key is public-only and bypasses PostgreSQL and Worke
     admissionEnv: {},
     assertAdmissionBindings() {},
     assertAttemptAllowed: async () => {},
+    createPostgresDeviceSyncPrincipal: () => async () => {
+      throw new Error("device-sync principal is unreachable for envelope-key");
+    },
     assertUploadAuthorizationBindings() {},
     assertUploadAuthorizationAllowed: async () => {},
     authenticatePostgresDevice: async () => { throw new Error("must not authenticate"); },
@@ -2265,6 +2268,9 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
         vite.ssrLoadModule("/src/postgres-device-disconnect.ts"),
       ]);
     const deviceSyncReads = await vite.ssrLoadModule("/src/postgres-device-sync-reads.ts");
+    const postgresDeviceSyncPrincipal = await vite.ssrLoadModule(
+      "/src/postgres-device-sync-principal.ts",
+    );
     const v12ManifestCandidates = await vite.ssrLoadModule("/src/postgres-v12-manifest-candidates.ts");
     const [uploadAuthorization, formatAuthority] = await Promise.all([
       vite.ssrLoadModule("/src/postgres-upload-authorization.ts"),
@@ -2419,17 +2425,19 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       ACCOUNTLESS_ENROLLMENT_MODE: "enabled",
       ACCOUNTLESS_OWNERSHIP_MODE: "enabled",
     };
+    let deviceSyncRateLimitCalls = 0;
+    let deviceSyncCredentialRateLimitCalls = 0;
+    let deviceSyncAttemptRateLimitCalls = 0;
+    let deviceDisconnectRateLimitCalls = 0;
     for (const [binding, name, limit] of [
       ["ENROLLMENT_RATE_LIMIT", "ENROLLMENT", 20],
-      // This end-to-end fixture exercises more than 20 authenticated sync
-      // requests; cover the fixed-window boundary separately below.
-      ["RECOVERY_RATE_LIMIT", "RECOVERY", 100],
+      ["RECOVERY_RATE_LIMIT", "RECOVERY", 20],
       ["CLIENT_ATTEMPT_RATE_LIMIT", "CLIENT_ATTEMPT", 1_000],
       ["PUBLIC_READ_RATE_LIMIT", "PUBLIC_READ", 1_000],
       ["UPLOAD_AUTHORIZATION_RATE_LIMIT", "UPLOAD_AUTHORIZATION", 1_000],
       ["UPLOAD_PRINCIPAL_RATE_LIMIT", "UPLOAD_PRINCIPAL", 1_000],
     ]) {
-      admissionEnv[binding] = rateLimit.createPostgresRateLimiter(primaryPool, {
+      const limiter = rateLimit.createPostgresRateLimiter(primaryPool, {
         primarySchema,
         ledgerSchema,
         name,
@@ -2437,6 +2445,38 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
         periodSeconds: 60,
         keyHashSecret: randomBytes(32),
       });
+      admissionEnv[binding] = {
+        async limit(input) {
+          if ((name === "RECOVERY" || name === "CLIENT_ATTEMPT")
+              && input.key.startsWith("usage-monitor:device_sync:")) {
+            deviceSyncAttemptRateLimitCalls += 1;
+          }
+          return limiter.limit(input);
+        },
+      };
+    }
+    for (const [binding, name, limit] of [
+      ["DEVICE_SYNC_CLIENT_RATE_LIMIT", "DEVICE_SYNC_CLIENT", 4_200],
+      ["DEVICE_SYNC_RATE_LIMIT", "DEVICE_SYNC", 6_000],
+      ["DEVICE_SYNC_PRINCIPAL_RATE_LIMIT", "DEVICE_SYNC_PRINCIPAL", 4_200],
+    ]) {
+      const limiter = rateLimit.createPostgresRateLimiter(primaryPool, {
+        primarySchema,
+        ledgerSchema,
+        name,
+        limit,
+        periodSeconds: 60,
+        keyHashSecret: randomBytes(32),
+      });
+      admissionEnv[binding] = {
+        async limit(input) {
+          if (name === "DEVICE_SYNC_PRINCIPAL") deviceSyncRateLimitCalls += 1;
+          if (name === "DEVICE_SYNC_CLIENT" || name === "DEVICE_SYNC") {
+            deviceSyncCredentialRateLimitCalls += 1;
+          }
+          return limiter.limit(input);
+        },
+      };
     }
     const recoveryBoundary = rateLimit.createPostgresRateLimiter(primaryPool, {
       primarySchema,
@@ -2458,8 +2498,6 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
       privateOrigin: "http://127.0.0.1:43817",
     });
-    let deviceSyncRateLimitCalls = 0;
-    let deviceDisconnectRateLimitCalls = 0;
     const manifestDispatchOptions = {
       primaryPool,
       ledgerPool,
@@ -2490,10 +2528,12 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       admissionEnv: Object.freeze(admissionEnv),
       assertAdmissionBindings: admission.assertAdmissionBindings,
       assertAttemptAllowed: (...args) => {
-        if (args[4] === "device_sync") deviceSyncRateLimitCalls += 1;
+        if (args[4] === "device_sync") deviceSyncAttemptRateLimitCalls += 1;
         if (args[4] === "device_disconnect") deviceDisconnectRateLimitCalls += 1;
         return admission.assertAttemptAllowed(...args);
       },
+      createPostgresDeviceSyncPrincipal:
+        postgresDeviceSyncPrincipal.createPostgresDeviceSyncPrincipal,
       assertUploadAuthorizationBindings: admission.assertUploadAuthorizationBindings,
       assertUploadAuthorizationAllowed: admission.assertUploadAuthorizationAllowed,
       authenticatePostgresDevice: transport.authenticatePostgresDevice,
@@ -2709,21 +2749,51 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     assert.equal(legacyCapabilities.formats.length, 4);
     assert.equal(legacyCapabilities.formats.some((format) => format.rank === 12), false);
 
+    const admissionCallsBeforeCookie = {
+      attempt: deviceSyncAttemptRateLimitCalls,
+      credential: deviceSyncCredentialRateLimitCalls,
+      principal: deviceSyncRateLimitCalls,
+    };
     const cookiesOnDeviceRoute = await dispatch(request({
       url: syncCapabilitiesUrl,
       method: "GET",
       headers: { cookie: "session=synthetic" },
     }));
     await assertApiError(cookiesOnDeviceRoute, 401, "DEVICE_AUTH_INVALID");
+    assert.equal(deviceSyncAttemptRateLimitCalls, admissionCallsBeforeCookie.attempt + 2);
+    assert.equal(deviceSyncCredentialRateLimitCalls, admissionCallsBeforeCookie.credential);
+    assert.equal(deviceSyncRateLimitCalls, admissionCallsBeforeCookie.principal);
+
+    const admissionCallsBeforeUnknownBearer = {
+      attempt: deviceSyncAttemptRateLimitCalls,
+      credential: deviceSyncCredentialRateLimitCalls,
+      principal: deviceSyncRateLimitCalls,
+    };
     await assertApiError(await dispatch(request({
       url: syncCapabilitiesUrl,
       method: "GET",
-      headers: { authorization: "Device um_device_invalid.invalid" },
+      headers: {
+        authorization: `Device um_device_${randomUUID()}.${"A".repeat(43)}`,
+      },
     })), 401, "DEVICE_AUTH_INVALID");
+    assert.equal(deviceSyncAttemptRateLimitCalls, admissionCallsBeforeUnknownBearer.attempt + 2);
+    assert.equal(deviceSyncCredentialRateLimitCalls, admissionCallsBeforeUnknownBearer.credential + 2);
+    assert.equal(deviceSyncRateLimitCalls, admissionCallsBeforeUnknownBearer.principal);
+
+    const admissionCallsBeforeWrongMethod = {
+      attempt: deviceSyncAttemptRateLimitCalls,
+      credential: deviceSyncCredentialRateLimitCalls,
+      principal: deviceSyncRateLimitCalls,
+    };
     await assertApiError(await dispatch(request({
       url: syncCapabilitiesUrl,
       method: "POST",
     })), 405, "METHOD_NOT_ALLOWED");
+    assert.deepEqual({
+      attempt: deviceSyncAttemptRateLimitCalls,
+      credential: deviceSyncCredentialRateLimitCalls,
+      principal: deviceSyncRateLimitCalls,
+    }, admissionCallsBeforeWrongMethod);
 
     runtime.postgresTestDispatch = createPostgresTestV12DayManifestDispatch({
       ...manifestDispatchOptions,
@@ -3187,6 +3257,10 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     assert.equal(uploadManifestReceipt.expectedChunks, uploadChunks.length);
 
     const uploadChunk = async (chunk) => {
+      const deviceSyncCallsBeforeUpload = {
+        credential: deviceSyncCredentialRateLimitCalls,
+        principal: deviceSyncRateLimitCalls,
+      };
       const envelope = await encryptHostV12(chunk, envelopePublicJwk, envelopePublicJwk.kid);
       const raw = JSON.stringify(envelope);
       const bytes = Buffer.from(raw);
@@ -3212,6 +3286,11 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
         },
         body: raw,
       }));
+      assert.deepEqual({
+        credential: deviceSyncCredentialRateLimitCalls,
+        principal: deviceSyncRateLimitCalls,
+      }, deviceSyncCallsBeforeUpload,
+      "v1.2 chunk uploads do not consume device-sync budgets");
       return { authorizationId, bytes, response };
     };
 
@@ -3482,12 +3561,23 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     assert.equal(nextEffectivePage.next, null);
     assert.equal(deviceSyncRateLimitCalls, syncRateBeforeDomain + 5,
       "each effective page must consume the authenticated device-sync limiter");
-    const rateCallsBeforeUnauthenticatedPage = deviceSyncRateLimitCalls;
+    const rateCallsBeforeUnauthenticatedPage = {
+      attempt: deviceSyncAttemptRateLimitCalls,
+      credential: deviceSyncCredentialRateLimitCalls,
+      principal: deviceSyncRateLimitCalls,
+    };
     await assertApiError(await dispatch(new Request(
       `${effectivePageUrl}?${effectivePageQuery}`, { method: "GET" },
     )), 401, "DEVICE_AUTH_INVALID");
-    assert.equal(deviceSyncRateLimitCalls, rateCallsBeforeUnauthenticatedPage + 1,
-      "a rejected effective-page bearer must consume the pre-auth device-sync limiter");
+    assert.deepEqual({
+      attempt: deviceSyncAttemptRateLimitCalls,
+      credential: deviceSyncCredentialRateLimitCalls,
+      principal: deviceSyncRateLimitCalls,
+    }, {
+      attempt: rateCallsBeforeUnauthenticatedPage.attempt + 2,
+      credential: rateCallsBeforeUnauthenticatedPage.credential,
+      principal: rateCallsBeforeUnauthenticatedPage.principal,
+    }, "a missing effective-page bearer consumes only the attempt pair");
 
     for (const query of [
       `${effectivePageQuery}&limit=201`,
@@ -3539,9 +3629,47 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     assert.equal(consumedPredecessor.rows[0].token_hash, sha256Hex(predecessor.token));
     assert.ok(consumedPredecessor.rows[0].consumed_at);
 
+    const activeV12Replay = await dispatch(request({ body: JSON.stringify(manifest) }));
+    assert.equal(activeV12Replay.status, 201,
+      "the active participant can replay its v1.2 manifest before the tombstone");
+    assert.equal((await activeV12Replay.json()).manifestId, accepted.manifestId);
+    const activeDeviceState = await primaryPool.query(
+      `SELECT participant.state AS participant_state, credential.state AS device_state,
+              credential.expires_at > clock_timestamp() AS credential_current
+         FROM ${primaryTable("participants")} participant
+         JOIN ${primaryTable("device_credentials")} credential
+           ON credential.participant_id=participant.id
+        WHERE participant.id=$1 AND credential.id=$2`,
+      [participantId, deviceId],
+    );
+    assert.deepEqual(activeDeviceState.rows, [{
+      participant_state: "active", device_state: "active", credential_current: true,
+    }], "the same v1.2 device is valid immediately before tombstoning");
+    await primaryPool.query(
+      `UPDATE ${primaryTable("participants")} SET state='deleting' WHERE id=$1`,
+      [participantId],
+    );
     await ledgerAuthority.recordPostgresDeletionTombstone(
       ledgerPool, participantId, Date.now(), { schema: schemaOptions },
     );
+    // Model a restore that reactivates primary state while the independent
+    // ledger tombstone remains live and authoritative.
+    await primaryPool.query(
+      `UPDATE ${primaryTable("participants")} SET state='active' WHERE id=$1`,
+      [participantId],
+    );
+    assert.deepEqual((await primaryPool.query(
+      `SELECT participant.state AS participant_state, credential.state AS device_state
+         FROM ${primaryTable("participants")} participant
+         JOIN ${primaryTable("device_credentials")} credential
+           ON credential.participant_id=participant.id
+        WHERE participant.id=$1 AND credential.id=$2`,
+      [participantId, deviceId],
+    )).rows, [{ participant_state: "active", device_state: "active" }],
+    "the primary participant and bearer are restored to active state");
+    assert.equal(await ledgerAuthority.hasPostgresDeletionTombstone(
+      ledgerPool, participantId, Date.now(), { schema: schemaOptions },
+    ), true);
     await assertApiError(await dispatch(request({ body: JSON.stringify(manifest) })), 401, "DEVICE_AUTH_INVALID");
     await assertApiError(await dispatch(request({
       url: domainPredecessorUrl, body: "{}",

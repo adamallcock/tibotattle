@@ -265,16 +265,25 @@ scoped-primary account billing claim is introduced by the new transport.
 The v1.2 source path adds independent successor capability and authorization,
 an exact local field review, a separate progress journal, encrypted transport,
 typed admission and complete-domain activation. The client pins its domain
-predecessor before staging any day: a device with no ready day yet is seeded
+predecessor before staging any day. A device with no ready day yet is seeded
 with the current UTC day, and the predecessor fingerprint pins only the prior
-head and input revision, so the client's own newly ready days never
-invalidate its journal. A complete domain includes days without records.
-Its three usage extensions are continuity bits, same-time order and
-non-additive cache-write TTL detail. They
-are excluded from current cache arithmetic. Exact-total corrections preserve
-immutable source variants so later older-client uploads cannot erase known
-totals or their own unique occurrences. Every analytical pathway must use the
-qualified occurrence reader before the correction runtime is activated; see the
+head, its manifest digest and the input revision, so the pass's own newly
+ready days never invalidate its journal. The predecessor range and its
+4,096-day limit count ready days, not the earlier manifest versions that each
+changed day keeps. A complete domain includes days without records: such a
+day is an empty manifest, ready at registration (ingestion-isolation `0012`
+allows it in D1). Activating an unchanged day vector under an unchanged head
+and input revision acknowledges the active generation instead of writing a new
+one, as v1.1 does. Device-sync requests have their own address, location and
+participant budgets, each sized for one full pass of the largest domain. A
+request without a well-formed device bearer is charged only to the attempt
+budgets, and a bearer that fails verification is charged to them as well. Its
+three usage extensions are continuity bits, same-time order and non-additive
+cache-write TTL detail. They are excluded from current cache arithmetic.
+Exact-total corrections preserve immutable source variants so later
+older-client uploads cannot erase known totals or their own unique occurrences.
+Every analytical pathway must use the qualified occurrence reader before the
+correction runtime is activated; see the
 [current implementation plan](../plans/2026-09-20-turn-boundary-telemetry-plan.md).
 
 Daily performance is a separate stream with its own policy, grants, encrypted

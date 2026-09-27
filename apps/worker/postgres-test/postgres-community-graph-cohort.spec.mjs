@@ -305,6 +305,16 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
     return { deviceId, expiresAt };
   }
 
+  // The v1.2 owner bridge journals each accepted head as owner-active, which
+  // advances the source epoch; a caught-up cursor carries it with the sequence.
+  async function catchUpCursor(sequence) {
+    await pool.query(`UPDATE ${sqlSchema}.analytics_source_cursors SET sequence=$2,
+      authority_epoch=(SELECT authority_epoch FROM ${sqlSchema}.storage_source_state WHERE singleton=1)
+      WHERE source_id=$1`, [SOURCE_ID, sequence]);
+    return Number((await pool.query(`SELECT authority_epoch::text AS epoch
+      FROM ${sqlSchema}.analytics_source_cursors WHERE source_id=$1`, [SOURCE_ID])).rows[0].epoch);
+  }
+
   async function writeModelResult(owner, sequence) {
     const payload = JSON.stringify(readyComposition(MODEL_FINGERPRINT));
     const payloadDigest = createHash("sha256").update(payload).digest("hex");
@@ -325,8 +335,12 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
     await pool.query(`UPDATE ${sqlSchema}.input_versions SET revision=7 WHERE participant_id=$1`, [seeded[0].participantId]);
     const latest = await pool.query(`SELECT COALESCE(max(sequence),0)::text AS sequence
       FROM ${sqlSchema}.storage_ingestion_changes WHERE source_id=$1`, [SOURCE_ID]);
-    await pool.query(`UPDATE ${sqlSchema}.analytics_source_cursors SET sequence=$2 WHERE source_id=$1`,
-      [SOURCE_ID, latest.rows[0].sequence]);
+    const sourceEpoch = await catchUpCursor(latest.rows[0].sequence);
+    const exactOwnerRows = await pool.query(`SELECT count(*)::int AS count
+      FROM ${sqlSchema}.storage_ingestion_changes WHERE source_id=$1 AND event_tuple_version=1 AND kind='owner-active'`,
+    [SOURCE_ID]);
+    assert.equal(sourceEpoch, exactOwnerRows.rows[0].count,
+      "each bridged owner-active advanced the source epoch once and nothing else moved it");
 
     const first = await listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
@@ -342,8 +356,8 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
       sourcePin: {
         sourceId: SOURCE_ID,
         sourceNamespace: SOURCE_NAMESPACE,
-        sourceAuthorityEpoch: 0,
-        analyticsAuthorityEpoch: 0,
+        sourceAuthorityEpoch: sourceEpoch,
+        analyticsAuthorityEpoch: sourceEpoch,
         sequence: Number(latest.rows[0].sequence),
         policyRevision: 1,
         collectionRevision: 2,
@@ -473,16 +487,37 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
       schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
     })).rejects.toMatchObject({ code: "POSTGRES_COMMUNITY_GRAPH_COHORT_UNAVAILABLE" });
 
+    // A journal row that moves only the sequence, not the source authority
+    // epoch, must still end a continuation. The v1.2 owner bridge journals
+    // the cohort owners, so a raw version-0 row for them is refused
+    // (storage_owner_tuple_mixed); the epoch-neutral exact row is a
+    // 'source-updated' through the single producer, which needs an active
+    // owner head. The bridge gives seeded[0] one once 0055 is applied; before
+    // that, append its owner-active here and catch the cursor up to it.
+    const ownerHead = await pool.query(`SELECT state FROM ${sqlSchema}.storage_owner_revisions
+      WHERE source_id=$1 AND owner_digest=$2`, [SOURCE_ID, seeded[0].ownerDigest]);
+    if (ownerHead.rows.length === 0) {
+      await pool.query(`SELECT ${sqlSchema}.storage_journal_append('owner-active',$1,$2,$2,$2)`,
+        [seeded[0].ownerDigest, createHash("sha256").update("graph-cohort-owner-active").digest("hex")]);
+    } else {
+      assert.equal(ownerHead.rows[0].state, "active");
+    }
+    const scanStart = await pool.query(`SELECT COALESCE(max(sequence),0)::text AS sequence
+      FROM ${sqlSchema}.storage_ingestion_changes WHERE source_id=$1`, [SOURCE_ID]);
+    const scanEpoch = await catchUpCursor(scanStart.rows[0].sequence);
     const newAuthorityScan = await listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
       limit: 1, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
     });
     assert.ok(newAuthorityScan.next);
-    await pool.query(`INSERT INTO ${sqlSchema}.storage_ingestion_changes(
-      source_id, sequence, event_digest, owner_digest, owner_revision, authority_epoch, kind, recorded_ms
-    ) VALUES ($1,$2,$3,$4,1,0,'source-updated',$5)`, [
-      SOURCE_ID, Number(latest.rows[0].sequence) + 1, "e".repeat(64), seeded[0].ownerDigest, Date.now(),
-    ]);
+    await pool.query(`SELECT ${sqlSchema}.storage_journal_append('source-updated',$1,$2,$2,$2)`,
+      [seeded[0].ownerDigest, "e".repeat(64)]);
+    const appended = await pool.query(`SELECT max(sequence)::text AS sequence
+      FROM ${sqlSchema}.storage_ingestion_changes WHERE source_id=$1`, [SOURCE_ID]);
+    assert.equal(Number(appended.rows[0].sequence), Number(scanStart.rows[0].sequence) + 1);
+    const epochAfter = await pool.query(`SELECT authority_epoch::text AS epoch
+      FROM ${sqlSchema}.storage_source_state WHERE singleton=1`);
+    assert.equal(Number(epochAfter.rows[0].epoch), scanEpoch, "the new row moves the sequence only");
     await expect(listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
       after: newAuthorityScan.next, limit: 1, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
@@ -493,8 +528,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
     for (const suffix of ["4", "5"]) await seedEffectiveOwner(suffix);
     const latest = await pool.query(`SELECT COALESCE(max(sequence),0)::text AS sequence
       FROM ${sqlSchema}.storage_ingestion_changes WHERE source_id=$1`, [SOURCE_ID]);
-    await pool.query(`UPDATE ${sqlSchema}.analytics_source_cursors SET sequence=$2 WHERE source_id=$1`,
-      [SOURCE_ID, latest.rows[0].sequence]);
+    await catchUpCursor(latest.rows[0].sequence);
     const first = await listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
       limit: 1, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
@@ -513,8 +547,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
     const auth = await seedAccountlessAuthorizationExpiryBoundary();
     const latest = await pool.query(`SELECT COALESCE(max(sequence),0)::text AS sequence
       FROM ${sqlSchema}.storage_ingestion_changes WHERE source_id=$1`, [SOURCE_ID]);
-    await pool.query(`UPDATE ${sqlSchema}.analytics_source_cursors SET sequence=$2 WHERE source_id=$1`,
-      [SOURCE_ID, latest.rows[0].sequence]);
+    await catchUpCursor(latest.rows[0].sequence);
 
     const first = await listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,

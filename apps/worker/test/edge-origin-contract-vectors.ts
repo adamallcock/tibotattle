@@ -29,6 +29,7 @@ const EXPECTED_EXPORT_NAMES = Object.freeze([
   "EDGE_ADMISSION_OUTCOMES",
   "EDGE_ADMISSION_PURPOSES",
   "EDGE_CONTRACT_REQUEST_HEADERS",
+  "EDGE_DEFERRED_DEVICE_SYNC_ATTEMPT",
   "EDGE_FENCE_RETRY_AFTER_SECONDS",
   "EDGE_HEADERS",
   "EDGE_HOST_KINDS",
@@ -49,6 +50,7 @@ const EXPECTED_EXPORT_NAMES = Object.freeze([
   "decodeEdgeAdmission",
   "encodeEdgeAdmission",
   "isEdgeOriginAudience",
+  "isEdgeDeferredDeviceSyncAttempt",
   "isEdgeRequestId",
   "isEdgeServiceAccountEmail",
   "parseCloudRunInvokerClaims",
@@ -62,6 +64,7 @@ const EXPECTED_HEADERS = Object.freeze({
   admission: "x-tibotattle-edge-admission",
   requestId: "x-tibotattle-edge-request-id",
   callbackQuery: "x-tibotattle-google-callback-query",
+  deferredAdmission: "x-tibotattle-edge-deferred-admission",
   invokerToken: "x-serverless-authorization",
   originMarker: "x-tibotattle-origin",
 });
@@ -100,6 +103,7 @@ const EXPECTED_DROPPED_RESPONSE_HEADERS = Object.freeze([
   "x-cloud-trace-context",
   "traceparent",
   "x-tibotattle-origin",
+  "x-tibotattle-edge-deferred-admission",
 ]);
 
 const EXPECTED_ADMISSION_PURPOSES = Object.freeze([
@@ -109,6 +113,7 @@ const EXPECTED_ADMISSION_PURPOSES = Object.freeze([
   "device_disconnect",
   "device_credential_renew",
   "device_sync",
+  "device_sync_credential",
   "accountless_ownership",
   "accountless_renewal",
   "public_aggregate_read",
@@ -156,6 +161,7 @@ const REQUEST_ID_CASES: readonly { readonly value: unknown; readonly valid: bool
 
 const MALFORMED_ADMISSION_VALUES: readonly unknown[] = [
   "v1;upload_authorization;allowed",
+  "v1;device_sync_credential",
   "v2;enrollment;allowed",
   "V1;enrollment;allowed",
   "v1;enrollment",
@@ -804,6 +810,13 @@ export const EDGE_ORIGIN_CONTRACT_CHECKS: readonly EdgeOriginContractCheck[] = O
       }
       assert.ok(!all.includes("x-tibotattle-edge-client-key"));
       assert.ok(dropped.includes(contract.EDGE_HEADERS.originMarker));
+      assert.ok(dropped.includes(contract.EDGE_HEADERS.deferredAdmission));
+      assert.ok(!(contract.EDGE_CONTRACT_REQUEST_HEADERS as readonly string[]).some(
+        (name) => name === contract.EDGE_HEADERS.deferredAdmission,
+      ));
+      assert.ok(!(contract.FORWARDED_REQUEST_HEADERS as readonly string[]).some(
+        (name) => name === contract.EDGE_HEADERS.deferredAdmission,
+      ));
       assert.ok(!dropped.includes("set-cookie"));
     },
   },
@@ -824,7 +837,24 @@ export const EDGE_ORIGIN_CONTRACT_CHECKS: readonly EdgeOriginContractCheck[] = O
           encoded.add(value);
         }
       }
-      assert.equal(encoded.size, 30);
+      assert.equal(encoded.size, 33);
+      assert.equal(contract.EDGE_DEFERRED_DEVICE_SYNC_ATTEMPT, "v1;device_sync");
+      assert.equal(contract.isEdgeDeferredDeviceSyncAttempt("v1;device_sync"), true);
+      for (const value of [
+        "v1;device_sync;allowed",
+        "v1;device_sync_credential",
+        "v1;device_sync;limited",
+        "V1;device_sync",
+        "v1;device_sync ",
+        " v1;device_sync",
+        "",
+        undefined,
+        null,
+        1,
+        {},
+      ]) {
+        assert.equal(contract.isEdgeDeferredDeviceSyncAttempt(value), false);
+      }
     },
   },
   {

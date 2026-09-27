@@ -75,6 +75,7 @@ import {
   readPostgresDeviceSyncState,
   readPostgresDeviceSyncManifest,
 } from "../src/postgres-device-sync-reads.ts";
+import { createPostgresDeviceSyncPrincipal } from "../src/postgres-device-sync-principal.ts";
 import { disconnectPostgresAuthenticatedDevice } from "../src/postgres-device-disconnect.ts";
 import { readPostgresV12DayCandidates } from "../src/postgres-v12-manifest-candidates.ts";
 import {
@@ -141,6 +142,9 @@ const RATE_LIMIT_BINDINGS = Object.freeze([
   ["UPLOAD_PRINCIPAL_RATE_LIMIT", "UPLOAD_PRINCIPAL", 1_000, 60],
   ["UPLOAD_INGRESS_REQUEST_RATE_LIMIT", "UPLOAD_INGRESS_REQUEST", 1_000, 60],
   ["UPLOAD_INGRESS_CLIENT_RATE_LIMIT", "UPLOAD_INGRESS_CLIENT", 1_000, 60],
+  ["DEVICE_SYNC_CLIENT_RATE_LIMIT", "DEVICE_SYNC_CLIENT", 4_200, 60],
+  ["DEVICE_SYNC_RATE_LIMIT", "DEVICE_SYNC", 6_000, 60],
+  ["DEVICE_SYNC_PRINCIPAL_RATE_LIMIT", "DEVICE_SYNC_PRINCIPAL", 4_200, 60],
 ]);
 const RATE_LIMIT_INTEGER = /^\d+$/u;
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/u;
@@ -700,6 +704,7 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           admissionEnv: Object.freeze(admissionEnv),
           assertAdmissionBindings,
           assertAttemptAllowed,
+          createPostgresDeviceSyncPrincipal,
           assertUploadAuthorizationBindings,
           assertUploadAuthorizationAllowed,
           assertPostgresV12UploadAllowed: (pool, device, nowEpoch, { schema }) =>

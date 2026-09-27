@@ -88,6 +88,32 @@
       "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
       "namespace_id": "1008",
       "simple": { "limit": 1000, "period": 60 }
+    },
+    {
+      // Authenticated device sync (src/admission.ts). Every well-formed device
+      // bearer is charged to its client address and then to this per-location
+      // key before verification; the participant key after it. One v1.2 pass
+      // needs N + 6 device-sync requests for an N-day domain, so the
+      // participant and address budgets cover the largest supported domain
+      // (4096 days) with headroom for the separate performance stream.
+      // Missing or malformed bearers are charged only to the attempt
+      // budgets; a bearer that fails verification is charged to them too.
+      "name": "DEVICE_SYNC_RATE_LIMIT",
+      "namespace_id": "1009",
+      "simple": { "limit": 20000, "period": 60 }
+    },
+    {
+      "name": "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT",
+      "namespace_id": "1010",
+      "simple": { "limit": 4200, "period": 60 }
+    },
+    {
+      // Local harnesses drive many synthetic devices from one address, so the
+      // address key matches the location key here; hosted environments size
+      // it for one pass and keep it below their location cap.
+      "name": "DEVICE_SYNC_CLIENT_RATE_LIMIT",
+      "namespace_id": "1011",
+      "simple": { "limit": 20000, "period": 60 }
     }
   ],
   "durable_objects": {
@@ -222,6 +248,24 @@
           "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
           "namespace_id": "2008",
           "simple": { "limit": 20, "period": 60 }
+        },
+        {
+          // Staging mirrors the production device-sync budgets: a rehearsal
+          // device must still complete one full pass of the largest supported
+          // domain inside one window, and one address stays below the cap.
+          "name": "DEVICE_SYNC_RATE_LIMIT",
+          "namespace_id": "2009",
+          "simple": { "limit": 6000, "period": 60 }
+        },
+        {
+          "name": "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT",
+          "namespace_id": "2010",
+          "simple": { "limit": 4200, "period": 60 }
+        },
+        {
+          "name": "DEVICE_SYNC_CLIENT_RATE_LIMIT",
+          "namespace_id": "2011",
+          "simple": { "limit": 4200, "period": 60 }
         }
       ],
       "durable_objects": {
@@ -436,6 +480,30 @@
           "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
           "namespace_id": "3008",
           "simple": { "limit": 3000, "period": 60 }
+        },
+        {
+          // Per-location backstop for all authenticated device sync: one
+          // largest-domain pass plus concurrent ordinary passes, about 100
+          // requests per second into the primary D1 at most.
+          "name": "DEVICE_SYNC_RATE_LIMIT",
+          "namespace_id": "3009",
+          "simple": { "limit": 6000, "period": 60 }
+        },
+        {
+          // One participant's full v1.2 pass of the largest supported domain:
+          // 4096 day manifests + 6 fixed requests, plus performance headroom.
+          "name": "DEVICE_SYNC_PRINCIPAL_RATE_LIMIT",
+          "namespace_id": "3010",
+          "simple": { "limit": 4200, "period": 60 }
+        },
+        {
+          // Per client address, charged before credential verification: the
+          // same one-pass budget, shared by the installs behind one address,
+          // and below the location cap, so one address can neither drive more
+          // credential checks than one pass nor use up the location's budget.
+          "name": "DEVICE_SYNC_CLIENT_RATE_LIMIT",
+          "namespace_id": "3011",
+          "simple": { "limit": 4200, "period": 60 }
         }
       ],
       "durable_objects": {

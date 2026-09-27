@@ -301,6 +301,7 @@ export async function prepareTypedProductionDeployment({
   let candidateConfig;
   let expected;
   let typed;
+  let expectedLiveFingerprint;
   try {
     baseline = configTools.createSnapshot(inventory);
     if (baseline.sourceCommit !== expectedPreviousSourceCommit) {
@@ -336,6 +337,13 @@ export async function prepareTypedProductionDeployment({
         "PRODUCTION_TYPED_CONFIG_UNVERIFIED",
         preservation?.code,
       );
+    }
+    // The live fingerprint once this candidate is deployed: the baseline, or
+    // the baseline plus the pinned Rate Limit bindings the candidate adds.
+    // The post-deploy boundary requires exactly this configuration.
+    expectedLiveFingerprint = preservation.expectedFingerprint;
+    if (!PRODUCTION_SHA256_PATTERN.test(expectedLiveFingerprint ?? "")) {
+      return typedFailure("PRODUCTION_TYPED_CONFIG_UNVERIFIED");
     }
 
     expected = await buildSchemas({ workerDirectory });
@@ -375,6 +383,7 @@ export async function prepareTypedProductionDeployment({
     candidateConfig,
     configBytes,
     configSha256: typedConfigDigest(configBytes),
+    expectedLiveFingerprint,
     expectedSchemas: expected.expectedSchemas,
     expectedSchemaIdentity: typedSchemaIdentity(expected),
     provider,
@@ -386,8 +395,10 @@ export async function prepareTypedProductionDeployment({
 /**
  * Re-read the pinned live configuration and all fixed typed SELECTs at a
  * deployment boundary. Before Wrangler the active version/source must still
- * be the pinned predecessor; after Wrangler only the source/version may move,
- * while the effective configuration and typed schema must remain identical.
+ * be the pinned predecessor; after Wrangler only the source/version may move
+ * and the effective configuration must be exactly the prepared one (the
+ * baseline plus any pinned Rate Limit additions), while the typed schema must
+ * remain identical.
  */
 export async function revalidateTypedProductionDeployment({
   typedDeployment,
@@ -397,6 +408,7 @@ export async function revalidateTypedProductionDeployment({
   phase,
 } = {}) {
   if (!typedDeployment?.baseline
+      || !PRODUCTION_SHA256_PATTERN.test(typedDeployment.expectedLiveFingerprint ?? "")
       || !typedDeployment?.currentInventory
       || typeof typedDeployment.provider?.capture !== "function"
       || typeof typedDeployment.provider?.query !== "function"
@@ -419,10 +431,8 @@ export async function revalidateTypedProductionDeployment({
           || snapshot.sourceCommit !== expectedPreviousSourceCommit) {
         return typedFailure("PRODUCTION_TYPED_LIVE_CHANGED");
       }
-    } else if (!typedSnapshotMatches(typedDeployment.baseline, snapshot, {
-      source: false,
-      version: false,
-    }) || snapshot.sourceCommit !== sourceCommit) {
+    } else if (snapshot?.fingerprint !== typedDeployment.expectedLiveFingerprint
+        || snapshot.sourceCommit !== sourceCommit) {
       return typedFailure("PRODUCTION_TYPED_POST_DEPLOY_LIVE_MISMATCH");
     }
 
