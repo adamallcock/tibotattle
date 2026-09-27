@@ -333,17 +333,51 @@ test('credential failure diagnostics preserve fixed launch/settings stages and c
   assert.deepEqual(macCredentialFailureDiagnostics({ signedLaunchStage: 'native_intro',
     stage: 'native_intro_unexpected', ownedMacProcessesStopped: true,
     message: '/Users/PRIVATE_SENTINEL', stderr: 'SECRET' }), {
-    launchStage: 'native_intro', launchCode: 'native_intro_unexpected', settingsStage: null,
+    launchStage: 'native_intro', process: null, nativeIntro: null, launchCode: 'native_intro_unexpected', settingsStage: null,
     launchOwnedProcessesStopped: true,
   });
   assert.deepEqual(macCredentialFailureDiagnostics({ emptyProfileStage: 'settings_effect',
     ownedMacProcessesStopped: false }), {
-    launchStage: null, launchCode: null, settingsStage: 'settings_effect', launchOwnedProcessesStopped: false,
+    launchStage: null, process: null, nativeIntro: null, launchCode: null, settingsStage: 'settings_effect', launchOwnedProcessesStopped: false,
   });
   for (const error of [null, {}, { signedLaunchStage: 'PRIVATE_SENTINEL', stage: 'PRIVATE_SENTINEL',
     emptyProfileStage: 'PRIVATE_SENTINEL', ownedMacProcessesStopped: 'true' }]) {
     assert.deepEqual(macCredentialFailureDiagnostics(error), {
-      launchStage: null, launchCode: null, settingsStage: null, launchOwnedProcessesStopped: null,
+      launchStage: null, process: null, nativeIntro: null, launchCode: null, settingsStage: null, launchOwnedProcessesStopped: null,
     });
   }
+});
+
+test('credential intro timeout retains only the closed owned-UI snapshot', () => {
+  const nativeIntro = { status: 'observed', windowCount: 1, staticTextCount: 1, buttonCount: 1,
+    checkboxCount: 0, introMessage: false, continueButton: false, quitButton: true, loginCheckbox: false,
+    secureStorageRefusal: true, handoverRefusal: false, privacyRefusal: false };
+  const error = { signedLaunchStage: 'native_intro', stage: 'native_intro_timeout',
+    signedNativeIntroDiagnostic: nativeIntro, ownedMacProcessesStopped: true,
+    message: 'PRIVATE_SENTINEL', stderr: 'PRIVATE_SENTINEL', path: '/PRIVATE_SENTINEL' };
+  const result = macCredentialFailureDiagnostics(error);
+  assert.equal(result.launchCode, 'native_intro_timeout');
+  assert.deepEqual(result.nativeIntro, nativeIntro);
+  assert.notEqual(result.nativeIntro, nativeIntro);
+  assert.equal(JSON.stringify(result).includes('PRIVATE_SENTINEL'), false);
+  for (const unsafe of [{ ...nativeIntro, text: 'PRIVATE_SENTINEL' },
+    { ...nativeIntro, status: 'PRIVATE_SENTINEL' }, { ...nativeIntro, windowCount: 99999 },
+    { ...nativeIntro, secureStorageRefusal: 'PRIVATE_SENTINEL' }]) {
+    assert.equal(macCredentialFailureDiagnostics({ ...error, signedNativeIntroDiagnostic: unsafe }).nativeIntro, null);
+  }
+});
+
+test('credential projection retains only bounded process observations', async () => {
+  const { EventEmitter } = await import('node:events');
+  const { observeSignedStagingProcess } = await import('../scripts/run-signed-electron-staging.mjs');
+  const child = new EventEmitter(); child.stderr = new EventEmitter();
+  const snapshot = observeSignedStagingProcess(child);
+  child.stderr.emit('data', Buffer.from('sandbox_apply: Operation not permitted PRIVATE_SENTINEL'));
+  child.emit('exit', 1, null);
+  const process = snapshot(), error = { signedProcessDiagnostic: process, message: 'PRIVATE_SENTINEL', stderr: 'PRIVATE_SENTINEL' };
+  const result = macCredentialFailureDiagnostics(error);
+  assert.deepEqual(result.process, process); assert.notEqual(result.process, process);
+  assert.equal(JSON.stringify(result).includes('PRIVATE_SENTINEL'), false);
+  for (const changed of [{ ...process, text: 'PRIVATE_SENTINEL' }, { ...process, exitSignal: 'PRIVATE_SENTINEL' },
+    { ...process, stderrBytesScanned: Infinity }]) assert.equal(macCredentialFailureDiagnostics({ ...error, signedProcessDiagnostic: changed }).process, null);
 });

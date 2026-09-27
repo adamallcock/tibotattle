@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseSignedStagingExecutionArguments, signedStagingChildEnvironment, signedStagingFixture, signedStagingNativeIntroScript, interpretSignedStagingNativeIntroResult, assertSignedStagingFreshProjection } from '../scripts/run-signed-electron-staging.mjs';
+import { parseSignedStagingExecutionArguments, signedStagingChildEnvironment, signedStagingFixture, signedStagingNativeIntroScript, interpretSignedStagingNativeIntroResult, assertSignedStagingFreshProjection, waitForSignedStagingNativeIntro, signedStagingNativeIntroDiagnosticScript, sanitizeSignedStagingNativeIntroDiagnostic, observeSignedStagingProcess, sanitizeSignedStagingProcessDiagnostic } from '../scripts/run-signed-electron-staging.mjs';
 const identity = ['--app', '/tmp/reviewed/TiboTattle.app', '--source-revision', 'a'.repeat(40), '--asar-sha256', 'b'.repeat(64)];
 test('execution requires an explicit staging mutation mode and exact artifact inputs', () => {
   assert.throws(() => parseSignedStagingExecutionArguments(identity));
@@ -119,4 +119,292 @@ test('unverified launch cleanup refuses surviving detached descendants without s
   await assert.rejects(stopOwnedMacSharingApp(state, { processTableImpl: () => [{ pid: 1235, group: 1234 }] }),
     { stage: 'unverified_group_remaining' });
   assert.equal(await stopOwnedMacSharingApp(state, { processTableImpl: () => [{ pid: 9999, group: 9999 }] }), true);
+});
+
+
+test('native intro waiter preserves terminal refusals instead of swallowing their stage', async () => {
+  for (const stage of ['native_intro_closed', 'native_intro_identity', 'native_intro_automation_unavailable']) {
+    let calls = 0;
+    const error = Object.assign(new Error('private details must not reach proof'), { stage });
+    await assert.rejects(waitForSignedStagingNativeIntro(() => { calls++; throw error; },
+      { now: () => 0, wait: () => assert.fail('terminal refusal must not retry') }), received => received === error);
+    assert.equal(calls, 1);
+  }
+  for (const [result, stage] of [['unavailable', 'native_intro_automation_unavailable'], ['unexpected', 'native_intro_unexpected']]) {
+    await assert.rejects(waitForSignedStagingNativeIntro(() => result,
+      { now: () => 0, wait: () => assert.fail('terminal result must not retry') }), { stage });
+  }
+});
+
+test('native intro waiter keeps the 60 second deadline and 100 ms cadence for waiting only', async () => {
+  let time = 0, calls = 0;
+  await assert.rejects(waitForSignedStagingNativeIntro(() => { calls++; return 'waiting'; }, {
+    now: () => time, wait: async ms => { assert.equal(ms, 100); time += ms; },
+  }), { stage: 'native_intro_timeout' });
+  assert.equal(time, 60_000); assert.equal(calls, 600);
+  time = 0; calls = 0;
+  await waitForSignedStagingNativeIntro(() => ++calls === 3 ? 'continued' : 'waiting', {
+    now: () => time, wait: async ms => { time += ms; },
+  });
+  assert.equal(calls, 3); assert.equal(time, 200);
+});
+
+test('native intro failure snapshot is read-only, PID-scoped and content-free', async () => {
+  const { runInNewContext } = await import('node:vm');
+  const { desktopFirstRunDialogCopy } = await import('../apps/electron/desktop-first-run.js');
+  const copy = desktopFirstRunDialogCopy({ production: true, locale: 'en-US' });
+  let message = copy.message;
+  let controls = [
+    { role: () => 'AXStaticText', value: () => message },
+    ...copy.buttons.map(name => ({ role: () => 'AXButton', name: () => name })),
+    { role: () => 'AXCheckBox', name: () => copy.checkboxLabel },
+    { role: () => 'AXTextField', value: () => { throw Error('must not read credential fields'); } },
+  ];
+  let enabled = true, windows = [{ entireContents: () => controls }];
+  const script = signedStagingNativeIntroDiagnosticScript(12345);
+  const execute = () => JSON.parse(runInNewContext(script + '; run();', { Application(name) {
+    assert.equal(name, 'System Events'); return { uiElementsEnabled: () => enabled,
+      applicationProcesses: { whose(query) { assert.equal(query.unixId, 12345);
+        assert.deepEqual(Object.keys(query), ['unixId']); return () => [{ windows: () => windows }]; } } };
+  } }));
+  const result = execute();
+  assert.deepEqual(result, { status: 'observed', windowCount: 1, staticTextCount: 1, buttonCount: 2,
+    checkboxCount: 1, introMessage: true, continueButton: true, quitButton: true, loginCheckbox: true,
+    secureStorageRefusal: false, handoverRefusal: false, privacyRefusal: false });
+  assert.deepEqual(sanitizeSignedStagingNativeIntroDiagnostic(result), result);
+  assert.doesNotMatch(script, /\.click\(|keystroke|keyCode|setValue/u);
+  message = 'TiboTattle could not complete its secure startup checks.';
+  assert.equal(execute().secureStorageRefusal, true); assert.equal(execute().introMessage, false);
+  const { DESKTOP_SECURE_STORAGE_FAILURE_REASONS, createDesktopSecureStorageDialog } =
+    await import('../apps/electron/desktop-secure-storage-readiness.js');
+  for (const reason of DESKTOP_SECURE_STORAGE_FAILURE_REASONS) {
+    message = createDesktopSecureStorageDialog(reason).message;
+    assert.equal(execute().secureStorageRefusal, true);
+    assert.equal(execute().introMessage, false);
+  }
+  message = 'PRIVATE_SENTINEL /private/secret';
+  assert.equal(JSON.stringify(execute()).includes('PRIVATE_SENTINEL'), false);
+  enabled = false;
+  assert.equal(execute().status, 'automation_unavailable'); assert.equal(execute().windowCount, null);
+  enabled = true; windows = Array(4).fill(windows[0]);
+  assert.equal(execute().status, 'overflow'); assert.equal(execute().buttonCount, null);
+  windows = [{ entireContents: () => Array(501).fill(controls[0]) }];
+  assert.equal(execute().status, 'overflow');
+  for (const invalid of [{ ...result, rawText: 'PRIVATE_SENTINEL' }, { ...result, windowCount: 4 },
+    { ...result, buttonCount: 1501 }, { ...result, checkboxCount: -1 }, { ...result, introMessage: 'true' },
+    { ...result, status: 'automation_unavailable' }, null]) {
+    assert.equal(sanitizeSignedStagingNativeIntroDiagnostic(invalid), null);
+  }
+});
+
+
+test('direct-child stderr classifier handles split literals without exporting content', async () => {
+  const { EventEmitter } = await import('node:events');
+  for (const [literal, flag] of [['electron_shell_entry_failed', 'electronEntryFailure'], ['sandbox_apply:', 'sandboxApplyMessage'], ['sandbox_init() failed', 'sandboxInitializationMessage'],
+    ['InitializeSandbox() failed', 'sandboxInitializationMessage'], ['SeatbeltExec:', 'seatbeltMessage'],
+    ['Operation not permitted', 'operationNotPermitted'], ['Library not loaded:', 'dynamicLibraryMissing'],
+    ['SandboxSerializer: Failed to deserialize policy:', 'sandboxPolicyDeserializeFailure'],
+    ['SandboxSerializer: Failed to apply compiled policy:', 'sandboxCompiledPolicyFailure'],
+    ['SandboxSerializer: Failed to initialize sandbox with source mode policy:', 'sandboxSourcePolicyFailure'],
+    ['bootstrap_check_in ', 'machBootstrapCheck'], ["GPU process isn't usable. Goodbye.", 'gpuProcessUnusable'],
+    [':FATAL:', 'chromiumFatal'], ['Check failed:', 'chromiumCheckFailure']]) {
+    for (let split = 1; split < literal.length; split++) {
+      const child = new EventEmitter(); child.stderr = new EventEmitter();
+      const snapshot = observeSignedStagingProcess(child);
+      child.stderr.emit('data', Buffer.from('PRIVATE_SENTINEL' + literal.slice(0, split)));
+      child.stderr.emit('data', Buffer.from(literal.slice(split) + '/private/synthetic'));
+      child.emit('exit', null, 'SIGABRT'); child.stderr.emit('end');
+      const value = snapshot();
+      assert.equal(value[flag], true); assert.equal(value.exitSignal, 'SIGABRT');
+      assert.equal(value.stderrComplete, true); assert.equal(value.stderrTruncated, false);
+      assert.equal(JSON.stringify(value).includes('PRIVATE_SENTINEL'), false);
+      assert.equal(JSON.stringify(value).includes('/private/'), false);
+    }
+  }
+});
+test('stderr scan cap drains excess and distinguishes incomplete from truncated prefixes', async () => {
+  const { EventEmitter } = await import('node:events');
+  const child = new EventEmitter(); child.stderr = new EventEmitter();
+  const snapshot = observeSignedStagingProcess(child);
+  child.stderr.emit('data', Buffer.alloc(65536, 120));
+  child.stderr.emit('data', Buffer.from('sandbox_apply: Operation not permitted PRIVATE_SENTINEL'));
+  const value = snapshot();
+  assert.equal(value.stderrBytesScanned, 65536); assert.equal(value.stderrTruncated, true);
+  assert.equal(value.stderrComplete, false); assert.equal(value.sandboxApplyMessage, false);
+  assert.equal(value.operationNotPermitted, false);
+  for (let i = 0; i < 3; i++) child.stderr.emit('data', Buffer.alloc(65536));
+  child.stderr.emit('end'); assert.deepEqual(snapshot(), value);
+  const other = new EventEmitter(); other.stderr = new EventEmitter();
+  const exact = observeSignedStagingProcess(other);
+  other.stderr.emit('data', Buffer.alloc(65536)); other.stderr.emit('end');
+  assert.equal(exact().stderrTruncated, false); assert.equal(exact().stderrComplete, true);
+});
+test('pre-cleanup failure snapshot cannot acquire a cleanup signal or unknown raw strings', async () => {
+  const { EventEmitter } = await import('node:events');
+  const child = new EventEmitter(); child.stderr = new EventEmitter();
+  const snapshot = observeSignedStagingProcess(child), before = snapshot();
+  child.emit('exit', null, 'SIGTERM'); child.stderr.emit('data', Buffer.from('sandbox_apply:'));
+  assert.deepEqual(snapshot(), before); assert.equal(before.exited, false); assert.equal(before.exitSignal, null);
+  for (const [code, signal] of [[0, null], [42, null], [null, 'SIGKILL'], [null, 'PRIVATE_SENTINEL'], [9999999, null]]) {
+    const direct = new EventEmitter(); direct.stderr = new EventEmitter();
+    const read = observeSignedStagingProcess(direct); direct.emit('exit', code, signal);
+    const result = read(); assert.equal(result.exited, true);
+    assert.equal(result.exitCode, Number.isInteger(code) && code >= 0 && code <= 255 ? code : null);
+    assert.equal(result.unknownExitSignal, signal === 'PRIVATE_SENTINEL');
+    assert.equal(JSON.stringify(result).includes('PRIVATE_SENTINEL'), false);
+  }
+  const failed = new EventEmitter(); failed.stderr = new EventEmitter();
+  const read = observeSignedStagingProcess(failed); failed.emit('error', new Error('PRIVATE_SENTINEL'));
+  assert.equal(read().spawnFailed, true); assert.equal(read().exited, false);
+});
+test('process diagnostic rejects unknown fields, unbounded values and contradictory states', async () => {
+  const { EventEmitter } = await import('node:events');
+  const child = new EventEmitter(); child.stderr = new EventEmitter();
+  const value = observeSignedStagingProcess(child)();
+  assert.deepEqual(sanitizeSignedStagingProcessDiagnostic(value), value);
+  for (const flag of ['sandboxPolicyDeserializeFailure', 'sandboxCompiledPolicyFailure', 'sandboxSourcePolicyFailure',
+    'machBootstrapCheck', 'gpuProcessUnusable', 'chromiumFatal', 'chromiumCheckFailure']) {
+    assert.equal(value[flag], false);
+    assert.equal(sanitizeSignedStagingProcessDiagnostic({ ...value, [flag]: 'true' }), null);
+    const missing = { ...value }; delete missing[flag];
+    assert.equal(sanitizeSignedStagingProcessDiagnostic(missing), null);
+  }
+  for (const extra of [{ raw: 'PRIVATE_SENTINEL' }, { [Symbol('private')]: true }, { exitCode: 256 }, { exitSignal: 'PRIVATE_SENTINEL' },
+    { stderrBytesScanned: 65537 }, { stderrBytesScanned: -1 }, { stderrComplete: 'yes' },
+    { stderrTruncated: true }, { exited: true, exitSignal: 'SIGABRT', unknownExitSignal: true },
+    { exitCode: 0 }, { exited: true, exitCode: 0, exitSignal: 'SIGABRT' }]) {
+    assert.equal(sanitizeSignedStagingProcessDiagnostic({ ...value, ...extra }), null);
+  }
+});
+
+test('real stderr stream drains beyond scan cap and never stitches a literal across discarded bytes', async () => {
+  const { EventEmitter, once } = await import('node:events');
+  const { PassThrough } = await import('node:stream');
+  const child = new EventEmitter(); child.stderr = new PassThrough();
+  const read = observeSignedStagingProcess(child), ended = once(child.stderr, 'end');
+  child.stderr.write(Buffer.alloc(65536 - 8, 120));
+  child.stderr.write(Buffer.from('sandbox_')); child.stderr.write(Buffer.from('apply:'));
+  child.stderr.end(Buffer.alloc(128 * 1024)); await ended;
+  const result = read();
+  assert.equal(result.stderrBytesScanned, 65536); assert.equal(result.stderrTruncated, true);
+  assert.equal(result.stderrComplete, true); assert.equal(result.sandboxApplyMessage, false);
+});
+
+test('long Chromium policy marker is recognized only when wholly within the scan bound', async () => {
+  const { EventEmitter } = await import('node:events');
+  const literal = 'SandboxSerializer: Failed to initialize sandbox with source mode policy:';
+  for (const beyondBound of [false, true]) {
+    const child = new EventEmitter(); child.stderr = new EventEmitter();
+    const snapshot = observeSignedStagingProcess(child);
+    child.stderr.emit('data', Buffer.alloc(65536 - literal.length + Number(beyondBound), 120));
+    // Bytewise delivery exercises the longest overlap rather than only two chunks.
+    for (const character of literal) child.stderr.emit('data', Buffer.from(character));
+    child.stderr.emit('end');
+    const value = snapshot();
+    assert.equal(value.stderrBytesScanned, 65536);
+    assert.equal(value.sandboxSourcePolicyFailure, !beyondBound);
+    assert.equal(value.stderrTruncated, beyondBound);
+    assert.equal(value.stderrComplete, true);
+  }
+});
+
+test('GPU codes and same-line spawn errno survive every chunk split without exporting paths', async () => {
+  const { EventEmitter } = await import('node:events');
+  const cases = [
+    ['GPU process launch failed: error_code=1003\n', 'gpuLaunchFailureCodes', 1003],
+    ['GPU process exited unexpectedly: exit_code=-2147483648\r\n', 'gpuExitCodes', -2147483648],
+    ['posix_spawnp(/private/PRIVATE_SENTINEL/helper): -1 Operation not permitted\n', 'posixSpawnErrnos', 1],
+  ];
+  for (const [message, key, expected] of cases) {
+    for (let split = 1; split < message.length; split++) {
+      const child = new EventEmitter(); child.stderr = new EventEmitter();
+      const read = observeSignedStagingProcess(child);
+      child.stderr.emit('data', Buffer.from(message.slice(0, split)));
+      child.stderr.emit('data', Buffer.from(message.slice(split))); child.stderr.emit('end');
+      const result = read();
+      assert.deepEqual(result[key], [expected]);
+      for (const flag of ['Overflow', 'OutOfRange', 'Malformed', 'Partial']) assert.equal(result[key + flag], false);
+      assert.equal(JSON.stringify(result).includes('PRIVATE_SENTINEL'), false);
+      assert.equal(JSON.stringify(result).includes('/private/'), false);
+      result[key].push(42); assert.deepEqual(read()[key], [expected]);
+    }
+  }
+});
+
+test('numeric stderr classification caps unique codes and distinguishes invalid, partial and unobserved', async () => {
+  const { EventEmitter } = await import('node:events');
+  const classify = message => {
+    const child = new EventEmitter(); child.stderr = new EventEmitter();
+    const read = observeSignedStagingProcess(child);
+    for (const byte of Buffer.from(message)) child.stderr.emit('data', Buffer.from([byte]));
+    child.stderr.emit('end'); return read();
+  };
+  const specs = [
+    ['GPU process launch failed: error_code=', 'gpuLaunchFailureCodes', 0, 65535],
+    ['GPU process exited unexpectedly: exit_code=', 'gpuExitCodes', -2147483648, 2147483647],
+    ['posix_spawnp(/PRIVATE_SENTINEL): -', 'posixSpawnErrnos', 1, 255],
+  ];
+  for (const [prefix, key, min, max] of specs) {
+    const valid = classify(prefix + min + '\n' + prefix + max + '\n');
+    assert.deepEqual(valid[key], [min, max]);
+    for (const invalid of [min - 1, max + 1, '999999999999999999999999999999999999999']) {
+      const result = classify(prefix + invalid + '\n');
+      assert.deepEqual(result[key], []);
+      // An unsupported sign is malformed rather than a parsed range violation.
+      assert.equal(result[key + (String(invalid).startsWith('-') && min >= 0 ? 'Malformed' : 'OutOfRange')], true);
+    }
+    for (const malformed of ['1PRIVATE_SENTINEL\n', '+1\n', '--1\n', '1.0\n', '\n']) {
+      const result = classify(prefix + malformed);
+      assert.deepEqual(result[key], []); assert.equal(result[key + 'Malformed'], true);
+    }
+    for (const partial of ['', '1', '-']) {
+      if (partial === '-' && min >= 0) continue;
+      const result = classify(prefix + partial);
+      assert.deepEqual(result[key], []); assert.equal(result[key + 'Partial'], true);
+    }
+    const many = classify(Array.from({ length: 10 }, (_, i) => prefix + (i + 1) + '\n').join('') + prefix + '1\n');
+    assert.deepEqual(many[key], [1, 2, 3, 4, 5, 6, 7, 8]); assert.equal(many[key + 'Overflow'], true);
+    const repeat = classify((prefix + '1\n').repeat(12));
+    assert.deepEqual(repeat[key], [1]); assert.equal(repeat[key + 'Overflow'], false);
+    assert.equal(classify('PRIVATE_SENTINEL')[key + 'Partial'], false);
+  }
+  const disconnected = classify('posix_spawnp(/PRIVATE_SENTINEL\n): -1 Operation not permitted\n');
+  assert.deepEqual(disconnected.posixSpawnErrnos, []); assert.equal(disconnected.posixSpawnErrnosMalformed, true);
+});
+
+test('numeric scan never consumes discarded delimiters or freezes cleanup output into evidence', async () => {
+  const { EventEmitter } = await import('node:events');
+  for (const marker of ['GPU process launch failed: error_code=', 'GPU process launch failed: error_code=1003']) {
+    for (const atScanLimit of [false, true]) {
+      const child = new EventEmitter(); child.stderr = new EventEmitter();
+      const read = observeSignedStagingProcess(child);
+      if (atScanLimit) child.stderr.emit('data', Buffer.alloc(65536 - marker.length, 120));
+      child.stderr.emit('data', Buffer.from(marker));
+      if (atScanLimit) { child.stderr.emit('data', Buffer.from('\n')); child.stderr.emit('end'); }
+      const value = read();
+      assert.equal(value.stderrTruncated, atScanLimit); assert.equal(value.stderrComplete, atScanLimit);
+      assert.deepEqual(value.gpuLaunchFailureCodes, []); assert.equal(value.gpuLaunchFailureCodesPartial, true);
+      child.stderr.emit('data', Buffer.from('1003\n')); child.emit('exit', null, 'SIGTERM');
+      assert.deepEqual(read(), value);
+    }
+  }
+});
+
+test('numeric diagnostic schema rejects forged arrays and detaches accepted arrays', async () => {
+  const { EventEmitter } = await import('node:events');
+  const child = new EventEmitter(); child.stderr = new EventEmitter();
+  const value = observeSignedStagingProcess(child)();
+  for (const key of ['gpuLaunchFailureCodes', 'gpuExitCodes', 'posixSpawnErrnos']) {
+    const hole = Array(1); hole.extra = 1;
+    const symbol = []; symbol[Symbol('PRIVATE_SENTINEL')] = 1;
+    for (const invalid of [[1, 1], [1.5], [Infinity], ['PRIVATE_SENTINEL'], Array(1), hole, symbol, Array.from({ length: 9 }, (_, i) => i + 1)]) {
+      assert.equal(sanitizeSignedStagingProcessDiagnostic({ ...value, [key]: invalid }), null);
+    }
+    assert.equal(sanitizeSignedStagingProcessDiagnostic({ ...value, [key + 'Overflow']: true }), null);
+    for (const flag of ['Overflow', 'OutOfRange', 'Malformed', 'Partial']) {
+      assert.equal(sanitizeSignedStagingProcessDiagnostic({ ...value, [key + flag]: 'true' }), null);
+    }
+    const input = { ...value, [key]: [1] }, clean = sanitizeSignedStagingProcessDiagnostic(input);
+    clean[key].push(2); assert.deepEqual(input[key], [1]);
+  }
 });
