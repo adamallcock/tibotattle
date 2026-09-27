@@ -59,7 +59,12 @@ parity but hit a stale QA assertion: the script still expected the former
 "local companion" source label, while the dashboard now displays the local
 observation time. The updated assertion matches the rendered time to the
 local API; the same package passed snapshot parity, cancellation, retry and
-clean quit. Full terminal QA on the final frozen source remains open.
+clean quit. On 2026-09-27, the final
+`a39e2186a046e093002efa187f6b61546c27fb7a` unsigned Apple silicon
+package passed the full isolated real-history QA profile, including the
+quick-result timing gate, rendered dashboard parity, cancellation, retry, and
+clean quit. Its ASAR SHA-256 was
+`4e80fb3eeb8154622f9c63938341e0b411ced95b817f7d541d3ee9c4db56af3a`.
 This development result does not qualify signed or installed bytes.
 
 CodexBar's [documented app default](https://github.com/steipete/CodexBar/blob/e0286a895055e60ddaefa6a5f176f246aa2f05e4/docs/codex.md#L199-L215)
