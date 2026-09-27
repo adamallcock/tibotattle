@@ -366,6 +366,7 @@ export function macCredentialFailureDiagnostics(error, predecessorUi = null, pre
 export async function runMacCredentialQualification({ intake, execute = false }) {
   const proof = { schemaVersion: SCHEMA, status: 'planned', credentialContinuityQualified: false,
     enforcedLoopbackOnly: false, fixtureCleaned: false, ownedProcessesStopped: false,
+    predecessorFirstRunCompleted: false,
     applicationBytesUnchanged: false, cases: [], fixtureScopes: [], failureStage: null, failurePhase: null, failureDiagnostics: null, fixtureFailure: null,
     nativeLegacyMigrationQualified: false, hostedUploadQualified: false, timeoutQualified: false,
     lockedStoreQualified: false, deniedStoreQualified: false, legacyOnlyQualified: false,
@@ -412,12 +413,28 @@ export async function runMacCredentialQualification({ intake, execute = false })
     await mkdir(codex, { mode: 0o700 }); await mkdir(join(codex, 'sessions'), { mode: 0o700 });
     await writeFile(join(codex, 'sessions', 'rollout-credential-synthetic.jsonl'), signedStagingFixture(), { mode: 0o600, flag: 'wx' });
     const launchOptions = { networkMode: MACOS_LOOPBACK_MODE };
+    stage = 'predecessor_first_run';
+    active = await launchVerifiedMacSharingApp(verified, environment, {
+      ...launchOptions, untouched: true, observeFixedEntryFailure: true,
+      onFailure: ({ pid, stage: launchStage, fixedEntryFailureObserved, debuggerListening }) => {
+        if (launchStage === 'native_intro') {
+          predecessorUi = observePredecessorUi(pid);
+          predecessorEntryFailure = fixedEntryFailureObserved;
+          predecessorDebuggerListening = debuggerListening;
+          predecessorProcess = observePredecessorProcess(pid);
+        }
+      },
+    });
+    if (active.nativeIntroContinued !== true) fail('predecessor_first_run');
+    await exerciseEmptyProfileSettings(active.settings);
+    await stopOwnedMacSharingApp(active); active = null;
+    proof.predecessorFirstRunCompleted = true;
     stage = 'modern_fixture'; fixture = await fixtureSession(input, helper, 'modern', environment);
     await fixture.request('seed'); const before = validateCredentialSnapshot(await fixture.request('snapshot'), 'modern');
     proof.fixtureScopes.push({ scenario: 'modern', ...((await fixture.request('select')).scope) });
     await fixture.request('scope');
     stage = 'predecessor_launch'; active = await launchVerifiedMacSharingApp(verified, environment, {
-      ...launchOptions, untouched: true, observeFixedEntryFailure: true,
+      ...launchOptions,
       onFailure: ({ pid, stage: launchStage, fixedEntryFailureObserved, debuggerListening }) => {
         if (launchStage === 'native_intro') {
           predecessorUi = observePredecessorUi(pid);

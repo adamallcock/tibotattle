@@ -151,7 +151,7 @@ export function interpretSignedStagingNativeIntroResult(value) {
 }
 
 async function continueNativeIntro(state, verified) {
-  await waitFor(() => {
+  try { await waitFor(() => {
     if (state.stopped()) fail('native_intro_closed');
     const row = processTable().find((entry) => entry.pid === state.pid);
     if (row?.group !== state.pid || row.command !== verified.executable) fail('native_intro_identity');
@@ -161,7 +161,13 @@ async function continueNativeIntro(state, verified) {
         { encoding: 'utf8', timeout: OPERATION, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
     } catch { fail('native_intro_automation_unavailable'); }
     return interpretSignedStagingNativeIntroResult(result);
-  }, STARTUP, 'native introduction');
+  }, STARTUP, 'native introduction'); }
+  catch (error) {
+    // waitFor retries ordinary errors, including our fixed closed-process
+    // result. Preserve that result when the owned executable has exited.
+    if (state.stopped()) fail('native_intro_closed');
+    throw error;
+  }
   state.nativeIntroContinued = true;
 }
 

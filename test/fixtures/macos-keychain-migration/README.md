@@ -73,7 +73,10 @@ descendant process, plus an actual loopback connection. A fixed inherited
 sandbox permits loopback, retains normal OS credential protection, and blocks
 external app traffic; no endpoint, proxy, app bytes or ACL is weakened.
 
-The v1 first journey verifies existing modern values through the exact signed
+Each journey first completes the signed predecessor's ordinary first run with
+external traffic blocked and before selecting the synthetic Keychain. It then
+seeds existing modern items, restarts that predecessor, and replaces the app.
+The v1 journey verifies those values through the exact signed
 Electron 0.1.20 predecessor and installed candidate replacement, a completed
 local refresh, three controlled candidate restarts, and persistent sharing
 preferences. Every readback must retain the item identity, bytes and ACL.
