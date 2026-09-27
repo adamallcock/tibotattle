@@ -10,9 +10,11 @@ import { createSealedSqliteIngestionJournalSource } from "../scripts/postgres-in
 import {
   createSealedSqliteAnalyticsHistorySource,
   transferPostgresAnalyticsHistoryBootstrap,
+  transferPostgresAnalyticsRuntimeSourceRegistry,
   transferPostgresAnalyticsHistoryState,
 } from "../scripts/postgres-analytics-history-transfer.mjs";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { applyStockAndStagedMigrations } from "./staged-migrations-harness.mjs";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "5432");
@@ -24,11 +26,11 @@ function eventDigest(sequence, suffix) {
   return BigInt(sequence * 10 + suffix).toString(16).padStart(64, "0");
 }
 
-async function makeSealedSource({ namespace = "synthetic-analytics-namespace", journalContentOverride = null } = {}) {
+async function makeSealedSource({ namespace = "synthetic-analytics-namespace", sourceId = "synthetic-analytics-source",
+  additionalRuntimeSources = [], journalContentOverride = null } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "tibotattle-analytics-history-pg17-"));
   const path = join(await realpath(directory), "analytics-source.sqlite");
   const database = new DatabaseSync(path);
-  const sourceId = "synthetic-analytics-source";
   const owners = [
     { digest: "a".repeat(64), revision: 2, authorityEpoch: 1, state: "active" },
     { digest: "b".repeat(64), revision: 2, authorityEpoch: 2, state: "withdrawn" },
@@ -52,7 +54,11 @@ async function makeSealedSource({ namespace = "synthetic-analytics-namespace", j
         owner_digest TEXT NOT NULL,revision INTEGER NOT NULL,kind TEXT NOT NULL,object_digest TEXT NOT NULL,
         content_digest TEXT NOT NULL,authority_epoch INTEGER NOT NULL,public_authority_epoch INTEGER NOT NULL,
         recorded_ms INTEGER NOT NULL,PRIMARY KEY(source_id,sequence),UNIQUE(source_id,event_digest));`);
-    database.prepare("INSERT INTO analytics_runtime_sources VALUES(?,?,1)").run(sourceId, namespace);
+    const insertRuntimeSource = database.prepare("INSERT INTO analytics_runtime_sources VALUES(?,?,1)");
+    insertRuntimeSource.run(sourceId, namespace);
+    for (const runtimeSource of additionalRuntimeSources) {
+      insertRuntimeSource.run(runtimeSource.sourceId, runtimeSource.namespace);
+    }
     database.prepare("INSERT INTO analytics_source_cursors VALUES(?,?,?)").run(sourceId, 6n, 5n);
     const insertOwner = database.prepare("INSERT INTO analytics_owner_state VALUES(?,?,?,?,?)");
     for (const owner of owners) {
@@ -70,7 +76,13 @@ async function makeSealedSource({ namespace = "synthetic-analytics-namespace", j
   }
   await chmod(path, 0o400);
   const expectedSha256 = createHash("sha256").update(await readFile(path)).digest("hex");
-  const source = await createSealedSqliteAnalyticsHistorySource({ path: await realpath(path), expectedSha256 });
+  let source;
+  try {
+    source = await createSealedSqliteAnalyticsHistorySource({ path: await realpath(path), expectedSha256 });
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw error;
+  }
 
   const journalPath = join(await realpath(directory), "ingestion-journal.sqlite");
   const journalDatabase = new DatabaseSync(journalPath);
@@ -120,6 +132,155 @@ async function localSocket() {
   assert.equal(metadata.uid, process.getuid());
   return { host: resolved, port: PG_TEST_PORT };
 }
+
+test("PG17 transfers only the sealed runtime-source registry subset into staged 0092", {
+  skip: !PG_TEST_SOCKET,
+}, async () => {
+  const socket = await localSocket();
+  const pool = new pg.Pool({ ...socket, user: PG_TEST_USER, password: PG_TEST_PASSWORD,
+    database: PG_TEST_DATABASE, ssl: false, max: 3, connectionTimeoutMillis: 5_000,
+    application_name: "pg-runtime-source-registry-transfer-test" });
+  const schema = `analytics_history_transfer_target_${randomBytes(6).toString("hex")}`;
+  const quoted = `"${schema}"`;
+  const table = name => `${quoted}."${name}"`;
+  let fixture;
+  let schemaCreated = false;
+  const invalidFixtures = [];
+  try {
+    const locality = await pool.query("SELECT inet_server_addr() AS address,current_setting('server_version_num') AS version");
+    assert.equal(locality.rows[0]?.address, null, "test must use the local Unix socket");
+    assert.match(locality.rows[0]?.version ?? "", /^17\d+$/u, "test must run on PostgreSQL 17");
+    await pool.query(`CREATE SCHEMA ${quoted}`);
+    schemaCreated = true;
+    const migration = await applyStockAndStagedMigrations({ role: "primary", schema, pool,
+      stagedFiles: ["0092_runtime_source_registry.sql"] });
+    assert.equal(migration.stockApplied, 46);
+    assert.deepEqual(migration.staged.map(({ name }) => name), ["0092_runtime_source_registry.sql"]);
+
+    const sourceId = "s".repeat(128);
+    const namespace = `${"n".repeat(198)}λ📦`;
+    const additionalRuntimeSources = [{ sourceId: "synthetic-secondary-source",
+      namespace: "synthetic-secondary-namespace" }];
+    fixture = await makeSealedSource({ namespace, sourceId, additionalRuntimeSources });
+    const transfer = () => transferPostgresAnalyticsRuntimeSourceRegistry({ source: fixture.source,
+      destinationPool: pool, targetSchema: schema, pageSize: 1 });
+    const before = await pool.query(`SELECT count(*)::text AS rows FROM ${table("analytics_runtime_sources")}`);
+    assert.equal(before.rows[0]?.rows, "0", "the staged registry begins empty");
+
+    await pool.query(`UPDATE ${table("collection_controls")} SET control_state='operational',
+      processing_enabled=true WHERE singleton=1`);
+    await assert.rejects(transfer(), error => error?.code === "ANALYTICS_HISTORY_TARGET_NOT_CONTAINED");
+    await pool.query(`UPDATE ${table("collection_controls")} SET control_state='contained',
+      processing_enabled=false WHERE singleton=1`);
+
+    await pool.query(`ALTER TABLE ${table("analytics_runtime_sources")}
+      DISABLE TRIGGER analytics_runtime_source_immutable`);
+    await assert.rejects(transfer(), error => error?.code === "ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_REQUIRED");
+    const afterDisabledTrigger = await pool.query(`SELECT count(*)::text AS rows
+      FROM ${table("analytics_runtime_sources")}`);
+    assert.equal(afterDisabledTrigger.rows[0]?.rows, "0", "disabled immutability is refused before writes");
+    await pool.query(`ALTER TABLE ${table("analytics_runtime_sources")}
+      ENABLE TRIGGER analytics_runtime_source_immutable`);
+    await pool.query(`DROP TRIGGER analytics_runtime_source_immutable
+      ON ${table("analytics_runtime_sources")}`);
+    await pool.query(`CREATE TRIGGER analytics_runtime_source_immutable
+      BEFORE UPDATE OR DELETE ON ${table("analytics_runtime_sources")}
+      FOR EACH STATEMENT EXECUTE FUNCTION ${quoted}."reject_analytics_runtime_source_mutation"()`);
+    await assert.rejects(transfer(), error => error?.code === "ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_REQUIRED");
+    const afterAlteredTrigger = await pool.query(`SELECT count(*)::text AS rows
+      FROM ${table("analytics_runtime_sources")}`);
+    assert.equal(afterAlteredTrigger.rows[0]?.rows, "0", "altered trigger events are refused before writes");
+    await pool.query(`DROP TRIGGER analytics_runtime_source_immutable
+      ON ${table("analytics_runtime_sources")}`);
+    await pool.query(`CREATE TRIGGER analytics_runtime_source_immutable
+      BEFORE UPDATE OR DELETE ON ${table("analytics_runtime_sources")}
+      FOR EACH ROW EXECUTE FUNCTION ${quoted}."reject_analytics_runtime_source_mutation"()`);
+
+    const result = await transfer();
+    assert.equal(result.status, "partial_runtime_source_registry_stage_complete");
+    assert.equal(result.sourceRows, "2");
+    assert.equal(result.targetRows, "2");
+    assert.equal(result.rowsInserted, "2");
+    assert.match(result.supportedTransferSubset, /source_id_ascii_1_to_128/u);
+    assert.match(result.supportedTransferSubset, /namespace_utf8_bytes_1_to_256/u);
+    assert.equal(result.fullD1RegistryParity, false);
+    assert.equal(result.fullAnalyticsTransfer, false);
+    assert.equal(result.analyticsContinuityQualified, false);
+    assert.equal(result.readerEnabled, false);
+    assert.equal(result.publicationEnabled, false);
+    assert.equal(result.productionCutoverAuthorized, false);
+    assert.equal(result.runtimeSourceRegistryTargetDdlOwned, false);
+    assert.equal(result.rawNamespaceIncluded, false);
+    assert.equal(JSON.stringify(result).includes(namespace), false);
+    assert.equal(result.sourceRowsSha256, result.targetRowsSha256);
+    const stored = await pool.query(`SELECT source_id,source_namespace,contract_version
+      FROM ${table("analytics_runtime_sources")} ORDER BY source_id COLLATE "C"`);
+    assert.deepEqual(stored.rows, [
+      { source_id: "s".repeat(128), source_namespace: namespace, contract_version: 1 },
+      { source_id: "synthetic-secondary-source", source_namespace: "synthetic-secondary-namespace", contract_version: 1 },
+    ], "independent PostgreSQL readback preserves all three D1 tuple values exactly");
+
+    const replay = await transfer();
+    assert.equal(replay.rowsInserted, "0");
+    assert.equal(replay.resumed, true);
+    assert.equal(replay.sourceRowsSha256, result.sourceRowsSha256);
+    assert.equal(replay.targetRowsSha256, result.targetRowsSha256);
+
+    const conflicting = await makeSealedSource({ namespace: "synthetic-conflicting-namespace", sourceId,
+      additionalRuntimeSources });
+    invalidFixtures.push(conflicting);
+    await assert.rejects(transferPostgresAnalyticsRuntimeSourceRegistry({ source: conflicting.source,
+      destinationPool: pool, targetSchema: schema, pageSize: 1 }), error => {
+      assert.equal(error?.code, "ANALYTICS_HISTORY_RUNTIME_REGISTRY_CONFLICT");
+      assert.equal(error.message.includes("synthetic-conflicting-namespace"), false);
+      return true;
+    });
+    const afterConflict = await pool.query(`SELECT source_id,source_namespace,contract_version
+      FROM ${table("analytics_runtime_sources")}`);
+    assert.deepEqual(afterConflict.rows, stored.rows, "conflict verification must not mutate immutable target rows");
+
+    for (const invalidNamespace of ["n".repeat(201), "synthetic-control-\u0001-namespace"]) {
+      const unsupported = await makeSealedSource({ namespace: invalidNamespace, sourceId });
+      invalidFixtures.push(unsupported);
+      await assert.rejects(transferPostgresAnalyticsRuntimeSourceRegistry({ source: unsupported.source,
+        destinationPool: pool, targetSchema: schema, pageSize: 1 }), error => {
+        assert.equal(error?.code, "ANALYTICS_HISTORY_RUNTIME_REGISTRY_TUPLE_UNSUPPORTED");
+        assert.equal(error.message.includes(invalidNamespace), false);
+        return true;
+      });
+    }
+    const afterUnsupported = await pool.query(`SELECT count(*)::text AS rows
+      FROM ${table("analytics_runtime_sources")}`);
+    assert.equal(afterUnsupported.rows[0]?.rows, "2", "unsupported D1-valid tuples are refused before target writes");
+
+    await pool.query(`INSERT INTO ${table("analytics_runtime_sources")}
+      (source_id,source_namespace,contract_version) VALUES ($1,$2,1)`,
+    ["synthetic-extra-target-source", "synthetic-extra-target-namespace"]);
+    await assert.rejects(transfer(), error => error?.code === "ANALYTICS_HISTORY_RUNTIME_REGISTRY_PARITY_FAILED");
+    const afterExtra = await pool.query(`SELECT count(*)::text AS rows
+      FROM ${table("analytics_runtime_sources")}`);
+    assert.equal(afterExtra.rows[0]?.rows, "3", "an extra target registration prevents exact-set receipt");
+
+    for (const sourceId of ["synthetic.source", "s".repeat(129)]) {
+      await assert.rejects(makeSealedSource({ sourceId }), error => {
+        assert.equal(error?.code, "ANALYTICS_HISTORY_SOURCE_INTEGRITY_INVALID");
+        assert.equal(error.message.includes(sourceId), false);
+        return true;
+      });
+    }
+  } finally {
+    fixture?.source.close();
+    fixture?.journalSource.close();
+    if (fixture) await rm(fixture.directory, { recursive: true, force: true });
+    for (const invalid of invalidFixtures) {
+      invalid.source.close();
+      invalid.journalSource.close();
+      await rm(invalid.directory, { recursive: true, force: true });
+    }
+    if (schemaCreated) await pool.query(`DROP SCHEMA IF EXISTS ${quoted} CASCADE`).catch(() => {});
+    await pool.end();
+  }
+}, 120_000);
 
 test("PG17 stages only exact analytics state/cursors behind contained controls", {
   skip: !PG_TEST_SOCKET,

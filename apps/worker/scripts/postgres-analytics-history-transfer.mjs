@@ -26,6 +26,8 @@ const INGESTION_JOURNAL_RUNS = "_storage_ingestion_journal_transfer_runs_v1";
 const INGESTION_JOURNAL_CHECKPOINTS = "_storage_ingestion_journal_transfer_checkpoints_v1";
 const MAX_INGESTION_JOURNAL_PAGE_SIZE = 250;
 const TRUSTED_SOURCES = new WeakSet();
+const SEALED_RUNTIME_SOURCE_REGISTRY_READERS = new WeakMap();
+const RUNTIME_SOURCE_REGISTRY_SUBSET = "source_id_ascii_1_to_128_initial_alphanumeric_then_alphanumeric_colon_underscore_hyphen; namespace_utf8_bytes_1_to_256_and_unicode_characters_1_to_200_without_controls; contract_version_1";
 
 const SOURCE_TABLES = Object.freeze({
   analytics_runtime_sources: Object.freeze({
@@ -330,6 +332,126 @@ function validateSqliteRows(database) {
       || invalidOwners || unregisteredOwners) fail("ANALYTICS_HISTORY_SOURCE_INTEGRITY_INVALID");
 }
 
+function readSealedRuntimeSourceRegistryPage(source, { after = null, limit } = {}) {
+  assertSource(source);
+  validatePageSize(limit);
+  const reader = SEALED_RUNTIME_SOURCE_REGISTRY_READERS.get(source);
+  if (!reader) fail("ANALYTICS_HISTORY_SEALED_SOURCE_REQUIRED");
+  try {
+    return reader({ after, limit });
+  } catch (error) {
+    if (error instanceof PostgresAnalyticsHistoryTransferError) throw error;
+    fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_SOURCE_READ_FAILED");
+  }
+}
+
+function validateRuntimeSourceRegistryTuple(raw) {
+  if (!raw || typeof raw !== "object" || typeof raw.source_id !== "string"
+      || !SOURCE_ID.test(raw.source_id) || typeof raw.source_namespace !== "string"
+      || raw.contract_version !== 1) {
+    fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TUPLE_UNSUPPORTED");
+  }
+  const namespace = raw.source_namespace;
+  const codePointLength = [...namespace].length;
+  const namespaceBytes = Buffer.from(namespace, "utf8");
+  // D1 leaves these identifiers unbounded. This rehearsal deliberately accepts
+  // only the existing transfer subset plus the 0092 text bounds; other D1-valid
+  // tuples are refused unchanged, so this is not full D1 registry parity.
+  if (namespaceBytes.byteLength < 1 || namespaceBytes.byteLength > 256
+      || namespaceBytes.toString("utf8") !== namespace
+      || codePointLength < 1 || codePointLength > 200 || /\p{Cc}/u.test(namespace)) {
+    fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TUPLE_UNSUPPORTED");
+  }
+  return Object.freeze({ source_id: raw.source_id, source_namespace: namespace, contract_version: 1 });
+}
+
+function validatePostgresRuntimeSourceRegistryTuple(raw) {
+  if (!raw || typeof raw !== "object" || typeof raw.source_id !== "string"
+      || [...raw.source_id].length < 1 || [...raw.source_id].length > 200 || /\p{Cc}/u.test(raw.source_id)
+      || typeof raw.source_namespace !== "string" || raw.contract_version !== 1) {
+    fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_ROW_INVALID");
+  }
+  const namespace = raw.source_namespace;
+  const namespaceBytes = Buffer.from(namespace, "utf8");
+  if (namespaceBytes.toString("utf8") !== namespace || [...namespace].length < 1
+      || [...namespace].length > 200 || /\p{Cc}/u.test(namespace)) {
+    fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_ROW_INVALID");
+  }
+  return Object.freeze({ source_id: raw.source_id, source_namespace: namespace, contract_version: 1 });
+}
+
+function updateRuntimeSourceRegistryHash(hash, row) {
+  hash.update(`${JSON.stringify([row.source_id, row.source_namespace, row.contract_version])}\n`);
+}
+
+function compareUtf8BinaryText(left, right) {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+async function scanRuntimeSourceRegistrySource(source, pageSize) {
+  const hash = sha256();
+  let rowCount = 0n;
+  let after = null;
+  let pagesRead = 0;
+  for (;;) {
+    const page = readSealedRuntimeSourceRegistryPage(source, { after, limit: pageSize });
+    if (!page || !Array.isArray(page.rows) || page.rows.length > pageSize) {
+      fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_SOURCE_PAGE_INVALID");
+    }
+    pagesRead += 1;
+    for (const raw of page.rows) {
+      const row = validateRuntimeSourceRegistryTuple(raw);
+      if (after !== null && row.source_id <= after) fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_SOURCE_ORDER_INVALID");
+      updateRuntimeSourceRegistryHash(hash, row);
+      after = row.source_id;
+      rowCount += 1n;
+    }
+    if (page.rows.length < pageSize) break;
+  }
+  return Object.freeze({ rowCount: rowCount.toString(), sha256: hash.digest("hex"), pagesRead });
+}
+
+async function scanRuntimeSourceRegistryTarget(client, schema, pageSize) {
+  const hash = sha256();
+  let rowCount = 0n;
+  let after = null;
+  let pagesRead = 0;
+  for (;;) {
+    let result;
+    try {
+      result = after === null
+        ? await client.query(`SELECT source_id,source_namespace,contract_version
+            FROM ${relation(schema, "analytics_runtime_sources")}
+            ORDER BY source_id COLLATE "C" LIMIT $1`, [pageSize])
+        : await client.query(`SELECT source_id,source_namespace,contract_version
+            FROM ${relation(schema, "analytics_runtime_sources")}
+            WHERE source_id COLLATE "C" > $1::text COLLATE "C"
+            ORDER BY source_id COLLATE "C" LIMIT $2`, [after, pageSize]);
+    } catch {
+      fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_READ_FAILED");
+    }
+    if (!Array.isArray(result?.rows) || result.rows.length > pageSize) {
+      fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_READ_FAILED");
+    }
+    pagesRead += 1;
+    for (const raw of result.rows) {
+      const row = validatePostgresRuntimeSourceRegistryTuple({
+        source_id: raw.source_id,
+        source_namespace: raw.source_namespace,
+        contract_version: Number(raw.contract_version),
+      });
+      if (after !== null && compareUtf8BinaryText(row.source_id, after) <= 0) {
+        fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_ORDER_INVALID");
+      }
+      updateRuntimeSourceRegistryHash(hash, row);
+      after = row.source_id;
+      rowCount += 1n;
+    }
+    if (result.rows.length < pageSize) break;
+  }
+  return Object.freeze({ rowCount: rowCount.toString(), sha256: hash.digest("hex"), pagesRead });
+}
+
 export async function createSealedSqliteAnalyticsHistorySource({ path, expectedSha256 } = {}) {
   if (!SHA256.test(expectedSha256 ?? "")) fail("ANALYTICS_HISTORY_SQLITE_SHA256_REQUIRED");
   const initial = await fingerprintSqlite(path);
@@ -457,6 +579,38 @@ export async function createSealedSqliteAnalyticsHistorySource({ path, expectedS
     },
   });
   TRUSTED_SOURCES.add(source);
+  SEALED_RUNTIME_SOURCE_REGISTRY_READERS.set(source, ({ after = null, limit } = {}) => {
+    if (closed) fail("ANALYTICS_HISTORY_SQLITE_CLOSED");
+    validatePageSize(limit);
+    if (after !== null) validateSourceId(after);
+    const key = `analytics_runtime_sources:${after === null ? "first" : "next"}`;
+    let statement = prepared.get(key);
+    if (!statement) {
+      const columns = SOURCE_TABLES.analytics_runtime_sources.columns.map(column => `"${column}"`).join(",");
+      const sql = after === null
+        ? `SELECT ${columns} FROM "analytics_runtime_sources" ORDER BY source_id COLLATE BINARY LIMIT ?`
+        : `SELECT ${columns} FROM "analytics_runtime_sources" WHERE source_id COLLATE BINARY > ? COLLATE BINARY
+            ORDER BY source_id COLLATE BINARY LIMIT ?`;
+      try {
+        statement = database.prepare(sql);
+        prepared.set(key, statement);
+      } catch {
+        fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_SOURCE_READ_FAILED");
+      }
+    }
+    try {
+      const rows = after === null ? statement.all(BigInt(limit)) : statement.all(after, BigInt(limit));
+      if (rows.length > limit) fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_SOURCE_PAGE_INVALID");
+      return Object.freeze({ rows: Object.freeze(rows.map(row => Object.freeze({
+        source_id: row.source_id,
+        source_namespace: row.source_namespace,
+        contract_version: Number(row.contract_version),
+      }))) });
+    } catch (error) {
+      if (error instanceof PostgresAnalyticsHistoryTransferError) throw error;
+      fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_SOURCE_READ_FAILED");
+    }
+  });
   return source;
 }
 
@@ -509,6 +663,7 @@ function quoteSchema(schema) {
 
 function relation(schema, name) {
   if (!SPEC_BY_NAME.has(name) && !TARGET_OPERATION_TABLES.includes(name) && name !== "collection_controls"
+      && name !== "analytics_runtime_sources"
       && !["storage_source_state", APPLIED_MAIN_RUNS, APPLIED_MAIN_CHECKPOINTS, INGESTION_JOURNAL_RUNS,
         INGESTION_JOURNAL_CHECKPOINTS].includes(name)) {
     fail("ANALYTICS_HISTORY_TABLE_INVALID");
@@ -959,6 +1114,264 @@ async function validateTarget(client, schema) {
     if (!result.rows?.[0]?.relation) fail("ANALYTICS_HISTORY_TARGET_SCHEMA_REQUIRED");
   }
   return version;
+}
+
+async function validateRuntimeSourceRegistryTarget(client, schema) {
+  let server;
+  try {
+    server = await client.query(`SELECT current_setting('server_version_num')::integer AS version,
+      current_setting('server_encoding') AS encoding,inet_server_addr() AS address`);
+  } catch {
+    fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_REQUIRED");
+  }
+  const row = server.rows?.[0];
+  const version = Number(row?.version);
+  if (!Number.isSafeInteger(version) || Math.floor(version / 10_000) !== 17) {
+    fail("ANALYTICS_HISTORY_POSTGRES_17_REQUIRED");
+  }
+  if (row?.address !== null || row?.encoding !== "UTF8") {
+    fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_LOCAL_TARGET_REQUIRED");
+  }
+  for (const name of ["collection_controls", "analytics_runtime_sources"]) {
+    let relationResult;
+    try {
+      relationResult = await client.query("SELECT to_regclass($1) AS relation", [`${schema}.${name}`]);
+    } catch {
+      fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_REQUIRED");
+    }
+    if (!relationResult.rows?.[0]?.relation) fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_REQUIRED");
+  }
+  const registryConstraints = new Map([
+    ["analytics_runtime_sources_pkey", ["p", "PRIMARY KEY (source_id)"]],
+    ["analytics_runtime_sources_source_id_check", ["c",
+      "CHECK ((((char_length(source_id) >= 1) AND (char_length(source_id) <= 200)) AND (source_id !~ '[[:cntrl:]]'::text)))"]],
+    ["analytics_runtime_sources_source_namespace_check", ["c",
+      "CHECK ((((char_length(source_namespace) >= 1) AND (char_length(source_namespace) <= 200)) AND (source_namespace !~ '[[:cntrl:]]'::text)))"]],
+    ["analytics_runtime_sources_contract_version_check", ["c", "CHECK ((contract_version = 1))"]],
+  ]);
+  let constraints;
+  try {
+    constraints = await client.query(`SELECT conname,contype,convalidated,pg_get_constraintdef(oid) AS definition
+      FROM pg_constraint WHERE conrelid=to_regclass($1) AND conname=ANY($2::text[])`,
+    [`${schema}.analytics_runtime_sources`, [...registryConstraints.keys()]]);
+  } catch {
+    fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_REQUIRED");
+  }
+  if (constraints.rowCount !== registryConstraints.size || constraints.rows.some(constraint => {
+    const expected = registryConstraints.get(constraint.conname);
+    return !expected || constraint.contype !== expected[0] || !constraint.convalidated
+      || constraint.definition !== expected[1];
+  })) {
+    fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_REQUIRED");
+  }
+  const foreignKeys = new Map([
+    ["analytics_admin_metric_snapshots_runtime_source_fk", "analytics_admin_metric_snapshots"],
+    ["analytics_admin_metrics_history_cache_runtime_source_fk", "analytics_admin_metrics_history_cache"],
+  ]);
+  for (const [name, child] of foreignKeys) {
+    let foreignKey;
+    try {
+      foreignKey = await client.query(`SELECT contype,convalidated,
+          confrelid=to_regclass($2) AS references_registry,pg_get_constraintdef(oid) AS definition
+        FROM pg_constraint WHERE conrelid=to_regclass($1) AND conname=$3`,
+      [`${schema}.${child}`, `${schema}.analytics_runtime_sources`, name]);
+    } catch {
+      fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_REQUIRED");
+    }
+    if (foreignKey.rowCount !== 1 || foreignKey.rows[0]?.contype !== "f"
+        || !foreignKey.rows[0]?.convalidated || foreignKey.rows[0]?.references_registry !== true
+        || foreignKey.rows[0]?.definition !== `FOREIGN KEY (source_id) REFERENCES ${schema}.analytics_runtime_sources(source_id)`) {
+      fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_REQUIRED");
+    }
+  }
+  let triggers;
+  try {
+    triggers = await client.query(`SELECT trigger_row.tgname,trigger_row.tgenabled,
+        trigger_row.tgtype::integer AS trigger_type,procedure_row.proname,
+        function_schema.nspname AS function_schema,language_row.lanname,
+        procedure_row.prosrc AS function_source
+      FROM pg_trigger trigger_row
+      JOIN pg_proc procedure_row ON procedure_row.oid=trigger_row.tgfoid
+      JOIN pg_namespace function_schema ON function_schema.oid=procedure_row.pronamespace
+      JOIN pg_language language_row ON language_row.oid=procedure_row.prolang
+      WHERE trigger_row.tgrelid=to_regclass($1) AND NOT trigger_row.tgisinternal
+        AND trigger_row.tgname=ANY($2::text[]) ORDER BY trigger_row.tgname`,
+    [`${schema}.analytics_runtime_sources`, [
+      "analytics_runtime_source_immutable", "analytics_runtime_source_truncate_refused",
+    ]]);
+  } catch {
+    fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_REQUIRED");
+  }
+  const expectedFunctionSource = "BEGIN RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'analytics_runtime_source_immutable'; RETURN NULL; END;";
+  const triggerContract = new Map([
+    ["analytics_runtime_source_immutable", 27],
+    ["analytics_runtime_source_truncate_refused", 34],
+  ]);
+  if (triggers.rowCount !== triggerContract.size || triggers.rows.some(trigger =>
+    trigger.tgenabled !== "O" || trigger.trigger_type !== triggerContract.get(trigger.tgname)
+      || trigger.proname !== "reject_analytics_runtime_source_mutation"
+      || trigger.function_schema !== schema || trigger.lanname !== "plpgsql"
+      || trigger.function_source.replace(/\s+/gu, " ").trim() !== expectedFunctionSource)) {
+    fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_REQUIRED");
+  }
+  return Math.floor(version / 10_000);
+}
+
+/**
+ * Rehearse only the sealed D1 runtime-source tuple transfer into staged 0092.
+ * The accepted D1 subset and the exact target are checked before a single row
+ * is written. Namespace values stay internal to this function and its sealed
+ * reader; receipts contain hashes and counts only. This does not import history
+ * or qualify full D1 registry parity, analytics continuity, readers, publication,
+ * or cutover.
+ */
+export async function transferPostgresAnalyticsRuntimeSourceRegistry({
+  source,
+  destinationPool,
+  targetSchema: rawTargetSchema,
+  pageSize = POSTGRES_ANALYTICS_HISTORY_DEFAULT_PAGE_SIZE,
+} = {}) {
+  const schema = typeof rawTargetSchema === "string" ? rawTargetSchema : "";
+  const prefix = POSTGRES_ANALYTICS_HISTORY_TARGET_SCHEMA_PREFIX;
+  const suffix = schema.startsWith(prefix) ? schema.slice(prefix.length) : "";
+  if (!SCHEMA.test(schema) || !TARGET_SUFFIX.test(suffix)) fail("ANALYTICS_HISTORY_TARGET_SCHEMA_REQUIRED");
+  const size = validatePageSize(pageSize);
+  const snapshot = assertSource(source);
+  if (!destinationPool || typeof destinationPool.connect !== "function") {
+    fail("ANALYTICS_HISTORY_DESTINATION_REQUIRED");
+  }
+  await source.verifySnapshot();
+  const sourceManifest = await scanRuntimeSourceRegistrySource(source, size);
+  await source.verifySnapshot();
+
+  let client;
+  try {
+    client = await destinationPool.connect();
+  } catch {
+    fail("ANALYTICS_HISTORY_DESTINATION_REQUIRED");
+  }
+  let transactionStarted = false;
+  let committed = false;
+  let rowsInserted = 0n;
+  try {
+    const postgresMajor = await validateRuntimeSourceRegistryTarget(client, schema);
+    await client.query("BEGIN");
+    transactionStarted = true;
+    const lock = await client.query("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS locked",
+      [`${schema}:analytics-runtime-source-registry-transfer`]);
+    if (lock.rows?.[0]?.locked !== true) fail("ANALYTICS_HISTORY_TRANSFER_BUSY");
+    try {
+      await client.query(`LOCK TABLE ${relation(schema, "analytics_runtime_sources")} IN SHARE ROW EXCLUSIVE MODE`);
+    } catch {
+      fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_REQUIRED");
+    }
+    await validateRuntimeSourceRegistryTarget(client, schema);
+    await assertContained(client, schema);
+
+    let after = null;
+    for (;;) {
+      const page = readSealedRuntimeSourceRegistryPage(source, { after, limit: size });
+      if (!page || !Array.isArray(page.rows) || page.rows.length > size) {
+        fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_SOURCE_PAGE_INVALID");
+      }
+      const rows = page.rows.map(validateRuntimeSourceRegistryTuple);
+      if (rows.length === 0) break;
+      for (let index = 0; index < rows.length; index += 1) {
+        if ((after !== null && rows[index].source_id <= after)
+            || (index > 0 && rows[index].source_id <= rows[index - 1].source_id)) {
+          fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_SOURCE_ORDER_INVALID");
+        }
+      }
+      const values = rows.flatMap(row => [row.source_id, row.source_namespace, row.contract_version]);
+      const tuples = rows.map((_, index) => {
+        const offset = index * 3;
+        return `($${offset + 1},$${offset + 2},$${offset + 3})`;
+      }).join(",");
+      let inserted;
+      try {
+        inserted = await client.query(`INSERT INTO ${relation(schema, "analytics_runtime_sources")}
+          (source_id,source_namespace,contract_version) VALUES ${tuples}
+          ON CONFLICT (source_id) DO NOTHING`, values);
+      } catch {
+        fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_INSERT_FAILED");
+      }
+      if (!Number.isSafeInteger(inserted.rowCount) || inserted.rowCount < 0 || inserted.rowCount > rows.length) {
+        fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_INSERT_FAILED");
+      }
+      rowsInserted += BigInt(inserted.rowCount);
+
+      let readback;
+      try {
+        readback = await client.query(`SELECT source_id,source_namespace,contract_version
+          FROM ${relation(schema, "analytics_runtime_sources")}
+          WHERE source_id=ANY($1::text[]) ORDER BY source_id COLLATE "C"`,
+        [rows.map(row => row.source_id)]);
+      } catch {
+        fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TARGET_READ_FAILED");
+      }
+      if (readback.rowCount !== rows.length) fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_CONFLICT");
+      for (let index = 0; index < rows.length; index += 1) {
+        const target = validatePostgresRuntimeSourceRegistryTuple({
+          source_id: readback.rows[index]?.source_id,
+          source_namespace: readback.rows[index]?.source_namespace,
+          contract_version: Number(readback.rows[index]?.contract_version),
+        });
+        const expected = rows[index];
+        if (target.source_id !== expected.source_id || target.source_namespace !== expected.source_namespace
+            || target.contract_version !== expected.contract_version) {
+          fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_CONFLICT");
+        }
+      }
+      after = rows.at(-1).source_id;
+      if (rows.length < size) break;
+    }
+
+    await source.verifySnapshot();
+    const finalSourceManifest = await scanRuntimeSourceRegistrySource(source, size);
+    if (finalSourceManifest.rowCount !== sourceManifest.rowCount
+        || finalSourceManifest.sha256 !== sourceManifest.sha256) {
+      fail("ANALYTICS_HISTORY_SOURCE_CHANGED");
+    }
+    await assertContained(client, schema);
+    const targetManifest = await scanRuntimeSourceRegistryTarget(client, schema, size);
+    if (targetManifest.rowCount !== sourceManifest.rowCount || targetManifest.sha256 !== sourceManifest.sha256) {
+      fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_PARITY_FAILED");
+    }
+    await source.verifySnapshot();
+    await client.query("COMMIT");
+    committed = true;
+    transactionStarted = false;
+    return Object.freeze({
+      schema: "sealed-d1-runtime-source-registry-transfer-v1",
+      status: "partial_runtime_source_registry_stage_complete",
+      targetSchema: schema,
+      postgresMajor,
+      sourceSnapshotSha256: snapshot.artifactSha256,
+      sourceRows: sourceManifest.rowCount,
+      targetRows: targetManifest.rowCount,
+      sourceRowsSha256: sourceManifest.sha256,
+      targetRowsSha256: targetManifest.sha256,
+      pageSize: size,
+      pagesRead: sourceManifest.pagesRead,
+      rowsInserted: rowsInserted.toString(),
+      resumed: rowsInserted.toString() !== sourceManifest.rowCount,
+      supportedTransferSubset: RUNTIME_SOURCE_REGISTRY_SUBSET,
+      fullD1RegistryParity: false,
+      fullAnalyticsTransfer: false,
+      analyticsContinuityQualified: false,
+      readerEnabled: false,
+      publicationEnabled: false,
+      productionCutoverAuthorized: false,
+      rawNamespaceIncluded: false,
+      runtimeSourceRegistryTargetDdlOwned: false,
+    });
+  } catch (error) {
+    if (transactionStarted && !committed) await client.query("ROLLBACK").catch(() => {});
+    if (error instanceof PostgresAnalyticsHistoryTransferError) throw error;
+    fail("ANALYTICS_HISTORY_RUNTIME_REGISTRY_TRANSFER_FAILED");
+  } finally {
+    client.release();
+  }
 }
 
 async function acquireTargetLock(client, schema) {
