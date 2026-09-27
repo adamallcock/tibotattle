@@ -91,3 +91,12 @@ architectures. This follows the released 0.1.24 allocation `1032`; the
 superseded unpublished `1031` candidate is not reused. The provenance build
 number remains independent. This allocation enables candidate packaging and
 does not claim signing, notarization, installed qualification, or publication.
+
+## 2026-09-27 amendment: 0.1.26 successor allocation
+
+The owner selected 0.1.26 after holding the signed but unpublished 0.1.25
+candidate. Allocate stable Mac bundle version `1034` to both architectures,
+following 0.1.25's `1033` without reusing or altering its tag or artifacts.
+The independently selected provenance build number still binds each new
+artifact. This allocation does not claim a signed build, installed credential
+qualification, updater delivery, or publication.

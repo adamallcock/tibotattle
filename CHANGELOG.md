@@ -36,14 +36,27 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-**0.1.26 candidate notes:** [release-notes/0.1.26.md](./release-notes/0.1.26.md).
+No changes yet.
 
-The tagged 0.1.25 candidate remains unpublished. Its planned changes are
-carried into this successor.
+## [0.1.26](./release-notes/0.1.26.md) - 2026-09-27
 
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.26) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.26) ·
+[changes since the v0.1.25 tagged candidate](https://github.com/adamallcock/tibotattle/compare/v0.1.25...v0.1.26) ·
+[changes since the last public v0.1.24 release](https://github.com/adamallcock/tibotattle/compare/v0.1.24...v0.1.26)
+
+Version 0.1.25 was tagged and signed but never published. Version 0.1.26
+carries those changes forward from the last public 0.1.24 release.
+
+- Restore direct Codex allowance refresh for newer bundled CLI layouts and
+  report selected CLI source without private paths. Keep quota freshness
+  independent of local usage and bound the dashboard's timeout cleanup wait.
 - Distinguish a locked Mac Keychain from an item access denial when macOS
-  returns the same authorization error for both. Keep credential reads silent
-  and leave existing items and access controls intact.
+  reports the same authorization error. Keep credential reads silent and leave
+  existing items and access controls intact.
+- Add Mac update visibility, preserve startup checkpoints and cached reports
+  during refresh, correct cached Trends header ranges, and retain newly
+  recognized Claude model names. Keep forecast-only GPT-6.1 Astra unpriced.
 
 ## [0.1.25](./release-notes/0.1.25.md) - 2026-09-27
 
