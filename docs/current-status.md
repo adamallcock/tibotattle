@@ -56,14 +56,18 @@ installed updater runs and cask resolution are distinct evidence.
 The [public website](https://tibotattle.com/) serves the 0.1.26 four-platform
 download page. Its [site manifest](https://tibotattle.com/release-site-manifest.json)
 has SHA-256
-`cb9b987f845963502031cafe9d97afae39e8f9b0ab9b4229e9ffcccba5bba549`.
-Cache-busted public readback matched the generated homepage, docs, privacy,
-share card, robots and sitemap; the share image is PNG at 1200×630. The rendered
-page exposed each published installer and live community aggregates.
+`676ddc42654eb4a44bffd59c3b45862f430a6e9e266f4211dc7610eaeac47c1c`.
+The 2026-09-27 website-only follow-up put localized navigation on a full row at
+narrow widths; the generated site changed only its stylesheet and manifest.
+Cache-busted public readback matched the new stylesheet and manifest, while the
+other generated files retained their launch-release bytes. The share image is
+PNG at 1200×630. The live Spanish page showed the full Docs link at 390 px,
+and the link opened Docs; the rendered page also exposed the published installers
+and live community aggregates.
 
 The production Worker health endpoint names web-only source
-`19f2459754a4a5393d3ba0804e7b293dbe7924c8`, a descendant of the
-previous deployed source `1fc2fe174daea7a728c638149c36eaccc78832a5`.
+`ae637aa7c38febf97bd15ae4ad79d020aaa5d3f7`, a descendant of the
+previous deployed web-only source `19f2459754a4a5393d3ba0804e7b293dbe7924c8`.
 The guarded typed-storage website deploy preserved the live bindings and
 qualified all three database roles. The 0.1.26 tag's separate analytics
 migration `0027_admin_metrics_history_publications.sql` and its associated
