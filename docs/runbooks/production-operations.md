@@ -359,6 +359,21 @@ resume under grouped processing. This groups acquisition work; it does not
 prepare reusable effective-day summaries or increase the invocation query cap.
 Verify the deployed revision before assuming this source behavior is active.
 
+Effective graph work uses the existing owner/day/metric selection lease with a
+closed version-2 effective envelope. A busy contender checks owner and target
+authority before yielding without reading quota pages. The claimant recaptures
+the complete effective scope; a lease never substitutes for source, correction,
+erasure or checkpoint validation. Version-1 v1.1 selections retain their pinned
+generation contract. Both source families use the caller's lease duration,
+including the longer scheduled pass's 570-second lease.
+
+The selection write rechecks target erasure and authority in the same SQL
+statement. Discard and claim predicates match the selected envelope so a stale
+invocation cannot act on a replacement row that happens to reuse its revision.
+Ordinary graph retirement removes at most 32 obsolete selection rows per pass,
+preserving in-horizon pending work and unexpired claims except for erased owners.
+Erasure completion requires selection metadata to be absent as well.
+
 Overlapping effective calculations still use an exact checkpoint-head comparison.
 When a save confirms that another writer has promoted a newer active head for
 the same key, `checkpoint_advanced` is a normal deferral. The scheduler may
@@ -367,6 +382,13 @@ such conflict exhausts the graph lane for that invocation. It never saves the
 losing payload against a substituted head. Missing, unchanged, retired or
 malformed heads remain failures; a trigger or provider error is not reclassified
 merely because another invocation is running.
+
+Verify the deployed revision before assuming effective leases are active. A
+rollback to source `214a6d3` ignores effective selection rows and cannot run their
+new horizon cleanup. Checkpoint comparisons still protect result promotion, but
+duplicate computation can recur and abandoned selections can remain in the
+diagnostic census until forward cleanup resumes. Do not clear checkpoint heads
+or bypass erasure to make those counts fall.
 
 With `GRAPH_DAY_PROJECTION_FOLD=enabled` and analytics migration
 `0028_graph_day_effective_quota.sql` present, effective-history calculations also

@@ -672,7 +672,10 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
      graphRan=true;
      let graph:StorageGraphWorkProgress={state:'deferred',reason:'graph_failure'};
      try{
-      graph=await advanceStorageCommunityGraphWork({...scoped,remainingQueries:meter.remainingQueries,deadlineMs,
+      // Scope capture and durable claim work spend this same meter before
+      // compute allocates its inner budget. Keep the remaining count live so
+      // that allocation still leaves checkpoint and claim-release headroom.
+      graph=await advanceStorageCommunityGraphWork({...scoped,get remainingQueries(){return meter.remainingQueries;},deadlineMs,
        admissionQueries:graphAdmission,...(options.graphLeaseMs===undefined?{}:{leaseMs:options.graphLeaseMs}),
        ...(options.foldGraphDayProjections===undefined?{}:{preparedFold:options.foldGraphDayProjections})});
       if(graph.failure)graphFailure??=graph.failure;

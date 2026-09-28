@@ -21,13 +21,17 @@ export async function retireStorageGraphPage(target:D1Database,sourceId:string,n
  if(!Number.isFinite(nowMs)||!/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,127}$/.test(sourceId))throw new Error('STORAGE_GRAPH_RETIREMENT_INVALID');
  const oldest=new Date(Date.parse(new Date(nowMs).toISOString().slice(0,10))
   -(ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS-1)*86400000).toISOString().slice(0,10);
+ // Older callers could leave selection metadata after the receipt committed.
+ // A terminal owner's remaining selections reopen this bounded cleanup only.
  const erased=await target.prepare(`WITH terminals AS (
   SELECT owner_digest,revision FROM analytics_owner_state WHERE source_id=? AND state='erased'
   UNION ALL SELECT owner_digest,terminal_revision AS revision FROM analytics_storage_erasure_fences WHERE source_id=?
  ), latest AS (SELECT owner_digest,MAX(revision) revision FROM terminals GROUP BY owner_digest)
  SELECT t.owner_digest,t.revision FROM latest t WHERE NOT EXISTS(SELECT 1 FROM analytics_graph_erasure_receipts r
   WHERE r.source_id=? AND r.owner_digest=t.owner_digest AND r.terminal_revision>=t.revision)
- ORDER BY t.owner_digest LIMIT 1`).bind(sourceId,sourceId,sourceId).first<{owner_digest:string;revision:number}>();
+  OR EXISTS(SELECT 1 FROM analytics_community_graph_work_selection s
+   WHERE s.source_id=? AND s.owner_digest=t.owner_digest)
+ ORDER BY t.owner_digest LIMIT 1`).bind(sourceId,sourceId,sourceId,sourceId).first<{owner_digest:string;revision:number}>();
  const results=await target.batch([
   target.prepare(`DELETE FROM analytics_community_graph_results WHERE (source_id,owner_digest,metric,day) IN (
    SELECT source_id,owner_digest,metric,day FROM analytics_community_graph_results
@@ -39,6 +43,14 @@ export async function retireStorageGraphPage(target:D1Database,sourceId:string,n
     WHERE r.source_id=e.source_id AND r.owner_digest=e.owner_digest AND r.day=e.day
      AND r.metric='model' AND r.dependency_digest=e.dependency_digest)) ORDER BY owner_digest,day LIMIT 32) RETURNING day`)
    .bind(sourceId,oldest,erased?.owner_digest??null),
+  // An abandoned selection is metadata, but it must not outlive this graph's
+  // horizon indefinitely. Keep a live ordinary claim until its lease expires;
+  // an erased owner's terminal authority overrides every claim and day.
+  target.prepare(`DELETE FROM analytics_community_graph_work_selection WHERE (source_id,owner_digest,day,metric) IN (
+   SELECT source_id,owner_digest,day,metric FROM analytics_community_graph_work_selection
+   WHERE source_id=? AND (owner_digest=? OR (day<? AND (state!='claimed' OR claim_expires_ms<=?)))
+   ORDER BY owner_digest,day,metric LIMIT 32) RETURNING day`)
+   .bind(sourceId,erased?.owner_digest??null,oldest,nowMs),
  ]);
  const deleted=results.reduce((n,r)=>n+r.results.length,0);
  const stage=await target.prepare(`SELECT s.source_id,s.owner_digest,s.day,s.dependency_digest,s.source_namespace,s.method,
@@ -68,6 +80,7 @@ export async function retireStorageGraphPage(target:D1Database,sourceId:string,n
     OR EXISTS(SELECT 1 FROM analytics_storage_erasure_fences WHERE source_id=?1 AND owner_digest=?2 AND terminal_revision=?3))
    AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_results WHERE source_id=?1 AND owner_digest=?2)
    AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_execution WHERE source_id=?1 AND owner_digest=?2)
+   AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_work_selection WHERE source_id=?1 AND owner_digest=?2)
    AND NOT EXISTS(SELECT 1 FROM analytics_history_checkpoint_stages WHERE source_id=?1 AND owner_digest=?2)
    ON CONFLICT(source_id,owner_digest) DO UPDATE SET terminal_revision=excluded.terminal_revision
     WHERE excluded.terminal_revision>analytics_graph_erasure_receipts.terminal_revision`)

@@ -9,11 +9,20 @@ const unavailable=()=>new Error('STORAGE_GRAPH_SELECTION_UNAVAILABLE');
 const invalid=()=>new TypeError('STORAGE_GRAPH_SELECTION_INVALID');
 export type StorageGraphSelectionMetric='fits'|'model';
 export interface StorageGraphSelectionKey {sourceId:string;ownerDigest:string;day:string;metric:StorageGraphSelectionMetric}
-export interface StorageGraphWorkEnvelope {
+export interface StorageGraphV11WorkEnvelope {
  version:1;source:'v1.1';sourceId:string;sourceNamespace:string;ownerDigest:string;day:string;
  metric:StorageGraphSelectionMetric;fixedNow:string;dependencyDigest:string;checkpointDependencyDigest:string;
  checkpointMethod:string;checkpointKeyDigest:string;targetAuthorityEpoch:number;snapshot:V11GenerationSnapshot;
 }
+/** Effective evidence is recaptured after claiming, not resumed from a v1.1
+ * generation. The lease covers the owner/day/metric across checkpoint formats;
+ * the calculation retains its exact dependency and per-page owner fences. */
+export interface StorageGraphEffectiveWorkEnvelope {
+ version:2;source:'effective';sourceId:string;sourceNamespace:string;ownerDigest:string;day:string;
+ metric:StorageGraphSelectionMetric;fixedNow:string;dependencyDigest:string;checkpointDependencyDigest:string;
+ targetAuthorityEpoch:number;participantId:string;ownerRevision:number;
+}
+export type StorageGraphWorkEnvelope=StorageGraphV11WorkEnvelope|StorageGraphEffectiveWorkEnvelope;
 export interface StorageGraphWorkSelection {key:StorageGraphSelectionKey;revision:number;
  state:'pending'|'claimed'|'complete';envelope:StorageGraphWorkEnvelope;envelopeSha256:string;
  claimToken:string|null;claimExpiresMs:number|null;createdMs:number;updatedMs:number}
@@ -34,6 +43,17 @@ function binds(key:StorageGraphSelectionKey){if(!validKey(key))throw invalid();r
 
 async function normalizeEnvelope(value:unknown):Promise<StorageGraphWorkEnvelope>{
  if(!value||typeof value!=='object'||Array.isArray(value))throw invalid();const v=value as Record<string,unknown>;
+ if(v.version===2&&v.source==='effective'){
+  if(Object.keys(v).sort().join(',')!==['checkpointDependencyDigest','day','dependencyDigest','fixedNow','metric',
+   'ownerDigest','ownerRevision','participantId','source','sourceId','sourceNamespace','targetAuthorityEpoch','version'].sort().join(',')
+   ||!token(v.sourceId,128)||!token(v.sourceNamespace,256)||typeof v.ownerDigest!=='string'||!HEX.test(v.ownerDigest)||!day(v.day)
+   ||v.metric!=='fits'&&v.metric!=='model'||v.fixedNow!==modelHistoryWindow(v.day as string).fixedNow
+   ||typeof v.dependencyDigest!=='string'||!HEX.test(v.dependencyDigest)
+   ||typeof v.checkpointDependencyDigest!=='string'||!HEX.test(v.checkpointDependencyDigest)
+   ||!safe(v.targetAuthorityEpoch)||!safe(v.ownerRevision)||typeof v.participantId!=='string'
+   ||v.participantId.length<1||v.participantId.length>256)throw invalid();
+  return structuredClone(v) as unknown as StorageGraphEffectiveWorkEnvelope;
+ }
  if(Object.keys(v).sort().join(',')!==['checkpointDependencyDigest','checkpointKeyDigest','checkpointMethod','day',
   'dependencyDigest','fixedNow','metric','ownerDigest','snapshot','source','sourceId','sourceNamespace',
   'targetAuthorityEpoch','version'].sort().join(',')||v.version!==1||v.source!=='v1.1'||!token(v.sourceId,128)
@@ -75,7 +95,17 @@ async function targetLive(target:D1Database,e:StorageGraphWorkEnvelope){return !
  WHERE o.source_id=? AND o.owner_digest=? AND o.state='active' AND o.authority_epoch=?
  AND NOT EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f WHERE f.source_id=o.source_id AND f.owner_digest=o.owner_digest)`)
  .bind(e.sourceId,e.ownerDigest,e.targetAuthorityEpoch).first()}
-async function sourceLive(source:D1Database,e:StorageGraphWorkEnvelope){const s=e.snapshot;return !!await source.prepare(`SELECT 1
+async function sourceLive(source:D1Database,e:StorageGraphWorkEnvelope){
+ if(e.source==='effective')return !!await source.prepare(`SELECT 1
+  FROM storage_v11_owner_links l
+  JOIN participants p ON p.id=l.participant_id AND p.state='active'
+  JOIN storage_owner_revisions r ON r.owner_digest=l.owner_digest AND r.state='active'
+    AND r.revision=? AND r.authority_epoch=?
+  JOIN typed_v1_admission_state a ON a.id=1 AND a.runtime_contract_version=1 AND a.source_namespace=?
+  JOIN typed_v11_admission_state b ON b.id=1 AND b.runtime_contract_version=1 AND b.source_namespace=a.source_namespace
+  WHERE l.participant_id=? AND l.owner_digest=? AND l.state='active'`)
+  .bind(e.ownerRevision,e.targetAuthorityEpoch,e.sourceNamespace,e.participantId,e.ownerDigest).first();
+ const s=e.snapshot;return !!await source.prepare(`SELECT 1
  FROM typed_v11_admission_state a JOIN participants p ON p.id=? AND p.state='active'
  JOIN telemetry_v11_domains g ON g.id=? AND g.participant_id=p.id AND g.device_id=? AND g.manifest_digest=? AND g.from_day=? AND g.through_day=?
  JOIN device_credentials d ON d.id=g.device_id AND d.participant_id=p.id AND d.state='active'
@@ -89,13 +119,15 @@ async function sourceLive(source:D1Database,e:StorageGraphWorkEnvelope){const s=
   e.targetAuthorityEpoch,s.sourceNamespace).first()}
 async function live(source:D1Database,target:D1Database,e:StorageGraphWorkEnvelope){return await targetLive(target,e)&&await sourceLive(source,e)}
 async function remove(target:D1Database,selection:StorageGraphWorkSelection){await target.prepare(`DELETE FROM analytics_community_graph_work_selection
- WHERE source_id=? AND owner_digest=? AND day=? AND metric=? AND selection_revision=?`).bind(...binds(selection.key),selection.revision).run()}
+ WHERE source_id=? AND owner_digest=? AND day=? AND metric=? AND selection_revision=?
+ AND envelope_sha256=? AND state=? AND claim_token IS ?`).bind(...binds(selection.key),selection.revision,
+ selection.envelopeSha256,selection.state,selection.claimToken).run()}
 
 /** Discard a selection at its exact revision. A recorded envelope that no
  * longer matches the scope the current build computes is superseded work, not
  * work in flight: removing the row lets the next pass record a fresh selection
- * for the same owner-day. The revision fence leaves a concurrent claimant's
- * row untouched, and removal is what a completed claim does as well. */
+ * for the same owner-day. The revision, envelope and claim fences also leave a
+ * deleted/recreated row untouched when its revision counter starts over. */
 export const discardStorageGraphWorkSelection=(target:D1Database,selection:StorageGraphWorkSelection)=>remove(target,selection);
 
 export async function loadLiveStorageGraphWorkSelection(options:{source:D1Database;target:D1Database;key:StorageGraphSelectionKey;nowMs?:number}){
@@ -103,8 +135,10 @@ export async function loadLiveStorageGraphWorkSelection(options:{source:D1Databa
  const now=options.nowMs??Date.now();if(!safe(now))throw invalid();
  if(selection.state==='claimed'&&selection.claimExpiresMs!<=now){await options.target.prepare(`UPDATE analytics_community_graph_work_selection
   SET state='pending',selection_revision=selection_revision+1,claim_token=NULL,claim_expires_ms=NULL,updated_ms=?
-  WHERE source_id=? AND owner_digest=? AND day=? AND metric=? AND selection_revision=? AND state='claimed' AND claim_expires_ms<=?`)
-  .bind(now,...binds(selection.key),selection.revision,now).run();selection=await load(options.target,options.key);if(!selection)return null;}
+  WHERE source_id=? AND owner_digest=? AND day=? AND metric=? AND selection_revision=?
+  AND envelope_sha256=? AND state='claimed' AND claim_token=? AND claim_expires_ms<=?`)
+  .bind(now,...binds(selection.key),selection.revision,selection.envelopeSha256,selection.claimToken,now).run();
+  selection=await load(options.target,options.key);if(!selection)return null;}
  if(!await live(options.source,options.target,selection.envelope)){await remove(options.target,selection);return null}return selection;
 }
 
@@ -115,7 +149,8 @@ export async function ensureStorageGraphWorkSelection(options:{source:D1Database
  if(!current){const result=await options.target.prepare(`INSERT INTO analytics_community_graph_work_selection
   (source_id,owner_digest,day,metric,authority_epoch,selection_revision,state,envelope_json,envelope_sha256,created_ms,updated_ms)
   SELECT ?,?,?,?,?,1,'pending',?,?,?,? WHERE EXISTS(SELECT 1 FROM analytics_owner_state o WHERE o.source_id=? AND o.owner_digest=?
-   AND o.state='active' AND o.authority_epoch=?) ON CONFLICT DO NOTHING RETURNING source_id`)
+   AND o.state='active' AND o.authority_epoch=? AND NOT EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
+    WHERE f.source_id=o.source_id AND f.owner_digest=o.owner_digest)) ON CONFLICT DO NOTHING RETURNING source_id`)
   .bind(key.sourceId,key.ownerDigest,key.day,key.metric,encoded.envelope.targetAuthorityEpoch,encoded.json,encoded.hash,now,now,
    key.sourceId,key.ownerDigest,encoded.envelope.targetAuthorityEpoch).all();
   const selection=await load(options.target,key);return result.results.length===1&&selection?{status:'created' as const,selection}:
@@ -135,8 +170,10 @@ export async function claimStorageGraphWorkSelection(options:{source:D1Database;
  if(!await live(options.source,options.target,options.selection.envelope)){await remove(options.target,options.selection);return {status:'blocked' as const};}
  const result=await options.target.prepare(`UPDATE analytics_community_graph_work_selection SET state='claimed',selection_revision=selection_revision+1,
   claim_token=?,claim_expires_ms=?,updated_ms=? WHERE source_id=? AND owner_digest=? AND day=? AND metric=?
-  AND selection_revision=? AND (state='pending' OR (state='claimed' AND claim_expires_ms<=?)) RETURNING source_id`)
-  .bind(options.claimToken,now+lease,now,...binds(options.selection.key),options.selection.revision,now).all();
+  AND selection_revision=? AND envelope_sha256=?
+  AND (state='pending' OR (state='claimed' AND claim_expires_ms<=?)) RETURNING source_id`)
+  .bind(options.claimToken,now+lease,now,...binds(options.selection.key),options.selection.revision,
+   options.selection.envelopeSha256,now).all();
  const selection=await load(options.target,options.selection.key);return result.results.length===1&&selection?{status:'claimed' as const,selection}:
   selection?{status:selection.state==='claimed'?'busy' as const:'conflict' as const,selection}:{status:'blocked' as const};}
 

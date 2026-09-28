@@ -14,6 +14,8 @@ import {registerTelemetryV11DayManifest} from '../src/telemetry-v11-repository';
 import {activateTelemetryV11Domain,createTelemetryV11DomainPredecessor} from '../src/telemetry-v11-domain';
 import {authenticateDevice,createDeviceUploadAuthorization,claimDeviceUploadAuthorization} from '../src/device-auth';
 import {sha256Hex} from '../src/crypto';
+import {canonicalJson} from '../src/canonical-json';
+import {modelHistoryWindow} from '../src/model-history-window';
 import {initializeStorageAnalyticsRuntime,advanceStorageAnalytics} from '../src/storage-analytics-runtime';
 import {eraseParticipantAsOwner} from '../src/participant-erasure';
 import {advanceStorageErasureJobs,prepareStorageParticipantErasure,requireStorageParticipantErasureComplete} from '../src/storage-erasure';
@@ -202,6 +204,59 @@ describe('cross-store physical erasure completion',()=>{
   expect(await count('analytics_storage_erasure_receipts')).toBe(1);
   await expect(writeGraphDayProjection({target:target(),key:projectionKey,projection,effectiveQuota}))
    .rejects.toThrow();
+ });
+ it('refuses to complete while graph selection metadata survives, then drains it in bounded pages',async()=>{
+  const f=await fixture();await deliver();const o=f.event.ownerDigest,nowMs=Date.now();
+  let fenced=false,seeded=false,held=false;
+  const stalled=new Proxy(target(),{get(db,key){
+   if(key==='prepare')return(sql:string)=>{
+    if(sql.includes('INSERT INTO analytics_storage_erasure_fences'))fenced=true;
+    if(!held&&sql.includes('DELETE FROM analytics_community_graph_work_selection')){
+     held=true;return db.prepare(sql.replace('WHERE (source_id','WHERE 0 AND (source_id'));
+    }
+    return db.prepare(sql);
+   };
+   if(key==='batch')return async(statements:D1PreparedStatement[])=>{
+    const result=await db.batch(statements);
+    if(fenced&&!seeded){
+     seeded=true;
+     // Represent a delayed older writer after the one-time fence trigger.
+     // Current admission refuses this owner; direct synthetic rows exercise
+     // completion independently of that admission gate and exceed one page.
+     for(let index=0;index<33;index++){
+      const day=new Date(Date.parse(today())-index*86400000).toISOString().slice(0,10);
+      const envelope=canonicalJson({version:2,source:'effective',sourceId,sourceNamespace,ownerDigest:o,
+       day,metric:'model',fixedNow:modelHistoryWindow(day).fixedNow,dependencyDigest:'b'.repeat(64),
+       checkpointDependencyDigest:'c'.repeat(64),targetAuthorityEpoch:f.event.authorityEpoch,
+       participantId:f.participantId,ownerRevision:f.event.revision});
+      await db.prepare(`INSERT INTO analytics_community_graph_work_selection
+       (source_id,owner_digest,day,metric,authority_epoch,selection_revision,state,envelope_json,envelope_sha256,
+        claim_token,claim_expires_ms,created_ms,updated_ms) VALUES(?,?,?,'model',?,1,'claimed',?,?,?,?,?,?)`)
+       .bind(sourceId,o,day,f.event.authorityEpoch,envelope,await sha256Hex(envelope),
+        'synthetic-delayed-erasure-claim',nowMs+60000,nowMs,nowMs).run();
+     }
+    }
+    return result;
+   };
+   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+  }});
+  await expect(eraseParticipantAsOwner(runtime(stalled),'synthetic-admin',f.participantId)).rejects.toThrow();
+  expect(seeded).toBe(true);expect(held).toBe(true);
+  expect(await count('analytics_storage_erasure_fences')).toBe(1);
+  expect(await count('analytics_community_graph_work_selection')).toBe(33);
+  expect(await count('analytics_graph_erasure_receipts')).toBe(0);
+  expect(await count('analytics_storage_erasure_receipts')).toBe(0);
+  expect(await b.DELETION_LEDGER.prepare('SELECT state FROM storage_erasure_jobs').first('state')).toBe('pending');
+  expect(await advanceStorageErasureJobs(bindings())).toEqual({completed:0,pending:true});
+  expect(await count('analytics_community_graph_work_selection')).toBe(1);
+  expect(await count('analytics_graph_erasure_receipts')).toBe(0);
+  expect(await count('analytics_storage_erasure_receipts')).toBe(0);
+  expect(await b.DELETION_LEDGER.prepare('SELECT state FROM storage_erasure_jobs').first('state')).toBe('pending');
+  await drain();await requireStorageParticipantErasureComplete(b.DELETION_LEDGER,f.participantId,bindings());
+  expect(await count('analytics_community_graph_work_selection')).toBe(0);
+  expect(await count('analytics_graph_erasure_receipts')).toBe(1);
+  expect(await count('analytics_storage_erasure_receipts')).toBe(1);
+  expect(await b.DELETION_LEDGER.prepare('SELECT state FROM storage_erasure_jobs').first('state')).toBe('complete');
  });
  it('uses the same durable mapping and completion gate during restore replay',async()=>{
   const f=await fixture(5);await deliver();await recordDeletionTombstone(b.DELETION_LEDGER,f.participantId);

@@ -2,7 +2,7 @@
 title: Effective cache throughput follow-up
 date: 2026-09-27
 type: plan
-status: in-progress
+status: production-observed-coordination-follow-up
 ---
 
 # Effective cache throughput follow-up
@@ -121,13 +121,26 @@ must be observed during a canary; statement savings alone do not settle them.
   during review was fixed and covered before the runtime was frozen.
 - TypeScript, documentation checks, preflight (20/20), diff checks and the
   disabled, unbound analytics example dry build passed.
-- Full Worker regression is running against the frozen runtime. The existing
-  analytics candidate is based on production source `42e64933`; runtime and test
-  files are byte-identical to the qualified workspace. Its commit and exact
-  production-configuration dry artifact remain to be recorded.
-- No new production change has been made in this follow-up. A production canary
-  must measure completed results, cache coverage, statements, duration and
-  failures; advancing a checkpoint alone is not a completed result.
+- Full Worker regression passed: 164 files, 2,105/2,105 tests, 921.17 seconds.
+  Workspace-copy, endpoint, generated-type, TypeScript and operations-script
+  checks also passed. The combined command then stopped at the generic website
+  packaging requirement for a clean committed release tree; website/staging
+  asset gates remain unqualified. The command is not reported all-green.
+- The clean local analytics candidate is commit
+  `214a6d390c78aab1e6bac2d0edf627750fee4f7b`, based
+  on production source `42e64933`; its four changed runtime and four test files
+  are byte-identical to the qualified workspace. The candidate branch has not
+  been pushed; production activation is recorded below.
+- The analytics dry build using verified production bindings/settings passed.
+  The pinned JavaScript is 1,367,754 bytes, SHA-256
+  `e69863db6f35c9491cb18b4dc7503e3b84e0497dbf343f4c653bb26185966678`.
+  Its upload configuration SHA-256 is
+  `1cca72c2327c8dd4d7c505cdd035eb122498f301111c2060c02df19a402e4fc2`.
+  Configuration values remain in private local operation files. This dry build
+  confirms compilation, not live execution.
+- The production canary must measure completed results, cache coverage,
+  statements, duration and failures; advancing a checkpoint alone is not a
+  completed result.
 
 ## Online comparison after authorization
 
@@ -142,3 +155,125 @@ cold cache preparation from reuse: record complete result counts, exact
 checkpoint movement, prepared day coverage, query counts, duration and failure
 counts. A short cold sample can establish safety and preparation progress;
 claim a throughput multiplier only from comparable completed work after reuse.
+
+## Production activation on 2026-09-28
+
+The owner authorized proceeding after the exact candidate deployment request.
+Under the shared production coordination lock, fresh checks verified source
+`42e64933`, the pinned artifact, bindings, runtime settings, cron and complete
+analytics schema/migration ledger before upload and activation. No migration
+was applied. The preceding version remains the rollback target listed above.
+
+- Activation began at 04:42:03.356 UTC for source
+  `214a6d390c78aab1e6bac2d0edf627750fee4f7b`.
+- Version `599bad71-a603-493a-9d0b-27d77d283862` was confirmed active at 100%.
+- Independent readback at 04:43:33.432 UTC confirmed source, version, bindings,
+  runtime settings, every-minute schedule and schema preservation.
+- The pre-activation aggregate at 04:40:15.555 UTC had 247 daily days queued,
+  2,080 stored graph results and two effective prepared day entries.
+- A bounded observer recorded 15 natural scheduled runs from 04:44:57 through
+  04:58:57 UTC: 14 ordinary and one longer pass, zero exceptions, zero failed
+  outcomes and zero reported lane failures. These logs contain no completed
+  graph calculations or daily publications; they do contain three verified
+  checkpoint advances by another invocation. No manual workload was submitted.
+- The longer pass stopped after two checkpoint conflicts, using 751 statements.
+  The counters do not establish how much work was duplicated or which run won.
+- Readback at 05:01:42 UTC reconfirmed the exact version at 100%, source, bindings,
+  runtime settings, cron and schema. The aggregate now had 244 daily days queued,
+  2,081 stored graph results and 14 effective prepared day entries. This includes
+  one more completed graph result than the pre-activation baseline, observed
+  after the bounded tail ended. It is not a comparable throughput benchmark.
+- The operation released its own shared production coordination lock at
+  05:02:18.963 UTC after independently matching the active version and resources.
+  A further bounded, read-only observer continues while the next local increment
+  is developed; no production operation is left holding that lock.
+- The extended observation detected failures after the clean initial sample:
+  a 05:12 UTC checkpoint-load failure, a 05:13 scope failure, and exceptions in
+  the 05:10 longer pass and the 05:14 ordinary pass. The longer pass reported
+  `graph_model_compute / d1_other`, then `COLLECTION_CONTROL_UNAVAILABLE`.
+  The exact deployed version, bindings and schema still matched at 05:15:56.
+  Read-only probes at 05:16 returned successfully from both databases (analytics
+  348 ms; ingestion 5,724 ms, including API transport). The 05:15 and 05:16
+  scheduled runs subsequently reported no failures. The underlying error is
+  not yet identified; neither the short clean sample nor resumed progress
+  establishes sustained production reliability.
+- The combined bounded observation ended at 05:24:52: 36 invocation records
+  for 35 distinct scheduled times, with 33 `ok`, two `exception` and one
+  `canceled` outcome. Four records reported a lane failure or exception.
+  The canceled 05:19 slot later also produced an `ok` record. The last reported
+  failure was at 05:14:01; the 05:20 longer pass finished with 836 statements,
+  a normal query-budget deferral and no reported failure. No complete graph
+  calculation was present in the captured logs. Both observers have stopped.
+- At 05:23:40 the aggregate had 241 daily days queued, 2,081 graph results and
+  24 effective prepared day entries. At 05:26:27 the exact format-3 checkpoint
+  for the September 27 model had finished quota acquisition (48,291 observations)
+  and entered usage processing. This is intermediate progress, not publication.
+- At 05:36:48 the queue had fallen to 239 daily days (oldest January 31),
+  with 2,083 stored graph results and 25 effective prepared day entries. The
+  latest public model publication remained September 25. This is eight fewer
+  queued days and three more stored results than the pre-activation baseline;
+  it does not establish a comparable throughput multiplier.
+- A temporary, non-persisted query of retained Cloudflare logs recovered the
+  three content-free failure fingerprints. Static local matching identifies
+  the scope failure as `ApiError:COLLECTION_CONTROL_UNAVAILABLE` and confirms
+  the checkpoint-unavailable error. The `d1_other` model-compute fingerprint
+  is unmatched; the original provider cause remains unconfirmed. No raw log
+  message or participant identifier was retained in this evidence.
+
+## Next increment: coordinate effective graph calculations
+
+Source inspection of the deployed commit confirms that the existing graph work
+lease is acquired only for owners with v1.1 history and no effective history.
+Effective owners bypass selection and claim, so ordinary and longer invocations
+can compute the same owner/day/metric concurrently. Checkpoint comparison still
+protects promotion, but a losing invocation can spend statements before that
+comparison refuses it. The 570-second longer-pass lease does not cover this path.
+
+Extend the existing bounded work-selection envelope with a closed effective
+variant and use the same claim, release and expiry lifecycle. Preserve legacy
+v1.1 envelopes, full effective source recapture, correction and erasure checks,
+and checkpoint comparisons. The existing table can hold the bounded envelope;
+no new migration is planned. Qualify overlapping scheduler calls, a busy
+contender doing no quota-page work, expiry/release, source changes, erasure and
+v1.1 compatibility before preparing another production candidate.
+
+The implementation also fences delayed inserts against erasure and stale
+claims against deleted/recreated selections. Bounded graph retirement removes
+old or erased-owner selections; both graph and final erasure completion require
+their absence. The scheduler supplies the actual remaining statement allowance
+after selection work so compute preserves its release reserve. Keep the
+950-statement cap, schedule and analytical result/checkpoint identities.
+
+### Lease qualification
+
+- New effective-selection cases: 14/14 passed. Existing graph publication cases:
+  35/35 passed. Retirement: 6/6 passed; erasure: 11/11 passed, including a
+  delayed older writer leaving 33 selection rows across multiple cleanup pages.
+- The waiting contender uses exactly nine actual D1 statements and reads zero
+  quota pages while the winning invocation holds its lease. Selection creation,
+  claim and release use five, four and two statements respectively. Fresh
+  current-work setup uses 38 statements before compute.
+- Synthetic 1,200-row cases with 950- and 560-statement allocations preserve a
+  durable checkpoint and release the claim with at least 38 statements left.
+  They prove the bounded lifecycle, not saturation of the outer cap or an
+  elapsed-time speedup. Repeated busy-cohort scheduling cost is unmeasured.
+- Review found no remaining source-fence, deadline or release-budget blocker.
+  TypeScript, whitespace, documentation and preflight (20/20) checks passed.
+- The full Worker command ran all 2,126 tests across 166 files: 2,123 passed;
+  three exact-count assertions failed because bounded selection cleanup adds
+  one statement to the existing retirement batch. No runtime source changed
+  after this run. The two affected test files now expect 82, 160 and 79
+  statements respectively (the grouped path still uses 41 round trips and
+  retains its 840-statement bound); all 67 tests in those files pass on rerun.
+  The original full command is not reported all-green.
+- Workspace-copy, endpoint, generated-type, TypeScript and operations-script
+  gates passed before the full regression. The eight original source/test
+  files remain byte-identical in the candidate checkout. The candidate retains
+  its deployed admin-cache compatibility variant and excludes migration 0027;
+  only the three new accounting expectations are applied to its two existing
+  test files. The exact candidate's five focused suites then passed 98/98 tests,
+  covering claims, retirement, erasure and both affected projection pathways.
+  Its analytics dry build remains pending. Production activation of this lease
+  increment has not occurred.
+- Read-only production verification at 05:44:27 UTC reconfirmed source
+  `214a6d3` at 100%, with the existing bindings, runtime, schedule and schema.

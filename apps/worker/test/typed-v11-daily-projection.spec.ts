@@ -344,8 +344,9 @@ describe("typed accountless upload to isolated projection", () => {
       .toBeLessThanOrEqual(262_144);
     // One ordinary-dispatch probe per journal event distinguishes a v1.2 head
     // acknowledgement (isolation 0011) from the default v1.1 projection.
+    // Selection cleanup adds one statement inside the existing retirement batch.
     expect({ queries: measured.queriesUsed, prepared: stats.prepared, roundTrips: stats.roundTrips })
-      .toEqual({ queries: 78, prepared: 78, roundTrips: 41 });
+      .toEqual({ queries: 79, prepared: 79, roundTrips: 41 });
     expect(measured.queriesUsed).toBeLessThan(840);
   });
 

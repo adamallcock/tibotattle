@@ -31,6 +31,9 @@ import {claimStorageGraphWorkSelection,completeStorageGraphWorkSelection,discard
 const fail=()=>new Error('STORAGE_GRAPH_WORK_UNAVAILABLE');
 const CURRENT_FIT_CACHE_PAGE=64;
 const SCOPE_RETRY_HEADROOM_MS=4_000;
+// Covers a claim, bounded scope recapture and release; after recapture the
+// same headroom keeps completion/release outside the calculation's meter.
+const SELECTION_QUERY_RESERVE=40;
 type CachedGraphResult={owner_digest:string;source_kind:'v0.2'|'v1'|'v1.1'|'mixed'|'effective'};
 export interface StorageGraphWorkProgress {
  state:'complete'|'reused'|'deferred'|'idle';metric?:'fits'|'model';day?:string;reason?:string;
@@ -192,8 +195,8 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
    return capture();
   }
  };
- let scope:StorageGraphScope,selection:StorageGraphWorkSelection|null=null,claimToken:string|null=null;
- if(owner.hasV11&&!owner.hasEffective){
+ let scope:StorageGraphScope|undefined,selection:StorageGraphWorkSelection|null=null,claimToken:string|null=null;
+ if(owner.hasV11||owner.hasEffective){
   const key:StorageGraphSelectionKey={sourceId:options.sourceId,ownerDigest:owner.ownerDigest,day,metric};
   const existing=await withStorageGraphFailureStage('graph_scope',()=>readStorageGraphWorkSelection(options.target,key));
   if(existing&&existing.state!=='complete'){
@@ -201,33 +204,50 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
     source:options.source,target:options.target,key,nowMs}));
    if(!live)return {state:'deferred',metric,day,reason:'selection_invalidated'};
    selection=live;
+   // Effective source pages are expensive. The live owner/target proofs above
+   // suffice to leave another claimant alone before capturing the full window.
+   if(owner.hasEffective&&selection.state==='claimed'&&selection.claimExpiresMs!>nowMs)
+    return {state:'deferred',metric,day,reason:'selection_busy'};
   }else{
    const latest=await captureLatest();
-   if(latest.source!=='v1.1'||!('source'in latest.pin))throw fail();
+   if(!['v1.1','effective'].includes(latest.source)||!('source'in latest.pin))throw fail();
    const pin=latest.pin;
-   const snapshot=await withStorageGraphFailureStage('graph_scope',()=>loadTypedV11GenerationSnapshot(options.source,
-    {sourceNamespace:options.sourceNamespace,pin}));
+   const snapshot=latest.source==='v1.1'
+    ?await withStorageGraphFailureStage('graph_scope',()=>loadTypedV11GenerationSnapshot(options.source,
+      {sourceNamespace:options.sourceNamespace,pin})):null;
    const ownerAuthorityEpoch=await options.target.prepare(`SELECT authority_epoch FROM analytics_owner_state
     WHERE source_id=? AND owner_digest=? AND state='active'`).bind(options.sourceId,owner.ownerDigest)
     .first<number>('authority_epoch');
    if(!Number.isSafeInteger(ownerAuthorityEpoch)||ownerAuthorityEpoch!<1)
-    return {state:'deferred',metric,day,reason:'v11_owner_pending'};
+    return {state:'deferred',metric,day,reason:latest.source==='effective'?'effective_owner_pending':'v11_owner_pending'};
    const authorityEpoch=ownerAuthorityEpoch as number;
-   scope={...latest,snapshot,ownerAuthorityEpoch:authorityEpoch,owner:{...latest.owner,inputRevision:snapshot.inputRevision}};
-   const checkpointKey:StorageHistoryKey={sourceId:options.sourceId,sourceNamespace:options.sourceNamespace,
-    ownerDigest:owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
-    method:v11CheckpointMethod(metric,options.preparedFold)};
-   const envelope:StorageGraphWorkEnvelope={version:1,source:'v1.1',sourceId:options.sourceId,
-    sourceNamespace:options.sourceNamespace,ownerDigest:owner.ownerDigest,day:scope.day,metric,
-    fixedNow:scope.fixedNow,dependencyDigest:scope.dependencyDigest,
-    checkpointDependencyDigest:scope.checkpointDependencyDigest,checkpointMethod:checkpointKey.method,
-    checkpointKeyDigest:await storageHistoryKeyDigest(checkpointKey),targetAuthorityEpoch:authorityEpoch,snapshot};
+   let envelope:StorageGraphWorkEnvelope;
+   if(latest.source==='effective'){
+    if(authorityEpoch!==latest.owner.authorityEpoch)return {state:'deferred',metric,day,reason:'effective_owner_pending'};
+    envelope={version:2,source:'effective',sourceId:options.sourceId,sourceNamespace:options.sourceNamespace,
+     ownerDigest:owner.ownerDigest,day:latest.day,metric,fixedNow:latest.fixedNow,
+     dependencyDigest:latest.dependencyDigest,checkpointDependencyDigest:latest.checkpointDependencyDigest,
+     targetAuthorityEpoch:authorityEpoch,participantId:latest.owner.participantId,ownerRevision:latest.owner.ownerRevision};
+   }else{
+    if(!snapshot)throw fail();
+    scope={...latest,snapshot,ownerAuthorityEpoch:authorityEpoch,owner:{...latest.owner,inputRevision:snapshot.inputRevision}};
+    const checkpointKey:StorageHistoryKey={sourceId:options.sourceId,sourceNamespace:options.sourceNamespace,
+     ownerDigest:owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
+     method:v11CheckpointMethod(metric,options.preparedFold)};
+    envelope={version:1,source:'v1.1',sourceId:options.sourceId,
+     sourceNamespace:options.sourceNamespace,ownerDigest:owner.ownerDigest,day:scope.day,metric,
+     fixedNow:scope.fixedNow,dependencyDigest:scope.dependencyDigest,
+     checkpointDependencyDigest:scope.checkpointDependencyDigest,checkpointMethod:checkpointKey.method,
+     checkpointKeyDigest:await storageHistoryKeyDigest(checkpointKey),targetAuthorityEpoch:authorityEpoch,snapshot};
+   }
    const ensured=await withStorageGraphFailureStage('graph_scope',()=>ensureStorageGraphWorkSelection({
     source:options.source,target:options.target,envelope,...(existing?{expectedRevision:existing.revision}:{}),nowMs}));
    if(!('selection'in ensured)||!ensured.selection||ensured.status==='conflict')
     return {state:'deferred',metric,day,reason:'selection_changed'};
    selection=ensured.selection;
   }
+  if((options.remainingQueries??900)<SELECTION_QUERY_RESERVE
+   ||Date.now()>=(options.deadlineMs??Date.now()+20_000))return {state:'deferred',metric,day,reason:'budget'};
   const token=crypto.randomUUID();claimToken=token;
   const claimed=await withStorageGraphFailureStage('graph_scope',()=>claimStorageGraphWorkSelection({
    source:options.source,target:options.target,selection:selection!,claimToken:token,nowMs,
@@ -235,26 +255,35 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   if(claimed.status!=='claimed'||!claimed.selection)
    return {state:'deferred',metric,day,reason:claimed.status==='busy'?'selection_busy':'selection_changed'};
   selection=claimed.selection;
-  // The scope is recomputed from the envelope's own pinned snapshot, so these
-  // fields are a deterministic function of that snapshot and of this build.
-  // They cannot drift with later uploads; a disagreement means the row was
-  // recorded by a build that derived digests or named the checkpoint method
-  // differently.
+  // Revalidate the claimed source contract before doing page work. v1.1 keeps
+  // its pinned generation; effective work must recapture its exact live scope.
   let superseded=false;
   try{
-   scope=await withStorageGraphFailureStage('graph_scope',()=>captureSelectedStorageGraphScope(options.source,{owner,day,metric,
-    snapshot:selection!.envelope.snapshot,ownerAuthorityEpoch:selection!.envelope.targetAuthorityEpoch,
-    sourceId:options.sourceId,sourceNamespace:options.sourceNamespace,
-    ...(options.preparedFold===undefined?{}:{preparedFold:options.preparedFold})}));
-   const checkpointKey:StorageHistoryKey={sourceId:options.sourceId,sourceNamespace:options.sourceNamespace,
-    ownerDigest:owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
-    method:v11CheckpointMethod(scope.metric,options.preparedFold)};
    const envelope=selection.envelope;
-   superseded=envelope.day!==scope.day||envelope.metric!==scope.metric||envelope.fixedNow!==scope.fixedNow
-    ||envelope.dependencyDigest!==scope.dependencyDigest
-    ||envelope.checkpointDependencyDigest!==scope.checkpointDependencyDigest
-    ||envelope.checkpointMethod!==checkpointKey.method
-    ||envelope.checkpointKeyDigest!==await storageHistoryKeyDigest(checkpointKey);
+   if(owner.hasEffective&&envelope.source==='effective'){
+    // The lease does not authorize cached source evidence. Recompute every
+    // family/correction dependency after claiming and retain the reader's
+    // owner checks before/after every page and checkpoint promotion.
+    scope=await captureLatest();
+    superseded=scope.source!=='effective'||envelope.day!==scope.day||envelope.metric!==scope.metric
+     ||envelope.fixedNow!==scope.fixedNow||envelope.dependencyDigest!==scope.dependencyDigest
+     ||envelope.checkpointDependencyDigest!==scope.checkpointDependencyDigest
+     ||envelope.participantId!==scope.owner.participantId||envelope.ownerRevision!==scope.owner.ownerRevision
+     ||envelope.targetAuthorityEpoch!==scope.owner.authorityEpoch;
+   }else if(!owner.hasEffective&&envelope.source==='v1.1'){
+    scope=await withStorageGraphFailureStage('graph_scope',()=>captureSelectedStorageGraphScope(options.source,{owner,day,metric,
+     snapshot:envelope.snapshot,ownerAuthorityEpoch:envelope.targetAuthorityEpoch,
+     sourceId:options.sourceId,sourceNamespace:options.sourceNamespace,
+     ...(options.preparedFold===undefined?{}:{preparedFold:options.preparedFold})}));
+    const checkpointKey:StorageHistoryKey={sourceId:options.sourceId,sourceNamespace:options.sourceNamespace,
+     ownerDigest:owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
+     method:v11CheckpointMethod(scope.metric,options.preparedFold)};
+    superseded=envelope.day!==scope.day||envelope.metric!==scope.metric||envelope.fixedNow!==scope.fixedNow
+     ||envelope.dependencyDigest!==scope.dependencyDigest
+     ||envelope.checkpointDependencyDigest!==scope.checkpointDependencyDigest
+     ||envelope.checkpointMethod!==checkpointKey.method
+     ||envelope.checkpointKeyDigest!==await storageHistoryKeyDigest(checkpointKey);
+   }else superseded=true;
   }catch(error){
    try{await releaseStorageGraphWorkSelection({target:options.target,selection,claimToken:token});}catch{/* Preserve the scope failure. */}
    selection=null;claimToken=null;throw error;
@@ -272,8 +301,13 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   }
  }else scope=await captureLatest();
  try{
+  if(!scope)throw fail();
+  const selectedScope=scope;
+  const maxQueries=(options.remainingQueries??900)-SELECTION_QUERY_RESERVE;
+  if(maxQueries<50||Date.now()>=(options.deadlineMs??Date.now()+20_000))
+   return {state:'deferred',metric,day,reason:'budget'};
   const result=await withStorageGraphFailureStage(metric==='fits'?'graph_current_fit_compute':'graph_model_compute',
-   ()=>computeStorageGraphResult(options,scope,{maxQueries:Math.max(1,(options.remainingQueries??900)-40),
+   ()=>computeStorageGraphResult(options,selectedScope,{maxQueries,
     deadlineMs:options.deadlineMs,
     ...(options.preparedFold!==undefined?{preparedFold:options.preparedFold}:{})}));
   if(result.state==='complete'&&selection&&claimToken){

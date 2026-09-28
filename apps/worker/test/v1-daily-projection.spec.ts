@@ -331,7 +331,8 @@ describe('separate typed v1 analytical projection',()=>{
   const pass=await runStorageAnalyticsPass({source:source(),target:target(),sourceId,sourceNamespace:namespace,maxSteps:4,publishCommunity:false});
   expect(pass).toMatchObject({state:'progress',reason:'step_limit',steps:4,recordsRead:800});
   // The admin snapshot inside this pass reads the source and delivered containment epochs (two bounded statements).
-  expect(pass.queriesUsed).toBe(81);
+  // Graph retirement also bounds abandoned selection cleanup in its existing batch.
+  expect(pass.queriesUsed).toBe(82);
  });
  it('still classifies and applies a real typed-v1 event when the speculative prefix probe is skipped',async()=>{
   const value=await seed('usage',3);await insertTypedTelemetryV1Chunk(source(),value.insert,namespace);
@@ -351,7 +352,8 @@ describe('separate typed v1 analytical projection',()=>{
   const pass=await runStorageAnalyticsV1CatchupPass({source:source(),target:target(),sourceId,sourceNamespace:namespace,
    pageEvents:16,maxSteps:16});
   expect(pass).toMatchObject({state:'progress',reason:'step_limit',steps:16,recordsRead:3200});
-  expect(pass.queriesUsed).toBe(159);
+  // The selection cleanup adds one statement without changing the page cap.
+  expect(pass.queriesUsed).toBe(160);
  });
  it('serializes chained queue pages through a durable generation claim',async()=>{
   await seedPage(4,1);await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
