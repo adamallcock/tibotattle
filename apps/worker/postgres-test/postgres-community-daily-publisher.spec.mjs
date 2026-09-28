@@ -529,6 +529,11 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
     });
   }
 
+  async function readAuthorityShards() {
+    return (await pool.query(`SELECT shard_id, revision
+      FROM ${sqlSchema}.community_daily_v12_authority_state ORDER BY shard_id`)).rows;
+  }
+
   function pausePublisherAfterQuery(match) {
     let reached;
     let resume;
@@ -953,14 +958,14 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
     await addAccountlessRetainedV11Day();
     expect(await publish()).toEqual({ state: "published", day: DAY, revision: 2 });
     const readAuthority = async () => (await pool.query(`SELECT
-        authority.revision AS public_source_generation,
+        (SELECT sum(authority.revision)::text FROM ${sqlSchema}.community_daily_v12_authority_state authority)
+          AS public_source_generation,
         runtime.state AS runtime_state,runtime.revision AS runtime_revision,
         typed_runtime.state AS typed_runtime_state,
         typed_runtime.policy_revision AS typed_runtime_policy_revision
-      FROM ${sqlSchema}.community_daily_v12_authority_state authority
-      JOIN ${sqlSchema}.telemetry_v12_runtime runtime ON runtime.id=1
+      FROM ${sqlSchema}.telemetry_v12_runtime runtime
       JOIN ${sqlSchema}.telemetry_v12_typed_runtime typed_runtime ON typed_runtime.id=1
-      WHERE authority.id=1`)).rows[0];
+      WHERE runtime.id=1`)).rows[0];
     const before = await readAuthority();
 
     await expect(pool.query(`UPDATE ${sqlSchema}.telemetry_v12_runtime
@@ -1053,6 +1058,9 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
       .map((row) => row.relation_name).sort()).toEqual(expected);
     expect(result.rows.filter((row) => row.trigger_name.startsWith("b_"))
       .map((row) => row.relation_name).sort()).toEqual(expected);
+    const shards = await readAuthorityShards();
+    expect(shards).toHaveLength(128);
+    expect(shards.map((row) => Number(row.shard_id))).toEqual(Array.from({ length: 128 }, (_, index) => index));
 
     const beforeStatementDml = await pool.query(`SELECT relation.relname AS relation_name,
         trigger_row.tgname AS trigger_name
@@ -1069,7 +1077,68 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
     }
   });
 
-  it("refuses TRUNCATE while a publisher holds the generation pin without waiting on it", async () => {
+  it("keeps the authority shard inventory closed", async () => {
+    await expect(pool.query(`INSERT INTO ${sqlSchema}.community_daily_v12_authority_state(shard_id,revision)
+      VALUES (128,1)`)).rejects.toMatchObject({
+      code: "P1005",
+      message: expect.stringContaining("community_daily_v12_authority_state_retained"),
+    });
+    await expect(pool.query(`DELETE FROM ${sqlSchema}.community_daily_v12_authority_state
+      WHERE shard_id=0`)).rejects.toMatchObject({
+      code: "P1005",
+      message: expect.stringContaining("community_daily_v12_authority_state_retained"),
+    });
+    expect(await readAuthorityShards()).toHaveLength(128);
+  });
+
+  it("routes a multi-statement upload transaction to one authority shard", async () => {
+    const before = await readAuthorityShards();
+    await pool.query("BEGIN");
+    try {
+      // Exercises a superset of covered v1.2 upload relations. A real chunk
+      // writes one stream child (usage, quota, or session); only a completing
+      // chunk changes the manifest to ready. Empty predicates avoid creating
+      // source records while proving that all statements in one transaction
+      // select the same shard.
+      await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_chunks
+        SET chunk_digest=chunk_digest WHERE false`);
+      await pool.query(`UPDATE ${sqlSchema}.typed_telemetry_dictionary
+        SET value=value WHERE false`);
+      await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_typed_attributions
+        SET plan_type_id=plan_type_id WHERE false`);
+      await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_typed_records
+        SET provider_id=provider_id WHERE false`);
+      await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_typed_usage
+        SET boundary_flags=boundary_flags WHERE false`);
+      await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_typed_quota
+        SET used_percent=used_percent WHERE false`);
+      await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_typed_session_tools
+        SET count=count WHERE false`);
+      await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_day_manifests
+        SET state=state WHERE false`);
+      await pool.query("COMMIT");
+    } catch (error) {
+      await pool.query("ROLLBACK").catch(() => {});
+      throw error;
+    }
+    const after = await readAuthorityShards();
+    const changed = after.map((row, index) => ({
+      shardId: Number(row.shard_id),
+      delta: BigInt(row.revision) - BigInt(before[index].revision),
+    })).filter((row) => row.delta !== 0n);
+    expect(changed).toHaveLength(1);
+    expect(changed[0].delta).toBe(8n);
+    expect(after.reduce((sum, row, index) => sum + BigInt(row.revision) - BigInt(before[index].revision), 0n))
+      .toBe(8n);
+  });
+
+  it("does not advance public-source generations for its own immutable aggregate insert", async () => {
+    const before = await readAuthorityShards();
+    expect(await publish()).toEqual({ state: "published", day: DAY, revision: 1 });
+    expect(await readAuthorityShards()).toEqual(before);
+  });
+
+  it("refuses TRUNCATE after the in-flight publisher releases its source relation locks", async () => {
     const gate = pausePublisherAfterQuery((sql) => sql.includes("community_daily_v12_authority_state")
       && sql.includes("FOR SHARE"));
     const publication = publish({}, gate.pool);
@@ -1080,16 +1149,20 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
       await gate.reached;
       await writer.query("BEGIN");
       transaction = true;
-      await writer.query("SET LOCAL statement_timeout='500ms'");
       truncatePromise = writer.query(`TRUNCATE ${sqlSchema}.telemetry_v12_runtime`);
+      const truncateState = await Promise.race([
+        truncatePromise.then(() => "completed", () => "failed"),
+        new Promise((resolve) => setTimeout(() => resolve("waiting"), 100)),
+      ]);
+      expect(truncateState).toBe("waiting");
+      gate.resume();
+      expect(await publication).toEqual({ state: "published", day: DAY, revision: 1 });
       await expect(truncatePromise).rejects.toMatchObject({
         code: "P1005",
         message: expect.stringContaining("community_daily_public_source_truncate_refused"),
       });
       await writer.query("ROLLBACK");
       transaction = false;
-      gate.resume();
-      expect(await publication).toEqual({ state: "published", day: DAY, revision: 1 });
     } finally {
       gate.resume();
       if (transaction) await writer.query("ROLLBACK").catch(() => {});
@@ -1147,6 +1220,35 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
     expect(await publish()).toEqual({ state: "published", day: DAY, revision: 1 });
   });
 
+  it("fails promptly when an uncommitted source writer holds a shard at final validation", async () => {
+    const gate = pausePublisherAfterQuery((sql) => sql.startsWith("SELECT pg_advisory_xact_lock"));
+    const publication = publish({}, gate.pool);
+    const writer = await pool.connect();
+    let writerTransaction = false;
+    try {
+      await gate.reached; // the RR snapshot is established before the source transaction starts
+      await writer.query("BEGIN");
+      writerTransaction = true;
+      await writer.query(`UPDATE ${sqlSchema}.telemetry_v12_runtime
+        SET revision=revision WHERE id=1`);
+      const startedAt = Date.now();
+      gate.resume();
+      await expect(publication).rejects.toMatchObject({
+        code: "timeout",
+        operation: "community_daily.publish",
+      });
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+      await writer.query("ROLLBACK");
+      writerTransaction = false;
+    } finally {
+      gate.resume();
+      if (writerTransaction) await writer.query("ROLLBACK").catch(() => {});
+      writer.release();
+      await publication.catch(() => {});
+    }
+    expect(await publish()).toEqual({ state: "published", day: DAY, revision: 1 });
+  });
+
   it("serializes a v1.2 accountless authorization update after the snapshot", async () => {
     const fixture = await addAccountlessRetainedV11Day({ includeHistoricalDailyRevision: false });
     await pool.query(`INSERT INTO ${sqlSchema}.accountless_v12_device_authorizations(
@@ -1177,7 +1279,7 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
     const participantId = "synthetic-authority-race-owner";
     await addIsolatedSocialParticipant(participantId);
     const gate = pausePublisherAfterQuery((sql) => sql.includes("community_daily_v12_authority_state")
-      && sql.includes("FOR SHARE"));
+      && sql.includes("FOR SHARE NOWAIT"));
     const publication = publish({}, gate.pool);
     const writer = await pool.connect();
     let writerTransaction = false;
@@ -1209,6 +1311,48 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
 
     expect(await publish()).toEqual({ state: "published", day: DAY, revision: 2 });
     expect(await publish()).toEqual({ state: "unchanged", day: DAY, revision: 2 });
+  });
+
+  it("takes source shards after the aggregate insert and holds them only through commit", async () => {
+    const before = await readAuthorityShards();
+    const gate = pausePublisherAfterQuery((sql) => sql.includes("community_daily_v12_authority_state")
+      && sql.includes("FOR SHARE NOWAIT"));
+    const publication = publish({}, gate.pool);
+    const writer = await pool.connect();
+    let writerTransaction = false;
+    let updatePromise;
+    try {
+      await gate.reached;
+      // The aggregate row is inserted but remains invisible until commit.
+      expect((await writer.query(`SELECT count(*)::int AS count
+        FROM ${sqlSchema}.community_daily_aggregates WHERE source_id=$1 AND day=$2::date`,
+      [SOURCE_ID, DAY])).rows[0].count).toBe(0);
+      await writer.query("BEGIN");
+      writerTransaction = true;
+      updatePromise = writer.query(`UPDATE ${sqlSchema}.telemetry_v12_runtime
+        SET revision=revision WHERE id=1`);
+      const updateState = await Promise.race([
+        updatePromise.then(() => "completed", () => "failed"),
+        new Promise((resolve) => setTimeout(() => resolve("waiting"), 100)),
+      ]);
+      expect(updateState).toBe("waiting");
+
+      gate.resume();
+      expect(await publication).toEqual({ state: "published", day: DAY, revision: 1 });
+      await updatePromise;
+      await writer.query("COMMIT");
+      writerTransaction = false;
+    } finally {
+      gate.resume();
+      if (writerTransaction) await writer.query("ROLLBACK").catch(() => {});
+      if (updatePromise) await updatePromise.catch(() => {});
+      writer.release();
+      await publication.catch(() => {});
+    }
+    const after = await readAuthorityShards();
+    expect(after.reduce((sum, row) => sum + BigInt(row.revision), 0n))
+      .toBeGreaterThan(before.reduce((sum, row) => sum + BigInt(row.revision), 0n));
+    expect(await publish()).toEqual({ state: "published", day: DAY, revision: 2 });
   });
 
   it("preserves exact mixed v1.0/v1.1 publication output", async () => {

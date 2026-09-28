@@ -2,12 +2,18 @@
 -- generation. This is a transaction fence, not a backfill: old immutable
 -- daily rows retain NULL and therefore cannot be reused as `unchanged`.
 --
--- The singleton covers the mutable rows read by the public daily projection
--- and its eligibility/policy fence, including v1/v1.1 source precedence and
--- the v1.2 authorization/runtime inputs. Publishers take FOR SHARE on it
--- before reading those inputs. BEFORE STATEMENT triggers take the conflicting
--- row lock before source DML, so a change either precedes the publisher's
--- snapshot or waits until after its commit. Statement triggers deliberately
+-- The 128 transaction-hash shards cover the mutable rows read by the public
+-- daily projection and its eligibility/policy fence, including v1/v1.1 source
+-- precedence and the v1.2 authorization/runtime inputs. A source transaction
+-- updates the same shard for every covered statement it executes. Publishers
+-- read the summed generation from their REPEATABLE READ snapshot, perform
+-- bounded source work, then take FOR SHARE NOWAIT on every shard immediately
+-- before returning `unchanged` or inserting the immutable daily revision. A
+-- source writer takes its shard row lock in a BEFORE STATEMENT trigger before
+-- touching source rows. An update committed after the publisher snapshot
+-- causes a serialization failure at the final lock; an in-flight writer makes
+-- NOWAIT fail closed; a writer arriving after the final locks waits only across
+-- the immutable publication commit. Statement triggers deliberately
 -- invalidate on no-op/zero-row DML as a safe conservative false positive.
 
 ALTER TABLE community_daily_aggregates
@@ -15,16 +21,17 @@ ALTER TABLE community_daily_aggregates
     CHECK (public_source_generation IS NULL OR public_source_generation >= 1);
 
 CREATE TABLE community_daily_v12_authority_state (
-  id smallint PRIMARY KEY CHECK (id = 1),
+  shard_id smallint PRIMARY KEY CHECK (shard_id >= 0 AND shard_id < 128),
   revision bigint NOT NULL CHECK (revision >= 1)
 );
-INSERT INTO community_daily_v12_authority_state(id, revision) VALUES (1, 1);
+INSERT INTO community_daily_v12_authority_state(shard_id, revision)
+  SELECT shard_id::smallint, 1 FROM generate_series(0, 127) AS shard_id;
 
 CREATE FUNCTION community_daily_v12_authority_state_guard()
 RETURNS trigger
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
-  IF NEW.revision <> OLD.revision + 1 THEN
+  IF NEW.shard_id <> OLD.shard_id OR NEW.revision <> OLD.revision + 1 THEN
     RAISE EXCEPTION 'community_daily_v12_authority_revision_step_required' USING ERRCODE = 'P1005';
   END IF;
   RETURN NEW;
@@ -34,6 +41,18 @@ $$;
 CREATE TRIGGER community_daily_v12_authority_state_revision_guard
 BEFORE UPDATE ON community_daily_v12_authority_state
 FOR EACH ROW EXECUTE FUNCTION community_daily_v12_authority_state_guard();
+
+CREATE FUNCTION community_daily_v12_authority_state_no_addition()
+RETURNS trigger
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  RAISE EXCEPTION 'community_daily_v12_authority_state_retained' USING ERRCODE = 'P1005';
+END;
+$$;
+
+CREATE TRIGGER community_daily_v12_authority_state_no_insert
+BEFORE INSERT ON community_daily_v12_authority_state
+FOR EACH ROW EXECUTE FUNCTION community_daily_v12_authority_state_no_addition();
 
 CREATE FUNCTION community_daily_v12_authority_state_no_removal()
 RETURNS trigger
@@ -53,10 +72,17 @@ FOR EACH STATEMENT EXECUTE FUNCTION community_daily_v12_authority_state_no_remov
 CREATE FUNCTION community_daily_v12_authority_advance()
 RETURNS trigger
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE
+  target_shard smallint;
 BEGIN
+  -- Hash the transaction identity rather than an owner identity. This avoids
+  -- requiring every source relation to expose the same owner key and spreads
+  -- concurrent upload transactions across independent row locks. The bit mask
+  -- is safe because the shard count is a power of two.
+  target_shard := (hashtextextended(txid_current()::text, 731042) & 127)::smallint;
   UPDATE community_daily_v12_authority_state
      SET revision = revision + 1
-   WHERE id = 1;
+   WHERE shard_id = target_shard;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'community_daily_v12_authority_state_missing' USING ERRCODE = 'P1005';
   END IF;
@@ -65,7 +91,7 @@ END;
 $$;
 
 -- `a_` orders these BEFORE STATEMENT triggers ahead of existing same-relation
--- triggers. Acquiring the singleton before any row operation is important:
+-- triggers. Acquiring a shard before any row operation is important:
 -- row-level triggers could hold an authority row first, which creates a
 -- publisher/writer lock inversion when the writer has already pinned a source
 -- journal row. The publisher takes no row locks on generation-covered inputs.
@@ -187,7 +213,7 @@ END;
 $$;
 
 -- PostgreSQL obtains ACCESS EXCLUSIVE before a TRUNCATE trigger fires. Refuse
--- truncation without touching the generation row; otherwise a publisher that
+-- truncation without touching a generation shard; otherwise a publisher that
 -- holds FOR SHARE and then reads the relation could deadlock with that lock.
 DO $$
 DECLARE relation_name text;

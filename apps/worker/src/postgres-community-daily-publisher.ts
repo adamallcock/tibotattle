@@ -40,6 +40,7 @@ import {
 
 const MAX_DAILY_AGGREGATE_CELLS = 100;
 const SPEND_FETCH_BATCH_SIZE = 1_000;
+const DAILY_PUBLIC_SOURCE_GENERATION_SHARDS = 128;
 const DAILY_SOURCE_TRANSACTION_TIMEOUT_MILLISECONDS = 40_000;
 const DAILY_SOURCE_EXPIRY_LOOKAHEAD_SECONDS = 45;
 const POSTGRES_DAILY_V12_PROVIDERS = new Set(["openai_codex", "anthropic_claude_code"]);
@@ -57,6 +58,7 @@ const POSTGRES_DAILY_V12_MODEL_BY_ID = new Map(REVIEWED_MODEL_CATALOG.map((model
 
 interface DailyFenceRow {
   readonly public_source_generation: string | number;
+  readonly public_source_shard_count: string | number;
   readonly source_id: string;
   readonly source_authority_epoch: string | number;
   readonly cursor_sequence: string | number;
@@ -697,16 +699,20 @@ async function captureFence(
   schema: string,
   sourceId: string,
   sourceNamespace: string,
-  lockedPublicSourceGeneration: number,
 ) {
   // Requires staged primary 0093 and 0095 to be deliberately promoted/applied
-  // before deploying this reader. The generation lock was acquired before this
-  // read. All tables consulted here and by publicDailySourceCtes advance that
-  // lock in a BEFORE STATEMENT trigger; no row locks are taken here, avoiding
-  // inversions with writers that already hold source/journal rows.
+  // before deploying this reader. The generation sum and all other authority
+  // inputs are read from the same REPEATABLE READ snapshot. Shard locks are
+  // acquired only after source work is complete, immediately before an
+  // immutable result is returned or inserted.
   const result = await client.query<DailyFenceRow>(
     `SELECT source.source_id,
-            public_source.revision AS public_source_generation,
+            (SELECT sum(public_source.revision)::text
+               FROM ${schema}.community_daily_v12_authority_state public_source)
+              AS public_source_generation,
+            (SELECT count(*)::text
+               FROM ${schema}.community_daily_v12_authority_state public_source)
+              AS public_source_shard_count,
             source.authority_epoch AS source_authority_epoch,
             cursor.sequence AS cursor_sequence,
             cursor.authority_epoch AS cursor_authority_epoch,
@@ -737,7 +743,6 @@ async function captureFence(
             controls.control_state,
             controls.publication_enabled
        FROM ${schema}.storage_source_state source
-       JOIN ${schema}.community_daily_v12_authority_state public_source ON public_source.id=1
        JOIN ${schema}.analytics_source_cursors cursor ON cursor.source_id=source.source_id
        JOIN ${schema}.typed_v1_admission_state v1 ON v1.id=1
        JOIN ${schema}.typed_v11_admission_state v11 ON v11.id=1
@@ -749,9 +754,15 @@ async function captureFence(
     [sourceId, DAILY_SOURCE_EXPIRY_LOOKAHEAD_SECONDS],
   );
   const row = result.rows[0];
-  if (!Array.isArray(result.rows) || result.rows.length !== 1 || !row
-      || row.source_id !== sourceId
-      || integer(row.public_source_generation, 1) !== lockedPublicSourceGeneration
+  if (!Array.isArray(result.rows) || result.rows.length !== 1 || !row) {
+    unavailable("community_daily.authority_fence");
+  }
+  const publicSourceShardCount = integer(row?.public_source_shard_count);
+  if (publicSourceShardCount !== DAILY_PUBLIC_SOURCE_GENERATION_SHARDS) {
+    unavailable("community_daily.authority_generation");
+  }
+  if (row.source_id !== sourceId
+      || integer(row.public_source_generation, 1) < DAILY_PUBLIC_SOURCE_GENERATION_SHARDS
       || row.v1_source_namespace !== sourceNamespace || row.v11_source_namespace !== sourceNamespace
       || integer(row.v1_runtime_contract_version) !== 1
       || integer(row.v11_runtime_contract_version) !== 1
@@ -794,6 +805,36 @@ async function captureFence(
     telemetryV12AccountlessAuthorizationCount: v12AuthorizationCount,
     telemetryV12NextAccountlessAuthorizationExpiry: v12NextAuthorizationExpiry,
   });
+}
+
+async function lockPublicSourceGenerationAtCommit(
+  client: PostgresClient,
+  schema: string,
+  expectedGeneration: number,
+): Promise<void> {
+  // A writer advances one transaction-hash shard in a BEFORE STATEMENT
+  // trigger before it can touch a source row. NOWAIT makes an in-flight writer
+  // a prompt, retryable fail-closed outcome. Under REPEATABLE READ, a source
+  // transaction committed since the publisher snapshot instead raises
+  // SQLSTATE 40001 here. Once these locks are acquired, later writers wait only
+  // through the final immutable insert/commit.
+  const result = await client.query<{ shard_id: string | number; revision: string | number }>(
+    `SELECT shard_id, revision
+       FROM ${schema}.community_daily_v12_authority_state
+      ORDER BY shard_id
+      FOR SHARE NOWAIT`,
+  );
+  if (!Array.isArray(result.rows) || result.rows.length !== DAILY_PUBLIC_SOURCE_GENERATION_SHARDS) {
+    unavailable("community_daily.authority_generation");
+  }
+  let generation = 0;
+  for (let index = 0; index < result.rows.length; index += 1) {
+    const row = result.rows[index];
+    if (!row || integer(row.shard_id) !== index) unavailable("community_daily.authority_generation");
+    generation += integer(row.revision, 1);
+    if (!Number.isSafeInteger(generation)) unavailable("community_daily.authority_generation");
+  }
+  if (generation !== expectedGeneration) unavailable("community_daily.authority_generation");
 }
 
 function sameV12AuthorityPin(previous: RevisionRow, fence: Awaited<ReturnType<typeof captureFence>>): boolean {
@@ -868,16 +909,8 @@ export async function publishPostgresCommunityDailyDay(
       "SELECT pg_advisory_xact_lock(hashtextextended($1, 731042))",
       [`${identity.sourceId}\u001f${capturedDay}`],
     );
-    const generationLock = await client.query<{ revision: string | number }>(
-      `SELECT revision FROM ${schema}.community_daily_v12_authority_state
-        WHERE id=1 FOR SHARE`,
-    );
-    if (!Array.isArray(generationLock.rows) || generationLock.rows.length !== 1) {
-      unavailable("community_daily.authority_generation");
-    }
-    const lockedPublicSourceGeneration = integer(generationLock.rows[0]?.revision, 1);
     const fence = await captureFence(
-      client, schema, identity.sourceId, identity.sourceNamespace, lockedPublicSourceGeneration,
+      client, schema, identity.sourceId, identity.sourceNamespace,
     );
     const previousResult = await client.query<RevisionRow>(
       `SELECT revision, release_state, payload_json, payload_sha256,
@@ -901,6 +934,7 @@ export async function publishPostgresCommunityDailyDay(
         && integer(previous.collection_revision, 1) === fence.collectionRevision
         && sameV12AuthorityPin(previous, fence)
         && await sha256Hex(previous.payload_json) === previous.payload_sha256) {
+      await lockPublicSourceGenerationAtCommit(client, schema, fence.publicSourceGeneration);
       return Object.freeze({ state: "unchanged", day: capturedDay, revision: integer(previous.revision, 1) });
     }
     const revision = integer(previous?.revision ?? 0) + 1;
@@ -988,6 +1022,11 @@ export async function publishPostgresCommunityDailyDay(
         fence.telemetryV12NextAccountlessAuthorizationExpiry, releasedAt],
     );
     if (inserted.rowCount !== 1 || inserted.rows[0]?.revision === undefined) unavailable("community_daily.publish_fence");
+    // Insert while the transaction still holds no source-generation locks.
+    // If the final NOWAIT/REPEATABLE READ validation fails, the wrapper rolls
+    // this uncommitted immutable revision back. On success, the only work after
+    // locking the shards is returning from this callback and committing.
+    await lockPublicSourceGenerationAtCommit(client, schema, fence.publicSourceGeneration);
     return Object.freeze({ state: "published", day: capturedDay, revision: integer(inserted.rows[0].revision, 1) });
   }, {
     operation: "community_daily.publish",
