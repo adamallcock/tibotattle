@@ -9,6 +9,7 @@ import { encodeBase64Url } from "../src/crypto.ts";
 import { disconnectPostgresAuthenticatedDevice } from "../src/postgres-device-disconnect.ts";
 import {
   publishPostgresCommunityDailyDay,
+  pricePostgresTypedV12DailyUsageRecord,
   readPostgresCommunityDailyDaySourceEligibility,
 } from "../src/postgres-community-daily-publisher.ts";
 import { readPostgresPublishedCommunityDaily } from "../src/postgres-community-daily.ts";
@@ -974,5 +975,106 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
       inputUncachedTokens: 0,
     });
     expect(JSON.parse(successor.rows[0].payload_json)).not.toHaveProperty("allowance");
+  });
+});
+
+function typedAnthropicV12Usage(overrides = {}) {
+  return {
+    schemaVersion: "usage-event-v1.2",
+    eventId: `event:v2:${"a".repeat(64)}`,
+    eventTime: "2026-08-01T13:47:00.000Z",
+    sessionUuid: `session:v2:${"b".repeat(64)}`,
+    provider: "anthropic_claude_code",
+    modelId: "claude-sonnet-4-6",
+    speedMode: "standard",
+    apiServiceTier: "standard",
+    surface: "local_interactive_unclassified",
+    billingSurface: "claude_subscription",
+    reasoningEffort: "high",
+    agentScope: "root",
+    outcome: "completed",
+    totalInputContextTokens: 1000,
+    components: {
+      inputUncachedTokens: 100,
+      inputCacheReadTokens: 900,
+      inputCacheWriteTokens: 30,
+      outputTextTokens: null,
+      outputReasoningTokens: null,
+      outputCombinedTokens: 75,
+    },
+    accountPlanAttribution: {
+      accountBasis: "unavailable",
+      accountTrackId: null,
+      planBasis: "same_source_occurrence",
+      planType: "pro",
+      planEraId: null,
+    },
+    boundaryFlags: null,
+    tieOrder: null,
+    cacheWriteTtl: { fiveMinuteTokens: 10, oneHourTokens: 20 },
+    ...overrides,
+  };
+}
+
+describe("PostgreSQL community daily typed v1.2 pricing adapter", () => {
+  it("uses the explicit stored Anthropic TTL split without JSON conversion", () => {
+    expect(pricePostgresTypedV12DailyUsageRecord(typedAnthropicV12Usage())).toMatchObject({
+      costNanousd: 1_852_500,
+      pricingStatus: "fully_priced",
+      modelId: "claude-sonnet-4-6",
+      unpricedReasonCodes: [],
+    });
+  });
+
+  it("does not infer a TTL split when positive aggregate cache writes lack the buckets", () => {
+    const priced = pricePostgresTypedV12DailyUsageRecord(typedAnthropicV12Usage({
+      cacheWriteTtl: null,
+    }));
+    expect(priced).toMatchObject({ costNanousd: 1_695_000, pricingStatus: "partially_priced" });
+    expect(priced?.unpricedReasonCodes).toContain("anthropic_cache_write_ttl_split_missing");
+  });
+
+  it("rejects mismatched or TTL-only cache-write evidence before pricing/drop", () => {
+    expect(() => pricePostgresTypedV12DailyUsageRecord(typedAnthropicV12Usage({
+      cacheWriteTtl: { fiveMinuteTokens: 10, oneHourTokens: 19 },
+    }))).toThrow();
+    expect(() => pricePostgresTypedV12DailyUsageRecord(typedAnthropicV12Usage({
+      components: {
+        inputUncachedTokens: null,
+        inputCacheReadTokens: null,
+        inputCacheWriteTokens: null,
+        outputTextTokens: null,
+        outputReasoningTokens: null,
+        outputCombinedTokens: null,
+      },
+      cacheWriteTtl: { fiveMinuteTokens: 10, oneHourTokens: 20 },
+    }))).toThrow();
+  });
+
+  it.each([
+    ["provider", "synthetic_provider"],
+    ["modelId", "gpt-5.6-sol"],
+    ["billingSurface", "synthetic_billing"],
+    ["speedMode", "synthetic_speed"],
+    ["apiServiceTier", "synthetic_tier"],
+    ["reasoningEffort", "synthetic_effort"],
+  ])("rejects unreviewed v1.2 pricing dictionary field %s", (field, value) => {
+    expect(() => pricePostgresTypedV12DailyUsageRecord(typedAnthropicV12Usage({ [field]: value })))
+      .toThrow();
+  });
+
+  it("drops a typed usage record with no token observations", () => {
+    expect(pricePostgresTypedV12DailyUsageRecord(typedAnthropicV12Usage({
+      totalInputContextTokens: 1000,
+      components: {
+        inputUncachedTokens: null,
+        inputCacheReadTokens: null,
+        inputCacheWriteTokens: null,
+        outputTextTokens: null,
+        outputReasoningTokens: null,
+        outputCombinedTokens: null,
+      },
+      cacheWriteTtl: null,
+    }))).toBeNull();
   });
 });

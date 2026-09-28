@@ -30,9 +30,28 @@ import {
   type PostgresSchemaOptions,
 } from "./postgres-client";
 import { MAX_V1_SOURCE_CHUNKS } from "./telemetry-v1-source-selection";
+import { priceTelemetryUsageEvent } from "./server-pricing";
+import type { TelemetryUsageEvent } from "./telemetry-validation";
+import {
+  parseTelemetryV12Record,
+  REVIEWED_MODEL_CATALOG,
+  type TelemetryV12UsageEvent,
+} from "@app-usagemonitor/telemetry-contract";
 
 const MAX_DAILY_AGGREGATE_CELLS = 100;
 const SPEND_FETCH_BATCH_SIZE = 1_000;
+const POSTGRES_DAILY_V12_PROVIDERS = new Set(["openai_codex", "anthropic_claude_code"]);
+const POSTGRES_DAILY_V12_BILLING_SURFACES = new Set([
+  "chatgpt_subscription", "openai_api", "claude_subscription", "unknown",
+]);
+const POSTGRES_DAILY_V12_SPEED_MODES = new Set(["standard", "fast", "unknown", "other"]);
+const POSTGRES_DAILY_V12_API_SERVICE_TIERS = new Set([
+  "standard", "priority", "flex", "batch", "unknown", "other", "default",
+]);
+const POSTGRES_DAILY_V12_REASONING_EFFORTS = new Set([
+  "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "unknown",
+]);
+const POSTGRES_DAILY_V12_MODEL_BY_ID = new Map(REVIEWED_MODEL_CATALOG.map((model) => [model.id, model]));
 
 interface DailyFenceRow {
   readonly source_id: string;
@@ -118,6 +137,13 @@ interface SpendRecordQueryRow extends Record<string, unknown> {
   readonly record_json: string;
 }
 
+export interface PostgresTypedV12DailyUsagePrice {
+  readonly costNanousd: number;
+  readonly pricingStatus: "fully_priced" | "partially_priced" | "unpriced";
+  readonly modelId: string | null;
+  readonly unpricedReasonCodes: readonly string[];
+}
+
 function invalid(): never {
   throw new PostgresStorageError("invalid", "community_daily.publish", { retryable: false });
 }
@@ -143,6 +169,86 @@ function timestamp(value: unknown): string | null {
 
 function nullableInteger(value: unknown, minimum = 0): number | null {
   return value === null ? null : integer(value, minimum);
+}
+
+/**
+ * Price a decoded PostgreSQL v1.2 usage record without converting it to the
+ * lossy v1 JSON shape. Validate the closed v1.2 contract before mapping fields;
+ * typed storage has an explicit Anthropic 5m/1h cache-write split, which is
+ * passed directly to the shared pricer.
+ * This adapter is intentionally not wired into the public daily source CTE
+ * until v1.2 publication eligibility and its commit-time fences are proven.
+ */
+export function pricePostgresTypedV12DailyUsageRecord(
+  value: unknown,
+): PostgresTypedV12DailyUsagePrice | null {
+  let usage: TelemetryV12UsageEvent;
+  try {
+    usage = parseTelemetryV12Record("usage", value) as TelemetryV12UsageEvent;
+  } catch {
+    invalid();
+  }
+  const model = usage.modelId === "unknown"
+    ? null
+    : POSTGRES_DAILY_V12_MODEL_BY_ID.get(
+      usage.modelId as Exclude<TelemetryUsageEvent["modelId"], "unknown">,
+    );
+  if (!POSTGRES_DAILY_V12_PROVIDERS.has(usage.provider)
+      || (usage.modelId !== "unknown" && model?.provider !== usage.provider)
+      || !POSTGRES_DAILY_V12_BILLING_SURFACES.has(usage.billingSurface)
+      || !POSTGRES_DAILY_V12_SPEED_MODES.has(usage.speedMode)
+      || !POSTGRES_DAILY_V12_API_SERVICE_TIERS.has(usage.apiServiceTier)
+      || !POSTGRES_DAILY_V12_REASONING_EFFORTS.has(usage.reasoningEffort)) invalid();
+  const ttlFiveMinute = usage.cacheWriteTtl?.fiveMinuteTokens ?? null;
+  const ttlOneHour = usage.cacheWriteTtl?.oneHourTokens ?? null;
+  const aggregateCacheWrite = usage.components.inputCacheWriteTokens;
+  if ((ttlFiveMinute === null) !== (ttlOneHour === null)
+      || (ttlFiveMinute !== null && (ttlOneHour === null || aggregateCacheWrite === null
+        || ttlFiveMinute + ttlOneHour !== aggregateCacheWrite))) invalid();
+  const components = {
+    inputUncachedTokens: usage.components.inputUncachedTokens,
+    inputCacheReadTokens: usage.components.inputCacheReadTokens,
+    inputCacheWriteTokens: aggregateCacheWrite,
+    inputCacheWrite5mTokens: ttlFiveMinute,
+    inputCacheWrite1hTokens: ttlOneHour,
+    outputTextTokens: usage.components.outputTextTokens,
+    outputReasoningTokens: usage.components.outputReasoningTokens,
+    outputCombinedTokens: usage.components.outputCombinedTokens,
+  };
+  // Match the existing daily pricing adapter's DROP behavior for a typed usage
+  // row that has no token observations. Context alone is not billable evidence.
+  if (components.inputUncachedTokens === null
+      && components.inputCacheReadTokens === null
+      && components.inputCacheWriteTokens === null
+      && components.inputCacheWrite5mTokens === null
+      && components.inputCacheWrite1hTokens === null
+      && components.outputTextTokens === null
+      && components.outputReasoningTokens === null
+      && components.outputCombinedTokens === null) return null;
+  const pricingEvent = {
+    schemaVersion: "usage-event-v0.1",
+    eventTime: usage.eventTime,
+    provider: usage.provider,
+    modelId: usage.modelId,
+    modelRecognition: usage.modelId === "unknown" ? "unrecognized" : "recognized",
+    modelFingerprint: null,
+    billingSurface: usage.billingSurface,
+    speedMode: usage.speedMode,
+    // `default` is a valid typed-v1.2 transport value, but it is not a price
+    // tier in the shared v0.1 pricing contract. Preserve it as unknown rather
+    // than infer `standard`.
+    apiServiceTier: usage.apiServiceTier === "default" ? "unknown" : usage.apiServiceTier,
+    reasoningEffort: usage.reasoningEffort,
+    components,
+    totalInputContextTokens: usage.totalInputContextTokens,
+  } as unknown as TelemetryUsageEvent;
+  const priced = priceTelemetryUsageEvent(pricingEvent);
+  return Object.freeze({
+    costNanousd: priced.costNanousd,
+    pricingStatus: priced.coverageStatus,
+    modelId: usage.modelId === "unknown" ? null : usage.modelId,
+    unpricedReasonCodes: Object.freeze([...priced.unpricedReasonCodes]),
+  });
 }
 
 function dayValue(value: unknown): string {
