@@ -1190,3 +1190,280 @@ test("backend response cookies retain host-only session attributes", async () =>
   ]);
   assert.equal(result.headers["cache-control"], "no-store");
 });
+
+test("the public gateway exposes envelope-key and session-scoped device routes with bounded 100-device output", async () => {
+  const timestamp = "2026-09-28T12:34:56.789Z";
+  const devices = Array.from({ length: 100 }, (_, index) => ({
+    deviceId: `d81c0f3b-9d3e-4dc8-b367-${String(index).padStart(12, "0")}`,
+    state: "revoked",
+    createdAt: timestamp,
+    expiresAt: timestamp,
+    lastUsedAt: timestamp,
+    revokedAt: timestamp,
+  }));
+  const deviceListBody = Buffer.from(JSON.stringify({ devices }));
+  assert.equal(deviceListBody.byteLength, 22_713,
+    "100 maximum-width rows serialize to 22,713 bytes");
+  assert.ok(deviceListBody.byteLength <= 32 * 1_024,
+    "the private handler's 100-row response fits the route's 32 KiB cap");
+
+  const envelopeBody = JSON.stringify({
+    algorithm: "RSA-OAEP-256",
+    keyId: "synthetic-key",
+    publicJwk: { alg: "RSA-OAEP-256", e: "AQAB", key_ops: ["encrypt"], kid: "synthetic-key", kty: "RSA", n: "c3ludGhldGlj", use: "enc" },
+  });
+  const revokeBody = JSON.stringify({ revoked: true, deviceId: DEVICE_ID });
+  const { calls: metadataCalls, fetchImpl: metadata } = metadataFetch();
+  const backendCalls = [];
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      const url = new URL(input);
+      if (url.origin === "http://metadata.google.internal") return metadata(input, options);
+      backendCalls.push({ url, options });
+      if (url.pathname === "/api/v1/envelope-key") {
+        return new Response(envelopeBody, { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.pathname === "/api/v1/me/devices") {
+        return new Response(deviceListBody, {
+          status: 200,
+          headers: { "content-type": "application/json", vary: "Cookie" },
+        });
+      }
+      if (url.pathname === "/api/v1/me/devices/revoke") {
+        return new Response(revokeBody, {
+          status: 200,
+          headers: { "content-type": "application/json", vary: "Cookie" },
+        });
+      }
+      assert.fail(`unexpected private route: ${url.pathname}`);
+    },
+    logger: () => {},
+  });
+
+  const envelope = await invoke(handler, {
+    method: "GET",
+    url: "/api/v1/envelope-key",
+    body: null,
+    headers: {
+      origin: undefined,
+      authorization: "Bearer caller-controlled",
+      cookie: SESSION_COOKIE,
+      "x-usage-monitor-csrf": "caller-controlled",
+    },
+  });
+  assert.equal(envelope.status, 200);
+  assert.equal(envelope.body.toString("utf8"), envelopeBody);
+
+  const listed = await invoke(handler, {
+    method: "GET",
+    url: "/api/v1/me/devices",
+    body: null,
+    headers: { cookie: SESSION_COOKIE, "x-usage-monitor-csrf": "not-forwarded-on-GET" },
+  });
+  assert.equal(listed.status, 200);
+  assert.equal(listed.headers.vary, "Cookie");
+  assert.equal(JSON.parse(listed.body.toString("utf8")).devices.length, 100);
+
+  const revoked = await invoke(handler, {
+    method: "POST",
+    url: "/api/v1/me/devices/revoke",
+    body: revokeBody,
+    headers: {
+      cookie: SESSION_COOKIE,
+      "x-usage-monitor-csrf": "csrf-test-token",
+      "sec-fetch-site": "same-origin",
+    },
+  });
+  assert.equal(revoked.status, 200);
+  assert.equal(revoked.headers.vary, "Cookie");
+  assert.equal(revoked.body.toString("utf8"), revokeBody);
+
+  assert.equal(backendCalls.length, 3);
+  assert.equal(backendCalls[0].url.href, `${BACKEND_ORIGIN}/api/v1/envelope-key`);
+  assert.equal(backendCalls[0].options.method, "GET");
+  assert.equal(backendCalls[0].options.body, undefined);
+  assert.equal(backendCalls[0].options.headers.has("authorization"), false);
+  assert.equal(backendCalls[0].options.headers.has("cookie"), false);
+  assert.equal(backendCalls[0].options.headers.has("x-usage-monitor-csrf"), false);
+  assert.equal(backendCalls[0].options.headers.has("origin"), false);
+
+  assert.equal(backendCalls[1].url.href, `${BACKEND_ORIGIN}/api/v1/me/devices`);
+  assert.equal(backendCalls[1].options.method, "GET");
+  assert.equal(backendCalls[1].options.body, undefined);
+  assert.equal(backendCalls[1].options.headers.get("cookie"), SESSION_COOKIE);
+  assert.equal(backendCalls[1].options.headers.has("authorization"), false);
+  assert.equal(backendCalls[1].options.headers.has("x-usage-monitor-csrf"), false);
+  assert.equal(backendCalls[1].options.headers.has("origin"), false);
+
+  assert.equal(backendCalls[2].url.href, `${BACKEND_ORIGIN}/api/v1/me/devices/revoke`);
+  assert.equal(backendCalls[2].options.method, "POST");
+  assert.equal(backendCalls[2].options.headers.get("origin"), BACKEND_ORIGIN,
+    "the gateway translates the verified public Origin for the private handler");
+  assert.equal(backendCalls[2].options.headers.get("cookie"), SESSION_COOKIE);
+  assert.equal(backendCalls[2].options.headers.has("authorization"), false);
+  assert.equal(backendCalls[2].options.headers.get("x-usage-monitor-csrf"), "csrf-test-token");
+  assert.equal(backendCalls[2].options.headers.get("sec-fetch-site"), "same-origin");
+  assert.equal(backendCalls[2].options.headers.get("content-type"), "application/json");
+  assert.equal(backendCalls[2].options.body.toString("utf8"), revokeBody);
+  assert.ok(Buffer.byteLength(backendCalls[2].options.body) <= 2 * 1_024 * 1_024);
+  assert.equal(metadataCalls.length, 3, "each private request obtains service identity before forwarding");
+});
+
+test("personal gateway routes reject unsupported methods, queries, bodies, and session or CSRF failures before forwarding", async () => {
+  const { calls: metadataCalls, fetchImpl: metadata } = metadataFetch();
+  let backendCalls = 0;
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      backendCalls += 1;
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    },
+    logger: () => {},
+  });
+  const session = { cookie: SESSION_COOKIE };
+  const csrf = {
+    ...session,
+    "x-usage-monitor-csrf": "csrf-test-token",
+    "sec-fetch-site": "same-origin",
+  };
+  const tooLargeStream = Readable.from([Buffer.alloc(2 * 1_024 * 1_024 + 1)]);
+  const cases = [
+    { name: "envelope method", options: { method: "POST", url: "/api/v1/envelope-key", body: "{}" }, status: 405, code: "METHOD_NOT_ALLOWED" },
+    { name: "envelope query", options: { method: "GET", url: "/api/v1/envelope-key?unexpected=1", body: null }, status: 404, code: "NOT_FOUND" },
+    { name: "envelope body", options: { method: "GET", url: "/api/v1/envelope-key", body: "{}", headers: { "content-length": "2" } }, status: 413, code: "BODY_TOO_LARGE" },
+    { name: "device list method", options: { method: "POST", url: "/api/v1/me/devices", body: "{}" }, status: 405, code: "METHOD_NOT_ALLOWED" },
+    { name: "device list query", options: { method: "GET", url: "/api/v1/me/devices?unexpected=1", body: null, headers: session }, status: 404, code: "NOT_FOUND" },
+    { name: "device list body", options: { method: "GET", url: "/api/v1/me/devices", body: "{}", headers: { ...session, "content-length": "2" } }, status: 413, code: "BODY_TOO_LARGE" },
+    { name: "device list cookie required", options: { method: "GET", url: "/api/v1/me/devices", body: null }, status: 401, code: "COOKIE_INVALID" },
+    { name: "device list rejects Authorization", options: { method: "GET", url: "/api/v1/me/devices", body: null, headers: { ...session, authorization: "Bearer caller-controlled" } }, status: 400, code: "AUTHORIZATION_INVALID" },
+    { name: "device list rejects malformed cookie", options: { method: "GET", url: "/api/v1/me/devices", body: null, headers: { cookie: "other=value" } }, status: 400, code: "COOKIE_INVALID" },
+    { name: "revoke method", options: { method: "GET", url: "/api/v1/me/devices/revoke", body: null }, status: 405, code: "METHOD_NOT_ALLOWED" },
+    { name: "revoke query", options: { url: "/api/v1/me/devices/revoke?unexpected=1", body: JSON.stringify({ deviceId: DEVICE_ID }), headers: csrf }, status: 404, code: "NOT_FOUND" },
+    { name: "revoke requires cookie", options: { url: "/api/v1/me/devices/revoke", body: JSON.stringify({ deviceId: DEVICE_ID }), headers: { "x-usage-monitor-csrf": "csrf-test-token", "sec-fetch-site": "same-origin" } }, status: 401, code: "COOKIE_INVALID" },
+    { name: "revoke rejects malformed cookie", options: { url: "/api/v1/me/devices/revoke", body: JSON.stringify({ deviceId: DEVICE_ID }), headers: { ...csrf, cookie: `${SESSION_COOKIE}; theme=dark` } }, status: 400, code: "COOKIE_INVALID" },
+    { name: "revoke rejects Authorization", options: { url: "/api/v1/me/devices/revoke", body: JSON.stringify({ deviceId: DEVICE_ID }), headers: { ...csrf, authorization: "Bearer caller-controlled" } }, status: 400, code: "AUTHORIZATION_INVALID" },
+    { name: "revoke requires CSRF token", options: { url: "/api/v1/me/devices/revoke", body: JSON.stringify({ deviceId: DEVICE_ID }), headers: { ...session, "sec-fetch-site": "same-origin" } }, status: 403, code: "CSRF_INVALID" },
+    { name: "revoke requires same-origin fetch metadata", options: { url: "/api/v1/me/devices/revoke", body: JSON.stringify({ deviceId: DEVICE_ID }), headers: { ...csrf, "sec-fetch-site": "cross-site" } }, status: 403, code: "CSRF_INVALID" },
+    { name: "revoke rejects absent fetch metadata", options: { url: "/api/v1/me/devices/revoke", body: JSON.stringify({ deviceId: DEVICE_ID }), headers: { cookie: SESSION_COOKIE, "x-usage-monitor-csrf": "csrf-test-token" } }, status: 403, code: "CSRF_INVALID" },
+    { name: "revoke requires public Origin", options: { url: "/api/v1/me/devices/revoke", body: JSON.stringify({ deviceId: DEVICE_ID }), headers: { ...csrf, origin: undefined } }, status: 403, code: "CSRF_INVALID" },
+    { name: "revoke rejects foreign Origin", options: { url: "/api/v1/me/devices/revoke", body: JSON.stringify({ deviceId: DEVICE_ID }), headers: { ...csrf, origin: "https://attacker.example" } }, status: 403, code: "CSRF_INVALID" },
+    { name: "revoke requires JSON", options: { url: "/api/v1/me/devices/revoke", body: "{}", headers: { ...csrf, "content-type": "text/plain" } }, status: 415, code: "CONTENT_TYPE_INVALID" },
+    { name: "revoke rejects declared oversize body", options: { url: "/api/v1/me/devices/revoke", body: "{}", headers: { ...csrf, "content-length": String(2 * 1_024 * 1_024 + 1) } }, status: 413, code: "BODY_TOO_LARGE" },
+    { name: "revoke rejects streamed oversize body", options: { url: "/api/v1/me/devices/revoke", body: null, stream: tooLargeStream, headers: { ...csrf, "transfer-encoding": "chunked", "content-type": "application/json" } }, status: 413, code: "BODY_TOO_LARGE" },
+    { name: "disconnect remains private", options: { method: "POST", url: "/api/v1/device/disconnect", body: "{}", headers: { authorization: DEVICE_AUTHORIZATION } }, status: 404, code: "NOT_FOUND" },
+  ];
+
+  for (const item of cases) {
+    const result = await invoke(handler, item.options);
+    assert.equal(result.status, item.status, item.name);
+    assert.equal(result.json().error.code, item.code, item.name);
+  }
+  assert.equal(backendCalls, 0);
+  assert.equal(metadataCalls.length, 0,
+    "invalid or unlisted routes fail before private service identity lookup");
+});
+
+test("device revocation forwards closed JSON at the 2 MiB limit and preserves private errors without fallback", async () => {
+  const maximumBodyBytes = 2 * 1_024 * 1_024;
+  const compactBody = JSON.stringify({ deviceId: DEVICE_ID });
+  const body = compactBody + " ".repeat(maximumBodyBytes - Buffer.byteLength(compactBody));
+  assert.equal(Buffer.byteLength(body), maximumBodyBytes);
+  assert.deepEqual(Object.keys(JSON.parse(body)), ["deviceId"]);
+
+  const privateNotFound = JSON.stringify({ error: { code: "DEVICE_NOT_FOUND", requestId: "synthetic-request-id" } });
+  const privateBodyInvalid = JSON.stringify({ error: { code: "BODY_INVALID", requestId: "synthetic-body-request-id" } });
+  const { calls: metadataCalls, fetchImpl: metadata } = metadataFetch();
+  const backendCalls = [];
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      backendCalls.push({ url: new URL(input), options });
+      const closedBody = Object.keys(JSON.parse(options.body.toString("utf8"))).length === 1;
+      return new Response(closedBody ? privateNotFound : privateBodyInvalid, {
+        status: closedBody ? 404 : 400,
+        headers: { "content-type": "application/json; charset=utf-8", vary: "Cookie" },
+      });
+    },
+    logger: () => {},
+  });
+  const result = await invoke(handler, {
+    url: "/api/v1/me/devices/revoke",
+    body,
+    headers: {
+      cookie: SESSION_COOKIE,
+      "x-usage-monitor-csrf": "csrf-test-token",
+      "sec-fetch-site": "same-origin",
+    },
+  });
+
+  assert.equal(result.status, 404);
+  assert.equal(result.headers.vary, "Cookie");
+  assert.equal(result.body.toString("utf8"), privateNotFound);
+  assert.equal(backendCalls.length, 1);
+  assert.equal(backendCalls[0].url.href, `${BACKEND_ORIGIN}/api/v1/me/devices/revoke`);
+  assert.equal(Buffer.byteLength(backendCalls[0].options.body), maximumBodyBytes);
+
+  const extraPropertyBody = JSON.stringify({ deviceId: DEVICE_ID, unexpected: true });
+  const invalidClosedBody = await invoke(handler, {
+    url: "/api/v1/me/devices/revoke",
+    body: extraPropertyBody,
+    headers: {
+      cookie: SESSION_COOKIE,
+      "x-usage-monitor-csrf": "csrf-test-token",
+      "sec-fetch-site": "same-origin",
+    },
+  });
+  assert.equal(invalidClosedBody.status, 400);
+  assert.equal(invalidClosedBody.body.toString("utf8"), privateBodyInvalid,
+    "the private handler's closed-schema refusal is preserved");
+  assert.equal(backendCalls.length, 2, "each request invokes only the private handler once");
+  assert.equal(backendCalls[1].url.href, `${BACKEND_ORIGIN}/api/v1/me/devices/revoke`);
+  assert.equal(backendCalls[1].options.body.toString("utf8"), extraPropertyBody);
+  assert.equal(metadataCalls.length, 2);
+});
+
+test("new personal gateway routes fail closed when the private response exceeds its route cap", async () => {
+  const { fetchImpl: metadata } = metadataFetch();
+  const routes = [
+    { path: "/api/v1/envelope-key", method: "GET", body: null, cap: 8 * 1_024, headers: {} },
+    { path: "/api/v1/me/devices", method: "GET", body: null, cap: 32 * 1_024, headers: { cookie: SESSION_COOKIE } },
+    {
+      path: "/api/v1/me/devices/revoke",
+      method: "POST",
+      body: JSON.stringify({ deviceId: DEVICE_ID }),
+      cap: 8 * 1_024,
+      headers: {
+        cookie: SESSION_COOKIE,
+        "x-usage-monitor-csrf": "csrf-test-token",
+        "sec-fetch-site": "same-origin",
+      },
+    },
+  ];
+  const backendCalls = [];
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      backendCalls.push(new URL(input).pathname);
+      const body = JSON.stringify({ padding: "x".repeat(routes[backendCalls.length - 1].cap) });
+      assert.ok(Buffer.byteLength(body) > routes[backendCalls.length - 1].cap);
+      return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+    },
+    logger: () => {},
+  });
+
+  for (const route of routes) {
+    const result = await invoke(handler, {
+      method: route.method,
+      url: route.path,
+      body: route.body,
+      headers: route.headers,
+    });
+    assert.equal(result.status, 502, route.path);
+    assert.equal(result.json().error.code, "UPSTREAM_UNAVAILABLE", route.path);
+  }
+  assert.deepEqual(backendCalls, routes.map((route) => route.path));
+});

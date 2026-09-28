@@ -54,10 +54,32 @@ const ROUTES = new Map([
     responseTypes: ["application/json"], maxResponseBytes: 32 * 1_024,
     sessionCookie: false, forwardCsrf: false,
   })],
+  ["/api/v1/envelope-key", Object.freeze({
+    id: "envelope_key", method: "GET", body: "none", maxBodyBytes: 0,
+    responseTypes: ["application/json"], maxResponseBytes: 8 * 1_024,
+    sessionCookie: false, forwardAuthorization: false, forwardCsrf: false,
+  })],
   ["/api/v1/session", Object.freeze({
     id: "session", method: "GET", body: "none", maxBodyBytes: 0,
     responseTypes: ["application/json"], maxResponseBytes: 8 * 1_024,
     sessionCookie: true, forwardAuthorization: false, forwardCsrf: false,
+  })],
+  ["/api/v1/me/devices", Object.freeze({
+    id: "participant_devices", method: "GET", body: "none", maxBodyBytes: 0,
+    responseTypes: ["application/json"], maxResponseBytes: 32 * 1_024,
+    // The private projection allows 100 UUID rows with four 24-byte UTC
+    // timestamps and the longest state. Its exact JSON size is exercised by
+    // oauth-gateway.check.mjs before this cap is changed.
+    sessionCookie: true, requireSessionCookie: true, forwardAuthorization: false,
+    rejectAuthorization: true, forwardCsrf: false,
+  })],
+  ["/api/v1/me/devices/revoke", Object.freeze({
+    id: "participant_device_revoke", method: "POST", body: "json", maxBodyBytes: 2 * 1_024 * 1_024,
+    responseTypes: ["application/json"], maxResponseBytes: 8 * 1_024,
+    sessionCookie: true, requireSessionCookie: true, forwardAuthorization: false,
+    rejectAuthorization: true, forwardCsrf: true, requireCsrf: true,
+    forwardSecFetchSite: true, requireSecFetchSite: true,
+    originContract: "backend",
   })],
   ["/api/v1/logout", Object.freeze({
     id: "logout", method: "POST", body: "none", maxBodyBytes: 0,
