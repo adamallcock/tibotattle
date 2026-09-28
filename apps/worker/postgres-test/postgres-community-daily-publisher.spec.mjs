@@ -108,7 +108,10 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
     await pool.query(`CREATE SCHEMA ${sqlSchema}`);
     await applyStockAndStagedMigrations({
       role: "primary", schema, pool,
-      stagedFiles: ["0093_community_daily_v12_authority_pin.sql"],
+      stagedFiles: [
+        "0093_community_daily_v12_authority_pin.sql",
+        "0095_community_daily_v12_authority_generation.sql",
+      ],
     });
     await pool.query(`INSERT INTO ${sqlSchema}.typed_telemetry_namespaces(id,original_id)
       VALUES (1,decode('0102','hex'))`);
@@ -372,7 +375,10 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
     return result.rows[0];
   }
 
-  async function addAccountlessRetainedV11Day({ mismatchedLedgerHash = false } = {}) {
+  async function addAccountlessRetainedV11Day({
+    mismatchedLedgerHash = false,
+    includeHistoricalDailyRevision = true,
+  } = {}) {
     const deviceId = randomUUID();
     const participantId = `synthetic-accountless-${randomUUID()}`;
     const secret = randomBytes(32).toString("base64url");
@@ -488,14 +494,16 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
     await pool.query(`INSERT INTO ${sqlSchema}.analytics_publication_owner_members(
       source_id,day,metric,generation,owner_digest)
       VALUES ($1,$2::date,'daily','synthetic-daily-generation',$3)`, [SOURCE_ID, DAY, ownerDigest]);
-    const payloadJson = JSON.stringify({ schemaVersion: "community-daily-aggregate-v1.0", day: DAY });
-    const payloadDigest = createHash("sha256").update(payloadJson).digest("hex");
-    await pool.query(`INSERT INTO ${sqlSchema}.community_daily_aggregates(
-      source_id,source_namespace,day,revision,payload_json,payload_sha256,
-      source_authority_epoch,source_cursor_sequence,policy_revision,
-      collection_revision,release_state,released_at)
-      VALUES ($1,$2,$3::date,1,$4,$5,0,0,1,1,'published',$6::timestamptz)`,
-    [SOURCE_ID, SOURCE_NAMESPACE, DAY, payloadJson, payloadDigest, now]);
+    if (includeHistoricalDailyRevision) {
+      const payloadJson = JSON.stringify({ schemaVersion: "community-daily-aggregate-v1.0", day: DAY });
+      const payloadDigest = createHash("sha256").update(payloadJson).digest("hex");
+      await pool.query(`INSERT INTO ${sqlSchema}.community_daily_aggregates(
+        source_id,source_namespace,day,revision,payload_json,payload_sha256,
+        source_authority_epoch,source_cursor_sequence,policy_revision,
+        collection_revision,release_state,released_at)
+        VALUES ($1,$2,$3::date,1,$4,$5,0,0,1,1,'published',$6::timestamptz)`,
+      [SOURCE_ID, SOURCE_NAMESPACE, DAY, payloadJson, payloadDigest, now]);
+    }
 
     return {
       authorization,
@@ -519,6 +527,40 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
       schema: { primarySchema: schema },
       ...options,
     });
+  }
+
+  function pausePublisherAfterQuery(match) {
+    let reached;
+    let resume;
+    const reachedPromise = new Promise((resolve) => { reached = resolve; });
+    const resumed = new Promise((resolve) => { resume = resolve; });
+    let paused = false;
+    return {
+      reached: reachedPromise,
+      resume() { resume(); },
+      pool: {
+        async connect() {
+          const client = await pool.connect();
+          return {
+            async query(text, values) {
+              const result = await client.query(text, values);
+              if (!paused && match(String(text))) {
+                paused = true;
+                reached();
+                await resumed;
+              }
+              return result;
+            },
+            release(discard) { return client.release(discard); },
+          };
+        },
+      },
+    };
+  }
+
+  async function addIsolatedSocialParticipant(id) {
+    await pool.query(`INSERT INTO ${sqlSchema}.participants(id,owner_kind,state,created_at)
+      VALUES ($1,'social','active',clock_timestamp())`, [id]);
   }
 
   it("reports only exact selected-day v1 and v1.1 record-presence booleans", async () => {
@@ -844,17 +886,23 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
 
   it("pins v1.2 runtime and accountless expiry inputs into immutable daily revisions", async () => {
     const fixture = await addAccountlessRetainedV11Day();
+    expect((await pool.query(`SELECT public_source_generation
+      FROM ${sqlSchema}.community_daily_aggregates
+      WHERE source_id=$1 AND day=$2::date ORDER BY revision DESC LIMIT 1`,
+    [SOURCE_ID, DAY])).rows[0].public_source_generation).toBe(null);
     const first = await publish();
     expect(first).toEqual({ state: "published", day: DAY, revision: 2 });
 
     const readPin = async () => (await pool.query(`SELECT
+      public_source_generation,
       telemetry_v12_runtime_state,telemetry_v12_runtime_revision,
       telemetry_v12_typed_runtime_state,telemetry_v12_typed_runtime_policy_revision,
       telemetry_v12_accountless_authorization_count,
       telemetry_v12_next_accountless_authorization_expiry
       FROM ${sqlSchema}.community_daily_aggregates
       WHERE source_id=$1 AND day=$2::date ORDER BY revision DESC LIMIT 1`, [SOURCE_ID, DAY])).rows[0];
-    expect(await readPin()).toMatchObject({
+    const initialPin = await readPin();
+    expect(initialPin).toMatchObject({
       telemetry_v12_runtime_state: "staged",
       telemetry_v12_runtime_revision: "0",
       telemetry_v12_typed_runtime_state: "staged",
@@ -862,6 +910,7 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
       telemetry_v12_accountless_authorization_count: "0",
       telemetry_v12_next_accountless_authorization_expiry: null,
     });
+    expect(Number(initialPin.public_source_generation)).toBeGreaterThan(0);
     expect(await publish()).toEqual({ state: "unchanged", day: DAY, revision: 2 });
 
     await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_runtime
@@ -898,6 +947,268 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
     });
     expect((await pool.query(`SELECT sequence FROM ${sqlSchema}.analytics_source_cursors
       WHERE source_id=$1`, [SOURCE_ID])).rows).toEqual([{ sequence: "0" }]);
+  });
+
+  it("requires strict runtime revisions and fences same-value authority updates", async () => {
+    await addAccountlessRetainedV11Day();
+    expect(await publish()).toEqual({ state: "published", day: DAY, revision: 2 });
+    const readAuthority = async () => (await pool.query(`SELECT
+        authority.revision AS public_source_generation,
+        runtime.state AS runtime_state,runtime.revision AS runtime_revision,
+        typed_runtime.state AS typed_runtime_state,
+        typed_runtime.policy_revision AS typed_runtime_policy_revision
+      FROM ${sqlSchema}.community_daily_v12_authority_state authority
+      JOIN ${sqlSchema}.telemetry_v12_runtime runtime ON runtime.id=1
+      JOIN ${sqlSchema}.telemetry_v12_typed_runtime typed_runtime ON typed_runtime.id=1
+      WHERE authority.id=1`)).rows[0];
+    const before = await readAuthority();
+
+    await expect(pool.query(`UPDATE ${sqlSchema}.telemetry_v12_runtime
+      SET state='active' WHERE id=1`)).rejects.toMatchObject({
+      code: "P1005",
+      message: expect.stringContaining("community_daily_v12_runtime_revision_required"),
+    });
+    await expect(pool.query(`UPDATE ${sqlSchema}.telemetry_v12_typed_runtime
+      SET state='active' WHERE id=1`)).rejects.toMatchObject({
+      code: "P1005",
+      message: expect.stringContaining("community_daily_v12_typed_runtime_revision_required"),
+    });
+    expect(await readAuthority()).toEqual(before);
+
+    await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_runtime
+      SET state='active',revision=revision+1 WHERE id=1`);
+    await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_typed_runtime
+      SET state='active',policy_revision=policy_revision+1 WHERE id=1`);
+    const advanced = await readAuthority();
+    expect(advanced).toMatchObject({
+      runtime_state: "active",
+      runtime_revision: before.runtime_revision + 1,
+      typed_runtime_state: "active",
+      typed_runtime_policy_revision: before.typed_runtime_policy_revision + 1,
+    });
+    expect(BigInt(advanced.public_source_generation)).toBeGreaterThan(BigInt(before.public_source_generation));
+    expect(await publish()).toEqual({ state: "published", day: DAY, revision: 3 });
+
+    const published = await readAuthority();
+    await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_runtime SET revision=revision WHERE id=1`);
+    await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_typed_runtime
+      SET policy_revision=policy_revision WHERE id=1`);
+    const sameValues = await readAuthority();
+    expect(sameValues).toMatchObject({
+      runtime_state: published.runtime_state,
+      runtime_revision: published.runtime_revision,
+      typed_runtime_state: published.typed_runtime_state,
+      typed_runtime_policy_revision: published.typed_runtime_policy_revision,
+    });
+    expect(BigInt(sameValues.public_source_generation)).toBeGreaterThan(BigInt(published.public_source_generation));
+    expect(await publish()).toEqual({ state: "published", day: DAY, revision: 4 });
+    expect(await publish()).toEqual({ state: "unchanged", day: DAY, revision: 4 });
+  });
+
+  it("fails closed when the staged public generation schema is absent", async () => {
+    await pool.query(`ALTER TABLE ${sqlSchema}.community_daily_v12_authority_state
+      RENAME TO community_daily_v12_authority_state_missing`);
+    try {
+      await expect(publish()).rejects.toMatchObject({
+        code: "unavailable",
+        operation: "community_daily.publish",
+      });
+      expect((await pool.query(`SELECT count(*)::int AS count
+        FROM ${sqlSchema}.community_daily_aggregates WHERE source_id=$1 AND day=$2::date`,
+      [SOURCE_ID, DAY])).rows[0].count).toBe(0);
+    } finally {
+      await pool.query(`ALTER TABLE ${sqlSchema}.community_daily_v12_authority_state_missing
+        RENAME TO community_daily_v12_authority_state`);
+    }
+  });
+
+  it("installs generation triggers on all mutable daily-source and eligibility inputs", async () => {
+    const expected = [
+      "accountless_enrollment_ledger", "accountless_public_history_retention",
+      "accountless_upload_owners", "accountless_v11_device_authorizations",
+      "accountless_v12_device_authorizations", "analytics_source_cursors",
+      "collection_controls", "device_credentials", "participants", "publication_state",
+      "storage_ingestion_changes", "storage_source_state", "storage_v11_owner_links",
+      "telemetry_v1_chunks", "telemetry_v1_records", "telemetry_v11_chunks",
+      "telemetry_v11_domain_days", "telemetry_v11_domain_heads", "telemetry_v11_domains",
+      "telemetry_v11_records", "telemetry_v12_chunks", "telemetry_v12_day_manifests",
+      "telemetry_v12_device_capabilities", "telemetry_v12_domain_days",
+      "telemetry_v12_domain_heads", "telemetry_v12_domains", "telemetry_v12_runtime",
+      "telemetry_v12_typed_attributions", "telemetry_v12_typed_quota",
+      "telemetry_v12_typed_records", "telemetry_v12_typed_runtime",
+      "telemetry_v12_typed_session_tools", "telemetry_v12_typed_usage",
+      "typed_telemetry_dictionary", "typed_v1_admission_state", "typed_v11_admission_state",
+    ].sort();
+    const result = await pool.query(`SELECT relation.relname AS relation_name, trigger_row.tgname AS trigger_name
+      FROM pg_trigger trigger_row
+      JOIN pg_class relation ON relation.oid=trigger_row.tgrelid
+      JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+      WHERE namespace.nspname=$1 AND (
+          trigger_row.tgname LIKE 'a_community_daily_authority_%'
+          OR trigger_row.tgname LIKE 'b_community_daily_authority_no_truncate_%'
+        )
+        AND NOT trigger_row.tgisinternal
+      ORDER BY trigger_row.tgname`, [schema]);
+    expect(result.rows.filter((row) => row.trigger_name.startsWith("a_"))
+      .map((row) => row.relation_name).sort()).toEqual(expected);
+    expect(result.rows.filter((row) => row.trigger_name.startsWith("b_"))
+      .map((row) => row.relation_name).sort()).toEqual(expected);
+
+    const beforeStatementDml = await pool.query(`SELECT relation.relname AS relation_name,
+        trigger_row.tgname AS trigger_name
+      FROM pg_trigger trigger_row
+      JOIN pg_class relation ON relation.oid=trigger_row.tgrelid
+      JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+      WHERE namespace.nspname=$1 AND NOT trigger_row.tgisinternal
+        AND (trigger_row.tgtype & 2)=2 AND (trigger_row.tgtype & 1)=0
+        AND (trigger_row.tgtype & 28)<>0
+      ORDER BY relation.relname, trigger_row.tgname`, [schema]);
+    for (const relationName of expected) {
+      const firstDmlTrigger = beforeStatementDml.rows.find((row) => row.relation_name === relationName);
+      expect(firstDmlTrigger?.trigger_name).toMatch(/^a_community_daily_authority_/u);
+    }
+  });
+
+  it("refuses TRUNCATE while a publisher holds the generation pin without waiting on it", async () => {
+    const gate = pausePublisherAfterQuery((sql) => sql.includes("community_daily_v12_authority_state")
+      && sql.includes("FOR SHARE"));
+    const publication = publish({}, gate.pool);
+    const writer = await pool.connect();
+    let transaction = false;
+    let truncatePromise;
+    try {
+      await gate.reached;
+      await writer.query("BEGIN");
+      transaction = true;
+      await writer.query("SET LOCAL statement_timeout='500ms'");
+      truncatePromise = writer.query(`TRUNCATE ${sqlSchema}.telemetry_v12_runtime`);
+      await expect(truncatePromise).rejects.toMatchObject({
+        code: "P1005",
+        message: expect.stringContaining("community_daily_public_source_truncate_refused"),
+      });
+      await writer.query("ROLLBACK");
+      transaction = false;
+      gate.resume();
+      expect(await publication).toEqual({ state: "published", day: DAY, revision: 1 });
+    } finally {
+      gate.resume();
+      if (transaction) await writer.query("ROLLBACK").catch(() => {});
+      if (truncatePromise) await truncatePromise.catch(() => {});
+      writer.release();
+      await publication.catch(() => {});
+    }
+    expect((await pool.query(`SELECT count(*)::int AS count
+      FROM ${sqlSchema}.telemetry_v12_runtime WHERE id=1`)).rows[0].count).toBe(1);
+  });
+
+  it("fails closed when an active v1.2 lease enters the commit safety window", async () => {
+    const fixture = await addAccountlessRetainedV11Day({ includeHistoricalDailyRevision: false });
+    await pool.query(`INSERT INTO ${sqlSchema}.accountless_v12_device_authorizations(
+      enrollment_device_id,participant_id,device_credential_id,
+      telemetry_schema_version,field_dictionary_version,privacy_contract_version,
+      authorized_at,expires_at,state)
+      VALUES ($1,$2,$1,'telemetry-contribution-v1.2',
+        'telemetry-v1.2-registry-2026-09-20.1','ongoing-privacy-safe-telemetry-v1.2',
+        clock_timestamp(),clock_timestamp()+interval '30 seconds','active')`,
+    [fixture.deviceId, fixture.participantId]);
+    expect((await pool.query(`SELECT bool_or(expires_at > transaction_timestamp()
+      AND expires_at <= transaction_timestamp()+interval '45 seconds') AS near
+      FROM ${sqlSchema}.accountless_v12_device_authorizations WHERE enrollment_device_id=$1`,
+    [fixture.deviceId])).rows[0].near).toBe(true);
+
+    await expect(publish()).rejects.toMatchObject({
+      code: "unavailable",
+      operation: "community_daily.authority_fence",
+    });
+    expect((await pool.query(`SELECT count(*)::int AS count
+      FROM ${sqlSchema}.community_daily_aggregates WHERE source_id=$1 AND day=$2::date`,
+    [SOURCE_ID, DAY])).rows[0].count).toBe(0);
+
+    await pool.query(`UPDATE ${sqlSchema}.accountless_v12_device_authorizations
+      SET expires_at=clock_timestamp()+interval '10 minutes' WHERE enrollment_device_id=$1`,
+    [fixture.deviceId]);
+    expect(await publish()).toEqual({ state: "published", day: DAY, revision: 1 });
+    expect(await publish()).toEqual({ state: "unchanged", day: DAY, revision: 1 });
+  });
+
+  it("serializes a runtime commit that lands after the repeatable-read snapshot", async () => {
+    const gate = pausePublisherAfterQuery((sql) => sql.startsWith("SELECT pg_advisory_xact_lock"));
+    const publication = publish({}, gate.pool);
+    await gate.reached;
+
+    await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_runtime
+      SET state='blocked',revision=revision+1 WHERE id=1`);
+    gate.resume();
+
+    await expect(publication).rejects.toMatchObject({ code: "conflict", operation: "community_daily.publish" });
+    expect((await pool.query(`SELECT count(*)::int AS count
+      FROM ${sqlSchema}.community_daily_aggregates WHERE source_id=$1 AND day=$2::date`,
+    [SOURCE_ID, DAY])).rows[0].count).toBe(0);
+    expect(await publish()).toEqual({ state: "published", day: DAY, revision: 1 });
+  });
+
+  it("serializes a v1.2 accountless authorization update after the snapshot", async () => {
+    const fixture = await addAccountlessRetainedV11Day({ includeHistoricalDailyRevision: false });
+    await pool.query(`INSERT INTO ${sqlSchema}.accountless_v12_device_authorizations(
+      enrollment_device_id,participant_id,device_credential_id,
+      telemetry_schema_version,field_dictionary_version,privacy_contract_version,
+      authorized_at,expires_at,state)
+      VALUES ($1,$2,$1,'telemetry-contribution-v1.2',
+        'telemetry-v1.2-registry-2026-09-20.1','ongoing-privacy-safe-telemetry-v1.2',
+        $3::timestamptz,$4::timestamptz,'active')`,
+    [fixture.deviceId, fixture.participantId, "2026-09-24T00:00:00.000Z", "2027-09-24T00:00:00.000Z"]);
+
+    const gate = pausePublisherAfterQuery((sql) => sql.startsWith("SELECT pg_advisory_xact_lock"));
+    const publication = publish({}, gate.pool);
+    await gate.reached;
+    await pool.query(`UPDATE ${sqlSchema}.accountless_v12_device_authorizations
+      SET expires_at='2028-09-24T00:00:00.000Z'::timestamptz WHERE enrollment_device_id=$1`,
+    [fixture.deviceId]);
+    gate.resume();
+
+    await expect(publication).rejects.toMatchObject({ code: "conflict", operation: "community_daily.publish" });
+    expect((await pool.query(`SELECT count(*)::int AS count
+      FROM ${sqlSchema}.community_daily_aggregates WHERE source_id=$1 AND day=$2::date`,
+    [SOURCE_ID, DAY])).rows[0].count).toBe(0);
+    expect(await publish()).toEqual({ state: "published", day: DAY, revision: 1 });
+  });
+
+  it("holds the public generation through publication before owner erasure can proceed", async () => {
+    const participantId = "synthetic-authority-race-owner";
+    await addIsolatedSocialParticipant(participantId);
+    const gate = pausePublisherAfterQuery((sql) => sql.includes("community_daily_v12_authority_state")
+      && sql.includes("FOR SHARE"));
+    const publication = publish({}, gate.pool);
+    const writer = await pool.connect();
+    let writerTransaction = false;
+    let updatePromise;
+    try {
+      await gate.reached;
+      await writer.query("BEGIN");
+      writerTransaction = true;
+      updatePromise = writer.query(`UPDATE ${sqlSchema}.participants SET state='deleting' WHERE id=$1`,
+        [participantId]);
+      const updateState = await Promise.race([
+        updatePromise.then(() => "completed", () => "failed"),
+        new Promise((resolve) => setTimeout(() => resolve("waiting"), 100)),
+      ]);
+      expect(updateState).toBe("waiting");
+
+      gate.resume();
+      expect(await publication).toEqual({ state: "published", day: DAY, revision: 1 });
+      await updatePromise;
+      await writer.query("COMMIT");
+      writerTransaction = false;
+    } finally {
+      gate.resume();
+      if (writerTransaction) await writer.query("ROLLBACK").catch(() => {});
+      if (updatePromise) await updatePromise.catch(() => {});
+      writer.release();
+      await publication.catch(() => {});
+    }
+
+    expect(await publish()).toEqual({ state: "published", day: DAY, revision: 2 });
+    expect(await publish()).toEqual({ state: "unchanged", day: DAY, revision: 2 });
   });
 
   it("preserves exact mixed v1.0/v1.1 publication output", async () => {

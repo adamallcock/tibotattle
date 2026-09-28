@@ -40,6 +40,8 @@ import {
 
 const MAX_DAILY_AGGREGATE_CELLS = 100;
 const SPEND_FETCH_BATCH_SIZE = 1_000;
+const DAILY_SOURCE_TRANSACTION_TIMEOUT_MILLISECONDS = 40_000;
+const DAILY_SOURCE_EXPIRY_LOOKAHEAD_SECONDS = 45;
 const POSTGRES_DAILY_V12_PROVIDERS = new Set(["openai_codex", "anthropic_claude_code"]);
 const POSTGRES_DAILY_V12_BILLING_SURFACES = new Set([
   "chatgpt_subscription", "openai_api", "claude_subscription", "unknown",
@@ -54,6 +56,7 @@ const POSTGRES_DAILY_V12_REASONING_EFFORTS = new Set([
 const POSTGRES_DAILY_V12_MODEL_BY_ID = new Map(REVIEWED_MODEL_CATALOG.map((model) => [model.id, model]));
 
 interface DailyFenceRow {
+  readonly public_source_generation: string | number;
   readonly source_id: string;
   readonly source_authority_epoch: string | number;
   readonly cursor_sequence: string | number;
@@ -70,6 +73,7 @@ interface DailyFenceRow {
   readonly telemetry_v12_typed_runtime_policy_revision: string | number;
   readonly telemetry_v12_accountless_authorization_count: string | number;
   readonly telemetry_v12_next_accountless_authorization_expiry: string | Date | null;
+  readonly telemetry_v12_accountless_authorization_expires_soon: boolean;
   readonly control_state: string;
   readonly publication_enabled: boolean;
 }
@@ -94,6 +98,7 @@ interface RevisionRow {
   readonly telemetry_v12_typed_runtime_policy_revision: string | number | null;
   readonly telemetry_v12_accountless_authorization_count: string | number | null;
   readonly telemetry_v12_next_accountless_authorization_expiry: string | Date | null;
+  readonly public_source_generation: string | number | null;
 }
 
 interface DailyTotalsQueryRow extends Record<string, unknown> {
@@ -692,14 +697,16 @@ async function captureFence(
   schema: string,
   sourceId: string,
   sourceNamespace: string,
+  lockedPublicSourceGeneration: number,
 ) {
-  // Requires staged primary 0093 to be deliberately promoted/applied before
-  // deploying this reader. The v1.2 values are a preparatory immutable pin
-  // only; the source CTE below still excludes typed v1.2. Before enabling that
-  // source, authorization writes and the expiry boundary also need a commit-time
-  // fence so eligibility cannot change after this statement's snapshot.
+  // Requires staged primary 0093 and 0095 to be deliberately promoted/applied
+  // before deploying this reader. The generation lock was acquired before this
+  // read. All tables consulted here and by publicDailySourceCtes advance that
+  // lock in a BEFORE STATEMENT trigger; no row locks are taken here, avoiding
+  // inversions with writers that already hold source/journal rows.
   const result = await client.query<DailyFenceRow>(
     `SELECT source.source_id,
+            public_source.revision AS public_source_generation,
             source.authority_epoch AS source_authority_epoch,
             cursor.sequence AS cursor_sequence,
             cursor.authority_epoch AS cursor_authority_epoch,
@@ -715,15 +722,22 @@ async function captureFence(
             telemetry_v12_typed_runtime.policy_revision AS telemetry_v12_typed_runtime_policy_revision,
             (SELECT count(*) FROM ${schema}.accountless_v12_device_authorizations account_auth
               WHERE account_auth.state='active'
-                AND account_auth.expires_at > statement_timestamp())
+                AND account_auth.expires_at > transaction_timestamp())
               AS telemetry_v12_accountless_authorization_count,
             (SELECT min(account_auth.expires_at) FROM ${schema}.accountless_v12_device_authorizations account_auth
               WHERE account_auth.state='active'
-                AND account_auth.expires_at > statement_timestamp())
+                AND account_auth.expires_at > transaction_timestamp())
               AS telemetry_v12_next_accountless_authorization_expiry,
+            EXISTS (SELECT 1 FROM ${schema}.accountless_v12_device_authorizations account_auth
+              WHERE account_auth.state='active'
+                AND account_auth.expires_at > transaction_timestamp()
+                AND account_auth.expires_at <= transaction_timestamp()
+                  + ($2::integer * interval '1 second'))
+              AS telemetry_v12_accountless_authorization_expires_soon,
             controls.control_state,
             controls.publication_enabled
        FROM ${schema}.storage_source_state source
+       JOIN ${schema}.community_daily_v12_authority_state public_source ON public_source.id=1
        JOIN ${schema}.analytics_source_cursors cursor ON cursor.source_id=source.source_id
        JOIN ${schema}.typed_v1_admission_state v1 ON v1.id=1
        JOIN ${schema}.typed_v11_admission_state v11 ON v11.id=1
@@ -731,14 +745,13 @@ async function captureFence(
        JOIN ${schema}.collection_controls controls ON controls.singleton=1
        JOIN ${schema}.telemetry_v12_runtime telemetry_v12_runtime ON telemetry_v12_runtime.id=1
        JOIN ${schema}.telemetry_v12_typed_runtime telemetry_v12_typed_runtime ON telemetry_v12_typed_runtime.id=1
-      WHERE source.singleton=1 AND source.source_id=$1
-      FOR SHARE OF source, cursor, v1, v11, policy, controls,
-                     telemetry_v12_runtime, telemetry_v12_typed_runtime`,
-    [sourceId],
+      WHERE source.singleton=1 AND source.source_id=$1`,
+    [sourceId, DAILY_SOURCE_EXPIRY_LOOKAHEAD_SECONDS],
   );
   const row = result.rows[0];
   if (!Array.isArray(result.rows) || result.rows.length !== 1 || !row
       || row.source_id !== sourceId
+      || integer(row.public_source_generation, 1) !== lockedPublicSourceGeneration
       || row.v1_source_namespace !== sourceNamespace || row.v11_source_namespace !== sourceNamespace
       || integer(row.v1_runtime_contract_version) !== 1
       || integer(row.v11_runtime_contract_version) !== 1
@@ -747,8 +760,9 @@ async function captureFence(
       || integer(row.telemetry_v12_runtime_revision) < 0
       || !["staged", "active"].includes(row.telemetry_v12_typed_runtime_state)
       || integer(row.telemetry_v12_typed_runtime_policy_revision, 1) < 1
+      || row.telemetry_v12_accountless_authorization_expires_soon !== false
       || row.control_state !== "operational" || row.publication_enabled !== true) {
-    unavailable();
+    unavailable("community_daily.authority_fence");
   }
   const v12AuthorizationCount = integer(row.telemetry_v12_accountless_authorization_count);
   const v12NextAuthorizationExpiry = timestamp(row.telemetry_v12_next_accountless_authorization_expiry);
@@ -769,6 +783,7 @@ async function captureFence(
   }
   return Object.freeze({
     sourceAuthorityEpoch,
+    publicSourceGeneration: integer(row.public_source_generation, 1),
     cursorSequence,
     policyRevision: integer(row.policy_revision, 1),
     collectionRevision: integer(row.collection_revision, 1),
@@ -786,8 +801,10 @@ function sameV12AuthorityPin(previous: RevisionRow, fence: Awaited<ReturnType<ty
       || previous.telemetry_v12_typed_runtime_state === null
       || previous.telemetry_v12_runtime_revision === null
       || previous.telemetry_v12_typed_runtime_policy_revision === null
-      || previous.telemetry_v12_accountless_authorization_count === null) return false;
-  return previous.telemetry_v12_runtime_state === fence.telemetryV12RuntimeState
+      || previous.telemetry_v12_accountless_authorization_count === null
+      || previous.public_source_generation === null) return false;
+  return nullableInteger(previous.public_source_generation, 1) === fence.publicSourceGeneration
+    && previous.telemetry_v12_runtime_state === fence.telemetryV12RuntimeState
     && nullableInteger(previous.telemetry_v12_runtime_revision) === fence.telemetryV12RuntimeRevision
     && previous.telemetry_v12_typed_runtime_state === fence.telemetryV12TypedRuntimeState
     && nullableInteger(previous.telemetry_v12_typed_runtime_policy_revision, 1)
@@ -840,16 +857,33 @@ export async function publishPostgresCommunityDailyDay(
   const ctes = publicDailySourceCtes(schema);
 
   return withPostgresMutation(pool, async (client) => {
+    // The transaction bound leaves a five-second margin after the 45-second
+    // expiry look-ahead checked below. `SET LOCAL` does not establish the
+    // REPEATABLE READ snapshot; the advisory lock remains the first SELECT.
+    await client.query(
+      `SET LOCAL transaction_timeout='${DAILY_SOURCE_TRANSACTION_TIMEOUT_MILLISECONDS}ms'`,
+    );
     // Serialize same-day revisions without locking unrelated publication days.
     await client.query(
       "SELECT pg_advisory_xact_lock(hashtextextended($1, 731042))",
       [`${identity.sourceId}\u001f${capturedDay}`],
     );
-    const fence = await captureFence(client, schema, identity.sourceId, identity.sourceNamespace);
+    const generationLock = await client.query<{ revision: string | number }>(
+      `SELECT revision FROM ${schema}.community_daily_v12_authority_state
+        WHERE id=1 FOR SHARE`,
+    );
+    if (!Array.isArray(generationLock.rows) || generationLock.rows.length !== 1) {
+      unavailable("community_daily.authority_generation");
+    }
+    const lockedPublicSourceGeneration = integer(generationLock.rows[0]?.revision, 1);
+    const fence = await captureFence(
+      client, schema, identity.sourceId, identity.sourceNamespace, lockedPublicSourceGeneration,
+    );
     const previousResult = await client.query<RevisionRow>(
       `SELECT revision, release_state, payload_json, payload_sha256,
               source_authority_epoch, source_cursor_sequence,
               policy_revision, collection_revision,
+              public_source_generation,
               telemetry_v12_runtime_state, telemetry_v12_runtime_revision,
               telemetry_v12_typed_runtime_state, telemetry_v12_typed_runtime_policy_revision,
               telemetry_v12_accountless_authorization_count,
@@ -929,14 +963,15 @@ export async function publishPostgresCommunityDailyDay(
       `INSERT INTO ${schema}.community_daily_aggregates (
          source_id, source_namespace, day, revision, payload_json, payload_sha256,
          source_authority_epoch, source_cursor_sequence, policy_revision,
-         collection_revision, telemetry_v12_runtime_state, telemetry_v12_runtime_revision,
+         collection_revision, public_source_generation,
+         telemetry_v12_runtime_state, telemetry_v12_runtime_revision,
          telemetry_v12_typed_runtime_state, telemetry_v12_typed_runtime_policy_revision,
          telemetry_v12_accountless_authorization_count,
          telemetry_v12_next_accountless_authorization_expiry,
          release_state, released_at
        )
-       SELECT $1,$2,$3::date,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-              'published',$17::timestamptz
+       SELECT $1,$2,$3::date,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+              'published',$18::timestamptz
         WHERE NOT EXISTS (
           SELECT 1 FROM ${schema}.storage_ingestion_changes change
            WHERE change.source_id=$1
@@ -946,6 +981,7 @@ export async function publishPostgresCommunityDailyDay(
        RETURNING revision`,
       [identity.sourceId, identity.sourceNamespace, capturedDay, revision, payloadJson, payloadSha256,
         fence.sourceAuthorityEpoch, fence.cursorSequence, fence.policyRevision, fence.collectionRevision,
+        fence.publicSourceGeneration,
         fence.telemetryV12RuntimeState, fence.telemetryV12RuntimeRevision,
         fence.telemetryV12TypedRuntimeState, fence.telemetryV12TypedRuntimePolicyRevision,
         fence.telemetryV12AccountlessAuthorizationCount,
