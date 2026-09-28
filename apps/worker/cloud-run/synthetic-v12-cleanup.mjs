@@ -21,6 +21,7 @@ export const SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT =
   "tibotattle-test-runtime@tibotattle.iam.gserviceaccount.com";
 export const SYNTHETIC_V12_CLEANUP_MIGRATION_ROOT = "/app/apps/worker/postgres/migrations";
 export const SYNTHETIC_V12_CLEANUP_PARTICIPANT_PREFIX = "synthetic-v12-smoke-";
+export const SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER = SYNTHETIC_V12_CLEANUP_PARTICIPANT_PREFIX;
 export const SYNTHETIC_V12_CLEANUP_SERVICE = CLOUD_RUN_IAM_TEST_TARGET.service;
 export const SYNTHETIC_V12_CLEANUP_TARGETS = Object.freeze({
   primary: CLOUD_RUN_IAM_TEST_TARGET.postgres.primary,
@@ -41,6 +42,10 @@ const INSTANCE_PATTERN = /^[A-Za-z0-9_.:-]{1,200}$/u;
 const DATABASE_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/u;
 const UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const MAX_RECOVERY_WINDOW_MILLISECONDS = 60_000;
+const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const V12_CHUNK_ID_PATTERN = /^chunk:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const SYNTHETIC_OBJECT_KEY_PATTERN =
+  /^telemetry\/v12-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const EXPECTED_MIGRATION_SHAPES = Object.freeze({
   primary: Object.freeze({ count: 46, tail: "0046_owner_journal_authority.sql" }),
   ledger: Object.freeze({ count: 6, tail: "0006_erasure_ledger_transfer_receipts.sql" }),
@@ -202,12 +207,14 @@ export function parseSyntheticV12CleanupConfig(env, attachedServiceAccountEmail)
   const rawParticipantId = env.SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID;
   const rawCreatedAtFrom = env.SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM;
   const rawCreatedAtTo = env.SYNTHETIC_V12_CLEANUP_CREATED_AT_TO;
+  const rawOrphanMarker = env.SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER;
   let participantId = null;
   let createdAtFrom = null;
   let createdAtTo = null;
+  let orphanMarker = null;
   let selectorMode;
   if (rawParticipantId !== undefined && rawParticipantId !== "") {
-    if (rawCreatedAtFrom !== undefined || rawCreatedAtTo !== undefined) {
+    if (rawCreatedAtFrom !== undefined || rawCreatedAtTo !== undefined || rawOrphanMarker !== undefined) {
       fail("SYNTHETIC_CLEANUP_SELECTOR_CONFIGURATION_INVALID");
     }
     participantId = validateParticipantId(rawParticipantId);
@@ -222,7 +229,15 @@ export function parseSyntheticV12CleanupConfig(env, attachedServiceAccountEmail)
     if (duration <= 0 || duration > MAX_RECOVERY_WINDOW_MILLISECONDS) {
       fail("SYNTHETIC_CLEANUP_RECOVERY_WINDOW_INVALID");
     }
-    selectorMode = "bounded_created_at_window";
+    if (rawOrphanMarker !== undefined) {
+      if (rawOrphanMarker !== SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER) {
+        fail("SYNTHETIC_CLEANUP_SELECTOR_CONFIGURATION_INVALID");
+      }
+      orphanMarker = SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER;
+      selectorMode = "bounded_smoke_orphan_window";
+    } else {
+      selectorMode = "bounded_created_at_window";
+    }
   }
   return Object.freeze({
     job: SYNTHETIC_V12_CLEANUP_JOB,
@@ -239,6 +254,7 @@ export function parseSyntheticV12CleanupConfig(env, attachedServiceAccountEmail)
     selectorMode,
     createdAtFrom,
     createdAtTo,
+    orphanMarker,
   });
 }
 
@@ -309,6 +325,177 @@ export async function resolveSyntheticV12CleanupParticipantId({
       return participantId;
     }, {
       operation: "postgres.synthetic_cleanup.participant_selector",
+      statementTimeoutMilliseconds: 10_000,
+      lockTimeoutMilliseconds: 5_000,
+      preserveSafeError: preserveRecoverySelectorError,
+    });
+  } catch (error) {
+    if (typeof error?.code === "string"
+        && error.code.startsWith("SYNTHETIC_CLEANUP_RECOVERY_")) throw error;
+    fail("POSTGRES_SYNTHETIC_CLEANUP_SELECTOR_READ_FAILED");
+  }
+}
+
+/**
+ * Read-only, in-process recovery discovery for a single synthetic smoke owner.
+ * The marker gates this stronger selector; the exact owner id is returned only
+ * to the caller so the existing exact-owner eraser can run without copying an
+ * identifier through Cloud Run logs or another Job.
+ */
+export async function resolveSyntheticV12CleanupSmokeOrphanParticipantId({
+  primaryPool,
+  primarySchema,
+  orphanMarker,
+  createdAtFrom,
+  createdAtTo,
+}) {
+  if (primaryPool === null || typeof primaryPool?.connect !== "function") {
+    fail("POSTGRES_SYNTHETIC_CLEANUP_SELECTOR_READ_FAILED");
+  }
+  if (orphanMarker !== SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER) {
+    fail("SYNTHETIC_CLEANUP_RECOVERY_MARKER_INVALID");
+  }
+  const from = validateRecoveryTimestamp(createdAtFrom);
+  const to = validateRecoveryTimestamp(createdAtTo);
+  const duration = Date.parse(to) - Date.parse(from);
+  if (duration <= 0 || duration > MAX_RECOVERY_WINDOW_MILLISECONDS) {
+    fail("SYNTHETIC_CLEANUP_RECOVERY_WINDOW_INVALID");
+  }
+  const schemaSql = quoteSchema(primarySchema);
+  const invalid = (code) => fail(`SYNTHETIC_CLEANUP_RECOVERY_${code}`);
+  try {
+    return await withPostgresRead(primaryPool, async (client) => {
+      // Include any synthetic-prefix row in the window, even if it has the
+      // wrong owner family or state. Such a row must make the selection fail
+      // closed rather than disappear from the ambiguity count.
+      const candidateResult = await client.query(
+        `SELECT participant.id, participant.created_at, participant.owner_kind,
+                participant.state, participant.identity_link_key
+           FROM ${schemaSql}."participants" participant
+          WHERE left(participant.id, char_length($1)) = $1
+            AND participant.created_at >= $2::timestamptz
+            AND participant.created_at < $3::timestamptz
+          ORDER BY participant.created_at, participant.id
+          LIMIT 2`,
+        [orphanMarker, from, to],
+      );
+      if (!Array.isArray(candidateResult?.rows) || candidateResult.rows.length !== 1) {
+        invalid("CANDIDATE_NOT_UNIQUE");
+      }
+      const candidate = candidateResult.rows[0];
+      let participantId;
+      try { participantId = validateParticipantId(candidate?.id); } catch {
+        invalid("CANDIDATE_INVALID");
+      }
+      const createdAt = candidate.created_at instanceof Date
+        ? candidate.created_at.toISOString()
+        : typeof candidate.created_at === "string" ? candidate.created_at : "";
+      const observed = Date.parse(createdAt);
+      if (!Number.isFinite(observed) || observed < Date.parse(from) || observed >= Date.parse(to)
+          || candidate.owner_kind !== "social" || candidate.state !== "active"
+          || candidate.identity_link_key !== null) {
+        invalid("CANDIDATE_INVALID");
+      }
+
+      const manifestsResult = await client.query(
+        `SELECT id, device_id, chunk_day::text AS chunk_day, expected_chunk_count, state
+           FROM ${schemaSql}."telemetry_v12_day_manifests"
+          WHERE participant_id = $1
+          ORDER BY id
+          LIMIT 2`,
+        [participantId],
+      );
+      if (!Array.isArray(manifestsResult?.rows) || manifestsResult.rows.length !== 1) {
+        invalid("MANIFEST_SHAPE_INVALID");
+      }
+      const manifest = manifestsResult.rows[0];
+      if (!UUID_V4_PATTERN.test(manifest?.id ?? "")
+          || !UUID_V4_PATTERN.test(manifest?.device_id ?? "")
+          || typeof manifest?.chunk_day !== "string"
+          || !/^\d{4}-\d{2}-\d{2}$/u.test(manifest.chunk_day)
+          || Number(manifest.expected_chunk_count) !== 1) {
+        invalid("MANIFEST_SHAPE_INVALID");
+      }
+
+      const chunksResult = await client.query(
+        `SELECT id, manifest_id, participant_id, device_id, stream,
+                chunk_day::text AS chunk_day, chunk_seq, r2_key
+           FROM ${schemaSql}."telemetry_v12_chunks"
+          WHERE participant_id = $1
+          ORDER BY id
+          LIMIT 2`,
+        [participantId],
+      );
+      if (!Array.isArray(chunksResult?.rows) || chunksResult.rows.length > 1) {
+        invalid("CHUNK_SHAPE_INVALID");
+      }
+      if (chunksResult.rows.length === 0) {
+        if (manifest.state !== "staged") invalid("MANIFEST_SHAPE_INVALID");
+      } else {
+        const chunk = chunksResult.rows[0];
+        if (!V12_CHUNK_ID_PATTERN.test(chunk?.id ?? "")
+            || chunk?.manifest_id !== manifest.id || chunk?.participant_id !== participantId
+            || chunk?.device_id !== manifest.device_id || chunk?.stream !== "usage"
+            || chunk?.chunk_day !== manifest.chunk_day || Number(chunk?.chunk_seq) !== 0
+            || typeof chunk?.r2_key !== "string"
+            || !SYNTHETIC_OBJECT_KEY_PATTERN.test(chunk.r2_key)
+            || manifest.state !== "ready") {
+          invalid("CHUNK_SHAPE_INVALID");
+        }
+        const pendingResult = await client.query(
+          `SELECT contribution_id, object_key, object_kind,
+                  reconciliation_state, registration_token
+             FROM ${schemaSql}."pending_objects"
+            WHERE contribution_id = $1
+            ORDER BY contribution_id
+            LIMIT 2`,
+          [chunk.id],
+        );
+        if (!Array.isArray(pendingResult?.rows) || pendingResult.rows.length !== 1) {
+          invalid("REFERENCE_SHAPE_INVALID");
+        }
+        const pending = pendingResult.rows[0];
+        if (pending?.contribution_id !== chunk.id || pending?.object_key !== chunk.r2_key
+            || pending?.object_kind !== "telemetry_v12"
+            || pending?.reconciliation_state !== "registered"
+            || typeof pending?.registration_token !== "string"
+            || !/^[0-9a-f]{32}$/u.test(pending.registration_token)) {
+          invalid("REFERENCE_SHAPE_INVALID");
+        }
+      }
+
+      const consumingResult = await client.query(
+        `SELECT count(*)::text AS row_count
+           FROM ${schemaSql}."device_upload_authorizations"
+          WHERE participant_id = $1 AND state = 'consuming'`,
+        [participantId],
+      );
+      if (!Array.isArray(consumingResult?.rows) || consumingResult.rows.length !== 1
+          || Number(consumingResult.rows[0]?.row_count) !== 0) {
+        invalid("UPLOAD_IN_PROGRESS");
+      }
+
+      // Exact-owner erasure refuses to complete when unrelated v1.2 pending
+      // objects cannot be attributed to a stored chunk. Check this before it
+      // writes its deletion fence or ledger receipt.
+      const unattributedResult = await client.query(
+        `SELECT 1 AS present
+           FROM ${schemaSql}."pending_objects" pending
+          WHERE pending.object_kind = 'telemetry_v12'
+            AND NOT EXISTS (
+              SELECT 1
+                FROM ${schemaSql}."telemetry_v12_chunks" chunk
+               WHERE chunk.id = pending.contribution_id
+                 AND chunk.r2_key = pending.object_key
+            )
+          LIMIT 1`,
+      );
+      if (!Array.isArray(unattributedResult?.rows) || unattributedResult.rows.length > 0) {
+        invalid("UNATTRIBUTED_REFERENCE_PRESENT");
+      }
+      return participantId;
+    }, {
+      operation: "postgres.synthetic_cleanup.smoke_orphan_selector",
       statementTimeoutMilliseconds: 10_000,
       lockTimeoutMilliseconds: 5_000,
       preserveSafeError: preserveRecoverySelectorError,
@@ -469,14 +656,27 @@ export async function runSyntheticV12Cleanup({ env = process.env, dependencies =
       verifyPostgres17MigrationReceipt(ledgerPool, config.ledger, "ledger", manifest.roles.ledger),
     ]);
     const eraseOwner = dependencies.eraseOwner ?? eraseSyntheticPostgresV12Owner;
-    const participantId = config.selectorMode === "explicit_participant_id"
-      ? config.participantId
-      : await (dependencies.resolveParticipantId ?? resolveSyntheticV12CleanupParticipantId)({
+    let participantId;
+    if (config.selectorMode === "explicit_participant_id") {
+      participantId = config.participantId;
+    } else if (config.selectorMode === "bounded_smoke_orphan_window") {
+      participantId = await (dependencies.resolveSmokeOrphanParticipantId
+        ?? resolveSyntheticV12CleanupSmokeOrphanParticipantId)({
+        primaryPool,
+        primarySchema: config.primary.schema,
+        orphanMarker: config.orphanMarker,
+        createdAtFrom: config.createdAtFrom,
+        createdAtTo: config.createdAtTo,
+      });
+    } else {
+      participantId = await (dependencies.resolveParticipantId
+        ?? resolveSyntheticV12CleanupParticipantId)({
         primaryPool,
         primarySchema: config.primary.schema,
         createdAtFrom: config.createdAtFrom,
         createdAtTo: config.createdAtTo,
       });
+    }
     const accessToken = await (dependencies.createAccessTokenProvider ?? createGoogleAccessTokenProvider)();
     const objectStore = await (dependencies.createObjectStore ?? (({ bucket, tokenProvider, historyProof }) =>
       new GcsErasureObjectStore(bucket, tokenProvider, globalThis.fetch, 30_000, historyProof)))({
@@ -492,7 +692,7 @@ export async function runSyntheticV12Cleanup({ env = process.env, dependencies =
       schema: { primarySchema: config.primary.schema, ledgerSchema: config.ledger.schema },
     };
     result = await eraseOwner(eraseOptions);
-    if (config.selectorMode === "bounded_created_at_window") {
+    if (config.selectorMode !== "explicit_participant_id") {
       const firstResult = result;
       if (firstResult.status === "incomplete") {
         result = await eraseOwner(eraseOptions);

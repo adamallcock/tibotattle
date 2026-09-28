@@ -36,8 +36,10 @@ const {
   parseSyntheticV12CleanupConfig,
   readAttachedSyntheticCleanupServiceAccount,
   resolveSyntheticV12CleanupParticipantId,
+  resolveSyntheticV12CleanupSmokeOrphanParticipantId,
   runSyntheticV12Cleanup,
   SYNTHETIC_V12_CLEANUP_JOB,
+  SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER,
   SYNTHETIC_V12_CLEANUP_SERVICE,
   SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT,
   SYNTHETIC_V12_CLEANUP_TARGETS,
@@ -246,6 +248,35 @@ test("bounded recovery config requires one exact UTC window no wider than one mi
     {
       SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID: PARTICIPANT_ID,
     },
+    { SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER: "synthetic-v12-smoke-other-" },
+  ]) {
+    assert.throws(() => parseSyntheticV12CleanupConfig(
+      { ...env, ...overrides }, SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT,
+    ));
+  }
+});
+
+test("smoke-orphan recovery config requires the exact marker and excludes explicit ids", () => {
+  const env = validEnv({
+    SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID: undefined,
+    SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM: "2026-09-28T02:53:30.000Z",
+    SYNTHETIC_V12_CLEANUP_CREATED_AT_TO: "2026-09-28T02:54:05.000Z",
+    SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER: SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER,
+  });
+  const parsed = parseSyntheticV12CleanupConfig(env, SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT);
+  assert.equal(parsed.participantId, null);
+  assert.equal(parsed.selectorMode, "bounded_smoke_orphan_window");
+  assert.equal(parsed.orphanMarker, SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER);
+  assert.equal(parsed.createdAtFrom, env.SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM);
+  assert.equal(parsed.createdAtTo, env.SYNTHETIC_V12_CLEANUP_CREATED_AT_TO);
+
+  for (const overrides of [
+    { SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID: PARTICIPANT_ID },
+    { SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER: "synthetic-v12-smoke-20000000-" },
+    { SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER: "" },
+    { SYNTHETIC_V12_CLEANUP_CREATED_AT_TO: undefined },
+    { SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM: "2026-09-28T02:53:00.000Z",
+      SYNTHETIC_V12_CLEANUP_CREATED_AT_TO: "2026-09-28T02:54:01.000Z" },
   ]) {
     assert.throws(() => parseSyntheticV12CleanupConfig(
       { ...env, ...overrides }, SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT,
@@ -314,6 +345,182 @@ test("bounded recovery selector accepts exactly one synthetic owner and rejects 
     createdAtTo: to,
   }), (error) => error?.code === "SYNTHETIC_CLEANUP_RECOVERY_CANDIDATE_INVALID"
     && !error.message.includes(candidateId));
+});
+
+function smokeOrphanFixture(overrides = {}) {
+  const participantId = "synthetic-v12-smoke-30000000-0000-4000-8000-000000000003";
+  const manifestId = "30000000-0000-4000-8000-000000000004";
+  const deviceId = "30000000-0000-4000-8000-000000000005";
+  const chunkId = "chunk:30000000-0000-4000-8000-000000000006";
+  const objectKey = "telemetry/v12-30000000-0000-4000-8000-000000000007";
+  return {
+    candidates: [{
+      id: participantId,
+      created_at: new Date("2026-09-28T02:53:37.000Z"),
+      owner_kind: "social",
+      state: "active",
+      identity_link_key: null,
+    }],
+    manifests: [{
+      id: manifestId,
+      device_id: deviceId,
+      chunk_day: "2026-09-24",
+      expected_chunk_count: 1,
+      state: "ready",
+    }],
+    chunks: [{
+      id: chunkId,
+      manifest_id: manifestId,
+      participant_id: participantId,
+      device_id: deviceId,
+      stream: "usage",
+      chunk_day: "2026-09-24",
+      chunk_seq: 0,
+      r2_key: objectKey,
+    }],
+    pending: [{
+      contribution_id: chunkId,
+      object_key: objectKey,
+      object_kind: "telemetry_v12",
+      reconciliation_state: "registered",
+      registration_token: "a".repeat(32),
+    }],
+    consuming: [{ row_count: "0" }],
+    unattributed: [],
+    ...overrides,
+  };
+}
+
+function smokeOrphanPool(fixture, calls = []) {
+  return {
+    async connect() {
+      return {
+        async query(sql, values) {
+          calls.push({ sql, values });
+          if (sql.includes('FROM "tibotattle_v12_a2_20260925"."participants" participant')) {
+            return { rows: fixture.candidates, rowCount: fixture.candidates.length };
+          }
+          if (sql.includes('FROM "tibotattle_v12_a2_20260925"."telemetry_v12_day_manifests"')) {
+            return { rows: fixture.manifests, rowCount: fixture.manifests.length };
+          }
+          if (sql.includes('FROM "tibotattle_v12_a2_20260925"."pending_objects" pending')) {
+            return { rows: fixture.unattributed, rowCount: fixture.unattributed.length };
+          }
+          if (sql.includes('FROM "tibotattle_v12_a2_20260925"."telemetry_v12_chunks"')) {
+            return { rows: fixture.chunks, rowCount: fixture.chunks.length };
+          }
+          if (sql.includes('FROM "tibotattle_v12_a2_20260925"."pending_objects"')) {
+            return { rows: fixture.pending, rowCount: fixture.pending.length };
+          }
+          if (sql.includes('FROM "tibotattle_v12_a2_20260925"."device_upload_authorizations"')) {
+            return { rows: fixture.consuming, rowCount: fixture.consuming.length };
+          }
+          return { rows: [], rowCount: 0 };
+        },
+        release() {},
+      };
+    },
+  };
+}
+
+test("smoke-orphan selector resolves one complete synthetic manifest, chunk, and exact pending reference read-only", async () => {
+  const fixture = smokeOrphanFixture();
+  const calls = [];
+  const candidateId = fixture.candidates[0].id;
+  const from = "2026-09-28T02:53:30.000Z";
+  const to = "2026-09-28T02:54:05.000Z";
+  assert.equal(await resolveSyntheticV12CleanupSmokeOrphanParticipantId({
+    primaryPool: smokeOrphanPool(fixture, calls),
+    primarySchema: SYNTHETIC_V12_CLEANUP_TARGETS.primary.schema,
+    orphanMarker: SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER,
+    createdAtFrom: from,
+    createdAtTo: to,
+  }), candidateId);
+  const candidateQuery = calls.find(({ sql }) => sql.includes('"participants" participant'));
+  assert.ok(candidateQuery);
+  assert.match(candidateQuery.sql, /left\(participant\.id, char_length\(\$1\)\) = \$1/u);
+  assert.match(candidateQuery.sql, /created_at >= \$2::timestamptz/u);
+  assert.match(candidateQuery.sql, /created_at < \$3::timestamptz/u);
+  assert.match(candidateQuery.sql, /ORDER BY participant\.created_at, participant\.id\s+LIMIT 2/u);
+  assert.deepEqual(candidateQuery.values, [SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER, from, to]);
+  assert.ok(calls.some(({ sql }) => sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"));
+  assert.ok(calls.some(({ sql }) => /pending_objects" pending[\s\S]*LIMIT 1/u.test(sql)));
+  assert.equal(calls.some(({ sql }) => /^\s*(?:INSERT|UPDATE|DELETE|TRUNCATE|ALTER|DROP)\b/iu.test(sql)), false);
+  assert.equal(calls.some(({ values = [] }) => values.includes(candidateId)), true);
+
+  const beforeChunk = smokeOrphanFixture({
+    manifests: [{ ...fixture.manifests[0], state: "staged" }],
+    chunks: [],
+    pending: [],
+  });
+  assert.equal(await resolveSyntheticV12CleanupSmokeOrphanParticipantId({
+    primaryPool: smokeOrphanPool(beforeChunk),
+    primarySchema: SYNTHETIC_V12_CLEANUP_TARGETS.primary.schema,
+    orphanMarker: SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER,
+    createdAtFrom: from,
+    createdAtTo: to,
+  }), beforeChunk.candidates[0].id);
+});
+
+test("smoke-orphan selector fails closed on ambiguity, stale rows, owner drift, or unsupported manifest/chunk shape", async (t) => {
+  const good = smokeOrphanFixture();
+  const participantId = good.candidates[0].id;
+  const options = {
+    primarySchema: SYNTHETIC_V12_CLEANUP_TARGETS.primary.schema,
+    orphanMarker: SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER,
+    createdAtFrom: "2026-09-28T02:53:30.000Z",
+    createdAtTo: "2026-09-28T02:54:05.000Z",
+  };
+  const cases = [
+    ["ambiguous recent synthetic owner", { candidates: [
+      ...good.candidates,
+      { ...good.candidates[0], id: "synthetic-v12-smoke-30000000-0000-4000-8000-000000000008" },
+    ] }, "SYNTHETIC_CLEANUP_RECOVERY_CANDIDATE_NOT_UNIQUE"],
+    ["row outside requested time window", { candidates: [
+      { ...good.candidates[0], created_at: new Date("2026-09-28T02:52:00.000Z") },
+    ] }, "SYNTHETIC_CLEANUP_RECOVERY_CANDIDATE_INVALID"],
+    ["non-synthetic owner family", { candidates: [
+      { ...good.candidates[0], owner_kind: "accountless" },
+    ] }, "SYNTHETIC_CLEANUP_RECOVERY_CANDIDATE_INVALID"],
+    ["inactive owner", { candidates: [{ ...good.candidates[0], state: "deleting" }] },
+      "SYNTHETIC_CLEANUP_RECOVERY_CANDIDATE_INVALID"],
+    ["linked owner", { candidates: [{ ...good.candidates[0], identity_link_key: "linked" }] },
+      "SYNTHETIC_CLEANUP_RECOVERY_CANDIDATE_INVALID"],
+    ["extra manifest", { manifests: [
+      ...good.manifests,
+      { ...good.manifests[0], id: "30000000-0000-4000-8000-000000000009" },
+    ] }, "SYNTHETIC_CLEANUP_RECOVERY_MANIFEST_SHAPE_INVALID"],
+    ["wrong expected chunk count", { manifests: [{ ...good.manifests[0], expected_chunk_count: 2 }] },
+      "SYNTHETIC_CLEANUP_RECOVERY_MANIFEST_SHAPE_INVALID"],
+    ["chunk does not belong to the selected manifest", { chunks: [
+      { ...good.chunks[0], manifest_id: "30000000-0000-4000-8000-000000000010" },
+    ] }, "SYNTHETIC_CLEANUP_RECOVERY_CHUNK_SHAPE_INVALID"],
+    ["extra chunk", { chunks: [
+      ...good.chunks,
+      { ...good.chunks[0], id: "chunk:30000000-0000-4000-8000-000000000011" },
+    ] }, "SYNTHETIC_CLEANUP_RECOVERY_CHUNK_SHAPE_INVALID"],
+    ["manifest is not ready after its chunk", { manifests: [{ ...good.manifests[0], state: "staged" }] },
+      "SYNTHETIC_CLEANUP_RECOVERY_CHUNK_SHAPE_INVALID"],
+    ["pending object key mismatch", { pending: [{
+      ...good.pending[0], object_key: "telemetry/v12-30000000-0000-4000-8000-000000000012",
+    }] }, "SYNTHETIC_CLEANUP_RECOVERY_REFERENCE_SHAPE_INVALID"],
+    ["pending object state mismatch", { pending: [{ ...good.pending[0], reconciliation_state: "deleting" }] },
+      "SYNTHETIC_CLEANUP_RECOVERY_REFERENCE_SHAPE_INVALID"],
+    ["missing pending object", { pending: [] }, "SYNTHETIC_CLEANUP_RECOVERY_REFERENCE_SHAPE_INVALID"],
+    ["unrelated unattributed pending reference", { unattributed: [{ present: 1 }] },
+      "SYNTHETIC_CLEANUP_RECOVERY_UNATTRIBUTED_REFERENCE_PRESENT"],
+    ["active upload authorization", { consuming: [{ row_count: "1" }] },
+      "SYNTHETIC_CLEANUP_RECOVERY_UPLOAD_IN_PROGRESS"],
+  ];
+  for (const [name, overrides, code] of cases) {
+    await t.test(name, async () => {
+      const fixture = smokeOrphanFixture(overrides);
+      await assert.rejects(resolveSyntheticV12CleanupSmokeOrphanParticipantId({
+        ...options,
+        primaryPool: smokeOrphanPool(fixture),
+      }), (error) => error?.code === code && !error.message.includes(participantId));
+    });
+  }
 });
 
 test("Cloud Run metadata identity is checked without logging its value", async () => {
@@ -465,6 +672,109 @@ test("bounded recovery keeps the resolved owner in memory and replays exact eras
   assert.equal(JSON.stringify(result).includes("synthetic-token"), false);
 });
 
+test("smoke-orphan recovery resolves in-memory before GCS setup, erases exact owner, then replays", async () => {
+  const manifest = fakeManifest();
+  const primaryPool = migrationPool("primary", manifest.roles.primary);
+  const ledgerPool = migrationPool("ledger", manifest.roles.ledger);
+  const candidateId = "synthetic-v12-smoke-30000000-0000-4000-8000-000000000013";
+  const env = validEnv({
+    SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID: undefined,
+    SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM: "2026-09-28T02:53:30.000Z",
+    SYNTHETIC_V12_CLEANUP_CREATED_AT_TO: "2026-09-28T02:54:05.000Z",
+    SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER: SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER,
+  });
+  let eraseCalls = 0;
+  const setupOrder = [];
+  const result = await runSyntheticV12Cleanup({
+    env,
+    dependencies: {
+      async readServiceAccountEmail() { return SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT; },
+      buildManifest: async () => manifest,
+      createConnector() { return { marker: "connector" }; },
+      async createPool(options) {
+        return options.instanceConnectionName === SYNTHETIC_V12_CLEANUP_TARGETS.primary.instanceConnectionName
+          ? primaryPool : ledgerPool;
+      },
+      async resolveSmokeOrphanParticipantId(options) {
+        setupOrder.push("resolved");
+        assert.equal(options.primaryPool, primaryPool);
+        assert.equal(options.primarySchema, SYNTHETIC_V12_CLEANUP_TARGETS.primary.schema);
+        assert.equal(options.orphanMarker, SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER);
+        assert.equal(options.createdAtFrom, env.SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM);
+        assert.equal(options.createdAtTo, env.SYNTHETIC_V12_CLEANUP_CREATED_AT_TO);
+        return candidateId;
+      },
+      async createAccessTokenProvider() {
+        setupOrder.push("token-provider");
+        return async () => "synthetic-token";
+      },
+      createObjectStore() {
+        setupOrder.push("object-store");
+        return { async deleteBatch() {} };
+      },
+      async eraseOwner(options) {
+        setupOrder.push("erase");
+        eraseCalls += 1;
+        assert.equal(options.participantId, candidateId);
+        return eraseCalls === 1
+          ? { status: "complete", objectsDeleted: 1 }
+          : { status: "already_complete", objectsDeleted: 1 };
+      },
+      async closeResources({ pools }) { assert.equal(pools.length, 2); },
+    },
+  });
+  assert.deepEqual(setupOrder, ["resolved", "token-provider", "object-store", "erase", "erase"]);
+  assert.deepEqual(result, {
+    status: "complete",
+    objectsDeleted: 1,
+    attempts: 2,
+    replayStatus: "already_complete",
+  });
+  assert.equal(JSON.stringify(result).includes(candidateId), false);
+  assert.equal(JSON.stringify(result).includes("synthetic-token"), false);
+});
+
+test("smoke-orphan rejection happens before GCS or exact-owner erasure", async () => {
+  const manifest = fakeManifest();
+  const primaryPool = migrationPool("primary", manifest.roles.primary);
+  const ledgerPool = migrationPool("ledger", manifest.roles.ledger);
+  const env = validEnv({
+    SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID: undefined,
+    SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM: "2026-09-28T02:53:30.000Z",
+    SYNTHETIC_V12_CLEANUP_CREATED_AT_TO: "2026-09-28T02:54:05.000Z",
+    SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER: SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER,
+  });
+  let accessTokenCalls = 0;
+  let objectStoreCalls = 0;
+  let eraseCalls = 0;
+  let closed = false;
+  await assert.rejects(runSyntheticV12Cleanup({
+    env,
+    dependencies: {
+      async readServiceAccountEmail() { return SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT; },
+      buildManifest: async () => manifest,
+      createConnector() { return {}; },
+      async createPool(options) {
+        return options.instanceConnectionName === SYNTHETIC_V12_CLEANUP_TARGETS.primary.instanceConnectionName
+          ? primaryPool : ledgerPool;
+      },
+      async resolveSmokeOrphanParticipantId() {
+        throw Object.assign(new Error("SYNTHETIC_CLEANUP_RECOVERY_CANDIDATE_NOT_UNIQUE"), {
+          code: "SYNTHETIC_CLEANUP_RECOVERY_CANDIDATE_NOT_UNIQUE",
+        });
+      },
+      async createAccessTokenProvider() { accessTokenCalls += 1; return async () => "synthetic-token"; },
+      createObjectStore() { objectStoreCalls += 1; return { async deleteBatch() {} }; },
+      async eraseOwner() { eraseCalls += 1; return { status: "complete", objectsDeleted: 0 }; },
+      async closeResources() { closed = true; },
+    },
+  }), (error) => error?.code === "SYNTHETIC_CLEANUP_RECOVERY_CANDIDATE_NOT_UNIQUE");
+  assert.equal(accessTokenCalls, 0);
+  assert.equal(objectStoreCalls, 0);
+  assert.equal(eraseCalls, 0);
+  assert.equal(closed, true);
+});
+
 async function localPostgresEndpoint() {
   assert.ok(!PG_TEST_HOST || ["localhost", "127.0.0.1", "::1"].includes(PG_TEST_HOST),
     "local cleanup checks require loopback PostgreSQL or a private Unix socket");
@@ -578,7 +888,7 @@ async function seedOwner(pool, schema, {
     if (withChunk) {
       const grantId = randomUUID();
       const contributionId = `chunk:${randomUUID()}`;
-      objectKey = `telemetry/v12/test/${randomUUID()}`;
+      objectKey = `telemetry/v12-${randomUUID()}`;
       const digest = randomBytes(32).toString("hex");
       await pool.query(
         `INSERT INTO ${qualified(schema, "device_upload_authorizations")} (
@@ -1184,7 +1494,7 @@ test("PG17 cleanup erases a bridged smoke owner whose v1.2 receipt reuses the se
   }
 });
 
-test("PG17 recovery selector resolves only a staged, zero-chunk synthetic owner in its exact window", {
+test("PG17 recovery selectors resolve staged and ready synthetic owners in their exact windows", {
   skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
   timeout: 180_000,
 }, async () => {
@@ -1223,12 +1533,90 @@ test("PG17 recovery selector resolves only a staged, zero-chunk synthetic owner 
       createdAtTo: new Date(createdAt + 1).toISOString(),
     });
     assert.equal(resolved, fixture.participantId);
+    const smokeOrphanResolved = await resolveSyntheticV12CleanupSmokeOrphanParticipantId({
+      primaryPool: pool,
+      primarySchema,
+      orphanMarker: SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER,
+      createdAtFrom: new Date(createdAt - 1).toISOString(),
+      createdAtTo: new Date(createdAt + 1).toISOString(),
+    });
+    assert.equal(smokeOrphanResolved, fixture.participantId);
     const chunks = await pool.query(
       `SELECT count(*)::int AS count FROM ${qualified(primarySchema, "telemetry_v12_chunks")}
         WHERE participant_id=$1`,
       [resolved],
     );
     assert.equal(chunks.rows[0]?.count, 0);
+
+    // Remove this staged-only test owner before creating the one-chunk case so
+    // the marker/window selector has exactly one possible target.
+    const removedPartial = await pool.query(
+      `DELETE FROM ${qualified(primarySchema, "participants")} WHERE id=$1`,
+      [fixture.participantId],
+    );
+    assert.equal(removedPartial.rowCount, 1);
+
+    const completedFixture = await seedOwner(pool, primarySchema, {
+      withChunk: true,
+      withCredentialRotation: false,
+    });
+    const completedManifest = await pool.query(
+      `SELECT id, manifest_json FROM ${qualified(primarySchema, "telemetry_v12_day_manifests")}
+        WHERE participant_id=$1`,
+      [completedFixture.participantId],
+    );
+    const completedChunk = await pool.query(
+      `SELECT id, manifest_id, chunk_id, chunk_digest, record_count, stream
+         FROM ${qualified(primarySchema, "telemetry_v12_chunks")}
+        WHERE participant_id=$1`,
+      [completedFixture.participantId],
+    );
+    assert.equal(completedManifest.rows.length, 1);
+    assert.equal(completedChunk.rows.length, 1);
+    const readyDocument = JSON.parse(completedManifest.rows[0].manifest_json);
+    readyDocument.chunks = [{
+      chunkId: completedChunk.rows[0].chunk_id,
+      chunkDigest: completedChunk.rows[0].chunk_digest,
+      recordCount: Number(completedChunk.rows[0].record_count),
+    }];
+    await pool.query(
+      `UPDATE ${qualified(primarySchema, "telemetry_v12_day_manifests")}
+          SET manifest_json=$2 WHERE id=$1`,
+      [completedManifest.rows[0].id, JSON.stringify(readyDocument)],
+    );
+    // The PG17 integrity trigger permits ready only when the declared chunk
+    // and its record representation are both complete.
+    await pool.query(
+      `INSERT INTO ${qualified(primarySchema, "telemetry_v12_records")} (
+         chunk_id, manifest_id, stream, occurrence_id, observed_at, record_json
+       ) VALUES ($1,$2,$3,'synthetic-smoke-record',clock_timestamp(),'{}')`,
+      [completedChunk.rows[0].id, completedChunk.rows[0].manifest_id, completedChunk.rows[0].stream],
+    );
+    await pool.query(
+      `UPDATE ${qualified(primarySchema, "telemetry_v12_day_manifests")}
+          SET state='ready', ready_at=clock_timestamp() WHERE id=$1`,
+      [completedManifest.rows[0].id],
+    );
+    const readyOwnerTime = await pool.query(
+      `SELECT created_at FROM ${qualified(primarySchema, "participants")} WHERE id=$1`,
+      [completedFixture.participantId],
+    );
+    assert.equal(readyOwnerTime.rows.length, 1);
+    const readyCreatedAt = new Date(readyOwnerTime.rows[0].created_at).getTime();
+    const readyResolved = await resolveSyntheticV12CleanupSmokeOrphanParticipantId({
+      primaryPool: pool,
+      primarySchema,
+      orphanMarker: SYNTHETIC_V12_CLEANUP_ORPHAN_MARKER,
+      createdAtFrom: new Date(readyCreatedAt - 1).toISOString(),
+      createdAtTo: new Date(readyCreatedAt + 1).toISOString(),
+    });
+    assert.equal(readyResolved, completedFixture.participantId);
+    const stillActive = await pool.query(
+      `SELECT state FROM ${qualified(primarySchema, "participants")} WHERE id=$1`,
+      [completedFixture.participantId],
+    );
+    assert.equal(stillActive.rows[0]?.state, "active",
+      "the recovery selector must inspect the ready chunk without mutating its owner");
   } finally {
     try { await pool.query(`DROP SCHEMA IF EXISTS "${primarySchema}" CASCADE`); } catch {}
     await pool.end();
