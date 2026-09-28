@@ -35,6 +35,7 @@ await build({
 const {
   parseSyntheticV12CleanupConfig,
   readAttachedSyntheticCleanupServiceAccount,
+  resolveSyntheticV12CleanupParticipantId,
   runSyntheticV12Cleanup,
   SYNTHETIC_V12_CLEANUP_JOB,
   SYNTHETIC_V12_CLEANUP_SERVICE,
@@ -172,6 +173,7 @@ test("cleanup config requires a provisioned test bucket receipt and pins the one
   assert.equal(parsed.origin, SYNTHETIC_V12_CLEANUP_TARGETS.origin);
   assert.equal(parsed.bucket, CLEANUP_BUCKET);
   assert.equal(parsed.participantId, PARTICIPANT_ID);
+  assert.equal(parsed.selectorMode, "explicit_participant_id");
   for (const overrides of [
     { CLOUD_RUN_TASK_INDEX: "1" },
     { CLOUD_RUN_TASK_COUNT: "2" },
@@ -215,6 +217,103 @@ test("cleanup config requires a provisioned test bucket receipt and pins the one
   }, SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT));
   assert.throws(() => parseSyntheticV12CleanupConfig(env, "another@tibotattle.iam.gserviceaccount.com"));
   assert.throws(() => parseSyntheticV12CleanupConfig(env, SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT + ".evil"));
+});
+
+test("bounded recovery config requires one exact UTC window no wider than one minute", () => {
+  const env = validEnv();
+  delete env.SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID;
+  env.SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM = "2026-09-28T02:53:30.000Z";
+  env.SYNTHETIC_V12_CLEANUP_CREATED_AT_TO = "2026-09-28T02:54:05.000Z";
+  const parsed = parseSyntheticV12CleanupConfig(env, SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT);
+  assert.equal(parsed.participantId, null);
+  assert.equal(parsed.selectorMode, "bounded_created_at_window");
+  assert.equal(parsed.createdAtFrom, env.SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM);
+  assert.equal(parsed.createdAtTo, env.SYNTHETIC_V12_CLEANUP_CREATED_AT_TO);
+
+  for (const overrides of [
+    { SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM: undefined },
+    { SYNTHETIC_V12_CLEANUP_CREATED_AT_TO: undefined },
+    { SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM: "2026-09-28 02:53:30Z" },
+    { SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM: "2026-02-30T02:53:30.000Z" },
+    {
+      SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM: "2026-09-28T02:53:00.000Z",
+      SYNTHETIC_V12_CLEANUP_CREATED_AT_TO: "2026-09-28T02:54:01.000Z",
+    },
+    {
+      SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM: "2026-09-28T02:54:05.000Z",
+      SYNTHETIC_V12_CLEANUP_CREATED_AT_TO: "2026-09-28T02:53:30.000Z",
+    },
+    {
+      SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID: PARTICIPANT_ID,
+    },
+  ]) {
+    assert.throws(() => parseSyntheticV12CleanupConfig(
+      { ...env, ...overrides }, SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT,
+    ));
+  }
+});
+
+test("bounded recovery selector accepts exactly one synthetic owner and rejects zero or ambiguous matches", async () => {
+  const candidateId = "synthetic-v12-smoke-20000000-0000-4000-8000-000000000002";
+  const from = "2026-09-28T02:53:30.000Z";
+  const to = "2026-09-28T02:54:05.000Z";
+  const calls = [];
+  let rows = [{ id: candidateId, created_at: new Date("2026-09-28T02:53:37.000Z") }];
+  const pool = {
+    async connect() {
+      return {
+        async query(sql, values) {
+          calls.push({ sql, values });
+          return sql.includes('FROM "tibotattle_v12_a2_20260925"."participants"')
+            ? { rows, rowCount: rows.length } : { rows: [], rowCount: 0 };
+        },
+        release() {},
+      };
+    },
+  };
+  assert.equal(await resolveSyntheticV12CleanupParticipantId({
+    primaryPool: pool,
+    primarySchema: SYNTHETIC_V12_CLEANUP_TARGETS.primary.schema,
+    createdAtFrom: from,
+    createdAtTo: to,
+  }), candidateId);
+  const selection = calls.find(({ sql }) => sql.includes('FROM "tibotattle_v12_a2_20260925"."participants"'));
+  assert.ok(selection);
+  assert.match(selection.sql, /ORDER BY participant\.created_at, participant\.id\s+LIMIT 2/u);
+  assert.match(selection.sql, /owner_kind = 'social'/u);
+  assert.match(selection.sql, /state = 'active'/u);
+  assert.match(selection.sql, /identity_link_key IS NULL/u);
+  assert.match(selection.sql, /manifest\.state = 'staged'/u);
+  assert.match(selection.sql, /manifest\.expected_chunk_count = 1/u);
+  assert.match(selection.sql, /NOT EXISTS \([\s\S]*telemetry_v12_chunks/u);
+  assert.deepEqual(selection.values, ["synthetic-v12-smoke-%", from, to]);
+
+  rows = [];
+  await assert.rejects(resolveSyntheticV12CleanupParticipantId({
+    primaryPool: pool,
+    primarySchema: SYNTHETIC_V12_CLEANUP_TARGETS.primary.schema,
+    createdAtFrom: from,
+    createdAtTo: to,
+  }), (error) => error?.code === "SYNTHETIC_CLEANUP_RECOVERY_CANDIDATE_NOT_UNIQUE");
+  rows = [
+    { id: candidateId, created_at: new Date("2026-09-28T02:53:37.000Z") },
+    { id: "synthetic-v12-smoke-20000000-0000-4000-8000-000000000003",
+      created_at: new Date("2026-09-28T02:53:38.000Z") },
+  ];
+  await assert.rejects(resolveSyntheticV12CleanupParticipantId({
+    primaryPool: pool,
+    primarySchema: SYNTHETIC_V12_CLEANUP_TARGETS.primary.schema,
+    createdAtFrom: from,
+    createdAtTo: to,
+  }), (error) => error?.code === "SYNTHETIC_CLEANUP_RECOVERY_CANDIDATE_NOT_UNIQUE");
+  rows = [{ id: "synthetic-v12-smoke-not-a-uuid", created_at: new Date("2026-09-28T02:53:37.000Z") }];
+  await assert.rejects(resolveSyntheticV12CleanupParticipantId({
+    primaryPool: pool,
+    primarySchema: SYNTHETIC_V12_CLEANUP_TARGETS.primary.schema,
+    createdAtFrom: from,
+    createdAtTo: to,
+  }), (error) => error?.code === "SYNTHETIC_CLEANUP_RECOVERY_CANDIDATE_INVALID"
+    && !error.message.includes(candidateId));
 });
 
 test("Cloud Run metadata identity is checked without logging its value", async () => {
@@ -303,6 +402,69 @@ test("injected cleanup execution verifies both PG receipts and returns a redacte
   assert.equal(JSON.stringify(result).includes("synthetic-token"), false);
 });
 
+test("bounded recovery keeps the resolved owner in memory and replays exact erasure idempotently", async () => {
+  const manifest = fakeManifest();
+  const primaryPool = migrationPool("primary", manifest.roles.primary);
+  const ledgerPool = migrationPool("ledger", manifest.roles.ledger);
+  const candidateId = "synthetic-v12-smoke-20000000-0000-4000-8000-000000000004";
+  const env = validEnv({
+    SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID: undefined,
+    SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM: "2026-09-28T02:53:30.000Z",
+    SYNTHETIC_V12_CLEANUP_CREATED_AT_TO: "2026-09-28T02:54:05.000Z",
+  });
+  let eraseCalls = 0;
+  let resolved = false;
+  const setupOrder = [];
+  const result = await runSyntheticV12Cleanup({
+    env,
+    dependencies: {
+      async readServiceAccountEmail() { return SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT; },
+      buildManifest: async () => manifest,
+      createConnector() { return { marker: "connector" }; },
+      async createPool(options) {
+        return options.instanceConnectionName === SYNTHETIC_V12_CLEANUP_TARGETS.primary.instanceConnectionName
+          ? primaryPool : ledgerPool;
+      },
+      async resolveParticipantId(options) {
+        resolved = true;
+        setupOrder.push("resolved");
+        assert.equal(options.primaryPool, primaryPool);
+        assert.equal(options.primarySchema, SYNTHETIC_V12_CLEANUP_TARGETS.primary.schema);
+        assert.equal(options.createdAtFrom, env.SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM);
+        assert.equal(options.createdAtTo, env.SYNTHETIC_V12_CLEANUP_CREATED_AT_TO);
+        return candidateId;
+      },
+      async createAccessTokenProvider() {
+        setupOrder.push("token-provider");
+        return async () => "synthetic-token";
+      },
+      createObjectStore() {
+        setupOrder.push("object-store");
+        return { async deleteBatch() {} };
+      },
+      async eraseOwner(options) {
+        eraseCalls += 1;
+        assert.equal(options.participantId, candidateId);
+        return eraseCalls === 1
+          ? { status: "complete", objectsDeleted: 0 }
+          : { status: "already_complete", objectsDeleted: 0 };
+      },
+      async closeResources({ pools }) { assert.equal(pools.length, 2); },
+    },
+  });
+  assert.equal(resolved, true);
+  assert.deepEqual(setupOrder, ["resolved", "token-provider", "object-store"]);
+  assert.equal(eraseCalls, 2);
+  assert.deepEqual(result, {
+    status: "complete",
+    objectsDeleted: 0,
+    attempts: 2,
+    replayStatus: "already_complete",
+  });
+  assert.equal(JSON.stringify(result).includes(candidateId), false);
+  assert.equal(JSON.stringify(result).includes("synthetic-token"), false);
+});
+
 async function localPostgresEndpoint() {
   assert.ok(!PG_TEST_HOST || ["localhost", "127.0.0.1", "::1"].includes(PG_TEST_HOST),
     "local cleanup checks require loopback PostgreSQL or a private Unix socket");
@@ -329,7 +491,7 @@ function qualified(schema, name) {
   return `"${schema}"."${name}"`;
 }
 
-async function seedOwner(pool, schema, { withChunk = false } = {}) {
+async function seedOwner(pool, schema, { withChunk = false, withStagedManifest = false } = {}) {
   const participantId = `synthetic-v12-smoke-${randomUUID()}`;
   const sessionId = randomUUID();
   const pairingId = randomUUID();
@@ -395,20 +557,9 @@ async function seedOwner(pool, schema, { withChunk = false } = {}) {
   );
 
   let objectKey = null;
-  if (withChunk) {
+  if (withChunk || withStagedManifest) {
     const manifestId = randomUUID();
-    const grantId = randomUUID();
-    const contributionId = `chunk:${randomUUID()}`;
-    objectKey = `telemetry/v12/test/${randomUUID()}`;
     const day = "2026-09-24";
-    const digest = randomBytes(32).toString("hex");
-    await pool.query(
-      `INSERT INTO ${qualified(schema, "device_upload_authorizations")} (
-         id, participant_id, issued_by_device_id, secret_hash, envelope_digest, body_bytes,
-         content_type, state, issued_at, expires_at, consumed_at, consumed_contribution_id
-       ) VALUES ($1, $2, $3, $4, $5, 1, 'application/json', 'consumed', $6, $7, $6, $8)`,
-      [grantId, participantId, deviceId, randomBytes(32), digest, now, later, contributionId],
-    );
     await pool.query(
       `INSERT INTO ${qualified(schema, "telemetry_v12_day_manifests")} (
          id, participant_id, device_id, chunk_day, manifest_digest, parser_version,
@@ -417,21 +568,34 @@ async function seedOwner(pool, schema, { withChunk = false } = {}) {
       [manifestId, participantId, deviceId, day, randomBytes(32).toString("hex"),
         JSON.stringify({ day, chunks: [] }), now],
     );
-    await pool.query(
-      `INSERT INTO ${qualified(schema, "pending_objects")} (contribution_id, object_key, object_kind)
-       VALUES ($1, $2, 'telemetry_v12')`,
-      [contributionId, objectKey],
-    );
-    await pool.query(
-      `INSERT INTO ${qualified(schema, "telemetry_v12_chunks")} (
-         id, manifest_id, participant_id, device_id, stream, chunk_day, chunk_seq,
-         chunk_id, chunk_digest, envelope_digest, parser_version, record_count,
-         r2_key, device_upload_authorization_id, created_at
-       ) VALUES ($1, $2, $3, $4, 'usage', $5::date, 0, $6, $7, $8,
-         'v1.2-test', 1, $9, $10, $11)`,
-      [contributionId, manifestId, participantId, deviceId, day, randomUUID(), digest,
-        digest, objectKey, grantId, now],
-    );
+    if (withChunk) {
+      const grantId = randomUUID();
+      const contributionId = `chunk:${randomUUID()}`;
+      objectKey = `telemetry/v12/test/${randomUUID()}`;
+      const digest = randomBytes(32).toString("hex");
+      await pool.query(
+        `INSERT INTO ${qualified(schema, "device_upload_authorizations")} (
+           id, participant_id, issued_by_device_id, secret_hash, envelope_digest, body_bytes,
+           content_type, state, issued_at, expires_at, consumed_at, consumed_contribution_id
+         ) VALUES ($1, $2, $3, $4, $5, 1, 'application/json', 'consumed', $6, $7, $6, $8)`,
+        [grantId, participantId, deviceId, randomBytes(32), digest, now, later, contributionId],
+      );
+      await pool.query(
+        `INSERT INTO ${qualified(schema, "pending_objects")} (contribution_id, object_key, object_kind)
+         VALUES ($1, $2, 'telemetry_v12')`,
+        [contributionId, objectKey],
+      );
+      await pool.query(
+        `INSERT INTO ${qualified(schema, "telemetry_v12_chunks")} (
+           id, manifest_id, participant_id, device_id, stream, chunk_day, chunk_seq,
+           chunk_id, chunk_digest, envelope_digest, parser_version, record_count,
+           r2_key, device_upload_authorization_id, created_at
+         ) VALUES ($1, $2, $3, $4, 'usage', $5::date, 0, $6, $7, $8,
+           'v1.2-test', 1, $9, $10, $11)`,
+        [contributionId, manifestId, participantId, deviceId, day, randomUUID(), digest,
+          digest, objectKey, grantId, now],
+      );
+    }
   }
   return { participantId, deviceId, ownerDigest, objectKey };
 }
@@ -747,6 +911,46 @@ test("PG17 owner-erasure fixture fences one exact owner, retries an object failu
       "archived owner refusal happens before fencing or archive cascade");
     assert.equal(deletes.length, 2,
       "historical object keys are not silently omitted from object erasure");
+
+    const partialFixture = await seedOwner(primaryPool, primarySchema, { withStagedManifest: true });
+    const partialShape = await primaryPool.query(
+      `SELECT
+         (SELECT count(*)::int FROM ${qualified(primarySchema, "telemetry_v12_day_manifests")}
+           WHERE participant_id=$1 AND state='staged' AND expected_chunk_count=1) AS staged_manifest_count,
+         (SELECT count(*)::int FROM ${qualified(primarySchema, "telemetry_v12_chunks")}
+           WHERE participant_id=$1) AS chunk_count,
+         (SELECT count(*)::int FROM ${qualified(primarySchema, "pending_objects")}
+           WHERE object_kind='telemetry_v12') AS pending_object_count`,
+      [partialFixture.participantId],
+    );
+    assert.deepEqual(partialShape.rows[0], {
+      staged_manifest_count: 1,
+      chunk_count: 0,
+      pending_object_count: 0,
+    }, "the pre-chunk recovery fixture must have one staged manifest and no object refs");
+    const emptyDeletes = [];
+    const partialOptions = {
+      ...options,
+      participantId: partialFixture.participantId,
+      objectStore: {
+        async deleteBatch(refs) {
+          emptyDeletes.push(refs);
+          assert.deepEqual(refs, [], "partial manifest cleanup must never invent a storage key");
+        },
+      },
+    };
+    const partialCleanup = await eraseSyntheticPostgresV12Owner(partialOptions);
+    assert.deepEqual(partialCleanup, { status: "complete", objectsDeleted: 0 });
+    assert.equal(emptyDeletes.length, 1,
+      "empty exact-reference deletion is a valid idempotent store operation");
+    const partialOwner = await primaryPool.query(
+      `SELECT id FROM ${qualified(primarySchema, "participants")} WHERE id=$1`,
+      [partialFixture.participantId],
+    );
+    assert.equal(partialOwner.rows.length, 0);
+    const partialReplay = await eraseSyntheticPostgresV12Owner(partialOptions);
+    assert.deepEqual(partialReplay, { status: "already_complete", objectsDeleted: 0 });
+    assert.equal(emptyDeletes.length, 1, "an exact replay must not invoke storage deletion twice");
   } finally {
     for (const schema of createdSchemas.reverse()) {
       try { await primaryPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); } catch {}
@@ -950,5 +1154,53 @@ test("PG17 cleanup erases a bridged smoke owner whose v1.2 receipt reuses the se
     }
     await rm(temporary, { recursive: true, force: true });
     await Promise.all([primaryPool.end(), ledgerPool.end()]);
+  }
+});
+
+test("PG17 recovery selector resolves only a staged, zero-chunk synthetic owner in its exact window", {
+  skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  const endpoint = await localPostgresEndpoint();
+  const suffix = randomBytes(5).toString("hex");
+  const primarySchema = `cleanup_recovery_${suffix}`;
+  const pool = new pg.Pool({
+    host: endpoint.host,
+    port: endpoint.port,
+    user: PG_TEST_USER,
+    ...(PG_TEST_PASSWORD === undefined ? { password: "synthetic-local-only" } : { password: PG_TEST_PASSWORD }),
+    database: PG_TEST_DATABASE,
+    ssl: false,
+    max: 2,
+    connectionTimeoutMillis: 3_000,
+  });
+  try {
+    const server = await pool.query("SELECT current_setting('server_version_num')::integer AS version");
+    assert.equal(Math.floor(server.rows[0].version / 10_000), 17);
+    await pool.query(`CREATE SCHEMA "${primarySchema}"`);
+    await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool });
+    const fixture = await seedOwner(pool, primarySchema, { withStagedManifest: true });
+    const row = await pool.query(
+      `SELECT created_at FROM ${qualified(primarySchema, "participants")} WHERE id=$1`,
+      [fixture.participantId],
+    );
+    assert.equal(row.rows.length, 1);
+    const createdAt = new Date(row.rows[0].created_at).getTime();
+    const resolved = await resolveSyntheticV12CleanupParticipantId({
+      primaryPool: pool,
+      primarySchema,
+      createdAtFrom: new Date(createdAt - 1).toISOString(),
+      createdAtTo: new Date(createdAt + 1).toISOString(),
+    });
+    assert.equal(resolved, fixture.participantId);
+    const chunks = await pool.query(
+      `SELECT count(*)::int AS count FROM ${qualified(primarySchema, "telemetry_v12_chunks")}
+        WHERE participant_id=$1`,
+      [resolved],
+    );
+    assert.equal(chunks.rows[0]?.count, 0);
+  } finally {
+    try { await pool.query(`DROP SCHEMA IF EXISTS "${primarySchema}" CASCADE`); } catch {}
+    await pool.end();
   }
 });

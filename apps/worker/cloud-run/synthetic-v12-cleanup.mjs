@@ -39,6 +39,8 @@ const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const SCHEMA_PATTERN = /^[a-z_][a-z0-9_]{0,62}$/u;
 const INSTANCE_PATTERN = /^[A-Za-z0-9_.:-]{1,200}$/u;
 const DATABASE_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/u;
+const UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
+const MAX_RECOVERY_WINDOW_MILLISECONDS = 60_000;
 const EXPECTED_MIGRATION_SHAPES = Object.freeze({
   primary: Object.freeze({ count: 46, tail: "0046_owner_journal_authority.sql" }),
   ledger: Object.freeze({ count: 6, tail: "0006_erasure_ledger_transfer_receipts.sql" }),
@@ -64,6 +66,24 @@ function validateParticipantId(value) {
     fail("SYNTHETIC_CLEANUP_PARTICIPANT_INVALID");
   }
   return value;
+}
+
+function validateRecoveryTimestamp(value) {
+  if (typeof value !== "string" || !UTC_TIMESTAMP_PATTERN.test(value)) {
+    fail("SYNTHETIC_CLEANUP_RECOVERY_WINDOW_INVALID");
+  }
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== value) {
+    fail("SYNTHETIC_CLEANUP_RECOVERY_WINDOW_INVALID");
+  }
+  return value;
+}
+
+function preserveRecoverySelectorError(error) {
+  return typeof error?.code === "string"
+      && error.code.startsWith("SYNTHETIC_CLEANUP_RECOVERY_")
+    ? error
+    : null;
 }
 
 function record(value) {
@@ -179,7 +199,31 @@ export function parseSyntheticV12CleanupConfig(env, attachedServiceAccountEmail)
     fail("GCS_SYNTHETIC_CLEANUP_BUCKET_INVALID");
   }
   const historyProof = validateBucketProof(env.GCS_ERASURE_BUCKET_HISTORY_PROOF, env.GCS_BUCKET_NAME);
-  const participantId = validateParticipantId(env.SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID);
+  const rawParticipantId = env.SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID;
+  const rawCreatedAtFrom = env.SYNTHETIC_V12_CLEANUP_CREATED_AT_FROM;
+  const rawCreatedAtTo = env.SYNTHETIC_V12_CLEANUP_CREATED_AT_TO;
+  let participantId = null;
+  let createdAtFrom = null;
+  let createdAtTo = null;
+  let selectorMode;
+  if (rawParticipantId !== undefined && rawParticipantId !== "") {
+    if (rawCreatedAtFrom !== undefined || rawCreatedAtTo !== undefined) {
+      fail("SYNTHETIC_CLEANUP_SELECTOR_CONFIGURATION_INVALID");
+    }
+    participantId = validateParticipantId(rawParticipantId);
+    selectorMode = "explicit_participant_id";
+  } else {
+    if (rawCreatedAtFrom === undefined || rawCreatedAtTo === undefined) {
+      fail("SYNTHETIC_CLEANUP_SELECTOR_CONFIGURATION_INVALID");
+    }
+    createdAtFrom = validateRecoveryTimestamp(rawCreatedAtFrom);
+    createdAtTo = validateRecoveryTimestamp(rawCreatedAtTo);
+    const duration = Date.parse(createdAtTo) - Date.parse(createdAtFrom);
+    if (duration <= 0 || duration > MAX_RECOVERY_WINDOW_MILLISECONDS) {
+      fail("SYNTHETIC_CLEANUP_RECOVERY_WINDOW_INVALID");
+    }
+    selectorMode = "bounded_created_at_window";
+  }
   return Object.freeze({
     job: SYNTHETIC_V12_CLEANUP_JOB,
     execution: env.CLOUD_RUN_EXECUTION,
@@ -192,7 +236,88 @@ export function parseSyntheticV12CleanupConfig(env, attachedServiceAccountEmail)
     bucket: env.GCS_BUCKET_NAME,
     historyProof,
     participantId,
+    selectorMode,
+    createdAtFrom,
+    createdAtTo,
   });
+}
+
+/** Resolve one exact synthetic owner inside a short, caller-pinned UTC window. */
+export async function resolveSyntheticV12CleanupParticipantId({
+  primaryPool,
+  primarySchema,
+  createdAtFrom,
+  createdAtTo,
+}) {
+  if (primaryPool === null || typeof primaryPool?.connect !== "function") {
+    fail("POSTGRES_SYNTHETIC_CLEANUP_SELECTOR_READ_FAILED");
+  }
+  const from = validateRecoveryTimestamp(createdAtFrom);
+  const to = validateRecoveryTimestamp(createdAtTo);
+  const duration = Date.parse(to) - Date.parse(from);
+  if (duration <= 0 || duration > MAX_RECOVERY_WINDOW_MILLISECONDS) {
+    fail("SYNTHETIC_CLEANUP_RECOVERY_WINDOW_INVALID");
+  }
+  const schemaSql = quoteSchema(primarySchema);
+  try {
+    return await withPostgresRead(primaryPool, async (client) => {
+      const result = await client.query(
+        `SELECT participant.id, participant.created_at
+           FROM ${schemaSql}."participants" participant
+          WHERE participant.id LIKE $1
+            AND participant.owner_kind = 'social'
+            AND participant.state = 'active'
+            AND participant.identity_link_key IS NULL
+            AND participant.created_at >= $2::timestamptz
+            AND participant.created_at < $3::timestamptz
+            AND (
+              SELECT count(*)
+                FROM ${schemaSql}."telemetry_v12_day_manifests" manifest
+               WHERE manifest.participant_id = participant.id
+            ) = 1
+            AND (
+              SELECT count(*)
+                FROM ${schemaSql}."telemetry_v12_day_manifests" manifest
+               WHERE manifest.participant_id = participant.id
+                 AND manifest.state = 'staged'
+                 AND manifest.expected_chunk_count = 1
+            ) = 1
+            AND NOT EXISTS (
+              SELECT 1
+                FROM ${schemaSql}."telemetry_v12_chunks" chunk
+               WHERE chunk.participant_id = participant.id
+            )
+          ORDER BY participant.created_at, participant.id
+          LIMIT 2`,
+        [`${SYNTHETIC_V12_CLEANUP_PARTICIPANT_PREFIX}%`, from, to],
+      );
+      if (!Array.isArray(result?.rows) || result.rows.length !== 1) {
+        fail("SYNTHETIC_CLEANUP_RECOVERY_CANDIDATE_NOT_UNIQUE");
+      }
+      const row = result.rows[0];
+      let participantId;
+      try { participantId = validateParticipantId(row?.id); } catch {
+        fail("SYNTHETIC_CLEANUP_RECOVERY_CANDIDATE_INVALID");
+      }
+      const createdAt = row.created_at instanceof Date
+        ? row.created_at.toISOString()
+        : typeof row.created_at === "string" ? row.created_at : "";
+      const observed = Date.parse(createdAt);
+      if (!Number.isFinite(observed) || observed < Date.parse(from) || observed >= Date.parse(to)) {
+        fail("SYNTHETIC_CLEANUP_RECOVERY_CANDIDATE_INVALID");
+      }
+      return participantId;
+    }, {
+      operation: "postgres.synthetic_cleanup.participant_selector",
+      statementTimeoutMilliseconds: 10_000,
+      lockTimeoutMilliseconds: 5_000,
+      preserveSafeError: preserveRecoverySelectorError,
+    });
+  } catch (error) {
+    if (typeof error?.code === "string"
+        && error.code.startsWith("SYNTHETIC_CLEANUP_RECOVERY_")) throw error;
+    fail("POSTGRES_SYNTHETIC_CLEANUP_SELECTOR_READ_FAILED");
+  }
 }
 
 export async function readAttachedSyntheticCleanupServiceAccount({
@@ -289,7 +414,7 @@ async function verifyPostgres17MigrationReceipt(pool, target, role, migrations) 
   }
 }
 
-/** Execute a fixed one-owner test cleanup with injectable cloud/SQL adapters. */
+/** Execute a fixed one-owner cleanup with injectable cloud/SQL adapters. */
 export async function runSyntheticV12Cleanup({ env = process.env, dependencies = {} } = {}) {
   if (env === null || typeof env !== "object"
       || env.CLOUD_RUN_JOB !== SYNTHETIC_V12_CLEANUP_JOB
@@ -343,6 +468,15 @@ export async function runSyntheticV12Cleanup({ env = process.env, dependencies =
       verifyPostgres17MigrationReceipt(primaryPool, config.primary, "primary", manifest.roles.primary),
       verifyPostgres17MigrationReceipt(ledgerPool, config.ledger, "ledger", manifest.roles.ledger),
     ]);
+    const eraseOwner = dependencies.eraseOwner ?? eraseSyntheticPostgresV12Owner;
+    const participantId = config.selectorMode === "explicit_participant_id"
+      ? config.participantId
+      : await (dependencies.resolveParticipantId ?? resolveSyntheticV12CleanupParticipantId)({
+        primaryPool,
+        primarySchema: config.primary.schema,
+        createdAtFrom: config.createdAtFrom,
+        createdAtTo: config.createdAtTo,
+      });
     const accessToken = await (dependencies.createAccessTokenProvider ?? createGoogleAccessTokenProvider)();
     const objectStore = await (dependencies.createObjectStore ?? (({ bucket, tokenProvider, historyProof }) =>
       new GcsErasureObjectStore(bucket, tokenProvider, globalThis.fetch, 30_000, historyProof)))({
@@ -350,13 +484,36 @@ export async function runSyntheticV12Cleanup({ env = process.env, dependencies =
       tokenProvider: accessToken,
       historyProof: config.historyProof,
     });
-    result = await (dependencies.eraseOwner ?? eraseSyntheticPostgresV12Owner)({
+    const eraseOptions = {
       primaryPool,
       ledgerPool,
       objectStore,
-      participantId: config.participantId,
+      participantId,
       schema: { primarySchema: config.primary.schema, ledgerSchema: config.ledger.schema },
-    });
+    };
+    result = await eraseOwner(eraseOptions);
+    if (config.selectorMode === "bounded_created_at_window") {
+      const firstResult = result;
+      if (firstResult.status === "incomplete") {
+        result = await eraseOwner(eraseOptions);
+        result = Object.freeze({
+          ...result,
+          attempts: 2,
+          firstAttemptStatus: "incomplete",
+          replayStatus: result.status,
+        });
+      } else {
+        const replay = await eraseOwner(eraseOptions);
+        if (replay.status !== "already_complete") {
+          fail("SYNTHETIC_CLEANUP_RECOVERY_REPLAY_INVALID");
+        }
+        result = Object.freeze({
+          ...firstResult,
+          attempts: 2,
+          replayStatus: replay.status,
+        });
+      }
+    }
   } catch (error) {
     operationError = error;
   } finally {
@@ -387,6 +544,9 @@ async function main() {
       schemaVersion: "synthetic-v12-owner-cleanup-receipt-v1",
       status: receipt.status,
       ...(receipt.status === "incomplete" ? { code: receipt.code } : { objectsDeleted: receipt.objectsDeleted }),
+      ...(receipt.attempts === undefined ? {} : { attempts: receipt.attempts }),
+      ...(receipt.replayStatus === undefined ? {} : { replayStatus: receipt.replayStatus }),
+      ...(receipt.firstAttemptStatus === undefined ? {} : { firstAttemptStatus: receipt.firstAttemptStatus }),
     }));
     if (receipt.status === "incomplete") process.exitCode = 2;
   } catch (error) {
