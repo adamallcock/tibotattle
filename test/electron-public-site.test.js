@@ -5,8 +5,10 @@ import { deflateSync } from 'node:zlib';
 import { mkdtemp, mkdir, readFile, writeFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readElectronSitePublication, renderElectronSiteDocumentation, renderElectronSiteDownloads } from '../scripts/lib/electron-public-site.mjs';
+import { readElectronSitePublication, readPublishedElectronSiteRelease, renderElectronSiteDocumentation, renderElectronSiteDownloads } from '../scripts/lib/electron-public-site.mjs';
 import { identityDigest } from '../scripts/lib/release-operation.mjs';
+import { validateCanonicalManifest } from '../scripts/release-evidence-policy.js';
+import { RELEASE_EVIDENCE_SCHEMA_VERSION } from '../config/release-evidence.js';
 import { buildPublicReleaseSite, parseArgs } from '../scripts/build-public-release-site.js';
 
 const hash = b => createHash('sha256').update(b).digest('hex');
@@ -40,6 +42,91 @@ async function fixture(t) {
   const planPath=join(root,'plan.json');await writeFile(planPath,JSON.stringify(plan));
   return {root,plan,planPath,options:{planPath,artifactRoot:root,approvedPlanSha256:identityDigest(plan)}};
 }
+async function publishedFixture(t) {
+  const root = await mkdtemp(join(tmpdir(), 'electron-published-site-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const version = '0.1.20', tag = `v${version}`, commit = '1'.repeat(40);
+  const repository = 'https://github.com/adamallcock/tibotattle';
+  const source = { version, tag, commit, repository };
+  const specs = [
+    ['linux', 'x64', 'appimage', `TiboTattle-${version}-linux-x86_64.AppImage`],
+    ['macos', 'arm64', 'dmg', `TiboTattle-${version}-mac-arm64.dmg`],
+    ['macos', 'x64', 'dmg', `TiboTattle-${version}-mac-x64.dmg`],
+    ['windows', 'x64', 'exe', `TiboTattle-${version}-Windows-x64.exe`],
+  ];
+  const artifacts = specs.map(([platform, architecture, format, fileName]) => {
+    const bytes = Buffer.byteLength(fileName);
+    const sha256 = hash(Buffer.from(fileName));
+    return { platform, channel: 'direct', architecture, format, version,
+      distribution: 'github-release',
+      downloadUrl: `${repository}/releases/download/${tag}/${fileName}`,
+      fileName, bytes, sha256, source, store: null, sbom: null, provenance: null,
+      build: { sourceManifestSha256: '2'.repeat(64), unsignedPayloadSha256: '3'.repeat(64) },
+      nativeTrust: platform === 'macos'
+        ? { signerIdentity: 'Developer ID Application: Test (ABCDE12345)', teamId: 'ABCDE12345' }
+        : platform === 'windows' ? { publisher: 'Test', certificateSha256: '4'.repeat(64) }
+          : { scheme: 'none' },
+      assurances: platform === 'macos'
+        ? { cleanInstallSmokePassed: true, developerIdSigned: true, gatekeeperAssessmentPassed: true,
+          hardenedRuntime: true, notarizationAccepted: true, ticketStapled: true }
+        : platform === 'windows' ? { authenticodeSigned: true, cleanInstallSmokePassed: true, timestamped: true }
+          : { artifactIntegrityVerified: true, cleanInstallSmokePassed: true },
+      updater: { enabled: false, mechanism: 'none', metadata: null } };
+  });
+  const manifest = { schemaVersion: RELEASE_EVIDENCE_SCHEMA_VERSION, product: { name: 'TiboTattle' },
+    version, tag, commit, repository, artifacts };
+  validateCanonicalManifest(manifest);
+  const manifestPath = join(root, 'release-manifest.json');
+  const writeManifest = async () => { const bytes = Buffer.from(`${JSON.stringify(manifest)}\n`);
+    await writeFile(manifestPath, bytes); return hash(bytes); };
+  const approvedManifestSha256 = await writeManifest();
+  return { root, manifest, manifestPath, writeManifest,
+    options: { manifestPath, approvedManifestSha256, buildNumber: '2026091002' } };
+}
+
+test('published release intake pins canonical evidence and verifies all four remote installer bytes', async t => {
+  const f = await publishedFixture(t); const calls = [];
+  const release = await readPublishedElectronSiteRelease({ ...f.options,
+    verifyPublishedInstaller: async value => { calls.push(value); return { bytes: value.expectedBytes, sha256: value.expectedSha256 }; } });
+  assert.deepEqual(release.downloads.map(item => item.target), ['darwin-arm64', 'darwin-x64', 'win32-x64', 'linux-x64']);
+  assert.equal(calls.length, 4);
+  assert.deepEqual(release.verificationScope, ['pinned-release-manifest', 'published-installer-bytes']);
+  assert.equal(release.publishedInstallersVerified, true);
+  await assert.rejects(readPublishedElectronSiteRelease({ ...f.options, approvedManifestSha256: '0'.repeat(64),
+    verifyPublishedInstaller: async () => assert.fail('bad pin must fail first') }), /exact reviewed/u);
+  f.manifest.artifacts[0].downloadUrl = 'https://example.net/other.AppImage';
+  const changedDigest = await f.writeManifest();
+  await assert.rejects(readPublishedElectronSiteRelease({ ...f.options, approvedManifestSha256: changedDigest,
+    verifyPublishedInstaller: async () => assert.fail('foreign URL must fail first') }));
+});
+
+test('published release intake cannot qualify a preview or combine publication modes', async t => {
+  const f = await publishedFixture(t);
+  const release = await readPublishedElectronSiteRelease({ ...f.options, verifyPublishedInstaller: async value =>
+    ({ bytes: value.expectedBytes, sha256: value.expectedSha256, published: false }) });
+  assert.equal(release.publishedInstallersVerified, false);
+  assert.deepEqual(release.verificationScope, ['pinned-release-manifest']);
+  const social = join(f.root, 'social.png');
+  await writeFile(social, await readFile(new URL('../apps/web/public/tibotattle-icon.png', import.meta.url)));
+  const args = { output: join(f.root, 'output'), siteUrl: 'https://tibotattle.com/',
+    releaseNotesUrl: 'https://github.com/adamallcock/tibotattle/releases/tag/v0.1.20',
+    privacyUrl: 'https://tibotattle.com/privacy', securityUrl: 'https://tibotattle.com/docs',
+    supportUrl: 'https://github.com/adamallcock/tibotattle/issues', socialImage: social,
+    electronPublishedManifest: f.manifestPath, electronPublishedManifestSha256: f.options.approvedManifestSha256,
+    electronPublishedBuildNumber: f.options.buildNumber };
+  let calls = 0;
+  await buildPublicReleaseSite(args, { verifyPublishedInstaller: async value => { calls++;
+    return { bytes: value.expectedBytes, sha256: value.expectedSha256, published: false }; } });
+  assert.equal(calls, 4);
+  const manifest = JSON.parse(await readFile(join(args.output, 'release-site-manifest.json'), 'utf8'));
+  assert.equal(manifest.electronRelease.publishedInstallersVerified, false);
+  assert.deepEqual(manifest.electronRelease.verificationScope, ['pinned-release-manifest']);
+  await assert.rejects(buildPublicReleaseSite({ ...args, electronPublicationPlan: f.manifestPath }), /excludes native installer inputs/u);
+  const linkPath = join(f.root, 'release-link.json');
+  await symlink(f.manifestPath, linkPath);
+  await assert.rejects(readPublishedElectronSiteRelease({ ...f.options, manifestPath: linkPath,
+    verifyPublishedInstaller: async () => assert.fail('symlink must fail before fetch') }), /exact reviewed/u);
+});
 test('Electron intake binds the reviewed identity and all target bytes before exposing exact downloads',async t=>{
   const f=await fixture(t), calls=[];const release=await readElectronSitePublication({...f.options,verifyPublishedInstaller:async value=>{calls.push(value);return {bytes:value.expectedBytes,sha256:value.expectedSha256};}});
   assert.equal(calls.length,4);assert.equal(release.downloads.length,4);

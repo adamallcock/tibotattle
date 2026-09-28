@@ -6,6 +6,7 @@ import { basename, resolve, sep } from 'node:path';
 import distribution from '../../config/electron-production-distribution.cjs';
 import { EN_US_CATALOG } from '../../packages/i18n/index.js';
 import { identityDigest } from './release-operation.mjs';
+import { validateCanonicalManifest } from '../release-evidence-policy.js';
 
 const fail = () => { throw new TypeError('Electron site requires the exact reviewed stable publication plan and unchanged artifacts'); };
 const HASH = /^[a-f0-9]{64}$/u;
@@ -15,6 +16,68 @@ const supportsAutomaticNativeReplacement = version => {
   return major > 0 || minor > 1 || (minor === 1 && patch >= 20);
 };
 const targets = Object.keys(distribution.PRODUCTION_ELECTRON_TARGETS);
+const publishedTargets = Object.freeze([
+  { target: 'darwin-arm64', platform: 'macos', architecture: 'arm64', format: 'dmg', name: version => `TiboTattle-${version}-mac-arm64.dmg` },
+  { target: 'darwin-x64', platform: 'macos', architecture: 'x64', format: 'dmg', name: version => `TiboTattle-${version}-mac-x64.dmg` },
+  { target: 'win32-x64', platform: 'windows', architecture: 'x64', format: 'exe', name: version => `TiboTattle-${version}-Windows-x64.exe` },
+  { target: 'linux-x64', platform: 'linux', architecture: 'x64', format: 'appimage', name: version => `TiboTattle-${version}-linux-x86_64.AppImage` },
+]);
+
+/** Reuse an attested, already-published release when its private build plan is no longer retained. */
+export async function readPublishedElectronSiteRelease({ manifestPath, approvedManifestSha256, buildNumber, verifyPublishedInstaller }) {
+  if (!HASH.test(approvedManifestSha256 ?? '') || !/^\d{10}$/u.test(buildNumber ?? '')) fail();
+  const before = await lstat(manifestPath);
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > 128 * 1024) fail();
+  const handle = await open(manifestPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  let bytes;
+  try {
+    const opened = await handle.stat();
+    if (opened.ino !== before.ino || opened.dev !== before.dev) fail();
+    const chunks = [];
+    let length = 0;
+    for await (const chunk of handle.createReadStream({ autoClose: false })) {
+      length += chunk.length;
+      if (length > before.size) fail();
+      chunks.push(chunk);
+    }
+    bytes = Buffer.concat(chunks);
+    const after = await handle.stat();
+    const named = await lstat(manifestPath);
+    if (after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs
+        || named.ino !== before.ino || named.dev !== before.dev || named.isSymbolicLink()) fail();
+  } finally { await handle.close(); }
+  if (bytes.length !== before.size || createHash('sha256').update(bytes).digest('hex') !== approvedManifestSha256) fail();
+  const manifest = JSON.parse(bytes.toString('utf8'));
+  validateCanonicalManifest(manifest);
+  if (manifest.product.name !== 'TiboTattle'
+      || manifest.repository !== 'https://github.com/adamallcock/tibotattle'
+      || !supportsAutomaticNativeReplacement(manifest.version)
+      || manifest.artifacts.length !== publishedTargets.length) fail();
+  const downloads = [];
+  let publishedInstallersVerified = true;
+  for (const expected of publishedTargets) {
+    const name = expected.name(manifest.version);
+    const url = `https://github.com/adamallcock/tibotattle/releases/download/${manifest.tag}/${name}`;
+    const matching = manifest.artifacts.filter(artifact => artifact.platform === expected.platform
+      && artifact.architecture === expected.architecture && artifact.channel === 'direct');
+    if (matching.length !== 1) fail();
+    const artifact = matching[0];
+    if (artifact.format !== expected.format || artifact.distribution !== 'github-release'
+        || artifact.fileName !== name || artifact.downloadUrl !== url
+        || (expected.platform === 'macos' && (artifact.assurances.developerIdSigned !== true
+          || artifact.assurances.notarizationAccepted !== true || artifact.assurances.ticketStapled !== true))
+        || (expected.platform === 'windows' && artifact.assurances.authenticodeSigned !== true)
+        || (expected.platform === 'linux' && artifact.assurances.artifactIntegrityVerified !== true)) fail();
+    const verified = await verifyPublishedInstaller({ installerUrl: url, expectedBytes: artifact.bytes, expectedSha256: artifact.sha256 });
+    if (verified?.bytes !== artifact.bytes || verified?.sha256 !== artifact.sha256) fail();
+    if (verified.published === false) publishedInstallersVerified = false;
+    downloads.push({ target: expected.target, url, bytes: artifact.bytes, sha256: artifact.sha256 });
+  }
+  return { version: manifest.version, buildNumber, sourceRevision: manifest.commit,
+    approvedManifestSha256, publishedInstallersVerified,
+    verificationScope: ['pinned-release-manifest', ...(publishedInstallersVerified ? ['published-installer-bytes'] : [])], downloads };
+}
+
 export async function readElectronSitePublication({ planPath, artifactRoot, approvedPlanSha256, verifyPublishedInstaller }) {
   if (!HASH.test(approvedPlanSha256 ?? '')) fail();
   const planStat = await lstat(planPath);
