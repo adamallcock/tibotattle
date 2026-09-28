@@ -60,6 +60,10 @@ service `tibotattle-test-app` generation 50 observed, revision
 test runtime service account. An authenticated `/api/health` request returned
 HTTP 200, `status=ready`, primary migration receipt `current` at 46, and ledger
 receipt `current` at 6. It still reported `workerApplicationReady=false`.
+After this deployment, anonymous public gateway probes returned HTTP 200 for
+`/api/health` and HTTP 401 for the sync manifest, v1.2 day-manifests, and
+v1.2 sync-capabilities GET routes. None redirected or set a cookie. These
+responses establish routing and unauthenticated refusal only.
 
 The image deploy and database migration qualify the isolated test service's
 schema and runtime pairing. They do not prove the new authenticated device
