@@ -6,7 +6,8 @@ export { allowanceModelPresentation, modelThemeIcon } from "./model-visuals.js";
 // retired in favour of daily revisions, so no snapshot render path lives here
 // any more.
 
-import { normalizeCommunityDailySeries, planWeeklyApiEquivalentUsd } from "./community-data.js";
+import { normalizeCommunityDailySeries, planWeeklyApiEquivalentUsd,
+  PUBLIC_ALLOWANCE_MODEL_CONFIG } from "./community-data.js";
 import {
   compact,
   compactPrecise,
@@ -513,9 +514,10 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     ...[ ["pro", "Pro 20×"], ["prolite", "Pro 5×"], ["plus", "Plus"] ].map(([key, label], index) => ({
       key, label, view: "plans", className: `allowance-series-${index}`,
     })),
-    ...series.breakdowns.modelConfig.map(({ modelId, label }, index) => ({
+    ...PUBLIC_ALLOWANCE_MODEL_CONFIG.map(({ modelId, label }, index) => ({
       key: modelId, label, view: "models", ...allowanceModelPresentation(modelId, index),
-    })).sort((left, right) => left.order - right.order),
+      order: index,
+    })),
   ];
   const summaryFor = (day, definition) => {
     const breakdown = breakdownDays.get(day.day);
@@ -617,6 +619,10 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     return { ...definition, dots, markerDots, centralSegments, bandSegments: split(band), latest: dots.at(-1) ?? null };
   }).filter(definition => definition.dots.length > 0);
   if (visible.length === 0) return null;
+  const visibleByKey = new Map(visible.map(definition => [definition.key, definition]));
+  const cardSeries = view === "models"
+    ? viewDefinitions.map(definition => visibleByKey.get(definition.key)
+      ?? { ...definition, latest: null }) : visible;
   const dots = visible.flatMap(definition => definition.dots)
     .sort((a, b) => a.day.localeCompare(b.day) || a.seriesOrder - b.seriesOrder);
   const dayTicks = Array.from({ length: 6 }, (_, index) => {
@@ -627,6 +633,7 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
   return { width, height, margin, plot, dots, view,
     markerDots: visible.flatMap(definition => definition.markerDots),
     latest: dots.at(-1), legendSeries: view === "aggregate" ? null : visible,
+    cardSeries,
     latestSummaries: visible.map(definition => definition.latest),
     spanDays: 1 + Math.round((endMs - startMs) / MILLISECONDS_PER_DAY),
     sparse: new Set(dots.map(dot => dot.day)).size <= 2,
@@ -1136,18 +1143,30 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t, inspe
   const legend = node("div", "community-daily-legend allowance-series-legend");
   const legendButtons = [];
   const legendItems = model.legendSeries?.map(series => [
-    `daily-legend-swatch allowance-central ${series.className}`, series.label, series.key,
+    `daily-legend-swatch allowance-central ${series.className}`, series.label, series.key, true,
   ]) ?? [
     ["daily-legend-swatch allowance-central", "community.allowance.legendCentral"],
     ["daily-legend-swatch allowance-band", "community.allowance.legendBand"],
     ["daily-legend-swatch allowance-dot", "community.allowance.legendDots"],
   ].map(([className, key]) => [className, t(key)]);
-  for (const [swatchClass, label, seriesKey] of legendItems) {
-    const item = node(seriesKey ? "button" : "span", seriesKey ? "allowance-legend-button" : "");
+  if (model.view === "models") {
+    legendItems.splice(0, legendItems.length, ...model.cardSeries.map(series => [
+      `daily-legend-swatch allowance-central ${series.className}`,
+      series.label, series.key, series.latest !== null,
+    ]));
+  }
+  for (const [swatchClass, label, seriesKey, hasEstimate] of legendItems) {
+    const item = node(seriesKey && hasEstimate ? "button" : "span",
+      seriesKey ? `allowance-legend-button${hasEstimate ? "" : " unavailable"}` : "");
     if (seriesKey) {
-      item.setAttribute("type", "button");
-      item.setAttribute("aria-pressed", "false");
-      legendButtons.push({ item, seriesKey });
+      if (hasEstimate) {
+        item.setAttribute("type", "button");
+        item.setAttribute("aria-pressed", "false");
+        legendButtons.push({ item, seriesKey });
+      } else {
+        item.setAttribute("role", "note");
+        item.setAttribute("aria-label", `${label}: ${t("community.allowance.noModelEstimate")}`);
+      }
     }
     const swatch = node("span", swatchClass);
     swatch.setAttribute("aria-hidden", "true");
@@ -1583,24 +1602,28 @@ export function renderCommunityAllowanceSection({
   if (view !== "aggregate") {
     container.append(node("p", "allowance-summary-caption", t("community.allowance.cardsCaption")));
     const cards = node("div", "allowance-summary-cards");
-    for (const latest of model.latestSummaries) {
-      const card = node("article", `allowance-summary-card ${latest.seriesClass}`.trim());
+    for (const seriesCard of model.cardSeries) {
+      const latest = seriesCard.latest;
+      const card = node("article", `allowance-summary-card ${seriesCard.className}`.trim());
       const heading = node("div", "allowance-summary-heading");
-      heading.append(node("h3", "", latest.seriesLabel));
-      const icon = modelThemeIcon(documentRef, latest.seriesTheme);
+      heading.append(node("h3", "", seriesCard.label));
+      const icon = modelThemeIcon(documentRef, seriesCard.theme);
       if (icon) heading.append(icon);
       // A plan cohort leads with ITS OWN week at API prices, because that is
       // the number a reader on that plan is asking about. The Pro 20x
       // equivalent stays underneath as the comparable figure the basis names.
-      const planUsd = view === "plans" ? planWeeklyApiEquivalentUsd(latest.centralUsd, latest.seriesKey) : null;
+      const planUsd = view === "plans" && latest !== null
+        ? planWeeklyApiEquivalentUsd(latest.centralUsd, latest.seriesKey) : null;
       card.append(heading,
         node("strong", "allowance-summary-value",
-          dollars.format(planUsd === null ? latest.centralUsd : planUsd)));
+          latest === null ? "—" : dollars.format(planUsd === null ? latest.centralUsd : planUsd)));
       if (planUsd !== null) {
         card.append(node("p", "allowance-plan-value",
           t("community.allowance.referenceEquivalent", { value: dollars.format(latest.centralUsd) })));
       }
-      card.append(node("p", "allowance-headline-caveat", `${formatUtcCalendarDay(latest.day)} · ${plural("community.allowance.shortAccountCount", latest.participantCount)}`));
+      card.append(node("p", "allowance-headline-caveat", latest === null
+        ? t("community.allowance.noModelEstimate")
+        : `${formatUtcCalendarDay(latest.day)} · ${plural("community.allowance.shortAccountCount", latest.participantCount)}`));
       cards.append(card);
     }
     container.append(cards);
