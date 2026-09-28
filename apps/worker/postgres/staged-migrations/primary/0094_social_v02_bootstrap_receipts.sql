@@ -78,9 +78,12 @@ CREATE TRIGGER storage_legacy_event_source_truncate_refused
   FOR EACH STATEMENT EXECUTE FUNCTION storage_legacy_event_source_truncate_refused();
 
 -- Preserve 0053's bounded v1/v1.1/v1.2 discovery and add the missing D1
--- legacy-family rule. A matching receipt must name the current input revision
--- and the exact participant/owner link. A missing input-version row is also
--- pending: D1's bootstrap requests a revision and receipt for that case.
+-- legacy-family rule. A matching receipt must name the current input revision,
+-- exact participant/owner link, exact version-1 journal event from the active
+-- source, and an active owner-revision head at or beyond that event in the
+-- same monotonic owner chain. The head may be newer because later events do
+-- not make an earlier exact event unapplied. A missing input-version row is
+-- also pending: D1's bootstrap requests a revision and receipt for that case.
 CREATE OR REPLACE FUNCTION community_public_source_bootstrap_pending()
 RETURNS bigint
 LANGUAGE sql STABLE SET search_path FROM CURRENT AS $$
@@ -132,6 +135,23 @@ LANGUAGE sql STABLE SET search_path FROM CURRENT AS $$
                 ON owner_link.participant_id = source.participant_id
                AND owner_link.owner_digest = source.owner_digest
                AND owner_link.state = 'active'
+              JOIN storage_source_state current_source
+                ON current_source.singleton = 1
+              JOIN storage_ingestion_changes change
+                ON change.source_id = current_source.source_id
+               AND change.event_digest = source.event_digest
+               AND change.owner_digest = source.owner_digest
+               AND change.kind = source.change_kind
+               AND change.event_tuple_version = 1
+               AND change.object_digest = source.event_digest
+               AND change.content_digest = source.event_digest
+              JOIN storage_owner_revisions applied_head
+                ON applied_head.source_id = change.source_id
+               AND applied_head.owner_digest = change.owner_digest
+               AND applied_head.revision >= change.revision
+               AND applied_head.authority_epoch >= change.authority_epoch
+               AND applied_head.last_sequence >= change.sequence
+               AND applied_head.state = 'active'
              WHERE current_input.participant_id = eligible.participant_id
           )
         LIMIT 10000) legacy)

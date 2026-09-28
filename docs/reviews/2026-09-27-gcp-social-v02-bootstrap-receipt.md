@@ -23,23 +23,30 @@ social public-source row, and an accepted v0.2 contribution.
 Staged PostgreSQL `0053` counted pending v1, v1.1, and v1.2 receipts but did not
 count this legacy family. An eligible social v0.2 owner could therefore be
 present before `0053` seeded `community_public_source_bootstrap` as completed.
-Staged `0094` adds a D1-shaped immutable receipt relation, counts eligible
-social v0.2 owners as pending until an exact current-revision tuple matches the
-same active owner link, and repairs an already-completed singleton to pending.
-A missing analytical input-version row also remains pending. The migration
-does not fabricate or backfill source receipts.
+Staged `0094` adds a D1-shaped immutable receipt relation and repairs an
+already-completed singleton to pending. An eligible owner stays pending until
+the current input revision has a matching receipt and active owner link, an
+exact version-1 journal event for the configured source with matching event,
+owner, kind, and event digests, and an active `storage_owner_revisions` head
+from the same source/owner chain at or beyond that event's revision, epoch, and
+sequence. The head can advance after this event; the retained exact event plus
+the journal's monotonic revision chain proves it was applied. Missing input
+versions, receipt-only rows, mismatched events, and events without an applied
+head stay pending. The mutable owner-link object/manifest pointers are not used
+as event proof because the v1.1 head trigger can overwrite them after a legacy
+receipt. The migration does not fabricate or backfill source receipts.
 
 The PostgreSQL tuple table validates the D1-shaped fields and owner-link
 identity, but it has no journal-provenance foreign key and does not establish
 source authenticity by itself. Its rows are trusted only after a sealed D1
-receipt import with exact readback. The synthetic PG17 test inserts a tuple
-directly to exercise the SQL gate; it does not prove that tuple came from D1.
-Receipt deletion follows D1's stricter terminal rule: PostgreSQL requires the
-current source's retained `storage_owner_revisions.state='erased'` head. The
-older `storage_owner_erasure_receipts` row alone is insufficient. The current
-PG social eraser may therefore be blocked from deleting these receipts until
-its terminal owner-journal path is repaired; that dependency is not solved by
-0094.
+receipt and journal import with exact readback. The synthetic PG17 test
+exercises the SQL gate using local rows; it does not prove those rows came from
+D1. Receipt deletion follows D1's stricter terminal rule: PostgreSQL requires
+the current source's retained `storage_owner_revisions.state='erased'` head.
+The older `storage_owner_erasure_receipts` row alone is insufficient. The
+current PG social eraser may therefore be blocked from deleting these receipts
+until its terminal owner-journal path is repaired; that dependency is not
+solved by 0094.
 
 ## Remaining promotion blocker
 
@@ -55,7 +62,13 @@ review does not claim that path exists or that any source data was imported.
 ## Local evidence
 
 [`postgres-social-v02-bootstrap-receipt.spec.mjs`](../../apps/worker/postgres-test/postgres-social-v02-bootstrap-receipt.spec.mjs)
-reproduces the premature `0053` completion on PostgreSQL 17, verifies `0094`
-repairs it, checks missing and stale revision refusals, and permits completion
-only after the exact current tuple and owner link are present. The fixture is
-synthetic and uses the private local PostgreSQL Unix socket.
+reproduces the premature `0053` completion on PostgreSQL 17 and verifies
+`0094` repairs it. It proves that a receipt alone, a receipt paired with an
+unrelated exact event, and a matching exact event without an applied owner head
+all remain pending. It also verifies that a current receipt with the exact
+version-1 event and matching active owner head clears only its own pending
+item even after a later event advances that owner head, while other incomplete
+owners still block bootstrap completion. Missing and stale revisions, owner
+membership, immutable receipts, and the owner erasure deletion guard remain
+covered. The fixture is synthetic and uses the private local PostgreSQL Unix
+socket.
