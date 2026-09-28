@@ -1008,6 +1008,9 @@ export function renderCommunityDailySeries({
   ));
   breakdown.append(summary);
   const wrap = node("div", "table-wrap snapshot-table");
+  wrap.setAttribute("role", "region");
+  wrap.setAttribute("aria-label", t("community.daily.metricsCaption"));
+  wrap.setAttribute("tabindex", "0");
   const table = documentRef.createElement("table");
   const caption = node("caption", "sr-only", t("community.daily.metricsCaption"));
   const thead = documentRef.createElement("thead");
@@ -1533,6 +1536,7 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t, inspe
 export function renderCommunityAllowanceSection({
   documentRef,
   container,
+  sourceContainer = null,
   stateNode = null,
   payload,
   rangeDays = null,
@@ -1547,6 +1551,7 @@ export function renderCommunityAllowanceSection({
   const inspection = previousInspection?.view === view ? previousInspection : null;
   allowanceInspectionByContainer.delete(container);
   clear(container);
+  sourceContainer?.replaceChildren();
   const series = normalizeCommunityDailySeries(payload);
   const retained = cachedEvidence(cache);
   const setChip = (labelKey, published) => {
@@ -1598,7 +1603,11 @@ export function renderCommunityAllowanceSection({
 
   setChip("community.allowance.available", true);
   const dollars = usdFormatter();
-  container.append(sourceDisclosureDetails(node, t, ["community.allowance.smallSampleDisclosure"]));
+  const sourceDisclosure = sourceDisclosureDetails(node, t,
+    view === "aggregate"
+      ? ["community.allowance.smallSampleDisclosure", "community.allowance.methodNote"]
+      : ["community.allowance.smallSampleDisclosure"]);
+  (sourceContainer ?? container).append(sourceDisclosure);
   if (view !== "aggregate") {
     container.append(node("p", "allowance-summary-caption", t("community.allowance.cardsCaption")));
     const cards = node("div", "allowance-summary-cards");
@@ -1623,7 +1632,7 @@ export function renderCommunityAllowanceSection({
       }
       card.append(node("p", "allowance-headline-caveat", latest === null
         ? t("community.allowance.noModelEstimate")
-        : `${formatUtcCalendarDay(latest.day)} · ${plural("community.allowance.shortAccountCount", latest.participantCount)}`));
+        : plural("community.allowance.shortAccountCount", latest.participantCount)));
       cards.append(card);
     }
     container.append(cards);
@@ -1690,10 +1699,5 @@ export function renderCommunityAllowanceSection({
 
   appendCommunityAllowanceChart({ documentRef, container, model, t, inspection });
 
-  container.append(node(
-    "p",
-    "snapshot-disclosure",
-    t("community.allowance.methodNote"),
-  ));
   return "published";
 }
