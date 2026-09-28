@@ -19,7 +19,7 @@ export function exampleCacheImpact() {
     for(const row of Object.values(byOutcomeBucket)) for(const key of ['comparableReturns','reusedMoreThanHalfReturns','reusedHalfOrLessReturns','matchedOrExceededReturns','reusedBetweenHalfAndPreviousReturns','cacheReadDrops','lostCacheTokens','pricedDrops','unpricedDrops','estimatedPremiumUsd']) total[key]=(total[key]??0)+row[key];
     return total;
   };
-  const models=[cohort('gpt-5.5',.6),cohort('gpt-5.4',.4)];
+  const models=[cohort('gpt-6-astra',.6),cohort('gpt-6-sol',.4)];
   const all=cohort('',0);
   for(const id of ids)for(const key of Object.keys(models[0].byOutcomeBucket[id]))if(!['startSeconds','endSeconds','coverageStatus'].includes(key))all.byOutcomeBucket[id][key]=models.reduce((sum,m)=>sum+m.byOutcomeBucket[id][key],0);
   for(const key of Object.keys(models[0]))if(typeof models[0][key]==='number')all[key]=models.reduce((sum,m)=>sum+m[key],0);
@@ -34,7 +34,7 @@ export function exampleModelSpeeds(period='all', speedMode='standard') {
   const latency=[1.4,2.1,1.1,3.8,1.7,.9,1.6,2.3,4.9,2.6,1.3,1.8,1.2,.8,2.7,1.9,3.4,1.5,2.2,1.1,1.8,3.1,2.4,1.2,4.2,1.7,.9,1.4,2.8,1.6];
   if (!['standard','fast'].includes(speedMode)) throw new RangeError('Unsupported speed mode');
   return {schemaVersion:5,method:5,speedMode,excludedUnknownTurns:0,status:'ready',collecting:false,stale:false,updatedAt:new Date(end+86400000-1).toISOString(),period,interval:'day',start,end,historyProgress:null,
-    models:speedMode==='fast'?[]:[['gpt-5.5','GPT-5.5'],['gpt-5.4','GPT-5.4']].map(([id,label],index)=>{
+    models:speedMode==='fast'?[]:[['gpt-6-astra','Astra'],['gpt-6-sol','GPT-6 Sol']].map(([id,label],index)=>{
       const history=activity.map((count,i)=>{
         const j=(i+index*9)%30, n=Math.max(3,Math.round(count*(index ? .62 : 1)));
         const at=end-(29-i)*86400000, median=speeds[j]+index*8;
