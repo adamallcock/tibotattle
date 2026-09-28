@@ -18,9 +18,16 @@ approval.
 The reviewed source archive and regional Cloud Build path can produce and
 qualify an immutable image for the test project. The existing gated deployer,
 [`gcp-private-test-deploy.mjs`](../../apps/worker/scripts/gcp-private-test-deploy.mjs#L1202),
-is fixed to `tibotattle-test-app`; it does not cover the public gateway. A
-separate gateway-specific guard is required to qualify its service settings,
-IAM, Logging exclusion, traffic, and rollback identity before an image update.
+is fixed to `tibotattle-test-app`; it does not cover the public gateway. The
+follow-on gateway-specific guard is implemented in
+[`gcp-test-gateway-deploy.mjs`](../../apps/worker/scripts/gcp-test-gateway-deploy.mjs).
+It reuses the existing exact-archive and Cloud Build provenance assessors, then
+checks the fixed gateway service, public IAM/ingress, four reviewed environment
+values, runtime account, `_Default` request-log exclusion, and 100% latest-ready
+traffic. Its `deploy` mode requires an explicit fixed-service confirmation,
+creates a no-traffic revision, verifies it, switches to that exact revision,
+and restores the captured revision if post-update readback fails. This is local
+guard code and test evidence only; no live deployment was performed.
 
 The new gateway paths are `GET /api/v1/device/sync/manifest` and
 `GET /api/v1/device/telemetry/v1.2/day-manifests` in
@@ -39,10 +46,15 @@ Read-only Cloud Run and Logging inspection on 2026-09-27 found:
   `tibotattle-test-app-00047-hm6`, also at 100% on that image. Its service IAM
   policy had no public invoker binding; the gateway runtime identity had an
   invoker binding.
-- Gateway ingress was public, its IAM policy granted `roles/run.invoker` to
-  `allUsers`, and its attached runtime account matched the test gateway
-  configuration. These are required properties of this browser-facing test
-  gateway, not production guidance.
+- Gateway ingress was public, and its IAM policy contained exactly one binding:
+  `roles/run.invoker` for `allUsers`. Its attached runtime account matched the
+  test gateway configuration. Extra IAM bindings or principals are treated as
+  unreviewed access drift by the guard. These are required properties of this
+  browser-facing test gateway, not production guidance.
+- The gateway revision had exactly four configured `OAUTH_GATEWAY_*` variable
+  names and no secret references. The guard requires those exact names/values,
+  rejects extra variables and secret references, and never returns environment
+  values in its result.
 - The enabled `_Default` sink exclusion
   `tibotattle_test_oauth_gateway_requests` matched the exact gateway service
   and `run.googleapis.com/requests`. The project had only `_Default` and
@@ -105,6 +117,14 @@ live authenticated GET also requires an approved synthetic device authorization;
 this preflight had no such token and did not attempt a request. The deployment
 guard should report route smoke as not run, leaving that separate test-owner
 credential gate explicit.
+
+The local guard interface is `npm --prefix apps/worker run gcp:test-gateway --`
+followed by `preflight`, `verify`, or `deploy`. `preflight` is read-only.
+`verify` and `deploy` require generated archive/build receipt arguments;
+`deploy` additionally requires
+`--confirm-test-gateway-deploy=tibotattle-test-oauth-gateway`. The focused
+no-live-call contract tests run with
+`npm --prefix apps/worker run gcp:test-gateway:check`.
 
 ## Evidence boundary
 
