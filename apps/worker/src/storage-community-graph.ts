@@ -581,7 +581,10 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       if(!failure||failure.reason!=='checkpoint_unavailable')throw error;
       let latest;try{latest=await readStorageHistoryCheckpointHead({target:bindings.target,key});}catch{throw error;}
       if(latest?.retired===0&&latest.generation!==null&&latest.generation!==expectedHead)
-        return {state:'deferred',reason,failure};
+        // Another writer promoted this exact key. Reload through the normal
+        // scheduler while its existing query, time and step limits permit;
+        // treating a won race as a failure abandons the rest of a long pass.
+        return {state:'deferred',reason:'checkpoint_advanced'};
       throw error;
     }
     return {state:'deferred',reason};

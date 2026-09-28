@@ -64,7 +64,7 @@ both the old and rebuilt final-day heads still loads the exact new dependency
 in 711 statements. Oversized memory or reset-fragment metadata selects the
 paged path before any source dependency or cached payload decoding.
 
-Final dense-fixture measurements (6,001 quota observations over five days,
+Initial dense-fixture measurements (6,001 quota observations over five days,
 120 usage events, 950-statement cap) show exact fits/model parity. Counts include
 source validation, checkpoint reads/writes, preparation and result publication:
 
@@ -85,7 +85,7 @@ estimates. The whole workflow still includes daily publication, usage reduction
 and scheduling. The corpus establishes exact output parity and removal of
 repeated quota scans; a production sample must establish elapsed throughput.
 
-### Final source qualification
+### Initial source qualification
 
 Qualification completed on September 27 local time (September 28 UTC), on the
 patch based on `d4c1f192`:
@@ -125,7 +125,7 @@ Artifact identities:
 - Analytics JavaScript from that baseline plus the patch SHA-256:
   `6645fb2d85bac7ba3be6dc74bea2697c8a31518dc1d114df16185cd00634303a`.
 
-The production step is to recheck the active version, bindings, fold switch
+The initial production plan was to recheck the active version, bindings, fold switch
 and analytics schema, apply only migration 0028, then deploy the analytics
 candidate. It keeps the 950 cap and delivery catch-up disabled. Migration and
 activation require explicit production authorization. Observe natural scheduled
@@ -157,6 +157,35 @@ retention remain unchanged.
 Recovery qualification: TypeScript passed; seven dedicated compatibility
 cases and 39 graph/prepared-fold cases passed. An independent review found no
 blocker and reran eight compatibility/adoption/cleanup cases, all passing.
-The complete Worker check is being repeated. The recovery's completion cleanup
+The recovery full Worker suite subsequently passed all 2,062 tests across 163 files; the generic website dry-deployment gate remained blocked by its clean release-tree requirement. The recovery's completion cleanup
 adds a few target queries beyond the original synthetic counts above. No
 production speedup is claimed.
+
+
+## Bounded checkpoint contention retry
+
+Recovery source `93dcecea` was activated at 100% and its checkpoint survived
+older cleanup, advanced into the next calculation phase, and began preparing
+effective cache days. An overlapping long pass reported a checkpoint save
+failure consistent with the existing lost-CAS path. Source review found that
+a verified newer active head was still marked as a failure, exhausting the
+remaining graph window.
+
+This follow-up returns `checkpoint_advanced` only for a verified newer active
+head on the exact key. A fresh scheduler attempt reloads it within the same
+query, time and step limits. A second contention exhausts the lane, and the
+content-free count is reported separately from failures. The losing payload
+is never saved against a substituted expected head. Missing, unchanged, retired
+and malformed heads remain errors; provider/trigger errors are unchanged.
+
+Eight targeted integration cases passed, including deterministic different-
+successor races with preparation off/on, exact winner preservation, resume
+from the winning head and complete output parity. Eight runtime cases passed,
+including recovery, repeated-race bounds, query/deadline/step exhaustion and
+genuine failure propagation. TypeScript and independent source/test review
+passed. The complete Worker command is being repeated before activation.
+
+The exact recovery benchmark, including completion cleanup, used 941 cold
+model statements, 185 warm fits statements and 184 warm adjacent-model
+statements: 1,310 total versus 5,776 (77.3% fewer). This remains synthetic
+query evidence, not a production throughput measurement.

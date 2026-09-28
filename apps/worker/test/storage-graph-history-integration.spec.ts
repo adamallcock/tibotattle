@@ -92,6 +92,17 @@ function unavailableCheckpointOwner(database:D1Database,onUnavailable?:()=>Promi
  return new Proxy(database,{get(value,key){if(key==='prepare')return(sql:string)=>statement(value.prepare(sql),sql);
   const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}});
 }
+function beforeFirstCheckpointSave(database:D1Database,beforeSave:()=>Promise<void>){let saves=0;
+ const statement=(inner:D1PreparedStatement,sql:string):D1PreparedStatement=>new Proxy(inner,{get(value,key){
+  if(key==='bind')return(...args:unknown[])=>statement(value.bind(...args),sql);
+  if(key==='first'&&sql.includes('SELECT revision,authority_epoch FROM analytics_owner_state'))return async(...args:unknown[])=>{
+   const owner=await Reflect.apply(Reflect.get(value,key) as Function,value,args);
+   if(++saves===1)await beforeSave();return owner;
+  };
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}});
+ return {database:new Proxy(database,{get(value,key){if(key==='prepare')return(sql:string)=>statement(value.prepare(sql),sql);
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}}),saves:()=>saves};
+}
 function loseFirstCheckpointBatchResponse(database:D1Database){let losses=0;
  return {database:new Proxy(database,{get(value,key){
   if(key==='batch')return async(statements:D1PreparedStatement[])=>{const result=await value.batch(statements);
@@ -369,7 +380,7 @@ it('reopens one repaired direct attempt, serializes concurrent claims, then fall
  expect(scheduledDirect.attempts()).toBe(1);
 },60000);
 
-it('rethrows an unavailable checkpoint failure when the exact head is unchanged',async()=>{
+it('rethrows an unavailable checkpoint failure when the exact head is still absent',async()=>{
  const owner=await fixture(),scope=await captureStorageGraphScope(source(),{owner,day,metric:'model',sourceId,sourceNamespace:namespace});
  const direct=await computeStorageGraphResult(bindings(),scope);
  expect(direct.state).toBe('complete');
@@ -380,7 +391,7 @@ it('rethrows an unavailable checkpoint failure when the exact head is unchanged'
  expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(0);
 });
 
-it('defers an unavailable checkpoint after a newer exact head is promoted',async()=>{
+it('reports checkpoint advancement without a failure after a newer exact head is promoted',async()=>{
  const owner=await fixture(),scope=await captureStorageGraphScope(source(),{owner,day,metric:'model',sourceId,sourceNamespace:namespace});
  const direct=await computeStorageGraphResult(bindings(),scope);
  expect(direct.state).toBe('complete');
@@ -392,10 +403,29 @@ it('defers an unavailable checkpoint after a newer exact head is promoted',async
   const saved=await saveStorageHistoryCheckpoint({target:target(),key,checkpoint:checkpointForKey(key),expectedHead:null});
   if(saved.status!=='saved')throw new Error('synthetic promotion did not finish');promotedHead=saved.headDigest;
  })},scope);
- expect(result).toEqual({state:'deferred',reason:'historical_checkpoint',failure:{phase:'graph_checkpoint_save',reason:'checkpoint_unavailable'}});
+ expect(result).toEqual({state:'deferred',reason:'checkpoint_advanced'});
  expect(promotedHead).toMatch(/^[a-f0-9]{64}$/);
  expect(await target().prepare('SELECT count(*) n FROM analytics_community_graph_results').first('n')).toBe(0);
 });
+
+it.each(['unchanged','null','retired','malformed'] as const)('keeps an unavailable save visible when the exact effective head is %s',async(headState)=>{
+ const scope=await effectiveFixture(),key=await effectiveKey(scope);
+ expect(await computeStorageGraphResult(bindings(),scope,{maxQueries:250,deadlineMs:Date.now()+60_000}))
+  .toEqual({state:'deferred',reason:'effective_checkpoint'});
+ const saved=await loadStorageHistoryCheckpoint({target:target(),key});
+ if(saved.status!=='ready')throw new Error('synthetic effective checkpoint missing');
+ const digest=await storageHistoryKeyDigest(key);
+ await expect(computeStorageGraphResult({...bindings(),target:unavailableCheckpointOwner(target(),async()=>{
+  if(headState==='retired')await retireStorageHistoryCheckpoint({target:target(),key,expectedHead:saved.headDigest,maxWrites:2});
+  if(headState==='null'||headState==='malformed')await target().prepare('UPDATE analytics_history_checkpoint_heads SET generation=? WHERE key_digest=?')
+   .bind(headState==='null'?null:'synthetic-invalid-head',digest).run();
+ })},scope,{deadlineMs:Date.now()+60_000}))
+  .rejects.toMatchObject({stage:'graph_checkpoint_save',reason:'checkpoint_unavailable'});
+ expect(await target().prepare('SELECT count(*) n FROM analytics_community_graph_results').first('n')).toBe(0);
+ expect(await target().prepare('SELECT generation,retired FROM analytics_history_checkpoint_heads WHERE key_digest=?').bind(digest).first())
+  .toEqual({generation:headState==='unchanged'?saved.headDigest:headState==='malformed'?'synthetic-invalid-head':null,
+   retired:headState==='retired'?1:0});
+},30000);
 
 it('preserves a retired legacy tombstone while a repaired checkpoint generation advances',async()=>{
  const owner=await fixture(),scope=await captureStorageGraphScope(source(),{owner,day,metric:'model',sourceId,sourceNamespace:namespace});
@@ -504,6 +534,54 @@ it.each([1,100])('routes correction-active owners through a resumable effective 
  await source().prepare("UPDATE storage_owner_revisions SET revision=revision+1 WHERE owner_digest=?").bind(owner.ownerDigest).run();
  await expect(readStorageGraphResult(bindings(),scope)).rejects.toThrow();
 },90000);
+
+it.each([false,true])('resumes a different effective successor after losing checkpoint CAS with preparation=%s',async(preparedFold)=>{
+ const scope=await effectiveFixture(),baseline=await finishEffectiveGraph(scope);
+ await clearSyntheticGraph(scope);
+ if(!('source'in scope.pin))throw new Error('effective source pin missing');
+ const pin=scope.pin;
+ const advance=(checkpoint?:StorageEffectiveHistoryCheckpoint)=>advanceStorageEffectiveAnalysis({source:source(),sourceNamespace:namespace,
+  owner:scope.owner,pin,day,metric:'model',nowMs:Date.parse(scope.fixedNow),checkpoint,
+  budget:{remainingQueries:950,deadlineMs:Date.now()+60_000}});
+ const first=await advance();
+ if(first.status!=='deferred'||!first.checkpoint)throw new Error('synthetic first effective page missing');
+ const key=await effectiveKey(scope,preparedFold),digest=await storageHistoryKeyDigest(key);
+ const initial=await saveStorageHistoryCheckpoint({target:target(),key,checkpoint:first.checkpoint,expectedHead:null});
+ if(initial.status!=='saved')throw new Error('synthetic initial checkpoint did not promote');
+ const competing=await advance(structuredClone(first.checkpoint));
+ if(competing.status!=='deferred'||!competing.checkpoint)throw new Error('synthetic competing effective page missing');
+ const winningCheckpoint=structuredClone(competing.checkpoint);
+ const observed=observeEffectiveQuotaPages(source());
+ let winningHead:string|undefined;
+ const race=beforeFirstCheckpointSave(target(),async()=>{
+  // The loser has already read four pages. Promote a different, one-page
+  // successor immediately before its save reads the head; no Promise timing
+  // or duplicate-generation short circuit can turn this into a false pass.
+  expect(observed.pages()).toBe(4);
+  const winner=await saveStorageHistoryCheckpoint({target:target(),key,checkpoint:winningCheckpoint,expectedHead:initial.headDigest});
+  if(winner.status!=='saved')throw new Error('synthetic winning checkpoint did not promote');
+  winningHead=winner.headDigest;
+ });
+ expect(await computeStorageGraphResult({...bindings(),source:observed.database,target:race.database},scope,
+  {deadlineMs:Date.now()+60_000,maxQueries:950,effectiveCheckpointPages:4,preparedFold}))
+  .toEqual({state:'deferred',reason:'checkpoint_advanced'});
+ expect(race.saves()).toBe(1);
+ expect(winningHead).toMatch(/^[a-f0-9]{64}$/u);
+ expect(winningHead).not.toBe(initial.headDigest);
+ expect(await loadStorageHistoryCheckpoint({target:target(),key}))
+  .toMatchObject({status:'ready',headDigest:winningHead,checkpoint:winningCheckpoint});
+ expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages WHERE key_digest=?').bind(digest).first('n')).toBe(2);
+ expect(await target().prepare('SELECT count(*) n FROM analytics_community_graph_results').first('n')).toBe(0);
+
+ const retry=await computeStorageGraphResult(bindings(),scope,
+  {deadlineMs:Date.now()+60_000,maxQueries:250,effectiveCheckpointPages:4,preparedFold});
+ expect(retry).toEqual({state:'deferred',reason:'effective_checkpoint'});
+ // A fresh invocation must resume the winner, then CAS from that exact head.
+ // This proves it did not simply restart at the previous or empty checkpoint.
+ expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages WHERE key_digest=? AND expected_head=?')
+  .bind(digest,winningHead!).first('n')).toBe(1);
+ expect((await finishEffectiveGraph(scope,4,950,preparedFold)).result.result).toEqual(baseline.result.result);
+},60000);
 
 it('reuses effective quota days across metrics and adjacent windows with exact cold and warm results',async()=>{
  await fixture(0,false,100);

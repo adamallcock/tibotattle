@@ -277,6 +277,8 @@ export interface StorageAnalyticsPass {
  sweepQueries?:number;sweepIterations?:number;
  sweepV11Worked?:number;sweepV1Worked?:number;sweepGraphWorked?:number;
  graphFailure?:StorageGraphFailureFields;
+ /** Exact-key head advances by another writer; at most two per invocation. */
+ graphCheckpointAdvances?:number;
  /** The prepared-day builder, closed and content-free. Absent means the lane is
   * switched off. Present with `opened:false` means it was switched on but never
   * admitted; `candidates` with no `built` and no `refused` means it selected
@@ -376,6 +378,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  const meter=createD1InvocationBudget(options.maxQueries??900);
  const scoped={...options,source:meter.wrap(options.source),target:meter.wrap(options.target)};
  let steps=0,recordsRead=0,dailyPublications=0,graphCalculations=0,graphFailure:StorageGraphFailureFields|undefined;
+ let graphCheckpointAdvances=0;
  let graphDayProjection:StorageGraphDayProjectionFields|undefined;
  // The three retirement sweeps run on EVERY iteration of the hot loop,
  // including a public-only pass whose own step is a no-op. A pass that
@@ -387,13 +390,15 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
   ({state,reason,steps,recordsRead,queriesUsed:meter.queriesUsed,dailyPublications,graphCalculations,
    sweepQueries:sweep.queries,sweepIterations:sweep.iterations,
    sweepV11Worked:sweep.v11Worked,sweepV1Worked:sweep.v1Worked,sweepGraphWorked:sweep.graphWorked,
-   ...(graphFailure?{graphFailure}:{}),...(graphDayProjection?{graphDayProjection}:{})});
+   ...(graphFailure?{graphFailure}:{}),...(graphCheckpointAdvances?{graphCheckpointAdvances}:{}),
+   ...(graphDayProjection?{graphDayProjection}:{})});
  // A graph-only pass has exactly one lane, and an exhausted lane reports itself
  // idle for the rest of the pass. Without this, a window that ended with its
  // owner-day still unfinished would report an idle cohort or ordinary progress
  // and read as "nothing to do" in the scheduler log while the same selection
  // keeps failing. The minute pass keeps its existing lane semantics.
- const graphOnlyStalled=():boolean=>options.graphOnly===true&&graphFailure!==undefined;
+ const graphOnlyStalled=():boolean=>options.graphOnly===true
+  &&(graphFailure!==undefined||graphCheckpointAdvances>1);
  try {
   if(Date.now()>=deadlineMs)return result('deferred','deadline');
   // Privacy cleanup is independent of publication and capacity admission for
@@ -679,6 +684,10 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
       if(meter.remainingQueries>=30)await retireStorageCommunityGraphPublications(scoped);
      }catch(error){laneFailure('graph_work',error);}
      if(graph.failure||graph.reason==='graph_failure')graphExhausted=true;
+     // A verified newer checkpoint is safe to reload with this same meter and
+     // deadline. Permit one contention retry; repeated competing heavy reads
+     // should wait for the next invocation instead of consuming its window.
+     if(graph.reason==='checkpoint_advanced'&&++graphCheckpointAdvances>1)graphExhausted=true;
      return graph.state==='idle';
     };
     // Both lanes need most of one scheduled window when both have work. The

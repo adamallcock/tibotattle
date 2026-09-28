@@ -8,7 +8,7 @@ import { advanceStorageCommunityDaily, advanceNextStorageCommunityDaily, readPub
 import { captureStorageCommunityAuthority, storageCommunityAuthorityIsCurrent, readStorageCommunityOwnerPage } from "../src/storage-community-authority";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
 import { env, reset, applyD1Migrations, type D1Migration } from "cloudflare:test";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { telemetryV11DomainManifestDigestInput, type TelemetryV11DomainManifest } from "@app-usagemonitor/telemetry-contract";
 import { authenticateDevice, createDeviceUploadAuthorization, claimDeviceUploadAuthorization } from "../src/device-auth";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
@@ -30,6 +30,9 @@ import { makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
 import { initializeStorageAnalyticsRuntime, runStorageAnalyticsPass, advanceStorageAnalytics } from "../src/storage-analytics-runtime";
 import { runStorageAnalyticsSchedule } from "../src/storage-analytics-worker";
+import * as storageCommunityGraphWork from '../src/storage-community-graph-work';
+import { createD1InvocationBudget } from '../src/d1-invocation-budget';
+import { StorageGraphOperationError } from '../src/storage-analytics-failure';
 
 interface Bindings extends Env { STORAGE_ANALYTICS_DB: D1Database; TEST_MIGRATIONS: D1Migration[];
   TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[]; TEST_TYPED_V11_ADMISSION_MIGRATIONS: D1Migration[];
@@ -678,7 +681,98 @@ describe('independent public daily publication',()=>{
     const result=await runStorageAnalyticsPass({...options(),target:failing,publishCommunity:true,publicOnly:true,
       graphOnly:true,maxSteps:4,maxQueries:900,deadlineMs:Date.now()+8*60_000,graphLeaseMs:570_000});
     expect(result.graphFailure).toEqual({phase:'graph_work',reason:'application'});
+    expect(result.graphCheckpointAdvances).toBeUndefined();
     expect(result).toMatchObject({state:'deferred',reason:'step_limit',graphCalculations:0,dailyPublications:0});
+  });
+  describe('graph checkpoint contention',()=>{
+    // Script only the graph attempt boundary. Control reads, publication
+    // retirement and the invocation meter still run against real D1 bindings.
+    const contention={state:'deferred' as const,reason:'checkpoint_advanced'};
+    const graphPass=(overrides:Partial<Parameters<typeof runStorageAnalyticsPass>[0]>={})=>
+      runStorageAnalyticsPass({...options(),publishCommunity:true,publicOnly:true,graphOnly:true,
+        maxSteps:32,maxQueries:240,deadlineMs:Date.now()+60_000,...overrides});
+    afterEach(()=>{vi.restoreAllMocks();});
+
+    it('retries one newer checkpoint with the same deadline and shared query meter, then completes',async()=>{
+      const maxQueries=240,meter=createD1InvocationBudget(maxQueries);
+      let now=Date.now();const deadlineMs=now+60_000;
+      vi.spyOn(Date,'now').mockImplementation(()=>now);
+      const allowances:number[]=[];
+      const graph=vi.spyOn(storageCommunityGraphWork,'advanceStorageCommunityGraphWork')
+        .mockImplementationOnce(async scoped=>{
+          expect(scoped.deadlineMs).toBe(deadlineMs);
+          expect(scoped.remainingQueries).toBe(meter.remainingQueries);
+          allowances.push(scoped.remainingQueries!);
+          await scoped.source.prepare('SELECT 1 AS synthetic_source_read').run();
+          await scoped.target.batch([scoped.target.prepare('SELECT 1 AS synthetic_target_read'),
+            scoped.target.prepare('SELECT 1 AS synthetic_target_read')]);
+          now+=200;
+          return contention;
+        }).mockImplementationOnce(async scoped=>{
+          expect(scoped.deadlineMs).toBe(deadlineMs);
+          expect(scoped.remainingQueries).toBe(meter.remainingQueries);
+          allowances.push(scoped.remainingQueries!);
+          await scoped.target.prepare('SELECT 1 AS synthetic_target_read').run();
+          return {state:'complete',metric:'fits',day:today()};
+        });
+      const result=await graphPass({source:meter.wrap(source()),target:meter.wrap(target()),
+        maxQueries,maxSteps:2,deadlineMs});
+      expect(graph).toHaveBeenCalledTimes(2);
+      expect(result).toMatchObject({state:'progress',reason:'step_limit',steps:2,graphCalculations:1,dailyPublications:0,
+        graphCheckpointAdvances:1});
+      expect(result.graphFailure).toBeUndefined();
+      expect(allowances[1]).toBeLessThan(allowances[0]!-3);
+      expect(result.queriesUsed).toBe(meter.queriesUsed);
+      expect(result.queriesUsed).toBeLessThanOrEqual(maxQueries);
+    });
+
+    it('stops after two competing checkpoints without recording a graph failure',async()=>{
+      const graph=vi.spyOn(storageCommunityGraphWork,'advanceStorageCommunityGraphWork').mockResolvedValue(contention);
+      const result=await graphPass();
+      expect(graph).toHaveBeenCalledTimes(2);
+      expect(result).toMatchObject({state:'deferred',reason:'step_limit',graphCalculations:0,dailyPublications:0,
+        graphCheckpointAdvances:2});
+      expect(result.steps).toBeLessThan(32);
+      expect(result.graphFailure).toBeUndefined();
+      expect(result.queriesUsed).toBeLessThanOrEqual(240);
+    });
+
+    it.each(['query_budget','deadline','step_limit'] as const)('does not retry beyond the existing %s limit',async boundary=>{
+      const maxQueries=240,meter=createD1InvocationBudget(maxQueries);
+      let now=Date.now();const deadlineMs=now+60_000;
+      vi.spyOn(Date,'now').mockImplementation(()=>now);
+      const graph=vi.spyOn(storageCommunityGraphWork,'advanceStorageCommunityGraphWork').mockImplementation(async scoped=>{
+        if(boundary==='query_budget'){
+          // Spend real statements on the source binding, leaving less than
+          // the graph admission floor in the same source-and-target meter.
+          await scoped.source.batch(Array.from({length:scoped.remainingQueries!-100},()=>
+            scoped.source.prepare('SELECT 1 AS synthetic_source_read')));
+        }else if(boundary==='deadline')now=deadlineMs;
+        return contention;
+      });
+      const result=await graphPass({source:meter.wrap(source()),target:meter.wrap(target()),maxQueries,
+        deadlineMs,maxSteps:boundary==='step_limit'?1:32});
+      expect(graph).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({state:boundary==='step_limit'?'progress':'deferred',reason:boundary,
+        steps:1,graphCalculations:0,dailyPublications:0,graphCheckpointAdvances:1});
+      expect(result.graphFailure).toBeUndefined();
+      expect(result.queriesUsed).toBe(meter.queriesUsed);
+      expect(result.queriesUsed).toBeLessThanOrEqual(maxQueries);
+    });
+
+    it.each(['reported','thrown'] as const)('stops on a genuine %s failure after the contention retry',async mode=>{
+      const failure={phase:'graph_checkpoint_save' as const,reason:'checkpoint_unavailable' as const};
+      const graph=vi.spyOn(storageCommunityGraphWork,'advanceStorageCommunityGraphWork')
+        .mockResolvedValueOnce(contention).mockImplementation(async()=>{
+          if(mode==='thrown')throw new StorageGraphOperationError(failure.phase,failure.reason);
+          return {state:'deferred',reason:'graph_failure',failure};
+        });
+      const result=await graphPass();
+      expect(graph).toHaveBeenCalledTimes(2);
+      expect(result).toMatchObject({state:'deferred',reason:'step_limit',graphCalculations:0,graphFailure:failure,
+        graphCheckpointAdvances:1});
+      expect(result.steps).toBeLessThan(32);
+    });
   });
   it('refuses a graph-only pass whose claim lease cannot bound its own window',async()=>{
     // A graph-only pass must publish community results from the public phase.
