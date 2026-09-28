@@ -33,12 +33,13 @@ const bindings=()=>({source:source(),target:target(),ledger:b.DELETION_LEDGER,so
 const runtime=(t=target())=>{const configured={...b,ENVIRONMENT:'synthetic-development'} as Env;
  Reflect.set(configured,'TELEMETRY_STORAGE_MODE','typed');Reflect.set(configured,'TELEMETRY_STORAGE_NAMESPACE',sourceNamespace);Reflect.set(configured,'ANALYTICS_DB',t);return configured;};
 const today=()=>new Date().toISOString().slice(0,10);
-beforeEach(async()=>{
- await reset();for(const migrations of [b.TEST_MIGRATIONS,b.TEST_TYPED_INGESTION_MIGRATIONS,b.TEST_INGESTION_BRIDGE_MIGRATIONS,b.TEST_TYPED_V11_ADMISSION_MIGRATIONS,b.TEST_TYPED_V1_ADMISSION_MIGRATIONS])await applyD1Migrations(source(),migrations);
- await applyD1Migrations(target(),b.TEST_ANALYTICS_MIGRATIONS);await applyD1Migrations(b.DELETION_LEDGER,b.TEST_DELETION_LEDGER_MIGRATIONS);
+async function initialize(analyticsMigrations: D1Migration[] = b.TEST_ANALYTICS_MIGRATIONS){
+ for(const migrations of [b.TEST_MIGRATIONS,b.TEST_TYPED_INGESTION_MIGRATIONS,b.TEST_INGESTION_BRIDGE_MIGRATIONS,b.TEST_TYPED_V11_ADMISSION_MIGRATIONS,b.TEST_TYPED_V1_ADMISSION_MIGRATIONS])await applyD1Migrations(source(),migrations);
+ await applyD1Migrations(target(),analyticsMigrations);await applyD1Migrations(b.DELETION_LEDGER,b.TEST_DELETION_LEDGER_MIGRATIONS);
  await initializeStorageSource(source(),sourceId);await initializeTypedV11Admission(source(),sourceNamespace);await initializeTypedV1Admission(source(),sourceNamespace);
  await applyD1Migrations(source(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);await initializeStorageAnalyticsRuntime(bindings());
-});
+}
+beforeEach(async()=>{await reset();await initialize();});
 async function fixture(days=1){
  const device=await createV11DeviceFixture(source(),{grant:true});const entries:TelemetryV11DomainManifest['days']=[];
  for(let n=days-1;n>=0;n--){
@@ -89,6 +90,44 @@ async function completedSharedFeature(ownerDigest:string){
  throw new Error('synthetic shared feature bound');
 }
 describe('cross-store physical erasure completion',()=>{
+ it('keeps erasure completion compatible with analytics schemas before model blocks',async()=>{
+  await reset();await initialize(b.TEST_ANALYTICS_MIGRATIONS.filter(migration=>migration.name<'0030_'));
+  const f=await fixture();await deliver();
+  expect(await eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId)).toMatchObject({deleted:true});
+  expect(await count('analytics_storage_erasure_receipts')).toBe(1);
+ });
+ it('fails closed when a model block schema is only partly installed',async()=>{
+  const f=await fixture();await deliver();
+  await target().prepare('DROP TABLE analytics_model_block_policy').run();
+  await expect(eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId))
+   .rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+  expect(await count('analytics_storage_erasure_receipts')).toBe(0);
+  expect(await b.DELETION_LEDGER.prepare('SELECT state FROM storage_erasure_jobs').first('state')).toBe('pending');
+ });
+ it('withholds an erasure receipt while an owner model policy survives damaged cleanup',async()=>{
+  const f=await fixture();await deliver();
+  const owner=await target().prepare(`SELECT revision,authority_epoch FROM analytics_owner_state
+   WHERE source_id=? AND owner_digest=?`).bind(sourceId,f.event.ownerDigest)
+   .first<{revision:number;authority_epoch:number}>();
+  expect(owner).toBeTruthy();
+  await target().prepare(`INSERT INTO analytics_model_block_policy
+   (source_id,owner_digest,policy_revision,source_namespace,owner_revision,authority_epoch,
+    input_revision,method,authority_digest,today_day,updated_ms)
+   VALUES(?,?,1,?,?,?,?,?,?,?,?)`)
+   .bind(sourceId,f.event.ownerDigest,sourceNamespace,owner!.revision,owner!.authority_epoch,
+    f.event.revision,MODEL_BLOCK_METHOD,'b'.repeat(64),today(),Date.now()).run();
+  expect(await count('analytics_model_block_policy')).toBe(1);
+  for(const trigger of ['analytics_model_block_policy_terminal_insert','analytics_model_block_policy_terminal_update',
+   'analytics_model_block_policy_owner_update','analytics_model_block_policy_owner_delete'])
+   await target().prepare(`DROP TRIGGER ${trigger}`).run();
+  await expect(eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId))
+   .rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+  expect(await count('analytics_model_block_policy')).toBe(1);
+  expect(await count('analytics_storage_erasure_receipts')).toBe(0);
+  expect(await b.DELETION_LEDGER.prepare('SELECT state FROM storage_erasure_jobs').first('state')).toBe('pending');
+  await target().prepare('DELETE FROM analytics_model_block_policy').run();await drain();
+  expect(await count('analytics_storage_erasure_receipts')).toBe(1);
+ });
  it('physically erases shared feature heads and parts before recording completion',async()=>{
   const f=await fixture();await deliver();await completedSharedFeature(f.event.ownerDigest);
   expect(await count('analytics_shared_feature_days')).toBe(1);

@@ -64,10 +64,12 @@ async function cacheRetentionErasureTables(target:D1Database):Promise<readonly s
  if (present.size>0 && required.some(name=>!present.has(name))) throw unavailable();
  return Object.freeze(CACHE_RETENTION_ERASURE_TABLES.filter(name=>present.has(name)));
 }
-const MODEL_BLOCK_ERASURE_TABLES = Object.freeze(['analytics_model_blocks','analytics_model_block_parts']);
+const MODEL_BLOCK_ERASURE_TABLES = Object.freeze([
+ 'analytics_model_blocks','analytics_model_block_parts','analytics_model_block_policy',
+]);
 async function modelBlockErasureTables(target:D1Database):Promise<readonly string[]> {
  const result=await target.prepare(`SELECT name FROM sqlite_schema WHERE type='table'
-   AND name IN ('analytics_model_blocks','analytics_model_block_parts')`).all<{name:string}>();
+   AND name IN ('analytics_model_blocks','analytics_model_block_parts','analytics_model_block_policy')`).all<{name:string}>();
  if(result.success!==true||!Array.isArray(result.results))throw unavailable();
  const rows=result.results;
  if(rows.length===0)return [];
