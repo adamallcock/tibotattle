@@ -1328,6 +1328,8 @@ test("the community allowance surface leads the product hero with honest labelin
     /data-range-days="30" class="active" aria-pressed="true"/u,
   );
   assert.match(html, /Pro 20x-equivalent allowance/u);
+  assert.match(html, /class="allowance-intro-copy" role="paragraph"[\s\S]*?id="community-allowance-source-summary"/u);
+  assert.match(html, /class="allowance-picker-row"[\s\S]*?data-allowance-view-controls[\s\S]*?id="community-allowance-range-controls"/u);
   assert.match(html, /API-price value of a Pro 20x-equivalent week: overall, by plan or by model/u);
   for (const view of ["aggregate", "plans", "models"]) {
     assert.equal(html.match(new RegExp(`data-allowance-view="${view}"`, "gu"))?.length, 2);
@@ -1672,6 +1674,10 @@ test("a published daily series renders friendly cumulative activity, latest-firs
 
   const table = container.descendants().find(({ tag }) => tag === "table");
   assert.ok(table, "a published daily series renders its table");
+  const tableRegion = container.descendants().find(element => element.className === "table-wrap snapshot-table");
+  assert.equal(tableRegion.attributes.get("role"), "region");
+  assert.equal(tableRegion.attributes.get("tabindex"), "0");
+  assert.equal(tableRegion.attributes.get("aria-label"), "Delayed daily community activity totals");
   const columnLabels = table
     .descendants()
     .filter((element) => element.tag === "th")
@@ -2238,9 +2244,13 @@ test("the allowance section renders the estimate with its visible caveat", () =>
   assert.match(container.text, /5 qualifying reset fits in the trailing 30 days/u);
   assert.match(container.text, /Latest published estimate \(Aug 7, 2026\)/u);
   assert.doesNotMatch(container.text, /Latest published estimate \(Aug 6, 2026\)/u);
-  // The methodology note names the merged multipliers and real 40pp gate.
-  assert.match(container.text, /Pro ×1, Pro 5x ×4, Plus ×20/u);
-  assert.match(container.text, /40-point observed-span floor/u);
+  // The methodology stays available inside the source disclosure, without a
+  // second visible paragraph below the aggregate chart.
+  const methodDetails = container.descendants().find(element => element.className === "snapshot-disclosure-details");
+  assert.ok(methodDetails);
+  assert.match(methodDetails.text, /Pro ×1, Pro 5x ×4, Plus ×20/u);
+  assert.match(methodDetails.text, /40-point observed-span floor/u);
+  assert.equal(container.children.at(-1).className, "community-daily-chart community-allowance-chart");
   // Chart present with band, line, and fit dots; sparse two-point series
   // carries the still-filling note.
   const svg = container.descendants().find(({ tag }) => tag === "svg");
