@@ -466,6 +466,7 @@ function renderCommunityAllowanceResult(payload, cache = lastCommunityAllowanceC
   const state = renderCommunityAllowanceSection({
     documentRef: document,
     container,
+    sourceContainer: $("#community-allowance-source-summary"),
     stateNode: $("#community-allowance-state"),
     payload,
     rangeDays: allowanceRangeDays,

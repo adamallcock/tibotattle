@@ -314,6 +314,8 @@ test("real public render shows model sample semantics, per-view labels and discl
       assert.match(cards[3].text, /No published estimate yet/u);
       assert.match(cards[0].text.trim(), /^GPT-6 Astra/u);
       assert.match(cards[0].className, /allowance-model-astra/u);
+      assert.ok(cards.every(card => !/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{1,2}, \d{4}\b/u.test(card.text)),
+        "model cards show source counts without repeating the publication day");
       assert.ok(cards.every(card => !card.text.includes("per 7 days")), "one shared unit caption replaces repeated card prose");
       assert.ok(cards.every(card => card.descendants().some(element => element.attributes.get("aria-hidden") === "true")));
       assert.equal(svg.attributes.get("aria-label"), "Community allowance by model");
@@ -322,12 +324,15 @@ test("real public render shows model sample semantics, per-view labels and discl
     } else if (view === "plans") {
       // Nothing is scaled any more: each plan is charted on its own axis at its
       // own week, so the old "Pro 5× ×4, Plus ×20" note would be a lie.
-      assert.match(container.text, /its own week at API prices, on its own scale/u);
+      assert.match(container.text, /Shading shows the middle 80% of qualifying reset fits/u);
+      assert.doesNotMatch(container.text, /Each plan is charted|Card values repeat/u);
       assert.equal(svg.attributes.get("aria-label"), "Community allowance by plan");
       const normalized = normalizeCommunityDailySeries(publicAllowanceFixture());
       const summaries = buildCommunityAllowanceChartModel(normalized, { view: "plans" }).latestSummaries;
       const cards = container.descendants().filter(element => element.tag === "article");
       assert.equal(cards.length, 3);
+      assert.ok(cards.every(card => !/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{1,2}, \d{4}\b/u.test(card.text)),
+        "plan cards show source counts without repeating the publication day");
       cards.forEach((card, index) => {
         // The card LEADS with the plan's own week and carries the reference
         // equivalent underneath, which is the inverse of the old layout.
@@ -347,6 +352,21 @@ test("real public render shows model sample semantics, per-view labels and discl
   assert.equal(renderCommunityAllowanceSection({ documentRef, container, payload: emptyModels, view: "models" }), "estimates_accumulating");
   assert.match(container.text, /No identified model estimates/u);
   assert.doesNotMatch(container.text, /no reset fit has qualified/u);
+});
+
+test("the source disclosure can sit beside the introduction without leaving a result gap", () => {
+  const documentRef = { documentElement: { lang: "en-US" }, createElement: tag => new Element(tag),
+    createElementNS: (_, tag) => new Element(tag) };
+  const container = new Element("div");
+  const sourceContainer = new Element("div");
+  const payload = publicAllowanceFixture(NOW);
+  assert.equal(renderCommunityAllowanceSection({ documentRef, container, sourceContainer, payload }), "published");
+  assert.match(sourceContainer.text, /About these sources/u);
+  assert.match(sourceContainer.text, /single source.*estimated capacity/u);
+  assert.doesNotMatch(container.text, /About these sources/u);
+  payload.allowanceState = "updating";
+  assert.equal(renderCommunityAllowanceSection({ documentRef, container, sourceContainer, payload }), "allowance_updating");
+  assert.equal(sourceContainer.children.length, 0, "unavailable estimates do not leave a stale disclosure");
 });
 
 test("legend focus dims other series without discarding data and limits keyboard inspection to that series", () => {
