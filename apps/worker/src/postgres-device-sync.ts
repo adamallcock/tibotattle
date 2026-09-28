@@ -465,6 +465,10 @@ export async function readPostgresDeviceSyncCapabilities(
       rank: format.format_rank,
       lifecycle: (row.incompatible_history
         && format.schema_version === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION)
+        // PostgreSQL has no qualified v1.1 writer / manifest / domain path.
+        // Registry acceptance alone must not advertise support to clients.
+        || (format.schema_version === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+          && format.lifecycle === "accepted")
         || (accountless && format.schema_version !== TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION)
         ? "blocked" as const : format.lifecycle,
     })),

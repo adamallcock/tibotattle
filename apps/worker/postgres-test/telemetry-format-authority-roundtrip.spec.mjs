@@ -237,13 +237,39 @@ test("PostgreSQL enforces per-format lifecycle, floors, consent, and successor a
     });
     const authority = await vite.ssrLoadModule("/src/postgres-telemetry-format-authority.ts");
     const transport = await vite.ssrLoadModule("/src/postgres-typed-v12-transport.ts");
+    const deviceSync = await vite.ssrLoadModule("/src/postgres-device-sync.ts");
+    const typedCodec = await vite.ssrLoadModule("/src/typed-telemetry-codec.ts");
     const constants = await vite.ssrLoadModule("/src/constants.ts");
     const nowEpoch = Date.now();
     const now = new Date(nowEpoch).toISOString();
+    const sourceNamespace = "synthetic-v11-capability-source";
+    await pool.query(
+      `INSERT INTO ${q(schema, "typed_telemetry_namespaces")} (id, original_id)
+       VALUES (1, $1)`,
+      [typedCodec.encodeTypedTelemetryId(sourceNamespace)],
+    );
+    await pool.query(
+      `INSERT INTO ${q(schema, "typed_v1_admission_state")} (
+         id, source_namespace, namespace_id, runtime_contract_version, next_source_row_id
+       ) VALUES (1, $1, 1, 1, 1)`,
+      [sourceNamespace],
+    );
+    await pool.query(
+      `INSERT INTO ${q(schema, "typed_v11_admission_state")} (
+         id, source_namespace, namespace_id, runtime_contract_version, next_source_row_id
+       ) VALUES (1, $1, 1, 1, 1)`,
+      [sourceNamespace],
+    );
+    const capabilityOptions = { ...options, sourceNamespace, nowEpoch };
     const social = await seedSocialDevice({
       pool, schema, nowEpoch, consentVersion: constants.TELEMETRY_CONSENT_VERSION,
     });
     const principal = { participantId: social.participantId, deviceId: social.deviceId };
+    await pool.query(
+      `INSERT INTO ${q(schema, "attribution_enrollments")} (participant_id, namespace, created_at)
+       VALUES ($1, $2, $3::timestamptz)`,
+      [social.participantId, createHash("sha256").update(`namespace:${social.participantId}`).digest("hex"), now],
+    );
 
     await authority.assertPostgresTelemetryTransportWriteAllowed(
       pool, principal, "telemetry-contribution-v0.1", { ...options, nowEpoch },
@@ -268,6 +294,40 @@ test("PostgreSQL enforces per-format lifecycle, floors, consent, and successor a
       `UPDATE ${q(schema, "telemetry_transport_formats")}
           SET lifecycle='accepted' WHERE schema_version='telemetry-contribution-v1.1'`,
     );
+    const acceptedRegistryCapabilities = await deviceSync.readPostgresDeviceSyncCapabilities(
+      pool, social.participantId, social.deviceId, "https://private.example", capabilityOptions,
+    );
+    assert.deepEqual(acceptedRegistryCapabilities.formats.map(({ schemaVersion, lifecycle }) => ({
+      schemaVersion, lifecycle,
+    })), [
+      { schemaVersion: "telemetry-contribution-v0.1", lifecycle: "accepted" },
+      { schemaVersion: "telemetry-contribution-v0.2", lifecycle: "blocked" },
+      { schemaVersion: "telemetry-contribution-v1.0", lifecycle: "accepted" },
+      { schemaVersion: "telemetry-contribution-v1.1", lifecycle: "blocked" },
+    ], "v1.1 registry acceptance is not sufficient to advertise a PostgreSQL writer");
+    assert.equal(acceptedRegistryCapabilities.consentCurrent, false);
+    await pool.query(
+      `UPDATE ${q(schema, "telemetry_transport_formats")}
+          SET lifecycle='staged' WHERE schema_version='telemetry-contribution-v1.1'`,
+    );
+    const stagedRegistryCapabilities = await deviceSync.readPostgresDeviceSyncCapabilities(
+      pool, social.participantId, social.deviceId, "https://private.example", capabilityOptions,
+    );
+    assert.equal(stagedRegistryCapabilities.formats.at(-1)?.lifecycle, "staged",
+      "a staged v1.1 registry row remains explicitly staged");
+    await pool.query(
+      `UPDATE ${q(schema, "telemetry_transport_formats")}
+          SET lifecycle='blocked' WHERE schema_version='telemetry-contribution-v1.1'`,
+    );
+    const blockedRegistryCapabilities = await deviceSync.readPostgresDeviceSyncCapabilities(
+      pool, social.participantId, social.deviceId, "https://private.example", capabilityOptions,
+    );
+    assert.equal(blockedRegistryCapabilities.formats.at(-1)?.lifecycle, "blocked",
+      "a blocked v1.1 registry row remains blocked");
+    await pool.query(
+      `UPDATE ${q(schema, "telemetry_transport_formats")}
+          SET lifecycle='accepted' WHERE schema_version='telemetry-contribution-v1.1'`,
+    );
     await assert.rejects(
       authority.assertPostgresTelemetryTransportWriteAllowed(
         pool, principal, "telemetry-contribution-v1.1", { ...options, nowEpoch },
@@ -278,6 +338,12 @@ test("PostgreSQL enforces per-format lifecycle, floors, consent, and successor a
     await authority.assertPostgresTelemetryTransportWriteAllowed(
       pool, principal, "telemetry-contribution-v1.1", { ...options, nowEpoch },
     );
+    const consentedCapabilities = await deviceSync.readPostgresDeviceSyncCapabilities(
+      pool, social.participantId, social.deviceId, "https://private.example", capabilityOptions,
+    );
+    assert.equal(consentedCapabilities.consentCurrent, true);
+    assert.equal(consentedCapabilities.formats.at(-1)?.lifecycle, "blocked",
+      "social consent does not make the unsupported PostgreSQL v1.1 writer routable");
 
     await pool.query(
       `UPDATE ${q(schema, "telemetry_transport_participant_floors")}
@@ -309,6 +375,12 @@ test("PostgreSQL enforces per-format lifecycle, floors, consent, and successor a
     );
 
     const accountless = await seedAccountlessDevice({ pool, schema, nowEpoch });
+    await pool.query(
+      `INSERT INTO ${q(schema, "attribution_enrollments")} (participant_id, namespace, created_at)
+       VALUES ($1, $2, $3::timestamptz)`,
+      [accountless.participantId,
+        createHash("sha256").update(`namespace:${accountless.participantId}`).digest("hex"), now],
+    );
     const accountlessPrincipal = {
       participantId: accountless.participantId,
       deviceId: accountless.deviceId,
@@ -332,6 +404,15 @@ test("PostgreSQL enforces per-format lifecycle, floors, consent, and successor a
     await authority.assertPostgresTelemetryTransportWriteAllowed(
       pool, accountlessPrincipal, "telemetry-contribution-v1.1", { ...options, nowEpoch },
     );
+    const accountlessCapabilities = await deviceSync.readPostgresDeviceSyncCapabilities(
+      pool, accountless.participantId, accountless.deviceId,
+      "https://private.example", capabilityOptions,
+    );
+    assert.equal(accountlessCapabilities.authorityKind, "accountless");
+    assert.equal(accountlessCapabilities.authorizationCurrent, true,
+      "the existing accountless shared-v1.1 grant status remains visible");
+    assert.equal(accountlessCapabilities.formats.at(-1)?.lifecycle, "blocked",
+      "an accountless grant does not imply a PostgreSQL v1.1 writer exists");
 
     await assert.rejects(
       authority.assertPostgresTelemetryTransportWriteAllowed(
@@ -353,6 +434,12 @@ test("PostgreSQL enforces per-format lifecycle, floors, consent, and successor a
     await authority.assertPostgresTelemetryTransportWriteAllowed(
       pool, principal, "telemetry-contribution-v1.2", { ...options, nowEpoch },
     );
+    const v12Capabilities = await deviceSync.readPostgresDeviceSyncV12Capabilities(
+      pool, social.participantId, social.deviceId,
+      "https://private.example", capabilityOptions,
+    );
+    assert.equal(v12Capabilities.successor.lifecycle, "accepted",
+      "the separate v1.2 capability path is unaffected by the v1.1 failsafe");
     await transport.authenticatePostgresDevice(pool, accountless.bearer, { ...options, nowEpoch });
     await authority.assertPostgresTelemetryTransportWriteAllowed(
       pool, accountlessPrincipal, "telemetry-contribution-v1.2", { ...options, nowEpoch },
