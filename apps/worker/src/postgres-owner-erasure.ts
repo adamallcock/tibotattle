@@ -107,9 +107,9 @@ const ALLOWED_PARTICIPANT_TABLES = Object.freeze({
   web_sessions: [1, 1],
   device_pairings: [1, 1],
   device_credentials: [1, 1],
-  // The fresh credential-renewal smoke owner has one replay receipt, which is
-  // erased with its device and participant.
-  device_credential_rotations: [1, 1],
+  // A pre-renewal smoke owner has none; after credential renewal it has one.
+  // More than one remains outside the bounded synthetic family.
+  device_credential_rotations: [0, 1],
   device_upload_authorizations: [0, 4],
   telemetry_v12_device_capabilities: [1, 1],
   storage_v11_owner_links: [1, 1],
@@ -292,7 +292,7 @@ async function validateParticipantFamily(
   client: PostgresClient,
   primarySchema: string,
   participantId: string,
-): Promise<void> {
+): Promise<ReadonlyMap<string, number>> {
   const catalog = parseRows<{ readonly table_name: string }>(await client.query(
     `SELECT DISTINCT columns.table_name
        FROM information_schema.columns columns
@@ -324,8 +324,12 @@ async function validateParticipantFamily(
     await client.query(countsSql, [participantId]),
   );
   if (rows.length !== names.length) fail("SYNTHETIC_OWNER_ERASURE_FAMILY_UNSUPPORTED");
+  const counts = new Map<string, number>(
+    Object.keys(ALLOWED_PARTICIPANT_TABLES).map((name) => [name, 0]),
+  );
   for (const row of rows) {
     const count = parseCount(row.row_count);
+    counts.set(row.table_name, count);
     const limit = Object.hasOwn(ALLOWED_PARTICIPANT_TABLES, row.table_name)
       ? ALLOWED_PARTICIPANT_TABLES[row.table_name as keyof typeof ALLOWED_PARTICIPANT_TABLES]
       : [0, 0];
@@ -333,6 +337,7 @@ async function validateParticipantFamily(
       fail("SYNTHETIC_OWNER_ERASURE_FAMILY_UNSUPPORTED");
     }
   }
+  return counts;
 }
 
 async function readChunkReferences(
@@ -435,7 +440,7 @@ async function fenceAndRead(
           || participant.state === "deleting" && participant.deletion_session_id !== fenceId) {
         fail("SYNTHETIC_OWNER_ERASURE_STATE_UNEXPECTED");
       }
-      await validateParticipantFamily(client, primarySchema, participantId);
+      const familyCounts = await validateParticipantFamily(client, primarySchema, participantId);
       const ownerRows = parseRows<OwnerLinkRow>(await client.query(
         `SELECT owner_digest, state
            FROM ${table(primarySchema, "storage_v11_owner_links")}
@@ -455,15 +460,59 @@ async function fenceAndRead(
       if (consuming.length !== 1 || parseCount(consuming[0]?.count) !== 0) {
         fail("SYNTHETIC_OWNER_ERASURE_UPLOAD_IN_PROGRESS");
       }
-      const manifestRows = parseRows<{ readonly count: string | number }>(await client.query(
-        `SELECT count(*)::text AS count FROM ${table(primarySchema, "telemetry_v12_day_manifests")}
-          WHERE participant_id = $1`,
+      const manifestRows = parseRows<{
+        readonly state: string;
+        readonly expected_chunk_count: string | number;
+      }>(await client.query(
+        `SELECT state, expected_chunk_count
+           FROM ${table(primarySchema, "telemetry_v12_day_manifests")}
+          WHERE participant_id = $1 ORDER BY id FOR UPDATE`,
         [participantId],
       ));
       const refs = await readChunkReferences(client, primarySchema, participantId);
-      if (parseCount(manifestRows[0]?.count) > 1 || refs.length > 1
-          || refs.length === 1 && parseCount(manifestRows[0]?.count) !== 1) {
+      if (manifestRows.length > 1 || refs.length > 1
+          || refs.length === 1 && manifestRows.length !== 1) {
         fail("SYNTHETIC_OWNER_ERASURE_FAMILY_UNSUPPORTED");
+      }
+      if (familyCounts.get("device_credential_rotations") === 0) {
+        const credentials = parseRows<{
+          readonly credential_generation: string | number;
+          readonly state: string;
+        }>(await client.query(
+          `SELECT credential_generation, state
+             FROM ${table(primarySchema, "device_credentials")}
+            WHERE participant_id = $1 FOR UPDATE`,
+          [participantId],
+        ));
+        const inputRevision = participant.state === "active" ? 0 : 1;
+        const expectedCredentialState = participant.state === "active" ? "active" : "revoked";
+        const preRenewalTables = [
+          "device_upload_authorizations",
+          "telemetry_v12_domain_predecessors",
+          "telemetry_v12_domains",
+          "telemetry_v12_domain_heads",
+          "storage_v12_event_sources",
+          "input_source_digests",
+          "current_queue",
+          "telemetry_transport_participant_floors",
+          "telemetry_transport_device_floors",
+        ];
+        const inputVersionRows = parseRows<{ readonly revision: string | number }>(await client.query(
+          `SELECT revision FROM ${table(primarySchema, "input_versions")}
+            WHERE participant_id = $1 FOR UPDATE`,
+          [participantId],
+        ));
+        if (manifestRows.length !== 1 || manifestRows[0]?.state !== "staged"
+            || Number(manifestRows[0]?.expected_chunk_count) !== 1 || refs.length !== 0
+            || credentials.length !== 1
+            || Number(credentials[0]?.credential_generation) !== 1
+            || credentials[0]?.state !== expectedCredentialState
+            || familyCounts.get("input_versions") !== 1
+            || inputVersionRows.length !== 1
+            || parseCount(inputVersionRows[0]?.revision) !== inputRevision
+            || preRenewalTables.some((name) => familyCounts.get(name) !== 0)) {
+          fail("SYNTHETIC_OWNER_ERASURE_FAMILY_UNSUPPORTED");
+        }
       }
       if (participant.state === "active") {
         await client.query(

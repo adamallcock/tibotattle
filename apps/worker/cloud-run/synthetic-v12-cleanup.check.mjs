@@ -491,7 +491,11 @@ function qualified(schema, name) {
   return `"${schema}"."${name}"`;
 }
 
-async function seedOwner(pool, schema, { withChunk = false, withStagedManifest = false } = {}) {
+async function seedOwner(pool, schema, {
+  withChunk = false,
+  withStagedManifest = false,
+  withCredentialRotation = true,
+} = {}) {
   const participantId = `synthetic-v12-smoke-${randomUUID()}`;
   const sessionId = randomUUID();
   const pairingId = randomUUID();
@@ -531,17 +535,20 @@ async function seedOwner(pool, schema, { withChunk = false, withStagedManifest =
     `INSERT INTO ${qualified(schema, "device_credentials")} (
        id, participant_id, authority_kind, paired_via_pairing_id, secret_hash,
        state, issued_at, expires_at, last_used_at, social_verified_at, credential_generation
-     ) VALUES ($1, $2, 'social', $3, $4, 'active', $5, $6, $5, $5, 2)`,
-    [deviceId, participantId, pairingId, replacementSecretHash, now, later],
+     ) VALUES ($1, $2, 'social', $3, $4, 'active', $5, $6, $5, $5, $7)`,
+    [deviceId, participantId, pairingId, replacementSecretHash, now, later,
+      withCredentialRotation ? 2 : 1],
   );
-  await pool.query(
-    `INSERT INTO ${qualified(schema, "device_credential_rotations")} (
-       id, device_id, participant_id, prior_secret_hash, replacement_secret_hash,
-       attempt_id, generation, rotated_at, retire_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, 2, $7, $8)`,
-    [randomUUID(), deviceId, participantId, priorSecretHash, replacementSecretHash,
-      randomUUID(), now, later],
-  );
+  if (withCredentialRotation) {
+    await pool.query(
+      `INSERT INTO ${qualified(schema, "device_credential_rotations")} (
+         id, device_id, participant_id, prior_secret_hash, replacement_secret_hash,
+         attempt_id, generation, rotated_at, retire_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, 2, $7, $8)`,
+      [randomUUID(), deviceId, participantId, priorSecretHash, replacementSecretHash,
+        randomUUID(), now, later],
+    );
+  }
   await pool.query(
     `INSERT INTO ${qualified(schema, "telemetry_v12_device_capabilities")} (
        participant_id, device_id, telemetry_schema_version, field_dictionary_version,
@@ -912,7 +919,10 @@ test("PG17 owner-erasure fixture fences one exact owner, retries an object failu
     assert.equal(deletes.length, 2,
       "historical object keys are not silently omitted from object erasure");
 
-    const partialFixture = await seedOwner(primaryPool, primarySchema, { withStagedManifest: true });
+    const partialFixture = await seedOwner(primaryPool, primarySchema, {
+      withStagedManifest: true,
+      withCredentialRotation: false,
+    });
     const partialShape = await primaryPool.query(
       `SELECT
          (SELECT count(*)::int FROM ${qualified(primarySchema, "telemetry_v12_day_manifests")}
@@ -951,6 +961,23 @@ test("PG17 owner-erasure fixture fences one exact owner, retries an object failu
     const partialReplay = await eraseSyntheticPostgresV12Owner(partialOptions);
     assert.deepEqual(partialReplay, { status: "already_complete", objectsDeleted: 0 });
     assert.equal(emptyDeletes.length, 1, "an exact replay must not invoke storage deletion twice");
+
+    const lateNoRotationFixture = await seedOwner(primaryPool, primarySchema, {
+      withChunk: true,
+      withCredentialRotation: false,
+    });
+    await assert.rejects(
+      eraseSyntheticPostgresV12Owner({ ...options, participantId: lateNoRotationFixture.participantId }),
+      (error) => error?.code === "SYNTHETIC_OWNER_ERASURE_FAMILY_UNSUPPORTED",
+      "zero rotation receipts are accepted only for the staged pre-renewal, zero-chunk fixture",
+    );
+    const lateNoRotationState = await primaryPool.query(
+      `SELECT state FROM ${qualified(primarySchema, "participants")} WHERE id=$1`,
+      [lateNoRotationFixture.participantId],
+    );
+    assert.equal(lateNoRotationState.rows[0]?.state, "active",
+      "the mismatched no-rotation family is refused before fencing or object deletion");
+    assert.equal(deletes.length, 2);
   } finally {
     for (const schema of createdSchemas.reverse()) {
       try { await primaryPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); } catch {}
@@ -1179,7 +1206,10 @@ test("PG17 recovery selector resolves only a staged, zero-chunk synthetic owner 
     assert.equal(Math.floor(server.rows[0].version / 10_000), 17);
     await pool.query(`CREATE SCHEMA "${primarySchema}"`);
     await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool });
-    const fixture = await seedOwner(pool, primarySchema, { withStagedManifest: true });
+    const fixture = await seedOwner(pool, primarySchema, {
+      withStagedManifest: true,
+      withCredentialRotation: false,
+    });
     const row = await pool.query(
       `SELECT created_at FROM ${qualified(primarySchema, "participants")} WHERE id=$1`,
       [fixture.participantId],
