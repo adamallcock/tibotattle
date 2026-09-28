@@ -3138,6 +3138,23 @@
       "provenance": "docs/runbooks/macos-stable-release-runbook.md",
       "provenanceReason": null,
       "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/lib/macos-pf-credential-qualification.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Temporary runner-UID PF anchor that blocks external TCP/UDP, proven effective before each signed-app launch, for disposable hosted credential qualification only; not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/smoke-electron-macos-credentials.mjs",
+        "scripts/run-signed-electron-staging.mjs",
+        "test/smoke-electron-macos-credentials.test.mjs"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
+      "provenanceReason": null,
+      "legacyPaths": []
     }
   ]
 }
