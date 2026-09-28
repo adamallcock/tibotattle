@@ -45,6 +45,30 @@ function v12Capability(destinationOrigin = BACKEND_ORIGIN) {
   };
 }
 
+function communityDailyResponse(from = "2026-09-01", to = "2026-09-02") {
+  return {
+    schemaVersion: "community-daily-read-v1.0",
+    from,
+    to,
+    allowanceState: "updating",
+    allowanceReadState: "confirmed",
+    days: [{
+      day: from,
+      revision: 1,
+      releasedAt: `${from}T03:00:00.000Z`,
+      payload: {
+        schemaVersion: "community-daily-aggregate-v1.0",
+        policyVersion: "community-daily-v1.0",
+        day: from,
+        revision: 1,
+        immutableRevision: true,
+        recomputesOnLateData: true,
+        totals: { contributingDevices: 1, usageEvents: 2 },
+      },
+    }],
+  };
+}
+
 class MemoryResponse extends EventEmitter {
   constructor() {
     super();
@@ -135,6 +159,181 @@ test("test-only gateway pins public origin, private backend, and token audience"
   assert.throws(() => configuration({ OAUTH_GATEWAY_BACKEND_ORIGIN: "https://example.invalid" }), /OAUTH_GATEWAY_ORIGIN_INVALID/);
   assert.throws(() => configuration({ OAUTH_GATEWAY_BACKEND_AUDIENCE: "https://example.invalid" }), /OAUTH_GATEWAY_AUDIENCE_INVALID/);
   assert.throws(() => configuration({ OAUTH_GATEWAY_PUBLIC_ORIGIN: "http://tibotattle.example" }), /OAUTH_GATEWAY_PUBLIC_ORIGIN_INVALID/);
+});
+
+test("public community daily GET forwards only its bounded query and reduced projection", async () => {
+  const expected = communityDailyResponse("2025-09-01", "2026-09-01");
+  const { calls: metadataCalls, fetchImpl: metadata } = metadataFetch();
+  const backendCalls = [];
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      backendCalls.push({ url: new URL(input), options });
+      return new Response(JSON.stringify(expected), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+    logger: () => {},
+  });
+
+  const result = await invoke(handler, {
+    method: "GET",
+    url: "/api/v1/community/daily?from=2025-09-01&to=2026-09-01",
+    body: null,
+    headers: {
+      cookie: SESSION_COOKIE,
+      authorization: "Bearer caller-controlled",
+      "x-usage-monitor-csrf": "caller-csrf",
+      "x-forwarded-host": "attacker.invalid",
+      "cf-connecting-ip": "203.0.113.8",
+    },
+  });
+
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.json(), expected);
+  assert.equal(metadataCalls.length, 1);
+  assert.equal(backendCalls.length, 1);
+  const [{ url, options }] = backendCalls;
+  assert.equal(url.origin, BACKEND_ORIGIN);
+  assert.equal(url.pathname, "/api/v1/community/daily");
+  assert.equal(url.search, "?from=2025-09-01&to=2026-09-01");
+  assert.equal(options.method, "GET");
+  assert.equal(options.body, undefined);
+  assert.equal(options.headers.get("accept"), "application/json");
+  assert.equal(options.headers.get("authorization"), null);
+  assert.equal(options.headers.get("cookie"), null);
+  assert.equal(options.headers.get("x-usage-monitor-csrf"), null);
+  assert.equal(options.headers.get("x-forwarded-host"), null);
+  assert.equal(options.headers.get("cf-connecting-ip"), null);
+  assert.equal(options.headers.get("x-serverless-authorization"), `Bearer ${TOKEN}`);
+});
+
+test("public community daily rejects malformed ranges, methods, and cross-origin reads before proxying", async () => {
+  let metadataCalls = 0;
+  let backendCalls = 0;
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input) => {
+      if (new URL(input).origin === "http://metadata.google.internal") {
+        metadataCalls += 1;
+        return metadataResponse();
+      }
+      backendCalls += 1;
+      return new Response(JSON.stringify(communityDailyResponse()), {
+        headers: { "content-type": "application/json" },
+      });
+    },
+    logger: () => {},
+  });
+  const invalidRanges = [
+    "/api/v1/community/daily",
+    "/api/v1/community/daily?from=2026-09-01",
+    "/api/v1/community/daily?from=2026-09-01&to=2026-09-02&extra=1",
+    "/api/v1/community/daily?from=2026-09-01&from=2026-09-02&to=2026-09-02",
+    "/api/v1/community/daily?from=2026-02-30&to=2026-03-01",
+    "/api/v1/community/daily?from=2026-09-02&to=2026-09-01",
+    "/api/v1/community/daily?from=2025-08-31&to=2026-09-01",
+  ];
+  for (const url of invalidRanges) {
+    const result = await invoke(handler, { method: "GET", url, body: null });
+    assert.equal(result.status, 404, url);
+    assert.equal(result.json().error.code, "NOT_FOUND", url);
+  }
+
+  const wrongMethod = await invoke(handler, {
+    method: "POST",
+    url: "/api/v1/community/daily?from=2026-09-01&to=2026-09-02",
+    body: "{}",
+  });
+  assert.equal(wrongMethod.status, 405);
+  assert.equal(wrongMethod.headers.allow, "GET");
+
+  const crossOrigin = await invoke(handler, {
+    method: "GET",
+    url: "/api/v1/community/daily?from=2026-09-01&to=2026-09-02",
+    body: null,
+    headers: { origin: "https://attacker.invalid" },
+  });
+  assert.equal(crossOrigin.status, 403);
+  assert.equal(crossOrigin.json().error.code, "CSRF_INVALID");
+  assert.equal(metadataCalls, 0);
+  assert.equal(backendCalls, 0);
+});
+
+test("public community daily fails closed on response drift and enforces its response cap", async () => {
+  const publishedDay = communityDailyResponse().days[0];
+  const responses = [
+    "not-json",
+    JSON.stringify({ ...communityDailyResponse(), allowanceState: "ready" }),
+    JSON.stringify({ ...communityDailyResponse(), from: "2026-09-02" }),
+    JSON.stringify({ ...communityDailyResponse(), allowanceBreakdowns: {} }),
+    JSON.stringify({
+      ...communityDailyResponse(),
+      days: [{ ...publishedDay, payload: {
+        ...publishedDay.payload,
+        allowance: { state: "ready" },
+      } }],
+    }),
+    JSON.stringify({
+      ...communityDailyResponse(),
+      days: [{ ...publishedDay, payload: {
+        ...publishedDay.payload,
+        capacityByPlanType: {},
+      } }],
+    }),
+    JSON.stringify({ ...communityDailyResponse(), days: [{
+      ...publishedDay,
+      day: "2026-09-03",
+      payload: { ...publishedDay.payload, day: "2026-09-03" },
+    }] }),
+    JSON.stringify({ ...communityDailyResponse(), days: [publishedDay, publishedDay] }),
+    JSON.stringify({ ...communityDailyResponse(), days: [{ ...publishedDay, releasedAt: "not-a-time" }] }),
+  ];
+  const { fetchImpl: metadata } = metadataFetch();
+  let backendIndex = 0;
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      const body = responses[backendIndex++];
+      return new Response(body, { headers: { "content-type": "application/json" } });
+    },
+    logger: () => {},
+  });
+  for (const body of responses) {
+    const result = await invoke(handler, {
+      method: "GET",
+      url: "/api/v1/community/daily?from=2026-09-01&to=2026-09-02",
+      body: null,
+    });
+    assert.equal(result.status, 502);
+    assert.equal(result.json().error.code, "UPSTREAM_UNAVAILABLE");
+    assert.equal(result.body.includes(Buffer.from(body)), false);
+  }
+  assert.equal(backendIndex, responses.length);
+
+  const marker = "private-community-response-marker";
+  const oversizedJson = JSON.stringify(`${marker}${"x".repeat(8 * 1_024 * 1_024)}`);
+  const logs = [];
+  const oversizedHandler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      return new Response(oversizedJson, { headers: { "content-type": "application/json" } });
+    },
+    logger: (line) => logs.push(line),
+  });
+  const oversized = await invoke(oversizedHandler, {
+    method: "GET",
+    url: "/api/v1/community/daily?from=2026-09-01&to=2026-09-02",
+    body: null,
+  });
+  assert.equal(oversized.status, 502);
+  assert.equal(oversized.json().error.code, "UPSTREAM_UNAVAILABLE");
+  assert.equal(oversized.body.includes(Buffer.from(marker)), false);
+  assert.equal(logs.join("\n").includes(marker), false);
 });
 
 test("Google start forwards only the allowlisted request and separates serverless from application authorization", async () => {

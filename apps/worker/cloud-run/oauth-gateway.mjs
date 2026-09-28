@@ -33,11 +33,24 @@ const V12_DAY_MANIFEST_READ_ROUTE = Object.freeze({
   requireDeviceAuthorization: true, allowMissingOrigin: true, rejectCookie: true,
   queryContract: "day_range",
 });
+const COMMUNITY_DAILY_MAX_DAYS = 366;
+// The PostgreSQL publisher permits up to 256 KiB per daily payload (91.5 MiB
+// across this route's full 366-day query). Keep this test gateway at
+// 8 MiB, or 32 MiB of raw response buffers at the four-request limit, before
+// UTF-8 decoding and JSON parsing overhead. Dense full-year responses are an
+// explicit parity qualification gap.
+const COMMUNITY_DAILY_MAX_RESPONSE_BYTES = 8 * 1_024 * 1_024;
 const ROUTES = new Map([
   ["/api/health", Object.freeze({
     id: "health", method: "GET", body: "none", maxBodyBytes: 0,
     responseTypes: ["application/json"], maxResponseBytes: 16 * 1_024,
     sessionCookie: false, forwardAuthorization: false, forwardCsrf: false,
+  })],
+  ["/api/v1/community/daily", Object.freeze({
+    id: "community_daily", method: "GET", body: "none", maxBodyBytes: 0,
+    responseTypes: ["application/json"], maxResponseBytes: COMMUNITY_DAILY_MAX_RESPONSE_BYTES,
+    sessionCookie: false, forwardAuthorization: false, forwardCsrf: false,
+    queryContract: "community_daily",
   })],
   ["/api/v1/identity/google/start", Object.freeze({
     id: "google_start", method: "POST", body: "json", maxBodyBytes: 4_096,
@@ -224,6 +237,12 @@ const CALLBACK_QUERY_HEADER = "x-tibotattle-google-callback-query";
 const SESSION_COOKIE_MEMBER = /^__Host-usage_monitor_session=[A-Za-z0-9_.-]{0,384}$/u;
 const JWT_PATTERN = /^[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}$/u;
 const SAME_ORIGIN_FETCH_SITE = "same-origin";
+function validCommunityDayString(day) {
+  return typeof day === "string"
+    && /^\d{4}-\d{2}-\d{2}$/u.test(day)
+    && Number.isFinite(Date.parse(`${day}T00:00:00.000Z`))
+    && new Date(`${day}T00:00:00.000Z`).toISOString().slice(0, 10) === day;
+}
 const RESPONSE_HEADERS = Object.freeze([
   "allow",
   "cache-control",
@@ -338,7 +357,19 @@ function identifyRoute(requestTarget, publicOrigin, requestMethod) {
     ? routeDefinition.getRoute : routeDefinition;
   if (!route) return null;
   if (route.id !== "google_callback") {
-    if (route.queryContract !== "day_range") {
+    if (route.queryContract === "community_daily") {
+      const queryKeys = [...url.searchParams.keys()];
+      const from = url.searchParams.get("from");
+      const to = url.searchParams.get("to");
+      if (queryKeys.length !== 2
+          || queryKeys.some((key) => key !== "from" && key !== "to")
+          || url.searchParams.getAll("from").length !== 1
+          || url.searchParams.getAll("to").length !== 1
+          || !validCommunityDayString(from) || !validCommunityDayString(to)) return null;
+      const rangeDays = (Date.parse(`${to}T00:00:00.000Z`)
+        - Date.parse(`${from}T00:00:00.000Z`)) / 86_400_000 + 1;
+      if (rangeDays < 1 || rangeDays > COMMUNITY_DAILY_MAX_DAYS) return null;
+    } else if (route.queryContract !== "day_range") {
       if (queryStart !== -1) return null;
     } else {
       const queryKeys = [...url.searchParams.keys()];
@@ -353,6 +384,50 @@ function identifyRoute(requestTarget, publicOrigin, requestMethod) {
     url,
     allowedMethods: routeDefinition.allowedMethods ?? route.method,
   });
+}
+
+function communityDailyResponseBody(body, expectedFrom, expectedTo) {
+  let value;
+  try { value = JSON.parse(body.toString("utf8")); } catch {
+    throw new Error("UPSTREAM_COMMUNITY_DAILY_INVALID");
+  }
+  const exactKeys = (candidate, keys) => candidate !== null
+    && typeof candidate === "object" && !Array.isArray(candidate)
+    && Object.keys(candidate).length === keys.length
+    && keys.every((key) => Object.hasOwn(candidate, key));
+  if (!exactKeys(value, [
+    "schemaVersion", "from", "to", "allowanceState", "allowanceReadState", "days",
+  ]) || value.schemaVersion !== "community-daily-read-v1.0"
+      || value.from !== expectedFrom || value.to !== expectedTo
+      || value.allowanceState !== "updating"
+      || !["confirmed", "temporarily_unavailable"].includes(value.allowanceReadState)
+      || !Array.isArray(value.days) || value.days.length > COMMUNITY_DAILY_MAX_DAYS) {
+    throw new Error("UPSTREAM_COMMUNITY_DAILY_INVALID");
+  }
+  const rangeDays = (Date.parse(`${expectedTo}T00:00:00.000Z`)
+    - Date.parse(`${expectedFrom}T00:00:00.000Z`)) / 86_400_000 + 1;
+  if (value.days.length > rangeDays) throw new Error("UPSTREAM_COMMUNITY_DAILY_INVALID");
+  let previousDay = null;
+  // The private dispatcher uses readPostgresPublishedCommunityDaily, whose
+  // projectDailyPayload validates/rebuilds the closed aggregate allowlist;
+  // it then strips the optional allowance and capacity fields. Keep this
+  // boundary check focused on that reduced public envelope.
+  for (const day of value.days) {
+    if (!exactKeys(day, ["day", "revision", "releasedAt", "payload"])
+        || !validCommunityDayString(day.day) || day.day < expectedFrom || day.day > expectedTo
+        || (previousDay !== null && day.day <= previousDay)
+        || !Number.isSafeInteger(day.revision) || day.revision < 1
+        || typeof day.releasedAt !== "string" || day.releasedAt.length > 64
+        || !Number.isFinite(Date.parse(day.releasedAt))
+        || typeof day.payload !== "object" || day.payload === null || Array.isArray(day.payload)
+        || day.payload.day !== day.day || day.payload.revision !== day.revision
+        || Object.hasOwn(day.payload, "allowance")
+        || Object.hasOwn(day.payload, "capacityByPlanType")) {
+      throw new Error("UPSTREAM_COMMUNITY_DAILY_INVALID");
+    }
+    previousDay = day.day;
+  }
+  return body;
 }
 
 function safeStaticPath(requestTarget, publicOrigin) {
@@ -855,8 +930,20 @@ export function createOauthGatewayHandler({
         await upstream.body?.cancel().catch(() => undefined);
         throw new Error("UPSTREAM_RESPONSE_TYPE_INVALID");
       }
+      if (route.id === "community_daily"
+          && upstream.status >= 200 && upstream.status < 300 && upstream.status !== 200) {
+        await upstream.body?.cancel().catch(() => undefined);
+        throw new Error("UPSTREAM_RESPONSE_INVALID");
+      }
       let responseBody = await readBoundedResponse(upstream, route.maxResponseBytes);
       const responseHeaderValues = responseHeaders(upstream);
+      if (route.id === "community_daily" && upstream.status === 200) {
+        responseBody = communityDailyResponseBody(
+          responseBody,
+          url.searchParams.get("from"),
+          url.searchParams.get("to"),
+        );
+      }
       if (route.id === "device_sync_capabilities_v12" && upstream.status === 200
           && contentType === "application/json") {
         responseBody = publicV12CapabilityBody(responseBody, configuration, route.maxResponseBytes);
