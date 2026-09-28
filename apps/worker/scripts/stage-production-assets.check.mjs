@@ -78,7 +78,7 @@ async function fixture() {
     "feature-insights.js": "export const featureInsights = true;\n",
     "feature-tour.css": ".feature-tour { color: green; }\n",
     "feature-tour.js": "export const featureTour = true;\n",
-    "feature-value.jpg": Buffer.from("reviewed feature still\n"),
+    "feature-value.png": Buffer.from("reviewed feature still\n"),
     "feature-week.js": "export const featureWeek = true;\n",
     "model-performance.css": ".performance-card { color: green; }\n",
     "model-performance.js": "export const modelPerformance = true;\n",
@@ -240,7 +240,7 @@ test("stages only verified generated public assets and maps the community entry 
     await readFile(join(value.destination, "tibotattle-icon.png")),
     value.generatedFiles["tibotattle-icon.png"],
   );
-  for (const media of ["feature-allowance.mp4", "feature-allowance.jpg", "feature-value.jpg"]) {
+  for (const media of ["feature-allowance.mp4", "feature-allowance.jpg", "feature-value.png"]) {
     assert.deepEqual(
       await readFile(join(value.destination, media)),
       value.generatedFiles[media],

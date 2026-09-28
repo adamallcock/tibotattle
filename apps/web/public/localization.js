@@ -1390,7 +1390,7 @@ export const WEB_MESSAGES = Object.freeze({
   // band. In the hero they sit above the download, where an unlabelled set of
   // totals would read as the reader's own usage rather than the community's.
   "community.contribution.heroHeading": ["Contributed by the community so far", "社区迄今的贡献", "Aportado por la comunidad hasta ahora"],
-  "community.daily.activitySummary": ["See community activity", "查看社区活动", "Ver la actividad de la comunidad"],
+  "community.daily.activitySummary": ["Explore the contribution history", "探索贡献历史", "Explorar el historial de contribuciones"],
   "community.daily.activityHeading": ["Community activity over time", "社区活动趋势", "Actividad de la comunidad a lo largo del tiempo"],
   "community.daily.activityCopy": ["Delayed, aggregate daily totals from optional contributions. This public view includes no prompts, responses, or account details.", "来自可选贡献的延迟汇总每日总量。此公开视图不包含提示词、回复或账户详情。", "Totales diarios agregados y diferidos de contribuciones opcionales. Esta vista pública no incluye prompts, respuestas ni datos de cuentas."],
   "community.daily.activityThrough": ["Activity through", "活动截至", "Actividad hasta"],
