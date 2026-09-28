@@ -202,6 +202,11 @@ better outside the report: local status, **Refresh usage**, **Share**, and
 **Settings**. **Share** opens the report's existing local share card; it does
 not create a second report or sharing service.
 
+**Save image** writes a locally timestamped PNG to Downloads. The report names
+the final file only after WebKit confirms completion, then offers **Open image**
+through the Mac's default app. If opening fails, the host reveals the file in
+Finder or opens Downloads. File paths stay inside the native host.
+
 Both recent cache-drop tables offer local **Thread name** links, with separate
 parent and subworker links when ancestry is known. Click or keyboard-activate
 a link to open its canonical `codex://threads/<UUID>` target in Codex. A

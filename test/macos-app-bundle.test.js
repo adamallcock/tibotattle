@@ -2022,6 +2022,15 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
   assert.match(source, /navigationAction\.shouldPerformDownload \{\s*\n\s*decisionHandler\(\.download\)/u);
   assert.match(source, /static func downloadsDestination\(for suggestedFilename: String\)/u);
+  assert.match(source, /private static func shareCardFilename\(from suggestedFilename: String\) -> String\?/u);
+  assert.match(source, /pendingDownloads\[ObjectIdentifier\(download\)\] = PendingDownload/u);
+  assert.match(source, /func downloadDidFinish\(_ download: WKDownload\) \{[\s\S]*?status: "saved"/u);
+  assert.match(source, /latestCompletedShareDownload = pending\.destination/u);
+  assert.match(source, /openCompletedDownload\(named: filename\)/u);
+  assert.match(source, /guard let url = latestCompletedShareDownload,/u);
+  assert.match(source, /NSWorkspace\.shared\.open\(url\)/u);
+  assert.match(source, /tibotattle:share-download-result/u);
+  assert.match(source, /tibotattle:share-open-result/u);
   // A file that could not be saved must not tear down a working dashboard.
   assert.match(
     source,
@@ -2109,6 +2118,39 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   assert.match(source, /UM_MACOS_DASHBOARD_READY_TIMEOUT/u);
   assert.match(source, /UM_MACOS_DASHBOARD_VIEW_UNAVAILABLE/u);
   assert.match(source, /UM_MACOS_DASHBOARD_DOWNLOAD_FAILED/u);
+});
+
+test("native share names strip WebKit's blob UUID and reject other names", {
+  skip: process.platform !== "darwin" ? "requires the macOS Swift runtime" : false,
+}, async () => {
+  const source = await readFile(
+    new URL("../apps/macos/UsageMonitorApp.swift", import.meta.url), "utf8",
+  );
+  const start = source.indexOf("private static func isShareCardDestinationName(");
+  const end = source.indexOf("/// A page-supplied filename", start);
+  assert.ok(start >= 0 && end > start, "native share naming helpers are available");
+  const script = `import Foundation
+struct ShareNameCheck {
+${source.slice(start, end)}
+static func run() {
+  let expected = "2026-09-28-07-04-tibotattle-results.png"
+  precondition(shareCardFilename(from: expected) == expected)
+  precondition(shareCardFilename(from: "50b74e50-9472-4d68-9d54-204b61a69b06-" + expected) == expected)
+  precondition(shareCardFilename(from: "50b74e50-9472-4d68-9d54-204b61a69b06-2026-09-28-07-04-tibotattle-results") == expected)
+  precondition(shareCardFilename(from: "../" + expected) == nil)
+  precondition(shareCardFilename(from: String(repeating: "a", count: 201)) == nil)
+  precondition(isShareCardDestinationName("2026-09-28-07-04-tibotattle-results-1.png"))
+  precondition(!isShareCardDestinationName("other.png"))
+  print("share names accepted")
+}
+}
+ShareNameCheck.run()
+`;
+  const result = spawnSync("swift", ["-"], {
+    input: script, encoding: "utf8", timeout: 10_000,
+  });
+  assert.equal(result.status, 0, result.error?.message ?? result.stderr);
+  assert.match(result.stdout, /share names accepted/u);
 });
 
 test("native Codex link bridge requires a trusted click and a canonical thread target", async () => {

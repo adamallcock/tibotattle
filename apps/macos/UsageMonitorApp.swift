@@ -2880,10 +2880,15 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         (TiboTattleLocalization.LanguagePreference) -> Void
     private var allowedPort: Int?
     private var pendingDashboardURL: URL?
-    /// The in-flight download's chosen destination, promoted to
-    /// `latestCompletedDownload` only when WebKit reports it finished.
-    private var pendingDownloadDestination: URL?
+    private struct PendingDownload {
+        let destination: URL
+        let shareFilename: String?
+    }
+    /// Each WebKit download owns its destination until completion. A later
+    /// download must not replace an earlier one's pending destination.
+    private var pendingDownloads: [ObjectIdentifier: PendingDownload] = [:]
     private var latestCompletedDownload: URL?
+    private var latestCompletedShareDownload: URL?
     private var viewportPreparationAttempts = 0
     private var dashboardReadiness = NativeDashboardReadiness()
     private var dashboardContentPoll: DispatchWorkItem?
@@ -3363,10 +3368,18 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             return
         }
         if message.name == "tibotattleDownloads" {
-            // The page asks; the shell acts. The path never crosses the
-            // bridge in either direction.
-            if payload["type"] as? String == "reveal-latest-download" {
+            // The page asks; the shell acts. Only the current loopback page
+            // may request these actions, and no path crosses the bridge.
+            guard let sourceURL = message.frameInfo.request.url,
+                  isCompanionURL(sourceURL)
+            else { return }
+            if payload.count == 1,
+               payload["type"] as? String == "reveal-latest-download" {
                 revealLatestDownload()
+            } else if payload.count == 2,
+                      payload["type"] as? String == "open-completed-download",
+                      let filename = payload["filename"] as? String {
+                openCompletedDownload(named: filename)
             }
             return
         }
@@ -3710,31 +3723,114 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         completionHandler: @escaping (URL?) -> Void
     ) {
         let destination = Self.downloadsDestination(for: suggestedFilename)
-        pendingDownloadDestination = destination
+        let shareFilename = Self.shareCardFilename(from: suggestedFilename)
+        if let destination {
+            pendingDownloads[ObjectIdentifier(download)] = PendingDownload(
+                destination: destination,
+                shareFilename: shareFilename
+            )
+        } else if let shareFilename {
+            notifyShareDownloadResult(
+                status: "failed", requestedFilename: shareFilename
+            )
+        }
         completionHandler(destination)
     }
 
     func downloadDidFinish(_ download: WKDownload) {
-        // Only a completed download may ever be revealed. The destination is
-        // promoted here, not at decide time, so the page's "Show in Finder"
-        // can never point at a partial file.
-        latestCompletedDownload = pendingDownloadDestination
-        pendingDownloadDestination = nil
+        guard let pending = pendingDownloads.removeValue(
+            forKey: ObjectIdentifier(download)
+        ) else { return }
+        // Only a completed download may be opened or revealed.
+        guard Self.isRegularDownloadFile(pending.destination)
+        else {
+            if let requestedFilename = pending.shareFilename {
+                notifyShareDownloadResult(
+                    status: "failed", requestedFilename: requestedFilename
+                )
+            }
+            onDownloadFailure()
+            return
+        }
+        latestCompletedDownload = pending.destination
+        if let requestedFilename = pending.shareFilename {
+            latestCompletedShareDownload = pending.destination
+            notifyShareDownloadResult(
+                status: "saved",
+                requestedFilename: requestedFilename,
+                filename: pending.destination.lastPathComponent
+            )
+        }
     }
 
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
-        pendingDownloadDestination = nil
+        let pending = pendingDownloads.removeValue(forKey: ObjectIdentifier(download))
+        if let requestedFilename = pending?.shareFilename {
+            notifyShareDownloadResult(
+                status: "failed", requestedFilename: requestedFilename
+            )
+        }
         // A file that could not be saved is not a dashboard that failed, so
         // the open page is left exactly as it is.
         onDownloadFailure()
     }
 
+    private func notifyShareDownloadResult(
+        status: String,
+        requestedFilename: String,
+        filename: String? = nil
+    ) {
+        var detail = [
+            "status": status,
+            "requestedFilename": requestedFilename,
+        ]
+        if let filename { detail["filename"] = filename }
+        dispatchShareEvent("tibotattle:share-download-result", detail: detail)
+    }
+
+    private func dispatchShareEvent(_ name: String, detail: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: detail),
+              let json = String(data: data, encoding: .utf8)
+        else { return }
+        webView.evaluateJavaScript("""
+        window.dispatchEvent(new CustomEvent('\(name)', { detail: \(json) }));
+        """, completionHandler: nil)
+    }
+
+    private func openCompletedDownload(named filename: String) {
+        guard let url = latestCompletedShareDownload,
+              url.lastPathComponent == filename,
+              Self.isShareCardDestinationName(filename),
+              Self.isRegularDownloadFile(url)
+        else {
+            revealLatestDownload(matching: filename)
+            dispatchShareEvent("tibotattle:share-open-result", detail: [
+                "filename": filename, "opened": false,
+            ])
+            return
+        }
+        let opened = NSWorkspace.shared.open(url)
+        if !opened {
+            // The file may have moved or its default app may be unavailable.
+            // Finder provides a useful fallback without exposing a path.
+            revealLatestDownload(matching: filename)
+        }
+        dispatchShareEvent("tibotattle:share-open-result", detail: [
+            "filename": filename,
+            "opened": opened,
+        ])
+    }
+
     /// Reveal the last finished download, or fall back to opening the
     /// Downloads folder when none finished yet - the honest nearest thing,
     /// never an error for a file that is still being written.
-    func revealLatestDownload() {
-        if let url = latestCompletedDownload,
-           FileManager.default.fileExists(atPath: url.path) {
+    func revealLatestDownload(matching filename: String? = nil) {
+        let candidate = filename == nil
+            ? latestCompletedDownload
+            : latestCompletedShareDownload
+        if let url = candidate,
+           (filename == nil || url.lastPathComponent == filename),
+           Self.isRegularDownloadFile(url) {
             NSWorkspace.shared.activateFileViewerSelecting([url])
             return
         }
@@ -3748,6 +3844,36 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         }
     }
 
+    private static func isRegularDownloadFile(_ url: URL) -> Bool {
+        guard let values = try? url.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        ) else { return false }
+        return values.isRegularFile == true && values.isSymbolicLink != true
+    }
+
+    private static func isShareCardDestinationName(_ filename: String) -> Bool {
+        guard filename.utf8.count <= 128 else { return false }
+        let pattern = #"^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-tibotattle-results(?:-[0-9]+)?\.png$"#
+        return filename.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    /// WebKit may prepend a blob URL's UUID to the anchor's download name.
+    /// Accept that prefix only for this fixed share-card export pattern.
+    private static func shareCardFilename(from suggestedFilename: String) -> String? {
+        guard suggestedFilename.utf8.count <= 200 else { return nil }
+        let pattern = #"^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}-)?([0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-tibotattle-results)(?:\.png)?$"#
+        guard let expression = try? NSRegularExpression(
+            pattern: pattern, options: [.caseInsensitive]
+        ),
+              let match = expression.firstMatch(
+                in: suggestedFilename,
+                range: NSRange(suggestedFilename.startIndex..., in: suggestedFilename)
+              ),
+              let stemRange = Range(match.range(at: 1), in: suggestedFilename)
+        else { return nil }
+        return "\(suggestedFilename[stemRange]).png"
+    }
+
     /// A page-supplied filename is untrusted, so only a bounded, separator-free
     /// basename is ever used, and an existing file is never overwritten.
     static func downloadsDestination(for suggestedFilename: String) -> URL? {
@@ -3757,9 +3883,8 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             suggestedFilename.unicodeScalars.filter(allowed.contains)
         )
         let stripped = cleaned.drop(while: { $0 == "." })
-        let candidate = stripped.isEmpty
-            ? "tibotattle-download"
-            : String(stripped.prefix(120))
+        let candidate = shareCardFilename(from: suggestedFilename)
+            ?? (stripped.isEmpty ? "tibotattle-download" : String(stripped.prefix(120)))
         guard let downloads = try? FileManager.default.url(
             for: .downloadsDirectory,
             in: .userDomainMask,

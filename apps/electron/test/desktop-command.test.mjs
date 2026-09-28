@@ -55,8 +55,9 @@ test("desktop commands contain only the fixed presentation vocabulary", () => {
   assert.deepEqual(createDesktopCommand("hostedSignInReturn"), {
     command: "hostedSignInReturn",
   });
-  assert.deepEqual(createDesktopCommand("shareCardDownloadCompleted"), {
+  assert.deepEqual(createDesktopCommand("shareCardDownloadCompleted", "2026-09-28-19-15-tibotattle-results.png"), {
     command: "shareCardDownloadCompleted",
+    filename: "2026-09-28-19-15-tibotattle-results.png",
   });
   assert.deepEqual(createDesktopCommand("shareCardDownloadFailed"), {
     command: "shareCardDownloadFailed",
@@ -84,6 +85,8 @@ test("desktop commands reject selectors, paths, URLs, extra keys, and prototypes
     { command: "appearance", preference: "sepia", resolvedTheme: "dark" },
     { command: "hostedSignInReturn", value: "unexpected" },
     { command: "shareCardDownloadCompleted", path: "/private/download.png" },
+    { command: "shareCardDownloadCompleted", filename: "../private.png" },
+    { command: "shareCardDownloadCompleted", filename: "2026-09-28-19-15-tibotattle-results.png", path: "/private/download.png" },
     { command: "shareCardDownloadFailed", error: "private details" },
     Object.assign(Object.create(null), { command: "refresh" }),
   ]) {

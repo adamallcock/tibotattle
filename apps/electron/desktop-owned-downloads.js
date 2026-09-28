@@ -26,7 +26,9 @@ export const DESKTOP_OWNED_DOWNLOAD_MAX_ENTRIES = 16;
 export const DESKTOP_OWNED_DOWNLOAD_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 export const DESKTOP_SHARE_CARD_FILENAME_PATTERN =
-  /^tibotattle-results-TT-[0-9A-HJKMNP-TV-Z]{6}\.png$/u;
+  /^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-tibotattle-results\.png$/u;
+const BLOB_UUID_PREFIXED_SHARE_CARD_FILENAME_PATTERN =
+  /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})-([0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-tibotattle-results)(?:\.png)?$/iu;
 
 const DOWNLOAD_TYPES = Object.freeze({
   share_card: Object.freeze({
@@ -71,6 +73,7 @@ function assertExactOptions(options) {
     "fs",
     "path",
     "reveal",
+    "open",
     "randomUUID",
     "maxEntries",
   ]);
@@ -79,7 +82,7 @@ function assertExactOptions(options) {
   }
 }
 
-function assertDependencies({ rootPath, fs, path, reveal, randomUUID, maxEntries }) {
+function assertDependencies({ rootPath, fs, path, reveal, open, randomUUID, maxEntries }) {
   if (typeof rootPath !== "string"
       || rootPath.length === 0
       || typeof path?.resolve !== "function"
@@ -89,6 +92,7 @@ function assertDependencies({ rootPath, fs, path, reveal, randomUUID, maxEntries
       || typeof fs?.lstat !== "function"
       || typeof fs?.realpath !== "function"
       || typeof reveal !== "function"
+      || (open !== undefined && typeof open !== "function")
       || typeof randomUUID !== "function"
       || !Number.isSafeInteger(maxEntries)
       || maxEntries < 1
@@ -232,7 +236,7 @@ function publicEntry(entry) {
 function pathForEntry(path, root, entry) {
   let destination;
   try {
-    destination = path.join(root, `${entry.id}-${entry.filename}`);
+    destination = path.join(root, entry.filename);
   } catch {
     throw invalidDownload("owned download destination is invalid");
   }
@@ -281,10 +285,10 @@ async function assertDestinationAvailable(fs, destination) {
   try {
     await fs.lstat(destination);
   } catch (error) {
-    if (error?.code === "ENOENT") return;
+    if (error?.code === "ENOENT") return true;
     throw invalidDownload("owned download destination is unavailable");
   }
-  throw invalidDownload("owned download destination is unavailable");
+  return false;
 }
 
 function assertDestinationAvailableSync(fs, destination) {
@@ -292,10 +296,10 @@ function assertDestinationAvailableSync(fs, destination) {
   try {
     fs.lstatSync(destination);
   } catch (error) {
-    if (error?.code === "ENOENT") return;
+    if (error?.code === "ENOENT") return true;
     throw invalidDownload("owned download destination is unavailable");
   }
-  throw invalidDownload("owned download destination is unavailable");
+  return false;
 }
 
 /**
@@ -312,6 +316,7 @@ export async function createDesktopOwnedDownloadRegistry(options = {}) {
   };
   const path = options.path ?? defaultPath;
   const reveal = options.reveal;
+  const open = options.open;
   const randomUUID = options.randomUUID ?? defaultRandomUUID;
   const maxEntries = options.maxEntries ?? DESKTOP_OWNED_DOWNLOAD_MAX_ENTRIES;
   const resolvedRoot = assertDependencies({
@@ -319,6 +324,7 @@ export async function createDesktopOwnedDownloadRegistry(options = {}) {
     fs,
     path,
     reveal,
+    open,
     randomUUID,
     maxEntries,
   });
@@ -373,6 +379,18 @@ export async function createDesktopOwnedDownloadRegistry(options = {}) {
     throw invalidDownload("owned download identifier is unavailable");
   }
 
+  function availableFilename(requested, checkAvailable) {
+    const stem = requested.slice(0, -4);
+    for (let suffix = 0; suffix <= 999; suffix += 1) {
+      const filename = suffix === 0 ? requested : `${stem}-${suffix}.png`;
+      assertSafeFilename(filename, "share_card");
+      const destination = pathForEntry(path, root, { filename });
+      if ([...entries.values()].some((entry) => entry.destination === destination)) continue;
+      if (checkAvailable(destination)) return { filename, destination };
+    }
+    throw invalidDownload("owned download destination is unavailable");
+  }
+
   async function verifyFinal(entry) {
     let before;
     try {
@@ -417,14 +435,25 @@ export async function createDesktopOwnedDownloadRegistry(options = {}) {
       const registration = assertRegistration(value);
       ensureCapacity();
       const id = generateId();
+      const selected = await (async () => {
+        const stem = registration.filename.slice(0, -4);
+        for (let suffix = 0; suffix <= 999; suffix += 1) {
+          const filename = suffix === 0 ? registration.filename : `${stem}-${suffix}.png`;
+          assertSafeFilename(filename, registration.kind);
+          const destination = pathForEntry(path, root, { filename });
+          if ([...entries.values()].some((entry) => entry.destination === destination)) continue;
+          if (await assertDestinationAvailable(fs, destination)) return { filename, destination };
+        }
+        throw invalidDownload("owned download destination is unavailable");
+      })();
       const entry = {
         ...registration,
+        filename: selected.filename,
         id,
         state: "registered",
-        destination: pathForEntry(path, root, { id, filename: registration.filename }),
+        destination: selected.destination,
         completedSequence: null,
       };
-      await assertDestinationAvailable(fs, entry.destination);
       entries.set(id, entry);
       // The destination is an internal main-process value. Callers must not
       // put it in a renderer response or an IPC payload.
@@ -449,14 +478,16 @@ export async function createDesktopOwnedDownloadRegistry(options = {}) {
     const registration = assertRegistration(value);
     ensureCapacity();
     const id = generateId();
+    const selected = availableFilename(registration.filename, (destination) =>
+      assertDestinationAvailableSync(fs, destination));
     const entry = {
       ...registration,
+      filename: selected.filename,
       id,
       state: "registered",
-      destination: pathForEntry(path, root, { id, filename: registration.filename }),
+      destination: selected.destination,
       completedSequence: null,
     };
-    assertDestinationAvailableSync(fs, entry.destination);
     entries.set(id, entry);
     return Object.freeze({
       id,
@@ -518,6 +549,30 @@ export async function createDesktopOwnedDownloadRegistry(options = {}) {
     });
   }
 
+  async function openLatest(...argumentsList) {
+    return enqueue(async () => {
+      if (argumentsList.length !== 0) throw invalidDownload("open does not accept arguments");
+      if (latestCompletedId === null) return "none";
+      const entry = entries.get(latestCompletedId);
+      if (!entry || entry.state !== "completed") {
+        latestCompletedId = null;
+        return "unavailable";
+      }
+      const verified = await verifyFinal(entry);
+      if (verified === null) {
+        entries.delete(entry.id);
+        latestCompletedId = null;
+        return "unavailable";
+      }
+      if (typeof open !== "function") return "unavailable";
+      try {
+        return await open(verified.canonicalPath) === true ? "opened" : "unavailable";
+      } catch {
+        return "unavailable";
+      }
+    });
+  }
+
   function destinationFor(id) {
     const entry = entries.get(assertOpaqueId(id));
     if (!entry) return null;
@@ -540,6 +595,7 @@ export async function createDesktopOwnedDownloadRegistry(options = {}) {
     completeDownload,
     failDownload,
     revealLatest,
+    openLatest,
     destinationFor,
     inspect,
     clear,
@@ -606,14 +662,20 @@ function validLoopbackBlobURL(value, origin) {
 export function shareCardDownloadMetadata({ origin, url, mime, filename } = {}) {
   if (!validLoopbackBlobURL(url, origin)
       || mime !== "image/png"
-      || typeof filename !== "string"
-      || !DESKTOP_SHARE_CARD_FILENAME_PATTERN.test(filename)) {
+      || typeof filename !== "string") {
     return null;
+  }
+  let normalizedFilename = filename;
+  if (!DESKTOP_SHARE_CARD_FILENAME_PATTERN.test(filename)) {
+    const match = BLOB_UUID_PREFIXED_SHARE_CARD_FILENAME_PATTERN.exec(filename);
+    const blobUUID = new URL(url).pathname.split("/").at(-1);
+    if (!match || match[1].toLowerCase() !== blobUUID?.toLowerCase()) return null;
+    normalizedFilename = `${match[2]}.png`;
   }
   return Object.freeze({
     kind: "share_card",
     mime: "image/png",
-    filename,
+    filename: normalizedFilename,
     url,
   });
 }
@@ -663,13 +725,15 @@ export function installDesktopOwnedDownloadHandler({
   const pending = new Map();
   const itemListeners = new Map();
 
-  const notifyState = (command) => {
+  const notifyState = (command, filename) => {
     if (!active || dashboardWebContents.isDestroyed?.() === true
         || typeof onState !== "function") {
       return;
     }
     try {
-      onState(createDesktopCommand(command));
+      onState(command === "shareCardDownloadCompleted"
+        ? createDesktopCommand(command, filename)
+        : createDesktopCommand(command));
     } catch {
       // State delivery is presentation-only. A consumer failure must never
       // change the registry outcome or escape the Electron event boundary.
@@ -708,6 +772,7 @@ export function installDesktopOwnedDownloadHandler({
 
   const settleCompletion = async (id) => {
     if (!beginSettlement(id)) return;
+    const filename = pending.get(id)?.filename;
     let completed = false;
     try {
       try {
@@ -728,9 +793,8 @@ export function installDesktopOwnedDownloadHandler({
       }
     } finally {
       pending.delete(id);
-      notifyState(completed
-        ? "shareCardDownloadCompleted"
-        : "shareCardDownloadFailed");
+      if (completed) notifyState("shareCardDownloadCompleted", filename);
+      else notifyState("shareCardDownloadFailed");
     }
   };
 
@@ -747,16 +811,17 @@ export function installDesktopOwnedDownloadHandler({
       void settleFailure(id).catch(() => {});
       return;
     }
+    const currentMetadata = shareCardDownloadMetadata({
+      origin,
+      url: currentURL,
+      mime: currentMime,
+      filename: currentFilename,
+    });
     if (!active
         || dashboardWebContents.isDestroyed?.() === true
         || state !== "completed"
         || currentURL !== initialURL
-        || shareCardDownloadMetadata({
-          origin,
-          url: currentURL,
-          mime: currentMime,
-          filename: currentFilename,
-        }) === null) {
+        || currentMetadata?.filename !== pending.get(id)?.requestedFilename) {
       void settleFailure(id).catch(() => {});
       return;
     }
@@ -815,7 +880,11 @@ export function installDesktopOwnedDownloadHandler({
       const doneListener = (doneEvent, state) => {
         handleDone(registration.id, item, initialURL, doneEvent, state);
       };
-      pending.set(registration.id, { settling: false });
+      pending.set(registration.id, {
+        settling: false,
+        requestedFilename: metadata.filename,
+        filename: registration.filename ?? metadata.filename,
+      });
       itemListeners.set(registration.id, { item, listener: doneListener });
       item.on("done", doneListener);
       item.setSavePath(registration.destination);

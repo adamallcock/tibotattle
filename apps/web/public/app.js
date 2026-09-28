@@ -3819,10 +3819,13 @@ function drawShareCard(canvas, card) {
   return true;
 }
 
-function shareCardFileName(card) {
-  // The reference is the only variable part, and it matched the fixed
-  // reference pattern before the card was composed.
-  return `tibotattle-results-${card.reference}.png`;
+const SHARE_CARD_SAVED_FILE_PATTERN =
+  /^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-tibotattle-results(?:-[0-9]+)?\.png$/u;
+
+function shareCardFileName(now = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+    + `-${pad(now.getHours())}-${pad(now.getMinutes())}-tibotattle-results.png`;
 }
 
 function setShareCardStatus(text, { error = false } = {}) {
@@ -3999,9 +4002,9 @@ function renderShareCard(data, { history: sharedHistory = null } = {}) {
     history,
     activity,
   });
-  // The header's reference chip is gone (owner-directed, 2026-08-08): the
-  // reference still exists — the saved file name carries it — but the panel
-  // header no longer prints a code the reader cannot act on.
+  // The header's reference chip is gone (owner-directed, 2026-08-08). The
+  // reference remains in the selectable transcript, while saved names use
+  // local time and do not expose a diagnostic identifier.
   // This generated transcript replaces the initial placeholder. The static
   // localizer must not overwrite the selected-plan figures after a language
   // change; renderWeekly rebuilds the transcript in the new language.
@@ -4037,8 +4040,73 @@ async function runShareCardAction(action) {
   }
 }
 
+function waitForShareDownloadResult(requestedFilename) {
+  let settle;
+  const promise = new Promise((resolve) => {
+    const onResult = (event) => {
+      if (event.detail?.requestedFilename !== requestedFilename) return;
+      settle(event.detail);
+    };
+    const timer = setTimeout(() => settle({ status: "unconfirmed" }), 30_000);
+    settle = (result) => {
+      clearTimeout(timer);
+      window.removeEventListener("tibotattle:share-download-result", onResult);
+      resolve(result);
+    };
+    window.addEventListener("tibotattle:share-download-result", onResult);
+  });
+  return { promise, cancel: () => settle({ status: "cancelled" }) };
+}
+
+function waitForElectronShareDownloadResult() {
+  let settle;
+  const promise = new Promise((resolve) => {
+    const onCompleted = (event) => settle({ status: "saved", filename: event.detail?.filename });
+    const onFailed = () => settle({ status: "failed" });
+    const timer = setTimeout(() => settle({ status: "unconfirmed" }), 30_000);
+    settle = (result) => {
+      clearTimeout(timer);
+      window.removeEventListener("tibotattle:share-card-download-completed", onCompleted);
+      window.removeEventListener("tibotattle:share-card-download-failed", onFailed);
+      resolve(result);
+    };
+    window.addEventListener("tibotattle:share-card-download-completed", onCompleted);
+    window.addEventListener("tibotattle:share-card-download-failed", onFailed);
+  });
+  return { promise, cancel: () => settle({ status: "cancelled" }) };
+}
+
+function openSavedShareImage(bridge, filename) {
+  const fail = () => setShareCardStatus(
+    t("shareCard.openFailed"),
+    { error: true },
+  );
+  const cleanup = () => {
+    clearTimeout(timer);
+    window.removeEventListener("tibotattle:share-open-result", onResult);
+  };
+  const onResult = (event) => {
+    if (event.detail?.filename !== filename) return;
+    cleanup();
+    if (event.detail.opened !== true) fail();
+  };
+  const timer = setTimeout(() => {
+    cleanup();
+    fail();
+  }, 10_000);
+  window.addEventListener("tibotattle:share-open-result", onResult);
+  try {
+    bridge.postMessage({ type: "open-completed-download", filename });
+  } catch {
+    cleanup();
+    fail();
+  }
+}
+
 function downloadShareCard() {
-  return runShareCardAction(async (card) => {
+  return runShareCardAction(async () => {
+    dismissShareCardToast();
+    setShareCardStatus("");
     const blob = await shareCardBlob($("#share-card-canvas"));
     if (blob === null) {
       setShareCardStatus(
@@ -4050,22 +4118,56 @@ function downloadShareCard() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = shareCardFileName(card);
-    link.click();
-    URL.revokeObjectURL(url);
-    // The image no longer prints the reference (owner-directed, 2026-08-08),
-    // so the claim moved with the fact: the file name carries it.
-    const saved = `Saved as ${shareCardFileName(card)}. The file name carries reference ${card.reference}.`;
-    // Reveal is native-only: the shell tracks where the download landed and
-    // shows it in Finder itself, so the page never learns a filesystem path.
-    // In a plain browser the button is absent rather than disabled.
+    const filename = shareCardFileName();
+    link.download = filename;
+    // The native host confirms completion and supplies only the final basename.
+    // The page never receives the filesystem path.
     const bridge = document.body.classList.contains("native-dashboard")
       ? window.webkit?.messageHandlers?.tibotattleDownloads
       : undefined;
-    showShareCardToast(saved, bridge ? {
-      actionLabel: t("shareCard.showInFinder"),
-      onAction: () => bridge.postMessage({ type: "reveal-latest-download" }),
-    } : {});
+    const electron = window.tibotattleDesktop?.version === "v1"
+      && typeof window.tibotattleDesktop.openLatestDownload === "function"
+      ? window.tibotattleDesktop : null;
+    const completion = bridge
+      ? waitForShareDownloadResult(filename)
+      : electron ? waitForElectronShareDownloadResult() : null;
+    try {
+      link.click();
+    } catch {
+      completion?.cancel();
+      setShareCardStatus(t("shareCard.downloadStartFailed"), { error: true });
+      return;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+    if (!completion) {
+      showShareCardToast(t("shareCard.downloadRequested", { filename }));
+      return;
+    }
+    const result = await completion.promise;
+    if (result.status !== "saved"
+      || typeof result.filename !== "string"
+      || !SHARE_CARD_SAVED_FILE_PATTERN.test(result.filename)) {
+      setShareCardStatus(
+        result.status === "failed"
+          ? t("shareCard.saveFailed")
+          : t("shareCard.saveUnconfirmed"),
+        { error: true },
+      );
+      return;
+    }
+    setShareCardStatus("");
+    showShareCardToast(t("shareCard.savedToDownloads", { filename: result.filename }), {
+      actionLabel: t("shareCard.openImage"),
+      onAction: () => {
+        if (bridge) openSavedShareImage(bridge, result.filename);
+        else if (electron) {
+          Promise.resolve().then(() => electron.openLatestDownload()).then((status) => {
+            if (status !== "opened") setShareCardStatus(t("shareCard.openFailed"), { error: true });
+          }).catch(() => setShareCardStatus(t("shareCard.openFailed"), { error: true }));
+        }
+      },
+    });
   });
 }
 
@@ -4079,18 +4181,20 @@ function copyShareCardImage() {
       );
       return;
     }
-    const blob = await shareCardBlob($("#share-card-canvas"));
-    if (blob === null) {
-      setShareCardStatus(
-        "TiboTattle could not turn the card into a PNG. Nothing was copied.",
-        { error: true },
-      );
-      return;
-    }
+    // WebKit requires the write to start during the click gesture. Give the
+    // ClipboardItem a promise so canvas.toBlob can finish after write starts.
+    const png = shareCardBlob($("#share-card-canvas")).then((blob) => {
+      if (blob === null) throw new Error("share-card-png-unavailable");
+      return blob;
+    });
+    // Observe conversion separately even if ClipboardItem construction or
+    // clipboard.write fails before the canvas callback runs.
+    const pngReady = png.then(() => true, () => false);
     try {
-      await navigator.clipboard.write([
-        new ClipboardItem({ "image/png": blob }),
+      const write = navigator.clipboard.write([
+        new ClipboardItem({ "image/png": png }),
       ]);
+      await Promise.all([write, png]);
       // A stale error from an earlier attempt would otherwise sit under the
       // fresh confirmation.
       setShareCardStatus("");
@@ -4099,7 +4203,9 @@ function copyShareCardImage() {
       );
     } catch {
       setShareCardStatus(
-        "The browser refused clipboard access, so nothing was copied. Use Save image instead.",
+        (await pngReady)
+          ? "The image could not be copied to the clipboard. Use Save image instead."
+          : "TiboTattle could not turn the card into a PNG. Nothing was copied.",
         { error: true },
       );
     }

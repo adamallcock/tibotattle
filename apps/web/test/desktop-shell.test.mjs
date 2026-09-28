@@ -149,6 +149,20 @@ test("desktop startup reapplies the persisted forced appearance", async () => {
   mounted.teardown();
 });
 
+test("desktop bridge forwards the completed share filename without a path", () => {
+  const { commandListeners, events, windowRef } = fakeWindow();
+  const mounted = mountDesktopShell({ documentRef: fakeDocument(), windowRef });
+  commandListeners[0]({
+    command: "shareCardDownloadCompleted",
+    filename: "2026-09-28-07-04-tibotattle-results-1.png",
+  });
+  assert.deepEqual(events.map(({ type, detail }) => ({ type, detail })), [{
+    type: "tibotattle:share-card-download-completed",
+    detail: { filename: "2026-09-28-07-04-tibotattle-results-1.png" },
+  }]);
+  mounted.teardown();
+});
+
 test("Electron Share selects Allowance and focuses the existing results card", () => {
   const { windowRef } = fakeWindow();
   const shareButton = fakeButton();

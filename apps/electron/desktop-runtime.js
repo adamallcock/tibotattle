@@ -588,6 +588,9 @@ async function createRuntimeOwnedDownloadsRegistry({
     return await createDesktopOwnedDownloadRegistry({
       rootPath,
       reveal: (path) => runtime.shell.showItemInFolder(path),
+      open: typeof runtime.shell.openPath === "function"
+        ? async (path) => await runtime.shell.openPath(path) === ""
+        : undefined,
     });
   } catch {
     // A real Electron runtime must not silently fall back to the browser's
@@ -1978,6 +1981,7 @@ export async function launchDesktopRuntime({
     isAuthorizedSettingsFrame: lifecycle.isAuthorizedSettingsFrame,
     isAuthorizedDesktopDownloadContext: lifecycle.isAuthorizedDesktopDownloadContext,
     revealLatestDownload: lifecycle.revealLatestDownload,
+    openLatestDownload: lifecycle.openLatestDownload,
     get state() {
       return lifecycle.state;
     },

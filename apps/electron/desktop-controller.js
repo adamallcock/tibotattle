@@ -1474,6 +1474,20 @@ export function createDesktopController({
       }
       return selected.revealLatestDownload();
     },
+    async openLatestDownload(_args, context = {}) {
+      const selected = lifecycle();
+      let authorized = false;
+      try {
+        authorized = typeof selected.isAuthorizedDesktopDownloadContext === "function"
+          && selected.isAuthorizedDesktopDownloadContext(context.sender, context.senderFrame) === true;
+      } catch {
+        authorized = false;
+      }
+      if (!authorized || typeof selected.openLatestDownload !== "function") {
+        throw controllerError("desktop_download_unavailable");
+      }
+      return selected.openLatestDownload();
+    },
     async openDashboardInBrowser() {
       return openDashboardInBrowserAction();
     },

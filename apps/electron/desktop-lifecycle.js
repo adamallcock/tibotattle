@@ -1770,6 +1770,10 @@ export function createDesktopLifecycle({
       if (ownedDownloadsRegistry === null) return Promise.resolve("unavailable");
       return ownedDownloadsRegistry.revealLatest();
     },
+    openLatestDownload() {
+      if (ownedDownloadsRegistry === null) return Promise.resolve("unavailable");
+      return ownedDownloadsRegistry.openLatest?.() ?? Promise.resolve("unavailable");
+    },
     get state() {
       return Object.freeze({
         started,
