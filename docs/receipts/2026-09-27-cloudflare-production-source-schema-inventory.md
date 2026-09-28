@@ -41,6 +41,10 @@ injected credential successfully read the D1 database metadata.
   `0012_v12_empty_day_manifests.sql`, `0061_accountless_history_retention.sql`,
   and `0062_v1_acquisition_vocabulary.sql`. The separate analytics database
   has `analytics_*` tables and its own `d1_storage_migrations` history.
+  `wrangler d1 info` reported the ingestion database at 6,675,173,376 bytes
+  (about 6.68 GB), 174 tables, in Cloudflare's eastern North America region,
+  with read replication disabled. These are aggregate database properties,
+  not a transferable-row count.
 - The live `app-usagemonitor` Worker deployment list showed one version at
   100% traffic. Its version detail's D1 bindings map `USAGE_MONITOR_DB` to the
   separate production ingestion database, `ANALYTICS_DB` to the separate
@@ -77,7 +81,8 @@ named older binding. An account-wide `wrangler d1 list` located the separate
 ingestion and analytics databases; `d1 info` matched their listed identities,
 and `d1 execute --remote --command` queried only `sqlite_master` table names,
 `PRAGMA table_info(d1_storage_migrations)`, and migration names on the
-ingestion database. `wrangler deployments list` identified the 100%-serving
+ingestion database. `d1 info` supplied aggregate size and region metadata.
+`wrangler deployments list` identified the 100%-serving
 `app-usagemonitor` version; `wrangler versions view` was filtered to D1
 bindings only. No script,
 secret-binding, or user-row values were recorded. `wrangler r2 bucket list`
