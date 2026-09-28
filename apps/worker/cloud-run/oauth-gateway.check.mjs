@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
+import { readTelemetryV12Capabilities } from "../../../src/contribution/telemetry-v12-sync.js";
 import { createFilesystemAssets } from "./assets.mjs";
 import {
   createOauthGatewayConfiguration,
@@ -24,6 +25,25 @@ const V12_CONSENT = Object.freeze({
   fieldDictionaryVersion: "telemetry-v1.2-registry-2026-09-20.1",
   privacyContractVersion: "ongoing-privacy-safe-telemetry-v1.2",
 });
+
+function v12Capability(destinationOrigin = BACKEND_ORIGIN) {
+  return {
+    schemaVersion: "device-sync-capabilities-v1.2",
+    destinationOrigin,
+    enrollmentNamespace: "synthetic_enrollment_namespace",
+    identityVersion: "account-track-v2",
+    authorityKind: "social",
+    successor: {
+      schemaVersion: "telemetry-contribution-v1.2",
+      envelopeSchemaVersion: "telemetry-envelope-v1.2",
+      lifecycle: "accepted",
+      requiredConsent: V12_CONSENT,
+      consentCurrent: true,
+      authorizationCurrent: true,
+      activationTime: "2026-09-28T12:00:00.000Z",
+    },
+  };
+}
 
 class MemoryResponse extends EventEmitter {
   constructor() {
@@ -329,9 +349,12 @@ test("the v1.2 desktop edge forwards only its exact routes and never logs creden
     configuration: configuration(),
     fetchImpl: async (input, options) => {
       if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
-      backendCalls.push({ url: new URL(input), options });
-      const status = new URL(input).pathname === "/api/v1/me/device-telemetry-v12-consents" ? 201 : 200;
-      return new Response("{}", { status, headers: { "content-type": "application/json" } });
+      const url = new URL(input);
+      backendCalls.push({ url, options });
+      const status = url.pathname === "/api/v1/me/device-telemetry-v12-consents" ? 201 : 200;
+      const responseBody = url.pathname === "/api/v1/device/sync-capabilities-v1.2"
+        ? JSON.stringify(v12Capability()) : "{}";
+      return new Response(responseBody, { status, headers: { "content-type": "application/json" } });
     },
     logger: (line) => logs.push(line),
   });
@@ -1004,6 +1027,165 @@ test("spoofed origins and authorities are rejected while forwarded security head
   });
   assert.equal(ignoredSpoofedForwarding.status, 200);
   assert.equal(backendCount, 1);
+});
+
+test("the gateway maps only the closed v1.2 capability response to its configured public origin", async () => {
+  const { fetchImpl: metadata } = metadataFetch();
+  const backendCalls = [];
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      const url = new URL(input);
+      if (url.origin === "http://metadata.google.internal") return metadata(input, options);
+      backendCalls.push({ url, options });
+      assert.equal(url.origin, BACKEND_ORIGIN, "the backend request retains its pinned private origin");
+      if (url.pathname === "/api/v1/device/sync-capabilities-v1.2") {
+        return new Response(JSON.stringify(v12Capability()), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ destinationOrigin: BACKEND_ORIGIN }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+    logger: () => {},
+  });
+  const forgedHeaders = {
+    "x-tibotattle-oauth-gateway-public-origin": "https://attacker.example",
+    "x-tibotattle-edge-public-origin": "https://attacker.example",
+    "x-forwarded-for": "203.0.113.9",
+    "x-forwarded-host": "attacker.example",
+  };
+  const expectedCapability = v12Capability(PUBLIC_ORIGIN);
+  const capability = await invoke(handler, {
+    method: "GET",
+    url: "/api/v1/device/sync-capabilities-v1.2",
+    body: null,
+    headers: { authorization: DEVICE_AUTHORIZATION, ...forgedHeaders },
+  });
+  assert.equal(capability.status, 200);
+  assert.deepEqual(capability.json(), expectedCapability,
+    "all capability fields are preserved except destinationOrigin, which comes from gateway configuration");
+  assert.equal(capability.headers["content-length"], String(capability.body.byteLength),
+    "content length reflects the mapped bounded response");
+  assert.equal(backendCalls.length, 1);
+  for (const name of Object.keys(forgedHeaders)) {
+    assert.equal(backendCalls[0].options.headers.has(name), false, `${name} is never forwarded`);
+  }
+
+  const clientCapability = await readTelemetryV12Capabilities({
+    serverBaseUrl: PUBLIC_ORIGIN,
+    deviceAuthorization: DEVICE_AUTHORIZATION,
+    fetchImpl: async (input, options) => {
+      const url = new URL(input);
+      assert.equal(url.origin, PUBLIC_ORIGIN);
+      const response = await invoke(handler, {
+        method: options.method,
+        url: `${url.pathname}${url.search}`,
+        body: null,
+        headers: Object.fromEntries(new Headers(options.headers)),
+      });
+      return new Response(response.body, { status: response.status, headers: response.headers });
+    },
+  });
+  assert.deepEqual(clientCapability, expectedCapability,
+    "the maintained v1.2 client contract accepts the public gateway capability");
+  assert.equal(backendCalls.length, 2);
+
+  const peerRoute = await invoke(handler, {
+    method: "GET",
+    url: "/api/v1/device/sync/state",
+    body: null,
+    headers: { authorization: DEVICE_AUTHORIZATION, ...forgedHeaders },
+  });
+  assert.equal(peerRoute.status, 200);
+  assert.deepEqual(peerRoute.json(), { destinationOrigin: BACKEND_ORIGIN },
+    "peer GET responses are not origin-rewritten");
+  assert.equal(backendCalls[2].options.headers.has("x-tibotattle-oauth-gateway-public-origin"), false);
+
+  const v11Capabilities = await invoke(handler, {
+    method: "GET",
+    url: "/api/v1/device/sync-capabilities",
+    body: null,
+    headers: { authorization: DEVICE_AUTHORIZATION, ...forgedHeaders },
+  });
+  assert.equal(v11Capabilities.status, 404, "the v1.1 capability route remains unavailable");
+  assert.equal(backendCalls.length, 3);
+});
+
+test("malformed or unexpected private capability responses fail closed without leaking their body", async () => {
+  const { fetchImpl: metadata } = metadataFetch();
+  const responses = [
+    "private-upstream-secret malformed",
+    JSON.stringify(v12Capability("https://attacker.example")),
+    JSON.stringify({ ...v12Capability(), unexpected: "private-upstream-secret" }),
+  ];
+  let backendIndex = 0;
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      return new Response(responses[backendIndex++], {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+    logger: () => {},
+  });
+
+  for (let index = 0; index < responses.length; index += 1) {
+    const result = await invoke(handler, {
+      method: "GET",
+      url: "/api/v1/device/sync-capabilities-v1.2",
+      body: null,
+      headers: { authorization: DEVICE_AUTHORIZATION },
+    });
+    assert.equal(result.status, 502);
+    assert.equal(result.json().error.code, "UPSTREAM_UNAVAILABLE");
+    assert.equal(result.body.includes(Buffer.from("private-upstream-secret")), false);
+    assert.equal(result.body.includes(Buffer.from(responses[index])), false);
+  }
+  assert.equal(backendIndex, responses.length);
+});
+
+test("the gateway preserves only bounded numeric Retry-After on private 429 and 503 responses", async () => {
+  const outcomes = [
+    { status: 429, retryAfter: "60", expected: "60" },
+    { status: 503, retryAfter: "86400", expected: "86400" },
+    { status: 429, retryAfter: "86401", expected: undefined },
+    { status: 429, retryAfter: "0", expected: undefined },
+    { status: 429, retryAfter: "Wed, 21 Oct 2026 07:28:00 GMT", expected: undefined },
+    { status: 200, retryAfter: "60", expected: undefined },
+    { status: 502, retryAfter: "60", expected: undefined },
+  ];
+  const { fetchImpl: metadata } = metadataFetch();
+  let backendIndex = 0;
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      const outcome = outcomes[backendIndex++];
+      return new Response(JSON.stringify(v12Capability()), {
+        status: outcome.status,
+        headers: { "content-type": "application/json", "retry-after": outcome.retryAfter },
+      });
+    },
+    logger: () => {},
+  });
+
+  for (const outcome of outcomes) {
+    const result = await invoke(handler, {
+      method: "GET",
+      url: "/api/v1/device/sync-capabilities-v1.2",
+      body: null,
+      headers: { authorization: DEVICE_AUTHORIZATION },
+    });
+    assert.equal(result.status, outcome.status);
+    assert.equal(result.headers["retry-after"], outcome.expected);
+  }
+  assert.equal(backendIndex, outcomes.length);
 });
 
 test("request and response bodies, unsupported content, and upstream redirects stay bounded", async () => {

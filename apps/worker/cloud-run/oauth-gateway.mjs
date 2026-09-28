@@ -2,6 +2,11 @@
 
 import http from "node:http";
 import { createFilesystemAssets } from "./assets.mjs";
+import {
+  TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+  TELEMETRY_V12_ENVELOPE_SCHEMA_VERSION,
+  isTelemetryV12ConsentCurrent,
+} from "@app-usagemonitor/telemetry-contract";
 
 const BACKEND_ORIGIN = "https://tibotattle-test-app-5t5mehqi7a-ue.a.run.app";
 const METADATA_IDENTITY_URL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity";
@@ -192,6 +197,14 @@ const RESPONSE_HEADERS = Object.freeze([
   "vary",
   "x-content-type-options",
 ]);
+const V12_CAPABILITY_KEYS = Object.freeze([
+  "schemaVersion", "destinationOrigin", "enrollmentNamespace", "identityVersion", "authorityKind", "successor",
+]);
+const V12_SUCCESSOR_KEYS = Object.freeze([
+  "schemaVersion", "envelopeSchemaVersion", "lifecycle", "requiredConsent", "consentCurrent",
+  "authorizationCurrent", "activationTime",
+]);
+const ENROLLMENT_NAMESPACE_PATTERN = /^[A-Za-z0-9_-]{16,128}$/u;
 
 function safeError(status, code, allow) {
   const body = Buffer.from(JSON.stringify({
@@ -205,6 +218,53 @@ function safeError(status, code, allow) {
   };
   if (allow) headers.allow = allow;
   return { status, headers, body };
+}
+
+function exactRecord(value, keys) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === keys.length
+    && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function validCapabilityInstant(value) {
+  return typeof value === "string" && value.length === 24
+    && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
+}
+
+/** Rewrite only the unsigned, closed v1.2 capability contract for the public
+ * gateway. The private Request URL remains unchanged for private dispatch. */
+function publicV12CapabilityBody(body, configuration, maximumBytes) {
+  let value;
+  try { value = JSON.parse(body.toString("utf8")); } catch {
+    throw new Error("UPSTREAM_CAPABILITY_INVALID");
+  }
+  const successor = value?.successor;
+  if (!exactRecord(value, V12_CAPABILITY_KEYS)
+      || value.schemaVersion !== "device-sync-capabilities-v1.2"
+      || (value.destinationOrigin !== configuration.backendOrigin
+        && value.destinationOrigin !== configuration.publicOrigin)
+      || typeof value.enrollmentNamespace !== "string"
+      || !ENROLLMENT_NAMESPACE_PATTERN.test(value.enrollmentNamespace)
+      || value.identityVersion !== "account-track-v2"
+      || !["social", "accountless"].includes(value.authorityKind)
+      || !exactRecord(successor, V12_SUCCESSOR_KEYS)
+      || successor.schemaVersion !== TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION
+      || successor.envelopeSchemaVersion !== TELEMETRY_V12_ENVELOPE_SCHEMA_VERSION
+      || !["accepted", "staged", "blocked"].includes(successor.lifecycle)
+      || !isTelemetryV12ConsentCurrent(successor.requiredConsent)
+      || typeof successor.consentCurrent !== "boolean"
+      || typeof successor.authorizationCurrent !== "boolean"
+      || (successor.activationTime !== null && !validCapabilityInstant(successor.activationTime))
+      || (successor.authorizationCurrent && successor.activationTime === null)
+      || (value.authorityKind === "accountless" && successor.consentCurrent)
+      || (successor.authorizationCurrent && (successor.lifecycle !== "accepted"
+        || (value.authorityKind === "social" && !successor.consentCurrent)))) {
+    throw new Error("UPSTREAM_CAPABILITY_INVALID");
+  }
+  value.destinationOrigin = configuration.publicOrigin;
+  const mapped = Buffer.from(JSON.stringify(value));
+  if (mapped.byteLength > maximumBytes) throw new Error("UPSTREAM_RESPONSE_TOO_LARGE");
+  return mapped;
 }
 
 function canonicalOrigin(value, name) {
@@ -561,6 +621,13 @@ function responseHeaders(response) {
     const value = response.headers.get(name);
     if (value !== null) result[name] = value;
   }
+  if (response.status === 429 || response.status === 503) {
+    const retryAfter = response.headers.get("retry-after");
+    if (retryAfter !== null && /^(?:0|[1-9]\d{0,4})$/u.test(retryAfter)) {
+      const seconds = Number(retryAfter);
+      if (seconds >= 1 && seconds <= 86_400) result["retry-after"] = retryAfter;
+    }
+  }
   const cookies = response.headers.getSetCookie?.() ?? [];
   if (cookies.length > 0) result["set-cookie"] = cookies;
   result["cache-control"] = "no-store";
@@ -740,10 +807,16 @@ export function createOauthGatewayHandler({
         await upstream.body?.cancel().catch(() => undefined);
         throw new Error("UPSTREAM_RESPONSE_TYPE_INVALID");
       }
-      const responseBody = await readBoundedResponse(upstream, route.maxResponseBytes);
+      let responseBody = await readBoundedResponse(upstream, route.maxResponseBytes);
+      const responseHeaderValues = responseHeaders(upstream);
+      if (route.id === "device_sync_capabilities_v12" && upstream.status === 200
+          && contentType === "application/json") {
+        responseBody = publicV12CapabilityBody(responseBody, configuration, route.maxResponseBytes);
+        responseHeaderValues["content-length"] = String(responseBody.byteLength);
+      }
       result = {
         status: upstream.status,
-        headers: responseHeaders(upstream),
+        headers: responseHeaderValues,
         body: responseBody,
       };
     } catch {
