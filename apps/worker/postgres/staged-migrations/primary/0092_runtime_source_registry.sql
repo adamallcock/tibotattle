@@ -1,4 +1,5 @@
--- Candidate primary DDL for the exact D1 runtime-source identity contract.
+-- Staged candidate primary DDL for isolated source-transfer qualification.
+-- This is not part of the stock primary migration manifest until separately promoted.
 -- Registration binds one source ID to its raw namespace at contract version 1.
 -- It does not grant ingestion or participant authority.
 CREATE TABLE analytics_runtime_sources (

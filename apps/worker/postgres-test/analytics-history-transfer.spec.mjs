@@ -27,7 +27,7 @@ function eventDigest(sequence, suffix) {
 }
 
 async function makeSealedSource({ namespace = "synthetic-analytics-namespace", sourceId = "synthetic-analytics-source",
-  additionalRuntimeSources = [], journalContentOverride = null } = {}) {
+  additionalRuntimeSources = [], journalContentOverride = null, omitRuntimeSource = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "tibotattle-analytics-history-pg17-"));
   const path = join(await realpath(directory), "analytics-source.sqlite");
   const database = new DatabaseSync(path);
@@ -55,7 +55,7 @@ async function makeSealedSource({ namespace = "synthetic-analytics-namespace", s
         content_digest TEXT NOT NULL,authority_epoch INTEGER NOT NULL,public_authority_epoch INTEGER NOT NULL,
         recorded_ms INTEGER NOT NULL,PRIMARY KEY(source_id,sequence),UNIQUE(source_id,event_digest));`);
     const insertRuntimeSource = database.prepare("INSERT INTO analytics_runtime_sources VALUES(?,?,1)");
-    insertRuntimeSource.run(sourceId, namespace);
+    if (!omitRuntimeSource) insertRuntimeSource.run(sourceId, namespace);
     for (const runtimeSource of additionalRuntimeSources) {
       insertRuntimeSource.run(runtimeSource.sourceId, runtimeSource.namespace);
     }
@@ -119,7 +119,7 @@ async function makeSealedSource({ namespace = "synthetic-analytics-namespace", s
   const expectedJournalSha256 = createHash("sha256").update(await readFile(journalPath)).digest("hex");
   const journalSource = await createSealedSqliteIngestionJournalSource({ path: await realpath(journalPath),
     expectedSha256: expectedJournalSha256, expectedSourceId: sourceId });
-  return { directory, source, journalSource };
+  return { directory, path, source, journalSource };
 }
 
 async function localSocket() {
@@ -162,6 +162,9 @@ test("PG17 transfers only the sealed runtime-source registry subset into staged 
     const additionalRuntimeSources = [{ sourceId: "synthetic-secondary-source",
       namespace: "synthetic-secondary-namespace" }];
     fixture = await makeSealedSource({ namespace, sourceId, additionalRuntimeSources });
+    await assert.rejects(makeSealedSource({ omitRuntimeSource: true }), error =>
+      error?.code === "ANALYTICS_HISTORY_SOURCE_INTEGRITY_INVALID",
+    "state and journal rows without their source registration are refused before transfer");
     const transfer = () => transferPostgresAnalyticsRuntimeSourceRegistry({ source: fixture.source,
       destinationPool: pool, targetSchema: schema, pageSize: 1 });
     const before = await pool.query(`SELECT count(*)::text AS rows FROM ${table("analytics_runtime_sources")}`);
@@ -209,8 +212,11 @@ test("PG17 transfers only the sealed runtime-source registry subset into staged 
     assert.equal(result.readerEnabled, false);
     assert.equal(result.publicationEnabled, false);
     assert.equal(result.productionCutoverAuthorized, false);
-    assert.equal(result.runtimeSourceRegistryTargetDdlOwned, false);
-    assert.equal(result.rawNamespaceIncluded, false);
+    assert.equal(result.rawNamespaceTransferredAndReadBack, true);
+    assert.equal(result.rawNamespaceIncludedInReceipt, false);
+    assert.equal(result.stagedTargetDdlValidated, true);
+    assert.equal(result.stockTargetMigrationReady, false);
+    assert.equal(result.productionTargetPromotionReady, false);
     assert.equal(JSON.stringify(result).includes(namespace), false);
     assert.equal(result.sourceRowsSha256, result.targetRowsSha256);
     const stored = await pool.query(`SELECT source_id,source_namespace,contract_version
@@ -238,6 +244,27 @@ test("PG17 transfers only the sealed runtime-source registry subset into staged 
     const afterConflict = await pool.query(`SELECT source_id,source_namespace,contract_version
       FROM ${table("analytics_runtime_sources")}`);
     assert.deepEqual(afterConflict.rows, stored.rows, "conflict verification must not mutate immutable target rows");
+
+    const changedRegistry = await makeSealedSource({ namespace: "synthetic-registry-before-change", sourceId,
+      additionalRuntimeSources });
+    invalidFixtures.push(changedRegistry);
+    await chmod(changedRegistry.path, 0o600);
+    const changedDatabase = new DatabaseSync(changedRegistry.path);
+    try {
+      changedDatabase.prepare("UPDATE analytics_runtime_sources SET source_namespace=? WHERE source_id=?")
+        .run("synthetic-registry-after-change", sourceId);
+    } finally {
+      changedDatabase.close();
+      await chmod(changedRegistry.path, 0o400);
+    }
+    await assert.rejects(transferPostgresAnalyticsRuntimeSourceRegistry({ source: changedRegistry.source,
+      destinationPool: pool, targetSchema: schema, pageSize: 1 }),
+    error => error?.code === "ANALYTICS_HISTORY_SOURCE_CHANGED",
+    "a registry tuple changed after sealing is refused before target writes");
+    const afterChangedRegistry = await pool.query(`SELECT source_id,source_namespace,contract_version
+      FROM ${table("analytics_runtime_sources")} ORDER BY source_id COLLATE "C"`);
+    assert.deepEqual(afterChangedRegistry.rows, stored.rows,
+      "a post-seal registry change cannot alter the previously verified target");
 
     for (const invalidNamespace of ["n".repeat(201), "synthetic-control-\u0001-namespace"]) {
       const unsupported = await makeSealedSource({ namespace: invalidNamespace, sourceId });

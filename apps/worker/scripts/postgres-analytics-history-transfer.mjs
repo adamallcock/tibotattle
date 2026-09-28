@@ -1220,10 +1220,10 @@ async function validateRuntimeSourceRegistryTarget(client, schema) {
 /**
  * Rehearse only the sealed D1 runtime-source tuple transfer into staged 0092.
  * The accepted D1 subset and the exact target are checked before a single row
- * is written. Namespace values stay internal to this function and its sealed
- * reader; receipts contain hashes and counts only. This does not import history
- * or qualify full D1 registry parity, analytics continuity, readers, publication,
- * or cutover.
+ * is written. The raw namespace is copied and independently read back, while
+ * receipts contain hashes and counts only. This does not import history or
+ * qualify full D1 registry parity, analytics continuity, readers, publication,
+ * a stock migration, or cutover.
  */
 export async function transferPostgresAnalyticsRuntimeSourceRegistry({
   source,
@@ -1362,8 +1362,11 @@ export async function transferPostgresAnalyticsRuntimeSourceRegistry({
       readerEnabled: false,
       publicationEnabled: false,
       productionCutoverAuthorized: false,
-      rawNamespaceIncluded: false,
-      runtimeSourceRegistryTargetDdlOwned: false,
+      rawNamespaceTransferredAndReadBack: true,
+      rawNamespaceIncludedInReceipt: false,
+      stagedTargetDdlValidated: true,
+      stockTargetMigrationReady: false,
+      productionTargetPromotionReady: false,
     });
   } catch (error) {
     if (transactionStarted && !committed) await client.query("ROLLBACK").catch(() => {});
