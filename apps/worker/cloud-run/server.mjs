@@ -39,6 +39,7 @@ import {
 } from "../src/postgres-typed-v12-admission.ts";
 import { createPostgresDeviceUploadAuthorization } from "../src/postgres-upload-authorization.ts";
 import { createPostgresTypedV12Domain } from "../src/postgres-typed-v12-domain.ts";
+import { readPostgresTelemetryV12EffectivePage } from "../src/postgres-typed-v12-effective-reader.ts";
 import {
   decryptSyntheticEnvelope,
   publicEnvelopeKey,
@@ -496,6 +497,7 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           publicEnvelopeKey,
           sourceNamespace: backend.sourceIdentity.sourceNamespace,
           createPostgresTypedV12Domain,
+          readPostgresTelemetryV12EffectivePage,
           registerPostgresTypedV12DayManifest,
           claimPostgresDeviceUploadAuthorization,
           abandonPostgresDeviceUploadAuthorization,
