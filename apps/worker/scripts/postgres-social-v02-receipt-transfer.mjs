@@ -255,10 +255,14 @@ function readSourceManifest(database, expectedSourceId) {
   const sourceAuthorityEpoch = normalizeInteger(manifest.source_authority_epoch);
   const journalEventCount = normalizeInteger(manifest.journal_event_count);
   const journalLastSequence = normalizeInteger(manifest.journal_last_sequence);
-  if (BigInt(sourceAuthorityEpoch) < 0n || BigInt(journalEventCount) < 0n || BigInt(journalLastSequence) < 0n
-      || BigInt(journalEventCount) !== BigInt(journalLastSequence)
+  const journalEventCountValue = BigInt(journalEventCount);
+  const journalLastSequenceValue = BigInt(journalLastSequence);
+  if (BigInt(sourceAuthorityEpoch) < 0n || journalEventCountValue < 0n || journalLastSequenceValue < 0n
+      || (journalEventCountValue === 0n
+        && (journalLastSequenceValue !== 0n || BigInt(sourceAuthorityEpoch) !== 0n))
+      || (journalEventCountValue > 0n && journalLastSequenceValue < journalEventCountValue)
       || !SHA256.test(manifest.journal_event_rows_sha256 ?? "")
-      || (BigInt(journalEventCount) === 0n && BigInt(sourceAuthorityEpoch) !== 0n)) {
+      ) {
     fail("SOCIAL_V02_RECEIPT_SOURCE_MANIFEST_INVALID");
   }
   return Object.freeze({ sourceId: manifest.source_id, sourceAuthorityEpoch, journalEventCount,
@@ -755,6 +759,8 @@ export async function transferPostgresSocialV02Receipts({
       sourceSnapshotSha256: manifest.sourceSnapshotSha256,
       sourceJournalRows: manifest.journalEventCount,
       sourceJournalRowsSha256: manifest.journalEventRowsSha256,
+      sourceJournalLastSequence: manifest.journalLastSequence,
+      targetJournalLastSequence: journal.lastSequence,
       sourceReceiptRows: manifest.receiptRows,
       sourceReceiptRowsSha256: manifest.receiptRowsSha256,
       targetReceiptRows: target.count,

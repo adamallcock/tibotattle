@@ -221,3 +221,89 @@ test("PG17 social v0.2 receipt transfer reconciles sealed source evidence, inser
     await rm(file.directory, { recursive: true, force: true });
   }
 }));
+
+test("PG17 transfer reconciles v1 rows across retained v0 sequence gaps and rolls back a later page failure", {
+  skip: SKIP,
+  timeout: 180_000,
+}, async () => withTarget(async ({ pool, schema, table }) => {
+  await pool.query(`INSERT INTO ${table("storage_source_state")}(singleton,source_id,authority_epoch)
+    VALUES (1,$1,0)`, [SOCIAL_V02_SOURCE_ID]);
+  const { participantId, ownerDigest } = await insertEligibleSocialV02(pool, table);
+  const firstEventDigest = sha256("synthetic-social-v02-gapped-event-one");
+  const retainedV0Digest = sha256("synthetic-retained-v0-event");
+  const secondEventDigest = sha256("synthetic-social-v02-gapped-event-two");
+
+  await pool.query(`SELECT ${table("storage_journal_append")}('owner-active',$1,$2,$2,$2)`,
+    [ownerDigest, firstEventDigest]);
+  await pool.query(`INSERT INTO ${table("storage_ingestion_changes")}(
+      source_id,sequence,event_digest,owner_digest,owner_revision,authority_epoch,kind,recorded_ms
+    ) VALUES ($1,2,$2,$3,0,0,'source-updated',0)`,
+  [SOCIAL_V02_SOURCE_ID, retainedV0Digest, sha256("synthetic-v0-owner")]);
+  await pool.query(`UPDATE ${table("community_analytical_input_versions")} SET revision=2
+    WHERE participant_id=$1`, [participantId]);
+  await pool.query(`SELECT ${table("storage_journal_append")}('source-updated',$1,$2,$2,$2)`,
+    [ownerDigest, secondEventDigest]);
+
+  const first = await sourceProof(pool, table, participantId, ownerDigest, firstEventDigest);
+  const second = await sourceProof(pool, table, participantId, ownerDigest, secondEventDigest);
+  first.proof.input_revision = "1";
+  assert.equal(first.journal.sequence, "1");
+  assert.equal(second.journal.sequence, "3");
+  assert.equal(second.sourceAuthorityEpoch, "1");
+  const journalRows = [first.journal, second.journal];
+  const proofRows = [first.proof, second.proof].sort((left, right) => left.event_digest.localeCompare(right.event_digest));
+  const failureDigest = proofRows[1].event_digest;
+  assert.match(failureDigest, /^[0-9a-f]{64}$/u);
+  const file = await makeSocialV02ReceiptProjection({
+    sourceId: first.sourceId,
+    sourceAuthorityEpoch: first.sourceAuthorityEpoch,
+    journalRows,
+    proofRows,
+  });
+  let source;
+  try {
+    source = await createSealedSqliteSocialV02ReceiptSource({
+      path: file.path,
+      expectedSha256: file.expectedSha256,
+      expectedSourceId: first.sourceId,
+    });
+
+    await pool.query(`CREATE FUNCTION "${schema}".social_v02_second_page_failure()
+      RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.event_digest = '${failureDigest}' THEN
+          RAISE EXCEPTION 'synthetic_second_page_failure' USING ERRCODE='P1005';
+        END IF;
+        RETURN NEW;
+      END;
+      $$`);
+    await pool.query(`CREATE TRIGGER social_v02_second_page_failure
+      BEFORE INSERT ON ${table("storage_legacy_event_sources")}
+      FOR EACH ROW EXECUTE FUNCTION "${schema}".social_v02_second_page_failure()`);
+
+    await assert.rejects(transferPostgresSocialV02Receipts({
+      source,
+      destinationPool: pool,
+      targetSchema: schema,
+      pageSize: 1,
+    }), { code: "SOCIAL_V02_RECEIPT_TARGET_INSERT_FAILED" });
+    assert.equal((await pool.query(`SELECT count(*)::int AS count
+      FROM ${table("storage_legacy_event_sources")}`)).rows[0].count, 0,
+    "failure on page two rolls back the receipt inserted by page one");
+
+    await pool.query(`DROP TRIGGER social_v02_second_page_failure ON ${table("storage_legacy_event_sources")}`);
+    await pool.query(`DROP FUNCTION "${schema}".social_v02_second_page_failure()`);
+    const result = await transferPostgresSocialV02Receipts({ source, destinationPool: pool, targetSchema: schema, pageSize: 1 });
+    assert.equal(result.sourceJournalRows, "2");
+    assert.equal(result.sourceJournalLastSequence, "3");
+    assert.equal(result.targetJournalLastSequence, "3");
+    assert.equal(result.targetReceiptRows, "2");
+    assert.equal(result.bootstrapPending, "0");
+    assert.equal((await pool.query(`SELECT count(*)::int AS count FROM ${table("storage_ingestion_changes")}`)).rows[0].count, 3,
+      "the retained version-0 row remains between the two exact journal rows");
+    assert.equal((await pool.query(`SELECT count(*)::int AS count FROM ${table("storage_legacy_event_sources")}`)).rows[0].count, 2);
+  } finally {
+    source?.close();
+    await rm(file.directory, { recursive: true, force: true });
+  }
+}));

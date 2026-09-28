@@ -11,10 +11,11 @@ import {
   SOCIAL_V02_SOURCE_ID,
 } from "../postgres-test/social-v02-receipt-transfer-fixture.mjs";
 
-function eventFixture(index, { currentInputRevision = index } = {}) {
+function eventFixture(index, { currentInputRevision = index, sequence = index, publicAuthorityEpoch = sequence } = {}) {
   const eventDigest = digest(`event-${index}`);
   const ownerDigest = digest(`owner-${index}`);
-  const sequence = String(index);
+  sequence = String(sequence);
+  publicAuthorityEpoch = String(publicAuthorityEpoch);
   const journal = {
     source_id: SOCIAL_V02_SOURCE_ID,
     sequence,
@@ -25,7 +26,7 @@ function eventFixture(index, { currentInputRevision = index } = {}) {
     object_digest: eventDigest,
     content_digest: eventDigest,
     authority_epoch: "1",
-    public_authority_epoch: sequence,
+    public_authority_epoch: publicAuthorityEpoch,
     recorded_ms: String(1_790_000_000_000 + index),
   };
   const proof = {
@@ -40,7 +41,7 @@ function eventFixture(index, { currentInputRevision = index } = {}) {
     object_digest: eventDigest,
     content_digest: eventDigest,
     authority_epoch: "1",
-    public_authority_epoch: sequence,
+    public_authority_epoch: publicAuthorityEpoch,
     recorded_ms: journal.recorded_ms,
     owner_link_digest: ownerDigest,
     owner_link_state: "active",
@@ -92,6 +93,45 @@ test("sealed social v0.2 receipt projection scans bounded pages without exposing
     assert.equal(JSON.stringify(receipt).includes(first.proof.owner_digest), false);
   } finally {
     source.close();
+    await rm(file.directory, { recursive: true, force: true });
+  }
+});
+
+test("sealed social v0.2 journal manifest keeps row count distinct from the last gapped sequence", async () => {
+  const first = eventFixture(1, { sequence: 1, publicAuthorityEpoch: 1 });
+  const third = eventFixture(3, { sequence: 3, publicAuthorityEpoch: 1 });
+  const { file, source } = await openFixture({
+    sourceAuthorityEpoch: "1",
+    journalRows: [first.journal, third.journal],
+    proofRows: [first.proof, third.proof],
+  });
+  try {
+    const receipt = await scanSealedSqliteSocialV02Receipts({ source, pageSize: 1 });
+    assert.equal(receipt.journalEventCount, "2");
+    assert.equal(receipt.journalLastSequence, "3");
+    assert.equal(receipt.receiptRows, "2");
+  } finally {
+    source.close();
+    await rm(file.directory, { recursive: true, force: true });
+  }
+});
+
+test("sealed social v0.2 journal manifest still rejects impossible count and last-sequence bounds", async () => {
+  const row = eventFixture(1, { sequence: 1, publicAuthorityEpoch: 1 });
+  const file = await makeSocialV02ReceiptProjection({
+    sourceAuthorityEpoch: "1",
+    journalRows: [row.journal],
+    manifestJournalEventCount: 2,
+    manifestJournalLastSequence: 1,
+    proofRows: [row.proof],
+  });
+  try {
+    await assert.rejects(createSealedSqliteSocialV02ReceiptSource({
+      path: file.path,
+      expectedSha256: file.expectedSha256,
+      expectedSourceId: SOCIAL_V02_SOURCE_ID,
+    }), { code: "SOCIAL_V02_RECEIPT_SOURCE_MANIFEST_INVALID" });
+  } finally {
     await rm(file.directory, { recursive: true, force: true });
   }
 });

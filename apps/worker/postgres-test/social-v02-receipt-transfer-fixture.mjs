@@ -31,6 +31,8 @@ export async function makeSocialV02ReceiptProjection({
   sourceId = SOCIAL_V02_SOURCE_ID,
   sourceAuthorityEpoch = "1",
   journalRows = [],
+  manifestJournalEventCount,
+  manifestJournalLastSequence,
   proofRows = [],
   extraTable = false,
 } = {}) {
@@ -59,7 +61,11 @@ export async function makeSocialV02ReceiptProjection({
     `);
     if (extraTable) database.exec("CREATE TABLE unexpected_source_data(value TEXT) STRICT");
 
-    const journal = journalRows.map(normalizeJournal);
+    const journal = journalRows.map(normalizeJournal).sort((left, right) => {
+      const leftSequence = BigInt(left.sequence);
+      const rightSequence = BigInt(right.sequence);
+      return leftSequence < rightSequence ? -1 : leftSequence > rightSequence ? 1 : 0;
+    });
     const journalHash = createHash("sha256");
     for (const row of journal) journalHash.update(`${JSON.stringify(SOCIAL_V02_JOURNAL_COLUMNS.map(column => row[column]))}\n`);
     const lastSequence = journal.length === 0 ? "0" : journal.at(-1).sequence;
@@ -67,7 +73,8 @@ export async function makeSocialV02ReceiptProjection({
       singleton,schema_version,source_id,source_authority_epoch,journal_event_count,
       journal_event_rows_sha256,journal_last_sequence) VALUES(1,?,?,?,?,?,?)`).run(
       "sealed-sqlite-social-v02-receipt-projection-v1", sourceId, BigInt(sourceAuthorityEpoch),
-      BigInt(journal.length), journalHash.digest("hex"), BigInt(lastSequence));
+      BigInt(manifestJournalEventCount ?? journal.length), journalHash.digest("hex"),
+      BigInt(manifestJournalLastSequence ?? lastSequence));
 
     const insert = database.prepare(`INSERT INTO social_v02_receipt_proofs(
       ${SOCIAL_V02_PROOF_COLUMNS.map(column => `"${column}"`).join(",")})

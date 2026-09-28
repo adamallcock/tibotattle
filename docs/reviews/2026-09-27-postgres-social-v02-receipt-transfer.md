@@ -29,24 +29,24 @@ or applied-head transfer machinery. The local PG17 test verifies exact import,
 rollback for a mismatched current input revision, bootstrap pending reaching
 zero, and safe replay.
 
-## Source-side blocker
+## Live-source boundary and remaining blocker
 
 The projection format is a tested contract for a future sealed source exporter;
 this change does not implement that exporter or prove that a generated file
 came from D1. Its expected file hash pins an artifact but is not itself a D1
-attestation. A real import therefore remains blocked until a deliberate,
-reviewed source-side snapshot/bridge can provide the complete receipt, journal,
-input, owner-link, and head evidence from one consistent source state.
-
-The parent agent recorded the read-only production inventory in
+attestation. The parent agent's corrected metadata receipt,
 `docs/receipts/2026-09-27-cloudflare-production-source-schema-inventory.md`
-(integration commit `cd21b95f081e7815193af84839229f870950a34c`). That receipt
-reports no `storage_%` tables in the configured production `USAGE_MONITOR_DB`
-and no separately listed storage-ingestion D1; it read no user rows and made
-no changes. This checkout's D1 ingestion-bridge migration is therefore not
-evidence that a matching live production receipt/journal source exists. Do not
-run this adapter against Cloud SQL or production data until source deployment
-and the snapshot contract are resolved.
+(integration commit `c675d2b03cbbf9c2949e79b49a23d849a9fd733f`), reports that the
+100%-serving Worker version at the observation time binds to a separate
+production ingestion D1 containing the legacy receipt, journal, and owner-head
+tables. That corrected receipt supersedes the earlier inventory, which checked
+only the older primary D1. It read no user rows and made no changes.
+
+Real transfer remains blocked until a reviewed source fence/snapshot and
+exporter can provide complete receipt, journal, input, owner-link, and head
+evidence from one consistent source state, then reconcile it with the target.
+This work did not inspect source rows, establish a fence/snapshot, or run the
+adapter against production or Cloud SQL.
 
 ## Validation
 
