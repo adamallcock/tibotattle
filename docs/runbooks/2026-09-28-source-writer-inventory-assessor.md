@@ -12,6 +12,11 @@ with a separate expected graph. It makes no Cloudflare API calls and reads no
 source rows. Even an exact match is `review_required_match`; this tool is not a
 production freeze, export, migration, or cutover gate.
 
+No Cloudflare API collector is maintained for this schema. The [provider
+feasibility review](../reviews/2026-09-28-cloudflare-source-writer-provider-feasibility.md)
+records why the current binding and Queue variants cannot be represented
+losslessly and what must change before a collector can be reviewed.
+
 ## Maintained interface
 
 Run the Worker package command with two separate JSON files:
