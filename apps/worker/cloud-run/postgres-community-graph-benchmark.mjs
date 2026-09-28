@@ -691,9 +691,9 @@ function statementKind(statement) {
   if (/^WITH PAGE AS MATERIALIZED\b/u.test(sql)
       && /\.ANALYTICS_PUBLICATION_OWNER_MEMBERS MEMBER\b/u.test(sql)
       && /MEMBER\.OWNER_DIGEST > \$4::TEXT\b/u.test(sql)) return "member_readback_page";
-  if (/^WITH GRAPH_RESULT_PAGE AS MATERIALIZED\b/u.test(sql)
-      && /UPDATE PG_TEMP\.PG_COMMUNITY_GRAPH_MEMBERS/u.test(sql)
-      && /INSERT INTO PG_TEMP\.PG_COMMUNITY_GRAPH_CAPACITIES/u.test(sql)) return "result_page_apply";
+  if (sql.startsWith("WITH GRAPH_RESULT_PAGE AS MATERIALIZED")
+      && sql.includes("INSERT INTO PG_TEMP.PG_COMMUNITY_GRAPH_RESULT_PROOFS")
+      && sql.includes("INSERT INTO PG_TEMP.PG_COMMUNITY_GRAPH_CAPACITIES")) return "result_page_apply";
   if (/ANALYTICS_PUBLICATION_OWNER_MEMBERS/u.test(sql)) return "publication_member_read";
   if (/ANALYTICS_PUBLICATION_CAPTURES/u.test(sql)) return "publication_capture";
   if (/ANALYTICS_PUBLICATIONS/u.test(sql)) return "publication_row";

@@ -403,14 +403,18 @@ async function publishPostgresCommunityModelDayStreamWithClientMembers(
         authority_epoch bigint NOT NULL,
         source_kind text NOT NULL,
         model_method text,
-        input_fingerprint text,
-        result_sha256 text
+        input_fingerprint text
       ) ON COMMIT DROP`);
       await client.query(`CREATE TEMP TABLE pg_community_graph_capacities (
         owner_digest text NOT NULL,
         model_id text NOT NULL,
         capacity double precision NOT NULL,
         PRIMARY KEY(owner_digest, model_id)
+      ) ON COMMIT DROP`);
+      await client.query(`CREATE TEMP TABLE pg_community_graph_result_proofs (
+        owner_digest text PRIMARY KEY CHECK (owner_digest ~ '^[0-9a-f]{64}$'),
+        input_fingerprint text NOT NULL CHECK (input_fingerprint ~ '^[0-9a-f]{64}$'),
+        result_sha256 text NOT NULL CHECK (result_sha256 ~ '^[0-9a-f]{64}$')
       ) ON COMMIT DROP`);
 
       let previousDigest = "";
@@ -673,20 +677,19 @@ async function publishPostgresCommunityModelDayStreamWithClientMembers(
         }
         if (proofUpdates.length > 0 || capacityRows.length > 0) {
           const applied = await client.query<{
-            updated_count: string | number;
+            proof_inserted_count: string | number;
             inserted_count: string | number;
           }>(
             `WITH graph_result_page AS MATERIALIZED (
                SELECT proof.owner_digest, proof.input_fingerprint, proof.result_sha256
                  FROM unnest($1::text[], $2::text[], $3::text[])
                       AS proof(owner_digest, input_fingerprint, result_sha256)
-             ), updated_members AS (
-               UPDATE pg_temp.pg_community_graph_members member
-                  SET input_fingerprint = graph_result_page.input_fingerprint,
-                      result_sha256 = graph_result_page.result_sha256
+             ), inserted_proofs AS (
+               INSERT INTO pg_temp.pg_community_graph_result_proofs
+                 (owner_digest, input_fingerprint, result_sha256)
+               SELECT owner_digest, input_fingerprint, result_sha256
                  FROM graph_result_page
-                WHERE member.owner_digest = graph_result_page.owner_digest
-               RETURNING member.owner_digest
+               RETURNING owner_digest
              ), capacity_rows AS MATERIALIZED (
                SELECT capacity.owner_digest, capacity.model_id, capacity.value
                  FROM unnest($4::text[], $5::text[], $6::float8[])
@@ -697,7 +700,7 @@ async function publishPostgresCommunityModelDayStreamWithClientMembers(
                  FROM capacity_rows
                RETURNING owner_digest, model_id
              )
-             SELECT (SELECT count(*)::text FROM updated_members) AS updated_count,
+             SELECT (SELECT count(*)::text FROM inserted_proofs) AS proof_inserted_count,
                     (SELECT count(*)::text FROM inserted_capacities) AS inserted_count`,
             [proofUpdates.map((item) => item.ownerDigest),
               proofUpdates.map((item) => item.fingerprint), proofUpdates.map((item) => item.resultHash),
@@ -706,7 +709,7 @@ async function publishPostgresCommunityModelDayStreamWithClientMembers(
           );
           const appliedRow = applied.rows[0];
           if (applied.rows.length !== 1 || !appliedRow
-              || integer(appliedRow.updated_count) !== proofUpdates.length
+              || integer(appliedRow.proof_inserted_count) !== proofUpdates.length
               || integer(appliedRow.inserted_count) !== capacityRows.length) throw fail();
           proofUpdates.length = 0;
           capacityRows.length = 0;
@@ -930,6 +933,12 @@ async function memberReceipt(
               source_kind, input_fingerprint, result_sha256
          FROM ${schema}.analytics_publication_owner_members
         WHERE source_id=$1 AND day=$2::date AND metric='model' AND generation=$3
+     ), candidate AS MATERIALIZED (
+       SELECT member.owner_digest, member.input_revision, member.owner_revision, member.authority_epoch,
+              member.source_kind, proof.input_fingerprint, proof.result_sha256
+         FROM pg_temp.pg_community_graph_members member
+         LEFT JOIN pg_temp.pg_community_graph_result_proofs proof
+           ON proof.owner_digest=member.owner_digest
      ), compared AS MATERIALIZED (
        SELECT stored.owner_digest AS stored_digest, candidate.owner_digest AS candidate_digest,
               stored.input_revision, candidate.input_revision AS candidate_input_revision,
@@ -938,8 +947,7 @@ async function memberReceipt(
               stored.source_kind, candidate.source_kind AS candidate_source_kind,
               stored.input_fingerprint, candidate.input_fingerprint AS candidate_input_fingerprint,
               stored.result_sha256, candidate.result_sha256 AS candidate_result_sha256
-         FROM stored FULL JOIN pg_temp.pg_community_graph_members candidate
-           ON candidate.owner_digest=stored.owner_digest
+         FROM stored FULL JOIN candidate ON candidate.owner_digest=stored.owner_digest
      )
      SELECT count(*) FILTER (WHERE stored_digest IS NOT NULL) AS stored_count,
             count(*) FILTER (WHERE stored_digest IS DISTINCT FROM candidate_digest
@@ -973,9 +981,11 @@ async function insertMemberPages(
       inserted_count: string | number;
     }>(
       `WITH page AS MATERIALIZED (
-         SELECT owner_digest, input_revision, owner_revision, authority_epoch,
-                source_kind, input_fingerprint, result_sha256
+         SELECT member.owner_digest, member.input_revision, member.owner_revision, member.authority_epoch,
+                member.source_kind, proof.input_fingerprint, proof.result_sha256
            FROM pg_temp.pg_community_graph_members member
+           LEFT JOIN pg_temp.pg_community_graph_result_proofs proof
+             ON proof.owner_digest=member.owner_digest
           WHERE member.owner_digest COLLATE "C" > $4::text COLLATE "C"
           ORDER BY member.owner_digest COLLATE "C"
           LIMIT $5::integer

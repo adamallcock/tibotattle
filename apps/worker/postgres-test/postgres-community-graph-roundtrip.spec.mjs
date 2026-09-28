@@ -48,8 +48,7 @@ function measuredPool(base) {
   let connectionAcquisitions = 0;
   let checkedOutConnections = 0;
   let maxConcurrentCheckedOutConnections = 0;
-  let explainedResultPage = false;
-  let explainedMemberReadbackPage = false;
+  const explainedQueryKinds = new Set();
   let lastMemberReadbackDigest = "";
   let memberReadbackPageBoundaryCount = 0;
   let memberReadbackCanonicalOrder = true;
@@ -62,8 +61,8 @@ function measuredPool(base) {
     if (sql.includes("WITH locked AS MATERIALIZED")) return "authority_locks";
     if (sql.includes("WITH stored AS MATERIALIZED")) return "member_receipt";
     if (sql.includes("WITH graph_result_page AS MATERIALIZED")
-        && /UPDATE\s+pg_temp\.pg_community_graph_members/u.test(sql)
-        && /INSERT INTO\s+pg_temp\.pg_community_graph_capacities/u.test(sql)) return "result_page_apply";
+        && sql.includes("INSERT INTO pg_temp.pg_community_graph_result_proofs")
+        && sql.includes("INSERT INTO pg_temp.pg_community_graph_capacities")) return "result_page_apply";
     if (/\bINSERT INTO\b/u.test(sql) && sql.includes("analytics_publication_owner_members")) {
       return "publication_members";
     }
@@ -73,6 +72,42 @@ function measuredPool(base) {
     if (sql.includes("analytics_publication_owner_members")) return "publication_members";
     if (sql.includes("analytics_publications")) return "publication_read_write";
     return "other_sql";
+  };
+  const explainQuery = async (client, kind, sql, values, rollbackMutation) => {
+    const savepoint = "pg_graph_benchmark_explain";
+    if (rollbackMutation) await client.query(`SAVEPOINT ${savepoint}`);
+    let explained;
+    try {
+      explained = await client.query(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sql}`, values);
+    } finally {
+      if (rollbackMutation) {
+        await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+      }
+    }
+    const document = explained.rows[0]?.["QUERY PLAN"]?.[0];
+    const bufferCounters = ["Shared Hit Blocks", "Shared Read Blocks", "Shared Dirtied Blocks",
+      "Shared Written Blocks", "Local Hit Blocks", "Local Read Blocks", "Local Dirtied Blocks",
+      "Local Written Blocks", "Temp Read Blocks", "Temp Written Blocks"];
+    const nodes = [];
+    const collect = (node) => {
+      if (!node) return;
+      nodes.push({ type: node["Node Type"], relation: node["Relation Name"],
+        index: node["Index Name"], planRows: node["Plan Rows"], actualRows: node["Actual Rows"],
+        loops: node["Actual Loops"], actualTotalTimeMs: node["Actual Total Time"],
+        rowsRemovedByFilter: node["Rows Removed by Filter"],
+        buffers: Object.fromEntries(bufferCounters
+          .filter((key) => Number.isSafeInteger(node[key])).map((key) => [key, node[key]])) });
+      for (const child of node.Plans ?? []) collect(child);
+    };
+    collect(document?.Plan);
+    console.log(JSON.stringify({
+      kind: `synthetic-postgres-${kind}-explain-v1`,
+      querySha256: createHash("sha256").update(sql).digest("hex"),
+      planningTimeMs: document?.["Planning Time"] ?? null,
+      executionTimeMs: document?.["Execution Time"] ?? null,
+      nodes,
+    }));
   };
   return {
     pool: {
@@ -85,64 +120,19 @@ function measuredPool(base) {
         );
         return {
           async query(sql, values) {
-            if (!explainedResultPage && process.env.PG_GRAPH_STRESS_EXPLAIN === "1"
-                && classify(sql) === "result_pages") {
-              explainedResultPage = true;
-              const explained = await client.query(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sql}`, values);
-              const explainedPlan = explained.rows[0]?.["QUERY PLAN"]?.[0];
-              const plan = explainedPlan?.Plan;
-              const bufferCounters = ["Shared Hit Blocks", "Shared Read Blocks", "Shared Dirtied Blocks",
-                "Shared Written Blocks", "Local Hit Blocks", "Local Read Blocks", "Local Dirtied Blocks",
-                "Local Written Blocks", "Temp Read Blocks", "Temp Written Blocks"];
-              const nodes = [];
-              const collect = (node) => {
-                if (!node) return;
-                const buffers = Object.fromEntries(bufferCounters
-                  .filter((key) => Number.isSafeInteger(node[key]))
-                  .map((key) => [key, node[key]]));
-                nodes.push({ type: node["Node Type"], relation: node["Relation Name"],
-                  index: node["Index Name"], planRows: node["Plan Rows"],
-                  actualRows: node["Actual Rows"], loops: node["Actual Loops"],
-                  actualTotalTimeMs: node["Actual Total Time"],
-                  rowsRemovedByFilter: node["Rows Removed by Filter"],
-                  buffers });
-                for (const child of node.Plans ?? []) collect(child);
-              };
-              collect(plan);
-              console.log(JSON.stringify({
-                kind: "synthetic-postgres-result-page-explain-v2",
-                querySha256: createHash("sha256").update(sql).digest("hex"),
-                planningTimeMs: explainedPlan?.["Planning Time"] ?? null,
-                executionTimeMs: explainedPlan?.["Execution Time"] ?? null,
-                nodes,
-              }));
+            const kind = classify(sql);
+            if (!explainedQueryKinds.has(kind)
+                && process.env.PG_GRAPH_STRESS_EXPLAIN === "1"
+                && ["result_pages", "result_page_apply", "publication_members"].includes(kind)) {
+              explainedQueryKinds.add(kind);
+              await explainQuery(client, kind, sql, values,
+                kind === "result_page_apply" || kind === "publication_members");
             }
-            if (!explainedMemberReadbackPage && process.env.PG_GRAPH_STRESS_READBACK_EXPLAIN === "1"
-                && classify(sql) === "member_readback_pages") {
-              explainedMemberReadbackPage = true;
-              const explained = await client.query(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sql}`, values);
-              const explainedPlan = explained.rows[0]?.["QUERY PLAN"]?.[0];
-              const bufferCounters = ["Shared Hit Blocks", "Shared Read Blocks", "Shared Dirtied Blocks",
-                "Shared Written Blocks", "Local Hit Blocks", "Local Read Blocks", "Local Dirtied Blocks",
-                "Local Written Blocks", "Temp Read Blocks", "Temp Written Blocks"];
-              const nodes = [];
-              const collect = (node) => {
-                if (!node) return;
-                nodes.push({ type: node["Node Type"], relation: node["Relation Name"],
-                  index: node["Index Name"], planRows: node["Plan Rows"], actualRows: node["Actual Rows"],
-                  loops: node["Actual Loops"], actualTotalTimeMs: node["Actual Total Time"],
-                  rowsRemovedByFilter: node["Rows Removed by Filter"],
-                  buffers: Object.fromEntries(bufferCounters
-                    .filter((key) => Number.isSafeInteger(node[key])).map((key) => [key, node[key]])) });
-                for (const child of node.Plans ?? []) collect(child);
-              };
-              collect(explainedPlan?.Plan);
-              console.log(JSON.stringify({
-                kind: "synthetic-postgres-member-readback-page-explain-v1",
-                planningTimeMs: explainedPlan?.["Planning Time"] ?? null,
-                executionTimeMs: explainedPlan?.["Execution Time"] ?? null,
-                nodes,
-              }));
+            if (!explainedQueryKinds.has(kind)
+                && process.env.PG_GRAPH_STRESS_READBACK_EXPLAIN === "1"
+                && kind === "member_readback_pages") {
+              explainedQueryKinds.add(kind);
+              await explainQuery(client, kind, sql, values, false);
             }
             const started = performance.now();
             let result;

@@ -500,7 +500,7 @@ test("query receipt metrics count pages and connections without retaining SQL or
             return { rows: [{ synthetic: "x" }], rowCount: 1 };
           }
           if (sql.includes("WITH graph_result_page AS MATERIALIZED")) {
-            return { rows: [{ updated_count: "1", inserted_count: "1" }], rowCount: 1 };
+            return { rows: [{ proof_inserted_count: "1", inserted_count: "1" }], rowCount: 1 };
           }
           return { rows: [], rowCount: 0 };
         },
@@ -516,12 +516,14 @@ test("query receipt metrics count pages and connections without retaining SQL or
     WHERE member.owner_digest > $4::text ORDER BY member.owner_digest LIMIT $5::integer
   ) SELECT page.owner_digest FROM page`);
   metrics.setPhase("publish");
-  await client.query(`WITH graph_result_page AS MATERIALIZED (SELECT 'digest' AS owner_digest),
-    updated_members AS (UPDATE pg_temp.pg_community_graph_members SET result_sha256='hash'
-      FROM graph_result_page WHERE true RETURNING owner_digest),
+  await client.query(`WITH graph_result_page AS MATERIALIZED
+      (SELECT 'digest' AS owner_digest, 'fingerprint' AS input_fingerprint, 'hash' AS result_sha256),
+    inserted_proofs AS (INSERT INTO pg_temp.pg_community_graph_result_proofs
+      (owner_digest, input_fingerprint, result_sha256)
+      SELECT owner_digest, input_fingerprint, result_sha256 FROM graph_result_page RETURNING owner_digest),
     inserted_capacities AS (INSERT INTO pg_temp.pg_community_graph_capacities(owner_digest, model_id, capacity)
       SELECT owner_digest, 'model', 1 FROM graph_result_page RETURNING owner_digest)
-    SELECT (SELECT count(*) FROM updated_members), (SELECT count(*) FROM inserted_capacities)`);
+    SELECT (SELECT count(*) FROM inserted_proofs), (SELECT count(*) FROM inserted_capacities)`);
   await client.query(`WITH page AS MATERIALIZED (SELECT 'synthetic'::text AS owner_digest),
     inserted AS (INSERT INTO synthetic.analytics_publication_owner_members(owner_digest)
       SELECT owner_digest FROM page ON CONFLICT DO NOTHING RETURNING owner_digest)
@@ -533,7 +535,7 @@ test("query receipt metrics count pages and connections without retaining SQL or
   assert.equal(snapshot.rowsRead, 2);
   assert.equal(snapshot.pages.publicationMemberReadPages, 1);
   assert.equal(snapshot.pages.publicationMemberWriteQueries, 1);
-  assert.equal(snapshot.pages.resultPageApplyQueries, 1);
+  assert.equal(snapshot.pages.resultPageApplyQueries, 1, JSON.stringify(snapshot));
   assert.equal(snapshot.queries["publish.result_page_apply"].calls, 1);
   assert.equal(snapshot.queries["publish.publication_member_write"].calls, 1);
   assert.equal(snapshot.connections.poolCheckouts, 1);
