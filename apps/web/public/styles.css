@@ -4015,6 +4015,13 @@ footer p { margin: 0; }
   padding: 1px 3px;
 }
 .community-site .allowance-legend-button { min-height: 26px; padding: 2px 6px; font-size: .72rem; }
+/* The expanded chart keeps its credit. Reserve a separate legend row so six
+   model labels can wrap without covering the credit or the plotted values. */
+.community-site .community-chart-dialog .allowance-series-legend {
+  position: static;
+  padding-inline-end: 90px;
+  min-height: 30px;
+}
 
 /* Closed, this is one quiet line — it inherited the journey card treatment and
    stood 105px tall shut, which is worse than the prose it replaced. */
