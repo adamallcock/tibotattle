@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, readFile, realpath, rm } from "node:fs/promises";
+import { chmod, copyFile, readFile, realpath, rename, rm } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -29,7 +29,9 @@ function quote(value) {
 
 function syntheticSqlite({ nonDefaultIssuance = false, omitIssuance = false, extraParticipantColumn = false,
   omitSessionParticipantForeignKey = false, omitCooldownTable = false, duplicateCooldownMarker = false,
-  wrongCooldownVersion = false } = {}) {
+  wrongCooldownVersion = false, deletingParticipant = false, emptyIdentityAuthority = false,
+  missingIdentityPin = false, extraIdentityPinColumn = false,
+  identityLinkPin = { keyVersion: "synthetic-key-v1", fingerprint: "f".repeat(64), recordedAt: "2031-09-27T12:34:56.789Z" } } = {}) {
   const directory = `/private/tmp/tibotattle-identity-transfer-${randomBytes(5).toString("hex")}`;
   const path = join(directory, "source.sqlite");
   mkdirSync(directory, { mode: 0o700 });
@@ -47,6 +49,12 @@ function syntheticSqlite({ nonDefaultIssuance = false, omitIssuance = false, ext
       identity_cooldown_digest TEXT${duplicateCooldownMarker ? "" : " PRIMARY KEY NOT NULL"},
       schema_version TEXT NOT NULL, deleted_at TEXT NOT NULL, retain_until TEXT NOT NULL
     ) STRICT`]),
+    `CREATE TABLE identity_link_secret_configuration (
+      singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton=1),
+      key_version TEXT NOT NULL CHECK(length(key_version) BETWEEN 1 AND 64 AND key_version NOT GLOB '*[^A-Za-z0-9._-]*'),
+      secret_fingerprint TEXT NOT NULL CHECK(length(secret_fingerprint)=64 AND secret_fingerprint NOT GLOB '*[^0-9a-f]*'),
+      recorded_at TEXT NOT NULL${extraIdentityPinColumn ? ", test_extra TEXT" : ""}
+    ) STRICT`,
     `CREATE TABLE enrollment_grants (
       id TEXT PRIMARY KEY NOT NULL, secret_hash BLOB NOT NULL, state TEXT NOT NULL DEFAULT 'issued',
       issued_at TEXT NOT NULL, expires_at TEXT NOT NULL, redeemed_at TEXT,
@@ -126,6 +134,12 @@ function syntheticSqlite({ nonDefaultIssuance = false, omitIssuance = false, ext
     ) STRICT`);
   }
   database.exec(ddl.join(";\n"));
+  if (!missingIdentityPin) {
+    database.prepare(`INSERT INTO identity_link_secret_configuration
+      (singleton,key_version,secret_fingerprint,recorded_at) VALUES (1,?,?,?)`).run(
+      identityLinkPin.keyVersion, identityLinkPin.fingerprint, identityLinkPin.recordedAt,
+    );
+  }
   if (!omitIssuance) {
     database.prepare(`INSERT INTO accountless_enrollment_issuance
       (singleton,budget_day,daily_issued,lifetime_issued,last_issue_token,updated_at)
@@ -133,7 +147,7 @@ function syntheticSqlite({ nonDefaultIssuance = false, omitIssuance = false, ext
       nonDefaultIssuance ? 1 : 0, nonDefaultIssuance ? 1 : 0,
     );
   }
-  if (!omitCooldownTable || duplicateCooldownMarker) {
+  if ((!omitCooldownTable || duplicateCooldownMarker) && !emptyIdentityAuthority) {
     const insertCooldown = database.prepare(`INSERT INTO identity_reenrollment_cooldowns
       (identity_cooldown_digest,schema_version,deleted_at,retain_until) VALUES(?,?,?,?)`);
     insertCooldown.run("c".repeat(64), wrongCooldownVersion ? "synthetic-wrong-version" : "identity-reenrollment-cooldown-v0.1", "2031-09-25T00:00:00.000Z", "2031-10-02T00:00:00.000Z");
@@ -141,7 +155,10 @@ function syntheticSqlite({ nonDefaultIssuance = false, omitIssuance = false, ext
       insertCooldown.run("c".repeat(64), "identity-reenrollment-cooldown-v0.1", "2031-09-25T00:00:00.000Z", "2031-10-02T00:00:00.000Z");
     }
   }
-  insertSocialFixture(database);
+  if (!emptyIdentityAuthority) insertSocialFixture(database);
+  if (deletingParticipant) {
+    database.prepare("UPDATE participants SET state='deleting' WHERE id='synthetic-social-01'").run();
+  }
   database.close();
   return { directory, path };
 }
@@ -206,6 +223,10 @@ async function seal(path) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+async function closeSource(source) {
+  await source?.close();
+}
+
 async function localSocket() {
   assert.match(PG_TEST_SOCKET ?? "", /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u);
   assert.ok(Number.isSafeInteger(PG_TEST_PORT) && PG_TEST_PORT > 0 && PG_TEST_PORT <= 65535);
@@ -230,6 +251,8 @@ test("sealed source rejects missing or non-default accountless authority and col
     [{ omitSessionParticipantForeignKey: true }, "IDENTITY_TRANSFER_SOURCE_LAYOUT_INVALID"],
     [{ omitCooldownTable: true }, "IDENTITY_TRANSFER_SOURCE_LAYOUT_INVALID"],
     [{ duplicateCooldownMarker: true }, "IDENTITY_TRANSFER_SOURCE_LAYOUT_INVALID"],
+    [{ missingIdentityPin: true }, "IDENTITY_TRANSFER_SOURCE_IDENTITY_PIN_MISSING"],
+    [{ extraIdentityPinColumn: true }, "IDENTITY_TRANSFER_SOURCE_LAYOUT_INVALID"],
   ]) {
     const fixture = syntheticSqlite(options);
     await t.test(JSON.stringify(options), async () => {
@@ -262,11 +285,43 @@ test("sealed synthetic source preserves consent bytes, credential hashes, and ca
     assert.equal(markerPage.rows[0].deleted_at, "2031-09-25T00:00:00.000Z");
     assert.equal(markerPage.rows[0].retain_until, "2031-10-02T00:00:00.000Z");
     assert.equal((await source.listPage({ table: "device_credentials", limit: 1 })).rows[0].secret_hash.length, 32);
+    const identityLinkPin = await source.readIdentityLinkSecretConfiguration();
+    assert.equal(identityLinkPin.singleton, 1);
+    assert.equal(identityLinkPin.key_version, "synthetic-key-v1");
+    assert.equal(identityLinkPin.secret_fingerprint === "f".repeat(64), true,
+      "the synthetic fingerprint should be read exactly without appearing in failure output");
+    assert.equal(identityLinkPin.recorded_at, "2031-09-27T12:34:56.789Z");
     await assert.rejects(source.listPage({ table: "storage_owner_revisions", limit: 1 }), error =>
       error instanceof PostgresIdentityAuthorityTransferError && error.code === "IDENTITY_TRANSFER_TABLE_INVALID");
   } finally {
-    source?.close();
+    await closeSource(source);
     await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("sealed source reads from a private read-only snapshot after the caller path is replaced", async () => {
+  const fixture = syntheticSqlite();
+  const replacement = syntheticSqlite({
+    emptyIdentityAuthority: true,
+    identityLinkPin: { keyVersion: "synthetic-key-v2", fingerprint: "e".repeat(64), recordedAt: "2031-09-28T12:34:56.789Z" },
+  });
+  let source;
+  try {
+    source = await createSealedSqliteIdentityAuthoritySource({
+      path: fixture.path,
+      expectedSha256: await seal(fixture.path),
+    });
+    const movedPath = `${fixture.path}.sealed-origin`;
+    await rename(fixture.path, movedPath);
+    await copyFile(replacement.path, fixture.path);
+    await chmod(fixture.path, 0o400);
+    await source.verifySnapshot();
+    assert.equal((await source.listPage({ table: "participants", limit: 1 })).rows[0].id, "synthetic-social-01");
+    assert.equal((await source.readIdentityLinkSecretConfiguration()).key_version, "synthetic-key-v1");
+  } finally {
+    await closeSource(source);
+    await rm(fixture.directory, { recursive: true, force: true });
+    await rm(replacement.directory, { recursive: true, force: true });
   }
 });
 
@@ -308,6 +363,32 @@ test("PG17 transfers synthetic social authority in FK order, resumes a failed pa
     await pool.query(`CREATE SCHEMA ${quote(controlSchema)}`);
     controlCreated = true;
     assert.equal((await applyPostgresMigrations({ role: "primary", schema: targetSchema, pool })).applied, 46);
+    const deletingFixture = syntheticSqlite({ deletingParticipant: true });
+    let deletingSource;
+    try {
+      deletingSource = await createSealedSqliteIdentityAuthoritySource({
+        path: deletingFixture.path,
+        expectedSha256: await seal(deletingFixture.path),
+      });
+      await assert.rejects(runPostgresIdentityAuthorityTransfer({
+        source: deletingSource,
+        destinationPool: pool,
+        targetSchema,
+        controlSchema,
+        transferId: "synthetic-deleting-participant-refused",
+        pageSize: 1,
+      }), error => error instanceof PostgresIdentityAuthorityTransferError
+        && error.code === "IDENTITY_TRANSFER_ERASURE_LEDGER_REQUIRED");
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${quote(targetSchema)}.participants`)).rows[0]?.n, 0);
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${quote(targetSchema)}.identity_link_secret_configuration`)).rows[0]?.n, 0);
+    } finally {
+      await closeSource(deletingSource);
+      await rm(deletingFixture.directory, { recursive: true, force: true });
+    }
+    assert.equal((await pool.query(
+      "SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema=$1 AND table_name=$2",
+      [controlSchema, "_identity_authority_transfer_runs_v1"],
+    )).rows[0]?.n, 0);
     const wrongMarkerFixture = syntheticSqlite({ wrongCooldownVersion: true });
     let wrongMarkerSource;
     try {
@@ -326,7 +407,7 @@ test("PG17 transfers synthetic social authority in FK order, resumes a failed pa
         && error.code === "IDENTITY_TRANSFER_SOURCE_AUTHORITY_INVALID");
       assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${quote(targetSchema)}.participants`)).rows[0]?.n, 0);
     } finally {
-      wrongMarkerSource?.close();
+      await closeSource(wrongMarkerSource);
       await rm(wrongMarkerFixture.directory, { recursive: true, force: true });
     }
     const expectedSha256 = await seal(fixture.path);
@@ -349,6 +430,21 @@ test("PG17 transfers synthetic social authority in FK order, resumes a failed pa
       transferId: "synthetic-social-authority-run-01",
       pageSize: 1,
     };
+    for (const [label, mismatch] of [
+      ["version", { key_version: "synthetic-key-other", secret_fingerprint: "f".repeat(64), recorded_at: "2031-09-27T12:34:56.789Z" }],
+      ["fingerprint", { key_version: "synthetic-key-v1", secret_fingerprint: "e".repeat(64), recorded_at: "2031-09-27T12:34:56.789Z" }],
+      ["recorded-at", { key_version: "synthetic-key-v1", secret_fingerprint: "f".repeat(64), recorded_at: "2031-09-28T12:34:56.789Z" }],
+    ]) {
+      await pool.query(`INSERT INTO ${quote(targetSchema)}.identity_link_secret_configuration
+        (singleton,key_version,secret_fingerprint,recorded_at) VALUES (1,$1,$2,$3)`,
+      [mismatch.key_version, mismatch.secret_fingerprint, mismatch.recorded_at]);
+      await assert.rejects(runPostgresIdentityAuthorityTransfer({ ...request, transferId: `synthetic-pin-mismatch-${label}` }), error =>
+        error instanceof PostgresIdentityAuthorityTransferError
+          && error.code === "IDENTITY_TRANSFER_TARGET_IDENTITY_PIN_MISMATCH");
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${quote(targetSchema)}.participants`)).rows[0]?.n, 0);
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${quote(controlSchema)}._identity_authority_transfer_runs_v1`)).rows[0]?.n, 0);
+      await pool.query(`DELETE FROM ${quote(targetSchema)}.identity_link_secret_configuration WHERE singleton=1`);
+    }
     await pool.query(`INSERT INTO ${quote(targetSchema)}.identity_reenrollment_cooldowns
       (identity_cooldown_digest,participant_id,created_at,expires_at)
       VALUES ($1,NULL,'2031-09-20T00:00:00Z','2031-10-01T00:00:00Z')`, ["d".repeat(64)]);
@@ -377,12 +473,23 @@ test("PG17 transfers synthetic social authority in FK order, resumes a failed pa
     assert.ok(receipt.pagesCommittedThisRun > 0);
     assert.equal(receipt.source.rows, receipt.destination.rows);
     assert.equal(receipt.source.manifestSha256, receipt.destination.manifestSha256);
+    assert.equal(receipt.capabilities.identityLinkSecretConfigurationTransferred, true);
+    assert.equal(receipt.capabilities.destinationRuntimeSecretMatchVerified, false);
+    assert.equal(JSON.stringify(receipt).includes("f".repeat(64)), false);
     assert.equal(receipt.source.tables.participants.rows, 2);
     assert.equal(receipt.source.tables.identity_reenrollment_cooldowns.rows, 1);
     assert.equal(receipt.source.tables.device_pairing_events.rows, 2);
     assert.equal(receipt.capabilities.accountlessAuthorityTransferred, false);
     assert.equal(receipt.capabilities.analyticsOwnerLinksTransferred, false);
     assert.equal(receipt.capabilities.productionCutoverAuthorized, false);
+    const targetPin = await pool.query(`SELECT singleton,key_version,secret_fingerprint,recorded_at
+      FROM ${quote(targetSchema)}.identity_link_secret_configuration`);
+    assert.equal(targetPin.rows.length, 1);
+    assert.equal(targetPin.rows[0].singleton, 1);
+    assert.equal(targetPin.rows[0].key_version, "synthetic-key-v1");
+    assert.equal(targetPin.rows[0].secret_fingerprint === "f".repeat(64), true,
+      "the synthetic target pin should match without printing its fingerprint on failure");
+    assert.equal(targetPin.rows[0].recorded_at.toISOString(), "2031-09-27T12:34:56.789Z");
 
     const values = await pool.query(`SELECT participant.id,participant.consent_version,
         encode(participant.access_token_hash,'hex') AS access_hash,
@@ -427,11 +534,12 @@ test("PG17 transfers synthetic social authority in FK order, resumes a failed pa
     writable.prepare("UPDATE participants SET consent_version='synthetic-mutated-source' WHERE id='synthetic-social-01'").run();
     writable.close();
     await chmod(fixture.path, 0o400);
-    await assert.rejects(runPostgresIdentityAuthorityTransfer(request), error =>
-      error instanceof PostgresIdentityAuthorityTransferError && error.code === "IDENTITY_TRANSFER_SNAPSHOT_CHANGED");
+    const afterOriginalPathMutation = await runPostgresIdentityAuthorityTransfer(request);
+    assert.equal(afterOriginalPathMutation.idempotentRetry, true);
+    assert.equal(afterOriginalPathMutation.source.manifestSha256, receipt.source.manifestSha256);
     assert.equal((await pool.query(`SELECT status FROM ${quote(controlSchema)}._identity_authority_transfer_runs_v1 WHERE transfer_id=$1`, [request.transferId])).rows[0]?.status, "complete");
   } finally {
-    source?.close();
+    await closeSource(source);
     await pool.end();
     if (targetCreated) await new pg.Client({ ...endpoint, user: PG_TEST_USER, password: process.env.PG_TEST_PASSWORD ?? "synthetic-local-only", database: PG_TEST_DATABASE }).connect().then(async client => {
       try { await client.query(`DROP SCHEMA ${quote(targetSchema)} CASCADE`); } finally { await client.end(); }
@@ -440,5 +548,93 @@ test("PG17 transfers synthetic social authority in FK order, resumes a failed pa
       try { await client.query(`DROP SCHEMA ${quote(controlSchema)} CASCADE`); } finally { await client.end(); }
     }).catch(() => {});
     await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("PG17 reserves a zero-row target once across concurrent transfer IDs and rejects alternate control schemas", {
+  skip: !PG_TEST_SOCKET,
+}, async () => {
+  const endpoint = await localSocket();
+  const pool = new pg.Pool({
+    ...endpoint,
+    user: PG_TEST_USER,
+    password: process.env.PG_TEST_PASSWORD ?? "synthetic-local-only",
+    database: PG_TEST_DATABASE,
+    ssl: false,
+    max: 4,
+    connectionTimeoutMillis: 5_000,
+  });
+  const suffix = randomBytes(5).toString("hex");
+  const targetSchema = `${POSTGRES_IDENTITY_AUTHORITY_TARGET_SCHEMA_PREFIX}${suffix}`;
+  const controlSchema = `${POSTGRES_IDENTITY_AUTHORITY_CONTROL_SCHEMA_PREFIX}${suffix}`;
+  const firstFixture = syntheticSqlite({ emptyIdentityAuthority: true });
+  const secondFixture = syntheticSqlite({
+    emptyIdentityAuthority: true,
+    identityLinkPin: { keyVersion: "synthetic-key-v2", fingerprint: "e".repeat(64), recordedAt: "2031-09-28T12:34:56.789Z" },
+  });
+  let firstSource;
+  let secondSource;
+  let targetCreated = false;
+  let controlCreated = false;
+  try {
+    const locality = await pool.query("SELECT inet_server_addr() AS address, current_setting('server_version_num')::int AS version_num");
+    assert.equal(locality.rows[0]?.address, null);
+    assert.equal(Math.floor(locality.rows[0]?.version_num / 10_000), 17);
+    await pool.query(`CREATE SCHEMA ${quote(targetSchema)}`);
+    targetCreated = true;
+    await pool.query(`CREATE SCHEMA ${quote(controlSchema)}`);
+    controlCreated = true;
+    assert.equal((await applyPostgresMigrations({ role: "primary", schema: targetSchema, pool })).applied, 46);
+    firstSource = await createSealedSqliteIdentityAuthoritySource({
+      path: firstFixture.path,
+      expectedSha256: await seal(firstFixture.path),
+    });
+    secondSource = await createSealedSqliteIdentityAuthoritySource({
+      path: secondFixture.path,
+      expectedSha256: await seal(secondFixture.path),
+    });
+    const outcomes = await Promise.allSettled([
+      runPostgresIdentityAuthorityTransfer({
+        source: firstSource, destinationPool: pool, targetSchema, controlSchema,
+        transferId: "synthetic-empty-target-claim-a", pageSize: 1,
+      }),
+      runPostgresIdentityAuthorityTransfer({
+        source: secondSource, destinationPool: pool, targetSchema, controlSchema,
+        transferId: "synthetic-empty-target-claim-b", pageSize: 1,
+      }),
+    ]);
+    const succeeded = outcomes.filter(result => result.status === "fulfilled");
+    const rejected = outcomes.filter(result => result.status === "rejected");
+    assert.equal(succeeded.length, 1);
+    assert.equal(succeeded[0].value.status, "staged_rehearsal_complete");
+    assert.equal(succeeded[0].value.source.rows, 0);
+    assert.equal(succeeded[0].value.destination.rows, 0);
+    assert.equal(rejected.length, 1);
+    assert.ok(rejected[0].reason instanceof PostgresIdentityAuthorityTransferError);
+    assert.equal(rejected[0].reason.code, "IDENTITY_TRANSFER_TARGET_ALREADY_CLAIMED");
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${quote(controlSchema)}._identity_authority_transfer_runs_v1`)).rows[0]?.n, 1);
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${quote(targetSchema)}.identity_link_secret_configuration`)).rows[0]?.n, 1);
+
+    const alternateControlSchema = `${POSTGRES_IDENTITY_AUTHORITY_CONTROL_SCHEMA_PREFIX}${randomBytes(5).toString("hex")}`;
+    await assert.rejects(runPostgresIdentityAuthorityTransfer({
+      source: secondSource,
+      destinationPool: pool,
+      targetSchema,
+      controlSchema: alternateControlSchema,
+      transferId: "synthetic-empty-target-alternate-control",
+    }), error => error instanceof PostgresIdentityAuthorityTransferError
+      && error.code === "IDENTITY_TRANSFER_DISPOSABLE_SCHEMA_REQUIRED");
+  } finally {
+    await closeSource(firstSource);
+    await closeSource(secondSource);
+    await pool.end();
+    if (targetCreated) await new pg.Client({ ...endpoint, user: PG_TEST_USER, password: process.env.PG_TEST_PASSWORD ?? "synthetic-local-only", database: PG_TEST_DATABASE }).connect().then(async client => {
+      try { await client.query(`DROP SCHEMA ${quote(targetSchema)} CASCADE`); } finally { await client.end(); }
+    }).catch(() => {});
+    if (controlCreated) await new pg.Client({ ...endpoint, user: PG_TEST_USER, password: process.env.PG_TEST_PASSWORD ?? "synthetic-local-only", database: PG_TEST_DATABASE }).connect().then(async client => {
+      try { await client.query(`DROP SCHEMA ${quote(controlSchema)} CASCADE`); } finally { await client.end(); }
+    }).catch(() => {});
+    await rm(firstFixture.directory, { recursive: true, force: true });
+    await rm(secondFixture.directory, { recursive: true, force: true });
   }
 });

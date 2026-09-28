@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { lstat, open, realpath } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { lstat, mkdtemp, open, realpath, rm } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
+import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { readPostgresMigrations } from "../cloud-run/postgres-migrations.mjs";
 
@@ -14,10 +15,12 @@ export const POSTGRES_IDENTITY_AUTHORITY_MAX_PAGE_SIZE = 250;
 export const POSTGRES_IDENTITY_AUTHORITY_RUN_TABLE = "_identity_authority_transfer_runs_v1";
 export const POSTGRES_IDENTITY_AUTHORITY_CHECKPOINT_TABLE = "_identity_authority_transfer_checkpoints_v1";
 const PRIMARY_MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
+const IDENTITY_LINK_SECRET_CONFIGURATION_TABLE = "identity_link_secret_configuration";
 
 const IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
 const TRANSFER_ID = /^[A-Za-z0-9._-]{1,128}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
+const IDENTITY_LINK_SECRET_VERSION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
 const MAX_SEALED_SQLITE_BYTES = 100 * 1024 * 1024 * 1024;
 const HASH_BUFFER_BYTES = 1024 * 1024;
 const KNOWN_PRIMARY_MIGRATION_COUNT = 46;
@@ -235,7 +238,7 @@ function quoteIdentifier(value) {
 
 function quoteRelation(schema, name) {
   if (!TABLE_BY_NAME.has(name) && name !== CONTROL_RUN_TABLE && name !== CONTROL_CHECKPOINT_TABLE
-      && name !== PRIMARY_MIGRATION_HISTORY_TABLE) {
+      && name !== PRIMARY_MIGRATION_HISTORY_TABLE && name !== IDENTITY_LINK_SECRET_CONFIGURATION_TABLE) {
     fail("IDENTITY_TRANSFER_TABLE_INVALID");
   }
   return `${quoteIdentifier(schema)}."${name}"`;
@@ -342,6 +345,21 @@ function digestObject(value) {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+function normalizeIdentityLinkPin(value) {
+  if (!exactObject(value, ["singleton", "key_version", "secret_fingerprint", "recorded_at"])
+      || normalizeInteger(value.singleton) !== 1
+      || typeof value.key_version !== "string" || !IDENTITY_LINK_SECRET_VERSION.test(value.key_version)
+      || typeof value.secret_fingerprint !== "string" || !SHA256.test(value.secret_fingerprint)) {
+    fail("IDENTITY_TRANSFER_SOURCE_IDENTITY_PIN_INVALID");
+  }
+  return Object.freeze({
+    singleton: 1,
+    key_version: value.key_version,
+    secret_fingerprint: value.secret_fingerprint,
+    recorded_at: normalizeTimestamp(value.recorded_at),
+  });
+}
+
 function cursorValue(spec, row) {
   const value = row[spec.sourcePrimaryKey[0]];
   if (typeof value !== "string") fail("IDENTITY_TRANSFER_SOURCE_KEY_INVALID");
@@ -353,8 +371,12 @@ function mapTableManifest(entries) {
     Object.freeze({ rows, sha256 })])));
 }
 
-function manifestDigest(tables) {
-  return digestObject({ schema: POSTGRES_IDENTITY_AUTHORITY_TRANSFER_SCHEMA, tables });
+function manifestDigest(tables, identityLinkPin) {
+  return digestObject({
+    schema: POSTGRES_IDENTITY_AUTHORITY_TRANSFER_SCHEMA,
+    tables,
+    identityLinkSecretConfigurationSha256: digestObject(identityLinkPin),
+  });
 }
 
 function exactSnapshotDescriptor(source) {
@@ -364,7 +386,8 @@ function exactSnapshotDescriptor(source) {
       || snapshot.binding !== POSTGRES_IDENTITY_AUTHORITY_SOURCE_BINDING
       || snapshot.immutable !== true || !SHA256.test(snapshot.artifactSha256 ?? "")
       || snapshot.snapshotId !== `sha256:${snapshot.artifactSha256}`
-      || typeof source.listPage !== "function" || typeof source.verifySnapshot !== "function") {
+      || typeof source.listPage !== "function" || typeof source.readIdentityLinkSecretConfiguration !== "function"
+      || typeof source.verifySnapshot !== "function") {
     fail("IDENTITY_TRANSFER_SEALED_SOURCE_REQUIRED");
   }
   return Object.freeze({
@@ -400,45 +423,83 @@ function sameFileIdentity(left, right) {
     && left.mode === right.mode && left.uid === right.uid && left.nlink === right.nlink;
 }
 
-async function sealedSqliteFingerprint(path) {
-  if (typeof path !== "string" || !isAbsolute(path)) fail("IDENTITY_TRANSFER_SEALED_SQLITE_PATH_INVALID");
-  let handle;
+async function createPrivateSealedSqliteSnapshot(sourcePath, expectedSha256) {
+  if (typeof sourcePath !== "string" || !isAbsolute(sourcePath)) fail("IDENTITY_TRANSFER_SEALED_SQLITE_PATH_INVALID");
+  const temporaryRoot = process.platform === "darwin" ? "/private/tmp" : tmpdir();
+  const directory = await mkdtemp(join(temporaryRoot, "tibotattle-identity-authority-snapshot-"));
+  const path = join(directory, "source.sqlite");
+  let input;
+  let output;
+  let privateHandle;
   try {
-    const before = await lstat(path);
+    const before = await lstat(sourcePath);
     if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
         || before.uid !== process.getuid?.() || (before.mode & 0o077) !== 0
         || (before.mode & 0o222) !== 0 || before.size < 1 || before.size > MAX_SEALED_SQLITE_BYTES) {
       fail("IDENTITY_TRANSFER_SEALED_SQLITE_UNSAFE");
     }
-    const resolved = await realpath(path);
-    if (resolved !== path) fail("IDENTITY_TRANSFER_SEALED_SQLITE_UNSAFE");
-    await assertNoSqliteSidecars(path);
-    handle = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
-    const opened = await handle.stat();
-    if (!opened.isFile() || !sameFileIdentity(before, opened)) fail("IDENTITY_TRANSFER_SEALED_SQLITE_CHANGED");
+    if (await realpath(sourcePath) !== sourcePath) fail("IDENTITY_TRANSFER_SEALED_SQLITE_UNSAFE");
+    await assertNoSqliteSidecars(sourcePath);
+    input = await open(sourcePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const opened = await input.stat();
+    if (!opened.isFile() || !sameFileIdentity(before, opened)) {
+      fail("IDENTITY_TRANSFER_SEALED_SQLITE_CHANGED");
+    }
+    output = await open(path, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
     const hash = createHash("sha256");
     const buffer = Buffer.allocUnsafe(HASH_BUFFER_BYTES);
     let offset = 0;
     while (offset < opened.size) {
-      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.byteLength, opened.size - offset), offset);
+      const { bytesRead } = await input.read(buffer, 0, Math.min(buffer.byteLength, opened.size - offset), offset);
       if (bytesRead <= 0) fail("IDENTITY_TRANSFER_SEALED_SQLITE_CHANGED");
-      hash.update(buffer.subarray(0, bytesRead));
+      const chunk = buffer.subarray(0, bytesRead);
+      hash.update(chunk);
+      let written = 0;
+      while (written < bytesRead) {
+        const result = await output.write(chunk, written, bytesRead - written, offset + written);
+        if (result.bytesWritten <= 0) fail("IDENTITY_TRANSFER_SEALED_SQLITE_UNAVAILABLE");
+        written += result.bytesWritten;
+      }
       offset += bytesRead;
     }
-    const after = await handle.stat();
-    if (!sameFileIdentity(opened, after)) fail("IDENTITY_TRANSFER_SEALED_SQLITE_CHANGED");
+    const after = await input.stat();
+    const finalSourcePath = await lstat(sourcePath);
+    if (!sameFileIdentity(opened, after) || !sameFileIdentity(opened, finalSourcePath)) {
+      fail("IDENTITY_TRANSFER_SEALED_SQLITE_CHANGED");
+    }
+    if (hash.digest("hex") !== expectedSha256) fail("IDENTITY_TRANSFER_SEALED_SQLITE_SHA256_MISMATCH");
+    await assertNoSqliteSidecars(sourcePath);
+    await output.sync();
+    await output.chmod(0o400);
+    const writtenStat = await output.stat();
+    if (!writtenStat.isFile() || writtenStat.size !== opened.size || writtenStat.nlink !== 1
+        || writtenStat.uid !== process.getuid?.() || (writtenStat.mode & 0o077) !== 0
+        || (writtenStat.mode & 0o222) !== 0) fail("IDENTITY_TRANSFER_SEALED_SQLITE_UNAVAILABLE");
+    await output.close();
+    output = null;
+    privateHandle = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const privateStat = await privateHandle.stat();
+    if (!sameFileIdentity(writtenStat, privateStat) || await realpath(path) !== path) {
+      fail("IDENTITY_TRANSFER_SEALED_SQLITE_CHANGED");
+    }
     await assertNoSqliteSidecars(path);
-    return Object.freeze({ sha256: hash.digest("hex"), stat: opened });
+    return Object.freeze({ path, directory, sha256: expectedSha256, stat: privateStat, handle: privateHandle });
   } catch (error) {
+    await privateHandle?.close().catch(() => {});
+    await input?.close().catch(() => {});
+    await output?.close().catch(() => {});
+    await rm(directory, { recursive: true, force: true }).catch(() => {});
     if (error instanceof PostgresIdentityAuthorityTransferError) throw error;
     fail("IDENTITY_TRANSFER_SEALED_SQLITE_UNAVAILABLE");
   } finally {
-    await handle?.close().catch(() => {});
+    await input?.close().catch(() => {});
+    await output?.close().catch(() => {});
   }
 }
 
 function validateSqliteLayout(database) {
   const names = new Set(database.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(row => row.name));
+  validateIdentityLinkSecretConfigurationLayout(database, names);
   for (const spec of TABLES) {
     if (!names.has(spec.name)) fail("IDENTITY_TRANSFER_SOURCE_LAYOUT_INVALID");
     let columns;
@@ -500,6 +561,54 @@ function validateSqliteLayout(database) {
   if (requiredAccountlessTables.some(name => !names.has(name))) fail("IDENTITY_TRANSFER_SOURCE_LAYOUT_INVALID");
 }
 
+function validateIdentityLinkSecretConfigurationLayout(database, names) {
+  if (!names.has(IDENTITY_LINK_SECRET_CONFIGURATION_TABLE)) fail("IDENTITY_TRANSFER_SOURCE_LAYOUT_INVALID");
+  let columns;
+  let sql;
+  try {
+    columns = database.prepare(`PRAGMA table_xinfo("${IDENTITY_LINK_SECRET_CONFIGURATION_TABLE}")`).all();
+    sql = database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?")
+      .get(IDENTITY_LINK_SECRET_CONFIGURATION_TABLE)?.sql;
+  } catch {
+    fail("IDENTITY_TRANSFER_SOURCE_LAYOUT_INVALID");
+  }
+  const expected = [
+    { name: "singleton", type: "INTEGER", primaryKey: 1 },
+    { name: "key_version", type: "TEXT", primaryKey: 0 },
+    { name: "secret_fingerprint", type: "TEXT", primaryKey: 0 },
+    { name: "recorded_at", type: "TEXT", primaryKey: 0 },
+  ];
+  if (!Array.isArray(columns) || columns.length !== expected.length || typeof sql !== "string"
+      || !/\)\s*STRICT\s*;?\s*$/iu.test(sql)) fail("IDENTITY_TRANSFER_SOURCE_LAYOUT_INVALID");
+  for (let index = 0; index < expected.length; index += 1) {
+    const actual = columns[index];
+    const wanted = expected[index];
+    if (actual?.name !== wanted.name || String(actual.type).toUpperCase() !== wanted.type
+        || Number(actual.notnull) !== 1 || Number(actual.pk) !== wanted.primaryKey || Number(actual.hidden) !== 0) {
+      fail("IDENTITY_TRANSFER_SOURCE_LAYOUT_INVALID");
+    }
+  }
+  const extraObjects = database.prepare(
+    "SELECT type,name FROM sqlite_master WHERE tbl_name=? AND type IN ('index','trigger')",
+  ).all(IDENTITY_LINK_SECRET_CONFIGURATION_TABLE);
+  if (extraObjects.length !== 0) fail("IDENTITY_TRANSFER_SOURCE_LAYOUT_INVALID");
+}
+
+function readIdentityLinkSecretConfiguration(database) {
+  let rows;
+  try {
+    rows = database.prepare(
+      `SELECT singleton,key_version,secret_fingerprint,recorded_at
+         FROM "${IDENTITY_LINK_SECRET_CONFIGURATION_TABLE}" ORDER BY singleton`,
+    ).all();
+  } catch {
+    fail("IDENTITY_TRANSFER_SOURCE_LAYOUT_INVALID");
+  }
+  if (!Array.isArray(rows) || rows.length === 0) fail("IDENTITY_TRANSFER_SOURCE_IDENTITY_PIN_MISSING");
+  if (rows.length !== 1) fail("IDENTITY_TRANSFER_SOURCE_LAYOUT_INVALID");
+  return normalizeIdentityLinkPin(rows[0]);
+}
+
 function assertAccountlessAuthorityOutOfScope(database) {
   try {
     const participants = database.prepare("SELECT count(*) AS count FROM participants WHERE owner_kind='accountless'").get()?.count;
@@ -533,11 +642,11 @@ export async function createSealedSqliteIdentityAuthoritySource({
 } = {}) {
   if (binding !== POSTGRES_IDENTITY_AUTHORITY_SOURCE_BINDING) fail("IDENTITY_TRANSFER_SOURCE_BINDING_INVALID");
   if (!SHA256.test(expectedSha256 ?? "")) fail("IDENTITY_TRANSFER_SEALED_SQLITE_SHA256_REQUIRED");
-  const initial = await sealedSqliteFingerprint(path);
-  if (initial.sha256 !== expectedSha256) fail("IDENTITY_TRANSFER_SEALED_SQLITE_SHA256_MISMATCH");
+  const privateSnapshot = await createPrivateSealedSqliteSnapshot(path, expectedSha256);
   let database;
+  let identityLinkSecretConfiguration;
   try {
-    database = new DatabaseSync(path, { readOnly: true, allowExtension: false });
+    database = new DatabaseSync(privateSnapshot.path, { readOnly: true, allowExtension: false });
     database.exec("PRAGMA query_only=ON");
     if (database.prepare("PRAGMA journal_mode").get()?.journal_mode === "wal") {
       fail("IDENTITY_TRANSFER_SEALED_SQLITE_SIDECAR_PRESENT");
@@ -547,8 +656,11 @@ export async function createSealedSqliteIdentityAuthoritySource({
     }
     validateSqliteLayout(database);
     assertAccountlessAuthorityOutOfScope(database);
+    identityLinkSecretConfiguration = readIdentityLinkSecretConfiguration(database);
   } catch (error) {
     database?.close();
+    await privateSnapshot.handle.close().catch(() => {});
+    await rm(privateSnapshot.directory, { recursive: true, force: true }).catch(() => {});
     if (error instanceof PostgresIdentityAuthorityTransferError) throw error;
     fail("IDENTITY_TRANSFER_SEALED_SQLITE_INVALID");
   }
@@ -591,10 +703,26 @@ export async function createSealedSqliteIdentityAuthoritySource({
   let closed = false;
   const source = Object.freeze({
     snapshot,
+    async readIdentityLinkSecretConfiguration() {
+      if (closed) fail("IDENTITY_TRANSFER_SEALED_SQLITE_CLOSED");
+      return identityLinkSecretConfiguration;
+    },
     async verifySnapshot() {
       if (closed) fail("IDENTITY_TRANSFER_SEALED_SQLITE_CLOSED");
-      const actual = await sealedSqliteFingerprint(path);
-      if (actual.sha256 !== expectedSha256 || !sameFileIdentity(initial.stat, actual.stat)) {
+      const descriptorStat = await privateSnapshot.handle.stat();
+      let pathStat;
+      try {
+        pathStat = await lstat(privateSnapshot.path);
+        if (await realpath(privateSnapshot.path) !== privateSnapshot.path) {
+          fail("IDENTITY_TRANSFER_SNAPSHOT_CHANGED");
+        }
+        await assertNoSqliteSidecars(privateSnapshot.path);
+      } catch (error) {
+        if (error instanceof PostgresIdentityAuthorityTransferError) throw error;
+        fail("IDENTITY_TRANSFER_SNAPSHOT_CHANGED");
+      }
+      if (!sameFileIdentity(privateSnapshot.stat, descriptorStat)
+          || !sameFileIdentity(privateSnapshot.stat, pathStat)) {
         fail("IDENTITY_TRANSFER_SNAPSHOT_CHANGED");
       }
       return { snapshotId: snapshot.snapshotId, artifactSha256: expectedSha256 };
@@ -618,6 +746,8 @@ export async function createSealedSqliteIdentityAuthoritySource({
       closed = true;
       statements.clear();
       database.close();
+      return privateSnapshot.handle.close()
+        .then(() => rm(privateSnapshot.directory, { recursive: true, force: true }));
     },
   });
   TRUSTED_SOURCES.add(source);
@@ -655,6 +785,9 @@ async function scanSource(source, pageSize) {
         if (spec.name === "participants" && row.owner_kind !== "social") {
           fail("IDENTITY_TRANSFER_ACCOUNTLESS_AUTHORITY_OUT_OF_SCOPE");
         }
+        if (spec.name === "participants" && row.state === "deleting") {
+          fail("IDENTITY_TRANSFER_ERASURE_LEDGER_REQUIRED");
+        }
         if (spec.name === "device_credentials"
             && (row.authority_kind !== "social" || row.accountless_enrollment_device_id !== null)) {
           fail("IDENTITY_TRANSFER_ACCOUNTLESS_AUTHORITY_OUT_OF_SCOPE");
@@ -673,7 +806,14 @@ async function scanSource(source, pageSize) {
     tables.push({ spec, rows, sha256: hash.digest("hex") });
   }
   const tableMap = mapTableManifest(tables);
-  return Object.freeze({ tables: tableMap, sha256: manifestDigest(tableMap) });
+  const identityLinkSecretConfiguration = normalizeIdentityLinkPin(
+    await source.readIdentityLinkSecretConfiguration(),
+  );
+  return Object.freeze({
+    tables: tableMap,
+    identityLinkSecretConfiguration,
+    sha256: manifestDigest(tableMap, identityLinkSecretConfiguration),
+  });
 }
 
 async function assertPostgres17(pool) {
@@ -720,7 +860,7 @@ async function assertTargetLayout(pool, schema) {
          FROM information_schema.columns
         WHERE table_schema=$1 AND table_name=ANY($2::text[])
         ORDER BY table_name,ordinal_position`,
-      [schema, TABLES.map(spec => spec.name)],
+      [schema, [...TABLES.map(spec => spec.name), IDENTITY_LINK_SECRET_CONFIGURATION_TABLE]],
     );
   } catch {
     fail("IDENTITY_TRANSFER_TARGET_LAYOUT_INVALID");
@@ -743,6 +883,24 @@ async function assertTargetLayout(pool, schema) {
       }
     }
   }
+  const pinColumns = byTable.get(IDENTITY_LINK_SECRET_CONFIGURATION_TABLE) ?? [];
+  const pinExpected = [
+    ["singleton", "integer", "NO"], ["key_version", "text", "NO"],
+    ["secret_fingerprint", "text", "NO"], ["recorded_at", "timestamp with time zone", "NO"],
+  ];
+  if (pinColumns.length !== pinExpected.length || pinColumns.some((column, index) =>
+    column.column_name !== pinExpected[index][0] || column.data_type !== pinExpected[index][1]
+      || column.is_nullable !== pinExpected[index][2])) fail("IDENTITY_TRANSFER_TARGET_LAYOUT_INVALID");
+  const primaryKey = await pool.query(
+    `SELECT string_agg(kcu.column_name,',' ORDER BY kcu.ordinal_position) AS columns
+       FROM information_schema.table_constraints tc
+       JOIN information_schema.key_column_usage kcu
+         ON kcu.constraint_schema=tc.constraint_schema AND kcu.constraint_name=tc.constraint_name
+        AND kcu.table_name=tc.table_name
+      WHERE tc.constraint_schema=$1 AND tc.table_name=$2 AND tc.constraint_type='PRIMARY KEY'`,
+    [schema, IDENTITY_LINK_SECRET_CONFIGURATION_TABLE],
+  );
+  if (primaryKey.rows?.[0]?.columns !== "singleton") fail("IDENTITY_TRANSFER_TARGET_LAYOUT_INVALID");
 }
 
 async function ensureControlTables(pool, controlSchema) {
@@ -759,6 +917,12 @@ async function ensureControlTables(pool, controlSchema) {
     updated_at timestamptz NOT NULL,
     completed_at timestamptz
   )`);
+  try {
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS "_identity_authority_transfer_runs_target_schema_uidx"
+      ON ${quoteRelation(controlSchema, CONTROL_RUN_TABLE)} (target_schema)`);
+  } catch {
+    fail("IDENTITY_TRANSFER_CONTROL_LAYOUT_INVALID");
+  }
   await pool.query(`CREATE TABLE IF NOT EXISTS ${quoteRelation(controlSchema, CONTROL_CHECKPOINT_TABLE)} (
     transfer_id text NOT NULL REFERENCES ${quoteRelation(controlSchema, CONTROL_RUN_TABLE)}(transfer_id) ON DELETE CASCADE,
     table_name text NOT NULL,
@@ -800,6 +964,15 @@ async function ensureControlTables(pool, controlSchema) {
   if (actualKeys[CONTROL_RUN_TABLE] !== "transfer_id"
       || actualKeys[CONTROL_CHECKPOINT_TABLE] !== "transfer_id,table_name"
       || Object.keys(actualKeys).length !== 2) fail("IDENTITY_TRANSFER_CONTROL_LAYOUT_INVALID");
+  const targetIndex = await pool.query(
+    `SELECT indexdef FROM pg_indexes WHERE schemaname=$1 AND tablename=$2
+      AND indexname='_identity_authority_transfer_runs_target_schema_uidx'`,
+    [controlSchema, CONTROL_RUN_TABLE],
+  );
+  if (targetIndex.rows?.length !== 1
+      || !/^CREATE UNIQUE INDEX .*\(target_schema\)$/u.test(targetIndex.rows[0]?.indexdef ?? "")) {
+    fail("IDENTITY_TRANSFER_CONTROL_LAYOUT_INVALID");
+  }
   const foreignKeys = await pool.query(
     `SELECT kcu.column_name,ccu.table_name AS referenced_table,ccu.column_name AS referenced_column,rc.delete_rule
        FROM information_schema.referential_constraints rc
@@ -818,10 +991,13 @@ async function ensureControlTables(pool, controlSchema) {
       || foreignKeys.rows[0]?.delete_rule !== "CASCADE") fail("IDENTITY_TRANSFER_CONTROL_LAYOUT_INVALID");
 }
 
-async function acquireTransferLock(pool, transferId) {
+async function acquireTransferLock(pool, targetSchema) {
   const client = await pool.connect();
   try {
-    await client.query("SELECT pg_advisory_lock(hashtext($1))", [`identity-authority-transfer:${transferId}`]);
+    await client.query(
+      "SELECT pg_advisory_lock(hashtextextended('identity-authority-transfer:' || current_database() || ':' || $1, 0))",
+      [targetSchema],
+    );
     return client;
   } catch {
     client.release();
@@ -829,9 +1005,12 @@ async function acquireTransferLock(pool, transferId) {
   }
 }
 
-async function releaseTransferLock(client, transferId) {
+async function releaseTransferLock(client, targetSchema) {
   try {
-    await client.query("SELECT pg_advisory_unlock(hashtext($1))", [`identity-authority-transfer:${transferId}`]);
+    await client.query(
+      "SELECT pg_advisory_unlock(hashtextextended('identity-authority-transfer:' || current_database() || ':' || $1, 0))",
+      [targetSchema],
+    );
   } finally {
     client.release();
   }
@@ -842,12 +1021,16 @@ async function getOrCreateRun({ pool, controlSchema, transferId, targetSchema, s
   await pool.query(
     `INSERT INTO ${relation} (transfer_id,schema_version,source_binding,source_snapshot_id,
        source_artifact_sha256,source_manifest_sha256,target_schema,status,updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,'copying',clock_timestamp()) ON CONFLICT (transfer_id) DO NOTHING`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'copying',clock_timestamp()) ON CONFLICT DO NOTHING`,
     [transferId, POSTGRES_IDENTITY_AUTHORITY_TRANSFER_SCHEMA, snapshot.binding, snapshot.snapshotId,
       snapshot.artifactSha256, sourceManifest.sha256, targetSchema],
   );
   const selected = await pool.query(`SELECT * FROM ${relation} WHERE transfer_id=$1`, [transferId]);
   const run = selected.rows?.[0];
+  if (!run) {
+    const targetOwner = await pool.query(`SELECT transfer_id FROM ${relation} WHERE target_schema=$1`, [targetSchema]);
+    if (targetOwner.rows?.length > 0) fail("IDENTITY_TRANSFER_TARGET_ALREADY_CLAIMED");
+  }
   if (!run || run.schema_version !== POSTGRES_IDENTITY_AUTHORITY_TRANSFER_SCHEMA
       || run.source_binding !== snapshot.binding || run.source_snapshot_id !== snapshot.snapshotId
       || run.source_artifact_sha256 !== snapshot.artifactSha256
@@ -861,6 +1044,57 @@ async function assertTargetEmptyBeforeRun(pool, targetSchema) {
   for (const spec of TABLES) {
     const row = await pool.query(`SELECT EXISTS (SELECT 1 FROM ${quoteRelation(targetSchema, spec.name)} LIMIT 1) AS has_rows`);
     if (row.rows?.[0]?.has_rows !== false) fail("IDENTITY_TRANSFER_TARGET_NOT_EMPTY");
+  }
+}
+
+async function assertTargetHasNoOtherRun(pool, controlSchema, targetSchema, transferId) {
+  const result = await pool.query(
+    `SELECT transfer_id FROM ${quoteRelation(controlSchema, CONTROL_RUN_TABLE)} WHERE target_schema=$1`,
+    [targetSchema],
+  );
+  if (result.rows?.length > 1) fail("IDENTITY_TRANSFER_CONTROL_LAYOUT_INVALID");
+  if (result.rows?.length === 1 && result.rows[0].transfer_id !== transferId) {
+    fail("IDENTITY_TRANSFER_TARGET_ALREADY_CLAIMED");
+  }
+  return result.rows?.[0] ?? null;
+}
+
+function identityPinMatches(left, right) {
+  return left.singleton === right.singleton && left.key_version === right.key_version
+    && left.secret_fingerprint === right.secret_fingerprint
+    && normalizeTimestamp(left.recorded_at) === normalizeTimestamp(right.recorded_at);
+}
+
+async function readTargetIdentityLinkPin(pool, targetSchema) {
+  const relation = quoteRelation(targetSchema, IDENTITY_LINK_SECRET_CONFIGURATION_TABLE);
+  const result = await pool.query(
+    `SELECT singleton,key_version,secret_fingerprint,recorded_at FROM ${relation} ORDER BY singleton`,
+  );
+  if (result.rows?.length > 1) fail("IDENTITY_TRANSFER_TARGET_IDENTITY_PIN_MISMATCH");
+  if (result.rows?.length === 0) return null;
+  try {
+    return normalizeIdentityLinkPin(result.rows[0]);
+  } catch {
+    fail("IDENTITY_TRANSFER_TARGET_IDENTITY_PIN_MISMATCH");
+  }
+}
+
+async function ensureTargetIdentityLinkPin(pool, targetSchema, sourcePin) {
+  const relation = quoteRelation(targetSchema, IDENTITY_LINK_SECRET_CONFIGURATION_TABLE);
+  let actual = await readTargetIdentityLinkPin(pool, targetSchema);
+  if (actual && !identityPinMatches(sourcePin, actual)) {
+    fail("IDENTITY_TRANSFER_TARGET_IDENTITY_PIN_MISMATCH");
+  }
+  if (!actual) {
+    await pool.query(
+      `INSERT INTO ${relation} (singleton,key_version,secret_fingerprint,recorded_at)
+       VALUES (1,$1,$2,$3) ON CONFLICT (singleton) DO NOTHING`,
+      [sourcePin.key_version, sourcePin.secret_fingerprint, sourcePin.recorded_at],
+    );
+    actual = await readTargetIdentityLinkPin(pool, targetSchema);
+  }
+  if (!actual || !identityPinMatches(sourcePin, actual)) {
+    fail("IDENTITY_TRANSFER_TARGET_IDENTITY_PIN_MISMATCH");
   }
 }
 
@@ -994,7 +1228,10 @@ export async function runPostgresIdentityAuthorityTransfer({
       || targetSchema.slice(POSTGRES_IDENTITY_AUTHORITY_TARGET_SCHEMA_PREFIX.length).length < 8
       || !controlSchema.startsWith(POSTGRES_IDENTITY_AUTHORITY_CONTROL_SCHEMA_PREFIX)
       || controlSchema.slice(POSTGRES_IDENTITY_AUTHORITY_CONTROL_SCHEMA_PREFIX.length).length < 8
-      || targetSchema === controlSchema) fail("IDENTITY_TRANSFER_DISPOSABLE_SCHEMA_REQUIRED");
+      || targetSchema === controlSchema
+      || controlSchema !== `${POSTGRES_IDENTITY_AUTHORITY_CONTROL_SCHEMA_PREFIX}${targetSchema.slice(POSTGRES_IDENTITY_AUTHORITY_TARGET_SCHEMA_PREFIX.length)}`) {
+    fail("IDENTITY_TRANSFER_DISPOSABLE_SCHEMA_REQUIRED");
+  }
   if (typeof transferId !== "string" || !TRANSFER_ID.test(transferId)) fail("IDENTITY_TRANSFER_ID_INVALID");
   const size = validatePageSize(pageSize);
   const snapshot = exactSnapshotDescriptor(source);
@@ -1004,13 +1241,14 @@ export async function runPostgresIdentityAuthorityTransfer({
   await assertTargetLayout(destinationPool, targetSchema);
   const sourceManifest = await scanSource(source, size);
   await assertSnapshot(source, snapshot);
-  await ensureControlTables(destinationPool, controlSchema);
-  const lockClient = await acquireTransferLock(destinationPool, transferId);
+  const lockClient = await acquireTransferLock(destinationPool, targetSchema);
   try {
-    const priorRun = await destinationPool.query(
-      `SELECT transfer_id FROM ${quoteRelation(controlSchema, CONTROL_RUN_TABLE)} WHERE transfer_id=$1`, [transferId],
+    await ensureControlTables(destinationPool, controlSchema);
+    const priorRun = await assertTargetHasNoOtherRun(destinationPool, controlSchema, targetSchema, transferId);
+    if (!priorRun) await assertTargetEmptyBeforeRun(destinationPool, targetSchema);
+    await ensureTargetIdentityLinkPin(
+      destinationPool, targetSchema, sourceManifest.identityLinkSecretConfiguration,
     );
-    if ((priorRun.rows?.length ?? 0) === 0) await assertTargetEmptyBeforeRun(destinationPool, targetSchema);
     const run = await getOrCreateRun({
       pool: destinationPool, controlSchema, transferId, targetSchema, snapshot, sourceManifest,
     });
@@ -1027,7 +1265,11 @@ export async function runPostgresIdentityAuthorityTransfer({
     const targetTables = Object.create(null);
     for (const spec of TABLES) targetTables[spec.name] = await scanPostgresTable(destinationPool, targetSchema, spec, size);
     const targetManifest = Object.freeze(targetTables);
-    const targetManifestSha256 = manifestDigest(targetManifest);
+    const targetIdentityLinkSecretConfiguration = await readTargetIdentityLinkPin(destinationPool, targetSchema);
+    if (!targetIdentityLinkSecretConfiguration || !identityPinMatches(
+      sourceManifest.identityLinkSecretConfiguration, targetIdentityLinkSecretConfiguration,
+    )) fail("IDENTITY_TRANSFER_TARGET_IDENTITY_PIN_MISMATCH");
+    const targetManifestSha256 = manifestDigest(targetManifest, targetIdentityLinkSecretConfiguration);
     for (const spec of TABLES) {
       const expected = sourceManifest.tables[spec.name];
       const actual = targetManifest[spec.name];
@@ -1075,12 +1317,14 @@ export async function runPostgresIdentityAuthorityTransfer({
         analyticsOwnerLinksTransferred: false,
         ownerJournalAndRevisionsTransferred: false,
         deletionLedgerTransferred: false,
+        identityLinkSecretConfigurationTransferred: true,
+        destinationRuntimeSecretMatchVerified: false,
         productionCutoverAuthorized: false,
         erasureAuthorized: false,
       }),
     });
   } finally {
-    await releaseTransferLock(lockClient, transferId);
+    await releaseTransferLock(lockClient, targetSchema);
   }
 }
 
