@@ -317,7 +317,7 @@ test("the public site presents only the install call to action and the community
   assert.match(html, /id="community-daily-hero"/u);
   assert.match(
     html,
-    /id="community-method-summary"[^>]*>See community activity<\/summary>/u,
+    /id="community-method-summary"[^>]*>Explore the contribution history<\/summary>/u,
   );
   assert.doesNotMatch(html, /community-daily-status|community-daily-panel-state/u);
 
@@ -511,7 +511,7 @@ test("the first visit leads with the product, platform choice, and daily communi
     /brew install --cask adamallcock\/tap\/tibotattle/u,
   );
   assert.match(html, /Latest community evidence/u);
-  assert.match(html, /See community activity/u);
+  assert.match(html, /Explore the contribution history/u);
   assert.match(html, /Community activity over time/u);
   assert.match(
     html,
@@ -1126,7 +1126,7 @@ test("unavailable community activity uses the compact public state", async () =>
   );
   assert.match(
     html,
-    /<summary id="community-method-summary"[^>]*>See community activity<\/summary>/u,
+    /<summary id="community-method-summary"[^>]*>Explore the contribution history<\/summary>/u,
   );
   assert.match(html, /Community activity over time/u);
   assert.match(
@@ -2757,20 +2757,19 @@ test("every figure on the page carries a legible TiboTattle credit", async () =>
   );
 });
 
-test("the band opens on its chart, with its figures hosted in the hero", async () => {
+test("contribution history starts collapsed while headline figures stay in the hero", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
-  // The disclosure stays -- the published-site contract pins its summary --
-  // but it no longer hides the page's community evidence behind a click.
-  assert.match(html, /<details class="community-method" open>/u);
+  // Headline evidence stays in the hero; the volume history is supporting detail.
+  assert.match(html, /<details class="community-method">/u);
   assert.match(
     html,
-    /<summary id="community-method-summary"[^>]*>See community activity<\/summary>/u,
+    /<summary id="community-method-summary"[^>]*>Explore the contribution history<\/summary>/u,
   );
   assert.equal(
     insideClosedDetails(html, html.indexOf('id="community-daily-result"')),
-    false,
-    "the figures the daily renderer writes are not behind a closed disclosure",
+    true,
+    "daily details remain inside the contribution history disclosure",
   );
   // The figures now lead the hero instead, so the band opens on its chart and
   // must not keep a gap where they used to sit.
@@ -2778,8 +2777,7 @@ test("the band opens on its chart, with its figures hosted in the hero", async (
     styles,
     /\.community-site \.community-proof \.community-daily-chart:first-child \{\s*margin-top: 0;/u,
   );
-  // Open by default, the summary is the band's rule, so the heading below it
-  // does not draw a second one.
+  // When opened, the summary and heading share a single dividing rule.
   assert.match(
     styles,
     /\.community-site \.community-method\[open\] > summary \{[^}]*border-bottom: 1px solid var\(--line\);/u,
@@ -3056,4 +3054,15 @@ test("the measured cache section styles its period control and its caveat", asyn
     note[1].match(/color:([^;]+);/u)?.[1],
     ties[1].match(/color:([^;]+);/u)?.[1],
   );
+});
+
+
+test("community findings precede app examples and closing steps lead to the download", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  const positions = ["community-allowance-figure", "community-findings-title", "cache-continuity", "community-method-summary", "feature-tour-title"]
+    .map(id => html.indexOf(`id="${id}"`));
+  assert.ok(positions.every((position, index) => position >= 0 && (index === 0 || position > positions[index - 1])));
+  assert.match(html, /class="model-performance" data-speeds-demo/u);
+  assert.ok(html.indexOf('id="how-it-works"') < html.indexOf('<section class="tour-cta">'));
+  assert.match(html, /src="\.\/feature-value\.png" width="988" height="1007"/u);
 });
