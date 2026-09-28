@@ -812,13 +812,14 @@ test("controller fails closed when notification rollback cannot be proven", asyn
   assert.equal(snapshot.settings.notifications.state, "state_unavailable");
 });
 
-test("controller permits reveal only for the live dashboard context", async () => {
+test("controller permits reveal and open only for the live dashboard context", async () => {
   const value = fixture({
     lifecycleOverrides: {
       isAuthorizedDesktopDownloadContext(sender, frame) {
         return sender === "dashboard" && frame === "dashboard-frame";
       },
       revealLatestDownload: async () => "revealed",
+      openLatestDownload: async () => "opened",
     },
   });
   await value.controller.initialize();
@@ -835,6 +836,20 @@ test("controller permits reveal only for the live dashboard context", async () =
       senderFrame: "dashboard-frame",
     }),
     "revealed",
+  );
+  await assert.rejects(
+    value.controller.handlers.openLatestDownload({}, {
+      sender: "settings",
+      senderFrame: "settings-frame",
+    }),
+    (error) => error?.code === "desktop_download_unavailable",
+  );
+  assert.equal(
+    await value.controller.handlers.openLatestDownload({}, {
+      sender: "dashboard",
+      senderFrame: "dashboard-frame",
+    }),
+    "opened",
   );
 });
 

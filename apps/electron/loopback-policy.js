@@ -245,15 +245,25 @@ export function installLoopbackNavigationPolicy({
     sessionInstallation = sessionPolicyInstallations.get(session);
     if (sessionInstallation === undefined) {
       const requestFilter = { urls: ["<all_urls>"] };
-      const onPermissionRequest = (contents, permission, callback) => {
-        const allowed = permission === "notifications"
-          && notificationPermissionWebContentsIds.has(contents?.id);
+      const onPermissionRequest = (contents, permission, callback, details) => {
+        const clipboardWrite = permission === "clipboard-sanitized-write"
+          && blobDownloadWebContentsIds.has(contents?.id)
+          && details?.isMainFrame === true
+          && policy.isAllowedURL(details.requestingUrl);
+        const allowed = clipboardWrite || (permission === "notifications"
+          && notificationPermissionWebContentsIds.has(contents?.id));
         if (allowed) callback?.(true);
         else policy.handlePermissionRequest({ callback });
       };
-      const onPermissionCheck = (contents, permission) => (
-        permission === "notifications"
-          && notificationPermissionWebContentsIds.has(contents?.id)
+      const onPermissionCheck = (contents, permission, requestingOrigin, details) => (
+        (permission === "notifications"
+          && notificationPermissionWebContentsIds.has(contents?.id))
+        || (permission === "clipboard-sanitized-write"
+          && blobDownloadWebContentsIds.has(contents?.id)
+          && requestingOrigin === policy.origin
+          && details?.isMainFrame === true
+          && (details.requestingUrl === undefined
+            || policy.isAllowedURL(details.requestingUrl)))
       );
       const blobDownloadWebContentsIds = new Set();
       const notificationPermissionWebContentsIds = new Set();

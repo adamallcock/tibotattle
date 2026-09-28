@@ -327,9 +327,11 @@ and bounded blob downloads. Provider sign-in opens in the system browser.
 | Direction | Name | Payload boundary |
 | --- | --- | --- |
 | Web to native | `tibotattleLocalization` | Closed language-preference enum. |
-| Web to native | `tibotattleDownloads` | Fixed `reveal-latest-download` action; no path crosses the bridge. |
+| Web to native | `tibotattleDownloads` | Fixed `reveal-latest-download` and exact completed-share `open-completed-download` actions; no path crosses the bridge. |
 | Web to native | `tibotattleHostedSignIn` | One boolean indicating whether a handoff is in flight. |
 | Native to web | `tibotattle:hosted-sign-in-return` | Payload-free wake-up event. |
+| Native to web | `tibotattle:share-download-result` | Share-save completion status and final basename, never a path. |
+| Native to web | `tibotattle:share-open-result` | Default-app open result for the exact completed share basename. |
 | Native to web | `tibotattle:local-evidence-updated` | Payload-free refresh-complete event. |
 | Native to web | `tibotattle:locale-override` | Closed language preference plus locale table metadata. |
 | Native to web | `tibotattle:appearance-override` | Closed appearance preference and resolved theme. |
@@ -343,6 +345,15 @@ one fixed IPC channel. Its refresh subset is dashboard-frame-only:
 | Renderer to main | `refreshStarted` | Exact `{ mode }`, where mode is `quick` or `detailed`; returns one positive integer lease. |
 | Renderer to main | `refreshHeartbeat` | Exact `{ lease }` with one positive safe integer; renews only the matching missing-heartbeat watchdog. |
 | Renderer to main | `refreshSettled` | Exact `{ lease }` with one positive safe integer; matching terminal settlement is idempotent. |
+
+## Electron share bridge
+
+The sandboxed Electron dashboard can request `openLatestDownload` without a
+path or filename. The main process authorizes only its live dashboard frame,
+rechecks the completed PNG in Downloads, and opens it with the OS default app.
+The desktop completion command contains only the validated final basename;
+the failure command contains no filesystem detail. The dashboard's main frame
+alone may request `clipboard-sanitized-write`; clipboard reads remain denied.
 
 ## Process and provider protocols
 

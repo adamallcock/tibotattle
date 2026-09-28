@@ -483,7 +483,7 @@ class LifecycleDownloadItem extends EventEmitter {
     super();
     this.url = "blob:http://127.0.0.1:4001/4a4e02e8-2cbf-4dfb-bb2a-4f6e4c0efb90";
     this.mime = "image/png";
-    this.filename = "tibotattle-results-TT-012345.png";
+    this.filename = "2026-09-28-19-15-tibotattle-results.png";
     this.savePath = null;
     this.cancelled = false;
   }
@@ -986,9 +986,39 @@ test("loopback session admits only the dashboard same-origin Blob download", () 
   session.handler(settings, "notifications", (allowed) => permissions.push(allowed));
   session.handler(dashboard, "notifications", (allowed) => permissions.push(allowed));
   session.handler(settings, "geolocation", (allowed) => permissions.push(allowed));
-  assert.deepEqual(permissions, [true, false, false]);
+  session.handler(dashboard, "clipboard-sanitized-write", (allowed) => permissions.push(allowed), {
+    isMainFrame: true, requestingUrl: `${origin}/`,
+  });
+  session.handler(settings, "clipboard-sanitized-write", (allowed) => permissions.push(allowed), {
+    isMainFrame: true, requestingUrl: `${origin}/`,
+  });
+  session.handler(dashboard, "clipboard-sanitized-write", (allowed) => permissions.push(allowed), {
+    isMainFrame: false, requestingUrl: `${origin}/`,
+  });
+  session.handler(dashboard, "clipboard-read", (allowed) => permissions.push(allowed), {
+    isMainFrame: true, requestingUrl: `${origin}/`,
+  });
+  session.handler(dashboard, "clipboard-sanitized-write", (allowed) => permissions.push(allowed), {
+    isMainFrame: true, requestingUrl: "https://example.test/",
+  });
+  assert.deepEqual(permissions, [true, false, false, true, false, false, false, false]);
   assert.equal(session.checkHandler(settings, "notifications"), true);
   assert.equal(session.checkHandler(dashboard, "notifications"), false);
+  assert.equal(session.checkHandler(dashboard, "clipboard-sanitized-write", origin, {
+    isMainFrame: true, requestingUrl: `${origin}/`,
+  }), true);
+  assert.equal(session.checkHandler(settings, "clipboard-sanitized-write", origin, {
+    isMainFrame: true, requestingUrl: `${origin}/`,
+  }), false);
+  assert.equal(session.checkHandler(dashboard, "clipboard-sanitized-write", "https://example.test", {
+    isMainFrame: true, requestingUrl: `${origin}/`,
+  }), false);
+  assert.equal(session.checkHandler(dashboard, "clipboard-sanitized-write", origin, {
+    isMainFrame: false, requestingUrl: `${origin}/`,
+  }), false);
+  assert.equal(session.checkHandler(dashboard, "clipboard-read", origin, {
+    isMainFrame: true, requestingUrl: `${origin}/`,
+  }), false);
   const download = {
     url: blob,
     method: "GET",
@@ -2884,13 +2914,14 @@ test("desktop lifecycle installs one dashboard-owned download handler and remove
   const failed = [];
   let prepared = 0;
   let revealed = 0;
+  let opened = 0;
   let cleared = 0;
   const ownedDownloadsRegistry = {
     prepareDownload(value) {
       assert.deepEqual(value, {
         kind: "share_card",
         mime: "image/png",
-        filename: "tibotattle-results-TT-012345.png",
+        filename: "2026-09-28-19-15-tibotattle-results.png",
       });
       prepared += 1;
       return {
@@ -2901,6 +2932,7 @@ test("desktop lifecycle installs one dashboard-owned download handler and remove
     async completeDownload(id) { completed.push(id); return true; },
     async failDownload(id) { failed.push(id); return true; },
     async revealLatest() { revealed += 1; return "revealed"; },
+    async openLatest() { opened += 1; return "opened"; },
     clear() { cleared += 1; },
   };
   const supervisor = {
@@ -2952,7 +2984,7 @@ test("desktop lifecycle installs one dashboard-owned download handler and remove
   ]);
   assert.deepEqual(dashboard.webContents.sent, [{
     channel: "tibotattle:desktop-command:v1",
-    command: { command: "shareCardDownloadCompleted" },
+    command: { command: "shareCardDownloadCompleted", filename: "2026-09-28-19-15-tibotattle-results.png" },
   }]);
   assert.equal(lifecycle.isAuthorizedDesktopDownloadContext(
     dashboard.webContents,
@@ -2960,6 +2992,8 @@ test("desktop lifecycle installs one dashboard-owned download handler and remove
   ), true);
   assert.equal(await lifecycle.revealLatestDownload(), "revealed");
   assert.equal(revealed, 1);
+  assert.equal(await lifecycle.openLatestDownload(), "opened");
+  assert.equal(opened, 1);
 
   const oldSession = dashboardSession;
   const stalePending = new LifecycleDownloadItem();
@@ -2971,7 +3005,7 @@ test("desktop lifecycle installs one dashboard-owned download handler and remove
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(dashboard.webContents.sent, [{
     channel: "tibotattle:desktop-command:v1",
-    command: { command: "shareCardDownloadCompleted" },
+    command: { command: "shareCardDownloadCompleted", filename: "2026-09-28-19-15-tibotattle-results.png" },
   }]);
   const staleItem = new LifecycleDownloadItem();
   oldSession.emit("will-download", { preventDefault() {} }, staleItem, dashboard.webContents);
@@ -4667,6 +4701,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     "installUpdateAndRestart",
     "setAutomaticDownload",
     "revealLatestDownload",
+    "openLatestDownload",
     "openDashboardInBrowser",
     "showDiagnostics",
     "revealLocalData",
@@ -4699,7 +4734,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   commandListener({}, { command: "language", value: "es" });
   commandListener({}, { command: "sidebar", collapsed: true });
   commandListener({}, { command: "hostedSignInReturn" });
-  commandListener({}, { command: "shareCardDownloadCompleted" });
+  commandListener({}, { command: "shareCardDownloadCompleted", filename: "2026-09-28-19-15-tibotattle-results.png" });
   commandListener({}, { command: "shareCardDownloadFailed" });
   commandListener({}, {
     command: "shareCardDownloadCompleted",
@@ -4725,7 +4760,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     { command: "language", value: "es" },
     { command: "sidebar", collapsed: true },
     { command: "hostedSignInReturn" },
-    { command: "shareCardDownloadCompleted" },
+    { command: "shareCardDownloadCompleted", filename: "2026-09-28-19-15-tibotattle-results.png" },
     { command: "shareCardDownloadFailed" },
   ]);
   unsubscribe();
@@ -4765,6 +4800,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   await bridge.installUpdateAndRestart();
   await bridge.setAutomaticDownload(false);
   await bridge.revealLatestDownload();
+  await bridge.openLatestDownload();
   await bridge.openDashboardInBrowser();
   await bridge.showDiagnostics();
   await bridge.revealLocalData();
@@ -4845,6 +4881,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     { channel: "tibotattle:desktop:v1", request: { action: "installUpdateAndRestart", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "setAutomaticDownload", args: { enabled: false } } },
     { channel: "tibotattle:desktop:v1", request: { action: "revealLatestDownload", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "openLatestDownload", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "openDashboardInBrowser", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "showDiagnostics", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "revealLocalData", args: {} } },
@@ -4884,6 +4921,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
       "extra",
     ),
     () => bridge.revealLatestDownload("extra"),
+    () => bridge.openLatestDownload("extra"),
     () => bridge.checkForUpdates("extra"),
     () => bridge.downloadUpdate("extra"),
     () => bridge.installUpdateAndRestart("extra"),

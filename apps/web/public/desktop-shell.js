@@ -230,10 +230,13 @@ function installCommandBridge(documentRef, windowRef, applyLanguage, applySideba
       return;
     }
     if (command.command === "shareCardDownloadCompleted") {
-      dispatchFixedDesktopEvent(
-        windowRef,
-        "tibotattle:share-card-download-completed",
-      );
+      if (typeof windowRef?.CustomEvent === "function"
+          && typeof windowRef?.dispatchEvent === "function") {
+        windowRef.dispatchEvent(new windowRef.CustomEvent(
+          "tibotattle:share-card-download-completed",
+          { detail: { filename: command.filename } },
+        ));
+      }
       return;
     }
     if (command.command === "shareCardDownloadFailed") {

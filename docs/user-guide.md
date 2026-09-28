@@ -119,6 +119,12 @@ local accounting cache. The choice becomes available only when that retained
 history contains a plan-specific five-hour reset with enough observed quota
 movement to fit; missing evidence is never presented as zero.
 
+**Save image** exports the share card as a PNG named with the local save time,
+such as `2026-09-28-19-15-tibotattle-results.png`. Desktop builds confirm the
+completed save in Downloads and offer **Open image** in the default app. A
+second save within the same minute receives a numeric suffix. In a browser,
+the destination follows that browser's download settings.
+
 These historical estimates are conditional on the locally observed plan, not
 proof of which provider account generated every token. Known plan switches and
 ambiguous boundary quantities are excluded narrowly; coherent older history is

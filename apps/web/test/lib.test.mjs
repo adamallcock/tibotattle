@@ -9721,14 +9721,17 @@ test("a posted results card always carries a diagnostic-format reference", async
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const section = shareCardSource(appSource);
 
-  // No card is composed at all without a reference in that format, so an image
-  // can never be saved or copied untraceable.
+  // The local card transcript retains a validated reference, while the export
+  // filename is now a simple timestamp rather than a diagnostic identifier.
   assert.match(
     section,
     /if \(!DIAGNOSTIC_REFERENCE_PATTERN\.test\(reference \?\? ""\)\) \{\s*\n\s*throw new TypeError\("A results card requires a minted reference\."\);/u,
   );
   assert.match(section, /shareCardReference = createDiagnosticReference\(\);/u);
-  assert.doesNotMatch(section, /Math\.random|Date\.now|new Date\(/u);
+  assert.doesNotMatch(
+    section.slice(0, section.indexOf("function shareCardFileName(")),
+    /Math\.random|Date\.now|new Date\(/u,
+  );
 
   // One image and one reference always describe the same figures: the
   // reference is re-minted whenever any printed figure changes.
@@ -9763,10 +9766,8 @@ test("a posted results card always carries a diagnostic-format reference", async
     /if \(signature !== shareCardSignature \|\| shareCardReference === ""\) \{/u,
   );
 
-  // Re-pinned 2026-08-08 (owner-directed): the identifier line no longer
-  // paints on the image — the reference reaches a reader through the text
-  // transcript's trailer and the saved file's name — and the toasts stopped
-  // claiming otherwise.
+  // The identifier line does not paint on the image; the selectable text
+  // transcript retains its reference. Export filenames use local save time.
   assert.match(section, /const identifiers = \[\s*\n\s*t\("share\.identifier\.debug", \{ reference \}\),/u);
   assert.match(section, /t\("share\.identifier\.version", \{/u);
   assert.doesNotMatch(section, /price table \$\{registryVersion\}/u);
@@ -9774,17 +9775,12 @@ test("a posted results card always carries a diagnostic-format reference", async
   assert.match(section, /identifierLine: identifiers\.join\(" · "\),/u);
   assert.match(
     section,
-    /return `tibotattle-results-\$\{card\.reference\}\.png`;/u,
+    /-tibotattle-results\.png`;/u,
   );
-  assert.match(
-    section,
-    /The file name carries reference \$\{card\.reference\}\./u,
-  );
+  assert.doesNotMatch(section, /The file name carries reference/u);
   assert.doesNotMatch(section, /is printed on the image/u);
 
-  // Re-pinned 2026-08-08 (owner-directed, second round): the "TT-XXXXXX"
-  // header chip is gone from the panel — a code the reader could not act on.
-  // The reference still travels with every saved file's name.
+  // The "TT-XXXXXX" header chip remains absent from the panel.
   assert.doesNotMatch(section, /share-card-reference/u);
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   assert.doesNotMatch(html, /id="share-card-reference"/u);
