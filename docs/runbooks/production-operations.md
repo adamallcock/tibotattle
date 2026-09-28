@@ -529,6 +529,66 @@ is an estimate of remaining time. Parallelizing days alone does not remove the
 complete-account-cache prerequisite; source fencing and shared resource budgets
 must remain intact in any later concurrency change.
 
+### Opt-in durable batches and shared analytical features
+
+The local redesign adds three forward analytics migrations: `0030` stores
+resumable historical model batches, `0031` admits clipped ranges across the
+entire retained graph window, and `0032` stores shared day features. These are
+separate from migration `0027` and require an exact ledger inspection before
+application. Do not apply an unreviewed missing migration as a side effect of
+deploying these Workers. The [redesign checklist](../plans/2026-09-28-analytics-redesign.md)
+records qualification and the remaining online gate.
+
+| Control | Consumer | Default |
+|---|---|---|
+| `STORAGE_ANALYTICS_MODEL_BLOCKS=enabled` | Analytics Worker: historical model-date batches adopted into the existing publisher | Off |
+| `STORAGE_ANALYTICS_SHARED_FEATURES=enabled` | Analytics and publication Workers: shared daily, API-value, scalar and model inputs | Off |
+| `CACHE_RETENTION_SHARED_FEATURES=enabled` | Cache Worker: shared usage events and seven-day continuity inputs | Off |
+
+Admitted v1, v1.1 and v1.2 evidence uses the same effective reader. Shared
+features are keyed by source namespace, opaque owner, UTC day, exact dependency
+digest and producer methods, including pricing registries. Owner metadata
+provides deduplication and authority fences. An unchanged day can be reused
+after an unrelated upload; a changed day or method receives a new value.
+Daily activity/API value, ordered scalar usage, quota evidence, model usage and
+cache continuity share that preparation. Scalar timing and attribution hazards
+remain explicit. Public reducers, contributor counts, fingerprints and serving
+contracts remain authoritative.
+
+Features are private derived data. Completed features contain hashed session
+references and day-local ordering ordinals, with no source record JSON or raw
+session identifiers. A pending source page retains only its admitted opaque
+pagination cursor, under the existing checkpoint privacy contract; completion
+removes it. Atomic head promotion prevents incomplete values from being read.
+Current source and target authority are checked before use. Erasure completion
+proves physical absence of feature heads and parts as well as existing outputs.
+
+The initial feature representation admits at most 6,000 source rows and 4 MiB
+per day; a complete scalar/model window admits at most 8 MiB. Capacity and
+representation refusal use the existing bounded calculation. They do not
+publish missing evidence as zero or turn a cache limit into a statistical
+refusal. Model blocks retain at most four admitted jobs per owner and preserve
+the existing 950-statement analytics invocation cap. Shared daily preparation
+uses a larger bounded slice while respecting the graph reserve and both the
+inner and outer statement meters. Publication and cache Workers retain their
+independent existing invocation caps.
+
+Cleanup advances bounded cursor pages, preserves complete current-method
+features and active claims, removes obsolete method generations and abandoned
+pending work, and remains available at the operating capacity guard. Per-day
+cleanup bounds replaced dependency generations. Source data retention is
+unchanged.
+
+Roll out schema, code and activation as separate steps. Initially deploy all
+three Workers with these controls disabled, preserving the live configuration
+and previous serving payloads. Activate shared publication, cache, graph and
+finally model batches in measured stages; compare complete output identities,
+failure counts, queue drainage, statements and elapsed time at each stage.
+Disabling the corresponding control restores the existing calculation path.
+Rollback does not reverse migrations or delete published data. Stop rollout on
+output mismatch, recurring failure, stalled durable progress, or an erasure
+completion regression. Local throughput is not a production latency claim.
+
 ## Read-only observation
 
 Start without credentials or mutations:

@@ -4,10 +4,11 @@ import { createGraphDayProjectionSourceBuild } from './graph-day-projection';
 import { createD1InvocationBudget } from './d1-invocation-budget';
 import { publicAnalyticsEnabled } from './public-analytics-gate';
 import { storageGraphFailureFields } from './storage-analytics-failure';
+import { analyticsFeatureControls,type AnalyticsFeatureControlEnv } from './analytics-feature-controls';
 
 /** Separate scheduler entry point; it has no upload route or credential binding.
  * Resource binding/deployment belongs to the qualified Wrangler role plan. */
-export interface StorageAnalyticsWorkerEnv {
+export interface StorageAnalyticsWorkerEnv extends AnalyticsFeatureControlEnv {
  STORAGE_ANALYTICS_MODE?:'disabled'|'enabled';
  PUBLIC_ANALYTICS_MODE?:'disabled'|'enabled';
  STORAGE_SOURCE_ID?:string;
@@ -69,6 +70,7 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
   ||(options?.cron!==undefined&&typeof options.cron!=='string')
   ||(options?.nowMs!==undefined&&(!Number.isSafeInteger(options.nowMs)||options.nowMs<0)))throw new Error('STORAGE_ANALYTICS_CONFIGURATION_INVALID');
  const publishCommunity=publicAnalyticsEnabled(env);
+ const features=analyticsFeatureControls(env);
  // Once the publication worker is live this worker stops publishing, so the two
  // never share a 55-second window. Unset means this worker keeps the lane, so
  // deploying the split changes nothing until both switches are thrown.
@@ -116,6 +118,8 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
    ...(buildProjections&&env.GRAPH_DAY_PROJECTION_LONG_PASS==='enabled'
     ?{graphDayProjectionLongPass:true}:{})};
   const result=await runStorageAnalyticsPass({...bindings,...projectionOptions,publishCommunity,
+   ...(features.modelBlocks?{modelBlocks:true}:{}),
+   ...(features.sharedFeatures?{sharedFeatures:true}:{}),
    ...(skipPublication?{skipPublication:true}:{}),
    ...(publishCommunity?{publicOnly:true}:{}),maxQueries:meter.remainingQueries,
    ...(publishCommunity?{maxSteps:32}:{}),

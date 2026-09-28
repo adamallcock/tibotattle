@@ -10,6 +10,14 @@ import type {EffectiveTelemetryOccurrence} from './telemetry-usage-effective-rea
 
 export const EFFECTIVE_USAGE_DAY_MAX_BYTES=4*1024*1024;
 export interface EffectiveUsageDay {projection:GraphDayProjection}
+/** Storage-neutral preparation contract shared by the reader and its store. */
+export interface StorageEffectiveUsagePreparation {
+  load(days:readonly string[]):Promise<readonly EffectiveUsageDay[]|undefined>;
+  nextMissingDay(days:readonly string[]):Promise<string|undefined>;
+  store(day:EffectiveUsageDay):Promise<'stored'|'deferred'>;
+  /** An explicit resource refusal disables preparation durably for this job. */
+  refused():boolean;
+}
 /** Compact day-local state only. Session identifiers are owner-scoped hashes;
  * no source record JSON or raw session identifier enters this checkpoint. */
 export interface EffectiveUsageDayPending extends EffectiveUsageDay {lastObservedAtMs:number|null}

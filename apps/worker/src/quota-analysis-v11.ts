@@ -21,7 +21,7 @@ import type {
   QuotaSnapshotInput,
   QuotaUsageEventInput,
 } from "@app-usagemonitor/quota-analysis";
-import { parseTelemetryV11Attribution, TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
+import { parseTelemetryV11Attribution, TELEMETRY_PLAN_TYPES, TELEMETRY_V11_PLAN_BASES } from "@app-usagemonitor/telemetry-contract";
 import type { TelemetryV11Attribution } from "@app-usagemonitor/telemetry-contract";
 import {
   MAX_DOWNSAMPLED_QUOTA_ROWS,
@@ -116,6 +116,9 @@ export interface V11AnalysisOptions {
       rows: readonly UsageRow[]; complete: boolean;
     }>;
   };
+  /** Persisted, closed analytical features. The caller supplies an independent
+   * checkpoint identity so hashed session carry cannot mix with raw-row carry. */
+  preparedUsageReader?: V11PreparedUsageReader;
   /** Compute the scalar fit half of the usage reduction. Default true.
    *
    * `false` is the model-only mode the v1 historical path already takes
@@ -161,6 +164,58 @@ export interface UsageRow {
   provider: string;
   session_uuid: string | null;
   record_json: string;
+}
+
+export const V11_PREPARED_USAGE_FEATURE_METHOD = 'v11-ordered-priced-usage-feature-v1';
+type UsagePrice = NonNullable<ReturnType<typeof priceChunkUsageRecord>>;
+/** Exact per-event evidence needed by scalar intervals and model reduction.
+ * Account/era keys are admitted pseudonyms; session references are scoped
+ * hashes. Source record JSON and raw session identifiers are never retained. */
+export interface V11PreparedUsageFeature {
+  occurrenceId: string;
+  observedAtMs: number;
+  provider: string;
+  sessionDigest: string | null;
+  accountScopeId: string | null;
+  planBasis: TelemetryV11Attribution['planBasis'] | null;
+  planType: string | null;
+  planEraId: string | null;
+  outcome: 'priced' | 'skipped' | 'refused';
+  refusalReason: string | null;
+  pricingStatus: UsagePrice['pricingStatus'] | null;
+  costNanousd: number;
+  modelId: string | null;
+}
+export interface V11PreparedUsageReader {
+  days: readonly string[];
+  readPage(input: { day: string; afterTime: string; afterOccurrence: string }): Promise<
+    {state:'ready'; rows: readonly V11PreparedUsageFeature[]; complete:boolean}
+    | {state:'deferred'}>;
+}
+export function validV11UsageFeature(value: unknown): value is V11PreparedUsageFeature {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as V11PreparedUsageFeature;
+  if (Object.keys(row).sort().join(',') !== ['occurrenceId','observedAtMs','provider','sessionDigest',
+    'accountScopeId','planBasis','planType','planEraId','outcome','refusalReason','pricingStatus','costNanousd','modelId'].sort().join(',')
+    || typeof row.occurrenceId !== 'string' || !/^[A-Za-z0-9._:-]{1,256}$/u.test(row.occurrenceId)
+    || !Number.isSafeInteger(row.observedAtMs) || row.observedAtMs < 0 || row.observedAtMs > 8_640_000_000_000_000
+    || typeof row.provider !== 'string' || !TOKEN.test(row.provider)
+    || row.sessionDigest !== null && (typeof row.sessionDigest !== 'string' || !/^[a-f0-9]{64}$/u.test(row.sessionDigest))
+    || row.accountScopeId !== null && (typeof row.accountScopeId !== 'string' || !DIRECT_ACCOUNT_TRACK.test(row.accountScopeId))
+    || row.planBasis !== null && !TELEMETRY_V11_PLAN_BASES.includes(row.planBasis)
+    || row.planType !== null && !DIRECT_PLAN_TYPES.has(row.planType)
+    || row.planEraId !== null && (typeof row.planEraId !== 'string' || !/^plan-era:v1:[a-f0-9]{64}$/u.test(row.planEraId))
+    || !Number.isSafeInteger(row.costNanousd) || row.costNanousd < 0
+    || row.modelId !== null && (typeof row.modelId !== 'string' || !TOKEN.test(row.modelId))) return false;
+  if (row.outcome === 'priced') return row.refusalReason === null && row.planBasis !== null && row.planType !== null
+    && ['fully_priced','partially_priced','unpriced'].includes(row.pricingStatus ?? '')
+    && (!(row.planBasis === 'unavailable' || row.planBasis === 'conflicted')
+      || row.planType === 'unknown' && row.planEraId === null);
+  if (row.planBasis !== null || row.planType !== null || row.planEraId !== null
+    || row.pricingStatus !== null || row.costNanousd !== 0 || row.modelId !== null) return false;
+  if (row.outcome === 'skipped') return row.refusalReason === null;
+  return row.outcome === 'refused' && row.refusalReason === 'invalid_attribution_record'
+    && row.sessionDigest === null && row.accountScopeId === null;
 }
 
 interface Seed {
@@ -1042,6 +1097,62 @@ async function usageRowEvidence(row: UsageRow,
   return { attribution, scope, end, priced };
 }
 
+export async function prepareV11UsageFeature(row: UsageRow, ownerDigest: string): Promise<V11PreparedUsageFeature> {
+  if (!/^[a-f0-9]{64}$/u.test(ownerDigest)) throw new Error('V11_USAGE_FEATURE_INVALID');
+  const feature: V11PreparedUsageFeature = {
+    occurrenceId: row.occurrence_id, observedAtMs: Date.parse(row.observed_at),
+    provider: TOKEN.test(row.provider) ? row.provider : 'unknown', sessionDigest: null,
+    accountScopeId: null, planBasis: null, planType: null, planEraId: null,
+    outcome: 'skipped', refusalReason: null, pricingStatus: null, costNanousd: 0, modelId: null,
+  };
+  const evidence = await usageRowEvidence(row, async (session, observedAtMs, scope) => {
+    feature.observedAtMs = observedAtMs;
+    feature.accountScopeId = scope;
+    if (session !== null) feature.sessionDigest = await sha256Hex(JSON.stringify([
+      V11_PREPARED_USAGE_FEATURE_METHOD, ownerDigest, row.provider, row.session_uuid,
+    ]));
+    return null;
+  });
+  if (evidence !== null) {
+    if ('status' in evidence) {
+      feature.outcome = 'refused'; feature.refusalReason = evidence.reason;
+    } else {
+      feature.outcome = 'priced';
+      feature.accountScopeId = evidence.scope;
+      feature.planBasis = evidence.attribution.planBasis;
+      feature.planType = evidence.attribution.planType;
+      feature.planEraId = evidence.attribution.planEraId;
+      feature.pricingStatus = evidence.priced.pricingStatus;
+      feature.costNanousd = evidence.priced.costNanousd;
+      feature.modelId = evidence.priced.modelId;
+    }
+  }
+  if (!validV11UsageFeature(feature)) throw new Error('V11_USAGE_FEATURE_INVALID');
+  return feature;
+}
+
+function preparedUsageEvent(context: Context, previous: Map<string, {time:number;scope:string|null}>,
+  feature: V11PreparedUsageFeature): UsageEvidence | Refusal | null {
+  if (!validV11UsageFeature(feature)) throw new Error('V11_USAGE_FEATURE_INVALID');
+  if (feature.outcome === 'refused') return refused(feature.refusalReason!);
+  let prior: {time:number;scope:string|null} | undefined;
+  if (feature.sessionDigest !== null) {
+    const key = `feature:${feature.sessionDigest}`;
+    prior = previous.get(key);
+    if (prior === undefined && previous.size >= MAX_SESSIONS) return refused('session_interval_scope_limit_exceeded');
+    previous.set(key, {time:feature.observedAtMs,scope:feature.accountScopeId});
+  }
+  // Non-measurable rows still advance session carry, exactly as the raw path.
+  if (feature.outcome === 'skipped') return null;
+  const accountBreak = prior !== undefined && prior.scope !== feature.accountScopeId;
+  return {provider:feature.provider,scope:feature.accountScopeId,accountBreak,
+    eraKey:v11UsageEventEra(context.index,{provider:feature.provider,accountScopeId:feature.accountScopeId,
+      planBasis:feature.planBasis,planType:feature.planType,planEraId:feature.planEraId,
+      observedAtMs:feature.observedAtMs,accountBreak,...(prior ? {priorObservedAtMs:prior.time} : {})}),
+    interval:{start:prior?.time??feature.observedAtMs,end:feature.observedAtMs},
+    priced:{costNanousd:feature.costNanousd,pricingStatus:feature.pricingStatus!,modelId:feature.modelId}};
+}
+
 /** One usage row reduced to what a prepared day stores, or the reason it is
  * not stored at all. Everything here is decided by the row; `accountBreak` and
  * the window era are not, and are left to the day builder and the fold.
@@ -1419,7 +1530,8 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
   if (!state) {
     if (budget.remainingQueries < 1 || now() >= budget.deadlineMs) throw new Error("v11 usage reduction initialization unavailable");
     budget.remainingQueries -= 1;
-    const selected = options.effectiveUsageReader ? [...options.effectiveUsageReader.days] : await usageDays(db, context);
+    const selected = options.preparedUsageReader ? [...options.preparedUsageReader.days]
+      : options.effectiveUsageReader ? [...options.effectiveUsageReader.days] : await usageDays(db, context);
     if (!Array.isArray(selected)) return { version:1,identity:structuredClone(reductionIdentity),days:[], dayIndex:0, cursorTime:context.start,
       cursorOccurrence:"", rowsRead:0, complete:true, commonRefusal:selected.reason,
       scalarReduced, scalarRefusal:null,
@@ -1444,20 +1556,36 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
     if (budget.remainingQueries < 1 || now() >= budget.deadlineMs) break;
     const day = state.days[state.dayIndex]!;
     budget.remainingQueries -= 1;
-    const effectivePage = options.effectiveUsageReader ? await options.effectiveUsageReader.readPage({
+    const preparedPage = options.preparedUsageReader ? await options.preparedUsageReader.readPage({
       day, afterTime: state.cursorTime, afterOccurrence: state.cursorOccurrence,
     }) : null;
-    const rows = effectivePage ? effectivePage.rows : options.typedSourceNamespace ? await readTypedV11UsageAnalysisPage(db, { sourceNamespace:options.typedSourceNamespace,
+    if (preparedPage?.state === 'deferred') break;
+    const effectivePage = !preparedPage && options.effectiveUsageReader ? await options.effectiveUsageReader.readPage({
+      day, afterTime: state.cursorTime, afterOccurrence: state.cursorOccurrence,
+    }) : null;
+    const rows = preparedPage ? [] : effectivePage ? effectivePage.rows : options.typedSourceNamespace ? await readTypedV11UsageAnalysisPage(db, { sourceNamespace:options.typedSourceNamespace,
       ...(options.generationSnapshot ? { snapshot:options.generationSnapshot,
         fenceSnapshot:!options.generationSnapshotFenced } : { pin }),
       day, from:context.start, to:context.end, afterTime:state.cursorTime, afterOccurrence:state.cursorOccurrence })
       : (await db.prepare(V11_USAGE_PAGE_SQL).bind(pin.participantId,pin.generationId,day,context.start,context.end,
         state.cursorTime,state.cursorOccurrence,PAGE_SIZE).all<UsageRow>()).results;
-    if(rows.length>maximum-state.rowsRead){state.rowsRead=maximum;state.commonRefusal="windowed_usage_limit_exceeded";
+    const rowCount = preparedPage?.rows.length ?? rows.length;
+    if(rowCount>maximum-state.rowsRead){state.rowsRead=maximum;state.commonRefusal="windowed_usage_limit_exceeded";
       state.complete=true;break;}
-    state.rowsRead += rows.length;
-    for (const row of rows) {
-      const event = await usageEvent(context, previous, row);
+    state.rowsRead += rowCount;
+    let previousFeatureTime = Date.parse(state.cursorTime), previousFeatureId = state.cursorOccurrence;
+    if (preparedPage && preparedPage.rows.length === 0 && !preparedPage.complete)
+      throw new Error('V11_USAGE_FEATURE_PAGE_INVALID');
+    for (let index = 0; index < rowCount; index++) {
+      const feature = preparedPage?.rows[index];
+      if (feature) {
+        if (!validV11UsageFeature(feature) || new Date(feature.observedAtMs).toISOString().slice(0,10) !== day
+          || feature.observedAtMs < previousFeatureTime
+          || feature.observedAtMs === previousFeatureTime && feature.occurrenceId <= previousFeatureId)
+          throw new Error('V11_USAGE_FEATURE_PAGE_INVALID');
+        previousFeatureTime = feature.observedAtMs; previousFeatureId = feature.occurrenceId;
+      }
+      const event = feature ? preparedUsageEvent(context, previous, feature) : await usageEvent(context, previous, rows[index]!);
       if (event && "status" in event) { state.commonRefusal = event.reason; state.complete = true; break; }
       if (!event) continue;
       reduceScalar(context,runtime,state,hazards,scalarBuckets,event);
@@ -1470,13 +1598,18 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
     }
     if (state.complete) break;
     const pageSize = options.typedSourceNamespace ? TYPED_V11_ANALYSIS_PAGE_SIZE : PAGE_SIZE;
-    if (effectivePage ? effectivePage.complete : rows.length < pageSize) {
+    if (preparedPage ? preparedPage.complete : effectivePage ? effectivePage.complete : rows.length < pageSize) {
       state.dayIndex += 1;
       state.cursorTime = state.days[state.dayIndex] ? `${state.days[state.dayIndex]}T00:00:00.000Z` : context.end;
       state.cursorOccurrence = "";
     } else {
-      const last = rows[rows.length - 1]!;
-      state.cursorTime = last.observed_at; state.cursorOccurrence = last.occurrence_id;
+      if (preparedPage) {
+        const last = preparedPage.rows.at(-1)!;
+        state.cursorTime = new Date(last.observedAtMs).toISOString(); state.cursorOccurrence = last.occurrenceId;
+      } else {
+        const last = rows[rows.length - 1]!;
+        state.cursorTime = last.observed_at; state.cursorOccurrence = last.occurrence_id;
+      }
     }
   }
   state.complete ||= state.dayIndex >= state.days.length;

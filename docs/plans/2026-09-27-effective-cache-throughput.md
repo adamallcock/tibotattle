@@ -2,20 +2,21 @@
 title: Effective cache throughput follow-up
 date: 2026-09-27
 type: plan
-status: effective-usage-local-qualification
+status: effective-usage-deployed-initial-canary-complete
 ---
 
 # Effective cache throughput follow-up
 
-Latest state (September 28, 13:09 UTC): analytics source `15a5907e` remains
-deployed at 100%, with unchanged resources, schema and migration ledger.
-There are 130 queued publication dates and 2,112 stored graph results; the
-latest published model day is September 28. Four graphs completed in the
-preceding hour, none in the preceding ten minutes. The owner authorized the
-next usage performance increment. The
-[deployment receipt](../receipts/2026-09-28-analytics-throughput-increment.md)
-records exact qualification, observed costs and remaining limits. Earlier
-sections preserve preceding experiments and rollback evidence.
+Latest state (September 28, 14:08 UTC): approved analytics source `23575017`
+is deployed at 100% with migration 0029 applied and independently verified.
+All 18 initial scheduled canary runs passed without exceptions or lane failures;
+the exact deployment lock is released. The latest aggregate has 125
+queued publication dates, 2,113 stored graph results and all 70 dates in the
+model publication window stored through September 28. No effective usage
+summaries have been built yet, so production reuse and speed remain unmeasured.
+The [usage deployment receipt](../receipts/2026-09-28-effective-usage-throughput.md)
+records qualification and live evidence. Earlier sections preserve preceding
+experiments and rollback evidence.
 
 ## Current increment: reusable effective model usage
 
@@ -35,8 +36,8 @@ sections preserve preceding experiments and rollback evidence.
 Fits requires separate profiling because it retains scalar information absent
 from model-only summaries. Queue concurrency trials (1, then 2, then 4) and
 replica reads remain subsequent enhancements, subject to measured throughput
-and database pressure. No production topology or schema change is implied by
-this local increment.
+and database pressure. Migration 0029 is applied; production topology is
+unchanged.
 
 ### Usage increment evidence and storage decision
 
@@ -52,8 +53,8 @@ identifies repeated usage reads even after quota preparation. Final paired
 qualification uses the production migration set, which excludes migration
 0027; local elapsed times are not a production forecast.
 
-The new cache will use closed `effective-usage` graph-day keys. A forward
-analytics migration `0029_graph_day_effective_usage.sql` is required to widen
+The new cache uses closed `effective-usage` graph-day keys. The forward
+analytics migration `0029_graph_day_effective_usage.sql` widens
 the table layout constraint while preserving existing values, metadata, pages
 and protection triggers. Reusing the quota identity would mix incompatible
 contents; changing only the acquisition version would also be refused by the
@@ -61,7 +62,7 @@ current schema and retired by older cleanup Workers. Usage keys include a
 digest of the model pricing/method contract in their manifest ID and the raw
 correction-aware day dependency in their manifest digest. Source and owner
 fences remain required on every use. The migration and production activation
-are separate protected gates after the exact candidate is reviewable.
+were separately authorized and verified for source `23575017`.
 
 ### Paired model qualification
 
@@ -93,8 +94,27 @@ across cold plus warm; the cold job costs 17% more statements. A smaller
 versus 684 for control, so small or non-repeated work can regress. Local elapsed
 times are not a production speed claim. Four-page preparation groups reduced
 checkpoint amplification; completed days and large successors retain durable
-boundaries. The full Worker gate and analytics artifact qualification remain
-pending; production still runs `15a5907e` without migration 0029.
+boundaries. Candidate `23575017` passed all 2,223 Worker tests, the analytics
+dry build and exact-schema migration rehearsal. The umbrella gate subsequently
+stopped at its missing generated website release manifest; website and staging
+deployment are not qualified. The owner approved the exact production migration
+and deployment. Migration 0029 is applied and verified; `23575017` is active
+at 100% as version `4514cd0c-fff8-47d3-a487-a7a291f0dbb5`. Its initial
+18-run canary passed with no exceptions or lane failures. All runs were idle,
+so cache reuse and throughput still require naturally arriving graph work.
+The [usage qualification receipt](../receipts/2026-09-28-effective-usage-throughput.md)
+records the complete candidate, measurements and production progress.
+
+### Next investigation: daily publication cost
+
+The separate publisher remains on source `ba7f00b2`. Its three observed natural
+runs each defer on query budget after 804 statements, including 56 statements
+on empty retirement sweeps, with no exceptions. The daily queue decreases from
+126 to 125 dates during the broader observation and owner-fold checkpoints
+advance. Profile this exact source and the candidate shared-runtime savings
+before choosing a publisher change; count completed dates as well as partial
+folds. Any publisher deployment remains a separate operation. Queue concurrency
+and replica reads remain deferred as requested.
 
 The owner requested further performance work after the production canary for
 source `42e649333dcc04050214841089736692ac36d87b`. The read-only observation at

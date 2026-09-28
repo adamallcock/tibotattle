@@ -1,0 +1,901 @@
+{
+  "schemaVersion": "model-block-benchmark-v1",
+  "mode": "full",
+  "corpus": {
+    "calendarDays": 130,
+    "modelDates": 30,
+    "admittedFormats": [
+      "v1",
+      "v1.1",
+      "v1.2"
+    ],
+    "fullInputCalendarDays": 130
+  },
+  "scope": "Local synthetic model history only. Independent empty analytics targets. Source admission and fixture setup excluded. Candidate includes durable writes, fresh resumes and final visibility read. No scheduler, public aggregate, production latency or workload qualification.",
+  "phases": {
+    "cold": {
+      "reference": {
+        "costs": {
+          "model.source.other": {
+            "statements": 2761,
+            "failedStatements": 0,
+            "rowsRead": 1427640,
+            "rowsWritten": 0,
+            "databaseMs": 204,
+            "statementCallWallMs": 707,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 2761
+          },
+          "model.source.owner_fence": {
+            "statements": 3226,
+            "failedStatements": 0,
+            "rowsRead": 46512,
+            "rowsWritten": 0,
+            "databaseMs": 210,
+            "statementCallWallMs": 791,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 3226
+          },
+          "model.source.correction": {
+            "statements": 1531,
+            "failedStatements": 0,
+            "rowsRead": 6715,
+            "rowsWritten": 0,
+            "databaseMs": 59,
+            "statementCallWallMs": 362,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 1531
+          },
+          "model.source.dependency_links": {
+            "statements": 1474,
+            "failedStatements": 0,
+            "rowsRead": 5591895,
+            "rowsWritten": 0,
+            "databaseMs": 19380,
+            "statementCallWallMs": 20043,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 1474
+          },
+          "model.target.other": {
+            "statements": 296,
+            "failedStatements": 0,
+            "rowsRead": 296,
+            "rowsWritten": 0,
+            "databaseMs": 6,
+            "statementCallWallMs": 56,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 296
+          },
+          "model.target.graph_result": {
+            "statements": 94,
+            "failedStatements": 0,
+            "rowsRead": 90,
+            "rowsWritten": 60,
+            "databaseMs": 2,
+            "statementCallWallMs": 19,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 94
+          },
+          "model.target.owner_fence": {
+            "statements": 312,
+            "failedStatements": 0,
+            "rowsRead": 312,
+            "rowsWritten": 0,
+            "databaseMs": 7,
+            "statementCallWallMs": 95,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 312
+          },
+          "model.target.prepared_graph_day": {
+            "statements": 2271,
+            "failedStatements": 0,
+            "rowsRead": 74351,
+            "rowsWritten": 868,
+            "databaseMs": 122,
+            "statementCallWallMs": 429,
+            "allocatedBatchWallMs": 54.00000000000027,
+            "metadataSamples": 2271
+          },
+          "model.target.checkpoint": {
+            "statements": 2197,
+            "failedStatements": 0,
+            "rowsRead": 6642,
+            "rowsWritten": 1507,
+            "databaseMs": 61,
+            "statementCallWallMs": 220,
+            "allocatedBatchWallMs": 143.00000000000048,
+            "metadataSamples": 2197
+          },
+          "model.source.typed_quota": {
+            "statements": 660,
+            "failedStatements": 0,
+            "rowsRead": 8786,
+            "rowsWritten": 0,
+            "databaseMs": 1458,
+            "statementCallWallMs": 1624,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 660
+          },
+          "model.source.v12_quota": {
+            "statements": 660,
+            "failedStatements": 0,
+            "rowsRead": 661152,
+            "rowsWritten": 0,
+            "databaseMs": 608,
+            "statementCallWallMs": 784,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 660
+          },
+          "model.source.typed_usage": {
+            "statements": 134,
+            "failedStatements": 0,
+            "rowsRead": 6082,
+            "rowsWritten": 0,
+            "databaseMs": 242,
+            "statementCallWallMs": 279,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 134
+          },
+          "model.source.v12_usage": {
+            "statements": 134,
+            "failedStatements": 0,
+            "rowsRead": 627106,
+            "rowsWritten": 0,
+            "databaseMs": 164,
+            "statementCallWallMs": 204,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 134
+          }
+        },
+        "measurementFailures": 0,
+        "checkpointPartInsertStatements": 841,
+        "checkpointPayloadBytesSubmitted": 14224575,
+        "wallMs": 27293,
+        "operationWallMs": {},
+        "invocations": 34,
+        "maximumStatementsPerInvocation": 792,
+        "statements": 15750,
+        "failedStatements": 0,
+        "rowsRead": 8457579,
+        "rowsWritten": 2435,
+        "databaseMs": 22523,
+        "databaseWallMs": 25810,
+        "statementCallWallMs": 25613,
+        "allocatedBatchWallMs": 197.00000000000074,
+        "metadataSamples": 15750,
+        "metadataContract": "Every successful statement has finite nonnegative rows_read, rows_written and duration.",
+        "batchWallTimeAllocation": "Per-family allocatedBatchWallMs divides each measured batch call equally among its statements; family durations are not independently measured.",
+        "cpuMs": null,
+        "cpuUnavailableReason": "Local Workerd test bindings do not expose per-operation CPU time.",
+        "peakMemoryBytes": null,
+        "peakMemoryUnavailableReason": "Serialized retained bytes are measured; isolate peak heap is not exposed."
+      },
+      "candidate": {
+        "costs": {
+          "model.target.model_block": {
+            "statements": 55,
+            "failedStatements": 0,
+            "rowsRead": 5065,
+            "rowsWritten": 27,
+            "databaseMs": 5,
+            "statementCallWallMs": 13,
+            "allocatedBatchWallMs": 3,
+            "metadataSamples": 55
+          },
+          "model.target.prepared_graph_day": {
+            "statements": 943,
+            "failedStatements": 0,
+            "rowsRead": 21858,
+            "rowsWritten": 868,
+            "databaseMs": 35,
+            "statementCallWallMs": 115,
+            "allocatedBatchWallMs": 48.00000000000015,
+            "metadataSamples": 943
+          },
+          "model.source.owner_fence": {
+            "statements": 269,
+            "failedStatements": 0,
+            "rowsRead": 1255,
+            "rowsWritten": 0,
+            "databaseMs": 3,
+            "statementCallWallMs": 56,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 269
+          },
+          "model.source.other": {
+            "statements": 434,
+            "failedStatements": 0,
+            "rowsRead": 202325,
+            "rowsWritten": 0,
+            "databaseMs": 23,
+            "statementCallWallMs": 101,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 434
+          },
+          "model.source.correction": {
+            "statements": 492,
+            "failedStatements": 0,
+            "rowsRead": 57279,
+            "rowsWritten": 0,
+            "databaseMs": 33,
+            "statementCallWallMs": 133,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 492
+          },
+          "model.target.owner_fence": {
+            "statements": 65,
+            "failedStatements": 0,
+            "rowsRead": 130,
+            "rowsWritten": 0,
+            "databaseMs": 1,
+            "statementCallWallMs": 8,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 65
+          },
+          "model.source.typed_quota": {
+            "statements": 52,
+            "failedStatements": 0,
+            "rowsRead": 694,
+            "rowsWritten": 0,
+            "databaseMs": 118,
+            "statementCallWallMs": 156,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 52
+          },
+          "model.source.v12_quota": {
+            "statements": 52,
+            "failedStatements": 0,
+            "rowsRead": 49114,
+            "rowsWritten": 0,
+            "databaseMs": 49,
+            "statementCallWallMs": 64,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 52
+          },
+          "model.source.typed_usage": {
+            "statements": 102,
+            "failedStatements": 0,
+            "rowsRead": 4288,
+            "rowsWritten": 0,
+            "databaseMs": 239,
+            "statementCallWallMs": 260,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 102
+          },
+          "model.source.v12_usage": {
+            "statements": 102,
+            "failedStatements": 0,
+            "rowsRead": 186101,
+            "rowsWritten": 0,
+            "databaseMs": 107,
+            "statementCallWallMs": 134,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 102
+          },
+          "model.source.dependency_links": {
+            "statements": 9,
+            "failedStatements": 0,
+            "rowsRead": 67462,
+            "rowsWritten": 0,
+            "databaseMs": 137,
+            "statementCallWallMs": 141,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 9
+          }
+        },
+        "measurementFailures": 0,
+        "checkpointPartInsertStatements": 5,
+        "checkpointPayloadBytesSubmitted": 144709,
+        "wallMs": 1661,
+        "operationWallMs": {},
+        "invocations": 5,
+        "maximumStatementsPerInvocation": 829,
+        "statements": 2575,
+        "failedStatements": 0,
+        "rowsRead": 595571,
+        "rowsWritten": 895,
+        "databaseMs": 750,
+        "databaseWallMs": 1232.0000000000002,
+        "statementCallWallMs": 1181,
+        "allocatedBatchWallMs": 51.00000000000015,
+        "metadataSamples": 2575,
+        "metadataContract": "Every successful statement has finite nonnegative rows_read, rows_written and duration.",
+        "batchWallTimeAllocation": "Per-family allocatedBatchWallMs divides each measured batch call equally among its statements; family durations are not independently measured.",
+        "cpuMs": null,
+        "cpuUnavailableReason": "Local Workerd test bindings do not expose per-operation CPU time.",
+        "peakMemoryBytes": null,
+        "peakMemoryUnavailableReason": "Serialized retained bytes are measured; isolate peak heap is not exposed."
+      },
+      "candidateInvocations": [
+        {
+          "statements": 755,
+          "preparedDays": 18,
+          "reusedDays": 0,
+          "emptyDays": 80,
+          "sourcePages": 22,
+          "completedDates": 0,
+          "status": "deferred",
+          "reason": "query_budget"
+        },
+        {
+          "statements": 794,
+          "preparedDays": 16,
+          "reusedDays": 0,
+          "emptyDays": 0,
+          "sourcePages": 28,
+          "completedDates": 0,
+          "status": "deferred",
+          "reason": "query_budget"
+        },
+        {
+          "statements": 829,
+          "preparedDays": 16,
+          "reusedDays": 0,
+          "emptyDays": 0,
+          "sourcePages": 25,
+          "completedDates": 10,
+          "status": "deferred",
+          "reason": "query_budget"
+        },
+        {
+          "statements": 180,
+          "preparedDays": 0,
+          "reusedDays": 0,
+          "emptyDays": 0,
+          "sourcePages": 0,
+          "completedDates": 20,
+          "status": "complete"
+        }
+      ],
+      "visibilityReadStatements": 17,
+      "output": {
+        "completedModelDates": 30,
+        "ready": 30,
+        "analyticalSha256": "e4c1f379652917e165258456cc754f3ec72445dc82a6a159718dfe5fccdaecb7"
+      }
+    },
+    "replay": {
+      "reference": {
+        "costs": {
+          "model.source.other": {
+            "statements": 240,
+            "failedStatements": 0,
+            "rowsRead": 26520,
+            "rowsWritten": 0,
+            "databaseMs": 12,
+            "statementCallWallMs": 70,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 240
+          },
+          "model.source.owner_fence": {
+            "statements": 120,
+            "failedStatements": 0,
+            "rowsRead": 14774,
+            "rowsWritten": 0,
+            "databaseMs": 19,
+            "statementCallWallMs": 35,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 120
+          },
+          "model.source.correction": {
+            "statements": 30,
+            "failedStatements": 0,
+            "rowsRead": 30,
+            "rowsWritten": 0,
+            "databaseMs": 4,
+            "statementCallWallMs": 10,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 30
+          },
+          "model.source.dependency_links": {
+            "statements": 30,
+            "failedStatements": 0,
+            "rowsRead": 133455,
+            "rowsWritten": 0,
+            "databaseMs": 426,
+            "statementCallWallMs": 447,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 30
+          },
+          "model.target.other": {
+            "statements": 30,
+            "failedStatements": 0,
+            "rowsRead": 30,
+            "rowsWritten": 0,
+            "databaseMs": 0,
+            "statementCallWallMs": 5,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 30
+          },
+          "model.target.graph_result": {
+            "statements": 60,
+            "failedStatements": 0,
+            "rowsRead": 60,
+            "rowsWritten": 0,
+            "databaseMs": 3,
+            "statementCallWallMs": 15,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 60
+          },
+          "model.target.checkpoint": {
+            "statements": 30,
+            "failedStatements": 0,
+            "rowsRead": 30,
+            "rowsWritten": 0,
+            "databaseMs": 2,
+            "statementCallWallMs": 9,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 30
+          }
+        },
+        "measurementFailures": 0,
+        "checkpointPartInsertStatements": 0,
+        "checkpointPayloadBytesSubmitted": 0,
+        "wallMs": 608,
+        "operationWallMs": {},
+        "invocations": 30,
+        "maximumStatementsPerInvocation": 18,
+        "statements": 540,
+        "failedStatements": 0,
+        "rowsRead": 174899,
+        "rowsWritten": 0,
+        "databaseMs": 466,
+        "databaseWallMs": 591,
+        "statementCallWallMs": 591,
+        "allocatedBatchWallMs": 0,
+        "metadataSamples": 540,
+        "metadataContract": "Every successful statement has finite nonnegative rows_read, rows_written and duration.",
+        "batchWallTimeAllocation": "Per-family allocatedBatchWallMs divides each measured batch call equally among its statements; family durations are not independently measured.",
+        "cpuMs": null,
+        "cpuUnavailableReason": "Local Workerd test bindings do not expose per-operation CPU time.",
+        "peakMemoryBytes": null,
+        "peakMemoryUnavailableReason": "Serialized retained bytes are measured; isolate peak heap is not exposed."
+      },
+      "candidate": {
+        "costs": {
+          "model.target.model_block": {
+            "statements": 6,
+            "failedStatements": 0,
+            "rowsRead": 980,
+            "rowsWritten": 0,
+            "databaseMs": 0,
+            "statementCallWallMs": 2,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 6
+          },
+          "model.target.prepared_graph_day": {
+            "statements": 2,
+            "failedStatements": 0,
+            "rowsRead": 468,
+            "rowsWritten": 0,
+            "databaseMs": 0,
+            "statementCallWallMs": 0,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 2
+          },
+          "model.source.owner_fence": {
+            "statements": 4,
+            "failedStatements": 0,
+            "rowsRead": 12,
+            "rowsWritten": 0,
+            "databaseMs": 0,
+            "statementCallWallMs": 0,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 4
+          },
+          "model.source.other": {
+            "statements": 12,
+            "failedStatements": 0,
+            "rowsRead": 40,
+            "rowsWritten": 0,
+            "databaseMs": 1,
+            "statementCallWallMs": 2,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 12
+          },
+          "model.source.correction": {
+            "statements": 8,
+            "failedStatements": 0,
+            "rowsRead": 3444,
+            "rowsWritten": 0,
+            "databaseMs": 0,
+            "statementCallWallMs": 2,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 8
+          },
+          "model.target.owner_fence": {
+            "statements": 4,
+            "failedStatements": 0,
+            "rowsRead": 8,
+            "rowsWritten": 0,
+            "databaseMs": 0,
+            "statementCallWallMs": 0,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 4
+          }
+        },
+        "measurementFailures": 0,
+        "checkpointPartInsertStatements": 0,
+        "checkpointPayloadBytesSubmitted": 0,
+        "wallMs": 8,
+        "operationWallMs": {},
+        "invocations": 2,
+        "maximumStatementsPerInvocation": 19,
+        "statements": 36,
+        "failedStatements": 0,
+        "rowsRead": 4952,
+        "rowsWritten": 0,
+        "databaseMs": 1,
+        "databaseWallMs": 6,
+        "statementCallWallMs": 6,
+        "allocatedBatchWallMs": 0,
+        "metadataSamples": 36,
+        "metadataContract": "Every successful statement has finite nonnegative rows_read, rows_written and duration.",
+        "batchWallTimeAllocation": "Per-family allocatedBatchWallMs divides each measured batch call equally among its statements; family durations are not independently measured.",
+        "cpuMs": null,
+        "cpuUnavailableReason": "Local Workerd test bindings do not expose per-operation CPU time.",
+        "peakMemoryBytes": null,
+        "peakMemoryUnavailableReason": "Serialized retained bytes are measured; isolate peak heap is not exposed."
+      },
+      "candidateInvocations": [
+        {
+          "statements": 19,
+          "preparedDays": 0,
+          "reusedDays": 0,
+          "emptyDays": 0,
+          "sourcePages": 0,
+          "completedDates": 0,
+          "status": "complete"
+        }
+      ],
+      "visibilityReadStatements": 17,
+      "output": {
+        "completedModelDates": 30,
+        "ready": 30,
+        "analyticalSha256": "e4c1f379652917e165258456cc754f3ec72445dc82a6a159718dfe5fccdaecb7"
+      }
+    },
+    "correction": {
+      "reference": {
+        "costs": {
+          "model.source.other": {
+            "statements": 667,
+            "failedStatements": 0,
+            "rowsRead": 185181,
+            "rowsWritten": 0,
+            "databaseMs": 31,
+            "statementCallWallMs": 144,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 667
+          },
+          "model.source.owner_fence": {
+            "statements": 643,
+            "failedStatements": 0,
+            "rowsRead": 54712,
+            "rowsWritten": 0,
+            "databaseMs": 68,
+            "statementCallWallMs": 216,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 643
+          },
+          "model.source.correction": {
+            "statements": 247,
+            "failedStatements": 0,
+            "rowsRead": 1039,
+            "rowsWritten": 0,
+            "databaseMs": 9,
+            "statementCallWallMs": 47,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 247
+          },
+          "model.source.dependency_links": {
+            "statements": 1460,
+            "failedStatements": 0,
+            "rowsRead": 7547940,
+            "rowsWritten": 0,
+            "databaseMs": 20385,
+            "statementCallWallMs": 21174,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 1460
+          },
+          "model.target.other": {
+            "statements": 151,
+            "failedStatements": 0,
+            "rowsRead": 151,
+            "rowsWritten": 0,
+            "databaseMs": 3,
+            "statementCallWallMs": 23,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 151
+          },
+          "model.target.graph_result": {
+            "statements": 90,
+            "failedStatements": 0,
+            "rowsRead": 180,
+            "rowsWritten": 30,
+            "databaseMs": 4,
+            "statementCallWallMs": 18,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 90
+          },
+          "model.target.owner_fence": {
+            "statements": 92,
+            "failedStatements": 0,
+            "rowsRead": 92,
+            "rowsWritten": 0,
+            "databaseMs": 2,
+            "statementCallWallMs": 26,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 92
+          },
+          "model.target.prepared_graph_day": {
+            "statements": 1559,
+            "failedStatements": 0,
+            "rowsRead": 38964,
+            "rowsWritten": 10,
+            "databaseMs": 76,
+            "statementCallWallMs": 402,
+            "allocatedBatchWallMs": 1,
+            "metadataSamples": 1559
+          },
+          "model.target.checkpoint": {
+            "statements": 846,
+            "failedStatements": 0,
+            "rowsRead": 1772,
+            "rowsWritten": 454,
+            "databaseMs": 33,
+            "statementCallWallMs": 109,
+            "allocatedBatchWallMs": 68.99999999999994,
+            "metadataSamples": 846
+          },
+          "model.source.typed_quota": {
+            "statements": 30,
+            "failedStatements": 0,
+            "rowsRead": 210,
+            "rowsWritten": 0,
+            "databaseMs": 1,
+            "statementCallWallMs": 6,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 30
+          },
+          "model.source.v12_quota": {
+            "statements": 30,
+            "failedStatements": 0,
+            "rowsRead": 288843,
+            "rowsWritten": 0,
+            "databaseMs": 55,
+            "statementCallWallMs": 59,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 30
+          },
+          "model.source.typed_usage": {
+            "statements": 32,
+            "failedStatements": 0,
+            "rowsRead": 1815,
+            "rowsWritten": 0,
+            "databaseMs": 7,
+            "statementCallWallMs": 15,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 32
+          },
+          "model.source.v12_usage": {
+            "statements": 32,
+            "failedStatements": 0,
+            "rowsRead": 929075,
+            "rowsWritten": 0,
+            "databaseMs": 118,
+            "statementCallWallMs": 123,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 32
+          }
+        },
+        "measurementFailures": 0,
+        "checkpointPartInsertStatements": 211,
+        "checkpointPayloadBytesSubmitted": 8707505,
+        "wallMs": 23109,
+        "operationWallMs": {},
+        "invocations": 30,
+        "maximumStatementsPerInvocation": 240,
+        "statements": 5879,
+        "failedStatements": 0,
+        "rowsRead": 9049974,
+        "rowsWritten": 494,
+        "databaseMs": 20792,
+        "databaseWallMs": 22432,
+        "statementCallWallMs": 22362,
+        "allocatedBatchWallMs": 69.99999999999994,
+        "metadataSamples": 5879,
+        "metadataContract": "Every successful statement has finite nonnegative rows_read, rows_written and duration.",
+        "batchWallTimeAllocation": "Per-family allocatedBatchWallMs divides each measured batch call equally among its statements; family durations are not independently measured.",
+        "cpuMs": null,
+        "cpuUnavailableReason": "Local Workerd test bindings do not expose per-operation CPU time.",
+        "peakMemoryBytes": null,
+        "peakMemoryUnavailableReason": "Serialized retained bytes are measured; isolate peak heap is not exposed."
+      },
+      "candidate": {
+        "costs": {
+          "model.target.model_block": {
+            "statements": 22,
+            "failedStatements": 0,
+            "rowsRead": 2020,
+            "rowsWritten": 12,
+            "databaseMs": 1,
+            "statementCallWallMs": 2,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 22
+          },
+          "model.target.prepared_graph_day": {
+            "statements": 309,
+            "failedStatements": 0,
+            "rowsRead": 1585,
+            "rowsWritten": 10,
+            "databaseMs": 9,
+            "statementCallWallMs": 79,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 309
+          },
+          "model.source.owner_fence": {
+            "statements": 15,
+            "failedStatements": 0,
+            "rowsRead": 1085,
+            "rowsWritten": 0,
+            "databaseMs": 1,
+            "statementCallWallMs": 4,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 15
+          },
+          "model.source.other": {
+            "statements": 36,
+            "failedStatements": 0,
+            "rowsRead": 11229,
+            "rowsWritten": 0,
+            "databaseMs": 0,
+            "statementCallWallMs": 11,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 36
+          },
+          "model.source.correction": {
+            "statements": 32,
+            "failedStatements": 0,
+            "rowsRead": 6109,
+            "rowsWritten": 0,
+            "databaseMs": 3,
+            "statementCallWallMs": 7,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 32
+          },
+          "model.target.owner_fence": {
+            "statements": 7,
+            "failedStatements": 0,
+            "rowsRead": 14,
+            "rowsWritten": 0,
+            "databaseMs": 0,
+            "statementCallWallMs": 0,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 7
+          },
+          "model.source.typed_quota": {
+            "statements": 2,
+            "failedStatements": 0,
+            "rowsRead": 14,
+            "rowsWritten": 0,
+            "databaseMs": 0,
+            "statementCallWallMs": 0,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 2
+          },
+          "model.source.v12_quota": {
+            "statements": 2,
+            "failedStatements": 0,
+            "rowsRead": 16283,
+            "rowsWritten": 0,
+            "databaseMs": 4,
+            "statementCallWallMs": 4,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 2
+          },
+          "model.source.typed_usage": {
+            "statements": 4,
+            "failedStatements": 0,
+            "rowsRead": 111,
+            "rowsWritten": 0,
+            "databaseMs": 5,
+            "statementCallWallMs": 6,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 4
+          },
+          "model.source.v12_usage": {
+            "statements": 4,
+            "failedStatements": 0,
+            "rowsRead": 56937,
+            "rowsWritten": 0,
+            "databaseMs": 10,
+            "statementCallWallMs": 10,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 4
+          },
+          "model.source.dependency_links": {
+            "statements": 9,
+            "failedStatements": 0,
+            "rowsRead": 79997,
+            "rowsWritten": 0,
+            "databaseMs": 134,
+            "statementCallWallMs": 137,
+            "allocatedBatchWallMs": 0,
+            "metadataSamples": 9
+          }
+        },
+        "measurementFailures": 0,
+        "checkpointPartInsertStatements": 2,
+        "checkpointPayloadBytesSubmitted": 45848,
+        "wallMs": 486,
+        "operationWallMs": {},
+        "invocations": 2,
+        "maximumStatementsPerInvocation": 425,
+        "statements": 442,
+        "failedStatements": 0,
+        "rowsRead": 175384,
+        "rowsWritten": 22,
+        "databaseMs": 167,
+        "databaseWallMs": 260,
+        "statementCallWallMs": 260,
+        "allocatedBatchWallMs": 0,
+        "metadataSamples": 442,
+        "metadataContract": "Every successful statement has finite nonnegative rows_read, rows_written and duration.",
+        "batchWallTimeAllocation": "Per-family allocatedBatchWallMs divides each measured batch call equally among its statements; family durations are not independently measured.",
+        "cpuMs": null,
+        "cpuUnavailableReason": "Local Workerd test bindings do not expose per-operation CPU time.",
+        "peakMemoryBytes": null,
+        "peakMemoryUnavailableReason": "Serialized retained bytes are measured; isolate peak heap is not exposed."
+      },
+      "candidateInvocations": [
+        {
+          "statements": 425,
+          "preparedDays": 1,
+          "reusedDays": 49,
+          "emptyDays": 80,
+          "sourcePages": 1,
+          "completedDates": 30,
+          "status": "complete"
+        }
+      ],
+      "visibilityReadStatements": 17,
+      "output": {
+        "completedModelDates": 30,
+        "ready": 30,
+        "analyticalSha256": "e4c1f379652917e165258456cc754f3ec72445dc82a6a159718dfe5fccdaecb7"
+      }
+    }
+  },
+  "evidence": {
+    "recordedAt": "2026-09-28T17:31:07.399Z",
+    "nodeVersion": "v26.2.0",
+    "baseCommit": "d4c1f19228da8da3fec2e638052184f961b66795",
+    "workingTreeDirty": true,
+    "workerInputFingerprint": {
+      "sha256": "67e2fd723b6e6d65e51a7a50363a26b3a006d000bbb48b1a42b1db22115fb903",
+      "files": 645
+    },
+    "fingerprintScope": "Worker src, test, scripts, source and analytics migrations, package/lockfile, Wrangler and TypeScript/Vitest config.",
+    "workspacePackageCopies": {
+      "verifiedBeforeAndAfter": true,
+      "packages": [
+        {
+          "packageName": "@app-usagemonitor/accounting",
+          "fileCount": 7,
+          "sha256": "65822265725f3efc7ab42d2d6cb5a8e9955b9ac46115c590ea4d18cca7101631"
+        },
+        {
+          "packageName": "@app-usagemonitor/telemetry-contract",
+          "fileCount": 45,
+          "sha256": "4472f0d691a6f45b9e6e1148185a983dedead5744d1bea8272841341d3dc4e80"
+        },
+        {
+          "packageName": "@app-usagemonitor/quota-analysis",
+          "fileCount": 11,
+          "sha256": "7f17e89466d215f567dfa45cb16eec0915c18eb63d8f1d35a543d768adaa1919"
+        }
+      ]
+    }
+  }
+}

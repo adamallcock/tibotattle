@@ -22,6 +22,8 @@ import { StorageGraphOperationError, withStorageGraphFailureStage,
  type StorageGraphFailureFields } from './storage-analytics-failure';
 import {loadTypedV11GenerationSnapshot} from './typed-v11-quota-reader';
 import {storageHistoryKeyDigest,type StorageHistoryKey} from './storage-history-checkpoint';
+import {planHistoricalModelBlockRanges} from './analytics-model-block-contract';
+import {advanceStorageModelBlockGraphWork} from './storage-community-graph-model-block';
 import {claimStorageGraphWorkSelection,completeStorageGraphWorkSelection,discardStorageGraphWorkSelection,
  ensureStorageGraphWorkSelection,
  loadLiveStorageGraphWorkSelection,readStorageGraphWorkSelection,releaseStorageGraphWorkSelection,
@@ -156,10 +158,16 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   * graph attempt per invocation needs. A pass that keeps returning to this
   * lane inside one window sets a smaller floor, so the last of its meter is
   * spent resuming a claim rather than left unusable. */
- admissionQueries?:number;
+  admissionQueries?:number;
+  /** Local qualification seam for complete historical model blocks. The
+   * ordinary scheduler leaves this off until the integrated path is measured. */
+  modelBlocks?:boolean;
+  sharedFeatures?:boolean;
 }):Promise<StorageGraphWorkProgress> {
  const nowMs=options.nowMs??Date.now();
  if(!Number.isFinite(nowMs))throw fail();
+ if(options.modelBlocks!==undefined&&typeof options.modelBlocks!=='boolean'
+  ||options.sharedFeatures!==undefined&&typeof options.sharedFeatures!=='boolean')throw fail();
  const admissionQueries=options.admissionQueries??550;
  if(!Number.isSafeInteger(admissionQueries)||admissionQueries<1||admissionQueries>1_000)throw fail();
  if((options.remainingQueries??900)<admissionQueries || Date.now()>=(options.deadlineMs??Date.now()+20_000)) {
@@ -347,9 +355,37 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   const maxQueries=(options.remainingQueries??900)-SELECTION_QUERY_RESERVE;
   if(maxQueries<50||Date.now()>=(options.deadlineMs??Date.now()+20_000))
    return {state:'deferred',metric,day,reason:'budget'};
+  // The normal scan cursor and owner-day selection claim stay authoritative.
+  // A block may serve only a selected effective historical model date in a
+  // planned UTC-aligned range, including its clipped historical edges.
+  if(options.modelBlocks===true&&metric==='model'&&day<today&&selectedScope.source==='effective'
+   &&planHistoricalModelBlockRanges(today).some(range=>range.outputFromDay<=day&&day<=range.outputThroughDay)){
+   // The adapter retires stale jobs even when the remaining allowance cannot
+   // start its block runner. It still shares this claim and invocation meter.
+   const block=await withStorageGraphFailureStage('graph_model_compute',
+    ()=>advanceStorageModelBlockGraphWork({source:options.source,target:options.target,
+     sourceId:options.sourceId,sourceNamespace:options.sourceNamespace,
+     scope:selectedScope,nowMs,maxQueries,deadlineMs:options.deadlineMs,
+     ...(options.sharedFeatures===true?{sharedFeatures:true}:{})}));
+   if(block.state!=='unsupported'){
+    if(block.state==='complete'&&selection&&claimToken){
+     const finished=await completeStorageGraphWorkSelection({target:options.target,selection,claimToken});
+     if(finished.status!=='completed')return {state:'deferred',metric,day,reason:'selection_changed'};
+     selection=null;
+    }
+    return block.state==='complete'?{state:block.reused?'reused':'complete',metric,day}
+     :{state:'deferred',metric,day,reason:block.reason??'block_deferred'};
+   }
+  }
+  // An unsupported block may have spent bounded preflight statements before
+  // yielding to the native path. Re-read the live allowance before computing.
+  const nativeQueries=(options.remainingQueries??900)-SELECTION_QUERY_RESERVE;
+  if(nativeQueries<50||Date.now()>=(options.deadlineMs??Date.now()+20_000))
+   return {state:'deferred',metric,day,reason:'budget'};
   const result=await withStorageGraphFailureStage(metric==='fits'?'graph_current_fit_compute':'graph_model_compute',
-   ()=>computeStorageGraphResult(options,selectedScope,{maxQueries,
+   ()=>computeStorageGraphResult(options,selectedScope,{maxQueries:nativeQueries,
     deadlineMs:options.deadlineMs,
+    ...(options.sharedFeatures===true?{sharedFeatures:true}:{}),
     ...(options.preparedFold!==undefined?{preparedFold:options.preparedFold}:{})}));
   if(result.state==='complete'&&selection&&claimToken){
    const finished=await completeStorageGraphWorkSelection({target:options.target,selection,claimToken});

@@ -538,6 +538,16 @@ describe("bounded shared effective day dependencies", () => {
     const query = observed.queries.find(value => value.sql.includes("selected(occurrence_id)"))!;
     const prior = await db().prepare(dependencySqlBaseline.sql).bind(...query.values).all();
     expect(prior.results).toEqual(dependency.occurrenceLinks);
+    const batched = observeDependencyQueries(db());
+    const batchedReader = await createEffectiveHistoryDayDependencyReader(batched.database, owner,
+      namespace, [selectedDay, outsideDay], { occurrenceLinks: "batched" });
+    expect(batchedReader).toBeDefined();
+    for (const targetDay of [selectedDay, outsideDay]) {
+      const exact = await effectiveHistoryDependency(db(), owner, namespace, targetDay, targetDay);
+      expect(await batchedReader!.readDigest(targetDay)).toBe(await sha256Hex(canonicalJson(exact)));
+    }
+    const batchQuery = batched.queries.find(value => value.sql.includes("/* batched occurrence links */"))!;
+    expect(batchQuery).toBeDefined();
 
     const rowIds = family === "v12"
       ? (await db().prepare(`SELECT r.id AS id,c.chunk_day AS day FROM telemetry_v12_records r
@@ -556,12 +566,16 @@ describe("bounded shared effective day dependencies", () => {
         : sql.replaceAll(new RegExp(`FROM ${family === "v1" ? "typed_v1_record_admissions" : "telemetry_v12_records"} complete\\s+WHERE complete.chunk_id=chunk.id`, "gu"),
           match => `${match} AND complete.${family === "v1" ? "typed_record_id" : "id"}<>${missingId}`);
       const currentSql = withoutProof(query.sql), priorSql = withoutProof(dependencySqlBaseline.sql);
+      const batchedSql = withoutProof(batchQuery.sql);
       expect(currentSql).not.toBe(query.sql);
       expect(priorSql).not.toBe(dependencySqlBaseline.sql);
+      expect(batchedSql).not.toBe(batchQuery.sql);
       const current = await db().prepare(currentSql).bind(...query.values).all();
       const priorMissing = await db().prepare(priorSql).bind(...query.values).all();
+      const batchedMissing = await db().prepare(batchedSql).bind(...batchQuery.values).all();
       expect(current.results).toEqual([]);
       expect(current.results).toEqual(priorMissing.results);
+      expect(batchedMissing.results).toEqual([]);
     }
   }, 30_000);
 
@@ -590,6 +604,13 @@ describe("bounded shared effective day dependencies", () => {
       expect(dependency.occurrenceLinks).toEqual([expect.objectContaining({ family, source_day: sourceDay })]);
       expect(dependency.occurrenceLinks).toEqual(prior.results);
     }
+    const batched = await createEffectiveHistoryDayDependencyReader(db(), owner, namespace,
+      [selectedDay, outsideDay], { occurrenceLinks: "batched" });
+    expect(batched).toBeDefined();
+    for (const targetDay of [outsideDay, selectedDay]) {
+      const exact = await effectiveHistoryDependency(db(), owner, namespace, targetDay, targetDay);
+      expect(await batched!.readDigest(targetDay)).toBe(await sha256Hex(canonicalJson(exact)));
+    }
   }, 30_000);
 
   it("preserves compact, plain, and escaped occurrence IDs without conflating codec tags", async () => {
@@ -617,6 +638,13 @@ describe("bounded shared effective day dependencies", () => {
     expect(dependency.occurrenceLinks).toEqual([expect.objectContaining({ family: "v12", source_day: outsideDay })]);
     expect(dependency.occurrenceLinks).toEqual(prior.results);
     expect(canonicalJson({ ...dependency, occurrenceLinks: prior.results })).toBe(canonicalJson(dependency));
+    const batched = await createEffectiveHistoryDayDependencyReader(db(), owner, namespace,
+      [selectedDay, outsideDay, differentIdDay], { occurrenceLinks: "batched" });
+    expect(batched).toBeDefined();
+    for (const targetDay of [differentIdDay, selectedDay, outsideDay]) {
+      const exact = await effectiveHistoryDependency(db(), owner, namespace, targetDay, targetDay);
+      expect(await batched!.readDigest(targetDay)).toBe(await sha256Hex(canonicalJson(exact)));
+    }
   }, 30_000);
 
   it("seeks typed occurrence links by owner and stream before decoding compatibility rows", async () => {
@@ -805,6 +833,10 @@ describe("bounded shared effective day dependencies", () => {
     expect(exact.v12).toEqual([]);
     expect(await reader!.readDigest(selectedDay)).toBe(await sha256Hex(canonicalJson(exact)));
     expect(observed.queries).toHaveLength(5);
+    const batched = await createEffectiveHistoryDayDependencyReader(db(), emptyDependencyOwner,
+      namespace, [selectedDay], { occurrenceLinks: "batched" });
+    expect(batched).toBeDefined();
+    expect(await batched!.readDigest(selectedDay)).toBe(await sha256Hex(canonicalJson(exact)));
 
     const providerError = new Error("synthetic D1 provider unavailable");
     const failing = observeDependencyQueries(db(), { rows(query, rows) {

@@ -31,6 +31,9 @@ import {
   type PublicCacheRetentionWindow,
 } from "./cache-retention-values";
 import { parseStoredRecordJson } from "./stored-record";
+import { cacheRetentionEventFromRecord, cacheRetentionSessionDigest } from "./cache-retention-events";
+export { cacheRetentionEventFromRecord, cacheRetentionSessionDigest,
+  CACHE_RETENTION_SESSION_DIGEST_METHOD, CACHE_RETENTION_RECORD_SCHEMAS } from "./cache-retention-events";
 import { assertV1SourcePinCurrent, loadV1SourcePin,
   type V1SourcePin } from "./telemetry-v1-source-selection";
 import { loadV11SourcePin } from "./telemetry-v11-domain";
@@ -752,28 +755,13 @@ export async function retireCacheRetentionDayPage(target: D1Database, sourceId: 
     marks, carry, values, bands };
 }
 
-/**
- * The opaque session key the reduction pairs on.
- *
- * A raw `sessionUuid` is session content and must never reach a derived
- * artifact, so the reduction only ever sees this digest and compares it for
- * equality. Owner-scoped, following the prepared graph day's own derivation, so
- * one uuid under two owners cannot collide. Only its cardinality is stored.
- */
-export const CACHE_RETENTION_SESSION_DIGEST_METHOD = "cache-retention-session-v1";
-export async function cacheRetentionSessionDigest(input: { ownerDigest: string; provider: string;
-  sessionUuid: string }): Promise<string> {
-  if (!HASH.test(input.ownerDigest) || typeof input.provider !== "string"
-    || typeof input.sessionUuid !== "string" || input.sessionUuid.length === 0) throw fail();
-  return sha256Hex(canonicalJson({ method: CACHE_RETENTION_SESSION_DIGEST_METHOD, kind: "session",
-    ownerDigest: input.ownerDigest, value: [input.provider, input.sessionUuid] }));
-}
-
 /** The lane's own deadline and the source statements this pass may still spend
  * building. Several days share one pass allowance. */
 export interface CacheRetentionBuildBudget {
   readonly deadlineMs: number;
   remainingQueries: number;
+  /** Actual shared D1 invocation headroom, when durable day features are enabled. */
+  readonly remainingSharedQueries?: () => number;
 }
 /** The build ran out of the pass's source allowance or reached its deadline.
  * Distinct from a refusal: the day is representable, it simply did not fit this
@@ -786,58 +774,6 @@ function spend(budget: CacheRetentionBuildBudget, now: () => number): void {
   if (now() >= budget.deadlineMs) throw new CacheRetentionDeferredError("deadline");
   if (budget.remainingQueries < 1) throw new CacheRetentionDeferredError("query_budget");
   budget.remainingQueries -= 1;
-}
-
-const TOKENS = (value: unknown): number | null => {
-  if (value === null || value === undefined) return null;
-  return Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= 1e12
-    ? value as number : null;
-};
-
-/**
- * The stored usage-event schemas this mapper reads.
- *
- * Both are admitted because the fields this measurement uses are the SAME
- * fields, under the same names, with the same closed per-field validators: v1's
- * `parseUsageEvent` and v1.1's `parseTelemetryV11UsageEvent` both require
- * `sessionUuid`, `modelId`, `reasoningEffort`, `speedMode` and `surface` as
- * bounded tokens and all three input components as nullable token counts. The
- * only usage-stream field v1.1 adds is `accountPlanAttribution`, which this
- * measurement never reads. Admitting v1.0 therefore widens the INPUT and not
- * the method, and nothing below is relaxed: an unknown schema version is still
- * unreadable, and so is any admitted record whose fields do not validate.
- */
-export const CACHE_RETENTION_RECORD_SCHEMAS: ReadonlySet<string> =
-  new Set(["usage-event-v1.1", "usage-event-v1.0"]);
-
-/** Map one stored usage record to the lens's own event, or report that it
- * cannot be read. Only allowlisted fields are consulted and none is coerced: an
- * absent token component stays `null`, and an absent or malformed configuration
- * token makes the row unreadable rather than a guess. */
-export function cacheRetentionEventFromRecord(input: { sessionDigest: string; observedAtMs: number;
-  orderKey: string; recordJson: string }): CacheRetentionItem | null {
-  const record = parseStoredRecordJson(input.recordJson) as Record<string, unknown> | null;
-  const unreadable: CacheRetentionItem = { sessionDigest: input.sessionDigest,
-    observedAtMs: input.observedAtMs, orderKey: input.orderKey, unreadable: true };
-  if (!record || typeof record.schemaVersion !== "string"
-    || !CACHE_RETENTION_RECORD_SCHEMAS.has(record.schemaVersion)) return unreadable;
-  const components = record.components;
-  if (!components || typeof components !== "object" || Array.isArray(components)) return unreadable;
-  const { modelId, reasoningEffort, speedMode, surface } = record;
-  if (!validCacheRetentionToken(modelId) || !validCacheRetentionToken(reasoningEffort)
-    || !validCacheRetentionToken(speedMode) || !validCacheRetentionToken(surface)) return unreadable;
-  const parts = components as Record<string, unknown>;
-  const cacheReadTokens = TOKENS(parts.inputCacheReadTokens);
-  const uncachedTokens = TOKENS(parts.inputUncachedTokens);
-  const cacheWriteTokens = TOKENS(parts.inputCacheWriteTokens);
-  // The population filter, exactly as the local lens states it: positive-input
-  // requests only, so a quota-only or bookkeeping row can never consume an
-  // adjacency boundary. A row outside the population is not in the session's
-  // sequence at all, which is why it is dropped rather than made a break.
-  if ((cacheReadTokens ?? 0) + (uncachedTokens ?? 0) + (cacheWriteTokens ?? 0) <= 0) return null;
-  return { sessionDigest: input.sessionDigest, observedAtMs: input.observedAtMs,
-    orderKey: input.orderKey, model: modelId, effort: reasoningEffort, speedMode, surface,
-    cacheReadTokens, uncachedTokens, cacheWriteTokens };
 }
 
 /** One UTC day of mapped events. The seam stays open so a test can drive the
@@ -1485,6 +1421,80 @@ export function createCacheRetentionEffectiveDayBuild(options: {
   };
 }
 
+/** Reuse the exact effective owner-day input across cache, daily, quota and
+ * model outputs. The feature store preserves ordered, digest-only cache items;
+ * this is the same seven-day carry and v2 reducer as the native page path. */
+function createCacheRetentionSharedFeatureDayBuild(options: {
+  source: D1Database; target: D1Database; sourceNamespace: string;
+  owner: StorageCommunityOwner & {ownerDigest:string}; now: () => number;
+  native: CacheRetentionDayBuild;
+}): CacheRetentionDayBuild {
+  return async (candidate, carry, budget) => {
+    checkKey(candidate); checkCarry(candidate,carry);
+    if (candidate.sourceLayout !== 'effective' || candidate.ownerDigest !== options.owner.ownerDigest
+      || candidate.sourceNamespace !== options.sourceNamespace || !budget.remainingSharedQueries) {
+      throw new CacheRetentionDeferredError('query_budget');
+    }
+    const {advanceSharedAnalyticsFeatureDay} = await import('./storage-analytics-shared-features');
+    const expected = new Map(carry.map(value => [value.day,value.manifestDigest]));
+    expected.set(candidate.day,candidate.manifestDigest);
+    const features = new Map<string, {cacheItems:readonly CacheRetentionItem[];cacheEventsRead:number}>();
+    for (const featureDay of [...cacheRetentionLookbackDays(candidate.day),candidate.day]) {
+      if (options.now() >= budget.deadlineMs) throw new CacheRetentionDeferredError('deadline');
+      const before = budget.remainingSharedQueries();
+      let result: Awaited<ReturnType<typeof advanceSharedAnalyticsFeatureDay>>;
+      try {
+        result = await advanceSharedAnalyticsFeatureDay({source:options.source,target:options.target,
+          sourceId:candidate.sourceId,sourceNamespace:options.sourceNamespace,owner:options.owner,
+          day:featureDay,budget:{remainingQueries:()=>Math.min(budget.remainingQueries,
+            budget.remainingSharedQueries!()),deadlineMs:budget.deadlineMs,now:options.now}});
+      } catch (error) {
+        if (!(error instanceof Error) || !/no such table|no such column/i.test(error.message)) throw error;
+        return options.native(candidate,carry,budget);
+      } finally {
+        budget.remainingQueries = Math.max(0,budget.remainingQueries
+          - Math.max(0,before-budget.remainingSharedQueries()));
+      }
+      if (result.state === 'deferred') throw new CacheRetentionDeferredError(
+        result.reason === 'deadline' ? 'deadline' : 'query_budget');
+      if (result.state === 'refused') return options.native(candidate,carry,budget);
+      const expectedDigest = expected.get(featureDay);
+      if (expectedDigest !== '' && result.dependencyDigest !== expectedDigest) {
+        throw new CacheRetentionRefusedError('owner_source_unavailable');
+      }
+      features.set(featureDay,result.value);
+    }
+    const own = features.get(candidate.day)!;
+    const sessions = new Set(own.cacheItems.map(item => item.sessionDigest));
+    const tail = new Map<string,CacheRetentionEvent>();
+    for (const featureDay of cacheRetentionLookbackDays(candidate.day)) {
+      for (const item of features.get(featureDay)!.cacheItems) {
+        if (!sessions.has(item.sessionDigest)) continue;
+        if ('unreadable' in item) tail.delete(item.sessionDigest);
+        else tail.set(item.sessionDigest,item);
+      }
+    }
+    // A source-only append after the first feature read may change an empty
+    // carry day before the final mark write. The owner CAS makes that pass
+    // retry under the fresh daily/carry identity instead of publishing it.
+    spend(budget,options.now);
+    const live = await options.source.prepare(`SELECT o.revision,o.authority_epoch,v.revision AS input_revision
+      FROM storage_owner_revisions o
+      JOIN storage_v11_owner_links l ON l.owner_digest=o.owner_digest AND l.state='active'
+      JOIN participants p ON p.id=l.participant_id AND p.state='active'
+      JOIN community_analytical_input_versions v ON v.participant_id=p.id
+      WHERE o.owner_digest=? AND o.state='active'`).bind(candidate.ownerDigest)
+      .first<{revision:number;authority_epoch:number;input_revision:number}>();
+    if (!live || live.revision !== options.owner.ownerRevision
+      || live.authority_epoch !== options.owner.authorityEpoch
+      || live.input_revision !== options.owner.inputRevision) {
+      throw new CacheRetentionRefusedError('owner_source_unavailable');
+    }
+    return reduceCacheRetentionDay({day:candidate.day,events:own.cacheItems,
+      carry:[...tail.values()],eventsRead:own.cacheEventsRead});
+  };
+}
+
 /**
  * The production build for a WHOLE source, resolving each candidate owner's
  * source itself.
@@ -1505,12 +1515,16 @@ export function createCacheRetentionEffectiveDayBuild(options: {
  */
 export function createCacheRetentionDaySourceBuild(options: {
   source: D1Database; target?: D1Database; sourceNamespace: string; now?: () => number;
+  sharedFeatures?: boolean;
 }): CacheRetentionDayBuild {
   const resolved = new Map<string, CacheRetentionDayBuild | null>();
   const now = options.now ?? Date.now;
   return async (candidate, carry, budget) => {
     checkKey(candidate);
     if (candidate.sourceNamespace !== options.sourceNamespace) throw fail();
+    if (options.sharedFeatures && !budget.remainingSharedQueries) {
+      throw new CacheRetentionDeferredError('query_budget');
+    }
     // The effective key contains every target-side identity that the source
     // validation proves. The effective branch below still resolves afresh on
     // every call, because a source-only late arrival can invalidate a target
@@ -1534,14 +1548,15 @@ export function createCacheRetentionDaySourceBuild(options: {
           if (!options.target) throw new CacheRetentionDeferredError("query_budget");
           spend(budget, now);
           const owner = await options.source.prepare(`SELECT link.participant_id,
-              owner.revision,owner.authority_epoch
+              owner.revision,owner.authority_epoch,COALESCE(input.revision,0) AS input_revision
             FROM storage_v11_owner_links link
             JOIN storage_owner_revisions owner ON owner.owner_digest=link.owner_digest
             JOIN participants participant ON participant.id=link.participant_id
               AND participant.state='active'
+            LEFT JOIN community_analytical_input_versions input ON input.participant_id=link.participant_id
             WHERE link.owner_digest=? AND link.state='active' AND owner.state='active'
             LIMIT 2`).bind(candidate.ownerDigest)
-            .first<{ participant_id: string; revision: number; authority_epoch: number }>();
+            .first<{ participant_id: string; revision: number; authority_epoch: number; input_revision:number }>();
           if (owner && Number.isSafeInteger(owner.revision) && owner.revision >= 1
             && Number.isSafeInteger(owner.authority_epoch) && owner.authority_epoch >= 1) {
             // The candidate digest is the effective daily projection's
@@ -1553,7 +1568,7 @@ export function createCacheRetentionDaySourceBuild(options: {
             try {
               const effectiveOwner: StorageCommunityOwner = {
                 participantId: owner.participant_id, ownerDigest: candidate.ownerDigest,
-                inputRevision: 1, ownerRevision: owner.revision,
+                inputRevision: owner.input_revision, ownerRevision: owner.revision,
                 authorityEpoch: owner.authority_epoch,
                 hasV1: false, hasV11: false, hasV12: true, hasLegacy: false,
                 hasEffective: true,
@@ -1582,9 +1597,13 @@ export function createCacheRetentionDaySourceBuild(options: {
                 }
               }
               if (dependenciesMatch) {
-                build = createCacheRetentionEffectiveDayBuild({ source: options.source, target: options.target,
+                const native = createCacheRetentionEffectiveDayBuild({ source: options.source, target: options.target,
                   sourceNamespace: options.sourceNamespace, ownerDigest: candidate.ownerDigest,
                   ownerRevision: owner.revision, authorityEpoch: owner.authority_epoch, now });
+                build = options.sharedFeatures && budget.remainingSharedQueries
+                  ? createCacheRetentionSharedFeatureDayBuild({source:options.source,target:options.target,
+                    sourceNamespace:options.sourceNamespace,owner:effectiveOwner as StorageCommunityOwner & {ownerDigest:string},now,native})
+                  : native;
               }
             } catch (error) {
               if (error instanceof CacheRetentionDeferredError) throw error;
@@ -1645,8 +1664,9 @@ export interface CacheRetentionDayLaneResult {
    * indistinguishable from "never opened" without this counter. */
   skipped: number;
   candidates: number;
-  /** Source statements the build spent. The lane's own meter wraps only the
-   * target, so the caller deducts this from the pass meter. */
+  /** Conservative build allowance spent. With shared features this also
+   * counts target feature statements; the outer D1 meter counts each actual
+   * source and target statement once. */
   sourceQueriesUsed: number;
 }
 
@@ -1769,6 +1789,7 @@ const SELECTION_SQL = `SELECT * FROM (
  */
 export async function advanceCacheRetentionDayLane(options: {
   target: D1Database; sourceId: string; build: CacheRetentionDayBuild;
+  sharedRemainingQueries?: () => number;
   deadlineMs: number; remainingQueries: number; maxDays?: number; maxWrites?: number;
   fromDay?: string; now?: () => number; sourceQueries?: number;
   /** Deterministic owner sharding: every owner digest falls in exactly one of
@@ -1814,7 +1835,7 @@ export async function advanceCacheRetentionDayLane(options: {
   let affordable = options.remainingQueries - 1;
   const sourceAllowance = options.sourceQueries ?? 256;
   const sourceBudget: CacheRetentionBuildBudget = { deadlineMs: options.deadlineMs,
-    remainingQueries: sourceAllowance };
+    remainingQueries: sourceAllowance,remainingSharedQueries:options.sharedRemainingQueries };
   const spent = (): number => sourceAllowance - sourceBudget.remainingQueries;
   for (const row of candidates) {
     if (affordable < perDay) {

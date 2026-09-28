@@ -14,14 +14,14 @@ import { appendEffectiveQuotaDay, finishEffectiveQuotaDay, foldEffectiveQuotaDay
   mapEffectiveQuotaPageRow, validEffectiveQuotaDay, validEffectiveQuotaDayPending,
   type EffectiveQuotaDay, type EffectiveQuotaDayPending } from './effective-quota-day';
 import {appendEffectiveUsageDay,mapEffectiveUsagePageRow,validEffectiveUsageDay,validEffectiveUsageDayPending,
-  type EffectiveUsageDay,type EffectiveUsageDayPending} from './effective-usage-day';
-import type {StorageEffectiveUsagePreparation} from './storage-effective-usage-days';
+  type EffectiveUsageDay,type EffectiveUsageDayPending,type StorageEffectiveUsagePreparation} from './effective-usage-day';
 import {MAX_WINDOWED_USAGE_ROWS} from './quota-analysis-v1';
 
 export const STORAGE_EFFECTIVE_READER_METHOD = 'effective-usage-owner-day-v1';
 const DAY_MS = 86_400_000;
 const MAX_EFFECTIVE_DEPENDENCY_ROWS = 30_000;
 const MAX_EFFECTIVE_DEPENDENCY_BYTES = 4 * 1024 * 1024;
+const EFFECTIVE_DEPENDENCY_BATCH_DAYS = 16;
 const V12_DEPENDENCY_TABLES = [
   'telemetry_v12_runtime', 'telemetry_v12_device_capabilities',
   'accountless_v12_device_authorizations', 'telemetry_v12_day_manifests',
@@ -163,7 +163,15 @@ async function v12DependencySchema(source:D1Database):Promise<boolean>{
  * headers. This mirrors the effective reader's cross-family occurrence
  * expansion without storing one dependency row per in-window record. */
 async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCommunityOwner,
-  sourceNamespace:string,fromDay:string,throughDay:string,includeV12:boolean,includeSessions:boolean):Promise<readonly Record<string,unknown>[]> {
+  sourceNamespace:string,fromDay:string,throughDay:string,includeV12:boolean,includeSessions:boolean,
+  selectedDays?:readonly string[]):Promise<readonly Record<string,unknown>[]|undefined> {
+  const batched=selectedDays!==undefined;
+  const target=(alias='')=>batched?`${alias?`${alias}.`:''}target_day,`:'';
+  const selectionScope=batched?'selection_scopes':'scope';
+  const outside=(column:string)=>batched?`${column}<>wanted.target_day`:`(${column}<s.from_day OR ${column}>s.through_day)`;
+  const physicalOutside=batched?'':`AND (scoped_record.observed_day<CAST(s.from_ms/86400000 AS INTEGER)
+            OR scoped_record.observed_day>=CAST(s.through_ms/86400000 AS INTEGER))`;
+  const selectedOutside=batched?`AND scoped_record.observed_day<>CAST(strftime('%s',wanted.target_day)/86400 AS INTEGER)`:'';
   // These fragments are static allowlisted SQL, never caller input. Keeping
   // the stream set in the dependency identity prevents a session-enabled
   // reader from reusing a usage/quota-only checkpoint.
@@ -218,15 +226,20 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
           WHERE complete.chunk_id=chunk.id)
     ),`:' ';
   const selectedV12=includeV12?`      UNION
-      SELECT v12_record.occurrence_id
+      SELECT ${target('s')}v12_record.occurrence_id
         FROM retained_v12_chunks chunk
-        JOIN scope s ON chunk.source_day>=s.from_day AND chunk.source_day<=s.through_day
+        JOIN ${selectionScope} s ON chunk.source_day>=s.from_day AND chunk.source_day<=s.through_day
         CROSS JOIN telemetry_v12_records v12_record ON v12_record.chunk_id=chunk.id
           AND v12_record.manifest_id=chunk.manifest_id AND v12_record.stream=chunk.stream
 ` : '';
-  const rows=(await source.prepare(`WITH scope(owner_digest,participant_id,source_namespace,from_day,through_day,from_ms,through_ms) AS (
+  const rows=(await source.prepare(`${batched?'/* batched occurrence links */ ':''}WITH scope(owner_digest,participant_id,source_namespace,from_day,through_day,from_ms,through_ms) AS (
       SELECT ?,?,?,?,?,?,?
-    ), complete_v1_chunks AS MATERIALIZED (
+    ), ${batched?`selection_scopes(target_day,owner_digest,participant_id,source_namespace,from_day,through_day,from_ms,through_ms) AS MATERIALIZED (
+      SELECT json_extract(day.value,'$[0]'),s.owner_digest,s.participant_id,s.source_namespace,
+        json_extract(day.value,'$[0]'),json_extract(day.value,'$[0]'),
+        json_extract(day.value,'$[1]'),json_extract(day.value,'$[2]')
+        FROM scope s CROSS JOIN json_each(?) day
+    ), `:''}complete_v1_chunks AS MATERIALIZED (
       SELECT chunk.id FROM scope s
         JOIN telemetry_v1_chunks chunk ON chunk.participant_id=s.participant_id
        WHERE chunk.stream IN ${sourceStreams} AND chunk.superseded_at IS NULL
@@ -238,9 +251,9 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
         JOIN telemetry_v11_chunks chunk ON chunk.participant_id=s.participant_id
        WHERE chunk.stream IN ${sourceStreams}
          AND chunk.record_count=${TYPED_V11_CHUNK_PROOF_COUNT_SQL}
-    ), ${retainedV12} selected(occurrence_id) AS MATERIALIZED (
-      SELECT scoped_record.occurrence_id
-        FROM scope s
+    ), ${retainedV12} selected(${target()}occurrence_id) AS MATERIALIZED (
+      SELECT ${target('s')}scoped_record.occurrence_id
+        FROM ${selectionScope} s
         CROSS JOIN typed_v1_owner_memberships scoped_owner
           ON scoped_owner.participant_id=s.participant_id
         CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
@@ -268,8 +281,8 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
          AND r.format_code=10 AND r.stream IN ${sourceStreams}
          AND r.observed_day>=s.from_day AND r.observed_day<=s.through_day
       UNION
-      SELECT scoped_record.occurrence_id
-        FROM scope s
+      SELECT ${target('s')}scoped_record.occurrence_id
+        FROM ${selectionScope} s
         CROSS JOIN typed_v11_owner_memberships scoped_owner
           ON scoped_owner.participant_id=s.participant_id
         CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
@@ -303,16 +316,16 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
          AND r.owner_id=typed_owner.id AND r.format_code=11 AND r.stream IN ${sourceStreams}
          AND r.observed_day>=s.from_day AND r.observed_day<=s.through_day
       UNION
-      SELECT h.occurrence_id
+      SELECT ${target('s')}h.occurrence_id
         FROM telemetry_usage_correction_facts f
         JOIN telemetry_usage_correction_history h ON h.id=f.history_id
-        JOIN scope s ON h.participant_id=s.participant_id AND lower(hex(h.owner_digest))=s.owner_digest
+        JOIN ${selectionScope} s ON h.participant_id=s.participant_id AND lower(hex(h.owner_digest))=s.owner_digest
        WHERE h.event_time_ms>=s.from_ms AND h.event_time_ms<s.through_ms
-${selectedV12}    ), linked(family,source_day,source_key,source_digest) AS (
+${selectedV12}    ), linked(${target()}family,source_day,source_key,source_digest) AS (
       /* Only outside-window chunk headers enter the dependency. Collapse
        * matching occurrences here instead of materializing each record's
        * decoded identity and digest before throwing those columns away. */
-      SELECT DISTINCT 'v1',r.observed_day,chunk.id,chunk.chunk_digest
+      SELECT DISTINCT ${target('wanted')}'v1',r.observed_day,chunk.id,chunk.chunk_digest
         FROM scope s
         CROSS JOIN typed_v1_owner_memberships scoped_owner
           ON scoped_owner.participant_id=s.participant_id
@@ -320,10 +333,9 @@ ${selectedV12}    ), linked(family,source_day,source_key,source_digest) AS (
           ON scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=10
           AND scoped_record.stream IN ${typedStreams}
           AND scoped_record.occurrence_id IN (SELECT occurrence_id FROM selected)
-          AND (scoped_record.observed_day<CAST(s.from_ms/86400000 AS INTEGER)
-            OR scoped_record.observed_day>=CAST(s.through_ms/86400000 AS INTEGER))
+          ${physicalOutside}
         CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
-        JOIN selected wanted ON wanted.occurrence_id=scoped_record.occurrence_id
+        JOIN selected wanted ON wanted.occurrence_id=scoped_record.occurrence_id ${selectedOutside}
         JOIN typed_v1_admission_state v1 ON v1.id=1 AND v1.runtime_contract_version=1
           AND v1.source_namespace=s.source_namespace
         JOIN typed_v1_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
@@ -340,9 +352,9 @@ ${selectedV12}    ), linked(family,source_day,source_key,source_digest) AS (
        WHERE r.participant_id=s.participant_id AND r.source_namespace=v1.source_namespace
          AND r.namespace_id=v1.namespace_id AND r.owner_id=typed_owner.id
          AND r.format_code=10 AND r.stream IN ${sourceStreams}
-         AND (r.observed_day<s.from_day OR r.observed_day>s.through_day)
+         AND ${outside('r.observed_day')}
       UNION
-      SELECT DISTINCT 'v11',domain_day.observed_day,chunk.id||':'||manifest.id,manifest.manifest_digest
+      SELECT DISTINCT ${target('wanted')}'v11',domain_day.observed_day,chunk.id||':'||manifest.id,manifest.manifest_digest
         FROM scope s
         CROSS JOIN typed_v11_owner_memberships scoped_owner
           ON scoped_owner.participant_id=s.participant_id
@@ -350,10 +362,9 @@ ${selectedV12}    ), linked(family,source_day,source_key,source_digest) AS (
           ON scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=11
           AND scoped_record.stream IN ${typedStreams}
           AND scoped_record.occurrence_id IN (SELECT occurrence_id FROM selected)
-          AND (scoped_record.observed_day<CAST(s.from_ms/86400000 AS INTEGER)
-            OR scoped_record.observed_day>=CAST(s.through_ms/86400000 AS INTEGER))
+          ${physicalOutside}
         CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
-        JOIN selected wanted ON wanted.occurrence_id=scoped_record.occurrence_id
+        JOIN selected wanted ON wanted.occurrence_id=scoped_record.occurrence_id ${selectedOutside}
         JOIN typed_v11_admission_state v11 ON v11.id=1 AND v11.runtime_contract_version=1
         JOIN typed_v11_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
         JOIN typed_telemetry_owners typed_owner ON typed_owner.id=owner_membership.typed_owner_id
@@ -376,8 +387,15 @@ ${selectedV12}    ), linked(family,source_day,source_key,source_digest) AS (
        WHERE v11.source_namespace=s.source_namespace AND r.participant_id=s.participant_id
          AND r.source_namespace=v11.source_namespace AND r.namespace_id=v11.namespace_id
          AND r.owner_id=typed_owner.id AND r.format_code=11 AND r.stream IN ${sourceStreams}
-         AND (domain_day.observed_day<s.from_day OR domain_day.observed_day>s.through_day)
-${includeV12?`      UNION
+         AND ${outside('domain_day.observed_day')}
+${includeV12?batched?`      UNION
+      SELECT DISTINCT wanted.target_day,'v12',chunk.source_day,chunk.id,chunk.manifest_digest
+        FROM retained_v12_chunks chunk
+        JOIN telemetry_v12_records r ON r.chunk_id=chunk.id
+          AND r.manifest_id=chunk.manifest_id AND r.stream=chunk.stream
+        JOIN selected wanted ON wanted.occurrence_id=r.occurrence_id
+       WHERE chunk.source_day<>wanted.target_day
+`:`      UNION
       SELECT 'v12',chunk.source_day,chunk.id,chunk.manifest_digest
         FROM retained_v12_chunks chunk
         JOIN scope s
@@ -391,34 +409,38 @@ ${includeV12?`      UNION
        * triggers are the only delete path and the caller's owner CAS fences
        * that transition, so an outside-day count plus both monotonic INTEGER
        * PRIMARY KEY frontiers is an exact compact identity. */
-      SELECT date(h.event_time_ms/1000,'unixepoch') AS source_day,
+      SELECT ${target('wanted')}date(h.event_time_ms/1000,'unixepoch') AS source_day,
         count(*) AS history_fact_count,max(h.id) AS max_history_id,max(f.id) AS max_fact_id
         FROM telemetry_usage_correction_facts f
         JOIN telemetry_usage_correction_history h ON h.id=f.history_id
         JOIN scope s ON h.participant_id=s.participant_id AND lower(hex(h.owner_digest))=s.owner_digest
         JOIN selected wanted ON wanted.occurrence_id=h.occurrence_id
-       WHERE date(h.event_time_ms/1000,'unixepoch')<s.from_day
-          OR date(h.event_time_ms/1000,'unixepoch')>s.through_day
-       GROUP BY date(h.event_time_ms/1000,'unixepoch')
+       WHERE ${outside("date(h.event_time_ms/1000,'unixepoch')")}
+       GROUP BY ${target('wanted')}date(h.event_time_ms/1000,'unixepoch')
     ), outside_headers AS (
-      SELECT family,NULL AS occurrence_id,source_day,NULL AS record_day,NULL AS observed_at_ms,
+      SELECT ${target('l')}family,NULL AS occurrence_id,source_day,NULL AS record_day,NULL AS observed_at_ms,
         source_key,source_digest,NULL AS canonical_digest,NULL AS record_digest,NULL AS base_digest,
         NULL AS history_fact_count,NULL AS max_history_id,NULL AS max_fact_id
         FROM linked l JOIN scope s
-       WHERE l.source_day<s.from_day OR l.source_day>s.through_day
-       GROUP BY family,source_day,source_key,source_digest
+       WHERE ${batched?'l.source_day<>l.target_day':'l.source_day<s.from_day OR l.source_day>s.through_day'}
+       GROUP BY ${target('l')}family,source_day,source_key,source_digest
       UNION ALL
-      SELECT 'correction',NULL,source_day,NULL,NULL,
+      SELECT ${target()}'correction',NULL,source_day,NULL,NULL,
         'correction-day:'||source_day,NULL,NULL,NULL,NULL,
         history_fact_count,max_history_id,max_fact_id
         FROM correction_frontiers
     )
-    SELECT family,occurrence_id,source_day,record_day,observed_at_ms,source_key,source_digest,canonical_digest,
+    SELECT ${target()}family,occurrence_id,source_day,record_day,observed_at_ms,source_key,source_digest,canonical_digest,
       record_digest,base_digest,history_fact_count,max_history_id,max_fact_id
-      FROM outside_headers ORDER BY family,source_day,source_key LIMIT ?`)
+      FROM outside_headers ORDER BY ${target()}family,source_day,source_key LIMIT ?`)
     .bind(owner.ownerDigest,owner.participantId,sourceNamespace,fromDay,throughDay,
       Date.parse(`${fromDay}T00:00:00.000Z`),Date.parse(`${throughDay}T00:00:00.000Z`)+DAY_MS,
+      ...(selectedDays?[JSON.stringify(selectedDays.map(day=>[day,Date.parse(day),Date.parse(day)+DAY_MS]))]:[]),
       MAX_EFFECTIVE_DEPENDENCY_ROWS+1).all<Record<string,unknown>>()).results;
+  // The aggregate is optional: a batch too large for one bounded result must
+  // not make an otherwise valid singleton dependency unavailable.
+  if(batched&&(rows.length>MAX_EFFECTIVE_DEPENDENCY_ROWS
+    ||bytes(canonicalJson(rows))>MAX_EFFECTIVE_DEPENDENCY_BYTES))return undefined;
   if(rows.length>MAX_EFFECTIVE_DEPENDENCY_ROWS)throw fail();
   return dependencyRows(rows);
 }
@@ -572,20 +594,22 @@ export async function effectiveHistoryDependency(source:D1Database,owner:Storage
   const headers=await readEffectiveHistoryHeaders(source,owner,sourceNamespace,fromDay,throughDay,includeSessions);
   if(!headers)throw fail();
   const occurrenceLinks=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,fromDay,throughDay,headers.v12Available,includeSessions);
+  if(!occurrenceLinks)throw fail();
   return assembleEffectiveHistoryDependency(owner,fromDay,throughDay,includeSessions,headers,occurrenceLinks);
 }
 
 /** Share bounded immutable headers across selected days while preserving each
- * day's exact occurrence-link expansion. A whole-window link query cannot be
- * split: another selected day is still outside THIS day's dependency. Callers
- * keep the existing owner fences around this optional snapshot and its reads. */
+ * day's exact occurrence-link expansion. Optional batches carry a target day
+ * through every join: another selected day is still outside THIS dependency.
+ * Callers keep the existing owner fences around this snapshot and its reads. */
 export async function createEffectiveHistoryDayDependencyReader(source:D1Database,owner:StorageCommunityOwner,
   sourceNamespace:string,days:readonly string[],
-  options:{includeSessions?:boolean;canContinue?:()=>boolean}={}):Promise<{
+  options:{includeSessions?:boolean;canContinue?:()=>boolean;occurrenceLinks?:'per-day'|'batched'}={}):Promise<{
     readDigest(day:string):Promise<string|undefined>;
   }|undefined>{
   if(!Array.isArray(days)||days.length>101||!options||typeof options!=='object'||Array.isArray(options)
-    ||Object.keys(options).some(key=>key!=='includeSessions'&&key!=='canContinue')
+    ||Object.keys(options).some(key=>key!=='includeSessions'&&key!=='canContinue'&&key!=='occurrenceLinks')
+    ||(options.occurrenceLinks!==undefined&&options.occurrenceLinks!=='per-day'&&options.occurrenceLinks!=='batched')
     ||(options.canContinue!==undefined&&typeof options.canContinue!=='function'))throw fail();
   if(days.some((day,index)=>typeof day!=='string'||(index>0&&days[index-1]!>=day)))throw fail();
   for(const day of days)validDependencyDay(day);
@@ -611,11 +635,53 @@ export async function createEffectiveHistoryDayDependencyReader(source:D1Databas
     }
   }
   const v12Available=headers.v12Available;
-  return {async readDigest(day:string){
+  const selectedDays=[...days];
+  const oversizedBlocks=new Set<number>();
+  let blockIndex=-1;
+  let blockLinks=new Map<string,readonly Record<string,unknown>[]>();
+  const readDigest=async(day:string):Promise<string|undefined>=>{
     const dayHeaders=selected.get(day);if(!dayHeaders)throw fail();
     if(options.canContinue?.()===false)return undefined;
-    const links=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,day,day,v12Available,includeSessions);
+    let links:readonly Record<string,unknown>[]|undefined;
+    if(options.occurrenceLinks==='batched'){
+      const index=Math.floor(selectedDays.indexOf(day)/EFFECTIVE_DEPENDENCY_BATCH_DAYS);
+      if(index!==blockIndex){
+        // Retain only one bounded block. Concurrent calls are serialized below
+        // so two block loads cannot transiently accumulate retained results.
+        blockLinks.clear();blockIndex=-1;
+        if(!oversizedBlocks.has(index)){
+          const block=selectedDays.slice(index*EFFECTIVE_DEPENDENCY_BATCH_DAYS,(index+1)*EFFECTIVE_DEPENDENCY_BATCH_DAYS);
+          const rows=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,
+            block[0]!,block.at(-1)!,v12Available,includeSessions,block);
+          if(options.canContinue?.()===false)return undefined;
+          if(rows){
+            const partition=new Map(block.map(targetDay=>[targetDay,[] as Record<string,unknown>[]]));
+            for(const row of rows){
+              const {target_day:targetDay,...dependency}=row;
+              if(typeof targetDay!=='string'||!partition.has(targetDay))throw fail();
+              partition.get(targetDay)!.push(dependency);
+            }
+            blockLinks=new Map([...partition].map(([targetDay,values])=>[targetDay,dependencyRows(values)]));
+            blockIndex=index;
+          }else oversizedBlocks.add(index);
+        }
+      }
+      links=blockLinks.get(day);
+    }
+    if(!links){
+      if(options.canContinue?.()===false)return undefined;
+      links=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,day,day,v12Available,includeSessions);
+    }
+    if(!links)throw fail();
+    if(options.canContinue?.()===false)return undefined;
     return sha256Hex(canonicalJson(assembleEffectiveHistoryDependency(owner,day,day,includeSessions,dayHeaders,links)));
+  };
+  let pending:Promise<unknown>=Promise.resolve();
+  return {readDigest(day:string){
+    if(options.occurrenceLinks!=='batched')return readDigest(day);
+    const result=pending.then(()=>readDigest(day));
+    pending=result.then(()=>undefined,()=>undefined);
+    return result;
   }};
 }
 export async function effectiveHistoryPin(owner:StorageCommunityOwner,fromDay:string,throughDay:string,
@@ -655,6 +721,8 @@ export async function advanceStorageEffectiveAnalysis(input:{
     preferSinglePageCheckpoint?:()=>boolean;
   };
   preparedUsage?:StorageEffectiveUsagePreparation;
+  /** Complete durable ordered features; caller isolates its checkpoint key. */
+  preparedUsageReader?:import('./quota-analysis-v11').V11PreparedUsageReader;
   /** The durable group boundary is the only place to start a cache-only step. */
   allowQuotaCoverage?:boolean;
   budget:{remainingQueries:number;deadlineMs:number;now?:()=>number};
@@ -808,6 +876,7 @@ export async function advanceStorageEffectiveAnalysis(input:{
   }
   const days=checkpoint.effectiveDays.usage;
   const options={nowMs:input.nowMs,sourcePin:pin,quotaAcquisition:checkpoint.acquisition,
+    ...(input.preparedUsageReader?{preparedUsageReader:input.preparedUsageReader}:{}),
     scalarRequested:input.metric==='fits',effectiveUsageReader:{days,async readPage(cursor:{day:string;afterTime:string;afterOccurrence:string}){
       const page=await read(cursor.day,'usage',cursor.afterOccurrence?{
         observedAtMs:Date.parse(cursor.afterTime),occurrenceId:cursor.afterOccurrence}:undefined);

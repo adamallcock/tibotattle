@@ -19,6 +19,7 @@ import { readEffectiveTelemetryOwnerDayPage, type EffectiveTelemetryStream } fro
 import { countStorageDailyContributingDevices, STORAGE_DAILY_DEVICE_METHOD } from './storage-community-daily-devices';
 import type { EffectiveUsageReaderCursor } from './telemetry-usage-effective-reader';
 import { effectiveHistoryDependency } from './storage-effective-history';
+import { advanceSharedAnalyticsFeatureDay, type SharedAnalyticsFeatureBudget } from './storage-analytics-shared-features';
 
 export interface StorageCommunityDailyBindings {
   source: D1Database; target: D1Database; sourceId: string; sourceNamespace: string;
@@ -166,17 +167,36 @@ async function advanceEffectiveDailyValues(options: StorageCommunityDailyBinding
 }
 
 async function ownerPage(options: StorageCommunityDailyBindings, observedDay: string,
-  owner: StorageCommunityOwner, effectiveEnabled: boolean, old?: OwnerCache): Promise<'advanced'|'deferred'> {
+  owner: StorageCommunityOwner, effectiveEnabled: boolean, old?: OwnerCache,
+  sharedFeatures = false, sharedFeatureBudget?: SharedAnalyticsFeatureBudget): Promise<'advanced'|'deferred'> {
   const {source,target,sourceId,sourceNamespace}=options, ownerDigest=owner.ownerDigest!;
   const effective = usesEffectiveReader(owner,effectiveEnabled);
-  const dependencyDigest = effective ? await sha256Hex(canonicalJson(await effectiveHistoryDependency(
+  let sharedValues: V11DailyProjectionValues | null = null;
+  let dependencyDigest: string | null = null;
+  if (effective && sharedFeatures && sharedFeatureBudget) {
+    try {
+      const feature = await advanceSharedAnalyticsFeatureDay({source,target,sourceId,sourceNamespace,
+        owner:{...owner,ownerDigest},day:observedDay,budget:sharedFeatureBudget});
+      if (feature.state === 'deferred') return 'deferred';
+      if (feature.state === 'complete') {
+        validateV11DailyProjectionValues(feature.value.daily);
+        sharedValues = feature.value.daily;
+        dependencyDigest = feature.dependencyDigest;
+      }
+    } catch (error) {
+      // An older target without the optional feature migration retains the
+      // existing effective reader. Other failures remain visible to the pass.
+      if (!(error instanceof Error) || !/no such table|no such column/i.test(error.message)) throw error;
+    }
+  }
+  dependencyDigest ??= effective ? await sha256Hex(canonicalJson(await effectiveHistoryDependency(
     source,owner,sourceNamespace,observedDay,observedDay,{includeSessions:true}))) : null;
   const oldCursor = effective && old?.source_format === 'effective' && old.method === METHOD
     ? readEffectiveCursor(old.fingerprint,dependencyDigest!) : null;
   // A later upload for another day advances the owner's authority revision,
   // but does not discard a partial fold of this unchanged closed day. The
   // occurrence reader and publication still enforce the fresh authority CAS.
-  const reuse = effective ? oldCursor !== null : current(old,owner,effectiveEnabled);
+  const reuse = effective ? oldCursor !== null && sharedValues === null : current(old,owner,effectiveEnabled);
   const progress = old?.progress_revision ?? 0;
   const retained=reuse?await target.prepare(`SELECT CASE WHEN length(CAST(values_json AS BLOB))<=? THEN values_json ELSE NULL END AS values_json
     FROM analytics_community_daily_owners WHERE source_id=? AND day=? AND owner_digest=? AND progress_revision=?`)
@@ -186,6 +206,10 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
   validateV11DailyProjectionValues(values);
   let nextIndex = 0, fingerprint: string|null = null, complete = true;
   if (usesEffectiveReader(owner,effectiveEnabled)) {
+    if (sharedValues !== null) {
+      values = sharedValues;
+      fingerprint = effectiveCursorJson({usage:null,quota:null,session:null},dependencyDigest!);
+    } else {
     let cursor = reuse ? oldCursor : emptyEffectiveCursor();
     if (cursor === null) {
       // A malformed or pre-contract cursor cannot be treated as complete. The
@@ -198,6 +222,7 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
     values = advanced.values;
     fingerprint = effectiveCursorJson(cursor,dependencyDigest!);
     complete = advanced.complete;
+    }
   } else if (owner.hasV11) {
     const ready = await target.prepare(`SELECT 1 AS ready FROM analytics_owner_state o
       JOIN analytics_v11_owner_heads h ON h.source_id=o.source_id AND h.owner_digest=o.owner_digest
@@ -316,6 +341,7 @@ const hardAuthority=(authority:StorageCommunityAuthority)=>({sourceId:authority.
  * already names every day whose inputs actually changed. */
 export async function advanceNextStorageCommunityDaily(options:StorageCommunityDailyBindings & {
   nowMs?:number;maxOwners?:number;preferStaleHead?:boolean;
+  sharedFeatures?:boolean;sharedFeatureBudget?:SharedAnalyticsFeatureBudget;
   /** Days already deferred in this pass; they yield to the next candidate. */
   skipDays?:readonly string[];
 }):Promise<(StorageCommunityDailyProgress&{day:string})|{state:'idle';ownersAdvanced:0}> {
@@ -351,8 +377,10 @@ export async function advanceNextStorageCommunityDaily(options:StorageCommunityD
  * appends; a large v1 day resumes at its exact immutable chunk fingerprint. */
 export async function advanceStorageCommunityDaily(options: StorageCommunityDailyBindings & {
   day:string;nowMs?:number;maxOwners?:number;
+  sharedFeatures?:boolean;sharedFeatureBudget?:SharedAnalyticsFeatureBudget;
 }):Promise<StorageCommunityDailyProgress> {
   const {source,target,sourceId}=options;day(options.day);await assertTarget(options);
+  if (options.sharedFeatures === true && !options.sharedFeatureBudget) throw unavailable();
   const maxOwners=options.maxOwners??4;
   if(!Number.isSafeInteger(maxOwners)||maxOwners<1||maxOwners>16)throw unavailable();
   const initialOwners=await cohort(source,false);
@@ -379,7 +407,8 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
     const row=cache.get(owner.ownerDigest!);
     if(current(row,owner,effectiveEnabled)&&row.complete===1)continue;
     if(ownersAdvanced>=maxOwners)return {state:'progress',ownersAdvanced};
-    if(await ownerPage(options,options.day,owner,effectiveEnabled,row)==='deferred')return deferred('projection_pending',ownersAdvanced);
+    if(await ownerPage(options,options.day,owner,effectiveEnabled,row,
+      options.sharedFeatures,options.sharedFeatureBudget)==='deferred')return deferred('projection_pending',ownersAdvanced);
     ownersAdvanced++;
   }
   // Read all selected values and the queue revision in one target snapshot.

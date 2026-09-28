@@ -19,6 +19,8 @@ import { createD1InvocationBudget, D1InvocationBudgetExceededError } from './d1-
  */
 export interface CacheRetentionDayWorkerEnv {
  CACHE_RETENTION_BUILD?:'disabled'|'enabled';
+ /** Durable shared owner-day feature read is independent of lane admission. */
+ CACHE_RETENTION_SHARED_FEATURES?:'disabled'|'enabled';
  STORAGE_SOURCE_ID?:string;
  TELEMETRY_STORAGE_NAMESPACE?:string;
  STORAGE_INGESTION_DB?:D1Database;
@@ -96,6 +98,9 @@ export async function runCacheRetentionDaySchedule(env:CacheRetentionDayWorkerEn
  if(!cacheRetentionBuildEnabled(env))return;
  if(!env.STORAGE_INGESTION_DB||!env.STORAGE_ANALYTICS_DB||!env.STORAGE_SOURCE_ID
   ||!env.TELEMETRY_STORAGE_NAMESPACE
+  ||(env.CACHE_RETENTION_SHARED_FEATURES!==undefined
+    &&env.CACHE_RETENTION_SHARED_FEATURES!=='enabled'
+    &&env.CACHE_RETENTION_SHARED_FEATURES!=='disabled')
   ||(env.CACHE_RETENTION_FROM_DAY!==undefined&&!DAY.test(env.CACHE_RETENTION_FROM_DAY))
   ||(options?.nowMs!==undefined&&(!Number.isSafeInteger(options.nowMs)||options.nowMs<0)))throw invalid();
  if(CACHE_RETENTION_WORKER_WRITES>CACHE_RETENTION_MAX_WRITES)throw invalid();
@@ -110,7 +115,9 @@ export async function runCacheRetentionDaySchedule(env:CacheRetentionDayWorkerEn
   const target=meter.wrap(env.STORAGE_ANALYTICS_DB);
   const source=meter.wrap(env.STORAGE_INGESTION_DB);
   const lane=await advanceCacheRetentionDayLane({target,sourceId:env.STORAGE_SOURCE_ID,
-   build:createCacheRetentionDaySourceBuild({source,target,sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE}),
+   build:createCacheRetentionDaySourceBuild({source,target,sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE,
+    sharedFeatures:env.CACHE_RETENTION_SHARED_FEATURES==='enabled'}),
+   sharedRemainingQueries:()=>meter.remainingQueries,
    deadlineMs:started+CACHE_RETENTION_WORKER_WINDOW_MS,
    remainingQueries:CACHE_RETENTION_WORKER_TARGET_QUERIES,
    sourceQueries:CACHE_RETENTION_WORKER_QUERIES-CACHE_RETENTION_WORKER_TARGET_QUERIES,

@@ -27,6 +27,11 @@ import { advanceStorageEffectiveAnalysis, assertEffectiveHistoryOwner, effective
 import type { GraphDayProjection } from './graph-day-projection-values';
 import { createStorageEffectiveQuotaPreparation } from './storage-effective-quota-days';
 import { createStorageEffectiveUsagePreparation } from './storage-effective-usage-days';
+import { effectiveUsageWindowRepresentable } from './effective-usage-day';
+import { readSharedAnalyticsFeatureWindow, advanceSharedAnalyticsFeatureDay } from './storage-analytics-shared-features';
+import type { SharedAnalyticsFeatureDay } from './analytics-shared-features';
+import type { V11PreparedUsageReader } from './quota-analysis-v11';
+import { readEffectiveTelemetryOwnerDays } from './telemetry-usage-effective-reader';
 import { loadStorageHistoryCheckpoint, readStorageHistoryCheckpointHead, saveStorageHistoryCheckpoint, retireStorageHistoryCheckpoint,
   storageHistoryCheckpointParts,
   type StorageHistoryCheckpoint,type StorageHistoryKey,type StorageHistoryLoadCursor,
@@ -58,10 +63,11 @@ export function storageGraphEffectiveCheckpointMethod(metric:'fits'|'model'):str
  * analytical result identities retain their existing dependency. Disabling
  * preparation resumes the original key, and abandoned method-key tombstones
  * remain valid. Format 4 adds one independently resumable cache gap and a
- * durable ready-to-store value. Format 5 adds compact model usage preparation;
- * preceding formats are read only for adoption. */
-export async function storageGraphEffectiveCheckpointKey(key:StorageHistoryKey,preparedQuota=false,format:2|3|4|5=4):Promise<StorageHistoryKey> {
-  if(format!==2&&format!==3&&format!==4&&format!==5)throw fail();
+ * durable ready-to-store value. Format 5 adds compact model usage preparation.
+ * Format 6 uses shared priced usage with hashed session keys and ordinal
+ * cursors; it never adopts raw-session reductions from preceding formats. */
+export async function storageGraphEffectiveCheckpointKey(key:StorageHistoryKey,preparedQuota=false,format:2|3|4|5|6=4):Promise<StorageHistoryKey> {
+  if(format!==2&&format!==3&&format!==4&&format!==5&&format!==6)throw fail();
   return {...key,...(preparedQuota?{dependencyDigest:await sha256Hex(canonicalJson({
     checkpointFormat:`effective-quota-days-${format}`,dependencyDigest:key.dependencyDigest}))}:{})};
 }
@@ -488,22 +494,70 @@ function decoded(row:{payload_json:string;payload_fingerprint:string;source_kind
 
 /** Private read. A matching method/dependency proves data reuse; a final source
  * read independently proves authority. Cache timestamps never prove either. */
-export async function readStorageGraphResult(bindings:StorageAnalyticsBindings,scope:StorageGraphScope):Promise<StorageGraphResult|null> {
+async function readStorageGraphCache(bindings:StorageAnalyticsBindings,scope:StorageGraphScope):Promise<
+  {result:StorageGraphResult;inputRevision:number}|null> {
   if(bindings.sourceId!==scope.authority.sourceId||bindings.sourceNamespace!==scope.authority.sourceNamespace
     || bindings.source===bindings.target)throw fail();
   await targetReady(bindings.target,scope);
-  const row=await bindings.target.prepare(`SELECT payload_json,payload_fingerprint,payload_sha256,authority_json,source_kind
+  const row=await bindings.target.prepare(`SELECT payload_json,payload_fingerprint,payload_sha256,authority_json,source_kind,input_revision
     FROM analytics_community_graph_results WHERE source_id=? AND owner_digest=? AND metric=? AND day=?
       AND method=? AND dependency_digest=?`).bind(bindings.sourceId,scope.owner.ownerDigest,scope.metric,
         scope.day,STORAGE_GRAPH_METHOD,scope.dependencyDigest)
-    .first<{payload_json:string;payload_fingerprint:string;payload_sha256:string;authority_json:string;source_kind:StorageGraphSource}>();
+    .first<{payload_json:string;payload_fingerprint:string;payload_sha256:string;authority_json:string;
+      source_kind:StorageGraphSource;input_revision:number}>();
   if(!row)return null;
   let authority:StorageCommunityAuthority;try{authority=JSON.parse(row.authority_json)}catch{return null}
   if(!authority||!sameStorageCommunityCalculationAuthority(authority,scope.authority)
     ||new TextEncoder().encode(row.payload_json).byteLength>MAX_RESULT_BYTES
     ||await sha256Hex(row.payload_json)!==row.payload_sha256)return null;
   const result=decoded(row,scope);
-  return result && await current(bindings.source,scope)?result:null;
+  return result && await current(bindings.source,scope)?{result,inputRevision:row.input_revision}:null;
+}
+
+export async function readStorageGraphResult(bindings:StorageAnalyticsBindings,scope:StorageGraphScope):Promise<StorageGraphResult|null> {
+  return (await readStorageGraphCache(bindings,scope))?.result??null;
+}
+
+async function refreshStorageGraphInputRevision(bindings:StorageAnalyticsBindings,scope:StorageGraphScope):Promise<void> {
+  await bindings.target.prepare(`UPDATE analytics_community_graph_results SET input_revision=?
+    WHERE source_id=? AND owner_digest=? AND metric=? AND day=? AND method=? AND dependency_digest=?
+    AND input_revision<?`).bind(scope.owner.inputRevision,bindings.sourceId,scope.owner.ownerDigest,scope.metric,
+      scope.day,STORAGE_GRAPH_METHOD,scope.dependencyDigest,scope.owner.inputRevision).run();
+}
+
+async function retireCompletedEffectiveGraphCheckpoint(bindings:StorageAnalyticsBindings,scope:StorageGraphScope,
+  options:{preparedFold:boolean;format:4|5|6;remainingQueries:()=>number;deadlineMs:number;now:()=>number}):Promise<void> {
+  if(scope.source!=='effective'||!options.preparedFold||options.remainingQueries()<8
+    ||options.now()>=options.deadlineMs)return;
+  // Retire only after the exact result has passed readback and source fences.
+  // One bounded page installs the tombstone; ordinary cleanup drains its parts.
+  const originalKey:StorageHistoryKey={sourceId:bindings.sourceId,sourceNamespace:bindings.sourceNamespace,
+    ownerDigest:scope.owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
+    method:storageGraphEffectiveCheckpointMethod(scope.metric)};
+  const key=await storageGraphEffectiveCheckpointKey(originalKey,true,options.format);
+  try {
+    const head=await readStorageHistoryCheckpointHead({target:bindings.target,key});
+    if(head&&!head.retired)await retireStorageHistoryCheckpoint({target:bindings.target,key,
+      expectedHead:head.generation,maxWrites:2});
+  } catch(error) {
+    // A concurrent successor can win the head comparison. Later reuse or
+    // ordinary age/erasure cleanup retries without discarding a valid result.
+    if(!(error instanceof Error)||error.message!=='STORAGE_HISTORY_CHECKPOINT_UNAVAILABLE')throw error;
+  }
+}
+
+/** Reuse only: a miss never opens analytical work. Preserve the native proof
+ * refresh and prepared-checkpoint cleanup while avoiding an unchanged write. */
+export async function reuseStorageGraphResult(bindings:StorageAnalyticsBindings,scope:StorageGraphScope,
+  options:{remainingQueries:()=>number;deadlineMs:number;now:()=>number;
+    assertCurrent:()=>Promise<void>}):Promise<StorageGraphResult|null> {
+  const cached=await readStorageGraphCache(bindings,scope);
+  if(!cached)return null;
+  await options.assertCurrent();
+  if(cached.inputRevision<scope.owner.inputRevision)await refreshStorageGraphInputRevision(bindings,scope);
+  await retireCompletedEffectiveGraphCheckpoint(bindings,scope,{...options,preparedFold:true,
+    format:scope.metric==='model'?5:4});
+  return cached.result;
 }
 
 /** Runs the existing kernels against read-only source evidence. Only their
@@ -517,6 +571,11 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     preparedFold?:boolean;
     /** Local comparison/rollback seam; fits never consumes model summaries. */
     preparedEffectiveUsage?:boolean;
+    /** Durable shared day features, deployed independently of model batching. */
+    sharedFeatures?:boolean;
+    /** Private block fallback computes with native checkpoints but defers the
+     * public graph-row write until the complete block passes adoption proof. */
+    persistResult?:boolean;
     /** Bounded comparison/rollback of checkpoint frequency. Both modes use
      * the same reader, result identity and persisted checkpoint format. */
     effectiveCheckpointPages?:1|4}={}):Promise<
@@ -533,32 +592,15 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
   const originalEffectiveKey=():StorageHistoryKey=>({sourceId:bindings.sourceId,sourceNamespace:bindings.sourceNamespace,
     ownerDigest:scope.owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
     method:storageGraphEffectiveCheckpointMethod(scope.metric)});
-  let effectiveFormat:4|5=scope.metric==='model'&&options.preparedEffectiveUsage!==false?5:4;
-  const retireCompletedEffectiveCheckpoint=async()=>{
-    if(scope.source!=='effective'||!(options.preparedFold??STORAGE_V11_PREPARED_FOLD)
-      ||meter.remainingQueries<8||now()>=deadlineMs)return;
-    // Retire only after the exact result has passed readback and source fences.
-    // One bounded page installs the tombstone; existing cleanup Workers drain
-    // its remaining pages even though they do not know the prepared format.
-    const key=await storageGraphEffectiveCheckpointKey(originalEffectiveKey(),true,effectiveFormat);
-    try{
-      const head=await readStorageHistoryCheckpointHead({target:bindings.target,key});
-      if(head&&!head.retired)await retireStorageHistoryCheckpoint({target:bindings.target,key,
-        expectedHead:head.generation,maxWrites:2});
-    }catch(error){
-      // A concurrent successor can win the head comparison. The completed
-      // result remains valid; later reuse or ordinary age/erasure cleanup retries.
-      if(!(error instanceof Error)||error.message!=='STORAGE_HISTORY_CHECKPOINT_UNAVAILABLE')throw error;
-    }
-  };
+  let effectiveFormat:4|5|6=options.sharedFeatures===true?6:scope.metric==='model'&&options.preparedEffectiveUsage!==false?5:4;
+  const retireCompletedEffectiveCheckpoint=()=>retireCompletedEffectiveGraphCheckpoint(bindings,scope,{
+    preparedFold:options.preparedFold??STORAGE_V11_PREPARED_FOLD,format:effectiveFormat,
+    remainingQueries:()=>meter.remainingQueries,deadlineMs,now});
   const cached=await readStorageGraphResult(bindings,scope);
   if(cached) {
     // Small proof refresh only. The exact window dependency was recomputed;
     // the completed payload and its original analytical fingerprint are kept.
-    await bindings.target.prepare(`UPDATE analytics_community_graph_results SET input_revision=?
-      WHERE source_id=? AND owner_digest=? AND metric=? AND day=? AND method=? AND dependency_digest=?
-      AND input_revision<?`).bind(scope.owner.inputRevision,bindings.sourceId,scope.owner.ownerDigest,scope.metric,
-        scope.day,STORAGE_GRAPH_METHOD,scope.dependencyDigest,scope.owner.inputRevision).run();
+    if(options.persistResult!==false)await refreshStorageGraphInputRevision(bindings,scope);
     await retireCompletedEffectiveCheckpoint();
     return {state:'complete',result:cached,reused:true};
   }
@@ -602,19 +644,69 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       WHERE source_id=? AND owner_digest=? AND state='active' AND authority_epoch=?`)
       .bind(bindings.sourceId,scope.owner.ownerDigest,scope.owner.authorityEpoch).first<number>('ready');
     if(ownerReady!==1)return {state:'deferred',reason:'effective_owner_pending'};
-    const preparedQuota=(options.preparedFold??STORAGE_V11_PREPARED_FOLD)
+    let sharedDays:readonly SharedAnalyticsFeatureDay[]|undefined;
+    if(options.sharedFeatures===true){
+      // The effective inventory is a source-fenced proof of which days can
+      // contribute to this graph. Empty calendar dates need no durable row;
+      // repeatedly proving and storing them made sparse cold windows expensive.
+      // All selected populated days still require their exact dependency digest.
+      if(meter.remainingQueries<100||now()>=checkpointWorkDeadlineMs)
+        return {state:'deferred',reason:'shared_feature_query_budget'};
+      const inventory={sourceNamespace:bindings.sourceNamespace,ownerDigest:scope.owner.ownerDigest,
+        ownerRevision:scope.owner.ownerRevision,authorityEpoch:scope.owner.authorityEpoch,
+        fromDay:pin.fromDay,throughDay:pin.throughDay};
+      await assertEffectiveHistoryOwner(source,scope.owner);
+      const quotaDays=await readEffectiveTelemetryOwnerDays(source,{...inventory,stream:'quota'});
+      const usageDays=await readEffectiveTelemetryOwnerDays(source,{...inventory,stream:'usage'});
+      await assertEffectiveHistoryOwner(source,scope.owner);
+      const days=[...new Set([...quotaDays,...usageDays])].sort();
+      const sharedInput={...bindings,owner:scope.owner,
+        budget:{remainingQueries:()=>meter.remainingQueries,deadlineMs:checkpointWorkDeadlineMs,now}};
+      const window=days.length===0?{state:'complete' as const,values:[]}
+        :await readSharedAnalyticsFeatureWindow({...sharedInput,days});
+      if(window.state==='complete')sharedDays=window.values;
+      else if(window.state==='missing'){
+        const advanced=await advanceSharedAnalyticsFeatureDay({...sharedInput,day:window.day});
+        if(advanced.state!=='refused')return {state:'deferred',reason:advanced.state==='complete'
+          ?'shared_feature_prepared':`shared_feature_${advanced.reason}`};
+      }else if(window.state==='deferred')return {state:'deferred',reason:`shared_feature_${window.reason}`};
+      // Unrepresentable or pre-migration days retain the native calculation.
+      // No partial feature set is ever offered to a statistical finisher.
+    }
+    const bySharedDay=new Map(sharedDays?.map(value=>[value.day,value]));
+    const preparedQuota:Parameters<typeof advanceStorageEffectiveAnalysis>[0]['preparedQuota']=sharedDays?{
+      async load(days){return days.map(day=>bySharedDay.get(day)?.quota).every(value=>value!==undefined)
+        ?days.map(day=>bySharedDay.get(day)!.quota):undefined;},
+      async store(){return 'deferred';},
+    }:(options.preparedFold??STORAGE_V11_PREPARED_FOLD)
       ?await createStorageEffectiveQuotaPreparation({source,target:bindings.target,sourceId:bindings.sourceId,
         sourceNamespace:bindings.sourceNamespace,owner:scope.owner,
         remainingQueries:()=>meter.remainingQueries,deadlineMs:checkpointWorkDeadlineMs,now}):undefined;
-    const preparedUsage=metric==='model'&&options.preparedEffectiveUsage!==false
+    const preparedUsage:Parameters<typeof advanceStorageEffectiveAnalysis>[0]['preparedUsage']=sharedDays&&metric==='model'?{
+      async load(days){const values=days.map(day=>bySharedDay.get(day)?.modelUsage);
+        if(values.some(value=>value===undefined))return undefined;
+        const complete=days.map(day=>bySharedDay.get(day)!.modelUsage);
+        return effectiveUsageWindowRepresentable(complete)?complete:undefined;},
+      async nextMissingDay(){return undefined;},async store(){return 'deferred';},refused:()=>false,
+    }:metric==='model'&&options.preparedEffectiveUsage!==false
       &&(options.preparedFold??STORAGE_V11_PREPARED_FOLD)
       ?await createStorageEffectiveUsagePreparation({source,target:bindings.target,sourceId:bindings.sourceId,
         sourceNamespace:bindings.sourceNamespace,owner:scope.owner,
         remainingQueries:()=>meter.remainingQueries,deadlineMs:checkpointWorkDeadlineMs,now}):undefined;
-    effectiveFormat=preparedUsage?5:4;
+    const preparedUsageReader:V11PreparedUsageReader|undefined=sharedDays?{
+      days:sharedDays.filter(value=>value.scalarUsage.length>0).map(value=>value.day),
+      async readPage({day,afterTime,afterOccurrence}){
+        const value=bySharedDay.get(day);if(!value)throw fail();
+        const at=Date.parse(afterTime),index=value.scalarUsage.findIndex(row=>row.observedAtMs>at
+          ||row.observedAtMs===at&&row.occurrenceId>afterOccurrence);
+        return {state:'ready',rows:index<0?[]:value.scalarUsage.slice(index,index+200),
+          complete:index<0||index+200>=value.scalarUsage.length};
+      },
+    }:undefined;
+    effectiveFormat=sharedDays?6:preparedUsage?5:4;
     const originalKey=originalEffectiveKey();
     const key=await storageGraphEffectiveCheckpointKey(originalKey,preparedQuota!==undefined||preparedUsage!==undefined,effectiveFormat);
-    const loadKeys=preparedQuota?[key,...(preparedUsage?[await storageGraphEffectiveCheckpointKey(originalKey,true,4)]:[]),
+    const loadKeys=sharedDays?[key]:preparedQuota?[key,...(preparedUsage?[await storageGraphEffectiveCheckpointKey(originalKey,true,4)]:[]),
       await storageGraphEffectiveCheckpointKey(originalKey,true,3),
       await storageGraphEffectiveCheckpointKey(originalKey,true,2),originalKey]:[key];
     let cursor:StorageHistoryLoadCursor|undefined,head:string|null=null,checkpoint:StorageEffectiveHistoryCheckpoint|undefined;
@@ -653,6 +745,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
         const next=await advanceStorageEffectiveAnalysis({source,sourceNamespace:bindings.sourceNamespace,
           owner:scope.owner,pin,day:scope.day,metric,nowMs,checkpoint,
           ...(preparedQuota?{preparedQuota}:{}),
+          ...(preparedUsageReader?{preparedUsageReader}:{}),
           ...(preparedUsage?{preparedUsage}:{}),
           allowQuotaCoverage:pages===0,
           budget:{get remainingQueries(){return meter.remainingQueries-80;},deadlineMs:checkpointWorkDeadlineMs,now}});
@@ -962,16 +1055,46 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       payload=canonicalJson(composition);
     }
   }
-  if(!payload)throw fail();
   const payloadFingerprint=scope.source==='v1.1'?v11CompletedFingerprint:scope.pin.fingerprint;
   if(!payloadFingerprint)throw fail();
+  if(options.persistResult===false){
+    if(new TextEncoder().encode(payload).byteLength>MAX_RESULT_BYTES)return {state:'deferred',reason:'result_size_limit'};
+    const result=decoded({payload_json:payload,payload_fingerprint:payloadFingerprint,source_kind:scope.source},scope);
+    if(!result)throw fail();
+    if(!await current(bindings.source,scope))return {state:'deferred',reason:'authority_changed'};
+    await targetReady(bindings.target,scope);
+    return {state:'complete',result,reused:false};
+  }
+  const saved=await saveStorageGraphResult(bindings,scope,{payload,payloadFingerprint});
+  if(saved.state==='complete')await retireCompletedEffectiveCheckpoint();
+  return saved;
+}
+
+/** Graph-owned commit/readback shared by the ordinary kernels and verified
+ * block adoption. Neither caller may choose a method or skip payload/source
+ * validation. Extra adoption authority is checked immediately around writes. */
+export async function saveStorageGraphResult(bindings:StorageAnalyticsBindings,scope:StorageGraphScope,
+ options:{payload:string;payloadFingerprint:string;assertCurrent?:()=>Promise<void>}):Promise<
+  {state:'complete';result:StorageGraphResult;reused:boolean}
+  |{state:'deferred';reason:string}> {
+  const {payload,payloadFingerprint}=options;
+  if(bindings.source===bindings.target||bindings.sourceId!==scope.authority.sourceId
+    ||bindings.sourceNamespace!==scope.authority.sourceNamespace||!payload||!payloadFingerprint)throw fail();
   if(new TextEncoder().encode(payload).byteLength>MAX_RESULT_BYTES)return {state:'deferred',reason:'result_size_limit'};
-  if(!await current(source,scope))return {state:'deferred',reason:'authority_changed'};
+  if(!decoded({payload_json:payload,payload_fingerprint:payloadFingerprint,source_kind:scope.source},scope))throw fail();
+  if(!await current(bindings.source,scope))return {state:'deferred',reason:'authority_changed'};
   await targetReady(bindings.target,scope);
+  await options.assertCurrent?.();
   const hash=await sha256Hex(payload);
   await bindings.target.prepare(`INSERT INTO analytics_community_graph_results
     (source_id,owner_digest,metric,day,method,dependency_digest,input_revision,payload_fingerprint,
-      payload_json,payload_sha256,authority_json,computed_ms,source_kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+      payload_json,payload_sha256,authority_json,computed_ms,source_kind)
+    SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?
+    WHERE EXISTS(SELECT 1 FROM analytics_runtime_sources WHERE source_id=? AND source_namespace=? AND contract_version=1)
+      AND NOT EXISTS(SELECT 1 FROM analytics_storage_erasure_fences WHERE source_id=? AND owner_digest=?)
+      AND (? IS NULL OR EXISTS(SELECT 1 FROM analytics_owner_state
+        WHERE source_id=? AND owner_digest=? AND state='active' AND authority_epoch=?
+          AND (?=0 OR revision=?)))
     ON CONFLICT(source_id,owner_digest,metric,day) DO UPDATE SET method=excluded.method,
       dependency_digest=excluded.dependency_digest,input_revision=excluded.input_revision,
       payload_fingerprint=excluded.payload_fingerprint,payload_json=excluded.payload_json,
@@ -980,8 +1103,11 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     WHERE excluded.input_revision>=analytics_community_graph_results.input_revision`)
     .bind(bindings.sourceId,scope.owner.ownerDigest,scope.metric,scope.day,STORAGE_GRAPH_METHOD,
       scope.dependencyDigest,scope.owner.inputRevision,payloadFingerprint,payload,hash,
-      canonicalJson(scope.authority),Date.now(),scope.source).run();
+      canonicalJson(scope.authority),Date.now(),scope.source,
+      bindings.sourceId,bindings.sourceNamespace,bindings.sourceId,scope.owner.ownerDigest,
+      scope.ownerAuthorityEpoch??null,bindings.sourceId,scope.owner.ownerDigest,
+      scope.ownerAuthorityEpoch??null,scope.source==='effective'?1:0,scope.owner.ownerRevision).run();
   const result=await readStorageGraphResult(bindings,scope);
-  if(result)await retireCompletedEffectiveCheckpoint();
+  await options.assertCurrent?.();
   return result?{state:'complete',result,reused:false}:{state:'deferred',reason:'source_changed'};
 }

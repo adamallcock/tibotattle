@@ -90,6 +90,33 @@ describe('ordered ingestion before public analytics',()=>{
   await runStorageAnalyticsSchedule({STORAGE_ANALYTICS_MODE:'disabled'});
   expect(pass).not.toHaveBeenCalled();
  });
+ it('activates durable features and model blocks independently in the public phase',async()=>{
+  pass.mockResolvedValue(result);
+  await runStorageAnalyticsSchedule(environment());
+  expect(pass.mock.calls[1]![0]).not.toHaveProperty('sharedFeatures');
+  expect(pass.mock.calls[1]![0]).not.toHaveProperty('modelBlocks');
+  pass.mockClear();
+  await runStorageAnalyticsSchedule({...environment(),STORAGE_ANALYTICS_SHARED_FEATURES:'enabled'});
+  expect(pass.mock.calls[0]![0]).not.toHaveProperty('sharedFeatures');
+  expect(pass.mock.calls[1]![0]).toMatchObject({sharedFeatures:true,maxQueries:950});
+  expect(pass.mock.calls[1]![0]).not.toHaveProperty('modelBlocks');
+  pass.mockClear();
+  await runStorageAnalyticsSchedule({...environment(),STORAGE_ANALYTICS_SHARED_FEATURES:'disabled',
+   STORAGE_ANALYTICS_MODEL_BLOCKS:'enabled'});
+  expect(pass.mock.calls[1]![0]).not.toHaveProperty('sharedFeatures');
+  expect(pass.mock.calls[1]![0]).toMatchObject({modelBlocks:true});
+  pass.mockClear();
+  await runStorageAnalyticsSchedule({...environment(),STORAGE_ANALYTICS_SHARED_FEATURES:'enabled',
+   STORAGE_ANALYTICS_MODEL_BLOCKS:'enabled'},{nowMs:at(10)});
+  expect(pass.mock.calls[1]![0]).toMatchObject({sharedFeatures:true,modelBlocks:true,graphOnly:true});
+ });
+ it('rejects malformed durable feature activation before any database work',async()=>{
+  for(const field of ['STORAGE_ANALYTICS_SHARED_FEATURES','STORAGE_ANALYTICS_MODEL_BLOCKS'] as const) {
+   await expect(runStorageAnalyticsSchedule({...environment(),[field]:'yes' as 'enabled'}))
+    .rejects.toThrow('STORAGE_ANALYTICS_FEATURE_CONFIGURATION_INVALID');
+  }
+  expect(pass).not.toHaveBeenCalled();
+ });
 });
 describe('long graph-only pass on the single minute schedule',()=>{
  const deliveryPhase=(spend:number)=>async(options:Parameters<typeof runStorageAnalyticsPass>[0])=>{

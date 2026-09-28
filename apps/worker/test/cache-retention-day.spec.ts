@@ -1206,6 +1206,9 @@ describe('the cache-retention builder over the real source readers',()=>{
   await expect(runCacheRetentionDaySchedule({...env2,CACHE_RETENTION_BUILD:'enabled',
    CACHE_RETENTION_SHARDS:'2',CACHE_RETENTION_SHARD:'2'}))
    .rejects.toThrow('CACHE_RETENTION_CONFIGURATION_INVALID');
+  await expect(runCacheRetentionDaySchedule({...env2,CACHE_RETENTION_BUILD:'enabled',
+   CACHE_RETENTION_SHARED_FEATURES:'unknown' as 'enabled'}))
+   .rejects.toThrow('CACHE_RETENTION_CONFIGURATION_INVALID');
  });
  it('does not reuse an effective factory for a different day identity',async()=>{
   const fixture=await source(1),day=fixture.days[0]!,digest=await effectiveDigest(fixture,day);
@@ -1241,6 +1244,10 @@ describe('the cache-retention builder over the real source readers',()=>{
   // the source rather than reusing the already-resolved factory.
   await expect(build(candidate,carry,{deadlineMs:Date.now()+60_000,remainingQueries:900}))
    .rejects.toThrow('prepared cache retention day refused');
+  const shared=createCacheRetentionDaySourceBuild({source:sourceDb(),target:target(),
+   sourceNamespace,sharedFeatures:true});
+  await expect(shared(candidate,carry,{deadlineMs:Date.now()+60_000,remainingQueries:900,
+   remainingSharedQueries:()=>900})).rejects.toThrow('prepared cache retention day refused');
  });
 });
 

@@ -2,6 +2,7 @@ import { createD1InvocationBudget } from './d1-invocation-budget';
 import { publicAnalyticsEnabled } from './public-analytics-gate';
 import { runStorageAnalyticsPass } from './storage-analytics-runtime';
 import { storageGraphFailureFields } from './storage-analytics-failure';
+import { analyticsFeatureControls,type AnalyticsFeatureControlEnv } from './analytics-feature-controls';
 
 /**
  * The community publication lane, on its own schedule.
@@ -25,7 +26,7 @@ import { storageGraphFailureFields } from './storage-analytics-failure';
  * the state they reclaim is mostly the graph's own checkpoints, and they were
  * measured at seven to twenty-one statements a pass.
  */
-export interface StoragePublicationWorkerEnv {
+export interface StoragePublicationWorkerEnv extends AnalyticsFeatureControlEnv {
   STORAGE_INGESTION_DB?: D1Database;
   STORAGE_ANALYTICS_DB?: D1Database;
   DELETION_LEDGER?: D1Database;
@@ -62,6 +63,7 @@ export async function runStoragePublicationSchedule(
     throw new Error('STORAGE_PUBLICATION_CONFIGURATION_INVALID');
   }
   const event = 'storage_publication_schedule';
+  const features=analyticsFeatureControls(env);
   try {
     const meter = createD1InvocationBudget(900);
     const started = Date.now();
@@ -72,6 +74,7 @@ export async function runStoragePublicationSchedule(
       sourceId: env.STORAGE_SOURCE_ID,
       sourceNamespace: env.TELEMETRY_STORAGE_NAMESPACE,
       publishCommunity: true, publicOnly: true, publicationOnly: true,
+      ...(features.sharedFeatures?{sharedFeatures:true}:{}),
       maxSteps: 32, maxQueries: meter.remainingQueries,
       deadlineMs: started + PUBLICATION_WINDOW_MS,
     });

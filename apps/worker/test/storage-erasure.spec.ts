@@ -1,4 +1,9 @@
 import {captureStorageCommunityAuthority} from '../src/storage-community-authority';
+import {readStorageCommunityOwnerPage} from '../src/storage-community-authority';
+import {advanceSharedAnalyticsFeatureDay} from '../src/storage-analytics-shared-features';
+import {createD1InvocationBudget} from '../src/d1-invocation-budget';
+import {createModelBlockCheckpoint,modelBlockInputDays,MODEL_BLOCK_METHOD,type ModelBlockIdentity} from '../src/analytics-model-block-contract';
+import {claimModelBlockJob,ensureModelBlockJob,saveModelBlockJob} from '../src/storage-analytics-model-block';
 import {saveStorageHistoryCheckpoint} from '../src/storage-history-checkpoint';
 import {reduceGraphDayProjection,writeGraphDayProjection} from '../src/graph-day-projection';
 import {createV1QuotaAcquisitionCheckpoint} from '../src/quota-analysis-v1-reader';
@@ -55,7 +60,76 @@ async function fixture(days=1){
 async function deliver(){for(let i=0;i<30;i++)if((await advanceStorageAnalytics(bindings())).state==='idle')return;throw new Error('synthetic delivery bound');}
 const count=(table:string)=>target().prepare(`SELECT COUNT(*) n FROM ${table}`).first<number>('n');
 async function drain(){for(let n=0;n<20;n++)if(!(await advanceStorageErasureJobs(bindings())).pending)return;throw new Error('synthetic erasure bound');}
+async function completedModelBlock(ownerDigest:string){
+ const owner=await target().prepare('SELECT revision,authority_epoch FROM analytics_owner_state WHERE source_id=? AND owner_digest=?')
+  .bind(sourceId,ownerDigest).first<{revision:number;authority_epoch:number}>();
+ if(!owner)throw new Error('synthetic missing model block owner');
+ const identity:ModelBlockIdentity={version:1,method:MODEL_BLOCK_METHOD,sourceId,sourceNamespace,ownerDigest,
+  ownerRevision:owner.revision,authorityEpoch:owner.authority_epoch,inputRevision:1,authorityDigest:'b'.repeat(64),
+  outputFromDay:today(),outputThroughDay:today()};
+ const initial=createModelBlockCheckpoint(identity,modelBlockInputDays(identity).map(day=>({day,digest:'c'.repeat(64),hasQuota:false,hasUsage:false})));
+ expect(await ensureModelBlockJob({target:target(),identity,initial,now:Date.now()})).toBe(true);
+ const claim=await claimModelBlockJob({target:target(),identity,now:Date.now()});if(!claim)throw new Error('synthetic missing model claim');
+ expect(await saveModelBlockJob({target:target(),identity,claim,now:Date.now(),checkpoint:{...initial,phase:'complete',
+  inputIndex:initial.dependencies.length,outputs:[{day:today(),fingerprint:'d'.repeat(64),
+   value:{status:'not_testable',reason:'supported_quota_track_unavailable'}}]}})).toBe(true);
+}
+async function completedSharedFeature(ownerDigest:string){
+ const owner=(await readStorageCommunityOwnerPage(source())).find(value=>value.ownerDigest===ownerDigest);
+ if(!owner)throw new Error('synthetic missing shared feature owner');
+ for(let attempt=0;attempt<12;attempt++){
+  const meter=createD1InvocationBudget(950);
+  const result=await advanceSharedAnalyticsFeatureDay({source:meter.wrap(source()),target:meter.wrap(target()),
+   sourceId,sourceNamespace,owner:{...owner,ownerDigest},day:today(),
+   budget:{remainingQueries:()=>meter.remainingQueries,deadlineMs:Date.now()+55_000,now:Date.now}});
+  expect(meter.queriesUsed).toBeLessThanOrEqual(950);
+  if(result.state==='complete')return;
+  expect(result.state).toBe('deferred');
+ }
+ throw new Error('synthetic shared feature bound');
+}
 describe('cross-store physical erasure completion',()=>{
+ it('physically erases shared feature heads and parts before recording completion',async()=>{
+  const f=await fixture();await deliver();await completedSharedFeature(f.event.ownerDigest);
+  expect(await count('analytics_shared_feature_days')).toBe(1);
+  expect(await count('analytics_shared_feature_parts')).toBeGreaterThan(0);
+  expect(await eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId)).toMatchObject({deleted:true});
+  expect(await count('analytics_shared_feature_days')).toBe(0);
+  expect(await count('analytics_shared_feature_parts')).toBe(0);
+  expect(await count('analytics_storage_erasure_receipts')).toBe(1);
+ });
+ it('withholds completion while interrupted shared feature retirement leaves a private payload',async()=>{
+  const f=await fixture();await deliver();await completedSharedFeature(f.event.ownerDigest);
+  for(const trigger of ['analytics_shared_feature_terminal_insert','analytics_shared_feature_terminal_update',
+   'analytics_shared_feature_owner_update'])await target().prepare(`DROP TRIGGER ${trigger}`).run();
+  await expect(eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId))
+   .rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+  expect(await count('analytics_shared_feature_days')).toBe(1);
+  expect(await count('analytics_storage_erasure_receipts')).toBe(0);
+  await target().prepare('DELETE FROM analytics_shared_feature_days').run();await drain();
+  expect(await count('analytics_shared_feature_parts')).toBe(0);
+  expect(await count('analytics_storage_erasure_receipts')).toBe(1);
+ });
+ it('erases completed experimental model heads and all private checkpoint parts before recording completion',async()=>{
+  const f=await fixture();await deliver();await completedModelBlock(f.event.ownerDigest);
+  expect(await count('analytics_model_blocks')).toBe(1);expect(await count('analytics_model_block_parts')).toBe(1);
+  expect(await eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId)).toMatchObject({deleted:true});
+  expect(await count('analytics_model_blocks')).toBe(0);expect(await count('analytics_model_block_parts')).toBe(0);
+  expect(await count('analytics_storage_erasure_receipts')).toBe(1);
+ });
+ it('withholds an erasure receipt while any experimental model payload survives interrupted cleanup',async()=>{
+  const f=await fixture();await deliver();await completedModelBlock(f.event.ownerDigest);
+  // Simulate damaged/interrupted retirement, independently of the writer's
+  // capability refusal. Receipt validation must still prove physical absence.
+  for(const trigger of ['analytics_model_blocks_terminal_insert','analytics_model_blocks_terminal_update','analytics_model_blocks_owner_update'])
+   await target().prepare(`DROP TRIGGER ${trigger}`).run();
+  await expect(eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId)).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+  expect(await count('analytics_model_blocks')).toBe(1);expect(await count('analytics_model_block_parts')).toBe(1);
+  expect(await count('analytics_storage_erasure_receipts')).toBe(0);
+  expect(await b.DELETION_LEDGER.prepare('SELECT state FROM storage_erasure_jobs').first('state')).toBe('pending');
+  await target().prepare('DELETE FROM analytics_model_blocks').run();await drain();
+  expect(await count('analytics_model_block_parts')).toBe(0);expect(await count('analytics_storage_erasure_receipts')).toBe(1);
+ });
  it('accepts only a structurally successful empty ledger result',async()=>{
   const malformed=new Proxy(b.DELETION_LEDGER,{get(db,key){if(key==='prepare')return(sql:string)=>{
    const statement=db.prepare(sql);if(!sql.includes("FROM storage_erasure_jobs WHERE source_id=? AND state='pending'"))return statement;

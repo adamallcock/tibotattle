@@ -1,7 +1,8 @@
 import {canonicalJson} from './canonical-json';
 import {sha256Hex} from './crypto';
 import {COMPOSITION_CACHE_KEY_SUFFIX} from './community-allowance';
-import {validEffectiveUsageDay,effectiveUsageWindowRepresentable,type EffectiveUsageDay} from './effective-usage-day';
+import {validEffectiveUsageDay,effectiveUsageWindowRepresentable,type EffectiveUsageDay,
+  type StorageEffectiveUsagePreparation} from './effective-usage-day';
 import {GRAPH_DAY_EFFECTIVE_DEVICE_ID,GRAPH_DAY_EFFECTIVE_USAGE_MANIFEST_PREFIX,
   graphDayEffectiveUsageSupported,readGraphDayEffectiveUsageHeads,readGraphDayProjection,writeGraphDayProjection,
   type GraphDayProjectionKey,type GraphDayProjectionLoadCursor,type GraphDayProjectionWriteCursor} from './graph-day-projection';
@@ -9,13 +10,7 @@ import {assertEffectiveHistoryOwner,effectiveHistoryDependency,createEffectiveHi
 import type {StorageCommunityOwner} from './storage-community-authority';
 
 export const STORAGE_EFFECTIVE_USAGE_WINDOW_BYTES=8*1024*1024;
-export interface StorageEffectiveUsagePreparation {
-  load(days:readonly string[]):Promise<readonly EffectiveUsageDay[]|undefined>;
-  nextMissingDay(days:readonly string[]):Promise<string|undefined>;
-  store(day:EffectiveUsageDay):Promise<'stored'|'deferred'>;
-  /** An explicit resource refusal disables preparation durably for this job. */
-  refused():boolean;
-}
+export type {StorageEffectiveUsagePreparation} from './effective-usage-day';
 const fail=()=>new Error('STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE');
 
 /** A source-fenced, pricing-versioned model input cache. A miss never licenses
