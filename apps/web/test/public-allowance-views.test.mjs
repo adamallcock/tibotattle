@@ -33,21 +33,24 @@ function series() {
   };
 }
 
-test("30-day comparisons use identical date and dollar axes", () => {
+test("30-day comparisons keep dates aligned and use view-specific positive dollar axes", () => {
   const models = ["aggregate", "plans", "models"].map(view => buildCommunityAllowanceChartModel(series(), { view, rangeDays: 30 }));
   for (const model of models) {
     assert.ok(model);
     assert.deepEqual(model.dayTicks, models[0].dayTicks);
-    assert.deepEqual(model.dollarTicks, models[0].dollarTicks);
-    assert.deepEqual(model.plot, models[0].plot);
-    assert.ok(model.dollarTicks.at(-1).value >= 6500);
+    assert.equal(model.dollarTicks[0].value > 0, true);
   }
+  assert.notDeepEqual(models[0].dollarTicks, models[2].dollarTicks);
+  assert.equal(models[2].height, models[0].height * 1.5);
+  assert.ok(models[2].dollarTicks.at(-1).value >= 6500);
   assert.equal(models[1].legendSeries.length, 3);
+  assert.deepEqual(models[1].cardSeries.map(item => item.key), ["plus", "prolite", "pro"]);
+  assert.deepEqual(models[1].latestSummaries.map(item => item.seriesKey), ["plus", "prolite", "pro"]);
   assert.deepEqual(models[2].legendSeries.map(item => item.label),
     ["GPT-6 Astra", "GPT-6 Sol", "GPT-6 Luna"]);
 });
 
-test("All fits the selected view's evidence dates without changing dollar scales", () => {
+test("All fits the selected view's evidence dates and dollar scale", () => {
   const data = series();
   const aggregate = buildCommunityAllowanceChartModel(data);
   const model = buildCommunityAllowanceChartModel(data, { view: "models" });
@@ -55,7 +58,18 @@ test("All fits the selected view's evidence dates without changing dollar scales
   assert.equal(model.dots[0].x, model.plot.left);
   assert.equal(model.dots.at(-1).x, model.plot.right);
   assert.equal(aggregate.dayTicks[0].day, "2026-09-01");
-  assert.deepEqual(model.dollarTicks, aggregate.dollarTicks);
+  assert.ok(model.dollarTicks[0].value > 0);
+  assert.notDeepEqual(model.dollarTicks, aggregate.dollarTicks);
+});
+
+test("each plan's own-week chart gets a rounded positive floor", () => {
+  const data = series();
+  for (const key of ["plus", "prolite", "pro"]) {
+    const model = buildCommunityAllowanceChartModel(data, { view: "plans", seriesKeys: [key] });
+    assert.equal(model.legendSeries[0].key, key);
+    assert.ok(model.dollarTicks[0].value > 0);
+    assert.ok(model.dollarTicks[0].value < Math.min(...model.dots.map(dot => dot.band80Usd?.lowerUsd ?? dot.centralUsd)));
+  }
 });
 
 test("public model order is exact across cards, legend and same-day inspection", () => {
