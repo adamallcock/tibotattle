@@ -44,6 +44,10 @@ const REQUIRED_LEDGER_DIAGNOSTIC_PATHS = new Set([
   "apps/worker/cloud-run/ledger-preflight-reconcile.mjs",
   "apps/worker/cloud-run/ledger-preflight-reconcile.check.mjs",
 ]);
+const REQUIRED_SOURCE_PIN_DIAGNOSTIC_PATHS = new Set([
+  "apps/worker/cloud-run/postgres-source-pin-diagnostic.mjs",
+  "apps/worker/cloud-run/postgres-source-pin-diagnostic.check.mjs",
+]);
 const REQUIRED_DAILY_ACTIVATION_PATHS = new Set([
   "apps/worker/cloud-run/postgres-community-daily-activation.mjs",
   "apps/worker/cloud-run/postgres-community-daily-activation.check.mjs",
@@ -94,6 +98,8 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/synthetic-v12-discovery.check.mjs", destination: "apps/worker/cloud-run/synthetic-v12-discovery.check.mjs" }),
   Object.freeze({ source: "cloud-run/ledger-reconciliation-diagnostic.mjs", destination: "apps/worker/cloud-run/ledger-reconciliation-diagnostic.mjs" }),
   Object.freeze({ source: "cloud-run/ledger-reconciliation-diagnostic.check.mjs", destination: "apps/worker/cloud-run/ledger-reconciliation-diagnostic.check.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-source-pin-diagnostic.mjs", destination: "apps/worker/cloud-run/postgres-source-pin-diagnostic.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-source-pin-diagnostic.check.mjs", destination: "apps/worker/cloud-run/postgres-source-pin-diagnostic.check.mjs" }),
   Object.freeze({ source: "cloud-run/ledger-preflight-reconcile.mjs", destination: "apps/worker/cloud-run/ledger-preflight-reconcile.mjs" }),
   Object.freeze({ source: "cloud-run/ledger-preflight-reconcile.check.mjs", destination: "apps/worker/cloud-run/ledger-preflight-reconcile.check.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-graph-benchmark.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-benchmark.mjs" }),
@@ -232,6 +238,9 @@ async function validateSource(assets) {
   const includedPaths = new Set(files.map((file) => file.destination));
   if ([...REQUIRED_LEDGER_DIAGNOSTIC_PATHS].some((path) => !includedPaths.has(path))) {
     fail("CLOUD_RUN_CONTEXT_LEDGER_DIAGNOSTIC_PATH_SET_UNEXPECTED");
+  }
+  if ([...REQUIRED_SOURCE_PIN_DIAGNOSTIC_PATHS].some((path) => !includedPaths.has(path))) {
+    fail("CLOUD_RUN_CONTEXT_SOURCE_PIN_DIAGNOSTIC_PATH_SET_UNEXPECTED");
   }
   if ([...REQUIRED_DAILY_ACTIVATION_PATHS].some((path) => !includedPaths.has(path))) {
     fail("CLOUD_RUN_CONTEXT_DAILY_ACTIVATION_PATH_SET_UNEXPECTED");
