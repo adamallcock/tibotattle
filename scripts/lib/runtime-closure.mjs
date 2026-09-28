@@ -78,7 +78,7 @@ export const RUNTIME_PINNED_PACKAGES = Object.freeze({
   "@app-usagemonitor/telemetry-contract": RELEASE_VERSION,
   ajv: "8.20.0",
   "fast-deep-equal": "3.1.3",
-  "fast-uri": "3.1.6",
+  "fast-uri": "3.1.7",
   "json-schema-traverse": "1.0.0",
   "require-from-string": "2.0.2",
   runcost: "0.2.1",
@@ -91,7 +91,7 @@ export const RUNTIME_PINNED_PACKAGE_TREE_DIGESTS = Object.freeze({
   ajv: "7fecaf9a9ff3f41dabc7f7d762c7fecb8384c38a3c0dd4e6da0f3b3ef04569ca",
   "fast-deep-equal":
     "6c98665ed0585630ce02fbf064e6ed854f8e6546cb1e534158dbfbc18e05aa85",
-  "fast-uri": "d267bdc69f6805e4b6dcab9d48d543c490ee3022adb3f7e1ba02f542f70e25c8",
+  "fast-uri": "855a20b57b9e673f6d0b1f10a19aa8f7dabc91ef0ceb09816bf23fdf239e4a48",
   "json-schema-traverse":
     "71ac31baf5e8476eb746605c96d1961a1e7474d4491828506602cbf17b5c5af6",
   "require-from-string":
