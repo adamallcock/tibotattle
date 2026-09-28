@@ -15,6 +15,8 @@ import {
 import {
   parseSyntheticV12SmokeConfig,
   assertSyntheticV12RuntimeReady,
+  createSyntheticV12SmokeCliReceipt,
+  writeSyntheticV12SmokeCliReceipt,
   encryptSyntheticV12Envelope,
   makeManifestAndChunk,
   postgresAndGcsReadback,
@@ -958,6 +960,113 @@ test("public v1.2 mode rejects unpinned gateway config before checking or seedin
   );
   assert.equal(fake.seedCount, 0);
   assert.equal(fake.calls.length, 0);
+});
+
+test("CLI receipt rejects incomplete success and hides malformed orphan markers", () => {
+  assert.throws(() => createSyntheticV12SmokeCliReceipt({
+    status: "ok",
+    kind: "synthetic-v12-smoke",
+    participantId: PARTICIPANT_ID,
+  }), { code: "SMOKE_CLI_RECEIPT_INVALID" });
+  const receipt = createSyntheticV12SmokeCliReceipt({
+    status: "failed",
+    kind: "synthetic-v12-smoke",
+    code: "SMOKE_FAILED",
+    orphanMarker: PARTICIPANT_ID,
+  });
+  assert.deepEqual(receipt, {
+    schemaVersion: "synthetic-v12-smoke-cli-receipt-v1",
+    status: "failed",
+    kind: "synthetic-v12-smoke",
+    code: "SMOKE_FAILED",
+  });
+  assert.equal(JSON.stringify(receipt).includes(PARTICIPANT_ID), false);
+});
+
+test("CLI logging boundary writes only the sanitized receipt to stdout or stderr", () => {
+  const stdout = [];
+  const stderr = [];
+  const failed = writeSyntheticV12SmokeCliReceipt({
+    status: "ok",
+    kind: "synthetic-v12-smoke",
+    synthetic: true,
+    participantId: PARTICIPANT_ID,
+    origin: CLOUD_RUN_IAM_TEST_TARGET.origin,
+    manifest: "staged_and_exactly_replayed",
+    chunk: "staged_and_exactly_replayed",
+    domain: "activated_and_exactly_replayed",
+    syncState: "empty_history_admission_available",
+    syncManifest: "bounded_one_day_empty_history",
+    v12DayManifestRead: "single_staged_manifest_for_device",
+    publicReadPath: "fixed_test_gateway",
+    deviceCredentialRenewal: "rotated_replayed_new_secret_authorized_old_secret_rejected",
+    postgresReadback: true,
+    effectiveRecordReadback: true,
+    gcsReadback: true,
+    publication: "withheld_by_verified_degraded_controls",
+    retainedFixturePrefix: SYNTHETIC_V12_SMOKE_PARTICIPANT_PREFIX,
+    serverlessToken: SERVERLESS_TOKEN,
+    deviceSecret: DEVICE_SECRET,
+    grantToken: GRANT_TOKEN_1,
+  }, {
+    stdout: (line) => stdout.push(line),
+    stderr: (line) => stderr.push(line),
+  });
+  assert.equal(failed, false);
+  assert.equal(stderr.length, 0);
+  assert.equal(stdout.length, 1);
+  const successLog = JSON.parse(stdout[0]);
+  assert.deepEqual(successLog, {
+    schemaVersion: "synthetic-v12-smoke-cli-receipt-v1",
+    status: "ok",
+    kind: "synthetic-v12-smoke",
+    synthetic: true,
+    manifest: "staged_and_exactly_replayed",
+    chunk: "staged_and_exactly_replayed",
+    domain: "activated_and_exactly_replayed",
+    syncState: "empty_history_admission_available",
+    syncManifest: "bounded_one_day_empty_history",
+    v12DayManifestRead: "single_staged_manifest_for_device",
+    publicReadPath: "fixed_test_gateway",
+    deviceCredentialRenewal: "rotated_replayed_new_secret_authorized_old_secret_rejected",
+    postgresReadback: true,
+    effectiveRecordReadback: true,
+    gcsReadback: true,
+    publication: "withheld_by_verified_degraded_controls",
+    fixtureRetained: true,
+  });
+  assert.equal(Object.keys(successLog).some((key) => /participant.?id|token|secret|origin/iu.test(key)), false);
+  for (const sensitive of [PARTICIPANT_ID, CLOUD_RUN_IAM_TEST_TARGET.origin,
+    SERVERLESS_TOKEN, DEVICE_SECRET, GRANT_TOKEN_1]) {
+    assert.equal(stdout[0].includes(sensitive), false);
+  }
+
+  const failedStatus = writeSyntheticV12SmokeCliReceipt({
+    status: "failed",
+    kind: "synthetic-v12-smoke",
+    code: "SMOKE_FAILED",
+    orphanMarker: SYNTHETIC_V12_SMOKE_PARTICIPANT_PREFIX,
+    participantId: PARTICIPANT_ID,
+    authorization: SERVERLESS_TOKEN,
+    responseBody: DEVICE_SECRET,
+  }, {
+    stdout: (line) => stdout.push(line),
+    stderr: (line) => stderr.push(line),
+  });
+  assert.equal(failedStatus, true);
+  assert.equal(stdout.length, 1);
+  assert.equal(stderr.length, 1);
+  const failureLog = JSON.parse(stderr[0]);
+  assert.deepEqual(failureLog, {
+    schemaVersion: "synthetic-v12-smoke-cli-receipt-v1",
+    status: "failed",
+    kind: "synthetic-v12-smoke",
+    code: "SMOKE_FAILED",
+    orphanMarker: SYNTHETIC_V12_SMOKE_PARTICIPANT_PREFIX,
+  });
+  for (const sensitive of [PARTICIPANT_ID, SERVERLESS_TOKEN, DEVICE_SECRET]) {
+    assert.equal(stderr[0].includes(sensitive), false);
+  }
 });
 
 test("public v1.2 mode rejects cross-origin replies, redirects, and cookies", async () => {

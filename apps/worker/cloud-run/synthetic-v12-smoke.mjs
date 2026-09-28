@@ -1210,6 +1210,101 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
   }
 }
 
+const SYNTHETIC_V12_SMOKE_CLI_RECEIPT_SCHEMA = "synthetic-v12-smoke-cli-receipt-v1";
+
+/** Build a closed, content-free CLI receipt. The in-process journey result may
+ * contain its synthetic owner ID for exact cleanup, but stdout and stderr are
+ * captured by Cloud Logging and must never include that identifier or tokens.
+ */
+export function createSyntheticV12SmokeCliReceipt(receipt) {
+  if (receipt === null || typeof receipt !== "object" || Array.isArray(receipt)
+      || receipt.kind !== "synthetic-v12-smoke") {
+    fail("SMOKE_CLI_RECEIPT_INVALID");
+  }
+  if (receipt.status === "failed") {
+    const code = typeof receipt.code === "string" && /^[A-Z0-9_]{1,100}$/u.test(receipt.code)
+      ? receipt.code : "SYNTHETIC_V12_SMOKE_FAILED";
+    return Object.freeze({
+      schemaVersion: SYNTHETIC_V12_SMOKE_CLI_RECEIPT_SCHEMA,
+      status: "failed",
+      kind: "synthetic-v12-smoke",
+      code,
+      ...(receipt.orphanMarker === SYNTHETIC_V12_SMOKE_PARTICIPANT_PREFIX
+        ? { orphanMarker: SYNTHETIC_V12_SMOKE_PARTICIPANT_PREFIX } : {}),
+    });
+  }
+  const expected = {
+    synthetic: true,
+    manifest: "staged_and_exactly_replayed",
+    chunk: "staged_and_exactly_replayed",
+    domain: "activated_and_exactly_replayed",
+    syncState: "empty_history_admission_available",
+    syncManifest: "bounded_one_day_empty_history",
+    v12DayManifestRead: "single_staged_manifest_for_device",
+    publicReadPath: "fixed_test_gateway",
+    deviceCredentialRenewal: "rotated_replayed_new_secret_authorized_old_secret_rejected",
+    postgresReadback: true,
+    effectiveRecordReadback: true,
+    gcsReadback: true,
+    publication: "withheld_by_verified_degraded_controls",
+    retainedFixturePrefix: SYNTHETIC_V12_SMOKE_PARTICIPANT_PREFIX,
+  };
+  if (receipt.status !== "ok"
+      || Object.entries(expected).some(([key, value]) => receipt[key] !== value)
+      || (receipt.deviceRequestPath !== undefined
+        && receipt.deviceRequestPath !== "public_test_gateway")) {
+    fail("SMOKE_CLI_RECEIPT_INVALID");
+  }
+  return Object.freeze({
+    schemaVersion: SYNTHETIC_V12_SMOKE_CLI_RECEIPT_SCHEMA,
+    status: "ok",
+    kind: "synthetic-v12-smoke",
+    synthetic: true,
+    ...(receipt.deviceRequestPath === "public_test_gateway"
+      ? { deviceRequestPath: "public_test_gateway" } : {}),
+    manifest: expected.manifest,
+    chunk: expected.chunk,
+    domain: expected.domain,
+    syncState: expected.syncState,
+    syncManifest: expected.syncManifest,
+    v12DayManifestRead: expected.v12DayManifestRead,
+    publicReadPath: expected.publicReadPath,
+    deviceCredentialRenewal: expected.deviceCredentialRenewal,
+    postgresReadback: true,
+    effectiveRecordReadback: true,
+    gcsReadback: true,
+    publication: expected.publication,
+    fixtureRetained: true,
+  });
+}
+
+/** Write only the closed receipt shape to Cloud Logging and report whether the
+ * journey should exit unsuccessfully. Injectable writers let the focused check
+ * verify the actual logging boundary without invoking Cloud Run setup.
+ */
+export function writeSyntheticV12SmokeCliReceipt(receipt, {
+  stdout = (line) => console.log(line),
+  stderr = (line) => console.error(line),
+} = {}) {
+  let failed = receipt?.status !== "ok";
+  let cliReceipt;
+  try {
+    cliReceipt = createSyntheticV12SmokeCliReceipt(receipt);
+  } catch {
+    cliReceipt = {
+      schemaVersion: SYNTHETIC_V12_SMOKE_CLI_RECEIPT_SCHEMA,
+      status: "failed",
+      kind: "synthetic-v12-smoke",
+      code: "SMOKE_CLI_RECEIPT_INVALID",
+      ...((receipt?.orphanMarker !== undefined || receipt?.status === "ok")
+        ? { orphanMarker: SYNTHETIC_V12_SMOKE_PARTICIPANT_PREFIX } : {}),
+    };
+    failed = true;
+  }
+  (failed ? stderr : stdout)(JSON.stringify(cliReceipt));
+  return failed;
+}
+
 function safeReadbackFailure(error) {
   if (new Set([
     "SMOKE_POSTGRES_READBACK_MANIFEST_MISMATCH",
@@ -1512,7 +1607,7 @@ async function main() {
     };
     failed = true;
   }
-  (failed ? console.error : console.log)(JSON.stringify(receipt));
+  failed = writeSyntheticV12SmokeCliReceipt(receipt) || failed;
   if (failed) process.exitCode = 1;
 }
 
