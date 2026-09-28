@@ -9,7 +9,8 @@ import { initializeTypedV1Admission, insertTypedTelemetryV1Chunk } from "../src/
 import { currentTelemetryV1Chunk } from "../src/telemetry-v1-repository";
 import { parseTelemetryV1Chunk, type TelemetryV1UsageEvent } from "../src/telemetry-v1";
 import { telemetryV11LegacyProjection } from "../src/telemetry-v11-compatibility";
-import { readEffectiveUsageOwnerDayPage, readEffectiveTelemetryOwnerDayPage } from "../src/telemetry-usage-effective-reader";
+import { readEffectiveUsageOwnerDayPage, readEffectiveTelemetryOwnerDayPage,
+  readEffectiveTelemetryOwnerDays } from "../src/telemetry-usage-effective-reader";
 
 interface Bindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -47,9 +48,10 @@ async function makeInsert(
   eventIds: readonly string[],
   totals: boolean,
   supersedes: Awaited<ReturnType<typeof currentTelemetryV1Chunk>> = null,
+  observedDay = day,
 ) {
   const records = eventIds.map((eventId, index) => {
-    const projected = telemetryV11LegacyProjection("usage", v11UsageRecord(day, "a", {
+    const projected = telemetryV11LegacyProjection("usage", v11UsageRecord(observedDay, "a", {
       eventId,
       totalInputContextTokens: totals ? 150 : null,
       components: {
@@ -62,14 +64,14 @@ async function makeInsert(
     if (!projected) throw new Error("synthetic effective projection missing");
     return JSON.parse(projected.canonicalRecord) as TelemetryV1UsageEvent;
   });
-  const envelopeDigest = await sha256Hex(`synthetic-effective-reader-envelope:${revision}`);
+  const envelopeDigest = await sha256Hex(`synthetic-effective-reader-envelope:${observedDay}:${revision}`);
   const principal = await authenticateDevice(db(), fixture.authorization);
   const upload = await createDeviceUploadAuthorization(db(), principal, envelopeDigest, 1000);
   const claimed = await claimDeviceUploadAuthorization(db(), `Upload ${upload.uploadAuthorization}`, {
     envelopeDigest, bodyBytes: 1000, contentType: "application/json",
   });
   const chunk = parseTelemetryV1Chunk({
-    schemaVersion: "telemetry-contribution-v1.0", chunkId: `usage:${day}:0`, chunkRevision: revision,
+    schemaVersion: "telemetry-contribution-v1.0", chunkId: `usage:${observedDay}:0`, chunkRevision: revision,
     chunkDigest: await sha256Hex(canonicalTelemetryV11Json(records)), parserVersion: "synthetic-effective-reader-v1",
     consent: {
       telemetrySchemaVersion: "telemetry-contribution-v1.0",
@@ -113,6 +115,95 @@ function countSemanticVariantQueries(database: D1Database): { database: D1Databa
   });
   return { database: wrapped, count: () => queries };
 }
+
+function recordDirectQueries(database: D1Database) {
+  const queries: { sql: string; values: unknown[] }[] = [];
+  return { queries, database: new Proxy(database, { get(target, property) {
+    if (property === "prepare") return (sql: string) => {
+      if (!sql.includes("direct AS (")) return target.prepare(sql);
+      const query = { sql, values: [] as unknown[] };
+      queries.push(query);
+      const wrap = (statement: D1PreparedStatement): D1PreparedStatement => new Proxy(statement, {
+        get(inner, member) {
+          if (member === "bind") return (...values: unknown[]) => {
+            query.values = values;
+            return wrap(inner.bind(...values));
+          };
+          const value = Reflect.get(inner, member);
+          return typeof value === "function" ? value.bind(inner) : value;
+        },
+      });
+      return wrap(target.prepare(sql));
+    };
+    const value = Reflect.get(target, property);
+    return typeof value === "function" ? value.bind(target) : value;
+  } }) };
+}
+
+it("bounds candidate decoding to the indexed owner stream and UTC window without losing cross-day conflicts", async () => {
+  const fixture = await createV11DeviceFixture(db());
+  const otherDevice = await createV11DeviceFixture(db(), { participantId: fixture.participantId });
+  const occurrence = `event:v2:${"c".repeat(64)}`;
+  await insertTypedTelemetryV1Chunk(db(), await makeInsert(fixture, 1, [occurrence], true), sourceNamespace);
+  const outsideDay = "2026-09-21";
+  const outside = [occurrence, ...Array.from({ length: 199 }, (_, index) =>
+    `synthetic:outside:${String(index).padStart(4, "0")}`)];
+  await insertTypedTelemetryV1Chunk(db(),
+    await makeInsert(otherDevice, 1, outside, true, null, outsideDay), sourceNamespace);
+  const owner = await ownerFor(fixture.participantId);
+  const options = { sourceNamespace, ownerDigest: owner.owner_digest, ownerRevision: owner.revision,
+    authorityEpoch: owner.authority_epoch };
+  const observed = recordDirectQueries(db());
+  const page = await readEffectiveUsageOwnerDayPage(observed.database, { ...options, day, limit: 1 });
+  expect(page.next).toBeNull();
+  expect(page.rows).toHaveLength(1);
+  expect(page.rows[0]).toMatchObject({ occurrenceId: occurrence, eventTimeConflict: true, status: "base_conflict" });
+  expect(page.rows[0]!.sourceCount).toBe(2);
+
+  for (const stream of ["usage", "quota", "session"] as const) {
+    if (stream !== "usage") {
+      const empty = await readEffectiveTelemetryOwnerDayPage(observed.database,
+        { ...options, stream, day, limit: 1 });
+      expect(empty.rows).toEqual([]);
+      expect(empty.next).toBeNull();
+    }
+    expect(await readEffectiveTelemetryOwnerDays(observed.database,
+      { ...options, stream, fromDay: day, throughDay: outsideDay }))
+      .toEqual(stream === "usage" ? [day, outsideDay] : []);
+  }
+
+  const candidates = observed.queries.filter(query => query.sql.includes("selected_window("));
+  expect(candidates).toHaveLength(6);
+  for (const query of candidates) {
+    const plan = await db().prepare(`EXPLAIN QUERY PLAN ${query.sql}`).bind(...query.values).all<{ detail: string }>();
+    const physical = plan.results.filter(row => row.detail.includes("scoped_record"));
+    expect(physical).toHaveLength(2);
+    for (const row of physical) expect(row.detail).toMatch(
+      /SEARCH scoped_record USING (?:COVERING )?INDEX typed_telemetry_owner_time \(owner_id=\? AND stream=\? AND observed_at_ms>\? AND observed_at_ms<\?\)/u);
+  }
+  const query = candidates[0]!;
+  const priorSql = query.sql.replaceAll("        AND scoped_record.stream=window.stream_code\n", "")
+    .replaceAll("        AND scoped_record.observed_at_ms>=window.from_ms AND scoped_record.observed_at_ms<window.through_ms\n", "");
+  const current = await db().prepare(query.sql).bind(...query.values).all();
+  const prior = await db().prepare(priorSql).bind(...query.values).all();
+  expect(current.results).toEqual(prior.results);
+  // Identical synthetic evidence, query, and complete-chunk checks. Only the
+  // physical index predicates differ; unrelated same-owner days stay undecoded.
+  // Owner-wide completeness still costs one proof read per admitted record.
+  // The added range removes the extra physical/compatibility reads, not that
+  // invariant check; this fixture measures 225 versus 626 reads.
+  expect(current.meta.rows_read).toBeLessThan(prior.meta.rows_read / 2);
+  console.info("effective-reader-window-rows", { current: current.meta.rows_read, prior: prior.meta.rows_read });
+
+  const sources = observed.queries.filter(value => value.sql.includes("selected_stream("));
+  expect(sources).toHaveLength(1);
+  const sourcePlan = await db().prepare(`EXPLAIN QUERY PLAN ${sources[0]!.sql}`)
+    .bind(...sources[0]!.values).all<{ detail: string }>();
+  const sourcePhysical = sourcePlan.results.filter(row => row.detail.includes("scoped_record"));
+  expect(sourcePhysical).toHaveLength(2);
+  for (const row of sourcePhysical) expect(row.detail).toMatch(
+    /SEARCH scoped_record USING (?:COVERING )?INDEX typed_telemetry_owner_time \(owner_id=\? AND stream=\?\)/u);
+}, 30_000);
 
 describe("effective mixed v1 usage reader", () => {
   it("folds current known totals with archived null totals and retains a late unique occurrence", async () => {

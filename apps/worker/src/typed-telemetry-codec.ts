@@ -22,8 +22,8 @@ export type TypedTelemetryErrorCode = "TYPED_TELEMETRY_INVALID" | "TYPED_TELEMET
   | "TYPED_TELEMETRY_LIMIT" | "TYPED_TELEMETRY_UNAVAILABLE";
 
 export class TypedTelemetryError extends Error {
-  constructor(readonly code: TypedTelemetryErrorCode) {
-    super(code);
+  constructor(readonly code: TypedTelemetryErrorCode, options?: ErrorOptions) {
+    super(code, options);
     this.name = "TypedTelemetryError";
   }
 }

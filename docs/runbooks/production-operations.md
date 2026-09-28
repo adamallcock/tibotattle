@@ -390,6 +390,19 @@ duplicate computation can recur and abandoned selections can remain in the
 diagnostic census until forward cleanup resumes. Do not clear checkpoint heads
 or bypass erasure to make those counts fall.
 
+Effective candidate and inventory reads constrain the physical owner/stream/time
+index before decoding records. Cross-day source expansion retains all dates.
+The compact v1.1 completeness check uses namespace, format and original chunk
+identity together, retaining its admission proofs and manifest membership.
+These query changes use existing indexes and do not require a migration.
+
+The typed reader preserves an internal, non-enumerable error cause. The graph
+boundary uses only recognized causes to retain budget/deadline deferrals or
+emit the existing closed provider classification and digest. Never log the raw
+cause: provider messages can contain SQL and identifiers. The older generic
+`818d3d27` token identifies `TYPED_TELEMETRY_UNAVAILABLE` but cannot distinguish
+a database interruption, missing evidence or a masked budget refusal.
+
 With `GRAPH_DAY_PROJECTION_FOLD=enabled` and analytics migration
 `0028_graph_day_effective_quota.sql` present, effective-history calculations also
 prepare missing quota days during any of their four quota acquisition passes.

@@ -456,6 +456,20 @@ const emptyDependencyOwner: StorageCommunityOwner = {
 };
 
 describe("bounded shared effective day dependencies", () => {
+  it("seeks typed occurrence links by owner and stream before decoding compatibility rows", async () => {
+    const observed = observeDependencyQueries(db());
+    await effectiveHistoryDependency(observed.database, emptyDependencyOwner, namespace, day(), day());
+    const query = observed.queries.find(value => value.sql.includes("selected(occurrence_id)"))!;
+    const plan = (await db().prepare(`EXPLAIN QUERY PLAN ${query.sql}`).bind(...query.values)
+      .all<{ detail: string }>()).results;
+    const typedSeeks = plan.filter(row => row.detail.includes("scoped_record"));
+    expect(typedSeeks).toHaveLength(4);
+    for (const row of typedSeeks) {
+      expect(row.detail).toContain("SEARCH scoped_record");
+      expect(row.detail).toContain("owner_id=? AND stream=?");
+    }
+  });
+
   it("matches exact singleton digests across v1, v1.1, v1.2, sessions, corrections, and selected-day links", async () => {
     const days = [day(), dayAfter(day())];
     const legacy = await createV11DeviceFixture(db());

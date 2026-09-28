@@ -1,11 +1,13 @@
 import { env, applyD1Migrations, reset, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { canonicalTelemetryV11Json, type TelemetryV11Attribution, type TelemetryV11Record } from "@app-usagemonitor/telemetry-contract";
-import { encodeTypedTelemetryId, encodeTypedTelemetryRecord, type TypedTelemetryFormat } from "../src/typed-telemetry-codec";
+import { encodeTypedTelemetryId, encodeTypedTelemetryRecord, TypedTelemetryError, type TypedTelemetryFormat } from "../src/typed-telemetry-codec";
+import { createD1InvocationBudget, D1InvocationBudgetExceededError } from '../src/d1-invocation-budget';
+import { caughtStorageGraphFailureFields, storageGraphFailureDetail, withStorageGraphFailureStage } from '../src/storage-analytics-failure';
 import { persistTypedTelemetryBatch, type TypedTelemetrySourceRecord } from "../src/typed-telemetry-repository";
 import { telemetryV11LegacyProjection } from "../src/telemetry-v11-repository";
 import {
-  readTypedTelemetryCompatibilityPage, readTypedTelemetryRowsByStorageIds,
+  readTypedTelemetryCompatibilityPage, readTypedTelemetryRowsByStorageIds, readTypedTelemetryRowsByStorageIdPages,
   TYPED_TELEMETRY_COMPATIBILITY_COLUMNS, TYPED_TELEMETRY_COMPATIBILITY_PAGE_SQL,
   type TypedTelemetryCompatibilityOptions, type TypedTelemetryCompatibilityRecord,
 } from "../src/typed-telemetry-compatibility";
@@ -67,6 +69,58 @@ function expectExact(actual: TypedTelemetryCompatibilityRecord, expected: TypedT
 beforeEach(async () => { await reset(); await applyD1Migrations(db(), migrations()); });
 
 describe("typed raw SQL compatibility and exact bounded JSON reader", () => {
+  const readers=[
+    ['owner page',(database:D1Database,_id:number)=>readTypedTelemetryCompatibilityPage(database,options('usage'))],
+    ['physical IDs',(database:D1Database,id:number)=>readTypedTelemetryRowsByStorageIds(database,
+      {sourceNamespace:namespace,participantId,storageRowIds:[id]})],
+    ['physical ID pages',(database:D1Database,id:number)=>readTypedTelemetryRowsByStorageIdPages(database,
+      [{sourceNamespace:namespace,participantId,storageRowIds:[id]}])],
+  ] as const;
+
+  it.each(readers)('preserves a provider failure cause through the %s reader without changing its outward error',async(_name,read)=>{
+    await persistTypedTelemetryBatch(db(),[source('v11',17,usage('v11'))]);
+    const id=(await db().prepare('SELECT id FROM typed_telemetry_records').first<number>('id'))!;
+    const cause=new Error('D1_ERROR: D1 DB exceeded its CPU time limit and was reset.');
+    const failStatement=(statement:D1PreparedStatement):D1PreparedStatement=>new Proxy(statement,{get(value,key){
+      if(key==='bind')return(...args:unknown[])=>failStatement(value.bind(...args));
+      if(key==='all')return()=>Promise.reject(cause);
+      const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;
+    }});
+    const failed=new Proxy(db(),{get(value,key){
+      if(key==='prepare')return(sql:string)=>sql.includes('typed_telemetry_compatibility_records')
+        ?failStatement(value.prepare(sql)):value.prepare(sql);
+      if(key==='batch')return()=>Promise.reject(cause);
+      const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;
+    }});
+    const error=await read(failed,id).catch(error=>error);
+    expect(error).toBeInstanceOf(TypedTelemetryError);
+    expect(error).toMatchObject({name:'TypedTelemetryError',code:'TYPED_TELEMETRY_UNAVAILABLE',message:'TYPED_TELEMETRY_UNAVAILABLE'});
+    expect(error.cause).toBe(cause);
+    expect(Object.getOwnPropertyDescriptor(error,'cause')?.enumerable).toBe(false);
+    expect(JSON.stringify(error)).not.toContain('D1 DB');
+    expect(caughtStorageGraphFailureFields('graph_history_reader',error)).toEqual({phase:'graph_history_reader',reason:'d1_cpu_limit'});
+  });
+
+  it.each(readers)('preserves an actual invocation-budget deferral through the %s reader',async(_name,read)=>{
+    await persistTypedTelemetryBatch(db(),[source('v11',17,usage('v11'))]);
+    const id=(await db().prepare('SELECT id FROM typed_telemetry_records').first<number>('id'))!;
+    // The real schema statement succeeds. The first hydration statement then
+    // exhausts the same adapter used by scheduled graph work, inside the reader.
+    const meter=createD1InvocationBudget(1);
+    let typed:TypedTelemetryError|undefined;
+    const error=await withStorageGraphFailureStage<unknown>('graph_model_compute',()=>read(meter.wrap(db()),id).catch(error=>{
+      expect(error).toBeInstanceOf(TypedTelemetryError);typed=error;
+      // Before cause preservation, this actual meter refusal had exactly the
+      // same fingerprint as a missing typed row or an unavailable database.
+      expect(storageGraphFailureDetail(new TypedTelemetryError(error.code))).toBe('818d3d27');
+      throw error;
+    })).catch(error=>error);
+    expect(error).toBeInstanceOf(D1InvocationBudgetExceededError);
+    expect(typed?.cause).toBe(error);
+    expect(meter.queriesUsed).toBe(1);
+    expect(caughtStorageGraphFailureFields('graph_model_compute',error)).toBeUndefined();
+  });
+
   it("reconstructs authority-selected physical rows in requested order across streams", async () => {
     const rows = [source("v11", 17, usage("v11")), source("v11", 41, quota("v11")), source("v11", 90, session("v11"))];
     await persistTypedTelemetryBatch(db(), rows);

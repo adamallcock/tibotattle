@@ -1,5 +1,6 @@
 import { D1InvocationBudgetExceededError } from './d1-invocation-budget';
 import { V11ProjectionDeadlineExceededError } from './v11-daily-projection';
+import { TypedTelemetryError } from './typed-telemetry-codec';
 
 export const STORAGE_GRAPH_OPERATION_STAGES=[
  'graph_scope','graph_historical_pin','graph_checkpoint_load',
@@ -30,11 +31,23 @@ export class StorageGraphOperationError extends Error {
  }
 }
 
+/** The typed reader keeps its content-free outward error code. Only this
+ * recognized unavailable wrapper may reveal its internal cause to the graph
+ * classifier; arbitrary application causes are not diagnostic authority.
+ * Bound traversal even if a malformed error chain contains a cycle. */
+function diagnosticCause(error:unknown):unknown {
+ for(let depth=0;depth<4&&error instanceof TypedTelemetryError&&error.code==='TYPED_TELEMETRY_UNAVAILABLE';depth++){
+  const cause=error.cause;if(!(cause instanceof Error)||cause===error)break;error=cause;
+ }
+ return error;
+}
+
 /** 32-bit FNV-1a of the error name and message. The scheduler log carries
  * only this token; an operator matches it offline against the kernel's static
  * error strings. A provider message with SQL or identifiers is not recoverable
  * from it and is never logged. */
 export function storageGraphFailureDetail(error:unknown):string|undefined{
+ error=diagnosticCause(error);
  if(error instanceof StorageGraphOperationError)return error.detail;
  if(!(error instanceof Error))return undefined;
  const text=`${error.name}:${error.message}`;let hash=0x811c9dc5;
@@ -50,6 +63,8 @@ export interface StorageGraphFailureFields {
 /** D1 may attach SQL, bindings or account data to its message. Inspect only a
  * closed list of provider phrases and retain only the static classification. */
 export function classifyStorageGraphFailure(error:unknown):StorageGraphFailureReason{
+ error=diagnosticCause(error);
+ if(error instanceof StorageGraphOperationError)return error.reason;
  const message=error instanceof Error?error.message.toLowerCase():'';
  if(message==='storage_history_checkpoint_unavailable')return 'checkpoint_unavailable';
  if(message==='storage_v1_history_checkpoint_mismatch')return 'checkpoint_mismatch';
@@ -69,6 +84,7 @@ export function classifyStorageGraphFailure(error:unknown):StorageGraphFailureRe
 /** Controlled budget/deadline exhaustion remains a deferred pass. Existing
  * classified failures also keep their innermost actionable operation stage. */
 export function rethrowStorageGraphFailure(stage:StorageGraphOperationStage,error:unknown):never{
+ error=diagnosticCause(error);
  if(error instanceof D1InvocationBudgetExceededError||error instanceof V11ProjectionDeadlineExceededError
    ||error instanceof StorageGraphOperationError)throw error;
  throw new StorageGraphOperationError(stage,classifyStorageGraphFailure(error),storageGraphFailureDetail(error));
@@ -90,6 +106,7 @@ export function storageGraphFailureFields(error:unknown):StorageGraphFailureFiel
  * query-budget or deadline exhaustion into a scheduler failure. */
 export function caughtStorageGraphFailureFields(stage:StorageGraphOperationStage,
  error:unknown):StorageGraphFailureFields|undefined {
+ error=diagnosticCause(error);
  if(error instanceof D1InvocationBudgetExceededError||error instanceof V11ProjectionDeadlineExceededError)return undefined;
  if(error instanceof StorageGraphOperationError)return {phase:error.stage,reason:error.reason};
  return {phase:stage,reason:classifyStorageGraphFailure(error)};

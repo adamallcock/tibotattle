@@ -196,7 +196,7 @@ export async function readTypedTelemetryCompatibilityPage(db: D1Database, option
     } : null };
   } catch (error) {
     if (error instanceof TypedTelemetryError) throw error;
-    throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE");
+    throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE", { cause: error });
   }
 }
 /** Shared bounded decoder. Exact source membership is checked before returning
@@ -325,7 +325,7 @@ export async function readTypedTelemetryRowsByStorageIds(db: D1Database, options
     return await decodeRows(db, ids.map(id => found.get(id)!), { sourceNamespace, participantId });
   } catch (error) {
     if (error instanceof TypedTelemetryError) throw error;
-    throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE");
+    throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE", { cause: error });
   }
 }
 
@@ -364,7 +364,7 @@ export async function readTypedTelemetryRowsByStorageIdPages(db:D1Database,
    if(rows.some((row:Row|undefined)=>!row))throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE");return rows as Row[];});
   const tools=await readSessionTools(db,ordered.flat());
   return Promise.all(ordered.map((rows,index)=>decodeRows(db,rows,normalized[index]!,tools)));
- }catch(error){if(error instanceof TypedTelemetryError)throw error;throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE");}
+ }catch(error){if(error instanceof TypedTelemetryError)throw error;throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE",{cause:error});}
 }
 
 /** Internal usage-only analytical page. SQL has already bounded and pinned its

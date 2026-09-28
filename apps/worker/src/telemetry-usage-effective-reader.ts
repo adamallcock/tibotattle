@@ -22,6 +22,7 @@ import {
   type UsageCorrectionSource,
 } from "./telemetry-usage-reconciliation";
 import { sha256Hex } from "./crypto";
+import { TYPED_V11_CHUNK_PROOF_COUNT_SQL } from "./typed-v11-chunk-completeness";
 import {
   readTelemetryV12EffectiveCandidatePage,
   readTelemetryV12EffectiveOccurrences,
@@ -83,6 +84,10 @@ export interface EffectiveUsageReaderOptions {
 }
 
 export type EffectiveTelemetryStream = "usage" | "quota" | "session";
+
+function effectiveStreamCode(stream: EffectiveTelemetryStream): number {
+  return stream === "usage" ? 1 : stream === "quota" ? 2 : 3;
+}
 
 export interface EffectiveTelemetryReaderOptions extends EffectiveUsageReaderOptions {
   readonly stream: EffectiveTelemetryStream;
@@ -389,17 +394,23 @@ const COMPLETE_CHUNKS_SQL = `owner_scope(participant_id) AS (SELECT ?),
   ), complete_v11_chunks AS MATERIALIZED (
     SELECT chunk.id FROM owner_scope owner
       JOIN telemetry_v11_chunks chunk ON chunk.participant_id=owner.participant_id
-     WHERE chunk.record_count=(SELECT count(*) FROM typed_v11_record_admissions p WHERE p.chunk_id=chunk.id)
+     WHERE chunk.record_count=${TYPED_V11_CHUNK_PROOF_COUNT_SQL}
   )`;
 
 // Keep the owner lookup outside compatibility decoding. Namespace/format scans
 // expand unrelated owners before the LIMIT, including an owner with no rows.
+// Admission proofs require the stored day and timestamp's UTC day to agree.
+// Constrain the physical owner/stream/time index before compatibility decoding;
+// the decoded day/stream predicates remain as source-validation fences.
 const CANDIDATE_SQL = `
-  WITH ${COMPLETE_CHUNKS_SQL}, direct AS (
+  WITH ${COMPLETE_CHUNKS_SQL}, selected_window(stream_code,from_ms,through_ms) AS (SELECT ?,?,?), direct AS (
     SELECT r.occurrence_id,r.observed_at_ms
       FROM typed_v1_owner_memberships owner_membership
+      CROSS JOIN selected_window window
       CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
        ON scoped_record.owner_id=owner_membership.typed_owner_id AND scoped_record.format=10
+        AND scoped_record.stream=window.stream_code
+        AND scoped_record.observed_at_ms>=window.from_ms AND scoped_record.observed_at_ms<window.through_ms
       CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
       JOIN typed_v1_admission_state v1
        ON v1.id=1 AND v1.runtime_contract_version=1 AND v1.source_namespace=?
@@ -421,8 +432,11 @@ const CANDIDATE_SQL = `
     UNION ALL
     SELECT r.occurrence_id,r.observed_at_ms
       FROM typed_v11_owner_memberships owner_membership
+      CROSS JOIN selected_window window
       CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
        ON scoped_record.owner_id=owner_membership.typed_owner_id AND scoped_record.format=11
+        AND scoped_record.stream=window.stream_code
+        AND scoped_record.observed_at_ms>=window.from_ms AND scoped_record.observed_at_ms<window.through_ms
       CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
       JOIN typed_v11_admission_state v11
        ON v11.id=1 AND v11.runtime_contract_version=1
@@ -462,7 +476,7 @@ const CANDIDATE_SQL = `
 async function readDirectCandidates(db: D1Database, scope: OwnerScope, options: ReturnType<typeof normalizeOptions>): Promise<CandidateRow[]> {
   try {
     const rows = (await db.prepare(CANDIDATE_SQL).bind(
-      scope.participant_id,
+      scope.participant_id, 1, Date.parse(options.day), Date.parse(options.day) + 86_400_000,
       options.sourceNamespace, options.ownerDigest, scope.participant_id, options.day,
       options.ownerDigest, scope.participant_id, options.sourceNamespace, scope.participant_id, options.day,
       options.after.observedAtMs, options.after.observedAtMs, options.after.occurrenceId, options.limit + 1,
@@ -476,12 +490,15 @@ async function readDirectCandidates(db: D1Database, scope: OwnerScope, options: 
 
 const DIRECT_SOURCE_SQL = `
   WITH ${COMPLETE_CHUNKS_SQL}, requested(occurrence_id) AS MATERIALIZED (SELECT value FROM json_each(?)),
+  selected_stream(stream_code) AS (SELECT ?),
   direct AS (
     SELECT r.storage_row_id,r.source_namespace,r.participant_id,r.device_id,r.occurrence_id,
            r.observed_at_ms,r.canonical_sha256,r.format_code
       FROM typed_v1_owner_memberships owner_membership
+      CROSS JOIN selected_stream stream
       CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
        ON scoped_record.owner_id=owner_membership.typed_owner_id AND scoped_record.format=10
+        AND scoped_record.stream=stream.stream_code
       CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
       JOIN typed_v1_admission_state v1
        ON v1.id=1 AND v1.runtime_contract_version=1 AND v1.source_namespace=?
@@ -505,8 +522,10 @@ const DIRECT_SOURCE_SQL = `
     SELECT r.storage_row_id,r.source_namespace,r.participant_id,r.device_id,r.occurrence_id,
            r.observed_at_ms,r.canonical_sha256,r.format_code
       FROM typed_v11_owner_memberships owner_membership
+      CROSS JOIN selected_stream stream
       CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
        ON scoped_record.owner_id=owner_membership.typed_owner_id AND scoped_record.format=11
+        AND scoped_record.stream=stream.stream_code
       CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
       JOIN typed_v11_admission_state v11
        ON v11.id=1 AND v11.runtime_contract_version=1
@@ -555,7 +574,7 @@ async function readDirectSourceRows(db: D1Database, scope: OwnerScope, options: 
   try {
     const rows = (await db.prepare(DIRECT_SOURCE_SQL).bind(
       scope.participant_id,
-      JSON.stringify(occurrenceIds), options.sourceNamespace, options.ownerDigest, scope.participant_id,
+      JSON.stringify(occurrenceIds), 1, options.sourceNamespace, options.ownerDigest, scope.participant_id,
       options.ownerDigest, scope.participant_id, options.sourceNamespace, scope.participant_id,
       MAX_EFFECTIVE_USAGE_SOURCE_ROWS + 1,
     ).all<DirectSourceRow>()).results;
@@ -799,7 +818,7 @@ async function readGenericDirectCandidates(
 ): Promise<GenericCandidateRow[]> {
   try {
     const rows = (await db.prepare(GENERIC_CANDIDATE_SQL).bind(
-      scope.participant_id,
+      scope.participant_id, effectiveStreamCode(options.stream), Date.parse(options.day), Date.parse(options.day) + 86_400_000,
       options.sourceNamespace, options.stream, options.ownerDigest, scope.participant_id, options.stream, options.day,
       options.stream, options.ownerDigest, scope.participant_id, options.sourceNamespace, scope.participant_id,
       options.stream, options.day, options.after.observedAtMs, options.after.observedAtMs,
@@ -824,7 +843,7 @@ async function readGenericSourceRows(
   try {
     const rows = (await db.prepare(GENERIC_SOURCE_SQL).bind(
       scope.participant_id,
-      JSON.stringify(occurrenceIds), options.sourceNamespace, options.stream, options.ownerDigest,
+      JSON.stringify(occurrenceIds), effectiveStreamCode(options.stream), options.sourceNamespace, options.stream, options.ownerDigest,
       scope.participant_id, options.stream, options.stream, options.ownerDigest, scope.participant_id,
       options.sourceNamespace, scope.participant_id, options.stream, MAX_EFFECTIVE_USAGE_SOURCE_ROWS + 1,
     ).all<GenericSourceRow>()).results;
@@ -1064,7 +1083,8 @@ export async function readEffectiveTelemetryOwnerDays(db:D1Database,input:Omit<E
     .replaceAll('SELECT r.occurrence_id,r.observed_at_ms','SELECT r.observed_day')
     .replaceAll('r.observed_day=?','r.observed_day>=? AND r.observed_day<=?');
   const rows=(await db.prepare(`${prefix}) SELECT DISTINCT observed_day FROM direct ORDER BY observed_day LIMIT 102`)
-    .bind(scope.participant_id,options.sourceNamespace,options.stream,options.ownerDigest,scope.participant_id,options.stream,fromDay,throughDay,
+    .bind(scope.participant_id,effectiveStreamCode(options.stream),Date.parse(fromDay),Date.parse(throughDay)+86_400_000,
+      options.sourceNamespace,options.stream,options.ownerDigest,scope.participant_id,options.stream,fromDay,throughDay,
       options.stream,options.ownerDigest,scope.participant_id,options.sourceNamespace,scope.participant_id,
       options.stream,fromDay,throughDay).all<{observed_day:string}>()).results;
   const days=new Set(rows.map(row=>validDay(row.observed_day)));

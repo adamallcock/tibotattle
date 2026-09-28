@@ -3,6 +3,7 @@ import { canonicalJson } from './canonical-json';
 import { sha256Hex } from './crypto';
 import { readEffectiveTelemetryOwnerDayPage, readEffectiveTelemetryOwnerDays, type EffectiveUsageReaderCursor } from './telemetry-usage-effective-reader';
 import { typedTelemetryIdSql } from './typed-telemetry-codec';
+import { TYPED_V11_CHUNK_PROOF_COUNT_SQL } from './typed-v11-chunk-completeness';
 import { advanceV11QuotaAcquisition, createV11QuotaAcquisitionCheckpoint,
   type V11QuotaAcquisitionCheckpoint, type V11CompletedQuotaAcquisition,
   type V11QuotaAcquisitionIdentity, type V11QuotaPageReader } from './quota-analysis-v11-reader';
@@ -103,6 +104,10 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
   // the stream set in the dependency identity prevents a session-enabled
   // reader from reusing a usage/quota-only checkpoint.
   const sourceStreams=includeSessions?"('usage','quota','session')":"('usage','quota')";
+  // Admission proofs require an immutable record's observed timestamp/day to
+  // match its chunk day. Apply those physical bounds before compatibility
+  // decoding, while keeping every decoded source and admission check below.
+  const typedStreams=includeSessions?'(1,2,3)':'(1,2)';
   const typedOccurrence=typedTelemetryIdSql('h.occurrence_id');
   const typedV12Occurrence=typedTelemetryIdSql('v12_record.occurrence_id');
   const typedV12LinkedOccurrence=typedTelemetryIdSql('r.occurrence_id');
@@ -167,8 +172,7 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
       SELECT chunk.id FROM scope s
         JOIN telemetry_v11_chunks chunk ON chunk.participant_id=s.participant_id
        WHERE chunk.stream IN ${sourceStreams}
-         AND chunk.record_count=(SELECT count(*) FROM typed_v11_record_admissions complete
-           WHERE complete.chunk_id=chunk.id)
+         AND chunk.record_count=${TYPED_V11_CHUNK_PROOF_COUNT_SQL}
     ), ${retainedV12} selected(occurrence_id) AS MATERIALIZED (
       SELECT r.occurrence_id
         FROM scope s
@@ -176,6 +180,10 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
           ON scoped_owner.participant_id=s.participant_id
         CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
           ON scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=10
+          AND scoped_record.stream IN ${typedStreams}
+          AND scoped_record.observed_at_ms>=s.from_ms AND scoped_record.observed_at_ms<s.through_ms
+          AND scoped_record.observed_day>=CAST(s.from_ms/86400000 AS INTEGER)
+          AND scoped_record.observed_day<CAST(s.through_ms/86400000 AS INTEGER)
         CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
         JOIN typed_v1_admission_state v1 ON v1.id=1 AND v1.runtime_contract_version=1
           AND v1.source_namespace=s.source_namespace
@@ -201,6 +209,10 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
           ON scoped_owner.participant_id=s.participant_id
         CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
           ON scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=11
+          AND scoped_record.stream IN ${typedStreams}
+          AND scoped_record.observed_at_ms>=s.from_ms AND scoped_record.observed_at_ms<s.through_ms
+          AND scoped_record.observed_day>=CAST(s.from_ms/86400000 AS INTEGER)
+          AND scoped_record.observed_day<CAST(s.through_ms/86400000 AS INTEGER)
         CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
         JOIN typed_v11_admission_state v11 ON v11.id=1 AND v11.runtime_contract_version=1
         JOIN typed_v11_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
@@ -231,15 +243,19 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
         JOIN telemetry_usage_correction_history h ON h.id=f.history_id
         JOIN scope s ON h.participant_id=s.participant_id AND lower(hex(h.owner_digest))=s.owner_digest
        WHERE h.event_time_ms>=s.from_ms AND h.event_time_ms<s.through_ms
-${selectedV12}    ), linked(family,occurrence_id,source_day,record_day,observed_at_ms,source_key,source_digest,canonical_digest,
-      record_digest,base_digest,history_id,fact_id) AS (
-      SELECT DISTINCT 'v1',r.occurrence_id,r.observed_day,r.observed_day,r.observed_at_ms,
-        chunk.id,chunk.chunk_digest,r.canonical_sha256,NULL,NULL,NULL,NULL
+${selectedV12}    ), linked(family,source_day,source_key,source_digest) AS (
+      /* Only outside-window chunk headers enter the dependency. Collapse
+       * matching occurrences here instead of materializing each record's
+       * decoded identity and digest before throwing those columns away. */
+      SELECT DISTINCT 'v1',r.observed_day,chunk.id,chunk.chunk_digest
         FROM scope s
         CROSS JOIN typed_v1_owner_memberships scoped_owner
           ON scoped_owner.participant_id=s.participant_id
         CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
           ON scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=10
+          AND scoped_record.stream IN ${typedStreams}
+          AND (scoped_record.observed_day<CAST(s.from_ms/86400000 AS INTEGER)
+            OR scoped_record.observed_day>=CAST(s.through_ms/86400000 AS INTEGER))
         CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
         JOIN selected wanted ON wanted.occurrence_id=r.occurrence_id
         JOIN typed_v1_admission_state v1 ON v1.id=1 AND v1.runtime_contract_version=1
@@ -258,14 +274,17 @@ ${selectedV12}    ), linked(family,occurrence_id,source_day,record_day,observed_
        WHERE r.participant_id=s.participant_id AND r.source_namespace=v1.source_namespace
          AND r.namespace_id=v1.namespace_id AND r.owner_id=typed_owner.id
          AND r.format_code=10 AND r.stream IN ${sourceStreams}
+         AND (r.observed_day<s.from_day OR r.observed_day>s.through_day)
       UNION
-      SELECT DISTINCT 'v11',r.occurrence_id,domain_day.observed_day,r.observed_day,r.observed_at_ms,
-        chunk.id||':'||manifest.id,manifest.manifest_digest,r.canonical_sha256,NULL,NULL,NULL,NULL
+      SELECT DISTINCT 'v11',domain_day.observed_day,chunk.id||':'||manifest.id,manifest.manifest_digest
         FROM scope s
         CROSS JOIN typed_v11_owner_memberships scoped_owner
           ON scoped_owner.participant_id=s.participant_id
         CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
           ON scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=11
+          AND scoped_record.stream IN ${typedStreams}
+          AND (scoped_record.observed_day<CAST(s.from_ms/86400000 AS INTEGER)
+            OR scoped_record.observed_day>=CAST(s.through_ms/86400000 AS INTEGER))
         CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
         JOIN selected wanted ON wanted.occurrence_id=r.occurrence_id
         JOIN typed_v11_admission_state v11 ON v11.id=1 AND v11.runtime_contract_version=1
@@ -290,9 +309,9 @@ ${selectedV12}    ), linked(family,occurrence_id,source_day,record_day,observed_
        WHERE v11.source_namespace=s.source_namespace AND r.participant_id=s.participant_id
          AND r.source_namespace=v11.source_namespace AND r.namespace_id=v11.namespace_id
          AND r.owner_id=typed_owner.id AND r.format_code=11 AND r.stream IN ${sourceStreams}
+         AND (domain_day.observed_day<s.from_day OR domain_day.observed_day>s.through_day)
 ${includeV12?`      UNION
-      SELECT 'v12',NULL,chunk.source_day,NULL,NULL,
-        chunk.id,chunk.manifest_digest,NULL,NULL,NULL,NULL,NULL
+      SELECT 'v12',chunk.source_day,chunk.id,chunk.manifest_digest
         FROM retained_v12_chunks chunk
         JOIN scope s
        WHERE (chunk.source_day<s.from_day OR chunk.source_day>s.through_day)

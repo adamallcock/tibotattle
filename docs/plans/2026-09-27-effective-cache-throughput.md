@@ -2,7 +2,7 @@
 title: Effective cache throughput follow-up
 date: 2026-09-27
 type: plan
-status: production-observed-coordination-follow-up
+status: retry-candidate-in-qualification
 ---
 
 # Effective cache throughput follow-up
@@ -273,7 +273,160 @@ after selection work so compute preserves its release reserve. Keep the
   only the three new accounting expectations are applied to its two existing
   test files. The exact candidate's five focused suites then passed 98/98 tests,
   covering claims, retirement, erasure and both affected projection pathways.
-  Its analytics dry build remains pending. Production activation of this lease
-  increment has not occurred.
+  Production activation after this qualification is recorded below.
 - Read-only production verification at 05:44:27 UTC reconfirmed source
   `214a6d3` at 100%, with the existing bindings, runtime, schedule and schema.
+- The 05:48:08 UTC aggregate recorded 237 daily days queued (oldest February 2),
+  2,084 stored graph results and 25 effective prepared day entries. This is ten
+  fewer queued days and four additional stored results than before activation.
+  The latest model publication still remained September 25.
+
+### Concrete lease candidate
+
+The clean local candidate is commit `7cf653eea2ef778ecb8ff410d98375e7c4a69b45`,
+based on deployed source `214a6d3`. It contains five runtime files, five test
+files and the updated plan/runbook. The branch has not been pushed. All ten
+runtime/test files are hash-pinned to the qualified candidate checkout.
+
+The analytics-only dry build passed using the verified production configuration.
+It contains the effective lease, live remaining-budget getter, 40-statement
+release reserve and erasure-selection fence. The JavaScript is 1,373,406 bytes,
+SHA-256 `1ea6ec023b6be1164b91131175e10d799a6c51f3700c4c96acc977e1aee6e78a`;
+upload configuration SHA-256 is
+`2f9b2f9f68074ad7c0f51a1c73546f9091dbb575d383d89c912680b6dfcd5cd0`.
+These checks qualify this analytics artifact, not website or staging release
+gates skipped after the original full command's count-assertion failures.
+
+Read-only preflight matched the pinned artifact and live predecessor, complete
+schema/ledger, bindings, settings and schedule. Rollback for this candidate is
+version `599bad71-a603-493a-9d0b-27d77d283862`, source `214a6d3`. No migration,
+new resource, schedule change or manual workload is planned. Additional
+production deployment authorization was requested for this exact candidate
+before the activation recorded below.
+
+## Lease production activation on 2026-09-28
+
+The owner explicitly approved deployment of `7cf653ee`. A fresh preflight
+matched the clean candidate and pinned artifact, active predecessor, complete
+schema/ledger, bindings, settings and cron before acquiring the shared
+production coordination lock. No migration or manual workload was submitted.
+
+- The pre-activation aggregate at 06:42:14.989 UTC recorded 228 daily days
+  queued, 2,087 stored graph results and 44 effective prepared day entries.
+  Public model publication had advanced to September 27 on the previous build.
+- Activation began at 06:42:56.679 UTC for source
+  `7cf653eea2ef778ecb8ff410d98375e7c4a69b45`.
+- Version `c4a3cc05-a0ce-411c-a608-72fa37a05434` was activated at 100%.
+- Independent readback at 06:43:14.657 UTC confirmed the exact active version,
+  source, bindings, runtime settings, every-minute schedule and schema.
+- Bounded observation of natural scheduled work began, including at least one
+  longer pass. The shared operation lock was held during these checks;
+  completed-result throughput and failure counts were initially unqualified.
+- At 06:47:22 UTC the queue had 227 daily days and the effective cache had
+  48 prepared dates, with 2,087 stored graph results. The first six captured
+  runs were clean, without reported checkpoint conflicts. A lease observation
+  at 06:49:48 found all effective selections pending, showing no active claim
+  remained at that instant; at 06:51:53 one effective long-pass claim was active
+  with 513,586 ms remaining. No leases were manually released or cleared.
+- An aggregate-only, temporary Cloudflare telemetry query at 06:51:15 covered
+  eight completed invocations of this exact version. Mean wall time was
+  57,301.375 ms versus 950.875 ms of CPU; maxima were 62,044 ms and 1,831 ms
+  respectively. This points to external-work waiting as a performance limit;
+  it does not identify individual slow queries or prove D1 is the sole cause.
+- At 06:53:37 two invocations reported lane failures while their outer outcomes
+  remained `ok`: the longer pass reported `graph_model_compute / application`
+  (fingerprint `818d3d27`), and a nearby minute pass reported
+  `graph_scope / d1_cpu_limit` (`61b3db2c`). The longer pass used 683 statements
+  and completed no graph result. These are failures even without an uncaught
+  exception. The two fingerprints were absent from a retained-log query of the
+  predecessor's 04:42–06:42 window; that does not establish a code regression
+  because the underlying provider messages and individual queries are unknown.
+- Independent readback at 06:55:39 again matched the exact active version,
+  bindings, runtime, schedule and schema. Subsequent minute runs recovered
+  without reported failures. At 06:56:54 the daily queue was 223, effective
+  prepared dates 57 and stored graph results still 2,087. The September 26
+  endpoint checkpoint advanced from ordinal 19,886 at 06:52:30 to 24,342,
+  confirming further intermediate work after the burst. At that point the
+  deployment remained active; no rollback or additional code change had been made.
+
+### Failed canary and verified rollback
+
+The initial observation ended at 06:58:42 with 15 invocations and two reported
+lane failures. A bounded follow-up was started to check a second longer pass.
+At 07:00:07 the model-compute failure `818d3d27` repeated, followed by
+`COLLECTION_CONTROL_UNAVAILABLE` and an uncaught exception. This failed the
+canary before a second longer pass could qualify it. The original provider
+cause remains unidentified; no claim that the lease code caused it is made.
+
+- The combined captured sample contains 17 distinct scheduled times: 16 `ok`
+  outcomes and one `exception`, with three lane-failure records across three
+  invocations. It contains no completed graph calculation or daily publication,
+  and no reported checkpoint contention. Successful outer outcomes do not
+  erase the caught lane failures.
+- The last pre-rollback aggregate at 06:59:52 had 222 daily days queued,
+  2,087 stored graph results and 57 effective prepared dates. The September 26
+  endpoint checkpoint had reached ordinal 27,964. These are queue/cache and
+  intermediate-checkpoint gains, not a completed-result throughput result.
+- Rollback began at 07:02:17.904 UTC and verified at 07:02:19.818 UTC.
+  Production again uses version `599bad71-a603-493a-9d0b-27d77d283862`, source
+  `214a6d390c78aab1e6bac2d0edf627750fee4f7b`, at 100%.
+- Independent verification at 07:04:04.479 UTC matched the active predecessor's
+  exact version resources, binding identities, runtime, cron and complete
+  schema/ledger. Cloudflare's latest-uploaded settings still label `7cf653ee`;
+  the deployment and active version resources identify `214a6d3`. The earlier
+  generic verifier's settings-source assertion therefore fails after rollback;
+  no metadata write was used to manufacture a match.
+- The operation released its exact shared production lock at 07:04:10.119 UTC.
+  Both candidate observers have stopped. No migration, cache reset or manual
+  lease deletion was performed; previous checkpoints and prepared data remain.
+  Candidate `7cf653ee` remains a clean local, unpushed commit for diagnosis.
+- A temporary, version-filtered retained-log query at 07:06:02 found two
+  restored-version scheduler logs reporting completion without lane failures.
+  One recorded one completed graph calculation and 615 statements; the other
+  recorded zero calculations and 286 statements. This confirms resumed work,
+  not sustained reliability or a comparable performance benchmark.
+- The final aggregate at 07:06:42 UTC showed 220 daily days queued, 2,088 stored
+  graph results and 60 effective prepared dates. Public model publication
+  remained September 27. The stored-result count independently confirms one
+  additional result since the deployment baseline; it arrived after rollback.
+
+The next performance gate is to identify the failing query or provider operation
+and qualify it on representative data before another deployment. The measured
+CPU/wall-time split supports reducing external waits, but no production
+throughput multiplier or sustained-reliability improvement is established.
+
+## Investigation and authorized retry (September 28)
+
+The owner explicitly requested investigation followed by another production
+deployment. A read-only check at 08:24 UTC confirmed restored source `214a6d3`
+at 100%, with unchanged bindings, runtime, cron and schema. At 08:23 UTC the
+queue contained 204 daily dates and 2,094 stored graph results.
+
+- The `818d3d27` token exactly matches
+  `TypedTelemetryError:TYPED_TELEMETRY_UNAVAILABLE`. The same token occurred six
+  times in retained logs from the restored version after rollback. It is not
+  specific to the lease candidate. The typed reader discarded the underlying
+  cause, so historical logs cannot distinguish a provider failure from an
+  intentional inner query-budget refusal.
+- Local tests reproduced that masking through all three typed-reader entrypoints
+  using a real invocation meter. The correction preserves the private,
+  non-enumerable cause and lets the graph boundary retain budget/deadline
+  deferrals and closed provider classifications. Outward error codes and privacy
+  remain unchanged; raw provider messages are not logged.
+- `61b3db2c` exactly matches the documented D1 CPU-limit/reset error. D1 query
+  Insights for 06:00–08:00 UTC showed the dependency query averaging 6.12 seconds
+  and 33.46 million rows read. Effective candidate/source queries averaged
+  1.3–2.1 seconds and 19–29 million rows read.
+- Live `EXPLAIN QUERY PLAN` identified owner-only record scans before decoding,
+  plus a repeated compact-admission completeness lookup using only namespace
+  from the `(namespace_id, format, original_id)` chunk index. The candidate adds
+  physical stream/time bounds, collapses outside-window dependency rows to the
+  required chunk headers, and includes the proven `format=11` constraint in the
+  shared completeness lookup. Original admission, owner, decoded-source and
+  cross-day conflict checks remain. No migration is needed.
+- A paired read-only query at 08:39 UTC returned identical dependency rows under
+  an unchanged owner revision: 3,734,682 rows read and 1,985 ms for the proposed
+  SQL versus 33,521,609 rows and 6,217 ms for the old SQL. This is one measured
+  query comparison (8.98 times fewer rows, 3.13 times faster), not end-to-end
+  production throughput. The complete Worker gate, exact artifact and natural
+  scheduled canary remain required before declaring this retry successful.
