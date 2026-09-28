@@ -3,11 +3,13 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { canonicalJson } from '../src/canonical-json';
 import { sha256Hex } from '../src/crypto';
 import { finishEffectiveQuotaDay } from '../src/effective-quota-day';
+import {reduceGraphDayProjection} from '../src/graph-day-projection';
 import { createV11QuotaAcquisitionCheckpoint } from '../src/quota-analysis-v11-reader';
 import { STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD, storageGraphEffectiveCheckpointKey } from '../src/storage-community-graph';
 import type { StorageEffectiveHistoryCheckpoint } from '../src/storage-effective-history';
 import {
   loadStorageHistoryCheckpoint, saveStorageHistoryCheckpoint, storageHistoryKeyDigest,
+  storageHistoryCheckpointParts,
   type StorageHistoryCheckpoint, type StorageHistoryKey,
 } from '../src/storage-history-checkpoint';
 
@@ -171,5 +173,77 @@ describe('effective pending-day checkpoint codec across acquisition phases', () 
       .rejects.toThrow('STORAGE_HISTORY_CHECKPOINT_UNAVAILABLE');
     expect(await loadStorageHistoryCheckpoint({ target: target(), key: saved.key }))
       .toMatchObject({ status: 'ready', headDigest: saved.headDigest, checkpoint: checkpoint('endpoints') });
+  });
+});
+
+function usagePreparation(state:'reading'|'ready'|'disabled'|'pending'):StorageEffectiveHistoryCheckpoint {
+ const old=checkpoint('endpoints'),inputDay=old.effectiveCursor.day;
+ const {preparingQuota:_,...base}=old;
+ const observedAtMs=Date.parse(`${inputDay}T12:00:00.000Z`);
+ const projection=reduceGraphDayProjection(inputDay,[],{rowsRead:1,events:[{sessionDigest:'d'.repeat(64),
+  observedAtMs,provider:'openai_codex',accountScopeId:null,planBasis:null,planType:null,planEraId:null,
+  kind:'priced',model:'gpt-5.6-sol',costNanousd:10}]});
+ return {...base,phase:'finish',acquisition:{identity:base.identity,planAnchors:[],quotaRows:[]},
+  effectiveDays:{quota:base.effectiveDays.quota,usage:[inputDay]},usagePreparation:state==='disabled'?{state}:
+   state==='pending'?{state,rowsRead:200}:state==='ready'?{state,rowsRead:201,day:{projection}}:
+    {state,rowsRead:201,day:{projection,lastObservedAtMs:observedAtMs},
+    after:{observedAtMs,occurrenceId:'synthetic-usage-tail'}}};
+}
+describe('compact effective model usage preparation codec',()=>{
+ it.each(['reading','ready'] as const)('replays an interrupted >30-part %s successor from the same durable head',async state=>{
+  const original=await key(),usageKey=await storageGraphEffectiveCheckpointKey({...original,dependencyDigest:'b'.repeat(64)},true,5);
+  const prior=usagePreparation(state);
+  const first=await saveStorageHistoryCheckpoint({target:target(),key:usageKey,checkpoint:prior,expectedHead:null});
+  if(first.status!=='saved')throw new Error('synthetic prior did not promote');
+  const inputDay=prior.effectiveDays.usage[0]!,at=Date.parse(`${inputDay}T12:00:00.000Z`),rows=11_000;
+  const projection=reduceGraphDayProjection(inputDay,[],{rowsRead:rows,events:Array.from({length:rows},(_,index)=>({
+   sessionDigest:null,observedAtMs:at,provider:'openai_codex',
+   accountScopeId:`account-track:v2:${index.toString(16).padStart(64,'0')}`,
+   planBasis:'same_source_occurrence' as const,planType:'pro',planEraId:`plan-era:v1:${'b'.repeat(64)}`,
+   kind:'priced' as const,model:'gpt-5.6-sol',costNanousd:10}))});
+  const value:StorageEffectiveHistoryCheckpoint={...prior,usagePreparation:state==='ready'?{state,rowsRead:rows,day:{projection}}:
+   {state,rowsRead:rows,day:{projection,lastObservedAtMs:at},after:{observedAtMs:at,occurrenceId:'synthetic-large-usage-tail'}}};
+  expect(await storageHistoryCheckpointParts(usageKey,value)).toBeGreaterThan(30);
+  let lost=false;
+  const interrupted=new Proxy(target(),{get(database,key){
+   if(key==='batch')return async(statements:D1PreparedStatement[])=>{
+    const result=await database.batch(statements);if(!lost){lost=true;throw new Error('synthetic committed usage checkpoint loss');}return result;
+   };const result=Reflect.get(database,key);return typeof result==='function'?result.bind(database):result;
+  }});
+  await expect(saveStorageHistoryCheckpoint({target:interrupted,key:usageKey,checkpoint:value,
+   expectedHead:first.headDigest,maxWrites:8})).rejects.toThrow('synthetic committed usage checkpoint loss');
+  expect(await loadStorageHistoryCheckpoint({target:target(),key:usageKey})).toMatchObject({status:'ready',headDigest:first.headDigest,checkpoint:prior});
+  let saved=await saveStorageHistoryCheckpoint({target:target(),key:usageKey,checkpoint:value,expectedHead:first.headDigest});
+  for(let count=0;saved.status==='staging'&&count<4;count++)saved=await saveStorageHistoryCheckpoint({target:target(),
+   key:usageKey,checkpoint:value,expectedHead:first.headDigest,cursor:saved.cursor});
+  expect(saved.status).toBe('saved');
+  let loaded=await loadStorageHistoryCheckpoint({target:target(),key:usageKey,maxParts:32});
+  for(let count=0;loaded.status==='deferred'&&count<4;count++)loaded=await loadStorageHistoryCheckpoint({target:target(),
+   key:usageKey,maxParts:32,cursor:loaded.cursor});
+  expect(loaded).toMatchObject({status:'ready',checkpoint:value});
+ },30_000);
+ it.each(['reading','ready','disabled','pending'] as const)('roundtrips closed %s state under a separately versioned key',async state=>{
+  const original=await key(),usageKey=await storageGraphEffectiveCheckpointKey({...original,dependencyDigest:'b'.repeat(64)},true,5);
+  const value=usagePreparation(state);
+  const saved=await saveStorageHistoryCheckpoint({target:target(),key:usageKey,checkpoint:value,expectedHead:null});
+  expect(saved.status).toBe('saved');
+  expect(await loadStorageHistoryCheckpoint({target:target(),key:usageKey})).toMatchObject({status:'ready',checkpoint:value});
+  expect(await loadStorageHistoryCheckpoint({target:target(),key:original})).toMatchObject({status:'absent'});
+ });
+ it.each(['unknown','after','row-time','wrong-day','acquisition','quota-buffer','raw-session','counter-low','counter-high','counter-type'] as const)(
+  'rejects an incompatible compact usage preparation: %s',async kind=>{
+   const value=usagePreparation('reading') as any;
+   if(kind==='unknown')value.usagePreparation.private=true;
+   if(kind==='after')value.usagePreparation.after.observedAtMs++;
+   if(kind==='row-time')value.usagePreparation.day.lastObservedAtMs--;
+   if(kind==='wrong-day')value.effectiveDays.usage=['2026-05-30'];
+   if(kind==='acquisition'){value.phase='acquisition';value.acquisition=checkpoint('endpoints').acquisition;}
+   if(kind==='quota-buffer')value.quotaCoverage=withCoverage('ready').quotaCoverage;
+   if(kind==='raw-session')value.usagePreparation.day.projection.usage.sessions[0].sessionDigest='synthetic-raw-session';
+   if(kind==='counter-low')value.usagePreparation.rowsRead=0;
+   if(kind==='counter-high')value.usagePreparation.rowsRead=1_000_001;
+   if(kind==='counter-type')value.usagePreparation.rowsRead='201';
+   await expect(save(value)).rejects.toThrow('STORAGE_HISTORY_CHECKPOINT_UNAVAILABLE');
+   expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(0);
   });
 });

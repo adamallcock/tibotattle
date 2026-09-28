@@ -78,7 +78,10 @@ async function read(key: StorageHistoryKey) {
 }
 
 async function drainRetirement(at = nowMs) {
-  for (let attempt = 0; attempt < 20; attempt++) {
+  // Each extra retained format adds a head and its bounded payload cleanup.
+  // Keep the drain finite, scaled to the exact synthetic retained inventory.
+  const stages=await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first<number>('n');
+  for (let attempt = 0; attempt < (stages??0)*3+8; attempt++) {
     if ((await retireStorageGraphPage(target(), sourceId, at)).state === 'idle') return;
   }
   throw new Error('synthetic retirement did not drain');
@@ -107,9 +110,10 @@ describe('effective checkpoint format keys shared with older workers', () => {
     const previous = await storageGraphEffectiveCheckpointKey(original, true, 2);
     const latePhase = await storageGraphEffectiveCheckpointKey(original, true, 3);
     const prepared = await storageGraphEffectiveCheckpointKey(original, true);
+    const usage = await storageGraphEffectiveCheckpointKey(original, true, 5);
     expect(prepared).toEqual({ ...original, dependencyDigest: expect.stringMatching(/^[a-f0-9]{64}$/u) });
     // Pin every durable namespace: earlier writers retain their rollback
-    // heads, and only v4 may hold an independent gap or a ready-to-store day.
+    // heads; v4 adds quota gaps and v5 adds model usage preparation.
     expect(previous).toEqual({ ...original, dependencyDigest: '879d09906bdb08f12308f489840f82c83b61c72da6983c2cb2abcc660917eab4' });
     expect(latePhase.dependencyDigest).toBe('bf2a2695d3f1dbffda73105d80b5c11b0f45f76c4a91a0784d09628fd3ccdeb4');
     expect(prepared.dependencyDigest).toBe('11bd69df176fa7fd13ad2b6a4dde6763b6e6aa6b294711167c2f00a3edbe0906');
@@ -117,7 +121,8 @@ describe('effective checkpoint format keys shared with older workers', () => {
     expect(await storageGraphEffectiveCheckpointKey(original, true)).toEqual(prepared);
     const changedDependency = await storageGraphEffectiveCheckpointKey({ ...original, dependencyDigest: 'd'.repeat(64) }, true);
     expect(changedDependency.dependencyDigest).not.toBe(prepared.dependencyDigest);
-    expect(new Set(await Promise.all([original, previous, latePhase, prepared].map(storageHistoryKeyDigest))).size).toBe(4);
+    expect(new Set(await Promise.all([original, previous, latePhase, prepared,usage].map(storageHistoryKeyDigest))).size).toBe(5);
+    expect(usage.method).toBe(prepared.method);
     expect(STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS).toContain(prepared.method);
     // This is the same seven-method registry the pre-cache retirement caller
     // understands, so no registration or cleanup-policy expansion enables it.
@@ -130,6 +135,7 @@ describe('effective checkpoint format keys shared with older workers', () => {
     const previous = await storageGraphEffectiveCheckpointKey(original, true, 2);
     const latePhase = await storageGraphEffectiveCheckpointKey(original, true, 3);
     const prepared = await storageGraphEffectiveCheckpointKey(original, true);
+    const usage = await storageGraphEffectiveCheckpointKey(original,true,5);
     const abandoned = { ...original, method: `${original.method}:quota-days-1` };
     expect(await retireStorageHistoryCheckpoint({ target: target(), key: abandoned, expectedHead: null }))
       .toEqual({ status: 'retired' });
@@ -137,11 +143,13 @@ describe('effective checkpoint format keys shared with older workers', () => {
     const previousHead = await save(previous, true);
     const lateHead = await save(latePhase, true);
     const preparedHead = await save(prepared, true);
+    const usageHead = await save(usage,true);
     await drainRetirement();
     expect(await read(original)).toMatchObject({ status: 'ready', headDigest: oldHead, checkpoint: checkpoint(false) });
     expect(await read(previous)).toMatchObject({ status: 'ready', headDigest: previousHead, checkpoint: checkpoint(true) });
     expect(await read(latePhase)).toMatchObject({ status: 'ready', headDigest: lateHead, checkpoint: checkpoint(true) });
     expect(await read(prepared)).toMatchObject({ status: 'ready', headDigest: preparedHead, checkpoint: checkpoint(true) });
+    expect(await read(usage)).toMatchObject({status:'ready',headDigest:usageHead,checkpoint:checkpoint(true)});
     await expectRetired(abandoned);
 
     // Even if an older result exactly matches the old storage dependency, its
@@ -154,6 +162,7 @@ describe('effective checkpoint format keys shared with older workers', () => {
     expect(await read(previous)).toMatchObject({ status: 'ready', headDigest: previousHead, checkpoint: checkpoint(true) });
     expect(await read(latePhase)).toMatchObject({ status: 'ready', headDigest: lateHead, checkpoint: checkpoint(true) });
     expect(await read(prepared)).toMatchObject({ status: 'ready', headDigest: preparedHead, checkpoint: checkpoint(true) });
+    expect(await read(usage)).toMatchObject({status:'ready',headDigest:usageHead,checkpoint:checkpoint(true)});
     await expectRetired(abandoned);
     expect(await target().prepare('SELECT count(*) n FROM analytics_community_graph_results').first('n')).toBe(1);
   });
@@ -164,6 +173,7 @@ describe('effective checkpoint format keys shared with older workers', () => {
       storageGraphEffectiveCheckpointKey(baseKey(metric), true, 2),
       storageGraphEffectiveCheckpointKey(baseKey(metric), true, 3),
       storageGraphEffectiveCheckpointKey(baseKey(metric), true),
+      storageGraphEffectiveCheckpointKey(baseKey(metric), true, 5),
     ]));
     for (const key of keys) await save(key, true);
     if (authority === 'owner-state') {
@@ -180,7 +190,7 @@ describe('effective checkpoint format keys shared with older workers', () => {
   });
 
   it('keeps all prepared formats through their final retained UTC day and retires them at the next boundary', async () => {
-    const keys = await Promise.all(([2, 3, 4] as const).map(format => storageGraphEffectiveCheckpointKey(baseKey('model'), true, format)));
+    const keys = await Promise.all(([2, 3, 4, 5] as const).map(format => storageGraphEffectiveCheckpointKey(baseKey('model'), true, format)));
     const heads = [];
     for (const key of keys) heads.push(await save(key, true));
     const finalDay = Date.parse(`${day}T00:00:00.000Z`) + (ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS - 1) * 86_400_000;

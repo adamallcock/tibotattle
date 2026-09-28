@@ -25,7 +25,7 @@ import {initializeStorageAnalyticsRuntime,advanceStorageAnalytics,runStorageAnal
 import {drainCommunityPublicSourceBootstrap} from '../src/community-daily-aggregates';
 import {readStorageCommunityOwnerPage} from '../src/storage-community-authority';
 import {COMMUNITY_ALLOWANCE_FIT_METHOD} from '../src/community-allowance';
-import {captureStorageGraphScope,computeStorageGraphResult,readStorageGraphResult,storageGraphDependencyDigest,
+import {captureStorageGraphScope,computeStorageGraphResult as computeGraphResult,readStorageGraphResult,storageGraphDependencyDigest,
  STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,
  STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD,type StorageGraphScope,
  storageGraphEffectiveCheckpointMethod,storageGraphEffectiveCheckpointKey,
@@ -47,6 +47,11 @@ const b=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_MIGRATIONS:D1Migration[
  TEST_INGESTION_ISOLATION_MIGRATIONS:D1Migration[];TEST_ANALYTICS_MIGRATIONS:D1Migration[]};
 const source=()=>b.USAGE_MONITOR_DB,target=()=>b.STORAGE_ANALYTICS_DB,sourceId='synthetic-history-integration';
 const namespace='synthetic-history-origin',day='2026-09-05';
+// These retained gates measure quota preparation/checkpoint recovery. Keep the
+// usage input strategy fixed; storage-effective-usage-profile owns its paired
+// model-only rollout and source-read/performance assertions.
+const computeStorageGraphResult=(bindings:Parameters<typeof computeGraphResult>[0],scope:Parameters<typeof computeGraphResult>[1],
+ options:Parameters<typeof computeGraphResult>[2]={})=>computeGraphResult(bindings,scope,{preparedEffectiveUsage:false,...options});
 const bindings=()=>({source:source(),target:target(),sourceId,sourceNamespace:namespace});
 function observePreparedSql(database:D1Database){
  const queries:string[]=[];

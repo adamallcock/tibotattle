@@ -12,11 +12,11 @@ import { decodeV1UsageReductionCheckpoint,encodeV1UsageReductionCheckpoint,
 import type { StorageV1HistoryCheckpoint } from './storage-v1-history';
 import type { StorageV11HistoryCheckpoint } from './storage-v11-history';
 import { isV11GenerationSnapshot } from './typed-v11-quota-reader';
-import { validEffectiveDays,validEffectiveQuotaCursor,validEffectiveQuotaCoverage } from './storage-effective-history';
-import type { StorageEffectiveHistoryCheckpoint,EffectiveQuotaCoverage } from './storage-effective-history';
+import { validEffectiveDays,validEffectiveQuotaCursor,validEffectiveQuotaCoverage,validEffectiveUsagePreparation } from './storage-effective-history';
+import type { StorageEffectiveHistoryCheckpoint,EffectiveQuotaCoverage,EffectiveUsagePreparationState } from './storage-effective-history';
 import {validEffectiveQuotaDayPending,type EffectiveQuotaDayPending} from './effective-quota-day';
 import { GRAPH_DAY_PROJECTION_COMPONENTS,graphDayProjectionComponentEntries,graphDayProjectionFromComponents,
- type GraphDayProjectionComponent } from './graph-day-projection-values';
+ validGraphDayProjection,type GraphDayProjectionComponent } from './graph-day-projection-values';
 export type StorageHistoryCheckpoint=StorageV1HistoryCheckpoint|StorageV11HistoryCheckpoint|StorageEffectiveHistoryCheckpoint;
 export const STORAGE_HISTORY_PART_BYTES=128*1024,STORAGE_HISTORY_CONTROL_BYTES=16*1024;
 export const STORAGE_HISTORY_MAX_PARTS=1024,STORAGE_HISTORY_MAX_WRITES=32;
@@ -98,6 +98,39 @@ function encodeEffectiveCoverage(coverage:EffectiveQuotaCoverage,components:Reco
  }
  return {next:coverage.next,refusedDays:coverage.refusedDays,pending:meta};
 }
+function decodeEffectiveUsagePreparation(value:unknown,components:Record<string,unknown[]>):EffectiveUsagePreparationState|undefined{
+ const hasParts=()=>Object.keys(components).some(name=>name.startsWith('effectiveUsage:'));
+ if(value===undefined){if(hasParts())throw fail();return undefined;}
+ if(!value||typeof value!=='object'||Array.isArray(value))throw fail();
+ const meta=value as Record<string,unknown>;
+ if(meta.state==='disabled'){
+  if(Object.keys(meta).join(',')!=='state'||hasParts())throw fail();return {state:'disabled'};
+ }
+ if(meta.state==='pending'){
+  if(Object.keys(meta).sort().join(',')!=='rowsRead,state'||hasParts()||typeof meta.rowsRead!=='number')throw fail();
+  return {state:'pending',rowsRead:meta.rowsRead};
+ }
+ if(meta.state!=='reading'&&meta.state!=='ready'||typeof meta.day!=='string'
+  ||typeof meta.rowsRead!=='number'||Object.keys(meta).sort().join(',')!==
+    (meta.state==='reading'?'after,day,lastObservedAtMs,rowsRead,state':'day,rowsRead,state'))throw fail();
+ const parts:Partial<Record<GraphDayProjectionComponent,unknown[]>>={};
+ for(const name of GRAPH_DAY_PROJECTION_COMPONENTS){const key=`effectiveUsage:${name}`;
+  if(components[key]!==undefined)parts[name]=components[key];delete components[key];}
+ if(hasParts())throw fail();
+ const projection=graphDayProjectionFromComponents(meta.day,parts);
+ if(!validGraphDayProjection(projection))throw fail();
+ return meta.state==='ready'?{state:'ready',rowsRead:meta.rowsRead,day:{projection}}:
+  {state:'reading',rowsRead:meta.rowsRead,day:{projection,lastObservedAtMs:meta.lastObservedAtMs as number|null},
+   after:meta.after as Extract<EffectiveUsagePreparationState,{state:'reading'}>['after']};
+}
+function encodeEffectiveUsagePreparation(value:EffectiveUsagePreparationState,components:Record<string,unknown[]>):unknown{
+ if(value.state==='disabled')return {state:'disabled'};
+ if(value.state==='pending')return {state:'pending',rowsRead:value.rowsRead};
+ for(const [name,entries]of graphDayProjectionComponentEntries(value.day.projection))
+  components[`effectiveUsage:${name}`]=[...entries];
+ return value.state==='ready'?{state:'ready',rowsRead:value.rowsRead,day:value.day.projection.day}:
+  {state:'reading',rowsRead:value.rowsRead,day:value.day.projection.day,lastObservedAtMs:value.day.lastObservedAtMs,after:value.after};
+}
 function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistoryCheckpoint{
  const control=parse(controlText),components:Record<string,unknown[]>={};
  if(size(controlText)>STORAGE_HISTORY_CONTROL_BYTES||!control||control.version!==1
@@ -114,7 +147,9 @@ function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistor
    ||!validEffectiveDays(control.effectiveDays,control.identity.observedAtCutoff.slice(0,10),control.day))throw fail();
   try{encodeTypedTelemetryId(control.layout.slice('effective:'.length));}catch{throw fail();}
   createV11QuotaAcquisitionCheckpoint(control.identity);
+  const usagePreparation=decodeEffectiveUsagePreparation(control.usagePreparation,components);
   if(control.phase==='acquisition'){
+   if(usagePreparation!==undefined)throw fail();
    const preparedRows=components.effectiveQuotaRows;
    delete components.effectiveQuotaRows;
    let preparingQuota:EffectiveQuotaDayPending|undefined;
@@ -144,14 +179,18 @@ function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistor
    const usage=decodeV11UsageReductionCheckpoint(control.usage,
     Object.fromEntries(V11_USAGE_REDUCTION_COMPONENTS.map(name=>[name,components[name]??[]])));
    if(!same(usage.identity,control.identity))throw fail();
+   if(usagePreparation!==undefined&&!validEffectiveUsagePreparation(usagePreparation,
+    {phase:'usage',effectiveDays:control.effectiveDays,usage,...(coverage?{quotaCoverage:coverage}:{})}))throw fail();
    return {version:1,source:'effective',day:control.day,layout:control.layout,identity:control.identity,
     effectiveCursor:control.effectiveCursor,effectiveDays:control.effectiveDays,phase:'usage',acquisition,usage,
-    ...(coverage?{quotaCoverage:coverage}:{})};
+    ...(coverage?{quotaCoverage:coverage}:{}),...(usagePreparation?{usagePreparation}:{})};
   }
   if(Object.keys(components).some(k=>!['planAnchors','quotaRows'].includes(k)))throw fail();
+  if(usagePreparation!==undefined&&!validEffectiveUsagePreparation(usagePreparation,
+   {phase:'finish',effectiveDays:control.effectiveDays,...(coverage?{quotaCoverage:coverage}:{})}))throw fail();
   return {version:1,source:'effective',day:control.day,layout:control.layout,identity:control.identity,
    effectiveCursor:control.effectiveCursor,effectiveDays:control.effectiveDays,phase:'finish',acquisition,
-   ...(coverage?{quotaCoverage:coverage}:{})};
+   ...(coverage?{quotaCoverage:coverage}:{}),...(usagePreparation?{usagePreparation}:{})};
  }
  if(control.source==='v1.1'){
   createV11QuotaAcquisitionCheckpoint(control.identity);
@@ -216,10 +255,13 @@ async function frame(key:StorageHistoryKey,checkpoint:StorageHistoryCheckpoint):
    }
    const coverage=checkpoint.quotaCoverage;
    if(coverage!==undefined&&!validEffectiveQuotaCoverage(coverage,checkpoint.effectiveDays.quota,checkpoint.phase,pending))throw fail();
+   const usagePreparation=checkpoint.usagePreparation;
+   if(usagePreparation!==undefined&&!validEffectiveUsagePreparation(usagePreparation,checkpoint))throw fail();
    const control=canonicalJson({version:1,source:'effective',day:checkpoint.day,layout:checkpoint.layout,
     identity:checkpoint.identity,effectiveCursor:checkpoint.effectiveCursor,effectiveDays:checkpoint.effectiveDays,phase:checkpoint.phase,
     ...(pending?{preparingQuota:{day:pending.day,quotaRowsRead:pending.quotaRowsRead}}:{}),
     ...(coverage?{quotaCoverage:encodeEffectiveCoverage(coverage,components)}:{}),
+    ...(usagePreparation?{usagePreparation:encodeEffectiveUsagePreparation(usagePreparation,components)}:{}),
     acquisition:checkpoint.phase==='acquisition'?encodeV11QuotaWorkCheckpoint(checkpoint.acquisition).control:null,
     usage:usage?.control??null});
    if(size(control)>STORAGE_HISTORY_CONTROL_BYTES)throw fail();

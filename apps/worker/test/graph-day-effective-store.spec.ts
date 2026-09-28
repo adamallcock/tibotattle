@@ -67,7 +67,7 @@ const retire = (options: { limit?: number; acquisitionVersion?: string; nowMs?: 
 describe('effective graph day store migration', () => {
   it('refuses effective staging before migration and preserves legacy keys, bytes and guards', async () => {
     await reset();
-    await initialize(b.TEST_ANALYTICS_MIGRATIONS.filter(migration => !migration.name.startsWith('0028_')));
+    await initialize(b.TEST_ANALYTICS_MIGRATIONS.filter(migration => migration.name < '0028_'));
     expect(await graphDayEffectiveQuotaSupported(target())).toBe(false);
     const value = projection(), oldKey = await graphDayProjectionValueKey(legacy());
     const prior = await writeGraphDayProjection({ target: target(), key: legacy(), projection: value });

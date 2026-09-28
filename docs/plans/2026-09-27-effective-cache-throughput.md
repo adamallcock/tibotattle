@@ -2,16 +2,99 @@
 title: Effective cache throughput follow-up
 date: 2026-09-27
 type: plan
-status: next-throughput-increment-in-progress
+status: effective-usage-local-qualification
 ---
 
 # Effective cache throughput follow-up
 
-Latest state (September 28): corrected analytics source `32bd4091` is deployed
-at 100%. The 10:10 UTC follow-up confirms advancing effective checkpoints and a
-shrinking daily queue; completed graph throughput remains low. The retry and
-follow-up evidence and the proposed next experiments are recorded at the end of
-this plan. Earlier sections preserve preceding experiments and rollback evidence.
+Latest state (September 28, 13:09 UTC): analytics source `15a5907e` remains
+deployed at 100%, with unchanged resources, schema and migration ledger.
+There are 130 queued publication dates and 2,112 stored graph results; the
+latest published model day is September 28. Four graphs completed in the
+preceding hour, none in the preceding ten minutes. The owner authorized the
+next usage performance increment. The
+[deployment receipt](../receipts/2026-09-28-analytics-throughput-increment.md)
+records exact qualification, observed costs and remaining limits. Earlier
+sections preserve preceding experiments and rollback evidence.
+
+## Current increment: reusable effective model usage
+
+1. Profile a complete heavy synthetic model job and adjacent warm job against
+   exact deployed source `15a5907e`: source reads, dependency checks, checkpoint
+   statements/bytes and elapsed time. Observe live cursors read-only; submit no
+   manual production workload.
+2. Reuse the existing exact daily model summaries for effective usage, with
+   complete-day construction, correction-aware identities, owner fences and
+   bounded fallback. Measure preparation and validation as part of the cost.
+3. Qualify identical analytical results, cross-day sessions, account changes,
+   corrections, owner erasure, interrupted writes and old-checkpoint adoption.
+   Keep result identities, the 950-statement cap and deployment topology stable.
+4. Run focused regressions, the owning Worker gate and an analytics dry build.
+   Record a concrete candidate and any remaining production gate separately.
+
+Fits requires separate profiling because it retains scalar information absent
+from model-only summaries. Queue concurrency trials (1, then 2, then 4) and
+replica reads remain subsequent enhancements, subject to measured throughput
+and database pressure. No production topology or schema change is implied by
+this local increment.
+
+### Usage increment evidence and storage decision
+
+The 12:52 UTC read-only sample shows 132 queued publication dates, 2,112 stored
+graph results and the latest public model day advanced to September 28. This
+is continuing progress on deployed source `15a5907e`, before the usage change.
+
+The synthetic v1.2 baseline on exact deployed source `15a5907e` uses 1,322 usage
+records and 61 quota records over five days. With scope capture and all compute
+work metered together, its cold model costs 454 statements and the adjacent
+model costs 230. Each scans 1,014,651 rows through v1.2 usage queries. This
+identifies repeated usage reads even after quota preparation. Final paired
+qualification uses the production migration set, which excludes migration
+0027; local elapsed times are not a production forecast.
+
+The new cache will use closed `effective-usage` graph-day keys. A forward
+analytics migration `0029_graph_day_effective_usage.sql` is required to widen
+the table layout constraint while preserving existing values, metadata, pages
+and protection triggers. Reusing the quota identity would mix incompatible
+contents; changing only the acquisition version would also be refused by the
+current schema and retired by older cleanup Workers. Usage keys include a
+digest of the model pricing/method contract in their manifest ID and the raw
+correction-aware day dependency in their manifest digest. Source and owner
+fences remain required on every use. The migration and production activation
+are separate protected gates after the exact candidate is reviewable.
+
+### Paired model qualification
+
+The candidate was tested against the production analytics migration set
+(0001–0026, 0028, plus proposed 0029), retaining the deployed compatibility
+adjustments. A synthetic v1.2 fixture contains 12,122 usage events and 61 quota
+observations over five days, including a session crossing midnight. Both paths
+meter scope capture and every compute invocation under the same 950 cap.
+
+| Work | Paged control | Prepared usage |
+| --- | ---: | ---: |
+| Cold model statements | 1,399 | 1,634 |
+| Adjacent model statements | 1,161 | 117 |
+| Combined statements | 2,560 | 1,751 |
+| Combined source rows read | 157,681,013 | 85,793,452 |
+| Combined checkpoint payload bytes | 1,799,159 | 1,238,842 |
+| Usage-page queries, cold / adjacent | 65 / 65 | 65 / 0 |
+| Compute invocations, cold / adjacent | 2 / 2 | 3 / 1 |
+
+Full analytical results match for both jobs. A real second v1.2 generation
+changes one day: that day's dependency gets a new immutable summary, all four
+other usage summaries remain byte-identical, and corrected prepared/paged
+results match. The corrected calculation reads 13 usage pages instead of
+rereading all five days. All measured invocations stay below 950 statements.
+
+This is approximately 90% fewer statements for the warm job and 32% fewer
+across cold plus warm; the cold job costs 17% more statements. A smaller
+1,322-event fixture in the main migration set costs 744 combined statements
+versus 684 for control, so small or non-repeated work can regress. Local elapsed
+times are not a production speed claim. Four-page preparation groups reduced
+checkpoint amplification; completed days and large successors retain durable
+boundaries. The full Worker gate and analytics artifact qualification remain
+pending; production still runs `15a5907e` without migration 0029.
 
 The owner requested further performance work after the production canary for
 source `42e649333dcc04050214841089736692ac36d87b`. The read-only observation at
@@ -714,3 +797,43 @@ identity, result identity, the 950 cap and deployment topology are unchanged.
 
 Queue-based parallel jobs (user-facing option 3) and D1 replica reads (option 4)
 remain explicitly deferred until this increment has a measured production result.
+
+### Pre-deployment qualification and moving baseline
+
+The isolated candidate was pinned locally as
+`15a5907ec784b1137242fd2d30cc7447a6010242`; no push or merge occurred. Its exact
+analytics-only dry build passed: 1,391,095 bytes, SHA-256
+`b8d71d50e3fff4a36032432f53aa1b22d20a111704d05c5bb4384a35eebaaafa`.
+Read-only production preflight confirmed the existing `b488c666` version and
+unchanged bindings, runtime, schedule, complete schema and migration ledger.
+The full Worker regression is still running; production has not changed.
+
+At 11:09 UTC the publication queue was 152 dates, completed graph count 2,098
+with none in the preceding hour, and retained effective cache entries 70. By
+11:10 UTC the old version had filled June 21: the sampled 69-day window had no
+absent cache heads, with 4,895,998 payload bytes. Newer 71-day dependency scopes
+still lacked September 27 and 28. This moving baseline must be retained: a later
+canary cannot attribute the June 21 repair to the candidate. Presence remains
+separate from exact dependency validity and successful folding.
+
+### Increment deployed and initial canary completed
+
+Source `15a5907e` was activated at 100% on the analytics Worker at 11:26 UTC.
+The full Worker suite passed 2,176 cases across 168 files. The umbrella command
+then stopped at the missing generated website release manifest; the separate
+exact analytics-only artifact passed. The new version's 18-run canary reported
+nine graph completions, no uncaught exceptions or lane failures, and 428–879
+statements per run. Storage independently increased from 2,098 to 2,107 graph
+results: one effective model and eight v1.1 models since activation.
+
+The publication queue moved from 148 to 144 in its separate Worker. Both large
+active effective jobs adopted format 4 and advanced beyond their retained
+format-3 checkpoints; they remain pending. The largest retained cache is below
+its byte and fragment bounds. These observations support improved progress and
+initial stability, but do not establish sustained heavy-job throughput or a
+10-times system speedup. Exact metrics, build limitations, final resource
+verification and lock release are in the
+[September 28 deployment receipt](../receipts/2026-09-28-analytics-throughput-increment.md).
+
+The approved increment and its initial production qualification are complete.
+Parallel Queue jobs and D1 replica reads remain explicitly deferred enhancements.

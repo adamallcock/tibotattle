@@ -165,21 +165,23 @@ describe('cross-store physical erasure completion',()=>{
   await expect(saveStorageHistoryCheckpoint({target:target(),key,checkpoint,expectedHead:null})).rejects.toThrow();
   await expect(target().prepare('INSERT INTO analytics_community_graph_execution VALUES(?,?,?,?,?)').bind(sourceId,o,today(),d,'checkpoint').run()).rejects.toThrow('storage_owner_erased');
  });
- it.each(['typed-v11','effective'] as const)('refuses to complete while a %s prepared graph day survives, then removes it',async(sourceLayout)=>{
+ it.each(['typed-v11','effective','effective-usage'] as const)('refuses to complete while a %s prepared graph day survives, then removes it',async(sourceLayout)=>{
   const f=await fixture();await deliver();const o=f.event.ownerDigest;
   const day='2026-09-10',dayMs=Date.parse(`${day}T00:00:00.000Z`);
   const projectionKey={sourceId,sourceLayout,sourceNamespace,ownerDigest:o,
-   deviceId:sourceLayout==='effective'?'effective-owner':'synthetic-device',
-   manifestId:sourceLayout==='effective'?'effective-owner-day':'synthetic-manifest',manifestDigest:'b'.repeat(64),day};
+   deviceId:sourceLayout==='typed-v11'?'synthetic-device':'effective-owner',
+   manifestId:sourceLayout==='effective-usage'?`effective-owner-usage-v1:${'e'.repeat(64)}`
+    :sourceLayout==='effective'?'effective-owner-day':'synthetic-manifest',manifestDigest:'b'.repeat(64),day};
   const effectiveQuota=sourceLayout==='effective'?{quotaRowsRead:1,ownerRevision:f.event.revision}:undefined;
-  const projection=reduceGraphDayProjection(day,[{sourceRowId:1,observedAtMs:dayMs+60000,
+  const effectiveUsage=sourceLayout==='effective-usage'?{ownerRevision:f.event.revision}:undefined;
+  const projection=reduceGraphDayProjection(day,sourceLayout==='effective-usage'?[]:[{sourceRowId:1,observedAtMs:dayMs+60000,
    anchor:{contextKey:'openai_codex|codex',observedAtMs:dayMs+60000,planType:'pro',planVariant:'unknown',
     continuityId:null,conflicted:false,accountScopeId:null,planBasis:'same_source_occurrence'},
    row:{occurrence_id:'occ-00000001',observed_at:new Date(dayMs+60000).toISOString(),provider:'openai_codex',
     account_scope_id:null,limit_id:'codex',plan_type:'pro',plan_variant:'unknown',continuity_id:null,
     plan_basis:'same_source_occurrence',slot:'primary',used_percent:12.5,window_duration_minutes:10080,
     resets_at:new Date(dayMs+7*86400000).toISOString()}}]);
-  expect(await writeGraphDayProjection({target:target(),key:projectionKey,projection,effectiveQuota}))
+  expect(await writeGraphDayProjection({target:target(),key:projectionKey,projection,effectiveQuota,effectiveUsage}))
    .toMatchObject({status:'stored'});
   expect(await count('analytics_graph_day_values')).toBe(1);
   // Hold the prepared day past one cleanup page. Erasure must not write a
@@ -202,7 +204,7 @@ describe('cross-store physical erasure completion',()=>{
   await drain();await requireStorageParticipantErasureComplete(b.DELETION_LEDGER,f.participantId,bindings());
   expect(await count('analytics_graph_day_values')).toBe(0);expect(await count('analytics_graph_day_pages')).toBe(0);
   expect(await count('analytics_storage_erasure_receipts')).toBe(1);
-  await expect(writeGraphDayProjection({target:target(),key:projectionKey,projection,effectiveQuota}))
+  await expect(writeGraphDayProjection({target:target(),key:projectionKey,projection,effectiveQuota,effectiveUsage}))
    .rejects.toThrow();
  });
  it('refuses to complete while graph selection metadata survives, then drains it in bounded pages',async()=>{

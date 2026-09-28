@@ -49,6 +49,7 @@ export const GRAPH_DAY_PROJECTION_MAX_WRITES = 32;
 export const GRAPH_DAY_PROJECTION_MAX_SHARDS = 256;
 export const GRAPH_DAY_EFFECTIVE_DEVICE_ID = "effective-owner";
 export const GRAPH_DAY_EFFECTIVE_MANIFEST_ID = "effective-owner-day";
+export const GRAPH_DAY_EFFECTIVE_USAGE_MANIFEST_PREFIX = "effective-owner-usage-v1:";
 
 const HASH = /^[a-f0-9]{64}$/u;
 const encoder = new TextEncoder();
@@ -85,7 +86,7 @@ export class GraphDayProjectionRefusedError extends Error {
  */
 export interface GraphDayProjectionKey {
   sourceId: string;
-  sourceLayout: "json-v11" | "typed-v11" | "effective";
+  sourceLayout: "json-v11" | "typed-v11" | "effective" | "effective-usage";
   sourceNamespace: string;
   ownerDigest: string;
   deviceId: string;
@@ -100,13 +101,15 @@ function checkKey(key: GraphDayProjectionKey): void {
   if (!key || typeof key !== "object" || Object.keys(key).sort().join(",") !== [...KEY_FIELDS].sort().join(",")
     || typeof key.sourceId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/u.test(key.sourceId)
     || !HASH.test(key.ownerDigest) || !HASH.test(key.manifestDigest)
-    || !["json-v11", "typed-v11", "effective"].includes(key.sourceLayout)
+    || !["json-v11", "typed-v11", "effective", "effective-usage"].includes(key.sourceLayout)
     || typeof key.sourceNamespace !== "string" || key.sourceNamespace.length > 256
     || (key.sourceLayout === "json-v11") !== (key.sourceNamespace.length === 0)
     || typeof key.deviceId !== "string" || key.deviceId.length < 1 || key.deviceId.length > 256
     || typeof key.manifestId !== "string" || key.manifestId.length < 1 || key.manifestId.length > 256
     || (key.sourceLayout === "effective" && (key.deviceId !== GRAPH_DAY_EFFECTIVE_DEVICE_ID
       || key.manifestId !== GRAPH_DAY_EFFECTIVE_MANIFEST_ID))
+    || (key.sourceLayout === "effective-usage" && (key.deviceId !== GRAPH_DAY_EFFECTIVE_DEVICE_ID
+      || !/^effective-owner-usage-v1:[a-f0-9]{64}$/u.test(key.manifestId)))
     || !validGraphDayLabel(key.day)) throw fail();
 }
 function bounded(value: number, min: number, max: number): void {
@@ -116,6 +119,16 @@ function bounded(value: number, min: number, max: number): void {
 export interface GraphDayEffectiveQuota {
   quotaRowsRead: number;
   ownerRevision: number;
+}
+export interface GraphDayEffectiveUsage { ownerRevision: number }
+function checkEffectiveUsage(value: GraphDayEffectiveUsage): void {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).join(",") !== "ownerRevision") throw fail();
+  bounded(value.ownerRevision, 1, Number.MAX_SAFE_INTEGER);
+}
+function checkUsageProjection(projection: GraphDayProjection): void {
+  if (projection.planAnchors.anchors.length || projection.fitFragments.fragments.length
+    || projection.runEndpoints.endpoints.length) throw fail();
 }
 function checkEffectiveQuota(value: GraphDayEffectiveQuota): void {
   if (!value || typeof value !== "object" || Array.isArray(value)
@@ -135,6 +148,20 @@ export async function graphDayEffectiveQuotaSupported(target: D1Database): Promi
         AND "notnull"=0) AS columns_ready,
     (SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger'
       AND name='analytics_graph_day_effective_quota_contract'
+      AND tbl_name='analytics_graph_day_values') AS contract_ready`)
+    .first<{ columns_ready: number; contract_ready: number }>();
+  return row?.columns_ready === 2 && row.contract_ready === 1;
+}
+
+/** Created last by 0029. A partially applied upgrade must not stage usage
+ * payloads into a store whose closed layout contract still excludes them. */
+export async function graphDayEffectiveUsageSupported(target: D1Database): Promise<boolean> {
+  const row = await target.prepare(`SELECT
+    (SELECT COUNT(*) FROM pragma_table_info('analytics_graph_day_values')
+      WHERE name IN ('quota_rows_read','effective_owner_revision') AND type='INTEGER'
+        AND "notnull"=0) AS columns_ready,
+    (SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger'
+      AND name='analytics_graph_day_effective_usage_contract'
       AND tbl_name='analytics_graph_day_values') AS contract_ready`)
     .first<{ columns_ready: number; contract_ready: number }>();
   return row?.columns_ready === 2 && row.contract_ready === 1;
@@ -223,6 +250,7 @@ export type GraphDayProjectionWrite =
 export async function writeGraphDayProjection(input: { target: D1Database; key: GraphDayProjectionKey;
   projection: GraphDayProjection; maxWrites?: number; cursor?: GraphDayProjectionWriteCursor;
   effectiveQuota?: GraphDayEffectiveQuota;
+  effectiveUsage?: GraphDayEffectiveUsage;
 }): Promise<GraphDayProjectionWrite> {
   const { target, projection } = input, key = { ...input.key };
   checkKey(key);
@@ -232,6 +260,13 @@ export async function writeGraphDayProjection(input: { target: D1Database; key: 
     checkEffectiveQuota(effectiveQuota);
     if (!await graphDayEffectiveQuotaSupported(target)) throw fail();
   } else if (effectiveQuota !== undefined) throw fail();
+  const effectiveUsage = input.effectiveUsage;
+  if (key.sourceLayout === "effective-usage") {
+    if (effectiveUsage === undefined) throw fail();
+    checkEffectiveUsage(effectiveUsage);
+    checkUsageProjection(projection);
+    if (!await graphDayEffectiveUsageSupported(target)) throw fail();
+  } else if (effectiveUsage !== undefined) throw fail();
   if (projection.day !== key.day) throw fail();
   const max = input.maxWrites ?? GRAPH_DAY_PROJECTION_MAX_WRITES;
   bounded(max, 2, GRAPH_DAY_PROJECTION_MAX_WRITES);
@@ -247,7 +282,7 @@ export async function writeGraphDayProjection(input: { target: D1Database; key: 
     for (const index of cursor.present) present.add(index);
   } else {
     const row = await target.prepare(`SELECT values_digest,part_count,record_count
-      ${effectiveQuota === undefined ? "" : ",quota_rows_read,effective_owner_revision"}
+      ${effectiveQuota === undefined && effectiveUsage === undefined ? "" : ",quota_rows_read,effective_owner_revision"}
       FROM analytics_graph_day_values WHERE value_key=?`).bind(valueKey)
       .first<{ values_digest: string; part_count: number; record_count: number;
         quota_rows_read?: number; effective_owner_revision?: number }>();
@@ -257,6 +292,10 @@ export async function writeGraphDayProjection(input: { target: D1Database; key: 
       if (effectiveQuota !== undefined) {
         checkEffectiveQuota({ quotaRowsRead: row.quota_rows_read!, ownerRevision: row.effective_owner_revision! });
         if (row.quota_rows_read !== effectiveQuota.quotaRowsRead) throw fail();
+      }
+      if (effectiveUsage !== undefined) {
+        checkEffectiveUsage({ ownerRevision: row.effective_owner_revision! });
+        if (row.quota_rows_read !== null) throw fail();
       }
       return { status: "stored", valueKey, totalParts: f.parts.length, recordCount: f.recordCount };
     }
@@ -287,12 +326,13 @@ export async function writeGraphDayProjection(input: { target: D1Database; key: 
   if (complete) {
     statements.push(target.prepare(`INSERT INTO analytics_graph_day_values
       (value_key,source_id,source_layout,source_namespace,owner_digest,device_id,manifest_id,manifest_digest,
-       day,acquisition_version,record_count,part_count,values_digest${effectiveQuota === undefined ? "" : ",quota_rows_read,effective_owner_revision"})
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?${effectiveQuota === undefined ? "" : ",?,?"}) ON CONFLICT(value_key) DO NOTHING`)
+       day,acquisition_version,record_count,part_count,values_digest${effectiveQuota === undefined && effectiveUsage === undefined ? "" : ",quota_rows_read,effective_owner_revision"})
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?${effectiveQuota === undefined && effectiveUsage === undefined ? "" : ",?,?"}) ON CONFLICT(value_key) DO NOTHING`)
       .bind(valueKey, key.sourceId, key.sourceLayout, key.sourceNamespace, key.ownerDigest, key.deviceId,
         key.manifestId, key.manifestDigest, key.day, GRAPH_DAY_PROJECTION_VERSION, f.recordCount,
-        f.parts.length, f.digest, ...(effectiveQuota === undefined ? []
-          : [effectiveQuota.quotaRowsRead, effectiveQuota.ownerRevision])));
+        f.parts.length, f.digest, ...(effectiveQuota !== undefined
+          ? [effectiveQuota.quotaRowsRead, effectiveQuota.ownerRevision]
+          : effectiveUsage !== undefined ? [null, effectiveUsage.ownerRevision] : [])));
   }
   if (statements.length) await target.batch(statements);
   const stored = complete
@@ -315,12 +355,13 @@ export interface GraphDayProjectionLoadCursor {
   components: Partial<Record<GraphDayProjectionComponent, unknown[]>>;
   loaded: number;
   effectiveQuota?: GraphDayEffectiveQuota;
+  effectiveUsage?: GraphDayEffectiveUsage;
 }
 export type GraphDayProjectionRead =
   | { status: "absent"; valueKey: string }
   | { status: "deferred"; valueKey: string; cursor: GraphDayProjectionLoadCursor }
   | { status: "ready"; valueKey: string; projection: GraphDayProjection; recordCount: number;
-      effectiveQuota?: GraphDayEffectiveQuota };
+      effectiveQuota?: GraphDayEffectiveQuota; effectiveUsage?: GraphDayEffectiveUsage };
 
 export interface GraphDayEffectiveQuotaHead {
   key: GraphDayProjectionKey;
@@ -334,23 +375,33 @@ export interface GraphDayEffectiveQuotaHead {
  * loading any payload. The returned private cursors bind the same digest and
  * counts as an ordinary manifest read; they confer no source authority. An
  * oversized candidate set is a cache miss, never silently truncated coverage. */
-export async function readGraphDayEffectiveQuotaHeads(input: {
+interface GraphDayEffectiveHeadsInput {
   target: D1Database; sourceId: string; sourceNamespace: string; ownerDigest: string;
   fromDay: string; throughDay: string; limit?: number;
-}): Promise<readonly GraphDayEffectiveQuotaHead[] | undefined> {
+}
+export function readGraphDayEffectiveQuotaHeads(input: GraphDayEffectiveHeadsInput):
+  Promise<readonly GraphDayEffectiveQuotaHead[] | undefined> {
+  return readGraphDayEffectiveHeads(input, "effective", GRAPH_DAY_EFFECTIVE_MANIFEST_ID);
+}
+export function readGraphDayEffectiveUsageHeads(input: GraphDayEffectiveHeadsInput & { manifestId: string }):
+  Promise<readonly GraphDayEffectiveQuotaHead[] | undefined> {
+  return readGraphDayEffectiveHeads(input, "effective-usage", input.manifestId);
+}
+async function readGraphDayEffectiveHeads(input: GraphDayEffectiveHeadsInput,
+  sourceLayout: "effective" | "effective-usage", manifestId: string): Promise<readonly GraphDayEffectiveQuotaHead[] | undefined> {
   const limit = input.limit ?? 1024;
   bounded(limit, 1, 1024);
-  checkKey({ sourceId: input.sourceId, sourceLayout: "effective", sourceNamespace: input.sourceNamespace,
+  checkKey({ sourceId: input.sourceId, sourceLayout, sourceNamespace: input.sourceNamespace,
     ownerDigest: input.ownerDigest, deviceId: GRAPH_DAY_EFFECTIVE_DEVICE_ID,
-    manifestId: GRAPH_DAY_EFFECTIVE_MANIFEST_ID, manifestDigest: "0".repeat(64), day: input.fromDay });
+    manifestId, manifestDigest: "0".repeat(64), day: input.fromDay });
   if (!validGraphDayLabel(input.throughDay) || input.throughDay < input.fromDay) throw fail();
   const rows = (await input.target.prepare(`WITH heads AS MATERIALIZED (
     SELECT value_key,source_id,source_layout,source_namespace,
       owner_digest,device_id,manifest_id,manifest_digest,day,acquisition_version,
       values_digest,part_count,record_count,quota_rows_read,effective_owner_revision
     FROM analytics_graph_day_values
-    WHERE source_id=? AND source_namespace=? AND source_layout='effective' AND owner_digest=?
-      AND day>=? AND day<=? AND acquisition_version=?
+    WHERE source_id=? AND source_namespace=? AND source_layout='${sourceLayout}' AND owner_digest=?
+      AND day>=? AND day<=? AND acquisition_version=? AND manifest_id=?
     ORDER BY day,value_key LIMIT ?)
     SELECT h.*,
       (SELECT COALESCE(SUM(p.entry_count),0) FROM analytics_graph_day_pages p
@@ -358,21 +409,21 @@ export async function readGraphDayEffectiveQuotaHeads(input: {
       (SELECT COALESCE(SUM(length(CAST(p.payload_json AS BLOB))),0) FROM analytics_graph_day_pages p
         WHERE p.value_key=h.value_key) AS payload_bytes
     FROM heads h ORDER BY h.day,h.value_key`).bind(input.sourceId, input.sourceNamespace, input.ownerDigest,
-      input.fromDay, input.throughDay, GRAPH_DAY_PROJECTION_VERSION, limit + 1)
+      input.fromDay, input.throughDay, GRAPH_DAY_PROJECTION_VERSION, manifestId, limit + 1)
     .all<{ value_key: string; source_id: string; source_layout: string; source_namespace: string;
       owner_digest: string; device_id: string; manifest_id: string; manifest_digest: string; day: string;
       acquisition_version: string; values_digest: string; part_count: number; record_count: number;
-      quota_rows_read: number; effective_owner_revision: number; fit_fragment_count: number;
+      quota_rows_read: number | null; effective_owner_revision: number; fit_fragment_count: number;
       payload_bytes: number }>()).results;
   if (rows.length > limit) return undefined;
   const result: GraphDayEffectiveQuotaHead[] = [];
   for (const row of rows) {
-    const key: GraphDayProjectionKey = { sourceId: row.source_id, sourceLayout: "effective",
+    const key: GraphDayProjectionKey = { sourceId: row.source_id, sourceLayout,
       sourceNamespace: row.source_namespace, ownerDigest: row.owner_digest, deviceId: row.device_id,
       manifestId: row.manifest_id, manifestDigest: row.manifest_digest, day: row.day };
     checkKey(key);
     if (row.source_id !== input.sourceId || row.source_namespace !== input.sourceNamespace
-      || row.source_layout !== "effective" || row.owner_digest !== input.ownerDigest
+      || row.source_layout !== sourceLayout || row.owner_digest !== input.ownerDigest || row.manifest_id !== manifestId
       || row.day < input.fromDay || row.day > input.throughDay
       || row.acquisition_version !== GRAPH_DAY_PROJECTION_VERSION
       || await graphDayProjectionValueKey(key) !== row.value_key || !HASH.test(row.values_digest)) throw fail();
@@ -380,11 +431,18 @@ export async function readGraphDayEffectiveQuotaHeads(input: {
     bounded(row.record_count, 0, Number.MAX_SAFE_INTEGER);
     bounded(row.fit_fragment_count, 0, row.record_count);
     bounded(row.payload_bytes, 1, row.part_count * 262144);
-    const effectiveQuota = { quotaRowsRead: row.quota_rows_read, ownerRevision: row.effective_owner_revision };
-    checkEffectiveQuota(effectiveQuota);
+    const effectiveQuota = sourceLayout === "effective"
+      ? { quotaRowsRead: row.quota_rows_read!, ownerRevision: row.effective_owner_revision } : undefined;
+    const effectiveUsage = sourceLayout === "effective-usage" ? { ownerRevision: row.effective_owner_revision } : undefined;
+    if (effectiveQuota) checkEffectiveQuota(effectiveQuota);
+    if (effectiveUsage) {
+      checkEffectiveUsage(effectiveUsage);
+      if (row.quota_rows_read !== null) throw fail();
+    }
     result.push({ key, fitFragmentCount: row.fit_fragment_count, payloadBytes: row.payload_bytes,
       cursor: { valueKey: row.value_key, digest: row.values_digest,
-      partCount: row.part_count, recordCount: row.record_count, effectiveQuota, loaded: 0, components: {} } });
+      partCount: row.part_count, recordCount: row.record_count,
+      ...(effectiveQuota ? { effectiveQuota } : { effectiveUsage }), loaded: 0, components: {} } });
   }
   return result;
 }
@@ -403,22 +461,27 @@ export async function readGraphDayProjection(input: { target: D1Database; key: G
   let cursor = input.cursor;
   if (cursor && cursor.valueKey !== valueKey) throw fail();
   if (cursor && (key.sourceLayout === "effective") !== (cursor.effectiveQuota !== undefined)) throw fail();
+  if (cursor && (key.sourceLayout === "effective-usage") !== (cursor.effectiveUsage !== undefined)) throw fail();
   if (!cursor) {
     const row = await target.prepare(`SELECT values_digest,part_count,record_count
-      ${key.sourceLayout === "effective" ? ",quota_rows_read,effective_owner_revision" : ""}
+      ${["effective", "effective-usage"].includes(key.sourceLayout) ? ",quota_rows_read,effective_owner_revision" : ""}
       FROM analytics_graph_day_values WHERE value_key=?`).bind(valueKey)
       .first<{ values_digest: string; part_count: number; record_count: number;
-        quota_rows_read?: number; effective_owner_revision?: number }>();
+        quota_rows_read?: number | null; effective_owner_revision?: number }>();
     if (!row) return { status: "absent", valueKey };
     if (!HASH.test(row.values_digest) || !Number.isSafeInteger(row.part_count) || row.part_count < 1
       || row.part_count > GRAPH_DAY_PROJECTION_MAX_PARTS || !Number.isSafeInteger(row.record_count)
       || row.record_count < 0) throw fail();
+    if (key.sourceLayout === "effective-usage" && row.quota_rows_read !== null) throw fail();
     cursor = { valueKey, digest: row.values_digest, partCount: row.part_count,
       recordCount: row.record_count, components: {}, loaded: 0,
       ...(key.sourceLayout === "effective" ? { effectiveQuota: {
-        quotaRowsRead: row.quota_rows_read!, ownerRevision: row.effective_owner_revision! } } : {}) };
+        quotaRowsRead: row.quota_rows_read!, ownerRevision: row.effective_owner_revision! } } : {}),
+      ...(key.sourceLayout === "effective-usage" ? { effectiveUsage: {
+        ownerRevision: row.effective_owner_revision! } } : {}) };
   }
   if (cursor.effectiveQuota !== undefined) checkEffectiveQuota(cursor.effectiveQuota);
+  if (cursor.effectiveUsage !== undefined) checkEffectiveUsage(cursor.effectiveUsage);
   const rows = (await target.prepare(`SELECT part_index,component,entry_count,part_digest,payload_json
     FROM analytics_graph_day_pages WHERE value_key=? AND part_index>=? ORDER BY part_index LIMIT ?`)
     .bind(valueKey, cursor.loaded, max)
@@ -443,10 +506,12 @@ export async function readGraphDayProjection(input: { target: D1Database; key: G
   }
   const candidate = graphDayProjectionFromComponents(key.day, cursor.components);
   if (!validGraphDayProjection(candidate)) throw fail();
+  if (cursor.effectiveUsage !== undefined) checkUsageProjection(candidate);
   if (await projectionDigest(candidate, cursor.effectiveQuota) !== cursor.digest
     || graphDayProjectionRecordCount(candidate) !== cursor.recordCount) throw fail();
   return { status: "ready", valueKey, projection: candidate, recordCount: cursor.recordCount,
-    ...(cursor.effectiveQuota === undefined ? {} : { effectiveQuota: cursor.effectiveQuota }) };
+    ...(cursor.effectiveQuota === undefined ? {} : { effectiveQuota: cursor.effectiveQuota }),
+    ...(cursor.effectiveUsage === undefined ? {} : { effectiveUsage: cursor.effectiveUsage }) };
 }
 
 /**
@@ -480,7 +545,7 @@ export async function retireGraphDayProjectionPage(target: D1Database, sourceId:
   // daily identity at least as fresh as the prepared input can retire it; an
   // absent, older or malformed daily cursor is not evidence of invalidation.
   const effectiveRetirement = effectiveSupported ? `
-      OR (g.source_layout='effective' AND (
+      OR (g.source_layout IN ('effective','effective-usage') AND (
         g.day<?4 OR g.source_namespace IS NOT (SELECT r.source_namespace FROM analytics_runtime_sources r
           WHERE r.source_id=g.source_id)
         OR EXISTS(SELECT 1 FROM analytics_community_daily_owners d

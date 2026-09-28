@@ -26,6 +26,7 @@ import { advanceStorageEffectiveAnalysis, assertEffectiveHistoryOwner, effective
   effectiveHistoryPin, type StorageEffectiveHistoryCheckpoint } from './storage-effective-history';
 import type { GraphDayProjection } from './graph-day-projection-values';
 import { createStorageEffectiveQuotaPreparation } from './storage-effective-quota-days';
+import { createStorageEffectiveUsagePreparation } from './storage-effective-usage-days';
 import { loadStorageHistoryCheckpoint, readStorageHistoryCheckpointHead, saveStorageHistoryCheckpoint, retireStorageHistoryCheckpoint,
   storageHistoryCheckpointParts,
   type StorageHistoryCheckpoint,type StorageHistoryKey,type StorageHistoryLoadCursor,
@@ -57,9 +58,10 @@ export function storageGraphEffectiveCheckpointMethod(metric:'fits'|'model'):str
  * analytical result identities retain their existing dependency. Disabling
  * preparation resumes the original key, and abandoned method-key tombstones
  * remain valid. Format 4 adds one independently resumable cache gap and a
- * durable ready-to-store value; preceding formats are read only for adoption. */
-export async function storageGraphEffectiveCheckpointKey(key:StorageHistoryKey,preparedQuota=false,format:2|3|4=4):Promise<StorageHistoryKey> {
-  if(format!==2&&format!==3&&format!==4)throw fail();
+ * durable ready-to-store value. Format 5 adds compact model usage preparation;
+ * preceding formats are read only for adoption. */
+export async function storageGraphEffectiveCheckpointKey(key:StorageHistoryKey,preparedQuota=false,format:2|3|4|5=4):Promise<StorageHistoryKey> {
+  if(format!==2&&format!==3&&format!==4&&format!==5)throw fail();
   return {...key,...(preparedQuota?{dependencyDigest:await sha256Hex(canonicalJson({
     checkpointFormat:`effective-quota-days-${format}`,dependencyDigest:key.dependencyDigest}))}:{})};
 }
@@ -513,6 +515,8 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
      * the module constant, so the deploy is inert until the composition root
      * passes the deployment switch. */
     preparedFold?:boolean;
+    /** Local comparison/rollback seam; fits never consumes model summaries. */
+    preparedEffectiveUsage?:boolean;
     /** Bounded comparison/rollback of checkpoint frequency. Both modes use
      * the same reader, result identity and persisted checkpoint format. */
     effectiveCheckpointPages?:1|4}={}):Promise<
@@ -529,13 +533,14 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
   const originalEffectiveKey=():StorageHistoryKey=>({sourceId:bindings.sourceId,sourceNamespace:bindings.sourceNamespace,
     ownerDigest:scope.owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
     method:storageGraphEffectiveCheckpointMethod(scope.metric)});
+  let effectiveFormat:4|5=scope.metric==='model'&&options.preparedEffectiveUsage!==false?5:4;
   const retireCompletedEffectiveCheckpoint=async()=>{
     if(scope.source!=='effective'||!(options.preparedFold??STORAGE_V11_PREPARED_FOLD)
       ||meter.remainingQueries<8||now()>=deadlineMs)return;
     // Retire only after the exact result has passed readback and source fences.
     // One bounded page installs the tombstone; existing cleanup Workers drain
     // its remaining pages even though they do not know the prepared format.
-    const key=await storageGraphEffectiveCheckpointKey(originalEffectiveKey(),true);
+    const key=await storageGraphEffectiveCheckpointKey(originalEffectiveKey(),true,effectiveFormat);
     try{
       const head=await readStorageHistoryCheckpointHead({target:bindings.target,key});
       if(head&&!head.retired)await retireStorageHistoryCheckpoint({target:bindings.target,key,
@@ -601,9 +606,16 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       ?await createStorageEffectiveQuotaPreparation({source,target:bindings.target,sourceId:bindings.sourceId,
         sourceNamespace:bindings.sourceNamespace,owner:scope.owner,
         remainingQueries:()=>meter.remainingQueries,deadlineMs:checkpointWorkDeadlineMs,now}):undefined;
+    const preparedUsage=metric==='model'&&options.preparedEffectiveUsage!==false
+      &&(options.preparedFold??STORAGE_V11_PREPARED_FOLD)
+      ?await createStorageEffectiveUsagePreparation({source,target:bindings.target,sourceId:bindings.sourceId,
+        sourceNamespace:bindings.sourceNamespace,owner:scope.owner,
+        remainingQueries:()=>meter.remainingQueries,deadlineMs:checkpointWorkDeadlineMs,now}):undefined;
+    effectiveFormat=preparedUsage?5:4;
     const originalKey=originalEffectiveKey();
-    const key=await storageGraphEffectiveCheckpointKey(originalKey,preparedQuota!==undefined);
-    const loadKeys=preparedQuota?[key,await storageGraphEffectiveCheckpointKey(originalKey,true,3),
+    const key=await storageGraphEffectiveCheckpointKey(originalKey,preparedQuota!==undefined||preparedUsage!==undefined,effectiveFormat);
+    const loadKeys=preparedQuota?[key,...(preparedUsage?[await storageGraphEffectiveCheckpointKey(originalKey,true,4)]:[]),
+      await storageGraphEffectiveCheckpointKey(originalKey,true,3),
       await storageGraphEffectiveCheckpointKey(originalKey,true,2),originalKey]:[key];
     let cursor:StorageHistoryLoadCursor|undefined,head:string|null=null,checkpoint:StorageEffectiveHistoryCheckpoint|undefined;
     let loadIndex=0;
@@ -641,17 +653,28 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
         const next=await advanceStorageEffectiveAnalysis({source,sourceNamespace:bindings.sourceNamespace,
           owner:scope.owner,pin,day:scope.day,metric,nowMs,checkpoint,
           ...(preparedQuota?{preparedQuota}:{}),
+          ...(preparedUsage?{preparedUsage}:{}),
           allowQuotaCoverage:pages===0,
           budget:{get remainingQueries(){return meter.remainingQueries-80;},deadlineMs:checkpointWorkDeadlineMs,now}});
         if(next.status==='complete')return {state:'complete',analysis:next.analysis};
         if(!next.checkpoint)break;
         if(preparedQuota?.preferSinglePageCheckpoint?.())groupPages=1;
         successor=next.checkpoint;checkpoint=successor;pages++;
-        // Independent preparation reads one page per durable successor. Day
-        // completion is also a deterministic boundary: save its reduced value
-        // before any optional cache write changes the next retry's inputs.
-        if(next.quotaCoverageStep||successor.quotaCoverage?.pending?.state==='ready'){
+        // Quota gaps use one page; usage day-ready/fold/refusal transitions
+        // also end the group. Save a completed day before any optional cache
+        // write changes the next retry's inputs.
+        if(next.quotaCoverageStep||successor.quotaCoverage?.pending?.state==='ready'
+          ||next.usagePreparationStep||successor.usagePreparation?.state==='ready'){
           whole=true;break;
+        }
+        if(successor.usagePreparation?.state==='reading'){
+          // Small buffers share four pages. Once a successor needs multiple
+          // save batches, end at this exact data-dependent boundary so a short
+          // later pass can reproduce it rather than discard a partial group.
+          const reading=successor;
+          const parts=await withStorageGraphFailureStage('graph_checkpoint_save',
+            ()=>storageHistoryCheckpointParts(key,reading));
+          if(parts>STORAGE_GRAPH_V11_SINGLE_BATCH_PARTS){whole=true;break;}
         }
         if(phase!==null&&(successor.phase!=='acquisition'||successor.acquisition.phase!==phase)){
           whole=true;break;

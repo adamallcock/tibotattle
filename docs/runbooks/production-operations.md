@@ -441,10 +441,41 @@ group so interrupted multi-batch saves reproduce the same successor.
 Once preparation completes the whole window, the same job can retry the fold
 within its remaining query and time budget.
 Both fits and model results
-can reuse those inputs for overlapping windows; usage retains its existing
-effective reader. Missing migration support or incomplete cache coverage uses
+can reuse those inputs for overlapping windows. Missing migration support or incomplete cache coverage uses
 the paged calculation. This flag does not increase the 950-statement invocation
 cap or start additional writers.
+
+With analytics migration `0029_graph_day_effective_usage.sql`, model calculations
+also prepare reusable usage days through the existing correction-aware effective
+reader. Fits retains its scalar usage traversal. Model preparation reads at most
+200 reconciled occurrences per step and saves a compact day summary and cursor;
+the cumulative preparation count cannot exceed the existing one-million-row
+window limit. Small reading steps share at most four pages per save. A completed
+day, fold, refusal, or first successor exceeding 30 checkpoint parts ends that
+group, keeping larger interrupted saves reproducible. It never copies raw usage
+records or raw session IDs into the checkpoint. A
+completed summary remains durable until its immutable cache value is stored.
+Adopted partial model reductions remain available for the paged fallback, while
+independent preparation starts at each missing day's beginning.
+
+Only complete, source-validated coverage can replace the model usage traversal.
+The existing model fold combines daily cost cells, session openers and session
+tails, preserving cross-day account changes. Each prepared day is bounded to
+4 MiB and each loaded window to 8 MiB. A conservative union of at most 4,096
+session, model-cost and poisoned-bin entries preserves the paged model's
+checkpoint refusal boundary. Exceeding a preparation bound disables preparation
+for that checkpoint and retains the ordinary calculation; it does not turn a
+cache limit into a published analytical refusal.
+
+Usage values have a distinct `effective-usage` layout. Their manifest ID includes
+a digest of the composition pricing and method contract; their manifest digest
+is the same session-inclusive, correction-aware day dependency used by daily
+retirement. Reuse requires both identities and current source/owner authority.
+Migration 0029 preserves existing quota and legacy keys, metadata, page bytes,
+and immutable/erasure guards. Older Workers ignore this layout in quota readers
+and still remove it during owner erasure. Production migration and code
+activation remain separate gates; source implementation alone does not establish
+that this path is enabled in production.
 
 Effective prepared keys include the exact correction-aware day dependency and
 linked occurrences on other days. Every reuse verifies current source and
@@ -474,8 +505,9 @@ retention.
 
 Prepared effective checkpoints retain the original effective method names and
 isolate their storage dependency digest with the `effective-quota-days-4`
-format domain. Older independently deployed cleanup Workers recognize those
-methods. The prepared reader adopts `effective-quota-days-3`, then
+format domain for quota-only work. Model usage preparation uses
+`effective-quota-days-5` and adopts format 4 first. Older independently deployed
+cleanup Workers recognize the unchanged methods. The prepared reader then adopts `effective-quota-days-3`, then
 `effective-quota-days-2`, then the original paged key, and advances only the new key. The previous
 keys remain for rollback until ordinary horizon or erasure cleanup; disabling
 the flag resumes the original unwrapped key. Completed result identities remain
