@@ -334,6 +334,19 @@ publications and graph-preview freshness are shown separately. Do not replace
 that unavailable state with zero or read legacy source-side derived tables as a
 fallback.
 
+For typed graph catch-up, distinguish result rows from publishable evidence.
+The graph panel's “complete, awaiting publication” count means every active
+owner has a stored result row for that day. The publisher additionally checks
+the owner's current source family, exact closed-window dependencies, authority
+and payload before releasing the day. A transition to effective history can
+leave a previously stored v1.1 row counted while its replacement calculation
+is still checkpointed. The current allowance preview separately needs a result
+for every owner's current-day fit; completing a historical model day does not
+refresh that preview by itself. Check the checkpoint phases and the actual
+model-day and preview timestamps before treating a low completed-results rate
+as a stopped scheduler. The failure list is a bounded retained sample of API
+requests, not a census of scheduled calculation failures.
+
 The effective-history graph runner groups up to four 200-occurrence pages
 between checkpoint promotions, stopping at quota acquisition phase boundaries.
 Every page still verifies its source and owner authority. Whole groups can
@@ -369,9 +382,15 @@ lookback (currently 170 inclusive UTC input days). It deletes obsolete derived
 values before their pages. This does not change source or daily-publication
 retention.
 
-Prepared effective checkpoints use separate `:quota-days-1` method names and
-can adopt existing paged progress. Disabling the flag resumes the paged method;
-completed result identities remain unchanged. The forward migration preserves
+Prepared effective checkpoints retain the original effective method names and
+isolate their storage dependency digest with the `effective-quota-days-2`
+format domain. Older independently deployed cleanup Workers recognize those
+methods. The prepared reader can adopt existing paged progress; disabling the
+flag resumes the original unwrapped key. Completed result identities remain
+unchanged. After validated result readback, the analytics Worker marks the
+prepared checkpoint retired with a bounded page; existing cleanup drains its
+remaining parts. The abandoned `:quota-days-1` keys and their permanent
+tombstones must not be reused or cleared. The forward migration preserves
 legacy prepared values and immutable/erasure triggers. Apply and verify the
 analytics migration separately from deploying this code, then confirm source
 scan counts, checkpoint movement, completed results and publication. The local

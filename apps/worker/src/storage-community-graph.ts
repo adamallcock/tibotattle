@@ -26,7 +26,7 @@ import { advanceStorageEffectiveAnalysis, assertEffectiveHistoryOwner, effective
   effectiveHistoryPin, type StorageEffectiveHistoryCheckpoint } from './storage-effective-history';
 import type { GraphDayProjection } from './graph-day-projection-values';
 import { createStorageEffectiveQuotaPreparation } from './storage-effective-quota-days';
-import { loadStorageHistoryCheckpoint, readStorageHistoryCheckpointHead, saveStorageHistoryCheckpoint,
+import { loadStorageHistoryCheckpoint, readStorageHistoryCheckpointHead, saveStorageHistoryCheckpoint, retireStorageHistoryCheckpoint,
   storageHistoryCheckpointParts,
   type StorageHistoryCheckpoint,type StorageHistoryKey,type StorageHistoryLoadCursor,
   type StorageHistorySaveCursor } from './storage-history-checkpoint';
@@ -49,15 +49,18 @@ export const STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD 
 // abandoned, which is the documented purpose of this namespace.
 export const STORAGE_GRAPH_EFFECTIVE_FITS_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':effective-fits-checkpoint-1';
 export const STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':effective-model-checkpoint-1';
-/** Prepared quota inputs add a bounded component to the plan checkpoint.
- * Keep a separate namespace so disabling or rolling back the cache can resume
- * the original checkpoint without interpreting that component. */
-export function storageGraphEffectiveCheckpointMethod(metric:'fits'|'model',preparedQuota=false):string {
-  const base=metric==='fits'?STORAGE_GRAPH_EFFECTIVE_FITS_CHECKPOINT_METHOD:STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD;
-  return preparedQuota?base+':quota-days-1':base;
+export function storageGraphEffectiveCheckpointMethod(metric:'fits'|'model'):string {
+  return metric==='fits'?STORAGE_GRAPH_EFFECTIVE_FITS_CHECKPOINT_METHOD:STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD;
 }
-export const STORAGE_GRAPH_EFFECTIVE_FITS_CHECKPOINT_METHODS=Object.freeze([
-  storageGraphEffectiveCheckpointMethod('fits'),storageGraphEffectiveCheckpointMethod('fits',true)]);
+/** Isolate the prepared format without adding a method that older cleanup
+ * Workers would retire. Only the storage key changes; source, acquisition and
+ * analytical result identities retain their existing dependency. Disabling
+ * preparation resumes the original key, and abandoned method-key tombstones
+ * remain valid. */
+export async function storageGraphEffectiveCheckpointKey(key:StorageHistoryKey,preparedQuota=false):Promise<StorageHistoryKey> {
+  return {...key,...(preparedQuota?{dependencyDigest:await sha256Hex(canonicalJson({
+    checkpointFormat:'effective-quota-days-2',dependencyDigest:key.dependencyDigest}))}:{})};
+}
 export const STORAGE_GRAPH_V11_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':v11-shared-checkpoint-4';
 /** The v1.1 checkpoint namespaces, as a pure rule so both branches can be
  * proven rather than described.
@@ -110,7 +113,9 @@ export const STORAGE_GRAPH_V11_FITS_CHECKPOINT_METHODS = Object.freeze([
   storageGraphV11CheckpointMethods(false).fits, storageGraphV11CheckpointMethods(true).fits]);
 /** Every checkpoint method a live reader can build a key with. Retirement
  * reclaims any stage under another method on sight, so a new method must be
- * registered here before a reader starts writing under it.
+ * registered in every cleanup Worker before a reader starts writing under it.
+ * Prepared effective formats instead isolate their storage dependency digest
+ * while retaining a method recognized by separately deployed older cleanup.
  *
  * BOTH fold configurations are registered, unconditionally. The switch can be
  * thrown in either direction while stages are in flight, and the stages the
@@ -119,7 +124,6 @@ export const STORAGE_GRAPH_V11_FITS_CHECKPOINT_METHODS = Object.freeze([
 export const STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS = Object.freeze([
   STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD, STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,
   STORAGE_GRAPH_EFFECTIVE_FITS_CHECKPOINT_METHOD, STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD,
-  storageGraphEffectiveCheckpointMethod('fits',true),storageGraphEffectiveCheckpointMethod('model',true),
   ...new Set([...storageGraphV11CheckpointMethods(false).live,
     ...storageGraphV11CheckpointMethods(true).live])]);
 // Execution-only revision for the single optimistic direct historical read.
@@ -520,6 +524,26 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     checkpointWorkDeadlineMs=deadlineMs-STORAGE_GRAPH_CHECKPOINT_SAVE_HEADROOM_MS;
   if(!Number.isFinite(startedMs)||!Number.isFinite(deadlineMs))throw fail();
   bindings={...bindings,source:meter.wrap(bindings.source),target:meter.wrap(bindings.target)};
+  const originalEffectiveKey=():StorageHistoryKey=>({sourceId:bindings.sourceId,sourceNamespace:bindings.sourceNamespace,
+    ownerDigest:scope.owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
+    method:storageGraphEffectiveCheckpointMethod(scope.metric)});
+  const retireCompletedEffectiveCheckpoint=async()=>{
+    if(scope.source!=='effective'||!(options.preparedFold??STORAGE_V11_PREPARED_FOLD)
+      ||meter.remainingQueries<8||now()>=deadlineMs)return;
+    // Retire only after the exact result has passed readback and source fences.
+    // One bounded page installs the tombstone; existing cleanup Workers drain
+    // its remaining pages even though they do not know the prepared format.
+    const key=await storageGraphEffectiveCheckpointKey(originalEffectiveKey(),true);
+    try{
+      const head=await readStorageHistoryCheckpointHead({target:bindings.target,key});
+      if(head&&!head.retired)await retireStorageHistoryCheckpoint({target:bindings.target,key,
+        expectedHead:head.generation,maxWrites:2});
+    }catch(error){
+      // A concurrent successor can win the head comparison. The completed
+      // result remains valid; later reuse or ordinary age/erasure cleanup retries.
+      if(!(error instanceof Error)||error.message!=='STORAGE_HISTORY_CHECKPOINT_UNAVAILABLE')throw error;
+    }
+  };
   const cached=await readStorageGraphResult(bindings,scope);
   if(cached) {
     // Small proof refresh only. The exact window dependency was recomputed;
@@ -528,6 +552,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       WHERE source_id=? AND owner_digest=? AND metric=? AND day=? AND method=? AND dependency_digest=?
       AND input_revision<?`).bind(scope.owner.inputRevision,bindings.sourceId,scope.owner.ownerDigest,scope.metric,
         scope.day,STORAGE_GRAPH_METHOD,scope.dependencyDigest,scope.owner.inputRevision).run();
+    await retireCompletedEffectiveCheckpoint();
     return {state:'complete',result:cached,reused:true};
   }
   const nowMs=Date.parse(scope.fixedNow),source=bindings.source;
@@ -571,9 +596,8 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       ?await createStorageEffectiveQuotaPreparation({source,target:bindings.target,sourceId:bindings.sourceId,
         sourceNamespace:bindings.sourceNamespace,owner:scope.owner,
         remainingQueries:()=>meter.remainingQueries,deadlineMs:checkpointWorkDeadlineMs,now}):undefined;
-    const key:StorageHistoryKey={sourceId:bindings.sourceId,sourceNamespace:bindings.sourceNamespace,
-      ownerDigest:scope.owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
-      method:storageGraphEffectiveCheckpointMethod(metric,preparedQuota!==undefined)};
+    const originalKey=originalEffectiveKey();
+    const key=await storageGraphEffectiveCheckpointKey(originalKey,preparedQuota!==undefined);
     let cursor:StorageHistoryLoadCursor|undefined,head:string|null=null,checkpoint:StorageEffectiveHistoryCheckpoint|undefined;
     let loadKey=key;
     for(;;){
@@ -584,7 +608,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       if(loaded.status==='absent'&&preparedQuota&&loadKey===key){
         // Adopt an existing paged calculation when enabling preparation. Its
         // source dependency is identical, and only the new key is advanced.
-        loadKey={...key,method:storageGraphEffectiveCheckpointMethod(metric)};continue;
+        loadKey=originalKey;continue;
       }
       head=loadKey===key?(loaded.headDigest??null):null;
       if(loaded.status==='ready'){
@@ -920,5 +944,6 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       scope.dependencyDigest,scope.owner.inputRevision,payloadFingerprint,payload,hash,
       canonicalJson(scope.authority),Date.now(),scope.source).run();
   const result=await readStorageGraphResult(bindings,scope);
+  if(result)await retireCompletedEffectiveCheckpoint();
   return result?{state:'complete',result,reused:false}:{state:'deferred',reason:'source_changed'};
 }

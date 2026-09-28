@@ -2,13 +2,15 @@
 title: Analytics effective quota-day qualification
 date: 2026-09-27
 type: research
-status: source-qualified-awaiting-production
+status: recovery-qualification
 ---
 
 # Analytics effective quota-day qualification
 
-This records local implementation and qualification of the analytics-only candidate.
-It is not evidence of production migration, deployment or measured live speedup.
+This records implementation and local qualification of the analytics-only candidate.
+The first production test was rolled back after a cleanup compatibility defect;
+the recovery below preserves the optimization with a compatible storage key.
+Synthetic statement counts do not establish a production speedup.
 The maintained operational authority is [Production service operations](../runbooks/production-operations.md).
 
 ## Effective quota-day reuse: implementation and qualification
@@ -130,3 +132,31 @@ activation require explicit production authorization. Observe natural scheduled
 runs for completed results, publication freshness, source-page counts and
 errors before assigning a live speedup. This local qualification does not
 establish current production backlog counts or completion time.
+
+## Mixed-version checkpoint recovery
+
+The first candidate, source `10ce797d`, applied analytics migration 0028 and
+activated successfully. Natural scheduled work exposed a cross-Worker
+compatibility defect: an older publication Worker retired the new
+`:quota-days-1` checkpoint method. The exact new head was observed permanently
+retired while its original paged checkpoint remained intact. Analytics was
+restored to source `31a32281`; migration 0028 remains applied.
+
+The repair keeps the seven original recognized method names. Prepared storage
+keys derive a domain-separated dependency digest using
+`effective-quota-days-2`; source, acquisition and analytical result identities
+remain unchanged. The new reader adopts the original unwrapped key, and old
+readers cannot load the new payload. Abandoned key tombstones are preserved.
+
+After exact completed-result readback, a bounded retirement page marks the
+prepared head retired, allowing existing cleanup Workers to drain the remaining
+parts. The path reserves eight statements and uses a two-write page limit;
+concurrent head changes leave the valid result intact. Owner erasure and age
+retention remain unchanged.
+
+Recovery qualification: TypeScript passed; seven dedicated compatibility
+cases and 39 graph/prepared-fold cases passed. An independent review found no
+blocker and reran eight compatibility/adoption/cleanup cases, all passing.
+The complete Worker check is being repeated. The recovery's completion cleanup
+adds a few target queries beyond the original synthetic counts above. No
+production speedup is claimed.

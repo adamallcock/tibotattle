@@ -28,12 +28,13 @@ import {COMMUNITY_ALLOWANCE_FIT_METHOD} from '../src/community-allowance';
 import {captureStorageGraphScope,computeStorageGraphResult,readStorageGraphResult,storageGraphDependencyDigest,
  STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,
  STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD,type StorageGraphScope,
- storageGraphEffectiveCheckpointMethod,
+ storageGraphEffectiveCheckpointMethod,storageGraphEffectiveCheckpointKey,
  STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS,STORAGE_GRAPH_METHOD} from '../src/storage-community-graph';
 import {createD1InvocationBudget} from '../src/d1-invocation-budget';
 import {advanceStorageCommunityGraphWork} from '../src/storage-community-graph-work';
+import {retireStorageGraphPage} from '../src/storage-graph-retirement';
 import {loadStorageHistoryCheckpoint,retireStorageHistoryCheckpoint,saveStorageHistoryCheckpoint,
- storageHistoryKeyDigest,type StorageHistoryKey} from '../src/storage-history-checkpoint';
+ storageHistoryKeyDigest,readStorageHistoryCheckpointHead,type StorageHistoryKey} from '../src/storage-history-checkpoint';
 import type {StorageV1HistoryCheckpoint} from '../src/storage-v1-history';
 import {advanceStorageEffectiveAnalysis,type StorageEffectiveHistoryCheckpoint} from '../src/storage-effective-history';
 import {readGraphDayEffectiveQuotaHeads,readGraphDayProjection,writeGraphDayProjection} from '../src/graph-day-projection';
@@ -107,16 +108,16 @@ function observeEffectiveQuotaPages(database:D1Database,afterPage?:(page:number)
  return {database:new Proxy(database,{get(value,key){if(key==='prepare')return(sql:string)=>statement(value.prepare(sql),sql);
   const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}}),pages:()=>pages};
 }
-const effectiveKey=(scope:StorageGraphScope,preparedFold=false):StorageHistoryKey=>({sourceId,sourceNamespace:namespace,
+const effectiveKey=(scope:StorageGraphScope,preparedFold=false):Promise<StorageHistoryKey>=>storageGraphEffectiveCheckpointKey({sourceId,sourceNamespace:namespace,
  ownerDigest:scope.owner.ownerDigest!,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
- method:storageGraphEffectiveCheckpointMethod(scope.metric,preparedFold)});
+ method:storageGraphEffectiveCheckpointMethod(scope.metric)},preparedFold);
 async function clearSyntheticGraph(scope:StorageGraphScope){
  // This test owns its disposable source/target and preserves the source corpus
  // so both checkpoint strategies calculate exactly the same dependency.
  await target().prepare('DELETE FROM analytics_community_graph_results WHERE source_id=? AND owner_digest=? AND metric=? AND day=?')
   .bind(sourceId,scope.owner.ownerDigest,scope.metric,scope.day).run();
  for(const prepared of [false,true]){
-  const key=await storageHistoryKeyDigest(effectiveKey(scope,prepared));
+  const key=await storageHistoryKeyDigest(await effectiveKey(scope,prepared));
   await target().batch([
    target().prepare('DELETE FROM analytics_history_checkpoint_heads WHERE key_digest=?').bind(key),
    target().prepare('DELETE FROM analytics_history_checkpoint_parts WHERE key_digest=?').bind(key),
@@ -493,7 +494,7 @@ it.each([1,100])('routes correction-active owners through a resumable effective 
  expect(grouped.queries).toBeLessThan(baseline.queries*0.8);
  expect(grouped.targetQueries).toBeLessThan(baseline.targetQueries*0.45);
  expect(grouped.measurements.length).toBeLessThanOrEqual(baseline.measurements.length);
- expect((await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)})).status).toBe('ready');
+ expect((await loadStorageHistoryCheckpoint({target:target(),key:await effectiveKey(scope)})).status).toBe('ready');
  expect(result.result.composition?.status).toBe('ready');
  expect(await readStorageGraphResult(bindings(),scope)).not.toBeNull();
  expect(await target().prepare("SELECT source_kind FROM analytics_community_graph_results WHERE owner_digest=? AND metric='model'")
@@ -543,7 +544,7 @@ it('resumes an unfinished prepared quota day from the ordinary durable checkpoin
  expect(await computeStorageGraphResult({...bindings(),source:observed.database},scope,
   {maxQueries:950,deadlineMs:20_000,now:()=>now,preparedFold:true}))
   .toEqual({state:'deferred',reason:'effective_checkpoint'});
- const saved=await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope,true)});
+ const saved=await loadStorageHistoryCheckpoint({target:target(),key:await effectiveKey(scope,true)});
  expect(saved).toMatchObject({status:'ready',checkpoint:{phase:'acquisition',preparingQuota:{day:'2026-09-01',quotaRowsRead:200}}});
  const resumed=await finishEffectiveGraph(scope,4,950,true);
  expect(resumed.result.result).toEqual(baseline.result.result);
@@ -555,11 +556,21 @@ it('adopts an existing effective checkpoint when quota-day preparation is enable
  await clearSyntheticGraph(scope);
  const first=await computeStorageGraphResult(bindings(),scope,{maxQueries:250,deadlineMs:Date.now()+60_000});
  expect(first).toEqual({state:'deferred',reason:'effective_checkpoint'});
- const prior=await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)});
+ const prior=await loadStorageHistoryCheckpoint({target:target(),key:await effectiveKey(scope)});
  expect(prior.status).toBe('ready');
  expect((await finishEffectiveGraph(scope,4,950,true)).result.result).toEqual(baseline.result.result);
- expect(await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)})).toEqual(prior);
- expect((await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope,true)})).status).toBe('ready');
+ expect(await loadStorageHistoryCheckpoint({target:target(),key:await effectiveKey(scope)})).toEqual(prior);
+ expect(await readStorageHistoryCheckpointHead({target:target(),key:await effectiveKey(scope,true)})).toEqual({generation:null,retired:1});
+ // Once computation marks the prepared key retired, even the old seven-method
+ // cleanup drains its remaining payload pages without knowing the new format.
+ for(let attempt=0;attempt<20;attempt++){
+  if((await retireStorageGraphPage(target(),sourceId,Date.parse(day+'T12:00:00.000Z'))).state==='idle')break;
+ }
+ const preparedDigest=await storageHistoryKeyDigest(await effectiveKey(scope,true));
+ expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages WHERE key_digest=?')
+  .bind(preparedDigest).first('n')).toBe(0);
+ expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_parts WHERE key_digest=?')
+  .bind(preparedDigest).first('n')).toBe(0);
 },30000);
 
 it('falls back to the effective pager when a prepared middle day is missing or migration support is absent',async()=>{
@@ -574,8 +585,8 @@ it('falls back to the effective pager when a prepared middle day is missing or m
  const unsupported=await finishEffectiveGraph(scope,4,950,true);
  expect(unsupported.result.result).toEqual(baseline.result.result);
  expect(unsupported.measurements.reduce((sum,row)=>sum+row.quotaPages,0)).toBeGreaterThan(0);
- expect((await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)})).status).toBe('ready');
- expect((await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope,true)})).status).toBe('absent');
+ expect((await loadStorageHistoryCheckpoint({target:target(),key:await effectiveKey(scope)})).status).toBe('ready');
+ expect((await loadStorageHistoryCheckpoint({target:target(),key:await effectiveKey(scope,true)})).status).toBe('absent');
 },60000);
 
 it('promotes a partial effective group at its work deadline and resumes the identical result',async()=>{
@@ -586,7 +597,7 @@ it('promotes a partial effective group at its work deadline and resumes the iden
  const cut=await computeStorageGraphResult({...bindings(),source:observed.database},scope,{deadlineMs:20_000,now:()=>now});
  expect(cut).toEqual({state:'deferred',reason:'effective_checkpoint'});
  expect(observed.pages()).toBe(2);
- const saved=await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)});
+ const saved=await loadStorageHistoryCheckpoint({target:target(),key:await effectiveKey(scope)});
  expect(saved.status).toBe('ready');
  if(saved.status!=='ready'||!('source'in saved.checkpoint)||saved.checkpoint.source!=='effective')throw new Error('effective checkpoint missing');
  expect(saved.checkpoint.effectiveCursor).toMatchObject({phase:'plan',day:'2026-09-03',ordinal:25});
@@ -601,7 +612,7 @@ it('makes progress with a small effective query budget and resumes a checkpoint 
   {maxQueries:250,deadlineMs:Date.now()+60_000,effectiveCheckpointPages:1});
  expect(cut).toEqual({state:'deferred',reason:'effective_checkpoint'});
  expect(meter.queriesUsed).toBeLessThanOrEqual(250);
- expect((await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)})).status).toBe('ready');
+ expect((await loadStorageHistoryCheckpoint({target:target(),key:await effectiveKey(scope)})).status).toBe('ready');
  const resumed=await finishEffectiveGraph(scope,4,250);
  expect(resumed.measurements.length).toBeGreaterThan(1);
  expect(resumed.result.result).toEqual(baseline.result.result);
@@ -619,13 +630,13 @@ it('reproduces the exact effective successor after only some of its checkpoint p
   if(next.status!=='deferred'||!next.checkpoint)throw new Error('effective group finished unexpectedly');
   checkpoint=next.checkpoint;
  }
- const staged=await saveStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope),checkpoint:checkpoint!,expectedHead:null,maxWrites:3});
+ const staged=await saveStorageHistoryCheckpoint({target:target(),key:await effectiveKey(scope),checkpoint:checkpoint!,expectedHead:null,maxWrites:3});
  expect(staged.status).toBe('staging');
  if(staged.status!=='staging')throw new Error('effective group did not stage partially');
- expect((await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)})).status).toBe('absent');
+ expect((await loadStorageHistoryCheckpoint({target:target(),key:await effectiveKey(scope)})).status).toBe('absent');
  expect((await finishEffectiveGraph(scope)).result.result).toEqual(baseline.result.result);
  expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_parts WHERE key_digest=? AND generation=?')
-  .bind(await storageHistoryKeyDigest(effectiveKey(scope)),staged.generation).first<number>('n')).toBe(staged.totalParts);
+  .bind(await storageHistoryKeyDigest(await effectiveKey(scope)),staged.generation).first<number>('n')).toBe(staged.totalParts);
 },30000);
 
 it('resumes an effective four-page group whose committed response was lost',async()=>{
@@ -635,7 +646,7 @@ it('resumes an effective four-page group whose committed response was lost',asyn
  await expect(computeStorageGraphResult({...bindings(),source:observed.database,target:lost.database},scope,{deadlineMs:Date.now()+60_000}))
   .rejects.toMatchObject({stage:'graph_checkpoint_save',reason:'application'});
  expect(lost.losses()).toBe(1);expect(observed.pages()).toBe(4);
- expect((await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)})).status).toBe('ready');
+ expect((await loadStorageHistoryCheckpoint({target:target(),key:await effectiveKey(scope)})).status).toBe('ready');
  expect((await finishEffectiveGraph(scope)).result.result).toEqual(baseline.result.result);
 },30000);
 
@@ -662,7 +673,7 @@ it('saves a deterministic large successor after a stale prepared-day fallback cu
  first.checkpoint.acquisition.plan.observations=Array.from({length:30_000},(_,index)=>({
   contextKey:'openai_codex|codex',observedAtMs:Date.parse(first.checkpoint!.identity.observedAtCutoff)+index,
   planType:'pro',planVariant:'unknown',continuityId:null,conflicted:false,accountScopeId:null,planBasis:null}));
- const key=effectiveKey(scope,true);
+ const key=await effectiveKey(scope,true);
  let saved=await saveStorageHistoryCheckpoint({target:target(),key,checkpoint:first.checkpoint,expectedHead:null});
  while(saved.status==='staging')saved=await saveStorageHistoryCheckpoint({target:target(),key,
   checkpoint:first.checkpoint,expectedHead:null,cursor:saved.cursor});
@@ -693,7 +704,7 @@ it('keeps the old effective head when a deadline cuts a group whose checkpoint n
  first.checkpoint.acquisition.plan.observations=Array.from({length:30_000},(_,index)=>({
   contextKey:'openai_codex|codex',observedAtMs:Date.parse(first.checkpoint!.identity.observedAtCutoff)+index,
   planType:'pro',planVariant:'unknown',continuityId:null,conflicted:false,accountScopeId:null,planBasis:null}));
- const key=effectiveKey(scope);
+ const key=await effectiveKey(scope);
  let saved=await saveStorageHistoryCheckpoint({target:target(),key,checkpoint:first.checkpoint,expectedHead:null});
  while(saved.status==='staging')saved=await saveStorageHistoryCheckpoint({target:target(),key,
   checkpoint:first.checkpoint,expectedHead:null,cursor:saved.cursor});
@@ -718,7 +729,7 @@ it('retries failed effective reads from the last promoted group without double c
  await clearSyntheticGraph(scope);
  const observed=observeEffectiveQuotaPages(source(),page=>{if(page===6)throw new Error('synthetic page unavailable');});
  await expect(computeStorageGraphResult({...bindings(),source:observed.database},scope,{deadlineMs:Date.now()+60_000})).rejects.toThrow();
- const saved=await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)});
+ const saved=await loadStorageHistoryCheckpoint({target:target(),key:await effectiveKey(scope)});
  expect(saved.status).toBe('ready');
  if(saved.status!=='ready'||!('source'in saved.checkpoint)||saved.checkpoint.source!=='effective')throw new Error('effective checkpoint missing');
  // Five pages finished the plan phase and were promoted; the failed first
@@ -738,7 +749,7 @@ it.each(['revision','authority_epoch'] as const)('refuses effective work when ow
  }});
  await expect(computeStorageGraphResult({...bindings(),source:observed.database},scope,{deadlineMs:Date.now()+60_000})).rejects.toThrow();
  expect(observed.pages()).toBe(2);
- expect((await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)})).status).toBe('absent');
+ expect((await loadStorageHistoryCheckpoint({target:target(),key:await effectiveKey(scope)})).status).toBe('absent');
  expect(await target().prepare('SELECT count(*) n FROM analytics_community_graph_results').first<number>('n')).toBe(0);
 },30000);
 
