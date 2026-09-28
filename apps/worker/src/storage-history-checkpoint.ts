@@ -14,6 +14,7 @@ import type { StorageV11HistoryCheckpoint } from './storage-v11-history';
 import { isV11GenerationSnapshot } from './typed-v11-quota-reader';
 import { validEffectiveDays,validEffectiveQuotaCursor } from './storage-effective-history';
 import type { StorageEffectiveHistoryCheckpoint } from './storage-effective-history';
+import {validEffectiveQuotaDayPending,type EffectiveQuotaDayPending} from './effective-quota-day';
 export type StorageHistoryCheckpoint=StorageV1HistoryCheckpoint|StorageV11HistoryCheckpoint|StorageEffectiveHistoryCheckpoint;
 export const STORAGE_HISTORY_PART_BYTES=128*1024,STORAGE_HISTORY_CONTROL_BYTES=16*1024;
 export const STORAGE_HISTORY_MAX_PARTS=1024,STORAGE_HISTORY_MAX_WRITES=32;
@@ -67,10 +68,26 @@ function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistor
   try{encodeTypedTelemetryId(control.layout.slice('effective:'.length));}catch{throw fail();}
   createV11QuotaAcquisitionCheckpoint(control.identity);
   if(control.phase==='acquisition'){
+   const preparedRows=components.effectiveQuotaRows;
+   delete components.effectiveQuotaRows;
+   let preparingQuota:EffectiveQuotaDayPending|undefined;
+   if(Object.hasOwn(control,'preparingQuota')){
+    const meta=control.preparingQuota;
+    if(!meta||typeof meta!=='object'||Array.isArray(meta)
+      ||Object.keys(meta).sort().join(',')!=='day,quotaRowsRead')throw fail();
+    const pending={...meta,rows:preparedRows??[]};
+    if(!validEffectiveQuotaDayPending(pending)||pending.day!==control.effectiveCursor.day
+      ||pending.quotaRowsRead>control.effectiveCursor.ordinal)throw fail();
+    preparingQuota=pending;
+   }else if(preparedRows!==undefined)throw fail();
    for(const name of V11_QUOTA_WORK_COMPONENTS)components[name]??=[];
+   const acquisition=decodeV11QuotaWorkCheckpoint(control.identity,control.acquisition,components);
+   if(preparingQuota&&acquisition.phase!=='plan')throw fail();
    return {version:1,source:'effective',day:control.day,layout:control.layout,identity:control.identity,
-    effectiveCursor:control.effectiveCursor,effectiveDays:control.effectiveDays,phase:'acquisition',acquisition:decodeV11QuotaWorkCheckpoint(control.identity,control.acquisition,components)};
+    effectiveCursor:control.effectiveCursor,effectiveDays:control.effectiveDays,phase:'acquisition',acquisition,
+    ...(preparingQuota?{preparingQuota}:{})};
   }
+  if(Object.hasOwn(control,'preparingQuota'))throw fail();
   const acquisition={identity:control.identity,planAnchors:components.planAnchors??[],quotaRows:components.quotaRows??[]};
   if(!validateV11CompletedQuotaAcquisition(acquisition)
    ||Object.keys(components).some(k=>!['planAnchors','quotaRows',...V11_USAGE_REDUCTION_COMPONENTS].includes(k)))throw fail();
@@ -139,8 +156,15 @@ async function frame(key:StorageHistoryKey,checkpoint:StorageHistoryCheckpoint):
     ?{...encodeV11QuotaWorkCheckpoint(checkpoint.acquisition).components}
     :{planAnchors:checkpoint.acquisition.planAnchors,quotaRows:checkpoint.acquisition.quotaRows,
       ...(usage?.components??{})};
+   const pending=checkpoint.phase==='acquisition'?checkpoint.preparingQuota:undefined;
+   if(pending!==undefined){
+    if(!validEffectiveQuotaDayPending(pending)||checkpoint.phase!=='acquisition'||checkpoint.acquisition.phase!=='plan'
+      ||pending.day!==checkpoint.effectiveCursor.day||pending.quotaRowsRead>checkpoint.effectiveCursor.ordinal)throw fail();
+    components.effectiveQuotaRows=pending.rows;
+   }
    const control=canonicalJson({version:1,source:'effective',day:checkpoint.day,layout:checkpoint.layout,
     identity:checkpoint.identity,effectiveCursor:checkpoint.effectiveCursor,effectiveDays:checkpoint.effectiveDays,phase:checkpoint.phase,
+    ...(pending?{preparingQuota:{day:pending.day,quotaRowsRead:pending.quotaRowsRead}}:{}),
     acquisition:checkpoint.phase==='acquisition'?encodeV11QuotaWorkCheckpoint(checkpoint.acquisition).control:null,
     usage:usage?.control??null});
    if(size(control)>STORAGE_HISTORY_CONTROL_BYTES)throw fail();

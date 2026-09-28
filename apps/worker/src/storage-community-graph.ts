@@ -25,6 +25,7 @@ import { advanceStorageV11Analysis,loadStorageV11PreparedDays,STORAGE_V11_PREPAR
 import { advanceStorageEffectiveAnalysis, assertEffectiveHistoryOwner, effectiveHistoryDependency,
   effectiveHistoryPin, type StorageEffectiveHistoryCheckpoint } from './storage-effective-history';
 import type { GraphDayProjection } from './graph-day-projection-values';
+import { createStorageEffectiveQuotaPreparation } from './storage-effective-quota-days';
 import { loadStorageHistoryCheckpoint, readStorageHistoryCheckpointHead, saveStorageHistoryCheckpoint,
   storageHistoryCheckpointParts,
   type StorageHistoryCheckpoint,type StorageHistoryKey,type StorageHistoryLoadCursor,
@@ -48,6 +49,15 @@ export const STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD 
 // abandoned, which is the documented purpose of this namespace.
 export const STORAGE_GRAPH_EFFECTIVE_FITS_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':effective-fits-checkpoint-1';
 export const STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':effective-model-checkpoint-1';
+/** Prepared quota inputs add a bounded component to the plan checkpoint.
+ * Keep a separate namespace so disabling or rolling back the cache can resume
+ * the original checkpoint without interpreting that component. */
+export function storageGraphEffectiveCheckpointMethod(metric:'fits'|'model',preparedQuota=false):string {
+  const base=metric==='fits'?STORAGE_GRAPH_EFFECTIVE_FITS_CHECKPOINT_METHOD:STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD;
+  return preparedQuota?base+':quota-days-1':base;
+}
+export const STORAGE_GRAPH_EFFECTIVE_FITS_CHECKPOINT_METHODS=Object.freeze([
+  storageGraphEffectiveCheckpointMethod('fits'),storageGraphEffectiveCheckpointMethod('fits',true)]);
 export const STORAGE_GRAPH_V11_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':v11-shared-checkpoint-4';
 /** The v1.1 checkpoint namespaces, as a pure rule so both branches can be
  * proven rather than described.
@@ -109,6 +119,7 @@ export const STORAGE_GRAPH_V11_FITS_CHECKPOINT_METHODS = Object.freeze([
 export const STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS = Object.freeze([
   STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD, STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,
   STORAGE_GRAPH_EFFECTIVE_FITS_CHECKPOINT_METHOD, STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD,
+  storageGraphEffectiveCheckpointMethod('fits',true),storageGraphEffectiveCheckpointMethod('model',true),
   ...new Set([...storageGraphV11CheckpointMethods(false).live,
     ...storageGraphV11CheckpointMethods(true).live])]);
 // Execution-only revision for the single optimistic direct historical read.
@@ -125,6 +136,9 @@ const MAX_RESULT_BYTES = 1024 * 1024;
 const STORAGE_GRAPH_CHECKPOINT_SAVE_HEADROOM_MS = 12_000;
 // The v1 readers keep the 1,024-row page and their own `maxPages<=32` bound.
 const STORAGE_GRAPH_CHECKPOINT_PAGES_PER_CLAIM = 32;
+// Effective pages include source selection and correction reconciliation.
+// Keep their group small and retain every page's own authority fences.
+const STORAGE_GRAPH_EFFECTIVE_CHECKPOINT_PAGES = 4;
 /** Pages in the fixed whole v1.1 group, the fallback taken when a partial group
  * is not permitted (a multi-batch successor, or the `endpoints` sub-phase) or
  * not affordable. A whole group is all-or-nothing: a group that reads fewer
@@ -489,13 +503,18 @@ export async function readStorageGraphResult(bindings:StorageAnalyticsBindings,s
  * no transaction, cache write or backpressure hook in ingestion. */
 export async function computeStorageGraphResult(bindings:StorageAnalyticsBindings,scope:StorageGraphScope,
   options:{maxQueries?:number;deadlineMs?:number;now?:()=>number;
-    /** Whether this pass may fold prepared days for a v1.1 owner. Absent means
+    /** Whether this pass may fold prepared days for a v1.1 or effective owner. Absent means
      * the module constant, so the deploy is inert until the composition root
      * passes the deployment switch. */
-    preparedFold?:boolean}={}):Promise<
+    preparedFold?:boolean;
+    /** Bounded comparison/rollback of checkpoint frequency. Both modes use
+     * the same reader, result identity and persisted checkpoint format. */
+    effectiveCheckpointPages?:1|4}={}):Promise<
   {state:'complete';result:StorageGraphResult;reused:boolean}
   |{state:'deferred';reason:string;failure?:StorageGraphFailureFields}> {
   if(bindings.source===bindings.target)throw fail();
+  const effectiveCheckpointPages=options.effectiveCheckpointPages??STORAGE_GRAPH_EFFECTIVE_CHECKPOINT_PAGES;
+  if(effectiveCheckpointPages!==1&&effectiveCheckpointPages!==STORAGE_GRAPH_EFFECTIVE_CHECKPOINT_PAGES)throw fail();
   const meter=createD1InvocationBudget(options.maxQueries??900),now=options.now??Date.now,
     startedMs=now(),deadlineMs=options.deadlineMs??startedMs+20_000,
     checkpointWorkDeadlineMs=deadlineMs-STORAGE_GRAPH_CHECKPOINT_SAVE_HEADROOM_MS;
@@ -548,37 +567,71 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       WHERE source_id=? AND owner_digest=? AND state='active' AND authority_epoch=?`)
       .bind(bindings.sourceId,scope.owner.ownerDigest,scope.owner.authorityEpoch).first<number>('ready');
     if(ownerReady!==1)return {state:'deferred',reason:'effective_owner_pending'};
+    const preparedQuota=(options.preparedFold??STORAGE_V11_PREPARED_FOLD)
+      ?await createStorageEffectiveQuotaPreparation({source,target:bindings.target,sourceId:bindings.sourceId,
+        sourceNamespace:bindings.sourceNamespace,owner:scope.owner,
+        remainingQueries:()=>meter.remainingQueries,deadlineMs:checkpointWorkDeadlineMs,now}):undefined;
     const key:StorageHistoryKey={sourceId:bindings.sourceId,sourceNamespace:bindings.sourceNamespace,
       ownerDigest:scope.owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
-      method:metric==='fits'?STORAGE_GRAPH_EFFECTIVE_FITS_CHECKPOINT_METHOD:STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD};
+      method:storageGraphEffectiveCheckpointMethod(metric,preparedQuota!==undefined)};
     let cursor:StorageHistoryLoadCursor|undefined,head:string|null=null,checkpoint:StorageEffectiveHistoryCheckpoint|undefined;
+    let loadKey=key;
     for(;;){
       if(meter.remainingQueries<50||now()>=checkpointWorkDeadlineMs)return {state:'deferred',reason:'effective_checkpoint_read_budget'};
       const loaded=await withStorageGraphFailureStage('graph_checkpoint_load',
-        ()=>loadStorageHistoryCheckpoint({target:bindings.target,key,cursor}));
+        ()=>loadStorageHistoryCheckpoint({target:bindings.target,key:loadKey,cursor}));
       if(loaded.status==='deferred'){cursor=loaded.cursor;continue;}
-      head=loaded.headDigest??null;
+      if(loaded.status==='absent'&&preparedQuota&&loadKey===key){
+        // Adopt an existing paged calculation when enabling preparation. Its
+        // source dependency is identical, and only the new key is advanced.
+        loadKey={...key,method:storageGraphEffectiveCheckpointMethod(metric)};continue;
+      }
+      head=loadKey===key?(loaded.headDigest??null):null;
       if(loaded.status==='ready'){
         if(!('source'in loaded.checkpoint)||loaded.checkpoint.source!=='effective')throw fail();
         checkpoint=loaded.checkpoint;
       }
       cursor=undefined;break;
     }
-    // Each step is one deterministic occurrence page. Promote it before
-    // another page so a timeout or retry never loses already acquired work.
-    // Reproducing a partially staged successor is independent of time budget.
+    // A whole group ends after four occurrence pages or at a quota phase
+    // boundary. Its successor is reproducible after an interrupted multi-batch
+    // save. A budget/deadline cut may save only a successor that fits one
+    // atomic part-and-head batch; otherwise retain the previous durable head.
+    // The effective reader still fences each individual page. No source
+    // selection, correction reconciliation or analytical reduction is skipped.
     for(;;){
       if(meter.remainingQueries<200||now()>=checkpointWorkDeadlineMs)
         return {state:'deferred',reason:'effective_checkpoint'};
-      const next=await advanceStorageEffectiveAnalysis({source,sourceNamespace:bindings.sourceNamespace,
-        owner:scope.owner,pin,day:scope.day,metric,nowMs,checkpoint,
-        budget:{remainingQueries:meter.remainingQueries-80,deadlineMs:checkpointWorkDeadlineMs,now}});
-      if(next.status==='complete')return {state:'complete',analysis:next.analysis};
-      if(!next.checkpoint)return {state:'deferred',reason:'effective_checkpoint'};
-      const saved=await persistCheckpoint(key,next.checkpoint,head,'effective_checkpoint');
+      let pages=0,whole=false,successor:StorageEffectiveHistoryCheckpoint|undefined;
+      let groupPages=preparedQuota?.preferSinglePageCheckpoint?.()?1:effectiveCheckpointPages;
+      while(pages<groupPages&&meter.remainingQueries>=200&&now()<checkpointWorkDeadlineMs){
+        const phase=checkpoint?.phase==='acquisition'?checkpoint.acquisition.phase:checkpoint===undefined?'plan':null;
+        const next=await advanceStorageEffectiveAnalysis({source,sourceNamespace:bindings.sourceNamespace,
+          owner:scope.owner,pin,day:scope.day,metric,nowMs,checkpoint,
+          ...(preparedQuota?{preparedQuota}:{}),
+          budget:{get remainingQueries(){return meter.remainingQueries-80;},deadlineMs:checkpointWorkDeadlineMs,now}});
+        if(next.status==='complete')return {state:'complete',analysis:next.analysis};
+        if(!next.checkpoint)break;
+        if(preparedQuota?.preferSinglePageCheckpoint?.())groupPages=1;
+        successor=next.checkpoint;checkpoint=successor;pages++;
+        if(phase!==null&&(successor.phase!=='acquisition'||successor.acquisition.phase!==phase)){
+          whole=true;break;
+        }
+      }
+      if(!successor)return {state:'deferred',reason:'effective_checkpoint'};
+      whole ||= pages===groupPages&&(groupPages===1||now()<checkpointWorkDeadlineMs);
+      if(!whole){
+        const parts=await withStorageGraphFailureStage('graph_checkpoint_save',
+          ()=>storageHistoryCheckpointParts(key,successor));
+        if(parts>STORAGE_GRAPH_V11_SINGLE_BATCH_PARTS||!storageGraphV11SaveAffordable({parts,
+          remainingQueries:meter.remainingQueries,nowMs:now(),deadlineMs,
+          estimateMs:STORAGE_GRAPH_V11_ROUND_TRIP_DEFAULT_MS}))
+          return {state:'deferred',reason:'effective_checkpoint'};
+      }
+      const saved=await persistCheckpoint(key,successor,head,'effective_checkpoint');
       if(saved.state==='deferred')return saved;
       if(saved.head===head)return {state:'deferred',reason:'effective_checkpoint'};
-      head=saved.head;checkpoint=next.checkpoint;
+      head=saved.head;
     }
   };
   let v11CompletedFingerprint:string|null=null;

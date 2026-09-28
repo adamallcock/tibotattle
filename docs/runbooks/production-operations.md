@@ -334,6 +334,50 @@ publications and graph-preview freshness are shown separately. Do not replace
 that unavailable state with zero or read legacy source-side derived tables as a
 fallback.
 
+The effective-history graph runner groups up to four 200-occurrence pages
+between checkpoint promotions, stopping at quota acquisition phase boundaries.
+Every page still verifies its source and owner authority. Whole groups can
+reproduce an interrupted multi-batch checkpoint save. A group cut short by its
+query budget or work deadline can promote only when its successor fits one
+atomic part-and-head batch and leaves enough save time; larger cut groups
+resume from the preceding durable head. The checkpoint format and analytical
+result identities are unchanged, so previously saved one-page checkpoints can
+resume under grouped processing. This groups acquisition work; it does not
+prepare reusable effective-day summaries or increase the invocation query cap.
+Verify the deployed revision before assuming this source behavior is active.
+
+With `GRAPH_DAY_PROJECTION_FOLD=enabled` and analytics migration
+`0028_graph_day_effective_quota.sql` present, effective-history calculations also
+prepare quota days during their first source scan. Both fits and model results
+can reuse those inputs for overlapping windows; usage retains its existing
+effective reader. Missing migration support or incomplete cache coverage uses
+the paged calculation. This flag does not increase the 950-statement invocation
+cap or start additional writers.
+
+Effective prepared keys include the exact correction-aware day dependency and
+linked occurrences on other days. Every reuse verifies current source and
+owner authority. An unrelated later upload can reuse a closed day; a changed
+dependency cannot. Preparation is bounded to 12,800 quota occurrences and 4 MiB
+per day. A fold admits at most 8 MiB of encoded prepared input and conservatively
+keeps the existing 4,096-reset-cluster bound. Whole-window query admission
+preserves a fallback calculation or checkpoint save; exceeding a preparation
+bound does not publish an analytical refusal.
+
+Retirement also bounds the effective prepared cache to the input horizon of
+the scheduled graph: the oldest retained result day plus its existing model
+lookback (currently 170 inclusive UTC input days). It deletes obsolete derived
+values before their pages. This does not change source or daily-publication
+retention.
+
+Prepared effective checkpoints use separate `:quota-days-1` method names and
+can adopt existing paged progress. Disabling the flag resumes the paged method;
+completed result identities remain unchanged. The forward migration preserves
+legacy prepared values and immutable/erasure triggers. Apply and verify the
+analytics migration separately from deploying this code, then confirm source
+scan counts, checkpoint movement, completed results and publication. The local
+comparison is recorded in [Analytics throughput options](../research/2026-09-27-analytics-throughput-options.md);
+its statement reduction is not a production elapsed-time measurement.
+
 Acquisition completion is not a finished allowance estimate. The account census
 is capped at 10,000 tracked checkpoints and explicitly indicates truncation.
 Publication coverage uses 366 indexed day lookups; a day with known price data

@@ -504,7 +504,9 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     if(retiredGraph.state!=='idle')sweep.graphWorked+=1;
    }
    // The prepared-graph-day sweep costs statements in the hot loop, so it runs
-   // only where its rows can exist: with the builder lane switched on. The two
+   // only where its rows can exist: with the builder or prepared fold on. The
+   // effective fold prepares quota days while reading its existing source scan.
+   // The two
    // paths that must never depend on that switch keep it unconditional —
    // owner erasure, which is a privacy guarantee, and the capacity branch,
    // which must be able to reclaim space whatever the lane is doing.
@@ -513,7 +515,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    const longPassBuild=options.graphOnly===true&&options.graphDayProjectionLongPass===true
     &&options.buildGraphDayProjections===true;
    const projectionLane=options.buildGraphDayProjections===true&&(!options.graphOnly||longPassBuild);
-   const retiredProjection=projectionLane&&!options.graphOnly
+   const retiredProjection=(projectionLane||options.foldGraphDayProjections===true)&&!options.graphOnly
     ?await retireGraphDayProjectionPage(scoped.target,options.sourceId):idlePage;
    let publicIdle=true,graphRan=false;
    let projectionIdle=true,projectionRan=false;

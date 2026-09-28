@@ -27,12 +27,16 @@ import {readStorageCommunityOwnerPage} from '../src/storage-community-authority'
 import {COMMUNITY_ALLOWANCE_FIT_METHOD} from '../src/community-allowance';
 import {captureStorageGraphScope,computeStorageGraphResult,readStorageGraphResult,storageGraphDependencyDigest,
  STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,
+ STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD,type StorageGraphScope,
+ storageGraphEffectiveCheckpointMethod,
  STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS,STORAGE_GRAPH_METHOD} from '../src/storage-community-graph';
 import {createD1InvocationBudget} from '../src/d1-invocation-budget';
 import {advanceStorageCommunityGraphWork} from '../src/storage-community-graph-work';
 import {loadStorageHistoryCheckpoint,retireStorageHistoryCheckpoint,saveStorageHistoryCheckpoint,
  storageHistoryKeyDigest,type StorageHistoryKey} from '../src/storage-history-checkpoint';
 import type {StorageV1HistoryCheckpoint} from '../src/storage-v1-history';
+import {advanceStorageEffectiveAnalysis,type StorageEffectiveHistoryCheckpoint} from '../src/storage-effective-history';
+import {readGraphDayEffectiveQuotaHeads,readGraphDayProjection,writeGraphDayProjection} from '../src/graph-day-projection';
 
 const b=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_MIGRATIONS:D1Migration[];
  TEST_TYPED_INGESTION_MIGRATIONS:D1Migration[];TEST_INGESTION_BRIDGE_MIGRATIONS:D1Migration[];
@@ -93,6 +97,55 @@ function loseFirstCheckpointBatchResponse(database:D1Database){let losses=0;
    if(losses++===0)throw new Error('synthetic committed checkpoint response loss');return result;};
   const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}}),losses:()=>losses};
 }
+function observeEffectiveQuotaPages(database:D1Database,afterPage?:(page:number)=>void|Promise<void>){let pages=0;
+ const statement=(inner:D1PreparedStatement,sql:string,bound:unknown[]=[]):D1PreparedStatement=>new Proxy(inner,{get(value,key){
+  if(key==='bind')return(...args:unknown[])=>statement(value.bind(...args),sql,args);
+  if(key==='all'&&sql.includes('SELECT occurrence_id,observed_at_ms FROM grouped')&&sql.includes('chunk.stream=?')&&bound.includes('quota'))return async(...args:unknown[])=>{
+   const result=await Reflect.apply(Reflect.get(value,key) as Function,value,args);
+   pages++;await afterPage?.(pages);return result;};
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}});
+ return {database:new Proxy(database,{get(value,key){if(key==='prepare')return(sql:string)=>statement(value.prepare(sql),sql);
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}}),pages:()=>pages};
+}
+const effectiveKey=(scope:StorageGraphScope,preparedFold=false):StorageHistoryKey=>({sourceId,sourceNamespace:namespace,
+ ownerDigest:scope.owner.ownerDigest!,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
+ method:storageGraphEffectiveCheckpointMethod(scope.metric,preparedFold)});
+async function clearSyntheticGraph(scope:StorageGraphScope){
+ // This test owns its disposable source/target and preserves the source corpus
+ // so both checkpoint strategies calculate exactly the same dependency.
+ await target().prepare('DELETE FROM analytics_community_graph_results WHERE source_id=? AND owner_digest=? AND metric=? AND day=?')
+  .bind(sourceId,scope.owner.ownerDigest,scope.metric,scope.day).run();
+ for(const prepared of [false,true]){
+  const key=await storageHistoryKeyDigest(effectiveKey(scope,prepared));
+  await target().batch([
+   target().prepare('DELETE FROM analytics_history_checkpoint_heads WHERE key_digest=?').bind(key),
+   target().prepare('DELETE FROM analytics_history_checkpoint_parts WHERE key_digest=?').bind(key),
+   target().prepare('DELETE FROM analytics_history_checkpoint_stages WHERE key_digest=?').bind(key),
+  ]);
+ }
+}
+async function finishEffectiveGraph(scope:StorageGraphScope,effectiveCheckpointPages:1|4=4,maxQueries=950,preparedFold=false){
+ const measurements:{source:number;target:number;state:string;quotaPages:number}[]=[];
+ for(let attempt=0;attempt<30;attempt++){
+  const meter=createD1InvocationBudget(maxQueries),sourceMeter=createD1InvocationBudget(maxQueries),targetMeter=createD1InvocationBudget(maxQueries);
+  const observed=observeEffectiveQuotaPages(source());
+  const result=await computeStorageGraphResult({...bindings(),source:meter.wrap(sourceMeter.wrap(observed.database)),target:meter.wrap(targetMeter.wrap(target()))},scope,
+   {maxQueries,deadlineMs:Date.now()+60_000,effectiveCheckpointPages,preparedFold});
+  measurements.push({source:sourceMeter.queriesUsed,target:targetMeter.queriesUsed,state:result.state,quotaPages:observed.pages()});
+  expect(meter.queriesUsed).toBeLessThanOrEqual(maxQueries);
+  if(result.state==='complete')return {result,measurements,
+   queries:measurements.reduce((sum,row)=>sum+row.source+row.target,0),
+   targetQueries:measurements.reduce((sum,row)=>sum+row.target,0)};
+  expect(result.reason).toBe('effective_checkpoint');
+ }
+ throw new Error('effective graph did not finish');
+}
+async function effectiveFixture(){
+ await fixture();
+ await source().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+ const owner=(await readStorageCommunityOwnerPage(source()))[0]!;
+ return captureStorageGraphScope(source(),{owner,day,metric:'model',sourceId,sourceNamespace:namespace});
+}
 function checkpointForKey(key:StorageHistoryKey):StorageV1HistoryCheckpoint{
  const identity={participantId:'synthetic-checkpoint-participant',inputFingerprint:'c'.repeat(64),sourceMethodVersion:MODEL_HISTORY_METHOD_VERSION,
   observedAtCutoff:'2026-05-28T00:00:00.000Z',resetsAtCutoff:'2026-06-04T00:00:00.000Z',windowMinutes:10080,maxQuotaRows:60000};
@@ -106,7 +159,7 @@ beforeEach(async()=>{
  expect((await drainCommunityPublicSourceBootstrap(source())).completed).toBe(true);
  await initializeStorageAnalyticsRuntime(bindings());
 });
-async function fixture(extraUsageCount=0,v11CompatibleQuota=false){
+async function fixture(extraUsageCount=0,v11CompatibleQuota=false,quotaSamplesPerBin=1){
  const owner=await createV11DeviceFixture(source()),groups=new Map<string,TelemetryV1Record[]>();
  const base=Date.parse('2026-09-01T00:00:00Z'),at=(h:number)=>new Date(base+h*3600000).toISOString();
  const push=(stream:string,time:string,record:TelemetryV1Record)=>{const key=`${stream}:${time.slice(0,10)}`;
@@ -125,7 +178,7 @@ async function fixture(extraUsageCount=0,v11CompatibleQuota=false){
    push('usage',time,JSON.parse(telemetryV11LegacyProjection('usage',record)!.canonicalRecord));
    percent+=priced.costUsd*100/capacity;
   }
-  quota(at(bin*2+1));
+  for(let sample=1;sample<=quotaSamplesPerBin;sample++)quota(at(bin*2+sample/quotaSamplesPerBin));
  }
  for(let index=0;index<extraUsageCount;index++){
   const time=at(3+index/3_600_000),priced=pricedModelHistoryUsage('gpt-5.6-sol',0.0001,time),fields=JSON.parse(priced.record.recordJson!);
@@ -425,28 +478,22 @@ it('starts v1 checkpoint work under new keys when the acquisition contract chang
 });
 
 
-it('routes correction-active owners through a resumable effective graph without v1.2 uploads',async()=>{
- await fixture();
+it.each([1,100])('routes correction-active owners through a resumable effective graph with %i quota samples per bin',async(samples)=>{
+ await fixture(0,false,samples);
  await source().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
  const owner=(await readStorageCommunityOwnerPage(source()))[0]!;
  expect(owner).toMatchObject({hasV1:true,hasV12:false,hasEffective:true});
  const scope=await captureStorageGraphScope(source(),{owner,day,metric:'model',sourceId,sourceNamespace:namespace});
  expect(scope.source).toBe('effective');
- let result:Awaited<ReturnType<typeof computeStorageGraphResult>>|undefined;
- let checkpointCount=0;
- for(let attempt=0;attempt<12;attempt++){
-   const meter=createD1InvocationBudget(900);
-   result=await computeStorageGraphResult({...bindings(),source:meter.wrap(source()),target:meter.wrap(target())},scope,
-     {maxQueries:900,deadlineMs:Date.now()+60000});
-   expect(meter.queriesUsed).toBeLessThanOrEqual(900);
-   checkpointCount=await target().prepare("SELECT count(*) n FROM analytics_history_checkpoint_heads h JOIN analytics_history_checkpoint_stages s ON s.key_digest=h.key_digest AND s.generation=h.generation WHERE s.method LIKE '%effective-model-checkpoint%'")
-     .first<number>('n')??0;
-   if(result.state==='complete')break;
-   expect(result.reason).toBe('effective_checkpoint');
- }
- expect(checkpointCount).toBeGreaterThan(0);
- expect(result?.state).toBe('complete');
- if(result?.state!=='complete')throw new Error('effective graph did not finish');
+ const baseline=await finishEffectiveGraph(scope,1);
+ await clearSyntheticGraph(scope);
+ const grouped=await finishEffectiveGraph(scope);
+ const result=grouped.result;
+ expect(result.result).toEqual(baseline.result.result);
+ expect(grouped.queries).toBeLessThan(baseline.queries*0.8);
+ expect(grouped.targetQueries).toBeLessThan(baseline.targetQueries*0.45);
+ expect(grouped.measurements.length).toBeLessThanOrEqual(baseline.measurements.length);
+ expect((await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)})).status).toBe('ready');
  expect(result.result.composition?.status).toBe('ready');
  expect(await readStorageGraphResult(bindings(),scope)).not.toBeNull();
  expect(await target().prepare("SELECT source_kind FROM analytics_community_graph_results WHERE owner_digest=? AND metric='model'")
@@ -456,6 +503,255 @@ it('routes correction-active owners through a resumable effective graph without 
  await source().prepare("UPDATE storage_owner_revisions SET revision=revision+1 WHERE owner_digest=?").bind(owner.ownerDigest).run();
  await expect(readStorageGraphResult(bindings(),scope)).rejects.toThrow();
 },90000);
+
+it('reuses effective quota days across metrics and adjacent windows with exact cold and warm results',async()=>{
+ await fixture(0,false,100);
+ await source().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+ const owner=(await readStorageCommunityOwnerPage(source()))[0]!;
+ const model=await captureStorageGraphScope(source(),{owner,day,metric:'model',sourceId,sourceNamespace:namespace});
+ const fits=await captureStorageGraphScope(source(),{owner,day,metric:'fits',sourceId,sourceNamespace:namespace});
+ const adjacent=await captureStorageGraphScope(source(),{owner,day:'2026-09-06',metric:'model',sourceId,sourceNamespace:namespace});
+ const baselineModel=await finishEffectiveGraph(model),baselineFits=await finishEffectiveGraph(fits),baselineAdjacent=await finishEffectiveGraph(adjacent);
+ for(const scope of [model,fits,adjacent])await clearSyntheticGraph(scope);
+ const cold=await finishEffectiveGraph(model,4,950,true);
+ expect(cold.result.result).toEqual(baselineModel.result.result);
+ expect(await target().prepare("SELECT count(*) n FROM analytics_graph_day_values WHERE source_layout='effective'").first('n')).toBe(5);
+ const warmFits=await finishEffectiveGraph(fits,4,950,true),warmAdjacent=await finishEffectiveGraph(adjacent,4,950,true);
+ expect(warmFits.result.result).toEqual(baselineFits.result.result);
+ expect(warmAdjacent.result.result).toEqual(baselineAdjacent.result.result);
+ for(const warm of [warmFits,warmAdjacent])expect(warm.measurements.reduce((sum,row)=>sum+row.quotaPages,0)).toBe(0);
+ expect(warmFits.queries).toBeLessThan(baselineFits.queries*0.5);
+ expect(warmAdjacent.queries).toBeLessThan(baselineAdjacent.queries*0.5);
+ expect(cold.queries+warmFits.queries+warmAdjacent.queries)
+  .toBeLessThan(baselineModel.queries+baselineFits.queries+baselineAdjacent.queries);
+ // Retain aggregate measurements only: synthetic source content never enters
+ // a performance receipt. Output is shown only by an explicitly verbose run.
+ console.info('effective quota reuse statements',JSON.stringify({baselineModel:baselineModel.measurements,
+  baselineFits:baselineFits.measurements,baselineAdjacent:baselineAdjacent.measurements,
+  cold:cold.measurements,warmFits:warmFits.measurements,warmAdjacent:warmAdjacent.measurements}));
+},180000);
+
+it('resumes an unfinished prepared quota day from the ordinary durable checkpoint',async()=>{
+ await fixture(0,false,20);
+ await source().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+ const owner=(await readStorageCommunityOwnerPage(source()))[0]!;
+ const scope=await captureStorageGraphScope(source(),{owner,day,metric:'model',sourceId,sourceNamespace:namespace});
+ const baseline=await finishEffectiveGraph(scope);
+ await clearSyntheticGraph(scope);
+ let now=0;
+ const observed=observeEffectiveQuotaPages(source(),page=>{if(page===1)now=9_000;});
+ expect(await computeStorageGraphResult({...bindings(),source:observed.database},scope,
+  {maxQueries:950,deadlineMs:20_000,now:()=>now,preparedFold:true}))
+  .toEqual({state:'deferred',reason:'effective_checkpoint'});
+ const saved=await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope,true)});
+ expect(saved).toMatchObject({status:'ready',checkpoint:{phase:'acquisition',preparingQuota:{day:'2026-09-01',quotaRowsRead:200}}});
+ const resumed=await finishEffectiveGraph(scope,4,950,true);
+ expect(resumed.result.result).toEqual(baseline.result.result);
+ expect(await target().prepare("SELECT count(*) n FROM analytics_graph_day_values WHERE source_layout='effective'").first('n')).toBe(5);
+},90000);
+
+it('adopts an existing effective checkpoint when quota-day preparation is enabled',async()=>{
+ const scope=await effectiveFixture(),baseline=await finishEffectiveGraph(scope);
+ await clearSyntheticGraph(scope);
+ const first=await computeStorageGraphResult(bindings(),scope,{maxQueries:250,deadlineMs:Date.now()+60_000});
+ expect(first).toEqual({state:'deferred',reason:'effective_checkpoint'});
+ const prior=await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)});
+ expect(prior.status).toBe('ready');
+ expect((await finishEffectiveGraph(scope,4,950,true)).result.result).toEqual(baseline.result.result);
+ expect(await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)})).toEqual(prior);
+ expect((await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope,true)})).status).toBe('ready');
+},30000);
+
+it('falls back to the effective pager when a prepared middle day is missing or migration support is absent',async()=>{
+ const scope=await effectiveFixture(),baseline=await finishEffectiveGraph(scope,4,950,true);
+ await clearSyntheticGraph(scope);
+ await target().prepare("DELETE FROM analytics_graph_day_values WHERE source_layout='effective' AND day='2026-09-03'").run();
+ const missing=await finishEffectiveGraph(scope,4,950,true);
+ expect(missing.result.result).toEqual(baseline.result.result);
+ expect(missing.measurements.reduce((sum,row)=>sum+row.quotaPages,0)).toBeGreaterThan(0);
+ await clearSyntheticGraph(scope);
+ await target().prepare('DROP TRIGGER analytics_graph_day_effective_quota_contract').run();
+ const unsupported=await finishEffectiveGraph(scope,4,950,true);
+ expect(unsupported.result.result).toEqual(baseline.result.result);
+ expect(unsupported.measurements.reduce((sum,row)=>sum+row.quotaPages,0)).toBeGreaterThan(0);
+ expect((await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)})).status).toBe('ready');
+ expect((await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope,true)})).status).toBe('absent');
+},60000);
+
+it('promotes a partial effective group at its work deadline and resumes the identical result',async()=>{
+ const scope=await effectiveFixture(),baseline=await finishEffectiveGraph(scope,1);
+ await clearSyntheticGraph(scope);
+ let now=0;
+ const observed=observeEffectiveQuotaPages(source(),page=>{if(page===2)now=9_000;});
+ const cut=await computeStorageGraphResult({...bindings(),source:observed.database},scope,{deadlineMs:20_000,now:()=>now});
+ expect(cut).toEqual({state:'deferred',reason:'effective_checkpoint'});
+ expect(observed.pages()).toBe(2);
+ const saved=await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)});
+ expect(saved.status).toBe('ready');
+ if(saved.status!=='ready'||!('source'in saved.checkpoint)||saved.checkpoint.source!=='effective')throw new Error('effective checkpoint missing');
+ expect(saved.checkpoint.effectiveCursor).toMatchObject({phase:'plan',day:'2026-09-03',ordinal:25});
+ expect((await finishEffectiveGraph(scope)).result.result).toEqual(baseline.result.result);
+},30000);
+
+it('makes progress with a small effective query budget and resumes a checkpoint written by the one-page mode',async()=>{
+ const scope=await effectiveFixture(),baseline=await finishEffectiveGraph(scope,1);
+ await clearSyntheticGraph(scope);
+ const meter=createD1InvocationBudget(250);
+ const cut=await computeStorageGraphResult({...bindings(),source:meter.wrap(source()),target:meter.wrap(target())},scope,
+  {maxQueries:250,deadlineMs:Date.now()+60_000,effectiveCheckpointPages:1});
+ expect(cut).toEqual({state:'deferred',reason:'effective_checkpoint'});
+ expect(meter.queriesUsed).toBeLessThanOrEqual(250);
+ expect((await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)})).status).toBe('ready');
+ const resumed=await finishEffectiveGraph(scope,4,250);
+ expect(resumed.measurements.length).toBeGreaterThan(1);
+ expect(resumed.result.result).toEqual(baseline.result.result);
+},30000);
+
+it('reproduces the exact effective successor after only some of its checkpoint parts were staged',async()=>{
+ const scope=await effectiveFixture(),baseline=await finishEffectiveGraph(scope,1);
+ await clearSyntheticGraph(scope);
+ if(!('source'in scope.pin))throw new Error('effective source pin missing');
+ let checkpoint:StorageEffectiveHistoryCheckpoint|undefined;
+ for(let page=0;page<4;page++){
+  const next=await advanceStorageEffectiveAnalysis({source:source(),sourceNamespace:namespace,owner:scope.owner,
+   pin:scope.pin,day,metric:'model',nowMs:Date.parse(scope.fixedNow),checkpoint,
+   budget:{remainingQueries:950,deadlineMs:Date.now()+60_000}});
+  if(next.status!=='deferred'||!next.checkpoint)throw new Error('effective group finished unexpectedly');
+  checkpoint=next.checkpoint;
+ }
+ const staged=await saveStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope),checkpoint:checkpoint!,expectedHead:null,maxWrites:3});
+ expect(staged.status).toBe('staging');
+ if(staged.status!=='staging')throw new Error('effective group did not stage partially');
+ expect((await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)})).status).toBe('absent');
+ expect((await finishEffectiveGraph(scope)).result.result).toEqual(baseline.result.result);
+ expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_parts WHERE key_digest=? AND generation=?')
+  .bind(await storageHistoryKeyDigest(effectiveKey(scope)),staged.generation).first<number>('n')).toBe(staged.totalParts);
+},30000);
+
+it('resumes an effective four-page group whose committed response was lost',async()=>{
+ const scope=await effectiveFixture(),baseline=await finishEffectiveGraph(scope,1);
+ await clearSyntheticGraph(scope);
+ const observed=observeEffectiveQuotaPages(source()),lost=loseFirstCheckpointBatchResponse(target());
+ await expect(computeStorageGraphResult({...bindings(),source:observed.database,target:lost.database},scope,{deadlineMs:Date.now()+60_000}))
+  .rejects.toMatchObject({stage:'graph_checkpoint_save',reason:'application'});
+ expect(lost.losses()).toBe(1);expect(observed.pages()).toBe(4);
+ expect((await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)})).status).toBe('ready');
+ expect((await finishEffectiveGraph(scope)).result.result).toEqual(baseline.result.result);
+},30000);
+
+it('saves a deterministic large successor after a stale prepared-day fallback cuts the page group',async()=>{
+ const scope=await effectiveFixture();
+ await finishEffectiveGraph(scope,4,950,true);
+ await clearSyntheticGraph(scope);
+ const heads=await readGraphDayEffectiveQuotaHeads({target:target(),sourceId,sourceNamespace:namespace,
+  ownerDigest:scope.owner.ownerDigest!,fromDay:'2026-09-01',throughDay:day});
+ const last=heads?.find(head=>head.key.day===day);
+ if(!last)throw new Error('synthetic prepared day missing');
+ const projection=await readGraphDayProjection({target:target(),key:last.key,cursor:last.cursor,maxParts:32});
+ if(projection.status!=='ready')throw new Error('synthetic prepared day not ready');
+ // Retain a well-framed stale candidate so coverage is present and only the
+ // final source dependency check discovers the miss.
+ await target().prepare('DELETE FROM analytics_graph_day_values WHERE value_key=?').bind(projection.valueKey).run();
+ expect((await writeGraphDayProjection({target:target(),key:{...last.key,manifestDigest:'e'.repeat(64)},
+  projection:projection.projection,effectiveQuota:projection.effectiveQuota})).status).toBe('stored');
+ if(!('source'in scope.pin))throw new Error('effective source pin missing');
+ const first=await advanceStorageEffectiveAnalysis({source:source(),sourceNamespace:namespace,owner:scope.owner,
+  pin:scope.pin,day,metric:'model',nowMs:Date.parse(scope.fixedNow),
+  budget:{remainingQueries:950,deadlineMs:Date.now()+60_000}});
+ if(first.status!=='deferred'||first.checkpoint?.phase!=='acquisition')throw new Error('effective acquisition missing');
+ first.checkpoint.acquisition.plan.observations=Array.from({length:30_000},(_,index)=>({
+  contextKey:'openai_codex|codex',observedAtMs:Date.parse(first.checkpoint!.identity.observedAtCutoff)+index,
+  planType:'pro',planVariant:'unknown',continuityId:null,conflicted:false,accountScopeId:null,planBasis:null}));
+ const key=effectiveKey(scope,true);
+ let saved=await saveStorageHistoryCheckpoint({target:target(),key,checkpoint:first.checkpoint,expectedHead:null});
+ while(saved.status==='staging')saved=await saveStorageHistoryCheckpoint({target:target(),key,
+  checkpoint:first.checkpoint,expectedHead:null,cursor:saved.cursor});
+ expect(saved.totalParts).toBeGreaterThan(30);
+ let now=0;
+ const observed=observeEffectiveQuotaPages(source(),()=>{now=9_000;});
+ expect(await computeStorageGraphResult({...bindings(),source:observed.database},scope,
+  {maxQueries:300,deadlineMs:20_000,now:()=>now,preparedFold:true}))
+  .toEqual({state:'deferred',reason:'effective_checkpoint'});
+ expect(observed.pages()).toBe(1);
+ let successor=await loadStorageHistoryCheckpoint({target:target(),key});
+ while(successor.status==='deferred')successor=await loadStorageHistoryCheckpoint({target:target(),key,cursor:successor.cursor});
+ expect(successor.status).toBe('ready');
+ if(successor.status!=='ready')throw new Error('large successor missing');
+ expect(successor.headDigest).not.toBe(saved.headDigest);
+ expect(successor.checkpoint).toMatchObject({effectiveCursor:{ordinal:25}});
+},30000);
+
+it('keeps the old effective head when a deadline cuts a group whose checkpoint needs multiple batches',async()=>{
+ const scope=await effectiveFixture();
+ if(!('source'in scope.pin))throw new Error('effective source pin missing');
+ const first=await advanceStorageEffectiveAnalysis({source:source(),sourceNamespace:namespace,owner:scope.owner,
+  pin:scope.pin,day,metric:'model',nowMs:Date.parse(scope.fixedNow),
+  budget:{remainingQueries:950,deadlineMs:Date.now()+60_000}});
+ if(first.status!=='deferred'||first.checkpoint?.phase!=='acquisition')throw new Error('effective acquisition missing');
+ // A valid, large synthetic retained acquisition exercises the save boundary
+ // without importing thousands of additional source chunks in this test.
+ first.checkpoint.acquisition.plan.observations=Array.from({length:30_000},(_,index)=>({
+  contextKey:'openai_codex|codex',observedAtMs:Date.parse(first.checkpoint!.identity.observedAtCutoff)+index,
+  planType:'pro',planVariant:'unknown',continuityId:null,conflicted:false,accountScopeId:null,planBasis:null}));
+ const key=effectiveKey(scope);
+ let saved=await saveStorageHistoryCheckpoint({target:target(),key,checkpoint:first.checkpoint,expectedHead:null});
+ while(saved.status==='staging')saved=await saveStorageHistoryCheckpoint({target:target(),key,
+  checkpoint:first.checkpoint,expectedHead:null,cursor:saved.cursor});
+ expect(saved.totalParts).toBeGreaterThan(30);
+ let now=0;
+ const observed=observeEffectiveQuotaPages(source(),page=>{if(page===2)now=9_000;});
+ expect(await computeStorageGraphResult({...bindings(),source:observed.database},scope,{deadlineMs:20_000,now:()=>now}))
+  .toEqual({state:'deferred',reason:'effective_checkpoint'});
+ expect(observed.pages()).toBe(2);
+ expect(await target().prepare('SELECT generation FROM analytics_history_checkpoint_heads WHERE key_digest=?')
+  .bind(await storageHistoryKeyDigest(key)).first<string>('generation')).toBe(saved.headDigest);
+ expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages WHERE key_digest=?')
+  .bind(await storageHistoryKeyDigest(key)).first<number>('n')).toBe(1);
+ const resumed=await computeStorageGraphResult(bindings(),scope,{maxQueries:950,deadlineMs:Date.now()+60_000});
+ if(resumed.state==='deferred')expect(resumed.reason).toBe('effective_checkpoint');
+ expect(await target().prepare('SELECT generation FROM analytics_history_checkpoint_heads WHERE key_digest=?')
+  .bind(await storageHistoryKeyDigest(key)).first<string>('generation')).not.toBe(saved.headDigest);
+},30000);
+
+it('retries failed effective reads from the last promoted group without double counting',async()=>{
+ const scope=await effectiveFixture(),baseline=await finishEffectiveGraph(scope,1);
+ await clearSyntheticGraph(scope);
+ const observed=observeEffectiveQuotaPages(source(),page=>{if(page===6)throw new Error('synthetic page unavailable');});
+ await expect(computeStorageGraphResult({...bindings(),source:observed.database},scope,{deadlineMs:Date.now()+60_000})).rejects.toThrow();
+ const saved=await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)});
+ expect(saved.status).toBe('ready');
+ if(saved.status!=='ready'||!('source'in saved.checkpoint)||saved.checkpoint.source!=='effective')throw new Error('effective checkpoint missing');
+ // Five pages finished the plan phase and were promoted; the failed first
+ // cluster page must be read again from that phase boundary.
+ expect(saved.checkpoint.phase).toBe('acquisition');
+ if(saved.checkpoint.phase!=='acquisition')throw new Error('effective acquisition missing');
+ expect(saved.checkpoint.acquisition.phase).toBe('clusters');
+ expect((await finishEffectiveGraph(scope)).result.result).toEqual(baseline.result.result);
+},30000);
+
+it.each(['revision','authority_epoch'] as const)('refuses effective work when owner %s changes inside a page group',async(field)=>{
+ const scope=await effectiveFixture();
+ const observed=observeEffectiveQuotaPages(source(),async page=>{if(page===2){
+  const sql=field==='revision'?'UPDATE storage_owner_revisions SET revision=revision+1 WHERE owner_digest=?'
+   :'UPDATE storage_owner_revisions SET authority_epoch=authority_epoch+1 WHERE owner_digest=?';
+  await source().prepare(sql).bind(scope.owner.ownerDigest).run();
+ }});
+ await expect(computeStorageGraphResult({...bindings(),source:observed.database},scope,{deadlineMs:Date.now()+60_000})).rejects.toThrow();
+ expect(observed.pages()).toBe(2);
+ expect((await loadStorageHistoryCheckpoint({target:target(),key:effectiveKey(scope)})).status).toBe('absent');
+ expect(await target().prepare('SELECT count(*) n FROM analytics_community_graph_results').first<number>('n')).toBe(0);
+},30000);
+
+it('converges concurrent effective group writers on the same analytical result',async()=>{
+ const scope=await effectiveFixture(),baseline=await finishEffectiveGraph(scope,1);
+ await clearSyntheticGraph(scope);
+ const attempts=await Promise.all([1,2].map(()=>computeStorageGraphResult(bindings(),scope,{deadlineMs:Date.now()+60_000})));
+ for(const result of attempts){
+  if(result.state==='complete')expect(result.result).toEqual(baseline.result.result);
+  else expect(result.reason).toBe('effective_checkpoint');
+ }
+ expect((await finishEffectiveGraph(scope)).result.result).toEqual(baseline.result.result);
+},30000);
 
 it('folds mixed v1 and v1.1 evidence once through resumable model and fit graphs',async()=>{
  await fixture(0,true);

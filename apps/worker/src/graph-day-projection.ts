@@ -34,6 +34,8 @@ import { assertTypedV11GenerationSnapshotLive, createTypedV11QuotaPageReader,
 import { createV11QuotaAcquisitionIdentity, v11PreparedUsageDayRow } from "./quota-analysis-v11";
 import { loadV11SourcePin } from "./telemetry-v11-domain";
 import { readTypedV11UsageAnalysisPage, TYPED_V11_ANALYSIS_PAGE_SIZE } from "./typed-v11-analysis-reader";
+import { ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS } from "./admin-community-allowance";
+import { modelHistoryWindow } from "./model-history-window";
 
 /** One framed payload row. The SQL CHECK is 256 KiB; the framer stays below it
  * so a page can never be refused only because canonical JSON grew a byte. */
@@ -45,6 +47,8 @@ export const GRAPH_DAY_PROJECTION_MAX_WRITES = 32;
  * leading hex characters of the owner digest give 256 uniformly distributed
  * buckets, which is more instances than this corpus will ever need. */
 export const GRAPH_DAY_PROJECTION_MAX_SHARDS = 256;
+export const GRAPH_DAY_EFFECTIVE_DEVICE_ID = "effective-owner";
+export const GRAPH_DAY_EFFECTIVE_MANIFEST_ID = "effective-owner-day";
 
 const HASH = /^[a-f0-9]{64}$/u;
 const encoder = new TextEncoder();
@@ -81,7 +85,7 @@ export class GraphDayProjectionRefusedError extends Error {
  */
 export interface GraphDayProjectionKey {
   sourceId: string;
-  sourceLayout: "json-v11" | "typed-v11";
+  sourceLayout: "json-v11" | "typed-v11" | "effective";
   sourceNamespace: string;
   ownerDigest: string;
   deviceId: string;
@@ -96,15 +100,50 @@ function checkKey(key: GraphDayProjectionKey): void {
   if (!key || typeof key !== "object" || Object.keys(key).sort().join(",") !== [...KEY_FIELDS].sort().join(",")
     || typeof key.sourceId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/u.test(key.sourceId)
     || !HASH.test(key.ownerDigest) || !HASH.test(key.manifestDigest)
-    || !["json-v11", "typed-v11"].includes(key.sourceLayout)
+    || !["json-v11", "typed-v11", "effective"].includes(key.sourceLayout)
     || typeof key.sourceNamespace !== "string" || key.sourceNamespace.length > 256
     || (key.sourceLayout === "json-v11") !== (key.sourceNamespace.length === 0)
     || typeof key.deviceId !== "string" || key.deviceId.length < 1 || key.deviceId.length > 256
     || typeof key.manifestId !== "string" || key.manifestId.length < 1 || key.manifestId.length > 256
+    || (key.sourceLayout === "effective" && (key.deviceId !== GRAPH_DAY_EFFECTIVE_DEVICE_ID
+      || key.manifestId !== GRAPH_DAY_EFFECTIVE_MANIFEST_ID))
     || !validGraphDayLabel(key.day)) throw fail();
 }
 function bounded(value: number, min: number, max: number): void {
   if (!Number.isSafeInteger(value) || value < min || value > max) throw fail();
+}
+
+export interface GraphDayEffectiveQuota {
+  quotaRowsRead: number;
+  ownerRevision: number;
+}
+function checkEffectiveQuota(value: GraphDayEffectiveQuota): void {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).sort().join(",") !== "ownerRevision,quotaRowsRead") throw fail();
+  bounded(value.quotaRowsRead, 0, Number.MAX_SAFE_INTEGER);
+  bounded(value.ownerRevision, 1, Number.MAX_SAFE_INTEGER);
+}
+
+/** The final migration trigger is a capability marker as well as a metadata
+ * guard. Check the two columns too: a partial migration must never authorize
+ * staging payloads that the old manifest table cannot promote. This check is
+ * deliberately invocation-local; a schema change may follow a failed pass. */
+export async function graphDayEffectiveQuotaSupported(target: D1Database): Promise<boolean> {
+  const row = await target.prepare(`SELECT
+    (SELECT COUNT(*) FROM pragma_table_info('analytics_graph_day_values')
+      WHERE name IN ('quota_rows_read','effective_owner_revision') AND type='INTEGER'
+        AND "notnull"=0) AS columns_ready,
+    (SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger'
+      AND name='analytics_graph_day_effective_quota_contract'
+      AND tbl_name='analytics_graph_day_values') AS contract_ready`)
+    .first<{ columns_ready: number; contract_ready: number }>();
+  return row?.columns_ready === 2 && row.contract_ready === 1;
+}
+
+async function projectionDigest(projection: GraphDayProjection,
+  effectiveQuota?: GraphDayEffectiveQuota): Promise<string> {
+  return sha256Hex(canonicalJson(effectiveQuota === undefined ? projection
+    : { projection, quotaRowsRead: effectiveQuota.quotaRowsRead }));
 }
 
 /** The content-addressed row identity. It deliberately covers the acquisition
@@ -183,13 +222,22 @@ export type GraphDayProjectionWrite =
  */
 export async function writeGraphDayProjection(input: { target: D1Database; key: GraphDayProjectionKey;
   projection: GraphDayProjection; maxWrites?: number; cursor?: GraphDayProjectionWriteCursor;
+  effectiveQuota?: GraphDayEffectiveQuota;
 }): Promise<GraphDayProjectionWrite> {
   const { target, projection } = input, key = { ...input.key };
   checkKey(key);
+  const effectiveQuota = input.effectiveQuota;
+  if (key.sourceLayout === "effective") {
+    if (effectiveQuota === undefined) throw fail();
+    checkEffectiveQuota(effectiveQuota);
+    if (!await graphDayEffectiveQuotaSupported(target)) throw fail();
+  } else if (effectiveQuota !== undefined) throw fail();
   if (projection.day !== key.day) throw fail();
   const max = input.maxWrites ?? GRAPH_DAY_PROJECTION_MAX_WRITES;
   bounded(max, 2, GRAPH_DAY_PROJECTION_MAX_WRITES);
-  const valueKey = await graphDayProjectionValueKey(key), f = await framed(projection);
+  const valueKey = await graphDayProjectionValueKey(key), legacyFrame = await framed(projection);
+  const f = effectiveQuota === undefined ? legacyFrame
+    : { ...legacyFrame, digest: await projectionDigest(projection, effectiveQuota) };
   const present = new Set<number>();
   if (input.cursor) {
     const cursor = input.cursor;
@@ -199,11 +247,17 @@ export async function writeGraphDayProjection(input: { target: D1Database; key: 
     for (const index of cursor.present) present.add(index);
   } else {
     const row = await target.prepare(`SELECT values_digest,part_count,record_count
+      ${effectiveQuota === undefined ? "" : ",quota_rows_read,effective_owner_revision"}
       FROM analytics_graph_day_values WHERE value_key=?`).bind(valueKey)
-      .first<{ values_digest: string; part_count: number; record_count: number }>();
+      .first<{ values_digest: string; part_count: number; record_count: number;
+        quota_rows_read?: number; effective_owner_revision?: number }>();
     if (row) {
       if (row.values_digest !== f.digest || row.part_count !== f.parts.length
         || row.record_count !== f.recordCount) throw fail();
+      if (effectiveQuota !== undefined) {
+        checkEffectiveQuota({ quotaRowsRead: row.quota_rows_read!, ownerRevision: row.effective_owner_revision! });
+        if (row.quota_rows_read !== effectiveQuota.quotaRowsRead) throw fail();
+      }
       return { status: "stored", valueKey, totalParts: f.parts.length, recordCount: f.recordCount };
     }
     const staged = (await target.prepare(`SELECT part_index,part_digest FROM analytics_graph_day_pages
@@ -233,11 +287,12 @@ export async function writeGraphDayProjection(input: { target: D1Database; key: 
   if (complete) {
     statements.push(target.prepare(`INSERT INTO analytics_graph_day_values
       (value_key,source_id,source_layout,source_namespace,owner_digest,device_id,manifest_id,manifest_digest,
-       day,acquisition_version,record_count,part_count,values_digest)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(value_key) DO NOTHING`)
+       day,acquisition_version,record_count,part_count,values_digest${effectiveQuota === undefined ? "" : ",quota_rows_read,effective_owner_revision"})
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?${effectiveQuota === undefined ? "" : ",?,?"}) ON CONFLICT(value_key) DO NOTHING`)
       .bind(valueKey, key.sourceId, key.sourceLayout, key.sourceNamespace, key.ownerDigest, key.deviceId,
         key.manifestId, key.manifestDigest, key.day, GRAPH_DAY_PROJECTION_VERSION, f.recordCount,
-        f.parts.length, f.digest));
+        f.parts.length, f.digest, ...(effectiveQuota === undefined ? []
+          : [effectiveQuota.quotaRowsRead, effectiveQuota.ownerRevision])));
   }
   if (statements.length) await target.batch(statements);
   const stored = complete
@@ -259,11 +314,80 @@ export interface GraphDayProjectionLoadCursor {
   recordCount: number;
   components: Partial<Record<GraphDayProjectionComponent, unknown[]>>;
   loaded: number;
+  effectiveQuota?: GraphDayEffectiveQuota;
 }
 export type GraphDayProjectionRead =
   | { status: "absent"; valueKey: string }
   | { status: "deferred"; valueKey: string; cursor: GraphDayProjectionLoadCursor }
-  | { status: "ready"; valueKey: string; projection: GraphDayProjection; recordCount: number };
+  | { status: "ready"; valueKey: string; projection: GraphDayProjection; recordCount: number;
+      effectiveQuota?: GraphDayEffectiveQuota };
+
+export interface GraphDayEffectiveQuotaHead {
+  key: GraphDayProjectionKey;
+  cursor: GraphDayProjectionLoadCursor;
+  fitFragmentCount: number;
+  payloadBytes: number;
+}
+
+/** Read a bounded window of immutable manifests in one statement. Callers
+ * still recompute each source dependency and select its exact value key before
+ * loading any payload. The returned private cursors bind the same digest and
+ * counts as an ordinary manifest read; they confer no source authority. An
+ * oversized candidate set is a cache miss, never silently truncated coverage. */
+export async function readGraphDayEffectiveQuotaHeads(input: {
+  target: D1Database; sourceId: string; sourceNamespace: string; ownerDigest: string;
+  fromDay: string; throughDay: string; limit?: number;
+}): Promise<readonly GraphDayEffectiveQuotaHead[] | undefined> {
+  const limit = input.limit ?? 1024;
+  bounded(limit, 1, 1024);
+  checkKey({ sourceId: input.sourceId, sourceLayout: "effective", sourceNamespace: input.sourceNamespace,
+    ownerDigest: input.ownerDigest, deviceId: GRAPH_DAY_EFFECTIVE_DEVICE_ID,
+    manifestId: GRAPH_DAY_EFFECTIVE_MANIFEST_ID, manifestDigest: "0".repeat(64), day: input.fromDay });
+  if (!validGraphDayLabel(input.throughDay) || input.throughDay < input.fromDay) throw fail();
+  const rows = (await input.target.prepare(`WITH heads AS MATERIALIZED (
+    SELECT value_key,source_id,source_layout,source_namespace,
+      owner_digest,device_id,manifest_id,manifest_digest,day,acquisition_version,
+      values_digest,part_count,record_count,quota_rows_read,effective_owner_revision
+    FROM analytics_graph_day_values
+    WHERE source_id=? AND source_namespace=? AND source_layout='effective' AND owner_digest=?
+      AND day>=? AND day<=? AND acquisition_version=?
+    ORDER BY day,value_key LIMIT ?)
+    SELECT h.*,
+      (SELECT COALESCE(SUM(p.entry_count),0) FROM analytics_graph_day_pages p
+        WHERE p.value_key=h.value_key AND p.component='fitFragments') AS fit_fragment_count,
+      (SELECT COALESCE(SUM(length(CAST(p.payload_json AS BLOB))),0) FROM analytics_graph_day_pages p
+        WHERE p.value_key=h.value_key) AS payload_bytes
+    FROM heads h ORDER BY h.day,h.value_key`).bind(input.sourceId, input.sourceNamespace, input.ownerDigest,
+      input.fromDay, input.throughDay, GRAPH_DAY_PROJECTION_VERSION, limit + 1)
+    .all<{ value_key: string; source_id: string; source_layout: string; source_namespace: string;
+      owner_digest: string; device_id: string; manifest_id: string; manifest_digest: string; day: string;
+      acquisition_version: string; values_digest: string; part_count: number; record_count: number;
+      quota_rows_read: number; effective_owner_revision: number; fit_fragment_count: number;
+      payload_bytes: number }>()).results;
+  if (rows.length > limit) return undefined;
+  const result: GraphDayEffectiveQuotaHead[] = [];
+  for (const row of rows) {
+    const key: GraphDayProjectionKey = { sourceId: row.source_id, sourceLayout: "effective",
+      sourceNamespace: row.source_namespace, ownerDigest: row.owner_digest, deviceId: row.device_id,
+      manifestId: row.manifest_id, manifestDigest: row.manifest_digest, day: row.day };
+    checkKey(key);
+    if (row.source_id !== input.sourceId || row.source_namespace !== input.sourceNamespace
+      || row.source_layout !== "effective" || row.owner_digest !== input.ownerDigest
+      || row.day < input.fromDay || row.day > input.throughDay
+      || row.acquisition_version !== GRAPH_DAY_PROJECTION_VERSION
+      || await graphDayProjectionValueKey(key) !== row.value_key || !HASH.test(row.values_digest)) throw fail();
+    bounded(row.part_count, 1, GRAPH_DAY_PROJECTION_MAX_PARTS);
+    bounded(row.record_count, 0, Number.MAX_SAFE_INTEGER);
+    bounded(row.fit_fragment_count, 0, row.record_count);
+    bounded(row.payload_bytes, 1, row.part_count * 262144);
+    const effectiveQuota = { quotaRowsRead: row.quota_rows_read, ownerRevision: row.effective_owner_revision };
+    checkEffectiveQuota(effectiveQuota);
+    result.push({ key, fitFragmentCount: row.fit_fragment_count, payloadBytes: row.payload_bytes,
+      cursor: { valueKey: row.value_key, digest: row.values_digest,
+      partCount: row.part_count, recordCount: row.record_count, effectiveQuota, loaded: 0, components: {} } });
+  }
+  return result;
+}
 
 /** Read one prepared day, at most `maxParts` payload rows per call. Every page
  * is rehashed and the reassembled artifact must both validate and match the
@@ -278,17 +402,23 @@ export async function readGraphDayProjection(input: { target: D1Database; key: G
   const valueKey = await graphDayProjectionValueKey(key);
   let cursor = input.cursor;
   if (cursor && cursor.valueKey !== valueKey) throw fail();
+  if (cursor && (key.sourceLayout === "effective") !== (cursor.effectiveQuota !== undefined)) throw fail();
   if (!cursor) {
     const row = await target.prepare(`SELECT values_digest,part_count,record_count
+      ${key.sourceLayout === "effective" ? ",quota_rows_read,effective_owner_revision" : ""}
       FROM analytics_graph_day_values WHERE value_key=?`).bind(valueKey)
-      .first<{ values_digest: string; part_count: number; record_count: number }>();
+      .first<{ values_digest: string; part_count: number; record_count: number;
+        quota_rows_read?: number; effective_owner_revision?: number }>();
     if (!row) return { status: "absent", valueKey };
     if (!HASH.test(row.values_digest) || !Number.isSafeInteger(row.part_count) || row.part_count < 1
       || row.part_count > GRAPH_DAY_PROJECTION_MAX_PARTS || !Number.isSafeInteger(row.record_count)
       || row.record_count < 0) throw fail();
     cursor = { valueKey, digest: row.values_digest, partCount: row.part_count,
-      recordCount: row.record_count, components: {}, loaded: 0 };
+      recordCount: row.record_count, components: {}, loaded: 0,
+      ...(key.sourceLayout === "effective" ? { effectiveQuota: {
+        quotaRowsRead: row.quota_rows_read!, ownerRevision: row.effective_owner_revision! } } : {}) };
   }
+  if (cursor.effectiveQuota !== undefined) checkEffectiveQuota(cursor.effectiveQuota);
   const rows = (await target.prepare(`SELECT part_index,component,entry_count,part_digest,payload_json
     FROM analytics_graph_day_pages WHERE value_key=? AND part_index>=? ORDER BY part_index LIMIT ?`)
     .bind(valueKey, cursor.loaded, max)
@@ -313,43 +443,76 @@ export async function readGraphDayProjection(input: { target: D1Database; key: G
   }
   const candidate = graphDayProjectionFromComponents(key.day, cursor.components);
   if (!validGraphDayProjection(candidate)) throw fail();
-  if (await sha256Hex(canonicalJson(candidate)) !== cursor.digest
+  if (await projectionDigest(candidate, cursor.effectiveQuota) !== cursor.digest
     || graphDayProjectionRecordCount(candidate) !== cursor.recordCount) throw fail();
-  return { status: "ready", valueKey, projection: candidate, recordCount: cursor.recordCount };
+  return { status: "ready", valueKey, projection: candidate, recordCount: cursor.recordCount,
+    ...(cursor.effectiveQuota === undefined ? {} : { effectiveQuota: cursor.effectiveQuota }) };
 }
 
 /**
- * One bounded retirement page. Three independent reasons, all keyed to this
- * source only:
+ * One bounded retirement page. All retirement reasons are keyed to this source:
  *
  * - a row whose `acquisition_version` is not the current kernel contract;
  * - a row for an owner with a terminal erasure fence;
- * - a row whose day manifest identity no longer matches any delivered day,
- *   which is what a re-upload leaves behind after the new key is prepared.
+ * - a legacy row whose day manifest identity no longer matches any delivered day;
+ * - an effective row whose namespace or completed daily dependency changed, or
+ *   whose day is outside every maintained graph input window.
  *
  * Pages are deleted after the values row that authorized them, so an
  * interrupted retirement resumes from the orphan pages rather than leaving a
  * values row pointing at a partly deleted payload.
  */
 export async function retireGraphDayProjectionPage(target: D1Database, sourceId: string,
-  options: { limit?: number; acquisitionVersion?: string } = {},
+  options: { limit?: number; acquisitionVersion?: string; nowMs?: number } = {},
 ): Promise<{ state: "idle" | "retiring"; values: number; pages: number; refusals: number }> {
   const limit = options.limit ?? 32;
   bounded(limit, 1, 200);
   const version = options.acquisitionVersion ?? GRAPH_DAY_PROJECTION_VERSION;
   if (typeof version !== "string" || version.length < 1 || version.length > 128) throw fail();
+  const nowMs = options.nowMs ?? Date.now();
+  if (!Number.isFinite(nowMs) || !Number.isFinite(new Date(nowMs).getTime())) throw fail();
+  const todayMs = Date.parse(new Date(nowMs).toISOString().slice(0, 10));
+  const oldestResultDay = new Date(todayMs - (ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS - 1) * 86400000)
+    .toISOString().slice(0, 10);
+  const oldestInputDay = modelHistoryWindow(oldestResultDay).fromDay;
+  const effectiveSupported = await graphDayEffectiveQuotaSupported(target);
+  // Source-validated preparation may lead daily publication. Only a completed
+  // daily identity at least as fresh as the prepared input can retire it; an
+  // absent, older or malformed daily cursor is not evidence of invalidation.
+  const effectiveRetirement = effectiveSupported ? `
+      OR (g.source_layout='effective' AND (
+        g.day<?4 OR g.source_namespace IS NOT (SELECT r.source_namespace FROM analytics_runtime_sources r
+          WHERE r.source_id=g.source_id)
+        OR EXISTS(SELECT 1 FROM analytics_community_daily_owners d
+          WHERE d.source_id=g.source_id AND d.owner_digest=g.owner_digest AND d.day=g.day
+            AND d.source_format='effective' AND d.complete=1
+            AND d.owner_revision>=g.effective_owner_revision
+            AND (CASE WHEN json_valid(d.fingerprint)=1 THEN
+              CASE WHEN json_type(d.fingerprint)='object'
+                AND json_extract(d.fingerprint,'$.method')='effective-daily-cursor-v2'
+                AND json_type(d.fingerprint,'$.dependencyDigest')='text'
+                AND length(json_extract(d.fingerprint,'$.dependencyDigest'))=64
+                AND json_extract(d.fingerprint,'$.dependencyDigest') NOT GLOB '*[^0-9a-f]*'
+                AND (SELECT COUNT(*) FROM json_each(d.fingerprint))=3
+                AND json_type(d.fingerprint,'$.streams')='object'
+                AND (SELECT COUNT(*) FROM json_each(d.fingerprint,'$.streams'))=3
+                AND json_type(d.fingerprint,'$.streams.quota')='null'
+                AND json_type(d.fingerprint,'$.streams.session')='null'
+                AND json_type(d.fingerprint,'$.streams.usage')='null'
+              THEN json_extract(d.fingerprint,'$.dependencyDigest') ELSE NULL END
+              ELSE NULL END)!=g.manifest_digest)))` : "";
   const values = (await target.prepare(`DELETE FROM analytics_graph_day_values WHERE value_key IN (
     SELECT g.value_key FROM analytics_graph_day_values g
     WHERE g.source_id=?1 AND (g.acquisition_version!=?2
       OR EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
         WHERE f.source_id=g.source_id AND f.owner_digest=g.owner_digest)
-      OR NOT EXISTS(SELECT 1 FROM analytics_v11_reusable_values v
+      OR (g.source_layout IN ('json-v11','typed-v11') AND NOT EXISTS(SELECT 1 FROM analytics_v11_reusable_values v
         WHERE v.source_id=g.source_id AND v.source_layout=g.source_layout
           AND v.source_namespace=g.source_namespace AND v.owner_digest=g.owner_digest
           AND v.device_id=g.device_id AND v.manifest_id=g.manifest_id
-          AND v.manifest_digest=g.manifest_digest AND v.day=g.day))
+          AND v.manifest_digest=g.manifest_digest AND v.day=g.day))${effectiveRetirement})
     ORDER BY g.owner_digest,g.day,g.value_key LIMIT ?3) RETURNING value_key`)
-    .bind(sourceId, version, limit).all()).results.length;
+    .bind(sourceId, version, limit, ...(effectiveSupported ? [oldestInputDay] : [])).all()).results.length;
   const pages = (await target.prepare(`DELETE FROM analytics_graph_day_pages WHERE (value_key,part_index) IN (
     SELECT p.value_key,p.part_index FROM analytics_graph_day_pages p
     WHERE p.source_id=?1 AND NOT EXISTS(SELECT 1 FROM analytics_graph_day_values g WHERE g.value_key=p.value_key)

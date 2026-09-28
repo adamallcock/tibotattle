@@ -11,6 +11,9 @@ import { advanceV11UsageReduction, createV11QuotaAcquisitionIdentity, finishV11U
 import type { V11SourcePin } from './telemetry-v11-domain';
 import type { V11QuotaPageRow } from './typed-v11-quota-reader';
 import type { StorageCommunityOwner } from './storage-community-authority';
+import { appendEffectiveQuotaDay, finishEffectiveQuotaDay, foldEffectiveQuotaDays,
+  mapEffectiveQuotaPageRow, validEffectiveQuotaDayPending,
+  type EffectiveQuotaDay, type EffectiveQuotaDayPending } from './effective-quota-day';
 
 export const STORAGE_EFFECTIVE_READER_METHOD = 'effective-usage-owner-day-v1';
 const DAY_MS = 86_400_000;
@@ -31,7 +34,7 @@ export type StorageEffectiveHistoryCheckpoint = {
   version: 1; source: 'effective'; day: string; layout: string;
   identity: V11QuotaAcquisitionIdentity; effectiveCursor: EffectiveQuotaCursor;
   effectiveDays:{quota:readonly string[];usage:readonly string[]};
-} & ({phase:'acquisition'; acquisition:V11QuotaAcquisitionCheckpoint}
+} & ({phase:'acquisition'; acquisition:V11QuotaAcquisitionCheckpoint; preparingQuota?:EffectiveQuotaDayPending}
   |{phase:'finish'; acquisition:V11CompletedQuotaAcquisition}
   |{phase:'usage'; acquisition:V11CompletedQuotaAcquisition; usage:V11UsageReductionCheckpoint});
 export function validEffectiveQuotaCursor(value: unknown): value is EffectiveQuotaCursor {
@@ -470,6 +473,14 @@ export async function advanceStorageEffectiveAnalysis(input:{
   source:D1Database;sourceNamespace:string;owner:StorageCommunityOwner & {ownerDigest:string};
   pin:V11SourcePin;day:string;metric:'fits'|'model';nowMs:number;
   checkpoint?:StorageEffectiveHistoryCheckpoint|null;
+  /** Complete source-validated days only; missing coverage keeps the paged
+   * calculation. Preparation piggybacks on its first quota scan. */
+  preparedQuota?:{
+    load(days:readonly string[],identity:V11QuotaAcquisitionIdentity):Promise<readonly EffectiveQuotaDay[]|undefined>;
+    store(day:EffectiveQuotaDay):Promise<void>;
+    /** A costly cache miss leaves room for one deterministic page/save. */
+    preferSinglePageCheckpoint?:()=>boolean;
+  };
   budget:{remainingQueries:number;deadlineMs:number;now?:()=>number};
 }):Promise<{status:'deferred';checkpoint:StorageEffectiveHistoryCheckpoint|null}|{status:'complete';analysis:object}>{
   const {source,pin,owner,budget}=input;
@@ -484,6 +495,10 @@ export async function advanceStorageEffectiveAnalysis(input:{
     ||checkpoint.layout!==layout||canonicalJson(checkpoint.identity)!==canonicalJson(identity)
     ||!validEffectiveQuotaCursor(checkpoint.effectiveCursor)
     ||!validEffectiveDays(checkpoint.effectiveDays,pin.fromDay,pin.throughDay)))throw fail();
+  if(checkpoint?.phase==='acquisition'&&checkpoint.preparingQuota!==undefined
+    &&(!validEffectiveQuotaDayPending(checkpoint.preparingQuota)
+      ||checkpoint.acquisition.phase!=='plan'||checkpoint.preparingQuota.day!==checkpoint.effectiveCursor.day
+      ||checkpoint.preparingQuota.quotaRowsRead>checkpoint.effectiveCursor.ordinal))throw fail();
   if(!checkpoint){
     const inventory={sourceNamespace:input.sourceNamespace,ownerDigest:owner.ownerDigest,
       ownerRevision:owner.ownerRevision,authorityEpoch:owner.authorityEpoch,fromDay:pin.fromDay,throughDay:pin.throughDay};
@@ -499,27 +514,38 @@ export async function advanceStorageEffectiveAnalysis(input:{
       day,stream,limit:200,...(after?{after}:{})});
   if(checkpoint.phase==='acquisition'){
     const acquisition=checkpoint.acquisition;
+    if(input.preparedQuota){
+      const prepared=await input.preparedQuota.load(checkpoint.effectiveDays.quota,identity);
+      const folded=prepared===undefined?undefined:foldEffectiveQuotaDays(identity,prepared,checkpoint.effectiveDays.quota);
+      if(folded!==undefined){
+        await assertEffectiveHistoryOwner(source,owner);
+        if(folded.status==='not_testable')return {status:'complete',analysis:input.metric==='fits'
+          ?{schemaVersion:'account-scoped-quota-analysis-v0.1',status:'not_testable',reason:folded.reason,tracks:[]}
+          :{status:'not_testable',reason:folded.reason,tracks:[]}};
+        if(folded.status!=='complete')throw fail();
+        return {status:'deferred',checkpoint:{version:1,source:'effective',day:input.day,layout,identity,
+          effectiveDays:checkpoint.effectiveDays,effectiveCursor:checkpoint.effectiveCursor,
+          phase:'finish',acquisition:{identity,planAnchors:folded.planAnchors,quotaRows:folded.quotaRows}}};
+      }
+      if(budget.remainingQueries<120||now()>=budget.deadlineMs)return {status:'deferred',checkpoint:null};
+    }
     const cursor=structuredClone(checkpoint.effectiveCursor);
+    let preparingQuota=input.preparedQuota&&acquisition.phase==='plan'?checkpoint.preparingQuota:undefined;
     if(cursor.phase!==acquisition.phase){Object.assign(cursor,{phase:acquisition.phase,day:checkpoint.effectiveDays.quota[0]??pin.throughDay,
       after:null,ordinal:0,complete:checkpoint.effectiveDays.quota.length===0});}
     const reader:V11QuotaPageReader={pageSize:200,effective:{complete:()=>cursor.complete},
       async readPage(){
         if(cursor.complete)return [];
         const page=await read(cursor.day,'quota',cursor.after??undefined);
-        const rows:V11QuotaPageRow[]=page.rows.map(row=>{
-          if(row.status!=='compatible'||row.recordJson===null||row.eventTime===null)throw fail();
-          const value=parseTelemetryV11Record('quota',JSON.parse(row.recordJson));
-          if(value.schemaVersion!=='quota-observation-v1.1')throw fail();
-          const id=++cursor.ordinal;if(!Number.isSafeInteger(id))throw fail();
-          const at=Date.parse(row.eventTime),attribution=value.accountPlanAttribution;
-          return {physicalId:id,sourceRowId:id,observedAtMs:at,active:{id,observedAtMs:at,
-            observedAt:row.eventTime,observedDay:cursor.day,deviceId:'effective-owner',provider:value.provider,
-            limitId:value.limitId,planType:value.planType,planVariant:value.planVariant,
-            accountBasis:attribution.accountBasis,accountTrackId:attribution.accountTrackId,
-            planBasis:attribution.planBasis,planEraId:attribution.planEraId,occurrenceId:value.observationId,
-            slot:value.slot,usedPercent:value.usedPercent,windowDurationMinutes:value.windowDurationMinutes,
-            resetsAt:value.resetsAt,resetsAtMs:value.resetsAt===null?null:Date.parse(value.resetsAt)}};
-        });
+        const rows:V11QuotaPageRow[]=page.rows.map(row=>mapEffectiveQuotaPageRow(row,cursor.day,++cursor.ordinal));
+        if(input.preparedQuota&&acquisition.phase==='plan'&&(cursor.after===null||preparingQuota)){
+          preparingQuota=appendEffectiveQuotaDay(preparingQuota??null,cursor.day,rows,identity.windowMinutes)??undefined;
+          if(page.next===null&&preparingQuota){
+            const prepared=finishEffectiveQuotaDay(preparingQuota);
+            if(prepared)await input.preparedQuota.store(prepared);
+            preparingQuota=undefined;
+          }
+        }
         if(page.next)cursor.after=page.next;
         else {
           const nextDay=checkpoint!.effectiveDays.quota.find(day=>day>cursor.day);
@@ -535,7 +561,8 @@ export async function advanceStorageEffectiveAnalysis(input:{
       :{status:'not_testable',reason:step.reason,tracks:[]}};
     const base={version:1 as const,source:'effective' as const,day:input.day,layout,identity,effectiveCursor:cursor,effectiveDays:checkpoint.effectiveDays};
     return {status:'deferred',checkpoint:step.status==='deferred'
-      ?{...base,phase:'acquisition',acquisition:step.checkpoint}
+      ?{...base,phase:'acquisition',acquisition:step.checkpoint,
+        ...(step.checkpoint.phase==='plan'&&preparingQuota?{preparingQuota}:{})}
       :{...base,phase:'finish',acquisition:{identity,planAnchors:step.planAnchors,quotaRows:step.quotaRows}}};
   }
   const days=checkpoint.effectiveDays.usage;
