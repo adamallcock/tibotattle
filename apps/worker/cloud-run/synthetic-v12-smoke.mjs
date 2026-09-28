@@ -57,11 +57,14 @@ const MANIFEST_PATH = "/api/v1/device/telemetry/v1.2/day-manifests";
 const GRANT_PATH = "/api/v1/device/upload-authorizations";
 const CHUNK_PATH = "/api/v1/contributions";
 const SYNC_STATE_PATH = "/api/v1/device/sync/state";
+const SYNC_MANIFEST_PATH = "/api/v1/device/sync/manifest";
 const DOMAIN_PREDECESSOR_PATH = "/api/v1/me/telemetry-v12/domain-predecessor";
 const DOMAIN_ACTIVATE_PATH = "/api/v1/me/telemetry-v12/domain-activate";
 const DEVICE_CREDENTIAL_RENEWAL_PATH = "/api/v1/device/credential/renew";
+const PUBLIC_V12_DEVICE_READ_PATHS = new Set([SYNC_MANIFEST_PATH, MANIFEST_PATH]);
 const PUBLIC_V12_DEVICE_PATHS = new Set([
   SYNC_STATE_PATH,
+  SYNC_MANIFEST_PATH,
   MANIFEST_PATH,
   GRANT_PATH,
   CHUNK_PATH,
@@ -463,6 +466,16 @@ function expectStatus(response, value, expected, stage) {
   if (response.status !== expected) fail(`${stage}_${routeCode(value)}`);
 }
 
+function expectContentFreeDeviceAuthDenial(response, value, stage) {
+  expectStatus(response, value, 401, stage);
+  if (routeCode(value) !== "DEVICE_AUTH_INVALID"
+      || !safeObject(value?.error)
+      || Object.keys(value).some((key) => key !== "error" && key !== "requestId")
+      || Object.keys(value.error).some((key) => key !== "code" && key !== "requestId")) {
+    fail(`${stage}_RESPONSE_INVALID`);
+  }
+}
+
 function safeRedirect(response, origin) {
   if (response === null || typeof response !== "object"
       || response.redirected === true
@@ -535,22 +548,27 @@ async function requestJson({
   publicV12GatewayOrigin,
   method,
   path,
+  query,
   authorization,
   body,
 }) {
-  const publicGatewayRequest = publicV12GatewayOrigin !== null
-    && publicV12GatewayOrigin !== undefined
-    && PUBLIC_V12_DEVICE_PATHS.has(path);
-  if (publicGatewayRequest
+  const fixedPublicRead = method === "GET" && PUBLIC_V12_DEVICE_READ_PATHS.has(path);
+  const configuredPublicRequest = publicV12GatewayOrigin !== null
+    && publicV12GatewayOrigin !== undefined && PUBLIC_V12_DEVICE_PATHS.has(path);
+  const publicGatewayRequest = fixedPublicRead || configuredPublicRequest;
+  if (publicGatewayRequest && publicV12GatewayOrigin !== null
+      && publicV12GatewayOrigin !== undefined
       && publicV12GatewayOrigin !== SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN) {
     fail("PUBLIC_V12_GATEWAY_ORIGIN_INVALID");
   }
-  const requestOrigin = publicGatewayRequest ? publicV12GatewayOrigin : origin;
+  const requestOrigin = publicGatewayRequest
+    ? publicV12GatewayOrigin ?? SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN
+    : origin;
   const headers = { accept: "application/json" };
   if (publicGatewayRequest) {
     // The public gateway checks Origin on POSTs; it obtains its own backend ID
     // token. This job sends only the participant's Device or Upload capability.
-    headers.origin = publicV12GatewayOrigin;
+    headers.origin = requestOrigin;
   } else {
     const token = await getIdToken(origin);
     if (typeof token !== "string" || token.length < 1 || token.length > 8192
@@ -565,10 +583,25 @@ async function requestJson({
     headers["content-type"] = "application/json; charset=utf-8";
   }
   const url = new URL(path, requestOrigin);
+  if (method === "GET" && PUBLIC_V12_DEVICE_READ_PATHS.has(path)) {
+    if (!safeObject(query)
+        || Object.keys(query).sort().join(",") !== "fromDay,toDay"
+        || typeof query.fromDay !== "string" || !DAY_PATTERN.test(query.fromDay)
+        || query.fromDay !== query.toDay) {
+      fail("SMOKE_ROUTE_INVALID");
+    }
+    url.searchParams.set("fromDay", query.fromDay);
+    url.searchParams.set("toDay", query.toDay);
+  } else if (query !== undefined) {
+    fail("SMOKE_ROUTE_INVALID");
+  }
   const allowedPaths = [MANIFEST_PATH, GRANT_PATH, CHUNK_PATH, SYNC_STATE_PATH,
-    DOMAIN_PREDECESSOR_PATH, DOMAIN_ACTIVATE_PATH, DEVICE_CREDENTIAL_RENEWAL_PATH, "/api/health"];
+    SYNC_MANIFEST_PATH, DOMAIN_PREDECESSOR_PATH, DOMAIN_ACTIVATE_PATH,
+    DEVICE_CREDENTIAL_RENEWAL_PATH, "/api/health"];
+  const getPath = ["/api/health", SYNC_STATE_PATH, SYNC_MANIFEST_PATH].includes(path)
+    || (path === MANIFEST_PATH && method === "GET");
   if (url.origin !== requestOrigin || !allowedPaths.includes(path)
-      || (["/api/health", SYNC_STATE_PATH].includes(path) ? method !== "GET" : method !== "POST")) {
+      || (getPath ? method !== "GET" : method !== "POST")) {
     fail("SMOKE_ROUTE_INVALID");
   }
   let response;
@@ -858,6 +891,23 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       fail("SMOKE_SYNC_STATE_CONTRACT_INVALID");
     }
 
+    const dayRangeQuery = Object.freeze({ fromDay: config.day, toDay: config.day });
+    const { response: syncManifestResponse, value: syncManifest } = await request({
+      method: "GET",
+      path: SYNC_MANIFEST_PATH,
+      query: dayRangeQuery,
+      authorization: fixture.deviceAuthorization,
+    });
+    expectStatus(syncManifestResponse, syncManifest, 200, "SMOKE_SYNC_MANIFEST_FAILED");
+    if (Object.keys(syncManifest).sort().join(",")
+          !== "contractVersion,days,fromDay,schemaVersion,toDay"
+        || syncManifest.schemaVersion !== "device-sync-manifest-v1.0"
+        || syncManifest.contractVersion !== "telemetry-contribution-v1.0"
+        || syncManifest.fromDay !== config.day || syncManifest.toDay !== config.day
+        || !Array.isArray(syncManifest.days) || syncManifest.days.length !== 0) {
+      fail("SMOKE_SYNC_MANIFEST_CONTRACT_INVALID");
+    }
+
     const { manifest, chunk } = makeManifestAndChunk({
       day: config.day,
       sessionId: fixture.sessionId,
@@ -881,6 +931,36 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
     if (manifestReplay.value.manifestId !== manifestId
         || manifestReplay.value.manifestDigest !== manifest.manifestDigest) {
       fail("SMOKE_MANIFEST_REPLAY_MISMATCH");
+    }
+
+    const { response: dayCandidatesResponse, value: dayCandidates } = await request({
+      method: "GET",
+      path: MANIFEST_PATH,
+      query: dayRangeQuery,
+      authorization: fixture.deviceAuthorization,
+    });
+    expectStatus(dayCandidatesResponse, dayCandidates, 200, "SMOKE_V12_DAY_CANDIDATES_FAILED");
+    if (Object.keys(dayCandidates).sort().join(",") !== "bounded,candidates"
+        || dayCandidates.bounded !== false || !Array.isArray(dayCandidates.candidates)
+        || dayCandidates.candidates.length !== 1) {
+      fail("SMOKE_V12_DAY_CANDIDATES_CONTRACT_INVALID");
+    }
+    const [candidate] = dayCandidates.candidates;
+    if (!safeObject(candidate)
+        || Object.keys(candidate).sort().join(",")
+          !== "day,expectedChunks,manifestDigest,manifestId,state"
+        || candidate.manifestId !== manifestId || candidate.day !== config.day
+        || candidate.manifestDigest !== manifest.manifestDigest
+        || candidate.state !== "staged" || candidate.expectedChunks !== 1) {
+      fail("SMOKE_V12_DAY_CANDIDATE_MISMATCH");
+    }
+
+    for (const [path, stage] of [
+      [SYNC_MANIFEST_PATH, "SMOKE_SYNC_MANIFEST_UNAUTHENTICATED_ACCEPTED"],
+      [MANIFEST_PATH, "SMOKE_V12_DAY_CANDIDATES_UNAUTHENTICATED_ACCEPTED"],
+    ]) {
+      const denied = await request({ method: "GET", path, query: dayRangeQuery });
+      expectContentFreeDeviceAuthDenial(denied.response, denied.value, stage);
     }
 
     const envelope = await deps.encryptEnvelope(chunk, config.envelopePublicJwk);
@@ -1066,6 +1146,19 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       fail("SMOKE_DEVICE_CREDENTIAL_RENEWAL_OLD_SECRET_REJECTION_INVALID");
     }
 
+    for (const [path, stage] of [
+      [SYNC_MANIFEST_PATH, "SMOKE_SYNC_MANIFEST_OLD_SECRET_ACCEPTED"],
+      [MANIFEST_PATH, "SMOKE_V12_DAY_CANDIDATES_OLD_SECRET_ACCEPTED"],
+    ]) {
+      const denied = await request({
+        method: "GET",
+        path,
+        query: dayRangeQuery,
+        authorization: fixture.deviceAuthorization,
+      });
+      expectContentFreeDeviceAuthDenial(denied.response, denied.value, stage);
+    }
+
     const storage = await deps.readback({
       config,
       fixture,
@@ -1094,6 +1187,9 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
       chunk: "staged_and_exactly_replayed",
       domain: "activated_and_exactly_replayed",
       syncState: "empty_history_admission_available",
+      syncManifest: "bounded_one_day_empty_history",
+      v12DayManifestRead: "single_staged_manifest_for_device",
+      publicReadPath: "fixed_test_gateway",
       deviceCredentialRenewal: "rotated_replayed_new_secret_authorized_old_secret_rejected",
       postgresReadback: true,
       effectiveRecordReadback: true,

@@ -198,6 +198,7 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
   let seedCount = 0;
   let getTokenCount = 0;
   let encryptedEnvelopeBytes;
+  let stagedManifest;
   const replacementSecret = Buffer.alloc(32, 0xa5).toString("base64url");
   const replacementAuthorization = `Device um_device_${DEVICE_ID}.${replacementSecret}`;
   const renewalReceipt = {
@@ -295,6 +296,27 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
             },
           });
         }
+        if (url.pathname === "/api/v1/device/sync/manifest") {
+          assert.equal(options.method, "GET");
+          assert.deepEqual([...url.searchParams.keys()], ["fromDay", "toDay"]);
+          assert.deepEqual(url.searchParams.getAll("fromDay"), [env().SYNTHETIC_V12_SMOKE_DAY]);
+          assert.deepEqual(url.searchParams.getAll("toDay"), [env().SYNTHETIC_V12_SMOKE_DAY]);
+          const renewalCalls = calls.filter((call) =>
+            call.url.pathname === "/api/v1/device/credential/renew");
+          const suppliedAuthorization = options.headers.authorization;
+          const expectedAuthorization = renewalCalls.length >= 2
+            ? replacementAuthorization : fixture.deviceAuthorization;
+          if (suppliedAuthorization !== expectedAuthorization) {
+            return respond(401, { error: { code: "DEVICE_AUTH_INVALID" } });
+          }
+          return respond(200, {
+            schemaVersion: "device-sync-manifest-v1.0",
+            contractVersion: "telemetry-contribution-v1.0",
+            fromDay: env().SYNTHETIC_V12_SMOKE_DAY,
+            toDay: env().SYNTHETIC_V12_SMOKE_DAY,
+            days: [],
+          });
+        }
         if (url.pathname === "/api/v1/device/credential/renew") {
           assert.equal(options.method, "POST");
           assert.equal(options.headers.authorization, fixture.deviceAuthorization);
@@ -339,19 +361,37 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
           });
         }
         if (url.pathname === "/api/v1/device/telemetry/v1.2/day-manifests") {
+          if (options.method === "GET") {
+            assert.deepEqual([...url.searchParams.keys()], ["fromDay", "toDay"]);
+            assert.deepEqual(url.searchParams.getAll("fromDay"), [env().SYNTHETIC_V12_SMOKE_DAY]);
+            assert.deepEqual(url.searchParams.getAll("toDay"), [env().SYNTHETIC_V12_SMOKE_DAY]);
+            const renewalCalls = calls.filter((call) =>
+              call.url.pathname === "/api/v1/device/credential/renew");
+            const suppliedAuthorization = options.headers.authorization;
+            const expectedAuthorization = renewalCalls.length >= 2
+              ? replacementAuthorization : fixture.deviceAuthorization;
+            if (suppliedAuthorization !== expectedAuthorization) {
+              return respond(401, { error: { code: "DEVICE_AUTH_INVALID" } });
+            }
+            assert.ok(stagedManifest, "the public read follows the exact manifest replay");
+            return respond(200, { bounded: false, candidates: [stagedManifest] });
+          }
+          assert.equal(options.method, "POST");
           if (failManifest) {
             return respond(503, {
               requestId: "sensitive-request-id",
               error: { code: "REQUEST_REJECTED", secret: DEVICE_SECRET },
             });
           }
-          return respond(201, {
+          const submitted = JSON.parse(options.body);
+          stagedManifest = {
             manifestId: MANIFEST_ID,
-            manifestDigest: JSON.parse(options.body).manifestDigest,
+            day: submitted.day,
+            manifestDigest: submitted.manifestDigest,
             state: "staged",
             expectedChunks: 1,
-            stagedChunks: [],
-          });
+          };
+          return respond(201, { ...stagedManifest, stagedChunks: [] });
         }
         if (url.pathname === "/api/v1/device/upload-authorizations") {
           const grantIndex = calls.filter((call) => call.url.pathname === url.pathname).length;
@@ -720,6 +760,9 @@ test("smoke journey keeps IAM and participant credentials separate and replays e
     chunk: receipt.chunk,
     domain: receipt.domain,
     syncState: receipt.syncState,
+    syncManifest: receipt.syncManifest,
+    v12DayManifestRead: receipt.v12DayManifestRead,
+    publicReadPath: receipt.publicReadPath,
     deviceCredentialRenewal: receipt.deviceCredentialRenewal,
     postgresReadback: receipt.postgresReadback,
     effectiveRecordReadback: receipt.effectiveRecordReadback,
@@ -731,6 +774,9 @@ test("smoke journey keeps IAM and participant credentials separate and replays e
     chunk: "staged_and_exactly_replayed",
     domain: "activated_and_exactly_replayed",
     syncState: "empty_history_admission_available",
+    syncManifest: "bounded_one_day_empty_history",
+    v12DayManifestRead: "single_staged_manifest_for_device",
+    publicReadPath: "fixed_test_gateway",
     deviceCredentialRenewal: "rotated_replayed_new_secret_authorized_old_secret_rejected",
     postgresReadback: true,
     effectiveRecordReadback: true,
@@ -741,7 +787,8 @@ test("smoke journey keeps IAM and participant credentials separate and replays e
   const anonymous = fake.calls[0];
   assert.equal(anonymous.options.headers.authorization, undefined);
   assert.equal(anonymous.options.headers["x-serverless-authorization"], undefined);
-  const authenticated = fake.calls.slice(1);
+  const authenticated = fake.calls.filter((call) =>
+    call.options.headers["x-serverless-authorization"] === `Bearer ${SERVERLESS_TOKEN}`);
   assert.equal(authenticated.length, 15);
   for (const call of authenticated) {
     assert.equal(call.url.origin, CLOUD_RUN_IAM_TEST_TARGET.origin);
@@ -750,6 +797,30 @@ test("smoke journey keeps IAM and participant credentials separate and replays e
     assert.equal(call.options.headers.host, undefined);
     assert.equal(call.options.headers["x-forwarded-host"], undefined);
     assert.equal(call.options.headers["x-forwarded-authorization"], undefined);
+  }
+  const publicReads = fake.calls.filter((call) =>
+    call.url.origin === SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN
+      && ["/api/v1/device/sync/manifest", "/api/v1/device/telemetry/v1.2/day-manifests"]
+        .includes(call.url.pathname));
+  assert.equal(publicReads.length, 6);
+  for (const path of [
+    "/api/v1/device/sync/manifest",
+    "/api/v1/device/telemetry/v1.2/day-manifests",
+  ]) {
+    const reads = publicReads.filter((call) =>
+      call.url.pathname === path && call.options.method === "GET");
+    assert.equal(reads.length, 3);
+    assert.ok(reads.every((call) => call.url.search
+      === `?fromDay=${env().SYNTHETIC_V12_SMOKE_DAY}&toDay=${env().SYNTHETIC_V12_SMOKE_DAY}`));
+    assert.deepEqual(reads.map((call) => call.options.headers.authorization), [
+      fake.fixture.deviceAuthorization,
+      undefined,
+      fake.fixture.deviceAuthorization,
+    ], "the fresh credential succeeds, missing auth fails, and rotated-out auth fails");
+    assert.ok(reads.every((call) => call.options.credentials === "omit"
+      && call.options.redirect === "manual"
+      && call.options.body === undefined
+      && call.options.headers["x-serverless-authorization"] === undefined));
   }
   const deviceAuthCalls = authenticated.filter((call) =>
     call.options.headers.authorization?.startsWith("Device "));
@@ -836,10 +907,11 @@ test("opt-in public v1.2 mode splits private health from cookie-free Device requ
   assert.equal(privateCalls[0].options.headers["x-serverless-authorization"], undefined);
   assert.match(privateCalls[1].options.headers["x-serverless-authorization"], /^Bearer /u);
   assert.equal(privateCalls[1].url.pathname, "/api/health");
-  assert.equal(gatewayCalls.length, 14);
+  assert.equal(gatewayCalls.length, 20);
   assert.equal(fake.getTokenCount, 1, "the backend ID token is acquired only for private health");
   const expectedPaths = new Set([
     "/api/v1/device/sync/state",
+    "/api/v1/device/sync/manifest",
     "/api/v1/device/telemetry/v1.2/day-manifests",
     "/api/v1/device/upload-authorizations",
     "/api/v1/contributions",
@@ -855,7 +927,18 @@ test("opt-in public v1.2 mode splits private health from cookie-free Device requ
     assert.equal(call.options.headers.origin, SYNTHETIC_V12_PUBLIC_GATEWAY_ORIGIN);
     assert.equal(call.options.headers.cookie, undefined);
     assert.equal(call.options.headers["x-serverless-authorization"], undefined);
-    assert.match(call.options.headers.authorization, /^(?:Device um_device_|Upload um_device_upload_)/u);
+    const publicRead = call.options.method === "GET"
+      && ["/api/v1/device/sync/manifest", "/api/v1/device/telemetry/v1.2/day-manifests"]
+        .includes(call.url.pathname);
+    if (publicRead) {
+      assert.equal(call.url.search,
+        `?fromDay=${env().SYNTHETIC_V12_SMOKE_DAY}&toDay=${env().SYNTHETIC_V12_SMOKE_DAY}`);
+      assert.ok(call.options.headers.authorization === undefined
+        || call.options.headers.authorization === fake.fixture.deviceAuthorization);
+    } else {
+      assert.match(call.options.headers.authorization,
+        /^(?:Device um_device_|Upload um_device_upload_)/u);
+    }
   }
   for (const secret of [SERVERLESS_TOKEN, DEVICE_SECRET, fake.replacementSecret,
     fake.replacementAuthorization, GRANT_TOKEN_1, PREDECESSOR_TOKEN, DOMAIN_FINGERPRINT]) {
