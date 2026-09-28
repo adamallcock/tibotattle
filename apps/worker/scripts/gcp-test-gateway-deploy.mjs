@@ -10,6 +10,7 @@
 
 import { spawnSync } from "node:child_process";
 import { isAbsolute, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import {
   GCP_PRIVATE_TEST_BUILD,
@@ -31,6 +32,10 @@ export const GCP_TEST_GATEWAY_TARGET = Object.freeze({
   logSink: "_Default",
   logExclusionName: "tibotattle_test_oauth_gateway_requests",
 });
+
+export const GCP_TEST_GATEWAY_STAGE_TAG = "codex-stage";
+const READINESS_POLL_ATTEMPTS = 30;
+const READINESS_POLL_INTERVAL_MS = 1_000;
 
 const IMAGE_REFERENCE = new RegExp(
   "^" + GCP_PRIVATE_TEST_TARGET.imageRepository.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")
@@ -121,7 +126,8 @@ function serviceReady(service) {
 function revisionReady(revision) {
   const condition = revision?.status?.conditions?.find((entry) => entry?.type === "Ready")
     ?? revision?.status?.terminalCondition;
-  return conditionReady(condition);
+  return conditionReady(condition)
+    && !(typeof condition?.reason === "string" && /retired/iu.test(condition.reason));
 }
 
 function ingress(service) {
@@ -179,6 +185,50 @@ function revisionImage(revision) {
   return revisionContainer(revision)?.image ?? null;
 }
 
+function serviceTemplateImage(service) {
+  return service?.spec?.template?.spec?.containers?.[0]?.image
+    ?? service?.spec?.template?.containers?.[0]?.image
+    ?? null;
+}
+
+function serviceTraffic(service) {
+  const status = serviceStatus(service);
+  return status?.traffic ?? status?.trafficStatuses;
+}
+
+function singleActiveTrafficRevisionName(service) {
+  const traffic = serviceTraffic(service);
+  if (!Array.isArray(traffic) || traffic.some((entry) => !isRecord(entry)
+      || (entry.percent === undefined && typeof entry.tag === "string"
+        ? false
+        : !Number.isSafeInteger(entry.percent) || entry.percent < 0 || entry.percent > 100))) {
+    return null;
+  }
+  const active = traffic.filter((entry) => (entry.percent ?? 0) > 0);
+  if (active.length !== 1 || active[0].percent !== 100) return null;
+  return revisionName(active[0].revisionName ?? active[0].revision);
+}
+
+function stageTagAssignments(service) {
+  const traffic = serviceTraffic(service);
+  if (!Array.isArray(traffic)) return [];
+  return traffic.filter((entry) => entry?.tag === GCP_TEST_GATEWAY_STAGE_TAG);
+}
+
+function stageTagRevisionName(service) {
+  const matches = stageTagAssignments(service);
+  if (matches.length !== 1) return null;
+  return revisionName(matches[0].revisionName ?? matches[0].revision);
+}
+
+function stageTagStateReady(service, expectedRevision) {
+  const matches = stageTagAssignments(service);
+  if (expectedRevision === null) return matches.length === 0;
+  return matches.length === 1
+    && revisionName(matches[0].revisionName ?? matches[0].revision) === expectedRevision
+    && (matches[0].percent === undefined || matches[0].percent === 0);
+}
+
 function trafficToRevision(service, expectedRevision, { requireReady = true } = {}) {
   const status = serviceStatus(service);
   const traffic = status?.traffic ?? status?.trafficStatuses;
@@ -187,37 +237,15 @@ function trafficToRevision(service, expectedRevision, { requireReady = true } = 
     return false;
   }
   if (traffic.some((entry) => !isRecord(entry)
-      || !Number.isSafeInteger(entry.percent) || entry.percent < 0 || entry.percent > 100)) {
+      || (entry.percent === undefined && typeof entry.tag === "string"
+        ? false
+        : !Number.isSafeInteger(entry.percent) || entry.percent < 0 || entry.percent > 100))) {
     return false;
   }
-  const active = traffic.filter((entry) => entry.percent > 0);
+  const active = traffic.filter((entry) => (entry.percent ?? 0) > 0);
   return active.length === 1
     && active[0].percent === 100
     && revisionName(active[0].revisionName ?? active[0].revision) === expectedRevision;
-}
-
-function trafficToLatestReady(service) {
-  const latestReady = latestReadyRevisionName(service);
-  const latestCreated = latestCreatedRevisionName(service);
-  if (!latestReady || latestCreated !== latestReady) return false;
-  const status = serviceStatus(service);
-  const traffic = status?.traffic ?? status?.trafficStatuses;
-  if (!Array.isArray(traffic) || !serviceReady(service) || !serviceGenerationObserved(service)) {
-    return false;
-  }
-  if (traffic.some((entry) => !isRecord(entry)
-      || !Number.isSafeInteger(entry.percent) || entry.percent < 0 || entry.percent > 100)) {
-    return false;
-  }
-  const active = traffic.filter((entry) => entry.percent > 0);
-  const activeName = active.length === 1
-    ? revisionName(active[0].revisionName ?? active[0].revision)
-    : null;
-  return active.length === 1
-    && active[0].percent === 100
-    && (activeName === null
-      ? active[0].latestRevision === true
-      : activeName === latestReady);
 }
 
 function publicGatewayIamReady(policy) {
@@ -254,8 +282,9 @@ export function assessGatewayReadback({
   revision,
   expectedImage,
   expectedTrafficRevision,
-  requireLatestReadyTraffic = true,
-  requireLatestReadyRevision = true,
+  expectedTemplateImage,
+  expectedStageTagRevision = null,
+  requireRevisionReady = true,
   requireServiceReady = true,
 } = {}) {
   const blockers = [];
@@ -265,16 +294,11 @@ export function assessGatewayReadback({
   if (service?.metadata?.name !== GCP_TEST_GATEWAY_TARGET.service) {
     blockers.push("GCP_GATEWAY_SERVICE_IDENTITY_UNQUALIFIED");
   }
-  if ((requireServiceReady && !serviceReady(service)) || !revisionReady(revision)) {
+  if ((requireServiceReady && !serviceReady(service))
+      || (requireRevisionReady && !revisionReady(revision))) {
     blockers.push("GCP_GATEWAY_REVISION_NOT_READY");
   }
-  const expectedReadyRevision = latestReadyRevisionName(service);
   const actualRevision = revisionName(revision?.metadata?.name);
-  if (requireLatestReadyRevision && (!expectedReadyRevision
-      || expectedReadyRevision !== actualRevision
-      || latestCreatedRevisionName(service) !== expectedReadyRevision)) {
-    blockers.push("GCP_GATEWAY_LATEST_READY_REVISION_MISMATCH");
-  }
   const revisionService = revision?.metadata?.labels?.["serving.knative.dev/service"];
   if (revisionService !== undefined && revisionService !== GCP_TEST_GATEWAY_TARGET.service) {
     blockers.push("GCP_GATEWAY_REVISION_SERVICE_MISMATCH");
@@ -287,6 +311,17 @@ export function assessGatewayReadback({
   }
   if (revisionServiceAccount(revision) !== GCP_TEST_GATEWAY_TARGET.runtimeServiceAccount) {
     blockers.push("GCP_GATEWAY_RUNTIME_ACCOUNT_UNQUALIFIED");
+  }
+  const expectedTemplate = expectedTemplateImage ?? revisionImage(revision);
+  if (!expectedTemplate || serviceTemplateImage(service) !== expectedTemplate) {
+    blockers.push("GCP_GATEWAY_SERVICE_TEMPLATE_IMAGE_MISMATCH");
+  }
+  const expectedTraffic = expectedTrafficRevision ?? actualRevision;
+  if (!expectedTraffic || !trafficToRevision(service, expectedTraffic)) {
+    blockers.push("GCP_GATEWAY_TRAFFIC_REVISION_UNQUALIFIED");
+  }
+  if (!stageTagStateReady(service, expectedStageTagRevision)) {
+    blockers.push("GCP_GATEWAY_STAGE_TAG_STATE_UNQUALIFIED");
   }
   const expectedEnvironment = {
     OAUTH_GATEWAY_MODE: "test-only",
@@ -305,12 +340,6 @@ export function assessGatewayReadback({
   }
   if (!requestLogExclusionReady(sink)) {
     blockers.push("GCP_GATEWAY_REQUEST_LOG_EXCLUSION_UNQUALIFIED");
-  }
-  if (requireLatestReadyTraffic && !trafficToLatestReady(service)) {
-    blockers.push("GCP_GATEWAY_LATEST_READY_TRAFFIC_UNQUALIFIED");
-  }
-  if (expectedTrafficRevision && !trafficToRevision(service, expectedTrafficRevision)) {
-    blockers.push("GCP_GATEWAY_TRAFFIC_REVISION_UNQUALIFIED");
   }
   return Object.freeze({
     ok: blockers.length === 0,
@@ -467,8 +496,9 @@ function readRevisionNamed(name, spawn) {
 }
 
 function readRevision(service, spawn) {
-  const name = latestReadyRevisionName(service);
-  if (!name) fail("GCP_GATEWAY_LATEST_READY_REVISION_MISSING");
+  const name = singleActiveTrafficRevisionName(service)
+    ?? latestReadyRevisionName(service);
+  if (!name) fail("GCP_GATEWAY_ACTIVE_TRAFFIC_REVISION_MISSING");
   return readRevisionNamed(name, spawn);
 }
 
@@ -539,46 +569,156 @@ function gatewayAssessment(state, options = {}) {
   });
 }
 
-function updateTrafficArgs(revision) {
+function updateTrafficArgs(revision, { removeStageTag = true } = {}) {
   return [
     "run", "services", "update-traffic", GCP_TEST_GATEWAY_TARGET.service,
     "--to-revisions=" + revision + "=100",
+    ...(removeStageTag ? ["--remove-tags=" + GCP_TEST_GATEWAY_STAGE_TAG] : []),
     "--project=" + GCP_TEST_GATEWAY_TARGET.project,
     "--region=" + GCP_TEST_GATEWAY_TARGET.region,
     "--quiet",
   ];
 }
 
-async function restoreCapturedRevision({ revision, image, spawn }) {
-  const blockers = [];
-  try {
-    spawnGcloud(updateTrafficArgs(revision), spawn);
-  } catch {
-    blockers.push("GCP_GATEWAY_ROLLBACK_TRAFFIC_UPDATE_FAILED");
-  }
-  try {
-    const state = await readGatewayState(spawn);
-    const rollbackState = { ...state, revision: readRevisionNamed(revision, spawn) };
-    const assessment = gatewayAssessment(rollbackState, {
-      expectedImage: image,
-      expectedTrafficRevision: revision,
-      requireLatestReadyTraffic: false,
-      requireLatestReadyRevision: false,
-      requireServiceReady: false,
-    });
-    blockers.push(...assessment.blockers);
-  } catch {
-    blockers.push("GCP_GATEWAY_ROLLBACK_READBACK_FAILED");
+function updateStageTagArgs(revision) {
+  return [
+    "run", "services", "update-traffic", GCP_TEST_GATEWAY_TARGET.service,
+    "--update-tags=" + GCP_TEST_GATEWAY_STAGE_TAG + "=" + revision,
+    "--project=" + GCP_TEST_GATEWAY_TARGET.project,
+    "--region=" + GCP_TEST_GATEWAY_TARGET.region,
+    "--quiet",
+  ];
+}
+
+function restoreTemplateArgs(image) {
+  return [
+    "run", "services", "update", GCP_TEST_GATEWAY_TARGET.service,
+    "--image=" + image,
+    "--no-traffic",
+    "--project=" + GCP_TEST_GATEWAY_TARGET.project,
+    "--region=" + GCP_TEST_GATEWAY_TARGET.region,
+    "--quiet",
+  ];
+}
+
+function stageUpdateArgs(image) {
+  return [
+    "run", "services", "update", GCP_TEST_GATEWAY_TARGET.service,
+    "--image=" + image,
+    "--no-traffic",
+    "--tag=" + GCP_TEST_GATEWAY_STAGE_TAG,
+    "--project=" + GCP_TEST_GATEWAY_TARGET.project,
+    "--region=" + GCP_TEST_GATEWAY_TARGET.region,
+    "--quiet",
+  ];
+}
+
+function stageMutationState(service, rollbackRevision, candidateRevision = null) {
+  const taggedRevision = stageTagRevisionName(service);
+  return taggedRevision !== null
+    && (candidateRevision === null || taggedRevision === candidateRevision)
+    && trafficToRevision(service, rollbackRevision);
+}
+
+async function waitForStagedRevision({
+  rollbackRevision,
+  expectedImage,
+  spawn,
+  sleepFn = sleep,
+  knownRevision = null,
+  maxAttempts = READINESS_POLL_ATTEMPTS,
+  intervalMs = READINESS_POLL_INTERVAL_MS,
+}) {
+  let candidateRevision = knownRevision;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    let service;
+    try {
+      service = readGatewayService(spawn);
+    } catch {
+      if (attempt + 1 < maxAttempts) await sleepFn(intervalMs);
+      continue;
+    }
+    const latestCreated = latestCreatedRevisionName(service);
+    const taggedRevision = stageTagRevisionName(service);
+    if (taggedRevision) {
+      if (candidateRevision && taggedRevision !== candidateRevision) {
+        return Object.freeze({
+          ok: false,
+          kind: "unrelated_revision",
+          candidateRevision,
+          observedRevision: taggedRevision,
+        });
+      }
+      candidateRevision = taggedRevision;
+    }
+    if (!candidateRevision && latestCreated && latestCreated !== rollbackRevision
+        && serviceTemplateImage(service) === expectedImage) {
+      candidateRevision = latestCreated;
+    }
+    if (candidateRevision && latestCreated && latestCreated !== candidateRevision
+        && latestCreated !== rollbackRevision) {
+      return Object.freeze({
+        ok: false,
+        kind: "unrelated_revision",
+        candidateRevision,
+        observedRevision: latestCreated,
+      });
+    }
+    if (candidateRevision && latestCreated === candidateRevision
+        && stageTagStateReady(service, candidateRevision)
+        && serviceGenerationObserved(service)) {
+      try {
+        const revision = readRevisionNamed(candidateRevision, spawn);
+        if (revisionReady(revision)) {
+          return Object.freeze({
+            ok: true,
+            kind: "ready",
+            candidateRevision,
+            service,
+            revision,
+            expectedImageMatches: revisionImage(revision) === expectedImage,
+          });
+        }
+      } catch {
+        // Cloud Run may publish the service revision before its revision readback.
+      }
+    }
+    if (attempt + 1 < maxAttempts) await sleepFn(intervalMs);
   }
   return Object.freeze({
-    attempted: true,
-    ok: blockers.length === 0,
-    revision,
-    blockers: Object.freeze([...new Set(blockers)]),
+    ok: false,
+    kind: "timeout",
+    candidateRevision,
   });
 }
 
-async function restoreAfterFailedNoTrafficUpdate({ revision, image, spawn }) {
+async function waitForRollbackReadback({ revision, image, spawn, sleepFn = sleep }) {
+  let lastBlockers = ["GCP_GATEWAY_ROLLBACK_READBACK_FAILED"];
+  for (let attempt = 0; attempt < READINESS_POLL_ATTEMPTS; attempt += 1) {
+    try {
+      const state = await readServiceAndRevision(spawn);
+      const assessment = gatewayAssessment(state, {
+        expectedImage: image,
+        expectedTemplateImage: image,
+        expectedTrafficRevision: revision,
+        expectedStageTagRevision: null,
+        requireServiceReady: false,
+      });
+      if (assessment.ok) return Object.freeze({ ok: true, blockers: Object.freeze([]) });
+      lastBlockers = assessment.blockers;
+    } catch {
+      lastBlockers = ["GCP_GATEWAY_ROLLBACK_READBACK_FAILED"];
+    }
+    if (attempt + 1 < READINESS_POLL_ATTEMPTS) await sleepFn(READINESS_POLL_INTERVAL_MS);
+  }
+  return Object.freeze({ ok: false, blockers: Object.freeze(lastBlockers) });
+}
+
+async function cleanupStageTagAfterConcurrentRevision({
+  rollbackRevision,
+  candidateRevision,
+  spawn,
+}) {
   let service;
   try {
     service = readGatewayService(spawn);
@@ -586,20 +726,157 @@ async function restoreAfterFailedNoTrafficUpdate({ revision, image, spawn }) {
     return Object.freeze({
       attempted: false,
       ok: false,
-      revision,
-      blockers: Object.freeze(["GCP_GATEWAY_MUTATION_STATE_UNAVAILABLE"]),
+      complete: false,
+      blockers: Object.freeze(["GCP_GATEWAY_CONCURRENT_STATE_UNAVAILABLE"]),
     });
   }
-  const changed = latestCreatedRevisionName(service) !== revision
-    || latestReadyRevisionName(service) !== revision
-    || !trafficToRevision(service, revision);
-  if (!changed) return Object.freeze({
+  if (!stageMutationState(service, rollbackRevision, candidateRevision)) {
+    return Object.freeze({
+      attempted: false,
+      ok: false,
+      complete: false,
+      blockers: Object.freeze(["GCP_GATEWAY_CONCURRENT_STATE_NOT_OWNED"]),
+    });
+  }
+  try {
+    spawnGcloud([
+      "run", "services", "update-traffic", GCP_TEST_GATEWAY_TARGET.service,
+      "--remove-tags=" + GCP_TEST_GATEWAY_STAGE_TAG,
+      "--project=" + GCP_TEST_GATEWAY_TARGET.project,
+      "--region=" + GCP_TEST_GATEWAY_TARGET.region,
+      "--quiet",
+    ], spawn);
+  } catch {
+    return Object.freeze({
+      attempted: true,
+      ok: false,
+      complete: false,
+      blockers: Object.freeze(["GCP_GATEWAY_CONCURRENT_STAGE_TAG_CLEANUP_FAILED"]),
+    });
+  }
+  try {
+    service = readGatewayService(spawn);
+  } catch {
+    return Object.freeze({
+      attempted: true,
+      ok: false,
+      complete: false,
+      blockers: Object.freeze(["GCP_GATEWAY_CONCURRENT_CLEANUP_READBACK_FAILED"]),
+    });
+  }
+  const cleaned = stageTagAssignments(service).length === 0
+    && trafficToRevision(service, rollbackRevision);
+  return Object.freeze({
+    attempted: true,
+    ok: false,
+    complete: false,
+    stageTagRemoved: cleaned,
+    templateRestored: false,
+    blockers: Object.freeze([cleaned
+      ? "GCP_GATEWAY_CONCURRENT_TEMPLATE_RESTORE_DEFERRED"
+      : "GCP_GATEWAY_CONCURRENT_CLEANUP_UNVERIFIED"]),
+  });
+}
+
+async function waitForTrafficRevision({
+  revision,
+  image,
+  spawn,
+  sleepFn = sleep,
+  maxAttempts = READINESS_POLL_ATTEMPTS,
+  intervalMs = READINESS_POLL_INTERVAL_MS,
+}) {
+  let lastAssessment = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      const state = await readServiceAndRevision(spawn);
+      lastAssessment = gatewayAssessment(state, {
+        expectedImage: image,
+        expectedTemplateImage: image,
+        expectedTrafficRevision: revision,
+        expectedStageTagRevision: null,
+      });
+      if (lastAssessment.ok && lastAssessment.revision === revision) {
+        return Object.freeze({ ok: true, state, assessment: lastAssessment });
+      }
+    } catch {
+      lastAssessment = null;
+    }
+    if (attempt + 1 < maxAttempts) await sleepFn(intervalMs);
+  }
+  return Object.freeze({
+    ok: false,
+    assessment: lastAssessment,
+    blockers: Object.freeze(lastAssessment?.blockers
+      ?? ["GCP_GATEWAY_POSTDEPLOY_READBACK_FAILED"]),
+  });
+}
+
+async function restoreCapturedRevision({ revision, image, spawn, sleepFn = sleep }) {
+  const blockers = [];
+  try {
+    spawnGcloud(updateTrafficArgs(revision), spawn);
+  } catch {
+    blockers.push("GCP_GATEWAY_ROLLBACK_TRAFFIC_UPDATE_FAILED");
+  }
+  let templateRestoreAttempted = false;
+  try {
+    const service = readGatewayService(spawn);
+    if (serviceTemplateImage(service) !== image) {
+      templateRestoreAttempted = true;
+      spawnGcloud(restoreTemplateArgs(image), spawn);
+    }
+  } catch {
+    blockers.push("GCP_GATEWAY_ROLLBACK_TEMPLATE_RESTORE_FAILED");
+  }
+  const readback = await waitForRollbackReadback({ revision, image, spawn, sleepFn });
+  blockers.push(...readback.blockers);
+  return Object.freeze({
+    attempted: true,
+    ok: blockers.length === 0,
+    complete: readback.ok,
+    templateRestoreAttempted,
+    templateRestored: readback.ok,
+    stageTagRemoved: readback.ok,
+    revision,
+    blockers: Object.freeze([...new Set(blockers)]),
+  });
+}
+
+async function restoreAfterFailedNoTrafficUpdate({ revision, image, spawn, sleepFn = sleep }) {
+  for (let attempt = 0; attempt < READINESS_POLL_ATTEMPTS; attempt += 1) {
+    let service;
+    try {
+      service = readGatewayService(spawn);
+    } catch {
+      if (attempt + 1 === READINESS_POLL_ATTEMPTS) {
+        return Object.freeze({
+          attempted: false,
+          ok: false,
+          complete: false,
+          revision,
+          blockers: Object.freeze(["GCP_GATEWAY_MUTATION_STATE_UNAVAILABLE"]),
+        });
+      }
+    }
+    if (service) {
+      const changed = latestCreatedRevisionName(service) !== revision
+        || serviceTemplateImage(service) !== image
+        || stageTagAssignments(service).length > 0
+        || !trafficToRevision(service, revision);
+      if (changed) return restoreCapturedRevision({ revision, image, spawn, sleepFn });
+    }
+    if (attempt + 1 < READINESS_POLL_ATTEMPTS) await sleepFn(READINESS_POLL_INTERVAL_MS);
+  }
+  return Object.freeze({
     attempted: false,
     ok: true,
+    complete: true,
+    templateRestored: true,
+    stageTagRemoved: true,
     revision,
     blockers: Object.freeze([]),
   });
-  return restoreCapturedRevision({ revision, image, spawn });
 }
 
 function deploymentProvenanceResult(config, provenance) {
@@ -615,6 +892,9 @@ export async function runGcpTestGatewayDeployment({
   config,
   spawn = spawnSync,
   archiveBuilder = createCloudRunBuildArchive,
+  sleepFn = sleep,
+  pollAttempts = READINESS_POLL_ATTEMPTS,
+  pollIntervalMs = READINESS_POLL_INTERVAL_MS,
 } = {}) {
   validateConfig(config);
   let provenance = null;
@@ -637,8 +917,11 @@ export async function runGcpTestGatewayDeployment({
       readOnlyAssessment: true,
     });
   }
-  const initialAssessment = gatewayAssessment(initial, {
+  let initialAssessment = gatewayAssessment(initial, {
     ...(config.command === "verify" ? { expectedImage: config.image } : {}),
+    ...(config.command === "deploy"
+      ? { expectedTemplateImage: serviceTemplateImage(initial.service) }
+      : {}),
   });
   if (config.command === "preflight") return Object.freeze({
     status: initialAssessment.ok ? "ready" : "blocked",
@@ -657,37 +940,104 @@ export async function runGcpTestGatewayDeployment({
     image: initialAssessment.image,
     routeSmoke: "not_run_application_device_token_required",
   });
+  const activeRevision = initialAssessment.revision;
+  const activeImage = initialAssessment.image;
+  const templateImage = serviceTemplateImage(initial.service);
+  let reusableCandidate = null;
+  if (templateImage !== activeImage && templateImage === config.image
+      && initialAssessment.ok) {
+    const latestCreated = latestCreatedRevisionName(initial.service);
+    if (latestCreated && latestCreated !== activeRevision) {
+      try {
+        const candidate = readRevisionNamed(latestCreated, spawn);
+        const assessment = gatewayAssessment({ ...initial, revision: candidate }, {
+          expectedImage: config.image,
+          expectedTemplateImage: config.image,
+          expectedTrafficRevision: activeRevision,
+          requireRevisionReady: false,
+        });
+        if (assessment.ok) reusableCandidate = latestCreated;
+      } catch {
+        reusableCandidate = null;
+      }
+    }
+    // A prior no-traffic update left this exact image as the latest-created
+    // revision. Tag and qualify it in place instead of making a duplicate.
+  }
   if (!initialAssessment.ok) return Object.freeze({
     status: "blocked",
     blockers: Object.freeze(["GCP_GATEWAY_PREDEPLOY_READBACK_UNQUALIFIED", ...initialAssessment.blockers]),
     preDeployReadOnlyAssessment: true,
   });
-  if (initialAssessment.image === config.image) return Object.freeze({
+  if (templateImage !== activeImage && !reusableCandidate) return Object.freeze({
+    status: "blocked",
+    blockers: Object.freeze([
+      "GCP_GATEWAY_PREDEPLOY_READBACK_UNQUALIFIED",
+      "GCP_GATEWAY_SERVICE_TEMPLATE_IMAGE_MISMATCH",
+    ]),
+    preDeployReadOnlyAssessment: true,
+  });
+  if (activeImage === config.image) return Object.freeze({
     status: "blocked",
     blockers: Object.freeze(["GCP_GATEWAY_IMAGE_ALREADY_SERVING_USE_VERIFY"]),
     preDeployReadOnlyAssessment: true,
   });
 
-  const rollbackRevision = initialAssessment.revision;
-  const rollbackImage = initialAssessment.image;
+  const rollbackRevision = activeRevision;
+  const rollbackImage = activeImage;
   try {
-    spawnGcloud([
-      "run", "services", "update", GCP_TEST_GATEWAY_TARGET.service,
-      "--image=" + config.image,
-      "--no-traffic",
-      "--project=" + GCP_TEST_GATEWAY_TARGET.project,
-      "--region=" + GCP_TEST_GATEWAY_TARGET.region,
-      "--quiet",
-    ], spawn);
+    if (reusableCandidate) {
+      spawnGcloud(updateStageTagArgs(reusableCandidate), spawn);
+    } else {
+      spawnGcloud(stageUpdateArgs(config.image), spawn);
+    }
   } catch {
     const rollback = await restoreAfterFailedNoTrafficUpdate({
       revision: rollbackRevision,
       image: rollbackImage,
       spawn,
+      sleepFn,
     });
     return Object.freeze({
       status: "blocked",
-      blockers: Object.freeze(["GCP_GATEWAY_NO_TRAFFIC_UPDATE_FAILED"]),
+      blockers: Object.freeze(["GCP_GATEWAY_NO_TRAFFIC_STAGE_FAILED"]),
+      rollback,
+    });
+  }
+
+  const stagedReady = await waitForStagedRevision({
+    rollbackRevision,
+    expectedImage: config.image,
+    spawn,
+    sleepFn,
+    knownRevision: reusableCandidate,
+    maxAttempts: pollAttempts,
+    intervalMs: pollIntervalMs,
+  });
+  if (!stagedReady.ok && stagedReady.kind === "unrelated_revision") {
+    const rollback = await cleanupStageTagAfterConcurrentRevision({
+      rollbackRevision,
+      candidateRevision: stagedReady.candidateRevision,
+      spawn,
+    });
+    return Object.freeze({
+      status: "blocked",
+      blockers: Object.freeze(["GCP_GATEWAY_STAGED_REVISION_CHANGED"]),
+      rollback,
+    });
+  }
+  if (!stagedReady.ok) {
+    const rollback = await restoreCapturedRevision({
+      revision: rollbackRevision,
+      image: rollbackImage,
+      spawn,
+      sleepFn,
+    });
+    return Object.freeze({
+      status: "blocked",
+      blockers: Object.freeze([stagedReady.kind === "timeout"
+        ? "GCP_GATEWAY_STAGED_REVISION_READINESS_TIMEOUT"
+        : "GCP_GATEWAY_STAGED_REVISION_READBACK_FAILED"]),
       rollback,
     });
   }
@@ -695,17 +1045,20 @@ export async function runGcpTestGatewayDeployment({
   let staged;
   let stagedAssessment;
   try {
-    staged = await readServiceAndRevision(spawn);
-    stagedAssessment = gatewayAssessment(staged, {
-      expectedImage: config.image,
-      expectedTrafficRevision: rollbackRevision,
-      requireLatestReadyTraffic: false,
-    });
-    if (stagedAssessment.revision === rollbackRevision) {
+    const state = await readGatewayState(spawn);
+    const candidate = readRevisionNamed(stagedReady.candidateRevision, spawn);
+    staged = { ...state, revision: candidate };
+    if (latestCreatedRevisionName(state.service) !== stagedReady.candidateRevision) {
       stagedAssessment = Object.freeze({
-        ...stagedAssessment,
         ok: false,
-        blockers: Object.freeze([...stagedAssessment.blockers, "GCP_GATEWAY_NEW_REVISION_NOT_READY"]),
+        blockers: Object.freeze(["GCP_GATEWAY_STAGED_REVISION_CHANGED"]),
+      });
+    } else {
+      stagedAssessment = gatewayAssessment(staged, {
+        expectedImage: config.image,
+        expectedTemplateImage: config.image,
+        expectedTrafficRevision: rollbackRevision,
+        expectedStageTagRevision: stagedReady.candidateRevision,
       });
     }
   } catch {
@@ -719,6 +1072,7 @@ export async function runGcpTestGatewayDeployment({
       revision: rollbackRevision,
       image: rollbackImage,
       spawn,
+      sleepFn,
     });
     return Object.freeze({
       status: "blocked",
@@ -728,12 +1082,13 @@ export async function runGcpTestGatewayDeployment({
   }
 
   try {
-    spawnGcloud(updateTrafficArgs(stagedAssessment.revision), spawn);
+    spawnGcloud(updateTrafficArgs(stagedReady.candidateRevision), spawn);
   } catch {
     const rollback = await restoreCapturedRevision({
       revision: rollbackRevision,
       image: rollbackImage,
       spawn,
+      sleepFn,
     });
     return Object.freeze({
       status: "blocked",
@@ -742,34 +1097,24 @@ export async function runGcpTestGatewayDeployment({
     });
   }
 
-  let deployedAssessment;
-  try {
-    const deployed = await readServiceAndRevision(spawn);
-    deployedAssessment = gatewayAssessment(deployed, {
-      expectedImage: config.image,
-    });
-    if (deployedAssessment.revision !== stagedAssessment.revision) {
-      deployedAssessment = Object.freeze({
-        ...deployedAssessment,
-        ok: false,
-        blockers: Object.freeze([...deployedAssessment.blockers, "GCP_GATEWAY_DEPLOYED_REVISION_CHANGED"]),
-      });
-    }
-  } catch {
-    deployedAssessment = Object.freeze({
-      ok: false,
-      blockers: Object.freeze(["GCP_GATEWAY_POSTDEPLOY_READBACK_FAILED"]),
-    });
-  }
-  if (!deployedAssessment.ok) {
+  const deployed = await waitForTrafficRevision({
+    revision: stagedReady.candidateRevision,
+    image: config.image,
+    spawn,
+    sleepFn,
+    maxAttempts: pollAttempts,
+    intervalMs: pollIntervalMs,
+  });
+  if (!deployed.ok) {
     const rollback = await restoreCapturedRevision({
       revision: rollbackRevision,
       image: rollbackImage,
       spawn,
+      sleepFn,
     });
     return Object.freeze({
       status: "blocked",
-      blockers: Object.freeze(["GCP_GATEWAY_POSTDEPLOY_READBACK_UNQUALIFIED", ...deployedAssessment.blockers]),
+      blockers: Object.freeze(["GCP_GATEWAY_POSTDEPLOY_READBACK_UNQUALIFIED", ...deployed.blockers]),
       rollback,
     });
   }
@@ -777,8 +1122,8 @@ export async function runGcpTestGatewayDeployment({
     status: "deployed",
     blockers: Object.freeze([]),
     sourceProvenance: deploymentProvenanceResult(config, provenance),
-    deployedRevision: deployedAssessment.revision,
-    image: deployedAssessment.image,
+    deployedRevision: deployed.assessment.revision,
+    image: deployed.assessment.image,
     rollbackRevision,
     rollbackImage,
     postDeployReadback: true,

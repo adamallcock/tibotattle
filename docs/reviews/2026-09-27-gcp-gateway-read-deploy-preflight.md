@@ -7,11 +7,12 @@ status: snapshot
 
 # GCP test gateway read deployment preflight
 
-**Status:** read-only deployment preflight for the two authenticated manifest
-GET routes in source revision `9e26e842c5fafb5d4fcce60e0217111f72e02d5c`.
-No deployment, migration, IAM change, Logging change, or live route probe was
-performed. This is a test-project snapshot, not production readiness or cutover
-approval.
+**Status:** test-project snapshot for the two authenticated manifest GET routes
+in source revision `9e26e842c5fafb5d4fcce60e0217111f72e02d5c`. The initial
+preflight was read-only. A later authorized test-only image attempt is recorded
+below; its staged qualification failed and did not complete deployment. No
+migration, IAM change, or Logging change was performed. This is not production
+readiness or cutover approval.
 
 ## Finding
 
@@ -23,11 +24,14 @@ follow-on gateway-specific guard is implemented in
 [`gcp-test-gateway-deploy.mjs`](../../apps/worker/scripts/gcp-test-gateway-deploy.mjs).
 It reuses the existing exact-archive and Cloud Build provenance assessors, then
 checks the fixed gateway service, public IAM/ingress, four reviewed environment
-values, runtime account, `_Default` request-log exclusion, and 100% latest-ready
-traffic. Its `deploy` mode requires an explicit fixed-service confirmation,
-creates a no-traffic revision, verifies it, switches to that exact revision,
-and restores the captured revision if post-update readback fails. This is local
-guard code and test evidence only; no live deployment was performed.
+values, runtime account, `_Default` request-log exclusion, the exact revision
+receiving 100% traffic, and a matching service-template image. Its `deploy` mode
+requires explicit fixed-service confirmation, tags and polls the exact
+no-traffic candidate, verifies it while the captured revision remains at 100%,
+then switches traffic and removes the temporary tag. Rollback restores both
+captured traffic and the service-template image. This guard change is local;
+the live test-only attempt below exposed the prior guard behavior and was not
+qualified as a deployment.
 
 The new gateway paths are `GET /api/v1/device/sync/manifest` and
 `GET /api/v1/device/telemetry/v1.2/day-manifests` in
@@ -60,6 +64,37 @@ Read-only Cloud Run and Logging inspection on 2026-09-27 found:
   and `run.googleapis.com/requests`. The project had only `_Default` and
   `_Required` sinks; no folder or organization ancestor was returned.
 
+## Failed test-only staging attempt
+
+An authorized test-only attempt used successful Cloud Build `92465ed3` for the
+candidate image `sha256:7913cec3…`. The guard created no-traffic revision
+`tibotattle-test-oauth-gateway-00006-vrr`, then refused its immediate readback
+with `GCP_GATEWAY_LATEST_READY_REVISION_MISMATCH`,
+`GCP_GATEWAY_IMAGE_DIGEST_UNQUALIFIED`, and
+`GCP_GATEWAY_NEW_REVISION_NOT_READY`. It restored 100% traffic to prior revision
+`tibotattle-test-oauth-gateway-00005-qj2`, but the service template continued to
+point at the candidate image. That was an incomplete rollback, not a successful
+deployment. The later read-only snapshot found 00005 still serving 100%, health
+responding 200, and the new GET route returning 404; no authenticated device
+journey was qualified.
+
+The readback failure came from using `latestReadyRevision` as the revision to
+inspect immediately after a no-traffic update. At that point Cloud Run still
+reported 00005 as latest-ready while 00006 was latest-created; the old image was
+therefore compared with the candidate digest. A later readback showed 00006 as
+`Ready=True` with reason `Retired`. Cloud Run documents `RETIRED` as
+infrastructure retired for a non-current revision and recommends a traffic tag
+for testing a no-traffic revision. The repaired guard tags and polls the exact
+latest-created revision, keeps old traffic at 100% during qualification,
+removes the temporary tag during traffic switch, and restores the service
+template image on rollback. It may reuse a retained latest-created candidate
+only after exact image/config and source-build checks; ordinary preflight blocks
+the candidate-template/old-traffic mismatch.
+
+Cloud Run documents the retired revision state in [Manage revisions](https://docs.cloud.google.com/run/docs/managing/revisions)
+and tagged no-traffic staging and cleanup in [traffic migration](https://docs.cloud.google.com/run/docs/rollouts-rollbacks-traffic-migration)
+and the [`update-traffic` reference](https://docs.cloud.google.com/sdk/gcloud/reference/run/services/update-traffic).
+
 The current configured public origin is
 `https://tibotattle-test-oauth-gateway-806510610397.us-east1.run.app`. It
 matches the source constant
@@ -91,10 +126,11 @@ After the final integrated source revision and its owning tests pass:
    origin, fixed backend origin and matching audience, runtime account, public
    ingress/invoker policy, and enabled request-log exclusion. Stop if any
    setting differs; do not repair IAM or Logging in this deployment step.
-3. Use a gateway-specific guard with the verified immutable image. Create a
-   no-traffic revision first, verify its image and preserved gateway settings,
-   then move 100% traffic to the exact ready revision only after that readback
-   succeeds. This pre-traffic check does not exercise an authenticated route.
+3. Use a gateway-specific guard with the verified immutable image. It tags the
+   no-traffic revision, polls its exact ready revision and verifies image and
+   preserved settings while old traffic remains at 100%, then switches traffic
+   to that revision and removes the temporary tag. This check does not exercise
+   an authenticated route.
    Cloud Run supports image-only service updates with `--no-traffic` and exact
    revision traffic assignment ([service update](https://docs.cloud.google.com/sdk/gcloud/reference/run/services/update),
    [traffic update](https://docs.cloud.google.com/sdk/gcloud/reference/run/services/update-traffic)).
@@ -104,19 +140,22 @@ After the final integrated source revision and its owning tests pass:
    shows a backend change is required; the reviewed route change is in the
    gateway allowlist, while the backend manifest readers predate it.
 5. If post-update checks fail, assign 100% traffic to the captured rollback
-   revision with
-   `gcloud run services update-traffic tibotattle-test-oauth-gateway --to-revisions=<captured-revision>=100 --project=tibotattle --region=us-east1 --quiet`,
-   then verify that exact revision and its prior image receive 100% traffic.
+   revision, remove the temporary tag, and restore the prior service-template
+   image with a no-traffic update. Then verify that exact revision and matching
+   prior image receive 100% traffic, the template matches, and the tag is absent.
+   The traffic rollback command is
+   `gcloud run services update-traffic tibotattle-test-oauth-gateway --to-revisions=<captured-revision>=100 --remove-tags=codex-stage --project=tibotattle --region=us-east1 --quiet`.
    Preserve the new revision and failure receipt for diagnosis; do not make a
    compensating IAM, Logging, or backend change.
 
 No live canary request against a tagged revision is qualified: its generated
 tag hostname differs from the configured public origin that the gateway checks.
-The current source suite covers static route and authorization behavior. A
-live authenticated GET also requires an approved synthetic device authorization;
-this preflight had no such token and did not attempt a request. The deployment
-guard should report route smoke as not run, leaving that separate test-owner
-credential gate explicit.
+The old serving revision returned 200 for health and 404 for the new GET route,
+as expected before the candidate was deployed. This does not validate the
+candidate's routes. The current source suite covers static route and
+authorization behavior. A live authenticated GET also requires an approved
+synthetic device authorization; no such journey was run. The guard reports route
+smoke as not run, leaving that separate test-owner credential gate explicit.
 
 The local guard interface is `npm --prefix apps/worker run gcp:test-gateway --`
 followed by `preflight`, `verify`, or `deploy`. `preflight` is read-only.
@@ -128,8 +167,9 @@ no-live-call contract tests run with
 
 ## Evidence boundary
 
-The source build receipt from 2026-09-25 qualifies the prior image only; it does
-not qualify this candidate or its deployment. The 2026-09-25 gateway receipt
-records the same revision and image but is historical, not current runtime
-evidence. The observations above are the only live evidence in this review.
-Production Cloudflare was not inspected or changed.
+The source build receipt from 2026-09-25 qualifies the prior image only. Cloud
+Build `92465ed3` qualifies the candidate's source/build/image provenance, but
+the staged qualification failed and does not qualify deployment. The
+2026-09-25 gateway receipt is historical, not current runtime evidence. The
+later read-only observation above is the only live state evidence recorded in
+this review. Production Cloudflare was not inspected or changed.

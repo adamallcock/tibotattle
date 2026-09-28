@@ -9,6 +9,7 @@ import {
   GCP_PRIVATE_TEST_TARGET,
 } from "./gcp-private-test-deploy.mjs";
 import {
+  GCP_TEST_GATEWAY_STAGE_TAG,
   GCP_TEST_GATEWAY_TARGET,
   assessGatewayReadback,
   parseArgs,
@@ -66,6 +67,7 @@ function revisionFixture({
   envOverrides = {},
   additionalEnvironment = [],
   ready = "True",
+  readyReason,
 } = {}) {
   const environment = {
     OAUTH_GATEWAY_MODE: "test-only",
@@ -89,7 +91,7 @@ function revisionFixture({
         ],
       }],
     },
-    status: { conditions: [{ type: "Ready", status: ready }] },
+    status: { conditions: [{ type: "Ready", status: ready, ...(readyReason ? { reason: readyReason } : {}) }] },
   };
 }
 
@@ -97,6 +99,7 @@ function serviceFixture({
   readyRevision = oldRevision,
   createdRevision = oldRevision,
   traffic = [{ revisionName: oldRevision, percent: 100, latestRevision: true }],
+  templateImage = previousImage,
   ingressValue = "all",
   generation = 47,
   observedGeneration = 47,
@@ -115,7 +118,7 @@ function serviceFixture({
       template: {
         spec: {
           serviceAccountName: GCP_TEST_GATEWAY_TARGET.runtimeServiceAccount,
-          containers: [{ image: previousImage }],
+          containers: [{ image: templateImage }],
         },
       },
     },
@@ -193,21 +196,35 @@ function makeDeploymentHarness({
   failAfterTrafficSwitch = false,
   failNoTrafficUpdateBeforeMutation = false,
   failNoTrafficUpdateAfterMutation = false,
+  candidateReadyAfterReads = 2,
+  unrelatedRevisionAtPoll = null,
+  initialService,
+  initialCandidate,
 } = {}) {
   const calls = [];
   const revisions = new Map([[oldRevision, revisionFixture()]]);
+  if (initialCandidate) revisions.set(newRevision, initialCandidate);
   const state = {
-    service: serviceFixture(),
+    service: initialService ?? serviceFixture(),
     policy: policyFixture(),
     sink: sinkFixture(),
     failAfterTrafficSwitch,
   };
+  let candidateReads = 0;
+  let serviceReadsAfterStage = 0;
   const spawn = (command, args) => {
     calls.push({ command, args });
     if (args[0] === "builds" && args[1] === "describe") {
       return { status: 0, stdout: JSON.stringify(buildFixture()), stderr: "" };
     }
     if (args[0] === "run" && args[1] === "services" && args[2] === "describe") {
+      if (state.service.status.latestCreatedRevisionName === newRevision
+          && state.service.status.traffic.some((entry) => entry.tag === GCP_TEST_GATEWAY_STAGE_TAG)) {
+        serviceReadsAfterStage += 1;
+        if (unrelatedRevisionAtPoll === serviceReadsAfterStage) {
+          state.service.status.latestCreatedRevisionName = "tibotattle-test-oauth-gateway-00007-abc";
+        }
+      }
       return { status: 0, stdout: JSON.stringify(state.service), stderr: "" };
     }
     if (args[0] === "run" && args[1] === "services" && args[2] === "get-iam-policy") {
@@ -217,42 +234,87 @@ function makeDeploymentHarness({
       return { status: 0, stdout: JSON.stringify(state.sink), stderr: "" };
     }
     if (args[0] === "run" && args[1] === "revisions" && args[2] === "describe") {
-      const revision = revisions.get(args[3]);
+      let revision = revisions.get(args[3]);
+      if (args[3] === newRevision && !initialCandidate) {
+        candidateReads += 1;
+        if (candidateReadyAfterReads === null || candidateReads < candidateReadyAfterReads) {
+          revision = revisionFixture({ name: newRevision, imageValue: image, ready: "False" });
+        } else {
+          revision = revisionFixture({ name: newRevision, imageValue: image });
+        }
+      }
       return { status: revision ? 0 : 1, stdout: JSON.stringify(revision ?? {}), stderr: "" };
     }
     if (args[0] === "run" && args[1] === "services" && args[2] === "update") {
       assert.equal(args[3], GCP_TEST_GATEWAY_TARGET.service);
-      assert.equal(args.includes("--no-traffic"), true);
       const imageArgument = args.find((value) => value.startsWith("--image="));
+      assert.equal(args.includes("--no-traffic"), true);
+      if (imageArgument === "--image=" + previousImage) {
+        state.service.spec.template.spec.containers[0].image = previousImage;
+        state.service.metadata.generation += 1;
+        state.service.status.observedGeneration = state.service.metadata.generation;
+        state.service.status.latestCreatedRevisionName = "tibotattle-test-oauth-gateway-00007-rst";
+        state.service.status.latestReadyRevisionName = oldRevision;
+        revisions.set("tibotattle-test-oauth-gateway-00007-rst", revisionFixture({
+          name: "tibotattle-test-oauth-gateway-00007-rst",
+          imageValue: previousImage,
+        }));
+        return { status: 0, stdout: "", stderr: "" };
+      }
       assert.equal(imageArgument, "--image=" + image);
       if (failNoTrafficUpdateBeforeMutation) return { status: 1, stdout: "", stderr: "" };
       state.service = serviceFixture({
-        readyRevision: newRevision,
+        readyRevision: oldRevision,
         createdRevision: newRevision,
         traffic: [
           { revisionName: oldRevision, percent: 100 },
-          { revisionName: newRevision, percent: 0, latestRevision: true },
+          { revisionName: newRevision, tag: GCP_TEST_GATEWAY_STAGE_TAG },
         ],
+        templateImage: image,
         generation: 48,
         observedGeneration: 48,
       });
-      state.service.spec.template.spec.containers[0].image = image;
-      revisions.set(newRevision, revisionFixture({ name: newRevision, imageValue: image }));
+      revisions.set(newRevision, revisionFixture({
+        name: newRevision,
+        imageValue: image,
+        ready: "False",
+      }));
       return { status: failNoTrafficUpdateAfterMutation ? 1 : 0, stdout: "", stderr: "" };
     }
     if (args[0] === "run" && args[1] === "services" && args[2] === "update-traffic") {
+      const updateTag = args.find((value) => value.startsWith("--update-tags="));
+      if (updateTag) {
+        const assignment = updateTag.slice("--update-tags=".length);
+        const [tag, revision] = assignment.split("=");
+        const existing = state.service.status.traffic.filter((entry) => entry.tag !== tag);
+        state.service.status.traffic = [...existing, { revisionName: revision, percent: 0, tag }];
+        state.service.metadata.generation += 1;
+        state.service.status.observedGeneration = state.service.metadata.generation;
+        const candidate = revisions.get(revision);
+        if (candidate?.status?.conditions?.[0]?.reason === "Retired") {
+          candidate.status.conditions[0] = { type: "Ready", status: "True" };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      const removeTags = args.find((value) => value.startsWith("--remove-tags="));
+      if (removeTags) {
+        const removedTag = removeTags.slice("--remove-tags=".length);
+        state.service.status.traffic = state.service.status.traffic
+          .filter((entry) => entry.tag !== removedTag);
+      }
       const target = args.find((value) => value.startsWith("--to-revisions="))
         ?.slice("--to-revisions=".length);
-      const [name, percent] = target?.split("=") ?? [];
-      assert.equal(percent, "100");
-      state.service.status.traffic = [{
-        revisionName: name,
-        percent: 100,
-        latestRevision: name === latestReadyRevisionName(state.service),
-      }];
-      if (name === newRevision && state.failAfterTrafficSwitch) {
+      const targetRevision = target?.split("=")[0];
+      if (target) {
+        const [name, percent] = target.split("=");
+        assert.equal(percent, "100");
+        state.service.status.traffic = state.service.status.traffic
+          .filter((entry) => entry.tag)
+          .concat([{ revisionName: name, percent: 100 }]);
+      }
+      if (targetRevision === newRevision && state.failAfterTrafficSwitch) {
         state.policy = { bindings: [{ role: "roles/run.invoker", members: ["user:tampered"] }] };
-      } else if (name === oldRevision) {
+      } else if (target?.startsWith(oldRevision + "=")) {
         state.policy = policyFixture();
       }
       return { status: 0, stdout: "", stderr: "" };
@@ -262,6 +324,15 @@ function makeDeploymentHarness({
   const latestReadyRevisionName = (service) =>
     service.status.latestReadyRevisionName;
   return { calls, revisions, state, spawn };
+}
+
+function runDeployment(options) {
+  return runGcpTestGatewayDeployment({
+    sleepFn: async () => {},
+    pollAttempts: 4,
+    pollIntervalMs: 0,
+    ...options,
+  });
 }
 
 test("target, image, provenance, and explicit deployment confirmation are fixed", () => {
@@ -308,7 +379,7 @@ test("target, image, provenance, and explicit deployment confirmation are fixed"
   });
 });
 
-test("gateway readback qualifies the intended public test configuration and exact latest-ready traffic", () => {
+test("gateway readback qualifies the active 100% revision and matching service template", () => {
   const service = serviceFixture();
   const revision = revisionFixture();
   const assessment = assessGatewayReadback({
@@ -324,6 +395,48 @@ test("gateway readback qualifies the intended public test configuration and exac
     revision: oldRevision,
     image: previousImage,
   });
+});
+
+test("stage-tag readback accepts omitted zero allocation and rejects positive allocation", () => {
+  const base = {
+    policy: policyFixture(),
+    sink: sinkFixture(),
+    revision: revisionFixture({ name: newRevision, imageValue: image }),
+    expectedImage: image,
+    expectedTemplateImage: image,
+    expectedTrafficRevision: oldRevision,
+    expectedStageTagRevision: newRevision,
+  };
+  const omittedPercent = assessGatewayReadback({
+    ...base,
+    service: serviceFixture({
+      createdRevision: newRevision,
+      traffic: [
+        { revisionName: oldRevision, percent: 100 },
+        { revisionName: newRevision, tag: GCP_TEST_GATEWAY_STAGE_TAG },
+      ],
+      templateImage: image,
+      generation: 48,
+      observedGeneration: 48,
+    }),
+  });
+  assert.equal(omittedPercent.ok, true, JSON.stringify(omittedPercent));
+  const positivePercent = assessGatewayReadback({
+    ...base,
+    service: serviceFixture({
+      createdRevision: newRevision,
+      traffic: [
+        { revisionName: oldRevision, percent: 90 },
+        { revisionName: newRevision, percent: 10, tag: GCP_TEST_GATEWAY_STAGE_TAG },
+      ],
+      templateImage: image,
+      generation: 48,
+      observedGeneration: 48,
+    }),
+  });
+  assert.equal(positivePercent.ok, false);
+  assert.ok(positivePercent.blockers.includes("GCP_GATEWAY_TRAFFIC_REVISION_UNQUALIFIED"));
+  assert.ok(positivePercent.blockers.includes("GCP_GATEWAY_STAGE_TAG_STATE_UNQUALIFIED"));
 });
 
 test("gateway readback fails closed on changed IAM, ingress, origins, runtime account, image, or log exclusion", () => {
@@ -381,11 +494,10 @@ test("gateway readback fails closed on changed IAM, ingress, origins, runtime ac
     ["split traffic", { service: serviceFixture({ traffic: [
       { revisionName: oldRevision, percent: 90 },
       { revisionName: "other-revision", percent: 10 },
-    ] }) }, "GCP_GATEWAY_LATEST_READY_TRAFFIC_UNQUALIFIED"],
-    ["stale ready revision", { service: serviceFixture({
-      readyRevision: newRevision,
-      createdRevision: newRevision,
-    }) }, "GCP_GATEWAY_LATEST_READY_REVISION_MISMATCH"],
+    ] }) }, "GCP_GATEWAY_TRAFFIC_REVISION_UNQUALIFIED"],
+    ["service template differs from serving revision", { service: serviceFixture({
+      templateImage: image,
+    }) }, "GCP_GATEWAY_SERVICE_TEMPLATE_IMAGE_MISMATCH"],
   ];
   for (const [label, overrides, expectedBlocker] of cases) {
     const assessment = assessGatewayReadback({ ...base, ...overrides });
@@ -395,9 +507,9 @@ test("gateway readback fails closed on changed IAM, ingress, origins, runtime ac
   }
 });
 
-test("deploy verifies source provenance, creates no-traffic revision, then switches exact 100% traffic", async () => {
+test("deploy polls the exact tagged candidate while preserving old traffic, then switches and removes the tag", async () => {
   const harness = makeDeploymentHarness();
-  const result = await runGcpTestGatewayDeployment({
+  const result = await runDeployment({
     config: provenanceConfig(),
     spawn: harness.spawn,
     archiveBuilder: async () => ({
@@ -424,18 +536,24 @@ test("deploy verifies source provenance, creates no-traffic revision, then switc
     "run", "services", "update", GCP_TEST_GATEWAY_TARGET.service,
     "--image=" + image,
     "--no-traffic",
+    "--tag=" + GCP_TEST_GATEWAY_STAGE_TAG,
     "--project=" + GCP_TEST_GATEWAY_TARGET.project,
     "--region=" + GCP_TEST_GATEWAY_TARGET.region,
     "--quiet",
   ]);
   assert.equal(updateArgs.some((value) => /(?:env-vars|service-account|ingress|allow-unauthenticated)/u.test(value)), false);
   assert.equal(harness.calls[trafficIndex].args.includes("--to-revisions=" + newRevision + "=100"), true);
+  assert.equal(harness.calls[trafficIndex].args.includes("--remove-tags=" + GCP_TEST_GATEWAY_STAGE_TAG), true);
+  assert.ok(harness.calls.filter(({ args }) => args[0] === "run" && args[1] === "revisions"
+    && args[2] === "describe" && args[3] === newRevision).length >= 2);
+  assert.equal(harness.state.service.spec.template.spec.containers[0].image, image);
+  assert.deepEqual(harness.state.service.status.traffic, [{ revisionName: newRevision, percent: 100 }]);
   assert.equal(harness.calls.some(({ args }) => args[0] === "run" && args[1] === "deploy"), false);
 });
 
 test("failed post-switch IAM readback restores the exact captured revision to 100%", async () => {
   const harness = makeDeploymentHarness({ failAfterTrafficSwitch: true });
-  const result = await runGcpTestGatewayDeployment({
+  const result = await runDeployment({
     config: provenanceConfig(),
     spawn: harness.spawn,
     archiveBuilder: async () => ({
@@ -447,7 +565,10 @@ test("failed post-switch IAM readback restores the exact captured revision to 10
   assert.equal(result.status, "blocked");
   assert.ok(result.blockers.includes("GCP_GATEWAY_POSTDEPLOY_READBACK_UNQUALIFIED"));
   assert.equal(result.rollback.ok, true, JSON.stringify(result.rollback));
+  assert.equal(result.rollback.templateRestored, true);
+  assert.equal(result.rollback.stageTagRemoved, true);
   assert.equal(result.rollback.revision, oldRevision);
+  assert.equal(harness.state.service.spec.template.spec.containers[0].image, previousImage);
   const trafficCalls = harness.calls.filter(({ args }) =>
     args[0] === "run" && args[1] === "services" && args[2] === "update-traffic",
   );
@@ -461,7 +582,7 @@ test("failed post-switch IAM readback restores the exact captured revision to 10
 
 test("failed no-traffic command without a revision mutation does not issue rollback", async () => {
   const harness = makeDeploymentHarness({ failNoTrafficUpdateBeforeMutation: true });
-  const result = await runGcpTestGatewayDeployment({
+  const result = await runDeployment({
     config: provenanceConfig(),
     spawn: harness.spawn,
     archiveBuilder: async () => ({
@@ -479,7 +600,7 @@ test("failed no-traffic command without a revision mutation does not issue rollb
 
 test("failed no-traffic command after revision creation restores the captured traffic", async () => {
   const harness = makeDeploymentHarness({ failNoTrafficUpdateAfterMutation: true });
-  const result = await runGcpTestGatewayDeployment({
+  const result = await runDeployment({
     config: provenanceConfig(),
     spawn: harness.spawn,
     archiveBuilder: async () => ({
@@ -491,6 +612,8 @@ test("failed no-traffic command after revision creation restores the captured tr
   assert.equal(result.status, "blocked");
   assert.equal(result.rollback.attempted, true);
   assert.equal(result.rollback.ok, true, JSON.stringify(result.rollback));
+  assert.equal(result.rollback.templateRestored, true);
+  assert.equal(harness.state.service.spec.template.spec.containers[0].image, previousImage);
   const trafficCalls = harness.calls.filter(({ args }) =>
     args[0] === "run" && args[1] === "services" && args[2] === "update-traffic",
   );
@@ -502,7 +625,7 @@ test("failed no-traffic command after revision creation restores the captured tr
 test("unqualified predeploy IAM refuses before creating a revision", async () => {
   const harness = makeDeploymentHarness();
   harness.state.policy = { bindings: [] };
-  const result = await runGcpTestGatewayDeployment({
+  const result = await runDeployment({
     config: provenanceConfig(),
     spawn: harness.spawn,
     archiveBuilder: async () => ({
@@ -519,7 +642,7 @@ test("unqualified predeploy IAM refuses before creating a revision", async () =>
 
 test("Cloud Build image mismatch blocks before live service reads or mutation", async () => {
   const calls = [];
-  const result = await runGcpTestGatewayDeployment({
+  const result = await runDeployment({
     config: provenanceConfig(),
     spawn: (command, args) => {
       calls.push({ command, args });
@@ -540,4 +663,145 @@ test("Cloud Build image mismatch blocks before live service reads or mutation", 
   assert.ok(result.blockers.includes("GCP_BUILD_IMAGE_DIGEST_MISMATCH"));
   assert.equal(calls.some(({ args }) => args[0] === "run"), false);
   assert.equal(calls.some(({ args }) => args[0] === "builds"), true);
+});
+
+test("preflight blocks a retired latest-created candidate when old revision still serves 100%", async () => {
+  const harness = makeDeploymentHarness({
+    initialService: serviceFixture({
+      readyRevision: oldRevision,
+      createdRevision: newRevision,
+      traffic: [{ revisionName: oldRevision, percent: 100 }],
+      templateImage: image,
+      generation: 48,
+      observedGeneration: 48,
+    }),
+    initialCandidate: revisionFixture({
+      name: newRevision,
+      imageValue: image,
+      ready: "True",
+      readyReason: "Retired",
+    }),
+  });
+  const result = await runDeployment({
+    config: parseArgs(["preflight"]),
+    spawn: harness.spawn,
+  });
+  assert.equal(result.status, "blocked");
+  assert.equal(result.currentRevision, oldRevision);
+  assert.ok(result.blockers.includes("GCP_GATEWAY_SERVICE_TEMPLATE_IMAGE_MISMATCH"));
+  assert.equal(harness.calls.some(({ args }) => args[0] === "run"
+    && args[1] === "services" && args[2] !== "describe" && args[2] !== "get-iam-policy"), false);
+});
+
+test("preflight accepts an unserved retired latest-created revision when template matches serving image", async () => {
+  const harness = makeDeploymentHarness({
+    initialService: serviceFixture({
+      readyRevision: oldRevision,
+      createdRevision: newRevision,
+      traffic: [{ revisionName: oldRevision, percent: 100 }],
+      templateImage: previousImage,
+      generation: 48,
+      observedGeneration: 48,
+    }),
+    initialCandidate: revisionFixture({
+      name: newRevision,
+      imageValue: previousImage,
+      ready: "True",
+      readyReason: "Retired",
+    }),
+  });
+  const result = await runDeployment({
+    config: parseArgs(["preflight"]),
+    spawn: harness.spawn,
+  });
+  assert.equal(result.status, "ready", JSON.stringify(result));
+  assert.equal(result.currentRevision, oldRevision);
+  assert.equal(result.currentImage, previousImage);
+});
+
+test("deploy reuses and tags an exact retained candidate without stamping a duplicate revision", async () => {
+  const harness = makeDeploymentHarness({
+    initialService: serviceFixture({
+      readyRevision: oldRevision,
+      createdRevision: newRevision,
+      traffic: [{ revisionName: oldRevision, percent: 100 }],
+      templateImage: image,
+      generation: 48,
+      observedGeneration: 48,
+    }),
+    initialCandidate: revisionFixture({
+      name: newRevision,
+      imageValue: image,
+      ready: "True",
+      readyReason: "Retired",
+    }),
+  });
+  const result = await runDeployment({
+    config: provenanceConfig(),
+    spawn: harness.spawn,
+    archiveBuilder: async () => ({
+      sourceContentDigest: sourceDigest,
+      sourceArchiveSha256: archiveSha256,
+      cloudBuildConfigSha256: GCP_PRIVATE_TEST_BUILD.cloudBuildConfigSha256,
+    }),
+  });
+  assert.equal(result.status, "deployed", JSON.stringify(result));
+  assert.equal(result.deployedRevision, newRevision);
+  assert.equal(harness.calls.some(({ args }) => args[0] === "run"
+    && args[1] === "services" && args[2] === "update"), false);
+  const tagIndex = harness.calls.findIndex(({ args }) => args.some((value) =>
+    value === "--update-tags=" + GCP_TEST_GATEWAY_STAGE_TAG + "=" + newRevision,
+  ));
+  const switchIndex = harness.calls.findIndex(({ args }) => args.some((value) =>
+    value === "--to-revisions=" + newRevision + "=100",
+  ));
+  assert.ok(tagIndex >= 0 && switchIndex > tagIndex);
+  assert.deepEqual(harness.state.service.status.traffic, [{ revisionName: newRevision, percent: 100 }]);
+});
+
+test("candidate readiness timeout restores prior traffic, template image, and removes the tag", async () => {
+  const harness = makeDeploymentHarness({ candidateReadyAfterReads: null });
+  const result = await runDeployment({
+    config: provenanceConfig(),
+    spawn: harness.spawn,
+    pollAttempts: 3,
+    archiveBuilder: async () => ({
+      sourceContentDigest: sourceDigest,
+      sourceArchiveSha256: archiveSha256,
+      cloudBuildConfigSha256: GCP_PRIVATE_TEST_BUILD.cloudBuildConfigSha256,
+    }),
+  });
+  assert.equal(result.status, "blocked");
+  assert.ok(result.blockers.includes("GCP_GATEWAY_STAGED_REVISION_READINESS_TIMEOUT"));
+  assert.equal(result.rollback.ok, true, JSON.stringify(result.rollback));
+  assert.equal(result.rollback.templateRestored, true);
+  assert.equal(result.rollback.stageTagRemoved, true);
+  assert.equal(harness.state.service.spec.template.spec.containers[0].image, previousImage);
+  assert.deepEqual(harness.state.service.status.traffic, [{ revisionName: oldRevision, percent: 100 }]);
+});
+
+test("unrelated latest-created revision stops switching and only cleans the owned tag", async () => {
+  const harness = makeDeploymentHarness({ unrelatedRevisionAtPoll: 1 });
+  const result = await runDeployment({
+    config: provenanceConfig(),
+    spawn: harness.spawn,
+    archiveBuilder: async () => ({
+      sourceContentDigest: sourceDigest,
+      sourceArchiveSha256: archiveSha256,
+      cloudBuildConfigSha256: GCP_PRIVATE_TEST_BUILD.cloudBuildConfigSha256,
+    }),
+  });
+  assert.equal(result.status, "blocked");
+  assert.ok(result.blockers.includes("GCP_GATEWAY_STAGED_REVISION_CHANGED"));
+  assert.equal(result.rollback.complete, false);
+  assert.equal(result.rollback.templateRestored, false);
+  assert.equal(result.rollback.stageTagRemoved, true);
+  assert.deepEqual(harness.state.service.status.traffic, [{ revisionName: oldRevision, percent: 100 }]);
+  assert.equal(harness.state.service.spec.template.spec.containers[0].image, image);
+  assert.equal(harness.calls.some(({ args }) => args.some((value) =>
+    value === "--to-revisions=" + newRevision + "=100",
+  )), false);
+  assert.equal(harness.calls.some(({ args }) => args[0] === "run"
+    && args[1] === "services" && args[2] === "update"
+    && args.includes("--image=" + previousImage)), false);
 });
