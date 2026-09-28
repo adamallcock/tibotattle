@@ -1,6 +1,9 @@
 packages:
   - packages/*
 
+overrides:
+  fast-uri: 3.1.7
+
 allowBuilds:
   '@github/keytar': false
   electron-winstaller: false
