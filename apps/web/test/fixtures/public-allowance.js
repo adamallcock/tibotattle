@@ -32,6 +32,7 @@ export function publicAllowanceFixture(nowMs = Date.now()) {
         models: i < 25 ? [] : [
           ["gpt-5.5", 1200 + i * 6, 1], ["gpt-5.6-sol", 2200 + Math.cos(i) * 100, 3],
           ...(i > 30 ? [["gpt-6-astra", 1600 + i * 8, 1]] : []),
+          ...(i > 32 ? [["gpt-6-sol", 900 + i * 5, 2], ["gpt-6-luna", 130 + i, 1]] : []),
         ],
       })),
     },
