@@ -2185,7 +2185,7 @@ test("the allowance chart model maps estimates honestly and slices ranges", () =
   assert.ok(radiusByDay.get("2026-08-05") > radiusByDay.get("2026-04-01"));
   // The dollar axis covers the largest published claim (the band top).
   assert.ok(all.dollarTicks[all.dollarTicks.length - 1].value >= 2300);
-  assert.equal(all.dollarTicks[0].value, 0);
+  assert.ok(all.dollarTicks[0].value > 0, "allowance history uses a data-derived positive floor");
   // The latest point carries the honest counts the headline renders.
   assert.equal(all.latest.day, "2026-08-05");
   assert.equal(all.latest.fitCount, 12);

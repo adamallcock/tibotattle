@@ -3949,10 +3949,16 @@ footer p { margin: 0; }
   margin-top: 8px;
 }
 .community-site .allowance-summary-cards {
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
-@media (max-width: 460px) {
-  .allowance-summary-cards,
+@media (max-width: 600px) {
+  .community-site .allowance-summary-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .allowance-summary-card { padding: 8px 7px; }
+  .allowance-summary-value { font-size: 1.25rem; }
+  .allowance-summary-card h3 { font-size: .72rem; overflow-wrap: anywhere; }
+  .allowance-summary-card p { font-size: .68rem; overflow-wrap: anywhere; }
+}
+@media (max-width: 340px) {
   .community-site .allowance-summary-cards { grid-template-columns: minmax(0, 1fr); }
 }
 .allowance-summary-card {

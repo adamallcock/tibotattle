@@ -188,6 +188,24 @@ function valueAxis(maximum, plotTop, plotBottom, minimum = 0) {
   return { axisTop, axisBase, y, ticks };
 }
 
+// Allowance estimates occupy a narrow positive range. Derive a rounded floor
+// from the visible estimates and uncertainty bands instead of spending most of
+// the chart on empty space below them. Activity counts keep their zero axes.
+function allowanceValueAxis(minimum, maximum, plotTop, plotBottom) {
+  const spread = Math.max(maximum - minimum, maximum * 0.1, 1);
+  const padding = spread * 0.12;
+  const step = chartTickStep(spread + padding * 2);
+  const roundedBase = Math.floor(Math.max(minimum - padding, minimum * 0.5) / step) * step;
+  const axisBase = roundedBase > 0 ? roundedBase : chartTickStep(minimum * 0.5, 1);
+  const axisTop = axisBase + Math.ceil((maximum + padding - axisBase) / step) * step;
+  const y = value => plotBottom - (value - axisBase) / (axisTop - axisBase) * (plotBottom - plotTop);
+  const ticks = [];
+  for (let value = axisBase; value <= axisTop + step / 100; value += step) {
+    ticks.push({ value, y: y(value) });
+  }
+  return { axisBase, axisTop, y, ticks };
+}
+
 /**
  * Pure geometry for the public daily-series chart: usage events as bars on
  * the left axis and all input/output tokens as a line on the right axis.
@@ -395,12 +413,10 @@ function buildCommunityAllowanceSingleChartModel(series, {
     ? margin.left + plotWidth / 2
     : margin.left + ((atMs - startMs) / (endMs - startMs)) * plotWidth);
 
-  const dollars = valueAxis(
-    Math.max(...points.map((point) => (
-      point.band80Usd === null ? point.centralUsd : point.band80Usd.upperUsd
-    ))),
-    plotTop,
-    plotBottom,
+  const dollars = allowanceValueAxis(
+    Math.min(...points.map(point => point.band80Usd?.lowerUsd ?? point.centralUsd)),
+    Math.max(...points.map(point => point.band80Usd?.upperUsd ?? point.centralUsd)),
+    plotTop, plotBottom,
   );
 
   const dots = points.map((point) => ({
@@ -496,7 +512,7 @@ function buildCommunityAllowanceSingleChartModel(series, {
 export function buildCommunityAllowanceChartModel(series, options = {}) {
   const { view = "aggregate", rangeDays = null, seriesKeys = null,
     width = COMMUNITY_ALLOWANCE_CHART_WIDTH,
-    height = COMMUNITY_ALLOWANCE_CHART_HEIGHT } = options;
+    height = view === "models" ? COMMUNITY_ALLOWANCE_CHART_HEIGHT * 1.5 : COMMUNITY_ALLOWANCE_CHART_HEIGHT } = options;
   if (!["aggregate", "plans", "models"].includes(view)) return null;
   if (!series?.breakdowns) {
     return view === "aggregate" ? buildCommunityAllowanceSingleChartModel(series, options) : null;
@@ -511,8 +527,8 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
   const breakdownDays = new Map(series.breakdowns.days.map(day => [day.day, day]));
   const definitions = [
     { key: "aggregate", view: "aggregate", label: null, className: "" },
-    ...[ ["pro", "Pro 20×"], ["prolite", "Pro 5×"], ["plus", "Plus"] ].map(([key, label], index) => ({
-      key, label, view: "plans", className: `allowance-series-${index}`,
+    ...[ ["plus", "Plus", 2], ["prolite", "Pro 5×", 1], ["pro", "Pro 20×", 0] ].map(([key, label, color]) => ({
+      key, label, view: "plans", className: `allowance-series-${color}`,
     })),
     ...PUBLIC_ALLOWANCE_MODEL_CONFIG.map(({ modelId, label }, index) => ({
       key: modelId, label, view: "models", ...allowanceModelPresentation(modelId, index),
@@ -552,12 +568,9 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     const own = planWeeklyApiEquivalentUsd(value, definition.key);
     return own === null ? value : own;
   };
-  // Dollar axes stay comparable across tabs, so the bound is every definition,
-  // not just the drawn ones — EXCEPT when a caller asks for a single series.
-  // That is the small-multiples case, where the whole point is that each panel
-  // gets its own axis; sharing one there would reintroduce the squashing the
-  // panels exist to avoid.
-  const axisDefinitions = seriesKeys === null ? definitions : viewDefinitions;
+  // Each view gets a scale from its own visible series. A plan small multiple
+  // narrows that further to one plan's own weekly value.
+  const axisDefinitions = viewDefinitions;
   let maximum = 0;
   let minimum = Infinity;
   for (const day of rangeDaysWithActivity) for (const definition of axisDefinitions) {
@@ -578,7 +591,7 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
   const endMs = communityDayStartMs(days.at(-1).day);
   const x = day => startMs === endMs ? (plot.left + plot.right) / 2
     : plot.left + (communityDayStartMs(day) - startMs) / (endMs - startMs) * (plot.right - plot.left);
-  const dollars = valueAxis(maximum, plot.top, plot.bottom, minimum);
+  const dollars = allowanceValueAxis(minimum, maximum, plot.top, plot.bottom);
   const split = points => {
     const segments = [];
     for (const point of points) {
