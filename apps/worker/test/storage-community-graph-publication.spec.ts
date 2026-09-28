@@ -401,6 +401,23 @@ describe('isolated allowance graph publication',()=>{
   expect(await readPublishedStorageCommunityAdminPreview(bindings())).toMatchObject({models:{days:[{day:day(),values:stored.values}]}});
   expect(stored.day).toBe(day());expect(await publishStorageCommunityModelDay(bindings(),{day:day()})).toMatchObject({state:'unchanged'});
  });
+ it('publishes a ready effective historical model using its recorded attribution method',async()=>{
+  await modelFixture();
+  await typed().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+  const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+  expect(owner).toMatchObject({hasV11:true,hasEffective:true});
+  const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'model',
+   sourceId:namespace,sourceNamespace:namespace});
+  expect(scope.source).toBe('effective');
+  const result=await computeStorageGraphResult(bindings(),scope);
+  expect(result).toMatchObject({state:'complete',result:{composition:{status:'ready',fit:{status:'fitted'}}}});
+  expect(await b.STORAGE_ANALYTICS_DB.prepare("SELECT source_kind FROM analytics_community_graph_results WHERE metric='model'")
+   .first('source_kind')).toBe('effective');
+  expect(await publishStorageCommunityModelDay(bindings(),{day:day()})).toMatchObject({state:'published',memberCount:1});
+  const publication=await b.STORAGE_ANALYTICS_DB.prepare('SELECT payload_json FROM analytics_community_model_publications')
+   .first<string>('payload_json');
+  expect(JSON.parse(publication!).values.length).toBeGreaterThan(0);
+ });
  it('measures both full 16-owner publications with the actual shared statement meter',async()=>{
   for(let i=0;i<16;i++)await fixture(`participant:budget-${i.toString().padStart(2,'0')}`);
   for(let i=0;i<16;i++){await compute('fits',today(),i);await compute('model',day(),i);}

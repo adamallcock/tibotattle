@@ -250,7 +250,8 @@ async function capture(bindings:StorageAnalyticsBindings,day:string,metric:'fits
         if(canonicalJson(composition)==='{"reason":"legacy_source_overlap","status":"unsupported_source"}'){
           if(source!=='v0.2'&&source!=='mixed')return null;result.unsupportedSource=true;
         } else {
-          const method=source==='v1.1'?V11_PLAN_ATTRIBUTION_ADAPTER_VERSION:MODEL_HISTORY_METHOD_VERSION;
+          const method=source==='v1.1'||source==='effective'
+            ?V11_PLAN_ATTRIBUTION_ADAPTER_VERSION:MODEL_HISTORY_METHOD_VERSION;
           if(!validCompleteCachedComposition(composition,row.payload_fingerprint,method))return null;
           result.composition=composition;
         }
